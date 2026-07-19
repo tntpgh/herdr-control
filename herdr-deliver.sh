@@ -62,20 +62,42 @@ _MUX_RE='^(tmux|screen|zellij|abduco|dtach|mosh-client)$'
 # (`:!cmd`), less (`!cmd`) and any REPL all execute commands just as directly as
 # zsh does, so naming the shells only moved the hole. Name what MAY receive a
 # delivery instead, and everything unrecognised is refused by default.
-# Override for other agent runtimes via HERDR_AGENT_PROCS.
-_AGENT_RE="${HERDR_AGENT_PROCS:-^(claude|codex|node|deno|bun|omc|herdr-reviewr|aider|opencode|goose)$}"
+#
+# Agents that are their own binary: the name is enough.
+_AGENT_RE="${HERDR_AGENT_PROCS:-^(claude|codex|omc|herdr-reviewr|aider|opencode|goose)$}"
+#
+# Agents that ride a shared runtime need MORE than the name. Every agent here is
+# some form of `node <script>`, but bare `node` with no script is a JS REPL —
+# which evaluates whatever it is handed, i.e. exactly the execution primitive
+# this gate exists to deny. Same for deno/bun/python. So a runtime qualifies
+# only when it is actually RUNNING something: cmdline must carry an argument
+# beyond the binary itself.
+_RUNTIME_RE='^(node|deno|bun|python|python3|python3\.[0-9]+|ruby|perl)$'
 
 pane_is_agent() {
-  local info names
+  local info rows name cmdline
   info=$(herdr pane process-info --pane "$1" 2>/dev/null) || return 1
-  names=$(printf '%s' "$info" \
-    | jq -r '.result.process_info.foreground_processes[]?.name // empty' 2>/dev/null)
+  # name<TAB>cmdline, one process per line. A missing cmdline yields an empty
+  # field, which fails the runtime test below — conservative, as it should be.
+  rows=$(printf '%s' "$info" | jq -r '
+    .result.process_info.foreground_processes[]?
+    | ((.name // "") + "\t" + (.cmdline // ""))' 2>/dev/null)
   # No foreground process at all = sitting at a shell prompt.
-  [ -n "$names" ] || return 1
-  names=$(printf '%s\n' "$names" | grep -vxE "$_MUX_RE")
-  # Nothing but a multiplexer = a bare shell inside tmux.
-  [ -n "$names" ] || return 1
-  printf '%s\n' "$names" | grep -qxE "$_AGENT_RE"
+  [ -n "$rows" ] || return 1
+  while IFS=$'\t' read -r name cmdline; do
+    [ -n "$name" ] || continue
+    printf '%s' "$name" | grep -qxE "$_MUX_RE" && continue   # transparent, tells us nothing
+    printf '%s' "$name" | grep -qxE "$_AGENT_RE" && return 0
+    if printf '%s' "$name" | grep -qxE "$_RUNTIME_RE"; then
+      # ≥2 whitespace-separated fields means the runtime was given a script.
+      case "$cmdline" in
+        *[![:space:]]*[[:space:]]*[![:space:]]*) return 0 ;;
+      esac
+    fi
+  done <<EOF
+$rows
+EOF
+  return 1
 }
 
 require_agent_pane() {
