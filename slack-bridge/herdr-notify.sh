@@ -123,14 +123,29 @@ text="$*"
 [ -n "$text" ] || { echo "herdr-notify: empty text" >&2; exit 2; }
 
 _dry_report() {
-  echo "dry-run: pane=${pane:-none} text=${text}"
-  [ -n "$blocks" ] && { echo "--- would post with buttons ---"; printf '%s\n' "$body"; }
+  echo "dry-run: pane=${pane:-none}${blocks:+ (with buttons)}"
+  echo "--- message body ---"
+  printf '%s\n' "$body"
   exit 0
 }
 
-# Prefix the pane so it's visible even on a non-threaded reply.
+_lib="$(cd "$(dirname "$0")/.." && pwd)/lib"
+
+# Name the pane the way the operator named it. "w3:p1" identifies nothing to a
+# human reading this on a phone; "thurber-os — Main" does. The raw id stays as a
+# small suffix because it is what you type to target a pane by hand.
+where=""
+if [ -n "$pane" ]; then
+  . "$_lib/pane-name.sh"
+  where="$(pane_display_name "$pane")"
+fi
+_hdr() {  # the alert's first line
+  if [ -n "$pane" ]; then printf '🔔 *%s*  ·  %s\n`%s`' "$where" "$text" "$pane"
+  else printf '🔔 %s' "$text"; fi
+}
+
 body="$text"
-[ -n "$pane" ] && body="🔔 \`${pane}\`  ${text}"
+[ -n "$pane" ] && body="$(_hdr)"
 
 # --choices: an alert you cannot act on is half a feature. When the pane is
 # sitting on a numbered prompt, show the ACTUAL options and make them
@@ -139,13 +154,24 @@ body="$text"
 # end in herdr-select.sh, so a choice is validated and recorded identically.
 blocks=""
 if [ "$choices" = 1 ] && [ -n "$pane" ]; then
-  . "$(cd "$(dirname "$0")/.." && pwd)/lib/prompt-parse.sh"
-  opts=$(prompt_options "$pane")
+  . "$_lib/prompt-parse.sh"
+  # The Notification hook fires when the agent DECIDES it needs permission,
+  # which can be before the TUI has painted the prompt box. Reading once loses
+  # that race and silently degrades to scrollback, so the alert arrives without
+  # the question — which is exactly the failure this whole feature exists to
+  # avoid. Poll briefly for the options to appear. Costs nothing when they are
+  # already there, and the hook is async so a short wait is free.
+  opts=""
+  for _ in 1 2 3 4 5 6 7 8; do
+    opts=$(prompt_options "$pane")
+    [ -n "$opts" ] && break
+    sleep 0.25
+  done
   if [ -n "$opts" ]; then
     question=$(prompt_question "$pane")
     list=$(printf '%s\n' "$opts" | awk -F'\t' '{printf "  *%s.* %s\n", $1, $2}')
     nums=$(printf '%s\n' "$opts" | awk -F'\t' '{printf "%s%s", sep, $1; sep=", "}')
-    body="🔔 \`${pane}\`  ${text}"
+    body="$(_hdr)"
     [ -n "$question" ] && body="${body}"$'\n\n'"${question}"
     body="${body}"$'\n'"${list}"$'\n'"_Reply in thread with ${nums}._"
     blocks=$(printf '%s\n' "$opts" | jq -R -s --arg body "$body" --arg pane "$pane" '
@@ -157,6 +183,16 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
              text:{type:"plain_text", text:("\(.num). " + (.label|.[0:70]))},
              value:($pane + "|" + .num),
              action_id:("herdr_choice_" + .num)}))} ]')
+  else
+    # No numbered list to parse — but "Claude needs your permission to use Bash"
+    # on its own means you answer BLIND. Send what is actually on screen: the
+    # command, the reason, the question. This is the common case, not the edge
+    # case: a prompt auto-mode already dismissed, a non-numbered confirmation,
+    # or a plan approval all land here.
+    ctx=$(prompt_context "$pane")
+    if [ -n "$ctx" ]; then
+      body="$(_hdr)"$'\n\n```\n'"${ctx}"$'\n```'
+    fi
   fi
 fi
 
@@ -187,6 +223,12 @@ if [ -n "$pane" ]; then
   mkdir -p "$reg_dir"
   reg="$reg_dir/registry.jsonl"
   jq -nc --arg ts "$ts" --arg pane "$pane" '{ts:$ts,pane:$pane}' >> "$reg"
+  # Track it as AWAITING AN ANSWER only if we actually showed a live prompt.
+  # If you then answer in the terminal, herdr-resolve.sh retracts this message
+  # so it does not sit in Slack looking pending. Informational alerts carry no
+  # question, so they are never tracked and never deleted.
+  [ -n "$blocks" ] && jq -nc --arg ts "$ts" --arg pane "$pane" \
+    '{ts:$ts,pane:$pane}' >> "$reg_dir/pending.jsonl"
   # Keep the registry bounded (last 500 alerts).
   if [ "$(wc -l < "$reg" 2>/dev/null || echo 0)" -gt 600 ]; then
     tail -n 500 "$reg" > "$reg.tmp" && mv "$reg.tmp" "$reg"

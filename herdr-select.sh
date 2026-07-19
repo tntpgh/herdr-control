@@ -62,4 +62,17 @@ herdr pane send-keys "$pane" "$choice" >/dev/null 2>&1 || {
   exit 2
 }
 
+# Answered HERE, so stop tracking it as pending. herdr-resolve retracts alerts
+# whose prompt has vanished — correct when you answered in the terminal, wrong
+# when you answered in Slack: it would delete the very message carrying your
+# choice and the confirmation under it. Untrack, and the record stays.
+pending="$log_dir/pending.jsonl"
+if [ -s "$pending" ]; then
+  tmp=$(mktemp "${TMPDIR:-/tmp}/herdr-pending.XXXXXX") && {
+    jq -c --arg p "$pane" 'select(.pane != $p)' < "$pending" > "$tmp" 2>/dev/null \
+      && cat "$tmp" > "$pending"
+    rm -f "$tmp"
+  }
+fi
+
 echo "selected $choice ($label) in $pane"
