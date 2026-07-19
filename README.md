@@ -49,6 +49,12 @@ overridable as an environment variable per run.
 ./spawn-agent.sh ~/src/app audit codex          # a specific agent
 ./ensure-workspace.sh ~/src/app                 # just print the workspace id
 
+# Task: a worktree opened as a SUB-TAB in the repo's space, at the model the
+# job-class maps to (plan→opus/deep, implement→sonnet/std, explore→haiku/fast)
+./spawn-task.sh ~/src/app fix-comps implement          # claude sonnet
+./spawn-task.sh ~/src/app arch review codex            # codex, deep model
+./spawn-task.sh ~/src/app fix-comps implement --dry-run # preview, no changes
+
 # Sort: reorder tabs by branch state, needs-you first
 ./sort-tabs.sh                                   # the focused workspace
 ./sort-tabs.sh --all --dry-run                   # every workspace, show the plan
@@ -82,6 +88,23 @@ type = "shell"                  # runs detached; sort needs no TTY
 command = "bash /path/to/herdr-layout/sort-tabs.sh --all"
 ```
 
+## Answer agents from Slack (optional, two-way)
+
+`herdr-deliver.sh` delivers a message to an agent (or `--blocked` = the one that's
+waiting). The `slack-bridge/` builds a **two-way** conversation with a Slack bot:
+
+- **Outbound** — `herdr-notify.sh --pane <id> "<text>"` posts an alert to your DM
+  as the bot and records `ts→pane`.
+- **Inbound** — a Socket-Mode daemon (`slack-herdr-bridge.py`, run via
+  `run-bridge.sh`) routes your reply to a pane: (1) a reply **threaded** under an
+  alert → that alert's pane; (2) an explicit `w8:p2 <text>` prefix; (3) the single
+  blocked agent. Fail-closed to an allowlist of your Slack user id(s).
+
+So a blocked worker DMs you and you answer *in the thread* — it lands in the right
+pane, from your phone, no terminal. One-time Slack-app setup in
+`slack-bridge/SETUP.md`. Wire `herdr-notify.sh` into your agent's notify hook to
+replace a one-way webhook.
+
 ## How it works (worth knowing before you review)
 
 A few herdr API facts these rely on, since they aren't obvious from the CLI:
@@ -107,8 +130,12 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `config.sh` | **your config** — the only file to edit |
 | `ensure-workspace.sh` | focus-or-create a project's workspace |
 | `spawn-agent.sh` | new tab in a project's workspace, run an agent |
+| `spawn-task.sh` | worktree as a sub-tab, launched at the job-class's model |
 | `sort-tabs.sh` | reorder tabs by branch state |
 | `mark-tab.sh` | set a tab's status/colour + badge |
+| `herdr-deliver.sh` | deliver+submit a message to an agent (or `--blocked`) |
+| `send-to-agent.sh` | robust type+submit into a pane (delivery primitive) |
+| `slack-bridge/` | two-way Slack bot: outbound alerts + reply routing |
 | `herdr-rpc.py` | socket JSON-RPC for verbless methods (`tab.move`) |
 
 ## License
