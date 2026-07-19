@@ -85,6 +85,7 @@ _resolve_by_cwd() {
 pane=""
 cwd_hint=""
 dry=0
+choices=0
 while :; do
   case "${1:-}" in
     # ${2:?} not ${2:-}: with a trailing flag and no value, `shift 2` FAILS and
@@ -104,6 +105,8 @@ while :; do
     # resolution decides where a threaded reply gets injected, so it needs to be
     # checkable without DMing yourself to find out.
     --dry-run) dry=1; shift ;;
+    # Show the agent's actual options and make them answerable.
+    --choices) choices=1; shift ;;
     *) break ;;
   esac
 done
@@ -119,21 +122,58 @@ done
 text="$*"
 [ -n "$text" ] || { echo "herdr-notify: empty text" >&2; exit 2; }
 
-if [ "$dry" = 1 ]; then
+_dry_report() {
   echo "dry-run: pane=${pane:-none} text=${text}"
+  [ -n "$blocks" ] && { echo "--- would post with buttons ---"; printf '%s\n' "$body"; }
   exit 0
-fi
+}
 
 # Prefix the pane so it's visible even on a non-threaded reply.
 body="$text"
 [ -n "$pane" ] && body="🔔 \`${pane}\`  ${text}"
 
+# --choices: an alert you cannot act on is half a feature. When the pane is
+# sitting on a numbered prompt, show the ACTUAL options and make them
+# answerable — as a threaded number (works with no Slack app configuration) and
+# as buttons (dormant until Interactivity is enabled on the app). Both routes
+# end in herdr-select.sh, so a choice is validated and recorded identically.
+blocks=""
+if [ "$choices" = 1 ] && [ -n "$pane" ]; then
+  . "$(cd "$(dirname "$0")/.." && pwd)/lib/prompt-parse.sh"
+  opts=$(prompt_options "$pane")
+  if [ -n "$opts" ]; then
+    question=$(prompt_question "$pane")
+    list=$(printf '%s\n' "$opts" | awk -F'\t' '{printf "  *%s.* %s\n", $1, $2}')
+    nums=$(printf '%s\n' "$opts" | awk -F'\t' '{printf "%s%s", sep, $1; sep=", "}')
+    body="🔔 \`${pane}\`  ${text}"
+    [ -n "$question" ] && body="${body}"$'\n\n'"${question}"
+    body="${body}"$'\n'"${list}"$'\n'"_Reply in thread with ${nums}._"
+    blocks=$(printf '%s\n' "$opts" | jq -R -s --arg body "$body" --arg pane "$pane" '
+      [ split("\n")[] | select(length>0) | split("\t") | {num:.[0], label:.[1]} ] as $o
+      | [ {type:"section", text:{type:"mrkdwn", text:$body}},
+          {type:"actions",
+           elements: ($o | map({
+             type:"button",
+             text:{type:"plain_text", text:("\(.num). " + (.label|.[0:70]))},
+             value:($pane + "|" + .num),
+             action_id:("herdr_choice_" + .num)}))} ]')
+  fi
+fi
+
 # The bot token goes in via --config on STDIN, never as an argv element: a
 # `-H "Authorization: Bearer xoxb-…"` argument is readable by any same-user
 # process through `ps`. --config keeps it off the process table entirely.
+[ "$dry" = 1 ] && _dry_report
+
+if [ -n "$blocks" ]; then
+  payload=$(jq -nc --arg c "$user" --arg t "$body" --argjson b "$blocks" \
+    '{channel:$c,text:$t,blocks:$b}')
+else
+  payload=$(jq -nc --arg c "$user" --arg t "$body" '{channel:$c,text:$t}')
+fi
 resp=$(printf 'header = "Authorization: Bearer %s"\n' "$SLACK_BOT_TOKEN" \
   | curl -s -X POST --config - -H 'Content-type: application/json' \
-      --data "$(jq -nc --arg c "$user" --arg t "$body" '{channel:$c,text:$t}')" \
+      --data "$payload" \
       https://slack.com/api/chat.postMessage 2>/dev/null)
 if [ "$(printf '%s' "$resp" | jq -r '.ok')" != true ]; then
   echo "herdr-notify: slack error: $(printf '%s' "$resp" | jq -r '.error // "unknown"')" >&2

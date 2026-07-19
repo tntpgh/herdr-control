@@ -47,6 +47,8 @@ REGISTRY = os.path.join(
 )
 TARGET_RE = re.compile(r"^\s*(w[0-9A-Za-z]+:[pt][0-9]+)\s+(.*)$", re.S)
 MENTION_RE = re.compile(r"^\s*<@[^>]+>\s*")
+# A reply that is nothing but a number (optionally "2." or "option 2").
+CHOICE_RE = re.compile(r"^\s*(?:option\s*)?([0-9]{1,2})\.?\s*$", re.I)
 
 
 def pane_for_thread(thread_ts):
@@ -85,6 +87,39 @@ if not TEAM:
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
 
+SELECT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "herdr-select.sh")
+
+
+def select_option(pane, choice, via):
+    """Answer a numbered prompt. ONE implementation for both the threaded-number
+    route and the buttons, so a choice cannot mean different things depending on
+    how it was made. herdr-select validates that the option is actually on offer
+    and records it before pressing anything."""
+    try:
+        r = subprocess.run(
+            ["bash", SELECT, pane, str(choice)],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "HERDR_SELECT_VIA": via},
+        )
+    except subprocess.TimeoutExpired:
+        return False, "herdr-select timed out"
+    out = (r.stdout + r.stderr).strip().splitlines()
+    return r.returncode == 0, (out[-1] if out else f"exit {r.returncode}")
+
+
+def authorized(user, team, logger, what):
+    """The same gate for messages and button clicks. A button is not inherently
+    trustworthy just because Slack rendered it — the payload still says who
+    clicked, and that is what we check."""
+    if user not in ALLOW:
+        logger.info("ignoring %s from unauthorized user %s", what, user)
+        return False
+    if TEAM and team != TEAM:
+        logger.warning("REFUSED %s: team %r != HERDR_BRIDGE_TEAM %r", what, team, TEAM)
+        return False
+    return True
+
+
 def deliver(target, text):
     """Call herdr-deliver.sh; return (ok, message)."""
     try:
@@ -114,19 +149,12 @@ def message_team(event, body):
 def on_message(event, say, logger, body):
     if event.get("subtype") or event.get("bot_id"):
         return  # edits/joins/bot echoes
-    user = event.get("user", "")
-    if user not in ALLOW:
-        logger.info("ignoring message from unauthorized user %s", user)
+    # The workspace is checked BEFORE the id is trusted: same id, different team
+    # is a different human. Unattributable is refused, and logged at WARNING —
+    # a silent drop of a legitimate reply is indistinguishable from the bridge
+    # being down, and you would have no way to tell which.
+    if not authorized(event.get("user", ""), message_team(event, body), logger, "message"):
         return
-    # Check the workspace BEFORE trusting the id above: same id, different team
-    # is a different human. Unattributable means refused — but log it at WARNING,
-    # because a silent drop of a legitimate reply is indistinguishable from the
-    # bridge being down, and you would have no way to tell which.
-    if TEAM:
-        team = message_team(event, body)
-        if team != TEAM:
-            logger.warning("REFUSED message: team %r != HERDR_BRIDGE_TEAM %r", team, TEAM)
-            return
     if CHANNEL and event.get("channel") != CHANNEL:
         return
 
@@ -142,6 +170,17 @@ def on_message(event, say, logger, body):
     #   3) the single blocked agent
     target = pane_for_thread(thread_ts)
     text = raw
+
+    # A bare number in a thread under an alert is a CHOICE, not a message. It
+    # goes through herdr-select (which checks the option is really on offer and
+    # records it) instead of being typed into the composer, where the digit would
+    # be text and the Enter after it would accept whatever was highlighted.
+    if target and CHOICE_RE.match(raw):
+        ok, info = select_option(target, CHOICE_RE.match(raw).group(1), "slack-reply")
+        say(text=f"{':white_check_mark:' if ok else ':warning:'} {info}",
+            thread_ts=thread_ts or reply_ts)
+        return
+
     if target is None:
         m = TARGET_RE.match(raw)
         if m:
@@ -155,6 +194,32 @@ def on_message(event, say, logger, body):
     ok, info = deliver(target, text)
     icon = ":white_check_mark:" if ok else ":warning:"
     say(text=f"{icon} {info}", thread_ts=thread_ts or reply_ts)
+
+
+@app.action(re.compile(r"^herdr_choice_[0-9]+$"))
+def on_choice_button(ack, body, say, logger):
+    """Button route into the same selection path as a threaded number.
+
+    Requires Interactivity to be enabled on the Slack app; until then Slack
+    renders the buttons but never delivers the click, and the numbered-reply
+    route is what actually works. Nothing here is load-bearing for that route.
+    """
+    ack()
+    user = (body.get("user") or {}).get("id", "")
+    team = (body.get("team") or {}).get("id") or body.get("team_id")
+    if not authorized(user, team, logger, "button click"):
+        return
+    action = (body.get("actions") or [{}])[0]
+    value = action.get("value", "")
+    # value is "<pane>|<n>", written by herdr-notify. Parse defensively: it comes
+    # back from Slack, so treat it as input rather than as something we know.
+    pane, _, choice = value.partition("|")
+    if not pane or not choice.isdigit():
+        logger.warning("ignoring button with malformed value %r", value)
+        return
+    ok, info = select_option(pane, choice, "slack-button")
+    thread_ts = (body.get("message") or {}).get("ts")
+    say(text=f"{':white_check_mark:' if ok else ':warning:'} {info}", thread_ts=thread_ts)
 
 
 if __name__ == "__main__":
