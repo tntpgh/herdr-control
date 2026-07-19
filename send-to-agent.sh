@@ -69,12 +69,23 @@ composer_has_stuck_paste() {
 # ❯ 3.), y/n and [Y/n] confirmations, and Codex's approval wording, since
 # spawn-task launches codex too. This is a heuristic and cannot be exhaustive —
 # it is the reason --force exists.
-_PROMPT_RE='Do you want|❯[[:space:]]*[0-9]+\.|\([Yy]/[Nn]\)|\[[Yy]/[Nn]\]|[Aa]llow .* to (run|edit|write|access)|Approve|Proceed\?'
+# The composer sits INSIDE the bottom window, so this reads back our own text.
+# Bare words are therefore unusable: "Approve the PR once CI is green" and
+# "Do you want me to update the tests too" are ordinary instructions, and
+# matching them stranded the message in the composer. Require STRUCTURE that
+# prose does not have — a selected numbered option (❯ 2.) together with a
+# numbered option list, or an explicit y/n bracket.
+_PROMPT_ARROW='❯[[:space:]]*[0-9]+\.'
+_PROMPT_OPTION='^[[:space:]]*[0-9]+\.[[:space:]]'
+_PROMPT_YN='\([Yy]/[Nn]\)|\[[Yy]/[Nn]\]'
 
 looks_like_permission_prompt() {
-  local vis
+  local vis win
   vis=$(herdr pane read "$pane" --source visible --lines 30 2>/dev/null) || return 2
-  printf '%s' "$vis" | tail -n 12 | grep -Eq "$_PROMPT_RE" && return 0
+  win=$(printf '%s' "$vis" | tail -n 12)
+  printf '%s' "$win" | grep -Eq "$_PROMPT_YN" && return 0
+  printf '%s' "$win" | grep -Eq "$_PROMPT_ARROW" \
+    && printf '%s' "$win" | grep -Eq "$_PROMPT_OPTION" && return 0
   return 1
 }
 

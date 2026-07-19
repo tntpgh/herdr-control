@@ -64,6 +64,11 @@ _MUX_RE='^(tmux|screen|zellij|abduco|dtach|mosh-client)$'
 # delivery instead, and everything unrecognised is refused by default.
 #
 # Agents that are their own binary: the name is enough.
+# HERDR_AGENT_PROCS only ever WIDENS this gate — HERDR_AGENT_PROCS='.*' disables
+# it entirely, and the bridge subprocess inherits the daemon's environment, so a
+# value set in herdr-bridge.env or the launchd plist silently applies to messages
+# arriving from Slack. Treat it as security configuration, not convenience.
+# (A malformed regex makes grep error, which denies — that direction is safe.)
 _AGENT_RE="${HERDR_AGENT_PROCS:-^(claude|codex|omc|herdr-reviewr|aider|opencode|goose)$}"
 #
 # Agents that ride a shared runtime need MORE than the name. Every agent here is
@@ -89,9 +94,16 @@ pane_is_agent() {
     printf '%s' "$name" | grep -qxE "$_MUX_RE" && continue   # transparent, tells us nothing
     printf '%s' "$name" | grep -qxE "$_AGENT_RE" && return 0
     if printf '%s' "$name" | grep -qxE "$_RUNTIME_RE"; then
-      # ≥2 whitespace-separated fields means the runtime was given a script.
+      # "Was it given an ARGUMENT" is not the question — `node -i` has an
+      # argument and is still a REPL. The question is whether it was given
+      # something to RUN. Reject interactive/eval flags outright, then require
+      # the first argument to be a non-flag (a script path).
       case "$cmdline" in
-        *[![:space:]]*[[:space:]]*[![:space:]]*) return 0 ;;
+        *" -i"*|*" --interactive"*|*" -e "*|*" --eval"*|*" -c "*|*" -p "*|*" --print"*)
+          continue ;;
+      esac
+      case "$cmdline" in
+        *[![:space:]][[:space:]][!-]*) return 0 ;;
       esac
     fi
   done <<EOF
