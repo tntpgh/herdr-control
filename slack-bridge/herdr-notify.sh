@@ -87,8 +87,12 @@ cwd_hint=""
 dry=0
 while :; do
   case "${1:-}" in
-    --pane) pane="${2:-}"; shift 2 ;;
-    --cwd)  cwd_hint="${2:-}"; shift 2 ;;
+    # ${2:?} not ${2:-}: with a trailing flag and no value, `shift 2` FAILS and
+    # shifts nothing, and since there is no `set -e` the `while :` re-reads the
+    # same $1 forever — a wedged process spinning a core, which under launchd
+    # KeepAlive never resolves. Erroring out is the only safe response.
+    --pane) pane="${2:?--pane needs a value}"; shift 2 ;;
+    --cwd)  cwd_hint="${2:?--cwd needs a value}"; shift 2 ;;
     # --dry-run resolves the pane and reports it WITHOUT posting. Pane
     # resolution decides where a threaded reply gets injected, so it needs to be
     # checkable without DMing yourself to find out.
@@ -98,7 +102,12 @@ while :; do
 done
 [ -n "$pane" ] || pane="${HERDR_PANE_ID:-}"
 [ -n "$pane" ] || pane="$(_resolve_by_tmux || true)"
-[ -n "$pane" ] || pane="$(_resolve_by_cwd "${cwd_hint:-$PWD}" || true)"
+# cwd only when a caller EXPLICITLY offers one — never an implicit $PWD.
+# Uniqueness is not identity: if we happen to run from a directory where exactly
+# one unrelated pane sits, _only_one is satisfied and we would tag that pane, so
+# a threaded reply lands in an agent that has nothing to do with this alert.
+# _only_one defends against ambiguity, not coincidence.
+[ -n "$pane" ] || { [ -n "$cwd_hint" ] && pane="$(_resolve_by_cwd "$cwd_hint" || true)"; }
 
 text="$*"
 [ -n "$text" ] || { echo "herdr-notify: empty text" >&2; exit 2; }
@@ -112,9 +121,13 @@ fi
 body="$text"
 [ -n "$pane" ] && body="🔔 \`${pane}\`  ${text}"
 
-resp=$(curl -s -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H 'Content-type: application/json' \
-  --data "$(jq -nc --arg c "$user" --arg t "$body" '{channel:$c,text:$t}')" \
-  https://slack.com/api/chat.postMessage 2>/dev/null)
+# The bot token goes in via --config on STDIN, never as an argv element: a
+# `-H "Authorization: Bearer xoxb-…"` argument is readable by any same-user
+# process through `ps`. --config keeps it off the process table entirely.
+resp=$(printf 'header = "Authorization: Bearer %s"\n' "$SLACK_BOT_TOKEN" \
+  | curl -s -X POST --config - -H 'Content-type: application/json' \
+      --data "$(jq -nc --arg c "$user" --arg t "$body" '{channel:$c,text:$t}')" \
+      https://slack.com/api/chat.postMessage 2>/dev/null)
 if [ "$(printf '%s' "$resp" | jq -r '.ok')" != true ]; then
   echo "herdr-notify: slack error: $(printf '%s' "$resp" | jq -r '.error // "unknown"')" >&2
   exit 1
