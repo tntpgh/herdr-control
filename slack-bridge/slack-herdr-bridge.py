@@ -20,6 +20,9 @@ Env:
   SLACK_BOT_TOKEN            xoxb-...  (bot token; scope chat:write + read)
   SLACK_APP_TOKEN            xapp-...  (app-level token; scope connections:write)
   HERDR_BRIDGE_ALLOW_USERS   U0123,U0456   (REQUIRED — comma-separated Slack user ids)
+  HERDR_BRIDGE_TEAM          T0123     (STRONGLY recommended — bind the allowlist
+                                        to one workspace; member ids are unique
+                                        per workspace, not globally)
   HERDR_BRIDGE_CHANNEL       C0789     (optional — only handle this channel)
 
 Run via run-bridge.sh (which sources tokens from 1Password). Needs slack_bolt
@@ -67,8 +70,17 @@ def pane_for_thread(thread_ts):
 
 ALLOW = {u.strip() for u in os.environ.get("HERDR_BRIDGE_ALLOW_USERS", "").split(",") if u.strip()}
 CHANNEL = os.environ.get("HERDR_BRIDGE_CHANNEL", "").strip()
+# Slack member ids are unique per WORKSPACE, not globally. In a Slack Connect or
+# shared channel, an external-org user posts under their home-org id — so a
+# foreign account that happens to carry our allowlisted id would pass the only
+# check we have. Binding the workspace closes that.
+TEAM = os.environ.get("HERDR_BRIDGE_TEAM", "").strip()
 if not ALLOW:
     sys.exit("refusing to start: set HERDR_BRIDGE_ALLOW_USERS to a comma-separated allowlist of Slack user ids")
+if not TEAM:
+    print("WARNING: HERDR_BRIDGE_TEAM unset — the allowlist is not bound to a workspace. "
+          "Set it to your Slack team id (Txxxxxxxx) so a same-id user from another "
+          "workspace cannot pass the allowlist.", file=sys.stderr, flush=True)
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
@@ -94,6 +106,12 @@ def on_message(event, say, logger):
     user = event.get("user", "")
     if user not in ALLOW:
         logger.info("ignoring message from unauthorized user %s", user)
+        return
+    # Check the workspace BEFORE trusting the id above: same id, different team
+    # is a different human. A message with no team field is not from our
+    # workspace as far as we can prove, so it is refused.
+    if TEAM and event.get("team") != TEAM:
+        logger.info("ignoring message from foreign/unknown team %s", event.get("team"))
         return
     if CHANNEL and event.get("channel") != CHANNEL:
         return
@@ -126,5 +144,6 @@ def on_message(event, say, logger):
 
 
 if __name__ == "__main__":
-    print(f"herdr bridge up — allowlist={sorted(ALLOW)} channel={CHANNEL or 'any'} deliver={DELIVER}", flush=True)
+    print(f"herdr bridge up — allowlist={sorted(ALLOW)} team={TEAM or 'ANY (unbound)'} "
+          f"channel={CHANNEL or 'any'} deliver={DELIVER}", flush=True)
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
