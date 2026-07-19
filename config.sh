@@ -25,8 +25,17 @@
 # Skip gh entirely (git-only ranks; you lose reviewed/merged/waiting):
 : "${HERDR_SORT_NO_GH:=0}"
 
+# ---- spawn-task.sh model routing (job-class -> model) ----------------------
+# Claude tiers use the standard aliases (opus/sonnet/haiku) and need no config.
+# Codex model names are yours — edit to match your Codex setup.
+# Format: "<model>:<reasoning-effort>".
+: "${HERDR_CODEX_DEEP:=gpt-5.6-sol:high}"     # plan / architect / review / design
+: "${HERDR_CODEX_STD:=gpt-5.5:medium}"        # implement / debug / code
+: "${HERDR_CODEX_FAST:=gpt-5.4-mini:low}"     # explore / quick / mechanical / docs
+
 # ============================================================================
 #  End of your config — generic below.
 # ============================================================================
 export HERDR_DEFAULT_AGENT HERDR_SOURCE HERDR_SOCK HERDR_SORT_DONE_FIRST HERDR_SORT_NO_GH
+export HERDR_CODEX_DEEP HERDR_CODEX_STD HERDR_CODEX_FAST
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"
