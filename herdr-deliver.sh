@@ -15,16 +15,33 @@
 #   herdr-deliver.sh w8:p2 "continue; skip the migration for now"
 #
 # Delivery goes through send-to-agent.sh, which retries Enter until the message
-# actually submits (handles the TUI paste-debounce). Exit 0 delivered, 4 stranded.
+# actually submits (handles the TUI paste-debounce).
+#
+# Exit 0 delivered, 3 target is not an agent pane (refused), 4 stranded,
+# 5 target looks like it is sitting on a permission prompt (refused).
 set -uo pipefail
-source "$(cd "$(dirname "$0")" && pwd)/config.sh"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
 here=$(cd "$(dirname "$0")" && pwd)
 
-target="${1:?usage: herdr-deliver.sh <pane|tab|label|--blocked> <text...>}"; shift
+# --force must come FIRST, before the target. The Slack bridge always passes the
+# target as its own first argv element, so attacker-controlled message text can
+# never land in this position — the override stays a human-at-a-terminal act and
+# is deliberately NOT reachable from Slack, which is the whole point of the
+# permission-prompt guard it overrides.
+force=""
+if [ "${1:-}" = "--force" ]; then force="--force"; shift; fi
+
+target="${1:?usage: herdr-deliver.sh [--force] <pane|tab|label|--blocked> <text...>}"; shift
 text="$*"
 [ -n "$text" ] || { echo "herdr-deliver: empty message" >&2; exit 2; }
 
 panes=$(herdr pane list 2>/dev/null) || { echo "herdr-deliver: pane list failed" >&2; exit 1; }
+
+# A pane id from Slack is untrusted. Delivery is "write literal text, then press
+# Enter" — in an agent that is a prompt, but in a plain SHELL pane it is a
+# command. The gate for that lives in lib/pane-guard.sh, shared with
+# herdr-select.sh so the two input paths cannot drift apart.
+. "$here/lib/pane-guard.sh"
 
 resolve_blocked() {
   local ids
@@ -32,8 +49,10 @@ resolve_blocked() {
   local n; n=$(printf '%s' "$ids" | grep -c . || true)
   if [ "$n" -eq 0 ]; then echo "herdr-deliver: no blocked agent to answer" >&2; return 1; fi
   if [ "$n" -gt 1 ]; then
-    echo "herdr-deliver: $n blocked agents — name one explicitly:" >&2
-    printf '%s' "$panes" | jq -r '(.result.panes // .panes)[] | select(.agent_status=="blocked") | "  \(.pane_id)  \(.label // "")  \(.cwd // "")"' >&2
+    # Pane ids ONLY. Labels and cwds are local detail, and the bridge relays our
+    # last output line into Slack where every channel member can read it.
+    echo "herdr-deliver: several blocked agents: $(printf '%s' "$ids" | tr '\n' ' ')" >&2
+    echo "herdr-deliver: name one explicitly" >&2
     return 1
   fi
   printf '%s' "$ids"
@@ -41,13 +60,14 @@ resolve_blocked() {
 
 case "$target" in
   --blocked) pane=$(resolve_blocked) || exit 1 ;;
-  *:p*)      pane="$target" ;;
+  *:p*)      pane=$(printf '%s' "$panes" | jq -r --arg p "$target" '(.result.panes // .panes)[] | select(.pane_id==$p) | .pane_id' | head -1) ;;
   *:t*)      pane=$(printf '%s' "$panes" | jq -r --arg t "$target" '(.result.panes // .panes)[] | select(.tab_id==$t) | .pane_id' | head -1) ;;
   *)         pane=$(printf '%s' "$panes" | jq -r --arg l "$target" '(.result.panes // .panes)[] | select(.label==$l) | .pane_id' | head -1) ;;
 esac
 [ -n "$pane" ] || { echo "herdr-deliver: could not resolve target '$target'" >&2; exit 1; }
+require_agent_pane "$pane" || exit 3
 
-bash "$here/send-to-agent.sh" "$pane" "$text"
+bash "$here/send-to-agent.sh" "$pane" ${force:+"$force"} "$text"
 rc=$?
 [ "$rc" -eq 0 ] && echo "delivered to $pane" || echo "herdr-deliver: send to $pane returned $rc (may be stranded)" >&2
 exit "$rc"
