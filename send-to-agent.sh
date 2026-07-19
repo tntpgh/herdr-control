@@ -60,10 +60,21 @@ composer_has_stuck_paste() {
 # override. Unreadable also refuses: if we cannot see what we are answering, we
 # do not answer it.
 # 0 = prompt visible, 1 = no prompt, 2 = could not read.
+#
+# Only the BOTTOM of the pane is examined. A live prompt is anchored there, while
+# text we just delivered scrolls up — matching the whole viewport meant a message
+# that merely CONTAINED "Do you want" refused every later send to that pane.
+#
+# Patterns cover more than Claude's first option: any arrowed selection (❯ 2.,
+# ❯ 3.), y/n and [Y/n] confirmations, and Codex's approval wording, since
+# spawn-task launches codex too. This is a heuristic and cannot be exhaustive —
+# it is the reason --force exists.
+_PROMPT_RE='Do you want|❯[[:space:]]*[0-9]+\.|\([Yy]/[Nn]\)|\[[Yy]/[Nn]\]|[Aa]llow .* to (run|edit|write|access)|Approve|Proceed\?'
+
 looks_like_permission_prompt() {
   local vis
   vis=$(herdr pane read "$pane" --source visible --lines 30 2>/dev/null) || return 2
-  printf '%s' "$vis" | grep -Eq 'Do you want|❯[[:space:]]*1\.|^[[:space:]]*1\.[[:space:]]+Yes|\(y/n\)' && return 0
+  printf '%s' "$vis" | tail -n 12 | grep -Eq "$_PROMPT_RE" && return 0
   return 1
 }
 
@@ -91,6 +102,19 @@ herdr agent send "$pane" "$text" >/dev/null 2>&1 || {
 # settle. Cap the attempts so a genuinely stuck send reports honestly.
 unreadable=0
 for _ in 1 2 3 4 5 6; do
+  # Re-check before EVERY Enter, not just the first. The agent processes our
+  # text between iterations and can raise a permission prompt mid-loop — firing
+  # the remaining Enters into it would answer it with its default, which is
+  # exactly what the pre-send guard exists to prevent. A guard that only runs
+  # once protects the first keystroke and nothing after it.
+  if [ "$force" -eq 0 ]; then
+    looks_like_permission_prompt; pr=$?
+    if [ "$pr" -eq 0 ]; then
+      echo "REFUSED: a prompt appeared in $pane mid-submit — stopping rather than answering it." >&2
+      echo "REFUSED: the text was delivered but NOT submitted; finish it by hand." >&2
+      exit 5
+    fi
+  fi
   herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || {
     echo "ERROR: 'herdr pane send-keys $pane Enter' failed" >&2
     exit 2

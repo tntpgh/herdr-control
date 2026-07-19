@@ -23,7 +23,15 @@ set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
 here=$(cd "$(dirname "$0")" && pwd)
 
-target="${1:?usage: herdr-deliver.sh <pane|tab|label|--blocked> <text...>}"; shift
+# --force must come FIRST, before the target. The Slack bridge always passes the
+# target as its own first argv element, so attacker-controlled message text can
+# never land in this position — the override stays a human-at-a-terminal act and
+# is deliberately NOT reachable from Slack, which is the whole point of the
+# permission-prompt guard it overrides.
+force=""
+if [ "${1:-}" = "--force" ]; then force="--force"; shift; fi
+
+target="${1:?usage: herdr-deliver.sh [--force] <pane|tab|label|--blocked> <text...>}"; shift
 text="$*"
 [ -n "$text" ] || { echo "herdr-deliver: empty message" >&2; exit 2; }
 
@@ -43,6 +51,20 @@ panes=$(herdr pane list 2>/dev/null) || { echo "herdr-deliver: pane list failed"
 # The foreground process is the honest signal: an agent pane runs the agent (or
 # the tmux attach that hosts it); an idle shell pane's foreground IS the shell.
 # Deny shell-only and unreadable panes; anything running a real process is fine.
+# Transparent multiplexers say NOTHING about what is running inside the pane —
+# herdr reports the tmux client alongside the inner process, so 16 of 18 panes
+# here read "tmux,node" and a pane whose agent has exited reads "tmux,zsh".
+# They must be stripped before judging, or "tmux" alone satisfies any
+# "something non-shell is running" test and every shell pane passes.
+_MUX_RE='^(tmux|screen|zellij|abduco|dtach|mosh-client)$'
+
+# ALLOWLIST, not a denylist. A denylist of shells was the wrong shape: vim
+# (`:!cmd`), less (`!cmd`) and any REPL all execute commands just as directly as
+# zsh does, so naming the shells only moved the hole. Name what MAY receive a
+# delivery instead, and everything unrecognised is refused by default.
+# Override for other agent runtimes via HERDR_AGENT_PROCS.
+_AGENT_RE="${HERDR_AGENT_PROCS:-^(claude|codex|node|deno|bun|omc|herdr-reviewr|aider|opencode|goose)$}"
+
 pane_is_agent() {
   local info names
   info=$(herdr pane process-info --pane "$1" 2>/dev/null) || return 1
@@ -50,8 +72,10 @@ pane_is_agent() {
     | jq -r '.result.process_info.foreground_processes[]?.name // empty' 2>/dev/null)
   # No foreground process at all = sitting at a shell prompt.
   [ -n "$names" ] || return 1
-  # If every foreground process is a shell, it is a shell pane.
-  printf '%s\n' "$names" | grep -qvE '^(zsh|bash|sh|fish|dash|ksh|tcsh|csh)$'
+  names=$(printf '%s\n' "$names" | grep -vxE "$_MUX_RE")
+  # Nothing but a multiplexer = a bare shell inside tmux.
+  [ -n "$names" ] || return 1
+  printf '%s\n' "$names" | grep -qxE "$_AGENT_RE"
 }
 
 require_agent_pane() {
@@ -85,7 +109,7 @@ esac
 [ -n "$pane" ] || { echo "herdr-deliver: could not resolve target '$target'" >&2; exit 1; }
 require_agent_pane "$pane" || exit 3
 
-bash "$here/send-to-agent.sh" "$pane" "$text"
+bash "$here/send-to-agent.sh" "$pane" ${force:+"$force"} "$text"
 rc=$?
 [ "$rc" -eq 0 ] && echo "delivered to $pane" || echo "herdr-deliver: send to $pane returned $rc (may be stranded)" >&2
 exit "$rc"

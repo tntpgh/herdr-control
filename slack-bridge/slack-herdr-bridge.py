@@ -99,8 +99,19 @@ def deliver(target, text):
     return r.returncode == 0, msg
 
 
+def message_team(event, body):
+    """The workspace a message actually came from.
+
+    `event["team"]` is author attribution and is not always present (it varies
+    by message shape). Falling back to the envelope's team_id means a legitimate
+    message is not silently dropped just because the inner field is missing,
+    while a message we genuinely cannot attribute returns None and is refused.
+    """
+    return event.get("team") or event.get("user_team") or (body or {}).get("team_id")
+
+
 @app.event("message")
-def on_message(event, say, logger):
+def on_message(event, say, logger, body):
     if event.get("subtype") or event.get("bot_id"):
         return  # edits/joins/bot echoes
     user = event.get("user", "")
@@ -108,11 +119,14 @@ def on_message(event, say, logger):
         logger.info("ignoring message from unauthorized user %s", user)
         return
     # Check the workspace BEFORE trusting the id above: same id, different team
-    # is a different human. A message with no team field is not from our
-    # workspace as far as we can prove, so it is refused.
-    if TEAM and event.get("team") != TEAM:
-        logger.info("ignoring message from foreign/unknown team %s", event.get("team"))
-        return
+    # is a different human. Unattributable means refused — but log it at WARNING,
+    # because a silent drop of a legitimate reply is indistinguishable from the
+    # bridge being down, and you would have no way to tell which.
+    if TEAM:
+        team = message_team(event, body)
+        if team != TEAM:
+            logger.warning("REFUSED message: team %r != HERDR_BRIDGE_TEAM %r", team, TEAM)
+            return
     if CHANNEL and event.get("channel") != CHANNEL:
         return
 

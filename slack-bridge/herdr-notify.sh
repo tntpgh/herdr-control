@@ -91,8 +91,15 @@ while :; do
     # shifts nothing, and since there is no `set -e` the `while :` re-reads the
     # same $1 forever — a wedged process spinning a core, which under launchd
     # KeepAlive never resolves. Erroring out is the only safe response.
-    --pane) pane="${2:?--pane needs a value}"; shift 2 ;;
-    --cwd)  cwd_hint="${2:?--cwd needs a value}"; shift 2 ;;
+    # Distinguish ABSENT from EMPTY. `${2:?}` would also abort on an explicitly
+    # empty value, so a wrapper written as `--pane "$HERDR_PANE_ID"` would die
+    # exactly when that var is unset — which is the normal case the tmux
+    # resolution below exists to handle. An empty value should fall through to
+    # auto-resolution, not kill the notification.
+    --pane) [ $# -ge 2 ] || { echo "herdr-notify: --pane needs a value" >&2; exit 2; }
+            pane="$2"; shift 2 ;;
+    --cwd)  [ $# -ge 2 ] || { echo "herdr-notify: --cwd needs a value" >&2; exit 2; }
+            cwd_hint="$2"; shift 2 ;;
     # --dry-run resolves the pane and reports it WITHOUT posting. Pane
     # resolution decides where a threaded reply gets injected, so it needs to be
     # checkable without DMing yourself to find out.
