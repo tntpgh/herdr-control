@@ -32,9 +32,32 @@ spin an agent into the correct workspace with one command.
 ```bash
 git clone <this-repo> herdr-control && cd herdr-control
 $EDITOR config.sh          # the ONE file with your specifics — see below
+./install.sh               # show what would be wired into Claude Code
+./install.sh --apply       # wire it
 # optional: put them on PATH
 ln -s "$PWD"/*.sh ~/.local/bin/
 ```
+
+### What `install.sh` does
+
+The scripts here do nothing until something *calls* them, and that wiring lives
+in `~/.claude/settings.json`. `install.sh` registers three hooks:
+
+| event | script | why |
+|---|---|---|
+| `Notification` | `hooks/claude-notify.sh` | alert you when an agent needs input |
+| `PostToolUse` | `herdr-resolve.sh` | retract alerts you answered in the terminal |
+| `Stop` | `herdr-resolve.sh` | backstop for the same |
+
+It **edits `settings.json` in place and never replaces it** — that file is
+personal and routinely holds secrets and unrelated config. It merges only the
+entries above, writes a timestamped `.bak-herdr-*` first, validates the result
+before swapping it in, and is **idempotent**: a job already wired under a
+different script name is detected and skipped rather than duplicated, so you do
+not end up with every alert firing twice.
+
+Run it with no arguments for a dry run. Add `--bridge` to also install the
+launchd daemon (macOS) from `slack-bridge/com.herdr-control.bridge.plist.template`.
 
 **`config.sh` is the only file you edit** — it holds every machine/personal
 default (which agent to launch, PATH for a minimal environment, the metadata
@@ -135,6 +158,16 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `mark-tab.sh` | set a tab's status/colour + badge |
 | `herdr-deliver.sh` | deliver+submit a message to an agent (or `--blocked`) |
 | `send-to-agent.sh` | robust type+submit into a pane (delivery primitive) |
+| `herdr-select.sh` | answer a numbered prompt by pressing that option's key |
+| `herdr-resolve.sh` | retract Slack alerts whose prompt was answered elsewhere |
+| `install.sh` | wire the hooks into Claude Code (idempotent, dry-run by default) |
+| `hooks/claude-notify.sh` | the `Notification` hook that raises the alert |
+| `settings.example.json` | the hook wiring alone, with placeholders — merge, don't copy |
+| `SKILL.md` | what the tools do, and why several of them refuse things |
+| `AGENTS.md` | step-by-step activation for an agent to follow, with verification |
+| `lib/pane-guard.sh` | "is this pane safe to send input to?" — shared gate |
+| `lib/prompt-parse.sh` | read the options / context an agent is showing |
+| `lib/pane-name.sh` | pane id → "Space — Tab", for alerts a human reads |
 | `slack-bridge/` | two-way Slack bot: outbound alerts + reply routing |
 | `herdr-rpc.py` | socket JSON-RPC for verbless methods (`tab.move`) |
 

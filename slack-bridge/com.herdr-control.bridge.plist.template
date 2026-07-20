@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template. install.sh --bridge substitutes __RUN_BRIDGE__ with the absolute
+  path to slack-bridge/run-bridge.sh in your checkout and writes the result to
+  ~/Library/LaunchAgents/com.herdr-control.bridge.plist.
+
+  No secrets here: run-bridge.sh sources ~/.config/herdr-bridge.env, which
+  references 1Password rather than storing tokens on disk.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.herdr-control.bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__RUN_BRIDGE__</string>
+  </array>
+
+  <!-- Socket Mode holds a long-lived connection; restart it if it ever drops. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/herdr-bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/herdr-bridge.log</string>
+</dict>
+</plist>
