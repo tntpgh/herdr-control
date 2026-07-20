@@ -167,3 +167,4 @@ implying the flow is fully proven.
 | every alert arrives twice | two hooks wired for the same job — check `Notification` in settings.json |
 | `team=ANY (unbound)` at startup | `HERDR_BRIDGE_TEAM` unset; the workspace check is inert |
 | refusal on every reply | expected when no prompt is showing; only a live prompt accepts a choice |
+| cannot write files under a `hooks/` directory | agent sandboxes commonly block writes to any path named `hooks/` (a writable `.git/hooks` is code execution on the next git command). This repo uses `agent-hooks/` for that reason — do not rename it back. If you hit this elsewhere, the write needs to happen outside the sandbox |

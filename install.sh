@@ -10,7 +10,7 @@
 #   ./install.sh --apply --bridge   # also install the launchd bridge daemon (macOS)
 #
 # What it registers in ~/.claude/settings.json:
-#   Notification -> hooks/claude-notify.sh   alert you when an agent needs input
+#   Notification -> agent-hooks/claude-notify.sh   alert you when an agent needs input
 #   PostToolUse  -> herdr-resolve.sh         retract alerts answered in the terminal
 #   Stop         -> herdr-resolve.sh         backstop for the same
 #
@@ -54,7 +54,7 @@ settings = os.environ["SETTINGS"]
 # slack-notify.sh this hook was extracted from. Matching only our own filename
 # would add a SECOND hook doing the same work, so every alert would double.
 wanted = [
-    ("Notification", f'bash {here}/hooks/claude-notify.sh',
+    ("Notification", f'bash {here}/agent-hooks/claude-notify.sh',
         ("claude-notify.sh", "slack-notify.sh", "herdr-notify.sh")),
     ("PostToolUse",  f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",)),
     ("Stop",         f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",)),
