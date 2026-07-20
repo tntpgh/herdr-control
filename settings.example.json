@@ -1,0 +1,68 @@
+{
+  "_comment": [
+    "Example Claude Code settings showing ONLY what herdr-control needs.",
+    "",
+    "Do NOT copy this over your own ~/.claude/settings.json — that file holds your",
+    "model, permissions, env and possibly secrets. Either run ./install.sh --apply",
+    "(which merges just these entries and backs up first), or hand-merge the",
+    "\"hooks\" block below into your existing settings.",
+    "",
+    "Replace __HERDR_CONTROL__ with the absolute path to your checkout.",
+    "install.sh does this substitution for you.",
+    "",
+    "async:true matters — these run on every tool call and must never block the",
+    "agent. herdr-resolve exits in ~4ms when there is nothing pending."
+  ],
+
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash __HERDR_CONTROL__/hooks/claude-notify.sh",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash __HERDR_CONTROL__/herdr-resolve.sh",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash __HERDR_CONTROL__/herdr-resolve.sh",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ]
+  },
+
+  "_sandbox_note": [
+    "If you run Claude Code with its filesystem/network sandbox enabled, the",
+    "herdr socket and your tmux socket must be reachable or pane resolution",
+    "silently degrades. Add to sandbox.network.allowUnixSockets:",
+    "  ~/.config/herdr/herdr.sock",
+    "  /tmp/tmux-$UID/default        (and /private/tmp/... on macOS)",
+    "Without the tmux socket the alert can still be sent, but it cannot work out",
+    "WHICH pane asked, so replies have nowhere to go."
+  ]
+}

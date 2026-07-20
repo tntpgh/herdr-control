@@ -162,6 +162,9 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `herdr-resolve.sh` | retract Slack alerts whose prompt was answered elsewhere |
 | `install.sh` | wire the hooks into Claude Code (idempotent, dry-run by default) |
 | `hooks/claude-notify.sh` | the `Notification` hook that raises the alert |
+| `settings.example.json` | the hook wiring alone, with placeholders — merge, don't copy |
+| `SKILL.md` | what the tools do, and why several of them refuse things |
+| `AGENTS.md` | step-by-step activation for an agent to follow, with verification |
 | `lib/pane-guard.sh` | "is this pane safe to send input to?" — shared gate |
 | `lib/prompt-parse.sh` | read the options / context an agent is showing |
 | `lib/pane-name.sh` | pane id → "Space — Tab", for alerts a human reads |
