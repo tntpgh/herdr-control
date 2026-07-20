@@ -45,7 +45,7 @@ in `~/.claude/settings.json`. `install.sh` registers three hooks:
 
 | event | script | why |
 |---|---|---|
-| `Notification` | `hooks/claude-notify.sh` | alert you when an agent needs input |
+| `Notification` | `agent-hooks/claude-notify.sh` | alert you when an agent needs input |
 | `PostToolUse` | `herdr-resolve.sh` | retract alerts you answered in the terminal |
 | `Stop` | `herdr-resolve.sh` | backstop for the same |
 
@@ -161,7 +161,8 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `herdr-select.sh` | answer a numbered prompt by pressing that option's key |
 | `herdr-resolve.sh` | retract Slack alerts whose prompt was answered elsewhere |
 | `install.sh` | wire the hooks into Claude Code (idempotent, dry-run by default) |
-| `hooks/claude-notify.sh` | the `Notification` hook that raises the alert |
+| `agent-hooks/claude-notify.sh` | the `Notification` hook that raises the alert |
+| | *(named `agent-hooks/`, not `hooks/`, on purpose — see below)* |
 | `settings.example.json` | the hook wiring alone, with placeholders — merge, don't copy |
 | `SKILL.md` | what the tools do, and why several of them refuse things |
 | `AGENTS.md` | step-by-step activation for an agent to follow, with verification |
@@ -170,6 +171,20 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `lib/pane-name.sh` | pane id → "Space — Tab", for alerts a human reads |
 | `slack-bridge/` | two-way Slack bot: outbound alerts + reply routing |
 | `herdr-rpc.py` | socket JSON-RPC for verbless methods (`tab.move`) |
+
+### Why `agent-hooks/` and not `hooks/`
+
+Please don't rename it back. Agent sandboxes commonly block **writes to any
+directory named `hooks/`** — a sensible guard, since a writable `.git/hooks` is
+arbitrary code execution on the next git command, and the sandbox can't tell a
+git hook directory from any other. Observed behaviour with a folder called
+`hooks/`: creating and modifying files inside it is denied, while deleting is
+allowed.
+
+That breaks more than editing. **`git clone` has to create the file**, so a
+sandboxed agent can't even check this repo out cleanly — which is precisely the
+reader `AGENTS.md` is written for. The name also says what these are: hooks for
+your coding agent, not git hooks.
 
 ## License
 

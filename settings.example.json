@@ -21,7 +21,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash __HERDR_CONTROL__/hooks/claude-notify.sh",
+            "command": "bash __HERDR_CONTROL__/agent-hooks/claude-notify.sh",
             "timeout": 10,
             "async": true
           }
