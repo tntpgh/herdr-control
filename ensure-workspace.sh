@@ -14,16 +14,38 @@ focus=1
 proj="${1:?usage: ensure-workspace.sh [--no-focus] <project-path>}"
 [ -d "$proj" ] || { echo "ensure-workspace: not a directory: $proj" >&2; exit 1; }
 
-# Canonical repo root (fall back to the abs path for a non-git dir).
-root=$(git -C "$proj" rev-parse --show-toplevel 2>/dev/null || (cd "$proj" && pwd))
+# Canonical PROJECT root. Deliberately NOT --show-toplevel: inside a linked
+# worktree that returns the WORKTREE's own path, so every worktree resolves to a
+# different "project" and gets its own top-level workspace — task worktrees end up
+# scattered beside real projects instead of grouped under the repo they belong to.
+# --git-common-dir points at the MAIN repo's .git from anywhere, worktree
+# included, so a worktree and its parent share one workspace.
+repo_root() {
+  local d="$1" common
+  common=$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""
+  if [ -z "$common" ]; then
+    # Not a repo, or git too old for --path-format: best effort.
+    git -C "$d" rev-parse --show-toplevel 2>/dev/null || (cd "$d" && pwd)
+    return
+  fi
+  if [ "$(basename "$common")" = ".git" ]; then
+    dirname "$common"
+  else
+    printf '%s' "$common"   # bare repo / unusual layout: the common dir is the repo
+  fi
+}
+
+root=$(repo_root "$proj")
 label=$(basename "$root")
 
-# Find an open workspace whose panes sit in this repo.
+# Find an open workspace whose panes sit in this repo. Panes are matched through
+# the same resolver, so a pane sitting in a worktree of this repo counts as being
+# "on" the repo — which is what makes an existing project workspace get reused.
 ws=$(
   herdr pane list 2>/dev/null \
     | jq -r '(.result.panes // .panes)[] | select((.cwd // "") != "") | [.workspace_id, .cwd] | @tsv' \
     | while IFS=$'\t' read -r w cwd; do
-        cr=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$cwd")
+        cr=$(repo_root "$cwd")
         [ "$cr" = "$root" ] && { printf '%s\n' "$w"; break; }
       done | head -1
 )
