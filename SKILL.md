@@ -27,6 +27,25 @@ Two halves, usable independently:
 ./mark-tab.sh <pane> blocked "needs a decision"
 ```
 
+### ⚠️ Spawners that BYPASS this and produce no tab
+
+Two common ways to start parallel agents do **not** route through
+`spawn-agent.sh`, so nothing appears in the tab bar and the work is invisible:
+
+- **`omc team N:claude "..."`** (oh-my-claudecode's CLI-team runtime) — verified
+  2026-07-24: the worker starts correctly, but in a raw tmux window that herdr
+  never adopts. `herdr agent list` still returned exactly one agent afterwards;
+  the only visible effect was the *existing* pane's title changing. tmux panes and
+  herdr panes are separate registries — creating one does not create the other.
+- **Claude Code's in-process `Agent`/Task subagents** — these are context threads
+  inside one process, with no PTY at all, so they can never have a pane (the same
+  caveat `spawn-agent.sh` documents in its own header).
+
+If you want the work watchable, launch it with `spawn-agent.sh` (or
+`spawn-task.sh` for a worktree sub-tab) rather than either of the above. To adopt
+something already running elsewhere, `herdr tab create` + `herdr pane run` is what
+`spawn-agent.sh` does internally — prefer the script.
+
 `spawn-task.sh` maps a **job class** to a model, so a mechanical task does not
 burn your best model and a design task does not get your cheapest:
 `plan|architect|review|design` → deep, `implement|debug|code` → standard,
