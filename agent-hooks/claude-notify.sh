@@ -12,9 +12,27 @@ set -uo pipefail
 input="$(cat)"
 msg="$(printf '%s' "$input" | jq -r '.message // .title // "Claude needs your attention"')"
 
-# Only ping on actual permission prompts. Drop the idle "waiting for your input"
-# nag — mobile push already covers that, and it fires for every idle session.
-printf '%s' "$msg" | grep -qi 'permission' || exit 0
+# Decide what is worth a Slack ping.
+#
+# This used to be `grep -qi permission || exit 0` — pass ONLY messages containing
+# the literal word "permission". That silently dropped every question-shaped
+# notification ("Claude is waiting for your input", an AskUserQuestion prompt,
+# anything the agent actually asked), which is the case you most want to answer
+# from your phone. It went fully silent once sessions ran in auto /
+# bypass-permissions mode: there, permission prompts stop being raised at all, so
+# the one message shape that passed the gate stopped occurring — and the bridge
+# looked dead while every part of it was healthy (process up for 7 days, tokens
+# valid, hooks registered, outbound path posting fine).
+#
+# Inverted: drop the known-noisy idle nag, pass everything else. A false ping is
+# cheap; a swallowed question stalls an agent until someone happens to look.
+lower="$(printf '%s' "$msg" | tr '[:upper:]' '[:lower:]')"
+case "$lower" in
+  *permission*)                ;;          # permission prompt — always alert
+  *"waiting for your input"*)  exit 0 ;;   # pure idle nag — mobile push covers it
+  *"is idle"*)                 exit 0 ;;
+  *)                           ;;          # questions, errors, anything else — alert
+esac
 
 cwd="$(printf '%s' "$input" | jq -r '.cwd // ""')"
 where="${cwd##*/}"
