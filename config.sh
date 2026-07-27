@@ -33,9 +33,37 @@
 : "${HERDR_CODEX_STD:=gpt-5.5:medium}"        # implement / debug / code
 : "${HERDR_CODEX_FAST:=gpt-5.4-mini:low}"     # explore / quick / mechanical / docs
 
+# ---- shared state (smart-name.sh ownership/debounce, attention.sh stalls) ---
+# Where the tools remember what they've done. Removable at any time; the tools
+# rebuild it. Kept out of the repo and out of ~/.config/herdr on purpose.
+: "${HERDR_STATE_DIR:=${XDG_CACHE_HOME:-$HOME/.cache}/herdr-control}"
+
+# ---- smart-name.sh (tabs that say what the work is) ------------------------
+# 1 = call a model for ambiguous work; 0 = deterministic names only (no key,
+# no cost, no network). Known processes (Run Tests / Dev Server / View Logs /
+# Remote Shell) are named without a model either way.
+: "${SMART_NAME_AI:=1}"
+# The model that proposes labels. Naming is a trivial task — keep it cheap.
+: "${SMART_NAME_MODEL:=haiku}"
+# Hard ceiling on a single model call, seconds. Timed-out calls just abstain.
+: "${SMART_NAME_TIMEOUT:=25}"
+# Don't re-name a tab we already named more recently than this (seconds) unless
+# --force or the evidence changed. Tames churn on a busy pane.
+: "${SMART_NAME_COOLDOWN:=45}"
+# Max serialized evidence sent to the model. Bounded + sanitized before it goes.
+: "${SMART_NAME_EVIDENCE_CHARS:=4500}"
+
+# ---- attention.sh (honest waiting-reason signal engine + focus view) -------
+# An agent whose screen hasn't changed in this many seconds, with no permission
+# prompt up, is reported "stalled" rather than "working". Needs two runs to
+# fire (the first records a baseline).
+: "${HERDR_STALL_SECS:=90}"
+
 # ============================================================================
 #  End of your config — generic below.
 # ============================================================================
 export HERDR_DEFAULT_AGENT HERDR_SOURCE HERDR_SOCK HERDR_SORT_DONE_FIRST HERDR_SORT_NO_GH
 export HERDR_CODEX_DEEP HERDR_CODEX_STD HERDR_CODEX_FAST
+export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_MODEL SMART_NAME_TIMEOUT
+export SMART_NAME_COOLDOWN SMART_NAME_EVIDENCE_CHARS HERDR_STALL_SECS
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"
