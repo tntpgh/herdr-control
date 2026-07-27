@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Decision — form template</title>
+<style>
+  :root {
+    --ground:#eef2f2; --surface:#fff; --line:#c9d4d4; --ink:#10191c;
+    --ink-2:#3d4e53; --accent:#1f6e7e; --accent-soft:#e2eef0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --ground:#0c1316; --surface:#131e22; --line:#2c3b41; --ink:#e6edee;
+            --ink-2:#a9bcc1; --accent:#58b6c8; --accent-soft:#12323a; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--ground); color:var(--ink);
+         font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:40px 24px 120px; }
+  h1 { font-size:24px; margin:0 0 6px; letter-spacing:-.01em; }
+  .sub { color:var(--ink-2); margin:0 0 28px; }
+  fieldset { border:1px solid var(--line); border-radius:6px; background:var(--surface);
+             padding:18px 20px; margin:0 0 18px; }
+  legend { font:600 12px system-ui; letter-spacing:.12em; text-transform:uppercase;
+           color:var(--ink-2); padding:0 6px; }
+  label.opt { display:flex; gap:10px; align-items:flex-start; padding:10px 12px;
+              border:1px solid var(--line); border-radius:5px; margin-top:10px;
+              cursor:pointer; background:var(--ground); }
+  label.opt:hover { border-color:var(--accent); }
+  label.opt input { margin-top:3px; accent-color:var(--accent); }
+  label.opt input:checked ~ span { color:var(--ink); }
+  label.opt:has(input:checked) { border-color:var(--accent); background:var(--accent-soft); }
+  .hint { display:block; color:var(--ink-2); font-size:13.5px; margin-top:3px; }
+  textarea { width:100%; min-height:90px; padding:10px 12px; border-radius:5px;
+             border:1px solid var(--line); background:var(--ground); color:var(--ink);
+             font:14px/1.5 system-ui; resize:vertical; }
+  .bar { position:fixed; left:0; right:0; bottom:0; padding:14px 24px;
+         background:var(--surface); border-top:1px solid var(--line);
+         display:flex; gap:12px; justify-content:flex-end; align-items:center; }
+  button { font:600 14px system-ui; padding:10px 20px; border-radius:5px; cursor:pointer;
+           border:1px solid var(--accent); background:var(--accent); color:var(--ground); }
+  button:disabled { opacity:.5; cursor:default; }
+  button.ghost { background:transparent; color:var(--ink-2); border-color:var(--line); }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Form template</h1>
+  <p class="sub">Copy this file, change the questions, serve it with
+    <code>formserve.py</code>. The only wiring you need is the
+    <code>submitAnswers()</code> call at the bottom.</p>
+
+  <form id="f">
+    <fieldset>
+      <legend>A choice</legend>
+      <label class="opt">
+        <input type="radio" name="choice" value="option_a" required>
+        <span><b>Option A</b><span class="hint">What picking this means, and what it costs.</span></span>
+      </label>
+      <label class="opt">
+        <input type="radio" name="choice" value="option_b">
+        <span><b>Option B</b><span class="hint">The alternative, and its trade-off.</span></span>
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Confirmations</legend>
+      <label class="opt">
+        <input type="checkbox" name="confirmed">
+        <span><b>I have read the trade-off above</b></span>
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Anything else</legend>
+      <textarea name="notes" placeholder="Optional notes back to the agent…"></textarea>
+    </fieldset>
+  </form>
+</main>
+
+<div class="bar">
+  <button type="button" class="ghost" id="cancel">Send nothing</button>
+  <button type="submit" form="f" id="send">Send answers</button>
+</div>
+
+<script>
+  // The whole contract: gather whatever shape you want, call submitAnswers().
+  // formserve.py injects that function; it POSTs to /submit, disables the form,
+  // and shows a confirmation. The agent gets this object as JSON on stdout.
+  document.getElementById("f").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var fd = new FormData(e.target);
+    window.submitAnswers({
+      choice: fd.get("choice"),
+      confirmed: fd.get("confirmed") === "on",
+      notes: (fd.get("notes") || "").trim(),
+    });
+  });
+
+  document.getElementById("cancel").addEventListener("click", function () {
+    window.submitAnswers({ cancelled: true });
+  });
+</script>
+</body>
+</html>
