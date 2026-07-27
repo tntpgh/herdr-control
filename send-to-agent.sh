@@ -102,8 +102,13 @@ if [ "$force" -eq 0 ]; then
   fi
 fi
 
-herdr agent send "$pane" "$text" >/dev/null 2>&1 || {
-  echo "ERROR: 'herdr agent send $pane' failed — pane target valid? socket allowlisted?" >&2
+# `herdr agent send` DOES NOT EXIST — the agent verbs are list/get/read/
+# send-keys/prompt/rename/focus/wait/attach. This call therefore failed on EVERY
+# invocation, which silently killed the Slack->herdr reply path: a choice tapped
+# in Slack never reached the pane. Use the pane API, which the Enter loop below
+# already uses, so the whole script speaks one interface.
+herdr pane send-text "$pane" "$text" >/dev/null 2>&1 || {
+  echo "ERROR: 'herdr pane send-text $pane' failed — pane target valid? socket allowlisted?" >&2
   exit 2
 }
 
