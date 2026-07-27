@@ -131,6 +131,48 @@ except Exception:
 ' 2>/dev/null
 }
 
+# The plugin CLI attaches to a running daemon by reading daemon.json out of its
+# STATE dir. Without HERDR_PLUGIN_STATE_DIR it cannot find the daemon that backs
+# the pane, so it silently starts a THROWAWAY daemon plus a headless Chrome,
+# drives that instead, and still returns ok/navigated with the correct page title
+# — while the pane never moves. (The throwaway is short-lived: its pid changes
+# between calls, so it is a wrong-target bug, not a process leak.) herdr sets
+# this env when it launches plugin commands; we invoke the CLI directly, so we
+# must set it ourselves.
+#
+# herdr does not expose the state dir (plugin list carries plugin_root only), so
+# derive it from the XDG convention the plugin itself uses.
+browser_env() {
+  local root; root="$(browser_root)" || return 1
+  printf 'HERDR_PLUGIN_ID=%s\n' "$BROWSER_PLUGIN"
+  printf 'HERDR_PLUGIN_ROOT=%s\n' "$root"
+  printf 'HERDR_PLUGIN_STATE_DIR=%s/herdr/plugins/%s\n' \
+    "${XDG_STATE_HOME:-$HOME/.local/state}" "$BROWSER_PLUGIN"
+}
+
+browser_cli() {                         # run the plugin CLI against the REAL daemon
+  local root; root="$(browser_root)" || return 1
+  local state="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/$BROWSER_PLUGIN"
+  ( cd "$root" && HERDR_PLUGIN_ID="$BROWSER_PLUGIN" HERDR_PLUGIN_ROOT="$root" \
+      HERDR_PLUGIN_STATE_DIR="$state" bun run src/cli.ts "$@" )
+}
+
+# The URL the pane's view is actually showing — the only honest confirmation that
+# a navigation landed. `open` reports navigated:true even when it drove some
+# other browser entirely.
+pane_view_url() {
+  browser_cli views 2>/dev/null | python3 -c '
+import json, sys
+try:
+    views = json.load(sys.stdin).get("views") or []
+except Exception:
+    sys.exit(1)
+if not views:
+    sys.exit(1)
+print(views[0].get("url") or "")
+' 2>/dev/null
+}
+
 # ── actions ─────────────────────────────────────────────────────────────────
 do_open() {
   local profile; profile="$(display_profile)"
@@ -148,39 +190,25 @@ do_open() {
   fi
 }
 
-# Is the pane's browser view registered with the daemon? `views` lists only views
-# backed by a VISIBLE plugin pane, so a pane that herdr has never actually drawn
-# (its workspace not on screen on any client) registers nothing.
-#
-# This matters because `cli.ts open` still succeeds in that state — it drives the
-# daemon's own page instead, reports ok/navigated, and the pane keeps showing
-# about:blank. A command that reports success while changing nothing on screen is
-# worse than one that fails, so check first and say so.
-view_count() {
-  local root; root="$(browser_root)" || { printf '0'; return; }
-  bun run "$root/src/cli.ts" views 2>/dev/null | python3 -c '
-import json, sys
-try:
-    print(len((json.load(sys.stdin).get("views") or [])))
-except Exception:
-    print(0)
-' 2>/dev/null || printf '0'
-}
-
 do_url() {
   local url="${1:-}"
   [ -n "$url" ] || die "url: needs a URL"
-  do_open
-  local root; root="$(browser_root)" || die "browser plugin not installed"
   command -v bun >/dev/null 2>&1 || die "bun not on PATH (the browser CLI needs it)"
+  browser_root >/dev/null || die "browser plugin not installed"
+  do_open
 
-  if [ "$(view_count)" = "0" ]; then
-    note "WARNING: the browser pane has no registered view, so this navigation"
-    note "         will NOT appear in the pane — it drives the daemon's own page."
-    note "         herdr registers a view only for a pane it has actually drawn:"
-    note "         bring the workspace on screen once, then re-run."
+  browser_cli open "$url" >/dev/null 2>&1
+
+  # Confirm against the pane's own view rather than trusting the exit status.
+  # `open` returns ok/navigated even when it drove a different browser, which is
+  # precisely how this went unnoticed the first time.
+  local landed; landed="$(pane_view_url)"
+  if [ -z "$landed" ]; then
+    note "navigation reported success but the pane has NO registered view —"
+    note "the page is not on screen. Check: herdr plugin pane open ... browser"
+    return 1
   fi
-  bun run "$root/src/cli.ts" open "$url" 2>&1 | tail -6
+  printf '%s\n' "$landed"
 }
 
 do_close() {
