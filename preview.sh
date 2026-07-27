@@ -208,6 +208,28 @@ do_url() {
     note "the page is not on screen. Check: herdr plugin pane open ... browser"
     return 1
   fi
+
+  # ...and the right URL is still not proof the page RENDERED. This browser runs
+  # its own Chrome profile with no logins, so anything behind a session — a
+  # private claude.ai artifact, a dashboard, an authed preview — returns a
+  # not-found/sign-in page at exactly the URL you asked for. Read the text back.
+  local body; body="$(browser_cli text 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print((json.load(sys.stdin).get("text") or "")[:400])
+except Exception:
+    pass
+' 2>/dev/null)"
+  case "$body" in
+    "Page not found"*|*"Sign in"*|*"Log in to continue"*|"")
+      note "loaded $landed"
+      note "but the page looks EMPTY or gated: ${body:0:60}"
+      note "this browser has its own Chrome profile and no sessions. For anything"
+      note "behind a login, sign in once inside the pane — the profile persists at"
+      note "  ${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/$BROWSER_PLUGIN/chrome-profiles/"
+      note "For a local file, pass a file:// URL instead."
+      ;;
+  esac
   printf '%s\n' "$landed"
 }
 
