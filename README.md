@@ -6,8 +6,10 @@ coding agents — instead of just the messages inside it:
 
 - **route** an agent session into its own tab of the right project's workspace,
 - **open** a project's workspace on demand (reuse it if it's already open),
-- **sort** a space's tabs by the state of the branch each one is on, and
-- **colour** a tab by what it needs from you.
+- **sort** a space's tabs by the state of the branch each one is on,
+- **colour** a tab by what it needs from you,
+- **name** each tab after the task its dominant pane is actually doing, and
+- **surface** the one agent that needs you next, with an honest waiting-reason.
 
 They're plain `bash` + `python3` over herdr's control socket. No install step,
 no framework — clone, edit one config file, run.
@@ -85,6 +87,15 @@ overridable as an environment variable per run.
 
 # Colour: assert a tab's status (+ optional badge)
 ./mark-tab.sh w2:t3 waiting "merge decision?"
+
+# Name: rename tabs after the work their dominant pane is doing
+./smart-name.sh                                  # the focused tab
+./smart-name.sh --all --dry-run                  # every tab, show the plan
+./smart-name.sh --no-ai --all                    # deterministic names only, no model
+
+# Surface: honest per-agent waiting-reason + "what needs me next"
+./attention.sh --focus                           # the one thing to look at next
+./attention.sh --dry-run                          # classify every agent, change nothing
 ```
 
 ### Sort ranking (top → bottom, attention-first)
@@ -110,6 +121,62 @@ key = "prefix+shift+o"          # ctrl+b then shift+O
 type = "shell"                  # runs detached; sort needs no TTY
 command = "bash /path/to/herdr-layout/sort-tabs.sh --all"
 ```
+
+## Name tabs by their work, and see who needs you (`smart-name.sh` + `attention.sh`)
+
+Two tabs both reading "Main" tell you nothing. These give a tab a name that says
+what it's *for*, and give the sidebar an honest read on which agent is stuck.
+
+**`smart-name.sh` — tabs that say what the work is.** It looks at a tab's
+dominant pane (focused agent → any agent → focused command → first pane) and
+renames the tab to a 2–4 word task label. Known processes are named instantly
+with no model call — `Run Tests`, `Dev Server`, `View Logs`, `Remote Shell`,
+`Database Shell`. An agent doing ambiguous work is summarised by a cheap model.
+The idea is from [iurysza/herdr-tab-smart-rename](https://github.com/iurysza/herdr-tab-smart-rename);
+this is a pure-bash, Claude-native take — no Bun, no plugin.
+
+- **Manual names win.** A tab is only renamed when its label is a herdr
+  auto-name (`Main` / a number) or a name *this tool* set last time. A name you
+  typed is never touched — `--force` overrides, `--reset` hands a tab back.
+- **The model is a bare summariser, not an agent.** `claude -p` is normally a
+  full Claude Code agent that would read the *launcher's* project and name the
+  tab after the wrong repo. smart-name strips it back with `--system-prompt`,
+  `--setting-sources ""`, no tools, no MCP, run from an empty dir — so the label
+  comes only from the target pane's screen. Set `SMART_NAME_AI=0` for
+  deterministic-only (no key, no network, no cost); `SMART_NAME_MODEL` picks the
+  model (default `haiku` — naming is trivial).
+- **Untrusted by construction.** The pane scrape is sanitized (ANSI stripped,
+  `$HOME` folded, common secret shapes redacted, capped) and the prompt tells
+  the model the context is evidence, never instructions.
+
+**`attention.sh` — an honest waiting-reason, and one next action.** For every
+agent pane it publishes a `$status` sidebar token and (where herdr has no real
+status of its own) sets the tab colour, classified with strict precedence:
+
+| reason | meaning |
+|---|---|
+| `permission` | a numbered prompt is on screen — answer it now |
+| `waiting` | screen unchanged past `HERDR_STALL_SECS`, no prompt (sub-reason: `waiting for input` / `stalled Ns`) |
+| `working` | screen changed since the last pass |
+| `idle` | not an agent / a quiet shell |
+
+Its doctrine, borrowed from [caioniehues/herdmates](https://github.com/caioniehues/herdmates),
+is **never show a wrong reason** — when a state isn't clear it degrades to a
+plain `waiting` rather than guessing. A live agent's own status hook always wins
+the colour; the token is display-only and always safe. `--focus` prints the
+single most-urgent agent, then the short queue behind it — the "what do I look at
+next" view, in one line.
+
+**Sidebar + keys.** The `$task` and `$status` tokens only render if you tell the
+sidebar about them. Merge [`docs/herdr-config-snippet.toml`](docs/herdr-config-snippet.toml)
+into `~/.config/herdr/config.toml` (`herdr server reload-config`) — it adds the
+agent-card rows and binds `prefix+t` (name this tab), `prefix+alt+t` (name all),
+and `prefix+a` (the focus popup). Invalid token names fail *silently* (reload
+reports `partial`); if a row never appears, run `herdr config check`.
+
+Both are cheap to run on a timer. A herdr `type = "shell"` keybinding, a `loop`,
+or a cron that calls `attention.sh` every minute keeps the sidebar honest without
+a daemon.
 
 ## Answer agents from Slack (optional, two-way)
 
@@ -156,6 +223,8 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `spawn-task.sh` | worktree as a sub-tab, launched at the job-class's model |
 | `sort-tabs.sh` | reorder tabs by branch state |
 | `mark-tab.sh` | set a tab's status/colour + badge |
+| `smart-name.sh` | rename tabs after the task their dominant pane is doing |
+| `attention.sh` | honest per-agent waiting-reason + `--focus` next-action view |
 | `herdr-deliver.sh` | deliver+submit a message to an agent (or `--blocked`) |
 | `send-to-agent.sh` | robust type+submit into a pane (delivery primitive) |
 | `herdr-select.sh` | answer a numbered prompt by pressing that option's key |
@@ -172,6 +241,7 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `lib/pane-name.sh` | pane id → "Space — Tab", for alerts a human reads |
 | `lib/run-registry.sh` | central run/task registry — identity, lifecycle, events (see `docs/control-plane-design.md`) |
 | `docs/control-plane-design.md` | conductor/worker control-plane design — what's built vs. only designed |
+| `docs/herdr-config-snippet.toml` | sidebar rows + keybindings for the two tools above |
 | `slack-bridge/` | two-way Slack bot: outbound alerts + reply routing |
 | `herdr-rpc.py` | socket JSON-RPC for verbless methods (`tab.move`) |
 
