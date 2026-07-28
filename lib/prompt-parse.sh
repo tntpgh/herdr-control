@@ -66,6 +66,21 @@ prompt_context() {
     | cut -c1-200
 }
 
+# A stable fingerprint for "this exact prompt, right now" — the question plus
+# its options, hashed. Lets a wake event and a later answer agree on WHICH
+# prompt they mean: between a conductor deciding "press 2" and actually
+# pressing it, the prompt can vanish, the options can change, or the pane can
+# now belong to a different task entirely (time-of-check/time-of-use). A
+# caller that captured a prompt_id at decision time can pass it back at
+# injection time and refuse to act if it no longer matches, rather than
+# firing a stale decision into whatever the pane happens to show by then.
+prompt_id() {
+  local q opts
+  q="$(prompt_question "$1")"
+  opts="$(prompt_options "$1")"
+  printf '%s\n%s' "$q" "$opts" | shasum -a 256 | cut -d' ' -f1
+}
+
 prompt_question() {
   local win
   win=$(_prompt_window "$1") || return 1

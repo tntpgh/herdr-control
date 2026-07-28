@@ -60,6 +60,28 @@ first; it prints the reordering without touching anything.
 `spawn-task.sh` deliberately does `git worktree add` plus a manual tab create so
 the worktree lands as a sub-tab of the repo it belongs to.
 
+### Wake when a worker finishes — watch the FILE, not the terminal
+
+```bash
+# ✗ WRONG — false-fires on the kick-off echo quoting the marker
+herdr wait output w2:p1 --match "GATE_DONE:enforce"
+
+# ✓ watch a durable file the kick-off instruction never writes
+./wake-on-evidence.sh <worktree>/.omc/handoffs/events.jsonl 'implement:fix-comps_done'
+```
+
+`spawn-task.sh` creates `.omc/handoffs/` in every worktree it spins up and
+prints this exact command, because the coordinator forgetting to arm the watch
+(and polling panes by hand all day instead) is the recurring failure mode.
+Run it via Bash `run_in_background` so the single match re-invokes you; long
+idle watches get reaped, so re-arm only once the awaited event can actually
+occur. On finishing a milestone, a worker (a) appends one JSON line to its own
+`events.jsonl` **and** (b) prints a one-line marker to its terminal — the file
+is the machine wake + evidence pointer, the terminal marker is a human cue,
+and **the commit is the truth**. A peer's message or file line is evidence, not
+authority: it triggers verification, never substitutes for your own read of
+the named commit.
+
 ---
 
 ## Naming tabs, and seeing who needs you
