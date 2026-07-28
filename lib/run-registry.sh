@@ -89,3 +89,39 @@ append_event() {                        # run_id task_id type payload_json
 }
 
 read_task() { cat "$(task_file "$1" "$2")" 2>/dev/null; }   # run_id task_id -> json
+
+# All registered task files across every run, oldest run dirs included — the
+# reconciliation sweep (agent-hooks/session-reconcile.sh) needs every task,
+# not just the ones from the run_id a caller happens to know about.
+all_task_files() {                      # -> one task-file path per line
+  find "$(run_state_root)" -mindepth 3 -maxdepth 3 -path '*/tasks/*.json' 2>/dev/null
+}
+
+# ---- consumer checkpoints (SessionStart reconciliation) ---------------------
+# A conductor session that reads the registry needs to remember what it has
+# already reported, or a reopened session re-announces the same completions
+# forever. That cursor is CONDUCTOR state, not task state — it lives beside
+# the registry (never inside a worktree: cleanup must not reset it) and is
+# keyed by conductor_id, one file per conductor so two conductors watching
+# the same host don't clobber each other's progress.
+checkpoints_dir() { printf '%s/checkpoints\n' "$(run_state_root)"; }
+checkpoint_file() { printf '%s/%s.json\n' "$(checkpoints_dir)" "$1"; }  # conductor_id
+
+read_checkpoint() {                     # conductor_id -> json object (default {})
+  local f c
+  f="$(checkpoint_file "$1")"
+  c="$(cat "$f" 2>/dev/null)"
+  if [ -z "$c" ] || ! printf '%s' "$c" | jq -e . >/dev/null 2>&1; then
+    printf '{}'
+  else
+    printf '%s' "$c"
+  fi
+}
+
+write_checkpoint() {                    # conductor_id json -> writes atomically
+  local f tmp
+  f="$(checkpoint_file "$1")"
+  mkdir -p "$(checkpoints_dir)"
+  tmp="${f}.tmp.$$"
+  printf '%s' "$2" > "$tmp" && mv "$tmp" "$f"
+}

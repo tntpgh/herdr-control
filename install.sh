@@ -10,9 +10,11 @@
 #   ./install.sh --apply --bridge   # also install the launchd bridge daemon (macOS)
 #
 # What it registers in ~/.claude/settings.json:
-#   Notification -> agent-hooks/claude-notify.sh   alert you when an agent needs input
-#   PostToolUse  -> herdr-resolve.sh         retract alerts answered in the terminal
-#   Stop         -> herdr-resolve.sh         backstop for the same
+#   Notification -> agent-hooks/claude-notify.sh       alert you when an agent needs input
+#   PostToolUse  -> herdr-resolve.sh                   retract alerts answered in the terminal
+#   Stop         -> herdr-resolve.sh                   backstop for the same
+#   SessionStart -> agent-hooks/session-reconcile.sh   report task-state changes missed while
+#                                                       no conductor was watching (wake persistence)
 #
 # settings.json is EDITED IN PLACE, never replaced: it is a personal file that
 # routinely holds secrets and unrelated config, so this merges only the entries
@@ -48,16 +50,26 @@ here     = os.environ["HERE"]
 apply_   = os.environ["APPLY"] == "1"
 settings = os.environ["SETTINGS"]
 
-# (event, command to add, names that mean "this job is already wired").
+# (event, command to add, names that mean "this job is already wired", async).
 # The aliases matter: an existing install may call the same job through a
 # differently-named script — e.g. an APM-deployed herdr-ops, or the original
 # slack-notify.sh this hook was extracted from. Matching only our own filename
 # would add a SECOND hook doing the same work, so every alert would double.
+#
+# async=False ONLY for session-reconcile.sh: it must run to completion and
+# have its stdout captured BEFORE the session's first turn, so its
+# hookSpecificOutput.additionalContext actually lands in context — an async
+# ("defer hook execution") SessionStart hook's output is not guaranteed to
+# arrive in time, which would silently defeat the whole point of this hook.
+# Every other hook here fires mid-session and must never block the agent, so
+# those stay async=True.
 wanted = [
     ("Notification", f'bash {here}/agent-hooks/claude-notify.sh',
-        ("claude-notify.sh", "slack-notify.sh", "herdr-notify.sh")),
-    ("PostToolUse",  f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",)),
-    ("Stop",         f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",)),
+        ("claude-notify.sh", "slack-notify.sh", "herdr-notify.sh"), True),
+    ("PostToolUse",  f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",), True),
+    ("Stop",         f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",), True),
+    ("SessionStart", f'bash {here}/agent-hooks/session-reconcile.sh',
+        ("session-reconcile.sh",), False),
 ]
 
 with open(settings, encoding="utf-8") as f:
@@ -74,12 +86,12 @@ def existing(ev, aliases):
     return None
 
 todo = []
-for ev, cmd, aliases in wanted:
+for ev, cmd, aliases, is_async in wanted:
     have = existing(ev, aliases)
     if have:
         print(f"  = {ev:13s} already wired -> {have}")
     else:
-        todo.append((ev, cmd))
+        todo.append((ev, cmd, is_async))
         print(f"  + {ev:13s} {cmd}")
 
 if not todo:
@@ -94,12 +106,13 @@ stamp  = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 backup = f"{settings}.bak-herdr-{stamp}"
 shutil.copy2(settings, backup)
 
-for ev, cmd in todo:
+for ev, cmd, is_async in todo:
+    timeout = 10 if is_async else 20   # sync path shells out to `herdr pane list`
     hooks.setdefault(ev, []).append(collections.OrderedDict([
         ("matcher", ""),
         ("hooks", [collections.OrderedDict([
             ("type", "command"), ("command", cmd),
-            ("timeout", 10), ("async", True)])]),
+            ("timeout", timeout), ("async", is_async)])]),
     ]))
 
 tmp = settings + ".tmp-herdr"

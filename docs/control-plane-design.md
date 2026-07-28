@@ -44,14 +44,19 @@ control plane — see "Designed, not built" for the rest.
 | Task identity at spawn | `spawn-task.sh` | Generates `run_id`/`task_id`/`worker_id`/`conductor_id`, records the worker pane's `terminal_id` as a birth fingerprint, registers the task, stamps all five identities (plus `HERDR_TASK_LABEL`) into the worker's own shell env, transitions `starting`→`running` |
 | Push wake (Edge 1) | `agent-hooks/claude-notify.sh` | On an alert-worthy Notification event, if the worker was stamped with a conductor pane, sends a `[HERDR-PEER-SIGNAL]`-prefixed message naming the worker/pane/task and a `prompt_id`, via `send-to-agent.sh` — gated on `pane_is_agent` first (send-to-agent.sh does not enforce that itself), transitions the task to `blocked`, appends an `input_required` event to the central registry |
 | TOCTOU-safe answering (Edge 3 hardening) | `lib/prompt-parse.sh` (`prompt_id`), `herdr-select.sh` (`--expect-prompt-id`) | A stable hash of the current question+options; `herdr-select.sh` optionally revalidates it immediately before pressing anything and refuses if the prompt has changed since the id was captured. Backward compatible — omit the flag and behavior is unchanged. |
+| Wake persistence (SessionStart reconciliation) | `agent-hooks/session-reconcile.sh`, `lib/run-registry.sh` (`all_task_files`, `read_checkpoint`/`write_checkpoint`) | Runs on every conductor `SessionStart`: (a) reconciliation sweep — any task still `starting`/`running`/`blocked` whose registered pane no longer exists, or whose live `terminal_id` no longer matches the `pane_birth` fingerprint recorded at spawn, is transitioned to `lost`; (b) reports every task now in a terminal state (`completed`/`failed`/`blocked`/`lost`/`cancelled`) that a per-conductor checkpoint hasn't already shown, then updates that checkpoint. The checkpoint lives under the registry dir (`~/.local/state/herdr/runs/checkpoints/<conductor_id>.json`), never in a repo. Wired via `install.sh` as a synchronous (`async:false`) `SessionStart` hook — the only one that must NOT be async, since its `hookSpecificOutput.additionalContext` needs to land before the session's first turn. |
 
-All four were tested live against real herdr panes (not just `bash -n`):
+All five were tested live against real herdr panes (not just `bash -n`):
 `sort-tabs.sh` against a scratch workspace with a genuine agent-recognized
 pane and a bare shell; the full spawn→register→push-wake→blocked-state→event
 chain against a scratch conductor pane and a real worktree spawn (cleaned up
 after); `--expect-prompt-id` against both a matching and a deliberately wrong
 id; the agent-pane gate against a bare shell conductor pane (confirmed: no
-text delivered, nothing executed).
+text delivered, nothing executed); `session-reconcile.sh` against a
+hand-registered fake task marked `completed` (reported exactly once, silent on
+a second run) and a fake task marked `running` against a `pane_id`/`pane_birth`
+pair absent from a live `herdr pane list` (transitioned to `lost` and reported
+exactly once) — see this PR's description for the exact commands run.
 
 ### What was deliberately left alone
 
@@ -79,16 +84,21 @@ text delivered, nothing executed).
 
 The review's numbered corrections, as a roadmap. None of this exists in code.
 
-### 1 — Push does not replace polling; it's push + reconciliation
+### 1 — Push does not replace polling; it's push + reconciliation (partially built)
 
 > "push for responsiveness + periodic reconciliation for correctness" — push
 > alone cannot detect a crashed worker, a dead hook, a wedged worker that
 > never emits an input-needed event, a tmux restart, or laptop sleep.
 
-`wait-for-blocked.sh`-style polling is not a stopgap to delete once push
-works. Needed: a reconciliation sweep — inspect registered panes, expire
-leases, detect missed events, rebuild conductor state after a restart — on
-some interval, independent of whether push fired. Not built.
+Built: `agent-hooks/session-reconcile.sh` runs the reconciliation sweep
+described here — inspects every registered task's pane against the live
+`herdr pane list`, transitions anything whose pane is gone or recycled to
+`lost`, and rebuilds what the conductor gets told after a restart via the
+per-conductor checkpoint. **Not built**: it only runs on `SessionStart`, not
+"on some interval" — a conductor that stays open for hours without restarting
+gets no reconciliation until it does. No leases, no expiry independent of a
+session boundary. `wait-for-blocked.sh`-style interval polling inside a live
+session remains undone.
 
 ### 2 — Identity and lifecycle (CRITICAL — partially built)
 
@@ -100,13 +110,18 @@ some interval, independent of whether push fired. Not built.
 > "complete", and "pane exists" must never be conflated.
 
 Built: the five-way identity tuple, the birth fingerprint (`terminal_id`),
-and `starting`/`running`/`blocked` transitions via `set_task_state`. **Not
-built**: `completed`/`failed`/`cancelled`/`lost` as real terminal states with
-enforced transition rules, a `created` pre-registration state, or anything
-that revalidates a pane's fingerprint before acting on it (registration
-records the fingerprint; nothing currently re-checks it against the live
-pane before a wake or answer, which is exactly the reuse scenario the
-correction warns about).
+`starting`/`running`/`blocked` transitions via `set_task_state`, and now a
+real `lost` terminal state — `agent-hooks/session-reconcile.sh` revalidates
+every non-terminal task's `pane_id`/`pane_birth` against a live `herdr pane
+list` and transitions to `lost` on a mismatch or missing pane. **Not built**:
+`completed`/`failed`/`cancelled` are used by convention (a worker or operator
+sets them) but have no enforced transition-rule table (nothing stops
+`completed` -> `running`, for instance), there is still no `created`
+pre-registration state, and the fingerprint revalidation that now happens at
+`SessionStart` does NOT happen before a push wake or an answer is delivered
+mid-session — `claude-notify.sh` and `herdr-select.sh` still act on a pane id
+without re-checking its birth first. The reuse scenario the correction warns
+about is closed for the reconciliation path, not the live-delivery path.
 
 ### 3 — Control-plane state does not belong in the worker repo (built for the NEW state; not retrofitted)
 
@@ -115,10 +130,13 @@ correction warns about).
 > repos instead of one authoritative inbox.
 
 Built: `lib/run-registry.sh` puts task identity and lifecycle events under
-`~/.local/state/herdr/runs/<run_id>/`, not in any worktree. **Not built**:
-migrating or unifying the existing `.omc/handoffs/events.jsonl` completion
-channel into the same store — a worker's completion evidence and its
-lifecycle state currently live in two different places.
+`~/.local/state/herdr/runs/<run_id>/`, not in any worktree — and now the
+consumer checkpoint that reads that state also lives there
+(`~/.local/state/herdr/runs/checkpoints/<conductor_id>.json`), not in a repo,
+so a worktree cleanup can't reset what a conductor has already been shown.
+**Not built**: migrating or unifying the existing `.omc/handoffs/events.jsonl`
+completion channel into the same store — a worker's completion evidence and
+its lifecycle state currently live in two different places.
 
 ### 4 — JSONL is durable, not reliable
 
@@ -132,11 +150,19 @@ lifecycle state currently live in two different places.
 (one `events.jsonl` per `run_id`, `event_id` = `<run_id>_<sequence>`) but
 **explicitly not** the rest: writes are not atomic (no lock, no
 temp-file+rename), sequence numbers are count-then-append (not a real
-monotonic counter under concurrent writers), and there is no consumer
-checkpoint or dedup — a conductor restarting today has no way to know which
-events it already saw. This is the known weakest part of what got built;
-treat every number in the file above as "good enough for one worker being
-watched synchronously," not as a queue a fleet can trust.
+monotonic counter under concurrent writers). This is the known weakest part
+of what got built; treat every number in the file above as "good enough for
+one worker being watched synchronously," not as a queue a fleet can trust.
+
+**Partially built**: a consumer checkpoint now exists
+(`read_checkpoint`/`write_checkpoint`), but it is a checkpoint over **task
+state** (`task_id` -> last-reported `state`+`updated_at`), not over the
+**event stream** — a restarting conductor now knows which task-state
+transitions it has already been shown, but nothing dedups or checkpoints
+`events.jsonl` itself line-by-line. A task that changes state twice between
+two reconciliation runs is reported once (its latest state), with the
+intermediate transition never surfaced — correct for "tell me what changed,"
+not sufficient for "replay every event exactly once."
 
 ### 5 — Prompt answering has a TOCTOU race (partially built)
 

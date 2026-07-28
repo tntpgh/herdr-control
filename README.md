@@ -48,6 +48,7 @@ in `~/.claude/settings.json`. `install.sh` registers three hooks:
 | `Notification` | `agent-hooks/claude-notify.sh` | alert you when an agent needs input |
 | `PostToolUse` | `herdr-resolve.sh` | retract alerts you answered in the terminal |
 | `Stop` | `herdr-resolve.sh` | backstop for the same |
+| `SessionStart` | `agent-hooks/session-reconcile.sh` | report task-state changes missed while no conductor was watching, and detect `lost` tasks — see below |
 
 It **edits `settings.json` in place and never replaces it** — that file is
 personal and routinely holds secrets and unrelated config. It merges only the
@@ -111,6 +112,27 @@ type = "shell"                  # runs detached; sort needs no TTY
 command = "bash /path/to/herdr-layout/sort-tabs.sh --all"
 ```
 
+## Wake persistence across conductor sessions
+
+`spawn-task.sh` registers every task in a durable run registry
+(`lib/run-registry.sh`, under `~/.local/state/herdr/runs/`) and
+`agent-hooks/claude-notify.sh` pushes a wake to the conductor pane the moment a
+worker needs input. But push only works while the conductor session that
+spawned the worker is still running — close that session and its background
+`wake-on-evidence.sh` poller dies with it, so a reopened session starts blind
+to anything that happened in the meantime.
+
+`agent-hooks/session-reconcile.sh` (wired as a `SessionStart` hook) is the
+fix: on every session start it reads the registry and reports every task whose
+state changed to `completed` / `failed` / `blocked` / `lost` since *this
+conductor* last checked in — a checkpoint stored beside the registry, not in
+any repo, so a worktree cleanup can't reset it and a reported task is never
+re-announced. It also does the reconciliation half of "push + reconciliation":
+a task still `starting`/`running`/`blocked` whose registered pane no longer
+exists, or whose live `terminal_id` no longer matches the fingerprint recorded
+at spawn (pane ids get recycled), is marked `lost` rather than silently
+staying "running" forever.
+
 ## Answer agents from Slack (optional, two-way)
 
 `herdr-deliver.sh` delivers a message to an agent (or `--blocked` = the one that's
@@ -163,6 +185,7 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `wake-on-evidence.sh` | poll a peer's `.omc/handoffs/events.jsonl` for a marker, then wake |
 | `install.sh` | wire the hooks into Claude Code (idempotent, dry-run by default) |
 | `agent-hooks/claude-notify.sh` | the `Notification` hook that raises the alert |
+| `agent-hooks/session-reconcile.sh` | the `SessionStart` hook: reconcile the run registry (detect `lost` tasks) and report state changes missed since this conductor last checked in |
 | | *(named `agent-hooks/`, not `hooks/`, on purpose — see below)* |
 | `settings.example.json` | the hook wiring alone, with placeholders — merge, don't copy |
 | `SKILL.md` | what the tools do, and why several of them refuse things |
