@@ -75,6 +75,8 @@ root=$(git -C "$proj" rev-parse --show-toplevel 2>/dev/null || (cd "$proj" && pw
 [ -d "$root/.git" ] || git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || { echo "spawn-task: not a git repo: $root" >&2; exit 1; }
 wt="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$root")/${branch}"
 label="${job}:${branch}"
+events_file="$wt/.omc/handoffs/events.jsonl"
+wake_pattern="${label}_done"
 
 if [ "$dry" = 1 ]; then
   echo "spawn-task (dry-run):"
@@ -83,6 +85,7 @@ if [ "$dry" = 1 ]; then
   echo "  workspace : $(bash "$here/ensure-workspace.sh" --no-focus "$root" 2>/dev/null || echo '<would create>')"
   echo "  tab label : $label"
   echo "  launch    : $cli"
+  echo "  wake      : $here/wake-on-evidence.sh $events_file '$wake_pattern'"
   exit 0
 fi
 
@@ -94,6 +97,15 @@ elif git -C "$root" show-ref --verify --quiet "refs/heads/${branch}"; then
 else
   git -C "$root" worktree add -b "$branch" "$wt" ${base:+"$base"} >/dev/null 2>&1 || { echo "spawn-task: worktree add -b failed" >&2; exit 1; }
 fi
+
+# ---- coordination scaffold --------------------------------------------------
+# The herdr-ops protocol: a worker appends its completion event to its own
+# .omc/handoffs/events.jsonl; the conductor watches that FILE via
+# wake-on-evidence.sh (never `wait output --match`, which false-fires on the
+# kick-off echo quoting the marker). That only works if the directory exists
+# and the conductor remembers the exact command — both silently fall on the
+# orchestrator otherwise, which is how a whole day gets spent polling panes.
+mkdir -p "$(dirname "$events_file")"
 
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
 ws=$(bash "$here/ensure-workspace.sh" --no-focus "$root") || exit 1
@@ -108,3 +120,6 @@ herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --stat
 
 printf 'spawned %-22s ws=%s tab=%s pane=%s\n' "$label" "$ws" "$tab" "$pane"
 printf '  worktree: %s\n  launch:   %s\n' "$wt" "$cli"
+printf '  wake:     %s %s '"'"'%s'"'"'\n' "$here/wake-on-evidence.sh" "$events_file" "$wake_pattern"
+printf '  worker on completion appends to %s, e.g.:\n' "$events_file"
+printf '    {"event":"%s", ...}\n' "$wake_pattern"

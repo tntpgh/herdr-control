@@ -19,25 +19,48 @@
 #   sort-tabs.sh                 # the focused workspace
 #   sort-tabs.sh w2 --mark       # w2, and recolor tabs by state
 #   sort-tabs.sh --all --dry-run # show the plan for every workspace, move nothing
+#   sort-tabs.sh --all --yes     # every workspace, for real (--all otherwise refuses)
+#
+# --mark only recolors a tab whose pane is actually running an agent (detected
+# via lib/pane-guard.sh's process check, the same gate herdr-select.sh and
+# herdr-deliver.sh use). A bare shell prompt is left untouched rather than
+# asserted idle/done over — a shell was never doing anything, so "idle" is not
+# an observation, it's a guess. --all reaches into EVERY workspace, not just
+# the focused one, so it refuses to act (dry-run print of scope only) unless
+# --yes or --dry-run is also given.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/config.sh"
+. "$here/lib/pane-guard.sh"
 
-ws_arg=""; do_all=0; do_mark=0; dry=0
+ws_arg=""; do_all=0; do_mark=0; dry=0; confirmed=0
 for a in "$@"; do
   case "$a" in
     --all) do_all=1 ;;
     --mark) do_mark=1 ;;
     --dry-run|-n) dry=1 ;;
+    --yes|-y) confirmed=1 ;;
     w*) ws_arg="$a" ;;
     *) echo "sort-tabs: unknown arg '$a'" >&2; exit 1 ;;
   esac
 done
 
+if [ "$do_all" = 1 ] && [ "$dry" != 1 ] && [ "$confirmed" != 1 ]; then
+  echo "sort-tabs: --all reaches into EVERY workspace, not just the focused one:" >&2
+  herdr workspace list 2>/dev/null | jq -r '(.result.workspaces // .workspaces)[] | "  \(.workspace_id)  \(.label)"' >&2
+  echo "sort-tabs: pass --yes to act for real, or --dry-run to preview without acting." >&2
+  exit 1
+fi
+
 panes_json=$(herdr pane list 2>/dev/null) || { echo "sort-tabs: pane list failed" >&2; exit 1; }
 tab_cwd() {  # tab_id -> a representative cwd (first pane's foreground cwd)
   printf '%s' "$panes_json" | jq -r --arg t "$1" \
     '[(.result.panes // .panes)[] | select(.tab_id==$t)][0] | (.foreground_cwd // .cwd // "")'
+}
+
+tab_pane_id() {  # tab_id -> its first pane's pane_id (same pane mark-tab.sh would resolve to)
+  printf '%s' "$panes_json" | jq -r --arg t "$1" \
+    '[(.result.panes // .panes)[] | select(.tab_id==$t)][0] | (.pane_id // "")'
 }
 
 rank_state() {  # cwd -> "<rank> <state>"
@@ -63,7 +86,7 @@ rank_state() {  # cwd -> "<rank> <state>"
 }
 
 sort_one() {  # workspace_id
-  local ws="$1" tabs desired cur i tid rank state cwd lines sortflag
+  local ws="$1" tabs desired cur i tid rank state cwd lines sortflag pane marked skipped
   tabs=$(herdr tab list --workspace "$ws" 2>/dev/null | jq -r '(.result.tabs // .tabs)[].tab_id')
   [ -n "$tabs" ] || { echo "sort-tabs: no tabs in $ws"; return; }
 
@@ -100,16 +123,26 @@ sort_one() {  # workspace_id
     echo "  reordered $i tabs"
   fi
 
-  # Optional recolor by state.
+  # Optional recolor by state — but only for a tab whose pane is actually
+  # running an agent. herdr's agent_status is a claim about a process; a bare
+  # shell prompt has no process to make a claim about, so asserting "idle" or
+  # "done" over it is fabrication, not observation.
   if [ "$do_mark" = 1 ] && [ "$dry" != 1 ]; then
-    printf '%s' "$lines" | sed '/^$/d' | while IFS=$'\t' read -r rank tid state cwd; do
+    marked=0; skipped=0
+    while IFS=$'\t' read -r rank tid state cwd; do
+      [ -n "$tid" ] || continue
+      pane=$(tab_pane_id "$tid")
+      if [ -z "$pane" ] || ! pane_is_agent "$pane"; then
+        skipped=$((skipped+1))
+        continue
+      fi
       case "$state" in
-        waiting) bash "$here/mark-tab.sh" "$tid" waiting >/dev/null 2>&1 ;;
-        active)  bash "$here/mark-tab.sh" "$tid" active  >/dev/null 2>&1 ;;
-        committed|reviewed|merged) bash "$here/mark-tab.sh" "$tid" done >/dev/null 2>&1 ;;
+        waiting) bash "$here/mark-tab.sh" "$tid" waiting >/dev/null 2>&1 && marked=$((marked+1)) ;;
+        active)  bash "$here/mark-tab.sh" "$tid" active  >/dev/null 2>&1 && marked=$((marked+1)) ;;
+        committed|reviewed|merged) bash "$here/mark-tab.sh" "$tid" done >/dev/null 2>&1 && marked=$((marked+1)) ;;
       esac
-    done
-    echo "  recolored by state"
+    done < <(printf '%s' "$lines" | sed '/^$/d')
+    echo "  recolored $marked tab(s) hosting an agent; left $skipped agentless tab(s) untouched"
   fi
 }
 

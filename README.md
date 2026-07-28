@@ -160,6 +160,7 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `send-to-agent.sh` | robust type+submit into a pane (delivery primitive) |
 | `herdr-select.sh` | answer a numbered prompt by pressing that option's key |
 | `herdr-resolve.sh` | retract Slack alerts whose prompt was answered elsewhere |
+| `wake-on-evidence.sh` | poll a peer's `.omc/handoffs/events.jsonl` for a marker, then wake |
 | `install.sh` | wire the hooks into Claude Code (idempotent, dry-run by default) |
 | `agent-hooks/claude-notify.sh` | the `Notification` hook that raises the alert |
 | | *(named `agent-hooks/`, not `hooks/`, on purpose — see below)* |

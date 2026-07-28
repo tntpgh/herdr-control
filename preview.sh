@@ -102,7 +102,7 @@ sys.exit(1)
 ' 2>/dev/null
 }
 
-pane_is_open() {                        # $1 = pane label
+pane_id_for() {                         # $1 = pane label -> pane_id, or fail
   local ws; ws="$(current_workspace)" || return 1
   herdr pane list 2>/dev/null | python3 -c '
 import json, sys
@@ -112,13 +112,19 @@ try:
 except Exception:
     sys.exit(1)
 panes = (d.get("result") or {}).get("panes") or []
-sys.exit(0 if any((p.get("label") or "").lower() == label
-                  and p.get("workspace_id") == ws for p in panes) else 1)
+for p in panes:
+    if (p.get("label") or "").lower() == label and p.get("workspace_id") == ws:
+        print(p.get("pane_id") or "")
+        sys.exit(0)
+sys.exit(1)
 ' "$1" "$ws" 2>/dev/null
 }
 
+pane_is_open() { pane_id_for "$1" >/dev/null; }   # $1 = pane label
+
 browser_open() { pane_is_open "Browser"; }
 reviewr_open() { pane_is_open "reviewr"; }
+browser_pane_id() { pane_id_for "Browser"; }
 
 browser_root() {
   herdr plugin list --plugin "$BROWSER_PLUGIN" --json 2>/dev/null | python3 -c '
@@ -141,48 +147,102 @@ except Exception:
 # must set it ourselves.
 #
 # herdr does not expose the state dir (plugin list carries plugin_root only), so
-# derive it from the XDG convention the plugin itself uses.
-browser_env() {
+# derive it from the XDG convention the plugin itself uses (paths.ts).
+browser_state_dir() {
   local root; root="$(browser_root)" || return 1
-  printf 'HERDR_PLUGIN_ID=%s\n' "$BROWSER_PLUGIN"
-  printf 'HERDR_PLUGIN_ROOT=%s\n' "$root"
-  printf 'HERDR_PLUGIN_STATE_DIR=%s/herdr/plugins/%s\n' \
-    "${XDG_STATE_HOME:-$HOME/.local/state}" "$BROWSER_PLUGIN"
+  printf '%s/herdr/plugins/%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}" "$BROWSER_PLUGIN"
 }
 
 browser_cli() {                         # run the plugin CLI against the REAL daemon
-  local root; root="$(browser_root)" || return 1
-  local state="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/$BROWSER_PLUGIN"
+  local root state
+  root="$(browser_root)" || return 1
+  state="$(browser_state_dir)" || return 1
   ( cd "$root" && HERDR_PLUGIN_ID="$BROWSER_PLUGIN" HERDR_PLUGIN_ROOT="$root" \
       HERDR_PLUGIN_STATE_DIR="$state" bun run src/cli.ts "$@" )
 }
 
-# The URL the pane's view is actually showing — the only honest confirmation that
-# a navigation landed. `open` reports navigated:true even when it drove some
-# other browser entirely.
-pane_view_url() {
+# `cli.ts`'s daemon-state file (paths.ts: daemonStateFile) — a JSON blob with
+# the running daemon's own pid, written by whichever daemon last started. If
+# the process it names is dead, the file is stale: nothing is wrong with the
+# file itself, but trusting it without checking is exactly the mistake that
+# let the CLI drive a throwaway daemon while the real pane sat dead.
+browser_daemon_state_file() {
+  local dir; dir="$(browser_state_dir)" || return 1
+  printf '%s/daemon.json\n' "$dir"
+}
+
+# Is the daemon that daemon.json names actually alive? A missing file or a
+# dead pid both mean "no", which is the conservative direction: do_open then
+# treats the pane as needing a fresh spin-up instead of trusting a corpse.
+browser_daemon_alive() {
+  local f pid
+  f="$(browser_daemon_state_file)" || return 1
+  [ -f "$f" ] || return 1
+  pid=$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    p = d.get("pid")
+    print(int(p) if isinstance(p, int) else "")
+except Exception:
+    print("")
+' "$f" 2>/dev/null)
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+# The URL the pane's OWN view is actually showing — the only honest
+# confirmation that a navigation landed. `open` reports navigated:true even
+# when it drove some other browser entirely, and `cli.ts views` can return a
+# view belonging to a THROWAWAY daemon the CLI just spawned for this query
+# (e.g. because the real daemon was dead) — that view has pane_id null, which
+# means nothing is on screen. A view only counts when its pane_id is non-null
+# AND matches the pane WE opened; anything else is rejected, not guessed at.
+pane_view_url() {                       # $1 = our browser pane_id
+  local pane_id="$1"
+  [ -n "$pane_id" ] || return 1
   browser_cli views 2>/dev/null | python3 -c '
 import json, sys
+pane_id = sys.argv[1]
 try:
     views = json.load(sys.stdin).get("views") or []
 except Exception:
     sys.exit(1)
-if not views:
-    sys.exit(1)
-print(views[0].get("url") or "")
-' 2>/dev/null
+for v in views:
+    vp = v.get("pane_id")
+    if vp is not None and vp == pane_id:
+        print(v.get("url") or "")
+        sys.exit(0)
+sys.exit(1)
+' "$pane_id" 2>/dev/null
 }
 
 # ── actions ─────────────────────────────────────────────────────────────────
 do_open() {
-  local profile; profile="$(display_profile)"
+  local profile pid
+  profile="$(display_profile)"
   if [ "$profile" = "narrow" ] && reviewr_open; then
     note "narrow display — closing the reviewr sidebar to make room"
     herdr plugin action invoke close --plugin "$REVIEWR_PLUGIN" >/dev/null 2>&1 \
       || note "could not close reviewr (continuing)"
   fi
   if browser_open; then
-    herdr plugin pane focus --plugin "$BROWSER_PLUGIN" --entrypoint "$BROWSER_PANE" >/dev/null 2>&1
+    pid="$(browser_pane_id)"
+    if browser_daemon_alive; then
+      herdr plugin pane focus "$pid" >/dev/null 2>&1
+    else
+      # The pane is open but the daemon backing it is dead. viewer.ts does not
+      # reconnect on its own — it renders a static "Browser session ended"
+      # screen and gives up — so leaving the pane as-is here would let do_url
+      # drive a brand-new throwaway daemon (via ensureView) while this pane
+      # stays dead on screen. Close and reopen so a fresh viewer starts and
+      # heartbeats a real pane_id into the new daemon's view.
+      note "browser pane is open but its daemon is dead — reopening"
+      [ -n "$pid" ] && herdr plugin pane close "$pid" >/dev/null 2>&1
+      herdr plugin pane open --plugin "$BROWSER_PLUGIN" --entrypoint "$BROWSER_PANE" \
+        --placement split --direction right --focus >/dev/null 2>&1 \
+        || die "could not reopen the browser pane"
+    fi
   else
     herdr plugin pane open --plugin "$BROWSER_PLUGIN" --entrypoint "$BROWSER_PANE" \
       --placement split --direction right --focus >/dev/null 2>&1 \
@@ -197,15 +257,20 @@ do_url() {
   browser_root >/dev/null || die "browser plugin not installed"
   do_open
 
+  local pane_id; pane_id="$(browser_pane_id)"
+  [ -n "$pane_id" ] || die "browser pane did not open"
+
   browser_cli open "$url" >/dev/null 2>&1
 
-  # Confirm against the pane's own view rather than trusting the exit status.
-  # `open` returns ok/navigated even when it drove a different browser, which is
-  # precisely how this went unnoticed the first time.
-  local landed; landed="$(pane_view_url)"
+  # Confirm against OUR pane's own view rather than trusting the exit status
+  # or just any view in the list. `open` returns ok/navigated even when it
+  # drove a different browser entirely, and `views` can include a view with no
+  # pane (or someone else's pane) — see pane_view_url for why.
+  local landed; landed="$(pane_view_url "$pane_id")"
   if [ -z "$landed" ]; then
-    note "navigation reported success but the pane has NO registered view —"
-    note "the page is not on screen. Check: herdr plugin pane open ... browser"
+    note "navigation reported success but no view is registered against pane $pane_id —"
+    note "the page is not on screen (the CLI may have driven a different daemon)."
+    note "Check: herdr plugin pane open ... browser"
     return 1
   fi
 
@@ -234,9 +299,8 @@ except Exception:
 }
 
 do_close() {
-  browser_open || { note "browser pane is not open"; return 0; }
-  herdr plugin pane close --plugin "$BROWSER_PLUGIN" --entrypoint "$BROWSER_PANE" >/dev/null 2>&1 \
-    || die "could not close the browser pane"
+  local pid; pid="$(browser_pane_id)" || { note "browser pane is not open"; return 0; }
+  herdr plugin pane close "$pid" >/dev/null 2>&1 || die "could not close the browser pane"
   note "browser pane closed"
 }
 
