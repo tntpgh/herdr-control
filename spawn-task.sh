@@ -21,6 +21,7 @@
 set -uo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/config.sh"
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib/run-registry.sh"
 
 # ---- args ------------------------------------------------------------------
 base=""; dry=0; model_override=""; effort_override=""; positional=()
@@ -78,6 +79,23 @@ label="${job}:${branch}"
 events_file="$wt/.omc/handoffs/events.jsonl"
 wake_pattern="${label}_done"
 
+# ---- task identity (control-plane registration) -----------------------------
+# A bare pane_id is not a durable identity: herdr reuses pane ids once a pane
+# closes, so a delayed wake or answer can land on an unrelated future
+# process. Register a real identity — run/task/worker/conductor id plus the
+# worker pane's BIRTH fingerprint (herdr's terminal_id, unique per pane
+# instance, never reused) — in the CENTRAL run registry (lib/run-registry.sh),
+# not inside this worktree. See docs/control-plane-design.md.
+#
+# HERDR_RUN_ID lets a conductor group several spawn-task.sh calls under one
+# run (export it once per orchestration session); otherwise each spawn gets
+# its own run.
+run_id="${HERDR_RUN_ID:-$(gen_id run)}"
+task_id=$(gen_id task)
+worker_id=$(gen_id worker)
+conductor_pane_id="${HERDR_PANE_ID:-}"
+conductor_id="${HERDR_CONDUCTOR_ID:-conductor_${conductor_pane_id:-unknown}}"
+
 if [ "$dry" = 1 ]; then
   echo "spawn-task (dry-run):"
   echo "  repo      : $root"
@@ -86,6 +104,7 @@ if [ "$dry" = 1 ]; then
   echo "  tab label : $label"
   echo "  launch    : $cli"
   echo "  wake      : $here/wake-on-evidence.sh $events_file '$wake_pattern'"
+  echo "  registry  : run=$run_id task=$task_id conductor_pane=${conductor_pane_id:-<none — not running inside a herdr pane>}"
   exit 0
 fi
 
@@ -112,14 +131,26 @@ ws=$(bash "$here/ensure-workspace.sh" --no-focus "$root") || exit 1
 tc=$(herdr tab create --workspace "$ws" --cwd "$wt" --label "$label" --focus 2>/dev/null)
 tab=$(printf '%s' "$tc" | jq -r '.result.tab.tab_id // empty')
 pane=$(printf '%s' "$tc" | jq -r '.result.root_pane.pane_id // empty')
+pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 [ -n "$tab" ] && [ -n "$pane" ] || { echo "spawn-task: tab create failed in $ws" >&2; exit 1; }
 
+register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" \
+  "$pane" "$pane_birth" "$root" "$wt" "$label"
+
 # ---- launch the agent in the tab -------------------------------------------
-herdr pane run "$pane" "$cli" >/dev/null 2>&1 || { echo "spawn-task: launch failed: $cli" >&2; exit 1; }
+# Stamp identity into the worker's own shell so its hooks (agent-hooks/
+# claude-notify.sh) can push a wake to the conductor pane on input-needed,
+# and can log against the same run/task the conductor is watching.
+stamped_cli="export HERDR_RUN_ID='$run_id' HERDR_TASK_ID='$task_id' HERDR_WORKER_ID='$worker_id' HERDR_CONDUCTOR_ID='$conductor_id' HERDR_CONDUCTOR_PANE_ID='$conductor_pane_id' HERDR_TASK_LABEL='$label'; $cli"
+herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || { echo "spawn-task: launch failed: $cli" >&2; exit 1; }
 herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
+set_task_state "$run_id" "$task_id" "running"
 
 printf 'spawned %-22s ws=%s tab=%s pane=%s\n' "$label" "$ws" "$tab" "$pane"
 printf '  worktree: %s\n  launch:   %s\n' "$wt" "$cli"
 printf '  wake:     %s %s '"'"'%s'"'"'\n' "$here/wake-on-evidence.sh" "$events_file" "$wake_pattern"
 printf '  worker on completion appends to %s, e.g.:\n' "$events_file"
 printf '    {"event":"%s", ...}\n' "$wake_pattern"
+printf '  registry: %s\n' "$(task_file "$run_id" "$task_id")"
+printf '  conductor: %s%s\n' "${conductor_pane_id:-<none — spawned outside a herdr pane, no push wake>}" \
+  "${conductor_pane_id:+ (push wake wired if the worker hits an input-needed event)}"

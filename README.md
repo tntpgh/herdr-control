@@ -168,8 +168,10 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `SKILL.md` | what the tools do, and why several of them refuse things |
 | `AGENTS.md` | step-by-step activation for an agent to follow, with verification |
 | `lib/pane-guard.sh` | "is this pane safe to send input to?" — shared gate |
-| `lib/prompt-parse.sh` | read the options / context an agent is showing |
+| `lib/prompt-parse.sh` | read the options / context an agent is showing, plus `prompt_id` |
 | `lib/pane-name.sh` | pane id → "Space — Tab", for alerts a human reads |
+| `lib/run-registry.sh` | central run/task registry — identity, lifecycle, events (see `docs/control-plane-design.md`) |
+| `docs/control-plane-design.md` | conductor/worker control-plane design — what's built vs. only designed |
 | `slack-bridge/` | two-way Slack bot: outbound alerts + reply routing |
 | `herdr-rpc.py` | socket JSON-RPC for verbless methods (`tab.move`) |
 
