@@ -49,6 +49,7 @@ in `~/.claude/settings.json`. `install.sh` registers three hooks:
 | `PostToolUse` | `herdr-resolve.sh` | retract alerts you answered in the terminal |
 | `Stop` | `herdr-resolve.sh` | backstop for the same |
 | `SessionStart` | `agent-hooks/session-reconcile.sh` | report task-state changes missed while no conductor was watching, and detect `lost` tasks — see below |
+| `PostToolUse` | `agent-hooks/interval-reconcile.sh` | same sweep + report, throttled to run at most once per `HERDR_RECONCILE_INTERVAL_S` (default 300s) — the mid-session counterpart to `SessionStart`'s one-time pass |
 
 It **edits `settings.json` in place and never replaces it** — that file is
 personal and routinely holds secrets and unrelated config. It merges only the
@@ -122,16 +123,41 @@ spawned the worker is still running — close that session and its background
 `wake-on-evidence.sh` poller dies with it, so a reopened session starts blind
 to anything that happened in the meantime.
 
-`agent-hooks/session-reconcile.sh` (wired as a `SessionStart` hook) is the
-fix: on every session start it reads the registry and reports every task whose
-state changed to `completed` / `failed` / `blocked` / `lost` since *this
-conductor* last checked in — a checkpoint stored beside the registry, not in
-any repo, so a worktree cleanup can't reset it and a reported task is never
-re-announced. It also does the reconciliation half of "push + reconciliation":
-a task still `starting`/`running`/`blocked` whose registered pane no longer
-exists, or whose live `terminal_id` no longer matches the fingerprint recorded
-at spawn (pane ids get recycled), is marked `lost` rather than silently
-staying "running" forever.
+The shared sweep+report logic (`lib/reconcile.sh`) fixes that from two hooks:
+
+- **`agent-hooks/session-reconcile.sh`** (`SessionStart`, once per session) —
+  reports every task whose state changed to `completed` / `failed` /
+  `blocked` / `lost` since *this conductor* last checked in, via a checkpoint
+  stored beside the registry, not in any repo, so a worktree cleanup can't
+  reset it and a reported task is never re-announced.
+- **`agent-hooks/interval-reconcile.sh`** (`PostToolUse`, throttled) — the
+  same sweep + report, but running *during* a long-lived session instead of
+  only at its start, so a worker that goes `lost` or completes an hour into
+  an open session doesn't wait for the next restart to be noticed. Activity-
+  gated, not a real timer: an idle session with no tool calls gets no
+  reconciliation until its next tool call. Tune the interval with
+  `HERDR_RECONCILE_INTERVAL_S` (default 300s, in `config.sh`).
+
+Both do the reconciliation half of "push + reconciliation": a task still
+`starting`/`running`/`blocked` whose registered pane no longer exists, or
+whose live `terminal_id` no longer matches the fingerprint recorded at spawn
+(pane ids get recycled), is marked `lost` rather than silently staying
+"running" forever.
+
+### Pane-recycling is also closed on the delivery side
+
+Reconciliation catches a recycled pane on its own schedule; `claude-notify.sh`
+(push wake) and `herdr-select.sh` (answering a prompt) close the same gap
+*at the moment of delivery*, which is where it actually matters — pane ids
+free up and get reissued while a session is running, and a wake or a keypress
+aimed at a bare pane id can land in whatever unrelated process now holds that
+id. Both re-read the target pane's live `terminal_id` and compare it against
+the fingerprint the run registry recorded at spawn (the worker's own pane for
+`herdr-select.sh`, the conductor's pane — via `spawn-task.sh`'s new
+`conductor_pane_birth` — for `claude-notify.sh`), refusing on any mismatch.
+Enforced automatically whenever the pane is registered; a pane spawned outside
+the registry (e.g. `spawn-agent.sh`) has nothing to check against, so it's
+unaffected. See `lib/pane-guard.sh`'s `require_pane_birth_match`.
 
 ## Answer agents from Slack (optional, two-way)
 
@@ -186,14 +212,16 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `install.sh` | wire the hooks into Claude Code (idempotent, dry-run by default) |
 | `agent-hooks/claude-notify.sh` | the `Notification` hook that raises the alert |
 | `agent-hooks/session-reconcile.sh` | the `SessionStart` hook: reconcile the run registry (detect `lost` tasks) and report state changes missed since this conductor last checked in |
+| `agent-hooks/interval-reconcile.sh` | the throttled `PostToolUse` hook: same sweep + report, mid-session |
 | | *(named `agent-hooks/`, not `hooks/`, on purpose — see below)* |
 | `settings.example.json` | the hook wiring alone, with placeholders — merge, don't copy |
 | `SKILL.md` | what the tools do, and why several of them refuse things |
 | `AGENTS.md` | step-by-step activation for an agent to follow, with verification |
-| `lib/pane-guard.sh` | "is this pane safe to send input to?" — shared gate |
+| `lib/pane-guard.sh` | "is this pane safe to send input to?" — shared gate, plus `require_pane_birth_match` (recycled-pane refusal) |
 | `lib/prompt-parse.sh` | read the options / context an agent is showing, plus `prompt_id` |
 | `lib/pane-name.sh` | pane id → "Space — Tab", for alerts a human reads |
-| `lib/run-registry.sh` | central run/task registry — identity, lifecycle, events (see `docs/control-plane-design.md`) |
+| `lib/run-registry.sh` | central run/task registry — identity, lifecycle, events, checkpoints (see `docs/control-plane-design.md`) |
+| `lib/reconcile.sh` | the reconciliation sweep + report, shared by `session-reconcile.sh` and `interval-reconcile.sh` |
 | `docs/control-plane-design.md` | conductor/worker control-plane design — what's built vs. only designed |
 | `slack-bridge/` | two-way Slack bot: outbound alerts + reply routing |
 | `herdr-rpc.py` | socket JSON-RPC for verbless methods (`tab.move`) |

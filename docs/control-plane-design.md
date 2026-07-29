@@ -44,9 +44,11 @@ control plane — see "Designed, not built" for the rest.
 | Task identity at spawn | `spawn-task.sh` | Generates `run_id`/`task_id`/`worker_id`/`conductor_id`, records the worker pane's `terminal_id` as a birth fingerprint, registers the task, stamps all five identities (plus `HERDR_TASK_LABEL`) into the worker's own shell env, transitions `starting`→`running` |
 | Push wake (Edge 1) | `agent-hooks/claude-notify.sh` | On an alert-worthy Notification event, if the worker was stamped with a conductor pane, sends a `[HERDR-PEER-SIGNAL]`-prefixed message naming the worker/pane/task and a `prompt_id`, via `send-to-agent.sh` — gated on `pane_is_agent` first (send-to-agent.sh does not enforce that itself), transitions the task to `blocked`, appends an `input_required` event to the central registry |
 | TOCTOU-safe answering (Edge 3 hardening) | `lib/prompt-parse.sh` (`prompt_id`), `herdr-select.sh` (`--expect-prompt-id`) | A stable hash of the current question+options; `herdr-select.sh` optionally revalidates it immediately before pressing anything and refuses if the prompt has changed since the id was captured. Backward compatible — omit the flag and behavior is unchanged. |
-| Wake persistence (SessionStart reconciliation) | `agent-hooks/session-reconcile.sh`, `lib/run-registry.sh` (`all_task_files`, `read_checkpoint`/`write_checkpoint`) | Runs on every conductor `SessionStart`: (a) reconciliation sweep — any task still `starting`/`running`/`blocked` whose registered pane no longer exists, or whose live `terminal_id` no longer matches the `pane_birth` fingerprint recorded at spawn, is transitioned to `lost`; (b) reports every task now in a terminal state (`completed`/`failed`/`blocked`/`lost`/`cancelled`) that a per-conductor checkpoint hasn't already shown, then updates that checkpoint. The checkpoint lives under the registry dir (`~/.local/state/herdr/runs/checkpoints/<conductor_id>.json`), never in a repo. Wired via `install.sh` as a synchronous (`async:false`) `SessionStart` hook — the only one that must NOT be async, since its `hookSpecificOutput.additionalContext` needs to land before the session's first turn. |
+| Wake persistence (SessionStart reconciliation) | `agent-hooks/session-reconcile.sh`, `lib/reconcile.sh`, `lib/run-registry.sh` (`all_task_files`, `read_checkpoint`/`write_checkpoint`) | Runs on every conductor `SessionStart`: (a) reconciliation sweep — any task still `starting`/`running`/`blocked` whose registered pane no longer exists, or whose live `terminal_id` no longer matches the `pane_birth` fingerprint recorded at spawn, is transitioned to `lost`; (b) reports every task now in a terminal state (`completed`/`failed`/`blocked`/`lost`/`cancelled`) that a per-conductor checkpoint hasn't already shown, then updates that checkpoint. The checkpoint lives under the registry dir (`~/.local/state/herdr/runs/checkpoints/<conductor_id>.json`), never in a repo. Wired via `install.sh` as a synchronous (`async:false`) `SessionStart` hook — the only one that must NOT be async, since its `hookSpecificOutput.additionalContext` needs to land before the session's first turn. |
+| Wake persistence, mid-session (interval reconciliation) | `agent-hooks/interval-reconcile.sh`, `lib/run-registry.sh` (`checkpoint_age_s`) | The same sweep+report as above, wired as `PostToolUse` instead of `SessionStart`, so a long-lived session gets reconciliation without restarting. Throttled to once per `HERDR_RECONCILE_INTERVAL_S` (default 300s) via the checkpoint file's own mtime — most tool calls cost one `stat`. Activity-gated, not a real timer: see "designed, not built" item 1. |
+| Pane-birth revalidation at delivery time | `lib/pane-guard.sh` (`pane_birth_now`, `require_pane_birth_match`), `lib/run-registry.sh` (`task_for_pane`), `herdr-select.sh`, `agent-hooks/claude-notify.sh`, `spawn-task.sh` (`conductor_pane_birth`) | Closes the TOCTOU gap the review called the most dangerous unhit failure: pane ids are RECYCLED, so a wake or an answer aimed at a bare pane id can land in an unrelated later process. `herdr-select.sh` looks up the registered task for its target pane (`task_for_pane`) and refuses (`exit 7`) if the pane's live `terminal_id` no longer matches what was registered. `claude-notify.sh` does the mirror check on the CONDUCTOR side, using a new `conductor_pane_birth` fingerprint `spawn-task.sh` now captures at registration time (the worker's own `pane_birth` was already tracked; the conductor's pane was not). Both are mandatory whenever the pane IS registered — a pane spawned outside the registry (`spawn-agent.sh`) has nothing to check, so it is unaffected, the same backward-compatible principle as `--expect-prompt-id`. |
 
-All five were tested live against real herdr panes (not just `bash -n`):
+All eight were tested live against real herdr panes (not just `bash -n`):
 `sort-tabs.sh` against a scratch workspace with a genuine agent-recognized
 pane and a bare shell; the full spawn→register→push-wake→blocked-state→event
 chain against a scratch conductor pane and a real worktree spawn (cleaned up
@@ -56,7 +58,22 @@ text delivered, nothing executed); `session-reconcile.sh` against a
 hand-registered fake task marked `completed` (reported exactly once, silent on
 a second run) and a fake task marked `running` against a `pane_id`/`pane_birth`
 pair absent from a live `herdr pane list` (transitioned to `lost` and reported
-exactly once) — see this PR's description for the exact commands run.
+exactly once); `interval-reconcile.sh`'s throttle (immediate re-run silent,
+`HERDR_RECONCILE_INTERVAL_S=0` still silent when nothing new via
+`--quiet-if-empty`); pane-birth revalidation against a real scratch pane
+running a throwaway `node` script printing a fake numbered prompt — a
+registration with the pane's actual live fingerprint let `herdr-select.sh`
+press a real key (confirmed via the pane's own transcript), a registration
+with a deliberately wrong fingerprint made it refuse (`exit 7`) with the pane
+transcript byte-for-byte unchanged afterward; the same match/refuse pair
+proven for `claude-notify.sh`'s conductor-side check (delivered text on
+match, silently refused + logged a `push_wake_refused` event on mismatch,
+pane transcript unchanged) — see this PR's description for the exact commands
+run. Installing the hooks for real (`install.sh --apply --repoint`) also
+incidentally proved Claude Code's settings hot-reload: OTHER already-running
+sessions on the same machine picked up `interval-reconcile.sh` and started
+calling it within one tool call of the settings write, no restart observed
+to be necessary.
 
 ### What was deliberately left alone
 
@@ -94,11 +111,15 @@ Built: `agent-hooks/session-reconcile.sh` runs the reconciliation sweep
 described here — inspects every registered task's pane against the live
 `herdr pane list`, transitions anything whose pane is gone or recycled to
 `lost`, and rebuilds what the conductor gets told after a restart via the
-per-conductor checkpoint. **Not built**: it only runs on `SessionStart`, not
-"on some interval" — a conductor that stays open for hours without restarting
-gets no reconciliation until it does. No leases, no expiry independent of a
-session boundary. `wait-for-blocked.sh`-style interval polling inside a live
-session remains undone.
+per-conductor checkpoint. `agent-hooks/interval-reconcile.sh` extends this
+to run DURING a live session too (throttled `PostToolUse`, default every
+300s), so a conductor that stays open for hours no longer waits for a
+restart to learn a worker went `lost` or completed. **Not built**: the
+interval sweep is activity-gated (it only checks on a tool call), not a
+real independent timer — a session sitting fully idle (no tool calls) gets
+no reconciliation until its next tool call or the next `SessionStart`. No
+leases, no expiry independent of activity. A true wall-clock timer would
+need a background daemon, which is out of scope for a Claude Code hook.
 
 ### 2 — Identity and lifecycle (CRITICAL — partially built)
 
@@ -110,18 +131,27 @@ session remains undone.
 > "complete", and "pane exists" must never be conflated.
 
 Built: the five-way identity tuple, the birth fingerprint (`terminal_id`),
-`starting`/`running`/`blocked` transitions via `set_task_state`, and now a
-real `lost` terminal state — `agent-hooks/session-reconcile.sh` revalidates
-every non-terminal task's `pane_id`/`pane_birth` against a live `herdr pane
-list` and transitions to `lost` on a mismatch or missing pane. **Not built**:
-`completed`/`failed`/`cancelled` are used by convention (a worker or operator
-sets them) but have no enforced transition-rule table (nothing stops
-`completed` -> `running`, for instance), there is still no `created`
-pre-registration state, and the fingerprint revalidation that now happens at
-`SessionStart` does NOT happen before a push wake or an answer is delivered
-mid-session — `claude-notify.sh` and `herdr-select.sh` still act on a pane id
-without re-checking its birth first. The reuse scenario the correction warns
-about is closed for the reconciliation path, not the live-delivery path.
+`starting`/`running`/`blocked` transitions via `set_task_state`, a real `lost`
+terminal state (`agent-hooks/session-reconcile.sh` / `interval-reconcile.sh`
+revalidate every non-terminal task's `pane_id`/`pane_birth` against a live
+`herdr pane list`), and — the part this correction actually emphasizes —
+fingerprint revalidation IMMEDIATELY BEFORE LIVE DELIVERY, not just during
+reconciliation. `herdr-select.sh` now refuses (`exit 7`) to press a key if the
+target pane's live `terminal_id` no longer matches the `pane_birth` its
+registered task recorded (`lib/pane-guard.sh`'s `require_pane_birth_match`,
+via `lib/run-registry.sh`'s `task_for_pane` reverse lookup). `claude-notify.sh`
+does the mirror check before a push wake, using a new `conductor_pane_birth`
+field `spawn-task.sh` now captures for the CONDUCTOR's own pane (previously
+only the worker's pane had a fingerprint — the delivery direction this
+correction is actually about had nothing to check). Both are proven both
+ways: matching fingerprint delivers exactly as before, mismatched fingerprint
+refuses with the target pane provably untouched (see "Built this round").
+**Not built**: `completed`/`failed`/`cancelled` are used by convention (a
+worker or operator sets them) but have no enforced transition-rule table
+(nothing stops `completed` -> `running`, for instance), and there is still no
+`created` pre-registration state. The reuse scenario this correction warns
+about is now closed on BOTH the reconciliation path and the live-delivery
+path — what remains is transition-rule enforcement, not identity.
 
 ### 3 — Control-plane state does not belong in the worker repo (built for the NEW state; not retrofitted)
 
@@ -174,11 +204,19 @@ not sufficient for "replay every event exactly once."
 > TUI implementation detail, not a protocol invariant — encode it as an
 > adapter capability.
 
-Built: `prompt_id()` and `herdr-select.sh --expect-prompt-id`, tested against
-both a match and a deliberate mismatch. **Not built**: the adapter
-abstraction (`ClaudeCodeAdapter.answer_prompt()` etc.) that would let a
-different TUI or a version change declare its own safe submit behavior
-instead of "bare digit, never Enter" being hardcoded protocol knowledge.
+Built: `prompt_id()` and `herdr-select.sh --expect-prompt-id` (content-level:
+is this still the same QUESTION), tested against both a match and a
+deliberate mismatch — plus, this round, `require_pane_birth_match`
+(identity-level: does this pane id still mean the same PROCESS), covering
+the correction's other named case — "the pane id can now mean something
+else" — which `prompt_id` alone does not: a recycled pane running a
+different agent could show a superficially similar-looking prompt and still
+pass a content check. Unlike `--expect-prompt-id`, the pane-birth check is
+unconditional wherever the pane is registered, not opt-in, since there is no
+safe default that skips it. **Not built**: the adapter abstraction
+(`ClaudeCodeAdapter.answer_prompt()` etc.) that would let a different TUI or
+a version change declare its own safe submit behavior instead of "bare
+digit, never Enter" being hardcoded protocol knowledge.
 
 ### 6 — Delivery semantics are unspecified
 

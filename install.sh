@@ -7,11 +7,15 @@
 #
 #   ./install.sh              # show what would change, touch nothing
 #   ./install.sh --apply      # make the changes
-#   ./install.sh --apply --bridge   # also install the launchd bridge daemon (macOS)
+#   ./install.sh --apply --bridge     # also install the launchd bridge daemon (macOS)
+#   ./install.sh --apply --repoint    # ALSO repoint any job already wired at a
+#                                      # different checkout (e.g. an APM-deployed
+#                                      # herdr-ops skill copy) to point at THIS one
 #
 # What it registers in ~/.claude/settings.json:
 #   Notification -> agent-hooks/claude-notify.sh       alert you when an agent needs input
 #   PostToolUse  -> herdr-resolve.sh                   retract alerts answered in the terminal
+#   PostToolUse  -> agent-hooks/interval-reconcile.sh  throttled mid-session reconciliation
 #   Stop         -> herdr-resolve.sh                   backstop for the same
 #   SessionStart -> agent-hooks/session-reconcile.sh   report task-state changes missed while
 #                                                       no conductor was watching (wake persistence)
@@ -22,12 +26,13 @@
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
-APPLY=0; BRIDGE=0
+APPLY=0; BRIDGE=0; REPOINT=0
 for a in "$@"; do
   case "$a" in
-    --apply)  APPLY=1 ;;
-    --bridge) BRIDGE=1 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    --apply)   APPLY=1 ;;
+    --bridge)  BRIDGE=1 ;;
+    --repoint) REPOINT=1 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -43,14 +48,15 @@ SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 [ -f "$SETTINGS" ] || { echo "no Claude settings at $SETTINGS — is Claude Code installed?" >&2; exit 1; }
 
 # ---- hook registration -----------------------------------------------------
-HERE="$here" APPLY="$APPLY" SETTINGS="$SETTINGS" python3 - <<'PY'
+HERE="$here" APPLY="$APPLY" REPOINT="$REPOINT" SETTINGS="$SETTINGS" python3 - <<'PY'
 import json, os, shutil, collections, datetime, sys
 
 here     = os.environ["HERE"]
 apply_   = os.environ["APPLY"] == "1"
+repoint  = os.environ["REPOINT"] == "1"
 settings = os.environ["SETTINGS"]
 
-# (event, command to add, names that mean "this job is already wired", async).
+# (event, command to add, names that mean "this job is already wired", async, timeout).
 # The aliases matter: an existing install may call the same job through a
 # differently-named script — e.g. an APM-deployed herdr-ops, or the original
 # slack-notify.sh this hook was extracted from. Matching only our own filename
@@ -62,40 +68,58 @@ settings = os.environ["SETTINGS"]
 # ("defer hook execution") SessionStart hook's output is not guaranteed to
 # arrive in time, which would silently defeat the whole point of this hook.
 # Every other hook here fires mid-session and must never block the agent, so
-# those stay async=True.
+# those stay async=True (interval-reconcile.sh included: its expensive path
+# only runs once per HERDR_RECONCILE_INTERVAL_S and must not stall a tool call
+# on the rare tick it does real work).
 wanted = [
     ("Notification", f'bash {here}/agent-hooks/claude-notify.sh',
-        ("claude-notify.sh", "slack-notify.sh", "herdr-notify.sh"), True),
-    ("PostToolUse",  f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",), True),
-    ("Stop",         f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",), True),
+        ("claude-notify.sh", "slack-notify.sh", "herdr-notify.sh"), True, 10),
+    ("PostToolUse",  f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",), True, 10),
+    ("PostToolUse",  f'bash {here}/agent-hooks/interval-reconcile.sh',
+        ("interval-reconcile.sh",), True, 20),
+    ("Stop",         f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",), True, 10),
     ("SessionStart", f'bash {here}/agent-hooks/session-reconcile.sh',
-        ("session-reconcile.sh",), False),
+        ("session-reconcile.sh",), False, 20),
 ]
 
 with open(settings, encoding="utf-8") as f:
     d = json.load(f, object_pairs_hook=collections.OrderedDict)
 hooks = d.setdefault("hooks", collections.OrderedDict())
 
-def existing(ev, aliases):
+def find_hook(ev, aliases):
+    # Returns (hook_dict, current_command) for the first hook entry under
+    # this event whose command matches one of the job's aliases — a
+    # reference into the live `hooks` structure, so repointing it below is an
+    # in-place mutation, not a second data structure to keep in sync.
     for g in hooks.get(ev, []):
         for h in g.get("hooks", []):
             cmd = h.get("command", "")
             for a in aliases:
                 if a in cmd:
-                    return cmd
-    return None
+                    return h, cmd
+    return None, None
 
-todo = []
-for ev, cmd, aliases, is_async in wanted:
-    have = existing(ev, aliases)
-    if have:
-        print(f"  = {ev:13s} already wired -> {have}")
-    else:
-        todo.append((ev, cmd, is_async))
+add_todo = []       # (ev, cmd, is_async, timeout) — brand new hook groups
+repoint_todo = []    # (hook_dict, ev, old_cmd, new_cmd) — existing, path differs
+
+for ev, cmd, aliases, is_async, timeout in wanted:
+    h, have = find_hook(ev, aliases)
+    if have is None:
+        add_todo.append((ev, cmd, is_async, timeout))
         print(f"  + {ev:13s} {cmd}")
+    elif have == cmd:
+        print(f"  = {ev:13s} already wired -> {have}")
+    elif repoint:
+        repoint_todo.append((h, ev, have, cmd))
+        print(f"  ~ {ev:13s} repoint:")
+        print(f"      {have}")
+        print(f"      -> {cmd}")
+    else:
+        print(f"  = {ev:13s} already wired at a DIFFERENT path -> {have}")
+        print(f"      pass --repoint to point this job at {cmd}")
 
-if not todo:
-    print("nothing to do — all hooks already registered")
+if not add_todo and not repoint_todo:
+    print("nothing to do — every hook is registered and pointed at this checkout")
     sys.exit(0)
 
 if not apply_:
@@ -106,8 +130,11 @@ stamp  = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 backup = f"{settings}.bak-herdr-{stamp}"
 shutil.copy2(settings, backup)
 
-for ev, cmd, is_async in todo:
-    timeout = 10 if is_async else 20   # sync path shells out to `herdr pane list`
+for h, ev, old_cmd, new_cmd in repoint_todo:
+    h["command"] = new_cmd
+    print(f"  repointed {ev}: {old_cmd} -> {new_cmd}")
+
+for ev, cmd, is_async, timeout in add_todo:
     hooks.setdefault(ev, []).append(collections.OrderedDict([
         ("matcher", ""),
         ("hooks", [collections.OrderedDict([

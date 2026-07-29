@@ -25,6 +25,13 @@
 # Skip gh entirely (git-only ranks; you lose reviewed/merged/waiting):
 : "${HERDR_SORT_NO_GH:=0}"
 
+# ---- agent-hooks/interval-reconcile.sh (mid-session wake persistence) ------
+# Seconds between full reconciliation sweeps within one live session (the
+# throttle is activity-gated — it only checks on a tool call, see the file's
+# own header). Lower = more responsive lost-detection/reporting mid-session,
+# at the cost of a `herdr pane list` call that often:
+: "${HERDR_RECONCILE_INTERVAL_S:=300}"
+
 # ---- spawn-task.sh model routing (job-class -> model) ----------------------
 # Claude tiers use the standard aliases (opus/sonnet/haiku) and need no config.
 # Codex model names are yours — edit to match your Codex setup.
@@ -38,4 +45,5 @@
 # ============================================================================
 export HERDR_DEFAULT_AGENT HERDR_SOURCE HERDR_SOCK HERDR_SORT_DONE_FIRST HERDR_SORT_NO_GH
 export HERDR_CODEX_DEEP HERDR_CODEX_STD HERDR_CODEX_FAST
+export HERDR_RECONCILE_INTERVAL_S
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"

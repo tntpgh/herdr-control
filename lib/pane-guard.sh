@@ -71,3 +71,49 @@ require_agent_pane() {
   echo "herdr: input sent to a shell pane executes as a command." >&2
   return 1
 }
+
+# The pane's current birth fingerprint (herdr's own terminal_id) — unique per
+# pane INSTANCE and never reused, unlike pane_id itself which herdr recycles
+# once a pane closes. pane_is_agent above only proves something agent-shaped
+# is running in this pane RIGHT NOW; it says nothing about whether that is
+# still the same process an earlier decision (a registered task, a captured
+# prompt_id) was made about.
+pane_birth_now() {                      # pane_id -> live terminal_id, empty if pane gone
+  herdr pane list 2>/dev/null | jq -r --arg p "$1" \
+    '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null
+}
+
+# Refuse to act if a REGISTERED task's pane has been recycled since spawn —
+# the TOCTOU gap the consensus review (docs/control-plane-design.md,
+# correction 5) called the most dangerous unhit failure: "a delayed answer
+# being injected into a reused pane and accepted by the wrong task." Pane ids
+# get freed and reissued; validating "is this an agent pane" and "is this
+# prompt still on screen" is not enough if the pane itself now belongs to an
+# unrelated later process that also happens to be running an agent showing a
+# prompt.
+#
+# Requires lib/run-registry.sh to already be sourced (uses task_for_pane).
+# Only enforces when the pane IS registered — a pane spawned outside the
+# registry (e.g. spawn-agent.sh, which never calls register_task) has
+# nothing to validate against, so this passes it through unchanged. Same
+# backward-compatible principle as --expect-prompt-id: omit the thing to
+# check against, and behavior for that caller is unchanged.
+require_pane_birth_match() {            # pane_id -> 0 ok-to-proceed, 1 refuse
+  local pane="$1" task registered_birth live_birth
+  task="$(task_for_pane "$pane" 2>/dev/null)"
+  [ -n "$task" ] || return 0
+  registered_birth=$(printf '%s' "$task" | jq -r '.pane_birth // empty')
+  [ -n "$registered_birth" ] || return 0
+  live_birth="$(pane_birth_now "$pane")"
+  if [ -z "$live_birth" ]; then
+    echo "herdr: refusing — pane '$pane' no longer exists (its registered task's pane is gone)." >&2
+    return 1
+  fi
+  if [ "$live_birth" != "$registered_birth" ]; then
+    echo "herdr: refusing — pane '$pane' has been RECYCLED since its task was registered." >&2
+    echo "herdr:   registered fingerprint=$registered_birth  live fingerprint=$live_birth" >&2
+    echo "herdr:   this pane id now belongs to a different process; refusing to act on stale identity." >&2
+    return 1
+  fi
+  return 0
+}

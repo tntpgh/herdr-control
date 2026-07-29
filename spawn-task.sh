@@ -96,6 +96,18 @@ worker_id=$(gen_id worker)
 conductor_pane_id="${HERDR_PANE_ID:-}"
 conductor_id="${HERDR_CONDUCTOR_ID:-conductor_${conductor_pane_id:-unknown}}"
 
+# The conductor pane's birth fingerprint (herdr's terminal_id), captured NOW
+# so the push-wake edge (agent-hooks/claude-notify.sh) can revalidate it
+# immediately before delivery — conductor_pane_id is exactly as recyclable as
+# the worker's own pane_id, and a fingerprint recorded only for the worker
+# side leaves the wake-delivery direction with nothing to check against.
+# Empty when not spawned from inside a herdr pane, same as conductor_pane_id.
+conductor_pane_birth=""
+if [ -n "$conductor_pane_id" ]; then
+  conductor_pane_birth=$(herdr pane list 2>/dev/null | jq -r --arg p "$conductor_pane_id" \
+    '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null)
+fi
+
 if [ "$dry" = 1 ]; then
   echo "spawn-task (dry-run):"
   echo "  repo      : $root"
@@ -104,7 +116,7 @@ if [ "$dry" = 1 ]; then
   echo "  tab label : $label"
   echo "  launch    : $cli"
   echo "  wake      : $here/wake-on-evidence.sh $events_file '$wake_pattern'"
-  echo "  registry  : run=$run_id task=$task_id conductor_pane=${conductor_pane_id:-<none — not running inside a herdr pane>}"
+  echo "  registry  : run=$run_id task=$task_id conductor_pane=${conductor_pane_id:-<none — not running inside a herdr pane>} conductor_pane_birth=${conductor_pane_birth:-<none>}"
   exit 0
 fi
 
@@ -134,7 +146,7 @@ pane=$(printf '%s' "$tc" | jq -r '.result.root_pane.pane_id // empty')
 pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 [ -n "$tab" ] && [ -n "$pane" ] || { echo "spawn-task: tab create failed in $ws" >&2; exit 1; }
 
-register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" \
+register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
   "$pane" "$pane_birth" "$root" "$wt" "$label"
 
 # ---- launch the agent in the tab -------------------------------------------
