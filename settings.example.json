@@ -11,7 +11,16 @@
     "install.sh does this substitution for you.",
     "",
     "async:true matters — these run on every tool call and must never block the",
-    "agent. herdr-resolve exits in ~4ms when there is nothing pending."
+    "agent. herdr-resolve exits in ~4ms when there is nothing pending.",
+    "",
+    "SessionStart is deliberately async:false — its whole job is to inject",
+    "additionalContext before the session's first turn, which an async",
+    "('deferred') hook is not guaranteed to do in time.",
+    "",
+    "The second PostToolUse entry (interval-reconcile.sh) is throttled",
+    "internally (HERDR_RECONCILE_INTERVAL_S, default 300s) via the",
+    "checkpoint file's own mtime, so it costs ~one stat call on every tool",
+    "call and only does real work once per interval."
   ],
 
   "hooks": {
@@ -39,6 +48,17 @@
             "async": true
           }
         ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash __HERDR_CONTROL__/agent-hooks/interval-reconcile.sh",
+            "timeout": 20,
+            "async": true
+          }
+        ]
       }
     ],
     "Stop": [
@@ -50,6 +70,19 @@
             "command": "bash __HERDR_CONTROL__/herdr-resolve.sh",
             "timeout": 10,
             "async": true
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash __HERDR_CONTROL__/agent-hooks/session-reconcile.sh",
+            "timeout": 20,
+            "async": false
           }
         ]
       }

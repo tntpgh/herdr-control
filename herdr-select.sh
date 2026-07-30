@@ -27,12 +27,22 @@
 # behavior is unchanged — a human deciding and pressing in one motion has no
 # such gap.
 #
-# Exit 0 selected, 2 usage, 3 not an agent pane, 6 no prompt / bad option / prompt changed.
+# A second, unconditional TOCTOU close: pane ids are RECYCLED — closing and
+# reopening a tab can hand out the same id to an unrelated later process.
+# require_pane_birth_match (lib/pane-guard.sh) revalidates this pane's live
+# fingerprint against whatever the run registry recorded at spawn time,
+# immediately before the keypress, and refuses on a mismatch. Unlike
+# --expect-prompt-id this is not opt-in — it runs whenever the pane IS
+# registered, since there is no safe default that skips it.
+#
+# Exit 0 selected, 2 usage, 3 not an agent pane, 6 no prompt / bad option /
+# prompt changed, 7 pane recycled since its task was registered.
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/pane-guard.sh"
 . "$here/lib/prompt-parse.sh"
+. "$here/lib/run-registry.sh"
 
 pane="${1:?usage: herdr-select.sh <pane_id> <option-number> [--expect-prompt-id ID]}"
 choice="${2:?option number required}"
@@ -74,6 +84,13 @@ if [ -n "$expect_id" ] && [ "$current_prompt_id" != "$expect_id" ]; then
   echo "herdr-select: expected prompt_id $expect_id, currently $current_prompt_id — refusing to answer a different prompt." >&2
   exit 6
 fi
+
+# Also right before we act: this pane id may have been RECYCLED since the
+# task registry last recorded it. A live agent showing a live prompt is not
+# proof it is the SAME agent — it could be a different task's worker that
+# reused this pane id after the original one closed. Unconditional (no
+# --expect flag): there is no safe default that skips a fingerprint check.
+require_pane_birth_match "$pane" || exit 7
 
 # Record BEFORE sending. If the keypress fails or the agent does something
 # unexpected, the audit trail still shows exactly what was authorised and when.

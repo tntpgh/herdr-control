@@ -41,20 +41,28 @@ gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand
 }
 
 # Register a new task. Writes tasks/<task_id>.json with state=starting.
+#
+# conductor_pane_birth mirrors pane_birth but for the CONDUCTOR's pane, not
+# the worker's: the push-wake edge (agent-hooks/claude-notify.sh) delivers
+# INTO conductor_pane_id, and that pane id is exactly as recyclable as the
+# worker's — a fingerprint recorded only for the worker side would leave the
+# conductor-delivery direction with nothing to revalidate against.
 register_task() {
   local run_id="$1" task_id="$2" worker_id="$3" conductor_id="$4" \
-        conductor_pane_id="$5" pane_id="$6" pane_birth="$7" \
-        repo="$8" worktree="$9" label="${10}"
+        conductor_pane_id="$5" conductor_pane_birth="$6" pane_id="$7" pane_birth="$8" \
+        repo="$9" worktree="${10}" label="${11}"
   mkdir -p "$(tasks_dir "$run_id")"
   jq -n \
     --argjson schema 1 \
     --arg run_id "$run_id" --arg task_id "$task_id" --arg worker_id "$worker_id" \
     --arg conductor_id "$conductor_id" --arg conductor_pane_id "$conductor_pane_id" \
+    --arg conductor_pane_birth "$conductor_pane_birth" \
     --arg pane_id "$pane_id" --arg pane_birth "$pane_birth" \
     --arg repo "$repo" --arg worktree "$worktree" --arg label "$label" \
     --arg state "starting" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{schema:$schema, run_id:$run_id, task_id:$task_id, worker_id:$worker_id,
       conductor_id:$conductor_id, conductor_pane_id:$conductor_pane_id,
+      conductor_pane_birth:$conductor_pane_birth,
       pane_id:$pane_id, pane_birth:$pane_birth, repo:$repo, worktree:$worktree,
       label:$label, state:$state, created_at:$at, updated_at:$at}' \
     > "$(task_file "$run_id" "$task_id")"
@@ -89,3 +97,79 @@ append_event() {                        # run_id task_id type payload_json
 }
 
 read_task() { cat "$(task_file "$1" "$2")" 2>/dev/null; }   # run_id task_id -> json
+
+# Find the most-recently-updated registered task whose WORKER pane is this
+# pane id — used to revalidate a pane's birth fingerprint immediately before
+# acting on it (herdr-select.sh's keypress; see lib/pane-guard.sh's
+# require_pane_birth_match). Returns the task json, or empty if this pane was
+# never registered (e.g. spawned via spawn-agent.sh, which does not use the
+# registry) — a caller with nothing to validate against must fall back to
+# its prior behavior, not invent a refusal.
+task_for_pane() {                       # pane_id -> task json (latest updated_at) or empty
+  local pane="$1" best="" best_ts=""
+  while IFS= read -r tf; do
+    [ -n "$tf" ] && [ -f "$tf" ] || continue
+    local j p ts
+    j="$(cat "$tf" 2>/dev/null)"
+    printf '%s' "$j" | jq -e . >/dev/null 2>&1 || continue
+    p=$(printf '%s' "$j" | jq -r '.pane_id // empty')
+    [ "$p" = "$pane" ] || continue
+    ts=$(printf '%s' "$j" | jq -r '.updated_at // empty')
+    if [ -z "$best_ts" ] || [[ "$ts" > "$best_ts" ]]; then
+      best="$j"; best_ts="$ts"
+    fi
+  done < <(all_task_files)
+  printf '%s' "$best"
+}
+
+# All registered task files across every run, oldest run dirs included — the
+# reconciliation sweep (agent-hooks/session-reconcile.sh) needs every task,
+# not just the ones from the run_id a caller happens to know about.
+all_task_files() {                      # -> one task-file path per line
+  find "$(run_state_root)" -mindepth 3 -maxdepth 3 -path '*/tasks/*.json' 2>/dev/null
+}
+
+# ---- consumer checkpoints (SessionStart reconciliation) ---------------------
+# A conductor session that reads the registry needs to remember what it has
+# already reported, or a reopened session re-announces the same completions
+# forever. That cursor is CONDUCTOR state, not task state — it lives beside
+# the registry (never inside a worktree: cleanup must not reset it) and is
+# keyed by conductor_id, one file per conductor so two conductors watching
+# the same host don't clobber each other's progress.
+checkpoints_dir() { printf '%s/checkpoints\n' "$(run_state_root)"; }
+checkpoint_file() { printf '%s/%s.json\n' "$(checkpoints_dir)" "$1"; }  # conductor_id
+
+read_checkpoint() {                     # conductor_id -> json object (default {})
+  local f c
+  f="$(checkpoint_file "$1")"
+  c="$(cat "$f" 2>/dev/null)"
+  if [ -z "$c" ] || ! printf '%s' "$c" | jq -e . >/dev/null 2>&1; then
+    printf '{}'
+  else
+    printf '%s' "$c"
+  fi
+}
+
+write_checkpoint() {                    # conductor_id json -> writes atomically
+  local f tmp
+  f="$(checkpoint_file "$1")"
+  mkdir -p "$(checkpoints_dir)"
+  tmp="${f}.tmp.$$"
+  printf '%s' "$2" > "$tmp" && mv "$tmp" "$f"
+}
+
+# Seconds since a conductor's checkpoint was last written, or a large number
+# if it has never been written. write_checkpoint runs on EVERY reconciliation
+# pass (even a no-op one), so its mtime doubles as "when did this conductor
+# last actually check the registry" — agent-hooks/interval-reconcile.sh
+# throttles its expensive work (a live `herdr pane list` + a full task scan)
+# against this instead of keeping a second timestamp file to stay in sync
+# with.
+checkpoint_age_s() {                    # conductor_id -> integer seconds
+  local f mtime now
+  f="$(checkpoint_file "$1")"
+  [ -f "$f" ] || { printf '999999999\n'; return 0; }
+  mtime=$(stat -f '%m' "$f" 2>/dev/null || stat -c '%Y' "$f" 2>/dev/null || echo 0)
+  now=$(date -u +%s)
+  printf '%s\n' "$(( now - mtime ))"
+}
