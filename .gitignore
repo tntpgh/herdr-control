@@ -4,3 +4,12 @@ build/
 .omc/
 __pycache__/
 *.pyc
+
+# --- secrets hygiene (added 2026-07-30) ---
+# Ignore every env file by default; re-allow the templates that are meant to be tracked.
+.env*
+!.env.example
+!.env*.example
+!.env.op
+!.env.sample
+!.env.template
