@@ -49,6 +49,8 @@ control plane — see "Designed, not built" for the rest.
 | Pane-birth revalidation at delivery time | `lib/pane-guard.sh` (`pane_birth_now`, `require_pane_birth_match`), `lib/run-registry.sh` (`task_for_pane`), `herdr-select.sh`, `agent-hooks/claude-notify.sh`, `spawn-task.sh` (`conductor_pane_birth`) | Closes the TOCTOU gap the review called the most dangerous unhit failure: pane ids are RECYCLED, so a wake or an answer aimed at a bare pane id can land in an unrelated later process. `herdr-select.sh` looks up the registered task for its target pane (`task_for_pane`) and refuses (`exit 7`) if the pane's live `terminal_id` no longer matches what was registered. `claude-notify.sh` does the mirror check on the CONDUCTOR side, using a new `conductor_pane_birth` fingerprint `spawn-task.sh` now captures at registration time (the worker's own `pane_birth` was already tracked; the conductor's pane was not). Both are mandatory whenever the pane IS registered — a pane spawned outside the registry (`spawn-agent.sh`) has nothing to check, so it is unaffected, the same backward-compatible principle as `--expect-prompt-id`. |
 
 All eight were tested live against real herdr panes (not just `bash -n`):
+
+All four were tested live against real herdr panes (not just `bash -n`):
 `sort-tabs.sh` against a scratch workspace with a genuine agent-recognized
 pane and a bare shell; the full spawn→register→push-wake→blocked-state→event
 chain against a scratch conductor pane and a real worktree spawn (cleaned up
@@ -74,6 +76,7 @@ incidentally proved Claude Code's settings hot-reload: OTHER already-running
 sessions on the same machine picked up `interval-reconcile.sh` and started
 calling it within one tool call of the settings write, no restart observed
 to be necessary.
+text delivered, nothing executed).
 
 ### What was deliberately left alone
 
@@ -102,6 +105,7 @@ to be necessary.
 The review's numbered corrections, as a roadmap. None of this exists in code.
 
 ### 1 — Push does not replace polling; it's push + reconciliation (partially built)
+### 1 — Push does not replace polling; it's push + reconciliation
 
 > "push for responsiveness + periodic reconciliation for correctness" — push
 > alone cannot detect a crashed worker, a dead hook, a wedged worker that
@@ -120,6 +124,10 @@ real independent timer — a session sitting fully idle (no tool calls) gets
 no reconciliation until its next tool call or the next `SessionStart`. No
 leases, no expiry independent of activity. A true wall-clock timer would
 need a background daemon, which is out of scope for a Claude Code hook.
+`wait-for-blocked.sh`-style polling is not a stopgap to delete once push
+works. Needed: a reconciliation sweep — inspect registered panes, expire
+leases, detect missed events, rebuild conductor state after a restart — on
+some interval, independent of whether push fired. Not built.
 
 ### 2 — Identity and lifecycle (CRITICAL — partially built)
 
@@ -152,6 +160,13 @@ worker or operator sets them) but have no enforced transition-rule table
 `created` pre-registration state. The reuse scenario this correction warns
 about is now closed on BOTH the reconciliation path and the live-delivery
 path — what remains is transition-rule enforcement, not identity.
+and `starting`/`running`/`blocked` transitions via `set_task_state`. **Not
+built**: `completed`/`failed`/`cancelled`/`lost` as real terminal states with
+enforced transition rules, a `created` pre-registration state, or anything
+that revalidates a pane's fingerprint before acting on it (registration
+records the fingerprint; nothing currently re-checks it against the live
+pane before a wake or answer, which is exactly the reuse scenario the
+correction warns about).
 
 ### 3 — Control-plane state does not belong in the worker repo (built for the NEW state; not retrofitted)
 
@@ -167,6 +182,10 @@ so a worktree cleanup can't reset what a conductor has already been shown.
 **Not built**: migrating or unifying the existing `.omc/handoffs/events.jsonl`
 completion channel into the same store — a worker's completion evidence and
 its lifecycle state currently live in two different places.
+`~/.local/state/herdr/runs/<run_id>/`, not in any worktree. **Not built**:
+migrating or unifying the existing `.omc/handoffs/events.jsonl` completion
+channel into the same store — a worker's completion evidence and its
+lifecycle state currently live in two different places.
 
 ### 4 — JSONL is durable, not reliable
 
@@ -193,6 +212,11 @@ transitions it has already been shown, but nothing dedups or checkpoints
 two reconciliation runs is reported once (its latest state), with the
 intermediate transition never surfaced — correct for "tell me what changed,"
 not sufficient for "replay every event exactly once."
+monotonic counter under concurrent writers), and there is no consumer
+checkpoint or dedup — a conductor restarting today has no way to know which
+events it already saw. This is the known weakest part of what got built;
+treat every number in the file above as "good enough for one worker being
+watched synchronously," not as a queue a fleet can trust.
 
 ### 5 — Prompt answering has a TOCTOU race (partially built)
 
@@ -217,6 +241,11 @@ safe default that skips it. **Not built**: the adapter abstraction
 (`ClaudeCodeAdapter.answer_prompt()` etc.) that would let a different TUI or
 a version change declare its own safe submit behavior instead of "bare
 digit, never Enter" being hardcoded protocol knowledge.
+Built: `prompt_id()` and `herdr-select.sh --expect-prompt-id`, tested against
+both a match and a deliberate mismatch. **Not built**: the adapter
+abstraction (`ClaudeCodeAdapter.answer_prompt()` etc.) that would let a
+different TUI or a version change declare its own safe submit behavior
+instead of "bare digit, never Enter" being hardcoded protocol knowledge.
 
 ### 6 — Delivery semantics are unspecified
 
