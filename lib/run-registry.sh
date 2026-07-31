@@ -51,8 +51,21 @@ register_task() {
   local run_id="$1" task_id="$2" worker_id="$3" conductor_id="$4" \
         conductor_pane_id="$5" conductor_pane_birth="$6" pane_id="$7" pane_birth="$8" \
         repo="$9" worktree="${10}" label="${11}"
-  mkdir -p "$(tasks_dir "$run_id")"
-  jq -n \
+  local f tmp
+  f="$(task_file "$run_id" "$task_id")"
+  tmp="${f}.tmp.$$"
+  # Atomic write, same pattern as set_task_state/write_checkpoint below: jq
+  # writes to a pid-suffixed temp file in the SAME directory, then mv (an
+  # atomic rename on POSIX filesystems) into place. This used to be a bare
+  # `jq -n ... > "$(task_file ...)"`, which truncates the target to zero
+  # bytes BEFORE jq produces any output — a concurrent reader racing the
+  # write window (task_for_pane, the reconcile sweep) could observe a
+  # truncated/empty task file instead of either "not registered yet" (fine)
+  # or the complete record (fine). Neither mkdir -p nor the write itself was
+  # checked either, so a failure here (disk full, permissions) used to
+  # silently leave no usable task file with no error anywhere; both are
+  # checked now.
+  if mkdir -p "$(tasks_dir "$run_id")" && jq -n \
     --argjson schema 1 \
     --arg run_id "$run_id" --arg task_id "$task_id" --arg worker_id "$worker_id" \
     --arg conductor_id "$conductor_id" --arg conductor_pane_id "$conductor_pane_id" \
@@ -65,7 +78,13 @@ register_task() {
       conductor_pane_birth:$conductor_pane_birth,
       pane_id:$pane_id, pane_birth:$pane_birth, repo:$repo, worktree:$worktree,
       label:$label, state:$state, created_at:$at, updated_at:$at}' \
-    > "$(task_file "$run_id" "$task_id")"
+    > "$tmp" && mv "$tmp" "$f"; then
+    return 0
+  else
+    rm -f "$tmp"
+    echo "run-registry: failed to write task file for $run_id/$task_id" >&2
+    return 1
+  fi
 }
 
 # Transition a task's lifecycle state and record the transition as an event.
@@ -139,6 +158,44 @@ all_task_files() {                      # -> one task-file path per line
   find "$(run_state_root)" -mindepth 3 -maxdepth 3 -path '*/tasks/*.json' 2>/dev/null
 }
 
+# Prune terminal-state task files older than a max age. Nothing else in this
+# registry ever removes a task file — all_task_files() above walks every
+# task that has ever been registered, forever, so run_state_root grows
+# without bound on a long-lived host. Deliberately narrow: a file is removed
+# only if BOTH its state is one of the true TERMINAL states from
+# set_task_state's suggested list (completed/failed/cancelled/lost —
+# starting/running/blocked are left alone; "blocked" in particular can still
+# resolve, it's not a dead end) AND its updated_at is older than
+# max_age_days. This is not a general GC subsystem: it doesn't touch
+# events.jsonl, run directories, or checkpoints, just individual task files
+# whose terminal transition happened long enough ago that no reader still
+# needs them.
+prune_completed_tasks() {               # max_age_days -> removes old terminal task files
+  local max_age_days="$1" cutoff
+  # Same idiom as task_for_pane's `[[ "$ts" > "$best_ts" ]]`: ISO-8601 UTC
+  # timestamps (this registry's only timestamp format, see date -u
+  # +%Y-%m-%dT%H:%M:%SZ throughout) sort lexicographically in the same order
+  # they sort chronologically, so a plain string compare against a cutoff
+  # computed the same way avoids parsing timestamps back into epoch seconds
+  # (and the BSD/GNU `date` flag differences that would come with it).
+  cutoff=$(date -u -v-"${max_age_days}"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "-${max_age_days} days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  [ -n "$cutoff" ] || { echo "run-registry: prune_completed_tasks could not compute cutoff date" >&2; return 1; }
+  while IFS= read -r tf; do
+    [ -n "$tf" ] && [ -f "$tf" ] || continue
+    local j state updated_at
+    j="$(cat "$tf" 2>/dev/null)"
+    printf '%s' "$j" | jq -e . >/dev/null 2>&1 || continue   # skip a torn write
+    state=$(printf '%s' "$j" | jq -r '.state // empty')
+    case "$state" in
+      completed|failed|cancelled|lost) ;;
+      *) continue ;;
+    esac
+    updated_at=$(printf '%s' "$j" | jq -r '.updated_at // empty')
+    [ -n "$updated_at" ] && [[ "$updated_at" < "$cutoff" ]] && rm -f "$tf"
+  done < <(all_task_files)
+}
+
 # ---- consumer checkpoints (SessionStart reconciliation) ---------------------
 # A conductor session that reads the registry needs to remember what it has
 # already reported, or a reopened session re-announces the same completions
@@ -163,9 +220,23 @@ read_checkpoint() {                     # conductor_id -> json object (default {
 write_checkpoint() {                    # conductor_id json -> writes atomically
   local f tmp
   f="$(checkpoint_file "$1")"
-  mkdir -p "$(checkpoints_dir)"
   tmp="${f}.tmp.$$"
-  printf '%s' "$2" > "$tmp" && mv "$tmp" "$f"
+  # checkpoint_age_s (below) reads this file's mtime as "when did this
+  # conductor last actually check the registry", and interval-reconcile.sh
+  # throttles its expensive work against that age. If this write fails
+  # (disk full, permissions) the mtime never advances, so the throttle
+  # fails OPEN — it treats itself as perpetually due — rather than closed.
+  # Not dangerous on its own, but previously silent: nothing printed
+  # anywhere, so a stuck checkpoint looked identical to a healthy one with
+  # nothing new to report. mkdir -p and the write are both checked now, and
+  # either failing prints one diagnostic line to stderr.
+  if mkdir -p "$(checkpoints_dir)" && printf '%s' "$2" > "$tmp" && mv "$tmp" "$f"; then
+    return 0
+  else
+    rm -f "$tmp"
+    echo "run-registry: failed to write checkpoint for $1 — checkpoint_age_s will grow unbounded" >&2
+    return 1
+  fi
 }
 
 # Seconds since a conductor's checkpoint was last written, or a large number
@@ -183,3 +254,15 @@ checkpoint_age_s() {                    # conductor_id -> integer seconds
   now=$(date -u +%s)
   printf '%s\n' "$(( now - mtime ))"
 }
+
+# ---- interval-reconcile lock ------------------------------------------------
+# A plain directory under run_state_root, used by
+# agent-hooks/interval-reconcile.sh as an mkdir-based mutex around the
+# throttled reconciliation pass. checkpoint_age_s-vs-interval is a
+# check-then-act throttle, not atomic on its own — two PostToolUse hook
+# firings close together can both observe "due" and both proceed, doubling
+# the herdr pane list + full task scan and racing on the same task-file
+# writes. mkdir is atomic on POSIX filesystems (exactly one caller ever
+# wins the "did not exist, now does" transition), so it makes a
+# dependency-free mutex without needing flock or a PID file.
+reconcile_lock_dir() { printf '%s/reconcile.lock\n' "$(run_state_root)"; }

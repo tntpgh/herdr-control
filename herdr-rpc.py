@@ -15,12 +15,22 @@ matches our request — ignoring events.
 Prints the `result` object on success (exit 0); the `error` object to stderr on
 failure (exit 1). Socket path from $HERDR_SOCK (default ~/.config/herdr/herdr.sock).
 """
-import socket, os, json, sys
+import socket, os, json, sys, uuid
 
 SOCK = os.path.expanduser(os.environ.get("HERDR_SOCK", "~/.config/herdr/herdr.sock"))
 
 
-def rpc(method, params, rid="herdr-control"):
+def rpc(method, params, rid=None):
+    # A per-request id keeps concurrent invocations of this script from
+    # having their replies confused, regardless of herdr's exact socket fan-out
+    # semantics — matching against a fixed literal, two overlapping calls could
+    # each read the other's reply off the wire. pid+random makes collisions
+    # effectively impossible without needing any shared counter state. Default
+    # is generated here (call time), not in the signature (def time) — a
+    # default evaluated in the signature runs once at import and every caller
+    # that omits rid would share the same one.
+    if rid is None:
+        rid = f"herdr-control-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(float(os.environ.get("HERDR_RPC_TIMEOUT", "8")))
     s.connect(SOCK)
@@ -53,7 +63,22 @@ def main():
         sys.exit(2)
     method = sys.argv[1]
     params = json.loads(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else {}
-    msg = rpc(method, params)
+    # connect refusals, recv timeouts, and "socket closed with no matching
+    # reply" all raised straight out of rpc() as bare exceptions, so a dead
+    # or missing socket produced a Python traceback on stderr instead of the
+    # clean JSON error object this script's own docstring promises callers.
+    # A caller scripting around this (sort-tabs.sh included) has no JSON to
+    # parse when that happens — just noise. Catch it here and emit the same
+    # shape as an RPC-level error, keeping the documented exit-code contract
+    # (nonzero on failure) callers already rely on.
+    try:
+        msg = rpc(method, params)
+    except OSError as e:
+        print(json.dumps({"message": f"{type(e).__name__}: {e}"}), file=sys.stderr)
+        sys.exit(1)
+    except RuntimeError as e:
+        print(json.dumps({"message": str(e)}), file=sys.stderr)
+        sys.exit(1)
     if "error" in msg:
         print(json.dumps(msg["error"]), file=sys.stderr)
         sys.exit(1)

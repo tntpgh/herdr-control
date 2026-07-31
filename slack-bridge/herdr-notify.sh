@@ -221,6 +221,13 @@ ts=$(printf '%s' "$resp" | jq -r '.ts')
 if [ -n "$pane" ]; then
   reg_dir="${HERDR_BRIDGE_STATE:-$HOME/.config/herdr-bridge}"
   mkdir -p "$reg_dir"
+  # registry.jsonl/pending.jsonl here map Slack thread timestamps (and, via
+  # herdr-select.sh, authorised choices) to live agent panes. `mkdir -p` alone
+  # leaves the mode wherever the process umask lands — permissive on any host
+  # that isn't already running with umask 077 — so a co-resident local user
+  # could read or tamper with pane-routing state. Force 0700 explicitly every
+  # time rather than relying on the umask of whichever script gets here first.
+  chmod 700 "$reg_dir"
   reg="$reg_dir/registry.jsonl"
   jq -nc --arg ts "$ts" --arg pane "$pane" '{ts:$ts,pane:$pane}' >> "$reg"
   # Track it as AWAITING AN ANSWER only if we actually showed a live prompt.

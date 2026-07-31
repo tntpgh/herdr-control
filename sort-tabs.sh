@@ -86,8 +86,20 @@ rank_state() {  # cwd -> "<rank> <state>"
 }
 
 sort_one() {  # workspace_id
-  local ws="$1" tabs desired cur i tid rank state cwd lines sortflag pane marked skipped
-  tabs=$(herdr tab list --workspace "$ws" 2>/dev/null | jq -r '(.result.tabs // .tabs)[].tab_id')
+  local ws="$1" tabs tabs_json herdr_rc jq_rc desired cur i tid params rank state cwd lines sortflag pane marked skipped
+  # `herdr tab list | jq` used to collapse two very different outcomes into
+  # the same "no tabs in $ws" message: a genuinely empty workspace, and a
+  # dead/erroring RPC or a jq parse failure (both silently produce empty
+  # $tabs when piped straight through). Under --all that hid systemic
+  # failures — one workspace's socket error just looked like it had no tabs.
+  # Capture herdr's own exit status before jq ever sees the output, so a
+  # transport/parse failure is reported distinctly from a real empty result.
+  tabs_json=$(herdr tab list --workspace "$ws" 2>/dev/null); herdr_rc=$?
+  tabs=$(printf '%s' "$tabs_json" | jq -r '(.result.tabs // .tabs)[].tab_id' 2>/dev/null); jq_rc=$?
+  if [ "$herdr_rc" != 0 ] || [ "$jq_rc" != 0 ]; then
+    echo "sort-tabs: tab list RPC/parse failed for $ws (herdr rc=$herdr_rc, jq rc=$jq_rc)" >&2
+    return 1
+  fi
   [ -n "$tabs" ] || { echo "sort-tabs: no tabs in $ws"; return; }
 
   # Build "rank<TAB>tabid<TAB>state<TAB>cwd", preserving current order (stable).
@@ -95,6 +107,13 @@ sort_one() {  # workspace_id
   while IFS= read -r tid; do
     [ -n "$tid" ] || continue
     cwd=$(tab_cwd "$tid")
+    # A cwd is a filesystem path, and tab/newline are legal filename bytes on
+    # macOS/Linux — an embedded one would break the tab-delimited row framing
+    # below, shifting fields so `cut -f2` on a later row hands a bogus string
+    # (part of a path, not a tab_id) to the tab.move RPC. cwd is only used
+    # here for display and rank_state's git lookup, never required verbatim,
+    # so stripping the offending bytes is safe and closes the framing hole.
+    cwd=$(printf '%s' "$cwd" | tr -d '\t\n')
     read -r rank state <<<"$(rank_state "$cwd")"
     lines+=$(printf '%s\t%s\t%s\t%s\n' "$rank" "$tid" "$state" "$cwd")
     lines+=$'\n'
@@ -116,7 +135,15 @@ sort_one() {  # workspace_id
     i=0
     while IFS= read -r tid; do
       [ -n "$tid" ] || continue
-      python3 "$here/herdr-rpc.py" tab.move "{\"tab_id\":\"$tid\",\"insert_index\":$i}" >/dev/null \
+      # tid is interpolated straight from a JSON string field returned by
+      # `herdr tab list`, so a tab_id containing a quote or backslash would
+      # break out of the hand-built "{...}" literal below and either corrupt
+      # the RPC params or fail to parse as JSON. jq -n with --arg/--argjson
+      # does the escaping properly instead of us reimplementing it by hand.
+      params=$(jq -n --arg tab_id "$tid" --argjson insert_index "$i" \
+        '{tab_id:$tab_id, insert_index:$insert_index}') \
+        || { echo "sort-tabs: failed to build tab.move params for $tid" >&2; return 1; }
+      python3 "$here/herdr-rpc.py" tab.move "$params" >/dev/null \
         || { echo "sort-tabs: tab.move failed for $tid" >&2; return 1; }
       i=$((i+1))
     done <<<"$desired"
@@ -147,9 +174,14 @@ sort_one() {  # workspace_id
 }
 
 if [ "$do_all" = 1 ]; then
-  for ws in $(herdr workspace list 2>/dev/null | jq -r '(.result.workspaces // .workspaces)[].workspace_id'); do
+  # Every other id-list loop in this file reads via `while ... < <(...)` to
+  # avoid word-splitting/globbing on unquoted command substitution; this was
+  # the one holdout still using `for x in $(...)`, unsafe for a workspace
+  # label containing whitespace or shell glob characters.
+  while IFS= read -r ws; do
+    [ -n "$ws" ] || continue
     sort_one "$ws"
-  done
+  done < <(herdr workspace list 2>/dev/null | jq -r '(.result.workspaces // .workspaces)[].workspace_id')
 else
   ws="$ws_arg"
   [ -n "$ws" ] || ws=$(herdr workspace list 2>/dev/null | jq -r '(.result.workspaces // .workspaces)[] | select(.focused==true) | .workspace_id' | head -1)

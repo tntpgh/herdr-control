@@ -41,10 +41,20 @@ except ImportError:
     sys.exit("slack_bolt not installed — pip install -r requirements.txt (in a venv)")
 
 DELIVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "herdr-deliver.sh")
-REGISTRY = os.path.join(
-    os.environ.get("HERDR_BRIDGE_STATE", os.path.expanduser("~/.config/herdr-bridge")),
-    "registry.jsonl",
-)
+STATE_DIR = os.environ.get("HERDR_BRIDGE_STATE", os.path.expanduser("~/.config/herdr-bridge"))
+# Other components in this repo (herdr-notify.sh, herdr-select.sh) `mkdir -p`
+# this directory before writing to it, so its mode ends up wherever the calling
+# process's umask happens to leave it — permissive by default unless that
+# umask is already 077. registry.jsonl/pending.jsonl/selections.jsonl here map
+# Slack thread timestamps and authorised choices to live agent panes, so a
+# co-resident local user who can read or write it can hijack reply routing
+# regardless of which script's umask was in effect when the dir was first
+# created. This daemon reads from the same directory, so it owns making the
+# mode explicit too: create it if missing and force 0700 unconditionally,
+# rather than trusting whatever mode it was already left in.
+os.makedirs(STATE_DIR, exist_ok=True)
+os.chmod(STATE_DIR, 0o700)
+REGISTRY = os.path.join(STATE_DIR, "registry.jsonl")
 TARGET_RE = re.compile(r"^\s*(w[0-9A-Za-z]+:[pt][0-9]+)\s+(.*)$", re.S)
 MENTION_RE = re.compile(r"^\s*<@[^>]+>\s*")
 # A reply that is nothing but a number (optionally "2." or "option 2").
@@ -114,7 +124,21 @@ def authorized(user, team, logger, what):
     if user not in ALLOW:
         logger.info("ignoring %s from unauthorized user %s", what, user)
         return False
-    if TEAM and team != TEAM:
+    # The module docstring promises fail-closed. Before this fix, `TEAM and
+    # team != TEAM` only ran the workspace comparison when TEAM was truthy —
+    # with TEAM unset the whole condition was falsy and execution fell through
+    # to `return True`, meaning the one scenario this check exists for (a
+    # Slack Connect / shared-channel user carrying our allowlisted member id
+    # from a DIFFERENT workspace, per docs/AGENTS.md and SKILL.md) sailed
+    # straight through with the binding silently disabled. The startup
+    # warning already tells the operator why; the runtime now has to actually
+    # match it: with no TEAM configured we cannot verify the workspace at
+    # all, so refuse everything rather than authorize on an unverifiable
+    # claim.
+    if not TEAM:
+        logger.warning("REFUSED %s: HERDR_BRIDGE_TEAM unset — refusing all traffic (fail closed)", what)
+        return False
+    if team != TEAM:
         logger.warning("REFUSED %s: team %r != HERDR_BRIDGE_TEAM %r", what, team, TEAM)
         return False
     return True
@@ -208,6 +232,16 @@ def on_choice_button(ack, body, say, logger):
     user = (body.get("user") or {}).get("id", "")
     team = (body.get("team") or {}).get("id") or body.get("team_id")
     if not authorized(user, team, logger, "button click"):
+        return
+    # HERDR_BRIDGE_CHANNEL was previously enforced only on the message path
+    # (on_message) — a button click arrives as a separate Slack event with its
+    # own payload shape, so that restriction never applied here, and an
+    # otherwise-allowlisted user's click from outside the configured channel
+    # (a DM, or a channel they were added to later) would still be honored.
+    # Interactive payloads carry the channel under body["channel"]["id"]
+    # rather than body["channel"] directly, so the check is shaped to match
+    # that, but it is the same enforcement as the message path.
+    if CHANNEL and (body.get("channel") or {}).get("id") != CHANNEL:
         return
     action = (body.get("actions") or [{}])[0]
     value = action.get("value", "")

@@ -97,17 +97,27 @@ run_reconciliation() {
     esac
 
     # ---- report terminal states, once per (task_id, updated_at) ----------
+    # Keyed by "<run_id>/<task_id>", not bare task_id: run-registry.sh's own
+    # header admits task-id generation (date+pid+RANDOM) is "not
+    # collision-proof across concurrent spawns". A bare-task_id key means a
+    # same-named task_id from an unrelated run reported here would make this
+    # conductor treat a genuinely new terminal-state task from a DIFFERENT
+    # run as "already reported" the moment their task_ids happened to
+    # collide — the checkpoint would silently conflate two unrelated tasks.
+    # run_id is already part of every task record, so folding it into the
+    # key costs nothing and removes the ambiguity entirely.
     case "$state" in
       completed|failed|blocked|lost|cancelled)
-        local updated_at prior_updated_at label repo
+        local checkpoint_key updated_at prior_updated_at label repo
+        checkpoint_key="${run_id}/${task_id}"
         updated_at=$(printf '%s' "$task_json" | jq -r '.updated_at // empty')
-        prior_updated_at=$(printf '%s' "$checkpoint" | jq -r --arg t "$task_id" '.[$t].updated_at // empty')
+        prior_updated_at=$(printf '%s' "$checkpoint" | jq -r --arg t "$checkpoint_key" '.[$t].updated_at // empty')
         if [ "$prior_updated_at" != "$updated_at" ]; then
           label=$(printf '%s' "$task_json" | jq -r '.label // .task_id')
           repo=$(printf '%s' "$task_json" | jq -r '.repo // "" | split("/") | last')
           report_lines="${report_lines}- ${label} (${repo:-?}) -> ${state}  [${updated_at}]"$'\n'
           report_count=$((report_count + 1))
-          new_checkpoint=$(printf '%s' "$new_checkpoint" | jq --arg t "$task_id" --arg s "$state" --arg u "$updated_at" \
+          new_checkpoint=$(printf '%s' "$new_checkpoint" | jq --arg t "$checkpoint_key" --arg s "$state" --arg u "$updated_at" \
             '.[$t] = {state:$s, updated_at:$u}')
         fi
         ;;

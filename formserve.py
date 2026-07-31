@@ -25,16 +25,22 @@ The page contract — one function, injected automatically, no boilerplate:
 It returns a promise, disables further submits, and shows a confirmation. A page
 can also just POST JSON to /submit itself; the helper is a convenience.
 
-Deliberately NOT included: no auth, no TLS, no external binding. This is a
-single-shot loopback server for one local human, torn down the moment it has an
-answer. Keep it that way — the moment it binds anything but 127.0.0.1 it becomes
-an unauthenticated RPC endpoint into your terminal.
+Deliberately minimal: no TLS, no external binding, no persistent credential.
+/submit does require a random per-run token (embedded only in the page we
+actually served, checked with a constant-time comparison) so a local process
+that never loaded the page cannot blind-POST a fabricated answer — see
+build_handler() below. This is a single-shot loopback server for one local
+human, torn down the moment it has an answer. Keep it that way — the moment
+it binds anything but 127.0.0.1 it becomes a reachable RPC endpoint into your
+terminal.
 """
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -45,14 +51,21 @@ HERE = Path(__file__).resolve().parent
 
 # Injected before </body> so a served page needs no boilerplate to answer back.
 SHIM = """
+<input type="hidden" id="__formserve_token" value="{{FORMSERVE_TOKEN}}">
 <script>
 (function () {
   if (window.submitAnswers) return;
   window.submitAnswers = function (answers) {
+    var body = Object.assign({}, answers === undefined ? {} : answers);
+    // The token lives only in the page we actually served (see the /submit
+    // handler for why); folding it into every submit here means a page using
+    // the documented submitAnswers() helper closes the gap for free, without
+    // the page author needing to know the token exists.
+    body.__formserve_token = document.getElementById("__formserve_token").value;
     return fetch("/submit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(answers === undefined ? {} : answers),
+      body: JSON.stringify(body),
     }).then(function (r) {
       if (!r.ok) throw new Error("submit failed: " + r.status);
       document.querySelectorAll("button,input,select,textarea").forEach(function (el) {
@@ -84,7 +97,7 @@ SHIM = """
 """
 
 
-def build_handler(html: bytes, result: dict, done: threading.Event):
+def build_handler(html: bytes, result: dict, done: threading.Event, token: str):
     class Handler(BaseHTTPRequestHandler):
         # default logging writes a line per asset request into the agent's stdout
         def log_message(self, *_args):
@@ -123,6 +136,21 @@ def build_handler(html: bytes, result: dict, done: threading.Event):
                 payload = json.loads(raw.decode("utf-8") or "{}")
             except Exception as exc:
                 self._send(400, f"bad json: {exc}".encode())
+                return
+            # No auth on this endpoint (see the module docstring) means any
+            # local process that can reach 127.0.0.1:<port> during the up-to-4h
+            # serving window could otherwise POST a fabricated answer and, with
+            # --deliver, have it typed straight into a live agent pane — a local
+            # prompt-injection primitive. The per-run token is unguessable
+            # (secrets.token_urlsafe), embedded only in the HTML we actually
+            # served (SHIM above), and never logged (log_message stays
+            # silenced). A submit that doesn't carry a matching token did not
+            # come from someone who loaded this page, so it is rejected before
+            # the payload is ever stored or delivered. compare_digest avoids
+            # leaking the token's value through response-timing differences.
+            submitted = payload.pop("__formserve_token", None) if isinstance(payload, dict) else None
+            if not isinstance(submitted, str) or not hmac.compare_digest(submitted, token):
+                self._send(403, b"forbidden: missing or invalid token")
                 return
             result["answers"] = payload
             self._send(200, b'{"ok":true}', "application/json")
@@ -201,20 +229,26 @@ def main() -> int:
         print(f"formserve: no such file: {form}", file=sys.stderr)
         return 2
 
+    # Unguessable per-run secret (see the /submit handler for why this exists)
+    # — generated fresh every invocation so it cannot be reused across runs or
+    # guessed from a previous one.
+    token = secrets.token_urlsafe(24)
+    shim = SHIM.replace("{{FORMSERVE_TOKEN}}", token).encode()
+
     html = form.read_bytes()
     lowered = html.lower()
     if b"</body>" in lowered:
         cut = lowered.rindex(b"</body>")
-        html = html[:cut] + SHIM.encode() + html[cut:]
+        html = html[:cut] + shim + html[cut:]
     else:
-        html = html + SHIM.encode()
+        html = html + shim
 
     result: dict = {}
     done = threading.Event()
 
     # 127.0.0.1, never 0.0.0.0 — see the module docstring.
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port),
-                                build_handler(html, result, done))
+                                build_handler(html, result, done, token))
     port = httpd.server_address[1]
     url = f"http://127.0.0.1:{port}/"
 

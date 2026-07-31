@@ -36,5 +36,17 @@ conductor_id="$(resolve_conductor_id)"
 age="$(checkpoint_age_s "$conductor_id")"
 [ "$age" -ge "$interval" ] || exit 0     # not due yet — cheap, no herdr/jq calls
 
+# checkpoint_age_s-vs-interval above is check-then-act, not atomic: two
+# PostToolUse hook firings close together can both read "due" before either
+# has run reconciliation, and both proceed — doubling the herdr pane list +
+# full task scan and racing on the same task-file writes. mkdir is atomic on
+# POSIX filesystems (exactly one caller ever wins the "did not exist, now
+# does" transition), so it's a dependency-free mutex; the trap guarantees
+# the lock directory is removed on every exit path, including a failure
+# inside run_reconciliation itself.
+lockdir="$(reconcile_lock_dir)"
+mkdir "$lockdir" 2>/dev/null || exit 0
+trap 'rmdir "$lockdir" 2>/dev/null' EXIT
+
 run_reconciliation "$conductor_id" "PostToolUse" --quiet-if-empty
 exit 0

@@ -32,6 +32,14 @@
 # at the cost of a `herdr pane list` call that often:
 : "${HERDR_RECONCILE_INTERVAL_S:=300}"
 
+# ---- session-reconcile.sh retention (terminal task-file pruning) -----------
+# Task files in a terminal state (completed/failed/cancelled/lost) older
+# than this many days are removed on every SessionStart sweep
+# (lib/run-registry.sh's prune_completed_tasks). Nothing else prunes the
+# registry, so this is the only thing keeping run_state_root from growing
+# forever on a long-lived host.
+: "${HERDR_TASK_RETENTION_DAYS:=14}"
+
 # ---- spawn-task.sh model routing (job-class -> model) ----------------------
 # Claude tiers use the standard aliases (opus/sonnet/haiku) and need no config.
 # Codex model names are yours — edit to match your Codex setup.
@@ -50,6 +58,10 @@
 # no cost, no network). Known processes (Run Tests / Dev Server / View Logs /
 # Remote Shell) are named without a model either way.
 : "${SMART_NAME_AI:=1}"
+# Which summariser CLI to call: auto (claude if present, else omp — preserves
+# pre-existing behaviour on an install that already had claude configured,
+# even after omp is added to PATH later), or force one explicitly.
+: "${SMART_NAME_BACKEND:=auto}"
 # The model that proposes labels. Naming is a trivial task — keep it cheap.
 : "${SMART_NAME_MODEL:=haiku}"
 # Hard ceiling on a single model call, seconds. Timed-out calls just abstain.
@@ -71,7 +83,7 @@
 # ============================================================================
 export HERDR_DEFAULT_AGENT HERDR_SOURCE HERDR_SOCK HERDR_SORT_DONE_FIRST HERDR_SORT_NO_GH
 export HERDR_CODEX_DEEP HERDR_CODEX_STD HERDR_CODEX_FAST
-export HERDR_RECONCILE_INTERVAL_S
-export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_MODEL SMART_NAME_TIMEOUT
+export HERDR_RECONCILE_INTERVAL_S HERDR_TASK_RETENTION_DAYS
+export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_BACKEND SMART_NAME_MODEL SMART_NAME_TIMEOUT
 export SMART_NAME_COOLDOWN SMART_NAME_EVIDENCE_CHARS HERDR_STALL_SECS
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"

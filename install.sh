@@ -91,11 +91,24 @@ def find_hook(ev, aliases):
     # this event whose command matches one of the job's aliases — a
     # reference into the live `hooks` structure, so repointing it below is an
     # in-place mutation, not a second data structure to keep in sync.
+    #
+    # Matching used to be raw substring containment (`if a in cmd`). That
+    # means any command string that merely CONTAINS an alias as a substring
+    # anywhere — e.g. a hook literally named "my-herdr-notify.sh.bak"
+    # contains "herdr-notify.sh" — got misidentified as "already wired",
+    # even though it is a completely unrelated hook. With --repoint that is
+    # not cosmetic: this function's return value gets mutated in place
+    # below (`h["command"] = new_cmd`), so a substring false-positive would
+    # silently corrupt an unrelated entry in a file that routinely holds
+    # secrets and unrelated config. Compare basenames of whitespace-split
+    # command tokens instead, so a match requires the alias to be an exact
+    # path segment (the script's own filename), not a substring anywhere.
     for g in hooks.get(ev, []):
         for h in g.get("hooks", []):
             cmd = h.get("command", "")
+            basenames = {os.path.basename(tok.strip("'\"")) for tok in cmd.split()}
             for a in aliases:
-                if a in cmd:
+                if a in basenames:
                     return h, cmd
     return None, None
 
@@ -147,6 +160,15 @@ with open(tmp, "w", encoding="utf-8") as f:
     json.dump(d, f, indent=2, ensure_ascii=False)
     f.write("\n")
 json.load(open(tmp, encoding="utf-8"))   # never leave broken settings behind
+# open(tmp, "w") creates the tmp file at the umask-default mode (typically
+# 0o644), which silently drops any hardening the user applied to the
+# original — e.g. chmod 600 because, per the header above, this file
+# routinely holds secrets. os.replace() swaps inodes, it does not carry
+# permission bits with it, so without this the file would get quietly
+# world/group-readable again on every --apply. `settings` still exists on
+# disk at this point (replace hasn't happened yet), so copy its mode onto
+# tmp before the swap.
+os.chmod(tmp, os.stat(settings).st_mode & 0o777)
 os.replace(tmp, settings)
 print(f"wrote {settings}  (backup: {backup})")
 PY
