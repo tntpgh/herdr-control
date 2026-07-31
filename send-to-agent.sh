@@ -78,6 +78,15 @@ composer_has_stuck_paste() {
 _PROMPT_ARROW='❯[[:space:]]*[0-9]+\.'
 _PROMPT_OPTION='^[[:space:]]*[0-9]+\.[[:space:]]'
 _PROMPT_YN='\([Yy]/[Nn]\)|\[[Yy]/[Nn]\]'
+# omp's Approve/Deny tool-approval menu has no numbered options and no
+# Claude-shape `❯` arrow marker — it's an arrow-key/Enter menu, not a
+# digit-select. Verified 2026-07-31 against a live `omp --approval-mode
+# always-ask` pane: "Allow tool: bash" header, "Approve"/"Deny" rows,
+# "up/down navigate  enter select  esc cancel" footer. herdr-select.sh
+# cannot ANSWER this shape yet (see docs/control-plane-design.md) — this
+# only makes send-to-agent.sh recognise it and refuse, same as any other
+# prompt it can't safely blow through with a bare Enter.
+_PROMPT_OMP='Allow tool:|enter select'
 
 looks_like_permission_prompt() {
   local vis win
@@ -86,6 +95,7 @@ looks_like_permission_prompt() {
   printf '%s' "$win" | grep -Eq "$_PROMPT_YN" && return 0
   printf '%s' "$win" | grep -Eq "$_PROMPT_ARROW" \
     && printf '%s' "$win" | grep -Eq "$_PROMPT_OPTION" && return 0
+  printf '%s' "$win" | grep -Eq "$_PROMPT_OMP" && return 0
   return 1
 }
 
@@ -129,6 +139,11 @@ for _ in 1 2 3 4 5 6; do
       echo "REFUSED: a prompt appeared in $pane mid-submit — stopping rather than answering it." >&2
       echo "REFUSED: the text was delivered but NOT submitted; finish it by hand." >&2
       exit 5
+    fi
+    if [ "$pr" -eq 2 ]; then
+      echo "UNCONFIRMED: could not read $pane mid-submit — stopping rather than sending Enter blind." >&2
+      echo "UNCONFIRMED: the text was delivered but NOT confirmed submitted; finish it by hand." >&2
+      exit 4
     fi
   fi
   herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || {

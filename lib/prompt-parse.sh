@@ -66,6 +66,104 @@ prompt_context() {
     | cut -c1-200
 }
 
+# --- menu-shape prompts (no numbered options at all) ------------------------
+#
+# Not every agent renders a numbered list. omp's tool-approval prompt is an
+# up/down + Enter menu with no numbers and no bare-digit convention at all —
+# verified live 2026-07-31 against `omp --approval-mode always-ask`: an
+# "Allow tool: <name>" header, a blank separator, one row per option, a
+# blank separator, and a "... enter select ..." footer. The CURRENTLY
+# HIGHLIGHTED row is the only one carrying an SGR 24-bit background-colour
+# escape (\e[48;2;R;G;Bm) — every other row is unstyled plain text, which is
+# why this needs --format ansi; prompt_options above (plain --source
+# visible) cannot see it at all.
+#
+# Provides: prompt_menu_options <pane>  -> "N<TAB>label" per row, 1-based,
+#             top-to-bottom — the SAME numbering convention as
+#             prompt_options, so a caller (herdr-select.sh, a Slack "reply
+#             1/2/3") never needs to know which mechanism it is driving.
+#           prompt_menu_selected <pane> -> the 1-based row currently
+#             highlighted, or empty if no menu is showing OR the highlight
+#             could not be determined — never guess a position.
+#           prompt_menu_question <pane> -> the header/detail lines, for
+#             prompt_id() below.
+_MENU_HEADER='Allow tool:'
+_MENU_FOOTER='enter select'
+
+_menu_window() {
+  herdr pane read "$1" --source visible --lines 40 --format ansi 2>/dev/null | tail -n 20
+}
+
+# Strip ANSI escapes, then any leading non-alphanumeric run — the highlighted
+# row's leading icon glyph survives ANSI-stripping (it's a real character,
+# not an escape sequence) — then surrounding whitespace.
+_menu_strip() {
+  printf '%s' "$1" | sed -E $'s/\x1b\\[[0-9;]*m//g' | sed -E 's/^[^[:alnum:]]+//; s/[[:space:]]+$//'
+}
+
+prompt_menu_options() {
+  local win n=0 state=0 line stripped
+  win=$(_menu_window "$1") || return 1
+  while IFS= read -r line; do
+    case "$state" in
+      0) printf '%s' "$line" | grep -qF "$_MENU_HEADER" && state=1; continue ;;
+      1)
+        stripped=$(_menu_strip "$line")
+        [ -z "$stripped" ] && state=2
+        continue ;;
+      2)
+        printf '%s' "$line" | grep -qF "$_MENU_FOOTER" && { state=3; continue; }
+        stripped=$(_menu_strip "$line")
+        [ -n "$stripped" ] || continue
+        n=$((n+1))
+        printf '%d\t%s\n' "$n" "$stripped" ;;
+    esac
+  done <<EOF
+$win
+EOF
+}
+
+prompt_menu_selected() {
+  local win n=0 state=0 found="" line stripped
+  win=$(_menu_window "$1") || return 1
+  while IFS= read -r line; do
+    case "$state" in
+      0) printf '%s' "$line" | grep -qF "$_MENU_HEADER" && state=1; continue ;;
+      1)
+        stripped=$(_menu_strip "$line")
+        [ -z "$stripped" ] && state=2
+        continue ;;
+      2)
+        printf '%s' "$line" | grep -qF "$_MENU_FOOTER" && { state=3; continue; }
+        stripped=$(_menu_strip "$line")
+        [ -n "$stripped" ] || continue
+        n=$((n+1))
+        printf '%s' "$line" | grep -qE $'\x1b\\[48;2;[0-9]+;[0-9]+;[0-9]+m' && found="$n" ;;
+    esac
+  done <<EOF
+$win
+EOF
+  printf '%s' "$found"
+}
+
+prompt_menu_question() {
+  local win state=0 line stripped out=""
+  win=$(_menu_window "$1") || return 1
+  while IFS= read -r line; do
+    if [ "$state" = 0 ]; then
+      printf '%s' "$line" | grep -qF "$_MENU_HEADER" && state=1
+    fi
+    if [ "$state" = 1 ]; then
+      stripped=$(_menu_strip "$line")
+      [ -z "$stripped" ] && break
+      out="${out:+$out ; }$stripped"
+    fi
+  done <<EOF
+$win
+EOF
+  printf '%s' "$out"
+}
+
 # A stable fingerprint for "this exact prompt, right now" — the question plus
 # its options, hashed. Lets a wake event and a later answer agree on WHICH
 # prompt they mean: between a conductor deciding "press 2" and actually
@@ -74,10 +172,19 @@ prompt_context() {
 # caller that captured a prompt_id at decision time can pass it back at
 # injection time and refuse to act if it no longer matches, rather than
 # firing a stale decision into whatever the pane happens to show by then.
+#
+# Falls back to the menu-shape extractors above when no numbered options are
+# found, so --expect-prompt-id (herdr-select.sh) works the same way
+# regardless of which prompt shape is on screen — a caller never needs to
+# know or care which one it captured.
 prompt_id() {
   local q opts
   q="$(prompt_question "$1")"
   opts="$(prompt_options "$1")"
+  if [ -z "$opts" ]; then
+    q="$(prompt_menu_question "$1")"
+    opts="$(prompt_menu_options "$1")"
+  fi
   printf '%s\n%s' "$q" "$opts" | shasum -a 256 | cut -d' ' -f1
 }
 
