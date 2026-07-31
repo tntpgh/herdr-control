@@ -153,7 +153,15 @@ register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane
 # Stamp identity into the worker's own shell so its hooks (agent-hooks/
 # claude-notify.sh) can push a wake to the conductor pane on input-needed,
 # and can log against the same run/task the conductor is watching.
-stamped_cli="export HERDR_RUN_ID='$run_id' HERDR_TASK_ID='$task_id' HERDR_WORKER_ID='$worker_id' HERDR_CONDUCTOR_ID='$conductor_id' HERDR_CONDUCTOR_PANE_ID='$conductor_pane_id' HERDR_TASK_LABEL='$label'; $cli"
+#
+# %q-quote every interpolated value — label/branch/job are CLI-supplied and
+# land inside a string that gets TYPED into the freshly spawned worker's
+# live shell (herdr pane run, below). A single quote in $label (e.g. a
+# branch name containing one) previously broke out of the naive
+# 'single-quoted' interpolation and executed arbitrary commands in the new
+# pane — verified exploitable, fixed here.
+stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_TASK_LABEL=%q; %s' \
+  "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$label" "$cli")
 herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || { echo "spawn-task: launch failed: $cli" >&2; exit 1; }
 herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
 set_task_state "$run_id" "$task_id" "running"

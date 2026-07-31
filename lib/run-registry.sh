@@ -75,9 +75,19 @@ set_task_state() {                      # run_id task_id state
   f="$(task_file "$run_id" "$task_id")"
   [ -f "$f" ] || { echo "run-registry: no task file for $run_id/$task_id" >&2; return 1; }
   tmp="${f}.tmp.$$"
-  jq --arg state "$state" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '.state=$state | .updated_at=$at' "$f" > "$tmp" && mv "$tmp" "$f"
-  append_event "$run_id" "$task_id" "state_changed" "{\"state\":\"$state\"}"
+  # append_event must NOT fire on a failed state write — it used to run
+  # unconditionally as a separate statement, so a torn/failed jq or mv left
+  # events.jsonl permanently claiming a transition that never actually
+  # landed in the task file. The two sources of truth this registry is
+  # built around could silently diverge with no error surfaced anywhere.
+  if jq --arg state "$state" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '.state=$state | .updated_at=$at' "$f" > "$tmp" && mv "$tmp" "$f"; then
+    append_event "$run_id" "$task_id" "state_changed" "{\"state\":\"$state\"}"
+  else
+    rm -f "$tmp"
+    echo "run-registry: failed to write state for $run_id/$task_id — event NOT logged" >&2
+    return 1
+  fi
 }
 
 # Append one event to the run's CENTRAL events.jsonl (not the repo). Sequence
