@@ -26,7 +26,11 @@ _MUX_RE='^(tmux|screen|zellij|abduco|dtach|mosh-client)$'
 # value set in herdr-bridge.env or the launchd plist silently applies to input
 # arriving from Slack. Treat it as security configuration, not convenience.
 # (A malformed regex makes grep error, which denies — that direction is safe.)
-_AGENT_RE="${HERDR_AGENT_PROCS:-^(claude|codex|omc|herdr-reviewr|aider|opencode|goose)$}"
+# lib/agent-profiles.sh is the single source of truth for known agent binary
+# names — add a new agent there, not here.
+_pg_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$_pg_dir/agent-profiles.sh"
+_AGENT_RE="${HERDR_AGENT_PROCS:-^($(printf '%s' "$HERDR_AGENT_PROC_NAMES" | tr ' ' '|'))$}"
 
 # Agents that ride a shared runtime need MORE than the name. Every agent here is
 # some form of `node <script>`, but a runtime with no script — or with an

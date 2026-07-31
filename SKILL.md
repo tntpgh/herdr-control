@@ -52,6 +52,11 @@ burn your best model and a design task does not get your cheapest:
 `explore|quick|docs` → fast. Claude uses the standard aliases; Codex model names
 are yours to set in `config.sh`.
 
+**Agent-agnostic by construction.** `lib/agent-profiles.sh` is the single
+table of known agent process names, job-class→model routing, and launch
+flags — `claude`, `codex`, and (verified 2026-07-31, live) `omp` today. Add
+another CLI there, not by editing individual scripts.
+
 `sort-tabs.sh` ranks by git + PR state, attention-first:
 `waiting > active > committed > reviewed > merged > other`. Use `--dry-run`
 first; it prints the reordering without touching anything.
@@ -176,6 +181,12 @@ first: herdr reports the `tmux` client alongside the inner process, so a pane
 whose agent exited reads `tmux,zsh` and would otherwise pass. A shared runtime
 (`node`, `python`…) qualifies only when it was given a **script** — bare `node`
 or `node -i` is a REPL, which evaluates whatever it is handed.
+
+**One CLI's prompt shape is not another's.** `omp`'s tool-approval prompt is
+an arrow-key `Approve`/`Deny` menu, not Claude's/Codex's numbered list —
+`send-to-agent.sh` recognises and refuses it (same protection), but
+`herdr-select.sh` cannot yet ANSWER it. See "Multi-agent portability" in
+`docs/control-plane-design.md`.
 
 **Text is never delivered into a prompt.** A blocked agent is usually sitting on
 a permission gate, where typed text is inert and the Enter selects the

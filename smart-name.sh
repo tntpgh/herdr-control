@@ -173,23 +173,51 @@ Describe the task, not its tool, model, agent, or project. Omit project/app/mode
 If no clear persistent task exists, abstain.
 Return ONLY one JSON object, no prose: {"tab":"Review Auth Changes","reason":"short"} or {"tab":null,"reason":"unclear"}.'
 
-# NOTE: `claude -p` is a full Claude Code agent, not a bare model call — by
-# default it loads the launcher's CLAUDE.md, git state, and files, which would
-# name a tab after wherever this script runs instead of the target pane. The
-# flags below strip it back to a pure summariser: replace the system prompt,
-# load no settings/CLAUDE.md, expose no tools, no MCP; and run from a neutral
-# empty dir as belt-and-suspenders.
+# Both `claude -p` and `omp -p` are full agent CLIs, not a bare model call —
+# by default each loads the launcher's project context (CLAUDE.md/git state
+# for claude, project settings/skills for omp), which would name a tab after
+# wherever THIS script runs instead of the target pane. The flags below strip
+# each back to a pure summariser: replace the system prompt, load no
+# settings/skills/rules, expose no tools/MCP/extensions, run from a neutral
+# empty dir.
+#
+# SMART_NAME_BACKEND (config.sh) picks which CLI: `auto` (default) prefers
+# claude when present — an existing Claude Code install's naming behaviour,
+# cost, and auth path stay EXACTLY as they were before omp support was
+# added, even once omp is also on PATH — and only falls back to omp when
+# claude isn't installed. Set SMART_NAME_BACKEND=omp explicitly to prefer
+# omp's cleaner isolation flags (`--no-extensions --no-skills --no-rules
+# --no-session`, vs. claude -p's `--setting-sources ""`) instead. Verified
+# 2026-07-31: `omp -p` takes the prompt as a positional argument, not stdin
+# like `claude -p`.
 ai_name() {
   [ "$SMART_NAME_AI" = 1 ] || return 1
-  command -v claude >/dev/null 2>&1 || return 1
-  local evidence out neutral="$HERDR_STATE_DIR/.neutral"
-  evidence="$1"
+  local evidence="$1" out neutral="$HERDR_STATE_DIR/.neutral" backend="${SMART_NAME_BACKEND:-auto}"
   [ -n "$evidence" ] || return 1
   mkdir -p "$neutral" 2>/dev/null || neutral="${TMPDIR:-/tmp}"
-  out=$( cd "$neutral" && printf '%s' "$evidence" \
-         | _run_timeout "$SMART_NAME_TIMEOUT" claude -p --model "$SMART_NAME_MODEL" \
-             --system-prompt "$NAMING_INSTRUCTION" \
-             --setting-sources "" --tools "" --strict-mcp-config 2>/dev/null ) || return 1
+
+  case "$backend" in
+    claude) command -v claude >/dev/null 2>&1 || return 1 ;;
+    omp)    command -v omp    >/dev/null 2>&1 || return 1 ;;
+    *)
+      if command -v claude >/dev/null 2>&1; then backend=claude
+      elif command -v omp >/dev/null 2>&1; then backend=omp
+      else return 1
+      fi ;;
+  esac
+
+  if [ "$backend" = claude ]; then
+    out=$( cd "$neutral" && printf '%s' "$evidence" \
+             | _run_timeout "$SMART_NAME_TIMEOUT" claude -p --model "$SMART_NAME_MODEL" \
+                 --system-prompt "$NAMING_INSTRUCTION" \
+                 --setting-sources "" --tools "" --strict-mcp-config 2>/dev/null ) || return 1
+  else
+    out=$( _run_timeout "$SMART_NAME_TIMEOUT" omp -p "$evidence" \
+             --model "$SMART_NAME_MODEL" --system-prompt "$NAMING_INSTRUCTION" \
+             --no-tools --no-extensions --no-skills --no-rules --no-session \
+             --cwd "$neutral" 2>/dev/null ) || return 1
+  fi
+
   printf '%s' "$out" | python3 -c '
 import sys,json,re
 s=sys.stdin.read()

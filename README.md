@@ -80,6 +80,7 @@ overridable as an environment variable per run.
 # job-class maps to (plan→opus/deep, implement→sonnet/std, explore→haiku/fast)
 ./spawn-task.sh ~/src/app fix-comps implement          # claude sonnet
 ./spawn-task.sh ~/src/app arch review codex            # codex, deep model
+./spawn-task.sh ~/src/app fix-parser implement omp     # omp, sonnet (verified 2026-07-31)
 ./spawn-task.sh ~/src/app fix-comps implement --dry-run # preview, no changes
 
 # Sort: reorder tabs by branch state, needs-you first
@@ -285,17 +286,13 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `settings.example.json` | the hook wiring alone, with placeholders — merge, don't copy |
 | `SKILL.md` | what the tools do, and why several of them refuse things |
 | `AGENTS.md` | step-by-step activation for an agent to follow, with verification |
+| `lib/agent-profiles.sh` | known-agent process names + job-class→model routing + launch flags — single source of truth; add a new agent here |
 | `lib/pane-guard.sh` | "is this pane safe to send input to?" — shared gate, plus `require_pane_birth_match` (recycled-pane refusal) |
 | `lib/prompt-parse.sh` | read the options / context an agent is showing, plus `prompt_id` |
 | `lib/pane-name.sh` | pane id → "Space — Tab", for alerts a human reads |
 | `lib/run-registry.sh` | central run/task registry — identity, lifecycle, events, checkpoints (see `docs/control-plane-design.md`) |
 | `lib/reconcile.sh` | the reconciliation sweep + report, shared by `session-reconcile.sh` and `interval-reconcile.sh` |
-| `docs/control-plane-design.md` | conductor/worker control-plane design — what's built vs. only designed |
-| `lib/pane-guard.sh` | "is this pane safe to send input to?" — shared gate |
-| `lib/prompt-parse.sh` | read the options / context an agent is showing, plus `prompt_id` |
-| `lib/pane-name.sh` | pane id → "Space — Tab", for alerts a human reads |
-| `lib/run-registry.sh` | central run/task registry — identity, lifecycle, events (see `docs/control-plane-design.md`) |
-| `docs/control-plane-design.md` | conductor/worker control-plane design — what's built vs. only designed |
+| `docs/control-plane-design.md` | conductor/worker control-plane design — what's built vs. only designed, plus multi-agent portability status |
 | `docs/herdr-config-snippet.toml` | sidebar rows + keybindings for the two tools above |
 | `slack-bridge/` | two-way Slack bot: outbound alerts + reply routing |
 | `herdr-rpc.py` | socket JSON-RPC for verbless methods (`tab.move`) |

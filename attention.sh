@@ -98,7 +98,7 @@ classify() {
   # a frozen active-work marker -> stalled; a ready composer -> waiting for
   # input; anything else -> bare "waiting".
   vis=$(herdr pane read "$pane" --source visible --lines 12 2>/dev/null | perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g')
-  if printf '%s' "$vis" | grep -qiE 'esc to interrupt|thinking…|running…|compacting|⏳'; then
+  if printf '%s' "$vis" | grep -qiE 'esc to interrupt|thinking…|running…|compacting|⏳|⟨esc⟩'; then
     reason="stalled ${elapsed}s"
   elif printf '%s' "$vis" | grep -qE '│[[:space:]]*[❯>][[:space:]]*│|^[[:space:]]*[❯>][[:space:]]*$'; then
     reason="waiting for input"

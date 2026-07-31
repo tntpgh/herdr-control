@@ -16,13 +16,17 @@
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/config.sh"
+. "$here/lib/repo-root.sh"
 
 proj="${1:?usage: spawn-agent.sh <project-path> <role-label> [command...]}"
 role="${2:?usage: spawn-agent.sh <project-path> <role-label> [command...]}"
 shift 2
 cmd=("$@"); [ "${#cmd[@]}" -eq 0 ] && cmd=("$HERDR_DEFAULT_AGENT")
 
-root=$(git -C "$proj" rev-parse --show-toplevel 2>/dev/null || (cd "$proj" && pwd))
+# repo_root (lib/repo-root.sh), not --show-toplevel: inside a linked worktree
+# --show-toplevel returns the WORKTREE's own path, which would give a task
+# worktree its own separate workspace instead of joining its parent repo's.
+root=$(repo_root "$proj")
 
 ws=$(bash "$here/ensure-workspace.sh" --no-focus "$root") || exit 1
 

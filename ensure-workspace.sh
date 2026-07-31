@@ -7,33 +7,18 @@
 # field is only populated for herdr-managed worktrees, and labels are cosmetic, so
 # cwd is the reliable key. Matches by git top-level so a subdir pane still counts.
 set -uo pipefail
-source "$(cd "$(dirname "$0")" && pwd)/config.sh"
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/config.sh"
+. "$here/lib/repo-root.sh"
 
 focus=1
 [ "${1:-}" = "--no-focus" ] && { focus=0; shift; }
 proj="${1:?usage: ensure-workspace.sh [--no-focus] <project-path>}"
 [ -d "$proj" ] || { echo "ensure-workspace: not a directory: $proj" >&2; exit 1; }
 
-# Canonical PROJECT root. Deliberately NOT --show-toplevel: inside a linked
-# worktree that returns the WORKTREE's own path, so every worktree resolves to a
-# different "project" and gets its own top-level workspace — task worktrees end up
-# scattered beside real projects instead of grouped under the repo they belong to.
-# --git-common-dir points at the MAIN repo's .git from anywhere, worktree
-# included, so a worktree and its parent share one workspace.
-repo_root() {
-  local d="$1" common
-  common=$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""
-  if [ -z "$common" ]; then
-    # Not a repo, or git too old for --path-format: best effort.
-    git -C "$d" rev-parse --show-toplevel 2>/dev/null || (cd "$d" && pwd)
-    return
-  fi
-  if [ "$(basename "$common")" = ".git" ]; then
-    dirname "$common"
-  else
-    printf '%s' "$common"   # bare repo / unusual layout: the common dir is the repo
-  fi
-}
+# Canonical PROJECT root — repo_root (lib/repo-root.sh), shared with
+# spawn-agent.sh/spawn-task.sh so all three agree on which repo a path
+# belongs to.
 
 root=$(repo_root "$proj")
 label=$(basename "$root")

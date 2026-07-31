@@ -276,6 +276,38 @@ From Gemini's review, corroborating rather than duplicating the above:
   included), but a conductor juggling ten workers still can't reconstruct
   full context from a one-line label alone.
 
+## Multi-agent portability (2026-07-31)
+
+This whole design assumed one CLI (Claude Code, secondarily Codex). Widening
+it to any recognized agent — `lib/agent-profiles.sh`, added this round — is
+mostly mechanical (process-name allowlist, model-routing table, launch
+flags), verified live against `omp` (Oh My Pi): `pane_is_agent`, `spawn-task.sh`'s
+model routing, and `smart-name.sh`'s `omp -p` summariser path all confirmed
+working end-to-end against a real herdr pane.
+
+One piece is **not** portable by construction and remains open:
+**`herdr-select.sh` cannot answer an `omp` approval prompt.** Verified live
+(`omp --approval-mode always-ask`, real pane read): the prompt is an
+`Allow tool: <name>` header with an `Approve`/`Deny` menu navigated by
+up/down arrows + Enter — no numbered options, no bare-digit-no-Enter
+convention the way Claude's and Codex's prompts share. `send-to-agent.sh`
+now recognizes this shape (`Allow tool:`/`enter select` in
+`_PROMPT_OMP`) and refuses to blow through it with a bare Enter, same
+protection Claude/Codex prompts already got — but nothing presses
+"Approve" on your behalf yet. A worker launched at `--approval-mode write`
+(this round's chosen default for `omp`, matching Claude's
+`--permission-mode acceptEdits`) will sit blocked on its first `bash` call
+with no automated way to answer it; `--approval-mode yolo` avoids the block
+at the cost of no exec-approval gate at all.
+
+Closing this needs a genuine design decision, not a regex extension:
+whether to drive the Approve/Deny menu via `herdr pane send-keys` arrow
+sequences (exact keybinding beyond up/down/enter/esc not yet probed — e.g.
+a possible `y`/`a`/`d` hotkey was never tested), and how `herdr-select.sh`'s
+"record the choice before pressing" audit invariant maps onto a
+menu-navigation flow instead of a single keypress. Scoped as follow-up, not
+guessed at here.
+
 ## Full critiques (attached verbatim)
 
 <details>

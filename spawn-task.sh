@@ -7,13 +7,17 @@
 #
 #   spawn-task.sh ~/Code/tourguide fix-comps implement           # claude, sonnet
 #   spawn-task.sh ~/Code/tourguide arch-review review codex      # codex, deep model
+#   spawn-task.sh ~/Code/tourguide fix-parser implement omp      # omp, sonnet
 #   spawn-task.sh ~/Code/tourguide probe quick pwd               # literal cmd (no model)
 #
-# job-class -> model (edit MODEL MAP below; --model/--effort override):
-#   plan|architect|review|design  -> claude opus    · codex $HERDR_CODEX_DEEP
-#   implement|debug|code          -> claude sonnet  · codex $HERDR_CODEX_STD
-#   explore|quick|mechanical|docs -> claude haiku   · codex $HERDR_CODEX_FAST
-# (Claude tiers are standard aliases; Codex model names live in config.sh.)
+# job-class -> model (edit lib/agent-profiles.sh's model_for_agent; --model/
+# --effort override):
+#   plan|architect|review|design  -> claude opus   · codex $HERDR_CODEX_DEEP · omp opus:high
+#   implement|debug|code          -> claude sonnet · codex $HERDR_CODEX_STD  · omp sonnet:medium
+#   explore|quick|mechanical|docs -> claude haiku  · codex $HERDR_CODEX_FAST · omp haiku:low
+# (Claude/omp tiers are model-name aliases both CLIs fuzzy-match; Codex model
+# names live in config.sh. Known agents live in lib/agent-profiles.sh — add a
+# new one there, not in this file.)
 #
 # herdr's native `worktree create` always makes a SEPARATE space; to get a sub-tab
 # we do `git worktree add` + `tab create --workspace <repo-ws>` ourselves. Each tab
@@ -22,6 +26,8 @@ set -uo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/config.sh"
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/run-registry.sh"
+. "$here/lib/agent-profiles.sh"
+. "$here/lib/repo-root.sh"
 
 # ---- args ------------------------------------------------------------------
 base=""; dry=0; model_override=""; effort_override=""; positional=()
@@ -43,36 +49,35 @@ rest=("$@"); [ "${#rest[@]}" -eq 0 ] && rest=(claude)
 agent="${rest[0]}"
 
 # ---- MODEL MAP (job-class -> model / reasoning-effort) ----------------------
+# Table lives in lib/agent-profiles.sh (model_for_agent); this wrapper only
+# adds the --model/--effort override, which is local to this invocation.
 model_for() {  # <agent> <job> -> "<model>" or "<model>:<effort>"
-  local a="$1" j="$2"
   if [ -n "$model_override" ]; then
-    printf '%s' "$model_override"; [ -n "$effort_override" ] && printf ':%s' "$effort_override"; return
+    printf '%s' "$model_override"; [ -n "$effort_override" ] && printf ':%s' "$effort_override"
+    return
   fi
-  case "$a:$j" in
-    claude:plan|claude:architect|claude:review|claude:design) echo opus ;;
-    claude:implement|claude:debug|claude:code)                echo sonnet ;;
-    claude:explore|claude:quick|claude:mechanical|claude:docs) echo haiku ;;
-    claude:*)                                                 echo sonnet ;;
-    codex:plan|codex:architect|codex:review|codex:design)     echo "$HERDR_CODEX_DEEP" ;;
-    codex:implement|codex:debug|codex:code)                   echo "$HERDR_CODEX_STD" ;;
-    codex:explore|codex:quick|codex:mechanical|codex:docs)    echo "$HERDR_CODEX_FAST" ;;
-    codex:*)                                                  echo "$HERDR_CODEX_STD" ;;
-  esac
+  model_for_agent "$1" "$2"
 }
 
 # ---- build the launch command line -----------------------------------------
-case "$agent" in
-  claude)
-    m=$(model_for claude "$job")
-    cli="claude --model ${m} --permission-mode acceptEdits" ;;
-  codex)
-    me=$(model_for codex "$job"); m="${me%%:*}"; e="${me##*:}"
-    cli="codex -m ${m} -c model_reasoning_effort=${e}" ;;
-  *)
-    cli="${rest[*]}" ;;  # literal command; no model mapping
-esac
+# cli_for_agent (lib/agent-profiles.sh) knows the launch flags for a
+# recognized agent (claude/codex/omp today); anything else falls through
+# unchanged as a literal command, same as before.
+m=$(model_for "$agent" "$job")
+if cli=$(cli_for_agent "$agent" "$m"); then
+  # extra flags/args after the agent name (e.g. `... implement claude
+  # --some-flag`) used to be silently dropped — only the unrecognized-agent
+  # fallback below ever consumed them.
+  [ "${#rest[@]}" -gt 1 ] && cli="$cli ${rest[*]:1}"
+else
+  cli="${rest[*]}"  # literal command; no model mapping
+fi
 
-root=$(git -C "$proj" rev-parse --show-toplevel 2>/dev/null || (cd "$proj" && pwd))
+# repo_root (lib/repo-root.sh): --show-toplevel alone returns a linked
+# worktree's own path, not the shared main-repo root — calling spawn-task.sh
+# against an existing task worktree would then scatter the new worktree
+# under the sub-worktree's name instead of the real project's.
+root=$(repo_root "$proj")
 [ -d "$root/.git" ] || git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || { echo "spawn-task: not a git repo: $root" >&2; exit 1; }
 wt="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$root")/${branch}"
 label="${job}:${branch}"
@@ -121,7 +126,7 @@ if [ "$dry" = 1 ]; then
 fi
 
 # ---- worktree: create or reuse ---------------------------------------------
-if git -C "$root" worktree list --porcelain 2>/dev/null | grep -qx "worktree $wt"; then
+if git -C "$root" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt"; then
   :  # already checked out here
 elif git -C "$root" show-ref --verify --quiet "refs/heads/${branch}"; then
   git -C "$root" worktree add "$wt" "$branch" >/dev/null 2>&1 || { echo "spawn-task: worktree add (existing branch) failed" >&2; exit 1; }
