@@ -20,6 +20,29 @@ export WORKER_SCREEN="$WORK/worker.txt"
 export COND_SCREEN="$WORK/cond.txt"
 export SENT="$WORK/sent.log"
 export NOTIFIED="$WORK/notified.log"
+# Must be EXPORTED, not just set: the herdr stub is an exported bash function, but
+# it runs inside child shells (send-to-agent.sh is invoked as `bash <script>`), and
+# a plain shell variable does not cross that boundary — the redirect would go to
+# /wake.txt and fail silently.
+export WAKE="$WORK/wake.txt"
+
+# Belt and braces against a biometric prompt. herdr-notify.sh no longer sources
+# the bridge env on the --dry-run path, but this suite dry-runs it, and a future
+# test could easily reach a path that does. The real ~/.config/herdr-bridge.env
+# resolves both tokens through `op read`, which falls back to a 1Password Touch ID
+# prompt in any shell without OP_SERVICE_ACCOUNT_TOKEN — so an unguarded suite
+# demanded a thumbprint per run. A test suite must never need a human finger.
+#
+# The values are deliberately NOT shaped like real Slack tokens (no xoxb-/xapp-
+# prefix): the shared pre-commit secret scanner matches on those shapes, and a
+# realistic-looking dummy would trip it on every commit. Do not "fix" them.
+export HERDR_BRIDGE_ENV="$WORK/bridge.env"
+cat > "$HERDR_BRIDGE_ENV" <<'EOS'
+SLACK_BOT_TOKEN=DUMMY-NOT-A-REAL-TOKEN
+SLACK_APP_TOKEN=DUMMY-NOT-A-REAL-TOKEN
+HERDR_BRIDGE_ALLOW_USERS=UDUMMYUSER
+HERDR_BRIDGE_TEAM=TDUMMYTEAM
+EOS
 : > "$SENT"; : > "$NOTIFIED"
 
 WPANE="w1:p1"; WBIRTH="wterm-1"
@@ -41,7 +64,10 @@ herdr() {
       pane="$3"
       if [ "$pane" = "$CPANE" ]; then cat "$COND_SCREEN"; else cat "$WORKER_SCREEN"; fi ;;
     "pane send-text")
-      printf 'send-text %s\n' "$3" >> "$SENT" ;;
+      # Record the TEXT, not just the target: the wake body is a contract too —
+      # it has to carry the commands the receiver needs to act on it.
+      printf 'send-text %s\n' "$3" >> "$SENT"
+      printf '%s' "$4" > "$WAKE" ;;
     "pane send-keys")
       printf 'send-keys %s %s\n' "$3" "$4" >> "$SENT" ;;
     *) return 0 ;;
@@ -169,6 +195,28 @@ printf '%s' "$(q_payload wake_result)" | grep -q '"outcome":"submitted"' \
   || bad "outcome payload: $(q_payload wake_result)"
 [ "$(q_state)" = "blocked" ] && ok "task transitioned to blocked" || bad "task state=$(q_state)"
 printf '%s' "$(q_payload input_required)" | grep -q 'prompt_id' && ok "input_required carries a prompt_id" || bad "no prompt_id in input_required"
+
+printf '== the wake must be ACTIONABLE, not just an instruction to verify ==\n'
+# Observed live: a conductor received a wake, had no idea herdr even has a CLI,
+# concluded the worker "appears to have already disconnected", and told the human
+# so — while the worker sat on a live approval prompt. Telling a receiver to
+# "verify before acting" without the commands to verify produced a confidently
+# wrong answer, which is worse than no wake.
+wake_txt="$(cat "$WAKE" 2>/dev/null)"
+printf '%s' "$wake_txt" | grep -q 'HERDR-PEER-SIGNAL' \
+  && ok "machine-readable peer-signal prefix" || bad "no prefix: $wake_txt"
+printf '%s' "$wake_txt" | grep -q 'not an instruction from the operator' \
+  && ok "states it is not operator authority" || bad "missing the authority disclaimer"
+printf '%s' "$wake_txt" | grep -q "READ IT: herdr pane read $WPANE" \
+  && ok "carries the command to inspect the worker" || bad "no read command: $wake_txt"
+printf '%s' "$wake_txt" | grep -q "ANSWER IT:.*herdr-select.sh $WPANE" \
+  && ok "carries the command to answer it" || bad "no answer command: $wake_txt"
+printf '%s' "$wake_txt" | grep -q 'expect-prompt-id' \
+  && ok "answer command pins the prompt_id (TOCTOU close is usable)" || bad "no --expect-prompt-id"
+# One line only: send-text types this into a TUI composer, where an embedded
+# newline reads as Enter and would submit half a message.
+[ "$(printf '%s' "$wake_txt" | wc -l | tr -d ' ')" = "0" ] \
+  && ok "single line (a newline would submit the composer early)" || bad "wake spans multiple lines"
 
 printf '== conductor itself showing a prompt -> wake REFUSED and recorded as such ==\n'
 # This is the item-4 payoff. send-to-agent.sh refuses (exit 5) rather than press
