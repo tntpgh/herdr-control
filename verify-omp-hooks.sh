@@ -79,6 +79,22 @@ clean_screen() { printf ' $ \n ready\n'; }
 . "$here/lib/run-registry.sh"
 register_task run1 task1 w1 cond1 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt "impl:omp-test" >/dev/null 2>&1
 
+printf '== spawn-task.sh must stamp the worker its OWN pane id ==\n'
+# A static check, and worth one: this omission silently disabled the ENTIRE omp
+# push path and nothing caught it, because every other test supplies
+# HERDR_PANE_ID itself. omp-notify.sh refuses to alert without knowing which pane
+# to read (it cannot verify a prompt painted), so an unstamped worker no-ops on
+# every tool call — a feature that is fully wired, fully tested, and completely
+# inert in production. Two other things quietly depend on it too:
+# lib/push-wake.sh captures prompt_id only when it is set (so --expect-prompt-id
+# was unusable from a push wake), and the wake text names the worker's pane.
+# Found by running a real omp worker, not by any of the stubbed suites.
+if grep -q 'HERDR_PANE_ID=%q' "$here/spawn-task.sh"; then
+  ok "spawn-task.sh stamps HERDR_PANE_ID into the worker environment"
+else
+  bad "spawn-task.sh does NOT stamp HERDR_PANE_ID — the omp push path is inert"
+fi
+
 run_notify() {                          # <tool> -> runs omp-notify.sh
   printf '{"tool":"%s","message":"omp needs permission","cwd":"/tmp/repo"}' "$1" \
     | ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" \

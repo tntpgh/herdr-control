@@ -156,8 +156,21 @@ register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane
 
 # ---- launch the agent in the tab -------------------------------------------
 # Stamp identity into the worker's own shell so its hooks (agent-hooks/
-# claude-notify.sh) can push a wake to the conductor pane on input-needed,
-# and can log against the same run/task the conductor is watching.
+# claude-notify.sh, agent-hooks/omp-notify.sh) can push a wake to the conductor
+# pane on input-needed, and can log against the same run/task the conductor is
+# watching.
+#
+# HERDR_PANE_ID is the worker's OWN pane, and it was missing here until
+# 2026-08-01 — a latent gap that only showed up once something depended on it:
+#   * agent-hooks/omp-notify.sh cannot verify that a prompt actually painted
+#     without knowing which pane to read, and refuses to alert blind, so the
+#     ENTIRE omp push path silently no-opped for every spawned worker.
+#   * lib/push-wake.sh captures prompt_id only when this is set, so for spawned
+#     Claude workers it was always empty — meaning --expect-prompt-id, the whole
+#     TOCTOU close, could never actually be used from a push wake.
+#   * the wake text names the worker's pane so the conductor knows where to
+#     look; unset, it read "(?)".
+# Cheap to stamp, and three separate features quietly depended on it.
 #
 # %q-quote every interpolated value — label/branch/job are CLI-supplied and
 # land inside a string that gets TYPED into the freshly spawned worker's
@@ -165,8 +178,8 @@ register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane
 # branch name containing one) previously broke out of the naive
 # 'single-quoted' interpolation and executed arbitrary commands in the new
 # pane — verified exploitable, fixed here.
-stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_TASK_LABEL=%q; %s' \
-  "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$label" "$cli")
+stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_PANE_ID=%q HERDR_TASK_LABEL=%q; %s' \
+  "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$cli")
 herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || { echo "spawn-task: launch failed: $cli" >&2; exit 1; }
 herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
 set_task_state "$run_id" "$task_id" "running"
