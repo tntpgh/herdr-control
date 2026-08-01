@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run]
+# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus]
 #
 # Spin a task into its own WORKTREE, opened as a TAB inside the project's own
 # workspace (a "sub-tab", not a separate space), running the right agent at the
@@ -9,6 +9,10 @@
 #   spawn-task.sh ~/Code/tourguide arch-review review codex      # codex, deep model
 #   spawn-task.sh ~/Code/tourguide fix-parser implement omp      # omp, sonnet
 #   spawn-task.sh ~/Code/tourguide probe quick pwd               # literal cmd (no model)
+#
+# Default is BACKGROUND: the new sub-tab does not steal focus (a spawned task
+# worker should never yank your terminal out from under you). Pass --focus
+# to jump to it immediately: spawn-task.sh --focus ~/Code/tourguide fix-comps implement
 #
 # job-class -> model (edit lib/agent-profiles.sh's model_for_agent; --model/
 # --effort override):
@@ -30,13 +34,14 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/repo-root.sh"
 
 # ---- args ------------------------------------------------------------------
-base=""; dry=0; model_override=""; effort_override=""; positional=()
+base=""; dry=0; model_override=""; effort_override=""; foc=--no-focus; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base="$2"; shift 2 ;;
     --model) model_override="$2"; shift 2 ;;
     --effort) effort_override="$2"; shift 2 ;;
     --dry-run|-n) dry=1; shift ;;
+    --focus) foc=--focus; shift ;;
     *) positional+=("$1"); shift ;;
   esac
 done
@@ -145,7 +150,7 @@ mkdir -p "$(dirname "$events_file")"
 
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
 ws=$(bash "$here/ensure-workspace.sh" --no-focus "$root") || exit 1
-tc=$(herdr tab create --workspace "$ws" --cwd "$wt" --label "$label" --focus 2>/dev/null)
+tc=$(herdr tab create --workspace "$ws" --cwd "$wt" --label "$label" "$foc" 2>/dev/null)
 tab=$(printf '%s' "$tc" | jq -r '.result.tab.tab_id // empty')
 pane=$(printf '%s' "$tc" | jq -r '.result.root_pane.pane_id // empty')
 pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
@@ -184,7 +189,8 @@ herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || { echo "spawn-task: lau
 herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
 set_task_state "$run_id" "$task_id" "running"
 
-printf 'spawned %-22s ws=%s tab=%s pane=%s\n' "$label" "$ws" "$tab" "$pane"
+bgtag="background"; [ "$foc" = --focus ] && bgtag="focused"
+printf 'spawned %-22s ws=%s tab=%s pane=%s  [%s]\n' "$label" "$ws" "$tab" "$pane" "$bgtag"
 printf '  worktree: %s\n  launch:   %s\n' "$wt" "$cli"
 printf '  wake:     %s %s '"'"'%s'"'"'\n' "$here/wake-on-evidence.sh" "$events_file" "$wake_pattern"
 printf '  worker on completion appends to %s, e.g.:\n' "$events_file"
