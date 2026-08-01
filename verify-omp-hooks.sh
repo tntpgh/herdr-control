@@ -95,6 +95,35 @@ else
   bad "spawn-task.sh does NOT stamp HERDR_PANE_ID — the omp push path is inert"
 fi
 
+printf '== the Slack alert must be ANSWERABLE for a menu-shape prompt ==\n'
+# Reported live: "I see the message, but no buttons show on slack for me to
+# select". herdr-notify.sh built its option list with prompt_options only — the
+# NUMBERED parser — so for omp (a highlight menu with no numbers on screen) it
+# always came back empty, the alert fell through to the plain-context branch, and
+# with no options there were no buttons, no "reply with 1/2" line, and no
+# pending.jsonl entry for herdr-resolve.sh to retract. The alert arrived and could
+# only be read.
+omp_menu_screen "rm -rf /tmp/x" > "$WORKER_SCREEN"
+alert_body="$(HERDR_BRIDGE_STATE="$WORK/nb" bash "$here/slack-bridge/herdr-notify.sh" \
+  --dry-run --choices --pane "$WPANE" "omp needs your permission" 2>&1 || true)"
+printf '%s' "$alert_body" | grep -q 'with buttons' \
+  && ok "alert carries Slack buttons" || bad "no buttons built: $alert_body"
+printf '%s' "$alert_body" | grep -qE '\*1\.\* Approve' \
+  && ok "option 1 Approve rendered" || bad "option 1 missing"
+printf '%s' "$alert_body" | grep -qE '\*2\.\* Deny' \
+  && ok "option 2 Deny rendered" || bad "option 2 missing"
+printf '%s' "$alert_body" | grep -q 'Reply in thread with 1, 2' \
+  && ok "threaded-number reply hint present (works with no Slack config)" || bad "no reply hint"
+# The question must come from the MENU extractor. prompt_question returns "the
+# last non-empty line above the first numbered option"; with no numbered option
+# on screen it never stops early and yields the pane's last line, which for omp
+# is a box-drawing rule — so choosing it by "is prompt_question empty" silently
+# led the alert with a row of ─── where the command should be.
+printf '%s' "$alert_body" | grep -q 'Allow tool: bash' \
+  && ok "question names the tool and command" || bad "question wrong: $alert_body"
+printf '%s' "$alert_body" | grep -qE '^[[:space:]]*─+[[:space:]]*$' \
+  && bad "a box-drawing rule leaked in as the question" || ok "no TUI furniture as the question"
+
 run_notify() {                          # <tool> -> runs omp-notify.sh
   printf '{"tool":"%s","message":"omp needs permission","cwd":"/tmp/repo"}' "$1" \
     | ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" \

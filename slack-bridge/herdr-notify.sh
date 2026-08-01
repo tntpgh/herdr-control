@@ -148,10 +148,10 @@ body="$text"
 [ -n "$pane" ] && body="$(_hdr)"
 
 # --choices: an alert you cannot act on is half a feature. When the pane is
-# sitting on a numbered prompt, show the ACTUAL options and make them
-# answerable — as a threaded number (works with no Slack app configuration) and
-# as buttons (dormant until Interactivity is enabled on the app). Both routes
-# end in herdr-select.sh, so a choice is validated and recorded identically.
+# sitting on a prompt, show the ACTUAL options and make them answerable — as a
+# threaded number (works with no Slack app configuration) and as buttons (dormant
+# until Interactivity is enabled on the app). Both routes end in herdr-select.sh,
+# so a choice is validated and recorded identically.
 blocks=""
 if [ "$choices" = 1 ] && [ -n "$pane" ]; then
   . "$_lib/prompt-parse.sh"
@@ -161,14 +161,41 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
   # the question — which is exactly the failure this whole feature exists to
   # avoid. Poll briefly for the options to appear. Costs nothing when they are
   # already there, and the hook is async so a short wait is free.
+  #
+  # BOTH prompt shapes, in the same order herdr-select.sh's _current_offer() and
+  # prompt_id() use them — numbered first, then the menu. This was numbered-ONLY
+  # until 2026-08-01, which made every omp alert unanswerable: omp renders an
+  # Approve/Deny highlight menu with no numbers on screen, so prompt_options
+  # always returned empty, the alert fell through to the plain-context branch,
+  # and with no options there were no buttons, no "reply with 1/2" line, and
+  # nothing written to pending.jsonl (so herdr-resolve.sh never tracked or
+  # retracted it either). Observed live: the alert arrived and could only be
+  # read, not acted on.
+  #
+  # prompt_menu_options numbers the rows 1..N top-to-bottom — deliberately the
+  # same convention as prompt_options — so everything downstream (the threaded
+  # number, the button values, herdr-select.sh) works unchanged and neither the
+  # operator nor Slack ever needs to know which mechanism is being driven.
   opts=""
+  mech=""
   for _ in 1 2 3 4 5 6 7 8; do
-    opts=$(prompt_options "$pane")
-    [ -n "$opts" ] && break
+    opts=$(prompt_options "$pane");     [ -n "$opts" ] && { mech=numbered; break; }
+    opts=$(prompt_menu_options "$pane"); [ -n "$opts" ] && { mech=menu; break; }
     sleep 0.25
   done
   if [ -n "$opts" ]; then
-    question=$(prompt_question "$pane")
+    # The question extractor must MATCH the parser that produced the options.
+    # prompt_question finds "the last non-empty line above the first numbered
+    # option" — with no numbered option on screen it never stops early and
+    # returns the last line of the window instead, which for omp is the TUI's
+    # box-drawing rule. Choosing it by "is prompt_question empty" therefore does
+    # not work: it is not empty, it is wrong, and the alert led with a row of
+    # ─── characters where the command should be.
+    if [ "$mech" = menu ]; then
+      question=$(prompt_menu_question "$pane")
+    else
+      question=$(prompt_question "$pane")
+    fi
     list=$(printf '%s\n' "$opts" | awk -F'\t' '{printf "  *%s.* %s\n", $1, $2}')
     nums=$(printf '%s\n' "$opts" | awk -F'\t' '{printf "%s%s", sep, $1; sep=", "}')
     body="$(_hdr)"
