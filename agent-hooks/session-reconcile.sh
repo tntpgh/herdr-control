@@ -26,10 +26,10 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 conductor_id="$(resolve_conductor_id)"
 run_reconciliation "$conductor_id" "SessionStart"
 
-# Terminal-state task files otherwise accumulate forever — all_task_files()
-# has no retention, so a long-lived host's registry grows without bound.
+# Terminal-state task rows otherwise accumulate forever — nothing else in the
+# registry prunes, so a long-lived host's store grows without bound.
 # SessionStart is the natural place for this: it already pays the cost of a
-# full task-file scan for run_reconciliation above, it fires at most once
+# full task scan for run_reconciliation above, it fires at most once
 # per session (unlike interval-reconcile.sh's every-tool-call throttle), and
 # HERDR_TASK_RETENTION_DAYS (config.sh, default 14) makes the age
 # configurable without touching this file.

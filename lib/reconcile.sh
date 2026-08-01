@@ -43,8 +43,21 @@ resolve_conductor_id() {
 # every time. Without it (SessionStart's one-time cost), an explicit
 # "no changes" line is useful confirmation that reconciliation actually ran.
 run_reconciliation() {
-  local conductor_id="$1" hook_event="$2" quiet=0
-  [ "${3:-}" = "--quiet-if-empty" ] && quiet=1
+  local conductor_id="$1" hook_event="$2" quiet=0 hook_json=1
+  shift 2
+  # Flags rather than one positional: agent-hooks/omp-reconcile.sh needs the
+  # human summary WITHOUT the trailing hookSpecificOutput line. That JSON is
+  # Claude Code's own hook-output protocol for injecting additionalContext; omp
+  # injects context by returning a message from its before_agent_start handler
+  # instead (agent-hooks/omp-herdr-control.ts), so emitting Claude's envelope
+  # there would just print a stray JSON blob into the omp session.
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --quiet-if-empty) quiet=1 ;;
+      --no-hook-json)   hook_json=0 ;;
+    esac
+    shift
+  done
 
   local live_json have_live=0
   live_json="$(herdr pane list 2>/dev/null || true)"
@@ -61,11 +74,14 @@ run_reconciliation() {
   checkpoint="$(read_checkpoint "$conductor_id")"
   new_checkpoint="$checkpoint"
 
-  while IFS= read -r tf; do
-    [ -n "$tf" ] && [ -f "$tf" ] || continue
-    local task_json run_id task_id state pane_id pane_birth
-    task_json="$(cat "$tf" 2>/dev/null)"
-    printf '%s' "$task_json" | jq -e . >/dev/null 2>&1 || continue   # skip a torn write
+  # One JSON object per registered task, straight from the registry. This used
+  # to iterate FILE PATHS and cat each one, which needed a torn-write guard
+  # (`jq -e .` on the contents) because a reader could catch a task file
+  # mid-rewrite. The registry is a single SQLite read now, so there is no
+  # partially-written row left to defend against.
+  while IFS= read -r task_json; do
+    [ -n "$task_json" ] || continue
+    local run_id task_id state pane_id pane_birth
 
     run_id=$(printf '%s' "$task_json" | jq -r '.run_id // empty')
     task_id=$(printf '%s' "$task_json" | jq -r '.task_id // empty')
@@ -122,7 +138,7 @@ run_reconciliation() {
         fi
         ;;
     esac
-  done < <(all_task_files)
+  done < <(all_tasks_json)
 
   write_checkpoint "$conductor_id" "$new_checkpoint"
 
@@ -130,12 +146,12 @@ run_reconciliation() {
     [ "$quiet" = 1 ] && return 0
     local summary="wake-persistence: no task-state changes since this conductor (${conductor_id}) last checked in."
     printf '%s\n' "$summary"
-    jq -nc --arg ev "$hook_event" --arg ctx "$summary" '{hookSpecificOutput:{hookEventName:$ev, additionalContext:$ctx}}'
+    [ "$hook_json" = 1 ] && jq -nc --arg ev "$hook_event" --arg ctx "$summary" '{hookSpecificOutput:{hookEventName:$ev, additionalContext:$ctx}}'
     return 0
   fi
 
   local summary="wake-persistence: ${report_count} task(s) changed state since this conductor (${conductor_id}) last checked:"$'\n'"${report_lines%$'\n'}"
   printf '%s\n' "$summary"
-  jq -nc --arg ev "$hook_event" --arg ctx "$summary" '{hookSpecificOutput:{hookEventName:$ev, additionalContext:$ctx}}'
+  [ "$hook_json" = 1 ] && jq -nc --arg ev "$hook_event" --arg ctx "$summary" '{hookSpecificOutput:{hookEventName:$ev, additionalContext:$ctx}}'
   return 0
 }

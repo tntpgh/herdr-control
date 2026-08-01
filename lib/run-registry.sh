@@ -10,38 +10,307 @@
 #
 # So: every task gets a registered identity (run/task/worker/conductor id,
 # plus a pane BIRTH fingerprint — herdr's own terminal_id, unique per pane
-# instance and never reused) in ONE central directory, not a file per
-# worktree.
+# instance and never reused) in ONE central store, not a file per worktree.
 #
-# Sourced by spawn-task.sh (register) and agent-hooks/claude-notify.sh (read,
-# to find the conductor to wake and to log the wake event). Requires: jq.
+# ---- why SQLite, and not the JSON-file + JSONL spool this replaced ---------
+# The file layout ("tasks/<task_id>.json" plus an append-only "events.jsonl"
+# per run) satisfied "durable" and failed "reliable". Review correction 4
+# named the exact gaps, and every one of them is a property a filesystem
+# cannot give you without reimplementing a database badly:
 #
-# KNOWN GAPS — this is the SHAPE of a durable registry for a single worker,
-# not the full reliability story a multi-worker fleet needs. Documented, not
-# solved here (see docs/control-plane-design.md, "designed but not built"):
-#   - id generation is date+pid+RANDOM: not collision-proof across concurrent
-#     spawns on the same host in the same second
-#   - task-file writes are NOT atomic (no lock, no temp-file+rename+fsync)
-#   - event sequence numbers are best-effort (count-then-append), not a real
-#     monotonic counter under concurrent writers
-#   - no consumer checkpoints, no dedup, no reconciliation sweep, no leases
+#   * sequence numbers were count-then-append (`grep -c` the file, add one).
+#     Two writers racing produce the SAME sequence, and neither notices.
+#   * no dedup. An at-least-once producer that retried wrote the event twice.
+#   * the consumer checkpoint tracked TASK STATE only, never the event stream,
+#     so "replay every event exactly once" was impossible by construction —
+#     a task changing state twice between two sweeps reported once.
+#   * atomicity was per-file temp+rename. That makes ONE file consistent; it
+#     cannot make a state change and its event log entry land together, which
+#     is precisely the divergence a prior fix had to paper over by refusing to
+#     log an event when the state write failed.
+#
+# SQLite gives all four as primitives: AUTOINCREMENT is a real monotonic
+# counter, UNIQUE(event_id) is dedup, a transaction makes the state change and
+# its event atomic *together*, and a cursor column is an event-stream
+# checkpoint. WAL mode plus busy_timeout make concurrent hook firings safe
+# instead of merely unlikely. It is also not a new dependency: sqlite3 ships
+# with macOS.
+#
+# Sourced by spawn-task.sh (register), agent-hooks/claude-notify.sh and
+# agent-hooks/omp-notify.sh (read + log), lib/reconcile.sh (sweep),
+# lib/pane-guard.sh (task_for_pane), herdr-select.sh (approval lifecycle).
+# Requires: sqlite3, jq.
 set -uo pipefail
 
+# ---- location ---------------------------------------------------------------
+# HERDR_RUN_STATE_DIR keeps its old meaning (the registry root) so an operator
+# override and every doc that mentions it still work; the database simply
+# lives inside it. Never inside a worktree: worktree cleanup must not be able
+# to delete the control plane.
 run_state_root() {
   printf '%s\n' "${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}"
 }
 
-run_dir()     { printf '%s/%s\n' "$(run_state_root)" "$1"; }        # run_id
-tasks_dir()   { printf '%s/tasks\n' "$(run_dir "$1")"; }             # run_id
-task_file()   { printf '%s/%s.json\n' "$(tasks_dir "$1")" "$2"; }    # run_id task_id
-events_file() { printf '%s/events.jsonl\n' "$(run_dir "$1")"; }      # run_id
+registry_db() { printf '%s/registry.sqlite3\n' "$(run_state_root)"; }
+
+# ---- SQL plumbing -----------------------------------------------------------
+# Quote a value as a SQLite string literal by doubling embedded single quotes.
+#
+# This is the ONLY way a caller-supplied value may reach a statement. It is
+# security-relevant, not stylistic: spawn-task.sh already shipped a verified
+# shell-injection through an unescaped task label (a branch name containing a
+# single quote), and a registry that interpolates a label straight into SQL
+# reintroduces the same class one layer down — a label of
+#   x'); DROP TABLE tasks; --
+# would otherwise be executed. Doubling the quote is SQLite's own literal
+# escape, so the value can contain quotes, newlines, semicolons, anything.
+_sq() {
+  local s=${1//\'/\'\'}
+  printf "'%s'" "$s"
+}
+
+# Every connection sets busy_timeout and synchronous itself: they are
+# per-connection, not stored in the file, and each call here is a fresh
+# sqlite3 process. busy_timeout is what turns "two PostToolUse hooks fired at
+# once" from an SQLITE_BUSY error into a short block — the old code had no
+# equivalent and simply corrupted its own sequence numbers instead.
+# synchronous=FULL because a control plane's whole job is to still be correct
+# after the laptop slept or the process was killed; it costs an fsync per
+# commit on a table that sees a handful of writes per minute.
+#
+# busy_timeout is set through the CLI's `.timeout` DOT-COMMAND, not
+# `PRAGMA busy_timeout=N`, and that distinction is load-bearing: the PRAGMA
+# form is a getter-setter and RETURNS A ROW, so it prints "5000" onto stdout
+# ahead of the actual result. Every reader here then saw "5000\n<real value>"
+# — read_task returned a number jq could not index, checkpoint_age_s parsed
+# 5000 as an age, and set_task_state compared the literal string "5000
+# starting" against its transition table and refused every legal move. The
+# dot-command sets the same timeout and emits nothing. (`PRAGMA
+# synchronous=FULL` is a pure setter and is silent, so it can stay inline.)
+_sql() {
+  sqlite3 -batch -noheader -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$(registry_db)" \
+    "PRAGMA synchronous=FULL; $*"
+}
+
+_now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# ---- schema -----------------------------------------------------------------
+# Guarded per process, not per call: each script invocation is a fresh shell,
+# so this runs at most once per process even though the DDL is idempotent.
+_HERDR_REGISTRY_READY=0
+
+_registry_schema_version() { printf '2\n'; }
+
+registry_init() {
+  [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
+  local root db
+  root="$(run_state_root)"
+  db="$(registry_db)"
+  mkdir -p "$root" || {
+    printf 'run-registry: cannot create registry root %s\n' "$root" >&2
+    return 1
+  }
+
+  # journal_mode is persisted in the database header, so it is set here rather
+  # than in _sql — WAL is what lets the reconcile sweep read while a hook
+  # writes, instead of the two serializing on a whole-file lock.
+  if ! sqlite3 -batch "$db" "
+PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=${HERDR_REGISTRY_BUSY_MS:-5000};
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+-- task_id is the PRIMARY KEY, deliberately. Id generation is
+-- timestamp+pid+RANDOM and this file's previous header admitted it is 'not
+-- collision-proof across concurrent spawns in the same second'. Under the old
+-- file layout a collision silently OVERWROTE the earlier task's registration,
+-- quietly detaching a live worker from its pane-birth fingerprint (which
+-- disables recycled-pane refusal for it — a safety regression that produced no
+-- error). As a primary key the same collision now fails the INSERT loudly and
+-- register_task reports it.
+CREATE TABLE IF NOT EXISTS tasks (
+  task_id              TEXT PRIMARY KEY,
+  run_id               TEXT NOT NULL,
+  worker_id            TEXT NOT NULL DEFAULT '',
+  conductor_id         TEXT NOT NULL DEFAULT '',
+  conductor_pane_id    TEXT NOT NULL DEFAULT '',
+  conductor_pane_birth TEXT NOT NULL DEFAULT '',
+  pane_id              TEXT NOT NULL DEFAULT '',
+  pane_birth           TEXT NOT NULL DEFAULT '',
+  repo                 TEXT NOT NULL DEFAULT '',
+  worktree             TEXT NOT NULL DEFAULT '',
+  label                TEXT NOT NULL DEFAULT '',
+  state                TEXT NOT NULL,
+  created_at           TEXT NOT NULL,
+  updated_at           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tasks_by_pane  ON tasks(pane_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS tasks_by_state ON tasks(state, updated_at);
+
+-- sequence is a REAL monotonic counter (AUTOINCREMENT never reuses a value,
+-- even after deletes), replacing count-then-append. event_id is UNIQUE so a
+-- caller that retries an at-least-once delivery can pass the same id and get
+-- dedup instead of a duplicate row.
+CREATE TABLE IF NOT EXISTS events (
+  sequence    INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id    TEXT NOT NULL UNIQUE,
+  run_id      TEXT NOT NULL,
+  task_id     TEXT NOT NULL DEFAULT '',
+  type        TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  payload     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS events_by_task ON events(task_id, sequence);
+
+-- last_event_seq is the piece review correction 4 called out as missing: a
+-- cursor over the EVENT STREAM, not just over task state. task_states keeps
+-- the existing per-task 'already reported this transition' map so the report
+-- behaviour operators are used to is unchanged.
+CREATE TABLE IF NOT EXISTS checkpoints (
+  conductor_id   TEXT PRIMARY KEY,
+  last_event_seq INTEGER NOT NULL DEFAULT 0,
+  task_states    TEXT NOT NULL DEFAULT '{}',
+  updated_at     TEXT NOT NULL
+);
+
+-- The approval lifecycle review correction 6 asked for: 'an answer needs three
+-- separate records: decision recorded / delivery attempted / delivery
+-- confirmed-or-timed-out. Recording a choice before pressing must not imply it
+-- was delivered.' Three nullable timestamps, so the difference between
+-- 'decided but never delivered' and 'delivered and confirmed' is a queryable
+-- fact rather than an inference from a log line.
+CREATE TABLE IF NOT EXISTS approvals (
+  approval_id    TEXT PRIMARY KEY,
+  run_id         TEXT NOT NULL DEFAULT '',
+  task_id        TEXT NOT NULL DEFAULT '',
+  pane_id        TEXT NOT NULL DEFAULT '',
+  prompt_id      TEXT NOT NULL DEFAULT '',
+  choice         TEXT NOT NULL DEFAULT '',
+  choice_text    TEXT NOT NULL DEFAULT '',
+  decided_by     TEXT NOT NULL DEFAULT '',
+  authority      TEXT NOT NULL DEFAULT '',
+  policy_verdict TEXT NOT NULL DEFAULT '',
+  command        TEXT NOT NULL DEFAULT '',
+  decided_at     TEXT NOT NULL,
+  attempted_at   TEXT,
+  confirmed_at   TEXT,
+  outcome        TEXT,
+  detail         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS approvals_by_pane ON approvals(pane_id, decided_at DESC);
+
+INSERT OR IGNORE INTO schema_meta(key, value)
+  VALUES ('schema_version', '$(_registry_schema_version)');
+" >/dev/null 2>&1; then
+    printf 'run-registry: failed to initialize %s\n' "$db" >&2
+    return 1
+  fi
+
+  _HERDR_REGISTRY_READY=1
+  _migrate_legacy_files
+  return 0
+}
+
+# ---- one-time import of the pre-SQLite file layout --------------------------
+# A registry holding LIVE task state cannot simply be abandoned: dropping a
+# running worker's registration is not a clean slate, it silently disables
+# recycled-pane refusal for that worker (pane-guard.sh treats an unregistered
+# pane as 'nothing to check against' and passes it through). So the old files
+# are imported once, then left on disk untouched — deleting an operator's prior
+# state is not this function's business, and keeping it makes the migration
+# reversible by hand.
+_migrate_legacy_files() {
+  local root marker
+  root="$(run_state_root)"
+  marker=$(_sql "SELECT value FROM schema_meta WHERE key='legacy_import';" 2>/dev/null)
+  [ -n "$marker" ] && return 0
+
+  local tf j n=0
+  while IFS= read -r tf; do
+    [ -n "$tf" ] && [ -f "$tf" ] || continue
+    j="$(cat "$tf" 2>/dev/null)"
+    printf '%s' "$j" | jq -e . >/dev/null 2>&1 || continue   # skip a torn write
+    local ti ri
+    ti=$(printf '%s' "$j" | jq -r '.task_id // empty')
+    ri=$(printf '%s' "$j" | jq -r '.run_id  // empty')
+    [ -n "$ti" ] && [ -n "$ri" ] || continue
+    # INSERT OR IGNORE: re-running the import must never clobber a task that
+    # has since been updated through the new code path.
+    _sql "INSERT OR IGNORE INTO tasks
+      (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth,
+       pane_id, pane_birth, repo, worktree, label, state, created_at, updated_at)
+      VALUES ($(_sq "$ti"), $(_sq "$ri"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.worker_id // ""')"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.conductor_id // ""')"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.conductor_pane_id // ""')"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.conductor_pane_birth // ""')"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.pane_id // ""')"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.pane_birth // ""')"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.repo // ""')"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.worktree // ""')"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.label // ""')"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.state // "lost"')"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.created_at // ""')"),
+        $(_sq "$(printf '%s' "$j" | jq -r '.updated_at // ""')"));" >/dev/null 2>&1 && n=$((n+1))
+  done < <(find "$root" -mindepth 3 -maxdepth 3 -path '*/tasks/*.json' 2>/dev/null)
+
+  # Legacy events keep their original event_id (`<run_id>_<seq>`), so the
+  # UNIQUE constraint dedups them if this ever runs twice. Their sequence is
+  # reassigned by AUTOINCREMENT — the old numbers were not trustworthy under
+  # concurrency anyway, which is the whole reason for this migration.
+  local ef line
+  while IFS= read -r ef; do
+    [ -n "$ef" ] && [ -f "$ef" ] || continue
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      printf '%s' "$line" | jq -e . >/dev/null 2>&1 || continue
+      local eid
+      eid=$(printf '%s' "$line" | jq -r '.event_id // empty')
+      [ -n "$eid" ] || continue
+      _sql "INSERT OR IGNORE INTO events (event_id, run_id, task_id, type, occurred_at, payload)
+        VALUES ($(_sq "$eid"),
+          $(_sq "$(printf '%s' "$line" | jq -r '.run_id // ""')"),
+          $(_sq "$(printf '%s' "$line" | jq -r '.task_id // ""')"),
+          $(_sq "$(printf '%s' "$line" | jq -r '.type // "unknown"')"),
+          $(_sq "$(printf '%s' "$line" | jq -r '.occurred_at // ""')"),
+          $(_sq "$(printf '%s' "$line" | jq -c '.payload // {}')"));" >/dev/null 2>&1
+    done < "$ef"
+  done < <(find "$root" -mindepth 2 -maxdepth 2 -name 'events.jsonl' 2>/dev/null)
+
+  local cf cid
+  while IFS= read -r cf; do
+    [ -n "$cf" ] && [ -f "$cf" ] || continue
+    cid="$(basename "$cf" .json)"
+    j="$(cat "$cf" 2>/dev/null)"
+    printf '%s' "$j" | jq -e . >/dev/null 2>&1 || continue
+    _sql "INSERT OR IGNORE INTO checkpoints (conductor_id, last_event_seq, task_states, updated_at)
+      VALUES ($(_sq "$cid"), 0, $(_sq "$(printf '%s' "$j" | jq -c .)"), $(_sq "$(_now_iso)"));" >/dev/null 2>&1
+  done < <(find "$root/checkpoints" -maxdepth 1 -name '*.json' 2>/dev/null)
+
+  _sql "INSERT OR REPLACE INTO schema_meta(key,value) VALUES ('legacy_import','$(_now_iso)');" >/dev/null 2>&1
+  [ "$n" -gt 0 ] && printf 'run-registry: imported %s legacy task record(s) into %s\n' "$n" "$(registry_db)" >&2
+  return 0
+}
 
 gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand>"
   printf '%s_%s_%s_%s\n' "$1" "$(date -u +%Y%m%dT%H%M%SZ)" "$$" "$RANDOM"
 }
 
-# Register a new task. Writes tasks/<task_id>.json with state=starting.
-#
+# ---- task records -----------------------------------------------------------
+# One JSON object per task, built in SQL so every reader sees identical field
+# names whether it asked for one task or all of them.
+_task_json_select() {
+  printf "%s" "SELECT json_object(
+    'schema', 2, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
+    'conductor_id', conductor_id, 'conductor_pane_id', conductor_pane_id,
+    'conductor_pane_birth', conductor_pane_birth, 'pane_id', pane_id,
+    'pane_birth', pane_birth, 'repo', repo, 'worktree', worktree, 'label', label,
+    'state', state, 'created_at', created_at, 'updated_at', updated_at) FROM tasks"
+}
+
 # conductor_pane_birth mirrors pane_birth but for the CONDUCTOR's pane, not
 # the worker's: the push-wake edge (agent-hooks/claude-notify.sh) delivers
 # INTO conductor_pane_id, and that pane id is exactly as recyclable as the
@@ -51,81 +320,113 @@ register_task() {
   local run_id="$1" task_id="$2" worker_id="$3" conductor_id="$4" \
         conductor_pane_id="$5" conductor_pane_birth="$6" pane_id="$7" pane_birth="$8" \
         repo="$9" worktree="${10}" label="${11}"
-  local f tmp
-  f="$(task_file "$run_id" "$task_id")"
-  tmp="${f}.tmp.$$"
-  # Atomic write, same pattern as set_task_state/write_checkpoint below: jq
-  # writes to a pid-suffixed temp file in the SAME directory, then mv (an
-  # atomic rename on POSIX filesystems) into place. This used to be a bare
-  # `jq -n ... > "$(task_file ...)"`, which truncates the target to zero
-  # bytes BEFORE jq produces any output — a concurrent reader racing the
-  # write window (task_for_pane, the reconcile sweep) could observe a
-  # truncated/empty task file instead of either "not registered yet" (fine)
-  # or the complete record (fine). Neither mkdir -p nor the write itself was
-  # checked either, so a failure here (disk full, permissions) used to
-  # silently leave no usable task file with no error anywhere; both are
-  # checked now.
-  if mkdir -p "$(tasks_dir "$run_id")" && jq -n \
-    --argjson schema 1 \
-    --arg run_id "$run_id" --arg task_id "$task_id" --arg worker_id "$worker_id" \
-    --arg conductor_id "$conductor_id" --arg conductor_pane_id "$conductor_pane_id" \
-    --arg conductor_pane_birth "$conductor_pane_birth" \
-    --arg pane_id "$pane_id" --arg pane_birth "$pane_birth" \
-    --arg repo "$repo" --arg worktree "$worktree" --arg label "$label" \
-    --arg state "starting" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{schema:$schema, run_id:$run_id, task_id:$task_id, worker_id:$worker_id,
-      conductor_id:$conductor_id, conductor_pane_id:$conductor_pane_id,
-      conductor_pane_birth:$conductor_pane_birth,
-      pane_id:$pane_id, pane_birth:$pane_birth, repo:$repo, worktree:$worktree,
-      label:$label, state:$state, created_at:$at, updated_at:$at}' \
-    > "$tmp" && mv "$tmp" "$f"; then
+  registry_init || return 1
+  local at; at="$(_now_iso)"
+
+  # Plain INSERT, not INSERT OR REPLACE: a task_id collision must be a visible
+  # failure, not a silent overwrite of a live worker's registration. See the
+  # tasks table comment in registry_init.
+  if _sql "INSERT INTO tasks
+      (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth,
+       pane_id, pane_birth, repo, worktree, label, state, created_at, updated_at)
+      VALUES ($(_sq "$task_id"), $(_sq "$run_id"), $(_sq "$worker_id"), $(_sq "$conductor_id"),
+        $(_sq "$conductor_pane_id"), $(_sq "$conductor_pane_birth"), $(_sq "$pane_id"),
+        $(_sq "$pane_birth"), $(_sq "$repo"), $(_sq "$worktree"), $(_sq "$label"),
+        'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
+    append_event "$run_id" "$task_id" "registered" \
+      "$(jq -nc --arg p "$pane_id" --arg l "$label" '{pane_id:$p, label:$l}')" >/dev/null 2>&1
     return 0
-  else
-    rm -f "$tmp"
-    echo "run-registry: failed to write task file for $run_id/$task_id" >&2
-    return 1
   fi
+  printf 'run-registry: failed to register task %s (duplicate task_id, or database unwritable)\n' "$task_id" >&2
+  return 1
 }
 
-# Transition a task's lifecycle state and record the transition as an event.
-# Suggested states: starting running blocked completed failed cancelled lost
+# ---- lifecycle --------------------------------------------------------------
+# Legal transitions. Review correction 2 listed enforcement as missing —
+# "nothing stops `completed` -> `running`". That is not a cosmetic gap once
+# anything trusts the state: a terminal task silently returning to `running`
+# would be swept for liveness again and could be re-reported forever, and the
+# approvals table below records decisions against a task whose state is
+# supposed to be settled. So the table is enforced, and an illegal transition
+# is refused with a diagnostic rather than written.
+#
+# `blocked` is deliberately NOT terminal even though it is reported like one:
+# a worker waiting on a prompt resolves back to `running` all the time.
+_legal_transition() {                   # from to -> 0 if allowed
+  local from="$1" to="$2"
+  [ "$from" = "$to" ] && return 0       # idempotent re-assert, always fine
+  case "$from" in
+    ''|starting) case "$to" in running|blocked|completed|failed|cancelled|lost) return 0 ;; esac ;;
+    running)     case "$to" in blocked|completed|failed|cancelled|lost) return 0 ;; esac ;;
+    blocked)     case "$to" in running|completed|failed|cancelled|lost) return 0 ;; esac ;;
+    # Terminal. Nothing leaves these; `lost` in particular must not be
+    # resurrected by a stale hook firing after the sweep already buried it.
+    completed|failed|cancelled|lost) return 1 ;;
+  esac
+  return 1
+}
+
 set_task_state() {                      # run_id task_id state
-  local run_id="$1" task_id="$2" state="$3" f tmp
-  f="$(task_file "$run_id" "$task_id")"
-  [ -f "$f" ] || { echo "run-registry: no task file for $run_id/$task_id" >&2; return 1; }
-  tmp="${f}.tmp.$$"
-  # append_event must NOT fire on a failed state write — it used to run
-  # unconditionally as a separate statement, so a torn/failed jq or mv left
-  # events.jsonl permanently claiming a transition that never actually
-  # landed in the task file. The two sources of truth this registry is
-  # built around could silently diverge with no error surfaced anywhere.
-  if jq --arg state "$state" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '.state=$state | .updated_at=$at' "$f" > "$tmp" && mv "$tmp" "$f"; then
-    append_event "$run_id" "$task_id" "state_changed" "{\"state\":\"$state\"}"
-  else
-    rm -f "$tmp"
-    echo "run-registry: failed to write state for $run_id/$task_id — event NOT logged" >&2
+  local run_id="$1" task_id="$2" state="$3"
+  registry_init || return 1
+  local cur
+  cur=$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  if [ -z "$cur" ]; then
+    printf 'run-registry: no task record for %s/%s\n' "$run_id" "$task_id" >&2
     return 1
   fi
+  if ! _legal_transition "$cur" "$state"; then
+    printf 'run-registry: refusing illegal transition %s -> %s for %s/%s\n' \
+      "$cur" "$state" "$run_id" "$task_id" >&2
+    return 1
+  fi
+  [ "$cur" = "$state" ] && return 0
+
+  # The state change and its event land in ONE transaction. Under the old file
+  # layout these were two separate writes, and a prior fix had to suppress the
+  # event when the state write failed to stop events.jsonl claiming a
+  # transition that never happened. A transaction removes the failure mode
+  # instead of compensating for it: either both rows are there or neither is.
+  local at eid
+  at="$(_now_iso)"
+  eid="$(gen_id ev)"
+  if _sql "BEGIN IMMEDIATE;
+    UPDATE tasks SET state=$(_sq "$state"), updated_at=$(_sq "$at")
+      WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");
+    INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload)
+      VALUES ($(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), 'state_changed', $(_sq "$at"),
+        $(_sq "$(jq -nc --arg s "$state" --arg f "$cur" '{state:$s, from:$f}')"));
+    COMMIT;" >/dev/null 2>&1; then
+    return 0
+  fi
+  printf 'run-registry: failed to write state %s for %s/%s\n' "$state" "$run_id" "$task_id" >&2
+  return 1
 }
 
-# Append one event to the run's CENTRAL events.jsonl (not the repo). Sequence
-# is best-effort (see KNOWN GAPS above) — good enough to order a single
-# worker's own events, not a promise under concurrent writers.
-append_event() {                        # run_id task_id type payload_json
-  local run_id="$1" task_id="$2" type="$3" payload="${4:-{\}}" ef seq
-  ef="$(events_file "$run_id")"
-  mkdir -p "$(run_dir "$run_id")"
-  seq=$(( $(grep -c . "$ef" 2>/dev/null || echo 0) + 1 ))
-  jq -nc --arg run_id "$run_id" --arg task_id "$task_id" --arg type "$type" \
-     --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson seq "$seq" \
-     --argjson payload "$payload" \
-     '{event_id: ($run_id + "_" + ($seq|tostring)), run_id:$run_id, task_id:$task_id,
-       sequence:$seq, type:$type, occurred_at:$at, payload:$payload}' \
-    >> "$ef"
+# append_event <run_id> <task_id> <type> [payload_json] [event_id]
+#
+# Supplying event_id makes the append IDEMPOTENT — the UNIQUE constraint turns
+# a retry into a no-op instead of a duplicate row. That is what lets a caller
+# implement at-least-once delivery (review correction 6) without the consumer
+# having to dedup: retry with the same id as many times as you like.
+append_event() {
+  local run_id="$1" task_id="${2:-}" type="$3" payload="${4:-{\}}" eid="${5:-}"
+  registry_init || return 1
+  [ -n "$eid" ] || eid="$(gen_id ev)"
+  printf '%s' "$payload" | jq -e . >/dev/null 2>&1 || payload='{}'
+  if _sql "INSERT OR IGNORE INTO events (event_id, run_id, task_id, type, occurred_at, payload)
+      VALUES ($(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), $(_sq "$type"),
+        $(_sq "$(_now_iso)"), $(_sq "$payload"));" >/dev/null 2>&1; then
+    return 0
+  fi
+  printf 'run-registry: failed to append event %s for %s/%s\n' "$type" "$run_id" "$task_id" >&2
+  return 1
 }
 
-read_task() { cat "$(task_file "$1" "$2")" 2>/dev/null; }   # run_id task_id -> json
+read_task() {                           # run_id task_id -> json (empty if absent)
+  registry_init || return 1
+  _sql "$(_task_json_select) WHERE run_id=$(_sq "$1") AND task_id=$(_sq "$2");" 2>/dev/null
+}
 
 # Find the most-recently-updated registered task whose WORKER pane is this
 # pane id — used to revalidate a pane's birth fingerprint immediately before
@@ -134,82 +435,58 @@ read_task() { cat "$(task_file "$1" "$2")" 2>/dev/null; }   # run_id task_id -> 
 # never registered (e.g. spawned via spawn-agent.sh, which does not use the
 # registry) — a caller with nothing to validate against must fall back to
 # its prior behavior, not invent a refusal.
-task_for_pane() {                       # pane_id -> task json (latest updated_at) or empty
-  local pane="$1" best="" best_ts=""
-  while IFS= read -r tf; do
-    [ -n "$tf" ] && [ -f "$tf" ] || continue
-    local j p ts
-    j="$(cat "$tf" 2>/dev/null)"
-    printf '%s' "$j" | jq -e . >/dev/null 2>&1 || continue
-    p=$(printf '%s' "$j" | jq -r '.pane_id // empty')
-    [ "$p" = "$pane" ] || continue
-    ts=$(printf '%s' "$j" | jq -r '.updated_at // empty')
-    if [ -z "$best_ts" ] || [[ "$ts" > "$best_ts" ]]; then
-      best="$j"; best_ts="$ts"
-    fi
-  done < <(all_task_files)
-  printf '%s' "$best"
+task_for_pane() {                       # pane_id -> task json or empty
+  registry_init || return 1
+  _sql "$(_task_json_select) WHERE pane_id=$(_sq "$1") ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null
 }
 
-# All registered task files across every run, oldest run dirs included — the
-# reconciliation sweep (agent-hooks/session-reconcile.sh) needs every task,
-# not just the ones from the run_id a caller happens to know about.
-all_task_files() {                      # -> one task-file path per line
-  find "$(run_state_root)" -mindepth 3 -maxdepth 3 -path '*/tasks/*.json' 2>/dev/null
+# Every registered task as one compact JSON object per line.
+#
+# Replaces the old all_task_files(), which emitted FILE PATHS its caller then
+# had to cat, JSON-validate (a torn write was a real possibility), and re-read
+# field by field. One query returns every task consistently, and there is no
+# torn-write case left to skip.
+all_tasks_json() {
+  registry_init || return 1
+  _sql "$(_task_json_select) ORDER BY updated_at;" 2>/dev/null
 }
 
-# Prune terminal-state task files older than a max age. Nothing else in this
-# registry ever removes a task file — all_task_files() above walks every
-# task that has ever been registered, forever, so run_state_root grows
-# without bound on a long-lived host. Deliberately narrow: a file is removed
-# only if BOTH its state is one of the true TERMINAL states from
-# set_task_state's suggested list (completed/failed/cancelled/lost —
-# starting/running/blocked are left alone; "blocked" in particular can still
-# resolve, it's not a dead end) AND its updated_at is older than
-# max_age_days. This is not a general GC subsystem: it doesn't touch
-# events.jsonl, run directories, or checkpoints, just individual task files
-# whose terminal transition happened long enough ago that no reader still
-# needs them.
-prune_completed_tasks() {               # max_age_days -> removes old terminal task files
-  local max_age_days="$1" cutoff
-  # Same idiom as task_for_pane's `[[ "$ts" > "$best_ts" ]]`: ISO-8601 UTC
-  # timestamps (this registry's only timestamp format, see date -u
-  # +%Y-%m-%dT%H:%M:%SZ throughout) sort lexicographically in the same order
-  # they sort chronologically, so a plain string compare against a cutoff
-  # computed the same way avoids parsing timestamps back into epoch seconds
-  # (and the BSD/GNU `date` flag differences that would come with it).
-  cutoff=$(date -u -v-"${max_age_days}"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-    || date -u -d "-${max_age_days} days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
-  [ -n "$cutoff" ] || { echo "run-registry: prune_completed_tasks could not compute cutoff date" >&2; return 1; }
-  while IFS= read -r tf; do
-    [ -n "$tf" ] && [ -f "$tf" ] || continue
-    local j state updated_at
-    j="$(cat "$tf" 2>/dev/null)"
-    printf '%s' "$j" | jq -e . >/dev/null 2>&1 || continue   # skip a torn write
-    state=$(printf '%s' "$j" | jq -r '.state // empty')
-    case "$state" in
-      completed|failed|cancelled|lost) ;;
-      *) continue ;;
-    esac
-    updated_at=$(printf '%s' "$j" | jq -r '.updated_at // empty')
-    [ -n "$updated_at" ] && [[ "$updated_at" < "$cutoff" ]] && rm -f "$tf"
-  done < <(all_task_files)
+# Remove terminal-state tasks older than max_age_days, and the events that
+# belong to them. Nothing else prunes, so this is the only thing keeping the
+# registry from growing forever on a long-lived host.
+#
+# Deliberately narrow, unchanged from the file-layout version: only the true
+# TERMINAL states (completed/failed/cancelled/lost) are eligible —
+# starting/running/blocked are left alone, and `blocked` in particular can
+# still resolve, it is not a dead end. Date arithmetic is SQLite's own
+# (julianday), which removes the BSD-vs-GNU `date -v`/`date -d` fallback pair
+# the old implementation needed.
+prune_completed_tasks() {               # max_age_days
+  local days="$1"
+  registry_init || return 1
+  case "$days" in ''|*[!0-9]*) printf 'run-registry: prune_completed_tasks needs an integer day count\n' >&2; return 1 ;; esac
+  _sql "BEGIN IMMEDIATE;
+    DELETE FROM events WHERE task_id IN (
+      SELECT task_id FROM tasks
+       WHERE state IN ('completed','failed','cancelled','lost')
+         AND julianday(updated_at) < julianday('now', '-${days} days'));
+    DELETE FROM tasks
+     WHERE state IN ('completed','failed','cancelled','lost')
+       AND julianday(updated_at) < julianday('now', '-${days} days');
+    COMMIT;" >/dev/null 2>&1
 }
 
-# ---- consumer checkpoints (SessionStart reconciliation) ---------------------
+# ---- consumer checkpoints ---------------------------------------------------
 # A conductor session that reads the registry needs to remember what it has
 # already reported, or a reopened session re-announces the same completions
-# forever. That cursor is CONDUCTOR state, not task state — it lives beside
-# the registry (never inside a worktree: cleanup must not reset it) and is
-# keyed by conductor_id, one file per conductor so two conductors watching
-# the same host don't clobber each other's progress.
-checkpoints_dir() { printf '%s/checkpoints\n' "$(run_state_root)"; }
-checkpoint_file() { printf '%s/%s.json\n' "$(checkpoints_dir)" "$1"; }  # conductor_id
-
-read_checkpoint() {                     # conductor_id -> json object (default {})
-  local f c
-  f="$(checkpoint_file "$1")"
-  c="$(cat "$f" 2>/dev/null)"
+# forever. That cursor is CONDUCTOR state, not task state — it lives with the
+# registry (never inside a worktree: cleanup must not reset it) and is keyed by
+# conductor_id so two conductors watching the same host don't clobber each
+# other's progress.
+read_checkpoint() {                     # conductor_id -> task_states json (default {})
+  registry_init || return 1
+  local c
+  c=$(_sql "SELECT task_states FROM checkpoints WHERE conductor_id=$(_sq "$1");" 2>/dev/null)
   if [ -z "$c" ] || ! printf '%s' "$c" | jq -e . >/dev/null 2>&1; then
     printf '{}'
   else
@@ -217,42 +494,100 @@ read_checkpoint() {                     # conductor_id -> json object (default {
   fi
 }
 
-write_checkpoint() {                    # conductor_id json -> writes atomically
-  local f tmp
-  f="$(checkpoint_file "$1")"
-  tmp="${f}.tmp.$$"
-  # checkpoint_age_s (below) reads this file's mtime as "when did this
-  # conductor last actually check the registry", and interval-reconcile.sh
-  # throttles its expensive work against that age. If this write fails
-  # (disk full, permissions) the mtime never advances, so the throttle
-  # fails OPEN — it treats itself as perpetually due — rather than closed.
-  # Not dangerous on its own, but previously silent: nothing printed
-  # anywhere, so a stuck checkpoint looked identical to a healthy one with
-  # nothing new to report. mkdir -p and the write are both checked now, and
-  # either failing prints one diagnostic line to stderr.
-  if mkdir -p "$(checkpoints_dir)" && printf '%s' "$2" > "$tmp" && mv "$tmp" "$f"; then
+write_checkpoint() {                    # conductor_id task_states_json
+  registry_init || return 1
+  local j="$2"
+  printf '%s' "$j" | jq -e . >/dev/null 2>&1 || j='{}'
+  # updated_at advances on EVERY write, including a no-op pass, because
+  # checkpoint_age_s below reads it as "when did this conductor last actually
+  # check the registry" and interval-reconcile.sh throttles against that.
+  if _sql "INSERT INTO checkpoints (conductor_id, last_event_seq, task_states, updated_at)
+      VALUES ($(_sq "$1"), 0, $(_sq "$j"), $(_sq "$(_now_iso)"))
+      ON CONFLICT(conductor_id) DO UPDATE SET
+        task_states=excluded.task_states, updated_at=excluded.updated_at;" >/dev/null 2>&1; then
     return 0
-  else
-    rm -f "$tmp"
-    echo "run-registry: failed to write checkpoint for $1 — checkpoint_age_s will grow unbounded" >&2
-    return 1
   fi
+  printf 'run-registry: failed to write checkpoint for %s — checkpoint_age_s will grow unbounded\n' "$1" >&2
+  return 1
 }
 
-# Seconds since a conductor's checkpoint was last written, or a large number
-# if it has never been written. write_checkpoint runs on EVERY reconciliation
-# pass (even a no-op one), so its mtime doubles as "when did this conductor
-# last actually check the registry" — agent-hooks/interval-reconcile.sh
-# throttles its expensive work (a live `herdr pane list` + a full task scan)
-# against this instead of keeping a second timestamp file to stay in sync
-# with.
+# Seconds since a conductor's checkpoint was last written, or a large number if
+# it never has been. Computed in SQL rather than from a file mtime, so it
+# survives the store being a database instead of a file per conductor.
 checkpoint_age_s() {                    # conductor_id -> integer seconds
-  local f mtime now
-  f="$(checkpoint_file "$1")"
-  [ -f "$f" ] || { printf '999999999\n'; return 0; }
-  mtime=$(stat -f '%m' "$f" 2>/dev/null || stat -c '%Y' "$f" 2>/dev/null || echo 0)
-  now=$(date -u +%s)
-  printf '%s\n' "$(( now - mtime ))"
+  registry_init || return 1
+  local age
+  age=$(_sql "SELECT CAST((julianday('now') - julianday(updated_at)) * 86400 AS INTEGER)
+              FROM checkpoints WHERE conductor_id=$(_sq "$1");" 2>/dev/null)
+  case "$age" in
+    ''|*[!0-9-]*) printf '999999999\n' ;;
+    *)            printf '%s\n' "$age" ;;
+  esac
+}
+
+# ---- event-stream cursor ----------------------------------------------------
+# The half of review correction 4 the file layout could not do at all: a
+# consumer cursor over EVENTS, so "replay every event exactly once" is
+# expressible. read_checkpoint's task_states map answers "what changed since I
+# last looked"; this answers "which events have I never seen", which is a
+# different question and the one an at-least-once producer needs.
+events_since() {                        # conductor_id [limit] -> one event json per line
+  registry_init || return 1
+  local cid="$1" limit="${2:-500}"
+  case "$limit" in ''|*[!0-9]*) limit=500 ;; esac
+  _sql "SELECT json_object('sequence', sequence, 'event_id', event_id, 'run_id', run_id,
+          'task_id', task_id, 'type', type, 'occurred_at', occurred_at,
+          'payload', json(payload))
+        FROM events
+        WHERE sequence > COALESCE(
+          (SELECT last_event_seq FROM checkpoints WHERE conductor_id=$(_sq "$cid")), 0)
+        ORDER BY sequence LIMIT $limit;" 2>/dev/null
+}
+
+# Advance the cursor to the highest sequence the consumer has actually
+# processed. Separate from write_checkpoint on purpose: a consumer that read
+# events but crashed before acting on them must be able to leave the cursor
+# where it was and see them again.
+advance_event_cursor() {                # conductor_id sequence
+  registry_init || return 1
+  local cid="$1" seq="$2"
+  case "$seq" in ''|*[!0-9]*) return 1 ;; esac
+  _sql "INSERT INTO checkpoints (conductor_id, last_event_seq, task_states, updated_at)
+      VALUES ($(_sq "$cid"), $seq, '{}', $(_sq "$(_now_iso)"))
+      ON CONFLICT(conductor_id) DO UPDATE SET
+        last_event_seq=MAX(checkpoints.last_event_seq, excluded.last_event_seq),
+        updated_at=excluded.updated_at;" >/dev/null 2>&1
+}
+
+# ---- approval lifecycle (decided / attempted / confirmed) -------------------
+# Review correction 6: "Recording the choice before pressing is good, but that
+# record must not imply successful delivery." herdr-select.sh's existing audit
+# write satisfied "decided" and then conflated it with "delivered", because
+# there was nowhere to put the other two facts. These three functions are that
+# somewhere. All are additive: a caller that only ever calls the first one
+# behaves exactly as before, minus the false implication.
+approval_decided() {                    # approval_id pane_id prompt_id choice choice_text decided_by authority policy_verdict command [run_id] [task_id]
+  registry_init || return 1
+  _sql "INSERT OR REPLACE INTO approvals
+      (approval_id, pane_id, prompt_id, choice, choice_text, decided_by, authority,
+       policy_verdict, command, run_id, task_id, decided_at)
+      VALUES ($(_sq "$1"), $(_sq "$2"), $(_sq "$3"), $(_sq "$4"), $(_sq "$5"), $(_sq "$6"),
+        $(_sq "$7"), $(_sq "$8"), $(_sq "$9"), $(_sq "${10:-}"), $(_sq "${11:-}"),
+        $(_sq "$(_now_iso)"));" >/dev/null 2>&1
+}
+
+approval_attempted() {                  # approval_id
+  registry_init || return 1
+  _sql "UPDATE approvals SET attempted_at=$(_sq "$(_now_iso)") WHERE approval_id=$(_sq "$1");" >/dev/null 2>&1
+}
+
+# outcome is send-to-agent.sh's own vocabulary (submitted / unsubmitted /
+# refused / …) so the record says what actually happened at the keyboard,
+# not merely that something was tried.
+approval_confirmed() {                  # approval_id outcome [detail]
+  registry_init || return 1
+  _sql "UPDATE approvals SET confirmed_at=$(_sq "$(_now_iso)"), outcome=$(_sq "$2"),
+        detail=$(_sq "${3:-}") WHERE approval_id=$(_sq "$1");" >/dev/null 2>&1
 }
 
 # ---- interval-reconcile lock ------------------------------------------------
@@ -261,8 +596,11 @@ checkpoint_age_s() {                    # conductor_id -> integer seconds
 # throttled reconciliation pass. checkpoint_age_s-vs-interval is a
 # check-then-act throttle, not atomic on its own — two PostToolUse hook
 # firings close together can both observe "due" and both proceed, doubling
-# the herdr pane list + full task scan and racing on the same task-file
-# writes. mkdir is atomic on POSIX filesystems (exactly one caller ever
-# wins the "did not exist, now does" transition), so it makes a
-# dependency-free mutex without needing flock or a PID file.
+# the herdr pane list + full task scan.
+#
+# Still a directory rather than a SQLite transaction, deliberately: what needs
+# serializing is the whole expensive sweep (a live `herdr pane list` plus a
+# full task scan), not just the database writes at the end of it. mkdir is
+# atomic on POSIX filesystems, so it makes a dependency-free mutex around
+# work that happens mostly OUTSIDE the database.
 reconcile_lock_dir() { printf '%s/reconcile.lock\n' "$(run_state_root)"; }
