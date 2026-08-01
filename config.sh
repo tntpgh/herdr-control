@@ -32,13 +32,36 @@
 # at the cost of a `herdr pane list` call that often:
 : "${HERDR_RECONCILE_INTERVAL_S:=300}"
 
-# ---- session-reconcile.sh retention (terminal task-file pruning) -----------
-# Task files in a terminal state (completed/failed/cancelled/lost) older
-# than this many days are removed on every SessionStart sweep
+# ---- session-reconcile.sh retention (terminal task pruning) ----------------
+# Tasks in a terminal state (completed/failed/cancelled/lost) older than this
+# many days are removed on every SessionStart sweep
 # (lib/run-registry.sh's prune_completed_tasks). Nothing else prunes the
-# registry, so this is the only thing keeping run_state_root from growing
-# forever on a long-lived host.
+# registry, so this is the only thing keeping it from growing forever on a
+# long-lived host.
 : "${HERDR_TASK_RETENTION_DAYS:=14}"
+
+# ---- approval posture floor (lib/posture.sh) -------------------------------
+# The LOOSEST posture any worker on this machine may be spawned at. A per-spawn
+# request can only tighten it, never loosen it (compose_posture takes the more
+# restrictive of the two), so this is a real floor rather than a default.
+#   yolo    no approval gate at all
+#   write   auto-approve file edits, still prompt before executing
+#   strict  prompt before everything
+# An unrecognized value here fails CLOSED to strict, loudly — a typo must not
+# widen what agents may do unattended.
+: "${HERDR_POSTURE_FLOOR:=write}"
+
+# ---- command policy (lib/command-policy.sh) --------------------------------
+# Extra rules for the classifier that decides whether an approval prompt may be
+# auto-answered by peer automation or must escalate to you. Rules only ever make
+# policy STRICTER: the verdict must be `escalate` or `deny`, there is no operator
+# verdict meaning "allow", so a site rule cannot downgrade a built-in deny.
+#
+# Newline-separated records, each TAB-separated:
+#   <escalate|deny><TAB><extended-regex><TAB><reason>
+# e.g. (note the real tabs — use $'...' so they survive)
+#   HERDR_POLICY_EXTRA_RULES=$'deny\tterraform +destroy\tnever unattended\nescalate\tkubectl +delete\task first'
+: "${HERDR_POLICY_EXTRA_RULES:=}"
 
 # ---- spawn-task.sh model routing (job-class -> model) ----------------------
 # Claude tiers use the standard aliases (opus/sonnet/haiku) and need no config.
@@ -84,6 +107,7 @@
 export HERDR_DEFAULT_AGENT HERDR_SOURCE HERDR_SOCK HERDR_SORT_DONE_FIRST HERDR_SORT_NO_GH
 export HERDR_CODEX_DEEP HERDR_CODEX_STD HERDR_CODEX_FAST
 export HERDR_RECONCILE_INTERVAL_S HERDR_TASK_RETENTION_DAYS
+export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES
 export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_BACKEND SMART_NAME_MODEL SMART_NAME_TIMEOUT
 export SMART_NAME_COOLDOWN SMART_NAME_EVIDENCE_CHARS HERDR_STALL_SECS
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"
