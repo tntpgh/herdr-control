@@ -40,7 +40,21 @@ try:
 except ImportError:
     sys.exit("slack_bolt not installed — pip install -r requirements.txt (in a venv)")
 
-DELIVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "herdr-deliver.sh")
+# Delivery/answering scripts are resolved RELATIVE TO THIS FILE, then allowed to
+# be overridden by env. The relative default is what makes a plain checkout work
+# with no configuration; the override exists because this repo is also shipped as
+# an APM-managed skill copy under ~/.claude/skills/herdr-ops/, and whichever copy
+# launchd happens to point at is the copy whose scripts run.
+#
+# That bit us for real (2026-08-01): the LaunchAgent pointed at the APM copy, so
+# every Slack reply was answered by ITS herdr-select.sh — which predated the
+# command-policy gate and the three-phase approval records. Outbound alerts came
+# from this checkout while inbound replies came from the other copy, and nothing
+# anywhere said so. Setting HERDR_DELIVER_BIN/HERDR_SELECT_BIN lets an operator
+# point a daemon at a specific checkout without editing an APM-managed file,
+# which hand-edits would lose on the next `apm update` anyway.
+DELIVER = os.environ.get("HERDR_DELIVER_BIN") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "herdr-deliver.sh")
 STATE_DIR = os.environ.get("HERDR_BRIDGE_STATE", os.path.expanduser("~/.config/herdr-bridge"))
 # Other components in this repo (herdr-notify.sh, herdr-select.sh) `mkdir -p`
 # this directory before writing to it, so its mode ends up wherever the calling
@@ -97,7 +111,8 @@ if not TEAM:
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
 
-SELECT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "herdr-select.sh")
+SELECT = os.environ.get("HERDR_SELECT_BIN") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "herdr-select.sh")
 
 
 def select_option(pane, choice, via):

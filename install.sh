@@ -243,7 +243,33 @@ fi
 # ---- bridge daemon (optional, macOS) ---------------------------------------
 if [ "$BRIDGE" = 1 ]; then
   PLIST="$HOME/Library/LaunchAgents/com.herdr-control.bridge.plist"
-  if [ "$APPLY" = 1 ]; then
+
+  # A bridge daemon may already be installed under a DIFFERENT label — this
+  # machine had com.tntpgh.herdr-bridge, pointed at the APM-deployed
+  # ~/.claude/skills/herdr-ops copy. Writing our own label on top of that does not
+  # replace it, it ADDS a second daemon: two Socket-Mode clients on one Slack app,
+  # so every reply is delivered twice and both race to press keys at the same
+  # prompt. Same "detect, do not duplicate" rule the hook wiring above follows.
+  #
+  # Not auto-fixed, because which copy should own the daemon is an operator
+  # decision and the other plist may be hand-maintained: repointing an existing
+  # plist's ProgramArguments at this checkout is usually right, but that is a
+  # choice, not a default.
+  OTHER_BRIDGE=""
+  for p in "$HOME/Library/LaunchAgents"/*.plist; do
+    [ -f "$p" ] || continue
+    [ "$p" = "$PLIST" ] && continue
+    if grep -q 'slack-bridge/run-bridge.sh' "$p" 2>/dev/null; then
+      OTHER_BRIDGE="$p"
+      break
+    fi
+  done
+  if [ -n "$OTHER_BRIDGE" ]; then
+    echo "  ! another bridge LaunchAgent already exists: $OTHER_BRIDGE" >&2
+    echo "  ! installing $PLIST too would run TWO daemons — every Slack reply delivered twice." >&2
+    echo "  ! repoint that plist's ProgramArguments at $here/slack-bridge/run-bridge.sh instead," >&2
+    echo "  ! or remove it first. Skipping the bridge step." >&2
+  elif [ "$APPLY" = 1 ]; then
     mkdir -p "$HOME/Library/LaunchAgents"
     sed "s|__RUN_BRIDGE__|$here/slack-bridge/run-bridge.sh|" \
       "$here/slack-bridge/com.herdr-control.bridge.plist.template" > "$PLIST"
