@@ -15,11 +15,33 @@
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
 
-ENV_FILE="${HERDR_BRIDGE_ENV:-$HOME/.config/herdr-bridge.env}"
-[ -f "$ENV_FILE" ] && . "$ENV_FILE" || { echo "herdr-notify: no bridge env ($ENV_FILE)" >&2; exit 1; }
-: "${SLACK_BOT_TOKEN:?herdr-notify: SLACK_BOT_TOKEN unset}"
-user="${HERDR_BRIDGE_ALLOW_USERS%%,*}"
-[ -n "$user" ] || { echo "herdr-notify: HERDR_BRIDGE_ALLOW_USERS unset" >&2; exit 1; }
+# --dry-run never posts, so it must not need a Slack token — and asking for one
+# here is not free. The bridge env file resolves both tokens through `op read`,
+# which uses OP_SERVICE_ACCOUNT_TOKEN when it is present and otherwise falls back
+# to the 1Password desktop app: a Touch ID prompt, per invocation, per token.
+#
+# launchd has that service-account token in its environment, so the daemon itself
+# is quiet. An interactive shell generally does NOT — so every `--dry-run` from a
+# terminal, and every run of verify-omp-hooks.sh (which dry-runs this script to
+# check an alert renders), demanded a thumbprint. Two, in fact. AGENTS.md step 7
+# tells an operator to dry-run this as a verification step; that step should not
+# cost a biometric prompt, and a test suite must never need a human finger.
+#
+# Pre-scanned rather than folded into the arg loop below, because the loop runs
+# well after this point and the whole aim is to decide BEFORE sourcing anything.
+_dry_prescan=0
+for _a in "$@"; do
+  [ "$_a" = "--dry-run" ] && { _dry_prescan=1; break; }
+done
+
+user=""
+if [ "$_dry_prescan" = 0 ]; then
+  ENV_FILE="${HERDR_BRIDGE_ENV:-$HOME/.config/herdr-bridge.env}"
+  [ -f "$ENV_FILE" ] && . "$ENV_FILE" || { echo "herdr-notify: no bridge env ($ENV_FILE)" >&2; exit 1; }
+  : "${SLACK_BOT_TOKEN:?herdr-notify: SLACK_BOT_TOKEN unset}"
+  user="${HERDR_BRIDGE_ALLOW_USERS%%,*}"
+  [ -n "$user" ] || { echo "herdr-notify: HERDR_BRIDGE_ALLOW_USERS unset" >&2; exit 1; }
+fi
 
 # ── pane resolution ─────────────────────────────────────────────────────────
 # Order: --pane > $HERDR_PANE_ID > tmux-session match > UNIQUE cwd > untagged.
