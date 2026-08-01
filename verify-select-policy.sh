@@ -111,11 +111,50 @@ sel 1 --authority human; rc=$?
 [ "$(keys_pressed)" = "1" ] && ok "key pressed for the human" || bad "keys pressed=$(keys_pressed)"
 [ "$(q_appr policy_verdict)" = "escalate" ] && ok "escalate verdict RECORDED even though allowed" || bad "verdict=$(q_appr policy_verdict)"
 
-printf '== default authority is human (no flag) ==\n'
+printf '== NO flag at all: a non-interactive caller defaults to PEER (fail closed) ==\n'
+# This test used to assert the opposite. The default was `human`, so an agent that
+# simply never passed --authority inherited a person's unconditional permission —
+# the exact hole the flag exists to close, left open by its own default. This
+# harness runs without a TTY and without HERDR_SELECT_VIA, which is precisely the
+# shape of an agent shelling out.
 set_screen "rm -rf /tmp/scratch"; reset_keys
 sel 1; rc=$?
-[ "$rc" -eq 0 ] && ok "exit 0 without --authority" || bad "exit $rc"
-[ "$(q_appr authority)" = "human" ] && ok "authority defaults to human" || bad "authority=$(q_appr authority)"
+[ "$rc" -eq 8 ] && ok "exit 8 with no flag — defaults to peer" || bad "exit $rc (expected 8); default is not failing closed"
+[ "$(keys_pressed)" = "0" ] && ok "no key pressed" || bad "keys pressed=$(keys_pressed)"
+
+printf '== a SAFE command still passes on the peer default ==\n'
+set_screen "ls -la /tmp"; reset_keys
+sel 1; rc=$?
+[ "$rc" -eq 0 ] && ok "exit 0 — peer may answer an operational prompt" || bad "exit $rc (expected 0)"
+[ "$(q_appr authority)" = "peer" ] && ok "recorded authority=peer" || bad "authority=$(q_appr authority)"
+
+printf '== a Slack reply IS demonstrably human (bridge sets HERDR_SELECT_VIA) ==\n'
+# The bridge sets this for both the threaded-number and button routes, and only
+# after its own user allowlist check — so a real person acted, and must not be
+# blocked from approving their own agent's destructive command.
+for v in slack-reply slack-button; do
+  set_screen "rm -rf /tmp/scratch"; reset_keys
+  ( export HERDR_SELECT_VIA="$v"; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
+  [ "$rc" -eq 0 ] && ok "via=$v -> human, destructive approval allowed" || bad "via=$v exit $rc (expected 0)"
+  [ "$(q_appr authority)" = "human" ] && ok "via=$v recorded as human" || bad "via=$v authority=$(q_appr authority)"
+  [ "$(q_appr policy_verdict)" = "escalate" ] && ok "via=$v verdict still recorded for attribution" || bad "via=$v verdict=$(q_appr policy_verdict)"
+done
+
+printf '== an unrecognised via is NOT human ==\n'
+set_screen "rm -rf /tmp/scratch"; reset_keys
+( export HERDR_SELECT_VIA=totally-made-up; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
+[ "$rc" -eq 8 ] && ok "unknown via falls through to peer" || bad "exit $rc (expected 8)"
+
+printf '== an explicit --authority human still overrides the default ==\n'
+set_screen "rm -rf /tmp/scratch"; reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 0 ] && ok "explicit human wins" || bad "exit $rc (expected 0)"
+
+printf '== a bad HERDR_SELECT_AUTHORITY value is rejected, not silently coerced ==\n'
+set_screen "ls -la /tmp"; reset_keys
+( export HERDR_SELECT_AUTHORITY=banana; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
+[ "$rc" -eq 2 ] && ok "exit 2 on a bad authority value" || bad "exit $rc (expected 2)"
+[ "$(keys_pressed)" = "0" ] && ok "no key pressed" || bad "keys pressed=$(keys_pressed)"
 
 printf '== HERDR_SELECT_AUTHORITY env also gates ==\n'
 set_screen "git push --force origin main"; reset_keys

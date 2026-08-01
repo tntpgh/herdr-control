@@ -53,15 +53,32 @@
 # --expect-prompt-id this is not opt-in — it runs whenever the pane IS
 # registered, since there is no safe default that skips it.
 #
-# --authority peer|human (default human, or $HERDR_SELECT_AUTHORITY) is what
-# separates an operational question from an authorization one — review
-# correction 8. Until now every caller looked human: a conductor AGENT invoking
-# this script got `via=cli` and the same unconditional permission a person has,
-# which is the permission-laundering hole the whole coordination protocol exists
-# to prevent. Declare `peer` and the command the prompt is asking about is
-# classified (lib/command-policy.sh); anything not `allow` is REFUSED and left
-# for a human. Under `human` the verdict is still recorded — a person may
+# --authority peer|human separates an operational question from an authorization
+# one — review correction 8. Under `peer` the command the prompt is asking about
+# is classified (lib/command-policy.sh) and anything not `allow` is REFUSED and
+# left for a human. Under `human` the verdict is still recorded — a person may
 # approve a destructive command, but the audit trail says what it was.
+#
+# THE DEFAULT FAILS CLOSED TO `peer`. It was `human`, which meant a conductor
+# AGENT that simply never passed the flag got the same unconditional permission a
+# person has — the permission-laundering hole this is supposed to close, left open
+# by its own default. Observed live: a conductor received a push wake and started
+# reasoning about answering the worker's prompt with nothing standing between it
+# and a keypress.
+#
+# A caller is treated as human only when it is DEMONSTRABLY human:
+#   * HERDR_SELECT_VIA is a slack-* value — the bridge sets that for both the
+#     threaded-number and button routes, and only after its own user allowlist
+#     check, so a real person acted.
+#   * stdin is an interactive terminal — a person typing the command.
+# Everything else (an agent's non-interactive shell, a cron, a script) is `peer`.
+#
+# Not a containment boundary, and worth being precise about: an agent that can
+# set an env var can also just pass --authority human, and one holding the herdr
+# socket can press keys directly without this script at all. What the default buys
+# is that automation which never CONSIDERED authority does not silently inherit a
+# human's. It defends against accident and stale signals, not against a hostile
+# local process.
 #
 # Exit 0 selected, 2 usage, 3 not an agent pane, 6 no prompt / bad option /
 # prompt changed / navigation could not converge, 7 pane recycled since its
@@ -79,7 +96,20 @@ choice="${2:?option number required}"
 shift 2
 
 expect_id=""
-authority="${HERDR_SELECT_AUTHORITY:-human}"
+# Demonstrably-human callers only; see the header. Explicit
+# HERDR_SELECT_AUTHORITY or --authority still wins over this.
+_default_authority() {
+  case "${HERDR_SELECT_VIA:-}" in
+    slack-reply|slack-button) printf 'human\n'; return 0 ;;
+  esac
+  [ -t 0 ] && { printf 'human\n'; return 0; }
+  printf 'peer\n'
+}
+authority="${HERDR_SELECT_AUTHORITY:-$(_default_authority)}"
+case "$authority" in
+  peer|human) ;;
+  *) echo "herdr-select: HERDR_SELECT_AUTHORITY must be peer or human, got '$authority'" >&2; exit 2 ;;
+esac
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect-prompt-id) expect_id="${2:?--expect-prompt-id needs a value}"; shift 2 ;;
