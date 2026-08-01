@@ -63,6 +63,8 @@ not end up with every alert firing twice.
 Run it with no arguments for a dry run. Add `--bridge` to also install the
 launchd daemon (macOS) from `slack-bridge/com.herdr-control.bridge.plist.template`.
 
+`install.sh` also symlinks the omp side of the same wiring: `agent-hooks/omp-herdr-control.ts` into `~/.omp/agent/extensions/herdr-control.ts` (or `$PI_CODING_AGENT_DIR/extensions` when set) — omp's own auto-discovery root, so it applies globally and cwd-independently, the same way `~/.claude/settings.json` does for Claude. One symlink gives an omp session the same four jobs the hook table above gives a Claude session (push-wake, session reconciliation, mid-session reconciliation, alert retraction), mapped onto omp's `tool_call` / `before_agent_start` / `tool_result` / `agent_end` extension events instead. It never copies the file — an edit here is live on the next omp session with no reinstall — refuses to clobber a real (non-symlink) file already at that path, and is idempotent and `--repoint`-aware exactly like the Claude hooks above. To disable it without uninstalling, add `disabledExtensions: [extension-module:herdr-control]` to `~/.omp/agent/config.yml`.
+
 **`config.sh` is the only file you edit** — it holds every machine/personal
 default (which agent to launch, PATH for a minimal environment, the metadata
 label, sort preferences). Everything else is generic. Each value is also
@@ -135,6 +137,23 @@ spawned the worker is still running — close that session and its background
 `wake-on-evidence.sh` poller dies with it, so a reopened session starts blind
 to anything that happened in the meantime.
 
+The registry itself is one SQLite database (`registry.sqlite3`, WAL mode)
+under that directory now, not a JSON file per task plus an append-only
+`events.jsonl` per run — the file layout it replaced. Four things the files
+could not do without reimplementing a database badly: a real monotonic event
+sequence (`AUTOINCREMENT`, not `grep -c` a file and then append — two writers
+racing on that produced the *same* sequence number and neither noticed),
+dedup via `UNIQUE(event_id)` so an at-least-once retry doesn't log an event
+twice, a state change and its event-log entry landing in ONE transaction
+instead of two writes that could diverge, and a consumer cursor over the
+*event stream* itself, not just task state, so "replay every event exactly
+once" is actually expressible. `task_id` is now a primary key, so a colliding
+id fails loudly instead of silently overwriting a live worker's registration,
+and legal state transitions are enforced — `completed → running` is refused,
+not merely unusual. Whatever was already on disk from the old layout is
+imported once, non-destructively, the first time the registry runs; nothing
+is deleted.
+
 The shared sweep+report logic (`lib/reconcile.sh`) fixes that from two hooks:
 
 - **`agent-hooks/session-reconcile.sh`** (`SessionStart`, once per session) —
@@ -170,6 +189,67 @@ the fingerprint the run registry recorded at spawn (the worker's own pane for
 Enforced automatically whenever the pane is registered; a pane spawned outside
 the registry (e.g. `spawn-agent.sh`) has nothing to check against, so it's
 unaffected. See `lib/pane-guard.sh`'s `require_pane_birth_match`.
+
+### omp workers push too
+
+Everything above talks about Claude Code because that was the only
+integration for a while. `install.sh` now wires the identical four jobs into
+an omp session too — see "What `install.sh` does" above for the symlink —
+mapped onto omp's own event names: `tool_call` → alert + push-wake,
+`before_agent_start` → session reconciliation injected as a message,
+`tool_result` → throttled mid-session reconciliation + alert retraction,
+`agent_end` → retraction backstop. Same shared code underneath
+(`lib/push-wake.sh`, `lib/reconcile.sh`) as the Claude hooks — Claude and omp
+cannot drift into two different notions of "the worker needs you."
+
+omp has no event that means "I am asking the human something" the way
+Claude's `Notification` does — only `tool_call`, which fires before *every*
+tool call, approved or not. Alerting straight off that would be a signal
+storm, so `agent-hooks/omp-notify.sh` polls the worker's own pane for a
+prompt that actually painted and stays silent when none appears — safe to
+call on every tool call, and approval-mode-agnostic by construction: under
+`yolo` nothing ever prompts, so nothing ever alerts.
+
+**Only reaches workers `spawn-task.sh` launched.** The push wake needs
+`HERDR_PANE_ID` stamped into the worker's environment; an omp session started
+by hand has none, so it stays reconciliation-only (`attention.sh`,
+`wait-for-blocked.sh`, the interval sweep) — the same deal a hand-started
+Claude session gets.
+
+## Approval posture and command policy
+
+`spawn-task.sh` composes two independent floors, both set in `config.sh`,
+both of which only ever get *stricter* for one spawn, never looser:
+
+- **Approval posture** (`lib/posture.sh`) — `yolo` (no gate) < `write`
+  (auto-approve file edits, still prompt before executing — the default
+  `HERDR_POSTURE_FLOOR`) < `strict` (prompt before everything).
+  `compose_posture` returns the more restrictive of the machine floor and a
+  per-spawn request; an unrecognized posture name fails *closed* to `strict`,
+  loudly, rather than being ignored. `lib/agent-profiles.sh` translates the
+  resolved posture into each agent's own verified flag —
+  `claude --permission-mode acceptEdits|manual|bypassPermissions`,
+  `omp --approval-mode write|always-ask|yolo`. **codex gets no posture flag
+  at all** — its approval surface isn't a single documented enum the way the
+  other two are, and a guessed flag would either break the spawn or silently
+  fail to enforce anything while looking like it did. `posture_is_enforced_for
+  codex` returns false so a caller can say so rather than imply a guarantee.
+- **Command policy** (`lib/command-policy.sh`) — classifies the shell command
+  behind an approval prompt as `allow` / `escalate` / `deny`: recursive `rm`,
+  `git push --force`, `DROP`/`TRUNCATE TABLE`, `mkfs` and fork-bombs,
+  `curl | sh`, plus your own rules via `HERDR_POLICY_EXTRA_RULES` in
+  `config.sh` (newline-separated, tab-separated
+  `<escalate|deny><TAB><regex><TAB><reason>` — there is no operator verdict
+  meaning "allow", so a site rule can only tighten). This is what
+  `herdr-select.sh --authority peer` checks before letting one agent
+  auto-answer another agent's prompt on your behalf: anything short of
+  `allow` is refused (exit code 8) and left for you. Classification can only
+  see what's on screen — a command that scrolled away can't be judged, which
+  is why `--authority peer` is opt-in and `human` (the default) still records
+  the verdict but never enforces it.
+
+See `SKILL.md`'s "The safety model" for the full list of what refuses and why.
+
 ## Name tabs by their work, and see who needs you (`smart-name.sh` + `attention.sh`)
 
 Two tabs both reading "Main" tell you nothing. These give a tab a name that says
@@ -275,22 +355,33 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `attention.sh` | honest per-agent waiting-reason + `--focus` next-action view |
 | `herdr-deliver.sh` | deliver+submit a message to an agent (or `--blocked`) |
 | `send-to-agent.sh` | robust type+submit into a pane (delivery primitive) |
-| `herdr-select.sh` | answer a numbered prompt by pressing that option's key |
+| `herdr-select.sh` | answer a prompt — numbered digit or omp's arrow menu — by pressing the right key(s); `--authority peer\|human` gates auto-answer through command policy |
 | `herdr-resolve.sh` | retract Slack alerts whose prompt was answered elsewhere |
 | `wake-on-evidence.sh` | poll a peer's `.omc/handoffs/events.jsonl` for a marker, then wake |
-| `install.sh` | wire the hooks into Claude Code (idempotent, dry-run by default) |
+| `install.sh` | wire the hooks into Claude Code and the omp extension symlink (idempotent, dry-run by default) |
+| `verify-run-registry.sh` | 42-check verification of the SQLite run registry — sequencing, dedup, transactions, migration from the old file layout |
+| `verify-posture.sh` | 49-check verification of the posture ladder — composition, fail-closed unknowns, per-agent flag translation |
+| `verify-command-policy.sh` | 25-check verification of the command-policy classifier — floor rules, normalization, operator rules |
+| `verify-select-policy.sh` | 29-check verification of `herdr-select.sh --authority peer` against a stubbed herdr — runs the real script, not a reimplementation |
+| `verify-omp-hooks.sh` | 21-check verification of the omp extension's four event handlers against a stubbed pane |
 | `agent-hooks/claude-notify.sh` | the `Notification` hook that raises the alert |
 | `agent-hooks/session-reconcile.sh` | the `SessionStart` hook: reconcile the run registry (detect `lost` tasks) and report state changes missed since this conductor last checked in |
 | `agent-hooks/interval-reconcile.sh` | the throttled `PostToolUse` hook: same sweep + report, mid-session |
+| `agent-hooks/omp-herdr-control.ts` | omp extension module (symlinked by `install.sh`) mapping `tool_call`/`before_agent_start`/`tool_result`/`agent_end` to the same four jobs the Claude hooks do |
+| `agent-hooks/omp-notify.sh` | omp's equivalent of `claude-notify.sh` — polls for a painted prompt before alerting, silent otherwise, so it's safe on every `tool_call` |
+| `agent-hooks/omp-reconcile.sh` | omp's equivalent of `session-reconcile.sh` + `interval-reconcile.sh`, invoked from `before_agent_start`/`tool_result` |
 | | *(named `agent-hooks/`, not `hooks/`, on purpose — see below)* |
 | `settings.example.json` | the hook wiring alone, with placeholders — merge, don't copy |
 | `SKILL.md` | what the tools do, and why several of them refuse things |
 | `AGENTS.md` | step-by-step activation for an agent to follow, with verification |
-| `lib/agent-profiles.sh` | known-agent process names + job-class→model routing + launch flags — single source of truth; add a new agent here |
+| `lib/agent-profiles.sh` | known-agent process names, job-class→model routing, per-agent capabilities (`numbered-prompt`/`menu-prompt`/`summariser`/`push-hook`), and posture→flag translation — single source of truth; add a new agent here |
 | `lib/pane-guard.sh` | "is this pane safe to send input to?" — shared gate, plus `require_pane_birth_match` (recycled-pane refusal) |
 | `lib/prompt-parse.sh` | read the options / context an agent is showing, plus `prompt_id` |
 | `lib/pane-name.sh` | pane id → "Space — Tab", for alerts a human reads |
-| `lib/run-registry.sh` | central run/task registry — identity, lifecycle, events, checkpoints (see `docs/control-plane-design.md`) |
+| `lib/posture.sh` | the approval posture ladder (`yolo`<`write`<`strict`) — `compose_posture` only ever tightens a per-spawn request against `HERDR_POSTURE_FLOOR` |
+| `lib/command-policy.sh` | classifies the shell command behind a prompt (`allow`/`escalate`/`deny`) — the gate `herdr-select.sh --authority peer` enforces before auto-answering |
+| `lib/run-registry.sh` | central run/task registry — one SQLite database (`registry.sqlite3`, WAL) for identity, lifecycle, sequenced+deduped events, checkpoints, and the approval decided/attempted/confirmed lifecycle; imports the old JSON/JSONL layout once, non-destructively (see `docs/control-plane-design.md`) |
+| `lib/push-wake.sh` | shared push-wake delivery + outcome recording (pane-birth check, `prompt_id` capture, `wake_attempted`/`wake_result`) — used by `claude-notify.sh` and `omp-notify.sh` alike |
 | `lib/reconcile.sh` | the reconciliation sweep + report, shared by `session-reconcile.sh` and `interval-reconcile.sh` |
 | `docs/control-plane-design.md` | conductor/worker control-plane design — what's built vs. only designed, plus multi-agent portability status |
 | `docs/herdr-config-snippet.toml` | sidebar rows + keybindings for the two tools above |

@@ -53,9 +53,14 @@ burn your best model and a design task does not get your cheapest:
 are yours to set in `config.sh`.
 
 **Agent-agnostic by construction.** `lib/agent-profiles.sh` is the single
-table of known agent process names, job-class→model routing, and launch
-flags — `claude`, `codex`, and (verified 2026-07-31, live) `omp` today. Add
-another CLI there, not by editing individual scripts.
+table of known agent process names, job-class→model routing, launch flags,
+and per-agent *capabilities* (`numbered-prompt` / `menu-prompt` / `summariser`
+/ `push-hook` — what a given CLI's TUI can actually do, so `herdr-select.sh`
+and `install.sh` ask a question here instead of hardcoding one CLI's prompt
+shape) — `claude`/`omc`, `codex`, and (verified 2026-07-31, live) `omp`
+today. An agent with no declared capability isn't a bug — it spawns and is
+watched exactly as before, it just isn't guessed at for auto-answering or
+push-wake. Add another CLI's row here, not by editing individual scripts.
 
 `sort-tabs.sh` ranks by git + PR state, attention-first:
 `waiting > active > committed > reviewed > merged > other`. Use `--dry-run`
@@ -117,6 +122,37 @@ caioniehues/herdmates: **never show a wrong reason**; degrade to a plain
 `waiting`. `--focus` is the one-line "what next". Both feed the `$task`/`$status`
 sidebar cards — enable them by merging `docs/herdr-config-snippet.toml` into
 `config.toml` (invalid token names fail silently; `herdr config check`).
+
+---
+
+## omp workers push too
+
+Everything above assumes Claude Code. `install.sh` wires the identical four
+jobs — push-wake, session reconciliation, mid-session reconciliation, alert
+retraction — into an omp session too, through omp's own extension events
+instead of `settings.json` hooks: `tool_call` → alert + push-wake,
+`before_agent_start` → session reconciliation injected as a message,
+`tool_result` → throttled reconciliation + retraction, `agent_end` →
+retraction backstop. Same shared code underneath (`lib/push-wake.sh`,
+`lib/reconcile.sh`) as the Claude hooks — there is exactly one place that
+knows how to notify/reconcile/retract, not two copies that can quietly
+disagree.
+
+omp has no event that means "I am asking the human something" — only
+`tool_call`, which fires before *every* tool call, approved or not. Alerting
+straight off that would be a signal storm on every single bash invocation, so
+`agent-hooks/omp-notify.sh` polls the worker's own pane briefly for a prompt
+that actually painted and exits silently when none does. That makes it safe
+to call unconditionally and approval-mode-agnostic by construction: under
+`yolo` nothing ever prompts, so nothing ever alerts — it never has to know or
+mirror which mode the worker was launched at.
+
+**This only reaches workers `spawn-task.sh` launched.** The push wake needs
+`HERDR_PANE_ID` stamped into the worker's environment; an omp session started
+by hand has none, so it stays reconciliation-only — the same limitation a
+hand-started Claude session already had. Operator kill switch, if you need
+one without uninstalling: `disabledExtensions: [extension-module:herdr-control]`
+in `~/.omp/agent/config.yml`.
 
 ---
 
@@ -182,11 +218,21 @@ whose agent exited reads `tmux,zsh` and would otherwise pass. A shared runtime
 (`node`, `python`…) qualifies only when it was given a **script** — bare `node`
 or `node -i` is a REPL, which evaluates whatever it is handed.
 
-**One CLI's prompt shape is not another's.** `omp`'s tool-approval prompt is
-an arrow-key `Approve`/`Deny` menu, not Claude's/Codex's numbered list —
-`send-to-agent.sh` recognises and refuses it (same protection), but
-`herdr-select.sh` cannot yet ANSWER it. See "Multi-agent portability" in
-`docs/control-plane-design.md`.
+**One CLI's prompt shape is not another's — so ask, don't assume.** `omp`'s
+tool-approval prompt is an arrow-key `Approve`/`Deny` menu with no numbers at
+all, the opposite convention from Claude's/Codex's numbered list — "press the
+bare digit, never Enter" used to be protocol knowledge hardcoded into this
+script, and it was already wrong for the second agent added. Now
+`lib/agent-profiles.sh` declares each agent's `answer_strategy_for_agent`
+(`digit` / `menu` / `none`), and `herdr-select.sh` dispatches on that instead
+of guessing: for `menu` it arrow-navigates to the wanted row — confirmed
+after every keystroke via that row's ANSI background-colour highlight, since
+nothing here trusts a keypress landed without checking — then Enter. Verified
+live 2026-07-31 against `omp --approval-mode always-ask`, but only against
+its two-option `Allow tool: bash` shape; a prompt with more options or a
+different header is untested. An agent with **no** declared strategy
+(`none`) is refused the same way an unrecognised prompt always was —
+automation does not guess at a shape it has never been told.
 
 **Text is never delivered into a prompt.** A blocked agent is usually sitting on
 a permission gate, where typed text is inert and the Enter selects the
@@ -194,12 +240,64 @@ a permission gate, where typed text is inert and the Enter selects the
 re-checks before **every** Enter, since a prompt can appear mid-submit. `--force`
 overrides — from a terminal only, never from Slack.
 
-**A choice is a choice.** `herdr-select.sh` is the one path allowed to answer a
-prompt. It requires the pane to be showing a numbered prompt *right now*,
-requires the number to be one currently on offer, sends the **bare digit and
-never Enter**, and records the choice to `~/.config/herdr-bridge/selections.jsonl`
-*before* pressing — so what was authorised is on disk even if the keypress or
-the agent then misbehaves.
+**A choice is a choice.** `herdr-select.sh` is the one path allowed to answer
+a prompt. It requires the pane to be showing a prompt *right now*, requires
+the option to be one currently on offer — re-checked a second time
+immediately before acting, since a prompt can change between the initial
+read and the keypress — and answers it the way that agent's own strategy
+demands (a bare digit and never Enter, or an arrow-walk to the row and then
+Enter; see "One CLI's prompt shape is not another's" above). It records the
+choice to `~/.config/herdr-bridge/selections.jsonl` *before* acting — so what
+was authorised is on disk even if the keypress or the agent then misbehaves
+— and now refuses to press anything at all if that write itself fails,
+rather than falling through to send-keys with a broken audit trail.
+
+**Posture composes, never loosens.** How much a worker may do unattended is
+a ranked ladder, not a raw CLI flag chosen per spawn: `yolo` (0, no gate) <
+`write` (1, auto-approve edits, still prompt before executing — the default
+`HERDR_POSTURE_FLOOR`) < `strict` (2, prompt before everything).
+`compose_posture` always returns the *more* restrictive of the machine floor
+and a per-spawn request, so a caller can tighten one spawn but can never
+hand out something looser than the floor — and an unrecognised posture name
+(a typo in `config.sh`) fails **closed** to `strict` rather than being
+ignored. `lib/agent-profiles.sh` translates the resolved posture into each
+agent's own verified flag. **codex gets no flag at all, on purpose** — its
+approval surface isn't a single documented enum the way Claude's and omp's
+are, and a plausible-looking guess would either break the spawn or silently
+fail to enforce anything while looking like it did; `posture_is_enforced_for
+codex` reports `false` so a caller can say so instead of implying a
+guarantee that isn't there.
+
+**A prompt's own command decides whether a peer may answer it.**
+`lib/command-policy.sh` classifies the shell text behind a prompt as
+`allow` / `escalate` / `deny` — recursive `rm`, `git push --force`,
+`DROP`/`TRUNCATE TABLE`, `mkfs`/fork-bombs (deny), `curl | sh`, plus operator
+rules from `HERDR_POLICY_EXTRA_RULES` that can only ever tighten (there is
+no operator verdict meaning "allow"). `herdr-select.sh --authority peer` is
+what this actually gates: a conductor *agent* calling herdr-select.sh used
+to look exactly like a human, and under `peer` anything short of `allow` is
+now REFUSED — no key pressed — and left for a human (exit code 8). Under
+`authority human` (the default) the verdict is still classified and
+recorded, but it never blocks; a person is the authority already, so
+recording it is about attribution, not permission. The classifier can only
+see what's *visible on screen* — a command scrolled out of the pane can't be
+judged, which is exactly why `peer` is opt-in rather than the default.
+
+**Deciding, attempting, and confirming are three separate facts.** The run
+registry (`lib/run-registry.sh`) records `approval_decided` /
+`approval_attempted` / `approval_confirmed` for every `herdr-select.sh`
+answer, so "we decided and typed nothing" can never again read the same as
+"the keystrokes actually landed" — a run that dies mid-send leaves
+`confirmed_at` null, which used to be indistinguishable from success. Pushed
+wakes get the same treatment: `lib/push-wake.sh` records `wake_attempted`
+then `wake_result` with `send-to-agent.sh`'s real outcome (`submitted` /
+`unsubmitted` / `refused` / `transport_error`) instead of the old `|| true`
+that threw the outcome away. None of this would hold together as an audit
+trail if the underlying store could lose or duplicate events under
+concurrent writers — which is why it's now one SQLite database (WAL mode)
+instead of a JSON file per task plus an append-only log: a real monotonic
+sequence, `UNIQUE`-keyed dedup for retries, and a state change landing in
+the *same transaction* as its event-log entry.
 
 **Alerts retract themselves.** Answer in the terminal and `herdr-resolve.sh`
 deletes the Slack message, because a stale alert that looks pending teaches you

@@ -49,8 +49,6 @@ control plane — see "Designed, not built" for the rest.
 | Pane-birth revalidation at delivery time | `lib/pane-guard.sh` (`pane_birth_now`, `require_pane_birth_match`), `lib/run-registry.sh` (`task_for_pane`), `herdr-select.sh`, `agent-hooks/claude-notify.sh`, `spawn-task.sh` (`conductor_pane_birth`) | Closes the TOCTOU gap the review called the most dangerous unhit failure: pane ids are RECYCLED, so a wake or an answer aimed at a bare pane id can land in an unrelated later process. `herdr-select.sh` looks up the registered task for its target pane (`task_for_pane`) and refuses (`exit 7`) if the pane's live `terminal_id` no longer matches what was registered. `claude-notify.sh` does the mirror check on the CONDUCTOR side, using a new `conductor_pane_birth` fingerprint `spawn-task.sh` now captures at registration time (the worker's own `pane_birth` was already tracked; the conductor's pane was not). Both are mandatory whenever the pane IS registered — a pane spawned outside the registry (`spawn-agent.sh`) has nothing to check, so it is unaffected, the same backward-compatible principle as `--expect-prompt-id`. |
 
 All eight were tested live against real herdr panes (not just `bash -n`):
-
-All four were tested live against real herdr panes (not just `bash -n`):
 `sort-tabs.sh` against a scratch workspace with a genuine agent-recognized
 pane and a bare shell; the full spawn→register→push-wake→blocked-state→event
 chain against a scratch conductor pane and a real worktree spawn (cleaned up
@@ -76,7 +74,6 @@ incidentally proved Claude Code's settings hot-reload: OTHER already-running
 sessions on the same machine picked up `interval-reconcile.sh` and started
 calling it within one tool call of the settings write, no restart observed
 to be necessary.
-text delivered, nothing executed).
 
 ### What was deliberately left alone
 
@@ -100,12 +97,62 @@ text delivered, nothing executed).
   state (task lifecycle, `input_required` events), not retrofitted onto the
   existing completion-evidence channel. Unifying them is listed below.
 
-## Designed, not built
+## Built in round 2 (2026-08-01)
 
-The review's numbered corrections, as a roadmap. None of this exists in code.
+Round 1 above built the SHAPE and is left as written — it is the record of that
+round, not a live description of the code. Round 2 closed corrections 2, 4, 5
+and 6 and made omp a first-class agent. Where the two disagree, this section
+wins.
+
+**Superseded rows in the round-1 table:** the registry is no longer
+`~/.local/state/herdr/runs/<run_id>/` JSON files plus a per-run `events.jsonl` —
+it is one SQLite database at `~/.local/state/herdr/runs/registry.sqlite3`.
+`all_task_files()` is gone (it emitted file paths); `all_tasks_json()` replaces
+it with one JSON object per line. Legacy task files, events and checkpoints are
+imported once, non-destructively, on first use — dropping a running worker's
+registration would silently disable recycled-pane refusal for it, which is a
+safety regression that produces no error.
+
+| Piece | File | What it does |
+|---|---|---|
+| SQLite registry (correction 4) | `lib/run-registry.sh` | Real monotonic `sequence` (AUTOINCREMENT, replacing `grep -c` count-then-append, which collided silently under concurrent writers); `UNIQUE(event_id)` so an at-least-once retry dedups instead of double-logging; a state change and its event in ONE transaction (the prior fix could only SUPPRESS the event when the state write failed); `task_id` as PRIMARY KEY so an id collision fails loudly instead of overwriting a live registration; enforced state transitions (`completed -> running` is refused); `events_since`/`advance_event_cursor` as a cursor over the EVENT STREAM, which the file layout could not express at all |
+| Approval lifecycle (correction 6) | `lib/run-registry.sh` (`approval_decided`/`approval_attempted`/`approval_confirmed`), `lib/push-wake.sh`, `herdr-select.sh` | Three distinct records, so "decided and typed nothing" can no longer read the same as "the agent received it". Wakes likewise record `wake_attempted` then `wake_result` carrying `send-to-agent.sh`'s real outcome (`submitted`/`unsubmitted`/`refused`/`transport_error`) — that exit status existed all along and was discarded by a fire-and-forget `\|\| true` |
+| Adapter capabilities (correction 5) | `lib/agent-profiles.sh` (`agent_capabilities`, `answer_strategy_for_agent`) | "Bare digit, never Enter" was hardcoded protocol knowledge and was already wrong for omp, whose menu wants arrow keys and Enter. Now declared per agent (`numbered-prompt`, `menu-prompt`, `summariser`, `push-hook`); an agent declaring nothing is refused an automated answer rather than guessed at |
+| Operational vs authorization (correction 8) | `lib/command-policy.sh`, `herdr-select.sh` (`--authority`, exit 8) | A conductor AGENT calling `herdr-select.sh` previously looked exactly like a person. Under `--authority peer` the prompt's command is normalized (heredoc/quote/ANSI-C/`$()` to depth 8) and classified; anything not `allow` is refused with no key pressed. Under `human` the verdict is still recorded — a person may approve a destructive command, but it is attributable |
+| Posture floor | `lib/posture.sh`, `config.sh` (`HERDR_POSTURE_FLOOR`) | `yolo`<`write`<`strict`, composed by taking the MORE restrictive of floor and request, so a spawn can tighten and never loosen. Unknown names fail closed to `strict`. codex is deliberately unmapped and gets no flag — inventing one would either break the spawn or falsely imply enforcement |
+| omp push hooks | `agent-hooks/omp-herdr-control.ts`, `omp-notify.sh`, `omp-reconcile.sh`, `install.sh` | omp workers PUSH when blocked instead of waiting to be noticed by a poll. Installed globally as a symlink into omp's user-level auto-discovery root, so parity with `~/.claude/settings.json` rather than a per-repo `.omp/` |
+
+Verified by five suites at the repo root, 166 checks total:
+`verify-run-registry.sh` (42 — including 20 concurrent writers proving unique
+sequences, and a SQL-injection attempt through a task label), `verify-posture.sh`
+(49), `verify-command-policy.sh` (25), `verify-select-policy.sh` (29 — runs the
+REAL `herdr-select.sh` against a stubbed herdr and asserts that on every refusal
+NO KEY IS PRESSED), `verify-omp-hooks.sh` (21).
+
+### Still open after round 2
+
+- **Correction 3, half of it.** `.omc/handoffs/events.jsonl` is still repo-local
+  and still separate from the registry. A worker's completion evidence and its
+  lifecycle state remain in two places.
+- **Correction 1's timer.** Interval reconciliation is still activity-gated: an
+  idle session with no tool calls gets none until its next tool call. A true
+  wall-clock timer needs a daemon.
+- **Backpressure.** No debounce, priority, fairness or coalescing. omp's alert
+  path is bounded only because it stays silent unless a prompt actually painted;
+  N simultaneously-blocked workers still produce N injections.
+- **Classification sees only the VISIBLE pane.** A command scrolled out of view
+  cannot be judged, which is part of why peer authority is opt-in rather than
+  the default.
+- **omp menu answering** has been exercised only against the 2-option
+  `Allow tool: bash` shape; the N-row path is written generically but unproven.
+
+## The review's numbered corrections — status
+
+The review's numbered corrections, as a roadmap. Round 1 (2026-07-27) built the
+shape; round 2 (2026-08-01) closed 2, 4, 5 and 6 — see the section above, which
+wins where the per-correction notes below still read as unbuilt.
 
 ### 1 — Push does not replace polling; it's push + reconciliation (partially built)
-### 1 — Push does not replace polling; it's push + reconciliation
 
 > "push for responsiveness + periodic reconciliation for correctness" — push
 > alone cannot detect a crashed worker, a dead hook, a wedged worker that
@@ -154,19 +201,14 @@ only the worker's pane had a fingerprint — the delivery direction this
 correction is actually about had nothing to check). Both are proven both
 ways: matching fingerprint delivers exactly as before, mismatched fingerprint
 refuses with the target pane provably untouched (see "Built this round").
-**Not built**: `completed`/`failed`/`cancelled` are used by convention (a
-worker or operator sets them) but have no enforced transition-rule table
-(nothing stops `completed` -> `running`, for instance), and there is still no
-`created` pre-registration state. The reuse scenario this correction warns
-about is now closed on BOTH the reconciliation path and the live-delivery
-path — what remains is transition-rule enforcement, not identity.
-and `starting`/`running`/`blocked` transitions via `set_task_state`. **Not
-built**: `completed`/`failed`/`cancelled`/`lost` as real terminal states with
-enforced transition rules, a `created` pre-registration state, or anything
-that revalidates a pane's fingerprint before acting on it (registration
-records the fingerprint; nothing currently re-checks it against the live
-pane before a wake or answer, which is exactly the reuse scenario the
-correction warns about).
+**Built in round 2**: the transition-rule table is now enforced in
+`set_task_state` — `completed`/`failed`/`cancelled`/`lost` are real terminal
+states and nothing leaves them, so a stale hook firing after the sweep already
+buried a task cannot resurrect it. An illegal transition is refused with a
+diagnostic rather than written. `blocked` is deliberately NOT terminal even
+though it is reported like one: a worker waiting on a prompt resolves back to
+`running` routinely. **Still not built**: a `created` pre-registration state,
+which nothing has needed.
 
 ### 3 — Control-plane state does not belong in the worker repo (built for the NEW state; not retrofitted)
 
@@ -182,10 +224,6 @@ so a worktree cleanup can't reset what a conductor has already been shown.
 **Not built**: migrating or unifying the existing `.omc/handoffs/events.jsonl`
 completion channel into the same store — a worker's completion evidence and
 its lifecycle state currently live in two different places.
-`~/.local/state/herdr/runs/<run_id>/`, not in any worktree. **Not built**:
-migrating or unifying the existing `.omc/handoffs/events.jsonl` completion
-channel into the same store — a worker's completion evidence and its
-lifecycle state currently live in two different places.
 
 ### 4 — JSONL is durable, not reliable
 
@@ -195,28 +233,29 @@ lifecycle state currently live in two different places.
 > atomic append, consumer checkpoints, dedup, explicit run scoping — or a
 > small SQLite db / one-file-per-event spool.
 
-`lib/run-registry.sh`'s `append_event` has event ids and per-run scoping
-(one `events.jsonl` per `run_id`, `event_id` = `<run_id>_<sequence>`) but
-**explicitly not** the rest: writes are not atomic (no lock, no
-temp-file+rename), sequence numbers are count-then-append (not a real
-monotonic counter under concurrent writers). This is the known weakest part
-of what got built; treat every number in the file above as "good enough for
-one worker being watched synchronously," not as a queue a fleet can trust.
+**Built in round 2** — this correction is closed, by taking the review's own
+suggestion ("a small SQLite db"). `lib/run-registry.sh` is now one database at
+`~/.local/state/herdr/runs/registry.sqlite3` in WAL mode, and each named gap maps
+to a primitive rather than to careful shell:
 
-**Partially built**: a consumer checkpoint now exists
-(`read_checkpoint`/`write_checkpoint`), but it is a checkpoint over **task
-state** (`task_id` -> last-reported `state`+`updated_at`), not over the
-**event stream** — a restarting conductor now knows which task-state
-transitions it has already been shown, but nothing dedups or checkpoints
-`events.jsonl` itself line-by-line. A task that changes state twice between
-two reconciliation runs is reported once (its latest state), with the
-intermediate transition never surfaced — correct for "tell me what changed,"
-not sufficient for "replay every event exactly once."
-monotonic counter under concurrent writers), and there is no consumer
-checkpoint or dedup — a conductor restarting today has no way to know which
-events it already saw. This is the known weakest part of what got built;
-treat every number in the file above as "good enough for one worker being
-watched synchronously," not as a queue a fleet can trust.
+- *sequence numbers were count-then-append* → `INTEGER PRIMARY KEY AUTOINCREMENT`,
+  a real monotonic counter that never reuses a value. Proven with 20 concurrent
+  writers: 20 rows, 20 distinct sequences.
+- *duplicate events on retry* → `UNIQUE(event_id)` plus an optional caller-supplied
+  id, so an at-least-once producer retries into a no-op. `lib/push-wake.sh` uses
+  this: a repeated wake for the same task and prompt writes the same rows once.
+- *atomic append* → a transaction. The state change and its event now land
+  together; the previous design could only SUPPRESS the event when the state
+  write failed, which is compensation, not atomicity.
+- *consumer cursor loss* → `events_since` / `advance_event_cursor`, a cursor over
+  the event stream. Advancing is separate from reading on purpose: a consumer
+  that read events and then crashed must be able to see them again.
+- *concurrent writers* → `.timeout` (the CLI dot-command; `PRAGMA busy_timeout=N`
+  returns a row and would corrupt every query's output).
+
+The checkpoint over task state is kept alongside it — it answers "what changed
+since I last looked", which is a different and still-useful question from "which
+events have I never seen".
 
 ### 5 — Prompt answering has a TOCTOU race (partially built)
 
@@ -237,15 +276,17 @@ else" — which `prompt_id` alone does not: a recycled pane running a
 different agent could show a superficially similar-looking prompt and still
 pass a content check. Unlike `--expect-prompt-id`, the pane-birth check is
 unconditional wherever the pane is registered, not opt-in, since there is no
-safe default that skips it. **Not built**: the adapter abstraction
-(`ClaudeCodeAdapter.answer_prompt()` etc.) that would let a different TUI or
-a version change declare its own safe submit behavior instead of "bare
-digit, never Enter" being hardcoded protocol knowledge.
-Built: `prompt_id()` and `herdr-select.sh --expect-prompt-id`, tested against
-both a match and a deliberate mismatch. **Not built**: the adapter
-abstraction (`ClaudeCodeAdapter.answer_prompt()` etc.) that would let a
-different TUI or a version change declare its own safe submit behavior
-instead of "bare digit, never Enter" being hardcoded protocol knowledge.
+safe default that skips it.
+
+**Built in round 2**: the adapter abstraction exists as declared per-agent
+capabilities in `lib/agent-profiles.sh` (`agent_capabilities`,
+`answer_strategy_for_agent`) rather than as a class per TUI. `numbered-prompt`
+means "press the bare digit, never Enter"; `menu-prompt` means "arrow to the row,
+confirming the highlight after every keystroke, then Enter". `herdr-select.sh`
+dispatches on that instead of carrying the convention as protocol knowledge —
+which it had already outgrown, since omp's menu wants the exact opposite of
+Claude's digit. An agent that declares neither is refused an automated answer
+rather than guessed at.
 
 ### 6 — Delivery semantics are unspecified
 
@@ -255,13 +296,24 @@ instead of "bare digit, never Enter" being hardcoded protocol knowledge.
 > confirmed-or-timed-out. Recording a choice before pressing must not imply
 > it was delivered.
 
-Not built at all. The push wake in `claude-notify.sh` is fire-and-forget
-(`|| true`) with no ACK, no retry, and no distinction between "delivery
-attempted" and "delivery confirmed" — `send-to-agent.sh`'s own exit codes
-(SUBMITTED/UNSUBMITTED/REFUSED) are available and currently discarded by the
-wake call. `herdr-select.sh`'s existing "record before sending" pattern
-satisfies "decision recorded" but conflates it with "delivery attempted" —
-there is no separate "confirmed" record.
+**Built in round 2.** `lib/push-wake.sh` (new, shared by the Claude and omp
+notify hooks so the two entry points cannot drift) writes `wake_attempted`
+BEFORE the send and `wake_result` after it, carrying `send-to-agent.sh`'s real
+outcome — `submitted` / `unsubmitted` / `refused` / `transport_error`. Those exit
+codes existed all along and were thrown away by a fire-and-forget `|| true`, so
+"the conductor was woken" and "we typed at a pane and never looked" recorded
+identically. Both events use stable ids derived from the task and prompt, so an
+at-least-once retry dedups rather than double-logging.
+
+`herdr-select.sh` likewise now writes three separate records —
+`approval_decided` / `approval_attempted` / `approval_confirmed` — so a run that
+dies at a failed `send-keys` leaves `decided_at` and `attempted_at` set with
+`confirmed_at` NULL, which is exactly the state that used to be
+indistinguishable from success.
+
+**Still not built**: an ACK *from* the conductor (that it read the wake, not
+merely that the text submitted), and retry. The outcome is recorded; nothing
+acts on a `refused` result yet.
 
 ## Also flagged, not yet triaged into the numbered list
 
@@ -269,44 +321,75 @@ From Gemini's review, corroborating rather than duplicating the above:
 
 - **Signal storms** — a busy repo with many simultaneous blocked prompts could
   flood the conductor; needs debounce per worker or a queue summary instead
-  of N immediate pane injections.
+  of N immediate pane injections. Round 2 bounded one side of this by
+  accident of design rather than by solving it: `omp-notify.sh` fires on every
+  `tool_call` but stays silent unless a prompt actually painted, so
+  auto-approved calls cost nothing. N genuinely-blocked workers still produce N
+  injections.
 - **Wake cycles** — worker A waits on worker B waits on worker A; should
   alert the human rather than attempt to resolve automatically.
 - **Task summary on every wake** — partially addressed (`HERDR_TASK_LABEL` is
   included), but a conductor juggling ten workers still can't reconstruct
   full context from a one-line label alone.
 
-## Multi-agent portability (2026-07-31)
+## Multi-agent portability (2026-07-31, updated 2026-08-01)
 
-This whole design assumed one CLI (Claude Code, secondarily Codex). Widening
-it to any recognized agent — `lib/agent-profiles.sh`, added this round — is
-mostly mechanical (process-name allowlist, model-routing table, launch
-flags), verified live against `omp` (Oh My Pi): `pane_is_agent`, `spawn-task.sh`'s
-model routing, and `smart-name.sh`'s `omp -p` summariser path all confirmed
-working end-to-end against a real herdr pane.
+This whole design assumed one CLI (Claude Code, secondarily Codex). Widening it
+to any recognized agent — `lib/agent-profiles.sh` — is mostly mechanical
+(process-name allowlist, model-routing table, launch flags), verified live
+against `omp` (Oh My Pi): `pane_is_agent`, `spawn-task.sh`'s model routing, and
+`smart-name.sh`'s `omp -p` summariser path all confirmed end-to-end against a
+real herdr pane.
 
-One piece is **not** portable by construction and remains open:
-**`herdr-select.sh` cannot answer an `omp` approval prompt.** Verified live
-(`omp --approval-mode always-ask`, real pane read): the prompt is an
-`Allow tool: <name>` header with an `Approve`/`Deny` menu navigated by
-up/down arrows + Enter — no numbered options, no bare-digit-no-Enter
-convention the way Claude's and Codex's prompts share. `send-to-agent.sh`
-now recognizes this shape (`Allow tool:`/`enter select` in
-`_PROMPT_OMP`) and refuses to blow through it with a bare Enter, same
-protection Claude/Codex prompts already got — but nothing presses
-"Approve" on your behalf yet. A worker launched at `--approval-mode write`
-(this round's chosen default for `omp`, matching Claude's
-`--permission-mode acceptEdits`) will sit blocked on its first `bash` call
-with no automated way to answer it; `--approval-mode yolo` avoids the block
-at the cost of no exec-approval gate at all.
+**The two pieces this section previously listed as open are now closed.**
 
-Closing this needs a genuine design decision, not a regex extension:
-whether to drive the Approve/Deny menu via `herdr pane send-keys` arrow
-sequences (exact keybinding beyond up/down/enter/esc not yet probed — e.g.
-a possible `y`/`a`/`d` hotkey was never tested), and how `herdr-select.sh`'s
-"record the choice before pressing" audit invariant maps onto a
-menu-navigation flow instead of a single keypress. Scoped as follow-up, not
-guessed at here.
+*Answering omp's prompt.* `herdr-select.sh` drives the `Allow tool: <name>` /
+`Approve` / `Deny` menu: it walks the highlight with Down/Up and confirms the
+move after every keystroke by reading the row's ANSI 24-bit background-colour
+escape (plain-text scraping cannot see the highlight at all, which is why this
+needed `--format ansi`), then presses Enter. Bounded at 20 presses so a
+pathological or wrapping menu cannot spin. Which mechanism an agent needs is now
+declared, not sniffed — capability `menu-prompt` vs `numbered-prompt` in
+`lib/agent-profiles.sh` — which is also the adapter abstraction correction 5
+asked for. The "record the choice before pressing" invariant maps onto menu
+navigation unchanged: the decision is recorded once, before the first keystroke.
+
+*Pushing when blocked.* omp workers were reconciliation-only because
+`install.sh` wired Claude hooks and nothing else. `agent-hooks/omp-herdr-control.ts`
+is an omp extension module, installed as a symlink into omp's **user-level**
+auto-discovery root (`~/.omp/agent/extensions/`, honouring `PI_CODING_AGENT_DIR`)
+— cwd-independent, so it is genuine parity with a global
+`~/.claude/settings.json` rather than a per-repo `.omp/`. Operator kill switch:
+`disabledExtensions: [extension-module:herdr-control]`.
+
+The event mapping is not one-to-one, and the difference matters. Claude has a
+`Notification` event meaning "I am asking the human something", so its hook is
+told. omp's nearest surface is `tool_call`, which fires before EVERY tool call.
+Alerting straight off that would be a self-inflicted signal storm, so
+`omp-notify.sh` polls the worker's own pane and exits silently unless a prompt
+actually painted. That also makes it approval-mode-agnostic for free: under
+`--approval-mode yolo` nothing prompts, so nothing alerts, with no need to mirror
+which mode omp was launched at.
+
+| Claude hook | omp event | job |
+|---|---|---|
+| `Notification` | `tool_call` | verify a prompt painted, then alert + push wake |
+| `SessionStart` (`additionalContext`) | `before_agent_start` | reconciliation report, returned as an injected message |
+| `PostToolUse` | `tool_result` | throttled interval reconcile + alert retraction |
+| `Stop` | `agent_end` | retraction backstop |
+
+One hard safety note on that shim: omp's tool dispatch is **fail-closed** — a
+handler that throws BLOCKS the tool call. So every handler is exhaustively
+wrapped and returns `undefined` on all paths. A monitoring shim that can wedge
+the agent it monitors is strictly worse than no shim.
+
+**Remaining omp gaps.** The menu path has been exercised only against the
+2-option `Allow tool: bash` shape; the N-row code is written generically but
+unproven. `send-to-agent.sh`'s `_PROMPT_OMP` false-positive risk against a
+genuine Claude prompt was never empirically closed (distinct exact phrases, so
+structurally low risk). And a manually-started omp session has no
+`HERDR_PANE_ID`, so it cannot verify a prompt and stays reconciliation-only —
+the same deal a hand-started Claude session gets for its push wake.
 
 ## Full critiques (attached verbatim)
 
