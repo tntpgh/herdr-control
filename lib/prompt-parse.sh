@@ -198,3 +198,46 @@ prompt_question() {
         NF { last = $0 }
         END { gsub(/^[[:space:]]+|[[:space:]]+$/, "", last); print last }'
 }
+
+# The text an approval decision should be CLASSIFIED against
+# (lib/command-policy.sh), for deciding whether automation may answer a prompt
+# or must escalate it to a human.
+#
+# Deliberately NOT named prompt_command, and deliberately not a precise parse of
+# "the command". Pulling an exact command string out of a TUI screenshot is
+# guesswork that fails in the dangerous direction: a near-miss extraction hands
+# the classifier the WRONG text, and a classifier fed the wrong text returns a
+# confident verdict about something nobody is being asked to approve.
+#
+# So this returns the whole visible prompt region — the menu header/details
+# (where omp puts the tool and its arguments) plus the screen text (where Claude
+# renders the command). The classifier then looks for dangerous SHAPES anywhere
+# in that text. The failure mode of that design is escalating a prompt whose
+# prose merely mentions something like `rm -rf`, which costs one human glance;
+# the failure mode of the precise-parse design is silently auto-approving a
+# destructive command because the extractor clipped it.
+#
+# It does its OWN read rather than reusing prompt_context, and that is a
+# correctness fix, not a style choice. prompt_context is built for a Slack alert:
+# it ends in `tail -n 8 | cut -c1-200`, which is right for something a human
+# skims and WRONG for security classification — a command longer than 200
+# characters, or sitting more than eight non-empty lines above the bottom of the
+# pane, was trimmed away before the classifier ever saw it, and a classifier
+# handed the leftovers returns `allow`. That is a fail-open. Here nothing is
+# truncated: only ANSI escapes and box-drawing furniture are stripped.
+#
+# Residual limit, stated rather than papered over: this can only classify what is
+# VISIBLE. A command that has scrolled out of the pane cannot be judged, which is
+# part of why peer authority is opt-in and a human remains the default.
+prompt_command_text() {
+  local menu win
+  menu="$(prompt_menu_question "$1" 2>/dev/null)" || menu=""
+  win="$(herdr pane read "$1" --source visible --lines 60 2>/dev/null)" || win=""
+  printf '%s\n%s\n' "$menu" "$(
+    printf '%s\n' "$win" \
+      | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \
+      | sed $'s/\xc2\xa0/ /g' \
+      | grep -vE '^[[:space:]]*[─═│┌┐└┘├┤┬┴┼╭╮╰╯]+[[:space:]]*$' \
+      | sed -E 's/[[:space:]]+$//'
+  )"
+}

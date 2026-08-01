@@ -53,24 +53,42 @@
 # --expect-prompt-id this is not opt-in — it runs whenever the pane IS
 # registered, since there is no safe default that skips it.
 #
+# --authority peer|human (default human, or $HERDR_SELECT_AUTHORITY) is what
+# separates an operational question from an authorization one — review
+# correction 8. Until now every caller looked human: a conductor AGENT invoking
+# this script got `via=cli` and the same unconditional permission a person has,
+# which is the permission-laundering hole the whole coordination protocol exists
+# to prevent. Declare `peer` and the command the prompt is asking about is
+# classified (lib/command-policy.sh); anything not `allow` is REFUSED and left
+# for a human. Under `human` the verdict is still recorded — a person may
+# approve a destructive command, but the audit trail says what it was.
+#
 # Exit 0 selected, 2 usage, 3 not an agent pane, 6 no prompt / bad option /
 # prompt changed / navigation could not converge, 7 pane recycled since its
-# task was registered.
+# task was registered, 8 refused by command policy (peer authority only).
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/pane-guard.sh"
 . "$here/lib/prompt-parse.sh"
 . "$here/lib/run-registry.sh"
+. "$here/lib/command-policy.sh"
 
 pane="${1:?usage: herdr-select.sh <pane_id> <option-number> [--expect-prompt-id ID]}"
 choice="${2:?option number required}"
 shift 2
 
 expect_id=""
+authority="${HERDR_SELECT_AUTHORITY:-human}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect-prompt-id) expect_id="${2:?--expect-prompt-id needs a value}"; shift 2 ;;
+    --authority)
+      authority="${2:?--authority needs peer or human}"; shift 2
+      case "$authority" in
+        peer|human) ;;
+        *) echo "herdr-select: --authority must be peer or human, got '$authority'" >&2; exit 2 ;;
+      esac ;;
     *) echo "herdr-select: unknown arg '$1'" >&2; exit 2 ;;
   esac
 done
@@ -146,6 +164,40 @@ relabel=$(printf '%s\n' "${reoffer#*$'\t'}" | awk -F'\t' -v c="$choice" '$1==c {
 # --expect flag): there is no safe default that skips a fingerprint check.
 require_pane_birth_match "$pane" || exit 7
 
+# ---- command policy: is this an operational question or an authorization one?
+# Review correction 8, previously unbuilt: "Peer automation may answer only
+# allowlisted operational prompts; destructive, credential, production, or
+# scope-changing prompts must escalate to the human."
+#
+# Classified for BOTH authorities, but only ENFORCED for `peer`. A human
+# answering their own agent's prompt is the authority — the point of recording
+# the verdict for them is attribution, not permission. For automation the
+# verdict is a gate.
+cmd_text="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
+policy_verdict="$(classify_command "$cmd_text")"
+policy_reason="$(classify_reason)"
+
+if [ "$authority" = peer ]; then
+  # Unreadable prompt text means the classifier had nothing to judge. For
+  # automation that must refuse, not pass: the codebase's own rule everywhere
+  # else (send-to-agent.sh's unreadable-pane path, herdr-resolve.sh's ambiguous
+  # cases) is that not being able to see what you are answering means you do
+  # not answer it.
+  if [ -z "${cmd_text//[[:space:]]/}" ]; then
+    echo "herdr-select: refusing — peer authority cannot classify an unreadable prompt in $pane." >&2
+    exit 8
+  fi
+  if [ "$policy_verdict" != allow ]; then
+    echo "herdr-select: REFUSED ($policy_verdict) — a human must answer this one." >&2
+    [ -n "$policy_reason" ] && echo "herdr-select: $policy_reason" >&2
+    echo "herdr-select: option $choice ($label) in $pane was NOT pressed." >&2
+    append_event "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "approval_escalated" \
+      "$(jq -nc --arg v "$policy_verdict" --arg r "$policy_reason" --arg p "$pane" \
+         '{verdict:$v, reason:$r, pane:$p}')" >/dev/null 2>&1 || true
+    exit 8
+  fi
+fi
+
 # Record BEFORE sending. If the keypress fails or the agent does something
 # unexpected, the audit trail still shows exactly what was authorised and
 # when. A failed WRITE now refuses to proceed at all — this used to fall
@@ -157,11 +209,30 @@ mkdir -p "$log_dir" || { echo "herdr-select: cannot create $log_dir — refusing
 jq -nc --arg pane "$pane" --arg choice "$choice" --arg label "$label" --arg mechanism "$mechanism" \
        --arg via "${HERDR_SELECT_VIA:-cli}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
        --arg prompt_id "$current_prompt_id" \
-  '{at:$at,pane:$pane,choice:($choice|tonumber),label:$label,mechanism:$mechanism,via:$via,prompt_id:$prompt_id}' \
+       --arg authority "$authority" --arg verdict "$policy_verdict" --arg reason "$policy_reason" \
+  '{at:$at,pane:$pane,choice:($choice|tonumber),label:$label,mechanism:$mechanism,via:$via,prompt_id:$prompt_id,authority:$authority,policy_verdict:$verdict,policy_reason:$reason}' \
   >> "$log_dir/selections.jsonl" || {
   echo "herdr-select: failed to write $log_dir/selections.jsonl — refusing to answer without an audit trail." >&2
   exit 2
 }
+
+# ---- the same decision, in the durable registry ----------------------------
+# selections.jsonl above stays the operator-facing audit file (the Slack bridge
+# and herdr-resolve.sh both read that directory). These records add the part
+# review correction 6 said was missing: "decision recorded / delivery attempted
+# / delivery confirmed-or-timed-out. Recording a choice before pressing must not
+# imply it was delivered." Three separate writes, so "we decided and typed
+# nothing" can never again read the same as "the agent received it".
+approval_id="$(gen_id appr)"
+_own="$(task_for_pane "$pane" 2>/dev/null)"
+_run=$(printf '%s' "$_own" | jq -r '.run_id // empty' 2>/dev/null)
+_task=$(printf '%s' "$_own" | jq -r '.task_id // empty' 2>/dev/null)
+# One line, bounded: this is an audit field, not a transcript.
+_cmd_record=$(printf '%s' "$cmd_text" | tr '\n' ' ' | cut -c1-500)
+approval_decided "$approval_id" "$pane" "$current_prompt_id" "$choice" "$label" \
+  "${HERDR_SELECT_VIA:-cli}" "$authority" "$policy_verdict" "$_cmd_record" \
+  "${_run:-}" "${_task:-}" >/dev/null 2>&1 || true
+approval_attempted "$approval_id" >/dev/null 2>&1 || true
 
 if [ "$mechanism" = numbered ]; then
   # Claude's and Codex's selection prompts take the bare digit — no Enter,
@@ -207,6 +278,15 @@ else
     exit 2
   }
 fi
+
+# Delivery CONFIRMED — the third of the three records. Reached only by falling
+# through every send-keys call above without one of them exiting non-zero, so
+# unlike the decision record this one genuinely means the keystrokes landed.
+# A run that dies at a failed send-keys leaves decided_at and attempted_at set
+# with confirmed_at NULL, which is exactly the state that used to be
+# indistinguishable from success.
+approval_confirmed "$approval_id" "pressed" \
+  "mechanism=$mechanism choice=$choice" >/dev/null 2>&1 || true
 
 # Answered HERE, so stop tracking it as pending. herdr-resolve retracts alerts
 # whose prompt has vanished — correct when you answered in the terminal, wrong
