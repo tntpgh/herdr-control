@@ -82,10 +82,11 @@ _PROMPT_YN='\([Yy]/[Nn]\)|\[[Yy]/[Nn]\]'
 # Claude-shape `❯` arrow marker — it's an arrow-key/Enter menu, not a
 # digit-select. Verified 2026-07-31 against a live `omp --approval-mode
 # always-ask` pane: "Allow tool: bash" header, "Approve"/"Deny" rows,
-# "up/down navigate  enter select  esc cancel" footer. herdr-select.sh
-# cannot ANSWER this shape yet (see docs/control-plane-design.md) — this
-# only makes send-to-agent.sh recognise it and refuse, same as any other
-# prompt it can't safely blow through with a bare Enter.
+# "up/down navigate  enter select  esc cancel" footer. herdr-select.sh CAN now
+# answer this shape (capability `menu-prompt`, lib/agent-profiles.sh — it walks
+# the highlight and presses Enter); what this pattern does is stop ordinary TEXT
+# delivery from blowing through the prompt with a bare Enter, same as any other
+# prompt shape.
 _PROMPT_OMP='Allow tool:|enter select'
 
 looks_like_permission_prompt() {

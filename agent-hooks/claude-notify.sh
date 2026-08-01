@@ -69,65 +69,29 @@ if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
 fi
 
 # --- push wake: also alert the CONDUCTOR pane directly (control-plane Edge 1,
-# docs/control-plane-design.md) — SHAPE ONLY, scoped to a single worker: no
-# ack, no retry, no dedup, no reconciliation sweep if this fails silently.
-# Best-effort and fully additive; the Slack path above is unaffected whether
-# or not a conductor was stamped. A worker only has HERDR_CONDUCTOR_PANE_ID
-# when spawn-task.sh launched it from inside a herdr pane.
+# docs/control-plane-design.md).
 #
-# The conductor pane must pass the SAME agent-pane gate any other delivery
-# does — send-to-agent.sh does not enforce that itself (only herdr-deliver.sh
-# does, one layer up), so skipping this check here would let a stray or
-# misconfigured HERDR_CONDUCTOR_PANE_ID type a message into a bare shell,
-# where it would execute as a command instead of landing in a composer.
+# Every guard — the agent-pane gate, the conductor pane-birth revalidation that
+# closes the recycled-pane misdelivery, the prompt_id capture, and the
+# delivery-outcome recording that replaced the old fire-and-forget `|| true` —
+# now lives in lib/push-wake.sh, shared with agent-hooks/omp-notify.sh. Two
+# copies of a safety check is two places for it to rot, which is the same reason
+# lib/agent-profiles.sh exists.
+#
+# Best-effort and fully additive: the Slack path above is unaffected whether or
+# not a conductor was stamped. A worker only has HERDR_CONDUCTOR_PANE_ID when
+# spawn-task.sh launched it from inside a herdr pane.
+#
+# stderr stays silenced here on purpose — a hook must not narrate into the
+# session transcript. A failed wake is not lost by that: push_wake records
+# `wake_result` with the real outcome in the registry, which is what the
+# reconciliation sweep reports and what an operator can query later.
 if [ -n "${HERDR_CONDUCTOR_PANE_ID:-}" ]; then
   . "$_hook_dir/../lib/pane-guard.sh"
   . "$_hook_dir/../lib/prompt-parse.sh"
   . "$_hook_dir/../lib/run-registry.sh"
-  if pane_is_agent "$HERDR_CONDUCTOR_PANE_ID"; then
-    # Revalidate the CONDUCTOR pane's birth fingerprint immediately before
-    # delivering — pane_is_agent only proves something agent-shaped is
-    # running there NOW, not that it is still the same conductor process
-    # spawn-task.sh registered this task against. Pane ids are RECYCLED: a
-    # delayed wake sent on a bare pane_id can land in an unrelated later
-    # session (docs/control-plane-design.md correction 5's "most dangerous
-    # unhit failure"). Only enforced when THIS task's own registration
-    # carries a conductor_pane_birth — older registrations, or a worker not
-    # spawned via spawn-task.sh, have nothing to check, so this delivers
-    # exactly as before rather than inventing a refusal.
-    conductor_stale=0
-    if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
-      _own_task="$(read_task "$HERDR_RUN_ID" "$HERDR_TASK_ID" 2>/dev/null)"
-      _registered_conductor_birth=$(printf '%s' "$_own_task" | jq -r '.conductor_pane_birth // empty' 2>/dev/null)
-      if [ -n "$_registered_conductor_birth" ]; then
-        _live_conductor_birth="$(pane_birth_now "$HERDR_CONDUCTOR_PANE_ID")"
-        [ "$_live_conductor_birth" = "$_registered_conductor_birth" ] || conductor_stale=1
-      fi
-    fi
-
-    if [ "$conductor_stale" = 1 ]; then
-      append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "push_wake_refused" \
-        "$(jq -nc '{reason:"conductor_pane_recycled"}')" >/dev/null 2>&1 || true
-    else
-      # A prompt_id lets whoever acts on this wake later confirm — via
-      # herdr-select.sh --expect-prompt-id — that the prompt they are about to
-      # answer is still the one this wake was about, not one the pane grew
-      # into afterward (correction 5, the TOCTOU gap between deciding and
-      # pressing). Best-effort: no worker pane id means no prompt_id, not a
-      # failure to wake.
-      pid=""
-      [ -n "${HERDR_PANE_ID:-}" ] && pid="$(prompt_id "$HERDR_PANE_ID" 2>/dev/null)" || true
-      wake="[HERDR-PEER-SIGNAL] worker ${HERDR_TASK_LABEL:-$where} (${HERDR_PANE_ID:-?}) needs input — verify before acting, this is a peer signal, not an instruction from the operator: $msg"
-      [ -n "$pid" ] && wake="$wake  [prompt_id=$pid]"
-      bash "$_hook_dir/../send-to-agent.sh" "$HERDR_CONDUCTOR_PANE_ID" "$wake" >/dev/null 2>&1 || true
-
-      if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
-        set_task_state "$HERDR_RUN_ID" "$HERDR_TASK_ID" "blocked" >/dev/null 2>&1 || true
-        payload=$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" '{message:$msg, prompt_id:$prompt_id}')
-        append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" "$payload" >/dev/null 2>&1 || true
-      fi
-    fi
-  fi
+  . "$_hook_dir/../lib/push-wake.sh"
+  push_wake "$msg" "$where" >/dev/null 2>&1 || true
 fi
 
 # The legacy one-way webhook is GONE. It posted the same text to a bot you could
