@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — wire herdr-control into Claude Code and (optionally) launchd.
+# install.sh — wire herdr-control into Claude Code, omp, and (optionally) launchd.
 #
 # The scripts in this repo are useless until something CALLS them. That wiring
 # lived only in one machine's ~/.claude/settings.json, so a clone gave you every
@@ -10,7 +10,9 @@
 #   ./install.sh --apply --bridge     # also install the launchd bridge daemon (macOS)
 #   ./install.sh --apply --repoint    # ALSO repoint any job already wired at a
 #                                      # different checkout (e.g. an APM-deployed
-#                                      # herdr-ops skill copy) to point at THIS one
+#                                      # herdr-ops skill copy) to point at THIS one —
+#                                      # applies to BOTH the Claude hooks below and
+#                                      # the omp extension symlink
 #
 # What it registers in ~/.claude/settings.json:
 #   Notification -> agent-hooks/claude-notify.sh       alert you when an agent needs input
@@ -23,6 +25,21 @@
 # settings.json is EDITED IN PLACE, never replaced: it is a personal file that
 # routinely holds secrets and unrelated config, so this merges only the entries
 # above, skips any already present, and writes a timestamped backup first.
+#
+# What it symlinks for omp (Oh My Pi), under ~/.omp/agent/extensions/ (or
+# $PI_CODING_AGENT_DIR/extensions when set):
+#   herdr-control.ts -> agent-hooks/omp-herdr-control.ts   the same four jobs
+#                                                           above, via omp's
+#                                                           tool_call / tool_result /
+#                                                           before_agent_start /
+#                                                           agent_end extension events
+#
+# omp has no settings.json-style hook config to merge into — its extensions
+# are plain files it auto-discovers by directory, resolved to their REALPATH
+# before import. A symlink into this checkout gets the same "edit here, no
+# reinstall needed" property the Claude wiring gets from invoking scripts by
+# path; it just can't be merged the way JSON can, so a real (non-symlink)
+# file already at that path is left alone and reported, never clobbered.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -174,6 +191,54 @@ print(f"wrote {settings}  (backup: {backup})")
 PY
 rc=$?
 [ "$rc" -eq 0 ] || { echo "hook registration failed (settings.json untouched)" >&2; exit "$rc"; }
+
+# ---- omp extension symlink --------------------------------------------------
+# omp auto-discovers extension modules from $PI_CODING_AGENT_DIR/extensions
+# when set, else ~/.omp/agent/extensions/ — honoring the operator's own agent
+# dir override the same way the block above honors $CLAUDE_SETTINGS. omp's
+# loader resolves each entry to its REALPATH before dynamic-importing it, so
+# a symlink into THIS checkout is picked up and reloads on every edit — the
+# same live-checkout property `bash $here/...` gives the Claude hooks,
+# achieved differently because omp has no settings.json-style command
+# string to merge a path into.
+OMP_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}"
+OMP_EXT_DIR="$OMP_AGENT_DIR/extensions"
+OMP_LINK="$OMP_EXT_DIR/herdr-control.ts"
+OMP_TARGET="$here/agent-hooks/omp-herdr-control.ts"
+
+if [ -L "$OMP_LINK" ] && [ "$(readlink "$OMP_LINK")" = "$OMP_TARGET" ]; then
+  echo "  = omp extension already wired -> $OMP_LINK"
+elif [ -L "$OMP_LINK" ]; then
+  # Points somewhere else — a different checkout, an APM-deployed copy, or a
+  # stale link from a machine move. Same --repoint gate as the Claude hooks
+  # above: repointing an existing install is a deliberate opt-in, never
+  # something a plain re-run does on its own.
+  omp_have=$(readlink "$OMP_LINK")
+  if [ "$REPOINT" = 1 ]; then
+    if [ "$APPLY" = 1 ]; then
+      ln -sf "$OMP_TARGET" "$OMP_LINK"
+      echo "  ~ omp extension repointed: $omp_have -> $OMP_TARGET"
+    else
+      echo "  ~ omp extension repoint:"
+      echo "      $omp_have"
+      echo "      -> $OMP_TARGET"
+    fi
+  else
+    echo "  = omp extension already wired at a DIFFERENT path -> $omp_have"
+    echo "      pass --repoint to point this job at $OMP_TARGET"
+  fi
+elif [ -e "$OMP_LINK" ]; then
+  # A real (non-symlink) file already occupies this path — never ours to
+  # delete. Mirrors settings.json's "never overwrite personal config"
+  # posture above: report and refuse rather than guess it is safe to replace.
+  echo "  ! omp extension refusing to overwrite non-symlink file -> $OMP_LINK" >&2
+elif [ "$APPLY" = 1 ]; then
+  mkdir -p "$OMP_EXT_DIR"
+  ln -s "$OMP_TARGET" "$OMP_LINK"
+  echo "  + omp extension $OMP_LINK -> $OMP_TARGET"
+else
+  echo "  + omp extension $OMP_LINK -> $OMP_TARGET"
+fi
 
 # ---- bridge daemon (optional, macOS) ---------------------------------------
 if [ "$BRIDGE" = 1 ]; then
