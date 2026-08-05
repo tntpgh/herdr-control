@@ -136,8 +136,11 @@ Fill in:
 | `HERDR_BRIDGE_CHANNEL` | optional | pin to one channel; otherwise DMs + any channel the bot is in |
 
 ```bash
-curl -s -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-  https://slack.com/api/auth.test | jq -r .team_id
+# Same reason as slack-bridge/herdr-notify.sh's own comment — never put the
+# bot token in argv, where any same-user process can read it via `ps`, or
+# let it land in shell history: pipe it in via curl --config on stdin.
+printf 'header = "Authorization: Bearer %s\n"' "$SLACK_BOT_TOKEN" \
+  | curl -s -X POST --config - https://slack.com/api/auth.test | jq -r .team_id
 ```
 
 Set `HERDR_BRIDGE_TEAM` from that. Without it, a user carrying the same member

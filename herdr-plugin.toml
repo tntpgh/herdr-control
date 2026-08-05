@@ -1,0 +1,120 @@
+#
+# herdr-plugin.toml — registers herdr-control's HERDR-PLUGIN LAYER as a
+# first-class herdr plugin: `herdr plugin install tntpgh/herdr-control` (or
+# `herdr plugin link .` for local development) gives every action below a
+# keybinding-ready id and a `herdr plugin log list` audit trail, in place of
+# the manual docs/herdr-config-snippet.toml `type = "shell"` keybindings.
+#
+# This repo has THREE tiers, not two (see README's "As a herdr plugin"
+# section for the full grep-traced writeup):
+#   - Shared Foundation    — pure herdr-socket primitives with no opinion
+#     about who's calling (lib/pane-guard.sh, lib/pane-name.sh,
+#     lib/prompt-parse.sh, lib/agent-profiles.sh, lib/repo-root.sh,
+#     ensure-workspace.sh, lib/layout.sh, lib/project.sh). Consumed by
+#     entry points in BOTH tiers below.
+#   - Herdr-Plugin Layer    — pure herdr-socket calls. Exactly what's below:
+#     open-project.sh, quick-action.sh, sort-tabs.sh, smart-name.sh,
+#     attention.sh, mark-tab.sh.
+#   - Outside-Herdr Layer   — spawn-agent.sh/spawn-task.sh's run registry,
+#     push-wake, approval posture, command policy, the Slack bridge. Reacts
+#     to CLAUDE CODE's own hook events (Notification, PostToolUse, Stop,
+#     SessionStart) or omp's extension events (tool_call, before_agent_start,
+#     tool_result, agent_end) — signals herdr's plugin manifest cannot see.
+# herdr's plugin event vocabulary (worktree.created/worktree.opened, per
+# herdr's own docs) is about HERDR's state transitions, not an agent CLI's
+# internal reasoning loop — there is no herdr event that means "Claude is
+# showing a permission prompt," because that signal never reaches herdr at
+# all. No function call ever crosses between the two entry-point tiers —
+# the only channel is herdr's own persisted pane metadata (agent_status,
+# set via `herdr pane report-agent`), which BOTH tiers write to and read
+# from. The Outside-Herdr Layer cannot become a herdr plugin without herdr
+# itself growing an agent-lifecycle event surface it does not have in v1; it
+# stays wired through ~/.claude/settings.json and the omp extension module,
+# same as today.
+#
+# No [[build]] step: these are plain bash scripts, already the finished
+# artifact `command` needs, so there is nothing to compile — one real
+# advantage over herdr-plus's Go binary (no toolchain dependency, no
+# prebuilt-binary-fallback story to get right, "herdr plugin install" is
+# already the terminal state).
+#
+# `command` arrays are NOT run through a shell (herdr's own docs: "there is
+# no shell expansion unless your command starts a shell itself") — `bash
+# <script>.sh` is exactly right here since every action script already has
+# its own #!/usr/bin/env bash shebang and argument parsing.
+#
+# NOT YET LIVE-TESTED: this machine's herdr CLI (protocol 19) is newer than
+# its running server (protocol 17), so `herdr plugin link .` — and every
+# other live socket call — currently fails with protocol_mismatch. Written
+# and validated against herdr's published plugin docs (manifest shape, argv
+# `command` semantics, working-directory-is-plugin-root behaviour) and
+# herdr-plus's own working manifest, not against a live install. Restart the
+# herdr server, then `herdr plugin link .` from this repo to verify for real.
+
+id = "tntpgh.herdr-control"
+name = "herdr-control"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "herdr-control's Herdr-Plugin Layer: Projects (open-project.sh), Quick Actions (quick-action.sh), tab sort/rename/attention (sort-tabs.sh, smart-name.sh, attention.sh)."
+platforms = ["linux", "macos"]
+
+# projects — fuzzy-pick (or, headlessly, `open-project.sh <name>` from a
+# terminal) a declarative project template and open its whole workspace.
+#
+# Herdr runs an action's `command` on the server, with no TTY — fzf cannot
+# run there. `projects` dispatches to the `projects-pick` PANE below instead
+# (pick-pane-open.sh), which gets a real terminal.
+[[actions]]
+id = "projects"
+title = "herdr-control: Projects"
+contexts = ["workspace"]
+command = ["bash", "pick-pane-open.sh", "projects-pick"]
+
+[[panes]]
+id = "projects-pick"
+title = "Projects"
+placement = "overlay"
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/open-project.sh\" --pick"]
+
+# quick-actions — fuzzy-pick a one-off command (global + this workspace's own
+# .herdr-control/quick-actions/, if any). Same no-TTY problem and same fix:
+# dispatches to the `quick-actions-pick` pane, which also gets --cwd forwarded
+# so the repo-local tier resolves the repo the user actually triggered this
+# from, not the plugin's own install directory.
+[[actions]]
+id = "quick-actions"
+title = "herdr-control: Quick Actions"
+contexts = ["workspace"]
+command = ["bash", "pick-pane-open.sh", "quick-actions-pick"]
+
+[[panes]]
+id = "quick-actions-pick"
+title = "Quick Actions"
+placement = "overlay"
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/quick-action.sh\" --pick"]
+
+# sort-tabs — reorder the FOCUSED workspace's tabs by branch/PR state,
+# needs-you first. No args needed: sort-tabs.sh with none operates on
+# whichever workspace herdr says is focused at invocation time.
+[[actions]]
+id = "sort-tabs"
+title = "herdr-control: Sort Tabs"
+contexts = ["workspace"]
+command = ["bash", "sort-tabs.sh"]
+
+# smart-name — rename the focused tab after the work its dominant pane is
+# actually doing (deterministic for known processes, a cheap model call for
+# ambiguous agent work — see smart-name.sh's own header for the AI opt-out).
+[[actions]]
+id = "smart-name"
+title = "herdr-control: Name This Tab"
+contexts = ["pane", "workspace"]
+command = ["bash", "smart-name.sh"]
+
+# attention — print the one agent that needs you next, with an honest
+# waiting-reason, and set the sidebar/tab-colour tokens for every other pane.
+[[actions]]
+id = "attention"
+title = "herdr-control: What Needs Me"
+contexts = ["workspace"]
+command = ["bash", "attention.sh", "--focus"]

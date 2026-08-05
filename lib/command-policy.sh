@@ -32,8 +32,18 @@ set -uo pipefail
 # bridges classify_command's subshell back to classify_reason's call in the
 # parent. One file, overwritten every call — not a durable log, just enough
 # to survive one fork; PIDs recycle, so nothing here grows unbounded.
+#
+# Lives under a 0700 directory, not the shared /tmp, and the path itself is
+# not attacker-predictable-and-preseedable in the way a bare
+# $TMPDIR/name.$$.reason would be: a co-resident user on a multi-user Linux
+# box (macOS's TMPDIR is already a private per-user 0700 directory) could
+# otherwise pre-create that exact path as a symlink to a victim file before
+# this PID exists, and the plain `>` redirect below would follow it and
+# clobber whatever it points at.
 _cp_reason_file() {
-  printf '%s/herdr-command-policy.%s.reason\n' "${TMPDIR:-/tmp}" "$$"
+  local d="${XDG_RUNTIME_DIR:-$HOME/.cache}/herdr-control"
+  mkdir -p "$d" 2>/dev/null && chmod 700 "$d" 2>/dev/null
+  printf '%s/command-policy.%s.reason\n' "$d" "$$"
 }
 
 # ---- rule-severity accumulator ---------------------------------------------
@@ -79,7 +89,7 @@ scannable_command() {
   # be MORE willing to see through quoting than a real shell, not less —
   # false positives here just mean a human reviews something safe, false
   # negatives mean a destructive command auto-executes.
-  text="$(printf '%s' "$text" | sed "s/['\"]//g")"
+  text="$(printf '%s' "$text" | sed "s/['\"\\\\]//g")"
   text="$(_cp_flatten_substitutions "$text")"
   printf '%s' "$text"
 }
@@ -234,11 +244,28 @@ classify_command() {
     _cp_match '(--recursive\b|(^|[[:space:]])-[A-Za-z]*[rR][A-Za-z]*([[:space:]]|$))' "$norm"; } &&
     _cp_consider 1 "recursive rm (-r/-R/--recursive) can delete an entire directory tree"
 
+  # escalate — dd writing to a raw block device is exactly as irreversible
+  # as the mkfs case above, just spelled differently.
+  { _cp_match '(^|[^A-Za-z0-9_./-])dd([[:space:]]|$)' "$norm" && _cp_match 'of=/dev/' "$norm"; } &&
+    _cp_consider 2 "dd writing to a raw device destroys it irreversibly"
+
+  # escalate — recursive/wide-open chmod can strip protection from an
+  # entire tree (world-writable secrets, executable payloads left in place).
+  { _cp_match '\bchmod\b' "$norm" &&
+    _cp_match '(--recursive\b|(^|[[:space:]])-[A-Za-z]*[rR][A-Za-z]*([[:space:]]|$))' "$norm"; } &&
+    _cp_consider 1 "recursive chmod can strip protection from an entire tree"
+
+  # escalate — find piping into rm/-delete walks and deletes a whole tree,
+  # same blast radius as recursive rm but a different verb.
+  { _cp_match '\bfind\b' "$norm" && _cp_match '(-delete\b|-exec[[:space:]]+rm\b)' "$norm"; } &&
+    _cp_consider 1 "find -delete / -exec rm walks and deletes a whole tree"
+
   # escalate — git push --force/-f rewrites remote history other people may
   # already have pulled; the target branch needs a human's eyes, not an
-  # automated yes.
+  # automated yes. Flag matched as a CLUSTER (-uf, -fu, ...), not just a
+  # bare -f, since git accepts short options combined.
   { _cp_match '\bgit\b' "$norm" && _cp_match '\bpush\b' "$norm" &&
-    _cp_match '(^|[[:space:]])(-f|--force(-with-lease)?)([[:space:]]|$)' "$norm"; } &&
+    _cp_match '(^|[[:space:]])(-[A-Za-z]*f[A-Za-z]*|--force(-with-lease)?)([[:space:]]|$)' "$norm"; } &&
     _cp_consider 1 "git push --force/-f rewrites remote history"
 
   # escalate — DROP/TRUNCATE TABLE, case-insensitive (SQL keywords are
@@ -246,11 +273,38 @@ classify_command() {
   _cp_imatch '\bdrop[[:space:]]+table\b|\btruncate[[:space:]]+table\b' "$norm" &&
     _cp_consider 1 "DROP/TRUNCATE TABLE is an irreversible schema/data change"
 
-  # escalate — curl piping straight into a shell executes unreviewed remote
-  # code with the invoking user's privileges; a human should read the
-  # script before it runs, not after.
-  { _cp_match '\bcurl\b' "$norm" && _cp_match '\|[[:space:]]*(sh|bash)\b' "$norm"; } &&
-    _cp_consider 1 "piping a remote download into a shell executes unreviewed code"
+  # escalate — fetch-and-execute, in ANY combination of downloader and
+  # interpreter. Split into two independent rules on purpose: the old
+  # single rule required the literal token "curl" AND a pipe into sh/bash,
+  # so wget, base64-then-exec, and `python3 -c "$(curl …)"` (no pipe at
+  # all — the substitution is flattened to inline text above, so this rule
+  # alone catches it) all sailed through as "allow". A human should read
+  # unreviewed remote code before it runs, regardless of which tool fetched
+  # it or which interpreter runs it.
+  _cp_match '\|[[:space:]]*(sh|bash|zsh|dash|ksh|python3?|perl|ruby|node)([[:space:]]|$)' "$norm" &&
+    _cp_consider 1 "pipes data into an interpreter — executes unreviewed code"
+  _cp_imatch '\b(curl|wget|fetch|aria2c)\b' "$norm" &&
+    _cp_consider 1 "downloads from the network — pair with running the result unreviewed"
+
+  # escalate — reads or ships credential material. This is the gap the
+  # header comment above (and README/SKILL.md) already promised was
+  # covered and was not: peer automation could auto-approve a prompt that
+  # reads an SSH key or pipes ~/.aws/credentials to an external URL.
+  _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|id_(rsa|ed25519|ecdsa)\b|\.env(\.[A-Za-z0-9_-]+)?\b|\bcredentials\b' "$norm" &&
+    _cp_consider 1 "reads credential material — a human must approve"
+  _cp_imatch '(^|[[:space:]])(printenv|env)([[:space:]]|$)|\bop[[:space:]]+read\b|\bgh[[:space:]]+secret\b|\baws[[:space:]]+(configure|sts)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm" &&
+    _cp_consider 1 "enumerates or resolves secrets"
+
+  # escalate — production / infrastructure scope change. A name-based
+  # rule (matching the literal word "prod"/"production"/"live") is
+  # necessarily approximate — it has no notion of which context is
+  # actually production — but a false escalation just means a human looks
+  # once at an operational command; a false allow means an unreviewed
+  # agent prompt destroyed a live system.
+  _cp_imatch '\b(prod|production|live)\b' "$norm" &&
+    _cp_consider 1 "names a production target"
+  _cp_imatch '\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(delete|drain|scale)\b|\bhelm[[:space:]]+(delete|uninstall)\b|\bflyctl?[[:space:]]+(deploy|destroy)\b' "$norm" &&
+    _cp_consider 1 "infrastructure scope change"
 
   _cp_apply_operator_rules "$norm"
 

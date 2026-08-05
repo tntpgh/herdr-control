@@ -236,6 +236,15 @@ fi
 # itself failed (a full disk, a missing directory permission).
 log_dir="${HERDR_BRIDGE_STATE:-$HOME/.config/herdr-bridge}"
 mkdir -p "$log_dir" || { echo "herdr-select: cannot create $log_dir — refusing to answer without an audit trail." >&2; exit 2; }
+# selections.jsonl is the authorization audit trail — command text, verdict,
+# and authority for every peer/human approval. Whichever of herdr-select.sh /
+# herdr-notify.sh / the Slack bridge happens to create this shared directory
+# FIRST decides its mode under a plain mkdir -p, so force 0700 here too
+# rather than relying on that race — same fix, same reasoning as
+# herdr-notify.sh's reg_dir chmod a few lines of that file up.
+chmod 700 "$log_dir" 2>/dev/null || true
+[ -e "$log_dir/selections.jsonl" ] || : > "$log_dir/selections.jsonl"
+chmod 600 "$log_dir/selections.jsonl" 2>/dev/null || true
 jq -nc --arg pane "$pane" --arg choice "$choice" --arg label "$label" --arg mechanism "$mechanism" \
        --arg via "${HERDR_SELECT_VIA:-cli}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
        --arg prompt_id "$current_prompt_id" \

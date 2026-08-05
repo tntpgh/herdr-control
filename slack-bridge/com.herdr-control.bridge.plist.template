@@ -25,9 +25,15 @@
   <key>KeepAlive</key>
   <true/>
 
+  <!-- ~/Library/Logs is per-user (0700 by default on macOS), unlike
+       /tmp, which is world-writable-and-sticky: a co-resident local user
+       could otherwise read the bridge's own startup banner (Slack member
+       id allowlist, team/channel binding) or any traceback that surfaces
+       agent pane content via the notify path. install.sh substitutes
+       __LOG_PATH__ and creates the directory before loading this plist. -->
   <key>StandardOutPath</key>
-  <string>/tmp/herdr-bridge.log</string>
+  <string>__LOG_PATH__</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/herdr-bridge.log</string>
+  <string>__LOG_PATH__</string>
 </dict>
 </plist>

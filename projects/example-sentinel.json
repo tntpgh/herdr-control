@@ -1,0 +1,19 @@
+{
+  "name": "example-sentinel",
+  "description": "PATTERN: agent pane + an ALWAYS-VISIBLE ambient sentinel, not a one-shot check. Do this for a repo that's a checkout multiple concurrent sessions might touch: a nonempty stash list means another session was here, not that your work vanished. Copy this into your personal tier (see README's Private vs. public) and point working_dir at your own repo.",
+  "working_dir": "~/Code/your-project",
+  "tabs": [
+    {
+      "label": "work",
+      "panes": [
+        { "cmd": "claude", "focus": true },
+        {
+          "split": "down",
+          "ratio": 0.25,
+          "label": "Sentinel",
+          "cmd": "while :; do clear; printf '=== sentinel  %s ===\n' \"$(date '+%H:%M:%S')\"; echo; echo '-- uncommitted --'; git status --short; echo; echo '-- stash (nonempty = ANOTHER session touched this checkout — git stash apply, never pop) --'; git stash list; sleep 60; done"
+        }
+      ]
+    }
+  ]
+}

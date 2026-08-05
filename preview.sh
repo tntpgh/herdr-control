@@ -85,8 +85,8 @@ print("narrow")
 # ── pane state ──────────────────────────────────────────────────────────────
 # A plugin pane counts as open only when it is in the SAME workspace we are
 # acting on. `herdr pane list` spans every workspace, and screen space does not:
-# a reviewr sidebar in the knowledge-base workspace is not competing with a
-# browser pane in thurber-os, because the two are never on screen together.
+# a reviewr sidebar in workspace A is not competing with a browser pane in
+# workspace B, because the two are never on screen together.
 # Scanning globally made this evict a sidebar the user could not even see.
 current_workspace() {
   herdr workspace list 2>/dev/null | python3 -c '

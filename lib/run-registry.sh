@@ -110,6 +110,10 @@ registry_init() {
     printf 'run-registry: cannot create registry root %s\n' "$root" >&2
     return 1
   }
+  # Task/run/worker/conductor identity plus every reconciliation event lives
+  # here — same "force 0700, don't trust a first-runner's umask" reasoning
+  # as the Slack bridge's state dir (see herdr-notify.sh's reg_dir comment).
+  chmod 700 "$root" 2>/dev/null || true
 
   # journal_mode is persisted in the database header, so it is set here rather
   # than in _sql — WAL is what lets the reconcile sweep read while a hook

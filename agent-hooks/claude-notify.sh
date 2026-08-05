@@ -59,8 +59,8 @@ if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
   # is showing a numbered list. Send the actual options so the alert can be
   # answered from Slack instead of only announcing that something is stuck.
   # Do NOT resolve the pane here. This used to take the FIRST pane matching the
-  # hook's cwd, which picks at random between agents sharing a repo (5 panes
-  # currently share the knowledge-base cwd) — and the tagged pane is where a
+  # hook's cwd, which picks at random between agents sharing a repo (several
+  # panes can share one repo's cwd) — and the tagged pane is where a
   # threaded Slack reply gets injected and submitted, so a wrong guess delivers
   # your instructions to a different agent. herdr-notify now resolves the pane
   # exactly (tmux-session match) and declines to tag when it cannot; pass the

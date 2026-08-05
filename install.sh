@@ -244,8 +244,8 @@ fi
 if [ "$BRIDGE" = 1 ]; then
   PLIST="$HOME/Library/LaunchAgents/com.herdr-control.bridge.plist"
 
-  # A bridge daemon may already be installed under a DIFFERENT label — this
-  # machine had com.tntpgh.herdr-bridge, pointed at the APM-deployed
+  # A bridge daemon may already be installed under a DIFFERENT label — one
+  # machine had it under a different reverse-DNS label, pointed at an
   # ~/.claude/skills/herdr-ops copy. Writing our own label on top of that does not
   # replace it, it ADDS a second daemon: two Socket-Mode clients on one Slack app,
   # so every reply is delivered twice and both race to press keys at the same
@@ -270,8 +270,9 @@ if [ "$BRIDGE" = 1 ]; then
     echo "  ! repoint that plist's ProgramArguments at $here/slack-bridge/run-bridge.sh instead," >&2
     echo "  ! or remove it first. Skipping the bridge step." >&2
   elif [ "$APPLY" = 1 ]; then
-    mkdir -p "$HOME/Library/LaunchAgents"
-    sed "s|__RUN_BRIDGE__|$here/slack-bridge/run-bridge.sh|" \
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+    sed -e "s|__RUN_BRIDGE__|$here/slack-bridge/run-bridge.sh|" \
+        -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.bridge.log|g" \
       "$here/slack-bridge/com.herdr-control.bridge.plist.template" > "$PLIST"
     launchctl unload "$PLIST" 2>/dev/null
     launchctl load "$PLIST" && echo "bridge daemon loaded ($PLIST)"

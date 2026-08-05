@@ -77,7 +77,7 @@ the worktree lands as a sub-tab of the repo it belongs to.
 herdr wait output w2:p1 --match "GATE_DONE:enforce"
 
 # ✓ watch a durable file the kick-off instruction never writes
-./wake-on-evidence.sh <worktree>/.omc/handoffs/events.jsonl 'implement:fix-comps_done'
+./wake-on-evidence.sh <worktree>/.omc/handoffs/events.jsonl 'implement:fix-worker_done'
 ```
 
 `spawn-task.sh` creates `.omc/handoffs/` in every worktree it spins up and

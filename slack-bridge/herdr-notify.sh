@@ -5,7 +5,7 @@
 # conversation — replaces the one-way OMC/OMX webhook). Tags the pane it's about
 # and records ts->pane so a threaded REPLY routes straight back to that pane.
 #
-#   herdr-notify.sh --pane w8:p2 "tourguide: needs a decision — merge comps fix?"
+#   herdr-notify.sh --pane w8:p2 "myproject: needs a decision — merge fix?"
 #   HERDR_PANE_ID=w8:p2 herdr-notify.sh "blocked on your call"   # pane from env
 #   herdr-notify.sh "blocked on your call"        # pane auto-resolved (below)
 #
@@ -154,7 +154,7 @@ _dry_report() {
 _lib="$(cd "$(dirname "$0")/.." && pwd)/lib"
 
 # Name the pane the way the operator named it. "w3:p1" identifies nothing to a
-# human reading this on a phone; "thurber-os — Main" does. The raw id stays as a
+# human reading this on a phone; "project-a — Main" does. The raw id stays as a
 # small suffix because it is what you type to target a pane by hand.
 where=""
 if [ -n "$pane" ]; then

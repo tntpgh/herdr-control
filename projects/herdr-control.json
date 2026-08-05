@@ -1,0 +1,21 @@
+{
+  "name": "herdr-control",
+  "description": "herdr-control tooling — agent + full verify suite on open",
+  "working_dir": "~/Code/herdr-control",
+  "tabs": [
+    {
+      "label": "work",
+      "panes": [
+        {
+          "cmd": "claude",
+          "focus": true
+        },
+        {
+          "split": "down",
+          "ratio": 0.3,
+          "cmd": "for v in verify-*.sh; do echo \"== $v ==\"; bash \"$v\" || { echo \"FAILED: $v\"; break; }; done; exec $SHELL"
+        }
+      ]
+    }
+  ]
+}

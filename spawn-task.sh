@@ -5,14 +5,14 @@
 # workspace (a "sub-tab", not a separate space), running the right agent at the
 # right model for the job. This is the orchestrator's per-task hand:
 #
-#   spawn-task.sh ~/Code/tourguide fix-comps implement           # claude, sonnet
-#   spawn-task.sh ~/Code/tourguide arch-review review codex      # codex, deep model
-#   spawn-task.sh ~/Code/tourguide fix-parser implement omp      # omp, sonnet
-#   spawn-task.sh ~/Code/tourguide probe quick pwd               # literal cmd (no model)
+#   spawn-task.sh ~/Code/myproject fix-parser implement           # claude, sonnet
+#   spawn-task.sh ~/Code/myproject arch-review review codex       # codex, deep model
+#   spawn-task.sh ~/Code/myproject fix-worker implement omp       # omp, sonnet
+#   spawn-task.sh ~/Code/myproject probe quick pwd                # literal cmd (no model)
 #
 # Default is BACKGROUND: the new sub-tab does not steal focus (a spawned task
 # worker should never yank your terminal out from under you). Pass --focus
-# to jump to it immediately: spawn-task.sh --focus ~/Code/tourguide fix-comps implement
+# to jump to it immediately: spawn-task.sh --focus ~/Code/myproject fix-parser implement
 #
 # job-class -> model (edit lib/agent-profiles.sh's model_for_agent; --model/
 # --effort override):

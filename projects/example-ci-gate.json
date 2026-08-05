@@ -1,0 +1,19 @@
+{
+  "name": "example-ci-gate",
+  "description": "PATTERN: agent pane + a ONE-SHOT check run once on open (not an always-running sentinel — see example-sentinel.json for that). Do this for a repo with a single documented CI/lint/test entrypoint: 'is the tree green right now' becomes the first thing you see, not something you remember to run. Copy this into your personal tier (see README's Private vs. public), point working_dir at your own repo, and swap the command for your own entrypoint.",
+  "working_dir": "~/Code/your-project",
+  "tabs": [
+    {
+      "label": "work",
+      "panes": [
+        { "cmd": "claude", "focus": true },
+        {
+          "split": "down",
+          "ratio": 0.3,
+          "label": "CI",
+          "cmd": "bash your-ci-entrypoint.sh; echo; echo '--- finished (exit code above) ---'; exec $SHELL"
+        }
+      ]
+    }
+  ]
+}

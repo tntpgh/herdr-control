@@ -1,0 +1,4 @@
+[
+  { "cmd": "claude", "focus": true },
+  { "split": "down", "ratio": 0.3, "cmd": "git log --oneline -20 --graph --all; exec $SHELL" }
+]

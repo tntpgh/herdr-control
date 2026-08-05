@@ -1,0 +1,5 @@
+{
+  "name": "Verify Suite",
+  "type": "command",
+  "command": "cd \"$HERDR_CONTROL_WORKDIR\" && for v in verify-*.sh; do echo \"== $v ==\"; bash \"$v\" || { echo \"FAILED: $v\"; exit 1; }; done"
+}

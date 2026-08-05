@@ -2,10 +2,10 @@
 # pane-name.sh — turn a pane id into something a human recognises.
 #
 # "w3:p1" means nothing to the person reading the alert on their phone. The
-# workspace and tab already carry the names they chose ("thurber-os", "Main"),
+# workspace and tab already carry the names they chose ("project-a", "Main"),
 # so use those and keep the id only as a small technical suffix.
 #
-# Provides: pane_display_name <pane_id>   -> "thurber-os — Main" / "~ — main"
+# Provides: pane_display_name <pane_id>   -> "project-a — Main" / "~ — main"
 #
 # Falls back through: pane label -> "workspace — tab" -> workspace -> pane id.
 # Never fails: an alert with an ugly name beats no alert.
@@ -27,7 +27,7 @@ EOF
     (.result.tabs // .tabs)[]? | select(.tab_id==$t) | .label // empty' 2>/dev/null)
 
   # Space — Tab is the primary identity: it is what you see in the herdr UI.
-  # A pane label ("thurber-os-gate") is extra precision when several panes share
+  # A pane label ("project-a-gate") is extra precision when several panes share
   # a tab, so it rides along in parens rather than replacing the names.
   local name=""
   if [ -n "$wlabel" ] && [ -n "$tlabel" ]; then name="$wlabel — $tlabel"
