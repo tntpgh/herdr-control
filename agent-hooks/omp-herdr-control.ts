@@ -97,21 +97,57 @@ function spawnDetached(args: string[], stdinInput?: string): void {
 }
 
 // ---- Notification: tool_call -----------------------------------------------
-// omp's tool_call event shape isn't documented precisely enough to type
-// exactly, so this narrows defensively across the plausible field names
-// (`tool.name`, `toolCall.name`, `toolName`, `name`) instead of asserting
-// one. The result only feeds the Slack message text — cosmetic, not
-// anything gating behavior — so "best guess, never throw" is the right
-// contract for it, unlike everything else in this file.
-function extractToolName(event: unknown): string {
-  if (!event || typeof event !== "object") return "tool";
-  const nested = "tool" in event ? event.tool : "toolCall" in event ? event.toolCall : undefined;
-  if (nested && typeof nested === "object" && "name" in nested && typeof nested.name === "string") {
-    return nested.name;
+// omp's docs (docs/extensions.md, docs/hooks.md) both show the SAME shape for
+// this event — `event.toolName: string` and `event.input: Record<string,
+// unknown>` — so this reads those fields directly instead of guessing across
+// plausible names. It is still defensive (typeof checks, never asserts),
+// because the result only feeds Slack message text — cosmetic, not anything
+// gating behavior — so "best effort, never throw" is still the contract.
+//
+// The bug this replaces: the old version only ever sent the tool's NAME
+// ("omp tool call: bash") with no arguments at all, so a Slack approval
+// alert could not be acted on without switching to the pane — you were
+// asked to approve "bash" with no idea which command. describeToolCall
+// pulls the part of `input` a human actually needs to decide: the command
+// for bash, the path for file tools, the pattern for search tools, and the
+// raw (truncated) input JSON for anything unrecognized — never silently
+// dropping an unfamiliar tool's arguments.
+const MAX_DETAIL_LEN = 300;
+
+function truncate(s: string, max = MAX_DETAIL_LEN): string {
+  const flat = s.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
+function describeToolCall(toolName: string, input: unknown): string | undefined {
+  const rec = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
+  switch (toolName.toLowerCase()) {
+    case "bash":
+    case "shell":
+      return (str(rec.command) && truncate(str(rec.command)!)) || undefined;
+    case "write":
+    case "read":
+    case "edit":
+    case "multiedit":
+      return str(rec.file_path ?? rec.path);
+    case "grep": {
+      const pattern = str(rec.pattern);
+      if (!pattern) return undefined;
+      const p = str(rec.path);
+      return truncate(p ? `${pattern}  (${p})` : pattern);
+    }
+    case "glob":
+      return str(rec.pattern);
+    default: {
+      try {
+        const json = JSON.stringify(rec);
+        return json && json !== "{}" ? truncate(json) : undefined;
+      } catch {
+        return undefined;
+      }
+    }
   }
-  if ("toolName" in event && typeof event.toolName === "string") return event.toolName;
-  if ("name" in event && typeof event.name === "string") return event.name;
-  return "tool";
 }
 
 // Fires before EVERY tool call, not just ones that end up blocked —
@@ -122,10 +158,13 @@ function extractToolName(event: unknown): string {
 function onToolCall(event: unknown): undefined {
   try {
     if (notifyAvailable) {
-      const toolName = extractToolName(event);
+      const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+      const toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
+      const detail = describeToolCall(toolName, e.input);
+      const message = detail ? `${toolName}: ${detail}` : `omp tool call: ${toolName}`;
       const payload = JSON.stringify({
         tool: toolName,
-        message: `omp tool call: ${toolName}`,
+        message,
         cwd: process.cwd(),
       });
       spawnDetached([NOTIFY_SH], payload);

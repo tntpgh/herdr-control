@@ -16,6 +16,10 @@
 #
 # What it registers in ~/.claude/settings.json:
 #   Notification -> agent-hooks/claude-notify.sh       alert you when an agent needs input
+#   PreToolUse   -> agent-hooks/claude-pretooluse-cache.sh  cache the tool+command so
+#                                                       the Notification alert above can
+#                                                       show what is being approved, not
+#                                                       just that something needs approval
 #   PostToolUse  -> herdr-resolve.sh                   retract alerts answered in the terminal
 #   PostToolUse  -> agent-hooks/interval-reconcile.sh  throttled mid-session reconciliation
 #   Stop         -> herdr-resolve.sh                   backstop for the same
@@ -49,7 +53,7 @@ for a in "$@"; do
     --apply)   APPLY=1 ;;
     --bridge)  BRIDGE=1 ;;
     --repoint) REPOINT=1 ;;
-    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -91,6 +95,8 @@ settings = os.environ["SETTINGS"]
 wanted = [
     ("Notification", f'bash {here}/agent-hooks/claude-notify.sh',
         ("claude-notify.sh", "slack-notify.sh", "herdr-notify.sh"), True, 10),
+    ("PreToolUse",   f'bash {here}/agent-hooks/claude-pretooluse-cache.sh',
+        ("claude-pretooluse-cache.sh",), True, 10),
     ("PostToolUse",  f'bash {here}/herdr-resolve.sh',  ("herdr-resolve.sh",), True, 10),
     ("PostToolUse",  f'bash {here}/agent-hooks/interval-reconcile.sh',
         ("interval-reconcile.sh",), True, 20),

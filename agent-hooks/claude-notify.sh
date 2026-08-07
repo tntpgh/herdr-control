@@ -8,6 +8,7 @@
 # to — a config change would then kill notifications silently. herdr-notify owns
 # its own credentials (the bridge env file), so there is nothing to read here.
 set -uo pipefail
+_hook_dir=$(cd "$(dirname "$0")" && pwd)
 
 input="$(cat)"
 msg="$(printf '%s' "$input" | jq -r '.message // .title // "Claude needs your attention"')"
@@ -38,6 +39,34 @@ cwd="$(printf '%s' "$input" | jq -r '.cwd // ""')"
 where="${cwd##*/}"
 [ -n "$where" ] && msg="$msg  ·  ${where}"
 
+# --- surface WHAT is being approved, not just THAT something needs approval.
+# Notification's own payload has no tool_name/tool_input (see header) — read
+# the cache claude-pretooluse-cache.sh's PreToolUse hook just wrote for this
+# same session_id instead. Freshness-gated to ~10s: PreToolUse and a
+# permission-triggered Notification fire back-to-back for the SAME call, so a
+# fresh cache hit is that call; anything older is a stale leftover from a
+# previous (possibly auto-approved) tool call and would mislabel an unrelated
+# prompt — an idle nag or an AskUserQuestion — with the wrong command. Missing
+# cache, missing jq, or a session with no prior tool call are all silent
+# no-ops: this only ever adds detail, never blocks the base alert.
+session_id="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null || true)"
+if [ -n "$session_id" ]; then
+  cache_dir="${HERDR_STATE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/herdr-control}/last-tool"
+  cache_file="$cache_dir/$session_id.json"
+  if [ -f "$cache_file" ]; then
+    cache_age=$(( $(date +%s) - $(jq -r '.ts // 0' "$cache_file" 2>/dev/null || echo 0) ))
+    if [ "$cache_age" -ge 0 ] && [ "$cache_age" -le 10 ]; then
+      . "$_hook_dir/../lib/tool-summary.sh"
+      tool_name=$(jq -r '.tool // empty' "$cache_file" 2>/dev/null)
+      tool_input=$(jq -c '.input // {}' "$cache_file" 2>/dev/null || printf '{}')
+      if [ -n "$tool_name" ]; then
+        summary="$(tool_summary_line "$tool_name" "$tool_input")"
+        [ -n "$summary" ] && msg="$msg"$'\n'"\`${summary}\`"
+      fi
+    fi
+  fi
+fi
+
 # --- 2-way: also alert through herdrbot (tagged with the pane so a threaded
 # reply routes back). Runs ALONGSIDE the webhook for now. Best-effort. ---
 # Find herdr-notify in whichever layout is installed. Checked in order:
@@ -46,7 +75,6 @@ where="${cwd##*/}"
 #   3. ~/.claude/skills/...     — an APM-deployed herdr-ops skill
 # Resolving rather than hardcoding is what lets the same hook serve a plain
 # clone and a packaged install without editing.
-_hook_dir=$(cd "$(dirname "$0")" && pwd)
 for notify in \
   "${HERDR_NOTIFY:-}" \
   "$_hook_dir/../slack-bridge/herdr-notify.sh" \
