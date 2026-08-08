@@ -69,7 +69,16 @@ herdr() {
       printf 'send-text %s\n' "$3" >> "$SENT"
       printf '%s' "$4" > "$WAKE" ;;
     "pane send-keys")
-      printf 'send-keys %s %s\n' "$3" "$4" >> "$SENT" ;;
+      printf 'send-keys %s %s\n' "$3" "$4" >> "$SENT"
+      # send-to-agent.sh now CONFIRMS a submit by diffing the composer
+      # before/after Enter (see send-to-agent.sh's header, 2026-08-06) rather
+      # than assuming success whenever no paste-placeholder is present — so a
+      # stub pane must actually CHANGE after Enter, the way a real one does,
+      # or every wake in this suite would read back as UNSUBMITTED.
+      if [ "$3" = "$CPANE" ] && [ "$4" = "Enter" ]; then
+        { printf ' %s\n' "$(cat "$WAKE" 2>/dev/null)"; printf '\n submitted\n $ \n ready\n'; } > "$COND_SCREEN"
+      fi
+      ;;
     *) return 0 ;;
   esac
 }

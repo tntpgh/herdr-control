@@ -8,6 +8,8 @@
 #
 # Provides: prompt_options <pane_id>   -> "N<TAB>text" per line, empty if none
 #           prompt_question <pane_id>  -> the question line, if identifiable
+#           composer_stable_snapshot <pane_id> [lines] -> filtered bottom-of-pane
+#             text for send-to-agent.sh's before/after submit-confirmation diff
 
 # A numbered option, with or without the selection arrow:
 #   ❯ 1. Yes
@@ -64,6 +66,44 @@ prompt_context() {
     | awk '{ s=$0; gsub(/[[:space:]]/,"",s); if (length(s)) print }' \
     | tail -n 8 \
     | cut -c1-200
+}
+
+# ---- submit confirmation (send-to-agent.sh) ---------------------------------
+#
+# A snapshot of the bottom of the pane, filtered to strip volatile furniture
+# that changes independent of whether anything was actually submitted — the
+# OMC/tmux status bar's live elapsed-time and context-percentage counters,
+# the spinner glyph — but DELIBERATELY KEEPING `❯`-prefixed lines. That is the
+# opposite choice from prompt_context above: prompt_context strips them
+# because it wants the agent's own words; this wants exactly the composer's
+# own line, since "unsent text still sitting there" is the whole signal.
+#
+# Why this exists: send-to-agent.sh's Enter-retry loop used to detect
+# "submitted" by grepping for ONE specific artifact (Claude's "[Pasted text"
+# paste-debounce placeholder). For ordinary short text there is no such
+# artifact, so that check reported "clear" — and therefore SUBMITTED — after
+# the very first Enter, whether or not the Enter actually landed. Comparing
+# two of these snapshots instead (before/after an Enter) catches that
+# honestly: a message truly stuck in the composer produces byte-identical
+# snapshots and correctly keeps retrying; a real submit changes the bottom of
+# the pane (new response text, a fresh empty prompt, or the debounce artifact
+# clearing) and is detected the same way regardless of which of those it was.
+#
+# The status-bar/spinner strip is what makes this safe to compare across a
+# multi-second retry gap: without it, session-elapsed-minutes or a context%
+# counter ticking over between two reads would register as "something
+# changed" and falsely declare an unsubmitted message SUBMITTED — a worse
+# failure than the one this replaces, since it actively lies about delivery.
+composer_stable_snapshot() {
+  local win
+  win=$(herdr pane read "$1" --source visible --lines "${2:-12}" 2>/dev/null) || return 1
+  printf '%s\n' "$win" \
+    | sed $'s/\xc2\xa0/ /g' \
+    | grep -vE '^[[:space:]]*[─═│┌┐└┘├┤┬┴┼╭╮╰╯]+[[:space:]]*$' \
+    | grep -vE '^[[:space:]]*(branch:|\[OMC#|⏵)' \
+    | grep -vE '^\[[a-z0-9-]+:' \
+    | grep -vE '^[[:space:]]*[✻✳✽✶✢✷✸✹✺·*][[:space:]]' \
+    | sed -E 's/[[:space:]]+$//'
 }
 
 # --- menu-shape prompts (no numbered options at all) ------------------------

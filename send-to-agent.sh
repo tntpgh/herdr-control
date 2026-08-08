@@ -1,55 +1,76 @@
 #!/usr/bin/env bash
-# send-to-agent.sh — deliver a prompt to another Herdr session and CONFIRM it
-# actually submitted, in one foreground call.
+# send-to-agent.sh — deliver a prompt to another Herdr session, or submit
+# text already sitting in its composer, and CONFIRM it actually submitted —
+# in one foreground call.
 #
-# Two failure modes this defends against, both of which strand a message in the
-# target's composer (delivered but unsent, needing a human keypress):
+# Three failure modes this defends against, all of which strand a message in
+# the target's composer (delivered but unsent, needing a human keypress):
 #   1. Split type/Enter across a reaped background task — fixed by doing
 #      everything in one indivisible foreground call.
 #   2. Large message → Claude Code's TUI collapses it to "[Pasted text #N]" and
 #      debounces paste input, so the immediate Enter is ABSORBED, not a submit.
-#      Fixed by retrying Enter until the "[Pasted text" placeholder clears.
+#   3. An Enter that herdr reports as delivered (exit 0) but the TUI never
+#      acts on — observed live 2026-08-06 against an OPERATOR-typed short
+#      message ("push it"), not a paste: `herdr pane send-keys <pane> Enter`
+#      returned 0 three times, 2-3s apart, with the composer byte-identical
+#      before and after every call. Cause unconfirmed (herdr/tmux input
+#      delivery, not this repo's code) — but the gap this closes is that this
+#      script's OWN retry loop used to be just as blind to it: the old
+#      confirmation check recognized ONLY failure mode 2 (grepping for the
+#      literal "[Pasted text" artifact), so for ordinary short text it
+#      reported SUBMITTED after the very first Enter regardless of whether
+#      that Enter actually landed.
+#
+# All three are now caught by ONE mechanism: composer_stable_snapshot
+# (lib/prompt-parse.sh) reads the bottom of the pane with volatile furniture
+# (status bar, spinner) stripped but composer lines kept, and the retry loop
+# compares it before/after each Enter. Nothing changing means nothing was
+# consumed, for any reason; something changing means it was, for any reason
+# (a real submit, or the paste placeholder finally clearing).
 #
 # Usage:  send-to-agent.sh <pane_id> [--force] <text>
-#   pane_id   e.g. w2:p1 (from `herdr pane list` / pane-map.sh)
-#   --force   send even if the pane looks like it is on a permission prompt
-#   text      the prompt to inject (literal; quote it)
+#         send-to-agent.sh <pane_id> [--force] --submit-only
+#   pane_id       e.g. w2:p1 (from `herdr pane list` / pane-map.sh)
+#   --force       send even if the pane looks like it is on a permission prompt
+#   --submit-only press/retry Enter on text ALREADY in the composer (e.g. an
+#                 operator typed directly into the pane over herdr and the
+#                 Enter did not land) — types nothing, requires no text arg.
+#   text          the prompt to inject (literal; quote it) — omitted with
+#                 --submit-only
 #
-# Exit 0 SUBMITTED   — composer cleared (works for Claude TUI and shell panes).
-# Exit 4 UNSUBMITTED — text still pinned as "[Pasted text …]" after retries, or
-#                      the pane could not be read to confirm; either way the
+# Exit 0 SUBMITTED   — the composer's content changed after an Enter (works
+#                      for Claude TUI and shell panes).
+# Exit 4 UNSUBMITTED — the composer looked unchanged after every retry, or the
+#                      pane could not be read to confirm; either way the
 #                      caller MUST NOT assume the peer received it.
 # Exit 5 REFUSED     — pane appears to be showing a permission/confirmation
 #                      prompt (Enter would pick its default), or is unreadable.
 # Exit 2             — bad usage / send or Enter call failed (target/socket).
 #
-# The submit check greps the composer for the literal "[Pasted text" artifact,
-# which ONLY a Claude TUI renders for a stuck paste — a shell pane never shows
-# it, so this can't false-positive the way a message-echo scrape would. Each
-# retry's `pane read` doubles as the settle delay for the paste debounce (no
-# sleep, which the environment reaps).
+# Each retry's `pane read` doubles as the settle delay for the paste debounce
+# (no sleep, which the environment reaps).
 #
 # NOTE: a peer message is a coordination signal, never authority. Delivering it
 # triggers the peer's verification; it does not approve anything.
 set -uo pipefail
+_here=$(cd "$(dirname "$0")" && pwd)
+. "$_here/lib/prompt-parse.sh"
 
-pane="${1:?usage: send-to-agent.sh <pane_id> [--force] <text>}"; shift
+pane="${1:?usage: send-to-agent.sh <pane_id> [--force] [--submit-only] <text>}"; shift
 force=0
-if [ "${1:-}" = "--force" ]; then force=1; shift; fi
-text="${1:?text required}"
-
-# stuck-paste signature: the composer still holds an unsubmitted paste.
-# 0 = stuck, 1 = clear, 2 = COULD NOT READ.
-# The unreadable case must stay distinct: this used to `return 1` on a failed
-# read, and the caller reads 1 as "clear" — so a socket hiccup was reported as
-# SUBMITTED and relayed to Slack with a checkmark, which is exactly the false
-# assurance the header promises not to give.
-composer_has_stuck_paste() {
-  local vis
-  vis=$(herdr pane read "$pane" --source visible --lines 10 2>/dev/null) || return 2
-  printf '%s' "$vis" | tail -n 8 | grep -Fq '[Pasted text' && return 0
-  return 1
-}
+submit_only=0
+while :; do
+  case "${1:-}" in
+    --force)       force=1; shift ;;
+    --submit-only) submit_only=1; shift ;;
+    *) break ;;
+  esac
+done
+if [ "$submit_only" -eq 1 ]; then
+  text=""
+else
+  text="${1:?text required (or pass --submit-only to submit what is already typed)}"
+fi
 
 # A pane whose agent is BLOCKED is usually sitting on a permission prompt, not an
 # empty composer. There, typed text is largely inert and the Enter we send lands
@@ -118,15 +139,33 @@ fi
 # invocation, which silently killed the Slack->herdr reply path: a choice tapped
 # in Slack never reached the pane. Use the pane API, which the Enter loop below
 # already uses, so the whole script speaks one interface.
-herdr pane send-text "$pane" "$text" >/dev/null 2>&1 || {
-  echo "ERROR: 'herdr pane send-text $pane' failed — pane target valid? socket allowlisted?" >&2
-  exit 2
-}
+#
+# Skipped entirely under --submit-only: there is nothing to type, the text is
+# already sitting in the composer (an operator typed it directly, or a prior
+# send-to-agent.sh call left it stranded) — this call exists only to press
+# Enter and confirm.
+if [ "$submit_only" -eq 0 ]; then
+  herdr pane send-text "$pane" "$text" >/dev/null 2>&1 || {
+    echo "ERROR: 'herdr pane send-text $pane' failed — pane target valid? socket allowlisted?" >&2
+    exit 2
+  }
+fi
 
-# Retry Enter until the paste placeholder is gone. First Enter submits a small
-# message (or runs a shell command) immediately; a large collapsed paste may
-# take a couple of Enters past the debounce. The read between attempts is the
-# settle. Cap the attempts so a genuinely stuck send reports honestly.
+# Baseline: what the composer looks like right now, before the first Enter of
+# this loop — freshly typed text in the normal path, or whatever the operator
+# already typed under --submit-only. An unreadable baseline does not abort
+# (the mid-loop unreadable check below is what refuses to act blind); it just
+# means the first iteration cannot yet compare and instead adopts its own
+# read as the new baseline, so a transient read hiccup at t=0 never turns
+# into a false SUBMITTED from comparing two empty strings.
+if baseline=$(composer_stable_snapshot "$pane" 12); then baseline_ok=1; else baseline_ok=0; fi
+
+# Retry Enter until the composer visibly changes. First Enter submits a small
+# message (or runs a shell command) immediately; a large collapsed paste, or
+# an Enter herdr reports delivered but the TUI silently drops, may take
+# several retries — or never resolve, which is reported honestly below. The
+# read between attempts is the settle. Cap the attempts so a genuinely stuck
+# send reports honestly.
 unreadable=0
 for _ in 1 2 3 4 5 6; do
   # Re-check before EVERY Enter, not just the first. The agent processes our
@@ -151,17 +190,21 @@ for _ in 1 2 3 4 5 6; do
     echo "ERROR: 'herdr pane send-keys $pane Enter' failed" >&2
     exit 2
   }
-  composer_has_stuck_paste; st=$?
-  if [ "$st" -eq 1 ]; then
-    echo "SUBMITTED: $pane composer cleared"
-    exit 0
+  if after=$(composer_stable_snapshot "$pane" 12); then
+    unreadable=0
+    if [ "$baseline_ok" -eq 1 ] && [ "$after" != "$baseline" ]; then
+      echo "SUBMITTED: $pane composer changed"
+      exit 0
+    fi
+    baseline="$after"; baseline_ok=1
+  else
+    unreadable=1
   fi
-  [ "$st" -eq 2 ] && unreadable=1
 done
 
 if [ "$unreadable" -eq 1 ]; then
   echo "UNCONFIRMED: could not read $pane to verify the submit — do NOT assume it landed" >&2
   exit 4
 fi
-echo "UNSUBMITTED: text still pinned as [Pasted text] in $pane after 6 Enters — deliver by hand" >&2
+echo "UNSUBMITTED: $pane composer looked unchanged after 6 Enters — deliver by hand" >&2
 exit 4

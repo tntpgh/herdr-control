@@ -792,7 +792,7 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 | `attention.sh` | honest per-agent waiting-reason + `--focus` next-action view |
 | `wait-for-blocked.sh` | blocks (for a background job) until any/some agent pane needs input, then reports it — `shift 2`'s all-or-nothing bash semantics used to break the single-argument form (`wait-for-blocked.sh 30`), see `verify-wait-for-blocked.sh` |
 | `herdr-deliver.sh` | deliver+submit a message to an agent (or `--blocked`) |
-| `send-to-agent.sh` | robust type+submit into a pane (delivery primitive) |
+| `send-to-agent.sh` | robust type+submit into a pane (delivery primitive); `--submit-only` presses/confirms text ALREADY in the composer (e.g. an operator typed directly and the Enter didn't land) |
 | `herdr-select.sh` | answer a prompt — numbered digit or omp's arrow menu — by pressing the right key(s); `--authority peer\|human` gates auto-answer through command policy |
 | `herdr-resolve.sh` | retract Slack alerts whose prompt was answered elsewhere |
 | `wake-on-evidence.sh` | poll a peer's `.omc/handoffs/events.jsonl` for a marker, then wake |
