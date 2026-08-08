@@ -126,6 +126,8 @@ if [ "$dry" = 1 ]; then
   echo "  tab label : $label"
   echo "  launch    : $cli"
   echo "  wake      : $here/wake-on-evidence.sh $events_file '$wake_pattern'"
+  echo "              ^ run BACKGROUNDED (run_in_background/async:true) — a blocking"
+  echo "                foreground call strands you idle until re-prompted by hand"
   echo "  registry  : run=$run_id task=$task_id conductor_pane=${conductor_pane_id:-<none — not running inside a herdr pane>} conductor_pane_birth=${conductor_pane_birth:-<none>}"
   exit 0
 fi
@@ -143,9 +145,15 @@ fi
 # The herdr-ops protocol: a worker appends its completion event to its own
 # .omc/handoffs/events.jsonl; the conductor watches that FILE via
 # wake-on-evidence.sh (never `wait output --match`, which false-fires on the
-# kick-off echo quoting the marker). That only works if the directory exists
-# and the conductor remembers the exact command — both silently fall on the
-# orchestrator otherwise, which is how a whole day gets spent polling panes.
+# kick-off echo quoting the marker), run via the harness's own background/
+# async job facility, NEVER blocking foreground. That only works if the
+# directory exists, the conductor remembers the exact command, AND runs it
+# backgrounded — all three silently fall on the orchestrator otherwise.
+# Forgetting the command means polling panes by hand all day; running it in
+# the foreground is subtler and just as costly — it looks armed right up
+# until it returns and leaves the conductor idle, needing the operator to
+# manually re-prompt every single time (observed live, 2026-08-06). The
+# printed hint below is flagged BACKGROUNDED for exactly this reason.
 mkdir -p "$(dirname "$events_file")"
 
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
@@ -193,6 +201,8 @@ bgtag="background"; [ "$foc" = --focus ] && bgtag="focused"
 printf 'spawned %-22s ws=%s tab=%s pane=%s  [%s]\n' "$label" "$ws" "$tab" "$pane" "$bgtag"
 printf '  worktree: %s\n  launch:   %s\n' "$wt" "$cli"
 printf '  wake:     %s %s '"'"'%s'"'"'\n' "$here/wake-on-evidence.sh" "$events_file" "$wake_pattern"
+printf '            ^ run BACKGROUNDED (run_in_background/async:true) — a blocking\n'
+printf '              foreground call strands you idle until re-prompted by hand\n'
 printf '  worker on completion appends to %s, e.g.:\n' "$events_file"
 printf '    {"event":"%s", ...}\n' "$wake_pattern"
 printf '  registry: %s  (run=%s task=%s)\n' "$(registry_db)" "$run_id" "$task_id"
