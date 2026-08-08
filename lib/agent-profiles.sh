@@ -165,17 +165,41 @@ cli_for_agent() {
     claude|omc)
       printf 'claude --model %s%s\n' "$spec" "${flag:+ $flag}" ;;
     codex)
-      m="${spec%%:*}"; e="${spec##*:}"
-      printf 'codex -m %s -c model_reasoning_effort=%s%s\n' "$m" "$e" "${flag:+ $flag}" ;;
+      # A spec with no ":effort" (e.g. spawn-task.sh's `--model X` override
+      # with no `--effort`) makes bash's ${spec##*:} a no-op — nothing to
+      # strip — so `e` silently comes back equal to the MODEL NAME. Observed
+      # live 2026-08-08: `-c model_reasoning_effort=gpt-5.6-sol` hard-errors
+      # codex on EVERY call (invalid_enum_value), with no crash and no
+      # failure signal in spawn-task.sh's own output — the pane just sits
+      # there silently dead. Omit the flag entirely instead and let codex use
+      # its own default reasoning effort — safer than guessing a specific
+      # level, and correct-by-construction rather than relying on every
+      # caller to always pass a colon.
+      m="${spec%%:*}"
+      if [ "$m" = "$spec" ]; then
+        printf 'codex -m %s%s\n' "$m" "${flag:+ $flag}"
+      else
+        e="${spec##*:}"
+        printf 'codex -m %s -c model_reasoning_effort=%s%s\n' "$m" "$e" "${flag:+ $flag}"
+      fi
+      ;;
     omp)
-      m="${spec%%:*}"; e="${spec##*:}"
+      # Same colonless-spec hazard as codex above — `--thinking <model-name>`
+      # would be an equally invalid omp flag value. Omit rather than guess.
+      m="${spec%%:*}"
       # At the `write` floor omp auto-approves read+write and still prompts on
       # exec — the closest equivalent to Claude's acceptEdits. That prompt IS
       # answerable now (herdr-select.sh's menu strategy, capability
       # `menu-prompt`), so `write` no longer means "will sit blocked forever on
       # its first bash call" the way it did when the menu shape had no
       # answering path.
-      printf 'omp --model %s --thinking %s%s\n' "$m" "$e" "${flag:+ $flag}" ;;
+      if [ "$m" = "$spec" ]; then
+        printf 'omp --model %s%s\n' "$m" "${flag:+ $flag}"
+      else
+        e="${spec##*:}"
+        printf 'omp --model %s --thinking %s%s\n' "$m" "$e" "${flag:+ $flag}"
+      fi
+      ;;
     *)
       return 1 ;;
   esac

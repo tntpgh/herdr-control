@@ -89,6 +89,19 @@ check "a strict FLOOR overrides everything" \
 check "codex gets no posture flag appended" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent codex gpt-5.5:medium)" \
   "codex -m gpt-5.5 -c model_reasoning_effort=medium"
+printf '== 2026-08-08 bug: a spec with NO ":effort" must OMIT the flag, never pass the model name as the effort value ==\n'
+# Reported live: spawn-task.sh --model X with no --effort produced
+# `codex -m X -c model_reasoning_effort=X` — codex hard-errors on every call
+# (invalid_enum_value), silently, with no crash and no obvious signal.
+check "codex with no effort in the spec omits the flag entirely" \
+  "$(cli_for_agent codex gpt-5.6-sol)" \
+  "codex -m gpt-5.6-sol"
+check "omp with no effort in the spec omits --thinking entirely" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet)" \
+  "omp --model sonnet --approval-mode write"
+check "codex with an effort still works (no regression)" \
+  "$(cli_for_agent codex gpt-5.6-sol:high)" \
+  "codex -m gpt-5.6-sol -c model_reasoning_effort=high"
 if cli_for_agent definitely-not-an-agent x >/dev/null 2>&1; then
   bad "unknown agent should exit 1"
 else
