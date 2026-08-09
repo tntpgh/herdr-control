@@ -204,30 +204,61 @@ rc=$?
 # name.sh's label, attention.sh's honest waiting reason) — without it, every
 # tab herdr-control's own tools didn't explicitly label (most notably a
 # workspace's own root tab, ensure-workspace.sh) shows up in the Agents panel
-# as generic noise instead of real work. config.toml is EDITED IN PLACE with a
-# backup first, same "never silently replace personal config" posture as
-# settings.json above, and only APPENDED to — this table does not exist in
-# herdr's own shipped defaults, so there is nothing to merge keys into, only
-# a check for whether it is there yet.
+# as generic noise instead of real work. Paired with sidebar_min_width: herdr
+# auto-scales the sidebar to fit the SHORTEST row's content (state_icon +
+# workspace + tab), so short workspace/tab names can leave the $task/$status
+# rows below them truncated even though smart-name.sh's own naming budget
+# (30 chars, smart-name.sh's NAMING_INSTRUCTION) fits well inside herdr's
+# documented 36-column max — the sidebar just never grew that wide on its
+# own. A floor, not a fixed width: workspaces that need more still grow past
+# it, this only stops it shrinking below what a full task label needs.
+#
+# config.toml is EDITED IN PLACE with a backup first, same "never silently
+# replace personal config" posture as settings.json above. The [ui.sidebar.
+# agents] table is pure append (it does not exist in herdr's shipped
+# defaults); sidebar_min_width is inserted into the EXISTING bare [ui] table
+# if one is already present (TOML forbids a second [ui] header), else a new
+# one is appended.
 HERDR_CONFIG="${HERDR_CONFIG:-$HOME/.config/herdr/config.toml}"
+need_agents_block=0; need_sidebar_width=0
+if [ -f "$HERDR_CONFIG" ]; then
+  grep -q '^\[ui\.sidebar\.agents\]' "$HERDR_CONFIG" 2>/dev/null || need_agents_block=1
+  grep -q '^sidebar_min_width' "$HERDR_CONFIG" 2>/dev/null || need_sidebar_width=1
+fi
 if [ ! -f "$HERDR_CONFIG" ]; then
-  echo "  ! no herdr config at $HERDR_CONFIG — skipping the Agents sidebar block (herdr not configured yet?)" >&2
-elif grep -q '^\[ui\.sidebar\.agents\]' "$HERDR_CONFIG" 2>/dev/null; then
+  echo "  ! no herdr config at $HERDR_CONFIG — skipping Agents sidebar setup (herdr not configured yet?)" >&2
+elif [ "$need_agents_block" = 0 ] && [ "$need_sidebar_width" = 0 ]; then
   echo "  = herdr Agents sidebar config already wired -> $HERDR_CONFIG"
 elif [ "$APPLY" = 1 ]; then
   cp "$HERDR_CONFIG" "${HERDR_CONFIG}.bak-herdr-control-$(date +%Y%m%d%H%M%S)"
-  {
-    printf '\n'
-    sed -n '/^# ---- Agent sidebar cards/,/^\]$/p' "$here/docs/herdr-config-snippet.toml"
-  } >> "$HERDR_CONFIG"
-  echo "  + appended [ui.sidebar.agents] to $HERDR_CONFIG (backup written alongside it)"
+  if [ "$need_sidebar_width" = 1 ]; then
+    if grep -q '^\[ui\]$' "$HERDR_CONFIG"; then
+      awk '{print} /^\[ui\]$/ && !d {print "sidebar_min_width = 34"; d=1}' "$HERDR_CONFIG" > "${HERDR_CONFIG}.tmp" \
+        && mv "${HERDR_CONFIG}.tmp" "$HERDR_CONFIG"
+    else
+      printf '\n[ui]\nsidebar_min_width = 34\n' >> "$HERDR_CONFIG"
+    fi
+    echo "  + set sidebar_min_width = 34 in $HERDR_CONFIG"
+  fi
+  if [ "$need_agents_block" = 1 ]; then
+    {
+      printf '\n'
+      sed -n '/^# ---- Agent sidebar cards/,/^\]$/p' "$here/docs/herdr-config-snippet.toml"
+    } >> "$HERDR_CONFIG"
+    echo "  + appended [ui.sidebar.agents] to $HERDR_CONFIG"
+  fi
+  echo "    (backup written alongside it)"
   if command -v herdr >/dev/null 2>&1 && herdr server reload-config >/dev/null 2>&1; then
     echo "    reloaded: herdr server reload-config"
+    echo "    NOTE: some sidebar settings only apply to a freshly attached client —"
+    echo "    detach and run \`herdr session attach default\` (or reattach however you"
+    echo "    normally do) if the change doesn't show up immediately."
   else
     echo "    ! reload-config failed or herdr unreachable — restart herdr, or run: herdr server reload-config" >&2
   fi
 else
-  echo "  + would append [ui.sidebar.agents] sidebar block -> $HERDR_CONFIG"
+  [ "$need_agents_block" = 1 ] && echo "  + would append [ui.sidebar.agents] sidebar block -> $HERDR_CONFIG"
+  [ "$need_sidebar_width" = 1 ] && echo "  + would set sidebar_min_width = 34 -> $HERDR_CONFIG"
 fi
 
 # ---- omp extension symlink --------------------------------------------------
