@@ -195,6 +195,23 @@ stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q
   "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$cli")
 herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || { echo "spawn-task: launch failed: $cli" >&2; exit 1; }
 herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
+
+# Best-effort agent_session capture — herdr reports this natively for
+# claude/codex (empty for omp today) once the CLI has actually started
+# reporting in, which can lag a beat behind the launch above. A short,
+# bounded poll rather than one immediate read: reconcile.sh's corroboration
+# check (lib/reconcile.sh) is the thing that actually NEEDS this to survive a
+# herdr crash+restart, and it also opportunistically backfills any task still
+# missing one later — so a miss here is degraded, not broken, and never worth
+# blocking or failing the spawn over.
+agent_session=""
+for _ in 1 2 3 4 5; do
+  agent_session=$(herdr pane get "$pane" 2>/dev/null | jq -r '.result.pane.agent_session.value // empty')
+  [ -n "$agent_session" ] && break
+  sleep 0.4
+done
+[ -n "$agent_session" ] && set_task_agent_session "$run_id" "$task_id" "$agent_session"
+
 set_task_state "$run_id" "$task_id" "running"
 
 bgtag="background"; [ "$foc" = --focus ] && bgtag="focused"

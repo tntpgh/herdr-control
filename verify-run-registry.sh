@@ -70,6 +70,56 @@ check "state unchanged after refusal" "$(read_task run1 task1 | jq -r .state)" "
 set_task_state run1 task1 completed || bad "idempotent re-assert of same state refused"
 ok "idempotent same-state re-assert allowed"
 
+printf '== set_task_state compare-and-swap under CONCURRENT racing sweeps ==\n'
+# Sol's finding (2026-08-09 incident): the old set_task_state read `cur`
+# outside its transaction with no WHERE-guard on the write, so two
+# reconcile sweeps racing (a herdr-restart storm firing SessionStart AND
+# the interval hook back to back) both read the SAME cur, both passed the
+# legality check, and both committed — a duplicate state_changed (and, on
+# the real incident, a triplicate lost_detected) for one transition.
+register_task runCAS taskCAS w c cp cb paneCAS birthCAS /repo/cas /wt/cas "cas" \
+  || bad "register taskCAS failed"
+set_task_state runCAS taskCAS running || bad "starting -> running refused (cas setup)"
+n_racers=15
+for i in $(seq 1 "$n_racers"); do
+  ( set_task_state runCAS taskCAS blocked >/dev/null 2>&1 ) &
+done
+wait
+check "final state is blocked, not stuck mid-race" "$(read_task runCAS taskCAS | jq -r .state)" "blocked"
+dup_events=$(sqlite3 "$(registry_db)" \
+  "SELECT count(*) FROM events WHERE task_id='taskCAS' AND type='state_changed' AND payload LIKE '%\"state\":\"blocked\"%';")
+check "exactly ONE state_changed event, not $n_racers duplicates" "$dup_events" "1"
+
+printf '== set_task_agent_session: best-effort capture, never overwrites once set ==\n'
+check "starts empty" "$(read_task runCAS taskCAS | jq -r .agent_session)" ""
+set_task_agent_session runCAS taskCAS "sess-abc"
+check "captured" "$(read_task runCAS taskCAS | jq -r .agent_session)" "sess-abc"
+set_task_agent_session runCAS taskCAS "sess-xyz"
+check "does not clobber an already-recorded session" "$(read_task runCAS taskCAS | jq -r .agent_session)" "sess-abc"
+set_task_agent_session runCAS taskCAS ""
+check "empty value is a no-op, not a blank overwrite" "$(read_task runCAS taskCAS | jq -r .agent_session)" "sess-abc"
+
+printf '== rebaseline_pane_birth: corrects identity WITHOUT touching state or the state machine ==\n'
+rebaseline_pane_birth runCAS taskCAS "birthCAS-v2" "test" || bad "rebaseline_pane_birth failed"
+check "pane_birth updated" "$(read_task runCAS taskCAS | jq -r .pane_birth)" "birthCAS-v2"
+check "state untouched by a rebaseline" "$(read_task runCAS taskCAS | jq -r .state)" "blocked"
+check "pane_birth_rebaselined event logged" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskCAS' AND type='pane_birth_rebaselined';")" "1"
+rebaseline_pane_birth runCAS taskCAS "birthCAS-v2" "no-op" || bad "no-op rebaseline (same value) should still return success"
+check "re-rebaselining to the SAME value logs no extra event" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskCAS' AND type='pane_birth_rebaselined';")" "1"
+if rebaseline_pane_birth runCAS taskNope "x" "y" 2>/dev/null; then
+  bad "rebaseline_pane_birth accepted a nonexistent task"
+else
+  ok "rebaseline_pane_birth refuses a nonexistent task"
+fi
+
+printf '== schema v3: agent_session column present after migration ==\n'
+check "agent_session column exists" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='agent_session';")" "1"
+check "schema_version is 3" \
+  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "3"
+
 printf '== event dedup on an explicit event_id (at-least-once retry safety) ==\n'
 before=$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")
 append_event run1 task1 retry_test '{"n":1}' stable-id-1
@@ -92,7 +142,7 @@ check "all $n_writers concurrent events landed" "$rows" "$n_writers"
 check "every sequence is unique"                "$uniq_seqs" "$n_writers"
 
 printf '== all_tasks_json ==\n'
-check "one line per task" "$(all_tasks_json | wc -l | tr -d ' ')" "2"
+check "one line per task" "$(all_tasks_json | wc -l | tr -d ' ')" "3"
 all_tasks_json | while IFS= read -r l; do
   printf '%s' "$l" | jq -e . >/dev/null 2>&1 || { printf '  FAIL  non-JSON row\n'; exit 1; }
 done || bad "all_tasks_json emitted a non-JSON row"
