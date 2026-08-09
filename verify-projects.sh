@@ -37,7 +37,7 @@ herdr() {
     "workspace create")
       [ "$HERDR_FAIL_ON" = "workspace" ] && { echo '{"error":{"message":"stub: workspace create failed"}}'; return 1; }
       local n; n=$(( $(cat "$HERDR_SEQ_FILE") + 1 )); echo "$n" > "$HERDR_SEQ_FILE"
-      printf '{"result":{"workspace":{"workspace_id":"ws-%s"}}}\n' "$n"
+      printf '{"result":{"workspace":{"workspace_id":"ws-%s","active_tab_id":"roottab-%s"}}}\n' "$n" "$n"
       ;;
     "tab create")
       [ "$HERDR_FAIL_ON" = "tab" ] && { echo '{"error":{"message":"stub: tab create failed"}}'; return 1; }
@@ -51,6 +51,8 @@ herdr() {
     "pane run")
       printf '%s\n' "$*" >> "$HERDR_RUN_LOG"
       ;;
+    "tab rename")
+      : ;;
     "pane rename")
       : ;;
     *) echo '{"error":{"message":"stub: unhandled herdr call: '"$*"'"}}'; return 1 ;;
@@ -78,6 +80,7 @@ project_open '{"name":"x","working_dir":"'"$WORK"'","tabs":[{"label":"work","pan
 [ "$(calls_matching '^workspace create')" = "1" ] && ok "one workspace create" || bad "workspace create calls=$(calls_matching '^workspace create')"
 [ "$(calls_matching '^tab create')" = "1" ] && ok "one tab create" || bad "tab create calls=$(calls_matching '^tab create')"
 [ "$PROJECT_WORKSPACE_ID" = "ws-1" ] && ok "PROJECT_WORKSPACE_ID threaded" || bad "PROJECT_WORKSPACE_ID=$PROJECT_WORKSPACE_ID"
+grep -q '^tab rename roottab-1 ' "$HERDR_LOG" && ok "root tab renamed using workspace create's active_tab_id" || bad "no/wrong tab rename: $(grep '^tab rename' "$HERDR_LOG")"
 
 printf '== project_open: 3 tabs -> one workspace, THREE tab-creates, only tab 0 gets the project focus flag ==\n'
 reset_stub

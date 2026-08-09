@@ -198,6 +198,38 @@ PY
 rc=$?
 [ "$rc" -eq 0 ] || { echo "hook registration failed (settings.json untouched)" >&2; exit "$rc"; }
 
+# ---- herdr Agents sidebar config -------------------------------------------
+# docs/herdr-config-snippet.toml's [ui.sidebar.agents] block replaces herdr's
+# bare "workspace / tab" default agent-card row with $task/$status (smart-
+# name.sh's label, attention.sh's honest waiting reason) — without it, every
+# tab herdr-control's own tools didn't explicitly label (most notably a
+# workspace's own root tab, ensure-workspace.sh) shows up in the Agents panel
+# as generic noise instead of real work. config.toml is EDITED IN PLACE with a
+# backup first, same "never silently replace personal config" posture as
+# settings.json above, and only APPENDED to — this table does not exist in
+# herdr's own shipped defaults, so there is nothing to merge keys into, only
+# a check for whether it is there yet.
+HERDR_CONFIG="${HERDR_CONFIG:-$HOME/.config/herdr/config.toml}"
+if [ ! -f "$HERDR_CONFIG" ]; then
+  echo "  ! no herdr config at $HERDR_CONFIG — skipping the Agents sidebar block (herdr not configured yet?)" >&2
+elif grep -q '^\[ui\.sidebar\.agents\]' "$HERDR_CONFIG" 2>/dev/null; then
+  echo "  = herdr Agents sidebar config already wired -> $HERDR_CONFIG"
+elif [ "$APPLY" = 1 ]; then
+  cp "$HERDR_CONFIG" "${HERDR_CONFIG}.bak-herdr-control-$(date +%Y%m%d%H%M%S)"
+  {
+    printf '\n'
+    sed -n '/^# ---- Agent sidebar cards/,/^\]$/p' "$here/docs/herdr-config-snippet.toml"
+  } >> "$HERDR_CONFIG"
+  echo "  + appended [ui.sidebar.agents] to $HERDR_CONFIG (backup written alongside it)"
+  if command -v herdr >/dev/null 2>&1 && herdr server reload-config >/dev/null 2>&1; then
+    echo "    reloaded: herdr server reload-config"
+  else
+    echo "    ! reload-config failed or herdr unreachable — restart herdr, or run: herdr server reload-config" >&2
+  fi
+else
+  echo "  + would append [ui.sidebar.agents] sidebar block -> $HERDR_CONFIG"
+fi
+
 # ---- omp extension symlink --------------------------------------------------
 # omp auto-discovers extension modules from $PI_CODING_AGENT_DIR/extensions
 # when set, else ~/.omp/agent/extensions/ — honoring the operator's own agent

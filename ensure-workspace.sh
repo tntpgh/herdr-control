@@ -41,9 +41,17 @@ if [ -n "$ws" ]; then
   exit 0
 fi
 
-# Create it.
+# Create it. herdr auto-creates a root tab as part of workspace creation but
+# gives it no label of its own (herdr's bare default is just the tab's
+# position number, e.g. "1") — every OTHER tab in this repo's tooling gets a
+# real label at creation (spawn-task.sh's worker tabs, layout.sh's project
+# tabs), so a workspace's own root tab was the one gap left showing up as
+# generic noise in herdr's Agents sidebar. Best-effort: a rename failing
+# must not fail workspace creation, which already succeeded by this point.
 foc=--no-focus; [ "$focus" = 1 ] && foc=--focus
-ws=$(herdr workspace create --cwd "$root" --label "$label" "$foc" 2>/dev/null \
-       | jq -r '.result.workspace.workspace_id // empty')
+ws_json=$(herdr workspace create --cwd "$root" --label "$label" "$foc" 2>/dev/null)
+ws=$(printf '%s' "$ws_json" | jq -r '.result.workspace.workspace_id // empty')
 [ -n "$ws" ] || { echo "ensure-workspace: workspace create failed for $root" >&2; exit 1; }
+tab_id=$(printf '%s' "$ws_json" | jq -r '.result.workspace.active_tab_id // empty')
+[ -n "$tab_id" ] && herdr tab rename "$tab_id" "$label" >/dev/null 2>&1 || true
 printf '%s\n' "$ws"
