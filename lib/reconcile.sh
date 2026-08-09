@@ -69,11 +69,53 @@ run_reconciliation() {
     printf '%s' "$live_json" | jq -r --arg p "$1" \
       '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null
   }
+  _live_agent_session_for() {           # pane_id -> agent_session.value, empty if none/gone
+    [ "$have_live" = 1 ] || { printf ''; return 0; }
+    printf '%s' "$live_json" | jq -r --arg p "$1" \
+      '(.result.panes // .panes)[]? | select(.pane_id==$p) | .agent_session.value // empty' 2>/dev/null
+  }
 
   local checkpoint new_checkpoint report_lines="" report_count=0
   checkpoint="$(read_checkpoint "$conductor_id")"
   new_checkpoint="$checkpoint"
 
+
+  # ---- PASS 1: count identity-UNCERTAIN mismatches in THIS sweep ---------
+  # A herdr crash+restart reissues terminal_id for every pane it
+  # re-enumerates on reconnect (observed live, 2026-08-09: three unrelated
+  # tasks across three repos all flipped pane_birth mismatch within the same
+  # second) — the agent processes underneath never died. A mismatch this
+  # library can positively CORROBORATE via agent_session (both sides
+  # present) is never "uncertain": it is either confirmed-same (rebaseline,
+  # below) or confirmed-different (a genuinely new process took the pane,
+  # still lost). Only mismatches with NO corroboration available on either
+  # side (omp, or a legacy row registered before agent_session existed)
+  # count here. Per Sol's review: mass-simultaneous uncertainty is good
+  # evidence of a shared-cause restart, but not proof any ONE of them is
+  # still alive — so it gates against BURYING them, not toward silently
+  # resurrecting them either. An isolated uncertain mismatch (the common
+  # real case: one tab closed and reopened) still gets marked lost exactly
+  # as before.
+  local uncertain_count=0
+  if [ "$have_live" = 1 ]; then
+    while IFS= read -r _t; do
+      [ -n "$_t" ] || continue
+      local _state _pane _birth
+      _state=$(printf '%s' "$_t" | jq -r '.state // empty')
+      case "$_state" in starting|running|blocked) ;; *) continue ;; esac
+      _pane=$(printf '%s' "$_t" | jq -r '.pane_id // empty')
+      _birth=$(printf '%s' "$_t" | jq -r '.pane_birth // empty')
+      [ -n "$_pane" ] || continue
+      local _live_birth; _live_birth="$(_live_birth_for "$_pane")"
+      [ -n "$_live_birth" ] || continue                                  # pane_gone: not "uncertain"
+      { [ -n "$_birth" ] && [ "$_live_birth" != "$_birth" ]; } || continue # no mismatch at all
+      local _reg_sess _live_sess
+      _reg_sess=$(printf '%s' "$_t" | jq -r '.agent_session // empty')
+      _live_sess="$(_live_agent_session_for "$_pane")"
+      [ -n "$_reg_sess" ] && [ -n "$_live_sess" ] && continue            # corroborated either way
+      uncertain_count=$((uncertain_count + 1))
+    done < <(all_tasks_json)
+  fi
   # One JSON object per registered task, straight from the registry. This used
   # to iterate FILE PATHS and cat each one, which needed a torn-write guard
   # (`jq -e .` on the contents) because a reader could catch a task file
@@ -81,13 +123,14 @@ run_reconciliation() {
   # partially-written row left to defend against.
   while IFS= read -r task_json; do
     [ -n "$task_json" ] || continue
-    local run_id task_id state pane_id pane_birth
+    local run_id task_id state pane_id pane_birth reg_session
 
     run_id=$(printf '%s' "$task_json" | jq -r '.run_id // empty')
     task_id=$(printf '%s' "$task_json" | jq -r '.task_id // empty')
     state=$(printf '%s' "$task_json" | jq -r '.state // empty')
     pane_id=$(printf '%s' "$task_json" | jq -r '.pane_id // empty')
     pane_birth=$(printf '%s' "$task_json" | jq -r '.pane_birth // empty')
+    reg_session=$(printf '%s' "$task_json" | jq -r '.agent_session // empty')
     [ -n "$run_id" ] && [ -n "$task_id" ] || continue
 
     # ---- lost detection — only tasks that could still be alive ------------
@@ -99,7 +142,48 @@ run_reconciliation() {
           if [ -z "$live_birth" ]; then
             reason="pane_gone"
           elif [ -n "$pane_birth" ] && [ "$live_birth" != "$pane_birth" ]; then
-            reason="pane_recycled"
+            local live_session
+            live_session="$(_live_agent_session_for "$pane_id")"
+            if [ -n "$reg_session" ] && [ -n "$live_session" ]; then
+              if [ "$reg_session" = "$live_session" ]; then
+                # Same agent session survived a terminal_id change: this is a
+                # false-positive CLOSE, not a resurrection — the task was
+                # never marked lost, so there is nothing to un-bury.
+                rebaseline_pane_birth "$run_id" "$task_id" "$live_birth" "agent_session_match"
+                task_json="$(read_task "$run_id" "$task_id")"
+                pane_birth="$live_birth"
+              else
+                reason="pane_recycled"   # a genuinely different session now owns this pane_id
+              fi
+            elif [ "$uncertain_count" -ge 2 ]; then
+              # No corroboration available, but part of a mass-simultaneous
+              # mismatch this sweep — looks like a shared-cause restart, not
+              # N independent deaths, yet there is no POSITIVE evidence this
+              # particular pane is still the same process either. Don't bury
+              # it and don't silently rebaseline it: leave state untouched.
+              # pane-guard.sh's own pane_birth check keeps refusing input
+              # against it until this resolves on its own (a future sweep
+              # either corroborates it via a now-reported agent_session, or
+              # the pane genuinely goes away and it is marked lost then) —
+              # the fail-closed-on-input half of the design.
+              append_event "$run_id" "$task_id" "pane_identity_uncertain" \
+                "$(jq -nc --arg pane "$pane_id" --argjson n "$uncertain_count" \
+                  '{pane_id:$pane, reason:"mass_simultaneous_mismatch_no_corroboration", concurrent_uncertain_count:$n}')"
+            else
+              reason="pane_recycled"    # isolated mismatch, no corroboration — today's behavior
+            fi
+          else
+            # pane_birth matches (or was never recorded) — task is genuinely
+            # alive. Opportunistic backfill: herdr's agent_session report can
+            # land after registration (spawn-task.sh's own capture already
+            # retries briefly, but a slow-starting agent can still miss that
+            # window) — catching it here means the NEXT restart has
+            # corroboration available even for a task that missed it at spawn.
+            if [ -z "$reg_session" ]; then
+              local live_session_fill
+              live_session_fill="$(_live_agent_session_for "$pane_id")"
+              [ -n "$live_session_fill" ] && set_task_agent_session "$run_id" "$task_id" "$live_session_fill"
+            fi
           fi
           if [ -n "$reason" ]; then
             set_task_state "$run_id" "$task_id" "lost"

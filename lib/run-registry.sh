@@ -99,7 +99,7 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '2\n'; }
+_registry_schema_version() { printf '3\n'; }
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
@@ -144,6 +144,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   conductor_pane_birth TEXT NOT NULL DEFAULT '',
   pane_id              TEXT NOT NULL DEFAULT '',
   pane_birth           TEXT NOT NULL DEFAULT '',
+  -- herdr's own agent_session (a claude/codex session id herdr reports
+  -- natively; empty for omp today, and possibly empty briefly right after
+  -- spawn before the agent has reported in). This is the identity that
+  -- SURVIVES a herdr server crash+restart, unlike pane_birth/terminal_id,
+  -- which herdr reissues for every pane it re-enumerates on reconnect even
+  -- though the underlying agent process never died — see
+  -- lib/reconcile.sh's corroboration check.
+  agent_session        TEXT NOT NULL DEFAULT '',
   repo                 TEXT NOT NULL DEFAULT '',
   worktree             TEXT NOT NULL DEFAULT '',
   label                TEXT NOT NULL DEFAULT '',
@@ -214,8 +222,26 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   fi
 
   _HERDR_REGISTRY_READY=1
+  _migrate_schema_v3
   _migrate_legacy_files
   return 0
+}
+
+# ---- schema v2 -> v3: add tasks.agent_session -------------------------------
+# CREATE TABLE IF NOT EXISTS above only shapes a BRAND NEW database; an
+# existing one (schema_version '2') already has a `tasks` table without this
+# column, and IF NOT EXISTS is a no-op against it. Idempotent and safe to run
+# on every registry_init() call: checks pragma_table_info before ALTERing, and
+# schema_meta's INSERT OR REPLACE makes re-running after a partial failure
+# harmless (it will just retry the ALTER, which itself no-ops once the column
+# exists).
+_migrate_schema_v3() {
+  local has_col
+  has_col=$(_sql "SELECT 1 FROM pragma_table_info('tasks') WHERE name='agent_session';" 2>/dev/null)
+  if [ -z "$has_col" ]; then
+    _sql "ALTER TABLE tasks ADD COLUMN agent_session TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
+  fi
+  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3');" >/dev/null 2>&1
 }
 
 # ---- one-time import of the pre-SQLite file layout --------------------------
@@ -308,10 +334,11 @@ gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand
 # names whether it asked for one task or all of them.
 _task_json_select() {
   printf "%s" "SELECT json_object(
-    'schema', 2, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
+    'schema', 3, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
     'conductor_id', conductor_id, 'conductor_pane_id', conductor_pane_id,
     'conductor_pane_birth', conductor_pane_birth, 'pane_id', pane_id,
-    'pane_birth', pane_birth, 'repo', repo, 'worktree', worktree, 'label', label,
+    'pane_birth', pane_birth, 'agent_session', agent_session, 'repo', repo,
+    'worktree', worktree, 'label', label,
     'state', state, 'created_at', created_at, 'updated_at', updated_at) FROM tasks"
 }
 
@@ -373,38 +400,110 @@ _legal_transition() {                   # from to -> 0 if allowed
 set_task_state() {                      # run_id task_id state
   local run_id="$1" task_id="$2" state="$3"
   registry_init || return 1
-  local cur
-  cur=$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
-  if [ -z "$cur" ]; then
-    printf 'run-registry: no task record for %s/%s\n' "$run_id" "$task_id" >&2
-    return 1
-  fi
-  if ! _legal_transition "$cur" "$state"; then
-    printf 'run-registry: refusing illegal transition %s -> %s for %s/%s\n' \
-      "$cur" "$state" "$run_id" "$task_id" >&2
-    return 1
-  fi
-  [ "$cur" = "$state" ] && return 0
+  local attempt=0
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    local cur
+    cur=$(_sql "SELECT state FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+    if [ -z "$cur" ]; then
+      printf 'run-registry: no task record for %s/%s\n' "$run_id" "$task_id" >&2
+      return 1
+    fi
+    if ! _legal_transition "$cur" "$state"; then
+      printf 'run-registry: refusing illegal transition %s -> %s for %s/%s\n' \
+        "$cur" "$state" "$run_id" "$task_id" >&2
+      return 1
+    fi
+    [ "$cur" = "$state" ] && return 0
 
-  # The state change and its event land in ONE transaction. Under the old file
-  # layout these were two separate writes, and a prior fix had to suppress the
-  # event when the state write failed to stop events.jsonl claiming a
-  # transition that never happened. A transaction removes the failure mode
-  # instead of compensating for it: either both rows are there or neither is.
-  local at eid
-  at="$(_now_iso)"
-  eid="$(gen_id ev)"
-  if _sql "BEGIN IMMEDIATE;
-    UPDATE tasks SET state=$(_sq "$state"), updated_at=$(_sq "$at")
-      WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");
-    INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload)
-      VALUES ($(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), 'state_changed', $(_sq "$at"),
-        $(_sq "$(jq -nc --arg s "$state" --arg f "$cur" '{state:$s, from:$f}')"));
-    COMMIT;" >/dev/null 2>&1; then
-    return 0
-  fi
-  printf 'run-registry: failed to write state %s for %s/%s\n' "$state" "$run_id" "$task_id" >&2
+    # The state change and its event land in ONE transaction, AND that
+    # transaction is compare-and-swap on the "$cur" we just read (WHERE
+    # ... AND state=$cur). Without the CAS guard, two reconcile sweeps
+    # racing (e.g. a herdr-restart storm firing SessionStart AND the
+    # PostToolUse interval hook back to back) both read the same "cur",
+    # both pass the legality check above, and both used to COMMIT —
+    # observed live as duplicate state_changed/lost_detected event pairs
+    # for one task at the same timestamp. Gating the event INSERT on
+    # `(SELECT changes())>0` (evaluated against the UPDATE immediately
+    # above it, before the INSERT's own execution changes it again) makes
+    # the loser's INSERT a no-op in the SAME transaction, instead of a
+    # second write needing its own compensating check.
+    local at eid changed
+    at="$(_now_iso)"
+    eid="$(gen_id ev)"
+    changed=$(_sql "BEGIN IMMEDIATE;
+      UPDATE tasks SET state=$(_sq "$state"), updated_at=$(_sq "$at")
+        WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id") AND state=$(_sq "$cur");
+      INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload)
+        SELECT $(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), 'state_changed', $(_sq "$at"),
+          $(_sq "$(jq -nc --arg s "$state" --arg f "$cur" '{state:$s, from:$f}')")
+        WHERE (SELECT changes()) > 0;
+      COMMIT;
+      SELECT changes();" 2>/dev/null)
+    [ "$changed" = "1" ] && return 0
+    # A concurrent writer already moved this row between our read and our
+    # write. Loop: if they wrote the state we also wanted, the next
+    # iteration's idempotent-reassert check (cur = state) returns success;
+    # if they wrote something else, the legality check re-runs against the
+    # NEW reality instead of blindly retrying a now-stale transition.
+  done
+  printf 'run-registry: state write for %s/%s lost the compare-and-swap race 3 times (concurrent writer contention)\n' \
+    "$run_id" "$task_id" >&2
   return 1
+}
+
+# set_task_agent_session <run_id> <task_id> <agent_session>
+#
+# Best-effort metadata capture, deliberately NOT a lifecycle transition (no
+# event, no state check) — herdr reports agent_session natively for
+# claude/codex once the CLI has actually started, which is AFTER
+# register_task() runs (spawn-task.sh registers the task the moment the pane
+# EXISTS, before the agent inside it does). Call this once the agent is
+# confirmed up (spawn-task.sh does so right where it flips starting->running)
+# and again opportunistically from a reconcile sweep for any task still
+# missing one — capturing it late is still useful, since it corroborates
+# identity across the NEXT herdr restart, not this one. Empty is a legitimate,
+# permanent answer for omp today; never treat empty as a caller mistake.
+set_task_agent_session() {
+  local run_id="$1" task_id="$2" agent_session="${3:-}"
+  registry_init || return 1
+  [ -n "$agent_session" ] || return 0
+  _sql "UPDATE tasks SET agent_session=$(_sq "$agent_session")
+    WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id") AND agent_session='';" >/dev/null 2>&1
+}
+
+# rebaseline_pane_birth <run_id> <task_id> <new_pane_birth> [reason]
+#
+# Corrects a task's recorded pane_birth fingerprint WITHOUT touching state or
+# going through the lifecycle state machine — for when a pane's identity is
+# corroborated as the SAME live agent process despite herdr minting it a new
+# terminal_id. A herdr crash+restart reissues terminal_id for every pane it
+# re-enumerates on reconnect; the process underneath never died, so this is a
+# false-positive CLOSE, not a resurrection. Deliberately not set_task_state():
+# `lost` stays genuinely terminal and non-resurrectable for real pane deaths
+# (that invariant is the whole point of review correction 2) — this only ever
+# runs on a task that was never marked lost in the first place, preventing the
+# false positive instead of reopening a buried one. Logs an audited
+# pane_birth_rebaselined event so the correction is a queryable fact, the same
+# way an incident repair should be, not a silent field edit.
+rebaseline_pane_birth() {
+  local run_id="$1" task_id="$2" new_birth="$3" reason="${4:-}"
+  registry_init || return 1
+  local old_birth
+  old_birth=$(_sql "SELECT pane_birth FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  [ -n "$old_birth" ] || return 1
+  [ "$old_birth" = "$new_birth" ] && return 0     # already current
+  local at changed
+  at="$(_now_iso)"
+  changed=$(_sql "BEGIN IMMEDIATE;
+    UPDATE tasks SET pane_birth=$(_sq "$new_birth"), updated_at=$(_sq "$at")
+      WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id") AND pane_birth=$(_sq "$old_birth");
+    COMMIT;
+    SELECT changes();" 2>/dev/null)
+  [ "$changed" = "1" ] || return 1
+  append_event "$run_id" "$task_id" "pane_birth_rebaselined" \
+    "$(jq -nc --arg old "$old_birth" --arg new "$new_birth" --arg reason "$reason" \
+      '{old_pane_birth:$old, new_pane_birth:$new, reason:$reason}')" >/dev/null 2>&1
 }
 
 # append_event <run_id> <task_id> <type> [payload_json] [event_id]
