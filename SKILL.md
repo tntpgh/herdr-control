@@ -218,7 +218,9 @@ single blocked agent.
 
 This path puts text from Slack into a live terminal and presses Enter. That is
 powerful enough to deserve explicit limits, and they are the reason several
-things refuse rather than guess.
+things refuse rather than guess. `docs/approval-policy.md` is the single-page
+version of the invariants below, framed as a contract any new script must
+satisfy — read it before adding a new automated-answering or spawn path.
 
 **Only agent panes accept input.** `lib/pane-guard.sh` resolves the target and
 requires a real agent process. Delivery is "write literal text, then press
