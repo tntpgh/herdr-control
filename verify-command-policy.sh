@@ -191,6 +191,24 @@ check "operator rule cannot downgrade a built-in deny (mkfs stays deny)" "mkfs.e
 unset HERDR_POLICY_EXTRA_RULES
 
 echo
+echo "== operator rules ride the SAME obfuscation-defeating normalization as built-ins =="
+# Proves _cp_apply_operator_rules runs against scannable_command's output
+# (quote-stripped, ANSI-C-decoded, $()/`` flattened), not the raw string —
+# an operator rule authored against plain literal text must not be
+# trivially evaded by the same tricks the built-in table already defeats.
+export HERDR_POLICY_EXTRA_RULES="$(printf 'deny\tspecial-internal-deploy-tool\toperator: never auto-run our internal deploy tool')"
+check "operator rule matches literal text"              "special-internal-deploy-tool --now"            deny
+check "operator rule sees through quote-stripping"       '"special-internal-deploy-tool" --now'          deny
+check "operator rule sees through \$(...) substitution"  '$(echo special-internal-deploy-tool) --now'    deny
+unset HERDR_POLICY_EXTRA_RULES
+
+echo
+echo "== malformed operator verdict is skipped, never silently applied =="
+export HERDR_POLICY_EXTRA_RULES="$(printf 'block\tnpm publish\ttypo verdict must not escalate')"
+check "unrecognized verdict token is ignored (npm publish stays allow)" "npm publish" allow
+unset HERDR_POLICY_EXTRA_RULES
+
+echo
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

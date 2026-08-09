@@ -43,13 +43,18 @@
 # <script>.sh` is exactly right here since every action script already has
 # its own #!/usr/bin/env bash shebang and argument parsing.
 #
-# NOT YET LIVE-TESTED: this machine's herdr CLI (protocol 19) is newer than
-# its running server (protocol 17), so `herdr plugin link .` — and every
-# other live socket call — currently fails with protocol_mismatch. Written
-# and validated against herdr's published plugin docs (manifest shape, argv
-# `command` semantics, working-directory-is-plugin-root behaviour) and
-# herdr-plus's own working manifest, not against a live install. Restart the
-# herdr server, then `herdr plugin link .` from this repo to verify for real.
+# LIVE-VERIFIED 2026-08-09: client/server protocol match now (both 19).
+# `herdr plugin link .` succeeded, `herdr plugin list`/`plugin action list`
+# show all 5 actions registered under `tntpgh.herdr-control`, and invoking
+# the direct-dispatch `attention` action end-to-end (`herdr plugin action
+# invoke attention --plugin tntpgh.herdr-control`) returned exit_code 0 with
+# real stdout via `herdr plugin log list` — manifest shape, argv `command`
+# semantics, and server-side dispatch all confirmed for real, not just
+# against herdr's docs. NOT exercised: the two `[[panes]]`-backed overlay
+# actions (`projects`, `quick-actions`) that dispatch through
+# pick-pane-open.sh to a real TTY pane — invoking those needs a live
+# fzf-interactive session, not a headless CLI check; verify those by hand
+# before relying on them.
 
 id = "tntpgh.herdr-control"
 name = "herdr-control"
