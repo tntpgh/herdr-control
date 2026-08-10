@@ -2,6 +2,7 @@ build/
 *.log
 .DS_Store
 .omc/
+.local-state/engineering-ledger/
 __pycache__/
 *.pyc
 
