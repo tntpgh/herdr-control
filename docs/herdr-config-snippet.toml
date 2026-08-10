@@ -19,12 +19,21 @@
 # ---- Agent sidebar cards: show the task + honest status --------------------
 # $task   <- smart-name.sh   (the tab's current task label)
 # $status <- attention.sh    (permission / waiting reason / working)
+#
+# The bare "tab" token renders in herdr's DEFAULT dim/secondary style, next to
+# "workspace" in its bright primary style — same row, visibly different
+# contrast (reported live 2026-08-09: "the tab name text is basically too
+# faint to read compared to the well-contrasted space name"). $task/$status
+# are unstyled custom tokens and get the same dim default. All three are
+# forced bright + non-dim below; colors are tokyo-night's own palette
+# (#c0caf5 foreground, #7dcfff accent) — swap them if you run a different
+# theme, `dim = false` is the part that actually matters.
 [ui.sidebar.agents]
 row_gap = 0
 rows = [
-  ["state_icon", "workspace", "tab"],
-  ["$task"],
-  ["$status"],
+  ["state_icon", "workspace", { token = "tab", fg = "#c0caf5", bold = true, dim = false }],
+  [{ token = "$task", fg = "#7dcfff", bold = true, dim = false }],
+  [{ token = "$status", fg = "#c0caf5", bold = false, dim = false }],
 ]
 
 # Optional: give Claude leads a denser card than the default.
