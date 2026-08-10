@@ -25,13 +25,15 @@
 # contrast (reported live 2026-08-09: "the tab name text is basically too
 # faint to read compared to the well-contrasted space name"). $task/$status
 # are unstyled custom tokens and get the same dim default. All three are
-# forced bright + non-dim below; colors are tokyo-night's own palette
-# (#c0caf5 foreground, #7dcfff accent) — swap them if you run a different
-# theme, `dim = false` is the part that actually matters.
+# forced bright + non-dim below, and "tab" is given its own accent color
+# (purple) rather than matching "workspace"'s foreground, so the two are
+# still visually distinct at a glance — colors are tokyo-night's own
+# palette (#c0caf5 foreground, #bb9af7 purple, #7dcfff cyan) — swap them if
+# you run a different theme, `dim = false` is the part that actually matters.
 [ui.sidebar.agents]
 row_gap = 0
 rows = [
-  ["state_icon", "workspace", { token = "tab", fg = "#c0caf5", bold = true, dim = false }],
+  ["state_icon", "workspace", { token = "tab", fg = "#bb9af7", bold = true, dim = false }],
   [{ token = "$task", fg = "#7dcfff", bold = true, dim = false }],
   [{ token = "$status", fg = "#c0caf5", bold = false, dim = false }],
 ]
