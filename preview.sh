@@ -154,11 +154,53 @@ browser_state_dir() {
 }
 
 browser_cli() {                         # run the plugin CLI against the REAL daemon
+  local view_id=""
+  if [ "${1:-}" = "--view-id" ]; then
+    view_id="${2:-}"
+    [ -n "$view_id" ] || return 1
+    shift 2
+  fi
   local root state
   root="$(browser_root)" || return 1
   state="$(browser_state_dir)" || return 1
   ( cd "$root" && HERDR_PLUGIN_ID="$BROWSER_PLUGIN" HERDR_PLUGIN_ROOT="$root" \
-      HERDR_PLUGIN_STATE_DIR="$state" bun run src/cli.ts "$@" )
+      HERDR_PLUGIN_STATE_DIR="$state" HERDR_BROWSER_VIEW_ID="$view_id" \
+      bun run src/cli.ts "$@" )
+}
+
+# The plugin view id bound to a given pane, or nothing if no view has
+# registered against it yet (see wait_for_pane_view_id — pane-open and view
+# registration are asynchronous; do_url must not navigate before this
+# exists, or the CLI's default view-selection falls back to creating a
+# fresh UNBOUND view — the exact race in
+# docs/2026-08-10-herdr-browser-render-bug.md).
+pane_view_id() {                        # $1 = pane id -> plugin view id, or fail
+  local pane_id="$1"
+  browser_cli views 2>/dev/null | python3 -c '
+import json, sys
+pane_id = sys.argv[1]
+try:
+    views = json.load(sys.stdin).get("views") or []
+except Exception:
+    sys.exit(1)
+for view in views:
+    if view.get("pane_id") == pane_id:
+        print(view.get("view_id") or "")
+        sys.exit(0)
+sys.exit(1)
+' "$pane_id" 2>/dev/null
+}
+
+wait_for_pane_view_id() {               # pane-open and view registration race
+  local pane_id="$1" view_id attempt
+  for attempt in $(seq 1 100); do
+    view_id="$(pane_view_id "$pane_id")" && [ -n "$view_id" ] && {
+      printf '%s\n' "$view_id"
+      return 0
+    }
+    sleep 0.05
+  done
+  return 1
 }
 
 # `cli.ts`'s daemon-state file (paths.ts: daemonStateFile) — a JSON blob with
@@ -260,16 +302,44 @@ do_url() {
   local pane_id; pane_id="$(browser_pane_id)"
   [ -n "$pane_id" ] || die "browser pane did not open"
 
-  browser_cli open "$url" >/dev/null 2>&1
+  # Wait for the viewer to heartbeat a pane-backed view into existence
+  # before navigating at all — pane-open and view registration are
+  # asynchronous, and navigating an implicit/default view before the real
+  # one exists is exactly the startup race this fix closes (see
+  # docs/2026-08-10-herdr-browser-render-bug.md).
+  local view_id; view_id="$(wait_for_pane_view_id "$pane_id")" || {
+    note "browser pane opened, but its plugin view did not become ready"
+    return 1
+  }
+
+  # Target that view explicitly and require the navigation to actually
+  # succeed — an ambiguous/ignored CLI error used to be silently discarded.
+  local opened expected
+  opened="$(browser_cli --view-id "$view_id" open "$url")" || {
+    note "navigation failed for pane $pane_id: $opened"
+    return 1
+  }
+  expected="$(printf '%s' "$opened" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("url") or "")
+except Exception:
+    pass
+' 2>/dev/null)"
+  [ -n "$expected" ] || {
+    note "navigation returned no final URL for pane $pane_id"
+    return 1
+  }
 
   # Confirm against OUR pane's own view rather than trusting the exit status
-  # or just any view in the list. `open` returns ok/navigated even when it
-  # drove a different browser entirely, and `views` can include a view with no
-  # pane (or someone else's pane) — see pane_view_url for why.
+  # alone — and now against the SPECIFIC url the CLI just confirmed it
+  # navigated to, not merely "some nonempty url" (about:blank passed that
+  # check before). `views` can include a view with no pane (or someone
+  # else's pane) — see pane_view_url for why.
   local landed; landed="$(pane_view_url "$pane_id")"
-  if [ -z "$landed" ]; then
-    note "navigation reported success but no view is registered against pane $pane_id —"
-    note "the page is not on screen (the CLI may have driven a different daemon)."
+  if [ "$landed" != "$expected" ]; then
+    note "navigation returned $expected, but pane $pane_id is showing ${landed:-<nothing>}"
+    note "the page is not on screen"
     note "Check: herdr plugin pane open ... browser"
     return 1
   fi
@@ -278,7 +348,7 @@ do_url() {
   # its own Chrome profile with no logins, so anything behind a session — a
   # private claude.ai artifact, a dashboard, an authed preview — returns a
   # not-found/sign-in page at exactly the URL you asked for. Read the text back.
-  local body; body="$(browser_cli text 2>/dev/null | python3 -c '
+  local body; body="$(browser_cli --view-id "$view_id" text 2>/dev/null | python3 -c '
 import json, sys
 try:
     print((json.load(sys.stdin).get("text") or "")[:400])
