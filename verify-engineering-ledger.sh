@@ -34,6 +34,9 @@ ledger_gh_prs_json() {
 ledger_gh_runs_json() {
   printf '%s\n' '[{"databaseId":9,"status":"completed","conclusion":"success","createdAt":"2026-08-08T03:00:00Z","updatedAt":"2026-08-08T04:00:00Z","headBranch":"client-jane@example.com"}]'
 }
+# Never let a real op/Neon credential on this machine leak a test row into
+# the live kb.engineering_activity table: force "unavailable" unconditionally.
+ledger_neon_dsn() { return 1; }
 
 printf '== sanitization + six-source digest ==\n'
 export ENGINEERING_LEDGER_DIR="$WORK/sanitized"
@@ -42,6 +45,10 @@ digest="$ENGINEERING_LEDGER_DIR/2026-08-08.jsonl"
 [ -f "$digest" ] && ok 'digest file created' || bad 'digest file missing'
 [ "$(wc -l < "$digest" | tr -d ' ')" = 6 ] && ok 'one JSON line per source (six total)' || bad 'wrong source line count'
 jq -e . "$digest" >/dev/null 2>&1 && ok 'every digest line is valid JSON' || bad 'invalid JSONL'
+# Snapshot the pristine one-cycle digest now, before later sections append
+# more cycles onto $digest — the row-shaping tests below need exactly six.
+fresh_cycle_file="$WORK/fresh-cycle.jsonl"
+cp "$digest" "$fresh_cycle_file"
 
 if rg -qi 'jane|xoxb|hunter2|/Users/alice|client payload|headBranch' "$digest"; then
   bad 'raw secret/PII/request-like fixture content leaked'
@@ -86,6 +93,39 @@ elif [ -d "$foreign_lock" ] && [ -f "$foreign_lock/pid" ]; then
 else
   bad 'foreign lock was altered despite ownership refusal'
 fi
+
+printf '== kb.engineering_activity row shaping ==\n'
+# This harness may itself be running inside a herdr-spawned task (ambient
+# HERDR_RUN_ID/HERDR_TASK_ID) — unset for the no-override baseline case so
+# that ambient values don't leak into the assertion below.
+activity_rows=$(unset HERDR_RUN_ID HERDR_TASK_ID; ledger_activity_rows_json "$fresh_cycle_file" test-poll-1)
+[ "$(printf '%s' "$activity_rows" | jq 'length')" = 6 ] \
+  && ok 'row-shaping produces one activity row per source record' || bad 'row-shaping produced wrong row count'
+printf '%s' "$activity_rows" | jq -e 'all(.[]; .run_id == "test-poll-1" and .task_id == null and (.repo | length) > 0 and (.event_type | endswith("_digest")) and (.summary | length) > 0 and .payload.schema == 1 and (.observed_at | length) > 0)' >/dev/null 2>&1 \
+  && ok 'every activity row has the required kb.engineering_activity shape' || bad 'activity row missing a required field or malformed'
+[ "$(printf '%s' "$activity_rows" | jq -r '.[] | select(.event_type == "kb_digest") | .repo')" = knowledge-base ] \
+  && ok 'kb source maps to repo=knowledge-base' || bad 'kb source repo mapping wrong'
+if rg -qi 'jane|xoxb|hunter2|/Users/alice|client payload|headBranch' <<<"$activity_rows"; then
+  bad 'activity row payload leaked raw fixture content'
+else
+  ok 'activity row payload stays sanitized (same content as the JSONL digest)'
+fi
+HERDR_RUN_ID=hrun-1 HERDR_TASK_ID=htask-1 \
+  activity_rows_with_ids=$(ledger_activity_rows_json "$fresh_cycle_file" test-poll-1)
+[ "$(printf '%s' "$activity_rows_with_ids" | jq -r '.[0].run_id')" = hrun-1 ] \
+  && ok 'HERDR_RUN_ID overrides the poll_id fallback when set' || bad 'HERDR_RUN_ID override ignored'
+[ "$(printf '%s' "$activity_rows_with_ids" | jq -r '.[0].task_id')" = htask-1 ] \
+  && ok 'HERDR_TASK_ID populates task_id when set' || bad 'HERDR_TASK_ID not applied'
+
+printf '== Neon activity write fails closed without touching the local JSONL ==\n'
+before_cksum=$(cksum < "$fresh_cycle_file")
+if ledger_write_neon_activity "$fresh_cycle_file" test-poll-1 2>/dev/null; then
+  bad 'Neon activity write succeeded with no DSN available (should be impossible in this harness)'
+else
+  ok 'Neon activity write reports failure when the DSN is unavailable'
+fi
+[ "$(cksum < "$fresh_cycle_file")" = "$before_cksum" ] \
+  && ok 'local JSONL digest untouched by a failed Neon write' || bad 'local JSONL digest was mutated by the Neon write attempt'
 
 printf '== one source fails; others continue ==\n'
 export ENGINEERING_LEDGER_DIR="$WORK/failure-isolation"

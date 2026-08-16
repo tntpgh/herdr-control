@@ -208,6 +208,61 @@ ledger_collect_kb() {
     '
 }
 
+ledger_neon_dsn() {
+  if [ -n "${NEON_CONNECTION_STRING:-}" ]; then
+    printf '%s' "$NEON_CONNECTION_STRING"
+    return 0
+  fi
+  command -v op >/dev/null 2>&1 || return 1
+  op read 'op://secrets/neon/credential' 2>/dev/null
+}
+
+# Reshapes the six already-sanitized cycle records (ledger_collect_*'s output)
+# into kb.engineering_activity rows. No new PII exposure: payload is the same
+# sanitized record already destined for the local JSONL.
+ledger_activity_rows_json() {
+  local cycle_file="$1" poll_id="$2"
+  local run_id="${HERDR_RUN_ID:-$poll_id}" task_id="${HERDR_TASK_ID:-}"
+  jq -cs \
+    --arg run_id "$run_id" --arg task_id "$task_id" '
+      map(
+        (if .source == "kb" then "knowledge-base" else .source_id end) as $repo
+        | (.source + "_digest") as $event_type
+        | (
+            if .source == "sentry" then "sentry/" + .source_id + "=" + .status + ":" + ((.issue_count // 0) | tostring)
+            elif .source == "kb" then "kb=" + .status + ":" + ((.failed_steps_count // 0) | tostring)
+            else "github/" + .source_id + "=" + .status + ":prs" + ((.pull_requests.sample_size // 0) | tostring) + "/ci" + ((.ci_runs.sample_size // 0) | tostring)
+            end
+          ) as $summary
+        | {
+            run_id: $run_id,
+            task_id: (if ($task_id | length) > 0 then $task_id else null end),
+            repo: $repo,
+            event_type: $event_type,
+            summary: $summary,
+            payload: .,
+            observed_at: .observed_at
+          }
+      )
+    ' "$cycle_file"
+}
+
+# Best-effort: promotes this cycle's six records to kb.engineering_activity.
+# Never fails the poll — the local JSONL append (already done by the caller)
+# is the durability guarantee; this is additive. Missing DSN, missing `op`,
+# network hiccup, or the table not existing yet all fail the same way here.
+ledger_write_neon_activity() {
+  local cycle_file="$1" poll_id="$2" python dsn kb_repo
+  kb_repo="${ENGINEERING_LEDGER_KB_REPO:-$HOME/Code/knowledge-base}"
+  python="${ENGINEERING_LEDGER_KB_PYTHON:-$kb_repo/.venv/bin/python3}"
+  [ -x "$python" ] || python=$(command -v python3 2>/dev/null) || return 1
+  dsn=$(ledger_neon_dsn) || return 1
+  [ -n "$dsn" ] || return 1
+
+  ledger_activity_rows_json "$cycle_file" "$poll_id" \
+    | NEON_CONNECTION_STRING="$dsn" "$python" "$_engineering_ledger_lib_dir/engineering-ledger-neon-write.py" >/dev/null 2>&1
+}
+
 ledger_gh_prs_json() {
   local repo_path="$1"
   command -v gh >/dev/null 2>&1 || return 1
@@ -436,5 +491,13 @@ engineering_ledger_poll() {
   ledger_lock_release "$lock_dir"
   lock_held=0
   lock_dir=''
+
+  # Neon write happens outside the local-file lock (independent resource; a
+  # slow/hung connection here must not block other pollers waiting on it) and
+  # strictly after the local append, so a Neon failure never costs the record
+  # its JSONL durability — see ledger_write_neon_activity.
+  ledger_write_neon_activity "$cycle_file" "$poll_id" || \
+    printf 'engineering-ledger: kb.engineering_activity write unavailable this cycle; local JSONL is authoritative\n' >&2
+
   ledger_summary "$cycle_file" "$poll_id" "${output_file##*/}" "$new_signatures"
 }

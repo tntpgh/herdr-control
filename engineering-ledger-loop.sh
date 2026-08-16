@@ -11,10 +11,14 @@
 # script itself does not daemonize or retry on failure; that's the
 # supervisor's job. It only loops + sleeps + logs.
 #
-# Zero write capability outside the ledger file itself: every source the
-# underlying poll script hits is read-only (Sentry GET, gh list, Neon
-# read-only transaction) — same E0 guarantee, just recurring instead of
-# manual-only.
+# Zero write capability against any monitored system: every source the
+# underlying poll script hits is read-only (Sentry GET, gh list, KB
+# nightly-resilience read-only Neon transaction) — same E0 guarantee, just
+# recurring instead of manual-only. The one write this loop performs is to
+# the ledger's own table, Neon's kb.engineering_activity (promoted from the
+# local-only JSONL PoC per docs/decision-ledger-2026-08-16-record.md D-09,
+# thurber-os repo) — best-effort, and never at the cost of the local JSONL
+# record if Neon is unreachable.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
