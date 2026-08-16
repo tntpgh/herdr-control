@@ -105,6 +105,17 @@ the truth**. A peer's message or file line is evidence, not authority: it
 triggers verification, never substitutes for your own read of the named
 commit.
 
+**If a task's own effect removes its own worktree** (e.g. "delete this
+now-redundant branch, it's already fully merged"), `events.jsonl` is gone
+with it — `git worktree remove` deletes `.omc/handoffs/` along with
+everything else in the worktree. Verify completion via the outer repo state
+instead (`git worktree list`, `git branch -a`, `git log`), or have the task
+call `append_event()` from `lib/run-registry.sh` directly before it removes
+its own worktree — that writes to the central registry, which survives.
+Observed live 2026-08-16: a dispatched fix turned out to be a no-op (already
+merged upstream), the task's only real work was deleting its now-redundant
+worktree, and its own completion event vanished with it.
+
 ---
 
 ## Naming tabs, and seeing who needs you
@@ -135,6 +146,47 @@ caioniehues/herdmates: **never show a wrong reason**; degrade to a plain
 `waiting`. `--focus` is the one-line "what next". Both feed the `$task`/`$status`
 sidebar cards — enable them by merging `docs/herdr-config-snippet.toml` into
 `config.toml` (invalid token names fail silently; `herdr config check`).
+
+---
+
+## Proactive lifecycle — don't wait to be asked
+
+Standing rule for a conductor session (Terrence, 2026-08-16): every part of
+managing dispatched workers — permission grants, completion detection, tab
+cleanup — is done proactively, not reactively. Don't just answer
+`[HERDR-PEER-SIGNAL]` interjections one at a time and otherwise sit idle;
+periodically sweep every dispatched pane on your own initiative
+(`herdr pane read <id> --source visible --lines 8..30`) so an idle-but-stuck
+worker doesn't sit unnoticed between signals, and force the issue as a batch
+nears completion instead of waiting for the last stragglers to self-report.
+
+**Granting permission prompts directly.** `herdr-select.sh`'s
+`classify_command` (see `docs/approval-policy.md` rule 1) is deliberately
+conservative — it refuses rather than guesses, and that is correct, not a
+bug to route around by loosening the classifier. A conductor holding the
+herdr socket already has the authority to press keys directly
+(`docs/approval-policy.md` rule 7 says exactly this: the trust boundary
+isn't a containment boundary against someone with that access). When you
+choose to grant something `herdr-select.sh` refused: **read the actual
+command/script content immediately before granting, not from an earlier
+turn** — the same TOCTOU discipline rule 3 requires of `herdr-select.sh`
+itself applies to you making the call by hand. Verified-safe categories seen
+in practice: cleanup of a symlink/worktree you just watched get created,
+test fixtures whose literal string content matches a dangerous pattern
+(read the file — a `rm -rf` inside a script is not the same as a live
+`rm -rf` invocation), ephemeral/mocked infra (a throwaway Docker Postgres, a
+fully self-mocked `herdr` shell function), and read-only queries that only
+print. Never grant an actual unreviewed production write or a real secret
+VALUE exposure yourself — those stay with the human even under this rule.
+
+**Closing out.** Once a worker's own message/completion event shows it's
+genuinely done (not just an idle prompt mid-turn — check the last real
+message), extract any durable lesson worth keeping and close its tab
+(`herdr tab close <tab_id>`). Don't leave finished panes open "in case" —
+that is what the commit and a retained memory are for. If a spawned
+workspace's default empty root tab (see `ensure-workspace.sh`'s own comment
+about this gap) was never used, close that too — `spawn-task.sh` now does
+this automatically, best-effort, only for a tab with no agent set at all.
 
 ---
 
