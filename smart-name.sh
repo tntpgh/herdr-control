@@ -181,13 +181,12 @@ Return ONLY one JSON object, no prose: {"tab":"Review Auth Changes","reason":"sh
 # settings/skills/rules, expose no tools/MCP/extensions, run from a neutral
 # empty dir.
 #
-# SMART_NAME_BACKEND (config.sh) picks which CLI: `auto` (default) prefers
-# claude when present — an existing Claude Code install's naming behaviour,
-# cost, and auth path stay EXACTLY as they were before omp support was
-# added, even once omp is also on PATH — and only falls back to omp when
-# claude isn't installed. Set SMART_NAME_BACKEND=omp explicitly to prefer
-# omp's cleaner isolation flags (`--no-extensions --no-skills --no-rules
-# --no-session`, vs. claude -p's `--setting-sources ""`) instead. Verified
+# SMART_NAME_BACKEND (config.sh) picks which CLI: default flipped to `omp`
+# 2026-08-16 — nothing spawned from this toolchain should launch a bare
+# claude/codex process anymore. `auto` (if ever explicitly requested) now
+# prefers omp too, falling back to claude only when omp isn't installed —
+# the reverse of this file's pre-2026-08-16 preference order. Set
+# SMART_NAME_BACKEND=claude explicitly to force the old behaviour. Verified
 # 2026-07-31: `omp -p` takes the prompt as a positional argument, not stdin
 # like `claude -p`.
 ai_name() {
@@ -200,8 +199,8 @@ ai_name() {
     claude) command -v claude >/dev/null 2>&1 || return 1 ;;
     omp)    command -v omp    >/dev/null 2>&1 || return 1 ;;
     *)
-      if command -v claude >/dev/null 2>&1; then backend=claude
-      elif command -v omp >/dev/null 2>&1; then backend=omp
+      if command -v omp >/dev/null 2>&1; then backend=omp
+      elif command -v claude >/dev/null 2>&1; then backend=claude
       else return 1
       fi ;;
   esac
