@@ -18,6 +18,14 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/command-policy.sh"
 
+# A throwaway registry for the o2-readonly-flag cases below (classify_command's
+# optional [run_id] [task_id] args) — never touches ~/.local/state/herdr.
+export HERDR_RUN_STATE_DIR="$(mktemp -d)/runs"
+trap 'rm -rf "$(dirname "$HERDR_RUN_STATE_DIR")"' EXIT
+. "$here/lib/run-registry.sh"
+register_task roRun roTask w c cp cb pane-ro birth-ro /repo /wt "explore:ro" 1 >/dev/null 2>&1
+register_task rwRun rwTask w c cp cb pane-rw birth-rw /repo /wt "impl:rw" >/dev/null 2>&1
+
 total=0
 failed=0
 
@@ -207,6 +215,49 @@ echo "== malformed operator verdict is skipped, never silently applied =="
 export HERDR_POLICY_EXTRA_RULES="$(printf 'block\tnpm publish\ttypo verdict must not escalate')"
 check "unrecognized verdict token is ignored (npm publish stays allow)" "npm publish" allow
 unset HERDR_POLICY_EXTRA_RULES
+
+echo
+echo "== o2-readonly-flag: classify_command <cmd> [run_id] [task_id] =="
+# check_ro <label> <cmd> <want-verdict> <want-labeled(0|1)>
+check_ro() {
+  local label="$1" cmd="$2" want="$3" want_labeled="$4" run_id="$5" task_id="$6" got reason labeled
+  total=$((total + 1))
+  got="$(classify_command "$cmd" "$run_id" "$task_id")"
+  reason="$(classify_reason)"
+  case "$reason" in "read-only task auto-pass:"*) labeled=1 ;; *) labeled=0 ;; esac
+  if [ "$got" = "$want" ] && [ "$labeled" = "$want_labeled" ]; then
+    printf 'PASS  %-52s => %-9s labeled=%s\n' "$label" "$got" "$labeled"
+  else
+    printf 'FAIL  %-52s => %-9s labeled=%s (want %s labeled=%s; reason=%s)\n' \
+      "$label" "$got" "$labeled" "$want" "$want_labeled" "$reason"
+    failed=$((failed + 1))
+  fi
+}
+
+check_ro "genuinely read-only command, read-only task -> labeled auto-pass" \
+  "cat /etc/hosts" allow 1 roRun roTask
+check_ro "git status, read-only task -> labeled auto-pass" \
+  "git status" allow 1 roRun roTask
+check_ro "find without -delete/-exec, read-only task -> labeled auto-pass" \
+  "find . -name '*.txt'" allow 1 roRun roTask
+check_ro "same command, NON-read-only task -> allow but NOT labeled" \
+  "cat /etc/hosts" allow 0 rwRun rwTask
+check_ro "same command, no task identity at all -> allow but NOT labeled" \
+  "cat /etc/hosts" allow 0 "" ""
+check_ro "recursive rm on a read-only task -> STILL escalate, never labeled" \
+  "rm -rf /tmp/x" escalate 0 roRun roTask
+check_ro "git push --force on a read-only task -> STILL escalate, never labeled" \
+  "git push --force origin main" escalate 0 roRun roTask
+check_ro "credential read on a read-only task -> STILL escalate, never labeled" \
+  "cat ~/.ssh/id_ed25519" escalate 0 roRun roTask
+check_ro "find -delete on a read-only task -> not labeled (find alone isn't read-only)" \
+  "find / -delete" escalate 0 roRun roTask
+check_ro "bare rm (no -r), read-only task -> allow but NOT labeled (blacklisted verb)" \
+  "rm file.txt" allow 0 roRun roTask
+check_ro "npm install, read-only task -> allow but NOT labeled" \
+  "npm install left-pad" allow 0 roRun roTask
+check_ro "unregistered task id -> allow but NOT labeled" \
+  "cat /etc/hosts" allow 0 roRun nonexistentTask
 
 echo
 echo "-----------------------------------------------------------------"

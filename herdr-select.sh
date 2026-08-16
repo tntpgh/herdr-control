@@ -203,8 +203,19 @@ require_pane_birth_match "$pane" || exit 7
 # answering their own agent's prompt is the authority — the point of recording
 # the verdict for them is attribution, not permission. For automation the
 # verdict is a gate.
+#
+# Looked up here (moved ahead of the approval-lifecycle block below, which
+# used to be the only consumer) so classify_command can pass it through to
+# its read-only auto-pass check (o2-readonly-flag) — "the current task" for
+# THIS prompt is the task that owns the worker pane being approved, i.e.
+# task_for_pane's answer, not the conductor's own HERDR_TASK_ID (the
+# conductor approving on a worker's behalf is not itself that task).
+_own="$(task_for_pane "$pane" 2>/dev/null)"
+_run=$(printf '%s' "$_own" | jq -r '.run_id // empty' 2>/dev/null)
+_task=$(printf '%s' "$_own" | jq -r '.task_id // empty' 2>/dev/null)
+
 cmd_text="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
-policy_verdict="$(classify_command "$cmd_text")"
+policy_verdict="$(classify_command "$cmd_text" "$_run" "$_task")"
 policy_reason="$(classify_reason)"
 
 if [ "$authority" = peer ]; then
@@ -263,9 +274,8 @@ jq -nc --arg pane "$pane" --arg choice "$choice" --arg label "$label" --arg mech
 # imply it was delivered." Three separate writes, so "we decided and typed
 # nothing" can never again read the same as "the agent received it".
 approval_id="$(gen_id appr)"
-_own="$(task_for_pane "$pane" 2>/dev/null)"
-_run=$(printf '%s' "$_own" | jq -r '.run_id // empty' 2>/dev/null)
-_task=$(printf '%s' "$_own" | jq -r '.task_id // empty' 2>/dev/null)
+# _own/_run/_task were already looked up above for classify_command's
+# read-only auto-pass check — same pane, same task, no need to re-query.
 # One line, bounded: this is an audit field, not a transcript.
 _cmd_record=$(printf '%s' "$cmd_text" | tr '\n' ' ' | cut -c1-500)
 approval_decided "$approval_id" "$pane" "$current_prompt_id" "$choice" "$label" \

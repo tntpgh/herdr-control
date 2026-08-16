@@ -99,7 +99,7 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '3\n'; }
+_registry_schema_version() { printf '4\n'; }
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
@@ -155,6 +155,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   repo                 TEXT NOT NULL DEFAULT '',
   worktree             TEXT NOT NULL DEFAULT '',
   label                TEXT NOT NULL DEFAULT '',
+  -- Set by spawn-task.sh --read-only: this task's worker is only meant to
+  -- inspect, never mutate. lib/command-policy.sh reads this (via
+  -- task_is_read_only below) to auto-pass genuinely read-only commands
+  -- (grep/cat/ls/find/git log/show/diff/status and similar) for that task's
+  -- pane without a fresh per-command judgment call — see docs/decision-
+  -- ledger-2026-08-16-record.md D-11 (thurber-os) and this repo's TASK.md.
+  -- Never widens what a write/mutating command may do: command-policy.sh's
+  -- floor rules are evaluated unchanged regardless of this flag.
+  read_only            INTEGER NOT NULL DEFAULT 0,
   state                TEXT NOT NULL,
   created_at           TEXT NOT NULL,
   updated_at           TEXT NOT NULL
@@ -223,6 +232,7 @@ INSERT OR IGNORE INTO schema_meta(key, value)
 
   _HERDR_REGISTRY_READY=1
   _migrate_schema_v3
+  _migrate_schema_v4
   _migrate_legacy_files
   return 0
 }
@@ -242,6 +252,21 @@ _migrate_schema_v3() {
     _sql "ALTER TABLE tasks ADD COLUMN agent_session TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
   fi
   _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3');" >/dev/null 2>&1
+}
+
+# ---- schema v3 -> v4: add tasks.read_only -----------------------------------
+# Same idempotent shape as _migrate_schema_v3 above, one column later.
+# Backs spawn-task.sh's --read-only flag (see the tasks table comment in
+# registry_init) — a pre-existing database just gets the column ALTERed in,
+# defaulting every already-registered task to 0 (not read-only), which is the
+# correct, non-widening default for a task nobody explicitly marked.
+_migrate_schema_v4() {
+  local has_col
+  has_col=$(_sql "SELECT 1 FROM pragma_table_info('tasks') WHERE name='read_only';" 2>/dev/null)
+  if [ -z "$has_col" ]; then
+    _sql "ALTER TABLE tasks ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0;" >/dev/null 2>&1
+  fi
+  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4');" >/dev/null 2>&1
 }
 
 # ---- one-time import of the pre-SQLite file layout --------------------------
@@ -334,11 +359,12 @@ gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand
 # names whether it asked for one task or all of them.
 _task_json_select() {
   printf "%s" "SELECT json_object(
-    'schema', 3, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
+    'schema', 4, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
     'conductor_id', conductor_id, 'conductor_pane_id', conductor_pane_id,
     'conductor_pane_birth', conductor_pane_birth, 'pane_id', pane_id,
     'pane_birth', pane_birth, 'agent_session', agent_session, 'repo', repo,
-    'worktree', worktree, 'label', label,
+    'worktree', worktree, 'label', label, 'read_only',
+    json(CASE WHEN read_only=1 THEN 'true' ELSE 'false' END),
     'state', state, 'created_at', created_at, 'updated_at', updated_at) FROM tasks"
 }
 
@@ -351,6 +377,12 @@ register_task() {
   local run_id="$1" task_id="$2" worker_id="$3" conductor_id="$4" \
         conductor_pane_id="$5" conductor_pane_birth="$6" pane_id="$7" pane_birth="$8" \
         repo="$9" worktree="${10}" label="${11}"
+  # read_only (12th, optional): "1"/"true" mark the task; anything else
+  # (including omitted, the default for every pre-existing caller) is 0. A
+  # trailing optional param rather than a required one so this addition
+  # cannot break a caller written before --read-only existed.
+  local read_only=0
+  case "${12:-0}" in 1|true|TRUE|True) read_only=1 ;; esac
   registry_init || return 1
   local at; at="$(_now_iso)"
 
@@ -359,10 +391,10 @@ register_task() {
   # tasks table comment in registry_init.
   if _sql "INSERT INTO tasks
       (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth,
-       pane_id, pane_birth, repo, worktree, label, state, created_at, updated_at)
+       pane_id, pane_birth, repo, worktree, label, read_only, state, created_at, updated_at)
       VALUES ($(_sq "$task_id"), $(_sq "$run_id"), $(_sq "$worker_id"), $(_sq "$conductor_id"),
         $(_sq "$conductor_pane_id"), $(_sq "$conductor_pane_birth"), $(_sq "$pane_id"),
-        $(_sq "$pane_birth"), $(_sq "$repo"), $(_sq "$worktree"), $(_sq "$label"),
+        $(_sq "$pane_birth"), $(_sq "$repo"), $(_sq "$worktree"), $(_sq "$label"), $read_only,
         'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
     append_event "$run_id" "$task_id" "registered" \
       "$(jq -nc --arg p "$pane_id" --arg l "$label" '{pane_id:$p, label:$l}')" >/dev/null 2>&1
@@ -529,6 +561,20 @@ append_event() {
 read_task() {                           # run_id task_id -> json (empty if absent)
   registry_init || return 1
   _sql "$(_task_json_select) WHERE run_id=$(_sq "$1") AND task_id=$(_sq "$2");" 2>/dev/null
+}
+
+# task_is_read_only <run_id> <task_id> -> "1" or "0"
+#
+# Cheap boolean lookup for lib/command-policy.sh's read-only auto-pass check
+# — a raw column read rather than round-tripping through read_task's full
+# JSON, since this is called on the hot path of classifying a prompt. A
+# nonexistent task reads as "0" (not read-only): the safe, non-widening
+# default for anything this registry has no record of.
+task_is_read_only() {
+  registry_init || { printf '0\n'; return 1; }
+  local v
+  v=$(_sql "SELECT read_only FROM tasks WHERE run_id=$(_sq "$1") AND task_id=$(_sq "$2");" 2>/dev/null)
+  case "$v" in 1) printf '1\n' ;; *) printf '0\n' ;; esac
 }
 
 # Find the most-recently-updated registered task whose WORKER pane is this

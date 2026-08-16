@@ -27,6 +27,14 @@ PANE="w1:p1"
 BIRTH="term-abc-123"
 export PANE BIRTH
 
+# A second pane/task, registered read_only below, for the o2-readonly-flag
+# end-to-end case — kept separate from PANE/task1 so registering it cannot
+# perturb task_for_pane's "most recently updated task for this pane" answer
+# for any of the PANE-based tests above or below it.
+PANE2="w1:p2"
+BIRTH2="term-ro-456"
+export PANE2 BIRTH2
+
 # ---- the stub -------------------------------------------------------------
 # Implements exactly the four herdr calls this path makes:
 #   pane process-info --pane <id>   lib/pane-guard.sh: pane_is_agent
@@ -38,7 +46,8 @@ herdr() {
     "pane process-info")
       printf '{"result":{"process_info":{"foreground_processes":[{"name":"claude","cmdline":"claude --model sonnet"}]}}}\n' ;;
     "pane list")
-      printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s","cwd":"/tmp"}]}}\n' "$PANE" "$BIRTH" ;;
+      printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s","cwd":"/tmp"},{"pane_id":"%s","terminal_id":"%s","cwd":"/tmp"}]}}\n' \
+        "$PANE" "$BIRTH" "$PANE2" "$BIRTH2" ;;
     "pane read")
       cat "$SCREEN" ;;
     "pane send-keys")
@@ -70,8 +79,10 @@ keys_pressed() { wc -l < "$KEYS" | tr -d ' '; }
 
 . "$here/lib/run-registry.sh"
 register_task run1 task1 w1 c1 "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt "impl:test" >/dev/null 2>&1
+register_task runRO taskRO w1 c1 "w9:p9" "cond-birth" "$PANE2" "$BIRTH2" /repo /wt "explore:ro" 1 >/dev/null 2>&1
 
 sel() { ( bash "$here/herdr-select.sh" "$PANE" "$@" >"$WORK/out.txt" 2>"$WORK/err.txt" ); }
+sel_ro() { ( bash "$here/herdr-select.sh" "$PANE2" "$@" >"$WORK/out.txt" 2>"$WORK/err.txt" ); }
 
 q_appr() {
   sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
@@ -216,6 +227,31 @@ reset_keys
   bash "$here/herdr-select.sh" "$PANE" 1 --authority peer >/dev/null 2>&1 ); rc=$?
 [ "$rc" -eq 8 ] && ok "operator rule escalates it" || bad "exit $rc (expected 8)"
 [ "$(keys_pressed)" = "0" ] && ok "no key pressed under the operator rule" || bad "keys pressed=$(keys_pressed)"
+
+printf '== o2-readonly-flag: a read-only task auto-passes a genuinely read-only command ==\n'
+set_screen "cat /etc/hosts"; reset_keys
+before_ro=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE task_id='taskRO' AND type='read_only_auto_pass';" 2>/dev/null)
+sel_ro 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && ok "exit 0 — genuinely read-only command auto-passes" || bad "exit $rc (expected 0); stderr: $(cat "$WORK/err.txt")"
+[ "$(keys_pressed)" = "1" ] && ok "key pressed" || bad "keys pressed=$(keys_pressed)"
+[ "$(q_appr policy_verdict)" = "allow" ] && ok "verdict recorded allow" || bad "verdict=$(q_appr policy_verdict)"
+after_ro=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE task_id='taskRO' AND type='read_only_auto_pass';" 2>/dev/null)
+[ "$(( after_ro - before_ro ))" = "1" ] && ok "read_only_auto_pass event logged against taskRO" || bad "read_only_auto_pass events delta=$(( after_ro - before_ro ))"
+
+printf '== o2-readonly-flag: a write/mutating command on the SAME read-only task still escalates ==\n'
+set_screen "rm -rf /tmp/scratch"; reset_keys
+before_esc=$(count_events approval_escalated)
+before_ro=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE task_id='taskRO' AND type='read_only_auto_pass';" 2>/dev/null)
+sel_ro 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "exit 8 — read_only never widens a write command's verdict" || bad "exit $rc (expected 8)"
+[ "$(keys_pressed)" = "0" ] && ok "no key pressed" || bad "keys pressed=$(keys_pressed)"
+[ "$(( $(count_events approval_escalated) - before_esc ))" = "1" ] && ok "approval_escalated event recorded" || bad "escalation not recorded"
+after_ro=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE task_id='taskRO' AND type='read_only_auto_pass';" 2>/dev/null)
+[ "$after_ro" = "$before_ro" ] && ok "no read_only_auto_pass event logged for a write command" || bad "unexpected read_only_auto_pass event on rm -rf"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

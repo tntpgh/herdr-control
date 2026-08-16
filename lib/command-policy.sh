@@ -11,9 +11,20 @@
 # a prompt, and every caller must treat anything but a bare "allow" as "do
 # not auto-answer this."
 #
-# Provides: scannable_command <cmd>   -> normalized text on stdout
-#           classify_command <cmd>    -> verdict token (allow|escalate|deny)
-#           classify_reason           -> reason for the last classify_command
+# Provides: scannable_command <cmd>                    -> normalized text on stdout
+#           classify_command <cmd> [run_id] [task_id]  -> verdict token (allow|escalate|deny)
+#           classify_reason                             -> reason for the last classify_command
+#
+# The optional [run_id] [task_id] wire in the o2-readonly-flag feature: when
+# both are given and lib/run-registry.sh's task_is_read_only says that task
+# is marked read_only (spawn-task.sh --read-only), a command that is
+# GENUINELY read-only (grep/cat/ls/find/git log|show|diff|status and
+# similar — see _cp_read_only_command below) gets its "allow" verdict
+# annotated and logged as a formal, auditable auto-pass instead of an
+# unremarkable default. This NEVER changes an escalate/deny verdict into
+# allow — it only labels a command the floor rules already allowed. See
+# _cp_read_only_command's header for the exact, deliberately narrow shape of
+# "genuinely read-only".
 #
 # Ported in spirit from yc-software/qm's src/policy/command-policy.ts — same
 # five floor rules, same normalize-before-match shape — reimplemented here
@@ -207,6 +218,81 @@ _cp_flatten_substitutions() {
   printf '%s' "$text"
 }
 
+# ---- read-only task auto-pass: is this command GENUINELY read-only? -------
+# Deliberately narrow and deliberately separate from the floor-rule table
+# above: this is never consulted to move a verdict OUT of escalate/deny (see
+# classify_command's call site below — it only fires once best_v is already
+# 0/allow), so a command that trips any floor or operator rule — including
+# the credential-read rule, so `cat ~/.ssh/id_ed25519` still escalates even
+# under a read-only task — is completely unaffected by this function. Its
+# only job is deciding whether an already-"allow" command is safe to label
+# and log as a formal read-only auto-pass, per spawn-task.sh --read-only.
+#
+# NOT a per-segment parse of "the" command: lib/prompt-parse.sh's
+# prompt_command_text (classify_command's usual raw input, via herdr-
+# select.sh) deliberately returns the WHOLE visible prompt region — menu
+# header, the command, the question, and the numbered Yes/No options — not
+# an isolated command string; see that function's own header comment for
+# why a precise extraction is the wrong design here too. A strict "every
+# line must independently be a safe verb" check would therefore never fire
+# on a real capture (a "Do you want to proceed?" / "2. No" line never looks
+# like grep/cat/ls), defeating the whole feature. So, same substring-scan
+# philosophy as the floor rules above: a BLACKLIST of common mutation verbs
+# and redirects is checked ANYWHERE in the text (catches a mutating verb
+# hiding in a chain or in the noise around the real command, and covers gaps
+# the floor rules don't — a bare `rm file`, `mkdir`, `npm install`, a
+# non-force `git push`, `>` redirection), and only once that comes back
+# clean does a POSITIVE match against the curated safe-verb allowlist (the
+# "grep, cat, ls, find, git log/show/diff/status, and similar" set the
+# read-only flag was scoped to) get to label the command. Both directions
+# fail closed: an unmatched command is simply never labeled (no verdict
+# change either way — see the best_v==0 gate at the call site), so erring
+# broad on the blacklist or narrow on the allowlist only ever costs an
+# unlabeled audit entry, never a wrongly-widened permission.
+_CP_RO_SAFE_VERBS='(grep|egrep|fgrep|cat|less|more|head|tail|ls|pwd|echo|printf|diff|file|stat|tree|which|type|wc|whoami|date|du|df|ps)'
+_CP_RO_GIT_SAFE_SUBCMDS='(log|show|diff|status|branch|remote|blame|describe|rev-parse|ls-files|shortlog)'
+_CP_RO_MUTATION_BLACKLIST='\b(rm|mv|cp|mkdir|rmdir|touch|chmod|chown|chgrp|kill|dd|mkfs|truncate|tee|sed|npm|yarn|pnpm|pip|pip3|brew|apt|apt-get|docker|cargo|gem|push|commit|merge|rebase|checkout|reset|clean|stash|clone)\b|>>?|\|[[:space:]]*tee\b'
+
+_cp_read_only_command() {               # normalized text -> 0 (yes) / 1 (no)
+  local text="$1" positive=1
+  _cp_match "$_CP_RO_MUTATION_BLACKLIST" "$text" && return 1
+  if _cp_match '\bfind\b' "$text"; then
+    _cp_match '(-delete\b|-exec\b)' "$text" && return 1
+    positive=0
+  fi
+  if _cp_match '\bgit\b' "$text"; then
+    _cp_match "git[[:space:]]+${_CP_RO_GIT_SAFE_SUBCMDS}\b" "$text" || return 1
+    positive=0
+  fi
+  _cp_match "\b${_CP_RO_SAFE_VERBS}\b" "$text" && positive=0
+  [ "$positive" -eq 0 ]
+}
+
+# lib/run-registry.sh's task_is_read_only/append_event, sourced ONLY when a
+# caller actually supplies task identity — command-policy.sh must stay
+# independently sourceable (verify-command-policy.sh sources only this
+# file), so this dependency is optional and pulled in lazily rather than at
+# the top of the file.
+_cp_ensure_run_registry() {
+  declare -F task_is_read_only >/dev/null 2>&1 && return 0
+  local d; d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  [ -f "$d/run-registry.sh" ] && . "$d/run-registry.sh"
+}
+
+# _cp_log_read_only_auto_pass <run_id> <task_id> <raw_command>
+#
+# Best-effort audit write via lib/run-registry.sh's own append_event — no new
+# log file invented, per the task's "reuse whatever logging/audit mechanism
+# ... already has" instruction.
+_cp_log_read_only_auto_pass() {
+  local run_id="$1" task_id="$2" raw="$3"
+  _cp_ensure_run_registry
+  declare -F append_event >/dev/null 2>&1 || return 1
+  local cmd_record; cmd_record="$(printf '%s' "$raw" | tr '\n' ' ' | cut -c1-500)"
+  append_event "$run_id" "$task_id" "read_only_auto_pass" \
+    "$(jq -nc --arg c "$cmd_record" '{command:$c}')" >/dev/null 2>&1
+}
+
 # ---- the floor rule table (ported from qm's command-policy.ts) ------------
 # Applies in EVERY posture — there is no "trusted mode" that skips these.
 # Deny rules are checked ahead of require_approval ones so a command that
@@ -307,6 +393,24 @@ classify_command() {
     _cp_consider 1 "infrastructure scope change"
 
   _cp_apply_operator_rules "$norm"
+
+  # ---- read-only task auto-pass (o2-readonly-flag) --------------------------
+  # Only ever consulted when the floor+operator rules ALREADY landed on
+  # allow (best_v=0) — see _cp_read_only_command's header for why this can
+  # never weaken an escalate/deny verdict for a write/mutating command. Task
+  # identity is optional and caller-supplied (herdr-select.sh passes the
+  # pane's own run_id/task_id via task_for_pane); omitted, this block is a
+  # no-op and classify_command behaves exactly as before.
+  local run_id="${2:-}" task_id="${3:-}"
+  if [ "$_cp_best_v" -eq 0 ] && [ -n "$run_id" ] && [ -n "$task_id" ]; then
+    _cp_ensure_run_registry
+    if declare -F task_is_read_only >/dev/null 2>&1 && \
+       [ "$(task_is_read_only "$run_id" "$task_id" 2>/dev/null)" = "1" ] && \
+       _cp_read_only_command "$norm"; then
+      _cp_best_r="read-only task auto-pass: genuinely read-only command, no per-command approval needed"
+      _cp_log_read_only_auto_pass "$run_id" "$task_id" "$raw"
+    fi
+  fi
 
   case "$_cp_best_v" in
     2) printf 'deny\n' ;;

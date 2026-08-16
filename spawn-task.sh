@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus]
+# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus] [--read-only]
 #
 # Spin a task into its own WORKTREE, opened as a TAB inside the project's own
 # workspace (a "sub-tab", not a separate space), running the right agent at the
@@ -34,7 +34,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/repo-root.sh"
 
 # ---- args ------------------------------------------------------------------
-base=""; dry=0; model_override=""; effort_override=""; foc=--no-focus; positional=()
+base=""; dry=0; model_override=""; effort_override=""; foc=--no-focus; read_only=0; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base="$2"; shift 2 ;;
@@ -42,6 +42,15 @@ while [ $# -gt 0 ]; do
     --effort) effort_override="$2"; shift 2 ;;
     --dry-run|-n) dry=1; shift ;;
     --focus) foc=--focus; shift ;;
+    # Formalizes the ad hoc "clear read-only prompts for this one pane, this
+    # one task" verbal authorization (docs/orchestration-evolution-loop-
+    # charter.md §5 item 1, thurber-os) into a standing, auditable registry
+    # attribute instead of a fresh Conductor judgment call every time. Marks
+    # the task read_only=true in the run registry (lib/run-registry.sh);
+    # lib/command-policy.sh's classify_command then auto-passes genuinely
+    # read-only commands for this task's pane and logs each one. Never
+    # widens what a write/mutating command may do — see command-policy.sh.
+    --read-only) read_only=1; shift ;;
     *) positional+=("$1"); shift ;;
   esac
 done
@@ -129,6 +138,7 @@ if [ "$dry" = 1 ]; then
   echo "              ^ run BACKGROUNDED (run_in_background/async:true) — a blocking"
   echo "                foreground call strands you idle until re-prompted by hand"
   echo "  registry  : run=$run_id task=$task_id conductor_pane=${conductor_pane_id:-<none — not running inside a herdr pane>} conductor_pane_birth=${conductor_pane_birth:-<none>}"
+  echo "  read_only : $([ "$read_only" = 1 ] && echo true || echo false)"
   exit 0
 fi
 
@@ -165,7 +175,7 @@ pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 [ -n "$tab" ] && [ -n "$pane" ] || { echo "spawn-task: tab create failed in $ws" >&2; exit 1; }
 
 register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
-  "$pane" "$pane_birth" "$root" "$wt" "$label"
+  "$pane" "$pane_birth" "$root" "$wt" "$label" "$read_only"
 
 # ---- launch the agent in the tab -------------------------------------------
 # Stamp identity into the worker's own shell so its hooks (agent-hooks/
@@ -222,6 +232,7 @@ printf '            ^ run BACKGROUNDED (run_in_background/async:true) — a bloc
 printf '              foreground call strands you idle until re-prompted by hand\n'
 printf '  worker on completion appends to %s, e.g.:\n' "$events_file"
 printf '    {"event":"%s", ...}\n' "$wake_pattern"
-printf '  registry: %s  (run=%s task=%s)\n' "$(registry_db)" "$run_id" "$task_id"
+printf '  registry: %s  (run=%s task=%s)%s\n' "$(registry_db)" "$run_id" "$task_id" \
+  "$([ "$read_only" = 1 ] && echo '  [read_only=true]')"
 printf '  conductor: %s%s\n' "${conductor_pane_id:-<none — spawned outside a herdr pane, no push wake>}" \
   "${conductor_pane_id:+ (push wake wired if the worker hits an input-needed event)}"

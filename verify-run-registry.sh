@@ -117,8 +117,23 @@ fi
 printf '== schema v3: agent_session column present after migration ==\n'
 check "agent_session column exists" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='agent_session';")" "1"
-check "schema_version is 3" \
-  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "3"
+
+printf '== schema v4: read_only column present after migration ==\n'
+check "read_only column exists" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='read_only';")" "1"
+check "schema_version is 4" \
+  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "4"
+
+printf '== register_task --read-only (o2-readonly-flag) ==\n'
+register_task runRO taskRO w c cp cb paneRO birthRO /repo/ro /wt/ro "ro" 1 \
+  || bad "register_task with read_only=1 failed"
+check "read_only recorded true"  "$(read_task runRO taskRO | jq -r .read_only)" "true"
+check "task_is_read_only reports 1" "$(task_is_read_only runRO taskRO)" "1"
+register_task runRW taskRW w c cp cb paneRW birthRW /repo/rw /wt/rw "rw" \
+  || bad "register_task without read_only (omitted, default) failed"
+check "omitted read_only defaults to false" "$(read_task runRW taskRW | jq -r .read_only)" "false"
+check "task_is_read_only reports 0 for a normal task" "$(task_is_read_only runRW taskRW)" "0"
+check "task_is_read_only reports 0 for an unknown task" "$(task_is_read_only runRW nope)" "0"
 
 printf '== event dedup on an explicit event_id (at-least-once retry safety) ==\n'
 before=$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")
@@ -142,7 +157,7 @@ check "all $n_writers concurrent events landed" "$rows" "$n_writers"
 check "every sequence is unique"                "$uniq_seqs" "$n_writers"
 
 printf '== all_tasks_json ==\n'
-check "one line per task" "$(all_tasks_json | wc -l | tr -d ' ')" "3"
+check "one line per task" "$(all_tasks_json | wc -l | tr -d ' ')" "5"
 all_tasks_json | while IFS= read -r l; do
   printf '%s' "$l" | jq -e . >/dev/null 2>&1 || { printf '  FAIL  non-JSON row\n'; exit 1; }
 done || bad "all_tasks_json emitted a non-JSON row"
