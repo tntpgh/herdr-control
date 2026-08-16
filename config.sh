@@ -5,8 +5,11 @@
 # ============================================================================
 
 # The agent command `spawn-agent.sh` runs when you don't pass one explicitly.
-# e.g. claude · codex · "aider" · a wrapper of your own.
-: "${HERDR_DEFAULT_AGENT:=claude}"
+# e.g. omp · claude · codex · "aider" · a wrapper of your own. Was `claude`;
+# flipped to `omp` 2026-08-16 so nothing spawned defaults to a bare
+# claude/codex process, matching spawn-task.sh's cli_for_agent routing and
+# smart-name.sh's SMART_NAME_BACKEND default.
+: "${HERDR_DEFAULT_AGENT:=omp}"
 
 # Extra dirs prepended to PATH so git/gh/jq/python3 (and your agent) resolve even
 # when herdr runs a script with a minimal environment (e.g. from a keybinding).
@@ -81,10 +84,11 @@
 # no cost, no network). Known processes (Run Tests / Dev Server / View Logs /
 # Remote Shell) are named without a model either way.
 : "${SMART_NAME_AI:=1}"
-# Which summariser CLI to call: auto (claude if present, else omp — preserves
-# pre-existing behaviour on an install that already had claude configured,
-# even after omp is added to PATH later), or force one explicitly.
-: "${SMART_NAME_BACKEND:=auto}"
+# Which summariser CLI to call. Was `auto` (claude if present, else omp);
+# flipped to omp-only 2026-08-16 — nothing spawned from this toolchain
+# should launch a bare claude/codex process anymore, matching spawn-task.sh's
+# own cli_for_agent routing. Force `claude` explicitly if ever needed.
+: "${SMART_NAME_BACKEND:=omp}"
 # The model that proposes labels. Naming is a trivial task — keep it cheap.
 : "${SMART_NAME_MODEL:=haiku}"
 # Hard ceiling on a single model call, seconds. Timed-out calls just abstain.
