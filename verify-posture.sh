@@ -70,10 +70,23 @@ check "codex unmapped (must not invent a flag)" "$(posture_flag_for_agent codex 
 posture_is_enforced_for codex && bad "codex must report posture NOT enforced" || ok "codex reports posture not enforced"
 posture_is_enforced_for omp   && ok "omp reports posture enforced"            || bad "omp should report enforced"
 
+printf '== omp cross-family model lookup (Ctrl+P swap target) ==\n'
+check "claude opus -> codex deep tier"     "$(omp_cross_family_model claude opus)"   "openai-codex/gpt-5.6-sol high"
+check "claude sonnet -> codex std tier"    "$(omp_cross_family_model claude sonnet)" "openai-codex/gpt-5.5 medium"
+check "claude haiku -> codex fast tier"    "$(omp_cross_family_model claude haiku)"  "openai-codex/gpt-5.4-mini low"
+check "codex deep tier -> claude opus"     "$(omp_cross_family_model codex gpt-5.6-sol)"   "opus high"
+check "codex std tier -> claude sonnet"    "$(omp_cross_family_model codex gpt-5.5)"       "sonnet medium"
+check "codex fast tier -> claude haiku"    "$(omp_cross_family_model codex gpt-5.4-mini)"  "haiku low"
+
 printf '== cli_for_agent composes the floor, and cannot be loosened ==\n'
-check "claude at the write floor" \
+printf -- '-- claude/codex both launch under omp now (one approval surface, one\n'
+printf -- '   push-hook, Ctrl+P swaps --models between the two families) --\n'
+check "claude at the write floor launches omp, not the claude binary" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent claude sonnet)" \
-  "claude --model sonnet --permission-mode acceptEdits"
+  "omp --model sonnet --models sonnet,openai-codex/gpt-5.5 --approval-mode write"
+check "codex at the write floor launches omp, not the codex binary" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent codex gpt-5.5:medium)" \
+  "omp --model openai-codex/gpt-5.5 --thinking medium --models openai-codex/gpt-5.5,sonnet --approval-mode write"
 check "omp at the write floor" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet:medium)" \
   "omp --model sonnet --thinking medium --approval-mode write"
@@ -83,25 +96,26 @@ check "a yolo REQUEST is refused at a write floor" \
 check "a strict request IS honoured (tightening)" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet:medium strict)" \
   "omp --model sonnet --thinking medium --approval-mode always-ask"
-check "a strict FLOOR overrides everything" \
+check "a strict FLOOR overrides everything, even routed through omp" \
   "$(HERDR_POSTURE_FLOOR=strict cli_for_agent claude sonnet yolo)" \
-  "claude --model sonnet --permission-mode manual"
-check "codex gets no posture flag appended" \
-  "$(HERDR_POSTURE_FLOOR=write cli_for_agent codex gpt-5.5:medium)" \
-  "codex -m gpt-5.5 -c model_reasoning_effort=medium"
+  "omp --model sonnet --models sonnet,openai-codex/gpt-5.5 --approval-mode always-ask"
+check "omc still launches the real claude binary (it IS its own harness)" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omc sonnet)" \
+  "claude --model sonnet --permission-mode acceptEdits"
 printf '== 2026-08-08 bug: a spec with NO ":effort" must OMIT the flag, never pass the model name as the effort value ==\n'
 # Reported live: spawn-task.sh --model X with no --effort produced
 # `codex -m X -c model_reasoning_effort=X` — codex hard-errors on every call
-# (invalid_enum_value), silently, with no crash and no obvious signal.
-check "codex with no effort in the spec omits the flag entirely" \
+# (invalid_enum_value), silently, with no crash and no obvious signal. Same
+# hazard now applies to omp's --thinking, guarded the same way.
+check "codex with no effort in the spec omits --thinking entirely" \
   "$(cli_for_agent codex gpt-5.6-sol)" \
-  "codex -m gpt-5.6-sol"
+  "omp --model openai-codex/gpt-5.6-sol --models openai-codex/gpt-5.6-sol,opus --approval-mode write"
 check "omp with no effort in the spec omits --thinking entirely" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet)" \
   "omp --model sonnet --approval-mode write"
 check "codex with an effort still works (no regression)" \
   "$(cli_for_agent codex gpt-5.6-sol:high)" \
-  "codex -m gpt-5.6-sol -c model_reasoning_effort=high"
+  "omp --model openai-codex/gpt-5.6-sol --thinking high --models openai-codex/gpt-5.6-sol,opus --approval-mode write"
 if cli_for_agent definitely-not-an-agent x >/dev/null 2>&1; then
   bad "unknown agent should exit 1"
 else
