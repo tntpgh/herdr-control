@@ -2,13 +2,23 @@
 # spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus]
 #
 # Spin a task into its own WORKTREE, opened as a TAB inside the project's own
-# workspace (a "sub-tab", not a separate space), running the right agent at the
-# right model for the job. This is the orchestrator's per-task hand:
+# workspace (a "sub-tab", not a separate space), running the right model at
+# the right job-class tier. This is the orchestrator's per-task hand:
 #
-#   spawn-task.sh ~/Code/myproject fix-parser implement           # claude, sonnet
-#   spawn-task.sh ~/Code/myproject arch-review review codex       # codex, deep model
+#   spawn-task.sh ~/Code/myproject fix-parser implement           # claude flavor, sonnet, under omp
+#   spawn-task.sh ~/Code/myproject arch-review review codex       # codex flavor, deep model, under omp
 #   spawn-task.sh ~/Code/myproject fix-worker implement omp       # omp, sonnet
 #   spawn-task.sh ~/Code/myproject probe quick pwd                # literal cmd (no model)
+#
+# `claude`/`codex` are MODEL FAMILIES, not CLI binaries: both launch under the
+# omp harness (lib/agent-profiles.sh's cli_for_agent) with `--models` set to
+# the requested family plus its cross-family equivalent at the same
+# job-class tier, so Ctrl+P swaps the live pane between them instead of
+# locking a worker into whichever flavor was requested at spawn time. One
+# approval surface, one push-hook, one answering convention for every worker
+# this script spawns — `omc` is the only agent that still launches its own
+# native binary (Claude Code + OMC's hook/skill system, a harness in its own
+# right, not a bare CLI to wrap).
 #
 # Default is BACKGROUND: the new sub-tab does not steal focus (a spawned task
 # worker should never yank your terminal out from under you). Pass --focus
@@ -19,9 +29,10 @@
 #   plan|architect|review|design  -> claude opus   · codex $HERDR_CODEX_DEEP · omp opus:high
 #   implement|debug|code          -> claude sonnet · codex $HERDR_CODEX_STD  · omp sonnet:medium
 #   explore|quick|mechanical|docs -> claude haiku  · codex $HERDR_CODEX_FAST · omp haiku:low
-# (Claude/omp tiers are model-name aliases both CLIs fuzzy-match; Codex model
-# names live in config.sh. Known agents live in lib/agent-profiles.sh — add a
-# new one there, not in this file.)
+# (Claude/omp tiers are model-name aliases omp fuzzy-matches; Codex model
+# names live in config.sh and are launched via omp's `openai-codex/<model>`
+# provider prefix. Known agents live in lib/agent-profiles.sh — add a new one
+# there, not in this file.)
 #
 # herdr's native `worktree create` always makes a SEPARATE space; to get a sub-tab
 # we do `git worktree add` + `tab create --workspace <repo-ws>` ourselves. Each tab

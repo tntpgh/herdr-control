@@ -147,6 +147,42 @@ posture_is_enforced_for() {             # <agent> -> exit 0 if a flag exists for
   [ -n "$(posture_flag_for_agent "$1" "$(resolved_posture)")" ]
 }
 
+# ---- omp cross-family model routing ------------------------------------------
+# `claude`/`codex` as a spawn-task.sh agent argument mean "use this model
+# family at this job-class's tier" — they no longer name a CLI BINARY to
+# launch. Both route through the omp harness (below), so every spawned
+# worker shares one approval surface, one push-hook wiring
+# (agent-hooks/omp-herdr-control.ts), and one answering convention
+# (herdr-select.sh already detects numbered-vs-menu live off the rendered
+# screen, so it needs no per-agent branch here) — and the operator can
+# Ctrl+P swap the live pane between the Claude and Codex model families
+# instead of being locked into whichever flavor was requested at spawn
+# time. `omc` is deliberately NOT routed here: it IS its own harness
+# (Claude Code + OMC's own hook/skill system), not a bare CLI to wrap.
+#
+# The tier mapping below is a lookup, not new logic: model_for_agent's
+# claude/codex tiers are already 1:1 by construction (opus/HERDR_CODEX_DEEP
+# = deep, sonnet/HERDR_CODEX_STD = standard, haiku/HERDR_CODEX_FAST = fast),
+# and every model id here was verified live against omp's own model cache
+# (`openai-codex` provider, `~/.omp/agent/models.db`) 2026-08-16 — a bare
+# `omp --model openai-codex/gpt-5.4-mini -p "..."` round-tripped for real.
+omp_cross_family_model() {   # <from-agent> <bare-model-name> -> "<omp-model> <thinking-or-empty>"
+  local from="$1" name="$2"
+  case "$from" in
+    claude)
+      case "$name" in
+        opus)  printf 'openai-codex/%s %s\n' "${HERDR_CODEX_DEEP%%:*}" "${HERDR_CODEX_DEEP##*:}" ;;
+        haiku) printf 'openai-codex/%s %s\n' "${HERDR_CODEX_FAST%%:*}" "${HERDR_CODEX_FAST##*:}" ;;
+        *)     printf 'openai-codex/%s %s\n' "${HERDR_CODEX_STD%%:*}"  "${HERDR_CODEX_STD##*:}" ;;
+      esac ;;
+    codex)
+      if   [ "$name" = "${HERDR_CODEX_DEEP%%:*}" ]; then printf 'opus high\n'
+      elif [ "$name" = "${HERDR_CODEX_FAST%%:*}" ]; then printf 'haiku low\n'
+      else printf 'sonnet medium\n'
+      fi ;;
+  esac
+}
+
 # ---- launch command ---------------------------------------------------------
 # cli_for_agent <agent> <model-spec> [posture-request] -> launch command, exit 0.
 # Exit 1 (no stdout) if <agent> isn't a known agent — caller falls back to
@@ -159,33 +195,33 @@ posture_is_enforced_for() {             # <agent> -> exit 0 if a flag exists for
 # spawns at the floor.
 cli_for_agent() {
   local a="$1" spec="$2" want="${3:-}" m e posture flag
+  local has_effort alt alt_model models
   posture="$(resolved_posture "$want")"
-  flag="$(posture_flag_for_agent "$a" "$posture")"
   case "$a" in
-    claude|omc)
-      printf 'claude --model %s%s\n' "$spec" "${flag:+ $flag}" ;;
-    codex)
-      # A spec with no ":effort" (e.g. spawn-task.sh's `--model X` override
-      # with no `--effort`) makes bash's ${spec##*:} a no-op — nothing to
-      # strip — so `e` silently comes back equal to the MODEL NAME. Observed
-      # live 2026-08-08: `-c model_reasoning_effort=gpt-5.6-sol` hard-errors
-      # codex on EVERY call (invalid_enum_value), with no crash and no
-      # failure signal in spawn-task.sh's own output — the pane just sits
-      # there silently dead. Omit the flag entirely instead and let codex use
-      # its own default reasoning effort — safer than guessing a specific
-      # level, and correct-by-construction rather than relying on every
-      # caller to always pass a colon.
+    claude|codex)
+      # Always the omp posture vocabulary — omp is the ONLY binary actually
+      # launched for either flavor now (see the block comment above).
+      flag="$(posture_flag_for_agent omp "$posture")"
       m="${spec%%:*}"
-      if [ "$m" = "$spec" ]; then
-        printf 'codex -m %s%s\n' "$m" "${flag:+ $flag}"
+      has_effort=1; [ "$m" = "$spec" ] && has_effort=0
+      alt="$(omp_cross_family_model "$a" "$m")"
+      alt_model="${alt%% *}"
+      [ "$a" = codex ] && m="openai-codex/$m"
+      models="${m},${alt_model}"
+      if [ "$has_effort" = 0 ]; then
+        printf 'omp --model %s --models %s%s\n' "$m" "$models" "${flag:+ $flag}"
       else
         e="${spec##*:}"
-        printf 'codex -m %s -c model_reasoning_effort=%s%s\n' "$m" "$e" "${flag:+ $flag}"
+        printf 'omp --model %s --thinking %s --models %s%s\n' "$m" "$e" "$models" "${flag:+ $flag}"
       fi
       ;;
+    omc)
+      flag="$(posture_flag_for_agent omc "$posture")"
+      printf 'claude --model %s%s\n' "$spec" "${flag:+ $flag}" ;;
     omp)
-      # Same colonless-spec hazard as codex above — `--thinking <model-name>`
-      # would be an equally invalid omp flag value. Omit rather than guess.
+      # Same colonless-spec hazard as the claude/codex branch above —
+      # `--thinking <model-name>` would be an equally invalid omp flag value.
+      # Omit rather than guess.
       m="${spec%%:*}"
       # At the `write` floor omp auto-approves read+write and still prompts on
       # exec — the closest equivalent to Claude's acceptEdits. That prompt IS
@@ -193,6 +229,7 @@ cli_for_agent() {
       # `menu-prompt`), so `write` no longer means "will sit blocked forever on
       # its first bash call" the way it did when the menu shape had no
       # answering path.
+      flag="$(posture_flag_for_agent "$a" "$posture")"
       if [ "$m" = "$spec" ]; then
         printf 'omp --model %s%s\n' "$m" "${flag:+ $flag}"
       else
