@@ -71,14 +71,19 @@ refuses to wire anything up if one is missing:
 > in a NEW script, don't assume the first one you tried works everywhere.
 
 **Bring your own agent CLI.** `spawn-agent.sh`/`spawn-task.sh` don't hardcode
-Claude Code — `HERDR_DEFAULT_AGENT` in `config.sh` picks the default, and
-`lib/agent-profiles.sh` is the ONE place that knows how to launch a
-recognized agent (`cli_for_agent`) and which model a job-class maps to for it
-(`model_for_agent`). Today that's `claude`/`codex`/`omp`. Anything else
+one binary — `HERDR_DEFAULT_AGENT` in `config.sh` picks the default
+(`omp` as of 2026-08-16), and `lib/agent-profiles.sh` is the ONE place that
+knows how to launch a recognized agent (`cli_for_agent`) and which model a
+job-class maps to for it (`model_for_agent`). `claude` and `codex` are MODEL
+FAMILIES, not CLI binaries, today: both route through the omp harness with
+`--models` set so Ctrl+P can swap the live pane between them — nothing
+spawned from this toolchain launches a bare `claude`/`codex` process by
+default anymore. `omc` is the one exception (it IS its own harness — Claude
+Code plus OMC's hook/skill system — not a bare CLI to wrap). Anything else
 already works as a **literal command**, just without job-class model
 routing — `spawn-task.sh ~/app fix-bug quick "my-other-tool --flag"` runs
 `my-other-tool --flag` verbatim in the new tab/worktree. To give a new agent
-the same `plan`/`implement`/`explore` → model mapping the built-in three get,
+the same `plan`/`implement`/`explore` → model mapping the built-in ones get,
 add it to `lib/agent-profiles.sh` — nowhere else needs to change; every
 script that launches an agent goes through that one file.
 
