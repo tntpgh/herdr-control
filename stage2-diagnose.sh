@@ -22,28 +22,20 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$HERE/lib/engineering-stage2.sh"
 THURBER_OS="${STAGE2_THURBER_OS_REPO:-$HOME/Code/thurber-os}"
 BRANCH="evolution-loop/stage2-diagnose-$(date -u +%Y%m%d)"
 MODEL="${STAGE2_MODEL:-claude-fable-5}"
 BRIEF_FILE="$(mktemp "${TMPDIR:-/tmp}/stage2-diagnose-brief.XXXXXX.md")"
 
 # Find the most recent prior Stage-2 doc (if any) so the new pass knows what
-# to treat as carry-over instead of re-reporting it as new.
-# Prior docs can live in two places: merged onto main, or still sitting on an
-# unmerged evolution-loop/* worktree branch (the real state as of 2026-08-10 --
-# neither the bootstrap pass nor the first Stage-2 pass have landed on main
-# yet). Search both, or a future run silently thinks it's the first pass when
-# it isn't -- exactly the "does the loop's history compound" gap the first
-# pass itself flagged.
-PRIOR_DOC="$( { ls -1 "$THURBER_OS"/docs/tracking/*-stage2-diagnose-pass.md 2>/dev/null; \
-  ls -1 "$HOME"/.herdr/worktrees/thurber-os/evolution-loop/*/docs/tracking/*-stage2-diagnose-pass.md 2>/dev/null; \
-  ls -1 "$HOME"/.herdr/worktrees/thurber-os/evolution-loop/*/docs/tracking/*-fable5-bootstrap-diagnosis.md 2>/dev/null; \
-  } | awk '{ n=split($0,a,"/"); print a[n]"\t"$0 }' | sort | tail -1 | cut -f2- || true )"
+# to treat as carry-over instead of re-reporting it as new. lib/engineering-
+# stage2.sh's stage2_find_latest_doc is the SAME search stage3-execute.sh
+# uses to find the doc it consumes -- one implementation, not two that can
+# drift apart.
 PRIOR_LINE="none found on main OR any evolution-loop/* worktree -- this is genuinely the first pass, or check for a branch this search missed"
-if [ -n "$PRIOR_DOC" ]; then
-  ON_MAIN=""
-  case "$PRIOR_DOC" in "$THURBER_OS"/*) ON_MAIN=" (on main)";; *) ON_MAIN=" (UNMERGED -- still on its own branch, not main)";; esac
-  PRIOR_LINE="$PRIOR_DOC$ON_MAIN -- read it in full and label anything it already reported as carry-over, not new"
+if PRIOR_DOC="$(stage2_find_latest_doc "$THURBER_OS")"; then
+  PRIOR_LINE="$PRIOR_DOC ($(stage2_doc_location_label "$THURBER_OS" "$PRIOR_DOC")) -- read it in full and label anything it already reported as carry-over, not new"
 fi
 
 cat > "$BRIEF_FILE" <<EOF
@@ -84,6 +76,52 @@ full first -- this is your governing document, not this brief alone).
    whether there's now enough data for a real trend claim.
 5. Classify every finding with the exact §4 taxonomy. No finding without
    a classification.
+6. For every finding classified \`auto-remediate\` or
+   \`auto-diagnose-with-fix\` AND allowlisted per the Phase-3 allowlist
+   above, ALSO add a structured entry to the Stage-3 output block below --
+   see "Structured Stage-3 output" section. This is new as of the
+   G-ELOOP-E2 build (2026-08-20): earlier passes' free-text-only docs are
+   exactly what taught Stage-3 it needs this, since a prose-only doc gives
+   an automated consumer nothing safe to parse.
+
+## Structured Stage-3 output -- REQUIRED, even if empty
+
+Stage-3 (\`stage3-execute.sh\`) parses this doc mechanically and fails
+closed (does nothing, logs why) if this fenced block is missing or
+malformed -- so get the shape exactly right, and include it even when you
+found zero Stage-3-eligible items (an empty array, not a missing block, is
+how Stage-3 tells "ran, found nothing" apart from "doc predates this
+contract").
+
+At the very end of the doc, after everything else, add exactly one fenced
+block tagged \`stage3-findings\` containing a JSON array. One object per
+eligible finding (auto-remediate or auto-diagnose-with-fix AND allowlisted):
+
+\`\`\`stage3-findings
+[
+  {"repo": "knowledge-base", "file": "connectors/imessage.py", "line_hint": 388, "class": "missing_error_observability", "fix_summary": "one sentence: what's wrong and the fix"}
+]
+\`\`\`
+
+Field rules -- Stage-3 validates these mechanically, so:
+- \`repo\`: exactly one of \`knowledge-base\`, \`tourguide\`, \`thurber-ai\`
+  (the literal directory name, not a display name).
+- \`file\`: path relative to that repo's root.
+- \`line_hint\`: your best-guess line number (integer), or \`null\` if you
+  don't have one -- Stage-3 treats it as a hint to re-verify, not ground
+  truth.
+- \`class\`: exactly one of the three allowlist slugs --
+  \`schema_nullability_mismatch\`, \`dead_code\`, \`missing_error_observability\`.
+  Do not invent new class names here; anything else is dropped by Stage-3
+  as not-allowlisted regardless of how you classified it in prose above.
+- \`fix_summary\`: one sentence, plain text, no secrets/PII (same discipline
+  as everything else in this doc).
+
+Never include a finding here that touches ZipForms writes, entity-graph
+merge/dedup, \`kb.action_queue\`'s outbound-send path, or thurber-ai's
+dispatch/tier/policy/send code -- Stage-3 denylists those file paths
+mechanically too, but don't rely on that backstop; those are never-automate
+per §5d regardless of class.
 
 ## Constraints -- this is the E0/E1 boundary, take it seriously
 
@@ -110,8 +148,8 @@ full first -- this is your governing document, not this brief alone).
 
 ## When done
 
-Commit the doc, then append the handoff event to \`.omc/handoffs/events.jsonl\`
-in this worktree:
+Commit the doc (the structured \`stage3-findings\` block included), then
+append the handoff event to \`.omc/handoffs/events.jsonl\` in this worktree:
 \`{"event":"review:${BRANCH}_done","commit":"<hash>","summary":"<one-line: how many findings, by classification, headline items>"}\`
 EOF
 
