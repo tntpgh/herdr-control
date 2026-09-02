@@ -43,6 +43,21 @@ echo "== refusals =="
 "$SUT" "$D/empty.md" "$D/np1.md" >/dev/null 2>&1 && no "empty handoff" "exited 0" || ok "empty handoff refused"
 printf 'no heading here\njust prose\n' > "$D/nohead.md"
 "$SUT" "$D/nohead.md" "$D/np1.md" >/dev/null 2>&1 && no "headingless" "exited 0" || ok "headingless handoff refused (undedupable)"
+
+# A decorative rule is a valid markdown heading but a useless key: it matches every
+# notepad that ever used the same banner. This silently no-opped a real session save.
+printf '# ==========\n# =====\n\nbody\n' > "$D/deco.md"
+"$SUT" "$D/deco.md" "$D/np1.md" >/dev/null 2>&1 && no "decorative heading" "exited 0" || ok "decorative-only heading refused"
+
+# A banner ABOVE a real title must key on the title, not the banner.
+: > "$D/np3.md"
+printf '# =====\n# Session 2026-03-03 - real title\n\nbody\n' > "$D/banner.md"
+"$SUT" "$D/banner.md" "$D/np3.md" >/dev/null 2>&1
+n=$(grep -c "real title" "$D/np3.md")
+[ "$n" = 1 ] && ok "banner then title: wrote once" || no "banner then title" "count=$n"
+"$SUT" "$D/banner.md" "$D/np3.md" >/dev/null 2>&1
+n=$(grep -c "real title" "$D/np3.md")
+[ "$n" = 1 ] && ok "banner then title: re-run still once" || no "banner re-run" "duplicated: count=$n"
 "$SUT" "$D/handoff.md" "$D/absent-notepad.md" >/dev/null 2>&1 && no "missing notepad" "exited 0" || ok "missing notepad reported, not created"
 [ -f "$D/absent-notepad.md" ] && no "missing notepad" "was created" || ok "missing notepad really not created"
 "$SUT" >/dev/null 2>&1 && no "no args" "exited 0" || ok "no args shows usage"
