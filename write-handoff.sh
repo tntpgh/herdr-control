@@ -34,12 +34,18 @@ shift
 [ -f "$HANDOFF" ] || { echo "write-handoff: no such file: $HANDOFF" >&2; exit 1; }
 [ -s "$HANDOFF" ] || { echo "write-handoff: $HANDOFF is empty — refusing" >&2; exit 1; }
 
-# Dedupe key: the first markdown heading. Without one there is nothing stable to
-# match on, so refuse rather than append something that can never be detected as
-# a duplicate later.
-KEY="$(grep -m1 '^#\{1,2\} ' "$HANDOFF" || true)"
+# Dedupe key: the first markdown heading that actually says something.
+#
+# "First heading" alone is not enough. A decorative rule like `# =========` is a
+# valid heading, matches every notepad that ever used the same banner, and made
+# this script report "already has this handoff" for three notepads that had none
+# of it — a silent NO-OP on a session save, which is the one job it has. So the
+# key must contain letters or digits; anything else is not distinctive enough to
+# detect a duplicate later, and refusing beats appending something unfindable.
+KEY="$(grep -m1 -E '^#{1,2} +.*[A-Za-z0-9]' "$HANDOFF" | sed -E 's/[[:space:]=_*#-]+$//' || true)"
 if [ -z "$KEY" ]; then
-    echo "write-handoff: $HANDOFF has no '# ' or '## ' heading to key on — refusing" >&2
+    echo "write-handoff: $HANDOFF has no heading containing letters or digits to key on." >&2
+    echo "  A decorative rule like '# =====' is not a usable key — give the handoff a real title." >&2
     exit 1
 fi
 echo "write-handoff: key = ${KEY}"
