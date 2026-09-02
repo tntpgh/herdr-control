@@ -21,11 +21,37 @@
 # scheduled job) is the actual fix, and remains Terrence's call.
 set -euo pipefail
 
+# --scheduled: proceed only on the FIRST Friday of the month; exit 0 quietly on every
+# other Friday. launchd cannot express "first Friday" - StartCalendarInterval ANDs its
+# keys, so Day+Weekday together fire only when the 1st happens to BE a Friday - so the
+# plist fires weekly and this gate picks the right week. The cadence stays monthly per
+# charter §3 Stage 2; it just lands at the end of a work week instead of on day 1, which
+# gives the review a month of work plus a natural week boundary to sit behind.
+#
+# Opt-in so a manual `./stage2-diagnose.sh` still runs immediately, any day. Only the
+# scheduled path is date-gated.
+if [ "${1:-}" = "--scheduled" ]; then
+    shift
+    if [ "$(date +%-d)" -gt 7 ]; then
+        echo "stage2-diagnose: $(date '+%F %A') is not the first Friday of the month - skipping"
+        exit 0
+    fi
+    echo "stage2-diagnose: $(date '+%F %A') is the first Friday - running the monthly pass"
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 THURBER_OS="${STAGE2_THURBER_OS_REPO:-$HOME/Code/thurber-os}"
 BRANCH="evolution-loop/stage2-diagnose-$(date -u +%Y%m%d)"
 MODEL="${STAGE2_MODEL:-claude-fable-5}"
-BRIEF_FILE="$(mktemp "${TMPDIR:-/tmp}/stage2-diagnose-brief.XXXXXX.md")"
+# Trailing X's are REQUIRED. BSD /usr/bin/mktemp - which is what launchd's PATH
+# resolves to - returns a template with a suffix after the X's *verbatim* and creates
+# that literal file, so every run reuses one name and the SECOND run dies on
+# "File exists" under `set -e`. An interactive shell hides this completely, because
+# GNU coreutils mktemp is on PATH there and handles the suffix. That is exactly what
+# happened: the 2026-09-01 run wrote its brief to a file literally named
+# stage2-diagnose-brief.XXXXXX.md, which would have blocked the next run before it
+# ever reached the spawn.
+BRIEF_FILE="$(mktemp "${TMPDIR:-/tmp}/stage2-diagnose-brief.XXXXXX")"
 
 # Find the most recent prior Stage-2 doc (if any) so the new pass knows what
 # to treat as carry-over instead of re-reporting it as new.
