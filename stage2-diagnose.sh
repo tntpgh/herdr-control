@@ -30,10 +30,26 @@ set -euo pipefail
 #
 # Opt-in so a manual `./stage2-diagnose.sh` still runs immediately, any day. Only the
 # scheduled path is date-gated.
+# Defined before the gate: the skip path reports too, so the helper must already
+# be loaded when it fires.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$HERE/lib/emit-loop-run.sh"
+
 if [ "${1:-}" = "--scheduled" ]; then
     shift
-    if [ "$(date +%-d)" -gt 7 ]; then
+    # Weekday AND day-of-month. The plist only fires on Fridays, so the original
+    # day<=7 check was sufficient in production — but it made the script rely on
+    # its caller for half its own contract, and a manual `--scheduled` in the
+    # first week of a month therefore SPAWNED a real Fable-5 pass. Verified the
+    # hard way on Wednesday 2026-09-03. The gate now expresses "first Friday"
+    # by itself, so the script is safe to invoke with --scheduled any day.
+    if [ "$(date +%u)" != "5" ] || [ "$(date +%-d)" -gt 7 ]; then
         echo "stage2-diagnose: $(date '+%F %A') is not the first Friday of the month - skipping"
+        # Report the skip. A no-op is still a RUN of this stage, and reporting it
+        # keeps the dead-man window at ~7 days (weekly trigger) instead of ~38
+        # (monthly full pass) — so a dead loop is caught in a week rather than
+        # after it has already missed its real slot.
+        emit_loop_run diagnose succeeded 0 "skipped: not the first Friday"
         exit 0
     fi
     echo "stage2-diagnose: $(date '+%F %A') is the first Friday - running the monthly pass"
