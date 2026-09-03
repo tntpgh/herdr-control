@@ -26,7 +26,24 @@ rc=$?
 # The higher watcher the sentinel design asks for. Cadence matters: the heartbeat
 # TTL is 5 min and this poll runs every 5 min, so staleness is detectable here and
 # nowhere else in the fleet.
-sentinel_watch
+#
+# The verdict is a FINDING, not just a log line. Until 2026-09-03 this ran
+# sentinel_watch and then passed a hardcoded findings=0 to emit_loop_run, so 46
+# consecutive DEGRADED polls (0 healthy, ever) were recorded as
+# `state=succeeded findings=0` — a watcher whose alarm had no reader, which is the
+# exact failure this file exists to prevent one level down. Anything that is not
+# `healthy` now counts, so the OBSERVE lane's findings column carries the signal
+# and Sisyphus can see it.
+sentinel_line="$(sentinel_watch)"
+echo "$sentinel_line"
+case "$sentinel_line" in
+    "sentinel: healthy"*) sentinel_findings=0 ;;
+    *)                    sentinel_findings=1 ;;
+esac
 
-emit_loop_run observe "$([ "$rc" = 0 ] && echo succeeded || echo failed)" 0 "poll rc=$rc"
+# `state` stays keyed to the POLL's own exit code: the poll really did succeed, and
+# conflating "the loop ran" with "the loop is happy" would make a degraded sentinel
+# look like a broken poll. The finding is the correct channel for the verdict.
+emit_loop_run observe "$([ "$rc" = 0 ] && echo succeeded || echo failed)" \
+    "$sentinel_findings" "poll rc=$rc; $sentinel_line"
 exit $rc
