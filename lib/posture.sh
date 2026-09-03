@@ -40,8 +40,6 @@ posture_rank() {                        # <posture> -> 0|1|2, empty if unknown
   esac
 }
 
-posture_is_known() { [ -n "$(posture_rank "$1")" ]; }
-
 # compose_posture <floor> <requested> -> the more restrictive of the two.
 #
 # Either side being unknown collapses to `strict`. That is the fail-closed
