@@ -14,5 +14,13 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/config.sh"
 . "$here/lib/engineering-ledger.sh"
+. "$here/lib/emit-loop-run.sh"
 
 engineering_ledger_poll "$@"
+rc=$?
+
+# Feed the dead-man for this lane (E0 OBSERVE). Every poll reports; the row proves
+# the loop is alive, and `findings` is the learning signal over successive runs.
+# --dry-run still reports: a dry poll is a real invocation of the loop.
+emit_loop_run observe "$([ "$rc" = 0 ] && echo succeeded || echo failed)" 0 "poll rc=$rc"
+exit $rc
