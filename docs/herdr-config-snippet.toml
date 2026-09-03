@@ -53,8 +53,12 @@ rows = [
 # ---- Keybindings -----------------------------------------------------------
 # prefix+t  — smart-name the focused tab now (runs detached; the rename lands
 #             a moment later). A model call for an agent tab takes a few seconds.
-# (Scripts are invoked via `bash <path>` — this repo's scripts are not marked
-#  executable, matching install.sh and the sort-tabs keybinding in README.)
+# (Keybindings call `bash <path>` deliberately: that works regardless of file mode,
+#  so it is the robust form for generated config. The old claim here — "this repo's
+#  scripts are not marked executable" — was false and is why the repo drifted into
+#  two conventions: 40 of 68 tracked .sh files were already 100755. As of
+#  2026-09-03 the rule is EXEC-IF-INVOKED: any script a doc tells you to run as
+#  `./x.sh` is 100755; `lib/*.sh` are sourced and stay 100644.)
 [[keys.command]]
 key = "prefix+t"
 type = "shell"
