@@ -11,14 +11,19 @@
 # the latest ledger data and the latest prior Stage-2 doc itself (so carry-
 # overs are tracked correctly without this script hardcoding dates).
 #
-# What this does NOT automate, honestly (charter §8 item 3 is still open):
-# the spawned session can still hit an interactive permission prompt (a
-# network-egress command, an unusual file category) that only a human /
-# conductor session can answer -- exactly what happened during the first
-# real pass. Firing this from launchd with nobody watching means it may
-# just sit at such a prompt until someone checks the pane. That is a real
-# limitation, not silently papered over: §8 item 3 (persistent conductor vs
-# scheduled job) is the actual fix, and remains Terrence's call.
+# What this also automates now (added 2026-09-04, after the third consecutive
+# monthly-pass loss): DELIVERING THE BRIEF. Until then this script spawned the
+# pane and printed "send the brief yourself" into a launchd log nobody reads —
+# the 2026-09-04 scheduled pass spawned fine, idled briefless for 4 hours, and
+# was lost when herdr restarted (registry: lost_detected pane_gone, zero
+# commits). Delivery goes through herdr-deliver.sh -> send-to-agent.sh, which
+# confirms the composer actually consumed the submit.
+#
+# What this still does NOT automate, honestly (charter §8 item 3 is still
+# open): a mid-run interactive permission prompt only a human/conductor can
+# answer, and consuming the completion event (no conductor exists on the
+# scheduled path — the wake command is printed, not run). A prompt painted at
+# boot stops delivery honestly (rc=5) rather than Enter-ing through it.
 set -euo pipefail
 
 # --scheduled: proceed only on the FIRST Friday of the month; exit 0 quietly on every
@@ -160,8 +165,70 @@ EOF
 echo "stage2-diagnose: spawning Fable-5 pass on branch $BRANCH"
 echo "stage2-diagnose: brief written to $BRIEF_FILE"
 
-"$HERE/spawn-task.sh" --model "$MODEL" "$THURBER_OS" "$BRANCH" review
+SPAWN_OUT="$("$HERE/spawn-task.sh" --model "$MODEL" "$THURBER_OS" "$BRANCH" review)" || {
+    src=$?
+    printf '%s\n' "$SPAWN_OUT"
+    emit_loop_run diagnose failed 0 "spawn-task.sh rc=$src for $BRANCH — no pane, no pass"
+    exit 1
+}
+printf '%s\n' "$SPAWN_OUT"
 
-echo "stage2-diagnose: spawned (background, not blocking). Send the brief to"
-echo "the new pane with send-to-agent.sh once it's up, e.g.:"
-echo "  bash $HERE/send-to-agent.sh <pane_id> \"@$BRIEF_FILE\""
+PANE="$(printf '%s\n' "$SPAWN_OUT" | sed -n 's/^spawned .* pane=\([^ ]*\).*/\1/p' | head -1)"
+if [ -z "$PANE" ]; then
+    emit_loop_run diagnose failed 0 "spawned $BRANCH but pane id unparseable — brief undelivered, worker idle"
+    echo "stage2-diagnose: could not parse pane id from spawn-task.sh output. Deliver by hand:" >&2
+    echo "  bash $HERE/send-to-agent.sh <pane_id> \"@$BRIEF_FILE\"" >&2
+    exit 1
+fi
+
+# ---- deliver the brief ------------------------------------------------------
+# herdr-deliver.sh refuses with rc=3 while the pane is still a bare shell
+# (lib/pane-guard.sh pane_is_agent) — that refusal IS the boot-wait, so
+# retrying on it waits out the agent's cold start without a bespoke readiness
+# probe. rc=4 means typed-but-unconfirmed (retry re-submits). rc=5 means a
+# permission/trust prompt painted: stop — forcing would ANSWER the prompt, and
+# that decision belongs to a human (docs/approval-policy.md rule 1).
+delivered=0 drc=0
+for _ in {1..30}; do
+    if bash "$HERE/herdr-deliver.sh" "$PANE" "@$BRIEF_FILE"; then
+        delivered=1; break
+    else
+        drc=$?
+    fi
+    if [ "$drc" -eq 5 ]; then break; fi
+    sleep 5
+done
+
+# Boot-time race, observed live on this fix's own first run (2026-09-04):
+# send-to-agent.sh reported SUBMITTED while the brief still sat in the
+# composer — the pane passed pane_is_agent the moment the omp PROCESS
+# existed, the welcome screen ate the Enter, and "composer changed" was the
+# typed text itself appearing during TUI paint. So verify the composer
+# actually CLEARED: the composer is the pane's final ╰─ … ─╯ line (transcript
+# echoes of the brief path land ABOVE it, so matching only that line cannot
+# false-positive on a working agent). If the brief is still there, press
+# Enter again (--submit-only types nothing) and re-check.
+if [ "$delivered" -eq 1 ]; then
+    _base="$(basename "$BRIEF_FILE")"
+    for _ in 1 2 3; do
+        sleep 5
+        _tail="$(herdr pane read "$PANE" --source visible --lines 8 2>/dev/null || true)"
+        printf '%s\n' "$_tail" | grep '^[[:space:]]*╰' | grep -qF "$_base" || break
+        bash "$HERE/send-to-agent.sh" "$PANE" --submit-only || true
+    done
+    if printf '%s\n' "${_tail:-}" | grep '^[[:space:]]*╰' | grep -qF "$_base"; then
+        delivered=0 drc=8  # stranded in composer despite submit retries
+    fi
+fi
+
+if [ "$delivered" -eq 1 ]; then
+    echo "stage2-diagnose: brief delivered + submit-confirmed to $PANE"
+    emit_loop_run diagnose succeeded 0 "monthly pass dispatched: pane=$PANE branch=$BRANCH brief delivered+confirmed"
+    echo "stage2-diagnose: completion watcher (a conductor should run this BACKGROUNDED):"
+    echo "  bash $HERE/wake-on-evidence.sh ${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$THURBER_OS")/$BRANCH/.omc/handoffs/events.jsonl 'review:${BRANCH}_done'"
+else
+    emit_loop_run diagnose failed 0 "spawned pane=$PANE for $BRANCH but brief NOT delivered (last rc=$drc) — worker idle, needs manual send"
+    echo "stage2-diagnose: BRIEF NOT DELIVERED to $PANE (last rc=$drc). Deliver by hand:" >&2
+    echo "  bash $HERE/send-to-agent.sh $PANE \"@$BRIEF_FILE\"" >&2
+    exit 1
+fi
