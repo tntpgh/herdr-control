@@ -5,38 +5,19 @@
 _engineering_ledger_lib_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 _engineering_ledger_repo_dir=$(cd "$_engineering_ledger_lib_dir/.." && pwd)
 
+# Single source for the sensitive-value deny check used when redacting free
+# text pulled from Sentry issue titles and KB failure rows. Two variants:
+# a strict form used on "signature" values (short, colon-truncated tokens,
+# capped at 60 chars) requires password/token/secret/api-key to be followed
+# by an assignment; a looser form used on longer free-text "label" values
+# (capped at 80 chars) matches those words unconditionally. Kept as plain
+# strings (not functions) so the collectors' inline `jq -c` programs can
+# share the same pattern via `--arg` instead of duplicating the literal.
+_engineering_ledger_sensitive_sig_pattern='(?i)(bearer[[:space:]]+|xox[baprs]-|gh[opsu]_|sk-[a-z0-9]|op://|password[[:space:]]*=|token[[:space:]]*=|secret[[:space:]]*=|api[_-]?key[[:space:]]*=|https?://|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|/users/|/home/|(?:[0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z0-9_=-]{32,})'
+_engineering_ledger_sensitive_label_pattern='(?i)(bearer[[:space:]]+|xox[baprs]-|gh[opsu]_|sk-[a-z0-9]|op://|password|token|secret|api[_-]?key|https?://|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|/users/|/home/|(?:[0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z0-9_=-]{32,})'
+
 ledger_now() {
   date -u +%Y-%m-%dT%H:%M:%SZ
-}
-
-# Mirrors tourguide's self_heal_digest.mjs discipline: retain only the token
-# before the first ':' (e.g. TypeError), normalize whitespace, and cap at 60
-# characters. The extra deny checks fail closed when the retained token itself
-# looks like a credential, URL, path, email, IP, UUID, or high-entropy value.
-ledger_sanitize_signature() {
-  jq -Rr '
-    def head: split(":")[0] | gsub("^[[:space:]]+|[[:space:]]+$"; "");
-    def sensitive:
-      test("(?i)(bearer[[:space:]]+|xox[baprs]-|gh[opsu]_|sk-[a-z0-9]|op://|password[[:space:]]*=|token[[:space:]]*=|secret[[:space:]]*=|api[_-]?key[[:space:]]*=|https?://|[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}|/users/|/home/|(?:[0-9]{1,3}\\.){3}[0-9]{1,3}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z0-9_=-]{32,})");
-    head as $h
-    | if ($h | length) == 0 then "unknown"
-      elif ($h | sensitive) then "redacted"
-      else ($h | gsub("[[:space:]]+"; "_") | gsub("[^A-Za-z0-9_.-]"; "_") | .[0:60])
-      end
-  '
-}
-
-ledger_sanitize_label() {
-  jq -Rr '
-    def trimmed: gsub("^[[:space:]]+|[[:space:]]+$"; "");
-    def sensitive:
-      test("(?i)(bearer[[:space:]]+|xox[baprs]-|gh[opsu]_|sk-[a-z0-9]|op://|password|token|secret|api[_-]?key|https?://|[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}|/users/|/home/|(?:[0-9]{1,3}\\.){3}[0-9]{1,3}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z0-9_=-]{32,})");
-    trimmed as $v
-    | if ($v | length) == 0 then "unknown"
-      elif ($v | sensitive) then "redacted"
-      else ($v | gsub("[[:space:]]+"; "_") | gsub("[^A-Za-z0-9_.-]"; "_") | .[0:80])
-      end
-  '
 }
 
 ledger_error_entry() {
@@ -107,11 +88,12 @@ ledger_collect_sentry() {
 
   printf '%s' "$issues_json" | jq -c \
     --arg poll_id "$poll_id" --arg observed_at "$observed_at" \
-    --arg source_id "$source_id" --arg project_slug "$project_slug" --arg project_id "$project_id" '
+    --arg source_id "$source_id" --arg project_slug "$project_slug" --arg project_id "$project_id" \
+    --arg sig_pattern "$_engineering_ledger_sensitive_sig_pattern" '
       def safe_sig:
         tostring | split(":")[0] | gsub("^[[:space:]]+|[[:space:]]+$"; "") as $h
         | if ($h | length) == 0 then "unknown"
-          elif ($h | test("(?i)(bearer[[:space:]]+|xox[baprs]-|gh[opsu]_|sk-[a-z0-9]|op://|password[[:space:]]*=|token[[:space:]]*=|secret[[:space:]]*=|api[_-]?key[[:space:]]*=|https?://|[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}|/users/|/home/|(?:[0-9]{1,3}\\.){3}[0-9]{1,3}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z0-9_=-]{32,})")) then "redacted"
+          elif ($h | test($sig_pattern)) then "redacted"
           else ($h | gsub("[[:space:]]+"; "_") | gsub("[^A-Za-z0-9_.-]"; "_") | .[0:60])
           end;
       def safe_time:
@@ -169,17 +151,19 @@ ledger_collect_kb() {
   }
 
   printf '%s' "$rows_json" | jq -c \
-    --arg poll_id "$poll_id" --arg observed_at "$observed_at" '
+    --arg poll_id "$poll_id" --arg observed_at "$observed_at" \
+    --arg sig_pattern "$_engineering_ledger_sensitive_sig_pattern" \
+    --arg label_pattern "$_engineering_ledger_sensitive_label_pattern" '
       def safe_sig:
         tostring | split(":")[0] | gsub("^[[:space:]]+|[[:space:]]+$"; "") as $h
         | if ($h | length) == 0 then "unknown"
-          elif ($h | test("(?i)(bearer[[:space:]]+|xox[baprs]-|gh[opsu]_|sk-[a-z0-9]|op://|password[[:space:]]*=|token[[:space:]]*=|secret[[:space:]]*=|api[_-]?key[[:space:]]*=|https?://|[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}|/users/|/home/|(?:[0-9]{1,3}\\.){3}[0-9]{1,3}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z0-9_=-]{32,})")) then "redacted"
+          elif ($h | test($sig_pattern)) then "redacted"
           else ($h | gsub("[[:space:]]+"; "_") | gsub("[^A-Za-z0-9_.-]"; "_") | .[0:60])
           end;
       def safe_label:
         tostring | gsub("^[[:space:]]+|[[:space:]]+$"; "") as $v
         | if ($v | length) == 0 then "unknown"
-          elif ($v | test("(?i)(bearer[[:space:]]+|xox[baprs]-|gh[opsu]_|sk-[a-z0-9]|op://|password|token|secret|api[_-]?key|https?://|[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}|/users/|/home/|(?:[0-9]{1,3}\\.){3}[0-9]{1,3}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z0-9_=-]{32,})")) then "redacted"
+          elif ($v | test($label_pattern)) then "redacted"
           else ($v | gsub("[[:space:]]+"; "_") | gsub("[^A-Za-z0-9_.-]"; "_") | .[0:80])
           end;
       def safe_time:
