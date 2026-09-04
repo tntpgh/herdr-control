@@ -178,6 +178,24 @@ pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
   "$pane" "$pane_birth" "$root" "$wt" "$label"
 
+# ---- close an empty default root tab, if this call just created one --------
+# ensure-workspace.sh's own comment already names this gap: "herdr
+# auto-creates a root tab as part of workspace creation but gives it no
+# label of its own" — that script does a best-effort rename, but the tab
+# itself stays open and empty forever once THIS sub-tab is the one doing
+# real work. Best-effort, non-fatal, scoped tight: only closes a tab in
+# THIS workspace that is not the one just created AND has no agent set at
+# all (never ran anything) — a genuinely reused, active workspace with real
+# other work in it never loses a tab here, because that tab will have an
+# agent.
+for _t in $(herdr tab list 2>/dev/null | jq -r --arg ws "$ws" --arg keep "$tab" \
+    '(.result.tabs // .tabs)[] | select(.workspace_id==$ws and .tab_id!=$keep) | .tab_id' 2>/dev/null); do
+  _agent=$(herdr pane list 2>/dev/null | jq -r --arg t "$_t" \
+    '(.result.panes // .panes)[] | select(.tab_id==$t) | .agent // empty' 2>/dev/null | head -1)
+  [ -z "$_agent" ] && herdr tab close "$_t" >/dev/null 2>&1
+done
+true
+
 # ---- launch the agent in the tab -------------------------------------------
 # Stamp identity into the worker's own shell so its hooks (agent-hooks/
 # claude-notify.sh, agent-hooks/omp-notify.sh) can push a wake to the conductor
@@ -233,6 +251,12 @@ printf '            ^ run BACKGROUNDED (run_in_background/async:true) — a bloc
 printf '              foreground call strands you idle until re-prompted by hand\n'
 printf '  worker on completion appends to %s, e.g.:\n' "$events_file"
 printf '    {"event":"%s", ...}\n' "$wake_pattern"
+printf '  ⚠ if this task'"'"'s own effect removes its OWN worktree (e.g. "delete\n'
+printf '    this now-redundant branch"), %s is gone with it —\n' "$events_file"
+printf '    verify completion via outer repo state (git branch -a / git log) instead,\n'
+printf '    or have the task call append_event() from lib/run-registry.sh directly\n'
+printf '    (writes to the central registry, survives worktree removal) before it\n'
+printf '    removes its own worktree.\n'
 printf '  registry: %s  (run=%s task=%s)\n' "$(registry_db)" "$run_id" "$task_id"
 printf '  conductor: %s%s\n' "${conductor_pane_id:-<none — spawned outside a herdr pane, no push wake>}" \
   "${conductor_pane_id:+ (push wake wired if the worker hits an input-needed event)}"
