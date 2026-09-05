@@ -127,18 +127,8 @@ composer_stable_snapshot() {
 #             could not be determined — never guess a position.
 #           prompt_menu_question <pane> -> the header/detail lines, for
 #             prompt_id() below.
-_MENU_HEADER='Allow tool:'
-_MENU_FOOTER='enter select'
-
 _menu_window() {
   herdr pane read "$1" --source visible --lines 60 --format ansi 2>/dev/null
-}
-
-# Strip styling and the box, not just whitespace: current omp wraps both
-# command details and choices in a bordered panel.
-_menu_strip() {
-  printf '%s' "$1" | sed -E $'s/\x1b\\[[0-9;]*m//g' \
-    | sed -E 's/^[^[:alnum:]]+//; s/[[:space:]│─╮]+$//'
 }
 
 # Parse the complete, known two-choice approval menu from ONE snapshot.
@@ -146,48 +136,60 @@ _menu_strip() {
 # Unknown/truncated menu shapes fail closed rather than turning detail text
 # into option 1 and arrow-walking forever toward a row that cannot be selected.
 _prompt_menu() {                       # <pane> visible|options|selected|question
-  local win line stripped state=0 question="" selected="" n=0 invalid=0 complete=0 visible=0
+  local win
   win=$(_menu_window "$1") || return 1
-  while IFS= read -r line; do
-    stripped=$(_menu_strip "$line")
-    case "$stripped" in
-      "$_MENU_HEADER"*)
-        state=1; question="$stripped"; selected=""; n=0; invalid=0; complete=0; visible=0
-        continue ;;
-    esac
-    if [ "$state" = 0 ]; then
-      # A dismissed menu still in the viewport is not an active prompt.
-      [ -z "$stripped" ] || { complete=0; visible=0; }
-      continue
-    fi
-    case "$stripped" in
-      "up/down navigate"*"$_MENU_FOOTER"*)
-        visible=1
-        [ "$state" = 3 ] && [ "$invalid" = 0 ] && complete=1
-        state=0; continue ;;
-      "") continue ;;
-    esac
-    case "$state:$stripped" in
-      1:Approve) state=2; n=1 ;;
-      2:Deny) state=3; n=2 ;;
-      1:*) question="$question ; $stripped"; continue ;;
-      *) invalid=1; continue ;;
-    esac
-    if printf '%s' "$line" | grep -qE $'\x1b\\[48;2;[0-9]+;[0-9]+;[0-9]+m'; then
-      [ -z "$selected" ] || invalid=1
-      selected="$n"
-    fi
-  done <<EOF
-$win
-EOF
-  # Unknown choices require attention even though automated selection refuses.
-  [ "$2" = visible ] && { [ "$visible" = 1 ]; return; }
-  [ "$complete" = 1 ] && [ "$invalid" = 0 ] || return 1
-  case "$2" in
-    options) printf '1\tApprove\n2\tDeny\n' ;;
-    selected) printf '%s' "$selected" ;;
-    question) printf '%s' "$question" ;;
-  esac
+  # One parser process per snapshot, not sed/grep subprocesses per screen
+  # row. The latter made one reviewed approval take seconds of process churn.
+  printf '%s\n' "$win" | python3 -c '
+import re, sys
+ansi = re.compile(r"\x1b\[[0-9;]*m")
+highlight = re.compile(r"\x1b\[48;2;[0-9]+;[0-9]+;[0-9]+m")
+state = 0
+question = []
+selected = ""
+invalid = complete = visible = False
+for line in sys.stdin:
+    text = re.sub(r"^[^A-Za-z0-9]+", "", ansi.sub("", line)).rstrip(" \t\r\n│─╮")
+    if text.startswith("Allow tool:"):
+        state, question, selected = 1, [text], ""
+        invalid = complete = visible = False
+        continue
+    if state == 0:
+        if text:
+            complete = visible = False
+        continue
+    if text.startswith("up/down navigate") and "enter select" in text:
+        visible = True
+        complete = state == 3 and not invalid
+        state = 0
+        continue
+    if not text:
+        continue
+    if state == 1 and text == "Approve":
+        state, n = 2, "1"
+    elif state == 2 and text == "Deny":
+        state, n = 3, "2"
+    elif state == 1:
+        question.append(text)
+        continue
+    else:
+        invalid = True
+        continue
+    if highlight.search(line):
+        invalid = invalid or bool(selected)
+        selected = n
+mode = sys.argv[1]
+if mode == "visible":
+    sys.exit(0 if visible else 1)
+if not complete or invalid:
+    sys.exit(1)
+if mode == "options":
+    print("1\tApprove\n2\tDeny")
+elif mode == "selected":
+    print(selected, end="")
+elif mode == "question":
+    print(" ; ".join(question), end="")
+' "$2"
 }
 
 prompt_menu_options()  { _prompt_menu "$1" options; }
@@ -234,35 +236,19 @@ prompt_question() {
 # (lib/command-policy.sh), for deciding whether automation may answer a prompt
 # or must escalate it to a human.
 #
-# Deliberately NOT named prompt_command, and deliberately not a precise parse of
-# "the command". Pulling an exact command string out of a TUI screenshot is
-# guesswork that fails in the dangerous direction: a near-miss extraction hands
-# the classifier the WRONG text, and a classifier fed the wrong text returns a
-# confident verdict about something nobody is being asked to approve.
+# A recognized complete omp panel supplies ALL its header/detail rows, not
+# a guessed shell-command extraction. Do not also classify old transcript
+# output above that panel: a previous discussion of rm/credentials is not
+# the pending git-status request. Unknown/numbered layouts retain the whole
+# visible-region fallback because their command boundaries are not known.
 #
-# So this returns the whole visible prompt region — the menu header/details
-# (where omp puts the tool and its arguments) plus the screen text (where Claude
-# renders the command). The classifier then looks for dangerous SHAPES anywhere
-# in that text. The failure mode of that design is escalating a prompt whose
-# prose merely mentions something like `rm -rf`, which costs one human glance;
-# the failure mode of the precise-parse design is silently auto-approving a
-# destructive command because the extractor clipped it.
-#
-# It does its OWN read rather than reusing prompt_context, and that is a
-# correctness fix, not a style choice. prompt_context is built for a Slack alert:
-# it ends in `tail -n 8 | cut -c1-200`, which is right for something a human
-# skims and WRONG for security classification — a command longer than 200
-# characters, or sitting more than eight non-empty lines above the bottom of the
-# pane, was trimmed away before the classifier ever saw it, and a classifier
-# handed the leftovers returns `allow`. That is a fail-open. Here nothing is
-# truncated: only ANSI escapes and box-drawing furniture are stripped.
-#
-# Residual limit, stated rather than papered over: this can only classify what is
-# VISIBLE. A command that has scrolled out of the pane cannot be judged, which is
-# part of why peer authority is opt-in and a human remains the default.
+# Never reuse prompt_context's display trimming (8 lines, 200 columns).
+# Selection separately refuses explicit elision markers. This is still only
+# a visible-text guard, not proof about an indirect script or a sandbox.
 prompt_command_text() {
   local menu win
   menu="$(prompt_menu_question "$1" 2>/dev/null)" || menu=""
+  if [ -n "$menu" ]; then printf '%s\n' "$menu"; return 0; fi
   win="$(herdr pane read "$1" --source visible --lines 60 2>/dev/null)" || win=""
   printf '%s\n%s\n' "$menu" "$(
     printf '%s\n' "$win" \

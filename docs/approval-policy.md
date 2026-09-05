@@ -1,27 +1,43 @@
 # Approval policy — the trust-boundary contract
 
-This is the single place that names the invariants any script touching
-approval, delivery, or auto-answering must satisfy. It doesn't introduce new
-behavior — every rule below is already enforced by existing code, cited by
-file — it exists so a new script (or an outside reviewer) has one page to
-check against instead of reconstructing the boundary from
-`docs/control-plane-design.md`'s design history across several "review
-correction" entries.
+This is the contract for approval, delivery, and automated answering.
+On 2026-09-04 Terrence selected `reviewed_operational` conductor authority and
+`isolation_first` unattended execution through the localhost operating-policy
+form. That grant does not sign governance gates, approve production mutations,
+or authorize a worker to expand its own scope.
 
 If you're adding a new automated-answering path, a new spawn surface, or a
 new remote-control channel, it MUST satisfy every rule here or explain in
 its own header comment why a rule doesn't apply.
 
-## 1. Only "allow" may be answered without a human
+## 1. Peer defaults and reviewed conductor authority are distinct
 
-`lib/command-policy.sh`'s `classify_command` is the sole gate between "an
-agent auto-presses a key for another agent" and "a human must look at this."
-It classifies the raw shell text behind a prompt into `allow` / `escalate` /
-`deny`. Peer automation (`herdr-select.sh --authority peer`) may act ONLY on
-`allow`; anything else is refused, unconditionally, with no key pressed
-(exit 8). `--authority human` still records the verdict — a person may
-approve a destructive command — but the decision is attributable, not
-silent. (Design history: `docs/control-plane-design.md` correction 8.)
+`herdr-select.sh --authority peer` remains the non-interactive default:
+only `classify_command=allow` may proceed. `--authority human` records an
+explicit human decision. Neither is silently promoted to conductor authority.
+
+`--authority conductor` requires an active registered task owned by the
+caller's current pane and birth identity, a complete recognized omp panel,
+`--expect-prompt-id`, an operational `--review-category`, and a nonempty
+`--review-reason`. It records the original classifier verdict, reviewer,
+category, and reason before attempting input. The conductor must inspect the
+**complete command/script and actual target**, not just a clipped summary or
+a worker's assurance. Categories:
+
+- `local-read`: task-scoped research, local read-only shell/eval.
+- `local-build`: reviewed local tests/builds and supporting task operations.
+- `branch-work`: assigned worktree edits, commits, non-main pushes, PR creation.
+- `owned-cleanup`: verified task-owned disposable files/worktrees/containers.
+
+The grant permits reviewed false positives in the built-in `escalate`
+heuristic; it never overrides `deny` or operator-added restrictions.
+`conductor_reserved_reason` additionally refuses recognized secret-value,
+remote-mutation, main-merge/push, governance, and control-weakening forms.
+Production/customer writes, secret-value exposure, unrelated bulk deletion,
+main merges, governance signatures, new spending, and weakening controls
+remain **human-only**, whether or not a regex recognizes their spelling.
+The categories/reason are a trusted conductor's accountable attestation,
+not proof that arbitrary shell/eval code is semantically safe.
 
 Operator-added rules (`HERDR_POLICY_EXTRA_RULES`) run through the identical
 normalized text as the built-in table and can only ADD `escalate`/`deny`
@@ -99,6 +115,14 @@ against accident and stale signals, not a hostile actor with equivalent
 access. New docs or scripts describing a trust boundary MUST state what it
 actually defends against, rather than imply a containment guarantee it
 doesn't provide.
+
+Executory loops may not run unattended until their worker boundary is
+enforced. Same-user host workers remain attended/trusted operations. Rule
+files, worktrees, model intelligence, and the `conductor` flag are not that
+boundary; workers must not receive host credentials or control sockets.
+Native omp task subagents are a separate authorization boundary: v18.1.10
+sets their approval mode to YOLO while retaining explicit tool policies.
+Do not claim that a herdr launch floor governs those descendants.
 
 ---
 

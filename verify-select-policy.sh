@@ -38,7 +38,7 @@ herdr() {
     "pane process-info")
       printf '{"result":{"process_info":{"foreground_processes":[{"name":"claude","cmdline":"claude --model sonnet"}]}}}\n' ;;
     "pane list")
-      printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s","cwd":"/tmp"}]}}\n' "$PANE" "$BIRTH" ;;
+      printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s","cwd":"/tmp"},{"pane_id":"w9:p9","terminal_id":"cond-birth","cwd":"/tmp"}]}}\n' "$PANE" "$BIRTH" ;;
     "pane read")
       cat "$SCREEN" ;;
     "pane send-keys")
@@ -216,6 +216,63 @@ reset_keys
   bash "$here/herdr-select.sh" "$PANE" 1 --authority peer >/dev/null 2>&1 ); rc=$?
 [ "$rc" -eq 8 ] && ok "operator rule escalates it" || bad "exit $rc (expected 8)"
 [ "$(keys_pressed)" = "0" ] && ok "no key pressed under the operator rule" || bad "keys pressed=$(keys_pressed)"
+
+printf '== reviewed conductor: owned task, exact prompt, attributed exception ==\n'
+. "$here/lib/prompt-parse.sh"
+set_menu() {
+  printf 'Allow tool: bash\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' "$1" > "$SCREEN"
+}
+conductor_select() {
+  ( export HERDR_PANE_ID=w9:p9
+    sel 1 --authority conductor --review-category owned-cleanup \
+      --review-reason "Reviewed complete command; target is this task-owned disposable directory." \
+      --expect-prompt-id "$(prompt_id "$PANE")" )
+}
+set_menu "git status"; reset_keys
+{ printf 'Previous research discussed rm -rf /tmp/example\n'; cat "$SCREEN"; } > "$WORK/with-history"
+mv "$WORK/with-history" "$SCREEN"
+sel 1 --authority peer; rc=$?
+[ "$rc" = 0 ] && [ "$(cat "$KEYS")" = Enter ] \
+  && ok "complete pending panel is not contaminated by prior transcript examples" || bad "old transcript escalated safe git status"
+set_task_state run1 task1 running >/dev/null 2>&1
+set_menu "rm -rf /wt/scratch"; reset_keys
+conductor_select; rc=$?
+[ "$rc" = 0 ] && [ "$(cat "$KEYS")" = Enter ] \
+  && ok "registered conductor can approve reviewed task-owned cleanup" || bad "reviewed exception failed: $(cat "$WORK/err.txt")"
+[ "$(q_appr authority)" = conductor ] && [ "$(count_events approval_reviewed)" -eq 1 ] \
+  && ok "review is recorded as conductor, never laundered as human" || bad "missing attributable conductor review"
+
+printf '== incomplete or self-issued conductor review refuses without input ==\n'
+reset_keys
+( export HERDR_PANE_ID=w9:p9; sel 1 --authority conductor --review-category owned-cleanup ); rc=$?
+[ "$rc" = 2 ] && [ "$(keys_pressed)" = 0 ] && ok "missing review/prompt binding refused" || bad "accepted unbound review"
+( export HERDR_PANE_ID="$PANE"
+  sel 1 --authority conductor --review-category owned-cleanup --review-reason reviewed \
+    --expect-prompt-id "$(prompt_id "$PANE")" ); rc=$?
+[ "$rc" = 8 ] && [ "$(keys_pressed)" = 0 ] && ok "worker cannot use its own identity to approve itself" || bad "self approval accepted"
+
+printf '== reserved actions and site restrictions cannot use conductor exception ==\n'
+for command in "cat ~/.aws/credentials" "wrangler deploy" "gh pr merge 12" "git push origin main" "mkfs /dev/disk9"; do
+  set_menu "$command"; reset_keys
+  conductor_select; rc=$?
+  [ "$rc" = 8 ] && [ "$(keys_pressed)" = 0 ] && ok "human boundary held: $command" || bad "conductor granted reserved action: $command"
+done
+set_menu "rm -rf /wt/scratch"; reset_keys
+( export HERDR_POLICY_EXTRA_RULES="$(printf 'escalate\trm\tsite cleanup requires human')"; conductor_select ); rc=$?
+[ "$rc" = 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "equal-severity site rule cannot hide behind built-in escalation reason" || bad "site policy bypassed"
+
+printf '== clipped approvals refuse, but a known Deny remains safe ==\n'
+set_menu "printf […200ch elided…]"; reset_keys
+conductor_select; rc=$?
+[ "$rc" = 8 ] && [ "$(keys_pressed)" = 0 ] && ok "clipped command cannot be reviewed by assertion" || bad "clipped approval accepted"
+printf 'Allow tool: bash\nCommand: mkfs /dev/disk9\n\nApprove\n\033[48;2;42;47;65m Deny\033[0m\n\nup/down navigate  enter select  esc cancel\n' > "$SCREEN"
+sel 2 --authority peer; rc=$?
+[ "$rc" = 0 ] && [ "$(cat "$KEYS")" = Enter ] && ok "peer can deny an unsafe request without approving it" || bad "safe denial blocked"
+reset_keys
+set_task_state run1 task1 completed >/dev/null 2>&1
+conductor_select; rc=$?
+[ "$rc" = 8 ] && [ "$(keys_pressed)" = 0 ] && ok "completed task no longer grants conductor authority" || bad "terminal task accepted"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

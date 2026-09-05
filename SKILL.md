@@ -166,24 +166,24 @@ background-job facility; it exits on a blocker and must be rearmed after that
 blocker is resolved. An unknown menu still wakes for inspection but is not
 auto-selectable. A polling helper is not a permanently installed supervisor.
 
-**Granting permission prompts directly.** `herdr-select.sh`'s
-`classify_command` (see `docs/approval-policy.md` rule 1) is deliberately
-conservative — it refuses rather than guesses, and that is correct, not a
-bug to route around by loosening the classifier. A conductor holding the
-herdr socket already has the authority to press keys directly
-(`docs/approval-policy.md` rule 7 says exactly this: the trust boundary
-isn't a containment boundary against someone with that access). When you
-choose to grant something `herdr-select.sh` refused: **read the actual
-command/script content immediately before granting, not from an earlier
-turn** — the same TOCTOU discipline rule 3 requires of `herdr-select.sh`
-itself applies to you making the call by hand. Verified-safe categories seen
-in practice: cleanup of a symlink/worktree you just watched get created,
-test fixtures whose literal string content matches a dangerous pattern
-(read the file — a `rm -rf` inside a script is not the same as a live
-`rm -rf` invocation), ephemeral/mocked infra (a throwaway Docker Postgres, a
-fully self-mocked `herdr` shell function), and read-only queries that only
-print. Never grant an actual unreviewed production write or a real secret
-VALUE exposure yourself — those stay with the human even under this rule.
+**Handle routine approvals as the conductor, not as the human.** The default
+peer path still approves only classifier `allow`. Terrence's 2026-09-04
+operating-policy decision authorizes fresh-reviewed, task-scoped operational
+exceptions through the audited path:
+
+```bash
+./herdr-select.sh <worker-pane> 1 --authority conductor \
+  --expect-prompt-id <fresh-id> --review-category local-read \
+  --review-reason "Reviewed the complete command and its task-scoped target."
+```
+
+Use `local-read`, `local-build`, `branch-work`, or `owned-cleanup` as appropriate.
+Read the actual full script/command immediately before granting. Do not
+impersonate a human or bypass a refusal with raw socket keys. Deny-class
+actions, operator restrictions, and the human-reserved boundaries in
+`docs/approval-policy.md` stay with Terrence. A reason string records judgment;
+it does not contain an untrusted process. Unattended execution requires the
+approved isolated worker boundary; host panes remain attended/trusted work.
 
 **Closing out.** Once a worker's own message/completion event shows it's
 genuinely done (not just an idle prompt mid-turn — check the last real
