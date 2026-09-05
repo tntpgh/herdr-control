@@ -168,6 +168,10 @@ def parse_args(argv):
     p.add_argument("--max-file-mb", type=int, default=64, help="snapshot: refuse tracked files larger than this")
     p.add_argument("--max-snapshot-gb", type=float, default=2.0, help="snapshot: refuse exports larger than this")
     p.add_argument("--no-workspace-git", action="store_true", help="do not git-init a baseline commit inside the worker's /workspace")
+    p.add_argument("--input", action="append", default=[], metavar="NAME=REPO[@REF]",
+                   help="extra git repo exported READ-ONLY (same secret/harness filters as the main snapshot) at /herdr/inputs/NAME; repeatable")
+    p.add_argument("--input-dir", action="append", default=[], metavar="NAME=DIR",
+                   help="plain directory copied READ-ONLY at /herdr/inputs/NAME after per-file screening (no symlinks, no .env/key files); repeatable")
     a = p.parse_args(argv)
     if not MODEL_RE.match(a.model):
         p.error("--model must be provider-qualified: anthropic/<id> or openai-codex/<id>")
@@ -182,6 +186,20 @@ def parse_args(argv):
         p.error("refusing to run the worker as root")
     if a.task_id is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,40}", a.task_id):
         p.error("--task-id must be [A-Za-z0-9_.-], max 41 chars")
+    seen = set()
+    a.inputs = []
+    for kind, items in (("repo", a.input), ("dir", a.input_dir)):
+        for item in items:
+            name, sep, target = item.partition("=")
+            if not sep or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,40}", name) or not target:
+                p.error(f"--input{'-dir' if kind == 'dir' else ''} wants NAME=PATH with NAME [A-Za-z0-9_-]: {item!r}")
+            if name in seen:
+                p.error(f"duplicate input name {name!r}")
+            seen.add(name)
+            ref = "HEAD"
+            if kind == "repo" and "@" in target:
+                target, ref = target.rsplit("@", 1)
+            a.inputs.append({"name": name, "kind": kind, "path": os.path.abspath(target), "ref": ref})
     tools = [t for t in a.worker_tools.split(",") if t]
     if not tools or any(not re.fullmatch(r"[a-z_]+", t) for t in tools):
         p.error("--worker-tools must be a comma-separated list of omp tool names")
@@ -401,6 +419,63 @@ def export_snapshot(repo, commit, dest, max_file_bytes, max_total_bytes):
     manifest["file_count"] = len(manifest["files"])
     manifest["excluded_count"] = len(manifest["excluded"])
     return manifest
+
+
+def export_dir(src, dest, manifest, max_file_bytes, max_total_bytes):
+    """Screened copy of a plain directory: same name/dir filters as the git
+    snapshot, private-key content sniff, symlinks and specials skipped and
+    recorded, size caps enforced. Used for data directories (a ledger) that
+    are not git-tracked; a live host tree is never bind-mounted."""
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
+        rel_dir = os.path.relpath(dirpath, src)
+        rel_dir = "" if rel_dir == "." else rel_dir
+        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS and not os.path.islink(os.path.join(dirpath, d)))
+        for name in sorted(filenames):
+            rel = os.path.join(rel_dir, name) if rel_dir else name
+            full = os.path.join(dirpath, name)
+            st = os.lstat(full)
+            if stat.S_ISLNK(st.st_mode):
+                manifest["excluded"].append({"path": rel, "reason": "symlink"}); continue
+            if not stat.S_ISREG(st.st_mode):
+                manifest["excluded"].append({"path": rel, "reason": "special-file"}); continue
+            reason = _excluded_reason(rel)
+            if reason:
+                manifest["excluded"].append({"path": rel, "reason": reason}); continue
+            if st.st_size > max_file_bytes:
+                manifest["excluded"].append({"path": rel, "reason": "too-large"}); continue
+            with open(full, "rb") as f:
+                head = f.read(SNIFF_BYTES)
+            if PRIVATE_KEY_MARK in head:
+                manifest["excluded"].append({"path": rel, "reason": "private-key-content"}); continue
+            total += st.st_size
+            if total > max_total_bytes:
+                raise Fail(EXIT_PREFLIGHT, f"input {src} exceeds --max-snapshot-gb")
+            out = os.path.join(dest, rel)
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            shutil.copyfile(full, out)
+            os.chmod(out, 0o644)
+            manifest["files"].append({"path": rel, "size": st.st_size})
+    manifest["file_count"] = len(manifest["files"])
+    manifest["excluded_count"] = len(manifest["excluded"])
+    manifest["total_bytes"] = total
+    return manifest
+
+
+def export_inputs(inputs, task_dir, max_file_bytes, max_total_bytes, log):
+    out = []
+    for inp in inputs:
+        dest = os.path.join(task_dir, "inputs", inp["name"])
+        os.makedirs(dest, mode=0o700)
+        if inp["kind"] == "repo":
+            m = export_snapshot(inp["path"], inp["commit"], dest, max_file_bytes, max_total_bytes)
+        else:
+            m = export_dir(inp["path"], dest, {"schema": SCHEMA + "/manifest", "files": [], "excluded": [], "submodules": []}, max_file_bytes, max_total_bytes)
+        m.update({"name": inp["name"], "kind": inp["kind"], "path": inp["path"], "ref": inp.get("ref"), "commit": inp.get("commit")})
+        log(f"input {inp['name']}: {m['file_count']} files, {m['excluded_count']} excluded")
+        loosen_for_container(dest)
+        out.append(m)
+    return out
 
 
 # --- change collection ---------------------------------------------------------------
@@ -802,6 +877,7 @@ def build_plan(a, task_id, task_dir, commit, main_root, operator_rules, image_id
         "--mount", f"type=bind,src={d('brief')},dst=/herdr/brief,readonly",
         "--mount", f"type=bind,src={d('operator')},dst=/herdr/operator,readonly",
         "--mount", f"type=bind,src={d('config', 'omp')},dst=/herdr/config,readonly",
+        *[m for inp in a.inputs for m in ("--mount", f"type=bind,src={d('inputs', inp['name'])},dst=/herdr/inputs/{inp['name']},readonly")],
         image_id, *omp_args,
     ]
     relay_create = [
@@ -833,7 +909,8 @@ def build_plan(a, task_id, task_dir, commit, main_root, operator_rules, image_id
         "task_dir": task_dir,
         "image": {"ref": a.image, "id": image_id, "label": f"{IMAGE_LABEL}={IMAGE_LABEL_VALUE}"},
         "source": {"repo": os.path.abspath(a.repo), "main_root": main_root, "ref": a.ref, "commit": commit,
-                   "operator_rules": operator_rules, "brief": os.path.abspath(a.brief)},
+                   "operator_rules": operator_rules, "brief": os.path.abspath(a.brief),
+                   "inputs": [{k: v for k, v in i.items() if k != "commit" or v} for i in a.inputs]},
         "networks": {
             "task": {"name": f"{prefix}-net-task", "flags": "--internal --ipv6=false --opt com.docker.network.bridge.gateway_mode_ipv4=isolated", "members": ["worker", "relay"]},
             "egress": {"name": f"{prefix}-net-egress", "flags": "--ipv6=false", "members": ["relay"]},
@@ -857,7 +934,7 @@ def models_yml():
     )
 
 
-def worker_rules_text(repo, commit, model, operator_rules_path, operator_text, git_baseline):
+def worker_rules_text(repo, commit, model, operator_rules_path, operator_text, git_baseline, inputs=()):
     git_note = (
         "- /workspace is a git repository whose single commit on `main` is the baseline snapshot; use `git status`/`git diff` to review your own changes. There is no remote and nothing you commit leaves the container."
         if git_baseline else
@@ -869,6 +946,7 @@ def worker_rules_text(repo, commit, model, operator_rules_path, operator_text, g
         f"- You are omp {OMP_VERSION} running in an isolated container for one finite task. Model: `{model}`.",
         f"- /workspace is an export of `{repo}` at commit `{commit}` with untracked files, .git, .env*, key files and agent/harness config deliberately omitted.",
         git_note,
+        *([f"- Read-only inputs under /herdr/inputs: {', '.join(i['name'] for i in inputs)} — each is an export/screened copy, never a live checkout; nothing there is writable or committed."] if inputs else []),
         "- Writable: /workspace and /herdr/out. Everything else is read-only; /tmp and $HOME are small tmpfs scratch.",
         "- There is NO network except the model relay. Package installs, web fetches, host services, Docker, ssh and DNS for external names all fail by design — do not retry them or work around it.",
         "- No credentials exist here. Do not search for them.",
@@ -898,7 +976,7 @@ def make_task_dir(work_root, task_id):
     if os.path.exists(task_dir):
         raise Fail(EXIT_USAGE, f"task dir already exists: {task_dir}")
     os.makedirs(task_dir, mode=0o700)
-    for sub in ("staging", "baseline", "out", "brief", "operator", "config/omp", "secrets", "logs", "artifacts"):
+    for sub in ("staging", "baseline", "out", "brief", "operator", "config/omp", "secrets", "logs", "artifacts", "inputs"):
         os.makedirs(os.path.join(task_dir, sub), mode=0o700)
     os.chmod(os.path.join(task_dir, "secrets"), 0o700)
     return task_dir
@@ -946,6 +1024,11 @@ def preflight(a, log):
         operator_rules = os.path.abspath(a.operator_rules) if a.operator_rules else derive_operator_rules(main_root)
         if operator_rules is None or not os.path.isfile(operator_rules):
             raise Fail(EXIT_PREFLIGHT, f"no operator AGENTS.md found in an ancestor of {main_root}; pass --operator-rules or --no-operator-rules")
+    for inp in a.inputs:
+        if not os.path.isdir(inp["path"]):
+            raise Fail(EXIT_PREFLIGHT, f"--input{'-dir' if inp['kind'] == 'dir' else ''} {inp['name']}: not a directory: {inp['path']}")
+        if inp["kind"] == "repo":
+            inp["commit"] = git(inp["path"], "rev-parse", "--verify", "--end-of-options", inp["ref"] + "^{commit}").strip()
     master_token = read_token_file(a.gateway_token_file, log)
 
     rc, out, err = _run(["docker", "version", "--format", "{{.Server.Version}}"], timeout=30)
@@ -1008,7 +1091,7 @@ def write_task_inputs(a, task_dir, pre, task_id, task_token):
         with open(pre["operator_rules"], "r", encoding="utf-8", errors="replace") as f:
             operator_text = f.read()
     with open(d("operator", "worker-rules.md"), "w", encoding="utf-8") as f:
-        f.write(worker_rules_text(os.path.abspath(a.repo), pre["commit"], a.model, pre["operator_rules"], operator_text, not a.no_workspace_git))
+        f.write(worker_rules_text(os.path.abspath(a.repo), pre["commit"], a.model, pre["operator_rules"], operator_text, not a.no_workspace_git, a.inputs))
     with open(d("config", "omp", "models.yml"), "w", encoding="utf-8") as f:
         f.write(models_yml())
     passwd, group = passwd_files(a.container_uid, a.container_gid)
@@ -1097,6 +1180,7 @@ def main(argv=None):
         manifest = export_snapshot(a.repo, pre["commit"], os.path.join(task_dir, "staging"), a.max_file_mb * 1024 * 1024, int(a.max_snapshot_gb * (1 << 30)))
         manifest["repo"] = os.path.abspath(a.repo)
         manifest["ref"] = a.ref
+        manifest["inputs"] = export_inputs(a.inputs, task_dir, a.max_file_mb * 1024 * 1024, int(a.max_snapshot_gb * (1 << 30)), log)
         manifest_path = os.path.join(task_dir, "manifest.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
