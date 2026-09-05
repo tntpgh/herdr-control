@@ -247,9 +247,14 @@ policy_reason="$(classify_reason)"
 
 # Refusing a known Deny choice executes no requested action. Conversely, an
 # approval whose arguments the TUI elided is not a complete review surface.
+# Both checks judge the SAME text that was classified — never a fresh read,
+# which can come back empty on a torn frame and would fail open.
 if [ "$authority" != human ] && [ "$declining" = 0 ] && [ "$mechanism" = menu ]; then
-  review_panel="$(prompt_menu_question "$pane")"
-  case "$review_panel" in
+  if [ -z "${cmd_text//[[:space:]]/}" ]; then
+    echo "herdr-select: refusing — cannot read the approval panel in $pane." >&2
+    exit 8
+  fi
+  case "$cmd_text" in
     *"elided"*|*"truncated"*)
       echo "herdr-select: approval arguments are clipped; ask the worker for a complete, shorter request." >&2
       exit 8 ;;
@@ -261,7 +266,7 @@ if [ "$authority" = conductor ] && [ "$declining" = 0 ]; then
     echo "herdr-select: conductor cannot approve unreadable or deny-class actions." >&2
     exit 8
   fi
-  reservation="$(conductor_reserved_reason "$(prompt_menu_question "$pane")")"
+  reservation="$(conductor_reserved_reason "$cmd_text")"
   if [ -n "$reservation" ]; then
     echo "herdr-select: $reservation" >&2
     exit 8

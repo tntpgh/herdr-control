@@ -148,9 +148,19 @@ state = 0
 question = []
 selected = ""
 invalid = complete = visible = False
-for line in sys.stdin:
-    text = re.sub(r"^[^A-Za-z0-9]+", "", ansi.sub("", line)).rstrip(" \t\r\n│─╮")
-    if text.startswith("Allow tool:"):
+# Read bytes: a stray non-UTF-8 byte in a pane must degrade to U+FFFD, not
+# abort the parser and silence the wake path.
+for raw in sys.stdin.buffer:
+    line = raw.decode("utf-8", "replace")
+    plain = ansi.sub("", line)
+    # `text` (leading punctuation stripped) is ONLY for header/option/footer
+    # matching. `body` keeps a command row intact — `-rf`, `--flag`, `| sh`,
+    # `~/.ssh` — because it is what gets classified.
+    text = re.sub(r"^[^A-Za-z0-9]+", "", plain).rstrip(" \t\r\n│─╮")
+    body = re.sub(r"^[\s│]+", "", plain).rstrip(" \t\r\n│─╮")
+    # A header row only OPENS a panel; inside one it is command content
+    # (a multi-line command can contain the literal text "Allow tool:").
+    if state == 0 and text.startswith("Allow tool:"):
         state, question, selected = 1, [text], ""
         invalid = complete = visible = False
         continue
@@ -163,14 +173,14 @@ for line in sys.stdin:
         complete = state == 3 and not invalid
         state = 0
         continue
-    if not text:
+    if not body:
         continue
     if state == 1 and text == "Approve":
         state, n = 2, "1"
     elif state == 2 and text == "Deny":
         state, n = 3, "2"
     elif state == 1:
-        question.append(text)
+        question.append(body)
         continue
     else:
         invalid = True
