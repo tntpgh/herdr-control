@@ -43,7 +43,7 @@ resolve_conductor_id() {
 # every time. Without it (SessionStart's one-time cost), an explicit
 # "no changes" line is useful confirmation that reconciliation actually ran.
 run_reconciliation() {
-  local conductor_id="$1" hook_event="$2" quiet=0 hook_json=1
+  local conductor_id="$1" hook_event="$2" quiet=0 hook_json=1 defer=0
   shift 2
   # Flags rather than one positional: agent-hooks/omp-reconcile.sh needs the
   # human summary WITHOUT the trailing hookSpecificOutput line. That JSON is
@@ -51,10 +51,22 @@ run_reconciliation() {
   # injects context by returning a message from its before_agent_start handler
   # instead (agent-hooks/omp-herdr-control.ts), so emitting Claude's envelope
   # there would just print a stray JSON blob into the omp session.
+  #
+  # --defer-ack separates PREPARING a report from ACKNOWLEDGING it. Claude's
+  # hook protocol captures this function's stdout and injects it, so for those
+  # callers printing IS delivery and the checkpoint may commit inline. omp's
+  # interval path is different: the extension shim used to spawn the sweep
+  # with stdout ignored while this function checkpointed the report as
+  # delivered — every mid-session report was silently consumed unseen, and
+  # the next session start said "no changes". Under --defer-ack a deliverable
+  # report is emitted as a JSON envelope WITHOUT moving task_states or the
+  # event cursor; the consumer feeds the envelope back through
+  # `omp-reconcile.sh ack` only after the injection was actually accepted.
   while [ $# -gt 0 ]; do
     case "$1" in
       --quiet-if-empty) quiet=1 ;;
       --no-hook-json)   hook_json=0 ;;
+      --defer-ack)      defer=1 ;;
     esac
     shift
   done
@@ -193,6 +205,37 @@ run_reconciliation() {
             state=$(printf '%s' "$task_json" | jq -r '.state // empty')
           fi
         fi
+
+        # ---- conductor identity (the un-re-checked half of restart recovery)
+        # The sweep above corroborates the WORKER pane after a herdr restart;
+        # the conductor's pane is exactly as recyclable and was never
+        # revalidated here — lib/push-wake.sh does refuse a mismatched
+        # conductor at delivery time, but that refusal is invisible until now.
+        # Surface the uncertainty as an event, once per changed live identity
+        # (the dedup event_id keys on the live fingerprint), for the event
+        # consumption pass below to report. Deliberately neither rebaselined
+        # nor treated as task death: no agent_session corroboration exists
+        # for the conductor side, so "unknown identity" is the honest verdict
+        # — a human/conductor decides whether to re-register, not this sweep.
+        if [ "$have_live" = 1 ]; then
+          case "$state" in
+            starting|running|blocked)
+              local cond_pane cond_birth cond_live
+              cond_pane=$(printf '%s' "$task_json" | jq -r '.conductor_pane_id // empty')
+              cond_birth=$(printf '%s' "$task_json" | jq -r '.conductor_pane_birth // empty')
+              if [ -n "$cond_pane" ] && [ -n "$cond_birth" ]; then
+                cond_live="$(_live_birth_for "$cond_pane")"
+                if [ "$cond_live" != "$cond_birth" ]; then
+                  append_event "$run_id" "$task_id" "conductor_identity_uncertain" \
+                    "$(jq -nc --arg pane "$cond_pane" --arg reg "$cond_birth" --arg live "$cond_live" \
+                      '{conductor_pane_id:$pane, registered_birth:$reg, live_birth:$live,
+                        reason:(if $live=="" then "conductor_pane_gone" else "conductor_pane_birth_mismatch" end)}')" \
+                    "condid_${run_id}_${task_id}_${cond_live:-gone}" >/dev/null 2>&1
+                fi
+              fi
+              ;;
+          esac
+        fi
         ;;
     esac
 
@@ -224,7 +267,92 @@ run_reconciliation() {
     esac
   done < <(all_tasks_json)
 
-  write_checkpoint "$conductor_id" "$new_checkpoint"
+  # ---- PASS 3: consume the event stream (cursor, not state) ----------------
+  # The task_states map above is keyed on updated_at, which has second
+  # granularity and only moves on a STATE change — a renewed prompt on an
+  # already-blocked worker, a wake that failed delivery, an identity
+  # uncertainty: none of those move it, so none of them were ever reported.
+  # events_since/advance-cursor existed for exactly this and had no consumer.
+  # Ownership scope: a conductor reports events for tasks it registered
+  # (task.conductor_id matches), plus tasks with no attributable conductor
+  # ('' legacy rows, 'conductor_unknown' scheduled spawns) — somebody must
+  # surface a conductorless worker's verified input request, and the sweeping
+  # conductor is the only somebody there is. Other conductors' tasks are
+  # skipped but still advance THIS conductor's own cursor: each conductor's
+  # checkpoint row is independent, so skipping here hides nothing from the
+  # owner. The cursor itself is only committed at the ack point below, so a
+  # failed delivery replays these events instead of losing them.
+  local ev_json ev_seq ev_type ev_owner ev_label ev_repo ev_detail ev_at
+  local max_seq=0 ev_shown=0 ev_elided=0
+  while IFS= read -r ev_json; do
+    [ -n "$ev_json" ] || continue
+    ev_seq=$(printf '%s' "$ev_json" | jq -r '.sequence // 0')
+    case "$ev_seq" in *[!0-9]*) ev_seq=0 ;; esac
+    [ "$ev_seq" -gt "$max_seq" ] && max_seq="$ev_seq"
+    ev_type=$(printf '%s' "$ev_json" | jq -r '.type // empty')
+    case "$ev_type" in
+      input_required|push_wake_refused|pane_identity_uncertain|conductor_identity_uncertain|stale_worker_hook_refused|completion_evidence) ;;
+      wake_result)
+        # A submitted wake needs no report — the conductor it woke IS the
+        # audience. Only failures are silent and need surfacing.
+        [ "$(printf '%s' "$ev_json" | jq -r '.payload.outcome // empty')" = "submitted" ] && continue ;;
+      *) continue ;;
+    esac
+    ev_owner=$(printf '%s' "$ev_json" | jq -r '.task_conductor_id // empty')
+    case "$ev_owner" in ''|conductor_unknown|"$conductor_id") ;; *) continue ;; esac
+    # Bounded: a conductor whose cursor has never advanced (first pass after
+    # this feature, or a long-dead checkpoint) may face a deep backlog; a
+    # session-start injection must not be 500 lines of history. Everything
+    # scanned is still acknowledged via max_seq — elided lines are counted,
+    # not lost silently.
+    if [ "$ev_shown" -ge 20 ]; then
+      ev_elided=$((ev_elided + 1))
+      continue
+    fi
+    ev_label=$(printf '%s' "$ev_json" | jq -r 'if (.label // "") != "" then .label else (.task_id // "?") end')
+    ev_repo=$(printf '%s' "$ev_json" | jq -r '.repo // "" | split("/") | last // ""')
+    ev_at=$(printf '%s' "$ev_json" | jq -r '.occurred_at // "?"')
+    ev_detail=$(printf '%s' "$ev_json" | jq -r \
+      '[(.payload.reason // empty), (.payload.outcome // empty),
+        (if (.payload.prompt_id // "") != "" then "prompt=" + .payload.prompt_id else empty end)]
+       | map(select(. != "")) | join(" ")')
+    report_lines="${report_lines}- ${ev_type}: ${ev_label} (${ev_repo:-?})${ev_detail:+ — ${ev_detail}}  [${ev_at}]"$'\n'
+    report_count=$((report_count + 1))
+    ev_shown=$((ev_shown + 1))
+  done < <(events_since "$conductor_id")
+  if [ "$ev_elided" -gt 0 ]; then
+    report_lines="${report_lines}- (+${ev_elided} older event(s) acknowledged unlisted — query the registry events table for history)"$'\n'
+    report_count=$((report_count + 1))
+  fi
+
+  # ---- commit or defer ------------------------------------------------------
+  if [ "$defer" = 1 ]; then
+    if [ "$report_count" -eq 0 ]; then
+      # Nothing deliverable: acknowledging now cannot lose anything, and the
+      # throttle clock must advance either way.
+      ack_reconcile "$conductor_id" "$new_checkpoint" "$max_seq"
+      [ "$quiet" = 1 ] && return 0
+      jq -nc --arg c "$conductor_id" \
+        --arg r "wake-persistence: no task-state changes since this conductor (${conductor_id}) last checked in." \
+        '{report:$r, ack_required:false, conductor_id:$c}'
+      return 0
+    fi
+    # Deliverable content: hold the acknowledgment. Only the throttle clock
+    # moves now; the consumer feeds this envelope back through
+    # `omp-reconcile.sh ack` after the injection was actually accepted, and a
+    # consumer that dies first simply causes redelivery on a later pass.
+    touch_checkpoint_clock "$conductor_id"
+    local summary="wake-persistence: ${report_count} update(s) since this conductor (${conductor_id}) last checked:"$'\n'"${report_lines%$'\n'}"
+    jq -nc --arg r "$summary" --arg c "$conductor_id" \
+      --argjson t "$new_checkpoint" --argjson s "$max_seq" \
+      '{report:$r, ack_required:true, conductor_id:$c, task_states:$t, last_event_seq:$s}'
+    return 0
+  fi
+
+  # Inline mode (Claude hook callers): printing IS delivery — the hook runner
+  # captures stdout and injects it as additionalContext — so the task_states
+  # map and the event cursor commit together, here.
+  ack_reconcile "$conductor_id" "$new_checkpoint" "$max_seq"
 
   if [ "$report_count" -eq 0 ]; then
     [ "$quiet" = 1 ] && return 0
@@ -234,7 +362,7 @@ run_reconciliation() {
     return 0
   fi
 
-  local summary="wake-persistence: ${report_count} task(s) changed state since this conductor (${conductor_id}) last checked:"$'\n'"${report_lines%$'\n'}"
+  local summary="wake-persistence: ${report_count} update(s) since this conductor (${conductor_id}) last checked:"$'\n'"${report_lines%$'\n'}"
   printf '%s\n' "$summary"
   [ "$hook_json" = 1 ] && jq -nc --arg ev "$hook_event" --arg ctx "$summary" '{hookSpecificOutput:{hookEventName:$ev, additionalContext:$ctx}}'
   return 0

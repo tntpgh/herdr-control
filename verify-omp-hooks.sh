@@ -303,6 +303,72 @@ bash "$here/agent-hooks/omp-reconcile.sh" bogus >/dev/null 2>"$WORK/r.err"; rc=$
 [ "$rc" -eq 0 ] && ok "exit 0 (never fails the agent's turn)" || bad "exit $rc"
 grep -q 'unknown mode' "$WORK/r.err" && ok "unknown mode explained on stderr" || bad "silent on a bad mode"
 
+printf '== envelope contract: undelivered session report replays until acked ==\n'
+# The session pass above emitted its envelope and nobody acked it — exactly a
+# consumer that died between delivery and ack. The report must REPLAY.
+env_s1="$(bash "$here/agent-hooks/omp-reconcile.sh" session 2>/dev/null)"
+printf '%s' "$env_s1" | jq -e '.ack_required == true' >/dev/null 2>&1 \
+  && ok "session envelope demands an ack" || bad "no ack-demanding envelope: $env_s1"
+printf '%s' "$env_s1" | jq -r '.report' | grep -q 'wake-persistence' \
+  && ok "unacked report replays across passes" || bad "unacked report lost: $env_s1"
+printf '%s' "$env_s1" | bash "$here/agent-hooks/omp-reconcile.sh" ack 2>/dev/null
+env_s2="$(bash "$here/agent-hooks/omp-reconcile.sh" session 2>/dev/null)"
+printf '%s' "$env_s2" | jq -e '.ack_required == false' >/dev/null 2>&1 \
+  && ok "acked report stops replaying (ack committed states + cursor)" || bad "still pending after ack: $env_s2"
+printf 'garbage not json' | bash "$here/agent-hooks/omp-reconcile.sh" ack 2>/dev/null; rc=$?
+[ "$rc" -eq 0 ] && ok "garbage ack is a no-op, never a crash" || bad "garbage ack exit $rc"
+
+printf '== terminal task: hook rejected BEFORE state change or actionable event ==\n'
+# A recycled pane's next occupant inherits stale HERDR_RUN_ID/TASK_ID env; a
+# hook already in flight can fire after the sweep buried its task. Neither
+# may resurrect state OR append a fresh "needs input" fact for a dead task.
+set_task_state run1 task1 running >/dev/null 2>&1
+set_task_state run1 task1 completed >/dev/null 2>&1
+omp_menu_screen "stale-test-cmd" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+: > "$SENT"
+n_input_before=$(q_event input_required)
+run_notify bash
+[ "$(q_state)" = "completed" ] && ok "terminal state not resurrected to blocked" || bad "state=$(q_state)"
+[ "$(q_event input_required)" = "$n_input_before" ] \
+  && ok "no input_required appended for a dead task" || bad "dead task generated an actionable event"
+[ "$(q_event stale_worker_hook_refused)" -ge 1 ] \
+  && ok "refusal recorded (reconciliation surfaces it)" || bad "stale hook refused silently"
+printf '%s' "$(q_payload stale_worker_hook_refused)" | grep -q '"reason":"task_terminal"' \
+  && ok "refusal names the reason" || bad "refusal payload: $(q_payload stale_worker_hook_refused)"
+[ ! -s "$SENT" ] && ok "no wake typed for a terminal task" || bad "woke the conductor about a dead task: $(cat "$SENT")"
+
+printf '== repeated wake attempts: every outcome recorded, first result not frozen ==\n'
+# The old constant event ids ("<base>_result") + INSERT OR IGNORE preserved
+# the FIRST transport outcome forever: a wake that succeeded then failed on
+# re-prompt (or vice versa) was unrecordable. Two attempts at the SAME
+# logical prompt must yield two correlated, individually identifiable rows.
+register_task run3 task3 w3 cond3 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt3 "impl:attempts" >/dev/null 2>&1
+run_notify_for() {                      # <run> <task> <tool>
+  printf '{"tool":"%s","message":"omp needs permission","cwd":"/tmp/repo"}' "$3" \
+    | ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" \
+               HERDR_RUN_ID="$1" HERDR_TASK_ID="$2" HERDR_TASK_LABEL="impl:attempts"
+        bash "$here/agent-hooks/omp-notify.sh" >/dev/null 2>&1 )
+}
+omp_menu_screen "attempt-cmd-A" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+run_notify_for run3 task3 bash          # conductor clean -> submitted
+omp_menu_screen "attempt-cmd-A" > "$WORKER_SCREEN"   # SAME logical prompt again
+omp_menu_screen "busy" > "$COND_SCREEN"              # conductor mid-prompt -> refused
+run_notify_for run3 task3 bash
+n_res=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE type='wake_result' AND task_id='task3';")
+[ "$n_res" = "2" ] && ok "both attempts recorded ($n_res rows)" || bad "wake_result rows for task3: $n_res"
+outcomes=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT json_extract(payload,'\$.outcome') FROM events WHERE type='wake_result' AND task_id='task3' ORDER BY sequence;")
+printf '%s' "$outcomes" | head -1 | grep -q 'submitted' \
+  && ok "first attempt's outcome preserved (submitted)" || bad "outcomes: $outcomes"
+printf '%s' "$outcomes" | tail -1 | grep -qE 'refused|unsubmitted' \
+  && ok "second attempt's DIFFERENT outcome recorded, not swallowed by dedup" || bad "outcomes: $outcomes"
+n_keys=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(DISTINCT json_extract(payload,'\$.wake_key')) FROM events WHERE type='wake_result' AND task_id='task3';")
+[ "$n_keys" = "1" ] && ok "both rows correlate to the same logical prompt (wake_key)" || bad "wake_key count: $n_keys"
+
 printf '== the TS extension shim actually drives these scripts (needs bun) ==\n'
 # The shim and the shell scripts were verified separately; this proves they
 # compose. Without it, a rename or a changed stdin contract on either side would
@@ -355,6 +421,65 @@ await new Promise(r => setTimeout(r, 600));
   grep -q 'RECONCILE mode=session'  "$REC" && ok "session reconcile invoked"  || bad "no session reconcile"
   grep -q 'RECONCILE mode=interval' "$REC" && ok "interval reconcile invoked" || bad "no interval reconcile"
   grep -q 'RESOLVE' "$REC" && ok "alert retraction invoked" || bad "no retraction"
+
+  printf '== TS shim: envelope reports are DELIVERED (sendMessage) then ACKED ==\n'
+  # The regression this pins: the old shim spawned the interval pass with
+  # stdout ignored while the script checkpointed the report as delivered —
+  # every mid-session report was consumed unseen. Now the interval report
+  # must reach pi.sendMessage, and the ack must carry the whole envelope
+  # back; a fake pi with no sendMessage must produce NO ack (redelivery).
+  SHIM2="$WORK/shim2"; mkdir -p "$SHIM2/agent-hooks"
+  cat > "$SHIM2/agent-hooks/omp-notify.sh" <<'EOS'
+#!/usr/bin/env bash
+cat >/dev/null
+EOS
+  cat > "$SHIM2/agent-hooks/omp-reconcile.sh" <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  session)  printf '{"report":"wake-persistence: session hello","ack_required":true,"conductor_id":"condZ","task_states":{},"last_event_seq":4}\n' ;;
+  interval) printf '{"report":"wake-persistence: deferred hello","ack_required":true,"conductor_id":"condZ","task_states":{},"last_event_seq":9}\n' ;;
+  ack)      cat >> "$REC2.ack"; printf 'ACK\n' >> "$REC2" ;;
+esac
+exit 0
+EOS
+  cat > "$SHIM2/herdr-resolve.sh" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+  chmod +x "$SHIM2/agent-hooks/"*.sh "$SHIM2/herdr-resolve.sh"
+  export REC2="$SHIM2/rec.log"; : > "$REC2"; : > "$REC2.ack"
+  shim2_out="$(HERDR_CONTROL_DIR="$SHIM2" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+const sent = [];
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, sendMessage: (m) => { sent.push(m); } });
+const bas = handlers["before_agent_start"]({});
+console.log("SESSION_INJECT:" + (bas && bas.message ? bas.message.content : "none"));
+handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
+await new Promise(r => setTimeout(r, 800));
+console.log("SENT:" + sent.length + ":" + (sent[0] ? sent[0].content : ""));
+' 2>&1)"
+  printf '%s' "$shim2_out" | grep -q 'SESSION_INJECT:wake-persistence: session hello' \
+    && ok "session envelope report injected (not raw JSON)" || bad "session inject: $shim2_out"
+  printf '%s' "$shim2_out" | grep -q 'SENT:1:wake-persistence: deferred hello' \
+    && ok "interval report delivered through pi.sendMessage" || bad "sendMessage never saw the report: $shim2_out"
+  ack_n=$(grep -c 'ACK' "$REC2" 2>/dev/null || true)
+  [ "${ack_n:-0}" = "2" ] && ok "both envelopes acked exactly once each" || bad "ack count: ${ack_n:-0} ($(cat "$REC2" 2>/dev/null))"
+  grep -q '"last_event_seq":9' "$REC2.ack" && grep -q '"last_event_seq":4' "$REC2.ack" \
+    && ok "acks carry the original envelopes back verbatim" || bad "ack stdin: $(cat "$REC2.ack" 2>/dev/null)"
+
+  # No sendMessage available -> the report CANNOT be delivered -> no ack may
+  # be recorded, so the next pass redelivers instead of losing it.
+  : > "$REC2"; : > "$REC2.ack"
+  HERDR_CONTROL_DIR="$SHIM2" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
+handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
+await new Promise(r => setTimeout(r, 800));
+' >/dev/null 2>&1
+  grep -q 'ACK' "$REC2" \
+    && bad "acked an interval report that was never delivered" || ok "undeliverable report left unacked (will replay)"
 fi
 
 printf '\n%s\n' "-----"

@@ -130,6 +130,75 @@ run_reconciliation condF SessionStart --quiet-if-empty --no-hook-json >/dev/null
 check "agent_session opportunistically backfilled" "$(read_task runF taskF | jq -r .agent_session)" "sess-backfilled"
 check "state untouched by a backfill" "$(read_task runF taskF | jq -r .state)" "running"
 
+printf '== event consumption: silent facts surface, once per conductor ==\n'
+# A renewed prompt on an already-blocked worker, a failed wake, an identity
+# uncertainty: none of these move a task's state/updated_at, so the
+# state-keyed report never showed them. They must surface via the event
+# cursor — and only once per conductor.
+register_task runG taskG w condG cpG cbG paneG birthG /repo/g /wt/g "eventful" || bad "register taskG failed"
+set_task_state runG taskG running || bad "taskG -> running failed"
+_PANES=$'paneG\tbirthG\t'
+run_reconciliation condG SessionStart --quiet-if-empty --no-hook-json >/dev/null   # drain condG's backlog
+append_event runG taskG input_required '{"message":"perm?","prompt_id":"p1"}' evG1 || bad "append evG1 failed"
+append_event runG taskG wake_result '{"outcome":"refused","exit_code":5}' evG2 || bad "append evG2 failed"
+append_event runG taskG wake_result '{"outcome":"submitted","exit_code":0}' evG3 || bad "append evG3 failed"
+out=$(run_reconciliation condG SessionStart --no-hook-json)
+printf '%s' "$out" | grep -q 'input_required: eventful' \
+  && ok "input_required surfaces without a state change" || bad "input_required unreported: $out"
+printf '%s' "$out" | grep -q 'wake_result: eventful.*refused' \
+  && ok "failed wake surfaces" || bad "failed wake unreported: $out"
+printf '%s' "$out" | grep -q 'submitted' \
+  && bad "successful wake reported as noise" || ok "submitted wake not reported (its conductor already saw it)"
+out2=$(run_reconciliation condG SessionStart --quiet-if-empty --no-hook-json)
+printf '%s' "$out2" | grep -q 'input_required' \
+  && bad "event re-reported after inline ack" || ok "reported once per conductor, then acknowledged"
+
+printf '== ownership scope: another conductor'\''s events do not leak, owner still sees them ==\n'
+register_task runH taskH w condOTHER cpH cbH paneH birthH /repo/h /wt/h "foreignwork" || bad "register taskH failed"
+set_task_state runH taskH running || bad "taskH -> running failed"
+_PANES=$'paneG\tbirthG\t\npaneH\tbirthH\t'
+append_event runH taskH input_required '{"message":"x","prompt_id":"p2"}' evH1 || bad "append evH1 failed"
+out=$(run_reconciliation condG SessionStart --quiet-if-empty --no-hook-json)
+printf '%s' "$out" | grep -q 'foreignwork' \
+  && bad "another conductor's event leaked into condG" || ok "foreign task's event not reported to condG"
+out=$(run_reconciliation condOTHER SessionStart --quiet-if-empty --no-hook-json)
+printf '%s' "$out" | grep -q 'input_required: foreignwork' \
+  && ok "owning conductor sees its task's event" || bad "owner never shown its event: $out"
+
+printf '== conductor pane identity: surfaced as uncertainty, never buried or reattached ==\n'
+register_task runI taskI w condI cpaneI cbirthI-old paneI birthI /repo/i /wt/i "condcheck" || bad "register taskI failed"
+set_task_state runI taskI running || bad "taskI -> running failed"
+_PANES=$'paneI\tbirthI\t\ncpaneI\tcbirthI-NEW\t'
+out=$(run_reconciliation condI SessionStart --no-hook-json)
+check "worker NOT marked dead for a conductor-side mismatch" "$(read_task runI taskI | jq -r .state)" "running"
+check "conductor_pane_birth NOT silently rebaselined" "$(read_task runI taskI | jq -r .conductor_pane_birth)" "cbirthI-old"
+check "conductor_identity_uncertain logged" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskI' AND type='conductor_identity_uncertain';")" "1"
+printf '%s' "$out" | grep -q 'conductor_identity_uncertain: condcheck' \
+  && ok "uncertainty surfaced in the report" || bad "uncertainty invisible: $out"
+run_reconciliation condI SessionStart --quiet-if-empty --no-hook-json >/dev/null
+check "same live identity does not re-log (dedup per changed fingerprint)" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskI' AND type='conductor_identity_uncertain';")" "1"
+
+printf '== defer-ack: an undelivered report replays; an acked one stops ==\n'
+register_task runJ taskJ w condJ cpJ cbJ paneJ birthJ /repo/j /wt/j "deferred" || bad "register taskJ failed"
+set_task_state runJ taskJ running || bad "taskJ -> running failed"
+_PANES=$'paneJ\tbirthJ\t'
+run_reconciliation condJ SessionStart --quiet-if-empty --no-hook-json >/dev/null   # drain condJ's backlog
+append_event runJ taskJ input_required '{"message":"y","prompt_id":"p3"}' evJ1 || bad "append evJ1 failed"
+env1=$(run_reconciliation condJ SessionStart --quiet-if-empty --no-hook-json --defer-ack)
+printf '%s' "$env1" | jq -e '.ack_required == true' >/dev/null 2>&1 \
+  && ok "deliverable report emits an envelope demanding ack" || bad "no ack-demanding envelope: $env1"
+printf '%s' "$env1" | jq -r '.report' | grep -q 'input_required: deferred' \
+  && ok "report text rides inside the envelope" || bad "report missing from envelope: $env1"
+env2=$(run_reconciliation condJ SessionStart --quiet-if-empty --no-hook-json --defer-ack)
+printf '%s' "$env2" | jq -r '.report' | grep -q 'input_required: deferred' \
+  && ok "unacked report REPLAYS — a failed delivery loses nothing" || bad "unacked report vanished: $env2"
+ack_reconcile condJ "$(printf '%s' "$env2" | jq -c '.task_states')" "$(printf '%s' "$env2" | jq -r '.last_event_seq')" \
+  || bad "ack_reconcile on envelope failed"
+env3=$(run_reconciliation condJ SessionStart --quiet-if-empty --no-hook-json --defer-ack)
+[ -z "$env3" ] && ok "acked report does not replay" || bad "replayed after ack: $env3"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi
