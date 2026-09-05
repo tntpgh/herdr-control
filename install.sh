@@ -8,6 +8,7 @@
 #   ./install.sh              # show what would change, touch nothing
 #   ./install.sh --apply      # make the changes
 #   ./install.sh --apply --bridge     # also install the launchd bridge daemon (macOS)
+#   ./install.sh --apply --hub        # also install the launchd agent for hub.py (localhost:8600)
 #   ./install.sh --apply --repoint    # ALSO repoint any job already wired at a
 #                                      # different checkout (e.g. an APM-deployed
 #                                      # herdr-ops skill copy) to point at THIS one —
@@ -47,11 +48,12 @@
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
-APPLY=0; BRIDGE=0; REPOINT=0
+APPLY=0; BRIDGE=0; HUB=0; REPOINT=0
 for a in "$@"; do
   case "$a" in
     --apply)   APPLY=1 ;;
     --bridge)  BRIDGE=1 ;;
+    --hub)     HUB=1 ;;
     --repoint) REPOINT=1 ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
@@ -347,6 +349,25 @@ if [ "$BRIDGE" = 1 ]; then
     launchctl load "$PLIST" && echo "bridge daemon loaded ($PLIST)"
   else
     echo "  + would install launchd plist -> $PLIST"
+  fi
+fi
+
+# ---- local hub (optional, macOS) --------------------------------------------
+# hub.py at http://127.0.0.1:8600/ — the operator's one page (decisions inbox,
+# herdr attention, fleet, KB nightly, search memory). The omp extension also
+# starts it on session start when the port is free, so this agent only adds
+# "up after reboot, before any session".
+if [ "$HUB" = 1 ]; then
+  PLIST="$HOME/Library/LaunchAgents/com.herdr-control.hub.plist"
+  if [ "$APPLY" = 1 ]; then
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+    sed -e "s|__HUB_PY__|$here/hub.py|" \
+        -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.hub.log|g" \
+      "$here/com.herdr-control.hub.plist.template" > "$PLIST"
+    launchctl unload "$PLIST" 2>/dev/null
+    launchctl load "$PLIST" && echo "hub agent loaded ($PLIST) -> http://127.0.0.1:8600/"
+  else
+    echo "  + would install launchd plist -> $PLIST (hub.py on :8600)"
   fi
 fi
 
