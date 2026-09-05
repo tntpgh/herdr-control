@@ -40,9 +40,9 @@ const ROOT = process.env.HERDR_CONTROL_DIR?.trim() || path.dirname(HERE);
 const NOTIFY_SH = path.join(ROOT, "agent-hooks", "omp-notify.sh");
 const RECONCILE_SH = path.join(ROOT, "agent-hooks", "omp-reconcile.sh");
 const RESOLVE_SH = path.join(ROOT, "herdr-resolve.sh");
-const STATUS_PY = path.join(ROOT, "herdr-status.py");
-const STATUS_PORT = Number(process.env.HERDR_STATUS_PORT) || 8650;
-const STATUS_URL = `http://127.0.0.1:${STATUS_PORT}/`;
+const HUB_PY = path.join(ROOT, "hub.py");
+const HUB_PORT = Number(process.env.HERDR_HUB_PORT) || 8600;
+const HUB_URL = `http://127.0.0.1:${HUB_PORT}/`;
 
 // existsSync can throw on a permission-denied ancestor directory, which is
 // exactly the kind of environment surprise this file must survive without
@@ -64,7 +64,7 @@ function safeExists(p: string): boolean {
 const notifyAvailable = safeExists(NOTIFY_SH);
 const reconcileAvailable = safeExists(RECONCILE_SH);
 const resolveAvailable = safeExists(RESOLVE_SH);
-const statusAvailable = safeExists(STATUS_PY);
+const hubAvailable = safeExists(HUB_PY);
 
 // ---- fire-and-forget spawn --------------------------------------------------
 // Every non-blocking call in this file (Notification, interval reconcile,
@@ -224,16 +224,18 @@ function parseEnvelope(stdout: string): ReconcileEnvelope | undefined {
 // Terrence, 2026-09-05: "I hate seeing a huge amount of info in the
 // herdr-reconcile window when we enter something … should be a web page on
 // localhost, not in our prompts." So: the full wake-persistence report (task
-// states + up to 20 event lines) is never injected. herdr-status.py serves
-// the registry at STATUS_URL; the extension starts it when the port is free
-// (idempotent — a second copy exits when the port is taken). What still
-// reaches the model is at most ONE line, at session start only, and nothing
-// mid-session. The envelope is acked exactly as before, so the conductor's
-// cursor advances and the page — not the next prompt — carries the history.
-function ensureStatusServer(): void {
-  if (!statusAvailable) return;
+// states + up to 20 event lines) is never injected. hub.py serves the
+// registry, the decisions inbox and the rest at HUB_URL; the extension starts
+// it when the port is free (idempotent — a second copy exits when the port is
+// taken; launchd normally has it up already). What still reaches the model is
+// at most ONE line, at session start only, and only when something needs a
+// human: tasks needing attention or an open decision form. The envelope is
+// acked exactly as before, so the conductor's cursor advances and the page —
+// not the next prompt — carries the history.
+function ensureHub(): void {
+  if (!hubAvailable) return;
   try {
-    const child = spawn("python3", [STATUS_PY, "--port", String(STATUS_PORT)], {
+    const child = spawn("python3", [HUB_PY, "--port", String(HUB_PORT)], {
       detached: true,
       stdio: ["ignore", "ignore", "ignore"],
     });
@@ -244,10 +246,21 @@ function ensureStatusServer(): void {
   }
 }
 
-// "wake-persistence: 22 update(s) since …" -> 22; anything else -> 0.
-function updateCount(report: string): number {
-  const m = /^wake-persistence:\s+(\d+)\s+update/.exec(report);
-  return m ? Number(m[1]) : 0;
+// {attention, open_decisions} from the hub, or undefined when it is not up
+// yet (first start on a machine without the launchd agent) — bounded so a
+// slow hub costs the session start at most 2s.
+function hubSummary(): { attention: number; open_decisions: number } | undefined {
+  try {
+    const r = spawnSync("curl", ["-s", "--max-time", "2", `${HUB_URL}api/summary`], { encoding: "utf8" });
+    if (r.error || r.status !== 0 || !r.stdout) return undefined;
+    const j: unknown = JSON.parse(r.stdout);
+    if (!j || typeof j !== "object" || !("attention" in j) || !("open_decisions" in j)) return undefined;
+    const attention = Number(j.attention);
+    const open_decisions = Number(j.open_decisions);
+    return Number.isFinite(attention) && Number.isFinite(open_decisions) ? { attention, open_decisions } : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // ---- SessionStart: before_agent_start --------------------------------------
@@ -261,23 +274,27 @@ function onBeforeAgentStart():
   | { message: { customType: string; content: string; display: boolean } }
   | undefined {
   try {
-    ensureStatusServer();
-    if (!reconcileAvailable) return undefined;
-    const result = spawnSync("bash", [RECONCILE_SH, "session"], {
-      encoding: "utf8",
-      timeout: 15_000,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    if (result.error) return undefined;
-    const env = parseEnvelope(result.stdout ?? "");
-    if (!env || !env.report) return undefined;
-    if (env.ackRequired) spawnDetached([RECONCILE_SH, "ack"], env.raw);
-    const n = updateCount(env.report);
-    if (n === 0) return undefined; // "no task-state changes" — say nothing
+    ensureHub();
+    if (reconcileAvailable) {
+      const result = spawnSync("bash", [RECONCILE_SH, "session"], {
+        encoding: "utf8",
+        timeout: 15_000,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (!result.error) {
+        const env = parseEnvelope(result.stdout ?? "");
+        if (env?.ackRequired) spawnDetached([RECONCILE_SH, "ack"], env.raw);
+      }
+    }
+    const s = hubSummary();
+    if (!s || s.attention + s.open_decisions === 0) return undefined; // nothing needs a human — say nothing
+    const parts = [];
+    if (s.attention) parts.push(`${s.attention} task(s) need attention`);
+    if (s.open_decisions) parts.push(`${s.open_decisions} decision(s) open`);
     return {
       message: {
         customType: "herdr-reconcile",
-        content: `herdr: ${n} task update(s) since this conductor last checked — ${STATUS_URL}`,
+        content: `hub: ${parts.join(", ")} — ${HUB_URL}`,
         display: true,
       },
     };

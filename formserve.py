@@ -40,10 +40,12 @@ import argparse
 import hmac
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -206,6 +208,48 @@ def deliver(target: str, url: str, answers: dict) -> None:
         print(f"formserve: delivered to {target}", file=sys.stderr)
 
 
+# ---- hub registry ------------------------------------------------------------
+# hub.py's /decisions inbox lists every form this script serves: one JSON file
+# per run under ~/.local/state/herdr/forms/, written at start (status open),
+# rewritten on submit (answered, with the answers) or timeout (expired). The
+# hub treats "open but the port no longer answers" as gone. Registry failures
+# never affect the form itself — the human's page comes first.
+FORMS_DIR = Path(os.environ.get("HERDR_STATE_ROOT", Path.home() / ".local/state/herdr")) / "forms"
+
+
+def _title_of(html_bytes: bytes, fallback: str) -> str:
+    m = re.search(rb"<h1[^>]*>(.*?)</h1>", html_bytes, re.I | re.S) or re.search(rb"<title>(.*?)</title>", html_bytes, re.I | re.S)
+    if not m:
+        return fallback
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1).decode("utf-8", "replace"))).strip() or fallback
+
+
+def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: float) -> Path | None:
+    try:
+        FORMS_DIR.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        path = FORMS_DIR / f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime(now))}-{port}.json"
+        path.write_text(json.dumps({
+            "id": path.stem, "title": _title_of(html_bytes, form.stem), "url": url, "port": port,
+            "form_path": str(form), "pid": os.getpid(), "status": "open",
+            "created_at": int(now * 1000), "expires_at": int((now + timeout) * 1000) if timeout > 0 else None,
+        }, indent=1))
+        return path
+    except OSError as e:
+        print(f"formserve: hub registry not written ({e}); the form itself is unaffected", file=sys.stderr)
+        return None
+
+
+def update_form(path: Path | None, **fields) -> None:
+    if path is None:
+        return
+    try:
+        data = json.loads(path.read_text())
+        data.update(fields, answered_at=int(time.time() * 1000))
+        path.write_text(json.dumps(data, indent=1))
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"formserve: hub registry not updated ({e})", file=sys.stderr)
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("form", help="path to the HTML file to serve")
@@ -255,6 +299,7 @@ def main() -> int:
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     print(f"formserve: serving {form.name} at {url}", file=sys.stderr)
+    registry = register_form(form, html, url, port, args.timeout)
 
     if not args.no_open:
         open_in_pane(url)
@@ -273,6 +318,7 @@ def main() -> int:
         # Word this carefully. "No answers submitted" reads as "the human
         # declined", and an agent acting on that would proceed as if it had an
         # answer it does not have. The form EXPIRED; nobody said anything.
+        update_form(registry, status="expired")
         print(f"formserve: form EXPIRED after {args.timeout}s with no submission. "
               f"This is not a decline — the page stopped being reachable and the "
               f"question is still unanswered. Re-serve it, or raise --timeout.",
@@ -280,6 +326,7 @@ def main() -> int:
         return 1
 
     answers = result.get("answers", {})
+    update_form(registry, status="answered", answers=answers)
     print(json.dumps(answers, indent=2, sort_keys=True))
     if args.deliver:
         deliver(args.deliver, url, answers)
