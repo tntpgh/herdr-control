@@ -193,6 +193,22 @@ if [ "$dry" = 1 ]; then
 fi
 
 # ---- worktree: create or reuse ---------------------------------------------
+# A NEW branch is cut from origin's default branch, never from the local
+# checkout's HEAD: the local checkout is routinely a dirty, stale lane (2026-09-05:
+# knowledge-base's was 76 commits behind, so a worker spent its first minutes
+# hunting for files that only existed on origin/main). --base still overrides.
+if [ -z "$base" ] && ! git -C "$root" show-ref --verify --quiet "refs/heads/${branch}"; then
+  git -C "$root" fetch -q origin 2>/dev/null || echo "spawn-task: fetch failed — basing on the last-known origin ref" >&2
+  def=$(git -C "$root" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null); def=${def#origin/}
+  if [ -z "$def" ]; then
+    def=$(git -C "$root" remote show origin 2>/dev/null | sed -n 's/^ *HEAD branch: //p')
+  fi
+  if [ -n "$def" ] && git -C "$root" show-ref --verify --quiet "refs/remotes/origin/${def}"; then
+    base="origin/${def}"
+  else
+    echo "spawn-task: could not resolve origin's default branch — basing on local HEAD (pass --base to be explicit)" >&2
+  fi
+fi
 if git -C "$root" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt"; then
   :  # already checked out here
 elif git -C "$root" show-ref --verify --quiet "refs/heads/${branch}"; then
