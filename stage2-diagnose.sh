@@ -196,7 +196,7 @@ BRIEF_FILE="$(mktemp "${TMPDIR:-/tmp}/stage2-diagnose-brief.XXXXXX")"
 # commits the returned patch after checking its scope).
 if [ "${SCHEDULED:-0}" = 1 ]; then
   LEDGER_LINE='`/herdr/inputs/ledger/*.jsonl` (a read-only copy of the Stage-1 engineering ledger)'
-  SIBLINGS_LINE='Sibling repos are READ-ONLY exports under `/herdr/inputs/knowledge-base`, `/herdr/inputs/tourguide`, `/herdr/inputs/thurber-ai` (tracked files only; no .git, no secrets) -- read/grep/glob there, zero edits.'
+  SIBLINGS_LINE='Sibling repos are READ-ONLY exports under `/herdr/inputs/knowledge-base`, `/herdr/inputs/tourguide`, `/herdr/inputs/thurber-ai`, `/herdr/inputs/herdr-control` (tracked files only; no .git, no secrets) -- read/grep/glob there, zero edits.'
   OUTPUT_LINE='`docs/tracking/'"$(date -u +%Y-%m-%d)"'-stage2-diagnose-pass.md` under `/workspace` (thurber-os). Do NOT commit and do NOT create any other file in /workspace; the orchestrator commits the returned patch on the pass branch only if that is the sole change.'
   DONE_LINE='Write the doc, then write /herdr/out/RESULT.md with: findings count by classification, headline items, and anything a human must decide. Then stop.'
 else
@@ -308,7 +308,7 @@ if [ "${SCHEDULED:-0}" = 1 ]; then
         exit 1
     fi
     ISO_INPUTS=()
-    for sib in knowledge-base tourguide thurber-ai; do
+    for sib in knowledge-base tourguide thurber-ai herdr-control; do
         [ -d "$HOME/Code/$sib/.git" ] || [ -f "$HOME/Code/$sib/.git" ] || {
             emit_loop_run diagnose failed 0 "isolated pass: sibling repo missing: $HOME/Code/$sib"; exit 1; }
         ISO_INPUTS+=(--input "$sib=$HOME/Code/$sib@$(_ref_for "$HOME/Code/$sib")")
