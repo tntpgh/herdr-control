@@ -114,21 +114,34 @@ clean_screen() { printf ' $ \n ready\n'; }
 . "$here/lib/run-registry.sh"
 register_task run1 task1 w1 cond1 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt "impl:omp-test" >/dev/null 2>&1
 
-printf '== spawn-task.sh must stamp the worker its OWN pane id ==\n'
-# A static check, and worth one: this omission silently disabled the ENTIRE omp
-# push path and nothing caught it, because every other test supplies
-# HERDR_PANE_ID itself. omp-notify.sh refuses to alert without knowing which pane
-# to read (it cannot verify a prompt painted), so an unstamped worker no-ops on
-# every tool call — a feature that is fully wired, fully tested, and completely
-# inert in production. Two other things quietly depend on it too:
-# lib/push-wake.sh captures prompt_id only when it is set (so --expect-prompt-id
-# was unusable from a push wake), and the wake text names the worker's pane.
-# Found by running a real omp worker, not by any of the stubbed suites.
-if grep -q 'HERDR_PANE_ID=%q' "$here/spawn-task.sh"; then
-  ok "spawn-task.sh stamps HERDR_PANE_ID into the worker environment"
-else
-  bad "spawn-task.sh does NOT stamp HERDR_PANE_ID — the omp push path is inert"
-fi
+. "$here/lib/prompt-parse.sh"
+printf '== current boxed omp menu: command details are not choices ==\n'
+printf '╭─ Allow tool: bash ─╮\n│\n│ Command: printf smoke │\n│\n│ \033[48;2;42;47;65m  Approve\033[0m │\n│ Deny │\n│\n│ up/down navigate  enter select  esc cancel │\n╰──╯\n' > "$WORKER_SCREEN"
+[ "$(prompt_menu_options "$WPANE")" = "$(printf '1\tApprove\n2\tDeny')" ] \
+  && ok "only actual choices are offered" || bad "command detail parsed as an option"
+[ "$(prompt_menu_selected "$WPANE")" = 1 ] \
+  && ok "Approve is selected as option 1" || bad "highlight points to wrong option"
+printf '%s' "$(prompt_menu_question "$WPANE")" | grep -q 'Command: printf smoke' \
+  && ok "command remains in the prompt identity" || bad "command omitted from question"
+: > "$SENT"
+bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer >"$WORK/select.out" 2>"$WORK/select.err"; rc=$?
+[ "$rc" = 0 ] && [ "$(cat "$SENT")" = "send-keys $WPANE Enter" ] \
+  && ok "boxed approval selects once without bogus arrow navigation" \
+  || bad "selection failed: $(cat "$WORK/select.err") $(cat "$SENT")"
+printf '╭─ Allow tool: bash ─╮\n│ Command: printf smoke │\n│ Approve │\n│ Deny │\n' > "$WORKER_SCREEN"
+[ -z "$(prompt_menu_options "$WPANE")" ] \
+  && ok "truncated menu offers no actionable choices" || bad "accepted incomplete menu"
+printf 'Allow tool: bash\n\nApprove\nAlways allow\nDeny\nup/down navigate  enter select  esc cancel\n' > "$WORKER_SCREEN"
+[ -z "$(prompt_menu_options "$WPANE")" ] \
+  && ok "unknown additional permission choice fails closed" || bad "accepted unknown menu"
+prompt_menu_visible "$WPANE" && ok "unknown menu still requires attention" || bad "unknown menu hidden from notifier"
+omp_menu_screen "printf 'enter select'" > "$WORKER_SCREEN"
+[ "$(prompt_menu_selected "$WPANE")" = 1 ] \
+  && ok "footer words inside a command do not hide its menu" || bad "command text mistaken for navigation footer"
+printf 'Task complete.\n' >> "$WORKER_SCREEN"
+[ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
+  && ok "dismissed menu above new output is not actionable" || bad "stale menu still active"
+
 
 printf '== the Slack alert must be ANSWERABLE for a menu-shape prompt ==\n'
 # Reported live: "I see the message, but no buttons show on slack for me to
@@ -245,11 +258,29 @@ printf '== a recycled conductor pane refuses the wake ==\n'
 omp_menu_screen "ls" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
 : > "$SENT"
+set_task_state run1 task1 running >/dev/null 2>&1
 CBIRTH="cterm-DIFFERENT"
 run_notify bash
 [ ! -s "$SENT" ] && ok "nothing delivered into a recycled conductor pane" || bad "delivered anyway: $(cat "$SENT")"
 [ "$(q_event push_wake_refused)" -ge 1 ] && ok "push_wake_refused recorded" || bad "no push_wake_refused event"
+[ "$(q_state)" = blocked ] && ok "blocked state survives unreachable conductor" || bad "worker hidden by failed conductor delivery"
 CBIRTH="cterm-1"
+
+printf '== conductorless worker still persists its verified input request ==\n'
+set_task_state run1 task1 running >/dev/null 2>&1
+CPANE=""
+: > "$SENT"
+run_notify bash
+[ "$(q_state)" = blocked ] && [ ! -s "$SENT" ] \
+  && ok "conductorless prompt is blocked without injecting anywhere" || bad "conductorless input request lost"
+CPANE="w2:p1"
+
+printf '== unknown menu remains alertable but not auto-selectable ==\n'
+printf 'Allow tool: bash\n\nApprove\nAlways allow\nDeny\nup/down navigate  enter select  esc cancel\n' > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+: > "$NOTIFIED"
+run_notify bash
+[ -s "$NOTIFIED" ] && ok "unrecognized choices still produce an alert" || bad "strict selection parser hid a real prompt"
 
 printf '== no HERDR_PANE_ID -> silent (cannot verify a prompt, so must not alert) ==\n'
 omp_menu_screen "rm -rf /" > "$WORKER_SCREEN"

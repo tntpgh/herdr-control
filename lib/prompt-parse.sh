@@ -131,78 +131,69 @@ _MENU_HEADER='Allow tool:'
 _MENU_FOOTER='enter select'
 
 _menu_window() {
-  herdr pane read "$1" --source visible --lines 40 --format ansi 2>/dev/null | tail -n 20
+  herdr pane read "$1" --source visible --lines 60 --format ansi 2>/dev/null
 }
 
-# Strip ANSI escapes, then any leading non-alphanumeric run — the highlighted
-# row's leading icon glyph survives ANSI-stripping (it's a real character,
-# not an escape sequence) — then surrounding whitespace.
+# Strip styling and the box, not just whitespace: current omp wraps both
+# command details and choices in a bordered panel.
 _menu_strip() {
-  printf '%s' "$1" | sed -E $'s/\x1b\\[[0-9;]*m//g' | sed -E 's/^[^[:alnum:]]+//; s/[[:space:]]+$//'
+  printf '%s' "$1" | sed -E $'s/\x1b\\[[0-9;]*m//g' \
+    | sed -E 's/^[^[:alnum:]]+//; s/[[:space:]│─╮]+$//'
 }
 
-prompt_menu_options() {
-  local win n=0 state=0 line stripped
+# Parse the complete, known two-choice approval menu from ONE snapshot.
+# Blank rows separate command details too; they are not an option boundary.
+# Unknown/truncated menu shapes fail closed rather than turning detail text
+# into option 1 and arrow-walking forever toward a row that cannot be selected.
+_prompt_menu() {                       # <pane> visible|options|selected|question
+  local win line stripped state=0 question="" selected="" n=0 invalid=0 complete=0 visible=0
   win=$(_menu_window "$1") || return 1
   while IFS= read -r line; do
-    case "$state" in
-      0) printf '%s' "$line" | grep -qF "$_MENU_HEADER" && state=1; continue ;;
-      1)
-        stripped=$(_menu_strip "$line")
-        [ -z "$stripped" ] && state=2
+    stripped=$(_menu_strip "$line")
+    case "$stripped" in
+      "$_MENU_HEADER"*)
+        state=1; question="$stripped"; selected=""; n=0; invalid=0; complete=0; visible=0
         continue ;;
-      2)
-        printf '%s' "$line" | grep -qF "$_MENU_FOOTER" && { state=3; continue; }
-        stripped=$(_menu_strip "$line")
-        [ -n "$stripped" ] || continue
-        n=$((n+1))
-        printf '%d\t%s\n' "$n" "$stripped" ;;
     esac
-  done <<EOF
-$win
-EOF
-}
-
-prompt_menu_selected() {
-  local win n=0 state=0 found="" line stripped
-  win=$(_menu_window "$1") || return 1
-  while IFS= read -r line; do
-    case "$state" in
-      0) printf '%s' "$line" | grep -qF "$_MENU_HEADER" && state=1; continue ;;
-      1)
-        stripped=$(_menu_strip "$line")
-        [ -z "$stripped" ] && state=2
-        continue ;;
-      2)
-        printf '%s' "$line" | grep -qF "$_MENU_FOOTER" && { state=3; continue; }
-        stripped=$(_menu_strip "$line")
-        [ -n "$stripped" ] || continue
-        n=$((n+1))
-        printf '%s' "$line" | grep -qE $'\x1b\\[48;2;[0-9]+;[0-9]+;[0-9]+m' && found="$n" ;;
-    esac
-  done <<EOF
-$win
-EOF
-  printf '%s' "$found"
-}
-
-prompt_menu_question() {
-  local win state=0 line stripped out=""
-  win=$(_menu_window "$1") || return 1
-  while IFS= read -r line; do
     if [ "$state" = 0 ]; then
-      printf '%s' "$line" | grep -qF "$_MENU_HEADER" && state=1
+      # A dismissed menu still in the viewport is not an active prompt.
+      [ -z "$stripped" ] || { complete=0; visible=0; }
+      continue
     fi
-    if [ "$state" = 1 ]; then
-      stripped=$(_menu_strip "$line")
-      [ -z "$stripped" ] && break
-      out="${out:+$out ; }$stripped"
+    case "$stripped" in
+      "up/down navigate"*"$_MENU_FOOTER"*)
+        visible=1
+        [ "$state" = 3 ] && [ "$invalid" = 0 ] && complete=1
+        state=0; continue ;;
+      "") continue ;;
+    esac
+    case "$state:$stripped" in
+      1:Approve) state=2; n=1 ;;
+      2:Deny) state=3; n=2 ;;
+      1:*) question="$question ; $stripped"; continue ;;
+      *) invalid=1; continue ;;
+    esac
+    if printf '%s' "$line" | grep -qE $'\x1b\\[48;2;[0-9]+;[0-9]+;[0-9]+m'; then
+      [ -z "$selected" ] || invalid=1
+      selected="$n"
     fi
   done <<EOF
 $win
 EOF
-  printf '%s' "$out"
+  # Unknown choices require attention even though automated selection refuses.
+  [ "$2" = visible ] && { [ "$visible" = 1 ]; return; }
+  [ "$complete" = 1 ] && [ "$invalid" = 0 ] || return 1
+  case "$2" in
+    options) printf '1\tApprove\n2\tDeny\n' ;;
+    selected) printf '%s' "$selected" ;;
+    question) printf '%s' "$question" ;;
+  esac
 }
+
+prompt_menu_options()  { _prompt_menu "$1" options; }
+prompt_menu_selected() { _prompt_menu "$1" selected; }
+prompt_menu_question() { _prompt_menu "$1" question; }
+prompt_menu_visible()  { _prompt_menu "$1" visible; }
 
 # A stable fingerprint for "this exact prompt, right now" — the question plus
 # its options, hashed. Lets a wake event and a later answer agree on WHICH

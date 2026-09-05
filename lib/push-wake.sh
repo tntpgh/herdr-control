@@ -64,6 +64,20 @@ _wake_outcome_for() {                   # <exit-code> -> token
 push_wake() {
   local msg="$1" where="${2:-}"
   local cpane="${HERDR_CONDUCTOR_PANE_ID:-}"
+  # Persist the worker's state independently of notification delivery. A
+  # scheduled worker can have no conductor; a stopped/recycled conductor
+  # must not make a verified permission prompt disappear from the registry.
+  local pid=""
+  if [ -n "${HERDR_PANE_ID:-}" ]; then
+    pid="$(prompt_id "$HERDR_PANE_ID" 2>/dev/null)" || pid=""
+  fi
+  local base="wake_${HERDR_RUN_ID:-norun}_${HERDR_TASK_ID:-notask}_${pid:-noprompt}"
+  if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
+    set_task_state "$HERDR_RUN_ID" "$HERDR_TASK_ID" "blocked" >/dev/null 2>&1 || true
+    append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
+      "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" '{message:$msg, prompt_id:$prompt_id}')" \
+      "${base}_input" >/dev/null 2>&1 || true
+  fi
   [ -n "$cpane" ] || return 1
 
   pane_is_agent "$cpane" || return 1
@@ -84,13 +98,6 @@ push_wake() {
         return 1
       fi
     fi
-  fi
-
-  # Best-effort: no worker pane means no prompt_id, which is not a reason to
-  # skip the wake — only a reason the receiver cannot revalidate it later.
-  local pid=""
-  if [ -n "${HERDR_PANE_ID:-}" ]; then
-    pid="$(prompt_id "$HERDR_PANE_ID" 2>/dev/null)" || pid=""
   fi
 
   # The [HERDR-PEER-SIGNAL] prefix is machine-readable on purpose: once this
@@ -123,11 +130,6 @@ push_wake() {
     [ -n "$pid" ] && wake="$wake --expect-prompt-id $pid"
   fi
 
-  # Stable event ids: a retried wake for the SAME task and prompt writes the
-  # same two rows rather than a fresh pair each time, which is what makes
-  # at-least-once delivery safe for the consumer (UNIQUE(event_id) dedups).
-  local base="wake_${HERDR_RUN_ID:-norun}_${HERDR_TASK_ID:-notask}_${pid:-noprompt}"
-
   if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
     append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "wake_attempted" \
       "$(jq -nc --arg p "$cpane" --arg pid "$pid" '{conductor_pane:$p, prompt_id:$pid}')" \
@@ -139,13 +141,6 @@ push_wake() {
   local outcome; outcome="$(_wake_outcome_for "$rc")"
 
   if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
-    # blocked BEFORE the result is recorded: the worker is blocked whether or
-    # not the conductor was reachable, and conflating the two is how a stuck
-    # worker ends up looking merely quiet.
-    set_task_state "$HERDR_RUN_ID" "$HERDR_TASK_ID" "blocked" >/dev/null 2>&1 || true
-    append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
-      "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" '{message:$msg, prompt_id:$prompt_id}')" \
-      "${base}_input" >/dev/null 2>&1 || true
     append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "wake_result" \
       "$(jq -nc --arg o "$outcome" --argjson c "$rc" --arg p "$cpane" \
          '{outcome:$o, exit_code:$c, conductor_pane:$p}')" \

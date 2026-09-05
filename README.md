@@ -547,6 +547,14 @@ spawned the worker is still running — close that session and its background
 `wake-on-evidence.sh` poller dies with it, so a reopened session starts blind
 to anything that happened in the meantime.
 
+The omp notification path records the verified worker's `blocked` state and
+`input_required` event **before** checking conductor availability or identity.
+An absent/recycled conductor prevents delivery, not persistence. The polling
+backstop (`wait-for-blocked.sh`) recognizes visible omp menus even when herdr
+reports `working`; unknown choices request attention but cannot be selected
+automatically. This does not install an always-running supervisor or change
+approval authority.
+
 The registry itself is one SQLite database (`registry.sqlite3`, WAL mode)
 under that directory now, not a JSON file per task plus an append-only
 `events.jsonl` per run — the file layout it replaced. Four things the files

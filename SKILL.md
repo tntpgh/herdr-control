@@ -160,6 +160,12 @@ periodically sweep every dispatched pane on your own initiative
 worker doesn't sit unnoticed between signals, and force the issue as a batch
 nears completion instead of waiting for the last stragglers to self-report.
 
+`wait-for-blocked.sh <interval> <max-polls> <pane...>` also detects a visible
+omp approval panel when herdr reports `working`. Run it under your supervised
+background-job facility; it exits on a blocker and must be rearmed after that
+blocker is resolved. An unknown menu still wakes for inspection but is not
+auto-selectable. A polling helper is not a permanently installed supervisor.
+
 **Granting permission prompts directly.** `herdr-select.sh`'s
 `classify_command` (see `docs/approval-policy.md` rule 1) is deliberately
 conservative — it refuses rather than guesses, and that is correct, not a
@@ -294,12 +300,12 @@ script, and it was already wrong for the second agent added. Now
 (`digit` / `menu` / `none`), and `herdr-select.sh` dispatches on that instead
 of guessing: for `menu` it arrow-navigates to the wanted row — confirmed
 after every keystroke via that row's ANSI background-colour highlight, since
-nothing here trusts a keypress landed without checking — then Enter. Verified
-live 2026-07-31 against `omp --approval-mode always-ask`, but only against
-its two-option `Allow tool: bash` shape; a prompt with more options or a
-different header is untested. An agent with **no** declared strategy
-(`none`) is refused the same way an unrecognised prompt always was —
-automation does not guess at a shape it has never been told.
+nothing here trusts a keypress landed without checking — then Enter. The
+flat and bordered two-choice `Allow tool:` panels are supported; command
+details are never numbered as choices. Verified with a live Fable worker
+running a harmless `printf` through peer approval. Unknown choices still
+trigger notification, but selection refuses; a truncated or dismissed menu
+does not supply actionable options.
 
 **Text is never delivered into a prompt.** A blocked agent is usually sitting on
 a permission gate, where typed text is inert and the Enter selects the
