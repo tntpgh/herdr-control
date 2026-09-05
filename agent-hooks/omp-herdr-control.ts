@@ -40,6 +40,9 @@ const ROOT = process.env.HERDR_CONTROL_DIR?.trim() || path.dirname(HERE);
 const NOTIFY_SH = path.join(ROOT, "agent-hooks", "omp-notify.sh");
 const RECONCILE_SH = path.join(ROOT, "agent-hooks", "omp-reconcile.sh");
 const RESOLVE_SH = path.join(ROOT, "herdr-resolve.sh");
+const STATUS_PY = path.join(ROOT, "herdr-status.py");
+const STATUS_PORT = Number(process.env.HERDR_STATUS_PORT) || 8650;
+const STATUS_URL = `http://127.0.0.1:${STATUS_PORT}/`;
 
 // existsSync can throw on a permission-denied ancestor directory, which is
 // exactly the kind of environment surprise this file must survive without
@@ -61,6 +64,7 @@ function safeExists(p: string): boolean {
 const notifyAvailable = safeExists(NOTIFY_SH);
 const reconcileAvailable = safeExists(RECONCILE_SH);
 const resolveAvailable = safeExists(RESOLVE_SH);
+const statusAvailable = safeExists(STATUS_PY);
 
 // ---- fire-and-forget spawn --------------------------------------------------
 // Every non-blocking call in this file (Notification, interval reconcile,
@@ -216,38 +220,64 @@ function parseEnvelope(stdout: string): ReconcileEnvelope | undefined {
   return { report: raw, ackRequired: false, raw };
 }
 
+// ---- the report lives on a web page, not in the prompt ----------------------
+// Terrence, 2026-09-05: "I hate seeing a huge amount of info in the
+// herdr-reconcile window when we enter something … should be a web page on
+// localhost, not in our prompts." So: the full wake-persistence report (task
+// states + up to 20 event lines) is never injected. herdr-status.py serves
+// the registry at STATUS_URL; the extension starts it when the port is free
+// (idempotent — a second copy exits when the port is taken). What still
+// reaches the model is at most ONE line, at session start only, and nothing
+// mid-session. The envelope is acked exactly as before, so the conductor's
+// cursor advances and the page — not the next prompt — carries the history.
+function ensureStatusServer(): void {
+  if (!statusAvailable) return;
+  try {
+    const child = spawn("python3", [STATUS_PY, "--port", String(STATUS_PORT)], {
+      detached: true,
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    child.on("error", () => {});
+    child.unref();
+  } catch {
+    // never into the agent turn
+  }
+}
+
+// "wake-persistence: 22 update(s) since …" -> 22; anything else -> 0.
+function updateCount(report: string): number {
+  const m = /^wake-persistence:\s+(\d+)\s+update/.exec(report);
+  return m ? Number(m[1]) : 0;
+}
+
 // ---- SessionStart: before_agent_start --------------------------------------
-// The only handler here that runs SYNCHRONOUSLY and returns injected
-// context — matching why Claude's install.sh wires session-reconcile.sh
-// with async:false: the report has to be captured BEFORE the first turn's
-// prompt is assembled, and an async ("defer") hook's output is not
-// guaranteed to arrive in time, which would silently defeat the whole point
-// of wake persistence. Bounded by `timeout` so a hung or missing
-// omp-reconcile.sh degrades to "nothing injected", never a stalled session
-// start.
-//
-// The ack fires here, just before returning the message: for this event the
-// runner keeps the first returned message, so a successfully constructed
-// return IS the accepted injection. A spawnSync timeout or parse failure
-// exits earlier, leaving the report unacked for redelivery.
+// Runs SYNCHRONOUSLY (an async hook's output is not guaranteed to land before
+// the first prompt is assembled), bounded by `timeout` so a hung or missing
+// omp-reconcile.sh degrades to "nothing injected". The ack fires just before
+// returning: for this event the runner keeps the first returned message, so
+// a constructed return IS the accepted delivery. A timeout or parse failure
+// exits earlier and leaves the envelope unacked for redelivery.
 function onBeforeAgentStart():
   | { message: { customType: string; content: string; display: boolean } }
   | undefined {
   try {
+    ensureStatusServer();
     if (!reconcileAvailable) return undefined;
     const result = spawnSync("bash", [RECONCILE_SH, "session"], {
       encoding: "utf8",
       timeout: 15_000,
       stdio: ["ignore", "pipe", "ignore"],
     });
-    if (result.error) return undefined; // bash or the script missing/unreadable
+    if (result.error) return undefined;
     const env = parseEnvelope(result.stdout ?? "");
-    if (!env || !env.report) return undefined; // nothing new — same no-op Claude gets
+    if (!env || !env.report) return undefined;
     if (env.ackRequired) spawnDetached([RECONCILE_SH, "ack"], env.raw);
+    const n = updateCount(env.report);
+    if (n === 0) return undefined; // "no task-state changes" — say nothing
     return {
       message: {
         customType: "herdr-reconcile",
-        content: env.report,
+        content: `herdr: ${n} task update(s) since this conductor last checked — ${STATUS_URL}`,
         display: true,
       },
     };
@@ -263,13 +293,13 @@ function onBeforeAgentStart():
 //
 // The interval pass is spawned fire-and-forget for the AGENT (the handler
 // returns immediately; a slow sweep costs the turn nothing) but its stdout
-// is COLLECTED, not ignored: when the sweep emits a report, it is injected
-// through pi.sendMessage — the supported context-injection API for
-// mid-session content — and only a sendMessage that did not throw
-// acknowledges the envelope. The child is deliberately NOT detached/unref'd
-// here: a piped-stdout child needs its parent reading, and this one's whole
-// purpose is to be read.
-function runIntervalReconcile(pi: HookAPI): void {
+// is COLLECTED so the envelope can be acked: the registry cursor advances
+// and the page picks the history up. Nothing is injected into context —
+// mid-session, the conductor learns about worker state from push-wakes
+// ([HERDR-PEER-SIGNAL], omp-notify.sh) and from the status page, not from a
+// 20-line report typed into the next turn. The child is deliberately NOT
+// detached/unref'd: a piped-stdout child needs its parent reading.
+function runIntervalReconcile(): void {
   try {
     const child = spawn("bash", [RECONCILE_SH, "interval"], {
       stdio: ["ignore", "pipe", "ignore"],
@@ -285,19 +315,9 @@ function runIntervalReconcile(pi: HookAPI): void {
     child.on("close", () => {
       try {
         const env = parseEnvelope(out);
-        if (!env || !env.report) return;
-        if (typeof pi.sendMessage !== "function") return; // never acked -> redelivered
-        pi.sendMessage({
-          customType: "herdr-reconcile",
-          content: env.report,
-          display: true,
-        });
-        // sendMessage returned without throwing: the entry is persisted to
-        // the session and participates in LLM context. That is the
-        // "accepted injection" the acknowledgment was waiting for.
-        if (env.ackRequired) spawnDetached([RECONCILE_SH, "ack"], env.raw);
+        if (env?.ackRequired) spawnDetached([RECONCILE_SH, "ack"], env.raw);
       } catch {
-        // sendMessage threw -> no ack -> the report replays next interval.
+        // no ack -> the envelope replays next interval; still never injected.
       }
     });
   } catch {
@@ -305,9 +325,9 @@ function runIntervalReconcile(pi: HookAPI): void {
   }
 }
 
-function onToolResult(pi: HookAPI): undefined {
+function onToolResult(): undefined {
   try {
-    if (reconcileAvailable) runIntervalReconcile(pi);
+    if (reconcileAvailable) runIntervalReconcile();
     if (resolveAvailable) spawnDetached([RESOLVE_SH]);
   } catch {
     // omp swallows tool_result handler errors (unlike tool_call), but this
@@ -334,6 +354,6 @@ function onAgentEnd(): undefined {
 export default function (pi: HookAPI): void {
   pi.on("tool_call", onToolCall);
   pi.on("before_agent_start", onBeforeAgentStart);
-  pi.on("tool_result", () => onToolResult(pi));
+  pi.on("tool_result", onToolResult);
   pi.on("agent_end", onAgentEnd);
 }
