@@ -66,6 +66,20 @@
 #   HERDR_POLICY_EXTRA_RULES=$'deny\tterraform +destroy\tnever unattended\nescalate\tkubectl +delete\task first'
 : "${HERDR_POLICY_EXTRA_RULES:=}"
 
+# ---- canonical operator ancestor rules (managed launches) ------------------
+# Managed omp-backed spawns (spawn-task.sh / spawn-agent.sh) append the
+# nearest ANCESTOR AGENTS.md of the ORIGINAL project root — e.g.
+# ~/Code/AGENTS.md for a project under ~/Code — via omp's
+# --append-system-prompt, with a provenance header naming the source.
+# Task worktrees live under ~/.herdr/worktrees, outside the project's
+# ancestor tree, so upward rule discovery can never reach that file on its
+# own; the worktree's own tracked rules still load through normal discovery.
+# Empty (the default) = DERIVE per project by walking the project root's
+# ancestors up to $HOME. Set a path to pin one explicit source instead; a
+# configured-but-missing/unreadable source FAILS the managed launch loudly —
+# there is no silent "launch without the operator's rules" fallback.
+: "${HERDR_CANONICAL_RULES:=}"
+
 # ---- spawn-task.sh model routing (job-class -> model) ----------------------
 # Claude tiers use the standard aliases (opus/sonnet/haiku) and need no config.
 # Codex model names are yours — edit to match your Codex setup.
@@ -111,7 +125,7 @@
 export HERDR_DEFAULT_AGENT HERDR_SOURCE HERDR_SOCK HERDR_SORT_DONE_FIRST HERDR_SORT_NO_GH
 export HERDR_CODEX_DEEP HERDR_CODEX_STD HERDR_CODEX_FAST
 export HERDR_RECONCILE_INTERVAL_S HERDR_TASK_RETENTION_DAYS
-export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES
+export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES HERDR_CANONICAL_RULES
 export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_BACKEND SMART_NAME_MODEL SMART_NAME_TIMEOUT
 export SMART_NAME_COOLDOWN SMART_NAME_EVIDENCE_CHARS HERDR_STALL_SECS
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"
