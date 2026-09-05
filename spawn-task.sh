@@ -45,12 +45,13 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/repo-root.sh"
 
 # ---- args ------------------------------------------------------------------
-base=""; dry=0; model_override=""; effort_override=""; foc=--no-focus; positional=()
+base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base="$2"; shift 2 ;;
     --model) model_override="$2"; shift 2 ;;
     --effort) effort_override="$2"; shift 2 ;;
+    --posture) posture_req="${2:?spawn-task: --posture needs a value (yolo|write|strict)}"; shift 2 ;;
     --dry-run|-n) dry=1; shift ;;
     --focus) foc=--focus; shift ;;
     *) positional+=("$1"); shift ;;
@@ -67,27 +68,49 @@ agent="${rest[0]}"
 # ---- MODEL MAP (job-class -> model / reasoning-effort) ----------------------
 # Table lives in lib/agent-profiles.sh (model_for_agent); this wrapper only
 # adds the --model/--effort override, which is local to this invocation.
+# --effort works STANDALONE: it replaces the effort part of whatever model
+# the job-class (or --model) resolved to. It used to be silently dropped
+# unless --model was also passed.
 model_for() {  # <agent> <job> -> "<model>" or "<model>:<effort>"
-  if [ -n "$model_override" ]; then
-    printf '%s' "$model_override"; [ -n "$effort_override" ] && printf ':%s' "$effort_override"
-    return
-  fi
-  model_for_agent "$1" "$2"
+  local spec
+  if [ -n "$model_override" ]; then spec="$model_override"; else spec=$(model_for_agent "$1" "$2"); fi
+  if [ -n "$effort_override" ]; then printf '%s:%s' "${spec%%:*}" "$effort_override"; else printf '%s' "$spec"; fi
 }
 
 # ---- build the launch command line -----------------------------------------
 # cli_for_agent (lib/agent-profiles.sh) knows the launch flags for a
-# recognized agent (claude/codex/omp today); anything else falls through
-# unchanged as a literal command, same as before.
+# recognized agent (claude/codex/omc/omp today) and emits every token
+# %q-quoted — safe to type into the worker's live shell. Anything else falls
+# through unchanged as a literal command: that path is EXPLICITLY UNMANAGED
+# (no posture flag, no canonical rules, raw shell string) and is reported as
+# such below rather than dressed up as enforced.
 m=$(model_for "$agent" "$job")
-if cli=$(cli_for_agent "$agent" "$m"); then
-  # extra flags/args after the agent name (e.g. `... implement claude
-  # --some-flag`) used to be silently dropped — only the unrecognized-agent
-  # fallback below ever consumed them.
-  [ "${#rest[@]}" -gt 1 ] && cli="$cli ${rest[*]:1}"
+managed=1
+if cli=$(cli_for_agent "$agent" "$m" "$posture_req"); then
+  # Extra flags/args after the agent name ride along %q-quoted — EXCEPT
+  # flags that would override the approval posture, rule/extension loading,
+  # or the system-prompt channel this script composes (managed_flag_rejected,
+  # lib/agent-profiles.sh). Those are refused loudly: a launch that LOOKS
+  # floor-governed must actually be floor-governed.
+  if [ "${#rest[@]}" -gt 1 ]; then
+    for _x in "${rest[@]:1}"; do
+      if managed_flag_rejected "$_x"; then
+        echo "spawn-task: refusing managed extra flag '$_x' — it would override approval posture, rules/extensions, or system context." >&2
+        echo "spawn-task: tighten with --posture <yolo|write|strict>, or run an explicitly UNMANAGED literal command if you really mean it." >&2
+        exit 1
+      fi
+      cli="$cli $(printf '%q' "$_x")"
+    done
+  fi
 else
-  cli="${rest[*]}"  # literal command; no model mapping
+  managed=0
+  cli="${rest[*]}"  # literal command; no model mapping, no posture flag, no rules append
 fi
+# The posture actually in force for this spawn (floor composed with the
+# request — can only tighten). Stamped into the worker below as ITS floor,
+# so a child spawn from inside the worktree can tighten further but never
+# loosen past what this spawn was granted.
+eff_posture=$(resolved_posture "$posture_req")
 
 # repo_root (lib/repo-root.sh): --show-toplevel alone returns a linked
 # worktree's own path, not the shared main-repo root — calling spawn-task.sh
@@ -99,6 +122,25 @@ wt="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$root")/${branch}"
 label="${job}:${branch}"
 events_file="$wt/.omc/handoffs/events.jsonl"
 wake_pattern="${label}_done"
+
+# ---- canonical operator ancestor rules (managed launches only) --------------
+# The worktree above lives OUTSIDE the project's ancestor tree, so the
+# worker's upward rule discovery cannot reach the operator's ancestor
+# AGENTS.md (this fleet: ~/Code/AGENTS.md). canonical_rules_resolve
+# (lib/agent-profiles.sh) derives the source from the ORIGINAL project
+# root's ancestors — or takes an inherited/explicit HERDR_CANONICAL_RULES
+# path — composes it with a provenance header, and hands back an
+# --append-system-prompt flag. A configured source that is missing or
+# unreadable FAILS the spawn: launching without the operator's rules while
+# looking managed is the dishonest direction.
+CANONICAL_RULES_SRC="" CANONICAL_RULES_ARGS=""
+if [ "$managed" = 1 ]; then
+  canonical_rules_resolve "$agent" "$root" || {
+    echo "spawn-task: canonical rules source configured but unusable — refusing managed launch" >&2
+    exit 1
+  }
+  [ -n "$CANONICAL_RULES_ARGS" ] && cli="$cli $CANONICAL_RULES_ARGS"
+fi
 
 # ---- task identity (control-plane registration) -----------------------------
 # A bare pane_id is not a durable identity: herdr reuses pane ids once a pane
@@ -135,7 +177,14 @@ if [ "$dry" = 1 ]; then
   echo "  worktree  : $wt   (branch ${branch}${base:+ off ${base}})"
   echo "  workspace : $(bash "$here/ensure-workspace.sh" --no-focus "$root" 2>/dev/null || echo '<would create>')"
   echo "  tab label : $label"
-  echo "  launch    : $cli"
+  if [ "$managed" = 1 ]; then
+    echo "  launch    : $cli"
+    echo "  posture   : $eff_posture  (floor ${HERDR_POSTURE_FLOOR:-write}, request ${posture_req:-none}; stamped into the worker as HERDR_POSTURE_FLOOR — child spawns can only tighten)"
+    echo "  rules     : ${CANONICAL_RULES_SRC:-<none — no ancestor AGENTS.md found/configured; normal project discovery only>}"
+  else
+    echo "  launch    : $cli"
+    echo "  ⚠ UNMANAGED literal command: no posture flag, no canonical rules append — only the env floor stamp reaches it"
+  fi
   echo "  wake      : $here/wake-on-evidence.sh $events_file '$wake_pattern'"
   echo "              ^ run BACKGROUNDED (run_in_background/async:true) — a blocking"
   echo "                foreground call strands you idle until re-prompted by hand"
@@ -178,6 +227,24 @@ pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
   "$pane" "$pane_birth" "$root" "$wt" "$label"
 
+# ---- close an empty default root tab, if this call just created one --------
+# ensure-workspace.sh's own comment already names this gap: "herdr
+# auto-creates a root tab as part of workspace creation but gives it no
+# label of its own" — that script does a best-effort rename, but the tab
+# itself stays open and empty forever once THIS sub-tab is the one doing
+# real work. Best-effort, non-fatal, scoped tight: only closes a tab in
+# THIS workspace that is not the one just created AND has no agent set at
+# all (never ran anything) — a genuinely reused, active workspace with real
+# other work in it never loses a tab here, because that tab will have an
+# agent.
+for _t in $(herdr tab list 2>/dev/null | jq -r --arg ws "$ws" --arg keep "$tab" \
+    '(.result.tabs // .tabs)[] | select(.workspace_id==$ws and .tab_id!=$keep) | .tab_id' 2>/dev/null); do
+  _agent=$(herdr pane list 2>/dev/null | jq -r --arg t "$_t" \
+    '(.result.panes // .panes)[] | select(.tab_id==$t) | .agent // empty' 2>/dev/null | head -1)
+  [ -z "$_agent" ] && herdr tab close "$_t" >/dev/null 2>&1
+done
+true
+
 # ---- launch the agent in the tab -------------------------------------------
 # Stamp identity into the worker's own shell so its hooks (agent-hooks/
 # claude-notify.sh, agent-hooks/omp-notify.sh) can push a wake to the conductor
@@ -202,8 +269,23 @@ register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane
 # branch name containing one) previously broke out of the naive
 # 'single-quoted' interpolation and executed arbitrary commands in the new
 # pane — verified exploitable, fixed here.
-stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_PANE_ID=%q HERDR_TASK_LABEL=%q; %s' \
-  "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$cli")
+#
+# Besides identity, the stamp carries the OPERATOR POLICY a child herdr
+# launch from inside this worktree needs (nothing secret goes in here):
+#   * HERDR_POSTURE_FLOOR = this spawn's EFFECTIVE posture — the child's
+#     floor is what this worker was actually granted, so a descendant can
+#     tighten but never loosen past it (lib/posture.sh composes only
+#     stricter).
+#   * HERDR_POLICY_EXTRA_RULES = the operator's extra command-policy rules
+#     (stricter-only by construction, lib/command-policy.sh) — only when set.
+#   * HERDR_CANONICAL_RULES = the resolved canonical rules SOURCE path, so a
+#     descendant spawn keeps the same explicit operator source instead of
+#     re-deriving from a possibly different tree — only when one resolved.
+stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_PANE_ID=%q HERDR_TASK_LABEL=%q HERDR_POSTURE_FLOOR=%q' \
+  "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$eff_posture")
+[ -n "${HERDR_POLICY_EXTRA_RULES:-}" ] && stamped_cli="$stamped_cli $(printf 'HERDR_POLICY_EXTRA_RULES=%q' "$HERDR_POLICY_EXTRA_RULES")"
+[ -n "$CANONICAL_RULES_SRC" ] && stamped_cli="$stamped_cli $(printf 'HERDR_CANONICAL_RULES=%q' "$CANONICAL_RULES_SRC")"
+stamped_cli="$stamped_cli; $cli"
 herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || { echo "spawn-task: launch failed: $cli" >&2; exit 1; }
 herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
 
@@ -228,11 +310,29 @@ set_task_state "$run_id" "$task_id" "running"
 bgtag="background"; [ "$foc" = --focus ] && bgtag="focused"
 printf 'spawned %-22s ws=%s tab=%s pane=%s  [%s]\n' "$label" "$ws" "$tab" "$pane" "$bgtag"
 printf '  worktree: %s\n  launch:   %s\n' "$wt" "$cli"
+if [ "$managed" = 1 ]; then
+  printf '  posture:  %s  (floor %s, request %s; stamped as the worker'"'"'s own floor)\n' \
+    "$eff_posture" "${HERDR_POSTURE_FLOOR:-write}" "${posture_req:-none}"
+  if [ -n "$CANONICAL_RULES_SRC" ]; then
+    printf '  rules:    %s (appended with provenance; normal project discovery untouched)\n' "$CANONICAL_RULES_SRC"
+  else
+    printf '  rules:    <none — no ancestor AGENTS.md found/configured; normal project discovery only>\n'
+  fi
+else
+  printf '  ⚠ UNMANAGED literal command: no posture flag, no canonical rules append —\n'
+  printf '    only the env floor stamp reaches it; nothing here enforces approvals.\n'
+fi
 printf '  wake:     %s %s '"'"'%s'"'"'\n' "$here/wake-on-evidence.sh" "$events_file" "$wake_pattern"
 printf '            ^ run BACKGROUNDED (run_in_background/async:true) — a blocking\n'
 printf '              foreground call strands you idle until re-prompted by hand\n'
 printf '  worker on completion appends to %s, e.g.:\n' "$events_file"
 printf '    {"event":"%s", ...}\n' "$wake_pattern"
+printf '  ⚠ if this task'"'"'s own effect removes its OWN worktree (e.g. "delete\n'
+printf '    this now-redundant branch"), %s is gone with it —\n' "$events_file"
+printf '    verify completion via outer repo state (git branch -a / git log) instead,\n'
+printf '    or have the task call append_event() from lib/run-registry.sh directly\n'
+printf '    (writes to the central registry, survives worktree removal) before it\n'
+printf '    removes its own worktree.\n'
 printf '  registry: %s  (run=%s task=%s)\n' "$(registry_db)" "$run_id" "$task_id"
 printf '  conductor: %s%s\n' "${conductor_pane_id:-<none — spawned outside a herdr pane, no push wake>}" \
   "${conductor_pane_id:+ (push wake wired if the worker hits an input-needed event)}"

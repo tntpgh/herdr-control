@@ -8,9 +8,12 @@
 # spawn-task.sh / lib/pane-guard.sh / smart-name.sh / herdr-select.sh, which
 # used to each carry their own partial copy of this knowledge and drifted.
 #
-# Sourced by: lib/pane-guard.sh (process allowlist), spawn-task.sh (model
-# routing + launch command), herdr-select.sh (which answering strategy a
-# prompt needs). Pure — nothing here touches herdr or the filesystem.
+# Sourced by: lib/pane-guard.sh (process allowlist), spawn-task.sh and
+# spawn-agent.sh (model routing + launch command + managed-flag policy +
+# canonical rules), herdr-select.sh (which answering strategy a prompt
+# needs). Pure — nothing here touches herdr or the filesystem — EXCEPT the
+# canonical-rules helpers at the bottom (they read the operator's ancestor
+# rules file and write a composed cache; only the spawners call them).
 _ap_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$_ap_dir/posture.sh"
 
@@ -100,6 +103,14 @@ model_for_agent() {
     claude:implement|claude:debug|claude:code)                  printf 'sonnet\n' ;;
     claude:explore|claude:quick|claude:mechanical|claude:docs)   printf 'haiku\n' ;;
     claude:*)                                                   printf 'sonnet\n' ;;
+    # omc launches the real claude binary (cli_for_agent below), so it uses
+    # claude's model aliases. These rows were MISSING until 2026-09-04:
+    # model_for_agent returned empty for omc, and spawn-task.sh then built
+    # `claude --model ` — a broken launch that looked routed but wasn't.
+    omc:plan|omc:architect|omc:review|omc:design)               printf 'opus\n' ;;
+    omc:implement|omc:debug|omc:code)                           printf 'sonnet\n' ;;
+    omc:explore|omc:quick|omc:mechanical|omc:docs)              printf 'haiku\n' ;;
+    omc:*)                                                      printf 'sonnet\n' ;;
     codex:plan|codex:architect|codex:review|codex:design)        printf '%s\n' "$HERDR_CODEX_DEEP" ;;
     codex:implement|codex:debug|codex:code)                      printf '%s\n' "$HERDR_CODEX_STD" ;;
     codex:explore|codex:quick|codex:mechanical|codex:docs)       printf '%s\n' "$HERDR_CODEX_FAST" ;;
@@ -143,8 +154,21 @@ posture_flag_for_agent() {              # <agent> <posture> -> flag string, may 
   esac
 }
 
-posture_is_enforced_for() {             # <agent> -> exit 0 if a flag exists for it
-  [ -n "$(posture_flag_for_agent "$1" "$(resolved_posture)")" ]
+# Whether the posture actually reaches the process that gets launched. This
+# checks the LAUNCHED binary's vocabulary, not the requested flavor's:
+# `codex` has no flag of its own in the table above, but cli_for_agent has
+# launched the omp harness for both claude and codex flavors since
+# 2026-08-16, and omp's --approval-mode IS emitted for those spawns — so
+# reporting "not enforced" for codex was the exact false-negative mirror of
+# the false-positive the unmapped table entry guards against.
+posture_is_enforced_for() {             # <agent> -> exit 0 if the launched CLI gets a real flag
+  local launcher
+  case "$1" in
+    claude|codex|omp) launcher=omp ;;   # all three launch the omp binary (cli_for_agent)
+    omc)              launcher=omc ;;   # its own harness: the real claude binary
+    *)                return 1 ;;       # unrecognized agent: literal command, nothing enforced
+  esac
+  [ -n "$(posture_flag_for_agent "$launcher" "$(resolved_posture)")" ]
 }
 
 # ---- omp cross-family model routing ------------------------------------------
@@ -193,9 +217,25 @@ omp_cross_family_model() {   # <from-agent> <bare-model-name> -> "<omp-model> <t
 # whichever is more restrictive. So a caller can tighten one spawn and can
 # never loosen below the machine floor, and omitting the argument simply
 # spawns at the floor.
+#
+# Every value-bearing token is %q-quoted at emission (_ap_emit), because the
+# output of this function is TYPED into a live shell (herdr pane run) by the
+# spawners. Model specs come from config.sh and from --model overrides on the
+# spawner's own command line — untrusted shell source either way. A model
+# name like `x;$(...)` used to be interpolated bare into that typed line and
+# would have executed in the fresh worker pane; now it arrives as one literal
+# argv element. Clean values (all the real model names) quote to themselves,
+# so the emitted command is byte-identical to before for every normal spawn.
+_ap_emit() {                            # <argv...> -> one shell-safe launch line
+  local out="" x
+  for x in "$@"; do out+="${out:+ }$(printf '%q' "$x")"; done
+  printf '%s\n' "$out"
+}
+
 cli_for_agent() {
   local a="$1" spec="$2" want="${3:-}" m e posture flag
   local has_effort alt alt_model models
+  local -a argv
   posture="$(resolved_posture "$want")"
   case "$a" in
     claude|codex)
@@ -208,16 +248,20 @@ cli_for_agent() {
       alt_model="${alt%% *}"
       [ "$a" = codex ] && m="openai-codex/$m"
       models="${m},${alt_model}"
-      if [ "$has_effort" = 0 ]; then
-        printf 'omp --model %s --models %s%s\n' "$m" "$models" "${flag:+ $flag}"
-      else
+      argv=(omp --model "$m")
+      if [ "$has_effort" = 1 ]; then
         e="${spec##*:}"
-        printf 'omp --model %s --thinking %s --models %s%s\n' "$m" "$e" "$models" "${flag:+ $flag}"
+        argv+=(--thinking "$e")
       fi
+      argv+=(--models "$models")
       ;;
     omc)
       flag="$(posture_flag_for_agent omc "$posture")"
-      printf 'claude --model %s%s\n' "$spec" "${flag:+ $flag}" ;;
+      # spawn-task.sh's standalone --effort rewrites the spec to model:effort;
+      # claude takes that as its own --effort flag, never inside --model.
+      argv=(claude --model "${spec%%:*}")
+      [ "${spec%%:*}" != "$spec" ] && argv+=(--effort "${spec##*:}")
+      ;;
     omp)
       # Same colonless-spec hazard as the claude/codex branch above —
       # `--thinking <model-name>` would be an equally invalid omp flag value.
@@ -230,14 +274,164 @@ cli_for_agent() {
       # its first bash call" the way it did when the menu shape had no
       # answering path.
       flag="$(posture_flag_for_agent "$a" "$posture")"
-      if [ "$m" = "$spec" ]; then
-        printf 'omp --model %s%s\n' "$m" "${flag:+ $flag}"
-      else
+      argv=(omp --model "$m")
+      if [ "$m" != "$spec" ]; then
         e="${spec##*:}"
-        printf 'omp --model %s --thinking %s%s\n' "$m" "$e" "${flag:+ $flag}"
+        argv+=(--thinking "$e")
       fi
       ;;
     *)
       return 1 ;;
   esac
+  # $flag word-splits on purpose: its values come only from
+  # posture_flag_for_agent's own fixed table ("--approval-mode write" is two
+  # argv elements), never from caller input.
+  # shellcheck disable=SC2206
+  [ -n "$flag" ] && argv+=($flag)
+  _ap_emit "${argv[@]}"
+}
+
+# ---- managed extra flags: what may NOT ride along ---------------------------
+# A managed launch's whole point is that posture, rules, and system context
+# are decided by the floor-composed spawn path, not by whatever extra argv
+# happened to follow the agent name. These flags would override exactly that
+# — approval mode, rule/extension loading, or the system-prompt channel the
+# canonical-rules append uses — so a spawner REFUSES the spawn when one
+# appears, loudly, instead of silently launching something that looks
+# floor-governed and isn't. Covers both launched vocabularies (omp and
+# claude, since omc launches the real claude binary). Everything else
+# (e.g. --resume, --continue) passes through, %q-quoted by the spawner.
+# Tighten a spawn with --posture; run a bypassing invocation as an explicitly
+# UNMANAGED literal command if you really mean it.
+managed_flag_rejected() {               # <arg> -> exit 0 if forbidden on a managed launch
+  case "$1" in
+    --approval-mode|--approval-mode=*|\
+    --permission-mode|--permission-mode=*|\
+    --auto-approve|--auto-approve=*|--yolo|\
+    --dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox|\
+    --allow-dangerously-skip-permissions|\
+    --allowedTools|--allowedTools=*|--allowed-tools|--allowed-tools=*|\
+    --no-rules|--no-extensions|--no-skills|--bare|--safe-mode|\
+    --system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*|\
+    --append-system-prompt|--append-system-prompt=*|\
+    --append-system-prompt-file|--append-system-prompt-file=*|\
+    --settings|--settings=*|--setting-sources|--setting-sources=*|\
+    --config|--config=*|--profile|--profile=*|--cwd|--cwd=*|\
+    --hook|--hook=*|-e|--extension|--extension=*|--plugin-dir|--plugin-dir=*|--plugin-url|--plugin-url=*|\
+    --mcp-config|--mcp-config=*|--strict-mcp-config|--agents|--agents=*|\
+    --add-dir|--add-dir=*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# ---- canonical operator ancestor rules --------------------------------------
+# Task worktrees live under ~/.herdr/worktrees — physically OUTSIDE the
+# project's ancestor tree — so an omp worker's normal upward rule discovery
+# finds the worktree's own tracked AGENTS.md but can never reach the
+# operator's ancestor rules (this fleet: ~/Code/AGENTS.md sitting above every
+# project). These helpers restore that one file, explicitly, via omp's
+# --append-system-prompt: the source is DERIVED from the original project
+# root's ancestors (never hardcoded), composed into a cache file with a
+# provenance header naming where it came from, and appended WITHOUT touching
+# normal project rule discovery, copying anything into the worktree, or
+# executing anything from the repo.
+#
+# These are the one exception to this file's "pure" rule (they read the rules
+# source and write the composed cache); only the spawners call them.
+
+canonical_rules_source() {   # <project-root> -> ':'-joined sources farthest-first (empty = none); exit 2 = configured but unusable
+  local src="${HERDR_CANONICAL_RULES:-}" dir found="" one
+  if [ -n "$src" ]; then
+    # Explicit operator path(s) — inherited across descendants via the spawn
+    # stamp. Any configured-but-unreadable entry FAILS the managed launch
+    # (caller aborts on exit 2): silently launching without the operator's
+    # rules is the dishonest direction.
+    local IFS=':'
+    for one in $src; do
+      [ -n "$one" ] || continue
+      [ -f "$one" ] && [ -r "$one" ] || {
+        echo "canonical-rules: HERDR_CANONICAL_RULES entry missing/unreadable: $one" >&2
+        return 2
+      }
+    done
+    printf '%s\n' "$src"; return 0
+  fi
+  dir=$(cd "$1" 2>/dev/null && pwd) || {
+    echo "canonical-rules: project root unreadable: $1" >&2
+    return 2
+  }
+  # Walk the ORIGINAL project root's ancestors (never the root itself — its
+  # own AGENTS.md loads through normal discovery), stopping at $HOME. omp's
+  # own discovery loads EVERY ancestor file, so collect them all, farthest
+  # first, rather than stopping at the nearest. The spawners pass repo_root's
+  # answer, so a nested spawn from inside a task worktree derives from the
+  # real project tree, not the worktree mirror.
+  while :; do
+    case "$dir" in "$HOME"|/|"") break ;; esac
+    dir=$(dirname "$dir")
+    [ -e "$dir/AGENTS.md" ] || continue
+    if [ -f "$dir/AGENTS.md" ] && [ -r "$dir/AGENTS.md" ]; then
+      found="$dir/AGENTS.md${found:+:$found}"
+    else
+      echo "canonical-rules: ancestor rules exist but are unreadable: $dir/AGENTS.md" >&2
+      return 2
+    fi
+  done
+  printf '%s\n' "$found"
+}
+
+canonical_rules_compose() {  # <':'-joined sources> -> composed cache file path; exit 1 on failure
+  local srcs="$1" dir out one
+  dir="${HERDR_STATE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/herdr-control}/canonical-rules"
+  mkdir -p "$dir" || return 1
+  out="$dir/$(printf '%s' "$srcs" | tr '/ :' '__+').md"
+  (
+    printf -- '<!-- herdr-control managed launch: canonical operator ancestor rules.\n'
+    printf -- '     Sources (outermost first): %s\n' "$srcs"
+    printf -- '     Appended because task worktrees live outside the project ancestor\n'
+    printf -- '     tree, so upward rule discovery cannot reach these files. The\n'
+    printf -- "     worktree's own project rules still load through normal discovery. -->\n"
+    IFS=':'
+    for one in $srcs; do
+      [ -n "$one" ] || continue
+      printf -- '\n<!-- source: %s -->\n' "$one"
+      cat "$one" || exit 1
+    done
+  ) > "$out.tmp.$$" || { rm -f "$out.tmp.$$"; return 1; }
+  mv -f "$out.tmp.$$" "$out" || return 1
+  printf '%s\n' "$out"
+}
+
+# canonical_rules_resolve <agent> <project-root> [launch-cwd]
+# Sets CANONICAL_RULES_SRC (':'-joined source paths, "" when none) and
+# CANONICAL_RULES_ARGS ("--append-system-prompt <%q path>", "" when none).
+# Exit 2 = a configured/derived source exists but is unusable — the caller
+# MUST refuse the managed launch rather than launch without it.
+# Only omp-backed launches take the flag; omc (the real claude binary, its
+# own harness with its own rule discovery) is left alone. When the launch
+# cwd sits INSIDE a source's directory tree, normal discovery already loads
+# that file — it is dropped from the append rather than loaded twice.
+canonical_rules_resolve() {
+  CANONICAL_RULES_SRC="" CANONICAL_RULES_ARGS=""
+  case "$1" in claude|codex|omp) ;; *) return 0 ;; esac
+  local src composed cwd="${3:-}" one keep=""
+  src=$(canonical_rules_source "$2") || return 2
+  [ -n "$src" ] || return 0
+  if [ -n "$cwd" ]; then
+    cwd=$(cd "$cwd" 2>/dev/null && pwd) || cwd=""
+  fi
+  local IFS=':'
+  for one in $src; do
+    [ -n "$one" ] || continue
+    case "${cwd:+$cwd/}" in "$(dirname "$one")/"*) continue ;; esac
+    keep="${keep:+$keep:}$one"
+  done
+  [ -n "$keep" ] || return 0
+  composed=$(canonical_rules_compose "$keep") || {
+    echo "canonical-rules: could not compose cache from $keep" >&2
+    return 2
+  }
+  CANONICAL_RULES_SRC="$keep"
+  CANONICAL_RULES_ARGS="--append-system-prompt $(printf '%q' "$composed")"
 }

@@ -50,7 +50,7 @@ pane="${HERDR_PANE_ID:-}"
 # ANSI background-colour escape) and the numbered shape, and a caller here has
 # no business caring which one a given omp build renders.
 _prompt_is_up() {
-  [ -n "$(prompt_menu_options "$pane" 2>/dev/null)" ] && return 0
+  prompt_menu_visible "$pane" 2>/dev/null && return 0
   [ -n "$(prompt_options      "$pane" 2>/dev/null)" ] && return 0
   return 1
 }

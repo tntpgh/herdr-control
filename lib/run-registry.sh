@@ -543,6 +543,16 @@ task_for_pane() {                       # pane_id -> task json or empty
   _sql "$(_task_json_select) WHERE pane_id=$(_sq "$1") ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null
 }
 
+# Find the most-recently-updated registered task working in this worktree —
+# the lookup a completion recorder needs when the pane is already gone (the
+# exact case that used to permanently mark a finished worker `lost`): the
+# worktree path survives the pane, so completion evidence found on its branch
+# can still be matched back to the registration it belongs to.
+task_for_worktree() {                   # worktree_path -> task json or empty
+  registry_init || return 1
+  _sql "$(_task_json_select) WHERE worktree=$(_sq "$1") ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null
+}
+
 # Every registered task as one compact JSON object per line.
 #
 # Replaces the old all_task_files(), which emitted FILE PATHS its caller then
@@ -638,13 +648,17 @@ events_since() {                        # conductor_id [limit] -> one event json
   registry_init || return 1
   local cid="$1" limit="${2:-500}"
   case "$limit" in ''|*[!0-9]*) limit=500 ;; esac
-  _sql "SELECT json_object('sequence', sequence, 'event_id', event_id, 'run_id', run_id,
-          'task_id', task_id, 'type', type, 'occurred_at', occurred_at,
-          'payload', json(payload))
-        FROM events
-        WHERE sequence > COALESCE(
+  _sql "SELECT json_object('sequence', e.sequence, 'event_id', e.event_id, 'run_id', e.run_id,
+          'task_id', e.task_id, 'type', e.type, 'occurred_at', e.occurred_at,
+          'payload', json(e.payload),
+          'task_conductor_id', COALESCE(t.conductor_id, ''),
+          'task_state', COALESCE(t.state, ''),
+          'label', COALESCE(t.label, ''),
+          'repo', COALESCE(t.repo, ''))
+        FROM events e LEFT JOIN tasks t ON t.task_id = e.task_id AND t.run_id = e.run_id
+        WHERE e.sequence > COALESCE(
           (SELECT last_event_seq FROM checkpoints WHERE conductor_id=$(_sq "$cid")), 0)
-        ORDER BY sequence LIMIT $limit;" 2>/dev/null
+        ORDER BY e.sequence LIMIT $limit;" 2>/dev/null
 }
 
 # Advance the cursor to the highest sequence the consumer has actually
@@ -658,6 +672,46 @@ advance_event_cursor() {                # conductor_id sequence
   _sql "INSERT INTO checkpoints (conductor_id, last_event_seq, task_states, updated_at)
       VALUES ($(_sq "$cid"), $seq, '{}', $(_sq "$(_now_iso)"))
       ON CONFLICT(conductor_id) DO UPDATE SET
+        last_event_seq=MAX(checkpoints.last_event_seq, excluded.last_event_seq),
+        updated_at=excluded.updated_at;" >/dev/null 2>&1
+}
+
+# touch_checkpoint_clock <conductor_id>
+#
+# Advance ONLY the checkpoint's updated_at — the throttle clock
+# checkpoint_age_s reads — without acknowledging anything. This is what a
+# DEFERRED-delivery reconciliation pass (agent-hooks/omp-reconcile.sh
+# --defer-ack) writes at prepare time: the sweep DID run (so the interval
+# throttle must reset, or every subsequent tool_result re-sweeps), but the
+# report has not been delivered yet, so neither task_states nor the event
+# cursor may move. write_checkpoint cannot express that — it conflates the
+# clock with the acknowledgment.
+touch_checkpoint_clock() {              # conductor_id
+  registry_init || return 1
+  _sql "INSERT INTO checkpoints (conductor_id, last_event_seq, task_states, updated_at)
+      VALUES ($(_sq "$1"), 0, '{}', $(_sq "$(_now_iso)"))
+      ON CONFLICT(conductor_id) DO UPDATE SET
+        updated_at=excluded.updated_at;" >/dev/null 2>&1
+}
+
+# ack_reconcile <conductor_id> <task_states_json> <last_event_seq>
+#
+# Commit a prepared reconciliation report as DELIVERED: task_states map and
+# event cursor together, in one transaction, only after the consumer confirmed
+# the report actually reached its session. The cursor uses MAX() so a stale or
+# replayed ack (at-least-once delivery retries with the same token) can never
+# move the cursor BACKWARD and resurrect already-consumed events; a crash
+# between delivery and ack leaves the cursor where it was, and the next pass
+# redelivers — duplicates are possible by design, silent loss is not.
+ack_reconcile() {                       # conductor_id task_states_json last_event_seq
+  registry_init || return 1
+  local cid="$1" j="$2" seq="$3"
+  printf '%s' "$j" | jq -e . >/dev/null 2>&1 || j='{}'
+  case "$seq" in ''|*[!0-9]*) return 1 ;; esac
+  _sql "INSERT INTO checkpoints (conductor_id, last_event_seq, task_states, updated_at)
+      VALUES ($(_sq "$cid"), $seq, $(_sq "$j"), $(_sq "$(_now_iso)"))
+      ON CONFLICT(conductor_id) DO UPDATE SET
+        task_states=excluded.task_states,
         last_event_seq=MAX(checkpoints.last_event_seq, excluded.last_event_seq),
         updated_at=excluded.updated_at;" >/dev/null 2>&1
 }

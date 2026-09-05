@@ -53,11 +53,11 @@
 # --expect-prompt-id this is not opt-in — it runs whenever the pane IS
 # registered, since there is no safe default that skips it.
 #
-# --authority peer|human separates an operational question from an authorization
-# one — review correction 8. Under `peer` the command the prompt is asking about
-# is classified (lib/command-policy.sh) and anything not `allow` is REFUSED and
-# left for a human. Under `human` the verdict is still recorded — a person may
-# approve a destructive command, but the audit trail says what it was.
+# --authority peer|conductor|human keeps a reviewed operational grant distinct
+# from human approval. Peer defaults to classifier allow-only; conductor
+# requires a live owned task, exact prompt, operational category and reason,
+# and cannot cross human-reserved boundaries. Human decisions remain explicit.
+# A known Deny choice is safe for peers even when approving would be refused.
 #
 # THE DEFAULT FAILS CLOSED TO `peer`. It was `human`, which meant a conductor
 # AGENT that simply never passed the flag got the same unconditional permission a
@@ -82,7 +82,7 @@
 #
 # Exit 0 selected, 2 usage, 3 not an agent pane, 6 no prompt / bad option /
 # prompt changed / navigation could not converge, 7 pane recycled since its
-# task was registered, 8 refused by command policy (peer authority only).
+# task was registered, 8 refused by policy or reviewed-authority boundary.
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
 here=$(cd "$(dirname "$0")" && pwd)
@@ -96,6 +96,8 @@ choice="${2:?option number required}"
 shift 2
 
 expect_id=""
+review_reason=""
+review_category=""
 # Demonstrably-human callers only; see the header. Explicit
 # HERDR_SELECT_AUTHORITY or --authority still wins over this.
 _default_authority() {
@@ -107,17 +109,19 @@ _default_authority() {
 }
 authority="${HERDR_SELECT_AUTHORITY:-$(_default_authority)}"
 case "$authority" in
-  peer|human) ;;
-  *) echo "herdr-select: HERDR_SELECT_AUTHORITY must be peer or human, got '$authority'" >&2; exit 2 ;;
+  peer|human|conductor) ;;
+  *) echo "herdr-select: authority must be peer, human, or conductor, got '$authority'" >&2; exit 2 ;;
 esac
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect-prompt-id) expect_id="${2:?--expect-prompt-id needs a value}"; shift 2 ;;
+    --review-reason) review_reason="${2:?--review-reason needs a reason}"; shift 2 ;;
+    --review-category) review_category="${2:?--review-category needs a category}"; shift 2 ;;
     --authority)
-      authority="${2:?--authority needs peer or human}"; shift 2
+      authority="${2:?--authority needs peer, human, or conductor}"; shift 2
       case "$authority" in
-        peer|human) ;;
-        *) echo "herdr-select: --authority must be peer or human, got '$authority'" >&2; exit 2 ;;
+        peer|human|conductor) ;;
+        *) echo "herdr-select: authority must be peer, human, or conductor, got '$authority'" >&2; exit 2 ;;
       esac ;;
     *) echo "herdr-select: unknown arg '$1'" >&2; exit 2 ;;
   esac
@@ -157,6 +161,8 @@ label=$(printf '%s\n' "$options" | awk -F'\t' -v c="$choice" '$1==c {print $2; f
   printf '%s\n' "$options" | awk -F'\t' '{printf "  %s. %s\n", $1, $2}' >&2
   exit 6
 }
+declining=0
+[ "$mechanism" = menu ] && [ "$choice" = 2 ] && [ "$label" = Deny ] && declining=1
 
 # Right before we act — the closest this synchronous script can get to
 # "immediately before injection" — confirm the prompt is still the one a
@@ -194,6 +200,38 @@ relabel=$(printf '%s\n' "${reoffer#*$'\t'}" | awk -F'\t' -v c="$choice" '$1==c {
 # --expect flag): there is no safe default that skips a fingerprint check.
 require_pane_birth_match "$pane" || exit 7
 
+# Terrence's reviewed-operational grant is a distinct, attributable authority,
+# not "human" and not an instruction to bypass this script with raw keys.
+# The registered task owner must review this exact prompt. Same-user callers
+# can still spoof environment/socket access; this is not process containment.
+if [ "$authority" = conductor ]; then
+  case "$review_category" in
+    local-read|local-build|branch-work|owned-cleanup) ;;
+    *) echo "herdr-select: conductor requires an operational --review-category" >&2; exit 2 ;;
+  esac
+  if [ -z "$expect_id" ] || [ -z "${review_reason//[[:space:]]/}" ]; then
+    echo "herdr-select: conductor requires --expect-prompt-id and --review-reason after reviewing the complete action and target." >&2
+    exit 2
+  fi
+  if [ "$mechanism" != menu ]; then
+    echo "herdr-select: reviewed conductor authority requires a complete recognized omp approval panel." >&2
+    exit 8
+  fi
+  reviewed_task="$(task_for_pane "$pane" 2>/dev/null)"
+  owner_pane="$(printf '%s' "$reviewed_task" | jq -r '.conductor_pane_id // empty')"
+  owner_birth="$(printf '%s' "$reviewed_task" | jq -r '.conductor_pane_birth // empty')"
+  task_state="$(printf '%s' "$reviewed_task" | jq -r '.state // empty')"
+  case "$task_state" in
+    starting|running|blocked) ;;
+    *) echo "herdr-select: conductor may only answer an active registered task." >&2; exit 8 ;;
+  esac
+  if [ -z "$owner_pane" ] || [ "$owner_pane" != "${HERDR_PANE_ID:-}" ] ||
+     [ -z "$owner_birth" ] || [ "$owner_birth" != "$(pane_birth_now "$owner_pane")" ]; then
+    echo "herdr-select: caller is not this task's live registered conductor." >&2
+    exit 8
+  fi
+fi
+
 # ---- command policy: is this an operational question or an authorization one?
 # Review correction 8, previously unbuilt: "Peer automation may answer only
 # allowlisted operational prompts; destructive, credential, production, or
@@ -207,7 +245,35 @@ cmd_text="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
 policy_verdict="$(classify_command "$cmd_text")"
 policy_reason="$(classify_reason)"
 
-if [ "$authority" = peer ]; then
+# Refusing a known Deny choice executes no requested action. Conversely, an
+# approval whose arguments the TUI elided is not a complete review surface.
+# Both checks judge the SAME text that was classified — never a fresh read,
+# which can come back empty on a torn frame and would fail open.
+if [ "$authority" != human ] && [ "$declining" = 0 ] && [ "$mechanism" = menu ]; then
+  if [ -z "${cmd_text//[[:space:]]/}" ]; then
+    echo "herdr-select: refusing — cannot read the approval panel in $pane." >&2
+    exit 8
+  fi
+  case "$cmd_text" in
+    *"elided"*|*"truncated"*)
+      echo "herdr-select: approval arguments are clipped; ask the worker for a complete, shorter request." >&2
+      exit 8 ;;
+  esac
+fi
+
+if [ "$authority" = conductor ] && [ "$declining" = 0 ]; then
+  if [ -z "${cmd_text//[[:space:]]/}" ] || [ "$policy_verdict" = deny ]; then
+    echo "herdr-select: conductor cannot approve unreadable or deny-class actions." >&2
+    exit 8
+  fi
+  reservation="$(conductor_reserved_reason "$cmd_text")"
+  if [ -n "$reservation" ]; then
+    echo "herdr-select: $reservation" >&2
+    exit 8
+  fi
+fi
+
+if [ "$authority" = peer ] && [ "$declining" = 0 ]; then
   # Unreadable prompt text means the classifier had nothing to judge. For
   # automation that must refuse, not pass: the codebase's own rule everywhere
   # else (send-to-agent.sh's unreadable-pane path, herdr-resolve.sh's ambiguous
@@ -249,7 +315,9 @@ jq -nc --arg pane "$pane" --arg choice "$choice" --arg label "$label" --arg mech
        --arg via "${HERDR_SELECT_VIA:-cli}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
        --arg prompt_id "$current_prompt_id" \
        --arg authority "$authority" --arg verdict "$policy_verdict" --arg reason "$policy_reason" \
-  '{at:$at,pane:$pane,choice:($choice|tonumber),label:$label,mechanism:$mechanism,via:$via,prompt_id:$prompt_id,authority:$authority,policy_verdict:$verdict,policy_reason:$reason}' \
+       --arg review_reason "$review_reason" --arg review_category "$review_category" \
+       --arg reviewer "${HERDR_PANE_ID:-}" \
+  '{at:$at,pane:$pane,choice:($choice|tonumber),label:$label,mechanism:$mechanism,via:$via,prompt_id:$prompt_id,authority:$authority,policy_verdict:$verdict,policy_reason:$reason,review_reason:$review_reason,review_category:$review_category,reviewer:$reviewer}' \
   >> "$log_dir/selections.jsonl" || {
   echo "herdr-select: failed to write $log_dir/selections.jsonl — refusing to answer without an audit trail." >&2
   exit 2
@@ -270,8 +338,29 @@ _task=$(printf '%s' "$_own" | jq -r '.task_id // empty' 2>/dev/null)
 _cmd_record=$(printf '%s' "$cmd_text" | tr '\n' ' ' | cut -c1-500)
 approval_decided "$approval_id" "$pane" "$current_prompt_id" "$choice" "$label" \
   "${HERDR_SELECT_VIA:-cli}" "$authority" "$policy_verdict" "$_cmd_record" \
-  "${_run:-}" "${_task:-}" >/dev/null 2>&1 || true
-approval_attempted "$approval_id" >/dev/null 2>&1 || true
+  "${_run:-}" "${_task:-}" >/dev/null 2>&1 || {
+    echo "herdr-select: cannot persist approval decision — refusing." >&2; exit 2;
+  }
+if [ "$authority" = conductor ]; then
+  append_event "$_run" "$_task" approval_reviewed \
+    "$(jq -nc --arg id "$approval_id" --arg reason "$review_reason" \
+       --arg category "$review_category" --arg reviewer "${HERDR_PANE_ID:-}" \
+       '{approval_id:$id,reason:$reason,category:$category,reviewer:$reviewer}')" >/dev/null 2>&1 || {
+    echo "herdr-select: cannot persist conductor review — refusing." >&2; exit 2;
+  }
+fi
+approval_attempted "$approval_id" >/dev/null 2>&1 || {
+  echo "herdr-select: cannot persist approval attempt — refusing." >&2; exit 2;
+}
+
+_require_current_decision() {
+  require_agent_pane "$pane" && require_pane_birth_match "$pane" || return 1
+  [ "$(prompt_id "$pane")" = "$current_prompt_id" ] || {
+    echo "herdr-select: prompt changed after review — refusing stale input." >&2
+    return 1
+  }
+}
+_require_current_decision || exit 6
 
 if [ "$mechanism" = numbered ]; then
   # Claude's and Codex's selection prompts take the bare digit — no Enter,
@@ -301,17 +390,20 @@ else
       echo "herdr-select: menu navigation in $pane did not reach option $choice after 20 presses — aborting." >&2
       exit 6
     }
+    _require_current_decision || exit 6
     dir=Down; [ "$choice" -lt "$cur" ] && dir=Up
     herdr pane send-keys "$pane" "$dir" >/dev/null 2>&1 || {
       echo "herdr-select: failed to send '$dir' to $pane" >&2
       exit 2
     }
+    sleep 0.1
     cur=$(prompt_menu_selected "$pane")
     [ -n "$cur" ] || {
       echo "herdr-select: the prompt in $pane vanished or its highlight became unreadable mid-navigation — aborting." >&2
       exit 6
     }
   done
+  _require_current_decision || exit 6
   herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || {
     echo "herdr-select: failed to send Enter to $pane" >&2
     exit 2
