@@ -61,7 +61,7 @@ git init -q --bare "$WORK/origin.git"
 git clone -q "$WORK/origin.git" "$WORK/thurber-os" 2>/dev/null
 git -C "$WORK/thurber-os" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 git -C "$WORK/thurber-os" branch -q -M main && git -C "$WORK/thurber-os" push -q -u origin main 2>/dev/null
-for sib in knowledge-base tourguide thurber-ai; do
+for sib in knowledge-base tourguide thurber-ai herdr-control; do
   git init -q -b main "$WORK/Code/$sib" && git -C "$WORK/Code/$sib" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 done
 TODAY="$(date -u +%Y-%m-%d)"; DOC="docs/tracking/$TODAY-stage2-diagnose-pass.md"
