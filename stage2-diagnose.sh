@@ -19,11 +19,21 @@
 # commits). Delivery goes through herdr-deliver.sh -> send-to-agent.sh, which
 # confirms the composer actually consumed the submit.
 #
+# What changed 2026-09-04 (durable-supervision pass): the SCHEDULED path no
+# longer spawns at all — an unattended, unisolated executory worker is
+# forbidden by policy until an isolated worker boundary exists, so first
+# Fridays now emit a failed "isolation-required" ledger row (a pre-triaged
+# page) instead of quietly launching a worker nothing owns. Manual (attended)
+# runs still dispatch, but no longer claim `succeeded` at dispatch: the
+# diagnose lane's succeeded row comes only from `--record-completion`, which
+# verifies a tracking doc actually committed on the pass branch first.
+#
 # What this still does NOT automate, honestly (charter §8 item 3 is still
 # open): a mid-run interactive permission prompt only a human/conductor can
-# answer, and consuming the completion event (no conductor exists on the
-# scheduled path — the wake command is printed, not run). A prompt painted at
-# boot stops delivery honestly (rc=5) rather than Enter-ing through it.
+# answer, and running the completion consumer itself (the wake-on-evidence +
+# --record-completion chain is printed for a conductor/human to run). A
+# prompt painted at boot stops delivery honestly (rc=5) rather than
+# Enter-ing through it.
 set -euo pipefail
 
 # --scheduled: proceed only on the FIRST Friday of the month; exit 0 quietly on every
@@ -48,22 +58,129 @@ if [ "${1:-}" = "--scheduled" ]; then
     # first week of a month therefore SPAWNED a real Fable-5 pass. Verified the
     # hard way on Wednesday 2026-09-03. The gate now expresses "first Friday"
     # by itself, so the script is safe to invoke with --scheduled any day.
-    if [ "$(date +%u)" != "5" ] || [ "$(date +%-d)" -gt 7 ]; then
+    #
+    # STAGE2_ASSUME_FIRST_FRIDAY=1 is a test seam ONLY: it can force the
+    # first-Friday branch, which below always refuses to dispatch — so the
+    # seam can only make this script MORE closed, never spawn anything.
+    if { [ "$(date +%u)" != "5" ] || [ "$(date +%-d)" -gt 7 ]; } \
+        && [ "${STAGE2_ASSUME_FIRST_FRIDAY:-0}" != "1" ]; then
         echo "stage2-diagnose: $(date '+%F %A') is not the first Friday of the month - skipping"
         # Report the skip. A no-op is still a RUN of this stage, and reporting it
         # keeps the dead-man window at ~7 days (weekly trigger) instead of ~38
         # (monthly full pass) — so a dead loop is caught in a week rather than
-        # after it has already missed its real slot.
-        emit_loop_run diagnose succeeded 0 "skipped: not the first Friday"
+        # after it has already missed its real slot. The note says exactly what
+        # this row proves: the SCHEDULER is alive. It is not a diagnosis
+        # outcome, and the emit API's two states cannot say more than the note.
+        emit_loop_run diagnose succeeded 0 "scheduler-liveness: skipped, not the first Friday — no pass due, NOT a diagnosis outcome"
         exit 0
     fi
-    echo "stage2-diagnose: $(date '+%F %A') is the first Friday - running the monthly pass"
+    # First Friday: this is where the monthly pass used to spawn. It no longer
+    # does. The scheduled path has no conductor and no human — the worker it
+    # spawned was an UNATTENDED, UNISOLATED executory agent on this host, which
+    # the 2026-09-04 policy forbids until an isolated worker boundary exists
+    # (Terrence authorized task-scoped operational authority on the condition
+    # that isolated executory workers land FIRST). Three consecutive monthly
+    # passes were lost partly because nothing owned the spawned worker's
+    # completion; refusing loudly here is the honest state, and the failed
+    # ledger row pages as a pre-triaged incident instead of rotting silently.
+    # Run `./stage2-diagnose.sh` by hand (attended) to do the monthly pass.
+    echo "stage2-diagnose: REFUSING scheduled dispatch — unattended unisolated executory workers are disabled by policy (2026-09-04)." >&2
+    echo "stage2-diagnose: run this script manually (attended) for the monthly pass, then record its outcome with --record-completion." >&2
+    emit_loop_run diagnose failed 0 "isolation-required: scheduled dispatch refused — unattended unisolated executory workers disabled by policy; run manually attended + --record-completion"
+    exit 1
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 THURBER_OS="${STAGE2_THURBER_OS_REPO:-$HOME/Code/thurber-os}"
 BRANCH="evolution-loop/stage2-diagnose-$(date -u +%Y%m%d)"
 MODEL="${STAGE2_MODEL:-claude-fable-5}"
+
+# ---- --record-completion [branch] [findings] --------------------------------
+# The explicit completion consumer this pipeline never had. Dispatch used to
+# emit `succeeded` the moment the brief landed, and nothing ever verified the
+# diagnosis happened — closing a finished worker's pane could permanently mark
+# the task `lost` (registry treats lost as terminal, correctly) while the
+# ledger said the month succeeded. Completion is a CLAIM until the named
+# branch carries a committed tracking doc; this subcommand verifies that
+# artifact, records the truth in the run registry, and only then feeds the
+# loop ledger a `succeeded` row. Never triggered by idle/agent_end — a human
+# or conductor runs it (chain it after wake-on-evidence.sh's exit-0 match).
+if [ "${1:-}" = "--record-completion" ]; then
+    shift
+    WTROOT="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$THURBER_OS")"
+    RC_BRANCH="${1:-}"; if [ $# -gt 0 ]; then shift; fi
+    RC_FINDINGS="${1:-0}"
+    if [ -z "$RC_BRANCH" ]; then
+        # Default to the newest stage-2 worktree by date-suffixed name — the
+        # dispatch-day default (today's date) is wrong by the time a human
+        # gets around to recording, which is exactly when this runs.
+        RC_BRANCH="$(ls -1d "$WTROOT"/evolution-loop/stage2-diagnose-* 2>/dev/null | sort | tail -1 | sed "s|^$WTROOT/||" || true)"
+    fi
+    if [ -z "$RC_BRANCH" ]; then
+        echo "stage2-diagnose: --record-completion found no stage2 worktree under $WTROOT and no branch was named" >&2
+        exit 2
+    fi
+    WT="$WTROOT/$RC_BRANCH"
+    if [ ! -e "$WT/.git" ]; then
+        echo "stage2-diagnose: no worktree at $WT — nothing to verify, completion NOT recorded" >&2
+        exit 2
+    fi
+    # Evidence = a tracking doc COMMITTED on this branch. `ls-files` alone
+    # would accept a doc inherited from the base branch (a PRIOR month's
+    # merged pass), so the doc's last commit must not be an ancestor of
+    # origin/main. No origin/main to compare against -> refuse; an
+    # unverifiable claim is not evidence.
+    DOC="$(git -C "$WT" ls-files 'docs/tracking/*-stage2-diagnose-pass.md' 2>/dev/null | sort | tail -1)"
+    if [ -z "$DOC" ]; then
+        echo "stage2-diagnose: no committed docs/tracking/*-stage2-diagnose-pass.md on $RC_BRANCH — completion NOT recorded" >&2
+        exit 2
+    fi
+    DOC_COMMIT="$(git -C "$WT" log -n1 --format=%H -- "$DOC" 2>/dev/null || true)"
+    if [ -z "$DOC_COMMIT" ]; then
+        echo "stage2-diagnose: $DOC is tracked but no commit touches it — completion NOT recorded" >&2
+        exit 2
+    fi
+    if ! git -C "$WT" rev-parse --verify -q origin/main >/dev/null 2>&1; then
+        echo "stage2-diagnose: cannot resolve origin/main in $WT to prove $DOC is new to this branch — completion NOT recorded" >&2
+        exit 2
+    fi
+    if git -C "$WT" merge-base --is-ancestor "$DOC_COMMIT" origin/main 2>/dev/null; then
+        echo "stage2-diagnose: newest tracking doc ($DOC) is inherited from origin/main, not produced on $RC_BRANCH — completion NOT recorded" >&2
+        exit 2
+    fi
+    echo "stage2-diagnose: verified $DOC @ ${DOC_COMMIT} on $RC_BRANCH"
+    # Registry: mark the registered task completed — or, when the sweep
+    # already buried it as `lost` (pane closed before anyone looked), append
+    # the evidence as an audited event instead. `lost` stays terminal by
+    # design; the evidence event makes the truth queryable and reportable
+    # without reopening a settled state machine.
+    . "$HERE/lib/run-registry.sh"
+    RC_TASK_JSON="$(task_for_worktree "$WT" 2>/dev/null || true)"
+    if [ -n "$RC_TASK_JSON" ]; then
+        RC_RUN="$(printf '%s' "$RC_TASK_JSON" | jq -r '.run_id')"
+        RC_TASK="$(printf '%s' "$RC_TASK_JSON" | jq -r '.task_id')"
+        RC_STATE="$(printf '%s' "$RC_TASK_JSON" | jq -r '.state')"
+        RC_EVIDENCE="$(jq -nc --arg doc "$DOC" --arg commit "$DOC_COMMIT" --arg branch "$RC_BRANCH" \
+            '{doc:$doc, commit:$commit, branch:$branch}')"
+        case "$RC_STATE" in
+            completed)
+                echo "stage2-diagnose: registry task $RC_RUN/$RC_TASK already completed" ;;
+            lost|failed|cancelled)
+                append_event "$RC_RUN" "$RC_TASK" "completion_evidence" "$RC_EVIDENCE" \
+                    "complete_${RC_TASK}_${DOC_COMMIT}" >/dev/null 2>&1 || true
+                echo "stage2-diagnose: registry task $RC_RUN/$RC_TASK is terminal ($RC_STATE) — evidence recorded as completion_evidence event, state left settled" ;;
+            *)
+                set_task_state "$RC_RUN" "$RC_TASK" completed || true
+                append_event "$RC_RUN" "$RC_TASK" "completion_recorded" "$RC_EVIDENCE" \
+                    "complete_${RC_TASK}_${DOC_COMMIT}" >/dev/null 2>&1 || true
+                echo "stage2-diagnose: registry task $RC_RUN/$RC_TASK -> completed" ;;
+        esac
+    else
+        echo "stage2-diagnose: no registry task for $WT (pruned or pre-registry spawn) — recording to the loop ledger only"
+    fi
+    emit_loop_run diagnose succeeded "$RC_FINDINGS" "verified: $DOC @ ${DOC_COMMIT:0:12} on $RC_BRANCH"
+    exit 0
+fi
 # Trailing X's are REQUIRED. BSD /usr/bin/mktemp - which is what launchd's PATH
 # resolves to - returns a template with a suffix after the X's *verbatim* and creates
 # that literal file, so every run reuses one name and the SECOND run dies on
@@ -223,9 +340,17 @@ fi
 
 if [ "$delivered" -eq 1 ]; then
     echo "stage2-diagnose: brief delivered + submit-confirmed to $PANE"
-    emit_loop_run diagnose succeeded 0 "monthly pass dispatched: pane=$PANE branch=$BRANCH brief delivered+confirmed"
-    echo "stage2-diagnose: completion watcher (a conductor should run this BACKGROUNDED):"
-    echo "  bash $HERE/wake-on-evidence.sh ${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$THURBER_OS")/$BRANCH/.omc/handoffs/events.jsonl 'review:${BRANCH}_done'"
+    # Deliberately NO succeeded emit here. Dispatch is not diagnosis: three
+    # consecutive monthly passes emitted `succeeded` at this line and were
+    # then lost with zero commits — the ledger said the month was fine while
+    # the worker idled or died. The `succeeded` row now comes only from
+    # --record-completion, after the tracking doc is verified committed on the
+    # branch. Until that runs, the diagnose lane simply has no terminal row
+    # for this pass, which is the truth.
+    echo "stage2-diagnose: DIAGNOSIS OUTCOME NOT YET RECORDED — after the worker lands its tracking doc, run:"
+    echo "  bash $HERE/stage2-diagnose.sh --record-completion $BRANCH [findings]"
+    echo "stage2-diagnose: completion watcher (a conductor should run this BACKGROUNDED, then record):"
+    echo "  bash $HERE/wake-on-evidence.sh ${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$THURBER_OS")/$BRANCH/.omc/handoffs/events.jsonl 'review:${BRANCH}_done' && bash $HERE/stage2-diagnose.sh --record-completion $BRANCH"
 else
     emit_loop_run diagnose failed 0 "spawned pane=$PANE for $BRANCH but brief NOT delivered (last rc=$drc) — worker idle, needs manual send"
     echo "stage2-diagnose: BRIEF NOT DELIVERED to $PANE (last rc=$drc). Deliver by hand:" >&2

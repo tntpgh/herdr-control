@@ -180,6 +180,42 @@ function onToolCall(event: unknown): undefined {
   return undefined;
 }
 
+// ---- reconcile envelope ------------------------------------------------------
+// omp-reconcile.sh session/interval print ONE JSON envelope: {report,
+// ack_required, conductor_id, task_states, last_event_seq}. `report` is the
+// human text to inject; when ack_required is true the WHOLE envelope must be
+// fed back to `omp-reconcile.sh ack` — but only AFTER the injection was
+// actually accepted. That ordering is this file's half of the fix for the
+// silently-eaten interval reports: the old shim spawned the interval pass
+// with stdout ignored while the script checkpointed the report as delivered,
+// so every mid-session report was consumed unseen and the next session said
+// "no changes". Now nothing is acknowledged until it demonstrably reached
+// the session; a crash between delivery and ack redelivers (duplicate, never
+// loss), and ack_reconcile's MAX() cursor makes a replayed ack harmless.
+interface ReconcileEnvelope {
+  report: string;
+  ackRequired: boolean;
+  raw: string;
+}
+
+// Non-JSON stdout is treated as a plain-text report with nothing to ack —
+// the shape an older omp-reconcile.sh printed (which acknowledged inline
+// before printing). Injecting it unacked is exactly right for that version.
+function parseEnvelope(stdout: string): ReconcileEnvelope | undefined {
+  const raw = stdout.trim();
+  if (!raw) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && typeof (parsed as Record<string, unknown>).report === "string") {
+      const rec = parsed as Record<string, unknown>;
+      return { report: (rec.report as string).trim(), ackRequired: rec.ack_required === true, raw };
+    }
+  } catch {
+    // fall through to plain-text compatibility below
+  }
+  return { report: raw, ackRequired: false, raw };
+}
+
 // ---- SessionStart: before_agent_start --------------------------------------
 // The only handler here that runs SYNCHRONOUSLY and returns injected
 // context — matching why Claude's install.sh wires session-reconcile.sh
@@ -189,6 +225,11 @@ function onToolCall(event: unknown): undefined {
 // of wake persistence. Bounded by `timeout` so a hung or missing
 // omp-reconcile.sh degrades to "nothing injected", never a stalled session
 // start.
+//
+// The ack fires here, just before returning the message: for this event the
+// runner keeps the first returned message, so a successfully constructed
+// return IS the accepted injection. A spawnSync timeout or parse failure
+// exits earlier, leaving the report unacked for redelivery.
 function onBeforeAgentStart():
   | { message: { customType: string; content: string; display: boolean } }
   | undefined {
@@ -200,12 +241,13 @@ function onBeforeAgentStart():
       stdio: ["ignore", "pipe", "ignore"],
     });
     if (result.error) return undefined; // bash or the script missing/unreadable
-    const report = (result.stdout ?? "").trim();
-    if (!report) return undefined; // nothing new — same no-op Claude gets
+    const env = parseEnvelope(result.stdout ?? "");
+    if (!env || !env.report) return undefined; // nothing new — same no-op Claude gets
+    if (env.ackRequired) spawnDetached([RECONCILE_SH, "ack"], env.raw);
     return {
       message: {
         customType: "herdr-reconcile",
-        content: report,
+        content: env.report,
         display: true,
       },
     };
@@ -216,13 +258,56 @@ function onBeforeAgentStart():
 
 // ---- PostToolUse: tool_result -----------------------------------------------
 // Same two jobs Claude's PostToolUse wiring does: throttled mid-session
-// reconciliation (omp-reconcile.sh self-throttles off its own checkpoint
-// file, so calling it after every tool result costs about one stat on the
-// common no-op tick) and alert retraction (answering a prompt in the
-// terminal must not leave a stale Slack alert sitting there looking live).
-function onToolResult(): undefined {
+// reconciliation and alert retraction (answering a prompt in the terminal
+// must not leave a stale Slack alert sitting there looking live).
+//
+// The interval pass is spawned fire-and-forget for the AGENT (the handler
+// returns immediately; a slow sweep costs the turn nothing) but its stdout
+// is COLLECTED, not ignored: when the sweep emits a report, it is injected
+// through pi.sendMessage — the supported context-injection API for
+// mid-session content — and only a sendMessage that did not throw
+// acknowledges the envelope. The child is deliberately NOT detached/unref'd
+// here: a piped-stdout child needs its parent reading, and this one's whole
+// purpose is to be read.
+function runIntervalReconcile(pi: HookAPI): void {
   try {
-    if (reconcileAvailable) spawnDetached([RECONCILE_SH, "interval"]);
+    const child = spawn("bash", [RECONCILE_SH, "interval"], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    child.on("error", () => {});
+    let out = "";
+    child.stdout?.on("error", () => {});
+    child.stdout?.on("data", (chunk: Buffer) => {
+      // Bounded: an envelope is small; a runaway child must not buffer
+      // unbounded output inside the agent process.
+      if (out.length < 262_144) out += chunk.toString("utf8");
+    });
+    child.on("close", () => {
+      try {
+        const env = parseEnvelope(out);
+        if (!env || !env.report) return;
+        if (typeof pi.sendMessage !== "function") return; // never acked -> redelivered
+        pi.sendMessage({
+          customType: "herdr-reconcile",
+          content: env.report,
+          display: true,
+        });
+        // sendMessage returned without throwing: the entry is persisted to
+        // the session and participates in LLM context. That is the
+        // "accepted injection" the acknowledgment was waiting for.
+        if (env.ackRequired) spawnDetached([RECONCILE_SH, "ack"], env.raw);
+      } catch {
+        // sendMessage threw -> no ack -> the report replays next interval.
+      }
+    });
+  } catch {
+    // spawn() throwing synchronously — same contract as spawnDetached.
+  }
+}
+
+function onToolResult(pi: HookAPI): undefined {
+  try {
+    if (reconcileAvailable) runIntervalReconcile(pi);
     if (resolveAvailable) spawnDetached([RESOLVE_SH]);
   } catch {
     // omp swallows tool_result handler errors (unlike tool_call), but this
@@ -249,6 +334,6 @@ function onAgentEnd(): undefined {
 export default function (pi: HookAPI): void {
   pi.on("tool_call", onToolCall);
   pi.on("before_agent_start", onBeforeAgentStart);
-  pi.on("tool_result", onToolResult);
+  pi.on("tool_result", () => onToolResult(pi));
   pi.on("agent_end", onAgentEnd);
 }

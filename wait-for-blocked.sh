@@ -29,22 +29,39 @@ interval="${1:-15}"; max="${2:-240}"; shift "$(( $# < 2 ? $# : 2 ))"
 watch_list="$*"
 
 command -v herdr >/dev/null 2>&1 || { echo "wait-for-blocked: herdr not on PATH" >&2; exit 2; }
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib/pane-guard.sh"
+. "$here/lib/prompt-parse.sh"
 
 i=0
 while [ "$i" -lt "$max" ]; do
-  out="$(herdr pane list 2>/dev/null | python3 -c '
+  candidates="$(herdr pane list 2>/dev/null | python3 -c '
 import json, sys
 watch = set(sys.argv[1].split()) if len(sys.argv) > 1 and sys.argv[1].strip() else None
 try:
-    panes = (json.load(sys.stdin).get("result") or {}).get("panes") or []
+    data = json.load(sys.stdin)
+    panes = (data.get("result") or data).get("panes") or []
 except Exception:
     sys.exit(1)                      # unreadable -> treat as "nothing yet", keep polling
 hits = [p for p in panes
-        if p.get("agent_status") == "blocked"
+        if (p.get("agent_status") == "blocked" or p.get("agent"))
         and (watch is None or p.get("pane_id") in watch)]
 for p in hits:
-    print(f'"'"'{p.get("pane_id")}\t{p.get("label") or "-"}\t{p.get("workspace_id")}'"'"')
+    print("\t".join(str(p.get(k) or "-") for k in ("pane_id", "label", "workspace_id", "agent_status")))
 ' "$watch_list" 2>/dev/null)"
+  # omp can be labelled "working" with a real approval menu painted.
+  # A missed push hook must not hide that stall from the polling backstop.
+  out="$(while IFS=$'\t' read -r pane label ws status; do
+    [ -n "$pane" ] || continue
+    if [ "$status" = blocked ] || {
+      pane_is_agent "$pane" && prompt_menu_visible "$pane"
+    }; then
+      printf '%s\t%s\t%s\n' "$pane" "$label" "$ws"
+    fi
+  done <<EOF
+$candidates
+EOF
+)"
 
   if [ -n "$out" ]; then
     echo "BLOCKED — these panes are waiting on input:"

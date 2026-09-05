@@ -31,6 +31,7 @@ herdr() {
   case "$1 $2" in
     "pane list") cat "$HERDR_PANES_JSON" ;;
     "pane read") cat "$HERDR_READ_TEXT" 2>/dev/null ;;
+    "pane process-info") printf '{"result":{"process_info":{"foreground_processes":[{"name":"omp","cmdline":"omp"}]}}}\n' ;;
     *) echo "stub herdr: unhandled call: $*" >&2; return 1 ;;
   esac
 }
@@ -83,6 +84,20 @@ none_blocked
 wfb 0 2; rc=$?
 [ "$rc" -eq 3 ] && ok "exit 3 on timeout" || bad "exit $rc (expected 3)"
 grep -q "nothing blocked after" "$WORK/out.txt" && ok "explains the timeout with the elapsed budget" || bad "no explanation: $(cat "$WORK/out.txt")"
+
+printf '== omp approval is visible even when herdr reports working ==\n'
+printf '{"result":{"panes":[{"pane_id":"w1:p1","agent":"omp","agent_status":"working"}]}}\n' > "$HERDR_PANES_JSON"
+printf '╭─ Allow tool: bash ─╮\n│\n│ Command: printf smoke │\n│\n│ Approve │\n│ Deny │\n│\n│ up/down navigate  enter select  esc cancel │\n╰──╯\n' > "$HERDR_READ_TEXT"
+wfb 0 1 w1:p1; rc=$?
+[ "$rc" -eq 0 ] && ok "visible menu wakes the conductor despite working status" || bad "missed omp approval (exit $rc)"
+wfb 0 1 w9:p9; rc=$?
+[ "$rc" -eq 3 ] && ok "visible-menu fallback still respects watch scope" || bad "unwatched menu woke the conductor"
+printf 'Allow tool: bash\n\nApprove\nAlways allow\nDeny\nup/down navigate  enter select  esc cancel\n' > "$HERDR_READ_TEXT"
+wfb 0 1 w1:p1; rc=$?
+[ "$rc" -eq 0 ] && ok "unknown menu wakes for review without auto-selecting" || bad "unknown approval hidden"
+printf 'Working on the task; no approval requested.\n' > "$HERDR_READ_TEXT"
+wfb 0 1 w1:p1; rc=$?
+[ "$rc" -eq 3 ] && ok "ordinary working output does not wake the conductor" || bad "false approval detection"
 
 printf '== herdr not on PATH (and no stub function in scope): exit 2, explains ==\n'
 out=$(env -i PATH=/nonexistent "$(command -v bash)" "$here/wait-for-blocked.sh" 2>&1); rc=$?

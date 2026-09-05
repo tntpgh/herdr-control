@@ -367,3 +367,23 @@ classify_reason() {
   [ -r "$f" ] && cat "$f"
   return 0
 }
+
+# Human-reserved actions under the reviewed-operational conductor grant.
+# This is a conservative accident guard, not an interpreter/sandbox. Indirect
+# scripts still require the trusted conductor to inspect their complete body.
+# Operator-added restrictions remain hard stops even when a built-in rule
+# with equal severity supplied classify_reason's first-match explanation.
+conductor_reserved_reason() {
+  local norm
+  norm="$(scannable_command "$1")"
+  _cp_best_v=0; _cp_best_r=""
+  _cp_apply_operator_rules "$norm"
+  if [ "$_cp_best_v" -gt 0 ]; then printf '%s\n' "$_cp_best_r"; return; fi
+  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.env(\.[A-Za-z0-9_-]+)?\b|id_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[[:space:]])(printenv|env)([[:space:]]|$)|\bop[[:space:]]+(read|item[[:space:]]+get)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm"; then
+    printf 'credential-value access remains human-only\n'
+  elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]])' "$norm"; then
+    printf 'remote mutation remains human-only\n'
+  elif _cp_imatch '\bgh[[:space:]]+pr[[:space:]]+merge\b|\bgit\b.*\bpush\b.*\b(main|master)\b|\b(gate-registry|approval-policy)\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo' "$norm"; then
+    printf 'merge, governance, or control weakening remains human-only\n'
+  fi
+}

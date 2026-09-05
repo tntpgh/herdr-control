@@ -173,6 +173,38 @@ check "new event appears past the cursor" "$(events_since condCursor | wc -l | t
 # not consuming.
 check "not advancing replays" "$(events_since condCursor | wc -l | tr -d ' ')" "1"
 
+printf '== events_since carries task ownership (join, not a second query per event) ==\n'
+[ "$(events_since condCursor | tail -1 | jq -r 'has("task_conductor_id") and has("label") and has("repo")')" = "true" ] \
+  && ok "event rows carry task_conductor_id/label/repo for ownership scoping" \
+  || bad "events_since join fields missing: $(events_since condCursor | tail -1)"
+
+printf '== deferred ack: clock and acknowledgment are separate facts ==\n'
+# ack_reconcile commits the delivered report: task_states + cursor together.
+ack_reconcile condDefer '{"r/t":{"state":"blocked","updated_at":"u1"}}' 7 || bad "ack_reconcile failed"
+check "ack committed task_states" "$(read_checkpoint condDefer | jq -r '."r/t".state')" "blocked"
+check "ack committed cursor" \
+  "$(sqlite3 "$(registry_db)" "SELECT last_event_seq FROM checkpoints WHERE conductor_id='condDefer';")" "7"
+# touch_checkpoint_clock is what an UNDELIVERED prepare writes: the throttle
+# clock must advance, the acknowledgment must not.
+touch_checkpoint_clock condDefer || bad "touch_checkpoint_clock failed"
+check "clock touch preserves the cursor" \
+  "$(sqlite3 "$(registry_db)" "SELECT last_event_seq FROM checkpoints WHERE conductor_id='condDefer';")" "7"
+check "clock touch preserves task_states" "$(read_checkpoint condDefer | jq -r '."r/t".state')" "blocked"
+age_t=$(checkpoint_age_s condDefer)
+if [ "$age_t" -ge 0 ] && [ "$age_t" -lt 60 ]; then ok "throttle clock fresh after touch ($age_t s)"; else bad "clock stale after touch: $age_t"; fi
+# A replayed/stale ack (at-least-once retry) must never move the cursor
+# backward and resurrect consumed events.
+ack_reconcile condDefer '{"r/t":{"state":"completed","updated_at":"u2"}}' 3 || bad "replayed ack errored"
+check "stale ack cannot move the cursor backward" \
+  "$(sqlite3 "$(registry_db)" "SELECT last_event_seq FROM checkpoints WHERE conductor_id='condDefer';")" "7"
+check "task_states follow delivery order (last writer)" "$(read_checkpoint condDefer | jq -r '."r/t".state')" "completed"
+ack_reconcile condDefer '{}' 'notanumber' && bad "non-numeric sequence accepted" || ok "non-numeric sequence refused"
+
+printf '== task_for_worktree: completion evidence outlives the pane ==\n'
+register_task runW taskW w c cp cb paneW bW /repo/w /wt/target "wt-task" || bad "register taskW failed"
+check "found by worktree path" "$(task_for_worktree /wt/target | jq -r .task_id)" "taskW"
+check "unknown worktree is empty, not an error" "$(task_for_worktree /wt/nowhere)" ""
+
 printf '== approval lifecycle: decided / attempted / confirmed are DISTINCT ==\n'
 approval_decided appr1 pane1 promptA 2 "Yes" human/thurbs operator allow "rm -i x" run1 task1 \
   || bad "approval_decided failed"
