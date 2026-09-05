@@ -92,7 +92,7 @@ root=$(repo_root "$proj")
 # operator's rules. Normal project rule discovery is untouched.
 CANONICAL_RULES_SRC="" CANONICAL_RULES_ARGS=""
 if [ "$managed" = 1 ]; then
-  canonical_rules_resolve "$agent" "$root" || {
+  canonical_rules_resolve "$agent" "$root" "$root" || {
     echo "spawn-agent: canonical rules source configured but unusable — refusing managed launch" >&2
     exit 1
   }

@@ -12,7 +12,11 @@ here=$(cd "$(dirname "$0")" && pwd)
 pass=0 fail=0
 ok()   { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
-check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
+# Launch strings are typed into a shell; compare what the shell would SEE
+# (eval'd argv), so %q escapes that the shell strips (`\,`) do not read as
+# a difference. A payload that fails to parse compares unequal.
+argv_of(){ ( eval "set -- $1" 2>/dev/null && printf '%s\n' "$@" ) ; }
+check(){ if [ "$(argv_of "$2")" = "$(argv_of "$3")" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
 
 printf '== rank ordering ==\n'
 check "yolo   rank" "$(posture_rank yolo)"   "0"
@@ -110,6 +114,9 @@ check "a strict FLOOR overrides everything, even routed through omp" \
 check "omc still launches the real claude binary (it IS its own harness)" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omc sonnet)" \
   "claude --model sonnet --permission-mode acceptEdits"
+check "omc with a standalone effort passes it as claude's own --effort, not inside --model" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omc sonnet:high)" \
+  "claude --model sonnet --effort high --permission-mode acceptEdits"
 printf '== 2026-08-08 bug: a spec with NO ":effort" must OMIT the flag, never pass the model name as the effort value ==\n'
 # Reported live: spawn-task.sh --model X with no --effort produced
 # `codex -m X -c model_reasoning_effort=X` — codex hard-errors on every call
@@ -173,9 +180,14 @@ check "posture flag still follows the quoted model" "$(sed -n '3p' "$WORK/argv.t
 
 printf '== managed extra flags: posture/rules/system-context overrides are refused ==\n'
 for f in --approval-mode --permission-mode --auto-approve --yolo \
-         --dangerously-skip-permissions --no-rules --no-extensions --no-skills \
+         --dangerously-skip-permissions --allow-dangerously-skip-permissions \
+         --allowedTools --allowed-tools=Bash --bare --safe-mode \
+         --no-rules --no-extensions --no-skills \
          --system-prompt --append-system-prompt --append-system-prompt=/x \
-         --settings --setting-sources --add-dir; do
+         --system-prompt-file --append-system-prompt-file=/x \
+         --settings --setting-sources --add-dir \
+         --config --config=/x --profile --cwd --cwd=/x \
+         --hook -e --extension --plugin-dir --mcp-config --strict-mcp-config --agents; do
   managed_flag_rejected "$f" && ok "rejects $f" || bad "must reject $f"
 done
 for f in --resume --continue -p; do
@@ -195,7 +207,7 @@ if canonical_rules_resolve omp "$fleet/proj"; then
   esac
   composed="${CANONICAL_RULES_ARGS#--append-system-prompt }"
   # %q of a plain path quotes to itself; eval-strip is unnecessary here.
-  if [ -f "$composed" ] && grep -q 'CANON-MARKER' "$composed" && grep -q "Source: $fleet/AGENTS.md" "$composed"; then
+  if [ -f "$composed" ] && grep -q 'CANON-MARKER' "$composed" && grep -q "source: $fleet/AGENTS.md" "$composed"; then
     ok "composed cache carries the content AND a provenance header naming the source"
   else
     bad "composed cache missing content or provenance: $composed"
@@ -203,6 +215,32 @@ if canonical_rules_resolve omp "$fleet/proj"; then
 else
   bad "resolve failed for a readable derived ancestor source"
 fi
+printf '== every ancestor AGENTS.md is restored, outermost first (matches omp discovery) ==\n'
+mkdir -p "$fleet/org/proj2"
+printf 'ORG-MARKER org rules\n' > "$fleet/org/AGENTS.md"
+if canonical_rules_resolve omp "$fleet/org/proj2"; then
+  check "both ancestors collected, farthest first" "$CANONICAL_RULES_SRC" "$fleet/AGENTS.md:$fleet/org/AGENTS.md"
+  composed="${CANONICAL_RULES_ARGS#--append-system-prompt }"
+  grep -q 'CANON-MARKER' "$composed" && grep -q 'ORG-MARKER' "$composed" \
+    && ok "composed cache carries both files" || bad "an ancestor was dropped: $composed"
+else
+  bad "resolve failed with two readable ancestors"
+fi
+canonical_rules_resolve omp "$fleet/org/proj2" "$fleet/org/proj2" && [ -z "$CANONICAL_RULES_ARGS" ] \
+  && ok "in-tree launch cwd: nothing appended (normal discovery already loads them)" \
+  || bad "in-tree launch double-loads ancestor rules: $CANONICAL_RULES_SRC"
+canonical_rules_resolve omp "$fleet/org/proj2" "$WORK/elsewhere" \
+  && [ "$CANONICAL_RULES_SRC" = "$fleet/AGENTS.md:$fleet/org/AGENTS.md" ] \
+  && ok "out-of-tree launch cwd (a worktree): all ancestors appended" \
+  || bad "out-of-tree cwd lost ancestors: $CANONICAL_RULES_SRC"
+chmod 000 "$fleet/org/AGENTS.md"
+if canonical_rules_resolve omp "$fleet/org/proj2" 2>/dev/null; then
+  bad "an unreadable ancestor must fail resolution, not be skipped"
+else
+  ok "unreadable ancestor fails resolution (rc!=0)"
+fi
+chmod 644 "$fleet/org/AGENTS.md"
+
 canonical_rules_resolve mytool "$fleet/proj" && [ -z "$CANONICAL_RULES_ARGS" ] \
   && ok "unrecognized agent: no rules flag (literal commands are unmanaged)" \
   || bad "unrecognized agent should resolve empty, rc 0"

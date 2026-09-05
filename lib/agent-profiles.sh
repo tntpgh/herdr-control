@@ -257,7 +257,10 @@ cli_for_agent() {
       ;;
     omc)
       flag="$(posture_flag_for_agent omc "$posture")"
-      argv=(claude --model "$spec")
+      # spawn-task.sh's standalone --effort rewrites the spec to model:effort;
+      # claude takes that as its own --effort flag, never inside --model.
+      argv=(claude --model "${spec%%:*}")
+      [ "${spec%%:*}" != "$spec" ] && argv+=(--effort "${spec##*:}")
       ;;
     omp)
       # Same colonless-spec hazard as the claude/codex branch above —
@@ -306,10 +309,16 @@ managed_flag_rejected() {               # <arg> -> exit 0 if forbidden on a mana
     --permission-mode|--permission-mode=*|\
     --auto-approve|--auto-approve=*|--yolo|\
     --dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox|\
-    --no-rules|--no-extensions|--no-skills|\
-    --system-prompt|--system-prompt=*|\
+    --allow-dangerously-skip-permissions|\
+    --allowedTools|--allowedTools=*|--allowed-tools|--allowed-tools=*|\
+    --no-rules|--no-extensions|--no-skills|--bare|--safe-mode|\
+    --system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*|\
     --append-system-prompt|--append-system-prompt=*|\
+    --append-system-prompt-file|--append-system-prompt-file=*|\
     --settings|--settings=*|--setting-sources|--setting-sources=*|\
+    --config|--config=*|--profile|--profile=*|--cwd|--cwd=*|\
+    --hook|--hook=*|-e|--extension|--extension=*|--plugin-dir|--plugin-dir=*|--plugin-url|--plugin-url=*|\
+    --mcp-config|--mcp-config=*|--strict-mcp-config|--agents|--agents=*|\
     --add-dir|--add-dir=*)
       return 0 ;;
   esac
@@ -331,73 +340,98 @@ managed_flag_rejected() {               # <arg> -> exit 0 if forbidden on a mana
 # These are the one exception to this file's "pure" rule (they read the rules
 # source and write the composed cache); only the spawners call them.
 
-canonical_rules_source() {   # <project-root> -> source path (empty = none); exit 2 = configured but unusable
-  local src="${HERDR_CANONICAL_RULES:-}" dir
+canonical_rules_source() {   # <project-root> -> ':'-joined sources farthest-first (empty = none); exit 2 = configured but unusable
+  local src="${HERDR_CANONICAL_RULES:-}" dir found="" one
   if [ -n "$src" ]; then
-    # Explicit operator path — inherited across descendants via the spawn
-    # stamp. Configured-but-unreadable FAILS the managed launch (caller
-    # aborts on exit 2): silently launching without the operator's rules is
-    # the dishonest direction.
-    if [ -f "$src" ] && [ -r "$src" ]; then printf '%s\n' "$src"; return 0; fi
-    echo "canonical-rules: HERDR_CANONICAL_RULES is set but missing/unreadable: $src" >&2
-    return 2
+    # Explicit operator path(s) — inherited across descendants via the spawn
+    # stamp. Any configured-but-unreadable entry FAILS the managed launch
+    # (caller aborts on exit 2): silently launching without the operator's
+    # rules is the dishonest direction.
+    local IFS=':'
+    for one in $src; do
+      [ -n "$one" ] || continue
+      [ -f "$one" ] && [ -r "$one" ] || {
+        echo "canonical-rules: HERDR_CANONICAL_RULES entry missing/unreadable: $one" >&2
+        return 2
+      }
+    done
+    printf '%s\n' "$src"; return 0
   fi
   dir=$(cd "$1" 2>/dev/null && pwd) || {
     echo "canonical-rules: project root unreadable: $1" >&2
     return 2
   }
   # Walk the ORIGINAL project root's ancestors (never the root itself — its
-  # own AGENTS.md loads through normal discovery), stopping at $HOME. The
-  # spawners pass repo_root's answer, so a nested spawn from inside a task
-  # worktree derives from the real project tree, not the worktree mirror.
+  # own AGENTS.md loads through normal discovery), stopping at $HOME. omp's
+  # own discovery loads EVERY ancestor file, so collect them all, farthest
+  # first, rather than stopping at the nearest. The spawners pass repo_root's
+  # answer, so a nested spawn from inside a task worktree derives from the
+  # real project tree, not the worktree mirror.
   while :; do
     case "$dir" in "$HOME"|/|"") break ;; esac
     dir=$(dirname "$dir")
-    if [ -e "$dir/AGENTS.md" ]; then
-      if [ -f "$dir/AGENTS.md" ] && [ -r "$dir/AGENTS.md" ]; then
-        printf '%s\n' "$dir/AGENTS.md"; return 0
-      fi
+    [ -e "$dir/AGENTS.md" ] || continue
+    if [ -f "$dir/AGENTS.md" ] && [ -r "$dir/AGENTS.md" ]; then
+      found="$dir/AGENTS.md${found:+:$found}"
+    else
       echo "canonical-rules: ancestor rules exist but are unreadable: $dir/AGENTS.md" >&2
       return 2
     fi
   done
-  return 0                              # nothing configured or found: launch normally
+  printf '%s\n' "$found"
 }
 
-canonical_rules_compose() {  # <source> -> composed cache file path; exit 1 on failure
-  local src="$1" dir out
+canonical_rules_compose() {  # <':'-joined sources> -> composed cache file path; exit 1 on failure
+  local srcs="$1" dir out one
   dir="${HERDR_STATE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/herdr-control}/canonical-rules"
   mkdir -p "$dir" || return 1
-  out="$dir/$(printf '%s' "$src" | tr '/ ' '__').md"
-  {
+  out="$dir/$(printf '%s' "$srcs" | tr '/ :' '__+').md"
+  (
     printf -- '<!-- herdr-control managed launch: canonical operator ancestor rules.\n'
-    printf -- '     Source: %s\n' "$src"
+    printf -- '     Sources (outermost first): %s\n' "$srcs"
     printf -- '     Appended because task worktrees live outside the project ancestor\n'
-    printf -- '     tree, so upward rule discovery cannot reach this file. The\n'
-    printf -- "     worktree's own project rules still load through normal discovery. -->\n\n"
-    cat "$src"
-  } > "$out.tmp.$$" || { rm -f "$out.tmp.$$"; return 1; }
+    printf -- '     tree, so upward rule discovery cannot reach these files. The\n'
+    printf -- "     worktree's own project rules still load through normal discovery. -->\n"
+    IFS=':'
+    for one in $srcs; do
+      [ -n "$one" ] || continue
+      printf -- '\n<!-- source: %s -->\n' "$one"
+      cat "$one" || exit 1
+    done
+  ) > "$out.tmp.$$" || { rm -f "$out.tmp.$$"; return 1; }
   mv -f "$out.tmp.$$" "$out" || return 1
   printf '%s\n' "$out"
 }
 
-# canonical_rules_resolve <agent> <project-root>
-# Sets CANONICAL_RULES_SRC (source path, "" when none) and
+# canonical_rules_resolve <agent> <project-root> [launch-cwd]
+# Sets CANONICAL_RULES_SRC (':'-joined source paths, "" when none) and
 # CANONICAL_RULES_ARGS ("--append-system-prompt <%q path>", "" when none).
 # Exit 2 = a configured/derived source exists but is unusable — the caller
 # MUST refuse the managed launch rather than launch without it.
 # Only omp-backed launches take the flag; omc (the real claude binary, its
-# own harness with its own rule discovery) is left alone.
+# own harness with its own rule discovery) is left alone. When the launch
+# cwd sits INSIDE a source's directory tree, normal discovery already loads
+# that file — it is dropped from the append rather than loaded twice.
 canonical_rules_resolve() {
   CANONICAL_RULES_SRC="" CANONICAL_RULES_ARGS=""
   case "$1" in claude|codex|omp) ;; *) return 0 ;; esac
-  local src composed
+  local src composed cwd="${3:-}" one keep=""
   src=$(canonical_rules_source "$2") || return 2
   [ -n "$src" ] || return 0
-  composed=$(canonical_rules_compose "$src") || {
-    echo "canonical-rules: could not compose cache from $src" >&2
+  if [ -n "$cwd" ]; then
+    cwd=$(cd "$cwd" 2>/dev/null && pwd) || cwd=""
+  fi
+  local IFS=':'
+  for one in $src; do
+    [ -n "$one" ] || continue
+    case "${cwd:+$cwd/}" in "$(dirname "$one")/"*) continue ;; esac
+    keep="${keep:+$keep:}$one"
+  done
+  [ -n "$keep" ] || return 0
+  composed=$(canonical_rules_compose "$keep") || {
+    echo "canonical-rules: could not compose cache from $keep" >&2
     return 2
   }
-  CANONICAL_RULES_SRC="$src"
+  CANONICAL_RULES_SRC="$keep"
   CANONICAL_RULES_ARGS="--append-system-prompt $(printf '%q' "$composed")"
 }
