@@ -74,25 +74,24 @@ if [ "${1:-}" = "--scheduled" ]; then
         emit_loop_run diagnose succeeded 0 "scheduler-liveness: skipped, not the first Friday — no pass due, NOT a diagnosis outcome"
         exit 0
     fi
-    # First Friday: this is where the monthly pass used to spawn. It no longer
-    # does. The scheduled path has no conductor and no human — the worker it
-    # spawned was an UNATTENDED, UNISOLATED executory agent on this host, which
-    # the 2026-09-04 policy forbids until an isolated worker boundary exists
-    # (Terrence authorized task-scoped operational authority on the condition
-    # that isolated executory workers land FIRST). Three consecutive monthly
-    # passes were lost partly because nothing owned the spawned worker's
-    # completion; refusing loudly here is the honest state, and the failed
-    # ledger row pages as a pre-triaged incident instead of rotting silently.
-    # Run `./stage2-diagnose.sh` by hand (attended) to do the monthly pass.
-    echo "stage2-diagnose: REFUSING scheduled dispatch — unattended unisolated executory workers are disabled by policy (2026-09-04)." >&2
-    echo "stage2-diagnose: run this script manually (attended) for the monthly pass, then record its outcome with --record-completion." >&2
-    emit_loop_run diagnose failed 0 "isolation-required: scheduled dispatch refused — unattended unisolated executory workers disabled by policy; run manually attended + --record-completion"
-    exit 1
+    # First Friday: the scheduled path runs the pass INSIDE the isolated
+    # worker (isolated-worker.py) — no host pane, no herdr socket, no
+    # credentials, network limited to the model relay. The worker's doc comes
+    # back as a patch; this script accepts it only if it touches nothing but
+    # docs/tracking/*-stage2-diagnose-pass.md, commits it on the pass branch,
+    # and records completion by verifying that commit. Anything else is a
+    # failed ledger row, never a claimed success. (2026-09-05, after Terrence's
+    # isolation_first decision replaced the 2026-09-04 refuse-outright stance.)
+    SCHEDULED=1
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 THURBER_OS="${STAGE2_THURBER_OS_REPO:-$HOME/Code/thurber-os}"
 BRANCH="evolution-loop/stage2-diagnose-$(date -u +%Y%m%d)"
+# The pass branches from, and is verified against, the remote DEFAULT branch —
+# thurber-os has no `main` (origin/HEAD -> plan/execution-layer). Hardcoding
+# origin/main here made --record-completion refuse every real pass.
+BASE_REF="${STAGE2_BASE_REF:-$(git -C "$THURBER_OS" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)}"
 MODEL="${STAGE2_MODEL:-claude-fable-5}"
 
 # ---- --record-completion [branch] [findings] --------------------------------
@@ -140,12 +139,12 @@ if [ "${1:-}" = "--record-completion" ]; then
         echo "stage2-diagnose: $DOC is tracked but no commit touches it — completion NOT recorded" >&2
         exit 2
     fi
-    if ! git -C "$WT" rev-parse --verify -q origin/main >/dev/null 2>&1; then
-        echo "stage2-diagnose: cannot resolve origin/main in $WT to prove $DOC is new to this branch — completion NOT recorded" >&2
+    if ! git -C "$WT" rev-parse --verify -q "$BASE_REF" >/dev/null 2>&1; then
+        echo "stage2-diagnose: cannot resolve $BASE_REF in $WT to prove $DOC is new to this branch — completion NOT recorded" >&2
         exit 2
     fi
-    if git -C "$WT" merge-base --is-ancestor "$DOC_COMMIT" origin/main 2>/dev/null; then
-        echo "stage2-diagnose: newest tracking doc ($DOC) is inherited from origin/main, not produced on $RC_BRANCH — completion NOT recorded" >&2
+    if git -C "$WT" merge-base --is-ancestor "$DOC_COMMIT" "$BASE_REF" 2>/dev/null; then
+        echo "stage2-diagnose: newest tracking doc ($DOC) is inherited from $BASE_REF, not produced on $RC_BRANCH — completion NOT recorded" >&2
         exit 2
     fi
     echo "stage2-diagnose: verified $DOC @ ${DOC_COMMIT} on $RC_BRANCH"
@@ -191,6 +190,22 @@ fi
 # ever reached the spawn.
 BRIEF_FILE="$(mktemp "${TMPDIR:-/tmp}/stage2-diagnose-brief.XXXXXX")"
 
+# The brief differs only in WHERE things live and HOW to finish: an attended
+# worktree pass reads sibling checkouts and commits; the isolated pass reads
+# read-only exports under /herdr/inputs and just writes the doc (this script
+# commits the returned patch after checking its scope).
+if [ "${SCHEDULED:-0}" = 1 ]; then
+  LEDGER_LINE='`/herdr/inputs/ledger/*.jsonl` (a read-only copy of the Stage-1 engineering ledger)'
+  SIBLINGS_LINE='Sibling repos are READ-ONLY exports under `/herdr/inputs/knowledge-base`, `/herdr/inputs/tourguide`, `/herdr/inputs/thurber-ai`, `/herdr/inputs/herdr-control` (tracked files only; no .git, no secrets) -- read/grep/glob there, zero edits.'
+  OUTPUT_LINE='`docs/tracking/'"$(date -u +%Y-%m-%d)"'-stage2-diagnose-pass.md` under `/workspace` (thurber-os). Do NOT commit and do NOT create any other file in /workspace; the orchestrator commits the returned patch on the pass branch only if that is the sole change.'
+  DONE_LINE='Write the doc, then write /herdr/out/RESULT.md with: findings count by classification, headline items, and anything a human must decide. Then stop.'
+else
+  LEDGER_LINE='`~/Code/herdr-control/.local-state/engineering-ledger/*.jsonl`'
+  SIBLINGS_LINE='Read-only across all sibling repos (knowledge-base, tourguide, thurber-ai) -- read/grep/glob directly, zero edits, zero commits, zero PRs in any of them.'
+  OUTPUT_LINE='`docs/tracking/'"$(date -u +%Y-%m-%d)"'-stage2-diagnose-pass.md` in THIS worktree (thurber-os), committed here, nothing else changes.'
+  DONE_LINE='Commit the doc, then append the handoff event to `.omc/handoffs/events.jsonl` in this worktree: `{"event":"review:'"$BRANCH"'_done","commit":"<hash>","summary":"<one-line: how many findings, by classification, headline items>"}`'
+fi
+
 # Find the most recent prior Stage-2 doc (if any) so the new pass knows what
 # to treat as carry-over instead of re-reporting it as new.
 # Prior docs can live in two places: merged onto main, or still sitting on an
@@ -227,7 +242,7 @@ full first -- this is your governing document, not this brief alone).
   never-automate list (ZipForms writes, entity-graph merges, anything
   gate-registry marks \`safety_critical\`).
 - Prior Stage-2 pass: $PRIOR_LINE
-- The Stage-1 ledger: \`~/Code/herdr-control/.local-state/engineering-ledger/*.jsonl\`
+- The Stage-1 ledger: $LEDGER_LINE
   -- read every line across every file present. Report honestly if it's
   still too thin for trend claims; only assert what the data actually
   supports.
@@ -251,12 +266,8 @@ full first -- this is your governing document, not this brief alone).
 
 ## Constraints -- this is the E0/E1 boundary, take it seriously
 
-- Read-only across all sibling repos (knowledge-base, tourguide,
-  thurber-ai) -- read/grep/glob directly, zero edits, zero commits, zero
-  PRs in any of them.
-- Output is a doc, never code:
-  \`docs/tracking/$(date -u +%Y-%m-%d)-stage2-diagnose-pass.md\` in THIS
-  worktree (thurber-os), committed here, nothing else changes.
+- $SIBLINGS_LINE
+- Output is a doc, never code: $OUTPUT_LINE
 - Phase 2 (E1): proposal-only. End with "what a human should decide next,"
   not an action plan you're already executing. Even with the allowlist now
   decided, Stage 3 execution is a SEPARATE, not-yet-built step -- this pass
@@ -274,11 +285,76 @@ full first -- this is your governing document, not this brief alone).
 
 ## When done
 
-Commit the doc, then append the handoff event to \`.omc/handoffs/events.jsonl\`
-in this worktree:
-\`{"event":"review:${BRANCH}_done","commit":"<hash>","summary":"<one-line: how many findings, by classification, headline items>"}\`
+$DONE_LINE
 EOF
 
+
+# ---- scheduled: run the pass in the isolated worker --------------------------
+if [ "${SCHEDULED:-0}" = 1 ]; then
+    # Test seam: verify-stage2.sh points this at a stub that fabricates a
+    # result; production leaves it unset. Neither value can reach a host pane.
+    ISO_WORKER="${STAGE2_ISOLATED_WORKER:-$HERE/isolated-worker.py}"
+    ISO_MODEL="${STAGE2_ISOLATED_MODEL:-anthropic/claude-fable-5-1}"
+    ISO_TIMEOUT="${STAGE2_ISOLATED_TIMEOUT:-5400}"
+    ISO_ROOT="${HERDR_ISOLATED_ROOT:-$HOME/.herdr/isolated-worker}"
+    GATEWAY_URL="${STAGE2_GATEWAY_URL:-http://host.docker.internal:4000}"
+    GATEWAY_TOKEN="${STAGE2_GATEWAY_TOKEN_FILE:-$HOME/.omp/auth-gateway.token}"
+    _ref_for() {  # <repo> -> origin/main if it resolves, else HEAD (read-only diagnosis input)
+        git -C "$1" fetch -q origin main >/dev/null 2>&1 || true
+        git -C "$1" rev-parse --verify -q origin/main >/dev/null 2>&1 && echo origin/main || echo HEAD
+    }
+    if ! git -C "$THURBER_OS" fetch -q origin "${BASE_REF#origin/}" 2>/dev/null; then
+        emit_loop_run diagnose failed 0 "isolated pass: cannot fetch $BASE_REF for $THURBER_OS — no snapshot source"
+        exit 1
+    fi
+    ISO_INPUTS=()
+    for sib in knowledge-base tourguide thurber-ai herdr-control; do
+        [ -d "$HOME/Code/$sib/.git" ] || [ -f "$HOME/Code/$sib/.git" ] || {
+            emit_loop_run diagnose failed 0 "isolated pass: sibling repo missing: $HOME/Code/$sib"; exit 1; }
+        ISO_INPUTS+=(--input "$sib=$HOME/Code/$sib@$(_ref_for "$HOME/Code/$sib")")
+    done
+    [ -d "$HERE/.local-state/engineering-ledger" ] && ISO_INPUTS+=(--input-dir "ledger=$HERE/.local-state/engineering-ledger")
+    echo "stage2-diagnose: running isolated pass ($ISO_MODEL, ${ISO_TIMEOUT}s) from $BASE_REF of $THURBER_OS"
+    ISO_OUT="$(python3 "$ISO_WORKER" --repo "$THURBER_OS" --ref "$BASE_REF" --brief "$BRIEF_FILE" \
+        --model "$ISO_MODEL" --gateway-url "$GATEWAY_URL" --gateway-token-file "$GATEWAY_TOKEN" \
+        --timeout "$ISO_TIMEOUT" --work-root "$ISO_ROOT" "${ISO_INPUTS[@]}" 2>/dev/null)" || true
+    ISO_STATUS="$(printf '%s' "$ISO_OUT" | jq -r '.status // "unknown"' 2>/dev/null || echo unknown)"
+    ISO_DIR="$(printf '%s' "$ISO_OUT" | jq -r '.task_dir // empty' 2>/dev/null || true)"
+    if [ "$ISO_STATUS" != completed ]; then
+        emit_loop_run diagnose failed 0 "isolated pass status=$ISO_STATUS task_dir=${ISO_DIR:-?} — no doc accepted"
+        echo "stage2-diagnose: isolated worker did not complete (status=$ISO_STATUS); see ${ISO_DIR:-<no task dir>}/logs" >&2
+        exit 1
+    fi
+    PATCH="$ISO_DIR/artifacts/changes.patch"
+    CHANGES="$ISO_DIR/artifacts/changes.json"
+    EXPECT_DOC="docs/tracking/$(date -u +%Y-%m-%d)-stage2-diagnose-pass.md"
+    # Accept ONLY the expected doc as the sole ADDED path — the worker's output
+    # is untrusted; scope is the review gate this unattended path has.
+    TOUCHED="$(jq -r '[.added[].path, .modified[].path, .deleted[].path, .symlinks_created[]?.path?] | map(select(. != null)) | join("\n")' "$CHANGES" 2>/dev/null || true)"
+    if [ "$TOUCHED" != "$EXPECT_DOC" ]; then
+        emit_loop_run diagnose failed 0 "isolated pass returned out-of-scope changes (expected only $EXPECT_DOC): $(printf '%s' "$TOUCHED" | tr '\n' ' ' | cut -c1-200) — patch NOT applied, task_dir=$ISO_DIR"
+        echo "stage2-diagnose: patch touches more than the tracking doc; refusing to apply. Review $PATCH by hand." >&2
+        exit 1
+    fi
+    WTROOT="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$THURBER_OS")"
+    WT="$WTROOT/$BRANCH"
+    if [ -e "$WT" ]; then
+        emit_loop_run diagnose failed 0 "isolated pass: worktree $WT already exists — refusing to overwrite; patch at $PATCH"
+        exit 1
+    fi
+    mkdir -p "$WTROOT"
+    git -C "$THURBER_OS" worktree add -q -b "$BRANCH" "$WT" "$BASE_REF"
+    if ! git -C "$WT" apply --index "$PATCH"; then
+        emit_loop_run diagnose failed 0 "isolated pass: patch did not apply cleanly on $BASE_REF — patch at $PATCH"
+        git -C "$THURBER_OS" worktree remove --force "$WT" >/dev/null 2>&1; git -C "$THURBER_OS" branch -D "$BRANCH" >/dev/null 2>&1
+        exit 1
+    fi
+    git -C "$WT" commit -q -m "Stage 2 diagnose pass $(date -u +%Y-%m-%d) (isolated worker, $ISO_MODEL)" -- "$EXPECT_DOC"
+    git -C "$WT" push -q -u origin "$BRANCH" 2>/dev/null || echo "stage2-diagnose: branch push failed (offline?) — doc is committed locally on $BRANCH" >&2
+    FINDINGS="$(grep -cE '^#{2,4} +F[0-9]+\b' "$WT/$EXPECT_DOC" 2>/dev/null || true)"
+    echo "stage2-diagnose: accepted $EXPECT_DOC on $BRANCH (worker RESULT.md: $ISO_DIR/out/RESULT.md)"
+    exec bash "$HERE/stage2-diagnose.sh" --record-completion "$BRANCH" "${FINDINGS:-0}"
+fi
 echo "stage2-diagnose: spawning Fable-5 pass on branch $BRANCH"
 echo "stage2-diagnose: brief written to $BRIEF_FILE"
 

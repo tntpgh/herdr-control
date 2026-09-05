@@ -101,6 +101,32 @@ class ArgPolicy(unittest.TestCase):
         self.assertEqual(iw.probe_url_for("http://gw.example:4000", None), "http://gw.example:4000")
         self.assertEqual(iw.probe_url_for("http://host.docker.internal:4000", "http://10.0.0.5:4000/"), "http://10.0.0.5:4000")
 
+    def test_inputs_parse_and_reject_bad_names(self):
+        a = iw.parse_args(self.BASE + ["--model", "anthropic/x", "--input", "kb=/tmp/kb@origin/main", "--input-dir", "ledger=/tmp/led"])
+        self.assertEqual([(i["name"], i["kind"], i["ref"]) for i in a.inputs],
+                         [("kb", "repo", "origin/main"), ("ledger", "dir", "HEAD")])
+        for bad in (["--input", "kb"], ["--input", "../x=/tmp"], ["--input", "a=/x", "--input-dir", "a=/y"]):
+            with self.assertRaises(SystemExit, msg=bad):
+                iw.parse_args(self.BASE + ["--model", "anthropic/x"] + bad)
+
+
+class DirInput(unittest.TestCase):
+    def test_screened_copy_drops_secrets_symlinks_and_harness_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src"); dest = os.path.join(tmp, "dest")
+            os.makedirs(os.path.join(src, "data")); os.makedirs(os.path.join(src, ".claude")); os.makedirs(dest)
+            open(os.path.join(src, "data", "runs.jsonl"), "w").write('{"a":1}\n')
+            open(os.path.join(src, ".env"), "w").write("SECRET=1\n")
+            open(os.path.join(src, "data", "key.txt"), "wb").write(b"-----BEGIN " + b"RSA PRIVATE KEY-----\n")
+            open(os.path.join(src, ".claude", "settings.json"), "w").write("{}")
+            os.symlink("/etc/passwd", os.path.join(src, "escape"))
+            m = iw.export_dir(src, dest, {"files": [], "excluded": [], "submodules": []}, 1 << 20, 1 << 24)
+            self.assertEqual({f["path"] for f in m["files"]}, {"data/runs.jsonl"})
+            self.assertEqual({e["path"]: e["reason"] for e in m["excluded"]},
+                             {".env": "env-file", "data/key.txt": "private-key-content", "escape": "symlink"})
+            self.assertFalse(os.path.lexists(os.path.join(dest, "escape")))
+            self.assertFalse(os.path.exists(os.path.join(dest, ".claude")))
+            self.assertTrue(os.path.isfile(os.path.join(dest, "data", "runs.jsonl")))
 
 # --- snapshot export ----------------------------------------------------------------
 

@@ -53,19 +53,61 @@ run_stage2() {  # <args...> -> stage2 with stubbed HOME; echoes rc
   printf '%s' "$?"
 }
 
-printf '== scheduled first-Friday: refuses dispatch, pages isolation-required ==\n'
-# STAGE2_ASSUME_FIRST_FRIDAY is the deliberate test seam: it can only force
-# the branch that REFUSES, never one that spawns.
+printf '== scheduled first-Friday: runs the ISOLATED worker, accepts only the tracking doc ==\n'
+# STAGE2_ASSUME_FIRST_FRIDAY forces the first-Friday branch; STAGE2_ISOLATED_WORKER
+# points it at a stub that fabricates a worker result — nothing can reach a
+# host pane or Docker from here.
+git init -q --bare "$WORK/origin.git"
+git clone -q "$WORK/origin.git" "$WORK/thurber-os" 2>/dev/null
+git -C "$WORK/thurber-os" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$WORK/thurber-os" branch -q -M main && git -C "$WORK/thurber-os" push -q -u origin main 2>/dev/null
+for sib in knowledge-base tourguide thurber-ai herdr-control; do
+  git init -q -b main "$WORK/Code/$sib" && git -C "$WORK/Code/$sib" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+done
+TODAY="$(date -u +%Y-%m-%d)"; DOC="docs/tracking/$TODAY-stage2-diagnose-pass.md"
+export STUB_MODE_FILE="$WORK/stub-mode"; export STUB_DOC="$DOC"
+cat > "$WORK/fake-isolated-worker.py" <<'EOS'
+import json, os, sys
+args = sys.argv[1:]; root = args[args.index("--work-root") + 1]
+td = os.path.join(root, "task-1"); os.makedirs(os.path.join(td, "artifacts")); os.makedirs(os.path.join(td, "out"))
+mode = open(os.environ["STUB_MODE_FILE"]).read().strip(); doc = os.environ["STUB_DOC"]
+if mode == "worker_failed":
+    print(json.dumps({"status": "worker_failed", "task_dir": td})); sys.exit(4)
+added = [{"path": doc, "size": 1}] if mode == "ok" else [{"path": doc, "size": 1}, {"path": "runtime/x.py", "size": 1}]
+json.dump({"added": added, "modified": [], "deleted": [], "symlinks_created": []}, open(os.path.join(td, "artifacts", "changes.json"), "w"))
+body = "# pass\n\n## F1 something\n\n## F2 other\n"
+patch = "".join(f"diff --git a/{p['path']} b/{p['path']}\nnew file mode 100644\n--- /dev/null\n+++ b/{p['path']}\n@@ -0,0 +1,5 @@\n" + "".join("+" + l + "\n" for l in body.splitlines()) for p in added)
+open(os.path.join(td, "artifacts", "changes.patch"), "w").write(patch)
+open(os.path.join(td, "out", "RESULT.md"), "w").write("2 findings\n")
+print(json.dumps({"status": "completed", "task_dir": td}))
+EOS
+export STAGE2_ISOLATED_WORKER="$WORK/fake-isolated-worker.py" HERDR_ISOLATED_ROOT="$WORK/iso"
+
+printf ok > "$STUB_MODE_FILE"; : > "$EMITLOG"
 rc=$(STAGE2_ASSUME_FIRST_FRIDAY=1 run_stage2 --scheduled)
-[ "$rc" = "1" ] && ok "scheduled dispatch exits 1 (fails closed)" || bad "exit $rc: $(cat "$WORK/s2.err")"
-grep -q -- '--state failed' "$EMITLOG" \
-  && ok "diagnose lane fed a FAILED row, not a fake success" || bad "emit log: $(cat "$EMITLOG")"
-grep -q 'isolation-required' "$EMITLOG" \
-  && ok "the failure names the actionable condition (isolation-required)" || bad "emit log: $(cat "$EMITLOG")"
-grep -q 'REFUSING scheduled dispatch' "$WORK/s2.err" \
-  && ok "refusal explained on stderr" || bad "silent refusal: $(cat "$WORK/s2.err")"
-grep -qi 'spawn' "$WORK/s2.out" \
-  && bad "scheduled path still reached a spawn" || ok "no worker spawned"
+[ "$rc" = "0" ] && ok "in-scope doc: exits 0" || bad "exit $rc: $(cat "$WORK/s2.err")"
+grep -q -- '--state succeeded' "$EMITLOG" && grep -q 'verified: '"$DOC" "$EMITLOG" \
+  && ok "succeeded row comes from --record-completion verifying the committed doc" || bad "emit log: $(cat "$EMITLOG")"
+grep -qE -- '--findings 2\b|findings.*2' "$EMITLOG" && ok "findings counted from the doc" || bad "findings not counted: $(cat "$EMITLOG")"
+BR_TODAY="evolution-loop/stage2-diagnose-$(date -u +%Y%m%d)"
+git -C "$WORK/thurber-os" log -1 --format=%s "$BR_TODAY" 2>/dev/null | grep -q 'isolated worker' \
+  && ok "doc committed on the pass branch" || bad "no commit on $BR_TODAY"
+grep -qE '^spawned .* pane=' "$WORK/s2.out" && bad "scheduled path still reached a host spawn" || ok "no host pane spawned"
+grep -q 'RESULT.md' "$WORK/s2.out" && ok "points at the worker's untrusted RESULT.md" || bad "no pointer to RESULT.md"
+
+printf out-of-scope > "$STUB_MODE_FILE"; : > "$EMITLOG"; rm -rf "$WORK/iso"
+git -C "$WORK/thurber-os" worktree remove --force "$HERDR_WT_DIR/thurber-os/$BR_TODAY" && git -C "$WORK/thurber-os" branch -q -D "$BR_TODAY"
+rc=$(STAGE2_ASSUME_FIRST_FRIDAY=1 run_stage2 --scheduled)
+[ "$rc" = "1" ] && grep -q 'out-of-scope' "$EMITLOG" && grep -q -- '--state failed' "$EMITLOG" \
+  && ok "patch touching code is refused with a failed row" || bad "rc=$rc emit: $(cat "$EMITLOG")"
+[ ! -e "$HERDR_WT_DIR/thurber-os/$BR_TODAY" ] && ok "no branch/worktree created for a refused patch" || bad "worktree created for out-of-scope patch"
+
+printf worker_failed > "$STUB_MODE_FILE"; : > "$EMITLOG"; rm -rf "$WORK/iso"
+rc=$(STAGE2_ASSUME_FIRST_FRIDAY=1 run_stage2 --scheduled)
+[ "$rc" = "1" ] && grep -q 'status=worker_failed' "$EMITLOG" && grep -q -- '--state failed' "$EMITLOG" \
+  && ok "worker failure is a failed row, never success" || bad "rc=$rc emit: $(cat "$EMITLOG")"
+unset STAGE2_ISOLATED_WORKER
+rm -rf "$WORK/thurber-os" "$WORK/origin.git"
 
 printf '== record-completion: no committed doc -> refused, no succeeded row ==\n'
 # A real repo with a real origin/main, so the inherited-doc guard is exercised
