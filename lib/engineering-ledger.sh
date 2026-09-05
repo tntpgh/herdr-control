@@ -47,13 +47,18 @@ ledger_error_entry() {
     '{schema:1,poll_id:$poll_id,observed_at:$observed_at,source:$source,source_id:$source_id,status:"error",failure:{class:"source_error",signature:$signature}}'
 }
 
+# Referenced by item ID, not title: on 2026-09-05 `op item edit` created a
+# SECOND item with the same title (the old org:admin personal token kept
+# winning the name lookup), and titles are not unique in 1Password. The
+# item holds the `engineering-ledger` Internal Integration token —
+# scopes `project:read` + `event:read`, nothing else.
 ledger_sentry_token() {
   if [ -n "${ENGINEERING_LEDGER_SENTRY_TOKEN:-}" ]; then
     printf '%s' "$ENGINEERING_LEDGER_SENTRY_TOKEN"
     return 0
   fi
   command -v op >/dev/null 2>&1 || return 1
-  op read 'op://secrets/claude-sentry-auth-token/credential' 2>/dev/null
+  op read 'op://Secrets/yob77xaqycg2hcgtmn52cwh6ie/credential' 2>/dev/null
 }
 
 ledger_sentry_get() {
@@ -69,9 +74,13 @@ ledger_sentry_get() {
     | curl -fsS --config - --get "$@" "$url"
 }
 
+# /api/0/projects/ lists every project the token can see and needs only
+# `project:read`; the org-scoped /organizations/<org>/projects/ additionally
+# requires `org:read`, which the minimal integration token deliberately
+# lacks. Both projects are in the one org, so the result is the same list.
 ledger_sentry_projects_json() {
   ledger_sentry_get \
-    'https://sentry.io/api/0/organizations/the-thurber-team/projects/' \
+    'https://sentry.io/api/0/projects/' \
     --data-urlencode 'per_page=100'
 }
 
