@@ -75,10 +75,9 @@ agent declaring nothing is refused an automated answer rather than guessed
 at — "bare digit, never Enter" was previously hardcoded protocol knowledge
 and was already wrong for omp's arrow-key menu. The same discipline applies
 to posture enforcement: `posture_flag_for_agent` maps a resolved posture to
-a real CLI flag for claude/omp; codex is deliberately left unmapped, because
-a plausible-looking guessed flag would either break the spawn or falsely
-imply enforcement that isn't happening. `posture_is_enforced_for(agent)` is
-how a caller checks this instead of assuming a guarantee. A new
+the real flag of the binary that is launched (omp for claude/codex/omp,
+claude for omc); `posture_is_enforced_for(agent)` reports on that launched
+binary, not on a flavor's own historical adapter. A new
 agent-adapter file MUST expose real capability/enforcement facts a caller
 can check — silence is the correct answer when a fact isn't actually known,
 not a fabricated one.

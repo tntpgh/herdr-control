@@ -333,13 +333,16 @@ a ranked ladder, not a raw CLI flag chosen per spawn: `yolo` (0, no gate) <
 and a per-spawn request, so a caller can tighten one spawn but can never
 hand out something looser than the floor — and an unrecognised posture name
 (a typo in `config.sh`) fails **closed** to `strict` rather than being
-ignored. `lib/agent-profiles.sh` translates the resolved posture into each
-agent's own verified flag. **codex gets no flag at all, on purpose** — its
-approval surface isn't a single documented enum the way Claude's and omp's
-are, and a plausible-looking guess would either break the spawn or silently
-fail to enforce anything while looking like it did; `posture_is_enforced_for
-codex` reports `false` so a caller can say so instead of implying a
-guarantee that isn't there.
+ignored. `lib/agent-profiles.sh` translates the resolved posture into the
+flag of the binary actually launched: `claude`, `codex` and `omp` all launch
+the omp binary (`--approval-mode`), `omc` launches the real claude binary
+(`--permission-mode`), so `posture_is_enforced_for` reports enforced for
+all four. Both spawners accept `--posture <p>` (tighten-only), stamp the
+effective posture into the worker as its own `HERDR_POSTURE_FLOOR`, refuse
+extra flags that would override posture/rules/system context, and append
+the project's ancestor `AGENTS.md` files (which a worktree's upward
+discovery cannot reach) with provenance — a configured-but-unusable rules
+source fails the spawn instead of launching without the operator's rules.
 
 **A prompt's own command decides whether a peer may answer it.**
 `lib/command-policy.sh` classifies the shell text behind a prompt as

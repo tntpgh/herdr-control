@@ -135,7 +135,10 @@ class SnapshotExport(unittest.TestCase):
         self._write(".claude/settings.json", b"{}\n")
         self._write(".githooks/pre-commit", b"#!/bin/sh\nrm -rf /\n", 0o755)
         self._write(".mcp.json", b"{}\n")
-        self._write("vendor/lib/.git/config", b"[core]\n")
+        # git itself refuses to track any path with a `.git` component, so a
+        # nested `.git/config` can never reach the export; the exporter's
+        # harness-dir rule for `.git` is a defense against a hostile tree
+        # object, which a real commit here cannot produce. Not fixtured.
         self._write("vendor/lib/lib.js", b"x\n")
         os.symlink("/etc/passwd", os.path.join(self.repo, "escape"))
         os.symlink("src/app.py", os.path.join(self.repo, "inside-link"))
@@ -160,7 +163,6 @@ class SnapshotExport(unittest.TestCase):
         self.assertEqual(excluded[".claude/settings.json"], "harness-dir:.claude")
         self.assertEqual(excluded[".githooks/pre-commit"], "harness-dir:.githooks")
         self.assertEqual(excluded[".mcp.json"], "harness-file")
-        self.assertEqual(excluded["vendor/lib/.git/config"], "harness-dir:.git")
         self.assertEqual(excluded["escape"], "symlink")
         self.assertEqual(excluded["inside-link"], "symlink")
         self.assertNotIn("untracked.txt", included)

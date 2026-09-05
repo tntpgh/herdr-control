@@ -645,26 +645,103 @@ both of which only ever get *stricter* for one spawn, never looser:
   `compose_posture` returns the more restrictive of the machine floor and a
   per-spawn request; an unrecognized posture name fails *closed* to `strict`,
   loudly, rather than being ignored. `lib/agent-profiles.sh` translates the
-  resolved posture into each agent's own verified flag —
-  `claude --permission-mode acceptEdits|manual|bypassPermissions`,
-  `omp --approval-mode write|always-ask|yolo`. **codex gets no posture flag
-  at all** — its approval surface isn't a single documented enum the way the
-  other two are, and a guessed flag would either break the spawn or silently
-  fail to enforce anything while looking like it did. `posture_is_enforced_for
-  codex` returns false so a caller can say so rather than imply a guarantee.
+  resolved posture into the launched binary's verified flag —
+  `omp --approval-mode write|always-ask|yolo` for `claude`/`codex`/`omp`
+  (all three launch the omp binary now), `claude --permission-mode
+  acceptEdits|manual|bypassPermissions` for `omc`. `posture_is_enforced_for`
+  reports on the binary actually launched, so codex is enforced too.
+  Both spawners take `--posture <p>` (tighten-only) and stamp the EFFECTIVE
+  posture into the worker as `HERDR_POSTURE_FLOOR`, so a child spawn can
+  only tighten further. Managed launches REFUSE extra flags that would
+  override the floor, rules, or system context (`--approval-mode`,
+  `--auto-approve`, `--config`, `--profile`, `--cwd`, `--no-rules`,
+  `--allowedTools`, `--bare`, `--append-system-prompt`, …); a literal
+  command still runs, visibly reported as UNMANAGED.
+- **Canonical operator rules** — task worktrees live under
+  `~/.herdr/worktrees`, outside the project's ancestor tree, so a worker's
+  upward rule discovery never reached `~/Code/AGENTS.md`. Managed omp-backed
+  launches now derive every ancestor `AGENTS.md` of the ORIGINAL project
+  root (outermost first) and append them via `--append-system-prompt` with a
+  provenance header; an explicit/inherited `HERDR_CANONICAL_RULES` that is
+  missing or unreadable FAILS the spawn rather than launching rules-less.
 - **Command policy** (`lib/command-policy.sh`) — classifies the shell command
   behind an approval prompt as `allow` / `escalate` / `deny`: recursive `rm`,
   `git push --force`, `DROP`/`TRUNCATE TABLE`, `mkfs` and fork-bombs,
   `curl | sh`, plus your own rules via `HERDR_POLICY_EXTRA_RULES` in
   `config.sh` (newline-separated, tab-separated
   `<escalate|deny><TAB><regex><TAB><reason>` — there is no operator verdict
-  meaning "allow", so a site rule can only tighten). This is what
-  `herdr-select.sh --authority peer` checks before letting one agent
-  auto-answer another agent's prompt on your behalf: anything short of
-  `allow` is refused (exit code 8) and left for you. Classification can only
-  see what's on screen — a command that scrolled away can't be judged, which
-  is why `--authority peer` is opt-in and `human` (the default) still records
-  the verdict but never enforces it.
+  meaning "allow", so a site rule can only tighten). `herdr-select.sh
+  --authority peer` (the non-interactive default) may only answer `allow`;
+  anything else is refused (exit 8). A known `Deny` choice is always safe
+  for a peer to press.
+- **Reviewed conductor authority** (`--authority conductor`, Terrence's
+  2026-09-04 operating-policy decision) — the registered conductor of a
+  LIVE task may approve a reviewed false positive of the `escalate`
+  heuristic within task scope: it must pass `--expect-prompt-id`, an
+  operational `--review-category` (`local-read` / `local-build` /
+  `branch-work` / `owned-cleanup`) and a `--review-reason`; the caller's
+  pane+birth must match the task's registered conductor; the prompt must be
+  a complete recognized omp panel (elided arguments refuse). It never
+  overrides `deny`, operator rules, or the recognized human-reserved forms
+  (`conductor_reserved_reason`: secret values, remote mutation, main
+  merge/push, governance, control weakening). Every decision records
+  authority, verdict, reviewer, category and reason. This is attribution
+  and accident protection among same-user processes — not containment.
+
+## Isolated smart workers (`isolated-worker.py`)
+
+Unattended executory work needs an enforced boundary, not a prompt claiming
+one. `isolated-worker.py` runs ONE finite omp task in a Docker container that
+has: no host home, no credentials, no Docker/herdr sockets; an unprivileged
+UID, `cap-drop ALL`, `no-new-privileges`, read-only root, CPU/memory/PID/time
+limits; and a per-task `--internal` network in
+`gateway_mode_ipv4=isolated` (plain `--internal` still exposes the host
+bridge). Its only route out is `isolated-model-relay.py`, a sidecar that
+forwards ONLY `POST /v1/pi/stream` for ONE provider-qualified model to the
+host `omp auth-gateway`, with a per-task bearer, body/concurrency/quota
+limits, and `options.headers` stripped. The worker's `models.yml` points
+`anthropic`/`openai-codex` at the relay over `transport: pi-native`; the
+gateway's master token and the broker's credentials never enter the worker.
+
+```bash
+omp auth-broker serve --bind=127.0.0.1:8765                                   # host, trusted cwd
+OMP_AUTH_BROKER_URL=http://127.0.0.1:8765 omp auth-gateway serve --bind=127.0.0.1:4000
+docker build --platform linux/arm64 -t herdr-isolated-worker:18.1.10 -f Dockerfile.isolated-worker "$(mktemp -d)"
+python3 isolated-worker.py --repo <repo> --ref <commit-or-branch> --brief <brief.md> \
+  --model anthropic/claude-fable-5-1 --gateway-url http://host.docker.internal:4000 \
+  --gateway-token-file ~/.omp/auth-gateway.token --timeout 900 [--dry-run]
+```
+
+Source is EXPORTED from the named ref (tracked files only; `.env*`, keys,
+`.git`, agent settings/hooks omitted — see the manifest) into task-owned
+staging; the worker's edits come back as `artifacts/changes.patch` for the
+conductor to review and apply. Nothing is written to the host checkout, and
+model completion (`agent_end` + stop) is reported separately from artifact
+acceptance. Verified live 2026-09-05 with Fable 5.1: `curl` to the internet
+failed with exit 6, no socket/credential/`/Users` path existed inside, the
+relay rejected the worker's own `GET /v1/models`, one file came back as a
+patch, the host tree stayed clean. The gateway bearer is NOT model-scoped —
+the relay is what scopes it; never hand the gateway token to a worker.
+`python3 verify-isolated-worker.py` exercises the relay/snapshot boundaries
+without Docker.
+
+## Durable supervision (what changed 2026-09-05)
+
+- omp's interval reconciliation used to checkpoint a report whose stdout was
+  discarded, silently consuming the next "task X went lost/blocked" notice.
+  It now delivers via the extension's message path first and acks
+  (`omp-reconcile.sh ack`) only after acceptance; failed delivery replays.
+- Reconciliation consumes the event stream (`events_since`) scoped to the
+  owning conductor — renewed input requests, failed wakes, refused pushes,
+  pane/conductor identity uncertainty and completion evidence surface once.
+- `push_wake` persists a verified worker's `blocked`/`input_required` BEFORE
+  checking conductor reachability, rejects stale/terminal hooks before
+  mutating state, and records every wake attempt individually.
+- `stage2-diagnose.sh` no longer emits `succeeded` at dispatch or on weekly
+  skips. The scheduled monthly pass FAILS CLOSED with an `isolation-required`
+  ledger row until it is moved onto the isolated worker path;
+  `--record-completion` verifies the doc commit on the branch before
+  completing the task.
 
 See `SKILL.md`'s "The safety model" for the full list of what refuses and why.
 
