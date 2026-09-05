@@ -18,9 +18,11 @@ the two things that need a human — attention items and open decisions.
 
 Sources (all read-only): ~/.local/state/herdr/runs/registry.sqlite3 (herdr),
 ~/.local/state/herdr/forms/*.json (formserve registry), consensus-search
-GET /log (Bearer from 1Password), knowledge-base's own venv + kb-deploy
+GET /log (bearer SEARCH_SYNC_TOKEN), knowledge-base's own venv + kb-deploy
 checkout for kb.nightly_runs/steps and server.heartbeat.latest_snapshot()
-(NEON DSN from 1Password, default_transaction_read_only=on). Loopback only,
+(NEON_CONNECTION_STRING, default_transaction_read_only=on). Secrets come
+from the environment or, pre-resolved, from ~/.config/op/service-account.env
+— never from an `op` subprocess (see secret()). Loopback only,
 no auth — same posture as formserve. Idempotent to start: a second copy sees
 the port taken and exits 0.
 """
@@ -140,26 +142,34 @@ def forms_data() -> dict:
             "open_count": len(open_forms)}
 
 
-# ── 1Password reads (service account, read-only) ───────────────────────────────
-def op_read(ref: str) -> str | None:
-    env = dict(os.environ)
-    if "OP_SERVICE_ACCOUNT_TOKEN" not in env and OP_ENV.exists():
-        for line in OP_ENV.read_text().splitlines():
-            line = line.strip().removeprefix("export ")
-            if line.startswith("OP_SERVICE_ACCOUNT_TOKEN="):
-                env["OP_SERVICE_ACCOUNT_TOKEN"] = line.split("=", 1)[1].strip().strip('"')
-    try:
-        r = subprocess.run(["op", "read", ref], capture_output=True, text=True, timeout=15, env=env)
-    except (OSError, subprocess.TimeoutExpired):
+# ── secrets: pre-resolved, never `op` from a background process ───────────────
+# ~/.config/op/service-account.env documents the rule: `op` probes TCC on every
+# invocation from a launchd/background session and raises a system prompt
+# nobody is there to answer (1Password/shell-plugins#606), so long-running
+# jobs read PRE-RESOLVED values from that file instead — the same escape
+# hatch lib/engineering-ledger.sh uses. Refresh a line from an interactive
+# shell when a secret rotates.
+def secret(name: str) -> str | None:
+    v = os.environ.get(name)
+    if v:
+        return v
+    if not OP_ENV.exists():
         return None
-    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    for line in OP_ENV.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.removeprefix("export ").partition("=")
+        if key.strip() == name:
+            return val.strip().strip("'\"") or None
+    return None
 
 
 # ── consensus-search memory ────────────────────────────────────────────────────
 def search_data() -> dict:
-    token = op_read("op://secrets/search-sync-token/credential")
+    token = secret("SEARCH_SYNC_TOKEN")
     if not token:
-        return {"error": "search-sync-token not readable from 1Password", "rows": []}
+        return {"error": f"SEARCH_SYNC_TOKEN not set and not in {OP_ENV} — resolve it there from an interactive shell", "rows": []}
     rows, since = [], 0
     for _ in range(50):  # 50 × 500 rows is far beyond today's table; a hard stop, not a limit
         req = urllib.request.Request(
@@ -217,9 +227,9 @@ print(json.dumps(out, default=str))
 def kb_data() -> dict:
     if not (KB_DEPLOY / "server").is_dir() or not KB_PYTHON.exists():
         return {"error": f"kb-deploy checkout or venv missing ({KB_DEPLOY}, {KB_PYTHON})"}
-    dsn = op_read("op://secrets/neon/credential")
+    dsn = secret("NEON_CONNECTION_STRING")
     if not dsn:
-        return {"error": "neon credential not readable from 1Password"}
+        return {"error": f"NEON_CONNECTION_STRING not set and not in {OP_ENV}"}
     env = dict(os.environ, NEON_CONNECTION_STRING=dsn)
     try:
         r = subprocess.run([str(KB_PYTHON), "-c", _KB_SNIPPET], cwd=KB_DEPLOY, env=env,
