@@ -71,6 +71,20 @@ check "reason is pane_gone" \
   "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.reason') FROM events WHERE task_id='taskB' AND type='lost_detected';")" \
   "pane_gone"
 
+printf '== pane_gone BUT the worktree holds a _done handoff event -> completed, NOT lost (2026-09-05) ==\n'
+WTD="$(dirname "$HERDR_RUN_STATE_DIR")/wt-z"; mkdir -p "$WTD/.omc/handoffs"   # under the harness tmp, cleaned by the EXIT trap
+printf '%s\n' '{"event":"implement:feat/x_started"}' 'not json at all' '{"event":"implement:feat/x_done","pr":"https://example/pr/1"}' > "$WTD/.omc/handoffs/events.jsonl"
+register_task runZ taskZ w c cp cb paneZ birthZ /repo/d "$WTD" "finished-then-closed" || bad "register taskZ failed"
+set_task_state runZ taskZ running || bad "taskZ -> running failed"
+_PANES=""    # tab closed by the conductor after the _done landed
+run_reconciliation condZ SessionStart --quiet-if-empty --no-hook-json >/dev/null
+check "finished worker marked completed" "$(read_task runZ taskZ | jq -r .state)" "completed"
+check "completion event cites the handoff event" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.event.event') FROM events WHERE task_id='taskZ' AND type='completion_recorded';")" \
+  "implement:feat/x_done"
+check "no lost_detected for a finished worker" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskZ' AND type='lost_detected';")" "0"
+
 printf '== mismatch corroborated by MATCHING agent_session -> rebaseline, NOT lost ==\n'
 register_task runC taskC w c cp cb paneC birthC-old /repo/c /wt/c "corroborated" || bad "register taskC failed"
 set_task_state runC taskC running || bad "taskC -> running failed"
