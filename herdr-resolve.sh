@@ -35,7 +35,11 @@ DRY=0
 # an async hook (10s timeout in settings.example.json), so the work per pass is
 # bounded and the queue drains across passes rather than being truncated
 # mid-sweep. The normal case is 1–2 alerts and never reaches either limit.
-MAX="${HERDR_RESOLVE_MAX_PER_RUN:-8}"
+# The budget must FIT the hook's 10s timeout: 3 deletes are 2 x PACE of sleep
+# plus 3 round trips. The first draft said 8 at 1s, which cannot finish — and
+# with the old end-of-run rewrite that meant the queue was never persisted and
+# the sweep re-deleted the same messages on every tool call forever.
+MAX="${HERDR_RESOLVE_MAX_PER_RUN:-3}"
 PACE="${HERDR_RESOLVE_PACE_S:-1}"
 done_n=0
 # Test seam: the suite stubs the Slack call, since asserting on rate-limit and
@@ -72,8 +76,38 @@ fi
 live_panes=$(herdr pane list 2>/dev/null \
   | jq -r '(.result.panes // .panes)[]?.pane_id // empty' 2>/dev/null)
 
-keep=$(mktemp "${TMPDIR:-/tmp}/herdr-pending.XXXXXX") || exit 0
-trap 'rm -f "$keep"' EXIT HUP INT TERM
+# Serialise the sweep. Two PostToolUse hooks firing close together would both
+# snapshot the queue and both delete the same messages. mkdir is atomic on
+# POSIX (exactly one caller wins the "did not exist, now does" transition), the
+# same dependency-free mutex agent-hooks/interval-reconcile.sh uses.
+lockdir="$STATE/.resolve.lock"
+if [ "$DRY" = 0 ]; then
+  mkdir "$lockdir" 2>/dev/null || exit 0
+  trap 'rmdir "$lockdir" 2>/dev/null' EXIT HUP INT TERM
+fi
+
+# Work from a snapshot, but NEVER write the snapshot back. herdr-notify appends
+# a new alert the moment a worker hits a prompt, and herdr-select removes the
+# one answered in Slack; a `cat snapshot > pending.jsonl` at the end of a
+# multi-second sweep would erase an alert that arrived mid-sweep (leaving a
+# live, armed Slack message with no record, permanently un-retractable) and
+# resurrect one that was legitimately untracked (so the next pass would delete
+# the message carrying the operator's own decision). Both are the failure
+# classes this file exists to prevent.
+#
+# Instead each settled entry is subtracted from the LIVE file by its ts, so
+# concurrent appends survive by construction.
+snapshot=$(mktemp "${TMPDIR:-/tmp}/herdr-pending.XXXXXX") || exit 0
+scratch="$snapshot.new"
+trap 'rm -f "$snapshot" "$scratch"; [ "$DRY" = 1 ] || rmdir "$lockdir" 2>/dev/null' EXIT HUP INT TERM
+cp "$PENDING" "$snapshot" || exit 0
+
+settle() {                             # <ts> -> drop just this alert, atomically
+  local t="$1"
+  jq -c --arg t "$t" 'select(.ts != $t)' < "$PENDING" > "$scratch" 2>/dev/null \
+    && mv -f "$scratch" "$PENDING"
+  rm -f "$scratch"
+}
 
 while IFS= read -r line; do
   [ -n "$line" ] || continue
@@ -86,17 +120,19 @@ while IFS= read -r line; do
     gone=1
   fi
   if [ "$gone" = 0 ]; then
-    # Unreadable but still-listed pane: keep the alert. We cannot prove it was
-    # answered, and deleting on "no evidence" would silently drop live questions.
+    # Unreadable but still-listed pane: leave the alert queued. We cannot prove
+    # it was answered, and deleting on "no evidence" drops live questions.
+    # "Queued" now means "not settled" — nothing is rewritten, so skipping is
+    # all it takes to keep an entry.
     if ! herdr pane read "$pane" --source visible --lines 5 >/dev/null 2>&1; then
-      printf '%s\n' "$line" >> "$keep"; continue
+      continue
     fi
     # Still asking: keep. BOTH prompt shapes, or this deletes live questions —
     # omp's approval prompt is an arrow menu with no numbers on screen, so a
     # prompt_options-only check reads every one of them as already answered and
     # retracts an alert whose worker is still blocked on it.
     if [ -n "$(prompt_options "$pane")$(prompt_menu_options "$pane")" ]; then
-      printf '%s\n' "$line" >> "$keep"; continue
+      continue
     fi
   fi
 
@@ -106,13 +142,14 @@ while IFS= read -r line; do
     continue
   fi
 
-  # Bound the deletes per run. chat.delete is rate limited (~1/s sustained) and
-  # this runs from an async hook with a 10s timeout, so a large backlog must
-  # drain across runs instead of being cut off mid-sweep. Everything past the
-  # budget stays queued, untouched.
-  if [ "$done_n" -ge "$MAX" ]; then
-    printf '%s\n' "$line" >> "$keep"; continue
-  fi
+  # Bound the deletes per run. chat.delete is rate limited and this runs from an
+  # async hook with a 10s timeout, so the budget must actually FIT that timeout:
+  # 3 deletes cost 2 x PACE of sleep plus 3 round trips, not 8 x 1s which cannot
+  # finish. A larger backlog drains across runs, and because every settled entry
+  # is removed from the queue immediately (settle(), below) rather than in one
+  # rewrite at the end, being killed mid-sweep loses at most one entry's
+  # bookkeeping instead of all of it.
+  if [ "$done_n" -ge "$MAX" ]; then continue; fi
   [ "$done_n" = 0 ] || sleep "$PACE"
   done_n=$((done_n + 1))
 
@@ -123,21 +160,22 @@ while IFS= read -r line; do
         https://slack.com/api/chat.delete 2>/dev/null)
   ok=$(printf '%s' "$resp" | jq -r '.ok // false' 2>/dev/null)
   err=$(printf '%s' "$resp" | jq -r '.error // empty' 2>/dev/null)
-  # Drop it only on a DEFINITIVE answer: deleted, or a refusal that will refuse
-  # again (message_not_found, cant_delete_message, …). Keep it when Slack was
-  # unreachable — and keep it when Slack said "not now": `ratelimited` and the
-  # 5xx-class errors are retryable, and treating them as definitive silently
-  # loses the retraction. Observed live 2026-09-06: sweeping 85 orphans at
-  # ~5/s got the last 2 rate limited, and both were dropped from the queue as
-  # though deleted — they were still sitting in Slack afterwards.
-  case "$err" in
-    ratelimited|internal_error|service_unavailable|fatal_error|request_timeout|accesslimited)
-      printf '%s\n' "$line" >> "$keep"; continue ;;
-  esac
-  if [ "$ok" != true ] && [ -z "$ok" ]; then
-    printf '%s\n' "$line" >> "$keep"
-  fi
-done < "$PENDING"
 
-# A dry run reports; it never rewrites the queue.
-[ "$DRY" = 1 ] || cat "$keep" > "$PENDING"
+  # KEEP unless the outcome is definitive. The rule is deliberately inverted:
+  # an allowlist of retryable errors meant every UNLISTED `ok:false` dropped the
+  # entry with the message still in Slack — and `invalid_auth` / `token_expired`
+  # / `token_revoked` / `not_authed` / `account_inactive` are exactly that. A
+  # rotated bot token would then drain the whole queue within seconds (the hook
+  # fires on every tool call in every session), leaving armed alerts in Slack
+  # with no ts->pane record left, so no later run could ever retract them: the
+  # very failure this file exists to prevent, made permanent.
+  #
+  # Definitive means "asking again cannot change the answer": the message is
+  # gone, or Slack will refuse this delete forever.
+  case "$ok:$err" in
+    true:*) ;;                        # deleted
+    *:message_not_found|*:cant_delete_message|*:msg_too_old|*:channel_not_found|*:bad_timestamp) ;;
+    *) continue ;;                    # anything else (incl. no reply at all): keep, retry next pass
+  esac
+  settle "$ts"
+done < "$snapshot"

@@ -212,6 +212,9 @@ cat > "$CURLSTUB" <<'EOS'
 #!/usr/bin/env bash
 cat >/dev/null                      # swallow the --config token on stdin
 printf 'stub\n' >> "$CURL_CALLS"
+# Simulate herdr-notify appending a NEW alert while the sweep is mid-flight:
+# this runs at exactly the moment the real curl would be talking to Slack.
+[ -n "${CURL_APPEND:-}" ] && printf '%s\n' "$CURL_APPEND" >> "$HERDR_BRIDGE_STATE/pending.jsonl"
 printf '%s' "$CURL_REPLY"
 EOS
 chmod +x "$CURLSTUB"
@@ -220,6 +223,12 @@ resolve_stubbed() {                 # <reply-json> [max] -> run with a fake Slac
   : > "$CURL_CALLS"
   CURL_REPLY="$1" HERDR_RESOLVE_CURL="$CURLSTUB" HERDR_RESOLVE_PACE_S=0 \
     HERDR_RESOLVE_MAX_PER_RUN="${2:-8}" HERDR_BRIDGE_STATE="$LC" \
+    bash "$here/herdr-resolve.sh" >/dev/null 2>&1
+}
+resolve_stubbed_appending() {       # <reply-json> -> ... and append CURL_APPEND mid-sweep
+  : > "$CURL_CALLS"
+  CURL_REPLY="$1" HERDR_RESOLVE_CURL="$CURLSTUB" HERDR_RESOLVE_PACE_S=0 \
+    HERDR_RESOLVE_MAX_PER_RUN=8 HERDR_BRIDGE_STATE="$LC" CURL_APPEND="${CURL_APPEND:-}" \
     bash "$here/herdr-resolve.sh" >/dev/null 2>&1
 }
 
@@ -251,6 +260,46 @@ resolve_stubbed '{"ok":true}' 2
 [ "$(grep -c stub "$CURL_CALLS")" = 2 ] && [ "$(lc_ts)" = "903 904 " ] \
   && ok "the per-run delete budget is honoured and the rest stays queued" \
   || bad "budget ignored: calls=$(grep -c stub "$CURL_CALLS") left=$(lc_ts)"
+
+# --- the three defects an independent review pass found in the first draft ---
+
+# 1. The retryable list was an ALLOWLIST, so every unlisted `ok:false` dropped
+#    the entry with the message still in Slack. `invalid_auth` is the one that
+#    matters: rotate the bot token with a backlog queued and the hook (which
+#    fires on every tool call in every session) would drain the whole queue in
+#    seconds, leaving armed alerts with no ts->pane record — un-retractable
+#    forever. The rule is now "keep unless the answer is definitive".
+lc_pending "$GONE"
+resolve_stubbed '{"ok":false,"error":"invalid_auth"}'
+[ "$(lc_ts)" = "333.3 " ] \
+  && ok "a rejected token keeps the alert queued (re-auth fixes it, dropping does not)" \
+  || bad "auth failure dropped the alert: $(lc_ts)"
+
+# 2. The sweep used to end in `cat snapshot > pending.jsonl`. With paced deletes
+#    that window is seconds long, and herdr-notify appends the moment any worker
+#    hits a prompt — so a live alert arriving mid-sweep was erased, leaving an
+#    armed Slack message with no record. Settling by ts against the LIVE file
+#    makes concurrent appends survive by construction.
+lc_pending "$GONE"
+CURL_APPEND='{"ts":"555.5","pane":"wZ:p9"}' resolve_stubbed_appending '{"ok":true}'
+printf '%s' "$(lc_ts)" | grep -q '555.5' \
+  && ok "an alert appended mid-sweep survives the sweep" \
+  || bad "concurrent alert erased by the sweep: $(lc_ts)"
+printf '%s' "$(lc_ts)" | grep -q '333.3' \
+  && bad "the settled alert was not removed: $(lc_ts)" \
+  || ok "the settled alert is still removed"
+
+# 3. Two hooks firing together would both snapshot and both delete. The sweep
+#    takes the same mkdir mutex interval-reconcile.sh uses.
+lc_pending "$GONE"
+mkdir -p "$LC/.resolve.lock"
+resolve_stubbed '{"ok":true}'
+# wc, not `grep -c`: grep exits 1 on zero matches, so a `|| echo 0` fallback
+# emits a SECOND zero and the comparison never matches.
+[ "$(wc -l < "$CURL_CALLS" | tr -d ' ')" = 0 ] && [ "$(lc_ts)" = "333.3 " ] \
+  && ok "a second concurrent sweep does nothing while the lock is held" \
+  || bad "lock ignored: calls=$(wc -l < "$CURL_CALLS" | tr -d ' ') left=$(lc_ts)"
+rmdir "$LC/.resolve.lock"
 
 # Answered in the TERMINAL: nothing is posted to Slack, so the alert must stay
 # TRACKED for herdr-resolve to delete. This is the exact line that produced the

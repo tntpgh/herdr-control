@@ -445,18 +445,33 @@ approval_confirmed "$approval_id" "pressed" \
 case "${HERDR_SELECT_VIA:-cli}" in slack-*)
   pending="$log_dir/pending.jsonl"
   if [ -s "$pending" ]; then
-    tmp=$(mktemp "${TMPDIR:-/tmp}/herdr-pending.XXXXXX") && {
-      # jq failure must never truncate the queue — a lost entry is a question
-      # that can never be retracted, so write back only on success.
-      if [ -n "${HERDR_SELECT_TS:-}" ]; then
-        jq -c --arg t "$HERDR_SELECT_TS" 'select(.ts != $t)' < "$pending" > "$tmp" 2>/dev/null \
-          && cat "$tmp" > "$pending"
-      else
-        jq -c --arg p "$pane" 'select(.pane != $p)' < "$pending" > "$tmp" 2>/dev/null \
-          && cat "$tmp" > "$pending"
-      fi
-      rm -f "$tmp"
-    }
+    # Same mutex herdr-resolve.sh takes for its sweep. Both do a
+    # read-modify-write on this file, and herdr-resolve's now spans seconds
+    # (paced deletes), so without serialising them one side's write can revive
+    # the entry the other just removed — and a revived entry means the next
+    # sweep deletes the very Slack message carrying this decision and the
+    # bridge's confirmation under it. Non-blocking: if the sweep holds the lock
+    # we skip the untrack, which is safe in the direction that matters (the
+    # alert stays queued and gets retracted later, rather than a live one being
+    # dropped). The keypress has already landed at this point either way.
+    lockdir="$log_dir/.resolve.lock"
+    if mkdir "$lockdir" 2>/dev/null; then
+      trap 'rmdir "$lockdir" 2>/dev/null' EXIT HUP INT TERM
+      tmp=$(mktemp "${TMPDIR:-/tmp}/herdr-pending.XXXXXX") && {
+        # jq failure must never truncate the queue — a lost entry is a question
+        # that can never be retracted, so write back only on success.
+        if [ -n "${HERDR_SELECT_TS:-}" ]; then
+          jq -c --arg t "$HERDR_SELECT_TS" 'select(.ts != $t)' < "$pending" > "$tmp" 2>/dev/null \
+            && cat "$tmp" > "$pending"
+        else
+          jq -c --arg p "$pane" 'select(.pane != $p)' < "$pending" > "$tmp" 2>/dev/null \
+            && cat "$tmp" > "$pending"
+        fi
+        rm -f "$tmp"
+      }
+      rmdir "$lockdir" 2>/dev/null
+      trap - EXIT HUP INT TERM
+    fi
   fi
 ;; esac
 

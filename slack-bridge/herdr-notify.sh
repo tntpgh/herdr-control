@@ -207,11 +207,26 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
   # operator nor Slack ever needs to know which mechanism is being driven.
   opts=""
   mech=""
+  pid=""
   for _ in 1 2 3 4 5 6 7 8; do
     opts=$(prompt_options "$pane");     [ -n "$opts" ] && { mech=numbered; break; }
     opts=$(prompt_menu_options "$pane"); [ -n "$opts" ] && { mech=menu; break; }
     sleep 0.25
   done
+  # Fingerprint the prompt that produced THESE options, taken here rather than
+  # after the body is built. prompt_id has no failure mode: with the prompt gone
+  # it hashes two empty strings and returns the sha256 of a lone newline
+  # (observed constant below). Shipping that as a button value posts buttons
+  # that render as actionable but are refused on every click by herdr-select's
+  # --expect-prompt-id check, which is worse than no fingerprint at all.
+  [ -n "$opts" ] && pid=$(prompt_id "$pane")
+  _EMPTY_PROMPT_ID=01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+  if [ "$pid" = "$_EMPTY_PROMPT_ID" ]; then
+    # The prompt vanished between the poll and this read. Fall back to the
+    # two-field value: herdr-select still refuses unless the option is really on
+    # offer, so the click is guarded, just not pinned to this exact question.
+    pid=""
+  fi
   if [ -n "$opts" ]; then
     # The question extractor must MATCH the parser that produced the options.
     # prompt_question finds "the last non-empty line above the first numbered
@@ -236,14 +251,14 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
     # stays armed forever and a click lands on whatever prompt occupies that
     # pane id next (herdr recycles them). herdr-select refuses on a mismatch.
     blocks=$(printf '%s\n' "$opts" | jq -R -s --arg body "$body" --arg pane "$pane" \
-      --arg pid "$(prompt_id "$pane")" '
+      --arg pid "$pid" '
       [ split("\n")[] | select(length>0) | split("\t") | {num:.[0], label:.[1]} ] as $o
       | [ {type:"section", text:{type:"mrkdwn", text:$body}},
           {type:"actions",
            elements: ($o | map({
              type:"button",
              text:{type:"plain_text", text:("\(.num). " + (.label|.[0:70]))},
-             value:($pane + "|" + .num + "|" + $pid),
+             value:($pane + "|" + .num + (if $pid == "" then "" else "|" + $pid end)),
              action_id:("herdr_choice_" + .num)}))} ]')
   else
     # No numbered list to parse — but "Claude needs your permission to use Bash"
