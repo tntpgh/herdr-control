@@ -198,12 +198,12 @@ if [ "${SCHEDULED:-0}" = 1 ]; then
   LEDGER_LINE='`/herdr/inputs/ledger/*.jsonl` (a read-only copy of the Stage-1 engineering ledger)'
   SIBLINGS_LINE='Sibling repos are READ-ONLY exports under `/herdr/inputs/knowledge-base`, `/herdr/inputs/tourguide`, `/herdr/inputs/thurber-ai`, `/herdr/inputs/herdr-control` (tracked files only; no .git, no secrets) -- read/grep/glob there, zero edits.'
   OUTPUT_LINE='`docs/tracking/'"$(date -u +%Y-%m-%d)"'-stage2-diagnose-pass.md` under `/workspace` (thurber-os). Do NOT commit and do NOT create any other file in /workspace; the orchestrator commits the returned patch on the pass branch only if that is the sole change.'
-  DONE_LINE='Write the doc, then write /herdr/out/RESULT.md with: findings count by classification, headline items, and anything a human must decide. Then stop.'
+  DONE_LINE='Done means: the doc exists at that path AND /herdr/out/RESULT.md exists with findings count by classification, headline items, and anything a human must decide. Not done until both exist. Then stop; nothing is merged by you.'
 else
   LEDGER_LINE='`~/Code/herdr-control/.local-state/engineering-ledger/*.jsonl`'
   SIBLINGS_LINE='Read-only across all sibling repos (knowledge-base, tourguide, thurber-ai) -- read/grep/glob directly, zero edits, zero commits, zero PRs in any of them.'
   OUTPUT_LINE='`docs/tracking/'"$(date -u +%Y-%m-%d)"'-stage2-diagnose-pass.md` in THIS worktree (thurber-os), committed here, nothing else changes.'
-  DONE_LINE='Commit the doc, then append the handoff event to `.omc/handoffs/events.jsonl` in this worktree: `{"event":"review:'"$BRANCH"'_done","commit":"<hash>","summary":"<one-line: how many findings, by classification, headline items>"}`'
+  DONE_LINE='Done means: the doc is COMMITTED on this branch (uncommitted is not done) AND the handoff event is appended to `.omc/handoffs/events.jsonl` in this worktree: `{"event":"review:'"$BRANCH"'_done","commit":"<hash>","summary":"<one-line: how many findings, by classification, headline items>"}`. Do not push, open a PR, or merge - the conductor does that. Then stop.'
 fi
 
 # Find the most recent prior Stage-2 doc (if any) so the new pass knows what
@@ -283,7 +283,7 @@ full first -- this is your governing document, not this brief alone).
   read as authorization to start merging a PR. Caught before any damage,
   but don't repeat the failure mode.)
 
-## When done
+## Done means
 
 $DONE_LINE
 EOF
