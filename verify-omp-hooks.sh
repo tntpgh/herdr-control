@@ -172,6 +172,75 @@ printf '%s' "$alert_body" | grep -q 'Allow tool: bash' \
 printf '%s' "$alert_body" | grep -qE '^[[:space:]]*─+[[:space:]]*$' \
   && bad "a box-drawing rule leaked in as the question" || ok "no TUI furniture as the question"
 
+printf '== the alert LIFECYCLE: an answered alert is retracted, a live one is not ==\n'
+# The failure this pins, observed 2026-09-06: 85 alerts from two overnight
+# workers still sat in Slack the next morning with live Approve/Deny buttons,
+# every one already answered in the terminal (approvals.decided_by='cli') and
+# both panes long closed. herdr-select untracked each alert from pending.jsonl
+# the moment it pressed a key, and herdr-resolve only ever looks at
+# pending.jsonl — so the retraction it exists to perform could never happen.
+LC="$WORK/lifecycle"; mkdir -p "$LC"
+lc_pending() { printf '%s\n' "$@" > "$LC/pending.jsonl"; }
+lc_ts() { jq -r .ts < "$LC/pending.jsonl" | tr '\n' ' '; }
+A1='{"ts":"111.1","pane":"'"$WPANE"'"}'
+A2='{"ts":"222.2","pane":"'"$WPANE"'"}'
+GONE='{"ts":"333.3","pane":"wZ:p9"}'
+
+omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
+lc_pending "$A1" "$GONE"
+dry="$(HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-resolve.sh" --dry-run 2>&1)"
+printf '%s' "$dry" | grep -q '111.1' \
+  && bad "retracted an alert whose omp menu is still on screen: $dry" \
+  || ok "a live menu-shape prompt keeps its alert"
+printf '%s' "$dry" | grep -q 'ts=333.3 pane=wZ:p9 (pane gone)' \
+  && ok "an alert for a pane herdr no longer lists is retracted" \
+  || bad "orphaned alert kept forever: $dry"
+[ "$(lc_ts)" = "111.1 333.3 " ] \
+  && ok "a dry run reports without rewriting the queue" || bad "dry run mutated pending.jsonl"
+
+clean_screen > "$WORKER_SCREEN"
+dry="$(HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-resolve.sh" --dry-run 2>&1)"
+printf '%s' "$dry" | grep -q 'ts=111.1 .* (prompt answered)' \
+  && ok "the prompt going away retracts its alert" || bad "answered alert kept: $dry"
+
+# Answered in the TERMINAL: nothing is posted to Slack, so the alert must stay
+# TRACKED for herdr-resolve to delete. This is the exact line that produced the
+# 85-alert backlog.
+omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
+lc_pending "$A1" "$A2"
+HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer \
+  >/dev/null 2>&1
+[ "$(lc_ts)" = "111.1 222.2 " ] \
+  && ok "a terminal answer leaves the alert tracked for retraction" \
+  || bad "terminal answer orphaned the alert: $(lc_ts)"
+
+# Answered in SLACK: the bridge posts the confirmation under that message, so
+# retracting it would delete the operator's own decision. Untrack THAT alert —
+# and only that one, because a pane can have several queued.
+HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS=111.1 \
+  bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer >/dev/null 2>&1
+[ "$(lc_ts)" = "222.2 " ] \
+  && ok "a Slack answer untracks only the alert that carried it" \
+  || bad "wrong alerts untracked: $(lc_ts)"
+
+# A Slack message is permanent, so its buttons are too. The value must pin the
+# QUESTION, not just the pane: herdr recycles pane ids, and a click on last
+# night's alert would otherwise land on whatever prompt lives there now.
+omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
+want_pid="$(prompt_id "$WPANE")"
+vals="$(HERDR_BRIDGE_STATE="$WORK/nb2" bash "$here/slack-bridge/herdr-notify.sh" \
+  --dry-run --choices --pane "$WPANE" "omp needs your permission" 2>&1 \
+  | sed -n '/--- button values ---/,$p')"
+printf '%s' "$vals" | grep -qxF "$WPANE|1|$want_pid" \
+  && ok "button value pins pane, option AND prompt fingerprint" \
+  || bad "button value cannot survive pane reuse: $vals"
+: > "$SENT"
+bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer \
+  --expect-prompt-id "deadbeef-not-this-question" >/dev/null 2>&1; rc=$?
+[ "$rc" != 0 ] && [ ! -s "$SENT" ] \
+  && ok "a click for a different question presses nothing" \
+  || bad "stale fingerprint answered the wrong prompt (rc=$rc sent=$(cat "$SENT"))"
+
 run_notify() {                          # <tool> -> runs omp-notify.sh
   printf '{"tool":"%s","message":"omp needs permission","cwd":"/tmp/repo"}' "$1" \
     | ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" \

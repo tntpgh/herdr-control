@@ -426,17 +426,38 @@ fi
 approval_confirmed "$approval_id" "pressed" \
   "mechanism=$mechanism choice=$choice" >/dev/null 2>&1 || true
 
-# Answered HERE, so stop tracking it as pending. herdr-resolve retracts alerts
-# whose prompt has vanished — correct when you answered in the terminal, wrong
-# when you answered in Slack: it would delete the very message carrying your
-# choice and the confirmation under it. Untrack, and the record stays.
-pending="$log_dir/pending.jsonl"
-if [ -s "$pending" ]; then
-  tmp=$(mktemp "${TMPDIR:-/tmp}/herdr-pending.XXXXXX") && {
-    jq -c --arg p "$pane" 'select(.pane != $p)' < "$pending" > "$tmp" 2>/dev/null \
-      && cat "$tmp" > "$pending"
-    rm -f "$tmp"
-  }
-fi
+# Stop tracking the alert as pending ONLY when the answer came from Slack. That
+# is the case the untrack exists for: the message carrying your choice also
+# carries the confirmation the bridge posts under it, so herdr-resolve deleting
+# it would erase your own decision.
+#
+# Answered in the TERMINAL (cli/conductor/peer), nothing is posted to Slack — so
+# the alert sits there with live buttons, looking pending, forever. Untracking it
+# was what made that permanent: herdr-resolve only ever looks at pending.jsonl.
+# Observed 2026-09-06: 85 alerts from two overnight workers, every one already
+# answered via this script (approvals.decided_by='cli'), still armed in Slack the
+# next morning. Leave them TRACKED and herdr-resolve retracts each one on its
+# next pass — which is exactly the lie-prevention it was written for.
+#
+# Scope the untrack to the answered message when the caller told us which one
+# (the bridge passes the alert's ts). A pane can have several alerts queued; a
+# pane-wide drop disarmed the answered one and orphaned the rest.
+case "${HERDR_SELECT_VIA:-cli}" in slack-*)
+  pending="$log_dir/pending.jsonl"
+  if [ -s "$pending" ]; then
+    tmp=$(mktemp "${TMPDIR:-/tmp}/herdr-pending.XXXXXX") && {
+      # jq failure must never truncate the queue — a lost entry is a question
+      # that can never be retracted, so write back only on success.
+      if [ -n "${HERDR_SELECT_TS:-}" ]; then
+        jq -c --arg t "$HERDR_SELECT_TS" 'select(.ts != $t)' < "$pending" > "$tmp" 2>/dev/null \
+          && cat "$tmp" > "$pending"
+      else
+        jq -c --arg p "$pane" 'select(.pane != $p)' < "$pending" > "$tmp" 2>/dev/null \
+          && cat "$tmp" > "$pending"
+      fi
+      rm -f "$tmp"
+    }
+  fi
+;; esac
 
 echo "selected $choice ($label) in $pane via $mechanism"

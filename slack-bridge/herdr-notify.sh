@@ -148,6 +148,13 @@ _dry_report() {
   echo "dry-run: pane=${pane:-none}${blocks:+ (with buttons)}"
   echo "--- message body ---"
   printf '%s\n' "$body"
+  # What a click would actually do. The value is the whole contract between an
+  # immortal Slack message and herdr-select: target pane, option, and the
+  # fingerprint of the question it was posted for.
+  if [ -n "$blocks" ]; then
+    echo "--- button values ---"
+    printf '%s' "$blocks" | jq -r '.[] | select(.type=="actions") | .elements[].value'
+  fi
   exit 0
 }
 
@@ -223,14 +230,20 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
     body="$(_hdr)"
     [ -n "$question" ] && body="${body}"$'\n\n'"${question}"
     body="${body}"$'\n'"${list}"$'\n'"_Reply in thread with ${nums}._"
-    blocks=$(printf '%s\n' "$opts" | jq -R -s --arg body "$body" --arg pane "$pane" '
+    # The button value carries the prompt FINGERPRINT as well as the target, so
+    # a click can only ever answer the question the button was posted for. A
+    # Slack message is permanent: without this, a button from a closed pane
+    # stays armed forever and a click lands on whatever prompt occupies that
+    # pane id next (herdr recycles them). herdr-select refuses on a mismatch.
+    blocks=$(printf '%s\n' "$opts" | jq -R -s --arg body "$body" --arg pane "$pane" \
+      --arg pid "$(prompt_id "$pane")" '
       [ split("\n")[] | select(length>0) | split("\t") | {num:.[0], label:.[1]} ] as $o
       | [ {type:"section", text:{type:"mrkdwn", text:$body}},
           {type:"actions",
            elements: ($o | map({
              type:"button",
              text:{type:"plain_text", text:("\(.num). " + (.label|.[0:70]))},
-             value:($pane + "|" + .num),
+             value:($pane + "|" + .num + "|" + $pid),
              action_id:("herdr_choice_" + .num)}))} ]')
   else
     # No numbered list to parse — but "Claude needs your permission to use Bash"

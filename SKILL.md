@@ -377,10 +377,14 @@ the *same transaction* as its event-log entry.
 
 **Alerts retract themselves.** Answer in the terminal and `herdr-resolve.sh`
 deletes the Slack message, because a stale alert that looks pending teaches you
-to distrust alerts. It is conservative in the direction that matters: an
-unreadable pane, a pane still prompting, or an unreachable Slack all **keep** the
-message. Answering in Slack keeps it too, so your choice and its confirmation
-survive.
+to distrust alerts. An alert for a pane herdr no longer lists is deleted too —
+nobody can ever answer it. It is conservative in the direction that matters: a
+still-listed pane that cannot be read, a pane still prompting (numbered *or*
+omp's arrow menu), or an unreachable Slack all **keep** the message. Answering
+in Slack keeps that one message, so your choice and its confirmation survive —
+only that one, so other alerts queued for the same pane still retract.
+`herdr-resolve.sh --dry-run` prints what it would retract and why, touching
+neither Slack nor the queue.
 
 **The allowlist is the only authentication.** `HERDR_BRIDGE_ALLOW_USERS` gates
 everything, and it now gates *approving tool use*, not just sending text. Slack
