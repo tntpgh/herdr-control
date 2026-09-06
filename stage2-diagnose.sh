@@ -350,6 +350,21 @@ if [ "${SCHEDULED:-0}" = 1 ]; then
         exit 1
     fi
     git -C "$WT" commit -q -m "Stage 2 diagnose pass $(date -u +%Y-%m-%d) (isolated worker, $ISO_MODEL)" -- "$EXPECT_DOC"
+    # Derive the OKF findings bundle (docs/findings/<date>/f<n>.md) from the
+    # accepted doc, on the conductor side: the worker's scope stays one
+    # file, and the bundle is validated by the same checker ci.sh runs
+    # before it is committed. A doc whose findings cannot be parsed into
+    # conformant concepts is still accepted as narrative — the bundle is
+    # then the pass's own follow-up, reported, not faked.
+    if [ -x "$WT/scripts/findings_to_okf.py" ] && [ -f "$WT/scripts/validate_okf.py" ]; then
+        if (cd "$WT" && python3 scripts/findings_to_okf.py "$EXPECT_DOC" >/dev/null && uv run --with pyyaml scripts/validate_okf.py docs/findings >/dev/null); then
+            git -C "$WT" add docs/findings && git -C "$WT" commit -q -m "findings: OKF concepts for the $(date -u +%Y-%m-%d) pass" -- docs/findings
+            echo "stage2-diagnose: findings bundle derived + validated (docs/findings/$(date -u +%Y-%m-%d)/)"
+        else
+            git -C "$WT" checkout -q -- docs/findings 2>/dev/null; git -C "$WT" clean -qfd docs/findings 2>/dev/null
+            echo "stage2-diagnose: findings bundle NOT derived — converter/validator failed on $EXPECT_DOC; pass doc accepted as narrative only" >&2
+        fi
+    fi
     git -C "$WT" push -q -u origin "$BRANCH" 2>/dev/null || echo "stage2-diagnose: branch push failed (offline?) — doc is committed locally on $BRANCH" >&2
     FINDINGS="$(grep -cE '^#{2,4} +F[0-9]+\b' "$WT/$EXPECT_DOC" 2>/dev/null || true)"
     echo "stage2-diagnose: accepted $EXPECT_DOC on $BRANCH (worker RESULT.md: $ISO_DIR/out/RESULT.md)"
