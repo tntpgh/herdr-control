@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The bounded-autonomy auth GATEWAY: `omp auth-gateway serve` on 127.0.0.1:4000,
+  talking to the broker at OMP_AUTH_BROKER_URL. Install both or neither — the
+  gateway is useless without com.herdr-control.auth-broker.plist.template, and
+  the broker's decisions never reach a worker without the gateway.
+
+  Tracked from 2026-09-06; before that both were hand-written plists in no
+  repository, found by thurber-os's launchd audit. install.sh --auth renders
+  __OMP__, __HOME__ and __LOG_DIR__.
+
+  Loopback only, same reasoning as the broker: this is the path a worker's
+  action is authorised through.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.herdr-control.auth-gateway</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__OMP__</string>
+    <string>auth-gateway</string>
+    <string>serve</string>
+    <string>--bind=127.0.0.1:4000</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.omp</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>OMP_AUTH_BROKER_URL</key>
+    <string>http://127.0.0.1:8765</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/com.herdr-control.auth-gateway.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/com.herdr-control.auth-gateway.log</string>
+</dict>
+</plist>
