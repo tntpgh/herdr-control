@@ -42,6 +42,24 @@ resolve_conductor_id() {
 # few minutes during a live session and must not narrate "nothing changed"
 # every time. Without it (SessionStart's one-time cost), an explicit
 # "no changes" line is useful confirmation that reconciliation actually ran.
+# The newest `*_done` handoff event in a task's worktree, or empty. Reads the
+# same file wake-on-evidence.sh watches; tolerates a missing worktree, a
+# missing file, and malformed lines (a worker's half-written line must never
+# make the classifier crash into marking everything lost).
+_done_event_for_task() {               # task_json -> event json | empty
+  local wt f
+  wt="$(printf '%s' "$1" | jq -r '.worktree // empty')"
+  [ -n "$wt" ] || return 0
+  f="$wt/.omc/handoffs/events.jsonl"
+  [ -r "$f" ] || return 0
+  # Line by line: a single malformed line must not stop jq before the _done
+  # line that follows it (a stream parse error aborts the whole file).
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s' "$line" | jq -c 'select(type=="object" and (.event|type)=="string" and (.event|endswith("_done")))' 2>/dev/null
+  done < "$f" | tail -n 1
+}
+
 run_reconciliation() {
   local conductor_id="$1" hook_event="$2" quiet=0 hook_json=1 defer=0
   shift 2
@@ -198,9 +216,27 @@ run_reconciliation() {
             fi
           fi
           if [ -n "$reason" ]; then
-            set_task_state "$run_id" "$task_id" "lost"
-            append_event "$run_id" "$task_id" "lost_detected" \
-              "$(jq -nc --arg r "$reason" --arg pane "$pane_id" '{reason:$r, pane_id:$pane}')"
+            # A gone pane is not a lost worker if the worker FINISHED. Workers
+            # append `{"event":"<label>_done", ...}` to their worktree's
+            # .omc/handoffs/events.jsonl (the herdr-ops protocol) and the
+            # conductor closes the tab; until 2026-09-05 this classifier then
+            # buried every such finished task as `lost` - terminal, so the
+            # evidence had to be bolted on as a separate event by whoever
+            # noticed (stage2-diagnose.sh grew exactly that bolt-on). Look for
+            # the evidence first; `lost` is for silence, not for done.
+            local done_ev
+            done_ev="$(_done_event_for_task "$task_json")"
+            if [ -n "$done_ev" ]; then
+              set_task_state "$run_id" "$task_id" "completed"
+              append_event "$run_id" "$task_id" "completion_recorded" \
+                "$(jq -nc --arg r "$reason" --arg pane "$pane_id" --argjson ev "$done_ev" \
+                  '{source:"worktree_handoff_event", pane_reason:$r, pane_id:$pane, event:$ev}')" \
+                "complete_${task_id}_$(printf '%s' "$done_ev" | jq -r '.event')"
+            else
+              set_task_state "$run_id" "$task_id" "lost"
+              append_event "$run_id" "$task_id" "lost_detected" \
+                "$(jq -nc --arg r "$reason" --arg pane "$pane_id" '{reason:$r, pane_id:$pane}')"
+            fi
             task_json="$(read_task "$run_id" "$task_id")"
             state=$(printf '%s' "$task_json" | jq -r '.state // empty')
           fi
