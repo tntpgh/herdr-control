@@ -24,11 +24,24 @@
   <key>Label</key>
   <string>com.herdr-control.bridge</string>
 
+  <!-- Three deliberate details, all from the security review of this PR:
+       * the pre-resolved Slack tokens come from launchd-secrets.env, a file
+         ONLY the plists that need it source — never ~/.zshenv, so a
+         Slack-facing daemon and every non-interactive shell do not share one
+         credential set;
+       * OP_SERVICE_ACCOUNT_TOKEN is UNSET before exec. The daemon must never
+         call `op` (that is this PR's whole point), and it forwards its whole
+         environment to herdr-select.sh/herdr-deliver.sh on every button click,
+         so carrying a vault-wide read credential into the one process that
+         accepts remote input is privilege it does not need;
+       * __RUN_BRIDGE__ is QUOTED. It is interpolated into a shell string now,
+         not an argv element, so an unquoted checkout path containing a space
+         would exec the wrong path and KeepAlive-loop forever. -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
     <string>-c</string>
-    <string>source "$HOME/.config/op/service-account.env" 2>/dev/null; exec __RUN_BRIDGE__</string>
+    <string>source "$HOME/.config/op/service-account.env" 2>/dev/null; source "$HOME/.config/op/launchd-secrets.env" 2>/dev/null; unset OP_SERVICE_ACCOUNT_TOKEN; exec "__RUN_BRIDGE__"</string>
   </array>
 
   <!-- launchd hands a job a minimal PATH. python3/herdr are in Homebrew and
