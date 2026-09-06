@@ -7,6 +7,17 @@
 
   No secrets here: run-bridge.sh sources ~/.config/herdr-bridge.env, which
   references 1Password rather than storing tokens on disk.
+
+  It sources ~/.config/op/service-account.env first (if you have one), because
+  a launchd job that calls `op` DEADLOCKS: op probes Apple Events / AppData TCC
+  on every invocation from a background session — regardless of
+  OP_SERVICE_ACCOUNT_TOKEN — and there is no TTY to answer the prompt
+  (1Password/shell-plugins#606). Measured 2026-09-06: token resolution hung
+  until a 25s timeout without that file, 0.68s with it. Keep pre-resolved
+  SLACK_BOT_TOKEN / SLACK_APP_TOKEN in it (chmod 600) and the daemon never
+  spawns op at all; herdr-bridge.env.example's `:-` guards make the env win.
+  The failure mode is silent: the daemon starts, never connects, and every
+  alert and phone approval disappears.
 -->
 <plist version="1.0">
 <dict>
@@ -16,8 +27,17 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>__RUN_BRIDGE__</string>
+    <string>-c</string>
+    <string>source "$HOME/.config/op/service-account.env" 2>/dev/null; exec __RUN_BRIDGE__</string>
   </array>
+
+  <!-- launchd hands a job a minimal PATH. python3/herdr are in Homebrew and
+       `op` is commonly in ~/.local/bin, which is on no default PATH at all. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
 
   <!-- Socket Mode holds a long-lived connection; restart it if it ever drops. -->
   <key>RunAtLoad</key>

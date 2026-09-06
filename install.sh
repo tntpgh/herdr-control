@@ -343,10 +343,17 @@ if [ "$BRIDGE" = 1 ]; then
   elif [ "$APPLY" = 1 ]; then
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
     sed -e "s|__RUN_BRIDGE__|$here/slack-bridge/run-bridge.sh|" \
+        -e "s|__HOME__|$HOME|g" \
         -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.bridge.log|g" \
       "$here/slack-bridge/com.herdr-control.bridge.plist.template" > "$PLIST"
-    launchctl unload "$PLIST" 2>/dev/null
-    launchctl load "$PLIST" && echo "bridge daemon loaded ($PLIST)"
+    # bootout/bootstrap, not load/unload: `launchctl kickstart -k` and `load`
+    # on an already-loaded label reuse the CACHED job definition, so a changed
+    # ProgramArguments silently does not take effect. Confirmed live 2026-09-06
+    # — a kickstart after editing the plist restarted the OLD argv and the
+    # daemon hung in `op read` with no Slack connection.
+    launchctl bootout "gui/$(id -u)/com.herdr-control.bridge" 2>/dev/null
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" \
+      && echo "bridge daemon loaded ($PLIST)"
   else
     echo "  + would install launchd plist -> $PLIST"
   fi
