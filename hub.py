@@ -29,11 +29,13 @@ the port taken and exits 0.
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures as cf
 import datetime as dt
 import html
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -64,6 +66,9 @@ SURFACES = [
     ("teamthurber.com", "https://teamthurber.com/", "HEAD", "tntpgh"),
     ("thurber-ai portal", "https://tunnel.teamthurber.com/", "HEAD", "thurber_ai"),
     ("knowledge-base (Fly)", "https://thurber-kb.fly.dev/healthz", "GET", "kb"),
+    ("vintageskins.com (BigCommerce)", "https://vintageskins.com/", "HEAD", None),
+    ("vintageskins labels (Worker)", "https://vintageskins-labels.tnt-pgh.workers.dev/", "HEAD", None),
+    ("vintageskins welcome webhook (Worker)", "https://vintageskins-welcome.tnt-pgh.workers.dev/", "HEAD", None),
     ("omp auth-gateway", "http://127.0.0.1:4000/", "HEAD", None),
     ("search dev (wrangler) · optional", "http://127.0.0.1:8799/", "HEAD", None),
 ]
@@ -270,12 +275,170 @@ def links_data() -> dict:
     return {"surfaces": results}
 
 
+# ── loops: every scheduled thing that is supposed to keep running ──────────────
+# One row per loop: what it is, when it last ran, whether that is fresh for its
+# cadence, and its last outcome — read from each loop's OWN artifact, never
+# re-derived. `stale_after_s` is the cadence plus slack (a daily loop is late
+# at 26h, not 24h01). "Suggestions" are the Stage-2 diagnose pass's own
+# Stage-3-eligible / auto-remediate findings plus derived nudges from the
+# freshness/outcome rules — proposal-only, exactly as the charter says.
+THURBER_OS = Path(os.environ.get("THURBER_OS", Path.home() / "Code/thurber-os"))
+# The Stage-1 ledger is per-MACHINE state written by the launchd job, which
+# runs the live checkout — so read it from there even when this hub runs from
+# a worktree. ENGINEERING_LEDGER_DIR is the same override the collector honors.
+HERDR_CONTROL = Path(os.environ.get("HERDR_CONTROL_DIR", Path.home() / "Code/herdr-control"))
+SENTINEL_HEARTBEAT = Path.home() / "Library/Application Support/thurber-os/local-sentinel/heartbeat.json"
+LEDGER_DIR = Path(os.environ.get("ENGINEERING_LEDGER_DIR", HERDR_CONTROL / ".local-state/engineering-ledger"))
+TRACKING_DIR = THURBER_OS / "docs/tracking"
+GATE_REGISTRY = THURBER_OS / "docs/gate-registry.yaml"
+
+
+def _parse_ts(v) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return v / 1000 if v > 1e11 else float(v)
+    try:
+        d = dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    return d.timestamp()
+
+
+def _loop(name, cadence, last, stale_after_s, outcome, detail, link=None) -> dict:
+    ts = _parse_ts(last)
+    age = (time.time() - ts) if ts else None
+    stale = age is None or age > stale_after_s
+    return {"name": name, "cadence": cadence, "last": last, "age_s": age, "stale": stale,
+            "outcome": outcome, "detail": detail, "link": link}
+
+
+def _loop_sentinel() -> dict:
+    if not SENTINEL_HEARTBEAT.exists():
+        return _loop("local sentinel", "every 5 min", None, 900, "missing", f"no heartbeat at {SENTINEL_HEARTBEAT}")
+    try:
+        raw = json.loads(SENTINEL_HEARTBEAT.read_text())
+        v = raw.get("verdict")
+        if isinstance(v, str):  # older writes stored a Python repr, not JSON
+            v = ast.literal_eval(v)
+    except (OSError, ValueError, SyntaxError) as e:
+        return _loop("local sentinel", "every 5 min", None, 900, "unreadable", str(e)[:120])
+    failed = v.get("failed_signals") or []
+    return _loop("local sentinel", "every 5 min", v.get("checked_at"), 900, v.get("status") or "?",
+                 f"failed signals: {', '.join(failed)}" if failed else "all signals healthy")
+
+
+def _loop_stage1() -> dict:
+    files = sorted(LEDGER_DIR.glob("*.jsonl")) if LEDGER_DIR.is_dir() else []
+    if not files:
+        return _loop("eloop stage 1 — engineering ledger collector", "hourly", None, 3 * 3600, "missing",
+                     f"no ledger files in {LEDGER_DIR}")
+    rows = []
+    for line in files[-1].read_text().splitlines()[-40:]:
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    last = max((r.get("observed_at") or "" for r in rows), default=None) or None
+    latest_poll = [r for r in rows if r.get("observed_at") == last]
+    bad = [f"{r.get('source')}:{r.get('source_id')}" for r in latest_poll if r.get("status") not in ("ok", "success", None)]
+    return _loop("eloop stage 1 — engineering ledger collector", "hourly", last, 3 * 3600,
+                 "degraded" if bad else "ok",
+                 f"{len(latest_poll)} source rows in the last poll" + (f"; not ok: {', '.join(bad)}" if bad else ""))
+
+
+_FINDING_RE = re.compile(r"^## (F\d+) — (.+)$", re.M)
+
+
+def _loop_stage2() -> tuple[dict, list[dict]]:
+    docs = sorted(TRACKING_DIR.glob("*-stage2-diagnose-pass.md")) if TRACKING_DIR.is_dir() else []
+    if not docs:
+        return _loop("eloop stage 2 — diagnose pass", "Fridays 09:00", None, 8 * 86400, "missing", "no pass docs"), []
+    doc = docs[-1]
+    text = doc.read_text()
+    when = doc.name[:10]
+    findings = []
+    for m in _FINDING_RE.finditer(text):
+        block = text[m.end(): text.find("\n## ", m.end()) if text.find("\n## ", m.end()) > 0 else len(text)]
+        title = m.group(2)
+        tags = []
+        if "Stage-3-eligible" in title or "Stage-3-eligible" in block[:600]:
+            tags.append("stage-3-eligible")
+        if "auto-remediate" in title.lower() or "**Classification: auto-remediate**" in block:
+            tags.append("auto-remediate")
+        if "CARRY-OVER" in title:
+            tags.append("carry-over")
+        if "RESOLVED" in title:
+            tags.append("resolved")
+        findings.append({"id": m.group(1), "title": title, "tags": tags, "doc": doc.name})
+    open_findings = [f for f in findings if "resolved" not in f["tags"]]
+    return _loop("eloop stage 2 — diagnose pass", "Fridays 09:00", f"{when}T09:00:00+00:00", 8 * 86400,
+                 "ok", f"{len(findings)} findings, {len(open_findings)} open, in {doc.name}",
+                 link=f"file://{doc}"), findings
+
+
+def _loop_gates() -> list[dict]:
+    if not GATE_REGISTRY.exists():
+        return []
+    out, cur = [], None
+    for line in GATE_REGISTRY.read_text().splitlines():
+        s = line.strip()
+        if s.startswith("- id: "):
+            cur = {"id": s[6:].strip(), "status": "?", "title": ""}
+            if cur["id"].startswith(("G-ELOOP", "G-OLOOP")):
+                out.append(cur)
+            else:
+                cur = None
+        elif cur is not None:
+            if s.startswith("status:"):
+                cur["status"] = s.split(":", 1)[1].strip()
+            elif s.startswith("title:"):
+                cur["title"] = s.split(":", 1)[1].strip()
+    return out
+
+
+def loops_data() -> dict:
+    kb = CACHES["kb"].get() or {}
+    runs = kb.get("runs") or []
+    last_run = runs[0] if runs else {}
+    loops = [
+        _loop("KB nightly", "daily 08:00", last_run.get("started_at"), 26 * 3600,
+              last_run.get("status") or "missing",
+              f"{last_run.get('total_steps') or '?'} steps · {last_run.get('host') or ''}" if last_run else (kb.get("error") or kb.get("ledger_error") or "no runs"),
+              link="/kb"),
+    ]
+    hb = kb.get("heartbeat") or {}
+    loops.append(_loop("fleet heartbeat [9h]", "daily (inside KB nightly)", hb.get("generated_at"), 26 * 3600,
+                       "divergent" if hb.get("divergent") else ("ok" if hb else "missing"),
+                       f"{hb.get('healthy_count')}/{hb.get('total_count')} healthy" if hb else "no snapshot yet", link="/kb"))
+    loops.append(_loop_sentinel())
+    loops.append(_loop_stage1())
+    s2, findings = _loop_stage2()
+    loops.append(s2)
+
+    suggestions = []
+    for lp in loops:
+        if lp["stale"]:
+            suggestions.append({"kind": "stale", "text": f"{lp['name']} has not run in {_age(lp['last']) if lp['last'] else 'ever'} (cadence {lp['cadence']}) — check its launchd job / log.", "link": lp.get("link")})
+        elif lp["outcome"] not in ("ok", "success", "healthy"):
+            suggestions.append({"kind": "outcome", "text": f"{lp['name']} last reported {lp['outcome']}: {lp['detail']}", "link": lp.get("link")})
+    for f in findings:
+        if "resolved" in f["tags"]:
+            continue
+        if "auto-remediate" in f["tags"] or "stage-3-eligible" in f["tags"]:
+            suggestions.append({"kind": "finding", "text": f"{f['id']}: {f['title']}", "tags": f["tags"], "link": f"file://{TRACKING_DIR / f['doc']}"})
+    return {"loops": loops, "findings": findings, "suggestions": suggestions, "gates": _loop_gates()}
+
+
 CACHES = {
     "herdr": Cached(5, herdr_data),
     "forms": Cached(3, forms_data),
     "search": Cached(120, search_data),
     "kb": Cached(300, kb_data),
     "links": Cached(60, links_data),
+    "loops": Cached(60, loops_data),
 }
 
 
@@ -325,7 +488,7 @@ STYLE = """
  pre{background:#0c0e13;border:1px solid #272c37;border-radius:8px;padding:10px;overflow:auto;font-size:12px}
  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:#ff7a7a} .dot.ok{background:#6fd39a}
 """
-NAV = [("/", "overview"), ("/decisions", "decisions"), ("/herdr", "herdr"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
+NAV = [("/", "overview"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
 
 
 def page(title: str, path: str, body: str, refresh: int = 15) -> str:
@@ -349,7 +512,8 @@ def task_rows(rows) -> str:
 
 
 def render_overview() -> str:
-    h, f, s, k, l = (CACHES[n].get() for n in ("herdr", "forms", "search", "kb", "links"))
+    h, f, s, k, l, lo = (CACHES[n].get() for n in ("herdr", "forms", "search", "kb", "links", "loops"))
+    bad_loops = [x for x in lo.get("loops", []) if x["stale"] or x["outcome"] not in ("ok", "success", "healthy")]
     att = len(h.get("attention", []))
     hb = (k or {}).get("heartbeat") or {}
     runs = (k or {}).get("runs") or []
@@ -362,6 +526,7 @@ def render_overview() -> str:
         ("/links", f"{alive}/{len(required)}", "surfaces alive", "probed from this Mac; dev servers not counted", alive < len(required)),
         ("/kb", _esc(last.get("status", "—")), "last KB nightly", f"{_age(last.get('started_at'))} ago · {last.get('total_steps') or '?'} steps" if last else (k.get("error") or "no runs"), last.get("status") == "failed"),
         ("/kb", f"{hb.get('healthy_count', '—')}/{hb.get('total_count', '—')}", "fleet healthy (KB heartbeat)", f"snapshot {_age(hb.get('generated_at'))} ago" if hb else "no snapshot", bool(hb.get("divergent"))),
+        ("/loops", f"{len(lo.get('loops', [])) - len(bad_loops)}/{len(lo.get('loops', []))}", "loops healthy", f"{len(lo.get('suggestions', []))} suggestion(s)" + (" · " + ", ".join(x["name"].split(" — ")[0] for x in bad_loops) if bad_loops else ""), bool(bad_loops)),
         ("/search", (s.get("totals") or {}).get("searches", "—"), "searches remembered", f"{(s.get('totals') or {}).get('replays', 0)} served from memory" if s.get("totals") else (s.get("error") or ""), False),
     ]
     body = "<div class=cards>" + "".join(
@@ -391,7 +556,15 @@ def render_herdr() -> str:
                  f"{' <span class=pill>behind</span>' if c['last_event_seq'] < d['max_event_seq'] else ''}</td>"
                  f"<td class=age>{_age(c['updated_at'])}</td></tr>" for c in d["checkpoints"])
     others = [t for t in d["tasks"] if t["state"] not in ATTENTION][:40]
-    body = (f"<h2>Needs attention ({len(d['attention'])})</h2><table>{task_rows(d['attention'])}</table>"
+    lo = CACHES["loops"].get()
+    strip = " ".join(
+        f"<a class='card {'hot' if (x['stale'] or x['outcome'] not in ('ok', 'success', 'healthy')) else ''}' href='/loops' style='padding:10px 12px'>"
+        f"<div class=t>{_esc(x['name'].split(' — ')[0])}</div><div style='font-weight:600'>{'STALE' if x['stale'] else _esc(x['outcome'])}</div>"
+        f"<div class=s>{_age(x['last']) if x['last'] else 'never'} ago · {_esc(x['cadence'])}</div></a>" for x in lo.get("loops", []))
+    sug = "".join(f"<li>{_esc(t['text'])}</li>" for t in lo.get("suggestions", [])[:5])
+    body = (f"<h2>Loops <a href='/loops' class=dim style='font-weight:400'>· all, with suggestions →</a></h2><div class=cards>{strip}</div>"
+            + (f"<h2>Suggestions</h2><ul class=dim style='margin:0 0 6px;padding-left:18px'>{sug}</ul>" if sug else "")
+            + f"<h2>Needs attention ({len(d['attention'])})</h2><table>{task_rows(d['attention'])}</table>"
             f"<h2>Recent events (newest first)</h2><table>{''.join(ev) or '<tr><td class=dim>none</td></tr>'}</table>"
             f"<h2>Conductor cursors</h2><table>{cp or '<tr><td class=dim>none</td></tr>'}</table>"
             f"<h2>Other tasks (latest 40)</h2><table>{task_rows(others)}</table>")
@@ -480,8 +653,30 @@ def render_links() -> str:
 
 
 # ── HTTP ───────────────────────────────────────────────────────────────────────
+def render_loops() -> str:
+    d = CACHES["loops"].get()
+    rows = ""
+    for lp in d["loops"]:
+        cls = "bad" if lp["stale"] or lp["outcome"] not in ("ok", "success", "healthy") else "ok"
+        name = f"<a href='{_esc(lp['link'])}'>{_esc(lp['name'])}</a>" if lp.get("link") and not str(lp["link"]).startswith("file://") else _esc(lp["name"])
+        rows += (f"<tr><td><span class='pill {cls}'>{'STALE' if lp['stale'] else _esc(lp['outcome'])}</span></td>"
+                 f"<td><b>{name}</b><br><small>{_esc(lp['cadence'])} · {_esc(lp['detail'])}</small></td>"
+                 f"<td class=age title='{_esc(lp['last'])}'>{_age(lp['last']) if lp['last'] else 'never'}</td></tr>")
+    sug = "".join(f"<tr><td><span class='pill {'hot' if s['kind'] != 'finding' else ''}'>{_esc(s['kind'])}</span></td>"
+                  f"<td>{_esc(s['text'])}{' <small>' + ' · '.join(s.get('tags', [])) + '</small>' if s.get('tags') else ''}</td></tr>"
+                  for s in d["suggestions"])
+    gates = "".join(f"<tr><td><span class=pill>{_esc(g['status'])}</span></td><td><b>{_esc(g['id'])}</b> <span class=dim>{_esc(g['title'])}</span></td></tr>" for g in d["gates"])
+    findings = "".join(f"<tr><td class=dim>{_esc(f['id'])}</td><td>{_esc(f['title'])}</td><td><small>{' · '.join(f['tags'])}</small></td></tr>" for f in d["findings"])
+    body = (f"<h2>Loops</h2><table>{rows}</table>"
+            f"<h2>Suggestions ({len(d['suggestions'])}) — proposal-only</h2><table>{sug or '<tr><td class=dim>nothing to suggest</td></tr>'}</table>"
+            f"<h2>Evolution-loop gates (docs/gate-registry.yaml — Terrence signs, nobody stamps)</h2><table>{gates or '<tr><td class=dim>none</td></tr>'}</table>"
+            f"<h2>Latest Stage-2 findings</h2><table>{findings or '<tr><td class=dim>none</td></tr>'}</table>")
+    return page("loops", "/loops", body, refresh=60)
+
+
 PAGES = {"/": (render_overview, None), "/herdr": (render_herdr, "herdr"), "/decisions": (render_decisions, "forms"),
-         "/search": (render_search, "search"), "/kb": (render_kb, "kb"), "/links": (render_links, "links")}
+         "/loops": (render_loops, "loops"), "/search": (render_search, "search"), "/kb": (render_kb, "kb"),
+         "/links": (render_links, "links")}
 
 
 class Handler(BaseHTTPRequestHandler):
