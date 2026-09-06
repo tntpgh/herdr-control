@@ -342,11 +342,29 @@ if [ "$BRIDGE" = 1 ]; then
     echo "  ! or remove it first. Skipping the bridge step." >&2
   elif [ "$APPLY" = 1 ]; then
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-    sed -e "s|__RUN_BRIDGE__|$here/slack-bridge/run-bridge.sh|" \
-        -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.bridge.log|g" \
+    # `&` in a sed replacement means "the whole match", and a `|` would end the
+    # expression, so a checkout path or $HOME containing either renders a
+    # corrupted path — silently, into a file launchd runs at every login.
+    # Escape both before substituting.
+    _sed_rhs() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
+    sed -e "s|__RUN_BRIDGE__|$(_sed_rhs "$here/slack-bridge/run-bridge.sh")|" \
+        -e "s|__HOME__|$(_sed_rhs "$HOME")|g" \
+        -e "s|__LOG_PATH__|$(_sed_rhs "$HOME/Library/Logs/com.herdr-control.bridge.log")|g" \
       "$here/slack-bridge/com.herdr-control.bridge.plist.template" > "$PLIST"
-    launchctl unload "$PLIST" 2>/dev/null
-    launchctl load "$PLIST" && echo "bridge daemon loaded ($PLIST)"
+    # A path with a space is now safe in the template's quoted `exec`, but a
+    # broken render must never be loaded: launchd would KeepAlive-loop it.
+    if ! plutil -lint "$PLIST" >/dev/null 2>&1; then
+      echo "  ! rendered plist is not valid ($PLIST) — not loading it" >&2
+      exit 1
+    fi
+    # bootout/bootstrap, not load/unload: `launchctl kickstart -k` and `load`
+    # on an already-loaded label reuse the CACHED job definition, so a changed
+    # ProgramArguments silently does not take effect. Confirmed live 2026-09-06
+    # — a kickstart after editing the plist restarted the OLD argv and the
+    # daemon hung in `op read` with no Slack connection.
+    launchctl bootout "gui/$(id -u)/com.herdr-control.bridge" 2>/dev/null
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" \
+      && echo "bridge daemon loaded ($PLIST)"
   else
     echo "  + would install launchd plist -> $PLIST"
   fi
