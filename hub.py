@@ -421,15 +421,119 @@ def loops_data() -> dict:
     suggestions = []
     for lp in loops:
         if lp["stale"]:
-            suggestions.append({"kind": "stale", "text": f"{lp['name']} has not run in {_age(lp['last']) if lp['last'] else 'ever'} (cadence {lp['cadence']}) — check its launchd job / log.", "link": lp.get("link")})
+            suggestions.append({"key": f"stale:{_slug(lp['name'])}", "kind": "stale", "text": f"{lp['name']} has not run in {_age(lp['last']) if lp['last'] else 'ever'} (cadence {lp['cadence']}) — check its launchd job / log.", "link": lp.get("link")})
         elif lp["outcome"] not in ("ok", "success", "healthy"):
-            suggestions.append({"kind": "outcome", "text": f"{lp['name']} last reported {lp['outcome']}: {lp['detail']}", "link": lp.get("link")})
+            suggestions.append({"key": f"outcome:{_slug(lp['name'])}", "kind": "outcome", "text": f"{lp['name']} last reported {lp['outcome']}: {lp['detail']}", "link": lp.get("link")})
     for f in findings:
         if "resolved" in f["tags"]:
             continue
         if "auto-remediate" in f["tags"] or "stage-3-eligible" in f["tags"]:
-            suggestions.append({"kind": "finding", "text": f"{f['id']}: {f['title']}", "tags": f["tags"], "link": f"file://{TRACKING_DIR / f['doc']}"})
-    return {"loops": loops, "findings": findings, "suggestions": suggestions, "gates": _loop_gates()}
+            suggestions.append({"key": f"finding:{f['id']}", "kind": "finding", "text": f"{f['id']}: {f['title']}", "tags": f["tags"], "link": f"file://{TRACKING_DIR / f['doc']}"})
+    decisions = _loop_decisions()
+    now_ms = int(time.time() * 1000)
+    dismissed = 0
+    for sg in suggestions:
+        d = decisions.get(sg["key"])
+        sg["decision"] = None
+        if d and d["status"] == "open":
+            sg["decision"] = {"state": "deciding", "url": d["url"]}
+        elif d and d.get("until") and d["until"] > now_ms:
+            sg["decision"] = {"state": "dismissed", "until": d["until"]}
+            dismissed += 1
+        elif d and d.get("decision") in ("accept", "hold"):
+            sg["decision"] = {"state": d["decision"], "at": d["answered_at"], "notes": d.get("notes", "")}
+    return {"loops": loops, "findings": findings, "suggestions": suggestions, "dismissed": dismissed,
+            "gates": _loop_gates()}
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+# Terrence, 2026-09-05 ("Rung 1"): every suggestion gets a Decide button; the
+# answer is a formserve form in the /decisions inbox; dismissals stop the nag.
+# No auto-dispatch: "accept" means the CONDUCTOR dispatches (Stage 3 / G-ELOOP-E2
+# is provisional). Decisions are derived from the forms registry itself - the
+# form's answers carry `loops_key` - so there is no second state file to drift.
+DISMISS_DAYS = {"dismiss_7": 7, "dismiss_30": 30}
+
+
+def _sidecar_key(form_path) -> str | None:
+    """An OPEN form has no answers yet; its suggestion key sits in a sidecar
+    written next to the html when the form was served."""
+    if not form_path:
+        return None
+    try:
+        return Path(form_path).with_suffix(".key").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _loop_decisions() -> dict:
+    """key -> newest form outcome for that suggestion (open, or answered)."""
+    out: dict = {}
+    for path in sorted(FORMS_DIR.glob("*.json")):  # oldest first; newer overwrite
+        try:
+            f = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        key = (f.get("answers") or {}).get("loops_key") or _sidecar_key(f.get("form_path"))
+        if not key:
+            continue
+        if f.get("status") == "open":
+            out[key] = {"status": "open", "url": f.get("url")} if port_open(int(f.get("port", 0) or 0)) else out.get(key, {})
+            continue
+        if f.get("status") != "answered":
+            continue
+        a = f.get("answers") or {}
+        days = DISMISS_DAYS.get(a.get("decision"))
+        out[key] = {"status": "answered", "decision": a.get("decision"), "notes": a.get("notes", ""),
+                    "answered_at": f.get("answered_at"),
+                    "until": (f.get("answered_at") or 0) + days * 86400 * 1000 if days else None}
+    return out
+
+
+DECIDE_FORM = """<!doctype html><html lang=en><head><meta charset=utf-8><title>{title}</title>
+<style>:root{{--ground:#0f1115;--surface:#171a21;--line:#272c37;--ink:#e6e9ef;--dim:#9aa3b2;--accent:#6aa6ff}}
+body{{margin:0;background:var(--ground);color:var(--ink);font:15px/1.5 system-ui,sans-serif}} main{{max-width:720px;margin:0 auto;padding:32px 24px 110px}}
+h1{{font-size:22px;margin:0 0 6px}} .sub{{color:var(--dim);margin:0 0 22px}} fieldset{{border:1px solid var(--line);border-radius:8px;background:var(--surface);padding:14px 16px;margin:0 0 16px}}
+legend{{color:var(--dim);font-size:12px;letter-spacing:.08em;text-transform:uppercase;padding:0 6px}} .opt{{display:flex;gap:10px;padding:8px 6px;border-radius:6px;cursor:pointer}} .opt:hover{{background:#1d2129}}
+.hint{{display:block;color:var(--dim);font-size:13px}} textarea{{width:100%;min-height:70px;background:var(--ground);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:8px;font:inherit}}
+.bar{{position:fixed;left:0;right:0;bottom:0;background:var(--surface);border-top:1px solid var(--line);padding:12px 24px;display:flex;gap:10px;justify-content:flex-end}}
+button{{font:600 14px system-ui;padding:10px 18px;border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:#0b1020;cursor:pointer}} .ghost{{background:transparent;color:var(--dim);border-color:var(--line)}}
+pre{{white-space:pre-wrap;background:var(--ground);border:1px solid var(--line);border-radius:6px;padding:10px;color:var(--dim);font-size:13px}}</style></head><body><main>
+<h1>{title}</h1><p class=sub>Suggestion from the hub's /loops page ({kind}). Nothing is dispatched by this form: "accept" hands it to the conductor to dispatch as a herdr worker.</p>
+<pre>{text}</pre>
+<form id=f><fieldset><legend>Decision</legend>
+<label class=opt><input type=radio name=decision value=accept required checked><span><b>Accept</b><span class=hint>conductor dispatches it (worktree + PR, human merge) and reports back</span></span></label>
+<label class=opt><input type=radio name=decision value=hold><span><b>Hold</b><span class=hint>keep it visible, no action yet</span></span></label>
+<label class=opt><input type=radio name=decision value=dismiss_7><span><b>Dismiss for 7 days</b><span class=hint>hidden from /loops until then; comes back if still true</span></span></label>
+<label class=opt><input type=radio name=decision value=dismiss_30><span><b>Dismiss for 30 days</b></span></label>
+</fieldset><fieldset><legend>Notes</legend><textarea name=notes placeholder="constraints, who, why…"></textarea></fieldset></form></main>
+<div class=bar><button type=button class=ghost id=cancel>Send nothing</button><button type=submit form=f>Send answer</button></div>
+<script>document.getElementById("f").addEventListener("submit",function(e){{e.preventDefault();var fd=new FormData(e.target);
+window.submitAnswers({{loops_key:{key_json},decision:fd.get("decision"),notes:(fd.get("notes")||"").trim()}})}});
+document.getElementById("cancel").addEventListener("click",function(){{window.submitAnswers({{cancelled:true,loops_key:{key_json}}})}});</script></body></html>"""
+
+
+def serve_loop_decision(key: str) -> str | None:
+    """Write a decision form for one suggestion and hand it to formserve, which
+    registers it in the inbox. Returns the registry-visible title, or None."""
+    sg = next((x for x in (CACHES["loops"].get() or {}).get("suggestions", []) if x["key"] == key), None)
+    if not sg:
+        return None
+    FORMS_DIR.mkdir(parents=True, exist_ok=True)
+    title = f"loops: {sg['text'][:70]}{'…' if len(sg['text']) > 70 else ''}"
+    form = FORMS_DIR / f"loops-{_slug(key)}-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}.html"
+    form.write_text(DECIDE_FORM.format(title=_esc(title), kind=_esc(sg["kind"]), text=_esc(sg["text"]),
+                                       key_json=json.dumps(key)))
+    form.with_suffix(".key").write_text(key)
+    subprocess.Popen([sys.executable, str(HERDR_CONTROL / "formserve.py"), str(form),
+                      "--timeout", "14400", "--no-open"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    CACHES["loops"].at = 0.0  # re-read on next view so the row shows "deciding"
+    CACHES["forms"].at = 0.0
+    return title
 
 
 CACHES = {
@@ -438,7 +542,7 @@ CACHES = {
     "search": Cached(120, search_data),
     "kb": Cached(300, kb_data),
     "links": Cached(60, links_data),
-    "loops": Cached(60, loops_data),
+    "loops": Cached(10, loops_data),
 }
 
 
@@ -486,6 +590,7 @@ STYLE = """
  .card.hot{border-color:#e08a4a} .card .s{font-size:12px;color:#9aa3b2;margin-top:6px}
  iframe{width:100%;height:720px;border:1px solid #272c37;border-radius:12px;background:#fff}
  pre{background:#0c0e13;border:1px solid #272c37;border-radius:8px;padding:10px;overflow:auto;font-size:12px}
+ button.decide{font:600 12px system-ui;padding:4px 10px;border-radius:5px;border:1px solid #6aa6ff;background:transparent;color:#6aa6ff;cursor:pointer} button.decide:hover{background:#6aa6ff;color:#0b1020}
  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:#ff7a7a} .dot.ok{background:#6fd39a}
 """
 NAV = [("/", "overview"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
@@ -653,6 +758,23 @@ def render_links() -> str:
 
 
 # ── HTTP ───────────────────────────────────────────────────────────────────────
+def _suggestion_row(s: dict) -> str:
+    dec = s.get("decision") or {}
+    st = dec.get("state")
+    if st == "deciding":
+        action = "<a class='pill run' href='/decisions'>deciding…</a>"
+    elif st == "accept":
+        action = f"<span class='pill ok' title='{_esc(dec.get('notes'))}'>accepted · awaiting conductor dispatch</span>"
+    elif st == "hold":
+        action = f"<span class='pill' title='{_esc(dec.get('notes'))}'>on hold</span>"
+    else:
+        action = (f"<form method=post action=/loops/decide style='margin:0'><input type=hidden name=key value='{_esc(s['key'])}'>"
+                  f"<button class=decide>Decide</button></form>")
+    tags = f" <small>{' · '.join(s.get('tags', []))}</small>" if s.get("tags") else ""
+    return (f"<tr><td><span class='pill {'hot' if s['kind'] != 'finding' else ''}'>{_esc(s['kind'])}</span></td>"
+            f"<td{' class=dim' if st == 'hold' else ''}>{_esc(s['text'])}{tags}</td><td class=age>{action}</td></tr>")
+
+
 def render_loops() -> str:
     d = CACHES["loops"].get()
     rows = ""
@@ -662,9 +784,9 @@ def render_loops() -> str:
         rows += (f"<tr><td><span class='pill {cls}'>{'STALE' if lp['stale'] else _esc(lp['outcome'])}</span></td>"
                  f"<td><b>{name}</b><br><small>{_esc(lp['cadence'])} · {_esc(lp['detail'])}</small></td>"
                  f"<td class=age title='{_esc(lp['last'])}'>{_age(lp['last']) if lp['last'] else 'never'}</td></tr>")
-    sug = "".join(f"<tr><td><span class='pill {'hot' if s['kind'] != 'finding' else ''}'>{_esc(s['kind'])}</span></td>"
-                  f"<td>{_esc(s['text'])}{' <small>' + ' · '.join(s.get('tags', [])) + '</small>' if s.get('tags') else ''}</td></tr>"
-                  for s in d["suggestions"])
+    sug = "".join(_suggestion_row(s) for s in d["suggestions"] if not (s.get("decision") or {}).get("state") == "dismissed")
+    if d.get("dismissed"):
+        sug += f"<tr><td></td><td class=dim>{d['dismissed']} dismissed (come back when their dismissal expires)</td><td></td></tr>"
     gates = "".join(f"<tr><td><span class=pill>{_esc(g['status'])}</span></td><td><b>{_esc(g['id'])}</b> <span class=dim>{_esc(g['title'])}</span></td></tr>" for g in d["gates"])
     findings = "".join(f"<tr><td class=dim>{_esc(f['id'])}</td><td>{_esc(f['title'])}</td><td><small>{' · '.join(f['tags'])}</small></td></tr>" for f in d["findings"])
     body = (f"<h2>Loops</h2><table>{rows}</table>"
@@ -701,6 +823,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "text/html; charset=utf-8", render().encode())
         except Exception as e:  # a render bug shows on the page, never takes the hub down
             return self._send(500, "text/plain", f"{type(e).__name__}: {e}".encode())
+
+    def do_POST(self):
+        path, _, _ = self.path.partition("?")
+        if path != "/loops/decide":
+            return self._send(404, "text/plain", b"not found")
+        n = int(self.headers.get("content-length") or 0)
+        form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+        key = (form.get("key") or [""])[0]
+        title = serve_loop_decision(key)
+        if not title:
+            return self._send(404, "text/plain", f"no such suggestion: {key}".encode())
+        self.send_response(303)
+        self.send_header("location", "/decisions")
+        self.send_header("content-length", "0")
+        self.end_headers()
 
     def _send(self, code: int, ctype: str, body: bytes):
         self.send_response(code)
