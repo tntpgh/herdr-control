@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The bounded-autonomy auth BROKER: `omp auth-broker serve` on 127.0.0.1:8765.
+  Paired with com.herdr-control.auth-gateway.plist.template, which points at it.
+
+  These two ran for two days as hand-written plists tracked in no repository —
+  found by thurber-os's launchd audit on 2026-09-06, in the same sweep that found
+  the Slack bridge deadlocked in `op read` for exactly that reason: an agent
+  nobody can review is an agent nobody fixes. Shipping the templates makes them
+  reviewable and reinstallable; install.sh --auth renders them.
+
+  install.sh substitutes __OMP__ (the resolved omp binary), __HOME__ and
+  __LOG_DIR__. No secret is here or in the rendered plist: the broker holds its
+  own state under WorkingDirectory.
+
+  Bind address is deliberately 127.0.0.1 — loopback only, never 0.0.0.0. This is
+  the component that decides whether a worker's action is allowed, so exposing it
+  on a routable interface would let anything on the LAN answer for the operator.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.herdr-control.auth-broker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__OMP__</string>
+    <string>auth-broker</string>
+    <string>serve</string>
+    <string>--bind=127.0.0.1:8765</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.omp</string>
+
+  <!-- launchd hands a job /usr/bin:/bin:/usr/sbin:/sbin and no HOME; omp lives
+       in Homebrew and reads its agent dir out of HOME. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- Without this a crash-looping broker respawns as fast as launchd allows. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/com.herdr-control.auth-broker.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/com.herdr-control.auth-broker.log</string>
+</dict>
+</plist>

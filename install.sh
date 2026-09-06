@@ -9,6 +9,7 @@
 #   ./install.sh --apply      # make the changes
 #   ./install.sh --apply --bridge     # also install the launchd bridge daemon (macOS)
 #   ./install.sh --apply --hub        # also install the launchd agent for hub.py (localhost:8600)
+#   ./install.sh --apply --auth       # also install the bounded-autonomy auth pair (macOS)
 #   ./install.sh --apply --repoint    # ALSO repoint any job already wired at a
 #                                      # different checkout (e.g. an APM-deployed
 #                                      # herdr-ops skill copy) to point at THIS one —
@@ -48,12 +49,13 @@
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
-APPLY=0; BRIDGE=0; HUB=0; REPOINT=0
+APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0
 for a in "$@"; do
   case "$a" in
     --apply)   APPLY=1 ;;
     --bridge)  BRIDGE=1 ;;
     --hub)     HUB=1 ;;
+    --auth)    AUTH=1 ;;
     --repoint) REPOINT=1 ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
@@ -368,6 +370,38 @@ if [ "$HUB" = 1 ]; then
     launchctl load "$PLIST" && echo "hub agent loaded ($PLIST) -> http://127.0.0.1:8600/"
   else
     echo "  + would install launchd plist -> $PLIST (hub.py on :8600)"
+  fi
+fi
+
+# ---- bounded-autonomy auth pair (optional, macOS) ---------------------------
+# `omp auth-broker serve` on :8765 and `omp auth-gateway serve` on :4000, both
+# loopback. They ran for two days as hand-written plists tracked in no repo,
+# which is the same condition that let the Slack bridge sit deadlocked in
+# `op read` unnoticed (see slack-bridge/com.herdr-control.bridge.plist.template).
+# Install BOTH or neither: the gateway is inert without the broker.
+if [ "$AUTH" = 1 ]; then
+  OMP_BIN="$(command -v omp || true)"
+  LOG_DIR="$HOME/Library/Logs/herdr-control"
+  if [ -z "$OMP_BIN" ]; then
+    echo "  ! omp is not on PATH — cannot install the auth pair (they run \`omp auth-* serve\`)" >&2
+  elif [ "$APPLY" = 1 ]; then
+    mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+    for svc in auth-broker auth-gateway; do
+      PLIST="$HOME/Library/LaunchAgents/com.herdr-control.$svc.plist"
+      sed -e "s|__OMP__|$OMP_BIN|g" \
+          -e "s|__HOME__|$HOME|g" \
+          -e "s|__LOG_DIR__|$LOG_DIR|g" \
+        "$here/launchd/com.herdr-control.$svc.plist.template" > "$PLIST"
+      # bootout/bootstrap, not load/unload: `load` on an already-loaded label
+      # reuses the CACHED job definition, so an edited ProgramArguments silently
+      # does not take effect (confirmed live 2026-09-06 on the bridge).
+      launchctl bootout "gui/$(id -u)/com.herdr-control.$svc" 2>/dev/null
+      launchctl bootstrap "gui/$(id -u)" "$PLIST" \
+        && echo "$svc loaded ($PLIST)" \
+        || echo "  ! failed to load $svc — check $LOG_DIR/com.herdr-control.$svc.log" >&2
+    done
+  else
+    echo "  + would install launchd plists -> com.herdr-control.auth-{broker,gateway} (omp: ${OMP_BIN:-none})"
   fi
 fi
 
