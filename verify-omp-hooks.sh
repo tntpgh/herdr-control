@@ -472,7 +472,7 @@ console.log("EVENTS:" + Object.keys(handlers).sort().join(","));
 const tc = handlers["tool_call"]({ toolName: "bash", input: { command: "rm -rf /tmp/x" } });
 console.log("TOOLCALL_RETURN:" + (tc === undefined ? "undefined" : JSON.stringify(tc)));
 const bas = handlers["before_agent_start"]({});
-console.log("INJECTED:" + (bas && bas.message ? "yes" : "no"));
+console.log("INJECTED:" + (bas && bas.message ? bas.message.content : "none"));
 handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
 handlers["agent_end"]({});
 await new Promise(r => setTimeout(r, 600));
@@ -483,20 +483,30 @@ await new Promise(r => setTimeout(r, 600));
   # agent's tool call in omp, so this must return undefined on every path.
   printf '%s' "$shim_out" | grep -q 'TOOLCALL_RETURN:undefined' \
     && ok "tool_call returns undefined (never blocks the agent)" || bad "tool_call returned non-undefined"
-  printf '%s' "$shim_out" | grep -q 'INJECTED:yes' \
-    && ok "before_agent_start injects the reconciliation report" || bad "nothing injected"
+  # #37 moved the reconciliation report to the hub page and left AT MOST a
+  # one-line hub summary in the prompt; 0fbece0's report-injection contract is
+  # gone. What must hold now is that nothing else leaks into context — a raw
+  # envelope or a 20-line report in the first turn is the failure.
+  printf '%s' "$shim_out" | grep -qE 'INJECTED:(none|hub: )' \
+    && ok "the first turn gets a hub one-liner at most, never the report" \
+    || bad "reconcile output leaked into context: $shim_out"
   grep -q '"tool":"bash"' "$REC.notify" \
     && ok "omp-notify.sh received the documented stdin JSON" || bad "notify stdin wrong: $(cat "$REC.notify" 2>/dev/null)"
   grep -q 'RECONCILE mode=session'  "$REC" && ok "session reconcile invoked"  || bad "no session reconcile"
   grep -q 'RECONCILE mode=interval' "$REC" && ok "interval reconcile invoked" || bad "no interval reconcile"
   grep -q 'RESOLVE' "$REC" && ok "alert retraction invoked" || bad "no retraction"
 
-  printf '== TS shim: envelope reports are DELIVERED (sendMessage) then ACKED ==\n'
-  # The regression this pins: the old shim spawned the interval pass with
-  # stdout ignored while the script checkpointed the report as delivered —
-  # every mid-session report was consumed unseen. Now the interval report
-  # must reach pi.sendMessage, and the ack must carry the whole envelope
-  # back; a fake pi with no sendMessage must produce NO ack (redelivery).
+  printf '== TS shim: every envelope is ACKED, and no report enters the prompt ==\n'
+  # History matters here, because these assertions were pointed the wrong way
+  # for two releases. 0fbece0 delivered the report through pi.sendMessage and
+  # acked only on delivery; #37 moved reports to the hub page and left at most
+  # a one-line hub summary in the prompt, deleting sendMessage entirely. The
+  # tests kept asserting the deleted design and failed on main from then on —
+  # a red suite nobody could act on. The contract that IS current:
+  #   * the reconcile report NEVER reaches the conversation, session or interval
+  #   * both envelopes are still acked exactly once, carried back verbatim, so
+  #     the registry cursor advances and the page picks the history up
+  #   * acking no longer depends on a delivery channel that no longer exists
   SHIM2="$WORK/shim2"; mkdir -p "$SHIM2/agent-hooks"
   cat > "$SHIM2/agent-hooks/omp-notify.sh" <<'EOS'
 #!/usr/bin/env bash
@@ -528,17 +538,22 @@ handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
 await new Promise(r => setTimeout(r, 800));
 console.log("SENT:" + sent.length + ":" + (sent[0] ? sent[0].content : ""));
 ' 2>&1)"
-  printf '%s' "$shim2_out" | grep -q 'SESSION_INJECT:wake-persistence: session hello' \
-    && ok "session envelope report injected (not raw JSON)" || bad "session inject: $shim2_out"
-  printf '%s' "$shim2_out" | grep -q 'SENT:1:wake-persistence: deferred hello' \
-    && ok "interval report delivered through pi.sendMessage" || bad "sendMessage never saw the report: $shim2_out"
+  printf '%s' "$shim2_out" | grep -q 'SESSION_INJECT:wake-persistence' \
+    && bad "the session report was injected into the prompt: $shim2_out" \
+    || ok "session report stays out of the prompt"
+  printf '%s' "$shim2_out" | grep -q 'SESSION_INJECT:{' \
+    && bad "raw envelope JSON injected: $shim2_out" || ok "no raw envelope in context"
+  printf '%s' "$shim2_out" | grep -q 'SENT:0:' \
+    && ok "the interval report is not pushed into the conversation" \
+    || bad "mid-session report reached the agent: $shim2_out"
   ack_n=$(grep -c 'ACK' "$REC2" 2>/dev/null || true)
   [ "${ack_n:-0}" = "2" ] && ok "both envelopes acked exactly once each" || bad "ack count: ${ack_n:-0} ($(cat "$REC2" 2>/dev/null))"
   grep -q '"last_event_seq":9' "$REC2.ack" && grep -q '"last_event_seq":4' "$REC2.ack" \
     && ok "acks carry the original envelopes back verbatim" || bad "ack stdin: $(cat "$REC2.ack" 2>/dev/null)"
 
-  # No sendMessage available -> the report CANNOT be delivered -> no ack may
-  # be recorded, so the next pass redelivers instead of losing it.
+  # No sendMessage on the API at all: the ack must still happen. Under the old
+  # design this was the redelivery guard; under #37 there is nothing to deliver,
+  # and withholding the ack here would replay the same envelope forever.
   : > "$REC2"; : > "$REC2.ack"
   HERDR_CONTROL_DIR="$SHIM2" bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
@@ -548,7 +563,11 @@ handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
 await new Promise(r => setTimeout(r, 800));
 ' >/dev/null 2>&1
   grep -q 'ACK' "$REC2" \
-    && bad "acked an interval report that was never delivered" || ok "undeliverable report left unacked (will replay)"
+    && ok "the interval envelope is acked without any delivery channel" \
+    || bad "envelope left unacked — it will replay forever: $(cat "$REC2" 2>/dev/null)"
+  grep -q '"last_event_seq":9' "$REC2.ack" \
+    && ok "that ack still carries the envelope verbatim" \
+    || bad "ack stdin: $(cat "$REC2.ack" 2>/dev/null)"
 fi
 
 printf '\n%s\n' "-----"
