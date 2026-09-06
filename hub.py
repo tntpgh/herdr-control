@@ -139,6 +139,12 @@ def forms_data() -> dict:
                 f = json.loads(p.read_text())
             except (OSError, json.JSONDecodeError):
                 continue
+            # formserve lifts the title out of the form's <h1> and strips tags but
+            # not entities, so a title with "&" arrives as "&amp;" and _esc() then
+            # double-escapes it into a visible "&amp;". Decode once, here, so every
+            # consumer (page, iframe title, /api) gets the human string.
+            if f.get("title"):
+                f["title"] = html.unescape(f["title"])
             if f.get("status") == "open" and not port_open(int(f.get("port", 0) or 0)):
                 f["status"] = "gone"  # the server died without recording an outcome (killed, crashed)
             forms.append(f)
@@ -589,6 +595,15 @@ STYLE = """
  .card .n{font-size:28px;font-weight:700;line-height:1.1} .card .t{color:#9aa3b2;font-size:12px;text-transform:uppercase;letter-spacing:.08em}
  .card.hot{border-color:#e08a4a} .card .s{font-size:12px;color:#9aa3b2;margin-top:6px}
  iframe{width:100%;height:720px;border:1px solid #272c37;border-radius:12px;background:#fff}
+ iframe.dframe{height:calc(100vh - 190px);min-height:560px}
+ .dhead{margin:10px 0 8px}
+ details.hist{margin-top:22px;border-top:1px solid #272c37;padding-top:6px}
+ details.hist>summary{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#9aa3b2;cursor:pointer;padding:6px 0;list-style:none}
+ details.hist>summary::-webkit-details-marker{display:none}
+ details.hist>summary::before{content:"\\25B8  ";color:#e08a4a}
+ details.hist[open]>summary::before{content:"\\25BE  "}
+ details.hist>summary:hover{color:#e6e9ef}
+ details.hist>table{margin-top:8px}
  pre{background:#0c0e13;border:1px solid #272c37;border-radius:8px;padding:10px;overflow:auto;font-size:12px}
  button.decide{font:600 12px system-ui;padding:4px 10px;border-radius:5px;border:1px solid #6aa6ff;background:transparent;color:#6aa6ff;cursor:pointer} button.decide:hover{background:#6aa6ff;color:#0b1020}
  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:#ff7a7a} .dot.ok{background:#6fd39a}
@@ -692,19 +707,25 @@ def render_herdr() -> str:
 
 def render_decisions() -> str:
     d = CACHES["forms"].get()
-    body = f"<h2>Open ({d['open_count']})</h2>"
+    # Terrence, 2026-09-06: "open decisions should expand most of the page,
+    # history defaults collapsed." The open form is the only thing on this page
+    # that needs acting on, so it gets the viewport; the answered/expired log is
+    # reference material behind a <details>.
+    body = ""
     if not d["open"]:
-        body += "<p class=dim>Nothing waiting on you. Forms appear here the moment an agent serves one.</p>"
+        body += ("<h2>Open (0)</h2><p class=dim>Nothing waiting on you. "
+                 "Forms appear here the moment an agent serves one.</p>")
     for f in d["open"]:
-        body += (f"<p><b>{_esc(f.get('title') or f['id'])}</b> <span class=dim>· served {_age(f.get('created_at'))} ago · "
+        body += (f"<p class=dhead><b>{_esc(f.get('title') or f['id'])}</b> <span class=dim>· served {_age(f.get('created_at'))} ago · "
                  f"expires {_age(f.get('expires_at'))} · <a href='{_esc(f['url'])}' target=_blank>open in its own tab</a></span></p>"
-                 f"<iframe src='{_esc(f['url'])}' title='{_esc(f.get('title') or f['id'])}'></iframe>")
+                 f"<iframe class=dframe src='{_esc(f['url'])}' title='{_esc(f.get('title') or f['id'])}'></iframe>")
     rows = "".join(
         f"<tr><td><span class='pill {'ok' if f['status'] == 'answered' else 'bad'}'>{_esc(f['status'])}</span></td>"
         f"<td><b>{_esc(f.get('title') or f['id'])}</b><br><small>{_esc(f.get('form_path', ''))}</small>"
         + (f"<pre>{_esc(json.dumps(f.get('answers'), indent=1, sort_keys=True))}</pre>" if f.get("answers") else "")
         + f"</td><td class=age>{_age(f.get('answered_at') or f.get('created_at'))}</td></tr>" for f in d["history"])
-    body += f"<h2>History</h2><table>{rows or '<tr><td class=dim>none yet</td></tr>'}</table>"
+    body += (f"<details class=hist><summary>History · {len(d['history'])} answered/expired</summary>"
+             f"<table>{rows or '<tr><td class=dim>none yet</td></tr>'}</table></details>")
     key = ",".join(sorted(f["id"] for f in d["open"]))
     return page(f"decisions · {d['open_count']} open", "/decisions",
                 body + DECISIONS_POLLER % json.dumps(key), refresh=0)
