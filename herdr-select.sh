@@ -141,10 +141,17 @@ require_agent_pane "$pane" || exit 3
 # from scratch each time protects against).
 _current_offer() {   # -> "mechanism<TAB>options-blob" or empty
   local opts
-  opts=$(prompt_options "$pane")
-  if [ -n "$opts" ]; then printf 'numbered\t%s' "$opts"; return; fi
+  # MENU FIRST. omp paints a queued-message list ("1. Conductor: ...") under
+  # the input box, and that matches the numbered shape (`N. text`) exactly -
+  # three times on 2026-09-05 the numbered branch "answered" the Approve/Deny
+  # menu by selecting a queued message instead, leaving the prompt up and the
+  # worker blocked (one lost 8 minutes). The menu detector requires the
+  # highlight + navigation footer, which claude/codex never render, so they
+  # still fall through to numbered unchanged.
   opts=$(prompt_menu_options "$pane")
-  [ -n "$opts" ] && printf 'menu\t%s' "$opts"
+  if [ -n "$opts" ]; then printf 'menu\t%s' "$opts"; return; fi
+  opts=$(prompt_options "$pane")
+  [ -n "$opts" ] && printf 'numbered\t%s' "$opts"
 }
 
 offer=$(_current_offer)

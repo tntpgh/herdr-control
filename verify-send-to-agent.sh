@@ -201,5 +201,30 @@ send "some message"; rc=$?
 [ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed on refusal" || bad "Enters=$(enters_pressed)"
 [ ! -s "$SENDTEXT" ] && ok "text never typed into a live prompt" || bad "typed into a prompt: $(cat "$SENDTEXT")"
 
+printf '== boot-time race (2026-09-05, both fresh spawns): paste paints AFTER the baseline read - a "change" that still shows the text is NOT a submit ==\n'
+reset_state
+screen 0 <<'EOF'
+ Connecting to MCP servers: oh-my-claudecode, supabase…
+╭── ⟦Uf0d57⟧ Sonnet 5 ⟦Ue0b1⟧ tourguide/agents-md-router ───
+╰─
+EOF
+screen 1 <<'EOF'
+ Connected to MCP servers: oh-my-claudecode, supabase.
+╭── ⟦Uf0d57⟧ Sonnet 5 ⟦Ue0b1⟧ tourguide/agents-md-router ───
+╰─ @/tmp/tourguide-agents-router-brief.md
+EOF
+screen 2 <<'EOF'
+❯ @/tmp/tourguide-agents-router-brief.md
+
+⏺ Reading the brief.
+╭── ⟦Uf0d57⟧ Sonnet 5 ⟦Ue0b1⟧ tourguide/agents-md-router ───
+╰─
+EOF
+last_as 2
+send "@/tmp/tourguide-agents-router-brief.md"; rc=$?
+[ "$rc" -eq 0 ] && ok "exit 0" || bad "exit $rc: $(cat "$WORK/err.txt")"
+grep -q '^SUBMITTED' "$WORK/out.txt" && ok "reported SUBMITTED only once the text LEFT the composer" || bad "stdout: $(cat "$WORK/out.txt")"
+[ "$(enters_pressed)" = "2" ] && ok "two Enters: the first only revealed the paste" || bad "Enters=$(enters_pressed)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
