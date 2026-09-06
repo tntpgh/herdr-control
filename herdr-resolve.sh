@@ -41,6 +41,9 @@ DRY=0
 # the sweep re-deleted the same messages on every tool call forever.
 MAX="${HERDR_RESOLVE_MAX_PER_RUN:-3}"
 PACE="${HERDR_RESOLVE_PACE_S:-1}"
+# Give up on an alert Slack has refused for this many days. See the check in the
+# loop: the keep-on-uncertain rule has no other bound.
+MAX_AGE_D="${HERDR_RESOLVE_MAX_AGE_D:-7}"
 done_n=0
 # Test seam: the suite stubs the Slack call, since asserting on rate-limit and
 # unreachable handling is the entire point and neither can be provoked for real.
@@ -76,14 +79,15 @@ fi
 live_panes=$(herdr pane list 2>/dev/null \
   | jq -r '(.result.panes // .panes)[]?.pane_id // empty' 2>/dev/null)
 
-# Serialise the sweep. Two PostToolUse hooks firing close together would both
-# snapshot the queue and both delete the same messages. mkdir is atomic on
-# POSIX (exactly one caller wins the "did not exist, now does" transition), the
-# same dependency-free mutex agent-hooks/interval-reconcile.sh uses.
-lockdir="$STATE/.resolve.lock"
+# Serialise the sweep against the other two writers. Bounded wait plus stale
+# reclaim live in lib/pending-queue.sh — a one-shot `mkdir || exit` skipped the
+# work whenever any other session was mid-sweep, and a SIGKILL at the hook
+# timeout left the lock behind and stopped retraction permanently.
+. "$here/lib/pending-queue.sh"
+lockdir="$STATE/.pending.lock"
 if [ "$DRY" = 0 ]; then
-  mkdir "$lockdir" 2>/dev/null || exit 0
-  trap 'rmdir "$lockdir" 2>/dev/null' EXIT HUP INT TERM
+  pending_lock "$lockdir" || exit 0
+  trap 'pending_unlock "$lockdir"' EXIT HUP INT TERM
 fi
 
 # Work from a snapshot, but NEVER write the snapshot back. herdr-notify appends
@@ -98,22 +102,37 @@ fi
 # Instead each settled entry is subtracted from the LIVE file by its ts, so
 # concurrent appends survive by construction.
 snapshot=$(mktemp "${TMPDIR:-/tmp}/herdr-pending.XXXXXX") || exit 0
-scratch="$snapshot.new"
-trap 'rm -f "$snapshot" "$scratch"; [ "$DRY" = 1 ] || rmdir "$lockdir" 2>/dev/null' EXIT HUP INT TERM
+trap 'rm -f "$snapshot"; [ "$DRY" = 1 ] || pending_unlock "$lockdir"' EXIT HUP INT TERM
 cp "$PENDING" "$snapshot" || exit 0
 
-settle() {                             # <ts> -> drop just this alert, atomically
-  local t="$1"
-  jq -c --arg t "$t" 'select(.ts != $t)' < "$PENDING" > "$scratch" 2>/dev/null \
-    && mv -f "$scratch" "$PENDING"
-  rm -f "$scratch"
-}
+settle() { pending_drop "$PENDING" ts "$1"; }
 
 while IFS= read -r line; do
   [ -n "$line" ] || continue
   ts=$(printf '%s' "$line" | jq -r '.ts // empty' 2>/dev/null)
   pane=$(printf '%s' "$line" | jq -r '.pane // empty' 2>/dev/null)
   if [ -z "$ts" ] || [ -z "$pane" ]; then continue; fi
+  # BUDGET FIRST, before any per-entry RPC. Checking it after the pane probes
+  # made a run cost O(queue), not O(MAX): three herdr RPCs plus a prompt parse
+  # per still-listed pane, on every queued line, on every tool call in every
+  # session. With the (correct) keep-on-uncertain rule a stuck queue then makes
+  # every hook run exceed the same 10s timeout the lock's safety depends on.
+  # A dry run has no budget: its whole job is to report the entire queue.
+  if [ "$DRY" = 0 ] && [ "$done_n" -ge "$MAX" ]; then continue; fi
+
+  # Bound the queue in TIME. `keep unless definitive` is right, but Slack has
+  # permanent refusals this cannot enumerate (missing_scope,
+  # compliance_exports_prevent_deletion, ekm_access_denied, org_login_required),
+  # and nothing trims this file the way herdr-notify trims registry.jsonl. An
+  # entry that has failed for days is not going to succeed; keeping it forever
+  # pins the queue and burns the per-run budget on it every pass.
+  if [ "$DRY" = 0 ] && [ -n "${ts%%.*}" ] \
+     && [ "$(( $(date +%s) - ${ts%%.*} ))" -gt "$(( MAX_AGE_D * 86400 ))" ]; then
+    echo "herdr-resolve: giving up on alert ts=$ts pane=$pane after ${MAX_AGE_D}d" \
+         "— it is still in Slack; delete it by hand if it matters" >&2
+    settle "$ts"
+    continue
+  fi
 
   gone=0
   if [ -n "$live_panes" ] && ! printf '%s\n' "$live_panes" | grep -qxF "$pane"; then
@@ -142,14 +161,6 @@ while IFS= read -r line; do
     continue
   fi
 
-  # Bound the deletes per run. chat.delete is rate limited and this runs from an
-  # async hook with a 10s timeout, so the budget must actually FIT that timeout:
-  # 3 deletes cost 2 x PACE of sleep plus 3 round trips, not 8 x 1s which cannot
-  # finish. A larger backlog drains across runs, and because every settled entry
-  # is removed from the queue immediately (settle(), below) rather than in one
-  # rewrite at the end, being killed mid-sweep loses at most one entry's
-  # bookkeeping instead of all of it.
-  if [ "$done_n" -ge "$MAX" ]; then continue; fi
   [ "$done_n" = 0 ] || sleep "$PACE"
   done_n=$((done_n + 1))
 

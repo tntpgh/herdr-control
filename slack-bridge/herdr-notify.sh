@@ -311,8 +311,20 @@ if [ -n "$pane" ]; then
   # If you then answer in the terminal, herdr-resolve.sh retracts this message
   # so it does not sit in Slack looking pending. Informational alerts carry no
   # question, so they are never tracked and never deleted.
-  [ -n "$blocks" ] && jq -nc --arg ts "$ts" --arg pane "$pane" \
-    '{ts:$ts,pane:$pane}' >> "$reg_dir/pending.jsonl"
+  #
+  # Under the same mutex the sweep and herdr-select use: this is the only
+  # APPENDER, and herdr-resolve's settle() does a jq-read then rename, so an
+  # append landing inside that window would be dropped — an armed Slack message
+  # with no record, which is precisely the un-retractable state this queue
+  # exists to prevent. If the wait is exhausted, append anyway and say so: a
+  # possibly-lost record beats never recording a live question at all.
+  if [ -n "$blocks" ]; then
+    . "$_lib/pending-queue.sh"
+    _pl="$reg_dir/.pending.lock"
+    pending_lock "$_pl" || echo "herdr-notify: pending queue locked; appending unserialised" >&2
+    jq -nc --arg ts "$ts" --arg pane "$pane" '{ts:$ts,pane:$pane}' >> "$reg_dir/pending.jsonl"
+    pending_unlock "$_pl"
+  fi
   # Keep the registry bounded (last 500 alerts).
   if [ "$(wc -l < "$reg" 2>/dev/null || echo 0)" -gt 600 ]; then
     tail -n 500 "$reg" > "$reg.tmp" && mv "$reg.tmp" "$reg"

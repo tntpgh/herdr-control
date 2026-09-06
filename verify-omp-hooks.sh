@@ -25,6 +25,9 @@ export NOTIFIED="$WORK/notified.log"
 # a plain shell variable does not cross that boundary — the redirect would go to
 # /wake.txt and fail silently.
 export WAKE="$WORK/wake.txt"
+# Where the herdr stub records its RPCs. Exported for the same reason WAKE is:
+# the stub runs inside child shells.
+export HERDR_CALLS="$WORK/herdr.calls"
 
 # Belt and braces against a biometric prompt. herdr-notify.sh no longer sources
 # the bridge env on the --dry-run path, but this suite dry-runs it, and a future
@@ -54,6 +57,10 @@ export WPANE WBIRTH CPANE CBIRTH
 # CONDUCTOR and refuse every wake, which would pass for the wrong reason.
 herdr() {
   local sub="$1 $2" pane
+  # Record every RPC when a test asks: "how many pane reads did that cost?" is
+  # a real assertion, because a per-entry RPC inside a budgeted loop turns an
+  # O(MAX) run into an O(queue) one that outlives its hook timeout.
+  [ -n "${HERDR_CALLS:-}" ] && printf '%s\n' "$sub" >> "$HERDR_CALLS"
   case "$sub" in
     "pane process-info")
       printf '{"result":{"process_info":{"foreground_processes":[{"name":"omp","cmdline":"omp --model sonnet"}]}}}\n' ;;
@@ -182,25 +189,32 @@ printf '== the alert LIFECYCLE: an answered alert is retracted, a live one is no
 LC="$WORK/lifecycle"; mkdir -p "$LC"
 lc_pending() { printf '%s\n' "$@" > "$LC/pending.jsonl"; }
 lc_ts() { jq -r .ts < "$LC/pending.jsonl" | tr '\n' ' '; }
-A1='{"ts":"111.1","pane":"'"$WPANE"'"}'
-A2='{"ts":"222.2","pane":"'"$WPANE"'"}'
-GONE='{"ts":"333.3","pane":"wZ:p9"}'
+# Slack message ts values are epoch-seconds.micros, and herdr-resolve gives up
+# on an alert older than HERDR_RESOLVE_MAX_AGE_D — so fixtures must be dated
+# like the real thing or every one of them ages out mid-test.
+NOW=$(date +%s)
+T1="$NOW.1"; T2="$NOW.2"; TG="$NOW.3"; T5="$NOW.5"
+# An alert older than the age cap, for the give-up test further down.
+TOLD=$(( NOW - 30 * 86400 )).9
+A1='{"ts":"'"$T1"'","pane":"'"$WPANE"'"}'
+A2='{"ts":"'"$T2"'","pane":"'"$WPANE"'"}'
+GONE='{"ts":"'"$TG"'","pane":"wZ:p9"}'
 
 omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
 lc_pending "$A1" "$GONE"
 dry="$(HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-resolve.sh" --dry-run 2>&1)"
-printf '%s' "$dry" | grep -q '111.1' \
+printf '%s' "$dry" | grep -q "$T1" \
   && bad "retracted an alert whose omp menu is still on screen: $dry" \
   || ok "a live menu-shape prompt keeps its alert"
-printf '%s' "$dry" | grep -q 'ts=333.3 pane=wZ:p9 (pane gone)' \
+printf '%s' "$dry" | grep -q "ts=$TG pane=wZ:p9 (pane gone)" \
   && ok "an alert for a pane herdr no longer lists is retracted" \
   || bad "orphaned alert kept forever: $dry"
-[ "$(lc_ts)" = "111.1 333.3 " ] \
+[ "$(lc_ts)" = "$T1 $TG " ] \
   && ok "a dry run reports without rewriting the queue" || bad "dry run mutated pending.jsonl"
 
 clean_screen > "$WORKER_SCREEN"
 dry="$(HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-resolve.sh" --dry-run 2>&1)"
-printf '%s' "$dry" | grep -q 'ts=111.1 .* (prompt answered)' \
+printf '%s' "$dry" | grep -q "ts=$T1 .* (prompt answered)" \
   && ok "the prompt going away retracts its alert" || bad "answered alert kept: $dry"
 
 # What Slack ANSWERED decides whether the entry may leave the queue. Provoked
@@ -234,13 +248,13 @@ resolve_stubbed_appending() {       # <reply-json> -> ... and append CURL_APPEND
 
 lc_pending "$GONE"
 resolve_stubbed '{"ok":false,"error":"ratelimited"}'
-[ "$(lc_ts)" = "333.3 " ] \
+[ "$(lc_ts)" = "$TG " ] \
   && ok "a rate-limited delete stays queued (retried next pass)" \
   || bad "rate-limited retraction dropped: $(lc_ts)"
 
 lc_pending "$GONE"
 resolve_stubbed ''
-[ "$(lc_ts)" = "333.3 " ] \
+[ "$(lc_ts)" = "$TG " ] \
   && ok "an unreachable Slack stays queued" || bad "lost the alert offline: $(lc_ts)"
 
 lc_pending "$GONE"
@@ -254,10 +268,10 @@ resolve_stubbed '{"ok":true}'
 [ -z "$(lc_ts)" ] && ok "a deleted alert leaves the queue" || bad "deleted alert still queued"
 
 # A hook has ~10s. A backlog must drain across passes, not be cut off mid-sweep.
-lc_pending '{"ts":"901","pane":"wZ:p9"}' '{"ts":"902","pane":"wZ:p9"}' \
-           '{"ts":"903","pane":"wZ:p9"}' '{"ts":"904","pane":"wZ:p9"}'
+lc_pending '{"ts":"'"$NOW"'.901","pane":"wZ:p9"}' '{"ts":"'"$NOW"'.902","pane":"wZ:p9"}' \
+           '{"ts":"'"$NOW"'.903","pane":"wZ:p9"}' '{"ts":"'"$NOW"'.904","pane":"wZ:p9"}'
 resolve_stubbed '{"ok":true}' 2
-[ "$(grep -c stub "$CURL_CALLS")" = 2 ] && [ "$(lc_ts)" = "903 904 " ] \
+[ "$(grep -c stub "$CURL_CALLS")" = 2 ] && [ "$(lc_ts)" = "$NOW.903 $NOW.904 " ] \
   && ok "the per-run delete budget is honoured and the rest stays queued" \
   || bad "budget ignored: calls=$(grep -c stub "$CURL_CALLS") left=$(lc_ts)"
 
@@ -271,7 +285,7 @@ resolve_stubbed '{"ok":true}' 2
 #    forever. The rule is now "keep unless the answer is definitive".
 lc_pending "$GONE"
 resolve_stubbed '{"ok":false,"error":"invalid_auth"}'
-[ "$(lc_ts)" = "333.3 " ] \
+[ "$(lc_ts)" = "$TG " ] \
   && ok "a rejected token keeps the alert queued (re-auth fixes it, dropping does not)" \
   || bad "auth failure dropped the alert: $(lc_ts)"
 
@@ -281,25 +295,86 @@ resolve_stubbed '{"ok":false,"error":"invalid_auth"}'
 #    armed Slack message with no record. Settling by ts against the LIVE file
 #    makes concurrent appends survive by construction.
 lc_pending "$GONE"
-CURL_APPEND='{"ts":"555.5","pane":"wZ:p9"}' resolve_stubbed_appending '{"ok":true}'
-printf '%s' "$(lc_ts)" | grep -q '555.5' \
+CURL_APPEND='{"ts":"'"$T5"'","pane":"wZ:p9"}' resolve_stubbed_appending '{"ok":true}'
+printf '%s' "$(lc_ts)" | grep -q "$T5" \
   && ok "an alert appended mid-sweep survives the sweep" \
   || bad "concurrent alert erased by the sweep: $(lc_ts)"
-printf '%s' "$(lc_ts)" | grep -q '333.3' \
+printf '%s' "$(lc_ts)" | grep -q "$TG" \
   && bad "the settled alert was not removed: $(lc_ts)" \
   || ok "the settled alert is still removed"
 
-# 3. Two hooks firing together would both snapshot and both delete. The sweep
-#    takes the same mkdir mutex interval-reconcile.sh uses.
+# 3. Two hooks firing together would both snapshot and both delete. All three
+#    writers take one mutex, with a bounded wait — see 4-7 for why the first
+#    draft's non-blocking version was a live defect.
 lc_pending "$GONE"
-mkdir -p "$LC/.resolve.lock"
-resolve_stubbed '{"ok":true}'
+mkdir -p "$LC/.pending.lock"
+PENDING_LOCK_WAIT_S=0 resolve_stubbed '{"ok":true}'
 # wc, not `grep -c`: grep exits 1 on zero matches, so a `|| echo 0` fallback
 # emits a SECOND zero and the comparison never matches.
-[ "$(wc -l < "$CURL_CALLS" | tr -d ' ')" = 0 ] && [ "$(lc_ts)" = "333.3 " ] \
+[ "$(wc -l < "$CURL_CALLS" | tr -d ' ')" = 0 ] && [ "$(lc_ts)" = "$TG " ] \
   && ok "a second concurrent sweep does nothing while the lock is held" \
   || bad "lock ignored: calls=$(wc -l < "$CURL_CALLS" | tr -d ' ') left=$(lc_ts)"
-rmdir "$LC/.resolve.lock"
+rmdir "$LC/.pending.lock"
+
+# --- and the four the RE-review found in the fix itself ---------------------
+
+# 4. THE defect: herdr-select took the lock non-blocking and skipped its untrack
+#    when the sweep held it, on the theory that "retracted later" is safe. It is
+#    not: that message carries the operator's choice and the bridge's
+#    confirmation. Worse, the collision is caused BY the keypress — the Enter
+#    unblocks the worker, whose next tool call starts a sweep microseconds
+#    later. So the untrack must WAIT for the lock.
+omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
+lc_pending "$A1" "$A2"
+mkdir -p "$LC/.pending.lock"
+( sleep 1; rmdir "$LC/.pending.lock" ) &        # a sweep holding it, then done
+HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS="$T1" \
+  PENDING_LOCK_WAIT_S=5 bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer \
+  >/dev/null 2>&1
+wait
+[ "$(lc_ts)" = "$T2 " ] \
+  && ok "a Slack answer waits for the lock instead of leaving its own message retractable" \
+  || bad "untrack skipped under contention: $(lc_ts)"
+
+# 5. A SIGKILL at the hook timeout leaves the lockdir with no trap to remove it.
+#    Without reclaim that disables retraction permanently and silently.
+lc_pending "$GONE"
+mkdir -p "$LC/.pending.lock"
+touch -t 202001010000 "$LC/.pending.lock"       # ancient => stale
+PENDING_LOCK_STALE_S=60 resolve_stubbed '{"ok":true}'
+[ -z "$(lc_ts)" ] \
+  && ok "a stale lock is reclaimed rather than blocking retraction forever" \
+  || bad "stale lock not reclaimed: $(lc_ts)"
+rmdir "$LC/.pending.lock" 2>/dev/null
+
+# 6. Slack has permanent refusals this cannot enumerate (missing_scope,
+#    compliance_exports_prevent_deletion, ...). Keeping on uncertain is right,
+#    but unbounded: nothing trims this file, and a pinned entry burns the
+#    per-run budget on every pass forever.
+lc_pending '{"ts":"'"$TOLD"'","pane":"wZ:p9"}'
+resolve_stubbed '{"ok":false,"error":"missing_scope"}'
+[ -z "$(lc_ts)" ] \
+  && ok "an alert Slack has refused for weeks is finally given up on" \
+  || bad "queue grows without bound: $(lc_ts)"
+
+# 7. The budget was checked AFTER the per-entry pane RPCs, so a run cost
+#    O(queue) rather than O(MAX) — and a stuck queue then pushed every hook
+#    past the same 10s timeout the lock's safety depends on. One entry
+#    legitimately costs several reads (the explicit probe plus both prompt
+#    parsers), so the property is that the cost tracks the BUDGET: a queue of
+#    three must cost no more than a queue of one at the same budget.
+clean_screen > "$WORKER_SCREEN"
+: > "$HERDR_CALLS"
+lc_pending "$A1"
+resolve_stubbed '{"ok":true}' 1
+one=$(grep -c 'pane read' "$HERDR_CALLS")
+: > "$HERDR_CALLS"
+lc_pending "$A1" "$A2" '{"ts":"'"$NOW"'.7","pane":"'"$WPANE"'"}'
+resolve_stubbed '{"ok":true}' 1
+three=$(grep -c 'pane read' "$HERDR_CALLS")
+[ "$three" = "$one" ] \
+  && ok "per-run RPC cost tracks the delete budget, not the queue length" \
+  || bad "run cost is O(queue): $one pane reads for 1 queued, $three for 3, same budget"
 
 # Answered in the TERMINAL: nothing is posted to Slack, so the alert must stay
 # TRACKED for herdr-resolve to delete. This is the exact line that produced the
@@ -308,16 +383,16 @@ omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
 lc_pending "$A1" "$A2"
 HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer \
   >/dev/null 2>&1
-[ "$(lc_ts)" = "111.1 222.2 " ] \
+[ "$(lc_ts)" = "$T1 $T2 " ] \
   && ok "a terminal answer leaves the alert tracked for retraction" \
   || bad "terminal answer orphaned the alert: $(lc_ts)"
 
 # Answered in SLACK: the bridge posts the confirmation under that message, so
 # retracting it would delete the operator's own decision. Untrack THAT alert —
 # and only that one, because a pane can have several queued.
-HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS=111.1 \
+HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS="$T1" \
   bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer >/dev/null 2>&1
-[ "$(lc_ts)" = "222.2 " ] \
+[ "$(lc_ts)" = "$T2 " ] \
   && ok "a Slack answer untracks only the alert that carried it" \
   || bad "wrong alerts untracked: $(lc_ts)"
 

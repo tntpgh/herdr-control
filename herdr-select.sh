@@ -445,32 +445,37 @@ approval_confirmed "$approval_id" "pressed" \
 case "${HERDR_SELECT_VIA:-cli}" in slack-*)
   pending="$log_dir/pending.jsonl"
   if [ -s "$pending" ]; then
-    # Same mutex herdr-resolve.sh takes for its sweep. Both do a
-    # read-modify-write on this file, and herdr-resolve's now spans seconds
-    # (paced deletes), so without serialising them one side's write can revive
-    # the entry the other just removed — and a revived entry means the next
-    # sweep deletes the very Slack message carrying this decision and the
-    # bridge's confirmation under it. Non-blocking: if the sweep holds the lock
-    # we skip the untrack, which is safe in the direction that matters (the
-    # alert stays queued and gets retracted later, rather than a live one being
-    # dropped). The keypress has already landed at this point either way.
-    lockdir="$log_dir/.resolve.lock"
-    if mkdir "$lockdir" 2>/dev/null; then
-      trap 'rmdir "$lockdir" 2>/dev/null' EXIT HUP INT TERM
-      tmp=$(mktemp "${TMPDIR:-/tmp}/herdr-pending.XXXXXX") && {
-        # jq failure must never truncate the queue — a lost entry is a question
-        # that can never be retracted, so write back only on success.
-        if [ -n "${HERDR_SELECT_TS:-}" ]; then
-          jq -c --arg t "$HERDR_SELECT_TS" 'select(.ts != $t)' < "$pending" > "$tmp" 2>/dev/null \
-            && cat "$tmp" > "$pending"
-        else
-          jq -c --arg p "$pane" 'select(.pane != $p)' < "$pending" > "$tmp" 2>/dev/null \
-            && cat "$tmp" > "$pending"
-        fi
-        rm -f "$tmp"
-      }
-      rmdir "$lockdir" 2>/dev/null
+    # WAIT for the mutex; never skip. The first draft took it non-blocking and
+    # called skipping "safe because the alert gets retracted later" — but for a
+    # Slack-answered alert, retracted later IS the failure: that message carries
+    # the operator's choice and the bridge threads its confirmation under it.
+    #
+    # And the collision is CAUSED by this keypress, not coincidental: the Enter
+    # sent above unblocks the worker, the worker's very next tool call fires its
+    # PostToolUse hook, that hook starts a sweep and takes this lock — all within
+    # milliseconds of arriving here. So the non-blocking version lost the race
+    # routinely and the next sweep deleted the decision. Any other session's
+    # tool call does it too.
+    #
+    # Waiting costs nothing: the keystroke has already landed.
+    . "$(cd "$(dirname "$0")" && pwd)/lib/pending-queue.sh"
+    lockdir="$log_dir/.pending.lock"
+    if pending_lock "$lockdir"; then
+      trap 'pending_unlock "$lockdir"' EXIT HUP INT TERM
+      if [ -n "${HERDR_SELECT_TS:-}" ]; then
+        pending_drop "$pending" ts "$HERDR_SELECT_TS" \
+          || echo "herdr-select: could not untrack alert ts=$HERDR_SELECT_TS — the next sweep may retract the message carrying this choice" >&2
+      else
+        pending_drop "$pending" pane "$pane" \
+          || echo "herdr-select: could not untrack alerts for $pane" >&2
+      fi
+      pending_unlock "$lockdir"
       trap - EXIT HUP INT TERM
+    else
+      # Bounded wait exhausted. Say so: this is the one case where the operator's
+      # own message can still be retracted, and it must not be silent.
+      echo "herdr-select: pending queue locked for ${PENDING_LOCK_WAIT_S}s — alert not untracked;" \
+           "a sweep may delete the Slack message carrying this decision" >&2
     fi
   fi
 ;; esac
