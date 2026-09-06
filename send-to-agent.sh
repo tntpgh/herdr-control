@@ -160,6 +160,28 @@ fi
 # into a false SUBMITTED from comparing two empty strings.
 if baseline=$(composer_stable_snapshot "$pane" 12); then baseline_ok=1; else baseline_ok=0; fi
 
+# Boot-time race, observed on BOTH fresh spawns of 2026-09-05 (and once on
+# 2026-09-04, patched locally in stage2-diagnose.sh): on a pane whose agent is
+# still starting, the baseline is read before the paste has painted, so the
+# first Enter "changes" the composer from empty to the text - and that was
+# reported SUBMITTED while the brief sat there unsent. A change is only a
+# submit if the text we sent is GONE. The tail of the text is what the
+# composer shows last (an @file reference is its own tail).
+_sent_tail=""
+if [ "$submit_only" -eq 0 ]; then
+  _sent_tail=$(printf '%s\n' "$text" | sed -e '/^[[:space:]]*$/d' | tail -n 1 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-40)
+fi
+_still_in_composer() {   # <snapshot> -> 0 if the sent text is still sitting there
+  # Only the composer counts: everything from the LAST prompt marker on -
+  # `❯` for Claude/Codex; for omp the status-bar top `╭──` (its bare `╰─`
+  # composer line is box-drawing only and gets stripped from the snapshot
+  # when empty). A submitted message is echoed higher up in the transcript
+  # (`❯ hello`), and that echo must not read as "still unsent".
+  [ -n "$_sent_tail" ] || return 1
+  printf '%s\n' "$1" | awk '/^[[:space:]]*(❯|>|╭|╰─)/{n=NR} {l[NR]=$0} END{for(i=n;i>0&&i<=NR;i++)print l[i]}' \
+    | grep -qF -- "$_sent_tail"
+}
+
 # Retry Enter until the composer visibly changes. First Enter submits a small
 # message (or runs a shell command) immediately; a large collapsed paste, or
 # an Enter herdr reports delivered but the TUI silently drops, may take
@@ -192,7 +214,7 @@ for _ in 1 2 3 4 5 6; do
   }
   if after=$(composer_stable_snapshot "$pane" 12); then
     unreadable=0
-    if [ "$baseline_ok" -eq 1 ] && [ "$after" != "$baseline" ]; then
+    if [ "$baseline_ok" -eq 1 ] && [ "$after" != "$baseline" ] && ! _still_in_composer "$after"; then
       echo "SUBMITTED: $pane composer changed"
       exit 0
     fi
