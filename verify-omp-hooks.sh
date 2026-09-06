@@ -203,6 +203,55 @@ dry="$(HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-resolve.sh" --dry-run 2>&1)"
 printf '%s' "$dry" | grep -q 'ts=111.1 .* (prompt answered)' \
   && ok "the prompt going away retracts its alert" || bad "answered alert kept: $dry"
 
+# What Slack ANSWERED decides whether the entry may leave the queue. Provoked
+# for real 2026-09-06: sweeping the 85-alert backlog at ~5/s, the last two
+# deletes came back `ratelimited` and were dropped as though they had
+# succeeded — both messages were still sitting in Slack afterwards.
+CURLSTUB="$WORK/curl-stub.sh"
+cat > "$CURLSTUB" <<'EOS'
+#!/usr/bin/env bash
+cat >/dev/null                      # swallow the --config token on stdin
+printf 'stub\n' >> "$CURL_CALLS"
+printf '%s' "$CURL_REPLY"
+EOS
+chmod +x "$CURLSTUB"
+export CURL_CALLS="$WORK/curl.calls"
+resolve_stubbed() {                 # <reply-json> [max] -> run with a fake Slack
+  : > "$CURL_CALLS"
+  CURL_REPLY="$1" HERDR_RESOLVE_CURL="$CURLSTUB" HERDR_RESOLVE_PACE_S=0 \
+    HERDR_RESOLVE_MAX_PER_RUN="${2:-8}" HERDR_BRIDGE_STATE="$LC" \
+    bash "$here/herdr-resolve.sh" >/dev/null 2>&1
+}
+
+lc_pending "$GONE"
+resolve_stubbed '{"ok":false,"error":"ratelimited"}'
+[ "$(lc_ts)" = "333.3 " ] \
+  && ok "a rate-limited delete stays queued (retried next pass)" \
+  || bad "rate-limited retraction dropped: $(lc_ts)"
+
+lc_pending "$GONE"
+resolve_stubbed ''
+[ "$(lc_ts)" = "333.3 " ] \
+  && ok "an unreachable Slack stays queued" || bad "lost the alert offline: $(lc_ts)"
+
+lc_pending "$GONE"
+resolve_stubbed '{"ok":false,"error":"message_not_found"}'
+[ -z "$(lc_ts)" ] \
+  && ok "a refusal that will refuse again leaves the queue" \
+  || bad "definitive error kept forever: $(lc_ts)"
+
+lc_pending "$GONE"
+resolve_stubbed '{"ok":true}'
+[ -z "$(lc_ts)" ] && ok "a deleted alert leaves the queue" || bad "deleted alert still queued"
+
+# A hook has ~10s. A backlog must drain across passes, not be cut off mid-sweep.
+lc_pending '{"ts":"901","pane":"wZ:p9"}' '{"ts":"902","pane":"wZ:p9"}' \
+           '{"ts":"903","pane":"wZ:p9"}' '{"ts":"904","pane":"wZ:p9"}'
+resolve_stubbed '{"ok":true}' 2
+[ "$(grep -c stub "$CURL_CALLS")" = 2 ] && [ "$(lc_ts)" = "903 904 " ] \
+  && ok "the per-run delete budget is honoured and the rest stays queued" \
+  || bad "budget ignored: calls=$(grep -c stub "$CURL_CALLS") left=$(lc_ts)"
+
 # Answered in the TERMINAL: nothing is posted to Slack, so the alert must stay
 # TRACKED for herdr-resolve to delete. This is the exact line that produced the
 # 85-alert backlog.

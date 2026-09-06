@@ -31,6 +31,17 @@ PENDING="$STATE/pending.jsonl"
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
+# Retraction budget for ONE run. chat.delete is rate limited and this runs from
+# an async hook (10s timeout in settings.example.json), so the work per pass is
+# bounded and the queue drains across passes rather than being truncated
+# mid-sweep. The normal case is 1–2 alerts and never reaches either limit.
+MAX="${HERDR_RESOLVE_MAX_PER_RUN:-8}"
+PACE="${HERDR_RESOLVE_PACE_S:-1}"
+done_n=0
+# Test seam: the suite stubs the Slack call, since asserting on rate-limit and
+# unreachable handling is the entire point and neither can be provoked for real.
+CURL="${HERDR_RESOLVE_CURL:-curl}"
+
 # Fast path: nothing outstanding. This is the overwhelmingly common case, and it
 # must stay free — no pane list, no credential, no Slack.
 [ -s "$PENDING" ] || exit 0
@@ -95,14 +106,34 @@ while IFS= read -r line; do
     continue
   fi
 
+  # Bound the deletes per run. chat.delete is rate limited (~1/s sustained) and
+  # this runs from an async hook with a 10s timeout, so a large backlog must
+  # drain across runs instead of being cut off mid-sweep. Everything past the
+  # budget stays queued, untouched.
+  if [ "$done_n" -ge "$MAX" ]; then
+    printf '%s\n' "$line" >> "$keep"; continue
+  fi
+  [ "$done_n" = 0 ] || sleep "$PACE"
+  done_n=$((done_n + 1))
+
   # Answered elsewhere, or unanswerable — retract it.
-  ok=$(printf 'header = "Authorization: Bearer %s"\n' "$SLACK_BOT_TOKEN" \
-    | curl -s -X POST --config - -H 'Content-type: application/json' \
+  resp=$(printf 'header = "Authorization: Bearer %s"\n' "$SLACK_BOT_TOKEN" \
+    | $CURL -s -X POST --config - -H 'Content-type: application/json' \
         --data "$(jq -nc --arg c "$user" --arg ts "$ts" '{channel:$c,ts:$ts}')" \
-        https://slack.com/api/chat.delete 2>/dev/null | jq -r '.ok // false')
-  # If Slack refused (already gone, too old, transient), drop it from the queue
-  # anyway on a definitive error — but keep it if we simply could not reach
-  # Slack, so a network blip does not lose a live question.
+        https://slack.com/api/chat.delete 2>/dev/null)
+  ok=$(printf '%s' "$resp" | jq -r '.ok // false' 2>/dev/null)
+  err=$(printf '%s' "$resp" | jq -r '.error // empty' 2>/dev/null)
+  # Drop it only on a DEFINITIVE answer: deleted, or a refusal that will refuse
+  # again (message_not_found, cant_delete_message, …). Keep it when Slack was
+  # unreachable — and keep it when Slack said "not now": `ratelimited` and the
+  # 5xx-class errors are retryable, and treating them as definitive silently
+  # loses the retraction. Observed live 2026-09-06: sweeping 85 orphans at
+  # ~5/s got the last 2 rate limited, and both were dropped from the queue as
+  # though deleted — they were still sitting in Slack afterwards.
+  case "$err" in
+    ratelimited|internal_error|service_unavailable|fatal_error|request_timeout|accesslimited)
+      printf '%s\n' "$line" >> "$keep"; continue ;;
+  esac
   if [ "$ok" != true ] && [ -z "$ok" ]; then
     printf '%s\n' "$line" >> "$keep"
   fi
