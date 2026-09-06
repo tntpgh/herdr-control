@@ -90,8 +90,12 @@ answer_strategy_for_agent() {           # <agent> -> strategy
 # model_for_agent <agent> <job-class> -> "<model>" or "<model>:<thinking-or-effort>"
 #
 # job-class tiers: plan|architect|review|design (deep) ·
-#                  implement|debug|code (standard) ·
-#                  explore|quick|mechanical|docs (fast)
+#                  implement|debug|code|docs (standard) ·
+#                  explore|quick|mechanical (fast)
+# `docs` moved fast -> standard 2026-09-05: restructuring a governance doc
+# (which rules have incidents behind them) came up Haiku and had to be
+# killed and respawned. Docs work is judgment work; only explore/quick/
+# mechanical are genuinely fast-tier.
 #
 # Claude and omp both fuzzy-match plain aliases (opus/sonnet/haiku) to a
 # current canonical model, so they share the same tier names. Codex has no
@@ -100,27 +104,27 @@ model_for_agent() {
   local a="$1" j="$2"
   case "$a:$j" in
     claude:plan|claude:architect|claude:review|claude:design)   printf 'opus\n' ;;
-    claude:implement|claude:debug|claude:code)                  printf 'sonnet\n' ;;
-    claude:explore|claude:quick|claude:mechanical|claude:docs)   printf 'haiku\n' ;;
+    claude:implement|claude:debug|claude:code|claude:docs)      printf 'sonnet\n' ;;
+    claude:explore|claude:quick|claude:mechanical)               printf 'haiku\n' ;;
     claude:*)                                                   printf 'sonnet\n' ;;
     # omc launches the real claude binary (cli_for_agent below), so it uses
     # claude's model aliases. These rows were MISSING until 2026-09-04:
     # model_for_agent returned empty for omc, and spawn-task.sh then built
     # `claude --model ` — a broken launch that looked routed but wasn't.
     omc:plan|omc:architect|omc:review|omc:design)               printf 'opus\n' ;;
-    omc:implement|omc:debug|omc:code)                           printf 'sonnet\n' ;;
-    omc:explore|omc:quick|omc:mechanical|omc:docs)              printf 'haiku\n' ;;
+    omc:implement|omc:debug|omc:code|omc:docs)                  printf 'sonnet\n' ;;
+    omc:explore|omc:quick|omc:mechanical)                       printf 'haiku\n' ;;
     omc:*)                                                      printf 'sonnet\n' ;;
     codex:plan|codex:architect|codex:review|codex:design)        printf '%s\n' "$HERDR_CODEX_DEEP" ;;
-    codex:implement|codex:debug|codex:code)                      printf '%s\n' "$HERDR_CODEX_STD" ;;
-    codex:explore|codex:quick|codex:mechanical|codex:docs)       printf '%s\n' "$HERDR_CODEX_FAST" ;;
+    codex:implement|codex:debug|codex:code|codex:docs)           printf '%s\n' "$HERDR_CODEX_STD" ;;
+    codex:explore|codex:quick|codex:mechanical)                  printf '%s\n' "$HERDR_CODEX_FAST" ;;
     codex:*)                                                     printf '%s\n' "$HERDR_CODEX_STD" ;;
     # omp's reasoning dial is --thinking (off/minimal/low/medium/high/xhigh/max).
     # Verified 2026-07-31 (`omp --help`, live `omp -p` call): `--model <alias>`
     # fuzzy-matches opus/sonnet/haiku the same as Claude Code.
     omp:plan|omp:architect|omp:review|omp:design)               printf 'opus:high\n' ;;
-    omp:implement|omp:debug|omp:code)                           printf 'sonnet:medium\n' ;;
-    omp:explore|omp:quick|omp:mechanical|omp:docs)              printf 'haiku:low\n' ;;
+    omp:implement|omp:debug|omp:code|omp:docs)                  printf 'sonnet:medium\n' ;;
+    omp:explore|omp:quick|omp:mechanical)                       printf 'haiku:low\n' ;;
     omp:*)                                                      printf 'sonnet:medium\n' ;;
   esac
 }
