@@ -492,11 +492,25 @@ NAV = [("/", "overview"), ("/decisions", "decisions"), ("/loops", "loops"), ("/h
 
 
 def page(title: str, path: str, body: str, refresh: int = 15) -> str:
+    """refresh=0 disables the meta-refresh; the caller supplies its own poller."""
     nav = " ".join(f"<a href='{p}' class='{'on' if p == path else ''}'>{n}</a>" for p, n in NAV)
-    return (f"<!doctype html><html lang=en><head><meta charset=utf-8><meta http-equiv=refresh content={refresh}>"
+    meta = f"<meta http-equiv=refresh content={refresh}>" if refresh else ""
+    label = f"refresh {refresh}s" if refresh else "reloads only on change"
+    return (f"<!doctype html><html lang=en><head><meta charset=utf-8>{meta}"
             f"<title>{_esc(title)}</title><style>{STYLE}</style></head><body>"
-            f"<header><b>hub</b>{nav}<span class=dim style='margin-left:auto'>refresh {refresh}s · "
+            f"<header><b>hub</b>{nav}<span class=dim style='margin-left:auto'>{label} · "
             f"<a href='{path}?json=1'>json</a></span></header><main>{body}</main></body></html>")
+
+
+# Terrence, 2026-09-05: "the form kept refreshing before I could make full
+# decisions." A meta-refresh page tears down the embedded form iframe every
+# tick, losing whatever was half-answered. So /decisions never auto-refreshes;
+# it polls /api/summary and reloads only when the OPEN FORM SET changes (one
+# served, one answered) - the two moments a reload is worth losing nothing for.
+DECISIONS_POLLER = """<script>
+(function(){var key=%s;setInterval(function(){fetch('/api/summary').then(function(r){return r.json()})
+.then(function(s){if(s.open_ids!==key)location.reload()}).catch(function(){})},5000)})();
+</script>"""
 
 
 def task_rows(rows) -> str:
@@ -586,7 +600,9 @@ def render_decisions() -> str:
         + (f"<pre>{_esc(json.dumps(f.get('answers'), indent=1, sort_keys=True))}</pre>" if f.get("answers") else "")
         + f"</td><td class=age>{_age(f.get('answered_at') or f.get('created_at'))}</td></tr>" for f in d["history"])
     body += f"<h2>History</h2><table>{rows or '<tr><td class=dim>none yet</td></tr>'}</table>"
-    return page(f"decisions · {d['open_count']} open", "/decisions", body, refresh=10)
+    key = ",".join(sorted(f["id"] for f in d["open"]))
+    return page(f"decisions · {d['open_count']} open", "/decisions",
+                body + DECISIONS_POLLER % json.dumps(key), refresh=0)
 
 
 def render_search() -> str:
@@ -690,7 +706,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/summary":
             h, f = CACHES["herdr"].get(), CACHES["forms"].get()
             return self._send(200, "application/json", json.dumps(
-                {"attention": len(h.get("attention", [])), "open_decisions": f.get("open_count", 0)}).encode())
+                {"attention": len(h.get("attention", [])), "open_decisions": f.get("open_count", 0),
+                 "open_ids": ",".join(sorted(x["id"] for x in f.get("open", [])))}).encode())
         if path not in PAGES:
             return self._send(404, "text/plain", b"not found")
         render, source = PAGES[path]
