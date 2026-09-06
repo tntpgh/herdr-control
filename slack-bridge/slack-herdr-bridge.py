@@ -115,16 +115,30 @@ SELECT = os.environ.get("HERDR_SELECT_BIN") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "herdr-select.sh")
 
 
-def select_option(pane, choice, via):
+def select_option(pane, choice, via, alert_ts=None, prompt_id=None):
     """Answer a numbered prompt. ONE implementation for both the threaded-number
     route and the buttons, so a choice cannot mean different things depending on
     how it was made. herdr-select validates that the option is actually on offer
-    and records it before pressing anything."""
+    and records it before pressing anything.
+
+    alert_ts identifies WHICH alert was answered. herdr-select stops tracking
+    that one message as pending (the confirmation we post under it must not be
+    deleted by herdr-resolve) and leaves every other queued alert for the same
+    pane tracked, so those still get retracted when their prompt goes away.
+
+    prompt_id is the fingerprint the alert was posted for. Passed through as
+    --expect-prompt-id, herdr-select refuses to press anything if the pane has
+    moved on to a different question — the guarantee an immortal Slack button
+    needs, since herdr reuses pane ids."""
+    argv = ["bash", SELECT, pane, str(choice)]
+    if prompt_id:
+        argv += ["--expect-prompt-id", prompt_id]
+    env = {**os.environ, "HERDR_SELECT_VIA": via}
+    if alert_ts:
+        env["HERDR_SELECT_TS"] = str(alert_ts)
     try:
         r = subprocess.run(
-            ["bash", SELECT, pane, str(choice)],
-            capture_output=True, text=True, timeout=30,
-            env={**os.environ, "HERDR_SELECT_VIA": via},
+            argv, capture_output=True, text=True, timeout=30, env=env,
         )
     except subprocess.TimeoutExpired:
         return False, "herdr-select timed out"
@@ -215,7 +229,8 @@ def on_message(event, say, logger, body):
     # records it) instead of being typed into the composer, where the digit would
     # be text and the Enter after it would accept whatever was highlighted.
     if target and CHOICE_RE.match(raw):
-        ok, info = select_option(target, CHOICE_RE.match(raw).group(1), "slack-reply")
+        ok, info = select_option(target, CHOICE_RE.match(raw).group(1), "slack-reply",
+                                 alert_ts=thread_ts)
         say(text=f"{':white_check_mark:' if ok else ':warning:'} {info}",
             thread_ts=thread_ts or reply_ts)
         return
@@ -260,14 +275,19 @@ def on_choice_button(ack, body, say, logger):
         return
     action = (body.get("actions") or [{}])[0]
     value = action.get("value", "")
-    # value is "<pane>|<n>", written by herdr-notify. Parse defensively: it comes
-    # back from Slack, so treat it as input rather than as something we know.
-    pane, _, choice = value.partition("|")
+    # value is "<pane>|<n>|<prompt_id>", written by herdr-notify. Parse
+    # defensively: it comes back from Slack, so treat it as input rather than as
+    # something we know. Alerts posted before the fingerprint existed carry only
+    # "<pane>|<n>"; those keep the old behaviour (herdr-select still refuses
+    # unless that option is genuinely on offer) rather than being unanswerable.
+    pane, _, rest = value.partition("|")
+    choice, _, prompt_id = rest.partition("|")
     if not pane or not choice.isdigit():
         logger.warning("ignoring button with malformed value %r", value)
         return
-    ok, info = select_option(pane, choice, "slack-button")
     thread_ts = (body.get("message") or {}).get("ts")
+    ok, info = select_option(pane, choice, "slack-button", alert_ts=thread_ts,
+                             prompt_id=prompt_id or None)
     say(text=f"{':white_check_mark:' if ok else ':warning:'} {info}", thread_ts=thread_ts)
 
 

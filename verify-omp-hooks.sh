@@ -25,6 +25,9 @@ export NOTIFIED="$WORK/notified.log"
 # a plain shell variable does not cross that boundary — the redirect would go to
 # /wake.txt and fail silently.
 export WAKE="$WORK/wake.txt"
+# Where the herdr stub records its RPCs. Exported for the same reason WAKE is:
+# the stub runs inside child shells.
+export HERDR_CALLS="$WORK/herdr.calls"
 
 # Belt and braces against a biometric prompt. herdr-notify.sh no longer sources
 # the bridge env on the --dry-run path, but this suite dry-runs it, and a future
@@ -54,6 +57,10 @@ export WPANE WBIRTH CPANE CBIRTH
 # CONDUCTOR and refuse every wake, which would pass for the wrong reason.
 herdr() {
   local sub="$1 $2" pane
+  # Record every RPC when a test asks: "how many pane reads did that cost?" is
+  # a real assertion, because a per-entry RPC inside a budgeted loop turns an
+  # O(MAX) run into an O(queue) one that outlives its hook timeout.
+  [ -n "${HERDR_CALLS:-}" ] && printf '%s\n' "$sub" >> "$HERDR_CALLS"
   case "$sub" in
     "pane process-info")
       printf '{"result":{"process_info":{"foreground_processes":[{"name":"omp","cmdline":"omp --model sonnet"}]}}}\n' ;;
@@ -171,6 +178,241 @@ printf '%s' "$alert_body" | grep -q 'Allow tool: bash' \
   && ok "question names the tool and command" || bad "question wrong: $alert_body"
 printf '%s' "$alert_body" | grep -qE '^[[:space:]]*─+[[:space:]]*$' \
   && bad "a box-drawing rule leaked in as the question" || ok "no TUI furniture as the question"
+
+printf '== the alert LIFECYCLE: an answered alert is retracted, a live one is not ==\n'
+# The failure this pins, observed 2026-09-06: 85 alerts from two overnight
+# workers still sat in Slack the next morning with live Approve/Deny buttons,
+# every one already answered in the terminal (approvals.decided_by='cli') and
+# both panes long closed. herdr-select untracked each alert from pending.jsonl
+# the moment it pressed a key, and herdr-resolve only ever looks at
+# pending.jsonl — so the retraction it exists to perform could never happen.
+LC="$WORK/lifecycle"; mkdir -p "$LC"
+lc_pending() { printf '%s\n' "$@" > "$LC/pending.jsonl"; }
+lc_ts() { jq -r .ts < "$LC/pending.jsonl" | tr '\n' ' '; }
+# Slack message ts values are epoch-seconds.micros, and herdr-resolve gives up
+# on an alert older than HERDR_RESOLVE_MAX_AGE_D — so fixtures must be dated
+# like the real thing or every one of them ages out mid-test.
+NOW=$(date +%s)
+T1="$NOW.1"; T2="$NOW.2"; TG="$NOW.3"; T5="$NOW.5"
+# An alert older than the age cap, for the give-up test further down.
+TOLD=$(( NOW - 30 * 86400 )).9
+A1='{"ts":"'"$T1"'","pane":"'"$WPANE"'"}'
+A2='{"ts":"'"$T2"'","pane":"'"$WPANE"'"}'
+GONE='{"ts":"'"$TG"'","pane":"wZ:p9"}'
+
+omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
+lc_pending "$A1" "$GONE"
+dry="$(HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-resolve.sh" --dry-run 2>&1)"
+printf '%s' "$dry" | grep -q "$T1" \
+  && bad "retracted an alert whose omp menu is still on screen: $dry" \
+  || ok "a live menu-shape prompt keeps its alert"
+printf '%s' "$dry" | grep -q "ts=$TG pane=wZ:p9 (pane gone)" \
+  && ok "an alert for a pane herdr no longer lists is retracted" \
+  || bad "orphaned alert kept forever: $dry"
+[ "$(lc_ts)" = "$T1 $TG " ] \
+  && ok "a dry run reports without rewriting the queue" || bad "dry run mutated pending.jsonl"
+
+clean_screen > "$WORKER_SCREEN"
+dry="$(HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-resolve.sh" --dry-run 2>&1)"
+printf '%s' "$dry" | grep -q "ts=$T1 .* (prompt answered)" \
+  && ok "the prompt going away retracts its alert" || bad "answered alert kept: $dry"
+
+# What Slack ANSWERED decides whether the entry may leave the queue. Provoked
+# for real 2026-09-06: sweeping the 85-alert backlog at ~5/s, the last two
+# deletes came back `ratelimited` and were dropped as though they had
+# succeeded — both messages were still sitting in Slack afterwards.
+CURLSTUB="$WORK/curl-stub.sh"
+cat > "$CURLSTUB" <<'EOS'
+#!/usr/bin/env bash
+cat >/dev/null                      # swallow the --config token on stdin
+printf 'stub\n' >> "$CURL_CALLS"
+# Simulate herdr-notify appending a NEW alert while the sweep is mid-flight:
+# this runs at exactly the moment the real curl would be talking to Slack.
+[ -n "${CURL_APPEND:-}" ] && printf '%s\n' "$CURL_APPEND" >> "$HERDR_BRIDGE_STATE/pending.jsonl"
+printf '%s' "$CURL_REPLY"
+EOS
+chmod +x "$CURLSTUB"
+export CURL_CALLS="$WORK/curl.calls"
+resolve_stubbed() {                 # <reply-json> [max] -> run with a fake Slack
+  : > "$CURL_CALLS"
+  CURL_REPLY="$1" HERDR_RESOLVE_CURL="$CURLSTUB" HERDR_RESOLVE_PACE_S=0 \
+    HERDR_RESOLVE_MAX_PER_RUN="${2:-8}" HERDR_BRIDGE_STATE="$LC" \
+    bash "$here/herdr-resolve.sh" >/dev/null 2>&1
+}
+resolve_stubbed_appending() {       # <reply-json> -> ... and append CURL_APPEND mid-sweep
+  : > "$CURL_CALLS"
+  CURL_REPLY="$1" HERDR_RESOLVE_CURL="$CURLSTUB" HERDR_RESOLVE_PACE_S=0 \
+    HERDR_RESOLVE_MAX_PER_RUN=8 HERDR_BRIDGE_STATE="$LC" CURL_APPEND="${CURL_APPEND:-}" \
+    bash "$here/herdr-resolve.sh" >/dev/null 2>&1
+}
+
+lc_pending "$GONE"
+resolve_stubbed '{"ok":false,"error":"ratelimited"}'
+[ "$(lc_ts)" = "$TG " ] \
+  && ok "a rate-limited delete stays queued (retried next pass)" \
+  || bad "rate-limited retraction dropped: $(lc_ts)"
+
+lc_pending "$GONE"
+resolve_stubbed ''
+[ "$(lc_ts)" = "$TG " ] \
+  && ok "an unreachable Slack stays queued" || bad "lost the alert offline: $(lc_ts)"
+
+lc_pending "$GONE"
+resolve_stubbed '{"ok":false,"error":"message_not_found"}'
+[ -z "$(lc_ts)" ] \
+  && ok "a refusal that will refuse again leaves the queue" \
+  || bad "definitive error kept forever: $(lc_ts)"
+
+lc_pending "$GONE"
+resolve_stubbed '{"ok":true}'
+[ -z "$(lc_ts)" ] && ok "a deleted alert leaves the queue" || bad "deleted alert still queued"
+
+# A hook has ~10s. A backlog must drain across passes, not be cut off mid-sweep.
+lc_pending '{"ts":"'"$NOW"'.901","pane":"wZ:p9"}' '{"ts":"'"$NOW"'.902","pane":"wZ:p9"}' \
+           '{"ts":"'"$NOW"'.903","pane":"wZ:p9"}' '{"ts":"'"$NOW"'.904","pane":"wZ:p9"}'
+resolve_stubbed '{"ok":true}' 2
+[ "$(grep -c stub "$CURL_CALLS")" = 2 ] && [ "$(lc_ts)" = "$NOW.903 $NOW.904 " ] \
+  && ok "the per-run delete budget is honoured and the rest stays queued" \
+  || bad "budget ignored: calls=$(grep -c stub "$CURL_CALLS") left=$(lc_ts)"
+
+# --- the three defects an independent review pass found in the first draft ---
+
+# 1. The retryable list was an ALLOWLIST, so every unlisted `ok:false` dropped
+#    the entry with the message still in Slack. `invalid_auth` is the one that
+#    matters: rotate the bot token with a backlog queued and the hook (which
+#    fires on every tool call in every session) would drain the whole queue in
+#    seconds, leaving armed alerts with no ts->pane record — un-retractable
+#    forever. The rule is now "keep unless the answer is definitive".
+lc_pending "$GONE"
+resolve_stubbed '{"ok":false,"error":"invalid_auth"}'
+[ "$(lc_ts)" = "$TG " ] \
+  && ok "a rejected token keeps the alert queued (re-auth fixes it, dropping does not)" \
+  || bad "auth failure dropped the alert: $(lc_ts)"
+
+# 2. The sweep used to end in `cat snapshot > pending.jsonl`. With paced deletes
+#    that window is seconds long, and herdr-notify appends the moment any worker
+#    hits a prompt — so a live alert arriving mid-sweep was erased, leaving an
+#    armed Slack message with no record. Settling by ts against the LIVE file
+#    makes concurrent appends survive by construction.
+lc_pending "$GONE"
+CURL_APPEND='{"ts":"'"$T5"'","pane":"wZ:p9"}' resolve_stubbed_appending '{"ok":true}'
+printf '%s' "$(lc_ts)" | grep -q "$T5" \
+  && ok "an alert appended mid-sweep survives the sweep" \
+  || bad "concurrent alert erased by the sweep: $(lc_ts)"
+printf '%s' "$(lc_ts)" | grep -q "$TG" \
+  && bad "the settled alert was not removed: $(lc_ts)" \
+  || ok "the settled alert is still removed"
+
+# 3. Two hooks firing together would both snapshot and both delete. All three
+#    writers take one mutex, with a bounded wait — see 4-7 for why the first
+#    draft's non-blocking version was a live defect.
+lc_pending "$GONE"
+mkdir -p "$LC/.pending.lock"
+PENDING_LOCK_WAIT_S=0 resolve_stubbed '{"ok":true}'
+# wc, not `grep -c`: grep exits 1 on zero matches, so a `|| echo 0` fallback
+# emits a SECOND zero and the comparison never matches.
+[ "$(wc -l < "$CURL_CALLS" | tr -d ' ')" = 0 ] && [ "$(lc_ts)" = "$TG " ] \
+  && ok "a second concurrent sweep does nothing while the lock is held" \
+  || bad "lock ignored: calls=$(wc -l < "$CURL_CALLS" | tr -d ' ') left=$(lc_ts)"
+rmdir "$LC/.pending.lock"
+
+# --- and the four the RE-review found in the fix itself ---------------------
+
+# 4. THE defect: herdr-select took the lock non-blocking and skipped its untrack
+#    when the sweep held it, on the theory that "retracted later" is safe. It is
+#    not: that message carries the operator's choice and the bridge's
+#    confirmation. Worse, the collision is caused BY the keypress — the Enter
+#    unblocks the worker, whose next tool call starts a sweep microseconds
+#    later. So the untrack must WAIT for the lock.
+omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
+lc_pending "$A1" "$A2"
+mkdir -p "$LC/.pending.lock"
+( sleep 1; rmdir "$LC/.pending.lock" ) &        # a sweep holding it, then done
+HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS="$T1" \
+  PENDING_LOCK_WAIT_S=5 bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer \
+  >/dev/null 2>&1
+wait
+[ "$(lc_ts)" = "$T2 " ] \
+  && ok "a Slack answer waits for the lock instead of leaving its own message retractable" \
+  || bad "untrack skipped under contention: $(lc_ts)"
+
+# 5. A SIGKILL at the hook timeout leaves the lockdir with no trap to remove it.
+#    Without reclaim that disables retraction permanently and silently.
+lc_pending "$GONE"
+mkdir -p "$LC/.pending.lock"
+touch -t 202001010000 "$LC/.pending.lock"       # ancient => stale
+PENDING_LOCK_STALE_S=60 resolve_stubbed '{"ok":true}'
+[ -z "$(lc_ts)" ] \
+  && ok "a stale lock is reclaimed rather than blocking retraction forever" \
+  || bad "stale lock not reclaimed: $(lc_ts)"
+rmdir "$LC/.pending.lock" 2>/dev/null
+
+# 6. Slack has permanent refusals this cannot enumerate (missing_scope,
+#    compliance_exports_prevent_deletion, ...). Keeping on uncertain is right,
+#    but unbounded: nothing trims this file, and a pinned entry burns the
+#    per-run budget on every pass forever.
+lc_pending '{"ts":"'"$TOLD"'","pane":"wZ:p9"}'
+resolve_stubbed '{"ok":false,"error":"missing_scope"}'
+[ -z "$(lc_ts)" ] \
+  && ok "an alert Slack has refused for weeks is finally given up on" \
+  || bad "queue grows without bound: $(lc_ts)"
+
+# 7. The budget was checked AFTER the per-entry pane RPCs, so a run cost
+#    O(queue) rather than O(MAX) — and a stuck queue then pushed every hook
+#    past the same 10s timeout the lock's safety depends on. One entry
+#    legitimately costs several reads (the explicit probe plus both prompt
+#    parsers), so the property is that the cost tracks the BUDGET: a queue of
+#    three must cost no more than a queue of one at the same budget.
+clean_screen > "$WORKER_SCREEN"
+: > "$HERDR_CALLS"
+lc_pending "$A1"
+resolve_stubbed '{"ok":true}' 1
+one=$(grep -c 'pane read' "$HERDR_CALLS")
+: > "$HERDR_CALLS"
+lc_pending "$A1" "$A2" '{"ts":"'"$NOW"'.7","pane":"'"$WPANE"'"}'
+resolve_stubbed '{"ok":true}' 1
+three=$(grep -c 'pane read' "$HERDR_CALLS")
+[ "$three" = "$one" ] \
+  && ok "per-run RPC cost tracks the delete budget, not the queue length" \
+  || bad "run cost is O(queue): $one pane reads for 1 queued, $three for 3, same budget"
+
+# Answered in the TERMINAL: nothing is posted to Slack, so the alert must stay
+# TRACKED for herdr-resolve to delete. This is the exact line that produced the
+# 85-alert backlog.
+omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
+lc_pending "$A1" "$A2"
+HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer \
+  >/dev/null 2>&1
+[ "$(lc_ts)" = "$T1 $T2 " ] \
+  && ok "a terminal answer leaves the alert tracked for retraction" \
+  || bad "terminal answer orphaned the alert: $(lc_ts)"
+
+# Answered in SLACK: the bridge posts the confirmation under that message, so
+# retracting it would delete the operator's own decision. Untrack THAT alert —
+# and only that one, because a pane can have several queued.
+HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS="$T1" \
+  bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer >/dev/null 2>&1
+[ "$(lc_ts)" = "$T2 " ] \
+  && ok "a Slack answer untracks only the alert that carried it" \
+  || bad "wrong alerts untracked: $(lc_ts)"
+
+# A Slack message is permanent, so its buttons are too. The value must pin the
+# QUESTION, not just the pane: herdr recycles pane ids, and a click on last
+# night's alert would otherwise land on whatever prompt lives there now.
+omp_menu_screen "printf smoke" > "$WORKER_SCREEN"
+want_pid="$(prompt_id "$WPANE")"
+vals="$(HERDR_BRIDGE_STATE="$WORK/nb2" bash "$here/slack-bridge/herdr-notify.sh" \
+  --dry-run --choices --pane "$WPANE" "omp needs your permission" 2>&1 \
+  | sed -n '/--- button values ---/,$p')"
+printf '%s' "$vals" | grep -qxF "$WPANE|1|$want_pid" \
+  && ok "button value pins pane, option AND prompt fingerprint" \
+  || bad "button value cannot survive pane reuse: $vals"
+: > "$SENT"
+bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer \
+  --expect-prompt-id "deadbeef-not-this-question" >/dev/null 2>&1; rc=$?
+[ "$rc" != 0 ] && [ ! -s "$SENT" ] \
+  && ok "a click for a different question presses nothing" \
+  || bad "stale fingerprint answered the wrong prompt (rc=$rc sent=$(cat "$SENT"))"
 
 run_notify() {                          # <tool> -> runs omp-notify.sh
   printf '{"tool":"%s","message":"omp needs permission","cwd":"/tmp/repo"}' "$1" \
@@ -403,7 +645,7 @@ console.log("EVENTS:" + Object.keys(handlers).sort().join(","));
 const tc = handlers["tool_call"]({ toolName: "bash", input: { command: "rm -rf /tmp/x" } });
 console.log("TOOLCALL_RETURN:" + (tc === undefined ? "undefined" : JSON.stringify(tc)));
 const bas = handlers["before_agent_start"]({});
-console.log("INJECTED:" + (bas && bas.message ? "yes" : "no"));
+console.log("INJECTED:" + (bas && bas.message ? bas.message.content : "none"));
 handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
 handlers["agent_end"]({});
 await new Promise(r => setTimeout(r, 600));
@@ -414,20 +656,30 @@ await new Promise(r => setTimeout(r, 600));
   # agent's tool call in omp, so this must return undefined on every path.
   printf '%s' "$shim_out" | grep -q 'TOOLCALL_RETURN:undefined' \
     && ok "tool_call returns undefined (never blocks the agent)" || bad "tool_call returned non-undefined"
-  printf '%s' "$shim_out" | grep -q 'INJECTED:yes' \
-    && ok "before_agent_start injects the reconciliation report" || bad "nothing injected"
+  # #37 moved the reconciliation report to the hub page and left AT MOST a
+  # one-line hub summary in the prompt; 0fbece0's report-injection contract is
+  # gone. What must hold now is that nothing else leaks into context — a raw
+  # envelope or a 20-line report in the first turn is the failure.
+  printf '%s' "$shim_out" | grep -qE 'INJECTED:(none|hub: )' \
+    && ok "the first turn gets a hub one-liner at most, never the report" \
+    || bad "reconcile output leaked into context: $shim_out"
   grep -q '"tool":"bash"' "$REC.notify" \
     && ok "omp-notify.sh received the documented stdin JSON" || bad "notify stdin wrong: $(cat "$REC.notify" 2>/dev/null)"
   grep -q 'RECONCILE mode=session'  "$REC" && ok "session reconcile invoked"  || bad "no session reconcile"
   grep -q 'RECONCILE mode=interval' "$REC" && ok "interval reconcile invoked" || bad "no interval reconcile"
   grep -q 'RESOLVE' "$REC" && ok "alert retraction invoked" || bad "no retraction"
 
-  printf '== TS shim: envelope reports are DELIVERED (sendMessage) then ACKED ==\n'
-  # The regression this pins: the old shim spawned the interval pass with
-  # stdout ignored while the script checkpointed the report as delivered —
-  # every mid-session report was consumed unseen. Now the interval report
-  # must reach pi.sendMessage, and the ack must carry the whole envelope
-  # back; a fake pi with no sendMessage must produce NO ack (redelivery).
+  printf '== TS shim: every envelope is ACKED, and no report enters the prompt ==\n'
+  # History matters here, because these assertions were pointed the wrong way
+  # for two releases. 0fbece0 delivered the report through pi.sendMessage and
+  # acked only on delivery; #37 moved reports to the hub page and left at most
+  # a one-line hub summary in the prompt, deleting sendMessage entirely. The
+  # tests kept asserting the deleted design and failed on main from then on —
+  # a red suite nobody could act on. The contract that IS current:
+  #   * the reconcile report NEVER reaches the conversation, session or interval
+  #   * both envelopes are still acked exactly once, carried back verbatim, so
+  #     the registry cursor advances and the page picks the history up
+  #   * acking no longer depends on a delivery channel that no longer exists
   SHIM2="$WORK/shim2"; mkdir -p "$SHIM2/agent-hooks"
   cat > "$SHIM2/agent-hooks/omp-notify.sh" <<'EOS'
 #!/usr/bin/env bash
@@ -459,17 +711,22 @@ handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
 await new Promise(r => setTimeout(r, 800));
 console.log("SENT:" + sent.length + ":" + (sent[0] ? sent[0].content : ""));
 ' 2>&1)"
-  printf '%s' "$shim2_out" | grep -q 'SESSION_INJECT:wake-persistence: session hello' \
-    && ok "session envelope report injected (not raw JSON)" || bad "session inject: $shim2_out"
-  printf '%s' "$shim2_out" | grep -q 'SENT:1:wake-persistence: deferred hello' \
-    && ok "interval report delivered through pi.sendMessage" || bad "sendMessage never saw the report: $shim2_out"
+  printf '%s' "$shim2_out" | grep -q 'SESSION_INJECT:wake-persistence' \
+    && bad "the session report was injected into the prompt: $shim2_out" \
+    || ok "session report stays out of the prompt"
+  printf '%s' "$shim2_out" | grep -q 'SESSION_INJECT:{' \
+    && bad "raw envelope JSON injected: $shim2_out" || ok "no raw envelope in context"
+  printf '%s' "$shim2_out" | grep -q 'SENT:0:' \
+    && ok "the interval report is not pushed into the conversation" \
+    || bad "mid-session report reached the agent: $shim2_out"
   ack_n=$(grep -c 'ACK' "$REC2" 2>/dev/null || true)
   [ "${ack_n:-0}" = "2" ] && ok "both envelopes acked exactly once each" || bad "ack count: ${ack_n:-0} ($(cat "$REC2" 2>/dev/null))"
   grep -q '"last_event_seq":9' "$REC2.ack" && grep -q '"last_event_seq":4' "$REC2.ack" \
     && ok "acks carry the original envelopes back verbatim" || bad "ack stdin: $(cat "$REC2.ack" 2>/dev/null)"
 
-  # No sendMessage available -> the report CANNOT be delivered -> no ack may
-  # be recorded, so the next pass redelivers instead of losing it.
+  # No sendMessage on the API at all: the ack must still happen. Under the old
+  # design this was the redelivery guard; under #37 there is nothing to deliver,
+  # and withholding the ack here would replay the same envelope forever.
   : > "$REC2"; : > "$REC2.ack"
   HERDR_CONTROL_DIR="$SHIM2" bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
@@ -479,7 +736,11 @@ handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
 await new Promise(r => setTimeout(r, 800));
 ' >/dev/null 2>&1
   grep -q 'ACK' "$REC2" \
-    && bad "acked an interval report that was never delivered" || ok "undeliverable report left unacked (will replay)"
+    && ok "the interval envelope is acked without any delivery channel" \
+    || bad "envelope left unacked — it will replay forever: $(cat "$REC2" 2>/dev/null)"
+  grep -q '"last_event_seq":9' "$REC2.ack" \
+    && ok "that ack still carries the envelope verbatim" \
+    || bad "ack stdin: $(cat "$REC2.ack" 2>/dev/null)"
 fi
 
 printf '\n%s\n' "-----"

@@ -426,17 +426,58 @@ fi
 approval_confirmed "$approval_id" "pressed" \
   "mechanism=$mechanism choice=$choice" >/dev/null 2>&1 || true
 
-# Answered HERE, so stop tracking it as pending. herdr-resolve retracts alerts
-# whose prompt has vanished — correct when you answered in the terminal, wrong
-# when you answered in Slack: it would delete the very message carrying your
-# choice and the confirmation under it. Untrack, and the record stays.
-pending="$log_dir/pending.jsonl"
-if [ -s "$pending" ]; then
-  tmp=$(mktemp "${TMPDIR:-/tmp}/herdr-pending.XXXXXX") && {
-    jq -c --arg p "$pane" 'select(.pane != $p)' < "$pending" > "$tmp" 2>/dev/null \
-      && cat "$tmp" > "$pending"
-    rm -f "$tmp"
-  }
-fi
+# Stop tracking the alert as pending ONLY when the answer came from Slack. That
+# is the case the untrack exists for: the message carrying your choice also
+# carries the confirmation the bridge posts under it, so herdr-resolve deleting
+# it would erase your own decision.
+#
+# Answered in the TERMINAL (cli/conductor/peer), nothing is posted to Slack — so
+# the alert sits there with live buttons, looking pending, forever. Untracking it
+# was what made that permanent: herdr-resolve only ever looks at pending.jsonl.
+# Observed 2026-09-06: 85 alerts from two overnight workers, every one already
+# answered via this script (approvals.decided_by='cli'), still armed in Slack the
+# next morning. Leave them TRACKED and herdr-resolve retracts each one on its
+# next pass — which is exactly the lie-prevention it was written for.
+#
+# Scope the untrack to the answered message when the caller told us which one
+# (the bridge passes the alert's ts). A pane can have several alerts queued; a
+# pane-wide drop disarmed the answered one and orphaned the rest.
+case "${HERDR_SELECT_VIA:-cli}" in slack-*)
+  pending="$log_dir/pending.jsonl"
+  if [ -s "$pending" ]; then
+    # WAIT for the mutex; never skip. The first draft took it non-blocking and
+    # called skipping "safe because the alert gets retracted later" — but for a
+    # Slack-answered alert, retracted later IS the failure: that message carries
+    # the operator's choice and the bridge threads its confirmation under it.
+    #
+    # And the collision is CAUSED by this keypress, not coincidental: the Enter
+    # sent above unblocks the worker, the worker's very next tool call fires its
+    # PostToolUse hook, that hook starts a sweep and takes this lock — all within
+    # milliseconds of arriving here. So the non-blocking version lost the race
+    # routinely and the next sweep deleted the decision. Any other session's
+    # tool call does it too.
+    #
+    # Waiting costs nothing: the keystroke has already landed.
+    . "$(cd "$(dirname "$0")" && pwd)/lib/pending-queue.sh"
+    lockdir="$log_dir/.pending.lock"
+    if pending_lock "$lockdir"; then
+      trap 'pending_unlock "$lockdir"' EXIT HUP INT TERM
+      if [ -n "${HERDR_SELECT_TS:-}" ]; then
+        pending_drop "$pending" ts "$HERDR_SELECT_TS" \
+          || echo "herdr-select: could not untrack alert ts=$HERDR_SELECT_TS — the next sweep may retract the message carrying this choice" >&2
+      else
+        pending_drop "$pending" pane "$pane" \
+          || echo "herdr-select: could not untrack alerts for $pane" >&2
+      fi
+      pending_unlock "$lockdir"
+      trap - EXIT HUP INT TERM
+    else
+      # Bounded wait exhausted. Say so: this is the one case where the operator's
+      # own message can still be retracted, and it must not be silent.
+      echo "herdr-select: pending queue locked for ${PENDING_LOCK_WAIT_S}s — alert not untracked;" \
+           "a sweep may delete the Slack message carrying this decision" >&2
+    fi
+  fi
+;; esac
 
 echo "selected $choice ($label) in $pane via $mechanism"

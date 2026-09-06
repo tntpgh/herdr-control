@@ -148,6 +148,13 @@ _dry_report() {
   echo "dry-run: pane=${pane:-none}${blocks:+ (with buttons)}"
   echo "--- message body ---"
   printf '%s\n' "$body"
+  # What a click would actually do. The value is the whole contract between an
+  # immortal Slack message and herdr-select: target pane, option, and the
+  # fingerprint of the question it was posted for.
+  if [ -n "$blocks" ]; then
+    echo "--- button values ---"
+    printf '%s' "$blocks" | jq -r '.[] | select(.type=="actions") | .elements[].value'
+  fi
   exit 0
 }
 
@@ -200,11 +207,26 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
   # operator nor Slack ever needs to know which mechanism is being driven.
   opts=""
   mech=""
+  pid=""
   for _ in 1 2 3 4 5 6 7 8; do
     opts=$(prompt_options "$pane");     [ -n "$opts" ] && { mech=numbered; break; }
     opts=$(prompt_menu_options "$pane"); [ -n "$opts" ] && { mech=menu; break; }
     sleep 0.25
   done
+  # Fingerprint the prompt that produced THESE options, taken here rather than
+  # after the body is built. prompt_id has no failure mode: with the prompt gone
+  # it hashes two empty strings and returns the sha256 of a lone newline
+  # (observed constant below). Shipping that as a button value posts buttons
+  # that render as actionable but are refused on every click by herdr-select's
+  # --expect-prompt-id check, which is worse than no fingerprint at all.
+  [ -n "$opts" ] && pid=$(prompt_id "$pane")
+  _EMPTY_PROMPT_ID=01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+  if [ "$pid" = "$_EMPTY_PROMPT_ID" ]; then
+    # The prompt vanished between the poll and this read. Fall back to the
+    # two-field value: herdr-select still refuses unless the option is really on
+    # offer, so the click is guarded, just not pinned to this exact question.
+    pid=""
+  fi
   if [ -n "$opts" ]; then
     # The question extractor must MATCH the parser that produced the options.
     # prompt_question finds "the last non-empty line above the first numbered
@@ -223,14 +245,20 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
     body="$(_hdr)"
     [ -n "$question" ] && body="${body}"$'\n\n'"${question}"
     body="${body}"$'\n'"${list}"$'\n'"_Reply in thread with ${nums}._"
-    blocks=$(printf '%s\n' "$opts" | jq -R -s --arg body "$body" --arg pane "$pane" '
+    # The button value carries the prompt FINGERPRINT as well as the target, so
+    # a click can only ever answer the question the button was posted for. A
+    # Slack message is permanent: without this, a button from a closed pane
+    # stays armed forever and a click lands on whatever prompt occupies that
+    # pane id next (herdr recycles them). herdr-select refuses on a mismatch.
+    blocks=$(printf '%s\n' "$opts" | jq -R -s --arg body "$body" --arg pane "$pane" \
+      --arg pid "$pid" '
       [ split("\n")[] | select(length>0) | split("\t") | {num:.[0], label:.[1]} ] as $o
       | [ {type:"section", text:{type:"mrkdwn", text:$body}},
           {type:"actions",
            elements: ($o | map({
              type:"button",
              text:{type:"plain_text", text:("\(.num). " + (.label|.[0:70]))},
-             value:($pane + "|" + .num),
+             value:($pane + "|" + .num + (if $pid == "" then "" else "|" + $pid end)),
              action_id:("herdr_choice_" + .num)}))} ]')
   else
     # No numbered list to parse — but "Claude needs your permission to use Bash"
@@ -283,8 +311,20 @@ if [ -n "$pane" ]; then
   # If you then answer in the terminal, herdr-resolve.sh retracts this message
   # so it does not sit in Slack looking pending. Informational alerts carry no
   # question, so they are never tracked and never deleted.
-  [ -n "$blocks" ] && jq -nc --arg ts "$ts" --arg pane "$pane" \
-    '{ts:$ts,pane:$pane}' >> "$reg_dir/pending.jsonl"
+  #
+  # Under the same mutex the sweep and herdr-select use: this is the only
+  # APPENDER, and herdr-resolve's settle() does a jq-read then rename, so an
+  # append landing inside that window would be dropped — an armed Slack message
+  # with no record, which is precisely the un-retractable state this queue
+  # exists to prevent. If the wait is exhausted, append anyway and say so: a
+  # possibly-lost record beats never recording a live question at all.
+  if [ -n "$blocks" ]; then
+    . "$_lib/pending-queue.sh"
+    _pl="$reg_dir/.pending.lock"
+    pending_lock "$_pl" || echo "herdr-notify: pending queue locked; appending unserialised" >&2
+    jq -nc --arg ts "$ts" --arg pane "$pane" '{ts:$ts,pane:$pane}' >> "$reg_dir/pending.jsonl"
+    pending_unlock "$_pl"
+  fi
   # Keep the registry bounded (last 500 alerts).
   if [ "$(wc -l < "$reg" 2>/dev/null || echo 0)" -gt 600 ]; then
     tail -n 500 "$reg" > "$reg.tmp" && mv "$reg.tmp" "$reg"
