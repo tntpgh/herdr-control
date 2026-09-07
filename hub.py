@@ -11,7 +11,7 @@ the two things that need a human — attention items and open decisions.
   /herdr       run-registry view: needs-attention, recent events, conductor cursors
   /decisions   inbox: open formserve forms rendered inline, answered ones with answers
   /search      consensus-search memory: totals, last queries, replay counts
-  /kb          knowledge-base: last nightly runs + steps, fleet heartbeat snapshot
+  /kb          knowledge-base: nightly ledger, heartbeat, repeat-view signal audits
   /links       every surface with a liveness dot
   /api/summary {attention, open_decisions} — what the omp extension's one-liner reads
   any page     ?json=1 → the page's data as JSON
@@ -19,10 +19,10 @@ the two things that need a human — attention items and open decisions.
 Sources (all read-only): ~/.local/state/herdr/runs/registry.sqlite3 (herdr),
 ~/.local/state/herdr/forms/*.json (formserve registry), consensus-search
 GET /log (bearer SEARCH_SYNC_TOKEN), knowledge-base's own venv + kb-deploy
-checkout for kb.nightly_runs/steps and server.heartbeat.latest_snapshot()
-(NEON_CONNECTION_STRING, default_transaction_read_only=on). Secrets come
-from the environment or, pre-resolved, from ~/.config/op/service-account.env
-— never from an `op` subprocess (see secret()). Loopback only,
+checkout for kb.nightly_runs/steps, server.heartbeat.latest_snapshot(), and
+server.signal_quality.recent_runs() (NEON_CONNECTION_STRING, read-only).
+Secrets come from the environment or ~/.config/op/launchd-secrets.env
+— never from an `op` subprocess or shell evaluation (see secret()). Loopback only,
 no auth — same posture as formserve. Idempotent to start: a second copy sees
 the port taken and exits 0.
 """
@@ -34,6 +34,7 @@ import concurrent.futures as cf
 import datetime as dt
 import html
 import json
+import math
 import os
 import re
 import socket
@@ -46,6 +47,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from uuid import UUID
 from pathlib import Path
 
 DEFAULT_PORT = int(os.environ.get("HERDR_HUB_PORT", "8600"))
@@ -55,7 +57,9 @@ FORMS_DIR = STATE / "forms"
 KB_DEPLOY = Path(os.environ.get("KB_DEPLOY", Path.home() / "Code/kb-deploy"))
 KB_PYTHON = Path(os.environ.get("KB_PYTHON", Path.home() / "Code/knowledge-base/.venv/bin/python3"))
 SEARCH_URL = os.environ.get("CONSENSUS_SEARCH_URL", "https://consensus.teamthurber.com")
-OP_ENV = Path.home() / ".config/op/service-account.env"
+LAUNCHD_SECRETS = Path(os.environ.get("HERDR_HUB_SECRETS_ENV", Path.home() / ".config/op/launchd-secrets.env"))
+SECRET_NAMES = frozenset(("NEON_CONNECTION_STRING", "SEARCH_SYNC_TOKEN"))
+KB_DASHBOARD_URL = os.environ.get("KB_DASHBOARD_URL", "https://dashboard.teamthurber.com")
 ATTENTION = ("input_required", "blocked", "running")
 
 # Every surface the team runs, hosted and local. `probe` is what "alive" means
@@ -63,7 +67,7 @@ ATTENTION = ("input_required", "blocked", "running")
 SURFACES = [
     ("consensus·search", SEARCH_URL + "/", "GET", "search"),
     ("tourguide (apps)", "https://apps.teamthurber.com/health", "GET", "tourguide"),
-    ("teamthurber.com", "https://teamthurber.com/", "HEAD", "tntpgh"),
+    ("teamthurber.com", "https://teamthurber.com/", "HEAD", "tntpgh_actions"),
     ("thurber-ai portal", "https://tunnel.teamthurber.com/", "HEAD", "thurber_ai"),
     ("knowledge-base (Fly)", "https://thurber-kb.fly.dev/healthz", "GET", "kb"),
     ("vintageskins.com (BigCommerce)", "https://vintageskins.com/", "HEAD", None),
@@ -85,8 +89,8 @@ class Cached:
             if time.monotonic() - self.at > self.ttl:
                 try:
                     self.val = self.fn()
-                except Exception as e:  # a dead source is a card that says so, never a dead hub
-                    self.val = {"error": f"{type(e).__name__}: {e}"}
+                except Exception:  # failed readers must not leak credentials through exception text
+                    self.val = {"error": "source reader unavailable"}
                 self.at = time.monotonic()
             return self.val
 
@@ -154,25 +158,33 @@ def forms_data() -> dict:
 
 
 # ── secrets: pre-resolved, never `op` from a background process ───────────────
-# ~/.config/op/service-account.env documents the rule: `op` probes TCC on every
-# invocation from a launchd/background session and raises a system prompt
-# nobody is there to answer (1Password/shell-plugins#606), so long-running
-# jobs read PRE-RESOLVED values from that file instead — the same escape
-# hatch lib/engineering-ledger.sh uses. Refresh a line from an interactive
-# shell when a secret rotates.
+# Only the hub's two service credentials may be resolved. This is the existing
+# literal assignment parser, not a shell: no expansion, sourcing, or op calls.
+# The service-account file contains the broker token, not these service secrets.
 def secret(name: str) -> str | None:
+    if name not in SECRET_NAMES:
+        raise ValueError("unsupported hub credential name")
     v = os.environ.get(name)
     if v:
         return v
-    if not OP_ENV.exists():
+    try:
+        lines = LAUNCHD_SECRETS.read_text().splitlines()
+    except FileNotFoundError:
         return None
-    for line in OP_ENV.read_text().splitlines():
+    except (OSError, UnicodeError):
+        raise ValueError("hub service credential file unavailable") from None
+    for line in lines:
         line = line.strip()
         if line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.removeprefix("export ").partition("=")
         if key.strip() == name:
-            return val.strip().strip("'\"") or None
+            val = val.strip()
+            if val.startswith(("'", '"')):
+                if len(val) < 2 or val[-1] != val[0]:
+                    raise ValueError("invalid hub service credential assignment")
+                val = val[1:-1]
+            return val or None
     return None
 
 
@@ -180,7 +192,7 @@ def secret(name: str) -> str | None:
 def search_data() -> dict:
     token = secret("SEARCH_SYNC_TOKEN")
     if not token:
-        return {"error": f"SEARCH_SYNC_TOKEN not set and not in {OP_ENV} — resolve it there from an interactive shell", "rows": []}
+        return {"error": "SEARCH_SYNC_TOKEN unavailable; check the hub environment or scoped launchd credential file", "rows": []}
     rows, since = [], 0
     for _ in range(50):  # 50 × 500 rows is far beyond today's table; a hard stop, not a limit
         req = urllib.request.Request(
@@ -214,45 +226,229 @@ import json, sys, datetime
 sys.path.insert(0, ".")
 out = {}
 try:
-    from server import heartbeat
-    out["heartbeat"] = heartbeat.latest_snapshot()
-except Exception as e:
-    out["heartbeat_error"] = f"{type(e).__name__}: {e}"
-try:
     import psycopg, os
     with psycopg.connect(os.environ["NEON_CONNECTION_STRING"], options="-c default_transaction_read_only=on") as c:
-        runs = c.execute("SELECT run_id, host, weekday, git_sha, status, started_at, finished_at, total_steps "
-                         "FROM kb.nightly_runs ORDER BY started_at DESC LIMIT 5").fetchall()
-        cols = ["run_id","host","weekday","git_sha","status","started_at","finished_at","total_steps"]
-        out["runs"] = [dict(zip(cols, r)) for r in runs]
-        if runs:
-            steps = c.execute("SELECT step_label, status, attempts, duration_s, error_class, error_message "
-                              "FROM kb.nightly_steps WHERE run_id=%s ORDER BY ctid", (runs[0][0],)).fetchall()
-            out["steps"] = [dict(zip(["step_label","status","attempts","duration_s","error_class","error_message"], s)) for s in steps]
-except Exception as e:
-    out["ledger_error"] = f"{type(e).__name__}: {e}"
+        try:
+            with c.transaction():
+                row = c.execute("SELECT payload FROM kb.heartbeat_snapshots ORDER BY generated_at DESC LIMIT 1").fetchone()
+                payload = row[0] if row else None
+                out["heartbeat"] = json.loads(payload) if isinstance(payload, str) else payload
+        except Exception:
+            out["heartbeat_error"] = "heartbeat reader unavailable"
+        try:
+            with c.transaction():
+                runs = c.execute("SELECT run_id, host, weekday, git_sha, status, started_at, finished_at, total_steps "
+                                 "FROM kb.nightly_runs ORDER BY started_at DESC LIMIT 5").fetchall()
+                cols = ["run_id","host","weekday","git_sha","status","started_at","finished_at","total_steps"]
+                out["runs"] = [dict(zip(cols, r)) for r in runs]
+                if runs:
+                    steps = c.execute("SELECT step_label, status, attempts, duration_s, error_class "
+                                      "FROM kb.nightly_steps WHERE run_id=%s ORDER BY ctid", (runs[0][0],)).fetchall()
+                    out["steps"] = [dict(zip(["step_label","status","attempts","duration_s","error_class"], s)) for s in steps]
+        except Exception:
+            out.pop("runs", None)
+            out.pop("steps", None)
+            out["ledger_error"] = "nightly ledger reader unavailable"
+        try:
+            with c.transaction():
+                from server.signal_quality import recent_runs
+                out["signal_quality_runs"] = recent_runs(c, limit=10)
+        except Exception:
+            out["signal_quality_error"] = "signal quality reader unavailable; check KB module, migration, and database access"
+except Exception:
+    out["heartbeat_error"] = "heartbeat database unavailable"
+    out["ledger_error"] = "nightly ledger database unavailable"
+    out["signal_quality_error"] = "signal quality database unavailable"
 print(json.dumps(out, default=str))
 """
 
 
+SIGNAL_SUMMARY_FIELDS = (
+    "window_days", "person_count", "before_count", "after_count", "changed_count",
+    "repeat_before_count", "repeat_after_count", "withheld_stale_count",
+    "withheld_unknown_date_count", "violation_count",
+)
+
+
+def _public_signal_runs(rows) -> list[dict]:
+    """Allow only typed audit metadata and aggregate counters onto localhost."""
+    if not isinstance(rows, list):
+        raise ValueError("invalid signal quality response")
+    result = []
+    for row in rows[:10]:
+        if not isinstance(row, dict) or row.get("status") not in ("running", "ok", "degraded", "failed"):
+            raise ValueError("invalid signal quality run")
+        if not isinstance(row.get("run_id"), str):
+            raise ValueError("invalid audit run identifier")
+        run_id = str(UUID(row["run_id"]))
+        dates = {}
+        for key in ("started_at", "finished_at"):
+            value = row.get(key)
+            if value is None and key == "finished_at":
+                dates[key] = None
+                continue
+            if not isinstance(value, str):
+                raise ValueError("invalid audit timestamp")
+            date = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if date.tzinfo is None:
+                raise ValueError("audit timestamp requires timezone")
+            dates[key] = date.astimezone(dt.timezone.utc).isoformat()
+        rule = row.get("rule_version")
+        if not isinstance(rule, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,95}", rule):
+            raise ValueError("invalid audit rule version")
+        revision = row.get("source_revision")
+        if revision is not None and (not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{7,64}", revision)):
+            revision = None
+        summary = row.get("summary")
+        if not isinstance(summary, dict):
+            raise ValueError("invalid audit summary")
+        counts = {}
+        for key in SIGNAL_SUMMARY_FIELDS:
+            value = summary.get(key)
+            # A running/failed audit can lack counters; never substitute fake zeros.
+            if value is None and row["status"] in ("running", "failed"):
+                continue
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError("invalid audit counter")
+            counts[key] = value
+        # Raw error strings (including SQL/PII) have no place on this surface.
+        result.append({"run_id": run_id, **dates, "status": row["status"],
+                       "rule_version": rule, "source_revision": revision, "summary": counts,
+                       "error_code": "audit_failed" if row.get("error_code") else None})
+    return result
+
+
+def _signal_quality_link() -> str | None:
+    """Configured human-auth page only; no credentials/query/fragment in links."""
+    value = KB_DASHBOARD_URL
+    try:
+        url = urllib.parse.urlsplit(value)
+        if (url.scheme not in ("https", "http") or not url.hostname or url.username or url.password
+                or url.query or url.fragment or url.hostname not in ("dashboard.teamthurber.com", "localhost", "127.0.0.1")
+                or (url.scheme == "http" and url.hostname == "dashboard.teamthurber.com")
+                or url.path not in ("", "/")):
+            return None
+        url.port  # reject malformed ports
+    except ValueError:
+        return None
+    return value.rstrip("/") + "/signal-quality"
+
+
+# Heartbeat: the persisted snapshot carries raw checker exception text, subprocess
+# stderr and whole non-OK HTTP response bodies in systems.*.detail (SQ-SEC-04),
+# so this unauthenticated surface republishes NOTHING from the payload except the
+# checker names KB itself defines, its fixed status vocabulary, and counts derived
+# from those — no detail strings, no unknown keys, no producer-supplied numbers.
+# Names are server.heartbeat._CHECKERS; a key KB does not define is counted, never
+# echoed, because an arbitrary key may itself be secret-bearing.
+HEARTBEAT_SYSTEMS = frozenset(("kb", "tourguide", "tntpgh_actions", "idx_poller",
+                               "syncworks", "thurber_ai", "imagen", "search"))
+HEARTBEAT_UNHEALTHY = ("degraded", "unreachable")
+# status -> the only diagnostic string allowed out of this projection
+HEARTBEAT_CODES = {"healthy": "check_ok", "degraded": "check_degraded",
+                   "unreachable": "check_unreachable", "unknown": "check_not_observed"}
+
+
+def _public_heartbeat(payload) -> dict:
+    """Project a snapshot into typed names/statuses/counts and fixed codes.
+
+    Raises ValueError for any shape that cannot be summarized honestly: an
+    invalid payload must read unavailable, never healthy-by-default.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("invalid heartbeat payload")
+    generated = payload.get("generated_at")
+    if not isinstance(generated, str):
+        raise ValueError("invalid heartbeat timestamp")
+    when = dt.datetime.fromisoformat(generated.replace("Z", "+00:00"))
+    if when.tzinfo is None:
+        raise ValueError("heartbeat timestamp requires timezone")
+    raw = payload.get("systems")
+    if not isinstance(raw, dict):
+        raise ValueError("invalid heartbeat systems")
+    systems, unrecognized = {}, 0
+    for name, value in raw.items():
+        if not isinstance(name, str) or name not in HEARTBEAT_SYSTEMS:
+            unrecognized += 1
+            continue
+        status = value.get("status") if isinstance(value, dict) else None
+        status = status if status in HEARTBEAT_CODES else "unknown"
+        systems[name] = {"status": status, "code": HEARTBEAT_CODES[status]}
+    if not systems:
+        raise ValueError("heartbeat reported no known system")
+    healthy = sorted(n for n, v in systems.items() if v["status"] == "healthy")
+    unhealthy = sorted(n for n, v in systems.items() if v["status"] in HEARTBEAT_UNHEALTHY)
+    return {"generated_at": when.astimezone(dt.timezone.utc).isoformat(),
+            "systems": dict(sorted(systems.items())),
+            "healthy_count": len(healthy), "checked_count": len(healthy) + len(unhealthy),
+            "total_count": len(systems), "unrecognized_count": unrecognized,
+            "unhealthy": unhealthy, "divergent": bool(healthy) and bool(unhealthy)}
+
+
+def _kb_unavailable(reason: str) -> dict:
+    return {"error": reason, "signal_quality_error": "signal quality reader unavailable"}
+
+
 def kb_data() -> dict:
     if not (KB_DEPLOY / "server").is_dir() or not KB_PYTHON.exists():
-        return {"error": f"kb-deploy checkout or venv missing ({KB_DEPLOY}, {KB_PYTHON})"}
-    dsn = secret("NEON_CONNECTION_STRING")
+        return _kb_unavailable("kb-deploy checkout or venv missing")
+    try:
+        dsn = secret("NEON_CONNECTION_STRING")
+    except ValueError:
+        return _kb_unavailable("KB credential configuration unavailable")
     if not dsn:
-        return {"error": f"NEON_CONNECTION_STRING not set and not in {OP_ENV}"}
-    env = dict(os.environ, NEON_CONNECTION_STRING=dsn)
+        return _kb_unavailable("NEON_CONNECTION_STRING unavailable; check the hub environment or scoped launchd credential file")
+    # Do not pass broker/Slack/search credentials or Python startup overrides.
+    env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
+    env.update(NEON_CONNECTION_STRING=dsn, PGOPTIONS="-c default_transaction_read_only=on")
     try:
         r = subprocess.run([str(KB_PYTHON), "-c", _KB_SNIPPET], cwd=KB_DEPLOY, env=env,
                            capture_output=True, text=True, timeout=40)
     except subprocess.TimeoutExpired:
-        return {"error": "kb reader timed out (40s)"}
+        return _kb_unavailable("kb reader timed out (40s)")
+    except OSError:
+        return _kb_unavailable("kb reader could not start")
     if r.returncode != 0:
-        return {"error": f"kb reader exit {r.returncode}: {r.stderr.strip()[-300:]}"}
+        return _kb_unavailable(f"kb reader exit {r.returncode}; database observation unavailable")
     try:
-        return json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return {"error": f"kb reader printed non-JSON: {r.stdout[:200]}"}
+        data = json.loads(r.stdout)
+    except (json.JSONDecodeError, UnicodeError):
+        return _kb_unavailable("kb reader returned invalid JSON")
+    if not isinstance(data, dict):
+        return _kb_unavailable("kb reader returned invalid data")
+    for run in data.get("runs") or []:
+        run["status"] = _nightly_status(run)
+    # Only the producer's fixed diagnostic categories may cross this boundary.
+    # A credential can look like a short token too; shape alone is not redaction.
+    for step in data.get("steps") or []:
+        cls = step.get("error_class")
+        if cls not in (None, "transient", "structural", "unknown"):
+            step["error_class"] = "error_class_withheld"
+    # Errors are fixed local messages, not exception text from the child.
+    for key in ("heartbeat_error", "ledger_error", "signal_quality_error", "error"):
+        if key in data:
+            data[key] = "KB reader unavailable" if key == "error" else key.removesuffix("_error").replace("_", " ") + " reader unavailable"
+    if "heartbeat_error" in data:
+        data.pop("heartbeat", None)
+    elif "heartbeat" not in data:
+        data["heartbeat_error"] = "heartbeat reader unavailable"
+    elif data["heartbeat"] is not None:  # None = no snapshot recorded yet, which is truthful
+        try:
+            data["heartbeat"] = _public_heartbeat(data["heartbeat"])
+        except (ValueError, TypeError, KeyError, OverflowError):
+            data.pop("heartbeat", None)
+            data["heartbeat_error"] = "heartbeat unavailable: invalid snapshot contract"
+    if "signal_quality_error" in data:
+        data.pop("signal_quality_runs", None)
+    elif "signal_quality_runs" in data:
+        try:
+            data["signal_quality_runs"] = _public_signal_runs(data["signal_quality_runs"])
+        except (ValueError, TypeError, KeyError, OverflowError):
+            data.pop("signal_quality_runs", None)
+            data["signal_quality_error"] = "signal quality response unavailable: invalid aggregate contract"
+    else:
+        data["signal_quality_error"] = "signal quality reader unavailable"
+    return data
 
 
 # ── liveness ───────────────────────────────────────────────────────────────────
@@ -264,6 +460,7 @@ def probe(name: str, url: str, method: str, hb_key: str | None) -> dict:
             code = r.status
     except urllib.error.HTTPError as e:
         code = e.code  # 401/403/302 from an auth wall is still "there"
+        e.close()
     except (urllib.error.URLError, OSError, ValueError) as e:
         return {"name": name, "url": url, "alive": False, "code": None, "ms": None,
                 "detail": str(getattr(e, "reason", e))[:80], "hb": hb_key}
@@ -316,9 +513,29 @@ def _parse_ts(v) -> float | None:
 def _loop(name, cadence, last, stale_after_s, outcome, detail, link=None) -> dict:
     ts = _parse_ts(last)
     age = (time.time() - ts) if ts else None
-    stale = age is None or age > stale_after_s
+    observed = outcome not in ("unavailable", "unreadable", "unknown")
+    stale = observed and (age is None or age > stale_after_s)
     return {"name": name, "cadence": cadence, "last": last, "age_s": age, "stale": stale,
-            "outcome": outcome, "detail": detail, "link": link}
+            "observed": observed, "outcome": outcome, "detail": detail, "link": link}
+
+
+def _loop_age(lp: dict) -> str:
+    return "unknown" if not lp["observed"] else (_age(lp["last"]) if lp["last"] else "never")
+
+
+def _signal_quality_loop(kb: dict) -> dict:
+    error = kb.get("error") or kb.get("signal_quality_error")
+    if error or "signal_quality_runs" not in kb:
+        return _loop("signal quality [9j]", "daily (inside KB nightly)", None, 26 * 3600,
+                     "unavailable", "audit reader unavailable; check credentials, KB module and migration", link="/kb")
+    runs = kb["signal_quality_runs"]
+    last = runs[0] if runs else {}
+    summary = last.get("summary") or {}
+    detail = ("repeat-view eligibility and ranking invariants only; "
+              f"before {summary.get('before_count', '—')} → after {summary.get('after_count', '—')}; "
+              f"violations {summary.get('violation_count', '—')}")
+    return _loop("signal quality [9j]", "daily (inside KB nightly)", last.get("started_at"), 26 * 3600,
+                 last.get("status", "missing"), detail if last else "no recorded audit runs", link="/kb")
 
 
 def _loop_sentinel() -> dict:
@@ -405,20 +622,33 @@ def _loop_gates() -> list[dict]:
     return out
 
 
+def _nightly_status(run: dict) -> str:
+    if run.get("status"):
+        return run["status"]
+    if run.get("started_at") and not run.get("finished_at"):
+        return "running"
+    return "unknown" if run else "missing"
+
+
 def loops_data() -> dict:
     kb = CACHES["kb"].get() or {}
+    ledger_error = kb.get("error") or kb.get("ledger_error") or ("nightly ledger response unavailable" if "runs" not in kb else None)
     runs = kb.get("runs") or []
-    last_run = runs[0] if runs else {}
+    last_run = runs[0] if runs and not ledger_error else {}
     loops = [
         _loop("KB nightly", "daily 08:00", last_run.get("started_at"), 26 * 3600,
-              last_run.get("status") or "missing",
-              f"{last_run.get('total_steps') or '?'} steps · {last_run.get('host') or ''}" if last_run else (kb.get("error") or kb.get("ledger_error") or "no runs"),
+              "unavailable" if ledger_error else _nightly_status(last_run),
+              "nightly ledger reader unavailable; check credentials and database access" if ledger_error else (
+                  f"{last_run.get('total_steps') or '?'} steps · {last_run.get('host') or ''}" if last_run else "no runs"),
               link="/kb"),
     ]
-    hb = kb.get("heartbeat") or {}
+    heartbeat_error = kb.get("error") or kb.get("heartbeat_error") or ("heartbeat response unavailable" if "heartbeat" not in kb else None)
+    hb = (kb.get("heartbeat") or {}) if not heartbeat_error else {}
     loops.append(_loop("fleet heartbeat [9h]", "daily (inside KB nightly)", hb.get("generated_at"), 26 * 3600,
-                       "divergent" if hb.get("divergent") else ("ok" if hb else "missing"),
-                       f"{hb.get('healthy_count')}/{hb.get('total_count')} healthy" if hb else "no snapshot yet", link="/kb"))
+                       "unavailable" if heartbeat_error else ("divergent" if hb.get("divergent") else ("ok" if hb else "missing")),
+                       "heartbeat reader unavailable; check credentials and database access" if heartbeat_error else (
+                           f"{hb.get('healthy_count')}/{hb.get('total_count')} healthy" if hb else "no snapshot yet"), link="/kb"))
+    loops.append(_signal_quality_loop(kb))
     loops.append(_loop_sentinel())
     loops.append(_loop_stage1())
     s2, findings = _loop_stage2()
@@ -426,9 +656,13 @@ def loops_data() -> dict:
 
     suggestions = []
     for lp in loops:
-        if lp["stale"]:
-            suggestions.append({"key": f"stale:{_slug(lp['name'])}", "kind": "stale", "text": f"{lp['name']} has not run in {_age(lp['last']) if lp['last'] else 'ever'} (cadence {lp['cadence']}) — check its launchd job / log.", "link": lp.get("link")})
-        elif lp["outcome"] not in ("ok", "success", "healthy"):
+        if not lp["observed"]:
+            suggestions.append({"key": f"observer:{_slug(lp['name'])}", "kind": "observer",
+                                "text": f"{lp['name']} execution history is unknown: {lp['detail']}. Restore reader access before judging its schedule.",
+                                "link": lp.get("link")})
+        elif lp["stale"]:
+            suggestions.append({"key": f"stale:{_slug(lp['name'])}", "kind": "stale", "text": f"{lp['name']} has not run in {_age(lp['last']) if lp['last'] else 'ever'} (cadence {lp['cadence']}); last outcome {lp['outcome']} — check its launchd job / log.", "link": lp.get("link")})
+        elif lp["outcome"] not in ("ok", "success", "healthy", "running"):
             suggestions.append({"key": f"outcome:{_slug(lp['name'])}", "kind": "outcome", "text": f"{lp['name']} last reported {lp['outcome']}: {lp['detail']}", "link": lp.get("link")})
     for f in findings:
         if "resolved" in f["tags"]:
@@ -652,14 +886,20 @@ def render_overview() -> str:
     hb = (k or {}).get("heartbeat") or {}
     runs = (k or {}).get("runs") or []
     last = runs[0] if runs else {}
+    ledger_error = k.get("error") or k.get("ledger_error") or ("nightly reader unavailable" if "runs" not in k else None)
+    heartbeat_error = k.get("error") or k.get("heartbeat_error") or ("heartbeat reader unavailable" if "heartbeat" not in k else None)
     required = [x for x in l.get("surfaces", []) if x["name"] not in OPTIONAL]
     alive = sum(1 for x in required if x["alive"])
     cards = [
         ("/herdr", att, "need attention", f"{len(h.get('tasks', []))} tasks · events to #{h.get('max_event_seq', 0)}", att > 0),
         ("/decisions", f.get("open_count", 0), "decisions open", f"{len(f.get('history', []))} answered/expired on record", f.get("open_count", 0) > 0),
         ("/links", f"{alive}/{len(required)}", "surfaces alive", "probed from this Mac; dev servers not counted", alive < len(required)),
-        ("/kb", _esc(last.get("status", "—")), "last KB nightly", f"{_age(last.get('started_at'))} ago · {last.get('total_steps') or '?'} steps" if last else (k.get("error") or "no runs"), last.get("status") == "failed"),
-        ("/kb", f"{hb.get('healthy_count', '—')}/{hb.get('total_count', '—')}", "fleet healthy (KB heartbeat)", f"snapshot {_age(hb.get('generated_at'))} ago" if hb else "no snapshot", bool(hb.get("divergent"))),
+        ("/kb", "unavailable" if ledger_error else _esc(_nightly_status(last)), "last KB nightly",
+         ledger_error or (f"{_age(last.get('started_at'))} ago · {last.get('total_steps') or '?'} steps" if last else "no runs"),
+         bool(ledger_error) or last.get("status") == "failed"),
+        ("/kb", "unavailable" if heartbeat_error else f"{hb.get('healthy_count', '—')}/{hb.get('total_count', '—')}",
+         "fleet healthy (KB heartbeat)", heartbeat_error or (f"snapshot {_age(hb.get('generated_at'))} ago" if hb else "no snapshot"),
+         bool(heartbeat_error) or bool(hb.get("divergent"))),
         ("/loops", f"{len(lo.get('loops', [])) - len(bad_loops)}/{len(lo.get('loops', []))}", "loops healthy", f"{len(lo.get('suggestions', []))} suggestion(s)" + (" · " + ", ".join(x["name"].split(" — ")[0] for x in bad_loops) if bad_loops else ""), bool(bad_loops)),
         ("/search", (s.get("totals") or {}).get("searches", "—"), "searches remembered", f"{(s.get('totals') or {}).get('replays', 0)} served from memory" if s.get("totals") else (s.get("error") or ""), False),
     ]
@@ -693,8 +933,8 @@ def render_herdr() -> str:
     lo = CACHES["loops"].get()
     strip = " ".join(
         f"<a class='card {'hot' if (x['stale'] or x['outcome'] not in ('ok', 'success', 'healthy')) else ''}' href='/loops' style='padding:10px 12px'>"
-        f"<div class=t>{_esc(x['name'].split(' — ')[0])}</div><div style='font-weight:600'>{'STALE' if x['stale'] else _esc(x['outcome'])}</div>"
-        f"<div class=s>{_age(x['last']) if x['last'] else 'never'} ago · {_esc(x['cadence'])}</div></a>" for x in lo.get("loops", []))
+        f"<div class=t>{_esc(x['name'].split(' — ')[0])}</div><div style='font-weight:600'>{'STALE · ' if x['stale'] else ''}{_esc(x['outcome'])}</div>"
+        f"<div class=s>{_loop_age(x)} · {_esc(x['cadence'])}</div></a>" for x in lo.get("loops", []))
     sug = "".join(f"<li>{_esc(t['text'])}</li>" for t in lo.get("suggestions", [])[:5])
     body = (f"<h2>Loops <a href='/loops' class=dim style='font-weight:400'>· all, with suggestions →</a></h2><div class=cards>{strip}</div>"
             + (f"<h2>Suggestions</h2><ul class=dim style='margin:0 0 6px;padding-left:18px'>{sug}</ul>" if sug else "")
@@ -749,45 +989,102 @@ def render_search() -> str:
     return page("search memory", "/search", body, refresh=120)
 
 
+def _render_signal_quality(d: dict) -> str:
+    loop = _signal_quality_loop(d)
+    body = ("<h2>Signal quality — repeat-view unit</h2>"
+            "<p class=dim>Same-input before/after eligibility and ranking invariants. "
+            "This does not verify all sales signals or authorize outreach.</p>")
+    link = _signal_quality_link()
+    if link:
+        body += f"<p><a href='{_esc(link)}' target=_blank rel=noopener>Inspect audit details in authenticated KB</a></p>"
+    if not loop["observed"]:
+        return body + "<p class='pill bad'>unavailable</p><p class=dim>Audit history is unknown. Check reader access and the KB module/migration.</p>"
+    runs = d["signal_quality_runs"]
+    if not runs:
+        return body + "<p class=dim>No recorded audit runs (reader succeeded).</p>"
+    last = runs[0]
+    summary = last["summary"]
+    status = last["status"]
+    explanation = {
+        "ok": "Audit executed successfully; covered checks passed.",
+        "degraded": "Audit executed; covered quality checks need attention.",
+        "failed": "Audit failed; quality has not been established.",
+        "running": "Audit is running; final quality is not yet known.",
+    }[status]
+    body += (f"<p><span class='pill {'bad' if loop['stale'] else ('ok' if status == 'ok' else ('run' if status == 'running' else 'bad'))}'>"
+             f"{'STALE · ' if loop['stale'] else ''}{_esc(status)}</span> {_esc(explanation)}<br>"
+             f"<small>Rule {_esc(last['rule_version'])} · started {_esc(last['started_at'])} · "
+             f"finished {_esc(last['finished_at'] or 'not yet')} · revision {_esc(last['source_revision'] or 'unknown')}</small></p>")
+    cards = (
+        ("Eligible before → after", f"{summary.get('before_count', '—')} → {summary.get('after_count', '—')}"),
+        ("Repeat-view before → after", f"{summary.get('repeat_before_count', '—')} → {summary.get('repeat_after_count', '—')}"),
+        ("Changed", summary.get("changed_count", "—")),
+        ("Withheld stale / unknown date", f"{summary.get('withheld_stale_count', '—')} / {summary.get('withheld_unknown_date_count', '—')}"),
+        ("Violations", summary.get("violation_count", "—")),
+        ("Window days / people", f"{summary.get('window_days', '—')} / {summary.get('person_count', '—')}"),
+    )
+    body += "<div class=cards>" + "".join(
+        f"<div class=card><div class=t>{_esc(title)}</div><div class=n>{_esc(value)}</div></div>"
+        for title, value in cards) + "</div>"
+    rows = []
+    for run in runs[:10]:
+        counts = run["summary"]
+        rows.append(
+            f"<tr><td><span class='pill {'ok' if run['status'] == 'ok' else ('run' if run['status'] == 'running' else 'bad')}'>{_esc(run['status'])}</span></td>"
+            f"<td>{_esc(run['started_at'])}<br><small>finished {_esc(run['finished_at'] or 'not yet')} · {_esc(run['rule_version'])}</small></td>"
+            f"<td>eligible {_esc(counts.get('before_count', '—'))} → {_esc(counts.get('after_count', '—'))}<br>"
+            f"<small>repeat {_esc(counts.get('repeat_before_count', '—'))} → {_esc(counts.get('repeat_after_count', '—'))} · "
+            f"changed {_esc(counts.get('changed_count', '—'))} · violations {_esc(counts.get('violation_count', '—'))}</small></td></tr>")
+    return body + "<h3>Latest 10 audit runs</h3><table>" + "".join(rows) + "</table>"
+
+
 def render_kb() -> str:
     d = CACHES["kb"].get()
+    body = _render_signal_quality(d)
     if d.get("error"):
-        return page("kb", "/kb", f"<pre>{_esc(d['error'])}</pre>", refresh=120)
-    body = ""
+        return page("kb", "/kb", body + f"<h2>KB reader unavailable</h2><pre>{_esc(d['error'])}</pre>", refresh=120)
     hb = d.get("heartbeat") or {}
     if hb:
-        systems = (hb.get("payload") or {}).get("systems") or (hb.get("payload") or {})
+        systems = hb.get("systems") or {}
         rows = "".join(
-            f"<tr><td><span class='pill {'ok' if v.get('status') == 'healthy' else 'bad'}'>{_esc(v.get('status'))}</span></td>"
-            f"<td><b>{_esc(k)}</b><br><small>{_esc(v.get('detail', ''))}</small></td></tr>"
+            f"<tr><td><span class='pill {'ok' if v.get('status') == 'healthy' else ('' if v.get('status') == 'unknown' else 'bad')}'>{_esc(v.get('status'))}</span></td>"
+            f"<td><b>{_esc(k)}</b><br><small>{_esc(v.get('code'))}</small></td></tr>"
             for k, v in systems.items() if isinstance(v, dict))
-        body += (f"<h2>Fleet heartbeat — {hb.get('healthy_count')}/{hb.get('total_count')} healthy, snapshot {_age(hb.get('generated_at'))} ago"
-                 f"{' · DIVERGENT' if hb.get('divergent') else ''}</h2><table>{rows}</table>")
+        dropped = hb.get("unrecognized_count") or 0
+        body += (f"<h2>Fleet heartbeat — {_esc(hb.get('healthy_count'))}/{_esc(hb.get('total_count'))} healthy, "
+                 f"{_esc(hb.get('checked_count'))} checked, snapshot {_age(hb.get('generated_at'))} ago"
+                 f"{' · DIVERGENT' if hb.get('divergent') else ''}</h2>"
+                 + (f"<p class=dim>{dropped} snapshot entr{'y' if dropped == 1 else 'ies'} withheld: not a KB checker.</p>" if dropped else "")
+                 + f"<table>{rows}</table>")
     elif d.get("heartbeat_error"):
-        body += f"<h2>Fleet heartbeat</h2><pre>{_esc(d['heartbeat_error'])}</pre>"
+        body += f"<h2>Fleet heartbeat</h2><p class='pill bad'>unavailable</p><p class=dim>{_esc(d['heartbeat_error'])}</p>"
+    else:
+        body += "<h2>Fleet heartbeat</h2><p class=dim>No snapshot yet.</p>"
     runs = d.get("runs") or []
     if runs:
-        rows = "".join(f"<tr><td><span class='pill {'ok' if r['status'] in ('ok', 'success', 'completed') else 'bad'}'>{_esc(r['status'])}</span></td>"
+        rows = "".join(f"<tr><td><span class='pill {'ok' if _nightly_status(r) in ('ok', 'success', 'completed') else ('run' if _nightly_status(r) == 'running' else 'bad')}'>{_esc(_nightly_status(r))}</span></td>"
                        f"<td>{_esc(r['weekday'])} · {_esc(r['host'])} · <small>{_esc((r.get('git_sha') or '')[:7])}</small></td>"
                        f"<td class=dim>{r.get('total_steps') or '?'} steps</td><td class=age title='{_esc(r['started_at'])}'>{_age(r['started_at'])}</td></tr>" for r in runs)
         body += f"<h2>Nightly runs</h2><table>{rows}</table>"
         steps = "".join(f"<tr><td><span class='pill {'ok' if s['status'] in ('ok', 'success') else ('bad' if s['status'] in ('failed', 'error') else '')}'>{_esc(s['status'])}</span></td>"
-                        f"<td>{_esc(s['step_label'])}<br><small>{_esc((s.get('error_message') or s.get('error_class') or '')[:160])}</small></td><td class=dim>×{s.get('attempts') or 1} · {s.get('duration_s') or 0}s</td></tr>"
+                        f"<td>{_esc(s['step_label'])}<br><small>{_esc((s.get('error_class') or '')[:160])}</small></td><td class=dim>×{s.get('attempts') or 1} · {s.get('duration_s') or 0}s</td></tr>"
                         for s in d.get("steps") or [])
         body += f"<h2>Steps of the latest run</h2><table>{steps or '<tr><td class=dim>none</td></tr>'}</table>"
     elif d.get("ledger_error"):
         body += f"<h2>Nightly ledger</h2><pre>{_esc(d['ledger_error'])}</pre>"
+    else:
+        body += "<h2>Nightly ledger</h2><p class=dim>No recorded nightly runs.</p>"
     return page("knowledge-base", "/kb", body or "<p class=dim>nothing to show</p>", refresh=300)
 
 
 def render_links() -> str:
     d = CACHES["links"].get()
-    hb = ((CACHES["kb"].get() or {}).get("heartbeat") or {}).get("payload") or {}
-    systems = hb.get("systems") or hb
+    systems = ((CACHES["kb"].get() or {}).get("heartbeat") or {}).get("systems") or {}
     rows = ""
     for s in d.get("surfaces", []):
-        verdict = systems.get(s["hb"]) if s["hb"] and isinstance(systems, dict) else None
-        v = f"<span class='pill {'ok' if verdict.get('status') == 'healthy' else 'bad'}'>KB heartbeat: {_esc(verdict.get('status'))}</span>" if isinstance(verdict, dict) else ""
+        verdict = systems.get(s["hb"]) if s["hb"] else None
+        v = (f"<span class='pill {'ok' if verdict.get('status') == 'healthy' else ('' if verdict.get('status') == 'unknown' else 'bad')}'>"
+             f"KB heartbeat {_esc(s['hb'])}: {_esc(verdict.get('status'))}</span>") if isinstance(verdict, dict) else ""
         rows += (f"<tr><td><span class='dot {'ok' if s['alive'] else ''}'></span>{_esc(s['name'])}</td>"
                  f"<td><a href='{_esc(s['url'])}' target=_blank>{_esc(s['url'])}</a></td>"
                  f"<td class=dim>{s['code'] or ''} {str(s['ms']) + 'ms' if s['ms'] is not None else ''} {_esc(s['detail'])}</td><td>{v}</td></tr>")
@@ -816,11 +1113,11 @@ def render_loops() -> str:
     d = CACHES["loops"].get()
     rows = ""
     for lp in d["loops"]:
-        cls = "bad" if lp["stale"] or lp["outcome"] not in ("ok", "success", "healthy") else "ok"
+        cls = "bad" if lp["stale"] else ("run" if lp["outcome"] == "running" else ("ok" if lp["outcome"] in ("ok", "success", "healthy") else "bad"))
         name = f"<a href='{_esc(lp['link'])}'>{_esc(lp['name'])}</a>" if lp.get("link") and not str(lp["link"]).startswith("file://") else _esc(lp["name"])
-        rows += (f"<tr><td><span class='pill {cls}'>{'STALE' if lp['stale'] else _esc(lp['outcome'])}</span></td>"
+        rows += (f"<tr><td><span class='pill {cls}'>{'STALE · ' if lp['stale'] else ''}{_esc(lp['outcome'])}</span></td>"
                  f"<td><b>{name}</b><br><small>{_esc(lp['cadence'])} · {_esc(lp['detail'])}</small></td>"
-                 f"<td class=age title='{_esc(lp['last'])}'>{_age(lp['last']) if lp['last'] else 'never'}</td></tr>")
+                 f"<td class=age title='{_esc(lp['last'])}'>{_loop_age(lp)}</td></tr>")
     sug = "".join(_suggestion_row(s) for s in d["suggestions"] if not (s.get("decision") or {}).get("state") == "dismissed")
     if d.get("dismissed"):
         sug += f"<tr><td></td><td class=dim>{d['dismissed']} dismissed (come back when their dismissal expires)</td><td></td></tr>"
@@ -859,8 +1156,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "application/json", json.dumps(data, default=str).encode())
         try:
             return self._send(200, "text/html; charset=utf-8", render().encode())
-        except Exception as e:  # a render bug shows on the page, never takes the hub down
-            return self._send(500, "text/plain", f"{type(e).__name__}: {e}".encode())
+        except Exception:  # a render bug must never publish exception text on an unauthenticated surface
+            return self._send(500, "text/plain", b"page render unavailable")
 
     def do_POST(self):
         path, _, _ = self.path.partition("?")

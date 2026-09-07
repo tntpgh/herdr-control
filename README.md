@@ -860,11 +860,91 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
   If a name looks ugly and you don't know why, check `herdr pane list`'s
   own exit code before suspecting `pane_display_name`.
 
+## Operator hub: KB observation and signal quality
+
+`hub.py` serves the loopback-only operator index at `http://127.0.0.1:8600/`.
+`/kb` combines the nightly ledger, fleet heartbeat, and the latest ten
+signal-quality audit runs. `/loops` reports their cadence and observation
+state separately; these pages do not dispatch work or change any release gate.
+
+**Credential source:** injected `NEON_CONNECTION_STRING` and `SEARCH_SYNC_TOKEN`
+win over literal assignments in `~/.config/op/launchd-secrets.env` (mode 0600).
+`HERDR_HUB_SECRETS_ENV` overrides that one file, including for tests. The hub
+does not read `service-account.env`, discover alternative files, execute shell
+text, or call `op`. Do not put service credentials back into interactive-shell
+startup files. Rotation must update the pre-resolved service file separately
+from 1Password; an injected old value continues to win until the service's
+environment is refreshed. The KB child receives only its Neon credential and
+basic process environment, not the broker, Slack, or search tokens.
+
+**Unknown is not never:** missing credentials, timeout, query errors, or a
+missing KB module/table mean `unavailable` with unknown execution history.
+The suggested action is to restore reader access, not claim a job never ran.
+A successful read containing no rows means no recorded runs. Nightly rows with
+`started_at` present and null `status`/`finished_at` mean `running`, not missing
+or failed. Heartbeat, nightly ledger, and audit read failures are independent.
+Raw subprocess output and SQL exception text are not shown on the hub.
+
+**The heartbeat crosses as statuses, not diagnostics.** KB's checkers embed
+raw exception text, subprocess stderr, and whole non-OK HTTP response bodies in
+`systems.*.detail`, so the hub republishes none of it. A snapshot is projected
+into the checker names KB itself defines (`kb`, `tourguide`, `tntpgh_actions`,
+`idx_poller`, `syncworks`, `thurber_ai`, `imagen`, `search`), the fixed status
+vocabulary `healthy`/`degraded`/`unreachable`/`unknown`, one fixed diagnostic
+code per status (`check_ok`, `check_degraded`, `check_unreachable`,
+`check_not_observed`), a normalized UTC `generated_at`, and healthy/checked/
+total counts plus `divergent` **derived from those statuses**, not copied from
+the payload. Any other key is counted as `unrecognized_count` and dropped
+without echoing its name, because an arbitrary key can itself carry a secret.
+HTML escaping is not redaction, so this happens before rendering or JSON, and
+applies equally to `/kb`, `/kb?json=1`, `/?json=1`, and the `/links` verdicts.
+An unparseable, untyped, naive-timestamp, or no-known-system payload reads
+`heartbeat unavailable: invalid snapshot contract` — never a healthy default —
+while a genuine absent snapshot still reads "no snapshot yet" and a reader
+failure still reads unavailable. `nightly_steps.error_class` is bounded to a
+single token (`error_class_withheld` otherwise); the free-text `error_message`
+column is never selected. A render exception returns the fixed
+`page render unavailable`, never exception text.
+
+**Signal quality is scoped to the repeat-view correction and ranking
+invariants, not “all sales signals verified.”** The daily `[9j]` audit runs
+inside the existing KB nightly. A run becomes stale 26 hours after its start;
+the last outcome remains visible alongside `STALE`. `ok` means the covered
+checks passed, `degraded` means execution completed with quality findings,
+`failed` means quality was not established, and `running` has no final verdict.
+Missing running/failed counters display as unavailable (`—`), never invented
+zeros. The cards show same-input before/after eligibility, repeat-view counts,
+changed rows, withheld stale/unknown-date counts, and violations, with rule,
+revision, and timestamps. History is capped at ten runs.
+
+Only typed audit metadata and an explicit numeric aggregate allowlist reach
+the unauthenticated hub, including `/kb?json=1`. Client-level decisions and
+source communications stay in KB. Unknown fields are discarded; malformed
+aggregate responses are unavailable, not green. Audit error text is reduced
+to a generic safe code. The drill-down uses `KB_DASHBOARD_URL` (default
+`https://dashboard.teamthurber.com`) plus `/signal-quality`, protected by the
+KB dashboard's existing `get_user` authentication. Local dashboard overrides
+use `localhost` or `127.0.0.1` (normally port 8889). Credentials, query strings,
+fragments, arbitrary paths, and non-dashboard hosts are rejected; no token is
+placed in a link. This is not the MCP endpoint or public handoff API.
+
+Deployment order: land the KB `server.signal_quality.recent_runs(conn, limit)`
+reader, audit migration/nightly step and authenticated dashboard route, then
+update the hub. During staggered rollout it intentionally reports unavailable.
+It neither creates audit tables nor runs an audit. The focused regression
+entrypoint is `python3 verify-hub.py`: temporary mock credential files, fake
+DB modules, observer-state transitions, aggregate privacy, escaped HTML, and
+canary-secret negatives served over a real loopback handler for `/kb`,
+`/kb?json=1`, `/?json=1`, and `/links`; it never reads production credentials
+or queries Neon.
+
 ## Files
 
 | file | role |
 |------|------|
 | `config.sh` | **your config** — the only file to edit |
+| `hub.py` | loopback operator index, decisions inbox, read-only KB/heartbeat/signal-quality observation |
+| `verify-hub.py` | mock-only credential, observation-state, aggregate/heartbeat privacy, and HTML regressions |
 | `herdr-plugin.toml` | registers the herdr-socket-only tools (Projects, Quick Actions, sort/name/attention) as real herdr plugin actions, `--pick` tools via a pane — not yet live-verified, see its own header |
 | `pick-pane-open.sh` | dispatches an `[[actions]]` `--pick` invocation to its matching `[[panes]]` entry (herdr actions get no TTY; panes do) |
 | `ensure-workspace.sh` | focus-or-create a project's workspace |
