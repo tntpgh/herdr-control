@@ -88,9 +88,13 @@ fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 THURBER_OS="${STAGE2_THURBER_OS_REPO:-$HOME/Code/thurber-os}"
 BRANCH="evolution-loop/stage2-diagnose-$(date -u +%Y%m%d)"
-# The pass branches from, and is verified against, the remote DEFAULT branch —
-# thurber-os has no `main` (origin/HEAD -> plan/execution-layer). Hardcoding
-# origin/main here made --record-completion refuse every real pass.
+# The pass branches from, and is verified against, the remote DEFAULT branch,
+# resolved rather than hardcoded. thurber-os used to have no `main` at all
+# (origin/HEAD -> plan/execution-layer) and hardcoding origin/main here made
+# --record-completion refuse every real pass. Its trunk was renamed to `main`
+# on 2026-09-09, so the two now agree — but the resolution stays: the next repo
+# with a different trunk must not reintroduce that bug, and a stale
+# origin/HEAD is repaired with `git remote set-head origin -a`.
 BASE_REF="${STAGE2_BASE_REF:-$(git -C "$THURBER_OS" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)}"
 MODEL="${STAGE2_MODEL:-claude-fable-5}"
 
