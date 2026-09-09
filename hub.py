@@ -32,6 +32,7 @@ import argparse
 import ast
 import concurrent.futures as cf
 import datetime as dt
+import hmac
 import html
 import json
 import math
@@ -135,8 +136,23 @@ def port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.3) -> bool:
         return s.connect_ex((host, port)) == 0
 
 
+def form_html(form_id: str) -> Path:
+    """Where the hub keeps its own copy of a form's HTML.
+
+    The copy is what makes a decision durable. formserve's own port dies the
+    moment it collects an answer (and dies WITHOUT collecting one if its
+    process is killed or the machine sleeps), which used to leave a form
+    listed `open` at a URL that no longer answered — observed 2026-09-09 on
+    the eBay Hunter `rev 1` form, marked `gone`, unanswerable. With the HTML
+    here, the hub can serve and accept that same form itself, for as long as
+    the registry row exists.
+    """
+    return FORMS_DIR / f"{form_id}.html"
+
+
 def forms_data() -> dict:
     forms = []
+    now_ms = int(time.time() * 1000)
     if FORMS_DIR.is_dir():
         for p in sorted(FORMS_DIR.glob("*.json"), reverse=True):
             try:
@@ -149,12 +165,164 @@ def forms_data() -> dict:
             # consumer (page, iframe title, /api) gets the human string.
             if f.get("title"):
                 f["title"] = html.unescape(f["title"])
-            if f.get("status") == "open" and not port_open(int(f.get("port", 0) or 0)):
-                f["status"] = "gone"  # the server died without recording an outcome (killed, crashed)
+            f["hub_servable"] = form_html(f["id"]).exists()
+            if f["hub_servable"]:
+                f["hub_url"] = f"/decisions/{f['id']}"
+            if f.get("status") == "open":
+                exp = f.get("expires_at")
+                if exp and now_ms > int(exp):
+                    # An expired form is still unanswered — never "declined".
+                    f["status"] = "expired"
+                elif not f["hub_servable"] and not port_open(int(f.get("port", 0) or 0)):
+                    # Pre-hub form whose server died without recording an outcome.
+                    # A hub-servable one is NEVER gone: this page can still answer it.
+                    f["status"] = "gone"
             forms.append(f)
     open_forms = [f for f in forms if f["status"] == "open"]
     return {"open": open_forms, "history": [f for f in forms if f["status"] != "open"][:30],
             "open_count": len(open_forms)}
+
+
+# ── answering a form from the hub itself ──────────────────────────────────────
+# The hub serves the stored HTML with this shim appended, so a form authored for
+# formserve needs no change: it still calls window.submitAnswers().
+HUB_SUBMIT_SHIM = """
+<input type="hidden" id="__formserve_token" value="%(token)s">
+<script>
+(function () {
+  window.submitAnswers = function (answers) {
+    var body = Object.assign({}, answers === undefined ? {} : answers);
+    body.__formserve_token = document.getElementById("__formserve_token").value;
+    return fetch("%(action)s", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(function (r) {
+      if (!r.ok) return r.text().then(function (t) { throw new Error(r.status + ": " + t); });
+      document.querySelectorAll("button,input,select,textarea").forEach(function (el) { el.disabled = true; });
+      var b = document.createElement("div");
+      b.setAttribute("role", "status");
+      b.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:99999;padding:14px 18px;" +
+        "font:600 14px system-ui,sans-serif;text-align:center;background:#1f6e7e;color:#fff";
+      b.textContent = "Answer recorded in the hub. The agent has been notified.";
+      document.body.appendChild(b);
+      return true;
+    }).catch(function (e) {
+      var b = document.createElement("div");
+      b.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:99999;padding:14px 18px;" +
+        "font:600 14px system-ui,sans-serif;text-align:center;background:#a83a2f;color:#fff";
+      b.textContent = "Could not record answer: " + e.message;
+      document.body.appendChild(b);
+      throw e;
+    });
+  };
+})();
+</script>
+"""
+
+
+def _form_row(form_id: str) -> tuple[Path, dict] | tuple[None, None]:
+    """Registry row for an id, or (None, None). The id is path-validated: it
+    indexes a file under FORMS_DIR, so anything but the generated shape is
+    refused rather than joined onto a path."""
+    if not re.fullmatch(r"[0-9A-Za-z._-]{1,120}", form_id or ""):
+        return None, None
+    path = FORMS_DIR / f"{form_id}.json"
+    try:
+        return path, json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None, None
+
+
+def serve_stored_form(form_id: str) -> tuple[int, bytes]:
+    """The form's own HTML, plus the submit shim, at a URL that outlives its
+    creating process. An already-answered form is shown read-only."""
+    _, row = _form_row(form_id)
+    if row is None:
+        return 404, b"no such decision"
+    body = form_html(form_id)
+    if not body.exists():
+        return 404, b"this decision predates hub-served forms; use its own port"
+    try:
+        raw = body.read_text()
+    except OSError:
+        return 500, b"decision body unreadable"
+    if row.get("status") != "open":
+        answers = json.dumps(row.get("answers") or {}, indent=1, sort_keys=True)
+        banner = (f"<div style=\"position:sticky;top:0;z-index:99999;padding:12px 16px;"
+                  f"background:#1f6e7e;color:#fff;font:600 14px system-ui\">"
+                  f"{_esc(row['status'])}"
+                  + (f" · answered {_age(row.get('answered_at'))} ago" if row.get("answered_at") else "")
+                  + f"<pre style=\"margin:8px 0 0;font:12px ui-monospace;white-space:pre-wrap\">{_esc(answers)}</pre></div>")
+        # Insert after <body> so the banner is inside the document, and neuter
+        # the form: an answered decision must not look re-answerable.
+        frozen = ("<script>document.addEventListener('DOMContentLoaded',function(){"
+                  "document.querySelectorAll('button,input,select,textarea')"
+                  ".forEach(function(el){el.disabled=true;});});</script>")
+        m = re.search(r"<body[^>]*>", raw, re.I)
+        out = (raw[:m.end()] + banner + raw[m.end():]) if m else banner + raw
+        out = out.replace("</body>", frozen + "</body>") if "</body>" in out else out + frozen
+        return 200, out.encode()
+    shim = HUB_SUBMIT_SHIM % {"token": _esc(row.get("token") or ""),
+                              "action": f"/decisions/{form_id}/submit"}
+    out = raw.replace("</body>", shim + "</body>") if "</body>" in raw else raw + shim
+    return 200, out.encode()
+
+
+def record_answer(form_id: str, payload: dict) -> tuple[int, bytes]:
+    """Write an answer into the registry, then notify the waiting agent.
+
+    Same token posture as formserve: this endpoint is unauthenticated loopback,
+    so any local process could otherwise POST a fabricated answer that then
+    gets typed into a live agent pane. The token is generated per form and
+    embedded only in the HTML the hub actually served.
+    """
+    path, row = _form_row(form_id)
+    if row is None:
+        return 404, b"no such decision"
+    token = row.get("token") or ""
+    submitted = payload.pop("__formserve_token", None)
+    if not token or not isinstance(submitted, str) or not hmac.compare_digest(submitted, token):
+        return 403, b"forbidden: missing or invalid token"
+    if row.get("status") != "open":
+        # formserve's own port may have taken the answer microseconds earlier.
+        # First writer wins; never overwrite a recorded outcome.
+        return 409, f"already {row.get('status')}".encode()
+    row.update(status="answered", answers=payload, answered_at=int(time.time() * 1000),
+               answered_via="hub")
+    try:
+        path.write_text(json.dumps(row, indent=1))
+    except OSError as e:
+        return 500, f"could not record: {e}".encode()
+    CACHES["forms"].at = 0.0
+    notify_owner(row)
+    return 200, b'{"ok":true}'
+
+
+def notify_owner(row: dict) -> None:
+    """Push the answer to the agent that asked, using the delivery leaf that
+    already handles the two ways this strands (a reaped background task
+    splitting type from Enter, and a large paste being collapsed).
+
+    Honest limitation: omp's own agent inbox is in-process — there is no CLI to
+    post into it — so "push" here means the herdr pane leaf, exactly as
+    formserve --deliver does. An agent with no pane target still finds the
+    answer in the registry and on this page; nothing is lost, it just has to look.
+    """
+    target = row.get("deliver_to")
+    if not target:
+        return
+    leaf = HERDR_CONTROL / "herdr-deliver.sh"
+    if not leaf.exists():
+        leaf = HERDR_CONTROL / "send-to-agent.sh"
+    if not leaf.exists():
+        return
+    text = ("Form answers from the hub (" + str(row.get("title") or row.get("id")) + "):\n"
+            + json.dumps(row.get("answers") or {}, indent=2, sort_keys=True))
+    try:
+        subprocess.run(["bash", str(leaf), str(target), text], capture_output=True, text=True,
+                       timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass  # the answer is recorded; delivery is best-effort by design
 
 
 # ── secrets: pre-resolved, never `op` from a background process ───────────────
@@ -956,9 +1124,14 @@ def render_decisions() -> str:
         body += ("<h2>Open (0)</h2><p class=dim>Nothing waiting on you. "
                  "Forms appear here the moment an agent serves one.</p>")
     for f in d["open"]:
+        # Prefer the hub's own durable URL: it keeps working after the creating
+        # process exits, which the form's own port does not.
+        src = f.get("hub_url") or f["url"]
         body += (f"<p class=dhead><b>{_esc(f.get('title') or f['id'])}</b> <span class=dim>· served {_age(f.get('created_at'))} ago · "
-                 f"expires {_age(f.get('expires_at'))} · <a href='{_esc(f['url'])}' target=_blank>open in its own tab</a></span></p>"
-                 f"<iframe class=dframe src='{_esc(f['url'])}' title='{_esc(f.get('title') or f['id'])}'></iframe>")
+                 f"expires {_age(f.get('expires_at'))} · <a href='{_esc(src)}' target=_blank>open in its own tab</a>"
+                 + ("" if f.get("hub_servable") else " · <span class=pill>own port only</span>")
+                 + "</span></p>"
+                 f"<iframe class=dframe src='{_esc(src)}' title='{_esc(f.get('title') or f['id'])}'></iframe>")
     rows = "".join(
         f"<tr><td><span class='pill {'ok' if f['status'] == 'answered' else 'bad'}'>{_esc(f['status'])}</span></td>"
         f"<td><b>{_esc(f.get('title') or f['id'])}</b><br><small>{_esc(f.get('form_path', ''))}</small>"
@@ -1148,6 +1321,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "application/json", json.dumps(
                 {"attention": len(h.get("attention", [])), "open_decisions": f.get("open_count", 0),
                  "open_ids": ",".join(sorted(x["id"] for x in f.get("open", [])))}).encode())
+        if path.startswith("/decisions/"):
+            code, body = serve_stored_form(path[len("/decisions/"):].strip("/"))
+            return self._send(code, "text/html; charset=utf-8" if code == 200 else "text/plain", body)
         if path not in PAGES:
             return self._send(404, "text/plain", b"not found")
         render, source = PAGES[path]
@@ -1161,6 +1337,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path, _, _ = self.path.partition("?")
+        if path.startswith("/decisions/") and path.endswith("/submit"):
+            form_id = path[len("/decisions/"):-len("/submit")].strip("/")
+            n = int(self.headers.get("content-length") or 0)
+            raw = self.rfile.read(n) if n > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                return self._send(400, "text/plain", f"bad json: {e}".encode())
+            if not isinstance(payload, dict):
+                return self._send(400, "text/plain", b"answers must be a JSON object")
+            code, body = record_answer(form_id, payload)
+            return self._send(code, "application/json" if code == 200 else "text/plain", body)
         if path != "/loops/decide":
             return self._send(404, "text/plain", b"not found")
         n = int(self.headers.get("content-length") or 0)
