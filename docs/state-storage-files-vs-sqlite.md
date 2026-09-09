@@ -86,6 +86,32 @@ killing the writer mid-write: the real index stayed intact and byte-identical.
 per-key concurrent writes at rate, or a query beyond "load the whole map" —
 today's reader loads all 57 keys anyway, so a table would buy nothing.
 
+## 4b. The same bug, one level worse: decision records
+
+`formserve.py` and `hub.py` both answer the SAME decision file, and both did
+read → check `status == "open"` → `write_text(...)`. The comment said "first
+writer wins"; measured against the pre-fix code, 10 simultaneous two-surface
+races produced:
+
+```
+winners=20  losers=0            <- both surfaces "won" every race; the slower one
+                                   overwrote the recorded answer AND answered_via
+UNPARSEABLE decision records: 1 <- interleaved truncating writes
+expiry guard OVERWROTE a human's answer -> status=expired
+```
+
+That last one is an inverted guard, not a race: `status != "open" and
+fields.status != "expired"` let an expiry sweep stamp `expired` over a real
+answer — reporting a decision the human made as if it never came, which is the
+exact failure `~/Code/AGENTS.md` names ("expiry means still-unanswered, never
+declined").
+
+Fixed with the same nine lines, factored into `lib/record_store.py`
+(`claim_and_update`: re-read under `flock`, verify claimable, write via
+rename). `verify-record-store.py` pins it — 12 checks including 10 real
+two-process races — and a live double-POST against a running formserve records
+exactly one answer.
+
 ## 5. Rule of thumb this leaves behind
 
 - **Relational, queried, machine-global, many writers → SQLite** (WAL + busy

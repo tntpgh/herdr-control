@@ -51,6 +51,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
+sys.path.insert(0, str(HERE / "lib"))
+from record_store import NotClaimable, claim_and_update  # noqa: E402
+
 # Injected before </body> so a served page needs no boilerplate to answer back.
 SHIM = """
 <input type="hidden" id="__formserve_token" value="{{FORMSERVE_TOKEN}}">
@@ -262,19 +265,32 @@ def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: f
 def update_form(path: Path | None, **fields) -> None:
     """Record an outcome, unless the hub already recorded one.
 
-    Both surfaces can accept the same form now, so the write is check-and-set:
-    first writer wins and an existing outcome is never overwritten."""
+    Both surfaces can accept the same form, so the write is claim-once: the
+    status re-read, the guard and the write happen under one lock and land via
+    atomic rename (lib/record_store.py). The previous read-then-write could not
+    honour its own "first writer wins" comment — hub.py and this process could
+    both see `open` and the slower one would overwrite the recorded answer,
+    losing `answered_via`, the field that says where the human actually
+    answered.
+
+    `status=expired` is the deliberate exception: expiry is allowed to stamp a
+    form that is still open, and must never overwrite a real answer — which is
+    exactly `require_status="open"`. Expiry means still-unanswered, never
+    declined.
+    """
     if path is None:
         return
+
+    def _apply(row: dict) -> dict:
+        row.update(fields, answered_at=int(time.time() * 1000))
+        row.setdefault("answered_via", "port")
+        return row
+
     try:
-        data = json.loads(path.read_text())
-        if data.get("status") != "open" and fields.get("status") != "expired":
-            print(f"formserve: already {data.get('status')} via "
-                  f"{data.get('answered_via', 'another surface')}; not overwriting", file=sys.stderr)
-            return
-        data.update(fields, answered_at=int(time.time() * 1000))
-        data.setdefault("answered_via", "port")
-        path.write_text(json.dumps(data, indent=1))
+        claim_and_update(path, _apply)
+    except NotClaimable as e:
+        print(f"formserve: already {e.state} via "
+              f"{e.row.get('answered_via', 'another surface')}; not overwriting", file=sys.stderr)
     except (OSError, json.JSONDecodeError) as e:
         print(f"formserve: hub registry not updated ({e})", file=sys.stderr)
 
