@@ -225,7 +225,8 @@ Built: `lib/run-registry.sh` puts task identity and lifecycle events under
 consumer checkpoint that reads that state also lives there
 (`~/.local/state/herdr/runs/checkpoints/<conductor_id>.json`), not in a repo,
 so a worktree cleanup can't reset what a conductor has already been shown.
-**Not built**: migrating or unifying the existing `.omc/handoffs/events.jsonl`
+**Not built, and now deliberately not building it** (see
+`docs/state-storage-files-vs-sqlite.md`, 2026-09-09): migrating or unifying the existing `.omc/handoffs/events.jsonl`
 completion channel into the same store — a worker's completion evidence and
 its lifecycle state currently live in two different places.
 

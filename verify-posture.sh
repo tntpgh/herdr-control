@@ -146,13 +146,20 @@ done
 ok "every agent x job-class yields a model"
 check "claude plan -> opus"         "$(model_for_agent claude plan)"      "opus"
 check "claude implement -> sonnet"  "$(model_for_agent claude implement)" "sonnet"
-check "claude docs -> haiku"        "$(model_for_agent claude docs)"      "haiku"
+# `docs` moved fast -> standard on 2026-09-05 (lib/agent-profiles.sh:95): a
+# haiku worker restructuring a governance doc had to be killed and respawned.
+# These two rows kept asserting the pre-change routing and had been failing
+# ever since — a red suite nobody could read is worse than no suite.
+check "claude docs -> sonnet (judgment work, not fast)" \
+                                    "$(model_for_agent claude docs)"      "sonnet"
 check "omp plan -> opus:high"       "$(model_for_agent omp plan)"         "opus:high"
 check "omp unknown job -> default"  "$(model_for_agent omp weird)"        "sonnet:medium"
 check "omc plan -> opus (rows were missing; launch built 'claude --model ')" \
                                     "$(model_for_agent omc plan)"         "opus"
 check "omc implement -> sonnet"     "$(model_for_agent omc implement)"    "sonnet"
-check "omc docs -> haiku"           "$(model_for_agent omc docs)"         "haiku"
+check "omc docs -> sonnet"          "$(model_for_agent omc docs)"         "sonnet"
+check "omp docs -> sonnet:medium (the agent we actually run)" \
+                                    "$(model_for_agent omp docs)"         "sonnet:medium"
 
 # ============================================================================
 # Managed-launch regressions (2026-09-04): argv boundaries, bypass-flag
