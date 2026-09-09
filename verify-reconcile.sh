@@ -72,8 +72,8 @@ check "reason is pane_gone" \
   "pane_gone"
 
 printf '== pane_gone BUT the worktree holds a _done handoff event -> completed, NOT lost (2026-09-05) ==\n'
-WTD="$(dirname "$HERDR_RUN_STATE_DIR")/wt-z"; mkdir -p "$WTD/.omc/handoffs"   # under the harness tmp, cleaned by the EXIT trap
-printf '%s\n' '{"event":"implement:feat/x_started"}' 'not json at all' '{"event":"implement:feat/x_done","pr":"https://example/pr/1"}' > "$WTD/.omc/handoffs/events.jsonl"
+WTD="$(dirname "$HERDR_RUN_STATE_DIR")/wt-z"; mkdir -p "$WTD/.handoffs"   # under the harness tmp, cleaned by the EXIT trap
+printf '%s\n' '{"event":"implement:feat/x_started"}' 'not json at all' '{"event":"implement:feat/x_done","pr":"https://example/pr/1"}' > "$WTD/.handoffs/events.jsonl"
 register_task runZ taskZ w c cp cb paneZ birthZ /repo/d "$WTD" "finished-then-closed" || bad "register taskZ failed"
 set_task_state runZ taskZ running || bad "taskZ -> running failed"
 _PANES=""    # tab closed by the conductor after the _done landed
@@ -84,6 +84,35 @@ check "completion event cites the handoff event" \
   "implement:feat/x_done"
 check "no lost_detected for a finished worker" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskZ' AND type='lost_detected';")" "0"
+
+printf '== a worker briefed BEFORE the path change still completes (legacy .omc/handoffs, 2026-09-09) ==\n'
+# The compat half of lib/handoff.sh. If the reader ever stops consulting the
+# legacy file, an in-flight worker that finished correctly gets classified
+# LOST and its branch swept — which is the expensive direction of this change.
+WTL="$(dirname "$HERDR_RUN_STATE_DIR")/wt-legacy"; mkdir -p "$WTL/.omc/handoffs"
+printf '%s\n' '{"event":"implement:feat/legacy_done","pr":"https://example/pr/9"}' > "$WTL/.omc/handoffs/events.jsonl"
+register_task runL taskL w c cp cb paneL birthL /repo/l "$WTL" "legacy-briefed" || bad "register taskL failed"
+set_task_state runL taskL running || bad "taskL -> running failed"
+_PANES=""
+run_reconciliation condL SessionStart --quiet-if-empty --no-hook-json >/dev/null
+check "legacy-path worker marked completed" "$(read_task runL taskL | jq -r .state)" "completed"
+check "legacy completion cites its handoff event" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.event.event') FROM events WHERE task_id='taskL' AND type='completion_recorded';")" \
+  "implement:feat/legacy_done"
+
+printf '== both files present -> the later append wins, no double-count ==\n'
+WTB="$(dirname "$HERDR_RUN_STATE_DIR")/wt-both"; mkdir -p "$WTB/.handoffs" "$WTB/.omc/handoffs"
+printf '%s\n' '{"event":"implement:feat/both_done","pr":"https://example/pr/old"}' > "$WTB/.omc/handoffs/events.jsonl"
+printf '%s\n' '{"event":"implement:feat/both_done","pr":"https://example/pr/new"}' > "$WTB/.handoffs/events.jsonl"
+register_task runB2 taskB2 w c cp cb paneB2 birthB2 /repo/b2 "$WTB" "both-schemes" || bad "register taskB2 failed"
+set_task_state runB2 taskB2 running || bad "taskB2 -> running failed"
+_PANES=""
+run_reconciliation condB2 SessionStart --quiet-if-empty --no-hook-json >/dev/null
+check "dual-scheme worker completed exactly once" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskB2' AND type='completion_recorded';")" "1"
+check "the legacy file is read last, so its line is the one recorded" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.event.pr') FROM events WHERE task_id='taskB2' AND type='completion_recorded';")" \
+  "https://example/pr/old"
 
 printf '== mismatch corroborated by MATCHING agent_session -> rebaseline, NOT lost ==\n'
 register_task runC taskC w c cp cb paneC birthC-old /repo/c /wt/c "corroborated" || bad "register taskC failed"

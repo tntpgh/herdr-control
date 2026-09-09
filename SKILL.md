@@ -82,7 +82,7 @@ herdr wait output w2:p1 --match "GATE_DONE:enforce"
 # spawned worker with `timeout 240 wake-on-evidence.sh ...` in the foreground and
 # went idle every time it returned — the operator had to say "well?" / "check
 # progress" repeatedly across the whole session to get it looked at again.
-./wake-on-evidence.sh <worktree>/.omc/handoffs/events.jsonl 'implement:fix-worker_done'
+./wake-on-evidence.sh <worktree>/.handoffs/events.jsonl 'implement:fix-worker_done'
 
 # ✓ RIGHT — same command, run via your harness's background/async job facility
 # (Bash tool run_in_background: true, omp async: true, or equivalent) so the
@@ -91,7 +91,7 @@ herdr wait output w2:p1 --match "GATE_DONE:enforce"
 # and a foreground watch does not.
 ```
 
-`spawn-task.sh` creates `.omc/handoffs/` in every worktree it spins up and
+`spawn-task.sh` creates `.handoffs/` in every worktree it spins up and
 prints this exact command flagged as backgroundable, because the coordinator
 either forgetting to arm the watch at all, or arming it as a BLOCKING call,
 are both the recurring failure mode — the second is easier to fall into
@@ -107,7 +107,7 @@ commit.
 
 **If a task's own effect removes its own worktree** (e.g. "delete this
 now-redundant branch, it's already fully merged"), `events.jsonl` is gone
-with it — `git worktree remove` deletes `.omc/handoffs/` along with
+with it — `git worktree remove` deletes `.handoffs/` along with
 everything else in the worktree. Verify completion via the outer repo state
 instead (`git worktree list`, `git branch -a`, `git log`), or have the task
 call `append_event()` from `lib/run-registry.sh` directly before it removes

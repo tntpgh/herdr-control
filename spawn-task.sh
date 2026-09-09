@@ -43,6 +43,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/run-registry.sh"
 . "$here/lib/agent-profiles.sh"
 . "$here/lib/repo-root.sh"
+. "$here/lib/handoff.sh"
 
 # ---- args ------------------------------------------------------------------
 base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; positional=()
@@ -120,7 +121,7 @@ root=$(repo_root "$proj")
 [ -d "$root/.git" ] || git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || { echo "spawn-task: not a git repo: $root" >&2; exit 1; }
 wt="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$root")/${branch}"
 label="${job}:${branch}"
-events_file="$wt/.omc/handoffs/events.jsonl"
+events_file=$(handoff_events "$wt")
 wake_pattern="${label}_done"
 
 # ---- canonical operator ancestor rules (managed launches only) --------------
@@ -219,7 +220,8 @@ fi
 
 # ---- coordination scaffold --------------------------------------------------
 # The herdr-ops protocol: a worker appends its completion event to its own
-# .omc/handoffs/events.jsonl; the conductor watches that FILE via
+# .handoffs/events.jsonl (lib/handoff.sh — was .omc/handoffs, a third-party
+# harness's state root); the conductor watches that FILE via
 # wake-on-evidence.sh (never `wait output --match`, which false-fires on the
 # kick-off echo quoting the marker), run via the harness's own background/
 # async job facility, NEVER blocking foreground. That only works if the
@@ -231,6 +233,14 @@ fi
 # manually re-prompt every single time (observed live, 2026-08-06). The
 # printed hint below is flagged BACKGROUNDED for exactly this reason.
 mkdir -p "$(dirname "$events_file")"
+# Self-ignoring bus directory. `.omc/` was already in each repo's .gitignore,
+# so the old path was invisible to `git status` by accident of the vendor's
+# name being listed there; `.handoffs/` is in nobody's. Rather than open 16
+# .gitignore PRs (and still miss the next repo), the directory ignores itself:
+# a `*` pattern inside it also matches the .gitignore file, so git reports the
+# whole thing as nothing. A worker then can't accidentally commit its own
+# coordination log into the branch it was sent to write.
+printf '*\n' > "$(dirname "$events_file")/.gitignore"
 
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
 ws=$(bash "$here/ensure-workspace.sh" --no-focus "$root") || exit 1

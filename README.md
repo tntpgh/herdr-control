@@ -222,7 +222,7 @@ ignored typo. Full schema doc lives in `lib/layout.sh`'s header.
 **No `wait_for`/output-pattern step, on purpose.** `spawn-task.sh`'s own
 coordination-scaffold comment already found that `herdr wait output --match`
 false-fires on a command's own kick-off echo quoting the marker — that's why
-task completion is signalled through `.omc/handoffs/events.jsonl` +
+task completion is signalled through `.handoffs/events.jsonl` +
 `wake-on-evidence.sh` instead. A layout pane that genuinely needs to wait on
 another pane should use that same events-file pattern; the layout engine
 stays a pure "build the panes" primitive and never reintroduces a bug already
@@ -965,7 +965,7 @@ or queries Neon.
 | `send-to-agent.sh` | robust type+submit into a pane (delivery primitive); `--submit-only` presses/confirms text ALREADY in the composer (e.g. an operator typed directly and the Enter didn't land) |
 | `herdr-select.sh` | answer a prompt — numbered digit or omp's arrow menu — by pressing the right key(s); `--authority peer\|human` gates auto-answer through command policy |
 | `herdr-resolve.sh` | retract Slack alerts whose prompt was answered elsewhere |
-| `wake-on-evidence.sh` | poll a peer's `.omc/handoffs/events.jsonl` for a marker, then wake |
+| `wake-on-evidence.sh` | poll a peer's `.handoffs/events.jsonl` for a marker, then wake |
 | `install.sh` | wire the hooks into Claude Code and the omp extension symlink (idempotent, dry-run by default) |
 | `verify-run-registry.sh` | 42-check verification of the SQLite run registry — sequencing, dedup, transactions, migration from the old file layout |
 | `verify-posture.sh` | 49-check verification of the posture ladder — composition, fail-closed unknowns, per-agent flag translation |

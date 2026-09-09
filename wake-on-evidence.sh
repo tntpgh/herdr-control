@@ -19,12 +19,29 @@ pat="${2:?pattern required}"
 max="${3:-480}"
 interval="${4:-30}"
 
+# A worker briefed before 2026-09-09 appends to the legacy
+# `<worktree>/.omc/handoffs/events.jsonl` instead of `<worktree>/.handoffs/`
+# (see lib/handoff.sh). Watching only the path we were given would then time
+# out on a worker that finished correctly, so when handed a canonical path we
+# also watch its legacy sibling. Drop this once no in-flight worker predates
+# the change.
+watch=("$f")
+case "$f" in
+  */.handoffs/events.jsonl) watch+=("${f%/.handoffs/events.jsonl}/.omc/handoffs/events.jsonl") ;;
+esac
+
 for _ in $(seq 1 "$max"); do
-  if line=$(grep -E "$pat" "$f" 2>/dev/null | tail -1) && [ -n "$line" ]; then
+  # The MATCH test is the captured line, never the pipeline's status: grep
+  # exits 2 when ANY named file is missing, and under `set -o pipefail` that 2
+  # wins over the successful match in the file that does exist. With two
+  # watched paths one is normally absent, so gating on status here silently
+  # never fires — caught by verify-reconcile's legacy-brief case, 2026-09-09.
+  line=$(grep -hE "$pat" "${watch[@]}" 2>/dev/null | tail -1) || true
+  if [ -n "$line" ]; then
     echo "MATCH: $line"
     exit 0
   fi
   sleep "$interval"
 done
-echo "WATCH_TIMEOUT after ~$((max * interval / 60))m with no match for '$pat' in $f"
+echo "WATCH_TIMEOUT after ~$((max * interval / 60))m with no match for '$pat' in ${watch[*]}"
 exit 3

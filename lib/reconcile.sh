@@ -6,8 +6,15 @@
 # means — exactly the reason lib/pane-guard.sh and lib/prompt-parse.sh are
 # each a single sourced file instead of being copy-pasted per caller.
 #
-# Requires lib/run-registry.sh already sourced by the caller.
+# Requires lib/run-registry.sh already sourced by the caller. lib/handoff.sh is
+# sourced HERE rather than added to every caller's preamble: four hooks and two
+# scripts source this file, and a reader that silently loses handoff_event_files
+# would classify live workers as lost — the one failure this file exists to
+# prevent.
 set -uo pipefail
+if ! declare -F handoff_event_files >/dev/null 2>&1; then
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/handoff.sh"
+fi
 
 # ---- conductor identity ------------------------------------------------------
 # Best available identity, in priority order. None of these is bulletproof —
@@ -43,21 +50,26 @@ resolve_conductor_id() {
 # every time. Without it (SessionStart's one-time cost), an explicit
 # "no changes" line is useful confirmation that reconciliation actually ran.
 # The newest `*_done` handoff event in a task's worktree, or empty. Reads the
-# same file wake-on-evidence.sh watches; tolerates a missing worktree, a
-# missing file, and malformed lines (a worker's half-written line must never
-# make the classifier crash into marking everything lost).
+# same files wake-on-evidence.sh watches — canonical `.handoffs/events.jsonl`
+# AND the legacy `.omc/handoffs/` one, because a worker briefed before the
+# 2026-09-09 path change is still appending to the old file and must not be
+# classified as lost. Tolerates a missing worktree, missing files, and
+# malformed lines (a worker's half-written line must never make the
+# classifier crash into marking everything lost).
 _done_event_for_task() {               # task_json -> event json | empty
   local wt f
   wt="$(printf '%s' "$1" | jq -r '.worktree // empty')"
   [ -n "$wt" ] || return 0
-  f="$wt/.omc/handoffs/events.jsonl"
-  [ -r "$f" ] || return 0
-  # Line by line: a single malformed line must not stop jq before the _done
-  # line that follows it (a stream parse error aborts the whole file).
+  # Line by line across every scheme: a single malformed line must not stop jq
+  # before the _done line that follows it (a stream parse error aborts the
+  # whole file). Files are concatenated in append order, so the last _done
+  # line still wins regardless of which scheme it came from.
   local line
-  while IFS= read -r line || [ -n "$line" ]; do
-    printf '%s' "$line" | jq -c 'select(type=="object" and (.event|type)=="string" and (.event|endswith("_done")))' 2>/dev/null
-  done < "$f" | tail -n 1
+  while IFS= read -r f; do
+    while IFS= read -r line || [ -n "$line" ]; do
+      printf '%s' "$line" | jq -c 'select(type=="object" and (.event|type)=="string" and (.event|endswith("_done")))' 2>/dev/null
+    done < "$f"
+  done < <(handoff_event_files "$wt") | tail -n 1
 }
 
 run_reconciliation() {
