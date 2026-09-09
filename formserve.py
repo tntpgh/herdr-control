@@ -224,15 +224,34 @@ def _title_of(html_bytes: bytes, fallback: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1).decode("utf-8", "replace"))).strip() or fallback
 
 
-def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: float) -> Path | None:
+def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: float,
+                  token: str = "", deliver_to: str = "") -> Path | None:
+    """Register the form AND hand the hub a copy it can serve itself.
+
+    The HTML copy plus the token are what make the decision outlive this
+    process. Without them, this port dying — on submit by design, or on a kill
+    or a sleep by accident — left the form listed `open` at a URL that no
+    longer answered (observed 2026-09-09: the eBay Hunter `rev 1` form, marked
+    `gone`, unanswerable). The hub serves the same bytes at
+    /decisions/<id> for as long as the registry row exists.
+    """
     try:
         FORMS_DIR.mkdir(parents=True, exist_ok=True)
         now = time.time()
         path = FORMS_DIR / f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime(now))}-{port}.json"
+        try:
+            (FORMS_DIR / f"{path.stem}.html").write_bytes(html_bytes)
+            hub_url = f"http://127.0.0.1:8600/decisions/{path.stem}"
+        except OSError as e:
+            print(f"formserve: hub copy not written ({e}); only this port can answer",
+                  file=sys.stderr)
+            hub_url = ""
         path.write_text(json.dumps({
             "id": path.stem, "title": _title_of(html_bytes, form.stem), "url": url, "port": port,
             "form_path": str(form), "pid": os.getpid(), "status": "open",
-            "created_at": int(now * 1000), "expires_at": int((now + timeout) * 1000) if timeout > 0 else None,
+            "token": token, "deliver_to": deliver_to, "hub_url": hub_url,
+            "created_at": int(now * 1000),
+            "expires_at": int((now + timeout) * 1000) if timeout > 0 else None,
         }, indent=1))
         return path
     except OSError as e:
@@ -241,11 +260,20 @@ def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: f
 
 
 def update_form(path: Path | None, **fields) -> None:
+    """Record an outcome, unless the hub already recorded one.
+
+    Both surfaces can accept the same form now, so the write is check-and-set:
+    first writer wins and an existing outcome is never overwritten."""
     if path is None:
         return
     try:
         data = json.loads(path.read_text())
+        if data.get("status") != "open" and fields.get("status") != "expired":
+            print(f"formserve: already {data.get('status')} via "
+                  f"{data.get('answered_via', 'another surface')}; not overwriting", file=sys.stderr)
+            return
         data.update(fields, answered_at=int(time.time() * 1000))
+        data.setdefault("answered_via", "port")
         path.write_text(json.dumps(data, indent=1))
     except (OSError, json.JSONDecodeError) as e:
         print(f"formserve: hub registry not updated ({e})", file=sys.stderr)
@@ -279,7 +307,12 @@ def main() -> int:
     token = secrets.token_urlsafe(24)
     shim = SHIM.replace("{{FORMSERVE_TOKEN}}", token).encode()
 
-    html = form.read_bytes()
+    raw_html = form.read_bytes()
+    # The hub gets the PRISTINE bytes: it appends its own shim, whose
+    # submitAnswers() posts to /decisions/<id>/submit. Handing it this
+    # process's shimmed copy would point the hub's page at /submit on the hub,
+    # which is a 404 — the form would render and then fail to send.
+    html = raw_html
     lowered = html.lower()
     if b"</body>" in lowered:
         cut = lowered.rindex(b"</body>")
@@ -299,7 +332,8 @@ def main() -> int:
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     print(f"formserve: serving {form.name} at {url}", file=sys.stderr)
-    registry = register_form(form, html, url, port, args.timeout)
+    registry = register_form(form, raw_html, url, port, args.timeout,
+                             token=token, deliver_to=args.deliver or "")
 
     if not args.no_open:
         open_in_pane(url)
