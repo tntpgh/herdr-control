@@ -203,7 +203,7 @@ else
   LEDGER_LINE='`~/Code/herdr-control/.local-state/engineering-ledger/*.jsonl`'
   SIBLINGS_LINE='Read-only across all sibling repos (knowledge-base, tourguide, thurber-ai) -- read/grep/glob directly, zero edits, zero commits, zero PRs in any of them.'
   OUTPUT_LINE='`docs/tracking/'"$(date -u +%Y-%m-%d)"'-stage2-diagnose-pass.md` in THIS worktree (thurber-os), committed here, nothing else changes.'
-  DONE_LINE='Done means: the doc is COMMITTED on this branch (uncommitted is not done) AND the handoff event is appended to `.omc/handoffs/events.jsonl` in this worktree: `{"event":"review:'"$BRANCH"'_done","commit":"<hash>","summary":"<one-line: how many findings, by classification, headline items>"}`. Do not push, open a PR, or merge - the conductor does that. Then stop.'
+  DONE_LINE='Done means: the doc is COMMITTED on this branch (uncommitted is not done) AND the handoff event is appended to `.handoffs/events.jsonl` in this worktree: `{"event":"review:'"$BRANCH"'_done","commit":"<hash>","summary":"<one-line: how many findings, by classification, headline items>"}`. Do not push, open a PR, or merge - the conductor does that. Then stop.'
 fi
 
 # Find the most recent prior Stage-2 doc (if any) so the new pass knows what
@@ -441,7 +441,7 @@ if [ "$delivered" -eq 1 ]; then
     echo "stage2-diagnose: DIAGNOSIS OUTCOME NOT YET RECORDED — after the worker lands its tracking doc, run:"
     echo "  bash $HERE/stage2-diagnose.sh --record-completion $BRANCH [findings]"
     echo "stage2-diagnose: completion watcher (a conductor should run this BACKGROUNDED, then record):"
-    echo "  bash $HERE/wake-on-evidence.sh ${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$THURBER_OS")/$BRANCH/.omc/handoffs/events.jsonl 'review:${BRANCH}_done' && bash $HERE/stage2-diagnose.sh --record-completion $BRANCH"
+    echo "  bash $HERE/wake-on-evidence.sh ${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$THURBER_OS")/$BRANCH/.handoffs/events.jsonl 'review:${BRANCH}_done' && bash $HERE/stage2-diagnose.sh --record-completion $BRANCH"
 else
     emit_loop_run diagnose failed 0 "spawned pane=$PANE for $BRANCH but brief NOT delivered (last rc=$drc) — worker idle, needs manual send"
     echo "stage2-diagnose: BRIEF NOT DELIVERED to $PANE (last rc=$drc). Deliver by hand:" >&2

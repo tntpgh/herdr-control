@@ -27,7 +27,11 @@ pane. In a single session this broke four ways:
 
 (4) was fixed directly — see the sibling PR on `orch-hardening` (defects 1–7:
 sort-tabs agent gating, preview.sh CLI-signature/proof/daemon-health fixes,
-`.omc/handoffs` scaffolding, `wake-on-evidence.sh`). This document covers the
+`.omc/handoffs` scaffolding, `wake-on-evidence.sh`)
+> **Path note (2026-09-09):** the bus moved to `<worktree>/.handoffs/events.jsonl`
+> (`lib/handoff.sh`, `HERDR_HANDOFF_DIR`). Readers still consult the legacy
+> `.omc/handoffs/` path; every `.omc/handoffs` below means the file at its new
+> home.. This document covers the
 rest: a real push channel for (1)/(3) and the identity/durability foundation
 underneath it.
 
