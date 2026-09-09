@@ -51,6 +51,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from uuid import UUID
 from pathlib import Path
 
+# lib/ is beside this script, not on sys.path — hub.py runs from launchd with
+# whatever cwd the plist gives it, so the path is derived from __file__.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from record_store import NotClaimable, claim_and_update  # noqa: E402
+
 DEFAULT_PORT = int(os.environ.get("HERDR_HUB_PORT", "8600"))
 STATE = Path(os.environ.get("HERDR_STATE_ROOT", Path.home() / ".local/state/herdr"))
 REGISTRY = Path(os.environ.get("HERDR_RUN_REGISTRY", STATE / "runs/registry.sqlite3"))
@@ -283,14 +288,24 @@ def record_answer(form_id: str, payload: dict) -> tuple[int, bytes]:
     submitted = payload.pop("__formserve_token", None)
     if not token or not isinstance(submitted, str) or not hmac.compare_digest(submitted, token):
         return 403, b"forbidden: missing or invalid token"
-    if row.get("status") != "open":
-        # formserve's own port may have taken the answer microseconds earlier.
-        # First writer wins; never overwrite a recorded outcome.
-        return 409, f"already {row.get('status')}".encode()
-    row.update(status="answered", answers=payload, answered_at=int(time.time() * 1000),
-               answered_via="hub")
+    # The status read above is already stale — formserve's own port may answer
+    # between it and this line. claim_and_update re-reads under an exclusive
+    # lock and writes via rename, so the loser genuinely loses (409) instead of
+    # overwriting a recorded answer, and a crash can't leave a half-written
+    # decision record. See lib/record_store.py.
+    def _answer(row: dict) -> dict:
+        row.update(status="answered", answers=payload,
+                   answered_at=int(time.time() * 1000), answered_via="hub")
+        return row
+
     try:
-        path.write_text(json.dumps(row, indent=1))
+        row = claim_and_update(path, _answer)
+    except NotClaimable as e:
+        return 409, f"already {e.state}".encode()
+    except FileNotFoundError:
+        return 404, b"no such decision"
+    except json.JSONDecodeError as e:
+        return 500, f"decision record is corrupt: {e}".encode()
     except OSError as e:
         return 500, f"could not record: {e}".encode()
     CACHES["forms"].at = 0.0
