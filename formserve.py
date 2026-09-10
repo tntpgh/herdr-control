@@ -157,7 +157,22 @@ def build_handler(html: bytes, result: dict, done: threading.Event, token: str):
             if not isinstance(submitted, str) or not hmac.compare_digest(submitted, token):
                 self._send(403, b"forbidden: missing or invalid token")
                 return
+            # CLAIM BEFORE ACKNOWLEDGING. Two-model review, 2026-09-09: the 200
+            # used to go out here unconditionally, the claim happened later in
+            # main(), and when the hub had already recorded a different answer
+            # this process printed and DELIVERED the losing one to the agent
+            # anyway - the record was protected, the agent got a contradictory
+            # decision. Now the durable claim is the acknowledgement: a loser
+            # gets 409 with the canonical outcome and nothing is delivered.
+            outcome, row = update_form(result.get("registry"), status="answered", answers=payload)
+            if outcome == "lost":
+                self._send(409, json.dumps({"ok": False, "already": row.get("status"),
+                                            "via": row.get("answered_via"),
+                                            "answers": row.get("answers")}).encode(),
+                           "application/json")
+                return
             result["answers"] = payload
+            result["claimed"] = outcome          # "won", or "unregistered" when no hub record exists
             self._send(200, b'{"ok":true}', "application/json")
             # let the response flush before the server is torn down
             done.set()
@@ -262,7 +277,7 @@ def register_form(form: Path, html_bytes: bytes, url: str, port: int, timeout: f
         return None
 
 
-def update_form(path: Path | None, **fields) -> None:
+def update_form(path: Path | None, **fields) -> tuple[str, dict]:
     """Record an outcome, unless the hub already recorded one.
 
     Both surfaces can accept the same form, so the write is claim-once: the
@@ -277,9 +292,18 @@ def update_form(path: Path | None, **fields) -> None:
     form that is still open, and must never overwrite a real answer — which is
     exactly `require_status="open"`. Expiry means still-unanswered, never
     declined.
+
+    Returns (outcome, row):
+      ("won", row)          this call recorded the outcome
+      ("lost", row)         another surface already did; row is the canonical record
+      ("unregistered", {})  no hub record exists (hub was unreachable at start)
+      ("unavailable", {})   the record exists but could not be read/written
+    Callers MUST branch on this. The first version returned None and swallowed
+    NotClaimable with a stderr line, and main() then printed and delivered the
+    losing answer as if it had won (two-model review, 2026-09-09).
     """
     if path is None:
-        return
+        return "unregistered", {}
 
     def _apply(row: dict) -> dict:
         row.update(fields, answered_at=int(time.time() * 1000))
@@ -287,12 +311,14 @@ def update_form(path: Path | None, **fields) -> None:
         return row
 
     try:
-        claim_and_update(path, _apply)
+        return "won", claim_and_update(path, _apply)
     except NotClaimable as e:
         print(f"formserve: already {e.state} via "
               f"{e.row.get('answered_via', 'another surface')}; not overwriting", file=sys.stderr)
+        return "lost", e.row
     except (OSError, json.JSONDecodeError) as e:
         print(f"formserve: hub registry not updated ({e})", file=sys.stderr)
+        return "unavailable", {}
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -350,33 +376,76 @@ def main() -> int:
     print(f"formserve: serving {form.name} at {url}", file=sys.stderr)
     registry = register_form(form, raw_html, url, port, args.timeout,
                              token=token, deliver_to=args.deliver or "")
+    result["registry"] = registry            # the handler claims against it before any 200
 
     if not args.no_open:
         open_in_pane(url)
 
-    timeout = None if args.timeout <= 0 else args.timeout
+    # Wait on BOTH surfaces. The port is one place the human can answer; the
+    # hub is the other, and it writes the same record. Before this, a hub
+    # answer left this process waiting out its full timeout and then printing
+    # "the question is still unanswered" over a recorded human decision
+    # (two-model review, 2026-09-09). Poll the record every few seconds; a
+    # terminal status from anywhere ends the wait.
+    deadline = None if args.timeout <= 0 else time.monotonic() + args.timeout
+    hub_row: dict | None = None
     try:
-        submitted = done.wait(timeout=timeout)
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if done.wait(timeout=5.0 if remaining is None else min(5.0, remaining)):
+                break
+            if registry is not None:
+                try:
+                    row = json.loads(registry.read_text())
+                    if row.get("status") in ("answered", "expired") and row.get("answered_via") != "port":
+                        hub_row = row
+                        break
+                except (OSError, json.JSONDecodeError):
+                    pass
+            if remaining is not None and remaining <= 0:
+                break
     except KeyboardInterrupt:
-        submitted = False
         print("formserve: interrupted", file=sys.stderr)
     finally:
         httpd.shutdown()
         httpd.server_close()
 
-    if not submitted:
+    if hub_row is not None:
+        # The other surface recorded the outcome. Report THAT - it is the human's
+        # decision - and deliver it, exactly as if it had arrived here.
+        if hub_row.get("status") == "answered":
+            answers = hub_row.get("answers") or {}
+            print(f"formserve: answered via {hub_row.get('answered_via', 'hub')}; delivering that answer",
+                  file=sys.stderr)
+            print(json.dumps(answers, indent=2, sort_keys=True))
+            if args.deliver:
+                deliver(args.deliver, url, answers)
+            return 0
+        print("formserve: the hub recorded this form as EXPIRED; still unanswered.", file=sys.stderr)
+        return 1
+
+    if not done.is_set():
         # Word this carefully. "No answers submitted" reads as "the human
         # declined", and an agent acting on that would proceed as if it had an
         # answer it does not have. The form EXPIRED; nobody said anything.
-        update_form(registry, status="expired")
+        outcome, row = update_form(registry, status="expired")
+        if outcome == "lost" and row.get("status") == "answered":
+            # Answered elsewhere in the last few seconds: a real decision beats
+            # our expiry, and record_store already refused to overwrite it.
+            answers = row.get("answers") or {}
+            print(json.dumps(answers, indent=2, sort_keys=True))
+            if args.deliver:
+                deliver(args.deliver, url, answers)
+            return 0
         print(f"formserve: form EXPIRED after {args.timeout}s with no submission. "
               f"This is not a decline — the page stopped being reachable and the "
               f"question is still unanswered. Re-serve it, or raise --timeout.",
               file=sys.stderr)
         return 1
 
+    # The handler already claimed the record under lock before it sent the 200;
+    # result["answers"] is therefore the persisted winner, never a loser.
     answers = result.get("answers", {})
-    update_form(registry, status="answered", answers=answers)
     print(json.dumps(answers, indent=2, sort_keys=True))
     if args.deliver:
         deliver(args.deliver, url, answers)

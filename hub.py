@@ -293,7 +293,17 @@ def record_answer(form_id: str, payload: dict) -> tuple[int, bytes]:
     # lock and writes via rename, so the loser genuinely loses (409) instead of
     # overwriting a recorded answer, and a crash can't leave a half-written
     # decision record. See lib/record_store.py.
+    # Expiry is enforced HERE, under the lock, not only in the rendered list.
+    # forms_data() flipped `expired` in the loaded dict for display, but this
+    # path re-read the record and would accept an answer to a form whose
+    # expires_at had passed hours earlier - the exact case the hub copy exists
+    # for, since the original server is gone by then (two-model review,
+    # 2026-09-09). Raising NotClaimable inside the callback rejects it under the
+    # same lock that protects against the double-answer.
     def _answer(row: dict) -> dict:
+        exp = row.get("expires_at")
+        if isinstance(exp, (int, float)) and exp > 0 and time.time() * 1000 > exp:
+            raise NotClaimable("expired", row)
         row.update(status="answered", answers=payload,
                    answered_at=int(time.time() * 1000), answered_via="hub")
         return row
@@ -301,6 +311,8 @@ def record_answer(form_id: str, payload: dict) -> tuple[int, bytes]:
     try:
         row = claim_and_update(path, _answer)
     except NotClaimable as e:
+        if e.state == "expired" and e.row.get("status") == "open":
+            return 410, b"expired: this decision passed its deadline and is still unanswered; re-serve it"
         return 409, f"already {e.state}".encode()
     except FileNotFoundError:
         return 404, b"no such decision"
