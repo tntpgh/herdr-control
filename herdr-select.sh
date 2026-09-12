@@ -304,7 +304,7 @@ if [ "$authority" = peer ] && [ "$declining" = 0 ]; then
   if [ -n "$reservation" ] || [ "$policy_verdict" != allow ]; then
     if [ -n "$reservation" ]; then
       echo "herdr-select: REFUSED (reserved) — $reservation" >&2
-      policy_reason="$reservation"
+      policy_reason="$reservation"; policy_verdict="reserved"
     else
       echo "herdr-select: REFUSED ($policy_verdict) — a human must answer this one." >&2
       [ -n "$policy_reason" ] && echo "herdr-select: $policy_reason" >&2
