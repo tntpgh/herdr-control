@@ -13,8 +13,13 @@ its own header comment why a rule doesn't apply.
 ## 1. Peer defaults and reviewed conductor authority are distinct
 
 `herdr-select.sh --authority peer` remains the non-interactive default:
-only `classify_command=allow` may proceed. `--authority human` records an
-explicit human decision. Neither is silently promoted to conductor authority.
+only `classify_command=allow` may proceed, and never a form on the
+human-reserved list below (`conductor_reserved_reason`) — the classifier
+says `allow` for `gh pr merge` and `git push origin main`, so until
+2026-09-12 the peer path pressed Approve on merges the conductor path
+refused. A reservation for the conductor binds every automated authority
+beneath it. `--authority human` records an explicit human decision. Neither
+is silently promoted to conductor authority.
 
 `--authority conductor` requires an active registered task owned by the
 caller's current pane and birth identity, a complete recognized omp panel,

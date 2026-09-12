@@ -117,6 +117,29 @@ sel 1 --authority peer; rc=$?
 [ "$(keys_pressed)" = "0" ] && ok "NO KEY PRESSED on a credential-exfil prompt" || bad "keys pressed=$(keys_pressed) on a refusal!"
 [ "$(( $(count_events approval_escalated) - before_esc ))" = "1" ] && ok "approval_escalated event recorded" || bad "escalation not recorded"
 
+printf '== RESERVED form (main merge), classifier ALLOW, peer authority -> REFUSED, no key pressed ==\n'
+# Found live 2026-09-12 (thurber-os plan 012 lab): classify_command says
+# `allow` for `gh pr merge`, and conductor_reserved_reason — the human-only
+# list (merge, push to main, gate-registry, credential values, remote
+# mutation) — used to run only under --authority conductor. So the LEAST
+# trusted automated answerer could press Approve on a merge the reviewed
+# conductor is refused. A reservation for the conductor is a reservation for
+# every automated authority below it.
+for reserved in "gh pr merge 5 --squash" "git push origin main" "op read op://secrets/x/credential" "wrangler deploy"; do
+  set_screen "$reserved"; reset_keys
+  before_esc=$(count_events approval_escalated)
+  sel 1 --authority peer; rc=$?
+  [ "$rc" -eq 8 ] && ok "exit 8 for '$reserved'" || bad "exit $rc (expected 8) for '$reserved'"
+  [ "$(keys_pressed)" = "0" ] && ok "NO KEY PRESSED for '$reserved'" || bad "keys pressed=$(keys_pressed) on '$reserved'!"
+  grep -q 'human-only' "$WORK/err.txt" && ok "reservation named on stderr" || bad "no reservation on stderr: $(cat "$WORK/err.txt")"
+  [ "$(( $(count_events approval_escalated) - before_esc ))" = "1" ] && ok "approval_escalated recorded" || bad "escalation not recorded for '$reserved'"
+done
+printf '== the SAME reserved prompt, HUMAN authority -> allowed (a human is the authority) ==\n'
+set_screen "gh pr merge 5 --squash"; reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 0 ] && ok "exit 0 for the human" || bad "exit $rc; stderr: $(cat "$WORK/err.txt")"
+[ "$(keys_pressed)" = "1" ] && ok "key pressed for the human" || bad "keys pressed=$(keys_pressed)"
+
 printf '== the SAME destructive prompt, HUMAN authority -> allowed, verdict still recorded ==\n'
 set_screen "rm -rf /tmp/scratch"; reset_keys
 sel 1 --authority human; rc=$?
