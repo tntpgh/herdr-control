@@ -194,7 +194,16 @@ push_wake() {
   # teaches its reader to ignore the channel — observed 2026-09-12, an afternoon
   # of workers doing ordinary work. Held, never dropped: grace_realert re-checks
   # and delivers late if the prompt outlives the window. See lib/alert-gate.sh.
-  if [ -n "${HERDR_PANE_ID:-}" ] && ! human_must_answer "${HERDR_PANE_ID}"; then
+  # HERDR_ALERT_FORCE is how the grace timer comes back: it re-enters this
+  # function so the delayed wake gets pane_is_agent, the conductor pane-birth
+  # revalidation and the wake_attempted/wake_result records, exactly like an
+  # immediate one. The first draft handed $cpane and $wake to send-to-agent.sh
+  # 90 seconds later with none of that (PR #60 review, HERDR-AG-02): a pane id
+  # revalidated at T0 can belong to a bare shell by T+90, send-to-agent enforces
+  # neither check, and $wake embeds agent-controlled $msg — so that was
+  # agent-influenced text typed and Entered into an unvalidated pane. A delayed
+  # delivery must be a delivery, not a shortcut around the delivery's guards.
+  if [ -z "${HERDR_ALERT_FORCE:-}" ] && [ -n "${HERDR_PANE_ID:-}" ] && ! human_must_answer "${HERDR_PANE_ID}"; then
     if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
       append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "wake_held" \
         "$(jq -nc --arg p "$cpane" --arg pid "$pid" --arg k "$base" \
@@ -202,8 +211,16 @@ push_wake() {
         "${base}_held" >/dev/null 2>&1 || true
     fi
     grace_realert "${HERDR_PANE_ID}" "$pid" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-      bash "$_pw_dir/send-to-agent.sh" "$cpane" "$wake"
-    return 0
+      env HERDR_ALERT_FORCE=1 \
+          HERDR_PANE_ID="${HERDR_PANE_ID}" HERDR_CONDUCTOR_PANE_ID="$cpane" \
+          HERDR_RUN_ID="${HERDR_RUN_ID:-}" HERDR_TASK_ID="${HERDR_TASK_ID:-}" \
+          HERDR_TASK_LABEL="${HERDR_TASK_LABEL:-}" \
+          bash -c '. "$0/lib/pane-guard.sh"; . "$0/lib/prompt-parse.sh"; . "$0/lib/run-registry.sh"; . "$0/lib/push-wake.sh"; push_wake "$1" "$2"' \
+          "$_pw_dir" "$msg" "$where"
+    # A held wake has NOT been delivered, so it does not report success — the
+    # documented contract is "0 only when delivered AND confirmed submitted"
+    # (HERDR-AG-09). 2 distinguishes held from a transport failure.
+    return 2
   fi
 
   # Every ATTEMPT gets its own pair of event rows. The previous ids

@@ -75,14 +75,48 @@ HERDR_ALERT_GRACE_S=1 grace_realert "$PANE" "$pid" "" "" fake_alert
 sleep 3                                            # nobody answered it
 [ -s "$SENT" ] && ok "unanswered held prompt alerted after the grace window" || bad "HELD FOREVER — the alert was dropped, not delayed"
 
-printf '== grace: a DIFFERENT prompt in the window is not alerted under the old id ==\n'
+printf '== grace: a prompt whose TEXT MOVED is still alerted (the AG-01 silent-failure) ==\n'
+# This assertion used to say the opposite, and the opposite was the bug: a
+# repaint, a tmux resize rewrapping a long Command: row, or a scroll changes the
+# fingerprint of a prompt nobody answered, and the timer exited quietly. No
+# further hook fires for that prompt, so that was permanent silence. The
+# re-check now asks only "is a prompt still up?".
 menu "git status --short"
 pid=$(prompt_id "$PANE")
 : > "$SENT"
 HERDR_ALERT_GRACE_S=1 grace_realert "$PANE" "$pid" "" "" fake_alert
-menu "ls -la /tmp"                                  # answered, then a new prompt painted
+menu "git status --short --branch"        # same pending question, repainted wider
 sleep 3
-[ ! -s "$SENT" ] && ok "a new prompt is not alerted under the old fingerprint" || bad "stale fingerprint alerted"
+[ -s "$SENT" ] && ok "moved fingerprint still alerts (late, not never)" || bad "SILENT — a changed fingerprint dropped the alert"
+
+printf '== grace: the window is sanitized (asserted directly, not by waiting) ==\n'
+# Unvalidated, this value reaches `sleep`: a non-numeric one makes the timer
+# exit instantly and an absurd one is unbounded silence. Asserted through
+# _ag_grace_seconds so the clamp is actually covered - a test that had to sleep
+# 900s to check it would never have been written.
+[ "$(HERDR_ALERT_GRACE_S=45 _ag_grace_seconds)" = 45 ]        && ok "a sane window is honoured"        || bad "45 -> $(HERDR_ALERT_GRACE_S=45 _ag_grace_seconds)"
+[ "$(HERDR_ALERT_GRACE_S=not-a-number _ag_grace_seconds)" = 90 ] && ok "non-numeric falls back to 90"  || bad "non-numeric -> $(HERDR_ALERT_GRACE_S=not-a-number _ag_grace_seconds)"
+[ "$(HERDR_ALERT_GRACE_S= _ag_grace_seconds)" = 90 ]          && ok "empty falls back to 90"           || bad "empty -> $(HERDR_ALERT_GRACE_S= _ag_grace_seconds)"
+[ "$(HERDR_ALERT_GRACE_S=99999 _ag_grace_seconds)" = 900 ]    && ok "absurd window clamped to 900"     || bad "99999 -> $(HERDR_ALERT_GRACE_S=99999 _ag_grace_seconds)"
+[ "$(HERDR_ALERT_GRACE_S=0 _ag_grace_seconds)" = 1 ]          && ok "zero floored to 1"                || bad "0 -> $(HERDR_ALERT_GRACE_S=0 _ag_grace_seconds)"
+
+printf '== AG-06: an omp steering queue does not satisfy the shape gate ==\n'
+# The numbered extractor matches `1. Conductor: …`. Accepting it would hold an
+# alert for an UNRECOGNIZED panel that no peer can answer — silence for a
+# prompt that is nobody's.
+printf 'Allow tool: bash\n\nApprove\nAlways allow\nDeny\n\n Steering · 2\n   1. Conductor: do the thing\n   2. Conductor: and the other\n' > "$SCREEN"
+human_must_answer "$PANE" && ok "unrecognized panel + queue alerts a human" || bad "held a panel no peer can answer"
+
+printf '== a genuine numbered prompt (no omp furniture) is still classified ==\n'
+cat > "$SCREEN" <<'EOF'
+ Bash command
+   git status --short
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+EOF
+human_must_answer "$PANE" && bad "a plain allow-class numbered prompt should be held" || ok "numbered Claude/Codex prompt still gated normally"
 
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

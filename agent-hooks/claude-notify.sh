@@ -100,6 +100,7 @@ if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
   # nothing to classify and the gate says "tell a person", so a hand-started
   # Claude session alerts exactly as it always did.
   . "$_hook_dir/../lib/prompt-parse.sh"
+  . "$_hook_dir/../lib/run-registry.sh"   # append_event, for alert_grace_expired
   . "$_hook_dir/../lib/alert-gate.sh"
   if [ -z "${HERDR_PANE_ID:-}" ] || human_must_answer "${HERDR_PANE_ID}"; then
     bash "$notify" --choices ${cwd:+--cwd "$cwd"} "$msg" >/dev/null 2>&1 || true
