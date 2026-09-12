@@ -48,6 +48,38 @@ menu() {  # <command>
   printf 'Allow tool: bash\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\n Deny\n\nup/down navigate  enter select  esc cancel\n' "$1" > "$SCREEN"
 }
 run() { bash "$here/peer-answer.sh" --interval 0 "$@" >"$WORK/out.txt" 2>"$WORK/err.txt"; }
+LOCKS="$HERDR_BRIDGE_STATE/peer-answer-locks"
+
+printf '== PA-3: an INCOMPLETE panel (no footer) is never answered ==\n'
+printf 'Allow tool: bash\nCommand: git status\n\n\033[48;2;42;47;65m Approve\033[0m\n Deny\n' > "$SCREEN"; : > "$KEYS"
+run --max-rounds 1 "$PANE"; rc=$?
+[ "$rc" -eq 3 ] && [ "$(keys_pressed)" = "0" ] && ok "incomplete panel: no key, pane still watched" || bad "rc=$rc keys=$(keys_pressed)"
+
+printf '== PA-2: a non-policy outcome is NOT a permanent refusal (pane lock held, then released) ==\n'
+menu "git status --short"; : > "$KEYS"
+mkdir -p "$LOCKS/pane-$(printf '%s' "$PANE" | tr -c 'A-Za-z0-9' '_')"
+( sleep 1; rmdir "$LOCKS/pane-$(printf '%s' "$PANE" | tr -c 'A-Za-z0-9' '_')" ) &
+bash "$here/peer-answer.sh" --interval 2 --max-rounds 2 "$PANE" >"$WORK/out.txt" 2>"$WORK/err.txt"; rc=$?
+wait
+[ "$(keys_pressed)" = "1" ] && ok "pressed once the lock was released (not blacklisted)" || bad "keys=$(keys_pressed) rc=$rc out: $(cat "$WORK/out.txt")"
+
+printf '== PA-1: --agent must declare menu-prompt; other agents are never swept in ==\n'
+run --max-rounds 1 --agent weawr-lab --cwd-prefix /tmp; rc=$?
+[ "$rc" -eq 2 ] && grep -q 'menu-prompt' "$WORK/err.txt" && ok "agent without menu-prompt refused at start (exit 2)" || bad "rc=$rc err: $(cat "$WORK/err.txt")"
+menu "pwd"; : > "$KEYS"
+run --max-rounds 1 --agent claude "$PANE"; rc=$?
+[ "$rc" -eq 2 ] && [ "$(keys_pressed)" = "0" ] && ok "claude (numbered-prompt) refused at start, nothing pressed" || bad "rc=$rc keys=$(keys_pressed)"
+
+printf '== PA-5: a second instance on the same watch set is refused while the first lives ==\n'
+printf ' working on it\n' > "$SCREEN"
+bash "$here/peer-answer.sh" --interval 1 --max-rounds 4 "$PANE" >/dev/null 2>&1 &
+first=$!; sleep 1
+run --max-rounds 1 "$PANE"; rc=$?
+[ "$rc" -eq 2 ] && grep -q 'another instance' "$WORK/err.txt" && ok "duplicate instance refused (exit 2)" || bad "rc=$rc err: $(cat "$WORK/err.txt")"
+wait "$first"
+run --max-rounds 1 "$PANE"; rc=$?
+[ "$rc" -eq 3 ] && ok "lock released when the first instance exited" || bad "rc=$rc err: $(cat "$WORK/err.txt")"
+
 
 printf '== allow-class panel: pressed once, reported ==\n'
 menu "git status --short"; : > "$KEYS"
