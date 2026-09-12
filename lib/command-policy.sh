@@ -89,6 +89,11 @@ scannable_command() {
   # be MORE willing to see through quoting than a real shell, not less —
   # false positives here just mean a human reviews something safe, false
   # negatives mean a destructive command auto-executes.
+  # A backslash-newline continuation is one logical line to the shell, and
+  # the matchers below are line-scoped — `gh pr \<newline>merge 5` used to
+  # read as two harmless halves (PR #57 review, F2). Fold it before the
+  # quote/backslash strip below eats the backslash.
+  text="$(printf '%s' "$text" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
   text="$(printf '%s' "$text" | sed "s/['\"\\\\]//g")"
   text="$(_cp_flatten_substitutions "$text")"
   printf '%s' "$text"
@@ -379,11 +384,17 @@ conductor_reserved_reason() {
   _cp_best_v=0; _cp_best_r=""
   _cp_apply_operator_rules "$norm"
   if [ "$_cp_best_v" -gt 0 ]; then printf '%s\n' "$_cp_best_r"; return; fi
-  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.env(\.[A-Za-z0-9_-]+)?\b|id_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[[:space:]])(printenv|env)([[:space:]]|$)|\bop[[:space:]]+(read|item[[:space:]]+get)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm"; then
+  # Widened 2026-09-12 (security review of PR #57, findings F2–F6): once the
+  # peer path relies on this list, every gap here is a peer-pressed Approve.
+  # `gh -R o/r pr merge`, `gh api -X PUT …/merge`, `gh pr review --approve`,
+  # bare `git push` / `--all` / `--mirror` (upstream may be main), agent
+  # flags that switch approvals off, edits to the two policy scripts, the gh
+  # OAuth token file and bare env dumps were all classify=allow + unreserved.
+  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.env(\.[A-Za-z0-9_-]+)?\b|id_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[[:space:]])(printenv|env)([[:space:]]|$)|(^|[;[:space:]])(export|set)[[:space:]]*($|;)|\bdeclare[[:space:]]+-p\b|\bop[[:space:]]+(read|item[[:space:]]+get)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm"; then
     printf 'credential-value access remains human-only\n'
-  elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]])' "$norm"; then
+  elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]])|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]]+(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)' "$norm"; then
     printf 'remote mutation remains human-only\n'
-  elif _cp_imatch '\bgh[[:space:]]+pr[[:space:]]+merge\b|\bgit\b.*\bpush\b.*\b(main|master)\b|\b(gate-registry|approval-policy)\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo' "$norm"; then
+  elif _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\bgit\b.*\bpush\b.*\b(main|master)\b|\bgit\b.*\bpush\b.*(--all\b|--mirror\b)|(^|[;[:space:]])git[[:space:]]+push[[:space:]]*($|;)|\b(gate-registry|approval-policy|command-policy\.sh|herdr-select\.sh)\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$norm"; then
     printf 'merge, governance, or control weakening remains human-only\n'
   fi
 }
