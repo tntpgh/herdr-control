@@ -191,15 +191,24 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
   # avoid. Poll briefly for the options to appear. Costs nothing when they are
   # already there, and the hook is async so a short wait is free.
   #
-  # BOTH prompt shapes, in the same order herdr-select.sh's _current_offer() and
-  # prompt_id() use them — numbered first, then the menu. This was numbered-ONLY
-  # until 2026-08-01, which made every omp alert unanswerable: omp renders an
+  # BOTH prompt shapes, MENU first — the same order herdr-select.sh's
+  # _current_offer() and prompt_id() now use. It was numbered-ONLY until
+  # 2026-08-01, which made every omp alert unanswerable: omp renders an
   # Approve/Deny highlight menu with no numbers on screen, so prompt_options
   # always returned empty, the alert fell through to the plain-context branch,
   # and with no options there were no buttons, no "reply with 1/2" line, and
   # nothing written to pending.jsonl (so herdr-resolve.sh never tracked or
   # retracted it either). Observed live: the alert arrived and could only be
   # read, not acted on.
+  #
+  # The order was then numbered-first, and on an omp pane that is worse than
+  # unanswerable — it is WRONGLY answerable. omp paints its steering queue
+  # ("1. Conductor: …") above the panel, so prompt_options matched the QUEUE:
+  # Slack rendered those lines as the choices while the button carried the
+  # panel's fingerprint, and a click on "1" pressed Approve on a command the
+  # operator never saw. The bridge sets HERDR_SELECT_VIA, so that click counts
+  # as human authority and the command-policy gate does not run. Menu-first
+  # closes it: an approval panel is described by the panel.
   #
   # prompt_menu_options numbers the rows 1..N top-to-bottom — deliberately the
   # same convention as prompt_options — so everything downstream (the threaded
@@ -209,8 +218,8 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
   mech=""
   pid=""
   for _ in 1 2 3 4 5 6 7 8; do
-    opts=$(prompt_options "$pane");     [ -n "$opts" ] && { mech=numbered; break; }
     opts=$(prompt_menu_options "$pane"); [ -n "$opts" ] && { mech=menu; break; }
+    opts=$(prompt_options "$pane");      [ -n "$opts" ] && { mech=numbered; break; }
     sleep 0.25
   done
   # Fingerprint the prompt that produced THESE options, taken here rather than
