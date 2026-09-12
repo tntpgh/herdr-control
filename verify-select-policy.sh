@@ -125,7 +125,13 @@ printf '== RESERVED form (main merge), classifier ALLOW, peer authority -> REFUS
 # trusted automated answerer could press Approve on a merge the reviewed
 # conductor is refused. A reservation for the conductor is a reservation for
 # every automated authority below it.
-for reserved in "gh pr merge 5 --squash" "git push origin main" "op read op://secrets/x/credential" "wrangler deploy"; do
+# The second row of forms is the PR #57 security review's F2–F6: each was
+# classify=allow AND unreserved before the widening, i.e. a peer-pressed
+# Approve on a merge, a main push, an env dump, or an approvals-off flag.
+for reserved in "gh pr merge 5 --squash" "git push origin main" "op read op://secrets/x/credential" "wrangler deploy" \
+                "gh -R o/r pr merge 5" "gh api -X PUT repos/o/r/pulls/5/merge -f sha=abc" "gh pr review 5 --approve" \
+                "git push --all" "git push" "gh alias set m pr-merge" "codex --yolo" "codex -a yolo" "claude --permission-mode bypassPermissions" \
+                "cat ~/.config/gh/hosts.yml" "export" "declare -p" "vim lib/command-policy.sh"; do
   set_screen "$reserved"; reset_keys
   before_esc=$(count_events approval_escalated)
   sel 1 --authority peer; rc=$?
@@ -133,6 +139,14 @@ for reserved in "gh pr merge 5 --squash" "git push origin main" "op read op://se
   [ "$(keys_pressed)" = "0" ] && ok "NO KEY PRESSED for '$reserved'" || bad "keys pressed=$(keys_pressed) on '$reserved'!"
   grep -q 'human-only' "$WORK/err.txt" && ok "reservation named on stderr" || bad "no reservation on stderr: $(cat "$WORK/err.txt")"
   [ "$(( $(count_events approval_escalated) - before_esc ))" = "1" ] && ok "approval_escalated recorded" || bad "escalation not recorded for '$reserved'"
+done
+last_verdict=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT json_extract(payload,'$.verdict') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")
+[ "$last_verdict" = "reserved" ] && ok "escalation event carries verdict=reserved (F1)" || bad "escalation verdict=$last_verdict (expected reserved)"
+printf '== positive controls: the worker flow the lab depends on is STILL allowed ==\n'
+for allowed in "git push -u origin HEAD" "gh pr create --base main --fill" "gh issue edit 5 --add-label ready-for-review" "set -euo pipefail" "export UV_CACHE_DIR=/tmp/uv" "bash scripts/ci.sh"; do
+  set_screen "$allowed"; reset_keys
+  sel 1 --authority peer; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "'$allowed' still allowed for peer" || bad "'$allowed' now refused: rc=$rc; $(grep -m1 REFUSED "$WORK/err.txt")"
 done
 printf '== the SAME reserved prompt, HUMAN authority -> allowed (a human is the authority) ==\n'
 set_screen "gh pr merge 5 --squash"; reset_keys
@@ -267,6 +281,10 @@ set_rows() {  # each arg becomes one boxed panel row after "Command:"
 set_rows 'rm \' '-rf /Users/thurbs/Code'; reset_keys
 sel 1 --authority peer; rc=$?
 [ "$rc" = 8 ] && [ "$(keys_pressed)" = 0 ] && ok "continuation row '-rf …' still escalates" || bad "flag row stripped before classification"
+printf '== a backslash-newline continuation is one logical command (F2) ==\n'
+set_rows 'gh pr \' 'merge 5'; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = "0" ] && ok "'gh pr \\<nl>merge 5' refused, no key" || bad "continuation slipped: rc=$rc keys=$(keys_pressed)"
 set_rows 'true; \' ':(){ :|:& };:'; reset_keys
 conductor_select; rc=$?
 [ "$rc" = 8 ] && [ "$(keys_pressed)" = 0 ] && ok "punctuation-only row (fork bomb) still denies" || bad "fork bomb row erased"
