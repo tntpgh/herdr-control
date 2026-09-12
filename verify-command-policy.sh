@@ -50,6 +50,67 @@ check_not_allow() {
   fi
 }
 
+# check_reserved <label> <command> — conductor_reserved_reason must name it.
+# The peer path relies on this list too (PR #57), so an unreserved spelling of
+# a reserved action is an automated Approve, not a missing warning.
+check_reserved() {
+  local label="$1" cmd="$2" got
+  total=$((total + 1))
+  got="$(conductor_reserved_reason "$cmd")"
+  if [ -n "$got" ]; then
+    printf 'PASS  %-52s => reserved\n' "$label"
+  else
+    printf 'FAIL  %-52s => NOT reserved (an automated authority would press Approve)\n' "$label"
+    failed=$((failed + 1))
+  fi
+}
+
+# check_unreserved <label> <command> — must stay answerable by a peer. These are
+# the ordinary worker flow; reserving them sends every worker to a human and
+# re-creates the alert flood.
+check_unreserved() {
+  local label="$1" cmd="$2" got
+  total=$((total + 1))
+  got="$(conductor_reserved_reason "$cmd")"
+  if [ -z "$got" ]; then
+    printf 'PASS  %-52s => unreserved\n' "$label"
+  else
+    printf 'FAIL  %-52s => reserved [%s] (breaks the worker flow)\n' "$label" "$got"
+    failed=$((failed + 1))
+  fi
+}
+
+echo "== detonation F2: one invalid byte must not blank the scanner =="
+# BSD sed aborts on the first non-UTF-8 byte in a UTF-8 locale, so every
+# transform in scannable_command returned "" and the floor table judged an
+# EMPTY command: verdict allow, reservation none. A worker only has to emit one
+# stray byte (a latin-1 filename in `ls`, a corrupt log line) into its own pane.
+_dirty="$(printf 'git %s origin %s \377trailing' push ma"in")"
+check_reserved "default-branch push with a trailing 0xFF byte" "$_dirty"
+_dirty_scan="$(scannable_command "$_dirty")"
+total=$((total + 1))
+if [ -n "$_dirty_scan" ]; then
+  printf 'PASS  %-52s => [%s]\n' "scannable_command survives the byte" "$_dirty_scan"
+else
+  printf 'FAIL  %-52s => EMPTY (fail-open in the floor table itself)\n' "scannable_command survives the byte"
+  failed=$((failed + 1))
+fi
+_dirty_rm="$(printf 'rm -rf /tmp/x \377')"
+check_not_allow "recursive rm with a trailing 0xFF byte" "$_dirty_rm"
+
+echo "== detonation F3: reserved actions spelled around the old regexes =="
+check_reserved "git -C <dir> push (breaks push adjacency)"   "git -C /Users/thurbs/Code/other push"
+check_reserved "bare git push (upstream may be default)"     "git push"
+check_reserved "gh api --method=PUT .../merge (= form)"      "gh api --method=PUT repos/o/r/pulls/1/merge"
+check_reserved "gh api path ending /merge"                   "gh api repos/o/r/pulls/1/merge -X PUT"
+
+echo "== the worker flow stays peer-answerable (else the alert flood returns) =="
+check_unreserved "push a feature branch"        "git push -u origin HEAD"
+check_unreserved "open a PR"                    "gh pr create --base main --fill"
+check_unreserved "hand off for review"          "gh issue edit 5 --add-label ready-for-review"
+check_unreserved "run the repo's checks"        "bash scripts/ci.sh"
+check_unreserved "read the tree"                "git status --short --branch"
+
 echo "== positive controls: ordinary read-only/build commands must stay allow =="
 check "ls -la"                       "ls -la"    allow
 check "git status"                   "git status" allow
