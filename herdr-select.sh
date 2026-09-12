@@ -442,6 +442,28 @@ fi
 approval_confirmed "$approval_id" "pressed" \
   "mechanism=$mechanism choice=$choice" >/dev/null 2>&1 || true
 
+# The answer unblocks the worker, so the task is running again — say so.
+# lib/push-wake.sh writes `blocked` when a prompt paints, and until now NOTHING
+# wrote the other half: not this script, not lib/reconcile.sh (which only
+# transitions tasks whose PANE is gone). So an answered, working task reported
+# `blocked` forever, and hub's "N task(s) need attention" counted live workers
+# as stalled — six pages for three tasks that were all fine (2026-09-12).
+# Scoped to the task registered for THIS pane, taken from the registry rather
+# than the caller's environment: a conductor or the Slack bridge answering a
+# worker's prompt is not running inside that worker's HERDR_TASK_ID.
+# Best-effort and last: a bookkeeping write must never fail an answer that has
+# already landed, and set_task_state refuses a terminal->running transition on
+# its own, so a completed or lost task is not resurrected here.
+_answered_task="$(task_for_pane "$pane" 2>/dev/null || printf '')"
+if [ -n "$_answered_task" ]; then
+  _at_run=$(printf '%s' "$_answered_task" | jq -r '.run_id // empty')
+  _at_task=$(printf '%s' "$_answered_task" | jq -r '.task_id // empty')
+  _at_state=$(printf '%s' "$_answered_task" | jq -r '.state // empty')
+  if [ "$_at_state" = blocked ] && [ -n "$_at_run" ] && [ -n "$_at_task" ]; then
+    set_task_state "$_at_run" "$_at_task" "running" >/dev/null 2>&1 || true
+  fi
+fi
+
 # Stop tracking the alert as pending ONLY when the answer came from Slack. That
 # is the case the untrack exists for: the message carrying your choice also
 # carries the confirmation the bridge posts under it, so herdr-resolve deleting

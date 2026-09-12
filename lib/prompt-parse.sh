@@ -216,17 +216,26 @@ prompt_menu_visible()  { _prompt_menu "$1" visible; }
 # injection time and refuse to act if it no longer matches, rather than
 # firing a stale decision into whatever the pane happens to show by then.
 #
-# Falls back to the menu-shape extractors above when no numbered options are
-# found, so --expect-prompt-id (herdr-select.sh) works the same way
-# regardless of which prompt shape is on screen — a caller never needs to
-# know or care which one it captured.
+# The MENU shape wins whenever a complete one is on screen, and only then does
+# the numbered extractor get a turn. It used to be the other way round, and
+# that was wrong for exactly the pane this fingerprint matters most on: omp
+# prints its queued/steering messages as a numbered list ("1. Conductor: …"),
+# so `prompt_options` matched THAT and every distinct approval panel on such a
+# pane hashed to the same id. Observed live 2026-09-12 — five different
+# commands (git status, a plist read, run_nightly.sh, job_ledger.py,
+# search_memory.py) all woke the conductor carrying one prompt_id, which makes
+# --expect-prompt-id assert a prompt that is not the one on screen. Preferring
+# the menu is also what herdr-select.sh's own `_current_offer` does, so the id
+# and the mechanism now agree about which prompt is being answered. A pane
+# with no menu panel (Claude, Codex) is unaffected: its menu extractors return
+# nothing and the numbered path runs exactly as before.
 prompt_id() {
   local q opts
-  q="$(prompt_question "$1")"
-  opts="$(prompt_options "$1")"
+  q="$(prompt_menu_question "$1" 2>/dev/null)"
+  opts="$(prompt_menu_options "$1" 2>/dev/null)"
   if [ -z "$opts" ]; then
-    q="$(prompt_menu_question "$1")"
-    opts="$(prompt_menu_options "$1")"
+    q="$(prompt_question "$1")"
+    opts="$(prompt_options "$1")"
   fi
   printf '%s\n%s' "$q" "$opts" | shasum -a 256 | cut -d' ' -f1
 }

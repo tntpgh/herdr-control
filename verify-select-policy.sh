@@ -178,6 +178,50 @@ sel 1; rc=$?
 [ "$rc" -eq 0 ] && ok "exit 0 — peer may answer an operational prompt" || bad "exit $rc (expected 0)"
 [ "$(q_appr authority)" = "peer" ] && ok "recorded authority=peer" || bad "authority=$(q_appr authority)"
 
+printf '== an ANSWERED prompt clears the task back to running (the hub-nag bug) ==\n'
+# lib/push-wake.sh sets `blocked` when a prompt paints and nothing wrote the
+# other half, so hub counted working tasks as needing attention — six pages for
+# three healthy workers, 2026-09-12.
+q_task_state() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT state FROM tasks WHERE task_id='task1';" 2>/dev/null; }
+set_task_state run1 task1 blocked >/dev/null 2>&1
+[ "$(q_task_state)" = "blocked" ] && ok "precondition: task is blocked" || bad "precondition failed: $(q_task_state)"
+set_screen "ls -la /tmp"; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "the prompt was answered" || bad "rc=$rc keys=$(keys_pressed)"
+[ "$(q_task_state)" = "running" ] && ok "task cleared blocked -> running" || bad "task state=$(q_task_state) (expected running)"
+
+printf '== a REFUSED prompt leaves the task blocked (nothing was answered) ==\n'
+set_task_state run1 task1 blocked >/dev/null 2>&1
+set_screen "gh pr merge 5 --squash"; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = "0" ] && ok "refused, no key" || bad "rc=$rc keys=$(keys_pressed)"
+[ "$(q_task_state)" = "blocked" ] && ok "still blocked — a human is genuinely needed" || bad "task state=$(q_task_state) (expected blocked)"
+
+# (terminal->running is set_task_state's own invariant; verify-run-registry.sh
+# owns that case. Asserting it here would strand task1 as `completed` for every
+# test below, because that refusal is exactly what it proves.)
+set_task_state run1 task1 running >/dev/null 2>&1
+
+printf '== prompt_id fingerprints the PANEL, not omp queued messages ==\n'
+# Five different commands woke the conductor under one prompt_id on 2026-09-12,
+# because prompt_options matched omp's "1. Conductor: …" queue instead of the
+# approval panel — which makes --expect-prompt-id assert the wrong prompt.
+. "$here/lib/prompt-parse.sh"
+# The queue sits ABOVE the panel, which is where omp paints it (verified on a
+# live pane 2026-09-12). That position is what makes this a fingerprint bug
+# rather than a parse failure: the menu extractor opens at "Allow tool:" and
+# never sees those rows, while the numbered extractor scans the whole visible
+# region and matches them — so every panel on the pane hashed identically.
+menu_with_queue() {  # <command>
+  printf ' Steering · 2\n   1. Conductor: do the thing\n   2. Conductor: and the other\n\nAllow tool: bash\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\n Deny\n\nup/down navigate  enter select  esc cancel\n' "$1" > "$SCREEN"
+}
+menu_with_queue "git status --short"; id_a=$(prompt_id "$PANE")
+menu_with_queue "sed -n 1,150p tests/test_x.py"; id_b=$(prompt_id "$PANE")
+[ -n "$id_a" ] && [ "$id_a" != "$id_b" ] && ok "two different panels, two different ids" || bad "collision: $id_a == $id_b"
+menu_with_queue "git status --short"; id_c=$(prompt_id "$PANE")
+[ "$id_a" = "$id_c" ] && ok "the same panel is stable across reads" || bad "unstable id: $id_a != $id_c"
+
 printf '== a Slack reply IS demonstrably human (bridge sets HERDR_SELECT_VIA) ==\n'
 # The bridge sets this for both the threaded-number and button routes, and only
 # after its own user allowlist check — so a real person acted, and must not be
