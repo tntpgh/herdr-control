@@ -93,10 +93,16 @@ while :; do
   done <<EOF
 $(watched)
 EOF
-  [ "$live" -gt 0 ] || { echo "peer-answer: no watched agent pane remains"; exit 0; }
+  # Explicit panes: done when they are all gone. --cwd-prefix: panes appear
+  # and vanish as a lab dispatches, so an empty round is just an empty round;
+  # the loop runs until --max-rounds or the supervisor stops it.
+  if [ "$live" -eq 0 ] && [ -z "$prefix" ]; then
+    echo "peer-answer: no watched agent pane remains"; exit 0
+  fi
   rounds=$((rounds + 1))
   if [ "$max" -gt 0 ] && [ "$rounds" -ge "$max" ]; then
-    echo "peer-answer: round budget spent with $live pane(s) still live" >&2; exit 3
+    [ "$live" -gt 0 ] && echo "peer-answer: round budget spent with $live pane(s) still live" >&2 && exit 3
+    echo "peer-answer: round budget spent, nothing to watch"; exit 0
   fi
   sleep "$interval"
 done
