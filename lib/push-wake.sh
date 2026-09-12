@@ -46,6 +46,10 @@
 set -uo pipefail
 
 _pw_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Sourced here, not left to callers: the delivery gate below is a behavioural
+# guarantee of push_wake itself, and a guarantee a caller can forget to load is
+# not one.
+. "$_pw_dir/lib/alert-gate.sh"
 
 # Map send-to-agent.sh's exit status onto its own documented vocabulary, so the
 # recorded outcome is the same word the operator sees in a terminal.
@@ -176,6 +180,30 @@ push_wake() {
     # exit 8 rather than being auto-approved.
     wake="$wake  ·  ANSWER IT: $_pw_dir/herdr-select.sh ${HERDR_PANE_ID} <option>"
     [ -n "$pid" ] && wake="$wake --expect-prompt-id $pid"
+  fi
+
+  # ---- is a HUMAN actually being waited for? ---------------------------------
+  # Everything above this line still happens for every prompt: the stale/terminal
+  # rejection, the pane-birth checks, the `blocked` state, the `input_required`
+  # row. Only the DELIVERY is gated, and deliberately at this line rather than at
+  # the hook's decision point — a gate in the caller would skip the guards and
+  # the audit trail with it, which is the bug the first draft of this shipped.
+  #
+  # An allow-class, unreserved prompt is one peer-answer.sh takes in seconds.
+  # Waking a conductor (and paging Slack) for `git status` is the noise that
+  # teaches its reader to ignore the channel — observed 2026-09-12, an afternoon
+  # of workers doing ordinary work. Held, never dropped: grace_realert re-checks
+  # and delivers late if the prompt outlives the window. See lib/alert-gate.sh.
+  if [ -n "${HERDR_PANE_ID:-}" ] && ! human_must_answer "${HERDR_PANE_ID}"; then
+    if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
+      append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "wake_held" \
+        "$(jq -nc --arg p "$cpane" --arg pid "$pid" --arg k "$base" \
+           '{conductor_pane:$p, prompt_id:$pid, wake_key:$k, reason:"allow-class and unreserved; a peer may answer it"}')" \
+        "${base}_held" >/dev/null 2>&1 || true
+    fi
+    grace_realert "${HERDR_PANE_ID}" "$pid" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+      bash "$_pw_dir/send-to-agent.sh" "$cpane" "$wake"
+    return 0
   fi
 
   # Every ATTEMPT gets its own pair of event rows. The previous ids

@@ -90,7 +90,19 @@ if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
   # explicitly avoids herdr-notify having to disambiguate several panes sharing
   # one repo cwd — a wrong guess there sends the operator's reply to a different
   # agent.
-  bash "$notify" --choices --pane "$pane" "$msg" >/dev/null 2>&1 || true
+  #
+  # Gated the same way the conductor wake is (lib/alert-gate.sh, applied inside
+  # push_wake): an allow-class, unreserved prompt is one peer-answer.sh takes in
+  # seconds, and paging for it is what turned an afternoon of ordinary worker
+  # activity into a Slack flood on 2026-09-12. Held, never dropped — if the
+  # prompt outlives the grace window the alert is sent after all.
+  if human_must_answer "$pane"; then
+    bash "$notify" --choices --pane "$pane" "$msg" >/dev/null 2>&1 || true
+  else
+    grace_realert "$pane" "$(prompt_id "$pane" 2>/dev/null || printf '')" \
+      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+      bash "$notify" --choices --pane "$pane" "$msg"
+  fi
 fi
 
 # ---- push wake to the conductor --------------------------------------------

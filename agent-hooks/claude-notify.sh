@@ -93,7 +93,21 @@ if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
   # your instructions to a different agent. herdr-notify now resolves the pane
   # exactly (tmux-session match) and declines to tag when it cannot; pass the
   # hook's cwd only as a last-resort hint it may use if it is UNAMBIGUOUS.
-  bash "$notify" --choices ${cwd:+--cwd "$cwd"} "$msg" >/dev/null 2>&1 || true
+  # Gated the same way the conductor wake is (lib/alert-gate.sh, applied inside
+  # push_wake): an allow-class, unreserved prompt is one an automated peer takes
+  # in seconds, and paging for it is the noise that teaches its reader to ignore
+  # the channel (2026-09-12). Held, never dropped. With no HERDR_PANE_ID there is
+  # nothing to classify and the gate says "tell a person", so a hand-started
+  # Claude session alerts exactly as it always did.
+  . "$_hook_dir/../lib/prompt-parse.sh"
+  . "$_hook_dir/../lib/alert-gate.sh"
+  if [ -z "${HERDR_PANE_ID:-}" ] || human_must_answer "${HERDR_PANE_ID}"; then
+    bash "$notify" --choices ${cwd:+--cwd "$cwd"} "$msg" >/dev/null 2>&1 || true
+  else
+    grace_realert "${HERDR_PANE_ID}" "$(prompt_id "${HERDR_PANE_ID}" 2>/dev/null || printf '')" \
+      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+      bash "$notify" --choices ${cwd:+--cwd "$cwd"} "$msg"
+  fi
 fi
 
 # --- push wake: also alert the CONDUCTOR pane directly (control-plane Edge 1,
