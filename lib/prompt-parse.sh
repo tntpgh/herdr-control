@@ -234,8 +234,29 @@ prompt_id() {
   q="$(prompt_menu_question "$1" 2>/dev/null)"
   opts="$(prompt_menu_options "$1" 2>/dev/null)"
   if [ -z "$opts" ]; then
+    # No COMPLETE panel, so the numbered extractor supplies the options. But on
+    # an omp pane the numbered extractor matches the STEERING QUEUE, and any
+    # text below the navigation footer resets the menu parse — question
+    # included — so both halves of the hash came from the queue and every
+    # command on the pane collided again (PR #59 review, F3: the same failure
+    # this function exists to stop, one layout over).
+    #
+    # So when a panel is on screen at all, scrape its own header rows straight
+    # out of the region — "Allow tool:" down to the navigation footer — and
+    # keep them in the hash. Bounded to the panel, never the whole visible
+    # window: a fingerprint that moved with unrelated transcript output would
+    # make --expect-prompt-id refuse a prompt that had not changed.
+    local menu_q="$q"
+    if [ -z "$menu_q" ]; then
+      menu_q="$(herdr pane read "$1" --source visible --lines 60 2>/dev/null \
+        | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \
+        | sed -n '/Allow tool:/,/enter select/p' \
+        | sed -E 's/^[[:space:]│|]+//; s/[[:space:]│|]+$//' \
+        | grep -vE '^$')"
+    fi
     q="$(prompt_question "$1")"
     opts="$(prompt_options "$1")"
+    [ -n "$menu_q" ] && q="$menu_q"$'\n'"$q"
   fi
   printf '%s\n%s' "$q" "$opts" | shasum -a 256 | cut -d' ' -f1
 }

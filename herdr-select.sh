@@ -454,12 +454,33 @@ approval_confirmed "$approval_id" "pressed" \
 # Best-effort and last: a bookkeeping write must never fail an answer that has
 # already landed, and set_task_state refuses a terminal->running transition on
 # its own, so a completed or lost task is not resurrected here.
+# Two narrowings from the PR #59 review. F4: re-bind to the pane_birth already
+# validated before the keypress — task_for_pane takes the most recently updated
+# row for a pane id, so if two rows ever share one and a concurrent writer
+# reorders them between the guard and here, the write would land on the other
+# task. Blast radius is one bookkeeping field, but the fix is a comparison.
+# F6: a DECLINE that opens a composer (Claude's "No, and tell me what to do
+# differently") leaves the worker waiting on typed human input — recording that
+# as `running` is the same lie in the other direction, so only an answered
+# menu, or a decline that needs no typing, clears the state.
+# `declining` only marks the menu's own Deny (line 174), so it does not cover
+# Claude's third option — "No, and tell Claude what to do differently" — which
+# opens the composer and leaves the worker waiting on typed human input with no
+# further Notification hook to re-mark it. Recognise that shape by its label and
+# leave the task blocked: reporting it running is the same lie as the one this
+# block fixes, pointed the other way.
+case "$label" in
+  *"tell "*"what to do"*|*"and tell"*|*"provide instructions"*) _opens_composer=1 ;;
+  *) _opens_composer=0 ;;
+esac
 _answered_task="$(task_for_pane "$pane" 2>/dev/null || printf '')"
-if [ -n "$_answered_task" ]; then
+if [ -n "$_answered_task" ] && [ "$_opens_composer" = 0 ]; then
   _at_run=$(printf '%s' "$_answered_task" | jq -r '.run_id // empty')
   _at_task=$(printf '%s' "$_answered_task" | jq -r '.task_id // empty')
   _at_state=$(printf '%s' "$_answered_task" | jq -r '.state // empty')
-  if [ "$_at_state" = blocked ] && [ -n "$_at_run" ] && [ -n "$_at_task" ]; then
+  _at_birth=$(printf '%s' "$_answered_task" | jq -r '.pane_birth // empty')
+  if [ "$_at_state" = blocked ] && [ -n "$_at_run" ] && [ -n "$_at_task" ] &&
+     [ -n "$_at_birth" ] && [ "$_at_birth" = "$(pane_birth_now "$pane" 2>/dev/null)" ]; then
     set_task_state "$_at_run" "$_at_task" "running" >/dev/null 2>&1 || true
   fi
 fi

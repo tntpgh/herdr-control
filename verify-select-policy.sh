@@ -222,6 +222,63 @@ menu_with_queue "sed -n 1,150p tests/test_x.py"; id_b=$(prompt_id "$PANE")
 menu_with_queue "git status --short"; id_c=$(prompt_id "$PANE")
 [ "$id_a" = "$id_c" ] && ok "the same panel is stable across reads" || bad "unstable id: $id_a != $id_c"
 
+printf '== F3: the id still separates panels when the panel parses INCOMPLETE ==\n'
+# Any text below the navigation footer resets the menu parse, so the numbered
+# extractor takes over — and on an omp pane it matches the steering queue for
+# BOTH question and options, which collided again until the panel question was
+# kept in the hash.
+menu_queue_below() {  # <command>
+  printf 'Allow tool: bash\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\n Deny\n\nup/down navigate  enter select  esc cancel\n\n Steering · 2\n   1. Conductor: do the thing\n   2. Conductor: and the other\n' "$1" > "$SCREEN"
+}
+menu_queue_below "git status --short"; id_d=$(prompt_id "$PANE")
+menu_queue_below "sed -n 1,150p tests/test_x.py"; id_e=$(prompt_id "$PANE")
+[ "$id_d" != "$id_e" ] && ok "incomplete panel: two commands, two ids" || bad "collision below the footer: $id_d == $id_e"
+
+printf '== the id is STABLE while the highlight moves (or navigation would abort) ==\n'
+menu_with_queue "git status --short"; id_hi=$(prompt_id "$PANE")
+printf ' Steering · 2\n   1. Conductor: do the thing\n   2. Conductor: and the other\n\nAllow tool: bash\nCommand: git status --short\n\n Approve\n\033[48;2;42;47;65m Deny\033[0m\n\nup/down navigate  enter select  esc cancel\n' > "$SCREEN"
+id_lo=$(prompt_id "$PANE")
+[ "$id_hi" = "$id_lo" ] && ok "moving the highlight does not change the id" || bad "id changed with the highlight: $id_hi != $id_lo"
+
+printf '== F4: a stale row under the same pane id is NOT cleared (birth must match) ==\n'
+set_task_state run1 task1 blocked >/dev/null 2>&1
+BIRTH="term-DIFFERENT-999"          # live pane no longer matches the registered row
+set_screen "ls -la /tmp"; reset_keys
+sel 1 --authority peer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 7 ] && ok "recycled pane refused before any key (exit 7)" || bad "exit $rc (expected 7)"
+[ "$(q_task_state)" = "blocked" ] && ok "state untouched on a recycled pane" || bad "state=$(q_task_state)"
+BIRTH="term-abc-123"
+
+printf '== F6: a typed-answer DECLINE does not report running ==\n'
+# Claude option 3 opens the composer; the worker is waiting on a person, so
+# calling it running is the same lie in the other direction.
+set_task_state run1 task1 blocked >/dev/null 2>&1
+cat > "$SCREEN" <<'EOF'
+ Bash command
+   ls -la /tmp
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+   3. No, and tell Claude what to do differently
+EOF
+reset_keys
+sel 3 --authority peer >/dev/null 2>&1
+[ "$(q_task_state)" = "blocked" ] && ok "typed-answer decline stays blocked" || bad "state=$(q_task_state) (expected blocked)"
+set_task_state run1 task1 running >/dev/null 2>&1
+
+printf '== the Slack alert describes the PANEL, not omp queued messages ==\n'
+# herdr-notify.sh polled numbered-first, so on this exact pane Slack rendered
+# "1. Conductor: …" as the choices while the button carried the panel's id —
+# a click on 1 pressed Approve on a command the operator never saw, under
+# human authority (the bridge sets HERDR_SELECT_VIA, so no policy gate).
+menu_with_queue "git status --short"
+first_opt=$(prompt_menu_options "$PANE" | head -1)
+printf '%s' "$first_opt" | grep -qi 'approve' && ok "menu-first yields the panel's own first option" || bad "first option is '$first_opt'"
+grep -n 'prompt_menu_options "$pane"); \[ -n "$opts" \] && { mech=menu' "$here/slack-bridge/herdr-notify.sh" >/dev/null \
+  && ok "herdr-notify polls the menu before the numbered shape" \
+  || bad "herdr-notify still polls numbered-first — Slack would label the panel with the queue"
+
 printf '== a Slack reply IS demonstrably human (bridge sets HERDR_SELECT_VIA) ==\n'
 # The bridge sets this for both the threaded-number and button routes, and only
 # after its own user allowlist check — so a real person acted, and must not be

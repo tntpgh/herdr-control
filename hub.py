@@ -66,7 +66,13 @@ SEARCH_URL = os.environ.get("CONSENSUS_SEARCH_URL", "https://consensus.teamthurb
 LAUNCHD_SECRETS = Path(os.environ.get("HERDR_HUB_SECRETS_ENV", Path.home() / ".config/op/launchd-secrets.env"))
 SECRET_NAMES = frozenset(("NEON_CONNECTION_STRING", "SEARCH_SYNC_TOKEN"))
 KB_DASHBOARD_URL = os.environ.get("KB_DASHBOARD_URL", "https://dashboard.teamthurber.com")
-ATTENTION = ("input_required", "blocked", "running")
+# Attention means A PERSON IS THE ONE BEING WAITED FOR. `running` was in here,
+# which is why clearing a stale `blocked` alone did not move the badge: an
+# answered worker just swapped one attention state for another and the card
+# still said "N task(s) need attention" for tasks that were working fine
+# (six pages for three healthy tasks, 2026-09-12). A running task is active,
+# not blocked on anybody.
+ATTENTION = ("input_required", "blocked")
 
 # Every surface the team runs, hosted and local. `probe` is what "alive" means
 # for it; hosted ones also get the KB heartbeat verdict when a snapshot exists.
