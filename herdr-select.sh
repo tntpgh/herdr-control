@@ -54,9 +54,11 @@
 # registered, since there is no safe default that skips it.
 #
 # --authority peer|conductor|human keeps a reviewed operational grant distinct
-# from human approval. Peer defaults to classifier allow-only; conductor
-# requires a live owned task, exact prompt, operational category and reason,
-# and cannot cross human-reserved boundaries. Human decisions remain explicit.
+# from human approval. Peer defaults to classifier allow-only AND never
+# crosses the human-reserved list (merge/push to main, credential values,
+# remote mutation, governance, control weakening); conductor requires a live
+# owned task, exact prompt, operational category and reason, and cannot cross
+# the same human-reserved boundaries. Human decisions remain explicit.
 # A known Deny choice is safe for peers even when approving would be refused.
 #
 # THE DEFAULT FAILS CLOSED TO `peer`. It was `human`, which meant a conductor
@@ -290,9 +292,23 @@ if [ "$authority" = peer ] && [ "$declining" = 0 ]; then
     echo "herdr-select: refusing — peer authority cannot classify an unreadable prompt in $pane." >&2
     exit 8
   fi
-  if [ "$policy_verdict" != allow ]; then
-    echo "herdr-select: REFUSED ($policy_verdict) — a human must answer this one." >&2
-    [ -n "$policy_reason" ] && echo "herdr-select: $policy_reason" >&2
+  # The human-reserved list (lib/command-policy.sh conductor_reserved_reason:
+  # credential values, remote mutation, merge/push to main, governance,
+  # control weakening) used to be checked only for --authority conductor.
+  # classify_command says `allow` for `gh pr merge` and `git push origin
+  # main`, so the LEAST trusted automated authority could press Approve on
+  # exactly what the reviewed conductor is refused (found live 2026-09-12,
+  # thurber-os plan 012 lab). A reservation for the conductor is a
+  # reservation for every automated authority below it; only a human answers.
+  reservation="$(conductor_reserved_reason "$cmd_text")"
+  if [ -n "$reservation" ] || [ "$policy_verdict" != allow ]; then
+    if [ -n "$reservation" ]; then
+      echo "herdr-select: REFUSED (reserved) — $reservation" >&2
+      policy_reason="$reservation"
+    else
+      echo "herdr-select: REFUSED ($policy_verdict) — a human must answer this one." >&2
+      [ -n "$policy_reason" ] && echo "herdr-select: $policy_reason" >&2
+    fi
     echo "herdr-select: option $choice ($label) in $pane was NOT pressed." >&2
     append_event "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "approval_escalated" \
       "$(jq -nc --arg v "$policy_verdict" --arg r "$policy_reason" --arg p "$pane" \
