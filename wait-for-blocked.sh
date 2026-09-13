@@ -67,10 +67,28 @@ EOF
     echo "BLOCKED — these panes are waiting on input:"
     printf '%s\n' "$out" | while IFS=$'\t' read -r pane label ws; do
       echo "  $pane  (ws $ws, ${label})"
-      # Show the prompt itself, so the conductor can answer without another round
-      # trip. A numbered prompt is answered with herdr-select.sh <pane> <n>, NOT
-      # by sending Enter — Enter accepts whatever option happens to be highlighted.
-      herdr pane read "$pane" 2>/dev/null | tail -12 | sed 's/^/      | /'
+      # Show the prompt itself, so the conductor can answer without another
+      # round trip. A numbered prompt is answered with herdr-select.sh <pane>
+      # <n>, NOT by sending Enter — Enter accepts whatever option happens to
+      # be highlighted.
+      #
+      # When the prompt PARSES, emit the fingerprint and the parsed command
+      # rows: the fingerprint is what `herdr-select.sh --expect-prompt-id`
+      # needs to refuse a stale decision, and having it in the wake removes a
+      # separate lookup per grant. When it does not parse, fall back to the
+      # raw tail — a pane that herdr calls blocked but the parser cannot
+      # explain is exactly when the operator most needs to see raw screen.
+      if [ -n "$(prompt_menu_options "$pane" 2>/dev/null)" ] \
+         || [ -n "$(prompt_options "$pane" 2>/dev/null)" ]; then
+        printf '      prompt_id %s  selected %s\n' \
+          "$(prompt_id "$pane" 2>/dev/null | cut -c1-8)" \
+          "$(prompt_menu_selected "$pane" 2>/dev/null || echo '-')"
+        prompt_command_text "$pane" 2>/dev/null \
+          | tr ';' '\n' | sed -E 's/^ +//' | grep -vE '^$' \
+          | head -4 | sed 's/^/      | /'
+      else
+        herdr pane read "$pane" 2>/dev/null | tail -12 | sed 's/^/      | /'
+      fi
     done
     exit 0
   fi
