@@ -145,9 +145,15 @@ def _pane_statuses() -> dict | None:
         if out.returncode != 0:
             return None
         d = json.loads(out.stdout)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        panes = (d.get("result") or d).get("panes")
+    except Exception:
+        # Deliberately total. `Cached.get` converts ANY escaping exception into
+        # a truthy {"error": ...} dict, which this function's caller would read
+        # as "herdr answered, and no pane exists" — marking every live task
+        # `gone` while `herdr_reachable` still reported True. Non-object JSON
+        # (`[]`, `"x"`, `null`) reaching .get() was the concrete path: an
+        # AttributeError, not in the old except list.
         return None
-    panes = (d.get("result") or d).get("panes")
     if not isinstance(panes, list):
         return None
     return {p.get("pane_id"): (p.get("agent_status") or "idle")
@@ -168,22 +174,47 @@ def _iso_epoch(s: str | None) -> float | None:
         return None
 
 
+_DONE_RE = re.compile(rb'"event"\s*:\s*"[^"]*_done"')
+
+
+def _bus_relpaths() -> tuple[str, ...]:
+    """The handoff bus locations a READER must consider, canonical first.
+
+    `HERDR_HANDOFF_DIR` is a supported override (lib/handoff.sh `handoff_rel`),
+    and hardcoding `.handoffs` here meant that on any install that sets it, hub
+    found evidence for nobody — so every finished worker derived `stalled` and,
+    since `stalled` is an attention state, parked permanently in the
+    needs-attention list. The shell half never had this bug; that divergence is
+    precisely what the shared truth table exists to prevent, in a dimension the
+    table cannot express.
+    """
+    rel = os.environ.get("HERDR_HANDOFF_DIR") or ".handoffs"
+    return (f"{rel}/events.jsonl", ".omc/handoffs/events.jsonl")
+
+
 def _evidence_mtime(worktree: str | None) -> float | None:
     """When the worker last wrote completion evidence, or None if it never did.
 
     mtime rather than a parsed timestamp: the bus is append-only and not every
     event carries one, so the file's last write IS the last evidence.
+
+    Read as BYTES. A worker that echoes one non-UTF8 byte into its own log used
+    to raise UnicodeDecodeError here, which `Cached.get` catches as a generic
+    Exception and replaces with an error dict — leaving `/`, `/herdr` and
+    `/api/summary` reporting ZERO tasks needing attention. One stray byte
+    silenced the whole attention surface, the same shape as PR #61's floor
+    table. Nothing in this path may decode.
     """
     if not worktree:
         return None
     newest = None
-    for rel in (".handoffs/events.jsonl", ".omc/handoffs/events.jsonl"):
+    for rel in _bus_relpaths():
         p = Path(worktree) / rel
         try:
             if not p.stat().st_size:
                 continue
-            with p.open() as fh:
-                if not any(re.search(r'"event"\s*:\s*"[^"]*_done"', ln) for ln in fh):
+            with p.open("rb") as fh:
+                if not any(_DONE_RE.search(ln) for ln in fh):
                     continue
             m = p.stat().st_mtime
         except OSError:
