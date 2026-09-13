@@ -486,7 +486,11 @@ printf '== conductor itself showing a prompt -> wake REFUSED and recorded as suc
 # This is the item-4 payoff. send-to-agent.sh refuses (exit 5) rather than press
 # Enter into a live prompt; the old fire-and-forget `|| true` threw that away, so
 # a wake that never landed logged identically to one that did.
-omp_menu_screen "ls" > "$WORKER_SCREEN"
+# A wake is only DELIVERED for a prompt a human must answer
+# (lib/alert-gate.sh), so these fixtures use a human-class command: the
+# subject here is whether delivery is recorded honestly, not who owns the
+# prompt. An allow-class prompt is held and covered by verify-alert-gate.sh.
+omp_menu_screen "wrangler deploy" > "$WORKER_SCREEN"
 omp_menu_screen "something" > "$COND_SCREEN"   # conductor is mid-prompt
 : > "$SENT"
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events WHERE type='wake_result';" 2>/dev/null
@@ -592,10 +596,10 @@ run_notify_for() {                      # <run> <task> <tool>
                HERDR_RUN_ID="$1" HERDR_TASK_ID="$2" HERDR_TASK_LABEL="impl:attempts"
         bash "$here/agent-hooks/omp-notify.sh" >/dev/null 2>&1 )
 }
-omp_menu_screen "attempt-cmd-A" > "$WORKER_SCREEN"
+omp_menu_screen "wrangler deploy attempt-A" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
 run_notify_for run3 task3 bash          # conductor clean -> submitted
-omp_menu_screen "attempt-cmd-A" > "$WORKER_SCREEN"   # SAME logical prompt again
+omp_menu_screen "wrangler deploy attempt-A" > "$WORKER_SCREEN"   # SAME logical prompt again
 omp_menu_screen "busy" > "$COND_SCREEN"              # conductor mid-prompt -> refused
 run_notify_for run3 task3 bash
 n_res=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
