@@ -126,6 +126,46 @@ fi
     || bad "ACM sees files here — fixture no longer reproduces the original bypass"
 blocks "$R" "renamed file with an appended token is BLOCKED"
 
+printf '== THE PIPE-BUFFER BYPASS: a secret near the top of a LARGE file ==\n'
+# `grep -q` exits on match, `git show` dies of SIGPIPE (141), and `set -o
+# pipefail` adopts 141 as the pipeline status — so the `if` read FALSE and the
+# token sailed through. Measured 2026-09-12 against the then-live scanner: a
+# ghp_ token on line 1 of a 7 MB file was ALLOWED while the SAME token at the
+# bottom of the SAME file was blocked. 16 KB blocked, 64 KB and up allowed.
+#
+# Worse than the rename bypass: it needs no `git mv`, just a file bigger than
+# the pipe buffer — a minified bundle, a lockfile, a CSV, a JSON dump.
+#
+# The pair is the point. `top` alone could pass on a scanner that blocks
+# everything, so `clean_big` guards against exactly the false-positive
+# regression the first cut of this fix introduced (errexit aborting on a clean
+# no-match, which reads as "blocked" for every large file).
+R="$(new_repo)"
+python3 - "$R" "$GHP" <<'PYX'
+import sys
+r, ghp = sys.argv[1], sys.argv[2]
+pad = ("x" * 80 + "\n") * 90000          # ~7 MB, far past the 64 KB pipe buffer
+open(f"{r}/top.txt", "w").write(f'TOKEN = "{ghp}"\n' + pad)
+open(f"{r}/bottom.txt", "w").write(pad + f'TOKEN = "{ghp}"\n')
+open(f"{r}/clean_big.txt", "w").write(pad)
+PYX
+# Guard the guard: the fixture must actually exceed the pipe buffer, or this
+# case proves nothing.
+sz=$(wc -c < "$R/top.txt" | tr -d ' ')
+[ "$sz" -gt 65536 ] \
+    && ok "fixture exceeds the 64 KB pipe buffer ($sz bytes)" \
+    || bad "fixture is only $sz bytes — too small to reproduce the bypass"
+
+git -C "$R" add top.txt
+blocks "$R" "token at the TOP of a large file is BLOCKED"
+git -C "$R" reset -q
+git -C "$R" add bottom.txt
+blocks "$R" "token at the BOTTOM of a large file is BLOCKED"
+git -C "$R" reset -q
+git -C "$R" add clean_big.txt
+allows "$R" "a large file with NO token is allowed (no errexit false positive)"
+git -C "$R" reset -q
+
 printf '== ordinary cases ==\n'
 R="$(new_repo)"
 printf 'GITHUB_TOKEN = "%s"\n' "$GHP" > "$R/deploy.sh"
