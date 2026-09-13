@@ -145,7 +145,18 @@ def select_option(pane, choice, via, alert_ts=None, prompt_id=None):
     except subprocess.TimeoutExpired:
         return False, "herdr-select timed out"
     out = (r.stdout + r.stderr).strip().splitlines()
-    return r.returncode == 0, (out[-1] if out else f"exit {r.returncode}")
+    if r.returncode == 0:
+        return True, (out[-1] if out else "pressed")
+    # On a refusal herdr-select prints the REASON first and "option N (label) in
+    # <pane> was NOT pressed." last, so returning only the last line told the
+    # operator that nothing happened but never why. That was tolerable while
+    # this route counted as human and almost never refused; now that it is
+    # `peer`, refusal is the common case for anything reserved, and a
+    # reason-less warning invites a retry instead of a trip to the terminal.
+    # Lead with the reason, keep the outcome line after it.
+    reason = next((ln for ln in out if "REFUSED" in ln or "refusing" in ln), "")
+    tail = out[-1] if out else f"exit {r.returncode}"
+    return False, (f"{reason}\n{tail}" if reason and reason != tail else tail)
 
 
 def authorized(user, team, logger, what):
@@ -236,6 +247,23 @@ def on_message(event, say, logger, body):
     # to, and (until 2026-09-12) did it with human authority and no policy gate.
     # herdr-select now refuses on a fingerprint mismatch and treats this route as
     # `peer`, so a reserved action comes back instead of being pressed.
+    #
+    # No recorded fingerprint => the numeric route is NOT AVAILABLE on this
+    # thread. An informational alert (no --choices) never showed a question, so
+    # a number typed under it is answering something the operator was never
+    # shown — the convenience lost is imaginary. Review call, PR #62: refuse
+    # rather than press unpinned. Peer authority alone is not enough cover,
+    # because allow-class is a wide surface (`npm publish` is allow by default
+    # in our own suite, and `git push origin HEAD` from a default-branch
+    # worktree is a filed gap). The message falls through to the free-text
+    # path below, where send-to-agent.sh refuses to type into a pane that is
+    # sitting on a prompt — so nothing lands blind either way.
+    if target and CHOICE_RE.match(raw) and not thread_prompt_id:
+        say(text=":warning: This alert has no recorded prompt, so a numbered "
+                 "reply cannot be matched to a question — answer it in the "
+                 f"terminal ({target}), or reply with text to send a message.",
+            thread_ts=thread_ts or reply_ts)
+        return
     if target and CHOICE_RE.match(raw):
         ok, info = select_option(target, CHOICE_RE.match(raw).group(1), "slack-reply",
                                  prompt_id=thread_prompt_id, alert_ts=thread_ts)

@@ -183,8 +183,26 @@ label=$(printf '%s\n' "$options" | awk -F'\t' -v c="$choice" '$1==c {print $2; f
   printf '%s\n' "$options" | awk -F'\t' '{printf "  %s. %s\n", $1, $2}' >&2
   exit 6
 }
+# A DECLINE approves nothing, so it is safe from any authority and is exempted
+# from the policy gates below. That exemption used to be menu-shape only
+# (`mechanism = menu && choice = 2 && label = Deny`), which was fine while the
+# Slack reply route counted as human and skipped the gates anyway. Demoting
+# that route to `peer` (this change) turned the omission into a regression:
+# on a NUMBERED-shape agent (Claude, Codex), replying "3" to "No, and tell
+# Claude what to do differently" under an `rm -rf` alert was no longer a
+# recognised decline, so it ran the peer gate, classified escalate, and was
+# REFUSED — leaving the worker blocked with the dangerous prompt still on
+# screen, and refusing the one answer that could never do harm. Found in
+# review of PR #62; the suite's decline case only ever exercised the menu
+# shape, so it stayed green through it.
+#
+# Recognised by the LABEL, not the position: option numbering differs per
+# agent and per prompt, so "the second one" is not a decline anywhere except
+# omp's fixed Approve/Deny panel.
 declining=0
-[ "$mechanism" = menu ] && [ "$choice" = 2 ] && [ "$label" = Deny ] && declining=1
+case "$label" in
+  Deny|deny|No|no|"No, "*|"no, "*|Reject|reject|Cancel|cancel) declining=1 ;;
+esac
 
 # Right before we act — the closest this synchronous script can get to
 # "immediately before injection" — confirm the prompt is still the one a

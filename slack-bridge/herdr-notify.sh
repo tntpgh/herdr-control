@@ -182,6 +182,14 @@ body="$text"
 # until Interactivity is enabled on the app). Both routes end in herdr-select.sh,
 # so a choice is validated and recorded identically.
 blocks=""
+# Declared at this scope, not inside the --choices branch below, because the
+# registry write near the end of the file expands it unconditionally. Set only
+# in that branch, a plain informational alert (no --choices) died on `set -u`
+# with "pid: unbound variable", exit 1, and no registry record at all — i.e.
+# this file's own change broke every alert that is not an approval prompt.
+# Caught in review 2026-09-12; the dry-run path returns before the write, which
+# is why the existing suites could not see it.
+pid=""
 if [ "$choices" = 1 ] && [ -n "$pane" ]; then
   . "$_lib/prompt-parse.sh"
   # The Notification hook fires when the agent DECIDES it needs permission,
@@ -231,10 +239,24 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
   [ -n "$opts" ] && pid=$(prompt_id "$pane")
   _EMPTY_PROMPT_ID=01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
   if [ "$pid" = "$_EMPTY_PROMPT_ID" ]; then
-    # The prompt vanished between the poll and this read. Fall back to the
-    # two-field value: herdr-select still refuses unless the option is really on
-    # offer, so the click is guarded, just not pinned to this exact question.
+    # The prompt vanished between the poll and this read, so we have options
+    # but no question to pin them to. This used to fall back to a two-field
+    # button value and post the buttons anyway, reasoning that herdr-select
+    # still refuses unless the option is on offer. That reasoning is wrong on
+    # the surface it matters most (review of PR #62, 2026-09-12): a Slack
+    # button is IMMORTAL and carries human authority, and every omp approval
+    # panel offers the same two labels — "Approve"/"Deny" — so the
+    # option-still-on-offer check cannot tell one panel from another. An
+    # unpinned button is therefore a permanent one-click Approve on whatever
+    # question that pane shows next, with no policy gate.
+    #
+    # So: no fingerprint, no actionable alert. Drop the options and fall
+    # through to the plain-context branch — the operator still gets told the
+    # pane needs attention, and answers it in a terminal where the prompt is
+    # actually visible.
     pid=""
+    opts=""
+    mech=""
   fi
   if [ -n "$opts" ]; then
     # The question extractor must MATCH the parser that produced the options.

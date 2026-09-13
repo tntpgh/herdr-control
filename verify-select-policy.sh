@@ -275,9 +275,43 @@ printf '== the Slack alert describes the PANEL, not omp queued messages ==\n'
 menu_with_queue "git status --short"
 first_opt=$(prompt_menu_options "$PANE" | head -1)
 printf '%s' "$first_opt" | grep -qi 'approve' && ok "menu-first yields the panel's own first option" || bad "first option is '$first_opt'"
-grep -n 'prompt_menu_options "$pane"); \[ -n "$opts" \] && { mech=menu' "$here/slack-bridge/herdr-notify.sh" >/dev/null \
-  && ok "herdr-notify polls the menu before the numbered shape" \
-  || bad "herdr-notify still polls numbered-first — Slack would label the panel with the queue"
+# (An earlier version of this asserted the SOURCE TEXT of herdr-notify.sh with
+# grep. That passes for a different reason than the one claimed: it proves a
+# string exists in a file, not that any alert describes the panel — reformatting
+# the line fails it while the behaviour is intact, and it would still pass if the
+# loop below it were unreachable. The behavioural assertion above, that the
+# panel's own first option wins on a pane showing a steering queue, is the real
+# property; verify-notify-pinning.sh covers what herdr-notify actually posts.)
+
+printf '== a DECLINE is answerable from any authority, on BOTH prompt shapes ==\n'
+# A decline approves nothing, so it is safe from any authority. The exemption
+# used to be menu-shape only, which was invisible while the Slack reply route
+# counted as human; demoting it to peer turned that omission into a regression —
+# replying "3" to "No, and tell Claude what to do differently" under an rm -rf
+# alert got REFUSED, leaving the worker blocked with the dangerous prompt up.
+set_screen "rm -rf /tmp/scratch"; reset_keys
+sel 2 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && ok "menu Deny still allowed for peer" || bad "menu deny exit $rc"
+
+cat > "$SCREEN" <<'EOF'
+ Bash command
+   rm -rf /tmp/scratch
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+   3. No, and tell Claude what to do differently
+EOF
+reset_keys
+sel 2 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "numbered 'No' allowed for peer" || bad "numbered No refused: rc=$rc keys=$(keys_pressed)"
+reset_keys
+sel 3 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "numbered 'No, and tell...' allowed for peer" || bad "numbered decline refused: rc=$rc keys=$(keys_pressed)"
+reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = "0" ] && ok "the APPROVE option on the same prompt is still refused" || bad "approve leaked: rc=$rc keys=$(keys_pressed)"
+
 
 printf '== a Slack BUTTON is demonstrably human; a threaded REPLY is not ==\n'
 # The button carries the prompt fingerprint by construction, so a click is proof
