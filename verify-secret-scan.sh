@@ -166,6 +166,46 @@ git -C "$R" add clean_big.txt
 allows "$R" "a large file with NO token is allowed (no errexit false positive)"
 git -C "$R" reset -q
 
+printf '== a scanner that cannot run its own pattern has not cleared anything ==\n'
+# A grep ERROR (exit 2) is not a clean file. The trigger is a maintainer
+# editing PATTERNS, not an attacker: a construct valid in GNU ERE but not the
+# BSD grep this fleet runs makes grep exit 2 for EVERY file and EVERY pattern,
+# so the whole guard silently scans nothing. Judging only `-eq 0` conflated
+# that with "clean" — the same status conflation the SIGPIPE fix removed, one
+# field over, committed in its own new lines.
+R="$(new_repo)"
+printf 'nothing interesting here\n' > "$R/a.txt"
+git -C "$R" add a.txt
+# Build a copy of the scanner whose FIRST pattern is invalid ERE. `[` is an
+# unterminated bracket expression: grep exits 2, not 0 or 1.
+BROKEN="$WORK/broken-scanner.sh"
+sed -E 's/^PATTERNS=\(/PATTERNS=(\n    "["/' "$HOOK" > "$BROKEN"
+if bash -n "$BROKEN" 2>/dev/null && grep -qE '^\s+"\["' "$BROKEN"; then
+    ok "fixture scanner really carries an invalid pattern"
+    OUT="$(cd "$R" && bash "$BROKEN" 2>&1)"; RC=$?
+    [ "$RC" -ne 0 ] \
+        && ok "a pattern grep cannot compile BLOCKS rather than silently passing" \
+        || bad "grep error treated as clean — the whole guard scans nothing: rc=$RC ${OUT:-<silent>}"
+else
+    bad "could not build the broken-pattern fixture — case proves nothing"
+fi
+
+printf '== an unreadable staged file is reported ONCE, not once per pattern ==\n'
+# 17 identical refusals plus 17 lines of git stderr for one corrupt blob buries
+# the message, and the operator-facing message is the thing that has to
+# survive — the rename and SIGPIPE bypasses both hid behind output nobody read.
+R="$(new_repo)"
+printf 'clean line\n' > "$R/a.txt"
+git -C "$R" add a.txt
+BLOB="$(git -C "$R" rev-parse :a.txt)"
+rm -f "$R/.git/objects/${BLOB:0:2}/${BLOB:2}"
+OUT="$(cd "$R" && bash "$HOOK" 2>&1)"; RC=$?
+N="$(printf '%s\n' "$OUT" | grep -c 'refusing to treat an unreadable file as clean' || true)"
+[ "$RC" -ne 0 ] && ok "an unreadable staged file is refused" \
+               || bad "an unreadable staged file was treated as clean (rc=$RC)"
+[ "$N" -eq 1 ] && ok "the refusal is printed once, not once per pattern" \
+               || bad "printed $N times — one per pattern buries the message"
+
 printf '== ordinary cases ==\n'
 R="$(new_repo)"
 printf 'GITHUB_TOKEN = "%s"\n' "$GHP" > "$R/deploy.sh"

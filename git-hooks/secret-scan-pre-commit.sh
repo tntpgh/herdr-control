@@ -113,6 +113,23 @@ FOUND=0
 # never looks at it. `-z` + `read -r -d ''` can't be split by anything.
 while IFS= read -r -d '' FILE; do
     [[ "$FILE" =~ $SKIP_EXT ]] && continue
+
+    # Readability is a property of the FILE, not of a pattern. Checking it
+    # inside the pattern loop printed the same refusal 17 times for one corrupt
+    # blob, plus 17 lines of git's own stderr — and the operator-facing message
+    # is the thing that has to survive: the rename and SIGPIPE bypasses both
+    # hid behind output nobody read.
+    set +e
+    git show ":$FILE" >/dev/null 2>&1
+    _rd=$?
+    set -e
+    if [ "$_rd" -ne 0 ]; then
+        echo "UNREADABLE: could not read staged $FILE (git show exit $_rd) —" >&2
+        echo "  refusing to treat an unreadable file as clean." >&2
+        FOUND=1
+        continue
+    fi
+
     for PATTERN in "${PATTERNS[@]}"; do
         # Inspect BOTH exit codes, because `set -o pipefail` (line 10) turns a
         # successful match into a miss on any file bigger than the pipe buffer.
@@ -126,13 +143,10 @@ while IFS= read -r -d '' FILE; do
         # SQL fixtures: any generated text file over 64 KB was a free pass, and
         # unlike the rename bypass it needs no `git mv`, just a large file.
         #
-        # So: run the pipeline with pipefail OFF and judge the two statuses
-        # separately. grep 0 = match. git show 0 or 141 is expected (141 IS the
-        # early-exit case). Anything else is a real read failure and must still
-        # be LOUD rather than a silent "found nothing, so nothing to block."
-        # `set +e` as well as `+o pipefail`: outside an `if` condition a clean
-        # no-match (grep 1) is a failing command, and errexit would abort the
-        # hook — which reads as "blocked" and flags every clean large file.
+        # So: run the pipeline with pipefail OFF and judge the statuses
+        # separately. `set +e` as well, because outside an `if` condition a
+        # clean no-match (grep 1) is a failing command and errexit would abort
+        # the hook — which reads as "blocked" and flags every clean large file.
         # Capture both statuses in the SAME statement; any simple command in
         # between resets PIPESTATUS.
         set +e +o pipefail
@@ -142,9 +156,16 @@ while IFS= read -r -d '' FILE; do
         if [ "${_st[1]}" -eq 0 ]; then
             echo "BLOCKED: potential secret in $FILE  (pattern: $PATTERN)"
             FOUND=1
-        elif [ "${_st[0]}" -ne 0 ] && [ "${_st[0]}" -ne 141 ]; then
-            echo "BLOCKED: could not read staged $FILE (git show exit ${_st[0]}) —" >&2
-            echo "  refusing to treat an unreadable file as clean." >&2
+        elif [ "${_st[1]}" -gt 1 ]; then
+            # grep 0 = match, 1 = clean, ANYTHING ELSE is an error — most
+            # likely a pattern valid in GNU ERE but not the BSD grep this
+            # fleet runs, which would make grep exit 2 for every file and
+            # every pattern and silently scan NOTHING. Judging only `-eq 0`
+            # conflated that with "clean", which is precisely the
+            # status-conflation this fix was opened to remove — committed in
+            # its own new lines, one field over.
+            echo "BLOCKED: grep failed on $FILE (exit ${_st[1]}, pattern: $PATTERN) —" >&2
+            echo "  a scanner that cannot run its own pattern has not cleared this file." >&2
             FOUND=1
         fi
     done
