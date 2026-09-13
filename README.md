@@ -98,6 +98,39 @@ $EDITOR config.sh          # the ONE file with your specifics — see below
 ln -s "$PWD"/*.sh ~/.local/bin/
 ```
 
+### Restarting the control plane
+
+```bash
+./restart.sh              # restart all four LaunchAgents, then verify
+./restart.sh --verify     # health check; changes nothing
+./restart.sh --panes      # also close every agent pane first (clean slate)
+./restart.sh hub bridge   # only the named services
+```
+
+The four agents are `hub` (:8600), `bridge`, `auth-gateway` (:4000) and
+`auth-broker` (:8765). **A 401 from the auth pair is healthy** — the listener
+is up and refusing an unauthenticated probe; `restart.sh` encodes the expected
+codes so that is never misread as an outage.
+
+Use this rather than a remembered `launchctl` line. Three facts it exists to
+encode, each learned the hard way:
+
+- `launchctl load` and `kickstart -k` on an already-loaded label reuse the
+  **cached job definition**, so an edited plist silently has no effect.
+- `bootout` is **asynchronous** — bootstrapping straight after it races the
+  teardown, fails `Bootstrap failed: 5: Input/output error`, and leaves the
+  service **down**.
+- A service is not up because `bootstrap` returned 0. It is up when it still
+  holds the same pid a second later.
+
+`launchd/agent-lib.sh` holds that logic; `install.sh` and `restart.sh` share
+it, so the rules are never re-derived at a call site.
+
+It deliberately does **not** touch `~/.herdr/worktrees` (live git worktrees,
+possibly with uncommitted work) or `~/.herdr/isolated-worker`. A clean control
+plane is the services plus panes; agent state is separate.
+
+
 ### What `install.sh` does
 
 The scripts here do nothing until something *calls* them, and that wiring lives
