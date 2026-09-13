@@ -59,6 +59,13 @@
      "why": "THE MASKING CASE. A worker that finished round one, was handed a review brief, and went quiet still carries round one's completion evidence. Judging evidence without comparing it to the last thing the worker was ASKED reports that worker completed — which is how PR #313's five dropped findings stayed invisible. Evidence older than the brief is evidence about a previous round."},
     {"name": "done event NEWER than the last brief",
      "stored": "running", "pane": "idle", "done_event": "fresh", "want": "completed",
-     "why": "the same worker after it actually does the round: evidence postdates the ask."}
+     "why": "the same worker after it actually does the round: evidence postdates the ask."},
+
+    {"name": "unrecognised agent_status passes through",
+     "stored": "running", "pane": "reviewing", "done_event": false, "want": "reviewing",
+     "why": "REVIEW FINDING: the shell coerced an unknown status back to the STORED copy — the very thing this change stops trusting — while Python passed it through. Both suites passed because neither exercised it. A status we do not recognise is still herdr's answer, and inventing one is how the copies started."},
+    {"name": "a pane list with no panes array is herdr not answering",
+     "stored": "running", "pane": "__noshape__", "done_event": false, "want": "running",
+     "why": "REVIEW FINDING: a partially-initialised or version-skewed server returns {\"result\":{}} with exit 0. The shell read that as 'this pane is absent' and derived `gone` for EVERY task — handing reconcile a fleet-wide verdict off a shape nothing verified. Unparseable is unreachable: fall back to stored."}
   ]
 }

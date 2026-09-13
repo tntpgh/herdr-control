@@ -39,8 +39,8 @@ def run() -> int:
                 os.utime(ev, (NOW - 600, NOW - 600)); asked = NOW - 300
             elif de == "fresh":
                 os.utime(ev, (NOW, NOW)); asked = NOW - 300
-            if c["pane"] == "__down__":
-                panes = None                      # herdr unreachable
+            if c["pane"] in ("__down__", "__noshape__"):
+                panes = None                      # herdr unreachable / no panes array
             elif c["pane"] is None:
                 panes = {"wOTHER:p1": "working"}  # herdr up, this pane unknown
             else:
@@ -76,6 +76,58 @@ def run() -> int:
             else:
                 bad += 1
                 print(f"  FAIL {name}\n     want={want} got={got}")
+
+        # ---- the three review blockers, tested where they actually live ----
+        # A worker that echoes one non-UTF8 byte into its own log must not
+        # blank the entire attention surface (Cached swallows the exception
+        # into an error dict, and every surface then shows zero tasks).
+        badbus = Path(tmp) / "badbytes"
+        (badbus / ".handoffs").mkdir(parents=True)
+        (badbus / ".handoffs/events.jsonl").write_bytes(
+            b'{"event":"implement:x_done","n":"\xff\xfe"}\n')
+        try:
+            got = hub.derived_state({"state": "running", "pane_id": PANE,
+                                     "worktree": str(badbus)}, {PANE: "idle"})
+            checks2 = [("non-UTF8 byte in the bus does not raise", "completed", got)]
+        except Exception as e:  # noqa: BLE001
+            checks2 = [("non-UTF8 byte in the bus does not raise", "completed",
+                        f"{type(e).__name__}: {e}")]
+
+        # HERDR_HANDOFF_DIR is a supported override the shell honours; hub
+        # hardcoding .handoffs made every finished worker derive `stalled`.
+        alt = Path(tmp) / "altbus"
+        (alt / ".bus").mkdir(parents=True)
+        (alt / ".bus/events.jsonl").write_text('{"event":"implement:x_done"}\n')
+        os.environ["HERDR_HANDOFF_DIR"] = ".bus"
+        try:
+            got = hub.derived_state({"state": "running", "pane_id": PANE,
+                                     "worktree": str(alt)}, {PANE: "idle"})
+        except Exception as e:  # noqa: BLE001
+            got = f"{type(e).__name__}: {e}"
+        finally:
+            del os.environ["HERDR_HANDOFF_DIR"]
+        checks2.append(("HERDR_HANDOFF_DIR is honoured", "completed", got))
+
+        # Non-object JSON from `herdr pane list` used to raise AttributeError,
+        # which Cached turned into a truthy dict -> every task `gone`.
+        import subprocess as _sp
+        real = _sp.run
+        for shape in ('[]', '"x"', 'null', '{"result":{}}'):
+            _sp.run = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": shape})()
+            try:
+                got = hub._pane_statuses()
+            except Exception as e:  # noqa: BLE001 — a raiser here is the bug
+                got = f"{type(e).__name__}: {e}"
+            finally:
+                _sp.run = real
+            checks2.append((f"pane list {shape} -> herdr unreachable", None, got))
+        for name, want, got in checks2:
+            if got == want:
+                ok += 1
+                print(f"  ok   {name}")
+            else:
+                print(f"  FAIL {name}\n     want={want} got={got}")
+                bad += 1
 
         # `stalled` must be something a person is actually shown.
         if "stalled" in hub.ATTENTION:

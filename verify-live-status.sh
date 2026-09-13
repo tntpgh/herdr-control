@@ -121,6 +121,7 @@ while IFS=$'\t' read -r cname stored pane done want; do
   case "$pane" in
     null)     panes '{"panes":[{"pane_id":"wOTHER:p1","agent":"omp","agent_status":"working"}]}' ;;
     __down__) panes 'not json at all' ;;
+    __noshape__) panes '{"result":{}}' ;;
     *)        panes "{\"panes\":[{\"pane_id\":\"wH:pA\",\"agent\":\"omp\",\"agent_status\":\"$pane\"}]}" ;;
   esac
   if [ "$pane" = "__down__" ]; then

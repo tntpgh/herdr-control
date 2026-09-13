@@ -44,10 +44,17 @@ live_status_json() {
 # gone = herdr has no such pane (closed, or the whole server restarted).
 # Distinguished from `idle` on purpose: gone is reconcilable, idle is not.
 live_pane_status() {                    # <pane_id> -> status token
-  local pane="$1" snap
+  local pane="$1" snap shape
   [ -n "$pane" ] || { printf 'gone\n'; return 0; }
   snap="$(live_status_json)"
   [ -n "$snap" ] || { printf 'unknown\n'; return 0; }   # herdr unreachable: say so, never guess
+  # A snapshot with NO panes array is a herdr that did not really answer — a
+  # partially-initialised or version-skewed server. Reading that as "this pane
+  # is absent" would hand reconcile a fleet-wide `gone` verdict off a shape
+  # nothing verified. hub.py returns None here; the shell must agree.
+  shape="$(printf '%s' "$snap" | jq -r 'if ((.result.panes // .panes) | type) == "array"
+                                        then "ok" else "bad" end' 2>/dev/null)"
+  [ "$shape" = "ok" ] || { printf 'unknown\n'; return 0; }
   printf '%s' "$snap" | jq -r --arg p "$pane" '
     ((.result.panes // .panes)[]? | select(.pane_id==$p) | .agent_status // "idle")
     // "gone"' 2>/dev/null | head -1
@@ -82,7 +89,9 @@ derived_task_state() {                  # <task_json> [asked_at_epoch] -> state
       if [ -z "$ev" ]; then printf 'stalled\n'
       elif [ -n "$asked" ] && [ "$ev" -lt "$asked" ]; then printf 'stalled\n'
       else printf 'completed\n'; fi ;;
-    *) printf '%s\n' "${stored:-unknown}" ;;
+    # An unrecognised agent_status is passed THROUGH, never coerced to the
+    # stored copy this change exists to stop trusting. hub.py does the same.
+    *) printf '%s\n' "$live" ;;
   esac
 }
 
