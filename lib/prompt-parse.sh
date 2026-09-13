@@ -127,8 +127,30 @@ composer_stable_snapshot() {
 #             could not be determined — never guess a position.
 #           prompt_menu_question <pane> -> the header/detail lines, for
 #             prompt_id() below.
+# Read the WHOLE viewport, not a fixed 60 rows.
+#
+# 60 was a guess, and a panel taller than it is silently unanswerable: the
+# "Allow tool:" header scrolls out of the window, the parser fails closed
+# (correctly — it will not turn detail text into option 1), and the worker sits
+# `blocked` with nobody able to press a key. Observed 2026-09-12 on wH:p6,
+# whose panel spanned 61 rows: at --lines 60 the header appeared 0 times, at
+# --lines 200 it appeared once, and peer authority could not answer either way.
+# The workaround had even reached our task briefs ("keep every bash command
+# short enough that an approval panel renders it whole"), which is a parser bug
+# wearing a process rule.
+#
+# The pane reports its own viewport height, so ask for that plus headroom for
+# the panel's borders; fall back to a generous constant when the pane record is
+# unavailable. `--source visible` still bounds this to one screen, so a larger
+# request cannot drag an older panel out of scrollback.
 _menu_window() {
-  herdr pane read "$1" --source visible --lines 60 --format ansi 2>/dev/null
+  local rows
+  rows=$(herdr pane list 2>/dev/null \
+    | jq -r --arg p "$1" '((.result.panes // .panes)[]? | select(.pane_id==$p)
+                           | .scroll.viewport_rows) // empty' 2>/dev/null | head -1)
+  case "$rows" in (''|*[!0-9]*) rows=200 ;; esac
+  [ "$rows" -lt 60 ] && rows=60
+  herdr pane read "$1" --source visible --lines "$((rows + 8))" --format ansi 2>/dev/null
 }
 
 # Parse the complete, known two-choice approval menu from ONE snapshot.
