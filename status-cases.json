@@ -12,60 +12,161 @@
     "done_event: whether the worktree's handoff bus carries a *_done event."
   ],
   "cases": [
-    {"name": "stored blocked + pane idle + done event",
-     "stored": "blocked", "pane": "idle", "done_event": true, "want": "completed",
-     "why": "OBSERVED 2026-09-12: registry said blocked, pane was idle, work was finished. #59 clears blocked only when a prompt is ANSWERED, so a worker that goes quiet leaves the row forever."},
-    {"name": "stored running + pane idle + done event",
-     "stored": "running", "pane": "idle", "done_event": true, "want": "completed",
-     "why": "OBSERVED 2026-09-12: registry said running for hours after the PR merged."},
-    {"name": "pane idle + no done event",
-     "stored": "running", "pane": "idle", "done_event": false, "want": "stalled",
-     "why": "OBSERVED 2026-09-12: #313's worker took a five-item review brief and went idle without touching the branch. Indistinguishable from working in every surface we had."},
-    {"name": "pane done + no done event",
-     "stored": "running", "pane": "done", "done_event": false, "want": "stalled",
-     "why": "herdr's own 'done' means the agent stopped, not that the work landed."},
-    {"name": "pane working + stored blocked",
-     "stored": "blocked", "pane": "working", "done_event": false, "want": "running",
-     "why": "live truth wins in both directions, not just the pessimistic one."},
-    {"name": "pane working + no done event",
-     "stored": "running", "pane": "working", "done_event": false, "want": "running",
-     "why": "absence of a completion event is only meaningful once the worker has stopped."},
-    {"name": "pane blocked + stored running",
-     "stored": "running", "pane": "blocked", "done_event": false, "want": "blocked",
-     "why": "a prompt on screen is a person's problem even when the registry missed it."},
-
-    {"name": "stored completed survives a live pane",
-     "stored": "completed", "pane": "working", "done_event": false, "want": "completed",
-     "why": "acceptance is a fact herdr cannot know; a reused pane must not resurrect a closed task."},
-    {"name": "stored failed survives a live pane",
-     "stored": "failed", "pane": "working", "done_event": false, "want": "failed"},
-    {"name": "stored cancelled survives a live pane",
-     "stored": "cancelled", "pane": "working", "done_event": false, "want": "cancelled"},
-    {"name": "stored lost survives a live pane",
-     "stored": "lost", "pane": "working", "done_event": false, "want": "lost"},
-
-    {"name": "unknown pane",
-     "stored": "running", "pane": null, "done_event": false, "want": "gone",
-     "why": "herdr has no such pane: reconcile owns the verdict. Distinct from idle on purpose."},
-
-    {"name": "herdr down + stored running",
-     "stored": "running", "pane": "__down__", "done_event": false, "want": "running",
-     "why": "a dead herdr must not silently mark the whole fleet stalled and page a human about it."},
-    {"name": "herdr down + stored blocked",
-     "stored": "blocked", "pane": "__down__", "done_event": false, "want": "blocked"},
-
-    {"name": "done event OLDER than the last brief",
-     "stored": "running", "pane": "idle", "done_event": "stale", "want": "stalled",
-     "why": "THE MASKING CASE. A worker that finished round one, was handed a review brief, and went quiet still carries round one's completion evidence. Judging evidence without comparing it to the last thing the worker was ASKED reports that worker completed — which is how PR #313's five dropped findings stayed invisible. Evidence older than the brief is evidence about a previous round."},
-    {"name": "done event NEWER than the last brief",
-     "stored": "running", "pane": "idle", "done_event": "fresh", "want": "completed",
-     "why": "the same worker after it actually does the round: evidence postdates the ask."},
-
-    {"name": "unrecognised agent_status passes through",
-     "stored": "running", "pane": "reviewing", "done_event": false, "want": "reviewing",
-     "why": "REVIEW FINDING: the shell coerced an unknown status back to the STORED copy — the very thing this change stops trusting — while Python passed it through. Both suites passed because neither exercised it. A status we do not recognise is still herdr's answer, and inventing one is how the copies started."},
-    {"name": "a pane list with no panes array is herdr not answering",
-     "stored": "running", "pane": "__noshape__", "done_event": false, "want": "running",
-     "why": "REVIEW FINDING: a partially-initialised or version-skewed server returns {\"result\":{}} with exit 0. The shell read that as 'this pane is absent' and derived `gone` for EVERY task — handing reconcile a fleet-wide verdict off a shape nothing verified. Unparseable is unreachable: fall back to stored."}
+    {
+      "name": "stored blocked + pane idle + done event",
+      "stored": "blocked",
+      "pane": "idle",
+      "done_event": true,
+      "want": "completed",
+      "why": "OBSERVED 2026-09-12: registry said blocked, pane was idle, work was finished. #59 clears blocked only when a prompt is ANSWERED, so a worker that goes quiet leaves the row forever."
+    },
+    {
+      "name": "stored running + pane idle + done event",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": true,
+      "want": "completed",
+      "why": "OBSERVED 2026-09-12: registry said running for hours after the PR merged."
+    },
+    {
+      "name": "pane idle + no done event",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": false,
+      "want": "stalled",
+      "why": "OBSERVED 2026-09-12: #313's worker took a five-item review brief and went idle without touching the branch. Indistinguishable from working in every surface we had."
+    },
+    {
+      "name": "pane done + no done event",
+      "stored": "running",
+      "pane": "done",
+      "done_event": false,
+      "want": "stalled",
+      "why": "herdr's own 'done' means the agent stopped, not that the work landed."
+    },
+    {
+      "name": "pane working + stored blocked",
+      "stored": "blocked",
+      "pane": "working",
+      "done_event": false,
+      "want": "running",
+      "why": "live truth wins in both directions, not just the pessimistic one."
+    },
+    {
+      "name": "pane working + no done event",
+      "stored": "running",
+      "pane": "working",
+      "done_event": false,
+      "want": "running",
+      "why": "absence of a completion event is only meaningful once the worker has stopped."
+    },
+    {
+      "name": "pane blocked + stored running",
+      "stored": "running",
+      "pane": "blocked",
+      "done_event": false,
+      "want": "blocked",
+      "why": "a prompt on screen is a person's problem even when the registry missed it."
+    },
+    {
+      "name": "stored completed survives a live pane",
+      "stored": "completed",
+      "pane": "working",
+      "done_event": false,
+      "want": "completed",
+      "why": "acceptance is a fact herdr cannot know; a reused pane must not resurrect a closed task."
+    },
+    {
+      "name": "stored failed survives a live pane",
+      "stored": "failed",
+      "pane": "working",
+      "done_event": false,
+      "want": "failed"
+    },
+    {
+      "name": "stored cancelled survives a live pane",
+      "stored": "cancelled",
+      "pane": "working",
+      "done_event": false,
+      "want": "cancelled"
+    },
+    {
+      "name": "stored lost survives a live pane",
+      "stored": "lost",
+      "pane": "working",
+      "done_event": false,
+      "want": "lost"
+    },
+    {
+      "name": "unknown pane",
+      "stored": "running",
+      "pane": null,
+      "done_event": false,
+      "want": "gone",
+      "why": "herdr has no such pane: reconcile owns the verdict. Distinct from idle on purpose."
+    },
+    {
+      "name": "herdr down + stored running",
+      "stored": "running",
+      "pane": "__down__",
+      "done_event": false,
+      "want": "running",
+      "why": "a dead herdr must not silently mark the whole fleet stalled and page a human about it."
+    },
+    {
+      "name": "herdr down + stored blocked",
+      "stored": "blocked",
+      "pane": "__down__",
+      "done_event": false,
+      "want": "blocked"
+    },
+    {
+      "name": "done event OLDER than the last brief",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "stale",
+      "want": "stalled",
+      "why": "THE MASKING CASE. A worker that finished round one, was handed a review brief, and went quiet still carries round one's completion evidence. Judging evidence without comparing it to the last thing the worker was ASKED reports that worker completed \u2014 which is how PR #313's five dropped findings stayed invisible. Evidence older than the brief is evidence about a previous round."
+    },
+    {
+      "name": "done event NEWER than the last brief",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "fresh",
+      "want": "completed",
+      "why": "the same worker after it actually does the round: evidence postdates the ask."
+    },
+    {
+      "name": "unrecognised agent_status passes through",
+      "stored": "running",
+      "pane": "reviewing",
+      "done_event": false,
+      "want": "reviewing",
+      "why": "REVIEW FINDING: the shell coerced an unknown status back to the STORED copy \u2014 the very thing this change stops trusting \u2014 while Python passed it through. Both suites passed because neither exercised it. A status we do not recognise is still herdr's answer, and inventing one is how the copies started."
+    },
+    {
+      "name": "a pane list with no panes array is herdr not answering",
+      "stored": "running",
+      "pane": "__noshape__",
+      "done_event": false,
+      "want": "running",
+      "why": "REVIEW FINDING: a partially-initialised or version-skewed server returns {\"result\":{}} with exit 0. The shell read that as 'this pane is absent' and derived `gone` for EVERY task \u2014 handing reconcile a fleet-wide verdict off a shape nothing verified. Unparseable is unreachable: fall back to stored."
+    },
+    {
+      "name": "a later non-_done line after the done event",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "trailing",
+      "want": "stalled",
+      "why": "REVIEW P1: the anchor dated evidence by the bus FILE's mtime, so any later append \u2014 a progress note, a _start, anything not _done \u2014 made round one's stale completion look newer than a brief delivered after it. A worker that finished round one, took a review brief, wrote one line and went quiet read `completed`: PR #313's five dropped findings, reintroduced by the fix for them. Evidence is now dated by the EVENT; when it cannot be placed and an ask is on record, refuse to assume it answered THIS round."
+    },
+    {
+      "name": "unhashable pane_id",
+      "stored": "running",
+      "pane": "__unhashable__",
+      "done_event": false,
+      "want": "gone",
+      "why": "REVIEW P1: pane_id is TEXT in the schema but the row can hold anything, and a list raised TypeError straight out of panes.get() \u2014 which Cached turned into an error dict, marking every task `gone` while herdr_reachable still reported True. Round one's 'the reader is now total' covered _pane_statuses, not the lookup."
+    }
   ]
 }

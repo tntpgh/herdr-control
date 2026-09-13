@@ -122,6 +122,7 @@ while IFS=$'\t' read -r cname stored pane done want; do
     null)     panes '{"panes":[{"pane_id":"wOTHER:p1","agent":"omp","agent_status":"working"}]}' ;;
     __down__) panes 'not json at all' ;;
     __noshape__) panes '{"result":{}}' ;;
+    __unhashable__) panes '{"panes":[{"pane_id":"wH:pA","agent":"omp","agent_status":"idle"}]}' ;;
     *)        panes "{\"panes\":[{\"pane_id\":\"wH:pA\",\"agent\":\"omp\",\"agent_status\":\"$pane\"}]}" ;;
   esac
   if [ "$pane" = "__down__" ]; then
@@ -141,10 +142,20 @@ UP
   case "$done" in
     true)  W="$(wt_with_done tt$n)" ;;
     false) W="$(wt_silent tt$n)" ;;
+    trailing) W="$(wt_with_done tt$n)"
+              printf '{"event":"note","text":"still thinking"}\n' >> "$W/.handoffs/events.jsonl"
+              ASKED=$(( $(date +%s) - 300 )) ;;
     stale) W="$(wt_with_done tt$n)"; touch -t "$(date -v-10M +%Y%m%d%H%M 2>/dev/null || date -d '10 min ago' +%Y%m%d%H%M)" "$W/.handoffs/events.jsonl"; ASKED=$(( $(date +%s) - 300 )) ;;
     fresh) W="$(wt_with_done tt$n)"; ASKED=$(( $(date +%s) - 300 )) ;;
   esac
-  is "table: $cname" "$want" "$(state "$stored" "wH:pA" "$W" "$ASKED")"
+  if [ "$pane" = "__unhashable__" ]; then
+    # jq renders a non-string pane_id as its JSON text; the shell must not treat
+    # that as a live pane id.
+    got="$(reset_cache; derived_task_state "{\"state\":\"$stored\",\"pane_id\":[\"wH:pA\"],\"worktree\":\"$W\"}" "$ASKED")"
+    is "table: $cname" "$want" "$got"
+  else
+    is "table: $cname" "$want" "$(state "$stored" "wH:pA" "$W" "$ASKED")"
+  fi
 done < <(jq -r '.cases[] | [.name, .stored, (.pane // "null"), (.done_event|tostring), .want] | @tsv' status-cases.json)
 
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$pass" "$fail"

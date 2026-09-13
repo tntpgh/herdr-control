@@ -166,6 +166,7 @@ def _iso_epoch(s: str | None) -> float | None:
 
 
 _DONE_RE = re.compile(rb'"event"\s*:\s*"[^"]*_done"')
+_TS_RE = re.compile(rb'"(?:ts|at|time|timestamp|occurred_at)"\s*:\s*"([^"]+)"')
 
 
 def _bus_relpaths() -> tuple[str, ...]:
@@ -183,35 +184,71 @@ def _bus_relpaths() -> tuple[str, ...]:
     return (f"{rel}/events.jsonl", ".omc/handoffs/events.jsonl")
 
 
-def _evidence_mtime(worktree: str | None) -> float | None:
-    """When the worker last wrote completion evidence, or None if it never did.
+def _evidence_at(worktree: str | None) -> float | None | str:
+    """When the worker last wrote COMPLETION evidence.
 
-    mtime rather than a parsed timestamp: the bus is append-only and not every
-    event carries one, so the file's last write IS the last evidence.
+    Returns an epoch float, None ("no completion evidence at all"), or the
+    string "undatable" ("a _done event exists but cannot be placed in time").
+    The caller must treat those three as three different answers.
 
-    Read as BYTES. A worker that echoes one non-UTF8 byte into its own log used
-    to raise UnicodeDecodeError here, which `Cached.get` catches as a generic
-    Exception and replaces with an error dict — leaving `/`, `/herdr` and
-    `/api/summary` reporting ZERO tasks needing attention. One stray byte
-    silenced the whole attention surface, the same shape as PR #61's floor
-    table. Nothing in this path may decode.
+    Why not the file's mtime — this is the bug this whole change exists to
+    prevent, reintroduced by its own fix. Round-one review caught it: the bus
+    is append-only, so ANY later line (a progress note, a `_start`, anything
+    not `_done`) bumps mtime and makes round one's stale completion look newer
+    than a brief delivered after it. A worker that finished round one, took a
+    review brief, wrote one non-`_done` line and then went quiet would read
+    `completed` — exactly PR #313's five dropped findings.
+
+    So: date the `_done` EVENT. If it carries a timestamp, use that. If it does
+    not, mtime is only honest when the `_done` line is the LAST line in the
+    file, because then nothing has been appended since. Otherwise we genuinely
+    cannot date it, and saying so beats guessing in the optimistic direction.
+
+    Read as BYTES throughout. A worker that echoes one non-UTF8 byte into its
+    own log used to raise UnicodeDecodeError here, which `Cached.get` catches
+    as a generic Exception and replaces with an error dict — leaving `/`,
+    `/herdr` and `/api/summary` reporting ZERO tasks needing attention. One
+    stray byte silenced the whole attention surface, the same shape as PR #61's
+    floor table. Nothing in this path may decode.
     """
     if not worktree:
         return None
-    newest = None
+    best: float | None = None
+    undatable = False
     for rel in _bus_relpaths():
         p = Path(worktree) / rel
         try:
             if not p.stat().st_size:
                 continue
+            last_done_ts: bytes | None = None
+            done_is_last = False
             with p.open("rb") as fh:
-                if not any(_DONE_RE.search(ln) for ln in fh):
+                for ln in fh:
+                    if not ln.strip():
+                        continue
+                    if _DONE_RE.search(ln):
+                        m = _TS_RE.search(ln)
+                        last_done_ts = m.group(1) if m else None
+                        done_is_last = True
+                    else:
+                        done_is_last = False      # something came after it
+            if last_done_ts is None and not done_is_last:
+                continue                          # no _done in this file at all
+            if last_done_ts:
+                ts = _iso_epoch(last_done_ts.decode("ascii", "replace"))
+                if ts is not None:
+                    best = ts if best is None else max(best, ts)
                     continue
-            m = p.stat().st_mtime
+            if done_is_last:
+                st = p.stat().st_mtime
+                best = st if best is None else max(best, st)
+            else:
+                undatable = True
         except OSError:
             continue
-        newest = m if newest is None else max(newest, m)
-    return newest
+    if best is not None:
+        return best
+    return "undatable" if undatable else None
 
 
 def derived_state(task: dict, panes: dict | None,
@@ -229,15 +266,29 @@ def derived_state(task: dict, panes: dict | None,
         return stored
     if panes is None:
         return stored                      # herdr down: fall back, never invent
-    live = panes.get(task.get("pane_id"))
+    # A pane id from the registry is untrusted input: it is TEXT in the schema
+    # but this row could hold anything, and an unhashable value (a list) raised
+    # TypeError straight out of .get() — which `Cached` then turned into an
+    # error dict, marking every task `gone` while `herdr_reachable` still said
+    # True. Round one's "the reader is now total" was total only as far as
+    # _pane_statuses; the lookup itself was not.
+    pane = task.get("pane_id")
+    if not isinstance(pane, str) or not pane:
+        return "gone"
+    live = panes.get(pane)
     if live is None:
         return "gone"
     if live == "working":
         return "running"
     if live in ("idle", "done"):
-        ev = _evidence_mtime(task.get("worktree"))
+        ev = _evidence_at(task.get("worktree"))
         if ev is None:
-            return "stalled"
+            return "stalled"               # no completion evidence at all
+        if ev == "undatable":
+            # A `_done` exists but something was appended after it, so it
+            # cannot be placed against the ask. With no ask on record, take it;
+            # with one, refuse to assume it answered THIS round.
+            return "stalled" if asked_at is not None else "completed"
         if asked_at is not None and ev < asked_at:
             return "stalled"               # answered an older round, not this one
         return "completed"

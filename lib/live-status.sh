@@ -85,8 +85,13 @@ derived_task_state() {                  # <task_json> [asked_at_epoch] -> state
     idle|done)
       # Finished cleanly, or abandoned? The worker's own completion evidence is
       # the only thing that distinguishes them.
-      local ev; ev="$(_evidence_mtime "$wt")"
+      local ev; ev="$(_evidence_at "$wt")"
       if [ -z "$ev" ]; then printf 'stalled\n'
+      elif [ "$ev" = "undatable" ]; then
+        # A _done exists but a later line followed it, so it cannot be placed
+        # against the ask. No ask on record: take it. An ask on record: refuse
+        # to assume it answered THIS round.
+        if [ -n "$asked" ]; then printf 'stalled\n'; else printf 'completed\n'; fi
       elif [ -n "$asked" ] && [ "$ev" -lt "$asked" ]; then printf 'stalled\n'
       else printf 'completed\n'; fi ;;
     # An unrecognised agent_status is passed THROUGH, never coerced to the
@@ -102,14 +107,43 @@ derived_task_state() {                  # <task_json> [asked_at_epoch] -> state
 # Epoch seconds of the newest bus file carrying completion evidence, or empty.
 # mtime rather than a parsed timestamp: the bus is append-only and not every
 # event carries one, so the file's last write IS the last evidence.
-_evidence_mtime() {                     # <worktree> -> epoch | empty
-  local f newest="" m
+_evidence_at() {                        # <worktree> -> epoch | "undatable" | empty
+  local f newest="" undatable="" line last_done_ts done_is_last m
   [ -n "${1:-}" ] || return 0
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    grep -qE '"event"[[:space:]]*:[[:space:]]*"[^"]*_done"' "$f" 2>/dev/null || continue
-    m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null) || continue
-    [ -z "$newest" ] || [ "$m" -gt "$newest" ] && newest="$m"
+    last_done_ts=""; done_is_last=0
+    while IFS= read -r line; do
+      case "$line" in "") continue ;; esac
+      if printf '%s' "$line" | grep -qE '"event"[[:space:]]*:[[:space:]]*"[^"]*_done"'; then
+        last_done_ts=$(printf '%s' "$line" | sed -nE 's/.*"(ts|at|time|timestamp|occurred_at)"[[:space:]]*:[[:space:]]*"([^"]+)".*/\2/p' | head -1)
+        done_is_last=1
+      else
+        done_is_last=0
+      fi
+    done < "$f"
+    [ -n "$last_done_ts" ] || [ "$done_is_last" = 1 ] || continue
+    if [ -n "$last_done_ts" ]; then
+      m=$(_iso_epoch "$last_done_ts")
+      if [ -n "$m" ]; then
+        { [ -z "$newest" ] || [ "$m" -gt "$newest" ]; } && newest="$m"
+        continue
+      fi
+    fi
+    if [ "$done_is_last" = 1 ]; then
+      m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null) || continue
+      { [ -z "$newest" ] || [ "$m" -gt "$newest" ]; } && newest="$m"
+    else
+      undatable=1
+    fi
   done < <(handoff_event_files "$1" 2>/dev/null)
-  printf '%s' "$newest"
+  if [ -n "$newest" ]; then printf '%s' "$newest"
+  elif [ -n "$undatable" ]; then printf 'undatable'
+  fi
+}
+
+# Registry timestamps are UTC `...Z`; mtimes are epoch seconds.
+_iso_epoch() {                          # <iso8601> -> epoch | empty
+  date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$1" +%s 2>/dev/null \
+    || date -u -d "$1" +%s 2>/dev/null || true
 }

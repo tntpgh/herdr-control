@@ -33,6 +33,9 @@ def run() -> int:
             ev = wt / ".handoffs/events.jsonl"
             de = c["done_event"]
             ev.write_text('{"event":"implement:x_done","commit":"abc"}\n' if de else "")
+            if de == "trailing":
+                ev.write_text('{"event":"implement:x_done","commit":"abc"}\n'
+                              '{"event":"note","text":"still thinking"}\n')
             # `asked_at` is the brief delivery time; "stale" evidence predates it.
             asked = None
             if de == "stale":
@@ -41,12 +44,20 @@ def run() -> int:
                 os.utime(ev, (NOW, NOW)); asked = NOW - 300
             if c["pane"] in ("__down__", "__noshape__"):
                 panes = None                      # herdr unreachable / no panes array
+            elif c["pane"] == "__unhashable__":
+                panes = {PANE: "idle"}
             elif c["pane"] is None:
                 panes = {"wOTHER:p1": "working"}  # herdr up, this pane unknown
             else:
                 panes = {PANE: c["pane"]}
-            got = hub.derived_state(
-                {"state": c["stored"], "pane_id": PANE, "worktree": str(wt)}, panes, asked)
+            pid = [PANE] if c["pane"] == "__unhashable__" else PANE
+            if de == "trailing":
+                os.utime(ev, (NOW, NOW)); asked = NOW - 300   # mtime NEWER than the ask
+            try:
+                got = hub.derived_state(
+                    {"state": c["stored"], "pane_id": pid, "worktree": str(wt)}, panes, asked)
+            except Exception as e:  # noqa: BLE001 — a raiser here IS the defect
+                got = f"{type(e).__name__}: {e}"
             if got == c["want"]:
                 ok += 1
                 print(f"  ok   {c['name']}")
