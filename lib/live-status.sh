@@ -55,9 +55,13 @@ live_pane_status() {                    # <pane_id> -> status token
   shape="$(printf '%s' "$snap" | jq -r 'if ((.result.panes // .panes) | type) == "array"
                                         then "ok" else "bad" end' 2>/dev/null)"
   [ "$shape" = "ok" ] || { printf 'unknown\n'; return 0; }
+  # status<TAB>terminal_id. terminal_id is the pane BIRTH fingerprint that
+  # lib/pane-guard.sh compares before a keypress; pane ids are recycled, so a
+  # status keyed on the id alone can describe a different process entirely.
   printf '%s' "$snap" | jq -r --arg p "$pane" '
-    ((.result.panes // .panes)[]? | select(.pane_id==$p) | .agent_status // "idle")
-    // "gone"' 2>/dev/null | head -1
+    (((.result.panes // .panes)[]? | select(.pane_id==$p)
+      | ((.agent_status // "idle") + "\t" + (.terminal_id // ""))) // "gone")' \
+    2>/dev/null | head -1
 }
 
 # The state a human should SEE for a task. Registry state is used only for the
@@ -76,7 +80,16 @@ derived_task_state() {                  # <task_json> [asked_at_epoch] -> state
   esac
   pane=$(printf '%s' "$t" | jq -r '.pane_id // empty')
   wt=$(printf '%s' "$t" | jq -r '.worktree // empty')
-  live="$(live_pane_status "$pane")"
+  local _row birth reg
+  _row="$(live_pane_status "$pane")"
+  live="${_row%%	*}"
+  birth="${_row#*	}"; [ "$birth" = "$_row" ] && birth=""
+  # Same recycling refusal as hub.py: a registered birth that no longer matches
+  # means this slot belongs to someone else now.
+  reg=$(printf '%s' "$t" | jq -r '.pane_birth // empty')
+  if [ -n "$reg" ] && [ -n "$birth" ] && [ "$reg" != "$birth" ]; then
+    printf 'gone\n'; return 0
+  fi
   case "$live" in
     unknown) printf '%s\n' "$stored" ;;               # herdr down: fall back, do not invent
     gone)    printf 'gone\n' ;;                        # reconcile owns the verdict

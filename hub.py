@@ -125,7 +125,16 @@ TERMINAL = ("completed", "failed", "cancelled", "lost")
 
 
 def _pane_statuses() -> dict | None:
-    """{pane_id: agent_status} from herdr, or None when herdr is unreachable.
+    """{pane_id: (agent_status, terminal_id)} from herdr, or None if unreachable.
+
+    `terminal_id` is the pane's BIRTH fingerprint — the same value
+    lib/pane-guard.sh `pane_birth_now` compares against a task's registered
+    `pane_birth` before allowing a keypress. Pane ids are RECYCLED
+    (docs/control-plane-design.md; lib/push-wake.sh:20), so status keyed on
+    pane id alone can describe a DIFFERENT process that inherited the slot:
+    a finished task would read `running` off a stranger, or a live one read
+    `stalled`. Every other guard in this repo already carries the birth; the
+    derivation must too.
 
     None is not an empty dict: a dead herdr must not read as "no panes exist"
     and silently mark the whole fleet stalled.
@@ -147,8 +156,15 @@ def _pane_statuses() -> dict | None:
         return None
     if not isinstance(panes, list):
         return None
-    return {p.get("pane_id"): (p.get("agent_status") or "idle")
-            for p in panes if isinstance(p, dict) and p.get("pane_id")}
+    out: dict[str, tuple[str, str]] = {}
+    for p in panes:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("pane_id")
+        if not isinstance(pid, str) or not pid:
+            continue
+        out[pid] = (p.get("agent_status") or "idle", p.get("terminal_id") or "")
+    return out
 
 
 PANES = Cached(3.0, _pane_statuses)
@@ -275,8 +291,16 @@ def derived_state(task: dict, panes: dict | None,
     pane = task.get("pane_id")
     if not isinstance(pane, str) or not pane:
         return "gone"
-    live = panes.get(pane)
-    if live is None:
+    entry = panes.get(pane)
+    if entry is None:
+        return "gone"
+    live, birth = entry if isinstance(entry, tuple) else (entry, "")
+    # A pane id is RECYCLED. If the task registered a birth fingerprint and the
+    # live pane's differs, this slot now belongs to a different process and its
+    # status says nothing about our task — the same refusal pane-guard.sh makes
+    # before a keypress. `gone` rather than a guess: reconcile owns that verdict.
+    reg = task.get("pane_birth") or ""
+    if reg and birth and reg != birth:
         return "gone"
     if live == "working":
         return "running"
