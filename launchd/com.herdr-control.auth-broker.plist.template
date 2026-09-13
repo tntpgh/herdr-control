@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
+  (Flags are written as words here: a literal double hyphen is invalid
+  inside an XML comment and makes this plist unparseable.)
   The bounded-autonomy auth BROKER: `omp auth-broker serve` on 127.0.0.1:8765.
   Paired with com.herdr-control.auth-gateway.plist.template, which points at it.
 
@@ -8,7 +10,7 @@
   found by thurber-os's launchd audit on 2026-09-06, in the same sweep that found
   the Slack bridge deadlocked in `op read` for exactly that reason: an agent
   nobody can review is an agent nobody fixes. Shipping the templates makes them
-  reviewable and reinstallable; install.sh --auth renders them.
+  reviewable and reinstallable; install.sh, in auth mode, renders them.
 
   install.sh substitutes __OMP__ (the resolved omp binary), __HOME__ and
   __LOG_DIR__. No secret is here or in the rendered plist: the broker holds its
