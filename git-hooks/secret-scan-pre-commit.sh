@@ -114,10 +114,37 @@ FOUND=0
 while IFS= read -r -d '' FILE; do
     [[ "$FILE" =~ $SKIP_EXT ]] && continue
     for PATTERN in "${PATTERNS[@]}"; do
-        # No `2>/dev/null` on git show: a read failure here must be loud,
-        # not a silent "found nothing, so nothing to block."
-        if git show ":$FILE" | grep -qE -- "$PATTERN"; then
+        # Inspect BOTH exit codes, because `set -o pipefail` (line 10) turns a
+        # successful match into a miss on any file bigger than the pipe buffer.
+        #
+        # `grep -q` exits the instant it matches. `git show` is then killed by
+        # SIGPIPE (141), pipefail adopts 141 as the pipeline's status, the `if`
+        # reads FALSE, and FOUND is never set. Measured 2026-09-12: a `ghp_`
+        # token on line 1 of a 7 MB file was ALLOWED (rc=0) while the same
+        # token at the BOTTOM of the same file was BLOCKED — 16 KB blocks,
+        # 64 KB and up allow. Minified bundles, lockfiles, CSVs, JSON dumps,
+        # SQL fixtures: any generated text file over 64 KB was a free pass, and
+        # unlike the rename bypass it needs no `git mv`, just a large file.
+        #
+        # So: run the pipeline with pipefail OFF and judge the two statuses
+        # separately. grep 0 = match. git show 0 or 141 is expected (141 IS the
+        # early-exit case). Anything else is a real read failure and must still
+        # be LOUD rather than a silent "found nothing, so nothing to block."
+        # `set +e` as well as `+o pipefail`: outside an `if` condition a clean
+        # no-match (grep 1) is a failing command, and errexit would abort the
+        # hook — which reads as "blocked" and flags every clean large file.
+        # Capture both statuses in the SAME statement; any simple command in
+        # between resets PIPESTATUS.
+        set +e +o pipefail
+        git show ":$FILE" | grep -qE -- "$PATTERN"
+        _st=("${PIPESTATUS[@]}")
+        set -e -o pipefail
+        if [ "${_st[1]}" -eq 0 ]; then
             echo "BLOCKED: potential secret in $FILE  (pattern: $PATTERN)"
+            FOUND=1
+        elif [ "${_st[0]}" -ne 0 ] && [ "${_st[0]}" -ne 141 ]; then
+            echo "BLOCKED: could not read staged $FILE (git show exit ${_st[0]}) —" >&2
+            echo "  refusing to treat an unreadable file as clean." >&2
             FOUND=1
         fi
     done
