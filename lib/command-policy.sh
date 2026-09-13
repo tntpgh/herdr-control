@@ -77,6 +77,18 @@ scannable_command() {
     printf 'command-policy: scannable_command requires a <command> argument\n' >&2
     return 2
   fi
+  # BYTES, not characters. Every transform below is a `sed`, and in a UTF-8
+  # locale BSD sed aborts with "RE error: illegal byte sequence" on the first
+  # invalid byte — the substitution then captures nothing and this function
+  # returns the EMPTY STRING. That is a fail-open in the floor rule table
+  # itself: with one 0xFF byte appended, a push to the default branch went
+  # from `reserved: human-only` to classify=allow, reservation=none, and
+  # `--authority peer` would press Approve (proved 2026-09-12, detonation
+  # pass F2). A worker only has to emit one stray byte — a latin-1 filename
+  # in `ls`, a corrupt log line — for its own pane's scrollback to disarm the
+  # classifier. Under LC_ALL=C sed treats input as bytes and cannot fail this
+  # way; the patterns here are all ASCII, so nothing else changes.
+  local LC_ALL=C LANG=C
   local raw="$1" text
   text="$(_cp_strip_heredocs "$raw")"
   text="$(_cp_decode_ansi_c "$text")"
@@ -392,9 +404,19 @@ conductor_reserved_reason() {
   # OAuth token file and bare env dumps were all classify=allow + unreserved.
   if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.env(\.[A-Za-z0-9_-]+)?\b|id_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[[:space:]])(printenv|env)([[:space:]]|$)|(^|[;[:space:]])(export|set)[[:space:]]*($|;)|\bdeclare[[:space:]]+-p\b|\bop[[:space:]]+(read|item[[:space:]]+get)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm"; then
     printf 'credential-value access remains human-only\n'
-  elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]])|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]]+(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)' "$norm"; then
+  elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]])|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$norm"; then
     printf 'remote mutation remains human-only\n'
-  elif _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\bgit\b.*\bpush\b.*\b(main|master)\b|\bgit\b.*\bpush\b.*(--all\b|--mirror\b)|(^|[;[:space:]])git[[:space:]]+push[[:space:]]*($|;)|\b(gate-registry|approval-policy|command-policy\.sh|herdr-select\.sh)\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$norm"; then
+  # KNOWN GAP, deliberately not closed here (detonation pass F3): a worktree
+  # standing on the default branch makes `git push origin HEAD` a push to main
+  # without the word ever appearing. Reserving every `push … HEAD` would catch
+  # it — and would also catch `git push -u origin HEAD`, which is how every
+  # spawned worker publishes its feature branch, so every worker would escalate
+  # to a human and the alert flood this week's work removed would come straight
+  # back. Resolving HEAD needs the pane's repo, which a text scanner does not
+  # have; the fix belongs in a repo-aware check, not another regex. Bare
+  # `git push` and `git -C <dir> push` ARE reserved below, because those are
+  # rare in worker traffic and cost nothing to stop.
+  elif _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\bgit\b.*\bpush\b.*\b(main|master)\b|\bgit\b.*\bpush\b.*(--all\b|--mirror\b)|(^|[;[:space:]])git([[:space:]]+-[A-Za-z]+[[:space:]]+[^[:space:]]+)*[[:space:]]+push[[:space:]]*($|;)|\b(gate-registry|approval-policy|command-policy\.sh|herdr-select\.sh)\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$norm"; then
     printf 'merge, governance, or control weakening remains human-only\n'
   fi
 }
