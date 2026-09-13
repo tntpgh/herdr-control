@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Template. install.sh --bridge substitutes __RUN_BRIDGE__ with the absolute
+  (Flags are written as words here: a literal double hyphen is invalid
+  inside an XML comment and makes this plist unparseable.)
+  Template. install.sh, in bridge mode, substitutes __RUN_BRIDGE__ with the absolute
   path to slack-bridge/run-bridge.sh in your checkout and writes the result to
   ~/Library/LaunchAgents/com.herdr-control.bridge.plist.
 
