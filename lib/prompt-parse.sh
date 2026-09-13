@@ -201,7 +201,21 @@ for raw in sys.stdin.buffer:
             complete = visible = False
         continue
     if text.startswith("up/down navigate") and "enter select" in text:
-        visible = True
+        # `visible` requires an actual option ROW (state >= 2 means an
+        # "Approve" line was consumed), not merely a header plus a footer.
+        # Without that, a pane which merely DISPLAYS pane content — a
+        # conductor echoing `herdr pane read` output, a transcript quoting an
+        # approval panel — opens the state machine on the echoed "Allow tool:"
+        # and trips `visible` on the echoed footer, reporting a menu that is
+        # not there. Observed 2026-09-13 on the conductor pane itself, which
+        # herdr-gates then showed as GATE=UNPARSED while that session was
+        # merely printing the gates of other panes. A false needs-input is not
+        # harmless: wait-for-blocked.sh treats prompt_menu_visible as its
+        # backstop signal, so it would wake on a pane nobody is waiting on.
+        # The options sit ABOVE the footer in the omp layout and the header
+        # scrolls off the TOP, so a real panel showing its footer is showing
+        # its option rows too — requiring one costs no genuine detection.
+        visible = state >= 2
         complete = state == 3 and not invalid
         state = 0
         continue
