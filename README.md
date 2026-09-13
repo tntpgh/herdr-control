@@ -376,7 +376,9 @@ belong to everyone who clones this repo" one — and it does.
 **The security review this doesn't replace.** This split keeps *business
 context* (which repos you have, what they do) out of the tracked repo. It
 is not a secret-scanning policy — that's the shared pre-commit hook
-(content-based, scans every staged diff regardless of which file it's in)
+(`git-hooks/secret-scan-pre-commit.sh`, content-based, scans every staged
+diff regardless of which file it's in; installed into the fleet by
+`install-git-hooks.sh`, proven by `verify-secret-scan.sh`)
 plus periodically re-running a real history sweep (`git log --all -p`
 against AWS/GitHub/OpenAI/Slack token shapes and PEM headers) before
 treating a private repo as public-ready. Do both; they catch different

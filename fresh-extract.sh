@@ -23,6 +23,7 @@
 #
 # Exit 0 = clean. Exit 3 = findings. Exit 2 = usage/precondition error.
 set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
 
 SRC="${1:-}"; REF="${2:-}"; DEST="${3:-}"; shift 3 2>/dev/null || true
 DO_INIT=0; FORCE=0
@@ -63,7 +64,12 @@ _files() {
 # Reuses the SAME pattern list as the shared pre-commit guard, so the two can
 # never drift into disagreeing about what a secret looks like. If that file
 # moves, this must fail loudly rather than silently scan nothing.
-GUARD="$HOME/.claude/hooks/secret-scan-pre-commit.sh"
+#
+# Reads the TRACKED copy in this checkout. It used to read
+# ~/.claude/hooks/secret-scan-pre-commit.sh — an untracked file that existed on
+# exactly one machine, so this script's central claim ("reuses the same pattern
+# list") was unverifiable anywhere else and a clone simply refused to report.
+GUARD="$here/git-hooks/secret-scan-pre-commit.sh"
 echo "== credentials =="
 if [ -r "$GUARD" ]; then
   # shellcheck disable=SC1090
