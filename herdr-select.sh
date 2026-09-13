@@ -102,9 +102,22 @@ review_reason=""
 review_category=""
 # Demonstrably-human callers only; see the header. Explicit
 # HERDR_SELECT_AUTHORITY or --authority still wins over this.
+#
+# `slack-reply` was here until 2026-09-12 and is not. A detonation pass showed
+# the threaded-number route carries NO prompt fingerprint — the registry record
+# herdr-notify wrote held only {ts,pane}, so there was nothing to pass — while
+# claiming human authority, which skips the classifier AND the human-only list.
+# A "1" typed into an older alert thread therefore landed on whatever prompt
+# occupied that pane by then: the alert you answered could say "run the suite"
+# while the pane showed a push to the default branch. Terrence's call
+# (2026-09-12 decision form): a reply is not proof a human read THIS prompt, so
+# it gets peer authority — allow-class work goes through, anything reserved
+# comes back and needs a terminal or a form. The button route stays human: it
+# is bound to one fingerprint by construction.
 _default_authority() {
   case "${HERDR_SELECT_VIA:-}" in
-    slack-reply|slack-button) printf 'human\n'; return 0 ;;
+    slack-button) printf 'human\n'; return 0 ;;
+    slack-reply)  printf 'peer\n';  return 0 ;;
   esac
   [ -t 0 ] && { printf 'human\n'; return 0; }
   printf 'peer\n'

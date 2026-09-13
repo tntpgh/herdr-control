@@ -315,7 +315,12 @@ if [ -n "$pane" ]; then
   # time rather than relying on the umask of whichever script gets here first.
   chmod 700 "$reg_dir"
   reg="$reg_dir/registry.jsonl"
-  jq -nc --arg ts "$ts" --arg pane "$pane" '{ts:$ts,pane:$pane}' >> "$reg"
+  # `pid` too, not just the pane. Without it a threaded reply had nothing to
+  # pin itself to and landed on whatever prompt the pane showed by then
+  # (detonation pass F1, 2026-09-12) — the alert could say "run the suite"
+  # while the pane had moved on to a push. The bridge passes it back as
+  # --expect-prompt-id, exactly as the button route already did.
+  jq -nc --arg ts "$ts" --arg pane "$pane" --arg pid "$pid" '{ts:$ts,pane:$pane,prompt_id:$pid}' >> "$reg"
   # Track it as AWAITING AN ANSWER only if we actually showed a live prompt.
   # If you then answer in the terminal, herdr-resolve.sh retracts this message
   # so it does not sit in Slack looking pending. Informational alerts carry no
