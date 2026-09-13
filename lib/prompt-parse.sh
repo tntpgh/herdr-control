@@ -127,14 +127,43 @@ composer_stable_snapshot() {
 #             could not be determined — never guess a position.
 #           prompt_menu_question <pane> -> the header/detail lines, for
 #             prompt_id() below.
+# 200 lines, not 60: the header is the ANCHOR of the state machine below, and a
+# long command body pushes it further from the footer than 60 rows. Measured
+# 2026-09-13 on an `eval` approval whose body was ~1.2 kB — the "Allow tool:"
+# row was outside every window up to 140, so `_prompt_menu` never left state 0,
+# `prompt_menu_options` failed closed, and herdr-select refused a menu that was
+# plainly on screen ("not showing a prompt this script recognises"). Widening
+# alone is not sufficient — see the footer-anchored fallback in _prompt_menu —
+# but it keeps the RICH parse (full header + detail rows) available far more
+# often, and the fallback's truncated question is strictly worse for review.
 _menu_window() {
-  herdr pane read "$1" --source visible --lines 60 --format ansi 2>/dev/null
+  herdr pane read "$1" --source visible --lines 200 --format ansi 2>/dev/null
 }
 
 # Parse the complete, known two-choice approval menu from ONE snapshot.
 # Blank rows separate command details too; they are not an option boundary.
 # Unknown/truncated menu shapes fail closed rather than turning detail text
 # into option 1 and arrow-walking forever toward a row that cannot be selected.
+#
+# TWO passes, in preference order:
+#   1. header-anchored — opens on "Allow tool:", collects every detail row, and
+#      yields the rich question text a reviewer should be judging.
+#   2. footer-anchored — when pass 1 found no complete panel, walk UP from the
+#      navigation footer looking for Deny then Approve. The footer and the two
+#      option rows are pinned to the bottom of the panel, so they survive a
+#      command body long enough to push the header off-screen entirely; that is
+#      the case that deadlocked wM:p4 on 2026-09-13 (a ~1.2 kB `eval` body; the
+#      header was outside every window up to 140 rows, so no widening could
+#      reach it). The question is then only what is still visible, marked
+#      "[header off-screen]" so it is never mistaken for a full parse and so
+#      prompt_id() hashes differently from one.
+#
+# Pass 2 is deliberately narrow: it requires the exact footer, then exactly
+# "Deny", then exactly "Approve", nearest-first with only blank rows allowed
+# between. Anything else fails closed, as before. The risk it accepts is a pane
+# whose transcript happens to end with those three lines in that order; the risk
+# it removes is a real menu that cannot be answered at all, which forces either
+# a blind Enter (pressing whatever is highlighted) or a stalled lane.
 _prompt_menu() {                       # <pane> visible|options|selected|question
   local win
   win=$(_menu_window "$1") || return 1
@@ -144,14 +173,17 @@ _prompt_menu() {                       # <pane> visible|options|selected|questio
 import re, sys
 ansi = re.compile(r"\x1b\[[0-9;]*m")
 highlight = re.compile(r"\x1b\[48;2;[0-9]+;[0-9]+;[0-9]+m")
+lines = []
 state = 0
 question = []
 selected = ""
 invalid = complete = visible = False
+truncated = False
 # Read bytes: a stray non-UTF-8 byte in a pane must degrade to U+FFFD, not
 # abort the parser and silence the wake path.
 for raw in sys.stdin.buffer:
     line = raw.decode("utf-8", "replace")
+    lines.append(line)
     plain = ansi.sub("", line)
     # `text` (leading punctuation stripped) is ONLY for header/option/footer
     # matching. `body` keeps a command row intact — `-rf`, `--flag`, `| sh`,
@@ -188,6 +220,45 @@ for raw in sys.stdin.buffer:
     if highlight.search(line):
         invalid = invalid or bool(selected)
         selected = n
+
+# ---- pass 2: footer-anchored, header off-screen -----------------------------
+if not complete:
+    def _text(s):
+        return re.sub(r"^[^A-Za-z0-9]+", "", ansi.sub("", s)).rstrip(" \t\r\n|-\u2502\u2500\u256e")
+    foot = None
+    for i in range(len(lines) - 1, -1, -1):
+        t = _text(lines[i])
+        if t.startswith("up/down navigate") and "enter select" in t:
+            foot = i
+            break
+    if foot is not None:
+        want = ["Deny", "Approve"]
+        rows = {}
+        j = foot - 1
+        for label in want:
+            while j >= 0 and not _text(lines[j]):
+                j -= 1
+            if j < 0 or _text(lines[j]) != label:
+                rows = {}
+                break
+            rows[label] = j
+            j -= 1
+        if rows:
+            visible = complete = True
+            invalid = False
+            truncated = True
+            selected = ""
+            for label, n in (("Approve", "1"), ("Deny", "2")):
+                if highlight.search(lines[rows[label]]):
+                    invalid = invalid or bool(selected)
+                    selected = n
+            question = ["[header off-screen]"]
+            for k in range(max(0, rows["Approve"] - 6), rows["Approve"]):
+                b = re.sub(r"^[\s\u2502]+", "", ansi.sub("", lines[k])).rstrip(" \t\r\n\u2502\u2500\u256e")
+                if b:
+                    question.append(b)
+            if invalid:
+                complete = False
 mode = sys.argv[1]
 if mode == "visible":
     sys.exit(0 if visible else 1)
