@@ -127,30 +127,38 @@ composer_stable_snapshot() {
 #             could not be determined — never guess a position.
 #           prompt_menu_question <pane> -> the header/detail lines, for
 #             prompt_id() below.
-# Read the WHOLE viewport, not a fixed 60 rows.
+# Read the WHOLE visible screen, everywhere a pane is scraped.
 #
 # 60 was a guess, and a panel taller than it is silently unanswerable: the
 # "Allow tool:" header scrolls out of the window, the parser fails closed
 # (correctly — it will not turn detail text into option 1), and the worker sits
 # `blocked` with nobody able to press a key. Observed 2026-09-12 on wH:p6,
 # whose panel spanned 61 rows: at --lines 60 the header appeared 0 times, at
-# --lines 200 it appeared once, and peer authority could not answer either way.
-# The workaround had even reached our task briefs ("keep every bash command
-# short enough that an approval panel renders it whole"), which is a parser bug
-# wearing a process rule.
+# --lines 200 it appeared once. The workaround had even reached our task briefs
+# ("keep every bash command short enough that an approval panel renders it
+# whole"), which is a parser bug wearing a process rule.
 #
-# The pane reports its own viewport height, so ask for that plus headroom for
-# the panel's borders; fall back to a generous constant when the pane record is
-# unavailable. `--source visible` still bounds this to one screen, so a larger
-# request cannot drag an older panel out of scrollback.
+# `--source visible` already caps the read at the pane's own viewport —
+# measured across all 11 live panes, `--lines 200` and `--lines 500` return
+# identical row counts, never more than viewport_rows. So the window only has
+# to be LARGER than any viewport; it does not have to be exact. An earlier cut
+# of this fix derived it from `herdr pane list`, which cost a second RPC and a
+# jq per parse (+73%: 18.5ms -> 32.1ms) on a path that runs ~20 times per alert
+# — to produce a number that is inert for every pane here, and that can be
+# stale by the time `pane read` runs anyway. A constant is cheaper AND more
+# correct.
+#
+# Every pane scrape shares this, because a window that is right in one place
+# and 60 in three others is the same bug wearing a different line number.
+_PANE_WINDOW_LINES=1000
+
 _menu_window() {
-  local rows
-  rows=$(herdr pane list 2>/dev/null \
-    | jq -r --arg p "$1" '((.result.panes // .panes)[]? | select(.pane_id==$p)
-                           | .scroll.viewport_rows) // empty' 2>/dev/null | head -1)
-  case "$rows" in (''|*[!0-9]*) rows=200 ;; esac
-  [ "$rows" -lt 60 ] && rows=60
-  herdr pane read "$1" --source visible --lines "$((rows + 8))" --format ansi 2>/dev/null
+  herdr pane read "$1" --source visible --lines "$_PANE_WINDOW_LINES" --format ansi 2>/dev/null
+}
+
+# The same window, without ANSI — for the scrapes that work on plain text.
+_pane_visible() {
+  herdr pane read "$1" --source visible --lines "$_PANE_WINDOW_LINES" 2>/dev/null
 }
 
 # Parse the complete, known two-choice approval menu from ONE snapshot.
@@ -270,7 +278,7 @@ prompt_id() {
     # make --expect-prompt-id refuse a prompt that had not changed.
     local menu_q="$q"
     if [ -z "$menu_q" ]; then
-      menu_q="$(herdr pane read "$1" --source visible --lines 60 2>/dev/null \
+      menu_q="$(_pane_visible "$1" \
         | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \
         | sed -n '/Allow tool:/,/enter select/p' \
         | sed -E 's/^[[:space:]│|]+//; s/[[:space:]│|]+$//' \
@@ -311,7 +319,7 @@ prompt_command_text() {
   local menu win
   menu="$(prompt_menu_question "$1" 2>/dev/null)" || menu=""
   if [ -n "$menu" ]; then printf '%s\n' "$menu"; return 0; fi
-  win="$(herdr pane read "$1" --source visible --lines 60 2>/dev/null)" || win=""
+  win="$(_pane_visible "$1")" || win=""
   printf '%s\n%s\n' "$menu" "$(
     printf '%s\n' "$win" \
       | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \

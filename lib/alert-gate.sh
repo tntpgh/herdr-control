@@ -59,7 +59,13 @@ human_must_answer() {
   # authoritative; anything else on a pane showing `Allow tool:` furniture is
   # a person's.
   if [ -z "$(prompt_menu_options "$pane" 2>/dev/null)" ]; then
-    herdr pane read "$pane" --source visible --lines 60 2>/dev/null | grep -q 'Allow tool:' && return 0
+    # Same window as every other pane scrape (lib/prompt-parse.sh's
+    # _PANE_WINDOW_LINES). At a fixed 60 a tall unrecognized panel hid its own
+    # header here too, so human_must_answer fell through to the numbered
+    # extractor, matched omp's steering queue, and classified truncated text —
+    # the "silence for a prompt no peer can answer" case this function exists
+    # to prevent.
+    _pane_visible "$pane" | grep -q 'Allow tool:' && return 0
     [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || return 0
   fi
   cmd="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
