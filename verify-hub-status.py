@@ -45,17 +45,19 @@ def run() -> int:
             if c["pane"] in ("__down__", "__noshape__"):
                 panes = None                      # herdr unreachable / no panes array
             elif c["pane"] == "__unhashable__":
-                panes = {PANE: "idle"}
+                panes = {PANE: ("idle", "term-1")}
             elif c["pane"] is None:
-                panes = {"wOTHER:p1": "working"}  # herdr up, this pane unknown
+                panes = {"wOTHER:p1": ("working", "term-x")}  # herdr up, pane unknown
             else:
-                panes = {PANE: c["pane"]}
+                panes = {PANE: (c["pane"], "term-live")}
             pid = [PANE] if c["pane"] == "__unhashable__" else PANE
+            birth = {"mismatch": "term-OLD", "match": "term-live"}.get(c.get("birth"), "")
             if de == "trailing":
                 os.utime(ev, (NOW, NOW)); asked = NOW - 300   # mtime NEWER than the ask
             try:
                 got = hub.derived_state(
-                    {"state": c["stored"], "pane_id": pid, "worktree": str(wt)}, panes, asked)
+                    {"state": c["stored"], "pane_id": pid, "worktree": str(wt),
+                     "pane_birth": birth}, panes, asked)
             except Exception as e:  # noqa: BLE001 — a raiser here IS the defect
                 got = f"{type(e).__name__}: {e}"
             if got == c["want"]:
@@ -73,12 +75,12 @@ def run() -> int:
         checks = [
             ("no worktree recorded + idle pane -> stalled", "stalled",
              hub.derived_state({"state": "running", "pane_id": PANE, "worktree": None},
-                               {PANE: "idle"})),
+                               {PANE: ("idle", "t")})),
             ("empty pane list is NOT herdr being down", "gone",
              hub.derived_state({"state": "running", "pane_id": PANE, "worktree": str(wt)}, {})),
             ("unrecognised agent_status passes through", "reviewing",
              hub.derived_state({"state": "running", "pane_id": PANE, "worktree": str(wt)},
-                               {PANE: "reviewing"})),
+                               {PANE: ("reviewing", "t")})),
         ]
         for name, want, got in checks:
             if got == want:
@@ -98,7 +100,7 @@ def run() -> int:
             b'{"event":"implement:x_done","n":"\xff\xfe"}\n')
         try:
             got = hub.derived_state({"state": "running", "pane_id": PANE,
-                                     "worktree": str(badbus)}, {PANE: "idle"})
+                                     "worktree": str(badbus)}, {PANE: ("idle", "t")})
             checks2 = [("non-UTF8 byte in the bus does not raise", "completed", got)]
         except Exception as e:  # noqa: BLE001
             checks2 = [("non-UTF8 byte in the bus does not raise", "completed",
@@ -112,7 +114,7 @@ def run() -> int:
         os.environ["HERDR_HANDOFF_DIR"] = ".bus"
         try:
             got = hub.derived_state({"state": "running", "pane_id": PANE,
-                                     "worktree": str(alt)}, {PANE: "idle"})
+                                     "worktree": str(alt)}, {PANE: ("idle", "t")})
         except Exception as e:  # noqa: BLE001
             got = f"{type(e).__name__}: {e}"
         finally:

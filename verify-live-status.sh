@@ -33,7 +33,7 @@ wt_silent(){ local d="$TMP/$1"; mkdir -p "$d/.handoffs"; : >"$d/.handoffs/events
 
 . lib/live-status.sh
 reset_cache(){ _LS_SNAPSHOT=""; }
-tj(){ printf '{"state":"%s","pane_id":"%s","worktree":"%s"}' "$1" "$2" "${3:-}"; }
+tj(){ printf '{"state":"%s","pane_id":"%s","worktree":"%s","pane_birth":"%s"}' "$1" "$2" "${3:-}" "${BIRTH_REG:-}"; }
 state(){ reset_cache; derived_task_state "$(tj "$1" "$2" "${3:-}")" "${4:-}"; }
 
 echo "== the registry copy never wins over live truth"
@@ -116,14 +116,14 @@ echo "== every case in the shared truth table (status-cases.json)"
 # Both implementations must satisfy this file. hub.py reads the same one in
 # verify-hub-status.py; neither may carry a case the table does not.
 n=0
-while IFS=$'\t' read -r cname stored pane done want; do
+while IFS=$'\t' read -r cname stored pane done want birth; do
   n=$((n+1))
   case "$pane" in
     null)     panes '{"panes":[{"pane_id":"wOTHER:p1","agent":"omp","agent_status":"working"}]}' ;;
     __down__) panes 'not json at all' ;;
     __noshape__) panes '{"result":{}}' ;;
     __unhashable__) panes '{"panes":[{"pane_id":"wH:pA","agent":"omp","agent_status":"idle"}]}' ;;
-    *)        panes "{\"panes\":[{\"pane_id\":\"wH:pA\",\"agent\":\"omp\",\"agent_status\":\"$pane\"}]}" ;;
+    *)        panes "{\"panes\":[{\"pane_id\":\"wH:pA\",\"agent\":\"omp\",\"agent_status\":\"$pane\",\"terminal_id\":\"term-live\"}]}" ;;
   esac
   if [ "$pane" = "__down__" ]; then
     cat >"$TMP/bin/herdr" <<'DOWN'
@@ -139,6 +139,11 @@ UP
   fi
   chmod +x "$TMP/bin/herdr"
   ASKED=""
+  case "$birth" in
+    mismatch) BIRTH_REG="term-OLD" ;;
+    match)    BIRTH_REG="term-live" ;;
+    *)        BIRTH_REG="" ;;
+  esac
   case "$done" in
     true)  W="$(wt_with_done tt$n)" ;;
     false) W="$(wt_silent tt$n)" ;;
@@ -156,7 +161,7 @@ UP
   else
     is "table: $cname" "$want" "$(state "$stored" "wH:pA" "$W" "$ASKED")"
   fi
-done < <(jq -r '.cases[] | [.name, .stored, (.pane // "null"), (.done_event|tostring), .want] | @tsv' status-cases.json)
+done < <(jq -r '.cases[] | [.name, .stored, (.pane // "null"), (.done_event|tostring), .want, (.birth // "")] | @tsv' status-cases.json)
 
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$pass" "$fail"
 [ "$fail" -eq 0 ]

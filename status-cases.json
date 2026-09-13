@@ -167,6 +167,24 @@
       "done_event": false,
       "want": "gone",
       "why": "REVIEW P1: pane_id is TEXT in the schema but the row can hold anything, and a list raised TypeError straight out of panes.get() \u2014 which Cached turned into an error dict, marking every task `gone` while herdr_reachable still reported True. Round one's 'the reader is now total' covered _pane_statuses, not the lookup."
+    },
+    {
+      "name": "pane recycled since registration",
+      "stored": "running",
+      "pane": "working",
+      "done_event": false,
+      "want": "gone",
+      "birth": "mismatch",
+      "why": "REVIEW P1: pane ids are RECYCLED (docs/control-plane-design.md, lib/push-wake.sh:20) and derived_state keyed liveness on the id alone, never fetching pane_birth \u2014 so a finished task could read `running` off a stranger that inherited the slot, or a live one read `stalled`. Every other guard here already compares the birth fingerprint before acting; the derivation must too."
+    },
+    {
+      "name": "pane birth matches",
+      "stored": "running",
+      "pane": "working",
+      "done_event": false,
+      "want": "running",
+      "birth": "match",
+      "why": "the ordinary case: same slot, same process, status means what it says."
     }
   ]
 }
