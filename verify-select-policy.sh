@@ -275,21 +275,71 @@ printf '== the Slack alert describes the PANEL, not omp queued messages ==\n'
 menu_with_queue "git status --short"
 first_opt=$(prompt_menu_options "$PANE" | head -1)
 printf '%s' "$first_opt" | grep -qi 'approve' && ok "menu-first yields the panel's own first option" || bad "first option is '$first_opt'"
-grep -n 'prompt_menu_options "$pane"); \[ -n "$opts" \] && { mech=menu' "$here/slack-bridge/herdr-notify.sh" >/dev/null \
-  && ok "herdr-notify polls the menu before the numbered shape" \
-  || bad "herdr-notify still polls numbered-first — Slack would label the panel with the queue"
+# (An earlier version of this asserted the SOURCE TEXT of herdr-notify.sh with
+# grep. That passes for a different reason than the one claimed: it proves a
+# string exists in a file, not that any alert describes the panel — reformatting
+# the line fails it while the behaviour is intact, and it would still pass if the
+# loop below it were unreachable. The behavioural assertion above, that the
+# panel's own first option wins on a pane showing a steering queue, is the real
+# property; verify-notify-pinning.sh covers what herdr-notify actually posts.)
 
-printf '== a Slack reply IS demonstrably human (bridge sets HERDR_SELECT_VIA) ==\n'
-# The bridge sets this for both the threaded-number and button routes, and only
-# after its own user allowlist check — so a real person acted, and must not be
-# blocked from approving their own agent's destructive command.
-for v in slack-reply slack-button; do
-  set_screen "rm -rf /tmp/scratch"; reset_keys
-  ( export HERDR_SELECT_VIA="$v"; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
-  [ "$rc" -eq 0 ] && ok "via=$v -> human, destructive approval allowed" || bad "via=$v exit $rc (expected 0)"
-  [ "$(q_appr authority)" = "human" ] && ok "via=$v recorded as human" || bad "via=$v authority=$(q_appr authority)"
-  [ "$(q_appr policy_verdict)" = "escalate" ] && ok "via=$v verdict still recorded for attribution" || bad "via=$v verdict=$(q_appr policy_verdict)"
-done
+printf '== a DECLINE is answerable from any authority, on BOTH prompt shapes ==\n'
+# A decline approves nothing, so it is safe from any authority. The exemption
+# used to be menu-shape only, which was invisible while the Slack reply route
+# counted as human; demoting it to peer turned that omission into a regression —
+# replying "3" to "No, and tell Claude what to do differently" under an rm -rf
+# alert got REFUSED, leaving the worker blocked with the dangerous prompt up.
+set_screen "rm -rf /tmp/scratch"; reset_keys
+sel 2 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && ok "menu Deny still allowed for peer" || bad "menu deny exit $rc"
+
+cat > "$SCREEN" <<'EOF'
+ Bash command
+   rm -rf /tmp/scratch
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+   3. No, and tell Claude what to do differently
+EOF
+reset_keys
+sel 2 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "numbered 'No' allowed for peer" || bad "numbered No refused: rc=$rc keys=$(keys_pressed)"
+reset_keys
+sel 3 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "numbered 'No, and tell...' allowed for peer" || bad "numbered decline refused: rc=$rc keys=$(keys_pressed)"
+reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = "0" ] && ok "the APPROVE option on the same prompt is still refused" || bad "approve leaked: rc=$rc keys=$(keys_pressed)"
+
+
+printf '== a Slack BUTTON is demonstrably human; a threaded REPLY is not ==\n'
+# The button carries the prompt fingerprint by construction, so a click is proof
+# a person read THIS question. A threaded reply is not: it is a number typed
+# under a message that may be hours old, and until 2026-09-12 it claimed human
+# authority — skipping the classifier AND the human-only list — so a "1" in an
+# old thread pressed Approve on whatever the pane had moved on to. Terrence's
+# call (2026-09-12 decision form): the reply route gets peer authority.
+set_screen "rm -rf /tmp/scratch"; reset_keys
+( export HERDR_SELECT_VIA=slack-button; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "via=slack-button -> human, destructive approval allowed" || bad "via=slack-button exit $rc (expected 0)"
+[ "$(q_appr authority)" = "human" ] && ok "via=slack-button recorded as human" || bad "authority=$(q_appr authority)"
+[ "$(q_appr policy_verdict)" = "escalate" ] && ok "via=slack-button verdict still recorded for attribution" || bad "verdict=$(q_appr policy_verdict)"
+
+set_screen "rm -rf /tmp/scratch"; reset_keys
+( export HERDR_SELECT_VIA=slack-reply; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
+[ "$rc" -eq 8 ] && ok "via=slack-reply REFUSED a destructive prompt (peer)" || bad "via=slack-reply exit $rc (expected 8)"
+[ "$(keys_pressed)" = "0" ] && ok "no key pressed on the reply route" || bad "keys pressed=$(keys_pressed)!"
+
+set_screen "gh pr merge 5 --squash"; reset_keys
+( export HERDR_SELECT_VIA=slack-reply; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = "0" ] && ok "via=slack-reply cannot merge from a phone" || bad "reply route merged: rc=$rc keys=$(keys_pressed)"
+
+printf '== a Slack reply still answers ordinary work (else the route is useless) ==\n'
+set_screen "ls -la /tmp"; reset_keys
+( export HERDR_SELECT_VIA=slack-reply; bash "$here/herdr-select.sh" "$PANE" 1 >/dev/null 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "allow-class reply still pressed" || bad "rc=$rc keys=$(keys_pressed)"
+[ "$(q_appr authority)" = "peer" ] && ok "recorded authority=peer, not human" || bad "authority=$(q_appr authority)"
 
 printf '== an unrecognised via is NOT human ==\n'
 set_screen "rm -rf /tmp/scratch"; reset_keys

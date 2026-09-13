@@ -102,9 +102,22 @@ review_reason=""
 review_category=""
 # Demonstrably-human callers only; see the header. Explicit
 # HERDR_SELECT_AUTHORITY or --authority still wins over this.
+#
+# `slack-reply` was here until 2026-09-12 and is not. A detonation pass showed
+# the threaded-number route carries NO prompt fingerprint — the registry record
+# herdr-notify wrote held only {ts,pane}, so there was nothing to pass — while
+# claiming human authority, which skips the classifier AND the human-only list.
+# A "1" typed into an older alert thread therefore landed on whatever prompt
+# occupied that pane by then: the alert you answered could say "run the suite"
+# while the pane showed a push to the default branch. Terrence's call
+# (2026-09-12 decision form): a reply is not proof a human read THIS prompt, so
+# it gets peer authority — allow-class work goes through, anything reserved
+# comes back and needs a terminal or a form. The button route stays human: it
+# is bound to one fingerprint by construction.
 _default_authority() {
   case "${HERDR_SELECT_VIA:-}" in
-    slack-reply|slack-button) printf 'human\n'; return 0 ;;
+    slack-button) printf 'human\n'; return 0 ;;
+    slack-reply)  printf 'peer\n';  return 0 ;;
   esac
   [ -t 0 ] && { printf 'human\n'; return 0; }
   printf 'peer\n'
@@ -170,8 +183,26 @@ label=$(printf '%s\n' "$options" | awk -F'\t' -v c="$choice" '$1==c {print $2; f
   printf '%s\n' "$options" | awk -F'\t' '{printf "  %s. %s\n", $1, $2}' >&2
   exit 6
 }
+# A DECLINE approves nothing, so it is safe from any authority and is exempted
+# from the policy gates below. That exemption used to be menu-shape only
+# (`mechanism = menu && choice = 2 && label = Deny`), which was fine while the
+# Slack reply route counted as human and skipped the gates anyway. Demoting
+# that route to `peer` (this change) turned the omission into a regression:
+# on a NUMBERED-shape agent (Claude, Codex), replying "3" to "No, and tell
+# Claude what to do differently" under an `rm -rf` alert was no longer a
+# recognised decline, so it ran the peer gate, classified escalate, and was
+# REFUSED — leaving the worker blocked with the dangerous prompt still on
+# screen, and refusing the one answer that could never do harm. Found in
+# review of PR #62; the suite's decline case only ever exercised the menu
+# shape, so it stayed green through it.
+#
+# Recognised by the LABEL, not the position: option numbering differs per
+# agent and per prompt, so "the second one" is not a decline anywhere except
+# omp's fixed Approve/Deny panel.
 declining=0
-[ "$mechanism" = menu ] && [ "$choice" = 2 ] && [ "$label" = Deny ] && declining=1
+case "$label" in
+  Deny|deny|No|no|"No, "*|"no, "*|Reject|reject|Cancel|cancel) declining=1 ;;
+esac
 
 # Right before we act — the closest this synchronous script can get to
 # "immediately before injection" — confirm the prompt is still the one a
