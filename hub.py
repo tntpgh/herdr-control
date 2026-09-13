@@ -81,7 +81,11 @@ KB_DASHBOARD_URL = os.environ.get("KB_DASHBOARD_URL", "https://dashboard.teamthu
 # still said "N task(s) need attention" for tasks that were working fine
 # (six pages for three healthy tasks, 2026-09-12). A running task is active,
 # not blocked on anybody.
-ATTENTION = ("input_required", "blocked")
+# `stalled` is here because it is the state a person most needs to see and the
+# one nothing used to report: a worker that took a brief and went quiet looks
+# exactly like a worker that is thinking (2026-09-12, PR #313 — five review
+# findings dropped, noticed an hour later only because a human asked).
+ATTENTION = ("input_required", "blocked", "stalled")
 
 # Every surface the team runs, hosted and local. `probe` is what "alive" means
 # for it; hosted ones also get the KB heartbeat verdict when a snapshot exists.
@@ -116,6 +120,108 @@ class Cached:
             return self.val
 
 
+# ── live pane truth ────────────────────────────────────────────────────────────
+# The registry stores what herdr cannot know (which task, which brief, what the
+# worker owes). herdr stays authoritative for liveness, and we ask it at read
+# time rather than trusting the copy written into `tasks.state` at event time.
+# Three rows disagreed with reality on 2026-09-12 — blocked-but-idle,
+# running-after-merge, and a silently abandoned brief — because every derived
+# copy of a fact eventually disagrees with the fact.
+#
+# The truth table for this lives in status-cases.json and is shared with
+# lib/live-status.sh; verify-hub-status.py asserts this code satisfies it.
+TERMINAL = ("completed", "failed", "cancelled", "lost")
+
+
+def _pane_statuses() -> dict | None:
+    """{pane_id: agent_status} from herdr, or None when herdr is unreachable.
+
+    None is not an empty dict: a dead herdr must not read as "no panes exist"
+    and silently mark the whole fleet stalled.
+    """
+    try:
+        out = subprocess.run(["herdr", "pane", "list"], capture_output=True,
+                             text=True, timeout=4)
+        if out.returncode != 0:
+            return None
+        d = json.loads(out.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+    panes = (d.get("result") or d).get("panes")
+    if not isinstance(panes, list):
+        return None
+    return {p.get("pane_id"): (p.get("agent_status") or "idle")
+            for p in panes if isinstance(p, dict) and p.get("pane_id")}
+
+
+PANES = Cached(3.0, _pane_statuses)
+
+
+def _iso_epoch(s: str | None) -> float | None:
+    """Registry timestamps are UTC `...Z`; mtimes are epoch seconds."""
+    if not s:
+        return None
+    try:
+        return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _evidence_mtime(worktree: str | None) -> float | None:
+    """When the worker last wrote completion evidence, or None if it never did.
+
+    mtime rather than a parsed timestamp: the bus is append-only and not every
+    event carries one, so the file's last write IS the last evidence.
+    """
+    if not worktree:
+        return None
+    newest = None
+    for rel in (".handoffs/events.jsonl", ".omc/handoffs/events.jsonl"):
+        p = Path(worktree) / rel
+        try:
+            if not p.stat().st_size:
+                continue
+            with p.open() as fh:
+                if not any(re.search(r'"event"\s*:\s*"[^"]*_done"', ln) for ln in fh):
+                    continue
+            m = p.stat().st_mtime
+        except OSError:
+            continue
+        newest = m if newest is None else max(newest, m)
+    return newest
+
+
+def derived_state(task: dict, panes: dict | None,
+                  asked_at: float | None = None) -> str:
+    """The state to SHOW, from live truth plus the worker's own evidence.
+
+    `asked_at` is when a brief was last delivered to this worker. Completion
+    evidence OLDER than that is evidence about a previous round, not this one —
+    without that comparison a worker that takes a brief and goes quiet keeps
+    reporting `completed` off its last round's event, which is the exact failure
+    this whole change exists to make visible.
+    """
+    stored = task.get("state") or "unknown"
+    if stored in TERMINAL:
+        return stored
+    if panes is None:
+        return stored                      # herdr down: fall back, never invent
+    live = panes.get(task.get("pane_id"))
+    if live is None:
+        return "gone"
+    if live == "working":
+        return "running"
+    if live in ("idle", "done"):
+        ev = _evidence_mtime(task.get("worktree"))
+        if ev is None:
+            return "stalled"
+        if asked_at is not None and ev < asked_at:
+            return "stalled"               # answered an older round, not this one
+        return "completed"
+    return live
+
+
 # ── herdr registry ─────────────────────────────────────────────────────────────
 def herdr_data(event_limit: int = 100) -> dict:
     if not REGISTRY.exists():
@@ -138,15 +244,29 @@ def herdr_data(event_limit: int = 100) -> dict:
         checkpoints = [dict(r) for r in conn.execute(
             "SELECT conductor_id, last_event_seq, updated_at FROM checkpoints ORDER BY updated_at DESC LIMIT 12")]
         max_seq = conn.execute("SELECT COALESCE(MAX(sequence),0) FROM events").fetchone()[0]
+        # When each worker was last handed a brief — the anchor that makes
+        # "did it do what I last asked?" answerable at all.
+        asked = {r[0]: r[1] for r in conn.execute(
+            "SELECT task_id, MAX(occurred_at) FROM events WHERE type='brief_delivered' "
+            "GROUP BY task_id")}
     finally:
         conn.close()
     labels = {t["task_id"]: t["label"] or t["task_id"] for t in tasks}
     for e in events:
         e["label"] = labels.get(e["task_id"], e["task_id"])
+    # Derive at READ time. `stored_state` is kept alongside so a divergence is
+    # visible rather than silently papered over — when they disagree the row
+    # itself is evidence that something never transitioned.
+    panes = PANES.get()
+    for t in tasks:
+        t["stored_state"] = t["state"]
+        t["state"] = derived_state(t, panes, _iso_epoch(asked.get(t["task_id"])))
+        t["state_stale"] = t["state"] != t["stored_state"]
     attention = sorted((t for t in tasks if t["state"] in ATTENTION),
                        key=lambda t: (ATTENTION.index(t["state"]), t["updated_at"]))
     return {"tasks": tasks, "attention": attention, "events": events,
-            "checkpoints": checkpoints, "max_event_seq": max_seq}
+            "checkpoints": checkpoints, "max_event_seq": max_seq,
+            "herdr_reachable": panes is not None}
 
 
 # ── live herdr state: pushed by subscription, never scraped ────────────────────

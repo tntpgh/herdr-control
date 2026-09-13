@@ -81,5 +81,25 @@ require_pane_birth_match "$pane" || exit 7
 
 bash "$here/send-to-agent.sh" "$pane" ${force:+"$force"} "$text"
 rc=$?
+
+# Record that this worker WAS ASKED something, at this time.
+#
+# Without it, "did the worker do what I last asked?" is unanswerable, and a
+# `_done` event from an EARLIER round masks an abandoned later one: on
+# 2026-09-12 a worker took a five-item review brief, went idle without touching
+# the branch, and still carried round one's completion evidence — so every
+# surface reported it finished. Completion evidence only means anything when it
+# is newer than the last thing the worker was handed.
+if [ "$rc" -eq 0 ]; then
+  _t="$(task_for_pane "$pane" 2>/dev/null || printf '')"
+  if [ -n "$_t" ]; then
+    append_event "$(printf '%s' "$_t" | jq -r '.run_id // empty')" \
+                 "$(printf '%s' "$_t" | jq -r '.task_id // empty')" \
+                 brief_delivered \
+                 "$(jq -nc --arg p "$pane" --argjson n "${#text}" \
+                      '{pane:$p, chars:$n}')" >/dev/null 2>&1 || true
+  fi
+fi
+
 [ "$rc" -eq 0 ] && echo "delivered to $pane" || echo "herdr-deliver: send to $pane returned $rc (may be stranded)" >&2
 exit "$rc"
