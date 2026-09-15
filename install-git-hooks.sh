@@ -331,7 +331,7 @@ done
 
 echo
 echo "===== VERIFY ====="
-tracked=0 legacy=0 unguarded=0
+tracked=0 legacy=0 unguarded=0 ownpush=0
 for d in "$ROOT"/*/; do
   repo="${d%/}"
   [ -d "$repo/.git" ] || continue
@@ -349,12 +349,21 @@ for d in "$ROOT"/*/; do
     unguarded=$((unguarded+1)); echo "  INCOMPLETE: $(basename "$repo") — one of the three hooks is missing"
   elif already_ours "$pc" && already_ours "$pmc" && already_ours "$pp" --push; then
     tracked=$((tracked+1))
+  elif [ -f "$pp" ] && ! ours "$pp"; then
+    # Its own pre-push, which this script will never touch. That is the right
+    # behaviour, but it is NOT "still on the untracked ~/.claude copy" — that
+    # bucket reads as coverage, and there is none: the untracked scanner has no
+    # push mode at all, so `git am`, cherry-pick, revert and rebase replays in
+    # this repo reach the remote unscanned. Its own line, so it is visible.
+    ownpush=$((ownpush+1))
+    echo "  OWN PRE-PUSH: $(basename "$repo") — its push path is NOT scanned by this guard"
   else
     legacy=$((legacy+1))
   fi
 done
 echo "  repos on the TRACKED scanner (all 3 hooks):  $tracked"
 echo "  repos still on the untracked ~/.claude copy: $legacy"
+echo "  repos with their OWN pre-push (no push scan): $ownpush"
 echo "  repos missing one of the three hooks:        $unguarded"
 echo "  repos deliberately NOT opted in (no scan):   $noscan"
 echo "  worktrees covered by a parent repo:          $worktrees"

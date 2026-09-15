@@ -371,7 +371,14 @@ if [[ "$SCAN_MODE" == push ]]; then
         exit 1
     }
 
-    # git's pre-push protocol: one line per ref, on stdin.
+    # git's pre-push protocol: one line per ref, on stdin. BUFFERED, because
+    # this loop consumes it and a chained `pre-push.local` would otherwise
+    # receive an empty stdin — the ref list is the only thing a pre-push hook
+    # has to work with, so chaining without it hands the local hook nothing and
+    # it silently approves every push. Found by review; it becomes real the
+    # first time anyone writes a repo-local pre-push, which the `.local`
+    # convention invites.
+    PUSH_REFS=$(cat)
     PUSH_COMMITS=""
     while read -r _lref lsha _rref rsha; do
         # A deleted ref pushes nothing. `git push --delete` sends an all-zero
@@ -424,7 +431,7 @@ if [[ "$SCAN_MODE" == push ]]; then
             scan_commit "$commit"
             PUSH_COMMITS="$PUSH_COMMITS $commit"
         done
-    done
+    done <<<"$PUSH_REFS"
     # The PII checks are shared: this falls through to them with the pushed
     # commits in PUSH_COMMITS, rather than carrying a second copy of three
     # regexes that would drift from the index copy. The index file-walk and
@@ -671,9 +678,13 @@ if [[ "$SCAN_MODE" == push ]]; then
         echo "than using --no-verify, so the next person is protected too."
         exit 1
     fi
-    # Chain to a repo-specific pre-push hook if one exists.
+    # Chain to a repo-specific pre-push hook if one exists — with BOTH of the
+    # things git would have given it: the ref list on stdin (replayed from the
+    # buffer, since the loop above consumed the original) and git's own argv,
+    # `<remote-name> <remote-url>`. Chaining without them is worse than not
+    # chaining: the local hook runs, sees no refs and no remote, and approves.
     if [[ -x "$(git rev-parse --git-path hooks/pre-push.local 2>/dev/null)" ]]; then
-        exec "$(git rev-parse --git-path hooks/pre-push.local)"
+        exec "$(git rev-parse --git-path hooks/pre-push.local)" "$@" <<<"$PUSH_REFS"
     fi
     exit 0
 fi

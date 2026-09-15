@@ -178,6 +178,17 @@ printf '%s' "$OUT" | grep -q 'shim-home/pre-push .*has its OWN hook' \
 printf '%s' "$OUT" | grep -qE 'untracked ~/\.claude copy: *[1-9]' \
     && ok "and the repo is NOT counted as covered" \
     || bad "counted a repo with an unrecognised pre-push as fully tracked: $(printf '%s' "$OUT" | grep -E 'TRACKED|untracked')"
+# ... and it gets its OWN bucket, not the "untracked ~/.claude copy" one. That
+# label reads as coverage and there is none: the untracked scanner never had a
+# push mode, so git am / cherry-pick / revert / rebase replays in that repo
+# reach the remote unscanned. Review carried this forward as a LOW; it becomes
+# real the first time someone writes a repo-local pre-push.
+printf '%s' "$OUT" | grep -qE 'OWN PRE-PUSH: shim-home' \
+    && ok "a repo with its own pre-push is named, not filed under coverage" \
+    || bad "no OWN PRE-PUSH line: $(printf '%s' "$OUT" | grep -E 'OWN|untracked')"
+printf '%s' "$OUT" | grep -qE 'OWN pre-push \(no push scan\): *[1-9]' \
+    && ok "and counted in a bucket whose name says its push path is unscanned" \
+    || bad "the own-pre-push counter did not move: $(printf '%s' "$OUT" | grep -E 'OWN|untracked')"
 # Restore a correct shim for the rest of the suite.
 run --apply >/dev/null 2>&1 || true
 rm -f "$R_HOME/.git/hooks/pre-push"
