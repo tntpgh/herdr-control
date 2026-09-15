@@ -40,6 +40,25 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
 HOOK_SRC="$here/git-hooks/secret-scan-pre-commit.sh"
+
+# The installed shim embeds $here — the absolute path of the checkout this ran
+# from — so installing from a DISPOSABLE checkout points every hook in every
+# repo at a path that is about to vanish. This is not hypothetical: this
+# script's own first dry run was executed from /tmp/w-secret-guard, a linked
+# worktree that no longer exists. Had that been `--apply`, all ~36 hooks across
+# ~18 repos would now die with a bare `bash: .../secret-scan-pre-commit.sh: No
+# such file or directory` on every commit — fail-closed, fleet-wide, and the
+# fastest possible route to a `--no-verify` habit, which is the one outcome this
+# guard cannot survive.
+#
+# So refuse: a linked worktree (its .git is a FILE, not a directory) or any
+# checkout under a temp root is not a home for 36 hook shims. --dry-run is
+# always allowed, because seeing what would happen from anywhere is harmless.
+_disposable=""
+case "$here" in
+  /tmp/*|/private/tmp/*|/var/folders/*|"${TMPDIR:-/nonexistent}"*) _disposable="a temp directory" ;;
+esac
+[ -z "$_disposable" ] && [ -f "$here/.git" ] && _disposable="a linked git worktree"
 LEGACY_SRC="$HOME/.claude/hooks/secret-scan-pre-commit.sh"
 MARK="# installed by herdr-control install-git-hooks.sh"
 # The predecessor's marker. Its hooks are ours to replace: same content, written
@@ -71,16 +90,58 @@ fi
 # commit and teach --no-verify. Prove it parses before pointing 18 repos at it.
 bash -n "$HOOK_SRC" || { echo "REFUSING: $HOOK_SRC is not valid bash" >&2; exit 2; }
 
+# See the $here note at the top. A dry run from anywhere is fine; writing 36
+# shims that point into a directory somebody is about to delete is not.
+if [ -n "$_disposable" ] && [ "$MODE" != dry ]; then
+  echo "REFUSING: this checkout is $_disposable ($here)." >&2
+  echo "  The hooks this writes hard-code that path, so every commit in every" >&2
+  echo "  repo would break the moment it disappears. Run --apply from the" >&2
+  echo "  permanent checkout instead:  cd ~/Code/herdr-control && bash install-git-hooks.sh --apply" >&2
+  exit 2
+fi
+
+# WHERE THE SHIM POINTS. Not into the working tree.
+#
+# Pointing at "$here/git-hooks/..." looks elegant — a fix in the checkout is
+# live everywhere with no reinstall — but the path only exists on branches that
+# carry the file. Reproduced live on 2026-09-15: hooks installed while this
+# branch was checked out, then the checkout moved to a branch predating the
+# tracked scanner, and every commit in all 18 repos died with
+#   bash: /Users/thurbs/Code/herdr-control/git-hooks/secret-scan-pre-commit.sh:
+#   No such file or directory
+# The guard fails closed, which is right, but a guard that breaks every commit
+# whenever someone changes branch is a guard that gets bypassed within a day.
+#
+# So --apply COPIES the tracked scanner to a stable path outside any working
+# tree and points the shims there. Re-running --apply refreshes the copy, which
+# is the one step a scanner change now needs. `git-hooks/` stays the source of
+# truth; this is its deployment.
+HOOK_DEPLOY_DIR="${HERDR_HOOK_DEPLOY_DIR:-$HOME/.local/share/herdr-control/hooks}"
+HOOK_DEPLOY="$HOOK_DEPLOY_DIR/secret-scan-pre-commit.sh"
+
+deploy_scanner() {
+  mkdir -p "$HOOK_DEPLOY_DIR" || return 1
+  # Atomic: a half-written scanner is a broken guard in every repo at once.
+  local tmp="$HOOK_DEPLOY.new.$$"
+  cp "$HOOK_SRC" "$tmp" || return 1
+  chmod 0755 "$tmp" || return 1
+  bash -n "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$HOOK_DEPLOY" || return 1
+}
+
+hook_body() {
+  printf '#!/usr/bin/env bash\n%s\nexec bash %q\n' "$MARK" "$HOOK_DEPLOY"
+}
+
 [ "$MODE" = dry ] && echo "DRY RUN — nothing will be changed. Re-run with --apply."
+if [ "$MODE" = apply ]; then
+  deploy_scanner || { echo "REFUSING: could not deploy the scanner to $HOOK_DEPLOY" >&2; exit 2; }
+  echo "deployed:  $HOOK_SRC -> $HOOK_DEPLOY"
+fi
 echo "scanner: $HOOK_SRC"
+echo "shims exec: $HOOK_DEPLOY"
 echo
 
-# The hook body this script writes. One line of `exec bash <tracked copy>`, so a
-# fix in this checkout takes effect everywhere with no reinstall — the same
-# live-checkout property install.sh gives the Claude hooks.
-hook_body() {
-  printf '#!/usr/bin/env bash\n%s\nexec bash %q\n' "$MARK" "$HOOK_SRC"
-}
 
 # Is this a hook we may replace? Either it carries a marker we wrote, or it is
 # nothing BUT a call to the shared scanner.
@@ -105,8 +166,12 @@ ours() {                                  # <hook path>
   return 0
 }
 
-already_ours() {                          # <hook path> — already points HERE
-  [ -f "$1" ] && grep -qF "$HOOK_SRC" "$1"
+already_ours() {                          # <hook path> — already correct
+  # Compare against the DEPLOYED path, which is what a correct shim execs. This
+  # tested $HOOK_SRC (the in-tree source) and so reported every hook as needing
+  # a rewrite on a second --apply — idempotence the suite checks by asserting
+  # `changed=0 unchanged=7`.
+  [ -f "$1" ] && grep -qF "$HOOK_DEPLOY" "$1"
 }
 
 installed=0 skipped=0 restored=0 foreign=0 noscan=0 worktrees=0 notrepo=0

@@ -126,6 +126,139 @@ fi
     || bad "ACM sees files here — fixture no longer reproduces the original bypass"
 blocks "$R" "renamed file with an appended token is BLOCKED"
 
+printf '== THE TYPECHANGE BYPASS: symlink replaced by a regular file ==\n'
+# The rename hole taught the wrong lesson: the fix added ONE letter (R) to an
+# allow-list, and the next letter nobody thought of was another hole. Replace a
+# SYMLINK with a regular file carrying a credential and git records `T`, which
+# --diff-filter=ACMR does not select, so the file list came back EMPTY and the
+# scanner exited 0 with a live-shaped token staged.
+#
+# Observed 2026-09-15 against BOTH the then-merged scanner and the copy in force
+# on this machine: `git diff --cached --name-status` -> `T link.sh`,
+# `--diff-filter=ACMR` -> nothing, scanner rc=0. The filter is now `d`
+# (exclude deletions only), so every status letter is scanned by default.
+#
+# Revert the filter to any allow-list that omits T and only this case goes red.
+R="$(new_repo)"
+printf 'real content\n' > "$R/real.txt"
+ln -s real.txt "$R/link.sh"
+git -C "$R" add -A
+git -C "$R" commit -qm "add a symlink" --no-verify
+[ "$(git -C "$R" ls-files -s link.sh | cut -c1-6)" = "120000" ] \
+    && ok "fixture really committed a symlink (mode 120000)" \
+    || bad "fixture is not a symlink — case proves nothing: $(git -C "$R" ls-files -s link.sh)"
+rm "$R/link.sh"
+printf 'GITHUB_TOKEN = "%s"\n' "$GHP" > "$R/link.sh"
+git -C "$R" add link.sh
+git -C "$R" diff --cached --name-status | grep -q '^T' \
+    && ok "fixture really is a typechange (git recorded T)" \
+    || bad "fixture did not record as a typechange: $(git -C "$R" diff --cached --name-status)"
+[ -z "$(git -C "$R" diff --cached --name-only --diff-filter=ACMR)" ] \
+    && ok "ACMR sees an EMPTY file list (the bypass, still reproducible)" \
+    || bad "ACMR sees files here — fixture no longer reproduces the bypass"
+blocks "$R" "symlink replaced by a token-carrying regular file is BLOCKED"
+
+# META: make the NEXT status letter a red suite rather than a review question.
+# Every `--diff-filter=` in the scanner must go through the one constant, and
+# that constant must be the exclude form. Three literals that must agree is the
+# defect underneath both bypasses: the early `exit 0` filter disagreeing with
+# the scan loop's filter is how an empty list becomes a silent pass.
+# Comment lines are excluded: the scanner's own comments NAME the historical
+# allow-lists (ACM, ACMR, Ad) as part of explaining why they were holes, and a
+# meta-test that cannot tell documentation from code would force those
+# explanations to be deleted.
+_filters=$(grep -vE '^[[:space:]]*#' "$HOOK" | grep -oE -- '--diff-filter=[^ ]*' \
+           | grep -v '^--diff-filter="\$DIFF_FILTER"$' || true)
+[ -z "$_filters" ] \
+    && ok "every --diff-filter in the scanner uses the shared constant" \
+    || bad "literal --diff-filter found (must be \"\$DIFF_FILTER\"): $(printf '%s' "$_filters" | tr '\n' ' ')"
+grep -qE '^DIFF_FILTER=d$' "$HOOK" \
+    && ok "the constant is the EXCLUDE form (d), not an allow-list" \
+    || bad "DIFF_FILTER is not 'd' — an allow-list is how T and R were missed: $(grep -E '^DIFF_FILTER=' "$HOOK")"
+[ -n "$(git -C "$R" diff --cached --name-only --diff-filter=d)" ] \
+    && ok "filter=d DOES list the typechange the allow-list missed" \
+    || bad "filter=d missed the typechange fixture — the fix does not do what it claims"
+
+printf '== THE PIPE-BUFFER BYPASS: a secret near the top of a LARGE file ==\n'
+# `grep -q` exits on match, `git show` dies of SIGPIPE (141), and `set -o
+# pipefail` adopts 141 as the pipeline status — so the `if` read FALSE and the
+# token sailed through. Measured 2026-09-12 against the then-live scanner: a
+# ghp_ token on line 1 of a 7 MB file was ALLOWED while the SAME token at the
+# bottom of the SAME file was blocked. 16 KB blocked, 64 KB and up allowed.
+#
+# Worse than the rename bypass: it needs no `git mv`, just a file bigger than
+# the pipe buffer — a minified bundle, a lockfile, a CSV, a JSON dump.
+#
+# The pair is the point. `top` alone could pass on a scanner that blocks
+# everything, so `clean_big` guards against exactly the false-positive
+# regression the first cut of this fix introduced (errexit aborting on a clean
+# no-match, which reads as "blocked" for every large file).
+R="$(new_repo)"
+python3 - "$R" "$GHP" <<'PYX'
+import sys
+r, ghp = sys.argv[1], sys.argv[2]
+pad = ("x" * 80 + "\n") * 90000          # ~7 MB, far past the 64 KB pipe buffer
+open(f"{r}/top.txt", "w").write(f'TOKEN = "{ghp}"\n' + pad)
+open(f"{r}/bottom.txt", "w").write(pad + f'TOKEN = "{ghp}"\n')
+open(f"{r}/clean_big.txt", "w").write(pad)
+PYX
+# Guard the guard: the fixture must actually exceed the pipe buffer, or this
+# case proves nothing.
+sz=$(wc -c < "$R/top.txt" | tr -d ' ')
+[ "$sz" -gt 65536 ] \
+    && ok "fixture exceeds the 64 KB pipe buffer ($sz bytes)" \
+    || bad "fixture is only $sz bytes — too small to reproduce the bypass"
+
+git -C "$R" add top.txt
+blocks "$R" "token at the TOP of a large file is BLOCKED"
+git -C "$R" reset -q
+git -C "$R" add bottom.txt
+blocks "$R" "token at the BOTTOM of a large file is BLOCKED"
+git -C "$R" reset -q
+git -C "$R" add clean_big.txt
+allows "$R" "a large file with NO token is allowed (no errexit false positive)"
+git -C "$R" reset -q
+
+printf '== a scanner that cannot run its own pattern has not cleared anything ==\n'
+# A grep ERROR (exit 2) is not a clean file. The trigger is a maintainer
+# editing PATTERNS, not an attacker: a construct valid in GNU ERE but not the
+# BSD grep this fleet runs makes grep exit 2 for EVERY file and EVERY pattern,
+# so the whole guard silently scans nothing. Judging only `-eq 0` conflated
+# that with "clean" — the same status conflation the SIGPIPE fix removed, one
+# field over, committed in its own new lines.
+R="$(new_repo)"
+printf 'nothing interesting here\n' > "$R/a.txt"
+git -C "$R" add a.txt
+# Build a copy of the scanner whose FIRST pattern is invalid ERE. `[` is an
+# unterminated bracket expression: grep exits 2, not 0 or 1.
+BROKEN="$WORK/broken-scanner.sh"
+sed -E 's/^PATTERNS=\(/PATTERNS=(\n    "["/' "$HOOK" > "$BROKEN"
+if bash -n "$BROKEN" 2>/dev/null && grep -qE '^\s+"\["' "$BROKEN"; then
+    ok "fixture scanner really carries an invalid pattern"
+    OUT="$(cd "$R" && bash "$BROKEN" 2>&1)"; RC=$?
+    [ "$RC" -ne 0 ] \
+        && ok "a pattern grep cannot compile BLOCKS rather than silently passing" \
+        || bad "grep error treated as clean — the whole guard scans nothing: rc=$RC ${OUT:-<silent>}"
+else
+    bad "could not build the broken-pattern fixture — case proves nothing"
+fi
+
+printf '== an unreadable staged file is reported ONCE, not once per pattern ==\n'
+# 17 identical refusals plus 17 lines of git stderr for one corrupt blob buries
+# the message, and the operator-facing message is the thing that has to
+# survive — the rename and SIGPIPE bypasses both hid behind output nobody read.
+R="$(new_repo)"
+printf 'clean line\n' > "$R/a.txt"
+git -C "$R" add a.txt
+BLOB="$(git -C "$R" rev-parse :a.txt)"
+rm -f "$R/.git/objects/${BLOB:0:2}/${BLOB:2}"
+OUT="$(cd "$R" && bash "$HOOK" 2>&1)"; RC=$?
+N="$(printf '%s\n' "$OUT" | grep -c 'refusing to treat an unreadable file as clean' || true)"
+[ "$RC" -ne 0 ] && ok "an unreadable staged file is refused" \
+               || bad "an unreadable staged file was treated as clean (rc=$RC)"
+[ "$N" -eq 1 ] && ok "the refusal is printed once, not once per pattern" \
+               || bad "printed $N times — one per pattern buries the message"
+
 printf '== ordinary cases ==\n'
 R="$(new_repo)"
 printf 'GITHUB_TOKEN = "%s"\n' "$GHP" > "$R/deploy.sh"

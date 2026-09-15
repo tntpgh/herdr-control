@@ -9,14 +9,36 @@
 # automatically (they share the main repo's hooks dir).
 set -euo pipefail
 
-# `R` (renames) is in the filter deliberately. Without it, `git mv` a file that
-# stays similar enough for rename detection (R096 in the probe) and append a
-# token to it: the change records as one rename, `--diff-filter=ACM` returns an
-# EMPTY list, and this hook scans nothing at all while the token lands in the
-# commit. Proved 2026-09-12 against this file. It is conditional — a small file
-# records as D+A, which ACM does catch — which is exactly why it survived: it
-# does not reproduce on a toy fixture.
-STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null)
+# The filter EXCLUDES deletions and nothing else, on purpose. It used to be an
+# allow-list of status letters, and the letter nobody thought of was the hole,
+# twice:
+#
+#   ACM  -> `git mv` a file that stays similar enough for rename detection and
+#           append a token: the change records as one rename (R096 in the
+#           probe), the list comes back EMPTY, and the hook scans nothing while
+#           the token lands. Proved 2026-09-12. Conditional — a small file
+#           records as D+A, which ACM does catch — which is why it survived.
+#   ACMR -> replace a SYMLINK with a regular file carrying a credential: the
+#           change records as `T` (typechange) and the list comes back EMPTY
+#           again. Proved 2026-09-15 in a throwaway repo with no hooks path:
+#           `git diff --cached --name-status` showed `T link.sh`,
+#           `--diff-filter=ACMR` printed nothing, the scanner exited 0, and the
+#           staged content held a live-shaped 40-char ghp_ token. The same
+#           shape as the rename hole, one letter over.
+#
+# So: `d` (lower-case = EXCLUDE) drops only D, and every present-or-future
+# status letter (A C M R T U X B) is scanned by default. A detection control
+# must fail toward scanning; deletions are the one class that cannot carry
+# staged content — and `git show ":$path"` on a deleted path fails, which would
+# trip the unreadable-file refusal below and block every commit that deletes
+# something. Never mix cases in one filter: `--diff-filter=Ad` is rejected.
+#
+# ONE constant, three call sites. Three literals that must agree is the real
+# defect: this early `exit 0` disagreeing with the scan loop's own filter is
+# exactly how an empty list becomes a silent pass. verify-secret-scan.sh greps
+# for any `--diff-filter=` in this file that is not "$DIFF_FILTER".
+DIFF_FILTER=d
+STAGED=$(git diff --cached --name-only --diff-filter="$DIFF_FILTER" 2>/dev/null)
 [[ -z "$STAGED" ]] && exit 0
 
 # ── commit identity ──────────────────────────────────────────────────────────
@@ -113,15 +135,63 @@ FOUND=0
 # never looks at it. `-z` + `read -r -d ''` can't be split by anything.
 while IFS= read -r -d '' FILE; do
     [[ "$FILE" =~ $SKIP_EXT ]] && continue
+
+    # Readability is a property of the FILE, not of a pattern. Checking it
+    # inside the pattern loop printed the same refusal 17 times for one corrupt
+    # blob, plus 17 lines of git's own stderr — and the operator-facing message
+    # is the thing that has to survive: the rename and SIGPIPE bypasses both
+    # hid behind output nobody read.
+    set +e
+    git show ":$FILE" >/dev/null 2>&1
+    _rd=$?
+    set -e
+    if [ "$_rd" -ne 0 ]; then
+        echo "UNREADABLE: could not read staged $FILE (git show exit $_rd) —" >&2
+        echo "  refusing to treat an unreadable file as clean." >&2
+        FOUND=1
+        continue
+    fi
+
     for PATTERN in "${PATTERNS[@]}"; do
-        # No `2>/dev/null` on git show: a read failure here must be loud,
-        # not a silent "found nothing, so nothing to block."
-        if git show ":$FILE" | grep -qE -- "$PATTERN"; then
+        # Inspect BOTH exit codes, because `set -o pipefail` (line 10) turns a
+        # successful match into a miss on any file bigger than the pipe buffer.
+        #
+        # `grep -q` exits the instant it matches. `git show` is then killed by
+        # SIGPIPE (141), pipefail adopts 141 as the pipeline's status, the `if`
+        # reads FALSE, and FOUND is never set. Measured 2026-09-12: a `ghp_`
+        # token on line 1 of a 7 MB file was ALLOWED (rc=0) while the same
+        # token at the BOTTOM of the same file was BLOCKED — 16 KB blocks,
+        # 64 KB and up allow. Minified bundles, lockfiles, CSVs, JSON dumps,
+        # SQL fixtures: any generated text file over 64 KB was a free pass, and
+        # unlike the rename bypass it needs no `git mv`, just a large file.
+        #
+        # So: run the pipeline with pipefail OFF and judge the statuses
+        # separately. `set +e` as well, because outside an `if` condition a
+        # clean no-match (grep 1) is a failing command and errexit would abort
+        # the hook — which reads as "blocked" and flags every clean large file.
+        # Capture both statuses in the SAME statement; any simple command in
+        # between resets PIPESTATUS.
+        set +e +o pipefail
+        git show ":$FILE" | grep -qE -- "$PATTERN"
+        _st=("${PIPESTATUS[@]}")
+        set -e -o pipefail
+        if [ "${_st[1]}" -eq 0 ]; then
             echo "BLOCKED: potential secret in $FILE  (pattern: $PATTERN)"
+            FOUND=1
+        elif [ "${_st[1]}" -gt 1 ]; then
+            # grep 0 = match, 1 = clean, ANYTHING ELSE is an error — most
+            # likely a pattern valid in GNU ERE but not the BSD grep this
+            # fleet runs, which would make grep exit 2 for every file and
+            # every pattern and silently scan NOTHING. Judging only `-eq 0`
+            # conflated that with "clean", which is precisely the
+            # status-conflation this fix was opened to remove — committed in
+            # its own new lines, one field over.
+            echo "BLOCKED: grep failed on $FILE (exit ${_st[1]}, pattern: $PATTERN) —" >&2
+            echo "  a scanner that cannot run its own pattern has not cleared this file." >&2
             FOUND=1
         fi
     done
-done < <(git diff --cached -z --name-only --diff-filter=ACMR 2>/dev/null)
+done < <(git diff --cached -z --name-only --diff-filter="$DIFF_FILTER" 2>/dev/null)
 
 # ── client PII ───────────────────────────────────────────────────────────────
 # Credentials were never the bigger body. A 2026-09-03 audit found 1,409
@@ -150,7 +220,7 @@ PII_FOUND=0
 # relaxes the PII checks ONLY: the credential scan above walks every staged
 # file independently of $ADDED, so a token pasted here is still blocked
 # (proven on a real negative, 2026-09-06).
-ADDED="$(git diff --cached -U0 --diff-filter=ACMR \
+ADDED="$(git diff --cached -U0 --diff-filter="$DIFF_FILTER" \
          -- . ':(exclude)src/data/propx-*.json' \
               ':(exclude)src/data/price-band-evidence.json' \
               ':(exclude)src/data/sold-subdivision-context.json' \
