@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""hub.py's status derivation must satisfy the SAME truth table as the shell.
+"""hub.py's status derivation must satisfy the truth table it claims to.
 
-tests/status-cases.json is the single source. Two implementations exist because
-one serves shell callers and the other an HTTP view, but a case may not pass in
-one and fail in the other — that divergence is the bug this whole change is
-about, one layer up.
+status-cases.json (next to this file) is the single source, and hub.py's
+`derived_state` is the single implementation. There were two until 2026-09-15 —
+a shell half in lib/live-status.sh that had already drifted in two ways no row
+could see — and this file exists because a table nothing asserts is a comment.
 """
 from __future__ import annotations
 
@@ -67,9 +67,17 @@ def run() -> int:
             else:
                 # The subscription's projected record shape, which is what
                 # hub.pane_statuses() now returns.
-                panes = {PANE: {"pane_id": PANE, "agent_status": c["pane"], "birth": "term-live"}}
+                # `birth: unknown` is herdr_live's synthesised record for a
+                # status change on a pane it has no snapshot for: present,
+                # answering, but not IDENTIFIED.
+                live_birth = "" if c.get("birth") == "unknown" else "term-live"
+                panes = {PANE: {"pane_id": PANE, "agent_status": c["pane"], "birth": live_birth}}
             pid = [PANE] if c["pane"] == "__unhashable__" else PANE
-            birth = {"mismatch": "term-OLD", "match": "term-live"}.get(c.get("birth"), "")
+            # The REGISTRY's recorded fingerprint. `unknown` means the task
+            # registered one and the LIVE record has none — the case that
+            # silently disabled the guard.
+            birth = {"mismatch": "term-OLD", "match": "term-live",
+                     "unknown": "term-live"}.get(c.get("birth"), "")
             if de == "trailing":
                 os.utime(ev, (NOW, NOW)); asked = NOW - 300   # mtime NEWER than the ask
             try:
@@ -192,6 +200,38 @@ def run() -> int:
         else:
             bad += 1
             print("  FAIL stalled is an attention state\n     want=in ATTENTION got=absent")
+
+        # ---- the SOURCE of each verdict ---------------------------------
+        # Every fallback path returns the STORED state, so `state_stale` is
+        # False exactly when the row is least trustworthy. `derive` reports
+        # where the answer came from so the page can say `unconfirmed`; a
+        # renderer cannot invent that distinction from the state alone.
+        src_wt = Path(tmp) / "src"
+        (src_wt / ".handoffs").mkdir(parents=True)
+        (src_wt / ".handoffs/events.jsonl").write_text("")
+        base = {"state": "blocked", "pane_id": PANE, "worktree": str(src_wt)}
+        for label, task, live, want in (
+            ("herdr confirms blocked -> live", base,
+             {PANE: {"agent_status": "blocked", "birth": ""}}, "live"),
+            ("herdr unreachable -> stored", base, None, "stored"),
+            ("herdr has no opinion -> stored", base,
+             {PANE: {"agent_status": "unknown", "birth": ""}}, "stored"),
+            ("unrecognised status -> stored", base,
+             {PANE: {"agent_status": "reviewing", "birth": ""}}, "stored"),
+            ("unidentified pane -> stored", dict(base, pane_birth="term-A"),
+             {PANE: {"agent_status": "working", "birth": ""}}, "stored"),
+            ("recycled pane -> live (gone is a live fact)", dict(base, pane_birth="term-A"),
+             {PANE: {"agent_status": "working", "birth": "term-B"}}, "live"),
+            ("a terminal state -> registry", dict(base, state="completed"),
+             {PANE: {"agent_status": "working", "birth": ""}}, "registry"),
+        ):
+            got = hub.derive(task, live)[1]
+            if got == want:
+                ok += 1
+                print(f"  ok   source: {label}")
+            else:
+                bad += 1
+                print(f"  FAIL source: {label}\n     want={want} got={got}")
 
         # ---- the ask anchor: only a BRIEF re-asks ----------------------
         # PR #313 lost five review findings because a finished worker read

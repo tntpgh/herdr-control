@@ -70,10 +70,14 @@ with tempfile.TemporaryDirectory() as td:
     shutil.copytree(HERE / "lib", work / "lib")
     (work / "preview.sh").write_text("#!/bin/bash\nexit 0\n")
     delivered = root / "delivered.jsonl"
-    # formserve passes the answer TEXT as the second argument (no stdin); a stub
-    # that read stdin would block forever on the inherited pipe.
+    # The stub records the WHOLE argv, one delivery per line. It used to record
+    # `$2` alone, which pinned the answer text to argument position 2 — so
+    # adding the `--reply` flag (the flag that stops a form answer from moving
+    # hub.py's ask anchor) shifted the text to $3 and this suite failed on the
+    # argv shape rather than on any behaviour. A stub that reads stdin would
+    # block forever on the inherited pipe, so it must not.
     (work / "herdr-deliver.sh").write_text(
-        "#!/bin/bash\n" f"printf '%s\\n' \"$2\" >> '{delivered}'\n" "exit 0\n")
+        "#!/bin/bash\n" f"printf '%s\\n' \"$*\" >> '{delivered}'\n" "exit 0\n")
     for f in ("preview.sh", "herdr-deliver.sh"):
         os.chmod(work / f, 0o755)
     form = root / "q.html"
@@ -115,6 +119,12 @@ with tempfile.TemporaryDirectory() as td:
     check("port process exits 0 having noticed the hub answer", p.returncode, 0)
     check("port prints the HUB's answer, not the loser", json.loads(out or "{}"), {"pick": "merge"})
     check("delivered payload is the winner", "merge" in (delivered.read_text() if delivered.exists() else ""), True)
+    # An answer is an ANSWER, not a brief: without `--reply` the delivery
+    # records `brief_delivered`, which moves hub.py's `asked_at` anchor past
+    # the worker's own completion evidence and parks a finished task in
+    # Needs-attention forever (a finished worker never writes another `_done`).
+    check("the answer is delivered as a reply, not a brief",
+          "--reply" in (delivered.read_text() if delivered.exists() else ""), True)
     check("the losing 'hold' was never delivered", "hold" in (delivered.read_text() if delivered.exists() else ""), False)
     check("record unchanged", json.loads(rec.read_text())["answers"], {"pick": "merge"})
     if delivered.exists(): delivered.unlink()

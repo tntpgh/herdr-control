@@ -85,7 +85,20 @@ KB_DASHBOARD_URL = os.environ.get("KB_DASHBOARD_URL", "https://dashboard.teamthu
 # one nothing used to report: a worker that took a brief and went quiet looks
 # exactly like a worker that is thinking (2026-09-12, PR #313 — five review
 # findings dropped, noticed an hour later only because a human asked).
-ATTENTION = ("input_required", "blocked", "stalled")
+#
+# `input_required` is NOT here, though it was until this commit: it is an EVENT
+# type (lib/push-wake.sh:130), never a task state. lib/run-registry.sh's
+# `_legal_transition` has no arm for it, so every transition into it is refused
+# — measured, from every source state:
+#
+#     <empty> -> input_required : REFUSED      blocked   -> ... : REFUSED
+#     starting -> ...           : REFUSED      completed -> ... : REFUSED
+#     running  -> ...           : REFUSED
+#
+# and the live registry holds only completed/lost/running. A prompt is recorded
+# as state `blocked` PLUS an `input_required` event, so `blocked` is the state
+# that needs attention and this was dead vocabulary pretending to be a case.
+ATTENTION = ("blocked", "stalled")
 
 # Every surface the team runs, hosted and local. `probe` is what "alive" means
 # for it; hosted ones also get the KB heartbeat verdict when a snapshot exists.
@@ -280,28 +293,39 @@ def _evidence_at(worktree: str | None) -> float | None | str:
 
 def derived_state(task: dict, panes: dict | None,
                   asked_at: float | None = None) -> str:
-    """The state to SHOW, from live truth plus the worker's own evidence.
+    """The state to SHOW. See `derive` for the reasoning; this drops the source."""
+    return derive(task, panes, asked_at)[0]
+
+
+def derive(task: dict, panes: dict | None,
+           asked_at: float | None = None) -> tuple[str, str]:
+    """(state to SHOW, where it came from) — `live`, `stored`, or `registry`.
 
     `asked_at` is when a brief was last delivered to this worker. Completion
     evidence OLDER than that is evidence about a previous round, not this one —
     without that comparison a worker that takes a brief and goes quiet keeps
     reporting `completed` off its last round's event, which is the exact failure
     this whole change exists to make visible.
+
+    The SOURCE is returned because the page cannot otherwise tell a
+    live-confirmed state from the registry's copy: in every fallback path the
+    derived state IS the stored state, so `state_stale` is False and the row
+    looked exactly like a confirmed one. `blocked` because herdr says so and
+    `blocked` because herdr went quiet are different facts about whether anyone
+    is actually waiting.
     """
     # An empty `state` is the registry's own initial value, before the first
     # transition (lib/run-registry.sh:390) — it means "registered, nothing has
     # happened yet", which is `starting`. It used to normalise to `unknown`,
     # which is not a state anything filters on.
     stored = task.get("state") or "starting"
-    # REGISTRY-OWNED states: facts no pane status can see or contradict. The
-    # terminal four, plus `input_required` — a task waiting on a formserve
-    # decision is waiting on a PERSON, while its pane sits legitimately idle
-    # with last round's `_done` still fresh, so the derivation reported
-    # `completed` and the open decision silently left the attention list.
-    if stored in TERMINAL or stored == "input_required":
-        return stored
+    # REGISTRY-OWNED states: facts no pane status can see or contradict.
+    # The terminal four, and only those — see ATTENTION for why
+    # `input_required` is not a task state and cannot be one.
+    if stored in TERMINAL:
+        return stored, "registry"
     if panes is None:
-        return stored                      # herdr down: fall back, never invent
+        return stored, "stored"            # herdr down: fall back, never invent
     # A pane id from the registry is untrusted input: it is TEXT in the schema
     # but this row could hold anything, and an unhashable value (a list) raised
     # TypeError straight out of .get() — which `Cached` then turned into an
@@ -310,10 +334,10 @@ def derived_state(task: dict, panes: dict | None,
     # the poller; the lookup itself was not.
     pane = task.get("pane_id")
     if not isinstance(pane, str) or not pane:
-        return "gone"
+        return "gone", "live"
     entry = panes.get(pane)
     if entry is None:
-        return "gone"
+        return "gone", "live"
     # The record shape is the subscription's projection; a bare string or the
     # old (status, birth) tuple is still accepted so the truth-table fixtures
     # and any older caller keep working.
@@ -327,11 +351,25 @@ def derived_state(task: dict, panes: dict | None,
     # live pane's differs, this slot now belongs to a different process and its
     # status says nothing about our task — the same refusal pane-guard.sh makes
     # before a keypress. `gone` rather than a guess: reconcile owns that verdict.
+    #
+    # An EMPTY live birth is a third case, and it is not "matches".
+    # lib/herdr_live.py synthesises a record with `"birth": ""` for a status
+    # change on a pane it has no snapshot for yet, documenting that empty means
+    # UNKNOWN and a consumer "may only refuse on a definite disagreement". Both
+    # halves of that are right, and `reg and birth and ...` honoured only one:
+    # with an unidentified record the guard silently switched OFF and the task
+    # read the status of whatever now holds the id — a recycled pane reporting
+    # `working` for a task that is dead, which is the exact hole the guard
+    # exists to close. So: refuse to use the LIVE status when identity is
+    # unknown (fall back to the stored copy, as if herdr had no opinion), and
+    # keep `gone` for a definite mismatch.
     reg = task.get("pane_birth") or ""
     if reg and birth and reg != birth:
-        return "gone"
+        return "gone", "live"
+    if reg and not birth:
+        return stored, "stored"
     if live == "working":
-        return "running"
+        return "running", "live"
     # herdr's OWN `unknown` is not a task state, and it is not rare: it is what
     # herdr reports when an agent's turn-detection is quiet, which was true for
     # 12 of 14 live panes on this machine when this was written
@@ -343,11 +381,10 @@ def derived_state(task: dict, panes: dict | None,
     # this whole change exists to replace.
     #
     # "herdr has no opinion" and "herdr cannot be reached" deserve the same
-    # answer — keep the stored state, and let `state_stale` show it is a copy —
-    # but they must stay DISTINGUISHABLE upstream, which is why the shell half
-    # now says `__unreachable__` instead of overloading this token.
+    # answer — the stored copy — and the SOURCE this returns is what keeps them
+    # distinguishable on the page, rather than reading as a confirmed state.
     if live == "unknown":
-        return stored
+        return stored, "stored"
     if live in ("idle", "done"):
         ev = _evidence_at(task.get("worktree"))
         if ev is None:
@@ -357,22 +394,22 @@ def derived_state(task: dict, panes: dict | None,
             # pane is idle because nothing has run in it, so `stalled` would
             # put every freshly spawned worker straight into Needs-attention.
             if stored == "starting":
-                return "starting"
-            return "stalled"               # no completion evidence at all
+                return "starting", "live"
+            return "stalled", "live"       # no completion evidence at all
         if ev == "undatable":
             # A `_done` exists but something was appended after it, so it
             # cannot be placed against the ask. With no ask on record, take it;
             # with one, refuse to assume it answered THIS round.
-            return "stalled" if asked_at is not None else "completed"
+            return ("stalled", "live") if asked_at is not None else ("completed", "live")
         if asked_at is not None and ev < asked_at:
-            return "stalled"               # answered an older round, not this one
-        return "completed"
+            return "stalled", "live"       # answered an older round, not this one
+        return "completed", "live"
     if live == "blocked":
-        return "blocked"
+        return "blocked", "live"
     # An agent_status this code does not know is NOT a task state either. Same
     # reasoning as `unknown`: inventing a vocabulary entry hides the task from
     # every surface that filters on one.
-    return stored
+    return stored, "stored"
 
 
 # ── herdr registry ─────────────────────────────────────────────────────────────
@@ -410,10 +447,15 @@ def herdr_data(event_limit: int = 100) -> dict:
     # Derive at READ time. `stored_state` is kept alongside so a divergence is
     # visible rather than silently papered over — when they disagree the row
     # itself is evidence that something never transitioned.
+    #
+    # `state_source` is kept for the case `state_stale` cannot see: every
+    # fallback path RETURNS the stored state, so the two agree and the row
+    # looked live-confirmed. A reader has to be able to tell "herdr says
+    # blocked" from "herdr went quiet and this is the last thing we recorded".
     panes = pane_statuses()
     for t in tasks:
         t["stored_state"] = t["state"]
-        t["state"] = derived_state(t, panes, _iso_epoch(asked.get(t["task_id"])))
+        t["state"], t["state_source"] = derive(t, panes, _iso_epoch(asked.get(t["task_id"])))
         t["state_stale"] = t["state"] != t["stored_state"]
     attention = sorted((t for t in tasks if t["state"] in ATTENTION),
                        key=lambda t: (ATTENTION.index(t["state"]), t["updated_at"]))
@@ -1497,6 +1539,13 @@ def task_rows(rows) -> str:
         stale = ""
         if t.get("state_stale") and t.get("stored_state"):
             stale = f" <small class=dim title='registry still says this'>was {_esc(t['stored_state'])}</small>"
+        elif t.get("state_source") == "stored":
+            # The case `state_stale` is blind to: the derivation FELL BACK, so
+            # it returned the stored state and the two agree. Without this the
+            # row is indistinguishable from a live-confirmed one — "blocked
+            # because herdr says so" and "blocked because herdr went quiet" are
+            # different facts about whether anyone is actually waiting.
+            stale = " <small class=dim title='herdr has no live status for this pane; this is the registry copy'>unconfirmed</small>"
         out.append(f"<tr class='{cls}'><td><span class='pill {cls}'>{_esc(t['state'])}</span>{stale}</td>"
                    f"<td><b>{_esc(t['label'])}</b><br><small>{_esc(repo)} · pane {_esc(t['pane_id'] or '—')} · "
                    f"{_esc(t['conductor_id'] or 'no conductor')}</small></td>"

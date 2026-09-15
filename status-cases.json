@@ -1,15 +1,17 @@
 {
   "_comment": [
-    "The single truth table for derived task status. Both implementations read",
-    "THIS file: lib/live-status.sh (shell consumers) and hub.py (the web view).",
+    "The single truth table for derived task status. ONE implementation reads",
+    "this file: hub.py's derived_state(). verify-hub-status.py asserts it.",
     "",
-    "It exists because the bug being fixed is 'two models of the same fact drift",
-    "apart', and writing the derivation twice in two languages would recreate it",
-    "one layer up. Neither implementation may carry a case this file does not.",
+    "There were two until 2026-09-15 — lib/live-status.sh (shell) and hub.py —",
+    "and they had already drifted in two ways no row could see, which is why",
+    "the shell half was deleted rather than fixed.",
     "",
-    "pane: the agent_status herdr reports live, or null for a pane herdr has",
-    "never heard of, or \"__down__\" when herdr itself is unreachable.",
-    "done_event: whether the worktree's handoff bus carries a *_done event."
+    "Each case: stored (registry state), pane (herdr's agent_status, or null",
+    "for an unknown pane, or __down__ / __noshape__ for an unanswerable herdr),",
+    "birth (match / mismatch / unknown for the pane fingerprint), done_event",
+    "(false | true | stale | fresh | trailing | no_newline | undatable |",
+    "undatable_no_ask), want (the state to SHOW), why (the defect it pins)."
   ],
   "cases": [
     {
@@ -219,14 +221,6 @@
       "why": "The registry's initial state is the empty string before the first transition; same reasoning as `starting`, and the table had no row for either, so both implementations agreed by accident."
     },
     {
-      "name": "input_required is a registry fact herdr cannot see",
-      "stored": "input_required",
-      "pane": "idle",
-      "done_event": "fresh",
-      "want": "input_required",
-      "why": "A task waiting on a formserve decision is waiting on a PERSON, which no pane status can express: the worker is legitimately idle and its last round's `_done` is fresh, so the derivation reported `completed` and the open decision left the attention list. Treated like the terminal states: owned by the registry, not overridable by liveness."
-    },
-    {
       "name": "a bus whose last line has no trailing newline",
       "stored": "running",
       "pane": "idle",
@@ -249,6 +243,24 @@
       "done_event": "undatable_no_ask",
       "want": "completed",
       "why": "The other half of the undatable decision, also untested: with nothing on record to compare against, refusing would call every un-timestamped completion an abandonment."
+    },
+    {
+      "name": "a live record whose identity is UNKNOWN (empty birth)",
+      "stored": "blocked",
+      "pane": "working",
+      "birth": "unknown",
+      "done_event": false,
+      "want": "blocked",
+      "why": "REVIEW MEDIUM. lib/herdr_live.py synthesises a record with `birth: \"\"` for a status change on a pane it has no snapshot for yet — its own comment says empty means UNKNOWN, never mismatch, and a consumer may only refuse on a definite disagreement. The guard read `reg and birth and reg != birth`, so an unidentified record switched it OFF entirely and the task took the status of whatever holds the id now: a recycled pane reporting `working` for a task that is dead. Unknown identity is the same information as herdr having no opinion, so it gets the same answer — the stored copy — while a DEFINITE mismatch still means `gone`."
+    },
+    {
+      "name": "a live record with unknown identity does not resurrect a stalled worker",
+      "stored": "running",
+      "pane": "working",
+      "birth": "unknown",
+      "done_event": false,
+      "want": "running",
+      "why": "The other direction of the same rule: falling back must not invent either. With the stored state `running` the answer is `running` — not the stranger's `working` promoted to live truth, and not `gone`, which would bury a task whose pane is merely unidentified for one event."
     }
   ]
 }
