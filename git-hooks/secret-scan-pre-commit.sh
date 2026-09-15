@@ -122,6 +122,11 @@ if [[ "$SCAN_MODE" == index && "$HAVE_EMAIL" != "$WANT_EMAIL" ]]; then
     exit 1
 fi
 
+# These two are named because they need an exemption the others do not —
+# see `is_name_hex` below for why a PUBLIC key matches them.
+PAT_NAME_HEX_UPPER='(SYSTEM_KEY|WEBHOOK_KEY|SIGNING_KEY|API_KEY|SECRET|TOKEN)[A-Z_]*\s*[=:]\s*["\x27]?[a-f0-9]{32,}'
+PAT_NAME_HEX_JSON='["\x27][A-Za-z0-9_-]*([Kk]ey|[Ss]ecret|[Tt]oken)["\x27]\s*:\s*["\x27][a-f0-9]{32,}'
+
 # Patterns that indicate a hardcoded secret (not an op:// reference)
 PATTERNS=(
     'AIzaSy[A-Za-z0-9_-]{33}'                          # Google API keys
@@ -147,7 +152,7 @@ PATTERNS=(
                                                         # repos and had sat in history since 2026-07-13. FUB holds all
                                                         # client PII, so this is the highest-consequence shape here —
                                                         # and it was the one shape this guard could not see.
-    '(SYSTEM_KEY|WEBHOOK_KEY|SIGNING_KEY|API_KEY|SECRET|TOKEN)[A-Z_]*\s*[=:]\s*["\x27]?[a-f0-9]{32,}'
+    "$PAT_NAME_HEX_UPPER"
                                                         # A bare 32+ hex value ASSIGNED to a secret-shaped name. Bare
                                                         # hex alone is unusable as a pattern (git SHAs, md5sums,
                                                         # content hashes) — requiring the assignment target to look
@@ -155,7 +160,7 @@ PATTERNS=(
                                                         # above: a committed FUB X-System-Key of exactly this shape
                                                         # survived six audits, partly because a source comment called
                                                         # it "public-ish, in repo already".
-    '["\x27][A-Za-z0-9_-]*([Kk]ey|[Ss]ecret|[Tt]oken)["\x27]\s*:\s*["\x27][a-f0-9]{32,}'
+    "$PAT_NAME_HEX_JSON"
                                                         # Same value, JS/JSON/YAML object form:
                                                         #   "X-System-Key": "<32 hex>"
                                                         # The uppercase assignment pattern above catches the Python
@@ -163,6 +168,87 @@ PATTERNS=(
                                                         # when the guard flagged 1 of the 6 files holding the same
                                                         # committed FUB key and missed the four JS/TOML/JSON ones.
 )
+
+# ── the two patterns above whose ONLY signal is a secret-shaped NAME ─────────
+# Every other pattern matches a credential's own FORMAT (`ghp_` + 36, `AKIA` +
+# 16): the value itself says what it is. These two match "a secret-shaped name
+# assigned a long hex value", which cannot distinguish a PRIVATE key from a
+# PUBLIC one — and a public key is published by definition.
+#
+# Found by this guard's own live proof, 2026-09-15: watchdog-worker's
+# signed-registry commit carries
+#
+#     "pubkey": "<64 hex>"        (watchdog-worker, commit a5d06ae)
+#
+# an Ed25519 PUBLIC key, matched because "pubkey" ends in "key". There is no
+# compliant fix for that: the pubkey has to be in the repo for signature
+# verification to work, so the only way past it is the bypass flag — the
+# outcome this whole guard is designed not to provoke. That repo's whole design
+# is signed registries, so it will recur.
+#
+# The exemption is NAME-SCOPED and applies ONLY to these two patterns, checked
+# only after one of them has already matched. A line like
+# `"pubkey": "ghp_<36>"` is still blocked, because the `ghp_` pattern matched
+# on FORMAT and never consults this list — the allowlist cannot be used as a
+# shield by naming a field `pubkey`.
+# A name that says PUBLIC, or that names a hash/fingerprint rather than a
+# credential. Anchored in NAME position — the value is never consulted.
+# Deliberately NARROW, in two parts, each anchored in NAME position:
+#
+#   * a name whose "public" sits directly on the key word — pubkey,
+#     public_key, myPublicKey, host_pubkeys. NOT any name that merely contains
+#     "public": `public_api_token` holding a 40-hex value is a credential with
+#     a reassuring name, and an earlier draft of this list exempted it.
+#   * a hash/fingerprint name, with no free-form suffix. `hash_key` is NOT
+#     exempt — an HMAC key in a field named `hash_key` is still an HMAC key.
+#
+# "token" appears in neither branch: a "public token" is a contradiction, and
+# resolving it in favour of the reassuring word is how this class of mistake
+# happens.
+PUBLIC_NAME='["\x27]?[A-Za-z0-9_-]*(pub|public)[_-]?keys?["\x27]?[[:space:]]*[=:]|["\x27]?[A-Za-z0-9_-]*(fingerprint|checksum|digest|sha256|sha512|md5|etag|hash)(_?(hex|value|sum))?["\x27]?[[:space:]]*[=:]'
+
+is_name_hex() {                 # <pattern> -> 0 if it is one of the two
+    [ "$1" = "$PAT_NAME_HEX_UPPER" ] || [ "$1" = "$PAT_NAME_HEX_JSON" ]
+}
+
+# Are ALL of this pattern's matches in <text> published-by-design? Runs only
+# after a match, so its cost never touches the clean path.
+all_matches_public() {          # <text> <pattern>
+    # `grep -o` — OCCURRENCE granularity, not line. Per line was wrong and the
+    # suite caught it: `{"pubkey": "<hex>", "token": "<hex>"}` is ONE line that
+    # matches the allowlist because of the pubkey, so a real secret beside it on
+    # the same line was exempted. `-o` emits one `name: value` match per line,
+    # which is the same reason the PII email check below uses it.
+    #
+    # And NEVER judge a pipeline you exit early from. The first draft was
+    # `! printf | grep -oE | grep -qvEi`, which rebuilds the SIGPIPE bypass
+    # this file already paid for once (2026-09-12: a token in a >64KB file read
+    # as clean). `grep -qv` exits the instant it sees a NON-public match, the
+    # producer keeps writing, takes SIGPIPE, exits 141, pipefail adopts 141 —
+    # and `!` inverts that into "every match was published by design". The
+    # direction is inverted from the original incident, which is worse: there a
+    # match became a miss, here "some match is NOT public" becomes "all of them
+    # are". The race did not fire in 40 attempts at 3MB of match output here,
+    # so this is reasoning rather than a reproduction — but the same reasoning
+    # was right the first time and this structure costs nothing.
+    #
+    # It also closes two fail-opens that ARE deterministic, both resolving to
+    # EXEMPT: empty output — the index path re-reads the blob, and a read that
+    # fails yields nothing, so an unreadable file became an exempted one, in
+    # the one path that elsewhere refuses an unreadable file BY NAME — and
+    # `grep -oE` erroring out (exit >1 on an ERE it dislikes), which the main
+    # loops handle explicitly and this helper did not.
+    local out nonpublic st
+    set +e +o pipefail
+    out=$(printf '%s\n' "$1" | grep -oE -- "$2")
+    st=$?
+    set -e -o pipefail
+    # st>0 is "no matches" or "grep failed". Neither is a positive statement
+    # that the matches are public, so neither may exempt.
+    [ "$st" -eq 0 ] && [ -n "$out" ] || return 1
+    nonpublic=$(printf '%s\n' "$out" | grep -vEi -- "$PUBLIC_NAME" || true)
+    [ -z "$nonpublic" ]
+}
 
 # Binary and generated formats only. `lock` was in this list until 2026-09-09,
 # which made the PII-exclusion comment below FALSE where it mattered: it says
@@ -241,7 +327,13 @@ if [[ "$SCAN_MODE" == push ]]; then
             printf '%s\n' "$added" | grep -qE -- "$pattern"
             st=("${PIPESTATUS[@]}")
             set -e -o pipefail
-            if [ "${st[1]}" -eq 0 ]; then
+            if [ "${st[1]}" -eq 0 ] && is_name_hex "$pattern" \
+               && all_matches_public "$added" "$pattern"; then
+                # Every match was a published-by-design value (a pubkey, a
+                # fingerprint). Checked only AFTER a match, so the clean path
+                # pays nothing for it.
+                :
+            elif [ "${st[1]}" -eq 0 ]; then
                 # The commit, not just the pattern: in a range the operator
                 # needs to know WHICH commit to rewrite, and `git log --oneline`
                 # on a sha is the next command either way.
@@ -388,7 +480,13 @@ while IFS= read -r -d '' FILE; do
         git show ":$FILE" | grep -qE -- "$PATTERN"
         _st=("${PIPESTATUS[@]}")
         set -e -o pipefail
-        if [ "${_st[1]}" -eq 0 ]; then
+        if [ "${_st[1]}" -eq 0 ] && is_name_hex "$PATTERN" \
+           && all_matches_public "$(git show ":$FILE" 2>/dev/null)" "$PATTERN"; then
+            # A published-by-design value (a pubkey, a fingerprint). The file is
+            # re-read here rather than held in a variable for every scan,
+            # because this branch is only reached once a pattern has matched.
+            :
+        elif [ "${_st[1]}" -eq 0 ]; then
             echo "BLOCKED: potential secret in $FILE  (pattern: $PATTERN)"
             FOUND=1
         elif [ "${_st[1]}" -gt 1 ]; then
