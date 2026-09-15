@@ -178,20 +178,29 @@ ours() {                                  # <hook path>
   return 0
 }
 
-already_ours() {                          # <hook path> [required extra arg]
-  # Compare against the DEPLOYED path, which is what a correct shim execs. This
-  # tested $HOOK_SRC (the in-tree source) and so reported every hook as needing
-  # a rewrite on a second --apply — idempotence the suite checks by asserting
-  # `changed=0 unchanged=7`.
+already_ours() {                          # <hook path> [scanner args...]
+  # BYTE COMPARISON against the body we would write, not a set of substring
+  # greps. Three times in one day the grep form has called a broken shim
+  # correct, because each fix added an element the check did not know to look
+  # for:
   #
-  # The second argument matters for pre-push: a shim that execs the right
-  # scanner WITHOUT `--push` runs the index scan on a push, where the index is
-  # unrelated to what is being sent — it would exit 0 on staged-nothing and
-  # read as a guard that is present and working. Treat it as needing a rewrite.
-  [ -f "$1" ] || return 1
-  grep -qF "$HOOK_DEPLOY" "$1" || return 1
-  [ -n "${2:-}" ] && { grep -qF -- "$2" "$1" || return 1; }
-  return 0
+  #   * it grepped $HOOK_SRC (the in-tree path) while a correct shim execs
+  #     $HOOK_DEPLOY, so every hook was reported as needing a rewrite;
+  #   * it could not see a `pre-push` shim missing `--push` (index scan on a
+  #     push: exits 0 on a clean index and reads as a working guard);
+  #   * it could not see one missing `"$@"` — which leaves the scanner with no
+  #     remote name, so every NEW-branch push is refused with "give this
+  #     remote a name", advice that does not apply to an ordinary origin.
+  #     That is a refusal with no compliant fix, i.e. the shape that gets a
+  #     guard bypassed.
+  #
+  # We GENERATE the body, so the honest question is "is this file exactly what
+  # we would write?" — which needs no maintenance when the body changes again.
+  # It also refuses a file that merely MENTIONS the deployed path: a comment,
+  # an early `exit 0`, or a wrapper around it used to count as coverage.
+  local hk="$1"; shift
+  [ -f "$hk" ] || return 1
+  [ "$(cat "$hk")" = "$(hook_body "$@")" ]
 }
 
 installed=0 skipped=0 restored=0 foreign=0 noscan=0 worktrees=0 notrepo=0
@@ -201,7 +210,9 @@ place_hook() {                            # <repo> <hook path> <hook name> [scan
   local label="$(basename "$repo")/$name"
   shift 3
 
-  if already_ours "$hk" "${1:-}"; then
+  # "$@" and not "${1:-}": an empty placeholder would make hook_body emit a
+  # quoted empty argument and no hook would ever compare equal.
+  if already_ours "$hk" "$@"; then
     skipped=$((skipped+1)); printf '  =  %-44s already points at this checkout\n' "$label"; return
   fi
   if [ -f "$hk" ] && ! ours "$hk"; then
@@ -218,7 +229,13 @@ place_hook() {                            # <repo> <hook path> <hook name> [scan
   # Keep exactly one backup: the state before this script first touched the repo.
   # Overwriting it on a re-run would replace the user's original hook with our
   # own, so --undo would restore this script's output instead of undoing it.
-  if [ -f "$hk" ] && [ ! -e "$b" ]; then cp -p "$hk" "$b"; fi
+  # ... and never back up a hook THIS SCRIPT wrote. A previous generation of
+  # our own shim is not the user's hook, and preserving it means `--undo`
+  # reinstates a version with a known hole — the suite caught exactly that: a
+  # `pre-push` missing `"$@"` was backed up, repaired, and then restored by
+  # undo. The legacy fleet shims (`exec bash ~/.claude/...`) carry no MARK, so
+  # the rollback path that actually matters is untouched.
+  if [ -f "$hk" ] && [ ! -e "$b" ] && ! grep -qF "$MARK" "$hk"; then cp -p "$hk" "$b"; fi
   hook_body "$@" > "$hk"
   chmod +x "$hk"
   installed=$((installed+1)); printf '  +  %-44s installed\n' "$label"
@@ -233,10 +250,26 @@ undo_hook() {                             # <repo> <hook path> <hook name>
   if [ -e "$b" ]; then
     mv "$b" "$hk"; printf '  <  %-44s restored the hook that was here before\n' "$label"
   else
-    # Nothing was here before. Removing it outright would leave the repo with no
-    # secret scan at all, which is strictly worse than the state this script
-    # found; fall back to the untracked scanner if it still exists.
-    if [ -r "$LEGACY_SRC" ]; then
+    # Nothing was here before. For the COMMIT hooks, removing outright would
+    # leave the repo with no secret scan at all — strictly worse than the
+    # state this script found — so fall back to the untracked scanner.
+    #
+    # For `pre-push` that fallback is actively harmful, which is why the hook
+    # NAME is used here rather than ignored. No repo had a pre-push before
+    # this change, so there is never a backup for it, and the legacy path is
+    # now an 8-line forwarder into the deployed scanner WITHOUT `--push`:
+    # git would invoke it as `pre-push origin <url>`, `$1` would be `origin`,
+    # and the scanner would run its INDEX scan during a push. That judges
+    # whatever happens to be STAGED — so the push is not scanned at all, and a
+    # staged fixture token or a stale per-repo user.email would refuse the
+    # push with commit-shaped advice. Meanwhile VERIFY would file the repo
+    # under "still on the untracked copy", which reads as coverage.
+    #
+    # The untracked scanner never had a push mode. There is nothing to revert
+    # to, so remove it and say so.
+    if [ "$name" = pre-push ]; then
+      rm -f "$hk"; printf '  <  %-44s removed (no push scan existed before)\n' "$label"
+    elif [ -r "$LEGACY_SRC" ]; then
       printf '#!/usr/bin/env bash\nexec bash %q\n' "$LEGACY_SRC" > "$hk"; chmod +x "$hk"
       printf '  <  %-44s reverted to the untracked scanner\n' "$label"
     else
