@@ -17,9 +17,24 @@
 _OPT_LINE='^[[:space:]]*[❯>]?[[:space:]]*([0-9]+)\.[[:space:]]+(.+)$'
 
 _prompt_window() {
-  # The prompt is anchored at the bottom. Read a little more than the guard does
-  # so a long option list is not clipped, but stay in the live region.
-  herdr pane read "$1" --source visible --lines 40 2>/dev/null | tail -n 20
+  # The prompt is anchored at the BOTTOM of the viewport, so this stays
+  # bottom-anchored — but it takes that bottom out of the one window every
+  # other scrape uses. It used to ask for `--lines 40` directly, which is the
+  # clipping bug documented at _PANE_WINDOW_LINES below: a small --lines is not
+  # "the last N rows", it is an unreliable slice, and at 40 an option list
+  # rendered inside a taller panel could come back EMPTY while it was plainly
+  # on screen. prompt_options is the necessary condition in wait-for-blocked.sh,
+  # herdr-gates.sh, herdr-select.sh and attention.sh, so an empty parse there
+  # reads as "no prompt" and the worker waits for an answer nobody is asked for.
+  #
+  # The TUI pads with blank and non-breaking-space lines, so a raw `tail` of a
+  # full-height viewport can be all padding. Drop whitespace-only lines FIRST,
+  # then take the bottom slice: same intent as the original `tail -n 20`, now
+  # measured against content instead of furniture.
+  _pane_visible "$1" \
+    | sed $'s/\xc2\xa0/ /g' \
+    | awk '{ s=$0; gsub(/[[:space:]]/,"",s); if (length(s)) print }' \
+    | tail -n 25
 }
 
 prompt_options() {
@@ -48,7 +63,12 @@ prompt_options() {
 # --choices rather than on by default.
 prompt_context() {
   local win
-  win=$(herdr pane read "$1" --source visible --lines 40 2>/dev/null) || return 1
+  # Same window as every other scrape. This is the ALERT BODY — the only text
+  # describing what the agent is asking — and it was reading the clipped
+  # `--lines 40` slice, so the question itself could be missing from the very
+  # message sent to get it answered. The filters below strip furniture and the
+  # closing `tail -n 8` bounds the result, so a taller window costs nothing.
+  win=$(_pane_visible "$1") || return 1
   # The TUI pads with NON-BREAKING spaces, which [[:space:]] does not match —
   # without normalising them first, "blank" lines and a bare composer arrow
   # survive every filter below and end up in the alert.
