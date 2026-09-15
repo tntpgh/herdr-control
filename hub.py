@@ -119,17 +119,67 @@ OPTIONAL = {"search dev (wrangler) · optional"}  # a dev server being down is n
 
 # ── tiny TTL cache: each source is fetched at most once per window ─────────────
 class Cached:
-    def __init__(self, ttl: float, fn):
-        self.ttl, self.fn, self.at, self.val, self.lock = ttl, fn, 0.0, None, threading.Lock()
+    """TTL cache. `stale_ok` decides who pays for a refresh: the reader, or nobody.
+
+    Measured 2026-09-15, cold fill per cache:
+
+        herdr    ttl=5s     3.4ms      forms  ttl=3s     2.5ms
+        search   ttl=120s  341.7ms     kb     ttl=300s  323.9ms
+        links    ttl=60s   365.6ms     loops  ttl=10s   362.9ms
+
+    The four slow ones make network calls, and `/herdr` reads `loops` — TTL
+    10s — so roughly every tenth second a page load paid a ~360ms probe round
+    trip inline. `/` reads all four, so a cold overview cost ~1.4s. That is the
+    650ms outlier behind an otherwise 13ms page.
+
+    `stale_ok=True` serves the stale value immediately and refreshes in a
+    background thread, so a reader never waits on a network probe. Worst-case
+    staleness becomes ttl + one fill — irrelevant for a 60-300s surface probe.
+
+    It is deliberately NOT set on `herdr` or `forms`. Those are the liveness
+    surfaces: doubling their staleness window — hiding a blocked worker for
+    ~10s instead of ~5s — to save 3.4ms is the exact trade this file keeps
+    deciding against. They fill inline, where the cost is noise.
+
+    Nothing refreshes on a timer. A background refresh is only ever kicked BY a
+    read, so an unattended hub makes no network calls at all: `links_data`
+    probes production surfaces, and turning that into an unattended 60s
+    heartbeat would be a behaviour change with external effects nobody asked
+    for.
+    """
+
+    def __init__(self, ttl: float, fn, stale_ok: bool = False):
+        self.ttl, self.fn, self.stale_ok = ttl, fn, stale_ok
+        self.at, self.val, self.lock = 0.0, None, threading.Lock()
+        self.refreshing = False
+
+    def _fill(self):
+        try:
+            return self.fn()
+        except Exception:  # failed readers must not leak credentials through exception text
+            return {"error": "source reader unavailable"}
+
+    def _refresh(self):
+        # fn() runs OUTSIDE the lock on purpose: holding it across the 360ms
+        # probe would block every reader on exactly the wait this removes.
+        val = self._fill()
+        with self.lock:
+            self.val, self.at, self.refreshing = val, time.monotonic(), False
 
     def get(self):
         with self.lock:
-            if time.monotonic() - self.at > self.ttl:
-                try:
-                    self.val = self.fn()
-                except Exception:  # failed readers must not leak credentials through exception text
-                    self.val = {"error": "source reader unavailable"}
-                self.at = time.monotonic()
+            if time.monotonic() - self.at <= self.ttl:
+                return self.val
+            if self.stale_ok and self.val is not None:
+                if not self.refreshing:
+                    self.refreshing = True
+                    threading.Thread(target=self._refresh, daemon=True).start()
+                return self.val              # stale by at most ttl + one fill
+            # Nothing cached yet, or staleness is not acceptable here: the
+            # reader pays, because serving None is not an option and a stale
+            # liveness answer is worse than a slow one.
+            self.val = self._fill()
+            self.at = time.monotonic()
             return self.val
 
 
@@ -1434,12 +1484,15 @@ def serve_loop_decision(key: str) -> str | None:
 
 
 CACHES = {
+    # Liveness: cheap, filled inline, never served stale. See Cached.
     "herdr": Cached(5, herdr_data),
     "forms": Cached(3, forms_data),
-    "search": Cached(120, search_data),
-    "kb": Cached(300, kb_data),
-    "links": Cached(60, links_data),
-    "loops": Cached(10, loops_data),
+    # Network-backed: ~350ms each, so a reader gets the stale value and the
+    # refresh happens behind them.
+    "search": Cached(120, search_data, stale_ok=True),
+    "kb": Cached(300, kb_data, stale_ok=True),
+    "links": Cached(60, links_data, stale_ok=True),
+    "loops": Cached(10, loops_data, stale_ok=True),
 }
 
 

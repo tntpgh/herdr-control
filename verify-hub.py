@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import threading
 import types
 import unittest
@@ -502,6 +503,92 @@ class PublicSurface(ReaderFixture):
         # The JSON path never renders, and an unrelated page still serves.
         self.assertEqual((pages["/kb?json=1"][0], pages["/"][0]), (200, 200))
         self.assertNotIn(CANARY, pages["/kb?json=1"][1] + pages["/"][1])
+
+
+class CacheFreshness(unittest.TestCase):
+    """Who pays for a refresh, and what may be served stale.
+
+    Measured 2026-09-15: the four network-backed caches cost ~350ms to fill and
+    `loops` has a 10s TTL, so roughly every tenth second a `/herdr` load paid a
+    probe round trip inline. `stale_ok` moves that off the reader. The half that
+    matters more is what is NOT marked: the liveness caches must keep filling
+    inline, because a stale answer about a blocked worker is the failure this
+    hub exists to prevent.
+    """
+
+    def test_first_call_fills_inline_even_when_stale_is_allowed(self):
+        # There is no stale value to serve yet, so the reader must wait rather
+        # than be handed None.
+        c = hub.Cached(60, lambda: {"n": 1}, stale_ok=True)
+        self.assertEqual(c.get(), {"n": 1})
+
+    def test_fresh_value_is_reused(self):
+        calls = []
+        c = hub.Cached(60, lambda: calls.append(1) or {"n": len(calls)})
+        c.get(); c.get(); c.get()
+        self.assertEqual(len(calls), 1)
+
+    def test_stale_ok_returns_immediately_and_refreshes_behind_the_reader(self):
+        gate = threading.Event()
+        def slow():
+            gate.wait(5)
+            return {"v": "new"}
+        c = hub.Cached(0, slow, stale_ok=True)
+        c.val, c.at = {"v": "old"}, time.monotonic() - 999      # a stale value exists
+        t0 = time.monotonic()
+        got = c.get()
+        elapsed = time.monotonic() - t0
+        self.assertEqual(got, {"v": "old"}, "a stale_ok cache must not wait for the refresh")
+        self.assertLess(elapsed, 0.5, f"reader waited {elapsed:.2f}s on a background refresh")
+        gate.set()
+        for _ in range(100):                                    # let the thread land
+            if c.get() == {"v": "new"}:
+                break
+            time.sleep(0.02)
+        self.assertEqual(c.get(), {"v": "new"}, "the background refresh never landed")
+
+    def test_only_one_refresh_is_in_flight(self):
+        calls = []
+        gate = threading.Event()
+        def slow():
+            calls.append(1)
+            gate.wait(5)
+            return {"n": len(calls)}
+        c = hub.Cached(0, slow, stale_ok=True)
+        c.val, c.at = {"n": 0}, time.monotonic() - 999
+        for _ in range(10):
+            c.get()
+        gate.set()
+        time.sleep(0.2)
+        self.assertEqual(len(calls), 1, f"10 reads kicked {len(calls)} refreshes")
+
+    def test_liveness_caches_are_never_served_stale(self):
+        # The deliberate non-optimisation: `herdr` and `forms` fill inline, so a
+        # blocked worker cannot be hidden for an extra TTL to save 3.4ms.
+        for name in ("herdr", "forms"):
+            self.assertFalse(hub.CACHES[name].stale_ok,
+                             f"{name} must not serve a stale liveness answer")
+        for name in ("search", "kb", "links", "loops"):
+            self.assertTrue(hub.CACHES[name].stale_ok,
+                            f"{name} makes network calls and must not block a reader")
+
+    def test_a_reader_never_triggers_work_on_an_unattended_hub(self):
+        # No timer, no heartbeat: `links_data` probes production surfaces, so a
+        # cache that refreshed itself unattended would be an external side
+        # effect nobody asked for. Nothing may run without a get().
+        calls = []
+        c = hub.Cached(0, lambda: calls.append(1) or {}, stale_ok=True)
+        c.val, c.at = {}, time.monotonic() - 999
+        time.sleep(0.3)
+        self.assertEqual(calls, [], "the cache refreshed with no reader")
+
+    def test_a_failing_reader_does_not_leak_and_does_not_hang(self):
+        def boom():
+            raise RuntimeError(CANARY)
+        c = hub.Cached(0, boom, stale_ok=True)
+        self.assertEqual(c.get(), {"error": "source reader unavailable"})
+        self.assertNotIn(CANARY, json.dumps(c.get()))
+
 
 
 if __name__ == "__main__":
