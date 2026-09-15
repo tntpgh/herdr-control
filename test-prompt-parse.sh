@@ -105,5 +105,31 @@ FIXTURE="$(printf '│\n%s│   Approve │\n%s│    Deny │\n│\n%s\n' "$HL"
   && ok "two highlighted rows refused" || no "double highlight" "accepted"
 
 echo
+echo "== prompt_any_visible: both shapes from one read, same scope as before =="
+FIXTURE="$(panel 1 2 Approve)"
+prompt_any_visible fake:pane \
+  && ok "menu panel seen" || no "any_visible menu" "missed a complete panel"
+FIXTURE="$(panel 0 80 Approve)"
+prompt_any_visible fake:pane \
+  && ok "headerless menu seen" || no "any_visible headerless" "missed the footer-anchored panel"
+# The numbered shape (Claude/Codex), which carries no navigation footer at all,
+# so it must be found by the option-row path with the menu gate closed.
+FIXTURE=$'some output\n❯ 1. Yes\n  2. No, and tell me why\n'
+prompt_any_visible fake:pane \
+  && ok "numbered prompt seen with no footer" || no "any_visible numbered" "missed numbered options"
+# Scope guard (#59): omp prints queued/steering messages as a numbered list.
+# One that has scrolled out of the bottom 20 rows is NOT a prompt, and reading
+# the whole 200-row menu window would call it one.
+FIXTURE="1. Conductor: land the branch
+2. Conductor: then report
+$(for i in $(seq 25); do echo "transcript row $i"; done)"
+prompt_any_visible fake:pane \
+  && no "any_visible scope" "matched a numbered list above the live region" \
+  || ok "numbered list outside the bottom 20 rows ignored"
+FIXTURE=$'│ just some transcript output │\n│ Approve of this plan? │'
+prompt_any_visible fake:pane \
+  && no "any_visible prose" "accepted prose" || ok "prose refused"
+
+echo
 printf 'pass=%s fail=%s\n' "$pass" "$fail"
 [ "$fail" = 0 ]

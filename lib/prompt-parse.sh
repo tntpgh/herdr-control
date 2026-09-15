@@ -140,6 +140,24 @@ _menu_window() {
   herdr pane read "$1" --source visible --lines 200 --format ansi 2>/dev/null
 }
 
+# A NECESSARY condition for either pass below, decided in the shell with no
+# process at all: both passes end on the navigation footer, so a window
+# carrying neither of its words cannot parse as a menu and spawning python to
+# learn that is pure cost. It is deliberately only a gate — it never decides a
+# menu IS present, so no fixture that used to parse can stop parsing.
+#
+# Why it exists: omp-notify.sh calls this up to 10 times per tool call in every
+# omp pane, and python3.14 startup is ~45ms of CPU each. Measured 2026-09-14
+# while diagnosing machine-wide herdr lag — the poll cost 1.86s of CPU per tool
+# call per worker, against ~8 live workers, for the answer "nothing is asking".
+# Matching two separate words rather than the whole footer phrase keeps the gate
+# robust to a style change painted between them.
+_menu_gate() {                         # <window>
+  case "$1" in *navigate*) ;; *) return 1 ;; esac
+  case "$1" in *select*)   ;; *) return 1 ;; esac
+  return 0
+}
+
 # Parse the complete, known two-choice approval menu from ONE snapshot.
 # Blank rows separate command details too; they are not an option boundary.
 # Unknown/truncated menu shapes fail closed rather than turning detail text
@@ -167,9 +185,17 @@ _menu_window() {
 _prompt_menu() {                       # <pane> visible|options|selected|question
   local win
   win=$(_menu_window "$1") || return 1
-  # One parser process per snapshot, not sed/grep subprocesses per screen
-  # row. The latter made one reviewed approval take seconds of process churn.
-  printf '%s\n' "$win" | python3 -c '
+  _menu_gate "$win" || return 1
+  printf '%s\n' "$win" | _prompt_menu_parse "$2"
+}
+
+# The parser itself: <mode>, window on stdin. Split out from _prompt_menu so a
+# caller that already holds a snapshot (prompt_any_visible below) can parse it
+# without paying a second `herdr pane read`. One parser process per snapshot,
+# not sed/grep subprocesses per screen row — the latter made one reviewed
+# approval take seconds of process churn.
+_prompt_menu_parse() {                 # <mode>; window on stdin
+  python3 -c '
 import re, sys
 ansi = re.compile(r"\x1b\[[0-9;]*m")
 highlight = re.compile(r"\x1b\[48;2;[0-9]+;[0-9]+;[0-9]+m")
@@ -284,13 +310,45 @@ elif mode == "selected":
     print(selected, end="")
 elif mode == "question":
     print(" ; ".join(question), end="")
-' "$2"
+' "$1"
 }
 
 prompt_menu_options()  { _prompt_menu "$1" options; }
 prompt_menu_selected() { _prompt_menu "$1" selected; }
 prompt_menu_question() { _prompt_menu "$1" question; }
 prompt_menu_visible()  { _prompt_menu "$1" visible; }
+
+# "Is EITHER prompt shape on screen?", from ONE pane read.
+#
+# The obvious spelling — `prompt_menu_visible || [ -n "$(prompt_options)" ]` —
+# costs TWO `herdr pane read` processes per call, and omp-notify.sh calls it up
+# to 10 times per tool call in every omp pane. Measured 2026-09-14: 20 CLI
+# spawns and 10 python3 spawns per tool call, ~1.86s of CPU, all of it against
+# the single herdr server socket, which is what made the TUI itself feel laggy
+# with the fleet working. This reads once and answers both shapes from that
+# snapshot.
+#
+# The numbered shape keeps _prompt_window's bottom-anchored 20-row scope: both
+# reads end at the bottom of the visible region, so the last 20 rows of the
+# 200-row menu window ARE the rows prompt_options would have looked at. That
+# scope is load-bearing — omp prints queued/steering messages as a numbered
+# list higher up the pane, and matching those is the false "needs input" that
+# #59 removed. ANSI is stripped first because the menu window carries it and
+# _OPT_LINE anchors at start-of-line.
+prompt_any_visible() {                 # <pane>
+  local win
+  win=$(_menu_window "$1") || return 1
+  if _menu_gate "$win"; then
+    printf '%s\n' "$win" | _prompt_menu_parse visible && return 0
+  fi
+  # tail first, then ONE sed doing both jobs: strip the escapes the menu
+  # window carries (_OPT_LINE anchors at start-of-line) and print the option
+  # numbers. Two seds and a 200-row strip is measurable when this runs on
+  # every tool call in every pane.
+  [ -n "$(printf '%s\n' "$win" | tail -n 20 \
+    | sed -nE -e $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' -e "s/$_OPT_LINE/\1/p")" ] && return 0
+  return 1
+}
 
 # A stable fingerprint for "this exact prompt, right now" — the question plus
 # its options, hashed. Lets a wake event and a later answer agree on WHICH
