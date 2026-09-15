@@ -9,14 +9,36 @@
 # automatically (they share the main repo's hooks dir).
 set -euo pipefail
 
-# `R` (renames) is in the filter deliberately. Without it, `git mv` a file that
-# stays similar enough for rename detection (R096 in the probe) and append a
-# token to it: the change records as one rename, `--diff-filter=ACM` returns an
-# EMPTY list, and this hook scans nothing at all while the token lands in the
-# commit. Proved 2026-09-12 against this file. It is conditional — a small file
-# records as D+A, which ACM does catch — which is exactly why it survived: it
-# does not reproduce on a toy fixture.
-STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null)
+# The filter EXCLUDES deletions and nothing else, on purpose. It used to be an
+# allow-list of status letters, and the letter nobody thought of was the hole,
+# twice:
+#
+#   ACM  -> `git mv` a file that stays similar enough for rename detection and
+#           append a token: the change records as one rename (R096 in the
+#           probe), the list comes back EMPTY, and the hook scans nothing while
+#           the token lands. Proved 2026-09-12. Conditional — a small file
+#           records as D+A, which ACM does catch — which is why it survived.
+#   ACMR -> replace a SYMLINK with a regular file carrying a credential: the
+#           change records as `T` (typechange) and the list comes back EMPTY
+#           again. Proved 2026-09-15 in a throwaway repo with no hooks path:
+#           `git diff --cached --name-status` showed `T link.sh`,
+#           `--diff-filter=ACMR` printed nothing, the scanner exited 0, and the
+#           staged content held a live-shaped 40-char ghp_ token. The same
+#           shape as the rename hole, one letter over.
+#
+# So: `d` (lower-case = EXCLUDE) drops only D, and every present-or-future
+# status letter (A C M R T U X B) is scanned by default. A detection control
+# must fail toward scanning; deletions are the one class that cannot carry
+# staged content — and `git show ":$path"` on a deleted path fails, which would
+# trip the unreadable-file refusal below and block every commit that deletes
+# something. Never mix cases in one filter: `--diff-filter=Ad` is rejected.
+#
+# ONE constant, three call sites. Three literals that must agree is the real
+# defect: this early `exit 0` disagreeing with the scan loop's own filter is
+# exactly how an empty list becomes a silent pass. verify-secret-scan.sh greps
+# for any `--diff-filter=` in this file that is not "$DIFF_FILTER".
+DIFF_FILTER=d
+STAGED=$(git diff --cached --name-only --diff-filter="$DIFF_FILTER" 2>/dev/null)
 [[ -z "$STAGED" ]] && exit 0
 
 # ── commit identity ──────────────────────────────────────────────────────────
@@ -169,7 +191,7 @@ while IFS= read -r -d '' FILE; do
             FOUND=1
         fi
     done
-done < <(git diff --cached -z --name-only --diff-filter=ACMR 2>/dev/null)
+done < <(git diff --cached -z --name-only --diff-filter="$DIFF_FILTER" 2>/dev/null)
 
 # ── client PII ───────────────────────────────────────────────────────────────
 # Credentials were never the bigger body. A 2026-09-03 audit found 1,409
@@ -198,7 +220,7 @@ PII_FOUND=0
 # relaxes the PII checks ONLY: the credential scan above walks every staged
 # file independently of $ADDED, so a token pasted here is still blocked
 # (proven on a real negative, 2026-09-06).
-ADDED="$(git diff --cached -U0 --diff-filter=ACMR \
+ADDED="$(git diff --cached -U0 --diff-filter="$DIFF_FILTER" \
          -- . ':(exclude)src/data/propx-*.json' \
               ':(exclude)src/data/price-band-evidence.json' \
               ':(exclude)src/data/sold-subdivision-context.json' \
