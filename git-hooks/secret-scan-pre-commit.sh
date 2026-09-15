@@ -193,7 +193,19 @@ PATTERNS=(
 # shield by naming a field `pubkey`.
 # A name that says PUBLIC, or that names a hash/fingerprint rather than a
 # credential. Anchored in NAME position — the value is never consulted.
-PUBLIC_NAME='["\x27]?[A-Za-z0-9_-]*(pub|public)[A-Za-z0-9_-]*(key|token)["\x27]?[[:space:]]*[=:]|["\x27]?[A-Za-z0-9_-]*(fingerprint|checksum|digest|sha256|sha512|md5|etag|hash)[A-Za-z0-9_-]*["\x27]?[[:space:]]*[=:]'
+# Deliberately NARROW, in two parts, each anchored in NAME position:
+#
+#   * a name whose "public" sits directly on the key word — pubkey,
+#     public_key, myPublicKey, host_pubkeys. NOT any name that merely contains
+#     "public": `public_api_token` holding a 40-hex value is a credential with
+#     a reassuring name, and an earlier draft of this list exempted it.
+#   * a hash/fingerprint name, with no free-form suffix. `hash_key` is NOT
+#     exempt — an HMAC key in a field named `hash_key` is still an HMAC key.
+#
+# "token" appears in neither branch: a "public token" is a contradiction, and
+# resolving it in favour of the reassuring word is how this class of mistake
+# happens.
+PUBLIC_NAME='["\x27]?[A-Za-z0-9_-]*(pub|public)[_-]?keys?["\x27]?[[:space:]]*[=:]|["\x27]?[A-Za-z0-9_-]*(fingerprint|checksum|digest|sha256|sha512|md5|etag|hash)(_?(hex|value|sum))?["\x27]?[[:space:]]*[=:]'
 
 is_name_hex() {                 # <pattern> -> 0 if it is one of the two
     [ "$1" = "$PAT_NAME_HEX_UPPER" ] || [ "$1" = "$PAT_NAME_HEX_JSON" ]
@@ -207,7 +219,35 @@ all_matches_public() {          # <text> <pattern>
     # matches the allowlist because of the pubkey, so a real secret beside it on
     # the same line was exempted. `-o` emits one `name: value` match per line,
     # which is the same reason the PII email check below uses it.
-    ! printf '%s\n' "$1" | grep -oE -- "$2" | grep -qvEi -- "$PUBLIC_NAME"
+    #
+    # And NEVER judge a pipeline you exit early from. The first draft was
+    # `! printf | grep -oE | grep -qvEi`, which rebuilds the SIGPIPE bypass
+    # this file already paid for once (2026-09-12: a token in a >64KB file read
+    # as clean). `grep -qv` exits the instant it sees a NON-public match, the
+    # producer keeps writing, takes SIGPIPE, exits 141, pipefail adopts 141 —
+    # and `!` inverts that into "every match was published by design". The
+    # direction is inverted from the original incident, which is worse: there a
+    # match became a miss, here "some match is NOT public" becomes "all of them
+    # are". The race did not fire in 40 attempts at 3MB of match output here,
+    # so this is reasoning rather than a reproduction — but the same reasoning
+    # was right the first time and this structure costs nothing.
+    #
+    # It also closes two fail-opens that ARE deterministic, both resolving to
+    # EXEMPT: empty output — the index path re-reads the blob, and a read that
+    # fails yields nothing, so an unreadable file became an exempted one, in
+    # the one path that elsewhere refuses an unreadable file BY NAME — and
+    # `grep -oE` erroring out (exit >1 on an ERE it dislikes), which the main
+    # loops handle explicitly and this helper did not.
+    local out nonpublic st
+    set +e +o pipefail
+    out=$(printf '%s\n' "$1" | grep -oE -- "$2")
+    st=$?
+    set -e -o pipefail
+    # st>0 is "no matches" or "grep failed". Neither is a positive statement
+    # that the matches are public, so neither may exempt.
+    [ "$st" -eq 0 ] && [ -n "$out" ] || return 1
+    nonpublic=$(printf '%s\n' "$out" | grep -vEi -- "$PUBLIC_NAME" || true)
+    [ -z "$nonpublic" ]
 }
 
 # Binary and generated formats only. `lock` was in this list until 2026-09-09,

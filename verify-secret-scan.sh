@@ -721,6 +721,52 @@ pub_case f.json "{\"pubkey\": \"$GHP\"}"         block \
 # public, so it blocks.
 pub_case f.json "{\"pubkey\": \"$PUBHEX\", \"token\": \"$PUBHEX\"}" block \
     "a pubkey next to a real secret still blocks"
+# An earlier draft of PUBLIC_NAME allowed any name CONTAINING "public" and any
+# name STARTING with a hash word. Both were too wide, and both are credentials
+# with a reassuring name — the exact mistake the FUB key made ("public-ish, in
+# repo already", six audits).
+pub_case f.json "{\"public_api_token\": \"$PUBHEX\"}" block \
+    "public_api_token is a credential, not a public value"
+pub_case f.json "{\"hash_key\": \"$PUBHEX\"}" block \
+    "an HMAC key in a field named hash_key is still a key"
+pub_case f.json "{\"digest_key\": \"$PUBHEX\"}" block \
+    "and a hash word does not launder a key suffix"
+pub_case f.json "{\"publictoken\": \"$PUBHEX\"}" block \
+    "a \"public token\" is a contradiction, so it blocks"
+# Names a security reviewer named as real-world credentials, each of which an
+# earlier draft of PUBLIC_NAME exempted because it matched pub/public or a hash
+# word as a SUBSTRING anywhere in the name.
+pub_case f.json "{\"publish_token\": \"$PUBHEX\"}" block \
+    "publish_token (the NPM_PUBLISH_TOKEN shape) is a bearer secret"
+pub_case f.json "{\"pubsub_api_key\": \"$PUBHEX\"}" block \
+    "and a Google Pub/Sub api key is not a public key"
+pub_case f.json "{\"digest_secret\": \"$PUBHEX\"}" block \
+    "a hash word does not launder a secret suffix"
+# The hash word may END the name — that is a hash OF something, not a key.
+pub_case f.json "{\"password_hash\": \"$PUBHEX\"}" allow \
+    "password_hash is a hash of a credential, not one"
+pub_case f.json "{\"content_sha256\": \"$PUBHEX\"}" allow \
+    "and content_sha256 is a content hash"
+
+# The exemption must not be decided by a pipeline it exits early from. Round
+# one of this file's SIGPIPE incident (2026-09-12) was a `grep -q` reader
+# killing a `git show` producer; the first draft of all_matches_public rebuilt
+# it one layer in, where the inverted status reads as "every match is public".
+# A file whose FIRST match is a real secret followed by thousands of public
+# ones is the shape that exercises it: the reader can exit while the producer
+# is still writing.
+R="$(new_repo)"
+{
+    printf '"api_key": "%s",\n' "$PUBHEX"
+    i=0; while [ "$i" -lt 5000 ]; do printf '"pubkey_%s": "%s",\n' "$i" "$PUBHEX"; i=$((i+1)); done
+} > "$R/big.json"
+git -C "$R" add big.json
+blocks "$R" "a real secret among thousands of public values still blocks (no early-exit judgement)"
+# The shapes that MUST stay exempt, beyond the plain `pubkey` above.
+pub_case f.json "{\"myPublicKey\": \"$PUBHEX\"}" allow \
+    "camelCase publicKey is exempt"
+pub_case f.json "{\"host_pubkeys\": \"$PUBHEX\"}" allow \
+    "and a plural pubkeys field"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
