@@ -1,5 +1,5 @@
 {
   "name": "Verify Suite",
   "type": "command",
-  "command": "cd \"$HERDR_CONTROL_WORKDIR\" && for v in verify-*.sh; do echo \"== $v ==\"; bash \"$v\" || { echo \"FAILED: $v\"; exit 1; }; done"
+  "command": "cd \"$HERDR_CONTROL_WORKDIR\" && for v in verify-*.sh test-*.sh; do echo \"== $v ==\"; bash \"$v\" || { echo \"FAILED: $v\"; exit 1; }; done; for v in verify-*.py; do echo \"== $v ==\"; python3 \"$v\" || { echo \"FAILED: $v\"; exit 1; }; done"
 }

@@ -1,0 +1,266 @@
+{
+  "_comment": [
+    "The single truth table for derived task status. ONE implementation reads",
+    "this file: hub.py's derived_state(). verify-hub-status.py asserts it.",
+    "",
+    "There were two until 2026-09-15 — lib/live-status.sh (shell) and hub.py —",
+    "and they had already drifted in two ways no row could see, which is why",
+    "the shell half was deleted rather than fixed.",
+    "",
+    "Each case: stored (registry state), pane (herdr's agent_status, or null",
+    "for an unknown pane, or __down__ / __noshape__ for an unanswerable herdr),",
+    "birth (match / mismatch / unknown for the pane fingerprint), done_event",
+    "(false | true | stale | fresh | trailing | no_newline | undatable |",
+    "undatable_no_ask), want (the state to SHOW), why (the defect it pins)."
+  ],
+  "cases": [
+    {
+      "name": "stored blocked + pane idle + done event",
+      "stored": "blocked",
+      "pane": "idle",
+      "done_event": true,
+      "want": "completed",
+      "why": "OBSERVED 2026-09-12: registry said blocked, pane was idle, work was finished. #59 clears blocked only when a prompt is ANSWERED, so a worker that goes quiet leaves the row forever."
+    },
+    {
+      "name": "stored running + pane idle + done event",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": true,
+      "want": "completed",
+      "why": "OBSERVED 2026-09-12: registry said running for hours after the PR merged."
+    },
+    {
+      "name": "pane idle + no done event",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": false,
+      "want": "stalled",
+      "why": "OBSERVED 2026-09-12: #313's worker took a five-item review brief and went idle without touching the branch. Indistinguishable from working in every surface we had."
+    },
+    {
+      "name": "pane done + no done event",
+      "stored": "running",
+      "pane": "done",
+      "done_event": false,
+      "want": "stalled",
+      "why": "herdr's own 'done' means the agent stopped, not that the work landed."
+    },
+    {
+      "name": "pane working + stored blocked",
+      "stored": "blocked",
+      "pane": "working",
+      "done_event": false,
+      "want": "running",
+      "why": "live truth wins in both directions, not just the pessimistic one."
+    },
+    {
+      "name": "pane working + no done event",
+      "stored": "running",
+      "pane": "working",
+      "done_event": false,
+      "want": "running",
+      "why": "absence of a completion event is only meaningful once the worker has stopped."
+    },
+    {
+      "name": "pane blocked + stored running",
+      "stored": "running",
+      "pane": "blocked",
+      "done_event": false,
+      "want": "blocked",
+      "why": "a prompt on screen is a person's problem even when the registry missed it."
+    },
+    {
+      "name": "stored completed survives a live pane",
+      "stored": "completed",
+      "pane": "working",
+      "done_event": false,
+      "want": "completed",
+      "why": "acceptance is a fact herdr cannot know; a reused pane must not resurrect a closed task."
+    },
+    {
+      "name": "stored failed survives a live pane",
+      "stored": "failed",
+      "pane": "working",
+      "done_event": false,
+      "want": "failed"
+    },
+    {
+      "name": "stored cancelled survives a live pane",
+      "stored": "cancelled",
+      "pane": "working",
+      "done_event": false,
+      "want": "cancelled"
+    },
+    {
+      "name": "stored lost survives a live pane",
+      "stored": "lost",
+      "pane": "working",
+      "done_event": false,
+      "want": "lost"
+    },
+    {
+      "name": "unknown pane",
+      "stored": "running",
+      "pane": null,
+      "done_event": false,
+      "want": "gone",
+      "why": "herdr has no such pane: reconcile owns the verdict. Distinct from idle on purpose."
+    },
+    {
+      "name": "herdr down + stored running",
+      "stored": "running",
+      "pane": "__down__",
+      "done_event": false,
+      "want": "running",
+      "why": "a dead herdr must not silently mark the whole fleet stalled and page a human about it."
+    },
+    {
+      "name": "herdr down + stored blocked",
+      "stored": "blocked",
+      "pane": "__down__",
+      "done_event": false,
+      "want": "blocked"
+    },
+    {
+      "name": "done event OLDER than the last brief",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "stale",
+      "want": "stalled",
+      "why": "THE MASKING CASE. A worker that finished round one, was handed a review brief, and went quiet still carries round one's completion evidence. Judging evidence without comparing it to the last thing the worker was ASKED reports that worker completed — which is how PR #313's five dropped findings stayed invisible. Evidence older than the brief is evidence about a previous round."
+    },
+    {
+      "name": "done event NEWER than the last brief",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "fresh",
+      "want": "completed",
+      "why": "the same worker after it actually does the round: evidence postdates the ask."
+    },
+    {
+      "name": "unrecognised agent_status falls back to the stored state",
+      "stored": "running",
+      "pane": "reviewing",
+      "done_event": false,
+      "want": "running",
+      "why": "CORRECTED 2026-09-15. The earlier row wanted the raw status passed through, on the grounds that inventing one is how the copies started. True, and passing it through is worse: the result is a state in NO vocabulary — not TERMINAL, not ATTENTION, not a highlighted class — so the task disappears from /, /herdr and /api/summary instead of merely being mislabelled. A blocked worker whose hooks went quiet became invisible, which is the failure this whole change exists to end. herdr having no opinion is the same information as herdr being unreachable, so it gets the same answer: the stored copy, rendered with its `was ...` stale marker so nobody mistakes it for live."
+    },
+    {
+      "name": "a pane list with no panes array is herdr not answering",
+      "stored": "running",
+      "pane": "__noshape__",
+      "done_event": false,
+      "want": "running",
+      "why": "REVIEW FINDING: a partially-initialised or version-skewed server returns {\"result\":{}} with exit 0. The shell read that as 'this pane is absent' and derived `gone` for EVERY task — handing reconcile a fleet-wide verdict off a shape nothing verified. Unparseable is unreachable: fall back to stored."
+    },
+    {
+      "name": "a later non-_done line after the done event",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "trailing",
+      "want": "stalled",
+      "why": "REVIEW P1: the anchor dated evidence by the bus FILE's mtime, so any later append — a progress note, a _start, anything not _done — made round one's stale completion look newer than a brief delivered after it. A worker that finished round one, took a review brief, wrote one line and went quiet read `completed`: PR #313's five dropped findings, reintroduced by the fix for them. Evidence is now dated by the EVENT; when it cannot be placed and an ask is on record, refuse to assume it answered THIS round."
+    },
+    {
+      "name": "unhashable pane_id",
+      "stored": "running",
+      "pane": "__unhashable__",
+      "done_event": false,
+      "want": "gone",
+      "why": "REVIEW P1: pane_id is TEXT in the schema but the row can hold anything, and a list raised TypeError straight out of panes.get() — which Cached turned into an error dict, marking every task `gone` while herdr_reachable still reported True. Round one's 'the reader is now total' covered _pane_statuses, not the lookup."
+    },
+    {
+      "name": "pane recycled since registration",
+      "stored": "running",
+      "pane": "working",
+      "done_event": false,
+      "want": "gone",
+      "birth": "mismatch",
+      "why": "REVIEW P1: pane ids are RECYCLED (docs/control-plane-design.md, lib/push-wake.sh:20) and derived_state keyed liveness on the id alone, never fetching pane_birth — so a finished task could read `running` off a stranger that inherited the slot, or a live one read `stalled`. Every other guard here already compares the birth fingerprint before acting; the derivation must too."
+    },
+    {
+      "name": "pane birth matches",
+      "stored": "running",
+      "pane": "working",
+      "done_event": false,
+      "want": "running",
+      "birth": "match",
+      "why": "the ordinary case: same slot, same process, status means what it says."
+    },
+    {
+      "name": "herdr says `unknown` + stored running",
+      "stored": "running",
+      "pane": "unknown",
+      "done_event": false,
+      "want": "running",
+      "why": "MEASURED: `herdr pane list` reported agent_status `unknown` for 12 of 14 live panes on this machine, and smart-name.sh:149 documents it as the normal result when an agent's turn-detection is quiet. It is herdr's most common answer, not an edge case, and it is not a task state."
+    },
+    {
+      "name": "herdr says `unknown` + stored blocked stays VISIBLE",
+      "stored": "blocked",
+      "pane": "unknown",
+      "done_event": false,
+      "want": "blocked",
+      "why": "The consequence that makes the row above load-bearing: with pass-through, a worker the registry knows is blocked vanished from every attention surface the moment herdr stopped having an opinion about its pane. Falling back keeps the person visible."
+    },
+    {
+      "name": "a freshly spawned worker is not an abandoned brief",
+      "stored": "starting",
+      "pane": "idle",
+      "done_event": false,
+      "want": "starting",
+      "why": "`starting` is a real registry state (lib/run-registry.sh:390) and a just-spawned pane is idle with no completion evidence — identical in shape to an abandoned brief. Deriving `stalled` put every new worker straight into Needs-attention, since `stalled` is an attention state."
+    },
+    {
+      "name": "empty stored state + idle + no evidence",
+      "stored": "",
+      "pane": "idle",
+      "done_event": false,
+      "want": "starting",
+      "why": "The registry's initial state is the empty string before the first transition; same reasoning as `starting`, and the table had no row for either, so both implementations agreed by accident."
+    },
+    {
+      "name": "a bus whose last line has no trailing newline",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "no_newline",
+      "want": "completed",
+      "why": "The two implementations disagreed here and no row could see it: python's `for ln in fh` reads a final unterminated line, the shell's `while read` dropped it, so the same worker read `completed` on one surface and `stalled` on the other. The shell half is gone now; the row stays because a reader rewritten in any language must handle it."
+    },
+    {
+      "name": "a _done whose timestamp cannot be parsed, with an ask on record",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "undatable",
+      "want": "stalled",
+      "why": "The `trailing` row claimed to cover the undatable branch but its fixture carries no timestamp at all, so both implementations took the earlier `no evidence` path and the row passed for the wrong reason. This one carries a timestamp that fails ISO parsing, which is the only input that actually reaches `undatable`."
+    },
+    {
+      "name": "a _done whose timestamp cannot be parsed, with NO ask on record",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "undatable_no_ask",
+      "want": "completed",
+      "why": "The other half of the undatable decision, also untested: with nothing on record to compare against, refusing would call every un-timestamped completion an abandonment."
+    },
+    {
+      "name": "a live record whose identity is UNKNOWN (empty birth)",
+      "stored": "blocked",
+      "pane": "working",
+      "birth": "unknown",
+      "done_event": false,
+      "want": "blocked",
+      "why": "REVIEW MEDIUM. lib/herdr_live.py synthesises a record with `birth: \"\"` for a status change on a pane it has no snapshot for yet — its own comment says empty means UNKNOWN, never mismatch, and a consumer may only refuse on a definite disagreement. The guard read `reg and birth and reg != birth`, so an unidentified record switched it OFF entirely and the task took the status of whatever holds the id now: a recycled pane reporting `working` for a task that is dead. Unknown identity is the same information as herdr having no opinion, so it gets the same answer — the stored copy — while a DEFINITE mismatch still means `gone`."
+    },
+    {
+      "name": "a live record with unknown identity does not resurrect a stalled worker",
+      "stored": "running",
+      "pane": "working",
+      "birth": "unknown",
+      "done_event": false,
+      "want": "running",
+      "why": "The other direction of the same rule: falling back must not invent either. With the stored state `running` the answer is `running` — not the stranger's `working` promoted to live truth, and not `gone`, which would bury a task whose pane is merely unidentified for one event."
+    }
+  ]
+}

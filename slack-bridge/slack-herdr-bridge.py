@@ -186,11 +186,24 @@ def authorized(user, team, logger, what):
     return True
 
 
-def deliver(target, text):
-    """Call herdr-deliver.sh; return (ok, message)."""
+def deliver(target, text, reply=False):
+    """Call herdr-deliver.sh; return (ok, message).
+
+    `reply=True` records the delivery as an ANSWER rather than a brief. The
+    difference is load-bearing: hub.py anchors "did this worker do what I last
+    asked?" to the last `brief_delivered`, so recording an answer as a brief
+    moves the anchor past the worker's own completion evidence and parks a
+    finished task in Needs-attention permanently — a finished worker never
+    writes another `_done`.
+
+    Per ROUTE, not blanket: a threaded reply under an alert and the
+    `--blocked` route are answers by construction, but an explicit
+    `w8:p2 <text>` message is a human issuing a fresh instruction, which IS a
+    brief and must keep moving the anchor.
+    """
     try:
         r = subprocess.run(
-            ["bash", DELIVER, target, text],
+            ["bash", DELIVER] + (["--reply"] if reply else []) + [target, text],
             capture_output=True, text=True, timeout=45,
         )
     except subprocess.TimeoutExpired:
@@ -235,6 +248,10 @@ def on_message(event, say, logger, body):
     #   2) explicit "w8:p2 <text>" prefix
     #   3) the single blocked agent
     target, thread_prompt_id = pane_for_thread(thread_ts)
+    # Route 1 resolved it from the alert's own thread, so whatever arrives here
+    # is an ANSWER to the question that alert carried. Routes 2 and 3 decide
+    # below (an explicit prefix is a fresh instruction; --blocked is an answer).
+    is_reply = target is not None
     text = raw
 
     # A bare number in a thread under an alert is a CHOICE, not a message. It
@@ -281,7 +298,7 @@ def on_message(event, say, logger, body):
         say(text=":warning: empty message, nothing sent", thread_ts=thread_ts or reply_ts)
         return
 
-    ok, info = deliver(target, text)
+    ok, info = deliver(target, text, reply=is_reply or target == "--blocked")
     icon = ":white_check_mark:" if ok else ":warning:"
     say(text=f"{icon} {info}", thread_ts=thread_ts or reply_ts)
 

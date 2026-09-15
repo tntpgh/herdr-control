@@ -210,7 +210,15 @@ def deliver(target: str, url: str, answers: dict) -> None:
     text = f"Form answers from {url}:\n{body}"
     cmd = None
     if leaf.exists():
-        cmd = ["bash", str(leaf), target, text]
+        # `--reply`, not a brief. Form answers are BY CONSTRUCTION an answer to
+        # something the agent asked, and hub.py anchors "did it do what I last
+        # asked?" to the last `brief_delivered`: recording this as a brief moves
+        # the anchor past the worker's own completion evidence, so answering a
+        # form parked the task in Needs-attention as `stalled` forever (a
+        # finished worker never writes another `_done`). hub.py's notify_owner
+        # is the twin of this call and does the same thing; send-to-agent.sh
+        # records no event at all, so it takes no flag.
+        cmd = ["bash", str(leaf), "--reply", target, text]
     elif script.exists():
         cmd = ["bash", str(script), target, text]
     if not cmd:

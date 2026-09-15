@@ -13,7 +13,7 @@
         {
           "split": "down",
           "ratio": 0.3,
-          "cmd": "for v in verify-*.sh; do echo \"== $v ==\"; bash \"$v\" || { echo \"FAILED: $v\"; break; }; done; exec $SHELL"
+          "cmd": "for v in verify-*.sh test-*.sh; do echo \"== $v ==\"; bash \"$v\" || { echo \"FAILED: $v\"; break; }; done; for v in verify-*.py; do echo \"== $v ==\"; python3 \"$v\" || { echo \"FAILED: $v\"; break; }; done; exec $SHELL"
         }
       ]
     }

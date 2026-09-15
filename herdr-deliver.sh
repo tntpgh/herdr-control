@@ -32,6 +32,24 @@ here=$(cd "$(dirname "$0")" && pwd)
 force=""
 if [ "${1:-}" = "--force" ]; then force="--force"; shift; fi
 
+# Is this delivery a NEW ASK, or an answer to something the worker asked us?
+#
+# It decides which event gets recorded, and hub.py's `asked_at` anchor reads
+# ONLY `brief_delivered`. Recording every delivery as a brief made any message
+# invalidate the worker's completion evidence: reply "thanks" (or let
+# hub.py's own notify_owner forward a formserve answer) to a worker that has
+# already finished, and its `_done` becomes older than the ask, so it derives
+# `stalled` — an attention state — and parks in Needs-attention forever,
+# because a finished worker never writes another `_done`.
+#
+# `--reply` is explicit, and `--blocked` implies it: a pane that is sitting on
+# a prompt is by definition being answered, not briefed. Everything else is
+# treated as an ask, which keeps the failure direction safe — a brief
+# mislabelled as a reply would let an abandoned round read `completed`, and
+# that is the bug the anchor exists to catch.
+delivery_kind=brief
+if [ "${1:-}" = "--reply" ]; then delivery_kind=reply; shift; fi
+
 target="${1:?usage: herdr-deliver.sh [--force] <pane|tab|label|--blocked> <text...>}"; shift
 text="$*"
 [ -n "$text" ] || { echo "herdr-deliver: empty message" >&2; exit 2; }
@@ -81,5 +99,28 @@ require_pane_birth_match "$pane" || exit 7
 
 bash "$here/send-to-agent.sh" "$pane" ${force:+"$force"} "$text"
 rc=$?
+
+# Record that this worker WAS ASKED something, at this time.
+#
+# Without it, "did the worker do what I last asked?" is unanswerable, and a
+# `_done` event from an EARLIER round masks an abandoned later one: on
+# 2026-09-12 a worker took a five-item review brief, went idle without touching
+# the branch, and still carried round one's completion evidence — so every
+# surface reported it finished. Completion evidence only means anything when it
+# is newer than the last thing the worker was handed.
+if [ "$rc" -eq 0 ]; then
+  [ "$target" = "--blocked" ] && delivery_kind=reply
+  _t="$(task_for_pane "$pane" 2>/dev/null || printf '')"
+  if [ -n "$_t" ]; then
+    _ev=brief_delivered
+    [ "$delivery_kind" = reply ] && _ev=reply_delivered
+    append_event "$(printf '%s' "$_t" | jq -r '.run_id // empty')" \
+                 "$(printf '%s' "$_t" | jq -r '.task_id // empty')" \
+                 "$_ev" \
+                 "$(jq -nc --arg p "$pane" --arg k "$delivery_kind" --argjson n "${#text}" \
+                      '{pane:$p, kind:$k, chars:$n}')" >/dev/null 2>&1 || true
+  fi
+fi
+
 [ "$rc" -eq 0 ] && echo "delivered to $pane" || echo "herdr-deliver: send to $pane returned $rc (may be stranded)" >&2
 exit "$rc"
