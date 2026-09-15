@@ -159,6 +159,50 @@ results["actionable"] = {
     "done_flap": hubmod.edge_is_actionable("working", "done"),
 }
 
+# 13. A CLOSED pane must not wedge the subscription. One per-pane
+# `pane.agent_status_changed` subscription for a pane herdr has closed makes
+# the server reject the WHOLE events.subscribe with `pane_not_found`; the
+# first cut then backed off and rebuilt the same list from the same stale
+# state, so one closed pane (w8:p2F, live on 2026-09-15) stopped the
+# subscription permanently — connected:false, frozen panes, every consumer
+# quietly back on stale data. Recovery is to re-snapshot (pruning the pane)
+# and retry at once. `request` is stubbed here: no socket, no live herdr.
+snapshots = []
+
+
+def fake_snapshot(method, params=None, timeout=5.0):
+    snapshots.append(method)
+    return {"snapshot": {"workspaces": [{"workspace_id": "w1", "label": "repo"}],
+                         "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
+                                    "agent": "omp", "agent_status": "working", "revision": 10,
+                                    "cwd": "/repo"}]}}
+
+
+herdr_live.request = fake_snapshot
+live = fresh()
+live._panes["w1:pDEAD"] = dict(live._panes["w1:p1"], pane_id="w1:pDEAD")
+had_dead = "w1:pDEAD" in [p["pane_id"] for p in live.panes()]
+recoverable = live._subscribe_rejected(
+    {"error": {"code": "pane_not_found", "message": "pane w1:pDEAD not found"}})
+results["closed_pane"] = {
+    "seeded": had_dead,
+    "recoverable": recoverable,
+    "resnapshotted": snapshots == ["session.snapshot"],
+    "pruned": "w1:pDEAD" not in [p["pane_id"] for p in live.panes()],
+    "counted": live.data()["stats"]["subscribe_pruned"] == 1,
+}
+# Any OTHER rejection is not silently retried — it raises and backs off.
+results["other_rejection"] = live._subscribe_rejected({"error": {"code": "internal", "message": "boom"}})
+# And a fleet churning panes faster than we can resubscribe degrades to
+# lifecycle-only rather than losing the stream.
+live._subscribe_failures = herdr_live.STATUS_SUBS_GIVE_UP_AFTER
+subs, covered = live._subscriptions()
+results["degraded_subs"] = (
+    [s for s in subs if s["type"] == "pane.agent_status_changed"] == [],
+    len(covered) == 0,
+    any(s["type"] == "pane.updated" for s in subs),
+)
+
 print(json.dumps(results))
 PY
 ) || { echo "  FAIL python harness did not run: $out"; exit 1; }
@@ -195,6 +239,14 @@ get() { printf '%s' "$out" | jq -c ".$1"; }
   || no "actionable" "$(get actionable)"
 [ "$(get 'actionable | [.working_idle_flap, .idle_working_flap, .done_flap]')" = '[false,false,false]' ] \
   && ok "a working<->idle flap never spawns anything" || no "flap filter" "$(get actionable)"
+[ "$(get 'closed_pane | [.seeded, .recoverable, .resnapshotted, .pruned, .counted]')" = '[true,true,true,true,true]' ] \
+  && ok "a closed pane is pruned and the subscription retried, not wedged" \
+  || no "closed pane" "$(get closed_pane)"
+[ "$(get other_rejection)" = 'false' ] \
+  && ok "any other rejection still raises and backs off" || no "other rejection" "$(get other_rejection)"
+[ "$(get degraded_subs)" = '[true,true,true]' ] \
+  && ok "repeated rejections degrade to lifecycle-only rather than losing the stream" \
+  || no "degraded subs" "$(get degraded_subs)"
 
 echo
 echo "== edge dispatcher (agent-edge.sh, stubbed) =="
