@@ -4,6 +4,17 @@
 #
 #   peer-answer.sh [--interval S] [--max-rounds N] [--cwd-prefix DIR] [--agent LABEL] [pane_id ...]
 #
+# Two ways to run it:
+#
+#   * SWEEP (the original): `--interval S` rounds until the budget is spent.
+#     Use it when you deliberately want a supervised answerer for a lane.
+#   * EDGE (preferred): `--max-rounds 1 <pane>`, fired by agent-edge.sh the
+#     moment the hub's herdr subscription reports that pane `blocked`. No
+#     10-second sweep and no `pane list` per round — one round, one pane, at
+#     the moment there is something to answer. It is OPT-IN
+#     (`HERDR_EDGE_PEER_ANSWER=1`): auto-answering is standing authority, and
+#     a performance change must not grant it as a side effect.
+#
 # Why it exists: an omp session started outside spawn-task.sh (a weawr lab
 # worker, a hand-started pane) gets no push-wake (agent-hooks/omp-notify.sh),
 # so under `--approval-mode write` it blocks on EVERY exec — `pwd`, `git

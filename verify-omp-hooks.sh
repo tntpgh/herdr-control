@@ -646,20 +646,30 @@ const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
 console.log("EVENTS:" + Object.keys(handlers).sort().join(","));
-const tc = handlers["tool_call"]({ toolName: "bash", input: { command: "rm -rf /tmp/x" } });
-console.log("TOOLCALL_RETURN:" + (tc === undefined ? "undefined" : JSON.stringify(tc)));
+// The notification path is the APPROVAL event now, not tool_call. tool_call
+// fired before every tool call whether or not anything was ever asked, and
+// the script had to screen-scrape its own pane to find out — 20 `herdr pane
+// read` RPCs per tool call per worker. omp emits tool_approval_requested /
+// tool_approval_resolved (docs/extensions.md) and its own herdr integration
+// already reports blocked/idle off exactly that pair.
+const ar = handlers["tool_approval_requested"]({ toolName: "bash", input: { command: "git push --force" }, reason: "destructive" });
+console.log("APPROVAL_RETURN:" + (ar === undefined ? "undefined" : JSON.stringify(ar)));
 const bas = handlers["before_agent_start"]({});
 console.log("INJECTED:" + (bas && bas.message ? bas.message.content : "none"));
+handlers["tool_execution_start"]({ toolName: "read", args: { path: "/x" } });   // must stay silent
 handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
+handlers["tool_approval_resolved"]({ approved: true });
 handlers["agent_end"]({});
 await new Promise(r => setTimeout(r, 600));
 ' 2>&1)"
-  printf '%s' "$shim_out" | grep -q 'EVENTS:agent_end,before_agent_start,tool_call,tool_result' \
-    && ok "all four events registered" || bad "events: $shim_out"
-  # The single most important property: a throwing tool_call handler BLOCKS the
-  # agent's tool call in omp, so this must return undefined on every path.
-  printf '%s' "$shim_out" | grep -q 'TOOLCALL_RETURN:undefined' \
-    && ok "tool_call returns undefined (never blocks the agent)" || bad "tool_call returned non-undefined"
+  printf '%s' "$shim_out" \
+    | grep -q 'EVENTS:agent_end,before_agent_start,tool_approval_requested,tool_approval_resolved,tool_execution_end,tool_execution_start,tool_result' \
+    && ok "every event is registered, and tool_call is NOT one of them" || bad "events: $shim_out"
+  # Every handler must return undefined on every path. tool_call used to be the
+  # fail-closed one (a throw blocked the agent's tool); these are observability
+  # events, but the contract is kept so the wiring can move again safely.
+  printf '%s' "$shim_out" | grep -q 'APPROVAL_RETURN:undefined' \
+    && ok "the approval handler returns undefined (never blocks the agent)" || bad "approval handler returned non-undefined"
   # #37 moved the reconciliation report to the hub page and left AT MOST a
   # one-line hub summary in the prompt; 0fbece0's report-injection contract is
   # gone. What must hold now is that nothing else leaks into context — a raw
@@ -669,6 +679,8 @@ await new Promise(r => setTimeout(r, 600));
     || bad "reconcile output leaked into context: $shim_out"
   grep -q '"tool":"bash"' "$REC.notify" \
     && ok "omp-notify.sh received the documented stdin JSON" || bad "notify stdin wrong: $(cat "$REC.notify" 2>/dev/null)"
+  grep -q 'git push --force' "$REC.notify" \
+    && ok "the alert carries the command a human has to judge" || bad "notify message lost the command: $(cat "$REC.notify" 2>/dev/null)"
   grep -q 'RECONCILE mode=session'  "$REC" && ok "session reconcile invoked"  || bad "no session reconcile"
   grep -q 'RECONCILE mode=interval' "$REC" && ok "interval reconcile invoked" || bad "no interval reconcile"
   grep -q 'RESOLVE' "$REC" && ok "alert retraction invoked" || bad "no retraction"
