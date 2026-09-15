@@ -134,6 +134,15 @@ sanitize() {
   # Strip ANSI/OSC, fold the home path, redact common secret shapes, drop blank
   # lines, then hard-cap. Context is untrusted screen scrape — this is what
   # leaves the machine, so it is bounded and scrubbed before the model sees it.
+  #
+  # The cap is `tail -c`, not `head -c`. It is the LAST stage, so taking the
+  # FIRST 4500 bytes discards the BOTTOM of the window — the newest content,
+  # i.e. the task being named. Measured on four live panes: the cap bit on
+  # three of them, dropping 14-16 lines, and on the busiest the last line the
+  # model saw was a mid-table box rule while the actual last line on screen
+  # was the composer. Anchoring the line slice (tail -n, in gather_evidence)
+  # AND the byte cap at the bottom is what makes this bottom-anchored end to
+  # end; fixing only the first one moved the truncation, it did not remove it.
   perl -pe 's/\e\][^\a]*(?:\a|\e\\)//g; s/\e\[[0-9;?]*[ -\/]*[@-~]//g' \
     | sed "s|$HOME|~|g" \
     | sed -E 's/(sk|rk|pk)-[A-Za-z0-9_-]{16,}/[redacted-key]/g;
@@ -142,7 +151,7 @@ sanitize() {
               s/[Bb]earer[[:space:]]+[A-Za-z0-9._-]{16,}/Bearer [redacted]/g;
               s/(([Aa]pi[_-]?[Kk]ey|[Tt]oken|[Pp]assword|[Ss]ecret)[[:space:]]*[=:][[:space:]]*)[^[:space:]]+/\1[redacted]/g' \
     | grep -vE '^[[:space:]]*$' \
-    | head -c "$SMART_NAME_EVIDENCE_CHARS"
+    | tail -c "$SMART_NAME_EVIDENCE_CHARS"
 }
 
 gather_evidence() {

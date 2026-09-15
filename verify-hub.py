@@ -533,8 +533,8 @@ class CacheFreshness(unittest.TestCase):
         def slow():
             gate.wait(5)
             return {"v": "new"}
-        c = hub.Cached(0, slow, stale_ok=True)
-        c.val, c.at = {"v": "old"}, time.monotonic() - 999      # a stale value exists
+        c = hub.Cached(1, slow, stale_ok=True)                  # ttl=0 would mean "never stale"
+        c.val, c.at = {"v": "old"}, time.monotonic() - 2       # expired, inside the ceiling
         t0 = time.monotonic()
         got = c.get()
         elapsed = time.monotonic() - t0
@@ -554,17 +554,32 @@ class CacheFreshness(unittest.TestCase):
             calls.append(1)
             gate.wait(5)
             return {"n": len(calls)}
-        c = hub.Cached(0, slow, stale_ok=True)
-        c.val, c.at = {"n": 0}, time.monotonic() - 999
+        c = hub.Cached(1, slow, stale_ok=True)
+        c.val, c.at = {"n": 0}, time.monotonic() - 2
         for _ in range(10):
             c.get()
         gate.set()
         time.sleep(0.2)
         self.assertEqual(len(calls), 1, f"10 reads kicked {len(calls)} refreshes")
 
+    def test_a_non_stale_cache_refills_inline_rather_than_serving_its_old_value(self):
+        # BEHAVIOUR, not a boolean. The registry assertion below pins which
+        # caches are marked; review proved that on its own it pins nothing —
+        # mutating the guard in get() to `if self.val is not None:` serves every
+        # liveness cache stale and left all seven of these tests green.
+        # ttl=1 with a 2s-old value: expired, but well inside the staleness
+        # ceiling — so the ONLY thing that can force a refill here is
+        # stale_ok being false. With ttl=0 the ceiling is 0 and the inline path
+        # is taken for the wrong reason, which let review's mutation survive.
+        c = hub.Cached(1, lambda: {"v": "fresh"})            # stale_ok defaults False
+        c.val, c.at = {"v": "stale"}, time.monotonic() - 2
+        self.assertEqual(c.get(), {"v": "fresh"},
+                         "a liveness cache served a stale value instead of filling inline")
+
     def test_liveness_caches_are_never_served_stale(self):
-        # The deliberate non-optimisation: `herdr` and `forms` fill inline, so a
-        # blocked worker cannot be hidden for an extra TTL to save 3.4ms.
+        # The deliberate non-optimisation: `/herdr` renders entirely from the
+        # `herdr` cache, and the registry half of `/api/summary` is the only
+        # source for a task whose pane died while it was blocked.
         for name in ("herdr", "forms"):
             self.assertFalse(hub.CACHES[name].stale_ok,
                              f"{name} must not serve a stale liveness answer")
@@ -572,20 +587,94 @@ class CacheFreshness(unittest.TestCase):
             self.assertTrue(hub.CACHES[name].stale_ok,
                             f"{name} makes network calls and must not block a reader")
 
-    def test_a_reader_never_triggers_work_on_an_unattended_hub(self):
+    def test_one_read_kicks_exactly_one_fill_and_then_silence(self):
         # No timer, no heartbeat: `links_data` probes production surfaces, so a
-        # cache that refreshed itself unattended would be an external side
-        # effect nobody asked for. Nothing may run without a get().
+        # cache that kept refreshing after the reader left would be an
+        # unattended external side effect nobody asked for.
+        #
+        # This READS first. The earlier version only seeded the cache and slept,
+        # so it could fail only if a timer were armed in __init__ — review
+        # mutated get() to arm a self-re-arming Timer and the test stayed green
+        # while the mutant fired 19 unattended probes in a second.
         calls = []
-        c = hub.Cached(0, lambda: calls.append(1) or {}, stale_ok=True)
-        c.val, c.at = {}, time.monotonic() - 999
-        time.sleep(0.3)
-        self.assertEqual(calls, [], "the cache refreshed with no reader")
+        c = hub.Cached(0.05, lambda: calls.append(1) or {"n": len(calls)}, stale_ok=True)
+        c.val, c.at = {"n": 0}, time.monotonic() - 999
+        c.get()                                     # one reader, then nobody
+        time.sleep(0.6)                             # many TTLs pass unattended
+        self.assertEqual(len(calls), 1,
+                         f"one read kicked {len(calls)} fills with no further reader")
+
+    def test_invalidate_forces_an_inline_refill_even_where_stale_is_allowed(self):
+        # `serve_loop_decision` invalidates `loops` after writing a decision, so
+        # the next view shows "deciding". Under stale_ok an expired TIMESTAMP
+        # takes the stale branch instead, so the first view after deciding
+        # re-offered the `Decide` button — and a second POST spawns a second
+        # 4-hour formserve for one suggestion. invalidate() drops the VALUE,
+        # which is the only thing the stale branch requires.
+        c = hub.Cached(60, lambda: {"v": "after"}, stale_ok=True)
+        c.val, c.at = {"v": "before"}, time.monotonic()
+        c.invalidate()
+        # The VALUE must be gone, not just its timestamp. Asserting only the
+        # next get() hid the original bug: `at = 0.0` makes the age enormous
+        # (monotonic is uptime), so the staleness ceiling refills inline anyway
+        # — everywhere except a freshly booted machine, where the ceiling has
+        # not yet been exceeded and the stale branch fires.
+        self.assertIsNone(c.val, "invalidate() left the pre-invalidation value in place")
+        self.assertEqual(c.get(), {"v": "after"},
+                         "an invalidated cache served its pre-invalidation value")
+
+    def test_a_refresh_in_flight_cannot_land_on_top_of_an_invalidation(self):
+        # The lost update: a reader kicks a refresh, the decision handler
+        # invalidates 50ms later, then the refresh lands and re-stamps the
+        # PRE-decision value as fresh for a whole TTL.
+        gate = threading.Event()
+        state = {"v": "before"}
+        def slow():
+            gate.wait(5)
+            return dict(state)
+        c = hub.Cached(1, slow, stale_ok=True)
+        c.val, c.at = {"v": "before"}, time.monotonic() - 2
+        c.get()                                     # kicks the background refresh
+        state["v"] = "after"                        # the world moves on
+        c.invalidate()
+        gate.set()
+        time.sleep(0.2)                             # let the in-flight refresh land
+        self.assertIsNone(c.val, "a refresh that started before invalidate() overwrote it")
+        self.assertEqual(c.get(), {"v": "after"}, "the refill did not see the new world")
+
+    def test_a_thread_that_cannot_start_does_not_freeze_the_cache(self):
+        # `refreshing` latched True if Thread.start() raised — reachable on a
+        # ThreadingHTTPServer parking long-polls — and the cache then served the
+        # same stale value forever with no refresh EVER kicked again.
+        c = hub.Cached(1, lambda: {"v": "new"}, stale_ok=True)
+        c.val, c.at = {"v": "old"}, time.monotonic() - 2
+        boom = Mock(side_effect=RuntimeError("can't start new thread"))
+        with patch.object(hub.threading, "Thread", boom):
+            self.assertEqual(c.get(), {"v": "old"}, "a failed thread start must not raise at the reader")
+        self.assertFalse(c.refreshing, "refreshing latched True with no thread to clear it")
+        for _ in range(100):
+            if c.get() == {"v": "new"}:
+                break
+            time.sleep(0.02)
+        self.assertEqual(c.get(), {"v": "new"}, "the cache never refreshed again")
+
+    def test_a_value_older_than_the_ceiling_is_refilled_inline(self):
+        # `at` only advances when a fill completes and refreshes are only kicked
+        # by readers, so a sparsely-read hub would serve an arbitrarily old
+        # value: the first `/links` load of the morning would render last
+        # night's production-surface verdicts as today's.
+        c = hub.Cached(10, lambda: {"v": "today"}, stale_ok=True)
+        c.val, c.at = {"v": "last night"}, time.monotonic() - 10 * hub.STALE_CEILING - 1
+        self.assertEqual(c.get(), {"v": "today"},
+                         "a value past the staleness ceiling was still served")
+        # Just inside the ceiling it is still served stale, which is the point.
+        c.val, c.at = {"v": "recent"}, time.monotonic() - 11
+        self.assertEqual(c.get(), {"v": "recent"})
 
     def test_a_failing_reader_does_not_leak_and_does_not_hang(self):
         def boom():
             raise RuntimeError(CANARY)
-        c = hub.Cached(0, boom, stale_ok=True)
+        c = hub.Cached(1, boom, stale_ok=True)
         self.assertEqual(c.get(), {"error": "source reader unavailable"})
         self.assertNotIn(CANARY, json.dumps(c.get()))
 

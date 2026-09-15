@@ -117,6 +117,12 @@ SURFACES = [
 OPTIONAL = {"search dev (wrangler) · optional"}  # a dev server being down is normal, never "hot"
 
 
+# How many TTLs a `stale_ok` cache may pass off a stale value before a reader
+# has to wait for a real one. 4 keeps every interactive case fast (loops 10s ->
+# 40s, links 60s -> 4min) while making the first load after a quiet night fill
+# inline instead of rendering yesterday's answer as today's.
+STALE_CEILING = 4
+
 # ── tiny TTL cache: each source is fetched at most once per window ─────────────
 class Cached:
     """TTL cache. `stale_ok` decides who pays for a refresh: the reader, or nobody.
@@ -133,13 +139,28 @@ class Cached:
     650ms outlier behind an otherwise 13ms page.
 
     `stale_ok=True` serves the stale value immediately and refreshes in a
-    background thread, so a reader never waits on a network probe. Worst-case
-    staleness becomes ttl + one fill — irrelevant for a 60-300s surface probe.
+    background thread, so a reader never waits on a network probe.
 
-    It is deliberately NOT set on `herdr` or `forms`. Those are the liveness
-    surfaces: doubling their staleness window — hiding a blocked worker for
-    ~10s instead of ~5s — to save 3.4ms is the exact trade this file keeps
-    deciding against. They fill inline, where the cost is noise.
+    The staleness bound is "ttl + one fill, WHILE READS KEEP ARRIVING", and
+    neither half of that is what an earlier draft of this docstring claimed.
+    `at` advances only when a fill completes, and a refresh is only ever kicked
+    by a read, so on a sparsely-read hub the served value is as old as the last
+    read — a `Cached(1, …)` last filled 10h ago will hand a reader that 10h-old
+    value. And "one fill" is not ~350ms at the tail: `search_data` walks up to
+    50 pages at `timeout=20` each, `kb_data` shells out with `timeout=40`,
+    `loops_data` opens by reading `kb` so it inherits that 40s, and
+    `links_data` probes 10 surfaces at `timeout=5` over 8 workers. Hence
+    STALE_CEILING: past `ttl * STALE_CEILING` the reader pays once and gets a
+    real answer, so the first load of the morning is not last night's verdicts.
+
+    It is deliberately NOT set on `herdr` or `forms`, and the honest reason is
+    narrower than "it would hide a blocked worker" — `/api/blocked` and
+    `/api/blocked/wait` take the blocked SET from the subscription and use
+    `CACHES["herdr"]` only to join a label onto panes already known to be
+    blocked, so staleness there costs a stale label. Where it genuinely matters
+    is `/herdr`, which renders entirely from this cache, and the registry half
+    of `/api/summary`, which is the ONLY source for a task whose pane died
+    while it was blocked. Those fill inline, where the cost is 3.4ms of noise.
 
     Nothing refreshes on a timer. A background refresh is only ever kicked BY a
     read, so an unattended hub makes no network calls at all: `links_data`
@@ -152,6 +173,9 @@ class Cached:
         self.ttl, self.fn, self.stale_ok = ttl, fn, stale_ok
         self.at, self.val, self.lock = 0.0, None, threading.Lock()
         self.refreshing = False
+        # Bumped by invalidate(), so a refresh that started before it lands
+        # knows its snapshot is no longer wanted.
+        self.gen = 0
 
     def _fill(self):
         try:
@@ -159,25 +183,72 @@ class Cached:
         except Exception:  # failed readers must not leak credentials through exception text
             return {"error": "source reader unavailable"}
 
-    def _refresh(self):
+    def invalidate(self):
+        """Drop the value, not just its timestamp — the next read MUST refill.
+
+        Two callers poke this cache when they have just changed the thing it
+        describes (serve_form_decision, serve_loop_decision). They used to do it
+        by setting `at = 0.0`, which worked only because every expiry filled
+        inline. Under `stale_ok` an expired `at` takes the STALE branch instead,
+        so the operator's first view after deciding showed the pre-decision
+        value and `/loops` re-offered the `Decide` button for a suggestion
+        already being decided — a second POST then spawns a second 4-hour
+        formserve for one suggestion. Clearing `val` forces the inline path,
+        because `stale_ok` only ever applies when there IS something to serve.
+
+        `gen` also moves, so a refresh already in flight cannot land its
+        pre-invalidation snapshot on top of this.
+        """
+        with self.lock:
+            self.val, self.at, self.gen = None, 0.0, self.gen + 1
+
+    def _refresh(self, gen: int):
+        # `gen` is passed IN, captured by get() under the lock at kick time.
+        # Reading it here instead was a race the suite caught: thread start is
+        # asynchronous, so this body can first run AFTER an invalidate() has
+        # already bumped the counter — it would then read the NEW generation,
+        # believe its pre-invalidation snapshot was still wanted, and write it.
+        #
         # fn() runs OUTSIDE the lock on purpose: holding it across the 360ms
         # probe would block every reader on exactly the wait this removes.
-        val = self._fill()
+        try:
+            val = self._fill()
+        finally:
+            # BaseException too: without this the flag latches True and the
+            # cache freezes on a stale value with no further refresh EVER.
+            with self.lock:
+                self.refreshing = False
         with self.lock:
-            self.val, self.at, self.refreshing = val, time.monotonic(), False
+            if gen != self.gen:
+                return          # invalidated mid-flight: this snapshot is stale
+            self.val, self.at = val, time.monotonic()
 
     def get(self):
         with self.lock:
-            if time.monotonic() - self.at <= self.ttl:
+            age = time.monotonic() - self.at
+            if age <= self.ttl:
                 return self.val
-            if self.stale_ok and self.val is not None:
+            # Serve stale only while a reader is plausibly watching. `at` only
+            # advances when a fill COMPLETES and a refresh is only ever kicked
+            # by a read, so without this ceiling the first load of the morning
+            # renders last night's production-surface verdicts — where the old
+            # inline code cost ~365ms and rendered the truth. Past the ceiling
+            # the reader pays once and gets a real answer.
+            if self.stale_ok and self.val is not None and age <= self.ttl * STALE_CEILING:
                 if not self.refreshing:
                     self.refreshing = True
-                    threading.Thread(target=self._refresh, daemon=True).start()
-                return self.val              # stale by at most ttl + one fill
-            # Nothing cached yet, or staleness is not acceptable here: the
-            # reader pays, because serving None is not an option and a stale
-            # liveness answer is worse than a slow one.
+                    try:
+                        threading.Thread(target=self._refresh, args=(self.gen,),
+                                         daemon=True).start()
+                    except RuntimeError:
+                        # "can't start new thread" — reachable on a
+                        # ThreadingHTTPServer parking up to WAIT_MAX_CONCURRENT
+                        # long-polls. No thread exists to clear the flag.
+                        self.refreshing = False
+                return self.val
+            # Nothing cached yet, too old to pass off as current, or staleness
+            # is not acceptable here: the reader pays, because serving None is
+            # not an option and a stale liveness answer is worse than a slow one.
             self.val = self._fill()
             self.at = time.monotonic()
             return self.val
@@ -825,7 +896,7 @@ def record_answer(form_id: str, payload: dict) -> tuple[int, bytes]:
         return 500, f"decision record is corrupt: {e}".encode()
     except OSError as e:
         return 500, f"could not record: {e}".encode()
-    CACHES["forms"].at = 0.0
+    CACHES["forms"].invalidate()
     notify_owner(row)
     return 200, b'{"ok":true}'
 
@@ -1478,8 +1549,12 @@ def serve_loop_decision(key: str) -> str | None:
     subprocess.Popen([sys.executable, str(HERDR_CONTROL / "formserve.py"), str(form),
                       "--timeout", "14400", "--no-open"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    CACHES["loops"].at = 0.0  # re-read on next view so the row shows "deciding"
-    CACHES["forms"].at = 0.0
+    # invalidate(), not `at = 0.0`: under stale_ok an expired timestamp takes
+    # the STALE branch, so the first view after deciding re-offered `Decide`
+    # for a suggestion already being decided — and a refresh already in flight
+    # would re-stamp that pre-decision value fresh for a whole TTL.
+    CACHES["loops"].invalidate()   # re-read on next view so the row shows "deciding"
+    CACHES["forms"].invalidate()
     return title
 
 
