@@ -75,6 +75,17 @@ put_hook "$R_OWN" pre-commit '#!/usr/bin/env bash' 'npm run lint || exit 1' \
 R_NONE="$(mk_repo no-scan)"
 put_hook "$R_NONE" pre-commit '#!/usr/bin/env bash' 'echo lint-only'
 
+# A repo that REDIRECTS its hooks with core.hooksPath. git then ignores
+# `.git/hooks` entirely, so a hook written there is installed, executable,
+# counted as coverage — and never runs. Same failure shape as a shim pointing
+# into a deleted worktree, one config key over.
+R_REDIR="$(mk_repo hooks-redirected)"
+mkdir -p "$R_REDIR/.githooks"
+git -C "$R_REDIR" config core.hooksPath "$R_REDIR/.githooks"
+printf '#!/usr/bin/env bash\nexec bash ~/.claude/hooks/secret-scan-pre-commit.sh\n' \
+    > "$R_REDIR/.githooks/pre-commit"
+chmod +x "$R_REDIR/.githooks/pre-commit"
+
 # Not a git repository, and a linked worktree of shim-expanded.
 mkdir -p "$ROOT/just-a-dir"
 git -C "$R_EXPANDED" -c user.email=tnt@teamthurber.com -c user.name=t commit -q \
@@ -82,6 +93,11 @@ git -C "$R_EXPANDED" -c user.email=tnt@teamthurber.com -c user.name=t commit -q 
 git -C "$R_EXPANDED" worktree add -q "$ROOT/a-worktree" -b wt >/dev/null 2>&1
 
 # ═════════════════════════════════════════════════════════════════════════════
+# The marker every generation of the shim carries. A stale-shim fixture without
+# it is not a stale shim, it is somebody else's file, and the suite would then
+# be testing the wrong rule.
+MARKER="# installed by herdr-control install-git-hooks.sh"
+
 printf '== DRY RUN changes nothing on disk ==\n'
 before="$(cat "$R_EXPANDED/.git/hooks/pre-commit")"
 run --dry-run
@@ -106,6 +122,80 @@ done
     && ok "a MISSING pre-merge-commit is created (the merge path was unscanned)" \
     || bad "pre-merge-commit not installed where absent"
 [ -x "$R_TILDE/.git/hooks/pre-commit" ] && ok "written hooks are executable" || bad "hook not executable"
+# The THIRD hook. `pre-commit`/`pre-merge-commit` only fire when `git commit`
+# creates the commit, so `git am`, `cherry-pick`, `revert` and every `rebase`
+# replay wrote commits no scan ever read. `pre-push` is where that class is
+# caught, and it MUST carry `--push`: the same shim without the flag runs the
+# INDEX scan during a push, where the index is unrelated to what is being sent
+# — it would exit 0 on a clean index and read as a guard that is working.
+if [ -x "$R_HOME/.git/hooks/pre-push" ] && grep -qF "$DEPLOYED" "$R_HOME/.git/hooks/pre-push"; then
+    ok "pre-push is installed (git am / cherry-pick / rebase are commit-hook-free)"
+else
+    bad "pre-push not installed: $(cat "$R_HOME/.git/hooks/pre-push" 2>/dev/null)"
+fi
+grep -qF -- "--push" "$R_HOME/.git/hooks/pre-push" 2>/dev/null \
+    && ok "and it execs the scanner in PUSH mode, not index mode" \
+    || bad "pre-push shim is missing --push: $(cat "$R_HOME/.git/hooks/pre-push" 2>/dev/null)"
+# A shim pointing at the right scanner WITHOUT the flag must be treated as
+# needing a rewrite, not as already correct — otherwise a half-installed guard
+# survives every future --apply.
+printf '#!/usr/bin/env bash\n%s\nexec bash %s\n' "$MARKER" "$DEPLOYED" > "$R_HOME/.git/hooks/pre-push"
+chmod +x "$R_HOME/.git/hooks/pre-push"
+run --apply
+grep -qF -- "--push" "$R_HOME/.git/hooks/pre-push" \
+    && ok "a pre-push shim missing --push is repaired on the next --apply" \
+    || bad "left a pre-push shim running the index scan"
+# ... and one missing `"$@"`, which an earlier state of this very branch wrote.
+# git passes `pre-push <remote-name> <remote-url>`; without the forward the
+# scanner has no remote, so every NEW-branch push is refused with "give this
+# remote a name" — advice that does not apply to an ordinary origin, leaving
+# no compliant fix. A substring check cannot see this, which is why
+# already_ours compares the file against the body we would write.
+printf '#!/usr/bin/env bash\n%s\nexec bash %s --push\n' "$MARKER" "$DEPLOYED" > "$R_HOME/.git/hooks/pre-push"
+chmod +x "$R_HOME/.git/hooks/pre-push"
+run --apply
+grep -qF -- '"$@"' "$R_HOME/.git/hooks/pre-push" \
+    && ok "a pre-push shim that does not forward git's argv is repaired" \
+    || bad "left a shim with no remote name: $(cat "$R_HOME/.git/hooks/pre-push")"
+# And a file that merely MENTIONS the deployed path must not count as ours.
+# The safe outcome is NOT to overwrite it — a hook this script did not write
+# is never clobbered — but it must be reported as foreign and must NOT be
+# counted as coverage, which is what the old substring check did.
+printf '#!/usr/bin/env bash\nexit 0   # exec bash %s --push "$@"\n' "$DEPLOYED" \
+    > "$R_HOME/.git/hooks/pre-push"
+chmod +x "$R_HOME/.git/hooks/pre-push"
+run --apply
+grep -q '^exit 0' "$R_HOME/.git/hooks/pre-push" \
+    && ok "a hook that only mentions the scanner is left alone, not clobbered" \
+    || bad "overwrote a hook this script did not write"
+printf '%s' "$OUT" | grep -q 'shim-home/pre-push .*has its OWN hook' \
+    && ok "and is reported as foreign rather than silently accepted" \
+    || bad "an unrecognised pre-push was not reported: $(printf '%s' "$OUT" | grep pre-push)"
+# VERIFY prints counts, not a per-repo verdict for the healthy cases, so the
+# observable is the bucket: a repo whose pre-push we do not recognise must
+# land OUTSIDE "on the TRACKED scanner". Other fixtures are fully tracked, so
+# this asserts the not-tracked bucket is non-empty rather than a global zero.
+printf '%s' "$OUT" | grep -qE 'untracked ~/\.claude copy: *[1-9]' \
+    && ok "and the repo is NOT counted as covered" \
+    || bad "counted a repo with an unrecognised pre-push as fully tracked: $(printf '%s' "$OUT" | grep -E 'TRACKED|untracked')"
+# Restore a correct shim for the rest of the suite.
+run --apply >/dev/null 2>&1 || true
+rm -f "$R_HOME/.git/hooks/pre-push"
+run --apply
+# core.hooksPath: the hooks must land where GIT looks, not where we assume.
+if [ -x "$R_REDIR/.githooks/pre-commit" ] && grep -qF "$DEPLOYED" "$R_REDIR/.githooks/pre-commit"; then
+    ok "a core.hooksPath repo is guarded in the dir git actually reads"
+else
+    bad "wrote to .git/hooks in a repo that redirects hooksPath: $(cat "$R_REDIR/.githooks/pre-commit" 2>/dev/null)"
+fi
+[ -x "$R_REDIR/.githooks/pre-push" ] && grep -qF -- "--push" "$R_REDIR/.githooks/pre-push" \
+    && ok "and its push path too" || bad "core.hooksPath repo has no working pre-push"
+[ ! -e "$R_REDIR/.git/hooks/pre-commit" ] \
+    && ok "and NOTHING was written to the dir git ignores" \
+    || bad "installed a hook git will never run (.git/hooks with hooksPath set)"
+printf '%s' "$OUT" | grep -q 'core.hooksPath ->' \
+    && ok "the redirect is reported, not silently followed" \
+    || bad "followed a hooksPath redirect without saying so"
 
 printf '== what it must NOT touch ==\n'
 grep -q 'npm run lint' "$R_OWN/.git/hooks/pre-commit" \
@@ -133,9 +223,19 @@ snapshot="$(cat "$R_EXPANDED/.git/hooks/pre-commit")"
 run --apply
 [ "$(cat "$R_EXPANDED/.git/hooks/pre-commit")" = "$snapshot" ] \
     && ok "a second --apply changes nothing" || bad "re-run rewrote an already-correct hook"
-printf '%s' "$OUT" | grep -q 'changed=0 unchanged=7' \
-    && ok "re-run reports 0 changed, 7 already correct" \
-    || bad "re-run counts wrong: $(printf '%s' "$OUT" | grep 'this run')"
+# `changed=0` is the idempotence claim. The companion count is COMPUTED from
+# what is on disk rather than hardcoded: it was pinned at `unchanged=7`, so
+# adding the third hook per repo (pre-push, the one that closes `git am` and
+# the sequencer paths) failed this suite on an incidental constant instead of
+# on any behaviour. Each opted-in repo contributes one row per hook it carries.
+# Any hooks dir, not just `.git/hooks`: one fixture redirects core.hooksPath,
+# and the count has to follow the installer's own resolution.
+on_disk=$(find "$ROOT" -type f \
+          \( -name pre-commit -o -name pre-merge-commit -o -name pre-push \) \
+          -exec grep -lF "$DEPLOYED" {} + 2>/dev/null | wc -l | tr -d ' ')
+printf '%s' "$OUT" | grep -q "changed=0 unchanged=$on_disk" \
+    && ok "re-run reports 0 changed and $on_disk already correct" \
+    || bad "re-run counts wrong (expected unchanged=$on_disk): $(printf '%s' "$OUT" | grep 'this run')"
 # The backup must still be the ORIGINAL hook, not this script's own output —
 # otherwise --undo restores an install instead of undoing one.
 grep -qF 'secret-scan-pre-commit.sh' "$R_TILDE/.git/hooks/pre-commit$(printf '.pre-herdr-guard')" \
@@ -158,6 +258,18 @@ if [ -e "$R_HOME/.git/hooks/pre-merge-commit" ]; then
         || ok "a hook we created falls back to the untracked scanner rather than vanishing"
 else
     ok "a hook we created is removed when there is no scanner to fall back to"
+fi
+# pre-push is the one hook whose "fall back to the untracked scanner" is
+# HARMFUL. No repo had a pre-push before this change, so there is never a
+# backup, and the legacy path is a forwarder into the deployed scanner with no
+# `--push`: git would call it `pre-push origin <url>`, `$1` would be `origin`,
+# and the scanner would run its INDEX scan during a push — judging whatever is
+# STAGED, so the push goes unscanned while an executable "secret-scan" hook
+# sits there and VERIFY files the repo as covered.
+if [ -e "$R_HOME/.git/hooks/pre-push" ]; then
+    bad "undo left a pre-push behind: $(cat "$R_HOME/.git/hooks/pre-push")"
+else
+    ok "undo REMOVES a pre-push rather than reverting it to an index scan"
 fi
 grep -q 'npm run lint' "$R_OWN/.git/hooks/pre-commit" \
     && ok "undo still does not touch a bespoke hook" || bad "undo damaged a foreign hook"

@@ -129,8 +129,20 @@ deploy_scanner() {
   mv -f "$tmp" "$HOOK_DEPLOY" || return 1
 }
 
-hook_body() {
-  printf '#!/usr/bin/env bash\n%s\nexec bash %q\n' "$MARK" "$HOOK_DEPLOY"
+# The shim is one exec, so the scanner is never copied into a repo. Extra argv
+# (pre-push passes `--push`) is appended verbatim, THEN git's own hook
+# arguments via "$@". `exec` keeps stdin, where pre-push's ref list arrives.
+#
+# Forwarding "$@" is load-bearing for pre-push: git calls it as
+# `pre-push <remote-name> <remote-url>`, and the scanner needs the remote to
+# answer "which commits does THIS remote not have yet?". Without it the
+# scanner fell back to "what no remote has", and a commit fetched from a fork
+# could be pushed to origin unscanned (reproduced 2026-09-15).
+hook_body() {                             # [extra scanner args...]
+  printf '#!/usr/bin/env bash\n%s\nexec bash %q' "$MARK" "$HOOK_DEPLOY"
+  local a
+  for a in "$@"; do printf ' %q' "$a"; done
+  printf ' "$@"\n'
 }
 
 [ "$MODE" = dry ] && echo "DRY RUN — nothing will be changed. Re-run with --apply."
@@ -166,21 +178,41 @@ ours() {                                  # <hook path>
   return 0
 }
 
-already_ours() {                          # <hook path> — already correct
-  # Compare against the DEPLOYED path, which is what a correct shim execs. This
-  # tested $HOOK_SRC (the in-tree source) and so reported every hook as needing
-  # a rewrite on a second --apply — idempotence the suite checks by asserting
-  # `changed=0 unchanged=7`.
-  [ -f "$1" ] && grep -qF "$HOOK_DEPLOY" "$1"
+already_ours() {                          # <hook path> [scanner args...]
+  # BYTE COMPARISON against the body we would write, not a set of substring
+  # greps. Three times in one day the grep form has called a broken shim
+  # correct, because each fix added an element the check did not know to look
+  # for:
+  #
+  #   * it grepped $HOOK_SRC (the in-tree path) while a correct shim execs
+  #     $HOOK_DEPLOY, so every hook was reported as needing a rewrite;
+  #   * it could not see a `pre-push` shim missing `--push` (index scan on a
+  #     push: exits 0 on a clean index and reads as a working guard);
+  #   * it could not see one missing `"$@"` — which leaves the scanner with no
+  #     remote name, so every NEW-branch push is refused with "give this
+  #     remote a name", advice that does not apply to an ordinary origin.
+  #     That is a refusal with no compliant fix, i.e. the shape that gets a
+  #     guard bypassed.
+  #
+  # We GENERATE the body, so the honest question is "is this file exactly what
+  # we would write?" — which needs no maintenance when the body changes again.
+  # It also refuses a file that merely MENTIONS the deployed path: a comment,
+  # an early `exit 0`, or a wrapper around it used to count as coverage.
+  local hk="$1"; shift
+  [ -f "$hk" ] || return 1
+  [ "$(cat "$hk")" = "$(hook_body "$@")" ]
 }
 
 installed=0 skipped=0 restored=0 foreign=0 noscan=0 worktrees=0 notrepo=0
 
-place_hook() {                            # <repo> <hook path> <hook name>
+place_hook() {                            # <repo> <hook path> <hook name> [scanner args...]
   local repo="$1" hk="$2" name="$3" b="$2$BACKUP_SUFFIX"
   local label="$(basename "$repo")/$name"
+  shift 3
 
-  if already_ours "$hk"; then
+  # "$@" and not "${1:-}": an empty placeholder would make hook_body emit a
+  # quoted empty argument and no hook would ever compare equal.
+  if already_ours "$hk" "$@"; then
     skipped=$((skipped+1)); printf '  =  %-44s already points at this checkout\n' "$label"; return
   fi
   if [ -f "$hk" ] && ! ours "$hk"; then
@@ -197,8 +229,14 @@ place_hook() {                            # <repo> <hook path> <hook name>
   # Keep exactly one backup: the state before this script first touched the repo.
   # Overwriting it on a re-run would replace the user's original hook with our
   # own, so --undo would restore this script's output instead of undoing it.
-  if [ -f "$hk" ] && [ ! -e "$b" ]; then cp -p "$hk" "$b"; fi
-  hook_body > "$hk"
+  # ... and never back up a hook THIS SCRIPT wrote. A previous generation of
+  # our own shim is not the user's hook, and preserving it means `--undo`
+  # reinstates a version with a known hole — the suite caught exactly that: a
+  # `pre-push` missing `"$@"` was backed up, repaired, and then restored by
+  # undo. The legacy fleet shims (`exec bash ~/.claude/...`) carry no MARK, so
+  # the rollback path that actually matters is untouched.
+  if [ -f "$hk" ] && [ ! -e "$b" ] && ! grep -qF "$MARK" "$hk"; then cp -p "$hk" "$b"; fi
+  hook_body "$@" > "$hk"
   chmod +x "$hk"
   installed=$((installed+1)); printf '  +  %-44s installed\n' "$label"
 }
@@ -212,10 +250,26 @@ undo_hook() {                             # <repo> <hook path> <hook name>
   if [ -e "$b" ]; then
     mv "$b" "$hk"; printf '  <  %-44s restored the hook that was here before\n' "$label"
   else
-    # Nothing was here before. Removing it outright would leave the repo with no
-    # secret scan at all, which is strictly worse than the state this script
-    # found; fall back to the untracked scanner if it still exists.
-    if [ -r "$LEGACY_SRC" ]; then
+    # Nothing was here before. For the COMMIT hooks, removing outright would
+    # leave the repo with no secret scan at all — strictly worse than the
+    # state this script found — so fall back to the untracked scanner.
+    #
+    # For `pre-push` that fallback is actively harmful, which is why the hook
+    # NAME is used here rather than ignored. No repo had a pre-push before
+    # this change, so there is never a backup for it, and the legacy path is
+    # now an 8-line forwarder into the deployed scanner WITHOUT `--push`:
+    # git would invoke it as `pre-push origin <url>`, `$1` would be `origin`,
+    # and the scanner would run its INDEX scan during a push. That judges
+    # whatever happens to be STAGED — so the push is not scanned at all, and a
+    # staged fixture token or a stale per-repo user.email would refuse the
+    # push with commit-shaped advice. Meanwhile VERIFY would file the repo
+    # under "still on the untracked copy", which reads as coverage.
+    #
+    # The untracked scanner never had a push mode. There is nothing to revert
+    # to, so remove it and say so.
+    if [ "$name" = pre-push ]; then
+      rm -f "$hk"; printf '  <  %-44s removed (no push scan existed before)\n' "$label"
+    elif [ -r "$LEGACY_SRC" ]; then
       printf '#!/usr/bin/env bash\nexec bash %q\n' "$LEGACY_SRC" > "$hk"; chmod +x "$hk"
       printf '  <  %-44s reverted to the untracked scanner\n' "$label"
     else
@@ -235,8 +289,29 @@ for d in "$ROOT"/*/; do
     printf '  .  %-44s worktree — covered by its parent repo\n' "$(basename "$repo")"
     continue
   fi
-  pc="$repo/.git/hooks/pre-commit"
-  pmc="$repo/.git/hooks/pre-merge-commit"
+  # The hooks dir GIT WILL USE, not the one we assume. `core.hooksPath`
+  # redirects it repo-wide, and a hook written to `.git/hooks` in a repo that
+  # sets it is a file git never runs — installed, executable, reported as
+  # coverage, and dead. Exactly the failure shape as this morning's shims
+  # pointing into a deleted worktree, one config key over. `rev-parse
+  # --git-path hooks` is the only answer that accounts for it (measured: it
+  # resolves tg-portal's to tourguide's, which is what git does).
+  hooks_dir="$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null)"
+  [ -n "$hooks_dir" ] || hooks_dir="$repo/.git/hooks"
+  case "$hooks_dir" in /*) ;; *) hooks_dir="$repo/$hooks_dir" ;; esac
+  if [ "$hooks_dir" != "$repo/.git/hooks" ]; then
+    # Visible, because it means another directory owns this repo's guard.
+    printf '  i  %-44s core.hooksPath -> %s\n' "$(basename "$repo")" "$hooks_dir"
+  fi
+  pc="$hooks_dir/pre-commit"
+  pmc="$hooks_dir/pre-merge-commit"
+  # THREE hooks, because `pre-commit` and `pre-merge-commit` are only run when
+  # `git commit` creates the commit. `git am`, `cherry-pick`, `revert` and
+  # every `rebase` replay write commits without running either, so those paths
+  # were unscanned — and there is no GitHub push protection behind them
+  # (private repos, paid feature). `pre-push` closes the class: however a
+  # commit was made, it has to be pushed to leave the machine.
+  pp="$hooks_dir/pre-push"
 
   # Only repos ALREADY running the scan on ordinary commits. A repo without it
   # has made a different choice and opting it in is not this script's call.
@@ -247,8 +322,10 @@ for d in "$ROOT"/*/; do
   fi
 
   case "$MODE" in
-    undo) undo_hook "$repo" "$pc" pre-commit; undo_hook "$repo" "$pmc" pre-merge-commit ;;
-    *)    place_hook "$repo" "$pc" pre-commit; place_hook "$repo" "$pmc" pre-merge-commit ;;
+    undo) undo_hook "$repo" "$pc" pre-commit; undo_hook "$repo" "$pmc" pre-merge-commit
+          undo_hook "$repo" "$pp" pre-push ;;
+    *)    place_hook "$repo" "$pc" pre-commit; place_hook "$repo" "$pmc" pre-merge-commit
+          place_hook "$repo" "$pp" pre-push --push ;;
   esac
 done
 
@@ -258,21 +335,27 @@ tracked=0 legacy=0 unguarded=0
 for d in "$ROOT"/*/; do
   repo="${d%/}"
   [ -d "$repo/.git" ] || continue
-  pc="$repo/.git/hooks/pre-commit"; pmc="$repo/.git/hooks/pre-merge-commit"
+  # Same resolution as the install loop: verifying `.git/hooks` in a repo that
+  # redirects `core.hooksPath` would report a guard that git never runs.
+  hooks_dir="$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null)"
+  [ -n "$hooks_dir" ] || hooks_dir="$repo/.git/hooks"
+  case "$hooks_dir" in /*) ;; *) hooks_dir="$repo/$hooks_dir" ;; esac
+  pc="$hooks_dir/pre-commit"; pmc="$hooks_dir/pre-merge-commit"
+  pp="$hooks_dir/pre-push"
   grep -q "secret-scan" "$pc" 2>/dev/null || grep -q "secret-scan" "$pmc" 2>/dev/null || continue
-  both=1
-  for h in "$pc" "$pmc"; do [ -x "$h" ] || both=0; done
-  if [ "$both" = 0 ]; then
-    unguarded=$((unguarded+1)); echo "  INCOMPLETE: $(basename "$repo") — one of the two hooks is missing"
-  elif already_ours "$pc" && already_ours "$pmc"; then
+  all=1
+  for h in "$pc" "$pmc" "$pp"; do [ -x "$h" ] || all=0; done
+  if [ "$all" = 0 ]; then
+    unguarded=$((unguarded+1)); echo "  INCOMPLETE: $(basename "$repo") — one of the three hooks is missing"
+  elif already_ours "$pc" && already_ours "$pmc" && already_ours "$pp" --push; then
     tracked=$((tracked+1))
   else
     legacy=$((legacy+1))
   fi
 done
-echo "  repos on the TRACKED scanner (both hooks):   $tracked"
+echo "  repos on the TRACKED scanner (all 3 hooks):  $tracked"
 echo "  repos still on the untracked ~/.claude copy: $legacy"
-echo "  repos missing one of the two hooks:          $unguarded"
+echo "  repos missing one of the three hooks:        $unguarded"
 echo "  repos deliberately NOT opted in (no scan):   $noscan"
 echo "  worktrees covered by a parent repo:          $worktrees"
 echo "  non-repo directories ignored:                $notrepo"

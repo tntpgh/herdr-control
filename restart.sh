@@ -103,10 +103,20 @@ verify() {
   # blocked-worker surface reads it, and a listener answering 200 while the
   # subscription is dead would report an empty, silent fleet. `connected` is
   # the only honest check.
+  #
+  # It connects AFTER the listener binds — the HTTP probe above passing is not
+  # evidence this is up yet — so this waits on the same budget rather than
+  # asking once and declaring a healthy restart broken.
   printf "  %-34s " "hub herdr subscription"
-  live=$(curl -s --max-time 5 "http://127.0.0.1:${HERDR_HUB_PORT:-8600}/api/panes" 2>/dev/null)
+  local waited=0 budget="${PROBE_READY_SECS:-20}"
+  while :; do
+    live=$(curl -s --max-time 5 "http://127.0.0.1:${HERDR_HUB_PORT:-8600}/api/panes" 2>/dev/null)
+    printf '%s' "$live" | jq -e '.connected == true' >/dev/null 2>&1 && break
+    [ "$waited" -ge "$budget" ] && break
+    sleep 1; waited=$((waited + 1))
+  done
   if printf '%s' "$live" | jq -e '.connected == true' >/dev/null 2>&1; then
-    echo "UP   ($(printf '%s' "$live" | jq -r '"\(.panes | length) panes, \(.stats.events) events, \(.stats.reconnects) reconnects, \(.blocked | length) blocked"'))"
+    echo "UP   ($(printf '%s' "$live" | jq -r '"\(.panes | length) panes, \(.stats.events) events, \(.stats.reconnects) reconnects, \(.blocked | length) blocked"')$([ "$waited" -gt 0 ] && printf ', ready after %ss' "$waited"))"
   else
     echo "DOWN ($(printf '%s' "$live" | jq -r '.stats.last_error // "no response"' 2>/dev/null || echo 'no response'))" >&2
     fail=1
