@@ -129,14 +129,20 @@ deploy_scanner() {
   mv -f "$tmp" "$HOOK_DEPLOY" || return 1
 }
 
-# The shim is one exec, so the scanner is never copied into a repo. Extra
-# argv (pre-push passes `--push`) is appended verbatim; `exec` keeps stdin, and
-# pre-push's ref list arrives THERE, not in argv.
+# The shim is one exec, so the scanner is never copied into a repo. Extra argv
+# (pre-push passes `--push`) is appended verbatim, THEN git's own hook
+# arguments via "$@". `exec` keeps stdin, where pre-push's ref list arrives.
+#
+# Forwarding "$@" is load-bearing for pre-push: git calls it as
+# `pre-push <remote-name> <remote-url>`, and the scanner needs the remote to
+# answer "which commits does THIS remote not have yet?". Without it the
+# scanner fell back to "what no remote has", and a commit fetched from a fork
+# could be pushed to origin unscanned (reproduced 2026-09-15).
 hook_body() {                             # [extra scanner args...]
   printf '#!/usr/bin/env bash\n%s\nexec bash %q' "$MARK" "$HOOK_DEPLOY"
   local a
   for a in "$@"; do printf ' %q' "$a"; done
-  printf '\n'
+  printf ' "$@"\n'
 }
 
 [ "$MODE" = dry ] && echo "DRY RUN — nothing will be changed. Re-run with --apply."

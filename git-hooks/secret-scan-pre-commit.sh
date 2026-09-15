@@ -71,7 +71,17 @@ DIFF_FILTER=d
 #     forever, with no compliant path. A guard with no compliant path gets
 #     bypassed, which costs more than the drift it was watching.
 SCAN_MODE=index
-if [[ "${1:-}" == "--push" ]]; then SCAN_MODE=push; fi
+PUSH_REMOTE=""
+if [[ "${1:-}" == "--push" ]]; then
+    SCAN_MODE=push; shift
+    # git calls `pre-push <remote-name> <remote-url>`. WHICH remote matters:
+    # "what does this remote not have yet?" is the whole question, and
+    # answering it with "what do ALL remotes not have" let a commit fetched
+    # from a fork be pushed to origin unscanned (reproduced 2026-09-15: a new
+    # branch whose tip came from a second remote enumerated ZERO commits and
+    # the token landed on origin). The shim forwards git's argv for this.
+    PUSH_REMOTE="${1:-}"
+fi
 
 if [[ "$SCAN_MODE" == index ]]; then
     STAGED=$(git diff --cached --name-only --diff-filter="$DIFF_FILTER" 2>/dev/null)
@@ -173,6 +183,30 @@ FOUND=0
 # sent that the remote does not already have, with the same PATTERNS above —
 # one pattern list, two content sources, so a pattern fixed for commits is
 # fixed for pushes in the same edit.
+# The ADDED lines of a diff on stdin, with the file headers removed
+# STRUCTURALLY rather than by pattern.
+#
+# `grep -E '^\+' | grep -vE '^\+\+\+'` was the obvious way and it was a
+# bypass: a content line that itself starts with `++` appears in the diff as
+# `+++TOKEN = "..."`, which the header filter then dropped. Reproduced
+# 2026-09-15 — a file whose first line was `++TOKEN = "<ghp_...>"` pushed
+# clean. Patches, diff fixtures and any file that legitimately contains diff
+# text hit this by accident; a credential can hit it on purpose.
+#
+# So: drop everything from `diff --git` up to that file's first hunk header
+# (which is where `--- a/x` and `+++ b/x` live) and keep every `+` line after
+# it. A combined diff from a merge uses `@@@` and `++line`; `^@@` matches the
+# former and the extra `+` is harmless inside a scanned line.
+added_lines() {
+    awk '
+        /^diff /        { inhdr = 1; next }   # --git and --cc (merges)
+        inhdr && /^@@/  { inhdr = 0; next }
+        inhdr           { next }
+        /^@@/           { next }
+        /^\+/           { print substr($0, 2) }
+    '
+}
+
 if [[ "$SCAN_MODE" == push ]]; then
     PUSH_FOUND=0
     scan_commit() {
@@ -181,8 +215,25 @@ if [[ "$SCAN_MODE" == push ]]; then
         # own subject/body text would otherwise be scanned as content — a
         # commit MESSAGE mentioning a token shape is not a committed secret,
         # and blocking on it has no compliant fix short of rewriting history.
-        added=$(git show "$c" -U0 --format= --diff-filter="$DIFF_FILTER" 2>/dev/null \
-                | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^\+//' || true)
+        # --text is load-bearing, not tidiness. `git show` honours DIFF
+        # ATTRIBUTES: a path marked `-diff` in a committed .gitattributes
+        # (`*.min.js -diff`, `*.lock -diff` — ordinary idioms) and anything git
+        # auto-detects as binary (a NUL in the first 8KB) diffs as "Binary
+        # files ... differ" with ZERO added lines. So the scan saw nothing and
+        # called the commit clean. Reproduced 2026-09-15: `*.env -diff` plus a
+        # token in prod.env pushed clean. Index mode was never exposed because
+        # it greps the raw blob. Worst case --text scans a binary as text,
+        # which is the direction this control must fail in.
+        #
+        # And the STATUS matters: `|| true` on the pipeline discarded a git
+        # failure, so an unreadable object read as a clean commit — the same
+        # fail-open shape as the rev-list range, one level in.
+        local raw
+        if ! raw=$(git show "$c" --text -U0 --format= --diff-filter="$DIFF_FILTER" 2>/dev/null); then
+            refuse_push "could not read commit $c." \
+                        "The object may be corrupt; try: git fsck"
+        fi
+        added=$(printf '%s\n' "$raw" | added_lines || true)
         [[ -z "$added" ]] && return 0
         local pattern
         for pattern in "${PATTERNS[@]}"; do
@@ -206,6 +257,28 @@ if [[ "$SCAN_MODE" == push ]]; then
             fi
         done
     }
+    # Which remote-tracking refs count as "the remote already has this". git
+    # hands us a NAME normally, a URL when someone pushes to a raw path.
+    remote_name=""
+    if [[ -n "$PUSH_REMOTE" ]]; then
+        if git remote get-url "$PUSH_REMOTE" >/dev/null 2>&1; then
+            remote_name="$PUSH_REMOTE"
+        else
+            while read -r _n _u; do
+                [[ "$_u" == "$PUSH_REMOTE" ]] && remote_name="$_n"
+            done < <(git remote -v 2>/dev/null | awk '{print $1, $2}' | sort -u)
+        fi
+    fi
+
+    refuse_push() {                 # <why> <fix>
+        echo "BLOCKED: $1" >&2
+        echo "  $2" >&2
+        echo "  Refusing to treat a range this scanner could not enumerate as" >&2
+        echo "  clean — the index scan refuses an unreadable file for the same" >&2
+        echo "  reason, and a detection control must fail toward scanning." >&2
+        exit 1
+    }
+
     # git's pre-push protocol: one line per ref, on stdin.
     PUSH_COMMITS=""
     while read -r _lref lsha _rref rsha; do
@@ -215,15 +288,46 @@ if [[ "$SCAN_MODE" == push ]]; then
         [[ -z "${lsha:-}" || "$lsha" =~ ^0+$ ]] && continue
         range=""
         if [[ -z "${rsha:-}" || "$rsha" =~ ^0+$ ]]; then
-            # A NEW branch on the remote. The range is not `$lsha` alone —
-            # that is the branch's entire history back to the root, so the
-            # first push of any branch would rescan years of commits and
-            # block on anything historical, with no compliant path. Exclude
-            # everything the remote already has.
-            range=$(git rev-list --no-merges "$lsha" --not --remotes 2>/dev/null || true)
+            # A NEW ref on the remote. The range is not `$lsha` alone — that is
+            # the branch's entire history back to the root, so the first push of
+            # any branch would rescan years of commits and block on anything
+            # historical, with no compliant path. Exclude what THIS remote has.
+            #
+            # `--remotes` (all remotes) was the first version and it was a
+            # bypass: a commit fetched from a fork is reachable from
+            # `fork/contrib`, so pushing it to origin for the FIRST time
+            # enumerated zero commits. Reproduced, token landed on origin.
+            if [[ -z "$remote_name" ]]; then
+                refuse_push \
+                    "cannot tell which commits '$PUSH_REMOTE' already has." \
+                    "Give this remote a name (git remote add <name> <url>) and push to that."
+            fi
+            if ! range=$(git rev-list "$lsha" --not --remotes="$remote_name" 2>/dev/null); then
+                refuse_push \
+                    "could not enumerate what is new on '$remote_name'." \
+                    "Try: git fetch $remote_name   (then push again)"
+            fi
         else
-            range=$(git rev-list --no-merges "$rsha..$lsha" 2>/dev/null || true)
+            # An UPDATE to an existing ref. `$rsha` is the remote's current tip
+            # as it advertised it — which the local repo may not have: a force
+            # push over work someone else pushed, a single-branch or shallow
+            # clone. `rev-list` then FAILS, and `|| true` turned that into an
+            # empty range: exit 0, nothing scanned, content published.
+            # Reproduced 2026-09-15 with two clones — a `ghp_` token reached
+            # the remote through `git push --force`.
+            if ! range=$(git rev-list "$rsha..$lsha" 2>/dev/null); then
+                refuse_push \
+                    "'$rsha' (the tip $PUSH_REMOTE advertised) is not in this repository," \
+                    "so what you are publishing cannot be determined. Try: git fetch ${remote_name:-$PUSH_REMOTE}"
+            fi
         fi
+        # The first push of a brand-new repo (or a remote with no
+        # refs/remotes/<name>/* yet) legitimately has the ENTIRE history in
+        # range — correct, it genuinely is all being published for the first
+        # time, but a hook that goes silent for minutes is its own
+        # `--no-verify` risk. Say what it is doing when there is real work.
+        _n=$(printf '%s\n' $range | grep -c . || true)
+        [ "${_n:-0}" -gt 50 ] && echo "secret-scan: checking $_n commits for secrets..." >&2
         for commit in $range; do
             scan_commit "$commit"
             PUSH_COMMITS="$PUSH_COMMITS $commit"
@@ -342,25 +446,26 @@ PII_EXCLUDES=(
     ':(exclude)**/package-lock.json' ':(exclude)package-lock.json'
     ':(exclude)**/yarn.lock' ':(exclude)**/pnpm-lock.yaml'
 )
-if [[ "$SCAN_MODE" == push ]]; then
-    # The same added lines, from the commits being pushed. Client PII reaching
-    # the remote is the higher-consequence half of this hook (a 2026-09-03
-    # audit found 1,409 identities in knowledge-base history), and `git am`,
-    # `cherry-pick`, `revert` and every `rebase` replay reach the remote
-    # without ever running a commit-creation hook. Only commits the remote
-    # does not already have are in PUSH_COMMITS, so this cannot fire on
-    # published history and become unbypassable.
-    ADDED=""
-    for _c in $PUSH_COMMITS; do
-        ADDED="$ADDED
-$(git show "$_c" -U0 --format= --diff-filter="$DIFF_FILTER" "${PII_EXCLUDES[@]}" 2>/dev/null \
-  | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^\+//' || true)"
-    done
-else
-    ADDED="$(git diff --cached -U0 --diff-filter="$DIFF_FILTER" \
-             "${PII_EXCLUDES[@]}" 2>/dev/null \
-             | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^\+//' || true)"
-fi
+# The added lines to judge, per SOURCE. In push mode that is one call per
+# commit being sent, so a finding can name the commit to rewrite — the first
+# version concatenated every commit into one blob and could only say "a
+# pushed commit", which is not a fix anybody can act on. Client PII reaching
+# the remote is the higher-consequence half of this hook (a 2026-09-03 audit
+# found 1,409 identities in knowledge-base history), and `git am`,
+# `cherry-pick`, `revert` and every `rebase` replay reach a remote without
+# ever running a commit-creation hook. Only commits the remote does not
+# already have are in PUSH_COMMITS, so this cannot fire on published history
+# and become unbypassable.
+pii_added_for_commit() {        # <commit>
+    # --text for the same reason as scan_commit: a `-diff` attribute or a NUL
+    # byte otherwise hides every added line from this half too.
+    git show "$1" --text -U0 --format= --diff-filter="$DIFF_FILTER" "${PII_EXCLUDES[@]}" 2>/dev/null \
+        | added_lines || true
+}
+pii_added_for_index() {
+    git diff --cached -U0 --diff-filter="$DIFF_FILTER" "${PII_EXCLUDES[@]}" 2>/dev/null \
+        | added_lines || true
+}
 # Lockfiles are excluded from the PII checks only. npm records each package
 # MAINTAINER's address (maintainer@example.com and friends), published metadata, not
 # client PII, and it arrives whenever a dependency is added. Blocking it teaches
@@ -381,20 +486,22 @@ fi
 # The street check below still carries its own marker workaround for the same
 # root cause. knowledge-base/scripts/scan_diff.py strips the marker and this did
 # not, which is how the two implementations came to disagree on one diff.
-if [[ -n "$ADDED" ]]; then
+check_pii() {                   # <label> <added text>
+    local label="$1" text="$2"
+    [[ -n "$text" ]] || return 0
     # street address: <number> <Name> <suffix>, excluding the fixture words
-    if printf '%s\n' "$ADDED" \
+    if printf '%s\n' "$text" \
        | grep -nE '[0-9]{2,5} [A-Z][a-z]+( [A-Z][a-z]+)? (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)\b' \
        | grep -viE '\b(Main|Elm|Oak|Test|Example|Fake|Sample|Anywhere|Nowhere|Maple|Pine|First|Second|Foo|Bar)\b' \
        | grep -vE '^\+?[0-9]*:?\+?(123|456|789|1234|100|111|999) ' >/dev/null; then
-        echo "BLOCKED: a real-looking STREET ADDRESS is being added."
+        echo "BLOCKED: a real-looking STREET ADDRESS is being added in $label."
         PII_FOUND=1
     fi
     # phone: not the 555-01xx fiction range
-    if printf '%s\n' "$ADDED" \
+    if printf '%s\n' "$text" \
        | grep -E '(\+?1[-. ]?)?\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}' \
        | grep -vE '555[-. ]?01[0-9][0-9]' >/dev/null; then
-        echo "BLOCKED: a real-looking PHONE NUMBER is being added."
+        echo "BLOCKED: a real-looking PHONE NUMBER is being added in $label."
         PII_FOUND=1
     fi
     # email: not a reserved/example domain, and not our own team domain
@@ -422,12 +529,21 @@ if [[ -n "$ADDED" ]]; then
     # prefix/word matches on purpose. vintageskins.com and weizenyoung.com are
     # our own client-business domains (Lisa's shop; the family), not third
     # parties — that is why they are exempt.
-    if printf '%s\n' "$ADDED" \
+    if printf '%s\n' "$text" \
        | grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
        | grep -viE '@(([A-Za-z0-9-]+\.)*example\.(com|org|net)$|test\.|localhost$|invalid$|teamthurber\.com$|vintageskins\.com$|weizenyoung\.com$|users\.noreply\.github\.com$|([A-Za-z0-9-]+\.)?(developer|iam)\.gserviceaccount\.com$)|^secret@dashboard\.teamthurber\.com$' >/dev/null; then
-        echo "BLOCKED: a third-party EMAIL ADDRESS is being added."
+        echo "BLOCKED: a third-party EMAIL ADDRESS is being added in $label."
         PII_FOUND=1
     fi
+}
+
+if [[ "$SCAN_MODE" == push ]]; then
+    for _c in $PUSH_COMMITS; do
+        check_pii "commit $(git log -1 --format='%h %s' "$_c" 2>/dev/null || echo "$_c")" \
+                  "$(pii_added_for_commit "$_c")"
+    done
+else
+    check_pii "the staged changes" "$(pii_added_for_index)"
 fi
 
 # One verdict per mode, so the advice matches what the operator can actually

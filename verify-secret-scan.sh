@@ -427,7 +427,10 @@ push_repo() {                   # -> prints path to a repo with 3 hooks + a remo
         mkdir -p "$r/.git/hooks"
         printf '#!/usr/bin/env bash\nexec bash %s\n' "$HOOK" > "$r/.git/hooks/pre-commit"
         printf '#!/usr/bin/env bash\nexec bash %s\n' "$HOOK" > "$r/.git/hooks/pre-merge-commit"
-        printf '#!/usr/bin/env bash\nexec bash %s --push\n' "$HOOK" > "$r/.git/hooks/pre-push"
+        # `"$@"` because git calls pre-push as `<remote-name> <remote-url>`
+        # and the scanner needs the remote to answer "what does THIS remote
+        # not have yet?". The installed shim forwards it the same way.
+        printf '#!/usr/bin/env bash\nexec bash %s --push "$@"\n' "$HOOK" > "$r/.git/hooks/pre-push"
         chmod +x "$r/.git/hooks/pre-commit" "$r/.git/hooks/pre-merge-commit" "$r/.git/hooks/pre-push"
         git -C "$r" push -q origin main
     } >&2
@@ -549,6 +552,129 @@ git -C "$R" add ok.txt
 blocks "$R" "index mode still refuses the wrong commit identity"
 git -C "$R" commit -qm "wrong identity" --no-verify
 pushes "$R" "push mode does NOT enforce commit identity"
+
+# ═════════════════════════════════════════════════════════════════════════════
+printf '== PUSH MODE: the four bypasses security review reproduced ==\n'
+# Every one of these was ALLOWED by the first version of push mode and put a
+# live-shaped token on the remote. They are the reason this mode fails closed.
+
+# 1. A force push whose remote sha is not in the local object DB. git passes
+#    the tip the REMOTE advertised; after someone else pushes, we do not have
+#    it, `rev-list "$rsha..$lsha"` FAILS, and `|| true` made that an empty
+#    range: exit 0, nothing scanned, token published.
+BARE="$(mktemp -d "$WORK/forcebare.XXXXXX")"
+git -C "$BARE" init -q --bare
+A="$(new_repo)"; git -C "$A" remote add origin "$BARE"; git -C "$A" push -q origin main
+B="$(new_repo)"; git -C "$B" remote add origin "$BARE"
+git -C "$B" fetch -q origin; git -C "$B" reset -q --hard origin/main
+printf 'other work\n' > "$B/other.txt"; git -C "$B" add other.txt
+git -C "$B" commit -qm other --no-verify; git -C "$B" push -q origin main
+printf '#!/usr/bin/env bash\nexec bash %s --push "$@"\n' "$HOOK" > "$A/.git/hooks/pre-push"
+chmod +x "$A/.git/hooks/pre-push"
+printf 'GITHUB_TOKEN = "%s"\n' "$GHP" > "$A/creds.sh"
+git -C "$A" add creds.sh; git -C "$A" commit -qm "token" --no-verify
+if OUT="$(git -C "$A" push --force origin main 2>&1)"; then
+    bad "a force push over unfetched work was ALLOWED: $OUT"
+else
+    ok "a force push whose remote tip is unknown locally is refused"
+fi
+printf '%s' "$OUT" | grep -q "git fetch" \
+    && ok "and the refusal names the fix (git fetch)" \
+    || bad "refusal has no compliant path: $OUT"
+if git -C "$BARE" log -p --all 2>/dev/null | grep -q "$GHP"; then
+    bad "the token reached the remote anyway"
+else
+    ok "and nothing reached the remote"
+fi
+
+# 2. `--not --remotes` (ALL remotes) let a commit fetched from a second remote
+#    be pushed to origin for the first time with zero commits enumerated.
+O2="$(mktemp -d "$WORK/o2.XXXXXX")"; F2="$(mktemp -d "$WORK/f2.XXXXXX")"
+git -C "$O2" init -q --bare; git -C "$F2" init -q --bare
+FORKW="$(new_repo)"; git -C "$FORKW" remote add origin "$F2"
+printf 'AWS_KEY = "%s"\n' "$AWS" > "$FORKW/creds.sh"
+git -C "$FORKW" add creds.sh; git -C "$FORKW" commit -qm "fork token" --no-verify
+git -C "$FORKW" push -q origin main
+C="$(new_repo)"; git -C "$C" remote add origin "$O2"; git -C "$C" push -q origin main
+printf '#!/usr/bin/env bash\nexec bash %s --push "$@"\n' "$HOOK" > "$C/.git/hooks/pre-push"
+chmod +x "$C/.git/hooks/pre-push"
+git -C "$C" remote add fork "$F2"; git -C "$C" fetch -q fork
+git -C "$C" checkout -q -b feature fork/main
+if OUT="$(git -C "$C" push origin feature 2>&1)"; then
+    bad "a fork's commit was pushed to origin unscanned: $OUT"
+else
+    ok "a commit reachable only from ANOTHER remote is still scanned for this one"
+fi
+if git -C "$O2" log -p --all 2>/dev/null | grep -q "$AWS"; then
+    bad "the fork's token reached origin"
+else
+    ok "and it did not reach origin"
+fi
+
+# 3. A conflict resolution lives ONLY in the merge commit's own diff, and
+#    `--no-merges` skipped every merge.
+R="$(push_repo)"
+printf 'base\n' > "$R/f"; git -C "$R" add f
+git -C "$R" commit -qm base --no-verify; git -C "$R" push -q origin main
+git -C "$R" checkout -q -b theirs
+printf 'theirs\n' > "$R/f"; git -C "$R" add f; git -C "$R" commit -qm theirs --no-verify
+git -C "$R" checkout -q main
+printf 'ours\n' > "$R/f"; git -C "$R" add f; git -C "$R" commit -qm ours --no-verify
+git -C "$R" merge theirs >/dev/null 2>&1 || true
+printf 'TOKEN = "%s"\n' "$GHP" > "$R/f"; git -C "$R" add f
+git -C "$R" commit -qm "resolve the conflict" --no-verify >/dev/null 2>&1
+[ "$(git -C "$R" rev-list --parents -1 HEAD | wc -w | tr -d ' ')" -eq 3 ] \
+    && ok "fixture is a real MERGE commit (two parents)" \
+    || bad "fixture is not a merge commit, so this case proves nothing"
+refuses_push "$R" "a secret introduced by a merge's own conflict resolution is refused"
+
+# 4. A content line that itself starts with `++` appears in the diff as
+#    `+++TOKEN = ...`, which the `^\+\+\+` header filter dropped. Patch files
+#    and diff fixtures hit this by accident; a credential can on purpose.
+R="$(push_repo)"
+printf '++TOKEN = "%s"\n' "$GHP" > "$R/leak.diff"
+git -C "$R" add leak.diff
+git -C "$R" commit -qm "a patch-shaped file" --no-verify
+refuses_push "$R" "a token on a line starting with ++ is not mistaken for a diff header"
+
+# The same shape in the PII half, which used the identical extraction.
+R="$(push_repo)"
+printf '++contact = "%s"\n' "$BADPHONE" > "$R/lead.diff"
+git -C "$R" add lead.diff
+git -C "$R" commit -qm "patch-shaped PII" --no-verify
+refuses_push "$R" "and the PII half sees it too"
+printf '%s' "$OUT" | grep -qE "in commit [0-9a-f]{7}" \
+    && ok "the PII refusal names the COMMIT to rewrite" \
+    || bad "PII refusal does not say which commit: $OUT"
+
+# 5. `git show` honours DIFF ATTRIBUTES. A path marked `-diff` in a committed
+#    .gitattributes diffs as "Binary files ... differ" with zero added lines,
+#    so the scan saw nothing and called the commit clean. `*.min.js -diff` and
+#    `*.lock -diff` are ordinary idioms, and a token in a lockfile was already
+#    a real incident here. Index mode was never exposed: it greps the blob.
+R="$(push_repo)"
+printf '*.env -diff\n' > "$R/.gitattributes"
+git -C "$R" add .gitattributes
+git -C "$R" commit -qm "diff attributes" --no-verify
+git -C "$R" push -q origin main
+printf 'TOKEN = "%s"\n' "$GHP" > "$R/prod.env"
+git -C "$R" add prod.env
+git -C "$R" commit -qm "config" --no-verify
+git -C "$R" show HEAD --format= -U0 | grep -q 'Binary files' \
+    && ok "fixture really is hidden from a plain diff (Binary files ... differ)" \
+    || bad "fixture does not reproduce the -diff attribute, so this proves nothing"
+refuses_push "$R" "a -diff attribute does not hide a secret from the push scan"
+
+# The same shape with NO .gitattributes at all: git auto-detects binary from a
+# NUL in the first 8KB, which any generated file can carry.
+R="$(push_repo)"
+printf 'TOKEN = "%s"\n\0binary\n' "$GHP" > "$R/blob.dat"
+git -C "$R" add blob.dat
+git -C "$R" commit -qm "a generated blob" --no-verify
+git -C "$R" show HEAD --format= -U0 | grep -q 'Binary files' \
+    && ok "fixture is auto-detected as binary" \
+    || bad "fixture is not auto-detected as binary"
+refuses_push "$R" "and NUL-auto-detection does not hide one either"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
