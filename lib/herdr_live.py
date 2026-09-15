@@ -83,6 +83,12 @@ BLOCKED = "blocked"
 # an output-driven `pane_updated` for the same pane. See _apply_pane.
 STATUS_EVENT_STICKY_S = 3.0
 
+# After this many consecutive `pane_not_found` rejections, subscribe to the
+# lifecycle events ONLY. Per-pane status subscriptions are the richer signal,
+# but a fleet churning panes faster than we can resubscribe must not cost us
+# the stream itself.
+STATUS_SUBS_GIVE_UP_AFTER = 3
+
 DEFAULT_SOCKET = Path.home() / ".config/herdr/herdr.sock"
 
 
@@ -194,6 +200,7 @@ class LiveState:
         self._since: dict[str, float] = {}       # pane_id -> when its status last changed
         self._status_event_at: dict[str, float] = {}   # pane_id -> last authoritative status event
         self._workspaces: dict[str, str] = {}    # workspace_id -> label
+        self._subscribe_failures = 0
         self._edges: queue.Queue = queue.Queue(maxsize=1024)
         self._stop = threading.Event()
         self.stats = {
@@ -201,6 +208,8 @@ class LiveState:
             "connected_since": None,
             "reconnects": 0,
             "resubscribes": 0,
+            "subscribe_pruned": 0,
+            "status_subs_degraded": False,
             "events": 0,
             "edges": 0,
             "edges_dropped": 0,
@@ -441,19 +450,57 @@ class LiveState:
 
     # ── the stream ────────────────────────────────────────────────────────────
     def _subscriptions(self) -> tuple[list[dict], set[str]]:
-        """The subscription set, plus the panes it covers individually."""
+        """The subscription set, plus the panes it covers individually.
+
+        After repeated `pane_not_found` rejections the per-pane half is dropped
+        (see _subscribe_rejected): a degraded stream that still delivers
+        pane_updated and snapshots beats no stream at all."""
         subs: list[dict] = [{"type": t} for t in LIFECYCLE_SUBSCRIPTIONS]
         with self._lock:
             known = sorted(self._panes)
+            degraded = self._subscribe_failures >= STATUS_SUBS_GIVE_UP_AFTER
+        if degraded:
+            self.stats["status_subs_degraded"] = True
+            return subs, set()
         subs += [{"type": "pane.agent_status_changed", "pane_id": pid} for pid in known]
         return subs, set(known)
+
+    def _subscribe_rejected(self, ack: dict | None) -> bool:
+        """True when this rejection is recoverable and we should retry NOW.
+
+        THE WEDGE THIS FIXES (observed live 2026-09-15, 08:5x): a per-pane
+        `pane.agent_status_changed` subscription for a pane that has since
+        CLOSED makes the server reject the ENTIRE events.subscribe with
+        `pane_not_found`. The old code raised, backed off, and rebuilt the same
+        subscription list from the same stale state — because pruning only
+        happens in the snapshot that runs AFTER the ack. So one closed pane
+        (w8:p2F) stopped the subscription permanently: `connected:false`, 15
+        frozen panes, retry every 30s forever, and every consumer silently back
+        on stale data.
+
+        Recovery is to re-snapshot BEFORE retrying — which drops the vanished
+        pane (and emits its edge) — then subscribe again with the pruned set.
+        The snapshot is the same call bootstrap uses; if it fails too, the
+        caller backs off as before.
+        """
+        err = (ack or {}).get("error") or {}
+        if err.get("code") != "pane_not_found":
+            return False
+        with self._lock:
+            self._subscribe_failures += 1
+            n = self._subscribe_failures
+            self.stats["subscribe_pruned"] += 1
+        self._log(f"subscribe rejected ({err.get('message')}) — re-snapshotting to prune (attempt {n})")
+        self._emit(self._apply_snapshot(request("session.snapshot")))
+        return True
 
     def _connect_and_stream(self) -> bool:
         """Stream until the connection dies or the subscription set is stale.
 
         Returns True when it ended because we need to RESUBSCRIBE (a pane
-        appeared that no per-pane subscription covers) rather than because of a
-        failure — the caller must not count that as a reconnect or back off."""
+        appeared or vanished, so the subscription set is stale) rather than
+        because of a failure — the caller must not count that as a reconnect or
+        back off."""
         wire = _Wire(socket_path(), timeout=5.0)
         try:
             subs, covered = self._subscriptions()
@@ -461,7 +508,11 @@ class LiveState:
                        "params": {"subscriptions": subs}})
             ack = wire.read(timeout=5.0)
             if not ack or "result" not in ack:
+                if self._subscribe_rejected(ack):
+                    return True
                 raise ConnectionError(f"subscribe not acknowledged: {ack!r}")
+            with self._lock:
+                self._subscribe_failures = 0
 
             # Bootstrap AFTER the subscription is live (see module docstring).
             self._emit(self._apply_snapshot(request("session.snapshot")))
