@@ -684,7 +684,19 @@ if [[ "$SCAN_MODE" == push ]]; then
     # `<remote-name> <remote-url>`. Chaining without them is worse than not
     # chaining: the local hook runs, sees no refs and no remote, and approves.
     if [[ -x "$(git rev-parse --git-path hooks/pre-push.local 2>/dev/null)" ]]; then
-        exec "$(git rev-parse --git-path hooks/pre-push.local)" "$@" <<<"$PUSH_REFS"
+        # `<<<` on an EMPTY buffer would hand the local hook one BLANK line,
+        # which is harmless to the loop above (empty sha, skipped) but not to a
+        # chained hook: git's own pre-push.sample takes its else branch with
+        # both shas empty and runs `git rev-list -n1 --grep ^WIP ".."`, which
+        # errors — and a non-zero chained hook now blocks the push. git never
+        # invokes pre-push with zero refs (it short-circuits "Everything
+        # up-to-date" first), so this is unreachable today; it costs one line
+        # to keep it unreachable if that ever changes.
+        if [[ -n "$PUSH_REFS" ]]; then
+            exec "$(git rev-parse --git-path hooks/pre-push.local)" "$@" <<<"$PUSH_REFS"
+        else
+            exec "$(git rev-parse --git-path hooks/pre-push.local)" "$@" </dev/null
+        fi
     fi
     exit 0
 fi
