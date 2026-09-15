@@ -22,7 +22,15 @@ pass=0 fail=0
 ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 
+# The SOURCE of truth in the repo...
 TRACKED="$here/git-hooks/secret-scan-pre-commit.sh"
+# ...and where --apply DEPLOYS it, which is what the shims must exec. Pointing
+# shims into the working tree broke every commit in every repo the moment the
+# checkout moved to a branch without git-hooks/ (observed 2026-09-15), so the
+# deployed path is the contract now. The suite overrides it to stay in its own
+# sandbox.
+DEPLOY_DIR="$WORK/deployed"
+DEPLOYED="$DEPLOY_DIR/secret-scan-pre-commit.sh"
 LEGACY="$HOME/.claude/hooks/secret-scan-pre-commit.sh"
 
 # ── a synthetic fleet ────────────────────────────────────────────────────────
@@ -39,7 +47,7 @@ put_hook() {                        # <repo> <hook name> <content...>
     chmod +x "$1/.git/hooks/$2"
 }
 run() {                             # <mode...> -> rc; output in $OUT
-    OUT="$(CODE_ROOT="$ROOT" bash "$INSTALLER" "$@" 2>&1)"
+    OUT="$(CODE_ROOT="$ROOT" HERDR_HOOK_DEPLOY_DIR="$DEPLOY_DIR" bash "$INSTALLER" "$@" 2>&1)"
     return $?
 }
 
@@ -88,13 +96,13 @@ printf '== --apply: every spelling of the fleet shim is repointed ==\n'
 run --apply
 for r in "$R_EXPANDED" "$R_HOME" "$R_TILDE"; do
     n="$(basename "$r")"
-    if grep -qF "$TRACKED" "$r/.git/hooks/pre-commit" 2>/dev/null; then
-        ok "$n/pre-commit now points at the tracked copy"
+    if grep -qF "$DEPLOYED" "$r/.git/hooks/pre-commit" 2>/dev/null; then
+        ok "$n/pre-commit now points at the deployed copy"
     else
         bad "$n/pre-commit not repointed: $(cat "$r/.git/hooks/pre-commit" 2>/dev/null)"
     fi
 done
-[ -x "$R_HOME/.git/hooks/pre-merge-commit" ] && grep -qF "$TRACKED" "$R_HOME/.git/hooks/pre-merge-commit" \
+[ -x "$R_HOME/.git/hooks/pre-merge-commit" ] && grep -qF "$DEPLOYED" "$R_HOME/.git/hooks/pre-merge-commit" \
     && ok "a MISSING pre-merge-commit is created (the merge path was unscanned)" \
     || bad "pre-merge-commit not installed where absent"
 [ -x "$R_TILDE/.git/hooks/pre-commit" ] && ok "written hooks are executable" || bad "hook not executable"
@@ -108,7 +116,7 @@ grep -q 'npm run lint' "$R_OWN/.git/hooks/pre-commit" \
 # pre-merge-commit IS installed while the pre-commit is left alone. The two
 # hooks are judged independently, which is the only way to protect the merge
 # path of a repo that has customised the commit path.
-[ -x "$R_OWN/.git/hooks/pre-merge-commit" ] && grep -qF "$TRACKED" "$R_OWN/.git/hooks/pre-merge-commit" \
+[ -x "$R_OWN/.git/hooks/pre-merge-commit" ] && grep -qF "$DEPLOYED" "$R_OWN/.git/hooks/pre-merge-commit" \
     && ok "its unscanned MERGE path is still closed (hooks judged independently)" \
     || bad "left the merge path of a customised repo unscanned"
 grep -q 'lint-only' "$R_NONE/.git/hooks/pre-commit" && [ ! -e "$R_NONE/.git/hooks/pre-merge-commit" ] \

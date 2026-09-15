@@ -163,7 +163,12 @@ blocks "$R" "symlink replaced by a token-carrying regular file is BLOCKED"
 # that constant must be the exclude form. Three literals that must agree is the
 # defect underneath both bypasses: the early `exit 0` filter disagreeing with
 # the scan loop's filter is how an empty list becomes a silent pass.
-_filters=$(grep -oE -- '--diff-filter=[^ )"]*' "$HOOK" | grep -v '^--diff-filter="\$DIFF_FILTER"$' || true)
+# Comment lines are excluded: the scanner's own comments NAME the historical
+# allow-lists (ACM, ACMR, Ad) as part of explaining why they were holes, and a
+# meta-test that cannot tell documentation from code would force those
+# explanations to be deleted.
+_filters=$(grep -vE '^[[:space:]]*#' "$HOOK" | grep -oE -- '--diff-filter=[^ ]*' \
+           | grep -v '^--diff-filter="\$DIFF_FILTER"$' || true)
 [ -z "$_filters" ] \
     && ok "every --diff-filter in the scanner uses the shared constant" \
     || bad "literal --diff-filter found (must be \"\$DIFF_FILTER\"): $(printf '%s' "$_filters" | tr '\n' ' ')"
