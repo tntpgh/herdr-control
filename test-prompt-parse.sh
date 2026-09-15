@@ -103,6 +103,13 @@ FIXTURE='│ just some transcript output │
 FIXTURE="$(printf '│\n%s│   Approve │\n%s│    Deny │\n│\n%s\n' "$HL" "$HL" "$FOOT")"
 [ -z "$(prompt_menu_options fake:pane)" ] \
   && ok "two highlighted rows refused" || no "double highlight" "accepted"
+# A panel is bottom-anchored. Fresh output printed BELOW the footer means the
+# menu was dismissed and the pane moved on; answering it would press a key
+# into a pane that is not prompting.
+FIXTURE="$(panel 0 3 Approve)"$'\nTask complete.\n'
+[ -z "$(prompt_menu_options fake:pane)" ] && ! prompt_menu_visible fake:pane \
+  && ok "a dismissed menu with newer output below it is not actionable" \
+  || no "stale menu" "accepted a menu that has output under its footer"
 
 echo
 echo "== prompt_any_visible: both shapes from one read, same scope as before =="

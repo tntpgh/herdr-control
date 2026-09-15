@@ -154,17 +154,36 @@ sidebar cards — enable them by merging `docs/herdr-config-snippet.toml` into
 Standing rule for a conductor session (Terrence, 2026-08-16): every part of
 managing dispatched workers — permission grants, completion detection, tab
 cleanup — is done proactively, not reactively. Don't just answer
-`[HERDR-PEER-SIGNAL]` interjections one at a time and otherwise sit idle;
-periodically sweep every dispatched pane on your own initiative
-(`herdr pane read <id> --source visible --lines 8..30`) so an idle-but-stuck
-worker doesn't sit unnoticed between signals, and force the issue as a batch
-nears completion instead of waiting for the last stragglers to self-report.
+`[HERDR-PEER-SIGNAL]` interjections one at a time and otherwise sit idle.
 
-`wait-for-blocked.sh <interval> <max-polls> <pane...>` also detects a visible
-omp approval panel when herdr reports `working`. Run it under your supervised
+**Sweep by asking the hub, not the terminal.** The hub holds one
+`events.subscribe` connection to herdr, so the fleet's live state is one cheap
+HTTP call with zero herdr RPCs:
+
+```bash
+curl -s localhost:8600/api/blocked | jq -r '.blocked[] | "\(.pane_id) \(.label)"'
+curl -s localhost:8600/api/panes   | jq -r '.panes[] | select(.agent) | "\(.pane_id) \(.agent_status)"'
+```
+
+Use `herdr-gates.sh` when you need to see WHAT a pane is waiting on (it parses
+the panel), and `herdr pane read` only for a pane you are actually about to
+answer. Fanning reads across every pane on a timer is the habit that pushed
+herdr's own socket p95 from 9ms to 136ms (2026-09-14).
+
+`wait-for-blocked.sh <interval> <max-polls> <pane...>` now BLOCKS on the hub's
+long-poll (`/api/blocked/wait`) instead of polling: 0 herdr RPCs while it
+waits, versus 84 per minute before. It still detects a visible omp approval
+panel when herdr reports `working` — via a scrape backstop every
+`HERDR_WAIT_SCRAPE_EVERY`-th idle timeout (default 4 ≈ 2 min) — and it falls
+back to the old polling loop if the hub or its subscription is down
+(`HERDR_WAIT_MODE=poll` forces that). Run it under your supervised
 background-job facility; it exits on a blocker and must be rearmed after that
 blocker is resolved. An unknown menu still wakes for inspection but is not
 auto-selectable. A polling helper is not a permanently installed supervisor.
+
+If `/api/blocked` says `"connected": false`, the subscription is down: treat
+every live row as stale, fall back to `herdr-gates.sh`, and check
+`./restart.sh --verify`.
 
 **Handle routine approvals as the conductor, not as the human.** The default
 peer path still approves only classifier `allow`. Terrence's 2026-09-04

@@ -271,6 +271,21 @@ if not complete:
         if t.startswith("up/down navigate") and "enter select" in t:
             foot = i
             break
+    # A panel is BOTTOM-ANCHORED: below its footer there is nothing but the
+    # box closer and blank rows. Pass 1 already enforces this (its state
+    # machine clears `visible`/`complete` on any text after the footer), but
+    # pass 2 walked up from the last footer in the window and so accepted a
+    # DISMISSED menu with fresh output printed underneath — reporting a pane
+    # as needing input when it had already moved on, and offering a keypress
+    # into a pane that is not prompting. Caught by the verify-omp-hooks.sh
+    # case "dismissed menu above new output is not actionable", which was red
+    # on this branch from b0ac384 until 2026-09-15. (No apostrophes in here:
+    # this whole parser is a single-quoted shell argument.)
+    if foot is not None:
+        for tail in lines[foot + 1:]:
+            if _text(tail):
+                foot = None
+                break
     if foot is not None:
         want = ["Deny", "Approve"]
         rows = {}

@@ -206,8 +206,60 @@ overridable as an environment variable per run.
 ./attention.sh --dry-run                          # classify every agent, change nothing
 
 # Wait: block (in the background) until any/some agent needs input, then report
-./wait-for-blocked.sh                             # poll every 15s, up to 60min, any pane
-./wait-for-blocked.sh 10 30 w1:p2 w2:p1            # 10s/30 polls, only these two panes
+./wait-for-blocked.sh                             # waits on the hub's herdr subscription
+./wait-for-blocked.sh 10 30 w1:p2 w2:p1            # 60min budget in 10s units, these two panes
+HERDR_WAIT_MODE=poll ./wait-for-blocked.sh         # force the old polling loop
+
+# See the fleet the way herdr sees it (no screen scraping, no herdr RPCs)
+curl -s localhost:8600/api/panes   | jq '.panes[] | {pane_id, agent, agent_status}'
+curl -s localhost:8600/api/blocked | jq '.blocked[] | {pane_id, label, since}'
+curl -s "localhost:8600/api/blocked/wait?since=0&timeout=30"   # returns the instant it changes
+```
+
+### The control plane is pushed, not polled (`lib/herdr_live.py`)
+
+The hub (`com.herdr-control.hub`) holds ONE `events.subscribe` connection to
+herdr and keeps the live pane/agent map in memory. Everything that used to ask
+"who needs a human?" by fanning `herdr pane list` + `herdr pane read` across
+every pane now reads that map instead.
+
+Measured on this machine, one conductor waiting 60s:
+
+| | herdr RPCs per 60s of waiting |
+| --- | --- |
+| `wait-for-blocked.sh` polling (15s tick) | **84** (4 × `pane list`, 40 × `process-info`, 40 × `pane read`) |
+| `wait-for-blocked.sh` on the hub long-poll | **0** |
+
+Three rules make it safe to build alerting on an event stream:
+
+1. **Subscribe first, snapshot second.** `session.snapshot` before the
+   subscription would lose every change in between. The bootstrap order is in
+   `lib/herdr_live.py`, and a late-buffered event is discarded by pane
+   `revision`, never applied backwards.
+2. **A reconnect is a diff.** Every (re)connect re-snapshots and compares
+   against the state already held, so transitions that happened while
+   disconnected still fire. A hub restart is therefore a reconciliation: a
+   registry row still saying `blocked` for a prompt answered while it was down
+   gets healed (`agent-edge.sh`, audit line `reg=running`).
+3. **Status is authoritative for WHO, not for WHAT TO PRESS.** omp reports
+   `blocked` from its own `tool_approval_requested`, so it is a fact — but for
+   an agent with no reporting integration herdr's status is a heuristic (see
+   `herdr-gates.sh`). So nothing presses a key off status: `peer-answer.sh`
+   re-parses the panel, and auto-answering from an edge stays opt-in
+   (`HERDR_EDGE_PEER_ANSWER=1`). `wait-for-blocked.sh` keeps a scrape backstop
+   every `HERDR_WAIT_SCRAPE_EVERY`-th idle timeout (default 4 ≈ 2 min) for
+   exactly that population.
+
+`agent-edge.sh` is the one place a transition becomes action: registry follow,
+a graced Slack backstop for panes whose own hook never alerted
+(`HERDR_EDGE_ALERT_GRACE_S`, default 20s), retraction on unblock, and an audit
+line per edge in `~/.cache/herdr-control/agent-edges.jsonl`. If the hub is
+down or its subscription drops, every consumer falls back to polling — a
+performance change must never be the reason a worker's prompt goes unnoticed.
+
+```bash
+./verify-herdr-live.sh        # 22 checks: state machine, edge decisions, registry follow
+./restart.sh --verify         # includes "hub herdr subscription UP (N panes, …)"
 ```
 
 ### Multi-pane layouts, case by case (`spread-tab.sh`)
