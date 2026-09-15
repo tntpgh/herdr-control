@@ -109,9 +109,22 @@ probe_http() {
 
 # The services, in start order, with their health probes.
 # Format: label|url|expected codes  (url empty = no HTTP surface)
+#
+# ORDER IS LOAD-BEARING for the auth pair: `omp auth-gateway serve` probes its
+# upstream broker (http://127.0.0.1:8765/v1/snapshot) while starting and EXITS
+# 1 on ConnectionRefused — it does not retry. With the gateway listed first,
+# every `./restart.sh` (and every login, where launchd starts both at once)
+# produced a dead first run that KeepAlive then replaced: observed 2026-09-15
+# after a reboot as `RUNNING pid=7172 last_exit=1`, `runs = 2`, with
+# `code: "ConnectionRefused"` in the gateway log. Self-healing, but it makes
+# `--verify` report a nonzero exit on a healthy fleet, which trains the
+# operator to ignore exactly the field that would show a real crash. The
+# broker owns no upstream, so starting it first removes the race from the one
+# path we control. (Login order is launchd's; the gateway retrying instead of
+# exiting is omp's own binary to fix, not this repo's.)
 HERDR_SERVICES=(
   "com.herdr-control.hub|http://127.0.0.1:8600/|200 302"
   "com.herdr-control.bridge||"
-  "com.herdr-control.auth-gateway|http://127.0.0.1:4000/|401 200 404"
   "com.herdr-control.auth-broker|http://127.0.0.1:8765/|401 200 404"
+  "com.herdr-control.auth-gateway|http://127.0.0.1:4000/|401 200 404"
 )
