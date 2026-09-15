@@ -126,7 +126,7 @@
       "pane": "idle",
       "done_event": "stale",
       "want": "stalled",
-      "why": "THE MASKING CASE. A worker that finished round one, was handed a review brief, and went quiet still carries round one's completion evidence. Judging evidence without comparing it to the last thing the worker was ASKED reports that worker completed \u2014 which is how PR #313's five dropped findings stayed invisible. Evidence older than the brief is evidence about a previous round."
+      "why": "THE MASKING CASE. A worker that finished round one, was handed a review brief, and went quiet still carries round one's completion evidence. Judging evidence without comparing it to the last thing the worker was ASKED reports that worker completed — which is how PR #313's five dropped findings stayed invisible. Evidence older than the brief is evidence about a previous round."
     },
     {
       "name": "done event NEWER than the last brief",
@@ -137,12 +137,12 @@
       "why": "the same worker after it actually does the round: evidence postdates the ask."
     },
     {
-      "name": "unrecognised agent_status passes through",
+      "name": "unrecognised agent_status falls back to the stored state",
       "stored": "running",
       "pane": "reviewing",
       "done_event": false,
-      "want": "reviewing",
-      "why": "REVIEW FINDING: the shell coerced an unknown status back to the STORED copy \u2014 the very thing this change stops trusting \u2014 while Python passed it through. Both suites passed because neither exercised it. A status we do not recognise is still herdr's answer, and inventing one is how the copies started."
+      "want": "running",
+      "why": "CORRECTED 2026-09-15. The earlier row wanted the raw status passed through, on the grounds that inventing one is how the copies started. True, and passing it through is worse: the result is a state in NO vocabulary — not TERMINAL, not ATTENTION, not a highlighted class — so the task disappears from /, /herdr and /api/summary instead of merely being mislabelled. A blocked worker whose hooks went quiet became invisible, which is the failure this whole change exists to end. herdr having no opinion is the same information as herdr being unreachable, so it gets the same answer: the stored copy, rendered with its `was ...` stale marker so nobody mistakes it for live."
     },
     {
       "name": "a pane list with no panes array is herdr not answering",
@@ -150,7 +150,7 @@
       "pane": "__noshape__",
       "done_event": false,
       "want": "running",
-      "why": "REVIEW FINDING: a partially-initialised or version-skewed server returns {\"result\":{}} with exit 0. The shell read that as 'this pane is absent' and derived `gone` for EVERY task \u2014 handing reconcile a fleet-wide verdict off a shape nothing verified. Unparseable is unreachable: fall back to stored."
+      "why": "REVIEW FINDING: a partially-initialised or version-skewed server returns {\"result\":{}} with exit 0. The shell read that as 'this pane is absent' and derived `gone` for EVERY task — handing reconcile a fleet-wide verdict off a shape nothing verified. Unparseable is unreachable: fall back to stored."
     },
     {
       "name": "a later non-_done line after the done event",
@@ -158,7 +158,7 @@
       "pane": "idle",
       "done_event": "trailing",
       "want": "stalled",
-      "why": "REVIEW P1: the anchor dated evidence by the bus FILE's mtime, so any later append \u2014 a progress note, a _start, anything not _done \u2014 made round one's stale completion look newer than a brief delivered after it. A worker that finished round one, took a review brief, wrote one line and went quiet read `completed`: PR #313's five dropped findings, reintroduced by the fix for them. Evidence is now dated by the EVENT; when it cannot be placed and an ask is on record, refuse to assume it answered THIS round."
+      "why": "REVIEW P1: the anchor dated evidence by the bus FILE's mtime, so any later append — a progress note, a _start, anything not _done — made round one's stale completion look newer than a brief delivered after it. A worker that finished round one, took a review brief, wrote one line and went quiet read `completed`: PR #313's five dropped findings, reintroduced by the fix for them. Evidence is now dated by the EVENT; when it cannot be placed and an ask is on record, refuse to assume it answered THIS round."
     },
     {
       "name": "unhashable pane_id",
@@ -166,7 +166,7 @@
       "pane": "__unhashable__",
       "done_event": false,
       "want": "gone",
-      "why": "REVIEW P1: pane_id is TEXT in the schema but the row can hold anything, and a list raised TypeError straight out of panes.get() \u2014 which Cached turned into an error dict, marking every task `gone` while herdr_reachable still reported True. Round one's 'the reader is now total' covered _pane_statuses, not the lookup."
+      "why": "REVIEW P1: pane_id is TEXT in the schema but the row can hold anything, and a list raised TypeError straight out of panes.get() — which Cached turned into an error dict, marking every task `gone` while herdr_reachable still reported True. Round one's 'the reader is now total' covered _pane_statuses, not the lookup."
     },
     {
       "name": "pane recycled since registration",
@@ -175,7 +175,7 @@
       "done_event": false,
       "want": "gone",
       "birth": "mismatch",
-      "why": "REVIEW P1: pane ids are RECYCLED (docs/control-plane-design.md, lib/push-wake.sh:20) and derived_state keyed liveness on the id alone, never fetching pane_birth \u2014 so a finished task could read `running` off a stranger that inherited the slot, or a live one read `stalled`. Every other guard here already compares the birth fingerprint before acting; the derivation must too."
+      "why": "REVIEW P1: pane ids are RECYCLED (docs/control-plane-design.md, lib/push-wake.sh:20) and derived_state keyed liveness on the id alone, never fetching pane_birth — so a finished task could read `running` off a stranger that inherited the slot, or a live one read `stalled`. Every other guard here already compares the birth fingerprint before acting; the derivation must too."
     },
     {
       "name": "pane birth matches",
@@ -185,6 +185,70 @@
       "want": "running",
       "birth": "match",
       "why": "the ordinary case: same slot, same process, status means what it says."
+    },
+    {
+      "name": "herdr says `unknown` + stored running",
+      "stored": "running",
+      "pane": "unknown",
+      "done_event": false,
+      "want": "running",
+      "why": "MEASURED: `herdr pane list` reported agent_status `unknown` for 12 of 14 live panes on this machine, and smart-name.sh:149 documents it as the normal result when an agent's turn-detection is quiet. It is herdr's most common answer, not an edge case, and it is not a task state."
+    },
+    {
+      "name": "herdr says `unknown` + stored blocked stays VISIBLE",
+      "stored": "blocked",
+      "pane": "unknown",
+      "done_event": false,
+      "want": "blocked",
+      "why": "The consequence that makes the row above load-bearing: with pass-through, a worker the registry knows is blocked vanished from every attention surface the moment herdr stopped having an opinion about its pane. Falling back keeps the person visible."
+    },
+    {
+      "name": "a freshly spawned worker is not an abandoned brief",
+      "stored": "starting",
+      "pane": "idle",
+      "done_event": false,
+      "want": "starting",
+      "why": "`starting` is a real registry state (lib/run-registry.sh:390) and a just-spawned pane is idle with no completion evidence — identical in shape to an abandoned brief. Deriving `stalled` put every new worker straight into Needs-attention, since `stalled` is an attention state."
+    },
+    {
+      "name": "empty stored state + idle + no evidence",
+      "stored": "",
+      "pane": "idle",
+      "done_event": false,
+      "want": "starting",
+      "why": "The registry's initial state is the empty string before the first transition; same reasoning as `starting`, and the table had no row for either, so both implementations agreed by accident."
+    },
+    {
+      "name": "input_required is a registry fact herdr cannot see",
+      "stored": "input_required",
+      "pane": "idle",
+      "done_event": "fresh",
+      "want": "input_required",
+      "why": "A task waiting on a formserve decision is waiting on a PERSON, which no pane status can express: the worker is legitimately idle and its last round's `_done` is fresh, so the derivation reported `completed` and the open decision left the attention list. Treated like the terminal states: owned by the registry, not overridable by liveness."
+    },
+    {
+      "name": "a bus whose last line has no trailing newline",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "no_newline",
+      "want": "completed",
+      "why": "The two implementations disagreed here and no row could see it: python's `for ln in fh` reads a final unterminated line, the shell's `while read` dropped it, so the same worker read `completed` on one surface and `stalled` on the other. The shell half is gone now; the row stays because a reader rewritten in any language must handle it."
+    },
+    {
+      "name": "a _done whose timestamp cannot be parsed, with an ask on record",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "undatable",
+      "want": "stalled",
+      "why": "The `trailing` row claimed to cover the undatable branch but its fixture carries no timestamp at all, so both implementations took the earlier `no evidence` path and the row passed for the wrong reason. This one carries a timestamp that fails ISO parsing, which is the only input that actually reaches `undatable`."
+    },
+    {
+      "name": "a _done whose timestamp cannot be parsed, with NO ask on record",
+      "stored": "running",
+      "pane": "idle",
+      "done_event": "undatable_no_ask",
+      "want": "completed",
+      "why": "The other half of the undatable decision, also untested: with nothing on record to compare against, refusing would call every un-timestamped completion an abandonment."
     }
   ]
 }
