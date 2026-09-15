@@ -75,6 +75,17 @@ put_hook "$R_OWN" pre-commit '#!/usr/bin/env bash' 'npm run lint || exit 1' \
 R_NONE="$(mk_repo no-scan)"
 put_hook "$R_NONE" pre-commit '#!/usr/bin/env bash' 'echo lint-only'
 
+# A repo that REDIRECTS its hooks with core.hooksPath. git then ignores
+# `.git/hooks` entirely, so a hook written there is installed, executable,
+# counted as coverage — and never runs. Same failure shape as a shim pointing
+# into a deleted worktree, one config key over.
+R_REDIR="$(mk_repo hooks-redirected)"
+mkdir -p "$R_REDIR/.githooks"
+git -C "$R_REDIR" config core.hooksPath "$R_REDIR/.githooks"
+printf '#!/usr/bin/env bash\nexec bash ~/.claude/hooks/secret-scan-pre-commit.sh\n' \
+    > "$R_REDIR/.githooks/pre-commit"
+chmod +x "$R_REDIR/.githooks/pre-commit"
+
 # Not a git repository, and a linked worktree of shim-expanded.
 mkdir -p "$ROOT/just-a-dir"
 git -C "$R_EXPANDED" -c user.email=tnt@teamthurber.com -c user.name=t commit -q \
@@ -129,6 +140,20 @@ run --apply
 grep -qF -- "--push" "$R_HOME/.git/hooks/pre-push" \
     && ok "a pre-push shim missing --push is repaired on the next --apply" \
     || bad "left a pre-push shim running the index scan"
+# core.hooksPath: the hooks must land where GIT looks, not where we assume.
+if [ -x "$R_REDIR/.githooks/pre-commit" ] && grep -qF "$DEPLOYED" "$R_REDIR/.githooks/pre-commit"; then
+    ok "a core.hooksPath repo is guarded in the dir git actually reads"
+else
+    bad "wrote to .git/hooks in a repo that redirects hooksPath: $(cat "$R_REDIR/.githooks/pre-commit" 2>/dev/null)"
+fi
+[ -x "$R_REDIR/.githooks/pre-push" ] && grep -qF -- "--push" "$R_REDIR/.githooks/pre-push" \
+    && ok "and its push path too" || bad "core.hooksPath repo has no working pre-push"
+[ ! -e "$R_REDIR/.git/hooks/pre-commit" ] \
+    && ok "and NOTHING was written to the dir git ignores" \
+    || bad "installed a hook git will never run (.git/hooks with hooksPath set)"
+printf '%s' "$OUT" | grep -q 'core.hooksPath ->' \
+    && ok "the redirect is reported, not silently followed" \
+    || bad "followed a hooksPath redirect without saying so"
 
 printf '== what it must NOT touch ==\n'
 grep -q 'npm run lint' "$R_OWN/.git/hooks/pre-commit" \
@@ -161,7 +186,9 @@ run --apply
 # adding the third hook per repo (pre-push, the one that closes `git am` and
 # the sequencer paths) failed this suite on an incidental constant instead of
 # on any behaviour. Each opted-in repo contributes one row per hook it carries.
-on_disk=$(find "$ROOT" -path '*/.git/hooks/*' -type f \
+# Any hooks dir, not just `.git/hooks`: one fixture redirects core.hooksPath,
+# and the count has to follow the installer's own resolution.
+on_disk=$(find "$ROOT" -type f \
           \( -name pre-commit -o -name pre-merge-commit -o -name pre-push \) \
           -exec grep -lF "$DEPLOYED" {} + 2>/dev/null | wc -l | tr -d ' ')
 printf '%s' "$OUT" | grep -q "changed=0 unchanged=$on_disk" \

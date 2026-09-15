@@ -250,15 +250,29 @@ for d in "$ROOT"/*/; do
     printf '  .  %-44s worktree — covered by its parent repo\n' "$(basename "$repo")"
     continue
   fi
-  pc="$repo/.git/hooks/pre-commit"
-  pmc="$repo/.git/hooks/pre-merge-commit"
+  # The hooks dir GIT WILL USE, not the one we assume. `core.hooksPath`
+  # redirects it repo-wide, and a hook written to `.git/hooks` in a repo that
+  # sets it is a file git never runs — installed, executable, reported as
+  # coverage, and dead. Exactly the failure shape as this morning's shims
+  # pointing into a deleted worktree, one config key over. `rev-parse
+  # --git-path hooks` is the only answer that accounts for it (measured: it
+  # resolves tg-portal's to tourguide's, which is what git does).
+  hooks_dir="$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null)"
+  [ -n "$hooks_dir" ] || hooks_dir="$repo/.git/hooks"
+  case "$hooks_dir" in /*) ;; *) hooks_dir="$repo/$hooks_dir" ;; esac
+  if [ "$hooks_dir" != "$repo/.git/hooks" ]; then
+    # Visible, because it means another directory owns this repo's guard.
+    printf '  i  %-44s core.hooksPath -> %s\n' "$(basename "$repo")" "$hooks_dir"
+  fi
+  pc="$hooks_dir/pre-commit"
+  pmc="$hooks_dir/pre-merge-commit"
   # THREE hooks, because `pre-commit` and `pre-merge-commit` are only run when
   # `git commit` creates the commit. `git am`, `cherry-pick`, `revert` and
   # every `rebase` replay write commits without running either, so those paths
   # were unscanned — and there is no GitHub push protection behind them
   # (private repos, paid feature). `pre-push` closes the class: however a
   # commit was made, it has to be pushed to leave the machine.
-  pp="$repo/.git/hooks/pre-push"
+  pp="$hooks_dir/pre-push"
 
   # Only repos ALREADY running the scan on ordinary commits. A repo without it
   # has made a different choice and opting it in is not this script's call.
@@ -282,8 +296,13 @@ tracked=0 legacy=0 unguarded=0
 for d in "$ROOT"/*/; do
   repo="${d%/}"
   [ -d "$repo/.git" ] || continue
-  pc="$repo/.git/hooks/pre-commit"; pmc="$repo/.git/hooks/pre-merge-commit"
-  pp="$repo/.git/hooks/pre-push"
+  # Same resolution as the install loop: verifying `.git/hooks` in a repo that
+  # redirects `core.hooksPath` would report a guard that git never runs.
+  hooks_dir="$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null)"
+  [ -n "$hooks_dir" ] || hooks_dir="$repo/.git/hooks"
+  case "$hooks_dir" in /*) ;; *) hooks_dir="$repo/$hooks_dir" ;; esac
+  pc="$hooks_dir/pre-commit"; pmc="$hooks_dir/pre-merge-commit"
+  pp="$hooks_dir/pre-push"
   grep -q "secret-scan" "$pc" 2>/dev/null || grep -q "secret-scan" "$pmc" 2>/dev/null || continue
   all=1
   for h in "$pc" "$pmc" "$pp"; do [ -x "$h" ] || all=0; done
