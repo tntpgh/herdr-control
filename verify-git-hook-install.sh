@@ -106,6 +106,29 @@ done
     && ok "a MISSING pre-merge-commit is created (the merge path was unscanned)" \
     || bad "pre-merge-commit not installed where absent"
 [ -x "$R_TILDE/.git/hooks/pre-commit" ] && ok "written hooks are executable" || bad "hook not executable"
+# The THIRD hook. `pre-commit`/`pre-merge-commit` only fire when `git commit`
+# creates the commit, so `git am`, `cherry-pick`, `revert` and every `rebase`
+# replay wrote commits no scan ever read. `pre-push` is where that class is
+# caught, and it MUST carry `--push`: the same shim without the flag runs the
+# INDEX scan during a push, where the index is unrelated to what is being sent
+# — it would exit 0 on a clean index and read as a guard that is working.
+if [ -x "$R_HOME/.git/hooks/pre-push" ] && grep -qF "$DEPLOYED" "$R_HOME/.git/hooks/pre-push"; then
+    ok "pre-push is installed (git am / cherry-pick / rebase are commit-hook-free)"
+else
+    bad "pre-push not installed: $(cat "$R_HOME/.git/hooks/pre-push" 2>/dev/null)"
+fi
+grep -qF -- "--push" "$R_HOME/.git/hooks/pre-push" 2>/dev/null \
+    && ok "and it execs the scanner in PUSH mode, not index mode" \
+    || bad "pre-push shim is missing --push: $(cat "$R_HOME/.git/hooks/pre-push" 2>/dev/null)"
+# A shim pointing at the right scanner WITHOUT the flag must be treated as
+# needing a rewrite, not as already correct — otherwise a half-installed guard
+# survives every future --apply.
+printf '#!/usr/bin/env bash\nexec bash %s\n' "$DEPLOYED" > "$R_HOME/.git/hooks/pre-push"
+chmod +x "$R_HOME/.git/hooks/pre-push"
+run --apply
+grep -qF -- "--push" "$R_HOME/.git/hooks/pre-push" \
+    && ok "a pre-push shim missing --push is repaired on the next --apply" \
+    || bad "left a pre-push shim running the index scan"
 
 printf '== what it must NOT touch ==\n'
 grep -q 'npm run lint' "$R_OWN/.git/hooks/pre-commit" \
@@ -133,9 +156,17 @@ snapshot="$(cat "$R_EXPANDED/.git/hooks/pre-commit")"
 run --apply
 [ "$(cat "$R_EXPANDED/.git/hooks/pre-commit")" = "$snapshot" ] \
     && ok "a second --apply changes nothing" || bad "re-run rewrote an already-correct hook"
-printf '%s' "$OUT" | grep -q 'changed=0 unchanged=7' \
-    && ok "re-run reports 0 changed, 7 already correct" \
-    || bad "re-run counts wrong: $(printf '%s' "$OUT" | grep 'this run')"
+# `changed=0` is the idempotence claim. The companion count is COMPUTED from
+# what is on disk rather than hardcoded: it was pinned at `unchanged=7`, so
+# adding the third hook per repo (pre-push, the one that closes `git am` and
+# the sequencer paths) failed this suite on an incidental constant instead of
+# on any behaviour. Each opted-in repo contributes one row per hook it carries.
+on_disk=$(find "$ROOT" -path '*/.git/hooks/*' -type f \
+          \( -name pre-commit -o -name pre-merge-commit -o -name pre-push \) \
+          -exec grep -lF "$DEPLOYED" {} + 2>/dev/null | wc -l | tr -d ' ')
+printf '%s' "$OUT" | grep -q "changed=0 unchanged=$on_disk" \
+    && ok "re-run reports 0 changed and $on_disk already correct" \
+    || bad "re-run counts wrong (expected unchanged=$on_disk): $(printf '%s' "$OUT" | grep 'this run')"
 # The backup must still be the ORIGINAL hook, not this script's own output —
 # otherwise --undo restores an install instead of undoing one.
 grep -qF 'secret-scan-pre-commit.sh' "$R_TILDE/.git/hooks/pre-commit$(printf '.pre-herdr-guard')" \

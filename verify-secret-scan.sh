@@ -404,6 +404,152 @@ printf '%s' "$OUT" | grep -q "$WANT_EMAIL" \
     && ok "the identity refusal names the expected address" \
     || bad "identity refusal is not actionable: $OUT"
 
+# ═════════════════════════════════════════════════════════════════════════════
+printf '== PUSH MODE: the paths that never run a commit hook ==\n'
+# `pre-commit` and `pre-merge-commit` are the ONLY hooks git runs when `git
+# commit` creates a commit. `git am`, `cherry-pick`, `revert` and every
+# `rebase` replay write commits without running either, and this fleet has no
+# GitHub push protection behind them (private repos, paid feature). Each of
+# those paths was a free pass for a credential, and the only place to catch the
+# CLASS rather than the cases is `pre-push`: however a commit was made, it has
+# to be pushed to leave the machine.
+#
+# These drive the REAL hook through a REAL `git push` to a local bare remote,
+# with all three hooks installed — not by calling the scanner directly, because
+# what is under test includes git's own pre-push stdin protocol.
+push_repo() {                   # -> prints path to a repo with 3 hooks + a remote
+    local r bare
+    r="$(new_repo)"
+    bare="$(mktemp -d "$WORK/bare.XXXXXX")"
+    {
+        git -C "$bare" init -q --bare
+        git -C "$r" remote add origin "$bare"
+        mkdir -p "$r/.git/hooks"
+        printf '#!/usr/bin/env bash\nexec bash %s\n' "$HOOK" > "$r/.git/hooks/pre-commit"
+        printf '#!/usr/bin/env bash\nexec bash %s\n' "$HOOK" > "$r/.git/hooks/pre-merge-commit"
+        printf '#!/usr/bin/env bash\nexec bash %s --push\n' "$HOOK" > "$r/.git/hooks/pre-push"
+        chmod +x "$r/.git/hooks/pre-commit" "$r/.git/hooks/pre-merge-commit" "$r/.git/hooks/pre-push"
+        git -C "$r" push -q origin main
+    } >&2
+    printf '%s' "$r"
+}
+
+pushes() {                      # <repo> <label> [refspec] — push MUST succeed
+    local r="$1" label="$2" ref="${3:-main}"
+    if OUT="$(git -C "$r" push origin "$ref" 2>&1)"; then
+        ok "$label"
+    else
+        bad "$label — BLOCKED: $OUT"
+    fi
+}
+
+refuses_push() {                # <repo> <label> — push MUST be refused
+    local r="$1" label="$2"
+    if OUT="$(git -C "$r" push origin main 2>&1)"; then
+        bad "$label — ALLOWED (hook output: ${OUT:-<silent>})"
+    else
+        ok "$label"
+    fi
+}
+
+# cherry-pick: git runs NO commit-creation hook, so the token lands locally.
+R="$(push_repo)"
+git -C "$R" switch -q -c side
+printf 'GITHUB_TOKEN = "%s"\n' "$GHP" > "$R/creds.sh"
+git -C "$R" add creds.sh
+git -C "$R" commit -qm "token" --no-verify
+SIDE="$(git -C "$R" rev-parse HEAD)"
+git -C "$R" switch -q main
+git -C "$R" cherry-pick "$SIDE" >/dev/null 2>&1
+refuses_push "$R" "a CHERRY-PICKED secret is refused at push"
+printf '%s' "$OUT" | grep -q "rotate at the provider" \
+    && ok "the push refusal says to rotate FIRST" \
+    || bad "push refusal is not actionable: $OUT"
+
+# git am: runs applypatch hooks only, never pre-commit.
+R="$(push_repo)"
+git -C "$R" switch -q -c patchsrc
+printf 'AWS_KEY = "%s"\n' "$AWS" > "$R/creds.sh"
+git -C "$R" add creds.sh
+git -C "$R" commit -qm "token via patch" --no-verify
+git -C "$R" format-patch -1 -o "$R/patches" -q
+git -C "$R" switch -q main
+git -C "$R" am "$R"/patches/*.patch >/dev/null 2>&1
+refuses_push "$R" "a secret applied with git am is refused at push"
+
+# Add-then-remove: the TIP is clean, the history being published is not. Only a
+# per-commit scan sees this; reading the tip would call it clean.
+R="$(push_repo)"
+printf 'GITHUB_TOKEN = "%s"\n' "$GHP" > "$R/creds.sh"
+git -C "$R" add creds.sh
+git -C "$R" commit -qm "oops" --no-verify
+printf 'GITHUB_TOKEN = "$(op read op://secrets/x/credential)"\n' > "$R/creds.sh"
+git -C "$R" add creds.sh
+git -C "$R" commit -qm "use op:// instead" --no-verify
+if grep -q "$GHP" "$R/creds.sh"; then
+    bad "fixture wrong: the tip still holds the token"
+else
+    ok "the tip is clean, so only a per-commit scan can see this"
+fi
+refuses_push "$R" "a secret added and later removed is still refused at push"
+
+# Client PII on the same path: the higher-consequence half of this hook.
+R="$(push_repo)"
+printf 'buyer_phone = "%s"\n' "$BADPHONE" > "$R/lead.py"
+git -C "$R" add lead.py
+git -C "$R" commit -qm "lead" --no-verify
+refuses_push "$R" "client PII in a pushed commit is refused"
+
+# A commit MESSAGE that merely mentions a token shape is not a committed
+# secret, and blocking it has no compliant fix short of rewriting history — so
+# the scan must read the diff, not the log header.
+R="$(push_repo)"
+printf 'nothing secret\n' > "$R/notes.md"
+git -C "$R" add notes.md
+git -C "$R" commit -qm "remove the $GHP token from settings" --no-verify
+pushes "$R" "a token shape in the COMMIT MESSAGE does not block the push"
+
+# Controls: a guard that blocks ordinary work gets bypassed.
+R="$(push_repo)"
+printf '# notes\nop://secrets/thing/credential\n' > "$R/notes.md"
+git -C "$R" add notes.md
+git -C "$R" commit -qm "notes" --no-verify
+pushes "$R" "a clean push is allowed"
+
+# A NEW branch must not rescan history back to the root: on the first push of
+# any branch that would block on anything historical, with no compliant path.
+# Only commits the remote does not already have are in scope.
+R="$(push_repo)"
+printf 'GITHUB_TOKEN = "%s"\n' "$GHP" > "$R/old.sh"
+git -C "$R" add old.sh
+git -C "$R" commit -qm "historical secret, already published" --no-verify
+git -C "$R" push -q --no-verify origin main
+git -C "$R" switch -q -c feature
+printf 'clean\n' > "$R/new.txt"
+git -C "$R" add new.txt
+git -C "$R" commit -qm "clean work" --no-verify
+pushes "$R" "a NEW branch is scanned for its OWN commits, not all history" feature
+
+# Deleting a remote branch pushes no content. An unguarded range here would
+# resolve to "everything".
+if OUT="$(git -C "$R" push origin --delete feature 2>&1)"; then
+    ok "deleting a remote branch is not scanned as a range"
+else
+    bad "branch deletion was refused: $OUT"
+fi
+
+# Index mode is unchanged: the identity check still fires on a commit, and must
+# NOT fire on a push — a pushed range can hold commits whose author is already
+# public and unfixable (648 of them in knowledge-base), so enforcing it there
+# has no compliant path and would only teach --no-verify.
+R="$(push_repo)"
+git -C "$R" config user.email "thurbs@users.noreply.github.com"
+printf 'clean\n' > "$R/ok.txt"
+git -C "$R" add ok.txt
+blocks "$R" "index mode still refuses the wrong commit identity"
+git -C "$R" commit -qm "wrong identity" --no-verify
+pushes "$R" "push mode does NOT enforce commit identity"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi

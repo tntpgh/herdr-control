@@ -38,8 +38,45 @@ set -euo pipefail
 # exactly how an empty list becomes a silent pass. verify-secret-scan.sh greps
 # for any `--diff-filter=` in this file that is not "$DIFF_FILTER".
 DIFF_FILTER=d
-STAGED=$(git diff --cached --name-only --diff-filter="$DIFF_FILTER" 2>/dev/null)
-[[ -z "$STAGED" ]] && exit 0
+# ── what this scans: the INDEX, or a pushed RANGE ────────────────────────────
+# `pre-commit` and `pre-merge-commit` are the only hooks git runs when a commit
+# is CREATED by `git commit`. They are not run by:
+#
+#   git am              (runs applypatch-msg / pre-applypatch / post-applypatch)
+#   git cherry-pick     (no commit-creation hook at all)
+#   git revert          (same)
+#   git rebase          (same, for every commit it replays)
+#
+# So every one of those paths wrote commits this guard never read. `git am` of
+# a patch carrying a credential, or a cherry-pick of a commit made in a repo
+# whose hooks were not installed, landed unscanned — and the fleet has no
+# GitHub push protection to catch it on the far side (private repos, paid
+# feature, verified 2026-07-30).
+#
+# `--push` closes the class rather than the cases: whatever created a commit,
+# it has to be pushed to leave this machine. Hooked to `pre-push`, this reads
+# git's stdin protocol (`<local ref> <local sha> <remote ref> <remote sha>`)
+# and scans every commit being sent that the remote does not already have.
+#
+# Two deliberate differences from index mode, both because the subject is
+# different:
+#
+#   * It scans ADDED LINES per commit, not file content at the tip. A secret
+#     added in one commit and removed in a later one is still in the history
+#     being published — reading only the tip would call that clean.
+#   * It does NOT check author identity. In the index the fix is `git config`
+#     plus `--amend`; in a range the offending commits may be years old and
+#     already public (knowledge-base carries 648 commits attributed to another
+#     account), so enforcing it here would block every push of that branch
+#     forever, with no compliant path. A guard with no compliant path gets
+#     bypassed, which costs more than the drift it was watching.
+SCAN_MODE=index
+if [[ "${1:-}" == "--push" ]]; then SCAN_MODE=push; fi
+
+if [[ "$SCAN_MODE" == index ]]; then
+    STAGED=$(git diff --cached --name-only --diff-filter="$DIFF_FILTER" 2>/dev/null)
+    [[ -z "$STAGED" ]] && exit 0
+fi
 
 # ── commit identity ──────────────────────────────────────────────────────────
 # Every repo here belongs to the `tntpgh` GitHub account, so every commit must
@@ -57,9 +94,11 @@ STAGED=$(git diff --cached --name-only --diff-filter="$DIFF_FILTER" 2>/dev/null)
 # Runs before the secret scan on purpose: attribution is cheap to check and the
 # fix is one command, so there is no reason to make someone wait for a full
 # content scan to be told their identity is wrong.
+# Index mode only — see the SCAN_MODE header for why a pushed range cannot
+# enforce this without becoming unbypassable.
 WANT_EMAIL="tnt@teamthurber.com"
 HAVE_EMAIL="$(git config user.email || true)"
-if [[ "$HAVE_EMAIL" != "$WANT_EMAIL" ]]; then
+if [[ "$SCAN_MODE" == index && "$HAVE_EMAIL" != "$WANT_EMAIL" ]]; then
     echo "BLOCKED: commit author email is '${HAVE_EMAIL:-<unset>}', expected '$WANT_EMAIL'."
     echo "  Every repo here is under the tntpgh GitHub account; a different address"
     echo "  attributes the commit to another account and cannot be corrected later"
@@ -128,6 +167,76 @@ PATTERNS=(
 SKIP_EXT='\.(pyc|pyo|pyd|png|jpg|jpeg|gif|svg|ico|pdf|woff2?|eot|ttf|otf|zip|tar|gz|bin)$'
 
 FOUND=0
+
+# ── push mode ────────────────────────────────────────────────────────────────
+# Reached only from `pre-push`. Scans the ADDED LINES of every commit being
+# sent that the remote does not already have, with the same PATTERNS above —
+# one pattern list, two content sources, so a pattern fixed for commits is
+# fixed for pushes in the same edit.
+if [[ "$SCAN_MODE" == push ]]; then
+    PUSH_FOUND=0
+    scan_commit() {
+        local c="$1" added st
+        # -U0: added lines only. `--format=` suppresses the log header, whose
+        # own subject/body text would otherwise be scanned as content — a
+        # commit MESSAGE mentioning a token shape is not a committed secret,
+        # and blocking on it has no compliant fix short of rewriting history.
+        added=$(git show "$c" -U0 --format= --diff-filter="$DIFF_FILTER" 2>/dev/null \
+                | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^\+//' || true)
+        [[ -z "$added" ]] && return 0
+        local pattern
+        for pattern in "${PATTERNS[@]}"; do
+            set +e +o pipefail
+            printf '%s\n' "$added" | grep -qE -- "$pattern"
+            st=("${PIPESTATUS[@]}")
+            set -e -o pipefail
+            if [ "${st[1]}" -eq 0 ]; then
+                # The commit, not just the pattern: in a range the operator
+                # needs to know WHICH commit to rewrite, and `git log --oneline`
+                # on a sha is the next command either way.
+                echo "BLOCKED: potential secret in commit $(git log -1 --format='%h %s' "$c" 2>/dev/null || echo "$c")"
+                echo "         (pattern: $pattern)"
+                PUSH_FOUND=1
+            elif [ "${st[1]}" -gt 1 ]; then
+                # Same reasoning as the index loop: a scanner that cannot run
+                # its own pattern has not cleared anything.
+                echo "BLOCKED: grep failed on commit $c (exit ${st[1]}, pattern: $pattern) —" >&2
+                echo "  refusing to treat an unscannable commit as clean." >&2
+                PUSH_FOUND=1
+            fi
+        done
+    }
+    # git's pre-push protocol: one line per ref, on stdin.
+    PUSH_COMMITS=""
+    while read -r _lref lsha _rref rsha; do
+        # A deleted ref pushes nothing. `git push --delete` sends an all-zero
+        # LOCAL sha; scanning it would resolve to nothing and, worse, an
+        # unguarded `$lsha..` range would silently mean "everything".
+        [[ -z "${lsha:-}" || "$lsha" =~ ^0+$ ]] && continue
+        range=""
+        if [[ -z "${rsha:-}" || "$rsha" =~ ^0+$ ]]; then
+            # A NEW branch on the remote. The range is not `$lsha` alone —
+            # that is the branch's entire history back to the root, so the
+            # first push of any branch would rescan years of commits and
+            # block on anything historical, with no compliant path. Exclude
+            # everything the remote already has.
+            range=$(git rev-list --no-merges "$lsha" --not --remotes 2>/dev/null || true)
+        else
+            range=$(git rev-list --no-merges "$rsha..$lsha" 2>/dev/null || true)
+        fi
+        for commit in $range; do
+            scan_commit "$commit"
+            PUSH_COMMITS="$PUSH_COMMITS $commit"
+        done
+    done
+    # The PII checks are shared: this falls through to them with the pushed
+    # commits in PUSH_COMMITS, rather than carrying a second copy of three
+    # regexes that would drift from the index copy. The index file-walk and
+    # `git diff --cached` below are skipped — on a push, whatever happens to
+    # be staged is unrelated to what is being sent.
+fi
+
+if [[ "$SCAN_MODE" == index ]]; then
 # NUL-delimited, not `for FILE in $STAGED` — an unquoted word-split loop
 # silently skips (git show falls through 2>/dev/null into "no output") any
 # staged path containing whitespace, which is a general bypass: stage a
@@ -192,6 +301,7 @@ while IFS= read -r -d '' FILE; do
         fi
     done
 done < <(git diff --cached -z --name-only --diff-filter="$DIFF_FILTER" 2>/dev/null)
+fi
 
 # ── client PII ───────────────────────────────────────────────────────────────
 # Credentials were never the bigger body. A 2026-09-03 audit found 1,409
@@ -220,15 +330,37 @@ PII_FOUND=0
 # relaxes the PII checks ONLY: the credential scan above walks every staged
 # file independently of $ADDED, so a token pasted here is still blocked
 # (proven on a real negative, 2026-09-06).
-ADDED="$(git diff --cached -U0 --diff-filter="$DIFF_FILTER" \
-         -- . ':(exclude)src/data/propx-*.json' \
-              ':(exclude)src/data/price-band-evidence.json' \
-              ':(exclude)src/data/sold-subdivision-context.json' \
-              ':(exclude)cloudflare/worker/wrangler*.toml' \
-              ':(exclude)**/package-lock.json' ':(exclude)package-lock.json' \
-              ':(exclude)**/yarn.lock' ':(exclude)**/pnpm-lock.yaml' \
-              2>/dev/null \
-         | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^\+//' || true)"
+# ONE exclusion list, used by both content sources (the index here, a pushed
+# commit in push mode). Two copies of a pathspec is how the modes come to
+# disagree about what counts as client PII.
+PII_EXCLUDES=(
+    -- .
+    ':(exclude)src/data/propx-*.json'
+    ':(exclude)src/data/price-band-evidence.json'
+    ':(exclude)src/data/sold-subdivision-context.json'
+    ':(exclude)cloudflare/worker/wrangler*.toml'
+    ':(exclude)**/package-lock.json' ':(exclude)package-lock.json'
+    ':(exclude)**/yarn.lock' ':(exclude)**/pnpm-lock.yaml'
+)
+if [[ "$SCAN_MODE" == push ]]; then
+    # The same added lines, from the commits being pushed. Client PII reaching
+    # the remote is the higher-consequence half of this hook (a 2026-09-03
+    # audit found 1,409 identities in knowledge-base history), and `git am`,
+    # `cherry-pick`, `revert` and every `rebase` replay reach the remote
+    # without ever running a commit-creation hook. Only commits the remote
+    # does not already have are in PUSH_COMMITS, so this cannot fire on
+    # published history and become unbypassable.
+    ADDED=""
+    for _c in $PUSH_COMMITS; do
+        ADDED="$ADDED
+$(git show "$_c" -U0 --format= --diff-filter="$DIFF_FILTER" "${PII_EXCLUDES[@]}" 2>/dev/null \
+  | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^\+//' || true)"
+    done
+else
+    ADDED="$(git diff --cached -U0 --diff-filter="$DIFF_FILTER" \
+             "${PII_EXCLUDES[@]}" 2>/dev/null \
+             | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^\+//' || true)"
+fi
 # Lockfiles are excluded from the PII checks only. npm records each package
 # MAINTAINER's address (maintainer@example.com and friends), published metadata, not
 # client PII, and it arrives whenever a dependency is added. Blocking it teaches
@@ -296,6 +428,40 @@ if [[ -n "$ADDED" ]]; then
         echo "BLOCKED: a third-party EMAIL ADDRESS is being added."
         PII_FOUND=1
     fi
+fi
+
+# One verdict per mode, so the advice matches what the operator can actually
+# do: an index finding is fixed by editing the file before committing, a push
+# finding needs the credential rotated FIRST — it is already in local history
+# and a rewrite does not un-leak anything that was already pushed.
+if [[ "$SCAN_MODE" == push ]]; then
+    if [[ $PII_FOUND -ne 0 ]]; then
+        echo ""
+        echo "Push blocked: a commit being pushed adds client PII, and pushing"
+        echo "publishes it to every future clone."
+        echo "  fixtures: use 555-0100..555-0199, someone@example.com, 123 Main St"
+        echo "  real data: keep it in the DB or a gitignored path"
+        echo "  rewrite the commit (git rebase -i <sha>^), do not push past this"
+        echo "If this is genuinely synthetic, extend the allowlist in this hook."
+        exit 1
+    fi
+    if [[ ${PUSH_FOUND:-0} -ne 0 ]]; then
+        echo ""
+        echo "Push blocked: the commits above carry a hardcoded secret, and"
+        echo "pushing publishes history — a rewrite afterwards is not a fix,"
+        echo "the credential is already out."
+        echo "  rotate at the provider FIRST, then rewrite the commit:"
+        echo "    git rebase -i <sha>^     # edit it out, then push again"
+        echo "  store the new value in 1Password and reference it via op://"
+        echo "If this is a false positive, extend PATTERNS in this hook rather"
+        echo "than using --no-verify, so the next person is protected too."
+        exit 1
+    fi
+    # Chain to a repo-specific pre-push hook if one exists.
+    if [[ -x "$(git rev-parse --git-path hooks/pre-push.local 2>/dev/null)" ]]; then
+        exec "$(git rev-parse --git-path hooks/pre-push.local)"
+    fi
+    exit 0
 fi
 
 if [[ $PII_FOUND -ne 0 ]]; then

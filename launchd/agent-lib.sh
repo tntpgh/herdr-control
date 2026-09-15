@@ -97,14 +97,38 @@ agent_status() {
 # A 401 from auth-gateway/auth-broker is HEALTHY: the listener is up and
 # refusing an unauthenticated probe. Reading 401 as "down" is the standing
 # false alarm here, so expected codes are always explicit.
+#
+# This WAITS for readiness instead of asking once. `restart.sh` called it
+# immediately after `launchctl kickstart` returned, and kickstart returning
+# means the process was SPAWNED, not that it is listening — so a healthy
+# restart printed DOWN, exited nonzero, and told the operator to reinstall a
+# fleet that was fine two seconds later. That is the same false alarm the
+# start-order fix below removed from the auth pair, arriving by a different
+# route: a --verify that cries wolf teaches you to ignore the one field that
+# would show a real crash.
+#
+# A process that is already up answers on the first attempt, so the ordinary
+# read-only `--verify` path is not slowed down at all. PROBE_READY_SECS=0
+# restores the old single-shot behaviour.
 probe_http() {
   local name="$1" url="$2"; shift 2
-  local want=" $* " code
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null)
-  if [[ "$want" == *" $code "* ]]; then
-    echo "  UP   $name ($url -> $code)"; return 0
-  fi
-  echo "  DOWN $name ($url -> ${code:-no response}; wanted: $*)" >&2; return 1
+  local want=" $* " code waited=0 budget="${PROBE_READY_SECS:-20}"
+  while :; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null)
+    if [[ "$want" == *" $code "* ]]; then
+      if [ "$waited" -gt 0 ]; then
+        echo "  UP   $name ($url -> $code, ready after ${waited}s)"
+      else
+        echo "  UP   $name ($url -> $code)"
+      fi
+      return 0
+    fi
+    [ "$waited" -ge "$budget" ] && break
+    sleep 1; waited=$((waited + 1))
+  done
+  local note=""
+  [ "$budget" -gt 0 ] && note=" after ${budget}s"
+  echo "  DOWN $name ($url -> ${code:-no response}; wanted: $*)$note" >&2; return 1
 }
 
 # The services, in start order, with their health probes.

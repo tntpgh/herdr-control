@@ -129,8 +129,14 @@ deploy_scanner() {
   mv -f "$tmp" "$HOOK_DEPLOY" || return 1
 }
 
-hook_body() {
-  printf '#!/usr/bin/env bash\n%s\nexec bash %q\n' "$MARK" "$HOOK_DEPLOY"
+# The shim is one exec, so the scanner is never copied into a repo. Extra
+# argv (pre-push passes `--push`) is appended verbatim; `exec` keeps stdin, and
+# pre-push's ref list arrives THERE, not in argv.
+hook_body() {                             # [extra scanner args...]
+  printf '#!/usr/bin/env bash\n%s\nexec bash %q' "$MARK" "$HOOK_DEPLOY"
+  local a
+  for a in "$@"; do printf ' %q' "$a"; done
+  printf '\n'
 }
 
 [ "$MODE" = dry ] && echo "DRY RUN — nothing will be changed. Re-run with --apply."
@@ -166,21 +172,30 @@ ours() {                                  # <hook path>
   return 0
 }
 
-already_ours() {                          # <hook path> — already correct
+already_ours() {                          # <hook path> [required extra arg]
   # Compare against the DEPLOYED path, which is what a correct shim execs. This
   # tested $HOOK_SRC (the in-tree source) and so reported every hook as needing
   # a rewrite on a second --apply — idempotence the suite checks by asserting
   # `changed=0 unchanged=7`.
-  [ -f "$1" ] && grep -qF "$HOOK_DEPLOY" "$1"
+  #
+  # The second argument matters for pre-push: a shim that execs the right
+  # scanner WITHOUT `--push` runs the index scan on a push, where the index is
+  # unrelated to what is being sent — it would exit 0 on staged-nothing and
+  # read as a guard that is present and working. Treat it as needing a rewrite.
+  [ -f "$1" ] || return 1
+  grep -qF "$HOOK_DEPLOY" "$1" || return 1
+  [ -n "${2:-}" ] && { grep -qF -- "$2" "$1" || return 1; }
+  return 0
 }
 
 installed=0 skipped=0 restored=0 foreign=0 noscan=0 worktrees=0 notrepo=0
 
-place_hook() {                            # <repo> <hook path> <hook name>
+place_hook() {                            # <repo> <hook path> <hook name> [scanner args...]
   local repo="$1" hk="$2" name="$3" b="$2$BACKUP_SUFFIX"
   local label="$(basename "$repo")/$name"
+  shift 3
 
-  if already_ours "$hk"; then
+  if already_ours "$hk" "${1:-}"; then
     skipped=$((skipped+1)); printf '  =  %-44s already points at this checkout\n' "$label"; return
   fi
   if [ -f "$hk" ] && ! ours "$hk"; then
@@ -198,7 +213,7 @@ place_hook() {                            # <repo> <hook path> <hook name>
   # Overwriting it on a re-run would replace the user's original hook with our
   # own, so --undo would restore this script's output instead of undoing it.
   if [ -f "$hk" ] && [ ! -e "$b" ]; then cp -p "$hk" "$b"; fi
-  hook_body > "$hk"
+  hook_body "$@" > "$hk"
   chmod +x "$hk"
   installed=$((installed+1)); printf '  +  %-44s installed\n' "$label"
 }
@@ -237,6 +252,13 @@ for d in "$ROOT"/*/; do
   fi
   pc="$repo/.git/hooks/pre-commit"
   pmc="$repo/.git/hooks/pre-merge-commit"
+  # THREE hooks, because `pre-commit` and `pre-merge-commit` are only run when
+  # `git commit` creates the commit. `git am`, `cherry-pick`, `revert` and
+  # every `rebase` replay write commits without running either, so those paths
+  # were unscanned — and there is no GitHub push protection behind them
+  # (private repos, paid feature). `pre-push` closes the class: however a
+  # commit was made, it has to be pushed to leave the machine.
+  pp="$repo/.git/hooks/pre-push"
 
   # Only repos ALREADY running the scan on ordinary commits. A repo without it
   # has made a different choice and opting it in is not this script's call.
@@ -247,8 +269,10 @@ for d in "$ROOT"/*/; do
   fi
 
   case "$MODE" in
-    undo) undo_hook "$repo" "$pc" pre-commit; undo_hook "$repo" "$pmc" pre-merge-commit ;;
-    *)    place_hook "$repo" "$pc" pre-commit; place_hook "$repo" "$pmc" pre-merge-commit ;;
+    undo) undo_hook "$repo" "$pc" pre-commit; undo_hook "$repo" "$pmc" pre-merge-commit
+          undo_hook "$repo" "$pp" pre-push ;;
+    *)    place_hook "$repo" "$pc" pre-commit; place_hook "$repo" "$pmc" pre-merge-commit
+          place_hook "$repo" "$pp" pre-push --push ;;
   esac
 done
 
@@ -259,20 +283,21 @@ for d in "$ROOT"/*/; do
   repo="${d%/}"
   [ -d "$repo/.git" ] || continue
   pc="$repo/.git/hooks/pre-commit"; pmc="$repo/.git/hooks/pre-merge-commit"
+  pp="$repo/.git/hooks/pre-push"
   grep -q "secret-scan" "$pc" 2>/dev/null || grep -q "secret-scan" "$pmc" 2>/dev/null || continue
-  both=1
-  for h in "$pc" "$pmc"; do [ -x "$h" ] || both=0; done
-  if [ "$both" = 0 ]; then
-    unguarded=$((unguarded+1)); echo "  INCOMPLETE: $(basename "$repo") — one of the two hooks is missing"
-  elif already_ours "$pc" && already_ours "$pmc"; then
+  all=1
+  for h in "$pc" "$pmc" "$pp"; do [ -x "$h" ] || all=0; done
+  if [ "$all" = 0 ]; then
+    unguarded=$((unguarded+1)); echo "  INCOMPLETE: $(basename "$repo") — one of the three hooks is missing"
+  elif already_ours "$pc" && already_ours "$pmc" && already_ours "$pp" --push; then
     tracked=$((tracked+1))
   else
     legacy=$((legacy+1))
   fi
 done
-echo "  repos on the TRACKED scanner (both hooks):   $tracked"
+echo "  repos on the TRACKED scanner (all 3 hooks):  $tracked"
 echo "  repos still on the untracked ~/.claude copy: $legacy"
-echo "  repos missing one of the two hooks:          $unguarded"
+echo "  repos missing one of the three hooks:        $unguarded"
 echo "  repos deliberately NOT opted in (no scan):   $noscan"
 echo "  worktrees covered by a parent repo:          $worktrees"
 echo "  non-repo directories ignored:                $notrepo"
