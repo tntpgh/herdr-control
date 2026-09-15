@@ -127,17 +127,38 @@ composer_stable_snapshot() {
 #             could not be determined — never guess a position.
 #           prompt_menu_question <pane> -> the header/detail lines, for
 #             prompt_id() below.
-# 200 lines, not 60: the header is the ANCHOR of the state machine below, and a
-# long command body pushes it further from the footer than 60 rows. Measured
-# 2026-09-13 on an `eval` approval whose body was ~1.2 kB — the "Allow tool:"
-# row was outside every window up to 140, so `_prompt_menu` never left state 0,
-# `prompt_menu_options` failed closed, and herdr-select refused a menu that was
-# plainly on screen ("not showing a prompt this script recognises"). Widening
-# alone is not sufficient — see the footer-anchored fallback in _prompt_menu —
-# but it keeps the RICH parse (full header + detail rows) available far more
-# often, and the fallback's truncated question is strictly worse for review.
+# Read the WHOLE visible screen, everywhere a pane is scraped.
+#
+# 60 was a guess, and a panel taller than it is silently unanswerable: the
+# "Allow tool:" header scrolls out of the window, the parser fails closed
+# (correctly — it will not turn detail text into option 1), and the worker sits
+# `blocked` with nobody able to press a key. Observed 2026-09-12 on wH:p6,
+# whose panel spanned 61 rows: at --lines 60 the header appeared 0 times, at
+# --lines 200 it appeared once. The workaround had even reached our task briefs
+# ("keep every bash command short enough that an approval panel renders it
+# whole"), which is a parser bug wearing a process rule.
+#
+# `--source visible` already caps the read at the pane's own viewport —
+# measured across all 11 live panes, `--lines 200` and `--lines 500` return
+# identical row counts, never more than viewport_rows. So the window only has
+# to be LARGER than any viewport; it does not have to be exact. An earlier cut
+# of this fix derived it from `herdr pane list`, which cost a second RPC and a
+# jq per parse (+73%: 18.5ms -> 32.1ms) on a path that runs ~20 times per alert
+# — to produce a number that is inert for every pane here, and that can be
+# stale by the time `pane read` runs anyway. A constant is cheaper AND more
+# correct.
+#
+# Every pane scrape shares this, because a window that is right in one place
+# and 60 in three others is the same bug wearing a different line number.
+_PANE_WINDOW_LINES=1000
+
 _menu_window() {
-  herdr pane read "$1" --source visible --lines 200 --format ansi 2>/dev/null
+  herdr pane read "$1" --source visible --lines "$_PANE_WINDOW_LINES" --format ansi 2>/dev/null
+}
+
+# The same window, without ANSI — for the scrapes that work on plain text.
+_pane_visible() {
+  herdr pane read "$1" --source visible --lines "$_PANE_WINDOW_LINES" 2>/dev/null
 }
 
 # A NECESSARY condition for either pass below, decided in the shell with no
@@ -152,6 +173,11 @@ _menu_window() {
 # call per worker, against ~8 live workers, for the answer "nothing is asking".
 # Matching two separate words rather than the whole footer phrase keeps the gate
 # robust to a style change painted between them.
+#
+# The wider window above makes the gate MORE valuable, not less: a 1000-row
+# read hands python ~20x the bytes it used to, so refusing the spawn on a
+# window that cannot parse is now the difference between a cheap grep and a
+# 23 kB parse per attempt.
 _menu_gate() {                         # <window>
   case "$1" in *navigate*) ;; *) return 1 ;; esac
   case "$1" in *select*)   ;; *) return 1 ;; esac
@@ -406,7 +432,7 @@ prompt_id() {
     # make --expect-prompt-id refuse a prompt that had not changed.
     local menu_q="$q"
     if [ -z "$menu_q" ]; then
-      menu_q="$(herdr pane read "$1" --source visible --lines 60 2>/dev/null \
+      menu_q="$(_pane_visible "$1" \
         | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \
         | sed -n '/Allow tool:/,/enter select/p' \
         | sed -E 's/^[[:space:]│|]+//; s/[[:space:]│|]+$//' \
@@ -447,7 +473,7 @@ prompt_command_text() {
   local menu win
   menu="$(prompt_menu_question "$1" 2>/dev/null)" || menu=""
   if [ -n "$menu" ]; then printf '%s\n' "$menu"; return 0; fi
-  win="$(herdr pane read "$1" --source visible --lines 60 2>/dev/null)" || win=""
+  win="$(_pane_visible "$1")" || win=""
   printf '%s\n%s\n' "$menu" "$(
     printf '%s\n' "$win" \
       | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \
