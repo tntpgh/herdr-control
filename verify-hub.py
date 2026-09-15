@@ -597,12 +597,67 @@ class CacheFreshness(unittest.TestCase):
         # mutated get() to arm a self-re-arming Timer and the test stayed green
         # while the mutant fired 19 unattended probes in a second.
         calls = []
+        # Seeded INSIDE the staleness ceiling (age 0.06s against 0.05 x 4), so
+        # the read takes the stale branch and actually spawns the background
+        # refresh this test is about. A 999s age would exceed the ceiling, take
+        # the inline branch, and spawn nothing — the same fixture defect that
+        # made two of its sibling rows vacuous.
         c = hub.Cached(0.05, lambda: calls.append(1) or {"n": len(calls)}, stale_ok=True)
-        c.val, c.at = {"n": 0}, time.monotonic() - 999
+        c.val, c.at = {"n": 0}, time.monotonic() - 0.06
         c.get()                                     # one reader, then nobody
         time.sleep(0.6)                             # many TTLs pass unattended
         self.assertEqual(len(calls), 1,
                          f"one read kicked {len(calls)} fills with no further reader")
+
+    def test_no_reader_can_slip_between_clearing_the_flag_and_writing_the_value(self):
+        """The one-refresh invariant must hold at the lock boundary, not just on average.
+
+        `_refresh` used to clear `refreshing` in a `finally` and write the value
+        in a SEPARATE lock block. Between those two acquisitions the flag was
+        already False while `val` still held the old snapshot, so a reader
+        arriving there kicked a second refresh — for `links` a duplicate probe
+        of every production surface, which is the externality this design
+        exists to avoid. Two lock acquisitions wide with no I/O between, so
+        `test_only_one_refresh_is_in_flight` cannot see it; this widens the real
+        window with a lock spy rather than creating one.
+        """
+        fills = []
+
+        class SpyLock:
+            def __init__(self, inner, on_release):
+                self.inner, self.on_release, self.n = inner, on_release, 0
+
+            def __enter__(self):
+                self.inner.acquire()
+                return self
+
+            def __exit__(self, *_a):
+                self.n += 1
+                self.inner.release()
+                self.on_release(self.n)
+
+            def acquire(self, *a):
+                return self.inner.acquire(*a)
+
+            def release(self):
+                return self.inner.release()
+
+        c = hub.Cached(1, lambda: fills.append(1) or {"n": len(fills)}, stale_ok=True)
+        c.val, c.at = {"n": 0}, time.monotonic() - 2
+        arrived = {}
+
+        def on_release(n):
+            if n >= 2 and not arrived:
+                arrived["state"] = (c.refreshing, dict(c.val) if c.val else None)
+                c.get()                      # a reader arrives inside the window
+                time.sleep(0.05)
+
+        c.lock = SpyLock(c.lock, on_release)
+        c.get()                              # kicks the background refresh
+        time.sleep(0.6)
+        self.assertEqual(len(fills), 1,
+                         f"a reader inside the refresh window kicked {len(fills)} fills; "
+                         f"it observed {arrived.get('state')}")
 
     def test_invalidate_forces_an_inline_refill_even_where_stale_is_allowed(self):
         # `serve_loop_decision` invalidates `loops` after writing a decision, so

@@ -213,15 +213,27 @@ class Cached:
         # probe would block every reader on exactly the wait this removes.
         try:
             val = self._fill()
-        finally:
-            # BaseException too: without this the flag latches True and the
-            # cache freezes on a stale value with no further refresh EVER.
+        except BaseException:
+            # `_fill` already swallows Exception, so only a BaseException
+            # (an interpreter teardown, a KeyboardInterrupt) reaches here.
+            # Without clearing the flag it latches True and the cache freezes
+            # on a stale value with no further refresh EVER.
             with self.lock:
                 self.refreshing = False
+            raise
+        # ONE lock block for both writes. A `finally` that cleared the flag
+        # before the value write left a window — two lock acquisitions wide,
+        # no I/O between — where `refreshing` was already False while `val`
+        # still held the old snapshot. A reader arriving there passes
+        # `not self.refreshing` and kicks a SECOND refresh: for `links` that
+        # is a duplicate probe of every production surface, which is the exact
+        # externality this design exists to avoid, and for `search` a
+        # duplicate authenticated 50-page walk. Narrow, but it falsified the
+        # one-refresh-in-flight invariant the suite asserts.
         with self.lock:
-            if gen != self.gen:
-                return          # invalidated mid-flight: this snapshot is stale
-            self.val, self.at = val, time.monotonic()
+            self.refreshing = False
+            if gen == self.gen:  # else invalidated mid-flight: snapshot is stale
+                self.val, self.at = val, time.monotonic()
 
     def get(self):
         with self.lock:
