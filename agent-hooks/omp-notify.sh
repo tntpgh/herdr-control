@@ -49,11 +49,14 @@ pane="${HERDR_PANE_ID:-}"
 # lib/prompt-parse.sh already knows the menu shape (highlight detected via its
 # ANSI background-colour escape) and the numbered shape, and a caller here has
 # no business caring which one a given omp build renders.
-_prompt_is_up() {
-  prompt_menu_visible "$pane" 2>/dev/null && return 0
-  [ -n "$(prompt_options      "$pane" 2>/dev/null)" ] && return 0
-  return 1
-}
+#
+# prompt_any_visible answers both from ONE `herdr pane read`. Calling the two
+# predicates separately cost two reads per attempt — 20 CLI spawns and 10
+# python3 spawns per tool call per worker (~1.86s of CPU, measured 2026-09-14),
+# every one of them an RPC into the single-threaded herdr server. With ~8 live
+# workers that is what made herdr's own UI feel laggy, for the answer "nothing
+# is asking" on the overwhelming majority of tool calls.
+_prompt_is_up() { prompt_any_visible "$pane" 2>/dev/null; }
 
 # tool_call fires BEFORE omp paints the approval menu, so a single check would
 # usually miss it. Poll briefly. Each attempt costs one `herdr pane read`; the
@@ -63,10 +66,15 @@ _prompt_is_up() {
 # Bounded deliberately: if no prompt has painted within ~1.5s the tool was
 # auto-approved and there is nothing to alert about. Waiting longer would only
 # delay discovering that.
+#
+# 5 attempts at 0.3s, not 10 at 0.15s: an approval menu is a BLOCKING prompt —
+# once painted it stays until someone answers it — so a coarser poll can only
+# delay detection by one interval, never miss it, and it halves the RPCs this
+# fires at the herdr server on every tool call of every pane.
 found=0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
+for _ in 1 2 3 4 5; do
   if _prompt_is_up; then found=1; break; fi
-  sleep 0.15
+  sleep 0.3
 done
 [ "$found" = 1 ] || exit 0
 
