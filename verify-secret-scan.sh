@@ -676,6 +676,52 @@ git -C "$R" show HEAD --format= -U0 | grep -q 'Binary files' \
     || bad "fixture is not auto-detected as binary"
 refuses_push "$R" "and NUL-auto-detection does not hide one either"
 
+# ═════════════════════════════════════════════════════════════════════════════
+printf '== PUBLISHED-BY-DESIGN values are not credentials ==\n'
+# Two patterns match "a secret-shaped NAME assigned a long hex value", which
+# cannot tell a PRIVATE key from a PUBLIC one. Found by this guard's own live
+# proof: watchdog-worker's signed-registry commit carries an Ed25519 pubkey as
+# `"pubkey": "<64 hex>"`, matched because "pubkey" ends in "key". A pubkey MUST
+# be in the repo for verification to work, so that refusal has no compliant fix
+# and the only way past it is the bypass flag — the outcome this guard cannot
+# survive.
+#
+# The exemption is NAME-scoped, applies only to those two patterns, and is
+# consulted only after one of them has matched. The last two cases are the ones
+# that matter: it must not become a shield.
+PUBHEX="$(printf '8a88e3dd7409f195fd52db2d3cba5d72')$(printf 'ca6709bf1d94121bf3748801b40f6f5c')"
+
+pub_case() {                    # <file> <content> <expect: block|allow> <label>
+    local f="$1" content="$2" expect="$3" label="$4" r
+    r="$(new_repo)"
+    printf '%s\n' "$content" > "$r/$f"
+    git -C "$r" add "$f"
+    if [ "$expect" = block ]; then blocks "$r" "$label"; else allows "$r" "$label"; fi
+}
+
+pub_case f.json "{\"pubkey\": \"$PUBHEX\"}"      allow \
+    "an Ed25519 pubkey in JSON is not a secret"
+pub_case f.json "{\"public_key\": \"$PUBHEX\"}"  allow \
+    "nor is public_key"
+pub_case f.json "{\"fingerprint\": \"$PUBHEX\"}" allow \
+    "nor is a fingerprint"
+pub_case f.json "{\"sha256\": \"$PUBHEX\"}"      allow \
+    "nor is a content hash"
+pub_case f.json "{\"token\": \"$PUBHEX\"}"       block \
+    "a secret-shaped name with the SAME value still blocks"
+pub_case f.json "{\"api_key\": \"$PUBHEX\"}"     block \
+    "and so does api_key"
+pub_case s.py   "SYSTEM_KEY = \"$PUBHEX\""       block \
+    "and the uppercase assignment form"
+# The abuse case: naming a field `pubkey` must not launder a real token. The
+# format patterns never consult the allowlist.
+pub_case f.json "{\"pubkey\": \"$GHP\"}"         block \
+    "naming a field pubkey does NOT launder a ghp_ token"
+# One public value and one real secret in the same file: not ALL matches are
+# public, so it blocks.
+pub_case f.json "{\"pubkey\": \"$PUBHEX\", \"token\": \"$PUBHEX\"}" block \
+    "a pubkey next to a real secret still blocks"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi
