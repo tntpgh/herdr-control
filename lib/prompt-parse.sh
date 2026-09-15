@@ -432,7 +432,7 @@ prompt_id() {
     # make --expect-prompt-id refuse a prompt that had not changed.
     local menu_q="$q"
     if [ -z "$menu_q" ]; then
-      menu_q="$(herdr pane read "$1" --source visible --lines 60 2>/dev/null \
+      menu_q="$(_pane_visible "$1" \
         | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \
         | sed -n '/Allow tool:/,/enter select/p' \
         | sed -E 's/^[[:space:]│|]+//; s/[[:space:]│|]+$//' \
@@ -473,7 +473,7 @@ prompt_command_text() {
   local menu win
   menu="$(prompt_menu_question "$1" 2>/dev/null)" || menu=""
   if [ -n "$menu" ]; then printf '%s\n' "$menu"; return 0; fi
-  win="$(herdr pane read "$1" --source visible --lines 60 2>/dev/null)" || win=""
+  win="$(_pane_visible "$1")" || win=""
   printf '%s\n%s\n' "$menu" "$(
     printf '%s\n' "$win" \
       | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \

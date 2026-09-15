@@ -59,7 +59,7 @@ human_must_answer() {
   # authoritative; anything else on a pane showing `Allow tool:` furniture is
   # a person's.
   if [ -z "$(prompt_menu_options "$pane" 2>/dev/null)" ]; then
-    herdr pane read "$pane" --source visible --lines 60 2>/dev/null | grep -q 'Allow tool:' && return 0
+    _pane_visible "$pane" | grep -q 'Allow tool:' && return 0
     [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || return 0
   fi
   cmd="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
