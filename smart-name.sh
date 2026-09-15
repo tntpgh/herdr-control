@@ -31,6 +31,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/config.sh"
 # shellcheck source=lib/pane-guard.sh
 source "$HERE/lib/pane-guard.sh"   # pane_is_agent
+# shellcheck source=lib/prompt-parse.sh
+source "$HERE/lib/prompt-parse.sh" # _pane_visible, _PANE_WINDOW_LINES
 
 force=0 no_ai=0 dry=0 do_all=0 reset=0 target=""
 while [ $# -gt 0 ]; do
@@ -132,6 +134,15 @@ sanitize() {
   # Strip ANSI/OSC, fold the home path, redact common secret shapes, drop blank
   # lines, then hard-cap. Context is untrusted screen scrape — this is what
   # leaves the machine, so it is bounded and scrubbed before the model sees it.
+  #
+  # The cap is `tail -c`, not `head -c`. It is the LAST stage, so taking the
+  # FIRST 4500 bytes discards the BOTTOM of the window — the newest content,
+  # i.e. the task being named. Measured on four live panes: the cap bit on
+  # three of them, dropping 14-16 lines, and on the busiest the last line the
+  # model saw was a mid-table box rule while the actual last line on screen
+  # was the composer. Anchoring the line slice (tail -n, in gather_evidence)
+  # AND the byte cap at the bottom is what makes this bottom-anchored end to
+  # end; fixing only the first one moved the truncation, it did not remove it.
   perl -pe 's/\e\][^\a]*(?:\a|\e\\)//g; s/\e\[[0-9;?]*[ -\/]*[@-~]//g' \
     | sed "s|$HOME|~|g" \
     | sed -E 's/(sk|rk|pk)-[A-Za-z0-9_-]{16,}/[redacted-key]/g;
@@ -140,7 +151,7 @@ sanitize() {
               s/[Bb]earer[[:space:]]+[A-Za-z0-9._-]{16,}/Bearer [redacted]/g;
               s/(([Aa]pi[_-]?[Kk]ey|[Tt]oken|[Pp]assword|[Ss]ecret)[[:space:]]*[=:][[:space:]]*)[^[:space:]]+/\1[redacted]/g' \
     | grep -vE '^[[:space:]]*$' \
-    | head -c "$SMART_NAME_EVIDENCE_CHARS"
+    | tail -c "$SMART_NAME_EVIDENCE_CHARS"
 }
 
 gather_evidence() {
@@ -148,13 +159,32 @@ gather_evidence() {
   # screen, which shows the current task. (`agent read` depends on herdr's
   # turn-detection hooks, which are frequently silent — agent_status "unknown"
   # — and then return nothing.)
+  #
+  # The window is the shared one (_PANE_WINDOW_LINES), not a local `--lines`.
+  # This read asked for 60, and 60 is the exact number measured to lose a
+  # panel header: lib/prompt-parse.sh records "a panel spanning 61 rows: at
+  # --lines 60 the header appeared 0 times, at --lines 200 it appeared once".
+  # A clipped window here does not miss a prompt — this only names a tab — but
+  # it names it off the wrong half of the screen, and the whole point of the
+  # one-window rule is that a number that is right in one place and wrong in
+  # three others is the same bug wearing a different line number.
+  #
+  # BOTTOM-anchored, which is the part a straight widening would have got
+  # wrong: `sanitize` ends in `head -c`, so it caps from the TOP of the
+  # stream. Handing it a 1000-line window would have fed the model the OLDEST
+  # content on screen and truncated away the current task. So drop the TUI's
+  # blank and non-breaking-space padding first, then take the bottom slice,
+  # then let the existing character cap bound it.
   local pane="$1" cwd proc header body
   cwd=$(_panes | jq -r --arg p "$pane" 'select(.pane_id==$p) | .cwd // ""')
   proc=$(foreground_proc "$pane")
   header="cwd: ${cwd:-?}"
   [ -n "$proc" ] && header="$header
 process: $(printf '%s' "$proc" | tr '\t' ' ')"
-  body=$(herdr pane read "$pane" --source visible --lines 60 2>/dev/null)
+  body=$(_pane_visible "$pane" \
+         | sed $'s/\xc2\xa0/ /g' \
+         | awk '{ s=$0; gsub(/[[:space:]]/,"",s); if (length(s)) print }' \
+         | tail -n 60)
   printf '%s\n---\n%s\n' "$header" "$body" | sanitize
 }
 
