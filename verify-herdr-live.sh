@@ -159,6 +159,40 @@ results["actionable"] = {
     "done_flap": hubmod.edge_is_actionable("working", "done"),
 }
 
+# 14. A RECYCLED pane id is a NEW pane. herdr restarts revision numbering per
+# pane, so if the revision guard is applied across a birth change, every update
+# for the new occupant is dropped FOREVER: status, agent and cwd stay those of
+# the dead pane and no edge ever fires.
+live = fresh()
+occupant_a = {"event": "pane_updated", "data": {"type": "pane_updated", "pane": {
+    "pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "agent": "omp",
+    "agent_status": "blocked", "revision": 90, "cwd": "/repo",
+    "terminal_id": "term_OLD"}}}
+live._apply_event(occupant_a)           # occupant A, high revision, known birth
+recycled = {"event": "pane_updated", "data": {"type": "pane_updated", "pane": {
+    "pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "agent": "claude",
+    "agent_status": "working", "revision": 2, "cwd": "/other",
+    "terminal_id": "term_NEW"}}}
+edges = live._apply_event(recycled)
+rec = [p for p in live.panes() if p["pane_id"] == "w1:p1"][0]
+results["recycled_pane"] = (rec["agent"], rec["agent_status"], flat(edges))
+
+# 15. Degraded mode must actually STREAM. After STATUS_SUBS_GIVE_UP_AFTER
+# rejections the subscription set carries no per-pane entries, and the
+# post-bootstrap "am I covering every pane?" check then saw every pane as
+# uncovered and returned "resubscribe" BEFORE the read loop — a connect +
+# session.snapshot cycle that never streamed and never slept (measured 767,698
+# connects in 2s against a stub, with connected:true and last_error:null).
+live = fresh()
+live._subscribe_failures = herdr_live.STATUS_SUBS_GIVE_UP_AFTER
+subs, covered = live._subscriptions()
+results["degraded_shape"] = (
+    [s for s in subs if s["type"] == "pane.agent_status_changed"] == [],
+    len(covered) == 0,
+    # the flag the stream loop keys on: no per-pane subs => degraded
+    any(s["type"] == "pane.agent_status_changed" for s in subs) is False,
+)
+
 # 13. A CLOSED pane must not wedge the subscription. One per-pane
 # `pane.agent_status_changed` subscription for a pane herdr has closed makes
 # the server reject the WHOLE events.subscribe with `pane_not_found`; the
@@ -239,6 +273,21 @@ get() { printf '%s' "$out" | jq -c ".$1"; }
   || no "actionable" "$(get actionable)"
 [ "$(get 'actionable | [.working_idle_flap, .idle_working_flap, .done_flap]')" = '[false,false,false]' ] \
   && ok "a working<->idle flap never spawns anything" || no "flap filter" "$(get actionable)"
+# `before` is null, not "blocked": a recycled id is a NEW pane, so it reads as
+# a FIRST OBSERVATION, which agent-edge.sh handles as reconcile-only (no alert,
+# no keypress) and the registry birth guard refuses to write against the
+# previous occupant's task. Reporting it as a transition OF the dead pane would
+# attribute a stranger's prompt to that worker's task, which is the failure the
+# birth guard exists to prevent.
+[ "$(get recycled_pane)" = '["claude","working",[["w1:p1",null,"working"]]]' ] \
+  && ok "a recycled pane id is treated as a NEW pane, not a stale revision" \
+  || no "recycled pane" "$(get recycled_pane)"
+[ "$(get degraded_subs)" = '[true,true,true]' ] \
+  && ok "repeated rejections degrade to lifecycle-only rather than losing the stream" \
+  || no "degraded subs" "$(get degraded_subs)"
+[ "$(get degraded_shape)" = '[true,true,true]' ] \
+  && ok "degraded mode reports itself as covering every pane, so it streams" \
+  || no "degraded shape" "$(get degraded_shape)"
 [ "$(get 'closed_pane | [.seeded, .recoverable, .resnapshotted, .pruned, .counted]')" = '[true,true,true,true,true]' ] \
   && ok "a closed pane is pruned and the subscription retried, not wedged" \
   || no "closed pane" "$(get closed_pane)"
@@ -257,23 +306,45 @@ mkdir -p "$tmp/bin" "$tmp/state" "$tmp/bridge"
 # Stubs via the script's documented seams (config.sh exports its own PATH, so
 # PATH shadowing does not work here). Nothing real is reachable: no Slack, no
 # keypress, no hub.
+# The probe reads the hub, so the stub must answer the way the hub does:
+# `connected` plus a panes ARRAY. STUB_DOWN makes it unreachable (the
+# "could not look" case, which must NOT be read as "cleared").
 cat > "$tmp/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 echo "curl $*" >> "$STUB_LOG"
-if [ -n "${STUB_CLEARED:-}" ]; then echo '{"panes":[{"pane_id":"w1:p1","agent_status":"idle"}]}'
-else echo '{"panes":[{"pane_id":"w1:p1","agent_status":"blocked"}]}'; fi
+[ -n "${STUB_DOWN:-}" ] && exit 7
+if [ -n "${STUB_CLEARED:-}" ]; then echo '{"connected":true,"panes":[{"pane_id":"w1:p1","agent_status":"idle"},{"pane_id":"w1:p9","agent_status":"idle"}]}'
+else echo '{"connected":true,"panes":[{"pane_id":"w1:p1","agent_status":"blocked"},{"pane_id":"w1:p9","agent_status":"blocked"}]}'; fi
 STUB
 cat > "$tmp/bin/record" <<'STUB'
 #!/usr/bin/env bash
 echo "$(basename "$0") $*" >> "$STUB_LOG"
 exit 0
 STUB
-chmod +x "$tmp/bin/curl" "$tmp/bin/record"
-for name in notify resolve peer-answer; do cp "$tmp/bin/record" "$tmp/bin/$name"; done
+# The real herdr-notify appends {ts,pane} to pending.jsonl when it is given
+# --choices (that is what makes the alert retractable). The stub models that,
+# so the suite can tell a queued backstop from an un-queued one — the HIGH
+# finding this branch fixes. STUB_NOTIFY_NOQUEUE models the broken case.
+cat > "$tmp/bin/notify" <<'STUB'
+#!/usr/bin/env bash
+echo "notify $*" >> "$STUB_LOG"
+case " $* " in *" --choices "*) ;; *) exit 0 ;; esac
+[ -n "${STUB_NOTIFY_NOQUEUE:-}" ] && exit 0
+printf '{"ts":"%s","pane":"w1:p1"}\n' "$(date +%s)" >> "$STUB_PENDING"
+exit 0
+STUB
+chmod +x "$tmp/bin/curl" "$tmp/bin/record" "$tmp/bin/notify"
+for name in resolve peer-answer; do cp "$tmp/bin/record" "$tmp/bin/$name"; done
 
 run_edge() {                            # <status> <previous> [env assignments...]
   : > "$tmp/log"
-  env STUB_LOG="$tmp/log" \
+  # HERDR_RUN_STATE_DIR is set for EVERY case, not only the registry section:
+  # without it these runs call task_for_pane/set_task_state against the REAL
+  # ~/.local/state/herdr/runs registry, and a suite that mutates live
+  # control-plane state is one nobody can run on a working machine. Callers may
+  # still override it (the registry section points it at its own root).
+  env STUB_LOG="$tmp/log" STUB_PENDING="$tmp/bridge/pending.jsonl" \
+      HERDR_RUN_STATE_DIR="$tmp/runs-isolated" \
       HERDR_STATE_DIR="$tmp/state" HERDR_BRIDGE_STATE="$tmp/bridge" \
       HERDR_EDGE_ALERT_GRACE_S=0 \
       HERDR_EDGE_CURL="$tmp/bin/curl" HERDR_EDGE_NOTIFY="$tmp/bin/notify" \
@@ -296,12 +367,34 @@ case "$(did "$line")" in "registry-heal (first observation) reg="*) [ ! -s "$tmp
   || no "registry heal" "$line $(cat "$tmp/log")"
 
 line=$(run_edge blocked working)
-case "$(did "$line")" in "backstop alert reg="*) true ;; *) false ;; esac && grep -q "^notify --pane w1:p1" "$tmp/log" \
-  && ok "a real block with no hook alert gets the backstop, via notify" || no "backstop" "$line $(cat "$tmp/log")"
+case "$(did "$line")" in "backstop alert (queued for retraction) reg="*) true ;; *) false ;; esac \
+  && grep -q "^notify --choices --pane w1:p1" "$tmp/log" \
+  && ok "the backstop alerts WITH --choices, so the alert is queued and answerable" \
+  || no "backstop" "$line $(cat "$tmp/log")"
+rm -f "$tmp/bridge/pending.jsonl"
+
+# The HIGH finding this replaced: an alert posted with no pending entry is
+# un-retractable, invisible to the dedupe, and button-less. If that ever
+# happens again the audit line must SAY so instead of reading like a success.
+line=$(run_edge blocked working STUB_NOTIFY_NOQUEUE=1)
+case "$(did "$line")" in *"NOT QUEUED"*) true ;; *) false ;; esac \
+  && ok "an alert that failed to queue is recorded as NOT QUEUED, not as success" \
+  || no "unqueued alert" "$line"
+rm -f "$tmp/bridge/pending.jsonl"
 
 line=$(run_edge blocked working STUB_CLEARED=1)
 [ "$(did "$line")" = "cleared within grace, no alert" ] && ! grep -q "^notify" "$tmp/log" \
   && ok "a prompt answered inside the grace window is not alerted" || no "grace" "$line"
+
+# "Could not look" must never read as "cleared": that suppressed the page in
+# exactly the conditions where the control plane is least healthy, and wrote
+# `cleared within grace` into the audit file while doing it.
+line=$(run_edge blocked working STUB_DOWN=1)
+case "$(did "$line")" in *"probe unreachable"*|*"NOT QUEUED"*|*"queued for retraction"*) true ;; *) false ;; esac \
+  && grep -q "^notify --choices" "$tmp/log" \
+  && ok "an unreachable probe alerts anyway, and says the probe failed" \
+  || no "probe unknown" "$line $(cat "$tmp/log")"
+rm -f "$tmp/bridge/pending.jsonl"
 
 printf '{"ts":"1","pane":"w1:p1"}\n' > "$tmp/bridge/pending.jsonl"
 line=$(run_edge blocked working)
@@ -315,7 +408,7 @@ grep -q "^peer-answer" "$tmp/log" \
   || ok "auto-answering is off unless HERDR_EDGE_PEER_ANSWER=1"
 
 line=$(run_edge blocked working HERDR_EDGE_PEER_ANSWER=1)
-grep -q "^peer-answer --max-rounds 1 w1:p1" "$tmp/log" \
+grep -q "^peer-answer --max-rounds 1 --agent omp w1:p1" "$tmp/log" \
   && ok "opting in answers exactly one round, for that pane only" \
   || no "peer-answer opt-in" "$(cat "$tmp/log")"
 
@@ -350,11 +443,45 @@ after=$(sqlite3 "$regroot/registry.sqlite3" "select state from tasks where task_
 env HERDR_RUN_STATE_DIR="$regroot" bash -c '
   . "'"$HERE"'/config.sh"; . "'"$HERE"'/lib/run-registry.sh"
   set_task_state run_v task_v completed >/dev/null' 2>/dev/null
+rm -f "$tmp/bridge/pending.jsonl"   # or the dedupe exits before the audit line
 line=$(run_edge blocked working HERDR_RUN_STATE_DIR="$regroot")
 after=$(sqlite3 "$regroot/registry.sqlite3" "select state from tasks where task_id='task_v';" 2>/dev/null)
 [ "$after" = "completed" ] && case "$(did "$line")" in *"reg=refused("*) true ;; *) false ;; esac \
   && ok "a completed task is not dragged back to blocked, and the refusal is recorded" \
   || no "terminal guard" "after=$after did=$(did "$line")"
+
+# A RECYCLED pane id must not let this writer touch the previous occupant's
+# row. Every other writer in the repo refuses on a birth mismatch; this one
+# could not until the live record carried terminal_id.
+env HERDR_RUN_STATE_DIR="$regroot" bash -c '
+  . "'"$HERE"'/config.sh"; . "'"$HERE"'/lib/run-registry.sh"
+  register_task run_b task_b worker_b conductor_b c:p1 birth1 w1:p9 REGISTERED-BIRTH /repo /wt lane >/dev/null
+  set_task_state run_b task_b running >/dev/null' 2>/dev/null
+rm -f "$tmp/bridge/pending.jsonl"
+: > "$tmp/log"
+env STUB_LOG="$tmp/log" STUB_PENDING="$tmp/bridge/pending.jsonl" \
+    HERDR_STATE_DIR="$tmp/state" HERDR_BRIDGE_STATE="$tmp/bridge" HERDR_EDGE_ALERT_GRACE_S=0 \
+    HERDR_EDGE_CURL="$tmp/bin/curl" HERDR_EDGE_NOTIFY="$tmp/bin/notify" \
+    HERDR_EDGE_RESOLVE="$tmp/bin/resolve" HERDR_EDGE_PEER_ANSWER_SH="$tmp/bin/peer-answer" \
+    HERDR_RUN_STATE_DIR="$regroot" \
+    bash "$HERE/agent-edge.sh" w1:p9 blocked working omp /repo LIVE-BIRTH-DIFFERENT >/dev/null 2>&1
+after=$(sqlite3 "$regroot/registry.sqlite3" "select state from tasks where task_id='task_b';" 2>/dev/null)
+line=$(tail -1 "$tmp/state/agent-edges.jsonl" 2>/dev/null)
+[ "$after" = "running" ] && case "$(did "$line")" in *"pane recycled"*) true ;; *) false ;; esac \
+  && ok "a birth mismatch refuses the write and names it as a recycled pane" \
+  || no "birth guard" "after=$after did=$(did "$line")"
+
+# ...and a MATCHING birth still heals, so the guard is not just "always refuse".
+rm -f "$tmp/bridge/pending.jsonl"
+env STUB_LOG="$tmp/log" STUB_PENDING="$tmp/bridge/pending.jsonl" \
+    HERDR_STATE_DIR="$tmp/state" HERDR_BRIDGE_STATE="$tmp/bridge" HERDR_EDGE_ALERT_GRACE_S=0 \
+    HERDR_EDGE_CURL="$tmp/bin/curl" HERDR_EDGE_NOTIFY="$tmp/bin/notify" \
+    HERDR_EDGE_RESOLVE="$tmp/bin/resolve" HERDR_EDGE_PEER_ANSWER_SH="$tmp/bin/peer-answer" \
+    HERDR_RUN_STATE_DIR="$regroot" \
+    bash "$HERE/agent-edge.sh" w1:p9 blocked working omp /repo REGISTERED-BIRTH >/dev/null 2>&1
+after=$(sqlite3 "$regroot/registry.sqlite3" "select state from tasks where task_id='task_b';" 2>/dev/null)
+[ "$after" = "blocked" ] \
+  && ok "a matching birth still writes the state" || no "birth match" "after=$after"
 
 echo
 printf 'pass=%s fail=%s\n' "$pass" "$fail"

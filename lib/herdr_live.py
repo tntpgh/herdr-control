@@ -155,8 +155,24 @@ def request(method: str, params: dict | None = None, timeout: float = 5.0) -> di
 
 def _pane_record(pane: dict, workspaces: dict[str, str]) -> dict:
     """The projection every consumer gets. Deliberately small: identity, who is
-    in the pane, what herdr says it is doing, and where — no screen content, so
-    nothing here can leak a command or a credential into a page or a log."""
+    in the pane, what herdr says it is doing — no screen content, so nothing
+    here can leak a command or a credential into a page or a log.
+
+    `birth` is herdr's `terminal_id`, the pane's BIRTH fingerprint. Pane ids are
+    RECYCLED, so a status keyed on the id alone can describe a different process
+    that inherited the slot: herdr-select.sh, lib/pane-guard.sh and
+    lib/reconcile.sh all compare it before acting, and the security review found
+    the new edge writer was the one path that could not, because this record did
+    not carry it. It is an opaque id, not content.
+
+    `cwd` is deliberately NOT here. The record is served on an unauthenticated
+    loopback API, and an absolute path discloses the machine's project inventory
+    — one live row was
+    `/Users/…/CloudStorage/GoogleDrive-<address>/My Drive/Reno`, i.e. an email
+    address and a client-matter name. Nothing rendered needs it; the edge script
+    gets it from `cwd_of()` below, which the hub reads from its own state rather
+    than publishing.
+    """
     wid = pane.get("workspace_id") or ""
     return {
         "pane_id": pane.get("pane_id") or "",
@@ -166,7 +182,7 @@ def _pane_record(pane: dict, workspaces: dict[str, str]) -> dict:
         "label": pane.get("label"),
         "agent": pane.get("agent"),
         "agent_status": pane.get("agent_status") or "unknown",
-        "cwd": pane.get("foreground_cwd") or pane.get("cwd"),
+        "birth": pane.get("terminal_id") or "",
         "revision": pane.get("revision") or 0,
     }
 
@@ -199,6 +215,9 @@ class LiveState:
         self._panes: dict[str, dict] = {}
         self._since: dict[str, float] = {}       # pane_id -> when its status last changed
         self._status_event_at: dict[str, float] = {}   # pane_id -> last authoritative status event
+        # Kept OUT of the served record on purpose (see _pane_record): the edge
+        # script needs a cwd, an unauthenticated API reader does not.
+        self._cwd: dict[str, str] = {}
         self._workspaces: dict[str, str] = {}    # workspace_id -> label
         self._subscribe_failures = 0
         self._edges: queue.Queue = queue.Queue(maxsize=1024)
@@ -210,6 +229,11 @@ class LiveState:
             "resubscribes": 0,
             "subscribe_pruned": 0,
             "status_subs_degraded": False,
+            # Missing until 2026-09-15, which made the idle-resync path raise
+            # KeyError instead of resyncing: the exception was caught one frame
+            # up as "stream lost", so every quiet period became a reconnect and
+            # the safety net for a silently dead stream never once ran.
+            "resyncs": 0,
             "events": 0,
             "edges": 0,
             "edges_dropped": 0,
@@ -272,6 +296,12 @@ class LiveState:
             "agents": [p for p in panes if p.get("agent")],
         }
 
+    def cwd_of(self, pane_id: str) -> str:
+        """The pane's cwd, for a caller that needs it (the edge script's Slack
+        text). Deliberately not part of the served record — see _pane_record."""
+        with self._lock:
+            return self._cwd.get(pane_id, "")
+
     # ── state application ─────────────────────────────────────────────────────
     def _apply_pane(self, pane: dict, now: float) -> tuple[str, str | None, str | None, dict] | None:
         pid = pane.get("pane_id")
@@ -279,10 +309,20 @@ class LiveState:
             return None
         rec = _pane_record(pane, self._workspaces)
         prev = self._panes.get(pid)
+        # A RECYCLED id is a NEW pane, so the revision guard must not apply to
+        # it. herdr restarts revision numbering per pane: if a pane closes and
+        # a fresh one inherits the id with a lower revision, comparing
+        # revisions alone drops every update for it forever — status, agent and
+        # cwd stay those of the dead occupant and no edge ever fires. `birth`
+        # (terminal_id) is what tells them apart.
+        if prev and rec["birth"] and prev.get("birth") and rec["birth"] != prev["birth"]:
+            self._since.pop(pid, None)
+            self._status_event_at.pop(pid, None)
+            prev = None
         if prev and rec["revision"] and prev["revision"] > rec["revision"]:
             # A pane_updated that the socket buffered during a bootstrap can
             # arrive after the snapshot that already superseded it. Revisions
-            # are monotonic per pane, so the older one is simply dropped.
+            # are monotonic WITHIN one pane, so the older one is simply dropped.
             return None
         if (prev and rec["agent_status"] != prev["agent_status"]
                 and now - self._status_event_at.get(pid, 0.0) < STATUS_EVENT_STICKY_S):
@@ -294,6 +334,9 @@ class LiveState:
             # for a moment after one lands, an output event may refresh every
             # field EXCEPT the status.
             rec["agent_status"] = prev["agent_status"]
+        cwd = pane.get("foreground_cwd") or pane.get("cwd")
+        if cwd:
+            self._cwd[pid] = cwd
         self._panes[pid] = rec
         before = prev["agent_status"] if prev else None
         if before != rec["agent_status"]:
@@ -310,7 +353,13 @@ class LiveState:
 
     def _drop_pane(self, pane_id: str) -> tuple[str, str | None, str | None, dict] | None:
         prev = self._panes.pop(pane_id, None)
+        # EVERY per-pane map, not just _since. _status_event_at used to survive
+        # here, which both grew without bound on a fleet that recycles panes and
+        # let a recycled pane id inherit a stale sticky-status timestamp — able
+        # to suppress the new occupant's first real status for STATUS_EVENT_STICKY_S.
         self._since.pop(pane_id, None)
+        self._status_event_at.pop(pane_id, None)
+        self._cwd.pop(pane_id, None)
         if not prev:
             return None
         self._bump()
@@ -390,7 +439,12 @@ class LiveState:
                     rec = {"pane_id": pid, "workspace_id": wid,
                            "workspace": self._workspaces.get(wid) or wid,
                            "tab_id": "", "label": data.get("title"),
-                           "agent": data.get("agent"), "agent_status": "unknown", "revision": 0}
+                           "agent": data.get("agent"), "agent_status": "unknown",
+                           # The status event carries no terminal_id. Empty means
+                           # UNKNOWN, never "mismatch": a consumer may only refuse
+                           # on a definite disagreement, and the next pane_updated
+                           # or snapshot fills this in.
+                           "birth": "", "revision": 0}
                     self._panes[pid] = rec
                 merged = dict(rec)
                 merged["agent_status"] = data.get("agent_status") or "unknown"
@@ -504,6 +558,7 @@ class LiveState:
         wire = _Wire(socket_path(), timeout=5.0)
         try:
             subs, covered = self._subscriptions()
+            degraded = any(s["type"] == "pane.agent_status_changed" for s in subs) is False
             wire.send({"id": "herdr-live", "method": "events.subscribe",
                        "params": {"subscriptions": subs}})
             ack = wire.read(timeout=5.0)
@@ -511,8 +566,17 @@ class LiveState:
                 if self._subscribe_rejected(ack):
                     return True
                 raise ConnectionError(f"subscribe not acknowledged: {ack!r}")
-            with self._lock:
-                self._subscribe_failures = 0
+            # NOT reset on a degraded ack. Clearing the counter here made the
+            # next attempt rebuild the full (rejecting) subscription set, so
+            # degraded mode became a 4-connect cycle that repeated forever:
+            # measured against a stub that keeps rejecting, 767,698 connects and
+            # 767,697 session.snapshot RPCs in TWO SECONDS, event loop entered
+            # zero times, while stats still said connected:true and
+            # last_error:null. Against the real socket that is precisely the
+            # single-threaded saturation this module exists to remove.
+            if not degraded:
+                with self._lock:
+                    self._subscribe_failures = 0
 
             # Bootstrap AFTER the subscription is live (see module docstring).
             self._emit(self._apply_snapshot(request("session.snapshot")))
@@ -520,7 +584,7 @@ class LiveState:
                 self.stats["connected"] = True
                 self.stats["connected_since"] = time.time()
                 self.stats["last_error"] = None
-                uncovered = set(self._panes) - covered
+                uncovered = set() if degraded else set(self._panes) - covered
             if uncovered:
                 # Every pane needs its own `pane.agent_status_changed`
                 # subscription (the schema requires a pane_id), and the first
@@ -553,12 +617,34 @@ class LiveState:
 
     def _stream_forever(self) -> None:
         backoff = 0.5
+        rapid = 0
+        last = 0.0
         while not self._stop.is_set():
             try:
+                started = time.monotonic()
                 resubscribe = self._connect_and_stream()
                 backoff = 0.5
                 with self._lock:
                     self.stats["resubscribes" if resubscribe else "reconnects"] += 1
+                # A FLOOR on the resubscribe path. It is deliberately not a
+                # failure (a new pane legitimately needs a wider subscription),
+                # so it does not back off — which means any bug that returns
+                # True immediately becomes a hot loop hammering the socket. One
+                # did: the degraded-mode cycle above turned into ~380k
+                # connect+snapshot round trips per second. Converging normally
+                # takes two connects, so more than a handful of sub-second
+                # cycles in a row is a bug, and the right response is to slow
+                # down and say so rather than to saturate the server.
+                if time.monotonic() - started < 0.25:
+                    rapid += 1
+                else:
+                    rapid = 0
+                if rapid >= 5:
+                    pause = min(0.5 * (rapid - 4), 10.0)
+                    if time.monotonic() - last > 30:
+                        self._log(f"subscription cycling ({rapid} sub-second connects); pacing {pause:.1f}s")
+                        last = time.monotonic()
+                    self._stop.wait(pause)
             except Exception as exc:
                 with self._lock:
                     self.stats["connected"] = False

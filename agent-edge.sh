@@ -51,7 +51,8 @@ status="${2:-}"
 previous="${3:-}"
 agent="${4:-}"
 cwd="${5:-}"
-[ -n "$pane" ] && [ -n "$status" ] || { echo "usage: agent-edge.sh <pane_id> <status> [previous] [agent] [cwd]" >&2; exit 0; }
+birth="${6:-}"                          # herdr's terminal_id for this pane, if known
+[ -n "$pane" ] && [ -n "$status" ] || { echo "usage: agent-edge.sh <pane_id> <status> [previous] [agent] [cwd] [birth]" >&2; exit 0; }
 
 # shellcheck source=config.sh
 . "$here/config.sh" 2>/dev/null || true
@@ -62,7 +63,19 @@ STATE_DIR="${HERDR_STATE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/herdr-control}"
 LOG="$STATE_DIR/agent-edges.jsonl"
 BRIDGE_STATE="${HERDR_BRIDGE_STATE:-$HOME/.config/herdr-bridge}"
 PENDING="$BRIDGE_STATE/pending.jsonl"
-GRACE="${HERDR_EDGE_ALERT_GRACE_S:-20}"
+# The backstop must never beat lib/alert-gate.sh to Slack. The gate holds a
+# non-human-reserved prompt for HERDR_ALERT_GRACE_S (default 90) precisely so
+# an allow-class approval a peer answers in seconds does not page anybody —
+# that hold is the fix for the 2026-09-12 Slack flood. A 20s backstop wins that
+# race every time: it would page every held prompt (the dominant path under
+# --approval-mode write), and then the gate's own re-alert would post a SECOND
+# message for the same prompt at 90s.
+#
+# So the backstop waits for the gate to have had its turn, plus a margin. By
+# then a hook that works has already posted AND recorded the alert in
+# pending.jsonl, so the dedupe below suppresses us — and we only speak for the
+# panes the gate never covered, which is the whole point of a backstop.
+GRACE="${HERDR_EDGE_ALERT_GRACE_S:-$(( ${HERDR_ALERT_GRACE_S:-90} + 30 ))}"
 # Test seams, same convention as herdr-resolve.sh's HERDR_RESOLVE_CURL: the
 # suite must be able to exercise every branch without posting to Slack,
 # pressing a key, or needing a hub. config.sh exports its own PATH, so
@@ -76,9 +89,17 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 # The audit trail for a control plane that now ACTS on events: every edge and
 # what it decided to do, trimmed so it can never fill the disk. Without this,
 # "did the fleet notice?" is unanswerable after the fact.
+#
+# Built with jq, not interpolation: `agent` and the pane label are whatever an
+# integration reported, so a value containing a quote or a newline could forge
+# records in the very file that is supposed to answer "did the fleet notice?".
+# Same discipline as herdr-notify.sh and lib/run-registry.sh.
 note() {
-  printf '{"at":"%s","pane":"%s","status":"%s","previous":"%s","agent":"%s","did":"%s"}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pane" "$status" "$previous" "$agent" "$1" >> "$LOG" 2>/dev/null || true
+  jq -nc --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg pane "$pane" \
+     --arg status "$status" --arg previous "$previous" --arg agent "$agent" \
+     --arg did "$1" \
+     '{at:$at,pane:$pane,status:$status,previous:$previous,agent:$agent,did:$did}' \
+     >> "$LOG" 2>/dev/null || true
   if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 2000 ]; then
     tail -n 1000 "$LOG" > "$LOG.trim" 2>/dev/null && mv "$LOG.trim" "$LOG" 2>/dev/null || true
   fi
@@ -98,13 +119,32 @@ note() {
 # stayed `blocked` for another 16 seconds, and only a by-hand call proved the
 # code path worked. `reg=` now says which.
 follow_registry() {
-  local want="$1" task run_id task_id err
+  local want="$1" task run_id task_id reg_birth err
   command -v task_for_pane >/dev/null 2>&1 || { printf 'reg=no-registry'; return 0; }
   task=$(task_for_pane "$pane" 2>/dev/null) || { printf 'reg=lookup-failed'; return 0; }
   [ -n "$task" ] || { printf 'reg=no-task'; return 0; }
   run_id=$(printf '%s' "$task" | jq -r '.run_id // empty' 2>/dev/null)
   task_id=$(printf '%s' "$task" | jq -r '.task_id // empty' 2>/dev/null)
   [ -n "$run_id" ] && [ -n "$task_id" ] || { printf 'reg=unidentified'; return 0; }
+  # PANE IDS ARE RECYCLED. task_for_pane returns the most-recently-updated row
+  # for this id, so without a birth comparison this writer can flip a DEAD
+  # worker's row (and append a state_changed event) because an unrelated new
+  # pane inherited its id. Every other writer here already refuses on a
+  # mismatch — herdr-select.sh gates its identical bookkeeping write on it,
+  # lib/pane-guard.sh refuses input, lib/reconcile.sh calls it pane_recycled —
+  # and the security review found this was the one path that could not, because
+  # the live record carried no terminal_id. It does now, passed in as $6.
+  #
+  # Refuse only on a DEFINITE disagreement: an empty birth on either side means
+  # unknown (a status event carries no terminal_id, and an older registration
+  # may predate the field), and refusing on unknown would stop healing the very
+  # rows this exists to heal.
+  reg_birth=$(printf '%s' "$task" | jq -r '.pane_birth // empty' 2>/dev/null)
+  if [ -n "$reg_birth" ] && [ -n "$birth" ] && [ "$reg_birth" != "$birth" ]; then
+    printf 'reg=refused(pane recycled: registered %s, live %s)' \
+      "$(printf '%s' "$reg_birth" | cut -c1-12)" "$(printf '%s' "$birth" | cut -c1-12)"
+    return 0
+  fi
   if err=$(set_task_state "$run_id" "$task_id" "$want" 2>&1 >/dev/null); then
     printf 'reg=%s' "$want"
   else
@@ -117,12 +157,26 @@ pane_has_pending_alert() {
   jq -e --arg p "$pane" -s 'any(.[]; .pane == $p)' "$PENDING" >/dev/null 2>&1
 }
 
-still_blocked() {
-  # Ask the hub, not herdr: the subscription already knows, and this must not
-  # reintroduce a per-edge `herdr pane read`.
-  local url="${HERDR_HUB_URL:-http://127.0.0.1:${HERDR_HUB_PORT:-8600}/}"
-  "$CURL" -s --max-time 3 "${url}api/panes" 2>/dev/null \
-    | jq -e --arg p "$pane" 'any(.panes[]?; .pane_id == $p and .agent_status == "blocked")' >/dev/null 2>&1
+# THREE answers, not two: blocked | cleared | unknown.
+#
+# This used to be a curl+jq pipeline read as a boolean, so every failure —
+# hub restarting (./restart.sh does exactly that), a response slower than
+# --max-time, malformed JSON, curl missing — came back "not blocked", which
+# suppressed the alert AND wrote `cleared within grace, no alert` into the
+# audit file. The alert was dropped precisely when the control plane was least
+# healthy, and the record asserted the prompt had cleared. A monitor must never
+# confuse "it is fine" with "I could not look".
+pane_probe() {
+  local url="${HERDR_HUB_URL:-http://127.0.0.1:${HERDR_HUB_PORT:-8600}/}" body
+  body=$("$CURL" -s --max-time 3 "${url}api/panes" 2>/dev/null) || { printf 'unknown'; return 0; }
+  printf '%s' "$body" | jq -e '.connected == true and (.panes | type) == "array"' >/dev/null 2>&1 \
+    || { printf 'unknown'; return 0; }
+  if printf '%s' "$body" | jq -e --arg p "$pane" \
+       'any(.panes[]?; .pane_id == $p and .agent_status == "blocked")' >/dev/null 2>&1; then
+    printf 'blocked'
+  else
+    printf 'cleared'
+  fi
 }
 
 case "$status" in
@@ -137,24 +191,43 @@ case "$status" in
     if [ "${HERDR_EDGE_PEER_ANSWER:-0}" = "1" ]; then
       # One round, this pane only. peer-answer re-parses and refuses anything
       # that is not a complete recognised menu, and command-policy decides
-      # whether it may answer at all.
-      bash "$PEER_ANSWER" --max-rounds 1 "$pane" >/dev/null 2>&1 || true
+      # whether it may answer at all. `--agent` is passed because the
+      # capability profile is meant to be DECLARED for the agent actually in
+      # the pane (docs/approval-policy.md rule 4), not defaulted to omp.
+      bash "$PEER_ANSWER" --max-rounds 1 ${agent:+--agent "$agent"} "$pane" >/dev/null 2>&1 || true
       note "peer-answer(1 round)"
     fi
     sleep "$GRACE"
-    if ! still_blocked; then
-      note "cleared within grace, no alert"
-      exit 0
-    fi
+    case "$(pane_probe)" in
+      cleared)
+        note "cleared within grace, no alert"
+        exit 0 ;;
+      unknown)
+        # Could not ask. Fail toward alerting: a missed page on a blocked
+        # worker is the failure this script exists to prevent, and a duplicate
+        # is recoverable (the hook's own entry, if any, dedupes below).
+        note "probe unreachable — alerting anyway" ;;
+    esac
     if pane_has_pending_alert; then
       note "already alerted by the worker's own hook"
       exit 0
     fi
     msg="$agent needs input"
     [ -n "$cwd" ] && msg="$msg  ·  ${cwd##*/}"
-    bash "$NOTIFY" --pane "$pane" \
+    # --choices, exactly like the hook path (agent-hooks/omp-notify.sh:110).
+    # Without it herdr-notify never builds `blocks`, and its pending.jsonl
+    # append is gated on `blocks` — so the message would be posted with NO
+    # queue record: un-retractable by herdr-resolve.sh (the "armed Slack
+    # message with no record" state it exists to prevent), invisible to the
+    # dedupe above (so every later prompt on that pane posts another one), and
+    # button-less, i.e. strictly weaker than the alert it stands in for.
+    bash "$NOTIFY" --choices --pane "$pane" \
       "${msg} (no hook alert after ${GRACE}s — control-plane backstop)" >/dev/null 2>&1 || true
-    note "backstop alert $reg"
+    if pane_has_pending_alert; then
+      note "backstop alert (queued for retraction) $reg"
+    else
+      note "backstop alert NOT QUEUED — retraction will not find it $reg"
+    fi
     ;;
   working|idle)
     if [ -z "$previous" ]; then

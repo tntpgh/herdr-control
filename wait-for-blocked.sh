@@ -129,13 +129,27 @@ wait_via_hub() {
       printf '%s\n' "$hits" | report
       return 0
     fi
-    idle=$((idle + 1))
-    if [ "$SCRAPE_EVERY" -gt 0 ] && [ $((idle % SCRAPE_EVERY)) -eq 0 ]; then
-      hits=$(scrape_backstop)
-      if [ -n "$hits" ]; then
-        printf '%s\n' "$hits" | report
-        return 0
+    # `idle` counts TIMEOUTS, not iterations. The hub's version bumps on ANY
+    # pane's status change fleet-wide — including the working<->idle flaps the
+    # hub deliberately does not act on — so a busy fleet returns `changed:true`
+    # immediately, over and over. Counting iterations made the scrape backstop
+    # fire every 4th ROUND TRIP instead of every 4th quiet period: measured
+    # 237 hub requests and 188 real `herdr` CLI calls in 5 seconds of a
+    # nominal 600s wait, which reintroduces the scrape storm this file exists
+    # to remove, from the function whose header claims zero RPCs while waiting.
+    if printf '%s' "$body" | jq -e '.changed == false' >/dev/null 2>&1; then
+      idle=$((idle + 1))
+      if [ "$SCRAPE_EVERY" -gt 0 ] && [ $((idle % SCRAPE_EVERY)) -eq 0 ]; then
+        hits=$(scrape_backstop)
+        if [ -n "$hits" ]; then
+          printf '%s\n' "$hits" | report
+          return 0
+        fi
       fi
+    else
+      # A change we do not care about. Do not spin: one round trip per fleet
+      # status change is still a poll, just one somebody else is triggering.
+      sleep "${HERDR_WAIT_MIN_INTERVAL_S:-1}"
     fi
   done
 }

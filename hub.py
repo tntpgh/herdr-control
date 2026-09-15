@@ -188,6 +188,34 @@ def edge_is_actionable(before: str | None, after: str | None) -> bool:
     return herdr_live.BLOCKED in (before, after)
 
 
+# In-flight edge scripts. Each blocked edge holds a shell for the whole grace
+# window, and `blocked` is the fleet's highest-frequency transition under
+# --approval-mode write, so an uncapped fan-out is a real process bomb: the
+# edge queue's maxsize protects the STREAM thread, not the machine, because
+# Popen returns immediately and nothing applies back-pressure. Past the cap we
+# drop the edge and say so in the log rather than forking anyway — state stays
+# correct either way (the next transition or an idle resync re-derives it).
+EDGE_MAX_INFLIGHT = int(os.environ.get("HERDR_EDGE_MAX_INFLIGHT", "12"))
+_EDGE_INFLIGHT: list[subprocess.Popen] = []
+_EDGE_LOCK = threading.Lock()
+
+# Parked /api/blocked/wait requests. One per supervisor is the expected load;
+# the cap exists so a local process cannot turn a thread-per-connection server
+# into a wedged one (see the handler).
+WAIT_MAX_CONCURRENT = int(os.environ.get("HERDR_HUB_MAX_WAITERS", "32"))
+_WAITERS = {"n": 0}
+_WAITERS_LOCK = threading.Lock()
+
+
+def _edge_slot() -> bool:
+    """Reap finished edge children, then take a slot if one is free."""
+    with _EDGE_LOCK:
+        _EDGE_INFLIGHT[:] = [p for p in _EDGE_INFLIGHT if p.poll() is None]
+        if len(_EDGE_INFLIGHT) >= EDGE_MAX_INFLIGHT:
+            return False
+        return True
+
+
 def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dict) -> None:
     """One transition, handed to the shell that owns alerting and answering.
 
@@ -196,6 +224,10 @@ def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dic
     page. `before` is empty on first observation (process start or reconnect
     diff) — the script treats that as "reconcile", not "a prompt just
     appeared", because a fresh hub must not re-alert a prompt already alerted.
+
+    `cwd` comes from LIVE.cwd_of(), not from the served record: absolute paths
+    are not published on the unauthenticated API (see _pane_record), but the
+    script still wants one for its Slack line.
     """
     if not AGENT_EDGE.exists():
         return
@@ -203,13 +235,20 @@ def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dic
         return  # a plain shell pane has no prompt to alert and no task to follow
     if not edge_is_actionable(before, after):
         return
+    if not _edge_slot():
+        _live_log(f"edge dropped for {pane_id} {before}->{after}: "
+                  f"{EDGE_MAX_INFLIGHT} already in flight")
+        return
     try:
-        subprocess.Popen(
+        child = subprocess.Popen(
             ["bash", str(AGENT_EDGE), pane_id, after or "gone", before or "",
-             rec.get("agent") or "", rec.get("cwd") or ""],
+             rec.get("agent") or "", (LIVE.cwd_of(pane_id) if LIVE else ""),
+             rec.get("birth") or ""],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        with _EDGE_LOCK:
+            _EDGE_INFLIGHT.append(child)
     except OSError as exc:
         _live_log(f"edge spawn failed for {pane_id}: {exc}")
 
@@ -1517,7 +1556,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, "text/plain", b"since and timeout must be numbers")
             if LIVE is None:
                 return self._send(503, "application/json", b'{"connected":false,"error":"watcher not started"}')
-            version = LIVE.wait_for_change(since, timeout)
+            # The DURATION of one wait was bounded; the NUMBER of simultaneous
+            # waits was not. ThreadingHTTPServer spawns a thread per connection
+            # with no cap, and any local process (or a rebinding page in the
+            # browser, since this surface has no auth) can park thousands on
+            # `timeout=300`, pinning a thread and a descriptor each until the
+            # hub stops answering anything — which, via agent-edge.sh's probe,
+            # also silences every in-flight blocked-worker alert. Past the cap
+            # a caller is told to come back rather than parked.
+            with _WAITERS_LOCK:
+                if _WAITERS["n"] >= WAIT_MAX_CONCURRENT:
+                    return self._send(503, "application/json", json.dumps(
+                        {"connected": live_data().get("connected"), "error": "too many waiters",
+                         "retry_after_s": 1}).encode())
+                _WAITERS["n"] += 1
+            try:
+                version = LIVE.wait_for_change(since, timeout)
+            finally:
+                with _WAITERS_LOCK:
+                    _WAITERS["n"] -= 1
             live = live_data()
             return self._send(200, "application/json", json.dumps(
                 {"connected": live.get("connected"), "version": version,
