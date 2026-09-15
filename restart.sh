@@ -82,7 +82,7 @@ if [ ${#WANT[@]} -gt 0 ]; then
 fi
 
 verify() {
-  local fail=0 entry label url want st
+  local fail=0 entry label url want st live
   echo "===== VERIFY ====="
   # macOS ships bash 3.2: no mapfile. A while-read over process substitution
   # keeps `fail` in this shell (a pipe would not).
@@ -99,6 +99,18 @@ verify() {
     # shellcheck disable=SC2086
     probe_http "${label#com.herdr-control.}" "$url" $want || fail=1
   done < <(services)
+  # The hub's herdr subscription is a service in its own right now: every
+  # blocked-worker surface reads it, and a listener answering 200 while the
+  # subscription is dead would report an empty, silent fleet. `connected` is
+  # the only honest check.
+  printf "  %-34s " "hub herdr subscription"
+  live=$(curl -s --max-time 5 "http://127.0.0.1:${HERDR_HUB_PORT:-8600}/api/panes" 2>/dev/null)
+  if printf '%s' "$live" | jq -e '.connected == true' >/dev/null 2>&1; then
+    echo "UP   ($(printf '%s' "$live" | jq -r '"\(.panes | length) panes, \(.stats.events) events, \(.stats.reconnects) reconnects, \(.blocked | length) blocked"'))"
+  else
+    echo "DOWN ($(printf '%s' "$live" | jq -r '.stats.last_error // "no response"' 2>/dev/null || echo 'no response'))" >&2
+    fail=1
+  fi
   if command -v herdr >/dev/null 2>&1; then
     echo
     echo "  panes open: $(herdr pane list 2>/dev/null | grep -o '"pane_id"' | wc -l | tr -d ' ')"

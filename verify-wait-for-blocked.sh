@@ -28,6 +28,9 @@ bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 export HERDR_PANES_JSON="$WORK/panes.json"
 export HERDR_READ_TEXT="$WORK/read.txt"
 herdr() {
+  # Every call is logged when HERDR_CALL_LOG is set, so the hub-mode section
+  # can assert that discovery asked herdr NOTHING.
+  [ -n "${HERDR_CALL_LOG:-}" ] && printf '%s\n' "$*" >> "$HERDR_CALL_LOG"
   case "$1 $2" in
     "pane list") cat "$HERDR_PANES_JSON" ;;
     "pane read") cat "$HERDR_READ_TEXT" 2>/dev/null ;;
@@ -41,6 +44,13 @@ none_blocked() { printf '{"result":{"panes":[{"pane_id":"w1:p1","label":"idle","
 one_blocked()  { printf '{"result":{"panes":[{"pane_id":"w1:p1","label":"idle","workspace_id":"ws1","agent_status":"working"},{"pane_id":"w2:p1","label":"stuck","workspace_id":"ws2","agent_status":"blocked"}]}}\n' > "$HERDR_PANES_JSON"; }
 two_blocked()  { printf '{"result":{"panes":[{"pane_id":"w2:p1","label":"stuck-a","workspace_id":"ws2","agent_status":"blocked"},{"pane_id":"w3:p1","label":"stuck-b","workspace_id":"ws3","agent_status":"blocked"}]}}\n' > "$HERDR_PANES_JSON"; }
 printf 'Do you want to proceed?\n1. Yes\n2. No\n' > "$HERDR_READ_TEXT"
+
+# Everything below the hub section drives the POLLING path deliberately. The
+# shipping default is the hub's long-poll (`/api/blocked/wait`), and without
+# this the suite would silently talk to whatever real hub is running on this
+# machine, ignore every fixture, and hang until the harness timeout — which is
+# exactly how it failed on 2026-09-15.
+export HERDR_WAIT_MODE=poll
 
 wfb() { bash "$here/wait-for-blocked.sh" "$@" >"$WORK/out.txt" 2>"$WORK/err.txt"; }
 
@@ -103,6 +113,73 @@ printf '== herdr not on PATH (and no stub function in scope): exit 2, explains =
 out=$(env -i PATH=/nonexistent "$(command -v bash)" "$here/wait-for-blocked.sh" 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "exit 2" || bad "exit $rc (expected 2)"
 printf '%s' "$out" | grep -q "herdr not on PATH" && ok "explains the missing dependency" || bad "no explanation: $out"
+
+printf '== HUB MODE: waits on the subscription, and makes NO herdr call to find out ==\n'
+# A stub hub, because the point of this path is that the answer comes from the
+# hub's herdr subscription rather than from herdr: the stub `herdr` function
+# above records every call it receives, and this section asserts there were
+# none.
+HUB_DIR="$WORK/hub"; mkdir -p "$HUB_DIR"
+cat > "$HUB_DIR/hub.py" <<'PYHUB'
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+STATE = os.environ["STUB_HUB_STATE"]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+    def do_GET(self):
+        body = json.load(open(STATE))
+        path = self.path.split("?")[0]
+        if path == "/api/panes":
+            out = {"connected": body["connected"], "version": 1, "stats": {},
+                   "panes": body["panes"], "blocked": [p for p in body["panes"] if p["agent_status"] == "blocked"]}
+        else:
+            out = {"connected": body["connected"], "version": 1, "changed": True,
+                   "blocked": [p for p in body["panes"] if p["agent_status"] == "blocked"]}
+        raw = json.dumps(out).encode()
+        self.send_response(200); self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PYHUB
+export STUB_HUB_STATE="$HUB_DIR/state.json"
+hub_state() { printf '%s\n' "$1" > "$STUB_HUB_STATE"; }
+hub_state '{"connected": true, "panes": [{"pane_id":"w2:p1","label":"stuck","workspace":"ws2","agent_status":"blocked"}]}'
+PORT=8712
+python3 "$HUB_DIR/hub.py" "$PORT" & HUB_PID=$!
+trap '{ kill "$HUB_PID"; wait "$HUB_PID"; } 2>/dev/null; rm -rf "$WORK"' EXIT
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  curl -s --max-time 1 "http://127.0.0.1:$PORT/api/blocked" >/dev/null 2>&1 && break
+  sleep 0.3
+done
+
+: > "$WORK/herdr-calls"
+export HERDR_CALL_LOG="$WORK/herdr-calls"
+env HERDR_WAIT_MODE=auto HERDR_HUB_URL="http://127.0.0.1:$PORT/" HERDR_WAIT_SCRAPE_EVERY=0 \
+  bash "$here/wait-for-blocked.sh" 5 4 >"$WORK/out.txt" 2>"$WORK/err.txt"; rc=$?
+[ "$rc" -eq 0 ] && ok "hub mode exits 0 on a blocked pane" || bad "exit $rc: $(cat "$WORK/err.txt")"
+grep -q "w2:p1" "$WORK/out.txt" && ok "reports the pane the subscription named" || bad "pane missing: $(cat "$WORK/out.txt")"
+[ ! -s "$WORK/herdr-calls" ] || grep -qv 'pane list' "$WORK/herdr-calls" \
+  && ok "discovery made no \`herdr pane list\` call — the hub answered" \
+  || bad "hub mode still polled herdr: $(cat "$WORK/herdr-calls")"
+
+hub_state '{"connected": true, "panes": [{"pane_id":"w1:p1","label":"fine","workspace":"ws1","agent_status":"working"}]}'
+env HERDR_WAIT_MODE=auto HERDR_HUB_URL="http://127.0.0.1:$PORT/" HERDR_WAIT_SCRAPE_EVERY=0 \
+  bash "$here/wait-for-blocked.sh" 1 2 >"$WORK/out.txt" 2>"$WORK/err.txt"; rc=$?
+[ "$rc" -eq 3 ] && ok "hub mode times out when nobody is blocked" || bad "exit $rc (expected 3)"
+
+printf '== HUB DOWN / SUBSCRIPTION DOWN: falls back to polling, never goes blind ==\n'
+hub_state '{"connected": false, "panes": []}'
+one_blocked
+env HERDR_WAIT_MODE=auto HERDR_HUB_URL="http://127.0.0.1:$PORT/" \
+  bash "$here/wait-for-blocked.sh" 1 3 >"$WORK/out.txt" 2>"$WORK/err.txt"; rc=$?
+[ "$rc" -eq 0 ] && grep -q "w2:p1" "$WORK/out.txt" \
+  && ok "a subscription reporting connected:false degrades to polling and still finds the pane" \
+  || bad "exit $rc, out=$(cat "$WORK/out.txt") err=$(cat "$WORK/err.txt")"
+
+env HERDR_WAIT_MODE=auto HERDR_HUB_URL="http://127.0.0.1:59999/" \
+  bash "$here/wait-for-blocked.sh" 1 3 >"$WORK/out.txt" 2>"$WORK/err.txt"; rc=$?
+[ "$rc" -eq 0 ] && grep -q "w2:p1" "$WORK/out.txt" \
+  && ok "no hub at all degrades to polling too" \
+  || bad "exit $rc, out=$(cat "$WORK/out.txt") err=$(cat "$WORK/err.txt")"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

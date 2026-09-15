@@ -13,8 +13,16 @@ the two things that need a human — attention items and open decisions.
   /search      consensus-search memory: totals, last queries, replay counts
   /kb          knowledge-base: nightly ledger, heartbeat, repeat-view signal audits
   /links       every surface with a liveness dot
-  /api/summary {attention, open_decisions} — what the omp extension's one-liner reads
+  /api/summary {attention, live_blocked, open_decisions} — what the omp extension's one-liner reads
+  /api/panes   every pane herdr knows, with its agent and live agent_status
+  /api/blocked just the panes waiting on a person, joined to their task
+  /api/blocked/wait?since=N&timeout=S  long-poll: returns the instant that changes
   any page     ?json=1 → the page's data as JSON
+
+The hub holds ONE `events.subscribe` connection to herdr (lib/herdr_live.py)
+and treats herdr's own agent_status as authoritative for "a human is being
+waited for". That is what /api/blocked/wait serves, so a supervisor no longer
+polls `herdr pane list` + `pane read` per pane per tick to learn it.
 
 Sources (all read-only): ~/.local/state/herdr/runs/registry.sqlite3 (herdr),
 ~/.local/state/herdr/forms/*.json (formserve registry), consensus-search
@@ -55,6 +63,7 @@ from pathlib import Path
 # whatever cwd the plist gives it, so the path is derived from __file__.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from record_store import NotClaimable, claim_and_update  # noqa: E402
+import herdr_live  # noqa: E402
 
 DEFAULT_PORT = int(os.environ.get("HERDR_HUB_PORT", "8600"))
 STATE = Path(os.environ.get("HERDR_STATE_ROOT", Path.home() / ".local/state/herdr"))
@@ -138,6 +147,131 @@ def herdr_data(event_limit: int = 100) -> dict:
                        key=lambda t: (ATTENTION.index(t["state"]), t["updated_at"]))
     return {"tasks": tasks, "attention": attention, "events": events,
             "checkpoints": checkpoints, "max_event_seq": max_seq}
+
+
+# ── live herdr state: pushed by subscription, never scraped ────────────────────
+# The registry above is the DURABLE record — task identity, conductor routing,
+# the event log. It is written by scripts, so `tasks.state` is only as fresh as
+# the last writer, and a card reading "running" for a worker that has been
+# sitting on an approval menu for an hour is the exact failure this pairs with:
+# on 2026-09-12 a session escalated two tasks as blocked off status labels that
+# were already `completed`, and on 2026-09-14 the reverse (a live-blocked pane
+# the registry had not caught up to) kept every tool call in every pane paying
+# for a pending-alert sweep.
+#
+# So the hub now holds ONE long-lived `events.subscribe` connection to herdr
+# (lib/herdr_live.py) and treats herdr's own agent_status as authoritative for
+# "is a human being waited for". The registry stays authoritative for identity.
+# Where they disagree, the page SAYS SO rather than picking silently.
+LIVE: herdr_live.LiveState | None = None
+AGENT_EDGE = Path(__file__).resolve().parent / "agent-edge.sh"
+
+
+def _live_log(msg: str) -> None:
+    print(f"hub: live: {msg}", file=sys.stderr, flush=True)
+
+
+def edge_is_actionable(before: str | None, after: str | None) -> bool:
+    """Which transitions are worth a subprocess.
+
+    A busy agent pane flips working<->idle on every turn. Dispatching those
+    would spawn a shell per flap per pane to conclude "noop" — the same
+    busywork this whole change removes — so only three cases reach the script:
+
+      * something became `blocked` (a human is now being waited for),
+      * something WAS `blocked` (the prompt was answered: retract and follow),
+      * a first observation (`before` is None), which is the reconcile pass a
+        hub start owes the registry.
+    """
+    if before is None:
+        return True
+    return herdr_live.BLOCKED in (before, after)
+
+
+# In-flight edge scripts. Each blocked edge holds a shell for the whole grace
+# window, and `blocked` is the fleet's highest-frequency transition under
+# --approval-mode write, so an uncapped fan-out is a real process bomb: the
+# edge queue's maxsize protects the STREAM thread, not the machine, because
+# Popen returns immediately and nothing applies back-pressure. Past the cap we
+# drop the edge and say so in the log rather than forking anyway — state stays
+# correct either way (the next transition or an idle resync re-derives it).
+EDGE_MAX_INFLIGHT = int(os.environ.get("HERDR_EDGE_MAX_INFLIGHT", "12"))
+_EDGE_INFLIGHT: list[subprocess.Popen] = []
+_EDGE_LOCK = threading.Lock()
+
+# Parked /api/blocked/wait requests. One per supervisor is the expected load;
+# the cap exists so a local process cannot turn a thread-per-connection server
+# into a wedged one (see the handler).
+WAIT_MAX_CONCURRENT = int(os.environ.get("HERDR_HUB_MAX_WAITERS", "32"))
+_WAITERS = {"n": 0}
+_WAITERS_LOCK = threading.Lock()
+
+
+def _edge_slot() -> bool:
+    """Reap finished edge children, then take a slot if one is free."""
+    with _EDGE_LOCK:
+        _EDGE_INFLIGHT[:] = [p for p in _EDGE_INFLIGHT if p.poll() is None]
+        if len(_EDGE_INFLIGHT) >= EDGE_MAX_INFLIGHT:
+            return False
+        return True
+
+
+def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dict) -> None:
+    """One transition, handed to the shell that owns alerting and answering.
+
+    Fire-and-forget by construction: the edge script does Slack, push-wake and
+    peer-answer work that must never be able to stall the subscription or the
+    page. `before` is empty on first observation (process start or reconnect
+    diff) — the script treats that as "reconcile", not "a prompt just
+    appeared", because a fresh hub must not re-alert a prompt already alerted.
+
+    `cwd` comes from LIVE.cwd_of(), not from the served record: absolute paths
+    are not published on the unauthenticated API (see _pane_record), but the
+    script still wants one for its Slack line.
+    """
+    if not AGENT_EDGE.exists():
+        return
+    if not rec.get("agent"):
+        return  # a plain shell pane has no prompt to alert and no task to follow
+    if not edge_is_actionable(before, after):
+        return
+    if not _edge_slot():
+        _live_log(f"edge dropped for {pane_id} {before}->{after}: "
+                  f"{EDGE_MAX_INFLIGHT} already in flight")
+        return
+    try:
+        child = subprocess.Popen(
+            ["bash", str(AGENT_EDGE), pane_id, after or "gone", before or "",
+             rec.get("agent") or "", (LIVE.cwd_of(pane_id) if LIVE else ""),
+             rec.get("birth") or ""],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        with _EDGE_LOCK:
+            _EDGE_INFLIGHT.append(child)
+    except OSError as exc:
+        _live_log(f"edge spawn failed for {pane_id}: {exc}")
+
+
+def live_data() -> dict:
+    if LIVE is None:
+        return {"connected": False, "panes": [], "blocked": [], "agents": [],
+                "stats": {"last_error": "watcher not started"}}
+    return LIVE.data()
+
+
+def live_attention() -> list[dict]:
+    """Panes herdr says are waiting on a person, joined to their task label."""
+    live = live_data()
+    if not live.get("connected"):
+        return []
+    tasks = {t.get("pane_id"): t for t in (CACHES["herdr"].get() or {}).get("tasks", [])}
+    out = []
+    for pane in live.get("blocked", []):
+        task = tasks.get(pane["pane_id"]) or {}
+        out.append({**pane, "label": task.get("label") or pane.get("label") or pane["pane_id"],
+                    "task_id": task.get("task_id"), "registry_state": task.get("state")})
+    return out
 
 
 # ── formserve registry ─────────────────────────────────────────────────────────
@@ -1115,6 +1249,40 @@ def render_overview() -> str:
     return page("hub", "/", body)
 
 
+def _live_rows() -> str:
+    """herdr's own agent_status per pane, and where the registry disagrees.
+
+    Divergence is SHOWN, never silently resolved: `registry blocked / herdr
+    working` is a stale writer, `registry running / herdr blocked` is a worker
+    waiting on a human nobody told. Both were real incidents; a dashboard that
+    picks one source and hides the other cannot be checked."""
+    live = live_data()
+    stats = live.get("stats") or {}
+    if not live.get("connected"):
+        return ("<p class=dim>herdr subscription down — every row below would be stale, so none is shown. "
+                f"last error: {_esc(stats.get('last_error') or 'unknown')}</p>")
+    tasks = {t.get("pane_id"): t for t in (CACHES["herdr"].get() or {}).get("tasks", [])}
+    rows = []
+    for p in live.get("agents", []):
+        task = tasks.get(p["pane_id"]) or {}
+        reg = task.get("state")
+        blocked = p["agent_status"] == herdr_live.BLOCKED
+        diverges = bool(reg) and ((reg == "blocked") != blocked) and reg not in ("completed", "failed", "cancelled", "lost")
+        rows.append(
+            f"<tr{' class=hot' if blocked else ''}><td>{_esc(p['pane_id'])}</td>"
+            f"<td>{_esc(task.get('label') or p.get('label') or '')}</td>"
+            f"<td><span class='pill{' hot' if blocked else ''}'>{_esc(p['agent_status'])}</span></td>"
+            f"<td class=dim>{_esc(reg or '—')}{' <span class=\"pill hot\">diverges</span>' if diverges else ''}</td>"
+            f"<td class=dim>{_esc(p.get('agent') or '')} · {_esc(p.get('workspace') or '')}</td>"
+            f"<td class=age>{_age(dt.datetime.fromtimestamp(p['since'], dt.timezone.utc).isoformat()) if p.get('since') else ''}</td></tr>")
+    head = ("<tr><td class=dim>pane</td><td class=dim>task</td><td class=dim>herdr says</td>"
+            "<td class=dim>registry says</td><td class=dim>agent · workspace</td><td class=dim>in state</td></tr>")
+    meta = (f"<p class=dim>pushed by subscription · {stats.get('events', 0)} events, "
+            f"{stats.get('reconnects', 0)} reconnects, {stats.get('resyncs', 0)} idle resyncs, "
+            f"{stats.get('edges', 0)} edges" + (f", {stats['edges_dropped']} DROPPED" if stats.get("edges_dropped") else "") + "</p>")
+    return meta + "<table>" + head + ("".join(rows) or "<tr><td class=dim>no agent panes</td></tr>") + "</table>"
+
+
 def render_herdr() -> str:
     d = CACHES["herdr"].get()
     if d.get("error"):
@@ -1137,9 +1305,12 @@ def render_herdr() -> str:
         f"<div class=t>{_esc(x['name'].split(' — ')[0])}</div><div style='font-weight:600'>{'STALE · ' if x['stale'] else ''}{_esc(x['outcome'])}</div>"
         f"<div class=s>{_loop_age(x)} · {_esc(x['cadence'])}</div></a>" for x in lo.get("loops", []))
     sug = "".join(f"<li>{_esc(t['text'])}</li>" for t in lo.get("suggestions", [])[:5])
-    body = (f"<h2>Loops <a href='/loops' class=dim style='font-weight:400'>· all, with suggestions →</a></h2><div class=cards>{strip}</div>"
+    live_blocked = live_attention()
+    body = (f"<h2>Live fleet — herdr's own agent status</h2>{_live_rows()}"
+            f"<h2>Loops <a href='/loops' class=dim style='font-weight:400'>· all, with suggestions →</a></h2><div class=cards>{strip}</div>"
             + (f"<h2>Suggestions</h2><ul class=dim style='margin:0 0 6px;padding-left:18px'>{sug}</ul>" if sug else "")
-            + f"<h2>Needs attention ({len(d['attention'])})</h2><table>{task_rows(d['attention'])}</table>"
+            + f"<h2>Needs attention (live: {len(live_blocked)} · registry: {len(d['attention'])})</h2>"
+            f"<table>{task_rows(d['attention'])}</table>"
             f"<h2>Recent events (newest first)</h2><table>{''.join(ev) or '<tr><td class=dim>none</td></tr>'}</table>"
             f"<h2>Conductor cursors</h2><table>{cp or '<tr><td class=dim>none</td></tr>'}</table>"
             f"<h2>Other tasks (latest 40)</h2><table>{task_rows(others)}</table>")
@@ -1351,9 +1522,63 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "text/plain", b"ok")
         if path == "/api/summary":
             h, f = CACHES["herdr"].get(), CACHES["forms"].get()
+            # Attention is the UNION of what herdr says RIGHT NOW and what the
+            # registry recorded, deduped by pane. Counting only the registry is
+            # how a live-blocked worker stayed invisible for hours; counting
+            # only herdr would lose a task whose pane died while blocked.
+            live = live_attention()
+            panes = {x["pane_id"] for x in live}
+            registry = [t for t in h.get("attention", []) if t.get("pane_id") not in panes]
             return self._send(200, "application/json", json.dumps(
-                {"attention": len(h.get("attention", [])), "open_decisions": f.get("open_count", 0),
+                {"attention": len(live) + len(registry), "live_blocked": len(live),
+                 "registry_attention": len(h.get("attention", [])),
+                 "live_connected": live_data().get("connected", False),
+                 "open_decisions": f.get("open_count", 0),
                  "open_ids": ",".join(sorted(x["id"] for x in f.get("open", [])))}).encode())
+        if path == "/api/panes":
+            return self._send(200, "application/json", json.dumps(live_data(), default=str).encode())
+        if path == "/api/blocked":
+            live = live_data()
+            return self._send(200, "application/json", json.dumps(
+                {"connected": live.get("connected"), "version": live.get("version"),
+                 "blocked": live_attention()}, default=str).encode())
+        if path == "/api/blocked/wait":
+            # THE long-poll that replaces polling herdr. The caller passes the
+            # version it last saw; this returns the moment any agent status
+            # changes, or empty-handed at `timeout` so a supervisor loop still
+            # gets a heartbeat. Zero herdr RPCs either way — the answer comes
+            # from the subscription that is already open.
+            q = urllib.parse.parse_qs(query)
+            try:
+                since = int((q.get("since") or ["0"])[0])
+                timeout = max(1.0, min(float((q.get("timeout") or ["30"])[0]), 300.0))
+            except ValueError:
+                return self._send(400, "text/plain", b"since and timeout must be numbers")
+            if LIVE is None:
+                return self._send(503, "application/json", b'{"connected":false,"error":"watcher not started"}')
+            # The DURATION of one wait was bounded; the NUMBER of simultaneous
+            # waits was not. ThreadingHTTPServer spawns a thread per connection
+            # with no cap, and any local process (or a rebinding page in the
+            # browser, since this surface has no auth) can park thousands on
+            # `timeout=300`, pinning a thread and a descriptor each until the
+            # hub stops answering anything — which, via agent-edge.sh's probe,
+            # also silences every in-flight blocked-worker alert. Past the cap
+            # a caller is told to come back rather than parked.
+            with _WAITERS_LOCK:
+                if _WAITERS["n"] >= WAIT_MAX_CONCURRENT:
+                    return self._send(503, "application/json", json.dumps(
+                        {"connected": live_data().get("connected"), "error": "too many waiters",
+                         "retry_after_s": 1}).encode())
+                _WAITERS["n"] += 1
+            try:
+                version = LIVE.wait_for_change(since, timeout)
+            finally:
+                with _WAITERS_LOCK:
+                    _WAITERS["n"] -= 1
+            live = live_data()
+            return self._send(200, "application/json", json.dumps(
+                {"connected": live.get("connected"), "version": version,
+                 "changed": version != since, "blocked": live_attention()}, default=str).encode())
         if path.startswith("/decisions/"):
             code, body = serve_stored_form(path[len("/decisions/"):].strip("/"))
             return self._send(code, "text/html; charset=utf-8" if code == 200 else "text/plain", body)
@@ -1362,6 +1587,10 @@ class Handler(BaseHTTPRequestHandler):
         render, source = PAGES[path]
         if "json=1" in query:
             data = {n: CACHES[n].get() for n in CACHES} if source is None else CACHES[source].get()
+            if path in ("/herdr", "/"):
+                # Additive: every existing consumer of /herdr?json=1 keeps its
+                # keys, and gains herdr's live truth beside the registry's.
+                data = dict(data or {}, live=live_data())
             return self._send(200, "application/json", json.dumps(data, default=str).encode())
         try:
             return self._send(200, "text/html; charset=utf-8", render().encode())
@@ -1405,12 +1634,23 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    global LIVE
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--no-live", action="store_true",
+                    help="do not subscribe to herdr (pages fall back to the registry only)")
     args = ap.parse_args()
     if port_open(args.port):
         print(f"hub: already serving on http://127.0.0.1:{args.port}/", file=sys.stderr)
         return 0
+    if not args.no_live:
+        # One subscription for the whole machine. It starts BEFORE the listener
+        # so the first request already sees a bootstrapped fleet, and it is a
+        # daemon thread: if it cannot reach herdr the hub still serves, with
+        # `connected: false` saying plainly that the live rows are absent
+        # rather than quietly showing a stale fleet.
+        LIVE = herdr_live.LiveState(on_transition=_on_agent_edge, log=_live_log)
+        LIVE.start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"hub: http://127.0.0.1:{args.port}/", file=sys.stderr)
     try:

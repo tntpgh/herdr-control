@@ -127,31 +127,89 @@ composer_stable_snapshot() {
 #             could not be determined — never guess a position.
 #           prompt_menu_question <pane> -> the header/detail lines, for
 #             prompt_id() below.
+# 200 lines, not 60: the header is the ANCHOR of the state machine below, and a
+# long command body pushes it further from the footer than 60 rows. Measured
+# 2026-09-13 on an `eval` approval whose body was ~1.2 kB — the "Allow tool:"
+# row was outside every window up to 140, so `_prompt_menu` never left state 0,
+# `prompt_menu_options` failed closed, and herdr-select refused a menu that was
+# plainly on screen ("not showing a prompt this script recognises"). Widening
+# alone is not sufficient — see the footer-anchored fallback in _prompt_menu —
+# but it keeps the RICH parse (full header + detail rows) available far more
+# often, and the fallback's truncated question is strictly worse for review.
 _menu_window() {
-  herdr pane read "$1" --source visible --lines 60 --format ansi 2>/dev/null
+  herdr pane read "$1" --source visible --lines 200 --format ansi 2>/dev/null
+}
+
+# A NECESSARY condition for either pass below, decided in the shell with no
+# process at all: both passes end on the navigation footer, so a window
+# carrying neither of its words cannot parse as a menu and spawning python to
+# learn that is pure cost. It is deliberately only a gate — it never decides a
+# menu IS present, so no fixture that used to parse can stop parsing.
+#
+# Why it exists: omp-notify.sh calls this up to 10 times per tool call in every
+# omp pane, and python3.14 startup is ~45ms of CPU each. Measured 2026-09-14
+# while diagnosing machine-wide herdr lag — the poll cost 1.86s of CPU per tool
+# call per worker, against ~8 live workers, for the answer "nothing is asking".
+# Matching two separate words rather than the whole footer phrase keeps the gate
+# robust to a style change painted between them.
+_menu_gate() {                         # <window>
+  case "$1" in *navigate*) ;; *) return 1 ;; esac
+  case "$1" in *select*)   ;; *) return 1 ;; esac
+  return 0
 }
 
 # Parse the complete, known two-choice approval menu from ONE snapshot.
 # Blank rows separate command details too; they are not an option boundary.
 # Unknown/truncated menu shapes fail closed rather than turning detail text
 # into option 1 and arrow-walking forever toward a row that cannot be selected.
+#
+# TWO passes, in preference order:
+#   1. header-anchored — opens on "Allow tool:", collects every detail row, and
+#      yields the rich question text a reviewer should be judging.
+#   2. footer-anchored — when pass 1 found no complete panel, walk UP from the
+#      navigation footer looking for Deny then Approve. The footer and the two
+#      option rows are pinned to the bottom of the panel, so they survive a
+#      command body long enough to push the header off-screen entirely; that is
+#      the case that deadlocked wM:p4 on 2026-09-13 (a ~1.2 kB `eval` body; the
+#      header was outside every window up to 140 rows, so no widening could
+#      reach it). The question is then only what is still visible, marked
+#      "[header off-screen]" so it is never mistaken for a full parse and so
+#      prompt_id() hashes differently from one.
+#
+# Pass 2 is deliberately narrow: it requires the exact footer, then exactly
+# "Deny", then exactly "Approve", nearest-first with only blank rows allowed
+# between. Anything else fails closed, as before. The risk it accepts is a pane
+# whose transcript happens to end with those three lines in that order; the risk
+# it removes is a real menu that cannot be answered at all, which forces either
+# a blind Enter (pressing whatever is highlighted) or a stalled lane.
 _prompt_menu() {                       # <pane> visible|options|selected|question
   local win
   win=$(_menu_window "$1") || return 1
-  # One parser process per snapshot, not sed/grep subprocesses per screen
-  # row. The latter made one reviewed approval take seconds of process churn.
-  printf '%s\n' "$win" | python3 -c '
+  _menu_gate "$win" || return 1
+  printf '%s\n' "$win" | _prompt_menu_parse "$2"
+}
+
+# The parser itself: <mode>, window on stdin. Split out from _prompt_menu so a
+# caller that already holds a snapshot (prompt_any_visible below) can parse it
+# without paying a second `herdr pane read`. One parser process per snapshot,
+# not sed/grep subprocesses per screen row — the latter made one reviewed
+# approval take seconds of process churn.
+_prompt_menu_parse() {                 # <mode>; window on stdin
+  python3 -c '
 import re, sys
 ansi = re.compile(r"\x1b\[[0-9;]*m")
 highlight = re.compile(r"\x1b\[48;2;[0-9]+;[0-9]+;[0-9]+m")
+lines = []
 state = 0
 question = []
 selected = ""
 invalid = complete = visible = False
+truncated = False
 # Read bytes: a stray non-UTF-8 byte in a pane must degrade to U+FFFD, not
 # abort the parser and silence the wake path.
 for raw in sys.stdin.buffer:
     line = raw.decode("utf-8", "replace")
+    lines.append(line)
     plain = ansi.sub("", line)
     # `text` (leading punctuation stripped) is ONLY for header/option/footer
     # matching. `body` keeps a command row intact — `-rf`, `--flag`, `| sh`,
@@ -169,7 +227,21 @@ for raw in sys.stdin.buffer:
             complete = visible = False
         continue
     if text.startswith("up/down navigate") and "enter select" in text:
-        visible = True
+        # `visible` requires an actual option ROW (state >= 2 means an
+        # "Approve" line was consumed), not merely a header plus a footer.
+        # Without that, a pane which merely DISPLAYS pane content — a
+        # conductor echoing `herdr pane read` output, a transcript quoting an
+        # approval panel — opens the state machine on the echoed "Allow tool:"
+        # and trips `visible` on the echoed footer, reporting a menu that is
+        # not there. Observed 2026-09-13 on the conductor pane itself, which
+        # herdr-gates then showed as GATE=UNPARSED while that session was
+        # merely printing the gates of other panes. A false needs-input is not
+        # harmless: wait-for-blocked.sh treats prompt_menu_visible as its
+        # backstop signal, so it would wake on a pane nobody is waiting on.
+        # The options sit ABOVE the footer in the omp layout and the header
+        # scrolls off the TOP, so a real panel showing its footer is showing
+        # its option rows too — requiring one costs no genuine detection.
+        visible = state >= 2
         complete = state == 3 and not invalid
         state = 0
         continue
@@ -188,6 +260,60 @@ for raw in sys.stdin.buffer:
     if highlight.search(line):
         invalid = invalid or bool(selected)
         selected = n
+
+# ---- pass 2: footer-anchored, header off-screen -----------------------------
+if not complete:
+    def _text(s):
+        return re.sub(r"^[^A-Za-z0-9]+", "", ansi.sub("", s)).rstrip(" \t\r\n|-\u2502\u2500\u256e")
+    foot = None
+    for i in range(len(lines) - 1, -1, -1):
+        t = _text(lines[i])
+        if t.startswith("up/down navigate") and "enter select" in t:
+            foot = i
+            break
+    # A panel is BOTTOM-ANCHORED: below its footer there is nothing but the
+    # box closer and blank rows. Pass 1 already enforces this (its state
+    # machine clears `visible`/`complete` on any text after the footer), but
+    # pass 2 walked up from the last footer in the window and so accepted a
+    # DISMISSED menu with fresh output printed underneath — reporting a pane
+    # as needing input when it had already moved on, and offering a keypress
+    # into a pane that is not prompting. Caught by the verify-omp-hooks.sh
+    # case "dismissed menu above new output is not actionable", which was red
+    # on this branch from b0ac384 until 2026-09-15. (No apostrophes in here:
+    # this whole parser is a single-quoted shell argument.)
+    if foot is not None:
+        for tail in lines[foot + 1:]:
+            if _text(tail):
+                foot = None
+                break
+    if foot is not None:
+        want = ["Deny", "Approve"]
+        rows = {}
+        j = foot - 1
+        for label in want:
+            while j >= 0 and not _text(lines[j]):
+                j -= 1
+            if j < 0 or _text(lines[j]) != label:
+                rows = {}
+                break
+            rows[label] = j
+            j -= 1
+        if rows:
+            visible = complete = True
+            invalid = False
+            truncated = True
+            selected = ""
+            for label, n in (("Approve", "1"), ("Deny", "2")):
+                if highlight.search(lines[rows[label]]):
+                    invalid = invalid or bool(selected)
+                    selected = n
+            question = ["[header off-screen]"]
+            for k in range(max(0, rows["Approve"] - 6), rows["Approve"]):
+                b = re.sub(r"^[\s\u2502]+", "", ansi.sub("", lines[k])).rstrip(" \t\r\n\u2502\u2500\u256e")
+                if b:
+                    question.append(b)
+            if invalid:
+                complete = False
 mode = sys.argv[1]
 if mode == "visible":
     sys.exit(0 if visible else 1)
@@ -199,13 +325,45 @@ elif mode == "selected":
     print(selected, end="")
 elif mode == "question":
     print(" ; ".join(question), end="")
-' "$2"
+' "$1"
 }
 
 prompt_menu_options()  { _prompt_menu "$1" options; }
 prompt_menu_selected() { _prompt_menu "$1" selected; }
 prompt_menu_question() { _prompt_menu "$1" question; }
 prompt_menu_visible()  { _prompt_menu "$1" visible; }
+
+# "Is EITHER prompt shape on screen?", from ONE pane read.
+#
+# The obvious spelling — `prompt_menu_visible || [ -n "$(prompt_options)" ]` —
+# costs TWO `herdr pane read` processes per call, and omp-notify.sh calls it up
+# to 10 times per tool call in every omp pane. Measured 2026-09-14: 20 CLI
+# spawns and 10 python3 spawns per tool call, ~1.86s of CPU, all of it against
+# the single herdr server socket, which is what made the TUI itself feel laggy
+# with the fleet working. This reads once and answers both shapes from that
+# snapshot.
+#
+# The numbered shape keeps _prompt_window's bottom-anchored 20-row scope: both
+# reads end at the bottom of the visible region, so the last 20 rows of the
+# 200-row menu window ARE the rows prompt_options would have looked at. That
+# scope is load-bearing — omp prints queued/steering messages as a numbered
+# list higher up the pane, and matching those is the false "needs input" that
+# #59 removed. ANSI is stripped first because the menu window carries it and
+# _OPT_LINE anchors at start-of-line.
+prompt_any_visible() {                 # <pane>
+  local win
+  win=$(_menu_window "$1") || return 1
+  if _menu_gate "$win"; then
+    printf '%s\n' "$win" | _prompt_menu_parse visible && return 0
+  fi
+  # tail first, then ONE sed doing both jobs: strip the escapes the menu
+  # window carries (_OPT_LINE anchors at start-of-line) and print the option
+  # numbers. Two seds and a 200-row strip is measurable when this runs on
+  # every tool call in every pane.
+  [ -n "$(printf '%s\n' "$win" | tail -n 20 \
+    | sed -nE -e $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' -e "s/$_OPT_LINE/\1/p")" ] && return 0
+  return 1
+}
 
 # A stable fingerprint for "this exact prompt, right now" — the question plus
 # its options, hashed. Lets a wake event and a later answer agree on WHICH

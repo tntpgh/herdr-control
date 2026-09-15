@@ -13,16 +13,15 @@
 // this file INSIDE the checkout, not the ~/.omp symlink, and an edit here is
 // live on the next omp session start with no reinstall.
 //
-// THE ONE RULE THAT MATTERS: omp's tool_call dispatch is FAIL-CLOSED — per
-// its own docs, "if handler throws, wrapper fails closed and blocks
-// execution", and emitToolCall does NOT swallow handler errors the way it
-// swallows errors from every other event below. A monitoring shim that can
-// wedge the agent it watches is strictly worse than no shim at all, so every
-// handler here is wrapped in an exhaustive try/catch and NEVER returns
-// anything but undefined — there is no code path in this file that can
-// escalate into a blocked tool call. The other three handlers keep the same
-// defensive posture on principle, even though the runner swallows their
-// errors, so nobody has to re-derive "is this one safe" event by event.
+// THE ONE RULE THAT MATTERS: no handler here may ever throw back into the
+// agent it observes, and none may return anything but undefined. This file
+// used to register `tool_call`, whose dispatch is FAIL-CLOSED — per omp's own
+// docs, "if handler throws, wrapper fails closed and blocks execution", and
+// emitToolCall does NOT swallow handler errors the way it swallows every other
+// event's. It no longer registers that event (see the notification section
+// below), so nothing here can wedge a tool call any more; the exhaustive
+// try/catch and the explicit `return undefined` stay regardless, so nobody has
+// to re-derive "is this one safe" event by event if the wiring changes again.
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -100,7 +99,7 @@ function spawnDetached(args: string[], stdinInput?: string): void {
   }
 }
 
-// ---- Notification: tool_call -----------------------------------------------
+// ---- Notification: tool_approval_requested / ask --------------------------
 // omp's docs (docs/extensions.md, docs/hooks.md) both show the SAME shape for
 // this event — `event.toolName: string` and `event.input: Record<string,
 // unknown>` — so this reads those fields directly instead of guessing across
@@ -154,33 +153,97 @@ function describeToolCall(toolName: string, input: unknown): string | undefined 
   }
 }
 
-// Fires before EVERY tool call, not just ones that end up blocked —
-// omp-notify.sh does its own bounded poll for a live approval menu and exits
-// 0 silently when none actually appeared, so an auto-approved call produces
-// zero alert. That contract is what makes calling it unconditionally here
-// cheap and safe rather than a flood of noise.
-function onToolCall(event: unknown): undefined {
+// Fires ONLY when omp actually needs a human: `tool_approval_requested` (the
+// approval menu) and `tool_execution_start` for the `ask` tool (the numbered
+// question prompt). Both are documented observability events
+// (docs/extensions.md: "emitted by wrapper.ts only when a tool requires
+// approval and an approval handler is registered"), and omp's own herdr
+// integration (~/.omp/agent/extensions/herdr-omp-agent-state.ts) already
+// drives pane.report_agent blocked/idle off exactly this pair.
+//
+// This used to hang off `tool_call`, which fires before EVERY tool call
+// whether or not anything is ever asked, on the stated premise that "omp has
+// no such event". That premise was wrong (and the events pre-date this file's
+// last edit), and the cost of the workaround was real: omp-notify.sh had to
+// verify by screen-scraping its own pane, 20 `herdr pane read` RPCs and 10
+// python spawns per tool call per worker, which is what pushed herdr's socket
+// p95 from 9ms to 136ms with the fleet working (measured 2026-09-14). Now the
+// script runs only when there IS something to alert about, so the common tool
+// call costs zero RPCs.
+//
+// It also drops this file out of omp's fail-closed dispatch: `tool_call`
+// handler errors block the tool, approval/execution events are observability
+// and do not. The defensive style stays anyway.
+function notifyForPrompt(toolName: string, message: string): void {
+  if (!notifyAvailable) return;
+  spawnDetached([NOTIFY_SH], JSON.stringify({ tool: toolName, message, cwd: process.cwd() }));
+}
+
+function onApprovalRequested(event: unknown): undefined {
   try {
-    if (notifyAvailable) {
-      const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
-      const toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
-      const detail = describeToolCall(toolName, e.input);
-      const message = detail ? `${toolName}: ${detail}` : `omp tool call: ${toolName}`;
-      const payload = JSON.stringify({
-        tool: toolName,
-        message,
-        cwd: process.cwd(),
-      });
-      spawnDetached([NOTIFY_SH], payload);
-    }
+    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    const toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
+    // `reason` is the approval's own words when omp supplies one; the argument
+    // summary is the fallback, and still the more useful line for bash.
+    const detail = describeToolCall(toolName, e.input ?? e.args)
+      ?? (typeof e.reason === "string" && e.reason ? truncate(e.reason) : undefined);
+    notifyForPrompt(toolName, detail ? `${toolName}: ${detail}` : `omp needs your permission to use ${toolName}`);
   } catch {
     // MUST NOT throw — see the fail-closed contract at the top of this file.
   }
-  // Always undefined: this handler only ever observes, it never blocks or
-  // rewrites a tool call. Spelled out explicitly (rather than falling off
-  // the end of the function) so a future edit can't accidentally start
-  // returning a block/reason/input object from a code path meant to be a
-  // pure side-effecting notifier.
+  return undefined;
+}
+
+// The `ask` tool is not an approval, so it emits no approval event — it just
+// paints a numbered question and waits. Same alert path, same retraction path
+// (tool_execution_end), and the same shape omp's herdr integration uses to
+// report `blocked` for it.
+function onExecutionStart(event: unknown): undefined {
+  try {
+    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    if (e.toolName !== "ask") return undefined;
+    const args = e.args && typeof e.args === "object" ? (e.args as Record<string, unknown>) : {};
+    const questions = Array.isArray(args.questions) ? args.questions : [];
+    const first = questions.find(
+      (q: unknown) => q && typeof q === "object" && typeof (q as Record<string, unknown>).question === "string",
+    ) as Record<string, unknown> | undefined;
+    const q = typeof first?.question === "string" ? truncate(first.question) : "waiting for user input";
+    notifyForPrompt("ask", `ask: ${q}`);
+  } catch {
+    // see onApprovalRequested().
+  }
+  return undefined;
+}
+
+// Retraction is now edge-triggered too: the prompt was answered (in the
+// terminal, from Slack, or by a peer), so the alert for it is stale THE
+// MOMENT omp says so. It used to run on every tool_result, which meant a
+// pane-list, a pane read, two prompt parses and — until this branch — an
+// `op read` for the Slack token, on every tool call of every session, for as
+// long as any worker anywhere sat blocked.
+function retract(): void {
+  if (resolveAvailable) spawnDetached([RESOLVE_SH]);
+}
+
+function onApprovalResolved(): undefined {
+  try {
+    retract();
+  } catch {
+    // see onApprovalRequested().
+  }
+  return undefined;
+}
+
+function onExecutionEnd(event: unknown): undefined {
+  try {
+    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    // Only `ask` was ever alerted from tool_execution_start, so only `ask`
+    // needs the matching retraction; any other tool ending is not a prompt
+    // being answered and must not cost a sweep.
+    if (e.toolName === "ask") retract();
+  } catch {
+    // see onApprovalRequested().
+  }
   return undefined;
 }
 
@@ -344,8 +407,10 @@ function runIntervalReconcile(): void {
 
 function onToolResult(): undefined {
   try {
+    // Reconciliation only. Retraction moved to the approval/ask events above:
+    // sweeping here fired it on every tool call in every session, and while
+    // any worker sat blocked the queue was non-empty, so it always did work.
     if (reconcileAvailable) runIntervalReconcile();
-    if (resolveAvailable) spawnDetached([RESOLVE_SH]);
   } catch {
     // omp swallows tool_result handler errors (unlike tool_call), but this
     // stays defensive for consistency — see the header contract.
@@ -354,11 +419,10 @@ function onToolResult(): undefined {
 }
 
 // ---- Stop: agent_end ---------------------------------------------------------
-// Backstop retraction. PostToolUse above already retracts after every tool
-// call, but a turn can end without one more tool call firing — e.g. the
-// agent's final message answers the human directly with no further tool
-// use. Without this, an alert from the turn's last tool call could outlive
-// the turn itself.
+// Backstop retraction. tool_approval_resolved / tool_execution_end already
+// retract at the moment a prompt is answered, but a turn can end with an
+// alert still queued — a pane killed mid-prompt, or a resolve that lost its
+// race — so the turn boundary sweeps once more.
 function onAgentEnd(): undefined {
   try {
     if (resolveAvailable) spawnDetached([RESOLVE_SH]);
@@ -369,7 +433,10 @@ function onAgentEnd(): undefined {
 }
 
 export default function (pi: HookAPI): void {
-  pi.on("tool_call", onToolCall);
+  pi.on("tool_approval_requested", onApprovalRequested);
+  pi.on("tool_approval_resolved", onApprovalResolved);
+  pi.on("tool_execution_start", onExecutionStart);
+  pi.on("tool_execution_end", onExecutionEnd);
   pi.on("before_agent_start", onBeforeAgentStart);
   pi.on("tool_result", onToolResult);
   pi.on("agent_end", onAgentEnd);

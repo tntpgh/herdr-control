@@ -60,16 +60,38 @@ CURL="${HERDR_RESOLVE_CURL:-curl}"
 # 1Password Touch ID prompt in any shell without OP_SERVICE_ACCOUNT_TOKEN.
 # Same rule as herdr-notify's --dry-run prescan — a check must never need a
 # human finger.
+#
+# And a REAL run defers it too, to the first entry actually being retracted.
+# `. $ENV_FILE` costs an `op read` — 0.72s of 1Password round trip, measured
+# 2026-09-14 — because nothing pre-sets SLACK_BOT_TOKEN in the environment:
+# ~/.config/op/service-account.env carries only OP_SERVICE_ACCOUNT_TOKEN, so
+# the `${SLACK_BOT_TOKEN:-$(op read …)}` default in herdr-bridge.env fires
+# every single time. This script runs on every tool_result AND every agent_end
+# in every omp session, and while any worker sits blocked the queue is
+# non-empty, so the sweep runs — and its outcome is almost always "still
+# asking, keep", which needs no credential at all. That made a 1Password
+# network round trip part of the cost of every tool call in every pane.
+#
+# The cheap existence check stays eager: an unconfigured machine still exits
+# before the lock and the pane probes, it just no longer sources anything.
+ENV_FILE="${HERDR_BRIDGE_ENV:-$HOME/.config/herdr-bridge.env}"
+[ "$DRY" = 1 ] || [ -f "$ENV_FILE" ] || exit 0
 user=""
-if [ "$DRY" = 0 ]; then
-  ENV_FILE="${HERDR_BRIDGE_ENV:-$HOME/.config/herdr-bridge.env}"
-  [ -f "$ENV_FILE" ] || exit 0
+creds_tried=0
+bridge_creds() {                       # 0 when a chat.delete can be attempted
+  [ "$DRY" = 0 ] || return 1
+  if [ "$creds_tried" = 1 ]; then
+    [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "$user" ]
+    return
+  fi
+  creds_tried=1
   # shellcheck disable=SC1090
-  . "$ENV_FILE" 2>/dev/null || exit 0
-  [ -n "${SLACK_BOT_TOKEN:-}" ] || exit 0
+  . "$ENV_FILE" 2>/dev/null || return 1
+  [ -n "${SLACK_BOT_TOKEN:-}" ] || return 1
   user="${HERDR_BRIDGE_ALLOW_USERS%%,*}"
-  [ -n "$user" ] || exit 0
-fi
+  [ -n "$user" ] || return 1
+  return 0
+}
 
 # One pane-list call for the whole sweep. A pane herdr no longer lists cannot
 # paint a prompt, cannot be answered from Slack, and will never be resolved by
@@ -149,8 +171,12 @@ while IFS= read -r line; do
     # Still asking: keep. BOTH prompt shapes, or this deletes live questions —
     # omp's approval prompt is an arrow menu with no numbers on screen, so a
     # prompt_options-only check reads every one of them as already answered and
-    # retracts an alert whose worker is still blocked on it.
-    if [ -n "$(prompt_options "$pane")$(prompt_menu_options "$pane")" ]; then
+    # retracts an alert whose worker is still blocked on it. prompt_any_visible
+    # answers both from one pane read instead of three RPCs plus two parses per
+    # queued entry, and its menu test is `visible` rather than `options`: a
+    # torn or truncated panel now KEEPS the alert where the stricter parse
+    # dropped it, which is the safe direction for a question still on screen.
+    if prompt_any_visible "$pane"; then
       continue
     fi
   fi
@@ -160,6 +186,11 @@ while IFS= read -r line; do
       "$([ "$gone" = 1 ] && echo 'pane gone' || echo 'prompt answered')"
     continue
   fi
+
+  # First actual retraction of the run pays for the credential (see above).
+  # No credential -> keep the entry and try again next pass; never settle an
+  # alert whose Slack message is still armed.
+  bridge_creds || continue
 
   [ "$done_n" = 0 ] || sleep "$PACE"
   done_n=$((done_n + 1))

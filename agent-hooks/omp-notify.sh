@@ -2,22 +2,24 @@
 # omp-notify.sh — omp's equivalent of claude-notify.sh: alert when a worker
 # needs input, both to Slack and as a push wake to its conductor.
 #
-# ---- why this is shaped differently from the Claude hook --------------------
-# Claude Code has a `Notification` event that means "I am asking the human
-# something", so claude-notify.sh is REACTIVE — it is told. omp has no such
-# event. Its nearest surface is `tool_call`, which fires before EVERY tool call,
-# approved or not (see agent-hooks/omp-herdr-control.ts).
+# ---- what triggers this ------------------------------------------------------
+# omp DOES have a "I am asking the human something" surface, and this hook is
+# wired to it: `tool_approval_requested` for the approval menu and
+# `tool_execution_start` on the `ask` tool for a question (see
+# agent-hooks/omp-herdr-control.ts). omp's own herdr integration drives
+# pane.report_agent blocked/idle off the same pair.
 #
-# Alerting straight off `tool_call` would therefore be a signal storm — the
-# failure Gemini's review named ("at 10 workers, if 4 hit permission prompts
-# simultaneously, the conductor's input buffer floods"), except self-inflicted
-# on every single bash call whether or not anyone was ever asked anything.
+# This file used to say omp had no such event and hang off `tool_call`, which
+# fires before EVERY tool call, approved or not. That premise was wrong, and it
+# cost: the script had to VERIFY by screen-scraping its own pane on every tool
+# call of every worker — 20 `herdr pane read` RPCs and 10 python spawns each,
+# which pushed the herdr socket's p95 from 9ms to 136ms with the fleet working
+# and made the TUI itself feel laggy (measured 2026-09-14).
 #
-# So this script VERIFIES before it alerts: it polls the worker's own pane for a
-# prompt that actually painted, and exits silently when none appears. That makes
-# it safe to call on every tool call, and it is also approval-mode-agnostic by
-# construction — under `--approval-mode yolo` nothing ever prompts, so nothing
-# ever alerts, with no need to know or mirror which mode omp was launched at.
+# The pane read stays, but only on this path: the EVENT says a human is needed,
+# the pane says WHAT is on screen — the option rows Slack shows and the
+# prompt_id a later answer is asserted against. An auto-approved tool call now
+# never reaches this script at all, so it costs nothing.
 #
 # Reads one JSON object on stdin: {"tool": "...", "message": "...", "cwd": "..."}
 # Always exits 0 — a monitoring hook must never fail the agent it monitors.
@@ -49,11 +51,14 @@ pane="${HERDR_PANE_ID:-}"
 # lib/prompt-parse.sh already knows the menu shape (highlight detected via its
 # ANSI background-colour escape) and the numbered shape, and a caller here has
 # no business caring which one a given omp build renders.
-_prompt_is_up() {
-  prompt_menu_visible "$pane" 2>/dev/null && return 0
-  [ -n "$(prompt_options      "$pane" 2>/dev/null)" ] && return 0
-  return 1
-}
+#
+# prompt_any_visible answers both from ONE `herdr pane read`. Calling the two
+# predicates separately cost two reads per attempt — 20 CLI spawns and 10
+# python3 spawns per tool call per worker (~1.86s of CPU, measured 2026-09-14),
+# every one of them an RPC into the single-threaded herdr server. With ~8 live
+# workers that is what made herdr's own UI feel laggy, for the answer "nothing
+# is asking" on the overwhelming majority of tool calls.
+_prompt_is_up() { prompt_any_visible "$pane" 2>/dev/null; }
 
 # tool_call fires BEFORE omp paints the approval menu, so a single check would
 # usually miss it. Poll briefly. Each attempt costs one `herdr pane read`; the
@@ -63,10 +68,15 @@ _prompt_is_up() {
 # Bounded deliberately: if no prompt has painted within ~1.5s the tool was
 # auto-approved and there is nothing to alert about. Waiting longer would only
 # delay discovering that.
+#
+# 5 attempts at 0.3s, not 10 at 0.15s: an approval menu is a BLOCKING prompt —
+# once painted it stays until someone answers it — so a coarser poll can only
+# delay detection by one interval, never miss it, and it halves the RPCs this
+# fires at the herdr server on every tool call of every pane.
 found=0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
+for _ in 1 2 3 4 5; do
   if _prompt_is_up; then found=1; break; fi
-  sleep 0.15
+  sleep 0.3
 done
 [ "$found" = 1 ] || exit 0
 
