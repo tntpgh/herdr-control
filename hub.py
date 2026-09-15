@@ -171,6 +171,23 @@ def _live_log(msg: str) -> None:
     print(f"hub: live: {msg}", file=sys.stderr, flush=True)
 
 
+def edge_is_actionable(before: str | None, after: str | None) -> bool:
+    """Which transitions are worth a subprocess.
+
+    A busy agent pane flips working<->idle on every turn. Dispatching those
+    would spawn a shell per flap per pane to conclude "noop" — the same
+    busywork this whole change removes — so only three cases reach the script:
+
+      * something became `blocked` (a human is now being waited for),
+      * something WAS `blocked` (the prompt was answered: retract and follow),
+      * a first observation (`before` is None), which is the reconcile pass a
+        hub start owes the registry.
+    """
+    if before is None:
+        return True
+    return herdr_live.BLOCKED in (before, after)
+
+
 def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dict) -> None:
     """One transition, handed to the shell that owns alerting and answering.
 
@@ -184,6 +201,8 @@ def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dic
         return
     if not rec.get("agent"):
         return  # a plain shell pane has no prompt to alert and no task to follow
+    if not edge_is_actionable(before, after):
+        return
     try:
         subprocess.Popen(
             ["bash", str(AGENT_EDGE), pane_id, after or "gone", before or "",

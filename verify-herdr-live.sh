@@ -134,12 +134,30 @@ live = herdr_live.LiveState(on_transition=lambda p, b, a, r: (_ for _ in ()).thr
                             if p == "bad" else seen.append([p, b, a]),
                             log=lambda m: errors.append(m))
 threading.Thread(target=live._drain_edges, daemon=True).start()
+
 live._emit([("bad", "working", "blocked", {}), ("w1:p1", "working", "blocked", {})])
 deadline = time.time() + 3
 while time.time() < deadline and not seen:
     time.sleep(0.05)
 live.stop()
 results["delivery"] = (seen, len(errors) == 1)
+
+# 12. Which edges are worth a subprocess (hub.py). A busy pane flips
+# working<->idle every turn; spawning a shell per flap to conclude "noop" is
+# the busywork this change exists to remove.
+import importlib.util
+spec = importlib.util.spec_from_file_location("hubmod", f"{sys.argv[1]}/hub.py")
+hubmod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hubmod)
+results["actionable"] = {
+    "first_sight": hubmod.edge_is_actionable(None, "idle"),
+    "became_blocked": hubmod.edge_is_actionable("working", "blocked"),
+    "was_blocked": hubmod.edge_is_actionable("blocked", "idle"),
+    "pane_gone_while_blocked": hubmod.edge_is_actionable("blocked", None),
+    "working_idle_flap": hubmod.edge_is_actionable("working", "idle"),
+    "idle_working_flap": hubmod.edge_is_actionable("idle", "working"),
+    "done_flap": hubmod.edge_is_actionable("working", "done"),
+}
 
 print(json.dumps(results))
 PY
@@ -172,6 +190,11 @@ get() { printf '%s' "$out" | jq -c ".$1"; }
 [ "$(get delivery)" = '[[["w1:p1","working","blocked"]],true]' ] \
   && ok "an edge reaches the callback, and a throwing callback loses nothing after it" \
   || no "delivery" "$(get delivery)"
+[ "$(get 'actionable | [.first_sight, .became_blocked, .was_blocked, .pane_gone_while_blocked]')" = '[true,true,true,true]' ] \
+  && ok "blocked edges and first sightings reach the dispatcher" \
+  || no "actionable" "$(get actionable)"
+[ "$(get 'actionable | [.working_idle_flap, .idle_working_flap, .done_flap]')" = '[false,false,false]' ] \
+  && ok "a working<->idle flap never spawns anything" || no "flap filter" "$(get actionable)"
 
 echo
 echo "== edge dispatcher (agent-edge.sh, stubbed) =="
