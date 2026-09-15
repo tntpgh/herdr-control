@@ -762,6 +762,45 @@ R="$(new_repo)"
 } > "$R/big.json"
 git -C "$R" add big.json
 blocks "$R" "a real secret among thousands of public values still blocks (no early-exit judgement)"
+
+# ═════════════════════════════════════════════════════════════════════════════
+printf '== a chained pre-push.local gets what git would have given it ==\n'
+# The ref list is the ONLY input a pre-push hook has, and this scanner's loop
+# consumes it. Chaining without replaying it is worse than not chaining: the
+# local hook runs, sees no refs and no remote, and approves. Same for argv —
+# git calls pre-push as `<remote-name> <remote-url>`.
+R="$(push_repo)"
+cat > "$R/.git/hooks/pre-push.local" <<'LOCAL'
+#!/usr/bin/env bash
+# Records what it was handed, then approves.
+printf 'argv=%s\n' "$*" > "$PWD/.git/chained.txt"
+printf 'stdin=%s\n' "$(cat)" >> "$PWD/.git/chained.txt"
+exit 0
+LOCAL
+chmod +x "$R/.git/hooks/pre-push.local"
+printf 'clean work\n' > "$R/ok.txt"
+git -C "$R" add ok.txt
+git -C "$R" commit -qm "clean" --no-verify
+pushes "$R" "a clean push still succeeds with a chained local hook"
+if [ -f "$R/.git/chained.txt" ]; then
+    ok "the chained hook actually ran"
+else
+    bad "the chained pre-push.local never ran"
+fi
+grep -q 'stdin=.*refs/heads' "$R/.git/chained.txt" 2>/dev/null \
+    && ok "and received the REF LIST on stdin (replayed after our loop ate it)" \
+    || bad "chained hook got an empty stdin: $(cat "$R/.git/chained.txt" 2>/dev/null)"
+grep -q 'argv=origin ' "$R/.git/chained.txt" 2>/dev/null \
+    && ok "and git's argv (remote name and url)" \
+    || bad "chained hook got no argv: $(cat "$R/.git/chained.txt" 2>/dev/null)"
+# And a chained hook that REFUSES must be able to stop the push.
+R="$(push_repo)"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$R/.git/hooks/pre-push.local"
+chmod +x "$R/.git/hooks/pre-push.local"
+printf 'clean\n' > "$R/ok.txt"
+git -C "$R" add ok.txt
+git -C "$R" commit -qm "clean" --no-verify
+refuses_push "$R" "a chained hook's refusal still stops the push"
 # The shapes that MUST stay exempt, beyond the plain `pubkey` above.
 pub_case f.json "{\"myPublicKey\": \"$PUBHEX\"}" allow \
     "camelCase publicKey is exempt"
