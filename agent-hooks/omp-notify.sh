@@ -2,22 +2,24 @@
 # omp-notify.sh — omp's equivalent of claude-notify.sh: alert when a worker
 # needs input, both to Slack and as a push wake to its conductor.
 #
-# ---- why this is shaped differently from the Claude hook --------------------
-# Claude Code has a `Notification` event that means "I am asking the human
-# something", so claude-notify.sh is REACTIVE — it is told. omp has no such
-# event. Its nearest surface is `tool_call`, which fires before EVERY tool call,
-# approved or not (see agent-hooks/omp-herdr-control.ts).
+# ---- what triggers this ------------------------------------------------------
+# omp DOES have a "I am asking the human something" surface, and this hook is
+# wired to it: `tool_approval_requested` for the approval menu and
+# `tool_execution_start` on the `ask` tool for a question (see
+# agent-hooks/omp-herdr-control.ts). omp's own herdr integration drives
+# pane.report_agent blocked/idle off the same pair.
 #
-# Alerting straight off `tool_call` would therefore be a signal storm — the
-# failure Gemini's review named ("at 10 workers, if 4 hit permission prompts
-# simultaneously, the conductor's input buffer floods"), except self-inflicted
-# on every single bash call whether or not anyone was ever asked anything.
+# This file used to say omp had no such event and hang off `tool_call`, which
+# fires before EVERY tool call, approved or not. That premise was wrong, and it
+# cost: the script had to VERIFY by screen-scraping its own pane on every tool
+# call of every worker — 20 `herdr pane read` RPCs and 10 python spawns each,
+# which pushed the herdr socket's p95 from 9ms to 136ms with the fleet working
+# and made the TUI itself feel laggy (measured 2026-09-14).
 #
-# So this script VERIFIES before it alerts: it polls the worker's own pane for a
-# prompt that actually painted, and exits silently when none appears. That makes
-# it safe to call on every tool call, and it is also approval-mode-agnostic by
-# construction — under `--approval-mode yolo` nothing ever prompts, so nothing
-# ever alerts, with no need to know or mirror which mode omp was launched at.
+# The pane read stays, but only on this path: the EVENT says a human is needed,
+# the pane says WHAT is on screen — the option rows Slack shows and the
+# prompt_id a later answer is asserted against. An auto-approved tool call now
+# never reaches this script at all, so it costs nothing.
 #
 # Reads one JSON object on stdin: {"tool": "...", "message": "...", "cwd": "..."}
 # Always exits 0 — a monitoring hook must never fail the agent it monitors.
