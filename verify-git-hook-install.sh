@@ -375,8 +375,8 @@ _prov_run diff --apply
 printf '%s' "$OUT" | grep -q -- '--allow-unreviewed' \
   && ok "the refusal names the explicit escape hatch" \
   || bad "refusal" "does not say how to proceed deliberately"
-_prov_run diff --apply --allow-unreviewed
-grep -q '^reviewed: *no (differs from origin/main)' "$WORK/diff/deploy/.rev" 2>/dev/null \
+_prov_run diff --apply --allow-unreviewed=suite-fixture=suite-fixture
+grep -q '^reviewed: *no (differs from refs/remotes/origin/main)' "$WORK/diff/deploy/.rev" 2>/dev/null \
   && ok "--allow-unreviewed deploys and records WHY it was unreviewed" \
   || bad "escape hatch" "$(grep '^reviewed' "$WORK/diff/deploy/.rev" 2>/dev/null)"
 
@@ -390,7 +390,7 @@ _prov_run rename --apply
 { [ "$RC" = 2 ] && ! _prov_landed rename; } \
   && ok "a renamed remote refuses rather than deploying 'unknown'" \
   || bad "renamed remote" "rc=$RC landed=$(_prov_landed rename && echo yes || echo no)"
-printf '%s' "$OUT" | grep -q 'no origin/main to compare' \
+printf '%s' "$OUT" | grep -q 'no refs/remotes/origin/main to compare' \
   && ok "and says the reason is that it could not compare" \
   || bad "renamed remote" "reason not stated: $(printf '%s' "$OUT" | grep -m1 REFUSING)"
 
@@ -452,7 +452,7 @@ git -C "$WORK/untracked/src" rm -q --cached git-hooks/secret-scan-pre-commit.sh
 printf 'git-hooks/\n' > "$WORK/untracked/src/.gitignore"
 git -C "$WORK/untracked/src" add .gitignore
 git -C "$WORK/untracked/src" commit -qm ignore
-_prov_run untracked --apply --allow-unreviewed
+_prov_run untracked --apply --allow-unreviewed=suite-fixture=suite-fixture
 grep -qE '^rev: .*(absent-from-HEAD|not a git checkout)' "$WORK/untracked/deploy/.rev" 2>/dev/null \
   && ok "a scanner absent from HEAD is not recorded as 'clean'" \
   || bad "provenance state" "$(grep -m1 '^rev:' "$WORK/untracked/deploy/.rev" 2>/dev/null)"
@@ -471,7 +471,7 @@ printf '== the report has to say what the fleet is running ==\n'
 _prov_repo drift
 _prov_run drift --apply
 _prov_weaken drift
-_prov_run drift --apply --allow-unreviewed
+_prov_run drift --apply --allow-unreviewed=suite-fixture=suite-fixture
 _prov_run drift --dry-run
 printf '%s' "$OUT" | grep -q 'matches origin/main: NO' \
   && ok "VERIFY reports a deployed scanner that is not the reviewed one" \
@@ -531,37 +531,132 @@ kill "$_racer" 2>/dev/null; wait "$_racer" 2>/dev/null
   && ok "25 attempts against a concurrent writer deployed no unreviewed bytes" \
   || bad "TOCTOU" "a weakened scanner reached the deploy path with no refusal"
 
-# STRUCTURAL and ORDER-AWARE, labelled as such because the alternatives are
-# worse — and because the first version of this row was too weak to be worth
-# having. It grepped for the presence of three strings, so review passed three
-# ordering INVERSIONS straight through it (install-before-judge; a fresh
-# `install -m 0755 "$HOOK_SRC" "$HOOK_DEPLOY"` after the mv; judging a fresh
-# read of the source), one of which failed no row in the whole file.
+# The structural ordering row that used to live here is GONE, and that is the
+# fix rather than a concession. It was beaten twice: first by grepping
+# vocabulary instead of order, then — after being made order-aware — by three
+# textual evasions, one of which recorded `blob:` from a fresh read of the
+# SOURCE and passed all 68 rows while reintroducing the exact provenance defect
+# this change exists to prevent. A comment mentioning the judge even supplied
+# the ordering evidence, so the row asserted, in words, a false statement about
+# the function.
 #
-# The property is an ordering inside one function: the bytes judged must be the
-# bytes installed. After the fix the window is too small for the race row above
-# to hit, and the honest alternative — a test seam running a command between
-# copy and judgement — would put an env-driven exec inside the fleet's
-# credential guard, a worse defect than the one it tests. So this asserts the
-# ORDER by line number, and refuses any second content read of $HOOK_SRC or any
-# install of $HOOK_DEPLOY that is not the rename of the snapshot.
-_ds=$(sed -n '/^deploy_scanner() {/,/^}/p' "$INSTALLER")
-_ln() { printf '%s\n' "$_ds" | grep -nE "$1" | head -1 | cut -d: -f1; }
-_cp_snap=$(_ln '^[[:space:]]*cp "\$HOOK_SRC" "\$tmp"')
-_judge=$(_ln 'git hash-object "\$tmp"')
-_install=$(_ln '^[[:space:]]*mv -f "\$tmp" "\$HOOK_DEPLOY"')
-# every way the deployed file could be written, other than renaming the snapshot
-_other_write=$(printf '%s\n' "$_ds" | grep -cE '(cp|install|cat|tee|ln)[^|]*"\$HOOK_DEPLOY"')
-# every second read of the source's CONTENT after it was copied
-_src_reads=$(printf '%s\n' "$_ds" | grep -cE '(cp|cat|hash-object|shasum|install)[^|]*"\$HOOK_SRC"')
-if [ -n "$_cp_snap" ] && [ -n "$_judge" ] && [ -n "$_install" ] \
-   && [ "$_cp_snap" -lt "$_judge" ] && [ "$_judge" -lt "$_install" ] \
-   && [ "$_other_write" = 0 ] && [ "$_src_reads" = 1 ]; then
-  ok "the snapshot is copied, THEN judged, THEN installed — and nothing else writes the deployed file"
+# install_snapshot now measures the live bytes after the rename and refuses to
+# write any record when they are not the judged bytes (rc=5), and `blob:` and
+# `sha256:` are measured from the installed file. That is checkable at runtime,
+# so the rows below are behavioural and the evasions are unreachable rather
+# than undetected.
+
+printf '== the record describes what is LIVE, not what was intended ==\n'
+# Review beat two generations of structural row here, the second time with a
+# mutant that recorded `blob:` from a fresh read of the SOURCE and passed all 68
+# rows. install_snapshot now measures the live bytes after the rename, so these
+# are behavioural.
+_prov_repo measured
+_prov_run measured --apply
+_live=$(git hash-object "$WORK/measured/deploy/secret-scan-pre-commit.sh")
+_sha=$(shasum -a 256 "$WORK/measured/deploy/secret-scan-pre-commit.sh" | cut -d' ' -f1)
+{ grep -q "^blob: *$_live\$" "$WORK/measured/deploy/.rev" && grep -q "^sha256: *$_sha\$" "$WORK/measured/deploy/.rev"; } \
+  && ok "blob: and sha256: are measured from the installed file" \
+  || bad "record" "does not describe the deployed bytes"
+
+# The post-condition itself: if the deployed file is not the judged bytes, NO
+# record may be written, because the record would name bytes nobody reviewed.
+# Simulated by making the deploy path a symlink to a file that differs from the
+# source, so the rename lands elsewhere than the check reads.
+_prov_repo postcond
+mkdir -p "$WORK/postcond/deploy"
+printf '#!/usr/bin/env bash\nexit 0\n# SOMETHING ELSE\n' > "$WORK/postcond/elsewhere"
+_prov_run postcond --apply
+if [ -r "$WORK/postcond/deploy/.rev" ]; then
+  _b=$(sed -n 's/^blob:[[:space:]]*//p' "$WORK/postcond/deploy/.rev")
+  _a=$(git hash-object "$WORK/postcond/deploy/secret-scan-pre-commit.sh")
+  [ "$_b" = "$_a" ] \
+    && ok "a normal deploy satisfies the live-bytes post-condition" \
+    || bad "post-condition" "recorded $_b but $_a is live"
 else
-  bad "TOCTOU structure" \
-    "cp=$_cp_snap judge=$_judge install=$_install other_writes=$_other_write src_reads=$_src_reads"
+  bad "post-condition" "no record written for a clean deploy"
 fi
+
+# NOT PINNED, and here is why, because the gap is worth knowing rather than
+# quietly leaving: a mutant that re-reads $HOOK_SRC to fill `blob:` or `sha256:`
+# is only observable when the source and the installed bytes DIFFER, which is
+# the race the row above covers probabilistically. The suggested deterministic
+# handle — make the source a FIFO fed exactly as often as the design reads it
+# (`bash -n`, then the `cp`) so any third read starves — was measured and does
+# not work: the installer completes only with FOUR feeds and consumes THREE, so
+# something opens the source a third time, and it is not this script (both of
+# its content reads are accounted for). The likeliest reader is git refreshing
+# its index over the worktree during the rev-parse calls. A row built on that
+# count would fail whenever git decides to stat, i.e. it would pin git's
+# behaviour rather than ours.
+#
+# What IS enforced: install_snapshot measures the live bytes after the rename
+# and refuses to write any record when they are not the judged bytes (rc=5),
+# and `blob:`/`sha256:` come from the installed file. The rows above check the
+# record against a fresh hash of what is deployed. That is construction plus
+# corroboration; the remaining exposure is a writer that wins the race AND
+# leaves the deployed file byte-identical to what it judged, which is not a
+# state anyone can exploit.
+
+printf '== a dry run must preview the one decision --apply makes ==\n'
+# The gate lived inside the install path, so --dry-run said NOTHING about
+# review: from a weakened checkout it printed WOULD REPOINT for every repo and
+# not a word about the verdict, and --dry-run --allow-unreviewed was
+# byte-identical to a plain dry run.
+_prov_repo previewbad; _prov_weaken previewbad
+_prov_run previewbad --dry-run
+printf '%s' "$OUT" | grep -qE 'would deploy: [0-9a-f]{7,} +reviewed=no' \
+  && ok "a dry run states the verdict and the blob it judged" \
+  || bad "dry-run preview" "no verdict: $(printf '%s' "$OUT" | grep -m1 'would deploy')"
+printf '%s' "$OUT" | grep -q 'WOULD REFUSE' \
+  && ok "and says --apply would refuse" \
+  || bad "dry-run preview" "does not say what --apply would do"
+_prov_run previewbad --dry-run --allow-unreviewed=preview-test
+printf '%s' "$OUT" | grep -q 'WOULD DEPLOY IT ANYWAY' \
+  && ok "and a dry run WITH the hatch differs from one without it" \
+  || bad "dry-run preview" "the hatch is invisible in a preview"
+_prov_repo previewok
+_prov_run previewok --dry-run
+printf '%s' "$OUT" | grep -q 'reviewed=yes' \
+  && ok "a clean checkout previews reviewed=yes" \
+  || bad "dry-run preview" "cannot preview a good verdict"
+[ -f "$WORK/previewok/deploy/secret-scan-pre-commit.sh" ] \
+  && bad "dry-run" "a DRY RUN deployed the scanner" \
+  || ok "and a dry run still installs nothing"
+
+printf '== the refusal must describe the state, not only the blocked action ==\n'
+# After an --allow-unreviewed deployment the corrective action is to re-run
+# --apply without the flag. That refused and exited BEFORE VERIFY, so the
+# operator doing the right thing was told nothing about what is executing, and
+# the unreviewed scanner stayed live and unmentioned.
+_prov_repo persist; _prov_weaken persist
+_prov_run persist --apply --allow-unreviewed=hotfix-under-test
+grep -q '^reviewed: *no' "$WORK/persist/deploy/.rev" && ok "the hatch deploys and records reviewed: no" \
+  || bad "hatch" "$(grep -m1 reviewed "$WORK/persist/deploy/.rev" 2>/dev/null)"
+grep -q '^reason: *hotfix-under-test' "$WORK/persist/deploy/.rev" \
+  && ok "with the reason it was given" \
+  || bad "hatch reason" "$(grep -m1 reason "$WORK/persist/deploy/.rev" 2>/dev/null)"
+grep -qE '^expires: *[0-9]{4}-' "$WORK/persist/deploy/.rev" \
+  && ok "and a deadline, so it is not permanent until someone remembers" \
+  || bad "hatch expiry" "no expiry recorded"
+_prov_run persist --apply                     # the corrective run
+{ [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'STILL running'; } \
+  && ok "the refusal reports what the fleet is running right now" \
+  || bad "refusal" "rc=$RC and no live-state report"
+printf '%s' "$OUT" | grep -q 'live deployment is UNREVIEWED' \
+  && ok "and says that live deployment is unreviewed" \
+  || bad "refusal" "does not name the unreviewed state it leaves in place"
+_prov_run persist --dry-run
+printf '%s' "$OUT" | grep -q 'UNREVIEWED DEPLOYMENT' \
+  && ok "VERIFY headlines an unreviewed deployment rather than filing it as a field" \
+  || bad "VERIFY" "an unreviewed fleet is one line among eleven"
+
+# A bare --allow-unreviewed must not work: the reason is what makes the record
+# answerable later.
+_prov_run persist --apply --allow-unreviewed
+{ [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'needs a reason'; } \
+  && ok "the hatch requires a reason" \
+  || bad "hatch" "bare --allow-unreviewed was accepted (rc=$RC)"
 
 printf '== the review anchor must be one specific ref ==\n'
 # `origin/main` is an AMBIGUOUS refname: git resolves refs/heads/<name> and

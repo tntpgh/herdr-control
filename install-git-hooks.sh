@@ -20,11 +20,13 @@
 #   bash install-git-hooks.sh --dry-run    # same thing, said out loud
 #   bash install-git-hooks.sh --apply      # make the changes
 #   bash install-git-hooks.sh --undo       # restore what --apply replaced
-#   bash install-git-hooks.sh --apply --allow-unreviewed
+#   bash install-git-hooks.sh --apply --allow-unreviewed=<reason>
 #                                          # deploy a scanner origin/main does
 #                                          # NOT carry (a fix that must go live
 #                                          # before its PR merges). Recorded in
-#                                          # .rev as reviewed: no.
+#                                          # .rev as reviewed: no, with the
+#                                          # reason and a 7-day expiry that
+#                                          # VERIFY gets louder about.
 #
 # Dry run is the DEFAULT, matching install.sh: a script that rewrites hooks in 18
 # repositories should not do it because someone typed its name.
@@ -86,12 +88,18 @@ ROOT="${CODE_ROOT:-$HOME/Code}"
 
 MODE=dry
 ALLOW_UNREVIEWED=0
+ALLOW_UNREVIEWED_REASON=""
 for a in "$@"; do
   case "$a" in
     --dry-run) MODE=dry ;;
     --apply)   MODE=apply ;;
     --undo)    MODE=undo ;;
-    --allow-unreviewed) ALLOW_UNREVIEWED=1 ;;
+    --allow-unreviewed=*) ALLOW_UNREVIEWED=1; ALLOW_UNREVIEWED_REASON="${a#*=}" ;;
+    --allow-unreviewed)
+      echo "REFUSING: --allow-unreviewed needs a reason: --allow-unreviewed=<why>" >&2
+      echo "  It puts a scanner no review approved in front of 18 repositories," >&2
+      echo "  and the reason is what makes the record answerable later." >&2
+      exit 2 ;;
     -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
@@ -229,19 +237,29 @@ _blob_at() {                              # <ref> -> OID on stdout, or nothing
 DEPLOY_REVIEWED=unknown
 DEPLOY_REV=""
 DEPLOY_SNAP_OID=""
-deploy_scanner() {
+DEPLOY_SNAP=""
+DEPLOY_MAIN_OID=""
+
+# JUDGE, then INSTALL — two steps, because a dry run must be able to reach the
+# verdict without touching anything. The gate used to live inside the install
+# path, so `--dry-run` said nothing at all about the one decision --apply makes:
+# from a weakened checkout it printed WOULD REPOINT for every repo and not a
+# word about review, and `--dry-run --allow-unreviewed` was byte-identical to a
+# plain dry run. A preview that omits the thing which decides whether --apply
+# refuses is not a preview.
+judge_snapshot() {                        # -> 0 judged (verdict in DEPLOY_*), 1 unusable
   mkdir -p "$HOOK_DEPLOY_DIR" || return 1
-  local tmp="$HOOK_DEPLOY.new.$$"
-  cp "$HOOK_SRC" "$tmp" || { rm -f "$tmp"; return 1; }
-  chmod 0755 "$tmp" || { rm -f "$tmp"; return 1; }
+  DEPLOY_SNAP="$HOOK_DEPLOY.new.$$"
+  cp "$HOOK_SRC" "$DEPLOY_SNAP" || { rm -f "$DEPLOY_SNAP"; return 1; }
+  chmod 0755 "$DEPLOY_SNAP" || { rm -f "$DEPLOY_SNAP"; return 1; }
   # A scanner that cannot run is worse than none: it would fail every commit
   # and teach --no-verify.
-  bash -n "$tmp" || { rm -f "$tmp"; return 1; }
+  bash -n "$DEPLOY_SNAP" || { rm -f "$DEPLOY_SNAP"; return 1; }
 
-  DEPLOY_SNAP_OID=$(git hash-object "$tmp" 2>/dev/null)
-  local main_oid head_oid sha br state
+  DEPLOY_SNAP_OID=$(git hash-object "$DEPLOY_SNAP" 2>/dev/null)
+  local head_oid sha br state
   if _src_repo_ok; then
-    main_oid=$(_blob_at "$MAIN_REF")
+    DEPLOY_MAIN_OID=$(_blob_at "$MAIN_REF")
     head_oid=$(_blob_at HEAD)
     sha=$(git -C "$here" rev-parse --short HEAD 2>/dev/null)
     br=$(git -C "$here" rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -258,38 +276,46 @@ deploy_scanner() {
     DEPLOY_REV="unknown (not a git checkout, or $HOOK_SRC is outside it)"
   fi
 
-  if [ -z "${main_oid:-}" ]; then
-    DEPLOY_REVIEWED="no (no origin/main to compare)"
-  elif [ "$main_oid" = "$DEPLOY_SNAP_OID" ]; then
+  if [ -z "$DEPLOY_MAIN_OID" ]; then
+    DEPLOY_REVIEWED="no (no $MAIN_REF to compare)"
+  elif [ "$DEPLOY_MAIN_OID" = "$DEPLOY_SNAP_OID" ]; then
     DEPLOY_REVIEWED=yes
   else
-    DEPLOY_REVIEWED="no (differs from origin/main)"
+    DEPLOY_REVIEWED="no (differs from $MAIN_REF)"
   fi
-  # A control that cannot VERIFY its input must not deploy it. The first
-  # version mapped "cannot resolve origin/main" to a label that was not the
-  # string "no", and the refusal only fired on exactly "no" — so a renamed
-  # remote, a single-branch clone, a never-fetched clone or a plain directory
-  # copy deployed arbitrary scanner bytes with rc=0. That is the failure this
-  # gate exists to prevent, reached without the escape hatch.
-  if [ "$DEPLOY_REVIEWED" != yes ] && [ "$ALLOW_UNREVIEWED" != 1 ]; then
-    rm -f "$tmp"
-    return 3
-  fi
+}
 
-  mv -f "$tmp" "$HOOK_DEPLOY" || { rm -f "$tmp"; return 1; }
+# Returns: 0 installed · 1 could not install · 4 installed but the record could
+# not be written (the fleet IS running the new bytes) · 5 the bytes that went
+# live are not the bytes that were judged.
+install_snapshot() {
+  mv -f "$DEPLOY_SNAP" "$HOOK_DEPLOY" || { rm -f "$DEPLOY_SNAP"; return 1; }
 
-  # From here the fleet is ALREADY running these bytes, so a failure to write
-  # the record is not "could not deploy" — saying that would tell the operator
-  # nothing happened while 54 shims execute the new scanner. Written to a temp
-  # and renamed, like the scanner, so two concurrent runs cannot tear it.
+  # POST-CONDITION, measured rather than asserted. This is the real defence for
+  # the property a structural test row kept failing to pin: three separate
+  # textual evasions satisfied that row, and one of them — recording `blob:`
+  # from a fresh read of the SOURCE — passed all 68 rows while reintroducing
+  # exactly the provenance defect this change exists to fix. Measuring what is
+  # live closes the class instead of describing it.
+  local live_oid
+  live_oid=$(git hash-object "$HOOK_DEPLOY" 2>/dev/null)
+  [ "$live_oid" = "$DEPLOY_SNAP_OID" ] || return 5
+
+  # Provenance beside the copy, written to a temp and renamed so two concurrent
+  # runs cannot tear it. `blob:` and `sha256:` are measured FROM THE INSTALLED
+  # FILE, never from the source or from an intention.
   local rtmp="$HOOK_DEPLOY_REV.new.$$"
   {
     printf 'rev:        %s\n' "$DEPLOY_REV"
     printf 'source:     %s\n' "$HOOK_SRC"
-    printf 'blob:       %s\n' "${DEPLOY_SNAP_OID:-unknown}"
+    printf 'blob:       %s\n' "$live_oid"
     printf 'reviewed:   %s\n' "$DEPLOY_REVIEWED"
-    printf 'main-blob:  %s\n' "${main_oid:-none}"
+    [ "$DEPLOY_REVIEWED" = yes ] || {
+      printf 'reason:     %s\n' "${ALLOW_UNREVIEWED_REASON:-(none given)}"
+      printf 'expires:    %s\n' "$(_expiry_iso)"
+    }
     printf 'main-ref:   %s\n' "$MAIN_REF"
+    printf 'main-blob:  %s\n' "${DEPLOY_MAIN_OID:-none}"
     printf 'main-dated: %s\n' "$(git -C "$here" log -1 --format=%cI "$MAIN_REF" 2>/dev/null || printf unknown)"
     printf 'deploy-dir: %s\n' "$HOOK_DEPLOY_DIR"
     printf 'sha256:     %s\n' "$(shasum -a 256 "$HOOK_DEPLOY" | cut -d' ' -f1)"
@@ -298,6 +324,18 @@ deploy_scanner() {
     rm -f "$rtmp"
     return 4
   }
+}
+
+# An unreviewed deployment gets a deadline, because "deliberate, recorded and
+# permanent until someone remembers" is weaker than this file's own doctrine for
+# the one control between a credential and a push. Nothing consults .rev at
+# commit time (the shims exec the scanner directly), so the deadline is a
+# REPORTING deadline: VERIFY gets louder once it passes.
+UNREVIEWED_TTL_DAYS=7
+_expiry_iso() {
+  date -u -v+"${UNREVIEWED_TTL_DAYS}"d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+    || date -u -d "+${UNREVIEWED_TTL_DAYS} days" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+    || printf unknown
 }
 
 # The shim is one exec, so the scanner is never copied into a repo. Extra argv
@@ -341,31 +379,81 @@ case "$HOOK_DEPLOY_DIR" in
     fi ;;
 esac
 
-[ "$MODE" = dry ] && echo "DRY RUN — nothing will be changed. Re-run with --apply."
+# The state the fleet is in RIGHT NOW, printed on the refusal path too. After an
+# --allow-unreviewed deployment the corrective action is to re-run --apply
+# without the flag — which refuses and exits before VERIFY, so the operator
+# doing the right thing was told nothing about what is executing, and the
+# unreviewed scanner stayed live and unmentioned. The refusal even read as
+# though nothing was at risk ("would put code no review has approved in front
+# of every commit") when it already had.
+_report_live_state() {                    # to stderr, for the refusal path
+  [ -r "$HOOK_DEPLOY_REV" ] || { echo "  The fleet has no recorded deployment at $HOOK_DEPLOY." >&2; return; }
+  echo "  NOTHING CHANGED. The fleet is STILL running:" >&2
+  sed 's/^/    /' "$HOOK_DEPLOY_REV" >&2
+  grep -q '^reviewed: *yes' "$HOOK_DEPLOY_REV" \
+    || echo "  That live deployment is UNREVIEWED. Deploy from $MAIN_REF to clear it." >&2
+}
+
+if [ "$MODE" = dry ]; then
+  echo "DRY RUN — nothing will be changed. Re-run with --apply."
+  # Reach the verdict without installing: snapshot, judge, report, delete.
+  if judge_snapshot; then
+    echo "would deploy: ${DEPLOY_SNAP_OID:-unknown}  reviewed=$DEPLOY_REVIEWED"
+    if [ "$DEPLOY_REVIEWED" = yes ]; then
+      :
+    elif [ "$ALLOW_UNREVIEWED" = 1 ]; then
+      echo "  --apply WOULD DEPLOY IT ANYWAY (--allow-unreviewed given), recorded as reviewed: no"
+      echo "  reason would be: ${ALLOW_UNREVIEWED_REASON:-(none given)}"
+    else
+      echo "  --apply WOULD REFUSE. Override with --apply --allow-unreviewed=<reason>."
+    fi
+  else
+    echo "would deploy: NOTHING — $HOOK_SRC is not usable (see above)"
+  fi
+  rm -f "$DEPLOY_SNAP"
+fi
+
 if [ "$MODE" = apply ]; then
   # Best effort freshness: origin/main is whatever this checkout last saw, so a
   # scanner fix merged upstream would otherwise be "reviewed: yes" while the
   # fleet runs the pre-fix detector. Failure is fine (offline, no remote) — the
   # record carries main-dated and VERIFY says how old it is.
   git -C "$here" fetch --quiet origin main 2>/dev/null || true
-  deploy_scanner; _drc=$?
+  if ! judge_snapshot; then
+    echo "REFUSING: could not prepare $HOOK_SRC for deployment (nothing installed)" >&2
+    _report_live_state
+    exit 2
+  fi
+  if [ "$DEPLOY_REVIEWED" != yes ] && [ "$ALLOW_UNREVIEWED" != 1 ]; then
+    rm -f "$DEPLOY_SNAP"
+    echo "REFUSING: this scanner is $DEPLOY_REVIEWED." >&2
+    echo "  It would go in front of every commit and every push in $ROOT/*," >&2
+    echo "  and because the copy outlives a branch switch it would leave no" >&2
+    echo "  record of which revision — so it is not deployed." >&2
+    echo "  source: $HOOK_SRC" >&2
+    echo "  rev:    $DEPLOY_REV" >&2
+    _report_live_state
+    echo "  Either merge it first, or say so explicitly:" >&2
+    echo "    bash $0 --apply --allow-unreviewed=<reason>" >&2
+    exit 2
+  fi
+  install_snapshot; _drc=$?
   case "$_drc" in
     0) echo "deployed:  $HOOK_SRC -> $HOOK_DEPLOY"
-       echo "revision:  $DEPLOY_REV  reviewed=$DEPLOY_REVIEWED" ;;
-    3) echo "REFUSING: this scanner is $DEPLOY_REVIEWED." >&2
-       echo "  Deploying it would put code no review has approved in front of" >&2
-       echo "  every commit and every push in $ROOT/* — and, because the copy" >&2
-       echo "  outlives a branch switch, leave no record of which revision." >&2
-       echo "  source: $HOOK_SRC" >&2
-       echo "  rev:    $DEPLOY_REV" >&2
-       echo "  Either merge it first, or say so explicitly:" >&2
-       echo "    bash $0 --apply --allow-unreviewed" >&2
-       exit 2 ;;
+       echo "revision:  $DEPLOY_REV  reviewed=$DEPLOY_REVIEWED"
+       [ "$DEPLOY_REVIEWED" = yes ] || \
+         echo "           UNREVIEWED, expires $(_expiry_iso) — reason: ${ALLOW_UNREVIEWED_REASON:-(none given)}" ;;
     4) echo "DEPLOYED BUT UNRECORDED: $HOOK_DEPLOY is live and carrying the new" >&2
        echo "  bytes ($DEPLOY_SNAP_OID), but $HOOK_DEPLOY_REV could not be" >&2
        echo "  written — so the provenance record still describes the PREVIOUS" >&2
        echo "  generation. The fleet is running the new scanner. Fix the record:" >&2
        echo "    ls -l $HOOK_DEPLOY_REV   # read-only, immutable, or not yours?" >&2
+       exit 2 ;;
+    5) echo "REFUSING TO VOUCH: the bytes now live at $HOOK_DEPLOY are not the" >&2
+       echo "  bytes that were judged ($DEPLOY_SNAP_OID). Something rewrote the" >&2
+       echo "  deployed file between the rename and this check, so no provenance" >&2
+       echo "  record was written — the record would have named bytes nobody" >&2
+       echo "  reviewed. Re-run --apply from a quiet checkout." >&2
        exit 2 ;;
     *) echo "REFUSING: could not deploy the scanner to $HOOK_DEPLOY (nothing installed)" >&2
        exit 2 ;;
@@ -560,6 +648,30 @@ if [ -r "$HOOK_DEPLOY" ]; then
   printf '  deployed scanner: %s\n' "$HOOK_DEPLOY"
   if [ -r "$HOOK_DEPLOY_REV" ]; then
     sed 's/^/    /' "$HOOK_DEPLOY_REV"
+    # An unreviewed deployment is a headline, not a field. Nothing consults .rev
+    # at commit time — the shims exec the scanner directly — so this report is
+    # the only place the state is ever mentioned, and it used to be one line
+    # among eleven.
+    if ! grep -q '^reviewed: *yes' "$HOOK_DEPLOY_REV"; then
+      _why=$(sed -n 's/^reason:[[:space:]]*//p' "$HOOK_DEPLOY_REV")
+      _exp=$(sed -n 's/^expires:[[:space:]]*//p' "$HOOK_DEPLOY_REV")
+      _dep=$(sed -n 's/^deployed:[[:space:]]*//p' "$HOOK_DEPLOY_REV")
+      _days=""
+      if [ -n "$_dep" ]; then
+        _t=$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$_dep" +%s 2>/dev/null || date -u -d "$_dep" +%s 2>/dev/null)
+        [ -n "$_t" ] && _days=$(( ( $(date +%s) - _t ) / 86400 ))
+      fi
+      echo "    UNREVIEWED DEPLOYMENT: the fleet has been running unreviewed bytes${_days:+ for ${_days}d}"
+      echo "      reason: ${_why:-(none recorded)}"
+      if [ -n "$_exp" ] && [ "$_exp" != unknown ]; then
+        _et=$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$_exp" +%s 2>/dev/null || date -u -d "$_exp" +%s 2>/dev/null)
+        if [ -n "$_et" ] && [ "$(date +%s)" -gt "$_et" ]; then
+          echo "      EXPIRED $_exp — this was meant to be temporary. Deploy from $MAIN_REF."
+        else
+          echo "      expires: $_exp"
+        fi
+      fi
+    fi
     _rec=$(sed -n 's/^sha256:[[:space:]]*//p' "$HOOK_DEPLOY_REV")
     [ "$_rec" = "$_dep_sha" ] || echo "    STALE RECORD: .rev describes different bytes than the deployed file"
   else
