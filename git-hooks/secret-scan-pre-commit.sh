@@ -609,18 +609,51 @@ pii_added_for_index() {
 check_pii() {                   # <label> <added text>
     local label="$1" text="$2"
     [[ -n "$text" ]] || return 0
-    # street address: <number> <Name> <suffix>, excluding the fixture words
+    # street address: <number> <Name> <suffix>, excluding the fixture words.
+    #
+    # The Suite 200, Wexford PA 15090 office is OUR OWN. It is the canonical
+    # NAP, already tracked in tntpgh-dev/src/config/codex/identity.ts and
+    # docs/nap-canonical.md, printed on every piece of public marketing, and
+    # the brokerage identification is REQUIRED on licensee advertising by
+    # 49 Pa. Code 35.305(c) -- a branded PDF cannot be built without it. Same
+    # principle as the teamthurber.com email carve-out below: our own published
+    # business identity is not client PII, and blocking it only teaches
+    # --no-verify on ordinary branding work.
+    #
+    # NOTE the exclusion pattern below starts at the digit, with NO leading
+    # \b. It used to have one, and that made this very line unpublishable: the
+    # detector matched the address inside the pattern text, while the exclusion
+    # did not, because in source the escape `\b` puts a literal `b` against the
+    # digits and kills the word boundary. A guard whose allowlist cannot be
+    # committed is a guard that gets bypassed.
     if printf '%s\n' "$text" \
        | grep -nE '[0-9]{2,5} [A-Z][a-z]+( [A-Z][a-z]+)? (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)\b' \
        | grep -viE '\b(Main|Elm|Oak|Test|Example|Fake|Sample|Anywhere|Nowhere|Maple|Pine|First|Second|Foo|Bar)\b' \
+       | grep -viE '2100 Corporate Dr(ive)?\b' \
        | grep -vE '^\+?[0-9]*:?\+?(123|456|789|1234|100|111|999) ' >/dev/null; then
         echo "BLOCKED: a real-looking STREET ADDRESS is being added in $label."
         PII_FOUND=1
     fi
-    # phone: not the 555-01xx fiction range
+    # phone: not the 555-01xx fiction range, and not one of OUR OWN published
+    # business lines. The three team numbers are the canonical NAP
+    # (docs/nap-canonical.md: team, Terrence direct, broker office) and the
+    # broker office line is legally required on licensee advertising by
+    # 49 Pa. Code 35.305(c). The 367-5860 line is West Penn Multi-List's
+    # published switchboard -- a trade body whose number has to be quotable
+    # when documenting an MLS rule or a verification route.
+    #
+    # The `(^|[^0-9])` / `([^0-9]|$)` anchors are a FALSE-POSITIVE fix, not a
+    # relaxation: the pattern otherwise matched INSIDE a longer digit run, so
+    # the Springer DOI `s11146-013-9424-1` parsed as a phone number and blocked
+    # a commit whose only offence was citing a peer-reviewed paper
+    # (2026-09-16). A real phone is always bounded by a non-digit, and the
+    # separator requirement is unchanged, so a bare 10-digit run still never
+    # matched. The offending substring is deliberately NOT written out here --
+    # spelling it in a comment re-trips the detector on this file.
     if printf '%s\n' "$text" \
-       | grep -E '(\+?1[-. ]?)?\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}' \
-       | grep -vE '555[-. ]?01[0-9][0-9]' >/dev/null; then
+       | grep -oE '(^|[^0-9])(\+?1[-. ]?)?\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}([^0-9]|$)' \
+       | grep -vE '555[-. ]?01[0-9][0-9]' \
+       | grep -vE '\(?(412\)? ?[-. ]?(844[-. ]5536|900[-. ]2243|367[-. ]5860)|724\)? ?[-. ]?934[-. ]3400)' >/dev/null; then
         echo "BLOCKED: a real-looking PHONE NUMBER is being added in $label."
         PII_FOUND=1
     fi

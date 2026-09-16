@@ -342,6 +342,38 @@ EOS
 git -C "$R" add test_x.py
 allows "$R" "a parametrize decorator is not read as an email address"
 
+# Our OWN published business identity is not client PII. The office address and
+# the three canonical NAP lines are printed on every piece of public marketing
+# and the broker office line is REQUIRED on licensee advertising by
+# 49 Pa. Code 35.305(c); 412-367-5860 is West Penn Multi-List's published
+# switchboard, quoted when documenting an MLS rule. Blocking these taught
+# --no-verify on ordinary branding work (2026-09-16, tourguide sellers guide).
+R="$(new_repo)"
+cat > "$R/branding.js" <<'EOS'
+const NAP = {
+  office: "2100 Corporate Drive, Suite 200, Wexford, PA 15090",
+  brokerPhone: "(724) 934-3400",
+  direct: "(412) 844-5536",
+  team: "(412) 900-2243",
+  mlsSwitchboard: "412-367-5860",
+};
+EOS
+git -C "$R" add branding.js
+allows "$R" "our own published NAP (office + broker/team lines) is allowed"
+
+# The phone pattern used to match INSIDE a longer digit run, so the Springer
+# DOI below parsed as a phone number and blocked a commit whose only offence
+# was citing a peer-reviewed paper (2026-09-16). The fixture is the real DOI;
+# the substring it was misread as is deliberately not spelled out, because
+# writing it in a comment re-trips the detector on this file.
+R="$(new_repo)"
+cat > "$R/sources.md" <<'EOS'
+Seiler (2014), J. Real Estate Finance & Economics 49(2):237-255 —
+https://link.springer.com/article/10.1007/s11146-013-9424-1
+EOS
+git -C "$R" add sources.md
+allows "$R" "a DOI is not read as a phone number (digit-run false positive)"
+
 printf '== ...and real-looking PII still blocks ==\n'
 R="$(new_repo)"
 printf 'owner = "%s"\n' "$BADMAIL" > "$R/crm.py"
