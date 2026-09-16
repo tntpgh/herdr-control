@@ -299,6 +299,90 @@ printf 'if then fi(\n' > "$WORK/broken.sh"
 OUT="$(CODE_ROOT="$ROOT" bash -c "cd $WORK && mkdir -p gh && cp broken.sh gh/secret-scan-pre-commit.sh && sed 's|\$here/git-hooks|$WORK/gh|' $INSTALLER > $WORK/i.sh && bash $WORK/i.sh --apply" 2>&1)"; rc=$?
 [ "$rc" = 2 ] && ok "refuses to deploy a scanner that is not valid bash" || bad "deployed a broken scanner (rc=$rc)"
 
+# ===== which revision the fleet runs =====
+#
+# All 18 repos executed an OPEN PR's scanner on 2026-09-16, which allowed three
+# PII cases origin/main blocks. Nothing in this suite noticed, because every
+# other check here describes the SHIMS, and the shims were perfect: they all
+# pointed at the one deployed copy. What was missing was any statement about
+# WHAT that copy is.
+_prov_env() {                 # a throwaway repo + remote, $WORK/prov
+  rm -rf "$WORK/prov"; mkdir -p "$WORK/prov"
+  git init -q "$WORK/prov/src"
+  git -C "$WORK/prov/src" config user.email t@e.c
+  git -C "$WORK/prov/src" config user.name t
+  mkdir -p "$WORK/prov/src/git-hooks"
+  cp "$here/git-hooks/secret-scan-pre-commit.sh" "$WORK/prov/src/git-hooks/secret-scan-pre-commit.sh"
+  cp "$INSTALLER" "$WORK/prov/src/install-git-hooks.sh"
+  git -C "$WORK/prov/src" add -A >/dev/null
+  git -C "$WORK/prov/src" commit -qm base
+  git init -q --bare "$WORK/prov/remote.git"
+  git -C "$WORK/prov/src" remote add origin "$WORK/prov/remote.git"
+  git -C "$WORK/prov/src" push -q origin HEAD:refs/heads/main
+  git -C "$WORK/prov/src" fetch -q origin
+}
+_prov_run() {                 # [extra args...] -> rc, output in $OUT
+  OUT="$(cd "$WORK/prov/src" && CODE_ROOT="$WORK/prov/none" \
+    HERDR_HOOK_DEPLOY_DIR="$WORK/prov/deploy" bash install-git-hooks.sh "$@" 2>&1)"
+}
+
+_prov_env
+_prov_run --apply
+if [ -r "$WORK/prov/deploy/.rev" ]; then
+  grep -q '^reviewed: yes' "$WORK/prov/deploy/.rev" \
+    && ok "--apply records the deployed revision and that it is reviewed" \
+    || bad ".rev written but not marked reviewed: $(cat "$WORK/prov/deploy/.rev")"
+  # The point of the record is naming the REVISION — "reviewed: yes" without a
+  # sha would have described the 2026-09-16 deployment perfectly and still left
+  # nobody able to say which commit the fleet was running.
+  grep -qE '^rev:[[:space:]]+[0-9a-f]{7,}[[:space:]]' "$WORK/prov/deploy/.rev" \
+    && ok ".rev names the source commit, not just its review status" \
+    || bad ".rev has no resolvable revision line: $(sed -n 1p "$WORK/prov/deploy/.rev")"
+  _s=$(shasum -a 256 "$WORK/prov/deploy/secret-scan-pre-commit.sh" | cut -d' ' -f1)
+  grep -q "^sha256:[[:space:]]*$_s\$" "$WORK/prov/deploy/.rev" \
+    && ok ".rev's sha256 is of the bytes actually deployed" \
+    || bad ".rev sha256 does not match the deployed file"
+else
+  bad "--apply wrote no .rev provenance record"
+fi
+
+# The gate that was missing. An unreviewed scanner is the one thing that must
+# not reach 18 repos silently — a weakened detector lives on a branch BEFORE
+# review catches it, which is exactly what happened with #87 and #88.
+printf '\n# local edit\n' >> "$WORK/prov/src/git-hooks/secret-scan-pre-commit.sh"
+_prov_run --apply
+[ -n "$OUT" ] && printf '%s' "$OUT" | grep -q 'REFUSING' \
+  && ok "refuses to deploy a scanner origin/main does not carry" \
+  || bad "deployed an unreviewed scanner: $(printf '%s' "$OUT" | tail -2)"
+printf '%s' "$OUT" | grep -q -- '--allow-unreviewed' \
+  && ok "the refusal names the explicit escape hatch" \
+  || bad "refusal does not say how to proceed deliberately"
+
+_prov_run --apply --allow-unreviewed
+grep -q '^reviewed: no' "$WORK/prov/deploy/.rev" 2>/dev/null \
+  && ok "--allow-unreviewed deploys but records reviewed=no" \
+  || bad "escape hatch did not record that the source was unreviewed"
+
+# And the report has to SAY so afterwards, because that deployment outlives the
+# branch it came from.
+_prov_run --dry-run
+printf '%s' "$OUT" | grep -q 'matches origin/main: NO' \
+  && ok "VERIFY reports a deployed scanner that is not the reviewed one" \
+  || bad "VERIFY stayed silent about a drifted deployment"
+git -C "$WORK/prov/src" checkout -- git-hooks/secret-scan-pre-commit.sh
+_prov_run --apply
+_prov_run --dry-run
+printf '%s' "$OUT" | grep -q 'matches origin/main: yes' \
+  && ok "VERIFY confirms a deployment that does match origin/main" \
+  || bad "VERIFY cannot recognise a correct deployment"
+
+# A hand-written or stale .rev must not be believed.
+printf 'rev: bogus\nsha256: 0000\n' > "$WORK/prov/deploy/.rev"
+_prov_run --dry-run
+printf '%s' "$OUT" | grep -q 'STALE RECORD' \
+  && ok "VERIFY catches a .rev describing bytes other than the deployed file" \
+  || bad "a stale .rev was reported as provenance"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi
