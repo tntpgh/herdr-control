@@ -121,6 +121,38 @@ OPTIONAL = {"search dev (wrangler) · optional"}  # a dev server being down is n
 # has to wait for a real one. 4 keeps every interactive case fast (loops 10s ->
 # 40s, links 60s -> 4min) while making the first load after a quiet night fill
 # inline instead of rendering yesterday's answer as today's.
+# The revision this PROCESS is running, resolved once at import from the
+# directory the code was loaded out of. The service runs from a deployed git
+# worktree pinned detached at a commit, so this is a fact about what is serving
+# — not about which branch someone has checked out. `restart.sh --verify`
+# prints it, and /api/summary carries it, because "did the deploy take?" was
+# previously answerable only by timing a page load and inferring.
+def _running_rev() -> str:
+    try:
+        out = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent),
+                              "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+        rev = out.stdout.strip()
+    except Exception:
+        return "unknown"
+    return rev or "unknown"
+
+
+RUNNING_REV = _running_rev()
+
+# The tree THIS revision ships. Scripts the hub EXECUTES must come from here,
+# not from the developer checkout: `herdr-deliver.sh`, `send-to-agent.sh` and
+# `formserve.py` are the control plane's two action paths (deliver an answer to
+# an agent; serve a decision), and resolving them through HERDR_CONTROL left
+# them following whatever branch happened to be checked out — the exact mixture
+# the deployed worktree exists to prevent, in the two places where it matters
+# most. Found by review of the change that introduced the worktree.
+#
+# HERDR_CONTROL stays as it is, deliberately: it anchors LEDGER_DIR, which is
+# per-MACHINE state written by the launchd collector running the live checkout.
+# Code comes from the revision; machine state comes from the machine.
+APP_ROOT = Path(__file__).resolve().parent
+
 STALE_CEILING = 4
 
 # ── tiny TTL cache: each source is fetched at most once per window ─────────────
@@ -934,9 +966,9 @@ def notify_owner(row: dict) -> None:
     target = row.get("deliver_to")
     if not target:
         return
-    leaf = HERDR_CONTROL / "herdr-deliver.sh"
+    leaf = APP_ROOT / "herdr-deliver.sh"
     if not leaf.exists():
-        leaf = HERDR_CONTROL / "send-to-agent.sh"
+        leaf = APP_ROOT / "send-to-agent.sh"
     if not leaf.exists():
         return
     text = ("Form answers from the hub (" + str(row.get("title") or row.get("id")) + "):\n"
@@ -1566,7 +1598,7 @@ def serve_loop_decision(key: str) -> str | None:
     form.write_text(DECIDE_FORM.format(title=_esc(title), kind=_esc(sg["kind"]), text=_esc(sg["text"]),
                                        key_json=json.dumps(key)))
     form.with_suffix(".key").write_text(key)
-    subprocess.Popen([sys.executable, str(HERDR_CONTROL / "formserve.py"), str(form),
+    subprocess.Popen([sys.executable, str(APP_ROOT / "formserve.py"), str(form),
                       "--timeout", "14400", "--no-open"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     # invalidate(), not `at = 0.0`: under stale_ok an expired timestamp takes
@@ -2029,6 +2061,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"attention": len(live) + len(registry), "live_blocked": len(live),
                  "registry_attention": len(h.get("attention", [])),
                  "attention_unconfirmed": unconfirmed,
+                 "rev": RUNNING_REV,
                  "live_connected": live_data().get("connected", False),
                  "open_decisions": f.get("open_count", 0),
                  "open_ids": ",".join(sorted(x["id"] for x in f.get("open", [])))}).encode())
