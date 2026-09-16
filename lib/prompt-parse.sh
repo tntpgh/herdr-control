@@ -92,11 +92,34 @@ _is_prose() {
     for (i = 1; i <= NF; i++) if ($i ~ /^[A-Za-z][A-Za-z-]+$/) n++
     print n; exit }')
   [ "${words:-0}" -ge 5 ] || return 1
-  # A navigation footer is a hint, not output: two tokens, the same shape
-  # _menu_gate already requires, so a sentence containing "navigate" cannot
-  # pass as one.
-  case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
-    *navigate*select*|*navigate*cancel*|*select*navigate*) return 1 ;;
+  # A navigation footer is a hint, not output. Matching two LITERAL words
+  # (navigate + select) was enumerating footer PHRASINGS — the same open-set
+  # mistake as the furniture list, one noun over. Every one of these was
+  # refused, and any of them would make a live prompt unanswerable in a CLI an
+  # agent happens to run:
+  #
+  #   "Use the arrow keys to move, Enter to choose, Esc to go back"
+  #   "Press Enter to confirm your selection, or Esc to go back"
+  #   "Type a number and press return to answer this question"
+  #   "(Use arrow keys or type a number, then press Enter to submit)"
+  #
+  # So: a KEY NAME paired with a CHOICE VERB. Short hints that are already
+  # under five words ("esc to interrupt", "? for shortcuts") never reach here.
+  local low
+  low="$(printf '%s' "$1" | tr 'A-Z' 'a-z' | sed -E 's/^[^a-z0-9↑↓(?]*//; s/^[[:space:]]+//')"
+  # ANCHORED at the start, because an unanchored pair swallowed real output:
+  # " I have applied it. You can use the arrow keys to navigate the tree."
+  # contains arrow+navigate and is a sentence about what the agent DID. A hint
+  # is imperative — it opens with a key name, an arrow, a bracket, or a verb
+  # telling you to act — while output opens with a subject. That is the only
+  # separation available here: both shapes are the same length and use the
+  # same vocabulary.
+  case "$low" in
+    ↑*|↓*|"("*|"?"*|press*|use*|type*|choose*|hit*|select*|enter*|esc*|escape*|tab*|space*|return*|arrow*|up\ and\ down*)
+      case "$low" in
+        *select*|*choose*|*navigate*|*move*|*confirm*|*cancel*|*submit*|*answer*|*go\ back*|*shortcuts*)
+          return 1 ;;
+      esac ;;
   esac
   return 0
 }
@@ -128,9 +151,34 @@ prompt_options() {
       last = 0
       for (i = NR; i >= 1; i--) if (isopt[i]) { last = i; break }
       if (!last) exit 0
+      # Walk the run upward through option lines AND their CONTINUATIONS. An
+      # option that wraps ("1. Yes, and remember this decision for the rest of"
+      # / "   the session") used to truncate the run to the suffix, so a
+      # two-choice prompt reached Slack as ONE button and the wrapped option
+      # could not be picked at all. That is the failure mode this gate exists
+      # to avoid — asking a human the wrong question — so a continuation is
+      # joined onto its option rather than ending the run.
       first = last
-      while (first > 1 && isopt[first - 1]) first--
-      for (i = first; i <= last; i++) print "OPT\t" line[i]
+      while (first > 1) {
+        if (isopt[first - 1]) { first--; continue }
+        # an indented non-option line is a continuation only if an OPTION sits
+        # above it; otherwise it is the question, or output, and the run ends.
+        if (line[first - 1] ~ /^[[:space:]]+[^[:space:]]/ && first > 2 && isopt[first - 2]) {
+          first -= 2; continue
+        }
+        break
+      }
+      acc = ""
+      for (i = first; i <= last; i++) {
+        if (isopt[i]) {
+          if (acc != "") print "OPT\t" acc
+          acc = line[i]
+        } else {
+          sub(/^[[:space:]]+/, " ", line[i])
+          acc = acc line[i]          # a wrap is part of the option it follows
+        }
+      }
+      if (acc != "") print "OPT\t" acc
       # Each AFTER line carries how far it is from the BOTTOM, because the
       # status block lives there and is not agent output.
       # dist-from-bottom and whether the line carries DECORATION, so the

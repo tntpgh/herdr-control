@@ -198,6 +198,43 @@ SCREEN=$'Q?\n1. Yes\n2. No\n  ⫷⫷ x\n'"  󱊷 Commit the Jacomo fixes and pus
   && ok "and above omp's task line, which is prose by any word count" \
   || no "task line" "options empty — omp panes would be unanswerable"
 
+# Footer PHRASINGS are an open set too — matching the two literal words
+# navigate+select was the furniture mistake one noun over. Every line below was
+# REFUSED by that version, and any of them would make a live prompt
+# unanswerable in whatever CLI an agent happens to run inside a pane.
+for _f in \
+  '  ↑/↓ navigate · enter select · esc cancel' \
+  '  ? for shortcuts' \
+  '  Context left until auto-compact: 23%' \
+  '  ⏵⏵ auto-accept edits on (shift+tab to cycle)' \
+  '  esc to interrupt' \
+  '  Use the arrow keys to move, Enter to choose, Esc to go back' \
+  '  Press Enter to confirm your selection, or Esc to go back' \
+  '  Press up and down to move between the options' \
+  '  Type a number and press return to answer this question' \
+  '  Choose one of the options above with the arrow keys' \
+  '  (Use arrow keys or type a number, then press Enter to submit)'; do
+  SCREEN=$'Proceed?\n1. Yes\n2. No\n'"$_f"$'\n'"$BAR"
+  [ "$(prompt_options fake:pane | grep -c .)" -eq 2 ] \
+    && ok "offered below: $(printf '%s' "$_f" | cut -c1-44)" \
+    || no "footer phrasing" "REFUSED below: $_f"
+done
+
+# A WRAPPED option must arrive whole. This is the one failure in this file that
+# asks a human the WRONG question rather than failing to ask: the run was
+# strictly contiguous option lines, so an indented continuation truncated the
+# list to its suffix — a two-choice prompt reached Slack as ONE button, and the
+# option that wrapped could not be picked at all.
+SCREEN=$'Proceed?\n1. Yes, and remember this decision for the rest of\n   the session\n2. No\n'"$BAR"
+_opts="$(prompt_options fake:pane)"
+[ "$(printf '%s' "$_opts" | grep -c .)" -eq 2 ] \
+  && ok "a wrapped option does not truncate the list" \
+  || no "wrapped option" "got [$(printf '%s' "$_opts" | tr '\n' '|')]"
+case "$_opts" in
+  *"rest of the session"*) ok "and its continuation is joined onto it" ;;
+  *) no "wrapped option text" "continuation lost: [$(printf '%s' "$_opts" | tr '\n' '|')]" ;;
+esac
+
 SCREEN=$'Choose:\n1. Alpha\n2. Beta\nbranch: main'
 [ -n "$(prompt_options fake:pane)" ] \
   && ok "and above an OMC branch line" \
