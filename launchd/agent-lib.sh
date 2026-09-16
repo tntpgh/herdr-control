@@ -167,14 +167,22 @@ probe_http() {
 # deployed and checked-out code, which is worse than either.
 HERDR_APP_DIR="${HERDR_APP_DIR:-$HOME/.local/share/herdr-control/app}"
 
-app_rev() {                     # -> the sha the deployed app is pinned to
+app_rev_sha() {                 # -> the bare sha, for internal comparisons
   git -C "$HERDR_APP_DIR" rev-parse --short HEAD 2>/dev/null
+}
+
+app_rev() {                     # -> what is deployed, `-dirty` if it is not that
+  # `rev-parse` cannot see a modified tree, so a hand-edit in the deployed dir
+  # made every report — this, and /api/summary's `rev` — a provenance claim
+  # that was false. `--dirty` is the difference between a sha and a promise.
+  git -C "$HERDR_APP_DIR" describe --always --dirty --abbrev=7 2>/dev/null \
+    || git -C "$HERDR_APP_DIR" rev-parse --short HEAD 2>/dev/null
 }
 
 # deploy_app [<revision>] — point the deployed worktree at a committed revision
 # (default: origin/main). Never touches the developer checkout's HEAD.
 deploy_app() {
-  local want="${1:-origin/main}" src rev prev
+  local want="${1:-origin/main}" src rev prev fetched=""
   # HERDR_APP_SRC exists so verify-deploy.sh can exercise this against a
   # scratch repo with a deliberately unparseable commit — the rollback path
   # cannot be tested against real history, which always compiles. Unset in
@@ -183,30 +191,72 @@ deploy_app() {
   git -C "$src" rev-parse --git-dir >/dev/null 2>&1 || {
     echo "deploy: $src is not a git checkout" >&2; return 2; }
 
-  git -C "$src" fetch -q origin 2>/dev/null || true
+  # A fetch that failed must SAY so. `-q ... 2>/dev/null || true` hid every
+  # failure — offline, VPN down, expired credentials — and `$want` then
+  # resolved from whatever the remote-tracking ref was left at, while the
+  # deploy reported success "on origin/main". Continuing from a known ref is
+  # the right default (refusing to deploy offline would be worse); reporting
+  # it as current is not. thurber-os/scripts/audit_launchd.py carries the same
+  # note: "a comparison against an unfetched remote is not a comparison".
+  if ! git -C "$src" fetch -q origin 2>/dev/null; then
+    fetched=" [STALE: fetch failed; '$want' resolved from remote-tracking refs]"
+    echo "deploy: fetch failed — resolving '$want' from local remote-tracking refs" >&2
+  fi
   rev="$(git -C "$src" rev-parse --verify "$want^{commit}" 2>/dev/null)" || {
     echo "deploy: cannot resolve revision '$want'" >&2; return 2; }
 
-  if [ ! -d "$HERDR_APP_DIR/.git" ] && [ ! -f "$HERDR_APP_DIR/.git" ]; then
+  if [ ! -e "$HERDR_APP_DIR/.git" ]; then
     mkdir -p "$(dirname "$HERDR_APP_DIR")"
+    # PRUNE FIRST. `git worktree add` refuses a path still registered in
+    # .git/worktrees, so if the app dir is ever lost — a cleanup, a disk
+    # repair, a mv, a Migration Assistant restore — every later deploy fails
+    # with "missing but already registered worktree". The plist still points
+    # at the vanished path, launchd KeepAlive-loops a missing hub.py, and BOTH
+    # documented repairs (install.sh --hub --apply, restart.sh --deploy)
+    # refuse forever. The only way out was a `git worktree prune` the operator
+    # had to already know about. The first cutover was never the risk; every
+    # recovery after it was.
+    git -C "$src" worktree prune
     git -C "$src" worktree add -q --detach "$HERDR_APP_DIR" "$rev" || {
       echo "deploy: could not create the deployed worktree at $HERDR_APP_DIR" >&2; return 2; }
   else
-    prev="$(app_rev)"
-    git -C "$HERDR_APP_DIR" checkout -q --detach "$rev" || {
+    prev="$(app_rev_sha)"
+    # --force + clean: the deploy is AUTHORITATIVE. A plain checkout carries
+    # non-conflicting local edits and untracked files forward, so a hand-patch
+    # made in the deployed tree during an incident survived a deploy that
+    # reported a clean sha — recreating the "two sources of what is running"
+    # this whole change exists to remove.
+    git -C "$HERDR_APP_DIR" checkout -q --detach --force "$rev" || {
       echo "deploy: could not check out $rev in $HERDR_APP_DIR" >&2; return 2; }
+    git -C "$HERDR_APP_DIR" clean -qfdx
   fi
 
-  # Syntax-check what is about to be SERVED, not what was edited. A deploy that
-  # installs an unparseable hub leaves launchd crash-looping a service whose
-  # only job is telling you things are broken.
-  if ! python3 -m py_compile "$HERDR_APP_DIR/hub.py" 2>/dev/null; then
-    echo "deploy: $rev does not compile — rolling back" >&2
-    [ -n "${prev:-}" ] && git -C "$HERDR_APP_DIR" checkout -q --detach "$prev"
+  # Syntax-check what is about to be SERVED, and check the TREE, not one file:
+  # hub.py inserts its own `lib/` on sys.path and imports from it at module
+  # load, so a revision whose lib/*.py does not parse passed a hub.py-only
+  # gate and crash-looped the service on the next reload. Most changes here
+  # touch lib/.
+  if ! python3 -m compileall -q "$HERDR_APP_DIR/hub.py" "$HERDR_APP_DIR/lib" >/dev/null 2>&1; then
+    if [ -n "${prev:-}" ] && git -C "$HERDR_APP_DIR" checkout -q --detach --force "$prev"; then
+      echo "deploy: $rev does not compile — rolled back to $prev" >&2
+    else
+      # Claiming a rollback that did not happen is worse than the failure.
+      echo "deploy: $rev does not compile and NOTHING was rolled back —" >&2
+      echo "  $HERDR_APP_DIR holds a revision that cannot start." >&2
+    fi
     return 1
   fi
-  rm -rf "$HERDR_APP_DIR/__pycache__" 2>/dev/null || true
-  echo "  deployed $(git -C "$HERDR_APP_DIR" log -1 --format='%h %s' | cut -c1-72)"
+  find "$HERDR_APP_DIR" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
+  echo "  deployed $(app_rev) $(git -C "$HERDR_APP_DIR" log -1 --format=%s | cut -c1-56)${fetched}"
+}
+
+# render_hub_plist <template> <out> — one implementation, so the suite can
+# assert the RENDERED file instead of grepping install.sh for a sed expression.
+render_hub_plist() {
+  local tpl="$1" out="$2"
+  sed -e "s|__HUB_PY__|$HERDR_APP_DIR/hub.py|" \
+      -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.hub.log|g" \
+    "$tpl" > "$out"
 }
 
 HERDR_SERVICES=(

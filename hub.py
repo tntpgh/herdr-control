@@ -140,6 +140,19 @@ def _running_rev() -> str:
 
 RUNNING_REV = _running_rev()
 
+# The tree THIS revision ships. Scripts the hub EXECUTES must come from here,
+# not from the developer checkout: `herdr-deliver.sh`, `send-to-agent.sh` and
+# `formserve.py` are the control plane's two action paths (deliver an answer to
+# an agent; serve a decision), and resolving them through HERDR_CONTROL left
+# them following whatever branch happened to be checked out — the exact mixture
+# the deployed worktree exists to prevent, in the two places where it matters
+# most. Found by review of the change that introduced the worktree.
+#
+# HERDR_CONTROL stays as it is, deliberately: it anchors LEDGER_DIR, which is
+# per-MACHINE state written by the launchd collector running the live checkout.
+# Code comes from the revision; machine state comes from the machine.
+APP_ROOT = Path(__file__).resolve().parent
+
 STALE_CEILING = 4
 
 # ── tiny TTL cache: each source is fetched at most once per window ─────────────
@@ -953,9 +966,9 @@ def notify_owner(row: dict) -> None:
     target = row.get("deliver_to")
     if not target:
         return
-    leaf = HERDR_CONTROL / "herdr-deliver.sh"
+    leaf = APP_ROOT / "herdr-deliver.sh"
     if not leaf.exists():
-        leaf = HERDR_CONTROL / "send-to-agent.sh"
+        leaf = APP_ROOT / "send-to-agent.sh"
     if not leaf.exists():
         return
     text = ("Form answers from the hub (" + str(row.get("title") or row.get("id")) + "):\n"
@@ -1585,7 +1598,7 @@ def serve_loop_decision(key: str) -> str | None:
     form.write_text(DECIDE_FORM.format(title=_esc(title), kind=_esc(sg["kind"]), text=_esc(sg["text"]),
                                        key_json=json.dumps(key)))
     form.with_suffix(".key").write_text(key)
-    subprocess.Popen([sys.executable, str(HERDR_CONTROL / "formserve.py"), str(form),
+    subprocess.Popen([sys.executable, str(APP_ROOT / "formserve.py"), str(form),
                       "--timeout", "14400", "--no-open"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     # invalidate(), not `at = 0.0`: under stale_ok an expired timestamp takes

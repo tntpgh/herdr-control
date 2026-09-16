@@ -367,6 +367,11 @@ if [ "$BRIDGE" = 1 ]; then
   fi
 fi
 
+# Deferred non-fatal failures: the installer reports them at the END with a
+# nonzero exit, instead of aborting halfway and leaving later agents
+# unrendered — see the hub block below.
+INSTALL_RC=0
+
 # ---- local hub (optional, macOS) --------------------------------------------
 # hub.py at http://127.0.0.1:8600/ — the operator's one page (decisions inbox,
 # herdr attention, fleet, KB nightly, search memory). The omp extension also
@@ -381,16 +386,22 @@ if [ "$HUB" = 1 ]; then
     # when launchd next starts it, which is the shim defect one directory over.
     # deploy_app pins it to a commit, detached, so a branch switch cannot move
     # production and a rollback is a sha.
-    deploy_app "${HUB_REV:-origin/main}" || {
-      echo "  ! hub NOT installed: deploy failed (see above)" >&2; exit 2; }
-    sed -e "s|__HUB_PY__|$HERDR_APP_DIR/hub.py|" \
-        -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.hub.log|g" \
-      "$here/com.herdr-control.hub.plist.template" > "$PLIST"
-    # Was `unload` + `load`, which is the exact cached-job-definition bug the
-    # bridge and auth paths were already fixed for: an edited hub.py path or
-    # argv would not take effect. reload_agent does it the one right way.
-    reload_agent com.herdr-control.hub "$PLIST" \
-      && echo "  hub -> http://127.0.0.1:8600/"
+    #
+    # FAIL SOFT. An `exit 2` here aborted the whole installer before the auth
+    # pair was re-rendered — and `./install.sh --hub --bridge --auth --apply`
+    # is the command restart.sh documents as the repair when a plist is wrong.
+    # A run intended to fix the control plane would have fixed none of it and
+    # said nothing about the two services it skipped, which is the shape of
+    # the 2026-09-13 auth-plane outage.
+    if deploy_app "${HUB_REV:-origin/main}"; then
+      render_hub_plist "$here/com.herdr-control.hub.plist.template" "$PLIST"
+      reload_agent com.herdr-control.hub "$PLIST" \
+        && echo "  hub -> http://127.0.0.1:8600/"
+    else
+      INSTALL_RC=2
+      echo "  ! hub NOT installed: deploy failed (above). The plist and the" >&2
+      echo "    running hub are untouched; continuing with the other agents." >&2
+    fi
   else
     echo "  + would deploy $here -> $HERDR_APP_DIR (detached at ${HUB_REV:-origin/main})"
     echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/hub.py on :8600)"
@@ -441,3 +452,8 @@ Next, if you have not already:
   2. chmod 600 ~/.config/herdr-bridge.env
   3. start the bridge:  ./slack-bridge/run-bridge.sh   (or --bridge for launchd)
 EOF
+
+# A deferred failure (currently: a hub deploy that did not compile or could not
+# resolve) exits nonzero HERE, after every other agent has been rendered and
+# reloaded. Aborting mid-run is how a repair command repairs nothing.
+exit "${INSTALL_RC:-0}"

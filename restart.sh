@@ -47,7 +47,11 @@ for a in "$@"; do
     --panes)    PANES=1 ;;
     --deploy)   DEPLOY="origin/main" ;;
     --deploy=*) DEPLOY="${a#--deploy=}" ;;
-    -h|--help)  sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  # Stop at the first non-comment line instead of a fixed window:
+                # the window silently dropped the ROLLBACK block when two
+                # --deploy lines were added above it, and that block is the one
+                # thing an operator reaches for when the plane is down.
+                sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     -*)         echo "unknown flag: $a (try --help)" >&2; exit 2 ;;
     *)          WANT+=("$a") ;;
   esac
@@ -115,17 +119,42 @@ verify() {
   # that this is a fact rather than an inference from which branch happens to
   # be checked out; printing it is what makes that fact checkable.
   printf "  %-34s " "hub deployed revision"
-  if [ -d "$HERDR_APP_DIR" ]; then
-    _rev="$(app_rev)"
-    _behind="$(git -C "$HERDR_APP_DIR" rev-list --count "${_rev:-HEAD}..origin/main" 2>/dev/null || echo '?')"
-    if [ "${_behind:-0}" = 0 ]; then
-      echo "${_rev:-unknown} (== origin/main)"
+  _plist="$HOME/Library/LaunchAgents/com.herdr-control.hub.plist"
+  _plist_app=0
+  grep -qF "$HERDR_APP_DIR/hub.py" "$_plist" 2>/dev/null && _plist_app=1
+  if [ ! -d "$HERDR_APP_DIR" ]; then
+    if [ "$_plist_app" = 1 ]; then
+      # The plist points at a directory that is not there: launchd is
+      # KeepAlive-looping a missing hub.py. That IS the outage.
+      echo "MISSING — the plist points at $HERDR_APP_DIR, which does not exist" >&2
+      echo "    repair: ./restart.sh --deploy   (prunes the stale worktree registration)" >&2
+      fail=1
     else
-      echo "${_rev:-unknown} — ${_behind} commit(s) BEHIND origin/main; ./restart.sh --deploy"
+      # Not deployed yet, and the plist does not expect it to be. All four
+      # services can be up and serving; failing here would be exactly the
+      # cried wolf this file's own header warns about.
+      echo "not deployed (plist still runs a working checkout — ./install.sh --hub --apply)"
     fi
   else
-    echo "NOT DEPLOYED — the plist may still point at a working checkout" >&2
-    fail=1
+    _rev="$(app_rev)"
+    _head="$(git -C "$HERDR_APP_DIR" rev-parse HEAD 2>/dev/null)"
+    _main="$(git -C "$HERDR_APP_DIR" rev-parse origin/main 2>/dev/null)"
+    # IDENTITY, not a one-way count. `rev-list --count <rev>..origin/main`
+    # counts only what main has and the deployed rev does not, so ANY
+    # descendant of — or branch off — main scored 0 and was reported
+    # "== origin/main". That made the one line intended to prove provenance
+    # assert that unmerged code was reviewed main.
+    if [ -z "$_main" ]; then
+      echo "$_rev (origin/main does not resolve here — cannot compare)"
+    elif [ "$_head" = "$_main" ]; then
+      echo "$_rev (== origin/main)"
+    else
+      set -- $(git -C "$HERDR_APP_DIR" rev-list --left-right --count "$_main...$_head" 2>/dev/null || echo "? ?")
+      echo "$_rev — ${1:-?} behind / ${2:-?} ahead of origin/main"
+    fi
+    case "$_rev" in
+      *-dirty) echo "    ! the deployed tree has LOCAL EDITS; that sha is not what is running" >&2; fail=1 ;;
+    esac
   fi
   printf "  %-34s " "hub herdr subscription"
   local waited=0 budget="${PROBE_READY_SECS:-20}"

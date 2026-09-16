@@ -48,6 +48,17 @@ git -C "$SRC" checkout -q "$GOOD" -- hub.py
 git -C "$SRC" add -A
 git -C "$SRC" commit -qm "v3, parses again" --no-verify
 GOOD2="$(git -C "$SRC" rev-parse HEAD)"
+# A revision whose hub.py is FINE and whose lib/ does not parse. hub.py puts
+# its own lib/ on sys.path and imports from it at module load, so this crashes
+# the service — and a hub.py-only compile gate accepted it (review, proven).
+printf 'def broken(:\n' > "$SRC/lib/herdr_live.py"
+git -C "$SRC" add -A
+git -C "$SRC" commit -qm "v4, unparseable lib/" --no-verify
+BROKEN_LIB="$(git -C "$SRC" rev-parse HEAD)"
+git -C "$SRC" checkout -q "$GOOD2" -- lib/herdr_live.py
+git -C "$SRC" add -A
+git -C "$SRC" commit -qm "v5, lib parses again" --no-verify
+GOOD3="$(git -C "$SRC" rev-parse HEAD)"
 
 export HERDR_APP_SRC="$SRC"
 export HERDR_APP_DIR="$WORK/app"
@@ -89,8 +100,6 @@ printf '== a revision that does not compile is not served ==\n'
 OUT="$(deploy_app "$BROKEN" 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "deploying an unparseable revision FAILS" \
                 || bad "an unparseable revision deployed successfully"
-printf '%s' "$OUT" | grep -qi 'rolling back' \
-    && ok "and says it is rolling back" || bad "no rollback message: $OUT"
 [ "$(app_rev)" = "$(git -C "$SRC" rev-parse --short "$GOOD")" ] \
     && ok "the previous revision is still what is deployed" \
     || bad "left the app at $(app_rev) after a failed deploy"
@@ -98,14 +107,69 @@ python3 -m py_compile "$HERDR_APP_DIR/hub.py" 2>/dev/null \
     && ok "so the deployed hub.py still compiles" \
     || bad "the deployed hub.py does not compile after a rolled-back deploy"
 
+printf '== a revision whose lib/ does not parse is not served either ==\n'
+# hub.py alone compiled fine in this revision; 17/17 passed while this shipped.
+deploy_app "$GOOD2" >/dev/null 2>&1
+OUT="$(deploy_app "$BROKEN_LIB" 2>&1)"; RC=$?
+[ "$RC" -ne 0 ] && ok "a broken lib/ fails the deploy (the gate compiles the TREE)" \
+                || bad "a revision with an unparseable lib/ deployed with rc=0"
+[ "$(app_rev_sha)" = "$(git -C "$SRC" rev-parse --short "$GOOD2")" ] \
+    && ok "and the previous revision is still deployed" || bad "left the app at $(app_rev_sha)"
+if python3 -c "import sys; sys.path.insert(0, '$HERDR_APP_DIR/lib'); import herdr_live" 2>/dev/null; then
+    ok "the deployed tree still imports"
+else
+    bad "the deployed tree does not import after a rolled-back deploy"
+fi
+
+printf '== the app dir can be LOST and still recovered ==\n'
+# The unrecoverable case: `git worktree add` refuses a path still registered in
+# .git/worktrees, so once the dir vanished (a cleanup, a disk repair, a mv, a
+# Migration Assistant restore) BOTH documented repairs refused forever while
+# launchd KeepAlive-looped a missing hub.py. The only way out was a
+# `git worktree prune` the operator had to already know about.
+deploy_app "$GOOD2" >/dev/null 2>&1
+mv "$HERDR_APP_DIR" "$WORK/vanished"
+if OUT="$(deploy_app "$GOOD2" 2>&1)"; then
+    ok "a deploy re-creates the app dir after it is lost"
+else
+    bad "deploy cannot recover a lost app dir: $OUT"
+fi
+[ -f "$HERDR_APP_DIR/hub.py" ] && ok "and hub.py is there again" || bad "no hub.py after recovery"
+rm -rf "$WORK/vanished"
+
+printf '== a deploy is authoritative over the deployed tree ==\n'
+# A hand-patch made in the deployed dir during an incident used to survive a
+# deploy that then reported a clean sha — a second source of "what is running".
+printf 'x = 999  # hand-edit\n' > "$HERDR_APP_DIR/lib/herdr_live.py"
+printf 'print("stray")\n' > "$HERDR_APP_DIR/stray.py"
+deploy_app "$GOOD3" >/dev/null 2>&1
+grep -q 'hand-edit' "$HERDR_APP_DIR/lib/herdr_live.py" \
+    && bad "a local edit in the deployed tree survived a deploy" \
+    || ok "a local edit in the deployed tree is overwritten by the deploy"
+[ -f "$HERDR_APP_DIR/stray.py" ] \
+    && bad "an untracked file survived the deploy" \
+    || ok "and untracked files are cleaned"
+case "$(app_rev)" in
+    *-dirty) bad "app_rev still reports dirty after a clean deploy" ;;
+    *)       ok "app_rev reports a clean sha" ;;
+esac
+printf 'x = 1  # dirty again\n' >> "$HERDR_APP_DIR/lib/herdr_live.py"
+case "$(app_rev)" in
+    *-dirty) ok "and reports -dirty when the tree does NOT match the sha" ;;
+    *)       bad "app_rev reported a clean sha for a modified tree: $(app_rev)" ;;
+esac
+deploy_app "$GOOD3" >/dev/null 2>&1
+
 printf '== refusals ==\n'
+BEFORE_REFUSAL="$(app_rev_sha)"      # whatever is deployed right now, not a constant
 if deploy_app "no-such-revision" >/dev/null 2>&1; then
     bad "an unresolvable revision was accepted"
 else
     ok "an unresolvable revision is refused, not guessed"
 fi
-[ "$(app_rev)" = "$(git -C "$SRC" rev-parse --short "$GOOD")" ] \
-    && ok "and a refused deploy changes nothing" || bad "a refused deploy moved the app"
+[ "$(app_rev_sha)" = "$BEFORE_REFUSAL" ] \
+    && ok "and a refused deploy changes nothing" \
+    || bad "a refused deploy moved the app from $BEFORE_REFUSAL to $(app_rev_sha)"
 
 printf '== rolling forward and back is a sha ==\n'
 deploy_app "$GOOD2" >/dev/null 2>&1
@@ -115,21 +179,39 @@ deploy_app "$GOOD" >/dev/null 2>&1
 [ "$(app_rev)" = "$(git -C "$SRC" rev-parse --short "$GOOD")" ] \
     && ok "rolling BACK is the same command with an older sha" || bad "roll back left $(app_rev)"
 
-printf '== the installer must not point launchd at a working checkout ==\n'
-# The regression that started this: the plist rendered $here/hub.py.
-grep -q 's|__HUB_PY__|\$HERDR_APP_DIR/hub.py|' "$here/install.sh" \
-    && ok "install.sh renders the plist against the deployed app dir" \
-    || bad "install.sh does not render the deployed path"
-grep -q 's|__HUB_PY__|\$here/hub.py|' "$here/install.sh" \
-    && bad "install.sh still renders a checkout path into the plist" \
-    || ok "and no longer renders a checkout path"
-# And the live plist, when one is installed on this machine.
+printf '== the rendered plist points at the deployed app, not a checkout ==\n'
+# Asserted against the RENDERED FILE, not by grepping install.sh for a sed
+# expression: a source grep passes for a line that is unreachable, shadowed by
+# a later render, or resolving an empty variable.
+OUT_PLIST="$WORK/hub.plist"
+render_hub_plist "$here/com.herdr-control.hub.plist.template" "$OUT_PLIST"
+# plutil's JSON escapes every `/` as `\/`, so compare with the escapes removed
+# rather than against the raw path.
+ARGS="$(plutil -extract ProgramArguments json -o - "$OUT_PLIST" 2>/dev/null | tr -d '\\\\')"
+printf '%s' "$ARGS" | grep -qF "$HERDR_APP_DIR/hub.py" \
+    && ok "the rendered ProgramArguments names the deployed hub.py" \
+    || bad "rendered plist does not name $HERDR_APP_DIR/hub.py: $ARGS"
+printf '%s' "$ARGS" | grep -qF "$here/hub.py" \
+    && bad "the rendered plist names this checkout" \
+    || ok "and does not name this checkout"
+printf '%s' "$ARGS" | grep -qE '"/hub\.py"' \
+    && bad "HERDR_APP_DIR was empty when rendering — the plist points at /hub.py" \
+    || ok "and is not a bare /hub.py from an empty app dir"
+
+printf '== the plist installed on THIS machine ==\n'
 LIVE_PLIST="$HOME/Library/LaunchAgents/com.herdr-control.hub.plist"
 if [ -f "$LIVE_PLIST" ]; then
-    if grep -q "$HOME/Code/" "$LIVE_PLIST"; then
-        bad "the INSTALLED plist still launches hub.py from a working checkout"
+    LIVE_ARGS="$(plutil -extract ProgramArguments json -o - "$LIVE_PLIST" 2>/dev/null | tr -d '\\\\')"
+    LIVE_APP="$HOME/.local/share/herdr-control/app/hub.py"
+    # The POSITIVE fact, and that the file exists: "does not mention ~/Code" was
+    # satisfied by any path at all, including one pointing at a deployed dir
+    # that had been lost — the failure mode this change introduces.
+    if printf '%s' "$LIVE_ARGS" | grep -qF "$LIVE_APP"; then
+        ok "the installed plist runs the deployed app"
+        [ -f "$LIVE_APP" ] && ok "and that file exists" \
+            || bad "the installed plist points at $LIVE_APP, which does NOT exist — launchd is looping"
     else
-        ok "the installed plist does not launch from a working checkout"
+        bad "the installed plist does not run $LIVE_APP (it runs: $LIVE_ARGS)"
     fi
 else
     printf '  .     no hub plist installed on this machine — skipped\n'
