@@ -554,6 +554,23 @@ PII_FOUND=0
 # relaxes the PII checks ONLY: the credential scan above walks every staged
 # file independently of $ADDED, so a token pasted here is still blocked
 # (proven on a real negative, 2026-09-06).
+#
+# Same argument again for tntpgh-dev's published VIDEO metadata (2026-09-16):
+# `src/data/videos.json` is the team's own YouTube channel listing — titles and
+# descriptions copied verbatim from videos that are ALREADY public on YouTube,
+# and the titles ARE street addresses, because the videos are listing tours —
+# "<number> <Street> <City> PA <ZIP> Tour" is the channel's naming convention.
+# (No real example is written here on purpose: this very comment was blocked by
+# the street check on its first draft. A guard whose allowlist cannot be
+# committed is a guard that gets bypassed — same lesson as the exclusion-pattern
+# note further down.) `public/sitemap.xml` is generated
+# from that same data by `scripts/generate-sitemap.mjs` at prebuild, so the
+# addresses reappear in its `video:title`/`video:description` elements on every
+# regeneration. Neither is client PII by any reading: the site's whole purpose
+# is publishing these addresses, and the same street numbers are already in
+# ~4,800 tracked `/properties/*` URLs. Without these two entries the street
+# check blocks the VideoObject schema work outright, which is how a guard
+# teaches people to reach for --no-verify.
 # ONE exclusion list, used by both content sources (the index here, a pushed
 # commit in push mode). Two copies of a pathspec is how the modes come to
 # disagree about what counts as client PII.
@@ -562,6 +579,8 @@ PII_EXCLUDES=(
     ':(exclude)src/data/propx-*.json'
     ':(exclude)src/data/price-band-evidence.json'
     ':(exclude)src/data/sold-subdivision-context.json'
+    ':(exclude)src/data/videos.json'
+    ':(exclude)public/sitemap.xml'
     ':(exclude)cloudflare/worker/wrangler*.toml'
     ':(exclude)**/package-lock.json' ':(exclude)package-lock.json'
     ':(exclude)**/yarn.lock' ':(exclude)**/pnpm-lock.yaml'
