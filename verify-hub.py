@@ -747,16 +747,109 @@ class CacheFreshness(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual(c.get(), {"v": "new"}, "the cache never refreshed again")
 
+    def test_each_source_has_its_own_staleness_bound(self):
+        # `ttl x 4` was a convenience. What a stale value COSTS differs by
+        # source: a stale "prod is alive" on /links is actively misleading,
+        # while a twenty-minute-old read of a once-a-night ledger is the same
+        # answer. A source nobody has decided about gets the short default.
+        self.assertEqual(hub.CACHES["links"].stale_max, hub.STALE_MAX["links"])
+        self.assertLess(hub.CACHES["links"].stale_max, hub.CACHES["kb"].stale_max,
+                        "surface health may not go staler than the nightly ledger")
+        self.assertEqual(hub.Cached(10, lambda: {}, stale_ok=True, name="brand-new").stale_max,
+                         hub.DEFAULT_STALE_MAX,
+                         "an undecided source must inherit the conservative default")
+        for name in ("herdr", "forms"):
+            self.assertEqual(hub.CACHES[name].stale_max, 0.0,
+                             f"{name} fills inline; it has no staleness budget at all")
+
+    def test_the_per_source_bound_is_what_get_actually_enforces(self):
+        # The attribute assertions above pin the MAP; this pins that `get()`
+        # uses it. A mutation back to the old flat `ttl * 4` left those green,
+        # because 4 x 60s is 240s and nothing asserted an age between the two.
+        # `links` is ttl=60 / bound=90: at 120s old, per-source says refill
+        # inline (a stale "prod is alive" is the misleading case), the old flat
+        # rule said serve it.
+        c = hub.Cached(60, lambda: {"v": "probed now"}, stale_ok=True, name="links")
+        c.val, c.at = {"v": "two minutes old"}, time.monotonic() - 120
+        self.assertEqual(c.get(), {"v": "probed now"},
+                         "a 120s-old surface verdict was served from a 90s bound")
+        # And inside its own bound it is still served without waiting.
+        c.val, c.at = {"v": "seventy seconds old"}, time.monotonic() - 70
+        self.assertEqual(c.get(), {"v": "seventy seconds old"})
+
+    def test_a_hung_refresh_loses_ownership_instead_of_blocking_forever(self):
+        # `refreshing` was a lease of unknown length: a probe that hung held it
+        # for as long as its own timeouts allowed (search_data: 50 pages at
+        # timeout=20), no other refresh could start, and readers past the
+        # staleness bound launched PARALLEL probes instead of waiting.
+        started = threading.Event()
+        release = threading.Event()
+        fills = []
+
+        def hangs():
+            i = len(fills) + 1
+            fills.append(i)
+            started.set()
+            release.wait(10)
+            # Make the FIRST (soon-to-be-disowned) fill land LAST: a late write
+            # from a refresh that lost ownership is the actual hazard.
+            if i == 1:
+                time.sleep(0.3)
+            return {"n": i}
+
+        c = hub.Cached(1, hangs, stale_ok=True, name="loops")
+        c.val, c.at = {"n": 0}, time.monotonic() - 2
+        c.get()                                     # kicks the refresh
+        self.assertTrue(started.wait(2), "the refresh never started")
+        self.assertTrue(c.refreshing)
+        # Pretend it has outrun the budget.
+        c.refresh_started = time.monotonic() - hub.FILL_BUDGET_S - 1
+        gen_before = c.gen
+        c.get()
+        self.assertGreater(c.gen, gen_before,
+                           "a hung refresh must lose its right to write, not just its lease")
+        release.set()
+        time.sleep(0.8)
+        self.assertEqual(c.val, {"n": 2},
+                         "the disowned refresh's late value overwrote the live one")
+        self.assertEqual(len(fills), 2,
+                         "breaking the lease must allow exactly one new attempt")
+
+    def test_a_past_bound_reader_waits_for_an_in_flight_refresh(self):
+        # For `links` a duplicate fill means probing every production surface
+        # twice; the point of the whole design is not doing that.
+        fills = []
+        gate = threading.Event()
+
+        def slow():
+            fills.append(1)
+            gate.wait(5)
+            return {"n": len(fills)}
+
+        c = hub.Cached(0.05, slow, stale_ok=True, name="loops")
+        c.val, c.at = {"n": 0}, time.monotonic() - 0.06
+        c.get()                                     # in-flight refresh
+        time.sleep(0.05)
+        c.at = time.monotonic() - 999               # now past the staleness bound
+        done = []
+        t = threading.Thread(target=lambda: done.append(c.get()), daemon=True)
+        t.start()
+        time.sleep(0.3)
+        self.assertEqual(len(fills), 1,
+                         f"a past-bound reader started a parallel probe ({len(fills)} fills)")
+        gate.set()
+        t.join(5)
+
     def test_a_value_older_than_the_ceiling_is_refilled_inline(self):
         # `at` only advances when a fill completes and refreshes are only kicked
         # by readers, so a sparsely-read hub would serve an arbitrarily old
         # value: the first `/links` load of the morning would render last
         # night's production-surface verdicts as today's.
-        c = hub.Cached(10, lambda: {"v": "today"}, stale_ok=True)
-        c.val, c.at = {"v": "last night"}, time.monotonic() - 10 * hub.STALE_CEILING - 1
+        c = hub.Cached(10, lambda: {"v": "today"}, stale_ok=True, name="loops")
+        c.val, c.at = {"v": "last night"}, time.monotonic() - hub.STALE_MAX["loops"] - 1
         self.assertEqual(c.get(), {"v": "today"},
                          "a value past the staleness ceiling was still served")
-        # Just inside the ceiling it is still served stale, which is the point.
+        # Just inside the bound it is still served stale, which is the point.
         c.val, c.at = {"v": "recent"}, time.monotonic() - 11
         self.assertEqual(c.get(), {"v": "recent"})
 

@@ -159,7 +159,34 @@ RUNNING_REV = _running_rev()
 # Code comes from the revision; machine state comes from the machine.
 APP_ROOT = Path(__file__).resolve().parent
 
-STALE_CEILING = 4
+# How long a `stale_ok` cache may pass off a stale value before a reader has to
+# wait for a real one — PER SOURCE, in seconds, because `ttl x 4` was a
+# convenience and different observations have different consequences when old.
+# Reviewed 2026-09-16:
+#
+#   loops  40s   attention-adjacent: a suggestion's decision state shows here
+#                and the operator acts on it. Keep it close to its own TTL.
+#   links  90s   surface HEALTH. A stale "alive" is the actively misleading
+#                case — this page exists to say whether prod is up — so barely
+#                more than its 60s TTL.
+#   search 10m   memory-use stats. Nobody acts on a ten-minute-old count, and
+#                its fill is the most expensive (a paged walk).
+#   kb     20m   the nightly ledger. It changes once a night; a twenty-minute
+#                old read of it is the same answer.
+#
+# A source absent from this map gets DEFAULT_STALE_MAX, deliberately short: a
+# new network cache stays conservative until someone decides otherwise.
+STALE_MAX = {"loops": 40.0, "links": 90.0, "search": 600.0, "kb": 1200.0}
+DEFAULT_STALE_MAX = 30.0
+
+# No single fill may run longer than this. It is the bound that makes "refresh
+# in flight" a temporary state rather than a lease of unknown length: a hung
+# probe held refresh ownership for as long as its own timeouts allowed
+# (`search_data`: up to 50 pages at timeout=20), during which no other refresh
+# could start — and readers past the staleness ceiling launched PARALLEL inline
+# probes instead of waiting. Bounding the fill closes both without a second
+# mechanism.
+FILL_BUDGET_S = 25.0
 
 # ── tiny TTL cache: each source is fetched at most once per window ─────────────
 class Cached:
@@ -215,10 +242,18 @@ class Cached:
     review pass caught the claim; a curl of the served HTML confirmed it.
     """
 
-    def __init__(self, ttl: float, fn, stale_ok: bool = False):
-        self.ttl, self.fn, self.stale_ok = ttl, fn, stale_ok
+    def __init__(self, ttl: float, fn, stale_ok: bool = False, name: str = ""):
+        self.ttl, self.fn, self.stale_ok, self.name = ttl, fn, stale_ok, name
+        # Per-SOURCE staleness bound, not ttl x a constant. See STALE_MAX.
+        self.stale_max = STALE_MAX.get(name, DEFAULT_STALE_MAX) if stale_ok else 0.0
         self.at, self.val, self.lock = 0.0, None, threading.Lock()
         self.refreshing = False
+        # When the in-flight refresh started, so ownership can be BROKEN. A
+        # refresh that outruns FILL_BUDGET_S is presumed hung: it no longer
+        # blocks a fresh attempt, and it can no longer write (its generation
+        # is bumped), because a value fetched before an unknown-length stall
+        # is not evidence about now.
+        self.refresh_started = 0.0
         # Bumped by invalidate(), so a refresh that started before it lands
         # knows its snapshot is no longer wanted.
         self.gen = 0
@@ -292,9 +327,15 @@ class Cached:
             # renders last night's production-surface verdicts — where the old
             # inline code cost ~365ms and rendered the truth. Past the ceiling
             # the reader pays once and gets a real answer.
-            if self.stale_ok and self.val is not None and age <= self.ttl * STALE_CEILING:
+            # A refresh that has outrun the fill budget is presumed hung and
+            # loses ownership: bumping `gen` also stops its eventual write.
+            if self.refreshing and (time.monotonic() - self.refresh_started) > FILL_BUDGET_S:
+                self.refreshing = False
+                self.gen += 1
+            if self.stale_ok and self.val is not None and age <= self.stale_max:
                 if not self.refreshing:
                     self.refreshing = True
+                    self.refresh_started = time.monotonic()
                     try:
                         threading.Thread(target=self._refresh, args=(self.gen,),
                                          daemon=True).start()
@@ -304,9 +345,23 @@ class Cached:
                         # long-polls. No thread exists to clear the flag.
                         self.refreshing = False
                 return self.val
-            # Nothing cached yet, too old to pass off as current, or staleness
-            # is not acceptable here: the reader pays, because serving None is
-            # not an option and a stale liveness answer is worse than a slow one.
+            # Past the bound (or staleness not allowed here): the reader pays.
+            #
+            # But NOT in parallel with a refresh that is already running and
+            # still inside its budget — that duplicated the probe, which for
+            # `links` means hitting every production surface twice. Wait for
+            # the one in flight instead, up to what is left of its budget; if
+            # it lands, its value is this reader's answer.
+            if self.refreshing and self.val is not None:
+                waited = 0.0
+                while self.refreshing and waited < FILL_BUDGET_S:
+                    self.lock.release()
+                    try:
+                        time.sleep(0.05); waited += 0.05
+                    finally:
+                        self.lock.acquire()
+                if not self.refreshing and time.monotonic() - self.at <= self.ttl:
+                    return self.val          # the in-flight refresh answered it
             self.val = self._fill()
             self.at = time.monotonic()
             return self.val
@@ -1030,7 +1085,15 @@ def search_data() -> dict:
     if not token:
         return {"error": "SEARCH_SYNC_TOKEN unavailable; check the hub environment or scoped launchd credential file", "rows": []}
     rows, since = [], 0
+    # A wall-clock budget as well as a page cap. 50 pages at timeout=20 is up
+    # to ~1000s, and a fill that long held this cache's refresh ownership for
+    # the whole stall while readers past the staleness bound started parallel
+    # probes. The page cap bounds ROWS; only a deadline bounds TIME.
+    _deadline = time.monotonic() + FILL_BUDGET_S
     for _ in range(50):  # 50 × 500 rows is far beyond today's table; a hard stop, not a limit
+        if time.monotonic() > _deadline:
+            partial_walk = True
+            break
         req = urllib.request.Request(
             f"{SEARCH_URL}/log?since={since}&limit=500",
             headers={"authorization": f"Bearer {token}", "user-agent": "herdr-hub/1 (+tnt@teamthurber.com)"})
@@ -1040,7 +1103,8 @@ def search_data() -> dict:
         if page.get("next") is None:
             break
         since = page["next"]
-    totals = {"searches": len(rows), "replays": sum(int(r.get("hit_count") or 0) for r in rows),
+    totals = {"searches": len(rows), "truncated": bool(locals().get("partial_walk")),
+              "replays": sum(int(r.get("hit_count") or 0) for r in rows),
               "data_kind": sum(1 for r in rows if r.get("kind") == "data"),
               "partial": sum(1 for r in rows if r.get("status") != "ok")}
     latest = sorted(rows, key=lambda r: r["ts"], reverse=True)[:15]
@@ -1618,14 +1682,14 @@ def serve_loop_decision(key: str) -> str | None:
 
 CACHES = {
     # Liveness: cheap, filled inline, never served stale. See Cached.
-    "herdr": Cached(5, herdr_data),
-    "forms": Cached(3, forms_data),
+    "herdr": Cached(5, herdr_data, name="herdr"),
+    "forms": Cached(3, forms_data, name="forms"),
     # Network-backed: ~350ms each, so a reader gets the stale value and the
     # refresh happens behind them.
-    "search": Cached(120, search_data, stale_ok=True),
-    "kb": Cached(300, kb_data, stale_ok=True),
-    "links": Cached(60, links_data, stale_ok=True),
-    "loops": Cached(10, loops_data, stale_ok=True),
+    "search": Cached(120, search_data, stale_ok=True, name="search"),
+    "kb": Cached(300, kb_data, stale_ok=True, name="kb"),
+    "links": Cached(60, links_data, stale_ok=True, name="links"),
+    "loops": Cached(10, loops_data, stale_ok=True, name="loops"),
 }
 
 

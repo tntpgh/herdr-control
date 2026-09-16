@@ -37,10 +37,51 @@ _prompt_window() {
     | tail -n 25
 }
 
+# Lines that are screen FURNITURE rather than agent output: box rules, the
+# composer arrow, omp/OMC status lines, a tmux status bar, spinners. Used to
+# decide whether anything has happened SINCE an option list was painted.
+_FURNITURE='^[[:space:]]*([─═│┌┐└┘├┤┬┴┼╭╮╰╯]+|[❯>]|branch:|\[OMC#|⏵|\[[a-z0-9-]+:|[✻✳✽✶✢✷✸✹✺·*][[:space:]].*)[[:space:]]*$'
+# A NAVIGATION FOOTER is furniture too, and this one is load-bearing: the
+# footer is painted BELOW the options and is the very thing that says the menu
+# is live (_menu_gate requires "navigate" and "select" in the window). Treating
+# it as new output would reject every highlight menu — the 2026-08-01 failure,
+# where numbered-only parsing made omp alerts unanswerable, in reverse.
+_NAV_FOOTER='([Nn]avigate|[↑↓]|[Ee]nter to|[Ee]sc to|[Ss]pace to|[Tt]ab to)'
+
 prompt_options() {
   local win
   win=$(_prompt_window "$1") || return 1
-  printf '%s\n' "$win" | sed -nE "s/$_OPT_LINE/\1\t\2/p" \
+  # The LAST run of option lines, and only if nothing but furniture follows it.
+  #
+  # `!seen[$1]++` over a 25-line window took the first occurrence of each
+  # number ANYWHERE in it, so a numbered list that was already answered — or
+  # omp's steering queue painted above the panel — was offered as the current
+  # choice. That has hurt twice: on 2026-08-01 numbered-only parsing made every
+  # omp alert unanswerable, and the fix's numbered-FIRST ordering then matched
+  # the queue, so a Slack click on "1" pressed Approve on a command the
+  # operator never saw (slack-bridge/herdr-notify.sh:205-219 carries both).
+  # Menu-first ordering and prompt fingerprints closed the wrong-panel half;
+  # this closes the stale half.
+  #
+  # "Nothing after it" is the only freshness signal a screen scrape has. A
+  # prompt is the last thing painted while it is waiting; once the agent moves
+  # on, its own output lands below. Bottom-anchoring establishes LOCATION —
+  # this establishes that the location is still the live one.
+  printf '%s\n' "$win" | awk -v opt="$_OPT_LINE" -v furn="$_FURNITURE" -v nav="$_NAV_FOOTER" '
+    { line[NR] = $0; isopt[NR] = ($0 ~ opt); isfurn[NR] = ($0 ~ furn || $0 ~ nav) }
+    END {
+      # walk back to the end of the last option run
+      last = 0
+      for (i = NR; i >= 1; i--) if (isopt[i]) { last = i; break }
+      if (!last) exit 0
+      # anything but furniture after it means the prompt is no longer current
+      for (i = last + 1; i <= NR; i++) if (!isfurn[i]) exit 0
+      # the run itself: contiguous option lines ending at `last`
+      first = last
+      while (first > 1 && isopt[first - 1]) first--
+      for (i = first; i <= last; i++) print line[i]
+    }' \
+    | sed -nE "s/$_OPT_LINE/\1\t\2/p" \
     | sed -E 's/[[:space:]]+$//' \
     | awk -F'\t' '!seen[$1]++'   # first occurrence of each number wins
 }

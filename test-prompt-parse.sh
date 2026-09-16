@@ -138,5 +138,38 @@ prompt_any_visible fake:pane \
   && no "any_visible prose" "accepted prose" || ok "prose refused"
 
 echo
+echo "== a NUMBERED list is only offered while it is still the live prompt =="
+# `prompt_options` took the first occurrence of each number anywhere in the
+# bottom 25 lines, so an ANSWERED list — or omp's steering queue painted above
+# a panel — was served as the current choice. That has hurt twice: numbered-only
+# parsing made every omp alert unanswerable (2026-08-01), and the numbered-FIRST
+# fix then matched the queue, so a Slack click on "1" pressed Approve on a
+# command the operator never saw. A screen scrape has exactly one freshness
+# signal: a waiting prompt is the LAST thing painted.
+_prompt_window() { printf '%s\n' "$SCREEN"; }
+
+SCREEN=$'Approve this command?\n1. Yes\n2. No\n  ↑/↓ navigate · enter select · esc cancel\n❯'
+[ -n "$(prompt_options fake:pane)" ] \
+  && ok "a live list with a navigation footer below it is offered" \
+  || no "live numbered list" "options empty — the footer was read as new output"
+
+SCREEN=$'1. Yes\n2. No\n I have applied the change and moved on to the tests.\n❯'
+[ -z "$(prompt_options fake:pane)" ] \
+  && ok "a list the agent has already moved past is NOT offered" \
+  || no "stale numbered list" "offered [$(prompt_options fake:pane | tr '\n' '|')]"
+
+SCREEN=$'1. Conductor: review auth\n2. Conductor: fix nightly\n╭────────────╮\n│ Approve it │\n╰────────────╯\n  ↑/↓ navigate · enter select\n❯'
+[ -z "$(prompt_options fake:pane)" ] \
+  && ok "a steering QUEUE above a live panel is not mistaken for the choices" \
+  || no "queue above panel" "offered [$(prompt_options fake:pane | tr '\n' '|')]"
+
+SCREEN=$'old question\n1. A\n2. B\nnew question\n1. X\n2. Y\n❯'
+case "$(prompt_options fake:pane | tr '\n' ' ')" in
+  *X*Y*) ok "with two lists on screen, only the newest is offered" ;;
+  *) no "two lists" "offered [$(prompt_options fake:pane | tr '\n' '|')]" ;;
+esac
+unset -f _prompt_window
+
+echo
 printf 'pass=%s fail=%s\n' "$pass" "$fail"
 [ "$fail" = 0 ]
