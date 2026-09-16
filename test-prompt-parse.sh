@@ -157,10 +157,38 @@ SCREEN=$'Do you want to proceed?\n1. Yes\n2. No\n  \u2191/\u2193 navigate \u00b7
   && ok "a live list with a navigation footer below it is offered" \
   || no "live numbered list" "options empty — the footer was read as new output"
 
+# The classifier itself, line by line. Three earlier designs each failed
+# against one of these and the caller-level rows could not tell me which:
+# a furniture allowlist missed the bar, private-use byte ranges never fired in
+# BSD awk, and a positional rule swallowed the canonical stale case.
+for _line in \
+  'I have applied the change and moved on to the tests.' \
+  ' Done. Press Enter to send your next message.' \
+  ' I have applied it. You can use the arrow keys to navigate the tree.'; do
+  _is_prose "$_line" && ok "output recognised: ${_line:0:42}" \
+    || no "prose classifier" "missed output: $_line"
+done
+for _line in \
+  '  ↑/↓ navigate · enter select · esc cancel' \
+  '⏵⏵ auto-accept edits on' \
+  'branch: main' \
+  '  249 insertions(+), 18 deletions(-)' \
+  '╭── ⠙ 34m ▎ Opus 5 ▎ ~/Code/x ▎ main ▎ 20.71 ──22%──' \
+  '  󱊷 Commit the Jacomo fixes and push' \
+  '  󱊷 which line is still refusing, exactly'; do
+  _is_prose "$_line" && no "prose classifier" "status read as output: $_line" \
+    || ok "status recognised: ${_line:0:42}"
+done
+
 SCREEN=$'Choose:\n1. Alpha\n2. Beta\n\u23f5\u23f5 auto-accept edits on'
 [ -n "$(prompt_options fake:pane)" ] \
   && ok "a live list above Claude Code's mode line is offered" \
   || no "mode line" "options empty — the mode line was read as new output"
+
+SCREEN=$'Q?\n1. Yes\n2. No\n  ⫷⫷ x\n'"  󱊷 Commit the Jacomo fixes and push"$'\n'"$BAR"
+[ -n "$(prompt_options fake:pane)" ] \
+  && ok "and above omp's task line, which is prose by any word count" \
+  || no "task line" "options empty — omp panes would be unanswerable"
 
 SCREEN=$'Choose:\n1. Alpha\n2. Beta\nbranch: main'
 [ -n "$(prompt_options fake:pane)" ] \

@@ -59,29 +59,49 @@ _prompt_window() {
 # lines are not sentences — and anything carrying box-drawing or powerline
 # glyphs is excluded outright, which is what makes a status bar of any design
 # safe rather than a pattern someone has to have predicted.
+# Is a line AGENT OUTPUT — the positive signal that a prompt above it is gone?
+#
+# Three classifiers were tried against the real thing before this one, and the
+# failures are the reason it is shaped this way:
+#
+#   1. a FURNITURE allowlist (box characters, branch:, the mode line). The OMC
+#      bar is box characters interleaved with text and glyphs, so it matched
+#      nothing and a real prompt above a real bar went unanswerable — the
+#      2026-08-01 failure, reproduced by the fix for its opposite.
+#   2. PRIVATE-USE byte ranges in awk. Measured: the rule never fired at all in
+#      BSD awk, so it silently classified nothing.
+#   3. POSITION (ignore the last three lines). It swallowed the canonical stale
+#      case — prompt, one line of output, status bar — and offered it.
+#
+# What holds across omp, Claude Code and tmux: a status line carries GLYPHS and
+# is short; agent prose is a sentence in plain ASCII. So a line is output when
+# it has five or more words AND is either pure ASCII or long enough that the
+# glyphs are incidental. `LC_ALL=C grep` for the non-ASCII test, because that
+# is the one place a byte class behaves the same everywhere.
+#
+# The asymmetry is deliberate and is the whole design: this gate may fail to
+# REJECT (a stale list is then caught downstream by the prompt fingerprint —
+# herdr-select refuses on a mismatch, the Slack numeric route needs a recorded
+# prompt id), but it may not fail to ASK, because nothing downstream catches an
+# agent nobody can answer.
 _is_prose() {
-  # No apostrophe in any character class: this program lives inside a
-  # single-quoted shell string, and an earlier draft embedded one, which ended
-  # the quote and silently turned the whole matcher into garbage — it answered
-  # "no" for every input, including plain sentences, so the gate never rejected
-  # anything. Caught by testing the helper directly rather than the caller.
-  printf '%s\n' "$1" | awk '
-    # box-drawing, block and powerline glyphs: never prose, whatever the design
-    /[\xe2\x94-\xe2\x95]/                                { print "no"; exit }
-    /[\xee\x82]/                                          { print "no"; exit }
-    {
-      low = tolower($0)
-      # a navigation footer is a hint, not output. TWO tokens, the same shape
-      # _menu_gate already requires, so a sentence that merely contains
-      # "navigate" cannot pass as a footer.
-      if ((low ~ /navigate/ || low ~ /arrow keys/) && (low ~ /select/ || low ~ /cancel/)) {
-        print "no"; exit
-      }
-      n = 0
-      for (i = 1; i <= NF; i++) if ($i ~ /^[A-Za-z][A-Za-z-]+$/) n++
-      print (n >= 5) ? "yes" : "no"
-      exit
-    }'
+  local words
+  words=$(printf '%s\n' "$1" | awk '{ n = 0
+    for (i = 1; i <= NF; i++) if ($i ~ /^[A-Za-z][A-Za-z-]+$/) n++
+    print n; exit }')
+  [ "${words:-0}" -ge 5 ] || return 1
+  # A navigation footer is a hint, not output: two tokens, the same shape
+  # _menu_gate already requires, so a sentence containing "navigate" cannot
+  # pass as one.
+  case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+    *navigate*select*|*navigate*cancel*|*select*navigate*) return 1 ;;
+  esac
+  if printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]'; then
+    # Glyph-bearing: status lines are short, a sentence that happens to
+    # contain an em dash is not.
+    [ "$words" -ge 7 ] || return 1
+  fi
+  return 0
 }
 
 prompt_options() {
@@ -113,13 +133,35 @@ prompt_options() {
       first = last
       while (first > 1 && isopt[first - 1]) first--
       for (i = first; i <= last; i++) print "OPT\t" line[i]
-      for (i = last + 1; i <= NR; i++) print "AFTER\t" line[i]
+      # Each AFTER line carries how far it is from the BOTTOM, because the
+      # status block lives there and is not agent output.
+      for (i = last + 1; i <= NR; i++) print "AFTER\t" (NR - i) "\t" line[i]
     }')
   [ -n "$block" ] || return 0
-  local after
+  # Prose found ABOVE the trailing status region means the prompt is gone.
+  #
+  # Position, not a glyph pattern. Three attempts at classifying the status
+  # block by its CONTENT all failed against the real thing: the box-drawing
+  # list missed a bar of interleaved text and glyphs, the private-use byte
+  # ranges do not match in BSD awk (measured: the rule never fired), and
+  # omp paints a TASK-DESCRIPTION line — `<glyph> Commit the Jacomo fixes` —
+  # which is ordinary prose by any word-count rule. The one thing that is
+  # stable across omp, Claude Code and tmux is WHERE the status block is: the
+  # last few lines, always.
+  #
+  # So: the bottom STATUS_TAIL lines are never read as agent output. The
+  # residual, stated plainly: a single line of real output sitting inside that
+  # region will not reject a stale list. A click on it is still refused
+  # downstream by the prompt fingerprint, which is the trade this gate is
+  # built on — it may fail to reject, it may not fail to ask.
+  local after dist text
   while IFS= read -r after; do
     case "$after" in
-      AFTER*) [ "$(_is_prose "${after#AFTER	}")" = yes ] && return 0 ;;
+      AFTER*)
+        after="${after#AFTER	}"
+        text="${after#*	}"
+        _is_prose "$text" && return 0
+        ;;
     esac
   done <<<"$block"
   printf '%s\n' "$block" | sed -n 's/^OPT\t//p' \
