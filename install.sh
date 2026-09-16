@@ -376,7 +376,14 @@ if [ "$HUB" = 1 ]; then
   PLIST="$HOME/Library/LaunchAgents/com.herdr-control.hub.plist"
   if [ "$APPLY" = 1 ]; then
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-    sed -e "s|__HUB_PY__|$here/hub.py|" \
+    # The plist points at the DEPLOYED worktree, never at this checkout: a
+    # service launched from a working tree runs whatever branch is checked out
+    # when launchd next starts it, which is the shim defect one directory over.
+    # deploy_app pins it to a commit, detached, so a branch switch cannot move
+    # production and a rollback is a sha.
+    deploy_app "${HUB_REV:-origin/main}" || {
+      echo "  ! hub NOT installed: deploy failed (see above)" >&2; exit 2; }
+    sed -e "s|__HUB_PY__|$HERDR_APP_DIR/hub.py|" \
         -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.hub.log|g" \
       "$here/com.herdr-control.hub.plist.template" > "$PLIST"
     # Was `unload` + `load`, which is the exact cached-job-definition bug the
@@ -385,7 +392,8 @@ if [ "$HUB" = 1 ]; then
     reload_agent com.herdr-control.hub "$PLIST" \
       && echo "  hub -> http://127.0.0.1:8600/"
   else
-    echo "  + would install launchd plist -> $PLIST (hub.py on :8600)"
+    echo "  + would deploy $here -> $HERDR_APP_DIR (detached at ${HUB_REV:-origin/main})"
+    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/hub.py on :8600)"
   fi
 fi
 

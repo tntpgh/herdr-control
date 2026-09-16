@@ -146,6 +146,69 @@ probe_http() {
 # broker owns no upstream, so starting it first removes the race from the one
 # path we control. (Login order is launchd's; the gateway retrying instead of
 # exiting is omp's own binary to fix, not this repo's.)
+# ── the deployed app: what the SERVICE runs, pinned to a revision ───────────
+# `hub.py` used to be launched straight out of the working checkout, so
+# production behaviour depended on which branch happened to be checked out.
+# That is the same defect class as the git-hook shims that pointed into a
+# branch-local path on 2026-09-15 and killed every commit in 18 repos after a
+# switch — one directory over. Concretely: a reboot, a KeepAlive respawn, or
+# `restart.sh` while a feature branch was checked out would silently run that
+# branch's hub, and nothing would say so.
+#
+# The service now runs from a git WORKTREE at a stable path, checked out
+# DETACHED at a specific commit. A branch switch in the developer checkout
+# cannot move it, because a detached worktree has no branch to follow. Deploying
+# is an explicit act with a sha, and rollback is the same command with an older
+# one.
+#
+# A worktree rather than a file copy because hub.py resolves `lib/`,
+# `agent-edge.sh`, `formserve.py`, `herdr-deliver.sh` and `send-to-agent.sh`
+# relative to its OWN path: copying one file would leave it reading a mixture of
+# deployed and checked-out code, which is worse than either.
+HERDR_APP_DIR="${HERDR_APP_DIR:-$HOME/.local/share/herdr-control/app}"
+
+app_rev() {                     # -> the sha the deployed app is pinned to
+  git -C "$HERDR_APP_DIR" rev-parse --short HEAD 2>/dev/null
+}
+
+# deploy_app [<revision>] — point the deployed worktree at a committed revision
+# (default: origin/main). Never touches the developer checkout's HEAD.
+deploy_app() {
+  local want="${1:-origin/main}" src rev prev
+  # HERDR_APP_SRC exists so verify-deploy.sh can exercise this against a
+  # scratch repo with a deliberately unparseable commit — the rollback path
+  # cannot be tested against real history, which always compiles. Unset in
+  # every real invocation, where the source is the checkout this lib lives in.
+  src="${HERDR_APP_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  git -C "$src" rev-parse --git-dir >/dev/null 2>&1 || {
+    echo "deploy: $src is not a git checkout" >&2; return 2; }
+
+  git -C "$src" fetch -q origin 2>/dev/null || true
+  rev="$(git -C "$src" rev-parse --verify "$want^{commit}" 2>/dev/null)" || {
+    echo "deploy: cannot resolve revision '$want'" >&2; return 2; }
+
+  if [ ! -d "$HERDR_APP_DIR/.git" ] && [ ! -f "$HERDR_APP_DIR/.git" ]; then
+    mkdir -p "$(dirname "$HERDR_APP_DIR")"
+    git -C "$src" worktree add -q --detach "$HERDR_APP_DIR" "$rev" || {
+      echo "deploy: could not create the deployed worktree at $HERDR_APP_DIR" >&2; return 2; }
+  else
+    prev="$(app_rev)"
+    git -C "$HERDR_APP_DIR" checkout -q --detach "$rev" || {
+      echo "deploy: could not check out $rev in $HERDR_APP_DIR" >&2; return 2; }
+  fi
+
+  # Syntax-check what is about to be SERVED, not what was edited. A deploy that
+  # installs an unparseable hub leaves launchd crash-looping a service whose
+  # only job is telling you things are broken.
+  if ! python3 -m py_compile "$HERDR_APP_DIR/hub.py" 2>/dev/null; then
+    echo "deploy: $rev does not compile — rolling back" >&2
+    [ -n "${prev:-}" ] && git -C "$HERDR_APP_DIR" checkout -q --detach "$prev"
+    return 1
+  fi
+  rm -rf "$HERDR_APP_DIR/__pycache__" 2>/dev/null || true
+  echo "  deployed $(git -C "$HERDR_APP_DIR" log -1 --format='%h %s' | cut -c1-72)"
+}
+
 HERDR_SERVICES=(
   "com.herdr-control.hub|http://127.0.0.1:8600/|200 302"
   "com.herdr-control.bridge||"

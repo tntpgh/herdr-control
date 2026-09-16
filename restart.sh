@@ -5,6 +5,8 @@
 #   ./restart.sh --verify     check only; changes nothing
 #   ./restart.sh --panes      also close every agent pane first (clean slate)
 #   ./restart.sh hub bridge   restart only the named services
+#   ./restart.sh --deploy     deploy origin/main to the app worktree, then restart
+#   ./restart.sh --deploy=<rev>   deploy that revision (rollback is a sha)
 #
 # WHY THIS EXISTS, rather than a remembered launchctl incantation:
 #
@@ -38,11 +40,13 @@ here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=launchd/agent-lib.sh
 . "$here/launchd/agent-lib.sh"
 
-VERIFY_ONLY=0; PANES=0; WANT=()
+VERIFY_ONLY=0; PANES=0; DEPLOY=""; WANT=()
 for a in "$@"; do
   case "$a" in
     --verify)   VERIFY_ONLY=1 ;;
     --panes)    PANES=1 ;;
+    --deploy)   DEPLOY="origin/main" ;;
+    --deploy=*) DEPLOY="${a#--deploy=}" ;;
     -h|--help)  sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)         echo "unknown flag: $a (try --help)" >&2; exit 2 ;;
     *)          WANT+=("$a") ;;
@@ -107,6 +111,22 @@ verify() {
   # It connects AFTER the listener binds — the HTTP probe above passing is not
   # evidence this is up yet — so this waits on the same budget rather than
   # asking once and declaring a healthy restart broken.
+  # WHICH REVISION is serving. The whole point of the deployed worktree is
+  # that this is a fact rather than an inference from which branch happens to
+  # be checked out; printing it is what makes that fact checkable.
+  printf "  %-34s " "hub deployed revision"
+  if [ -d "$HERDR_APP_DIR" ]; then
+    _rev="$(app_rev)"
+    _behind="$(git -C "$HERDR_APP_DIR" rev-list --count "${_rev:-HEAD}..origin/main" 2>/dev/null || echo '?')"
+    if [ "${_behind:-0}" = 0 ]; then
+      echo "${_rev:-unknown} (== origin/main)"
+    else
+      echo "${_rev:-unknown} — ${_behind} commit(s) BEHIND origin/main; ./restart.sh --deploy"
+    fi
+  else
+    echo "NOT DEPLOYED — the plist may still point at a working checkout" >&2
+    fail=1
+  fi
   printf "  %-34s " "hub herdr subscription"
   local waited=0 budget="${PROBE_READY_SECS:-20}"
   while :; do
@@ -129,6 +149,14 @@ verify() {
 }
 
 if [ "$VERIFY_ONLY" = 1 ]; then verify; exit $?; fi
+
+# Deploy BEFORE restarting, so the service comes back on the revision asked
+# for — and only if it compiled. deploy_app rolls back on its own if not.
+if [ -n "$DEPLOY" ]; then
+  echo "===== DEPLOY ====="
+  deploy_app "$DEPLOY" || { echo "deploy failed; nothing was restarted" >&2; exit 2; }
+  echo
+fi
 
 if [ "$PANES" = 1 ]; then
   echo "Closing every agent pane — including the shell you may be reading this in."

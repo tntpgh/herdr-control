@@ -121,6 +121,25 @@ OPTIONAL = {"search dev (wrangler) · optional"}  # a dev server being down is n
 # has to wait for a real one. 4 keeps every interactive case fast (loops 10s ->
 # 40s, links 60s -> 4min) while making the first load after a quiet night fill
 # inline instead of rendering yesterday's answer as today's.
+# The revision this PROCESS is running, resolved once at import from the
+# directory the code was loaded out of. The service runs from a deployed git
+# worktree pinned detached at a commit, so this is a fact about what is serving
+# — not about which branch someone has checked out. `restart.sh --verify`
+# prints it, and /api/summary carries it, because "did the deploy take?" was
+# previously answerable only by timing a page load and inferring.
+def _running_rev() -> str:
+    try:
+        out = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent),
+                              "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+        rev = out.stdout.strip()
+    except Exception:
+        return "unknown"
+    return rev or "unknown"
+
+
+RUNNING_REV = _running_rev()
+
 STALE_CEILING = 4
 
 # ── tiny TTL cache: each source is fetched at most once per window ─────────────
@@ -2029,6 +2048,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"attention": len(live) + len(registry), "live_blocked": len(live),
                  "registry_attention": len(h.get("attention", [])),
                  "attention_unconfirmed": unconfirmed,
+                 "rev": RUNNING_REV,
                  "live_connected": live_data().get("connected", False),
                  "open_decisions": f.get("open_count", 0),
                  "open_ids": ",".join(sorted(x["id"] for x in f.get("open", [])))}).encode())
