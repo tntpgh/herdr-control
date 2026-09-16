@@ -195,7 +195,17 @@ _src_repo_ok() {
 # two files whose sha256 differ compared equal and the report said
 # "matches origin/main: yes" while the bytes did not. Review reproduced it by
 # appending two newlines. A blob OID is exact and is also what git itself uses.
-_blob_at() {                              # <rev> -> OID on stdout, or nothing
+# FULLY QUALIFIED refs only. `origin/main` is an AMBIGUOUS refname: git resolves
+# refs/heads/<name> and refs/tags/<name> BEFORE refs/remotes/<name>, so a local
+# branch or tag literally called `origin/main` — `git branch origin/main`, or
+# any tool that mirrors remote names locally — becomes the thing this gate
+# compares against. Review deployed a weakened scanner that way with rc=0,
+# `reviewed: yes`, `main-blob` equal to it and `matches origin/main: yes`. git
+# does warn that the name is ambiguous, but both call sites discarded stderr, so
+# it was invisible. A TAG is the worst case: fetch never prunes it, so the false
+# anchor is permanent.
+MAIN_REF=refs/remotes/origin/main
+_blob_at() {                              # <ref> -> OID on stdout, or nothing
   git -C "$here" rev-parse -q --verify "$1:git-hooks/secret-scan-pre-commit.sh" 2>/dev/null
 }
 
@@ -231,7 +241,7 @@ deploy_scanner() {
   DEPLOY_SNAP_OID=$(git hash-object "$tmp" 2>/dev/null)
   local main_oid head_oid sha br state
   if _src_repo_ok; then
-    main_oid=$(_blob_at origin/main)
+    main_oid=$(_blob_at "$MAIN_REF")
     head_oid=$(_blob_at HEAD)
     sha=$(git -C "$here" rev-parse --short HEAD 2>/dev/null)
     br=$(git -C "$here" rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -279,7 +289,8 @@ deploy_scanner() {
     printf 'blob:       %s\n' "${DEPLOY_SNAP_OID:-unknown}"
     printf 'reviewed:   %s\n' "$DEPLOY_REVIEWED"
     printf 'main-blob:  %s\n' "${main_oid:-none}"
-    printf 'main-dated: %s\n' "$(git -C "$here" log -1 --format=%cI origin/main 2>/dev/null || printf unknown)"
+    printf 'main-ref:   %s\n' "$MAIN_REF"
+    printf 'main-dated: %s\n' "$(git -C "$here" log -1 --format=%cI "$MAIN_REF" 2>/dev/null || printf unknown)"
     printf 'deploy-dir: %s\n' "$HOOK_DEPLOY_DIR"
     printf 'sha256:     %s\n' "$(shasum -a 256 "$HOOK_DEPLOY" | cut -d' ' -f1)"
     printf 'deployed:   %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -314,7 +325,13 @@ hook_body() {                             # [extra scanner args...]
 # it is never right for the real fleet.
 case "$HOOK_DEPLOY_DIR" in
   /tmp/*|/private/tmp/*|/var/folders/*|"${TMPDIR:-/nonexistent}"*)
-    if [ "$MODE" = apply ] && [ "$ROOT" = "$HOME/Code" ]; then
+    # Physically resolved, not string-compared. `CODE_ROOT=$HOME/Code/` with a
+    # trailing slash, or `$HOME/./Code`, walked straight past the equality test
+    # and rewrote the fleet's shims to a temp path — which is exactly the outage
+    # that happened here during mutation testing.
+    _root_p=$(cd "$ROOT" 2>/dev/null && pwd -P)
+    _fleet_p=$(cd "$HOME/Code" 2>/dev/null && pwd -P)
+    if [ "$MODE" = apply ] && [ -n "$_root_p" ] && [ "$_root_p" = "$_fleet_p" ]; then
       echo "REFUSING: deploy target $HOOK_DEPLOY_DIR is under a temp root," >&2
       echo "  but CODE_ROOT is the real fleet ($ROOT). Every shim in every repo" >&2
       echo "  would exec a path that disappears on reboot — fail-closed, fleet-" >&2
@@ -554,7 +571,7 @@ if [ -r "$HOOK_DEPLOY" ]; then
   # no origin/main line at all — and silence in a report whose whole purpose is
   # answering "what is the fleet running" reads as a pass.
   _dep_oid=$(git hash-object "$HOOK_DEPLOY" 2>/dev/null)
-  _main_oid=$(_src_repo_ok && _blob_at origin/main)
+  _main_oid=$(_src_repo_ok && _blob_at "$MAIN_REF")
   if [ -z "$_main_oid" ]; then
     echo "    matches origin/main: CANNOT TELL — no origin/main resolvable from $here."
     echo "      The fleet's scanner is UNVERIFIED. git -C $here fetch origin main"
@@ -562,7 +579,7 @@ if [ -r "$HOOK_DEPLOY" ]; then
     echo "    matches origin/main: yes"
     # origin/main is only as fresh as the last fetch, so "yes" against a stale
     # ref can still mean the fleet is running a pre-fix detector.
-    _md=$(git -C "$here" log -1 --format=%ct origin/main 2>/dev/null)
+    _md=$(git -C "$here" log -1 --format=%ct "$MAIN_REF" 2>/dev/null)
     if [ -n "$_md" ]; then
       _age=$(( ( $(date +%s) - _md ) / 86400 ))
       [ "$_age" -gt 14 ] && echo "      but origin/main here is ${_age}d old — fetch before trusting this"

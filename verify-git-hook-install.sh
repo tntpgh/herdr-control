@@ -296,7 +296,12 @@ OUT="$(CODE_ROOT="$ROOT" bash "$INSTALLER" --help 2>&1)"; rc=$?
 # A scanner that does not parse must never be pointed at 18 repos: it would fail
 # every commit and teach --no-verify, which is how a guard stops guarding.
 printf 'if then fi(\n' > "$WORK/broken.sh"
-OUT="$(CODE_ROOT="$ROOT" bash -c "cd $WORK && mkdir -p gh && cp broken.sh gh/secret-scan-pre-commit.sh && sed 's|\$here/git-hooks|$WORK/gh|' $INSTALLER > $WORK/i.sh && bash $WORK/i.sh --apply" 2>&1)"; rc=$?
+# HERDR_HOOK_DEPLOY_DIR is redirected here too. Unmutated this row is safe —
+# the `bash -n` refusal fires before anything is written — but with the single
+# guard it NAMES mutated away it would mkdir the LIVE fleet directory, and with
+# three guards off it would write `if then fi(` over the live scanner. It was
+# the only installer invocation in this file still pointing at the real path.
+OUT="$(CODE_ROOT="$ROOT" HERDR_HOOK_DEPLOY_DIR="$WORK/broken-deploy" bash -c "cd $WORK && mkdir -p gh && cp broken.sh gh/secret-scan-pre-commit.sh && sed 's|\$here/git-hooks|$WORK/gh|' $INSTALLER > $WORK/i.sh && HERDR_HOOK_DEPLOY_DIR=$WORK/broken-deploy bash $WORK/i.sh --apply" 2>&1)"; rc=$?
 [ "$rc" = 2 ] && ok "refuses to deploy a scanner that is not valid bash" || bad "deployed a broken scanner (rc=$rc)"
 
 # ===== which revision the fleet runs =====
@@ -526,26 +531,73 @@ kill "$_racer" 2>/dev/null; wait "$_racer" 2>/dev/null
   && ok "25 attempts against a concurrent writer deployed no unreviewed bytes" \
   || bad "TOCTOU" "a weakened scanner reached the deploy path with no refusal"
 
-# STRUCTURAL, and labelled as such because the alternatives are worse.
+# STRUCTURAL and ORDER-AWARE, labelled as such because the alternatives are
+# worse — and because the first version of this row was too weak to be worth
+# having. It grepped for the presence of three strings, so review passed three
+# ordering INVERSIONS straight through it (install-before-judge; a fresh
+# `install -m 0755 "$HOOK_SRC" "$HOOK_DEPLOY"` after the mv; judging a fresh
+# read of the source), one of which failed no row in the whole file.
 #
-# The property is an ORDERING inside one function: the bytes judged must be the
-# bytes installed. After the fix the window is small enough that the race row
-# above no longer hits it — mutating the hash back to $HOOK_SRC, or the install
-# back to a second `cp`, leaves every behavioural row green. The honest ways to
-# catch that are (a) a far longer race, which buys flakiness, or (b) a test seam
-# that runs a command between the copy and the judgement — an env-driven exec
-# inside the fleet's credential guard, a worse defect than the one it tests. So
-# this asserts the shape and says out loud that it is doing so.
+# The property is an ordering inside one function: the bytes judged must be the
+# bytes installed. After the fix the window is too small for the race row above
+# to hit, and the honest alternative — a test seam running a command between
+# copy and judgement — would put an env-driven exec inside the fleet's
+# credential guard, a worse defect than the one it tests. So this asserts the
+# ORDER by line number, and refuses any second content read of $HOOK_SRC or any
+# install of $HOOK_DEPLOY that is not the rename of the snapshot.
 _ds=$(sed -n '/^deploy_scanner() {/,/^}/p' "$INSTALLER")
-if printf '%s' "$_ds" | grep -q 'git hash-object "\$tmp"' \
-   && printf '%s' "$_ds" | grep -q 'mv -f "\$tmp" "\$HOOK_DEPLOY"' \
-   && [ "$(printf '%s' "$_ds" | grep -cE '(cp|cat|hash-object|shasum[^|]*) "\$HOOK_SRC"')" = 1 ]; then
-  ok "one snapshot is hashed, judged and installed (structural: ordering is not observable)"
+_ln() { printf '%s\n' "$_ds" | grep -nE "$1" | head -1 | cut -d: -f1; }
+_cp_snap=$(_ln '^[[:space:]]*cp "\$HOOK_SRC" "\$tmp"')
+_judge=$(_ln 'git hash-object "\$tmp"')
+_install=$(_ln '^[[:space:]]*mv -f "\$tmp" "\$HOOK_DEPLOY"')
+# every way the deployed file could be written, other than renaming the snapshot
+_other_write=$(printf '%s\n' "$_ds" | grep -cE '(cp|install|cat|tee|ln)[^|]*"\$HOOK_DEPLOY"')
+# every second read of the source's CONTENT after it was copied
+_src_reads=$(printf '%s\n' "$_ds" | grep -cE '(cp|cat|hash-object|shasum|install)[^|]*"\$HOOK_SRC"')
+if [ -n "$_cp_snap" ] && [ -n "$_judge" ] && [ -n "$_install" ] \
+   && [ "$_cp_snap" -lt "$_judge" ] && [ "$_judge" -lt "$_install" ] \
+   && [ "$_other_write" = 0 ] && [ "$_src_reads" = 1 ]; then
+  ok "the snapshot is copied, THEN judged, THEN installed — and nothing else writes the deployed file"
 else
-  # Mentions of $HOOK_SRC are fine (the refusal message and the .rev source
-  # field name it); what must not happen is READING its content again.
-  bad "TOCTOU structure" "deploy_scanner reads \$HOOK_SRC's content more than once, or judges something other than \$tmp"
+  bad "TOCTOU structure" \
+    "cp=$_cp_snap judge=$_judge install=$_install other_writes=$_other_write src_reads=$_src_reads"
 fi
+
+printf '== the review anchor must be one specific ref ==\n'
+# `origin/main` is an AMBIGUOUS refname: git resolves refs/heads/<name> and
+# refs/tags/<name> BEFORE refs/remotes/<name>. A local branch or tag literally
+# called origin/main therefore became the thing the gate compared against, and a
+# weakened scanner deployed with reviewed: yes and matches origin/main: yes. git
+# warns that the name is ambiguous; both call sites discarded stderr.
+_prov_repo anchorbranch; _prov_weaken anchorbranch
+git -C "$WORK/anchorbranch/src" add -A >/dev/null
+git -C "$WORK/anchorbranch/src" commit -qm weakened
+git -C "$WORK/anchorbranch/src" branch origin/main
+_prov_run anchorbranch --apply
+{ [ "$RC" = 2 ] && ! _prov_landed anchorbranch; } \
+  && ok "a local BRANCH named origin/main cannot become the review anchor" \
+  || bad "ambiguous ref" "rc=$RC landed=$(_prov_landed anchorbranch && echo yes || echo no)"
+
+# A tag is the worse case: fetch never prunes it, so the false anchor is permanent.
+_prov_repo anchortag; _prov_weaken anchortag
+git -C "$WORK/anchortag/src" add -A >/dev/null
+git -C "$WORK/anchortag/src" commit -qm weakened
+git -C "$WORK/anchortag/src" tag origin/main
+_prov_run anchortag --apply
+{ [ "$RC" = 2 ] && ! _prov_landed anchortag; } \
+  && ok "nor a TAG of that name, which no fetch will ever prune" \
+  || bad "ambiguous ref" "rc=$RC landed=$(_prov_landed anchortag && echo yes || echo no)"
+
+# And the fully-qualified anchor must still accept an ordinary checkout, or the
+# fix would simply have broken deployment.
+_prov_repo anchorok
+_prov_run anchorok --apply
+{ [ "$RC" = 0 ] && _prov_landed anchorok && grep -q '^reviewed: *yes' "$WORK/anchorok/deploy/.rev"; } \
+  && ok "a legitimate checkout still deploys against the qualified ref" \
+  || bad "anchor" "a good checkout was refused: rc=$RC"
+grep -q '^main-ref: *refs/remotes/origin/main' "$WORK/anchorok/deploy/.rev" \
+  && ok "and the record names WHICH ref was the anchor" \
+  || bad "anchor record" "$(grep -m1 'main-ref' "$WORK/anchorok/deploy/.rev" 2>/dev/null)"
 
 printf '== the deploy TARGET gets the same scrutiny as the source ==\n'
 _prov_repo target
@@ -559,6 +611,16 @@ _prov_repo target
 # suite row must never be able to reach the live fleet, mutated or not.
 mkdir -p "$WORK/target/home/Code/fixture-repo"
 git init -q "$WORK/target/home/Code/fixture-repo"
+# Every spelling of the same directory. The check was string equality, so
+# `$HOME/Code/` with a trailing slash and `$HOME/./Code` both walked past it —
+# and that is precisely the outage that happened here during mutation testing.
+for _spell in "$WORK/target/home/Code" "$WORK/target/home/Code/" "$WORK/target/home/./Code"; do
+  OUT="$(cd "$WORK/target/src" && HOME="$WORK/target/home" CODE_ROOT="$_spell" \
+    HERDR_HOOK_DEPLOY_DIR="$WORK/target/tmpdeploy" bash install-git-hooks.sh --apply 2>&1)"; RC=$?
+  { [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'REFUSING: deploy target'; } \
+    && ok "a temp deploy dir is refused for CODE_ROOT spelled '${_spell##*home}'" \
+    || bad "deploy target" "rc=$RC for $_spell — 54 shims would exec a vanishing path"
+done
 OUT="$(cd "$WORK/target/src" && HOME="$WORK/target/home" CODE_ROOT="$WORK/target/home/Code" \
   HERDR_HOOK_DEPLOY_DIR="$WORK/target/tmpdeploy" bash install-git-hooks.sh --apply 2>&1)"; RC=$?
 [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'REFUSING: deploy target' \
