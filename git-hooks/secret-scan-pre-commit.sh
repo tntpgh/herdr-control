@@ -611,6 +611,23 @@ check_pii() {                   # <label> <added text>
     [[ -n "$text" ]] || return 0
     # street address: <number> <Name> <suffix>, excluding the fixture words.
     #
+    # `([NSEW]\.? )?` closes a hole found 2026-09-16 while testing this very
+    # allowlist: a directional prefix is normal in US addresses and the
+    # pattern required a lowercase letter right after the number, so a real
+    # address of the form "<number> E <Name> St" was never detected at all.
+    # Restricted to the four directionals on purpose -- a bare `[A-Z]` there
+    # would start matching ordinary prose like "42 Bytes Read".
+    #
+    # Covenant Ave and the 226-4440 line are Vintage Skins' OWN published NAP
+    # -- Lisa's shop, a client business we build for, not a third party. Both
+    # are already tracked in vintageskins/seo/src/schema/organization.js, are
+    # printed on the storefront, in the Organization schema and in Merchant
+    # Center, and the phone is a Twilio IVR number, never her mobile. Same
+    # principle as the Wexford office below and the vintageskins.com email
+    # carve-out further down: a business's own published identity is not
+    # client PII, and blocking it only teaches people to bypass the guard on
+    # ordinary branding work.
+    #
     # The Suite 200, Wexford PA 15090 office is OUR OWN. It is the canonical
     # NAP, already tracked in tntpgh-dev/src/config/codex/identity.ts and
     # docs/nap-canonical.md, printed on every piece of public marketing, and
@@ -627,9 +644,10 @@ check_pii() {                   # <label> <added text>
     # digits and kills the word boundary. A guard whose allowlist cannot be
     # committed is a guard that gets bypassed.
     if printf '%s\n' "$text" \
-       | grep -nE '[0-9]{2,5} [A-Z][a-z]+( [A-Z][a-z]+)? (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)\b' \
+       | grep -nE '[0-9]{2,5} ([NSEW]\.? )?[A-Z][a-z]+( [A-Z][a-z]+)? (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)\b' \
        | grep -viE '\b(Main|Elm|Oak|Test|Example|Fake|Sample|Anywhere|Nowhere|Maple|Pine|First|Second|Foo|Bar)\b' \
        | grep -viE '2100 Corporate Dr(ive)?\b' \
+       | grep -viE '8878 Covenant Ave(nue)?\b' \
        | grep -vE '^\+?[0-9]*:?\+?(123|456|789|1234|100|111|999) ' >/dev/null; then
         echo "BLOCKED: a real-looking STREET ADDRESS is being added in $label."
         PII_FOUND=1
@@ -653,7 +671,7 @@ check_pii() {                   # <label> <added text>
     if printf '%s\n' "$text" \
        | grep -oE '(^|[^0-9])(\+?1[-. ]?)?\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}([^0-9]|$)' \
        | grep -vE '555[-. ]?01[0-9][0-9]' \
-       | grep -vE '\(?(412\)? ?[-. ]?(844[-. ]5536|900[-. ]2243|367[-. ]5860)|724\)? ?[-. ]?934[-. ]3400)' >/dev/null; then
+       | grep -vE '\(?(412\)? ?[-. ]?(844[-. ]5536|900[-. ]2243|367[-. ]5860|226[-. ]4440)|724\)? ?[-. ]?934[-. ]3400)' >/dev/null; then
         echo "BLOCKED: a real-looking PHONE NUMBER is being added in $label."
         PII_FOUND=1
     fi
