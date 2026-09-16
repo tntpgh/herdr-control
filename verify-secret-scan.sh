@@ -408,6 +408,24 @@ printf '{"videos":[],"token":"ghp_%s"}\n' "$(printf 'A%.0s' $(seq 36))" > "$R/sr
 git -C "$R" add src/data/videos.json
 blocks "$R" "a credential inside the exempted videos.json is still blocked"
 
+# ...and the exemption is ADDRESS-ONLY. A first draft put both paths in
+# PII_EXCLUDES, which drops them from the whole PII input, so a real pre-push
+# probe allowed a third-party email in videos.json and a non-fiction phone in
+# sitemap.xml -- two public-output paths had become general PII bypasses
+# (found in review, 2026-09-16). The phone and email detectors must still read
+# every line of both files.
+R="$(new_repo)"
+mkdir -p "$R/src/data"
+printf '{"videos":[{"contact":"%s"}]}\n' "$BADMAIL" > "$R/src/data/videos.json"
+git -C "$R" add src/data/videos.json
+blocks "$R" "a third-party email in the address-exempt videos.json still blocks"
+
+R="$(new_repo)"
+mkdir -p "$R/public"
+printf '<video:description>call %s</video:description>\n' "$BADPHONE" > "$R/public/sitemap.xml"
+git -C "$R" add public/sitemap.xml
+blocks "$R" "a real phone in the address-exempt sitemap.xml still blocks"
+
 printf '== ...and real-looking PII still blocks ==\n'
 R="$(new_repo)"
 printf 'owner = "%s"\n' "$BADMAIL" > "$R/crm.py"

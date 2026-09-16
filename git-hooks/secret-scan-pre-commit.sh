@@ -555,22 +555,32 @@ PII_FOUND=0
 # file independently of $ADDED, so a token pasted here is still blocked
 # (proven on a real negative, 2026-09-06).
 #
-# Same argument again for tntpgh-dev's published VIDEO metadata (2026-09-16):
-# `src/data/videos.json` is the team's own YouTube channel listing — titles and
-# descriptions copied verbatim from videos that are ALREADY public on YouTube,
-# and the titles ARE street addresses, because the videos are listing tours —
-# "<number> <Street> <City> PA <ZIP> Tour" is the channel's naming convention.
-# (No real example is written here on purpose: this very comment was blocked by
-# the street check on its first draft. A guard whose allowlist cannot be
-# committed is a guard that gets bypassed — same lesson as the exclusion-pattern
-# note further down.) `public/sitemap.xml` is generated
-# from that same data by `scripts/generate-sitemap.mjs` at prebuild, so the
-# addresses reappear in its `video:title`/`video:description` elements on every
-# regeneration. Neither is client PII by any reading: the site's whole purpose
-# is publishing these addresses, and the same street numbers are already in
-# ~4,800 tracked `/properties/*` URLs. Without these two entries the street
-# check blocks the VideoObject schema work outright, which is how a guard
-# teaches people to reach for --no-verify.
+# tntpgh-dev's published VIDEO metadata (2026-09-16) is a NARROWER case and it
+# is deliberately NOT in the list above. `src/data/videos.json` is the team's
+# own YouTube channel listing — titles copied verbatim from videos already
+# public on YouTube — and the titles ARE street addresses, because the videos
+# are listing tours ("<number> <Street> <City> PA <ZIP> Tour" is the channel's
+# naming convention). `public/sitemap.xml` is generated from that same data at
+# prebuild, so the addresses reappear in its `video:title` elements on every
+# regeneration. Thousands of `/properties/*` URLs in that same sitemap already
+# carry the same street numbers (3,413 of 4,335 `<loc>` entries on
+# tntpgh-dev@origin/main, 2026-09-16, counted with
+# `xmllint --xpath 'count(//*[local-name()="loc" and contains(text(),"/properties/")])'`).
+#
+# But "this file is public output" does NOT establish that every future value
+# in it is safe to publish. A first draft of this change put both paths in
+# PII_EXCLUDES, which drops them from the whole PII input — and a real pre-push
+# probe then ALLOWED a third-party email in videos.json and a non-fiction phone
+# number in sitemap.xml. Two public-output paths had become general PII
+# bypasses (found in review, 2026-09-16). So the exemption is scoped to the
+# STREET-ADDRESS detector only; the phone and email detectors still read every
+# line of both files, and the credential scan above never consulted this list
+# at all.
+#
+# (No real address is written in this comment on purpose: the first draft of it
+# was itself blocked by the street check. A guard whose allowlist cannot be
+# committed is a guard that gets bypassed — same lesson as the
+# exclusion-pattern note further down.)
 # ONE exclusion list, used by both content sources (the index here, a pushed
 # commit in push mode). Two copies of a pathspec is how the modes come to
 # disagree about what counts as client PII.
@@ -579,11 +589,16 @@ PII_EXCLUDES=(
     ':(exclude)src/data/propx-*.json'
     ':(exclude)src/data/price-band-evidence.json'
     ':(exclude)src/data/sold-subdivision-context.json'
-    ':(exclude)src/data/videos.json'
-    ':(exclude)public/sitemap.xml'
     ':(exclude)cloudflare/worker/wrangler*.toml'
     ':(exclude)**/package-lock.json' ':(exclude)package-lock.json'
     ':(exclude)**/yarn.lock' ':(exclude)**/pnpm-lock.yaml'
+)
+# Paths exempt from the STREET-ADDRESS detector ONLY. Everything here is still
+# read by the phone and email detectors, and by the credential scan, which is
+# what keeps a public-output path from becoming a general PII bypass.
+ADDRESS_ONLY_EXCLUDES=(
+    ':(exclude)src/data/videos.json'
+    ':(exclude)public/sitemap.xml'
 )
 # The added lines to judge, per SOURCE. In push mode that is one call per
 # commit being sent, so a finding can name the commit to rewrite — the first
@@ -603,6 +618,18 @@ pii_added_for_commit() {        # <commit>
 }
 pii_added_for_index() {
     git diff --cached -U0 --diff-filter="$DIFF_FILTER" "${PII_EXCLUDES[@]}" 2>/dev/null \
+        | added_lines || true
+}
+# The same two sources again, additionally dropping the address-only paths.
+# Only the street check reads these; see ADDRESS_ONLY_EXCLUDES above.
+addr_added_for_commit() {       # <commit>
+    git show "$1" --text -U0 --format= --diff-filter="$DIFF_FILTER" \
+        "${PII_EXCLUDES[@]}" "${ADDRESS_ONLY_EXCLUDES[@]}" 2>/dev/null \
+        | added_lines || true
+}
+addr_added_for_index() {
+    git diff --cached -U0 --diff-filter="$DIFF_FILTER" \
+        "${PII_EXCLUDES[@]}" "${ADDRESS_ONLY_EXCLUDES[@]}" 2>/dev/null \
         | added_lines || true
 }
 # Lockfiles are excluded from the PII checks only. npm records each package
@@ -625,9 +652,14 @@ pii_added_for_index() {
 # The street check below still carries its own marker workaround for the same
 # root cause. knowledge-base/scripts/scan_diff.py strips the marker and this did
 # not, which is how the two implementations came to disagree on one diff.
-check_pii() {                   # <label> <added text>
-    local label="$1" text="$2"
-    [[ -n "$text" ]] || return 0
+check_pii() {                   # <label> <added text> [<address-scoped text>]
+    # $2 feeds the phone and email detectors. $3 feeds the STREET detector and
+    # additionally drops ADDRESS_ONLY_EXCLUDES; it defaults to $2 so a caller
+    # that does not distinguish them keeps the stricter behaviour. Passing one
+    # text for both is what turned two public-output paths into general PII
+    # bypasses (found in review, 2026-09-16).
+    local label="$1" text="$2" addr_text="${3-$2}"
+    [[ -n "$text$addr_text" ]] || return 0
     # street address: <number> <Name> <suffix>, excluding the fixture words.
     #
     # `([NSEW]\.? )?` closes a hole found 2026-09-16 while testing this very
@@ -662,7 +694,7 @@ check_pii() {                   # <label> <added text>
     # did not, because in source the escape `\b` puts a literal `b` against the
     # digits and kills the word boundary. A guard whose allowlist cannot be
     # committed is a guard that gets bypassed.
-    if printf '%s\n' "$text" \
+    if printf '%s\n' "$addr_text" \
        | grep -nE '[0-9]{2,5} ([NSEW]\.? )?[A-Z][a-z]+( [A-Z][a-z]+)? (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)\b' \
        | grep -viE '\b(Main|Elm|Oak|Test|Example|Fake|Sample|Anywhere|Nowhere|Maple|Pine|First|Second|Foo|Bar)\b' \
        | grep -viE '2100 Corporate Dr(ive)?\b' \
@@ -730,10 +762,11 @@ check_pii() {                   # <label> <added text>
 if [[ "$SCAN_MODE" == push ]]; then
     for _c in $PUSH_COMMITS; do
         check_pii "commit $(git log -1 --format='%h %s' "$_c" 2>/dev/null || echo "$_c")" \
-                  "$(pii_added_for_commit "$_c")"
+                  "$(pii_added_for_commit "$_c")" \
+                  "$(addr_added_for_commit "$_c")"
     done
 else
-    check_pii "the staged changes" "$(pii_added_for_index)"
+    check_pii "the staged changes" "$(pii_added_for_index)" "$(addr_added_for_index)"
 fi
 
 # One verdict per mode, so the advice matches what the operator can actually
