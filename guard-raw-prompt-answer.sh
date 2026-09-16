@@ -64,14 +64,29 @@ _targets=$(printf '%s' "$CMD" | awk '
   function flush() { if (seg != "") print seg; seg = "" }
   {
     line = $0
+    # A trailing backslash CONTINUES the command; it does not end it. Flushing
+    # at that newline cut `herdr pane send-keys wN:p7 \` / `ENTER` into two
+    # segments, so the answering key was never seen — a bypass — and cut a
+    # quoted note the same way, a false denial.
+    while (line ~ /\\$/) { sub(/\\$/, " ", line); if ((getline nxt) > 0) line = line nxt; else break }
+    # Quote state resets per RECORD on purpose: an unterminated quote must not
+    # make every later line read as quoted, or `# do not sweep "` followed by a
+    # real call would be allowed. A continuation is folded above precisely so
+    # this reset never lands mid-command.
     inq = 0; q = ""
     for (i = 1; i <= length(line); i++) {
       c = substr(line, i, 1)
       if (inq) {
         seg = seg c
+        # Inside DOUBLE quotes a backslash escapes the next character, so \"
+        # does not close the span. Treating it as a close flipped the scanner
+        # into "quoted" for the rest of the line and swallowed a real call after
+        # the next `;`. Single quotes take no escapes, hence the check on q.
+        if (c == "\\" && q == "\"" && i < length(line)) { i++; seg = seg substr(line, i, 1); continue }
         if (c == q) inq = 0
         continue
       }
+      if (c == "\\" && i < length(line)) { i++; seg = seg c substr(line, i, 1); continue }
       if (c == "\"" || c == "\047") { inq = 1; q = c; seg = seg c; continue }
       if (c == ";" || c == "&" || c == "|" || c == "(" || c == ")") { flush(); continue }
       seg = seg c

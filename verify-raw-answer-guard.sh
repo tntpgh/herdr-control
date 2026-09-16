@@ -240,6 +240,36 @@ want_allow prompting 'echo "see the note (herdr pane send-keys wN:p7 ENTER)"' \
 want_allow prompting 'echo "the incident: for p in $panes; do herdr pane send-keys $p ENTER; done"' \
   'prose describing the sweep, quoted, with a do-loop inside'
 
+printf '== the splitter is load-bearing in BOTH directions ==\n'
+# It has to read a quoted pane id AND ignore a quoted mention, so every hole in
+# it is a bypass one way or a false denial the other. These are the shapes
+# review proved, all of them ordinary commands rather than evasions.
+#
+# An escaped quote inside a double-quoted span: closing on it left the scanner
+# believing the rest of the line was quoted, so the following `;` stopped being
+# a delimiter and a real call after it was absorbed.
+want_deny prompting 'printf "%s\n" "a \" b"; herdr pane send-keys wN:p7 ENTER' \
+  'an escaped quote does not swallow the call after the semicolon'
+want_deny prompting 'echo "quote is \" here"; herdr pane send-keys wN:p7 ENTER' \
+  'same with a stray escaped quote mid-string'
+want_allow prompting 'echo "he said \"ok\"; herdr pane send-keys wN:p7 ENTER"' \
+  'and a fully-quoted mention containing escapes is still a mention'
+
+# A trailing backslash continues the command. Flushing at that newline cut the
+# call in two, so the answering key landed in a segment whose first word was not
+# herdr — and cut a quoted note the same way, denying it.
+want_deny prompting 'herdr pane send-keys wN:p7 \
+   ENTER' 'a line continuation before the key is still one command'
+want_deny prompting 'herdr pane send-keys \
+   wN:p7 ENTER' 'and a continuation before the pane id'
+want_allow prompting 'echo "a; \
+herdr pane send-keys wN:p7 ENTER"' 'a continuation inside a quoted note is one echo'
+
+# Why quote state resets per record: an unterminated quote must not make every
+# later line read as quoted.
+want_deny prompting '# do not sweep "
+herdr pane send-keys wN:p7 ENTER' 'an unterminated quote on a comment line does not shield the next line'
+
 printf '== the sanctioned tools are not denied by it ==\n'
 OUT="$(HERDR_EXTRA_PATH="$WORK/bin" PATH="$WORK/bin:$PATH" HERDR_FAKE_SCREEN="$WORK/prompting.txt" \
        HERDR_SANCTIONED_ANSWER=1 bash "$GUARD" 'herdr pane send-keys wN:p7 ENTER' 2>&1)"
