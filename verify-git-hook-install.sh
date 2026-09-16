@@ -498,6 +498,55 @@ printf '%s' "$OUT" | grep -qE 'origin/main here is [0-9]+d old' \
   && ok "a match against a long-stale origin/main is flagged as stale" \
   || bad "freshness" "no staleness warning for a 60-day-old ref"
 
+# HOOK-DEPLOY-03 was a TOCTOU: the bytes checked against origin/main were read
+# with `cat`, the bytes deployed were read again with `cp`. Review won that race
+# on iteration 4 of 40 with a background writer, and .rev then recorded
+# `reviewed: yes` over the WEAKENED bytes, so no later check could notice.
+printf '== a concurrent writer cannot slip past the gate ==\n'
+_prov_repo race
+cp "$WORK/race/src/git-hooks/secret-scan-pre-commit.sh" "$WORK/race/good"
+printf '#!/usr/bin/env bash\nexit 0\n# WEAKENED-BY-RACE\n' > "$WORK/race/bad"
+(
+  for _ in $(seq 1 600); do
+    cp "$WORK/race/bad"  "$WORK/race/swap" && mv -f "$WORK/race/swap" "$WORK/race/src/git-hooks/secret-scan-pre-commit.sh"
+    cp "$WORK/race/good" "$WORK/race/swap" && mv -f "$WORK/race/swap" "$WORK/race/src/git-hooks/secret-scan-pre-commit.sh"
+  done
+) >/dev/null 2>&1 & _racer=$!
+_race_hit=0
+for _i in $(seq 1 25); do
+  _prov_run race --apply
+  if [ -f "$WORK/race/deploy/secret-scan-pre-commit.sh" ] \
+     && grep -q 'WEAKENED-BY-RACE' "$WORK/race/deploy/secret-scan-pre-commit.sh" 2>/dev/null; then
+    _race_hit=1; break
+  fi
+  rm -f "$WORK/race/deploy/secret-scan-pre-commit.sh"
+done
+kill "$_racer" 2>/dev/null; wait "$_racer" 2>/dev/null
+[ "$_race_hit" = 0 ] \
+  && ok "25 attempts against a concurrent writer deployed no unreviewed bytes" \
+  || bad "TOCTOU" "a weakened scanner reached the deploy path with no refusal"
+
+# STRUCTURAL, and labelled as such because the alternatives are worse.
+#
+# The property is an ORDERING inside one function: the bytes judged must be the
+# bytes installed. After the fix the window is small enough that the race row
+# above no longer hits it — mutating the hash back to $HOOK_SRC, or the install
+# back to a second `cp`, leaves every behavioural row green. The honest ways to
+# catch that are (a) a far longer race, which buys flakiness, or (b) a test seam
+# that runs a command between the copy and the judgement — an env-driven exec
+# inside the fleet's credential guard, a worse defect than the one it tests. So
+# this asserts the shape and says out loud that it is doing so.
+_ds=$(sed -n '/^deploy_scanner() {/,/^}/p' "$INSTALLER")
+if printf '%s' "$_ds" | grep -q 'git hash-object "\$tmp"' \
+   && printf '%s' "$_ds" | grep -q 'mv -f "\$tmp" "\$HOOK_DEPLOY"' \
+   && [ "$(printf '%s' "$_ds" | grep -cE '(cp|cat|hash-object|shasum[^|]*) "\$HOOK_SRC"')" = 1 ]; then
+  ok "one snapshot is hashed, judged and installed (structural: ordering is not observable)"
+else
+  # Mentions of $HOOK_SRC are fine (the refusal message and the .rev source
+  # field name it); what must not happen is READING its content again.
+  bad "TOCTOU structure" "deploy_scanner reads \$HOOK_SRC's content more than once, or judges something other than \$tmp"
+fi
+
 printf '== the deploy TARGET gets the same scrutiny as the source ==\n'
 _prov_repo target
 # A FAKE $HOME, so `$ROOT = $HOME/Code` is true of a fixture tree and not of
