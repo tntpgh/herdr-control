@@ -39,52 +39,54 @@ _prompt_window() {
 
 # Is a line AGENT OUTPUT — the positive signal that a prompt above it is gone?
 #
-# The first version of this gate enumerated FURNITURE and offered a list only
-# if everything below it matched. Review proved that backwards on this machine:
-# the OMC status bar that ends every live pane matched none of the patterns, so
-# a real prompt spliced above a real bar produced NO options where the old
-# parser produced both — the 2026-08-01 unanswerable-agent failure, reproduced.
-# Furniture is an OPEN set (every TUI's status bar, every future version), and
-# enumerating it fails toward REFUSING a live prompt.
-#
-# The costs are not symmetric. Refusing a live prompt blocks a human
-# immediately, totally, with nothing downstream to catch it. Offering a stale
-# list is caught downstream: herdr-select.sh refuses on a prompt-fingerprint
-# mismatch and the Slack numeric route requires a recorded prompt id, so a
-# click on a vanished prompt is rejected rather than pressed. So this gate now
-# offers BY DEFAULT and rejects only on a positive signal.
-#
-# That signal is PROSE: five or more alphabetic words. An agent that has moved
-# on says so in sentences. Status bars, box rules, navigation footers and stat
-# lines are not sentences — and anything carrying box-drawing or powerline
-# glyphs is excluded outright, which is what makes a status bar of any design
-# safe rather than a pattern someone has to have predicted.
-# Is a line AGENT OUTPUT — the positive signal that a prompt above it is gone?
-#
-# Three classifiers were tried against the real thing before this one, and the
-# failures are the reason it is shaped this way:
+# FOUR designs were tried against the real screens before this one, and every
+# failure is the reason a line of it exists:
 #
 #   1. a FURNITURE allowlist (box characters, branch:, the mode line). The OMC
-#      bar is box characters interleaved with text and glyphs, so it matched
-#      nothing and a real prompt above a real bar went unanswerable — the
-#      2026-08-01 failure, reproduced by the fix for its opposite.
-#   2. PRIVATE-USE byte ranges in awk. Measured: the rule never fired at all in
-#      BSD awk, so it silently classified nothing.
-#   3. POSITION (ignore the last three lines). It swallowed the canonical stale
-#      case — prompt, one line of output, status bar — and offered it.
+#      bar is box characters interleaved with text and glyphs, so a real prompt
+#      above a real bar went unanswerable — the 2026-08-01 failure reproduced
+#      by the fix for its opposite.
+#   2. bracket expressions holding box characters. In this awk (version
+#      20200816, UTF-8 aware) a class containing a multibyte character matches
+#      EVERY line, including an empty one: `printf 'x' | awk '$0 ~ /[─]/'`
+#      matches. So the rule did not miss the bar — it matched all prose too.
+#      And the byte form was the Latin-1 class [â, ...], not U+2500-257F,
+#      which is why it never fired at all. ANY awk bracket class holding box
+#      characters in this repo is suspect.
+#   3. POSITION alone (ignore the last N lines). Swept across all 14 live
+#      panes at N=0..6, refusals only cleared at N=5 — and exempting five
+#      trailing lines from ever rejecting leaves nothing of the stale half.
+#   4. a word count with a glyph threshold. The bar embeds the terminal TITLE,
+#      so it reads as a sentence: "... Opus ... main ... Fix OMP Load
+#      Warnings, KB Invariant" is seven qualifying words. Two of four agent
+#      panes refused, and the other two passed only because their titles were
+#      short — making answerability depend on what a task is CALLED, which is
+#      worse than a deterministic miss.
 #
-# What holds across omp, Claude Code and tmux: a status line carries GLYPHS and
-# is short; agent prose is a sentence in plain ASCII. So a line is output when
-# it has five or more words AND is either pure ASCII or long enough that the
-# glyphs are incidental. `LC_ALL=C grep` for the non-ASCII test, because that
-# is the one place a byte class behaves the same everywhere.
+# So: glyphs are detected with index() over real characters, never a bracket
+# class, and the two-line status block at the bottom is exempt by POSITION as
+# well. Together those are what make every live pane answerable.
 #
-# The asymmetry is deliberate and is the whole design: this gate may fail to
-# REJECT (a stale list is then caught downstream by the prompt fingerprint —
-# herdr-select refuses on a mismatch, the Slack numeric route needs a recorded
-# prompt id), but it may not fail to ASK, because nothing downstream catches an
-# agent nobody can answer.
+# The asymmetry is the design. This gate may fail to REJECT — a stale list is
+# caught downstream by the prompt fingerprint, since herdr-select refuses on a
+# mismatch and the Slack numeric route needs a recorded prompt id — but it may
+# not fail to ASK, because nothing downstream catches an agent nobody can
+# answer.
+#
+# The status block: omp paints a task line plus a two-line bar, Claude Code a
+# mode line, tmux one row. Two is what made all four agent panes answerable at
+# tail 1 and 2 in the live sweep; more than that and the stale half is gone.
+STATUS_TAIL=2
+
+_DECOR='─│┌┐└┘├┤┬┴┼╭╮╯╰═║█▀▄▏▎▋'
+
 _is_prose() {
+  # Any decoration character at all: status bar, panel, rule, progress block.
+  # `index()` on real characters — see design note 2 above.
+  printf '%s\n' "$1" | awk -v g="$_DECOR" '
+    BEGIN { n = split(g, ch, "") }
+    { for (k = 1; k <= n; k++) if (index($0, ch[k])) exit 1
+      exit 0 }' || return 1
   local words
   words=$(printf '%s\n' "$1" | awk '{ n = 0
     for (i = 1; i <= NF; i++) if ($i ~ /^[A-Za-z][A-Za-z-]+$/) n++
@@ -96,11 +98,6 @@ _is_prose() {
   case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
     *navigate*select*|*navigate*cancel*|*select*navigate*) return 1 ;;
   esac
-  if printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]'; then
-    # Glyph-bearing: status lines are short, a sentence that happens to
-    # contain an em dash is not.
-    [ "$words" -ge 7 ] || return 1
-  fi
   return 0
 }
 
@@ -159,7 +156,12 @@ prompt_options() {
     case "$after" in
       AFTER*)
         after="${after#AFTER	}"
-        text="${after#*	}"
+        dist="${after%%	*}"; text="${after#*	}"
+        # The bottom STATUS_TAIL lines are the status block, never output.
+        # This was declared and never READ in the first version — the code was
+        # a pure prose gate, which is why the bar's embedded title still
+        # refused a live prompt.
+        [ "$dist" -ge "$STATUS_TAIL" ] || continue
         _is_prose "$text" && return 0
         ;;
     esac

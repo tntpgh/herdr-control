@@ -850,25 +850,51 @@ class CacheFreshness(unittest.TestCase):
         for g in gates:
             g.set()
 
-    def test_the_post_wait_recheck_asks_about_freshness_not_the_flag(self):
-        """A SOURCE-level check, and it says so.
+    def test_queued_readers_do_not_each_probe_when_the_wait_times_out(self):
+        """Behavioural, and deterministic — no timing window.
 
         Gating the post-wait recheck on `not self.refreshing` sent every queued
         reader on to its own probe when the wait ended on a budget timeout with
-        the flag still set (review measured 3 fills for 2 readers, 2 with the
-        conjunct dropped). The behavioural version of this assertion needs the
-        fill to land inside a window measured in tenths of a second, and a
-        flaky row in a suite that gates deploys is worse than a source check
-        that states its own weakness. What must hold is that the recheck asks
-        only whether the VALUE is fresh.
+        the flag still set. For `links` that is every production surface, once
+        per queued reader.
+
+        My first version of this was a SOURCE check, on the grounds that the
+        behavioural form needed the fill to land inside a tenth-of-a-second
+        window. Review disagreed and was right: hold the fill open on an Event
+        instead of racing it, and the assertion lands on the final count after
+        join. Five consecutive runs gave 2 with the fix and 3 without.
         """
-        src = Path(__file__).with_name("hub.py").read_text()
-        recheck = [l for l in src.splitlines()
-                   if "time.monotonic() - self.at <= self.ttl" in l and "return self.val" not in l]
-        self.assertTrue(recheck, "the post-wait freshness recheck is gone entirely")
-        self.assertFalse(any("self.refreshing" in l for l in recheck),
-                         "the post-wait recheck consults the in-flight flag; on a budget "
-                         "timeout every queued reader will probe again")
+        hub_budget = hub.FILL_BUDGET_S
+        hub.FILL_BUDGET_S = 0.2          # the wait must TIME OUT
+        try:
+            started, release = threading.Event(), threading.Event()
+            fills, lk = [], threading.Lock()
+
+            def slow():
+                with lk:
+                    fills.append(1)
+                started.set()
+                release.wait(10)         # held open until both readers park
+                return {"n": len(fills)}
+
+            c = hub.Cached(0.01, slow, stale_ok=True, name="links")
+            c.val, c.at = {"n": 0}, time.monotonic() - 1
+            c.get()                      # R1 in flight
+            self.assertTrue(started.wait(5), "the first refresh never started")
+            c.at = time.monotonic() - 99999      # both readers are past the bound
+            out = []
+            readers = [threading.Thread(target=lambda: out.append(c.get()))
+                       for _ in range(2)]
+            for r in readers:
+                r.start()
+            time.sleep(hub.FILL_BUDGET_S * 3)    # both have provably given up
+            release.set()
+            for r in readers:
+                r.join(10)
+            self.assertEqual(len(fills), 2,
+                             f"{len(fills)} fills: every queued reader probed again")
+        finally:
+            hub.FILL_BUDGET_S = hub_budget
 
     def test_the_fill_budget_exceeds_the_slowest_honest_fill(self):
         # kb_data shells out with timeout=40 and loops_data reads kb, so it
