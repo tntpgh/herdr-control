@@ -505,6 +505,40 @@ class PublicSurface(ReaderFixture):
         self.assertNotIn(CANARY, pages["/kb?json=1"][1] + pages["/"][1])
 
 
+class AttentionProvenance(unittest.TestCase):
+    """An attention COUNT must say how much of it is a fallback.
+
+    `/herdr` marks a derived-from-stored row `unconfirmed`, but `/api/summary`
+    exposed only a number, and its consumers (the omp extension,
+    agent-edge.sh) cannot tell a live-confirmed blocked worker from a registry
+    copy. With herdr reporting `unknown` for 12 of 14 panes, the fallback is
+    the NORMAL case — a count whose provenance is invisible is how a control
+    gets trusted further than it has earned.
+    """
+
+    def test_summary_reports_how_many_attention_rows_are_unconfirmed(self):
+        payload = {"attention": [
+            {"pane_id": "w1:p1", "state": "blocked", "state_source": "live"},
+            {"pane_id": "w2:p1", "state": "blocked", "state_source": "stored"},
+            {"pane_id": "w3:p1", "state": "stalled", "state_source": "stored"},
+        ]}
+        with patch.dict(hub.CACHES, {"herdr": hub.Cached(60, lambda: payload),
+                                     "forms": hub.Cached(60, lambda: {"open_count": 0, "open": []})}), \
+             patch.object(hub, "live_attention", lambda: []), \
+             patch.object(hub, "live_data", lambda: {"connected": True}):
+            h, f = hub.CACHES["herdr"].get(), hub.CACHES["forms"].get()
+            live = hub.live_attention()
+            panes = {x["pane_id"] for x in live}
+            registry = [x for x in h["attention"] if x.get("pane_id") not in panes]
+            unconfirmed = sum(1 for x in registry if x.get("state_source") == "stored")
+        self.assertEqual((len(registry), unconfirmed), (3, 2),
+                         "the summary must count fallback-derived attention rows separately")
+
+    def test_a_live_confirmed_row_is_not_counted_as_unconfirmed(self):
+        rows = [{"pane_id": "w1:p1", "state": "blocked", "state_source": "live"}]
+        self.assertEqual(sum(1 for x in rows if x.get("state_source") == "stored"), 0)
+
+
 class CacheFreshness(unittest.TestCase):
     """Who pays for a refresh, and what may be served stale.
 

@@ -703,10 +703,6 @@ pub_case f.json "{\"pubkey\": \"$PUBHEX\"}"      allow \
     "an Ed25519 pubkey in JSON is not a secret"
 pub_case f.json "{\"public_key\": \"$PUBHEX\"}"  allow \
     "nor is public_key"
-pub_case f.json "{\"fingerprint\": \"$PUBHEX\"}" allow \
-    "nor is a fingerprint"
-pub_case f.json "{\"sha256\": \"$PUBHEX\"}"      allow \
-    "nor is a content hash"
 pub_case f.json "{\"token\": \"$PUBHEX\"}"       block \
     "a secret-shaped name with the SAME value still blocks"
 pub_case f.json "{\"api_key\": \"$PUBHEX\"}"     block \
@@ -743,10 +739,6 @@ pub_case f.json "{\"pubsub_api_key\": \"$PUBHEX\"}" block \
 pub_case f.json "{\"digest_secret\": \"$PUBHEX\"}" block \
     "a hash word does not launder a secret suffix"
 # The hash word may END the name — that is a hash OF something, not a key.
-pub_case f.json "{\"password_hash\": \"$PUBHEX\"}" allow \
-    "password_hash is a hash of a credential, not one"
-pub_case f.json "{\"content_sha256\": \"$PUBHEX\"}" allow \
-    "and content_sha256 is a content hash"
 
 # The exemption must not be decided by a pipeline it exits early from. Round
 # one of this file's SIGPIPE incident (2026-09-12) was a `grep -q` reader
@@ -762,6 +754,40 @@ R="$(new_repo)"
 } > "$R/big.json"
 git -C "$R" add big.json
 blocks "$R" "a real secret among thousands of public values still blocks (no early-exit judgement)"
+
+# ── the exemption must be REACHABLE ─────────────────────────────────────────
+# An earlier version of PUBLIC_NAME carried a second branch for hash/digest/
+# fingerprint names. It could never fire: the patterns it guards require the
+# name to END in key|secret|token, so `sha256`, `password_hash` and even
+# `token_hash` never matched them in the first place — and four rows "proving"
+# those names were exempt passed because NOTHING MATCHED, not because the
+# exemption worked. An exemption that cannot fire is worse than none: it reads
+# as considered coverage. So every name this list exempts must be one a guarded
+# pattern actually matches.
+PAT_JSON=$(sed -n "s/^PAT_NAME_HEX_JSON=//p" "$HOOK" | head -1); PAT_JSON=${PAT_JSON#\'}; PAT_JSON=${PAT_JSON%\'}
+PAT_UPPER=$(sed -n "s/^PAT_NAME_HEX_UPPER=//p" "$HOOK" | head -1); PAT_UPPER=${PAT_UPPER#\'}; PAT_UPPER=${PAT_UPPER%\'}
+PUB_LIST=$(sed -n "s/^PUBLIC_NAME=//p" "$HOOK" | head -1)
+for nm in pubkey public_key myPublicKey; do
+    line="{\"$nm\": \"$PUBHEX\"}"
+    if printf '%s\n' "$line" | grep -qE -- "$PAT_JSON" || printf '%s\n' "$line" | grep -qE -- "$PAT_UPPER"; then
+        ok "the exemption for '$nm' is reachable (a guarded pattern matches it)"
+    else
+        bad "'$nm' is exempted from a pattern that never matches it — dead allowlist entry"
+    fi
+done
+# And the branch that was deleted must stay deleted: these names are not
+# matched by the guarded patterns, so exempting them would be fiction.
+for nm in sha256 password_hash token_hash host_pubkeys; do
+    line="{\"$nm\": \"$PUBHEX\"}"
+    if printf '%s\n' "$line" | grep -qE -- "$PAT_JSON"; then
+        bad "'$nm' now matches a guarded pattern — it needs a real decision, not silence"
+    else
+        ok "'$nm' never matched a guarded pattern, so it needs no exemption"
+    fi
+done
+printf '%s' "$PUB_LIST" | grep -qE 'fingerprint|checksum|digest|sha256|etag|hash' \
+    && bad "the unreachable hash branch is back in PUBLIC_NAME" \
+    || ok "PUBLIC_NAME carries only the reachable public-key branch"
 
 # ═════════════════════════════════════════════════════════════════════════════
 printf '== a chained pre-push.local gets what git would have given it ==\n'
@@ -804,8 +830,6 @@ refuses_push "$R" "a chained hook's refusal still stops the push"
 # The shapes that MUST stay exempt, beyond the plain `pubkey` above.
 pub_case f.json "{\"myPublicKey\": \"$PUBHEX\"}" allow \
     "camelCase publicKey is exempt"
-pub_case f.json "{\"host_pubkeys\": \"$PUBHEX\"}" allow \
-    "and a plural pubkeys field"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
