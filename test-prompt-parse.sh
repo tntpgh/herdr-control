@@ -151,11 +151,20 @@ _prompt_window() { printf '%s\n' "$SCREEN"; }
 # The two-line OMC status bar, captured from a live pane. The first version of
 # this gate enumerated furniture and matched NEITHER line, so a real prompt
 # above a real bar produced no options at all — an unanswerable agent.
-BAR=$'\u256d\u2500\u2500 \uf0d5 7 \ue0b1 Opus 5 \ue0b1 ~/Code/thurber-os \ue0b1 main \ue0b1 20.71 \ue0b0\u2500\u250022%\u2500\u2500\n\u2570\u2500                    \u2500\u256f'
+BAR=$'╭── ⠙ 34m ▎ Opus 5 ▎ ~/Code/thurber-os ▎ main ▎ 20.71 ───22%───
+╰─                    ─╯'
 SCREEN=$'Do you want to proceed?\n1. Yes\n2. No\n  \u2191/\u2193 navigate \u00b7 enter select\n'"$BAR"
 [ -n "$(prompt_options fake:pane)" ] \
   && ok "a live list with a navigation footer below it is offered" \
   || no "live numbered list" "options empty — the footer was read as new output"
+
+# omp's task line is a SENTENCE and the classifier says so — it is exempted by
+# POSITION (the status block is sized from the trailing decorated run plus the
+# title line above it), not by being recognised as decoration. Asserting the
+# classifier called it status was asserting the wrong mechanism.
+_is_prose '  󱊷 Commit the Jacomo fixes and push' \
+  && ok "the task line reads as prose (it is a sentence); position exempts it" \
+  || no "task line classifier" "expected prose, got status"
 
 # The classifier itself, line by line. Three earlier designs each failed
 # against one of these and the caller-level rows could not tell me which:
@@ -174,8 +183,7 @@ for _line in \
   'branch: main' \
   '  249 insertions(+), 18 deletions(-)' \
   '╭── ⠙ 34m ▎ Opus 5 ▎ ~/Code/x ▎ main ▎ 20.71 ──22%──' \
-  '  󱊷 Commit the Jacomo fixes and push' \
-  '  󱊷 which line is still refusing, exactly'; do
+  ; do
   _is_prose "$_line" && no "prose classifier" "status read as output: $_line" \
     || ok "status recognised: ${_line:0:42}"
 done

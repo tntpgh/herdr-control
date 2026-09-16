@@ -121,7 +121,8 @@ prompt_options() {
   # sed extraction that follows, and post-prompt output like
   # "249 insertions(+), 18 deletions(-)" was swallowed into the run.
   local block
-  block=$(printf '%s\n' "$win" | awk '
+  block=$(printf '%s\n' "$win" | awk -v decor="$_DECOR" '
+    BEGIN { ng = split(decor, ch, "") }
     { line[NR] = $0; isopt[NR] = ($0 ~ /^[[:space:]]*[❯>]?[[:space:]]*[0-9]+[.][[:space:]]+./) }
     END {
       last = 0
@@ -132,36 +133,56 @@ prompt_options() {
       for (i = first; i <= last; i++) print "OPT\t" line[i]
       # Each AFTER line carries how far it is from the BOTTOM, because the
       # status block lives there and is not agent output.
-      for (i = last + 1; i <= NR; i++) print "AFTER\t" (NR - i) "\t" line[i]
+      # dist-from-bottom and whether the line carries DECORATION, so the
+      # caller can size the status block from the screen instead of guessing.
+      for (i = last + 1; i <= NR; i++) {
+        d = 0
+        for (k = 1; k <= ng; k++) if (index(line[i], ch[k])) { d = 1; break }
+        # PRIVATE-USE glyphs by lead byte (U+E000-F8FF -> \356/\357,
+        # plane-15/16 -> \363/\364). omp marks its task-description row with
+        # one, which is how that row is recognised as status rather than
+        # output — it is a sentence by every other measure, and the terminal
+        # TITLE it embeds is what made answerability depend on a task name.
+        if (!d && (index(line[i], "\356") || index(line[i], "\357") \
+                || index(line[i], "\363") || index(line[i], "\364"))) d = 1
+        print "AFTER\t" (NR - i) "\t" d "\t" line[i]
+      }
     }')
   [ -n "$block" ] || return 0
-  # Prose found ABOVE the trailing status region means the prompt is gone.
+  # The STATUS BLOCK is measured, not assumed: the trailing run of DECORATED
+  # lines (the bar), plus the one line immediately above it (omp's
+  # task-description line, Claude Code's mode line — the title row).
   #
-  # Position, not a glyph pattern. Three attempts at classifying the status
-  # block by its CONTENT all failed against the real thing: the box-drawing
-  # list missed a bar of interleaved text and glyphs, the private-use byte
-  # ranges do not match in BSD awk (measured: the rule never fired), and
-  # omp paints a TASK-DESCRIPTION line — `<glyph> Commit the Jacomo fixes` —
-  # which is ordinary prose by any word-count rule. The one thing that is
-  # stable across omp, Claude Code and tmux is WHERE the status block is: the
-  # last few lines, always.
-  #
-  # So: the bottom STATUS_TAIL lines are never read as agent output. The
-  # residual, stated plainly: a single line of real output sitting inside that
-  # region will not reject a stale list. A click on it is still refused
-  # downstream by the prompt fingerprint, which is the trade this gate is
-  # built on — it may fail to reject, it may not fail to ask.
-  local after dist text
+  # A fixed count was wrong in both directions. STATUS_TAIL=2 left omp's task
+  # line inside the checked region, and that line embeds the terminal TITLE, so
+  # it reads as a sentence — "<glyph> Fix OMP Load Warnings, KB Invariant" —
+  # and a live prompt above it was REFUSED. Raising the count to cover it then
+  # exempted a real line of output on panes whose status block is one row.
+  # Sizing it from the screen handles both: 3 on an omp pane, 1 on a shell.
+  local decor_run=0 after dist dec text
   while IFS= read -r after; do
     case "$after" in
       AFTER*)
         after="${after#AFTER	}"
-        dist="${after%%	*}"; text="${after#*	}"
-        # The bottom STATUS_TAIL lines are the status block, never output.
-        # This was declared and never READ in the first version — the code was
-        # a pure prose gate, which is why the bar's embedded title still
-        # refused a live prompt.
-        [ "$dist" -ge "$STATUS_TAIL" ] || continue
+        dist="${after%%	*}"; after="${after#*	}"
+        dec="${after%%	*}"
+        [ "$dist" -eq "$decor_run" ] && [ "$dec" = 1 ] && decor_run=$((decor_run + 1))
+        ;;
+    esac
+  done < <(printf '%s\n' "$block" | awk -F'\t' '$1=="AFTER"' | sort -t'	' -k2,2n)
+  # Exactly the decorated run. An earlier version added one for "the title
+  # row", which on a pane whose status block is bar-only exempted a genuine
+  # line of output and offered the canonical stale list. The title row is
+  # detected instead (private-use glyph), so it is inside the run when present
+  # and costs nothing when absent.
+  local status_block=$decor_run
+  while IFS= read -r after; do
+    case "$after" in
+      AFTER*)
+        after="${after#AFTER	}"
+        dist="${after%%	*}"; after="${after#*	}"
+        dec="${after%%	*}"; text="${after#*	}"
+        [ "$dist" -ge "$status_block" ] || continue
         _is_prose "$text" && return 0
         ;;
     esac
