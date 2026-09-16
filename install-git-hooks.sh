@@ -20,6 +20,11 @@
 #   bash install-git-hooks.sh --dry-run    # same thing, said out loud
 #   bash install-git-hooks.sh --apply      # make the changes
 #   bash install-git-hooks.sh --undo       # restore what --apply replaced
+#   bash install-git-hooks.sh --apply --allow-unreviewed
+#                                          # deploy a scanner origin/main does
+#                                          # NOT carry (a fix that must go live
+#                                          # before its PR merges). Recorded in
+#                                          # .rev as reviewed: no.
 #
 # Dry run is the DEFAULT, matching install.sh: a script that rewrites hooks in 18
 # repositories should not do it because someone typed its name.
@@ -38,6 +43,18 @@
 # re-run; safe to re-run after --undo.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+
+# GIT ENVIRONMENT, UNSET FIRST. Every provenance question below is asked with
+# `git -C "$here"`, and an inherited GIT_DIR/GIT_WORK_TREE OVERRIDES -C
+# discovery — so the reviewed-check, the revision record and the VERIFY
+# comparison would all answer about a DIFFERENT repository than the file being
+# deployed. Demonstrated by review: with only GIT_DIR changed, a weakened
+# scanner that is correctly refused gets deployed with `reviewed: yes`, a
+# plausible `rev: <sha> main clean`, and `matches origin/main: yes`. git sets
+# GIT_DIR for every hook, alias, `rebase -x`, `bisect run` and filter
+# subprocess, so this arrives by inheritance, not by an attacker.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CEILING_DIRECTORIES
 
 HOOK_SRC="$here/git-hooks/secret-scan-pre-commit.sh"
 
@@ -75,7 +92,7 @@ for a in "$@"; do
     --apply)   MODE=apply ;;
     --undo)    MODE=undo ;;
     --allow-unreviewed) ALLOW_UNREVIEWED=1 ;;
-    -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -92,6 +109,10 @@ fi
 # commit and teach --no-verify. Prove it parses before pointing 18 repos at it.
 bash -n "$HOOK_SRC" || { echo "REFUSING: $HOOK_SRC is not valid bash" >&2; exit 2; }
 
+HOOK_DEPLOY_DIR="${HERDR_HOOK_DEPLOY_DIR:-$HOME/.local/share/herdr-control/hooks}"
+HOOK_DEPLOY="$HOOK_DEPLOY_DIR/secret-scan-pre-commit.sh"
+HOOK_DEPLOY_REV="$HOOK_DEPLOY_DIR/.rev"
+
 # The $here refusal above was written when the shim exec'd "$here/git-hooks/...".
 # It no longer does — see HOOK_DEPLOY below; the installed shim is
 #   exec bash ~/.local/share/herdr-control/hooks/secret-scan-pre-commit.sh --push "$@"
@@ -107,7 +128,7 @@ bash -n "$HOOK_SRC" || { echo "REFUSING: $HOOK_SRC is not valid bash" >&2; exit 
 # that is gated below by _src_reviewed. A disposable source now warns.
 if [ -n "$_disposable" ] && [ "$MODE" != dry ]; then
   echo "note: source checkout is $_disposable ($here)."
-  echo "  Harmless — the scanner is copied to $HOME/.local/share/herdr-control/hooks"
+  echo "  Harmless — the scanner is copied to $HOOK_DEPLOY_DIR"
   echo "  and the shims point THERE, so this path may disappear afterwards."
 fi
 
@@ -127,9 +148,6 @@ fi
 # tree and points the shims there. Re-running --apply refreshes the copy, which
 # is the one step a scanner change now needs. `git-hooks/` stays the source of
 # truth; this is its deployment.
-HOOK_DEPLOY_DIR="${HERDR_HOOK_DEPLOY_DIR:-$HOME/.local/share/herdr-control/hooks}"
-HOOK_DEPLOY="$HOOK_DEPLOY_DIR/secret-scan-pre-commit.sh"
-HOOK_DEPLOY_REV="$HOOK_DEPLOY_DIR/.rev"
 
 # WHICH REVISION the fleet runs — recorded, and checked before it is written.
 #
@@ -151,44 +169,124 @@ HOOK_DEPLOY_REV="$HOOK_DEPLOY_DIR/.rev"
 # Same defect the hub had before #84: the thing that answers was whatever
 # happened to be checked out. Same fix — deploy a known revision, record it,
 # and make the mismatch loud.
-_src_rev() {                              # -> "<sha> <branch> <clean|dirty>"
-  local sha br st
-  sha=$(git -C "$here" rev-parse --short HEAD 2>/dev/null) || return 1
-  br=$(git -C "$here" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  # `dirty` is about THIS FILE, not the whole tree: an unrelated WIP file in a
-  # shared checkout must not block deploying an otherwise reviewed scanner.
-  if git -C "$here" diff --quiet HEAD -- git-hooks/secret-scan-pre-commit.sh 2>/dev/null; then
-    st=clean; else st=dirty; fi
-  printf '%s %s %s' "$sha" "${br:-DETACHED}" "$st"
+# The repo we ask about MUST be the repo the file came from. Without this, a
+# `$here` that is not a checkout at all (a tarball extract, a `cp -R` copy)
+# answers every question with a failure that used to read as "unknown", and
+# unknown used to deploy.
+_src_repo_ok() {
+  local top srcdir
+  top=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null) || return 1
+  # BOTH sides physically resolved. On macOS /var, /tmp and /etc are symlinks
+  # into /private, so `rev-parse --show-toplevel` answers /private/var/... for
+  # a checkout the caller reached as /var/... — a plain prefix test then fails
+  # for a perfectly good repo. It fails CLOSED (the deploy is refused), but the
+  # refusal blames a missing origin/main, which is the wrong reason and would
+  # send someone hunting a remote that is fine.
+  top=$(cd "$top" 2>/dev/null && pwd -P) || return 1
+  srcdir=$(cd "$(dirname "$HOOK_SRC")" 2>/dev/null && pwd -P) || return 1
+  case "$srcdir/" in
+    "$top"/*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-# Is the scanner about to be deployed the one origin/main carries? Compared by
-# CONTENT, not by ref name: a branch whose scanner is byte-identical to main's
-# (most PRs here never touch it) is a perfectly good source, and a checkout
-# sitting on main with an uncommitted edit is not.
-_src_reviewed() {
-  local mainblob
-  mainblob=$(git -C "$here" show origin/main:git-hooks/secret-scan-pre-commit.sh 2>/dev/null) || return 2
-  [ "$mainblob" = "$(cat "$HOOK_SRC")" ]
+# Blob OIDs, not command substitution. `[ "$(git show ...)" = "$(cat ...)" ]`
+# compares content MODULO TRAILING NEWLINES, because `$(...)` strips them — so
+# two files whose sha256 differ compared equal and the report said
+# "matches origin/main: yes" while the bytes did not. Review reproduced it by
+# appending two newlines. A blob OID is exact and is also what git itself uses.
+_blob_at() {                              # <rev> -> OID on stdout, or nothing
+  git -C "$here" rev-parse -q --verify "$1:git-hooks/secret-scan-pre-commit.sh" 2>/dev/null
 }
 
+# ONE SNAPSHOT is copied, judged, installed and recorded.
+#
+# The first version read HOOK_SRC twice: `cat` for the reviewed-check, `cp` for
+# the deploy. Review won that race on iteration 4 of 40 with a background
+# writer doing atomic `mv`s — the deployed copy was the WEAKENED file and .rev
+# affirmatively recorded `reviewed: yes` with the sha256 of the weakened bytes,
+# so even the stale-record check could not fire. In the workflow this very
+# change describes (a sibling session switching branches in the shared
+# checkout) that writer is not hypothetical.
+#
+# So: copy FIRST, then judge the copy, then rename it into place. Everything
+# below — the gate, the record, the hash — describes $tmp, the exact bytes that
+# become the fleet's scanner.
+#
+# Returns: 0 deployed · 1 could not deploy (nothing installed) · 3 refused as
+# unreviewed (nothing installed) · 4 installed but the record could not be
+# written (the fleet IS running the new bytes).
+DEPLOY_REVIEWED=unknown
+DEPLOY_REV=""
+DEPLOY_SNAP_OID=""
 deploy_scanner() {
   mkdir -p "$HOOK_DEPLOY_DIR" || return 1
-  # Atomic: a half-written scanner is a broken guard in every repo at once.
   local tmp="$HOOK_DEPLOY.new.$$"
-  cp "$HOOK_SRC" "$tmp" || return 1
-  chmod 0755 "$tmp" || return 1
+  cp "$HOOK_SRC" "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0755 "$tmp" || { rm -f "$tmp"; return 1; }
+  # A scanner that cannot run is worse than none: it would fail every commit
+  # and teach --no-verify.
   bash -n "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f "$tmp" "$HOOK_DEPLOY" || return 1
-  # Provenance beside the copy, written AFTER the move so a failed deploy never
-  # leaves a record claiming a revision that is not installed.
+
+  DEPLOY_SNAP_OID=$(git hash-object "$tmp" 2>/dev/null)
+  local main_oid head_oid sha br state
+  if _src_repo_ok; then
+    main_oid=$(_blob_at origin/main)
+    head_oid=$(_blob_at HEAD)
+    sha=$(git -C "$here" rev-parse --short HEAD 2>/dev/null)
+    br=$(git -C "$here" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    # clean/dirty/absent by BLOB IDENTITY, not by `git diff --quiet`, which
+    # exits 0 both for "unmodified" and for "this path is not in HEAD at all"
+    # (untracked, gitignored, or a symlink out of the tree). Review deployed a
+    # weakened untracked scanner that .rev then called `clean` against a commit
+    # which did not contain it.
+    if [ -z "$head_oid" ]; then state=absent-from-HEAD
+    elif [ "$head_oid" = "$DEPLOY_SNAP_OID" ]; then state=clean
+    else state=dirty; fi
+    DEPLOY_REV="${sha:-unknown} ${br:-DETACHED} $state"
+  else
+    DEPLOY_REV="unknown (not a git checkout, or $HOOK_SRC is outside it)"
+  fi
+
+  if [ -z "${main_oid:-}" ]; then
+    DEPLOY_REVIEWED="no (no origin/main to compare)"
+  elif [ "$main_oid" = "$DEPLOY_SNAP_OID" ]; then
+    DEPLOY_REVIEWED=yes
+  else
+    DEPLOY_REVIEWED="no (differs from origin/main)"
+  fi
+  # A control that cannot VERIFY its input must not deploy it. The first
+  # version mapped "cannot resolve origin/main" to a label that was not the
+  # string "no", and the refusal only fired on exactly "no" — so a renamed
+  # remote, a single-branch clone, a never-fetched clone or a plain directory
+  # copy deployed arbitrary scanner bytes with rc=0. That is the failure this
+  # gate exists to prevent, reached without the escape hatch.
+  if [ "$DEPLOY_REVIEWED" != yes ] && [ "$ALLOW_UNREVIEWED" != 1 ]; then
+    rm -f "$tmp"
+    return 3
+  fi
+
+  mv -f "$tmp" "$HOOK_DEPLOY" || { rm -f "$tmp"; return 1; }
+
+  # From here the fleet is ALREADY running these bytes, so a failure to write
+  # the record is not "could not deploy" — saying that would tell the operator
+  # nothing happened while 54 shims execute the new scanner. Written to a temp
+  # and renamed, like the scanner, so two concurrent runs cannot tear it.
+  local rtmp="$HOOK_DEPLOY_REV.new.$$"
   {
-    printf 'rev:      %s\n' "$(_src_rev 2>/dev/null || printf 'unknown (not a git checkout)')"
-    printf 'source:   %s\n' "$HOOK_SRC"
-    printf 'reviewed: %s\n' "$DEPLOY_REVIEWED"
-    printf 'sha256:   %s\n' "$(shasum -a 256 "$HOOK_DEPLOY" | cut -d' ' -f1)"
-    printf 'deployed: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  } > "$HOOK_DEPLOY_REV" || return 1
+    printf 'rev:        %s\n' "$DEPLOY_REV"
+    printf 'source:     %s\n' "$HOOK_SRC"
+    printf 'blob:       %s\n' "${DEPLOY_SNAP_OID:-unknown}"
+    printf 'reviewed:   %s\n' "$DEPLOY_REVIEWED"
+    printf 'main-blob:  %s\n' "${main_oid:-none}"
+    printf 'main-dated: %s\n' "$(git -C "$here" log -1 --format=%cI origin/main 2>/dev/null || printf unknown)"
+    printf 'deploy-dir: %s\n' "$HOOK_DEPLOY_DIR"
+    printf 'sha256:     %s\n' "$(shasum -a 256 "$HOOK_DEPLOY" | cut -d' ' -f1)"
+    printf 'deployed:   %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "$rtmp" 2>/dev/null && mv -f "$rtmp" "$HOOK_DEPLOY_REV" 2>/dev/null || {
+    rm -f "$rtmp"
+    return 4
+  }
 }
 
 # The shim is one exec, so the scanner is never copied into a repo. Extra argv
@@ -207,38 +305,54 @@ hook_body() {                             # [extra scanner args...]
   printf ' "$@"\n'
 }
 
-# Deploying an UNREVIEWED scanner stays possible, but only when asked for by
-# name. Refusing by default is the right direction here: this file is the only
-# thing between a hardcoded credential and a push, all 18 repos run the single
-# copy, and a branch is exactly where a weakened detector lives BEFORE review
-# catches it — #87 and #88 each carried a reviewer-found bypass. A scanner fix
-# that must go live before its PR merges is a real case, so the escape hatch
-# exists and is recorded in .rev instead of being done by hand.
-DEPLOY_REVIEWED=unknown
-if [ "$MODE" = apply ]; then
-  _src_reviewed; _rv=$?
-  case "$_rv" in
-    0) DEPLOY_REVIEWED=yes ;;
-    2) DEPLOY_REVIEWED="unknown (no origin/main to compare)" ;;
-    *) DEPLOY_REVIEWED=no ;;
-  esac
-  if [ "$DEPLOY_REVIEWED" = no ] && [ "$ALLOW_UNREVIEWED" != 1 ]; then
-    echo "REFUSING: $HOOK_SRC is not the scanner origin/main carries." >&2
-    echo "  Deploying it would put code no review has approved in front of" >&2
-    echo "  every commit and every push in $ROOT/* — and, because the copy" >&2
-    echo "  outlives a branch switch, leave no record of which revision." >&2
-    echo "  source: $(_src_rev 2>/dev/null || echo 'not a git checkout')" >&2
-    echo "  Either merge it first, or say so explicitly:" >&2
-    echo "    bash $0 --apply --allow-unreviewed" >&2
-    exit 2
-  fi
-fi
+# THE DEPLOY TARGET is where 54 shims will point, so it gets the same scrutiny
+# the SOURCE used to get. `HERDR_HOOK_DEPLOY_DIR=/tmp/... --apply` against the
+# real fleet reproduces exactly the fleet-wide fail-closed breakage the old
+# source refusal existed to prevent — and the suite sets that variable on every
+# run, so a copy-pasted command with one variable dropped is the realistic
+# path. A temp deploy dir is fine for a TEST (which also redirects CODE_ROOT);
+# it is never right for the real fleet.
+case "$HOOK_DEPLOY_DIR" in
+  /tmp/*|/private/tmp/*|/var/folders/*|"${TMPDIR:-/nonexistent}"*)
+    if [ "$MODE" = apply ] && [ "$ROOT" = "$HOME/Code" ]; then
+      echo "REFUSING: deploy target $HOOK_DEPLOY_DIR is under a temp root," >&2
+      echo "  but CODE_ROOT is the real fleet ($ROOT). Every shim in every repo" >&2
+      echo "  would exec a path that disappears on reboot — fail-closed, fleet-" >&2
+      echo "  wide, on every commit. Drop HERDR_HOOK_DEPLOY_DIR, or redirect" >&2
+      echo "  CODE_ROOT too if this was meant to be a test." >&2
+      exit 2
+    fi ;;
+esac
 
 [ "$MODE" = dry ] && echo "DRY RUN — nothing will be changed. Re-run with --apply."
 if [ "$MODE" = apply ]; then
-  deploy_scanner || { echo "REFUSING: could not deploy the scanner to $HOOK_DEPLOY" >&2; exit 2; }
-  echo "deployed:  $HOOK_SRC -> $HOOK_DEPLOY"
-  echo "revision:  $(_src_rev 2>/dev/null || echo unknown)  reviewed=$DEPLOY_REVIEWED"
+  # Best effort freshness: origin/main is whatever this checkout last saw, so a
+  # scanner fix merged upstream would otherwise be "reviewed: yes" while the
+  # fleet runs the pre-fix detector. Failure is fine (offline, no remote) — the
+  # record carries main-dated and VERIFY says how old it is.
+  git -C "$here" fetch --quiet origin main 2>/dev/null || true
+  deploy_scanner; _drc=$?
+  case "$_drc" in
+    0) echo "deployed:  $HOOK_SRC -> $HOOK_DEPLOY"
+       echo "revision:  $DEPLOY_REV  reviewed=$DEPLOY_REVIEWED" ;;
+    3) echo "REFUSING: this scanner is $DEPLOY_REVIEWED." >&2
+       echo "  Deploying it would put code no review has approved in front of" >&2
+       echo "  every commit and every push in $ROOT/* — and, because the copy" >&2
+       echo "  outlives a branch switch, leave no record of which revision." >&2
+       echo "  source: $HOOK_SRC" >&2
+       echo "  rev:    $DEPLOY_REV" >&2
+       echo "  Either merge it first, or say so explicitly:" >&2
+       echo "    bash $0 --apply --allow-unreviewed" >&2
+       exit 2 ;;
+    4) echo "DEPLOYED BUT UNRECORDED: $HOOK_DEPLOY is live and carrying the new" >&2
+       echo "  bytes ($DEPLOY_SNAP_OID), but $HOOK_DEPLOY_REV could not be" >&2
+       echo "  written — so the provenance record still describes the PREVIOUS" >&2
+       echo "  generation. The fleet is running the new scanner. Fix the record:" >&2
+       echo "    ls -l $HOOK_DEPLOY_REV   # read-only, immutable, or not yours?" >&2
+       exit 2 ;;
+    *) echo "REFUSING: could not deploy the scanner to $HOOK_DEPLOY (nothing installed)" >&2
+       exit 2 ;;
+  esac
 fi
 echo "scanner: $HOOK_SRC"
 echo "shims exec: $HOOK_DEPLOY"
@@ -434,13 +548,29 @@ if [ -r "$HOOK_DEPLOY" ]; then
   else
     echo "    no .rev — deployed before provenance was recorded, or written by hand"
   fi
-  if _mainblob=$(git -C "$here" show origin/main:git-hooks/secret-scan-pre-commit.sh 2>/dev/null); then
-    if [ "$_mainblob" = "$(cat "$HOOK_DEPLOY")" ]; then
-      echo "    matches origin/main: yes"
-    else
-      echo "    matches origin/main: NO — the fleet is NOT running the reviewed scanner"
-      echo "      redeploy from a checkout on main:  bash $0 --apply"
+  # By BLOB OID, and with an explicit verdict when it cannot be established.
+  # The first version wrapped this in `if _mainblob=$(...); then` with no else,
+  # so a fleet running a weakened branch scanner produced a VERIFY block with
+  # no origin/main line at all — and silence in a report whose whole purpose is
+  # answering "what is the fleet running" reads as a pass.
+  _dep_oid=$(git hash-object "$HOOK_DEPLOY" 2>/dev/null)
+  _main_oid=$(_src_repo_ok && _blob_at origin/main)
+  if [ -z "$_main_oid" ]; then
+    echo "    matches origin/main: CANNOT TELL — no origin/main resolvable from $here."
+    echo "      The fleet's scanner is UNVERIFIED. git -C $here fetch origin main"
+  elif [ "$_main_oid" = "$_dep_oid" ]; then
+    echo "    matches origin/main: yes"
+    # origin/main is only as fresh as the last fetch, so "yes" against a stale
+    # ref can still mean the fleet is running a pre-fix detector.
+    _md=$(git -C "$here" log -1 --format=%ct origin/main 2>/dev/null)
+    if [ -n "$_md" ]; then
+      _age=$(( ( $(date +%s) - _md ) / 86400 ))
+      [ "$_age" -gt 14 ] && echo "      but origin/main here is ${_age}d old — fetch before trusting this"
     fi
+  else
+    echo "    matches origin/main: NO — the fleet is NOT running the reviewed scanner"
+    echo "      deployed blob $_dep_oid vs origin/main $_main_oid"
+    echo "      redeploy from a checkout on main:  bash $0 --apply"
   fi
 else
   echo "  deployed scanner: MISSING at $HOOK_DEPLOY — every shim is dead"

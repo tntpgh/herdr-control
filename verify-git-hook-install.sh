@@ -303,85 +303,226 @@ OUT="$(CODE_ROOT="$ROOT" bash -c "cd $WORK && mkdir -p gh && cp broken.sh gh/sec
 #
 # All 18 repos executed an OPEN PR's scanner on 2026-09-16, which allowed three
 # PII cases origin/main blocks. Nothing in this suite noticed, because every
-# other check here describes the SHIMS, and the shims were perfect: they all
+# other check here describes the SHIMS — and the shims were perfect: they all
 # pointed at the one deployed copy. What was missing was any statement about
 # WHAT that copy is.
-_prov_env() {                 # a throwaway repo + remote, $WORK/prov
-  rm -rf "$WORK/prov"; mkdir -p "$WORK/prov"
-  git init -q "$WORK/prov/src"
-  git -C "$WORK/prov/src" config user.email t@e.c
-  git -C "$WORK/prov/src" config user.name t
-  mkdir -p "$WORK/prov/src/git-hooks"
-  cp "$here/git-hooks/secret-scan-pre-commit.sh" "$WORK/prov/src/git-hooks/secret-scan-pre-commit.sh"
-  cp "$INSTALLER" "$WORK/prov/src/install-git-hooks.sh"
-  git -C "$WORK/prov/src" add -A >/dev/null
-  git -C "$WORK/prov/src" commit -qm base
-  git init -q --bare "$WORK/prov/remote.git"
-  git -C "$WORK/prov/src" remote add origin "$WORK/prov/remote.git"
-  git -C "$WORK/prov/src" push -q origin HEAD:refs/heads/main
-  git -C "$WORK/prov/src" fetch -q origin
+#
+# The rows below were written twice. The first set passed a green run while a
+# security review found three HIGH bypasses, so each row now names the bypass
+# it closes, and the fixtures build the AWKWARD repo shapes (renamed remote,
+# single-branch clone, no .git, inherited GIT_DIR) rather than only the happy
+# one.
+_iso() { date -u -v-"$1"d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "$1 days ago" '+%Y-%m-%dT%H:%M:%SZ'; }
+_prov_repo() {                # <dir> [days-old] -> repo with origin/main
+  rm -rf "$WORK/$1"; mkdir -p "$WORK/$1"
+  git init -q "$WORK/$1/src"
+  git -C "$WORK/$1/src" config user.email t@e.c
+  git -C "$WORK/$1/src" config user.name t
+  mkdir -p "$WORK/$1/src/git-hooks"
+  cp "$here/git-hooks/secret-scan-pre-commit.sh" "$WORK/$1/src/git-hooks/secret-scan-pre-commit.sh"
+  cp "$INSTALLER" "$WORK/$1/src/install-git-hooks.sh"
+  git -C "$WORK/$1/src" add -A >/dev/null
+  GIT_COMMITTER_DATE="$(_iso "${2:-0}")" \
+    git -C "$WORK/$1/src" commit -qm base --date="$(_iso "${2:-0}")"
+  git init -q --bare "$WORK/$1/remote.git"
+  git -C "$WORK/$1/src" remote add origin "$WORK/$1/remote.git"
+  git -C "$WORK/$1/src" push -q origin HEAD:refs/heads/main
+  git -C "$WORK/$1/src" fetch -q origin
 }
-_prov_run() {                 # [extra args...] -> rc, output in $OUT
-  OUT="$(cd "$WORK/prov/src" && CODE_ROOT="$WORK/prov/none" \
-    HERDR_HOOK_DEPLOY_DIR="$WORK/prov/deploy" bash install-git-hooks.sh "$@" 2>&1)"
+_prov_weaken() { printf '\n# WEAKENED\nexit 0\n' >> "$WORK/$1/src/git-hooks/secret-scan-pre-commit.sh"; }
+_prov_run() {                 # <dir> [extra args...] -> rc in $RC, output in $OUT
+  local d="$1"; shift
+  OUT="$(cd "$WORK/$d/src" && CODE_ROOT="$WORK/$d/none" \
+    HERDR_HOOK_DEPLOY_DIR="$WORK/$d/deploy" bash install-git-hooks.sh "$@" 2>&1)"
+  RC=$?
 }
+_prov_landed() { [ -f "$WORK/$1/deploy/secret-scan-pre-commit.sh" ]; }
 
-_prov_env
-_prov_run --apply
-if [ -r "$WORK/prov/deploy/.rev" ]; then
-  grep -q '^reviewed: yes' "$WORK/prov/deploy/.rev" \
+_prov_repo happy
+_prov_run happy --apply
+if [ -r "$WORK/happy/deploy/.rev" ]; then
+  grep -q '^reviewed: *yes' "$WORK/happy/deploy/.rev" \
     && ok "--apply records the deployed revision and that it is reviewed" \
-    || bad ".rev written but not marked reviewed: $(cat "$WORK/prov/deploy/.rev")"
-  # The point of the record is naming the REVISION — "reviewed: yes" without a
-  # sha would have described the 2026-09-16 deployment perfectly and still left
-  # nobody able to say which commit the fleet was running.
-  grep -qE '^rev:[[:space:]]+[0-9a-f]{7,}[[:space:]]' "$WORK/prov/deploy/.rev" \
-    && ok ".rev names the source commit, not just its review status" \
-    || bad ".rev has no resolvable revision line: $(sed -n 1p "$WORK/prov/deploy/.rev")"
-  _s=$(shasum -a 256 "$WORK/prov/deploy/secret-scan-pre-commit.sh" | cut -d' ' -f1)
-  grep -q "^sha256:[[:space:]]*$_s\$" "$WORK/prov/deploy/.rev" \
-    && ok ".rev's sha256 is of the bytes actually deployed" \
-    || bad ".rev sha256 does not match the deployed file"
+    || bad ".rev not marked reviewed" "$(cat "$WORK/happy/deploy/.rev")"
+  grep -qE '^rev: +[0-9a-f]{7,} +[^ ]+ +clean' "$WORK/happy/deploy/.rev" \
+    && ok ".rev names the source commit and the state of that file" \
+    || bad ".rev revision line" "$(sed -n 1p "$WORK/happy/deploy/.rev")"
+  # The record must describe the DEPLOYED bytes. A sha256 of $HOOK_SRC passed
+  # the first version of this row in every fixture, because source and copy
+  # were always identical there — and telling them apart is exactly what the
+  # TOCTOU finding turned on.
+  _s=$(shasum -a 256 "$WORK/happy/deploy/secret-scan-pre-commit.sh" | cut -d' ' -f1)
+  _b=$(git hash-object "$WORK/happy/deploy/secret-scan-pre-commit.sh")
+  grep -q "^sha256: *$_s\$" "$WORK/happy/deploy/.rev" \
+    && grep -q "^blob: *$_b\$" "$WORK/happy/deploy/.rev" \
+    && ok ".rev's sha256 AND blob oid are of the bytes actually deployed" \
+    || bad ".rev hashes" "do not match the deployed file"
 else
-  bad "--apply wrote no .rev provenance record"
+  bad "--apply wrote no .rev provenance record" ""
 fi
 
-# The gate that was missing. An unreviewed scanner is the one thing that must
-# not reach 18 repos silently — a weakened detector lives on a branch BEFORE
-# review catches it, which is exactly what happened with #87 and #88.
-printf '\n# local edit\n' >> "$WORK/prov/src/git-hooks/secret-scan-pre-commit.sh"
-_prov_run --apply
-[ -n "$OUT" ] && printf '%s' "$OUT" | grep -q 'REFUSING' \
-  && ok "refuses to deploy a scanner origin/main does not carry" \
-  || bad "deployed an unreviewed scanner: $(printf '%s' "$OUT" | tail -2)"
+printf '== the gate: an unreviewed scanner must not reach 18 repos ==\n'
+_prov_repo diff; _prov_weaken diff
+_prov_run diff --apply
+{ [ "$RC" = 2 ] && ! _prov_landed diff; } \
+  && ok "refuses a scanner origin/main does not carry, and installs nothing" \
+  || bad "unreviewed scanner" "rc=$RC landed=$(_prov_landed diff && echo yes || echo no)"
 printf '%s' "$OUT" | grep -q -- '--allow-unreviewed' \
   && ok "the refusal names the explicit escape hatch" \
-  || bad "refusal does not say how to proceed deliberately"
+  || bad "refusal" "does not say how to proceed deliberately"
+_prov_run diff --apply --allow-unreviewed
+grep -q '^reviewed: *no (differs from origin/main)' "$WORK/diff/deploy/.rev" 2>/dev/null \
+  && ok "--allow-unreviewed deploys and records WHY it was unreviewed" \
+  || bad "escape hatch" "$(grep '^reviewed' "$WORK/diff/deploy/.rev" 2>/dev/null)"
 
-_prov_run --apply --allow-unreviewed
-grep -q '^reviewed: no' "$WORK/prov/deploy/.rev" 2>/dev/null \
-  && ok "--allow-unreviewed deploys but records reviewed=no" \
-  || bad "escape hatch did not record that the source was unreviewed"
+# HOOK-DEPLOY-01: "cannot verify" used to mean "deploy anyway". Three shapes,
+# all reachable without an attacker: a renamed remote, a single-branch clone of
+# a PR branch, and a directory copy with no .git at all.
+printf '== a control that cannot verify its input must not deploy it ==\n'
+_prov_repo rename; _prov_weaken rename
+git -C "$WORK/rename/src" remote rename origin upstream
+_prov_run rename --apply
+{ [ "$RC" = 2 ] && ! _prov_landed rename; } \
+  && ok "a renamed remote refuses rather than deploying 'unknown'" \
+  || bad "renamed remote" "rc=$RC landed=$(_prov_landed rename && echo yes || echo no)"
+printf '%s' "$OUT" | grep -q 'no origin/main to compare' \
+  && ok "and says the reason is that it could not compare" \
+  || bad "renamed remote" "reason not stated: $(printf '%s' "$OUT" | grep -m1 REFUSING)"
 
-# And the report has to SAY so afterwards, because that deployment outlives the
-# branch it came from.
-_prov_run --dry-run
+_prov_repo branchclone
+git -C "$WORK/branchclone/src" switch -qc feature
+printf '\n# WEAKENED on feature\nexit 0\n' >> "$WORK/branchclone/src/git-hooks/secret-scan-pre-commit.sh"
+git -C "$WORK/branchclone/src" commit -qam w
+git -C "$WORK/branchclone/src" push -q origin feature
+git clone -q --single-branch --branch feature "$WORK/branchclone/remote.git" "$WORK/branchclone/clone"
+cp "$INSTALLER" "$WORK/branchclone/clone/install-git-hooks.sh"
+OUT="$(cd "$WORK/branchclone/clone" && CODE_ROOT="$WORK/branchclone/none" \
+  HERDR_HOOK_DEPLOY_DIR="$WORK/branchclone/deploy" bash install-git-hooks.sh --apply 2>&1)"; RC=$?
+{ [ "$RC" = 2 ] && ! _prov_landed branchclone; } \
+  && ok "a single-branch clone of a PR branch refuses" \
+  || bad "single-branch clone" "rc=$RC landed=$(_prov_landed branchclone && echo yes || echo no)"
+
+_prov_repo nogit; _prov_weaken nogit
+cp -R "$WORK/nogit/src" "$WORK/nogit/plain"; rm -rf "$WORK/nogit/plain/.git"
+OUT="$(cd "$WORK/nogit/plain" && CODE_ROOT="$WORK/nogit/none" \
+  HERDR_HOOK_DEPLOY_DIR="$WORK/nogit/deploy" bash install-git-hooks.sh --apply 2>&1)"; RC=$?
+{ [ "$RC" = 2 ] && ! _prov_landed nogit; } \
+  && ok "a source that is not a git checkout at all refuses" \
+  || bad "non-checkout source" "rc=$RC landed=$(_prov_landed nogit && echo yes || echo no)"
+
+# HOOK-DEPLOY-02: git sets GIT_DIR for every hook, alias and `rebase -x`, so an
+# inherited value arrives without an attacker — and it used to make the gate,
+# the record and the VERIFY line all answer about a DIFFERENT repository.
+printf '== the questions must be about the repo the file came from ==\n'
+_prov_repo envA; _prov_weaken envA
+_prov_repo envB
+OUT="$(cd "$WORK/envA/src" && CODE_ROOT="$WORK/envA/none" \
+  HERDR_HOOK_DEPLOY_DIR="$WORK/envA/deploy" \
+  GIT_DIR="$WORK/envB/src/.git" GIT_WORK_TREE="$WORK/envB/src" \
+  bash install-git-hooks.sh --apply 2>&1)"; RC=$?
+{ [ "$RC" = 2 ] && ! _prov_landed envA; } \
+  && ok "an inherited GIT_DIR cannot bless a weakened scanner" \
+  || bad "GIT_DIR" "rc=$RC landed=$(_prov_landed envA && echo yes || echo no): $(printf '%s' "$OUT" | grep -m1 'revision:')"
+# The refusal above holds even WITHOUT the unset, because _src_repo_ok notices
+# that HOOK_SRC is outside the inherited repo — so it cannot tell whether the
+# environment was sanitized. This row can: with GIT_DIR unset the record names
+# envA's real commit; with it honoured, the repo cannot be identified at all.
+_prov_repo envC
+OUT="$(cd "$WORK/envC/src" && CODE_ROOT="$WORK/envC/none" \
+  HERDR_HOOK_DEPLOY_DIR="$WORK/envC/deploy" \
+  GIT_DIR="$WORK/envB/src/.git" GIT_WORK_TREE="$WORK/envB/src" \
+  bash install-git-hooks.sh --apply 2>&1)"; RC=$?
+if [ "$RC" = 0 ] && grep -qE '^rev: +[0-9a-f]{7,}' "$WORK/envC/deploy/.rev" 2>/dev/null; then
+  ok "and the record still names the repo the file came from"
+else
+  bad "GIT_DIR provenance" "rc=$RC rev=$(grep -m1 '^rev:' "$WORK/envC/deploy/.rev" 2>/dev/null)"
+fi
+
+# HOOK-DEPLOY-07: `git diff --quiet HEAD -- <path>` exits 0 both for
+# "unmodified" and for "not in HEAD at all", so an untracked weakened scanner
+# was recorded as `clean` against a commit that did not contain it.
+printf '== the record must not claim more than it knows ==\n'
+_prov_repo untracked
+git -C "$WORK/untracked/src" rm -q --cached git-hooks/secret-scan-pre-commit.sh
+printf 'git-hooks/\n' > "$WORK/untracked/src/.gitignore"
+git -C "$WORK/untracked/src" add .gitignore
+git -C "$WORK/untracked/src" commit -qm ignore
+_prov_run untracked --apply --allow-unreviewed
+grep -qE '^rev: .*(absent-from-HEAD|not a git checkout)' "$WORK/untracked/deploy/.rev" 2>/dev/null \
+  && ok "a scanner absent from HEAD is not recorded as 'clean'" \
+  || bad "provenance state" "$(grep -m1 '^rev:' "$WORK/untracked/deploy/.rev" 2>/dev/null)"
+
+# HOOK-DEPLOY-06: `[ "$(git show ...)" = "$(cat ...)" ]` compares content modulo
+# trailing newlines, because $( ) strips them — the report said "yes" for bytes
+# whose sha256 differed.
+_prov_repo trailing
+printf '\n\n' >> "$WORK/trailing/src/git-hooks/secret-scan-pre-commit.sh"
+_prov_run trailing --apply
+[ "$RC" = 2 ] \
+  && ok "bytes differing only in trailing newlines are NOT 'the reviewed scanner'" \
+  || bad "byte comparison" "rc=$RC — trailing-newline difference treated as identical"
+
+printf '== the report has to say what the fleet is running ==\n'
+_prov_repo drift
+_prov_run drift --apply
+_prov_weaken drift
+_prov_run drift --apply --allow-unreviewed
+_prov_run drift --dry-run
 printf '%s' "$OUT" | grep -q 'matches origin/main: NO' \
   && ok "VERIFY reports a deployed scanner that is not the reviewed one" \
-  || bad "VERIFY stayed silent about a drifted deployment"
-git -C "$WORK/prov/src" checkout -- git-hooks/secret-scan-pre-commit.sh
-_prov_run --apply
-_prov_run --dry-run
+  || bad "VERIFY" "stayed silent about a drifted deployment"
+printf '%s' "$OUT" | grep -qE 'deployed blob [0-9a-f]{7,} vs origin/main [0-9a-f]{7,}' \
+  && ok "and names both blobs, so the drift is checkable by hand" \
+  || bad "VERIFY" "does not identify the two versions"
+git -C "$WORK/drift/src" checkout -- git-hooks/secret-scan-pre-commit.sh
+_prov_run drift --apply
+_prov_run drift --dry-run
 printf '%s' "$OUT" | grep -q 'matches origin/main: yes' \
   && ok "VERIFY confirms a deployment that does match origin/main" \
-  || bad "VERIFY cannot recognise a correct deployment"
+  || bad "VERIFY" "cannot recognise a correct deployment"
 
-# A hand-written or stale .rev must not be believed.
-printf 'rev: bogus\nsha256: 0000\n' > "$WORK/prov/deploy/.rev"
-_prov_run --dry-run
-printf '%s' "$OUT" | grep -q 'STALE RECORD' \
-  && ok "VERIFY catches a .rev describing bytes other than the deployed file" \
-  || bad "a stale .rev was reported as provenance"
+# HOOK-DEPLOY-05: silence in a report whose purpose is answering "what is the
+# fleet running" reads as a pass.
+git -C "$WORK/drift/src" remote remove origin
+_prov_run drift --dry-run
+printf '%s' "$OUT" | grep -q 'matches origin/main: CANNOT TELL' \
+  && ok "with no origin/main, VERIFY says so instead of omitting the line" \
+  || bad "VERIFY" "printed no verdict at all when the ref was unresolvable"
+
+# origin/main is only as fresh as the last fetch, so a match against a stale
+# ref can still mean the fleet runs a pre-fix detector.
+_prov_repo old 60
+_prov_run old --apply
+_prov_run old --dry-run
+printf '%s' "$OUT" | grep -qE 'origin/main here is [0-9]+d old' \
+  && ok "a match against a long-stale origin/main is flagged as stale" \
+  || bad "freshness" "no staleness warning for a 60-day-old ref"
+
+printf '== the deploy TARGET gets the same scrutiny as the source ==\n'
+_prov_repo target
+# A FAKE $HOME, so `$ROOT = $HOME/Code` is true of a fixture tree and not of
+# the real fleet. This row asserts a REFUSAL, which means the moment the guard
+# it tests is mutated away, whatever CODE_ROOT points at gets 3 shims per repo
+# written into it. With the real path that is not a test, it is an outage: it
+# happened here — mutating the deploy-target check rewrote all 54 shims in 18
+# repos to exec a temp dir that no longer existed, and every commit in every
+# repo failed with "No such file or directory" until they were redeployed. A
+# suite row must never be able to reach the live fleet, mutated or not.
+mkdir -p "$WORK/target/home/Code/fixture-repo"
+git init -q "$WORK/target/home/Code/fixture-repo"
+OUT="$(cd "$WORK/target/src" && HOME="$WORK/target/home" CODE_ROOT="$WORK/target/home/Code" \
+  HERDR_HOOK_DEPLOY_DIR="$WORK/target/tmpdeploy" bash install-git-hooks.sh --apply 2>&1)"; RC=$?
+[ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'REFUSING: deploy target' \
+  && ok "a temp deploy dir is refused when CODE_ROOT is the real fleet" \
+  || bad "deploy target" "rc=$RC — 54 shims would exec a path that vanishes"
+_prov_run target --dry-run
+printf '%s' "$OUT" | grep -q "$WORK/target/deploy" \
+  && ok "and the disposable-source note names the real deploy dir" \
+  || bad "note" "hardcodes a path the scanner was not copied to"
+
+printf '%s' "$(bash "$INSTALLER" --help 2>&1)" | grep -q -- '--allow-unreviewed' \
+  && ok "--help documents the escape hatch" \
+  || bad "--help" "the bypass is discoverable only from a refusal message"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
