@@ -156,6 +156,34 @@ verify() {
       *-dirty) echo "    ! the deployed tree has LOCAL EDITS; that sha is not what is running" >&2; fail=1 ;;
     esac
   fi
+  # THE assertion that "the port answers" cannot make: does the process
+  # answering :8600 run the revision that was deployed?
+  #
+  # hub.py exits 0 immediately if the port is already open ("already
+  # serving"), and the omp extension starts a hub FROM THE CHECKOUT on session
+  # start. If such a process holds the port when the deployed job is
+  # bootstrapped, the deployed copy exits on the spot, KeepAlive respawns it
+  # forever, and every check here still passes — probe_http gets its 200,
+  # /api/panes reports connected — served by the stale checkout process.
+  # reload_agent's two-sample pid check is the only other thing that catches
+  # it, and asking the PORT structurally cannot.
+  if [ -d "$HERDR_APP_DIR" ]; then
+    printf "  %-34s " "hub serving the deployed rev"
+    _served="$(curl -s --max-time 5 "http://127.0.0.1:${HERDR_HUB_PORT:-8600}/api/summary" 2>/dev/null \
+               | sed -n 's/.*"rev": *"\([^"]*\)".*/\1/p')"
+    _want="$(app_rev)"
+    if [ -z "$_served" ]; then
+      echo "no answer (hub not serving, or too old to report a rev)" >&2
+    elif [ "$_served" = "$_want" ]; then
+      echo "yes ($_served)"
+    else
+      echo "NO — serving $_served, deployed $_want" >&2
+      echo "    something else holds :8600 (hub.py exits 0 when the port is taken," >&2
+      echo "    and the omp extension starts one from the checkout). Find it:" >&2
+      echo "      lsof -nP -iTCP:${HERDR_HUB_PORT:-8600} -sTCP:LISTEN" >&2
+      fail=1
+    fi
+  fi
   printf "  %-34s " "hub herdr subscription"
   local waited=0 budget="${PROBE_READY_SECS:-20}"
   while :; do

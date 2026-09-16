@@ -128,9 +128,15 @@ OPTIONAL = {"search dev (wrangler) · optional"}  # a dev server being down is n
 # prints it, and /api/summary carries it, because "did the deploy take?" was
 # previously answerable only by timing a page load and inferring.
 def _running_rev() -> str:
+    # `describe --always --dirty`, NOT `rev-parse`: rev-parse cannot see a
+    # modified tree, so this field reported a clean sha for code that was not
+    # that sha. The deploy is force+clean, so dirt can only arrive AFTER a
+    # deploy — i.e. exactly the incident hand-patch case, which is when an
+    # honest answer matters most. `app_rev` in launchd/agent-lib.sh was fixed
+    # for this and the commit message claimed this was too; it was not.
     try:
         out = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent),
-                              "rev-parse", "--short", "HEAD"],
+                              "describe", "--always", "--dirty", "--abbrev=7"],
                              capture_output=True, text=True, timeout=5)
         rev = out.stdout.strip()
     except Exception:
