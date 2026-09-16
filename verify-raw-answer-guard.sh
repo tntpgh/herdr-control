@@ -267,8 +267,12 @@ herdr pane send-keys wN:p7 ENTER"' 'a continuation inside a quoted note is one e
 
 # Why quote state resets per record: an unterminated quote must not make every
 # later line read as quoted.
+# The second line needs a DELIMITER for this to test anything: quote state
+# changes which `;` splits, not how words are read. The first version of this
+# row had no `;`, so the target was found either way and the row passed under
+# its own mutation — it asserted nothing about the reset it was named for.
 want_deny prompting '# do not sweep "
-herdr pane send-keys wN:p7 ENTER' 'an unterminated quote on a comment line does not shield the next line'
+echo ok; herdr pane send-keys wN:p7 ENTER' 'an unterminated quote on one line does not shield a call on the next'
 
 printf '== the sanctioned tools are not denied by it ==\n'
 OUT="$(HERDR_EXTRA_PATH="$WORK/bin" PATH="$WORK/bin:$PATH" HERDR_FAKE_SCREEN="$WORK/prompting.txt" \
