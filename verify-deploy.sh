@@ -198,6 +198,29 @@ printf '%s' "$ARGS" | grep -qE '"/hub\.py"' \
     && bad "HERDR_APP_DIR was empty when rendering — the plist points at /hub.py" \
     || ok "and is not a bare /hub.py from an empty app dir"
 
+printf '== the SERVED rev must equal the DEPLOYED rev ==\n'
+# "the port answers 200" and "the revision I deployed is answering" are
+# different claims. hub.py exits 0 when :8600 is already open, and the omp
+# extension starts a hub from the CHECKOUT on session start — so a stale
+# process holding the port keeps every HTTP check green while serving code
+# nobody deployed. Only comparing the revisions separates the two.
+LIVE_REV="$(curl -s --max-time 5 http://127.0.0.1:8600/api/summary 2>/dev/null \
+            | sed -n 's/.*"rev": *"\([^"]*\)".*/\1/p')"
+REAL_APP="$HOME/.local/share/herdr-control/app"
+if [ -n "$LIVE_REV" ] && [ -d "$REAL_APP" ]; then
+    WANT_REV="$(git -C "$REAL_APP" describe --always --dirty --abbrev=7 2>/dev/null)"
+    [ "$LIVE_REV" = "$WANT_REV" ] \
+        && ok "the hub answering :8600 runs the deployed revision ($LIVE_REV)" \
+        || bad "serving $LIVE_REV but $WANT_REV is deployed — something else holds :8600"
+else
+    printf '  .     no hub serving locally, or no deployed app — skipped\n'
+fi
+# And the field itself must be dirty-aware, or the comparison above cannot see
+# a hand-patched deployed tree.
+grep -q 'describe", "--always", "--dirty"' "$here/hub.py" \
+    && ok "the served rev is dirty-aware (rev-parse cannot see a modified tree)" \
+    || bad "hub.py still reports the rev with rev-parse, which is blind to local edits"
+
 printf '== the plist installed on THIS machine ==\n'
 LIVE_PLIST="$HOME/Library/LaunchAgents/com.herdr-control.hub.plist"
 if [ -f "$LIVE_PLIST" ]; then
