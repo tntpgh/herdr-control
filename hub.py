@@ -162,11 +162,19 @@ class Cached:
     of `/api/summary`, which is the ONLY source for a task whose pane died
     while it was blocked. Those fill inline, where the cost is 3.4ms of noise.
 
-    Nothing refreshes on a timer. A background refresh is only ever kicked BY a
-    read, so an unattended hub makes no network calls at all: `links_data`
-    probes production surfaces, and turning that into an unattended 60s
-    heartbeat would be a behaviour change with external effects nobody asked
-    for.
+    Nothing refreshes on a timer INSIDE this process: a background refresh is
+    only ever kicked by a read. That is deliberate — `links_data` probes
+    production surfaces, and a self-arming heartbeat against them would be an
+    external effect nobody asked for.
+
+    It does NOT follow that an unattended hub is silent, and an earlier draft of
+    this docstring claimed exactly that. The pages serve
+    `<meta http-equiv=refresh content=15>`, so a browser tab left open on `/`
+    IS a reader: it re-reads all four network caches every 15s, all night.
+    Probe volume is unchanged by the stale path — the old inline code fired on
+    the same cadence, driven by the same tab — but "no reader" means no tab
+    open anywhere, which is not the normal state of this machine. A multi-model
+    review pass caught the claim; a curl of the served HTML confirmed it.
     """
 
     def __init__(self, ttl: float, fn, stale_ok: bool = False):
@@ -2008,9 +2016,19 @@ class Handler(BaseHTTPRequestHandler):
             live = live_attention()
             panes = {x["pane_id"] for x in live}
             registry = [t for t in h.get("attention", []) if t.get("pane_id") not in panes]
+            # How much of that count rests on a FALLBACK rather than a live
+            # answer. `/herdr` marks those rows `unconfirmed`, but a consumer
+            # of this endpoint (the omp extension, agent-edge.sh, a future
+            # automation) saw only a number and could not tell the difference
+            # — and with herdr reporting `unknown` for 12 of 14 panes, the
+            # fallback is the NORMAL case, not a rare degradation. A count
+            # whose provenance is invisible is how a control gets trusted
+            # further than it has earned.
+            unconfirmed = sum(1 for t in registry if t.get("state_source") == "stored")
             return self._send(200, "application/json", json.dumps(
                 {"attention": len(live) + len(registry), "live_blocked": len(live),
                  "registry_attention": len(h.get("attention", [])),
+                 "attention_unconfirmed": unconfirmed,
                  "live_connected": live_data().get("connected", False),
                  "open_decisions": f.get("open_count", 0),
                  "open_ids": ",".join(sorted(x["id"] for x in f.get("open", [])))}).encode())

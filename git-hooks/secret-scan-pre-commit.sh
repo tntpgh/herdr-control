@@ -193,19 +193,34 @@ PATTERNS=(
 # shield by naming a field `pubkey`.
 # A name that says PUBLIC, or that names a hash/fingerprint rather than a
 # credential. Anchored in NAME position — the value is never consulted.
-# Deliberately NARROW, in two parts, each anchored in NAME position:
+# Deliberately NARROW, and ONE branch: a name whose "public" sits directly on
+# the key word — pubkey, public_key, myPublicKey. Singular `key` only: the
+# guarded JSON pattern requires a quote immediately after key|secret|token, so
+# a PLURAL `host_pubkeys` never matches it, and an exemption for it was a
+# second dead entry — caught by the reachability check in
+# verify-secret-scan.sh, which exists because the first one was not. NOT any name
+# that merely contains "public": `public_api_token` holding a 40-hex value is a
+# credential with a reassuring name, and an earlier draft exempted it. "token"
+# is absent on purpose — a "public token" is a contradiction, and resolving it
+# in favour of the reassuring word is how this class of mistake happens.
 #
-#   * a name whose "public" sits directly on the key word — pubkey,
-#     public_key, myPublicKey, host_pubkeys. NOT any name that merely contains
-#     "public": `public_api_token` holding a 40-hex value is a credential with
-#     a reassuring name, and an earlier draft of this list exempted it.
-#   * a hash/fingerprint name, with no free-form suffix. `hash_key` is NOT
-#     exempt — an HMAC key in a field named `hash_key` is still an HMAC key.
+# A second branch exempting hash/digest/fingerprint/sha256/etag names was
+# DELETED as unreachable, found by a multi-model review pass and confirmed by
+# probe. The patterns this list guards require the name to END in
+# key|secret|token, so every name that branch exempted — `sha256`, `digest`,
+# `password_hash`, even `token_hash` — never matched them in the first place:
 #
-# "token" appears in neither branch: a "public token" is a contradiction, and
-# resolving it in favour of the reassuring word is how this class of mistake
-# happens.
-PUBLIC_NAME='["\x27]?[A-Za-z0-9_-]*(pub|public)[_-]?keys?["\x27]?[[:space:]]*[=:]|["\x27]?[A-Za-z0-9_-]*(fingerprint|checksum|digest|sha256|sha512|md5|etag|hash)(_?(hex|value|sum))?["\x27]?[[:space:]]*[=:]'
+#     "sha256": "<40 hex>"         pattern matches: 0   scanner: allowed
+#     "password_hash": "<40 hex>"  pattern matches: 0   scanner: allowed
+#     "token_hash": "<40 hex>"     pattern matches: 0   scanner: allowed
+#     "hash_key": "<40 hex>"       pattern matches: 1   scanner: BLOCKED
+#
+# It was dead vocabulary pretending to be a case — the same shape as the
+# `input_required` state removed from ATTENTION earlier the same day — and four
+# suite rows "proving" those names were exempt passed because nothing matched,
+# not because the exemption worked. An exemption that cannot fire is worse than
+# none: it reads as considered coverage.
+PUBLIC_NAME='["\x27]?[A-Za-z0-9_-]*(pub|public)[_-]?key["\x27]?[[:space:]]*[=:]'
 
 is_name_hex() {                 # <pattern> -> 0 if it is one of the two
     [ "$1" = "$PAT_NAME_HEX_UPPER" ] || [ "$1" = "$PAT_NAME_HEX_JSON" ]
