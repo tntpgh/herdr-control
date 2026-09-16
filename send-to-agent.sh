@@ -55,9 +55,9 @@
 set -uo pipefail
 
 # guard-raw-prompt-answer.sh denies a raw keypress that would answer a live
-# prompt. This script IS refuses into a prompting pane — it reaches send-keys only after the
-# checks that guard is protecting — so it marks its own child calls as
-# sanctioned. Not a security boundary (anything able to set this can call
+# prompt. This script REFUSES to submit into a prompting pane (exit 5), so it
+# reaches send-keys only after the checks that guard is protecting — and marks
+# its own child calls as sanctioned. Not a security boundary (anything able to set this can call
 # `herdr pane` directly); it keeps the guard from denying the very tool it
 # points people at.
 export HERDR_SANCTIONED_ANSWER=1

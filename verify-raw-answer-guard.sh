@@ -20,11 +20,23 @@ trap 'rm -rf "$WORK"' EXIT
 # guard shells out to the real prompt-parse.sh, so the screens have to be real
 # shapes: an omp approval panel, and a plain shell prompt.
 mkdir -p "$WORK/bin"
+# IDENTITY-AWARE, because a stub that serves the same screen for ANY pane id
+# lets rows pass for the wrong reason. Review proved exactly that: the
+# sweep-loop row reported ok only because `$p` was accepted as a pane id, while
+# against the real CLI (which exits 1 on an unknown pane) the guard failed
+# open. Here an unknown id exits 1, like herdr.
 cat > "$WORK/bin/herdr" <<'STUB'
 #!/usr/bin/env bash
 # args: pane read <pane> ...
+[ "${1:-}" = pane ] || exit 0
 case "${2:-}" in
-  read) cat "${HERDR_FAKE_SCREEN:?}" ;;
+  read)
+    case "${3:-}" in
+      wN:p7|wN:p8) cat "$WORK_PROMPTING" ;;
+      wF:p3)       cat "$WORK_SHELL" ;;
+      w8:p2H)      cat "$WORK_NUMBERED_PROSE" ;;
+      *)           exit 1 ;;            # unknown pane, same as the real CLI
+    esac ;;
   list) printf '{"result":{"panes":[]}}\n' ;;
   *)    exit 0 ;;
 esac
@@ -50,6 +62,24 @@ cat > "$WORK/shell.txt" <<'SCREEN'
 ❯
 SCREEN
 
+# An agent pane that is NOT prompting but whose last message ends in a numbered
+# list — the shape that caused a ~10% false-denial rate on the live fleet,
+# because prompt_any_visible's numbered fallback matches it while the option
+# parsers return nothing.
+# Faithful to the measured case: prompt_any_visible's loose numbered fallback
+# matches the list, while prompt_options REFUSES it because agent prose follows
+# it (the staleness rule) — so the guard sees "a prompt" that its own parsers
+# will not corroborate. That combination is what produced the live false
+# denials, including on `send-text` to an idle agent.
+cat > "$WORK/numbered.txt" <<'SCREEN'
+  Handoff written. Still needs you:
+  1. review PR #519
+  2. decide on the tourguide trunk
+  I will wait for your call before merging anything else.
+╭── ⠙ 12m · Opus 5 · ~/Code/thurber-os · main ──────────────── 22% ──╮
+╰────────────────────────────────────────────────────────────────────╯
+SCREEN
+
 g() {                                   # <screen> <command> -> rc, out in $OUT
   # HERDR_EXTRA_PATH, not just PATH: config.sh PREPENDS it, so a stub that is
   # only on PATH loses to the real binary and every row here would pass or fail
@@ -57,7 +87,8 @@ g() {                                   # <screen> <command> -> rc, out in $OUT
   # happened while writing this: 16 rows "failed" because the stub was never
   # consulted.)
   OUT="$(HERDR_EXTRA_PATH="$WORK/bin" PATH="$WORK/bin:$PATH" \
-         HERDR_FAKE_SCREEN="$WORK/$1.txt" \
+         WORK_PROMPTING="$WORK/prompting.txt" WORK_SHELL="$WORK/shell.txt" \
+         WORK_NUMBERED_PROSE="$WORK/numbered.txt" WORK="$WORK" \
          HERDR_SANCTIONED_ANSWER= bash "$GUARD" "$2" 2>&1)"
   return $?
 }
@@ -102,8 +133,59 @@ want_deny  prompting 'true && herdr pane send-keys wN:p7 ENTER' 'after && it is 
 want_deny  prompting 'for p in a b; do herdr pane send-keys $p ENTER; done' 'inside a sweep loop (after `do`)'
 want_deny  prompting 'if true; then herdr pane send-keys wN:p7 ENTER; fi'   'after `then`'
 want_deny  prompting 'herdr pane send-keys wN:p7 ENTER # sweeping'          'with a trailing comment'
-want_allow prompting 'git commit -m "send-keys ENTER"'       'a commit message mentioning it is not a call'
+# The full call INSIDE the message, not a fragment: the old fixture omitted
+# `herdr pane` entirely, so it passed even under a guard doing no
+# command-position analysis at all (proved by mutation).
+want_allow prompting 'git commit -m "deny herdr pane send-keys wN:p7 ENTER"' 'a commit message containing the whole call is not a call'
 want_allow prompting 'herdr pane list'                       'other herdr subcommands are untouched'
+
+printf '== every target in the command, and only resolvable ones ==\n'
+# A greedy extractor checked ONE call per command: with two on a line the last
+# won, across newlines the first did, so the prompting pane escaped whenever it
+# sat on the unchecked side. That is a hand-unrolled sweep.
+want_deny prompting 'herdr pane send-keys wF:p3 ENTER && herdr pane send-keys wN:p7 ENTER' \
+  'the prompting pane is caught when it is second'
+want_deny prompting 'herdr pane send-keys wN:p7 ENTER && herdr pane send-keys wF:p3 ENTER' \
+  'and when it is first'
+want_deny prompting 'herdr pane send-keys wN:p7 ENTER
+herdr pane send-keys wF:p3 ENTER' 'and across newlines'
+want_allow shell 'herdr pane send-keys wF:p3 ENTER && herdr pane send-keys wF:p3 2' \
+  'two calls to a non-prompting pane stay allowed'
+
+# Quoting an argument is ordinary hygiene. The quotes used to survive into the
+# pane id, the read failed, and the guard allowed.
+want_deny prompting 'herdr pane send-keys "wN:p7" ENTER'  'a double-quoted pane id is still that pane'
+want_deny prompting "herdr pane send-keys 'wN:p7' ENTER"  'a single-quoted pane id too'
+
+# The sweep shape: the id is not known until the loop runs, so no liveness
+# question can be asked about it. Treating "cannot read that pane" as "not
+# prompting" failed open on the only spelling a real sweep uses.
+want_deny prompting 'for p in wN:p7 wN:p8; do herdr pane send-keys $p ENTER; done' \
+  'a run-time pane id is refused rather than assumed idle'
+want_deny prompting 'echo wN:p7 | xargs -I{} herdr pane send-keys {} ENTER' \
+  'and an xargs placeholder likewise'
+g prompting 'for p in wN:p7 wN:p8; do herdr pane send-keys $p ENTER; done'
+case "$OUT" in
+  *"computed at run time"*) ok 'and the refusal explains why it cannot be checked' ;;
+  *) bad 'ambiguous pane message' "$(printf '%s' "$OUT" | head -2)" ;;
+esac
+
+printf '== a pane that only LOOKS like it is prompting ==\n'
+# prompt_any_visible is the loosest predicate in prompt-parse.sh: its numbered
+# fallback matches an agent's ordinary prose summary. Denying on a "prompt" its
+# own parsers cannot corroborate produced a ~10% false-denial rate on live
+# panes, including send-text to an idle agent - the everyday way to message one.
+want_allow numbered 'herdr pane send-keys w8:p2H ENTER' \
+  'a numbered prose list is not an answerable prompt'
+want_allow numbered "herdr pane send-text w8:p2H 'status?'" \
+  'and messaging that agent is not answering it'
+
+printf '== writing ABOUT the side door is not using it ==\n'
+# Every one of these was DENIED before quoted spans were blanked.
+want_allow prompting 'echo "swept 4 panes; herdr pane send-keys wN:p7 ENTER was how"' \
+  'a note with a semicolon inside the quotes'
+want_allow prompting 'echo "see the note (herdr pane send-keys wN:p7 ENTER)"' \
+  'a parenthesised mention'
 
 printf '== the sanctioned tools are not denied by it ==\n'
 OUT="$(HERDR_EXTRA_PATH="$WORK/bin" PATH="$WORK/bin:$PATH" HERDR_FAKE_SCREEN="$WORK/prompting.txt" \
@@ -133,8 +215,7 @@ case "$OUT" in
 esac
 case "$OUT" in
   *Approve*Deny*|*Deny*Approve*) ok 'and shows the options actually on offer' ;;
-  *"not parseable"*) ok 'or says plainly that it could not read them' ;;
-  *) bad 'denial message' "no option list and no warning: $(printf '%s' "$OUT" | tail -2)" ;;
+  *) bad 'denial message' "no option list: $(printf '%s' "$OUT" | tail -2)" ;;
 esac
 # The command behind the prompt is the reason answering blind is unsafe; a
 # denial that hides it invites the reader to re-approve from memory.

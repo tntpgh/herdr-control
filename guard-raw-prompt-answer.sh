@@ -45,79 +45,140 @@ CMD="${1:-}"
 # than a hostile caller.
 [ "${HERDR_SANCTIONED_ANSWER:-}" = 1 ] && exit 0
 
-# Only `herdr pane send-keys` / `send-text` can answer a prompt, and only when
-# it is the COMMAND being run — not a word inside `echo`, a quoted printf
-# argument, or a commit message. Guessing that with one regex went wrong twice
-# (an over-broad pattern denied an echo; adding shell keywords to it broke the
-# match completely and the suite went from 25 rows passing to 14). So: split on
-# the things that START a command, and ask whether any resulting segment's
-# FIRST WORD is herdr. An over-broad guard on a control like this is not
-# harmless — it teaches the people it nags to route around it.
-printf '%s' "$CMD" \
-  | sed -e 's/#[^"'"'"']*$//' -e 's/&&/\n/g' -e 's/||/\n/g' -e 's/[;&|(){}]/\n/g' \
+# ONE quote-aware pass. Two requirements pull in opposite directions:
+#
+#   `echo "swept 4 panes; herdr pane send-keys wN:p7 ENTER was how"`  must be
+#   ALLOWED — the `;` is inside a string, so it starts no command, and writing
+#   a note about this side door must not be refused (review found every such
+#   note denied, which is the "teaches people to route around it" failure).
+#
+#   `herdr pane send-keys "wN:p7" ENTER` must be DENIED — quoting an argument
+#   is ordinary hygiene, and blanking quoted spans wholesale turned the pane id
+#   into `""`, so the guard allowed it.
+#
+# So the splitter tracks quote state and only breaks on UNQUOTED delimiters,
+# leaving the text of each segment intact. Braces are deliberately not
+# delimiters: `{}` is xargs' placeholder, and splitting on it hid the target.
+_targets=$(printf '%s' "$CMD" | awk '
+  BEGIN { seg = "" }
+  function flush() { if (seg != "") print seg; seg = "" }
+  {
+    line = $0
+    inq = 0; q = ""
+    for (i = 1; i <= length(line); i++) {
+      c = substr(line, i, 1)
+      if (inq) {
+        seg = seg c
+        if (c == q) inq = 0
+        continue
+      }
+      if (c == "\"" || c == "\047") { inq = 1; q = c; seg = seg c; continue }
+      if (c == ";" || c == "&" || c == "|" || c == "(" || c == ")") { flush(); continue }
+      seg = seg c
+    }
+    flush()                                  # a newline ends a command too
+  }
+  END { flush() }' \
   | sed -E 's/[[:space:]](do|then|else)[[:space:]]/\n/g' \
-  | awk '{ if ($1 ~ /(^|\/)herdr$/ && $2 == "pane" && ($3 == "send-keys" || $3 == "send-text")) f = 1 }
-         END { exit !f }' \
-  || exit 0
+  | awk '
+      # herdr need not be the FIRST word: a prefix runner may execute it, and
+      # `xargs -I{} herdr pane send-keys {} ENTER` is a sweep, not an evasion —
+      # review listed it among the shapes that failed open. So skip leading
+      # runner words and their flags, then require herdr at that position.
+      # Anything else (a pipeline whose producer merely mentions herdr, an
+      # `echo`) still does not match, which is what keeps notes allowed.
+      function is_runner(w) {
+        return (w == "xargs" || w == "env" || w == "command" || w == "time" ||
+                w == "nohup" || w == "stdbuf" || w == "nice")
+      }
+      {
+        start = 1
+        while (start <= NF && (is_runner($start) || $start ~ /^-/ || $start ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) start++
+        if ($start ~ /(^|\/)herdr$/ && $(start+1) == "pane" &&
+            ($(start+2) == "send-keys" || $(start+2) == "send-text")) {
+          keys = ""
+          for (i = start + 4; i <= NF; i++) keys = keys (keys == "" ? "" : " ") $i
+          print $(start+2) "\t" $(start+3) "\t" keys
+        }
+      }')
+[ -n "$_targets" ] || exit 0
 
-# Which pane, and which keys? The pane id is the first argument after the
-# subcommand; keys are everything after it.
-read -r sub pane keys <<<"$(printf '%s' "$CMD" \
-  | sed -nE 's/.*pane[[:space:]]+send-(keys|text)[[:space:]]+([^[:space:]]+)[[:space:]]*(.*)$/\1 \2 \3/p')"
-[ -n "${pane:-}" ] || exit 0
-
-# An ANSWERING key is one that commits a choice: Enter (the default option),
-# or a bare digit (the numbered-prompt shape, where the digit IS the answer and
-# no Enter follows). ESC and Ctrl-C cancel, which cannot approve anything, and
-# arrows only move the highlight — all three stay allowed so a caller can still
-# back out of a prompt it stumbled into.
-_answers=0
-case " ${keys:-} " in
-  *[Ee]nter*|*ENTER*|*[Rr]eturn*|*RETURN*) _answers=1 ;;
-esac
-# send-text into a prompting pane is denied OUTRIGHT, whatever the text, which
-# is send-to-agent.sh's own stance (exit 5: "Enter would select its default
-# option"). Deciding from the text is not possible anyway: a trailing newline
-# may arrive as a real newline, as the two characters \n, or be added by the
-# transport, and a bare digit with no newline IS the answer in the numbered
-# shape. The safe rule is the one the repo already uses — do not type into a
-# pane that is asking something.
-[ "$sub" = text ] && _answers=1
-printf '%s' "${keys:-}" | grep -qE '(^|[^0-9A-Za-z])[0-9]([^0-9A-Za-z]|$)' && _answers=1
-[ "$_answers" = 1 ] || exit 0
-
-# Is that pane actually asking something RIGHT NOW? This is the whole point of
-# checking at the tool boundary rather than statically: sending Enter to a pane
-# running a build is ordinary, and sending the same Enter two seconds after a
-# permission panel appeared is answering it.
 # shellcheck source=/dev/null
 [ -r "$here/config.sh" ] && . "$here/config.sh" >/dev/null 2>&1
 # shellcheck source=/dev/null
 . "$here/lib/prompt-parse.sh" >/dev/null 2>&1 || exit 0
-prompt_any_visible "$pane" 2>/dev/null || exit 0
 
-# It is. Deny, and name the accountable path — including the option NUMBER the
-# caller would have to state, because "press whatever is highlighted" is the
-# thing being refused.
-opts=$(prompt_menu_options "$pane" 2>/dev/null || true)
-[ -n "$opts" ] || opts=$(prompt_options "$pane" 2>/dev/null || true)
-# A prompt this guard can SEE but not parse is the most dangerous case to
-# answer blind, so the message says how to look at it rather than leaving the
-# reader with an empty list.
-[ -n "$opts" ] || opts="(not parseable — read it first: herdr pane read $pane --source visible)"
-cat <<EOF
-DENIED: $pane is showing a permission prompt, and this would answer it with a
-raw keypress — accepting whichever option happens to be highlighted, with no
-classifier verdict, no prompt-id check, no pane fingerprint, and no audit
-record. herdr-select.sh exists precisely for this and does all four:
+_deny() {                                 # <pane> <options> <why>
+  cat <<EOF
+DENIED: $3
 
-  $here/herdr-select.sh $pane <option-number> --expect-prompt-id \$(
-      . $here/lib/prompt-parse.sh; prompt_id $pane)
+herdr-select.sh exists precisely for this and does what a keypress cannot: it
+classifies the command behind the prompt (lib/command-policy.sh), refuses if
+the prompt changed since it was read (--expect-prompt-id), refuses if the
+option now means something else, checks the pane has not been RECYCLED by
+another task, and records the decision in an append-only audit trail.
 
-Options currently on offer in $pane:
-$(printf '%s\n' "${opts:-  (could not read the option list — do not answer blind)}" | sed 's/^/  /')
+  $here/herdr-select.sh $1 <option-number> --expect-prompt-id \$(
+      . $here/lib/prompt-parse.sh; prompt_id $1)
 
-To send a MESSAGE to an agent instead of answering its prompt, use
+Options currently on offer in $1:
+$(printf '%s\n' "$2" | sed 's/^/  /')
+
+To send a MESSAGE to an agent rather than answer its prompt, use
 $here/send-to-agent.sh, which refuses rather than submit into a prompting pane.
 EOF
-exit 1
+  exit 1
+}
+
+printf '%s\n' "$_targets" | while IFS=$'\t' read -r sub pane keys; do
+  [ -n "$pane" ] || continue
+  # Ordinary shell hygiene, not evasion: `send-keys "wN:p7" ENTER` kept the
+  # quotes in the extracted token, the pane read failed, and the guard allowed.
+  pane=${pane#[\"\']}; pane=${pane%[\"\']}
+
+  _answers=0
+  case " ${keys:-} " in
+    *[Ee]nter*|*ENTER*|*[Rr]eturn*|*RETURN*) _answers=1 ;;
+  esac
+  # send-text into a prompting pane is denied outright, whatever the text —
+  # send-to-agent.sh's own stance. Deciding from the text is not possible: a
+  # trailing newline may arrive as a real newline, as the two characters \n, or
+  # be added by the transport, and in the numbered shape a bare digit with no
+  # newline IS the answer.
+  [ "$sub" = send-text ] && _answers=1
+  printf '%s' "${keys:-}" | grep -qE '(^|[^0-9A-Za-z])[0-9]([^0-9A-Za-z]|$)' && _answers=1
+  [ "$_answers" = 1 ] || continue
+
+  # An UNRESOLVABLE pane id is the sweep shape this guard exists to stop:
+  # `for p in ...; do herdr pane send-keys $p ENTER; done`. The id is not known
+  # until the loop runs, so no liveness question can be asked about it — and
+  # treating "cannot read that pane" as "not prompting" failed open on the one
+  # spelling a real sweep uses.
+  case "$pane" in
+    *'$'*|*'`'*|'{}'|*'*'*)
+      _deny "$pane" "(pane id is not known until the command runs)" \
+        "the pane id in this command is computed at run time ($pane), so whether it
+is showing a prompt cannot be established before the keys are sent. A sweep
+that answers whatever it finds is the exact shape this guard exists to stop." ;;
+  esac
+
+  prompt_any_visible "$pane" 2>/dev/null || continue
+
+  # A PARSEABLE option list is required before denying. prompt_any_visible is
+  # the loosest predicate in prompt-parse.sh — its numbered fallback matches any
+  # bottom-of-viewport numbered list, which is what an agent's ordinary prose
+  # summary looks like. Review measured a ~10% false-denial rate on live panes:
+  # two idle/done panes were denied over a numbered "Still needs you" list, and
+  # that included `send-text` to an idle agent, the everyday way to message one.
+  # The blocked-vs-idle split was clean, so this costs no true positive.
+  opts=$(prompt_menu_options "$pane" 2>/dev/null || true)
+  [ -n "$opts" ] || opts=$(prompt_options "$pane" 2>/dev/null || true)
+  [ -n "$opts" ] || continue
+
+  _deny "$pane" "$opts" \
+    "$pane is showing a permission prompt, and this would answer it with a raw keypress
+— accepting whichever option happens to be highlighted, with no classifier
+verdict, no prompt-id check, no pane fingerprint, and no audit record."
+done
+_rc=$?
+exit "$_rc"
