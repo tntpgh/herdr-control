@@ -75,11 +75,17 @@ _targets=$(printf '%s' "$CMD" | awk '
       if (c == "\"" || c == "\047") { inq = 1; q = c; seg = seg c; continue }
       if (c == ";" || c == "&" || c == "|" || c == "(" || c == ")") { flush(); continue }
       seg = seg c
+      # `do`/`then`/`else` start a command too — and this must happen INSIDE the
+      # quote-aware pass. Doing it in a later sed with no quote state cut quoted
+      # prose into a bogus command position, and since a computed pane id is now
+      # refused without any liveness check, `echo "the incident: for p in
+      # $panes; do herdr pane send-keys $p ENTER; done"` was denied
+      # deterministically — writing the note about this guard, blocked by it.
+      if (seg ~ /(^|[[:space:]])(do|then|else)[[:space:]]$/) flush()
     }
     flush()                                  # a newline ends a command too
   }
   END { flush() }' \
-  | sed -E 's/[[:space:]](do|then|else)[[:space:]]/\n/g' \
   | awk '
       # herdr need not be the FIRST word: a prefix runner may execute it, and
       # `xargs -I{} herdr pane send-keys {} ENTER` is a sweep, not an evasion —
@@ -164,16 +170,38 @@ that answers whatever it finds is the exact shape this guard exists to stop." ;;
 
   prompt_any_visible "$pane" 2>/dev/null || continue
 
-  # A PARSEABLE option list is required before denying. prompt_any_visible is
-  # the loosest predicate in prompt-parse.sh — its numbered fallback matches any
+  # WHAT COUNTS AS "this pane is asking something" — two predicates, because
+  # one of them alone got it wrong in each direction.
+  #
+  # prompt_any_visible is the loosest: its numbered fallback matches any
   # bottom-of-viewport numbered list, which is what an agent's ordinary prose
-  # summary looks like. Review measured a ~10% false-denial rate on live panes:
-  # two idle/done panes were denied over a numbered "Still needs you" list, and
-  # that included `send-text` to an idle agent, the everyday way to message one.
-  # The blocked-vs-idle split was clean, so this costs no true positive.
+  # summary looks like. Gating on it alone denied two idle panes out of 21 on
+  # the live fleet, including `send-text` to an idle agent — the everyday way to
+  # message one.
+  #
+  # Requiring a PARSEABLE option list fixed that and went one step too far.
+  # _prompt_menu_parse accepts on two different conditions: `visible` once an
+  # Approve row is consumed, `complete` only for a fully-formed panel. A REAL,
+  # live omp panel that the parser can SEE but not enumerate — painted
+  # mid-frame, an extra option row, a theme highlighting two rows — is
+  # any_visible=yes, menu_visible=yes, options=EMPTY (omp panels carry no
+  # digits, so the numbered reader finds nothing either). Treating that as "not
+  # a prompt" allows a blind ENTER into the pane where it is MOST dangerous.
+  # The library fails closed there on purpose; reading fail-closed as no-prompt
+  # inverts it.
+  #
+  # So: a visible MENU PANEL is enough to refuse, parseable or not. The loose
+  # numbered predicate still needs corroboration.
+  _panel=0
+  prompt_menu_visible "$pane" 2>/dev/null && _panel=1
+  [ "$_panel" = 1 ] || prompt_any_visible "$pane" 2>/dev/null || continue
+
   opts=$(prompt_menu_options "$pane" 2>/dev/null || true)
   [ -n "$opts" ] || opts=$(prompt_options "$pane" 2>/dev/null || true)
-  [ -n "$opts" ] || continue
+  if [ -z "$opts" ]; then
+    [ "$_panel" = 1 ] || continue
+    opts="(panel visible but not parseable — read it first: herdr pane read $pane --source visible)"
+  fi
 
   _deny "$pane" "$opts" \
     "$pane is showing a permission prompt, and this would answer it with a raw keypress

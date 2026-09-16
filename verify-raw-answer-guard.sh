@@ -35,6 +35,8 @@ case "${2:-}" in
       wN:p7|wN:p8) cat "$WORK_PROMPTING" ;;
       wF:p3)       cat "$WORK_SHELL" ;;
       w8:p2H)      cat "$WORK_NUMBERED_PROSE" ;;
+      wM:p8)       cat "$WORK_MIDPAINT" ;;    # real panel, options unparseable
+      wM:p9)       cat "$WORK_THREEOPT" ;;    # real panel, extra option row
       *)           exit 1 ;;            # unknown pane, same as the real CLI
     esac ;;
   list) printf '{"result":{"panes":[]}}\n' ;;
@@ -80,6 +82,37 @@ cat > "$WORK/numbered.txt" <<'SCREEN'
 ╰────────────────────────────────────────────────────────────────────╯
 SCREEN
 
+# REAL panels whose options the parser will not enumerate. _prompt_menu_parse
+# accepts `visible` once an Approve row is consumed but `complete` only for a
+# fully-formed panel, so these are menu_visible=yes / options=EMPTY. omp panels
+# carry no digits, so the numbered reader finds nothing either. This is the pane
+# where a blind ENTER is MOST dangerous, and requiring parseable options made
+# the guard allow it.
+cat > "$WORK/midpaint.txt" <<'SCREEN'
+  Running the migration now.
+╭─ Allow tool: bash ───────────────────────────────────────────╮
+│                                                              │
+│ Command: psql -f drop_and_recreate.sql                       │
+│                                                              │
+│  ❯ Approve                                                   │
+│ up/down navigate  enter select  esc cancel                   │
+╰──────────────────────────────────────────────────────────────╯
+SCREEN
+cat > "$WORK/threeopt.txt" <<'SCREEN'
+  Ready to apply.
+╭─ Allow tool: bash ───────────────────────────────────────────╮
+│                                                              │
+│ Command: git push --force origin main                        │
+│                                                              │
+│  ❯ Approve                                                   │
+│    Approve and don't ask again                               │
+│    Deny                                                      │
+│    Deny and stop                                             │
+│                                                              │
+│ up/down navigate  enter select  esc cancel                   │
+╰──────────────────────────────────────────────────────────────╯
+SCREEN
+
 g() {                                   # <screen> <command> -> rc, out in $OUT
   # HERDR_EXTRA_PATH, not just PATH: config.sh PREPENDS it, so a stub that is
   # only on PATH loses to the real binary and every row here would pass or fail
@@ -88,7 +121,8 @@ g() {                                   # <screen> <command> -> rc, out in $OUT
   # consulted.)
   OUT="$(HERDR_EXTRA_PATH="$WORK/bin" PATH="$WORK/bin:$PATH" \
          WORK_PROMPTING="$WORK/prompting.txt" WORK_SHELL="$WORK/shell.txt" \
-         WORK_NUMBERED_PROSE="$WORK/numbered.txt" WORK="$WORK" \
+         WORK_NUMBERED_PROSE="$WORK/numbered.txt" \
+         WORK_MIDPAINT="$WORK/midpaint.txt" WORK_THREEOPT="$WORK/threeopt.txt" WORK="$WORK" \
          HERDR_SANCTIONED_ANSWER= bash "$GUARD" "$2" 2>&1)"
   return $?
 }
@@ -180,12 +214,31 @@ want_allow numbered 'herdr pane send-keys w8:p2H ENTER' \
 want_allow numbered "herdr pane send-text w8:p2H 'status?'" \
   'and messaging that agent is not answering it'
 
+printf '== a panel the parser can SEE but not enumerate ==\n'
+# Requiring a parseable option list fixed a ~10% false-denial rate and then
+# allowed these, which is the wrong direction: the library fails closed on a
+# panel it cannot enumerate, and reading fail-closed as no-prompt inverts it.
+want_deny midpaint 'herdr pane send-keys wM:p8 ENTER' \
+  'a panel painted mid-frame is still a prompt'
+want_deny threeopt 'herdr pane send-keys wM:p9 ENTER' \
+  'a panel with an extra option row is still a prompt'
+g midpaint 'herdr pane send-keys wM:p8 ENTER'
+case "$OUT" in
+  *"not parseable"*) ok 'and the refusal says to read it rather than listing nothing' ;;
+  *) bad 'unparseable panel' "no warning in the denial: $(printf '%s' "$OUT" | tail -2)" ;;
+esac
+
 printf '== writing ABOUT the side door is not using it ==\n'
 # Every one of these was DENIED before quoted spans were blanked.
 want_allow prompting 'echo "swept 4 panes; herdr pane send-keys wN:p7 ENTER was how"' \
   'a note with a semicolon inside the quotes'
 want_allow prompting 'echo "see the note (herdr pane send-keys wN:p7 ENTER)"' \
   'a parenthesised mention'
+# The do/then/else split used to run in a later sed with no quote state, and a
+# computed pane id is refused without any liveness check — so describing the
+# incident was denied deterministically, whatever the fleet was doing.
+want_allow prompting 'echo "the incident: for p in $panes; do herdr pane send-keys $p ENTER; done"' \
+  'prose describing the sweep, quoted, with a do-loop inside'
 
 printf '== the sanctioned tools are not denied by it ==\n'
 OUT="$(HERDR_EXTRA_PATH="$WORK/bin" PATH="$WORK/bin:$PATH" HERDR_FAKE_SCREEN="$WORK/prompting.txt" \
