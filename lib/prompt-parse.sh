@@ -37,10 +37,206 @@ _prompt_window() {
     | tail -n 25
 }
 
+# Is a line AGENT OUTPUT — the positive signal that a prompt above it is gone?
+#
+# FOUR designs were tried against the real screens before this one, and every
+# failure is the reason a line of it exists:
+#
+#   1. a FURNITURE allowlist (box characters, branch:, the mode line). The OMC
+#      bar is box characters interleaved with text and glyphs, so a real prompt
+#      above a real bar went unanswerable — the 2026-08-01 failure reproduced
+#      by the fix for its opposite.
+#   2. bracket expressions holding box characters. In this awk (version
+#      20200816, UTF-8 aware) a class containing a multibyte character matches
+#      EVERY line, including an empty one: `printf 'x' | awk '$0 ~ /[─]/'`
+#      matches. So the rule did not miss the bar — it matched all prose too.
+#      And the byte form was the Latin-1 class [â, ...], not U+2500-257F,
+#      which is why it never fired at all. ANY awk bracket class holding box
+#      characters in this repo is suspect.
+#   3. POSITION alone (ignore the last N lines). Swept across all 14 live
+#      panes at N=0..6, refusals only cleared at N=5 — and exempting five
+#      trailing lines from ever rejecting leaves nothing of the stale half.
+#   4. a word count with a glyph threshold. The bar embeds the terminal TITLE,
+#      so it reads as a sentence: "... Opus ... main ... Fix OMP Load
+#      Warnings, KB Invariant" is seven qualifying words. Two of four agent
+#      panes refused, and the other two passed only because their titles were
+#      short — making answerability depend on what a task is CALLED, which is
+#      worse than a deterministic miss.
+#
+# So: glyphs are detected with index() over real characters, never a bracket
+# class, and the two-line status block at the bottom is exempt by POSITION as
+# well. Together those are what make every live pane answerable.
+#
+# The asymmetry is the design. This gate may fail to REJECT — a stale list is
+# caught downstream by the prompt fingerprint, since herdr-select refuses on a
+# mismatch and the Slack numeric route needs a recorded prompt id — but it may
+# not fail to ASK, because nothing downstream catches an agent nobody can
+# answer.
+#
+# The status block: omp paints a task line plus a two-line bar, Claude Code a
+# mode line, tmux one row. Two is what made all four agent panes answerable at
+# tail 1 and 2 in the live sweep; more than that and the stale half is gone.
+STATUS_TAIL=2
+
+_DECOR='─│┌┐└┘├┤┬┴┼╭╮╯╰═║█▀▄▏▎▋'
+
+_is_prose() {
+  # Any decoration character at all: status bar, panel, rule, progress block.
+  # `index()` on real characters — see design note 2 above.
+  printf '%s\n' "$1" | awk -v g="$_DECOR" '
+    BEGIN { n = split(g, ch, "") }
+    { for (k = 1; k <= n; k++) if (index($0, ch[k])) exit 1
+      exit 0 }' || return 1
+  local words
+  words=$(printf '%s\n' "$1" | awk '{ n = 0
+    for (i = 1; i <= NF; i++) if ($i ~ /^[A-Za-z][A-Za-z-]+$/) n++
+    print n; exit }')
+  [ "${words:-0}" -ge 5 ] || return 1
+  # A navigation footer is a hint, not output. Matching two LITERAL words
+  # (navigate + select) was enumerating footer PHRASINGS — the same open-set
+  # mistake as the furniture list, one noun over. Every one of these was
+  # refused, and any of them would make a live prompt unanswerable in a CLI an
+  # agent happens to run:
+  #
+  #   "Use the arrow keys to move, Enter to choose, Esc to go back"
+  #   "Press Enter to confirm your selection, or Esc to go back"
+  #   "Type a number and press return to answer this question"
+  #   "(Use arrow keys or type a number, then press Enter to submit)"
+  #
+  # So: a KEY NAME paired with a CHOICE VERB. Short hints that are already
+  # under five words ("esc to interrupt", "? for shortcuts") never reach here.
+  local low
+  low="$(printf '%s' "$1" | tr 'A-Z' 'a-z' | sed -E 's/^[^a-z0-9↑↓(?]*//; s/^[[:space:]]+//')"
+  # ANCHORED at the start, because an unanchored pair swallowed real output:
+  # " I have applied it. You can use the arrow keys to navigate the tree."
+  # contains arrow+navigate and is a sentence about what the agent DID. A hint
+  # is imperative — it opens with a key name, an arrow, a bracket, or a verb
+  # telling you to act — while output opens with a subject. That is the only
+  # separation available here: both shapes are the same length and use the
+  # same vocabulary.
+  case "$low" in
+    ↑*|↓*|"("*|"?"*|press*|use*|type*|choose*|hit*|select*|enter*|esc*|escape*|tab*|space*|return*|arrow*|up\ and\ down*)
+      case "$low" in
+        *select*|*choose*|*navigate*|*move*|*confirm*|*cancel*|*submit*|*answer*|*go\ back*|*shortcuts*)
+          return 1 ;;
+      esac ;;
+  esac
+  return 0
+}
+
 prompt_options() {
   local win
   win=$(_prompt_window "$1") || return 1
-  printf '%s\n' "$win" | sed -nE "s/$_OPT_LINE/\1\t\2/p" \
+  # The LAST run of option lines, offered unless AGENT PROSE follows it.
+  #
+  # `!seen[$1]++` over a 25-line window took the first occurrence of each
+  # number ANYWHERE in it, so an already-answered list — or omp's steering
+  # queue painted above a panel — was served as the current choice. That has
+  # hurt twice: numbered-only parsing made every omp alert unanswerable
+  # (2026-08-01), and the numbered-FIRST fix then matched the queue, so a Slack
+  # click on "1" pressed Approve on a command the operator never saw
+  # (slack-bridge/herdr-notify.sh:205-219 carries both). Menu-first ordering
+  # and prompt fingerprints closed the wrong-panel half; this closes the stale
+  # half, in the direction that cannot block a human.
+  #
+  # `[0-9]+[.]` and not `\.`: awk -v STRIPS the backslash, so passing the
+  # sed-style pattern in made awk's notion of an option line looser than the
+  # sed extraction that follows, and post-prompt output like
+  # "249 insertions(+), 18 deletions(-)" was swallowed into the run.
+  local block
+  block=$(printf '%s\n' "$win" | awk -v decor="$_DECOR" '
+    BEGIN { ng = split(decor, ch, "") }
+    { line[NR] = $0; isopt[NR] = ($0 ~ /^[[:space:]]*[❯>]?[[:space:]]*[0-9]+[.][[:space:]]+./) }
+    END {
+      last = 0
+      for (i = NR; i >= 1; i--) if (isopt[i]) { last = i; break }
+      if (!last) exit 0
+      # Walk the run upward through option lines AND their CONTINUATIONS. An
+      # option that wraps ("1. Yes, and remember this decision for the rest of"
+      # / "   the session") used to truncate the run to the suffix, so a
+      # two-choice prompt reached Slack as ONE button and the wrapped option
+      # could not be picked at all. That is the failure mode this gate exists
+      # to avoid — asking a human the wrong question — so a continuation is
+      # joined onto its option rather than ending the run.
+      first = last
+      while (first > 1) {
+        if (isopt[first - 1]) { first--; continue }
+        # an indented non-option line is a continuation only if an OPTION sits
+        # above it; otherwise it is the question, or output, and the run ends.
+        if (line[first - 1] ~ /^[[:space:]]+[^[:space:]]/ && first > 2 && isopt[first - 2]) {
+          first -= 2; continue
+        }
+        break
+      }
+      acc = ""
+      for (i = first; i <= last; i++) {
+        if (isopt[i]) {
+          if (acc != "") print "OPT\t" acc
+          acc = line[i]
+        } else {
+          sub(/^[[:space:]]+/, " ", line[i])
+          acc = acc line[i]          # a wrap is part of the option it follows
+        }
+      }
+      if (acc != "") print "OPT\t" acc
+      # Each AFTER line carries how far it is from the BOTTOM, because the
+      # status block lives there and is not agent output.
+      # dist-from-bottom and whether the line carries DECORATION, so the
+      # caller can size the status block from the screen instead of guessing.
+      for (i = last + 1; i <= NR; i++) {
+        d = 0
+        for (k = 1; k <= ng; k++) if (index(line[i], ch[k])) { d = 1; break }
+        # PRIVATE-USE glyphs by lead byte (U+E000-F8FF -> \356/\357,
+        # plane-15/16 -> \363/\364). omp marks its task-description row with
+        # one, which is how that row is recognised as status rather than
+        # output — it is a sentence by every other measure, and the terminal
+        # TITLE it embeds is what made answerability depend on a task name.
+        if (!d && (index(line[i], "\356") || index(line[i], "\357") \
+                || index(line[i], "\363") || index(line[i], "\364"))) d = 1
+        print "AFTER\t" (NR - i) "\t" d "\t" line[i]
+      }
+    }')
+  [ -n "$block" ] || return 0
+  # The STATUS BLOCK is measured, not assumed: the trailing run of DECORATED
+  # lines (the bar), plus the one line immediately above it (omp's
+  # task-description line, Claude Code's mode line — the title row).
+  #
+  # A fixed count was wrong in both directions. STATUS_TAIL=2 left omp's task
+  # line inside the checked region, and that line embeds the terminal TITLE, so
+  # it reads as a sentence — "<glyph> Fix OMP Load Warnings, KB Invariant" —
+  # and a live prompt above it was REFUSED. Raising the count to cover it then
+  # exempted a real line of output on panes whose status block is one row.
+  # Sizing it from the screen handles both: 3 on an omp pane, 1 on a shell.
+  local decor_run=0 after dist dec text
+  while IFS= read -r after; do
+    case "$after" in
+      AFTER*)
+        after="${after#AFTER	}"
+        dist="${after%%	*}"; after="${after#*	}"
+        dec="${after%%	*}"
+        [ "$dist" -eq "$decor_run" ] && [ "$dec" = 1 ] && decor_run=$((decor_run + 1))
+        ;;
+    esac
+  done < <(printf '%s\n' "$block" | awk -F'\t' '$1=="AFTER"' | sort -t'	' -k2,2n)
+  # Exactly the decorated run. An earlier version added one for "the title
+  # row", which on a pane whose status block is bar-only exempted a genuine
+  # line of output and offered the canonical stale list. The title row is
+  # detected instead (private-use glyph), so it is inside the run when present
+  # and costs nothing when absent.
+  local status_block=$decor_run
+  while IFS= read -r after; do
+    case "$after" in
+      AFTER*)
+        after="${after#AFTER	}"
+        dist="${after%%	*}"; after="${after#*	}"
+        dec="${after%%	*}"; text="${after#*	}"
+        [ "$dist" -ge "$status_block" ] || continue
+        _is_prose "$text" && return 0
+        ;;
+    esac
+  done <<<"$block"
+  printf '%s\n' "$block" | sed -n 's/^OPT\t//p' \
+    | sed -nE "s/$_OPT_LINE/\1\t\2/p" \
     | sed -E 's/[[:space:]]+$//' \
     | awk -F'\t' '!seen[$1]++'   # first occurrence of each number wins
 }

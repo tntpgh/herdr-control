@@ -138,5 +138,134 @@ prompt_any_visible fake:pane \
   && no "any_visible prose" "accepted prose" || ok "prose refused"
 
 echo
+echo "== a NUMBERED list is only offered while it is still the live prompt =="
+# `prompt_options` took the first occurrence of each number anywhere in the
+# bottom 25 lines, so an ANSWERED list — or omp's steering queue painted above
+# a panel — was served as the current choice. That has hurt twice: numbered-only
+# parsing made every omp alert unanswerable (2026-08-01), and the numbered-FIRST
+# fix then matched the queue, so a Slack click on "1" pressed Approve on a
+# command the operator never saw. A screen scrape has exactly one freshness
+# signal: a waiting prompt is the LAST thing painted.
+_prompt_window() { printf '%s\n' "$SCREEN"; }
+
+# The two-line OMC status bar, captured from a live pane. The first version of
+# this gate enumerated furniture and matched NEITHER line, so a real prompt
+# above a real bar produced no options at all — an unanswerable agent.
+BAR=$'╭── ⠙ 34m ▎ Opus 5 ▎ ~/Code/thurber-os ▎ main ▎ 20.71 ───22%───
+╰─                    ─╯'
+SCREEN=$'Do you want to proceed?\n1. Yes\n2. No\n  \u2191/\u2193 navigate \u00b7 enter select\n'"$BAR"
+[ -n "$(prompt_options fake:pane)" ] \
+  && ok "a live list with a navigation footer below it is offered" \
+  || no "live numbered list" "options empty — the footer was read as new output"
+
+# omp's task line is a SENTENCE and the classifier says so — it is exempted by
+# POSITION (the status block is sized from the trailing decorated run plus the
+# title line above it), not by being recognised as decoration. Asserting the
+# classifier called it status was asserting the wrong mechanism.
+_is_prose '  󱊷 Commit the Jacomo fixes and push' \
+  && ok "the task line reads as prose (it is a sentence); position exempts it" \
+  || no "task line classifier" "expected prose, got status"
+
+# The classifier itself, line by line. Three earlier designs each failed
+# against one of these and the caller-level rows could not tell me which:
+# a furniture allowlist missed the bar, private-use byte ranges never fired in
+# BSD awk, and a positional rule swallowed the canonical stale case.
+for _line in \
+  'I have applied the change and moved on to the tests.' \
+  ' Done. Press Enter to send your next message.' \
+  ' I have applied it. You can use the arrow keys to navigate the tree.'; do
+  _is_prose "$_line" && ok "output recognised: ${_line:0:42}" \
+    || no "prose classifier" "missed output: $_line"
+done
+for _line in \
+  '  ↑/↓ navigate · enter select · esc cancel' \
+  '⏵⏵ auto-accept edits on' \
+  'branch: main' \
+  '  249 insertions(+), 18 deletions(-)' \
+  '╭── ⠙ 34m ▎ Opus 5 ▎ ~/Code/x ▎ main ▎ 20.71 ──22%──' \
+  ; do
+  _is_prose "$_line" && no "prose classifier" "status read as output: $_line" \
+    || ok "status recognised: ${_line:0:42}"
+done
+
+SCREEN=$'Choose:\n1. Alpha\n2. Beta\n\u23f5\u23f5 auto-accept edits on'
+[ -n "$(prompt_options fake:pane)" ] \
+  && ok "a live list above Claude Code's mode line is offered" \
+  || no "mode line" "options empty — the mode line was read as new output"
+
+SCREEN=$'Q?\n1. Yes\n2. No\n  ⫷⫷ x\n'"  󱊷 Commit the Jacomo fixes and push"$'\n'"$BAR"
+[ -n "$(prompt_options fake:pane)" ] \
+  && ok "and above omp's task line, which is prose by any word count" \
+  || no "task line" "options empty — omp panes would be unanswerable"
+
+# Footer PHRASINGS are an open set too — matching the two literal words
+# navigate+select was the furniture mistake one noun over. Every line below was
+# REFUSED by that version, and any of them would make a live prompt
+# unanswerable in whatever CLI an agent happens to run inside a pane.
+for _f in \
+  '  ↑/↓ navigate · enter select · esc cancel' \
+  '  ? for shortcuts' \
+  '  Context left until auto-compact: 23%' \
+  '  ⏵⏵ auto-accept edits on (shift+tab to cycle)' \
+  '  esc to interrupt' \
+  '  Use the arrow keys to move, Enter to choose, Esc to go back' \
+  '  Press Enter to confirm your selection, or Esc to go back' \
+  '  Press up and down to move between the options' \
+  '  Type a number and press return to answer this question' \
+  '  Choose one of the options above with the arrow keys' \
+  '  (Use arrow keys or type a number, then press Enter to submit)'; do
+  SCREEN=$'Proceed?\n1. Yes\n2. No\n'"$_f"$'\n'"$BAR"
+  [ "$(prompt_options fake:pane | grep -c .)" -eq 2 ] \
+    && ok "offered below: $(printf '%s' "$_f" | cut -c1-44)" \
+    || no "footer phrasing" "REFUSED below: $_f"
+done
+
+# A WRAPPED option must arrive whole. This is the one failure in this file that
+# asks a human the WRONG question rather than failing to ask: the run was
+# strictly contiguous option lines, so an indented continuation truncated the
+# list to its suffix — a two-choice prompt reached Slack as ONE button, and the
+# option that wrapped could not be picked at all.
+SCREEN=$'Proceed?\n1. Yes, and remember this decision for the rest of\n   the session\n2. No\n'"$BAR"
+_opts="$(prompt_options fake:pane)"
+[ "$(printf '%s' "$_opts" | grep -c .)" -eq 2 ] \
+  && ok "a wrapped option does not truncate the list" \
+  || no "wrapped option" "got [$(printf '%s' "$_opts" | tr '\n' '|')]"
+case "$_opts" in
+  *"rest of the session"*) ok "and its continuation is joined onto it" ;;
+  *) no "wrapped option text" "continuation lost: [$(printf '%s' "$_opts" | tr '\n' '|')]" ;;
+esac
+
+SCREEN=$'Choose:\n1. Alpha\n2. Beta\nbranch: main'
+[ -n "$(prompt_options fake:pane)" ] \
+  && ok "and above an OMC branch line" \
+  || no "branch line" "options empty — the branch line was read as new output"
+
+SCREEN=$'1. Yes\n2. No\n I have applied the change and moved on to the tests.\n'"$BAR"
+[ -z "$(prompt_options fake:pane)" ] \
+  && ok "a list the agent has already moved past is NOT offered" \
+  || no "stale numbered list" "offered [$(prompt_options fake:pane | tr '\n' '|')]"
+
+# The steering-queue case is guarded by ORDER, not by this parser: every caller
+# tries prompt_menu_options FIRST (slack-bridge/herdr-notify.sh:229,
+# herdr-select.sh:166), so on a screen with a real approval panel the menu
+# parse consumes it and the queue is never consulted. `prompt_options` cannot
+# distinguish them itself — the panel below the queue is box furniture, and
+# rejecting box furniture would refuse every live prompt painted above a status
+# bar, which is the 2026-08-01 unanswerable failure. So this asserts the
+# property that actually holds.
+FIXTURE="$(printf '1. Conductor: review auth\n2. Conductor: fix nightly\n%s' "$(panel 1 2 Approve)")"
+SCREEN="$FIXTURE"
+[ -n "$(prompt_menu_options fake:pane)" ] \
+  && ok "menu-first ordering consumes a panel, so a queue above it is never offered" \
+  || no "queue above panel" "the menu parse missed a real panel; the queue would be used"
+
+SCREEN=$'old question\n1. A\n2. B\nnew question\n1. X\n2. Y\n❯'
+case "$(prompt_options fake:pane | tr '\n' ' ')" in
+  *X*Y*) ok "with two lists on screen, only the newest is offered" ;;
+  *) no "two lists" "offered [$(prompt_options fake:pane | tr '\n' '|')]" ;;
+esac
+unset -f _prompt_window
+
+echo
 printf 'pass=%s fail=%s\n' "$pass" "$fail"
 [ "$fail" = 0 ]
