@@ -186,7 +186,12 @@ DEFAULT_STALE_MAX = 30.0
 # could start — and readers past the staleness ceiling launched PARALLEL inline
 # probes instead of waiting. Bounding the fill closes both without a second
 # mechanism.
-FILL_BUDGET_S = 25.0
+# 70s, not 25: `kb_data` shells out with `timeout=40` and `loops_data` opens by
+# reading `kb`, so it inherits that. A budget below the slowest HONEST fill
+# disowns healthy refreshes and duplicates them — the opposite of the problem
+# it exists to solve. It must exceed the longest legitimate fill, and every
+# fill's own timeouts must be what bounds it: 40s (kb) + headroom.
+FILL_BUDGET_S = 70.0
 
 # ── tiny TTL cache: each source is fetched at most once per window ─────────────
 class Cached:
@@ -298,9 +303,11 @@ class Cached:
             # `_fill` already swallows Exception, so only a BaseException
             # (an interpreter teardown, a KeyboardInterrupt) reaches here.
             # Without clearing the flag it latches True and the cache freezes
-            # on a stale value with no further refresh EVER.
+            # on a stale value with no further refresh EVER — but only clear it
+            # if this thread still owns it, for the same reason as below.
             with self.lock:
-                self.refreshing = False
+                if gen == self.gen:
+                    self.refreshing = False
             raise
         # ONE lock block for both writes. A `finally` that cleared the flag
         # before the value write left a window — two lock acquisitions wide,
@@ -312,8 +319,13 @@ class Cached:
         # duplicate authenticated 50-page walk. Narrow, but it falsified the
         # one-refresh-in-flight invariant the suite asserts.
         with self.lock:
-            self.refreshing = False
-            if gen == self.gen:  # else invalidated mid-flight: snapshot is stale
+            # Clear the flag ONLY if this thread still owns it. A refresh that
+            # was disowned for outrunning the budget used to clear the flag on
+            # its way out — releasing the ownership of the REPLACEMENT refresh,
+            # so the next reader started a third concurrent probe. Measured at
+            # 3 sweeps of every production surface for one expiry.
+            if gen == self.gen:
+                self.refreshing = False
                 self.val, self.at = val, time.monotonic()
 
     def get(self):
@@ -360,7 +372,11 @@ class Cached:
                         time.sleep(0.05); waited += 0.05
                     finally:
                         self.lock.acquire()
-                if not self.refreshing and time.monotonic() - self.at <= self.ttl:
+                # Freshness ONLY — not `not self.refreshing`. On a budget
+                # timeout the flag can still be set while the value HAS been
+                # refreshed, and gating on it sent every queued reader on to
+                # its own probe (measured: 3 fills for 2 readers).
+                if time.monotonic() - self.at <= self.ttl:
                     return self.val          # the in-flight refresh answered it
             self.val = self._fill()
             self.at = time.monotonic()

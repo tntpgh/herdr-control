@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -814,6 +815,73 @@ class CacheFreshness(unittest.TestCase):
                          "the disowned refresh's late value overwrote the live one")
         self.assertEqual(len(fills), 2,
                          "breaking the lease must allow exactly one new attempt")
+
+    def test_a_disowned_refresh_does_not_release_the_replacement_lease(self):
+        # `_refresh` cleared `refreshing` unconditionally, so a thread disowned
+        # for outrunning the budget released the REPLACEMENT refresh's
+        # ownership on its way out — and the next reader started a THIRD
+        # concurrent probe. For `links` that is every production surface, three
+        # times, for one expiry.
+        fills, gates = [], []
+
+        def slow():
+            g = threading.Event()
+            gates.append(g)
+            fills.append(1)
+            g.wait(10)
+            return {"n": len(fills)}
+
+        c = hub.Cached(1, slow, stale_ok=True, name="loops")
+        c.val, c.at = {"n": 0}, time.monotonic() - 2
+        c.get()                                      # refresh A
+        time.sleep(0.1)
+        c.refresh_started = time.monotonic() - hub.FILL_BUDGET_S - 1
+        c.get()                                      # disowns A, starts B
+        time.sleep(0.1)
+        self.assertEqual(len(fills), 2, "expected exactly A and B")
+        gates[0].set()                               # A returns, disowned
+        time.sleep(0.3)
+        self.assertTrue(c.refreshing,
+                        "the disowned refresh released B's lease")
+        c.get()
+        time.sleep(0.1)
+        self.assertEqual(len(fills), 2,
+                         f"a third probe started for one expiry ({len(fills)} fills)")
+        for g in gates:
+            g.set()
+
+    def test_the_post_wait_recheck_asks_about_freshness_not_the_flag(self):
+        """A SOURCE-level check, and it says so.
+
+        Gating the post-wait recheck on `not self.refreshing` sent every queued
+        reader on to its own probe when the wait ended on a budget timeout with
+        the flag still set (review measured 3 fills for 2 readers, 2 with the
+        conjunct dropped). The behavioural version of this assertion needs the
+        fill to land inside a window measured in tenths of a second, and a
+        flaky row in a suite that gates deploys is worse than a source check
+        that states its own weakness. What must hold is that the recheck asks
+        only whether the VALUE is fresh.
+        """
+        src = Path(__file__).with_name("hub.py").read_text()
+        recheck = [l for l in src.splitlines()
+                   if "time.monotonic() - self.at <= self.ttl" in l and "return self.val" not in l]
+        self.assertTrue(recheck, "the post-wait freshness recheck is gone entirely")
+        self.assertFalse(any("self.refreshing" in l for l in recheck),
+                         "the post-wait recheck consults the in-flight flag; on a budget "
+                         "timeout every queued reader will probe again")
+
+    def test_the_fill_budget_exceeds_the_slowest_honest_fill(self):
+        # kb_data shells out with timeout=40 and loops_data reads kb, so it
+        # inherits that. A budget below the slowest legitimate fill disowns
+        # HEALTHY refreshes and duplicates them — the opposite of the problem
+        # the budget exists to solve. Asserted against the real timeout in the
+        # source, so lowering either one without the other goes red.
+        src = Path(__file__).with_name("hub.py").read_text()
+        subprocess_timeouts = [float(m) for m in re.findall(r"timeout=(\d+)\)", src)]
+        self.assertTrue(subprocess_timeouts, "no fill timeouts found to compare against")
+        self.assertGreater(hub.FILL_BUDGET_S, max(subprocess_timeouts),
+                           "the fill budget is below a fill's own timeout; healthy "
+                           "refreshes will be disowned and duplicated")
 
     def test_a_past_bound_reader_waits_for_an_in_flight_refresh(self):
         # For `links` a duplicate fill means probing every production surface

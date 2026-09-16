@@ -148,20 +148,43 @@ echo "== a NUMBERED list is only offered while it is still the live prompt =="
 # signal: a waiting prompt is the LAST thing painted.
 _prompt_window() { printf '%s\n' "$SCREEN"; }
 
-SCREEN=$'Approve this command?\n1. Yes\n2. No\n  ↑/↓ navigate · enter select · esc cancel\n❯'
+# The two-line OMC status bar, captured from a live pane. The first version of
+# this gate enumerated furniture and matched NEITHER line, so a real prompt
+# above a real bar produced no options at all — an unanswerable agent.
+BAR=$'\u256d\u2500\u2500 \uf0d5 7 \ue0b1 Opus 5 \ue0b1 ~/Code/thurber-os \ue0b1 main \ue0b1 20.71 \ue0b0\u2500\u250022%\u2500\u2500\n\u2570\u2500                    \u2500\u256f'
+SCREEN=$'Do you want to proceed?\n1. Yes\n2. No\n  \u2191/\u2193 navigate \u00b7 enter select\n'"$BAR"
 [ -n "$(prompt_options fake:pane)" ] \
   && ok "a live list with a navigation footer below it is offered" \
   || no "live numbered list" "options empty — the footer was read as new output"
 
-SCREEN=$'1. Yes\n2. No\n I have applied the change and moved on to the tests.\n❯'
+SCREEN=$'Choose:\n1. Alpha\n2. Beta\n\u23f5\u23f5 auto-accept edits on'
+[ -n "$(prompt_options fake:pane)" ] \
+  && ok "a live list above Claude Code's mode line is offered" \
+  || no "mode line" "options empty — the mode line was read as new output"
+
+SCREEN=$'Choose:\n1. Alpha\n2. Beta\nbranch: main'
+[ -n "$(prompt_options fake:pane)" ] \
+  && ok "and above an OMC branch line" \
+  || no "branch line" "options empty — the branch line was read as new output"
+
+SCREEN=$'1. Yes\n2. No\n I have applied the change and moved on to the tests.\n'"$BAR"
 [ -z "$(prompt_options fake:pane)" ] \
   && ok "a list the agent has already moved past is NOT offered" \
   || no "stale numbered list" "offered [$(prompt_options fake:pane | tr '\n' '|')]"
 
-SCREEN=$'1. Conductor: review auth\n2. Conductor: fix nightly\n╭────────────╮\n│ Approve it │\n╰────────────╯\n  ↑/↓ navigate · enter select\n❯'
-[ -z "$(prompt_options fake:pane)" ] \
-  && ok "a steering QUEUE above a live panel is not mistaken for the choices" \
-  || no "queue above panel" "offered [$(prompt_options fake:pane | tr '\n' '|')]"
+# The steering-queue case is guarded by ORDER, not by this parser: every caller
+# tries prompt_menu_options FIRST (slack-bridge/herdr-notify.sh:229,
+# herdr-select.sh:166), so on a screen with a real approval panel the menu
+# parse consumes it and the queue is never consulted. `prompt_options` cannot
+# distinguish them itself — the panel below the queue is box furniture, and
+# rejecting box furniture would refuse every live prompt painted above a status
+# bar, which is the 2026-08-01 unanswerable failure. So this asserts the
+# property that actually holds.
+FIXTURE="$(printf '1. Conductor: review auth\n2. Conductor: fix nightly\n%s' "$(panel 1 2 Approve)")"
+SCREEN="$FIXTURE"
+[ -n "$(prompt_menu_options fake:pane)" ] \
+  && ok "menu-first ordering consumes a panel, so a queue above it is never offered" \
+  || no "queue above panel" "the menu parse missed a real panel; the queue would be used"
 
 SCREEN=$'old question\n1. A\n2. B\nnew question\n1. X\n2. Y\n❯'
 case "$(prompt_options fake:pane | tr '\n' ' ')" in

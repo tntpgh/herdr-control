@@ -37,50 +37,92 @@ _prompt_window() {
     | tail -n 25
 }
 
-# Lines that are screen FURNITURE rather than agent output: box rules, the
-# composer arrow, omp/OMC status lines, a tmux status bar, spinners. Used to
-# decide whether anything has happened SINCE an option list was painted.
-_FURNITURE='^[[:space:]]*([─═│┌┐└┘├┤┬┴┼╭╮╰╯]+|[❯>]|branch:|\[OMC#|⏵|\[[a-z0-9-]+:|[✻✳✽✶✢✷✸✹✺·*][[:space:]].*)[[:space:]]*$'
-# A NAVIGATION FOOTER is furniture too, and this one is load-bearing: the
-# footer is painted BELOW the options and is the very thing that says the menu
-# is live (_menu_gate requires "navigate" and "select" in the window). Treating
-# it as new output would reject every highlight menu — the 2026-08-01 failure,
-# where numbered-only parsing made omp alerts unanswerable, in reverse.
-_NAV_FOOTER='([Nn]avigate|[↑↓]|[Ee]nter to|[Ee]sc to|[Ss]pace to|[Tt]ab to)'
+# Is a line AGENT OUTPUT — the positive signal that a prompt above it is gone?
+#
+# The first version of this gate enumerated FURNITURE and offered a list only
+# if everything below it matched. Review proved that backwards on this machine:
+# the OMC status bar that ends every live pane matched none of the patterns, so
+# a real prompt spliced above a real bar produced NO options where the old
+# parser produced both — the 2026-08-01 unanswerable-agent failure, reproduced.
+# Furniture is an OPEN set (every TUI's status bar, every future version), and
+# enumerating it fails toward REFUSING a live prompt.
+#
+# The costs are not symmetric. Refusing a live prompt blocks a human
+# immediately, totally, with nothing downstream to catch it. Offering a stale
+# list is caught downstream: herdr-select.sh refuses on a prompt-fingerprint
+# mismatch and the Slack numeric route requires a recorded prompt id, so a
+# click on a vanished prompt is rejected rather than pressed. So this gate now
+# offers BY DEFAULT and rejects only on a positive signal.
+#
+# That signal is PROSE: five or more alphabetic words. An agent that has moved
+# on says so in sentences. Status bars, box rules, navigation footers and stat
+# lines are not sentences — and anything carrying box-drawing or powerline
+# glyphs is excluded outright, which is what makes a status bar of any design
+# safe rather than a pattern someone has to have predicted.
+_is_prose() {
+  # No apostrophe in any character class: this program lives inside a
+  # single-quoted shell string, and an earlier draft embedded one, which ended
+  # the quote and silently turned the whole matcher into garbage — it answered
+  # "no" for every input, including plain sentences, so the gate never rejected
+  # anything. Caught by testing the helper directly rather than the caller.
+  printf '%s\n' "$1" | awk '
+    # box-drawing, block and powerline glyphs: never prose, whatever the design
+    /[\xe2\x94-\xe2\x95]/                                { print "no"; exit }
+    /[\xee\x82]/                                          { print "no"; exit }
+    {
+      low = tolower($0)
+      # a navigation footer is a hint, not output. TWO tokens, the same shape
+      # _menu_gate already requires, so a sentence that merely contains
+      # "navigate" cannot pass as a footer.
+      if ((low ~ /navigate/ || low ~ /arrow keys/) && (low ~ /select/ || low ~ /cancel/)) {
+        print "no"; exit
+      }
+      n = 0
+      for (i = 1; i <= NF; i++) if ($i ~ /^[A-Za-z][A-Za-z-]+$/) n++
+      print (n >= 5) ? "yes" : "no"
+      exit
+    }'
+}
 
 prompt_options() {
   local win
   win=$(_prompt_window "$1") || return 1
-  # The LAST run of option lines, and only if nothing but furniture follows it.
+  # The LAST run of option lines, offered unless AGENT PROSE follows it.
   #
   # `!seen[$1]++` over a 25-line window took the first occurrence of each
-  # number ANYWHERE in it, so a numbered list that was already answered — or
-  # omp's steering queue painted above the panel — was offered as the current
-  # choice. That has hurt twice: on 2026-08-01 numbered-only parsing made every
-  # omp alert unanswerable, and the fix's numbered-FIRST ordering then matched
-  # the queue, so a Slack click on "1" pressed Approve on a command the
-  # operator never saw (slack-bridge/herdr-notify.sh:205-219 carries both).
-  # Menu-first ordering and prompt fingerprints closed the wrong-panel half;
-  # this closes the stale half.
+  # number ANYWHERE in it, so an already-answered list — or omp's steering
+  # queue painted above a panel — was served as the current choice. That has
+  # hurt twice: numbered-only parsing made every omp alert unanswerable
+  # (2026-08-01), and the numbered-FIRST fix then matched the queue, so a Slack
+  # click on "1" pressed Approve on a command the operator never saw
+  # (slack-bridge/herdr-notify.sh:205-219 carries both). Menu-first ordering
+  # and prompt fingerprints closed the wrong-panel half; this closes the stale
+  # half, in the direction that cannot block a human.
   #
-  # "Nothing after it" is the only freshness signal a screen scrape has. A
-  # prompt is the last thing painted while it is waiting; once the agent moves
-  # on, its own output lands below. Bottom-anchoring establishes LOCATION —
-  # this establishes that the location is still the live one.
-  printf '%s\n' "$win" | awk -v opt="$_OPT_LINE" -v furn="$_FURNITURE" -v nav="$_NAV_FOOTER" '
-    { line[NR] = $0; isopt[NR] = ($0 ~ opt); isfurn[NR] = ($0 ~ furn || $0 ~ nav) }
+  # `[0-9]+[.]` and not `\.`: awk -v STRIPS the backslash, so passing the
+  # sed-style pattern in made awk's notion of an option line looser than the
+  # sed extraction that follows, and post-prompt output like
+  # "249 insertions(+), 18 deletions(-)" was swallowed into the run.
+  local block
+  block=$(printf '%s\n' "$win" | awk '
+    { line[NR] = $0; isopt[NR] = ($0 ~ /^[[:space:]]*[❯>]?[[:space:]]*[0-9]+[.][[:space:]]+./) }
     END {
-      # walk back to the end of the last option run
       last = 0
       for (i = NR; i >= 1; i--) if (isopt[i]) { last = i; break }
       if (!last) exit 0
-      # anything but furniture after it means the prompt is no longer current
-      for (i = last + 1; i <= NR; i++) if (!isfurn[i]) exit 0
-      # the run itself: contiguous option lines ending at `last`
       first = last
       while (first > 1 && isopt[first - 1]) first--
-      for (i = first; i <= last; i++) print line[i]
-    }' \
+      for (i = first; i <= last; i++) print "OPT\t" line[i]
+      for (i = last + 1; i <= NR; i++) print "AFTER\t" line[i]
+    }')
+  [ -n "$block" ] || return 0
+  local after
+  while IFS= read -r after; do
+    case "$after" in
+      AFTER*) [ "$(_is_prose "${after#AFTER	}")" = yes ] && return 0 ;;
+    esac
+  done <<<"$block"
+  printf '%s\n' "$block" | sed -n 's/^OPT\t//p' \
     | sed -nE "s/$_OPT_LINE/\1\t\2/p" \
     | sed -E 's/[[:space:]]+$//' \
     | awk -F'\t' '!seen[$1]++'   # first occurrence of each number wins
