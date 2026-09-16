@@ -375,7 +375,7 @@ _prov_run diff --apply
 printf '%s' "$OUT" | grep -q -- '--allow-unreviewed' \
   && ok "the refusal names the explicit escape hatch" \
   || bad "refusal" "does not say how to proceed deliberately"
-_prov_run diff --apply --allow-unreviewed=suite-fixture=suite-fixture
+_prov_run diff --apply --allow-unreviewed=suite-fixture
 grep -q '^reviewed: *no (differs from refs/remotes/origin/main)' "$WORK/diff/deploy/.rev" 2>/dev/null \
   && ok "--allow-unreviewed deploys and records WHY it was unreviewed" \
   || bad "escape hatch" "$(grep '^reviewed' "$WORK/diff/deploy/.rev" 2>/dev/null)"
@@ -452,7 +452,7 @@ git -C "$WORK/untracked/src" rm -q --cached git-hooks/secret-scan-pre-commit.sh
 printf 'git-hooks/\n' > "$WORK/untracked/src/.gitignore"
 git -C "$WORK/untracked/src" add .gitignore
 git -C "$WORK/untracked/src" commit -qm ignore
-_prov_run untracked --apply --allow-unreviewed=suite-fixture=suite-fixture
+_prov_run untracked --apply --allow-unreviewed=suite-fixture
 grep -qE '^rev: .*(absent-from-HEAD|not a git checkout)' "$WORK/untracked/deploy/.rev" 2>/dev/null \
   && ok "a scanner absent from HEAD is not recorded as 'clean'" \
   || bad "provenance state" "$(grep -m1 '^rev:' "$WORK/untracked/deploy/.rev" 2>/dev/null)"
@@ -471,7 +471,7 @@ printf '== the report has to say what the fleet is running ==\n'
 _prov_repo drift
 _prov_run drift --apply
 _prov_weaken drift
-_prov_run drift --apply --allow-unreviewed=suite-fixture=suite-fixture
+_prov_run drift --apply --allow-unreviewed=suite-fixture
 _prov_run drift --dry-run
 printf '%s' "$OUT" | grep -q 'matches origin/main: NO' \
   && ok "VERIFY reports a deployed scanner that is not the reviewed one" \
@@ -597,6 +597,100 @@ fi
 # corroboration; the remaining exposure is a writer that wins the race AND
 # leaves the deployed file byte-identical to what it judged, which is not a
 # state anyone can exploit.
+
+printf '== identity is decided by BYTES, not by a path-sensitive hash ==\n'
+# `git hash-object` applies gitattributes, BY PATH — so the snapshot
+# (…sh.new.$$) and the installed file (…sh) hashed differently while being
+# byte-identical, as soon as a `text`/`eol` attribute was reachable. A global
+# attributes file is enough; the repo needs none. Review measured both
+# consequences: a scanner identical to the reviewed one REFUSED as "differs
+# from refs/remotes/origin/main", and — past the gate — the post-condition
+# firing on an untouched deploy, leaving the scanner live with NO record while
+# `cmp` called the bytes identical. This fixture is also the deterministic rc=5
+# probe I could not construct: no race, no seam.
+_prov_repo attrs
+# core.autocrlf OFF so the blob stores the CRLF bytes verbatim: the point of the
+# fixture is that the committed bytes and the worktree bytes are IDENTICAL while
+# `git hash-object` disagrees about them depending on the file's name. (First
+# attempt got this wrong — the machine's global autocrlf normalised the blob to
+# LF, so the bytes really did differ and refusing was correct.)
+git -C "$WORK/attrs/src" config core.autocrlf false
+printf 'line1\r\nline2\r\n#!/usr/bin/env bash\r\nexit 0\r\n' > "$WORK/attrs/src/git-hooks/secret-scan-pre-commit.sh"
+git -C "$WORK/attrs/src" add -A >/dev/null
+git -C "$WORK/attrs/src" commit -qm crlf
+git -C "$WORK/attrs/src" push -q origin HEAD:refs/heads/main
+git -C "$WORK/attrs/src" fetch -q origin
+printf '*.sh text\n' > "$WORK/attrs/attributes"
+printf '[core]\n\tattributesFile = %s\n' "$WORK/attrs/attributes" > "$WORK/attrs/gitconfig"
+OUT="$(cd "$WORK/attrs/src" && GIT_CONFIG_GLOBAL="$WORK/attrs/gitconfig" \
+  CODE_ROOT="$WORK/attrs/none" HERDR_HOOK_DEPLOY_DIR="$WORK/attrs/deploy" \
+  bash install-git-hooks.sh --apply 2>&1)"; RC=$?
+{ [ "$RC" = 0 ] && _prov_landed attrs; } \
+  && ok "a scanner identical to the anchor deploys even under a text attribute" \
+  || bad "attribute sensitivity" "rc=$RC — a good scanner was refused: $(printf '%s' "$OUT" | grep -m1 -E 'REFUS|VOUCH')"
+grep -q '^reviewed: *yes' "$WORK/attrs/deploy/.rev" 2>/dev/null \
+  && ok "and is recorded as reviewed rather than blaming the remote" \
+  || bad "attribute sensitivity" "$(grep -m1 reviewed "$WORK/attrs/deploy/.rev" 2>/dev/null)"
+# the post-condition must not fire on a correct deploy either
+printf '%s' "$OUT" | grep -q 'REFUSING TO VOUCH' \
+  && bad "post-condition" "fired on an untouched deploy (attribute-sensitive comparison)" \
+  || ok "and the live-bytes post-condition does not fire on it"
+
+printf '== the record cannot be written by the thing it records ==\n'
+# The reason string went into .rev verbatim, and both consumers asked
+# `grep -q '^reviewed: *yes'` ANYWHERE in the file — so a newline in the reason
+# forged a `reviewed: yes` line and silenced every unreviewed warning on a
+# record that simultaneously said `reviewed: no`.
+_prov_repo forge; _prov_weaken forge
+_prov_run forge --apply "--allow-unreviewed=hotfix
+reviewed:   yes"
+[ "$(grep -c '^reviewed:' "$WORK/forge/deploy/.rev" 2>/dev/null)" = 1 ] \
+  && ok "a newline in the reason cannot add a second reviewed: line" \
+  || bad "record forgery" "$(grep -c '^reviewed:' "$WORK/forge/deploy/.rev" 2>/dev/null) reviewed: lines"
+_prov_run forge --dry-run
+printf '%s' "$OUT" | grep -q 'UNREVIEWED DEPLOYMENT' \
+  && ok "and the unreviewed headline still fires" \
+  || bad "record forgery" "the warning was suppressed"
+_prov_run forge --apply
+printf '%s' "$OUT" | grep -q 'live deployment is UNREVIEWED' \
+  && ok "as does the refusal path's live-state warning" \
+  || bad "record forgery" "refusal path silenced"
+
+# `--allow-unreviewed=` — one keystroke past the bare form — set the flag with
+# an empty reason and recorded "(none given)", defeating the whole point of
+# requiring one.
+for _bad_reason in "" "   "; do
+  _prov_run forge --apply "--allow-unreviewed=$_bad_reason"
+  { [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'needs a REASON'; } \
+    && ok "--allow-unreviewed='$_bad_reason' is refused too" \
+    || bad "empty reason" "rc=$RC accepted an empty reason"
+done
+
+printf '== a dry run is read-only ==\n'
+# judge_snapshot used to mkdir the LIVE deploy dir and write
+# secret-scan-pre-commit.sh.new.<pid> beside the fleet's scanner, immediately
+# after printing "nothing will be changed".
+_prov_repo dryro
+rm -rf "$WORK/dryro/deploy"
+_prov_run dryro --dry-run
+[ -d "$WORK/dryro/deploy" ] \
+  && bad "dry run" "created the deploy directory" \
+  || ok "a dry run does not create the deploy directory"
+_prov_run dryro --apply
+_prov_run dryro --dry-run
+[ -z "$(find "$WORK/dryro/deploy" -name '*.new.*' 2>/dev/null)" ] \
+  && ok "and leaves no snapshot beside the live scanner" \
+  || bad "dry run" "left $(find "$WORK/dryro/deploy" -name '*.new.*')"
+
+# An unusable deadline used to SKIP the expiry check, so an unreviewed
+# deployment silently never expired.
+_prov_repo noddl; _prov_weaken noddl
+_prov_run noddl --apply --allow-unreviewed=deadline-test
+sed -i.bak 's/^expires:.*/expires:    not-a-date/' "$WORK/noddl/deploy/.rev"
+_prov_run noddl --dry-run
+printf '%s' "$OUT" | grep -q 'NO USABLE DEADLINE' \
+  && ok "an unparseable deadline is treated as expired, not skipped" \
+  || bad "expiry" "a bad deadline silently disabled the check"
 
 printf '== a dry run must preview the one decision --apply makes ==\n'
 # The gate lived inside the install path, so --dry-run said NOTHING about
