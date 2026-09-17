@@ -400,7 +400,7 @@ printf 'x = 1\n' > "$R/app.py"
 git -C "$R" add app.py
 blocks "$R" "a commit authored as the wrong account is blocked"
 scan "$R"
-printf '%s' "$OUT" | grep -q "$WANT_EMAIL" \
+grep -q "$WANT_EMAIL" <<<"$OUT" \
     && ok "the identity refusal names the expected address" \
     || bad "identity refusal is not actionable: $OUT"
 
@@ -465,7 +465,7 @@ SIDE="$(git -C "$R" rev-parse HEAD)"
 git -C "$R" switch -q main
 git -C "$R" cherry-pick "$SIDE" >/dev/null 2>&1
 refuses_push "$R" "a CHERRY-PICKED secret is refused at push"
-printf '%s' "$OUT" | grep -q "rotate at the provider" \
+grep -q "rotate at the provider" <<<"$OUT" \
     && ok "the push refusal says to rotate FIRST" \
     || bad "push refusal is not actionable: $OUT"
 
@@ -578,7 +578,7 @@ if OUT="$(git -C "$A" push --force origin main 2>&1)"; then
 else
     ok "a force push whose remote tip is unknown locally is refused"
 fi
-printf '%s' "$OUT" | grep -q "git fetch" \
+grep -q "git fetch" <<<"$OUT" \
     && ok "and the refusal names the fix (git fetch)" \
     || bad "refusal has no compliant path: $OUT"
 if git -C "$BARE" log -p --all 2>/dev/null | grep -q "$GHP"; then
@@ -643,7 +643,7 @@ printf '++contact = "%s"\n' "$BADPHONE" > "$R/lead.diff"
 git -C "$R" add lead.diff
 git -C "$R" commit -qm "patch-shaped PII" --no-verify
 refuses_push "$R" "and the PII half sees it too"
-printf '%s' "$OUT" | grep -qE "in commit [0-9a-f]{7}" \
+grep -qE "in commit [0-9a-f]{7}" <<<"$OUT" \
     && ok "the PII refusal names the COMMIT to rewrite" \
     || bad "PII refusal does not say which commit: $OUT"
 

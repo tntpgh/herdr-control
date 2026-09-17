@@ -813,7 +813,17 @@ if [ -r "$HOOK_DEPLOY" ]; then
     echo "      since it was recorded, so what it resembles now proves nothing."
     echo "      redeploy from a checkout on main:  bash $0 --apply"
   elif [ "$_main_oid" = "$_dep_oid" ]; then
-    echo "    matches origin/main: yes"
+    # "yes" here means "this is the checkout of the reviewed blob", which under
+    # normalising attributes is NOT the same claim as "the bytes are identical".
+    # Say which one is being made, so nobody reads filter-equivalence as byte
+    # identity — the report is the surface this whole change exists to provide.
+    if git -C "$here" cat-file blob "$MAIN_REF:$_TRACKED" 2>/dev/null | cmp -s - "$HOOK_DEPLOY"; then
+      echo "    matches origin/main: yes (byte-identical to the reviewed blob)"
+    else
+      echo "    matches origin/main: yes (this checkout of the reviewed blob;"
+      echo "      the bytes differ from the blob by this repo's line-ending"
+      echo "      attributes, which is what git itself calls unmodified)"
+    fi
     # origin/main is only as fresh as the last fetch, so "yes" against a stale
     # ref can still mean the fleet is running a pre-fix detector.
     _md=$(git -C "$here" log -1 --format=%ct "$MAIN_REF" 2>/dev/null)

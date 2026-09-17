@@ -22,6 +22,20 @@ pass=0 fail=0
 ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 
+# `has …` IS A FLAKY ASSERTION under `set -o pipefail`,
+# which this file sets. `grep -q` exits the instant it matches and closes the
+# pipe; if printf has not finished writing it takes EPIPE and exits non-zero,
+# and pipefail then makes the WRITER's failure the pipeline's verdict — so a
+# row prints FAIL for a property that holds. Review reproduced it from a
+# pristine clone: three runs gave 98/0, 97/1, 98/0, with
+# `printf: write error: Broken pipe` on the line above the FAIL. I had seen it
+# once and blamed my own harness; that was wrong, and it was 48 rows wide.
+#
+# A herestring has no writer process to fail, so these cannot flake.
+has()  { grep -q  "$@" <<<"$OUT"; }       # literal / BRE
+hase() { grep -qE "$@" <<<"$OUT"; }       # ERE
+shown() { grep -m1 "$@" <<<"$OUT"; }      # first match, for failure messages
+
 # The SOURCE of truth in the repo...
 TRACKED="$here/git-hooks/secret-scan-pre-commit.sh"
 # ...and where --apply DEPLOYS it, which is what the shims must exec. Pointing
@@ -103,7 +117,7 @@ before="$(cat "$R_EXPANDED/.git/hooks/pre-commit")"
 run --dry-run
 [ "$(cat "$R_EXPANDED/.git/hooks/pre-commit")" = "$before" ] \
     && ok "a dry run leaves hook files byte-identical" || bad "dry run wrote to disk"
-printf '%s' "$OUT" | grep -q 'DRY RUN' && ok "says it is a dry run" || bad "silent about being a dry run"
+has 'DRY RUN' && ok "says it is a dry run" || bad "silent about being a dry run"
 run                          # no arguments at all
 [ "$(cat "$R_EXPANDED/.git/hooks/pre-commit")" = "$before" ] \
     && ok "NO ARGUMENTS is a dry run, not an install" || bad "bare invocation mutated 18 repos' worth of hooks"
@@ -168,27 +182,27 @@ run --apply
 grep -q '^exit 0' "$R_HOME/.git/hooks/pre-push" \
     && ok "a hook that only mentions the scanner is left alone, not clobbered" \
     || bad "overwrote a hook this script did not write"
-printf '%s' "$OUT" | grep -q 'shim-home/pre-push .*has its OWN hook' \
+has 'shim-home/pre-push .*has its OWN hook' \
     && ok "and is reported as foreign rather than silently accepted" \
-    || bad "an unrecognised pre-push was not reported: $(printf '%s' "$OUT" | grep pre-push)"
+    || bad "an unrecognised pre-push was not reported: $(grep pre-push)"
 # VERIFY prints counts, not a per-repo verdict for the healthy cases, so the
 # observable is the bucket: a repo whose pre-push we do not recognise must
 # land OUTSIDE "on the TRACKED scanner". Other fixtures are fully tracked, so
 # this asserts the not-tracked bucket is non-empty rather than a global zero.
-printf '%s' "$OUT" | grep -qE 'untracked ~/\.claude copy: *[1-9]' \
+hase 'untracked ~/\.claude copy: *[1-9]' \
     && ok "and the repo is NOT counted as covered" \
-    || bad "counted a repo with an unrecognised pre-push as fully tracked: $(printf '%s' "$OUT" | grep -E 'TRACKED|untracked')"
+    || bad "counted a repo with an unrecognised pre-push as fully tracked: $(hase 'TRACKED|untracked')"
 # ... and it gets its OWN bucket, not the "untracked ~/.claude copy" one. That
 # label reads as coverage and there is none: the untracked scanner never had a
 # push mode, so git am / cherry-pick / revert / rebase replays in that repo
 # reach the remote unscanned. Review carried this forward as a LOW; it becomes
 # real the first time someone writes a repo-local pre-push.
-printf '%s' "$OUT" | grep -qE 'OWN PRE-PUSH: shim-home' \
+hase 'OWN PRE-PUSH: shim-home' \
     && ok "a repo with its own pre-push is named, not filed under coverage" \
-    || bad "no OWN PRE-PUSH line: $(printf '%s' "$OUT" | grep -E 'OWN|untracked')"
-printf '%s' "$OUT" | grep -qE 'OWN pre-push \(no push scan\): *[1-9]' \
+    || bad "no OWN PRE-PUSH line: $(hase 'OWN|untracked')"
+hase 'OWN pre-push \(no push scan\): *[1-9]' \
     && ok "and counted in a bucket whose name says its push path is unscanned" \
-    || bad "the own-pre-push counter did not move: $(printf '%s' "$OUT" | grep -E 'OWN|untracked')"
+    || bad "the own-pre-push counter did not move: $(hase 'OWN|untracked')"
 # Restore a correct shim for the rest of the suite.
 run --apply >/dev/null 2>&1 || true
 rm -f "$R_HOME/.git/hooks/pre-push"
@@ -204,7 +218,7 @@ fi
 [ ! -e "$R_REDIR/.git/hooks/pre-commit" ] \
     && ok "and NOTHING was written to the dir git ignores" \
     || bad "installed a hook git will never run (.git/hooks with hooksPath set)"
-printf '%s' "$OUT" | grep -q 'core.hooksPath ->' \
+has 'core.hooksPath ->' \
     && ok "the redirect is reported, not silently followed" \
     || bad "followed a hooksPath redirect without saying so"
 
@@ -226,7 +240,7 @@ grep -q 'lint-only' "$R_NONE/.git/hooks/pre-commit" && [ ! -e "$R_NONE/.git/hook
 [ ! -e "$ROOT/a-worktree/.git/hooks" ] \
     && ok "a linked worktree is skipped (its hooks dir is the parent's)" \
     || bad "wrote hooks into a worktree"
-printf '%s' "$OUT" | grep -q 'worktree — covered by its parent' \
+has 'worktree — covered by its parent' \
     && ok "and says so rather than staying silent" || bad "worktree skipped without explanation"
 
 printf '== idempotence ==\n'
@@ -244,9 +258,9 @@ run --apply
 on_disk=$(find "$ROOT" -type f \
           \( -name pre-commit -o -name pre-merge-commit -o -name pre-push \) \
           -exec grep -lF "$DEPLOYED" {} + 2>/dev/null | wc -l | tr -d ' ')
-printf '%s' "$OUT" | grep -q "changed=0 unchanged=$on_disk" \
+has "changed=0 unchanged=$on_disk" \
     && ok "re-run reports 0 changed and $on_disk already correct" \
-    || bad "re-run counts wrong (expected unchanged=$on_disk): $(printf '%s' "$OUT" | grep 'this run')"
+    || bad "re-run counts wrong (expected unchanged=$on_disk): $(grep 'this run')"
 # The backup must still be the ORIGINAL hook, not this script's own output —
 # otherwise --undo restores an install instead of undoing one.
 grep -qF 'secret-scan-pre-commit.sh' "$R_TILDE/.git/hooks/pre-commit$(printf '.pre-herdr-guard')" \
@@ -291,7 +305,7 @@ printf '== refusals ==\n'
 run --nonsense; rc=$?
 [ "$rc" = 2 ] && ok "an unknown option exits 2 rather than guessing" || bad "unknown option rc=$rc"
 OUT="$(CODE_ROOT="$ROOT" bash "$INSTALLER" --help 2>&1)"; rc=$?
-[ "$rc" = 0 ] && printf '%s' "$OUT" | grep -q -- '--undo' \
+[ "$rc" = 0 ] && has -- '--undo' \
     && ok "--help documents --undo" || bad "help output unusable"
 # A scanner that does not parse must never be pointed at 18 repos: it would fail
 # every commit and teach --no-verify, which is how a guard stops guarding.
@@ -372,7 +386,7 @@ _prov_run diff --apply
 { [ "$RC" = 2 ] && ! _prov_landed diff; } \
   && ok "refuses a scanner origin/main does not carry, and installs nothing" \
   || bad "unreviewed scanner" "rc=$RC landed=$(_prov_landed diff && echo yes || echo no)"
-printf '%s' "$OUT" | grep -q -- '--allow-unreviewed' \
+has -- '--allow-unreviewed' \
   && ok "the refusal names the explicit escape hatch" \
   || bad "refusal" "does not say how to proceed deliberately"
 _prov_run diff --apply --allow-unreviewed=suite-fixture
@@ -390,9 +404,9 @@ _prov_run rename --apply
 { [ "$RC" = 2 ] && ! _prov_landed rename; } \
   && ok "a renamed remote refuses rather than deploying 'unknown'" \
   || bad "renamed remote" "rc=$RC landed=$(_prov_landed rename && echo yes || echo no)"
-printf '%s' "$OUT" | grep -q 'no refs/remotes/origin/main to compare' \
+has 'no refs/remotes/origin/main to compare' \
   && ok "and says the reason is that it could not compare" \
-  || bad "renamed remote" "reason not stated: $(printf '%s' "$OUT" | grep -m1 REFUSING)"
+  || bad "renamed remote" "reason not stated: $(shown REFUSING)"
 
 _prov_repo branchclone
 git -C "$WORK/branchclone/src" switch -qc feature
@@ -427,7 +441,7 @@ OUT="$(cd "$WORK/envA/src" && CODE_ROOT="$WORK/envA/none" \
   bash install-git-hooks.sh --apply 2>&1)"; RC=$?
 { [ "$RC" = 2 ] && ! _prov_landed envA; } \
   && ok "an inherited GIT_DIR cannot bless a weakened scanner" \
-  || bad "GIT_DIR" "rc=$RC landed=$(_prov_landed envA && echo yes || echo no): $(printf '%s' "$OUT" | grep -m1 'revision:')"
+  || bad "GIT_DIR" "rc=$RC landed=$(_prov_landed envA && echo yes || echo no): $(shown 'revision:')"
 # The refusal above holds even WITHOUT the unset, because _src_repo_ok notices
 # that HOOK_SRC is outside the inherited repo — so it cannot tell whether the
 # environment was sanitized. This row can: with GIT_DIR unset the record names
@@ -473,16 +487,16 @@ _prov_run drift --apply
 _prov_weaken drift
 _prov_run drift --apply --allow-unreviewed=suite-fixture
 _prov_run drift --dry-run
-printf '%s' "$OUT" | grep -q 'matches origin/main: NO' \
+has 'matches origin/main: NO' \
   && ok "VERIFY reports a deployed scanner that is not the reviewed one" \
   || bad "VERIFY" "stayed silent about a drifted deployment"
-printf '%s' "$OUT" | grep -qE 'deployed blob [0-9a-f]{7,} vs origin/main [0-9a-f]{7,}' \
+hase 'deployed blob [0-9a-f]{7,} vs origin/main [0-9a-f]{7,}' \
   && ok "and names both blobs, so the drift is checkable by hand" \
   || bad "VERIFY" "does not identify the two versions"
 git -C "$WORK/drift/src" checkout -- git-hooks/secret-scan-pre-commit.sh
 _prov_run drift --apply
 _prov_run drift --dry-run
-printf '%s' "$OUT" | grep -q 'matches origin/main: yes' \
+has 'matches origin/main: yes' \
   && ok "VERIFY confirms a deployment that does match origin/main" \
   || bad "VERIFY" "cannot recognise a correct deployment"
 
@@ -490,7 +504,7 @@ printf '%s' "$OUT" | grep -q 'matches origin/main: yes' \
 # fleet running" reads as a pass.
 git -C "$WORK/drift/src" remote remove origin
 _prov_run drift --dry-run
-printf '%s' "$OUT" | grep -q 'matches origin/main: CANNOT TELL' \
+has 'matches origin/main: CANNOT TELL' \
   && ok "with no origin/main, VERIFY says so instead of omitting the line" \
   || bad "VERIFY" "printed no verdict at all when the ref was unresolvable"
 
@@ -499,7 +513,7 @@ printf '%s' "$OUT" | grep -q 'matches origin/main: CANNOT TELL' \
 _prov_repo old 60
 _prov_run old --apply
 _prov_run old --dry-run
-printf '%s' "$OUT" | grep -qE 'origin/main here is [0-9]+d old' \
+hase 'origin/main here is [0-9]+d old' \
   && ok "a match against a long-stale origin/main is flagged as stale" \
   || bad "freshness" "no staleness warning for a 60-day-old ref"
 
@@ -646,14 +660,14 @@ if [ -n "$_blobsz" ] && [ "$_blobsz" != "$_wtsz" ] && [ -z "$(git -C "$WORK/eoln
   _prov_run eolnorm --apply
   { [ "$RC" = 0 ] && _prov_landed eolnorm && grep -q '^reviewed: *yes' "$WORK/eolnorm/deploy/.rev"; } \
     && ok "and a pristine normalising checkout DEPLOYS instead of refusing forever" \
-    || bad "normalising checkout" "rc=$RC refused a clean checkout: $(printf '%s' "$OUT" | grep -m1 REFUSING)"
+    || bad "normalising checkout" "rc=$RC refused a clean checkout: $(shown REFUSING)"
   grep -qE '^rev: .* clean' "$WORK/eolnorm/deploy/.rev" 2>/dev/null \
     && ok "and the record calls that file clean, as git does" \
     || bad "normalising checkout" "$(grep -m1 '^rev:' "$WORK/eolnorm/deploy/.rev" 2>/dev/null)"
   _prov_run eolnorm --dry-run
-  printf '%s' "$OUT" | grep -q 'matches origin/main: yes' \
+  has 'matches origin/main: yes' \
     && ok "and VERIFY agrees with the gate instead of contradicting it" \
-    || bad "VERIFY" "disagrees under normalisation: $(printf '%s' "$OUT" | grep -m1 'matches origin')"
+    || bad "VERIFY" "disagrees under normalisation: $(shown 'matches origin')"
 else
   ok "(skipped: this git does not normalise the fixture — nothing to assert)"
 fi
@@ -675,6 +689,24 @@ _prov_run eoldirty --apply
 # the report had not. The invariant asserted here is the one that matters and
 # does not depend on which direction the attribute pushes: the report's verdict
 # must AGREE with the record the gate wrote.
+# "matches origin/main: yes" means two different things depending on the repo,
+# and the report should say which: byte-identical to the reviewed blob, or the
+# checkout of it under this repo's line-ending attributes. Conflating them is
+# how filter-equivalence gets read as byte identity.
+printf '== the report says WHICH claim it is making ==\n'
+_prov_repo claim
+_prov_run claim --apply
+_prov_run claim --dry-run
+has 'byte-identical to the reviewed blob' \
+  && ok "an ordinary deployment is called byte-identical" \
+  || bad "claim wording" "$(shown 'matches origin/main')"
+if [ -d "$WORK/eolnorm/deploy" ]; then
+  _prov_run eolnorm --dry-run
+  has 'this checkout of the reviewed blob' \
+    && ok "and a normalising checkout is called the checkout of it, not byte-identical" \
+    || bad "claim wording" "$(shown 'matches origin/main')"
+fi
+
 printf '== a stale deployed file cannot also be reported as matching ==\n'
 # Review drove the provenance line to a false YES: a deployed file that had
 # DRIFTED (same text, CRLF) normalised to the anchor's OID under a text
@@ -685,15 +717,38 @@ _prov_repo stale
 _prov_run stale --apply
 printf '\n# drifted after deployment\n' >> "$WORK/stale/deploy/secret-scan-pre-commit.sh"
 _prov_run stale --dry-run
-printf '%s' "$OUT" | grep -q 'STALE RECORD' \
+has 'STALE RECORD' \
   && ok "a deployed file modified after deployment is reported stale" \
   || bad "stale detection" "no STALE RECORD line"
-printf '%s' "$OUT" | grep -q 'matches origin/main: yes' \
+has 'matches origin/main: yes' \
   && bad "contradiction" "the same block says STALE RECORD and matches origin/main: yes" \
   || ok "and the provenance line refuses to vouch rather than contradicting it"
-printf '%s' "$OUT" | grep -q 'CANNOT VOUCH' \
+has 'CANNOT VOUCH' \
   && ok "saying so in words, with the redeploy command" \
-  || bad "stale reporting" "$(printf '%s' "$OUT" | grep -m1 'matches origin')"
+  || bad "stale reporting" "$(shown 'matches origin')"
+
+# THE GATE, MEASURED RATHER THAN REASONED. I shipped `--path` saying the gate
+# was attribute-immune "by construction, not by measurement", because my
+# fixtures did not diverge. Review built the one that does: global
+# core.autocrlf=input plus attributes `*.sh -text` with a CRLF scanner. Under
+# it the current code deploys reviewed=yes, and dropping `--path "$_TRACKED"`
+# REFUSES with "differs from refs/remotes/origin/main" and installs nothing.
+printf '== the path-aware gate has measurable teeth ==\n'
+_prov_repo teeth
+git -C "$WORK/teeth/src" config core.autocrlf false
+printf '#!/usr/bin/env bash\r\nexit 0\r\n' > "$WORK/teeth/src/git-hooks/secret-scan-pre-commit.sh"
+git -C "$WORK/teeth/src" add -A >/dev/null
+git -C "$WORK/teeth/src" commit -qm crlf
+git -C "$WORK/teeth/src" push -qf origin HEAD:refs/heads/main
+git -C "$WORK/teeth/src" fetch -q origin
+printf '*.sh -text\n' > "$WORK/teeth/attributes"
+printf '[core]\n\tattributesFile = %s\n\tautocrlf = input\n' "$WORK/teeth/attributes" > "$WORK/teeth/gitconfig"
+OUT="$(cd "$WORK/teeth/src" && GIT_CONFIG_GLOBAL="$WORK/teeth/gitconfig" \
+  CODE_ROOT="$WORK/teeth/none" HERDR_HOOK_DEPLOY_DIR="$WORK/teeth/deploy" \
+  bash install-git-hooks.sh --apply 2>&1)"; RC=$?
+{ [ "$RC" = 0 ] && _prov_landed teeth && grep -q '^reviewed: *yes' "$WORK/teeth/deploy/.rev"; } \
+  && ok "under autocrlf=input + '*.sh -text', the path-aware gate accepts the reviewed scanner" \
+  || bad "path-aware gate" "rc=$RC — $(shown -E 'REFUSING|VOUCH')"
 
 printf '== the report must agree with the gate ==\n'
 _prov_repo agree
@@ -718,8 +773,8 @@ _agree_run --apply --allow-unreviewed=consistency-fixture
 if [ -r "$WORK/agree/deploy/.rev" ]; then
   _rec_reviewed=$(sed -n 's/^reviewed:[[:space:]]*//p' "$WORK/agree/deploy/.rev" | head -1 | awk '{print $1}')
   _agree_run --dry-run
-  if printf '%s' "$OUT" | grep -q 'matches origin/main: yes'; then _rep=yes
-  elif printf '%s' "$OUT" | grep -q 'matches origin/main: NO'; then _rep=no
+  if has 'matches origin/main: yes'; then _rep=yes
+  elif has 'matches origin/main: NO'; then _rep=no
   else _rep=cannot-tell; fi
   [ "$_rec_reviewed" = "$_rep" ] \
     && ok "under a global text attribute, VERIFY ($_rep) agrees with the recorded verdict ($_rec_reviewed)" \
@@ -740,11 +795,11 @@ reviewed:   yes"
   && ok "a newline in the reason cannot add a second reviewed: line" \
   || bad "record forgery" "$(grep -c '^reviewed:' "$WORK/forge/deploy/.rev" 2>/dev/null) reviewed: lines"
 _prov_run forge --dry-run
-printf '%s' "$OUT" | grep -q 'UNREVIEWED DEPLOYMENT' \
+has 'UNREVIEWED DEPLOYMENT' \
   && ok "and the unreviewed headline still fires" \
   || bad "record forgery" "the warning was suppressed"
 _prov_run forge --apply
-printf '%s' "$OUT" | grep -q 'live deployment is UNREVIEWED' \
+has 'live deployment is UNREVIEWED' \
   && ok "as does the refusal path's live-state warning" \
   || bad "record forgery" "refusal path silenced"
 
@@ -753,7 +808,7 @@ printf '%s' "$OUT" | grep -q 'live deployment is UNREVIEWED' \
 # requiring one.
 for _bad_reason in "" "   "; do
   _prov_run forge --apply "--allow-unreviewed=$_bad_reason"
-  { [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'needs a REASON'; } \
+  { [ "$RC" = 2 ] && has 'needs a REASON'; } \
     && ok "--allow-unreviewed='$_bad_reason' is refused too" \
     || bad "empty reason" "rc=$RC accepted an empty reason"
 done
@@ -780,7 +835,7 @@ _prov_repo noddl; _prov_weaken noddl
 _prov_run noddl --apply --allow-unreviewed=deadline-test
 sed -i.bak 's/^expires:.*/expires:    not-a-date/' "$WORK/noddl/deploy/.rev"
 _prov_run noddl --dry-run
-printf '%s' "$OUT" | grep -q 'NO USABLE DEADLINE' \
+has 'NO USABLE DEADLINE' \
   && ok "an unparseable deadline is treated as expired, not skipped" \
   || bad "expiry" "a bad deadline silently disabled the check"
 
@@ -791,19 +846,19 @@ printf '== a dry run must preview the one decision --apply makes ==\n'
 # byte-identical to a plain dry run.
 _prov_repo previewbad; _prov_weaken previewbad
 _prov_run previewbad --dry-run
-printf '%s' "$OUT" | grep -qE 'would deploy: [0-9a-f]{7,} +reviewed=no' \
+hase 'would deploy: [0-9a-f]{7,} +reviewed=no' \
   && ok "a dry run states the verdict and the blob it judged" \
-  || bad "dry-run preview" "no verdict: $(printf '%s' "$OUT" | grep -m1 'would deploy')"
-printf '%s' "$OUT" | grep -q 'WOULD REFUSE' \
+  || bad "dry-run preview" "no verdict: $(shown 'would deploy')"
+has 'WOULD REFUSE' \
   && ok "and says --apply would refuse" \
   || bad "dry-run preview" "does not say what --apply would do"
 _prov_run previewbad --dry-run --allow-unreviewed=preview-test
-printf '%s' "$OUT" | grep -q 'WOULD DEPLOY IT ANYWAY' \
+has 'WOULD DEPLOY IT ANYWAY' \
   && ok "and a dry run WITH the hatch differs from one without it" \
   || bad "dry-run preview" "the hatch is invisible in a preview"
 _prov_repo previewok
 _prov_run previewok --dry-run
-printf '%s' "$OUT" | grep -q 'reviewed=yes' \
+has 'reviewed=yes' \
   && ok "a clean checkout previews reviewed=yes" \
   || bad "dry-run preview" "cannot preview a good verdict"
 [ -f "$WORK/previewok/deploy/secret-scan-pre-commit.sh" ] \
@@ -826,21 +881,21 @@ grep -qE '^expires: *[0-9]{4}-' "$WORK/persist/deploy/.rev" \
   && ok "and a deadline, so it is not permanent until someone remembers" \
   || bad "hatch expiry" "no expiry recorded"
 _prov_run persist --apply                     # the corrective run
-{ [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'STILL running'; } \
+{ [ "$RC" = 2 ] && has 'STILL running'; } \
   && ok "the refusal reports what the fleet is running right now" \
   || bad "refusal" "rc=$RC and no live-state report"
-printf '%s' "$OUT" | grep -q 'live deployment is UNREVIEWED' \
+has 'live deployment is UNREVIEWED' \
   && ok "and says that live deployment is unreviewed" \
   || bad "refusal" "does not name the unreviewed state it leaves in place"
 _prov_run persist --dry-run
-printf '%s' "$OUT" | grep -q 'UNREVIEWED DEPLOYMENT' \
+has 'UNREVIEWED DEPLOYMENT' \
   && ok "VERIFY headlines an unreviewed deployment rather than filing it as a field" \
   || bad "VERIFY" "an unreviewed fleet is one line among eleven"
 
 # A bare --allow-unreviewed must not work: the reason is what makes the record
 # answerable later.
 _prov_run persist --apply --allow-unreviewed
-{ [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'needs a reason'; } \
+{ [ "$RC" = 2 ] && has 'needs a reason'; } \
   && ok "the hatch requires a reason" \
   || bad "hatch" "bare --allow-unreviewed was accepted (rc=$RC)"
 
@@ -898,21 +953,21 @@ git init -q "$WORK/target/home/Code/fixture-repo"
 for _spell in "$WORK/target/home/Code" "$WORK/target/home/Code/" "$WORK/target/home/./Code"; do
   OUT="$(cd "$WORK/target/src" && HOME="$WORK/target/home" CODE_ROOT="$_spell" \
     HERDR_HOOK_DEPLOY_DIR="$WORK/target/tmpdeploy" bash install-git-hooks.sh --apply 2>&1)"; RC=$?
-  { [ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'REFUSING: deploy target'; } \
+  { [ "$RC" = 2 ] && has 'REFUSING: deploy target'; } \
     && ok "a temp deploy dir is refused for CODE_ROOT spelled '${_spell##*home}'" \
     || bad "deploy target" "rc=$RC for $_spell — 54 shims would exec a vanishing path"
 done
 OUT="$(cd "$WORK/target/src" && HOME="$WORK/target/home" CODE_ROOT="$WORK/target/home/Code" \
   HERDR_HOOK_DEPLOY_DIR="$WORK/target/tmpdeploy" bash install-git-hooks.sh --apply 2>&1)"; RC=$?
-[ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q 'REFUSING: deploy target' \
+[ "$RC" = 2 ] && has 'REFUSING: deploy target' \
   && ok "a temp deploy dir is refused when CODE_ROOT is the real fleet" \
   || bad "deploy target" "rc=$RC — 54 shims would exec a path that vanishes"
 _prov_run target --dry-run
-printf '%s' "$OUT" | grep -q "$WORK/target/deploy" \
+has "$WORK/target/deploy" \
   && ok "and the disposable-source note names the real deploy dir" \
   || bad "note" "hardcodes a path the scanner was not copied to"
 
-printf '%s' "$(bash "$INSTALLER" --help 2>&1)" | grep -q -- '--allow-unreviewed' \
+grep -q -- '--allow-unreviewed' <<<"$(bash "$INSTALLER" --help 2>&1)" \
   && ok "--help documents the escape hatch" \
   || bad "--help" "the bypass is discoverable only from a refusal message"
 
