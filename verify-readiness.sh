@@ -74,7 +74,7 @@ E="$(elapsed "$T0")"
 python3 -c "import sys;sys.exit(0 if float(sys.argv[1]) < 2 else 1)" "$E" \
     && ok "it answers on the first attempt (${E}s)" \
     || bad "a healthy probe took ${E}s — the readiness loop is running when it should not"
-printf '%s' "$OUT" | grep -q "ready after" \
+grep -q "ready after" <<<"$OUT" \
     && bad "reported a wait for a service that was already up: $OUT" \
     || ok "and says nothing about waiting"
 
@@ -99,7 +99,7 @@ if OUT="$(PROBE_READY_SECS=20 probe_http late "http://127.0.0.1:$P/" 200 2>&1)";
 else
     bad "a service that started 4s in was called DOWN: $OUT"
 fi
-printf '%s' "$OUT" | grep -q "ready after" \
+grep -q "ready after" <<<"$OUT" \
     && ok "and reports how long it took (evidence the restart was healthy, not lucky)" \
     || bad "no wait reported for a late starter: $OUT"
 E="$(elapsed "$T0")"
@@ -115,9 +115,9 @@ if OUT="$(PROBE_READY_SECS=3 probe_http dead "http://127.0.0.1:$DEAD/" 200 2>&1)
 else
     ok "a dead port is DOWN"
 fi
-printf '%s' "$OUT" | grep -q "wanted: 200" \
+grep -q "wanted: 200" <<<"$OUT" \
     && ok "and names the codes it wanted" || bad "refusal is not actionable: $OUT"
-printf '%s' "$OUT" | grep -q "after 3s" \
+grep -q "after 3s" <<<"$OUT" \
     && ok "and says it waited, so the operator knows it was not a single miss" \
     || bad "does not report the wait: $OUT"
 E="$(elapsed "$T0")"
