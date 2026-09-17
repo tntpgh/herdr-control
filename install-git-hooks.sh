@@ -239,25 +239,45 @@ _blob_at() {                              # <ref> -> OID on stdout, or nothing
   git -C "$here" rev-parse -q --verify "$1:git-hooks/secret-scan-pre-commit.sh" 2>/dev/null
 }
 
-# IDENTITY IS DECIDED BY BYTES, not by `git hash-object`.
+# IDENTITY, THREE TIMES, AND THEY ARE DIFFERENT QUESTIONS.
 #
-# hash-object applies gitattributes — that is what --no-filters exists to
-# suppress — and it does so by PATH, so `secret-scan-pre-commit.sh` and the
-# snapshot `secret-scan-pre-commit.sh.new.$$` hash DIFFERENTLY while being
-# byte-identical, as soon as a `text`/`eol` attribute is reachable (a global
-# attributes file is enough; the repo need not have one). Review measured both
-# consequences: a scanner identical to the reviewed one REFUSED as "differs
-# from refs/remotes/origin/main", sending the operator to hunt a remote that is
-# fine or to reach for --allow-unreviewed; and, past the gate, the
-# post-condition firing on an untouched deploy, leaving the scanner LIVE with NO
-# provenance record while `cmp` called the bytes identical.
+# 1. "Is this the checkout of the reviewed blob?" — provenance, and the one the
+#    gate and the report ask. Answered with `git hash-object --path <tracked
+#    path>`, which applies the attributes of the TRACKED path to whatever file
+#    it is given. That is what makes a snapshot named `…sh.new.$$` hash as if it
+#    were `…sh`, and that asymmetry is what produced the first defect here:
+#    plain `hash-object` applies gitattributes BY PATH, so two byte-identical
+#    files hashed differently and a correct deploy was refused as "differs from
+#    refs/remotes/origin/main" — or, past the gate, went live with no record at
+#    all while `cmp` called the bytes identical.
 #
-# So the gate compares raw blob bytes, and the post-condition compares sha256 of
-# the same file before and after the rename. `git hash-object --no-filters` is
-# kept ONLY for the human-readable blob: field.
-_same_as_main() {                         # <file> -> 0 identical to the anchor
-  git -C "$here" cat-file blob "$MAIN_REF:git-hooks/secret-scan-pre-commit.sh" 2>/dev/null \
-    | cmp -s - "$1"
+#    Raw `cat-file blob | cmp` was the first fix and it was wrong in the other
+#    direction: in any checkout that normalises this path (`text`,
+#    `eol=crlf`, or core.autocrlf=true) the working file LEGITIMATELY differs
+#    from the blob — measured at 33 bytes vs 35 — so a pristine checkout with no
+#    local edit would be refused on every run, with no operator-side fix and one
+#    obvious reflex: `--allow-unreviewed`, the exact habit this control exists
+#    to prevent.
+#
+# 2. "Are the bytes now live the bytes I judged?" — integrity across the rename,
+#    answered by sha256 of the same file before and after, which is immune to
+#    attributes and to path entirely. Unchanged.
+#
+# 3. The human-readable blob: field, `--no-filters`, so the record names the
+#    literal bytes on disk whatever the attributes say.
+_TRACKED=git-hooks/secret-scan-pre-commit.sh
+_oid_as_tracked() {                       # <file> -> OID as if it were $_TRACKED
+  git -C "$here" hash-object --path "$_TRACKED" -- "$1" 2>/dev/null
+}
+_same_as_main() {                         # <file> -> 0 if it is the reviewed blob
+  local a b
+  a=$(_oid_as_tracked "$1"); b=$(_blob_at "$MAIN_REF")
+  [ -n "$a" ] && [ -n "$b" ] && [ "$a" = "$b" ]
+}
+_same_as_head() {                         # <file> -> 0 if it is HEAD's blob
+  local a b
+  a=$(_oid_as_tracked "$1"); b=$(_blob_at HEAD)
+  [ -n "$a" ] && [ -n "$b" ] && [ "$a" = "$b" ]
 }
 _oid_of() { git hash-object --no-filters "$1" 2>/dev/null; }
 _sha_of() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
@@ -326,8 +346,7 @@ judge_snapshot() {                        # <workspace-dir>
     # weakened untracked scanner that .rev then called `clean` against a commit
     # which did not contain it.
     if [ -z "$head_oid" ]; then state=absent-from-HEAD
-    elif git -C "$here" cat-file blob "HEAD:git-hooks/secret-scan-pre-commit.sh" 2>/dev/null \
-         | cmp -s - "$DEPLOY_SNAP"; then state=clean
+    elif _same_as_head "$DEPLOY_SNAP"; then state=clean
     else state=dirty; fi
     DEPLOY_REV="${sha:-unknown} ${br:-DETACHED} $state"
   else
@@ -759,7 +778,16 @@ if [ -r "$HOOK_DEPLOY" ]; then
       fi
     fi
     _rec=$(sed -n 's/^sha256:[[:space:]]*//p' "$HOOK_DEPLOY_REV")
-    [ "$_rec" = "$_dep_sha" ] || echo "    STALE RECORD: .rev describes different bytes than the deployed file"
+    if [ "$_rec" != "$_dep_sha" ]; then
+      echo "    STALE RECORD: .rev describes different bytes than the deployed file"
+      # And the provenance line below must not contradict it. Review drove that
+      # comparison to a false YES: a deployed file that had DRIFTED (same text,
+      # CRLF) normalised to the anchor's OID under a text attribute, so the
+      # block said both "STALE RECORD" and "matches origin/main: yes". A report
+      # that asserts both is worse than one that admits it cannot tell — the
+      # reader believes the friendlier line.
+      _dep_drifted=1
+    fi
   else
     echo "    no .rev — deployed before provenance was recorded, or written by hand"
   fi
@@ -768,11 +796,22 @@ if [ -r "$HOOK_DEPLOY" ]; then
   # so a fleet running a weakened branch scanner produced a VERIFY block with
   # no origin/main line at all — and silence in a report whose whole purpose is
   # answering "what is the fleet running" reads as a pass.
-  _dep_oid=$(git hash-object "$HOOK_DEPLOY" 2>/dev/null)
+  # Asked the same way the gate asks it. This line was the one place the
+  # path-sensitive hash survived, and review drove it to BOTH a false NO on a
+  # byte-identical deployment and a false YES on a deployment whose bytes
+  # provably differed from the anchor — the original "report says yes while the
+  # bytes are not the reviewed ones" failure, in the surface this whole change
+  # exists to provide.
+  _dep_drifted=${_dep_drifted:-0}
+  _dep_oid=$(_oid_as_tracked "$HOOK_DEPLOY")
   _main_oid=$(_src_repo_ok && _blob_at "$MAIN_REF")
   if [ -z "$_main_oid" ]; then
     echo "    matches origin/main: CANNOT TELL — no origin/main resolvable from $here."
     echo "      The fleet's scanner is UNVERIFIED. git -C $here fetch origin main"
+  elif [ "$_dep_drifted" = 1 ]; then
+    echo "    matches origin/main: CANNOT VOUCH — the deployed file has changed"
+    echo "      since it was recorded, so what it resembles now proves nothing."
+    echo "      redeploy from a checkout on main:  bash $0 --apply"
   elif [ "$_main_oid" = "$_dep_oid" ]; then
     echo "    matches origin/main: yes"
     # origin/main is only as fresh as the last fetch, so "yes" against a stale

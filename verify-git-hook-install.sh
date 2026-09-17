@@ -598,43 +598,135 @@ fi
 # leaves the deployed file byte-identical to what it judged, which is not a
 # state anyone can exploit.
 
-printf '== identity is decided by BYTES, not by a path-sensitive hash ==\n'
-# `git hash-object` applies gitattributes, BY PATH — so the snapshot
+printf '== identity survives gitattributes, in both directions ==\n'
+# Plain `git hash-object` applies gitattributes BY PATH, so the snapshot
 # (…sh.new.$$) and the installed file (…sh) hashed differently while being
-# byte-identical, as soon as a `text`/`eol` attribute was reachable. A global
-# attributes file is enough; the repo needs none. Review measured both
-# consequences: a scanner identical to the reviewed one REFUSED as "differs
-# from refs/remotes/origin/main", and — past the gate — the post-condition
-# firing on an untouched deploy, leaving the scanner live with NO record while
-# `cmp` called the bytes identical. This fixture is also the deterministic rc=5
-# probe I could not construct: no race, no seam.
-_prov_repo attrs
-# core.autocrlf OFF so the blob stores the CRLF bytes verbatim: the point of the
-# fixture is that the committed bytes and the worktree bytes are IDENTICAL while
-# `git hash-object` disagrees about them depending on the file's name. (First
-# attempt got this wrong — the machine's global autocrlf normalised the blob to
-# LF, so the bytes really did differ and refusing was correct.)
-git -C "$WORK/attrs/src" config core.autocrlf false
-printf 'line1\r\nline2\r\n#!/usr/bin/env bash\r\nexit 0\r\n' > "$WORK/attrs/src/git-hooks/secret-scan-pre-commit.sh"
-git -C "$WORK/attrs/src" add -A >/dev/null
-git -C "$WORK/attrs/src" commit -qm crlf
-git -C "$WORK/attrs/src" push -q origin HEAD:refs/heads/main
-git -C "$WORK/attrs/src" fetch -q origin
-printf '*.sh text\n' > "$WORK/attrs/attributes"
-printf '[core]\n\tattributesFile = %s\n' "$WORK/attrs/attributes" > "$WORK/attrs/gitconfig"
-OUT="$(cd "$WORK/attrs/src" && GIT_CONFIG_GLOBAL="$WORK/attrs/gitconfig" \
-  CODE_ROOT="$WORK/attrs/none" HERDR_HOOK_DEPLOY_DIR="$WORK/attrs/deploy" \
-  bash install-git-hooks.sh --apply 2>&1)"; RC=$?
-{ [ "$RC" = 0 ] && _prov_landed attrs; } \
-  && ok "a scanner identical to the anchor deploys even under a text attribute" \
-  || bad "attribute sensitivity" "rc=$RC — a good scanner was refused: $(printf '%s' "$OUT" | grep -m1 -E 'REFUS|VOUCH')"
-grep -q '^reviewed: *yes' "$WORK/attrs/deploy/.rev" 2>/dev/null \
-  && ok "and is recorded as reviewed rather than blaming the remote" \
-  || bad "attribute sensitivity" "$(grep -m1 reviewed "$WORK/attrs/deploy/.rev" 2>/dev/null)"
-# the post-condition must not fire on a correct deploy either
-printf '%s' "$OUT" | grep -q 'REFUSING TO VOUCH' \
-  && bad "post-condition" "fired on an untouched deploy (attribute-sensitive comparison)" \
-  || ok "and the live-bytes post-condition does not fire on it"
+# byte-identical: a correct deploy refused as "differs from
+# refs/remotes/origin/main", and — past the gate — the post-condition firing on
+# an untouched deploy, leaving the scanner live with NO record while cmp called
+# the bytes identical.
+#
+# Raw `cat-file blob | cmp` fixed that and broke the other direction: in a
+# checkout that NORMALISES this path, the working file legitimately differs from
+# the blob (33 bytes vs 35), so a pristine checkout was refused on every run
+# with no operator-side fix — and the reflex that invites is
+# --allow-unreviewed, the habit this control exists to prevent.
+#
+# `hash-object --path <tracked path>` answers it correctly in both worlds. The
+# fixture is the second one, because it is the one a real repo produces: commit
+# `*.sh text eol=crlf`, so the blob is LF while the checkout is CRLF and git
+# itself calls the tree CLEAN.
+# A TRIVIAL scanner here, not the real one: under eol=crlf the 43 KB scanner is
+# no longer valid bash and the installer refuses for that (correct, different)
+# reason, which would make this row prove nothing about identity.
+_eol_repo() {                             # <dir> <scanner-body-file>
+  rm -rf "$WORK/$1"; mkdir -p "$WORK/$1/src/git-hooks"
+  git init -q "$WORK/$1/src"
+  git -C "$WORK/$1/src" config user.email t@e.c
+  git -C "$WORK/$1/src" config user.name t
+  cp "$2" "$WORK/$1/src/git-hooks/secret-scan-pre-commit.sh"
+  cp "$INSTALLER" "$WORK/$1/src/install-git-hooks.sh"
+  printf 'git-hooks/secret-scan-pre-commit.sh text eol=crlf\n' > "$WORK/$1/src/.gitattributes"
+  git -C "$WORK/$1/src" add -A >/dev/null
+  git -C "$WORK/$1/src" commit -qm base
+  # re-checkout so the attribute is applied to the working file
+  git -C "$WORK/$1/src" rm -q --cached -r . >/dev/null
+  git -C "$WORK/$1/src" reset -q --hard
+  git init -q --bare "$WORK/$1/remote.git"
+  git -C "$WORK/$1/src" remote add origin "$WORK/$1/remote.git"
+  git -C "$WORK/$1/src" push -q origin HEAD:refs/heads/main
+  git -C "$WORK/$1/src" fetch -q origin
+}
+printf '#!/usr/bin/env bash\nexit 0\n' > "$WORK/trivial-scanner"
+_eol_repo eolnorm "$WORK/trivial-scanner"
+_blobsz=$(git -C "$WORK/eolnorm/src" cat-file -s "refs/remotes/origin/main:git-hooks/secret-scan-pre-commit.sh" 2>/dev/null)
+_wtsz=$(wc -c < "$WORK/eolnorm/src/git-hooks/secret-scan-pre-commit.sh" | tr -d ' ')
+if [ -n "$_blobsz" ] && [ "$_blobsz" != "$_wtsz" ] && [ -z "$(git -C "$WORK/eolnorm/src" status --porcelain)" ]; then
+  ok "fixture: this path normalises (blob $_blobsz vs worktree $_wtsz) and git calls the tree clean"
+  _prov_run eolnorm --apply
+  { [ "$RC" = 0 ] && _prov_landed eolnorm && grep -q '^reviewed: *yes' "$WORK/eolnorm/deploy/.rev"; } \
+    && ok "and a pristine normalising checkout DEPLOYS instead of refusing forever" \
+    || bad "normalising checkout" "rc=$RC refused a clean checkout: $(printf '%s' "$OUT" | grep -m1 REFUSING)"
+  grep -qE '^rev: .* clean' "$WORK/eolnorm/deploy/.rev" 2>/dev/null \
+    && ok "and the record calls that file clean, as git does" \
+    || bad "normalising checkout" "$(grep -m1 '^rev:' "$WORK/eolnorm/deploy/.rev" 2>/dev/null)"
+  _prov_run eolnorm --dry-run
+  printf '%s' "$OUT" | grep -q 'matches origin/main: yes' \
+    && ok "and VERIFY agrees with the gate instead of contradicting it" \
+    || bad "VERIFY" "disagrees under normalisation: $(printf '%s' "$OUT" | grep -m1 'matches origin')"
+else
+  ok "(skipped: this git does not normalise the fixture — nothing to assert)"
+fi
+
+# The other direction must NOT become permissive.
+printf '#!/usr/bin/env bash\nexit 0\n# WEAKENED\n' > "$WORK/trivial-weak"
+_eol_repo eoldirty "$WORK/trivial-scanner"
+cp "$WORK/trivial-weak" "$WORK/eoldirty/src/git-hooks/secret-scan-pre-commit.sh"
+_prov_run eoldirty --apply
+{ [ "$RC" = 2 ] && ! _prov_landed eoldirty; } \
+  && ok "a weakened scanner is still refused under the same attributes" \
+  || bad "normalisation" "rc=$RC — normalisation handling made the gate permissive"
+
+# GLOBAL attributes reach the DEPLOY path, which lives outside any worktree —
+# a repo's own .gitattributes does not. That is the configuration in which the
+# report disagreed with the gate: review drove VERIFY to a false NO on a
+# byte-identical deployment and a false YES on one whose bytes provably
+# differed, because the gate had been converted to a path-aware comparison and
+# the report had not. The invariant asserted here is the one that matters and
+# does not depend on which direction the attribute pushes: the report's verdict
+# must AGREE with the record the gate wrote.
+printf '== a stale deployed file cannot also be reported as matching ==\n'
+# Review drove the provenance line to a false YES: a deployed file that had
+# DRIFTED (same text, CRLF) normalised to the anchor's OID under a text
+# attribute, so the block said both "STALE RECORD" and "matches origin/main:
+# yes". A report asserting both is worse than one admitting it cannot tell,
+# because the reader believes the friendlier line.
+_prov_repo stale
+_prov_run stale --apply
+printf '\n# drifted after deployment\n' >> "$WORK/stale/deploy/secret-scan-pre-commit.sh"
+_prov_run stale --dry-run
+printf '%s' "$OUT" | grep -q 'STALE RECORD' \
+  && ok "a deployed file modified after deployment is reported stale" \
+  || bad "stale detection" "no STALE RECORD line"
+printf '%s' "$OUT" | grep -q 'matches origin/main: yes' \
+  && bad "contradiction" "the same block says STALE RECORD and matches origin/main: yes" \
+  || ok "and the provenance line refuses to vouch rather than contradicting it"
+printf '%s' "$OUT" | grep -q 'CANNOT VOUCH' \
+  && ok "saying so in words, with the redeploy command" \
+  || bad "stale reporting" "$(printf '%s' "$OUT" | grep -m1 'matches origin')"
+
+printf '== the report must agree with the gate ==\n'
+_prov_repo agree
+# CRLF content committed with autocrlf OFF, so the blob stores CRLF and a
+# `*.sh text` attribute genuinely changes the answer. With LF content the
+# attribute is a no-op and this row asserts nothing (measured: it stayed green
+# under both pre-fix mutants).
+git -C "$WORK/agree/src" config core.autocrlf false
+printf '#!/usr/bin/env bash\r\nexit 0\r\n' > "$WORK/agree/src/git-hooks/secret-scan-pre-commit.sh"
+git -C "$WORK/agree/src" add -A >/dev/null
+git -C "$WORK/agree/src" commit -qm crlf
+git -C "$WORK/agree/src" push -qf origin HEAD:refs/heads/main
+git -C "$WORK/agree/src" fetch -q origin
+printf '*.sh text\n' > "$WORK/agree/attributes"
+printf '[core]\n\tattributesFile = %s\n' "$WORK/agree/attributes" > "$WORK/agree/gitconfig"
+_agree_run() {                            # <extra args...> -> RC, OUT
+  OUT="$(cd "$WORK/agree/src" && GIT_CONFIG_GLOBAL="$WORK/agree/gitconfig" \
+    CODE_ROOT="$WORK/agree/none" HERDR_HOOK_DEPLOY_DIR="$WORK/agree/deploy" \
+    bash install-git-hooks.sh "$@" 2>&1)"; RC=$?
+}
+_agree_run --apply --allow-unreviewed=consistency-fixture
+if [ -r "$WORK/agree/deploy/.rev" ]; then
+  _rec_reviewed=$(sed -n 's/^reviewed:[[:space:]]*//p' "$WORK/agree/deploy/.rev" | head -1 | awk '{print $1}')
+  _agree_run --dry-run
+  if printf '%s' "$OUT" | grep -q 'matches origin/main: yes'; then _rep=yes
+  elif printf '%s' "$OUT" | grep -q 'matches origin/main: NO'; then _rep=no
+  else _rep=cannot-tell; fi
+  [ "$_rec_reviewed" = "$_rep" ] \
+    && ok "under a global text attribute, VERIFY ($_rep) agrees with the recorded verdict ($_rec_reviewed)" \
+    || bad "report vs gate" "record says reviewed=$_rec_reviewed while VERIFY says matches=$_rep"
+else
+  bad "report vs gate" "no record written under a global attributes file"
+fi
 
 printf '== the record cannot be written by the thing it records ==\n'
 # The reason string went into .rev verbatim, and both consumers asked
