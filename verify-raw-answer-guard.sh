@@ -295,7 +295,7 @@ g prompting 'herdr pane send-keys wN:p7 ENTER'
 # appeared elsewhere in the message.
 printf '%s' "$OUT" | grep -qE 'herdr-select\.sh[[:space:]]+wN:p7[[:space:]]+<option-number>' \
   && ok 'the denial gives the runnable herdr-select.sh invocation' \
-  || bad 'denial message' "no runnable invocation: $(printf '%s' "$OUT" | grep -c . ) lines"
+  || bad 'denial message' "no runnable invocation: $(grep -c . <<<"$OUT" ) lines"
 case "$OUT" in
   *expect-prompt-id*) ok 'and the flag that closes the TOCTOU gap' ;;
   *) bad 'denial message' 'omits --expect-prompt-id' ;;
