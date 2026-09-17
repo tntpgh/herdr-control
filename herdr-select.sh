@@ -86,6 +86,14 @@
 # prompt changed / navigation could not converge, 7 pane recycled since its
 # task was registered, 8 refused by policy or reviewed-authority boundary.
 set -uo pipefail
+
+# guard-raw-prompt-answer.sh denies a raw keypress that would answer a live
+# prompt. This script IS the accountable path — it reaches send-keys only after the
+# checks that guard is protecting — so it marks its own child calls as
+# sanctioned. Not a security boundary (anything able to set this can call
+# `herdr pane` directly); it keeps the guard from denying the very tool it
+# points people at.
+export HERDR_SANCTIONED_ANSWER=1
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/pane-guard.sh"
