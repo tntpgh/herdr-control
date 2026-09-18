@@ -503,13 +503,26 @@ def _text(s):
 # The available fix (require both rows to share the box gutter) was written and
 # tested, and REJECTED: it assumes a wrap preserves the gutter, so a
 # hanging-indented footer would become unanswerable — the worst failure this
-# file has, the one that stranded wN:p9. The two errors are not
-# symmetric. A spurious keypress is bounded by herdr-select verifying the
-# selection took effect and by `--expect-prompt-id` failing closed when the
-# prompt is gone, so it degrades to a no-op; an unparseable real menu degrades
-# to a stalled worker and a human woken at 3am. Do not close this by making
-# real menus stricter. If omp ever hangs-indents the footer, revisit BOTH
-# choices together.
+# file has, the one that stranded wN:p9. The two errors are not symmetric: the
+# false negative is unbounded — a worker stalls until a human notices — while
+# the false positive is ONE bare Enter with no gap between deciding and
+# pressing, because peer-answer classifies and presses inside a single call.
+#
+# Be precise about why, because the obvious reason is wrong: peer-answer does
+# NOT pass `--expect-prompt-id` (peer-answer.sh:148 calls herdr-select with
+# just `--authority peer`), and herdr-select only enforces that fingerprint
+# when it was supplied (:219) — it is REQUIRED only for `--authority conductor`
+# (:260). So on the peer path nothing downstream re-checks that the prompt was
+# ever live, and none of the other guards fire on this residual either: the
+# re-offer check re-reads the same screen and agrees, `_require_current_
+# decision` only catches a change DURING the run, and the confirm-after-each-
+# keystroke walk is skipped entirely when Approve is already highlighted
+# (choice == cur, so it goes straight to Enter — the fixtures pin that as a
+# single bare `Enter`). `require_pane_birth_match` does run, but it proves pane
+# identity, not prompt liveness.
+#
+# Do not close this by making real menus stricter. If omp ever hangs-indents
+# the footer, revisit BOTH choices together.
 FOOTER = "up/down navigate enter select esc cancel"
 
 
