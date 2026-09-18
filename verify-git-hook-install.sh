@@ -301,6 +301,60 @@ grep -q 'npm run lint' "$R_OWN/.git/hooks/pre-commit" \
 run --undo
 ok "--undo is safe to run twice (rc=$?)"
 
+# ---- the shim verifies the scanner's bytes before running them -------------
+# Provenance used to be written once at deploy time and never re-checked, so a
+# write straight into the deploy directory was invisible. On 2026-09-18 the
+# deployed scanner was replaced with a work-in-progress copy; 18 repos
+# executed it and the only symptom was a silent `exit 1` on commit. `--apply`
+# restores it, but nothing prompted anyone to run one.
+_SV="$WORK/shimverify"
+mkdir -p "$_SV/code/repo" "$_SV/deploy"
+( cd "$_SV/code/repo" && git init -q . &&
+  git -c user.email=tnt@teamthurber.com -c user.name=t commit -q --allow-empty -m init ) >/dev/null 2>&1
+# Carries the marker, or the installer classifies it foreign and refuses to
+# replace it — correct behaviour, and it made the first version of this test
+# vacuous.
+# The path must contain "secret-scan": that substring IS the opt-in test, and
+# without it the repo is counted "NOT opted in" and left alone.
+printf '#!/usr/bin/env bash\n# installed by herdr-control install-git-hooks.sh\nexec bash /nonexistent/secret-scan-pre-commit.sh "$@"\n' \
+  > "$_SV/code/repo/.git/hooks/pre-commit"
+chmod +x "$_SV/code/repo/.git/hooks/pre-commit"
+CODE_ROOT="$_SV/code" HERDR_HOOK_DEPLOY_DIR="$_SV/deploy" \
+  bash "$INSTALLER" --apply >/dev/null 2>&1
+
+_sv_commit() {                            # file msg -> rc, stderr in $_SV/err
+  printf '%s\n' "$2" > "$_SV/code/repo/$1"
+  ( cd "$_SV/code/repo" && git add "$1" &&
+    git -c user.email=tnt@teamthurber.com -c user.name=t commit -q -m "$2" ) 2>"$_SV/err"
+}
+
+_sv_commit a.txt clean && ok "a commit works when the deployed scanner is the reviewed one" \
+  || bad "shim verify: a clean deployment refuses commits — $(head -2 "$_SV/err" | tr '\n' ' ')"
+
+printf '#!/bin/bash\nexit 0\n' > "$_SV/deploy/secret-scan-pre-commit.sh"
+if _sv_commit b.txt tampered; then
+  bad "shim verify: a commit went through a scanner whose bytes are not the reviewed ones"
+else
+  grep -q 'REFUSED: the deployed secret scanner is not the reviewed one' "$_SV/err" \
+    && ok "a tampered deployed scanner is REFUSED, fail-closed" \
+    || bad "shim verify: refused, but not for the provenance reason: $(head -2 "$_SV/err" | tr '\n' ' ')"
+  grep -q 'install-git-hooks.sh --apply' "$_SV/err" \
+    && ok "the refusal names the command that restores it" \
+    || bad "shim verify: refusal does not say how to recover"
+fi
+
+CODE_ROOT="$_SV/code" HERDR_HOOK_DEPLOY_DIR="$_SV/deploy" \
+  bash "$INSTALLER" --apply >/dev/null 2>&1
+_sv_commit c.txt restored && ok "--apply restores the scanner and commits resume" \
+  || bad "shim verify: still refused after --apply: $(head -2 "$_SV/err" | tr '\n' ' ')"
+
+# A fleet deployed before provenance existed must keep working: no .rev is not
+# tampering, and treating it as such would break every commit at once.
+mv "$_SV/deploy/.rev" "$_SV/deploy/.rev.away"
+_sv_commit d.txt norev && ok "a deployment with no .rev still runs (not treated as tampering)" \
+  || bad "shim verify: absent provenance blocked a commit: $(head -2 "$_SV/err" | tr '\n' ' ')"
+mv "$_SV/deploy/.rev.away" "$_SV/deploy/.rev"
+
 printf '== refusals ==\n'
 run --nonsense; rc=$?
 [ "$rc" = 2 ] && ok "an unknown option exits 2 rather than guessing" || bad "unknown option rc=$rc"

@@ -432,8 +432,49 @@ _expiry_iso() {
 # answer "which commits does THIS remote not have yet?". Without it the
 # scanner fell back to "what no remote has", and a commit fetched from a fork
 # could be pushed to origin unscanned (reproduced 2026-09-15).
+#
+# The shim also VERIFIES the scanner's bytes before running them. Provenance
+# was written once at deploy time and never re-checked, so an out-of-band
+# write to the deploy directory was invisible: on 2026-09-18 the deployed
+# scanner was replaced with a work-in-progress copy (sha256 dcc5f64e… against
+# the `sha256:` line's 815303d9…), 18 repos executed it, and the only signal
+# was a silent `exit 1` on commit — a scan that aborted under `set -euo
+# pipefail` and printed nothing. `--apply` would have restored it, but nobody
+# had reason to run one.
+#
+# So each hook invocation compares the scanner against the recorded sha256 and
+# REFUSES when they differ. Fail-closed is the right direction here: the whole
+# point of this deployment is that the fleet runs REVIEWED bytes, and
+# "unverifiable" must not mean "run it anyway". Cost is one sha256 of ~50 KB
+# per git operation.
+#
+# No .rev, or no `sha256:` line in it, is NOT treated as tampering — a fleet
+# deployed before provenance existed must keep working, and that case is
+# already reported by the VERIFY block.
 hook_body() {                             # [extra scanner args...]
-  printf '#!/usr/bin/env bash\n%s\nexec bash %q' "$MARK" "$HOOK_DEPLOY"
+  printf '#!/usr/bin/env bash\n%s\n' "$MARK"
+  printf 'H=%q\n' "$HOOK_DEPLOY"
+  printf 'R=%q\n' "$HOOK_DEPLOY_REV"
+  cat <<'SHIM'
+# One guard, not two: an absent .rev and a .rev with no `sha256:` line are the
+# same case — nothing to verify against — and a nested `[ -r ]` test around
+# this was an equivalent mutant (deleting it changed no behaviour, so no row
+# could ever fail for it).
+want=$(sed -n 's/^sha256:[[:space:]]*//p' "$R" 2>/dev/null | head -1)
+if [ -n "$want" ]; then
+  have=$(shasum -a 256 "$H" 2>/dev/null | cut -d' ' -f1)
+  if [ -n "$have" ] && [ "$have" != "$want" ]; then
+    echo "REFUSED: the deployed secret scanner is not the reviewed one." >&2
+    echo "  scanner: $H" >&2
+    echo "  recorded sha256: $want" >&2
+    echo "  actual   sha256: $have" >&2
+    echo "  Someone wrote to the deploy directory outside the installer." >&2
+    echo "  Restore it:  cd ~/Code/herdr-control && ./install-git-hooks.sh --apply" >&2
+    exit 1
+  fi
+fi
+SHIM
+  printf 'exec bash "$H"'
   local a
   for a in "$@"; do printf ' %q' "$a"; done
   printf ' "$@"\n'
