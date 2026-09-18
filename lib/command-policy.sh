@@ -610,8 +610,34 @@ classify_command() {
        # `fetch` hit is `git fetch`. A shape that has never occurred is not
        # worth the only fail-open-shaped test in the file.
        _cp_imatch '(^|[^A-Za-z0-9_.-])([^[:space:]]*/)?(wget|fetch|aria2c)([[:space:]]|$)' "$_cp_fields"; then
-      _cp_outs="$(printf '%s' "$_cp_fields" | grep -oiE '((^|[[:space:]])-[A-Za-z]*[oO]([[:space:]]+|[^-[:space:]])|--output[[:space:]=]+|--output-document[[:space:]=]+|>[[:space:]]*[^&[:space:]])[^[:space:]]*' |
-                  sed -E 's/^.*(-[A-Za-z]*[oO][[:space:]]+|--output[[:space:]=]+|--output-document[[:space:]=]+|>[[:space:]]*)//; s/^[[:space:]]*-[A-Za-z]*[oO]//')"
+      # Extraction is TOOL-AWARE and case-SENSITIVE, because the two tools
+      # disagree about the letter: for curl `-o FILE` is the output document,
+      # but for wget `-o FILE` is the LOG FILE and `-O FILE` is the output.
+      # Sharing one case-insensitive pattern therefore read `wget -o /dev/null
+      # <url>` as "output goes to /dev/null", exempted it, and let the body
+      # land in the cwd under a name derived from the URL — auto-approvable
+      # (pass 5). A log file is not an output target and may not grant an
+      # exemption.
+      #
+      # `curl -O` / `--remote-name` takes NO argument and derives the filename
+      # from the URL, so there is no target to test: it lands, full stop. Same
+      # for a wget with no `-O` at all, which is why the branch above fires on
+      # its mere presence.
+      if _cp_imatch '(^|[^A-Za-z0-9_.-])([^[:space:]]*/)?wget([[:space:]]|$)' "$_cp_fields"; then
+        _cp_outflag='((^|[[:space:]])-[A-Za-z]*O([[:space:]]+|[^-[:space:]])|--output-document[[:space:]=]+|>[[:space:]]*[^&[:space:]])'
+        _cp_outstrip='s/^.*(-[A-Za-z]*O[[:space:]]+|--output-document[[:space:]=]+|>[[:space:]]*)//; s/^[[:space:]]*-[A-Za-z]*O//'
+      else
+        _cp_outflag='((^|[[:space:]])-[A-Za-z]*o([[:space:]]+|[^-[:space:]])|--output[[:space:]=]+|>[[:space:]]*[^&[:space:]])'
+        _cp_outstrip='s/^.*(-[A-Za-z]*o[[:space:]]+|--output[[:space:]=]+|>[[:space:]]*)//; s/^[[:space:]]*-[A-Za-z]*o//'
+      fi
+      _cp_outs="$(printf '%s' "$_cp_fields" | grep -oE "$_cp_outflag"'[^[:space:]]*' | sed -E "$_cp_outstrip")"
+      # A filename derived from the URL has no target to examine, so nothing
+      # can exempt it. Case-SENSITIVE: curl `-O` derives a name, curl `-o` is
+      # an explicit target — matching these case-insensitively wiped the
+      # perfectly good `/dev/null` target off every status-code probe.
+      _cp_match '((^|[[:space:]])-[A-Za-z]*O([[:space:]]|$)|--remote-name([[:space:]]|$))' "$_cp_fields" &&
+        ! _cp_imatch '(^|[^A-Za-z0-9_.-])([^[:space:]]*/)?wget([[:space:]]|$)' "$_cp_fields" &&
+        _cp_outs=""
       # The loopback exemption belongs to the REQUEST URL, not to anything
       # else in the field: a header, a referer (`-e`) or a `?next=` parameter
       # mentioning localhost was exempting a download from a remote host (R5).
