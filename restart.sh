@@ -157,6 +157,35 @@ verify() {
     esac
   fi
   # THE assertion that "the port answers" cannot make: does the process
+  # THE PLUGIN'S revision, next to the hub's, because it is the same question
+  # asked of a different surface — and the one that was wrong for weeks without
+  # anybody noticing, because a local link never disagrees with itself.
+  printf "  %-34s " "plugin pinned revision"
+  _pstate="$(plugin_state)"
+  case "$_pstate" in
+    github*)
+      _psha="${_pstate#github }"
+      _want_full="$(git -C "$HERDR_APP_DIR" rev-parse HEAD 2>/dev/null)"
+      if [ -z "$_want_full" ]; then
+        echo "${_psha:0:7} (nothing deployed to compare against)"
+      elif [ "$_psha" = "$_want_full" ]; then
+        echo "${_psha:0:7} (== the deployed rev)"
+      else
+        echo "${_psha:0:7} != deployed ${_want_full:0:7}" >&2
+        echo "    repair: ./restart.sh --deploy   (pins the plugin with the app)" >&2
+        fail=1
+      fi ;;
+    local*)
+      echo "LOCAL LINK (${_pstate#local }) — actions run from that checkout's branch" >&2
+      echo "    its scripts are whatever is checked out there, which is what a" >&2
+      echo "    pinned install exists to prevent; deliberate during development." >&2 ;;
+    none)
+      echo "NOT INSTALLED — Projects / Quick Actions / What Needs Me are unavailable" >&2
+      echo "    repair: herdr plugin install $HERDR_PLUGIN_REPO --ref \$(cd $HERDR_APP_DIR && git rev-parse HEAD) -y" >&2
+      fail=1 ;;
+    *) echo "$_pstate" ;;
+  esac
+
   # answering :8600 run the revision that was deployed?
   #
   # hub.py exits 0 immediately if the port is already open ("already
@@ -212,6 +241,10 @@ if [ "$VERIFY_ONLY" = 1 ]; then verify; exit $?; fi
 if [ -n "$DEPLOY" ]; then
   echo "===== DEPLOY ====="
   deploy_app "$DEPLOY" || { echo "deploy failed; nothing was restarted" >&2; exit 2; }
+  # The plugin serves a revision too, and it moves WITH the deploy — see
+  # plugin_pin. Not fatal: a failed pin leaves the services deployable, and the
+  # message says how to recover. A local dev link is left alone and reported.
+  plugin_pin "$(app_rev_sha_full)" || true
   echo
 fi
 
