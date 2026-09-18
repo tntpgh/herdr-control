@@ -300,7 +300,20 @@ classify_command() {
   # it or which interpreter runs it.
   _cp_match '\|[[:space:]]*(sh|bash|zsh|dash|ksh|python3?|perl|ruby|node)([[:space:]]|$)' "$norm" &&
     _cp_consider 1 "pipes data into an interpreter — executes unreviewed code"
-  _cp_imatch '\b(curl|wget|fetch|aria2c)\b' "$norm" &&
+  # `git fetch` is not fetch-and-execute. It writes objects and refs into the
+  # local store and runs NOTHING: fetched content is inert until a checkout,
+  # and a checkout runs only filters/hooks the local repo already configured.
+  # But the rule matched the bare word `fetch` inside it, so the FIRST step of
+  # every review lane — fetch the branch under review — escalated to a human.
+  # Observed on wN:pA (2026-09-18) while three reviews were already queued.
+  # Masked before the match, not exempted after it, so a `git fetch` piped
+  # into a shell is still caught by the interpreter rule above, and a bare
+  # `fetch(1)` still escalates. No \b here: BSD sed does not implement it and
+  # silently matches nothing, so the mask would no-op on this machine while
+  # the fixtures below stayed red for no visible reason.
+  _cp_net="$(printf '%s' "$norm" | sed -E \
+    's/(^|[^A-Za-z0-9_-])git(([[:space:]]+-[^[:space:]]+)([[:space:]]+[^-[:space:]][^[:space:]]*)?)*[[:space:]]+fetch([^A-Za-z0-9_-]|$)/\1git ref-download\5/g')"
+  _cp_imatch '\b(curl|wget|fetch|aria2c)\b' "$_cp_net" &&
     _cp_consider 1 "downloads from the network — pair with running the result unreviewed"
 
   # escalate — reads or ships credential material. This is the gap the
