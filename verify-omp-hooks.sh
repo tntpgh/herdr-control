@@ -170,6 +170,24 @@ printf '│ /review/pr520 && ls -a │\n│ Approve │\n│ Deny │\n│ up/do
 printf '╭─ Allow tool: bash ─╮\n│ Command: git status │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n│ cancel │\nTask complete.\n' > "$WORKER_SCREEN"
 [ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
   && ok "wrap allowance does not resurrect a dismissed menu" || bad "wrapped footer masked new output"
+# The bypass an independent review of THIS branch found before it merged, and
+# the reason a fragment may only join the row immediately beneath it: the panel
+# closing border and any padding row normalise to empty text, so a version that
+# skipped blanks walked past the bottom of the panel and absorbed the first real
+# output line whenever that line was an exact remaining SUFFIX of the phrase.
+# A dismissed panel plus agent output `cancel` then parsed as a live menu, which
+# is exactly what the bottom-anchor check exists to stop.
+printf '╭─ Allow tool: bash ─╮\n│ Command: chmod 777 /etc/sudoers │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n╰────────╯\n\ncancel\n' > "$WORKER_SCREEN"
+[ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
+  && ok "output below a closed panel cannot complete its footer" || bad "absorbed a post-panel line as footer"
+# Same hole, reached through decorative rows rather than one blank.
+printf '╭─ Allow tool: bash ─╮\n│ Command: git push --force │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n╰────────╯\n────\n...\n>>>\n\ncancel\n' > "$WORKER_SCREEN"
+[ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
+  && ok "decorative rows do not bridge to a footer suffix" || bad "bridged a panel to later output"
+# And through the composer line a worker leaves on screen.
+printf '╭─ Allow tool: bash ─╮\n│ Command: rm -r build │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n╰────────╯\n> cancel\n' > "$WORKER_SCREEN"
+[ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
+  && ok "a composer line is not a footer continuation" || bad "composer text completed the footer"
 
 
 printf '== the Slack alert must be ANSWERABLE for a menu-shape prompt ==\n'

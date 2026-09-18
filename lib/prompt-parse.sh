@@ -465,6 +465,30 @@ def _text(s):
 # canonical single-row footer. It only ever fires on rows whose text is a
 # PREFIX of the exact phrase, so a command row that merely mentions these words
 # is untouched.
+#
+# ADJACENCY IS THE WHOLE SAFETY PROPERTY, and the first version of this did not
+# have it. It skipped any row whose _text() was empty, and _text() strips all
+# leading non-alphanumerics — so the panel closing border, rules, block glyphs
+# and padding rows all normalise to empty and the accumulator walked straight
+# past the bottom of the panel. It then joined the first REAL output line onto
+# the fragment whenever that line happened to be an exact remaining suffix of
+# the phrase, so a DISMISSED panel followed by agent output `cancel` parsed as
+# a live, answerable menu. That is precisely the false positive the
+# bottom-anchor check below exists to prevent: wait-for-blocked.sh would wake
+# on a pane that had moved on, and herdr-select.sh would press a key into a
+# pane that was not asking anything. Caught in review of this branch before it
+# merged (PR #93).
+#
+# So a fragment joins ONLY to the row immediately beneath it. A wrap is a
+# rendering artefact of one logical line; there is never a blank, a border or
+# anything else inside it.
+#
+# One known gap, unreachable today: the prefix test is character-level but the
+# rejoin inserts a space, so a footer broken MID-WORD ("enter sel" / "ect esc
+# cancel") never reassembles. omp word-wraps inside its own box, so this cannot
+# happen now — and if it ever did, _menu_gate would close first (the window
+# would contain no literal "select") and the parser would never be spawned, so
+# no fixture here would catch it. Worth knowing before changing how omp draws.
 FOOTER = "up/down navigate enter select esc cancel"
 
 
@@ -476,11 +500,8 @@ def _unwrap_footer(rows):
             j = i + 1
             while j < len(rows) and acc != FOOTER:
                 nxt = " ".join(_text(rows[j]).split())
-                if not nxt:
-                    j += 1
-                    continue
-                cand = acc + " " + nxt
-                if not FOOTER.startswith(cand):
+                cand = acc + " " + nxt if nxt else ""
+                if not nxt or not FOOTER.startswith(cand):
                     break
                 acc, j = cand, j + 1
             if acc == FOOTER:
