@@ -157,9 +157,6 @@ verify() {
     esac
   fi
   # THE assertion that "the port answers" cannot make: does the process
-  # THE PLUGIN'S revision, next to the hub's, because it is the same question
-  # asked of a different surface — and the one that was wrong for weeks without
-  # anybody noticing, because a local link never disagrees with itself.
   # answering :8600 run the revision that was deployed?
   #
   # hub.py exits 0 immediately if the port is already open ("already

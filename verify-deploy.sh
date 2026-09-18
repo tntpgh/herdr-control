@@ -262,6 +262,12 @@ printf '%s\n' "$*" >> "$PDIR/calls"
 case "$2" in
   install)
     [ -n "${PSTUB_FAIL:-}" ] && exit 1
+    # The real CLI REFUSES to install over an id that still exists. Without
+    # this the stub would let a broken flow look like it worked.
+    if grep -q 'plugin_id' "$HERDR_PLUGINS_JSON" 2>/dev/null; then
+      echo "plugin ${HERDR_PLUGIN_ID} is already installed; uninstall it first" >&2
+      exit 1
+    fi
     # exit 0 while changing nothing: "the command succeeded" and "the thing is
     # now true" are different claims, and only the second one matters.
     [ -n "${PSTUB_LIE:-}" ] && exit 0
@@ -274,7 +280,9 @@ json.dump([{ "plugin_id": "tntpgh.herdr-control",
              "source": {"kind": "github", "resolved_commit": ref} }], open(f, "w"))
 PY
     ;;
-  uninstall) : > "$HERDR_PLUGINS_JSON" ; printf '[]' > "$HERDR_PLUGINS_JSON" ;;
+  uninstall)
+    [ -n "${PSTUB_UNINSTALL_FAIL:-}" ] && exit 1
+    printf '[]' > "$HERDR_PLUGINS_JSON" ;;
 esac
 exit 0
 STUB
@@ -413,6 +421,32 @@ OUT="$(plugin_pin main 2>&1)"; rc=$?
 case "$OUT" in
   *"full 40-char sha"*) ok "and says what a pin has to be" ;;
   *) bad "non-sha message unhelpful: $OUT" ;;
+esac
+
+# A WRITE THAT FAILS SILENTLY was the last instance of the class this commit
+# closed. `plugin uninstall ... || true` meant a failed uninstall let the
+# install be refused for the id that still existed, and the operator was told
+# "the plugin is now UNINSTALLED, not stale" — while the record still held the
+# old pin, and BOTH printed recovery commands were wrong: the install refuses
+# again, and the link would swap a correct, still-present pin for the shared
+# checkout.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/managed\",\"source\":{\"kind\":\"github\",\"resolved_commit\":\"$REV_A\"}}]"
+OUT="$(PSTUB_UNINSTALL_FAIL=1 plugin_pin "$REV_B" 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && [ "$(plugin_state)" = "github $REV_A" ]; } \
+  && ok "a failed uninstall leaves the existing pin in place" \
+  || bad "failed uninstall: rc=$rc state='$(plugin_state)'"
+# `grep install` also matches UNinstall — the first version of this row failed
+# for that reason, not because the code was wrong.
+grep -qE '(^| )install ' "$PDIR/calls" \
+  && bad "it attempted the install the CLI would refuse anyway" \
+  || ok "and does not attempt the install that would be refused"
+case "$OUT" in
+  *"STILL PINNED"*"Nothing was lost"*) ok "and says what is true: still pinned, nothing lost" ;;
+  *) bad "failed-uninstall message: $OUT" ;;
+esac
+case "$OUT" in
+  *"UNINSTALLED, not stale"*) bad "it still claims the plugin is gone when it is not" ;;
+  *) ok "and no longer claims the plugin is gone" ;;
 esac
 
 # ── the --verify line is a function, so its branches are testable ──────────

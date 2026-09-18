@@ -293,7 +293,7 @@ plugin_report() {
 # that silently replaced a dev link would be the same class of surprise this
 # function exists to remove. It says so loudly instead.
 plugin_pin() {
-  local rev="${1:-}" state kind detail cli="${HERDR_PLUGIN_CLI:-herdr}"
+  local rev="${1:-}" state kind detail _bad cli="${HERDR_PLUGIN_CLI:-herdr}"
   # An EMPTY revision reached here as one empty argument from
   # `plugin_pin "$(app_rev_sha_full)"` when nothing is deployed — `$1` is bound,
   # so `set -u` never fired. The github arm then UNINSTALLED a correct pin and
@@ -329,7 +329,22 @@ plugin_pin() {
       # Reinstall is the update path; there is no `plugin update` subcommand,
       # and installing over an existing id REFUSES rather than swapping
       # (verified 2026-09-18), so the uninstall is required, not tidiness.
-      $cli plugin uninstall "$HERDR_PLUGIN_ID" >/dev/null 2>&1 || true ;;
+      #
+      # And it is CHECKED. `|| true` here was the last silent write in this
+      # function: when the uninstall failed, the install was then refused for
+      # the id that still existed, and the operator was told "the plugin is now
+      # UNINSTALLED, not stale" while the record still read the old pin — with
+      # both printed recovery commands wrong, since the install refuses again
+      # and the link would swap a correct, still-present pin for the shared
+      # checkout. Branching here also lets this path say the much better true
+      # thing: nothing was lost.
+      if ! $cli plugin uninstall "$HERDR_PLUGIN_ID" >/dev/null 2>&1; then
+        echo "plugin: uninstall of $HERDR_PLUGIN_ID FAILED — STILL PINNED at ${detail:0:7}." >&2
+        echo "  Nothing was lost: the install was not attempted, because it would" >&2
+        echo "  be refused over an id that still exists. The old revision is live." >&2
+        echo "  inspect: ${cli} plugin list" >&2
+        return 2
+      fi ;;
     none) : ;;
     *)
       # Anything this function cannot CLASSIFY it must not touch: an unreadable
