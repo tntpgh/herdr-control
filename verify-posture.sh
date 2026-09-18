@@ -296,6 +296,45 @@ fi
 unset -f herdr
 
 
+# ── the first argument is a PATH ───────────────────────────────────────────
+# `repo_root` fails on a bare repo NAME, leaving $root empty — and the guard
+# that followed PASSED anyway, because `git -C "" rev-parse` runs in the
+# caller's cwd and succeeds. The worktree path became
+# `~/.herdr/worktrees//review/pr520`, an empty project segment, and the wake
+# pattern and events bus pointed there too. The dry run printed the malformed
+# path and carried on. Measured 2026-09-16; it cost a re-dispatch.
+OUT="$(cd "$here" && ./spawn-task.sh tntpgh-dev review/pr-guard implement --dry-run 2>&1)"; rc=$?
+[ "$rc" = 1 ] \
+  && ok "a bare repo NAME is refused, not resolved against the caller's cwd" \
+  || bad "bare-name spawn: rc=$rc — it accepted a name as a path"
+case "$OUT" in
+  *"first argument is a PATH"*) ok "and the refusal says what the argument should be" ;;
+  *) bad "bare-name spawn: message not actionable: $(printf '%s' "$OUT" | tail -1)" ;;
+esac
+case "$OUT" in
+  *"worktrees//"*) bad "bare-name spawn: it still printed a path with an empty segment" ;;
+  *) ok "and no path with an empty segment is printed" ;;
+esac
+
+# The malformed-path guard is REACHABLE on its own: a branch ending in `/`
+# ("feat/") composes a worktree path ending in `/`, which would create a
+# directory one level up from where every downstream path expects it. An empty
+# branch cannot reach it — `${2:?usage}` refuses first — so this is the case
+# that keeps the guard from being dead code.
+OUT="$(cd "$here" && ./spawn-task.sh "$here" 'feat/' implement --dry-run 2>&1)"; rc=$?
+{ [ "$rc" = 1 ] && printf '%s' "$OUT" | grep -q 'refusing a malformed worktree path'; } \
+  && ok "a branch ending in / is refused rather than composed into a path" \
+  || bad "malformed path: rc=$rc: $(printf '%s' "$OUT" | tail -1)"
+
+# A real path still resolves, or the guard would have broken every spawn.
+OUT="$(cd "$here" && ./spawn-task.sh "$here" verify-posture-probe implement --dry-run 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && printf '%s' "$OUT" | grep -q 'worktree  :'; } \
+  && ok "a real repo path still resolves and prints its worktree" \
+  || bad "path spawn: rc=$rc: $(printf '%s' "$OUT" | tail -1)"
+printf '%s' "$OUT" | grep -qE 'worktrees/[^/]+/verify-posture-probe' \
+  && ok "and the project segment is the repo directory name" \
+  || bad "path spawn: unexpected worktree path: $(printf '%s' "$OUT" | grep 'worktree  :')"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi

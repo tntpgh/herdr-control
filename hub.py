@@ -98,7 +98,45 @@ KB_DASHBOARD_URL = os.environ.get("KB_DASHBOARD_URL", "https://dashboard.teamthu
 # and the live registry holds only completed/lost/running. A prompt is recorded
 # as state `blocked` PLUS an `input_required` event, so `blocked` is the state
 # that needs attention and this was dead vocabulary pretending to be a case.
-ATTENTION = ("blocked", "stalled")
+# ATTENTION, and the ORDER it is shown in. `ready_review` is new and it is the
+# state five of this machine's tasks were actually in when the taxonomy was
+# added (2026-09-18): finished workers whose panes read "awaiting PR
+# review/merge decision from Terrence", every one of them filed as `stalled` —
+# the state whose whole meaning is "took a brief and went quiet". The page then
+# said "5 tasks need attention" for a day, about nothing that was wrong, which
+# is how an attention surface stops being read.
+#
+# Borrowed, with attribution, from eliasstravik/herdr-projects (MIT), whose
+# Group enum separates Ready-for-review from Waiting-on-you and debounces both.
+# Their `Landing` (a PR open AND approved) is deliberately NOT here: this
+# registry holds no PR state, and polling GitHub from the hub's read path is a
+# different change with a network dependency in it.
+ATTENTION = ("blocked", "stalled", "ready_review")
+
+# DEBOUNCES, so a state that is momentary does not page. A worker is blocked
+# for a second or two every time it asks anything; before this the count
+# flickered with every prompt. Their values, unchanged, because they were
+# measured against the same agent CLIs: 30s blocked, 60s for a launch that
+# never became ready.
+BLOCKED_DEBOUNCE_SECS = 30
+NOT_READY_SECS = 60
+
+# WHAT YOU HAVE ALREADY LOOKED AT. Without this, a finished-but-unmerged task
+# pages forever: there is no state between "needs attention" and "resolved",
+# so the only way to clear it was to close the pane. An ack is not a claim that
+# the work is done — it is a record that a human has SEEN it, which is the
+# honest thing the hub can know.
+ACK_FILE = Path(os.environ.get("HERDR_ACK_FILE") or
+                (Path.home() / ".local/state/herdr/runs/acked.json"))
+
+
+def _acks() -> dict:
+    """{task_id: ack marker} — never raises; an unreadable file means no acks."""
+    try:
+        data = json.loads(ACK_FILE.read_bytes().decode("utf-8", "replace"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 # Every surface the team runs, hosted and local. `probe` is what "alive" means
 # for it; hosted ones also get the KB heartbeat verdict when a snapshot exists.
@@ -459,6 +497,48 @@ _DONE_RE = re.compile(rb'"event"\s*:\s*"[^"]*_done"')
 _TS_RE = re.compile(rb'"(?:ts|at|time|timestamp|occurred_at)"\s*:\s*"([^"]+)"')
 
 
+def _central_done_at(task_id: str) -> float | None:
+    """When the CENTRAL registry recorded completion for this task, if ever.
+
+    The worktree bus is not the only sanctioned place a worker may report
+    finishing. spawn-task.sh tells every worker so in as many words: a task
+    whose own effect removes its worktree should "call append_event() from
+    lib/run-registry.sh directly (writes to the central registry, survives
+    worktree removal)". That path existed and nothing read it — `_evidence_at`
+    looked only at the bus — so a worker that took the documented advice was
+    indistinguishable from one that went quiet.
+
+    THE CONTRACT IS THE SAME `_done` SUFFIX the bus uses, and it is not
+    widened here. spawn-task.sh:125 builds the wake pattern as
+    `${label}_done`, `_DONE_RE` matches `"event":"..._done"`, and this matches
+    an event TYPE ending in `_done`, plus the two types our own reconciler
+    writes (`completion_recorded`, `completion_evidence`, lib/reconcile.sh).
+    Nothing else counts, deliberately: the live registry also holds
+    `review.verdict`, `review_verdict`, `review_result`, `worker_done`,
+    `completion_verified` and `late_verified_completion` — six spellings a
+    worker invented for "I am done", none of them ours. Treating an unknown
+    type as completion would be the hub divining intent from a name it does not
+    define, which is how a stale worker gets read as finished. The fix for
+    those is the brief telling workers the exact event name, not this function
+    guessing.
+    """
+    if not task_id or not REGISTRY.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+        try:
+            row = conn.execute(
+                "SELECT occurred_at FROM events WHERE task_id = ? "
+                "AND (type LIKE '%\\_done' ESCAPE '\\' "
+                "     OR type IN ('completion_recorded', 'completion_evidence')) "
+                "ORDER BY sequence DESC LIMIT 1", (task_id,)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return _iso_epoch(row[0]) if row else None
+
+
 def _bus_relpaths() -> tuple[str, ...]:
     """The handoff bus locations a READER must consider, canonical first.
 
@@ -637,6 +717,14 @@ def derive(task: dict, panes: dict | None,
         return stored, "stored"
     if live in ("idle", "done"):
         ev = _evidence_at(task.get("worktree"))
+        # The bus is not the only sanctioned reporting path — see
+        # _central_done_at. Take whichever is NEWER, because a worker may write
+        # both, and a central record is the only one that survives its own
+        # worktree being removed. `undatable` from the bus is not a time, so a
+        # datable central event beats it outright.
+        central = _central_done_at(task.get("task_id") or "")
+        if central is not None:
+            ev = central if not isinstance(ev, float) else max(ev, central)
         if ev is None:
             # A worker that has not started yet is not an abandoned brief. The
             # registry's own initial states (`starting`, and the empty string
@@ -653,8 +741,31 @@ def derive(task: dict, panes: dict | None,
             return ("stalled", "live") if asked_at is not None else ("completed", "live")
         if asked_at is not None and ev < asked_at:
             return "stalled", "live"       # answered an older round, not this one
-        return "completed", "live"
+        # FINISHED, and the question is whether anybody has looked. Completion
+        # is not the end of the work: a review whose verdict is posted and a
+        # branch whose PR is open both need a decision that is not the worker's
+        # to make. `completed` retires the row from every attention surface, so
+        # before this the only states available were "pages forever" and
+        # "invisible".
+        #
+        # `ready_review` is the middle: it needs you, it is not a fault, and an
+        # ack clears it without pretending the task is resolved. The marker
+        # compared is the EVIDENCE TIME, so a worker that reports again after
+        # you acked (a second round, a follow-up) comes back — acking round one
+        # does not silence round two.
+        acked = _acks().get(task.get("task_id") or "")
+        if isinstance(acked, (int, float)) and acked >= ev:
+            return "completed", "live"
+        return "ready_review", "live"
     if live == "blocked":
+        # DEBOUNCED. A worker is blocked for a second or two every time it asks
+        # anything, so an undebounced count flickered with every prompt and the
+        # page cried wolf. `updated_at` is when the registry last saw this state
+        # change; below the threshold the task is still working as far as anyone
+        # needs to care.
+        since = _iso_epoch(task.get("updated_at"))
+        if since is not None and (time.time() - since) < BLOCKED_DEBOUNCE_SECS:
+            return "running", "live"
         return "blocked", "live"
     # An agent_status this code does not know is NOT a task state either. Same
     # reasoning as `unknown`: inventing a vocabulary entry hides the task from
@@ -706,6 +817,14 @@ def herdr_data(event_limit: int = 100) -> dict:
     for t in tasks:
         t["stored_state"] = t["state"]
         t["state"], t["state_source"] = derive(t, panes, _iso_epoch(asked.get(t["task_id"])))
+        # The evidence time, exposed because ack.sh binds an acknowledgement to
+        # it rather than to `now`: acking must not swallow a report that lands
+        # while the operator is typing the command.
+        _ev = _evidence_at(t.get("worktree"))
+        _central = _central_done_at(t.get("task_id") or "")
+        if _central is not None:
+            _ev = _central if not isinstance(_ev, float) else max(_ev, _central)
+        t["evidence_at"] = _ev if isinstance(_ev, float) else None
         t["state_stale"] = t["state"] != t["stored_state"]
     attention = sorted((t for t in tasks if t["state"] in ATTENTION),
                        key=lambda t: (ATTENTION.index(t["state"]), t["updated_at"]))

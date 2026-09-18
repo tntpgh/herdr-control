@@ -118,8 +118,31 @@ eff_posture=$(resolved_posture "$posture_req")
 # against an existing task worktree would then scatter the new worktree
 # under the sub-worktree's name instead of the real project's.
 root=$(repo_root "$proj")
+# AN EMPTY ROOT IS NOT THE CURRENT DIRECTORY. `repo_root` fails on a bare name
+# (`spawn-task.sh tntpgh-dev ...` — the first argument is a PATH), leaving
+# `$root` empty, and the guard below then PASSED: `git -C "" rev-parse` runs in
+# the caller's cwd and succeeds, so a spawn from inside any repo was accepted.
+# The worktree path became `~/.herdr/worktrees//review/pr520` — an empty
+# project segment — and everything downstream, including the wake pattern and
+# the events bus, pointed there. Measured 2026-09-16 when it cost a
+# re-dispatch; the dry run printed the malformed path and proceeded.
+[ -n "$root" ] || {
+  echo "spawn-task: could not resolve a repo root from '$proj'." >&2
+  echo "  The first argument is a PATH, not a repo name: ~/Code/<repo>" >&2
+  exit 1; }
 [ -d "$root/.git" ] || git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || { echo "spawn-task: not a git repo: $root" >&2; exit 1; }
 wt="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$root")/${branch}"
+# BELT, because the layout is herdr's and this builds it by hand. herdr owns
+# `~/.herdr/worktrees/<repo>/<branch>` and `herdr worktree create` returns the
+# path it chose; eliasstravik/herdr-projects records that return value and
+# never composes the path, which is the more durable shape — if herdr changes
+# the layout, a built path silently diverges from the real one. Migrating this
+# to `herdr worktree create` changes workspace and tab semantics (labels,
+# focus, the posture stamp) and is its own change; until then, refuse a path
+# with an empty segment rather than create one.
+case "$wt" in
+  *//*|*/) echo "spawn-task: refusing a malformed worktree path: $wt" >&2; exit 1 ;;
+esac
 label="${job}:${branch}"
 events_file=$(handoff_events "$wt")
 wake_pattern="${label}_done"
