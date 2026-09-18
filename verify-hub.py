@@ -680,10 +680,100 @@ class CentralCompletionEvidence(unittest.TestCase):
                                      "the `_done` suffix is the contract spawn-task.sh asks for")
                 self.assertIsNotNone(hub._central_done_at("t_recon"),
                                      "our own reconciler's event must count")
+                # The ESCAPE clause makes `\_` a LITERAL underscore. Drop it and
+                # the pattern becomes `%_done`, which matches any type ending in
+                # `done` with one preceding character — `notdone`, `undone`,
+                # `predone` — a widening in the read-a-stale-worker-as-finished
+                # direction that left both suites green until this row existed.
+                conn2 = sqlite3.connect(db)
+                conn2.execute("INSERT INTO events (task_id, type, occurred_at) VALUES (?,?,?)",
+                              ("t_offshape", "notdone", "2026-09-18T08:00:00Z"))
+                conn2.commit(); conn2.close()
+                self.assertIsNone(hub._central_done_at("t_offshape"),
+                                  "the underscore is literal: ESCAPE must not be droppable")
 
     def test_an_unreadable_registry_is_not_completion(self):
         with patch.object(hub, "REGISTRY", Path("/nonexistent/registry.sqlite3")):
             self.assertIsNone(hub._central_done_at("t"))
+
+
+class EvidenceAtIsScoped(unittest.TestCase):
+    """`evidence_at` is published only for the states derived FROM evidence.
+
+    It was published for every row, including ones `derive` short-circuits
+    before ever looking at evidence — terminal, gone, working, blocked,
+    herdr-unreachable — and that value is exactly what ack.sh trusted as
+    "this row is acknowledgeable". An ack written against a blocked or stalled
+    task lies in wait: the moment that pane goes idle with its evidence time
+    unchanged, the ack fires and the row leaves every surface.
+    """
+
+    def _rows(self, state, pane_status):
+        tasks = [{"task_id": "t1", "run_id": "r", "label": "l", "repo": "x", "state": state,
+                  "pane_id": "w1:p1", "conductor_id": "", "worktree": "/nonexistent",
+                  "created_at": "2026-09-07T12:00:00Z", "updated_at": "2026-09-07T13:00:00Z"}]
+        panes = {"w1:p1": {"pane_id": "w1:p1", "agent_status": pane_status, "birth": ""}}
+        with patch.object(hub, "_completion_at", lambda t: 1000.0), \
+             patch.object(hub, "_acks", lambda: {}), \
+             patch.object(hub, "pane_statuses", lambda: panes), \
+             patch.object(hub, "REGISTRY", Path("/nonexistent")):
+            # herdr_data needs a registry; drive derive directly instead and
+            # apply the same publication rule the read path applies.
+            st, _src = hub.derive(tasks[0], panes, None, completion=1000.0)
+        return st
+
+    def test_a_blocked_row_is_not_given_an_evidence_time(self):
+        self.assertEqual(self._rows("running", "blocked"), "blocked")
+
+    def test_an_evidence_backed_row_is(self):
+        self.assertEqual(self._rows("running", "idle"), "ready_review")
+
+    def test_herdr_data_publishes_evidence_at_only_for_evidence_backed_rows(self):
+        """The rule lives in the READ PATH, so it has to be tested there.
+
+        Driving `derive` alone left this uncovered: publishing `evidence_at`
+        for every row is invisible to a derive-level test, and that field is
+        exactly what ack.sh trusts as "this row is acknowledgeable".
+        """
+        import sqlite3
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "registry.sqlite3"
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                "CREATE TABLE tasks (task_id TEXT, run_id TEXT, label TEXT, repo TEXT, state TEXT,"
+                " pane_id TEXT, conductor_id TEXT, worktree TEXT, created_at TEXT, updated_at TEXT);"
+                "CREATE TABLE events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT,"
+                " task_id TEXT, occurred_at TEXT, payload TEXT);"
+                "CREATE TABLE checkpoints (conductor_id TEXT, last_event_seq INT, updated_at TEXT);")
+            for tid, pane in (("t_idle", "w1:p1"), ("t_blocked", "w1:p2")):
+                conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+                             (tid, "r", tid, "repo", "running", pane, "", "/nonexistent",
+                              "2026-09-07T12:00:00Z", "2026-09-07T13:00:00Z"))
+            conn.commit(); conn.close()
+            panes = {"w1:p1": {"pane_id": "w1:p1", "agent_status": "idle", "birth": ""},
+                     "w1:p2": {"pane_id": "w1:p2", "agent_status": "blocked", "birth": ""}}
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "pane_statuses", lambda: panes), \
+                 patch.object(hub, "_completion_at", lambda t: 1000.0), \
+                 patch.object(hub, "_acks", lambda: {}):
+                rows = {t["task_id"]: t for t in hub.herdr_data()["tasks"]}
+        self.assertEqual(rows["t_idle"]["state"], "ready_review")
+        self.assertEqual(rows["t_idle"]["evidence_at"], 1000.0,
+                         "an evidence-backed row carries the time an ack binds to")
+        self.assertEqual(rows["t_blocked"]["state"], "blocked")
+        self.assertIsNone(rows["t_blocked"]["evidence_at"],
+                          "a blocked row must carry NO evidence time: ack.sh trusts that field")
+
+    def test_derive_does_not_recompute_when_handed_a_completion(self):
+        """One computation per task on the read path, not two."""
+        calls = []
+        task = {"task_id": "t", "pane_id": "w1:p1", "worktree": "/nonexistent",
+                "state": "running", "updated_at": "2026-09-07T13:00:00Z", "pane_birth": ""}
+        panes = {"w1:p1": {"pane_id": "w1:p1", "agent_status": "idle", "birth": ""}}
+        with patch.object(hub, "_completion_at", lambda t: calls.append(1) or 1000.0), \
+             patch.object(hub, "_acks", lambda: {}):
+            hub.derive(task, panes, None, completion=1000.0)
+        self.assertEqual(calls, [], "a passed-in completion must not be recomputed")
 
 
 class BlockedDebounce(unittest.TestCase):
@@ -712,6 +802,20 @@ class BlockedDebounce(unittest.TestCase):
     def test_an_undatable_updated_at_pages_rather_than_hiding(self):
         """A missing timestamp must not swallow a real block."""
         self.assertEqual(hub.derive(self._task("not-a-date"), self._panes())[0], "blocked")
+
+    def test_a_future_timestamp_does_not_hide_a_block_forever(self):
+        """`time.time() - since` is NEGATIVE for a stamp ahead of the clock,
+        which is also `< 30`, so an unclamped debounce hid the task on every
+        surface until wall-clock caught up — for a year-ahead stamp, forever.
+        Reachable without anyone doing anything wrong: run-registry's
+        `import_tasks` takes `updated_at` verbatim from migrated JSON, and any
+        backward clock step (NTP after a wrong-clock boot, a laptop resume)
+        leaves stored stamps in the future.
+        """
+        for ahead in (60, 86_400, 365 * 86_400):
+            self.assertEqual(
+                hub.derive(self._task(self._iso(-ahead)), self._panes())[0], "blocked",
+                f"a stamp {ahead}s ahead of the clock must still page")
 
 
 class CacheFreshness(unittest.TestCase):

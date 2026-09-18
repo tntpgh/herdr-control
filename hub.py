@@ -513,14 +513,27 @@ def _central_done_at(task_id: str) -> float | None:
     `${label}_done`, `_DONE_RE` matches `"event":"..._done"`, and this matches
     an event TYPE ending in `_done`, plus the two types our own reconciler
     writes (`completion_recorded`, `completion_evidence`, lib/reconcile.sh).
-    Nothing else counts, deliberately: the live registry also holds
-    `review.verdict`, `review_verdict`, `review_result`, `worker_done`,
-    `completion_verified` and `late_verified_completion` — six spellings a
-    worker invented for "I am done", none of them ours. Treating an unknown
-    type as completion would be the hub divining intent from a name it does not
-    define, which is how a stale worker gets read as finished. The fix for
-    those is the brief telling workers the exact event name, not this function
-    guessing.
+    That is a SHAPE, which is the point: `worker_done` DOES count, even though
+    nothing in-tree writes it, because it satisfies what spawn-task.sh:125 asks
+    for. A worker may name its own event without asking permission.
+    (This paragraph previously claimed the opposite — that `worker_done` was
+    one of six invented spellings that do not count — while the SQL below and
+    this module's own test both say it does. A comment that contradicts the
+    code in the one place a reader checks this risk is worse than no comment.)
+
+    What does NOT count is anything OFF-shape, and the live registry holds five
+    such spellings workers invented for "I am done": `review.verdict`,
+    `review_verdict`, `review_result`, `completion_verified` and
+    `late_verified_completion`. Treating those as completion would be the hub
+    divining intent from a name it does not define, which is how a stale worker
+    gets read as finished. The fix for them is the brief naming the exact event,
+    not this function guessing.
+
+    One asymmetry worth knowing: SQLite `LIKE` is ASCII case-INSENSITIVE, so
+    `REVIEW_DONE` matches here while the bus-side `_DONE_RE` is case-sensitive
+    and would not. The two sanctioned reporting paths therefore accept slightly
+    different sets. Left as is: widening the regex would be a change in the
+    permissive direction on the path that has always been strict.
     """
     if not task_id or not REGISTRY.exists():
         return None
@@ -537,6 +550,25 @@ def _central_done_at(task_id: str) -> float | None:
     except sqlite3.Error:
         return None
     return _iso_epoch(row[0]) if row else None
+
+
+def _completion_at(task: dict) -> float | None | str:
+    """The merged completion evidence for a task: bus and central, newest wins.
+
+    One function because there were two copies — `derive` and `herdr_data` each
+    ran the same three-line merge, so every render paid for `_evidence_at` and
+    `_central_done_at` TWICE per task (measured by review: 2.2ms -> 18.4ms for
+    66 tasks on a 5s-TTL read path, an 8.4x regression), and the two copies
+    could drift.
+
+    `undatable` is returned unchanged: it is not a time, and every caller has
+    to decide what to do about that rather than be handed a number.
+    """
+    ev = _evidence_at(task.get("worktree"))
+    central = _central_done_at(task.get("task_id") or "")
+    if central is not None:
+        ev = central if not isinstance(ev, float) else max(ev, central)
+    return ev
 
 
 def _bus_relpaths() -> tuple[str, ...]:
@@ -627,8 +659,11 @@ def derived_state(task: dict, panes: dict | None,
     return derive(task, panes, asked_at)[0]
 
 
+_UNSET = object()
+
+
 def derive(task: dict, panes: dict | None,
-           asked_at: float | None = None) -> tuple[str, str]:
+           asked_at: float | None = None, completion=_UNSET) -> tuple[str, str]:
     """(state to SHOW, where it came from) — `live`, `stored`, or `registry`.
 
     `asked_at` is when a brief was last delivered to this worker. Completion
@@ -716,15 +751,18 @@ def derive(task: dict, panes: dict | None,
     if live == "unknown":
         return stored, "stored"
     if live in ("idle", "done"):
-        ev = _evidence_at(task.get("worktree"))
-        # The bus is not the only sanctioned reporting path — see
-        # _central_done_at. Take whichever is NEWER, because a worker may write
-        # both, and a central record is the only one that survives its own
-        # worktree being removed. `undatable` from the bus is not a time, so a
-        # datable central event beats it outright.
-        central = _central_done_at(task.get("task_id") or "")
-        if central is not None:
-            ev = central if not isinstance(ev, float) else max(ev, central)
+        # The bus is not the only sanctioned reporting path (see
+        # _central_done_at), and the merge lives in ONE place so the read path
+        # does it once per task — `completion` is passed in by herdr_data,
+        # which already has it, and computed here for every other caller.
+        # `completion` may be a VALUE or a THUNK. The read path passes a thunk
+        # because `derive` short-circuits before this arm for terminal, gone,
+        # working, blocked and herdr-unreachable rows — most rows, most of the
+        # time — and computing evidence for all of them unconditionally is what
+        # made `herdr_data` 8x slower on a 5s-TTL path. Callers with a value
+        # already in hand (the tests) pass it directly.
+        ev = (completion() if callable(completion)
+              else (_completion_at(task) if completion is _UNSET else completion))
         if ev is None:
             # A worker that has not started yet is not an abandoned brief. The
             # registry's own initial states (`starting`, and the empty string
@@ -764,7 +802,17 @@ def derive(task: dict, panes: dict | None,
         # change; below the threshold the task is still working as far as anyone
         # needs to care.
         since = _iso_epoch(task.get("updated_at"))
-        if since is not None and (time.time() - since) < BLOCKED_DEBOUNCE_SECS:
+        age = None if since is None else time.time() - since
+        # A NEGATIVE age is SKEW, not freshness. `time.time() - since` for an
+        # `updated_at` ahead of the clock is negative, which also satisfies
+        # `< DEBOUNCE` — so a task a year ahead never pages again, on any
+        # surface, because `blocked` is derived only here. Reachable two ways
+        # without anyone doing anything wrong: lib/run-registry.sh's
+        # `import_tasks` inserts `updated_at` verbatim from migrated task JSON,
+        # and `_now_iso` is `date -u`, so any backward clock step (an NTP
+        # correction after a wrong-clock boot, a VM or laptop resume) leaves
+        # stored stamps in the future. `_age` already carries this precedent.
+        if age is not None and 0 <= age < BLOCKED_DEBOUNCE_SECS:
             return "running", "live"
         return "blocked", "live"
     # An agent_status this code does not know is NOT a task state either. Same
@@ -816,15 +864,29 @@ def herdr_data(event_limit: int = 100) -> dict:
     panes = pane_statuses()
     for t in tasks:
         t["stored_state"] = t["state"]
-        t["state"], t["state_source"] = derive(t, panes, _iso_epoch(asked.get(t["task_id"])))
+        # ONE evidence computation per task, and only if the derivation
+        # actually reaches the arm that needs it — a memoised thunk rather than
+        # an eager call, because most rows short-circuit first.
+        _cell: dict = {}
+        def _comp(_t=t, _cell=_cell):
+            if "v" not in _cell:
+                _cell["v"] = _completion_at(_t)
+            return _cell["v"]
+        t["state"], t["state_source"] = derive(
+            t, panes, _iso_epoch(asked.get(t["task_id"])), completion=_comp)
+        _comp_value = _cell.get("v")
         # The evidence time, exposed because ack.sh binds an acknowledgement to
         # it rather than to `now`: acking must not swallow a report that lands
         # while the operator is typing the command.
-        _ev = _evidence_at(t.get("worktree"))
-        _central = _central_done_at(t.get("task_id") or "")
-        if _central is not None:
-            _ev = _central if not isinstance(_ev, float) else max(_ev, _central)
-        t["evidence_at"] = _ev if isinstance(_ev, float) else None
+        #
+        # Published ONLY for the states that were actually derived FROM it.
+        # Before this it was published for every row, including ones derive
+        # short-circuits before ever looking at evidence (terminal, gone,
+        # working, blocked, herdr-unreachable) — and that value is exactly what
+        # ack.sh trusted as "this row is acknowledgeable", so an ack could be
+        # written against a blocked or stalled task and lie in wait.
+        t["evidence_at"] = (_comp_value if isinstance(_comp_value, float)
+                            and t["state"] in ("ready_review", "completed") else None)
         t["state_stale"] = t["state"] != t["stored_state"]
     attention = sorted((t for t in tasks if t["state"] in ATTENTION),
                        key=lambda t: (ATTENTION.index(t["state"]), t["updated_at"]))

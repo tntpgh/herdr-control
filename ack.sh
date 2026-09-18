@@ -62,7 +62,10 @@ try:
 except (OSError, ValueError):
     acks = {}
 
-tasks = snap.get("tasks") or []
+# Elements are checked, not assumed: a well-formed-JSON response of the wrong
+# shape used to print a Python traceback from an operator tool, which is the
+# shape that gets read as "the hub is broken".
+tasks = [t for t in (snap.get("tasks") or []) if isinstance(t, dict)]
 ready = [t for t in tasks if t.get("state") == "ready_review"]
 
 def matches(t, key):
@@ -84,7 +87,16 @@ if mode == "list":
     print(f"\nack them: bash ack.sh --all   |   one: bash ack.sh <label>")
     raise SystemExit(0)
 
-targets = ready if do_all else [t for t in tasks for k in wanted if matches(t, k)]
+# TARGETS COME FROM THE ROWS THIS TOOL IS ABOUT. Drawing them from every task
+# and guarding only on "evidence_at is a number" let `ack.sh pr520` write
+# markers for blocked, stalled and running rows that happened to share a branch
+# suffix — and those markers lie in wait: the moment such a pane goes idle with
+# its evidence time unchanged, the ack fires and the row leaves every surface,
+# including this tool's own listing, so `--undo` cannot even name it.
+# `--undo` still searches every task, because removing a marker can only ever
+# make something MORE visible.
+pool = tasks if undo else ready
+targets = ready if do_all else [t for t in pool for k in wanted if matches(t, k)]
 if not targets:
     print(f"nothing matched: {' '.join(wanted) or '(no arguments)'}", file=sys.stderr)
     raise SystemExit(2)
@@ -102,9 +114,14 @@ for t in targets:
     # The marker is the EVIDENCE TIME the hub derived, not now(): acking must
     # not swallow a report that lands while you are typing the command.
     ev = t.get("evidence_at")
+    if t.get("state") != "ready_review":
+        # Belt to the `pool` braces above: a marker may only ever be written
+        # for the state an ack means something about.
+        print(f"refusing {t.get('label')}: state is {t.get('state')}, not ready_review", file=sys.stderr)
+        continue
     if not isinstance(ev, (int, float)):
-        # No evidence time means this is not a ready_review row; refuse rather
-        # than write a marker that silences a future report.
+        # No evidence time to bind to. Writing `now` here would silence a report
+        # that lands a second later.
         print(f"refusing {t.get('label')}: no evidence time (state {t.get('state')})", file=sys.stderr)
         continue
     acks[tid] = ev
