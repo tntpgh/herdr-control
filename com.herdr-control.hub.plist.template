@@ -14,6 +14,18 @@
 	<dict>
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<!-- Standing authority for agent-edge.sh to call peer-answer.sh, granted
+		     by Terrence on 2026-09-18 (decision 20260918T061813-58938, answer
+		     authority=grant). Without it every worker prompt reached a human,
+		     including `git status`: the machine floor posture is `write`, which
+		     auto-approves edits but still prompts before EXECUTING, so a review
+		     lane stalls on its first command. peer-answer re-parses the menu
+		     itself and lets lib/command-policy.sh decide, so this delegates only
+		     the `allow` class; `escalate` (credentials, production targets,
+		     remote mutation) and `deny` still stop, and a reserved action can be
+		     DECLINED but never approved by automation. -->
+		<key>HERDR_EDGE_PEER_ANSWER</key>
+		<string>1</string>
 	</dict>
 	<key>RunAtLoad</key>
 	<true/>
