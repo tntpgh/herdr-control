@@ -139,6 +139,30 @@ command = ["bash", "smart-name.sh"]
 
 # attention — print the one agent that needs you next, with an honest
 # waiting-reason, and set the sidebar/tab-colour tokens for every other pane.
+# approvals — every pane that is asking something, what the classifier says
+# about it, and (on request) an accountable answer to the operational ones.
+#
+# This is the half that repays the raw-keypress guard. Answering a prompt used
+# to be `herdr pane send-keys <pane> ENTER`; that is denied now, correctly, and
+# the compliant path costs four manual steps plus a copied prompt id per pane.
+# Four panes were parked at once on 2026-09-18. A safe path nobody can afford
+# is a safe path people route around.
+#
+# A PANE, not a headless action: the survey is something to read before
+# anything is answered, and `--answer` is a second, deliberate keystroke.
+[[actions]]
+id = "approvals"
+title = "herdr-control: Pending Approvals"
+description = "Survey every pane that is asking something, with the classifier's verdict; answer the operational ones through herdr-select"
+contexts = ["workspace"]
+command = ["bash", "pick-pane-open.sh", "approvals-pick"]
+
+[[panes]]
+id = "approvals-pick"
+title = "Pending Approvals"
+placement = "overlay"
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/approvals-pane.sh\""]
+
 [[actions]]
 id = "attention"
 title = "herdr-control: What Needs Me"
