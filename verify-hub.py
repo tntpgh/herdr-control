@@ -540,6 +540,329 @@ class AttentionProvenance(unittest.TestCase):
         self.assertEqual(sum(1 for x in rows if x.get("state_source") == "stored"), 0)
 
 
+class FinishedButUnseen(unittest.TestCase):
+    """Finished work needed a state between "pages forever" and "invisible".
+
+    Measured 2026-09-18: five tasks sat in Needs-attention for a day, every one
+    of them a worker whose pane read "awaiting PR review/merge decision from
+    Terrence" and every one filed as `stalled` — the state whose meaning is
+    "took a brief and went quiet". Completion retires a row from every
+    attention surface, so the only way to clear a finished-but-undecided task
+    was to close its pane.
+
+    Taxonomy borrowed with attribution from eliasstravik/herdr-projects (MIT),
+    which separates Ready-for-review from Waiting-on-you and acknowledges what
+    has been seen. `Landing` (PR open AND approved) is deliberately not taken:
+    this registry holds no PR state.
+    """
+
+    def _task(self, **kw):
+        t = {"task_id": "task_x", "pane_id": "w1:p1", "worktree": "/nonexistent",
+             "state": "running", "updated_at": "2026-09-07T13:00:00Z", "pane_birth": ""}
+        t.update(kw)
+        return t
+
+    def _panes(self, status="idle"):
+        return {"w1:p1": {"pane_id": "w1:p1", "agent_status": status, "birth": ""}}
+
+    def test_evidence_with_no_ack_is_ready_for_review_not_stalled(self):
+        with patch.object(hub, "_evidence_at", lambda w: 1000.0), \
+             patch.object(hub, "_central_done_at", lambda t: None), \
+             patch.object(hub, "_acks", lambda: {}):
+            self.assertEqual(hub.derive(self._task(), self._panes())[0], "ready_review")
+
+    def test_ready_review_is_an_attention_state(self):
+        self.assertIn("ready_review", hub.ATTENTION)
+
+    def test_an_ack_at_or_after_the_evidence_clears_it(self):
+        with patch.object(hub, "_evidence_at", lambda w: 1000.0), \
+             patch.object(hub, "_central_done_at", lambda t: None), \
+             patch.object(hub, "_acks", lambda: {"task_x": 1000.0}):
+            self.assertEqual(hub.derive(self._task(), self._panes())[0], "completed")
+
+    def test_a_newer_report_comes_back_after_an_ack(self):
+        """Acking round one must not silence round two."""
+        with patch.object(hub, "_evidence_at", lambda w: 2000.0), \
+             patch.object(hub, "_central_done_at", lambda t: None), \
+             patch.object(hub, "_acks", lambda: {"task_x": 1000.0}):
+            self.assertEqual(hub.derive(self._task(), self._panes())[0], "ready_review")
+
+    def test_no_evidence_anywhere_is_still_stalled(self):
+        """The PR #313 case is untouched: a brief delivered, nothing back."""
+        with patch.object(hub, "_evidence_at", lambda w: None), \
+             patch.object(hub, "_central_done_at", lambda t: None), \
+             patch.object(hub, "_acks", lambda: {}):
+            self.assertEqual(hub.derive(self._task(), self._panes(), asked_at=500.0)[0], "stalled")
+
+    def test_an_ack_cannot_silence_a_task_with_no_evidence(self):
+        """An ack binds to an evidence time; a stalled task has none to bind."""
+        with patch.object(hub, "_evidence_at", lambda w: None), \
+             patch.object(hub, "_central_done_at", lambda t: None), \
+             patch.object(hub, "_acks", lambda: {"task_x": 9e9}):
+            self.assertEqual(hub.derive(self._task(), self._panes(), asked_at=500.0)[0], "stalled")
+
+    def test_stale_evidence_against_a_newer_brief_is_still_stalled(self):
+        with patch.object(hub, "_evidence_at", lambda w: 100.0), \
+             patch.object(hub, "_central_done_at", lambda t: None), \
+             patch.object(hub, "_acks", lambda: {}):
+            self.assertEqual(hub.derive(self._task(), self._panes(), asked_at=500.0)[0], "stalled")
+
+
+class CentralCompletionEvidence(unittest.TestCase):
+    """The worktree bus is not the only sanctioned place to report finishing.
+
+    spawn-task.sh tells every worker that a task whose own effect removes its
+    worktree should "call append_event() from lib/run-registry.sh directly
+    (writes to the central registry, survives worktree removal)". Nothing read
+    that, so a worker taking the documented advice was indistinguishable from
+    one that went quiet.
+    """
+
+    def _panes(self):
+        return {"w1:p1": {"pane_id": "w1:p1", "agent_status": "idle", "birth": ""}}
+
+    def _task(self):
+        return {"task_id": "task_x", "pane_id": "w1:p1", "worktree": "/nonexistent",
+                "state": "running", "updated_at": "2026-09-07T13:00:00Z", "pane_birth": ""}
+
+    def test_central_evidence_alone_is_enough(self):
+        with patch.object(hub, "_evidence_at", lambda w: None), \
+             patch.object(hub, "_central_done_at", lambda t: 1000.0), \
+             patch.object(hub, "_acks", lambda: {}):
+            self.assertEqual(hub.derive(self._task(), self._panes())[0], "ready_review")
+
+    def test_the_newer_of_the_two_sources_wins(self):
+        with patch.object(hub, "_evidence_at", lambda w: 1000.0), \
+             patch.object(hub, "_central_done_at", lambda t: 3000.0), \
+             patch.object(hub, "_acks", lambda: {"task_x": 2000.0}):
+            # An ack older than the central report must not clear it.
+            self.assertEqual(hub.derive(self._task(), self._panes())[0], "ready_review")
+
+    def test_a_datable_central_event_beats_an_undatable_bus(self):
+        """`undatable` is not a time; a real central timestamp is."""
+        with patch.object(hub, "_evidence_at", lambda w: "undatable"), \
+             patch.object(hub, "_central_done_at", lambda t: 1000.0), \
+             patch.object(hub, "_acks", lambda: {}):
+            self.assertEqual(hub.derive(self._task(), self._panes(), asked_at=500.0)[0], "ready_review")
+
+    def test_the_contract_is_a_SHAPE_not_a_list_of_names(self):
+        """What counts is the `_done` SUFFIX, plus our reconciler's two types.
+
+        The live registry holds six spellings workers invented for "done":
+        `review.verdict`, `review_verdict`, `review_result`, `worker_done`,
+        `completion_verified`, `late_verified_completion`. Only the ones ending
+        `_done` count — including `worker_done`, which nothing in-tree writes
+        but which satisfies the contract spawn-task.sh:125 states
+        (`${label}_done`). That is the point: a SHAPE, so a worker can name its
+        own event without asking permission, and not an allow-list of names,
+        which is the enumeration trap this codebase keeps having to undo.
+        `review.verdict` does not count — not because it is unknown, but
+        because it is not the shape, and guessing intent from a name the hub
+        does not define is how a stale worker reads as finished.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "registry.sqlite3"
+            import sqlite3
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, "
+                         "task_id TEXT, type TEXT, occurred_at TEXT)")
+            for tid, typ in (("t_invented", "review.verdict"), ("t_invented2", "worker_done"),
+                             ("t_ours", "implement-x_done"), ("t_recon", "completion_recorded")):
+                conn.execute("INSERT INTO events (task_id, type, occurred_at) VALUES (?,?,?)",
+                             (tid, typ, "2026-09-18T08:00:00Z"))
+            conn.commit(); conn.close()
+            with patch.object(hub, "REGISTRY", db):
+                self.assertIsNone(hub._central_done_at("t_invented"),
+                                  "an agent-invented type must not count as completion")
+                self.assertIsNotNone(hub._central_done_at("t_invented2"),
+                                     "`worker_done` ends in _done, so it satisfies the shape")
+                self.assertIsNotNone(hub._central_done_at("t_ours"),
+                                     "the `_done` suffix is the contract spawn-task.sh asks for")
+                self.assertIsNotNone(hub._central_done_at("t_recon"),
+                                     "our own reconciler's event must count")
+                # The ESCAPE clause makes `\_` a LITERAL underscore. Drop it and
+                # the pattern becomes `%_done`, which matches any type ending in
+                # `done` with one preceding character — `notdone`, `undone`,
+                # `predone` — a widening in the read-a-stale-worker-as-finished
+                # direction that left both suites green until this row existed.
+                conn2 = sqlite3.connect(db)
+                conn2.execute("INSERT INTO events (task_id, type, occurred_at) VALUES (?,?,?)",
+                              ("t_offshape", "notdone", "2026-09-18T08:00:00Z"))
+                conn2.commit(); conn2.close()
+                self.assertIsNone(hub._central_done_at("t_offshape"),
+                                  "the underscore is literal: ESCAPE must not be droppable")
+
+    def test_an_unreadable_registry_is_not_completion(self):
+        with patch.object(hub, "REGISTRY", Path("/nonexistent/registry.sqlite3")):
+            self.assertIsNone(hub._central_done_at("t"))
+
+
+class EvidenceAtIsScoped(unittest.TestCase):
+    """`evidence_at` is published only for the states derived FROM evidence.
+
+    It was published for every row, including ones `derive` short-circuits
+    before ever looking at evidence — terminal, gone, working, blocked,
+    herdr-unreachable — and that value is exactly what ack.sh trusted as
+    "this row is acknowledgeable". An ack written against a blocked or stalled
+    task lies in wait: the moment that pane goes idle with its evidence time
+    unchanged, the ack fires and the row leaves every surface.
+    """
+
+    def _rows(self, state, pane_status):
+        tasks = [{"task_id": "t1", "run_id": "r", "label": "l", "repo": "x", "state": state,
+                  "pane_id": "w1:p1", "conductor_id": "", "worktree": "/nonexistent",
+                  "created_at": "2026-09-07T12:00:00Z", "updated_at": "2026-09-07T13:00:00Z"}]
+        panes = {"w1:p1": {"pane_id": "w1:p1", "agent_status": pane_status, "birth": ""}}
+        with patch.object(hub, "_completion_at", lambda t: 1000.0), \
+             patch.object(hub, "_acks", lambda: {}), \
+             patch.object(hub, "pane_statuses", lambda: panes), \
+             patch.object(hub, "REGISTRY", Path("/nonexistent")):
+            # herdr_data needs a registry; drive derive directly instead and
+            # apply the same publication rule the read path applies.
+            st, _src = hub.derive(tasks[0], panes, None, completion=1000.0)
+        return st
+
+    def test_a_blocked_row_is_not_given_an_evidence_time(self):
+        self.assertEqual(self._rows("running", "blocked"), "blocked")
+
+    def test_an_evidence_backed_row_is(self):
+        self.assertEqual(self._rows("running", "idle"), "ready_review")
+
+    def test_herdr_data_publishes_evidence_at_only_for_evidence_backed_rows(self):
+        """The rule lives in the READ PATH, so it has to be tested there.
+
+        Driving `derive` alone left this uncovered: publishing `evidence_at`
+        for every row is invisible to a derive-level test, and that field is
+        exactly what ack.sh trusts as "this row is acknowledgeable".
+        """
+        import sqlite3
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "registry.sqlite3"
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                "CREATE TABLE tasks (task_id TEXT, run_id TEXT, label TEXT, repo TEXT, state TEXT,"
+                " pane_id TEXT, conductor_id TEXT, worktree TEXT, created_at TEXT, updated_at TEXT);"
+                "CREATE TABLE events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT,"
+                " task_id TEXT, occurred_at TEXT, payload TEXT);"
+                "CREATE TABLE checkpoints (conductor_id TEXT, last_event_seq INT, updated_at TEXT);")
+            for tid, pane in (("t_idle", "w1:p1"), ("t_blocked", "w1:p2")):
+                conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+                             (tid, "r", tid, "repo", "running", pane, "", "/nonexistent",
+                              "2026-09-07T12:00:00Z", "2026-09-07T13:00:00Z"))
+            conn.commit(); conn.close()
+            panes = {"w1:p1": {"pane_id": "w1:p1", "agent_status": "idle", "birth": ""},
+                     "w1:p2": {"pane_id": "w1:p2", "agent_status": "blocked", "birth": ""}}
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "pane_statuses", lambda: panes), \
+                 patch.object(hub, "_completion_at", lambda t: 1000.0), \
+                 patch.object(hub, "_acks", lambda: {}):
+                rows = {t["task_id"]: t for t in hub.herdr_data()["tasks"]}
+        self.assertEqual(rows["t_idle"]["state"], "ready_review")
+        self.assertEqual(rows["t_idle"]["evidence_at"], 1000.0,
+                         "an evidence-backed row carries the time an ack binds to")
+        self.assertEqual(rows["t_blocked"]["state"], "blocked")
+        self.assertIsNone(rows["t_blocked"]["evidence_at"],
+                          "a blocked row must carry NO evidence time: ack.sh trusts that field")
+
+    def test_a_stalled_row_with_evidence_carries_no_evidence_time(self):
+        """The ONE shape the publication filter alone stops.
+
+        For blocked, gone and terminal rows the filter is redundant — the thunk
+        is never called, so there is nothing to publish. It is load-bearing for
+        exactly one case: a row that REACHES the idle/done arm, computes its
+        evidence, and then derives `stalled` because that evidence predates the
+        last brief. That is the original latent-marker vector: `evidence_at`
+        would be published for a task that needs attention, and ack.sh accepts
+        that field as "this row is acknowledgeable", so acking it would silence
+        a worker that answered an older round and went quiet.
+
+        Fixture from the reviewer who found it: a `_done` at 10:00 with a brief
+        delivered at 12:00.
+        """
+        import sqlite3
+        with tempfile.TemporaryDirectory() as d:
+            wt = Path(d) / "wt"
+            (wt / ".handoffs").mkdir(parents=True)
+            (wt / ".handoffs/events.jsonl").write_text(
+                '{"event":"implement:x_done","ts":"2026-09-18T10:00:00Z"}\n')
+            db = Path(d) / "registry.sqlite3"
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                "CREATE TABLE tasks (task_id TEXT, run_id TEXT, label TEXT, repo TEXT, state TEXT,"
+                " pane_id TEXT, conductor_id TEXT, worktree TEXT, created_at TEXT, updated_at TEXT);"
+                "CREATE TABLE events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT,"
+                " task_id TEXT, occurred_at TEXT, payload TEXT);"
+                "CREATE TABLE checkpoints (conductor_id TEXT, last_event_seq INT, updated_at TEXT);")
+            conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         ("t_stale", "r", "l", "repo", "running", "w1:p1", "", str(wt),
+                          "2026-09-18T09:00:00Z", "2026-09-18T09:30:00Z"))
+            conn.execute("INSERT INTO events (type, task_id, occurred_at, payload) VALUES (?,?,?,?)",
+                         ("brief_delivered", "t_stale", "2026-09-18T12:00:00Z", "{}"))
+            conn.commit(); conn.close()
+            panes = {"w1:p1": {"pane_id": "w1:p1", "agent_status": "idle", "birth": ""}}
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "pane_statuses", lambda: panes), \
+                 patch.object(hub, "_acks", lambda: {}):
+                row = hub.herdr_data()["tasks"][0]
+        self.assertEqual(row["state"], "stalled",
+                         "evidence older than the last brief answered a previous round")
+        self.assertIsNone(row["evidence_at"],
+                          "a stalled row must carry no evidence time: ack.sh would accept it")
+
+    def test_derive_does_not_recompute_when_handed_a_completion(self):
+        """One computation per task on the read path, not two."""
+        calls = []
+        task = {"task_id": "t", "pane_id": "w1:p1", "worktree": "/nonexistent",
+                "state": "running", "updated_at": "2026-09-07T13:00:00Z", "pane_birth": ""}
+        panes = {"w1:p1": {"pane_id": "w1:p1", "agent_status": "idle", "birth": ""}}
+        with patch.object(hub, "_completion_at", lambda t: calls.append(1) or 1000.0), \
+             patch.object(hub, "_acks", lambda: {}):
+            hub.derive(task, panes, None, completion=1000.0)
+        self.assertEqual(calls, [], "a passed-in completion must not be recomputed")
+
+
+class BlockedDebounce(unittest.TestCase):
+    """A worker is blocked for a second or two every time it asks anything.
+
+    Undebounced, the attention count flickered with every prompt. 30s, the
+    value herdr-projects measured against the same agent CLIs.
+    """
+
+    def _task(self, updated):
+        return {"task_id": "t", "pane_id": "w1:p1", "worktree": "/nonexistent",
+                "state": "running", "updated_at": updated, "pane_birth": ""}
+
+    def _panes(self):
+        return {"w1:p1": {"pane_id": "w1:p1", "agent_status": "blocked", "birth": ""}}
+
+    def _iso(self, ago):
+        return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_a_momentary_block_does_not_page(self):
+        self.assertEqual(hub.derive(self._task(self._iso(2)), self._panes())[0], "running")
+
+    def test_a_block_past_the_debounce_pages(self):
+        self.assertEqual(hub.derive(self._task(self._iso(120)), self._panes())[0], "blocked")
+
+    def test_an_undatable_updated_at_pages_rather_than_hiding(self):
+        """A missing timestamp must not swallow a real block."""
+        self.assertEqual(hub.derive(self._task("not-a-date"), self._panes())[0], "blocked")
+
+    def test_a_future_timestamp_does_not_hide_a_block_forever(self):
+        """`time.time() - since` is NEGATIVE for a stamp ahead of the clock,
+        which is also `< 30`, so an unclamped debounce hid the task on every
+        surface until wall-clock caught up — for a year-ahead stamp, forever.
+        Reachable without anyone doing anything wrong: run-registry's
+        `import_tasks` takes `updated_at` verbatim from migrated JSON, and any
+        backward clock step (NTP after a wrong-clock boot, a laptop resume)
+        leaves stored stamps in the future.
+        """
+        for ahead in (60, 86_400, 365 * 86_400):
+            self.assertEqual(
+                hub.derive(self._task(self._iso(-ahead)), self._panes())[0], "blocked",
+                f"a stamp {ahead}s ahead of the clock must still page")
+
+
 class CacheFreshness(unittest.TestCase):
     """Who pays for a refresh, and what may be served stale.
 

@@ -14,6 +14,7 @@ import sys
 import time
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -80,12 +81,26 @@ def run() -> int:
                      "unknown": "term-live"}.get(c.get("birth"), "")
             if de == "trailing":
                 os.utime(ev, (NOW, NOW)); asked = NOW - 300   # mtime NEWER than the ask
+            # `acked` is the marker ack.sh writes: the task's EVIDENCE time, so
+            # that acking round one cannot silence round two. "at-evidence"
+            # means the operator has seen this report; "before-evidence" means
+            # they acked an earlier one. A case without the column patches
+            # nothing, so every pre-existing row keeps its meaning.
+            acks = {}
+            if c.get("acked"):
+                ev_at = hub._evidence_at(str(wt))
+                base = ev_at if isinstance(ev_at, float) else time.time()
+                acks = {"task_t": base if c["acked"] == "at-evidence" else base - 600}
+            _ack_patch = patch.object(hub, "_acks", lambda: acks)
+            _ack_patch.start()
             try:
                 got = hub.derived_state(
                     {"state": c["stored"], "pane_id": pid, "worktree": str(wt),
-                     "pane_birth": birth}, panes, asked)
+                     "task_id": "task_t", "pane_birth": birth}, panes, asked)
             except Exception as e:  # noqa: BLE001 — a raiser here IS the defect
                 got = f"{type(e).__name__}: {e}"
+            finally:
+                _ack_patch.stop()
             if got == c["want"]:
                 ok += 1
                 print(f"  ok   {c['name']}")
@@ -127,9 +142,14 @@ def run() -> int:
         try:
             got = hub.derived_state({"state": "running", "pane_id": PANE,
                                      "worktree": str(badbus)}, {PANE: {"agent_status": "idle", "birth": "t"}})
-            checks2 = [("non-UTF8 byte in the bus does not raise", "completed", got)]
+            # `ready_review`, not `completed`, since 2026-09-18: evidence with
+            # nobody having acked it is finished-but-unseen. What this row
+            # actually defends is unchanged — one stray byte must not raise,
+            # because `Cached.get` turns any exception into an error dict and
+            # the whole attention surface then reports zero.
+            checks2 = [("non-UTF8 byte in the bus does not raise", "ready_review", got)]
         except Exception as e:  # noqa: BLE001
-            checks2 = [("non-UTF8 byte in the bus does not raise", "completed",
+            checks2 = [("non-UTF8 byte in the bus does not raise", "ready_review",
                         f"{type(e).__name__}: {e}")]
 
         # HERDR_HANDOFF_DIR is a supported override the shell honours; hub
@@ -145,7 +165,9 @@ def run() -> int:
             got = f"{type(e).__name__}: {e}"
         finally:
             del os.environ["HERDR_HANDOFF_DIR"]
-        checks2.append(("HERDR_HANDOFF_DIR is honoured", "completed", got))
+        # Same rename, same defended property: a reader that hardcodes
+        # `.handoffs` finds evidence for nobody on an install that overrides it.
+        checks2.append(("HERDR_HANDOFF_DIR is honoured", "ready_review", got))
 
         # The liveness source is the subscription now, not `herdr pane list`.
         # What must hold is unchanged and is the same class of bug: anything
@@ -251,8 +273,12 @@ def run() -> int:
                 "pane_birth": "term-live"}
         live = {PANE: {"agent_status": "idle", "birth": "term-live"}}
         for label, asked_ago, want in (
-            ("round-one brief, then the worker finished", 1200, "completed"),
-            ("a reply delivered after it finished does NOT re-ask", 1200, "completed"),
+            # Both assert the ROUND comparison, which is untouched: evidence
+            # newer than the last brief means the worker answered THIS round.
+            # Only the name of that outcome changed — it is now the state that
+            # says "finished, nobody has looked".
+            ("round-one brief, then the worker finished", 1200, "ready_review"),
+            ("a reply delivered after it finished does NOT re-ask", 1200, "ready_review"),
             ("a NEW brief after it finished DOES re-ask", 0, "stalled"),
         ):
             got = hub.derived_state(task, live, NOW - asked_ago)
