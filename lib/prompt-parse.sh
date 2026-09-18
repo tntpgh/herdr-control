@@ -447,11 +447,55 @@ question = []
 selected = ""
 invalid = complete = visible = False
 truncated = False
+
+
+def _text(s):
+    return re.sub(r"^[^A-Za-z0-9]+", "", ansi.sub("", s)).rstrip(" \t\r\n|-\u2502\u2500\u256e")
+
+
+# A pane narrow enough to wrap the navigation footer splits it across rows, and
+# the wrap point depends only on pane width: 43 columns broke it before
+# "cancel", a narrower pane breaks it earlier. Every fragment is footer, never
+# output — but both passes below judge rows individually, so the leftover
+# fragment read as text BELOW the footer and failed the panel closed. The hub
+# then paged for a prompt that peer-answer and herdr-select both refused to
+# touch, leaving a human keypress as the only exit (wN:p9, 2026-09-18).
+#
+# Rejoining here, once, keeps both passes and every fixture judging the same
+# canonical single-row footer. It only ever fires on rows whose text is a
+# PREFIX of the exact phrase, so a command row that merely mentions these words
+# is untouched.
+FOOTER = "up/down navigate enter select esc cancel"
+
+
+def _unwrap_footer(rows):
+    out, i = [], 0
+    while i < len(rows):
+        acc = " ".join(_text(rows[i]).split())
+        if acc and acc != FOOTER and FOOTER.startswith(acc):
+            j = i + 1
+            while j < len(rows) and acc != FOOTER:
+                nxt = " ".join(_text(rows[j]).split())
+                if not nxt:
+                    j += 1
+                    continue
+                cand = acc + " " + nxt
+                if not FOOTER.startswith(cand):
+                    break
+                acc, j = cand, j + 1
+            if acc == FOOTER:
+                out.append(FOOTER + "\n")
+                i = j
+                continue
+        out.append(rows[i])
+        i += 1
+    return out
+
+
 # Read bytes: a stray non-UTF-8 byte in a pane must degrade to U+FFFD, not
 # abort the parser and silence the wake path.
-for raw in sys.stdin.buffer:
-    line = raw.decode("utf-8", "replace")
-    lines.append(line)
+lines = _unwrap_footer([raw.decode("utf-8", "replace") for raw in sys.stdin.buffer])
+for line in lines:
     plain = ansi.sub("", line)
     # `text` (leading punctuation stripped) is ONLY for header/option/footer
     # matching. `body` keeps a command row intact — `-rf`, `--flag`, `| sh`,
@@ -505,8 +549,6 @@ for raw in sys.stdin.buffer:
 
 # ---- pass 2: footer-anchored, header off-screen -----------------------------
 if not complete:
-    def _text(s):
-        return re.sub(r"^[^A-Za-z0-9]+", "", ansi.sub("", s)).rstrip(" \t\r\n|-\u2502\u2500\u256e")
     foot = None
     for i in range(len(lines) - 1, -1, -1):
         t = _text(lines[i])

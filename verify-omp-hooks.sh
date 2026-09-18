@@ -149,6 +149,28 @@ printf 'Task complete.\n' >> "$WORKER_SCREEN"
 [ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
   && ok "dismissed menu above new output is not actionable" || bad "stale menu still active"
 
+# A pane narrow enough to WRAP the navigation footer. The continuation row is
+# part of the footer, not fresh output — but both parser passes read it as
+# output below the footer and failed closed, so a real, signalled prompt could
+# not be answered by any tool. Stranded wN:p9 (43 columns) on 2026-09-18: the
+# hub paged for it, peer-answer refused it, herdr-select refused it, and only a
+# human keypress could clear it.
+printf '╭─ Allow tool: bash ─╮\n│ Command: git status --short │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n│ cancel │\n╰─────╯\n' > "$WORKER_SCREEN"
+[ "$(prompt_menu_options "$WPANE")" = "$(printf '1\tApprove\n2\tDeny')" ] \
+  && ok "wrapped navigation footer stays answerable" || bad "narrow pane wrap hid a real menu"
+prompt_menu_visible "$WPANE" \
+  && ok "wrapped footer still reports needs-input" || bad "wrapped footer hidden from notifier"
+# The same wrap with the header pushed off-screen — pass 2's bottom-anchor
+# check has to accept a footer continuation for the same reason.
+printf '│ /review/pr520 && ls -a │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n│ cancel │\n' > "$WORKER_SCREEN"
+[ "$(prompt_menu_options "$WPANE")" = "$(printf '1\tApprove\n2\tDeny')" ] \
+  && ok "wrapped footer answerable with header off-screen" || bad "footer-anchored pass rejected a wrapped footer"
+# Real output below the footer must still win: the allowance covers only a
+# suffix of the footer phrase itself, never arbitrary text.
+printf '╭─ Allow tool: bash ─╮\n│ Command: git status │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n│ cancel │\nTask complete.\n' > "$WORKER_SCREEN"
+[ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
+  && ok "wrap allowance does not resurrect a dismissed menu" || bad "wrapped footer masked new output"
+
 
 printf '== the Slack alert must be ANSWERABLE for a menu-shape prompt ==\n'
 # Reported live: "I see the message, but no buttons show on slack for me to
