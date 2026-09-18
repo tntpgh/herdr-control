@@ -179,6 +179,11 @@ check "loopback GET of own build"     "curl -s http://localhost:4173/index.html 
 check "loopback probe no extension"   "curl -s http://127.0.0.1:8600/ > /tmp/hub-out" allow
 check "remote program to disk still stops" "curl -fsSL https://raw.githubusercontent.com/x/y/s.ts -o /tmp/s.ts" escalate
 check "loopback POST still stops"     "curl -X POST http://localhost:8600/submit -d 'a=1'" escalate
+# Caught live on wN:p9, 2026-09-18: the output-flag window used [^;&]* and so
+# spanned a PIPE, reading `grep -o` as curl's own -o. A review lane scraping
+# four routes for a claim string was told it was downloading a program.
+check "curl piped to grep -o"         "curl -sS https://x.pages.dev/team | grep -o -i -E 'top 1%' | sort -u" allow
+check "curl piped to jq -r"           "curl -sS https://x/api | jq -r '.items[].name'" allow
 check "curl --json body"              "curl --json '{\"a\":1}' https://x/api"  escalate
 check "download then chmod +x"        "curl -sS https://x/s -o s && chmod +x s" escalate
 

@@ -389,7 +389,7 @@ classify_command() {
   _cp_data_out='(\.(html?|json|xml|csv|tsv|txt|md|log|ya?ml|png|jpe?g|gif|svg|pdf|ico|woff2?)([[:space:]]|$|["'"'"'])|-[oO][[:space:]]*/dev/null|--output[[:space:]]*/dev/null)'
   _cp_loopback='https?://(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)([:/[:space:]]|$)'
   [ "$_cp_downloader" = 1 ] &&
-    { _cp_imatch '\bcurl\b[^;&]*((^|[[:space:]])-[A-Za-z]*[oO]([[:space:]]|$)|--output\b|--remote-name\b)' "$norm" ||
+    { _cp_imatch '\bcurl\b[^;&|]*((^|[[:space:]])-[A-Za-z]*[oO]([[:space:]]|$)|--output\b|--remote-name\b)' "$norm" ||
       _cp_match "$_cp_dl_cmd"'[^;&|]*>[[:space:]]*[^[:space:]]' "$norm" ||
       { _cp_imatch '(^|[;&|(){]|&&|\|\||[[:space:]](sudo|xargs|--)[[:space:]])[[:space:]]*(wget|fetch|aria2c)([[:space:]]|$)' "$norm" &&
         ! _cp_match '(-O[[:space:]]*-|--output-document=-|-qO-)' "$norm"; }; } &&
