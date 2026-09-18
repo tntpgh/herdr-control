@@ -374,6 +374,58 @@ EOS
 git -C "$R" add sources.md
 allows "$R" "a DOI is not read as a phone number (digit-run false positive)"
 
+# tntpgh-dev's published VIDEO metadata is public marketing content, not client
+# PII. The titles come verbatim from the team's own YouTube channel and they are
+# listing addresses because the videos are listing tours; `public/sitemap.xml`
+# is generated from the same data at prebuild, so the addresses reappear in its
+# video elements on every regeneration. Without these two exemptions the street
+# check blocks the VideoObject schema work outright (2026-09-16, plan 013 P3).
+R="$(new_repo)"
+mkdir -p "$R/src/data"
+printf '{"videos":[{"id":"x","title":"%s Original"}]}\n' "$BADSTREET" > "$R/src/data/videos.json"
+git -C "$R" add src/data/videos.json
+allows "$R" "a listing address in src/data/videos.json is published marketing, not PII"
+
+R="$(new_repo)"
+mkdir -p "$R/public"
+printf '<video:title>%s</video:title>\n' "$BADSTREET" > "$R/public/sitemap.xml"
+git -C "$R" add public/sitemap.xml
+allows "$R" "the same address in the generated public/sitemap.xml is allowed too"
+
+# ...and the exemption is a PATH exemption, never a content shield: the same
+# value one directory over still blocks, and a real credential inside an
+# exempted path is still caught by the credential half, which walks every
+# staged file independently of this list.
+R="$(new_repo)"
+mkdir -p "$R/src/data"
+printf '{"client":{"addr":"%s"}}\n' "$BADSTREET" > "$R/src/data/clients.json"
+git -C "$R" add src/data/clients.json
+blocks "$R" "the same address in a NON-exempt src/data file still blocks"
+
+R="$(new_repo)"
+mkdir -p "$R/src/data"
+printf '{"videos":[],"token":"ghp_%s"}\n' "$(printf 'A%.0s' $(seq 36))" > "$R/src/data/videos.json"
+git -C "$R" add src/data/videos.json
+blocks "$R" "a credential inside the exempted videos.json is still blocked"
+
+# ...and the exemption is ADDRESS-ONLY. A first draft put both paths in
+# PII_EXCLUDES, which drops them from the whole PII input, so a real pre-push
+# probe allowed a third-party email in videos.json and a non-fiction phone in
+# sitemap.xml -- two public-output paths had become general PII bypasses
+# (found in review, 2026-09-16). The phone and email detectors must still read
+# every line of both files.
+R="$(new_repo)"
+mkdir -p "$R/src/data"
+printf '{"videos":[{"contact":"%s"}]}\n' "$BADMAIL" > "$R/src/data/videos.json"
+git -C "$R" add src/data/videos.json
+blocks "$R" "a third-party email in the address-exempt videos.json still blocks"
+
+R="$(new_repo)"
+mkdir -p "$R/public"
+printf '<video:description>call %s</video:description>\n' "$BADPHONE" > "$R/public/sitemap.xml"
+git -C "$R" add public/sitemap.xml
+blocks "$R" "a real phone in the address-exempt sitemap.xml still blocks"
+
 printf '== ...and real-looking PII still blocks ==\n'
 R="$(new_repo)"
 printf 'owner = "%s"\n' "$BADMAIL" > "$R/crm.py"
