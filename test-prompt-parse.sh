@@ -33,6 +33,10 @@ HL=$'\x1b[48;2;40;40;40m'          # the 24-bit background the highlighted row c
 # printf. An escaped fixture silently becomes the text "\u2502", the header row
 # then fails to match, and every positive case fails while the fail-closed
 # cases still pass — which reads exactly like a broken parser.
+# Same trap, second form, found while reviewing the footer-unwrap fix: a
+# non-breaking space written as \u00a0 also stays literal text under bash 3.2,
+# so an NBSP-padded continuation row appears not to parse when the fixture is
+# what is broken. Write real bytes — $'\302\240' — and it parses fine.
 FOOT='│ up/down navigate  enter select  esc cancel │'
 
 # Build a panel. header=1 includes the "Allow tool:" anchor; body=N detail rows;

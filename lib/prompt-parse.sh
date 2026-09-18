@@ -489,6 +489,27 @@ def _text(s):
 # happen now — and if it ever did, _menu_gate would close first (the window
 # would contain no literal "select") and the parser would never be spawned, so
 # no fixture here would catch it. Worth knowing before changing how omp draws.
+#
+# A second gap is ACCEPTED DELIBERATELY, disclosed by the reviewer who found
+# the adjacency bug above: adjacency does not require the continuation to be
+# INSIDE the panel, so a bordered fragment
+#     │ up/down navigate  enter select  esc │
+# followed DIRECTLY by a bare, unbordered `cancel` still parses as answerable,
+# where main refuses it. It needs the first fragment to be the last panel row
+# with no closing border beneath it, and no real dismissed-panel capture
+# produces that — the panel own second fragment and its `╰──╯` sit in
+# between, and the break fires.
+#
+# The available fix (require both rows to share the box gutter) was written and
+# tested, and REJECTED: it assumes a wrap preserves the gutter, so a
+# hanging-indented footer would become unanswerable — the worst failure this
+# file has, the one that stranded wN:p9. The two errors are not
+# symmetric. A spurious keypress is bounded by herdr-select verifying the
+# selection took effect and by `--expect-prompt-id` failing closed when the
+# prompt is gone, so it degrades to a no-op; an unparseable real menu degrades
+# to a stalled worker and a human woken at 3am. Do not close this by making
+# real menus stricter. If omp ever hangs-indents the footer, revisit BOTH
+# choices together.
 FOOTER = "up/down navigate enter select esc cancel"
 
 
