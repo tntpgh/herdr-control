@@ -764,6 +764,51 @@ class EvidenceAtIsScoped(unittest.TestCase):
         self.assertIsNone(rows["t_blocked"]["evidence_at"],
                           "a blocked row must carry NO evidence time: ack.sh trusts that field")
 
+    def test_a_stalled_row_with_evidence_carries_no_evidence_time(self):
+        """The ONE shape the publication filter alone stops.
+
+        For blocked, gone and terminal rows the filter is redundant — the thunk
+        is never called, so there is nothing to publish. It is load-bearing for
+        exactly one case: a row that REACHES the idle/done arm, computes its
+        evidence, and then derives `stalled` because that evidence predates the
+        last brief. That is the original latent-marker vector: `evidence_at`
+        would be published for a task that needs attention, and ack.sh accepts
+        that field as "this row is acknowledgeable", so acking it would silence
+        a worker that answered an older round and went quiet.
+
+        Fixture from the reviewer who found it: a `_done` at 10:00 with a brief
+        delivered at 12:00.
+        """
+        import sqlite3
+        with tempfile.TemporaryDirectory() as d:
+            wt = Path(d) / "wt"
+            (wt / ".handoffs").mkdir(parents=True)
+            (wt / ".handoffs/events.jsonl").write_text(
+                '{"event":"implement:x_done","ts":"2026-09-18T10:00:00Z"}\n')
+            db = Path(d) / "registry.sqlite3"
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                "CREATE TABLE tasks (task_id TEXT, run_id TEXT, label TEXT, repo TEXT, state TEXT,"
+                " pane_id TEXT, conductor_id TEXT, worktree TEXT, created_at TEXT, updated_at TEXT);"
+                "CREATE TABLE events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT,"
+                " task_id TEXT, occurred_at TEXT, payload TEXT);"
+                "CREATE TABLE checkpoints (conductor_id TEXT, last_event_seq INT, updated_at TEXT);")
+            conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         ("t_stale", "r", "l", "repo", "running", "w1:p1", "", str(wt),
+                          "2026-09-18T09:00:00Z", "2026-09-18T09:30:00Z"))
+            conn.execute("INSERT INTO events (type, task_id, occurred_at, payload) VALUES (?,?,?,?)",
+                         ("brief_delivered", "t_stale", "2026-09-18T12:00:00Z", "{}"))
+            conn.commit(); conn.close()
+            panes = {"w1:p1": {"pane_id": "w1:p1", "agent_status": "idle", "birth": ""}}
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "pane_statuses", lambda: panes), \
+                 patch.object(hub, "_acks", lambda: {}):
+                row = hub.herdr_data()["tasks"][0]
+        self.assertEqual(row["state"], "stalled",
+                         "evidence older than the last brief answered a previous round")
+        self.assertIsNone(row["evidence_at"],
+                          "a stalled row must carry no evidence time: ack.sh would accept it")
+
     def test_derive_does_not_recompute_when_handed_a_completion(self):
         """One computation per task on the read path, not two."""
         calls = []
