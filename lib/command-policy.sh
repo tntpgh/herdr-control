@@ -144,308 +144,364 @@ _cp_count() { printf '%s' "$2" | grep -oiE "$1" 2>/dev/null | grep -c . ; }
 # The extensions that say "this file is data, not a program".
 _cp_data_run_ext='(html?|json|xml|csv|tsv|txt|md|log|ya?ml|png|jpe?g|gif|svg|pdf|ico|woff2?)'
 
+# ---- _cp_walk_prep ----------------------------------------------------------
+# The run rule's OWN normalisation, from the RAW command.
+#
+# It cannot reuse `scannable_command` + the shared splitter, because both are
+# lossy in ways that matter only here, and each loss was a bypass:
+#   * quote stripping is global, so `bash "/tmp/my;p.json"` became
+#     `bash /tmp/my;p.json`, the splitter cut the FILENAME in half, and the
+#     pair classified allow (pass 4). Same for a space: `bash '/tmp/my p.json'`.
+#   * `$(…)` is flattened to its inner words, so `VER=$(date +%s) bash x.json`
+#     put `date` where the command word goes. Pass 2 answered that with a
+#     "loose mode" that scanned past ordinary words; pass 3 showed it escalated
+#     ordinary traffic and pass 4 showed it was still escapable. Collapsing the
+#     substitution to ONE token removes the need for it entirely.
+#
+# So: operators and spaces INSIDE quotes (or backslash-escaped) become control
+# bytes, quote characters are dropped, and every command substitution collapses
+# to the single token `@SUB@`. Then the text is split on real operators, with
+# `<(` / `>(` protected. Output is one segment per line.
+#
+# The control bytes survive into the tokens, which is harmless: they are
+# stripped again by `_cp_is_data_path`, and no rule prints a token.
+_cp_walk_prep() {                       # raw
+  printf '%s' "$1" | awk '
+    function prot(c) {
+      if (c == " ")  return sprintf("%c", 1)
+      if (c == ";")  return sprintf("%c", 2)
+      if (c == "&")  return sprintf("%c", 3)
+      if (c == "|")  return sprintf("%c", 4)
+      if (c == "(")  return sprintf("%c", 5)
+      if (c == ")")  return sprintf("%c", 6)
+      if (c == "<")  return sprintf("%c", 7)
+      if (c == ">")  return sprintf("%c", 14)
+      return c
+    }
+    function skipsub(line, start, n,    d, j, ch) {
+      d = 1; j = start
+      while (j <= n && d > 0) {
+        ch = substr(line, j, 1)
+        if (ch == "(") d++
+        else if (ch == ")") d--
+        j++
+      }
+      return j
+    }
+    {
+      SQ = sprintf("%c", 39); DQ = "\""; BT = sprintf("%c", 96)
+      line = $0; n = length(line); st = 0; i = 1; out = ""
+      while (i <= n) {
+        c = substr(line, i, 1)
+        if (st == 0) {
+          if (c == "\\")      { out = out prot(substr(line, i+1, 1)); i += 2; continue }
+          if (c == SQ)        { st = 1; i++; continue }
+          if (c == DQ)        { st = 2; i++; continue }
+          if (c == BT)        { j = i+1; while (j <= n && substr(line, j, 1) != BT) j++
+                                out = out "@SUB@"; i = j+1; continue }
+          if (c == "$" && substr(line, i+1, 1) == "(") {
+                                i = skipsub(line, i+2, n); out = out "@SUB@"; continue }
+          out = out c; i++; continue
+        }
+        q = (st == 1) ? SQ : DQ
+        if (c == q)           { st = 0; i++; continue }
+        if (st == 2 && c == "\\") { out = out prot(substr(line, i+1, 1)); i += 2; continue }
+        if (st == 2 && c == "$" && substr(line, i+1, 1) == "(") {
+                                i = skipsub(line, i+2, n); out = out "@SUB@"; continue }
+        out = out prot(c); i++; continue
+      }
+      print out
+    }' |
+    sed -E 's/<\(/<@LP@/g; s/>\(/>@LP@/g; s/(\&\&|\|\||[;|&()])/\n/g; s/@LP@/(/g'
+}
+
 # ---- _cp_walk_run -----------------------------------------------------------
-# Does this ONE segment run a file whose extension says it is data?
+# Does this ONE segment RUN a file whose extension says it is data?
 #
-# Walks tokens rather than matching the segment. Two security passes shaped
-# this; both found the same class of defect, so the shape is worth stating:
-# EVERY disagreement about where the command word is, is a bypass.
+# Four security passes shaped this. Every defect in all four was the same
+# thing: A DISAGREEMENT ABOUT WHERE THE COMMAND WORD IS. The fixes that lasted
+# were the ones that removed a disagreement; the two that were HEURISTICS both
+# had to be deleted, because each was simultaneously escapable and noisy:
 #
-# Pass 1 broke the regex version four ways (long options, case asymmetry, a
-# six-name prefix list, and an anchored rule honouring `_cp_split=0`).
-# Pass 2 broke the first walker nine more ways, all of them "something that
-# legally precedes a command word that I did not skip":
-#   * `BASH /tmp/P.JSON` — the interpreter `case` was lower-case only while
-#     the extension test was case-insensitive. On this machine's APFS volume
-#     `BASH` resolves and runs, so that was the whole pair, again.
-#   * `if /tmp/p.json; then`, `2>&1 /tmp/p.json`, `> /dev/null bash /tmp/p.json`
-#     — reserved words and redirections are legal before the command word.
-#   * `sudo -u nobody bash /tmp/p.json` — a launcher flag with a SEPARATE
-#     value; the walk stopped on `nobody`.
-#   * `VER=$(date +%s) bash /tmp/p.json` — normalisation flattens the
-#     substitution, so the assignment token ends at `=` and `date` looked like
-#     the command word.
-#   * `bash <(cat /tmp/p.json)`, `python3 - < /tmp/p.json`, `deno run`,
-#     `busybox sh`, `node -r mod` — the program is not the first non-flag
-#     token.
-# Each is handled below by NAME, and each has a row in
-# verify-command-policy.sh, because the next reader will otherwise "simplify"
-# one of them away.
+#   * "loose mode" (pass 2) scanned past ordinary words after a flattened
+#     `VAR=$(…)`. Pass 3: it escalated `SHA=$(git rev-parse HEAD) gh pr comment
+#     --body-file ./notes.md` and read the bare `.` in `jq .` as `source`.
+#     Pass 4: still escapable — any interpreter NAME inside the substitution
+#     (`MSG=$(sh -c date) bash /tmp/p.json`) ended the walk. Deleted:
+#     `_cp_walk_prep` collapses a substitution to one token, so the assignment
+#     is a single token again and there is nothing to scan past.
+#   * the bare-word script-slot scan (pass 2) fired on any path-form data
+#     token in argv when the script slot was a bare word. It was the dominant
+#     cause of 14 false escalations in 56 realistic commands (pass 4) —
+#     `bun x prettier --write ./README.md`, `deno cache ./mod.ts --lock
+#     ./lock.json`, `bash runner /tmp/cfg.json`. Deleted in favour of two
+#     narrow, unambiguous cases: the script slot IS a substitution, or the
+#     script slot is an input redirection.
+#
+# A false escalation is not a lesser bug here. #94 removed 53 of them out of
+# 1,614 measured commands (3.3%) precisely because a guard that cries wolf
+# teaches people to press Approve without reading, and at that point the guard
+# is worse than nothing.
 #
 # Returns 0 and calls `_cp_consider` when it fires, 1 otherwise.
-_cp_walk_run() {                        # segment
-  _cp_wseg="$1"
+_cp_walk_run() {                        # segment raw
+  _cp_wseg="$1"; _cp_wraw="$2"
 
-  # Word-split WITHOUT globbing. Unset `-f` here and a `*.json` in the segment
-  # would expand against the real cwd, so the tokens this decides on would
-  # depend on what happens to be on disk.
   case "$-" in *f*) _cp_wglob=off ;; *) _cp_wglob=on ;; esac
   set -f
   # shellcheck disable=SC2086
   set -- $_cp_wseg
   [ "$_cp_wglob" = on ] && set +f
 
-  # LOOSE mode: keep scanning past ordinary words instead of giving up on the
-  # first one. Set only when something already ate the command word — a
-  # flattened `VAR=$(…)` assignment, or `su`, whose user argument is
-  # indistinguishable from a command. Scanning further can only find MORE
-  # candidates, never fewer, so it errs toward escalate.
-  _cp_wloose=0
-
-  # 1. Everything the shell accepts BEFORE the command word.
+  # Everything the shell accepts BEFORE the command word. A redirection is
+  # legal ANYWHERE in a simple command, not just at the front, so this runs
+  # again after the launcher phase and inside it — `sudo >/dev/null bash
+  # /tmp/p.json` stopped the walk on `>` (pass 4).
+  # ONE loop that consumes while ANYTHING matches. Two separate loops (pass 4
+  # fix, first attempt) got this wrong in both directions: a `*) break` in the
+  # grammar case exited before the launcher phase, so plain `sudo bash
+  # /tmp/p.json` classified allow. Interleaving is required because both are
+  # legal in any order and any number: `sudo >/dev/null env FOO=1 nice -n 10
+  # bash /tmp/p.json` is one command.
   while [ "$#" -gt 0 ]; do
+    _cp_wate=0
     case "$1" in
       '!'|'{'|'}'|'('|')'|if|then|elif|else|fi|while|until|for|do|done|select|case|esac|in|'[['|']]')
-        shift ;;
-      # A redirection. `>out`, `2>&1` and `>>x` carry their operand; a bare
-      # `>` / `2>` / `<` takes the NEXT token, which is a filename, not a
-      # program — dropping only the operator would read the filename as the
-      # command word.
+        shift; _cp_wate=1 ;;
       '>'|'>>'|'<'|'<>'|[0-9]'>'|[0-9]'>>'|[0-9]'<'|'&>'|'&>>')
-        shift; [ "$#" -gt 0 ] && shift ;;
+        shift; [ "$#" -gt 0 ] && shift; _cp_wate=1 ;;
       '>'*|'<'*|[0-9]'>'*|[0-9]'<'*|'&>'*)
-        shift ;;
-      # A lone file descriptor number. The segment splitter cuts on `&`, so
-      # `2>&1 /tmp/p.json` arrives as `2>` then `1 /tmp/p.json` and the `1`
-      # sat where the command word goes. A pure number is never a command.
+        shift; _cp_wate=1 ;;
       [0-9]*)
-        # ALL digits. The glob `[0-9][0-9]*` matched anything whose first two
-        # characters were digits — `12.json`, `10x` — which is wider than the
-        # comment and invites the next reader to widen it further.
-        case "$1" in *[!0-9]*) break ;; esac
-        shift ;;
-      [A-Za-z_]*=*)
-        # `VER=` with nothing after the `=` is a substitution that
-        # normalisation flattened into the following tokens.
-        case "$1" in *=) _cp_wloose=1 ;; esac
-        shift ;;
-      *) break ;;
-    esac
-  done
-
-  # 2. Launcher prefixes. `TOKEN=x /tmp/p.json`, `sudo -n /tmp/p.json` and
-  #    `stdbuf -o0 bash /tmp/p.json` are the same act as the bare form.
-  while [ "$#" -gt 0 ]; do
-    _cp_wl="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
-    case "$_cp_wl" in
-      sudo|doas|su|env|nice|ionice|nohup|time|timeout|stdbuf|setsid|command|builtin|exec|caffeinate)
-        # Short flags that take a SEPARATE value. Without this the walk stops
-        # on the VALUE (`sudo -u nobody bash x.json` stopped on `nobody`).
-        case "$_cp_wl" in
-          sudo)    _cp_wv='ugphCDRT' ;;
-          su)      _cp_wv='csl'; _cp_wloose=1 ;;
-          timeout) _cp_wv='sk' ;;
-          env)     _cp_wv='uSC' ;;
-          nice)    _cp_wv='n' ;;
-          ionice)  _cp_wv='cnpt' ;;
-          stdbuf)  _cp_wv='ioe' ;;
-          *)       _cp_wv= ;;
+        # ALL digits: a lone file descriptor. `[0-9][0-9]*` matched `12.json`.
+        case "$1" in
+          *[!0-9]*) ;;
+          *) shift; _cp_wate=1 ;;
         esac
-        shift
-        while [ "$#" -gt 0 ]; do
-          case "$1" in
-            --) shift; break ;;
-            --*) shift ;;
-            -?)
-              if [ -n "$_cp_wv" ] && printf '%s' "${1#-}" | grep -q "[$_cp_wv]"; then
-                shift; [ "$#" -gt 0 ] && shift
-              else
-                shift
-              fi
-              ;;
-            -*) shift ;;
-            [0-9]*) shift ;;
-            [A-Za-z_]*=*) shift ;;
-            *) break ;;
-          esac
-        done
         ;;
-      *) break ;;
+      [A-Za-z_]*=*)
+        shift; _cp_wate=1 ;;
     esac
-  done
 
-  # 3. The command word. Lower-cased ONCE, because the extension test and the
-  #    #94 download exemption are both case-insensitive and any asymmetry
-  #    between them is a bypass.
-  while [ "$#" -gt 0 ]; do
-    _cp_wcmd="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
-
-    # busybox is a multiplexer: the applet is the real command word.
-    if [ "$_cp_wcmd" = busybox ] && [ "$#" -gt 1 ]; then
-      shift
-      continue
-    fi
-
-    # In LOOSE mode we are NOT at a real command position — we are scanning
-    # past the flattened innards of a `VAR=$(…)`. Only a real interpreter NAME
-    # counts there, never the `source` builtin or its `.` spelling: worker
-    # commands pass a bare `.` constantly (`jq .`, `find .`, `cp … .`) and
-    # reading it as `source` made the next token a script slot.
-    if [ "$_cp_wloose" = 1 ]; then
-      case "$_cp_wcmd" in
-        source|.) shift; continue ;;
+    if [ "$_cp_wate" = 0 ]; then
+      _cp_wl="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
+      case "$_cp_wl" in
+        sudo|doas|su|env|nice|ionice|nohup|time|timeout|stdbuf|setsid|command|builtin|exec|caffeinate)
+          case "$_cp_wl" in
+            sudo)    _cp_wv='ugphCDRT'; _cp_wvl='user|group|host|prompt|chdir|close-from|role|type|other-user' ;;
+            su)      _cp_wv='csl';      _cp_wvl='command|shell|user' ;;
+            timeout) _cp_wv='sk';       _cp_wvl='signal|kill-after' ;;
+            env)     _cp_wv='uSC';      _cp_wvl='unset|chdir|split-string' ;;
+            nice)    _cp_wv='n';        _cp_wvl='adjustment' ;;
+            ionice)  _cp_wv='cnpt';     _cp_wvl='class|classdata|pid' ;;
+            stdbuf)  _cp_wv='ioe';      _cp_wvl='input|output|error' ;;
+            *)       _cp_wv=;           _cp_wvl= ;;
+          esac
+          shift
+          _cp_wate=1
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              --) shift; break ;;
+              --*=*) shift ;;
+              --*)
+                # A long option with a SEPARATE value. `sudo --user nobody bash
+                # x.json` stopped on `nobody` while the short spelling was
+                # handled — the asymmetry was a complete bypass (pass 4).
+                if [ -n "$_cp_wvl" ] &&
+                   printf '%s' "${1#--}" | grep -qE "^($_cp_wvl)$"; then
+                  shift; [ "$#" -gt 0 ] && shift
+                else
+                  shift
+                fi
+                ;;
+              -?)
+                if [ -n "$_cp_wv" ] && printf '%s' "${1#-}" | grep -q "[$_cp_wv]"; then
+                  shift; [ "$#" -gt 0 ] && shift
+                else
+                  shift
+                fi
+                ;;
+              -*) shift ;;
+              '>'|'>>'|'<'|'<>'|[0-9]'>'|[0-9]'>>'|[0-9]'<'|'&>'|'&>>') shift; [ "$#" -gt 0 ] && shift ;;
+              '>'*|'<'*|[0-9]'>'*|[0-9]'<'*|'&>'*) shift ;;
+              [0-9]*) case "$1" in *[!0-9]*) break ;; esac; shift ;;
+              [A-Za-z_]*=*) shift ;;
+              *) break ;;
+            esac
+          done
+          ;;
       esac
     fi
 
-    case "$_cp_wcmd" in
-      sh|bash|zsh|dash|ksh|mksh|python|python2|python3|perl|ruby|node|bun|deno|source|.)
-        # Which short flags mean "the program is inline, no file runs" is PER
-        # INTERPRETER. A cluster test for [cem] read `bash --norc` as inline;
-        # `-e` is errexit to a shell and an inline program to perl/ruby/node.
-        # `_cp_wvi` is the separate-value set: `node -r mod script`.
-        case "$_cp_wcmd" in
-          sh|bash|zsh|dash|ksh|mksh) _cp_winline=c;  _cp_wvi='O' ;;
-          python|python2|python3)    _cp_winline=cm; _cp_wvi='X' ;;
-          perl)                     _cp_winline=eE; _cp_wvi='IM' ;;
-          ruby)                     _cp_winline=e;  _cp_wvi='rI' ;;
-          # Per TOOL, not per family. `-r` is `--require MODULE` to node and
-          # `--reload` to deno, where it takes an OPTIONAL value — sharing the
-          # set made `deno run -r /tmp/p.json` swallow the script as the
-          # flag's value and classify allow. bun has no `-r` at all. deno's
-          # `-c` IS a separate-value config path, and its default name is
-          # literally `deno.json`, so omitting it escalated the most standard
-          # deno invocation there is.
-          node)                     _cp_winline=ep; _cp_wvi='r' ;;
-          bun)                      _cp_winline=ep; _cp_wvi= ;;
-          deno)                     _cp_winline=;   _cp_wvi='c' ;;
-          *)                        _cp_winline=;   _cp_wvi= ;;
-        esac
-        shift
+    [ "$_cp_wate" = 1 ] || break
+  done
+  [ "$#" -gt 0 ] || return 1
 
-        # deno/bun put a SUBCOMMAND where the script would be.
-        case "$_cp_wcmd" in
-          deno|bun)
-            case "${1:-}" in
-              run|test|bundle|compile|check|fmt|lint|task) shift ;;
-              eval|repl) return 1 ;;
-            esac
-            ;;
-        esac
+  # The command word, lower-cased once: the extension test and the #94
+  # download exemption are both case-insensitive, and `BASH /tmp/P.JSON` runs
+  # on this machine's case-insensitive volume.
+  _cp_wcmd="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
 
-        while [ "$#" -gt 0 ]; do
-          case "$1" in
-            --) shift; break ;;
-            --eval|--eval=*|--command|--command=*|--print|--print=*|--module|--module=*) return 1 ;;
-            # OUTPUT redirections and their operands. A data file that is
-            # merely where stderr goes is not the program: `bash 2>/tmp/p.json`
-            # escalated. INPUT redirection is deliberately NOT skipped — for
-            # `python3 - < /tmp/p.json` the redirected file IS the program, and
-            # leaving `<` in the script slot is what catches it.
-            '>'|'>>'|[0-9]'>'|[0-9]'>>'|'&>'|'&>>') shift; [ "$#" -gt 0 ] && shift ;;
-            '>'*|[0-9]*'>'*|'&>'*) shift ;;
-            --*) shift ;;
-            -?*)
-              if [ -n "$_cp_winline" ] && printf '%s' "${1#-}" | grep -q "[$_cp_winline]"; then
-                return 1
-              fi
-              if [ -n "$_cp_wvi" ] && [ "${#1}" = 2 ] && printf '%s' "${1#-}" | grep -q "[$_cp_wvi]"; then
-                shift; [ "$#" -gt 0 ] && shift
-              else
-                shift
-              fi
-              ;;
-            *) break ;;
-          esac
-        done
-        [ "$#" -gt 0 ] || return 1
-
-        # The script slot. Everything after it is the script's own argv, where
-        # a data file is perfectly normal (`bash run.sh data.json`).
-        if _cp_is_data_path "$1"; then
-          _cp_consider 1 "runs a data file as a program — its extension says it is not source"
-          return 0
-        fi
-
-        # The script slot holds neither a path nor a file with an extension —
-        # `bash echo /tmp/p.json` (a flattened `$(…)`), `bash <(cat x.json)`,
-        # `python3 - < x.json`. A bare word there is not a script anyone wrote,
-        # so a PATH-FORM data file further right is the real target.
-        #
-        # Both halves are required. Keying on "the raw command contains `$(`"
-        # instead escalated `bash scripts/ci.sh --config ci.yaml && echo
-        # $(git rev-parse HEAD)`, handing back part of what #94 measured; and
-        # accepting a bare `data.json` further right would escalate ordinary
-        # argv.
-        case "$1" in
-          */*|*.*) return 1 ;;
-        esac
-        _cp_wredir=0
-        for _cp_wtok in "$@"; do
-          # A bare operator's operand is a redirection TARGET, not a program:
-          # `bash echo > /tmp/p.json` writes a file, it does not run one.
-          if [ "$_cp_wredir" = 1 ]; then _cp_wredir=0; continue; fi
-          case "$_cp_wtok" in
-            # OUTPUT: the operand is a destination, skip it too.
-            '>'|'>>'|[0-9]'>'|[0-9]'>>'|'&>'|'&>>') _cp_wredir=1; continue ;;
-            '>'*|[0-9]*'>'*|'&>'*) continue ;;
-            # INPUT: skip the operator but KEEP its operand as a candidate —
-            # for `python3 - < /tmp/p.json` the redirected file is the program.
-            '<'|'<>'|[0-9]'<'|'<'*) continue ;;
-          esac
-          case "$_cp_wtok" in
-            ./*|/*|'~/'*|../*)
-              if _cp_is_data_path "$_cp_wtok"; then
-                _cp_consider 1 "runs a computed or piped path whose extension says it is data"
-                return 0
-              fi
-              ;;
-          esac
-        done
-        return 1
-        ;;
+  # busybox is a multiplexer: the applet is the real command word. A
+  # redirection may sit between the two.
+  while [ "$_cp_wcmd" = busybox ] && [ "$#" -gt 1 ]; do
+    shift
+    case "$1" in
+      '>'|'>>'|'<'|'<>'|[0-9]'>'|[0-9]'>>'|[0-9]'<'|'&>'|'&>>') shift; [ "$#" -gt 1 ] && shift ;;
+      '>'*|'<'*|[0-9]'>'*|[0-9]'<'*|'&>'*) shift ;;
     esac
+    _cp_wcmd="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
+  done
 
-    # WHAT THIS DOES NOT COVER, measured across both security passes and left
-    # open deliberately rather than papered over:
-    #   * rename laundering. `curl -o /tmp/p.json && mv /tmp/p.json /tmp/x &&
-    #     sh /tmp/x` is allow at every step: the download exemption keys on the
-    #     output name, this rule keys on the run-time name, and nothing
-    #     connects them. Inherent to reasoning about extensions — closing it
-    #     needs provenance the classifier cannot get from one command string.
-    #   * an interpreter fed by another program: `find . -name '*.json' -exec
-    #     bash {} \;`, `xargs -n1 bash`. The target is not in the segment.
-    #   * a quoted path containing a space. `scannable_command` strips quote
-    #     characters globally and deliberately, so `bash '/tmp/my p.json'`
-    #     becomes three tokens and the script slot holds `/tmp/my`. Testing the
-    #     slot joined with the next token would also escalate
-    #     `bash /tmp/runner data.json`, which is ordinary, so the gap is kept
-    #     rather than traded for a false escalation.
-    #   * a launcher that takes its command as a STRING (`su - user -c '…'`).
-    #     Loose mode finds an interpreter further right, but a program inside
-    #     `-c` is not a token this walker can see.
-    #   * contents. A `.sh` holding JSON and a `.json` holding a shell script
-    #     are both classified by name. This reduces the pair to shapes a
-    #     reviewer would notice; it is not a sandbox.
+  case "$_cp_wcmd" in
+    sh|bash|zsh|dash|ksh|mksh|python|python2|python3|perl|ruby|node|bun|deno|source|.)
+      # Inline-program flags mean no file runs, and they are PER TOOL: a
+      # cluster test for [cem] read `bash --norc` as inline, and `-e` is
+      # errexit to a shell but an inline program to perl/ruby/node.
+      # `_cp_wvi` is the separate-value set — `-r` is `--require MODULE` to
+      # node and `--reload` to deno, where sharing it swallowed the script.
+      case "$_cp_wcmd" in
+        sh|bash|zsh|dash|ksh|mksh) _cp_winline=c;  _cp_wvi='O' ;;
+        python|python2|python3)    _cp_winline=cm; _cp_wvi='X' ;;
+        perl)                     _cp_winline=eE; _cp_wvi='IM' ;;
+        ruby)                     _cp_winline=e;  _cp_wvi='rI' ;;
+        node)                     _cp_winline=ep; _cp_wvi='r' ;;
+        bun)                      _cp_winline=ep; _cp_wvi= ;;
+        deno)                     _cp_winline=;   _cp_wvi='c' ;;
+        *)                        _cp_winline=;   _cp_wvi= ;;
+      esac
+      shift
 
-    # No interpreter: the command word IS the file. Only a path-form
-    # invocation counts — a bare `p.json` is not something a shell finds on
-    # PATH, and treating it as one made every `cat p.json` escalate. The
-    # tilde is QUOTED: bash tilde-expands `case` patterns, so a bare `~/*`
-    # arm compiles to `$HOME/*` and never matches a literal tilde.
-    #
-    # ONLY at a real command position. In loose mode this arm is skipped
-    # entirely: scanning past a flattened substitution means every remaining
-    # token is an argument, so running it here read `./notes.md` in
-    # `SHA=$(git rev-parse HEAD) gh pr comment --body-file ./notes.md` as a
-    # program. That is a data-file MENTION waking a human, which is the exact
-    # class #94 removed 53 of.
-    if [ "$_cp_wloose" = 0 ]; then
+      # deno/bun put a SUBCOMMAND where the script would be. An unlisted
+      # subcommand simply leaves a bare word in the script slot, which now
+      # fires nothing — the list can be incomplete without inventing an
+      # escalation, which is how the old version produced false positives on
+      # `bun x`, `bun build`, `deno cache` and `deno install`.
+      case "$_cp_wcmd" in
+        deno|bun)
+          case "${1:-}" in
+            run|test|bundle|compile|check|fmt|lint|task|install|cache|serve|add|remove|link|upgrade|x|build|create|doc|info|publish)
+              shift ;;
+            eval|repl) return 1 ;;
+          esac
+          ;;
+      esac
+
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --) shift; break ;;
+          --eval|--eval=*|--command|--command=*|--print|--print=*|--module|--module=*) return 1 ;;
+          # Long options with separate values, per tool: deno's `--config
+          # ./deno.json` and `--lock ./lock.json` name DATA files, and reading
+          # them as the script escalated the most standard deno invocation.
+          --config|--lock|--import-map|--cert|--env-file|--outfile|--banner|--footer|--tsconfig|--require|--experimental-loader)
+            shift; [ "$#" -gt 0 ] && shift ;;
+          --*) shift ;;
+          # OUTPUT redirections: a data file that is merely where output goes
+          # is not the program (`bash 2>/tmp/p.json`). INPUT is left alone —
+          # for `python3 - < /tmp/p.json` the redirected file IS the program.
+          '>'|'>>'|[0-9]'>'|[0-9]'>>'|'&>'|'&>>') shift; [ "$#" -gt 0 ] && shift ;;
+          '>'*|[0-9]*'>'*|'&>'*) shift ;;
+          -?*)
+            if [ -n "$_cp_winline" ] && printf '%s' "${1#-}" | grep -q "[$_cp_winline]"; then
+              # An inline program means no file is run, so the walk stops —
+              # `bash -c 'cat /tmp/x.json'` is a command STRING that happens to
+              # end in a filename, and escalating it would be noise.
+              #
+              # Unless the program text IS a bare path to a data file:
+              # `bash -c /tmp/p.json` hands that path to the shell as a
+              # command, which runs it. Quoted program text never looks like
+              # this, because `_cp_walk_prep` keeps it as ONE token whose first
+              # characters are the real command (`cat…`).
+              shift
+              if [ "$#" -gt 0 ]; then
+                case "$1" in
+                  ./*|/*|'~/'*|../*)
+                    if _cp_is_data_path "$1"; then
+                      _cp_consider 1 "passes a data file to an interpreter as its program text"
+                      return 0
+                    fi
+                    ;;
+                esac
+              fi
+              return 1
+            fi
+            if [ -n "$_cp_wvi" ] && [ "${#1}" = 2 ] && printf '%s' "${1#-}" | grep -q "[$_cp_wvi]"; then
+              shift; [ "$#" -gt 0 ] && shift
+            else
+              shift
+            fi
+            ;;
+          *) break ;;
+        esac
+      done
+      [ "$#" -gt 0 ] || return 1
+
+      # The script slot. Everything after it is the script's own argv, where a
+      # data file is entirely normal (`bash run.sh data.json`).
+      if _cp_is_data_path "$1"; then
+        _cp_consider 1 "runs a data file as a program — its extension says it is not source"
+        return 0
+      fi
+
+      # Two narrow cases where the script slot is not the path itself.
+      #
+      # (a) the script slot IS a command substitution: `bash $(echo
+      #     /tmp/p.json)`. Fires only when that substitution's own text names a
+      #     data file, so `bash $(git rev-parse --show-toplevel)/scripts/ci.sh`
+      #     — whose script slot is `@SUB@/scripts/ci.sh`, not `@SUB@` — never
+      #     reaches here.
+      if [ "$1" = '@SUB@' ] &&
+         _cp_imatch '(\$\(|`)[^)`]*\.'"$_cp_data_run_ext"'[^)`]*(\)|`)' "$_cp_wraw"; then
+        _cp_consider 1 "runs a computed path whose extension says it is data"
+        return 0
+      fi
+
+      # (b) the program comes from stdin or a process substitution:
+      #     `python3 - < /tmp/p.json`, `bash <(cat /tmp/p.json)`.
       case "$1" in
-        ./*|/*|'~/'*|../*)
-          if _cp_is_data_path "$1"; then
-            _cp_consider 1 "executes a data file directly — its extension says it is not source"
-            return 0
-          fi
+        '<'*|-)
+          for _cp_wtok in "$@"; do
+            case "$_cp_wtok" in
+              '<'*) continue ;;
+            esac
+            if _cp_is_data_path "$_cp_wtok"; then
+              _cp_consider 1 "runs a piped or redirected data file as a program"
+              return 0
+            fi
+          done
           ;;
       esac
       return 1
-    fi
+      ;;
+  esac
 
-    # Loose mode keeps going. It must NOT stop at a path-form token that is
-    # not a data file: `VER=$(cat /etc/hostname) bash /tmp/payload.json`
-    # aborted on `/etc/hostname` and the whole pair went back to allow.
-    shift
-  done
+  # No interpreter: the command word IS the file. Only a path-form invocation
+  # counts — a bare `p.json` is not something a shell finds on PATH, and
+  # treating it as one made every `cat p.json` escalate. The tilde is QUOTED:
+  # bash tilde-expands `case` patterns, so a bare `~/*` arm compiles to
+  # `$HOME/*` and never matches a literal tilde.
+  #
+  # WHAT THIS DOES NOT COVER, measured across four passes and left open
+  # deliberately rather than papered over:
+  #   * rename laundering (`curl -o /tmp/p.json && mv /tmp/p.json /tmp/x && sh
+  #     /tmp/x`) — the download exemption keys on the output name, this rule on
+  #     the run-time name, and nothing connects them. Closing it needs
+  #     provenance no single command string carries.
+  #   * an interpreter fed by another program: `find … -exec bash {} \;`,
+  #     `xargs -n1 bash`.
+  #   * a launcher that takes its command as a STRING (`su - user -c '…'`).
+  #   * contents. A `.sh` holding JSON and a `.json` holding a script are both
+  #     classified by name. This is a tripwire for the obvious spelling, not a
+  #     sandbox — which is exactly why it must not cost false escalations.
+  case "$1" in
+    ./*|/*|'~/'*|../*)
+      if _cp_is_data_path "$1"; then
+        _cp_consider 1 "executes a data file directly — its extension says it is not source"
+        return 0
+      fi
+      ;;
+  esac
   return 1
 }
 
@@ -877,9 +933,9 @@ classify_command() {
   # was allow. Over-splitting keeps the invariant pointing the safe way.
   while IFS= read -r _cp_xseg; do
     [ -n "$_cp_xseg" ] || continue
-    _cp_walk_run "$_cp_xseg" && break
+    _cp_walk_run "$_cp_xseg" "$raw" && break
   done <<XSEGS
-$(printf '%s' "$norm" | sed -E 's/<\(/<@LP@/g; s/>\(/>@LP@/g; s/(\&\&|\|\||[;|&()])/\n/g; s/@LP@/(/g')
+$(_cp_walk_prep "$raw")
 XSEGS
 
   # A downloader is ANY token whose basename is one, wherever it sits.
