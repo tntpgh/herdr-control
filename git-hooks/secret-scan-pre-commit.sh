@@ -609,13 +609,67 @@ pii_added_for_index() {
 check_pii() {                   # <label> <added text>
     local label="$1" text="$2"
     [[ -n "$text" ]] || return 0
-    # street address: <number> <Name> <suffix>, excluding the fixture words
-    if printf '%s\n' "$text" \
-       | grep -nE '[0-9]{2,5} [A-Z][a-z]+( [A-Z][a-z]+)? (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)\b' \
+    # street address: <number> <Name> <suffix>, excluding the fixture words.
+    #
+    # The fixture-word list is ENUMERATED, which is the allowlist shape this
+    # repo keeps learning not to trust: it has to be extended by hand for every
+    # legitimate case, and until someone does, the guard blocks honest work and
+    # teaches people to route around it. On 2026-09-18 it blocked the video-SEO
+    # work over YouTube titles of the form "<number> <Street> Dr, Glenshaw PA
+    # 15116" — listing marketing already served from the public site, not
+    # client PII. (The real examples are deliberately not quoted here: this
+    # rule scans its own file, and an address spelled out in this comment
+    # blocks the very commit that adds the fix. The file learned that once
+    # already, see the `\b` note above.)
+    #
+    # So a detected address gets ONE more question, and it is not a name list:
+    # IS THIS ADDRESS ALREADY ON THE DEPLOYED TRUNK? An address already served
+    # to the public from `origin/main` cannot be leaked by committing it again.
+    # A buyer's or seller's address in exactly the same shape is not there, so
+    # it still blocks. The test is self-limiting: it can never introduce a NEW
+    # address, because being new is exactly what it detects.
+    #
+    # Baseline is the REMOTE trunk, never local HEAD. In a pre-push run the
+    # commit under inspection is already reachable from HEAD, so HEAD would let
+    # every address approve itself.
+    _ss_addr_published() {              # "<number> <Street> Dr"
+        _ss_a="$1"
+        # Drop the street-type suffix: the trunk may spell it "Drive" where
+        # this commit says "Dr". Number + street name is specific enough.
+        _ss_a="$(printf '%s' "$_ss_a" |
+                 sed -E 's/ (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)$//')"
+        [ -n "$_ss_a" ] || return 1
+        for _ss_ref in origin/main origin/HEAD; do
+            git rev-parse --verify --quiet "$_ss_ref" >/dev/null 2>&1 || continue
+            if git grep -qiF -- "$_ss_a" "$_ss_ref" 2>/dev/null; then return 0; fi
+        done
+        return 1
+    }
+
+    # `|| true`: this file runs under `set -euo pipefail`, and a no-match grep
+    # here otherwise aborts the whole scan mid-file — which looked like 23
+    # unrelated suite failures when it happened.
+    _ss_addrs="$(printf '%s\n' "$text" \
+       | grep -oE '[0-9]{2,5} [A-Z][a-z]+( [A-Z][a-z]+)? (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)' \
        | grep -viE '\b(Main|Elm|Oak|Test|Example|Fake|Sample|Anywhere|Nowhere|Maple|Pine|First|Second|Foo|Bar)\b' \
-       | grep -vE '^\+?[0-9]*:?\+?(123|456|789|1234|100|111|999) ' >/dev/null; then
-        echo "BLOCKED: a real-looking STREET ADDRESS is being added in $label."
-        PII_FOUND=1
+       | grep -vE '^\+?(123|456|789|1234|100|111|999) ' \
+       | sort -u || true)"
+    if [ -n "$_ss_addrs" ]; then
+        _ss_unpublished=""
+        while IFS= read -r _ss_one; do
+            [ -n "$_ss_one" ] || continue
+            _ss_addr_published "$_ss_one" ||
+                _ss_unpublished="$_ss_unpublished  $_ss_one
+"
+        done <<SS_ADDRS
+$_ss_addrs
+SS_ADDRS
+        if [ -n "$_ss_unpublished" ]; then
+            echo "BLOCKED: a real-looking STREET ADDRESS is being added in $label."
+            echo "  not already published on the deployed trunk:"
+            printf '%s' "$_ss_unpublished"
+            PII_FOUND=1
+        fi
     fi
     # phone: not the 555-01xx fiction range
     if printf '%s\n' "$text" \

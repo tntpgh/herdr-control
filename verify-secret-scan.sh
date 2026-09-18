@@ -358,6 +358,58 @@ printf 'addr = "%s"\n' "$BADSTREET" > "$R/crm.py"
 git -C "$R" add crm.py
 blocks "$R" "a real-looking street address is blocked"
 
+printf '== STREET ADDRESS: already published on the trunk vs genuinely new ==\n'
+# The address rule's allowlist used to be a list of fixture street NAMES, so a
+# published listing address in a YouTube title — already on the public site —
+# blocked the same as a client's home. The question is now "is this address
+# already on origin/main", which cannot be used to introduce a new one.
+#
+# Every address below is ASSEMBLED FROM FRAGMENTS, like BADSTREET above, so no
+# literal `<number> <Name> <Suffix>` appears in this file. That is not
+# cosmetic: the first version of these rows spelled them out, and the guard
+# this PR is adding blocked its own commit. A test fixture that trips the
+# detector it is testing cannot be committed.
+PUBNUM=406;  PUBST="Bla""ze";      PUBSUF=Dr
+NEWNUM=88;   NEWST="Hollow""brook"; NEWSUF=Ln
+ALTNUM=4412; ALTST="Ridge""crest";  ALTSUF=Dr
+PUBADDR="$PUBNUM $PUBST $PUBSUF"
+NEWADDR="$NEWNUM $NEWST $NEWSUF"
+ALTADDR="$ALTNUM $ALTST $ALTSUF"
+
+# `new_repo` has no `origin`, so nothing is published there: that is the
+# negative case, and it must still block.
+R="$(new_repo)"
+printf 'addr = "%s"\n' "$NEWADDR" > "$R/crm.py"
+git -C "$R" add crm.py
+blocks "$R" "an address on no published trunk is blocked"
+
+# A repo whose origin/main already carries the address: publishing it again
+# leaks nothing. Real bare upstream, not a stub, because the rule reads
+# `origin/main` through `git grep` and a stub would not prove that path.
+R="$(new_repo)"
+UP="$(mktemp -d)/upstream.git"
+git init -q --bare "$UP"
+printf 'listings = ["%s"]\n' "$PUBADDR" > "$R/listings.py"
+git -C "$R" add listings.py
+git -C "$R" -c user.email="$WANT_EMAIL" -c user.name=t commit -q --no-verify -m 'published listing data'
+git -C "$R" remote add origin "$UP"
+git -C "$R" push -q origin HEAD:refs/heads/main
+git -C "$R" fetch -q origin
+printf 'title = "%s, Glenshaw PA 15116"\n' "$PUBADDR" > "$R/videos.py"
+git -C "$R" add videos.py
+allows "$R" "an address already on origin/main is allowed"
+
+# The trunk spells the suffix out where the commit abbreviates it.
+printf 'title = "%s %s Drive"\n' "$PUBNUM" "$PUBST" > "$R/videos.py"
+git -C "$R" add videos.py
+allows "$R" "suffix spelling differences still match the trunk"
+
+# ...and the same repo still blocks a DIFFERENT address, which is what proves
+# the allowance is per-address and not a per-repo switch.
+printf 'title = "%s"\n' "$ALTADDR" > "$R/videos.py"
+git -C "$R" add videos.py
+blocks "$R" "a different, unpublished address still blocks in that repo"
+
 printf '== NON-UTF8 BYTES: a binary-ish staged file must not blind the scan ==\n'
 # `git show | grep` on a file holding an invalid UTF-8 byte is where a scanner
 # quietly stops matching (grep declaring the stream binary, or failing outright
