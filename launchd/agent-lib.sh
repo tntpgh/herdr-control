@@ -171,12 +171,201 @@ app_rev_sha() {                 # -> the bare sha, for internal comparisons
   git -C "$HERDR_APP_DIR" rev-parse --short HEAD 2>/dev/null
 }
 
+app_rev_sha_full() {            # -> the full sha; plugin pins need all 40
+  git -C "$HERDR_APP_DIR" rev-parse HEAD 2>/dev/null
+}
+
 app_rev() {                     # -> what is deployed, `-dirty` if it is not that
   # `rev-parse` cannot see a modified tree, so a hand-edit in the deployed dir
   # made every report — this, and /api/summary's `rev` — a provenance claim
   # that was false. `--dirty` is the difference between a sha and a promise.
   git -C "$HERDR_APP_DIR" describe --always --dirty --abbrev=7 2>/dev/null \
     || git -C "$HERDR_APP_DIR" rev-parse --short HEAD 2>/dev/null
+}
+
+# ── the herdr PLUGIN serves a revision too ──────────────────────────────────
+#
+# herdr-control ships a plugin (herdr-plugin.toml: Projects, Quick Actions,
+# Sort Tabs, Name This Tab, What Needs Me) and it was installed as
+# `local:/Users/thurbs/Code/herdr-control` — so every action executed out of
+# whatever branch that SHARED checkout happened to be sitting on. Measured
+# 2026-09-18: that checkout was on another session's PR branch, five commits
+# behind main, and `guard-raw-prompt-answer.sh` did not exist there at all.
+#
+# Same defect as the hub before #84 and the hook scanner before #89, in a third
+# place. So the plugin is pinned to a commit (`herdr plugin install ... --ref
+# <sha>`, which clones into its own managed root), and the pin moves HERE, with
+# the deploy — because a release whose second step a human has to remember is
+# how 18 repos ended up running an open PR's scanner.
+#
+# HERDR_PLUGIN_CLI is the test seam: verify-deploy.sh points it at a stub so
+# these paths are exercised without touching the operator's live plugin.
+HERDR_PLUGIN_ID="${HERDR_PLUGIN_ID:-tntpgh.herdr-control}"
+HERDR_PLUGIN_REPO="${HERDR_PLUGIN_REPO:-tntpgh/herdr-control}"
+
+plugin_state() {                # -> "<kind> <detail>": github <sha> | local <path> | none
+  # Read plugins.json, the file the herdr SERVER keeps, rather than shelling
+  # out: `plugin list --json` is not guaranteed across herdr versions, and a
+  # state read that invokes the CLI cannot be distinguished — by a caller or a
+  # test — from one that CHANGES something.
+  local f="${HERDR_PLUGINS_JSON:-$HOME/.config/herdr/plugins.json}"
+  [ -r "$f" ] || { printf 'none\n'; return 0; }
+  # A READ THAT FAILS MUST SAY SO. This printed nothing when python3 was absent
+  # or broken (the ordinary macOS "no developer tools" state) — and an empty
+  # state then fell through plugin_pin's case into an install, against a machine
+  # that might be holding a local dev link, while the failure message claimed
+  # the plugin was uninstalled. Silence is the one answer a state read may not
+  # give.
+  local out
+  out="$(python3 - "$f" "$HERDR_PLUGIN_ID" <<'PY'
+
+import json, sys
+try:
+    rows = json.load(open(sys.argv[1]))
+except Exception:
+    print("none"); raise SystemExit(0)
+for p in rows if isinstance(rows, list) else []:
+    if p.get("plugin_id") == sys.argv[2]:
+        src = p.get("source") or {}
+        kind = src.get("kind", "unknown")
+        if kind == "github":
+            print("github %s" % (src.get("resolved_commit") or "unknown"))
+        elif kind == "local":
+            print("local %s" % (src.get("path") or p.get("plugin_root") or "?"))
+        else:
+            print("%s %s" % (kind, p.get("plugin_root") or "?"))
+        raise SystemExit(0)
+print("none")
+PY
+)" || { printf 'unreadable %s\n' "$f"; return 2; }
+  [ -n "$out" ] || { printf 'unreadable %s\n' "$f"; return 2; }
+  printf '%s\n' "$out"
+}
+
+# plugin_report <deployed-sha> — the one line `--verify` prints about the
+# plugin, and its verdict. A FUNCTION rather than inline shell in restart.sh
+# because the review that found the bug below had to transplant the block into
+# a harness to drive it; a gate that can only be tested by copying it is a gate
+# whose branches go untested.
+#
+# Returns: 0 agrees with the deployed rev · 1 MUST FAIL the verify · 2 a
+# deliberate local dev link (reported, not a failure).
+plugin_report() {
+  local want="${1:-}" state kind detail
+  state="$(plugin_state)" || true
+  kind="${state%% *}"; detail="${state#* }"
+  case "$kind" in
+    github)
+      if [ -z "$want" ]; then
+        echo "${detail:0:7} (nothing deployed to compare against)"; return 0
+      elif [ "$detail" = "$want" ]; then
+        echo "${detail:0:7} (== the deployed rev)"; return 0
+      else
+        echo "${detail:0:7} != deployed ${want:0:7}"
+        echo "    repair: ./restart.sh --deploy   (pins the plugin with the app)" >&2
+        return 1
+      fi ;;
+    local)
+      echo "LOCAL LINK ($detail) — actions run from that checkout's branch"
+      echo "    its scripts are whatever is checked out there, which is what a" >&2
+      echo "    pinned install exists to prevent; deliberate during development." >&2
+      return 2 ;;
+    none)
+      echo "NOT INSTALLED — Projects / Quick Actions / What Needs Me are unavailable"
+      echo "    repair: herdr plugin install $HERDR_PLUGIN_REPO --ref \$(git -C $HERDR_APP_DIR rev-parse HEAD) -y" >&2
+      return 1 ;;
+    *)
+      # An unclassifiable state used to print itself and leave the verdict
+      # untouched, so `--verify` passed with a BLANK row when the read failed —
+      # a surface answering without saying what it answers from, which is the
+      # defect this whole change removes, reproduced in its own gate.
+      echo "UNKNOWN STATE ('${state:-<could not be read>}')"
+      echo "    the plugin's revision cannot be established; inspect" >&2
+      echo "    ${HERDR_PLUGINS_JSON:-$HOME/.config/herdr/plugins.json}" >&2
+      return 1 ;;
+  esac
+}
+
+# plugin_pin <revision> — make the SERVED plugin that revision.
+#
+# Returns 0 pinned (or already), 1 left alone deliberately, 2 failed.
+# A LOCAL link is left alone: someone is developing against it, and a deploy
+# that silently replaced a dev link would be the same class of surprise this
+# function exists to remove. It says so loudly instead.
+plugin_pin() {
+  local rev="${1:-}" state kind detail _bad cli="${HERDR_PLUGIN_CLI:-herdr}"
+  # An EMPTY revision reached here as one empty argument from
+  # `plugin_pin "$(app_rev_sha_full)"` when nothing is deployed — `$1` is bound,
+  # so `set -u` never fired. The github arm then UNINSTALLED a correct pin and
+  # ran `install --ref "" -y`: a working pin destroyed to chase a revision that
+  # does not exist.
+  [ -n "$rev" ] || {
+    echo "plugin: no revision to pin to (is $HERDR_APP_DIR deployed?) — plugin left as it is" >&2
+    return 2; }
+  # A pin must be a FULL sha, because herdr records the RESOLVED commit and the
+  # read-back below compares against what was asked for. `plugin_pin main`
+  # would install correctly and then report failure. Refuse at the door instead
+  # of letting the read-back lie.
+  case "$rev" in
+    *[^0-9a-f]*|"") _bad=1 ;;
+    *) [ "${#rev}" = 40 ] && _bad=0 || _bad=1 ;;
+  esac
+  [ "$_bad" = 0 ] || {
+    echo "plugin: '$rev' is not a full 40-char sha; resolve it first" >&2
+    echo "  e.g. plugin_pin \"\$(git -C \"\$HERDR_APP_DIR\" rev-parse HEAD)\"" >&2
+    return 2; }
+  command -v "${cli%% *}" >/dev/null 2>&1 || {
+    echo "plugin: $cli not on PATH — plugin left as it is" >&2; return 1; }
+  state="$(plugin_state)"; kind="${state%% *}"; detail="${state#* }"
+  case "$kind" in
+    local)
+      echo "plugin: LEFT AS A LOCAL LINK ($detail) — a dev link is deliberate," >&2
+      echo "  so the deploy will not replace it. Its actions run from whatever" >&2
+      echo "  branch that checkout is on. To serve the deployed revision:" >&2
+      echo "    herdr plugin unlink $HERDR_PLUGIN_ID && herdr plugin install $HERDR_PLUGIN_REPO --ref $rev -y" >&2
+      return 1 ;;
+    github)
+      [ "$detail" = "$rev" ] && { echo "plugin:    already pinned at ${rev:0:7}"; return 0; }
+      # Reinstall is the update path; there is no `plugin update` subcommand,
+      # and installing over an existing id REFUSES rather than swapping
+      # (verified 2026-09-18), so the uninstall is required, not tidiness.
+      #
+      # And it is CHECKED. `|| true` here was the last silent write in this
+      # function: when the uninstall failed, the install was then refused for
+      # the id that still existed, and the operator was told "the plugin is now
+      # UNINSTALLED, not stale" while the record still read the old pin — with
+      # both printed recovery commands wrong, since the install refuses again
+      # and the link would swap a correct, still-present pin for the shared
+      # checkout. Branching here also lets this path say the much better true
+      # thing: nothing was lost.
+      if ! $cli plugin uninstall "$HERDR_PLUGIN_ID" >/dev/null 2>&1; then
+        echo "plugin: uninstall of $HERDR_PLUGIN_ID FAILED — STILL PINNED at ${detail:0:7}." >&2
+        echo "  Nothing was lost: the install was not attempted, because it would" >&2
+        echo "  be refused over an id that still exists. The old revision is live." >&2
+        echo "  inspect: ${cli} plugin list" >&2
+        return 2
+      fi ;;
+    none) : ;;
+    *)
+      # Anything this function cannot CLASSIFY it must not touch: an unreadable
+      # record, a `source` key herdr adds later (`worktree`, `path`), a shape
+      # from a future version. Falling through to install was how the
+      # "a deploy will not replace a local link" guarantee became void exactly
+      # when the state read failed.
+      echo "plugin: cannot classify the installed plugin (record says '$state')" >&2
+      echo "  refusing to touch it — inspect ${HERDR_PLUGINS_JSON:-$HOME/.config/herdr/plugins.json}" >&2
+      return 2 ;;
+  esac
+  $cli plugin install "$HERDR_PLUGIN_REPO" --ref "$rev" -y >/dev/null 2>&1 || {
+    echo "plugin: install of $HERDR_PLUGIN_REPO@${rev:0:7} FAILED — the plugin is now" >&2
+    echo "  UNINSTALLED, not stale. Recover with either:" >&2
+    echo "    herdr plugin install $HERDR_PLUGIN_REPO --ref $rev -y" >&2
+    echo "    herdr plugin link ${HERDR_PLUGIN_LOCAL:-$HOME/Code/herdr-control}" >&2
+    return 2; }
+  state="$(plugin_state)"
+  [ "$state" = "github $rev" ] \
+    && { echo "plugin:    pinned at ${rev:0:7}"; return 0; } \
+    || { echo "plugin: install reported success but the record says '$state'" >&2; return 2; }
 }
 
 # deploy_app [<revision>] — point the deployed worktree at a committed revision

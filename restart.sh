@@ -184,6 +184,13 @@ verify() {
       fail=1
     fi
   fi
+  # THE PLUGIN'S revision, beside the hub's, because it is the same question
+  # asked of a different surface — and the one that was wrong for weeks with
+  # nothing reporting it, because a local link never disagrees with itself.
+  printf "  %-34s " "plugin pinned revision"
+  plugin_report "$(git -C "$HERDR_APP_DIR" rev-parse HEAD 2>/dev/null)"; _prc=$?
+  # 2 is the deliberate local dev link: reported, never a failure.
+  [ "$_prc" = 0 ] || [ "$_prc" = 2 ] || fail=1
   printf "  %-34s " "hub herdr subscription"
   local waited=0 budget="${PROBE_READY_SECS:-20}"
   while :; do
@@ -205,6 +212,7 @@ verify() {
   return $fail
 }
 
+
 if [ "$VERIFY_ONLY" = 1 ]; then verify; exit $?; fi
 
 # Deploy BEFORE restarting, so the service comes back on the revision asked
@@ -212,6 +220,10 @@ if [ "$VERIFY_ONLY" = 1 ]; then verify; exit $?; fi
 if [ -n "$DEPLOY" ]; then
   echo "===== DEPLOY ====="
   deploy_app "$DEPLOY" || { echo "deploy failed; nothing was restarted" >&2; exit 2; }
+  # The plugin serves a revision too, and it moves WITH the deploy — see
+  # plugin_pin. Not fatal: a failed pin leaves the services deployable, and the
+  # message says how to recover. A local dev link is left alone and reported.
+  plugin_pin "$(app_rev_sha_full)" || true
   echo
 fi
 

@@ -240,6 +240,250 @@ else
     printf '  .     no hub plist installed on this machine — skipped\n'
 fi
 
+
+# ── the PLUGIN serves a revision too ───────────────────────────────────────
+#
+# It was installed as a LOCAL link to the shared checkout, so its actions ran
+# from whatever branch that checkout sat on — measured on 2026-09-18 as another
+# session's PR branch, five commits behind main, missing a script entirely.
+# Same defect as the hub before the deployed worktree existed. These rows pin
+# the behaviour of moving that pin with the deploy.
+PDIR="$WORK/plugin"; mkdir -p "$PDIR/bin"
+export HERDR_PLUGINS_JSON="$PDIR/plugins.json"
+export HERDR_PLUGIN_CLI="$PDIR/bin/herdr"
+export HERDR_PLUGIN_ID=tntpgh.herdr-control
+export HERDR_PLUGIN_REPO=tntpgh/herdr-control
+
+# A stub herdr: logs every call, and `install` writes the record the real one
+# would. `install` fails when $PSTUB_FAIL is set, so the failure path is real.
+cat > "$PDIR/bin/herdr" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PDIR/calls"
+case "$2" in
+  install)
+    [ -n "${PSTUB_FAIL:-}" ] && exit 1
+    # The real CLI REFUSES to install over an id that still exists. Without
+    # this the stub would let a broken flow look like it worked.
+    if grep -q 'plugin_id' "$HERDR_PLUGINS_JSON" 2>/dev/null; then
+      echo "plugin ${HERDR_PLUGIN_ID} is already installed; uninstall it first" >&2
+      exit 1
+    fi
+    # exit 0 while changing nothing: "the command succeeded" and "the thing is
+    # now true" are different claims, and only the second one matters.
+    [ -n "${PSTUB_LIE:-}" ] && exit 0
+    ref=""; for a in "$@"; do [ "$prev" = --ref ] && ref="$a"; prev="$a"; done
+    python3 - "$HERDR_PLUGINS_JSON" "$ref" <<'PY'
+import json, sys
+f, ref = sys.argv[1], sys.argv[2]
+json.dump([{ "plugin_id": "tntpgh.herdr-control",
+             "plugin_root": "/managed/root",
+             "source": {"kind": "github", "resolved_commit": ref} }], open(f, "w"))
+PY
+    ;;
+  uninstall)
+    [ -n "${PSTUB_UNINSTALL_FAIL:-}" ] && exit 1
+    printf '[]' > "$HERDR_PLUGINS_JSON" ;;
+esac
+exit 0
+STUB
+chmod +x "$PDIR/bin/herdr"
+export PDIR
+
+_prec() { printf '%s' "$1" > "$HERDR_PLUGINS_JSON"; : > "$PDIR/calls"; }
+REV_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+REV_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/managed\",\"source\":{\"kind\":\"github\",\"resolved_commit\":\"$REV_A\"}}]"
+[ "$(plugin_state)" = "github $REV_A" ] \
+  && ok "plugin_state reads a pinned install and its commit" \
+  || bad "plugin_state on github: got '$(plugin_state)'"
+
+OUT="$(plugin_pin "$REV_A" 2>&1)"; rc=$?
+# No MUTATION, specifically: a state read may talk to the CLI, an idempotent
+# pin may not change anything.
+{ [ "$rc" = 0 ] && ! grep -qE 'install|uninstall' "$PDIR/calls"; } \
+  && ok "pinning to the revision already pinned changes nothing" \
+  || bad "already-pinned should be a no-op: rc=$rc calls=[$(tr '\n' ';' < "$PDIR/calls")]"
+
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/managed\",\"source\":{\"kind\":\"github\",\"resolved_commit\":\"$REV_A\"}}]"
+OUT="$(plugin_pin "$REV_B" 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && [ "$(plugin_state)" = "github $REV_B" ]; } \
+  && ok "a pin at another revision is replaced, and the record proves it" \
+  || bad "repin failed: rc=$rc state='$(plugin_state)' out='$OUT'"
+grep -q 'uninstall' "$PDIR/calls" \
+  && ok "and it uninstalls first, because install-over-an-existing-id refuses" \
+  || bad "repin skipped the uninstall the real CLI requires"
+
+# A LOCAL link is someone's dev loop. A deploy that silently replaced it would
+# be the same surprise this whole mechanism exists to remove.
+# The REAL shape the CLI writes for a link: `{"kind":"local"}` with the
+# directory only in the top-level plugin_root. The first fixture invented a
+# `path` key, so the row passed through plugin_state's plugin_root fallback
+# rather than the branch it appeared to exercise — it passed for a different
+# reason than it read.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/Users/x/Code/herdr-control\",\"source\":{\"kind\":\"local\"}}]"
+OUT="$(plugin_pin "$REV_B" 2>&1)"; rc=$?
+{ [ "$rc" = 1 ] && ! grep -qE 'install|uninstall' "$PDIR/calls"; } \
+  && ok "a local dev link is left alone, not replaced" \
+  || bad "local link was touched: rc=$rc calls=[$(tr '\n' ';' < "$PDIR/calls")]"
+case "$OUT" in
+  *"unlink"*"install"*) ok "and the message gives the two commands to serve the deployed rev" ;;
+  *) bad "local-link message is not actionable: $OUT" ;;
+esac
+
+# Not installed at all: install, no uninstall attempt needed.
+_prec '[]'
+OUT="$(plugin_pin "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && [ "$(plugin_state)" = "github $REV_A" ]; } \
+  && ok "an absent plugin is installed at the deployed revision" \
+  || bad "install-from-absent failed: rc=$rc '$OUT'"
+
+# A FAILED install leaves the plugin UNINSTALLED, not stale — the operator has
+# to be told that, because "the pin failed" and "you have no plugin" are
+# different states and only one of them loses Quick Actions.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/managed\",\"source\":{\"kind\":\"github\",\"resolved_commit\":\"$REV_A\"}}]"
+OUT="$(PSTUB_FAIL=1 plugin_pin "$REV_B" 2>&1)"; rc=$?
+[ "$rc" = 2 ] \
+  && ok "a failed install is reported as a failure" \
+  || bad "failed install returned rc=$rc"
+case "$OUT" in
+  *"UNINSTALLED, not stale"*) ok "and says the plugin is now absent rather than old" ;;
+  *) bad "failure message hides the resulting state: $OUT" ;;
+esac
+case "$OUT" in
+  *"plugin link"*) ok "and offers the local-link fallback as recovery" ;;
+  *) bad "failure message has no recovery path: $OUT" ;;
+esac
+
+# An install that exits 0 without changing the record must NOT be reported as
+# pinned. This is the same rule as the hook scanner's post-condition: verify the
+# state, not the exit code.
+_prec '[]'
+OUT="$(PSTUB_LIE=1 plugin_pin "$REV_A" 2>&1)"; rc=$?
+[ "$rc" = 2 ] \
+  && ok "an install that exits 0 without pinning is not called pinned" \
+  || bad "trusted the exit code over the record: rc=$rc '$OUT'"
+case "$OUT" in
+  *"the record says"*) ok "and the message quotes what the record actually says" ;;
+  *) bad "no record state in the message: $OUT" ;;
+esac
+
+# ── states the code cannot classify must STOP it, not fall through ─────────
+#
+# plugin_pin's case had arms for github/local/none and no catch-all, so an
+# unreadable record or a `source.kind` herdr adds later fell straight into
+# `plugin install` — against a machine that might hold a local dev link — and
+# the failure message then claimed the plugin was uninstalled when it was
+# untouched. That voided the documented guarantee exactly when the read failed.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/w\",\"source\":{\"kind\":\"worktree\"}}]"
+OUT="$(plugin_pin "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && ! grep -qE 'install|uninstall' "$PDIR/calls"; } \
+  && ok "an unrecognised source kind is refused, and nothing is installed" \
+  || bad "unknown kind fell through: rc=$rc calls=[$(tr '\n' ';' < "$PDIR/calls")]"
+case "$OUT" in
+  *"cannot classify"*) ok "and the refusal says it could not classify the record" ;;
+  *) bad "unknown-kind message is wrong: $OUT" ;;
+esac
+
+# A state read that DIES must report that, not print nothing. python3 missing
+# or broken is the ordinary macOS "no developer tools" state.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/Users/x/Code/herdr-control\",\"source\":{\"kind\":\"local\"}}]"
+ST="$(PATH=/nonexistent plugin_state 2>/dev/null)"; strc=$?
+{ [ "$strc" = 2 ] && case "$ST" in unreadable*) true ;; *) false ;; esac; } \
+  && ok "plugin_state reports an unreadable record instead of returning silence" \
+  || bad "broken state read returned rc=$strc '$ST'"
+: > "$PDIR/calls"
+OUT="$(PATH=/nonexistent plugin_pin "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && ! grep -qE 'install|uninstall' "$PDIR/calls"; } \
+  && ok "and a pin on an unreadable state touches NOTHING (the dev link survives)" \
+  || bad "unreadable state still ran the CLI: rc=$rc calls=[$(tr '\n' ';' < "$PDIR/calls")]"
+
+# An empty revision arrived as one empty argument when nothing was deployed;
+# the github arm then uninstalled a CORRECT pin to chase it.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/managed\",\"source\":{\"kind\":\"github\",\"resolved_commit\":\"$REV_A\"}}]"
+OUT="$(plugin_pin "" 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && ! grep -qE 'install|uninstall' "$PDIR/calls" && [ "$(plugin_state)" = "github $REV_A" ]; } \
+  && ok "an empty revision is refused and the existing pin survives" \
+  || bad "empty rev destroyed the pin: rc=$rc state='$(plugin_state)'"
+: > "$PDIR/calls"
+OUT="$(plugin_pin 2>&1)"; rc=$?
+[ "$rc" = 2 ] \
+  && ok "and calling it with no argument at all is refused, not an unbound-variable crash" \
+  || bad "no-arg call: rc=$rc '$OUT'"
+
+# herdr records the RESOLVED commit, so a branch name installs fine and then
+# fails the read-back. Refuse at the door instead of letting the report lie.
+: > "$PDIR/calls"
+OUT="$(plugin_pin main 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && ! grep -qE 'install|uninstall' "$PDIR/calls"; } \
+  && ok "a branch name is refused: a pin must be a full sha" \
+  || bad "accepted a non-sha ref: rc=$rc"
+case "$OUT" in
+  *"full 40-char sha"*) ok "and says what a pin has to be" ;;
+  *) bad "non-sha message unhelpful: $OUT" ;;
+esac
+
+# A WRITE THAT FAILS SILENTLY was the last instance of the class this commit
+# closed. `plugin uninstall ... || true` meant a failed uninstall let the
+# install be refused for the id that still existed, and the operator was told
+# "the plugin is now UNINSTALLED, not stale" — while the record still held the
+# old pin, and BOTH printed recovery commands were wrong: the install refuses
+# again, and the link would swap a correct, still-present pin for the shared
+# checkout.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/managed\",\"source\":{\"kind\":\"github\",\"resolved_commit\":\"$REV_A\"}}]"
+OUT="$(PSTUB_UNINSTALL_FAIL=1 plugin_pin "$REV_B" 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && [ "$(plugin_state)" = "github $REV_A" ]; } \
+  && ok "a failed uninstall leaves the existing pin in place" \
+  || bad "failed uninstall: rc=$rc state='$(plugin_state)'"
+# `grep install` also matches UNinstall — the first version of this row failed
+# for that reason, not because the code was wrong.
+grep -qE '(^| )install ' "$PDIR/calls" \
+  && bad "it attempted the install the CLI would refuse anyway" \
+  || ok "and does not attempt the install that would be refused"
+case "$OUT" in
+  *"STILL PINNED"*"Nothing was lost"*) ok "and says what is true: still pinned, nothing lost" ;;
+  *) bad "failed-uninstall message: $OUT" ;;
+esac
+case "$OUT" in
+  *"UNINSTALLED, not stale"*) bad "it still claims the plugin is gone when it is not" ;;
+  *) ok "and no longer claims the plugin is gone" ;;
+esac
+
+# ── the --verify line is a function, so its branches are testable ──────────
+# The review that found the catch-all bug had to transplant this block into a
+# harness to drive it. A gate testable only by copying it is a gate whose
+# branches go untested.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/managed\",\"source\":{\"kind\":\"github\",\"resolved_commit\":\"$REV_A\"}}]"
+OUT="$(plugin_report "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && case "$OUT" in *"== the deployed rev"*) true ;; *) false ;; esac; } \
+  && ok "plugin_report: agreement passes and says so" \
+  || bad "agreement: rc=$rc '$OUT'"
+OUT="$(plugin_report "$REV_B" 2>&1)"; rc=$?
+{ [ "$rc" = 1 ] && case "$OUT" in *"!= deployed"*repair*) true ;; *) false ;; esac; } \
+  && ok "plugin_report: drift FAILS and names the repair" \
+  || bad "drift: rc=$rc '$OUT'"
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/Users/x/Code/herdr-control\",\"source\":{\"kind\":\"local\"}}]"
+OUT="$(plugin_report "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && case "$OUT" in *"LOCAL LINK"*) true ;; *) false ;; esac; } \
+  && ok "plugin_report: a dev link is reported and is NOT a failure" \
+  || bad "local link: rc=$rc '$OUT'"
+_prec '[]'
+OUT="$(plugin_report "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 1 ] && case "$OUT" in *"NOT INSTALLED"*) true ;; *) false ;; esac; } \
+  && ok "plugin_report: an absent plugin FAILS (Quick Actions are gone)" \
+  || bad "absent: rc=$rc '$OUT'"
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/w\",\"source\":{\"kind\":\"worktree\"}}]"
+OUT="$(plugin_report "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 1 ] && case "$OUT" in *"UNKNOWN STATE"*) true ;; *) false ;; esac; } \
+  && ok "plugin_report: an unclassifiable state FAILS instead of printing a blank row" \
+  || bad "unknown state passed verify: rc=$rc '$OUT'"
+OUT="$(PATH=/nonexistent plugin_report "$REV_A" 2>&1)"; rc=$?
+[ "$rc" = 1 ] \
+  && ok "and so does an unreadable one" \
+  || bad "unreadable state passed verify: rc=$rc '$OUT'"
+
+unset HERDR_PLUGINS_JSON HERDR_PLUGIN_CLI HERDR_PLUGIN_ID HERDR_PLUGIN_REPO
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi

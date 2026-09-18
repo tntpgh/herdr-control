@@ -504,9 +504,27 @@ actions instead — install once, get keybinding-ready ids and a
 through an extra hop (`pick-pane-open.sh`, below) that the other three
 don't need:
 
+**Install it PINNED, not linked.** Until 2026-09-18 this was a
+`herdr plugin link ~/Code/herdr-control`, so every action executed out of
+whatever branch that shared checkout happened to be on — that day, another
+session's PR branch, five commits behind `main`, missing
+`guard-raw-prompt-answer.sh` entirely. Nothing reported it, because a local
+link never disagrees with itself. A pinned install clones into its own managed
+root that no `git switch` can move, and `herdr plugin list` prints the sha it
+serves. Same rule as the hub's deployed worktree and the hook scanner's `.rev`:
+the thing that answers must be a known revision.
+
 ```bash
-herdr plugin link .                        # local dev, from this repo
-# or: herdr plugin install tntpgh/herdr-control
+# the served copy — pinned to a commit
+herdr plugin install tntpgh/herdr-control --ref "$(git rev-parse origin/main)" -y
+
+# and it moves with the deploy, so there is no second step to forget:
+./restart.sh --deploy      # deploys hub.py AND pins the plugin to that rev
+./restart.sh --verify      # reports the plugin's rev beside the hub's; fails on drift
+
+# developing on it: unlink first, and a deploy will NOT clobber the link
+herdr plugin unlink tntpgh.herdr-control && herdr plugin link .
+
 herdr plugin action list --plugin tntpgh.herdr-control
 herdr plugin action invoke tntpgh.herdr-control.projects
 ```

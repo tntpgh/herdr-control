@@ -32,6 +32,27 @@
 # stays wired through ~/.claude/settings.json and the omp extension module,
 # same as today.
 #
+# HOW THIS IS INSTALLED, and why it matters: PINNED, not linked.
+#
+#   herdr plugin install tntpgh/herdr-control --ref <sha> -y
+#
+# Until 2026-09-18 it was `herdr plugin link ~/Code/herdr-control`, so every
+# action ran out of whatever branch that SHARED checkout was sitting on. That
+# day it was on another session's PR branch, five commits behind main, missing
+# a script entirely — the same "runs whatever is checked out" defect as the hub
+# before the deployed worktree and the hook shims before the .rev record.
+# A pinned install clones into its own managed root, which no `git switch` can
+# move, and `herdr plugin list` then prints the sha it is serving.
+#
+# The pin MOVES WITH THE DEPLOY (`./restart.sh --deploy` -> plugin_pin in
+# launchd/agent-lib.sh), because a release whose second step a human has to
+# remember is how 18 repos ended up running an open PR's scanner. `--verify`
+# reports the plugin's revision next to the hub's and fails on drift.
+#
+# Developing on it: `herdr plugin unlink tntpgh.herdr-control` then
+# `herdr plugin link <path>`. A deploy will NOT replace a local link — it says
+# so and leaves it — so a dev loop is never silently clobbered.
+#
 # No [[build]] step: these are plain bash scripts, already the finished
 # artifact `command` needs, so there is nothing to compile — one real
 # advantage over herdr-plus's Go binary (no toolchain dependency, no
