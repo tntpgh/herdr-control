@@ -257,9 +257,30 @@ classify_command() {
   # independently (not "flag immediately after rm") so `rm file -r` and
   # obfuscated `$(echo rm) -rf x` (flattened above to `echo rm -rf x`) both
   # still trip it.
+  #
+  # Narrowed 2026-09-18: 16 of 142 escalations in the recorded worker corpus
+  # were `rm -rf dist`, `rm -rf __pycache__`, `rm -rf node_modules` — build
+  # artifacts inside the worker OWN worktree, which is the thing a worker is
+  # expected to rebuild. A recursive rm whose every target is relative and
+  # glob-free cannot escape the working directory, so it no longer wakes
+  # anyone. Anything absolute, home-anchored, parent-relative or globbed still
+  # does: `/`, `~`, `$HOME`, `..`, `*` all keep the escalation, and so does a
+  # scratch path under /tmp — deliberately, because "outside the worktree" is
+  # the line, not "harmless in my judgement".
   { _cp_match '\brm\b' "$norm" &&
-    _cp_match '(--recursive\b|(^|[[:space:]])-[A-Za-z]*[rR][A-Za-z]*([[:space:]]|$))' "$norm"; } &&
-    _cp_consider 1 "recursive rm (-r/-R/--recursive) can delete an entire directory tree"
+    _cp_match '(--recursive\b|(^|[[:space:]])-[A-Za-z]*[rR][A-Za-z]*([[:space:]]|$))' "$norm" &&
+    _cp_match '\brm\b[^;&|]*[[:space:]](/|~|\$HOME|\$\{HOME|\.\.([[:space:]]|/|$)|[^[:space:]]*\*)' "$norm"; } &&
+    _cp_consider 1 "recursive rm of a path outside the working tree can delete anything"
+
+  # deny — recursive rm of the filesystem root, or of a bare HOME, is the same
+  # class as mkfs and dd-to-a-raw-device above: irreversible, and never
+  # eligible for auto-approval by anybody. It was only ESCALATE, which is a
+  # gap — escalate means one keypress from a menu that does not show the blast
+  # radius. A path UNDER root or home stays escalate; this is only the root
+  # itself, with or without a trailing glob.
+  { _cp_match '(--recursive\b|(^|[[:space:]])-[A-Za-z]*[rR][A-Za-z]*([[:space:]]|$))' "$norm" &&
+    _cp_match '\brm\b[^;&|]*[[:space:]](/|~|\$HOME|\$\{HOME\})(\*|[[:space:]]|$)' "$norm"; } &&
+    _cp_consider 2 "recursive rm of the filesystem root or home — irreversible, never auto-approvable"
 
   # escalate — dd writing to a raw block device is exactly as irreversible
   # as the mkfs case above, just spelled differently.
@@ -291,30 +312,97 @@ classify_command() {
     _cp_consider 1 "DROP/TRUNCATE TABLE is an irreversible schema/data change"
 
   # escalate — fetch-and-execute, in ANY combination of downloader and
-  # interpreter. Split into two independent rules on purpose: the old
-  # single rule required the literal token "curl" AND a pipe into sh/bash,
-  # so wget, base64-then-exec, and `python3 -c "$(curl …)"` (no pipe at
-  # all — the substitution is flattened to inline text above, so this rule
-  # alone catches it) all sailed through as "allow". A human should read
-  # unreviewed remote code before it runs, regardless of which tool fetched
-  # it or which interpreter runs it.
-  _cp_match '\|[[:space:]]*(sh|bash|zsh|dash|ksh|python3?|perl|ruby|node)([[:space:]]|$)' "$norm" &&
-    _cp_consider 1 "pipes data into an interpreter — executes unreviewed code"
-  # `git fetch` is not fetch-and-execute. It writes objects and refs into the
-  # local store and runs NOTHING: fetched content is inert until a checkout,
-  # and a checkout runs only filters/hooks the local repo already configured.
-  # But the rule matched the bare word `fetch` inside it, so the FIRST step of
-  # every review lane — fetch the branch under review — escalated to a human.
-  # Observed on wN:pA (2026-09-18) while three reviews were already queued.
-  # Masked before the match, not exempted after it, so a `git fetch` piped
-  # into a shell is still caught by the interpreter rule above, and a bare
-  # `fetch(1)` still escalates. No \b here: BSD sed does not implement it and
-  # silently matches nothing, so the mask would no-op on this machine while
-  # the fixtures below stayed red for no visible reason.
-  _cp_net="$(printf '%s' "$norm" | sed -E \
-    's/(^|[^A-Za-z0-9_-])git(([[:space:]]+-[^[:space:]]+)([[:space:]]+[^-[:space:]][^[:space:]]*)?)*[[:space:]]+fetch([^A-Za-z0-9_-]|$)/\1git ref-download\5/g')"
-  _cp_imatch '\b(curl|wget|fetch|aria2c)\b' "$_cp_net" &&
-    _cp_consider 1 "downloads from the network — pair with running the result unreviewed"
+  # interpreter. Split into independent rules on purpose: the old single rule
+  # required the literal token "curl" AND a pipe into sh/bash, so wget,
+  # base64-then-exec, and `python3 -c "$(curl …)"` (no pipe at all — the
+  # substitution is flattened to inline text above, so this rule alone catches
+  # it) all sailed through as "allow". A human should read unreviewed remote
+  # code before it runs, regardless of which tool fetched it or which
+  # interpreter runs it.
+  #
+  # What changed 2026-09-18, measured against 1,614 distinct commands real
+  # workers ran (extracted from their session transcripts): 142 escalated, and
+  # the largest class was this rule firing on the DOWNLOAD ALONE — 24 read-only
+  # GETs whose output went to a pipe or stdout, plus 11 `git fetch`. Reading a
+  # deployed page is how a review lane checks its own subject; it executes
+  # nothing. The rule now matches what its own comment always claimed: a
+  # download PAIRED with running it, a download that lands a FILE you could run
+  # later, or a request that SENDS data.
+
+  # stdin becomes the program: for a shell there is no other reading of it.
+  _cp_match '\|[[:space:]]*(sh|bash|zsh|dash|ksh)([[:space:]]|$)' "$norm" &&
+    _cp_consider 1 "pipes data into a shell — stdin becomes the program"
+  # For python/perl/ruby/node, stdin is the program ONLY when no inline program
+  # was given. `curl … | python3 -c "import json…"` pipes DATA into a program
+  # that is fully visible in the prompt being reviewed, which is not the same
+  # act as `| sh` at all — 3 of the 7 hits on this rule were exactly that.
+  { _cp_match '\|[[:space:]]*(python3?|perl|ruby|node)([[:space:]]|$)' "$norm" &&
+    ! _cp_match '\|[[:space:]]*(python3?|perl|ruby|node)[[:space:]]+-[A-Za-z]*[cem]([[:space:]]|$)' "$norm"; } &&
+    _cp_consider 1 "pipes data into an interpreter — stdin becomes the program"
+
+  # A downloader is a COMMAND, not a substring. Matching the bare words meant
+  # `git fetch` (the first step of every review lane), `node scripts/
+  # fetch-reviews.js`, and any path with "curl" in its name all counted as
+  # network downloads — 35 of the 43 hits on this rule in the recorded worker
+  # corpus were exactly that, and each one woke a human. The token now has to
+  # sit where a command goes: at the start, after a separator, or behind the
+  # usual prefixes (sudo/env/timeout/xargs/--). `git fetch` no longer needs a
+  # special case, because `fetch` there is a SUBCOMMAND, not a command.
+  # `-[A-Za-z]*[cem]` is in the prefix set because the normalizer above erases
+  # `$( )`, so `python3 -c "$(curl …)"` flattens to `python3 -c  curl …` and the
+  # downloader IS the command there — it just lost its punctuation.
+  _cp_dl_cmd='(^|[;&|(){]|&&|\|\||[[:space:]](sudo|nohup|xargs|exec|eval|time|env([[:space:]]+[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)*|timeout([[:space:]]+-[^[:space:]]+)*[[:space:]]+[0-9]+[A-Za-z]?|do|then|else|--|-[A-Za-z]*[cem])[[:space:]])[[:space:]]*(curl|wget|fetch|aria2c)([[:space:]]|$)'
+  _cp_downloader=0
+  _cp_imatch "$_cp_dl_cmd" "$norm" && _cp_downloader=1
+
+  # Paired with execution — the case this rule exists for. The pipe-into-shell
+  # and pipe-into-bare-interpreter shapes are NOT repeated here: the two rules
+  # above already fire on them independently, and repeating them would undo the
+  # inline-program exception (`curl … | python3 -c "…"` is data, not code).
+  # What is left is the execution this classifier would otherwise miss: running
+  # a downloaded script file, making one executable, `eval`, a base64 decode
+  # feeding a run, and the substitution form (`python3 -c "$(curl …)"`), where
+  # the downloaded text IS the inline program — recognisable because the
+  # downloader appears AFTER the inline flag with no pipe between them.
+  [ "$_cp_downloader" = 1 ] &&
+    _cp_match '((^|[[:space:]])(sh|bash|zsh|dash|ksh|python3?|perl|ruby|node)[[:space:]]+[^[:space:]]*\.(sh|py|pl|rb|js)([[:space:]]|$)|\bchmod[[:space:]]+[^[:space:]]*\+x|\beval\b|\bbase64[[:space:]]+(-d|--decode)\b|(python3?|perl|ruby|node)[[:space:]]+-[A-Za-z]*[ce]([[:space:]])[^|]*\b(curl|wget|aria2c)\b)' "$norm" &&
+    _cp_consider 1 "downloads and then runs it — unreviewed remote code"
+
+  # Lands a PROGRAM you could run in a later command, which this classifier
+  # never sees. curl writes to stdout unless told otherwise; wget/fetch/aria2c
+  # save a file unless told otherwise, so the default flips per tool.
+  #
+  # A landed file is only interesting if it could be executed. Saving a page,
+  # a JSON body or a markdown doc to /tmp and grepping it is how a worker
+  # inspects a deploy — 24 of the remaining escalations were exactly that — so
+  # known data extensions are exempt and everything else (a script extension,
+  # or no extension at all) still stops for a human.
+  #
+  # Two more exemptions, both measured rather than guessed:
+  #   * `-o /dev/null` lands NOTHING. It is the standard idiom for wanting only
+  #     the status line (`curl -s -o /dev/null -w "%{http_code}"`), which is how
+  #     every worker smoke-tests a URL.
+  #   * a loopback URL is not remote code. `curl http://localhost:4173/…` talks
+  #     to the build this same worker just started; the unreviewed-remote-code
+  #     risk this rule exists for does not exist there. A loopback request that
+  #     MUTATES is still caught below, by the data-sending rule.
+  _cp_data_out='(\.(html?|json|xml|csv|tsv|txt|md|log|ya?ml|png|jpe?g|gif|svg|pdf|ico|woff2?)([[:space:]]|$|["'"'"'])|-[oO][[:space:]]*/dev/null|--output[[:space:]]*/dev/null)'
+  _cp_loopback='https?://(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)([:/[:space:]]|$)'
+  [ "$_cp_downloader" = 1 ] &&
+    { _cp_imatch '\bcurl\b[^;&]*((^|[[:space:]])-[A-Za-z]*[oO]([[:space:]]|$)|--output\b|--remote-name\b)' "$norm" ||
+      _cp_match "$_cp_dl_cmd"'[^;&|]*>[[:space:]]*[^[:space:]]' "$norm" ||
+      { _cp_imatch '(^|[;&|(){]|&&|\|\||[[:space:]](sudo|xargs|--)[[:space:]])[[:space:]]*(wget|fetch|aria2c)([[:space:]]|$)' "$norm" &&
+        ! _cp_match '(-O[[:space:]]*-|--output-document=-|-qO-)' "$norm"; }; } &&
+    ! _cp_imatch "$_cp_data_out" "$norm" &&
+    ! _cp_imatch "$_cp_loopback" "$norm" &&
+    _cp_consider 1 "downloads a program to disk — it can be run by a later command"
+
+  # Sending data out is not reading the web: a GET is inert, but a POST/PUT, a
+  # form or file upload, or an inline body can mutate a remote system or carry
+  # a secret off this machine.
+  [ "$_cp_downloader" = 1 ] &&
+    _cp_imatch '(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--request[[:space:]]+(POST|PUT|PATCH|DELETE)|(^|[[:space:]])-d([[:space:]]|=)|--data(-raw|-binary|-urlencode|-ascii)?([[:space:]]|=)|(^|[[:space:]])-F([[:space:]]|=)|--form([[:space:]]|=)|(^|[[:space:]])-T([[:space:]]|=)|--upload-file|--json([[:space:]]|=))' "$norm" &&
+    _cp_consider 1 "sends data to the network — remote mutation or an exfiltration path"
 
   # escalate — reads or ships credential material. This is the gap the
   # header comment above (and README/SKILL.md) already promised was
@@ -325,13 +413,21 @@ classify_command() {
   _cp_imatch '(^|[[:space:]])(printenv|env)([[:space:]]|$)|\bop[[:space:]]+read\b|\bgh[[:space:]]+secret\b|\baws[[:space:]]+(configure|sts)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm" &&
     _cp_consider 1 "enumerates or resolves secrets"
 
-  # escalate — production / infrastructure scope change. A name-based
-  # rule (matching the literal word "prod"/"production"/"live") is
-  # necessarily approximate — it has no notion of which context is
-  # actually production — but a false escalation just means a human looks
-  # once at an operational command; a false allow means an unreviewed
-  # agent prompt destroyed a live system.
-  _cp_imatch '\b(prod|production|live)\b' "$norm" &&
+  # escalate — production / infrastructure scope change. A name-based rule is
+  # necessarily approximate: it has no notion of which context is actually
+  # production. The old form matched the bare word anywhere, on the reasoning
+  # that "a false escalation just means a human looks once". Measured against
+  # the recorded worker corpus that reasoning does not hold — every single hit
+  # was a LOCAL name: `cp -r dist dist-prod-verified`, a pytest node id with
+  # "production" in it, `pkill -f "serve dist"` next to a prod-named folder.
+  # None of them could touch a live system, and each one woke a human.
+  #
+  # So the word now has to appear where a TARGET goes: a selector flag, an
+  # environment assignment, a remote-session command, or a hostname. The
+  # dangerous shapes are unchanged — `kubectl --context production delete …`,
+  # `wrangler deploy --env production`, `ssh prod`, `psql …@live.…` — and the
+  # infrastructure-verb rule below is untouched and independent.
+  _cp_imatch '(--(context|env|environment|profile|namespace|target|app|stage|remote|host)([[:space:]]+|=)[^[:space:]]*(prod|production|live)|(^|[[:space:]])-[aeEpn][[:space:]]+(prod|production|live)([[:space:]]|$)|\b(NODE_ENV|APP_ENV|RAILS_ENV|DEPLOY_ENV|ENV|STAGE)=(prod|production|live)\b|\b(ssh|scp|rsync|psql|mysql|redis-cli|mongosh|wrangler|vercel|netlify|fly|heroku)\b[^;&|]*\b(prod|production|live)\b|\b(prod|production|live)\.[a-z0-9][a-z0-9.-]*\b)' "$norm" &&
     _cp_consider 1 "names a production target"
   _cp_imatch '\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(delete|drain|scale)\b|\bhelm[[:space:]]+(delete|uninstall)\b|\bflyctl?[[:space:]]+(deploy|destroy)\b' "$norm" &&
     _cp_consider 1 "infrastructure scope change"
