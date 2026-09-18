@@ -308,7 +308,12 @@ grep -q 'uninstall' "$PDIR/calls" \
 
 # A LOCAL link is someone's dev loop. A deploy that silently replaced it would
 # be the same surprise this whole mechanism exists to remove.
-_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/Users/x/Code/herdr-control\",\"source\":{\"kind\":\"local\",\"path\":\"/Users/x/Code/herdr-control\"}}]"
+# The REAL shape the CLI writes for a link: `{"kind":"local"}` with the
+# directory only in the top-level plugin_root. The first fixture invented a
+# `path` key, so the row passed through plugin_state's plugin_root fallback
+# rather than the branch it appeared to exercise — it passed for a different
+# reason than it read.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/Users/x/Code/herdr-control\",\"source\":{\"kind\":\"local\"}}]"
 OUT="$(plugin_pin "$REV_B" 2>&1)"; rc=$?
 { [ "$rc" = 1 ] && ! grep -qE 'install|uninstall' "$PDIR/calls"; } \
   && ok "a local dev link is left alone, not replaced" \
@@ -354,6 +359,94 @@ case "$OUT" in
   *"the record says"*) ok "and the message quotes what the record actually says" ;;
   *) bad "no record state in the message: $OUT" ;;
 esac
+
+# ── states the code cannot classify must STOP it, not fall through ─────────
+#
+# plugin_pin's case had arms for github/local/none and no catch-all, so an
+# unreadable record or a `source.kind` herdr adds later fell straight into
+# `plugin install` — against a machine that might hold a local dev link — and
+# the failure message then claimed the plugin was uninstalled when it was
+# untouched. That voided the documented guarantee exactly when the read failed.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/w\",\"source\":{\"kind\":\"worktree\"}}]"
+OUT="$(plugin_pin "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && ! grep -qE 'install|uninstall' "$PDIR/calls"; } \
+  && ok "an unrecognised source kind is refused, and nothing is installed" \
+  || bad "unknown kind fell through: rc=$rc calls=[$(tr '\n' ';' < "$PDIR/calls")]"
+case "$OUT" in
+  *"cannot classify"*) ok "and the refusal says it could not classify the record" ;;
+  *) bad "unknown-kind message is wrong: $OUT" ;;
+esac
+
+# A state read that DIES must report that, not print nothing. python3 missing
+# or broken is the ordinary macOS "no developer tools" state.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/Users/x/Code/herdr-control\",\"source\":{\"kind\":\"local\"}}]"
+ST="$(PATH=/nonexistent plugin_state 2>/dev/null)"; strc=$?
+{ [ "$strc" = 2 ] && case "$ST" in unreadable*) true ;; *) false ;; esac; } \
+  && ok "plugin_state reports an unreadable record instead of returning silence" \
+  || bad "broken state read returned rc=$strc '$ST'"
+: > "$PDIR/calls"
+OUT="$(PATH=/nonexistent plugin_pin "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && ! grep -qE 'install|uninstall' "$PDIR/calls"; } \
+  && ok "and a pin on an unreadable state touches NOTHING (the dev link survives)" \
+  || bad "unreadable state still ran the CLI: rc=$rc calls=[$(tr '\n' ';' < "$PDIR/calls")]"
+
+# An empty revision arrived as one empty argument when nothing was deployed;
+# the github arm then uninstalled a CORRECT pin to chase it.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/managed\",\"source\":{\"kind\":\"github\",\"resolved_commit\":\"$REV_A\"}}]"
+OUT="$(plugin_pin "" 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && ! grep -qE 'install|uninstall' "$PDIR/calls" && [ "$(plugin_state)" = "github $REV_A" ]; } \
+  && ok "an empty revision is refused and the existing pin survives" \
+  || bad "empty rev destroyed the pin: rc=$rc state='$(plugin_state)'"
+: > "$PDIR/calls"
+OUT="$(plugin_pin 2>&1)"; rc=$?
+[ "$rc" = 2 ] \
+  && ok "and calling it with no argument at all is refused, not an unbound-variable crash" \
+  || bad "no-arg call: rc=$rc '$OUT'"
+
+# herdr records the RESOLVED commit, so a branch name installs fine and then
+# fails the read-back. Refuse at the door instead of letting the report lie.
+: > "$PDIR/calls"
+OUT="$(plugin_pin main 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && ! grep -qE 'install|uninstall' "$PDIR/calls"; } \
+  && ok "a branch name is refused: a pin must be a full sha" \
+  || bad "accepted a non-sha ref: rc=$rc"
+case "$OUT" in
+  *"full 40-char sha"*) ok "and says what a pin has to be" ;;
+  *) bad "non-sha message unhelpful: $OUT" ;;
+esac
+
+# ── the --verify line is a function, so its branches are testable ──────────
+# The review that found the catch-all bug had to transplant this block into a
+# harness to drive it. A gate testable only by copying it is a gate whose
+# branches go untested.
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/managed\",\"source\":{\"kind\":\"github\",\"resolved_commit\":\"$REV_A\"}}]"
+OUT="$(plugin_report "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && case "$OUT" in *"== the deployed rev"*) true ;; *) false ;; esac; } \
+  && ok "plugin_report: agreement passes and says so" \
+  || bad "agreement: rc=$rc '$OUT'"
+OUT="$(plugin_report "$REV_B" 2>&1)"; rc=$?
+{ [ "$rc" = 1 ] && case "$OUT" in *"!= deployed"*repair*) true ;; *) false ;; esac; } \
+  && ok "plugin_report: drift FAILS and names the repair" \
+  || bad "drift: rc=$rc '$OUT'"
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/Users/x/Code/herdr-control\",\"source\":{\"kind\":\"local\"}}]"
+OUT="$(plugin_report "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 2 ] && case "$OUT" in *"LOCAL LINK"*) true ;; *) false ;; esac; } \
+  && ok "plugin_report: a dev link is reported and is NOT a failure" \
+  || bad "local link: rc=$rc '$OUT'"
+_prec '[]'
+OUT="$(plugin_report "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 1 ] && case "$OUT" in *"NOT INSTALLED"*) true ;; *) false ;; esac; } \
+  && ok "plugin_report: an absent plugin FAILS (Quick Actions are gone)" \
+  || bad "absent: rc=$rc '$OUT'"
+_prec "[{\"plugin_id\":\"tntpgh.herdr-control\",\"plugin_root\":\"/w\",\"source\":{\"kind\":\"worktree\"}}]"
+OUT="$(plugin_report "$REV_A" 2>&1)"; rc=$?
+{ [ "$rc" = 1 ] && case "$OUT" in *"UNKNOWN STATE"*) true ;; *) false ;; esac; } \
+  && ok "plugin_report: an unclassifiable state FAILS instead of printing a blank row" \
+  || bad "unknown state passed verify: rc=$rc '$OUT'"
+OUT="$(PATH=/nonexistent plugin_report "$REV_A" 2>&1)"; rc=$?
+[ "$rc" = 1 ] \
+  && ok "and so does an unreadable one" \
+  || bad "unreadable state passed verify: rc=$rc '$OUT'"
 
 unset HERDR_PLUGINS_JSON HERDR_PLUGIN_CLI HERDR_PLUGIN_ID HERDR_PLUGIN_REPO
 
