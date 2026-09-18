@@ -208,7 +208,11 @@ _cp_walk_run() {                        # segment
       # A lone file descriptor number. The segment splitter cuts on `&`, so
       # `2>&1 /tmp/p.json` arrives as `2>` then `1 /tmp/p.json` and the `1`
       # sat where the command word goes. A pure number is never a command.
-      [0-9]|[0-9][0-9]*)
+      [0-9]*)
+        # ALL digits. The glob `[0-9][0-9]*` matched anything whose first two
+        # characters were digits — `12.json`, `10x` — which is wider than the
+        # comment and invites the next reader to widen it further.
+        case "$1" in *[!0-9]*) break ;; esac
         shift ;;
       [A-Za-z_]*=*)
         # `VER=` with nothing after the `=` is a substitution that
@@ -272,6 +276,17 @@ _cp_walk_run() {                        # segment
       continue
     fi
 
+    # In LOOSE mode we are NOT at a real command position — we are scanning
+    # past the flattened innards of a `VAR=$(…)`. Only a real interpreter NAME
+    # counts there, never the `source` builtin or its `.` spelling: worker
+    # commands pass a bare `.` constantly (`jq .`, `find .`, `cp … .`) and
+    # reading it as `source` made the next token a script slot.
+    if [ "$_cp_wloose" = 1 ]; then
+      case "$_cp_wcmd" in
+        source|.) shift; continue ;;
+      esac
+    fi
+
     case "$_cp_wcmd" in
       sh|bash|zsh|dash|ksh|mksh|python|python2|python3|perl|ruby|node|bun|deno|source|.)
         # Which short flags mean "the program is inline, no file runs" is PER
@@ -283,7 +298,16 @@ _cp_walk_run() {                        # segment
           python|python2|python3)    _cp_winline=cm; _cp_wvi='X' ;;
           perl)                     _cp_winline=eE; _cp_wvi='IM' ;;
           ruby)                     _cp_winline=e;  _cp_wvi='rI' ;;
-          node|bun|deno)            _cp_winline=ep; _cp_wvi='r' ;;
+          # Per TOOL, not per family. `-r` is `--require MODULE` to node and
+          # `--reload` to deno, where it takes an OPTIONAL value — sharing the
+          # set made `deno run -r /tmp/p.json` swallow the script as the
+          # flag's value and classify allow. bun has no `-r` at all. deno's
+          # `-c` IS a separate-value config path, and its default name is
+          # literally `deno.json`, so omitting it escalated the most standard
+          # deno invocation there is.
+          node)                     _cp_winline=ep; _cp_wvi='r' ;;
+          bun)                      _cp_winline=ep; _cp_wvi= ;;
+          deno)                     _cp_winline=;   _cp_wvi='c' ;;
           *)                        _cp_winline=;   _cp_wvi= ;;
         esac
         shift
@@ -302,6 +326,13 @@ _cp_walk_run() {                        # segment
           case "$1" in
             --) shift; break ;;
             --eval|--eval=*|--command|--command=*|--print|--print=*|--module|--module=*) return 1 ;;
+            # OUTPUT redirections and their operands. A data file that is
+            # merely where stderr goes is not the program: `bash 2>/tmp/p.json`
+            # escalated. INPUT redirection is deliberately NOT skipped — for
+            # `python3 - < /tmp/p.json` the redirected file IS the program, and
+            # leaving `<` in the script slot is what catches it.
+            '>'|'>>'|[0-9]'>'|[0-9]'>>'|'&>'|'&>>') shift; [ "$#" -gt 0 ] && shift ;;
+            '>'*|[0-9]*'>'*|'&>'*) shift ;;
             --*) shift ;;
             -?*)
               if [ -n "$_cp_winline" ] && printf '%s' "${1#-}" | grep -q "[$_cp_winline]"; then
@@ -338,7 +369,19 @@ _cp_walk_run() {                        # segment
         case "$1" in
           */*|*.*) return 1 ;;
         esac
+        _cp_wredir=0
         for _cp_wtok in "$@"; do
+          # A bare operator's operand is a redirection TARGET, not a program:
+          # `bash echo > /tmp/p.json` writes a file, it does not run one.
+          if [ "$_cp_wredir" = 1 ]; then _cp_wredir=0; continue; fi
+          case "$_cp_wtok" in
+            # OUTPUT: the operand is a destination, skip it too.
+            '>'|'>>'|[0-9]'>'|[0-9]'>>'|'&>'|'&>>') _cp_wredir=1; continue ;;
+            '>'*|[0-9]*'>'*|'&>'*) continue ;;
+            # INPUT: skip the operator but KEEP its operand as a candidate —
+            # for `python3 - < /tmp/p.json` the redirected file is the program.
+            '<'|'<>'|[0-9]'<'|'<'*) continue ;;
+          esac
           case "$_cp_wtok" in
             ./*|/*|'~/'*|../*)
               if _cp_is_data_path "$_cp_wtok"; then
@@ -379,17 +422,28 @@ _cp_walk_run() {                        # segment
     # PATH, and treating it as one made every `cat p.json` escalate. The
     # tilde is QUOTED: bash tilde-expands `case` patterns, so a bare `~/*`
     # arm compiles to `$HOME/*` and never matches a literal tilde.
-    case "$1" in
-      ./*|/*|'~/'*|../*)
-        if _cp_is_data_path "$1"; then
-          _cp_consider 1 "executes a data file directly — its extension says it is not source"
-          return 0
-        fi
-        return 1
-        ;;
-    esac
+    #
+    # ONLY at a real command position. In loose mode this arm is skipped
+    # entirely: scanning past a flattened substitution means every remaining
+    # token is an argument, so running it here read `./notes.md` in
+    # `SHA=$(git rev-parse HEAD) gh pr comment --body-file ./notes.md` as a
+    # program. That is a data-file MENTION waking a human, which is the exact
+    # class #94 removed 53 of.
+    if [ "$_cp_wloose" = 0 ]; then
+      case "$1" in
+        ./*|/*|'~/'*|../*)
+          if _cp_is_data_path "$1"; then
+            _cp_consider 1 "executes a data file directly — its extension says it is not source"
+            return 0
+          fi
+          ;;
+      esac
+      return 1
+    fi
 
-    [ "$_cp_wloose" = 1 ] || return 1
+    # Loose mode keeps going. It must NOT stop at a path-form token that is
+    # not a data file: `VER=$(cat /etc/hostname) bash /tmp/payload.json`
+    # aborted on `/etc/hostname` and the whole pair went back to allow.
     shift
   done
   return 1
