@@ -447,11 +447,110 @@ question = []
 selected = ""
 invalid = complete = visible = False
 truncated = False
+
+
+def _text(s):
+    return re.sub(r"^[^A-Za-z0-9]+", "", ansi.sub("", s)).rstrip(" \t\r\n|-\u2502\u2500\u256e")
+
+
+# A pane narrow enough to wrap the navigation footer splits it across rows, and
+# the wrap point depends only on pane width: 43 columns broke it before
+# "cancel", a narrower pane breaks it earlier. Every fragment is footer, never
+# output — but both passes below judge rows individually, so the leftover
+# fragment read as text BELOW the footer and failed the panel closed. The hub
+# then paged for a prompt that peer-answer and herdr-select both refused to
+# touch, leaving a human keypress as the only exit (wN:p9, 2026-09-18).
+#
+# Rejoining here, once, keeps both passes and every fixture judging the same
+# canonical single-row footer. It only ever fires on rows whose text is a
+# PREFIX of the exact phrase, so a command row that merely mentions these words
+# is untouched.
+#
+# ADJACENCY IS THE WHOLE SAFETY PROPERTY, and the first version of this did not
+# have it. It skipped any row whose _text() was empty, and _text() strips all
+# leading non-alphanumerics — so the panel closing border, rules, block glyphs
+# and padding rows all normalise to empty and the accumulator walked straight
+# past the bottom of the panel. It then joined the first REAL output line onto
+# the fragment whenever that line happened to be an exact remaining suffix of
+# the phrase, so a DISMISSED panel followed by agent output `cancel` parsed as
+# a live, answerable menu. That is precisely the false positive the
+# bottom-anchor check below exists to prevent: wait-for-blocked.sh would wake
+# on a pane that had moved on, and herdr-select.sh would press a key into a
+# pane that was not asking anything. Caught in review of this branch before it
+# merged (PR #93).
+#
+# So a fragment joins ONLY to the row immediately beneath it. A wrap is a
+# rendering artefact of one logical line; there is never a blank, a border or
+# anything else inside it.
+#
+# One known gap, unreachable today: the prefix test is character-level but the
+# rejoin inserts a space, so a footer broken MID-WORD ("enter sel" / "ect esc
+# cancel") never reassembles. omp word-wraps inside its own box, so this cannot
+# happen now — and if it ever did, _menu_gate would close first (the window
+# would contain no literal "select") and the parser would never be spawned, so
+# no fixture here would catch it. Worth knowing before changing how omp draws.
+#
+# A second gap is ACCEPTED DELIBERATELY, disclosed by the reviewer who found
+# the adjacency bug above: adjacency does not require the continuation to be
+# INSIDE the panel, so a bordered fragment
+#     │ up/down navigate  enter select  esc │
+# followed DIRECTLY by a bare, unbordered `cancel` still parses as answerable,
+# where main refuses it. It needs the first fragment to be the last panel row
+# with no closing border beneath it, and no real dismissed-panel capture
+# produces that — the panel own second fragment and its `╰──╯` sit in
+# between, and the break fires.
+#
+# The available fix (require both rows to share the box gutter) was written and
+# tested, and REJECTED: it assumes a wrap preserves the gutter, so a
+# hanging-indented footer would become unanswerable — the worst failure this
+# file has, the one that stranded wN:p9. The two errors are not symmetric: the
+# false negative is unbounded — a worker stalls until a human notices — while
+# the false positive is ONE bare Enter with no gap between deciding and
+# pressing, because peer-answer classifies and presses inside a single call.
+#
+# Be precise about why, because the obvious reason is wrong: peer-answer does
+# NOT pass `--expect-prompt-id` (peer-answer.sh:148 calls herdr-select with
+# just `--authority peer`), and herdr-select only enforces that fingerprint
+# when it was supplied (:219) — it is REQUIRED only for `--authority conductor`
+# (:260). So on the peer path nothing downstream re-checks that the prompt was
+# ever live, and none of the other guards fire on this residual either: the
+# re-offer check re-reads the same screen and agrees, `_require_current_
+# decision` only catches a change DURING the run, and the confirm-after-each-
+# keystroke walk is skipped entirely when Approve is already highlighted
+# (choice == cur, so it goes straight to Enter — the fixtures pin that as a
+# single bare `Enter`). `require_pane_birth_match` does run, but it proves pane
+# identity, not prompt liveness.
+#
+# Do not close this by making real menus stricter. If omp ever hangs-indents
+# the footer, revisit BOTH choices together.
+FOOTER = "up/down navigate enter select esc cancel"
+
+
+def _unwrap_footer(rows):
+    out, i = [], 0
+    while i < len(rows):
+        acc = " ".join(_text(rows[i]).split())
+        if acc and acc != FOOTER and FOOTER.startswith(acc):
+            j = i + 1
+            while j < len(rows) and acc != FOOTER:
+                nxt = " ".join(_text(rows[j]).split())
+                cand = acc + " " + nxt if nxt else ""
+                if not nxt or not FOOTER.startswith(cand):
+                    break
+                acc, j = cand, j + 1
+            if acc == FOOTER:
+                out.append(FOOTER + "\n")
+                i = j
+                continue
+        out.append(rows[i])
+        i += 1
+    return out
+
+
 # Read bytes: a stray non-UTF-8 byte in a pane must degrade to U+FFFD, not
 # abort the parser and silence the wake path.
-for raw in sys.stdin.buffer:
-    line = raw.decode("utf-8", "replace")
-    lines.append(line)
+lines = _unwrap_footer([raw.decode("utf-8", "replace") for raw in sys.stdin.buffer])
+for line in lines:
     plain = ansi.sub("", line)
     # `text` (leading punctuation stripped) is ONLY for header/option/footer
     # matching. `body` keeps a command row intact — `-rf`, `--flag`, `| sh`,
@@ -505,8 +604,6 @@ for raw in sys.stdin.buffer:
 
 # ---- pass 2: footer-anchored, header off-screen -----------------------------
 if not complete:
-    def _text(s):
-        return re.sub(r"^[^A-Za-z0-9]+", "", ansi.sub("", s)).rstrip(" \t\r\n|-\u2502\u2500\u256e")
     foot = None
     for i in range(len(lines) - 1, -1, -1):
         t = _text(lines[i])

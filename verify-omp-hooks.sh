@@ -149,6 +149,46 @@ printf 'Task complete.\n' >> "$WORKER_SCREEN"
 [ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
   && ok "dismissed menu above new output is not actionable" || bad "stale menu still active"
 
+# A pane narrow enough to WRAP the navigation footer. The continuation row is
+# part of the footer, not fresh output — but both parser passes read it as
+# output below the footer and failed closed, so a real, signalled prompt could
+# not be answered by any tool. Stranded wN:p9 (43 columns) on 2026-09-18: the
+# hub paged for it, peer-answer refused it, herdr-select refused it, and only a
+# human keypress could clear it.
+printf '╭─ Allow tool: bash ─╮\n│ Command: git status --short │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n│ cancel │\n╰─────╯\n' > "$WORKER_SCREEN"
+[ "$(prompt_menu_options "$WPANE")" = "$(printf '1\tApprove\n2\tDeny')" ] \
+  && ok "wrapped navigation footer stays answerable" || bad "narrow pane wrap hid a real menu"
+prompt_menu_visible "$WPANE" \
+  && ok "wrapped footer still reports needs-input" || bad "wrapped footer hidden from notifier"
+# The same wrap with the header pushed off-screen — pass 2's bottom-anchor
+# check has to accept a footer continuation for the same reason.
+printf '│ /review/pr520 && ls -a │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n│ cancel │\n' > "$WORKER_SCREEN"
+[ "$(prompt_menu_options "$WPANE")" = "$(printf '1\tApprove\n2\tDeny')" ] \
+  && ok "wrapped footer answerable with header off-screen" || bad "footer-anchored pass rejected a wrapped footer"
+# Real output below the footer must still win: the allowance covers only a
+# suffix of the footer phrase itself, never arbitrary text.
+printf '╭─ Allow tool: bash ─╮\n│ Command: git status │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n│ cancel │\nTask complete.\n' > "$WORKER_SCREEN"
+[ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
+  && ok "wrap allowance does not resurrect a dismissed menu" || bad "wrapped footer masked new output"
+# The bypass an independent review of THIS branch found before it merged, and
+# the reason a fragment may only join the row immediately beneath it: the panel
+# closing border and any padding row normalise to empty text, so a version that
+# skipped blanks walked past the bottom of the panel and absorbed the first real
+# output line whenever that line was an exact remaining SUFFIX of the phrase.
+# A dismissed panel plus agent output `cancel` then parsed as a live menu, which
+# is exactly what the bottom-anchor check exists to stop.
+printf '╭─ Allow tool: bash ─╮\n│ Command: chmod 777 /etc/sudoers │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n╰────────╯\n\ncancel\n' > "$WORKER_SCREEN"
+[ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
+  && ok "output below a closed panel cannot complete its footer" || bad "absorbed a post-panel line as footer"
+# Same hole, reached through decorative rows rather than one blank.
+printf '╭─ Allow tool: bash ─╮\n│ Command: git push --force │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n╰────────╯\n────\n...\n>>>\n\ncancel\n' > "$WORKER_SCREEN"
+[ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
+  && ok "decorative rows do not bridge to a footer suffix" || bad "bridged a panel to later output"
+# And through the composer line a worker leaves on screen.
+printf '╭─ Allow tool: bash ─╮\n│ Command: rm -r build │\n│ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc │\n╰────────╯\n> cancel\n' > "$WORKER_SCREEN"
+[ -z "$(prompt_menu_options "$WPANE")" ] && ! prompt_menu_visible "$WPANE" \
+  && ok "a composer line is not a footer continuation" || bad "composer text completed the footer"
+
 
 printf '== the Slack alert must be ANSWERABLE for a menu-shape prompt ==\n'
 # Reported live: "I see the message, but no buttons show on slack for me to
