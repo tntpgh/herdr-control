@@ -972,6 +972,57 @@ A few herdr API facts these rely on, since they aren't obvious from the CLI:
 signal-quality audit runs. `/loops` reports their cadence and observation
 state separately; these pages do not dispatch work or change any release gate.
 
+### Scope: one hub, many projects (`?repo=`)
+
+The registry already tags every task with its repo, and the fleet spans five
+of them — but every surface rendered all of them mixed, so "what needs
+attention" meant "somewhere in five repos" and you filtered by eye. That is
+the whole reason a SECOND orchestrator looks attractive: not that one hub
+cannot hold the work, but that one VIEW could not separate it.
+
+`/` and `/herdr` take `?repo=<name>` — the basename a chip links to
+(`knowledge-base`) or the full path a script has
+(`/Users/thurbs/Code/knowledge-base`). A chip row at the top of each page
+shows every repo with its task and attention counts, always including **all**.
+
+```bash
+curl -s 'http://127.0.0.1:8600/herdr?json=1&repo=knowledge-base'   # scoped payload
+curl -s 'http://127.0.0.1:8600/api/summary?repo=tntpgh-dev'         # scoped counts
+```
+
+What it is careful about, because a filter that lies is worse than no filter:
+
+- **Chip counts come from the UNSCOPED snapshot**, so switching scope never
+  hides where the rest of the work is.
+- **Events narrow through their TASK**, not their label text — an event row
+  carries a `task_id` and no repo, and matching on label would be a guess.
+- **Live panes narrow through the task that owns the pane**, and the ones that
+  drop out are COUNTED AND NAMED (`13 pane(s) hidden by this scope`). The
+  first version scoped the task list above an unscoped pane list, which reads
+  as "these panes are this repo's".
+- **A scope that matches nothing says so** rather than rendering an empty
+  table that looks like calm, and `/api/summary` returns `scope_known: false`.
+- **An empty scoped event list explains itself**: the registry reads the
+  newest N events fleet-wide and the scope is applied afterwards, so a busy
+  repo whose last activity is older than the window shows zero. Measured on
+  live data — knowledge-base had 24 tasks and 0 events in the window.
+- **Fleet-wide facts stay fleet-wide.** Conductor cursors and `max_event_seq`
+  are not narrowed; a per-repo view must not claim the fleet is behind.
+- **Decisions are not scoped at all**, and `/api/summary` says
+  `decisions_scoped: false`. A served decision carries no repo, so filtering
+  would be a guess — and a consumer that scoped its attention count while
+  silently inheriting a fleet-wide decision count would report a repo as
+  needing a decision it has nothing to do with.
+- **The scope survives the page's own refresh** and travels on the `json`
+  link. A filter that resets itself every 15s while you read is worse than
+  none, because you do not notice it happening.
+
+This is READ-ONLY and additive: one registry, one hub, one answering path.
+An unscoped request returns exactly the keys it did before. A second writer is
+specifically what we do not want — `peer-answer` sees every pane and has
+standing authority to press Approve, so two orchestrators would answer each
+other's workers.
+
 **Credential source:** injected `NEON_CONNECTION_STRING` and `SEARCH_SYNC_TOKEN`
 win over literal assignments in `~/.config/op/launchd-secrets.env` (mode 0600).
 `HERDR_HUB_SECRETS_ENV` overrides that one file, including for tests. The hub

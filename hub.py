@@ -1945,19 +1945,121 @@ STYLE = """
  pre{background:#0c0e13;border:1px solid #272c37;border-radius:8px;padding:10px;overflow:auto;font-size:12px}
  button.decide{font:600 12px system-ui;padding:4px 10px;border-radius:5px;border:1px solid #6aa6ff;background:transparent;color:#6aa6ff;cursor:pointer} button.decide:hover{background:#6aa6ff;color:#0b1020}
  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;background:#ff7a7a} .dot.ok{background:#6fd39a}
+ .chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
+ .chips a.chip{display:flex;align-items:baseline;gap:6px;padding:4px 10px;border:1px solid #272c37;border-radius:999px;font-size:12px;font-weight:600;color:#9fb6d0;text-decoration:none}
+ .chips a.chip small{font-weight:400;color:#6b7a8d}
+ .chips a.chip:hover{border-color:#6aa6ff;color:#cfe0f5}
+ .chips a.chip.on{border-color:#6aa6ff;color:#cfe0f5;background:#11161d}
+ .chips a.chip.hot{border-color:#ff7a7a} .chips a.chip.hot small{color:#ff9d9d}
 """
 NAV = [("/", "overview"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
 
+# ---- SCOPE: one hub, many projects ------------------------------------------
+# Every task in the registry already carries the repo it belongs to, and the
+# fleet spans five of them — but every surface rendered all of them mixed
+# together, so "what needs attention" meant "in any of five repos" and the
+# reader had to filter by eye. That is the whole reason a second orchestrator
+# looked attractive: not because one hub cannot hold the work, but because one
+# VIEW could not separate it.
+#
+# Scoping is READ-ONLY and additive. There is still one registry, one hub, one
+# answering path — a second writer is the thing we specifically do not want,
+# because `peer-answer` sees every pane and #95 gave it standing authority.
+#
+# `?repo=` accepts either the basename (what a chip links to, `knowledge-base`)
+# or the full path (what a script has, `/Users/thurbs/Code/knowledge-base`).
+def scope_of(query: str) -> str:
+    """The requested repo scope, or "" for the whole fleet."""
+    try:
+        return (urllib.parse.parse_qs(query).get("repo") or [""])[0].strip()
+    except Exception:
+        return ""
 
-def page(title: str, path: str, body: str, refresh: int = 15) -> str:
-    """refresh=0 disables the meta-refresh; the caller supplies its own poller."""
+
+def _repo_matches(repo: str, scope: str) -> bool:
+    repo = repo or ""
+    return bool(scope) and (repo == scope or repo.rsplit("/", 1)[-1] == scope)
+
+
+def scope_repos(d: dict) -> list:
+    """[(basename, full path, task count, attention count)], busiest first."""
+    by: dict = {}
+    for t in d.get("tasks") or []:
+        full = t.get("repo") or ""
+        if not full:
+            continue
+        row = by.setdefault(full, {"n": 0, "att": 0})
+        row["n"] += 1
+        if t.get("state") in ATTENTION:
+            row["att"] += 1
+    return sorted(((full.rsplit("/", 1)[-1], full, v["n"], v["att"]) for full, v in by.items()),
+                  key=lambda r: (-r[3], -r[2], r[0]))
+
+
+def scoped(d: dict, scope: str) -> dict:
+    """A snapshot narrowed to one repo. Unscoped input is returned untouched.
+
+    Events are narrowed through their TASK, because an event row carries a
+    task_id and a label but no repo of its own — filtering on the label text
+    would be a guess, and a scope that quietly keeps another repo's events is
+    worse than no scope at all.
+
+    `checkpoints` and `max_event_seq` are deliberately NOT narrowed: a
+    conductor checkpoint is a fleet-wide fact, and pretending otherwise would
+    make a per-repo view claim the fleet is further behind than it is.
+    """
+    if not scope or d.get("error"):
+        return d
+    tasks = [t for t in (d.get("tasks") or []) if _repo_matches(t.get("repo"), scope)]
+    ids = {t.get("task_id") for t in tasks}
+    return dict(
+        d,
+        tasks=tasks,
+        attention=[t for t in (d.get("attention") or []) if _repo_matches(t.get("repo"), scope)],
+        events=[e for e in (d.get("events") or []) if e.get("task_id") in ids],
+        scope=scope,
+        scope_known=any(_repo_matches(t.get("repo"), scope) for t in (d.get("tasks") or [])),
+    )
+
+
+def scope_chips(d: dict, path: str, scope: str) -> str:
+    """The repo selector. Counts come from the UNSCOPED snapshot, so switching
+    scope never hides where the rest of the work is."""
+    rows = scope_repos(d)
+    if not rows:
+        return ""
+    total_att = sum(r[3] for r in rows)
+    out = [f"<a class='chip {'on' if not scope else ''}' href='{path}'>all"
+           f"<small>{len(d.get('tasks') or [])} · {total_att} hot</small></a>"]
+    for base, full, n, att in rows:
+        on = "on" if _repo_matches(full, scope) else ""
+        hot = "hot" if att else ""
+        out.append(f"<a class='chip {on} {hot}' href='{path}?repo={urllib.parse.quote(base)}'>"
+                   f"{_esc(base)}<small>{n} · {att} hot</small></a>")
+    unknown = ""
+    if scope and not any(_repo_matches(r[1], scope) for r in rows):
+        # Say it, rather than rendering an empty table that looks like calm.
+        unknown = (f"<div class=dim style='margin:6px 0'>no tasks for scope "
+                   f"<b>{_esc(scope)}</b> — showing nothing, not nothing to show</div>")
+    return f"<div class=chips>{''.join(out)}</div>{unknown}"
+
+
+
+def page(title: str, path: str, body: str, refresh: int = 15, scope: str = "") -> str:
+    """refresh=0 disables the meta-refresh; the caller supplies its own poller.
+
+    `scope` is carried into the meta-refresh URL and the json link. Without it
+    a scoped page silently reset to the whole fleet on its own 15s refresh —
+    a filter that undoes itself while you read is worse than no filter."""
     nav = " ".join(f"<a href='{p}' class='{'on' if p == path else ''}'>{n}</a>" for p, n in NAV)
-    meta = f"<meta http-equiv=refresh content={refresh}>" if refresh else ""
+    q = f"?repo={urllib.parse.quote(scope)}" if scope else ""
+    meta = (f"<meta http-equiv=refresh content='{refresh};url={path}{q}'>" if refresh else "")
     label = f"refresh {refresh}s" if refresh else "reloads only on change"
     return (f"<!doctype html><html lang=en><head><meta charset=utf-8>{meta}"
             f"<title>{_esc(title)}</title><style>{STYLE}</style></head><body>"
             f"<header><b>hub</b>{nav}<span class=dim style='margin-left:auto'>{label} · "
-            f"<a href='{path}?json=1'>json</a></span></header><main>{body}</main></body></html>")
+            f"<a href='{path}?json=1{('&repo=' + urllib.parse.quote(scope)) if scope else ''}'>json</a>"
+            f"</span></header><main>{body}</main></body></html>")
 
 
 # Terrence, 2026-09-05: "the form kept refreshing before I could make full
@@ -2000,8 +2102,9 @@ def task_rows(rows) -> str:
     return "".join(out) or "<tr><td class=dim>none</td></tr>"
 
 
-def render_overview() -> str:
-    h, f, s, k, l, lo = (CACHES[n].get() for n in ("herdr", "forms", "search", "kb", "links", "loops"))
+def render_overview(scope: str = "") -> str:
+    h_all, f, s, k, l, lo = (CACHES[n].get() for n in ("herdr", "forms", "search", "kb", "links", "loops"))
+    h = scoped(h_all, scope)
     bad_loops = [x for x in lo.get("loops", []) if x["stale"] or x["outcome"] not in ("ok", "success", "healthy")]
     att = len(h.get("attention", []))
     hb = (k or {}).get("heartbeat") or {}
@@ -2024,7 +2127,7 @@ def render_overview() -> str:
         ("/loops", f"{len(lo.get('loops', [])) - len(bad_loops)}/{len(lo.get('loops', []))}", "loops healthy", f"{len(lo.get('suggestions', []))} suggestion(s)" + (" · " + ", ".join(x["name"].split(" — ")[0] for x in bad_loops) if bad_loops else ""), bool(bad_loops)),
         ("/search", (s.get("totals") or {}).get("searches", "—"), "searches remembered", f"{(s.get('totals') or {}).get('replays', 0)} served from memory" if s.get("totals") else (s.get("error") or ""), False),
     ]
-    body = "<div class=cards>" + "".join(
+    body = scope_chips(h_all, "/", scope) + "<div class=cards>" + "".join(
         f"<a class='card {'hot' if hot else ''}' href='{href}'><div class=t>{t}</div><div class=n>{n}</div><div class=s>{_esc(sub)}</div></a>"
         for href, n, t, sub, hot in cards) + "</div>"
     body += "<h2>Needs attention</h2><table>" + task_rows(h.get("attention", [])) + "</table>"
@@ -2032,24 +2135,40 @@ def render_overview() -> str:
         body += "<h2>Open decisions</h2><table>" + "".join(
             f"<tr class=hot><td><span class='pill hot'>open</span></td><td><a href='/decisions'>{_esc(x.get('title') or x['id'])}</a>"
             f"<br><small>{_esc(x['url'])}</small></td><td class=age>{_age(x.get('created_at'))}</td></tr>" for x in f["open"]) + "</table>"
-    return page("hub", "/", body)
+    return page("hub", "/", body, scope=scope)
 
 
-def _live_rows() -> str:
+def _live_rows(scope: str = "") -> str:
     """herdr's own agent_status per pane, and where the registry disagrees.
 
     Divergence is SHOWN, never silently resolved: `registry blocked / herdr
     working` is a stale writer, `registry running / herdr blocked` is a worker
     waiting on a human nobody told. Both were real incidents; a dashboard that
-    picks one source and hides the other cannot be checked."""
+    picks one source and hides the other cannot be checked.
+
+    Under a repo scope, a pane is narrowed through the TASK that owns it — a
+    pane carries no repo of its own. Panes with no task in this repo (including
+    hand-started ones with no task at all) are counted and named as hidden,
+    never dropped in silence: the first render of this page under a scope
+    showed a scoped task list above an unscoped pane list, which reads as
+    "these panes belong to this repo" and is exactly the kind of quiet wrong
+    answer this dashboard exists to avoid."""
     live = live_data()
     stats = live.get("stats") or {}
     if not live.get("connected"):
         return ("<p class=dim>herdr subscription down — every row below would be stale, so none is shown. "
                 f"last error: {_esc(stats.get('last_error') or 'unknown')}</p>")
     tasks = {t.get("pane_id"): t for t in (CACHES["herdr"].get() or {}).get("tasks", [])}
+    agents = live.get("agents", [])
+    hidden = 0
+    if scope:
+        mine = {t.get("pane_id") for t in (CACHES["herdr"].get() or {}).get("tasks", [])
+                if t.get("pane_id") and _repo_matches(t.get("repo"), scope)}
+        kept = [p for p in agents if p.get("pane_id") in mine]
+        hidden = len(agents) - len(kept)
+        agents = kept
     rows = []
-    for p in live.get("agents", []):
+    for p in agents:
         task = tasks.get(p["pane_id"]) or {}
         reg = task.get("state")
         blocked = p["agent_status"] == herdr_live.BLOCKED
@@ -2063,14 +2182,37 @@ def _live_rows() -> str:
             f"<td class=age>{_age(dt.datetime.fromtimestamp(p['since'], dt.timezone.utc).isoformat()) if p.get('since') else ''}</td></tr>")
     head = ("<tr><td class=dim>pane</td><td class=dim>task</td><td class=dim>herdr says</td>"
             "<td class=dim>registry says</td><td class=dim>agent · workspace</td><td class=dim>in state</td></tr>")
+    scope_note = (f" · <b>{hidden}</b> pane(s) hidden by this scope "
+                  f"(<a href='/herdr'>all</a>)" if scope and hidden else "")
     meta = (f"<p class=dim>pushed by subscription · {stats.get('events', 0)} events, "
             f"{stats.get('reconnects', 0)} reconnects, {stats.get('resyncs', 0)} idle resyncs, "
-            f"{stats.get('edges', 0)} edges" + (f", {stats['edges_dropped']} DROPPED" if stats.get("edges_dropped") else "") + "</p>")
+            f"{stats.get('edges', 0)} edges" + (f", {stats['edges_dropped']} DROPPED" if stats.get("edges_dropped") else "") + scope_note + "</p>")
     return meta + "<table>" + head + ("".join(rows) or "<tr><td class=dim>no agent panes</td></tr>") + "</table>"
 
 
-def render_herdr() -> str:
-    d = CACHES["herdr"].get()
+def _events_window_note(d_all: dict, d: dict, scope: str) -> str:
+    """Say when a scoped event list is empty for a MECHANICAL reason.
+
+    The registry query takes the newest N events FLEET-WIDE and scoping
+    filters that window afterwards, so a busy repo whose last activity is
+    older than the window shows zero events. Measured on live data: scoping
+    to knowledge-base gave 24 tasks and 0 events. An empty table that means
+    "outside the window" and an empty table that means "nothing happened"
+    must not look the same — the first is a rendering artefact, the second is
+    a fact about the fleet.
+    """
+    if not scope or d.get("events") or not d.get("tasks"):
+        return ""
+    total = len(d_all.get("events") or [])
+    return (f"<div class=dim style='margin:-4px 0 8px'>none in the last {total} events, "
+            f"which are read fleet-wide before this scope is applied — not "
+            f"necessarily no activity in this repo. "
+            f"<a href='/herdr'>see all</a></div>")
+
+
+def render_herdr(scope: str = "") -> str:
+    d_all = CACHES["herdr"].get()
+    d = scoped(d_all, scope)
     if d.get("error"):
         return page("herdr", "/herdr", f"<pre>{_esc(d['error'])}</pre>")
     ev = []
@@ -2092,15 +2234,17 @@ def render_herdr() -> str:
         f"<div class=s>{_loop_age(x)} · {_esc(x['cadence'])}</div></a>" for x in lo.get("loops", []))
     sug = "".join(f"<li>{_esc(t['text'])}</li>" for t in lo.get("suggestions", [])[:5])
     live_blocked = live_attention()
-    body = (f"<h2>Live fleet — herdr's own agent status</h2>{_live_rows()}"
+    body = (scope_chips(d_all, "/herdr", scope)
+            + f"<h2>Live fleet — herdr's own agent status</h2>{_live_rows(scope)}"
             f"<h2>Loops <a href='/loops' class=dim style='font-weight:400'>· all, with suggestions →</a></h2><div class=cards>{strip}</div>"
             + (f"<h2>Suggestions</h2><ul class=dim style='margin:0 0 6px;padding-left:18px'>{sug}</ul>" if sug else "")
             + f"<h2>Needs attention (live: {len(live_blocked)} · registry: {len(d['attention'])})</h2>"
             f"<table>{task_rows(d['attention'])}</table>"
-            f"<h2>Recent events (newest first)</h2><table>{''.join(ev) or '<tr><td class=dim>none</td></tr>'}</table>"
+            + f"<h2>Recent events (newest first)</h2>{_events_window_note(d_all, d, scope)}"
+            f"<table>{''.join(ev) or '<tr><td class=dim>none</td></tr>'}</table>"
             f"<h2>Conductor cursors</h2><table>{cp or '<tr><td class=dim>none</td></tr>'}</table>"
             f"<h2>Other tasks (latest 40)</h2><table>{task_rows(others)}</table>")
-    return page("herdr", "/herdr", body)
+    return page("herdr", "/herdr", body, scope=scope)
 
 
 def render_decisions() -> str:
@@ -2293,6 +2437,11 @@ def render_loops() -> str:
     return page("loops", "/loops", body, refresh=60)
 
 
+# The pages whose content is per-repo. `/decisions`, `/kb`, `/links`, `/loops`
+# and `/search` are fleet-wide by nature — a decision carries no repo, and a
+# surface probe is about this Mac — so they are NOT scoped rather than being
+# given a filter that silently does nothing.
+SCOPED_PAGES = ("/", "/herdr")
 PAGES = {"/": (render_overview, None), "/herdr": (render_herdr, "herdr"), "/decisions": (render_decisions, "forms"),
          "/loops": (render_loops, "loops"), "/search": (render_search, "search"), "/kb": (render_kb, "kb"),
          "/links": (render_links, "links")}
@@ -2307,12 +2456,24 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             return self._send(200, "text/plain", b"ok")
         if path == "/api/summary":
-            h, f = CACHES["herdr"].get(), CACHES["forms"].get()
+            h_all, f = CACHES["herdr"].get(), CACHES["forms"].get()
+            # Scoped counts, because this endpoint is what the omp extension,
+            # agent-edge.sh and the decisions poller read — an unscoped number
+            # beside a scoped page is how a reader learns to distrust both.
+            scope = scope_of(query)
+            h = scoped(h_all, scope)
             # Attention is the UNION of what herdr says RIGHT NOW and what the
             # registry recorded, deduped by pane. Counting only the registry is
             # how a live-blocked worker stayed invisible for hours; counting
             # only herdr would lose a task whose pane died while blocked.
             live = live_attention()
+            if scope:
+                # A live row is a PANE, which carries no repo — it is scoped
+                # through the task that owns the pane. A pane with no task in
+                # this repo is not this repo's problem, and a pane with no task
+                # at all belongs to the fleet view, not here.
+                mine = {t.get("pane_id") for t in h.get("tasks", []) if t.get("pane_id")}
+                live = [x for x in live if x.get("pane_id") in mine]
             panes = {x["pane_id"] for x in live}
             registry = [t for t in h.get("attention", []) if t.get("pane_id") not in panes]
             # How much of that count rests on a FALLBACK rather than a live
@@ -2331,6 +2492,14 @@ class Handler(BaseHTTPRequestHandler):
                  "rev": RUNNING_REV,
                  "live_connected": live_data().get("connected", False),
                  "open_decisions": f.get("open_count", 0),
+                 # NOT scoped, and said so rather than implied: a served
+                 # decision carries no repo, so filtering it would be a guess.
+                 # A consumer that scopes its attention count and silently
+                 # inherits a fleet-wide decision count would report a repo as
+                 # needing a decision it has nothing to do with.
+                 "decisions_scoped": False,
+                 "scope": scope,
+                 "scope_known": h.get("scope_known", True) if scope else True,
                  "open_ids": ",".join(sorted(x["id"] for x in f.get("open", [])))}).encode())
         if path == "/api/panes":
             return self._send(200, "application/json", json.dumps(live_data(), default=str).encode())
@@ -2382,15 +2551,27 @@ class Handler(BaseHTTPRequestHandler):
         if path not in PAGES:
             return self._send(404, "text/plain", b"not found")
         render, source = PAGES[path]
+        scope = scope_of(query)
         if "json=1" in query:
             data = {n: CACHES[n].get() for n in CACHES} if source is None else CACHES[source].get()
             if path in ("/herdr", "/"):
                 # Additive: every existing consumer of /herdr?json=1 keeps its
                 # keys, and gains herdr's live truth beside the registry's.
                 data = dict(data or {}, live=live_data())
+            if scope and source == "herdr":
+                # `repos` travels WITH the scoped payload: a consumer that asked
+                # for one repo can still see the others exist, which is what
+                # stops a per-repo automation from concluding the fleet is idle.
+                data = dict(scoped(data, scope),
+                            repos=[{"repo": full, "name": base, "tasks": n, "attention": att}
+                                   for base, full, n, att in scope_repos(CACHES["herdr"].get())])
             return self._send(200, "application/json", json.dumps(data, default=str).encode())
         try:
-            return self._send(200, "text/html; charset=utf-8", render().encode())
+            # Only the surfaces that HAVE a per-repo meaning take the scope;
+            # the rest keep their zero-argument signature rather than growing a
+            # parameter they would ignore.
+            html = render(scope) if path in SCOPED_PAGES else render()
+            return self._send(200, "text/html; charset=utf-8", html.encode())
         except Exception:  # a render bug must never publish exception text on an unauthenticated surface
             return self._send(500, "text/plain", b"page render unavailable")
 

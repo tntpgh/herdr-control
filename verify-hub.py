@@ -1279,5 +1279,107 @@ class CacheFreshness(unittest.TestCase):
 
 
 
+class RepoScope(unittest.TestCase):
+    """One hub, many projects: the read path narrows, the write path does not.
+
+    The point of scoping was to make a second orchestrator unnecessary. So
+    these rows care about two things: that a scope never leaks another repo's
+    work in, and that it never makes the rest of the fleet invisible or, worse,
+    look calm."""
+
+    SNAP = {
+        "tasks": [
+            {"task_id": "a1", "label": "kb thing", "repo": "/Users/x/Code/knowledge-base",
+             "state": "blocked", "pane_id": "w1:p1", "conductor_id": "c", "updated_at": "2026-09-07T13:00:00Z"},
+            {"task_id": "a2", "label": "kb other", "repo": "/Users/x/Code/knowledge-base",
+             "state": "running", "pane_id": "w1:p2", "conductor_id": "c", "updated_at": "2026-09-07T13:00:00Z"},
+            {"task_id": "b1", "label": "dev thing", "repo": "/Users/x/Code/tntpgh-dev",
+             "state": "stalled", "pane_id": "w2:p1", "conductor_id": "c", "updated_at": "2026-09-07T13:00:00Z"},
+        ],
+        "events": [{"sequence": 3, "type": "x", "task_id": "b1", "label": "dev thing",
+                    "occurred_at": "2026-09-07T13:00:00Z", "payload": {}},
+                   {"sequence": 2, "type": "x", "task_id": "a1", "label": "kb thing",
+                    "occurred_at": "2026-09-07T13:00:00Z", "payload": {}}],
+        "checkpoints": [{"conductor_id": "c", "last_event_seq": 3, "updated_at": "2026-09-07T13:00:00Z"}],
+        "max_event_seq": 3,
+    }
+
+    def setUp(self):
+        self.snap = json.loads(json.dumps(self.SNAP))
+        self.snap["attention"] = [t for t in self.snap["tasks"] if t["state"] in hub.ATTENTION]
+
+    def test_scope_accepts_a_basename_or_a_full_path(self):
+        for want in ("knowledge-base", "/Users/x/Code/knowledge-base"):
+            d = hub.scoped(self.snap, want)
+            self.assertEqual([t["task_id"] for t in d["tasks"]], ["a1", "a2"], want)
+
+    def test_scope_narrows_the_attention_list(self):
+        # THE point of the feature: "what needs attention" must mean "in this
+        # repo". Without this row the attention list could stay fleet-wide on
+        # a scoped page and every other row still passed.
+        d = hub.scoped(self.snap, "knowledge-base")
+        self.assertEqual([t["task_id"] for t in d["attention"]], ["a1"])
+        d2 = hub.scoped(self.snap, "tntpgh-dev")
+        self.assertEqual([t["task_id"] for t in d2["attention"]], ["b1"])
+
+    def test_scope_narrows_events_through_their_task_not_their_label(self):
+        d = hub.scoped(self.snap, "knowledge-base")
+        # b1's event must be gone even though its label says nothing about a repo.
+        self.assertEqual([e["sequence"] for e in d["events"]], [2])
+
+    def test_a_fleet_wide_fact_is_not_narrowed(self):
+        # A conductor cursor is about the conductor, not a repo; narrowing it
+        # would make a per-repo view claim the fleet is behind when it is not.
+        d = hub.scoped(self.snap, "knowledge-base")
+        self.assertEqual(d["max_event_seq"], 3)
+        self.assertEqual(len(d["checkpoints"]), 1)
+
+    def test_an_unscoped_snapshot_is_returned_untouched(self):
+        self.assertIs(hub.scoped(self.snap, ""), self.snap)
+
+    def test_an_unknown_scope_is_reported_not_rendered_as_calm(self):
+        d = hub.scoped(self.snap, "not-a-repo")
+        self.assertEqual(d["tasks"], [])
+        self.assertFalse(d["scope_known"])
+
+    def test_chip_counts_come_from_the_unscoped_snapshot(self):
+        # Switching scope must never hide where the rest of the work is: the
+        # chips are the only thing on a scoped page that can say so.
+        html = hub.scope_chips(self.snap, "/herdr", "knowledge-base")
+        self.assertIn("knowledge-base", html)
+        self.assertIn("tntpgh-dev", html)
+        self.assertIn(">all<", html)
+        self.assertIn("repo=tntpgh-dev", html)
+
+    def test_chips_mark_the_active_scope_and_the_hot_repos(self):
+        html = hub.scope_chips(self.snap, "/herdr", "tntpgh-dev")
+        active = [c for c in re.findall(r"<a class='chip ([^']*)' href='[^']*'>([^<]*)<", html) if "on" in c[0].split()]
+        self.assertEqual([c[1] for c in active], ["tntpgh-dev"])
+        self.assertIn("hot", dict((n, c) for c, n in re.findall(r"<a class='chip ([^']*)' href='[^']*'>([^<]*)<", html))["knowledge-base"])
+
+    def test_scope_survives_the_pages_own_refresh_and_json_link(self):
+        # A filter that undoes itself on the 15s meta-refresh is worse than no
+        # filter, because the reader does not notice it happening.
+        html = hub.page("herdr", "/herdr", "body", scope="knowledge-base")
+        self.assertIn("url=/herdr?repo=knowledge-base", html)
+        self.assertIn("json=1&repo=knowledge-base", html)
+
+    def test_scope_of_ignores_junk_rather_than_raising(self):
+        self.assertEqual(hub.scope_of("repo=kb&x=1"), "kb")
+        self.assertEqual(hub.scope_of(""), "")
+        self.assertEqual(hub.scope_of("repo="), "")
+
+    def test_empty_scoped_event_list_says_it_is_a_window_artefact(self):
+        # The registry reads the newest N events FLEET-WIDE and the scope is
+        # applied afterwards, so a busy repo can show zero. Measured live:
+        # knowledge-base had 24 tasks and 0 events in the window.
+        scoped = dict(self.snap, events=[], tasks=self.snap["tasks"][:1], attention=[])
+        note = hub._events_window_note(self.snap, scoped, "knowledge-base")
+        self.assertIn("read fleet-wide before this scope", note)
+        # ...and says nothing when there is genuinely nothing to explain.
+        self.assertEqual(hub._events_window_note(self.snap, self.snap, ""), "")
+        self.assertEqual(hub._events_window_note(self.snap, dict(self.snap, tasks=[]), "x"), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
