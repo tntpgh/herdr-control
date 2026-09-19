@@ -44,6 +44,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/agent-profiles.sh"
 . "$here/lib/repo-root.sh"
 . "$here/lib/handoff.sh"
+. "$here/lib/op-env.sh"
 
 # ---- args ------------------------------------------------------------------
 base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; positional=()
@@ -334,7 +335,12 @@ stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q
   "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$eff_posture")
 [ -n "${HERDR_POLICY_EXTRA_RULES:-}" ] && stamped_cli="$stamped_cli $(printf 'HERDR_POLICY_EXTRA_RULES=%q' "$HERDR_POLICY_EXTRA_RULES")"
 [ -n "$CANONICAL_RULES_SRC" ] && stamped_cli="$stamped_cli $(printf 'HERDR_CANONICAL_RULES=%q' "$CANONICAL_RULES_SRC")"
-stamped_cli="$stamped_cli; $cli"
+# The op prelude runs FIRST (lib/op-env.sh): a worker that has to hunt for a
+# credential stops and asks a human, which is the one thing an unattended run
+# cannot afford. Measured 2026-09-19 — a spawned worker doing DB work found no
+# token, went looking for .env.local (gitignored, so absent from every linked
+# worktree), and produced four credential-shaped approval prompts.
+stamped_cli="$(op_env_prelude) $stamped_cli; $cli"
 herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || { echo "spawn-task: launch failed: $cli" >&2; exit 1; }
 herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
 
