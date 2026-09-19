@@ -540,6 +540,178 @@ class AttentionProvenance(unittest.TestCase):
         self.assertEqual(sum(1 for x in rows if x.get("state_source") == "stored"), 0)
 
 
+class HandoffDebt(unittest.TestCase):
+    """A debt nobody sees is a debt nobody pays.
+
+    `handoff-coverage.ts` (omp-harness#9) appends one JSON object per repo a
+    session changed without writing that repo's `.handoffs/notepad.md`, and
+    deletes a repo's rows when a session next starts THERE — so every row
+    present is unpaid by construction. The hub is the only surface that shows
+    the ledger to someone not already standing in the repo that owes it, which
+    is the only person in a position to notice.
+
+    A different process writes this file on a different schedule, so every
+    shape it can be caught in — absent, empty, half-appended, written by a
+    newer version — must degrade to a number. The page people open when things
+    are broken may not be the thing that breaks.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ledger = Path(self.tmp.name) / "omp/handoff-debt.jsonl"
+        p = patch.object(hub, "HANDOFF_DEBT", self.ledger)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def write(self, *lines):
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger.write_text("".join(f"{line}\n" for line in lines))
+
+    def row(self, **kw):
+        """The writer's real shape (handoff-coverage.ts `Debt`), camelCase and all."""
+        r = {"repo": "/Users/x/Code/herdr-control", "at": "2026-09-18T02:14:00.000Z",
+             "sessionCwd": "/Users/x/Code/thurber-os", "writes": 3, "mutations": 4,
+             "shipped": True, "lessonDebt": True}
+        r.update(kw)
+        return json.dumps(r)
+
+    def served(self, paths, attention=(), blocked=()):
+        """The real handler over HTTP, with the REAL debt reader behind it."""
+        caches = {name: Mock(get=lambda: {}) for name in hub.CACHES}
+        caches.update(herdr=Mock(get=lambda: {"attention": list(attention), "tasks": [], "max_event_seq": 0}),
+                      forms=Mock(get=lambda: {"open_count": 0, "open": [], "history": []}),
+                      links=Mock(get=lambda: {"surfaces": []}),
+                      loops=Mock(get=lambda: {"loops": [], "suggestions": [], "findings": [],
+                                              "gates": [], "dismissed": 0}),
+                      debt=hub.Cached(0, hub.handoff_debt_data, name="debt"))
+        out = {}
+        with patch.dict(hub.CACHES, caches), \
+             patch.object(hub, "live_attention", lambda: list(blocked)), \
+             patch.object(hub, "live_data", lambda: {"connected": True}):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), hub.Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                for path in paths:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}{path}",
+                                                timeout=10) as response:
+                        out[path] = response.read().decode()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=10)
+        return out
+
+    def test_an_absent_or_empty_ledger_is_zero_debt_and_a_page_that_renders(self):
+        # The normal state of a machine whose sessions keep their handoffs, and
+        # the state of every machine before the extension has ever shut down a
+        # session. Neither may cost a reader the overview page.
+        for label, prepare in (("absent", lambda: None),
+                               ("empty", lambda: self.write()),
+                               ("blank lines only", lambda: self.write("", "   "))):
+            with self.subTest(ledger=label):
+                prepare()
+                data = hub.handoff_debt_data()
+                self.assertEqual((data["debt"], data["repos"], data["unreadable"]), ([], [], 0))
+                # "no ledger" and "ledger I could not read" are different
+                # answers, and only one of them is good news. A missing file
+                # must NOT take the error arm.
+                self.assertIsNone(data.get("error"))
+                pages = self.served(("/api/summary", "/"))
+                summary = json.loads(pages["/api/summary"])
+                self.assertEqual((summary["attention"], summary["handoff_debt"]), (0, 0))
+                self.assertIn("every repo a session changed has a handoff", pages["/"])
+                self.assertNotIn("could not be read", pages["/"])
+
+    def test_a_well_formed_row_names_the_repo_the_work_and_the_missing_lesson(self):
+        self.write(self.row())
+        row = hub.handoff_debt_data()["debt"][0]
+        self.assertEqual(row, {"repo": "/Users/x/Code/herdr-control",
+                               "at": "2026-09-18T02:14:00.000Z",
+                               "session_cwd": "/Users/x/Code/thurber-os",
+                               "writes": 3, "mutations": 4,
+                               "shipped": True, "lesson_debt": True})
+        page = self.served(("/",))["/"]
+        # What the operator has to be able to read off the page: which repo,
+        # what that session did to it, where it was standing while doing it,
+        # and that the reasoning was never retained either.
+        self.assertIn("herdr-control", page)
+        self.assertIn("3 write(s) · 4 git/gh mutation(s)", page)
+        self.assertIn("/Users/x/Code/thurber-os", page)
+        self.assertIn("no lesson", page)
+        self.assertIn("shipped", page)
+
+    def test_a_malformed_line_beside_a_good_one_loses_neither_the_debt_nor_the_fact(self):
+        # The shape a reader hits by racing an append: one complete row, one
+        # truncated. Dropping the good row would hide real debt; counting the
+        # broken one would invent debt nobody can identify; saying nothing
+        # about it would report "no problem" for a corrupt ledger.
+        self.write(self.row(repo="/Users/x/Code/tntpgh-dev"),
+                   '{"repo": "/Users/x/Code/half-writ',
+                   "not json at all",
+                   json.dumps({"at": "2026-09-18T03:00:00Z", "writes": 9}),   # no repo: unownable
+                   json.dumps(["a list, not an object"]))
+        data = hub.handoff_debt_data()
+        self.assertEqual([r["repo"] for r in data["debt"]], ["/Users/x/Code/tntpgh-dev"])
+        self.assertEqual(data["unreadable"], 4)
+        summary = json.loads(self.served(("/api/summary",))["/api/summary"])
+        self.assertEqual((summary["handoff_debt"], summary["handoff_debt_unreadable"]), (1, 4),
+                         "an unreadable line must be reported, never counted as debt")
+
+    def test_a_row_from_a_newer_writer_degrades_field_by_field(self):
+        # Forward compatibility is not optional here: the writer lives in
+        # another repo and ships on its own schedule. An unknown key is
+        # ignored, a wrongly-typed count reads 0, and `shipped: "yes"` is not
+        # truthiness — only a real `true` may light the badge.
+        self.write(json.dumps({"repo": "/Users/x/Code/tourguide", "at": 1758158040,
+                               "sessionCwd": None, "writes": "several", "mutations": -2,
+                               "shipped": "yes", "lessonDebt": 1, "newField": {"a": 1}}))
+        self.assertEqual(hub.handoff_debt_data()["debt"], [
+            {"repo": "/Users/x/Code/tourguide", "at": "", "session_cwd": "",
+             "writes": 0, "mutations": 0, "shipped": False, "lesson_debt": False}])
+
+    def test_debt_moves_the_attention_count_without_calling_a_repo_a_task(self):
+        # The contract hub.py:16 documents: `attention` is what the omp
+        # extension's banner reads, so unpaid debt has to be IN it. But the
+        # repo's own history (ATTENTION's comment, 2026-09-18) is that a count
+        # whose noun is wrong stops being read — so the halves are published
+        # separately and the banner names each.
+        task = {"pane_id": "w1:p1", "state": "blocked", "state_source": "live"}
+        before = json.loads(self.served(("/api/summary",), attention=[task])["/api/summary"])
+        self.assertEqual((before["attention"], before["attention_tasks"], before["handoff_debt"]), (1, 1, 0))
+
+        self.write(self.row(repo="/Users/x/Code/herdr-control"),
+                   self.row(repo="/Users/x/Code/tntpgh-dev", shipped=False, lessonDebt=False))
+        after = json.loads(self.served(("/api/summary",), attention=[task])["/api/summary"])
+        self.assertEqual((after["attention"], after["attention_tasks"], after["handoff_debt"]), (3, 1, 2))
+
+    def test_two_sessions_owing_the_same_repo_are_one_thing_to_go_and_do(self):
+        # Paying a repo's debt pays every row it holds at once, because the
+        # writer clears them per repo. Counting rows would page twice for one
+        # afternoon's forgetfulness in one place.
+        self.write(self.row(at="2026-09-17T09:00:00Z"), self.row(at="2026-09-18T02:14:00Z"))
+        summary = json.loads(self.served(("/api/summary",))["/api/summary"])
+        self.assertEqual((summary["handoff_debt"], summary["handoff_debt_rows"]), (1, 2))
+        # Both rows still SHOWN — two sessions is two things to reconstruct.
+        self.assertEqual(len(hub.handoff_debt_data()["debt"]), 2)
+
+    def test_an_unreadable_ledger_says_so_instead_of_reporting_none(self):
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger.mkdir()                     # a directory where the file should be
+        data = hub.handoff_debt_data()
+        self.assertEqual((data["debt"], data["present"]), ([], False))
+        self.assertIn("Error", data["error"])
+        self.assertIn("ledger could not be read", self.served(("/",))["/"])
+
+    def test_newest_debt_is_listed_first(self):
+        self.write(self.row(repo="/Users/x/Code/a", at="2026-09-10T00:00:00Z"),
+                   self.row(repo="/Users/x/Code/c", at="2026-09-18T00:00:00Z"),
+                   self.row(repo="/Users/x/Code/b", at="2026-09-14T00:00:00Z"))
+        self.assertEqual([r["repo"].rsplit("/", 1)[-1] for r in hub.handoff_debt_data()["debt"]],
+                         ["c", "b", "a"])
+
+
 class FinishedButUnseen(unittest.TestCase):
     """Finished work needed a state between "pages forever" and "invisible".
 
@@ -937,8 +1109,9 @@ class CacheFreshness(unittest.TestCase):
     def test_liveness_caches_are_never_served_stale(self):
         # The deliberate non-optimisation: `/herdr` renders entirely from the
         # `herdr` cache, and the registry half of `/api/summary` is the only
-        # source for a task whose pane died while it was blocked.
-        for name in ("herdr", "forms"):
+        # source for a task whose pane died while it was blocked. `debt` is one
+        # small local file read, so it has nothing to buy by going stale.
+        for name in ("herdr", "forms", "debt"):
             self.assertFalse(hub.CACHES[name].stale_ok,
                              f"{name} must not serve a stale liveness answer")
         for name in ("search", "kb", "links", "loops"):
@@ -1082,7 +1255,7 @@ class CacheFreshness(unittest.TestCase):
         self.assertEqual(hub.Cached(10, lambda: {}, stale_ok=True, name="brand-new").stale_max,
                          hub.DEFAULT_STALE_MAX,
                          "an undecided source must inherit the conservative default")
-        for name in ("herdr", "forms"):
+        for name in ("herdr", "forms", "debt"):
             self.assertEqual(hub.CACHES[name].stale_max, 0.0,
                              f"{name} fills inline; it has no staleness budget at all")
 
@@ -1321,6 +1494,20 @@ class RepoScope(unittest.TestCase):
         self.assertEqual([t["task_id"] for t in d["attention"]], ["a1"])
         d2 = hub.scoped(self.snap, "tntpgh-dev")
         self.assertEqual([t["task_id"] for t in d2["attention"]], ["b1"])
+
+    def test_scope_narrows_handoff_debt_too(self):
+        # #102's debt ledger rows carry a repo, so a scoped overview must not
+        # show another repo's unpaid handoff — the two features landed in the
+        # same file and composing them was a merge decision, not an accident.
+        dbt = {"debt": [{"repo": "/Users/x/Code/knowledge-base", "writes": 1, "mutations": 0,
+                         "shipped": False, "lesson_debt": False, "session_cwd": "", "at": None},
+                        {"repo": "/Users/x/Code/tourguide", "writes": 2, "mutations": 1,
+                         "shipped": True, "lesson_debt": True, "session_cwd": "", "at": None}]}
+        kept = [r for r in dbt["debt"] if hub._repo_matches(r["repo"], "knowledge-base")]
+        self.assertEqual([r["repo"].rsplit("/", 1)[-1] for r in kept], ["knowledge-base"])
+        html = hub.debt_rows({"debt": kept})
+        self.assertIn("knowledge-base", html)
+        self.assertNotIn("tourguide", html)
 
     def test_scope_narrows_events_through_their_task_not_their_label(self):
         d = hub.scoped(self.snap, "knowledge-base")

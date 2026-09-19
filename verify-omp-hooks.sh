@@ -797,6 +797,86 @@ await new Promise(r => setTimeout(r, 800));
   grep -q '"last_event_seq":9' "$REC2.ack" \
     && ok "that ack still carries the envelope verbatim" \
     || bad "ack stdin: $(cat "$REC2.ack" 2>/dev/null)"
+
+  printf '== TS shim: the one-liner names repos owing a handoff as repos ==\n'
+  # hub.py folds unpaid handoff debt into `attention` (it needs a human), and
+  # publishes `handoff_debt` so this line can name it with its own noun. The
+  # repo already learned what happens otherwise: "5 tasks need attention" for
+  # five finished workers, ignored for a day (hub.py's ATTENTION comment).
+  # SHIM3 has no hub.py, so ensureHub() cannot spawn one and the extension
+  # talks only to the stub below.
+  SHIM3="$WORK/shim3"; mkdir -p "$SHIM3/agent-hooks"
+  for s in omp-notify.sh omp-reconcile.sh; do printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM3/agent-hooks/$s"; done
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM3/herdr-resolve.sh"
+  chmod +x "$SHIM3/agent-hooks/"*.sh "$SHIM3/herdr-resolve.sh"
+  # The stub is a FILE, not `python3 - <<EOS`: with a heredoc, stdin is the
+  # program text and is already at EOF, so anything waiting on stdin to stay
+  # alive exits the instant it starts serving.
+  cat > "$SHIM3/stub-hub.py" <<'EOS'
+import http.server, socketserver, sys, threading, os
+body = sys.argv[1].encode()
+
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+with socketserver.TCPServer(("127.0.0.1", 0), H) as srv:
+    print(srv.server_address[1], flush=True)
+    threading.Timer(30, lambda: os._exit(0)).start()   # never outlive the suite
+    srv.serve_forever()
+EOS
+  stub_summary() {                      # summary json -> the injected one-liner
+    : > "$SHIM3/port"
+    python3 "$SHIM3/stub-hub.py" "$1" > "$SHIM3/port" &
+    stub_pid=$!
+    local port="" tries=0
+    while [ -z "$port" ] && [ "$tries" -lt 50 ]; do
+      sleep 0.1; port="$(cat "$SHIM3/port" 2>/dev/null)"; tries=$((tries + 1))
+    done
+    HERDR_CONTROL_DIR="$SHIM3" HERDR_HUB_PORT="$port" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
+const bas = handlers["before_agent_start"]({});
+console.log("LINE:" + (bas && bas.message ? bas.message.content : "none"));
+' 2>&1 | grep '^LINE:'
+    kill "$stub_pid" 2>/dev/null || true
+    wait "$stub_pid" 2>/dev/null || true
+  }
+  line="$(stub_summary '{"attention":3,"attention_tasks":1,"handoff_debt":2,"open_decisions":0}')"
+  case "$line" in
+    *"1 task(s) need attention"*"2 repo(s) owe a handoff"*)
+      ok "both halves of the count are named, each with its own noun" ;;
+    *) bad "one-liner miscounted or dropped a half: $line" ;;
+  esac
+  line="$(stub_summary '{"attention":2,"handoff_debt":2,"open_decisions":0}')"
+  case "$line" in
+    *task*) bad "pure handoff debt was reported as tasks: $line" ;;
+    *"2 repo(s) owe a handoff"*) ok "debt with no blocked task says nothing about tasks" ;;
+    *) bad "debt-only summary produced no line: $line" ;;
+  esac
+  # An older hub, or one mid-deploy: no field, or a count that disagrees with
+  # the union. Neither may print a negative or swallow the task half.
+  line="$(stub_summary '{"attention":2,"open_decisions":0}')"
+  case "$line" in
+    *"2 task(s) need attention"*) ok "a hub without the field reads exactly as before" ;;
+    *) bad "missing handoff_debt changed the old line: $line" ;;
+  esac
+  line="$(stub_summary '{"attention":1,"handoff_debt":4,"open_decisions":1}')"
+  case "$line" in
+    *-[0-9]*) bad "a disagreeing hub produced a negative count: $line" ;;
+    *"4 repo(s) owe a handoff"*"1 decision(s) open"*) ok "a disagreeing hub clamps instead of printing nonsense" ;;
+    *) bad "clamped line lost its content: $line" ;;
+  esac
 fi
 
 printf '\n%s\n' "-----"

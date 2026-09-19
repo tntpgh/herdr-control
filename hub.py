@@ -13,7 +13,7 @@ the two things that need a human — attention items and open decisions.
   /search      consensus-search memory: totals, last queries, replay counts
   /kb          knowledge-base: nightly ledger, heartbeat, repeat-view signal audits
   /links       every surface with a liveness dot
-  /api/summary {attention, live_blocked, open_decisions} — what the omp extension's one-liner reads
+  /api/summary {attention, attention_tasks, handoff_debt, open_decisions} — what the omp extension's one-liner reads
   /api/panes   every pane herdr knows, with its agent and live agent_status
   /api/blocked just the panes waiting on a person, joined to their task
   /api/blocked/wait?since=N&timeout=S  long-poll: returns the instant that changes
@@ -1877,10 +1877,99 @@ def serve_loop_decision(key: str) -> str | None:
     return title
 
 
+# ── handoff debt: a repo someone changed and never wrote up ───────────────────
+# Written by the omp extension `handoff-coverage.ts` (omp-harness#9), never by
+# anything here. It exists because the notepad tools resolve
+# `.handoffs/notepad.md` from the SESSION's cwd, so a session working across
+# repos files every handoff into whichever repo it happened to be standing in:
+# on 2026-09-18 one session merged four PRs in herdr-control and two in
+# tntpgh-dev from a thurber-os cwd and left both those notepads bare.
+#
+# That extension appends a row at session_shutdown for each repo it changed
+# without a handoff, and DELETES a repo's rows the moment a session starts in
+# it. So every row present is unpaid by construction, and this reader makes no
+# judgement the writer has not already made — it only reads, and it is the
+# only surface that shows the ledger to a human who is not already standing in
+# the repo that owes it.
+#
+# A different process on a different schedule writes this file, which is the
+# whole reason for the defensive parse below: absent, empty, caught mid-append
+# or carrying a line from a future version of the writer, the answer must be a
+# number and a list. A page whose job is to be readable when things are broken
+# may not be the thing that breaks.
+HANDOFF_DEBT = Path(os.environ.get("HERDR_HANDOFF_DEBT",
+                                   Path.home() / ".local/state/omp/handoff-debt.jsonl"))
+
+
+def _debt_row(obj) -> dict | None:
+    """One ledger line, normalised — or None when it cannot be trusted.
+
+    A row is usable only if it names a repo: every other field degrades to a
+    shown-as-unknown detail, but a debt with no owner is one nobody can pay,
+    and counting it would inflate the badge with work that does not exist."""
+    if not isinstance(obj, dict):
+        return None
+    repo = obj.get("repo")
+    if not isinstance(repo, str) or not repo.strip():
+        return None
+
+    def _count(key) -> int:
+        # bool is an int in Python; a producer-supplied count is advisory and
+        # its type is never assumed.
+        v = obj.get(key)
+        return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+    at, cwd = obj.get("at"), obj.get("sessionCwd")
+    return {"repo": repo.strip(),
+            "at": at if isinstance(at, str) else "",
+            "session_cwd": cwd if isinstance(cwd, str) else "",
+            "writes": _count("writes"), "mutations": _count("mutations"),
+            "shipped": obj.get("shipped") is True,
+            "lesson_debt": obj.get("lessonDebt") is True}
+
+
+def handoff_debt_data() -> dict:
+    """Unpaid rows newest-first, the repos they name, and what was unreadable.
+
+    `unreadable` is REPORTED rather than swallowed. A half-written final line
+    is normal for an append-only file read at an arbitrary moment, but a reader
+    that silently drops lines would show "no debt" for a file full of it — the
+    failure mode that makes a surface worth less than no surface."""
+    try:
+        text = HANDOFF_DEBT.read_text(errors="replace")
+    except FileNotFoundError:
+        # No ledger is the normal state on a machine whose sessions all keep
+        # their handoffs. Zero, not an error.
+        return {"debt": [], "repos": [], "unreadable": 0, "present": False}
+    except OSError as exc:
+        return {"debt": [], "repos": [], "unreadable": 0, "present": False,
+                "error": f"{type(exc).__name__}: {exc}"}
+    rows, unreadable = [], 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = _debt_row(json.loads(line))
+        except (json.JSONDecodeError, ValueError):
+            row = None
+        if row is None:
+            unreadable += 1
+        else:
+            rows.append(row)
+    rows.sort(key=lambda r: r["at"], reverse=True)  # ISO-8601 sorts as text
+    return {"debt": rows, "repos": sorted({r["repo"] for r in rows}),
+            "unreadable": unreadable, "present": True,
+            "shipped": sum(1 for r in rows if r["shipped"]),
+            "lesson_debt": sum(1 for r in rows if r["lesson_debt"])}
+
+
 CACHES = {
     # Liveness: cheap, filled inline, never served stale. See Cached.
     "herdr": Cached(5, herdr_data, name="herdr"),
     "forms": Cached(3, forms_data, name="forms"),
+    # One local file read of a few lines: cheaper than the registry query
+    # above, so it is filled inline like the other two and never served stale.
+    "debt": Cached(5, handoff_debt_data, name="debt"),
     # Network-backed: ~350ms each, so a reader gets the stale value and the
     # refresh happens behind them.
     "search": Cached(120, search_data, stale_ok=True, name="search"),
@@ -2102,9 +2191,48 @@ def task_rows(rows) -> str:
     return "".join(out) or "<tr><td class=dim>none</td></tr>"
 
 
+def debt_rows(d: dict) -> str:
+    """One row per unpaid session: which repo, when, what it did, what it owes.
+
+    The counts are the point. "3 write(s), 4 git/gh mutation(s), SHIPPED" is
+    the difference between a handoff worth reconstructing and one worth
+    skipping, and it is the only thing left of that session once its cwd
+    notepad has scrolled past."""
+    out = []
+    for r in d.get("debt", []):
+        pills = ["<span class='pill hot'>shipped</span>"] if r["shipped"] else []
+        if r["lesson_debt"]:
+            pills.append(" <span class='pill hot' title='the session shipped and called neither retain nor learn'>no lesson</span>")
+        did = f"{r['writes']} write(s) · {r['mutations']} git/gh mutation(s)"
+        where = r["session_cwd"] or "an unrecorded cwd"
+        out.append(f"<tr class=hot><td>{''.join(pills) or '<span class=pill>owed</span>'}</td>"
+                   f"<td><b>{_esc(r['repo'].rsplit('/', 1)[-1])}</b><br>"
+                   f"<small>{_esc(did)} · that session was working in {_esc(where)}</small></td>"
+                   f"<td class=age title='{_esc(r['at'] or 'no timestamp recorded')}'>{_esc(_age(r['at']))}</td></tr>")
+    if d.get("error"):
+        out.append(f"<tr><td><span class='pill bad'>unreadable</span></td>"
+                   f"<td class=dim>handoff-debt ledger could not be read: {_esc(d['error'])}</td>"
+                   f"<td class=age>—</td></tr>")
+    if d.get("unreadable"):
+        # Shown, never counted: an unparseable line may be a half-written
+        # append, and a surface that turned one into a phantom debt would be
+        # asking for work nobody can identify. Silence would be worse still —
+        # "no debt" for a corrupt ledger is the one answer that misleads.
+        out.append(f"<tr><td><span class='pill bad'>{d['unreadable']}</span></td>"
+                   f"<td class=dim>unreadable ledger line(s), not counted as debt — "
+                   f"{_esc(str(HANDOFF_DEBT))}</td><td class=age>—</td></tr>")
+    return "".join(out) or "<tr><td class=dim>none — every repo a session changed has a handoff</td></tr>"
+
+
+
 def render_overview(scope: str = "") -> str:
-    h_all, f, s, k, l, lo = (CACHES[n].get() for n in ("herdr", "forms", "search", "kb", "links", "loops"))
+    h_all, f, s, k, l, lo, dbt = (CACHES[n].get() for n in ("herdr", "forms", "search", "kb", "links", "loops", "debt"))
+    # Handoff debt (#102) is per-REPO in its own right, so it narrows with the
+    # scope like everything else on this page; the ledger rows carry a repo.
     h = scoped(h_all, scope)
+    if scope:
+        dbt = dict(dbt, debt=[r for r in (dbt.get("debt") or [])
+                              if _repo_matches(r.get("repo"), scope)])
     bad_loops = [x for x in lo.get("loops", []) if x["stale"] or x["outcome"] not in ("ok", "success", "healthy")]
     att = len(h.get("attention", []))
     hb = (k or {}).get("heartbeat") or {}
@@ -2114,9 +2242,19 @@ def render_overview(scope: str = "") -> str:
     heartbeat_error = k.get("error") or k.get("heartbeat_error") or ("heartbeat reader unavailable" if "heartbeat" not in k else None)
     required = [x for x in l.get("surfaces", []) if x["name"] not in OPTIONAL]
     alive = sum(1 for x in required if x["alive"])
+    # Counted in REPOS, not rows: the unit of work is "go stand in that repo
+    # and write its handoff", which pays every row it holds at once. A count
+    # of rows would say 3 for one afternoon's forgetfulness in one place.
+    debt_repos = dbt.get("repos", [])
     cards = [
         ("/herdr", att, "need attention", f"{len(h.get('tasks', []))} tasks · events to #{h.get('max_event_seq', 0)}", att > 0),
         ("/decisions", f.get("open_count", 0), "decisions open", f"{len(f.get('history', []))} answered/expired on record", f.get("open_count", 0) > 0),
+        ("#handoff-debt", len(debt_repos), "repo(s) owe a handoff",
+         (f"{len(dbt.get('debt', []))} session(s)"
+          + (f" · {dbt['shipped']} shipped" if dbt.get("shipped") else "")
+          + (f" · {dbt['lesson_debt']} with no lesson" if dbt.get("lesson_debt") else ""))
+         if debt_repos else (dbt.get("error") or "no unpaid handoffs"),
+         bool(debt_repos) or bool(dbt.get("unreadable")) or bool(dbt.get("error"))),
         ("/links", f"{alive}/{len(required)}", "surfaces alive", "probed from this Mac; dev servers not counted", alive < len(required)),
         ("/kb", "unavailable" if ledger_error else _esc(_nightly_status(last)), "last KB nightly",
          ledger_error or (f"{_age(last.get('started_at'))} ago · {last.get('total_steps') or '?'} steps" if last else "no runs"),
@@ -2131,6 +2269,9 @@ def render_overview(scope: str = "") -> str:
         f"<a class='card {'hot' if hot else ''}' href='{href}'><div class=t>{t}</div><div class=n>{n}</div><div class=s>{_esc(sub)}</div></a>"
         for href, n, t, sub, hot in cards) + "</div>"
     body += "<h2>Needs attention</h2><table>" + task_rows(h.get("attention", [])) + "</table>"
+    # Always rendered, so the card's anchor always resolves and "nothing owed"
+    # is an answer the page gives rather than a section that silently vanished.
+    body += "<h2 id=handoff-debt>Unpaid handoff debt</h2><table>" + debt_rows(dbt) + "</table>"
     if f.get("open"):
         body += "<h2>Open decisions</h2><table>" + "".join(
             f"<tr class=hot><td><span class='pill hot'>open</span></td><td><a href='/decisions'>{_esc(x.get('title') or x['id'])}</a>"
@@ -2485,10 +2626,25 @@ class Handler(BaseHTTPRequestHandler):
             # whose provenance is invisible is how a control gets trusted
             # further than it has earned.
             unconfirmed = sum(1 for t in registry if t.get("state_source") == "stored")
+            # Handoff debt is a human's job, so it is IN `attention` — that
+            # field is the one number a consumer checks for "does anything
+            # want me". But the repo's own history says a count whose noun is
+            # wrong stops being read ("5 tasks need attention" for five
+            # finished workers, 2026-09-18, ATTENTION's comment above), and
+            # debt rows are not tasks. So the split is PUBLISHED rather than
+            # left to a subtraction: `attention_tasks` is the pane/registry
+            # half, `handoff_debt` the repo half, and the banner names each.
+            debt = CACHES["debt"].get()
+            debt_repos = len(debt.get("repos", []))
+            attention_tasks = len(live) + len(registry)
             return self._send(200, "application/json", json.dumps(
-                {"attention": len(live) + len(registry), "live_blocked": len(live),
+                {"attention": attention_tasks + debt_repos,
+                 "attention_tasks": attention_tasks, "live_blocked": len(live),
                  "registry_attention": len(h.get("attention", [])),
                  "attention_unconfirmed": unconfirmed,
+                 "handoff_debt": debt_repos,
+                 "handoff_debt_rows": len(debt.get("debt", [])),
+                 "handoff_debt_unreadable": debt.get("unreadable", 0),
                  "rev": RUNNING_REV,
                  "live_connected": live_data().get("connected", False),
                  "open_decisions": f.get("open_count", 0),

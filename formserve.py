@@ -328,6 +328,52 @@ def update_form(path: Path | None, **fields) -> tuple[str, dict]:
         print(f"formserve: hub registry not updated ({e})", file=sys.stderr)
         return "unavailable", {}
 
+
+def unanswerable_reasons(raw: str) -> list[str]:
+    """Why this HTML could never record an answer. Empty list = it can.
+
+    Written after 2026-09-17, when THREE of the day's forms were served,
+    listed `open`, announced to Terrence, and could not be answered at all —
+    one of them sat dead for 19 hours. Every failure was silent: the page
+    rendered perfectly, so "verify it rendered" (the skill's own check) passed.
+    The Send button just did nothing.
+
+    The three real shapes, each caught below:
+      1. No call to `submitAnswers()` anywhere. That call is the ENTIRE
+         contract with this script — the shim below defines the function, the
+         form has to invoke it. A form with a `type=submit` button and no
+         handler does a native browser submit, which posts form-encoded data
+         with no token and records nothing.
+      2. `<button form="f">` with no `<form id="f">`. The button is associated
+         with a form that does not exist, so clicking it fires no event at all,
+         anywhere.
+      3. `<form onsubmit="return false">` with no handler — the form actively
+         cancels its own submission.
+
+    Checked against the SOURCE file, which must never define submitAnswers
+    itself (this script and the hub each inject their own), so a bare
+    occurrence of the name is the page's call site.
+    """
+    reasons = []
+    if not re.search(r"submitAnswers\s*\(", raw):
+        reasons.append("nothing calls submitAnswers() — the Send button would "
+                       "do a native form post, which carries no token and "
+                       "records nothing")
+    form_ids = set(re.findall(r"<form[^>]*\bid=[\"']([^\"']+)", raw, re.I))
+    for ref in set(re.findall(r"<(?:button|input)[^>]*\bform=[\"']([^\"']+)", raw, re.I)):
+        if ref not in form_ids:
+            reasons.append(f"a submit control says form=\"{ref}\" but no "
+                           f"<form id=\"{ref}\"> exists, so clicking it fires "
+                           f"no event")
+    for tag in re.findall(r"<form[^>]*>", raw, re.I):
+        if re.search(r"onsubmit\s*=\s*[\"'][^\"']*return\s+false", tag, re.I) \
+                and not re.search(r"submitAnswers\s*\(", raw):
+            reasons.append("the <form> cancels its own submit (onsubmit=return "
+                           "false) and nothing calls submitAnswers()")
+    return reasons
+
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("form", help="path to the HTML file to serve")
@@ -349,6 +395,24 @@ def main() -> int:
     form = Path(args.form).expanduser().resolve()
     if not form.is_file():
         print(f"formserve: no such file: {form}", file=sys.stderr)
+        return 2
+
+    # Refuse to serve a form nobody can answer. A configuration error, so it
+    # exits 2 like the missing-file case above rather than serving a dead page:
+    # the failure this replaces was invisible — the decision appeared in the
+    # inbox, rendered correctly, and silently swallowed every click.
+    dead = unanswerable_reasons(form.read_text(errors="replace"))
+    if dead:
+        print(f"formserve: {form} cannot record an answer:", file=sys.stderr)
+        for reason in dead:
+            print(f"  - {reason}", file=sys.stderr)
+        print("  fix: give the <form> an id and add the one required script —\n"
+              "       document.getElementById('f').addEventListener('submit', e => {\n"
+              "         e.preventDefault();\n"
+              "         const fd = new FormData(e.target);\n"
+              "         window.submitAnswers({ q1: fd.get('q1'), notes: fd.get('notes') });\n"
+              "       });\n"
+              "  see examples/form-template.html", file=sys.stderr)
         return 2
 
     # Unguessable per-run secret (see the /submit handler for why this exists)

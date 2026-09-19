@@ -361,6 +361,23 @@ case "$(did "$line")" in "registry-follow-only (first observation) reg="*) true 
   && ok "first observation of a blocked pane records state and alerts nothing" \
   || no "first observation" "$line"
 
+# ...and with standing authority it ANSWERS that prompt while still alerting
+# nothing. A pane that was already blocked when the hub started produces no
+# further transition, so this is the only chance to clear it; three review
+# lanes sat stranded through exactly this gap on 2026-09-18.
+line=$(run_edge blocked "" HERDR_EDGE_PEER_ANSWER=1)
+case "$(did "$line")" in "peer-answer(first observation) reg="*) true ;; *) false ;; esac \
+  && grep -q "^peer-answer .*w1:p1" "$tmp/log" \
+  && ! grep -q "^notify" "$tmp/log" \
+  && ok "first observation answers an allow-class prompt and still alerts nothing" \
+  || no "first-observation peer-answer" "$line $(cat "$tmp/log")"
+# Without the grant it must stay exactly as before: record, answer nothing.
+: > "$tmp/log"
+line=$(run_edge blocked "")
+case "$(did "$line")" in "registry-follow-only (first observation) reg="*) [ ! -s "$tmp/log" ] ;; *) false ;; esac \
+  && ok "without standing authority a first observation answers nothing" \
+  || no "first observation ungranted" "$line $(cat "$tmp/log")"
+
 line=$(run_edge idle "")
 case "$(did "$line")" in "registry-heal (first observation) reg="*) [ ! -s "$tmp/log" ] ;; *) false ;; esac \
   && ok "first sight of an unblocked pane heals the registry, alerts nothing" \

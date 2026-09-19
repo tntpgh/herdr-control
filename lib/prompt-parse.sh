@@ -16,6 +16,34 @@
 #     2. Yes, and don't ask again
 _OPT_LINE='^[[:space:]]*[❯>]?[[:space:]]*([0-9]+)\.[[:space:]]+(.+)$'
 
+# KNOWN SHAPES THIS WINDOW DOES NOT HANDLE. Recorded here because they were
+# carried as "named, not patched" through five review rounds and lived only in
+# commit messages and PR bodies — which is not where the next person to touch
+# this function will look. None is reachable from any tool in this fleet today;
+# each becomes reachable the moment one paints the shape.
+#
+#   1. A STATUS ROW THAT WRAPS. The status block is sized from the screen as the
+#      trailing run of DECORATED lines. A row that wraps puts its continuation
+#      on a line carrying no glyph, so the run stops under it and the rows above
+#      the continuation are read as output. Reproduced by splicing a prompt
+#      above `"   and merge the remaining pull requests cleanly"` plus a real
+#      bar: the options are refused.
+#
+#   2. A BANNER PRINTED BETWEEN A PROMPT AND THE BAR (an update notice, a
+#      deprecation line). It is undecorated, so it ends the status run early and
+#      the prompt above it falls outside the window.
+#
+#   Both fail toward NOT OFFERING, which is the direction that leaves an agent
+#      unanswerable — the one this file's asymmetry says must not happen. The
+#      fix for either is the same and was deliberately not taken: widening the
+#      block by a fixed count re-opens the stale-menu hole that positional
+#      sizing was removed to close.
+#
+#   3. A SINGLE INVALID UTF-8 BYTE aborts the awk below (`towc: multibyte
+#      conversion failure`), truncating the window at that line. PRE-EXISTING
+#      and identical on origin/main — options survive if the bad byte is below
+#      them and are lost if above.
+#
 _prompt_window() {
   # The prompt is anchored at the BOTTOM of the viewport, so this stays
   # bottom-anchored — but it takes that bottom out of the one window every

@@ -1,0 +1,27 @@
+{
+  "name": "herdr-control",
+  "description": "This repo's own space: agent lane, live hub status, and the suite runner.",
+  "working_dir": ".",
+  "tabs": [
+    {
+      "label": "agent",
+      "panes": [
+        { "label": "omp", "cmd": "omp" },
+        { "label": "status", "split": "down", "cmd": "git status --short --branch" }
+      ]
+    },
+    {
+      "label": "hub",
+      "panes": [
+        { "label": "ps", "cmd": "./restart.sh --verify" }
+      ]
+    },
+    {
+      "label": "suites",
+      "panes": [
+        { "label": "policy", "cmd": "bash verify-command-policy.sh" },
+        { "label": "scan", "split": "down", "cmd": "bash verify-secret-scan.sh" }
+      ]
+    }
+  ]
+}
