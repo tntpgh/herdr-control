@@ -159,8 +159,90 @@ cat > "$PERSONAL/herdr-control/projects/herdr-control.json" <<'EOF'
 {"name":"herdr-control","description":"a personal override","working_dir":"/tmp",
  "tabs":[{"label":"work","panes":[{"cmd":"claude"}]}]}
 EOF
-XDG_CONFIG_HOME="$PERSONAL" bash "$here/open-project.sh" --dry-run herdr-control >"$WORK/collide.txt" 2>&1
+# From a directory with no repo-local space, so this measures personal-vs-
+# shipped and nothing else. Run inside this repo it would now resolve to the
+# REPO tier, which is correct precedence but a different assertion.
+( cd "$WORK" && XDG_CONFIG_HOME="$PERSONAL" bash "$here/open-project.sh" --dry-run herdr-control ) >"$WORK/collide.txt" 2>&1
 grep -q "a personal override" "$WORK/collide.txt" && ok "personal tier wins over the shipped example on a name collision" || bad "shipped example won instead: $(cat "$WORK/collide.txt")"
+
+# ...and the repo you are standing in beats BOTH, because it is the most
+# specific answer to "which space".
+RC="$WORK/collide-repo"; mkdir -p "$RC/.herdr-control"; git init -q "$RC"
+cat > "$RC/.herdr-control/project.json" <<'EOF'
+{"name":"herdr-control","description":"the repo tier override","working_dir":".",
+ "tabs":[{"label":"work","panes":[{"cmd":"echo repo-tier"}]}]}
+EOF
+( cd "$RC" && XDG_CONFIG_HOME="$PERSONAL" bash "$here/open-project.sh" --dry-run herdr-control ) >"$WORK/collide2.txt" 2>&1
+grep -q "the repo tier override" "$WORK/collide2.txt" \
+  && ok "the repo tier wins over BOTH personal and shipped on a name collision" \
+  || bad "repo tier did not win: $(cat "$WORK/collide2.txt")"
+
+printf '== open-project.sh: the REPO-LOCAL tier, found from cwd, gated by trust ==\n'
+# A repo ships its own space at <repo-root>/.herdr-control/project.json so a
+# fresh clone carries its tabs, panes and startup commands. That file's
+# commands arrived with the repo, so it needs the same approval a repo-local
+# quick action needs — and REFUSAL, not a warning, because the commands run
+# the moment the workspace opens.
+#
+# Its own git repo and its own trust DB, so this never reads or writes the
+# real ~/.local/state one.
+RL="$WORK/repolocal"
+mkdir -p "$RL/.herdr-control"
+git init -q "$RL"
+cat > "$RL/.herdr-control/project.json" <<'EOF'
+{"name":"repo-space","description":"the repo's own space","working_dir":".",
+ "tabs":[{"label":"work","panes":[{"cmd":"echo hello-from-the-repo"}]}]}
+EOF
+TRUSTDIR="$WORK/truststate"
+_rl() { ( cd "$RL" && XDG_STATE_HOME="$TRUSTDIR" XDG_CONFIG_HOME="$PERSONAL" \
+            bash "$here/open-project.sh" "$@" ) ; }
+
+_rl --dry-run >"$WORK/rl-noname.txt" 2>&1; rc=$?
+[ "$rc" -eq 0 ] && ok "no name needed: the repo you stand in IS the space" \
+  || bad "exit $rc with no name: $(head -2 "$WORK/rl-noname.txt")"
+grep -q "$RL/.herdr-control/project.json" "$WORK/rl-noname.txt" \
+  && ok "resolved from the repo root, not the personal or shipped dir" \
+  || bad "wrong file: $(cat "$WORK/rl-noname.txt")"
+grep -q 'using this repo.s space' "$WORK/rl-noname.txt" \
+  && ok "and it says which space it picked, so the default is never silent" \
+  || bad "no notice of the cwd-derived pick: $(cat "$WORK/rl-noname.txt")"
+
+_rl >"$WORK/rl-untrusted.txt" 2>&1; rc=$?
+[ "$rc" -ne 0 ] && ok "an UNTRUSTED repo space is REFUSED, not warned" \
+  || bad "opened an unapproved repo space (rc=$rc)"
+grep -q 'not approved on this machine' "$WORK/rl-untrusted.txt" \
+  && ok "the refusal says what is wrong" || bad "unclear refusal: $(cat "$WORK/rl-untrusted.txt")"
+grep -q -- '--trust' "$WORK/rl-untrusted.txt" \
+  && ok "and names the command that approves it" || bad "no recovery path offered"
+
+_rl --dry-run >/dev/null 2>&1 \
+  && ok "--dry-run is exempt: reading what it WOULD run is how you decide" \
+  || bad "dry-run refused, so the space cannot be reviewed before approving"
+
+_rl --trust >"$WORK/rl-trust.txt" 2>&1; rc=$?
+[ "$rc" -eq 0 ] && ok "--trust approves the repo space" || bad "--trust failed: $(cat "$WORK/rl-trust.txt")"
+grep -q 'echo hello-from-the-repo' "$WORK/rl-trust.txt" \
+  && ok "approval PRINTS the commands being approved" \
+  || bad "approved without showing what runs: $(cat "$WORK/rl-trust.txt")"
+_rl --dry-run >/dev/null 2>&1 && ok "and it resolves after approval" || bad "still refused after --trust"
+
+# Hash-keyed, so editing an approved file revokes it. This is the property that
+# makes approving once safe: it approves CONTENT, not a filename.
+cat > "$RL/.herdr-control/project.json" <<'EOF'
+{"name":"repo-space","description":"the repo's own space","working_dir":".",
+ "tabs":[{"label":"work","panes":[{"cmd":"echo something-else-entirely"}]}]}
+EOF
+_rl >"$WORK/rl-edited.txt" 2>&1; rc=$?
+[ "$rc" -ne 0 ] && ok "editing an approved space REVOKES approval (hash-keyed)" \
+  || bad "an edited space kept its approval — approval is keyed on the path only"
+
+# A repo with no space of its own must behave exactly as before.
+NOSPACE="$WORK/nospace"; mkdir -p "$NOSPACE"; git init -q "$NOSPACE"
+( cd "$NOSPACE" && XDG_STATE_HOME="$TRUSTDIR" XDG_CONFIG_HOME="$PERSONAL" \
+    bash "$here/open-project.sh" >"$WORK/rl-none.txt" 2>&1 ); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'usage:' "$WORK/rl-none.txt" \
+  && ok "a repo with no space still prints usage rather than guessing" \
+  || bad "unexpected behaviour with no space and no name: $(cat "$WORK/rl-none.txt")"
 
 
 printf '\n%s\n' "-----"
