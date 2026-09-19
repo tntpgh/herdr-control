@@ -81,7 +81,18 @@ with tempfile.TemporaryDirectory() as td:
     for f in ("preview.sh", "herdr-deliver.sh"):
         os.chmod(work / f, 0o755)
     form = root / "q.html"
-    form.write_text("<html><body><h1>merge or hold?</h1><form><input name='pick' value='merge'></form></body></html>")
+    # Answerable on purpose: formserve refuses to serve a form nothing can
+    # submit (see unanswerable_reasons / verify-formserve-answerable.sh). This
+    # test drives /submit directly rather than through a browser, but the
+    # fixture still has to be a form a human COULD answer, or it never serves.
+    form.write_text(
+        "<html><body><h1>merge or hold?</h1>"
+        "<form id='f'><input name='pick' value='merge'>"
+        "<button type='submit' form='f'>Send answers</button></form>"
+        "<script>document.getElementById('f').addEventListener('submit',function(e){"
+        "e.preventDefault();var fd=new FormData(e.target);"
+        "window.submitAnswers({pick:fd.get('pick')});});</script>"
+        "</body></html>")
 
     def start_port(timeout: int = 60, deliver: str = "w9:p9") -> tuple[subprocess.Popen, Path, str]:
         p = subprocess.Popen([sys.executable, str(work / "formserve.py"), str(form), "--timeout", str(timeout),
