@@ -184,7 +184,10 @@ grep -q '^exit 0' "$R_HOME/.git/hooks/pre-push" \
     || bad "overwrote a hook this script did not write"
 has 'shim-home/pre-push .*has its OWN hook' \
     && ok "and is reported as foreign rather than silently accepted" \
-    || bad "an unrecognised pre-push was not reported: $(grep pre-push)"
+    || bad "an unrecognised pre-push was not reported: $OUT"
+# ^ `$OUT`, not `$(grep pre-push)`. That was grep with no file and no redirect,
+# so the FAILURE path blocked on stdin and the suite hung forever instead of
+# reporting — which is how this branch appeared to have no result at all.
 # VERIFY prints counts, not a per-repo verdict for the healthy cases, so the
 # observable is the bucket: a repo whose pre-push we do not recognise must
 # land OUTSIDE "on the TRACKED scanner". Other fixtures are fully tracked, so
@@ -300,6 +303,142 @@ grep -q 'npm run lint' "$R_OWN/.git/hooks/pre-commit" \
     && ok "undo still does not touch a bespoke hook" || bad "undo damaged a foreign hook"
 run --undo
 ok "--undo is safe to run twice (rc=$?)"
+
+# ---- the shim verifies the scanner's bytes before running them -------------
+# Provenance used to be written once at deploy time and never re-checked, so a
+# write straight into the deploy directory was invisible. On 2026-09-18 the
+# deployed scanner was replaced with a work-in-progress copy; 18 repos
+# executed it and the only symptom was a silent `exit 1` on commit. `--apply`
+# restores it, but nothing prompted anyone to run one.
+_SV="$WORK/shimverify"
+mkdir -p "$_SV/code/repo" "$_SV/deploy"
+( cd "$_SV/code/repo" && git init -q . &&
+  git -c user.email=tnt@teamthurber.com -c user.name=t commit -q --allow-empty -m init ) >/dev/null 2>&1
+# Carries the marker, or the installer classifies it foreign and refuses to
+# replace it — correct behaviour, and it made the first version of this test
+# vacuous.
+# The path must contain "secret-scan": that substring IS the opt-in test, and
+# without it the repo is counted "NOT opted in" and left alone.
+printf '#!/usr/bin/env bash\n# installed by herdr-control install-git-hooks.sh\nexec bash /nonexistent/secret-scan-pre-commit.sh "$@"\n' \
+  > "$_SV/code/repo/.git/hooks/pre-commit"
+chmod +x "$_SV/code/repo/.git/hooks/pre-commit"
+CODE_ROOT="$_SV/code" HERDR_HOOK_DEPLOY_DIR="$_SV/deploy" \
+  bash "$INSTALLER" --apply >/dev/null 2>&1
+
+_sv_commit() {                            # file msg -> rc, stderr in $_SV/err
+  printf '%s\n' "$2" > "$_SV/code/repo/$1"
+  ( cd "$_SV/code/repo" && git add "$1" &&
+    git -c user.email=tnt@teamthurber.com -c user.name=t commit -q -m "$2" ) 2>"$_SV/err"
+}
+
+_sv_commit a.txt clean && ok "a commit works when the deployed scanner is the reviewed one" \
+  || bad "shim verify: a clean deployment refuses commits — $(head -2 "$_SV/err" | tr '\n' ' ')"
+
+printf '#!/bin/bash\nexit 0\n' > "$_SV/deploy/secret-scan-pre-commit.sh"
+if _sv_commit b.txt tampered; then
+  bad "shim verify: a commit went through a scanner whose bytes are not the reviewed ones"
+else
+  grep -q 'REFUSED: the deployed secret scanner is not the reviewed one' "$_SV/err" \
+    && ok "a tampered deployed scanner is REFUSED, fail-closed" \
+    || bad "shim verify: refused, but not for the provenance reason: $(head -2 "$_SV/err" | tr '\n' ' ')"
+  grep -q 'install-git-hooks.sh --apply' "$_SV/err" \
+    && ok "the refusal names the command that restores it" \
+    || bad "shim verify: refusal does not say how to recover"
+fi
+
+CODE_ROOT="$_SV/code" HERDR_HOOK_DEPLOY_DIR="$_SV/deploy" \
+  bash "$INSTALLER" --apply >/dev/null 2>&1
+_sv_commit c.txt restored && ok "--apply restores the scanner and commits resume" \
+  || bad "shim verify: still refused after --apply: $(head -2 "$_SV/err" | tr '\n' ' ')"
+
+# A fleet deployed before provenance existed must keep working: no .rev is not
+# tampering, and treating it as such would break every commit at once.
+mv "$_SV/deploy/.rev" "$_SV/deploy/.rev.away"
+_sv_commit d.txt norev && ok "a deployment with no .rev still runs (not treated as tampering)" \
+  || bad "shim verify: absent provenance blocked a commit: $(head -2 "$_SV/err" | tr '\n' ' ')"
+mv "$_SV/deploy/.rev.away" "$_SV/deploy/.rev"
+
+# CRLF or trailing whitespace on the recorded line. Unnormalised, the compare
+# fails and the refusal prints two hashes that look IDENTICAL — a fleet-wide
+# block an operator cannot debug.
+_sv_sha=$(sed -n 's/^sha256:[[:space:]]*//p' "$_SV/deploy/.rev" | head -1)
+cp "$_SV/deploy/.rev" "$_SV/deploy/.rev.orig"
+sed "s/^sha256:.*/sha256:     $_sv_sha /" "$_SV/deploy/.rev.orig" > "$_SV/deploy/.rev"
+_sv_commit e.txt trailingspace && ok "a trailing space on the recorded hash still verifies" \
+  || bad "shim verify: trailing whitespace blocked a commit: $(head -3 "$_SV/err" | tr '\n' ' ')"
+printf 'sha256:     %s\r\n' "$_sv_sha" > "$_SV/deploy/.rev"
+_sv_commit f.txt crlf && ok "a CRLF line ending on the recorded hash still verifies" \
+  || bad "shim verify: CRLF blocked a commit: $(head -3 "$_SV/err" | tr '\n' ' ')"
+cp "$_SV/deploy/.rev.orig" "$_SV/deploy/.rev"
+
+# FAIL CLOSED when the hash cannot be computed. A recorded expectation with no
+# way to check it must not run: that direction was unpinned, and the code did
+# the opposite of its own comment.
+_sv_nosha="$_SV/nosha"; mkdir -p "$_sv_nosha"
+printf '#!/bin/sh\nexit 127\n' > "$_sv_nosha/shasum"; chmod +x "$_sv_nosha/shasum"
+printf 'g\n' > "$_SV/code/repo/g.txt"
+( cd "$_SV/code/repo" && git add g.txt &&
+  PATH="$_sv_nosha:$PATH" git -c user.email=tnt@teamthurber.com -c user.name=t \
+    commit -q -m nohash ) 2>"$_SV/err" \
+  && bad "shim verify: ran the scanner unverified when no hash could be computed" \
+  || ok "no computable hash + a recorded one = REFUSED, not run unverified"
+grep -q 'cannot verify the deployed secret scanner' "$_SV/err" \
+  && ok "and it says the hash could not be computed, not that bytes were tampered" \
+  || bad "shim verify: wrong message for an uncomputable hash: $(head -2 "$_SV/err" | tr '\n' ' ')"
+( cd "$_SV/code/repo" && git reset -q HEAD g.txt 2>/dev/null; rm -f g.txt )
+
+# The STAGED record (.rev.next) covers the window inside every --apply in
+# which the new bytes are live and .rev still records the old hash. Without
+# it, any concurrent commit in another repo is refused for ~24 ms per apply.
+cp "$_SV/deploy/.rev" "$_SV/deploy/.rev.next"
+printf 'sha256:     %s\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$_SV/deploy/.rev"
+_sv_commit h.txt staged && ok "a match against the STAGED .rev.next verifies" \
+  || bad "shim verify: staged record ignored: $(head -3 "$_SV/err" | tr '\n' ' ')"
+cp "$_SV/deploy/.rev.orig" "$_SV/deploy/.rev"; rm -f "$_SV/deploy/.rev.next"
+
+# ...and a deploy whose record cannot be written must deploy NOTHING, rather
+# than leaving bytes live that no record describes — which with the shim in
+# place is a fleet-wide outage the installer reports as a success.
+_sv_ro="$WORK/rodeploy"; mkdir -p "$_sv_ro/code/repo" "$_sv_ro/deploy"
+( cd "$_sv_ro/code/repo" && git init -q . &&
+  git -c user.email=tnt@teamthurber.com -c user.name=t commit -q --allow-empty -m init )
+printf '#!/usr/bin/env bash\n# installed by herdr-control install-git-hooks.sh\nexec bash /nonexistent/secret-scan-pre-commit.sh "$@"\n' \
+  > "$_sv_ro/code/repo/.git/hooks/pre-commit"
+chmod +x "$_sv_ro/code/repo/.git/hooks/pre-commit"
+CODE_ROOT="$_sv_ro/code" HERDR_HOOK_DEPLOY_DIR="$_sv_ro/deploy" bash "$INSTALLER" --apply >/dev/null 2>&1
+_sv_before=$(shasum -a 256 "$_sv_ro/deploy/secret-scan-pre-commit.sh" 2>/dev/null | awk '{print $1}')
+chmod 500 "$_sv_ro/deploy"
+CODE_ROOT="$_sv_ro/code" HERDR_HOOK_DEPLOY_DIR="$_sv_ro/deploy" bash "$INSTALLER" --apply >"$WORK/ro.txt" 2>&1
+_sv_after=$(shasum -a 256 "$_sv_ro/deploy/secret-scan-pre-commit.sh" 2>/dev/null | awk '{print $1}')
+chmod 700 "$_sv_ro/deploy"
+[ "$_sv_before" = "$_sv_after" ] \
+  && ok "a deploy that cannot write its record leaves the previous bytes live" \
+  || bad "bytes went live with no record describing them (before=$_sv_before after=$_sv_after)"
+
+# ...and when the record cannot be written but the BYTES can — the case the
+# staged `.rev.next` exists for. A directory named `.rev` cannot be replaced
+# by `mv`, so the promote step fails while the scanner is already live.
+# Without staging, the fleet then refuses every commit; with it, the staged
+# record still describes the live bytes and work continues.
+#
+# This row exists because a mutant survived without it: removing the staging
+# call broke nothing, since the read-only-directory case above fails at the
+# scanner rename before a record is ever written.
+_sv_st="$WORK/stagedrev"; mkdir -p "$_sv_st/code/repo" "$_sv_st/deploy"
+( cd "$_sv_st/code/repo" && git init -q . &&
+  git -c user.email=tnt@teamthurber.com -c user.name=t commit -q --allow-empty -m init )
+printf '#!/usr/bin/env bash\n# installed by herdr-control install-git-hooks.sh\nexec bash /nonexistent/secret-scan-pre-commit.sh "$@"\n' \
+  > "$_sv_st/code/repo/.git/hooks/pre-commit"
+chmod +x "$_sv_st/code/repo/.git/hooks/pre-commit"
+CODE_ROOT="$_sv_st/code" HERDR_HOOK_DEPLOY_DIR="$_sv_st/deploy" bash "$INSTALLER" --apply >/dev/null 2>&1
+rm -f "$_sv_st/deploy/.rev"; mkdir -p "$_sv_st/deploy/.rev"
+CODE_ROOT="$_sv_st/code" HERDR_HOOK_DEPLOY_DIR="$_sv_st/deploy" bash "$INSTALLER" --apply >"$WORK/staged.txt" 2>&1
+printf 'x\n' > "$_sv_st/code/repo/s.txt"
+( cd "$_sv_st/code/repo" && git add s.txt &&
+  git -c user.email=tnt@teamthurber.com -c user.name=t commit -q -m staged ) 2>"$WORK/staged-err.txt" \
+  && ok "an unwritable record still leaves a STAGED one that verifies the live bytes" \
+  || bad "the fleet refused after a record write failed: $(head -3 "$WORK/staged-err.txt" | tr '\n' ' ')"
+rm -rf "$_sv_st/deploy/.rev"
 
 printf '== refusals ==\n'
 run --nonsense; rc=$?
