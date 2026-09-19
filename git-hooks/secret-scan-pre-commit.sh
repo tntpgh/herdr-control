@@ -554,6 +554,33 @@ PII_FOUND=0
 # relaxes the PII checks ONLY: the credential scan above walks every staged
 # file independently of $ADDED, so a token pasted here is still blocked
 # (proven on a real negative, 2026-09-06).
+#
+# tntpgh-dev's published VIDEO metadata (2026-09-16) is a NARROWER case and it
+# is deliberately NOT in the list above. `src/data/videos.json` is the team's
+# own YouTube channel listing — titles copied verbatim from videos already
+# public on YouTube — and the titles ARE street addresses, because the videos
+# are listing tours ("<number> <Street> <City> PA <ZIP> Tour" is the channel's
+# naming convention). `public/sitemap.xml` is generated from that same data at
+# prebuild, so the addresses reappear in its `video:title` elements on every
+# regeneration. Thousands of `/properties/*` URLs in that same sitemap already
+# carry the same street numbers (3,413 of 4,335 `<loc>` entries on
+# tntpgh-dev@origin/main, 2026-09-16, counted with
+# `xmllint --xpath 'count(//*[local-name()="loc" and contains(text(),"/properties/")])'`).
+#
+# But "this file is public output" does NOT establish that every future value
+# in it is safe to publish. A first draft of this change put both paths in
+# PII_EXCLUDES, which drops them from the whole PII input — and a real pre-push
+# probe then ALLOWED a third-party email in videos.json and a non-fiction phone
+# number in sitemap.xml. Two public-output paths had become general PII
+# bypasses (found in review, 2026-09-16). So the exemption is scoped to the
+# STREET-ADDRESS detector only; the phone and email detectors still read every
+# line of both files, and the credential scan above never consulted this list
+# at all.
+#
+# (No real address is written in this comment on purpose: the first draft of it
+# was itself blocked by the street check. A guard whose allowlist cannot be
+# committed is a guard that gets bypassed — same lesson as the
+# exclusion-pattern note further down.)
 # ONE exclusion list, used by both content sources (the index here, a pushed
 # commit in push mode). Two copies of a pathspec is how the modes come to
 # disagree about what counts as client PII.
@@ -566,6 +593,13 @@ PII_EXCLUDES=(
     ':(exclude)**/package-lock.json' ':(exclude)package-lock.json'
     ':(exclude)**/yarn.lock' ':(exclude)**/pnpm-lock.yaml'
 )
+# Paths exempt from the STREET-ADDRESS detector ONLY. Everything here is still
+# read by the phone and email detectors, and by the credential scan, which is
+# what keeps a public-output path from becoming a general PII bypass.
+ADDRESS_ONLY_EXCLUDES=(
+    ':(exclude)src/data/videos.json'
+    ':(exclude)public/sitemap.xml'
+)
 # The added lines to judge, per SOURCE. In push mode that is one call per
 # commit being sent, so a finding can name the commit to rewrite — the first
 # version concatenated every commit into one blob and could only say "a
@@ -576,15 +610,40 @@ PII_EXCLUDES=(
 # ever running a commit-creation hook. Only commits the remote does not
 # already have are in PUSH_COMMITS, so this cannot fire on published history
 # and become unbypassable.
-pii_added_for_commit() {        # <commit>
+pii_added_for_commit() {        # <commit> -> raw diff text; caller checks $?
     # --text for the same reason as scan_commit: a `-diff` attribute or a NUL
     # byte otherwise hides every added line from this half too.
-    git show "$1" --text -U0 --format= --diff-filter="$DIFF_FILTER" "${PII_EXCLUDES[@]}" 2>/dev/null \
-        | added_lines || true
+    #
+    # PR #87 re-review, 2026-09-16: this used to end `| added_lines || true`,
+    # which discarded `git show`'s own exit status and handed `added_lines`
+    # whatever partial/empty stdout it got — so a broken external diff driver
+    # (a `.gitattributes` entry naming a `diff.<x>.command` with no such
+    # binary) made `git show -U0` fail, and the pipeline still "succeeded"
+    # with an empty stream, which every detector below reads as "nothing
+    # added, nothing to block". No `| added_lines` here now: the caller reads
+    # this function's OWN exit status via `if raw=$(pii_added_for_commit …)`
+    # before piping to `added_lines`, so a diff failure is refused instead of
+    # silently scanning nothing.
+    git show "$1" --text -U0 --format= --diff-filter="$DIFF_FILTER" "${PII_EXCLUDES[@]}" 2>/dev/null
 }
-pii_added_for_index() {
-    git diff --cached -U0 --diff-filter="$DIFF_FILTER" "${PII_EXCLUDES[@]}" 2>/dev/null \
-        | added_lines || true
+pii_added_for_index() {         # -> raw diff text; caller checks $?
+    git diff --cached -U0 --diff-filter="$DIFF_FILTER" "${PII_EXCLUDES[@]}" 2>/dev/null
+}
+# The same two sources again, additionally dropping the address-only paths.
+# Only the street check reads these; see ADDRESS_ONLY_EXCLUDES above.
+#
+# Raw text, caller checks `$?` — NOT `| added_lines || true`. These arrived
+# with #87 carrying the very fail-open #91 removed from the two functions
+# above: `|| true` discards git's own exit status and hands `added_lines`
+# whatever partial stdout it got, so a broken external diff driver reads as
+# "no addresses added".
+addr_added_for_commit() {       # <commit> -> raw diff text; caller checks $?
+    git show "$1" --text -U0 --format= --diff-filter="$DIFF_FILTER" \
+        "${PII_EXCLUDES[@]}" "${ADDRESS_ONLY_EXCLUDES[@]}" 2>/dev/null
+}
+addr_added_for_index() {        # -> raw diff text; caller checks $?
+    git diff --cached -U0 --diff-filter="$DIFF_FILTER" \
+        "${PII_EXCLUDES[@]}" "${ADDRESS_ONLY_EXCLUDES[@]}" 2>/dev/null
 }
 # Lockfiles are excluded from the PII checks only. npm records each package
 # MAINTAINER's address (maintainer@example.com and friends), published metadata, not
@@ -606,22 +665,248 @@ pii_added_for_index() {
 # The street check below still carries its own marker workaround for the same
 # root cause. knowledge-base/scripts/scan_diff.py strips the marker and this did
 # not, which is how the two implementations came to disagree on one diff.
-check_pii() {                   # <label> <added text>
-    local label="$1" text="$2"
-    [[ -n "$text" ]] || return 0
-    # street address: <number> <Name> <suffix>, excluding the fixture words
-    if printf '%s\n' "$text" \
-       | grep -nE '[0-9]{2,5} [A-Z][a-z]+( [A-Z][a-z]+)? (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)\b' \
+# (Merge of #91's pipeline judging and #87's address-scoped text. Both halves
+# are load-bearing: judge_pipeline catches a stage that could not RUN, and the
+# third argument keeps the published-video path exemption scoped to the STREET
+# detector instead of dropping those paths from the whole PII input.)
+# Judges every stage of a `printf | extractor | grep -v… | grep -v…` pipeline
+# used by the street/phone detectors below, not just the last command bash's
+# own `if pipe; then` would look at. Found three times over on this branch:
+# a crashed extractor (awk on multibyte input) OR a mis-written exclusion
+# pattern (invalid ERE on the fleet's grep, exit 2+) both leave the FINAL
+# `grep -v` reading an empty/partial stream, which then legitimately exits 1
+# ("nothing survived") — and `pipefail` reports that rightmost nonzero 1, not
+# the real 2+ that caused it, so the failure is invisible to a bare `if`.
+# Looping every stage (not hand-listing "check index 1 and 3") is the actual
+# fix: a pipeline gaining a new stage later cannot silently go unjudged again.
+#
+# <strict-index> names the ONE stage (1-based, 0 is always printf and skipped)
+# that is an EXTRACTOR rather than a grep filter — awk has no "1 = nothing
+# matched" exit code of its own, so for that stage only 0 means "ran fine";
+# anything else means it did not finish, not "found nothing". Every other
+# non-final stage is a `grep -v` filter, where 0 or 1 are both legitimate
+# (something, or nothing, survived to feed the next stage) and anything else
+# is that stage's own pattern failing to run. The FINAL stage doubles as the
+# verdict: 0 there means a real value survived every exclusion.
+# Prints its own BLOCKED lines; caller does `if judge_pipeline …; then
+# PII_FOUND=1; fi`.
+judge_pipeline() {              # <label> <PII-class-name> <strict-index> <status0> <status1> ...
+    local label="$1" name="$2" strict="$3"; shift 3
+    local -a codes=("$@")
+    local last=$(( ${#codes[@]} - 1 ))
+    local i code blocked=1
+    for i in $(seq 1 "$last"); do
+        code="${codes[$i]}"
+        if [ "$i" -eq "$strict" ]; then
+            if [ "$code" -ne 0 ]; then
+                echo "BLOCKED: the $name scanner could not process $label (stage $i, exit $code) —" >&2
+                echo "  refusing to treat text an extractor could not finish scanning as clean." >&2
+                blocked=0
+            fi
+        elif [ "$i" -eq "$last" ]; then
+            if [ "$code" -eq 0 ]; then
+                echo "BLOCKED: a real-looking $name is being added in $label."
+                blocked=0
+            elif [ "$code" -gt 1 ]; then
+                echo "BLOCKED: grep failed while filtering $name candidates in $label (stage $i, exit $code) —" >&2
+                echo "  a scanner that cannot run its own pattern has not cleared this text." >&2
+                blocked=0
+            fi
+        elif [ "$code" -gt 1 ]; then
+            echo "BLOCKED: grep failed while filtering $name candidates in $label (stage $i, exit $code) —" >&2
+            echo "  a scanner that cannot run its own pattern has not cleared this text." >&2
+            blocked=0
+        fi
+    done
+    return "$blocked"
+}
+
+check_pii() {                   # <label> <added text> [<address-scoped text>]
+    # $2 feeds the phone and email detectors. $3 feeds the STREET detector and
+    # additionally drops ADDRESS_ONLY_EXCLUDES; it defaults to $2 so a caller
+    # that does not distinguish them keeps the stricter behaviour. Passing one
+    # text for both is what turned two public-output paths into general PII
+    # bypasses (found in review, 2026-09-16).
+    local label="$1" text="$2" addr_text="${3-$2}"
+    [[ -n "$text$addr_text" ]] || return 0
+    # street address: <number> <Name> <suffix>, excluding the fixture words.
+    #
+    # `([NSEW]\.? )?` closes a hole found 2026-09-16 while testing this very
+    # allowlist: a directional prefix is normal in US addresses and the
+    # pattern required a lowercase letter right after the number, so a real
+    # address of the form "<number> E <Name> St" was never detected at all.
+    # Restricted to the four directionals on purpose -- a bare `[A-Z]` there
+    # would start matching ordinary prose like "42 Bytes Read".
+    #
+    # Covenant Ave and the 226-4440 line are Vintage Skins' OWN published NAP
+    # -- Lisa's shop, a client business we build for, not a third party. Both
+    # are already tracked in vintageskins/seo/src/schema/organization.js, are
+    # printed on the storefront, in the Organization schema and in Merchant
+    # Center, and the phone is a Twilio IVR number, never her mobile. Same
+    # principle as the Wexford office below and the vintageskins.com email
+    # carve-out further down: a business's own published identity is not
+    # client PII, and blocking it only teaches people to bypass the guard on
+    # ordinary branding work.
+    #
+    # The Suite 200, Wexford PA 15090 office is OUR OWN. It is the canonical
+    # NAP, already tracked in tntpgh-dev/src/config/codex/identity.ts and
+    # docs/nap-canonical.md, printed on every piece of public marketing, and
+    # the brokerage identification is REQUIRED on licensee advertising by
+    # 49 Pa. Code 35.305(c) -- a branded PDF cannot be built without it. Same
+    # principle as the teamthurber.com email carve-out below: our own published
+    # business identity is not client PII, and blocking it only teaches
+    # --no-verify on ordinary branding work.
+    #
+    # NOTE the exclusion pattern below starts at the digit, with NO leading
+    # \b. It used to have one, and that made this very line unpublishable: the
+    # detector matched the address inside the pattern text, while the exclusion
+    # did not, because in source the escape `\b` puts a literal `b` against the
+    # digits and kills the word boundary. A guard whose allowlist cannot be
+    # committed is a guard that gets bypassed.
+    # PR #88 review, 2026-09-16: `grep -nE` printed the whole matching LINE,
+    # and each `grep -viE` exclusion then discarded that whole line — a
+    # third-party address sharing a line with one of our own allowlisted
+    # values laundered through untouched. `grep -oE` instead extracts one
+    # street-address OCCURRENCE per match, so each is excluded on its own.
+    # The two business-address exclusions are now anchored `^...$` against
+    # that single occurrence rather than matched as an unanchored substring:
+    # the old form let a LARGER house number containing an allowlisted
+    # suffix (one extra leading digit) match the exclusion too, because it
+    # only required the occurrence to CONTAIN the allowlisted text, never to
+    # EQUAL it. The numeric-near-match exclusion below drops the old
+    # `\+?[0-9]*:?\+?` prefix, which existed only to skip the `N:` line
+    # number `-n` used to add; `-o` never adds one.
+    #
+    # `judge_pipeline` (above) checks every stage's own exit status, not just
+    # this `if`'s last command: an invalid ERE in any exclusion below would
+    # otherwise make that stage exit 2+, hand the rest of the pipe an
+    # empty/partial stream, and the final `grep -vE` would legitimately exit 1
+    # ("nothing survived") — which reads as clean while the real failure is
+    # invisible. `0` for <strict-index>: every stage here is a grep filter,
+    # none is an extractor with awk's different exit semantics. `0` works as
+    # "no strict stage" specifically because `judge_pipeline`'s loop starts
+    # at `i=1` and stage 0 is always `printf` — it can never equal a real
+    # stage index. Do NOT "fix" this to `1`: that would make stage 1 (the
+    # `grep -oE` extractor's own legitimate "no address found at all", exit 1)
+    # get judged as if it must be exactly 0, and a clean commit with no street
+    # address anywhere would block on every commit.
+    #
+    # The deployment-order deferral that used to sit here is RESOLVED, not
+    # waived: the allowlist entries are assembled at runtime below, so editing
+    # them no longer requires a machine whose deployed scanner already carries
+    # them, and the four suite fixtures it had forced out are restored.
+    # THE ALLOWLIST ENTRIES ARE ASSEMBLED AT RUNTIME, and that is not style.
+    # Spelled out contiguously, these two lines are themselves real-looking
+    # addresses, so the FILE could only be committed on a machine whose
+    # DEPLOYED scanner already carried them — i.e. after this branch merged and
+    # was redeployed. Editing them before that point blocked the very commit
+    # that adds them (reproduced 2026-09-18, with the deployed hook restored to
+    # main's bytes), and four suite fixtures had already been commented out for
+    # the same reason. Concatenating the halves at runtime removes the
+    # deployment-order trap permanently: the detector cannot match
+    # `2100 Corpo""rate Dr`, and the pattern is identical once the shell joins
+    # it. Same lesson as the `\b` note above — a guard whose allowlist cannot
+    # be committed is a guard that gets bypassed.
+    _own_office="2100 Corpo""rate Dr(ive)?"
+    _own_shop="8878 Cove""nant Ave(nue)?"
+    set +e +o pipefail
+    # `$addr_text`, not `$text`: the published-video path exemption is scoped
+    # to THIS detector (#87). The phone and email detectors below still read
+    # every line of those files.
+    printf '%s\n' "$addr_text" \
+       | grep -oE '[0-9]{2,5} ([NSEW]\.? )?[A-Z][a-z]+( [A-Z][a-z]+)? (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)\b' \
        | grep -viE '\b(Main|Elm|Oak|Test|Example|Fake|Sample|Anywhere|Nowhere|Maple|Pine|First|Second|Foo|Bar)\b' \
-       | grep -vE '^\+?[0-9]*:?\+?(123|456|789|1234|100|111|999) ' >/dev/null; then
-        echo "BLOCKED: a real-looking STREET ADDRESS is being added in $label."
+       | grep -viE "(^|[^0-9])$_own_office\b" \
+       | grep -viE "(^|[^0-9])$_own_shop\b" \
+       | grep -vE '^(123|456|789|1234|100|111|999) ' >/dev/null
+    _pst=("${PIPESTATUS[@]}")
+    set -e -o pipefail
+    if judge_pipeline "$label" "STREET ADDRESS" 0 "${_pst[@]}"; then
         PII_FOUND=1
     fi
-    # phone: not the 555-01xx fiction range
-    if printf '%s\n' "$text" \
-       | grep -E '(\+?1[-. ]?)?\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}' \
-       | grep -vE '555[-. ]?01[0-9][0-9]' >/dev/null; then
-        echo "BLOCKED: a real-looking PHONE NUMBER is being added in $label."
+    # phone: not the 555-01xx fiction range, and not one of OUR OWN published
+    # business lines. The three team numbers are the canonical NAP
+    # (docs/nap-canonical.md: team, Terrence direct, broker office) and the
+    # broker office line is legally required on licensee advertising by
+    # 49 Pa. Code 35.305(c). The 367-5860 line is West Penn Multi-List's
+    # published switchboard -- a trade body whose number has to be quotable
+    # when documenting an MLS rule or a verification route.
+    #
+    # The `(^|[^0-9])` / `([^0-9]|$)` anchors are a FALSE-POSITIVE fix, not a
+    # relaxation: the pattern otherwise matched INSIDE a longer digit run, so
+    # the Springer DOI `s11146-013-9424-1` parsed as a phone number and blocked
+    # a commit whose only offence was citing a peer-reviewed paper
+    # (2026-09-16). A real phone is always bounded by a non-digit, and the
+    # separator requirement is unchanged, so a bare 10-digit run still never
+    # matched. The offending substring is deliberately NOT written out here --
+    # spelling it in a comment re-trips the detector on this file.
+    # PR #88 review, 2026-09-16: both boundaries above sat INSIDE the `-o`
+    # match, so `grep -o`'s non-overlapping scan consumed the one separator
+    # between two adjacent numbers along with the first candidate — scanning
+    # resumed at the second number's first digit, where a leading boundary
+    # can never match, so the second number was never EXTRACTED at all, not
+    # merely allowlisted. Reproduced for every one-character separator with
+    # the business number first; the reverse order was never affected, which
+    # is what made it read as a slash-specific quirk rather than a boundary-
+    # consumption bug. Replaced with an awk scanner that tries a match at
+    # EVERY start position and checks the character immediately before/after
+    # with `substr`, never consuming it — so two real numbers may legitimately
+    # share one separator character and both still get extracted, while the
+    # DOI false-positive above still cannot: its digit run has a digit on
+    # both sides of the only place the 3-3-4 shape lines up.
+    # A second fail-open, found immediately after the first: `if printf … |
+    # awk … | grep -vE … | grep -vE … >/dev/null; then` only tests the LAST
+    # command's exit status. `awk` (BWK awk on this fleet) decodes `length`/
+    # `substr` through the process locale, and en_US.UTF-8 — the default here
+    # — makes it die with `towc: multibyte conversion failure` the instant it
+    # meets ANY multibyte byte anywhere in $text, including in this hook's OWN
+    # em-dash-heavy comments a few lines above a real phone number. A dead awk
+    # prints nothing, the two `grep -v`s see an empty stream and find nothing
+    # to exclude, and the `if` reads "clean" — the exact shape finding 3 was
+    # opened to close, reintroduced one stage downstream of the diff read.
+    # Same guard as the credential loop above (`_st=("${PIPESTATUS[@]}")`),
+    # and the SAME `judge_pipeline` the street check above now uses, not a
+    # third convention: hand-checking just index 1 (awk) and index 3 (the
+    # last grep) left index 2 — the first exclusion grep — unjudged. If IT
+    # exits 2+ its output is empty, stage 3 then sees nothing and legitimately
+    # exits 1 ("nothing survived"), and pipefail reports that rightmost
+    # nonzero 1 — clean — while the real 2+ that caused it is invisible.
+    # `judge_pipeline` loops every stage so a future one added here cannot go
+    # unjudged the same way. `1` for <strict-index>: stage 1 is the awk
+    # extractor, which has no "1 = nothing matched" exit code of its own —
+    # only 0 means it ran to completion.
+    #
+    # This pattern only ever matches ASCII digits and punctuation, so
+    # `LC_ALL=C` (byte-oriented, no towc decoding) is the CORRECT scan, not a
+    # workaround: no multibyte byte can be one of `[0-9]`, so byte-wise
+    # scanning cannot skip a real phone number. Verified: the awk rewrite
+    # above (needed because `grep -o`'s non-overlapping scan cannot do a
+    # non-consuming boundary check, which IS the separator bug) carried this
+    # new fail-open in with it — the pre-awk `grep -oE` phone extractor never
+    # had a multibyte problem, `grep` decodes it without crashing. Caught by
+    # measuring the rewrite against an em-dash fixture before commit, not by
+    # reading the diff: default-locale awk exit 2, zero output, zero BLOCKED
+    # lines, on a line carrying a real phone number one line below this
+    # hook's own em-dash-heavy prose.
+    set +e +o pipefail
+    printf '%s\n' "$text" \
+        | LC_ALL=C awk '{
+            line = $0; n = length(line)
+            for (i = 1; i <= n; i++) {
+                rest = substr(line, i)
+                if (match(rest, /^(\+?1[-. ]?)?\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}/)) {
+                    before_ok = (i == 1) || (substr(line, i - 1, 1) !~ /[0-9]/)
+                    after = i + RLENGTH
+                    after_ok = (after > n) || (substr(line, after, 1) !~ /[0-9]/)
+                    if (before_ok && after_ok) print substr(rest, 1, RLENGTH)
+                }
+            }
+        }' \
+        | grep -vE '555[-. ]?01[0-9][0-9]' \
+        | grep -vE '\(?(412\)? ?[-. ]?(844[-. ]5536|900[-. ]2243|367[-. ]5860|226[-. ]4440)|724\)? ?[-. ]?934[-. ]3400)' >/dev/null
+    _pst=("${PIPESTATUS[@]}")
+    set -e -o pipefail
+    if judge_pipeline "$label" "PHONE NUMBER" 1 "${_pst[@]}"; then
         PII_FOUND=1
     fi
     # email: not a reserved/example domain, and not our own team domain
@@ -659,11 +944,46 @@ check_pii() {                   # <label> <added text>
 
 if [[ "$SCAN_MODE" == push ]]; then
     for _c in $PUSH_COMMITS; do
-        check_pii "commit $(git log -1 --format='%h %s' "$_c" 2>/dev/null || echo "$_c")" \
-                  "$(pii_added_for_commit "$_c")"
+        # Same fail-closed shape as scan_commit's own `git show` above: check
+        # each diff's exit status HERE, at the top level, not inside a
+        # `$(…)` used purely for its stdout — `exit 1` inside that command
+        # substitution would only kill the subshell and the push would sail
+        # through with an empty PII text.
+        #
+        # BOTH diffs are checked. #87 added the address-scoped one, and a
+        # broken diff driver there would silently produce "no addresses".
+        if ! _pii_raw=$(pii_added_for_commit "$_c"); then
+            refuse_push "could not compute the diff for commit $_c to check for client PII." \
+                        "A broken external diff driver (.gitattributes) can cause this; run 'git show $_c --text -U0' to see why."
+        elif ! _addr_raw=$(addr_added_for_commit "$_c"); then
+            refuse_push "could not compute the address-scoped diff for commit $_c." \
+                        "A broken external diff driver (.gitattributes) can cause this; run 'git show $_c --text -U0' to see why."
+        else
+            check_pii "commit $(git log -1 --format='%h %s' "$_c" 2>/dev/null || echo "$_c")" \
+                      "$(printf '%s' "$_pii_raw" | added_lines || true)" \
+                      "$(printf '%s' "$_addr_raw" | added_lines || true)"
+        fi
     done
 else
-    check_pii "the staged changes" "$(pii_added_for_index)"
+    if ! _pii_raw=$(pii_added_for_index); then
+        _pii_rc=$?
+        echo "BLOCKED: could not compute the diff for the staged changes (git diff exit $_pii_rc)." >&2
+        echo "  A broken external diff driver (a .gitattributes 'diff=' entry naming a" >&2
+        echo "  missing tool) can cause this. Refusing to treat an unreadable diff as clean" >&2
+        echo "  — every PII check below depends on this same diff." >&2
+        echo "  Try: git diff --cached -U0   (to see the underlying failure)" >&2
+        exit 1
+    elif ! _addr_raw=$(addr_added_for_index); then
+        _pii_rc=$?
+        echo "BLOCKED: could not compute the address-scoped diff for the staged changes (git diff exit $_pii_rc)." >&2
+        echo "  Refusing to treat an unreadable diff as clean — the street check depends on it." >&2
+        echo "  Try: git diff --cached -U0   (to see the underlying failure)" >&2
+        exit 1
+    else
+        check_pii "the staged changes" \
+                  "$(printf '%s' "$_pii_raw" | added_lines || true)" \
+                  "$(printf '%s' "$_addr_raw" | added_lines || true)"
+    fi
 fi
 
 # One verdict per mode, so the advice matches what the operator can actually
