@@ -219,12 +219,26 @@ _rl --dry-run >/dev/null 2>&1 \
   && ok "--dry-run is exempt: reading what it WOULD run is how you decide" \
   || bad "dry-run refused, so the space cannot be reviewed before approving"
 
-_rl --trust >"$WORK/rl-trust.txt" 2>&1; rc=$?
-[ "$rc" -eq 0 ] && ok "--trust approves the repo space" || bad "--trust failed: $(cat "$WORK/rl-trust.txt")"
+# `--trust` requires a typed YES, as quick-action.sh's does: printing the
+# commands and approving in the same breath leaves no point at which to
+# decline.
+printf 'no\n' | _rl --trust >"$WORK/rl-decline.txt" 2>&1; rc=$?
+[ "$rc" -ne 0 ] && ok "--trust DECLINED by anything other than YES" \
+  || bad "approved without confirmation: $(cat "$WORK/rl-decline.txt")"
+_rl >/dev/null 2>&1 && bad "a declined space still opened" \
+  || ok "and a declined space is still refused"
+
+printf 'YES\n' | _rl --trust >"$WORK/rl-trust.txt" 2>&1; rc=$?
+[ "$rc" -eq 0 ] && ok "--trust approves the repo space on YES" || bad "--trust failed: $(cat "$WORK/rl-trust.txt")"
 grep -q 'echo hello-from-the-repo' "$WORK/rl-trust.txt" \
   && ok "approval PRINTS the commands being approved" \
   || bad "approved without showing what runs: $(cat "$WORK/rl-trust.txt")"
-_rl --dry-run >/dev/null 2>&1 && ok "and it resolves after approval" || bad "still refused after --trust"
+# A REAL open, not `--dry-run`: dry-run is the one invocation the gate exempts,
+# so asserting it here could never fail for the reason the label claims — it
+# passed with an empty trust DB (found in review of this PR).
+_rl >"$WORK/rl-opened.txt" 2>&1 \
+  && ok "and it OPENS after approval (not just resolves)" \
+  || bad "still refused after --trust: $(cat "$WORK/rl-opened.txt")"
 
 # Hash-keyed, so editing an approved file revokes it. This is the property that
 # makes approving once safe: it approves CONTENT, not a filename.
@@ -243,6 +257,72 @@ NOSPACE="$WORK/nospace"; mkdir -p "$NOSPACE"; git init -q "$NOSPACE"
 [ "$rc" -ne 0 ] && grep -q 'usage:' "$WORK/rl-none.txt" \
   && ok "a repo with no space still prints usage rather than guessing" \
   || bad "unexpected behaviour with no space and no name: $(cat "$WORK/rl-none.txt")"
+
+printf '== open-project.sh: a repo space cannot forge the space TABLE or the tier ==\n'
+# `list_projects` is TAB-separated and, for the repo tier, its name and
+# description arrive with a `git pull`. A description carrying a tab and a
+# newline injected an extra row whose FILE field was any path the attacker
+# chose; because the gate compared that path against $REPO_FILE, the forged
+# row skipped the gate and its commands RAN — zero arguments, empty trust DB
+# (found in review of this PR, with a real file created as proof).
+INJ="$WORK/inject"; mkdir -p "$INJ/.herdr-control" "$INJ/elsewhere"; git init -q "$INJ"
+PWNED="$WORK/PWNED-marker"
+cat > "$INJ/elsewhere/evil.json" <<EOF
+{"name":"inject","description":"forged","working_dir":".",
+ "tabs":[{"label":"work","panes":[{"cmd":"touch $PWNED"}]}]}
+EOF
+# name stays clean so the cwd default picks it; the description forges a row.
+python3 - "$INJ/.herdr-control/project.json" "$INJ/elsewhere/evil.json" <<'PY'
+import json, sys
+out, evil = sys.argv[1], sys.argv[2]
+desc = "safe\trepo\tforged\t%s\ninject" % evil
+json.dump({"name": "inject", "description": desc, "working_dir": ".",
+           "tabs": [{"label": "work", "panes": [{"cmd": "echo real"}]}]}, open(out, "w"))
+PY
+_inj() { ( cd "$INJ" && XDG_STATE_HOME="$TRUSTDIR" XDG_CONFIG_HOME="$PERSONAL" \
+             bash "$here/open-project.sh" "$@" ) ; }
+_inj >"$WORK/inj.txt" 2>&1; rc=$?
+[ ! -e "$PWNED" ] \
+  && ok "a forged row cannot execute a file outside the tier" \
+  || bad "INJECTION EXECUTED: $PWNED exists — the trust gate was skipped"
+[ "$rc" -ne 0 ] \
+  && ok "and the injected space is refused rather than opened" \
+  || bad "opened an injected space (rc=$rc): $(cat "$WORK/inj.txt")"
+# The same table, via the unknown-name path rather than `--pick`: fzf opens a
+# TTY even with stdin redirected, so invoking it here hangs the suite.
+_inj no-such-space >"$WORK/inj-list.txt" 2>&1 || true
+if grep -q 'forged' "$WORK/inj-list.txt"; then
+  bad "forged row rendered in the listing: $(cat "$WORK/inj-list.txt")"
+else
+  ok "and the forged text does not reach the listing operators read"
+fi
+
+printf '== open-project.sh: a repo space runs from the REPO ROOT, not your cwd ==\n'
+# The tier is discovered from the root but `project_open` resolves
+# `working_dir` against the cwd, so `"working_dir": "."` meant a different
+# directory in every subdirectory — and what "." resolved to was never
+# covered by the content hash. Asserted on the herdr LOG, because that is
+# where the resolved directory actually reaches the tool.
+SUB="$WORK/subdir"; mkdir -p "$SUB/.herdr-control" "$SUB/deep/deeper"; git init -q "$SUB"
+cat > "$SUB/.herdr-control/project.json" <<'EOF'
+{"name":"subspace","description":"cwd anchoring","working_dir":".",
+ "tabs":[{"label":"work","panes":[{"cmd":"echo hi"}]}]}
+EOF
+printf 'YES\n' | ( cd "$SUB" && XDG_STATE_HOME="$TRUSTDIR" XDG_CONFIG_HOME="$PERSONAL" \
+    bash "$here/open-project.sh" --trust ) >/dev/null 2>&1
+: > "$HERDR_LOG"
+( cd "$SUB/deep/deeper" && XDG_STATE_HOME="$TRUSTDIR" XDG_CONFIG_HOME="$PERSONAL" \
+    bash "$here/open-project.sh" ) >"$WORK/sub.txt" 2>&1
+if grep -q "deep/deeper" "$HERDR_LOG"; then
+  bad "the space ran in the invoking subdirectory: $(grep -o '[^ ]*deep/deeper[^ ]*' "$HERDR_LOG" | head -1)"
+else
+  ok "invoked from a subdirectory, the space does not run in that subdirectory"
+fi
+if grep -qF "$SUB" "$HERDR_LOG"; then
+  ok "and the repo root is what reaches herdr as the working directory"
+else
+  bad "no repo-root cwd reached herdr: $(head -3 "$HERDR_LOG")"
+fi
 
 
 printf '\n%s\n' "-----"

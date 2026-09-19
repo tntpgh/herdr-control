@@ -62,7 +62,21 @@ WORKDIR="$PWD"
 LOCAL_DIR="$WORKDIR/.herdr-control/quick-actions"
 # The trust gate moved to lib/trust.sh when the repo-local project tier
 # needed the same approval store; same keying, same file.
-here=$(cd "$(dirname "$0")" && pwd)
+#
+# $0 is resolved through SYMLINKS, because README documents installing these
+# on PATH with `ln -s "$PWD"/*.sh ~/.local/bin/`. Invoked through that link,
+# a plain `dirname "$0"` points at ~/.local/bin, the source fails, and both
+# trust functions are simply undefined — the gate disappears rather than
+# refusing (found in review of the extraction).
+_self="$0"
+while [ -L "$_self" ]; do
+  _link=$(readlink "$_self")
+  case "$_link" in
+    /*) _self="$_link" ;;
+    *)  _self="$(dirname "$_self")/$_link" ;;
+  esac
+done
+here=$(cd "$(dirname "$_self")" && pwd)
 . "$here/lib/trust.sh"
 
 list_actions() {  # -> "<name>\t<scope>\t<file>" per line, LOCAL first (it can override GLOBAL)
