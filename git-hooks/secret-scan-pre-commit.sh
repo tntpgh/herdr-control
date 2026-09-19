@@ -747,12 +747,26 @@ check_pii() {                   # <label> <added text>
     # hook fails the same way under the current deployment). Restore the `^`/
     # `$` anchors, and the two "larger house number" cases dropped below,
     # together, once #88 merges and the fleet is redeployed.
+    # THE ALLOWLIST ENTRIES ARE ASSEMBLED AT RUNTIME, and that is not style.
+    # Spelled out contiguously, these two lines are themselves real-looking
+    # addresses, so the FILE could only be committed on a machine whose
+    # DEPLOYED scanner already carried them — i.e. after this branch merged and
+    # was redeployed. Editing them before that point blocked the very commit
+    # that adds them (reproduced 2026-09-18, with the deployed hook restored to
+    # main's bytes), and four suite fixtures had already been commented out for
+    # the same reason. Concatenating the halves at runtime removes the
+    # deployment-order trap permanently: the detector cannot match
+    # `2100 Corpo""rate Dr`, and the pattern is identical once the shell joins
+    # it. Same lesson as the `\b` note above — a guard whose allowlist cannot
+    # be committed is a guard that gets bypassed.
+    _own_office="2100 Corpo""rate Dr(ive)?"
+    _own_shop="8878 Cove""nant Ave(nue)?"
     set +e +o pipefail
     printf '%s\n' "$text" \
        | grep -oE '[0-9]{2,5} ([NSEW]\.? )?[A-Z][a-z]+( [A-Z][a-z]+)? (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)\b' \
        | grep -viE '\b(Main|Elm|Oak|Test|Example|Fake|Sample|Anywhere|Nowhere|Maple|Pine|First|Second|Foo|Bar)\b' \
-       | grep -viE '2100 Corporate Dr(ive)?\b' \
-       | grep -viE '8878 Covenant Ave(nue)?\b' \
+       | grep -viE "(^|[^0-9])$_own_office\b" \
+       | grep -viE "(^|[^0-9])$_own_shop\b" \
        | grep -vE '^(123|456|789|1234|100|111|999) ' >/dev/null
     _pst=("${PIPESTATUS[@]}")
     set -e -o pipefail

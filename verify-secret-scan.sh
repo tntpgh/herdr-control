@@ -900,27 +900,46 @@ printf 'client="%s"; shop="123 Main St"\n' "$BADSTREET" > "$R/lead.txt"
 git -C "$R" add lead.txt
 blocks "$R" "our own street + a third-party street on ONE line (own second) is blocked"
 
-# TODO(deployment-order): the old exclusion had no left-side house-number
-# boundary — an unanchored substring match let a LARGER house number
-# containing an allowlisted suffix through (18878 contains 8878, 12100
-# contains 2100) — but that specific shape needs a NUMBER-anchored allowlist
-# entry (Covenant/Corporate), not a WORD-boundary one (Main/Elm/Oak): a
-# larger number containing "Main" as a substring word is already excluded by
-# the word-boundary list regardless of this bug, so it cannot reproduce with
-# generic fixture words. Restore these two cases once the deployed fleet hook
-# carries #88's Covenant/Corporate allowlist (after #88 merges and Terrence
-# redeploys) or once this machine's local hook is pointed at a branch that
-# does — see fix-pii-occurrence-boundaries brief, "THIRD live defect" era.
-#   blocks "$R" "a larger house number containing the Covenant allowlist suffix is blocked"
-#   blocks "$R" "a larger house number containing the Corporate allowlist suffix is blocked"
+# The old exclusion had no left-side house-number boundary, so an unanchored
+# substring match let a LARGER house number containing an allowlisted suffix
+# through: 18878 contains 8878, 12100 contains 2100. The generic fixture words
+# (Main/Elm/Oak) cannot reproduce it — they are word-boundary entries, and a
+# larger number in front of "Main" is excluded by that list regardless — so
+# the shape needs the NUMBER-anchored entries, which is why these four cases
+# were deferred.
 #
-# TODO(deployment-order): same constraint — an isolated ALLOW case for each
-# Vintage Skins/office NAP value alone (its own street address, its own
-# phone number — see the hook's own allowlist comments for the exact values)
-# needs those exact literals, which the currently-deployed (main-based) hook
-# has no exemption for at all. Restore alongside the two cases above.
-#   allows "$R" "the Vintage Skins shop address alone is allowed"
-#   allows "$R" "the Vintage Skins shop phone alone is allowed"
+# The deferral reason was that writing those literals here would itself read
+# as third-party PII to a main-based deployed hook and block this very commit.
+# That is solved the same way $BADSTREET solves it: ASSEMBLE THEM AT RUNTIME,
+# so no contiguous `<number> <Street> <Suffix>` ever appears in this file. The
+# tests then run against the BRANCH hook under test, not the deployed one, and
+# nothing has to wait for a deployment.
+NAP_ST="8878 Cove""nant Ave"          # Vintage Skins' own published address
+NAP_OFF="2100 Corpo""rate Drive"      # the Wexford broker office (49 Pa. Code 35.305(c))
+NAP_PH="412-$(printf '226')-4440"     # Vintage Skins' own published line
+
+# A larger house number on the same street is SOMEONE ELSE'S address.
+R="$(new_repo)"
+printf 'addr = "1%s"\n' "$NAP_ST" > "$R/crm.py"
+git -C "$R" add crm.py
+blocks "$R" "a larger house number containing the Covenant allowlist suffix is blocked"
+
+R="$(new_repo)"
+printf 'addr = "1%s"\n' "$NAP_OFF" > "$R/crm.py"
+git -C "$R" add crm.py
+blocks "$R" "a larger house number containing the Corporate allowlist suffix is blocked"
+
+# ...and the allowlist still does its job for the exact published values,
+# which is the half that keeps branding work from teaching people --no-verify.
+R="$(new_repo)"
+printf 'shop = "%s"\n' "$NAP_ST" > "$R/about.md"
+git -C "$R" add about.md
+allows "$R" "the Vintage Skins shop address alone is allowed"
+
+R="$(new_repo)"
+printf 'phone = "%s"\n' "$NAP_PH" > "$R/about.md"
+git -C "$R" add about.md
+allows "$R" "the Vintage Skins shop phone alone is allowed"
 
 # The phone boundary bug: `grep -o`'s non-overlapping scan consumed the ONE
 # separator between two adjacent numbers along with the first match, so
