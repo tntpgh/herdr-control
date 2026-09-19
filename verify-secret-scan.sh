@@ -442,6 +442,77 @@ printf 'addr = "%s"\n' "$BADSTREET" > "$R/crm.py"
 git -C "$R" add crm.py
 blocks "$R" "a real-looking street address is blocked"
 
+printf '== STREET ADDRESS: already on the deployed trunk vs genuinely new ==\n'
+# The other street exclusions are ENUMERATED (fixture words, two own-NAP
+# entries), so every legitimate case needs the list extended by hand — and
+# until it is, the guard blocks honest work, which is how people learn to
+# route around it. #87 covered generated pipeline output by PATH. This covers
+# what no path list anticipates (a blog post quoting a listing, a CMA, a press
+# pitch) by asking whether the VALUE is already public.
+#
+# `new_repo` has no `origin`, so nothing is published there: that is the
+# negative case and it must still block. The positive case needs a real bare
+# upstream carrying the address, which is what the second repo builds — a stub
+# would not exercise the `git grep <ref>` path the rule actually uses.
+TRUNK_NUM=4821; TRUNK_ST="Pine""hurst"; TRUNK_SUF=Dr
+TRUNK_ADDR="$TRUNK_NUM $TRUNK_ST $TRUNK_SUF"
+OTHER_ADDR="1140 $(printf 'Rosslyn') Ave"
+
+R="$(new_repo)"
+printf 'addr = "%s"\n' "$OTHER_ADDR" > "$R/crm.py"
+git -C "$R" add crm.py
+blocks "$R" "an address on no published trunk is blocked"
+
+R="$(new_repo)"
+UP="$(mktemp -d)/upstream.git"
+git init -q --bare "$UP"
+printf 'listings = ["%s"]\n' "$TRUNK_ADDR" > "$R/listings.py"
+git -C "$R" add listings.py
+git -C "$R" -c user.email="$WANT_EMAIL" -c user.name=t commit -q --no-verify -m 'published listing data'
+git -C "$R" remote add origin "$UP"
+git -C "$R" push -q origin HEAD:refs/heads/main
+git -C "$R" fetch -q origin
+printf 'title = "%s, Pittsburgh PA"\n' "$TRUNK_ADDR" > "$R/post.md"
+git -C "$R" add post.md
+allows "$R" "an address already on origin/main is allowed"
+
+# The trunk spells the suffix out where the commit abbreviates it.
+printf 'title = "%s %s Drive"\n' "$TRUNK_NUM" "$TRUNK_ST" > "$R/post.md"
+git -C "$R" add post.md
+allows "$R" "a suffix spelling difference still matches the trunk"
+
+# Case, too. The detector and the own-NAP exclusions are both
+# case-insensitive, and any asymmetry between the halves of an exemption is
+# where bypasses live — so the trunk lookup matches the same way. Without
+# this row the `-i` can be dropped and nothing fails.
+printf 'TITLE = "%s %s DR"\n' "$TRUNK_NUM" "$(printf '%s' "$TRUNK_ST" | tr '[:lower:]' '[:upper:]')" > "$R/post.md"
+git -C "$R" add post.md
+allows "$R" "a case difference still matches the trunk"
+
+# ...and a DIFFERENT address still blocks in that same repo, which is what
+# proves the allowance is per-ADDRESS and not a per-repo switch.
+printf 'title = "%s"\n' "$OTHER_ADDR" > "$R/post.md"
+git -C "$R" add post.md
+blocks "$R" "a different, unpublished address still blocks in that repo"
+
+# The baseline is the REMOTE trunk. A local commit must not be able to approve
+# its own address: HEAD contains it, origin/main does not.
+R="$(new_repo)"
+UP2="$(mktemp -d)/upstream2.git"
+git init -q --bare "$UP2"
+printf 'seed = 1\n' > "$R/seed.py"
+git -C "$R" add seed.py
+git -C "$R" -c user.email="$WANT_EMAIL" -c user.name=t commit -q --no-verify -m seed
+git -C "$R" remote add origin "$UP2"
+git -C "$R" push -q origin HEAD:refs/heads/main
+git -C "$R" fetch -q origin
+printf 'addr = "%s"\n' "$OTHER_ADDR" > "$R/local.py"
+git -C "$R" add local.py
+git -C "$R" -c user.email="$WANT_EMAIL" -c user.name=t commit -q --no-verify -m 'local only'
+printf 'again = "%s"\n' "$OTHER_ADDR" > "$R/again.py"
+git -C "$R" add again.py
+blocks "$R" "an address in LOCAL history only does not approve itself"
+
 printf '== NON-UTF8 BYTES: a binary-ish staged file must not blind the scan ==\n'
 # `git show | grep` on a file holding an invalid UTF-8 byte is where a scanner
 # quietly stops matching (grep declaring the stream binary, or failing outright
