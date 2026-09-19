@@ -341,18 +341,56 @@ or via an `fzf` browser (`--pick`).
 project only adds the envelope (`name`/`description`/`working_dir`) and a
 list of tabs, opening one tab per entry via `lib/project.sh`'s `project_open`.
 
-Two tiers, shown together, resolved by name — see
+Three tiers, shown together, resolved by name — most specific first. See
 [Private vs. public](#private-vs-public) below for the full convention:
 
-1. **personal** — `${XDG_CONFIG_HOME:-~/.config}/herdr-control/projects/*.json`.
+1. **repo** — `<repo-root>/.herdr-control/project.json`, committed beside the
+   code it describes and found from your current directory. This is the tier
+   to use for PER-REPO START RULES: a fresh clone carries its own tabs, panes
+   and startup commands, and nothing has to be hand-copied per machine. Wins
+   any name collision, because the repo you are standing in is the most
+   specific answer to "which space". Requires approval — see below.
+2. **personal** — `${XDG_CONFIG_HOME:-~/.config}/herdr-control/projects/*.json`.
    YOUR real projects, real paths, real descriptions. Not tracked by this
-   repo. Wins on a name collision with a shipped example.
-2. **example** — `projects/*.json` in this repo, tracked. GENERIC patterns
+   repo. Wins a collision with a shipped example.
+3. **example** — `projects/*.json` in this repo, tracked. GENERIC patterns
    (`example-sentinel.json`: agent + an always-visible sentinel;
    `example-ci-gate.json`: agent + a one-shot check on open; `herdr-control.json`:
    this repo dogfooding itself) with placeholder `working_dir`s
    (`~/Code/your-project`) — copy one into your personal tier and edit it,
    don't run it verbatim.
+
+#### Per-repo start rules, end to end
+
+```bash
+cd ~/Code/some-repo
+cat > .herdr-control/project.json <<'JSON'
+{ "name": "some-repo", "description": "agent lane + the checks I always want",
+  "working_dir": ".",
+  "tabs": [ { "label": "agent",
+              "panes": [ {"cmd": "omp", "focus": true},
+                         {"split": "down", "cmd": "git status --short --branch"} ] } ] }
+JSON
+
+./open-project.sh --dry-run          # no name: the repo you stand in IS the space
+./open-project.sh --trust            # prints the commands, then approves them
+./open-project.sh                    # opens it
+```
+
+The name is optional from inside the repo — that is the point of the tier. It
+is still accepted, and is the only way to open a space for somewhere you are
+not (`./open-project.sh other-repo`).
+
+**Approval, and why refusal rather than a warning.** A repo-local space
+carries pane startup COMMANDS, so it is shell that arrived with a `git pull`
+from a branch anyone could have pushed — the same trust problem as a
+repo-local quick action, and it uses the same store (`lib/trust.sh`, shared by
+both since this tier shipped). Approval is keyed by (path, sha256 of content),
+so EDITING an approved space revokes it and the next run asks again. An
+unapproved space is refused, not warned: the commands run the moment the
+workspace opens, so a warning has no later moment at which it could be acted
+on. `--dry-run` is deliberately exempt, because reading what a space would run
+is how you decide whether to approve it.
 
 **Known gap vs. what inspired this** (see Credits): a fresh workspace's own
 auto-created root tab is left empty rather than reused by the project's first

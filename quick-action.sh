@@ -60,31 +60,24 @@ set -uo pipefail
 GLOBAL_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-control/quick-actions"
 WORKDIR="$PWD"
 LOCAL_DIR="$WORKDIR/.herdr-control/quick-actions"
-TRUST_DB="${XDG_STATE_HOME:-$HOME/.local/state}/herdr-control/trusted-actions"
-
-_trust_hash() { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
-
-is_trusted() {  # <file> -> 0 iff approved at its CURRENT content hash
-  local f="$1" h
-  [ -f "$TRUST_DB" ] || return 1
-  h=$(_trust_hash "$f")
-  [ -n "$h" ] || return 1
-  grep -qxF "$h  $f" "$TRUST_DB" 2>/dev/null
-}
-
-trust_file() {  # <file> -> record approval, replacing any stale entry for it
-  local f="$1" h dir
-  h=$(_trust_hash "$f")
-  [ -n "$h" ] || { echo "quick-action: cannot hash $f" >&2; return 1; }
-  dir=$(dirname "$TRUST_DB")
-  mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir" 2>/dev/null
-  if [ -f "$TRUST_DB" ]; then
-    grep -vF "  $f" "$TRUST_DB" >"$TRUST_DB.tmp" 2>/dev/null || : >"$TRUST_DB.tmp"
-    mv "$TRUST_DB.tmp" "$TRUST_DB"
-  fi
-  printf '%s  %s\n' "$h" "$f" >>"$TRUST_DB"
-  chmod 600 "$TRUST_DB" 2>/dev/null || true
-}
+# The trust gate moved to lib/trust.sh when the repo-local project tier
+# needed the same approval store; same keying, same file.
+#
+# $0 is resolved through SYMLINKS, because README documents installing these
+# on PATH with `ln -s "$PWD"/*.sh ~/.local/bin/`. Invoked through that link,
+# a plain `dirname "$0"` points at ~/.local/bin, the source fails, and both
+# trust functions are simply undefined — the gate disappears rather than
+# refusing (found in review of the extraction).
+_self="$0"
+while [ -L "$_self" ]; do
+  _link=$(readlink "$_self")
+  case "$_link" in
+    /*) _self="$_link" ;;
+    *)  _self="$(dirname "$_self")/$_link" ;;
+  esac
+done
+here=$(cd "$(dirname "$_self")" && pwd)
+. "$here/lib/trust.sh"
 
 list_actions() {  # -> "<name>\t<scope>\t<file>" per line, LOCAL first (it can override GLOBAL)
   local f name

@@ -33,27 +33,111 @@
 #   ./open-project.sh --pick                      # fuzzy-pick (needs fzf)
 #   ./open-project.sh --dry-run herdr-control     # preview, no calls made
 set -uo pipefail
-here=$(cd "$(dirname "$0")" && pwd)
+# $0 resolved through SYMLINKS — README documents `ln -s "$PWD"/*.sh
+# ~/.local/bin/`, and through that link a plain `dirname "$0"` finds neither
+# config.sh nor lib/trust.sh, so the trust gate would be undefined rather
+# than refusing.
+_self="$0"
+while [ -L "$_self" ]; do
+  _link=$(readlink "$_self")
+  case "$_link" in
+    /*) _self="$_link" ;;
+    *)  _self="$(dirname "$_self")/$_link" ;;
+  esac
+done
+here=$(cd "$(dirname "$_self")" && pwd)
 source "$here/config.sh"
 . "$here/lib/layout.sh"
 . "$here/lib/project.sh"
 
+. "$here/lib/trust.sh"
+
 PERSONAL_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-control/projects"
 SHIPPED_DIR="$here/projects"
 
-foc=--no-focus; dry=0; pick=0; positional=()
+# THIRD TIER: the repo's OWN space, committed beside the code it describes.
+#
+# `<repo-root>/.herdr-control/project.json`, found from the current directory
+# the way every other repo-aware tool here finds its root. This is what makes
+# per-repo start rules writable once: a fresh clone carries its own tabs,
+# panes and startup commands, instead of a personal-tier file that has to be
+# hand-copied per repo per machine.
+#
+# Same discovery shape as quick-action.sh's global vs repo-local, and the same
+# trust gate for the same reason — a space carries pane startup COMMANDS, so it
+# is shell that arrived with a `git pull` from a branch anyone could have
+# pushed. Approval is keyed by content hash, so editing an approved file
+# revokes it (lib/trust.sh).
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+REPO_FILE=""
+if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/.herdr-control/project.json" ]; then
+  REPO_FILE="$REPO_ROOT/.herdr-control/project.json"
+  # Run from the REPO ROOT, not from wherever you happened to stand. The
+  # tier is discovered from the root but `project_open` resolves
+  # `working_dir` against the cwd, so `"working_dir": "."` in an approved
+  # space meant something different in every subdirectory — and what "."
+  # resolved to was never covered by the content hash. Invoked from `sub/deep`
+  # this repo's own space ran `./restart.sh --verify` in `sub/deep`, which
+  # either fails or runs a same-named script the approval never saw.
+  cd "$REPO_ROOT" || exit 1
+fi
+
+foc=--no-focus; dry=0; pick=0; trust=0; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --focus) foc=--focus; shift ;;
     --dry-run|-n) dry=1; shift ;;
     --pick) pick=1; shift ;;
+    --trust) trust=1; shift ;;
     *) positional+=("$1"); shift ;;
   esac
 done
 set -- ${positional[@]+"${positional[@]}"}
 
-list_projects() {  # -> "<name>\t<scope>\t<description>\t<file>" per line, personal first
+if [ "$trust" = 1 ]; then
+  [ -n "$REPO_FILE" ] || {
+    echo "open-project: no repo-local space here (expected .herdr-control/project.json)" >&2; exit 1; }
+  echo "open-project: this space runs these commands:" >&2
+  jq -r '.tabs[]? | .panes | to_entries[]? | "  \(.value.cmd // "<shell>")"' "$REPO_FILE" >&2
+  # An explicit YES, exactly as quick-action.sh --trust does. Printing the
+  # commands and approving in the same breath gives the operator no point at
+  # which to decline, which makes the banner a lie.
+  printf 'open-project: type YES to approve %s: ' "$REPO_FILE" >&2
+  read -r _ans
+  [ "$_ans" = YES ] || { echo "open-project: not approved" >&2; exit 1; }
+  trust_file "$REPO_FILE" || exit 1
+  echo "approved at its current content: $REPO_FILE" >&2
+  exit 0
+fi
+
+# Fields are TAB-separated, so any field that can contain a TAB or a NEWLINE
+# can forge rows in this table. For the repo tier `name` and `description`
+# arrive with a `git pull`, and `project_validate` only type-checks them — a
+# description carrying "\t...\n" injected a row whose FILE field was any path
+# the attacker chose, and because the trust gate compared the resolved path
+# against $REPO_FILE, a forged path skipped the gate entirely and its commands
+# ran with zero arguments and an empty trust DB (found in review of this PR).
+#
+# Two independent fixes, both kept: untrusted text is scrubbed of the
+# separators here, AND the tier tag travels as its own field so the gate keys
+# on the TIER rather than on string equality of a parsed path.
+_scrub() { printf '%s' "$1" | tr -d '\t\n\r'; }
+
+list_projects() {  # -> "<name>\t<scope>\t<description>\t<file>" per line, most specific first
   local f name desc
+  # The repo you are STANDING IN is the most specific answer there is, so it
+  # is listed first and wins a name collision.
+  if [ -n "$REPO_FILE" ]; then
+    name=$(_scrub "$(jq -r '.name // empty' "$REPO_FILE" 2>/dev/null)")
+    desc=$(_scrub "$(jq -r '.description // ""' "$REPO_FILE" 2>/dev/null)")
+    if [ -n "$name" ]; then
+      if is_trusted "$REPO_FILE"; then
+        printf '%s\trepo\t%s\t%s\n' "$name" "$desc" "$REPO_FILE"
+      else
+        printf '%s\trepo, UNTRUSTED\t%s\t%s\n' "$name" "$desc" "$REPO_FILE"
+      fi
+    fi
+  fi
   for f in "$PERSONAL_DIR"/*.json; do
     [ -e "$f" ] || continue
     name=$(jq -r '.name // empty' "$f" 2>/dev/null)
@@ -68,13 +152,18 @@ list_projects() {  # -> "<name>\t<scope>\t<description>\t<file>" per line, perso
   done
 }
 
-# personal wins on a name collision — it's a deliberate override of a
-# shipped example, not a duplicate, so grep the FIRST match only.
-resolve_project() {  # <name> -> file path on stdout, empty + rc 1 if unknown
-  local n="$1" file
-  file=$(list_projects | awk -F'\t' -v want="$n" '$1==want{print $4; exit}')
-  [ -n "$file" ] || return 1
-  printf '%s' "$file"
+# The repo tier wins, then personal, then shipped: most specific first. Both
+# overrides are deliberate, not duplicates, so take the FIRST match only.
+#
+# Returns "<tier>\t<file>". The TIER travels with the path because the trust
+# gate keys on it: identifying the repo tier by comparing the resolved path
+# against $REPO_FILE let a forged row (see _scrub above) present a path that
+# was not equal to it and therefore skipped the gate.
+resolve_project() {  # <name> -> "<tier>\t<file>" on stdout, empty + rc 1 if unknown
+  local n="$1" row
+  row=$(list_projects | awk -F'\t' -v want="$n" '$1==want{print $2 "\t" $4; exit}')
+  [ -n "$row" ] || return 1
+  printf '%s' "$row"
 }
 
 name="${1:-}"
@@ -84,14 +173,58 @@ if [ "$pick" = 1 ]; then
     --delimiter='\t' --with-nth=1,2,3) || exit 1
   name=$(cut -f1 <<<"$chosen")
 fi
-[ -n "$name" ] || { echo "usage: open-project.sh [--focus] [--dry-run] [--pick] <name>" >&2; exit 1; }
+# NO NAME NEEDED when you are standing in a repo that ships a space. That is
+# the whole point of the tier: `cd ~/Code/knowledge-base && open-project.sh`
+# opens that repo's space, and you never type its name. A name is still
+# accepted, and is the only way to open a space for somewhere you are not.
+if [ -z "$name" ] && [ -n "$REPO_FILE" ]; then
+  name=$(jq -r '.name // empty' "$REPO_FILE" 2>/dev/null)
+  [ -n "$name" ] && echo "open-project: using this repo's space ($name)" >&2
+fi
+[ -n "$name" ] || {
+  echo "usage: open-project.sh [--focus] [--dry-run] [--pick] [--trust] [<name>]" >&2
+  echo "  with no <name>, opens <repo-root>/.herdr-control/project.json if there is one" >&2
+  exit 1; }
 
-file=$(resolve_project "$name") || {
+row=$(resolve_project "$name") || {
   echo "open-project: no such project: $name" >&2
   echo "available:" >&2
   list_projects | awk -F'\t' '{print "  " $1 " (" $2 ")"}' >&2
   exit 1
 }
+tier=${row%%	*}
+file=${row#*	}
+
+# A repo-local space runs pane commands that came from the repo, so it needs
+# the same approval a repo-local quick action needs. Refused, not warned: the
+# commands run the moment the workspace opens, so there is no later moment at
+# which a warning could still be acted on. `--dry-run` is exempt — reading what
+# a space WOULD do is how you decide whether to approve it.
+#
+# BEFORE the file is read, so approval covers the bytes that get executed and
+# an unapproved space cannot even reach the validator. Keyed on the TIER tag,
+# and the file must still be the repo path — a forged row claiming tier `repo`
+# with someone else's path is refused rather than opened.
+case "$tier" in
+  repo*)
+    if [ "$file" != "${REPO_FILE:-}" ]; then
+      echo "open-project: a listed space claims to be this repo's but points elsewhere:" >&2
+      echo "  $file" >&2
+      echo "  refusing — the repo tier is exactly \$REPO_ROOT/.herdr-control/project.json" >&2
+      exit 1
+    fi
+    if [ "$dry" = 0 ] && ! is_trusted "$REPO_FILE"; then
+      echo "open-project: this repo's space is not approved on this machine." >&2
+      echo "  file: $REPO_FILE" >&2
+      echo "  It runs pane commands that arrived with the repo. Review them:" >&2
+      echo "    ./open-project.sh --dry-run $name" >&2
+      echo "  Then approve at the current content:" >&2
+      echo "    ./open-project.sh --trust" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 project_json=$(cat "$file") || { echo "open-project: cannot read $file" >&2; exit 1; }
 project_validate "$project_json" || { echo "open-project: invalid project in $file" >&2; exit 1; }
 
