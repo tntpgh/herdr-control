@@ -1163,6 +1163,7 @@ or queries Neon.
 | `install.sh` | wire the hooks into Claude Code and the omp extension symlink (idempotent, dry-run by default) |
 | `verify-run-registry.sh` | 42-check verification of the SQLite run registry — sequencing, dedup, transactions, migration from the old file layout |
 | `verify-posture.sh` | 49-check verification of the posture ladder — composition, fail-closed unknowns, per-agent flag translation |
+| `verify-spawn-op-env.sh` | 12-check verification of `lib/op-env.sh` — that a spawned worker gets a working non-interactive 1Password identity, that `--no-secrets` genuinely withholds it (including from a `zsh -c` child, the path `~/.zshenv` used to re-grant), that the unmanaged literal-command path is withheld by default, that no credential value can reach the line typed into the pane (asserted against argv captured from a stubbed herdr), and that the ambient grant is still only the op token |
 | `verify-command-policy.sh` | 56-check verification of the command-policy classifier — floor rules, normalization, operator rules, credential/production escalation, curl\|sh-class bypasses, obfuscation/backslash-escape/heredoc coverage |
 | `verify-select-policy.sh` | 44-check verification of `herdr-select.sh --authority peer` against a stubbed herdr — runs the real script, not a reimplementation |
 | `verify-omp-hooks.sh` | 41-check verification of the omp extension's four event handlers against a stubbed pane |

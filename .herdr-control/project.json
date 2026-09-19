@@ -20,7 +20,8 @@
       "label": "suites",
       "panes": [
         { "label": "policy", "cmd": "bash verify-command-policy.sh" },
-        { "label": "scan", "split": "down", "cmd": "bash verify-secret-scan.sh" }
+        { "label": "scan", "split": "down", "cmd": "bash verify-secret-scan.sh" },
+        { "label": "op-env", "split": "down", "cmd": "bash verify-spawn-op-env.sh" }
       ]
     }
   ]

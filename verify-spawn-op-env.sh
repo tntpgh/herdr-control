@@ -40,25 +40,84 @@ for p in "$prelude" "$withheld"; do
 	esac
 done
 
-# 3. Both modes disarm the TCC probe: with a token but without this, `op`
+# 3. The DEFAULT disarms the TCC probe — with a token but without it, `op`
 #    blocks forever from a background session (1Password/shell-plugins#606 —
-#    the 2026-09-06 Slack-bridge deadlock).
-for p in "$prelude" "$withheld"; do
-	case "$p" in
-		*"OP_BIOMETRIC_UNLOCK_ENABLED=false"*) check "TCC probe disarmed" 0 "OP_BIOMETRIC_UNLOCK_ENABLED=false" ;;
-		*) check "TCC probe disarmed" 1 "missing in: $p" ;;
-	esac
-done
+#    the 2026-09-06 Slack-bridge deadlock). WITHHOLD deliberately does not: in
+#    the mode that means "this worker has no business calling op", a stalling
+#    `op` is a signal, and silencing it would hide an unauthorized call.
+case "$prelude" in
+	*"OP_BIOMETRIC_UNLOCK_ENABLED=false"*) check "default disarms the TCC probe" 0 "OP_BIOMETRIC_UNLOCK_ENABLED=false" ;;
+	*) check "default disarms the TCC probe" 1 "missing in: $prelude" ;;
+esac
+case "$withheld" in
+	*"OP_BIOMETRIC_UNLOCK_ENABLED=false"*) check "withhold leaves the TCC probe armed" 1 "withhold silenced the probe: $withheld" ;;
+	*) check "withhold leaves the TCC probe armed" 0 "an op call from a withheld worker still surfaces" ;;
+esac
 
 # 4. Both entry points apply the prelude AND accept the flag. A lib nothing
 #    calls is the failure mode this repo has already shipped once.
 for s in spawn-task.sh spawn-agent.sh; do
-	if grep -q 'op_env_prelude "$op_mode"' "$here/$s" && grep -q -- '--no-secrets) op_mode=withhold' "$here/$s"; then
-		check "$s wires the prelude and --no-secrets" 0 "op_env_prelude \"\$op_mode\" + --no-secrets flag"
+	# `grep` for the call is not enough — it matches a COMMENTED-OUT line, so the
+	# check could stay green while every worker silently lost the prelude
+	# (SPAWN-OPENV-002). Strip comments before looking.
+	if sed 's/#.*//' "$here/$s" | grep -q 'op_env_prelude "$op_mode"' \
+		&& sed 's/#.*//' "$here/$s" | grep -q -- '--no-secrets) secrets_req=withhold'; then
+		check "$s wires the prelude and --no-secrets" 0 "live call (not a comment) + the flag"
 	else
-		check "$s wires the prelude and --no-secrets" 1 "missing in $here/$s"
+		check "$s wires the prelude and --no-secrets" 1 "missing, or only present in a comment, in $here/$s"
 	fi
 done
+
+# 4b. THE COMPOSED LINE, not just the lib's return value. This is what actually
+#     gets typed into the pane, and it is where a future edit would interpolate
+#     something. Stub `herdr` the way verify-layout.sh does and capture argv.
+run_log=$(mktemp)
+stub_dir=$(mktemp -d)
+cat > "$stub_dir/herdr" <<STUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+	"tab create") printf '{"result":{"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"p1","terminal_id":"term1"}}}\n' ;;
+	"pane run")   printf '%s\n' "\$4" >> "$run_log" ;;
+	"pane list")  printf '{"result":{"panes":[]}}\n' ;;
+	# ensure-workspace.sh runs first and EXITS the spawn if it cannot resolve a
+	# workspace id, which is why a bare `{}` catch-all captured nothing.
+	*)            printf '{"result":{"workspace":{"workspace_id":"w1"},"workspaces":[],"panes":[],"tabs":[]}}\n' ;;
+esac
+STUB
+chmod +x "$stub_dir/herdr"
+probe_repo=$(mktemp -d); git -C "$probe_repo" init -q 2>/dev/null
+env HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" HERDR_WT_DIR="$(mktemp -d)" HERDR_RUN_STATE_DIR="$(mktemp -d)" \
+	bash "$here/spawn-task.sh" "$probe_repo" verify-op-env quick /bin/true >/dev/null 2>&1
+typed=$(cat "$run_log" 2>/dev/null)
+if [ -z "$typed" ]; then
+	check "the composed launch line is inspectable" 1 "stub captured no 'pane run' — harness broken, not the code"
+else
+	case "$typed" in
+		*"ops_"*) check "composed line carries no credential value" 1 "a token literal reached the typed command" ;;
+		*) check "composed line carries no credential value" 0 "argv captured from a stubbed herdr, no literal in it" ;;
+	esac
+	case "$typed" in
+		# quick + a literal command = UNMANAGED, so this one must be withheld.
+		*"HERDR_SECRETS_WITHHELD=1"*) check "unmanaged spawn types the withhold prelude" 0 "withhold marker present in the typed line" ;;
+		*) check "unmanaged spawn types the withhold prelude" 1 "unmanaged launch was not withheld: ${typed%% *}…" ;;
+	esac
+fi
+rm -rf "$stub_dir" "$probe_repo" "$run_log"
+
+# 4c. PIN THE GRANT. The default prelude sources a file this repo does not own,
+#     so "one broad read-only credential and nothing else" is prose unless the
+#     name set is checked. Names only — values are never read (SPAWN-OPENV-004).
+op_file="${OP_ENV_FILE:-$HOME/.config/op/service-account.env}"
+if [ -r "$op_file" ]; then
+	got=$(op_env_names)
+	case "$got" in
+		"OP_BIOMETRIC_UNLOCK_ENABLED OP_SERVICE_ACCOUNT_TOKEN "|"OP_SERVICE_ACCOUNT_TOKEN ")
+			check "the ambient grant is still only the op credential" 0 "exports: $got" ;;
+		*) check "the ambient grant is still only the op credential" 1 "file now exports MORE than the op token: $got" ;;
+	esac
+else
+	check "the ambient grant is still only the op credential" 1 "cannot read $op_file"
+fi
 
 # 5. END TO END in a real shell, both directions. `env -i` is the
 #    launchd/trimmed-parent case the login-shell path never covered.
@@ -77,6 +136,20 @@ case "$inherited" in
 	*TOKEN_ABSENT*) check "--no-secrets withholds an INHERITED token" 0 "parent token set -> TOKEN_ABSENT in worker" ;;
 	*) check "--no-secrets withholds an INHERITED token" 1 "worker kept the parent's token: $inherited" ;;
 esac
+
+# 6b. THE REGAIN PATH THAT ACTUALLY EXISTS. Check 6 runs /bin/sh, which never
+#     reads ~/.zshenv — so it could not have caught SPAWN-OPENV-001, where the
+#     worker's first `zsh -c` child got the token straight back. Probe zsh.
+#     Presence/absence only; the value is never printed.
+if command -v zsh >/dev/null 2>&1; then
+	regain=$(env -i HOME="$HOME" PATH="$PATH" /bin/sh -c "$withheld"' zsh -c '"'"'[ -n "$OP_SERVICE_ACCOUNT_TOKEN" ] && echo REGAINED || echo ABSENT'"'"'' 2>&1)
+	case "$regain" in
+		*ABSENT*) check "--no-secrets survives a zsh child" 0 "zsh -c under withhold -> ABSENT (~/.zshenv honours HERDR_SECRETS_WITHHELD)" ;;
+		*) check "--no-secrets survives a zsh child" 1 "zsh -c REGAINED the token — ~/.zshenv is re-sourcing it; the flag is theatre" ;;
+	esac
+else
+	check "--no-secrets survives a zsh child" 1 "zsh not on PATH"
+fi
 
 # 7. And the default identity actually works non-interactively — a token that
 #    is present but rejected is worse than none, because it fails deep in a run.

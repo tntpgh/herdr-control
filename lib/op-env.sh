@@ -58,20 +58,49 @@
 # keys with nothing ambient at all, and keeps working under `--no-secrets`.
 # This prelude is the floor for repos that have no such bootstrap yet.
 #
-# OP_BIOMETRIC_UNLOCK_ENABLED=false is unconditional in both modes: it is not a
-# credential, it just stops `op` blocking forever on a TCC prompt from a
-# background session (1Password/shell-plugins#606 — the 2026-09-06 Slack-bridge
-# deadlock, 25s hang vs 0.68s).
+# OP_BIOMETRIC_UNLOCK_ENABLED=false is set in the DEFAULT mode only. It is not a
+# credential — it stops `op` blocking forever on a TCC prompt from a background
+# session (1Password/shell-plugins#606 — the 2026-09-06 Slack-bridge deadlock,
+# 25s hang vs 0.68s). Withhold mode deliberately leaves it alone: in the mode
+# that means "this worker has no business calling op", a stalling `op` is a
+# signal, not a defect.
 #
 # NO SECRET IS INTERPOLATED IN EITHER MODE. The string is TYPED into the
 # worker's live shell by `herdr pane run`, so it names the file and lets the
-# shell read it, exactly as the launchd plists do.
-#
+# shell read it, exactly as the launchd plists do. `op_env_names` reads only
+# variable NAMES out of that file — never a value — so withhold clears whatever
+# the file currently grants instead of one hardcoded literal that silently
+# stops covering the file the day someone adds a line to it.
+
+OP_ENV_FILE="${OP_ENV_FILE:-$HOME/.config/op/service-account.env}"
+
+# Variable names exported by the service-account file. Names only, by
+# construction: the value side of every line is discarded by the regex.
+op_env_names() {
+	[ -r "$OP_ENV_FILE" ] || { printf '%s' OP_SERVICE_ACCOUNT_TOKEN; return; }
+	grep -oE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' "$OP_ENV_FILE" \
+		| sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/=$//' | sort -u | tr '\n' ' '
+}
+
 # $1: "withhold" for a worker that must not hold the credential; anything else
 #     gets the default identity.
 op_env_prelude() {
 	if [ "${1:-}" = withhold ]; then
-		printf '%s' 'unset OP_SERVICE_ACCOUNT_TOKEN; export OP_BIOMETRIC_UNLOCK_ENABLED=false;'
+		# HERDR_SECRETS_WITHHELD is load-bearing twice over, and the `unset`
+		# alone was theatre without it (security review 2026-09-19,
+		# SPAWN-OPENV-001):
+		#   * ~/.zshenv sources the service-account file for EVERY zsh — that is
+		#     deliberate, so `zsh -c` and `ssh host cmd` have an identity — so a
+		#     withheld worker's first zsh child got the token straight back. That
+		#     file now skips sourcing when this marker is set.
+		#   * it is exported, so a child spawn made from inside a withheld worker
+		#     inherits the restriction. Tighten-only, like HERDR_POSTURE_FLOOR:
+		#     a withheld worker cannot re-grant to its own children.
+		# It is NOT a sandbox: the file is mode 600 owned by this uid, so an
+		# agent that decides to read it can. What this removes is ambient
+		# inheritance — the token is no longer sitting in the environment of a
+		# process handling material we did not write.
+		printf 'export HERDR_SECRETS_WITHHELD=1; unset %s;' "$(op_env_names)"
 	else
 		printf '%s' '[ -r "$HOME/.config/op/service-account.env" ] && . "$HOME/.config/op/service-account.env"; export OP_BIOMETRIC_UNLOCK_ENABLED=false;'
 	fi

@@ -40,12 +40,17 @@ source "$here/config.sh"
 . "$here/lib/repo-root.sh"
 . "$here/lib/op-env.sh"
 
-foc=--no-focus; posture_req=""; op_mode=""
+# Same contract as spawn-task.sh: ON for a managed launch, OFF for an unmanaged
+# literal command, tighten-only inheritance from a withheld parent.
+secrets_req=""
+[ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && secrets_req=withhold
+foc=--no-focus; posture_req=""
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --focus) foc=--focus; shift ;;
-    --no-secrets) op_mode=withhold; shift ;;   # withhold the vault-read credential — lib/op-env.sh
+    --no-secrets) secrets_req=withhold; shift ;;  # withhold the vault-read credential — lib/op-env.sh
+    --secrets) secrets_req=grant; shift ;;        # grant it to an UNMANAGED launch
     --posture) posture_req="${2:?spawn-agent: --posture needs a value (yolo|write|strict)}"; shift 2 ;;
     *) args+=("$1"); shift ;;
   esac
@@ -80,6 +85,12 @@ else
   managed=0
   cli="${cmd[*]}"  # literal command; no model mapping, no posture flag, no rules append
 fi
+op_mode=withhold
+[ "$managed" = 1 ] && [ "$secrets_req" != withhold ] && op_mode=""
+[ "$secrets_req" = grant ] && op_mode=""
+[ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && op_mode=withhold   # tighten-only
+secrets_note="service account (read-only, 1 vault) — op resolves with no human"
+[ "$op_mode" = withhold ] && secrets_note="WITHHELD — token not placed in this pane's environment (the 600-mode file stays readable by this uid; not a sandbox)"
 eff_posture=$(resolved_posture "$posture_req")
 
 # repo_root (lib/repo-root.sh), not --show-toplevel: inside a linked worktree
@@ -144,4 +155,8 @@ else
   printf '  ⚠ UNMANAGED literal command: no posture flag, no canonical rules append —\n'
   printf '    only the env floor stamp reaches it; nothing here enforces approvals.\n'
 fi
+# Outside the managed/unmanaged branch: an unmanaged pane is exactly where a
+# silent credential grant would matter most, and this script keeps no registry
+# record, so its stdout is the only place the posture is ever stated.
+printf '  secrets:  %s\n' "$secrets_note"
 printf '  registry: <not registered — no task identity or wake persistence; use spawn-task.sh for a supervised worktree task>\n'
