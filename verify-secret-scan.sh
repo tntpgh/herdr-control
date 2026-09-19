@@ -915,6 +915,284 @@ refuses_push "$R" "a chained hook's refusal still stops the push"
 pub_case f.json "{\"myPublicKey\": \"$PUBHEX\"}" allow \
     "camelCase publicKey is exempt"
 
+# ═════════════════════════════════════════════════════════════════════════════
+printf '== PR #88 REVIEW: street/phone OCCURRENCE boundaries ==\n'
+# `grep -nE` used to print the whole matching LINE and each `grep -viE`
+# exclusion discarded that whole line, so a third-party address sharing a
+# line with one of our own allowlisted values laundered through untouched.
+# Fixed by switching to `grep -oE` (one occurrence per match) with the
+# business exclusions anchored `^...$` against that single occurrence.
+#
+# These fixtures deliberately use the pre-existing "123 Main St" /
+# "412-555-0142" (555-01xx) fixture values, NOT the Vintage Skins/office NAP
+# values (the shop's own street address and phone number, spelled out
+# plainly in the hook's own allowlist comments, deliberately not repeated
+# here) that the actual anchored
+# exclusions in the hook allowlist. The bug reproduces identically either
+# way — the whole-line/consumed-boundary mechanism doesn't care WHICH
+# allowlist entry is doing the laundering, generic fixture words are excluded
+# by the exact same buggy whole-line/non-overlapping logic as the NAP values
+# are. Using the generic ones here is a deployment-ordering constraint, not a
+# test-quality one: this machine's currently-installed pre-commit hook has
+# been redeployed from `main`, which does not carry the Covenant/Corporate/
+# 226-4440 allowlist entries from #88's still-unmerged branch at all (main's
+# street/phone checks have no business-NAP exemption whatsoever) — so a
+# fixture spelling those literal values out, even correctly built at runtime
+# via `$(printf …)` the way BADSTREET/BADPHONE/BADMAIL are, would itself read
+# as real third-party PII to the currently-deployed guard and block this very
+# commit. $BADSTREET/$BADPHONE are built at runtime (see file header) so this
+# file's own diff never carries the unblocked literal form either way.
+R="$(new_repo)"
+printf 'shop="123 Main St"; client="%s"\n' "$BADSTREET" > "$R/lead.txt"
+git -C "$R" add lead.txt
+blocks "$R" "our own street + a third-party street on ONE line (own first) is blocked"
+
+R="$(new_repo)"
+printf 'client="%s"; shop="123 Main St"\n' "$BADSTREET" > "$R/lead.txt"
+git -C "$R" add lead.txt
+blocks "$R" "our own street + a third-party street on ONE line (own second) is blocked"
+
+# The old exclusion had no left-side house-number boundary, so an unanchored
+# substring match let a LARGER house number containing an allowlisted suffix
+# through: 18878 contains 8878, 12100 contains 2100. The generic fixture words
+# (Main/Elm/Oak) cannot reproduce it — they are word-boundary entries, and a
+# larger number in front of "Main" is excluded by that list regardless — so
+# the shape needs the NUMBER-anchored entries, which is why these four cases
+# were deferred.
+#
+# The deferral reason was that writing those literals here would itself read
+# as third-party PII to a main-based deployed hook and block this very commit.
+# That is solved the same way $BADSTREET solves it: ASSEMBLE THEM AT RUNTIME,
+# so no contiguous `<number> <Street> <Suffix>` ever appears in this file. The
+# tests then run against the BRANCH hook under test, not the deployed one, and
+# nothing has to wait for a deployment.
+NAP_ST="8878 Cove""nant Ave"          # Vintage Skins' own published address
+NAP_OFF="2100 Corpo""rate Drive"      # the Wexford broker office (49 Pa. Code 35.305(c))
+NAP_PH="412-$(printf '226')-4440"     # Vintage Skins' own published line
+
+# A larger house number on the same street is SOMEONE ELSE'S address.
+R="$(new_repo)"
+printf 'addr = "1%s"\n' "$NAP_ST" > "$R/crm.py"
+git -C "$R" add crm.py
+blocks "$R" "a larger house number containing the Covenant allowlist suffix is blocked"
+
+R="$(new_repo)"
+printf 'addr = "1%s"\n' "$NAP_OFF" > "$R/crm.py"
+git -C "$R" add crm.py
+blocks "$R" "a larger house number containing the Corporate allowlist suffix is blocked"
+
+# ...and the allowlist still does its job for the exact published values,
+# which is the half that keeps branding work from teaching people --no-verify.
+R="$(new_repo)"
+printf 'shop = "%s"\n' "$NAP_ST" > "$R/about.md"
+git -C "$R" add about.md
+allows "$R" "the Vintage Skins shop address alone is allowed"
+
+R="$(new_repo)"
+printf 'phone = "%s"\n' "$NAP_PH" > "$R/about.md"
+git -C "$R" add about.md
+allows "$R" "the Vintage Skins shop phone alone is allowed"
+
+# The phone boundary bug: `grep -o`'s non-overlapping scan consumed the ONE
+# separator between two adjacent numbers along with the first match, so
+# scanning resumed at the second number's first digit where a leading
+# boundary can never match — the second number was never EXTRACTED, not
+# merely allowlisted. Reproduced for EVERY one-character separator with the
+# business number first; the reverse order was always fine, which is what
+# made it look like a slash-specific quirk. Swept here so a fix that only
+# special-cases `/` cannot pass. `412-555-0142` (555-01xx) stands in for the
+# business-NAP number here too, same deployment-order reason as above; the
+# consumed-boundary mechanism is identical regardless of which allowlisted
+# number sits on the left.
+for _sep in '/' ',' ';' ' ' '|' ':' '&' '+'; do
+    R="$(new_repo)"
+    printf 'contact = "412-555-0142%s%s"\n' "$_sep" "$BADPHONE" > "$R/lead.txt"
+    git -C "$R" add lead.txt
+    blocks "$R" "own then third-party phone, separator [$_sep], is blocked"
+
+    R="$(new_repo)"
+    printf 'contact = "%s%s412-555-0142"\n' "$BADPHONE" "$_sep" > "$R/lead.txt"
+    git -C "$R" add lead.txt
+    blocks "$R" "third-party then own phone, separator [$_sep], stays blocked"
+done
+
+# The directional-prefix fix (`([NSEW]\.? )?`) must keep matching a real
+# address and must NOT start matching ordinary prose that happens to have a
+# number followed by two capitalized words.
+R="$(new_repo)"
+printf 'address="4821 E %s Dr"\n' "$(printf 'Pinehurst')" > "$R/lead.txt"
+git -C "$R" add lead.txt
+blocks "$R" "a directional-prefixed third-party street address is blocked"
+
+R="$(new_repo)"
+printf '%s\n' '42 Bytes Read' > "$R/notes.md"
+git -C "$R" add notes.md
+allows "$R" "ordinary prose (42 Bytes Read) is not read as a street address"
+
+R="$(new_repo)"
+printf '%s\n' '100 E Commits Ahead' > "$R/notes.md"
+git -C "$R" add notes.md
+allows "$R" "ordinary prose (100 E Commits Ahead) is not read as a street address"
+
+# The hook staged as its own content: it necessarily discusses its own
+# allowlist values and pattern text in comments, and must not trip its own
+# detectors.
+R="$(new_repo)"
+mkdir -p "$R/git-hooks"
+cp "$HOOK" "$R/git-hooks/secret-scan-pre-commit.sh"
+git -C "$R" add git-hooks/secret-scan-pre-commit.sh
+allows "$R" "the hook staged as its own content is allowed"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+printf '== PR #87 RE-REVIEW: index-mode fail-open on a broken external diff driver ==\n'
+# `pii_added_for_index` used to end `| added_lines || true`, discarding
+# `git diff`'s own exit status. Any repo whose .gitattributes binds a file
+# type to an external diff driver whose binary is missing gets `git diff
+# --cached -U0` exit 128, and the pipeline still "succeeded" with an empty
+# stream — every PII detector then concluded clean. The credential scan is
+# UNAFFECTED here: it reads blobs directly via `git show :$FILE`, never a
+# diff, so this fixture carries NO credential-shaped value on purpose — a
+# credential in it would let the credential scan's unrelated BLOCKED line
+# pass this case for the wrong reason. Confirmed against the byte-identical
+# deployed fleet hook, 2026-09-16.
+R="$(new_repo)"
+git -C "$R" config diff.boom.command false
+printf '*.txt diff=boom\n' > "$R/.gitattributes"
+git -C "$R" add .gitattributes
+git -C "$R" commit -qm "diff attributes"
+printf 'addr="%s"; email="%s"; phone="%s"\n' "$BADSTREET" "$BADMAIL" "$BADPHONE" > "$R/lead.txt"
+git -C "$R" add lead.txt
+if (cd "$R" && git diff --cached -U0 >/dev/null 2>&1); then
+    bad "fixture's own git diff --cached did not fail — this case proves nothing"
+else
+    ok "fixture reproduces a broken external diff driver (git diff --cached fails)"
+fi
+scan "$R"; RC=$?
+[ "$RC" -ne 0 ] \
+    && ok "a broken diff driver plus PII-only content (no credential) is BLOCKED in index mode" \
+    || bad "a broken diff driver plus PII-only content was ALLOWED in index mode: $OUT"
+printf '%s' "$OUT" | grep -qi 'diff' \
+    && ok "the refusal names the diff failure" \
+    || bad "the refusal does not mention the diff failure: $OUT"
+printf '%s' "$OUT" | grep -qE 'STREET ADDRESS|PHONE NUMBER|EMAIL ADDRESS' \
+    && bad "the refusal names a PII class instead of the diff failure: $OUT" \
+    || ok "the refusal names the diff failure, not a PII class"
+
+printf '\n-- push mode: the same class of broken driver is already refused --\n'
+# `--text` (used by both scan_commit's read and pii_added_for_commit) forces
+# an internal textual diff and bypasses a full `diff.<x>.command` override —
+# proved directly: the index-mode fixture above, replayed through `git show
+# --text -U0` instead of `git diff --cached -U0`, does NOT fail. It does NOT
+# bypass a `diff.<x>.textconv` override, so that variant still breaks `git
+# show <commit> --text -U0`. scan_commit's own read-status check (an earlier
+# PR, unconditional per commit, no PII_EXCLUDES pathspec to narrow it) refuses
+# the push before this branch's new pii_added_for_commit guard would ever
+# run — this is proven below by asserting the SAME result against a copy of
+# the pre-fix hook, not assumed. The new push-mode guard is still correct
+# defense-in-depth (every extractor, both paths, per the fix) — it is just
+# not the code path THIS particular mechanism reaches, so this case is a
+# non-regression control, not a case this branch newly fixes.
+R="$(push_repo)"
+git -C "$R" config diff.boom.textconv /nonexistent/binary-does-not-exist
+printf '*.txt diff=boom\n' > "$R/.gitattributes"
+git -C "$R" add .gitattributes
+git -C "$R" commit -qm "diff attributes" --no-verify
+printf 'addr="%s"; email="%s"; phone="%s"\n' "$BADSTREET" "$BADMAIL" "$BADPHONE" > "$R/lead.txt"
+git -C "$R" add lead.txt
+git -C "$R" commit -qm "lead, PII only, no credential shape" --no-verify
+if git -C "$R" show HEAD --text -U0 --format= >/dev/null 2>&1; then
+    bad "fixture's own git show --text -U0 did not fail — this case proves nothing"
+else
+    ok "fixture reproduces a broken textconv driver (git show --text -U0 fails)"
+fi
+refuses_push "$R" "a broken textconv driver plus PII-only content is refused in push mode"
+printf '%s' "$OUT" | grep -qE 'STREET ADDRESS|PHONE NUMBER|EMAIL ADDRESS' \
+    && bad "the push refusal names a PII class instead of the read failure: $OUT" \
+    || ok "the push refusal does not name a PII class (existing read-failure guard)"
+
+# ═════════════════════════════════════════════════════════════════════════════
+printf '== PR #88 AWK REWRITE: a multibyte byte must not blind the phone scanner ==\n'
+# The occurrence-boundary fix above needed an awk scanner (`grep -o`'s
+# non-overlapping match cannot do a non-consuming boundary check, which IS
+# the separator bug) — but the pre-awk `grep -oE` phone extractor never had a
+# multibyte problem; grep decodes it without crashing. The awk rewrite
+# carried a NEW fail-open in with it: BWK awk decodes `length`/`substr`
+# through the process locale, and en_US.UTF-8 makes it die with `towc:
+# multibyte conversion failure` on ANY multibyte byte in the scanned text —
+# including an ordinary em dash in this hook's OWN comments a line or two
+# above a real phone number. A dead awk prints nothing and the exclusion
+# greps see an empty stream, which read as clean. Fixed with `LC_ALL=C`
+# (byte-oriented; this pattern only ever matches ASCII, so no real phone
+# number can be skipped) plus `judge_pipeline` failing closed on awk's own
+# nonzero exit. Caught by measuring the rewrite against this exact fixture
+# before commit, not by reading the diff — this bug never reached
+# origin/fix/pii-guard-own-nap-and-doi or the deployed fleet hook; it lived
+# only inside this branch's own development between the finding-2 fix and
+# this one. Kept as a permanent case anyway: without it, the exact same
+# regression can come back the next time someone touches this pipeline, and
+# the suite would report green while the hook silently scans nothing, same
+# as it did here.
+R="$(new_repo)"
+printf 'prose with an em dash %s here\nphone=%s\n' "$(printf '\xe2\x80\x94')" "$BADPHONE" > "$R/lead.txt"
+git -C "$R" add lead.txt
+scan "$R"; RC=$?
+[ "$RC" -ne 0 ] \
+    && ok "a multibyte byte plus a real phone number is BLOCKED (was silently allowed)" \
+    || bad "a multibyte byte plus a real phone number was ALLOWED: $OUT"
+printf '%s' "$OUT" | grep -qE 'STREET ADDRESS|EMAIL ADDRESS' \
+    && bad "the refusal names an unrelated PII class: $OUT" \
+    || ok "the refusal correctly attributes to the phone check, not another class"
+
+R="$(new_repo)"
+printf 'prose with an em dash %s here, nothing else\n' "$(printf '\xe2\x80\x94')" > "$R/notes.md"
+git -C "$R" add notes.md
+allows "$R" "a multibyte byte alone (no PII) is not itself a finding (no false positive)"
+
+printf '\n== judge_pipeline: every non-printf stage is judged, not just the last one ==\n'
+# Direct unit test of the shared helper (same extraction technique this file
+# already uses for PAT_JSON/PUB_LIST below): hand-checking index 1 (awk) and
+# the last index only, as the first cut of the multibyte fix did, left the
+# FIRST exclusion grep (index 2 in the phone pipeline) unjudged. If it exits
+# 2+, its output is empty, the last grep then sees nothing and legitimately
+# exits 1 ("nothing survived"), and pipefail reports that rightmost nonzero 1
+# — clean — while the real 2+ that caused it is invisible. `judge_pipeline`
+# loops every stage so this and any future stage cannot go unjudged.
+JP_SRC=$(awk '/^judge_pipeline\(\) \{/,/^}/' "$HOOK")
+[ -n "$JP_SRC" ] && eval "$JP_SRC"
+if ! declare -f judge_pipeline >/dev/null; then
+    bad "judge_pipeline not found in $HOOK — the extraction pattern drifted from the source"
+else
+    ok "judge_pipeline extracted from the hook for direct testing"
+    jp_case() {              # <label> <expect: block|allow> <strict> <codes...>
+        local label="$1" expect="$2"; shift 2
+        local out got
+        if out=$(judge_pipeline "test" "PHONE NUMBER" "$@" 2>&1); then got=block; else got=allow; fi
+        if [ "$got" = "$expect" ]; then
+            ok "$label"
+        else
+            bad "$label (got=$got want=$expect): $out"
+        fi
+    }
+    # stage0=printf(0, skipped) stage1=awk(0, ok) stage2=first exclusion grep
+    # stage3=last exclusion grep. strict=1 (awk is the extractor).
+    jp_case "stage 2 errors, stage 3 looks clean -> BLOCK (the gap this closes)" block 1 0 0 2 1
+    jp_case "every stage clean/no-match -> ALLOW (no false positive)" allow 1 0 0 1 1
+    jp_case "last stage finds a survivor (0) -> BLOCK" block 1 0 0 1 0
+    jp_case "the extractor stage itself errors -> BLOCK" block 1 0 2 1 1
+    jp_case "the last stage itself errors -> BLOCK" block 1 0 0 1 2
+    # strict=0 is the street call's "no extractor stage" sentinel, valid only
+    # because the loop starts at i=1 and stage 0 is always printf.
+    jp_case_street() {
+        local label="$1" expect="$2"; shift 2
+        local out got
+        if out=$(judge_pipeline "test" "STREET ADDRESS" 0 "$@" 2>&1); then got=block; else got=allow; fi
+        if [ "$got" = "$expect" ]; then ok "$label"; else bad "$label (got=$got want=$expect): $out"; fi
+    }
+    jp_case_street "street pipeline: all-grep, every stage clean -> ALLOW" allow 0 1 1 1 1
+    jp_case_street "street pipeline: an exclusion grep errors -> BLOCK" block 0 1 2 1 1
+fi
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi
