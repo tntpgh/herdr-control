@@ -20,49 +20,62 @@ check() {  # <name> <condition-result> <evidence>
 	else printf 'FAIL %s\n       %s\n' "$1" "$3"; fail=1; fi
 }
 
-prelude=$(op_env_prelude)
+prelude=$(op_env_prelude)                 # default: least privilege
+ambient=$(op_env_prelude ambient)         # --secrets: opt-in vault-read credential
 
-# 1. The prelude names the file and never carries a value. It is typed into a
-#    live shell by `herdr pane run`, so a literal token here would land in
-#    scrollback, in herdr's pane history, and in every log that reads a pane.
+# 1. DEFAULT LEAKS NO CREDENTIAL AT ALL. The service account reads one vault,
+#    249 items; a worker that does not need that must not be handed it.
 case "$prelude" in
-	*"ops_"*|*"OP_SERVICE_ACCOUNT_TOKEN="*) check "prelude carries no credential value" 1 "$prelude" ;;
-	*'.config/op/service-account.env'*)     check "prelude carries no credential value" 0 "sources the file, interpolates nothing" ;;
-	*)                                      check "prelude sources the service-account file" 1 "$prelude" ;;
+	*'service-account.env'*|*"OP_SERVICE_ACCOUNT_TOKEN"*)
+		check "default spawn stays least-privilege" 1 "$prelude" ;;
+	*) check "default spawn stays least-privilege" 0 "no token sourced: $prelude" ;;
 esac
 
-# 2. It disarms the TCC probe. With a valid service token but without this,
-#    `op` still blocks forever from a background session
+# 2. Both modes disarm the TCC probe. With a valid token but without this,
+#    `op` blocks forever from a background session
 #    (1Password/shell-plugins#606 — the 2026-09-06 Slack-bridge deadlock).
-case "$prelude" in
-	*"OP_BIOMETRIC_UNLOCK_ENABLED=false"*) check "TCC probe disarmed" 0 "OP_BIOMETRIC_UNLOCK_ENABLED=false" ;;
-	*) check "TCC probe disarmed" 1 "missing OP_BIOMETRIC_UNLOCK_ENABLED=false" ;;
+for p in "$prelude" "$ambient"; do
+	case "$p" in
+		*"OP_BIOMETRIC_UNLOCK_ENABLED=false"*) check "TCC probe disarmed" 0 "$p" ;;
+		*) check "TCC probe disarmed" 1 "missing OP_BIOMETRIC_UNLOCK_ENABLED=false in: $p" ;;
+	esac
+done
+
+# 3. The opt-in mode names the file and interpolates nothing. The string is
+#    TYPED into a live pane, so a literal value would land in scrollback, in
+#    herdr's pane history, and in every log that reads a pane.
+case "$ambient" in
+	*"ops_"*|*"OP_SERVICE_ACCOUNT_TOKEN="*) check "--secrets carries no credential value" 1 "$ambient" ;;
+	*'.config/op/service-account.env'*)     check "--secrets carries no credential value" 0 "sources the file, interpolates nothing" ;;
+	*)                                      check "--secrets sources the service-account file" 1 "$ambient" ;;
 esac
 
-# 3. Both spawn entry points actually apply it. A lib nothing calls is the
-#    failure mode this repo has already shipped once.
+# 4. Both entry points apply the prelude AND accept the flag. A lib nothing
+#    calls is the failure mode this repo has already shipped once.
 for s in spawn-task.sh spawn-agent.sh; do
-	if grep -q 'op_env_prelude' "$here/$s" && grep -q 'lib/op-env.sh' "$here/$s"; then
-		check "$s applies the prelude" 0 "sources lib/op-env.sh and calls op_env_prelude"
+	if grep -q 'op_env_prelude "$op_mode"' "$here/$s" && grep -q -- '--secrets) op_mode=ambient' "$here/$s"; then
+		check "$s wires the prelude and --secrets" 0 "op_env_prelude \"\$op_mode\" + --secrets flag"
 	else
-		check "$s applies the prelude" 1 "no op_env_prelude in $here/$s"
+		check "$s wires the prelude and --secrets" 1 "missing in $here/$s"
 	fi
 done
 
-# 4. END TO END, in a real shell: the prelude must produce a token even when
-#    the parent has none. `env -i` is the launchd/trimmed-parent case.
-out=$(env -i HOME="$HOME" PATH="$PATH" /bin/sh -c "$prelude"' [ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ] && echo TOKEN_PRESENT || echo TOKEN_ABSENT' 2>&1)
-case "$out" in
-	*TOKEN_PRESENT*) check "trimmed parent still gets a token" 0 "env -i + prelude -> TOKEN_PRESENT" ;;
-	*) check "trimmed parent still gets a token" 1 "env -i + prelude -> $out (is ~/.config/op/service-account.env installed, mode 600?)" ;;
+# 5. END TO END, in a real shell. `env -i` is the launchd/trimmed-parent case:
+#    default must yield NO token, --secrets must yield one.
+probe_token() { env -i HOME="$HOME" PATH="$PATH" /bin/sh -c "$1"' [ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ] && echo TOKEN_PRESENT || echo TOKEN_ABSENT' 2>&1; }
+case "$(probe_token "$prelude")" in
+	*TOKEN_ABSENT*) check "default: trimmed parent gets no token" 0 "env -i + default -> TOKEN_ABSENT" ;;
+	*) check "default: trimmed parent gets no token" 1 "default prelude leaked a token" ;;
+esac
+case "$(probe_token "$ambient")" in
+	*TOKEN_PRESENT*) check "--secrets: trimmed parent gets a token" 0 "env -i + --secrets -> TOKEN_PRESENT" ;;
+	*) check "--secrets: trimmed parent gets a token" 1 "is ~/.config/op/service-account.env installed, mode 600?" ;;
 esac
 
-# 5. And that identity actually works non-interactively — a token that is
-#    present but rejected is worse than none, because it fails deep inside a
-#    run. Reads an item this machine is known to hold; a 5s cap so a broken
-#    setup reports instead of hanging the way the incident did.
+# 6. And that identity actually works non-interactively — a token that is
+#    present but rejected is worse than none, because it fails deep in a run.
 if command -v op >/dev/null 2>&1; then
-	probe=$(env -i HOME="$HOME" PATH="$PATH" /bin/sh -c "$prelude"' op user get --me --format json 2>&1 | head -c 400' 2>&1)
+	probe=$(env -i HOME="$HOME" PATH="$PATH" /bin/sh -c "$ambient"' op user get --me --format json 2>&1 | head -c 400' 2>&1)
 	case "$probe" in
 		*SERVICE_ACCOUNT*) check "op authenticates non-interactively" 0 "op user get --me -> SERVICE_ACCOUNT" ;;
 		*) check "op authenticates non-interactively" 1 "op user get --me -> ${probe:-<no output>}" ;;

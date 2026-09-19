@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus]
+# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus] [--secrets]
+#
+# --secrets hands this ONE worker the ambient 1Password service-account
+# credential (one vault, 249 items, read-only). Default is without it: a repo's
+# own bootstrap reads the same file for the keys it needs (knowledge-base
+# server/env_bootstrap.py), which is narrower. See lib/op-env.sh.
 #
 # Spin a task into its own WORKTREE, opened as a TAB inside the project's own
 # workspace (a "sub-tab", not a separate space), running the right model at
@@ -47,13 +52,15 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/op-env.sh"
 
 # ---- args ------------------------------------------------------------------
-base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; positional=()
+base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; op_mode=""; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base="$2"; shift 2 ;;
     --model) model_override="$2"; shift 2 ;;
     --effort) effort_override="$2"; shift 2 ;;
     --posture) posture_req="${2:?spawn-task: --posture needs a value (yolo|write|strict)}"; shift 2 ;;
+    # Ambient vault-read credential for this ONE spawn — see lib/op-env.sh.
+    --secrets) op_mode=ambient; shift ;;
     --dry-run|-n) dry=1; shift ;;
     --focus) foc=--focus; shift ;;
     *) positional+=("$1"); shift ;;
@@ -340,7 +347,7 @@ stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q
 # cannot afford. Measured 2026-09-19 — a spawned worker doing DB work found no
 # token, went looking for .env.local (gitignored, so absent from every linked
 # worktree), and produced four credential-shaped approval prompts.
-stamped_cli="$(op_env_prelude) $stamped_cli; $cli"
+stamped_cli="$(op_env_prelude "$op_mode") $stamped_cli; $cli"
 herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || { echo "spawn-task: launch failed: $cli" >&2; exit 1; }
 herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
 

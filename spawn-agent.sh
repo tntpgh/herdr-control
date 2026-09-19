@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-agent.sh [--focus] [--posture P] <project-path> <role-label> [command...]
+# spawn-agent.sh [--focus] [--posture P] [--secrets] <project-path> <role-label> [command...]
 #
 # Launch an agent SESSION in its own new tab of the project's workspace:
 #   - ensure the project's workspace is open (ensure-workspace.sh, always --no-focus)
@@ -40,11 +40,12 @@ source "$here/config.sh"
 . "$here/lib/repo-root.sh"
 . "$here/lib/op-env.sh"
 
-foc=--no-focus; posture_req=""
+foc=--no-focus; posture_req=""; op_mode=""
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --focus) foc=--focus; shift ;;
+    --secrets) op_mode=ambient; shift ;;   # ambient vault-read credential — lib/op-env.sh
     --posture) posture_req="${2:?spawn-agent: --posture needs a value (yolo|write|strict)}"; shift 2 ;;
     *) args+=("$1"); shift ;;
   esac
@@ -121,7 +122,7 @@ stamped_cli=$(printf 'export HERDR_PANE_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUC
 [ -n "${HERDR_POLICY_EXTRA_RULES:-}" ] && stamped_cli="$stamped_cli $(printf 'HERDR_POLICY_EXTRA_RULES=%q' "$HERDR_POLICY_EXTRA_RULES")"
 [ -n "$CANONICAL_RULES_SRC" ] && stamped_cli="$stamped_cli $(printf 'HERDR_CANONICAL_RULES=%q' "$CANONICAL_RULES_SRC")"
 # op prelude first — same contract as spawn-task.sh and the launchd plists.
-stamped_cli="$(op_env_prelude) $stamped_cli; $cli"
+stamped_cli="$(op_env_prelude "$op_mode") $stamped_cli; $cli"
 
 herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 \
   || { echo "spawn-agent: failed to run '$cli' in $pane" >&2; exit 1; }

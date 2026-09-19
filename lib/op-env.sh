@@ -35,6 +35,27 @@
 # `.env.op` using the token this prelude provides.
 
 # Shell text that gives a worker a working, non-interactive `op` identity.
+#
+# DEFAULT IS LEAST PRIVILEGE, and the measurement is why. The service account
+# sees exactly one vault, read-only — `Secrets`, 249 items (measured
+# 2026-09-19). Sourcing the file into a worker's shell therefore hands every
+# task, and every subprocess it spawns, read access to all 249. The common case
+# does not need that: knowledge-base #352 has its bootstrap read the same file
+# itself, and a real spawned worker resolved 52 keys and did a live Neon read
+# with the variable absent from its environment. A secret a process reads for
+# itself is narrower than a credential left lying in its environment.
+#
+# So by default the prelude only disarms the TCC probe (harmless, and it stops
+# `op` blocking forever from a background session even when some other code
+# path does hold a token — 1Password/shell-plugins#606). The ambient token is
+# opt-in per spawn: `--secrets`, for a task in a repo with no bootstrap of its
+# own that genuinely must run `op` from the shell.
+#
+# $1: "ambient" to source the token, anything else for the default.
 op_env_prelude() {
-	printf '%s' '[ -r "$HOME/.config/op/service-account.env" ] && . "$HOME/.config/op/service-account.env"; export OP_BIOMETRIC_UNLOCK_ENABLED=false;'
+	if [ "${1:-}" = ambient ]; then
+		printf '%s' '[ -r "$HOME/.config/op/service-account.env" ] && . "$HOME/.config/op/service-account.env"; export OP_BIOMETRIC_UNLOCK_ENABLED=false;'
+	else
+		printf '%s' 'export OP_BIOMETRIC_UNLOCK_ENABLED=false;'
+	fi
 }
