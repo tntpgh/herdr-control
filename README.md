@@ -507,6 +507,54 @@ against AWS/GitHub/OpenAI/Slack token shapes and PEM headers) before
 treating a private repo as public-ready. Do both; they catch different
 things.
 
+#### Where real client data goes (`private-dir.sh`)
+
+The scanner's advice used to end "keep it in the DB or a gitignored path",
+which names nothing — so each session invented an answer, or pasted the value
+into a tracked plan document and hit the guard. A guard that blocks work
+without naming the alternative teaches people to route around it.
+
+```bash
+./private-dir.sh                 # in any repo: create/verify <root>/.private/
+```
+
+`<repo>/.private/` holds a `.gitignore` of `*` — the same self-ignoring trick
+`.handoffs/` uses, so nothing inside can be staged even by `git add -A`, and
+no tracked `.gitignore` edit (itself a reviewed, merged change) is needed
+before anyone can save a file. The script verifies the exclusion with
+`git check-ignore` and exits nonzero if something overrides it, rather than
+announcing success.
+
+Reference the file by PATH from tracked text: "computed from
+`.private/reger-corpus.json` (23 messages)" carries exactly what pasting the
+address carried, and none of the exposure. Anything another repo or machine
+needs goes in the KB, where access is scoped and audited; credentials go in
+1Password.
+
+#### A business's published contact is not client PII
+
+The email rule's domain allowlist is enumerated — one hand-added entry per
+vendor, forever, with the guard blocking honest work until someone adds it.
+So a ROLE MAILBOX at a business domain is now exempt by SHAPE:
+``info@`, `sales@` or `escrow@` at the vendor's own domain are
+what a company prints on its own website.
+
+Two things stay blocked, and they are the point of the rule:
+
+- a NAMED INDIVIDUAL at that same business — `firstname.lastname@ at a vendor` is a
+  person who happens to work somewhere;
+- a role-shaped local part at a CONSUMER provider — `office@` at
+  gmail/yahoo/icloud is a person who chose a role-shaped name, so the consumer
+  check is evaluated first and wins.
+
+Proven both ways in `verify-secret-scan.sh` (155 cases), with the fixtures
+assembled from fragments so the suite itself carries no blockable literal.
+The implementation is one `awk` stage rather than another `grep -v`, because
+the rule is an AND NOT ("role-shaped" AND "not consumer") and a pipeline of
+`grep -v` can only express independent drops — the first attempt wrote a PCRE
+lookahead into `grep -E`, which matches nothing and would have exempted
+everything it touched.
+
 ### Sort ranking (top → bottom, attention-first)
 
 | rank | state | how it's detected |

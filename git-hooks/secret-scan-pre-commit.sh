@@ -984,9 +984,40 @@ check_pii() {                   # <label> <added text> [<address-scoped text>]
     # prefix/word matches on purpose. vintageskins.com and weizenyoung.com are
     # our own client-business domains (Lisa's shop; the family), not third
     # parties — that is why they are exempt.
+    #
+    # A ROLE MAILBOX AT A BUSINESS DOMAIN IS A PUBLISHED CONTACT, NOT A
+    # PERSON. `info@`, `sales@`, `escrow@`, `closings@` and friends are what
+    # a company prints on its own website; blocking them treats a vendor's
+    # switchboard like a client's inbox, and the enumerated-domain allowlist
+    # above is the alternative — one hand-added entry per vendor, forever,
+    # with the guard blocking honest work until someone adds it.
+    #
+    # NOT at a consumer mail provider. `info@` at a gmail/yahoo/icloud-style
+    # address is a person who chose a role-shaped local part (spelled here
+    # WITHOUT the domain on purpose: this rule scans its own file, and the
+    # first version of this comment blocked the very commit that added it —
+    # the third time today an example in a guard's own text tripped the
+    # guard). A role mailbox means something only when the
+    # domain belongs to the business. That distinction is the whole rule, so
+    # the consumer list is checked FIRST and wins.
+    #
+    # Anything else at a non-allowlisted domain still blocks — a named
+    # individual is a named individual whether or not they work somewhere.
+    _ss_role='(info|sales|support|hello|contact|admin|billing|help|office|team|careers|jobs|press|media|marketing|webmaster|postmaster|abuse|security|privacy|legal|compliance|accounts|accounting|payables|receivables|orders|service|scheduling|showings|listings|closings|title|escrow|underwriting|noreply|no-reply|donotreply|do-not-reply|mail|hi|ask|inquiries|enquiries)'
+    _ss_consumer='(gmail|googlemail|yahoo|ymail|hotmail|outlook|live|msn|icloud|me|mac|aol|proton|protonmail|pm|gmx|mail|zoho|fastmail|comcast|verizon|att|sbcglobal|bellsouth|cox|charter|roadrunner|rr|earthlink|juno|aim)\.[A-Za-z.]{2,}'
+    # The role exemption is one awk stage, not another `grep -v`: it is an AND
+    # NOT ("looks like a role mailbox" AND "not at a consumer provider"), and
+    # a pipeline of `grep -v` can only express OR of independent drops. The
+    # first attempt wrote a PCRE lookahead into `grep -E`, which matches
+    # nothing and silently exempted everything it touched.
     if printf '%s\n' "$text" \
        | grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
-       | grep -viE '@(([A-Za-z0-9-]+\.)*example\.(com|org|net)$|test\.|localhost$|invalid$|teamthurber\.com$|vintageskins\.com$|weizenyoung\.com$|users\.noreply\.github\.com$|([A-Za-z0-9-]+\.)?(developer|iam)\.gserviceaccount\.com$)|^secret@dashboard\.teamthurber\.com$' >/dev/null; then
+       | grep -viE '@(([A-Za-z0-9-]+\.)*example\.(com|org|net)$|test\.|localhost$|invalid$|teamthurber\.com$|vintageskins\.com$|weizenyoung\.com$|users\.noreply\.github\.com$|([A-Za-z0-9-]+\.)?(developer|iam)\.gserviceaccount\.com$)|^secret@dashboard\.teamthurber\.com$' \
+       | awk -v role="^${_ss_role}@" -v cons="@${_ss_consumer}\$" '
+           { a = tolower($0) }
+           a ~ role && a !~ cons { next }   # published business contact
+           { print }' \
+       | grep -q . ; then
         echo "BLOCKED: a third-party EMAIL ADDRESS is being added in $label."
         PII_FOUND=1
     fi
@@ -1046,7 +1077,10 @@ if [[ "$SCAN_MODE" == push ]]; then
         echo "Push blocked: a commit being pushed adds client PII, and pushing"
         echo "publishes it to every future clone."
         echo "  fixtures: use 555-0100..555-0199, someone@example.com, 123 Main St"
-        echo "  real data: keep it in the DB or a gitignored path"
+        echo "  a business's PUBLISHED contact is fine: `info@` or `sales@` at a vendor's own domain"
+        echo "  real data: \$(git rev-parse --show-toplevel)/.private/  — self-ignoring, per repo"
+        echo "             create it with: herdr-control/private-dir.sh"
+        echo "             anything shared across repos belongs in the KB, not a file"
         echo "  rewrite the commit (git rebase -i <sha>^), do not push past this"
         echo "If this is genuinely synthetic, extend the allowlist in this hook."
         exit 1
@@ -1091,7 +1125,10 @@ if [[ $PII_FOUND -ne 0 ]]; then
     echo "Commit blocked: client PII in a tracked file is permanent — gitignore"
     echo "never untracks, and history reaches every future clone."
     echo "  fixtures: use 555-0100..555-0199, someone@example.com, 123 Main St"
-    echo "  real data: keep it in the DB or a gitignored path, never in a commit"
+    echo "  a business's PUBLISHED contact is fine: `info@` or `sales@` at a vendor's own domain"
+    echo "  real data: \$(git rev-parse --show-toplevel)/.private/  — self-ignoring, per repo"
+    echo "             create it with: herdr-control/private-dir.sh"
+    echo "             anything shared across repos belongs in the KB, not a file"
     echo "If this is genuinely synthetic, extend the allowlist in this hook rather"
     echo "than using --no-verify, so the next person is protected too."
     exit 1

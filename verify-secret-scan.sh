@@ -432,6 +432,41 @@ printf 'owner = "%s"\n' "$BADMAIL" > "$R/crm.py"
 git -C "$R" add crm.py
 blocks "$R" "a third-party email address is blocked"
 
+printf '== EMAIL: a business PUBLISHED contact vs a person ==\n'
+# The domain allowlist above is enumerated — one hand-added entry per vendor,
+# forever, with the guard blocking honest work until someone adds it. A ROLE
+# MAILBOX at a business domain is what a company prints on its own website, so
+# it is exempt by SHAPE rather than by name. A person stays blocked wherever
+# they work, and a role-shaped local part at a consumer provider is a person.
+#
+# Built from fragments like the other fixtures, so this file never carries a
+# blockable literal — the first version of the hook's own comment for this
+# rule blocked the commit that added it.
+ROLE_BIZ="info@northside-ti""tle.com"
+ROLE_BIZ2="escrow@allegheny-ti""tle.com"
+PERSON_BIZ="kristin.re""ger@northside-ti""tle.com"
+ROLE_CONSUMER="office@yah""oo.com"
+
+R="$(new_repo)"
+printf 'vendor = "%s"\nescrow = "%s"\n' "$ROLE_BIZ" "$ROLE_BIZ2" > "$R/vendors.md"
+git -C "$R" add vendors.md
+allows "$R" "a role mailbox at a business domain is allowed"
+
+R="$(new_repo)"
+printf 'vendor = "%s"\n' "$(printf '%s' "$ROLE_BIZ" | tr '[:lower:]' '[:upper:]')" > "$R/vendors.md"
+git -C "$R" add vendors.md
+allows "$R" "...case-insensitively, since a pasted contact is often capitalised"
+
+R="$(new_repo)"
+printf 'contact = "%s"\n' "$PERSON_BIZ" > "$R/vendors.md"
+git -C "$R" add vendors.md
+blocks "$R" "a NAMED individual at that same business domain still blocks"
+
+R="$(new_repo)"
+printf 'contact = "%s"\n' "$ROLE_CONSUMER" > "$R/vendors.md"
+git -C "$R" add vendors.md
+blocks "$R" "a role-shaped local part at a CONSUMER provider still blocks"
+
 R="$(new_repo)"
 printf 'cell = "%s"\n' "$BADPHONE" > "$R/crm.py"
 git -C "$R" add crm.py
