@@ -312,7 +312,12 @@ function ensureHub(): void {
 // {attention, open_decisions} from the hub, or undefined when it is not up
 // yet (first start on a machine without the launchd agent) — bounded so a
 // slow hub costs the session start at most 2s.
-function hubSummary(): { attention: number; open_decisions: number } | undefined {
+//
+// `attention` is the UNION (panes + repos owing a handoff); `handoff_debt` is
+// the repo half of it, published separately so this banner can name each with
+// its own noun instead of calling a repo a task. A hub too old to publish the
+// field reads as 0 and the line is exactly what it was before.
+function hubSummary(): { attention: number; handoff_debt: number; open_decisions: number } | undefined {
   try {
     const r = spawnSync("curl", ["-s", "--max-time", "2", `${HUB_URL}api/summary`], { encoding: "utf8" });
     if (r.error || r.status !== 0 || !r.stdout) return undefined;
@@ -320,7 +325,11 @@ function hubSummary(): { attention: number; open_decisions: number } | undefined
     if (!j || typeof j !== "object" || !("attention" in j) || !("open_decisions" in j)) return undefined;
     const attention = Number(j.attention);
     const open_decisions = Number(j.open_decisions);
-    return Number.isFinite(attention) && Number.isFinite(open_decisions) ? { attention, open_decisions } : undefined;
+    const raw_debt = "handoff_debt" in j ? Number(j.handoff_debt) : 0;
+    const handoff_debt = Number.isFinite(raw_debt) && raw_debt > 0 ? raw_debt : 0;
+    return Number.isFinite(attention) && Number.isFinite(open_decisions)
+      ? { attention, handoff_debt, open_decisions }
+      : undefined;
   } catch {
     return undefined;
   }
@@ -352,7 +361,13 @@ function onBeforeAgentStart():
     const s = hubSummary();
     if (!s || s.attention + s.open_decisions === 0) return undefined; // nothing needs a human — say nothing
     const parts = [];
-    if (s.attention) parts.push(`${s.attention} task(s) need attention`);
+    // `attention` carries both halves; subtract the one with its own noun so
+    // neither is dropped and neither is miscalled. Clamped at 0 so a hub
+    // mid-deploy (new field, old count, or the reverse) can only understate
+    // the task half, never print a negative.
+    const tasks = Math.max(0, s.attention - s.handoff_debt);
+    if (tasks) parts.push(`${tasks} task(s) need attention`);
+    if (s.handoff_debt) parts.push(`${s.handoff_debt} repo(s) owe a handoff`);
     if (s.open_decisions) parts.push(`${s.open_decisions} decision(s) open`);
     return {
       message: {
