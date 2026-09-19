@@ -554,6 +554,33 @@ PII_FOUND=0
 # relaxes the PII checks ONLY: the credential scan above walks every staged
 # file independently of $ADDED, so a token pasted here is still blocked
 # (proven on a real negative, 2026-09-06).
+#
+# tntpgh-dev's published VIDEO metadata (2026-09-16) is a NARROWER case and it
+# is deliberately NOT in the list above. `src/data/videos.json` is the team's
+# own YouTube channel listing — titles copied verbatim from videos already
+# public on YouTube — and the titles ARE street addresses, because the videos
+# are listing tours ("<number> <Street> <City> PA <ZIP> Tour" is the channel's
+# naming convention). `public/sitemap.xml` is generated from that same data at
+# prebuild, so the addresses reappear in its `video:title` elements on every
+# regeneration. Thousands of `/properties/*` URLs in that same sitemap already
+# carry the same street numbers (3,413 of 4,335 `<loc>` entries on
+# tntpgh-dev@origin/main, 2026-09-16, counted with
+# `xmllint --xpath 'count(//*[local-name()="loc" and contains(text(),"/properties/")])'`).
+#
+# But "this file is public output" does NOT establish that every future value
+# in it is safe to publish. A first draft of this change put both paths in
+# PII_EXCLUDES, which drops them from the whole PII input — and a real pre-push
+# probe then ALLOWED a third-party email in videos.json and a non-fiction phone
+# number in sitemap.xml. Two public-output paths had become general PII
+# bypasses (found in review, 2026-09-16). So the exemption is scoped to the
+# STREET-ADDRESS detector only; the phone and email detectors still read every
+# line of both files, and the credential scan above never consulted this list
+# at all.
+#
+# (No real address is written in this comment on purpose: the first draft of it
+# was itself blocked by the street check. A guard whose allowlist cannot be
+# committed is a guard that gets bypassed — same lesson as the
+# exclusion-pattern note further down.)
 # ONE exclusion list, used by both content sources (the index here, a pushed
 # commit in push mode). Two copies of a pathspec is how the modes come to
 # disagree about what counts as client PII.
@@ -565,6 +592,13 @@ PII_EXCLUDES=(
     ':(exclude)cloudflare/worker/wrangler*.toml'
     ':(exclude)**/package-lock.json' ':(exclude)package-lock.json'
     ':(exclude)**/yarn.lock' ':(exclude)**/pnpm-lock.yaml'
+)
+# Paths exempt from the STREET-ADDRESS detector ONLY. Everything here is still
+# read by the phone and email detectors, and by the credential scan, which is
+# what keeps a public-output path from becoming a general PII bypass.
+ADDRESS_ONLY_EXCLUDES=(
+    ':(exclude)src/data/videos.json'
+    ':(exclude)public/sitemap.xml'
 )
 # The added lines to judge, per SOURCE. In push mode that is one call per
 # commit being sent, so a finding can name the commit to rewrite — the first
@@ -595,6 +629,22 @@ pii_added_for_commit() {        # <commit> -> raw diff text; caller checks $?
 pii_added_for_index() {         # -> raw diff text; caller checks $?
     git diff --cached -U0 --diff-filter="$DIFF_FILTER" "${PII_EXCLUDES[@]}" 2>/dev/null
 }
+# The same two sources again, additionally dropping the address-only paths.
+# Only the street check reads these; see ADDRESS_ONLY_EXCLUDES above.
+#
+# Raw text, caller checks `$?` — NOT `| added_lines || true`. These arrived
+# with #87 carrying the very fail-open #91 removed from the two functions
+# above: `|| true` discards git's own exit status and hands `added_lines`
+# whatever partial stdout it got, so a broken external diff driver reads as
+# "no addresses added".
+addr_added_for_commit() {       # <commit> -> raw diff text; caller checks $?
+    git show "$1" --text -U0 --format= --diff-filter="$DIFF_FILTER" \
+        "${PII_EXCLUDES[@]}" "${ADDRESS_ONLY_EXCLUDES[@]}" 2>/dev/null
+}
+addr_added_for_index() {        # -> raw diff text; caller checks $?
+    git diff --cached -U0 --diff-filter="$DIFF_FILTER" \
+        "${PII_EXCLUDES[@]}" "${ADDRESS_ONLY_EXCLUDES[@]}" 2>/dev/null
+}
 # Lockfiles are excluded from the PII checks only. npm records each package
 # MAINTAINER's address (maintainer@example.com and friends), published metadata, not
 # client PII, and it arrives whenever a dependency is added. Blocking it teaches
@@ -615,6 +665,10 @@ pii_added_for_index() {         # -> raw diff text; caller checks $?
 # The street check below still carries its own marker workaround for the same
 # root cause. knowledge-base/scripts/scan_diff.py strips the marker and this did
 # not, which is how the two implementations came to disagree on one diff.
+# (Merge of #91's pipeline judging and #87's address-scoped text. Both halves
+# are load-bearing: judge_pipeline catches a stage that could not RUN, and the
+# third argument keeps the published-video path exemption scoped to the STREET
+# detector instead of dropping those paths from the whole PII input.)
 # Judges every stage of a `printf | extractor | grep -v… | grep -v…` pipeline
 # used by the street/phone detectors below, not just the last command bash's
 # own `if pipe; then` would look at. Found three times over on this branch:
@@ -667,9 +721,14 @@ judge_pipeline() {              # <label> <PII-class-name> <strict-index> <statu
     return "$blocked"
 }
 
-check_pii() {                   # <label> <added text>
-    local label="$1" text="$2"
-    [[ -n "$text" ]] || return 0
+check_pii() {                   # <label> <added text> [<address-scoped text>]
+    # $2 feeds the phone and email detectors. $3 feeds the STREET detector and
+    # additionally drops ADDRESS_ONLY_EXCLUDES; it defaults to $2 so a caller
+    # that does not distinguish them keeps the stricter behaviour. Passing one
+    # text for both is what turned two public-output paths into general PII
+    # bypasses (found in review, 2026-09-16).
+    local label="$1" text="$2" addr_text="${3-$2}"
+    [[ -n "$text$addr_text" ]] || return 0
     # street address: <number> <Name> <suffix>, excluding the fixture words.
     #
     # `([NSEW]\.? )?` closes a hole found 2026-09-16 while testing this very
@@ -732,21 +791,10 @@ check_pii() {                   # <label> <added text>
     # get judged as if it must be exactly 0, and a clean commit with no street
     # address anywhere would block on every commit.
     #
-    # DEFERRED (deployment-order, not a design choice): the house-number
-    # boundary half of the fix would anchor the two lines below `^...$`, so a
-    # LARGER house number containing an allowlisted suffix (18878 contains
-    # 8878) can no longer match. That change is held back FROM THIS COMMIT
-    # ONLY, and reverted to the base branch's exact unanchored `\b` text below
-    # so these two lines stay byte-identical to origin/fix/pii-guard-own-nap-
-    # and-doi and never appear as ADDED lines: the machine's currently
-    # installed pre-commit hook execs the fleet's DEPLOYED copy, which has
-    # been redeployed from `main` and carries NONE of this branch's business-
-    # NAP allowlist entries at all — any commit touching these two literal
-    # values, anchored or not, reads as real third-party PII to that deployed
-    # copy and refuses (verified: even #88's own already-merged-to-branch
-    # hook fails the same way under the current deployment). Restore the `^`/
-    # `$` anchors, and the two "larger house number" cases dropped below,
-    # together, once #88 merges and the fleet is redeployed.
+    # The deployment-order deferral that used to sit here is RESOLVED, not
+    # waived: the allowlist entries are assembled at runtime below, so editing
+    # them no longer requires a machine whose deployed scanner already carries
+    # them, and the four suite fixtures it had forced out are restored.
     # THE ALLOWLIST ENTRIES ARE ASSEMBLED AT RUNTIME, and that is not style.
     # Spelled out contiguously, these two lines are themselves real-looking
     # addresses, so the FILE could only be committed on a machine whose
@@ -762,7 +810,10 @@ check_pii() {                   # <label> <added text>
     _own_office="2100 Corpo""rate Dr(ive)?"
     _own_shop="8878 Cove""nant Ave(nue)?"
     set +e +o pipefail
-    printf '%s\n' "$text" \
+    # `$addr_text`, not `$text`: the published-video path exemption is scoped
+    # to THIS detector (#87). The phone and email detectors below still read
+    # every line of those files.
+    printf '%s\n' "$addr_text" \
        | grep -oE '[0-9]{2,5} ([NSEW]\.? )?[A-Z][a-z]+( [A-Z][a-z]+)? (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)\b' \
        | grep -viE '\b(Main|Elm|Oak|Test|Example|Fake|Sample|Anywhere|Nowhere|Maple|Pine|First|Second|Foo|Bar)\b' \
        | grep -viE "(^|[^0-9])$_own_office\b" \
@@ -894,22 +945,27 @@ check_pii() {                   # <label> <added text>
 if [[ "$SCAN_MODE" == push ]]; then
     for _c in $PUSH_COMMITS; do
         # Same fail-closed shape as scan_commit's own `git show` above: check
-        # the diff's exit status HERE, at the top level, not inside a
-        # `$(pii_added_for_commit …)` used purely for its stdout — `exit 1`
-        # inside that command substitution would only kill the subshell and
-        # the push would sail through with an empty PII text.
-        if _pii_raw=$(pii_added_for_commit "$_c"); then
-            check_pii "commit $(git log -1 --format='%h %s' "$_c" 2>/dev/null || echo "$_c")" \
-                      "$(printf '%s' "$_pii_raw" | added_lines || true)"
-        else
+        # each diff's exit status HERE, at the top level, not inside a
+        # `$(…)` used purely for its stdout — `exit 1` inside that command
+        # substitution would only kill the subshell and the push would sail
+        # through with an empty PII text.
+        #
+        # BOTH diffs are checked. #87 added the address-scoped one, and a
+        # broken diff driver there would silently produce "no addresses".
+        if ! _pii_raw=$(pii_added_for_commit "$_c"); then
             refuse_push "could not compute the diff for commit $_c to check for client PII." \
                         "A broken external diff driver (.gitattributes) can cause this; run 'git show $_c --text -U0' to see why."
+        elif ! _addr_raw=$(addr_added_for_commit "$_c"); then
+            refuse_push "could not compute the address-scoped diff for commit $_c." \
+                        "A broken external diff driver (.gitattributes) can cause this; run 'git show $_c --text -U0' to see why."
+        else
+            check_pii "commit $(git log -1 --format='%h %s' "$_c" 2>/dev/null || echo "$_c")" \
+                      "$(printf '%s' "$_pii_raw" | added_lines || true)" \
+                      "$(printf '%s' "$_addr_raw" | added_lines || true)"
         fi
     done
 else
-    if _pii_raw=$(pii_added_for_index); then
-        check_pii "the staged changes" "$(printf '%s' "$_pii_raw" | added_lines || true)"
-    else
+    if ! _pii_raw=$(pii_added_for_index); then
         _pii_rc=$?
         echo "BLOCKED: could not compute the diff for the staged changes (git diff exit $_pii_rc)." >&2
         echo "  A broken external diff driver (a .gitattributes 'diff=' entry naming a" >&2
@@ -917,6 +973,16 @@ else
         echo "  — every PII check below depends on this same diff." >&2
         echo "  Try: git diff --cached -U0   (to see the underlying failure)" >&2
         exit 1
+    elif ! _addr_raw=$(addr_added_for_index); then
+        _pii_rc=$?
+        echo "BLOCKED: could not compute the address-scoped diff for the staged changes (git diff exit $_pii_rc)." >&2
+        echo "  Refusing to treat an unreadable diff as clean — the street check depends on it." >&2
+        echo "  Try: git diff --cached -U0   (to see the underlying failure)" >&2
+        exit 1
+    else
+        check_pii "the staged changes" \
+                  "$(printf '%s' "$_pii_raw" | added_lines || true)" \
+                  "$(printf '%s' "$_addr_raw" | added_lines || true)"
     fi
 fi
 
