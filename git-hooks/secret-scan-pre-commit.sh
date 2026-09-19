@@ -688,6 +688,55 @@ addr_added_for_index() {        # -> raw diff text; caller checks $?
 # (something, or nothing, survived to feed the next stage) and anything else
 # is that stage's own pattern failing to run. The FINAL stage doubles as the
 # verdict: 0 there means a real value survived every exclusion.
+# ---- _ss_drop_published -----------------------------------------------------
+# Drops street addresses that are ALREADY ON THE DEPLOYED TRUNK, and behaves
+# like a `grep -v` stage so `judge_pipeline` needs no special case: exit 0 when
+# something survived (block it), 1 when nothing did.
+#
+# Why this exists. The other exclusions above are ENUMERATED — a list of
+# fixture street names, plus two own-NAP entries — and that shape has to be
+# extended by hand for every legitimate case. Until someone does, the guard
+# blocks honest work, and people learn to route around it. #87 solved the
+# specific case that bit (published video metadata) with a PATH exemption,
+# which is the right answer for generated pipeline output. This answers the
+# cases no path list anticipates: a blog post quoting a listing, a CMA, a
+# press pitch.
+#
+# The question it asks is not a name list: IS THIS ADDRESS ALREADY SERVED TO
+# THE PUBLIC FROM THE TRUNK? An address already on origin/main cannot be
+# leaked by committing it again; a buyer's or seller's address in exactly the
+# same shape is not there, so it still blocks. Self-limiting: it can never be
+# used to introduce a NEW address, because being new is what it detects.
+#
+# Baseline is the REMOTE trunk, never local HEAD. In a pre-push run the commit
+# under inspection is already reachable from HEAD, so HEAD would let every
+# address approve itself.
+_ss_on_trunk() {                # <"number street"> -> 0 if published
+    local a="$1" ref
+    [ -n "$a" ] || return 1
+    for ref in origin/main origin/HEAD; do
+        git rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || continue
+        if git grep -qiF -- "$a" "$ref" 2>/dev/null; then return 0; fi
+    done
+    return 1
+}
+
+_ss_drop_published() {          # stdin: one occurrence per line
+    local line probe any=1
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        # Drop the street-type suffix before comparing: the trunk may spell it
+        # "Drive" where this commit says "Dr". Number + street name is
+        # specific enough to be an identity.
+        probe="$(printf '%s' "$line" |
+                 sed -E 's/ (Dr|Rd|St|Ave|Ct|Ln|Way|Blvd|Road|Street|Drive|Avenue|Court|Lane)$//')"
+        if _ss_on_trunk "$probe"; then continue; fi
+        printf '%s\n' "$line"
+        any=0
+    done
+    return "$any"
+}
+
 # Prints its own BLOCKED lines; caller does `if judge_pipeline …; then
 # PII_FOUND=1; fi`.
 judge_pipeline() {              # <label> <PII-class-name> <strict-index> <status0> <status1> ...
@@ -818,7 +867,8 @@ check_pii() {                   # <label> <added text> [<address-scoped text>]
        | grep -viE '\b(Main|Elm|Oak|Test|Example|Fake|Sample|Anywhere|Nowhere|Maple|Pine|First|Second|Foo|Bar)\b' \
        | grep -viE "(^|[^0-9])$_own_office\b" \
        | grep -viE "(^|[^0-9])$_own_shop\b" \
-       | grep -vE '^(123|456|789|1234|100|111|999) ' >/dev/null
+       | grep -vE '^(123|456|789|1234|100|111|999) ' \
+       | _ss_drop_published >/dev/null
     _pst=("${PIPESTATUS[@]}")
     set -e -o pipefail
     if judge_pipeline "$label" "STREET ADDRESS" 0 "${_pst[@]}"; then
