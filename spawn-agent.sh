@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-agent.sh [--focus] [--posture P] [--secrets] <project-path> <role-label> [command...]
+# spawn-agent.sh [--focus] [--posture P] [--no-secrets] <project-path> <role-label> [command...]
 #
 # Launch an agent SESSION in its own new tab of the project's workspace:
 #   - ensure the project's workspace is open (ensure-workspace.sh, always --no-focus)
@@ -45,7 +45,7 @@ args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --focus) foc=--focus; shift ;;
-    --secrets) op_mode=ambient; shift ;;   # ambient vault-read credential — lib/op-env.sh
+    --no-secrets) op_mode=withhold; shift ;;   # withhold the vault-read credential — lib/op-env.sh
     --posture) posture_req="${2:?spawn-agent: --posture needs a value (yolo|write|strict)}"; shift 2 ;;
     *) args+=("$1"); shift ;;
   esac

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus] [--secrets]
+# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus] [--no-secrets]
 #
-# --secrets hands this ONE worker the ambient 1Password service-account
-# credential (one vault, 249 items, read-only). Default is without it: a repo's
-# own bootstrap reads the same file for the keys it needs (knowledge-base
-# server/env_bootstrap.py), which is narrower. See lib/op-env.sh.
+# Every worker starts with the 1Password service-account identity (one vault,
+# 249 items, READ-ONLY) so an unattended run never stops to ask for a
+# credential. `--no-secrets` withholds it — use it when the task handles
+# material we did not write (third-party code review, a scrape, anything
+# parsing untrusted input). See lib/op-env.sh for why the default is ON.
 #
 # Spin a task into its own WORKTREE, opened as a TAB inside the project's own
 # workspace (a "sub-tab", not a separate space), running the right model at
@@ -59,8 +60,8 @@ while [ $# -gt 0 ]; do
     --model) model_override="$2"; shift 2 ;;
     --effort) effort_override="$2"; shift 2 ;;
     --posture) posture_req="${2:?spawn-task: --posture needs a value (yolo|write|strict)}"; shift 2 ;;
-    # Ambient vault-read credential for this ONE spawn — see lib/op-env.sh.
-    --secrets) op_mode=ambient; shift ;;
+    # Withhold the vault-read credential from this ONE spawn — see lib/op-env.sh.
+    --no-secrets) op_mode=withhold; shift ;;
     --dry-run|-n) dry=1; shift ;;
     --focus) foc=--focus; shift ;;
     *) positional+=("$1"); shift ;;
@@ -212,6 +213,7 @@ if [ "$dry" = 1 ]; then
   if [ "$managed" = 1 ]; then
     echo "  launch    : $cli"
     echo "  posture   : $eff_posture  (floor ${HERDR_POSTURE_FLOOR:-write}, request ${posture_req:-none}; stamped into the worker as HERDR_POSTURE_FLOOR — child spawns can only tighten)"
+    echo "  secrets   : $([ "$op_mode" = withhold ] && echo 'WITHHELD (--no-secrets)' || echo 'service account (1 vault, 249 items, read-only)')"
     echo "  rules     : ${CANONICAL_RULES_SRC:-<none — no ancestor AGENTS.md found/configured; normal project discovery only>}"
   else
     echo "  launch    : $cli"
@@ -375,6 +377,7 @@ printf '  worktree: %s\n  launch:   %s\n' "$wt" "$cli"
 if [ "$managed" = 1 ]; then
   printf '  posture:  %s  (floor %s, request %s; stamped as the worker'"'"'s own floor)\n' \
     "$eff_posture" "${HERDR_POSTURE_FLOOR:-write}" "${posture_req:-none}"
+  printf '  secrets:  %s\n' "$([ "$op_mode" = withhold ] && echo 'WITHHELD (--no-secrets) — this worker cannot resolve op:// refs' || echo 'service account — op resolves without a human')"
   if [ -n "$CANONICAL_RULES_SRC" ]; then
     printf '  rules:    %s (appended with provenance; normal project discovery untouched)\n' "$CANONICAL_RULES_SRC"
   else

@@ -36,26 +36,43 @@
 
 # Shell text that gives a worker a working, non-interactive `op` identity.
 #
-# DEFAULT IS LEAST PRIVILEGE, and the measurement is why. The service account
-# sees exactly one vault, read-only — `Secrets`, 249 items (measured
-# 2026-09-19). Sourcing the file into a worker's shell therefore hands every
-# task, and every subprocess it spawns, read access to all 249. The common case
-# does not need that: knowledge-base #352 has its bootstrap read the same file
-# itself, and a real spawned worker resolved 52 keys and did a live Neon read
-# with the variable absent from its environment. A secret a process reads for
-# itself is narrower than a credential left lying in its environment.
+# DEFAULT IS ON, and that is a deliberate reversal of where this started.
+# Least privilege argued for opt-in; the actual workload says otherwise: almost
+# every task in this fleet reads a secret, so an opt-in flag is a checkpoint
+# that is remembered 90% of the time and silently parks an overnight run the
+# other 10%. A control whose failure mode is "the work did not happen, and
+# nobody was told" is not buying the safety it appears to.
 #
-# So by default the prelude only disarms the TCC probe (harmless, and it stops
-# `op` blocking forever from a background session even when some other code
-# path does hold a token — 1Password/shell-plugins#606). The ambient token is
-# opt-in per spawn: `--secrets`, for a task in a repo with no bootstrap of its
-# own that genuinely must run `op` from the shell.
+# What the grant actually is, measured 2026-09-19: the service account reads
+# exactly ONE vault — `Secrets`, 249 items — and cannot write (`op whoami` ->
+# SERVICE_ACCOUNT; `op vault list` -> one entry). And it is not new capability
+# for the worker: an agent with a shell and $HOME can read
+# ~/.config/op/service-account.env itself at any time. Withholding it removes a
+# human checkpoint, not an ability. The checkpoint is worth keeping only where
+# the worker handles material we did not write — third-party code review, a
+# web-facing scrape, anything parsing untrusted input that could carry an
+# injected instruction. That case gets `--no-secrets`.
 #
-# $1: "ambient" to source the token, anything else for the default.
+# Narrower is still better where it is free: a repo whose own bootstrap reads
+# the same file (knowledge-base server/env_bootstrap.py, #352) resolves its 52
+# keys with nothing ambient at all, and keeps working under `--no-secrets`.
+# This prelude is the floor for repos that have no such bootstrap yet.
+#
+# OP_BIOMETRIC_UNLOCK_ENABLED=false is unconditional in both modes: it is not a
+# credential, it just stops `op` blocking forever on a TCC prompt from a
+# background session (1Password/shell-plugins#606 — the 2026-09-06 Slack-bridge
+# deadlock, 25s hang vs 0.68s).
+#
+# NO SECRET IS INTERPOLATED IN EITHER MODE. The string is TYPED into the
+# worker's live shell by `herdr pane run`, so it names the file and lets the
+# shell read it, exactly as the launchd plists do.
+#
+# $1: "withhold" for a worker that must not hold the credential; anything else
+#     gets the default identity.
 op_env_prelude() {
-	if [ "${1:-}" = ambient ]; then
-		printf '%s' '[ -r "$HOME/.config/op/service-account.env" ] && . "$HOME/.config/op/service-account.env"; export OP_BIOMETRIC_UNLOCK_ENABLED=false;'
+	if [ "${1:-}" = withhold ]; then
+		printf '%s' 'unset OP_SERVICE_ACCOUNT_TOKEN; export OP_BIOMETRIC_UNLOCK_ENABLED=false;'
 	else
-		printf '%s' 'export OP_BIOMETRIC_UNLOCK_ENABLED=false;'
+		printf '%s' '[ -r "$HOME/.config/op/service-account.env" ] && . "$HOME/.config/op/service-account.env"; export OP_BIOMETRIC_UNLOCK_ENABLED=false;'
 	fi
 }
