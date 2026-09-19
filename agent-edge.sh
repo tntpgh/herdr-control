@@ -185,7 +185,24 @@ case "$status" in
     if [ -z "$previous" ]; then
       # First observation: the hub just started or re-bootstrapped. The prompt
       # may be hours old and already alerted. Record the truth, alert nothing.
-      note "registry-follow-only (first observation) $reg"
+      #
+      # But ANSWERING is not alerting, and skipping it here strands every
+      # prompt that was already blocked when the hub restarted. Measured
+      # 2026-09-18, the night standing authority was granted: the hub came up
+      # with three tntpgh-dev review lanes already blocked, every one of them on
+      # an allow-class command, and none was ever answered — a blocked pane
+      # produces no further transition by definition, so there is no second
+      # chance. The conductor had to press every one by hand.
+      #
+      # The classifier is still the only gate: peer-answer re-parses the menu
+      # and command-policy decides, so this answers exactly what it would have
+      # answered one transition later. Alerting stays suppressed either way.
+      if [ "${HERDR_EDGE_PEER_ANSWER:-0}" = "1" ]; then
+        bash "$PEER_ANSWER" --max-rounds 1 ${agent:+--agent "$agent"} "$pane" >/dev/null 2>&1 || true
+        note "peer-answer(first observation) $reg"
+      else
+        note "registry-follow-only (first observation) $reg"
+      fi
       exit 0
     fi
     if [ "${HERDR_EDGE_PEER_ANSWER:-0}" = "1" ]; then
