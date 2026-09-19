@@ -363,30 +363,38 @@ judge_snapshot() {                        # <workspace-dir>
 }
 
 # Returns: 0 installed · 1 could not install · 4 installed but the record could
-# not be written (the fleet IS running the new bytes) · 5 the bytes that went
-# live are not the bytes that were judged.
-install_snapshot() {
-  mv -f "$DEPLOY_SNAP" "$HOOK_DEPLOY" || { rm -f "$DEPLOY_SNAP"; return 1; }
-
-  # POST-CONDITION, measured rather than asserted. This is the real defence for
-  # the property a structural test row kept failing to pin: three separate
-  # textual evasions satisfied that row, and one of them — recording `blob:`
-  # from a fresh read of the SOURCE — passed all 68 rows while reintroducing
-  # exactly the provenance defect this change exists to fix. Measuring what is
-  # live closes the class instead of describing it.
-  local live_sha live_oid
-  live_sha=$(_sha_of "$HOOK_DEPLOY")
-  live_oid=$(_oid_of "$HOOK_DEPLOY")
-  [ -n "$live_sha" ] && [ "$live_sha" = "$DEPLOY_SNAP_SHA" ] || return 5
-
-  # Provenance beside the copy, written to a temp and renamed so two concurrent
-  # runs cannot tear it. `blob:` and `sha256:` are measured FROM THE INSTALLED
-  # FILE, never from the source or from an intention.
-  local rtmp="$HOOK_DEPLOY_REV.new.$$"
+# not be written · 5 the bytes that went live are not the bytes that were
+# judged.
+#
+# ORDERING IS LOAD-BEARING now that the shim verifies the deployed bytes
+# against `sha256:` before running them (see hook_body). Renaming the scanner
+# first and writing the record second leaves two states in which every commit
+# in all 18 repos is refused:
+#
+#   * the record cannot be written at all (rc=4). Before the shim that was
+#     harmless, and the installer says so ("the fleet IS running the new
+#     scanner"); with the shim it is a fleet-wide outage announced as success.
+#   * the ~24 ms between the two renames, measured in review. `--apply` is
+#     exactly the command an operator runs to FIX a bad deployment, so that
+#     window lands on the worst possible audience.
+#
+# NOT ROW-PINNED, and worth saying so: the ORDER of the two renames is only
+# observable inside that ~24 ms window, which review measured with timing
+# rather than a fixture. A mutant that removes the staging call passes the
+# whole suite, because every fixture that can fail a record write fails the
+# scanner rename first. What IS pinned: the shim accepting `.rev.next`, and a
+# failed record write leaving the previous bytes live.
+#
+# So the record for the NEW bytes is staged as `.rev.next` BEFORE they go live,
+# and the shim accepts a match against either record. If staging fails,
+# NOTHING is deployed — the old bytes and the old record stay consistent,
+# which is the entire point of having a record.
+_write_rev() {                          # <out> <sha> <oid>
+  local out="$1" sha="$2" oid="$3" tmp="$1.new.$$"
   {
     printf 'rev:        %s\n' "$DEPLOY_REV"
     printf 'source:     %s\n' "$HOOK_SRC"
-    printf 'blob:       %s\n' "$live_oid"
+    printf 'blob:       %s\n' "$oid"
     printf 'reviewed:   %s\n' "$DEPLOY_REVIEWED"
     [ "$DEPLOY_REVIEWED" = yes ] || {
       printf 'reason:     %s\n' "${ALLOW_UNREVIEWED_REASON:-(none given)}"
@@ -396,12 +404,39 @@ install_snapshot() {
     printf 'main-blob:  %s\n' "${DEPLOY_MAIN_OID:-none}"
     printf 'main-dated: %s\n' "$(git -C "$here" log -1 --format=%cI "$MAIN_REF" 2>/dev/null || printf unknown)"
     printf 'deploy-dir: %s\n' "$HOOK_DEPLOY_DIR"
-    printf 'sha256:     %s\n' "$live_sha"
+    printf 'sha256:     %s\n' "$sha"
     printf 'deployed:   %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  } > "$rtmp" 2>/dev/null && mv -f "$rtmp" "$HOOK_DEPLOY_REV" 2>/dev/null || {
-    rm -f "$rtmp"
-    return 4
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$out" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+install_snapshot() {
+  local snap_sha snap_oid live_sha live_oid
+  snap_sha=$(_sha_of "$DEPLOY_SNAP")
+  snap_oid=$(_oid_of "$DEPLOY_SNAP")
+  [ -n "$snap_sha" ] && [ "$snap_sha" = "$DEPLOY_SNAP_SHA" ] || { rm -f "$DEPLOY_SNAP"; return 5; }
+
+  # Stage first. A failure here deploys NOTHING.
+  _write_rev "$HOOK_DEPLOY_REV.next" "$snap_sha" "$snap_oid" || { rm -f "$DEPLOY_SNAP"; return 4; }
+
+  mv -f "$DEPLOY_SNAP" "$HOOK_DEPLOY" || {
+    rm -f "$DEPLOY_SNAP" "$HOOK_DEPLOY_REV.next"
+    return 1
   }
+
+  # POST-CONDITION, measured rather than asserted. This is the real defence for
+  # the property a structural test row kept failing to pin: three separate
+  # textual evasions satisfied that row, and one of them — recording `blob:`
+  # from a fresh read of the SOURCE — passed all 68 rows while reintroducing
+  # exactly the provenance defect this change exists to fix. Measuring what is
+  # live closes the class instead of describing it.
+  live_sha=$(_sha_of "$HOOK_DEPLOY")
+  live_oid=$(_oid_of "$HOOK_DEPLOY")
+  [ -n "$live_sha" ] && [ "$live_sha" = "$DEPLOY_SNAP_SHA" ] || return 5
+
+  # Promote. The staged copy is removed LAST, so there is no moment in which
+  # neither record describes the live bytes.
+  _write_rev "$HOOK_DEPLOY_REV" "$live_sha" "$live_oid" || return 4
+  rm -f "$HOOK_DEPLOY_REV.next"
 }
 
 # An unreviewed deployment gets a deadline, because "deliberate, recorded and
@@ -459,14 +494,47 @@ hook_body() {                             # [extra scanner args...]
 # One guard, not two: an absent .rev and a .rev with no `sha256:` line are the
 # same case — nothing to verify against — and a nested `[ -r ]` test around
 # this was an equivalent mutant (deleting it changed no behaviour, so no row
-# could ever fail for it).
-want=$(sed -n 's/^sha256:[[:space:]]*//p' "$R" 2>/dev/null | head -1)
-if [ -n "$want" ]; then
-  have=$(shasum -a 256 "$H" 2>/dev/null | cut -d' ' -f1)
-  if [ -n "$have" ] && [ "$have" != "$want" ]; then
+# could ever fail for it; review confirmed an unreadable .rev and a .rev that
+# is a directory both yield an empty `want` through the same path).
+#
+# The hash is normalised: `awk '{print $1}'` after stripping CR, because a
+# trailing space or a CRLF line ending otherwise makes the compare fail and
+# prints a tampering alarm whose two hashes look IDENTICAL — a fleet-wide
+# block with no way to see what is wrong. The installer never writes such a
+# line, but a hand-edited or copied record can.
+_ss_rev_sha() {                         # <rev file> -> recorded hash, or empty
+  sed -n 's/^sha256:[[:space:]]*//p' "$1" 2>/dev/null |
+    tr -d '\r' | awk 'NR==1{print $1}'
+}
+want=$(_ss_rev_sha "$R")
+# `.rev.next` is the record the installer STAGES for bytes that are about to
+# go live. Accepting either closes the window between the two renames, which
+# review measured at ~24 ms of every `--apply` — and `--apply` is the command
+# an operator runs to fix a bad deployment, so a refusal there is maximally
+# confusing.
+want_next=$(_ss_rev_sha "$R.next")
+if [ -n "$want" ] || [ -n "$want_next" ]; then
+  # `shasum`'s own output never carries a CR, so this side needs no stripping —
+  # mutating it to a plain `cut` changed nothing and no row could tell, which
+  # is the definition of an equivalent mutant. Normalisation belongs on the
+  # RECORD side, where a hand-edited or copied .rev really can carry one.
+  have=$(shasum -a 256 "$H" 2>/dev/null | awk 'NR==1{print $1}')
+  if [ -z "$have" ]; then
+    # FAIL CLOSED. There is a recorded expectation and no way to check it, and
+    # the whole point of this deployment is that the fleet runs REVIEWED bytes
+    # — "unverifiable" must not mean "run it anyway". Review found this
+    # direction unpinned and the code doing the opposite.
+    echo "REFUSED: cannot verify the deployed secret scanner." >&2
+    echo "  scanner: $H" >&2
+    echo "  a sha256 is recorded, but computing one here failed (is shasum on PATH?)." >&2
+    echo "  Refusing rather than running unverified bytes." >&2
+    exit 1
+  fi
+  if [ "$have" != "$want" ] && [ "$have" != "$want_next" ]; then
     echo "REFUSED: the deployed secret scanner is not the reviewed one." >&2
     echo "  scanner: $H" >&2
-    echo "  recorded sha256: $want" >&2
+    echo "  recorded sha256: ${want:-<none>}" >&2
+    [ -n "$want_next" ] && echo "  staged   sha256: $want_next" >&2
     echo "  actual   sha256: $have" >&2
     echo "  Someone wrote to the deploy directory outside the installer." >&2
     echo "  Restore it:  cd ~/Code/herdr-control && ./install-git-hooks.sh --apply" >&2
@@ -818,7 +886,12 @@ if [ -r "$HOOK_DEPLOY" ]; then
         echo "      expires: $_exp"
       fi
     fi
-    _rec=$(sed -n 's/^sha256:[[:space:]]*//p' "$HOOK_DEPLOY_REV")
+    # Read EXACTLY as the shim reads it (first line, CR stripped, first field).
+    # The shim took `head -1` while this read every line into one string, so
+    # the two consumers of one record could reach different verdicts about the
+    # same deployment — and the shim's verdict is the one that blocks commits.
+    _rec=$(sed -n 's/^sha256:[[:space:]]*//p' "$HOOK_DEPLOY_REV" 2>/dev/null |
+             tr -d '\r' | awk 'NR==1{print $1}')
     if [ "$_rec" != "$_dep_sha" ]; then
       echo "    STALE RECORD: .rev describes different bytes than the deployed file"
       # And the provenance line below must not contradict it. Review drove that
