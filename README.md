@@ -800,6 +800,33 @@ both of which only ever get *stricter* for one spawn, never looser:
   `--auto-approve`, `--config`, `--profile`, `--cwd`, `--no-rules`,
   `--allowedTools`, `--bare`, `--append-system-prompt`, …); a literal
   command still runs, visibly reported as UNMANAGED.
+- **Credential posture** (`lib/op-env.sh`) — a spawned worker starts with the
+  1Password service-account identity (one vault, read-only) plus
+  `OP_BIOMETRIC_UNLOCK_ENABLED=false`, so an unattended run never stops to ask
+  for a credential. The prelude names the file and interpolates nothing; no
+  value is ever typed into a pane. Three asymmetries, all asserted by
+  `verify-spawn-op-env.sh` and `verify-posture.sh`:
+  **(1)** an UNMANAGED literal command is withheld by default — it has no
+  posture flag and no approval surface — and needs an explicit `--secrets`;
+  **(2)** the job-class table (`secrets_default_for_job`) withholds for
+  anything matching `review`/`explore`/`audit`/`scrape`/`research`/`triage`
+  **and for any class it does not recognise** (fail closed). `spawn-agent.sh`
+  has no job class of its own, so it consults the table only when you pass
+  `--job <class>` — its tab label is never treated as one;
+  **(3)** withholding is inherited tighten-only via `HERDR_SECRETS_WITHHELD`,
+  so `--secrets` cannot lift a parent's.
+  **Half of withholding lives outside this repo.** `~/.zshenv` sources the
+  credential file for every zsh, so without a guard there a withheld worker's
+  first `zsh -c` child gets the token straight back. Install it:
+  ```sh
+  [ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] || { [ -r "$HOME/.config/op/service-account.env" ] && . "$HOME/.config/op/service-account.env"; }
+  ```
+  Both spawners probe for it (`op_env_guard_installed`) and downgrade the
+  printed line to `WITHHELD … DEGRADED` when it is absent, rather than claiming
+  a guarantee that is not in force. Withholding removes ambient inheritance
+  down the worker's own process tree — it is not an access control: the file
+  stays readable by this uid, and a pane the worker asks herdr to create is a
+  child of the herdr server, outside the marker.
 - **Canonical operator rules** — task worktrees live under
   `~/.herdr/worktrees`, outside the project's ancestor tree, so a worker's
   upward rule discovery never reached `~/Code/AGENTS.md`. Managed omp-backed
@@ -1163,6 +1190,7 @@ or queries Neon.
 | `install.sh` | wire the hooks into Claude Code and the omp extension symlink (idempotent, dry-run by default) |
 | `verify-run-registry.sh` | 42-check verification of the SQLite run registry — sequencing, dedup, transactions, migration from the old file layout |
 | `verify-posture.sh` | 49-check verification of the posture ladder — composition, fail-closed unknowns, per-agent flag translation |
+| `verify-spawn-op-env.sh` | 12-check verification of `lib/op-env.sh` — that a spawned worker gets a working non-interactive 1Password identity, that `--no-secrets` genuinely withholds it (including from a `zsh -c` child, the path `~/.zshenv` used to re-grant), that the unmanaged literal-command path is withheld by default, that no credential value can reach the line typed into the pane (asserted against argv captured from a stubbed herdr), and that the ambient grant is still only the op token |
 | `verify-command-policy.sh` | 56-check verification of the command-policy classifier — floor rules, normalization, operator rules, credential/production escalation, curl\|sh-class bypasses, obfuscation/backslash-escape/heredoc coverage |
 | `verify-select-policy.sh` | 44-check verification of `herdr-select.sh --authority peer` against a stubbed herdr — runs the real script, not a reimplementation |
 | `verify-omp-hooks.sh` | 41-check verification of the omp extension's four event handlers against a stubbed pane |

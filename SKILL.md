@@ -363,6 +363,24 @@ the project's ancestor `AGENTS.md` files (which a worktree's upward
 discovery cannot reach) with provenance — a configured-but-unusable rules
 source fails the spawn instead of launching without the operator's rules.
 
+**Secrets are ON by default; `--no-secrets` withholds them.** Both spawners
+prepend `lib/op-env.sh`'s prelude to the worker's launch line, so a managed
+worker starts with the machine's 1Password service-account identity (one
+vault, read-only) and `OP_BIOMETRIC_UNLOCK_ENABLED=false` — an unattended run
+never stops to ask for a credential, which it otherwise does by hunting for a
+`.env.local` that a linked worktree does not have. The prelude names the file
+and interpolates nothing; no value is ever typed into a pane.
+
+Three asymmetries worth knowing, all enforced by `verify-spawn-op-env.sh`:
+an **unmanaged literal command** (no posture flag, no approval surface) is
+**withheld by default** and needs an explicit `--secrets`; withholding is
+**tighten-only and inherited** (`HERDR_SECRETS_WITHHELD=1`, which `~/.zshenv`
+honours, so a `zsh -c` child cannot re-source its way back to the token); and
+withhold mode deliberately leaves the TCC probe armed, so an `op` call from a
+worker that should not be making one stalls visibly instead of succeeding
+quietly. Use `--no-secrets` for any task handling material we did not write —
+third-party code review, a scrape, anything parsing untrusted input.
+
 **A prompt's own command decides whether a peer may answer it.**
 `lib/command-policy.sh` classifies the shell text behind a prompt as
 `allow` / `escalate` / `deny` — recursive `rm`, `git push --force`,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-agent.sh [--focus] [--posture P] <project-path> <role-label> [command...]
+# spawn-agent.sh [--focus] [--posture P] [--no-secrets] <project-path> <role-label> [command...]
 #
 # Launch an agent SESSION in its own new tab of the project's workspace:
 #   - ensure the project's workspace is open (ensure-workspace.sh, always --no-focus)
@@ -38,13 +38,26 @@ here=$(cd "$(dirname "$0")" && pwd)
 source "$here/config.sh"
 . "$here/lib/agent-profiles.sh"
 . "$here/lib/repo-root.sh"
+. "$here/lib/op-env.sh"
 
-foc=--no-focus; posture_req=""
+# Same contract as spawn-task.sh: ON for a managed launch, OFF for an unmanaged
+# literal command, tighten-only inheritance from a withheld parent.
+secrets_req=""
+[ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && secrets_req=withhold
+foc=--no-focus; posture_req=""; job_class=""
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --focus) foc=--focus; shift ;;
+    --no-secrets) secrets_req=withhold; shift ;;  # withhold the vault-read credential — lib/op-env.sh
+    --secrets) secrets_req=grant; shift ;;        # grant it to an UNMANAGED launch
     --posture) posture_req="${2:?spawn-agent: --posture needs a value (yolo|write|strict)}"; shift 2 ;;
+    --job) job_class="${2:?spawn-agent: --job needs a class (review|implement|explore|...)}"; shift 2 ;;
+    # Everything after `--` belongs to the pane's own command, flags included.
+    # Without this, a `--no-secrets` meant for the worker's command was eaten
+    # here and silently changed THIS spawn's credential posture
+    # (SPAWN-OPENV-008-R; spawn-task.sh had it, this did not).
+    --) shift; args+=("$@"); break ;;
     *) args+=("$1"); shift ;;
   esac
 done
@@ -77,6 +90,28 @@ if cli=$(cli_for_agent "$agent" "$(model_for_agent "$agent" implement)" "$postur
 else
   managed=0
   cli="${cmd[*]}"  # literal command; no model mapping, no posture flag, no rules append
+fi
+# Same precedence as spawn-task.sh. spawn-agent has no job class of its own —
+# it launches at the `implement` tier — so the table is consulted with the
+# ROLE label, which is what an operator actually types (`review`, `explore`).
+op_mode=withhold
+secrets_why="unmanaged literal command"
+[ "$managed" = 1 ] && [ "$secrets_req" != withhold ] && { op_mode=""; secrets_why="managed default"; }
+# The ROLE is a free-text tab label, not a job class — matching it against the
+# table produced coverage that was not real (SPAWN-OPENV-010). Consult the table
+# only when the caller states a class with --job.
+if [ -n "$job_class" ] && [ -z "$op_mode" ] && [ "$(secrets_default_for_job "$job_class")" = withhold ]; then
+	op_mode=withhold; secrets_why="job class '$job_class' reads material we did not write"
+fi
+[ "$secrets_req" = withhold ] && { op_mode=withhold; secrets_why="--no-secrets"; }
+[ "$secrets_req" = grant ] && { op_mode=""; secrets_why="--secrets"; }
+[ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && { op_mode=withhold; secrets_why="inherited from a withheld parent"; }
+secrets_note="service account (read-only, 1 vault) — op resolves with no human [$secrets_why]"
+if [ "$op_mode" = withhold ]; then
+  secrets_note="WITHHELD [$secrets_why] — token not placed in this pane's environment (the 600-mode file stays readable by this uid; not a sandbox)"
+  # Half the mechanism is a guard in ~/.zshenv this repo does not install. Say
+  # so rather than printing a guarantee that is not in force (SPAWN-OPENV-001-R).
+  op_env_guard_installed || secrets_note="WITHHELD [$secrets_why] — DEGRADED: the ~/.zshenv HERDR_SECRETS_WITHHELD guard is MISSING, so a 'zsh -c' child re-sources the token. Install it or treat this as unwithheld."
 fi
 eff_posture=$(resolved_posture "$posture_req")
 
@@ -119,7 +154,8 @@ stamped_cli=$(printf 'export HERDR_PANE_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUC
   "$pane" "$conductor_id" "$conductor_pane_id" "$eff_posture")
 [ -n "${HERDR_POLICY_EXTRA_RULES:-}" ] && stamped_cli="$stamped_cli $(printf 'HERDR_POLICY_EXTRA_RULES=%q' "$HERDR_POLICY_EXTRA_RULES")"
 [ -n "$CANONICAL_RULES_SRC" ] && stamped_cli="$stamped_cli $(printf 'HERDR_CANONICAL_RULES=%q' "$CANONICAL_RULES_SRC")"
-stamped_cli="$stamped_cli; $cli"
+# op prelude first — same contract as spawn-task.sh and the launchd plists.
+stamped_cli="$(op_env_prelude "$op_mode") $stamped_cli; $cli"
 
 herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 \
   || { echo "spawn-agent: failed to run '$cli' in $pane" >&2; exit 1; }
@@ -141,4 +177,8 @@ else
   printf '  ⚠ UNMANAGED literal command: no posture flag, no canonical rules append —\n'
   printf '    only the env floor stamp reaches it; nothing here enforces approvals.\n'
 fi
+# Outside the managed/unmanaged branch: an unmanaged pane is exactly where a
+# silent credential grant would matter most, and this script keeps no registry
+# record, so its stdout is the only place the posture is ever stated.
+printf '  secrets:  %s\n' "$secrets_note"
 printf '  registry: <not registered — no task identity or wake persistence; use spawn-task.sh for a supervised worktree task>\n'

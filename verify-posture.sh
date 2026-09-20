@@ -287,6 +287,65 @@ else
 fi
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t3 quick ./my-tool --flag 2>&1)
 printf '%s\n' "$out" | grep -q 'UNMANAGED' && ok "literal command visibly reported as UNMANAGED" || bad "unmanaged launch not reported: $out"
+
+# ── credential posture (lib/op-env.sh) ─────────────────────────────────────
+# These live here, beside the posture checks, because the standalone
+# verify-spawn-op-env.sh is only as good as someone remembering to run it.
+# HONEST NOTE (SPAWN-OPENV-003-R): nothing in this repo RUNS either suite —
+# .github/workflows/secret-scan.yml deliberately excludes verify-*.sh and there
+# is no pre-push hook. Both are hand-run or opened from .herdr-control/project.json.
+# Until a self-hosted runner exists, the spawn-time degraded-mode warning in
+# lib/op-env.sh (op_env_guard_installed) is the control, not this file.
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t5 implement omp 2>&1)
+printf '%s\n' "$out" | grep -q 'secrets   : service account' \
+  && ok "managed spawn reports the service-account identity" || bad "secrets line missing on a managed spawn: $out"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run --no-secrets "$fleet/proj" t5 implement omp 2>&1)
+printf '%s\n' "$out" | grep -q 'secrets   : WITHHELD' \
+  && ok "--no-secrets flips the reported posture" || bad "--no-secrets not honoured: $out"
+# The UNMANAGED path has no posture flag and no approval surface, so it must
+# NOT get a vault credential unless it is asked for explicitly.
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t6 quick ./my-tool 2>&1)
+printf '%s\n' "$out" | grep -q 'secrets   : WITHHELD' \
+  && ok "unmanaged literal command is withheld by default" || bad "unmanaged launch got a credential: $out"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run --secrets "$fleet/proj" t6 quick ./my-tool 2>&1)
+printf '%s\n' "$out" | grep -q 'secrets   : service account' \
+  && ok "--secrets grants the unmanaged path when asked" || bad "--secrets ignored on unmanaged: $out"
+# Tighten-only inheritance: a withheld worker cannot re-grant to its children.
+out=$(env "${spawn_env[@]}" HERDR_SECRETS_WITHHELD=1 bash "$here/spawn-task.sh" --dry-run --secrets "$fleet/proj" t7 implement omp 2>&1)
+printf '%s\n' "$out" | grep -q 'secrets   : WITHHELD' \
+  && ok "inherited withholding cannot be lifted by a child --secrets" || bad "child re-granted itself a credential: $out"
+# A flag after `--` belongs to the worker's command, not to this script.
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t8 quick -- ./my-tool --no-secrets 2>&1)
+printf '%s\n' "$out" | grep -q -- './my-tool --no-secrets' \
+  && ok "flags after -- reach the worker's command intact" || bad "worker argv was eaten: $out"
+# Same for spawn-agent.sh, which did not have the terminator until SPAWN-OPENV-008-R
+# and which no verifier had ever executed.
+if grep -q -- '--) shift; args+=("$@"); break ;;' "$here/spawn-agent.sh"; then
+  ok "spawn-agent.sh honours the -- terminator"
+else
+  bad "spawn-agent.sh still steals flags meant for the pane's command"
+fi
+# And the job-class table must fail CLOSED on anything it does not recognise.
+. "$here/lib/agent-profiles.sh"
+[ "$(secrets_default_for_job pr-review)" = withhold ] && ok "job-class match is substring (pr-review withheld)" || bad "pr-review fell through to grant"
+[ "$(secrets_default_for_job wat)" = withhold ] && ok "an unrecognised job class fails closed" || bad "unknown job class granted a credential"
+# Job-class defaults (lib/agent-profiles.sh `secrets_default_for_job`): the
+# safe choice made once per class instead of remembered at every spawn.
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 review omp 2>&1)
+printf '%s\n' "$out" | grep -q "secrets   : WITHHELD \[job class 'review'" \
+  && ok "review class is withheld by default, and says why" || bad "review class got a credential: $out"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 explore omp 2>&1)
+printf '%s\n' "$out" | grep -q 'secrets   : WITHHELD' \
+  && ok "explore class is withheld by default" || bad "explore class got a credential: $out"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 implement omp 2>&1)
+printf '%s\n' "$out" | grep -q 'secrets   : service account' \
+  && ok "implement class keeps the credential (the unattended-run case)" || bad "implement lost its credential: $out"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run --secrets "$fleet/proj" t9 review omp 2>&1)
+printf '%s\n' "$out" | grep -q 'secrets   : service account.*--secrets' \
+  && ok "--secrets lifts a job-class default (a reviewer that must query the DB)" || bad "--secrets could not lift the class default: $out"
+out=$(env "${spawn_env[@]}" HERDR_SECRETS_WITHHELD=1 bash "$here/spawn-task.sh" --dry-run --secrets "$fleet/proj" t9 implement omp 2>&1)
+printf '%s\n' "$out" | grep -q 'WITHHELD \[inherited' \
+  && ok "inheritance still outranks --secrets, and names itself" || bad "inherited withholding was lifted: $out"
 if out=$(env "${spawn_env[@]}" "HERDR_CANONICAL_RULES=$WORK/does-not-exist.md" \
       bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t4 implement omp 2>&1); then
   bad "configured-but-missing rules source must fail the managed spawn"

