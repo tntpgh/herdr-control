@@ -85,12 +85,20 @@ else
   managed=0
   cli="${cmd[*]}"  # literal command; no model mapping, no posture flag, no rules append
 fi
+# Same precedence as spawn-task.sh. spawn-agent has no job class of its own —
+# it launches at the `implement` tier — so the table is consulted with the
+# ROLE label, which is what an operator actually types (`review`, `explore`).
 op_mode=withhold
-[ "$managed" = 1 ] && [ "$secrets_req" != withhold ] && op_mode=""
-[ "$secrets_req" = grant ] && op_mode=""
-[ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && op_mode=withhold   # tighten-only
-secrets_note="service account (read-only, 1 vault) — op resolves with no human"
-[ "$op_mode" = withhold ] && secrets_note="WITHHELD — token not placed in this pane's environment (the 600-mode file stays readable by this uid; not a sandbox)"
+secrets_why="unmanaged literal command"
+[ "$managed" = 1 ] && [ "$secrets_req" != withhold ] && { op_mode=""; secrets_why="managed default"; }
+if [ -z "$op_mode" ] && [ "$(secrets_default_for_job "$role")" = withhold ]; then
+	op_mode=withhold; secrets_why="role '$role' reads material we did not write"
+fi
+[ "$secrets_req" = withhold ] && { op_mode=withhold; secrets_why="--no-secrets"; }
+[ "$secrets_req" = grant ] && { op_mode=""; secrets_why="--secrets"; }
+[ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && { op_mode=withhold; secrets_why="inherited from a withheld parent"; }
+secrets_note="service account (read-only, 1 vault) — op resolves with no human [$secrets_why]"
+[ "$op_mode" = withhold ] && secrets_note="WITHHELD [$secrets_why] — token not placed in this pane's environment (the 600-mode file stays readable by this uid; not a sandbox)"
 eff_posture=$(resolved_posture "$posture_req")
 
 # repo_root (lib/repo-root.sh), not --show-toplevel: inside a linked worktree

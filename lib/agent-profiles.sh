@@ -100,6 +100,30 @@ answer_strategy_for_agent() {           # <agent> -> strategy
 # Claude and omp both fuzzy-match plain aliases (opus/sonnet/haiku) to a
 # current canonical model, so they share the same tier names. Codex has no
 # such alias scheme, so its model names are set in config.sh instead.
+# Credential posture BY JOB CLASS — the safe choice made once, not remembered
+# at every spawn (security review 2026-09-19, SPAWN-OPENV-006).
+#
+# The risk that justifies withholding attaches to the KIND of work, not to the
+# individual call: `review` reads diffs and third-party code, `explore` reads
+# whatever is out there. Both process material we did not write, which is the
+# one case where a prompt-injected instruction could reach a process holding a
+# vault credential. `implement`/`debug`/`plan` work on our own tree against our
+# own databases and genuinely need secrets — that is why the default is ON at
+# all (an opt-in flag was measured to be the wrong default: nearly every task
+# here reads a secret, so a forgotten flag parks an overnight run).
+#
+# Precedence in the spawners, strictest wins:
+#   HERDR_SECRETS_WITHHELD=1 (inherited)  >  --no-secrets  >  this table
+#   >  unmanaged-literal-command default  >  --secrets  >  managed default ON
+# So --secrets can lift a job-class default (a reviewer that must query the DB)
+# but never an inherited withholding.
+secrets_default_for_job() {  # <job-class> -> "withhold" | ""
+	case "$1" in
+		review|explore) printf 'withhold\n' ;;
+		*)              printf '\n' ;;
+	esac
+}
+
 model_for_agent() {
   local a="$1" j="$2"
   case "$a:$j" in

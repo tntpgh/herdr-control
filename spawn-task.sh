@@ -141,12 +141,20 @@ fi
 # would otherwise run with a vault credential in its environment and nothing
 # between the two. Say --secrets if that is genuinely what you want.
 op_mode=withhold
-if [ "$managed" = 1 ] && [ "$secrets_req" != withhold ]; then op_mode=""; fi
-if [ "$secrets_req" = grant ]; then op_mode=""; fi
-# Inherited withholding is tighten-only: --secrets cannot lift a parent's.
-[ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && op_mode=withhold
-secrets_note="service account (read-only, 1 vault) — op resolves with no human"
-[ "$op_mode" = withhold ] && secrets_note="WITHHELD — token not placed in this worker's environment (the 600-mode file stays readable by this uid; not a sandbox)"
+secrets_why="unmanaged literal command"
+if [ "$managed" = 1 ] && [ "$secrets_req" != withhold ]; then op_mode=""; secrets_why="managed default"; fi
+# Job class decides next (lib/agent-profiles.sh): review/explore read material
+# we did not write, so they are withheld even when managed.
+if [ -z "$op_mode" ] && [ "$(secrets_default_for_job "$job")" = withhold ]; then
+	op_mode=withhold; secrets_why="job class '$job' reads material we did not write"
+fi
+[ "$secrets_req" = withhold ] && { op_mode=withhold; secrets_why="--no-secrets"; }
+# --secrets lifts a job-class or unmanaged default, never an inherited one.
+[ "$secrets_req" = grant ] && { op_mode=""; secrets_why="--secrets"; }
+# Inherited withholding is tighten-only and wins over everything above.
+[ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && { op_mode=withhold; secrets_why="inherited from a withheld parent"; }
+secrets_note="service account (read-only, 1 vault) — op resolves with no human [$secrets_why]"
+[ "$op_mode" = withhold ] && secrets_note="WITHHELD [$secrets_why] — token not placed in this worker's environment (the 600-mode file stays readable by this uid; not a sandbox)"
 # The posture actually in force for this spawn (floor composed with the
 # request — can only tighten). Stamped into the worker below as ITS floor,
 # so a child spawn from inside the worktree can tighten further but never

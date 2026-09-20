@@ -313,6 +313,23 @@ printf '%s\n' "$out" | grep -q 'secrets   : WITHHELD' \
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t8 quick -- ./my-tool --no-secrets 2>&1)
 printf '%s\n' "$out" | grep -q -- './my-tool --no-secrets' \
   && ok "flags after -- reach the worker's command intact" || bad "worker argv was eaten: $out"
+# Job-class defaults (lib/agent-profiles.sh `secrets_default_for_job`): the
+# safe choice made once per class instead of remembered at every spawn.
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 review omp 2>&1)
+printf '%s\n' "$out" | grep -q "secrets   : WITHHELD \[job class 'review'" \
+  && ok "review class is withheld by default, and says why" || bad "review class got a credential: $out"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 explore omp 2>&1)
+printf '%s\n' "$out" | grep -q 'secrets   : WITHHELD' \
+  && ok "explore class is withheld by default" || bad "explore class got a credential: $out"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 implement omp 2>&1)
+printf '%s\n' "$out" | grep -q 'secrets   : service account' \
+  && ok "implement class keeps the credential (the unattended-run case)" || bad "implement lost its credential: $out"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run --secrets "$fleet/proj" t9 review omp 2>&1)
+printf '%s\n' "$out" | grep -q 'secrets   : service account.*--secrets' \
+  && ok "--secrets lifts a job-class default (a reviewer that must query the DB)" || bad "--secrets could not lift the class default: $out"
+out=$(env "${spawn_env[@]}" HERDR_SECRETS_WITHHELD=1 bash "$here/spawn-task.sh" --dry-run --secrets "$fleet/proj" t9 implement omp 2>&1)
+printf '%s\n' "$out" | grep -q 'WITHHELD \[inherited' \
+  && ok "inheritance still outranks --secrets, and names itself" || bad "inherited withholding was lifted: $out"
 if out=$(env "${spawn_env[@]}" "HERDR_CANONICAL_RULES=$WORK/does-not-exist.md" \
       bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t4 implement omp 2>&1); then
   bad "configured-but-missing rules source must fail the managed spawn"
