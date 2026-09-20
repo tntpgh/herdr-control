@@ -117,10 +117,20 @@ answer_strategy_for_agent() {           # <agent> -> strategy
 #   >  unmanaged-literal-command default  >  --secrets  >  managed default ON
 # So --secrets can lift a job-class default (a reviewer that must query the DB)
 # but never an inherited withholding.
+# Matching is SUBSTRING and fail-closed (SPAWN-OPENV-010). Exact tokens looked
+# tidy and covered almost nothing a human types: `pr-review`, `code-review`,
+# `review-111`, `audit`, `triage`, `scrape`, `research` all fell through to
+# GRANT and printed "[managed default]", which reads like a decision rather
+# than a miss. An unrecognised class is withheld: a job nobody classified is
+# exactly the one nobody thought about.
+KNOWN_JOB_CLASSES="plan architect review design implement debug code docs explore quick mechanical"
 secrets_default_for_job() {  # <job-class> -> "withhold" | ""
 	case "$1" in
-		review|explore) printf 'withhold\n' ;;
-		*)              printf '\n' ;;
+		*review*|*explore*|*audit*|*scrape*|*research*|*triage*) printf 'withhold\n'; return ;;
+	esac
+	case " $KNOWN_JOB_CLASSES " in
+		*" $1 "*) printf '\n' ;;
+		*)        printf 'withhold\n' ;;   # unrecognised: fail closed
 	esac
 }
 

@@ -154,7 +154,12 @@ fi
 # Inherited withholding is tighten-only and wins over everything above.
 [ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && { op_mode=withhold; secrets_why="inherited from a withheld parent"; }
 secrets_note="service account (read-only, 1 vault) — op resolves with no human [$secrets_why]"
-[ "$op_mode" = withhold ] && secrets_note="WITHHELD [$secrets_why] — token not placed in this worker's environment (the 600-mode file stays readable by this uid; not a sandbox)"
+if [ "$op_mode" = withhold ]; then
+  secrets_note="WITHHELD [$secrets_why] — token not placed in this worker's environment (the 600-mode file stays readable by this uid; not a sandbox)"
+  # Half the mechanism is a guard in ~/.zshenv this repo does not install. Say
+  # so rather than printing a guarantee that is not in force (SPAWN-OPENV-001-R).
+  op_env_guard_installed || secrets_note="WITHHELD [$secrets_why] — DEGRADED: the ~/.zshenv HERDR_SECRETS_WITHHELD guard is MISSING, so a 'zsh -c' child re-sources the token. Install it or treat this as unwithheld."
+fi
 # The posture actually in force for this spawn (floor composed with the
 # request — can only tighten). Stamped into the worker below as ITS floor,
 # so a child spawn from inside the worktree can tighten further but never

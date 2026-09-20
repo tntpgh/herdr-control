@@ -44,7 +44,7 @@ source "$here/config.sh"
 # literal command, tighten-only inheritance from a withheld parent.
 secrets_req=""
 [ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && secrets_req=withhold
-foc=--no-focus; posture_req=""
+foc=--no-focus; posture_req=""; job_class=""
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,6 +52,12 @@ while [ $# -gt 0 ]; do
     --no-secrets) secrets_req=withhold; shift ;;  # withhold the vault-read credential — lib/op-env.sh
     --secrets) secrets_req=grant; shift ;;        # grant it to an UNMANAGED launch
     --posture) posture_req="${2:?spawn-agent: --posture needs a value (yolo|write|strict)}"; shift 2 ;;
+    --job) job_class="${2:?spawn-agent: --job needs a class (review|implement|explore|...)}"; shift 2 ;;
+    # Everything after `--` belongs to the pane's own command, flags included.
+    # Without this, a `--no-secrets` meant for the worker's command was eaten
+    # here and silently changed THIS spawn's credential posture
+    # (SPAWN-OPENV-008-R; spawn-task.sh had it, this did not).
+    --) shift; args+=("$@"); break ;;
     *) args+=("$1"); shift ;;
   esac
 done
@@ -91,14 +97,22 @@ fi
 op_mode=withhold
 secrets_why="unmanaged literal command"
 [ "$managed" = 1 ] && [ "$secrets_req" != withhold ] && { op_mode=""; secrets_why="managed default"; }
-if [ -z "$op_mode" ] && [ "$(secrets_default_for_job "$role")" = withhold ]; then
-	op_mode=withhold; secrets_why="role '$role' reads material we did not write"
+# The ROLE is a free-text tab label, not a job class — matching it against the
+# table produced coverage that was not real (SPAWN-OPENV-010). Consult the table
+# only when the caller states a class with --job.
+if [ -n "$job_class" ] && [ -z "$op_mode" ] && [ "$(secrets_default_for_job "$job_class")" = withhold ]; then
+	op_mode=withhold; secrets_why="job class '$job_class' reads material we did not write"
 fi
 [ "$secrets_req" = withhold ] && { op_mode=withhold; secrets_why="--no-secrets"; }
 [ "$secrets_req" = grant ] && { op_mode=""; secrets_why="--secrets"; }
 [ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && { op_mode=withhold; secrets_why="inherited from a withheld parent"; }
 secrets_note="service account (read-only, 1 vault) — op resolves with no human [$secrets_why]"
-[ "$op_mode" = withhold ] && secrets_note="WITHHELD [$secrets_why] — token not placed in this pane's environment (the 600-mode file stays readable by this uid; not a sandbox)"
+if [ "$op_mode" = withhold ]; then
+  secrets_note="WITHHELD [$secrets_why] — token not placed in this pane's environment (the 600-mode file stays readable by this uid; not a sandbox)"
+  # Half the mechanism is a guard in ~/.zshenv this repo does not install. Say
+  # so rather than printing a guarantee that is not in force (SPAWN-OPENV-001-R).
+  op_env_guard_installed || secrets_note="WITHHELD [$secrets_why] — DEGRADED: the ~/.zshenv HERDR_SECRETS_WITHHELD guard is MISSING, so a 'zsh -c' child re-sources the token. Install it or treat this as unwithheld."
+fi
 eff_posture=$(resolved_posture "$posture_req")
 
 # repo_root (lib/repo-root.sh), not --show-toplevel: inside a linked worktree

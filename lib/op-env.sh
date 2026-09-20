@@ -76,10 +76,31 @@ OP_ENV_FILE="${OP_ENV_FILE:-$HOME/.config/op/service-account.env}"
 
 # Variable names exported by the service-account file. Names only, by
 # construction: the value side of every line is discarded by the regex.
+#
+# ALWAYS includes the two literals we know the file carries. Reading the file
+# was meant to future-proof the unset list; on its own it also fails OPEN — a
+# readable file with no `NAME=` lines yields the empty string, the prelude
+# emits `unset ;` (a no-op), the pane shell has already sourced ~/.zshenv, and
+# the spawner prints WITHHELD over a worker that still holds the token
+# (security review 2026-09-19, SPAWN-OPENV-009).
 op_env_names() {
-	[ -r "$OP_ENV_FILE" ] || { printf '%s' OP_SERVICE_ACCOUNT_TOKEN; return; }
-	grep -oE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' "$OP_ENV_FILE" \
-		| sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/=$//' | sort -u | tr '\n' ' '
+	names=""
+	[ -r "$OP_ENV_FILE" ] && names=$(grep -oE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' "$OP_ENV_FILE" \
+		| sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/=$//' | sort -u | tr '\n' ' ')
+	case " $names " in
+		*" OP_SERVICE_ACCOUNT_TOKEN "*) ;;
+		*) names="OP_SERVICE_ACCOUNT_TOKEN $names" ;;
+	esac
+	printf '%s' "$names"
+}
+
+# Is the ~/.zshenv guard that makes withholding survive a zsh child installed?
+# Half of the withhold mechanism lives in a file this repo does not own
+# (SPAWN-OPENV-001-R). Without it, `unset` clears one shell and the worker's
+# first `zsh -c` child re-sources the token — so callers MUST degrade their
+# reporting rather than print an unconditional "WITHHELD".
+op_env_guard_installed() {
+	grep -q 'HERDR_SECRETS_WITHHELD' "$HOME/.zshenv" 2>/dev/null
 }
 
 # $1: "withhold" for a worker that must not hold the credential; anything else
@@ -94,14 +115,21 @@ op_env_prelude() {
 		#     withheld worker's first zsh child got the token straight back. That
 		#     file now skips sourcing when this marker is set.
 		#   * it is exported, so a child spawn made from inside a withheld worker
-		#     inherits the restriction. Tighten-only, like HERDR_POSTURE_FLOOR:
-		#     a withheld worker cannot re-grant to its own children.
-		# It is NOT a sandbox: the file is mode 600 owned by this uid, so an
-		# agent that decides to read it can. What this removes is ambient
-		# inheritance — the token is no longer sitting in the environment of a
-		# process handling material we did not write.
-		printf 'export HERDR_SECRETS_WITHHELD=1; unset %s;' "$(op_env_names)"
+		#     inherits the restriction. Tighten-only, like HERDR_POSTURE_FLOOR.
+		# It is NOT a sandbox: the file is mode 600 owned by this uid, and a pane
+		# the worker asks herdr to create is a child of the herdr server, not of
+		# the worker, so it starts outside the withholding (SPAWN-OPENV-013).
+		# What this removes is ambient inheritance down the worker's own tree.
+		#
+		# OP_BIOMETRIC_UNLOCK_ENABLED=false is set in BOTH modes. It is not a
+		# credential. Withholding it was defensible while withhold meant "an
+		# operator typed --no-secrets"; once a job-class table can withhold by
+		# DEFAULT, an armed TCC probe means a token-less `op` hangs 25s on a
+		# prompt nobody can answer — reintroducing exactly the parked-overnight-
+		# run failure this design exists to prevent (SPAWN-OPENV-011). Disarmed,
+		# it fails fast and loudly instead, and the WITHHELD line is the signal.
+		printf 'export HERDR_SECRETS_WITHHELD=1; unset %s; export OP_BIOMETRIC_UNLOCK_ENABLED=false;' "$(op_env_names)"
 	else
-		printf '%s' '[ -r "$HOME/.config/op/service-account.env" ] && . "$HOME/.config/op/service-account.env"; export OP_BIOMETRIC_UNLOCK_ENABLED=false;'
+		printf '[ -r %s ] && . %s; export OP_BIOMETRIC_UNLOCK_ENABLED=false;' '"$HOME/.config/op/service-account.env"' '"$HOME/.config/op/service-account.env"'
 	fi
 }

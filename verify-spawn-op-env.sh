@@ -40,19 +40,44 @@ for p in "$prelude" "$withheld"; do
 	esac
 done
 
-# 3. The DEFAULT disarms the TCC probe — with a token but without it, `op`
-#    blocks forever from a background session (1Password/shell-plugins#606 —
-#    the 2026-09-06 Slack-bridge deadlock). WITHHOLD deliberately does not: in
-#    the mode that means "this worker has no business calling op", a stalling
-#    `op` is a signal, and silencing it would hide an unauthorized call.
-case "$prelude" in
-	*"OP_BIOMETRIC_UNLOCK_ENABLED=false"*) check "default disarms the TCC probe" 0 "OP_BIOMETRIC_UNLOCK_ENABLED=false" ;;
-	*) check "default disarms the TCC probe" 1 "missing in: $prelude" ;;
-esac
+# 3. BOTH modes disarm the TCC probe. Without it, `op` blocks forever from a
+#    background session (1Password/shell-plugins#606 — the 2026-09-06
+#    Slack-bridge deadlock). This check was inverted for withhold mode until
+#    SPAWN-OPENV-011: "a stalling op is a signal" holds when a human typed
+#    --no-secrets, but withhold is now a job-class DEFAULT, and an armed probe
+#    there means a 25s hang on a prompt nobody can answer — the parked-run
+#    failure the whole design exists to prevent.
+for p in "$prelude" "$withheld"; do
+	case "$p" in
+		*"OP_BIOMETRIC_UNLOCK_ENABLED=false"*) check "TCC probe disarmed" 0 "a token-less op fails fast instead of hanging" ;;
+		*) check "TCC probe disarmed" 1 "missing in: $p" ;;
+	esac
+done
+
+# 3b. Withhold must never emit a no-op `unset ;` (SPAWN-OPENV-009). The names
+#     come from a file this repo does not own; an empty result used to mean the
+#     prelude removed nothing while the spawner printed WITHHELD.
 case "$withheld" in
-	*"OP_BIOMETRIC_UNLOCK_ENABLED=false"*) check "withhold leaves the TCC probe armed" 1 "withhold silenced the probe: $withheld" ;;
-	*) check "withhold leaves the TCC probe armed" 0 "an op call from a withheld worker still surfaces" ;;
+	*"unset OP_SERVICE_ACCOUNT_TOKEN"*|*" OP_SERVICE_ACCOUNT_TOKEN "*)
+		check "withhold always unsets the op token by name" 0 "the literal is in the unset list regardless of the file" ;;
+	*) check "withhold always unsets the op token by name" 1 "unset list does not name the token: $withheld" ;;
 esac
+empty=$(OP_ENV_FILE=/dev/null bash -c '. '"$here"'/lib/op-env.sh; op_env_prelude withhold')
+case "$empty" in
+	*"unset OP_SERVICE_ACCOUNT_TOKEN"*) check "withhold survives an unreadable/empty credential file" 0 "OP_ENV_FILE=/dev/null still unsets the token" ;;
+	*) check "withhold survives an unreadable/empty credential file" 1 "fails open: $empty" ;;
+esac
+
+# 3c. THE OUT-OF-REPO HALF. Withholding only survives a `zsh -c` child because
+#     ~/.zshenv skips sourcing the credential file when the marker is set. This
+#     repo neither installs nor owns that line (SPAWN-OPENV-001-R), so its
+#     absence must be loud, not silent.
+if op_env_guard_installed; then
+	check "the ~/.zshenv withhold guard is installed" 0 "HERDR_SECRETS_WITHHELD honoured by the shell profile"
+else
+	check "the ~/.zshenv withhold guard is installed" 1 \
+		"MISSING — --no-secrets clears one shell and the worker's first 'zsh -c' child re-sources the token. Add: [ \"\${HERDR_SECRETS_WITHHELD:-}\" = 1 ] || { [ -r \"\$HOME/.config/op/service-account.env\" ] && . \"\$HOME/.config/op/service-account.env\"; }"
+fi
 
 # 4. Both entry points apply the prelude AND accept the flag. A lib nothing
 #    calls is the failure mode this repo has already shipped once.

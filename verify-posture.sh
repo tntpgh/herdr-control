@@ -289,8 +289,13 @@ out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t
 printf '%s\n' "$out" | grep -q 'UNMANAGED' && ok "literal command visibly reported as UNMANAGED" || bad "unmanaged launch not reported: $out"
 
 # ── credential posture (lib/op-env.sh) ─────────────────────────────────────
-# These live here, in the harness ci already runs, because the standalone
+# These live here, beside the posture checks, because the standalone
 # verify-spawn-op-env.sh is only as good as someone remembering to run it.
+# HONEST NOTE (SPAWN-OPENV-003-R): nothing in this repo RUNS either suite —
+# .github/workflows/secret-scan.yml deliberately excludes verify-*.sh and there
+# is no pre-push hook. Both are hand-run or opened from .herdr-control/project.json.
+# Until a self-hosted runner exists, the spawn-time degraded-mode warning in
+# lib/op-env.sh (op_env_guard_installed) is the control, not this file.
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t5 implement omp 2>&1)
 printf '%s\n' "$out" | grep -q 'secrets   : service account' \
   && ok "managed spawn reports the service-account identity" || bad "secrets line missing on a managed spawn: $out"
@@ -313,6 +318,17 @@ printf '%s\n' "$out" | grep -q 'secrets   : WITHHELD' \
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t8 quick -- ./my-tool --no-secrets 2>&1)
 printf '%s\n' "$out" | grep -q -- './my-tool --no-secrets' \
   && ok "flags after -- reach the worker's command intact" || bad "worker argv was eaten: $out"
+# Same for spawn-agent.sh, which did not have the terminator until SPAWN-OPENV-008-R
+# and which no verifier had ever executed.
+if grep -q -- '--) shift; args+=("$@"); break ;;' "$here/spawn-agent.sh"; then
+  ok "spawn-agent.sh honours the -- terminator"
+else
+  bad "spawn-agent.sh still steals flags meant for the pane's command"
+fi
+# And the job-class table must fail CLOSED on anything it does not recognise.
+. "$here/lib/agent-profiles.sh"
+[ "$(secrets_default_for_job pr-review)" = withhold ] && ok "job-class match is substring (pr-review withheld)" || bad "pr-review fell through to grant"
+[ "$(secrets_default_for_job wat)" = withhold ] && ok "an unrecognised job class fails closed" || bad "unknown job class granted a credential"
 # Job-class defaults (lib/agent-profiles.sh `secrets_default_for_job`): the
 # safe choice made once per class instead of remembered at every spawn.
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 review omp 2>&1)
