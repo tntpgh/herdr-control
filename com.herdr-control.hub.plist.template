@@ -6,14 +6,36 @@
 	<string>com.herdr-control.hub</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/env</string>
-		<string>python3</string>
-		<string>__HUB_PY__</string>
+		<!-- Sourced, not inherited: launchd gives a job none of the shell
+		     environment, so the read-only service-account identity has to be
+		     read from the file the way every other fleet agent does it (see
+		     com.teamthurber.eloop-stage1). Without it the notify path's
+		     `op read` had no token at all. `2>/dev/null` because the daemon
+		     must still start on a machine where the file is absent — the
+		     biometric flag above means that case fails fast instead of
+		     hanging on a prompt nobody is there to answer. -->
+		<string>/bin/bash</string>
+		<string>-c</string>
+		<string>source "$HOME/.config/op/service-account.env" 2>/dev/null; exec /usr/bin/env python3 __HUB_PY__</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<!-- NEVER let this daemon's descendants reach a Touch ID prompt.
+		     agent-edge.sh -> herdr-notify.sh sources ~/.config/herdr-bridge.env,
+		     whose Slack tokens are `${SLACK_BOT_TOKEN:-$(op read …)}`. launchd
+		     does not read ~/.zshenv, so that `op` ran with NO service-account
+		     token, and 1Password fell back to biometrics: on 2026-09-20 every
+		     burst of worker state changes painted a thumbprint prompt on
+		     Terrence's screen (81 unlock events, client pid = this daemon).
+		     A stale or revoked token does NOT do this — it returns 403 and
+		     exits. Only the ABSENCE of a token falls through to the GUI.
+		     The flag is the guarantee: with it, `op` fails fast instead of
+		     asking a human who may not be at the machine. The token below is
+		     the read-only identity, so the notify path resolves for real. -->
+		<key>OP_BIOMETRIC_UNLOCK_ENABLED</key>
+		<string>false</string>
 		<!-- Standing authority for agent-edge.sh to call peer-answer.sh, granted
 		     by Terrence on 2026-09-18 (decision 20260918T061813-58938, answer
 		     authority=grant). Without it every worker prompt reached a human,
