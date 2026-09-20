@@ -938,18 +938,31 @@ check_pii() {                   # <label> <added text> [<address-scoped text>]
     # reading the diff: default-locale awk exit 2, zero output, zero BLOCKED
     # lines, on a line carrying a real phone number one line below this
     # hook's own em-dash-heavy prose.
+    # LINEAR-ISH, not one substr() per byte. The prior loop tried a regex at
+    # EVERY start position and allocated `substr(line, i)` each time: O(n²) on
+    # a long line. A required vendored JS bundle with a 749,827-byte minified
+    # line left `git commit` inside this awk for 9 minutes at 0% CPU
+    # (tnt-skills, 2026-09-20). Generated bundles are legitimate tracked
+    # inputs; bypassing or allowlisting them would create a secret-scan hole.
+    #
+    # Search for the next phone-shaped candidate anywhere in the remaining
+    # suffix, check the non-consuming byte before/after, then resume ONE byte
+    # after its start. That preserves the separator-sharing fix above (the next
+    # candidate may start immediately after the same separator) while making
+    # work proportional to candidates rather than bytes².
     set +e +o pipefail
     printf '%s\n' "$text" \
         | LC_ALL=C awk '{
-            line = $0; n = length(line)
-            for (i = 1; i <= n; i++) {
-                rest = substr(line, i)
-                if (match(rest, /^(\+?1[-. ]?)?\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}/)) {
-                    before_ok = (i == 1) || (substr(line, i - 1, 1) !~ /[0-9]/)
-                    after = i + RLENGTH
-                    after_ok = (after > n) || (substr(line, after, 1) !~ /[0-9]/)
-                    if (before_ok && after_ok) print substr(rest, 1, RLENGTH)
-                }
+            line = $0; n = length(line); pos = 1
+            while (pos <= n) {
+                rest = substr(line, pos)
+                if (!match(rest, /(\+?1[-. ]?)?\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}/)) break
+                start = pos + RSTART - 1
+                before_ok = (start == 1) || (substr(line, start - 1, 1) !~ /[0-9]/)
+                after = start + RLENGTH
+                after_ok = (after > n) || (substr(line, after, 1) !~ /[0-9]/)
+                if (before_ok && after_ok) print substr(line, start, RLENGTH)
+                pos = start + 1
             }
         }' \
         | grep -vE '555[-. ]?01[0-9][0-9]' \
