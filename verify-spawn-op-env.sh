@@ -80,7 +80,9 @@ case "\$1 \$2" in
 	"pane run")   printf '%s\n' "\$4" >> "$run_log" ;;
 	"pane list")  printf '{"result":{"panes":[]}}\n' ;;
 	# ensure-workspace.sh runs first and EXITS the spawn if it cannot resolve a
-	# workspace id, which is why a bare `{}` catch-all captured nothing.
+	# workspace id, which is why an empty-object catch-all captured nothing.
+	# (No backticks in this heredoc: it is unquoted so $run_log expands, which
+	#  means a backticked word would be run as a command at write time.)
 	*)            printf '{"result":{"workspace":{"workspace_id":"w1"},"workspaces":[],"panes":[],"tabs":[]}}\n' ;;
 esac
 STUB
