@@ -1,0 +1,20 @@
+---
+description: Symptom-to-cause table for herdr-control activation and the Slack bridge — consult when an alert, hook, or reply misbehaves.
+globs: ["install.sh", "agent-hooks/**", "slack-bridge/**", "herdr-select.sh", "peer-answer.sh", "config.sh"]
+---
+# Troubleshooting
+
+| symptom | cause |
+|---|---|
+| alert names a pane but replies do nothing | Interactivity not enabled (buttons only); use a threaded number |
+| `pane=none` | tmux socket unreachable, or the agent runs outside a herdr pane |
+| alert has no options, only the message | prompt not painted yet, or auto-approved before the hook read it; the context block should still show what is on screen |
+| every alert arrives twice | two hooks wired for the same job — check `Notification` in settings.json |
+| `team=ANY (unbound)` at startup | `HERDR_BRIDGE_TEAM` unset; the workspace check is inert |
+| refusal on every reply | expected when no prompt is showing; only a live prompt accepts a choice |
+| cannot write files under a `hooks/` directory | agent sandboxes commonly block writes to any path named `hooks/` (a writable `.git/hooks` is code execution on the next git command). This repo uses `agent-hooks/` for that reason — do not rename it back. If you hit this elsewhere, the write needs to happen outside the sandbox |
+| omp session never alerts or pushes | check the extension symlink resolves (Step 3's omp subsection); a hand-started omp session (not via `spawn-task.sh`) has no `HERDR_PANE_ID` and is reconciliation-only by design |
+| `herdr-select.sh` exits 8 | expected under `--authority peer` when the prompt's command classifies as `escalate`/`deny` — a human needs to answer it, not automation |
+| `posture: unknown posture ... falling back to strict` on stderr | a typo in `HERDR_POSTURE_FLOOR` or a per-spawn posture request — fails closed on purpose, fix the name in `config.sh` |
+</content>
+<parameter name="i">Write troubleshooting.md rule file
