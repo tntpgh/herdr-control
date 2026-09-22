@@ -197,10 +197,20 @@ if [ "${ATTENTION_OWNERS:-1}" = 1 ] && [ -f "$HERE/lib/claims.sh" ]; then
     fi
     # Unowned work is the part that needs a human, so it is named last and
     # plainly: these are the items no lease will ever expire into someone's lap.
+    #
+    # Matched on WORKTREE as well as repo, because that is the scope
+    # spawn-task.sh claims — two workers on two branches of one repo are
+    # legitimately concurrent, so the claim has to be per-worktree to be
+    # precise. Comparing only `repo` here would report every auto-claimed
+    # worker as unowned and make this list exactly as uninformative as the
+    # banner it replaced.
     stalled=$(sqlite3 -batch -noheader "${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}/registry.sqlite3" \
       "SELECT repo || '  [' || state || ']  ' || label FROM tasks
         WHERE state IN ('running','blocked','starting')
-          AND repo NOT IN (SELECT scope FROM claims WHERE released_at IS NULL)
+          AND worktree NOT IN (SELECT scope FROM claims
+                                WHERE released_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+          AND repo     NOT IN (SELECT scope FROM claims
+                                WHERE released_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         ORDER BY updated_at ASC;" 2>/dev/null)
     if [ -n "$stalled" ]; then
       echo
