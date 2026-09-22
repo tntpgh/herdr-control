@@ -212,5 +212,102 @@ if [ -f lib/alert-gate.sh ]; then
     || no "human_must_answer escalates a tall panel" "returned $ag_rc — header missed, queue classified as the prompt"
 fi
 
+echo "== a tool whose approval panel renders no body row still fingerprints distinctly"
+# OBSERVED live 2026-09-21, pane w1B:p4 (Terrence): the browser tool's own
+# approval panel has ZERO content between "Allow tool: browser" and
+# "Approve" -- the code being approved renders in a SEPARATE "running
+# <label>" box above the panel, which the header-anchored parser never
+# scanned. Five-plus consecutive, genuinely different browser calls all
+# reported the SAME prompt_id, which is exactly what --expect-prompt-id
+# exists to prevent: a conductor cannot tell a fresh approval from a stale
+# one being re-answered when the id cannot move. Reproduced independently
+# here with the same literal panel shape (two blank rows, no Command line)
+# and, before the fix, the same collision.
+VIEWPORT=100
+make_running_browser_panel() {          # <code-line> -> writes $TMP/screen
+  { printf '%s\n' "some earlier scrollback line"
+    printf '%s\n' "The model narrates its plan here."
+    printf '\xe2\x95\xad\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 running some label \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xae\n'
+    printf '\xe2\x94\x82                                                 \xe2\x94\x82\n'
+    printf '\xe2\x94\x82 %s\xe2\x94\x82\n' "$1"
+    printf '\xe2\x94\x82                                                 \xe2\x94\x82\n'
+    printf '\xe2\x95\xb0\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xaf\n'
+    printf '\n'
+    printf '╭─ Allow tool: browser ────────────────────────────╮\n'
+    printf '│                                                 │\n'
+    printf '│                                                 │\n'
+    printf '│ %sApprove%s                                        │\n' "$HL" "$RESET"
+    printf '│   Deny                                          │\n'
+    printf '│                                                 │\n'
+    printf '│ up/down navigate  enter select  esc cancel      │\n'
+    printf '╰─────────────────────────────────────────────────╯\n'
+  } > "$TMP/screen"
+}
+make_running_browser_panel 'const tab = await browser.open({ name: "t1" });               '
+q1="$(prompt_menu_question "$PANE" 2>/dev/null)"
+id1="$(prompt_id "$PANE" 2>/dev/null)"
+make_running_browser_panel 'const t = await tab.evaluate("document.title");               '
+q2="$(prompt_menu_question "$PANE" 2>/dev/null)"
+id2="$(prompt_id "$PANE" 2>/dev/null)"
+case "$q1" in
+  *browser.open*) ok "the pending calls own code reaches the fingerprint text" ;;
+  *) no "the pending calls own code reaches the fingerprint text" "got: $q1" ;;
+esac
+if [ -n "$id1" ] && [ "$id1" != "$id2" ]; then
+  ok "two different browser calls no longer collide on one prompt_id"
+else
+  no "two different browser calls no longer collide on one prompt_id" "id1=$id1 id2=$id2"
+fi
+
+echo "== the fallback never fires when the panel already has its own content"
+# A bash panel with a real Command row, and a running box above it, must
+# hash on the Command row alone: the running-box fallback applies only when
+# the panel body is empty, never as an addition on top of real content.
+{ printf '%s\n' "some earlier scrollback line"
+  printf '╭─── running some label ─────────────────────────╮\n'
+  printf '│                                                 │\n'
+  printf '│ this running-box text must never appear below   │\n'
+  printf '│                                                 │\n'
+  printf '╰─────────────────────────────────────────────────╯\n'
+  printf '\n'
+  printf '╭─ Allow tool: bash ──────────────────────────────╮\n'
+  printf '│                                                 │\n'
+  printf '│ Command: git status                             │\n'
+  printf '│                                                 │\n'
+  printf '│ %sApprove%s                                        │\n' "$HL" "$RESET"
+  printf '│   Deny                                          │\n'
+  printf '│                                                 │\n'
+  printf '│ up/down navigate  enter select  esc cancel      │\n'
+  printf '╰─────────────────────────────────────────────────╯\n'
+} > "$TMP/screen"
+q_bash="$(prompt_menu_question "$PANE" 2>/dev/null)"
+case "$q_bash" in
+  *"running "*) no "a real command panel ignores the running box above it" "leaked running-box text: $q_bash" ;;
+  *"Command: git status"*) ok "a real command panel ignores the running box above it" ;;
+  *) no "a real command panel ignores the running box above it" "got: $q_bash" ;;
+esac
+
+echo "== two truly identical browser panels with no running box still collide honestly"
+# No distinguishing signal is available anywhere in the window, so the
+# fingerprint legitimately cannot tell them apart. This fix does not claim
+# to solve that case -- it only rescues the common one, where the running
+# box IS in the scraped window (it always renders directly above the panel
+# on a live pane).
+{ printf '╭─ Allow tool: browser ────────────────────────────╮\n'
+  printf '│                                                 │\n'
+  printf '│                                                 │\n'
+  printf '│ %sApprove%s                                        │\n' "$HL" "$RESET"
+  printf '│   Deny                                          │\n'
+  printf '│                                                 │\n'
+  printf '│ up/down navigate  enter select  esc cancel      │\n'
+  printf '╰─────────────────────────────────────────────────╯\n'
+} > "$TMP/screen"
+id_a="$(prompt_id "$PANE" 2>/dev/null)"
+id_b="$(prompt_id "$PANE" 2>/dev/null)"
+[ -n "$id_a" ] && [ "$id_a" = "$id_b" ] \
+  && ok "a genuinely undistinguishable pair still reports one honest id" \
+  || no "a genuinely undistinguishable pair still reports one honest id" "id_a=$id_a id_b=$id_b"
+VIEWPORT=62
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$pass" "$fail"
 [ "$fail" -eq 0 ]

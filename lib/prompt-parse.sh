@@ -475,6 +475,14 @@ question = []
 selected = ""
 invalid = complete = visible = False
 truncated = False
+# The most recent "running <label>" bordered box seen while scanning, and a
+# snapshot of it taken the instant a panel opens. See BROWSER_FALLBACK below
+# for why this exists — the approval panel for some tools (browser, observed
+# 2026-09-21) renders NO body row between its header and "Approve", so it is
+# the only source of content that distinguishes one pending call from another.
+running_open = False
+running_lines = []
+pending_running = []
 
 
 def _text(s):
@@ -588,10 +596,29 @@ for line in lines:
     # A header row only OPENS a panel; inside one it is command content
     # (a multi-line command can contain the literal text "Allow tool:").
     if state == 0 and text.startswith("Allow tool:"):
+        pending_running = list(running_lines)
         state, question, selected = 1, [text], ""
         invalid = complete = visible = False
         continue
     if state == 0:
+        # Track the nearest preceding "running <label>" bordered box. Close
+        # on an "Output"/"Status" divider (the call already finished, so its
+        # body is a PAST result) or the box own closing border: that row has
+        # pipe/border content (body non-empty) but no alnum (text empty) once
+        # leading non-alnum is stripped — the ONE thing that told it apart
+        # from a blank row inside the box, which also strips to empty text
+        # but ALSO strips to an empty body (the whole row is spaces and pipe
+        # chars, all in the leading-strip class). Checking "no alnum" alone
+        # closed on that first blank row, before ever reaching the code.
+        if text.startswith("running "):
+            running_open, running_lines = True, []
+        elif running_open:
+            if _text(plain).startswith(("Output", "Status")):
+                running_open = False
+            elif body and not text:
+                running_open = False
+            elif body:
+                running_lines.append(body)
         if text:
             complete = visible = False
         continue
@@ -691,6 +718,17 @@ if mode == "options":
 elif mode == "selected":
     print(selected, end="")
 elif mode == "question":
+    # BROWSER_FALLBACK: some tools approval panel (browser, observed
+    # 2026-09-21) renders no body row at all between its header and
+    # "Approve" — two distinct pending calls (open a tab; evaluate on it)
+    # produced the IDENTICAL panel text and so the IDENTICAL prompt_id,
+    # which defeats --expect-prompt-id staleness detection for that tool: a
+    # conductor answering one browser prompt could not tell it apart from
+    # the next. `question` degenerate here means len == 1, just the header
+    # — a real command/diff/detail row from any OTHER tool already makes it
+    # longer, so this never touches an already-distinguishing panel.
+    if len(question) == 1 and pending_running:
+        question = question + pending_running
     print(" ; ".join(question), end="")
 ' "$1"
 }
