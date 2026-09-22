@@ -31,7 +31,8 @@
 # Usage:  send-to-agent.sh <pane_id> [--force] <text>
 #         send-to-agent.sh <pane_id> [--force] --submit-only
 #   pane_id       e.g. w2:p1 (from `herdr pane list` / pane-map.sh)
-#   --force       send even if the pane looks like it is on a permission prompt
+#   --force       send even if the pane looks like it is on a permission prompt,
+#                 or if a human appears to be typing into it right now
 #   --submit-only press/retry Enter on text ALREADY in the composer (e.g. an
 #                 operator typed directly into the pane over herdr and the
 #                 Enter did not land) — types nothing, requires no text arg.
@@ -45,6 +46,9 @@
 #                      caller MUST NOT assume the peer received it.
 # Exit 5 REFUSED     — pane appears to be showing a permission/confirmation
 #                      prompt (Enter would pick its default), or is unreadable.
+# Exit 6 REFUSED     — the composer changed between two reads ~1s apart right
+#                      before injection — someone looks to be typing into this
+#                      pane RIGHT NOW. Re-send shortly, or use --force.
 # Exit 2             — bad usage / send or Enter call failed (target/socket).
 #
 # Each retry's `pane read` doubles as the settle delay for the paste debounce
@@ -139,6 +143,28 @@ if [ "$force" -eq 0 ]; then
   if [ "$pr" -eq 2 ]; then
     echo "REFUSED: cannot read $pane to check for a pending prompt — refusing to send blind (use --force)." >&2
     exit 5
+  fi
+fi
+
+# A human mid-keystroke in this pane's composer must not have our text
+# interleaved into it — the terminal has no notion of "two writers", so an
+# injection landing while someone is actively typing does not error, it
+# corrupts whatever they were typing (and what we just sent) into one
+# garbled line. Skipped under --submit-only: that path types nothing, it
+# only presses Enter on text that is already there. Bounded at 3 tries
+# (~1s total) — long enough to ride out a pause between words, not so long
+# that a genuinely busy composer makes this script hang.
+if [ "$submit_only" -eq 0 ] && [ "$force" -eq 0 ]; then
+  typing_now=1
+  for _ in 1 2 3; do
+    composer_looks_actively_typed "$pane" 350; ta=$?
+    if [ "$ta" -eq 1 ]; then typing_now=0; break; fi
+    [ "$ta" -eq 2 ] && break   # unreadable — do not keep guessing blind
+  done
+  if [ "$typing_now" -eq 1 ]; then
+    echo "REFUSED: $pane's composer is actively changing — someone looks to be typing right now." >&2
+    echo "REFUSED: waited ~1s for it to settle. Re-send shortly, or use --force to type anyway." >&2
+    exit 6
   fi
 fi
 
