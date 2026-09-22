@@ -171,3 +171,51 @@ EOF
     fi
   fi
 fi
+
+# --- ownership: route each item at its claim holder, not at everyone --------
+#
+# The failure this closes, observed 2026-09-22: the hub banner said "7 task(s)
+# need attention" in EVERY pane, for hours, across a whole working session.
+# Addressed to everyone is addressed to no one — classic diffusion of
+# responsibility, and the 6 stalled / 3 lost worker tasks underneath it were
+# still sitting there at the end of the day. An item with a live claim has an
+# owner and should say so; an item with NO live claim is the actually
+# interesting case, because nobody is coming for it.
+#
+# Deliberately a REPORT, not a delivery mechanism: routing here means naming
+# the responsible pane so the next action is obvious. Pushing a message into
+# that pane is send-to-agent.sh's job and stays there.
+if [ "${ATTENTION_OWNERS:-1}" = 1 ] && [ -f "$HERE/lib/claims.sh" ]; then
+  # shellcheck source=lib/claims.sh
+  source "$HERE/lib/claims.sh" 2>/dev/null </dev/null || true
+  if command -v claims_active >/dev/null 2>&1; then
+    live=$(claims_active 2>/dev/null)
+    if [ -n "$live" ]; then
+      echo
+      echo "owners (live claims):"
+      printf '%s\n' "$live" | jq -r '"   · \(.scope | split("/") | last) → \(.pane_id)\(if .purpose == "" then "" else " — " + .purpose end)"' 2>/dev/null
+    fi
+    # Unowned work is the part that needs a human, so it is named last and
+    # plainly: these are the items no lease will ever expire into someone's lap.
+    #
+    # Matched on WORKTREE as well as repo, because that is the scope
+    # spawn-task.sh claims — two workers on two branches of one repo are
+    # legitimately concurrent, so the claim has to be per-worktree to be
+    # precise. Comparing only `repo` here would report every auto-claimed
+    # worker as unowned and make this list exactly as uninformative as the
+    # banner it replaced.
+    stalled=$(sqlite3 -batch -noheader "${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}/registry.sqlite3" \
+      "SELECT repo || '  [' || state || ']  ' || label FROM tasks
+        WHERE state IN ('running','blocked','starting')
+          AND worktree NOT IN (SELECT scope FROM claims
+                                WHERE released_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+          AND repo     NOT IN (SELECT scope FROM claims
+                                WHERE released_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        ORDER BY updated_at ASC;" 2>/dev/null)
+    if [ -n "$stalled" ]; then
+      echo
+      echo "UNOWNED (no live claim — nobody is coming for these):"
+      printf '%s\n' "$stalled" | sed 's|^'"$HOME"'/Code/||; s|^|   · |'
+    fi
+  fi
+fi

@@ -333,6 +333,33 @@ pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
   "$pane" "$pane_birth" "$root" "$wt" "$label"
 
+# ---- claim the worktree on the worker's behalf ------------------------------
+# A spawned worker will never type `claim.sh take`, and neither will anyone
+# else on its behalf — so without this, the ownership view added to
+# attention.sh reports every worker task as UNOWNED forever, which is
+# technically true and permanently uninformative. Claiming here is what makes
+# that list DISCRIMINATING: owned work drops off it, and what remains is
+# genuinely orphaned.
+#
+# The scope is the WORKTREE, not the repo root, and that distinction is the
+# point: two workers on two branches of the same repo are legitimately
+# concurrent (that is the whole spawn-task pattern), and claiming $root would
+# make them collide with each other and with the operator's own main checkout.
+# Worktree paths are disjoint by construction, so the claim is precise.
+#
+# Best-effort: a claims failure must never stop a spawn. The worker is already
+# registered by this point, and a missing claim degrades to exactly the
+# pre-claims behaviour (reported unowned) rather than losing the task.
+#
+# No explicit release on completion: the TTL is the reaper, and the state a
+# terminal task leaves behind is already recorded in the registry. An explicit
+# release would only narrow the window, and it would need a handler on every
+# exit path including the ones that crash — which is the failure mode TTL
+# exists to make unnecessary.
+if [ -x "$here/claim.sh" ]; then
+  HERDR_PANE_ID="$pane" "$here/claim.sh" take "$wt" -m "$label" >/dev/null 2>&1 || true
+fi
+
 # ---- hand the worker its own identity --------------------------------------
 # Measured 2026-09-21 across three workers and ~12 wasted round trips: a
 # spawned worker cannot discover its own run_id/task_id. The completion hint
