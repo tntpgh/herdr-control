@@ -333,6 +333,45 @@ pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
   "$pane" "$pane_birth" "$root" "$wt" "$label"
 
+# ---- hand the worker its own identity --------------------------------------
+# Measured 2026-09-21 across three workers and ~12 wasted round trips: a
+# spawned worker cannot discover its own run_id/task_id. The completion hint
+# below tells it to append an event, but the ids reach it only as environment
+# variables, and EVERY route to those — `env`, `printenv`, even a narrowly
+# scoped `printenv HERDR_TASK_ID` naming six vars — is refused by
+# command-policy.sh as `credential-value access remains human-only`. The guard
+# is right: a list of variable NAMES cannot prove it excludes
+# OP_SERVICE_ACCOUNT_TOKEN. So the fix belongs on the BRIEF side, not the
+# guard side. We already know these values (they are printed on the
+# `registry:` line); write them where the worker can simply read them.
+#
+# `cat .handoffs/identity.json` and `jq -r .task_id …` both classify clean and
+# need no approval — verified against classify_command and
+# conductor_reserved_reason, which is the property that makes this work.
+#
+# `event` is pre-filled with the EXACT marker wake-on-evidence.sh watches, so
+# the worker never has to reconstruct it from its label.
+# The example is built here rather than inside jq: a nested quoting puzzle in
+# the generator is how this file ends up emitting a command the worker cannot
+# paste back.
+identity_example="printf '{\"event\":\"$wake_pattern\",\"status\":\"completed\"}\n' >> $events_file"
+jq -n \
+  --arg run "$run_id" --arg task "$task_id" --arg worker "$worker_id" \
+  --arg conductor "$conductor_id" --arg pane "$pane" --arg label "$label" \
+  --arg event "$wake_pattern" --arg events "$events_file" \
+  --arg worktree "$wt" --arg branch "$branch" --arg repo "$root" \
+  --arg example "$identity_example" \
+  '{run_id:$run, task_id:$task, worker_id:$worker, conductor_id:$conductor,
+    pane_id:$pane, label:$label, completion_event:$event,
+    events_file:$events, worktree:$worktree, branch:$branch, repo:$repo,
+    how_to_complete:"Append one JSON line to events_file, using completion_event verbatim. Read these values HERE — do not try env/printenv, that is human-reserved and will stall you until a human answers.",
+    example:$example}' \
+  > "$(handoff_identity "$wt")" 2>/dev/null || {
+    # Never fail a spawn over the convenience file — the worker can still be
+    # told its ids by hand, which is exactly the status quo this replaces.
+    echo "spawn-task: warning — could not write $(handoff_identity "$wt")" >&2
+  }
+
 # ---- close an empty default root tab, if this call just created one --------
 # ensure-workspace.sh's own comment already names this gap: "herdr
 # auto-creates a root tab as part of workspace creation but gives it no
@@ -437,8 +476,13 @@ printf '  secrets:  %s\n' "$secrets_note"
 printf '  wake:     %s %s '"'"'%s'"'"'\n' "$here/wake-on-evidence.sh" "$events_file" "$wake_pattern"
 printf '            ^ run BACKGROUNDED (run_in_background/async:true) — a blocking\n'
 printf '              foreground call strands you idle until re-prompted by hand\n'
+printf '  identity: %s\n' "$(handoff_identity "$wt")"
+printf '            ^ TELL THE WORKER THIS PATH. It holds run_id/task_id/pane_id and\n'
+printf '              completion_event, readable with cat/jq and NO approval prompt.\n'
+printf '              Without it a worker cannot learn its own ids: env/printenv are\n'
+printf '              human-reserved, so it loops until a human writes the event.\n'
 printf '  worker on completion appends to %s, e.g.:\n' "$events_file"
-printf '    {"event":"%s", ...}\n' "$wake_pattern"
+printf '    {"event":"%s", ...}   (exact marker is .completion_event in identity.json)\n' "$wake_pattern"
 printf '  ⚠ if this task'"'"'s own effect removes its OWN worktree (e.g. "delete\n'
 printf '    this now-redundant branch"), %s is gone with it —\n' "$events_file"
 printf '    verify completion via outer repo state (git branch -a / git log) instead,\n'
