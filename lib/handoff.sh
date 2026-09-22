@@ -27,6 +27,19 @@ handoff_dir() { printf '%s/%s\n' "${1%/}" "$(handoff_rel)"; }
 # The canonical events file — the one briefs name and watchers are pointed at.
 handoff_events() { printf '%s/%s/events.jsonl\n' "${1%/}" "$(handoff_rel)"; }
 
+# The worker's OWN identity, written by the spawner at spawn time.
+#
+# It exists because a spawned worker could not discover its own run_id/task_id
+# at all. The completion hint told it to append an event, but the ids live only
+# in its ENVIRONMENT, and every route to an env var — `env`, `printenv`, even a
+# narrowly scoped `printenv HERDR_TASK_ID` — is human-reserved by
+# command-policy.sh (`credential-value access remains human-only`), because a
+# variable NAME cannot prove the read excludes OP_SERVICE_ACCOUNT_TOKEN. That
+# refusal is correct and is not being weakened. So the identity is handed over
+# as a FILE instead: `cat`/`jq` on this path classify clean and need no
+# approval, which is the whole point.
+handoff_identity() { printf '%s/%s/identity.json\n' "${1%/}" "$(handoff_rel)"; }
+
 # Every events file a READER must consider: canonical first, then legacy when
 # it exists. Prints nothing for a worktree that has neither.
 handoff_event_files() {                # worktree -> 0..2 paths, newest scheme first
