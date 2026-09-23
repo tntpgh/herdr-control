@@ -4,7 +4,12 @@
 #
 #   close-done-workers.sh            # show what would close, change nothing
 #   close-done-workers.sh --apply --reason=no-follow-on
-#   close-done-workers.sh --apply --include-lost --reason=shipped --proof="https://github.com/org/repo/pull/1 abc1234"
+#   close-done-workers.sh --apply --reason=shipped --task=task_abc \
+#     --proof="https://github.com/org/repo/pull/1 abc1234"
+#
+# `--reason=shipped` needs `--pane=<id>` or `--task=<id>`: one proof cannot
+# honestly cover every closable task in a batch, so shipped scopes to
+# exactly the one it is evidence for. Other reasons stay batch-wide.
 #
 # ---- the distinction this script exists to enforce --------------------------
 # Closing a PANE and removing a WORKTREE are different operations with wildly
@@ -34,7 +39,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib/run-registry.sh
 source "$HERE/lib/run-registry.sh"
 
-apply=0; include_lost=0; closure_reason=""; closure_proof=""
+apply=0; include_lost=0; closure_reason=""; closure_proof=""; pane_filter=""; task_filter=""
 for a in "$@"; do
   case "$a" in
     --apply) apply=1 ;;
@@ -45,6 +50,8 @@ for a in "$@"; do
     # Mixed reasons across one run: filter panes and run it more than once.
     --reason=*) closure_reason="${a#--reason=}" ;;
     --proof=*) closure_proof="${a#--proof=}" ;;
+    --pane=*) pane_filter="${a#--pane=}" ;;
+    --task=*) task_filter="${a#--task=}" ;;
     -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'close-done-workers: unknown flag %s\n' "$a" >&2; exit 1 ;;
   esac
@@ -55,8 +62,22 @@ if [ "$apply" = 1 ]; then
     exit 1
   }
   if [ "$closure_reason" = shipped ]; then
-    _valid_proof_ref "$closure_proof" || {
-      printf 'close-done-workers: --reason=shipped requires --proof="<PR URL> <merge sha>" or a PROOF.md section reference\n' >&2
+    # One proof cannot honestly stand for every closable task in a batch —
+    # scope it to exactly the task it is evidence for. `--task=` is the
+    # precise identifier; `--pane=` is the convenience form (the newest task
+    # on that pane, same lookup close-done-workers already does per-row).
+    { [ -n "$pane_filter" ] || [ -n "$task_filter" ]; } || {
+      printf 'close-done-workers: --reason=shipped requires --pane=<id> or --task=<id> to scope the proof to one task\n' >&2
+      exit 1
+    }
+    proof_wt=""
+    if [ -n "$task_filter" ]; then
+      proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_filter");" 2>/dev/null)
+    else
+      proof_wt=$(_sql "SELECT worktree FROM tasks WHERE pane_id=$(_sq "$pane_filter") ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)
+    fi
+    _valid_proof_ref "$closure_proof" "$proof_wt" || {
+      printf 'close-done-workers: --reason=shipped requires --proof="<PR URL> <merge sha>" or a non-empty PROOF.md section in the selected task'"'"'s worktree\n' >&2
       exit 1
     }
   fi
@@ -64,6 +85,8 @@ fi
 
 states="'running','blocked','starting'"
 [ "$include_lost" = 1 ] && states="$states,'lost'"
+[ -n "$pane_filter" ] && states_filter=" AND pane_id=$(_sq "$pane_filter")" || states_filter=""
+[ -n "$task_filter" ] && states_filter="$states_filter AND task_id=$(_sq "$task_filter")"
 
 panes_json=$(herdr pane list 2>/dev/null)
 pane_status() { printf '%s' "$panes_json" | jq -r --arg p "$1" '((.result.panes // .panes)[]|select(.pane_id==$p)|.agent_status) // "absent"'; }
@@ -109,7 +132,7 @@ while IFS='|' read -r run_id task_id pane wt label; do
   [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
   [ "$(pane_status "$pane")" = absent ] || herdr pane close "$pane" >/dev/null 2>&1
 done < <(_sql "SELECT run_id || '|' || task_id || '|' || pane_id || '|' || worktree || '|' || label
-               FROM tasks WHERE state IN ($states) ORDER BY updated_at;")
+               FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at;")
 
 echo
 if [ "$apply" = 1 ]; then

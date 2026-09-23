@@ -105,12 +105,40 @@ check "event carries the proof" \
 set_task_state runShip taskShip completed || bad "idempotent re-assert with no reason refused"
 ok "idempotent re-assert of an already-completed task needs no reason"
 
-printf '== proof shape: a PROOF.md section reference is also accepted ==\n'
-register_task runPf taskPf w c cp cb panePf birthPf /repo/p /wt/p "pf" || bad "register taskPf failed"
+printf '== _valid_proof_ref: a PROOF.md reference is checked against the REAL file ==\n'
+wtreal=$(mktemp -d)/wt-real; mkdir -p "$wtreal/.handoffs"
+if _valid_proof_ref ".handoffs/PROOF.md#x" "$wtreal" 2>/dev/null; then
+  bad "an EMPTY PROOF.md counted as proof"
+else
+  ok "an empty real PROOF.md is refused"
+fi
+printf 'verified: ran X, 5/5 passed\n' > "$wtreal/.handoffs/PROOF.md"
+_valid_proof_ref ".handoffs/PROOF.md#x" "$wtreal" \
+  && ok "a non-empty real PROOF.md is accepted" || bad "a real, non-empty PROOF.md refused"
+_valid_proof_ref ".handoffs/PROOF.md#x" "" \
+  && ok "no worktree on record falls back to the name-shape check" \
+  || bad "no-worktree fallback refused a PROOF.md-shaped proof"
+if _valid_proof_ref ".handoffs/PROOF.md#x" "/no/such/worktree" 2>/dev/null; then
+  bad "a nonexistent worktree path was accepted"
+else
+  ok "a worktree that doesn't exist on disk is refused (no PROOF.md to check)"
+fi
+
+printf '== proof shape: a PROOF.md section reference is checked via set_task_state'"'"'s own worktree lookup ==\n'
+wtPf=$(mktemp -d)/wt-pf; mkdir -p "$wtPf/.handoffs"
+register_task runPf taskPf w c cp cb panePf birthPf /repo/p "$wtPf" "pf" || bad "register taskPf failed"
 set_task_state runPf taskPf running || bad "taskPf -> running failed (setup)"
+if set_task_state runPf taskPf completed shipped ".handoffs/PROOF.md#verify-run-registry" 2>/dev/null; then
+  bad "shipped accepted against an EMPTY PROOF.md (via set_task_state's own worktree lookup)"
+else
+  ok "shipped refused: the task's real PROOF.md exists but is empty"
+fi
+check "state unchanged by the refusal" "$(read_task runPf taskPf | jq -r .state)" "running"
+printf 'verified: ran verify-run-registry.sh itself, all green\n' > "$wtPf/.handoffs/PROOF.md"
 set_task_state runPf taskPf completed shipped ".handoffs/PROOF.md#verify-run-registry" \
-  || bad "shipped with a PROOF.md section reference refused"
-check "PROOF.md-referencing proof accepted" "$(read_task runPf taskPf | jq -r .state)" "completed"
+  || bad "shipped refused with a real, non-empty PROOF.md"
+check "PROOF.md-referencing proof accepted once the file actually holds something" \
+  "$(read_task runPf taskPf | jq -r .state)" "completed"
 
 
 # The gap correction 2 named: "nothing stops completed -> running".

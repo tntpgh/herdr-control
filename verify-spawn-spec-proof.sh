@@ -30,14 +30,15 @@ esac
 STUB
 chmod +x "$stub_dir/herdr"
 
-WT_ROOT=$(mktemp -d)
+WT_ROOT=$(mktemp -d); WT_ROOT=$(cd "$WT_ROOT" && pwd -P)
 run_spawn() {  # <branch> [extra args...]
   env HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" \
     HERDR_WT_DIR="$WT_ROOT" HERDR_RUN_STATE_DIR="$(mktemp -d)" \
     bash "$here/spawn-task.sh" "$probe_repo" "$@" quick /bin/true
 }
 
-probe_repo=$(mktemp -d); git -C "$probe_repo" init -q 2>/dev/null
+probe_repo=$(mktemp -d); git -C "$probe_repo" init -q -b main 2>/dev/null
+git -C "$probe_repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 
 printf '== no --brief: SPEC.md is the template, PROOF.md is empty ==\n'
 run_spawn no-brief-branch >/tmp/spawn-out-$$.log 2>&1 || bad "spawn (no brief) failed: $(cat /tmp/spawn-out-$$.log)"
@@ -70,6 +71,41 @@ else
 fi
 after_dirs=$(find "$WT_ROOT/$(basename "$probe_repo")" -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
 check "no worktree created for the refused spawn" "$after_dirs" "$before_dirs"
+
+printf '== re-spawn on the SAME branch: never truncates an existing PROOF.md or SPEC.md ==\n'
+# Simulate a worker that already collected evidence and edited its own
+# SPEC.md, then got re-spawned (a real supported path — see the worktree
+# reuse branch around spawn-task.sh's "worktree: create or reuse" section).
+printf 'verified: ran the suite, 12/12 passed\n' > "$proof"
+printf '# SPEC\n\n## Goal\nCUSTOM-MARKER-EDITED-IN-PLACE\n' > "$spec"
+run_spawn no-brief-branch >/tmp/spawn-out4-$$.log 2>&1 || bad "re-spawn (no brief) failed: $(cat /tmp/spawn-out4-$$.log)"
+grep -q 'ran the suite, 12/12 passed' "$proof" 2>/dev/null \
+  && ok "re-spawn without --brief leaves PROOF.md bytes untouched" \
+  || bad "PROOF.md wiped by re-spawn: $(cat "$proof" 2>/dev/null)"
+grep -q 'CUSTOM-MARKER-EDITED-IN-PLACE' "$spec" 2>/dev/null \
+  && ok "re-spawn without --brief leaves an existing SPEC.md untouched" \
+  || bad "SPEC.md replaced by re-spawn: $(cat "$spec" 2>/dev/null)"
+
+printf '== re-spawn WITH --brief: replaces SPEC.md (a real new brief), still never touches PROOF.md ==\n'
+brief_file2=$(mktemp)
+printf '# A genuinely new brief\n\n## Acceptance\n- [ ] the second round\n' > "$brief_file2"
+run_spawn no-brief-branch --brief "$brief_file2" >/tmp/spawn-out5-$$.log 2>&1 \
+  || bad "re-spawn (--brief) failed: $(cat /tmp/spawn-out5-$$.log)"
+grep -q 'A genuinely new brief' "$spec" 2>/dev/null \
+  && ok "re-spawn WITH --brief does replace SPEC.md" || bad "new brief not applied: $(cat "$spec" 2>/dev/null)"
+grep -q 'ran the suite, 12/12 passed' "$proof" 2>/dev/null \
+  && ok "re-spawn WITH --brief still leaves PROOF.md bytes untouched" \
+  || bad "PROOF.md wiped by a --brief re-spawn: $(cat "$proof" 2>/dev/null)"
+
+printf '== --brief pointing AT the worktree'"'"'s own SPEC.md does not truncate before reading it ==\n'
+printf '# SPEC\n\nSELF-REFERENTIAL-MARKER-BEFORE-RESPAWN\n' > "$spec"
+run_spawn no-brief-branch --brief "$spec" >/tmp/spawn-out6-$$.log 2>&1 \
+  || bad "re-spawn (--brief == own SPEC.md) failed: $(cat /tmp/spawn-out6-$$.log)"
+grep -q 'SELF-REFERENTIAL-MARKER-BEFORE-RESPAWN' "$spec" 2>/dev/null \
+  && ok "cat completed before the target path was ever touched — no self-truncation" \
+  || bad "self-referential --brief truncated SPEC.md: $(cat "$spec" 2>/dev/null)"
+grep -q '## Proof contract' "$spec" 2>/dev/null \
+  && ok "proof contract still appended after the self-referential read" || bad "proof contract missing"
 
 printf '== identity.json tells the worker where SPEC/PROOF live and the closure vocabulary ==\n'
 idjson="$wt/.handoffs/identity.json"

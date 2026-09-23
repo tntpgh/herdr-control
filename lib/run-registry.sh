@@ -416,17 +416,27 @@ _valid_closure_reason() {               # reason -> 0 if one of the five
   esac
 }
 
-# _valid_proof_ref <proof> -> 0 if it looks like a checkable pointer, not a
-# bare assertion. Two shapes, both named in the plan doc: "<PR URL> <merge
-# sha>" (space-separated; the sha is loosely checked as 7-40 hex characters,
-# what `git rev-parse --short`..full sha40 both produce) or a `.handoffs/
-# PROOF.md` section reference (anything naming PROOF.md — the anchor syntax is
-# the caller's; this only refuses a proof that could not possibly be one). An
-# empty string is never proof.
+# _valid_proof_ref <proof> [worktree] -> 0 if it looks like a checkable
+# pointer, not a bare assertion. Two shapes, both named in the plan doc:
+# "<PR URL> <merge sha>" (space-separated; the sha is loosely checked as
+# 7-40 hex characters, what `git rev-parse --short`..full sha40 both
+# produce) or a `.handoffs/PROOF.md` section reference. When a worktree is
+# on record, a PROOF.md reference is checked against the REAL file: every
+# worktree gets one created EMPTY at spawn time (spawn-task.sh), so a bare
+# mention of the filename passed even when nobody had written anything into
+# it — measured live. A caller with no worktree context (a unit test, a
+# synthetic proof) falls back to the name-shape check alone. An empty
+# string is never proof.
 _valid_proof_ref() {
-  local proof="$1" url rest sha
+  local proof="$1" wt="${2:-}" url rest sha
   [ -n "$proof" ] || return 1
-  case "$proof" in *PROOF.md*) return 0 ;; esac
+  case "$proof" in
+    *PROOF.md*)
+      [ -z "$wt" ] && return 0
+      [ -s "$wt/.handoffs/PROOF.md" ]
+      return $?
+      ;;
+  esac
   case "$proof" in *' '*) ;; *) return 1 ;; esac
   url="${proof%% *}"
   rest="${proof#* }"
@@ -466,10 +476,16 @@ set_task_state() {                      # run_id task_id state [reason] [proof]
           "$run_id" "$task_id" "${reason:-<empty>}" >&2
         return 1
       fi
-      if [ "$reason" = "shipped" ] && ! _valid_proof_ref "$proof"; then
-        printf 'run-registry: refusing shipped completion for %s/%s: proof missing/invalid (need "<PR URL> <merge sha>" or a PROOF.md section reference)\n' \
-          "$run_id" "$task_id" >&2
-        return 1
+      if [ "$reason" = "shipped" ]; then
+        local proof_wt=""
+        case "$proof" in
+          *PROOF.md*) proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null) ;;
+        esac
+        if ! _valid_proof_ref "$proof" "$proof_wt"; then
+          printf 'run-registry: refusing shipped completion for %s/%s: proof missing/invalid (need "<PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)\n' \
+            "$run_id" "$task_id" >&2
+          return 1
+        fi
       fi
     fi
 

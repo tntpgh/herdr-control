@@ -93,19 +93,45 @@ printf '== pane_gone + a _done event with NO valid closure reason -> NOT complet
 # cannot verify WHY it is closing).
 WTR="$(dirname "$HERDR_RUN_STATE_DIR")/wt-noreason"; mkdir -p "$WTR/.handoffs"
 printf '%s\n' '{"event":"implement:feat/noreason_done"}' > "$WTR/.handoffs/events.jsonl"
-register_task runR taskR w c cp cb paneR birthR /repo/r "$WTR" "no-reason" || bad "register taskR failed"
+register_task runR taskR w condR cp cb paneR birthR /repo/r "$WTR" "no-reason" || bad "register taskR failed"
 set_task_state runR taskR running || bad "taskR -> running failed"
 _PANES=""
-run_reconciliation condR SessionStart --quiet-if-empty --no-hook-json >/dev/null
+report_out=$(run_reconciliation condR SessionStart --quiet-if-empty --no-hook-json)
 check "stays running, not silently completed" "$(read_task runR taskR | jq -r .state)" "running"
 check "not misreported as lost either" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskR' AND type='lost_detected';")" "0"
 check "the rejection is recorded" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskR' AND type='completion_evidence_rejected';")" "1"
+check "why is specific — reconcile.sh pre-checked, not a generic fallback" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.why') FROM events WHERE task_id='taskR' AND type='completion_evidence_rejected';")" \
+  "closure reason missing/invalid: <empty>"
+printf '%s' "$report_out" | grep -q "closure reason missing/invalid" \
+  && ok "the conductor report line renders WHY, not just the bare event type" \
+  || bad "report omitted why: $report_out"
 # Retire it explicitly: left `running` with its pane gone, every later
 # scenario's own reconciliation sweep would re-attempt (and re-refuse) this
 # same completion — harmless but noisy. `cancelled` needs no closure reason.
 set_task_state runR taskR cancelled >/dev/null 2>&1
+
+printf '== ...and reconcile.sh pre-checks BEFORE calling set_task_state — no stderr noise every sweep ==\n'
+WTR2="$(dirname "$HERDR_RUN_STATE_DIR")/wt-noreason2"; mkdir -p "$WTR2/.handoffs"
+printf '%s\n' '{"event":"implement:feat/noreason2_done","reason":"shipped","proof":".handoffs/PROOF.md#x"}' \
+  > "$WTR2/.handoffs/events.jsonl"
+register_task runR2 taskR2 w condR2 cp cb paneR2 birthR2 /repo/r2 "$WTR2" "shipped-empty-proof" || bad "register taskR2 failed"
+set_task_state runR2 taskR2 running || bad "taskR2 -> running failed"
+_PANES=""
+stderr_out=$(run_reconciliation condR2 SessionStart --quiet-if-empty --no-hook-json 2>&1 >/dev/null)
+if printf '%s' "$stderr_out" | grep -q "run-registry: refusing"; then
+  bad "set_task_state's own stderr refusal fired — reconcile.sh did not pre-check: $stderr_out"
+else
+  ok "no set_task_state stderr noise — reconcile.sh pre-checked a shipped/empty-PROOF.md claim too"
+fi
+check "shipped with an empty (unpointed) PROOF.md is also rejected, not completed" \
+  "$(read_task runR2 taskR2 | jq -r .state)" "running"
+check "why names the shipped/proof problem specifically" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.why') FROM events WHERE task_id='taskR2' AND type='completion_evidence_rejected';")" \
+  "shipped proof missing/invalid or PROOF.md still empty"
+set_task_state runR2 taskR2 cancelled >/dev/null 2>&1
 
 printf '== a worker briefed BEFORE the path change still completes (legacy .omc/handoffs, 2026-09-09) ==\n'
 # The compat half of lib/handoff.sh. If the reader ever stops consulting the
