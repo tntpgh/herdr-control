@@ -940,7 +940,7 @@ def edge_is_actionable(before: str | None, after: str | None) -> bool:
 # edge queue's maxsize protects the STREAM thread, not the machine, because
 # Popen returns immediately and nothing applies back-pressure. Past the cap we
 # drop the edge and say so in the log rather than forking anyway — state stays
-# correct either way (the next transition or an idle resync re-derives it).
+# correct either way (the next transition or a periodic resync re-derives it).
 EDGE_MAX_INFLIGHT = int(os.environ.get("HERDR_EDGE_MAX_INFLIGHT", "12"))
 _EDGE_INFLIGHT: list[subprocess.Popen] = []
 _EDGE_LOCK = threading.Lock()
@@ -2326,7 +2326,7 @@ def _live_rows(scope: str = "") -> str:
     scope_note = (f" · <b>{hidden}</b> pane(s) hidden by this scope "
                   f"(<a href='/herdr'>all</a>)" if scope and hidden else "")
     meta = (f"<p class=dim>pushed by subscription · {stats.get('events', 0)} events, "
-            f"{stats.get('reconnects', 0)} reconnects, {stats.get('resyncs', 0)} idle resyncs, "
+            f"{stats.get('reconnects', 0)} reconnects, {stats.get('resyncs', 0)} resyncs, "
             f"{stats.get('edges', 0)} edges" + (f", {stats['edges_dropped']} DROPPED" if stats.get("edges_dropped") else "") + scope_note + "</p>")
     return meta + "<table>" + head + ("".join(rows) or "<tr><td class=dim>no agent panes</td></tr>") + "</table>"
 
