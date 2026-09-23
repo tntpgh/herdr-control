@@ -40,6 +40,7 @@ import argparse
 import ast
 import concurrent.futures as cf
 import datetime as dt
+import hashlib
 import hmac
 import html
 import json
@@ -73,7 +74,7 @@ KB_DEPLOY = Path(os.environ.get("KB_DEPLOY", Path.home() / "Code/kb-deploy"))
 KB_PYTHON = Path(os.environ.get("KB_PYTHON", Path.home() / "Code/knowledge-base/.venv/bin/python3"))
 SEARCH_URL = os.environ.get("CONSENSUS_SEARCH_URL", "https://consensus.teamthurber.com")
 LAUNCHD_SECRETS = Path(os.environ.get("HERDR_HUB_SECRETS_ENV", Path.home() / ".config/op/launchd-secrets.env"))
-SECRET_NAMES = frozenset(("NEON_CONNECTION_STRING", "SEARCH_SYNC_TOKEN"))
+SECRET_NAMES = frozenset(("NEON_CONNECTION_STRING", "SEARCH_SYNC_TOKEN", "DECISIONS_MIRROR_KEY"))
 KB_DASHBOARD_URL = os.environ.get("KB_DASHBOARD_URL", "https://dashboard.teamthurber.com")
 # The retired tourguide decision portal. Terrence, 2026-09-23: "forms should
 # never point to apps.teamthurber.com" — he answers here, on this hub. Open rows
@@ -1258,8 +1259,10 @@ def notify_owner(row: dict) -> None:
         leaf = APP_ROOT / "send-to-agent.sh"
     if not leaf.exists():
         return
+    via = ("\nAnswered on dashboard.teamthurber.com by " + str(row.get("answered_by") or "?")
+           if row.get("answered_via") == "dashboard" else "")
     text = ("Form answers from the hub (" + str(row.get("title") or row.get("id")) + "):\n"
-            + json.dumps(row.get("answers") or {}, indent=2, sort_keys=True))
+            + json.dumps(row.get("answers") or {}, indent=2, sort_keys=True) + via)
     # `--reply`, not a brief: this is an ANSWER to something the agent asked.
     # Without the flag this delivery records `brief_delivered`, which moves the
     # `asked_at` anchor and makes the worker's existing completion evidence
@@ -1279,34 +1282,99 @@ def notify_owner(row: dict) -> None:
 # MIRROR_EVERY_S the hub publishes its open forms to kb.hub_forms (KB's
 # server/hub_forms.py, run in KB's own venv from the kb-deploy checkout, the
 # same way kb_data() reads), closes finished ones, and pulls answers made on
-# the dashboard. A remote answer is only a REQUEST until it is recorded here,
-# under the same lock a local answer takes: the loser of a race is acked as
-# `conflict` and the local answer stands. Acks ride the next cycle.
+# the dashboard.
+#
+# kb.hub_forms is NOT trusted (security review 2026-09-23, F1): everyone with
+# the Neon DSN can write it, and an answer is typed into a live agent pane. So
+# a pending answer is delivered only if it carries a valid MAC under
+# DECISIONS_MIRROR_KEY (held by this hub and the dashboard's Fly app only),
+# over a nonce only this hub can derive (from the form's secret local token),
+# from an address on HERDR_DECISIONS_OWNERS. Anything else is acked `rejected`
+# and never reaches notify_owner. What the hub publishes is signed the same
+# way, so the dashboard refuses HTML a DSN holder swapped in.
+#
+# A remote answer is only a REQUEST until recorded here under the same lock a
+# local answer takes: the loser of a race is acked `conflict`, local stands.
 MIRROR_EVERY_S = float(os.environ.get("HERDR_MIRROR_EVERY_S", "20"))
-MIRROR_STATE: dict = {"last_ok": None, "last_error": None, "published": 0, "pulled": 0}
+MIRROR_STATE: dict = {"last_ok": None, "last_error": None, "published": 0, "pulled": 0,
+                      "rejected": 0, "last_rejection": None}
 _MIRROR_ACKS: list[dict] = []
+MAX_REMOTE_ANSWER_BYTES = 64_000
 
 
-def record_remote_answer(form_id: str, answers: dict, answered_by: str) -> str:
-    """Record a dashboard answer through the local registry. -> ack outcome."""
+def _decisions_owners() -> set[str]:
+    raw = os.environ.get("HERDR_DECISIONS_OWNERS", "tnt@teamthurber.com")
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+def _mirror_key() -> bytes:
+    k = secret("DECISIONS_MIRROR_KEY") or ""
+    if len(k) < 32:
+        raise RuntimeError("DECISIONS_MIRROR_KEY unavailable (hub launchd secrets)")
+    return k.encode()
+
+
+def _mirror_mac(key: bytes, *parts: str) -> str:
+    # Byte-for-byte the scheme in knowledge-base server/hub_forms.py _mac().
+    return hmac.new(key, "\x1f".join(parts).encode(), hashlib.sha256).hexdigest()
+
+
+def _mirror_canonical(answers: dict) -> str:
+    return json.dumps(answers, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _mirror_nonce(key: bytes, form_id: str, token: str) -> str:
+    return _mirror_mac(key, "nonce", form_id, token)[:32]
+
+
+def record_remote_answer(form_id: str, pending: dict, key: bytes) -> str:
+    """Verify a dashboard answer, then record it through the local registry.
+    -> ack outcome. Verification happens BEFORE claim_and_update: a rejected
+    answer changes nothing and is never delivered."""
     path, row = _form_row(form_id)
     if row is None:
         return "missing"
+    answers, by = pending.get("answers"), str(pending.get("answered_by") or "").strip().lower()
+    token = row.get("token") or ""
+
+    def _reject(why: str) -> str:
+        MIRROR_STATE["rejected"] += 1
+        MIRROR_STATE["last_rejection"] = f"{form_id}: {why}"
+        return "rejected"
+
     if not isinstance(answers, dict):
-        return "missing"
+        return _reject("answers are not an object")
+    canon = _mirror_canonical(answers)
+    if len(canon.encode()) > MAX_REMOTE_ANSWER_BYTES:
+        return _reject("answers too large")
+    if by not in _decisions_owners():
+        return _reject(f"answered_by {by or '(none)'} is not a decisions owner")
+    if not token:
+        return _reject("local form has no token to derive a nonce from")
+    nonce = _mirror_nonce(key, form_id, token)
+    if not hmac.compare_digest(str(pending.get("nonce") or ""), nonce):
+        return _reject("nonce does not match the published form")
+    want = _mirror_mac(key, "answer", form_id, nonce, canon, by)
+    if not hmac.compare_digest(str(pending.get("answer_sig") or ""), want):
+        return _reject("answer signature invalid")
 
     def _answer(r: dict) -> dict:
         exp = r.get("expires_at")
         if isinstance(exp, (int, float)) and exp > 0 and time.time() * 1000 > exp:
             raise NotClaimable("expired", r)
         r.update(status="answered", answers=answers, answered_at=int(time.time() * 1000),
-                 answered_via="dashboard", answered_by=str(answered_by or ""))
+                 answered_via="dashboard", answered_by=by)
         return r
 
     try:
         row = claim_and_update(path, _answer)
     except NotClaimable as e:
-        return "expired" if e.state == "expired" else "conflict"
+        if e.state == "expired":
+            return "expired"
+        # A lost ack after a hub restart: this very answer is already recorded.
+        if e.row.get("answered_via") == "dashboard" and e.row.get("answers") == answers:
+            return "delivered"
+        return "conflict"
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return "missing"
     CACHES["forms"].invalidate()
@@ -1317,46 +1385,61 @@ def record_remote_answer(form_id: str, answers: dict, answered_by: str) -> str:
 def mirror_sync() -> None:
     """One publish/pull cycle. Never raises: the mirror is a convenience and must
     not take the hub down; failures are shown on /decisions instead."""
+    acks: list[dict] = []
     try:
         if not (KB_DEPLOY / "server" / "hub_forms.py").exists() or not KB_PYTHON.exists():
             raise RuntimeError("kb-deploy has no server/hub_forms.py yet (fast-forwards nightly)")
         dsn = secret("NEON_CONNECTION_STRING")
         if not dsn:
             raise RuntimeError("NEON_CONNECTION_STRING unavailable")
+        key = _mirror_key()
         d = forms_data()
         opened = []
         for f in d["open"]:
-            if not f.get("hub_servable"):
+            _, row = _form_row(str(f.get("id") or ""))
+            token = (row or {}).get("token") or ""
+            if not f.get("hub_servable") or not token:
                 continue
             try:
                 html_text = form_html(f["id"]).read_text()
             except OSError:
                 continue
+            nonce = _mirror_nonce(key, f["id"], token)
             opened.append({"id": f["id"], "title": f.get("title") or "", "html": html_text,
-                           "expires_at_ms": f.get("expires_at")})
+                           "nonce": nonce, "expires_at_ms": f.get("expires_at"),
+                           "html_sig": _mirror_mac(key, "html", f["id"], nonce,
+                                                   hashlib.sha256(html_text.encode()).hexdigest())})
         acks, _MIRROR_ACKS[:] = list(_MIRROR_ACKS), []
-        payload = {"open": opened, "closed": [f["id"] for f in d["history"]], "acks": acks}
+        payload = {"open": opened, "closed": [f.get("id") for f in d["history"] if f.get("id")],
+                   "acks": acks}
         env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if k in os.environ}
         env["NEON_CONNECTION_STRING"] = dsn
         r = subprocess.run([str(KB_PYTHON), "-m", "server.hub_forms", "sync"], cwd=KB_DEPLOY, env=env,
                            input=json.dumps(payload), capture_output=True, text=True, timeout=40)
         if r.returncode != 0:
-            _MIRROR_ACKS[:0] = acks                     # not applied: retry them next cycle
             raise RuntimeError(f"hub_forms sync exit {r.returncode}")
+        acks = []                                       # applied by the child
         out = json.loads(r.stdout)
+        if not isinstance(out, dict) or not isinstance(out.get("pending", []), list):
+            raise ValueError("hub_forms sync returned an unexpected shape")
         for p in out.get("pending") or []:
+            if not isinstance(p, dict):
+                continue
             _MIRROR_ACKS.append({"id": p.get("id"),
-                                 "outcome": record_remote_answer(str(p.get("id") or ""), p.get("answers"),
-                                                                 p.get("answered_by") or "")})
+                                 "outcome": record_remote_answer(str(p.get("id") or ""), p, key)})
             MIRROR_STATE["pulled"] += 1
         MIRROR_STATE.update(last_ok=time.time(), last_error=None, published=out.get("published", 0))
-    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
+    except Exception as e:  # noqa: BLE001 — a dead mirror thread would look healthy forever
+        _MIRROR_ACKS[:0] = acks                         # not applied: retry them next cycle
         MIRROR_STATE["last_error"] = f"{type(e).__name__}: {e}"
 
 
 def _mirror_loop() -> None:
     while True:
-        mirror_sync()
+        try:
+            mirror_sync()
+        except Exception as e:  # noqa: BLE001 — belt and braces: the loop must not die
+            MIRROR_STATE["last_error"] = f"{type(e).__name__}: {e}"
         time.sleep(MIRROR_EVERY_S)
 
 
@@ -2516,13 +2599,18 @@ def render_decisions() -> str:
     # reference material behind a <details>.
     body = ""
     ms = MIRROR_STATE
-    if ms.get("last_error"):
-        body += (f"<p class=dim><span class='pill bad'>dashboard mirror</span> {_esc(ms['last_error'])} — "
+    stale = ms.get("last_ok") and time.time() - ms["last_ok"] > 3 * MIRROR_EVERY_S
+    if ms.get("last_error") or stale:
+        why = ms.get("last_error") or f"no successful sync for {_age(ms['last_ok'] * 1000)}"
+        body += (f"<p class=dim><span class='pill bad'>dashboard mirror</span> {_esc(why)} — "
                  "answer here; dashboard.teamthurber.com/decisions is not current.</p>")
     elif ms.get("last_ok"):
         body += (f"<p class=dim><span class='pill ok'>dashboard mirror</span> synced {_age(ms['last_ok'] * 1000)} ago · "
                  f"{ms.get('published', 0)} published · also answerable at "
                  f"<a href='{KB_DASHBOARD_URL}/decisions' target=_blank>dashboard.teamthurber.com/decisions</a></p>")
+    if ms.get("rejected"):
+        body += (f"<p><span class='pill bad'>rejected</span> {ms['rejected']} dashboard answer(s) failed "
+                 f"verification and were NOT delivered — last: {_esc(ms.get('last_rejection'))}</p>")
     p = CACHES["portal"].get()
     if p.get("error"):
         body += (f"<h2>Legacy portal · unreadable</h2><p><span class='pill bad'>error</span> {_esc(p['error'])}</p>")
