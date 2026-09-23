@@ -9,7 +9,7 @@ the two things that need a human — attention items and open decisions.
 
   /            overview cards (herdr attention, decisions, fleet, KB nightly, search memory)
   /herdr       run-registry view: needs-attention, recent events, conductor cursors
-  /decisions   inbox: open decision-portal rows (apps.teamthurber.com), open formserve forms inline, answered history
+  /decisions   inbox: open formserve forms inline (where Terrence answers), stray legacy-portal rows, answered history
   /search      consensus-search memory: totals, last queries, replay counts
   /kb          knowledge-base: nightly ledger, heartbeat, repeat-view signal audits
   /links       every surface with a liveness dot
@@ -75,10 +75,11 @@ SEARCH_URL = os.environ.get("CONSENSUS_SEARCH_URL", "https://consensus.teamthurb
 LAUNCHD_SECRETS = Path(os.environ.get("HERDR_HUB_SECRETS_ENV", Path.home() / ".config/op/launchd-secrets.env"))
 SECRET_NAMES = frozenset(("NEON_CONNECTION_STRING", "SEARCH_SYNC_TOKEN"))
 KB_DASHBOARD_URL = os.environ.get("KB_DASHBOARD_URL", "https://dashboard.teamthurber.com")
-# The durable decision portal (tourguide, apps.teamthurber.com/decisions). Read
-# through tourguide's own CLI, run from its checkout: decision.mjs loads the
-# service-role key from THAT checkout's .env.local, so the hub never holds it.
-PORTAL_URL = "https://apps.teamthurber.com/decisions"
+# The retired tourguide decision portal. Terrence, 2026-09-23: "forms should
+# never point to apps.teamthurber.com" — he answers here, on this hub. Open rows
+# another session still created are LISTED (so none is invisible) but never
+# linked; the fix is to supersede and re-ask here. Read through tourguide's own
+# CLI from its checkout, so the hub never holds the service-role key.
 TOURGUIDE_DIR = Path(os.environ.get("HERDR_TOURGUIDE_DIR", str(Path.home() / "Code/tourguide")))
 # Attention means A PERSON IS THE ONE BEING WAITED FOR. `running` was in here,
 # which is why clearing a stale `blocked` alone did not move the badge: an
@@ -2279,7 +2280,7 @@ def render_overview(scope: str = "") -> str:
     cards = [
         ("/herdr", att, "need attention", f"{len(h.get('tasks', []))} tasks · events to #{h.get('max_event_seq', 0)}", att > 0),
         ("/decisions", f.get("open_count", 0) + pd.get("open_count", 0), "decisions open",
-         f"{f.get('open_count', 0)} form(s) · {pd.get('open_count', 0)} in the portal"
+         f"{f.get('open_count', 0)} form(s) · {pd.get('open_count', 0)} stray legacy-portal row(s)"
          + (" (portal UNREADABLE)" if pd.get("error") else ""),
          f.get("open_count", 0) + pd.get("open_count", 0) > 0 or bool(pd.get("error"))),
         ("#handoff-debt", len(debt_repos), "repo(s) owe a handoff",
@@ -2430,14 +2431,13 @@ def render_decisions() -> str:
     body = ""
     p = CACHES["portal"].get()
     if p.get("error"):
-        body += (f"<h2>Portal · unreadable</h2><p><span class='pill bad'>error</span> {_esc(p['error'])} — "
-                 f"check <a href='{PORTAL_URL}' target=_blank>the portal</a> directly.</p>")
+        body += (f"<h2>Legacy portal · unreadable</h2><p><span class='pill bad'>error</span> {_esc(p['error'])}</p>")
     elif p["open"]:
-        body += (f"<h2>Portal · {p['open_count']} open</h2><p class=dim>Durable, attributed questions, answered at "
-                 f"<a href='{PORTAL_URL}' target=_blank>apps.teamthurber.com/decisions</a> (SSO).</p><table>"
+        body += (f"<h2>Legacy portal · {p['open_count']} stray</h2><p class=dim>Another session filed these in the retired "
+                 "tourguide portal. You do not answer there: an agent should supersede each and re-ask it here as a form.</p><table>"
                  + "".join(
                      f"<tr class=hot><td><span class='pill hot'>{_esc(x.get('gate'))}</span></td>"
-                     f"<td><a href='{PORTAL_URL}' target=_blank><b>{_esc(x.get('question'))}</b></a>"
+                     f"<td><b>{_esc(x.get('question'))}</b>"
                      + (f"<br><small>recommended: {_esc(x.get('recommendation'))}</small>" if x.get("recommendation") else "")
                      + f"<br><small>{_esc(x.get('decision_id'))} · {_esc(x.get('assignee'))}</small></td>"
                      f"<td class=age>{_age(x.get('created_at'))}</td></tr>" for x in p["open"])
