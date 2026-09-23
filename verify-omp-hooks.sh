@@ -681,7 +681,7 @@ printf 'RESOLVE\n' >> "$REC"
 EOS
   chmod +x "$SHIM/agent-hooks/"*.sh "$SHIM/herdr-resolve.sh"
   export REC="$SHIM/rec.log"; : > "$REC"
-  shim_out="$(HERDR_CONTROL_DIR="$SHIM" bun -e '
+  shim_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
@@ -756,7 +756,7 @@ exit 0
 EOS
   chmod +x "$SHIM2/agent-hooks/"*.sh "$SHIM2/herdr-resolve.sh"
   export REC2="$SHIM2/rec.log"; : > "$REC2"; : > "$REC2.ack"
-  shim2_out="$(HERDR_CONTROL_DIR="$SHIM2" bun -e '
+  shim2_out="$(HERDR_CONTROL_DIR="$SHIM2" HERDR_RUN_STATE_DIR="$SHIM2/state" bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 const sent = [];
@@ -784,7 +784,7 @@ console.log("SENT:" + sent.length + ":" + (sent[0] ? sent[0].content : ""));
   # design this was the redelivery guard; under #37 there is nothing to deliver,
   # and withholding the ack here would replay the same envelope forever.
   : > "$REC2"; : > "$REC2.ack"
-  HERDR_CONTROL_DIR="$SHIM2" bun -e '
+  HERDR_CONTROL_DIR="$SHIM2" HERDR_RUN_STATE_DIR="$SHIM2/state" bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
@@ -842,7 +842,12 @@ EOS
     while [ -z "$port" ] && [ "$tries" -lt 50 ]; do
       sleep 0.1; port="$(cat "$SHIM3/port" 2>/dev/null)"; tries=$((tries + 1))
     done
-    HERDR_CONTROL_DIR="$SHIM3" HERDR_HUB_PORT="$port" bun -e '
+    # Fresh state dir PER CALL: this function's job is asserting line CONTENT
+    # for a given summary, independent of the announce-throttle's own history
+    # — sharing state across calls would make this test's pass/fail depend on
+    # whether a fixture happens to repeat the previous one's exact tuple,
+    # which is accidental and not what any of these cases are checking.
+    HERDR_CONTROL_DIR="$SHIM3" HERDR_HUB_PORT="$port" HERDR_RUN_STATE_DIR="$(mktemp -d)" bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
@@ -877,6 +882,76 @@ console.log("LINE:" + (bas && bas.message ? bas.message.content : "none"));
     *"4 repo(s) owe a handoff"*"1 decision(s) open"*) ok "a disagreeing hub clamps instead of printing nonsense" ;;
     *) bad "clamped line lost its content: $line" ;;
   esac
+
+  printf '== TS shim: the SAME unresolved count does not re-announce every turn ==\n'
+  # Terrence, 2026-09-22: "less noise, more of the right kind" — measured
+  # against this exact banner repeating the identical count on every turn of
+  # a multi-hour session. before_agent_start in THIS harness fires more often
+  # than "once per session" (every turn re-triggers it), so without a
+  # throttle a static count re-announces itself dozens of times over. Runs
+  # the REAL cursor file (a fresh dir per case, not the pure shouldAnnounce()
+  # function — that is unit-tested separately in agent-hooks) so the actual
+  # read-compare-write round trip through the filesystem is what is proven
+  # here, not just the decision logic in isolation.
+  SHIM4="$WORK/shim4"; mkdir -p "$SHIM4/agent-hooks"
+  for s in omp-notify.sh omp-reconcile.sh; do printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM4/agent-hooks/$s"; done
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM4/herdr-resolve.sh"
+  chmod +x "$SHIM4/agent-hooks/"*.sh "$SHIM4/herdr-resolve.sh"
+  cp "$SHIM3/stub-hub.py" "$SHIM4/stub-hub.py"
+  : > "$SHIM4/port"
+  python3 "$SHIM4/stub-hub.py" '{"attention":3,"handoff_debt":0,"open_decisions":0}' > "$SHIM4/port" &
+  shim4_pid=$!
+  port4="" tries4=0
+  while [ -z "$port4" ] && [ "$tries4" -lt 50 ]; do
+    sleep 0.1; port4="$(cat "$SHIM4/port" 2>/dev/null)"; tries4=$((tries4 + 1))
+  done
+  shim4_out="$(HERDR_CONTROL_DIR="$SHIM4" HERDR_HUB_PORT="$port4" HERDR_RUN_STATE_DIR="$SHIM4/state" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
+const first = handlers["before_agent_start"]({});
+console.log("FIRST:" + (first && first.message ? first.message.content : "none"));
+const second = handlers["before_agent_start"]({});
+console.log("SECOND:" + (second && second.message ? second.message.content : "none"));
+' 2>&1)"
+  kill "$shim4_pid" 2>/dev/null || true; wait "$shim4_pid" 2>/dev/null || true
+  printf '%s' "$shim4_out" | grep -q '^FIRST:hub: 3 task' \
+    && ok "the first turn announces" || bad "first turn: $shim4_out"
+  printf '%s' "$shim4_out" | grep -q '^SECOND:none$' \
+    && ok "the second turn, same unresolved count, stays quiet" \
+    || bad "second turn repeated the announcement: $shim4_out"
+
+  printf '== shouldAnnounce(): the pure decision, every edge case ==\n'
+  # SHIM4 above proves the real filesystem round trip once; these exercise
+  # the exported decision function directly against constructed cursors, so
+  # the remind-floor boundary and the "changed but still nonzero" cases don't
+  # need a live clock or a real wait to prove.
+  edge_out="$(bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const { shouldAnnounce } = mod;
+const HOUR = 3600_000, REMIND = 2 * HOUR, now = 1_000_000_000_000;
+const r = (name, v) => console.log(name + ":" + v);
+r("never_announced", shouldAnnounce({ tasks: 7, handoff_debt: 0, open_decisions: 0 }, undefined, now, REMIND));
+r("identical_recent_quiet", shouldAnnounce({ tasks: 7, handoff_debt: 0, open_decisions: 0 },
+  { tasks: 7, handoff_debt: 0, open_decisions: 0, announced_at: now - 5 * 60_000 }, now, REMIND));
+r("identical_past_floor_announces", shouldAnnounce({ tasks: 7, handoff_debt: 0, open_decisions: 0 },
+  { tasks: 7, handoff_debt: 0, open_decisions: 0, announced_at: now - (REMIND + 60_000) }, now, REMIND));
+r("exactly_at_floor_inclusive", shouldAnnounce({ tasks: 7, handoff_debt: 0, open_decisions: 0 },
+  { tasks: 7, handoff_debt: 0, open_decisions: 0, announced_at: now - REMIND }, now, REMIND));
+r("worse_ignores_remind_window", shouldAnnounce({ tasks: 5, handoff_debt: 0, open_decisions: 0 },
+  { tasks: 3, handoff_debt: 0, open_decisions: 0, announced_at: now - 1000 }, now, REMIND));
+r("better_but_nonzero_still_announces", shouldAnnounce({ tasks: 2, handoff_debt: 0, open_decisions: 0 },
+  { tasks: 7, handoff_debt: 0, open_decisions: 0, announced_at: now - 1000 }, now, REMIND));
+r("same_total_different_mix_announces", shouldAnnounce({ tasks: 5, handoff_debt: 0, open_decisions: 2 },
+  { tasks: 5, handoff_debt: 2, open_decisions: 0, announced_at: now - 1000 }, now, REMIND));
+' 2>&1)"
+  printf '%s' "$edge_out" | grep -q '^never_announced:true$' && ok "first sighting ever always announces" || bad "$edge_out"
+  printf '%s' "$edge_out" | grep -q '^identical_recent_quiet:false$' && ok "identical tuple within the remind window stays quiet" || bad "$edge_out"
+  printf '%s' "$edge_out" | grep -q '^identical_past_floor_announces:true$' && ok "identical tuple past the remind floor re-announces (never silent forever)" || bad "$edge_out"
+  printf '%s' "$edge_out" | grep -q '^exactly_at_floor_inclusive:true$' && ok "exactly at the remind floor is inclusive" || bad "$edge_out"
+  printf '%s' "$edge_out" | grep -q '^worse_ignores_remind_window:true$' && ok "getting worse announces immediately, ignoring the window" || bad "$edge_out"
+  printf '%s' "$edge_out" | grep -q '^better_but_nonzero_still_announces:true$' && ok "getting better (still nonzero) is signal too, announces immediately" || bad "$edge_out"
+  printf '%s' "$edge_out" | grep -q '^same_total_different_mix_announces:true$' && ok "same total, different mix (a decision opened, a debt cleared) still announces" || bad "$edge_out"
 fi
 
 printf '\n%s\n' "-----"

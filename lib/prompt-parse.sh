@@ -350,6 +350,35 @@ composer_stable_snapshot() {
     | sed -E 's/[[:space:]]+$//'
 }
 
+# composer_looks_actively_typed <pane> [settle_ms=350]
+#
+# Two composer_stable_snapshot reads a short interval apart, compared. A
+# human mid-keystroke changes the composer between them; an idle one does
+# not — the same "read twice, compare" technique send-to-agent.sh already
+# uses to confirm a submit, applied BEFORE injection instead of after it.
+#
+# The gap this closes: send-to-agent.sh's only pre-send check was "is the
+# pane on a permission prompt" — nothing asked whether a human was AT THAT
+# MOMENT typing into the same composer this script was about to write into.
+# Two writers on one stdin interleave; the operator's own keystrokes and an
+# injected message would land mixed into each other, corrupting both, with
+# no error from anything — `herdr pane send-text` has no way to know it
+# shares the terminal with a live human.
+#
+#   0 = actively changing right now (probably a human typing)
+#   1 = stable across the interval (looks safe to write into)
+#   2 = unreadable — caller must not guess; same as any other blind spot
+#       here, this refuses rather than assumes idle.
+composer_looks_actively_typed() {
+  local pane="$1" settle_ms="${2:-350}"
+  local a b
+  a=$(composer_stable_snapshot "$pane" 12) || return 2
+  sleep "$(awk "BEGIN { printf \"%.3f\", $settle_ms / 1000 }")"
+  b=$(composer_stable_snapshot "$pane" 12) || return 2
+  [ "$a" = "$b" ] && return 1
+  return 0
+}
+
 # --- menu-shape prompts (no numbered options at all) ------------------------
 #
 # Not every agent renders a numbered list. omp's tool-approval prompt is an

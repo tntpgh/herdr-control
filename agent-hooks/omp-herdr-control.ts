@@ -24,7 +24,7 @@
 // to re-derive "is this one safe" event by event if the wiring changes again.
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
@@ -42,6 +42,18 @@ const RESOLVE_SH = path.join(ROOT, "herdr-resolve.sh");
 const HUB_PY = path.join(ROOT, "hub.py");
 const HUB_PORT = Number(process.env.HERDR_HUB_PORT) || 8600;
 const HUB_URL = `http://127.0.0.1:${HUB_PORT}/`;
+
+// Same root lib/run-registry.sh uses for the control plane — never inside a
+// repo or worktree, so a `git worktree remove` or a repo clean can't delete
+// state this file needs to keep working. Not the registry's own SQLite file:
+// this is one small keyed record with exactly one writer per machine (omp
+// itself, at most one SessionStart at a time), the same shape
+// notepad-mnemopi-sync-cursors.json already is — a table would buy nothing a
+// JSON file plus an atomic write does not already give it.
+const ATTENTION_CURSOR_PATH = path.join(
+  process.env.HERDR_RUN_STATE_DIR?.trim() || path.join(process.env.HOME ?? "", ".local/state/herdr/runs"),
+  "attention-announce-cursor.json",
+);
 
 // existsSync can throw on a permission-denied ancestor directory, which is
 // exactly the kind of environment surprise this file must survive without
@@ -335,6 +347,73 @@ function hubSummary(): { attention: number; handoff_debt: number; open_decisions
   }
 }
 
+// ---- announce throttle -------------------------------------------------------
+// Terrence, 2026-09-22: "less noise, more of the right kind" — measured
+// against this exact banner, which repeated the SAME unresolved count on
+// every single turn of a multi-hour session, not once per session as the
+// comment above this file's SessionStart handler says it should. In THIS
+// harness `before_agent_start` fires more often than "once per session"
+// (each turn re-triggers it), so a static count re-announced itself dozens
+// of times — the same information every time, at the cost of a line in
+// every prompt.
+//
+// The fix is not "announce less often on a timer" — a stuck problem must
+// stay visible, and a fixed interval either nags while nothing changed or
+// goes quiet while something did. It is "announce on CHANGE": the exact
+// same tuple as last time says nothing new, so it says nothing at all,
+// until either the numbers move (worse, better, or a different mix — all
+// worth knowing) or REMIND_AFTER_MS has passed since the last time a human
+// was actually told, so a genuinely stuck problem cannot go silent forever
+// just because nothing about it happened to change.
+const REMIND_AFTER_MS = (Number(process.env.HERDR_ATTENTION_REMIND_S) || 2 * 60 * 60) * 1000;
+
+interface AnnounceCursor {
+  tasks: number;
+  handoff_debt: number;
+  open_decisions: number;
+  announced_at: number; // epoch ms
+}
+
+// Best-effort throughout, like every other read in this file: a missing,
+// corrupt, or unreadable cursor means "nothing announced yet", which is the
+// same as a fresh machine — never a reason to fail closed and go silent.
+function readAnnounceCursor(): AnnounceCursor | undefined {
+  try {
+    const raw = readFileSync(ATTENTION_CURSOR_PATH, "utf8");
+    const j = JSON.parse(raw) as Partial<AnnounceCursor>;
+    if (
+      typeof j.tasks !== "number" ||
+      typeof j.handoff_debt !== "number" ||
+      typeof j.open_decisions !== "number" ||
+      typeof j.announced_at !== "number"
+    ) {
+      return undefined;
+    }
+    return j as AnnounceCursor;
+  } catch {
+    return undefined;
+  }
+}
+
+// temp-write + rename in the SAME directory as the target: the rename is
+// what makes this atomic (same filesystem, single syscall to replace the
+// old content), matching lib/record_store.py's write_atomic — a truncating
+// write here would leave a 0-byte cursor on a crash mid-write, and an
+// unreadable/empty cursor already degrades safely (see readAnnounceCursor),
+// but there is no reason to manufacture the failure this avoids for free.
+function writeAnnounceCursor(c: AnnounceCursor): void {
+  try {
+    mkdirSync(path.dirname(ATTENTION_CURSOR_PATH), { recursive: true });
+    const tmp = `${ATTENTION_CURSOR_PATH}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(c), "utf8");
+    renameSync(tmp, ATTENTION_CURSOR_PATH);
+  } catch {
+    // Worst case: the next turn re-announces something already seen once.
+    // That is exactly the pre-throttle behaviour — a failure here can only
+    // return to the old noise level, never to silence on a real problem.
+  }
+}
+
 // ---- SessionStart: before_agent_start --------------------------------------
 // Runs SYNCHRONOUSLY (an async hook's output is not guaranteed to land before
 // the first prompt is assembled), bounded by `timeout` so a hung or missing
@@ -342,6 +421,26 @@ function hubSummary(): { attention: number; handoff_debt: number; open_decisions
 // returning: for this event the runner keeps the first returned message, so
 // a constructed return IS the accepted delivery. A timeout or parse failure
 // exits earlier and leaves the envelope unacked for redelivery.
+
+// Pure decision, isolated from the filesystem and the clock so it is
+// unit-testable without a real cursor file or a real hub: given the current
+// counts, what was last announced (or undefined, never), and now, should
+// this turn say anything at all.
+export function shouldAnnounce(
+  current: { tasks: number; handoff_debt: number; open_decisions: number },
+  cursor: AnnounceCursor | undefined,
+  now: number,
+  remindAfterMs: number,
+): boolean {
+  if (!cursor) return true; // never announced before — first time is always news
+  const same =
+    cursor.tasks === current.tasks &&
+    cursor.handoff_debt === current.handoff_debt &&
+    cursor.open_decisions === current.open_decisions;
+  if (!same) return true; // the numbers moved — better, worse, or a different mix, always worth a line
+  return now - cursor.announced_at >= remindAfterMs; // unchanged: only past the remind floor
+}
+
 function onBeforeAgentStart():
   | { message: { customType: string; content: string; display: boolean } }
   | undefined {
@@ -359,16 +458,32 @@ function onBeforeAgentStart():
       }
     }
     const s = hubSummary();
-    if (!s || s.attention + s.open_decisions === 0) return undefined; // nothing needs a human — say nothing
-    const parts = [];
+    if (!s || s.attention + s.open_decisions === 0) {
+      // Nothing needs a human right now. Reset the cursor to zero (rather
+      // than leaving whatever was last announced) so that if the SAME count
+      // reappears later — the queue drained, then filled back up to the
+      // identical number — it is treated as fresh news, not as "unchanged
+      // since an hour ago", which it is not: something resolved in between.
+      writeAnnounceCursor({ tasks: 0, handoff_debt: 0, open_decisions: 0, announced_at: Date.now() });
+      return undefined;
+    }
     // `attention` carries both halves; subtract the one with its own noun so
     // neither is dropped and neither is miscalled. Clamped at 0 so a hub
     // mid-deploy (new field, old count, or the reverse) can only understate
     // the task half, never print a negative.
-    const tasks = Math.max(0, s.attention - s.handoff_debt);
-    if (tasks) parts.push(`${tasks} task(s) need attention`);
-    if (s.handoff_debt) parts.push(`${s.handoff_debt} repo(s) owe a handoff`);
-    if (s.open_decisions) parts.push(`${s.open_decisions} decision(s) open`);
+    const current = {
+      tasks: Math.max(0, s.attention - s.handoff_debt),
+      handoff_debt: s.handoff_debt,
+      open_decisions: s.open_decisions,
+    };
+    const now = Date.now();
+    if (!shouldAnnounce(current, readAnnounceCursor(), now, REMIND_AFTER_MS)) return undefined;
+    writeAnnounceCursor({ ...current, announced_at: now });
+
+    const parts = [];
+    if (current.tasks) parts.push(`${current.tasks} task(s) need attention`);
+    if (current.handoff_debt) parts.push(`${current.handoff_debt} repo(s) owe a handoff`);
+    if (current.open_decisions) parts.push(`${current.open_decisions} decision(s) open`);
     return {
       message: {
         customType: "herdr-reconcile",
