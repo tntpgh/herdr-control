@@ -19,6 +19,7 @@
 #
 # Exit 0 delivered, 3 target is not an agent pane (refused), 4 stranded,
 # 5 target looks like it is sitting on a permission prompt (refused),
+# 6 a human looks to be typing into the target right now (refused; re-send shortly),
 # 7 target pane was recycled since its registered task was spawned (refused).
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
