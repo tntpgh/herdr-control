@@ -116,8 +116,8 @@ class MirrorVerification(unittest.TestCase):
                          hub._mirror_mac(KEY, "answer", "f", nonce, hub._mirror_canonical(answers), OWNER))
         html_text = "<p>é</p>"
         import hashlib
-        self.assertEqual(hub_forms.html_sig("f", nonce, html_text),
-                         hub._mirror_mac(KEY, "html", "f", nonce, hashlib.sha256(html_text.encode()).hexdigest()))
+        self.assertEqual(hub_forms.html_sig("f", nonce, "Titlé", html_text),
+                         hub._mirror_mac(KEY, "html", "f", nonce, "Titlé", hashlib.sha256(html_text.encode()).hexdigest()))
 
 
 if __name__ == "__main__":

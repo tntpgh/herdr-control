@@ -1287,11 +1287,14 @@ def notify_owner(row: dict) -> None:
 # kb.hub_forms is NOT trusted (security review 2026-09-23, F1): everyone with
 # the Neon DSN can write it, and an answer is typed into a live agent pane. So
 # a pending answer is delivered only if it carries a valid MAC under
-# DECISIONS_MIRROR_KEY (held by this hub and the dashboard's Fly app only),
-# over a nonce only this hub can derive (from the form's secret local token),
-# from an address on HERDR_DECISIONS_OWNERS. Anything else is acked `rejected`
-# and never reaches notify_owner. What the hub publishes is signed the same
-# way, so the dashboard refuses HTML a DSN holder swapped in.
+# DECISIONS_MIRROR_KEY, over a nonce only this hub can derive (from the form's
+# secret local token), from an address on HERDR_DECISIONS_OWNERS. Anything else
+# is acked `rejected` and never reaches notify_owner. What the hub publishes
+# (id, nonce, title, HTML) is signed the same way, so the dashboard refuses a
+# form a DSN holder altered. The key stops REMOTE DSN holders (CI, other Fly
+# code paths, the KB MCP env, kb-deploy). It does not stop a process running as
+# this user, or anything with the ambient 1Password read token — those can
+# already forge a local answer through this hub's unauthenticated loopback.
 #
 # A remote answer is only a REQUEST until recorded here under the same lock a
 # local answer takes: the loser of a race is acked `conflict`, local stands.
@@ -1405,9 +1408,10 @@ def mirror_sync() -> None:
             except OSError:
                 continue
             nonce = _mirror_nonce(key, f["id"], token)
-            opened.append({"id": f["id"], "title": f.get("title") or "", "html": html_text,
+            title = str(f.get("title") or "")[:300]     # the store keeps 300 chars; sign what it keeps
+            opened.append({"id": f["id"], "title": title, "html": html_text,
                            "nonce": nonce, "expires_at_ms": f.get("expires_at"),
-                           "html_sig": _mirror_mac(key, "html", f["id"], nonce,
+                           "html_sig": _mirror_mac(key, "html", f["id"], nonce, title,
                                                    hashlib.sha256(html_text.encode()).hexdigest())})
         acks, _MIRROR_ACKS[:] = list(_MIRROR_ACKS), []
         payload = {"open": opened, "closed": [f.get("id") for f in d["history"] if f.get("id")],
