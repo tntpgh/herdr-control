@@ -77,16 +77,35 @@ results["dotted_name"] = outcome(live, live._apply_event(status_event("pane.agen
 live = fresh()
 results["underscore_name"] = outcome(live, live._apply_event(status_event("pane_agent_status_changed")))
 
-# 3. An output event racing the status change must not un-block the pane.
+# 3. For a pane whose status events we are subscribed to, a LATE pane_updated
+# (herdr delivers them up to ~8s after the fact, at a HIGHER revision than the
+# last one we saw, carrying the pre-transition status) must not un-block it —
+# however long after the status event it lands. The 3s hold this replaced let
+# exactly this row through on the live stream (2026-09-23).
 live = fresh()
+live._status_covered = {"w1:p1"}
 live._apply_event(status_event("pane.agent_status_changed"))
-results["sticky"] = outcome(live, live._apply_event(pane("working", 11)))
+real_time = time.time
+time.time = lambda: real_time() + 10    # the row lands 10s after the status event
+try:
+    results["late_output_row"] = outcome(live, live._apply_event(pane("working", 11)))
+finally:
+    time.time = real_time
 
-# 4. ...but the hold expires, so a genuine unblock still lands.
+# 4. ...while the real sources still move it: the next status event, and a
+# snapshot (current truth) even with no event at all.
 live = fresh()
+live._status_covered = {"w1:p1"}
 live._apply_event(status_event("pane.agent_status_changed"))
-live._status_event_at["w1:p1"] -= (herdr_live.STATUS_EVENT_STICKY_S + 1)
-results["sticky_expires"] = outcome(live, live._apply_event(pane("working", 12)))
+unblock = live._apply_event(status_event("pane.agent_status_changed", status="working"))
+live._apply_event(status_event("pane.agent_status_changed"))
+snap = live._apply_snapshot(SNAP_WORKING)
+results["covered_sources"] = (flat(unblock), live.status("w1:p1"), flat(snap))
+
+# 4b. An UNCOVERED pane (degraded mode, or not yet subscribed) has no status
+# events, so pane_updated stays its live status signal.
+live = fresh()
+results["uncovered_output_row"] = outcome(live, live._apply_event(pane("blocked", 11)))
 
 # 5. A lower-revision event (buffered during a bootstrap) is dropped.
 live = fresh()
@@ -189,7 +208,7 @@ subs, covered = live._subscriptions()
 results["degraded_shape"] = (
     [s for s in subs if s["type"] == "pane.agent_status_changed"] == [],
     len(covered) == 0,
-    # the flag the stream loop keys on: no per-pane subs => degraded
+    # degraded mode carries no per-pane subs (the loop itself keys on the counter)
     any(s["type"] == "pane.agent_status_changed" for s in subs) is False,
 )
 
@@ -237,6 +256,110 @@ results["degraded_subs"] = (
     any(s["type"] == "pane.updated" for s in subs),
 )
 
+# 16. A BUSY stream must not starve the resync. herdr flips agent_status
+# without bumping revision, so a pane that goes blocked and then sits quiet has
+# no later event to correct it if the status event never arrives. The resync
+# used to run only after 600s with NO event at all, which a working fleet
+# never produces — live 2026-09-23, a worker sat blocked on an allow-class
+# command for 3 minutes while the hub said working at the same revision.
+# Here another pane streams an event every 10ms for the whole run.
+def two_panes(p1_status):
+    return {"snapshot": {"workspaces": [{"workspace_id": "w1", "label": "repo"}], "panes": [
+        {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "agent": "omp",
+         "agent_status": p1_status, "revision": 10, "cwd": "/repo"},
+        {"pane_id": "w1:p2", "workspace_id": "w1", "tab_id": "w1:t1", "agent": "omp",
+         "agent_status": "working", "revision": 100, "cwd": "/repo"}]}}
+
+
+class BusyWire:
+    def __init__(self, *a, **k):
+        self.n = 0
+
+    def send(self, obj):
+        pass
+
+    def read(self, timeout):
+        self.n += 1
+        if self.n == 1:
+            return {"id": "herdr-live", "result": {"type": "subscription_started"}}
+        time.sleep(0.01)
+        return {"event": "pane_updated", "data": {"type": "pane_updated", "pane": {
+            "pane_id": "w1:p2", "workspace_id": "w1", "tab_id": "w1:t1", "agent": "omp",
+            "agent_status": "working", "revision": 100 + self.n, "cwd": "/repo"}}}
+
+    def close(self):
+        pass
+
+
+truth_calls = []
+
+
+def truth_snapshot(method, params=None, timeout=5.0):
+    truth_calls.append(method)
+    # The bootstrap sees w1:p1 working; after that herdr has flipped it to
+    # blocked at the SAME revision and no status event ever reaches the wire.
+    return two_panes("working" if len(truth_calls) == 1 else "blocked")
+
+
+real_wire = herdr_live._Wire
+herdr_live._Wire, herdr_live.request = BusyWire, truth_snapshot
+live = herdr_live.LiveState(resync_every_s=0.3)
+live._apply_snapshot(two_panes("working"))
+t = threading.Thread(target=live._connect_and_stream, daemon=True)
+t.start()
+time.sleep(1.0)
+live.stop()
+t.join(2)
+herdr_live._Wire = real_wire
+st = live.data()["stats"]
+results["busy_stream_resync"] = (live.status("w1:p1"), st["resyncs"] >= 1, st["events"] > 20)
+
+# 17. A FRESH process must reach per-pane status subscriptions. It knows no
+# panes at first, so its first subscribe has no per-pane entry — which the loop
+# used to read as "degraded", after which it never resubscribed: after every
+# hub restart no status event arrived until some pane was created.
+sent = []
+
+
+class RecordingWire:
+    def __init__(self, *a, **k):
+        self.n = 0
+
+    def send(self, obj):
+        sent.append(obj)
+
+    def read(self, timeout):
+        self.n += 1
+        if self.n == 1:
+            return {"id": "herdr-live", "result": {"type": "subscription_started"}}
+        time.sleep(min(timeout, 0.02))
+        return None
+
+    def close(self):
+        pass
+
+
+herdr_live._Wire, herdr_live.request = RecordingWire, lambda *a, **k: two_panes("working")
+live = herdr_live.LiveState(resync_every_s=60)
+box = {}
+t1 = threading.Thread(target=lambda: box.update(first=live._connect_and_stream()), daemon=True)
+t1.start()
+t1.join(1.0)                                            # the bug: this connect streams forever
+first = box.get("first", "never returned: streamed with no per-pane subscriptions")
+if "first" in box:
+    t = threading.Thread(target=live._connect_and_stream, daemon=True)
+    t.start()
+    time.sleep(0.3)
+covered_while_streaming = sorted(getattr(live, "_status_covered", set()))
+live.stop()
+t1.join(2)
+if "first" in box:
+    t.join(2)
+herdr_live._Wire = real_wire
+per_pane = [sorted(s["pane_id"] for s in m["params"]["subscriptions"] if s["type"] == "pane.agent_status_changed")
+            for m in sent]
+results["fresh_process_coverage"] = (first, per_pane, covered_while_streaming)
+
 print(json.dumps(results))
 PY
 ) || { echo "  FAIL python harness did not run: $out"; exit 1; }
@@ -249,10 +372,14 @@ get() { printf '%s' "$out" | jq -c ".$1"; }
 [ "$(get underscore_name)" = '["blocked",[["w1:p1","working","blocked"]]]' ] \
   && ok "underscored pane_agent_status_changed applies too" \
   || no "underscore name" "$(get underscore_name)"
-[ "$(get sticky)" = '["blocked",[]]' ] \
-  && ok "a racing output event cannot un-block the pane" || no "sticky" "$(get sticky)"
-[ "$(get sticky_expires)" = '["working",[["w1:p1","blocked","working"]]]' ] \
-  && ok "the status hold expires, so a real unblock still lands" || no "sticky expiry" "$(get sticky_expires)"
+[ "$(get late_output_row)" = '["blocked",[]]' ] \
+  && ok "a late output row cannot un-block a covered pane" || no "late output row" "$(get late_output_row)"
+[ "$(get covered_sources)" = '[[["w1:p1","blocked","working"]],"working",[["w1:p1","blocked","working"]]]' ] \
+  && ok "a covered pane still moves on its status event and on a snapshot" \
+  || no "covered sources" "$(get covered_sources)"
+[ "$(get uncovered_output_row)" = '["blocked",[["w1:p1","working","blocked"]]]' ] \
+  && ok "an uncovered pane still takes its status from pane_updated" \
+  || no "uncovered output row" "$(get uncovered_output_row)"
 [ "$(get revision_guard)" = '["blocked",[]]' ] \
   && ok "a lower-revision event is dropped" || no "revision guard" "$(get revision_guard)"
 [ "$(get reconnect_diff)" = '["blocked",[["w1:p1","working","blocked"]]]' ] \
@@ -296,6 +423,12 @@ get() { printf '%s' "$out" | jq -c ".$1"; }
 [ "$(get degraded_subs)" = '[true,true,true]' ] \
   && ok "repeated rejections degrade to lifecycle-only rather than losing the stream" \
   || no "degraded subs" "$(get degraded_subs)"
+[ "$(get busy_stream_resync)" = '["blocked",true,true]' ] \
+  && ok "a busy stream still resyncs, so a quiet blocked pane is corrected" \
+  || no "busy stream resync" "$(get busy_stream_resync)"
+[ "$(get fresh_process_coverage)" = '[true,[[],["w1:p1","w1:p2"]],["w1:p1","w1:p2"]]' ] \
+  && ok "a fresh process resubscribes once and covers every pane" \
+  || no "fresh process coverage" "$(get fresh_process_coverage)"
 
 echo
 echo "== edge dispatcher (agent-edge.sh, stubbed) =="

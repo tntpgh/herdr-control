@@ -38,10 +38,19 @@ Design notes that are load-bearing, not style:
   carries the full PaneInfo including `agent_status`, so the lifecycle stream
   alone already keeps state correct in the meantime.
 
-* IDLE RESYNC, NOT POLLING. A silently dead stream is indistinguishable from a
-  quiet fleet, and a control plane that cannot tell those apart is the thing
-  this replaces. If no event arrives for `resync_after_idle_s`, we spend ONE
-  `session.snapshot` RPC to re-verify. That is 6 RPCs an hour, not 6 a second.
+* PERIODIC RESYNC, NOT POLLING. Every `resync_every_s` of wall clock we spend
+  ONE `session.snapshot` RPC and diff it in, whether or not events are
+  flowing. It started as an IDLE resync (only after 600s with no event at all)
+  and that never ran on a working fleet: nine events a second from other panes
+  kept resetting it, so a status change whose event was never delivered stayed
+  wrong indefinitely. herdr changes `agent_status` WITHOUT bumping `revision`,
+  so a pane that goes blocked and then sits quiet (the pane this module exists
+  to report) has no later event to correct it. Measured 2026-09-23: after a
+  hub restart, 109 of 120 samples in 4 minutes had a worker `blocked` in herdr
+  and `working` here AT THE SAME REVISION (w1G:p3 for 3 minutes, on an
+  allow-class `jq` the peer would have answered in 2 seconds). One snapshot
+  every 10s is 0.1 RPC/s: the polling this replaced was 20 reads per tool call
+  per worker.
 
 * EDGES RUN OFF-THREAD. The callback may spawn shell (alerting, retraction,
   peer-answer). It runs on a worker thread draining a bounded queue, so a slow
@@ -78,10 +87,6 @@ LIFECYCLE_SUBSCRIPTIONS = (
 # The one status that means A PERSON IS BEING WAITED FOR. herdr's vocabulary is
 # idle | working | blocked | done | unknown; only `blocked` is a human's turn.
 BLOCKED = "blocked"
-
-# How long a `pane.agent_status_changed` event outranks the status carried by
-# an output-driven `pane_updated` for the same pane. See _apply_pane.
-STATUS_EVENT_STICKY_S = 3.0
 
 # After this many consecutive `pane_not_found` rejections, subscribe to the
 # lifecycle events ONLY. Per-pane status subscriptions are the richer signal,
@@ -200,12 +205,12 @@ class LiveState:
         self,
         on_transition: Callable[[str, str | None, str | None, dict], None] | None = None,
         log: Callable[[str], None] | None = None,
-        resync_after_idle_s: float = 600.0,
+        resync_every_s: float = 10.0,
         max_backoff_s: float = 30.0,
     ):
         self._on_transition = on_transition
         self._log = log or (lambda _msg: None)
-        self._resync_after_idle_s = resync_after_idle_s
+        self._resync_every_s = resync_every_s
         self._max_backoff_s = max_backoff_s
         self._lock = threading.Lock()
         # Shares _lock, so a state change can bump the version and wake every
@@ -214,7 +219,10 @@ class LiveState:
         self._version = 0
         self._panes: dict[str, dict] = {}
         self._since: dict[str, float] = {}       # pane_id -> when its status last changed
-        self._status_event_at: dict[str, float] = {}   # pane_id -> last authoritative status event
+        # Panes whose `pane.agent_status_changed` subscription the CURRENT
+        # connection holds. For these, status comes only from that event and
+        # from snapshots — never from `pane_updated`. See _apply_pane.
+        self._status_covered: set[str] = set()
         # Kept OUT of the served record on purpose (see _pane_record): the edge
         # script needs a cwd, an unauthenticated API reader does not.
         self._cwd: dict[str, str] = {}
@@ -303,7 +311,11 @@ class LiveState:
             return self._cwd.get(pane_id, "")
 
     # ── state application ─────────────────────────────────────────────────────
-    def _apply_pane(self, pane: dict, now: float) -> tuple[str, str | None, str | None, dict] | None:
+    def _apply_pane(self, pane: dict, now: float,
+                    authoritative: bool = False) -> tuple[str, str | None, str | None, dict] | None:
+        """`authoritative` is True for a snapshot row: current truth, so it may
+        set agent_status for any pane. An event-carried row may not, for a pane
+        whose status events we are subscribed to."""
         pid = pane.get("pane_id")
         if not pid:
             return None
@@ -317,22 +329,29 @@ class LiveState:
         # (terminal_id) is what tells them apart.
         if prev and rec["birth"] and prev.get("birth") and rec["birth"] != prev["birth"]:
             self._since.pop(pid, None)
-            self._status_event_at.pop(pid, None)
             prev = None
         if prev and rec["revision"] and prev["revision"] > rec["revision"]:
             # A pane_updated that the socket buffered during a bootstrap can
             # arrive after the snapshot that already superseded it. Revisions
             # are monotonic WITHIN one pane, so the older one is simply dropped.
             return None
-        if (prev and rec["agent_status"] != prev["agent_status"]
-                and now - self._status_event_at.get(pid, 0.0) < STATUS_EVENT_STICKY_S):
-            # `pane_updated` fires on OUTPUT and carries whatever status the
-            # record held when it was built, so one emitted around the same
-            # instant as a status change can carry the pre-change value and
-            # flip `blocked` back to `working`. The dedicated
-            # pane.agent_status_changed event is the authority for status, so
-            # for a moment after one lands, an output event may refresh every
-            # field EXCEPT the status.
+        if (prev and not authoritative and pid in self._status_covered
+                and rec["agent_status"] != prev["agent_status"]):
+            # `pane_updated` is not a status source for a covered pane. It is
+            # built when OUTPUT changes and delivered up to ~8s LATE, carrying
+            # the status of that moment. herdr changes status WITHOUT bumping
+            # `revision`, and the status event carries no revision, so nothing
+            # can tell a late row from a fresh one. Measured on the live stream
+            # 2026-09-23 (150s tap): every one of 22 transitions arrived as a
+            # pane.agent_status_changed within ~1s, while three pane_updated
+            # rows arrived 7-8s after their pane had moved on, each carrying
+            # the pre-transition status. The one built just before an approval
+            # menu painted says `working`; applied after the blocked event, it
+            # un-blocked the pane, which then sat silent — no output, no event —
+            # so nothing ever corrected it, and the peer never saw the prompt.
+            # The 3s "sticky" hold this replaces was shorter than that delay.
+            # Every other field still refreshes; the periodic resync bounds
+            # any status event we do miss.
             rec["agent_status"] = prev["agent_status"]
         cwd = pane.get("foreground_cwd") or pane.get("cwd")
         if cwd:
@@ -353,12 +372,11 @@ class LiveState:
 
     def _drop_pane(self, pane_id: str) -> tuple[str, str | None, str | None, dict] | None:
         prev = self._panes.pop(pane_id, None)
-        # EVERY per-pane map, not just _since. _status_event_at used to survive
-        # here, which both grew without bound on a fleet that recycles panes and
-        # let a recycled pane id inherit a stale sticky-status timestamp — able
-        # to suppress the new occupant's first real status for STATUS_EVENT_STICKY_S.
+        # EVERY per-pane map, not just _since: a map that survives here grows
+        # without bound on a fleet that recycles panes, and hands a recycled id
+        # the previous occupant's state.
         self._since.pop(pane_id, None)
-        self._status_event_at.pop(pane_id, None)
+        self._status_covered.discard(pane_id)
         self._cwd.pop(pane_id, None)
         if not prev:
             return None
@@ -380,7 +398,7 @@ class LiveState:
             live_ids = set()
             for pane in body.get("panes") or []:
                 live_ids.add(pane.get("pane_id"))
-                edge = self._apply_pane(pane, now)
+                edge = self._apply_pane(pane, now, authoritative=True)
                 if edge:
                     edges.append(edge)
             for gone in [pid for pid in self._panes if pid not in live_ids]:
@@ -417,6 +435,10 @@ class LiveState:
                 if old and old != pane.get("pane_id"):
                     self._panes.pop(old, None)
                     self._since.pop(old, None)
+                    self._cwd.pop(old, None)
+                    # This connection's status subscription is for the OLD id;
+                    # the new id is uncovered until the next resubscribe.
+                    self._status_covered.discard(old)
                 edge = self._apply_pane(pane, now)
                 if edge:
                     edges.append(edge)
@@ -451,7 +473,6 @@ class LiveState:
                 merged["agent"] = data.get("agent") or rec.get("agent")
                 before = rec["agent_status"]
                 self._panes[pid] = merged
-                self._status_event_at[pid] = now
                 if before != merged["agent_status"]:
                     self._since[pid] = now
                     self._bump()
@@ -488,7 +509,7 @@ class LiveState:
             except queue.Full:
                 # Never block the stream on a backed-up edge handler. Dropping
                 # is visible in stats, and state stays correct either way — the
-                # next transition (or an idle resync) re-derives what is needed.
+                # next transition (or a periodic resync) re-derives what is needed.
                 self.stats["edges_dropped"] += 1
 
     def _drain_edges(self) -> None:
@@ -558,7 +579,17 @@ class LiveState:
         wire = _Wire(socket_path(), timeout=5.0)
         try:
             subs, covered = self._subscriptions()
-            degraded = any(s["type"] == "pane.agent_status_changed" for s in subs) is False
+            # Degraded means we GAVE UP on per-pane subscriptions after repeated
+            # rejections — read from the counter _subscriptions() itself uses.
+            # It used to be inferred from "the list has no per-pane entry",
+            # which is ALSO true on a fresh process that simply knows no panes
+            # yet: the first connect then called itself degraded, forced
+            # `uncovered` empty, and never resubscribed, so after every hub
+            # restart no status event arrived until some pane was created
+            # (found in review 2026-09-23; it is why the stuck-`working`
+            # divergence came straight back after a restart).
+            with self._lock:
+                degraded = self._subscribe_failures >= STATUS_SUBS_GIVE_UP_AFTER
             wire.send({"id": "herdr-live", "method": "events.subscribe",
                        "params": {"subscriptions": subs}})
             ack = wire.read(timeout=5.0)
@@ -574,9 +605,12 @@ class LiveState:
             # zero times, while stats still said connected:true and
             # last_error:null. Against the real socket that is precisely the
             # single-threaded saturation this module exists to remove.
-            if not degraded:
-                with self._lock:
+            with self._lock:
+                if not degraded:
                     self._subscribe_failures = 0
+                # Empty when degraded: with no status events arriving,
+                # pane_updated is the only live status signal left.
+                self._status_covered = set(covered)
 
             # Bootstrap AFTER the subscription is live (see module docstring).
             self._emit(self._apply_snapshot(request("session.snapshot")))
@@ -596,12 +630,21 @@ class LiveState:
                 self._log(f"resubscribing to cover {len(uncovered)} pane(s)")
                 return True
 
+            next_resync = time.monotonic() + self._resync_every_s
             while not self._stop.is_set():
-                msg = wire.read(timeout=self._resync_after_idle_s)
-                if msg is None:
+                # Resync BEFORE reading, never between a read and applying it:
+                # a message already off the wire predates the snapshot, and
+                # applied after it would regress the state the snapshot set.
+                if time.monotonic() >= next_resync:
                     with self._lock:
                         self.stats["resyncs"] += 1
                     self._emit(self._apply_snapshot(request("session.snapshot")))
+                    next_resync = time.monotonic() + self._resync_every_s
+                # Floored above zero: settimeout(0) is NON-BLOCKING mode, where
+                # recv raises BlockingIOError instead of timing out — that would
+                # surface as "stream lost" and reconnect on every resync.
+                msg = wire.read(timeout=max(0.05, next_resync - time.monotonic()))
+                if msg is None:
                     continue
                 if "result" in msg or "error" in msg:
                     continue
@@ -613,6 +656,9 @@ class LiveState:
                     return True
             return False
         finally:
+            # The next connection's subscription set is not ours to assume.
+            with self._lock:
+                self._status_covered = set()
             wire.close()
 
     def _stream_forever(self) -> None:
