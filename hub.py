@@ -1274,6 +1274,92 @@ def notify_owner(row: dict) -> None:
         pass  # the answer is recorded; delivery is best-effort by design
 
 
+# ── remote mirror: dashboard.teamthurber.com/decisions ────────────────────────
+# Terrence, 2026-09-23: answer the same forms away from the Mac. Every
+# MIRROR_EVERY_S the hub publishes its open forms to kb.hub_forms (KB's
+# server/hub_forms.py, run in KB's own venv from the kb-deploy checkout, the
+# same way kb_data() reads), closes finished ones, and pulls answers made on
+# the dashboard. A remote answer is only a REQUEST until it is recorded here,
+# under the same lock a local answer takes: the loser of a race is acked as
+# `conflict` and the local answer stands. Acks ride the next cycle.
+MIRROR_EVERY_S = float(os.environ.get("HERDR_MIRROR_EVERY_S", "20"))
+MIRROR_STATE: dict = {"last_ok": None, "last_error": None, "published": 0, "pulled": 0}
+_MIRROR_ACKS: list[dict] = []
+
+
+def record_remote_answer(form_id: str, answers: dict, answered_by: str) -> str:
+    """Record a dashboard answer through the local registry. -> ack outcome."""
+    path, row = _form_row(form_id)
+    if row is None:
+        return "missing"
+    if not isinstance(answers, dict):
+        return "missing"
+
+    def _answer(r: dict) -> dict:
+        exp = r.get("expires_at")
+        if isinstance(exp, (int, float)) and exp > 0 and time.time() * 1000 > exp:
+            raise NotClaimable("expired", r)
+        r.update(status="answered", answers=answers, answered_at=int(time.time() * 1000),
+                 answered_via="dashboard", answered_by=str(answered_by or ""))
+        return r
+
+    try:
+        row = claim_and_update(path, _answer)
+    except NotClaimable as e:
+        return "expired" if e.state == "expired" else "conflict"
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return "missing"
+    CACHES["forms"].invalidate()
+    notify_owner(row)
+    return "delivered"
+
+
+def mirror_sync() -> None:
+    """One publish/pull cycle. Never raises: the mirror is a convenience and must
+    not take the hub down; failures are shown on /decisions instead."""
+    try:
+        if not (KB_DEPLOY / "server" / "hub_forms.py").exists() or not KB_PYTHON.exists():
+            raise RuntimeError("kb-deploy has no server/hub_forms.py yet (fast-forwards nightly)")
+        dsn = secret("NEON_CONNECTION_STRING")
+        if not dsn:
+            raise RuntimeError("NEON_CONNECTION_STRING unavailable")
+        d = forms_data()
+        opened = []
+        for f in d["open"]:
+            if not f.get("hub_servable"):
+                continue
+            try:
+                html_text = form_html(f["id"]).read_text()
+            except OSError:
+                continue
+            opened.append({"id": f["id"], "title": f.get("title") or "", "html": html_text,
+                           "expires_at_ms": f.get("expires_at")})
+        acks, _MIRROR_ACKS[:] = list(_MIRROR_ACKS), []
+        payload = {"open": opened, "closed": [f["id"] for f in d["history"]], "acks": acks}
+        env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if k in os.environ}
+        env["NEON_CONNECTION_STRING"] = dsn
+        r = subprocess.run([str(KB_PYTHON), "-m", "server.hub_forms", "sync"], cwd=KB_DEPLOY, env=env,
+                           input=json.dumps(payload), capture_output=True, text=True, timeout=40)
+        if r.returncode != 0:
+            _MIRROR_ACKS[:0] = acks                     # not applied: retry them next cycle
+            raise RuntimeError(f"hub_forms sync exit {r.returncode}")
+        out = json.loads(r.stdout)
+        for p in out.get("pending") or []:
+            _MIRROR_ACKS.append({"id": p.get("id"),
+                                 "outcome": record_remote_answer(str(p.get("id") or ""), p.get("answers"),
+                                                                 p.get("answered_by") or "")})
+            MIRROR_STATE["pulled"] += 1
+        MIRROR_STATE.update(last_ok=time.time(), last_error=None, published=out.get("published", 0))
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
+        MIRROR_STATE["last_error"] = f"{type(e).__name__}: {e}"
+
+
+def _mirror_loop() -> None:
+    while True:
+        mirror_sync()
+        time.sleep(MIRROR_EVERY_S)
+
+
 # ── secrets: pre-resolved, never `op` from a background process ───────────────
 # Only the hub's two service credentials may be resolved. This is the existing
 # literal assignment parser, not a shell: no expansion, sourcing, or op calls.
@@ -2429,6 +2515,14 @@ def render_decisions() -> str:
     # that needs acting on, so it gets the viewport; the answered/expired log is
     # reference material behind a <details>.
     body = ""
+    ms = MIRROR_STATE
+    if ms.get("last_error"):
+        body += (f"<p class=dim><span class='pill bad'>dashboard mirror</span> {_esc(ms['last_error'])} — "
+                 "answer here; dashboard.teamthurber.com/decisions is not current.</p>")
+    elif ms.get("last_ok"):
+        body += (f"<p class=dim><span class='pill ok'>dashboard mirror</span> synced {_age(ms['last_ok'] * 1000)} ago · "
+                 f"{ms.get('published', 0)} published · also answerable at "
+                 f"<a href='{KB_DASHBOARD_URL}/decisions' target=_blank>dashboard.teamthurber.com/decisions</a></p>")
     p = CACHES["portal"].get()
     if p.get("error"):
         body += (f"<h2>Legacy portal · unreadable</h2><p><span class='pill bad'>error</span> {_esc(p['error'])}</p>")
@@ -2824,6 +2918,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--no-live", action="store_true",
                     help="do not subscribe to herdr (pages fall back to the registry only)")
+    ap.add_argument("--no-mirror", action="store_true",
+                    help="do not sync forms to dashboard.teamthurber.com/decisions (smoke runs)")
     args = ap.parse_args()
     if port_open(args.port):
         print(f"hub: already serving on http://127.0.0.1:{args.port}/", file=sys.stderr)
@@ -2836,6 +2932,8 @@ def main() -> int:
         # rather than quietly showing a stale fleet.
         LIVE = herdr_live.LiveState(on_transition=_on_agent_edge, log=_live_log)
         LIVE.start()
+    if not args.no_mirror:
+        threading.Thread(target=_mirror_loop, name="dashboard-mirror", daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"hub: http://127.0.0.1:{args.port}/", file=sys.stderr)
     try:
