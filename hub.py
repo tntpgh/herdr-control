@@ -9,7 +9,7 @@ the two things that need a human — attention items and open decisions.
 
   /            overview cards (herdr attention, decisions, fleet, KB nightly, search memory)
   /herdr       run-registry view: needs-attention, recent events, conductor cursors
-  /decisions   inbox: open formserve forms rendered inline, answered ones with answers
+  /decisions   inbox: open decision-portal rows (apps.teamthurber.com), open formserve forms inline, answered history
   /search      consensus-search memory: totals, last queries, replay counts
   /kb          knowledge-base: nightly ledger, heartbeat, repeat-view signal audits
   /links       every surface with a liveness dot
@@ -75,6 +75,11 @@ SEARCH_URL = os.environ.get("CONSENSUS_SEARCH_URL", "https://consensus.teamthurb
 LAUNCHD_SECRETS = Path(os.environ.get("HERDR_HUB_SECRETS_ENV", Path.home() / ".config/op/launchd-secrets.env"))
 SECRET_NAMES = frozenset(("NEON_CONNECTION_STRING", "SEARCH_SYNC_TOKEN"))
 KB_DASHBOARD_URL = os.environ.get("KB_DASHBOARD_URL", "https://dashboard.teamthurber.com")
+# The durable decision portal (tourguide, apps.teamthurber.com/decisions). Read
+# through tourguide's own CLI, run from its checkout: decision.mjs loads the
+# service-role key from THAT checkout's .env.local, so the hub never holds it.
+PORTAL_URL = "https://apps.teamthurber.com/decisions"
+TOURGUIDE_DIR = Path(os.environ.get("HERDR_TOURGUIDE_DIR", str(Path.home() / "Code/tourguide")))
 # Attention means A PERSON IS THE ONE BEING WAITED FOR. `running` was in here,
 # which is why clearing a stale `blocked` alone did not move the badge: an
 # answered worker just swapped one attention state for another and the card
@@ -1074,6 +1079,29 @@ def forms_data() -> dict:
             "open_count": len(open_forms)}
 
 
+def portal_data() -> dict:
+    """Open rows in the decision portal. Terrence, 2026-09-23: the local
+    dashboard must list them — questions sat there unseen because only served
+    forms appeared here. An unreadable portal is SAID, never shown as "0 open":
+    silence would read as nothing waiting."""
+    cli = TOURGUIDE_DIR / "scripts" / "decision.mjs"
+    if not cli.exists():
+        return {"open": [], "open_count": 0, "error": f"{cli} not found"}
+    try:
+        r = subprocess.run(["node", str(cli), "list", "--status", "open"], cwd=TOURGUIDE_DIR,
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            return {"open": [], "open_count": 0,
+                    "error": f"decision.mjs exit {r.returncode}: {(r.stderr or '').strip()[:200]}"}
+        rows = json.loads(r.stdout or "[]")
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        return {"open": [], "open_count": 0, "error": f"{type(e).__name__}: {e}"}
+    rows = [{k: x.get(k) for k in ("gate", "decision_id", "question", "assignee", "created_at", "recommendation")}
+            for x in rows if isinstance(x, dict) and x.get("status") == "open"]
+    rows.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return {"open": rows, "open_count": len(rows), "error": None}
+
+
 # ── answering a form from the hub itself ──────────────────────────────────────
 # The hub serves the stored HTML with this shim appended, so a form authored for
 # formserve needs no change: it still calls window.submitAnswers().
@@ -1976,6 +2004,8 @@ CACHES = {
     "kb": Cached(300, kb_data, stale_ok=True, name="kb"),
     "links": Cached(60, links_data, stale_ok=True, name="links"),
     "loops": Cached(10, loops_data, stale_ok=True, name="loops"),
+    # One ~250ms node call to Supabase: served stale, refreshed behind the reader.
+    "portal": Cached(60, portal_data, stale_ok=True, name="portal"),
 }
 
 
@@ -2226,7 +2256,7 @@ def debt_rows(d: dict) -> str:
 
 
 def render_overview(scope: str = "") -> str:
-    h_all, f, s, k, l, lo, dbt = (CACHES[n].get() for n in ("herdr", "forms", "search", "kb", "links", "loops", "debt"))
+    h_all, f, s, k, l, lo, dbt, pd = (CACHES[n].get() for n in ("herdr", "forms", "search", "kb", "links", "loops", "debt", "portal"))
     # Handoff debt (#102) is per-REPO in its own right, so it narrows with the
     # scope like everything else on this page; the ledger rows carry a repo.
     h = scoped(h_all, scope)
@@ -2248,7 +2278,10 @@ def render_overview(scope: str = "") -> str:
     debt_repos = dbt.get("repos", [])
     cards = [
         ("/herdr", att, "need attention", f"{len(h.get('tasks', []))} tasks · events to #{h.get('max_event_seq', 0)}", att > 0),
-        ("/decisions", f.get("open_count", 0), "decisions open", f"{len(f.get('history', []))} answered/expired on record", f.get("open_count", 0) > 0),
+        ("/decisions", f.get("open_count", 0) + pd.get("open_count", 0), "decisions open",
+         f"{f.get('open_count', 0)} form(s) · {pd.get('open_count', 0)} in the portal"
+         + (" (portal UNREADABLE)" if pd.get("error") else ""),
+         f.get("open_count", 0) + pd.get("open_count", 0) > 0 or bool(pd.get("error"))),
         ("#handoff-debt", len(debt_repos), "repo(s) owe a handoff",
          (f"{len(dbt.get('debt', []))} session(s)"
           + (f" · {dbt['shipped']} shipped" if dbt.get("shipped") else "")
@@ -2395,8 +2428,22 @@ def render_decisions() -> str:
     # that needs acting on, so it gets the viewport; the answered/expired log is
     # reference material behind a <details>.
     body = ""
+    p = CACHES["portal"].get()
+    if p.get("error"):
+        body += (f"<h2>Portal · unreadable</h2><p><span class='pill bad'>error</span> {_esc(p['error'])} — "
+                 f"check <a href='{PORTAL_URL}' target=_blank>the portal</a> directly.</p>")
+    elif p["open"]:
+        body += (f"<h2>Portal · {p['open_count']} open</h2><p class=dim>Durable, attributed questions, answered at "
+                 f"<a href='{PORTAL_URL}' target=_blank>apps.teamthurber.com/decisions</a> (SSO).</p><table>"
+                 + "".join(
+                     f"<tr class=hot><td><span class='pill hot'>{_esc(x.get('gate'))}</span></td>"
+                     f"<td><a href='{PORTAL_URL}' target=_blank><b>{_esc(x.get('question'))}</b></a>"
+                     + (f"<br><small>recommended: {_esc(x.get('recommendation'))}</small>" if x.get("recommendation") else "")
+                     + f"<br><small>{_esc(x.get('decision_id'))} · {_esc(x.get('assignee'))}</small></td>"
+                     f"<td class=age>{_age(x.get('created_at'))}</td></tr>" for x in p["open"])
+                 + "</table>")
     if not d["open"]:
-        body += ("<h2>Open (0)</h2><p class=dim>Nothing waiting on you. "
+        body += ("<h2>Forms · 0 open</h2><p class=dim>No served form is waiting. "
                  "Forms appear here the moment an agent serves one.</p>")
     for f in d["open"]:
         # Prefer the hub's own durable URL: it keeps working after the creating
@@ -2415,7 +2462,7 @@ def render_decisions() -> str:
     body += (f"<details class=hist><summary>History · {len(d['history'])} answered/expired</summary>"
              f"<table>{rows or '<tr><td class=dim>none yet</td></tr>'}</table></details>")
     key = ",".join(sorted(f["id"] for f in d["open"]))
-    return page(f"decisions · {d['open_count']} open", "/decisions",
+    return page(f"decisions · {d['open_count'] + p.get('open_count', 0)} open", "/decisions",
                 body + DECISIONS_POLLER % json.dumps(key), refresh=0)
 
 
@@ -2597,7 +2644,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             return self._send(200, "text/plain", b"ok")
         if path == "/api/summary":
-            h_all, f = CACHES["herdr"].get(), CACHES["forms"].get()
+            h_all, f, pd = CACHES["herdr"].get(), CACHES["forms"].get(), CACHES["portal"].get()
             # Scoped counts, because this endpoint is what the omp extension,
             # agent-edge.sh and the decisions poller read — an unscoped number
             # beside a scoped page is how a reader learns to distrust both.
@@ -2648,6 +2695,10 @@ class Handler(BaseHTTPRequestHandler):
                  "rev": RUNNING_REV,
                  "live_connected": live_data().get("connected", False),
                  "open_decisions": f.get("open_count", 0),
+                 # The portal's open rows, separately: open_ids/open_decisions
+                 # stay form-only because /decisions reloads on that id set.
+                 "open_portal_decisions": pd.get("open_count", 0),
+                 "portal_error": pd.get("error"),
                  # NOT scoped, and said so rather than implied: a served
                  # decision carries no repo, so filtering it would be a guess.
                  # A consumer that scopes its attention count and silently
