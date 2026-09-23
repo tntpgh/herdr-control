@@ -483,7 +483,7 @@ printf 'Allow tool: bash\nCommand: mkfs /dev/disk9\n\nApprove\n\033[48;2;42;47;6
 sel 2 --authority peer; rc=$?
 [ "$rc" = 0 ] && [ "$(cat "$KEYS")" = Enter ] && ok "peer can deny an unsafe request without approving it" || bad "safe denial blocked"
 reset_keys
-set_task_state run1 task1 completed >/dev/null 2>&1
+set_task_state run1 task1 completed no-follow-on >/dev/null 2>&1
 conductor_select; rc=$?
 [ "$rc" = 8 ] && [ "$(keys_pressed)" = 0 ] && ok "completed task no longer grants conductor authority" || bad "terminal task accepted"
 

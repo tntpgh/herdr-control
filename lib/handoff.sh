@@ -40,6 +40,13 @@ handoff_events() { printf '%s/%s/events.jsonl\n' "${1%/}" "$(handoff_rel)"; }
 # approval, which is the whole point.
 handoff_identity() { printf '%s/%s/identity.json\n' "${1%/}" "$(handoff_rel)"; }
 
+# SPEC.md: the goal, acceptance checklist, and proof contract handed to a
+# spawned worker — written once, at spawn time (spawn-task.sh). PROOF.md:
+# empty at spawn, filled in by the worker as it collects the evidence its
+# eventual closure reason will point at (project-contract-plan.md item 1).
+handoff_spec()  { printf '%s/%s/SPEC.md\n'  "${1%/}" "$(handoff_rel)"; }
+handoff_proof() { printf '%s/%s/PROOF.md\n' "${1%/}" "$(handoff_rel)"; }
+
 # Every events file a READER must consider: canonical first, then legacy when
 # it exists. Prints nothing for a worktree that has neither.
 handoff_event_files() {                # worktree -> 0..2 paths, newest scheme first

@@ -239,11 +239,32 @@ run_reconciliation() {
             local done_ev
             done_ev="$(_done_event_for_task "$task_json")"
             if [ -n "$done_ev" ]; then
-              set_task_state "$run_id" "$task_id" "completed"
-              append_event "$run_id" "$task_id" "completion_recorded" \
-                "$(jq -nc --arg r "$reason" --arg pane "$pane_id" --argjson ev "$done_ev" \
-                  '{source:"worktree_handoff_event", pane_reason:$r, pane_id:$pane, event:$ev}')" \
-                "complete_${task_id}_$(printf '%s' "$done_ev" | jq -r '.event')"
+              # The worker's OWN completion claim now has to carry the same
+              # closure reason set_task_state requires of every other caller
+              # (project-contract-plan.md item 1) — `.handoffs/SPEC.md`'s
+              # proof contract, spawn-task.sh, tells it so. A `_done` line
+              # with no reason (or `shipped` with no proof) is exactly the
+              # unchecked claim this gate exists to stop trusting.
+              local ev_reason ev_proof
+              ev_reason="$(printf '%s' "$done_ev" | jq -r '.reason // empty')"
+              ev_proof="$(printf '%s' "$done_ev" | jq -r '.proof // empty')"
+              if set_task_state "$run_id" "$task_id" "completed" "$ev_reason" "$ev_proof"; then
+                append_event "$run_id" "$task_id" "completion_recorded" \
+                  "$(jq -nc --arg r "$reason" --arg pane "$pane_id" --argjson ev "$done_ev" \
+                    '{source:"worktree_handoff_event", pane_reason:$r, pane_id:$pane, event:$ev}')" \
+                  "complete_${task_id}_$(printf '%s' "$done_ev" | jq -r '.event')"
+              else
+                # Leave state as-is (the pane is gone either way): a human or
+                # conductor closes it explicitly with a real reason, or a
+                # later sweep tries again once the worker's own event is
+                # fixed. Recorded, never silent — and never falls through to
+                # `lost`, which would misreport a worker that DID finish.
+                append_event "$run_id" "$task_id" "completion_evidence_rejected" \
+                  "$(jq -nc --arg r "$reason" --arg pane "$pane_id" --argjson ev "$done_ev" \
+                    '{source:"worktree_handoff_event", pane_reason:$r, pane_id:$pane, event:$ev,
+                      why:"done event carries no valid closure reason/proof"}')" \
+                  "reject_${task_id}_$(printf '%s' "$done_ev" | jq -r '.event')"
+              fi
             else
               set_task_state "$run_id" "$task_id" "lost"
               append_event "$run_id" "$task_id" "lost_detected" \
@@ -339,7 +360,7 @@ run_reconciliation() {
     [ "$ev_seq" -gt "$max_seq" ] && max_seq="$ev_seq"
     ev_type=$(printf '%s' "$ev_json" | jq -r '.type // empty')
     case "$ev_type" in
-      input_required|push_wake_refused|pane_identity_uncertain|conductor_identity_uncertain|stale_worker_hook_refused|completion_evidence) ;;
+      input_required|push_wake_refused|pane_identity_uncertain|conductor_identity_uncertain|stale_worker_hook_refused|completion_evidence|completion_evidence_rejected) ;;
       wake_result)
         # A submitted wake needs no report — the conductor it woke IS the
         # audience. Only failures are silent and need surfacing.

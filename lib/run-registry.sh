@@ -397,8 +397,47 @@ _legal_transition() {                   # from to -> 0 if allowed
   return 1
 }
 
-set_task_state() {                      # run_id task_id state
-  local run_id="$1" task_id="$2" state="$3"
+# ---- closure-reason gate (thurber-os docs/project-contract-plan.md item 1) --
+# `completed` used to accept any caller's say-so — "done" was a claim nothing
+# checked (failure row 1: a conductor's own TODO said a task was done while
+# its worker sat blocked with PRs unopened). These two gate the one state that
+# closes a task's story: a caller must name WHY (the fixed vocabulary below —
+# free text would let a caller invent a sixth meaning nothing else
+# understands), and a "shipped" claim must point at something checkable.
+#
+# `handed_off_to:<x>` / `blocked_on:<x>` require a nonempty `<x>` — a bare
+# "handed_off_to:" names nobody.
+_valid_closure_reason() {               # reason -> 0 if one of the five
+  local reason="$1"
+  case "$reason" in
+    shipped|canceled|no-follow-on) return 0 ;;
+    handed_off_to:?*|blocked_on:?*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _valid_proof_ref <proof> -> 0 if it looks like a checkable pointer, not a
+# bare assertion. Two shapes, both named in the plan doc: "<PR URL> <merge
+# sha>" (space-separated; the sha is loosely checked as 7-40 hex characters,
+# what `git rev-parse --short`..full sha40 both produce) or a `.handoffs/
+# PROOF.md` section reference (anything naming PROOF.md — the anchor syntax is
+# the caller's; this only refuses a proof that could not possibly be one). An
+# empty string is never proof.
+_valid_proof_ref() {
+  local proof="$1" url rest sha
+  [ -n "$proof" ] || return 1
+  case "$proof" in *PROOF.md*) return 0 ;; esac
+  case "$proof" in *' '*) ;; *) return 1 ;; esac
+  url="${proof%% *}"
+  rest="${proof#* }"
+  sha="${rest%% *}"
+  case "$url" in *'://'*) ;; *) return 1 ;; esac
+  case "$sha" in *[!0-9a-fA-F]*|'') return 1 ;; esac
+  [ "${#sha}" -ge 7 ] && [ "${#sha}" -le 40 ]
+}
+
+set_task_state() {                      # run_id task_id state [reason] [proof]
+  local run_id="$1" task_id="$2" state="$3" reason="${4:-}" proof="${5:-}"
   registry_init || return 1
   local attempt=0
   while [ "$attempt" -lt 3 ]; do
@@ -416,6 +455,24 @@ set_task_state() {                      # run_id task_id state
     fi
     [ "$cur" = "$state" ] && return 0
 
+    # Closure-reason gate: only for a REAL transition INTO `completed` (the
+    # idempotent re-assert above already returned, and nothing legally
+    # transitions TO completed a second time). "Missing -> nonzero exit,
+    # nothing written" — checked before the transaction below, so a refused
+    # call touches no row and appends no event.
+    if [ "$state" = "completed" ]; then
+      if ! _valid_closure_reason "$reason"; then
+        printf 'run-registry: refusing completed for %s/%s: closure reason missing/invalid (need shipped|handed_off_to:<x>|blocked_on:<x>|canceled|no-follow-on, got %s)\n' \
+          "$run_id" "$task_id" "${reason:-<empty>}" >&2
+        return 1
+      fi
+      if [ "$reason" = "shipped" ] && ! _valid_proof_ref "$proof"; then
+        printf 'run-registry: refusing shipped completion for %s/%s: proof missing/invalid (need "<PR URL> <merge sha>" or a PROOF.md section reference)\n' \
+          "$run_id" "$task_id" >&2
+        return 1
+      fi
+    fi
+
     # The state change and its event land in ONE transaction, AND that
     # transaction is compare-and-swap on the "$cur" we just read (WHERE
     # ... AND state=$cur). Without the CAS guard, two reconcile sweeps
@@ -428,15 +485,30 @@ set_task_state() {                      # run_id task_id state
     # above it, before the INSERT's own execution changes it again) makes
     # the loser's INSERT a no-op in the SAME transaction, instead of a
     # second write needing its own compensating check.
-    local at eid changed
+    local at eid changed payload
     at="$(_now_iso)"
     eid="$(gen_id ev)"
+    # `reason`/`proof` ride in the SAME state_changed payload rather than a
+    # new table (project-contract-plan item 1: "no new table") — only
+    # `completed` carries them; every other transition's payload shape is
+    # unchanged, so an existing reader keyed on {state,from} still works.
+    if [ "$state" = "completed" ]; then
+      if [ -n "$proof" ]; then
+        payload="$(jq -nc --arg s "$state" --arg f "$cur" --arg reason "$reason" --arg proof "$proof" \
+          '{state:$s, from:$f, reason:$reason, proof:$proof}')"
+      else
+        payload="$(jq -nc --arg s "$state" --arg f "$cur" --arg reason "$reason" \
+          '{state:$s, from:$f, reason:$reason}')"
+      fi
+    else
+      payload="$(jq -nc --arg s "$state" --arg f "$cur" '{state:$s, from:$f}')"
+    fi
     changed=$(_sql "BEGIN IMMEDIATE;
       UPDATE tasks SET state=$(_sq "$state"), updated_at=$(_sq "$at")
         WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id") AND state=$(_sq "$cur");
       INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload)
         SELECT $(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), 'state_changed', $(_sq "$at"),
-          $(_sq "$(jq -nc --arg s "$state" --arg f "$cur" '{state:$s, from:$f}')")
+          $(_sq "$payload")
         WHERE (SELECT changes()) > 0;
       COMMIT;
       SELECT changes();" 2>/dev/null)

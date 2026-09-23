@@ -173,7 +173,10 @@ if [ "${1:-}" = "--record-completion" ]; then
                     "complete_${RC_TASK}_${DOC_COMMIT}" >/dev/null 2>&1 || true
                 echo "stage2-diagnose: registry task $RC_RUN/$RC_TASK is terminal ($RC_STATE) — evidence recorded as completion_evidence event, state left settled" ;;
             *)
-                set_task_state "$RC_RUN" "$RC_TASK" completed || true
+                # `handed_off_to:human_review`, not `shipped`: the doc is
+                # verified COMMITTED on the pass branch, not merged — no PR+
+                # sha to point at, so `shipped` would overclaim.
+                set_task_state "$RC_RUN" "$RC_TASK" completed "handed_off_to:human_review" || true
                 append_event "$RC_RUN" "$RC_TASK" "completion_recorded" "$RC_EVIDENCE" \
                     "complete_${RC_TASK}_${DOC_COMMIT}" >/dev/null 2>&1 || true
                 echo "stage2-diagnose: registry task $RC_RUN/$RC_TASK -> completed" ;;

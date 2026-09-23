@@ -3,8 +3,8 @@
 # settle their registry rows. DRY-RUN BY DEFAULT.
 #
 #   close-done-workers.sh            # show what would close, change nothing
-#   close-done-workers.sh --apply    # actually close
-#   close-done-workers.sh --apply --include-lost
+#   close-done-workers.sh --apply --reason=no-follow-on
+#   close-done-workers.sh --apply --include-lost --reason=shipped --proof="https://github.com/org/repo/pull/1 abc1234"
 #
 # ---- the distinction this script exists to enforce --------------------------
 # Closing a PANE and removing a WORKTREE are different operations with wildly
@@ -34,15 +34,33 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib/run-registry.sh
 source "$HERE/lib/run-registry.sh"
 
-apply=0; include_lost=0
+apply=0; include_lost=0; closure_reason=""; closure_proof=""
 for a in "$@"; do
   case "$a" in
     --apply) apply=1 ;;
     --include-lost) include_lost=1 ;;
+    # Required with --apply: no shim defaults a closure reason here either
+    # (project-contract-plan.md item 1) — the operator running this cleanup
+    # states why these panes are closing, uniformly for the whole batch.
+    # Mixed reasons across one run: filter panes and run it more than once.
+    --reason=*) closure_reason="${a#--reason=}" ;;
+    --proof=*) closure_proof="${a#--proof=}" ;;
     -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'close-done-workers: unknown flag %s\n' "$a" >&2; exit 1 ;;
   esac
 done
+if [ "$apply" = 1 ]; then
+  _valid_closure_reason "$closure_reason" || {
+    printf 'close-done-workers: --apply requires --reason=<shipped|handed_off_to:<x>|blocked_on:<x>|canceled|no-follow-on>\n' >&2
+    exit 1
+  }
+  if [ "$closure_reason" = shipped ]; then
+    _valid_proof_ref "$closure_proof" || {
+      printf 'close-done-workers: --reason=shipped requires --proof="<PR URL> <merge sha>" or a PROOF.md section reference\n' >&2
+      exit 1
+    }
+  fi
+fi
 
 states="'running','blocked','starting'"
 [ "$include_lost" = 1 ] && states="$states,'lost'"
@@ -86,7 +104,7 @@ while IFS='|' read -r run_id task_id pane wt label; do
   # run, the task stays `running` forever against a pane that no longer
   # exists — which is precisely the stale state that made the attention view
   # report seven phantom items all day.
-  set_task_state "$run_id" "$task_id" "completed" >/dev/null 2>&1 ||
+  set_task_state "$run_id" "$task_id" "completed" "$closure_reason" "$closure_proof" >/dev/null 2>&1 ||
     set_task_state "$run_id" "$task_id" "cancelled" >/dev/null 2>&1
   [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
   [ "$(pane_status "$pane")" = absent ] || herdr pane close "$pane" >/dev/null 2>&1

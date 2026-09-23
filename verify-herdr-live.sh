@@ -592,7 +592,7 @@ after=$(sqlite3 "$regroot/registry.sqlite3" "select state from tasks where task_
 # And a terminal row is never resurrected: the registry's own legality rule.
 env HERDR_RUN_STATE_DIR="$regroot" bash -c '
   . "'"$HERE"'/config.sh"; . "'"$HERE"'/lib/run-registry.sh"
-  set_task_state run_v task_v completed >/dev/null' 2>/dev/null
+  set_task_state run_v task_v completed no-follow-on >/dev/null' 2>/dev/null
 rm -f "$tmp/bridge/pending.jsonl"   # or the dedupe exits before the audit line
 line=$(run_edge blocked working HERDR_RUN_STATE_DIR="$regroot")
 after=$(sqlite3 "$regroot/registry.sqlite3" "select state from tasks where task_id='task_v';" 2>/dev/null)

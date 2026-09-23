@@ -73,7 +73,7 @@ check "reason is pane_gone" \
 
 printf '== pane_gone BUT the worktree holds a _done handoff event -> completed, NOT lost (2026-09-05) ==\n'
 WTD="$(dirname "$HERDR_RUN_STATE_DIR")/wt-z"; mkdir -p "$WTD/.handoffs"   # under the harness tmp, cleaned by the EXIT trap
-printf '%s\n' '{"event":"implement:feat/x_started"}' 'not json at all' '{"event":"implement:feat/x_done","pr":"https://example/pr/1"}' > "$WTD/.handoffs/events.jsonl"
+printf '%s\n' '{"event":"implement:feat/x_started"}' 'not json at all' '{"event":"implement:feat/x_done","pr":"https://example/pr/1","reason":"shipped","proof":"https://example/pr/1 abc1234"}' > "$WTD/.handoffs/events.jsonl"
 register_task runZ taskZ w c cp cb paneZ birthZ /repo/d "$WTD" "finished-then-closed" || bad "register taskZ failed"
 set_task_state runZ taskZ running || bad "taskZ -> running failed"
 _PANES=""    # tab closed by the conductor after the _done landed
@@ -85,12 +85,34 @@ check "completion event cites the handoff event" \
 check "no lost_detected for a finished worker" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskZ' AND type='lost_detected';")" "0"
 
+printf '== pane_gone + a _done event with NO valid closure reason -> NOT completed, NOT lost (item 1 gate) ==\n'
+# The worker's own "done" claim is exactly the unchecked assertion
+# project-contract-plan.md item 1 exists to stop trusting — a `_done` line
+# with no reason field must not silently close the task, and must not be
+# misreported as `lost` either (the worker really did finish; the sweep just
+# cannot verify WHY it is closing).
+WTR="$(dirname "$HERDR_RUN_STATE_DIR")/wt-noreason"; mkdir -p "$WTR/.handoffs"
+printf '%s\n' '{"event":"implement:feat/noreason_done"}' > "$WTR/.handoffs/events.jsonl"
+register_task runR taskR w c cp cb paneR birthR /repo/r "$WTR" "no-reason" || bad "register taskR failed"
+set_task_state runR taskR running || bad "taskR -> running failed"
+_PANES=""
+run_reconciliation condR SessionStart --quiet-if-empty --no-hook-json >/dev/null
+check "stays running, not silently completed" "$(read_task runR taskR | jq -r .state)" "running"
+check "not misreported as lost either" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskR' AND type='lost_detected';")" "0"
+check "the rejection is recorded" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskR' AND type='completion_evidence_rejected';")" "1"
+# Retire it explicitly: left `running` with its pane gone, every later
+# scenario's own reconciliation sweep would re-attempt (and re-refuse) this
+# same completion — harmless but noisy. `cancelled` needs no closure reason.
+set_task_state runR taskR cancelled >/dev/null 2>&1
+
 printf '== a worker briefed BEFORE the path change still completes (legacy .omc/handoffs, 2026-09-09) ==\n'
 # The compat half of lib/handoff.sh. If the reader ever stops consulting the
 # legacy file, an in-flight worker that finished correctly gets classified
 # LOST and its branch swept — which is the expensive direction of this change.
 WTL="$(dirname "$HERDR_RUN_STATE_DIR")/wt-legacy"; mkdir -p "$WTL/.omc/handoffs"
-printf '%s\n' '{"event":"implement:feat/legacy_done","pr":"https://example/pr/9"}' > "$WTL/.omc/handoffs/events.jsonl"
+printf '%s\n' '{"event":"implement:feat/legacy_done","pr":"https://example/pr/9","reason":"shipped","proof":"https://example/pr/9 def5678"}' > "$WTL/.omc/handoffs/events.jsonl"
 register_task runL taskL w c cp cb paneL birthL /repo/l "$WTL" "legacy-briefed" || bad "register taskL failed"
 set_task_state runL taskL running || bad "taskL -> running failed"
 _PANES=""
@@ -102,8 +124,8 @@ check "legacy completion cites its handoff event" \
 
 printf '== both files present -> the later append wins, no double-count ==\n'
 WTB="$(dirname "$HERDR_RUN_STATE_DIR")/wt-both"; mkdir -p "$WTB/.handoffs" "$WTB/.omc/handoffs"
-printf '%s\n' '{"event":"implement:feat/both_done","pr":"https://example/pr/old"}' > "$WTB/.omc/handoffs/events.jsonl"
-printf '%s\n' '{"event":"implement:feat/both_done","pr":"https://example/pr/new"}' > "$WTB/.handoffs/events.jsonl"
+printf '%s\n' '{"event":"implement:feat/both_done","pr":"https://example/pr/old","reason":"shipped","proof":"https://example/pr/old aaa1111"}' > "$WTB/.omc/handoffs/events.jsonl"
+printf '%s\n' '{"event":"implement:feat/both_done","pr":"https://example/pr/new","reason":"shipped","proof":"https://example/pr/new bbb2222"}' > "$WTB/.handoffs/events.jsonl"
 register_task runB2 taskB2 w c cp cb paneB2 birthB2 /repo/b2 "$WTB" "both-schemes" || bad "register taskB2 failed"
 set_task_state runB2 taskB2 running || bad "taskB2 -> running failed"
 _PANES=""

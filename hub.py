@@ -855,6 +855,24 @@ def herdr_data(event_limit: int = 100) -> dict:
         asked = {r[0]: r[1] for r in conn.execute(
             "SELECT task_id, MAX(occurred_at) FROM events WHERE type='brief_delivered' "
             "GROUP BY task_id")}
+        # The closure reason/proof a REAL registry transition recorded — item
+        # 1's "the hub shows a task as done only from the registry
+        # transition, with its reason": a `completed` row with nothing here
+        # is a completion this gate never actually saw (pre-gate data, or a
+        # direct DB edit), and the page says so rather than inventing one.
+        # Ascending order + dict overwrite: the LAST transition into
+        # `completed` for a task_id wins, matching set_task_state's own
+        # terminal-once invariant (there is normally exactly one).
+        closure_reasons: dict[str, dict] = {}
+        for r in conn.execute(
+                "SELECT task_id, payload FROM events WHERE type='state_changed' "
+                "AND json_extract(payload,'$.state')='completed' ORDER BY sequence"):
+            try:
+                p = json.loads(r["payload"] or "{}")
+            except json.JSONDecodeError:
+                p = {}
+            if p.get("reason"):
+                closure_reasons[r["task_id"]] = {"reason": p["reason"], "proof": p.get("proof")}
     finally:
         conn.close()
     labels = {t["task_id"]: t["label"] or t["task_id"] for t in tasks}
@@ -894,6 +912,9 @@ def herdr_data(event_limit: int = 100) -> dict:
         # written against a blocked or stalled task and lie in wait.
         t["evidence_at"] = (_comp_value if isinstance(_comp_value, float)
                             and t["state"] in ("ready_review", "completed") else None)
+        c = closure_reasons.get(t["task_id"]) or {}
+        t["closure_reason"] = c.get("reason")
+        t["closure_proof"] = c.get("proof")
         t["state_stale"] = t["state"] != t["stored_state"]
     attention = sorted((t for t in tasks if t["state"] in ATTENTION),
                        key=lambda t: (ATTENTION.index(t["state"]), t["updated_at"]))
@@ -2388,7 +2409,15 @@ def task_rows(rows) -> str:
             # because herdr says so" and "blocked because herdr went quiet" are
             # different facts about whether anyone is actually waiting.
             stale = " <small class=dim title='herdr has no live status for this pane; this is the registry copy'>unconfirmed</small>"
-        out.append(f"<tr class='{cls}'><td><span class='pill {cls}'>{_esc(t['state'])}</span>{stale}</td>"
+        # The whole point of item 1's gate: a `completed` row NAMES why. One
+        # not carrying a reason is a completion the gate never actually saw
+        # (pre-gate data, or a direct DB edit) — said plainly, not hidden.
+        closure = ""
+        if t["state"] == "completed":
+            reason = t.get("closure_reason")
+            closure = (f" <small class=dim title='closure reason'>{_esc(reason)}</small>" if reason
+                       else " <small class=dim title='no closure reason on record'>no reason recorded</small>")
+        out.append(f"<tr class='{cls}'><td><span class='pill {cls}'>{_esc(t['state'])}</span>{stale}{closure}</td>"
                    f"<td><b>{_esc(t['label'])}</b><br><small>{_esc(repo)} · pane {_esc(t['pane_id'] or '—')} · "
                    f"{_esc(t['conductor_id'] or 'no conductor')}</small></td>"
                    f"<td class=age title='{_esc(t['updated_at'])}'>{_age(t['updated_at'])}</td></tr>")
