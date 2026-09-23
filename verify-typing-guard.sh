@@ -137,6 +137,49 @@ send "a message after they paused"; rc=$?
 [ "$rc" -ne 6 ] && ok "not refused once typing settled (rc=$rc)" || bad "refused despite settling"
 [ -s "$SENDTEXT" ] && ok "text was typed once the composer went quiet" || bad "text never typed"
 
+# Regression, 2026-09-23: the guard compared the whole bottom-of-pane window,
+# so a WORKING omp conductor — output streaming, spinner/elapsed/cost ticking in
+# the composer's own top border — read as "typing" on every check, and every
+# push wake into it was refused with exit 6. Shape copied from a live omp pane:
+# `╭── <status> ──╮` border, then the input on the `╰─` row.
+# A live busy pane changes on EVERY read, so every one of the guard's six reads
+# gets a distinct screen — a fixture that settles after two would let the old
+# whole-window compare pass on its second pair and prove nothing.
+printf '\n== busy omp agent, EMPTY composer: output + status border churn on every read -> proceeds ==\n'
+reset_state
+spin=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴)
+for i in 1 2 3 4 5 6; do
+  screen "$i" <<EOF
+│ $ git show --stat 68d8edc | head -50                                │
+├─── Output ──────────────────────────────────────────────────────────┤
+│  streamed output line $i                                            │
+
+ • Background job completed [bash] bg_$i (11.5s)
+╭── ${spin[$((i - 1))]} 13m  Opus 5.5  ~/Code/tntpgh-dev  main ?$i  14.4$i ───42%───╮
+╰─                                                                ─╯
+EOF
+done
+last_as 6
+send "[HERDR-PEER-SIGNAL] worker w1H:p2 needs input"; rc=$?
+[ "$rc" -ne 6 ] && ok "busy agent is not mistaken for a typing human (rc=$rc)" || bad "refused a busy agent's empty composer as typing"
+[ -s "$SENDTEXT" ] && ok "wake text was typed" || bad "wake never typed into a busy agent"
+
+printf '\n== busy omp agent AND a human typing on the ╰─ row -> still REFUSED ==\n'
+reset_state
+i=0
+for typed in 'hel' 'hell' 'hello' 'hello t' 'hello th' 'hello the'; do
+  i=$((i + 1))
+  screen "$i" <<EOF
+│ streamed output line $i                                             │
+╭── ⠙ 13m  Opus 5.5  ~/Code/tntpgh-dev  main ?2  14.$i ───42%───╮
+╰─ $typed
+EOF
+done
+last_as 6
+send "[HERDR-PEER-SIGNAL] worker w1H:p2 needs input"; rc=$?
+[ "$rc" -eq 6 ] && ok "exit 6 REFUSED — the input row itself changed" || bad "exit $rc (expected 6): $(cat "$WORK/err.txt")"
+[ ! -s "$SENDTEXT" ] && ok "nothing interleaved into the human's input" || bad "typed anyway: $(cat "$SENDTEXT")"
+
 printf '\n== --force bypasses the typing guard on purpose ==\n'
 reset_state
 screen 1 <<'EOF'

@@ -350,12 +350,28 @@ composer_stable_snapshot() {
     | sed -E 's/[[:space:]]+$//'
 }
 
+# _composer_input_rows (stdin filter) — only the rows a human types into.
+#
+# omp draws its composer as a box at the bottom of the pane: a `╭── <status
+# bar> ──╮` top border, then the input (`│ …` continuation rows, the last row
+# on the `╰─ …` border itself). Everything above that border is agent OUTPUT,
+# and on a working agent it changes every frame — streamed text, tool panels,
+# "background job completed" notices — as does the border itself (spinner,
+# elapsed time, cost, context %, git untracked count). None of that is typing.
+# Only the rows below the LAST `╭` are the composer.
+#
+# No `╭` in the window — a `❯` composer, or input tall enough to scroll its own
+# border out of view — means the whole window, which is all this ever compared
+# before; the second case is all input rows anyway.
+_composer_input_rows() {
+  awk '{ row[NR] = $0 } /^[[:space:]]*╭/ { top = NR } END { for (i = top + 1; i <= NR; i++) print row[i] }'
+}
+
 # composer_looks_actively_typed <pane> [settle_ms=350]
 #
-# Two composer_stable_snapshot reads a short interval apart, compared. A
-# human mid-keystroke changes the composer between them; an idle one does
-# not — the same "read twice, compare" technique send-to-agent.sh already
-# uses to confirm a submit, applied BEFORE injection instead of after it.
+# Two reads of the composer's INPUT ROWS (_composer_input_rows over
+# composer_stable_snapshot) a short interval apart, compared. A human
+# mid-keystroke changes them between reads; an idle composer does not.
 #
 # The gap this closes: send-to-agent.sh's only pre-send check was "is the
 # pane on a permission prompt" — nothing asked whether a human was AT THAT
@@ -364,6 +380,12 @@ composer_stable_snapshot() {
 # injected message would land mixed into each other, corrupting both, with
 # no error from anything — `herdr pane send-text` has no way to know it
 # shares the terminal with a live human.
+#
+# Why input rows only (regression, 2026-09-23): the first version compared the
+# whole 12-line snapshot, so any WORKING omp pane read as "typing" — its output
+# and status border churn between two reads 350ms apart. Every push wake into
+# a busy conductor was refused with exit 6: 20 of 21 in the first 15 minutes
+# after it shipped, including a wake for a prompt only a human could answer.
 #
 #   0 = actively changing right now (probably a human typing)
 #   1 = stable across the interval (looks safe to write into)
@@ -375,7 +397,7 @@ composer_looks_actively_typed() {
   a=$(composer_stable_snapshot "$pane" 12) || return 2
   sleep "$(awk "BEGIN { printf \"%.3f\", $settle_ms / 1000 }")"
   b=$(composer_stable_snapshot "$pane" 12) || return 2
-  [ "$a" = "$b" ] && return 1
+  [ "$(printf '%s\n' "$a" | _composer_input_rows)" = "$(printf '%s\n' "$b" | _composer_input_rows)" ] && return 1
   return 0
 }
 

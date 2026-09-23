@@ -57,7 +57,7 @@ _wake_outcome_for() {                   # <exit-code> -> token
   case "$1" in
     0) printf 'submitted\n' ;;
     4) printf 'unsubmitted\n' ;;
-    5) printf 'refused\n' ;;
+    5|6) printf 'refused\n' ;;
     2) printf 'transport_error\n' ;;
     *) printf 'unknown\n' ;;
   esac
