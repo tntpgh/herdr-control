@@ -208,7 +208,7 @@ subs, covered = live._subscriptions()
 results["degraded_shape"] = (
     [s for s in subs if s["type"] == "pane.agent_status_changed"] == [],
     len(covered) == 0,
-    # the flag the stream loop keys on: no per-pane subs => degraded
+    # degraded mode carries no per-pane subs (the loop itself keys on the counter)
     any(s["type"] == "pane.agent_status_changed" for s in subs) is False,
 )
 
@@ -314,6 +314,52 @@ herdr_live._Wire = real_wire
 st = live.data()["stats"]
 results["busy_stream_resync"] = (live.status("w1:p1"), st["resyncs"] >= 1, st["events"] > 20)
 
+# 17. A FRESH process must reach per-pane status subscriptions. It knows no
+# panes at first, so its first subscribe has no per-pane entry — which the loop
+# used to read as "degraded", after which it never resubscribed: after every
+# hub restart no status event arrived until some pane was created.
+sent = []
+
+
+class RecordingWire:
+    def __init__(self, *a, **k):
+        self.n = 0
+
+    def send(self, obj):
+        sent.append(obj)
+
+    def read(self, timeout):
+        self.n += 1
+        if self.n == 1:
+            return {"id": "herdr-live", "result": {"type": "subscription_started"}}
+        time.sleep(min(timeout, 0.02))
+        return None
+
+    def close(self):
+        pass
+
+
+herdr_live._Wire, herdr_live.request = RecordingWire, lambda *a, **k: two_panes("working")
+live = herdr_live.LiveState(resync_every_s=60)
+box = {}
+t1 = threading.Thread(target=lambda: box.update(first=live._connect_and_stream()), daemon=True)
+t1.start()
+t1.join(1.0)                                            # the bug: this connect streams forever
+first = box.get("first", "never returned: streamed with no per-pane subscriptions")
+if "first" in box:
+    t = threading.Thread(target=live._connect_and_stream, daemon=True)
+    t.start()
+    time.sleep(0.3)
+covered_while_streaming = sorted(getattr(live, "_status_covered", set()))
+live.stop()
+t1.join(2)
+if "first" in box:
+    t.join(2)
+herdr_live._Wire = real_wire
+per_pane = [sorted(s["pane_id"] for s in m["params"]["subscriptions"] if s["type"] == "pane.agent_status_changed")
+            for m in sent]
+results["fresh_process_coverage"] = (first, per_pane, covered_while_streaming)
+
 print(json.dumps(results))
 PY
 ) || { echo "  FAIL python harness did not run: $out"; exit 1; }
@@ -380,6 +426,9 @@ get() { printf '%s' "$out" | jq -c ".$1"; }
 [ "$(get busy_stream_resync)" = '["blocked",true,true]' ] \
   && ok "a busy stream still resyncs, so a quiet blocked pane is corrected" \
   || no "busy stream resync" "$(get busy_stream_resync)"
+[ "$(get fresh_process_coverage)" = '[true,[[],["w1:p1","w1:p2"]],["w1:p1","w1:p2"]]' ] \
+  && ok "a fresh process resubscribes once and covers every pane" \
+  || no "fresh process coverage" "$(get fresh_process_coverage)"
 
 echo
 echo "== edge dispatcher (agent-edge.sh, stubbed) =="

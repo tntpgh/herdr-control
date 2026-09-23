@@ -435,6 +435,10 @@ class LiveState:
                 if old and old != pane.get("pane_id"):
                     self._panes.pop(old, None)
                     self._since.pop(old, None)
+                    self._cwd.pop(old, None)
+                    # This connection's status subscription is for the OLD id;
+                    # the new id is uncovered until the next resubscribe.
+                    self._status_covered.discard(old)
                 edge = self._apply_pane(pane, now)
                 if edge:
                     edges.append(edge)
@@ -575,7 +579,17 @@ class LiveState:
         wire = _Wire(socket_path(), timeout=5.0)
         try:
             subs, covered = self._subscriptions()
-            degraded = any(s["type"] == "pane.agent_status_changed" for s in subs) is False
+            # Degraded means we GAVE UP on per-pane subscriptions after repeated
+            # rejections — read from the counter _subscriptions() itself uses.
+            # It used to be inferred from "the list has no per-pane entry",
+            # which is ALSO true on a fresh process that simply knows no panes
+            # yet: the first connect then called itself degraded, forced
+            # `uncovered` empty, and never resubscribed, so after every hub
+            # restart no status event arrived until some pane was created
+            # (found in review 2026-09-23; it is why the stuck-`working`
+            # divergence came straight back after a restart).
+            with self._lock:
+                degraded = self._subscribe_failures >= STATUS_SUBS_GIVE_UP_AFTER
             wire.send({"id": "herdr-live", "method": "events.subscribe",
                        "params": {"subscriptions": subs}})
             ack = wire.read(timeout=5.0)
@@ -618,15 +632,18 @@ class LiveState:
 
             next_resync = time.monotonic() + self._resync_every_s
             while not self._stop.is_set():
-                # Floored above zero: settimeout(0) is NON-BLOCKING mode, where
-                # recv raises BlockingIOError instead of timing out — that would
-                # surface as "stream lost" and reconnect on every resync.
-                msg = wire.read(timeout=max(0.05, next_resync - time.monotonic()))
+                # Resync BEFORE reading, never between a read and applying it:
+                # a message already off the wire predates the snapshot, and
+                # applied after it would regress the state the snapshot set.
                 if time.monotonic() >= next_resync:
                     with self._lock:
                         self.stats["resyncs"] += 1
                     self._emit(self._apply_snapshot(request("session.snapshot")))
                     next_resync = time.monotonic() + self._resync_every_s
+                # Floored above zero: settimeout(0) is NON-BLOCKING mode, where
+                # recv raises BlockingIOError instead of timing out — that would
+                # surface as "stream lost" and reconnect on every resync.
+                msg = wire.read(timeout=max(0.05, next_resync - time.monotonic()))
                 if msg is None:
                     continue
                 if "result" in msg or "error" in msg:
