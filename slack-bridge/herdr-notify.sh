@@ -308,6 +308,14 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
     ctx=$(prompt_context "$pane")
     if [ -n "$ctx" ]; then
       body="$(_hdr)"$'\n\n```\n'"${ctx}"$'\n```'
+      # No numbered/menu options here, so pid stays empty — no real
+      # fingerprint to dedupe on. Still worth deduping: hash pane+context so
+      # repeated firings for this SAME plain-context prompt collapse to one
+      # post too (PR #131 review, P2: this branch skipped dedupe entirely —
+      # 3 firings, 3 posts). \x1e (record separator) joins pane and context
+      # so a pane id that happens to be a prefix of the context text can
+      # never collide with a different pane+context pairing.
+      ctx_key=$(printf '%s\x1e%s' "$pane" "$ctx" | shasum -a 256 | cut -d' ' -f1)
     else
       nothing_to_show=1
     fi
@@ -331,19 +339,24 @@ if [ "${nothing_to_show:-0}" = 1 ] && [ "${HERDR_SLACK_VERBOSE:-0}" != 1 ]; then
   exit 0
 fi
 
-# ---- dedupe: at most ONE Slack post per prompt_id, ever -------------------
+# ---- dedupe: at most ONE Slack post per (pane, key), within a TTL --------
 # Three hook firings for the same still-unanswered prompt used to post three
-# times — see lib/alert-gate.sh's alert_claim for the measurement and the
-# reasoning. HERDR_SLACK_VERBOSE=1 restores the old always-post behaviour.
-if [ -n "$pid" ] && [ "${HERDR_SLACK_VERBOSE:-0}" != 1 ]; then
+# times — see lib/alert-gate.sh's alert_claim for the measurement, the pane
+# scoping, and the TTL-expiry reasoning (a global permanent ledger silently
+# dropped a second pane's identical prompt, and any re-ask — PR #131 review,
+# P1). dedupe_key falls back to ctx_key when there is no numbered-prompt
+# fingerprint (the plain-context branch above — PR #131 review, P2).
+# HERDR_SLACK_VERBOSE=1 restores the old always-post behaviour.
+dedupe_key="${pid:-${ctx_key:-}}"
+if [ -n "$dedupe_key" ] && [ "${HERDR_SLACK_VERBOSE:-0}" != 1 ]; then
   . "$_lib/alert-gate.sh"
   if [ "$dry" = 1 ]; then
-    if alert_already_posted "$pid"; then
-      echo "dry-run: would SKIP — prompt $pid already alerted (duplicate)"
+    if alert_already_posted "$pane" "$dedupe_key"; then
+      echo "dry-run: would SKIP — already alerted for $pane (duplicate)"
       exit 0
     fi
-  elif ! alert_claim "$pid"; then
-    echo "herdr-notify: prompt $pid already alerted, skipping duplicate" >&2
+  elif ! alert_claim "$pane" "$dedupe_key"; then
+    echo "herdr-notify: already alerted for $pane, skipping duplicate" >&2
     exit 0
   fi
 fi
@@ -368,7 +381,7 @@ if [ "$(printf '%s' "$resp" | jq -r '.ok')" != true ]; then
   # This claim protected a send that did NOT happen — release it so a later
   # retry (grace_realert, the wake-fail backstop, a fresh hook firing) is not
   # permanently told "already posted" for a prompt Slack never actually saw.
-  [ -n "$pid" ] && command -v alert_release >/dev/null 2>&1 && alert_release "$pid"
+  [ -n "$dedupe_key" ] && command -v alert_release >/dev/null 2>&1 && alert_release "$pane" "$dedupe_key"
   exit 1
 fi
 ts=$(printf '%s' "$resp" | jq -r '.ts')

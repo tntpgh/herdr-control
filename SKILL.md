@@ -284,21 +284,31 @@ Slack gets a prompt only when a human genuinely has to act on it, at most
 once per prompt (.handoffs/SPEC.md, 2026-09-24). Concretely:
 
 - **KEPT**: an escalate/reserved/deny-class prompt still unanswered — ONE
-  post per prompt, however many times the hook re-fires for it while it
-  sits there; a conductor wake that failed delivery (refused/unsubmitted)
-  and is still unanswered after `HERDR_WAKE_FAIL_ALERT_S` (default 600s);
-  the herdr control-plane subscription itself going down or coming back
+  post per (pane, prompt) within `HERDR_ALERT_DEDUP_TTL_S` (default 3600s;
+  the SAME pane asking the SAME question again after that window, or after
+  a Deny, alerts again — the claim is not permanent), however many times the
+  hook re-fires while it sits there; a plain-context prompt (no numbered
+  options — a plan approval, a non-numbered confirmation) dedupes the same
+  way, keyed on `sha256(pane + context)` since it has no prompt_id; a
+  conductor wake that failed delivery (refused/unsubmitted) and is still
+  unanswered after `HERDR_WAKE_FAIL_ALERT_S` (default 600s); the herdr
+  control-plane subscription itself going down or coming back
   (`hub-connection-alert.sh`, graced by `HERDR_HUB_ALERT_GRACE_S`, default
   30s, so a reconnect blip never pages); a repo more than 30 minutes behind
   `origin/main` in its deploy (`deploy-drift-alert.sh`, reusing hub.py's
   own `deploy_drift_data()` cache and its dashboard card's `>30min` "hot"
   threshold — one page per drift episode, one recovery line when it clears).
-- **DROPPED**: allow-class prompts (a peer answers them); a duplicate post
-  for a prompt already alerted; a post for a prompt that was already
+- **DROPPED**: allow-class prompts (a peer answers them — this is
+  `lib/alert-gate.sh` `human_must_answer`/`HERDR_ALERT_GRACE_S`, upstream of
+  and UNAFFECTED by everything below); a duplicate post for a (pane, prompt)
+  already claimed within the TTL; a post for a prompt that was already
   answered by the time the send would go out.
-- **`HERDR_SLACK_VERBOSE=1`** restores the pre-filter always-post behaviour
-  on every path above — set it on one shell to debug an alert that looks
-  like it should have fired.
+- **`HERDR_SLACK_VERBOSE=1`** restores the pre-filter always-post behaviour,
+  but ONLY downstream of the allow/held decision — it disables the dedupe,
+  the nothing-to-show drop, and the hub-down grace, never the allow-class
+  hold itself. An alert missing because its command classified as allow
+  needs `classify_command` or a wait for `HERDR_ALERT_GRACE_S`, not this
+  flag (`.omp/rules/troubleshooting.md` has both cases split out).
 
 `verify-slack-symptoms.sh`, `verify-hub-connection-alert.sh`, and
 `verify-deploy-drift-alert.sh` are the acceptance suites for this; run the

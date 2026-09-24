@@ -66,5 +66,43 @@ printf '== a plain synced call with no prior alert is silent ==\n'
 run "$REPO" synced 0 def456 def456
 [ ! -s "$NOTIFIED" ] && ok "ordinary in-sync tick: 0 posts" || bad "paged on a plain in-sync tick: $(cat "$NOTIFIED")"
 
+printf '== Python: _deploy_drift_alert_check dispatch — 29m, 31m, fetch_ok=False, error ==\n'
+# Isolates the DECISION logic (which repos get a spawn, with what status arg)
+# from deploy-drift-alert.sh's own marker/dedup behaviour, already proven
+# above at the shell level. DEPLOY_DRIFT_ALERT is repointed at a plain
+# recording stub, not the real script.
+DISPATCH_LOG="$WORK/dispatch.log"; : > "$DISPATCH_LOG"
+cat > "$WORK/record-stub.sh" <<EOS
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$DISPATCH_LOG"
+EOS
+chmod +x "$WORK/record-stub.sh"
+DISPATCH_LOG="$DISPATCH_LOG" STUB="$WORK/record-stub.sh" python3 - "$here" <<'PY'
+import importlib.util, os, sys, time
+from pathlib import Path
+
+repo_dir = sys.argv[1]
+spec = importlib.util.spec_from_file_location("hub_under_test", str(Path(repo_dir) / "hub.py"))
+hub = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hub)
+hub.DEPLOY_DRIFT_ALERT = Path(os.environ["STUB"])
+
+hub._deploy_drift_alert_check({"repos": [
+    {"repo": "repo-29m", "behind_minutes": 29, "fetch_ok": True, "deployed": "a", "main": "b"},
+    {"repo": "repo-31m", "behind_minutes": 31, "fetch_ok": True, "deployed": "a", "main": "b"},
+    {"repo": "repo-nofetch", "behind_minutes": 45, "fetch_ok": False, "deployed": "a", "main": "b"},
+    {"repo": "repo-error", "behind_minutes": 45, "fetch_ok": True, "error": "boom", "deployed": "a", "main": "b"},
+]})
+time.sleep(0.5)   # let the spawned subprocesses finish writing before this process exits
+PY
+grep -qE '^repo-29m synced ' "$DISPATCH_LOG" && ok "29m (under threshold) dispatched as synced" \
+  || bad "29m row wrong or missing: $(cat "$DISPATCH_LOG")"
+grep -qE '^repo-31m drifted ' "$DISPATCH_LOG" && ok "31m (over threshold) dispatched as drifted" \
+  || bad "31m row wrong or missing: $(cat "$DISPATCH_LOG")"
+grep -q 'repo-nofetch' "$DISPATCH_LOG" && bad "fetch_ok=False repo was dispatched anyway" \
+  || ok "fetch_ok=False repo left alone (no false recovery, no false drift)"
+grep -q 'repo-error' "$DISPATCH_LOG" && bad "repo carrying an error was dispatched anyway" \
+  || ok "errored repo left alone"
+
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

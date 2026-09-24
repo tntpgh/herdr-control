@@ -183,5 +183,35 @@ HERDR_BRIDGE_STATE="$WORK/nbf" bash "$here/slack-bridge/herdr-notify.sh" --choic
 [ "$(n_posts)" = 1 ] && ok "the retry after a failed send still lands (claim was released)" \
   || bad "retry was blocked by a claim from a send that never reached Slack: $(n_posts) posts"
 
+printf '== P1: two panes showing the SAME panel text both post (not silently deduped against each other) ==\n'
+OTHER_PANE="w9:p1"
+omp_menu_screen "cat ~/.aws/credentials" > "$WORKER_SCREEN"   # herdr() stub: any pane != CPANE reads WORKER_SCREEN; unused elsewhere in this file, so no stale claim from an earlier section
+: > "$POSTED"
+HERDR_BRIDGE_STATE="$WORK/p1a" bash "$here/slack-bridge/herdr-notify.sh" --choices --pane "$WPANE" "needs input" >/dev/null 2>&1
+HERDR_BRIDGE_STATE="$WORK/p1a" bash "$here/slack-bridge/herdr-notify.sh" --choices --pane "$OTHER_PANE" "needs input" >/dev/null 2>&1
+[ "$(n_posts)" = 2 ] && ok "two different panes, identical text: both post ($(n_posts))" \
+  || bad "a second pane's identical prompt was silently dropped: $(n_posts) posts"
+
+printf '== P1: a re-ask of the SAME prompt after the dedupe TTL expires posts again ==\n'
+omp_menu_screen "op read op://secrets/x/credential" > "$WORKER_SCREEN"   # unused elsewhere in this file
+: > "$POSTED"
+HERDR_ALERT_DEDUP_TTL_S=1 HERDR_BRIDGE_STATE="$WORK/p1b" bash "$here/slack-bridge/herdr-notify.sh" \
+  --choices --pane "$WPANE" "needs input" >/dev/null 2>&1
+[ "$(n_posts)" = 1 ] || bad "first ask did not post: $(n_posts) posts"
+sleep 2   # outlive the 1s TTL
+HERDR_ALERT_DEDUP_TTL_S=1 HERDR_BRIDGE_STATE="$WORK/p1b" bash "$here/slack-bridge/herdr-notify.sh" \
+  --choices --pane "$WPANE" "needs input" >/dev/null 2>&1
+[ "$(n_posts)" = 2 ] && ok "a re-ask after the TTL expires posts again ($(n_posts))" \
+  || bad "a re-ask was silently dropped forever: $(n_posts) posts"
+
+printf '== P2: a plain-context prompt (no numbered options), 3 firings -> exactly 1 post ==\n'
+printf 'Continue with this plan?\nApprove\nDeny\n\nup/down navigate  enter select  esc cancel\n' > "$WORKER_SCREEN"
+: > "$POSTED"
+HERDR_BRIDGE_STATE="$WORK/p2" bash "$here/slack-bridge/herdr-notify.sh" --choices --pane "$WPANE" "needs input" >/dev/null 2>&1
+HERDR_BRIDGE_STATE="$WORK/p2" bash "$here/slack-bridge/herdr-notify.sh" --choices --pane "$WPANE" "needs input" >/dev/null 2>&1
+HERDR_BRIDGE_STATE="$WORK/p2" bash "$here/slack-bridge/herdr-notify.sh" --choices --pane "$WPANE" "needs input" >/dev/null 2>&1
+[ "$(n_posts)" = 1 ] && ok "plain-context prompt, 3 firings -> exactly 1 post ($(n_posts))" \
+  || bad "plain-context branch is not deduped: $(n_posts) posts"
+
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

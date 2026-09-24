@@ -255,6 +255,31 @@ class LiveState:
             "last_error": None,
         }
 
+    # PR #131 review, P2: extracted so the connection-flip detection is
+    # testable directly, without a real socket — both the successful-connect
+    # path and the stream-lost except handler used to duplicate this exact
+    # "was_connected = ...; set stats; fire only on a genuine flip" logic
+    # inline, which is also how a from-a-real-socket-only test would have
+    # missed a duplicate-fire regression in either copy.
+    def _set_connected(self, connected: bool, err: str | None = None) -> None:
+        """Update stats["connected"] and fire on_connection_change, but ONLY
+        on a genuine flip — never on a same-state resubscribe (the success
+        path can run repeatedly without ever having disconnected) or a
+        redundant re-affirm."""
+        with self._lock:
+            was_connected = self.stats["connected"]
+            self.stats["connected"] = connected
+            if connected:
+                self.stats["connected_since"] = time.time()
+                self.stats["last_error"] = None
+            else:
+                self.stats["last_error"] = err
+        if was_connected != connected and self._on_connection_change:
+            try:
+                self._on_connection_change(connected, None if connected else err)
+            except Exception:
+                pass
+
     # ── public surface ────────────────────────────────────────────────────────
     def start(self) -> None:
         threading.Thread(target=self._stream_forever, name="herdr-live", daemon=True).start()
@@ -620,17 +645,9 @@ class LiveState:
 
             # Bootstrap AFTER the subscription is live (see module docstring).
             self._emit(self._apply_snapshot(request("session.snapshot")))
+            self._set_connected(True)
             with self._lock:
-                was_connected = self.stats["connected"]
-                self.stats["connected"] = True
-                self.stats["connected_since"] = time.time()
-                self.stats["last_error"] = None
                 uncovered = set() if degraded else set(self._panes) - covered
-            if not was_connected and self._on_connection_change:
-                try:
-                    self._on_connection_change(True, None)
-                except Exception:
-                    pass
             if uncovered:
                 # Every pane needs its own `pane.agent_status_changed`
                 # subscription (the schema requires a pane_id), and the first
@@ -704,15 +721,7 @@ class LiveState:
                         last = time.monotonic()
                     self._stop.wait(pause)
             except Exception as exc:
-                with self._lock:
-                    was_connected = self.stats["connected"]
-                    self.stats["connected"] = False
-                    self.stats["last_error"] = f"{type(exc).__name__}: {exc}"
-                if was_connected and self._on_connection_change:
-                    try:
-                        self._on_connection_change(False, f"{type(exc).__name__}: {exc}")
-                    except Exception:
-                        pass
+                self._set_connected(False, f"{type(exc).__name__}: {exc}")
                 self._log(f"herdr stream lost ({exc!r}); retrying in {backoff:.1f}s")
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, self._max_backoff_s)

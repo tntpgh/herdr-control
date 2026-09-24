@@ -360,6 +360,22 @@ per_pane = [sorted(s["pane_id"] for s in m["params"]["subscriptions"] if s["type
             for m in sent]
 results["fresh_process_coverage"] = (first, per_pane, covered_while_streaming)
 
+# PR #131 review, P2: on_connection_change must fire on a genuine flip only —
+# never on a same-state resubscribe (the success path in _connect_and_stream
+# can run repeatedly without ever having disconnected) — and must fire for
+# BOTH halves of a real outage (disconnect, then reconnect), not just one.
+conn_calls = []
+conn_live = herdr_live.LiveState(on_connection_change=lambda c, e: conn_calls.append([c, e]))
+conn_live._set_connected(True)                 # initial connect — not part of either assertion below
+conn_calls.clear()
+conn_live._set_connected(True)                 # same-state resubscribe
+results["conn_resubscribe_fires"] = len(conn_calls)
+conn_calls.clear()
+conn_live._set_connected(False, "socket reset")   # disconnect
+conn_live._set_connected(True)                    # reconnect
+results["conn_flip_sequence_fires"] = len(conn_calls)
+results["conn_flip_sequence_values"] = conn_calls
+
 print(json.dumps(results))
 PY
 ) || { echo "  FAIL python harness did not run: $out"; exit 1; }
@@ -429,6 +445,15 @@ get() { printf '%s' "$out" | jq -c ".$1"; }
 [ "$(get fresh_process_coverage)" = '[true,[[],["w1:p1","w1:p2"]],["w1:p1","w1:p2"]]' ] \
   && ok "a fresh process resubscribes once and covers every pane" \
   || no "fresh process coverage" "$(get fresh_process_coverage)"
+[ "$(get conn_resubscribe_fires)" = '0' ] \
+  && ok "on_connection_change: a same-state resubscribe fires zero times" \
+  || no "conn resubscribe" "$(get conn_resubscribe_fires)"
+[ "$(get conn_flip_sequence_fires)" = '2' ] \
+  && ok "on_connection_change: connected->disconnected->connected fires exactly twice" \
+  || no "conn flip sequence" "$(get conn_flip_sequence_fires) $(get conn_flip_sequence_values)"
+[ "$(get conn_flip_sequence_values)" = '[[false,"socket reset"],[true,null]]' ] \
+  && ok "on_connection_change carries the right (connected, err) pair each time" \
+  || no "conn flip values" "$(get conn_flip_sequence_values)"
 
 echo
 echo "== edge dispatcher (agent-edge.sh, stubbed) =="
