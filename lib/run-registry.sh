@@ -99,7 +99,7 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '3\n'; }
+_registry_schema_version() { printf '4\n'; }
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
@@ -154,6 +154,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   agent_session        TEXT NOT NULL DEFAULT '',
   repo                 TEXT NOT NULL DEFAULT '',
   worktree             TEXT NOT NULL DEFAULT '',
+  -- thurber-os docs/project-contract-plan.md #3b: the worker's own branch and
+  -- the repo's trunk it may open a PR against. Set only by spawn-task.sh for
+  -- a MANAGED launch; empty means no grant, and every grant-tokenizer check
+  -- (lib/command-policy.sh's _cp_grant_action) fails closed on an empty
+  -- branch, falling through to the unchanged text rules — never a new store,
+  -- reusing the row spawn-task.sh already writes.
+  branch               TEXT NOT NULL DEFAULT '',
+  trunk                TEXT NOT NULL DEFAULT '',
   label                TEXT NOT NULL DEFAULT '',
   state                TEXT NOT NULL,
   created_at           TEXT NOT NULL,
@@ -223,6 +231,7 @@ INSERT OR IGNORE INTO schema_meta(key, value)
 
   _HERDR_REGISTRY_READY=1
   _migrate_schema_v3
+  _migrate_schema_v4
   _migrate_legacy_files
   return 0
 }
@@ -242,6 +251,23 @@ _migrate_schema_v3() {
     _sql "ALTER TABLE tasks ADD COLUMN agent_session TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
   fi
   _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3');" >/dev/null 2>&1
+}
+
+# ---- schema v3 -> v4: add tasks.branch / tasks.trunk (project-contract-plan
+# #3b's ownership grant) -------------------------------------------------
+# Same shape as v3 above: CREATE TABLE IF NOT EXISTS only shapes a brand new
+# database, so an existing v3 db needs both columns ALTERed in. spawn-task.sh
+# is the only writer that ever populates them (a managed launch's own branch
+# and the repo's trunk); every other reader treats an empty branch as "no
+# grant recorded" and falls through to the unchanged text rules.
+_migrate_schema_v4() {
+  local has_col
+  has_col=$(_sql "SELECT 1 FROM pragma_table_info('tasks') WHERE name='branch';" 2>/dev/null)
+  if [ -z "$has_col" ]; then
+    _sql "ALTER TABLE tasks ADD COLUMN branch TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
+    _sql "ALTER TABLE tasks ADD COLUMN trunk  TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
+  fi
+  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4');" >/dev/null 2>&1
 }
 
 # ---- one-time import of the pre-SQLite file layout --------------------------
@@ -334,11 +360,11 @@ gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand
 # names whether it asked for one task or all of them.
 _task_json_select() {
   printf "%s" "SELECT json_object(
-    'schema', 3, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
+    'schema', 4, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
     'conductor_id', conductor_id, 'conductor_pane_id', conductor_pane_id,
     'conductor_pane_birth', conductor_pane_birth, 'pane_id', pane_id,
     'pane_birth', pane_birth, 'agent_session', agent_session, 'repo', repo,
-    'worktree', worktree, 'label', label,
+    'worktree', worktree, 'branch', branch, 'trunk', trunk, 'label', label,
     'state', state, 'created_at', created_at, 'updated_at', updated_at) FROM tasks"
 }
 
@@ -347,10 +373,14 @@ _task_json_select() {
 # INTO conductor_pane_id, and that pane id is exactly as recyclable as the
 # worker's — a fingerprint recorded only for the worker side would leave the
 # conductor-delivery direction with nothing to revalidate against.
+# branch/trunk (12th/13th, both OPTIONAL) are the ownership grant (#3b): the
+# worker's own branch and the repo's trunk it may open a PR against. Empty
+# by default — only a MANAGED spawn-task.sh launch populates them; every
+# existing caller that passes 11 args keeps registering exactly as before.
 register_task() {
   local run_id="$1" task_id="$2" worker_id="$3" conductor_id="$4" \
         conductor_pane_id="$5" conductor_pane_birth="$6" pane_id="$7" pane_birth="$8" \
-        repo="$9" worktree="${10}" label="${11}"
+        repo="$9" worktree="${10}" label="${11}" branch="${12:-}" trunk="${13:-}"
   registry_init || return 1
   local at; at="$(_now_iso)"
 
@@ -359,11 +389,11 @@ register_task() {
   # tasks table comment in registry_init.
   if _sql "INSERT INTO tasks
       (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth,
-       pane_id, pane_birth, repo, worktree, label, state, created_at, updated_at)
+       pane_id, pane_birth, repo, worktree, branch, trunk, label, state, created_at, updated_at)
       VALUES ($(_sq "$task_id"), $(_sq "$run_id"), $(_sq "$worker_id"), $(_sq "$conductor_id"),
         $(_sq "$conductor_pane_id"), $(_sq "$conductor_pane_birth"), $(_sq "$pane_id"),
-        $(_sq "$pane_birth"), $(_sq "$repo"), $(_sq "$worktree"), $(_sq "$label"),
-        'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
+        $(_sq "$pane_birth"), $(_sq "$repo"), $(_sq "$worktree"), $(_sq "$branch"), $(_sq "$trunk"),
+        $(_sq "$label"), 'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
     append_event "$run_id" "$task_id" "registered" \
       "$(jq -nc --arg p "$pane_id" --arg l "$label" '{pane_id:$p, label:$l}')" >/dev/null 2>&1
     return 0
@@ -614,6 +644,31 @@ append_event() {
   return 1
 }
 
+# task_input_required_command <run_id> <task_id> <prompt_id> -> the
+# untruncated command recorded on the input_required event for THIS exact
+# prompt, or empty.
+#
+# thurber-os docs/project-contract-plan.md #3b, item 2: agent-hooks/
+# omp-herdr-control.ts now writes the untruncated tool_approval_requested
+# command into this event's payload (lib/push-wake.sh's `command` field)
+# alongside the display-truncated message it always carried. herdr-select.sh
+# reads it back here, keyed to the SAME prompt_id it already fingerprints
+# the on-screen panel with, so a stale or unrelated prompt's recorded
+# command can never be substituted for the one actually being answered.
+# Empty when no such event exists (a hand-started session, an older omp
+# build, or a non-bash prompt) — callers fall back to the scraped panel
+# text unchanged.
+task_input_required_command() {
+  local run_id="$1" task_id="$2" prompt_id="$3"
+  [ -n "$prompt_id" ] || return 0
+  registry_init || return 1
+  _sql "SELECT json_extract(payload,'\$.command') FROM events
+        WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id")
+          AND type='input_required'
+          AND json_extract(payload,'\$.prompt_id')=$(_sq "$prompt_id")
+        ORDER BY sequence DESC LIMIT 1;" 2>/dev/null
+}
+
 read_task() {                           # run_id task_id -> json (empty if absent)
   registry_init || return 1
   _sql "$(_task_json_select) WHERE run_id=$(_sq "$1") AND task_id=$(_sq "$2");" 2>/dev/null
@@ -628,7 +683,15 @@ read_task() {                           # run_id task_id -> json (empty if absen
 # its prior behavior, not invent a refusal.
 task_for_pane() {                       # pane_id -> task json or empty
   registry_init || return 1
-  _sql "$(_task_json_select) WHERE pane_id=$(_sq "$1") ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null
+  # updated_at is second-granularity (_now_iso); two tasks on the SAME pane
+  # touched inside one wall-clock second (a re-spawn into a just-completed
+  # pane, or — as this exposed — a fast test suite) tie on it, and a plain
+  # ORDER BY has no defined winner among ties. rowid is SQLite's own hidden
+  # monotonic insertion counter (task_id is TEXT PRIMARY KEY, not an alias
+  # for it, so it stays available) and never regresses across an UPDATE, so
+  # breaking ties on it deterministically favors the task registered LATER
+  # — the one a fresh grant/consistency lookup actually means.
+  _sql "$(_task_json_select) WHERE pane_id=$(_sq "$1") ORDER BY updated_at DESC, rowid DESC LIMIT 1;" 2>/dev/null
 }
 
 # Find the most-recently-updated registered task working in this worktree —
@@ -638,7 +701,7 @@ task_for_pane() {                       # pane_id -> task json or empty
 # can still be matched back to the registration it belongs to.
 task_for_worktree() {                   # worktree_path -> task json or empty
   registry_init || return 1
-  _sql "$(_task_json_select) WHERE worktree=$(_sq "$1") ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null
+  _sql "$(_task_json_select) WHERE worktree=$(_sq "$1") ORDER BY updated_at DESC, rowid DESC LIMIT 1;" 2>/dev/null
 }
 
 # Every registered task as one compact JSON object per line.

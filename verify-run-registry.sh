@@ -195,11 +195,15 @@ else
   ok "rebaseline_pane_birth refuses a nonexistent task"
 fi
 
-printf '== schema v3: agent_session column present after migration ==\n'
+printf '== schema v3/v4: agent_session and branch/trunk columns present after migration ==\n'
 check "agent_session column exists" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='agent_session';")" "1"
-check "schema_version is 3" \
-  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "3"
+check "branch column exists (#3b ownership grant)" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='branch';")" "1"
+check "trunk column exists (#3b ownership grant)" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='trunk';")" "1"
+check "schema_version is 4" \
+  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "4"
 
 printf '== event dedup on an explicit event_id (at-least-once retry safety) ==\n'
 before=$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")
@@ -311,6 +315,24 @@ check "old terminal task pruned"      "$(read_task run2 taskOld)" ""
 check "recent completed task KEPT"    "$(read_task run1 task1 | jq -r .task_id)" "task1"
 check "non-terminal task KEPT"        "$(read_task run1 taskEvil | jq -r .state)" "starting"
 if prune_completed_tasks abc 2>/dev/null; then bad "prune accepted a non-integer"; else ok "prune rejects a non-integer day count"; fi
+
+printf '== #3b ownership grant: branch/trunk stored and read back; empty by default ==\n'
+check "task1 has no grant (11-arg caller)" "$(read_task run1 task1 | jq -r '.branch + "|" + .trunk')" "|"
+register_task runGrant taskGrant w c cp cb paneGrant birthGrant /repo/g /wt/g "impl:grant" "feat/x" "main" \
+  || bad "register_task with branch/trunk failed"
+check "branch recorded" "$(read_task runGrant taskGrant | jq -r .branch)" "feat/x"
+check "trunk recorded"  "$(read_task runGrant taskGrant | jq -r .trunk)" "main"
+
+printf '== task_for_pane breaks an updated_at TIE deterministically (rowid, not scan order) ==\n'
+register_task runTie1 taskTie1 w c cp cb paneTie birthTie1 /repo/t /wt/t1 "first" || bad "register taskTie1 failed"
+register_task runTie2 taskTie2 w c cp cb paneTie birthTie2 /repo/t /wt/t2 "second" || bad "register taskTie2 failed"
+# Force an identical updated_at — the real failure mode this fixes: two
+# registrations on the same pane inside one wall-clock second, which
+# _now_iso's second granularity cannot tell apart on its own.
+same_ts=$(sqlite3 "$(registry_db)" "SELECT updated_at FROM tasks WHERE task_id='taskTie1';")
+sqlite3 "$(registry_db)" "UPDATE tasks SET updated_at='$same_ts' WHERE task_id IN ('taskTie1','taskTie2');"
+check "the LATER-registered task wins a tie, not scan order" \
+  "$(task_for_pane paneTie | jq -r .task_id)" "taskTie2"
 
 printf '== legacy file import ==\n'
 legacy_root="$(mktemp -d)/runs"
