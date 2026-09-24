@@ -38,6 +38,8 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib/run-registry.sh
 source "$HERE/lib/run-registry.sh"
+# shellcheck source=lib/pane-guard.sh
+source "$HERE/lib/pane-guard.sh"
 
 apply=0; include_lost=0; closure_reason=""; closure_proof=""; pane_filter=""; task_filter=""
 for a in "$@"; do
@@ -61,32 +63,44 @@ if [ "$apply" = 1 ]; then
     printf 'close-done-workers: --apply requires --reason=<shipped|handed_off_to:<x>|blocked_on:<x>|canceled|no-follow-on>\n' >&2
     exit 1
   }
-  if [ "$closure_reason" = shipped ]; then
-    # One proof cannot honestly stand for every closable task in a batch —
-    # scope it to exactly the task it is evidence for. `--task=` is the
-    # precise identifier; `--pane=` is the convenience form (the newest task
-    # on that pane, same lookup close-done-workers already does per-row).
-    { [ -n "$pane_filter" ] || [ -n "$task_filter" ]; } || {
-      printf 'close-done-workers: --reason=shipped requires --pane=<id> or --task=<id> to scope the proof to one task\n' >&2
-      exit 1
-    }
-    proof_wt=""
-    if [ -n "$task_filter" ]; then
-      proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_filter");" 2>/dev/null)
-    else
-      proof_wt=$(_sql "SELECT worktree FROM tasks WHERE pane_id=$(_sq "$pane_filter") ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)
-    fi
-    _valid_proof_ref "$closure_proof" "$proof_wt" || {
-      printf 'close-done-workers: --reason=shipped requires --proof="<PR URL> <merge sha>" or a non-empty PROOF.md section in the selected task'"'"'s worktree\n' >&2
-      exit 1
-    }
-  fi
+fi
+
+# `--pane=<id>` is herdr's own pane numbering, and herdr reuses a pane_id
+# once a pane closes — a stale registry row left behind by a PREVIOUS
+# occupant of that id still matches `pane_id=<id>` alone. pane_birth (the
+# fingerprint lib/pane-guard.sh's require_pane_birth_match validates
+# against, herdr's own terminal_id) disambiguates: only the row whose
+# registered pane_birth equals the CURRENTLY LIVE occupant's terminal_id is
+# what --pane=<id> actually means right now. A pane reporting no live
+# occupant at all (fully closed, never recycled) has nothing else it could
+# be confused with, so pane_id alone stays sufficient there.
+pane_birth_filter=""
+if [ -n "$pane_filter" ]; then
+  live_birth="$(pane_birth_now "$pane_filter")"
+  [ -n "$live_birth" ] && pane_birth_filter=" AND pane_birth=$(_sq "$live_birth")"
 fi
 
 states="'running','blocked','starting'"
 [ "$include_lost" = 1 ] && states="$states,'lost'"
-[ -n "$pane_filter" ] && states_filter=" AND pane_id=$(_sq "$pane_filter")" || states_filter=""
+[ -n "$pane_filter" ] && states_filter=" AND pane_id=$(_sq "$pane_filter")$pane_birth_filter" || states_filter=""
 [ -n "$task_filter" ] && states_filter="$states_filter AND task_id=$(_sq "$task_filter")"
+
+if [ "$apply" = 1 ] && [ "$closure_reason" = shipped ]; then
+  # One proof cannot honestly stand for every closable task in a batch —
+  # scope it to exactly the task it is evidence for. `--task=` is the
+  # precise identifier; `--pane=` is the convenience form, resolved above
+  # to the exact same row the main scan below will act on: state, pane_id,
+  # and — when the pane is live — pane_birth all agree.
+  { [ -n "$pane_filter" ] || [ -n "$task_filter" ]; } || {
+    printf 'close-done-workers: --reason=shipped requires --pane=<id> or --task=<id> to scope the proof to one task\n' >&2
+    exit 1
+  }
+  proof_wt=$(_sql "SELECT worktree FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)
+  _valid_proof_ref "$closure_proof" "$proof_wt" || {
+    printf 'close-done-workers: --reason=shipped requires --proof="<PR URL> <merge sha>" or a non-empty PROOF.md section in the selected task'"'"'s worktree\n' >&2
+    exit 1
+  }
+fi
 
 panes_json=$(herdr pane list 2>/dev/null)
 pane_status() { printf '%s' "$panes_json" | jq -r --arg p "$1" '((.result.panes // .panes)[]|select(.pane_id==$p)|.agent_status) // "absent"'; }

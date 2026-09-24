@@ -383,6 +383,8 @@ run_reconciliation() {
     esac
     ev_owner=$(printf '%s' "$ev_json" | jq -r '.task_conductor_id // empty')
     case "$ev_owner" in ''|conductor_unknown|"$conductor_id") ;; *) continue ;; esac
+    # Bounded: a conductor whose cursor has never advanced (first pass after
+    # this feature, or a long-dead checkpoint) may face a deep backlog; a
     # session-start injection must not be 500 lines of history. Everything
     # scanned is still acknowledged via max_seq — elided lines are counted,
     # not lost silently.

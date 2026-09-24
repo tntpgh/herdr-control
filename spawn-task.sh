@@ -385,7 +385,14 @@ spec_path="$(handoff_spec "$wt")"
 proof_path="$(handoff_proof "$wt")"
 if [ -n "$brief_file" ]; then
   tmp_spec=$(mktemp "$(dirname "$spec_path")/.SPEC.XXXXXX") || { echo "spawn-task: failed to write $spec_path" >&2; exit 1; }
-  { cat "$brief_file"; printf '\n'; _spec_proof_contract; } > "$tmp_spec" && mv -f "$tmp_spec" "$spec_path"
+  if grep -qF '## Proof contract' "$brief_file" 2>/dev/null; then
+    # The brief already carries the proof contract — e.g. a worker re-spawned
+    # with --brief pointing at its own SPEC.md, which spawn-task.sh appended
+    # it to on a prior run. Appending again would duplicate the section.
+    cat "$brief_file" > "$tmp_spec" && mv -f "$tmp_spec" "$spec_path"
+  else
+    { cat "$brief_file"; printf '\n'; _spec_proof_contract; } > "$tmp_spec" && mv -f "$tmp_spec" "$spec_path"
+  fi
 elif [ ! -s "$spec_path" ]; then
   _spec_template > "$spec_path" 2>/dev/null
 fi
