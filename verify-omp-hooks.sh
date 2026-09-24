@@ -555,6 +555,13 @@ CBIRTH="cterm-1"
 printf '== conductorless worker still persists its verified input request ==\n'
 set_task_state run1 task1 running >/dev/null 2>&1
 CPANE=""
+# A FRESH command, not "ls" reused from the recycled-conductor test above:
+# PR #132 review item 6 claims attn_track_<key> before push_wake, keyed on
+# pane+registered-birth+command — the identical prompt text would collide
+# with that test's already-consumed claim and this one would never even
+# reach push_wake, which is a fixture bug, not something the claim is wrong
+# to catch (the same key genuinely is the same logical event).
+omp_menu_screen "pwd" > "$WORKER_SCREEN"
 : > "$SENT"
 run_notify bash
 [ "$(q_state)" = blocked ] && [ ! -s "$SENT" ] \
@@ -624,11 +631,14 @@ printf '%s' "$(q_payload stale_worker_hook_refused)" | grep -q '"reason":"task_t
   && ok "refusal names the reason" || bad "refusal payload: $(q_payload stale_worker_hook_refused)"
 [ ! -s "$SENT" ] && ok "no wake typed for a terminal task" || bad "woke the conductor about a dead task: $(cat "$SENT")"
 
-printf '== repeated wake attempts: every outcome recorded, first result not frozen ==\n'
-# The old constant event ids ("<base>_result") + INSERT OR IGNORE preserved
-# the FIRST transport outcome forever: a wake that succeeded then failed on
-# re-prompt (or vice versa) was unrecordable. Two attempts at the SAME
-# logical prompt must yield two correlated, individually identifiable rows.
+printf '== repeated hook firings on ONE still-open prompt: claimed once, not re-attempted ==\n'
+# PR #132 review, item 6: a hook now claims attn_track_<key>
+# (lib/attention-key.sh) before calling push_wake at all — the SAME claim
+# the attention controller uses — so N independent firings for a prompt
+# nobody has answered yet cost exactly one delivery attempt, never one per
+# firing (the root cause, from the hook side, of item 1's double-wake: a
+# firing that finds the key already claimed must not spawn its own
+# grace_realert timer either).
 register_task run3 task3 w3 cond3 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt3 "impl:attempts" >/dev/null 2>&1
 run_notify_for() {                      # <run> <task> <tool>
   printf '{"tool":"%s","message":"omp needs permission","cwd":"/tmp/repo"}' "$3" \
@@ -638,21 +648,48 @@ run_notify_for() {                      # <run> <task> <tool>
 }
 omp_menu_screen "wrangler deploy attempt-A" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
-run_notify_for run3 task3 bash          # conductor clean -> submitted
-omp_menu_screen "wrangler deploy attempt-A" > "$WORKER_SCREEN"   # SAME logical prompt again
-omp_menu_screen "busy" > "$COND_SCREEN"              # conductor mid-prompt -> refused
+run_notify_for run3 task3 bash          # first firing: claims + delivers, submitted
+run_notify_for run3 task3 bash          # SAME logical prompt, fired again: already claimed
 run_notify_for run3 task3 bash
 n_res=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   "SELECT count(*) FROM events WHERE type='wake_result' AND task_id='task3';")
-[ "$n_res" = "2" ] && ok "both attempts recorded ($n_res rows)" || bad "wake_result rows for task3: $n_res"
+[ "$n_res" = "1" ] && ok "3 firings on one still-open prompt cost exactly 1 delivery attempt" \
+  || bad "wake_result rows for task3: $n_res"
+n_track=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE type='attention_tracking' AND task_id='task3';")
+[ "$n_track" = "1" ] && ok "the claim itself was made exactly once too" || bad "attention_tracking rows for task3: $n_track"
+
+printf '== HERDR_WAKE_LEGACY=1: every outcome recorded, first result not frozen ==\n'
+# The pre-controller guarantee this suite used to pin unconditionally: the
+# old constant event ids ("<base>_result") + INSERT OR IGNORE preserved the
+# FIRST transport outcome forever, so a wake that succeeded then failed on
+# re-prompt (or vice versa) was unrecordable. That guarantee still holds —
+# now opt-in, since the claim above is the hook's default.
+register_task run3b task3b w3b cond3b "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt3b "impl:legacy-attempts" >/dev/null 2>&1
+run_notify_legacy() {                   # <run> <task> <tool>
+  printf '{"tool":"%s","message":"omp needs permission","cwd":"/tmp/repo"}' "$3" \
+    | ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" \
+               HERDR_RUN_ID="$1" HERDR_TASK_ID="$2" HERDR_TASK_LABEL="impl:legacy-attempts" \
+               HERDR_WAKE_LEGACY=1
+        bash "$here/agent-hooks/omp-notify.sh" >/dev/null 2>&1 )
+}
+omp_menu_screen "wrangler deploy attempt-B" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+run_notify_legacy run3b task3b bash          # conductor clean -> submitted
+omp_menu_screen "wrangler deploy attempt-B" > "$WORKER_SCREEN"   # SAME logical prompt again
+omp_menu_screen "busy" > "$COND_SCREEN"                          # conductor mid-prompt -> refused
+run_notify_legacy run3b task3b bash
+n_res=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE type='wake_result' AND task_id='task3b';")
+[ "$n_res" = "2" ] && ok "both attempts recorded under the escape hatch ($n_res rows)" || bad "wake_result rows for task3b: $n_res"
 outcomes=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
-  "SELECT json_extract(payload,'\$.outcome') FROM events WHERE type='wake_result' AND task_id='task3' ORDER BY sequence;")
+  "SELECT json_extract(payload,'\$.outcome') FROM events WHERE type='wake_result' AND task_id='task3b' ORDER BY sequence;")
 printf '%s' "$outcomes" | head -1 | grep -q 'submitted' \
   && ok "first attempt's outcome preserved (submitted)" || bad "outcomes: $outcomes"
 printf '%s' "$outcomes" | tail -1 | grep -qE 'refused|unsubmitted' \
   && ok "second attempt's DIFFERENT outcome recorded, not swallowed by dedup" || bad "outcomes: $outcomes"
 n_keys=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
-  "SELECT count(DISTINCT json_extract(payload,'\$.wake_key')) FROM events WHERE type='wake_result' AND task_id='task3';")
+  "SELECT count(DISTINCT json_extract(payload,'\$.wake_key')) FROM events WHERE type='wake_result' AND task_id='task3b';")
 [ "$n_keys" = "1" ] && ok "both rows correlate to the same logical prompt (wake_key)" || bad "wake_key count: $n_keys"
 
 printf '== the TS extension shim actually drives these scripts (needs bun) ==\n'

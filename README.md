@@ -262,6 +262,47 @@ performance change must never be the reason a worker's prompt goes unnoticed.
 ./restart.sh --verify         # includes "hub herdr subscription UP (N panes, …)"
 ```
 
+### One level-triggered attention controller, not more hooks (`attention-tick.sh`)
+
+thurber-os `docs/project-contract-plan.md` §3a. Edge-triggered wakes
+(`agent-hooks/*.sh` → `push_wake`) are still the fast path — an omp
+`Notification` reaches the conductor in under a second — but a missed or
+repeated edge used to mean a stranded prompt or a spammed one: 62 prompts
+woken more than once in one measured session, one 14×. A hub thread
+(`_attention_loop`, same shape as `_mirror_loop`) re-derives the truth from
+CURRENT state every `HERDR_ATTENTION_INTERVAL_S` (default 15s) instead:
+
+1. Feeds `attention-tick.sh` the pane ids `live_attention()` currently
+   reports blocked (herdr_live.py's LiveState, not a re-scrape).
+2. Per pane, one fresh screen read decides prompt identity and command
+   classification. Dedupe key = pane id + its LIVE birth + the prompt's
+   fingerprint (prompt_id alone collides across panes — two panes showing the
+   identical command hash the same and must not share a clock).
+3. First sighting of a key claims it (`claim_once`, `lib/run-registry.sh`) —
+   the claim's own timestamp is "since", and the one chance this controller
+   gets to call `push_wake` for it. Every later pass just re-reads that
+   timestamp, which is what makes `HERDR_WAKE_RESPONSE_S` (default 600s)
+   measure from a fixed point instead of resetting on every pass.
+4. Unanswered past that window: one escalation to `HERDR_MAIN_PANE_ID`.
+   Unanswered past twice that: one local hub form (`formserve.py`,
+   `--timeout 86400`). A deny-verdict or conductor-reserved prompt
+   (`lib/command-policy.sh`) skips the ladder and gets the form immediately.
+   Every decision is a registry event (`attention_tracking`,
+   `attention_escalated`, `attention_form_served`), each claimed once per key.
+
+`push_wake` itself is untouched — `verify-omp-hooks.sh` pins "repeated wake
+attempts: every outcome recorded, first result not frozen" (a wake that lands
+then a retry that finds the conductor busy must both be visible), which is a
+hook's own retry, independent of this controller. `HERDR_WAKE_LEGACY=1` is
+the rollback: the controller calls `push_wake` on every pass again, exactly
+the pre-controller shape.
+
+```bash
+./verify-attention-tick.sh    # 20 checks: dedupe, the wake/escalate/form
+                               # ladder against an injected clock, deny/
+                               # reserved bypass, cross-pane independence
+```
+
 ### Multi-pane layouts, case by case (`spread-tab.sh`)
 
 `spawn-agent.sh`/`spawn-task.sh` only ever build ONE pane per tab — enough for
