@@ -939,6 +939,12 @@ def herdr_data(event_limit: int = 100) -> dict:
 # Where they disagree, the page SAYS SO rather than picking silently.
 LIVE: herdr_live.LiveState | None = None
 AGENT_EDGE = Path(__file__).resolve().parent / "agent-edge.sh"
+# thurber-os docs/project-contract-plan.md §3a — the level-triggered
+# attention controller. See attention-tick.sh's own header for the design;
+# this hub thread only feeds it the CURRENTLY blocked pane ids and reuses
+# live_attention() (already joins herdr_live.py's LiveState to the registry)
+# instead of re-deriving "who's blocked" a second way.
+ATTENTION_SCRIPT = Path(__file__).resolve().parent / "attention-tick.sh"
 
 
 def _live_log(msg: str) -> None:
@@ -1466,6 +1472,40 @@ def _mirror_loop() -> None:
         except Exception as e:  # noqa: BLE001 — belt and braces: the loop must not die
             MIRROR_STATE["last_error"] = f"{type(e).__name__}: {e}"
         time.sleep(MIRROR_EVERY_S)
+
+
+# ── attention controller: thurber-os docs/project-contract-plan.md §3a ────────
+ATTENTION_INTERVAL_S = float(os.environ.get("HERDR_ATTENTION_INTERVAL_S", "15") or 15)
+
+
+def _attention_tick() -> None:
+    """One pass: hand the controller the CURRENTLY blocked pane ids from
+    LiveState (via live_attention(), the same join /api/blocked already
+    uses) and let attention-tick.sh do everything else — it is the one place
+    that reasons about a specific prompt, so hub.py never re-derives that.
+
+    Never raises: a bad pass here must not take down the thread any more than
+    a bad mirror_sync() call may (see _mirror_loop below).
+    """
+    if LIVE is None or not ATTENTION_SCRIPT.exists():
+        return
+    panes = [p.get("pane_id") for p in live_attention() if p.get("pane_id")]
+    if not panes:
+        return
+    try:
+        subprocess.run(["bash", str(ATTENTION_SCRIPT), "tick"],
+                       input="\n".join(panes) + "\n", capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _live_log(f"attention tick failed: {exc}")
+
+
+def _attention_loop() -> None:
+    while True:
+        try:
+            _attention_tick()
+        except Exception as e:  # noqa: BLE001 — belt and braces: the loop must not die
+            _live_log(f"attention loop error: {type(e).__name__}: {e}")
+        time.sleep(ATTENTION_INTERVAL_S)
 
 
 # ── secrets: pre-resolved, never `op` from a background process ───────────────
@@ -3041,6 +3081,8 @@ def main() -> int:
                     help="do not subscribe to herdr (pages fall back to the registry only)")
     ap.add_argument("--no-mirror", action="store_true",
                     help="do not sync forms to dashboard.teamthurber.com/decisions (smoke runs)")
+    ap.add_argument("--no-attention", action="store_true",
+                    help="do not run the attention controller sweep (smoke runs)")
     args = ap.parse_args()
     if port_open(args.port):
         print(f"hub: already serving on http://127.0.0.1:{args.port}/", file=sys.stderr)
@@ -3055,6 +3097,8 @@ def main() -> int:
         LIVE.start()
     if not args.no_mirror:
         threading.Thread(target=_mirror_loop, name="dashboard-mirror", daemon=True).start()
+    if not args.no_attention:
+        threading.Thread(target=_attention_loop, name="attention-controller", daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"hub: http://127.0.0.1:{args.port}/", file=sys.stderr)
     try:

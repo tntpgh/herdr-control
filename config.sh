@@ -119,6 +119,28 @@
 # fire (the first records a baseline).
 : "${HERDR_STALL_SECS:=90}"
 
+# ---- attention controller (thurber-os docs/project-contract-plan.md §3a) ---
+# Level-triggered sweep, run as a thread inside hub.py (attention-tick.sh),
+# not a new daemon: every interval it re-derives "which blocked prompts has
+# nobody acted on" from CURRENT state instead of trusting an edge it may have
+# missed or repeated.
+#
+# Seconds between passes.
+: "${HERDR_ATTENTION_INTERVAL_S:=15}"
+# How long a tracked prompt may sit unanswered before the controller
+# escalates to HERDR_MAIN_PANE_ID, and again (same window, from the same
+# start) before it serves a local hub form. A wake counts as answered when
+# the prompt changes/resolves — this file's own value never resets the clock.
+: "${HERDR_WAKE_RESPONSE_S:=600}"
+# Pane id of the top-level operator session ("Main") that receives an
+# escalation when a task's own conductor does not act in time. Empty = no
+# Main to escalate to; the controller still serves the form on schedule.
+: "${HERDR_MAIN_PANE_ID:=}"
+# Rollback switch only: 1 makes the controller call push_wake on every pass
+# for a still-blocked prompt instead of at most once. push_wake's own
+# per-hook-firing behavior (agent-hooks/*.sh) is unaffected either way.
+: "${HERDR_WAKE_LEGACY:=0}"
+
 # ============================================================================
 #  End of your config — generic below.
 # ============================================================================
@@ -128,4 +150,5 @@ export HERDR_RECONCILE_INTERVAL_S HERDR_TASK_RETENTION_DAYS
 export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES HERDR_CANONICAL_RULES
 export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_BACKEND SMART_NAME_MODEL SMART_NAME_TIMEOUT
 export SMART_NAME_COOLDOWN SMART_NAME_EVIDENCE_CHARS HERDR_STALL_SECS
+export HERDR_ATTENTION_INTERVAL_S HERDR_WAKE_RESPONSE_S HERDR_MAIN_PANE_ID HERDR_WAKE_LEGACY
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"
