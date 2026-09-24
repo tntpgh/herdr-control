@@ -143,7 +143,16 @@ done
 last_verdict=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT json_extract(payload,'$.verdict') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")
 [ "$last_verdict" = "reserved" ] && ok "escalation event carries verdict=reserved (F1)" || bad "escalation verdict=$last_verdict (expected reserved)"
 printf '== positive controls: the worker flow the lab depends on is STILL allowed ==\n'
-for allowed in "git push -u origin HEAD" "gh pr create --base main --fill" "gh issue edit 5 --add-label ready-for-review" "set -euo pipefail" "export UV_CACHE_DIR=/tmp/uv" "bash scripts/ci.sh"; do
+# `git push -u origin HEAD` used to be in this list. #135 (2026-09-24,
+# independent security review, HIGH) closed exactly that gap on purpose —
+# `git push origin HEAD` resolves to whatever branch $PWD happens to be on,
+# which can be the default branch, and the old text rules never reserved it.
+# `_cp_push_is_safe` is now deny-by-default: safe only when the target
+# literally matches the fleet's own `type/slug` branch convention. Full
+# coverage (`check_reserved "-u origin HEAD"` and 20+ related DWIM/refspec
+# cases) lives in `verify-command-policy.sh`; asserting it here too would
+# duplicate that suite, not add coverage.
+for allowed in "gh pr create --base main --fill" "gh issue edit 5 --add-label ready-for-review" "set -euo pipefail" "export UV_CACHE_DIR=/tmp/uv" "bash scripts/ci.sh"; do
   set_screen "$allowed"; reset_keys
   sel 1 --authority peer; rc=$?
   [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "'$allowed' still allowed for peer" || bad "'$allowed' now refused: rc=$rc; $(grep -m1 REFUSED "$WORK/err.txt")"
