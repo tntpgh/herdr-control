@@ -49,8 +49,10 @@
 #      running or a delivery in flight; a second push_wake call here would
 #      spawn a SECOND timer that force-delivers a second wake when it expires
 #      (PR #132 review, P1 — the double-wake this exists to prevent).
-#   2. A deny-verdict or conductor-reserved prompt never enters that ladder at
-#      all: straight to the form, same tick it is first seen.
+#   2. A deny-verdict or conductor-reserved prompt skips the escalation rung
+#      (only a human can approve it) but still gets the owner's window: its
+#      conductor may deny/redirect, and usually does in seconds. Form only if
+#      it is still blocked at HERDR_WAKE_RESPONSE_S.
 #   3. elapsed >= HERDR_WAKE_RESPONSE_S (default 600s, "the owner's window"):
 #      one escalation to HERDR_MAIN_PANE_ID (birth-guarded the same way a
 #      worker pane is), claimed so it fires once — with exactly one retry if
@@ -240,32 +242,59 @@ _attn_maybe_escalate() {                # run_id task_id pane conductor_pane_id 
        '{key:$k, outcome:$o, exit_code:$c, attempt:$a}')" "${eid}_result" >/dev/null 2>&1 || true
 }
 
-_attn_serve_form() {                    # pane task_id reason
-  local pane="$1" task_id="$2" reason="$3"
+# House form style (~/.claude/skills/formserve/examples/form-template.html):
+# Terrence never gets an unstyled white page on the decisions hub. The page
+# carries what he needs to act without opening a terminal: the worker, why it
+# is here, and the exact command the worker is waiting on.
+_attn_serve_form() {                    # pane task_id reason label command_text
+  local pane="$1" task_id="$2" reason="$3" label="$4" cmd="$5"
   local dir="${HERDR_ATTENTION_FORM_DIR:-$(run_state_root)/attention-forms}"
   mkdir -p "$dir" 2>/dev/null || return 0
   local f="$dir/attention-$(date -u +%Y%m%dT%H%M%SZ)-$$.html"
+  local who; who="$(_attn_esc "${label:-$task_id}")"
   cat > "$f" <<HTML
-<!doctype html><html lang=en><head><meta charset=utf-8><title>Attention needed: $(_attn_esc "$pane")</title></head>
+<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1">
+<title>Attention needed: ${who} ($(_attn_esc "$pane"))</title>
+<style>
+:root{--ground:#eef2f2;--surface:#fff;--line:#c9d4d4;--ink:#10191c;--ink-2:#3d4e53;--accent:#1f6e7e;--accent-soft:#e2eef0}
+@media (prefers-color-scheme:dark){:root{--ground:#0c1316;--surface:#131e22;--line:#2c3b41;--ink:#e6edee;--ink-2:#a9bcc1;--accent:#58b6c8;--accent-soft:#12323a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:720px;margin:0 auto;padding:40px 24px 120px}
+h1{font-size:24px;margin:0 0 6px;letter-spacing:-.01em}
+.sub{color:var(--ink-2);margin:0 0 28px}
+fieldset{border:1px solid var(--line);border-radius:6px;background:var(--surface);padding:18px 20px;margin:0 0 18px}
+legend{font:600 12px system-ui;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-2);padding:0 6px}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;font:13px/1.5 ui-monospace,Menlo,monospace;background:var(--ground);border:1px solid var(--line);border-radius:5px;padding:10px 12px}
+.bar{position:fixed;left:0;right:0;bottom:0;padding:14px 24px;background:var(--surface);border-top:1px solid var(--line);display:flex;gap:12px;justify-content:flex-end;align-items:center}
+button{font:600 14px system-ui;padding:10px 20px;border-radius:5px;cursor:pointer;border:1px solid var(--accent);background:var(--accent);color:var(--ground)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+</style></head>
 <body><main>
-<h1>Attention needed: $(_attn_esc "$pane")</h1>
-<p>$(_attn_esc "$reason")</p>
-<p><code>herdr pane read $(_attn_esc "$pane") --source visible --lines 30</code></p>
-<form id=f><button type=submit>Acknowledge</button></form>
+<h1>Attention needed: ${who}</h1>
+<p class=sub>Worker pane $(_attn_esc "$pane") is blocked and nobody has acted on it.</p>
+<form id=f>
+<fieldset><legend>Why it is here</legend><p style="margin:0">$(_attn_esc "$reason")</p></fieldset>
+<fieldset><legend>Command it is waiting on</legend><pre>$(_attn_esc "${cmd:-(not captured)}")</pre></fieldset>
+<fieldset><legend>Look at it</legend><pre>herdr pane read $(_attn_esc "$pane") --source visible --lines 30</pre></fieldset>
+</form>
+</main>
+<div class=bar><button type=submit form=f>Acknowledge</button></div>
 <script>document.getElementById("f").addEventListener("submit",function(e){e.preventDefault();
 window.submitAnswers({acknowledged:true,pane:"$(_attn_esc "$pane")",task_id:"$(_attn_esc "$task_id")"})});</script>
-</main></body></html>
+</body></html>
 HTML
   local formserve="${HERDR_ATTENTION_FORMSERVE:-$here/formserve.py}"
   local python="${HERDR_ATTENTION_PYTHON:-python3}"
   ( "$python" "$formserve" "$f" --timeout 86400 --no-open >/dev/null 2>&1 & disown ) 2>/dev/null
 }
 
-_attn_maybe_form() {                    # run_id task_id pane key reason
-  local run_id="$1" task_id="$2" pane="$3" key="$4" reason="$5"
+_attn_maybe_form() {                    # run_id task_id pane key reason label command_text
+  local run_id="$1" task_id="$2" pane="$3" key="$4" reason="$5" label="$6" cmd="$7"
   claim_once "attn_form_${key}" "$run_id" "$task_id" "attention_form_served" \
     "$(jq -nc --arg p "$pane" --arg k "$key" --arg r "$reason" '{pane:$p, key:$k, reason:$r}')" || return 0
-  _attn_serve_form "$pane" "$task_id" "$reason"
+  _attn_serve_form "$pane" "$task_id" "$reason" "$label" "$cmd"
 }
 
 # The owner answering without the exact prompt clearing yet still counts as
@@ -350,21 +379,32 @@ attention_tick() {
     # letting attention_dedupe_key read the pane again itself.
     key="$(attention_dedupe_key "$pane" "$registered_birth" "$cmd")"
 
-    if [ -n "$reserved" ] || [ "$verdict" = "deny" ]; then
-      _attn_maybe_form "$run_id" "$task_id" "$pane" "$key" "reserved-or-deny: ${reserved:-$verdict}"
-      continue
-    fi
-
     local since since_epoch elapsed
     since="$(_attn_track_and_wake "$run_id" "$task_id" "$pane" "$conductor_pane_id" "$label" "$pid" "$key")"
     since_epoch="$(_attn_iso_epoch "$since")" || continue
     [ -n "$since_epoch" ] || continue
     _attn_answered_since "$pane" "$pid" "$since" && continue
     elapsed=$(( now - since_epoch ))
+
+    # Reserved/deny prompts skip the escalation rung, but NOT the owner's
+    # window: only a human may APPROVE them, yet the conductor may still DENY
+    # and redirect — and usually does within seconds. Serving the form on
+    # first sight put a dead question in front of Terrence for a prompt Main
+    # had already denied (w1Q:p6, 2026-09-24). A denied prompt clears, so
+    # the pane leaves live_attention() and never reaches this line again.
+    if [ -n "$reserved" ] || [ "$verdict" = "deny" ]; then
+      [ "$elapsed" -ge "$response_window" ] \
+        && _attn_maybe_form "$run_id" "$task_id" "$pane" "$key" \
+             "Only a human can approve this (${reserved:-deny verdict}), and its conductor has not denied or redirected it in ${elapsed}s." \
+             "$label" "$cmd"
+      continue
+    fi
+
     [ "$elapsed" -ge "$response_window" ] \
       && _attn_maybe_escalate "$run_id" "$task_id" "$pane" "$conductor_pane_id" "$key" "$label" "$elapsed"
     [ "$elapsed" -ge $(( response_window * 2 )) ] \
-      && _attn_maybe_form "$run_id" "$task_id" "$pane" "$key" "unanswered ${elapsed}s after wake"
+      && _attn_maybe_form "$run_id" "$task_id" "$pane" "$key" \
+           "No response ${elapsed}s after its conductor was woken, and after one escalation to Main." "$label" "$cmd"
   done
   return 0
 }
