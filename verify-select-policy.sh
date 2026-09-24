@@ -178,7 +178,7 @@ printf '== NO flag, stdin IS a terminal (an agent bash with pty:true) -> still P
 # without this case the hole would stay invisible.
 set_screen "rm -rf /tmp/scratch"; reset_keys
 script -q /dev/null bash "$here/herdr-select.sh" "$PANE" 1 >"$WORK/out.txt" 2>"$WORK/err.txt" </dev/null; rc=$?
-grep -q 'exit 8\|REFUSED\|refused' "$WORK/out.txt" "$WORK/err.txt" 2>/dev/null || [ "$rc" -eq 8 ] \
+[ "$rc" -eq 8 ] \
   && ok "a terminal-attached caller with no flag is refused (peer), not human" \
   || bad "tty caller got through: rc=$rc; $(cat "$WORK/out.txt" | head -3)"
 [ "$(keys_pressed)" = "0" ] && ok "no key pressed for the tty caller" || bad "tty caller pressed keys=$(keys_pressed)"
