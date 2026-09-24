@@ -431,6 +431,19 @@ class Cached:
             return self.val
 
 
+    def peek(self):
+        """The current value if this cache has EVER been filled, without
+        triggering a fill — for a caller with a tight latency budget
+        (`/api/summary`'s consumers allow 2-5s; a cold/post-idle
+        `deploy_drift` fill can cost multiple seconds) that would rather
+        report "not yet checked" than pay the first reader's fill cost.
+        Returns None only when nothing has EVER been filled; once filled,
+        returns the same value `get()` would serve, stale or not — this is
+        a peek, not a freshness check."""
+        with self.lock:
+            return self.val
+
+
 # ── live pane truth ────────────────────────────────────────────────────────────
 # The registry stores what herdr cannot know (which task, which brief, what the
 # worker owes). herdr stays authoritative for liveness, and we ask it at read
@@ -1471,6 +1484,27 @@ def _mirror_loop() -> None:
         time.sleep(MIRROR_EVERY_S)
 
 
+# DEPLOY_DRIFT_PRIME_EVERY_S — independent of any reader, unlike every other
+# stale_ok cache above (Cached's own docstring: "a background refresh is
+# only ever kicked by a read"). Deliberately different here: this cache's
+# only cost is two small git fetches against repos WE own, so keeping it
+# permanently warm is cheap, and it is what actually fixes "a cold/post-idle
+# read pays the fetch inline" — the 5s fetch timeout bounds that cost, this
+# loop makes a real reader hit it as close to never as possible. Well under
+# both the cache's own ttl (180s) and its stale_max (900s), so a real
+# reader's .get() should always see a value younger than its own ttl.
+DEPLOY_DRIFT_PRIME_EVERY_S = 60
+
+
+def _deploy_drift_prime_loop() -> None:
+    while True:
+        try:
+            CACHES["deploy_drift"].get()
+        except Exception:  # noqa: BLE001 — belt and braces: the loop must not die
+            pass
+        time.sleep(DEPLOY_DRIFT_PRIME_EVERY_S)
+
+
 # ── secrets: pre-resolved, never `op` from a background process ───────────────
 # Only the hub's two service credentials may be resolved. This is the existing
 # literal assignment parser, not a shell: no expansion, sourcing, or op calls.
@@ -2199,11 +2233,13 @@ def handoff_debt_data() -> dict:
 # network-backed card (see CACHES below), so a stale deploy becomes a card
 # instead of an incident.
 #
-# Two repos: herdr-control's own APP_ROOT — this process's deployed worktree,
-# the same directory RUNNING_REV above is computed from — and knowledge-base's
-# kb-deploy checkout (KB_DEPLOY). Both are DETACHED worktrees pinned at a sha
-# (agent-lib.sh's deploy_app), so HEAD is always "what is deployed", never
-# "whatever branch someone left checked out".
+# Two repos: herdr-control's own APP_ROOT — this process's deployed
+# worktree, the same directory RUNNING_REV above is computed from, a
+# DETACHED worktree pinned at a sha (agent-lib.sh's deploy_app) — and
+# knowledge-base's kb-deploy checkout (KB_DEPLOY), an ORDINARY branch
+# checkout its own nightly job fast-forwards (see kb_data()'s "kb-deploy has
+# no server/hub_forms.py yet" comment), not a detached worktree. Either way
+# HEAD is "what is deployed", never "whatever someone left checked out".
 DEPLOY_DRIFT_REPOS = [
     ("herdr-control", APP_ROOT),
     ("knowledge-base", KB_DEPLOY),
@@ -2230,26 +2266,49 @@ def _repo_drift(repo: str, path: Path) -> dict:
     def _short(sha):
         return _git("rev-parse", "--short", sha) or sha[:7]
 
-    # The only network call in this whole reader, and it runs on THIS cache's
-    # own TTL via the Cached stale_ok path (see CACHES) — never per-request.
-    # A failed fetch is not fatal: the comparison falls back to whatever
-    # origin/main last resolved to, the same "STALE, not blind" tradeoff
-    # deploy_app's own fetch failure takes in agent-lib.sh.
-    _git("fetch", "-q", "origin", "main", timeout=20)
+    # The only network call in this whole reader. `_deploy_drift_prime_loop`
+    # (main()) keeps this cache warm off the request path; 5s (not 20s)
+    # bounds the worst case for whichever reader DOES still pay it inline —
+    # /api/summary's consumers allow 2-5s, and 20s x 2 repos used to be able
+    # to block one behind the other under the cache's own lock.
+    #
+    # Its SUCCESS is recorded and reported, not just attempted: a failed
+    # fetch used to leave origin/main at whatever it last resolved to, and a
+    # reader comparing against that silently stale ref got "in sync" for a
+    # repo nobody could actually verify — worse than reporting nothing,
+    # because it looks like an answer.
+    fetch_ok = _git("fetch", "-q", "origin", "main", timeout=5) is not None
     deployed, main = _git("rev-parse", "HEAD"), _git("rev-parse", "origin/main")
     if not deployed or not main:
         return {"repo": repo, "error": "git rev-parse failed (no HEAD or no origin/main here)"}
+    if not fetch_ok:
+        # We KNOW a comparison, just not whether it is CURRENT — the
+        # origin/main resolved above is whatever the last successful fetch
+        # left behind, possibly hours old. Reported hot and unverified
+        # rather than as a (possibly false) verdict either way.
+        return {"repo": repo, "deployed": _short(deployed), "main": _short(main),
+                "behind_minutes": 0, "fetch_ok": False}
     if deployed == main:
-        return {"repo": repo, "deployed": _short(deployed), "main": _short(main), "behind_minutes": 0}
+        return {"repo": repo, "deployed": _short(deployed), "main": _short(main),
+                "behind_minutes": 0, "fetch_ok": True}
     # Oldest commit reachable from origin/main but not the deployed sha: ITS
-    # commit time is when the drift began. Empty when the deployed sha is
-    # ahead of (or off) main entirely — a different question than "we forgot
-    # to deploy", so that case is reported as in sync, not drifted.
+    # commit time is when the drift began.
     first = _git("rev-list", f"{deployed}..origin/main", "--reverse")
     first_sha = first.splitlines()[0] if first else None
-    ts = _git("log", "-1", "--format=%ct", first_sha) if first_sha else None
-    behind_minutes = max(0, int((time.time() - int(ts)) / 60)) if ts and ts.lstrip("-").isdigit() else 0
-    return {"repo": repo, "deployed": _short(deployed), "main": _short(main), "behind_minutes": behind_minutes}
+    if not first_sha:
+        # Empty: the deployed sha is ahead of (or off) main entirely — a
+        # different question than "we forgot to deploy", so reported as in
+        # sync, not drifted.
+        return {"repo": repo, "deployed": _short(deployed), "main": _short(main),
+                "behind_minutes": 0, "fetch_ok": True}
+    ts = _git("log", "-1", "--format=%ct", first_sha)
+    # Floored at 1, never 0: drift keys on deployed != main, already
+    # established by reaching this line — a commit that landed 20 seconds
+    # ago is still an undeployed commit, and "0m behind" reads as "in sync"
+    # on the card and detail row.
+    behind_minutes = max(1, int((time.time() - int(ts)) / 60)) if ts and ts.lstrip("-").isdigit() else 1
+    return {"repo": repo, "deployed": _short(deployed), "main": _short(main),
+            "behind_minutes": behind_minutes, "fetch_ok": True}
 
 
 def deploy_drift_data() -> dict:
@@ -2271,8 +2330,10 @@ CACHES = {
     "loops": Cached(10, loops_data, stale_ok=True, name="loops"),
     # One ~250ms node call to Supabase: served stale, refreshed behind the reader.
     "portal": Cached(60, portal_data, stale_ok=True, name="portal"),
-    # git fetch on ITS OWN schedule (a few minutes, per spec) — never inline
-    # on a request. Same stale_ok tradeoff as kb/links/search above.
+    # Primed by _deploy_drift_prime_loop (main()), not just read-triggered
+    # like kb/links/search above — see that loop for why. Still stale_ok so
+    # a request is never blocked on it; STALE_MAX above bounds the "priming
+    # loop somehow hasn't run yet" case.
     "deploy_drift": Cached(180, deploy_drift_data, stale_ok=True, name="deploy_drift"),
 }
 
@@ -2316,6 +2377,8 @@ def _minutes_label(m: int) -> str:
 def _drift_label(r: dict) -> str:
     if r.get("error"):
         return f"{r['repo']} unavailable"
+    if r.get("fetch_ok") is False:
+        return f"{r['repo']} unverified (fetch failed)"
     m = r.get("behind_minutes") or 0
     if m <= 0:
         return f"{r['repo']} in sync"
@@ -2558,6 +2621,12 @@ def deploy_drift_rows(dd: dict) -> str:
             out.append(f"<tr><td><span class='pill bad'>unavailable</span></td>"
                        f"<td>{_esc(r['repo'])}</td><td class=dim>{_esc(r['error'])}</td></tr>")
             continue
+        if r.get("fetch_ok") is False:
+            out.append(f"<tr class=hot><td><span class='pill hot'>unverified</span></td>"
+                       f"<td><b>{_esc(r['repo'])}</b></td>"
+                       f"<td class=dim>git fetch failed — {_esc(r['deployed'])} vs last-known "
+                       f"{_esc(r['main'])}</td></tr>")
+            continue
         m = r.get("behind_minutes") or 0
         hot = m > 30
         pill = (f"<span class='pill hot'>{_minutes_label(m)} behind</span>" if hot
@@ -2596,8 +2665,12 @@ def render_overview(scope: str = "") -> str:
     # below — a repo's deploy state is a machine-wide fact, not this repo's.
     dd_repos = dd.get("repos", [])
     dd_bad = [r for r in dd_repos if r.get("error")]
-    dd_drifted = [r for r in dd_repos if not r.get("error") and (r.get("behind_minutes") or 0) > 0]
-    dd_in_sync = len(dd_repos) - len(dd_bad) - len(dd_drifted)
+    # A failed fetch is its OWN bucket, never counted as in sync: we could
+    # not verify it either way. See _repo_drift's fetch_ok.
+    dd_unverified = [r for r in dd_repos if not r.get("error") and r.get("fetch_ok") is False]
+    dd_drifted = [r for r in dd_repos if not r.get("error") and r.get("fetch_ok") is not False
+                 and (r.get("behind_minutes") or 0) > 0]
+    dd_in_sync = len(dd_repos) - len(dd_bad) - len(dd_unverified) - len(dd_drifted)
     cards = [
         ("/herdr", att, "need attention", f"{len(h.get('tasks', []))} tasks · events to #{h.get('max_event_seq', 0)}", att > 0),
         ("/decisions", f.get("open_count", 0) + pd.get("open_count", 0), "decisions open",
@@ -2621,7 +2694,7 @@ def render_overview(scope: str = "") -> str:
         ("/search", (s.get("totals") or {}).get("searches", "—"), "searches remembered", f"{(s.get('totals') or {}).get('replays', 0)} served from memory" if s.get("totals") else (s.get("error") or ""), False),
         ("#deploy-drift", f"{dd_in_sync}/{len(dd_repos)}", "in sync (deploy drift)",
          "; ".join(_drift_label(r) for r in dd_repos) if dd_repos else "no repos configured",
-         bool(dd_bad) or any((r.get("behind_minutes") or 0) > 30 for r in dd_drifted)),
+         bool(dd_bad) or bool(dd_unverified) or any((r.get("behind_minutes") or 0) > 30 for r in dd_drifted)),
     ]
     body = scope_chips(h_all, "/", scope) + "<div class=cards>" + "".join(
         f"<a class='card {'hot' if hot else ''}' href='{href}'><div class=t>{t}</div><div class=n>{n}</div><div class=s>{_esc(sub)}</div></a>"
@@ -3021,7 +3094,12 @@ class Handler(BaseHTTPRequestHandler):
             # half, `handoff_debt` the repo half, and the banner names each.
             debt = CACHES["debt"].get()
             debt_repos = len(debt.get("repos", []))
-            dd = CACHES["deploy_drift"].get()
+            # peek(), never get(): this endpoint's consumers (the omp
+            # extension, agent-edge.sh) allow 2-5s, and a cold/post-idle
+            # get() used to fetch INLINE under the cache's lock — see
+            # _repo_drift. A cache the priming loop hasn't filled yet
+            # reports "not yet checked" instead of blocking to find out.
+            dd = CACHES["deploy_drift"].peek()
             attention_tasks = len(live) + len(registry)
             return self._send(200, "application/json", json.dumps(
                 {"attention": attention_tasks + debt_repos,
@@ -3032,7 +3110,8 @@ class Handler(BaseHTTPRequestHandler):
                  "handoff_debt_rows": len(debt.get("debt", [])),
                  "handoff_debt_unreadable": debt.get("unreadable", 0),
                  "rev": RUNNING_REV,
-                 "deploy_drift": dd.get("repos", []),
+                 "deploy_drift": dd.get("repos", []) if dd is not None else [],
+                 "deploy_drift_checked": dd is not None,
                  "live_connected": live_data().get("connected", False),
                  "open_decisions": f.get("open_count", 0),
                  # The portal's open rows, separately: open_ids/open_decisions
@@ -3180,6 +3259,10 @@ def main() -> int:
         LIVE.start()
     if not args.no_mirror:
         threading.Thread(target=_mirror_loop, name="dashboard-mirror", daemon=True).start()
+    # Unconditional (no --no-X flag): two small git fetches against repos we
+    # own, nowhere near mirror's cost, and skipping it would reopen exactly
+    # the inline-fetch-on-cold-read bug it exists to close.
+    threading.Thread(target=_deploy_drift_prime_loop, name="deploy-drift-prime", daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"hub: http://127.0.0.1:{args.port}/", file=sys.stderr)
     try:

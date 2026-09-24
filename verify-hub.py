@@ -432,7 +432,7 @@ class PublicSurface(ReaderFixture):
                     {"name": "tourguide (apps)", "url": "http://127.0.0.1:2/", "alive": True,
                      "code": 200, "ms": 4, "detail": "", "hb": "tourguide"}]
         empty_loops = {"loops": [], "suggestions": [], "findings": [], "gates": [], "dismissed": 0}
-        caches = {name: Mock(get=lambda: {}) for name in hub.CACHES}
+        caches = {name: Mock(get=lambda: {}, peek=lambda: {}) for name in hub.CACHES}
         caches.update(kb=Mock(get=lambda: kb), links=Mock(get=lambda: {"surfaces": surfaces}),
                       loops=Mock(get=lambda: empty_loops))
         out = {}
@@ -578,7 +578,7 @@ class HandoffDebt(unittest.TestCase):
 
     def served(self, paths, attention=(), blocked=()):
         """The real handler over HTTP, with the REAL debt reader behind it."""
-        caches = {name: Mock(get=lambda: {}) for name in hub.CACHES}
+        caches = {name: Mock(get=lambda: {}, peek=lambda: {}) for name in hub.CACHES}
         caches.update(herdr=Mock(get=lambda: {"attention": list(attention), "tasks": [], "max_event_seq": 0}),
                       forms=Mock(get=lambda: {"open_count": 0, "open": [], "history": []}),
                       links=Mock(get=lambda: {"surfaces": []}),
@@ -759,7 +759,7 @@ class DeployDrift(unittest.TestCase):
         empty mock, the same shape `hub.CACHES` itself has, so a future cache
         added to the module needs no update here."""
         caches = {name: Mock(get=lambda: {}) for name in hub.CACHES}
-        caches["deploy_drift"] = Mock(get=lambda: data)
+        caches["deploy_drift"] = Mock(get=lambda: data, peek=lambda: data)
         out = {}
         with patch.dict(hub.CACHES, caches), \
              patch.object(hub, "live_attention", lambda: []), \
@@ -786,7 +786,7 @@ class DeployDrift(unittest.TestCase):
         with patch.object(hub, "DEPLOY_DRIFT_REPOS", [("test-repo", deployed)]):
             data = hub.deploy_drift_data()
         self.assertEqual(data["repos"], [{"repo": "test-repo", "deployed": sha,
-                                          "main": sha, "behind_minutes": 0}])
+                                          "main": sha, "behind_minutes": 0, "fetch_ok": True}])
         pages = self._served(("/", "/api/summary"), data)
         self.assertIn("class='card ' href='#deploy-drift'", pages["/"])
         self.assertNotIn("class='card hot' href='#deploy-drift'", pages["/"])
@@ -798,11 +798,16 @@ class DeployDrift(unittest.TestCase):
         self._commit(origin, "one")
         deployed = self._clone(origin, "deployed-b")
         deployed_sha = self._short(deployed)
-        # Backdating only the COMMIT time, not when it is created: this
-        # commit is made after "one" but its %ct reads as 45 minutes ago,
-        # which is exactly what a real commit that landed 45 minutes ago and
-        # was never deployed looks like to `_repo_drift`.
+        # Two undeployed commits, oldest first: behind_minutes must key on
+        # the OLDEST (when drift BEGAN), not the newest — dropping the
+        # `--reverse` on `_repo_drift`'s `rev-list` would silently pick
+        # "three" (~5 min old) instead of "two" (~45 min old) and this
+        # assertion would read ~5, not ~45. Backdating only the COMMIT time,
+        # not when each is created: "two"/"three" are made in order but
+        # their %ct reads as 45/5 minutes ago, which is exactly what real
+        # commits that landed then and were never deployed look like.
         self._commit(origin, "two", when=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=45))
+        self._commit(origin, "three", when=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5))
         main_sha = self._short(origin)
         with patch.object(hub, "DEPLOY_DRIFT_REPOS", [("test-repo", deployed)]):
             data = hub.deploy_drift_data()
@@ -815,6 +820,27 @@ class DeployDrift(unittest.TestCase):
         self.assertIn(deployed_sha, pages["/"])
         self.assertIn(main_sha, pages["/"])
         self.assertEqual(json.loads(pages["/api/summary"])["deploy_drift"], data["repos"])
+
+    def test_a_failed_fetch_is_reported_as_unverified_not_in_sync(self):
+        origin = self._repo("origin-c")
+        self._commit(origin, "one")
+        deployed = self._clone(origin, "deployed-c")
+        # Point origin at a path that was never a repo: `git fetch` fails,
+        # but the remote-tracking ref `git clone` already created for
+        # `origin/main` still resolves — exactly the shape that used to
+        # silently read "in sync" with the fetch failure swallowed.
+        subprocess.run(["git", "-C", str(deployed), "remote", "set-url", "origin",
+                        str(Path(self.tmp.name) / "does-not-exist")],
+                       check=True, capture_output=True)
+        with patch.object(hub, "DEPLOY_DRIFT_REPOS", [("test-repo", deployed)]):
+            data = hub.deploy_drift_data()
+        row = data["repos"][0]
+        self.assertEqual(row["fetch_ok"], False)
+        self.assertNotIn("error", row)  # a comparison DOES exist, just not a trusted one
+        pages = self._served(("/",), data)
+        self.assertIn("class='card hot' href='#deploy-drift'", pages["/"])
+        self.assertNotIn("test-repo in sync", pages["/"])
+        self.assertIn("unverified (fetch failed)", pages["/"])
 
 
 class FinishedButUnseen(unittest.TestCase):
