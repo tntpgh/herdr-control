@@ -205,7 +205,19 @@ HERDR_ALERT_DEDUP_TTL_S=1 HERDR_BRIDGE_STATE="$WORK/p1b" bash "$here/slack-bridg
   || bad "a re-ask was silently dropped forever: $(n_posts) posts"
 
 printf '== P2: a plain-context prompt (no numbered options), 3 firings -> exactly 1 post ==\n'
-printf 'Continue with this plan?\nApprove\nDeny\n\nup/down navigate  enter select  esc cancel\n' > "$WORKER_SCREEN"
+# A genuine plain y/n confirmation: no "Allow tool:"/"Command:" header, no
+# Approve/Deny wording, no navigation footer — none of the menu-shape or
+# numbered-shape signals prompt_menu_options/prompt_options key on. The
+# earlier fixture here ("Continue with this plan?\nApprove\nDeny\n...\nup/down
+# navigate...") still parsed as a recognized menu shape (PR #131 review),
+# which meant this test exercised the SAME opts-based path as every other
+# test in this file rather than the plain-context branch it claimed to.
+printf 'Do you want to proceed? (y/n)\n' > "$WORKER_SCREEN"
+dry_out="$(HERDR_BRIDGE_STATE="$WORK/p2dry" bash "$here/slack-bridge/herdr-notify.sh" \
+  --dry-run --choices --pane "$WPANE" "needs input" 2>&1)"
+printf '%s' "$dry_out" | grep -q 'with buttons' \
+  && bad "plain y/n screen was rendered as a button menu: $dry_out" \
+  || ok "plain y/n screen is not rendered as a button menu (no numbered/menu options)"
 : > "$POSTED"
 HERDR_BRIDGE_STATE="$WORK/p2" bash "$here/slack-bridge/herdr-notify.sh" --choices --pane "$WPANE" "needs input" >/dev/null 2>&1
 HERDR_BRIDGE_STATE="$WORK/p2" bash "$here/slack-bridge/herdr-notify.sh" --choices --pane "$WPANE" "needs input" >/dev/null 2>&1

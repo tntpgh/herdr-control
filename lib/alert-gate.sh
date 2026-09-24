@@ -180,11 +180,16 @@ grace_realert() {
 # Sanitize the dedupe TTL, same pattern and same reason as _ag_grace_seconds:
 # asserted directly so a clamp gets tested without a real-time sleep.
 # "Permanent" (what the first draft did) is exactly the bug this closes, so
-# there is a hard ceiling, not just a default.
+# there is a hard ceiling, not just a default. Default is 5 minutes, not the
+# original hour: symptom alerts (an escalate-class prompt, a wake failure)
+# can legitimately recur well inside an hour, and herdr-resolve.sh's own
+# alert_release on a genuine retraction is now the FAST path for "this
+# prompt is resolved" — the TTL only has to cover the gap between hook
+# firings for a prompt nobody has answered yet, not a whole workday.
 _ag_dedup_ttl_seconds() {               # [raw] -> integer seconds
-  local t="${1:-${HERDR_ALERT_DEDUP_TTL_S:-3600}}"
+  local t="${1:-${HERDR_ALERT_DEDUP_TTL_S:-300}}"
   case "$t" in
-    ''|*[!0-9]*) printf '3600\n'; return ;;
+    ''|*[!0-9]*) printf '300\n'; return ;;
   esac
   [ "$t" -gt 86400 ] && { printf '86400\n'; return ; }   # a day, never forever
   [ "$t" -lt 1 ] && { printf '1\n'; return ; }
@@ -200,7 +205,7 @@ _ag_claim_id() { printf 'slack_alert_%s_%s' "${1:-_}" "$2"; }   # <pane> <key> -
 # file — a possible duplicate is recoverable, a dropped human-required alert
 # is not.
 alert_claim() {
-  local pane="$1" key="$2" changes lockdir eid ttl
+  local pane="$1" key="$2" changes lockdir eid ttl payload
   [ -n "$key" ] || return 0
   eid="$(_ag_claim_id "$pane" "$key")"
   ttl="$(_ag_dedup_ttl_seconds)"
