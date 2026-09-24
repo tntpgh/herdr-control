@@ -95,6 +95,18 @@ if [ "$apply" = 1 ] && [ "$closure_reason" = shipped ]; then
     printf 'close-done-workers: --reason=shipped requires --pane=<id> or --task=<id> to scope the proof to one task\n' >&2
     exit 1
   }
+  # A GONE pane (no live occupant at all) falls back to matching by
+  # pane_id alone above, which is fine for a batch reason but NOT for
+  # shipped: two stale rows can share one recycled pane_id with nobody
+  # currently occupying it, and a proof validated against ONE of them
+  # (via ORDER BY ... LIMIT 1 below) could otherwise get applied while the
+  # main scan processes a DIFFERENT row first — refuse outright rather
+  # than guess which one the proof is actually evidence for.
+  match_count=$(_sql "SELECT count(*) FROM tasks WHERE state IN ($states)$states_filter;" 2>/dev/null)
+  if [ "${match_count:-0}" -gt 1 ]; then
+    printf 'close-done-workers: --reason=shipped matches %s tasks for this scope — refusing (one proof cannot cover more than one task; use --task=<id> to disambiguate)\n' "$match_count" >&2
+    exit 1
+  fi
   proof_wt=$(_sql "SELECT worktree FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)
   _valid_proof_ref "$closure_proof" "$proof_wt" || {
     printf 'close-done-workers: --reason=shipped requires --proof="<PR URL> <merge sha>" or a non-empty PROOF.md section in the selected task'"'"'s worktree\n' >&2
@@ -105,7 +117,7 @@ fi
 panes_json=$(herdr pane list 2>/dev/null)
 pane_status() { printf '%s' "$panes_json" | jq -r --arg p "$1" '((.result.panes // .panes)[]|select(.pane_id==$p)|.agent_status) // "absent"'; }
 
-closable=0; held=0
+closable=0; held=0; refused=0
 while IFS='|' read -r run_id task_id pane wt label; do
   [ -n "$pane" ] || continue
   st=$(pane_status "$pane")
@@ -141,8 +153,17 @@ while IFS='|' read -r run_id task_id pane wt label; do
   # run, the task stays `running` forever against a pane that no longer
   # exists — which is precisely the stale state that made the attention view
   # report seven phantom items all day.
-  set_task_state "$run_id" "$task_id" "completed" "$closure_reason" "$closure_proof" >/dev/null 2>&1 ||
-    set_task_state "$run_id" "$task_id" "cancelled" >/dev/null 2>&1
+  if ! set_task_state "$run_id" "$task_id" "completed" "$closure_reason" "$closure_proof" >/dev/null 2>&1; then
+    # NEVER silently fall back to `cancelled` here — that used to convert
+    # ANY refusal (a proof that doesn't actually match THIS task, a race,
+    # an illegal transition) into a fabricated successful outcome: pane
+    # closed, run reporting "closed N" at exit 0. A refused transition
+    # means something is wrong with this exact row; leave its state and
+    # pane untouched so the operator sees it, instead of a lie.
+    refused=$((refused+1))
+    printf '  REFUSED %-8s %-46s registry refused the completed transition — left running, pane not closed\n' "$pane" "$label"
+    continue
+  fi
   [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
   [ "$(pane_status "$pane")" = absent ] || herdr pane close "$pane" >/dev/null 2>&1
 done < <(_sql "SELECT run_id || '|' || task_id || '|' || pane_id || '|' || worktree || '|' || label
@@ -150,7 +171,8 @@ done < <(_sql "SELECT run_id || '|' || task_id || '|' || pane_id || '|' || workt
 
 echo
 if [ "$apply" = 1 ]; then
-  printf 'closed %d, held back %d\n' "$closable" "$held"
+  printf 'closed %d, held back %d, refused %d\n' "$((closable - refused))" "$held" "$refused"
+  [ "$refused" -eq 0 ] || exit 1
 else
   printf '%d closable, %d held back — DRY RUN, nothing changed. Re-run with --apply\n' "$closable" "$held"
 fi

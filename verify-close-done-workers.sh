@@ -190,6 +190,67 @@ rc=$?
 check "taskR-live (the exact live task) is completed" "$(read_task runR2 taskR-live | jq -r .state)" "completed"
 check "taskR-stale (the recycled-away row) is NEVER touched" "$(read_task runR taskR-stale | jq -r .state)" "running"
 
+printf '== --reason=shipped --pane=<GONE id> matching TWO stale running rows: refused, never guesses which one (item 1, follow-up) ==\n'
+# pG is never present in the herdr stub'"'"'s pane list — a genuinely GONE
+# pane, not merely recycled. Two independent stale registrations share it
+# (e.g. a pane assigned, abandoned, and reassigned to another task that
+# also never got cleaned up) — nothing here disambiguates which one a
+# single proof is evidence for.
+gone_wt1=$(mktemp -d)/wt-gone-a
+git init -q -b main "$gone_wt1"
+git -C "$gone_wt1" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+mkdir -p "$gone_wt1/.handoffs"
+printf '*\n' > "$gone_wt1/.handoffs/.gitignore"
+git -C "$gone_wt1" remote add origin "$gone_wt1-origin-placeholder" 2>/dev/null
+git -C "$gone_wt1" update-ref refs/remotes/origin/main "$(git -C "$gone_wt1" rev-parse HEAD)"
+git -C "$gone_wt1" branch --set-upstream-to=origin/main main >/dev/null
+printf 'row A worktree — has content, must not be trusted as THE proof\n' > "$gone_wt1/.handoffs/PROOF.md"
+register_task runG taskG-a w c cp cb pG birthG-a "$gone_wt1" "$gone_wt1" "gone-stale-a" \
+  || bad "register taskG-a failed"
+set_task_state runG taskG-a running || bad "taskG-a -> running failed (setup)"
+gone_wt2=$(mktemp -d)/wt-gone-b
+git init -q -b main "$gone_wt2"
+git -C "$gone_wt2" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+mkdir -p "$gone_wt2/.handoffs"
+printf '*\n' > "$gone_wt2/.handoffs/.gitignore"
+git -C "$gone_wt2" remote add origin "$gone_wt2-origin-placeholder" 2>/dev/null
+git -C "$gone_wt2" update-ref refs/remotes/origin/main "$(git -C "$gone_wt2" rev-parse HEAD)"
+git -C "$gone_wt2" branch --set-upstream-to=origin/main main >/dev/null
+: > "$gone_wt2/.handoffs/PROOF.md"
+register_task runG2 taskG-b w c cp cb pG birthG-b "$gone_wt2" "$gone_wt2" "gone-stale-b" \
+  || bad "register taskG-b failed"
+set_task_state runG2 taskG-b running || bad "taskG-b -> running failed (setup)"
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --apply --reason=shipped --pane=pG \
+    --proof=".handoffs/PROOF.md#check" >/tmp/cdw-out12-$$.log 2>&1; then
+  bad "shipped ACCEPTED against an ambiguous (2-row) gone-pane scope: $(cat /tmp/cdw-out12-$$.log)"
+else
+  ok "shipped refused: ambiguous gone-pane scope matched more than one task"
+fi
+grep -qi 'refus' /tmp/cdw-out12-$$.log && ok "refusal reason is explicit in the output" \
+  || bad "no refusal message: $(cat /tmp/cdw-out12-$$.log)"
+check "taskG-a untouched (not completed, not cancelled)" "$(read_task runG taskG-a | jq -r .state)" "running"
+check "taskG-b untouched (not completed, not cancelled)" "$(read_task runG2 taskG-b | jq -r .state)" "running"
+grep -q '^pane close$' "$CALLS" && bad "a pane was closed despite the refusal" || ok "no pane was closed for the ambiguous scope"
+
+printf '== a completed transition the registry refuses prints REFUSED and never falls back to cancelled (item 1, follow-up) ==\n'
+register_task runL taskL w c cp cb pL birthL "/does/not/exist" "/does/not/exist" "buried" || bad "register taskL failed"
+set_task_state runL taskL running || bad "taskL -> running failed (setup)"
+set_task_state runL taskL lost || bad "taskL -> lost failed (setup)"
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --apply --include-lost --reason=no-follow-on --task=taskL \
+    >/tmp/cdw-out13-$$.log 2>&1; then
+  bad "apply against an illegal (lost->completed) transition exited 0: $(cat /tmp/cdw-out13-$$.log)"
+else
+  ok "apply exits nonzero when the registry refuses the completed transition"
+fi
+grep -q 'REFUSED' /tmp/cdw-out13-$$.log \
+  && ok "REFUSED is printed for the row the registry refused" \
+  || bad "no REFUSED line: $(cat /tmp/cdw-out13-$$.log)"
+check "taskL is still lost, NOT silently cancelled" "$(read_task runL taskL | jq -r .state)" "lost"
+grep -q '^pane close$' "$CALLS" && bad "the pane was closed despite the refused transition" \
+  || ok "the pane was left open, not closed, after the refusal"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi
