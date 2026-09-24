@@ -23,7 +23,7 @@ export CALLS
 herdr() {
   printf '%s\n' "$1 $2" >> "$CALLS"
   case "$1 $2" in
-    "pane list")  printf '{"result":{"panes":[{"pane_id":"pX","agent_status":"idle"},{"pane_id":"pY","agent_status":"idle"},{"pane_id":"pZ","agent_status":"idle"}]}}\n' ;;
+    "pane list")  printf '{"result":{"panes":[{"pane_id":"pX","agent_status":"idle","terminal_id":"birthX"},{"pane_id":"pY","agent_status":"idle","terminal_id":"birthY"},{"pane_id":"pZ","agent_status":"idle","terminal_id":"birthZ"},{"pane_id":"pR","agent_status":"idle","terminal_id":"birthR-live"}]}}\n' ;;
     "pane close") : ;;
     *) printf '{}\n' ;;
   esac
@@ -127,13 +127,129 @@ if bash "$here/close-done-workers.sh" --apply --reason=shipped --pane=pZ \
 else
   ok "shipped refused: the selected task's PROOF.md exists but is empty"
 fi
-check "no herdr RPC was made for the refused proof" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
+check "no herdr pane-close mutation for the refused proof (a pane-list read to resolve pane_birth is expected)" "$(grep -c '^pane close$' "$CALLS")" "0"
 printf 'verified: ran the check, output attached\n' > "$wt3/.handoffs/PROOF.md"
 bash "$here/close-done-workers.sh" --apply --reason=shipped --pane=pZ \
   --proof=".handoffs/PROOF.md#check" >/tmp/cdw-out8-$$.log 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && ok "shipped accepted once PROOF.md actually holds something" || bad "exit $rc: $(cat /tmp/cdw-out8-$$.log)"
 check "task3 now completed" "$(read_task run3 task3 | jq -r .state)" "completed"
+
+printf '== --pane=<id> whose pane_id was RECYCLED: a stale running row sharing that id is never matched (item 1) ==\n'
+# Simulates herdr reissuing a closed pane's id to a brand-new occupant while a
+# PREVIOUS registration for that same numeric id never got cleaned up. The
+# live occupant is pR with terminal_id "birthR-live" per the herdr stub
+# above; the stale row below deliberately carries a DIFFERENT (old)
+# pane_birth for the same pane_id, and a non-empty PROOF.md that must never
+# be read — if it is, the bug is still present.
+stale_wt=$(mktemp -d)
+mkdir -p "$stale_wt/.handoffs"
+printf 'this belongs to the STALE, recycled-away task — must never be read\n' > "$stale_wt/.handoffs/PROOF.md"
+register_task runR taskR-stale w c cp cb pR birthR-old "$stale_wt" "$stale_wt" "stale-recycled" \
+  || bad "register taskR-stale failed"
+set_task_state runR taskR-stale running || bad "taskR-stale -> running failed (setup)"
+
+live_wt=$(mktemp -d)/wt-live
+git init -q -b main "$live_wt"
+git -C "$live_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+mkdir -p "$live_wt/.handoffs"
+printf '*\n' > "$live_wt/.handoffs/.gitignore"
+git -C "$live_wt" remote add origin "$live_wt-origin-placeholder" 2>/dev/null
+git -C "$live_wt" update-ref refs/remotes/origin/main "$(git -C "$live_wt" rev-parse HEAD)"
+git -C "$live_wt" branch --set-upstream-to=origin/main main >/dev/null
+register_task runR2 taskR-live w c cp cb pR birthR-live "$live_wt" "$live_wt" "current-live" \
+  || bad "register taskR-live failed"
+set_task_state runR2 taskR-live running || bad "taskR-live -> running failed (setup)"
+
+: > "$CALLS"
+bash "$here/close-done-workers.sh" --pane=pR >/tmp/cdw-out9-$$.log 2>&1
+grep -q "current-live" /tmp/cdw-out9-$$.log \
+  && ok "dry-run scoped to pR reports the LIVE task" \
+  || bad "dry-run output missing the live task: $(cat /tmp/cdw-out9-$$.log)"
+grep -q "stale-recycled" /tmp/cdw-out9-$$.log \
+  && bad "dry-run scoped to pR ALSO matched the stale recycled row: $(cat /tmp/cdw-out9-$$.log)" \
+  || ok "dry-run scoped to pR did not match the stale recycled row"
+
+printf '== proof-worktree lookup for --pane=pR resolves to the LIVE task, never the stale one ==\n'
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --apply --reason=shipped --pane=pR \
+    --proof=".handoffs/PROOF.md#check" >/tmp/cdw-out10-$$.log 2>&1; then
+  bad "shipped accepted against pR — proof check must have read the STALE task's non-empty PROOF.md instead of the live task's empty one"
+else
+  ok "shipped refused: proof-worktree lookup scoped to the LIVE task's (empty) PROOF.md, not the stale task's"
+fi
+check "taskR-live untouched by the refused proof" "$(read_task runR2 taskR-live | jq -r .state)" "running"
+check "taskR-stale untouched by the refused proof" "$(read_task runR taskR-stale | jq -r .state)" "running"
+
+printf '== once the LIVE task'"'"'s own PROOF.md holds something, --apply --pane=pR settles ONLY it ==\n'
+printf 'verified: ran the check, output attached\n' > "$live_wt/.handoffs/PROOF.md"
+bash "$here/close-done-workers.sh" --apply --reason=shipped --pane=pR \
+  --proof=".handoffs/PROOF.md#check" >/tmp/cdw-out11-$$.log 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ok "shipped accepted once the LIVE task's PROOF.md holds something" || bad "exit $rc: $(cat /tmp/cdw-out11-$$.log)"
+check "taskR-live (the exact live task) is completed" "$(read_task runR2 taskR-live | jq -r .state)" "completed"
+check "taskR-stale (the recycled-away row) is NEVER touched" "$(read_task runR taskR-stale | jq -r .state)" "running"
+
+printf '== --reason=shipped --pane=<GONE id> matching TWO stale running rows: refused, never guesses which one (item 1, follow-up) ==\n'
+# pG is never present in the herdr stub'"'"'s pane list — a genuinely GONE
+# pane, not merely recycled. Two independent stale registrations share it
+# (e.g. a pane assigned, abandoned, and reassigned to another task that
+# also never got cleaned up) — nothing here disambiguates which one a
+# single proof is evidence for.
+gone_wt1=$(mktemp -d)/wt-gone-a
+git init -q -b main "$gone_wt1"
+git -C "$gone_wt1" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+mkdir -p "$gone_wt1/.handoffs"
+printf '*\n' > "$gone_wt1/.handoffs/.gitignore"
+git -C "$gone_wt1" remote add origin "$gone_wt1-origin-placeholder" 2>/dev/null
+git -C "$gone_wt1" update-ref refs/remotes/origin/main "$(git -C "$gone_wt1" rev-parse HEAD)"
+git -C "$gone_wt1" branch --set-upstream-to=origin/main main >/dev/null
+printf 'row A worktree — has content, must not be trusted as THE proof\n' > "$gone_wt1/.handoffs/PROOF.md"
+register_task runG taskG-a w c cp cb pG birthG-a "$gone_wt1" "$gone_wt1" "gone-stale-a" \
+  || bad "register taskG-a failed"
+set_task_state runG taskG-a running || bad "taskG-a -> running failed (setup)"
+gone_wt2=$(mktemp -d)/wt-gone-b
+git init -q -b main "$gone_wt2"
+git -C "$gone_wt2" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+mkdir -p "$gone_wt2/.handoffs"
+printf '*\n' > "$gone_wt2/.handoffs/.gitignore"
+git -C "$gone_wt2" remote add origin "$gone_wt2-origin-placeholder" 2>/dev/null
+git -C "$gone_wt2" update-ref refs/remotes/origin/main "$(git -C "$gone_wt2" rev-parse HEAD)"
+git -C "$gone_wt2" branch --set-upstream-to=origin/main main >/dev/null
+: > "$gone_wt2/.handoffs/PROOF.md"
+register_task runG2 taskG-b w c cp cb pG birthG-b "$gone_wt2" "$gone_wt2" "gone-stale-b" \
+  || bad "register taskG-b failed"
+set_task_state runG2 taskG-b running || bad "taskG-b -> running failed (setup)"
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --apply --reason=shipped --pane=pG \
+    --proof=".handoffs/PROOF.md#check" >/tmp/cdw-out12-$$.log 2>&1; then
+  bad "shipped ACCEPTED against an ambiguous (2-row) gone-pane scope: $(cat /tmp/cdw-out12-$$.log)"
+else
+  ok "shipped refused: ambiguous gone-pane scope matched more than one task"
+fi
+grep -qi 'refus' /tmp/cdw-out12-$$.log && ok "refusal reason is explicit in the output" \
+  || bad "no refusal message: $(cat /tmp/cdw-out12-$$.log)"
+check "taskG-a untouched (not completed, not cancelled)" "$(read_task runG taskG-a | jq -r .state)" "running"
+check "taskG-b untouched (not completed, not cancelled)" "$(read_task runG2 taskG-b | jq -r .state)" "running"
+grep -q '^pane close$' "$CALLS" && bad "a pane was closed despite the refusal" || ok "no pane was closed for the ambiguous scope"
+
+printf '== a completed transition the registry refuses prints REFUSED and never falls back to cancelled (item 1, follow-up) ==\n'
+register_task runL taskL w c cp cb pL birthL "/does/not/exist" "/does/not/exist" "buried" || bad "register taskL failed"
+set_task_state runL taskL running || bad "taskL -> running failed (setup)"
+set_task_state runL taskL lost || bad "taskL -> lost failed (setup)"
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --apply --include-lost --reason=no-follow-on --task=taskL \
+    >/tmp/cdw-out13-$$.log 2>&1; then
+  bad "apply against an illegal (lost->completed) transition exited 0: $(cat /tmp/cdw-out13-$$.log)"
+else
+  ok "apply exits nonzero when the registry refuses the completed transition"
+fi
+grep -q 'REFUSED' /tmp/cdw-out13-$$.log \
+  && ok "REFUSED is printed for the row the registry refused" \
+  || bad "no REFUSED line: $(cat /tmp/cdw-out13-$$.log)"
+check "taskL is still lost, NOT silently cancelled" "$(read_task runL taskL | jq -r .state)" "lost"
+grep -q '^pane close$' "$CALLS" && bad "the pane was closed despite the refused transition" \
+  || ok "the pane was left open, not closed, after the refusal"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

@@ -107,6 +107,14 @@ grep -q 'SELF-REFERENTIAL-MARKER-BEFORE-RESPAWN' "$spec" 2>/dev/null \
 grep -q '## Proof contract' "$spec" 2>/dev/null \
   && ok "proof contract still appended after the self-referential read" || bad "proof contract missing"
 
+printf '== --brief pointing at a SPEC.md that ALREADY carries a Proof contract heading: not duplicated ==\n'
+run_spawn no-brief-branch --brief "$spec" >/tmp/spawn-out7-$$.log 2>&1 \
+  || bad "re-spawn (--brief == spec already containing proof contract) failed: $(cat /tmp/spawn-out7-$$.log)"
+check "exactly one Proof contract heading, not duplicated" \
+  "$(grep -c '## Proof contract' "$spec" 2>/dev/null)" "1"
+grep -q 'SELF-REFERENTIAL-MARKER-BEFORE-RESPAWN' "$spec" 2>/dev/null \
+  && ok "brief's own body content preserved" || bad "brief body lost: $(cat "$spec" 2>/dev/null)"
+
 printf '== identity.json tells the worker where SPEC/PROOF live and the closure vocabulary ==\n'
 idjson="$wt/.handoffs/identity.json"
 [ -f "$idjson" ] && ok "identity.json written" || bad "identity.json missing"
