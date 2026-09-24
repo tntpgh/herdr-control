@@ -21,6 +21,7 @@ trap 'rm -rf "$WORK"' EXIT
 export HERDR_RUN_STATE_DIR="$WORK/runs"
 export HERDR_ATTENTION_FORM_DIR="$WORK/forms"
 export SENT="$WORK/sent.log"
+export HERDR_CALLS="$WORK/herdr.calls"
 : > "$SENT"
 
 # Two workers reused across most scenarios, one shared conductor, one Main.
@@ -44,6 +45,7 @@ export S1 S2 S3 S4 SC SM
 
 herdr() {
   local sub="$1 $2" pane
+  [ -n "${HERDR_CALLS:-}" ] && printf '%s %s\n' "$sub" "${3:-}" >> "$HERDR_CALLS"
   case "$sub" in
     "pane process-info")
       printf '{"result":{"process_info":{"foreground_processes":[{"name":"omp","cmdline":"omp --model sonnet"}]}}}\n' ;;
@@ -236,16 +238,21 @@ esc6=$(_q "SELECT count(*) FROM events WHERE task_id='task6' AND type='attention
 esc7=$(_q "SELECT count(*) FROM events WHERE task_id='task7' AND type='attention_escalated';")
 [ "$esc6" = "1" ] && [ "$esc7" = "1" ] && ok "both panes escalate independently" || bad "esc6=$esc6 esc7=$esc7"
 
-printf '== HERDR_WAKE_LEGACY=1 restores a push_wake call on every pass ==\n'
+printf '== PR #132 re-review item 2: under HERDR_WAKE_LEGACY=1 the controller itself never push_wakes ==\n'
 register_task run8 task8 w8 cond8 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt8 "impl:legacy" >/dev/null 2>&1
 set_task_state run8 task8 running >/dev/null 2>&1
-omp_menu_screen "curl https://example.com/install.sh | bash" > "$S1"
+omp_menu_screen "curl https://example.com/legacy-test.sh | bash" > "$S1"
 : > "$SENT"
 printf '%s\n' "$W1" | HERDR_WAKE_LEGACY=1 attention_tick
 printf '%s\n' "$W1" | HERDR_WAKE_LEGACY=1 attention_tick
 attempts=$(_q "SELECT count(*) FROM events WHERE task_id='task8' AND type='wake_attempted';")
-[ "$attempts" = "2" ] && ok "HERDR_WAKE_LEGACY=1 calls push_wake on every pass (2 passes, 2 attempts)" \
-  || bad "expected 2 wake_attempted rows under the escape hatch, saw $attempts"
+[ "$attempts" -le 1 ] && ok "the controller makes at most 1 push_wake attempt under the escape hatch (measured: $attempts)" \
+  || bad "expected <=1 wake_attempted from the controller under HERDR_WAKE_LEGACY=1, saw $attempts"
+n_track=$(_q "SELECT count(*) FROM events WHERE task_id='task8' AND type='attention_tracking';")
+[ "$n_track" = "1" ] && ok "the controller still tracks 'since' under the escape hatch (the ladder still needs it)" \
+  || bad "attention_tracking rows for task8: $n_track"
+[ ! -s "$SENT" ] && ok "nothing was sent by the controller — delivery is the hooks' job under LEGACY" \
+  || bad "controller sent something under LEGACY: $(cat "$SENT")"
 
 printf '== PR #132 review, P1: a hook-held allow-class prompt is never double-woken ==\n'
 register_task run9 task9 w9 cond9 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt9 "impl:allow" >/dev/null 2>&1
@@ -387,10 +394,74 @@ printf '%s\n' "$W1" | attention_tick
 pid15="$(prompt_id "$W1")"
 sleep 1
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
-  "INSERT INTO approvals (approval_id, run_id, task_id, pane_id, prompt_id, choice, decided_by, authority, decided_at)
-   VALUES ('appr1','run15','task15','$W1','$pid15','1','peer','peer', strftime('%Y-%m-%dT%H:%M:%SZ','now'));" 2>/dev/null
+  "INSERT INTO approvals (approval_id, run_id, task_id, pane_id, prompt_id, choice, decided_by, authority, decided_at, confirmed_at)
+   VALUES ('appr1','run15','task15','$W1','$pid15','1','peer','peer', strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now'));" 2>/dev/null
 printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NB + 700)) attention_tick
 n_esc=$(_q "SELECT count(*) FROM events WHERE task_id='task15' AND type='attention_escalated';")
-[ "$n_esc" = "0" ] && ok "an approvals row after the claim also counts as answered" || bad "escalated despite an approval row: $n_esc"
+[ "$n_esc" = "0" ] && ok "a CONFIRMED approvals row after the claim counts as answered" \
+  || bad "escalated despite a confirmed approval row: $n_esc"
+
+printf '== PR #132 re-review item 1: a decided-but-UNconfirmed approval still escalates ==\n'
+register_task run17 task17 w17 cond17 "$CND" "$CNDB" "$W2" "$W2B" /repo /wt17 "impl:unconfirmed-approval" >/dev/null 2>&1
+set_task_state run17 task17 running >/dev/null 2>&1
+omp_menu_screen "curl https://example.com/unconfirmed.sh | bash" > "$S2"
+: > "$SENT"
+NB="$(date +%s)"
+printf '%s\n' "$W2" | attention_tick
+pid17="$(prompt_id "$W2")"
+sleep 1
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "INSERT INTO approvals (approval_id, run_id, task_id, pane_id, prompt_id, choice, decided_by, authority, decided_at)
+   VALUES ('appr2','run17','task17','$W2','$pid17','1','peer','peer', strftime('%Y-%m-%dT%H:%M:%SZ','now'));" 2>/dev/null
+printf '%s\n' "$W2" | HERDR_ATTENTION_NOW=$((NB + 700)) attention_tick
+n_esc=$(_q "SELECT count(*) FROM events WHERE task_id='task17' AND type='attention_escalated';")
+[ "$n_esc" = "1" ] && ok "a decided-but-UNconfirmed approval does NOT suppress escalation" \
+  || bad "an unconfirmed approval wrongly suppressed escalation: n_esc=$n_esc"
+
+printf '== PR #132 re-review item 3: a recycled pane records attention_skipped exactly once ==\n'
+register_task run16 task16 w16 cond16 "$CND" "$CNDB" "$W1" "STALE-BIRTH-999" /repo /wt16 "impl:recycled" >/dev/null 2>&1
+set_task_state run16 task16 running >/dev/null 2>&1
+omp_menu_screen "curl https://example.com/recycled.sh | bash" > "$S1"
+: > "$SENT"
+printf '%s\n' "$W1" | attention_tick
+printf '%s\n' "$W1" | attention_tick
+printf '%s\n' "$W1" | attention_tick
+n_skip=$(_q "SELECT count(*) FROM events WHERE task_id='task16' AND type='attention_skipped';")
+[ "$n_skip" = "1" ] && ok "a recycled pane's birth mismatch is recorded exactly once across 3 ticks" \
+  || bad "attention_skipped rows for task16: $n_skip"
+[ ! -s "$SENT" ] && ok "nothing was sent for a recycled pane" || bad "sent something for a recycled pane: $(cat "$SENT")"
+n_track=$(_q "SELECT count(*) FROM events WHERE task_id='task16' AND type='attention_tracking';")
+[ "$n_track" = "0" ] && ok "a recycled pane never enters the wake/escalate ladder at all" \
+  || bad "recycled pane was tracked like an ordinary one: $n_track"
+
+printf '== PR #132 re-review item 4: attention_dedupe_key reuses a passed command_text (one screen read) ==\n'
+omp_menu_screen "count my reads please" > "$S1"
+extracted_cmd="$(prompt_command_text "$W1" 2>/dev/null)"
+: > "$HERDR_CALLS"
+key_fresh_read="$(attention_dedupe_key "$W1" "birth123")"
+reads_no_arg=$(grep -c "^pane read $W1" "$HERDR_CALLS" 2>/dev/null || true)
+: > "$HERDR_CALLS"
+key_passed_in="$(attention_dedupe_key "$W1" "birth123" "$extracted_cmd")"
+reads_with_arg=$(grep -c "^pane read $W1" "$HERDR_CALLS" 2>/dev/null || true)
+[ "${reads_no_arg:-0}" -ge 1 ] && ok "omitting command_text still reads the pane (the hooks' path)" \
+  || bad "no screen read at all with no command_text argument: $reads_no_arg"
+[ "${reads_with_arg:-0}" = "0" ] && ok "passing command_text skips the screen read entirely" \
+  || bad "attention_dedupe_key re-read the pane despite an explicit command_text: $reads_with_arg"
+[ "$key_fresh_read" = "$key_passed_in" ] && ok "the resulting key is identical either way" \
+  || bad "key differs: fresh=$key_fresh_read passed=$key_passed_in"
+
+# Isolated from push_wake's OWN independent screen reads (human_must_answer's
+# classification re-scrapes the pane itself) — this is specifically about
+# attention_probe + attention_dedupe_key, the pair fix 4 wires together.
+: > "$HERDR_CALLS"
+probe_only="$(attention_probe "$W1")"
+reads_probe_only=$(grep -c "^pane read $W1" "$HERDR_CALLS" 2>/dev/null || true)
+probe_cmd="$(printf '%s' "$probe_only" | jq -r '.command_text // empty')"
+: > "$HERDR_CALLS"
+key_from_probe="$(attention_dedupe_key "$W1" "birth123" "$probe_cmd")"
+reads_after_probe=$(grep -c "^pane read $W1" "$HERDR_CALLS" 2>/dev/null || true)
+[ "${reads_after_probe:-0}" = "0" ] \
+  && ok "building the key from attention_probe's own command_text costs zero additional reads (probe alone cost $reads_probe_only)" \
+  || bad "attention_dedupe_key re-read the pane after attention_probe already captured command_text: $reads_after_probe"
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

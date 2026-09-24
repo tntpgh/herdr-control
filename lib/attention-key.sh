@@ -6,7 +6,12 @@
 # independent computations of "the same key" is exactly how they drift, and a
 # drifted key is a dedupe that silently stops deduping.
 #
-# Provides: attention_dedupe_key <pane_id> [registered_birth] -> key
+# Provides: attention_dedupe_key <pane_id> [registered_birth] [command_text] -> key
+#             command_text omitted -> reads prompt_command_text itself (the
+#             hooks' path, which have no reason to have read it already);
+#             passed explicitly (even "") -> reused as-is, so a caller that
+#             already has it (attention_tick, via attention_probe) spends
+#             exactly one screen read, not two, on the same pane.
 #           attn_track_claim <pane_id> <run_id> <task_id> [prompt_id]
 #             -> 0 if THIS call owns delivery (fresh claim, or
 #                HERDR_WAKE_LEGACY=1), 1 if someone else already does.
@@ -27,9 +32,13 @@ _HERDR_ATTENTION_KEY_SH=1
 # prompt_command_text, whitespace-collapsed, is the semantic command — stable
 # across a repaint of the identical prompt, and still identifies a genuinely
 # NEW question (different command) as a different key.
-attention_dedupe_key() {                # pane_id [registered_birth] -> key
+attention_dedupe_key() {                # pane_id [registered_birth] [command_text] -> key
   local pane="$1" birth="${2:-}" cmd cmd_norm cmd_hash
-  cmd="$(prompt_command_text "$pane" 2>/dev/null)"
+  if [ "$#" -ge 3 ]; then
+    cmd="$3"
+  else
+    cmd="$(prompt_command_text "$pane" 2>/dev/null)"
+  fi
   cmd_norm="$(printf '%s' "$cmd" | tr -s '[:space:]' ' ' | sed -E 's/^ +| +$//')"
   cmd_hash="$(printf '%s' "$cmd_norm" | shasum -a 256 2>/dev/null | cut -d' ' -f1)"
   printf '%s__%s__%s\n' "$pane" "${birth:-nobirth}" "${cmd_hash:-nohash}"

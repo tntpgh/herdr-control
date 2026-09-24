@@ -141,11 +141,15 @@
 # (the common case — role addressing with an automatic fingerprint is item 4
 # of the plan doc, not yet built). Refuses only on a POSITIVE mismatch.
 : "${HERDR_MAIN_PANE_BIRTH:=}"
-# Rollback switch: 1 restores the pre-controller shape everywhere it applies
-# — the controller calls push_wake on every pass for a still-blocked prompt
-# instead of at most once, AND agent-hooks/omp-notify.sh /
+# Delivery-only rollback: 1 makes agent-hooks/omp-notify.sh and
 # agent-hooks/claude-notify.sh call push_wake on every firing again instead
-# of claiming attn_track_<key> first.
+# of claiming attn_track_<key> first (the pre-controller shape). The
+# controller itself NEVER calls push_wake under this flag either way — it
+# still tracks "since" for the escalate/form ladder, but delivery is the
+# hooks' job again, exactly as before this file existed. To disable the
+# controller entirely (no tracking, no escalation, no form), start the hub
+# with --no-attention instead; that is the full rollback, this is a
+# narrower one.
 : "${HERDR_WAKE_LEGACY:=0}"
 
 # ============================================================================

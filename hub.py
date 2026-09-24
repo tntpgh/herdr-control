@@ -1479,8 +1479,24 @@ ATTENTION_INTERVAL_S = float(os.environ.get("HERDR_ATTENTION_INTERVAL_S", "15") 
 # Same shape as MIRROR_STATE: a dead or failing tick must be VISIBLE (PR #132
 # review, item 7) rather than reading as a healthy silent thread forever.
 ATTENTION_STATE: dict = {"ticks": 0, "last_ok": None, "last_error": None,
-                         "last_rc": None, "last_stderr": ""}
+                         "last_rc": None, "last_stderr": "", "skipped_recycled_panes": 0}
 
+
+def _attention_skipped_count() -> int:
+    """How many distinct (pane, registered, live) recycled-pane skips the
+    controller has ever recorded. PR #132 re-review item 3: a birth mismatch
+    used to just `continue` silently in attention-tick.sh; it is now a
+    claimed `attention_skipped` event, and this is what surfaces that count
+    on /api/summary instead of it living only in the registry."""
+    try:
+        conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+        try:
+            row = conn.execute("SELECT count(*) FROM events WHERE type='attention_skipped';").fetchone()
+        finally:
+            conn.close()
+        return int(row[0]) if row else 0
+    except sqlite3.Error:
+        return 0
 
 def _attention_tick() -> None:
     """One pass: hand the controller the CURRENTLY blocked pane ids from
@@ -1517,6 +1533,7 @@ def _attention_tick() -> None:
             tail = ATTENTION_STATE["last_stderr"][-300:]
             ATTENTION_STATE["last_error"] = f"exit {result.returncode}: {tail}"
             _live_log(f"attention tick exit {result.returncode}: {tail}")
+        ATTENTION_STATE["skipped_recycled_panes"] = _attention_skipped_count()
     except (OSError, subprocess.SubprocessError) as exc:
         ATTENTION_STATE["ticks"] += 1
         ATTENTION_STATE["last_error"] = f"{type(exc).__name__}: {exc}"

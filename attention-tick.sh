@@ -111,8 +111,8 @@ attention_probe() {
   cmd="$(prompt_command_text "$pane" 2>/dev/null)"
   reserved="$(conductor_reserved_reason "$cmd" 2>/dev/null)"
   verdict="$(classify_command "$cmd" 2>/dev/null)" || verdict="escalate"
-  jq -nc --arg pid "$pid" --arg r "$reserved" --arg v "$verdict" \
-    '{visible:true, prompt_id:$pid, reserved:$r, verdict:$v}'
+  jq -nc --arg pid "$pid" --arg r "$reserved" --arg v "$verdict" --arg cmd "$cmd" \
+    '{visible:true, prompt_id:$pid, reserved:$r, verdict:$v, command_text:$cmd}'
 }
 
 # Has push_wake ALREADY owned this exact prompt — held it, attempted a
@@ -144,22 +144,26 @@ _attn_wake_owned() {                    # run_id task_id prompt_id -> 0 if owned
 # claim's timestamp — that stability is what makes the T+10/T+20 windows
 # measure from a fixed point instead of resetting on every pass.
 #
-# HERDR_WAKE_LEGACY=1 is the rollback: push_wake is called on EVERY pass for
-# a still-open prompt, exactly the pre-controller shape (a claim is still
-# made, best-effort, so the ladder still has a "since" to measure from — the
-# escape hatch restores push_wake's per-pass behavior, not the absence of a
-# ladder).
+# HERDR_WAKE_LEGACY=1 does NOT make the controller call push_wake on every
+# pass (PR #132 re-review item 2 — that was the ORIGINAL cut, and it was
+# wrong: it meant BOTH the controller and every hook firing could call
+# push_wake for the same still-open prompt, which is the double-wake this
+# whole file exists to prevent). Under the escape hatch the controller still
+# claims "since" (the ladder needs it) but NEVER calls push_wake itself —
+# delivery is entirely the hooks' job again, exactly the pre-controller
+# shape, because agent-hooks/omp-notify.sh and agent-hooks/claude-notify.sh
+# also bypass their OWN claim under HERDR_WAKE_LEGACY=1 (lib/attention-key.sh
+# attn_track_claim) and call push_wake on every firing. To disable the
+# controller ENTIRELY instead — no tracking, no escalation, no form, hooks
+# and Slack exactly as before this file existed — start the hub with
+# `--no-attention`; that is the full rollback, HERDR_WAKE_LEGACY=1 is a
+# narrower one (delivery only).
 _attn_track_and_wake() {                # run_id task_id pane conductor_pane_id label pid key -> since (ISO), stdout
   local run_id="$1" task_id="$2" pane="$3" conductor_pane_id="$4" label="$5" pid="$6" key="$7"
   local eid="attn_track_${key}" claimed=1
   local payload; payload="$(jq -nc --arg p "$pane" --arg k "$key" --arg pid "$pid" '{pane:$p, key:$k, prompt_id:$pid}')"
-  if [ "${HERDR_WAKE_LEGACY:-0}" = "1" ]; then
-    claim_once "$eid" "$run_id" "$task_id" "attention_tracking" "$payload" || true
-  else
-    claim_once "$eid" "$run_id" "$task_id" "attention_tracking" "$payload" || claimed=0
-  fi
-  if [ "${HERDR_WAKE_LEGACY:-0}" = "1" ] \
-     || { [ "$claimed" = "1" ] && ! _attn_wake_owned "$run_id" "$task_id" "$pid"; }; then
+  claim_once "$eid" "$run_id" "$task_id" "attention_tracking" "$payload" || claimed=0
+  if [ "${HERDR_WAKE_LEGACY:-0}" != "1" ] && [ "$claimed" = "1" ] && ! _attn_wake_owned "$run_id" "$task_id" "$pid"; then
     HERDR_RUN_ID="$run_id" HERDR_TASK_ID="$task_id" HERDR_PANE_ID="$pane" \
       HERDR_CONDUCTOR_PANE_ID="$conductor_pane_id" HERDR_TASK_LABEL="${label:-$task_id}" \
       push_wake "${label:-$task_id} needs input" "attention-controller" >/dev/null 2>&1 || true
@@ -270,6 +274,14 @@ _attn_maybe_form() {                    # run_id task_id pane key reason
 # and the EXISTING `approvals` table (herdr-select.sh writes a row on every
 # decision, human or peer) both qualify — anything timestamped after the
 # tracking claim means someone already acted on this exact prompt.
+#
+# An approvals row only counts once `confirmed_at IS NOT NULL` (PR #132
+# re-review item 1): `decided_at` alone means a choice was RECORDED, not that
+# it was delivered — the same three-phase distinction push_wake's own
+# wake_attempted/wake_result split exists for (lib/run-registry.sh's approvals
+# table comment: "decision recorded / delivery attempted / delivery
+# confirmed-or-timed-out"). Treating a decided-but-unconfirmed row as answered
+# would suppress escalation for a choice that never actually reached the pane.
 _attn_answered_since() {                # pane_id prompt_id since_iso -> 0 if answered
   local pane="$1" pid="$2" since_iso="$3" n
   [ -n "$pid" ] || return 1
@@ -279,7 +291,8 @@ _attn_answered_since() {                # pane_id prompt_id since_iso -> 0 if an
     AND occurred_at > $(_sq "$since_iso");" 2>/dev/null)"
   [ "${n:-0}" -gt 0 ] && return 0
   n="$(_sql "SELECT count(*) FROM approvals WHERE pane_id=$(_sq "$pane")
-    AND prompt_id=$(_sq "$pid") AND decided_at > $(_sq "$since_iso");" 2>/dev/null)"
+    AND prompt_id=$(_sq "$pid") AND decided_at > $(_sq "$since_iso")
+    AND confirmed_at IS NOT NULL;" 2>/dev/null)"
   [ "${n:-0}" -gt 0 ]
 }
 
@@ -305,7 +318,7 @@ attention_tick() {
     visible="$(printf '%s' "$probe" | jq -r '.visible')"
     [ "$visible" = "true" ] || continue # answered/unreadable: nothing pending right now
 
-    local run_id task_id conductor_pane_id label pid reserved verdict
+    local run_id task_id conductor_pane_id label pid reserved verdict cmd
     run_id="$(printf '%s' "$task" | jq -r '.run_id')"
     task_id="$(printf '%s' "$task" | jq -r '.task_id')"
     conductor_pane_id="$(printf '%s' "$task" | jq -r '.conductor_pane_id // empty')"
@@ -313,18 +326,29 @@ attention_tick() {
     pid="$(printf '%s' "$probe" | jq -r '.prompt_id')"
     reserved="$(printf '%s' "$probe" | jq -r '.reserved')"
     verdict="$(printf '%s' "$probe" | jq -r '.verdict')"
+    cmd="$(printf '%s' "$probe" | jq -r '.command_text // empty')"
 
     # Registered pane_birth, never a fresh live read (key drift, PR #132
     # review item 2 — an unreadable live sample must not change the key), and
     # refuse only on a POSITIVE mismatch: the pane was recycled since this
-    # task registered, so nothing left to say about it here.
+    # task registered, so nothing left to say about it here. Recorded once
+    # per (pane, registered, live) triple — not silently, PR #132 re-review
+    # item 3 — so a fleet of recycled panes is visible instead of a quiet
+    # `continue` nobody can query.
     local registered_birth live_birth key
     registered_birth="$(printf '%s' "$task" | jq -r '.pane_birth // empty')"
     live_birth="$(pane_birth_now "$pane" 2>/dev/null)"
     if [ -n "$registered_birth" ] && [ -n "$live_birth" ] && [ "$registered_birth" != "$live_birth" ]; then
+      claim_once "attn_skip_${pane}_${registered_birth}_${live_birth}" "$run_id" "$task_id" "attention_skipped" \
+        "$(jq -nc --arg p "$pane" --arg reg "$registered_birth" --arg live "$live_birth" \
+           '{pane:$p, registered_birth:$reg, live_birth:$live, reason:"pane recycled since registration"}')" \
+        >/dev/null 2>&1 || true
       continue
     fi
-    key="$(attention_dedupe_key "$pane" "$registered_birth")"
+    # One screen read, not two: attention_probe already read prompt_command_text
+    # for classification (PR #132 re-review item 4) — reuse it here instead of
+    # letting attention_dedupe_key read the pane again itself.
+    key="$(attention_dedupe_key "$pane" "$registered_birth" "$cmd")"
 
     if [ -n "$reserved" ] || [ "$verdict" = "deny" ]; then
       _attn_maybe_form "$run_id" "$task_id" "$pane" "$key" "reserved-or-deny: ${reserved:-$verdict}"
