@@ -1143,6 +1143,64 @@ check_reserved "lowercase printenv still dumps"               "printenv"
 check_unreserved "JS env.KEY member access still allowed"     "env.KB_API_KEY"
 
 echo
+echo "== round 5f: interpreter inline code — no JS exemptions, plus process/os/heredoc =="
+# CRITICAL, found by a fresh review of d15586e and confirmed live with a
+# marker var: node -e "const {env: e} = process; console.log(e)" auto-
+# approved because exemption 3 ('env:', for a JS object literal like
+# `{ env: x }`) also matches Ruby-style destructuring of the REAL
+# environment. Heredoc/here-string bodies fed to an interpreter were
+# also never scanned at all. Fix: inside interpreter inline code (a
+# node/python/ruby/perl/php/lua/osascript -e/-p/-c/-r/--eval/--print
+# payload, or a kept heredoc/here-string body fed to one), NONE of the
+# 5 JS exemptions apply; a bare `process` (JS) or `os` (Python) is
+# ALSO a dump, closing the obfuscated-access gap (`process['e'+'nv']`,
+# `require("process")`) a literal-word scan alone cannot.
+check_reserved "destructure env from process (the live CRITICAL)" \
+  "node -e \"const {env: e} = process; console.log(e)\""
+check "destructure env from process escalates" \
+  "node -e \"const {env: e} = process; console.log(e)\"" escalate
+check_reserved "destructure via require(process)" \
+  "node -e \"const { env: e } = require(\\\"process\\\"); console.log(JSON.stringify(e))\""
+check_reserved "let-destructure, no spaces" \
+  "node -e \"let {env:x}=process;console.log(x)\""
+check_reserved "string-concat obfuscated member access" \
+  "node -e \"console.log(process['e'+'nv'])\""
+node_heredoc_destructure="$(printf "node <<'EOF'\nconst {env: e} = process; console.log(e)\nEOF")"
+check_reserved "heredoc body: node destructures env from process" "$node_heredoc_destructure"
+python_heredoc_environ="$(printf "python3 - <<'EOF'\nimport os; print(dict(os.environ))\nEOF")"
+check_reserved "heredoc body: python3 - dumps os.environ" "$python_heredoc_environ"
+node_heredoc_obfuscated="$(printf "node <<'EOF'\nconsole.log(process['e'+'nv'])\nEOF")"
+check_reserved "heredoc body: node obfuscated process access" "$node_heredoc_obfuscated"
+check_reserved "bare process.argv in inline JS is reserved too" \
+  "node -e \"console.log(process.argv)\""
+check "bare process.argv in inline JS escalates" \
+  "node -e \"console.log(process.argv)\"" escalate
+check_reserved "here-string feeds os.environ to python3" \
+  'python3 <<< "import os; print(os.environ)"'
+check_reserved "shorthand destructure {env} from process" \
+  "node -e \"const {env} = process; console.log(env)\""
+# Must STAY allowed: inline code with no process/os/env word at all,
+# and test source written through a NON-interpreter heredoc (cat),
+# where the JS exemptions still apply because the body is never even
+# kept for scanning.
+check_unreserved "inline node reading package.json, no process/env" \
+  "node -e \"console.log(require('./package.json').version)\""
+check "inline node reading package.json allows" \
+  "node -e \"console.log(require('./package.json').version)\"" allow
+check_unreserved "inline python parsing stdin json, no os/env" \
+  "python3 -c \"import json,sys; print(json.load(sys.stdin)['a'])\""
+node_heredoc_clean="$(printf "node <<'EOF'\nconsole.log(1+1)\nEOF")"
+check_unreserved "heredoc body: node arithmetic, no process/env" "$node_heredoc_clean"
+check "heredoc body: node arithmetic allows" "$node_heredoc_clean" allow
+cat_heredoc_testcode="$(printf 'cat > t.test.js <<'"'"'EOF'"'"'\nconst env = { KB_API_KEY: "kb-secret" };\nEOF')"
+check_unreserved "test code through a cat heredoc keeps JS exemptions" "$cat_heredoc_testcode"
+check "test code through a cat heredoc allows" "$cat_heredoc_testcode" allow
+# Regression pins: interpreter detection must not fire on real, unrelated
+# uses of these binaries already covered by other rules.
+check "perl -e with unrelated content stays allow" "perl -e 'print 1' /tmp/p.json" allow
+check "node --eval with unrelated content stays allow" "node --eval 'x' /tmp/p.json" allow
+
+echo
 echo "== round 5, section D: secret-named \$VAR expansion (the worst finding) =="
 # 2026-09-19: a live token was echoed into a session transcript this
 # exact way and had to be rotated. Any \$NAME/\${NAME...} where NAME

@@ -723,12 +723,17 @@ _cp_strip_heredocs() {
         printf '%s' "$line" | grep -qE '<<-' && strip_tabs=1
         # "Feeds a shell" = the text BEFORE this line's first << names a
         # shell binary (bash/sh/zsh/dash/ksh/ash), e.g. `bash <<EOF` or
-        # `sh <<'EOF'`. Anything else (cat, tee, a custom function we can't
-        # see inside) is treated as inert — a real limitation of a static
-        # text scanner, not a parser, documented rather than hidden.
+        # `sh <<'EOF'`. Round 5f: an interpreter (node/nodejs/bun/deno/
+        # ruby/perl/php/lua/osascript, or python*/pypy* including bare
+        # `python3 -`) ALSO executes its heredoc body as code, not data —
+        # `node <<EOF ... EOF` runs the body as JS the same way `bash
+        # <<EOF` runs it as shell. Anything else (cat, tee, a custom
+        # function we can't see inside) is treated as inert — a real
+        # limitation of a static text scanner, not a parser, documented
+        # rather than hidden.
         keep_body=0
         prefix="${line%%<<*}"
-        printf '%s' "$prefix" | grep -qE '\b(bash|sh|zsh|dash|ksh|ash)\b' && keep_body=1
+        printf '%s' "$prefix" | grep -qE '\b(bash|sh|zsh|dash|ksh|ash|node|nodejs|bun|deno|ruby|perl|php|osascript)\b|\bpython[0-9.]*\b|\bpypy[0-9.]*\b|\blua[0-9.]*\b' && keep_body=1
       fi
     fi
   done <<CPEOF
@@ -888,8 +893,24 @@ _cp_flatten_substitutions() {
 # this word scan now that it's case-insensitive again, but kept: it is
 # also what catches `getenv()`/`ENVIRON`, which never contain the word
 # `env` as a standalone token at all.
-_cp_envdump_word_is_dump() {            # norm -> 0 (true) if it dumps env/printenv, anywhere but the 5 exemptions
-  printf '%s' "$1" | awk '
+# Round 5f: takes a second argument, NOEXEMPT — when "1", none of the 5
+# exemptions below apply at all. Interpreter inline code (a node/
+# python/ruby/etc -e payload, or a kept heredoc/here-string body fed to
+# one) is what sets it: the conductor found `node -e "const {env: e} =
+# process; ..."` auto-approving because exemption 3 (`env:` — meant for
+# a JS object literal like `{ env: x }`) also matches Ruby-style
+# destructuring of the REAL environment. A dot/colon/equals/const-let-
+# var/call shape means nothing about safety once the surrounding text
+# is itself about to be handed to an interpreter as code.
+# Also fixed here: this ran per INPUT LINE with no accumulator, so a
+# multi-line heredoc body (now kept, round 5f) printed one verdict per
+# line instead of one for the whole command — `env` living on the
+# heredoc's second line printed "0\n1", which `[ "$out" = 1 ]` in the
+# caller reads as false. Wrapped in BEGIN/END so the whole multi-line
+# input is one scan; single-line input (everything before round 5f)
+# is unaffected, since one line was always the whole scan anyway.
+_cp_envdump_word_is_dump() {            # norm [noexempt] -> 0 (true) if it dumps env/printenv, anywhere but the 5 exemptions
+  printf '%s' "$1" | awk -v NOEXEMPT="${2:-0}" '
     function is_ident(c) { return (c ~ /[A-Za-z0-9_]/) }
     function is_call_char(c) { return (c ~ /[]A-Za-z0-9_.]/) }
     function nearest_unmatched_open(line, uptoPos,    depth, k, ch) {
@@ -914,30 +935,32 @@ _cp_envdump_word_is_dump() {            # norm -> 0 (true) if it dumps env/print
         if (before != "" && is_ident(before)) { i++; continue }
         if (after  != "" && is_ident(after))  { i++; continue }
         exempt = 0
-        if (after == ".") exempt = 1
-        if (!exempt) {
-          j = i + wlen
-          while (substr(line, j, 1) == " " || substr(line, j, 1) == "\t") j++
-          nxt = substr(line, j, 1); nxt2 = substr(line, j + 1, 1)
-          if (nxt == "=" && nxt2 != "=") exempt = 1
-          else if (nxt == ":") exempt = 1
-        }
-        if (!exempt) {
-          if (substr(line, i - 6, 6) == "const ") exempt = 1
-          else if (substr(line, i - 4, 4) == "let ") exempt = 1
-          else if (substr(line, i - 4, 4) == "var ") exempt = 1
-        }
-        if (!exempt) {
-          popen = nearest_unmatched_open(line, i)
-          if (popen > 0) {
-            pchar = (popen > 1) ? substr(line, popen - 1, 1) : ""
-            if (pchar != "" && is_call_char(pchar)) {
-              between = substr(line, popen + 1, i - popen - 1)
-              if (between !~ /[;&|`]/ && index(between, "$(") == 0) {
-                k = i + wlen
-                while (substr(line, k, 1) == " " || substr(line, k, 1) == "\t") k++
-                fchar = substr(line, k, 1)
-                if (fchar == ")" || fchar == ",") exempt = 1
+        if (NOEXEMPT != "1") {
+          if (after == ".") exempt = 1
+          if (!exempt) {
+            j = i + wlen
+            while (substr(line, j, 1) == " " || substr(line, j, 1) == "\t") j++
+            nxt = substr(line, j, 1); nxt2 = substr(line, j + 1, 1)
+            if (nxt == "=" && nxt2 != "=") exempt = 1
+            else if (nxt == ":") exempt = 1
+          }
+          if (!exempt) {
+            if (substr(line, i - 6, 6) == "const ") exempt = 1
+            else if (substr(line, i - 4, 4) == "let ") exempt = 1
+            else if (substr(line, i - 4, 4) == "var ") exempt = 1
+          }
+          if (!exempt) {
+            popen = nearest_unmatched_open(line, i)
+            if (popen > 0) {
+              pchar = (popen > 1) ? substr(line, popen - 1, 1) : ""
+              if (pchar != "" && is_call_char(pchar)) {
+                between = substr(line, popen + 1, i - popen - 1)
+                if (between !~ /[;&|`]/ && index(between, "$(") == 0) {
+                  k = i + wlen
+                  while (substr(line, k, 1) == " " || substr(line, k, 1) == "\t") k++
+                  fchar = substr(line, k, 1)
+                  if (fchar == ")" || fchar == ",") exempt = 1
+                }
               }
             }
           }
@@ -945,8 +968,10 @@ _cp_envdump_word_is_dump() {            # norm -> 0 (true) if it dumps env/print
         if (!exempt) found = 1
         i += wlen
       }
-      print (found ? "1" : "0")
-    }'
+      if (found) anyfound = 1
+    }
+    END { print (anyfound ? "1" : "0") }
+  '
 }
 
 # ---- env dumps that never spell "env" -------------------------------------
@@ -979,14 +1004,64 @@ _CP_ENVDUMP_PS_RE='\bps[[:space:]]+([A-Za-z]*e[A-Za-z]*\b|-[A-Za-z]*E[A-Za-z]*)'
 _CP_ENVDUMP_GETENV_RE='\bgetenv\b|\bENVIRON\b'
 _CP_ENVDUMP_ENV_HASH_RE='\bENV[[:space:]]*[.[{]|[%$]ENV\b'
 
+# Round 5f: "interpreter inline code" — a node/python/ruby/perl/php/
+# lua/osascript payload run via -e/-p/--eval/--print/-c/-r, or a kept
+# heredoc/here-string body (see the keep_body list above) fed to one
+# of them. The word scan's 5 JS-object-literal exemptions (dot/colon/
+# equals/const-let-var/call-context) are shaped for JS SOURCE sitting
+# INERT in an outer shell command — `const env = {}` typed in a chat
+# message, `fetch(req, env)` typed in a code review comment. Once that
+# text is the ACTUAL PAYLOAD handed to an interpreter, the same shapes
+# mean something else: `{ env: e } = process` is destructuring the
+# real environment, not declaring an object key. So none of the 5
+# apply inside this region — enforced by threading NOEXEMPT into
+# `_cp_envdump_word_is_dump` below, not by a second parallel rule.
+# Two more keyword checks close the two gaps a bare env/printenv/ENV
+# scan cannot: obfuscated member access (`process['e'+'nv']` never
+# contains the substring "env" at all) and `require("process")`/
+# `os.getenv` naming the ACCESSOR, not the data, so the word scan
+# never sees "env" there either. Deliberately blunt: ANY `process` in
+# inline JS, or ANY `os` in inline Python, is a dump — the conductor's
+# call (round 5f design) is that a human should look at inline
+# interpreter code touching either at all, not that this scanner
+# should try to prove intent.
+_CP_JS_INLINE_RE='\b(node|nodejs|bun|deno)\b[^;&|]*[[:space:]](-e|-p|--eval|--print)\b|\bdeno[[:space:]]+eval\b'
+_CP_JS_HEREDOC_RE='\b(node|nodejs|bun|deno)\b[^;&|<]*<<<?'
+_CP_PY_INLINE_RE='\b(python[0-9.]*|pypy[0-9.]*)\b[^;&|]*[[:space:]]-c\b'
+_CP_PY_HEREDOC_RE='\b(python[0-9.]*|pypy[0-9.]*)\b[^;&|<]*<<<?'
+_CP_RUBYPERL_INLINE_RE='\bruby\b[^;&|]*[[:space:]]-e\b|\bperl\b[^;&|]*[[:space:]](-e|-E)\b'
+_CP_RUBYPERL_HEREDOC_RE='\b(ruby|perl)\b[^;&|<]*<<<?'
+_CP_OTHER_INLINE_RE='\bphp\b[^;&|]*[[:space:]]-r\b|\blua[0-9.]*\b[^;&|]*[[:space:]]-e\b|\bosascript\b[^;&|]*[[:space:]]-e\b'
+_CP_OTHER_HEREDOC_RE='\b(php|lua[0-9.]*|osascript)\b[^;&|<]*<<<?'
+
+_cp_js_inline_code() {         # norm -> 0 (true) if a JS runtime is running inline code
+  _cp_match "$_CP_JS_INLINE_RE" "$1" || _cp_match "$_CP_JS_HEREDOC_RE" "$1"
+}
+_cp_python_inline_code() {     # norm -> 0 (true) if python/pypy is running inline code
+  _cp_match "$_CP_PY_INLINE_RE" "$1" || _cp_match "$_CP_PY_HEREDOC_RE" "$1"
+}
+_cp_rubyperl_inline_code() {   # norm -> 0 (true) if ruby/perl is running inline code
+  _cp_match "$_CP_RUBYPERL_INLINE_RE" "$1" || _cp_match "$_CP_RUBYPERL_HEREDOC_RE" "$1"
+}
+_cp_other_inline_code() {      # norm -> 0 (true) if php/lua/osascript is running inline code
+  _cp_match "$_CP_OTHER_INLINE_RE" "$1" || _cp_match "$_CP_OTHER_HEREDOC_RE" "$1"
+}
+_cp_any_interpreter_inline_code() {   # norm -> 0 (true) if ANY of the above
+  _cp_js_inline_code "$1" || _cp_python_inline_code "$1" || \
+    _cp_rubyperl_inline_code "$1" || _cp_other_inline_code "$1"
+}
+
 _cp_env_dump_invoked() {                # raw -> 0 (true) if env/printenv is invoked to dump the environment
-  local raw="$1" norm
+  local raw="$1" norm noexempt=0
   norm="$(scannable_command "$raw")"
-  [ "$(_cp_envdump_word_is_dump "$norm")" = 1 ] && return 0
+  _cp_any_interpreter_inline_code "$norm" && noexempt=1
+  [ "$(_cp_envdump_word_is_dump "$norm" "$noexempt")" = 1 ] && return 0
   _cp_imatch "$_CP_ENVDUMP_OTHER_RE" "$norm" && return 0
   _cp_imatch "$_CP_ENVDUMP_GETENV_RE" "$norm" && return 0
   _cp_match "$_CP_ENVDUMP_ENV_HASH_RE" "$norm" && return 0
   _cp_match "$_CP_ENVDUMP_PS_RE" "$norm" && return 0
+  _cp_js_inline_code "$norm" && _cp_match '\bprocess\b' "$norm" && return 0
+  _cp_python_inline_code "$norm" && _cp_match '\bos\b' "$norm" && return 0
   return 1
 }
 
