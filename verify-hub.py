@@ -712,6 +712,111 @@ class HandoffDebt(unittest.TestCase):
                          ["c", "b", "a"])
 
 
+class DeployDrift(unittest.TestCase):
+    """The hub ran 3417af0 for hours while origin/main had fixes ahead of it,
+    and nobody noticed until someone was debugging something else — the same
+    deployed-sha-vs-origin/main comparison `restart.sh --verify` already
+    makes (`app_rev`/`app_rev_sha`, launchd/agent-lib.sh), read on a schedule
+    instead of by hand. `origin` here is a LOCAL path (git clone sets it up
+    automatically), so `deploy_drift_data`'s one network call — `git fetch` —
+    never touches the network in this suite.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _repo(self, name):
+        path = Path(self.tmp.name) / name
+        path.mkdir()
+        for args in (["init", "-q", "-b", "main"], ["config", "user.email", "t@example.com"],
+                    ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True)
+        return path
+
+    def _commit(self, path, message, when=None):
+        (path / "f.txt").write_text(message)
+        env = dict(os.environ)
+        if when is not None:                    # controls the COMMIT time, not creation order
+            iso = when.strftime("%Y-%m-%d %H:%M:%S +0000")
+            env["GIT_AUTHOR_DATE"] = iso
+            env["GIT_COMMITTER_DATE"] = iso
+        subprocess.run(["git", "-C", str(path), "add", "-A"], check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", message], check=True, capture_output=True, env=env)
+
+    def _short(self, path):
+        return subprocess.run(["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def _clone(self, origin, name):
+        deployed = Path(self.tmp.name) / name
+        subprocess.run(["git", "clone", "-q", str(origin), str(deployed)], check=True, capture_output=True)
+        return deployed
+
+    def _served(self, paths, data):
+        """The real handler over HTTP, with the REAL deploy-drift data (already
+        computed) standing in for the cache — every other cache is a generic
+        empty mock, the same shape `hub.CACHES` itself has, so a future cache
+        added to the module needs no update here."""
+        caches = {name: Mock(get=lambda: {}) for name in hub.CACHES}
+        caches["deploy_drift"] = Mock(get=lambda: data)
+        out = {}
+        with patch.dict(hub.CACHES, caches), \
+             patch.object(hub, "live_attention", lambda: []), \
+             patch.object(hub, "live_data", lambda: {"connected": True}):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), hub.Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                for path in paths:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}{path}",
+                                                timeout=10) as response:
+                        out[path] = response.read().decode()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=10)
+        return out
+
+    def test_deployed_equal_to_main_is_quiet(self):
+        origin = self._repo("origin-a")
+        self._commit(origin, "one")
+        deployed = self._clone(origin, "deployed-a")
+        sha = self._short(deployed)
+        with patch.object(hub, "DEPLOY_DRIFT_REPOS", [("test-repo", deployed)]):
+            data = hub.deploy_drift_data()
+        self.assertEqual(data["repos"], [{"repo": "test-repo", "deployed": sha,
+                                          "main": sha, "behind_minutes": 0}])
+        pages = self._served(("/", "/api/summary"), data)
+        self.assertIn("class='card ' href='#deploy-drift'", pages["/"])
+        self.assertNotIn("class='card hot' href='#deploy-drift'", pages["/"])
+        self.assertIn("in sync", pages["/"])
+        self.assertEqual(json.loads(pages["/api/summary"])["deploy_drift"], data["repos"])
+
+    def test_deployed_behind_for_45_minutes_is_a_hot_card_with_both_shas(self):
+        origin = self._repo("origin-b")
+        self._commit(origin, "one")
+        deployed = self._clone(origin, "deployed-b")
+        deployed_sha = self._short(deployed)
+        # Backdating only the COMMIT time, not when it is created: this
+        # commit is made after "one" but its %ct reads as 45 minutes ago,
+        # which is exactly what a real commit that landed 45 minutes ago and
+        # was never deployed looks like to `_repo_drift`.
+        self._commit(origin, "two", when=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=45))
+        main_sha = self._short(origin)
+        with patch.object(hub, "DEPLOY_DRIFT_REPOS", [("test-repo", deployed)]):
+            data = hub.deploy_drift_data()
+        row = data["repos"][0]
+        self.assertEqual((row["deployed"], row["main"]), (deployed_sha, main_sha))
+        self.assertGreaterEqual(row["behind_minutes"], 44)
+        self.assertLessEqual(row["behind_minutes"], 46)
+        pages = self._served(("/", "/api/summary"), data)
+        self.assertIn("class='card hot' href='#deploy-drift'", pages["/"])
+        self.assertIn(deployed_sha, pages["/"])
+        self.assertIn(main_sha, pages["/"])
+        self.assertEqual(json.loads(pages["/api/summary"])["deploy_drift"], data["repos"])
+
+
 class FinishedButUnseen(unittest.TestCase):
     """Finished work needed a state between "pages forever" and "invisible".
 
