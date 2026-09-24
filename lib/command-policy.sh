@@ -215,6 +215,71 @@ _cp_walk_prep() {                       # raw
     sed -E 's/<\(/<@LP@/g; s/>\(/>@LP@/g; s/(\&\&|\|\||[;|&()])/\n/g; s/@LP@/(/g'
 }
 
+# ---- _cp_procsub_bodies -----------------------------------------------------
+# Extracts the inner command text of every <(...) / >(...) process
+# substitution in RAW, including bodies nested inside an already-extracted
+# one, so a data-file run hidden inside one is still visible to the walker
+# below. `bash <(curl ...)` already has its own floor rule (_cp_net, a
+# completely different text pipeline); this exists for the "runs a data
+# file" check, which the split in _cp_walk_prep otherwise never exposes —
+# `<(bash x.json)` sits as ONE opaque argument token to whatever consumes
+# it, so `diff <(bash x.json) b.txt` classified allow, unreserved (proved
+# 2026-09-24), because the walker only ever inspects the OUTER command's
+# own word, never what is inside one of its arguments.
+#
+# Bounded to 4 extraction passes, matching this file's other recursion
+# bounds (_cp_decode_ansi_c, _cp_flatten_substitutions): each pass can only
+# ever find bodies STRICTLY SHORTER than what it was given, so this
+# terminates promptly even on adversarial nesting.
+_cp_procsub_extract_once() {            # text -> one <(...)/>(...) body per line
+  printf '%s' "$1" | awk '
+    {
+      line = $0; n = length(line); i = 1
+      while (i <= n) {
+        c = substr(line, i, 1); nx = substr(line, i + 1, 1)
+        if ((c == "<" || c == ">") && nx == "(") {
+          d = 1; j = i + 2
+          while (j <= n && d > 0) {
+            ch = substr(line, j, 1)
+            if (ch == "(") d++
+            else if (ch == ")") d--
+            j++
+          }
+          print substr(line, i + 2, j - i - 3)
+          i = j
+          continue
+        }
+        i++
+      }
+    }'
+}
+_cp_procsub_bodies() {                  # raw -> every body found, at every nesting level
+  local pending="$1" found="" pass=0 next
+  while [ "$pass" -lt 4 ]; do
+    pass=$((pass + 1))
+    next="$(_cp_procsub_extract_once "$pending")"
+    [ -n "$next" ] || break
+    found="$found
+$next"
+    pending="$next"
+  done
+  printf '%s\n' "$found"
+}
+# Every extracted body still needs its OWN prep pass (it may hold its own
+# quotes, substitutions, or nested process substitutions) before the walker
+# can read it as segments — the same reason the top-level raw command gets
+# one below.
+_cp_walk_segments() {                   # raw -> every segment the walker should examine
+  _cp_walk_prep "$1"
+  local body
+  while IFS= read -r body; do
+    [ -n "$body" ] || continue
+    _cp_walk_prep "$body"
+  done <<EOF
+$(_cp_procsub_bodies "$1")
+EOF
+}
+
 # ---- _cp_walk_run -----------------------------------------------------------
 # Does this ONE segment RUN a file whose extension says it is data?
 #
@@ -732,6 +797,171 @@ _cp_flatten_substitutions() {
 # Deny rules are checked ahead of require_approval ones so a command that
 # happens to also match a lesser pattern is still denied, not merely
 # escalated.
+# Shared env/printenv dump detector — round 4 (independent security
+# review, 2 HIGH findings, both confirmed live). classify_command and
+# conductor_reserved_reason each had their OWN inline env/printenv rule,
+# and each was wrong in a DIFFERENT, overlapping way:
+#   (a) classify_command's round-3 rule (_cp_enumerates_env_command,
+#       deleted here) skipped env whenever the NEXT TOKEN — not the next
+#       character — started with `=`/`:`/looked like `env`, so
+#       `env env=1` and `nohup env | head -200 # env: dump` sailed
+#       through: `env=1` and `# env: dump` are TEXT AFTER the real
+#       invocation, not part of it, and should never have cancelled it.
+#   (b) conductor_reserved_reason's round-2 rule disabled itself if
+#       ` env=` or ` env:` appeared ANYWHERE in the whole command, so a
+#       real dump could hide behind an unrelated LATER assignment.
+#   (c) neither one recognised `(`, `<(`, `>(`, `{`, a path form
+#       (`/usr/bin/env`), or most of the wrapper words (nohup, time,
+#       command, builtin, timeout, xargs, plain `sudo`) as a command
+#       position at all.
+# ONE function now, called by both, so they cannot drift apart again.
+#
+# The rule: a word that is exactly `env`/`printenv` (basename-compared, so
+# a path form like `/usr/bin/env` counts) is a DUMP when it sits at
+# COMMAND POSITION — string start, or right after `;`/`&`/`|`/`(`/`)`/
+# `{`/`}`/a newline/`$(`/a backtick/`<(`/`>(`, or right after a wrapper
+# word (sudo with any of its own flags/args, exec, xargs, nohup, time,
+# command, builtin, nice, `timeout <n>`, stdbuf) — UNLESS the very next
+# character after the word (skipping only whitespace, never skipping to
+# a later token's CONTENT) is `=`, `.`, or `:`, meaning it is an
+# identifier/assignment/member-access, never an invocation.
+#
+# `_cp_envdump_segments` does the position-finding: it splits text on
+# every one of those boundary characters, so "is the FIRST word of THIS
+# segment (after skipping wrapper words) env/printenv" answers "is this
+# occurrence at command position" for every boundary at once — including
+# `<(`/`>(`, replaced with a bare split rather than protected, because
+# here (unlike the data-file walker) they ARE a command position, not an
+# argument to protect. A `(` immediately preceded by an identifier
+# character is protected first and never split at all: `fn(env)` and
+# `fetch(req, env)` are function calls, not subshells, so `env` there is
+# never even the first word of a segment — never mind command position.
+#
+# Checking only the FIRST token of a segment, and (if that token is a
+# clean `env`/`printenv`) the token immediately after it, is what tells
+# `env | grep` and `xargs env` (invocation) apart from `env = {}` and
+# `env.KEY` (assignment / member access) even when both start at a
+# genuine command position — `let env; env = {}` splits into two
+# segments on the `;`; the first segment's first word is `let`, not
+# `env`, so the first `env` is never even examined; the second segment's
+# first word IS a clean `env`, but its very next token is `=`, so it is
+# excluded there.
+#
+# `$(env)` / `` `env` `` never reach the segment-based check at all —
+# command substitution is flattened to inline text by scannable_command
+# before this runs, which erases the very boundary that makes it a
+# command position — so those are extracted from RAW separately, the
+# same reasoning as `_cp_procsub_bodies` for `<(...)`/`>(...)` in the
+# data-file walker.
+_cp_dollar_paren_bodies() {             # raw -> one $(...)/`...` body per line
+  printf '%s' "$1" | awk '
+    {
+      line = $0; n = length(line); i = 1
+      while (i <= n) {
+        c = substr(line, i, 1); nx = substr(line, i + 1, 1)
+        if (c == "$" && nx == "(") {
+          d = 1; j = i + 2
+          while (j <= n && d > 0) {
+            ch = substr(line, j, 1)
+            if (ch == "(") d++
+            else if (ch == ")") d--
+            j++
+          }
+          print substr(line, i + 2, j - i - 3)
+          i = j
+          continue
+        }
+        if (c == "`") {
+          j = i + 1
+          while (j <= n && substr(line, j, 1) != "`") j++
+          print substr(line, i + 1, j - i - 1)
+          i = j + 1
+          continue
+        }
+        i++
+      }
+    }'
+}
+_cp_envdump_segments() {                # text -> one candidate command-position segment per line
+  printf '%s' "$1" | tr '\n' ';' |
+    sed -E 's/([A-Za-z0-9_])\(/\1@FNCALL@/g; s/<\(/\n/g; s/>\(/\n/g; s/(\&\&|\|\||[;|&(){}])/\n/g; s/@FNCALL@/(/g'
+}
+_cp_envdump_segment_is_dump() {         # segment -> 0 (true) if it invokes env/printenv as a dump
+  local seg="$1" w wv wvl
+  set -f
+  # shellcheck disable=SC2086
+  set -- $seg
+  set +f
+  while [ "$#" -gt 0 ]; do
+    w="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
+    case "$w" in
+      sudo|exec|xargs|nohup|time|command|builtin|nice|timeout|stdbuf)
+        case "$w" in
+          sudo)    wv='ugphCDRT'; wvl='user|group|host|prompt|chdir|close-from|role|type|other-user' ;;
+          timeout) wv='sk';       wvl='signal|kill-after' ;;
+          nice)    wv='n';        wvl='adjustment' ;;
+          stdbuf)  wv='ioe';      wvl='input|output|error' ;;
+          *)       wv=;           wvl= ;;
+        esac
+        shift
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --) shift; break ;;
+            --*=*) shift ;;
+            --*)
+              if [ -n "$wvl" ] && printf '%s' "${1#--}" | grep -qE "^($wvl)$"; then
+                shift; [ "$#" -gt 0 ] && shift
+              else
+                shift
+              fi ;;
+            -?)
+              if [ -n "$wv" ] && printf '%s' "${1#-}" | grep -q "[$wv]"; then
+                shift; [ "$#" -gt 0 ] && shift
+              else
+                shift
+              fi ;;
+            -*) shift ;;
+            *) break ;;
+          esac
+        done
+        continue ;;
+    esac
+    break
+  done
+  [ "$#" -gt 0 ] || return 1
+  w="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
+  case "$w" in
+    env|printenv) ;;
+    *) return 1 ;;
+  esac
+  case "${2:-}" in
+    =*|.*|:*) return 1 ;;
+  esac
+  return 0
+}
+_cp_env_dump_invoked() {                # raw -> 0 (true) if env/printenv is invoked to dump the environment
+  local raw="$1" norm seg body
+  norm="$(scannable_command "$raw")"
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    _cp_envdump_segment_is_dump "$seg" && return 0
+  done <<EOF
+$(_cp_envdump_segments "$norm")
+EOF
+  while IFS= read -r body; do
+    [ -n "$body" ] || continue
+    while IFS= read -r seg; do
+      [ -n "$seg" ] || continue
+      _cp_envdump_segment_is_dump "$seg" && return 0
+    done <<EOF2
+$(_cp_envdump_segments "$body")
+EOF2
+  done <<EOF3
+$(_cp_dollar_paren_bodies "$raw")
+EOF3
+  return 1
+}
+
 classify_command() {
   if [ "$#" -lt 1 ]; then
     printf 'command-policy: classify_command requires a <command> argument\n' >&2
@@ -935,7 +1165,7 @@ classify_command() {
     [ -n "$_cp_xseg" ] || continue
     _cp_walk_run "$_cp_xseg" "$raw" && break
   done <<XSEGS
-$(_cp_walk_prep "$raw")
+$(_cp_walk_segments "$raw")
 XSEGS
 
   # A downloader is ANY token whose basename is one, wherever it sits.
@@ -1145,7 +1375,7 @@ EOF
   # reads an SSH key or pipes ~/.aws/credentials to an external URL.
   _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|id_(rsa|ed25519|ecdsa)\b|\.env(\.[A-Za-z0-9_-]+)?\b|\bcredentials\b' "$norm" &&
     _cp_consider 1 "reads credential material — a human must approve"
-  _cp_imatch '(^|[[:space:]])(printenv|env)([[:space:]]|$)|\bop[[:space:]]+read\b|\bgh[[:space:]]+secret\b|\baws[[:space:]]+(configure|sts)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm" &&
+  { _cp_env_dump_invoked "$1" || _cp_imatch '\bop[[:space:]]+read\b|\bgh[[:space:]]+secret\b|\baws[[:space:]]+(configure|sts)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm"; } &&
     _cp_consider 1 "enumerates or resolves secrets"
 
   # escalate — production / infrastructure scope change. A name-based rule is
@@ -1242,6 +1472,159 @@ classify_reason() {
   return 0
 }
 
+# ---- credential-shaped VALUE detection --------------------------------------
+# The header comment above only ever covered credential-shaped PATHS and
+# commands (`.ssh/`, `printenv`, `op read`, …) — a literal secret typed
+# directly into a KEY=VALUE assignment (`TOKEN="ghp_…"`, `AWS_SECRET_
+# ACCESS_KEY=…`) matched none of them and sailed through allow AND
+# unreserved (proved 2026-09-24: a real-shaped GitHub/AWS/Stripe token in
+# an `eval` or `bash` payload). This closes that gap, with a narrow carve-
+# out for the obvious test-code placeholder (`KB_API_KEY: "kb-secret"`,
+# `TOKEN="test-token"`) a worker legitimately writes constantly —
+# Terrence's authorized loosening, 2026-09-24.
+#
+# The KEY side is deliberately broad (any identifier containing KEY/TOKEN/
+# SECRET/PASSWORD/CREDENTIAL): over-matching here only means an ordinary
+# placeholder gets checked against the criteria below and passes, which
+# costs nothing. Under-matching would let a real secret through unchecked.
+# The identifier prefix is `[A-Za-z0-9_]*` — ZERO or more, not one or more.
+# A mandatory-1+ prefix here was a real bug (found live via VERIFY_PLEASE,
+# 2026-09-24): it structurally cannot match a BARE key name with nothing
+# before it, because whatever it consumes has to leave the alternative
+# (`TOKEN`, `API_KEY`, ...) fully intact right after — and for a bare
+# `TOKEN=`, every non-empty split of "TOKEN" itself either eats into the
+# word or leaves nothing for the alternative to match. `TOKEN="ghp_…"`,
+# `API_KEY="AKIA…"`, and a placeholder-carve-out+op:// combo all classified
+# UNRESERVED (should have been reserved) for exactly this reason — the
+# prefixed spellings (`KB_API_KEY`, `AWS_SECRET_ACCESS_KEY`) worked by
+# accident, because they had a real prefix to consume.
+# The value stops at `{}` too, not just `;&|(),` — round 2, 2026-09-24:
+# `const env = { KB_API_KEY: "kb-secret" };` (a real refused shape from
+# tonight, JS object-literal syntax) needs the value to stop at the `}`
+# that closes the object, not swallow it.
+#
+# The value may be preceded by an optional quote (`'"'"'` or `"`) that is
+# consumed but never captured — round 2 REGRESSION, caught live by the
+# conductor testing this exact regex before it shipped: excluding quote
+# characters from the value class also means a match can never START
+# right after an opening quote, so ANY quoted value — a real secret
+# included — escaped detection entirely (fail-open). `['"'"'"]?` fixes
+# that without re-admitting quotes INTO the value itself, so a still-
+# quoted caller (this function's own defensive case) and the normal
+# already-quote-stripped one both work.
+_CP_CRED_KV_RE="[A-Za-z0-9_]*(API_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)[A-Za-z0-9_]*[[:space:]]*[:=][[:space:]]*['\"]?[^[:space:];&|(){}'\",]+"
+
+# Every criterion the authorization requires, all on the VALUE alone —
+# short, self-describing, no high-entropy run, no known secret prefix.
+_cp_cred_value_is_placeholder() {       # value -> 0 (true) if every placeholder criterion holds
+  local v="$1"
+  [ "${#v}" -le 24 ] || return 1
+  _cp_imatch '(test|fake|dummy|probe|example|sample|placeholder|secret)' "$v" || return 1
+  printf '%s' "$v" | grep -qE '[A-Za-z0-9_+/=-]{20,}' && return 1
+  case "$v" in
+    sk-*|ghp_*|github_pat_*|xox*|AKIA*|eyJ*|ops_*) return 1 ;;
+  esac
+  return 0
+}
+
+# 0 (true) when a credential-shaped assignment exists AND at least one of
+# them (or the surrounding text) fails the carve-out — i.e. this command
+# still belongs in the reserved bucket for something a KEY/TOKEN/SECRET
+# regex alone would have missed. Returns 1 (no reservation from THIS check)
+# both when there is no shaped assignment at all and when every one found
+# qualifies as an obvious placeholder. `op://` is checked command-wide,
+# same reasoning as `\bop[[:space:]]+read\b` above: a real vault reference
+# is never an "obvious placeholder" no matter how short the rest is.
+_cp_cred_shaped_and_not_placeholder() {  # norm -> 0 (true) if reserved
+  local norm="$1" matches m val
+  matches="$(printf '%s' "$norm" | grep -oiE "$_CP_CRED_KV_RE" || true)"
+  [ -n "$matches" ] || return 1
+  _cp_match 'op://' "$norm" && return 0
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    val="$(printf '%s' "$m" | sed -E "s/^.*[:=][[:space:]]*['\"]?//")"
+    _cp_cred_value_is_placeholder "$val" || return 0
+  done <<EOF
+$matches
+EOF
+  return 1
+}
+
+# ---- git push: an explicit plain branch name, never HEAD or a refspec -----
+# HIGH, 2026-09-24 (round 2, conductor's live probe of tonight's actually-
+# refused commands): the FIRST version of this asked the checkout at a
+# `cwd` argument for its real branch/upstream state — but no caller passes
+# the worker's actual cwd. herdr-select.sh calls conductor_reserved_reason
+# with none at all, so _cp_push_is_safe judged against ITS OWN $PWD (the
+# conductor's checkout), not the pane the command would actually run in:
+# `git push origin HEAD` classified unreserved whenever the conductor
+# happened to be standing in a feature checkout, regardless of what branch
+# the WORKER was actually on — which can be the default branch. The
+# command's real effective cwd is not recoverable from prompt text at all
+# (omp's bash tool carries its own cwd, invisible here), so no cwd this
+# file could plausibly be given is trustworthy. Deleted every git lookup;
+# safety is now judged from the command's own text alone, same footing as
+# every other rule in this file.
+#
+# Unreserved ONLY `git push origin <name>`, `git push -u origin <name>`,
+# and `git push --set-upstream origin <name>`, where <name> FULLY matches
+# the fleet's own branch-naming convention — a deny-by-default allowlist,
+# not a list of known-bad shapes to avoid.
+#
+# HIGH, round 4 (independent security review, confirmed live): the
+# previous version denied `HEAD`/`refs/*`/a colon and otherwise allowed
+# anything shaped like `[A-Za-z0-9][A-Za-z0-9._/-]*` — which let git's own
+# DWIM ref resolution and case-insensitive filesystems through as
+# "obviously fine" text that isn't: `git push origin heads/main`,
+# `remotes/origin/main`, `tags/v1.0.0`, a bare tag name (`v1.0.0`, if one
+# exists), `head` (APFS is case-insensitive — this can resolve to HEAD),
+# and `FETCH_HEAD` were all auto-approvable. None of those are literally
+# `HEAD` or contain a colon, the only two things the old check excluded —
+# a pattern-of-bad-names approach can only ever enumerate the bypasses
+# someone already thought of. Flipped to deny-by-default: safe ONLY when
+# the name fully matches the fleet's actual `type/slug` convention (every
+# branch in `~/Code` follows it — `feat/approve-safe-worker-ops`,
+# `fix/dnc-undo-log-private-root`, `ci/deploy-on-merge`,
+# `wip/kb-foo-2026-09-24`), which git's DWIM resolution has no ambiguous
+# alternate reading for. The old protected-literal-name set is redundant
+# under this design (nothing outside `type/slug` was ever going to match
+# it) and is gone — nothing else in this file used it.
+#
+# Three explicit rejections on top of the allowlist, each independently
+# redundant with it today (the allowed character class already excludes
+# a leading `.`, `@`, and — since every segment must start with
+# `[a-z0-9]` — a literal `..` segment) but kept anyway as the reviewer
+# required: a segment of `..`, a name ending in `.lock` (a real git ref
+# uses that suffix for its OWN lockfile; `foo.lock` matches the character
+# class fine and is not otherwise excluded), and anything containing
+# `@{` (reflog/upstream syntax, `@{-1}`, `@{upstream}`).
+#
+# Bare `git push` (no named target — its effective branch is exactly the
+# "what does HEAD resolve to" question this file cannot answer), any flag
+# other than `-u`/`--set-upstream` (`--force`, `--delete`/`-d`,
+# `--mirror`, `--all`, `--tags`, …), a `-C`, and any `cd … &&` prefix all
+# fail to match the shape below at all and fall straight through to "not
+# safe" — that catch-all is structural, not enumerated.
+_CP_PUSH_BRANCH_ALLOW_RE='^(feat|fix|chore|ci|docs|refactor|test|perf|build|wip|plan|review|spike)/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$'
+
+_cp_push_branch_is_safe() {             # name -> 0 (true) if this literal branch name is a safe push target
+  local name="$1"
+  case "$name" in
+    *@\{*) return 1 ;;
+    *.lock) return 1 ;;
+  esac
+  case "/$name/" in
+    */../*) return 1 ;;
+  esac
+  _cp_match "$_CP_PUSH_BRANCH_ALLOW_RE" "$name"
+}
+
+_cp_push_is_safe() {                    # norm -> 0 (true) only for git push [-u|--set-upstream] origin <plain-branch-name>
+  local norm="$1"
+  [[ "$norm" =~ ^[[:space:]]*git[[:space:]]+push[[:space:]]+((-u|--set-upstream)[[:space:]]+)?origin[[:space:]]+([^[:space:]:]+)[[:space:]]*$ ]] || return 1
+  _cp_push_branch_is_safe "${BASH_REMATCH[3]}"
+}
+
 # Human-reserved actions under the reviewed-operational conductor grant.
 # This is a conservative accident guard, not an interpreter/sandbox. Indirect
 # scripts still require the trusted conductor to inspect their complete body.
@@ -1259,7 +1642,17 @@ conductor_reserved_reason() {
   # bare `git push` / `--all` / `--mirror` (upstream may be main), agent
   # flags that switch approvals off, edits to the two policy scripts, the gh
   # OAuth token file and bare env dumps were all classify=allow + unreserved.
-  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.env(\.[A-Za-z0-9_-]+)?\b|id_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[[:space:]])(printenv|env)([[:space:]]|$)|(^|[;[:space:]])(export|set)[[:space:]]*($|;)|\bdeclare[[:space:]]+-p\b|\bop[[:space:]]+(read|item[[:space:]]+get)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm"; then
+  # Round 4: env/printenv dumps now go through the SAME _cp_env_dump_invoked
+  # classify_command uses — see its header for the full design and the two
+  # HIGH findings that made this a shared function instead of two.
+  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.env(\.[A-Za-z0-9_-]+)?\b|id_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[;[:space:]])(export|set)[[:space:]]*($|;)|\bdeclare[[:space:]]+-p\b|\bop[[:space:]]+(read|item[[:space:]]+get)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm" ||
+     _cp_env_dump_invoked "$1"; then
+    printf 'credential-value access remains human-only\n'
+  # Terrence's authorized loosening, 2026-09-24: a credential-shaped VALUE
+  # typed directly into the command (not a path/command match above) is
+  # reserved too, UNLESS it is an obvious test-code placeholder — see
+  # _cp_cred_shaped_and_not_placeholder for the exact carve-out.
+  elif _cp_cred_shaped_and_not_placeholder "$norm"; then
     printf 'credential-value access remains human-only\n'
   # The curl clause knew only -X / --data / -d, so the upload verbs this same
   # branch identified as exfiltration paths — -T/--upload-file, -F/--form,
@@ -1268,17 +1661,16 @@ conductor_reserved_reason() {
   # call: the two lists are derived from the same reasoning and must not drift.
   elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--request[[:space:]]+(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]]|(^|[[:space:]])-T([[:space:]]|=)|--upload-file|(^|[[:space:]])-F([[:space:]]|=)|--form([[:space:]]|=)|--json([[:space:]]|=))|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$norm"; then
     printf 'remote mutation remains human-only\n'
-  # KNOWN GAP, deliberately not closed here (detonation pass F3): a worktree
-  # standing on the default branch makes `git push origin HEAD` a push to main
-  # without the word ever appearing. Reserving every `push … HEAD` would catch
-  # it — and would also catch `git push -u origin HEAD`, which is how every
-  # spawned worker publishes its feature branch, so every worker would escalate
-  # to a human and the alert flood this week's work removed would come straight
-  # back. Resolving HEAD needs the pane's repo, which a text scanner does not
-  # have; the fix belongs in a repo-aware check, not another regex. Bare
-  # `git push` and `git -C <dir> push` ARE reserved below, because those are
-  # rare in worker traffic and cost nothing to stop.
-  elif _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\bgit\b.*\bpush\b.*\b(main|master)\b|\bgit\b.*\bpush\b.*(--all\b|--mirror\b)|(^|[;[:space:]])git([[:space:]]+-[A-Za-z]+[[:space:]]+[^[:space:]]+)*[[:space:]]+push[[:space:]]*($|;)|\b(gate-registry|approval-policy|command-policy\.sh|herdr-select\.sh)\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$norm"; then
-    printf 'merge, governance, or control weakening remains human-only\n'
+  # CLOSED 2026-09-24 (Terrence's authorized loosening, then hardened
+  # round 4 by an independent security review): _cp_push_is_safe is
+  # cwd-INDEPENDENT and deny-by-default — `git push origin <name>`,
+  # `git push -u origin <name>`, and `git push --set-upstream origin
+  # <name>` are unreserved ONLY when <name> fully matches the fleet's own
+  # `type/slug` branch-naming allowlist. Bare `git push`, any other flag,
+  # a `-C`, and any `cd … &&` prefix all fail to match this shape and
+  # stay reserved below — see _cp_push_is_safe's own header for the full
+  # design and the two security-review rounds that shaped it.
+  elif { _cp_match '\bgit\b' "$norm" && _cp_match '\bpush\b' "$norm" && ! _cp_push_is_safe "$norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|command-policy\.sh|herdr-select\.sh)\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$norm"; then
+    printf 'merge, governance, push, or control weakening remains human-only\n'
   fi
 }

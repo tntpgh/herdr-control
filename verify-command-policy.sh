@@ -65,9 +65,9 @@ check_reserved() {
   fi
 }
 
-# check_unreserved <label> <command> — must stay answerable by a peer. These are
-# the ordinary worker flow; reserving them sends every worker to a human and
-# re-creates the alert flood.
+# check_unreserved <label> <command> — must stay answerable by a peer. These
+# are the ordinary worker flow; reserving them sends every worker to a human
+# and re-creates the alert flood.
 check_unreserved() {
   local label="$1" cmd="$2" got
   total=$((total + 1))
@@ -100,12 +100,12 @@ check_not_allow "recursive rm with a trailing 0xFF byte" "$_dirty_rm"
 
 echo "== detonation F3: reserved actions spelled around the old regexes =="
 check_reserved "git -C <dir> push (breaks push adjacency)"   "git -C /Users/thurbs/Code/other push"
-check_reserved "bare git push (upstream may be default)"     "git push"
+check_reserved "bare git push (no named target)"             "git push"
 check_reserved "gh api --method=PUT .../merge (= form)"      "gh api --method=PUT repos/o/r/pulls/1/merge"
 check_reserved "gh api path ending /merge"                   "gh api repos/o/r/pulls/1/merge -X PUT"
 
 echo "== the worker flow stays peer-answerable (else the alert flood returns) =="
-check_unreserved "push a feature branch"        "git push -u origin HEAD"
+check_unreserved "push a feature branch"        "git push -u origin feat/x"
 check_unreserved "open a PR"                    "gh pr create --base main --fill"
 check_unreserved "hand off for review"          "gh issue edit 5 --add-label ready-for-review"
 check_unreserved "run the repo's checks"        "bash scripts/ci.sh"
@@ -716,6 +716,266 @@ check "P3-F8 two leading digits is not an fd" "12.json"                         
 # `12.json` is eaten as a file descriptor and the NEXT token is read as the
 # command word, which is how a data path gets promoted to a program.
 check "P3-F8 digit-led name before an arg"  "12.json /tmp/p.json"                                 allow
+
+echo
+echo "== authorized loosening 2026-09-24: four safe worker operations =="
+# Terrence explicitly authorized this ("do 1") after a night the conductor
+# had to step in about 20 times on the safe commands below. Scoped to
+# lib/command-policy.sh's _cp_reservation and the data-file walker only —
+# nothing outside these four cases changed.
+
+echo
+echo "== case 1: git push, an explicit plain branch name only (cwd-independent) =="
+# Round 2, 2026-09-24: the first version asked a `cwd` argument for the
+# checkout's real branch state, but no real caller passes the worker's
+# actual cwd (herdr-select.sh calls conductor_reserved_reason with none at
+# all) — so it judged against the CONDUCTOR's OWN $PWD and could approve a
+# push to the default branch whenever the conductor happened to be
+# standing on a feature checkout (HIGH, found live). Redesigned to be
+# judged from the command's own text alone, with no git lookups at all:
+# `git push origin <name>`, `git push -u origin <name>`, and `git push
+# --set-upstream origin <name>` are unreserved ONLY when <name> FULLY
+# matches the fleet's `type/slug` naming convention (deny-by-default
+# allowlist, _CP_PUSH_BRANCH_ALLOW_RE) — round 4 (independent security
+# review, HIGH, confirmed live): the round-2/3 version denied `HEAD`/
+# `refs/*`/a colon and allowed anything else shaped like a plain word,
+# which let git's own DWIM ref resolution and case-insensitive
+# filesystems through (see the DWIM section below).
+check_unreserved "explicit branch, plain name"          "git push origin feat/x"
+check_unreserved "-u form, plain name"                  "git push -u origin feat/x"
+check_unreserved "--set-upstream form, plain name"      "git push --set-upstream origin feat/x"
+check_unreserved "dotted/segmented branch name"         "git push -u origin feat/approve-safe-worker-ops"
+# Bare push has no named target at all — its effective branch is exactly
+# the "what does HEAD resolve to" question this design refuses to answer.
+check_reserved "bare git push, always reserved now"     "git push"
+# HEAD is reserved regardless of $PWD — the exact HIGH this round closes.
+check_reserved "origin HEAD, whatever \$PWD is"          "git push origin HEAD"
+check_reserved "-u origin HEAD"                          "git push -u origin HEAD"
+# The required protected set, and the release/deploy/hotfix conventions.
+check_reserved "main"                                     "git push origin main"
+check_reserved "master"                                    "git push origin master"
+check_reserved "trunk"                                       "git push origin trunk"
+check_reserved "tourguide (tntpgh/tourguide's own default)"    "git push origin tourguide"
+check_reserved "develop"                                         "git push origin develop"
+check_reserved "staging"                                           "git push origin staging"
+check_reserved "production"                                          "git push origin production"
+check_reserved "prod"                                                   "git push origin prod"
+check_reserved "gh-pages"                                                 "git push origin gh-pages"
+check_reserved "release"                                                   "git push origin release"
+check_reserved "release/ prefix"                                             "git push origin release/nightly"
+check_reserved "deploy/ prefix"                                                "git push origin deploy/nightly"
+check_reserved "hotfix/ prefix"                                                 "git push origin hotfix/urgent"
+check_reserved "deploy- prefix"                                                   "git push origin deploy-2026"
+check_reserved "release- prefix"                                                    "git push origin release-2026"
+# Every shape that fails to match one of the three exact forms at all.
+check_reserved "colon delete refspec"                     "git push origin :feat/x"
+check_reserved "src:dst refspec"                            "git push origin HEAD:main"
+check_reserved "--force"                                      "git push --force origin feat/x"
+check_reserved "-f"                                              "git push -f origin feat/x"
+check_reserved "--force-with-lease"                                "git push --force-with-lease origin feat/x"
+check_reserved "--delete"                                             "git push --delete origin feat/x"
+check_reserved "-d"                                                     "git push -d origin feat/x"
+check_reserved "--mirror"                                                 "git push --mirror origin"
+check_reserved "--all"                                                      "git push --all origin"
+check_reserved "--tags"                                                       "git push --tags origin"
+check_reserved "-C to a different repo"                                         "git -C /tmp/some-other-repo push"
+check_reserved "cd to a different repo, then push"                                "cd /tmp/some-other-repo && git push origin feat/x"
+check_reserved "trailing extra token, not a plain name"                             "git push origin feat/x extra"
+
+echo
+echo "== case 1, round 4: DWIM/ref-resolution bypasses of the old pattern-of-bad-names check =="
+# None of these are literally HEAD or contain a colon — the only two
+# things the pre-round-4 check excluded — so all eight were auto-
+# approvable before the allowlist flip. Confirmed live by the conductor
+# via /tmp/probe-bypass.sh.
+check_reserved "heads/ prefix reaches refs/heads/main"        "git push origin heads/main"
+check_reserved "heads/ prefix, -u form"                       "git push -u origin heads/master"
+check_reserved "mixed case, still resolves via DWIM"          "git push origin Heads/Main"
+check_reserved "remotes/ prefix reaches a remote-tracking ref" "git push origin remotes/origin/main"
+check_reserved "tags/ prefix reaches refs/tags"               "git push origin tags/v1.0.0"
+check_reserved "bare tag name (pushes a TAG if one exists)"   "git push origin v1.0.0"
+check_reserved "lowercase head (APFS is case-insensitive)"    "git push origin head"
+check_reserved "FETCH_HEAD"                                   "git push origin FETCH_HEAD"
+# The three explicit rejections layered on top of the allowlist.
+check_reserved "ref lockfile suffix"                          "git push -u origin feat/foo.lock"
+check_reserved "reflog/upstream syntax"                       "git push origin feat/foo@{upstream}"
+check_reserved "parent-segment traversal"                     "git push origin feat/../etc"
+# The fleet's real branch-naming convention, verbatim from the review.
+check_unreserved "fix/ prefix"                                "git push origin fix/dnc-undo-log-private-root"
+check_unreserved "ci/ prefix, --set-upstream form"            "git push --set-upstream origin ci/deploy-on-merge"
+check_unreserved "wip/ prefix, dated slug"                    "git push -u origin wip/kb-foo-2026-09-24"
+
+echo
+echo "== case 1 mutation check: prove the allowlist regex is load-bearing =="
+# A guard nothing can fail is not tested. Traced rather than executed
+# against a live-mutated copy of the sourced file: widen
+# _CP_PUSH_BRANCH_ALLOW_RE (e.g. drop the trailing `$`, or drop it to
+# `.*`) and every "check_reserved" row above — the DWIM bypasses, the
+# protected literal names, the explicit .lock/@{/.. rejections — flips
+# from PASS (reserved) to FAIL (unreserved); restore it and every one
+# flips back. See the PR body for the traced result.
+
+echo
+echo "== case 2: gh pr create --body-file (or -F) stays unreserved, any extension =="
+# The file is read, never executed. gh pr merge / review --approve stay
+# human-only, unaffected.
+check "gh pr create --body-file .md"          "gh pr create --title x --body-file /tmp/pr-body.md"    allow
+check "gh pr create --body-file .txt"         "gh pr create --title x --body-file /tmp/pr-body.txt"   allow
+check "gh pr create --body-file .json"        "gh pr create --title x --body-file /tmp/pr-body.json"  allow
+check "gh pr create -F short flag"            "gh pr create --title x -F /tmp/pr-body.txt"            allow
+check_unreserved "gh pr create --body-file, any extension"  "gh pr create --title x --body-file /tmp/pr-body.json"
+check_unreserved "gh pr create -F short flag"                "gh pr create --title x -F /tmp/pr-body.txt"
+check_reserved "gh pr merge stays human-only"                "gh pr merge 5"
+check_reserved "gh pr review --approve stays human-only"     "gh pr review 5 --approve"
+
+echo
+echo "== case 3: diff/cmp are read-only comparisons, any extension =="
+check "diff two json files"                   "diff a/package.json b/package.json"          allow
+check "diff recursive"                        "diff -r dira dirb"                             allow
+check "cmp two files"                         "cmp a.json b.json"                              allow
+check "diff of live command output"           "diff <(git show HEAD:f) <(git show main:f)"     allow
+check_unreserved "diff same shape"            "diff a/package.json b/package.json"
+check_unreserved "cmp same shape"             "cmp a.json b.json"
+# ...but actually executing a data file is still an execution, wherever it
+# is hidden. Proved 2026-09-24: `diff <(bash x.json) b.txt` classified
+# allow before the walker learned to look inside a process substitution —
+# `<(...)`/`>(...)` sat as ONE opaque argument token to whatever consumed
+# it, and the walker only ever inspected the OUTER command's own word.
+check "runs a data file inside <(...)"        "diff <(bash x.json) b.txt"                       escalate
+check "runs a data file inside >(...)"        "tee >(bash x.json) < /dev/null"                  escalate
+check "nested process substitution"           "diff <(cat <(bash x.json)) b.txt"                escalate
+check "direct execution still escalates"      "bash x.json"                                      escalate
+check "direct relative invoke still escalates" "./x.json"                                        escalate
+
+echo
+echo "== case 4: obvious placeholder credential values in test code stay unreserved =="
+# Closes a real gap: a genuine GitHub/AWS/Stripe-shaped secret typed
+# directly into an eval/bash payload classified allow AND unreserved
+# (proved 2026-09-24) because the credential bucket only ever matched
+# PATHS and commands (.ssh/, printenv, op read, ...), never a literal
+# VALUE. The carve-out keeps the ordinary placeholder a worker writes
+# constantly out of the reserved bucket: at most 24 characters, matches
+# test|fake|dummy|probe|example|sample|placeholder|secret, no 20+ char
+# high-entropy run, no known secret prefix, and the command references
+# none of .env*/op:///op read/printenv/env dumps/process.env.
+check_unreserved "JS/eval-style placeholder"          'KB_API_KEY: "kb-secret"'
+check_unreserved "shell-style placeholder"            'TOKEN="test-token"'
+check_unreserved "fake keyword placeholder"           'API_TOKEN="fake-123"'
+check_unreserved "example keyword placeholder"        'DB_PASSWORD="example-pw"'
+check_unreserved "at the 24-char ceiling, no entropy run" 'TOKEN="test.aaaaaaaaa.bbbbbbbbb"'
+check_reserved "one character over the ceiling"       'TOKEN="test.aaaaaaaaa.bbbbbbbbbb"'
+check_reserved "real-shaped GitHub token prefix"      'TOKEN="ghp_1234567890123456789012"'
+check_reserved "real-shaped AWS access key id prefix" 'API_KEY="AKIAiosfodnn7example"'
+check_reserved "high-entropy value, no known prefix"  'AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"'
+check_reserved "stripe-shaped prefix"                  'STRIPE_SECRET_KEY="sk-live-4242424242424242424242"'
+check_reserved "slack-shaped prefix"                    'SLACK_TOKEN="xoxb-123456789"'
+check_reserved "jwt-shaped prefix"                       'AUTH_TOKEN="eyJhbGciOiJIUzI1NiJ9.payload.sig"'
+check_reserved "1Password service-token-shaped prefix"    'OP_SERVICE_ACCOUNT_TOKEN="ops_abcdefghijklmnopqrstuvwx"'
+check_reserved "credential-shaped but no placeholder keyword" 'API_KEY="abc123xyz"'
+check_reserved "placeholder value alongside an op:// reference" 'TOKEN="test-token" op://vault/item/field'
+# The path/command-based bucket is untouched: still reserved regardless of
+# any placeholder text nearby.
+check_reserved ".env file reference stays reserved"    "node --env-file=.env.production server.js"
+check_reserved "process.env enumeration stays reserved" 'eval "process.env.SECRET_TOKEN"'
+check_reserved "op read stays reserved"                 "op read op://vault/item/field"
+check_reserved "printenv stays reserved"                 "printenv | grep TOKEN"
+# An ordinary variable is not credential-shaped at all — the KEY has to
+# look like one, not just any KEY=VALUE pair.
+check_unreserved "ordinary variable, not credential-shaped" 'NAME="John Doe"'
+# Round 2, 2026-09-24: the exact shape refused live tonight — a JS object
+# literal with a quoted value — plus the quote-handling regression the
+# conductor caught before it shipped (excluding quote chars from the value
+# class also meant a match could never start right after an opening
+# quote, so ANY quoted value, a real secret included, escaped detection).
+check_unreserved "double-quoted JS object literal (refused live tonight)" 'const env = { KB_API_KEY: "kb-secret" };'
+check_unreserved "single-quoted shell-style value"                        "KB_API_KEY='kb-secret'"
+check_reserved "double-quoted real-shaped secret stays reserved"          'KB_API_KEY="sk-live-9f8e7d6c5b4a39281706"'
+check_unreserved "already-unquoted form (regression pin)"                 'const env = { KB_API_KEY: kb-secret };'
+
+echo
+echo "== round 3/4: env/printenv dump detector, command position only =="
+# Conductor's live probe: 'const env = { KB_API_KEY: "kb-secret" };' was no
+# longer RESERVED after round 2, but classify_command still ESCALATED it
+# (reason: "enumerates or resolves secrets"), so herdr-select still refused
+# it — the bare-word rule fired on the JS/Worker bindings object `env`
+# itself, escalating identically-shaped `const cfg = {...}`-style code that
+# never mentioned "env" at all. Round 4 (independent security review, 2
+# HIGH) replaced this and conductor_reserved_reason's own separate,
+# differently-broken env rule with ONE shared _cp_env_dump_invoked — see
+# its header comment for the full command-position design.
+check "bare env still escalates"                    "env"                                    escalate
+check "bare printenv still escalates"                "printenv"                               escalate
+check "env piped still escalates"                     "env | grep KEY"                         escalate
+check "env inside command substitution escalates"     "echo \$(env)"                           escalate
+check "xargs env still escalates"                       "xargs env"                              escalate
+check "sudo env still escalates"                          "sudo env"                               escalate
+check "Worker bindings object, JS object literal"           'const env = { KB_API_KEY: "kb-secret" };' allow
+check "Worker bindings object, member access"                 "env.KB_API_KEY"                        allow
+check "Worker bindings object, function argument"               "worker.fetch(req, env)"                allow
+check "Worker bindings object, declare then assign"               "let env; env = {}"                     allow
+# The identically-shaped non-credential control the conductor named: same
+# object-literal syntax, no "env" anywhere, must have stayed allow all along.
+check "const cfg (control, never mentioned env)"                     'const cfg = { KB_API_KEY: "kb-secret" };' allow
+
+echo
+echo "== round 4: env-dump bypasses found by the independent security review =="
+# Every row here classified allow AND reserved='' before this round —
+# confirmed live via the conductor's /tmp/probe-bypass.sh. Each dump now
+# escalates AND reserves; each row that follows is a genuine command-
+# position occurrence the round-3 detector could not see: sudo/exec/
+# xargs's own flags and values, other wrapper words (nohup, time,
+# command, builtin, timeout, plain stdbuf/nice), `(`, `<(`, a path form,
+# and a trailing comment or later assignment that used to cancel the
+# earlier, real invocation.
+check "sudo -u root env, flag+value skipped"     "sudo -u root env"                     escalate
+check_reserved   "sudo -u root env"              "sudo -u root env"
+check "command env"                              "command env"                         escalate
+check_reserved   "command env"                   "command env"
+check "time env"                                 "time env"                             escalate
+check_reserved   "time env"                      "time env"
+check "nohup env, bare"                          "nohup env"                            escalate
+check_reserved   "nohup env, bare"               "nohup env"
+check "semicolon-separated"                      "ls; env"                              escalate
+check_reserved   "semicolon-separated"           "ls; env"
+check "backtick invocation"                      '`env`'                                escalate
+check_reserved   "backtick invocation"           '`env`'
+check "env with its own flag"                    "env -0"                               escalate
+check_reserved   "env with its own flag"         "env -0"
+check "a later token spelling env= cannot cancel the real invocation" "env env=1" escalate
+check_reserved   "a later token spelling env= cannot cancel it"       "env env=1" 
+check "a trailing comment cannot cancel it either" "nohup env | head -200 # env: dump" escalate
+check_reserved   "a trailing comment cannot cancel it either"         "nohup env | head -200 # env: dump"
+check "bare subshell"                            "(env)"                                escalate
+check_reserved   "bare subshell"                 "(env)"
+check "path form"                                "/usr/bin/env"                         escalate
+check_reserved   "path form"                     "/usr/bin/env"
+check "inside a process substitution"            "diff <(printenv) /dev/null"           escalate
+check_reserved   "inside a process substitution" "diff <(printenv) /dev/null"
+# The one new "must stay clean" shape round 3 did not cover: a bare
+# function call, not a subshell — `(` immediately preceded by an
+# identifier character.
+check_unreserved "bare function call, not a subshell" "fn(env)"
+check "bare function call, not a subshell (verdict)"  "fn(env)" allow
+
+echo
+echo "== round 4 mutation check: prove the shared env-dump detector is load-bearing =="
+# Traced rather than executed against a live-mutated copy: delete the
+# `case "\${2:-}" in =*|.*|:*) return 1 ;; esac` guard in
+# _cp_envdump_segment_is_dump and "Worker bindings object, declare then
+# assign" ('let env; env = {}') flips from PASS (allow/unreserved) to
+# FAIL (escalate/reserved); restore it and it flips back. Delete the
+# `env|printenv` exact-match instead (widen it to accept anything) and
+# every "must stay clean" row in this section flips to escalate/reserved
+# while the "must be a dump" rows stop distinguishing anything — either
+# mutation is caught. See the PR body for the traced result.
+
+echo
+echo "== case 4 mutation check: prove the placeholder carve-out is load-bearing =="
+# Same reasoning as the push mutation check above, traced rather than
+# executed against a live-mutated copy of the sourced file: delete the
+# length/keyword/entropy/prefix test in _cp_cred_value_is_placeholder and
+# "real-shaped GitHub token" above flips from PASS (reserved) to FAIL
+# (unreserved); restore it and it flips back. See the PR body.
 
 
 echo
