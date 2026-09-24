@@ -453,6 +453,80 @@ n_track=$(_q "SELECT count(*) FROM events WHERE task_id='task16' AND type='atten
 [ "$n_track" = "0" ] && ok "a recycled pane never enters the wake/escalate ladder at all" \
   || bad "recycled pane was tracked like an ordinary one: $n_track"
 
+printf '== occurrence: a command re-asked after a new prompt-appearance edge gets a fresh clock ==\n'
+register_task run18 task18 w18 cond18 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt18 "impl:occurrence" >/dev/null 2>&1
+set_task_state run18 task18 running >/dev/null 2>&1
+omp_menu_screen "git status" > "$S1"
+: > "$SENT"
+# Occurrence 1: a real hook (omp-notify.sh/claude-notify.sh) always claims via
+# attn_track_claim BEFORE the controller's own tick ever sees the prompt --
+# simulate that ordering directly, since only hooks mark edges (never the
+# controller, lib/attention-key.sh). Task state starts "running" (not
+# "blocked"), so this IS a transition: edge #1.
+pid1="$(prompt_id "$W1")"
+attn_track_claim "$W1" run18 task18 "$pid1" >/dev/null 2>&1
+# Read the key BACK from the claim row attn_track_claim itself wrote, rather
+# than recomputing it independently: attention_registered_birth resolves
+# task_for_pane("$W1") by `ORDER BY updated_at DESC` with 1-second
+# resolution and no tiebreaker, and pane w1:p1 has been reused by a dozen
+# tasks earlier in this file within the same wall-clock second -- an
+# independently recomputed key can legitimately resolve a DIFFERENT tied
+# row's birth than the one attn_track_claim itself used, and a mismatch
+# here silently made the later "since" lookup query zero rows.
+key1="$(_q "SELECT json_extract(payload,'\$.key') FROM events WHERE task_id='task18' AND type='attention_tracking' ORDER BY sequence DESC LIMIT 1;")"
+printf '%s\n' "$W1" | attention_tick        # the controller's next pass delivers the wake
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "INSERT INTO approvals (approval_id, run_id, task_id, pane_id, prompt_id, choice, decided_by, authority, decided_at, confirmed_at)
+   VALUES ('appr-occ1','run18','task18','$W1','$pid1','1','peer','peer', strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now'));" 2>/dev/null
+sleep 1   # cross a real ISO-second boundary: occurrence 1 and 2 render the
+          # IDENTICAL "git status" text, so prompt_id() -- content-hashed --
+          # is the SAME value for both. Without a real gap, this approval's
+          # decided_at can tie occurrence 2's own "since" under the `>=` in
+          # _attn_answered_since and falsely read occurrence 2 as answered
+          # by an approval that actually belongs to occurrence 1.
+clean_screen > "$S1"                         # approved, cleared
+# Between occurrences the task genuinely left "blocked": the approval above
+# is what agent-edge.sh's follow_registry() would observe as omp going
+# idle/working again and flip the registry back to "running" in production --
+# simulate that transition explicitly rather than reaching into
+# agent-edge.sh's own live-pane plumbing here.
+set_task_state run18 task18 running >/dev/null 2>&1
+
+# Occurrence 2: the worker re-runs the SAME command. omp/Claude's own hook
+# fires once for this genuinely NEW blocked prompt (state is no longer
+# "blocked") -- attn_track_claim is the hooks' shared choke point, so calling
+# it directly here is exactly what omp-notify.sh/claude-notify.sh do on that
+# fresh firing: mark a new edge, then reclaim.
+omp_menu_screen "git status" > "$S1"
+pid2="$(prompt_id "$W1")"
+attn_track_claim "$W1" run18 task18 "$pid2" >/dev/null 2>&1
+key2="$(_q "SELECT json_extract(payload,'\$.key') FROM events WHERE task_id='task18' AND type='attention_tracking' ORDER BY sequence DESC LIMIT 1;")"
+[ "$key1" != "$key2" ] && ok "the re-asked occurrence hashes to a DIFFERENT dedupe key ($key1 vs $key2)" \
+  || bad "the re-asked occurrence reused the exact same key: $key1"
+: > "$SENT"
+printf '%s\n' "$W1" | attention_tick        # the controller's next pass over occurrence 2
+n_esc=$(_q "SELECT count(*) FROM events WHERE task_id='task18' AND type='attention_escalated';")
+n_frm=$(_q "SELECT count(*) FROM events WHERE task_id='task18' AND type='attention_form_served';")
+[ "$n_esc" = "0" ] && ok "the re-asked prompt is NOT escalated at first sight" \
+  || bad "escalated on first sight of the new occurrence: $n_esc"
+[ "$n_frm" = "0" ] && ok "...and not formed either" || bad "formed on first sight of the new occurrence: $n_frm"
+n_edges=$(_q "SELECT count(*) FROM events WHERE task_id='task18' AND type='attn_prompt_edge';")
+[ "${n_edges:-0}" -ge 2 ] && ok "two distinct prompt-appearance edges recorded, one per occurrence" \
+  || bad "expected >=2 attn_prompt_edge rows, saw ${n_edges:-0}"
+# Measured from occurrence 2's OWN clock, read back from the claim row
+# _attn_track_and_wake itself persisted (not a fresh `date +%s`): this
+# sandbox can suspend a backgrounded shell for a real, unpredictable gap
+# between two consecutive statements, so two independent `date +%s` calls
+# are not a safe basis for an elapsed-time assertion. Deriving both "since"
+# and "now" from the same stored occurred_at keeps the check exact
+# regardless of any such gap.
+since2_iso="$(_q "SELECT occurred_at FROM events WHERE task_id='task18' AND type='attention_tracking' ORDER BY sequence DESC LIMIT 1;")"
+since2_epoch="$(_attn_iso_epoch "$since2_iso")"
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((since2_epoch + 605)) attention_tick
+esc_after="$(_q "SELECT count(*) FROM events WHERE task_id='task18' AND type='attention_escalated';")"
+[ "$esc_after" = "1" ] && ok "the new occurrence still escalates normally once ITS OWN 10-minute window elapses" \
+  || bad "expected exactly 1 escalation measured from the new occurrence's own clock: $esc_after"
+
 printf '== PR #132 re-review item 4: attention_dedupe_key reuses a passed command_text (one screen read) ==\n'
 omp_menu_screen "count my reads please" > "$S1"
 extracted_cmd="$(prompt_command_text "$W1" 2>/dev/null)"
