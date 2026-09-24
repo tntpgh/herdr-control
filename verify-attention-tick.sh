@@ -190,28 +190,47 @@ frm2=$(_q "SELECT count(*) FROM events WHERE task_id='task3' AND type='attention
 _wait_for "$FORMLOG" "\.html" 3 && ok "formserve was actually invoked with a generated form" \
   || bad "no formserve invocation recorded: $(cat "$FORMLOG" 2>/dev/null)"
 
-printf '== deny-verdict and conductor-reserved prompts skip the ladder entirely ==\n'
+printf '== deny/reserved: conductor gets its window, no Main escalation, form only if still blocked ==\n'
 register_task run4 task4 w4 cond4 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt4 "impl:deny" >/dev/null 2>&1
 set_task_state run4 task4 running >/dev/null 2>&1
 omp_menu_screen "mkfs.ext4 /dev/sda1" > "$S1"
 : > "$SENT"
+NB="$(date +%s)"                        # NOW0 is real minutes stale by this point
 printf '%s\n' "$W1" | attention_tick
-[ ! -s "$SENT" ] && ok "a deny-class prompt never gets a conductor wake" || bad "deny-class prompt woke someone: $(cat "$SENT")"
+_wait_for "$SENT" "^send-text ${CND}$" 3 \
+  && ok "a deny-class prompt wakes its conductor at first sight (so it can deny)" \
+  || bad "deny-class prompt never woke its conductor: $(cat "$SENT")"
+[ "$(_q "SELECT count(*) FROM events WHERE task_id='task4' AND type='attention_form_served';")" = "0" ] \
+  && ok "a deny-class prompt is NOT formed on first sight (its conductor may still deny it)" \
+  || bad "deny-class prompt was formed before its conductor had a chance"
+[ "$(_q "SELECT count(*) FROM events WHERE task_id='task4' AND type='attention_tracking';")" = "1" ] \
+  && ok "a deny-class prompt is tracked so its window has a clock" || bad "deny-class prompt not tracked"
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NB + 605)) attention_tick
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NB + 610)) attention_tick
+[ "$(grep -c "^send-text ${CND}$" "$SENT")" = "1" ] \
+  && ok "the owner-window ticks add no further conductor wakes" || bad "extra conductor wakes: $(cat "$SENT")"
 [ "$(_q "SELECT count(*) FROM events WHERE task_id='task4' AND type='attention_form_served';")" = "1" ] \
-  && ok "a deny-class prompt is formed immediately, not after 10 minutes" \
-  || bad "no immediate form for the deny-class prompt"
-[ "$(_q "SELECT count(*) FROM events WHERE task_id='task4' AND type='attention_tracking';")" = "0" ] \
-  && ok "a deny-class prompt never enters the wake/escalate ladder at all" || bad "deny-class prompt was tracked like an ordinary one"
+  && ok "still blocked after the owner's window -> exactly one form" || bad "deny-class form count after window wrong"
+[ "$(_q "SELECT count(*) FROM events WHERE task_id='task4' AND type='attention_escalated';")" = "0" ] \
+  && ok "a deny-class prompt never escalates to Main (only a human can approve it)" || bad "deny-class prompt escalated to Main"
+f=$(ls -t "$WORK"/forms/*.html 2>/dev/null | head -1)
+if [ -n "$f" ] && grep -q '<style>' "$f" && grep -q 'mkfs.ext4 /dev/sda1' "$f"; then
+  ok "the served form is styled and shows the exact blocked command"
+else
+  bad "served form unstyled or missing the command: ${f:-no file}"
+fi
 
 register_task run5 task5 w5 cond5 "$CND" "$CNDB" "$W2" "$W2B" /repo /wt5 "impl:reserved" >/dev/null 2>&1
 set_task_state run5 task5 running >/dev/null 2>&1
 omp_menu_screen "wrangler deploy" > "$S2"
 : > "$SENT"
+NB="$(date +%s)"
 printf '%s\n' "$W2" | attention_tick
-[ ! -s "$SENT" ] && ok "a conductor-reserved prompt (allow-verdict, remote mutation) never gets a wake" \
-  || bad "reserved prompt woke someone: $(cat "$SENT")"
-[ "$(_q "SELECT count(*) FROM events WHERE task_id='task5' AND type='attention_form_served';")" = "1" ] \
-  && ok "the reserved prompt is formed immediately too" || bad "no immediate form for the reserved prompt"
+clean_screen > "$S2"                    # conductor denied/redirected; the prompt cleared
+printf '%s\n' "$W2" | HERDR_ATTENTION_NOW=$((NB + 700)) attention_tick
+[ "$(_q "SELECT count(*) FROM events WHERE task_id='task5' AND type='attention_form_served';")" = "0" ] \
+  && ok "a reserved prompt its conductor already handled is never formed" \
+  || bad "reserved prompt formed after the conductor handled it (the w1Q:p6 dead form)"
 
 printf '== same prompt_id on two DIFFERENT panes -> two independent keys ==\n'
 register_task run6 task6 w6 cond6 "$CND" "$CNDB" "$W3" "$W3B" /repo /wt6 "impl:six" >/dev/null 2>&1
