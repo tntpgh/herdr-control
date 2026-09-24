@@ -25,5 +25,3 @@ To render the `$task`/`$status` sidebar cards and bind the keys, merge
 `__HERDR_CONTROL__`, then `herdr server reload-config`. **Invalid token names
 fail silently** — reload reports `partial` and keeps the old layout; run
 `herdr config check` and re-verify names if a row never appears.
-</content>
-<parameter name="i">Write tab-naming-attention.md rule file

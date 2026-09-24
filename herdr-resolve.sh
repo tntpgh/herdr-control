@@ -28,6 +28,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 
 STATE="${HERDR_BRIDGE_STATE:-$HOME/.config/herdr-bridge}"
 PENDING="$STATE/pending.jsonl"
+REGISTRY="$STATE/registry.jsonl"
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
@@ -127,7 +128,35 @@ snapshot=$(mktemp "${TMPDIR:-/tmp}/herdr-pending.XXXXXX") || exit 0
 trap 'rm -f "$snapshot"; [ "$DRY" = 1 ] || pending_unlock "$lockdir"' EXIT HUP INT TERM
 cp "$PENDING" "$snapshot" || exit 0
 
-settle() { pending_drop "$PENDING" ts "$1"; }
+# _prompt_id_for_ts <ts> -> the prompt_id herdr-notify.sh recorded for this
+# alert, or empty. registry.jsonl is append-only ts->pane->prompt_id
+# (herdr-notify.sh's own write); `tail -1` picks the newest match on the rare
+# chance a ts collided. Only covers the prompt_id-keyed claim — a
+# plain-context alert's sha256(pane+context) fallback key (slack-bridge/
+# herdr-notify.sh) is never written to registry.jsonl, so it is not
+# releasable here; it still expires on its own via HERDR_ALERT_DEDUP_TTL_S.
+_prompt_id_for_ts() {
+  local ts="$1"
+  [ -s "$REGISTRY" ] || { printf ''; return; }
+  jq -r --arg ts "$ts" 'select(.ts == $ts) | .prompt_id // empty' "$REGISTRY" 2>/dev/null | tail -1
+}
+
+# A retraction — this alert is done being tracked, whether because it was
+# actually deleted from Slack or because we gave up on it — means the
+# QUESTION IT WAS ABOUT is resolved. Without releasing the dedupe claim
+# (lib/alert-gate.sh alert_claim/alert_release), a legitimate re-ask of the
+# identical prompt on the identical pane stayed silently suppressed for the
+# full TTL even though the alert that would have explained the suppression
+# was itself gone.
+settle() {
+  local ts="$1" pid
+  pid="$(_prompt_id_for_ts "$ts")"
+  if [ -n "$pid" ]; then
+    . "$here/lib/alert-gate.sh" 2>/dev/null
+    command -v alert_release >/dev/null 2>&1 && alert_release "$pane" "$pid"
+  fi
+  pending_drop "$PENDING" ts "$ts"
+}
 
 while IFS= read -r line; do
   [ -n "$line" ] || continue
