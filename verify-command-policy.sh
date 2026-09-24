@@ -893,16 +893,12 @@ check_reserved "double-quoted real-shaped secret stays reserved"          'KB_AP
 check_unreserved "already-unquoted form (regression pin)"                 'const env = { KB_API_KEY: kb-secret };'
 
 echo
-echo "== round 3/4: env/printenv dump detector, command position only =="
-# Conductor's live probe: 'const env = { KB_API_KEY: "kb-secret" };' was no
-# longer RESERVED after round 2, but classify_command still ESCALATED it
-# (reason: "enumerates or resolves secrets"), so herdr-select still refused
-# it — the bare-word rule fired on the JS/Worker bindings object `env`
-# itself, escalating identically-shaped `const cfg = {...}`-style code that
-# never mentioned "env" at all. Round 4 (independent security review, 2
-# HIGH) replaced this and conductor_reserved_reason's own separate,
-# differently-broken env rule with ONE shared _cp_env_dump_invoked — see
-# its header comment for the full command-position design.
+echo "== rounds 3/4/5: env/printenv dump detector regression pins =="
+# These rows predate round 5b's redesign (see the round 5b section below
+# for why) but every one of them still has to hold under the CURRENT
+# implementation — a fail-closed "the word env/printenv anywhere, minus
+# 5 syntactic exemptions" scan, shared by classify_command and
+# conductor_reserved_reason via _cp_env_dump_invoked.
 check "bare env still escalates"                    "env"                                    escalate
 check "bare printenv still escalates"                "printenv"                               escalate
 check "env piped still escalates"                     "env | grep KEY"                         escalate
@@ -918,15 +914,11 @@ check "Worker bindings object, declare then assign"               "let env; env 
 check "const cfg (control, never mentioned env)"                     'const cfg = { KB_API_KEY: "kb-secret" };' allow
 
 echo
-echo "== round 4: env-dump bypasses found by the independent security review =="
-# Every row here classified allow AND reserved='' before this round —
-# confirmed live via the conductor's /tmp/probe-bypass.sh. Each dump now
-# escalates AND reserves; each row that follows is a genuine command-
-# position occurrence the round-3 detector could not see: sudo/exec/
-# xargs's own flags and values, other wrapper words (nohup, time,
-# command, builtin, timeout, plain stdbuf/nice), `(`, `<(`, a path form,
-# and a trailing comment or later assignment that used to cancel the
-# earlier, real invocation.
+echo "== round 4 (pinned): wrapper/position shapes the round-3 detector missed =="
+# Every row here classified allow AND reserved='' before round 4;
+# confirmed live via the conductor's /tmp/probe-bypass.sh. Still correct
+# under round 5b's simpler design — none of these needs "command
+# position" to be found, since the word scan looks anywhere.
 check "sudo -u root env, flag+value skipped"     "sudo -u root env"                     escalate
 check_reserved   "sudo -u root env"              "sudo -u root env"
 check "command env"                              "command env"                         escalate
@@ -958,16 +950,151 @@ check_unreserved "bare function call, not a subshell" "fn(env)"
 check "bare function call, not a subshell (verdict)"  "fn(env)" allow
 
 echo
-echo "== round 4 mutation check: prove the shared env-dump detector is load-bearing =="
-# Traced rather than executed against a live-mutated copy: delete the
-# `case "\${2:-}" in =*|.*|:*) return 1 ;; esac` guard in
-# _cp_envdump_segment_is_dump and "Worker bindings object, declare then
+echo "== env-dump mutation check: prove the shared detector is load-bearing =="
+# Traced rather than executed against a live-mutated copy: in
+# _cp_envdump_word_is_dump, delete the exemption-2 block (`if (nxt == "="
+# && nxt2 != "=") exempt = 1`) and "Worker bindings object, declare then
 # assign" ('let env; env = {}') flips from PASS (allow/unreserved) to
-# FAIL (escalate/reserved); restore it and it flips back. Delete the
-# `env|printenv` exact-match instead (widen it to accept anything) and
-# every "must stay clean" row in this section flips to escalate/reserved
-# while the "must be a dump" rows stop distinguishing anything — either
-# mutation is caught. See the PR body for the traced result.
+# FAIL (escalate/reserved); restore it and it flips back. Widen the
+# `tolower(substr(line,i,3)) == "env"` match to accept anything instead
+# and every "must stay clean" row in this section flips to escalate/
+# reserved while the "must be a dump" rows stop distinguishing anything
+# — either mutation is caught. See the PR body for the traced result.
+
+echo
+echo "== round 5b REDIRECT: back to fail-closed, delete command-position machinery =="
+# The conductor probed round 4's command-position design live
+# (/tmp/probe3.sh) and found it fail-open — parsing shell command
+# positions keeps losing to every new wrapper, keyword, -c body, and
+# substitution. Reverted to the ORIGINAL rule this file had before round
+# 3: the word env/printenv anywhere, minus 5 narrow syntactic exemptions
+# (see _cp_envdump_word_is_dump's header). _cp_envdump_segments, the
+# wrapper flag-value tables, and _cp_dollar_paren_bodies are gone —
+# nothing else used them.
+check "shell keyword did not create a boundary"        "! env"                                escalate
+check_reserved "shell keyword did not create a boundary" "! env"
+check "exec -a swallowed the command word"              "exec -a x env"                        escalate
+check_reserved "exec -a swallowed the command word"    "exec -a x env"
+check "if/then keyword position"                        "if true; then env; fi"                escalate
+check_reserved "if/then keyword position"              "if true; then env; fi"
+check "for/do keyword position"                          "for i in 1; do env; done"              escalate
+check_reserved "for/do keyword position"                "for i in 1; do env; done"
+check "env-var prefix assignment"                        "FOO=1 env | grep -i token"             escalate
+check_reserved "env-var prefix assignment"              "FOO=1 env | grep -i token"
+check "LC_ALL prefix assignment"                          "LC_ALL=C env"                          escalate
+check_reserved "LC_ALL prefix assignment"                "LC_ALL=C env"
+check "sudo with a prefix assignment"                      "sudo FOO=1 env"                        escalate
+check_reserved "sudo with a prefix assignment"            "sudo FOO=1 env"
+check "bash -c body"                                        "bash -c env"                           escalate
+check_reserved "bash -c body"                              "bash -c env"
+check "sh -c body, quoted"                                   "sh -c 'printenv'"                      escalate
+check_reserved "sh -c body, quoted"                         "sh -c 'printenv'"
+check "eval"                                                  "eval env"                              escalate
+check_reserved "eval"                                        "eval env"
+check "dollar-paren, no wrapper"                                '$(echo env)'                           escalate
+check_reserved "dollar-paren, no wrapper"                     '$(echo env)'
+check "backtick, no wrapper"                                     '`echo printenv`'                       escalate
+check_reserved "backtick, no wrapper"                           '`echo printenv`'
+check "timeout with a duration"                                    "timeout 5 env"                         escalate
+check_reserved "timeout with a duration"                          "timeout 5 env"
+check "xargs -n 1"                                                    "echo | xargs -n 1 env"                escalate
+check_reserved "xargs -n 1"                                          "echo | xargs -n 1 env"
+check "caffeinate -i"                                                    "caffeinate -i env"                     escalate
+check_reserved "caffeinate -i"                                          "caffeinate -i env"
+check "arch -arm64"                                                        "arch -arm64 env"                       escalate
+check_reserved "arch -arm64"                                              "arch -arm64 env"
+check "op run -- env"                                                        "op run -- env"                         escalate
+check_reserved "op run -- env"                                              "op run -- env"
+check "script -q /dev/null"                                                    "script -q /dev/null env"               escalate
+check_reserved "script -q /dev/null"                                          "script -q /dev/null env"
+check "conditional with a pipe"                                                  "if env | grep TOKEN; then :; fi"       escalate
+check_reserved "conditional with a pipe"                                        "if env | grep TOKEN; then :; fi"
+# The 5 exemptions still hold under the new design.
+check_unreserved "const env object literal, again"      'const env = { KB_API_KEY: "kb-secret" };'
+check_unreserved "member access, again"                 "env.KB_API_KEY"
+check_unreserved "function argument, again"             "worker.fetch(req, env)"
+check_unreserved "declare then assign, again"           "let env; env = {}"
+check_unreserved "bare function call, again"            "fn(env)"
+
+echo
+echo "== round 5, section C: env dumps that never spell env/printenv =="
+check_reserved "bare export dumps every exported var"   "export"
+check_reserved "export -p"                               "export -p"
+check_unreserved "export with an assignment is not a dump" "export FOO=bar"
+check_reserved "declare -x"                               "declare -x"
+check_reserved "declare -p"                               "declare -p"
+check_unreserved "declare -a is not a dump"              "declare -a arr"
+check_reserved "typeset -x"                                "typeset -x"
+check_reserved "typeset -p"                                "typeset -p"
+check_reserved "compgen -e"                                  "compgen -e"
+check_reserved "compgen -v"                                    "compgen -v"
+check_reserved "BSD ps dashless cluster with e"                  "ps eww"
+check_reserved "System V/GNU -E"                                    "ps -E"
+check_reserved "BSD ps auxe"                                          "ps auxe"
+check_unreserved "ps aux has no e, not a dump"                       "ps aux"
+check_reserved "launchctl getenv"                                       "launchctl getenv HOME"
+check_reserved "launchctl export"                                         "launchctl export"
+check_reserved "cat /proc/self/environ"                                     "cat /proc/self/environ"
+check_reserved "process substitution reading /proc environ"                  "echo \$(</proc/self/environ)"
+check_reserved "python os.environ"                                              "python3 -c 'import os; print(os.environ)'"
+check_reserved "perl %ENV"                                                        "perl -e 'print %ENV'"
+check_reserved "ruby p ENV"                                                         "ruby -e 'p ENV'"
+check_reserved "bare set also dumps"                                                  "set"
+check "bare set escalates too"                                                          "set" escalate
+
+echo
+echo "== round 5, section D: secret-named \$VAR expansion (the worst finding) =="
+# 2026-09-19: a live token was echoed into a session transcript this
+# exact way and had to be rotated. Any \$NAME/\${NAME...} where NAME
+# contains, case-insensitively, KEY/TOKEN/SECRET/PASSWORD/PASSWD/
+# CREDENTIAL/OP_SERVICE escalates and reserves — quotes included, since
+# scannable_command strips them before this runs either way.
+check_reserved "echo a 1Password service-account token var" 'echo $OP_SERVICE_ACCOUNT_TOKEN'
+check "echo a 1Password service-account token var (verdict)" 'echo $OP_SERVICE_ACCOUNT_TOKEN' escalate
+check_reserved "printf a KEY-named var, double-quoted"      'printf "%s\n" "$KB_API_KEY"'
+check "printf a KEY-named var, double-quoted (verdict)"     'printf "%s\n" "$KB_API_KEY"' escalate
+check_reserved "braced TOKEN-named var"                      'echo ${GITHUB_TOKEN}'
+check "braced TOKEN-named var (verdict)"                     'echo ${GITHUB_TOKEN}' escalate
+check_reserved "interpolated into a curl header"               'curl -H "Authorization: Bearer $CF_API_TOKEN" https://example.com'
+check "interpolated into a curl header (verdict)"              'curl -H "Authorization: Bearer $CF_API_TOKEN" https://example.com' escalate
+check_unreserved "ordinary var, not secret-shaped"           'echo $HOME'
+check "ordinary var stays allow"                             'echo $HOME' allow
+
+echo
+echo "== round 5b: pre-existing-on-main credential readers, closed here =="
+check_reserved "gh auth token"                    "gh auth token"
+check_reserved "gh auth status --show-token"      "gh auth status --show-token"
+check_reserved "gh auth status -t"                "gh auth status -t"
+check_reserved "gcloud print-access-token"        "gcloud auth print-access-token"
+check_reserved "gcloud print-identity-token"       "gcloud auth print-identity-token"
+check_reserved "fly auth token"                     "fly auth token"
+check_reserved "flyctl auth token"                   "flyctl auth token"
+check_reserved "git credential fill"                  "git credential fill"
+check_reserved "git credential-osxkeychain get"        "git credential-osxkeychain get"
+check_reserved "security dump-keychain"                  "security dump-keychain -d"
+check_reserved "security export"                           "security export -k login.keychain -t certs -f pkcs12 -o /tmp/out.p12"
+check_reserved "op inject"                                    "op inject -i tpl"
+check_reserved "op document get"                                "op document get X"
+check_reserved "op run --"                                        "op run -- anything"
+check_reserved ".envrc"                                             "cat .envrc"
+check_reserved ".dev.vars"                                             "cat .dev.vars"
+check_reserved ".env_local"                                               "cat .env_local"
+check_reserved "~/.zshenv"                                                   "cat ~/.zshenv"
+check_reserved "~/.docker/config.json"                                        "cat ~/.docker/config.json"
+check_reserved "~/.kube/config"                                                  "cat ~/.kube/config"
+check_reserved "~/.netrc"                                                          "cat ~/.netrc"
+check_reserved "~/.npmrc"                                                            "cat ~/.npmrc"
+check_reserved "~/.aws/credentials"                                                    "cat ~/.aws/credentials"
+
+echo
+echo "== round 5 regression guard: ordinary worker traffic stays allowed =="
+check_unreserved "own-branch push, plain name"    "git push -u origin feat/approve-safe-worker-ops"
+check_unreserved "gh pr create, full form"        "gh pr create --base main --head feat/x --title t --body-file /tmp/pr-body.txt"
+check_unreserved "diff of two ordinary files"     "diff package.json package-lock.json"
+check_unreserved "echo an ordinary var"           'echo $HOME'
+check_unreserved "ps aux, no environment flag"    "ps aux"
+check_unreserved "export with an assignment"      "export FOO=bar"
+check_unreserved "declare an array"               "declare -a arr"
 
 echo
 echo "== case 4 mutation check: prove the placeholder carve-out is load-bearing =="

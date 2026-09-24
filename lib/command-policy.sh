@@ -797,170 +797,133 @@ _cp_flatten_substitutions() {
 # Deny rules are checked ahead of require_approval ones so a command that
 # happens to also match a lesser pattern is still denied, not merely
 # escalated.
-# Shared env/printenv dump detector — round 4 (independent security
-# review, 2 HIGH findings, both confirmed live). classify_command and
-# conductor_reserved_reason each had their OWN inline env/printenv rule,
-# and each was wrong in a DIFFERENT, overlapping way:
-#   (a) classify_command's round-3 rule (_cp_enumerates_env_command,
-#       deleted here) skipped env whenever the NEXT TOKEN — not the next
-#       character — started with `=`/`:`/looked like `env`, so
-#       `env env=1` and `nohup env | head -200 # env: dump` sailed
-#       through: `env=1` and `# env: dump` are TEXT AFTER the real
-#       invocation, not part of it, and should never have cancelled it.
-#   (b) conductor_reserved_reason's round-2 rule disabled itself if
-#       ` env=` or ` env:` appeared ANYWHERE in the whole command, so a
-#       real dump could hide behind an unrelated LATER assignment.
-#   (c) neither one recognised `(`, `<(`, `>(`, `{`, a path form
-#       (`/usr/bin/env`), or most of the wrapper words (nohup, time,
-#       command, builtin, timeout, xargs, plain `sudo`) as a command
-#       position at all.
-# ONE function now, called by both, so they cannot drift apart again.
+# Shared env/printenv dump detector — round 5b REDIRECT (the conductor
+# probed round 4's command-position design live and found it fail-open:
+# `FOO=1 env`, `bash -c env`, `sh -c 'printenv'`, `eval env`, `$(echo
+# env)`, `` `echo printenv` ``, `timeout 5 env`, `xargs -n 1 env`,
+# `caffeinate -i env`, `arch -arm64 env`, `op run -- env`, `script -q
+# /dev/null env`, `if env | grep TOKEN; then :; fi`, plus round 4's own
+# regressions `! env` and `exec -a x env` — fifteen ways in one probe.
+# "Parsing shell command positions will keep losing: every wrapper,
+# keyword, -c body and substitution is a new hole" (the conductor's own
+# words). Deleted every part of that machinery (_cp_envdump_segments, the
+# wrapper flag-value tables, _cp_dollar_paren_bodies — nothing else used
+# any of them) and went back to the ORIGINAL fail-closed rule this file
+# had before round 3 ever touched it: ANY occurrence of the word `env`/
+# `printenv` (or a path ending in one), ANYWHERE in the command, is a
+# dump — no notion of "command position" at all, so there is no boundary
+# left to be a hole in.
 #
-# The rule: a word that is exactly `env`/`printenv` (basename-compared, so
-# a path form like `/usr/bin/env` counts) is a DUMP when it sits at
-# COMMAND POSITION — string start, or right after `;`/`&`/`|`/`(`/`)`/
-# `{`/`}`/a newline/`$(`/a backtick/`<(`/`>(`, or right after a wrapper
-# word (sudo with any of its own flags/args, exec, xargs, nohup, time,
-# command, builtin, nice, `timeout <n>`, stdbuf) — UNLESS the very next
-# character after the word (skipping only whitespace, never skipping to
-# a later token's CONTENT) is `=`, `.`, or `:`, meaning it is an
-# identifier/assignment/member-access, never an invocation.
+# The only carve-out is 5 narrow, SYNTACTIC exemptions for the JS/
+# Worker-bindings shapes round 3 was built to stop breaking, checked per
+# OCCURRENCE (an `env` this exempts does not exempt a DIFFERENT `env`
+# elsewhere in the same command):
+#   1. immediately followed by `.`                    env.KB_API_KEY
+#   2. followed by optional spaces then `=` (not `==`) const env = {...}
+#   3. followed by optional spaces then `:`            { env: x }
+#   4. preceded by `const `, `let `, or `var `         let env;
+#   5. preceded by `(` that itself directly follows an identifier
+#      character, or by `,`/`, `                       fn(env), fetch(req, env)
+# Anything else counts as a dump. `let env; env = {}` needs no special
+# case: it is two occurrences (split by the `;`, though this rule no
+# longer even looks at segments) — the first is exempted by rule 4, the
+# second by rule 2.
 #
-# `_cp_envdump_segments` does the position-finding: it splits text on
-# every one of those boundary characters, so "is the FIRST word of THIS
-# segment (after skipping wrapper words) env/printenv" answers "is this
-# occurrence at command position" for every boundary at once — including
-# `<(`/`>(`, replaced with a bare split rather than protected, because
-# here (unlike the data-file walker) they ARE a command position, not an
-# argument to protect. A `(` immediately preceded by an identifier
-# character is protected first and never split at all: `fn(env)` and
-# `fetch(req, env)` are function calls, not subshells, so `env` there is
-# never even the first word of a segment — never mind command position.
-#
-# Checking only the FIRST token of a segment, and (if that token is a
-# clean `env`/`printenv`) the token immediately after it, is what tells
-# `env | grep` and `xargs env` (invocation) apart from `env = {}` and
-# `env.KEY` (assignment / member access) even when both start at a
-# genuine command position — `let env; env = {}` splits into two
-# segments on the `;`; the first segment's first word is `let`, not
-# `env`, so the first `env` is never even examined; the second segment's
-# first word IS a clean `env`, but its very next token is `=`, so it is
-# excluded there.
-#
-# `$(env)` / `` `env` `` never reach the segment-based check at all —
-# command substitution is flattened to inline text by scannable_command
-# before this runs, which erases the very boundary that makes it a
-# command position — so those are extracted from RAW separately, the
-# same reasoning as `_cp_procsub_bodies` for `<(...)`/`>(...)` in the
-# data-file walker.
-_cp_dollar_paren_bodies() {             # raw -> one $(...)/`...` body per line
+# Case-insensitive on the word itself (`ENV`, `Printenv`) — this file's
+# original behaviour — but the exemption keywords (`const `/`let `/
+# `var `) are real, always-lowercase JS syntax and stay case-sensitive:
+# over-matching an exemption is the one direction this function must
+# never take.
+_cp_envdump_word_is_dump() {            # norm -> 0 (true) if it dumps env/printenv, anywhere but the 5 exemptions
   printf '%s' "$1" | awk '
+    function is_ident(c) { return (c ~ /[A-Za-z0-9_]/) }
     {
-      line = $0; n = length(line); i = 1
+      line = $0; n = length(line); i = 1; found = 0
       while (i <= n) {
-        c = substr(line, i, 1); nx = substr(line, i + 1, 1)
-        if (c == "$" && nx == "(") {
-          d = 1; j = i + 2
-          while (j <= n && d > 0) {
-            ch = substr(line, j, 1)
-            if (ch == "(") d++
-            else if (ch == ")") d--
-            j++
+        wlen = 0
+        if (tolower(substr(line, i, 8)) == "printenv") wlen = 8
+        else if (tolower(substr(line, i, 3)) == "env") wlen = 3
+        if (wlen == 0) { i++; continue }
+        before = (i > 1) ? substr(line, i - 1, 1) : ""
+        after  = substr(line, i + wlen, 1)
+        if (before != "" && is_ident(before)) { i++; continue }
+        if (after  != "" && is_ident(after))  { i++; continue }
+        exempt = 0
+        if (after == ".") exempt = 1
+        if (!exempt) {
+          j = i + wlen
+          while (substr(line, j, 1) == " " || substr(line, j, 1) == "\t") j++
+          nxt = substr(line, j, 1); nxt2 = substr(line, j + 1, 1)
+          if (nxt == "=" && nxt2 != "=") exempt = 1
+          else if (nxt == ":") exempt = 1
+        }
+        if (!exempt) {
+          if (substr(line, i - 6, 6) == "const ") exempt = 1
+          else if (substr(line, i - 4, 4) == "let ") exempt = 1
+          else if (substr(line, i - 4, 4) == "var ") exempt = 1
+        }
+        if (!exempt) {
+          p1 = (i > 1) ? substr(line, i - 1, 1) : ""
+          if (p1 == "(") {
+            p2 = (i > 2) ? substr(line, i - 2, 1) : ""
+            if (is_ident(p2)) exempt = 1
+          } else if (p1 == ",") {
+            exempt = 1
+          } else if (p1 == " ") {
+            p2 = (i > 2) ? substr(line, i - 2, 1) : ""
+            if (p2 == ",") exempt = 1
           }
-          print substr(line, i + 2, j - i - 3)
-          i = j
-          continue
         }
-        if (c == "`") {
-          j = i + 1
-          while (j <= n && substr(line, j, 1) != "`") j++
-          print substr(line, i + 1, j - i - 1)
-          i = j + 1
-          continue
-        }
-        i++
+        if (!exempt) found = 1
+        i += wlen
       }
+      print (found ? "1" : "0")
     }'
 }
-_cp_envdump_segments() {                # text -> one candidate command-position segment per line
-  printf '%s' "$1" | tr '\n' ';' |
-    sed -E 's/([A-Za-z0-9_])\(/\1@FNCALL@/g; s/<\(/\n/g; s/>\(/\n/g; s/(\&\&|\|\||[;|&(){}])/\n/g; s/@FNCALL@/(/g'
-}
-_cp_envdump_segment_is_dump() {         # segment -> 0 (true) if it invokes env/printenv as a dump
-  local seg="$1" w wv wvl
-  set -f
-  # shellcheck disable=SC2086
-  set -- $seg
-  set +f
-  while [ "$#" -gt 0 ]; do
-    w="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
-    case "$w" in
-      sudo|exec|xargs|nohup|time|command|builtin|nice|timeout|stdbuf)
-        case "$w" in
-          sudo)    wv='ugphCDRT'; wvl='user|group|host|prompt|chdir|close-from|role|type|other-user' ;;
-          timeout) wv='sk';       wvl='signal|kill-after' ;;
-          nice)    wv='n';        wvl='adjustment' ;;
-          stdbuf)  wv='ioe';      wvl='input|output|error' ;;
-          *)       wv=;           wvl= ;;
-        esac
-        shift
-        while [ "$#" -gt 0 ]; do
-          case "$1" in
-            --) shift; break ;;
-            --*=*) shift ;;
-            --*)
-              if [ -n "$wvl" ] && printf '%s' "${1#--}" | grep -qE "^($wvl)$"; then
-                shift; [ "$#" -gt 0 ] && shift
-              else
-                shift
-              fi ;;
-            -?)
-              if [ -n "$wv" ] && printf '%s' "${1#-}" | grep -q "[$wv]"; then
-                shift; [ "$#" -gt 0 ] && shift
-              else
-                shift
-              fi ;;
-            -*) shift ;;
-            *) break ;;
-          esac
-        done
-        continue ;;
-    esac
-    break
-  done
-  [ "$#" -gt 0 ] || return 1
-  w="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
-  case "$w" in
-    env|printenv) ;;
-    *) return 1 ;;
-  esac
-  case "${2:-}" in
-    =*|.*|:*) return 1 ;;
-  esac
-  return 0
-}
+
+# ---- env dumps that never spell "env" -------------------------------------
+# Round 5, section C (already open on main, closed here in the shared
+# detector so it travels with the word-based rule instead of drifting
+# from it): a handful of commands dump the environment by a completely
+# different name. Each is a narrow, literal shape — the exclusions
+# (`export FOO=bar` is an assignment, `declare -a arr` declares an array,
+# `ps aux` has no `e`) are the reason each pattern is this specific, not
+# a looser "the whole command mentions export/declare/ps".
+#
+# `ps` is the one CASE-SENSITIVE piece here on purpose: BSD ps spells the
+# environment flag lowercase (`eww`, `auxe`), GNU/other ps spells it
+# `-E` uppercase, and GNU's OWN lowercase `-e` means "every process" —
+# unrelated to environment. Case-folding this would flag `ps -e` too.
+_CP_ENVDUMP_OTHER_RE='\b(export|set)([[:space:]]*($|[;&|])|[[:space:]]+-p\b)|\b(declare|typeset)[[:space:]]+-[A-Za-z]*[xp]|\bcompgen[[:space:]]+-[A-Za-z]*[ev]|\blaunchctl[[:space:]]+(getenv|export)\b|/proc/[^[:space:]]*/environ\b|\bos\.environ\b|%ENV\b|\bENV\[|\bp[[:space:]]+ENV\b'
+_CP_ENVDUMP_PS_RE='\bps[[:space:]]+([A-Za-z]*e[A-Za-z]*\b|-[A-Za-z]*E[A-Za-z]*)'
+
 _cp_env_dump_invoked() {                # raw -> 0 (true) if env/printenv is invoked to dump the environment
-  local raw="$1" norm seg body
+  local raw="$1" norm
   norm="$(scannable_command "$raw")"
-  while IFS= read -r seg; do
-    [ -n "$seg" ] || continue
-    _cp_envdump_segment_is_dump "$seg" && return 0
-  done <<EOF
-$(_cp_envdump_segments "$norm")
-EOF
-  while IFS= read -r body; do
-    [ -n "$body" ] || continue
-    while IFS= read -r seg; do
-      [ -n "$seg" ] || continue
-      _cp_envdump_segment_is_dump "$seg" && return 0
-    done <<EOF2
-$(_cp_envdump_segments "$body")
-EOF2
-  done <<EOF3
-$(_cp_dollar_paren_bodies "$raw")
-EOF3
+  [ "$(_cp_envdump_word_is_dump "$norm")" = 1 ] && return 0
+  _cp_imatch "$_CP_ENVDUMP_OTHER_RE" "$norm" && return 0
+  _cp_match "$_CP_ENVDUMP_PS_RE" "$norm" && return 0
   return 1
 }
+
+# ---- secret-named variable expansion ---------------------------------------
+# Round 5, section D — the worst finding: `echo $OP_SERVICE_ACCOUNT_TOKEN`,
+# `printf '%s\n' "$KB_API_KEY"`, `echo ${GITHUB_TOKEN}`, and a credential
+# interpolated straight into a header (`curl -H "Authorization: Bearer
+# $CF_API_TOKEN" ...`) were all allow + unreserved on main. On
+# 2026-09-19 a live token was echoed into a session transcript this
+# exact way; a worker must never be able to auto-approve reading one.
+# Any `$NAME` or `${NAME...}` expansion where NAME contains, case-
+# insensitively, KEY/TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/OP_SERVICE
+# escalates and reserves — inside double quotes (already stripped by
+# scannable_command before this runs) and inside single quotes too: a
+# literal `$VAR` in single quotes never expands, but escalating it anyway
+# is the safe direction the brief asks for.
+_CP_SECRET_VAR_RE='\$\{?[A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|OP_SERVICE)[A-Za-z0-9_]*\b'
+_cp_secret_var_expanded() {             # norm -> 0 (true) if a secret-named $VAR/${VAR} is expanded
+  _cp_imatch "$_CP_SECRET_VAR_RE" "$1"
+}
+
 
 classify_command() {
   if [ "$#" -lt 1 ]; then
@@ -1373,9 +1336,24 @@ EOF
   # header comment above (and README/SKILL.md) already promised was
   # covered and was not: peer automation could auto-approve a prompt that
   # reads an SSH key or pipes ~/.aws/credentials to an external URL.
-  _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|id_(rsa|ed25519|ecdsa)\b|\.env(\.[A-Za-z0-9_-]+)?\b|\bcredentials\b' "$norm" &&
+  #
+  # Round 5: the `.env` alternative required a literal `.` right after
+  # `env` or nothing at all, so `.envrc`/`.env_local`/`.env-foo` (no dot
+  # separator) never matched at all — found on main, closed here with a
+  # single trailing `[A-Za-z0-9_.-]*` instead of an optional dotted group.
+  # `.zshenv`/`.docker/config.json`/`.kube/config`/`.netrc`/`.npmrc`
+  # are new; the latter two already lived in conductor_reserved_reason's
+  # own copy and never made it here.
+  _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.netrc\b|\.npmrc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env[A-Za-z0-9_.-]*\b|\bcredentials\b' "$norm" &&
     _cp_consider 1 "reads credential material — a human must approve"
-  { _cp_env_dump_invoked "$1" || _cp_imatch '\bop[[:space:]]+read\b|\bgh[[:space:]]+secret\b|\baws[[:space:]]+(configure|sts)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm"; } &&
+  # Round 5: `op inject`/`op run`/`op document get`, `gh auth token`/
+  # `gh auth status --show-token|-t`, `gcloud auth print-*-token`,
+  # `fly`/`flyctl auth token`, `git credential`/`git credential-*`, and
+  # `security dump-keychain`/`security export` all read or print a live
+  # credential and were allow+unreserved on main. Section D (a secret-
+  # named `$VAR`/`${VAR}` expansion) is its own shared check, folded into
+  # this same rule.
+  { _cp_env_dump_invoked "$1" || _cp_secret_var_expanded "$norm" || _cp_imatch '\bop[[:space:]]+(read|inject|run|document[[:space:]]+get)\b|\bgh[[:space:]]+secret\b|\bgh\b.*\bauth\b.*(\btoken\b|\bstatus\b.*(-t\b|--show-token))|\bgcloud\b.*\bauth\b.*\bprint-(access|identity)-token\b|\b(fly|flyctl)\b.*\bauth\b.*\btoken\b|\bgit\b.*\bcredential(-[A-Za-z0-9_-]+)?\b|\baws[[:space:]]+(configure|sts)\b|\bsecurity[[:space:]]+(find-(generic|internet)-password|dump-keychain|export)\b' "$norm"; } &&
     _cp_consider 1 "enumerates or resolves secrets"
 
   # escalate — production / infrastructure scope change. A name-based rule is
@@ -1642,11 +1620,18 @@ conductor_reserved_reason() {
   # bare `git push` / `--all` / `--mirror` (upstream may be main), agent
   # flags that switch approvals off, edits to the two policy scripts, the gh
   # OAuth token file and bare env dumps were all classify=allow + unreserved.
-  # Round 4: env/printenv dumps now go through the SAME _cp_env_dump_invoked
-  # classify_command uses — see its header for the full design and the two
-  # HIGH findings that made this a shared function instead of two.
-  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.env(\.[A-Za-z0-9_-]+)?\b|id_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[;[:space:]])(export|set)[[:space:]]*($|;)|\bdeclare[[:space:]]+-p\b|\bop[[:space:]]+(read|item[[:space:]]+get)\b|\bsecurity[[:space:]]+find-(generic|internet)-password\b' "$norm" ||
-     _cp_env_dump_invoked "$1"; then
+  # Round 4/5: env/printenv dumps, section-C shapes that never spell
+  # "env" (bare export/set, declare -x/-p, ps eww/-E, ...), and a
+  # secret-named `$VAR` expansion all go through the SAME shared checks
+  # classify_command uses — see their header comments for the full
+  # design. `export`/`set` bare and `declare -p` used to have their own
+  # copy inline here; deleted in favour of the shared one so the two
+  # never drift again. New this round: `.zshenv`/`.docker/config.json`/
+  # `.kube/config`, and `op inject`/`op run`/`op document get`/`gh auth
+  # token`/`gcloud auth print-*-token`/`fly auth token`/`git credential`/
+  # `security dump-keychain`/`security export`.
+  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env[A-Za-z0-9_.-]*\b|\bcredentials\b|\bop[[:space:]]+(read|item[[:space:]]+get|inject|run|document[[:space:]]+get)\b|\bgh[[:space:]]+secret\b|\bgh\b.*\bauth\b.*(\btoken\b|\bstatus\b.*(-t\b|--show-token))|\bgcloud\b.*\bauth\b.*\bprint-(access|identity)-token\b|\b(fly|flyctl)\b.*\bauth\b.*\btoken\b|\bgit\b.*\bcredential(-[A-Za-z0-9_-]+)?\b|\bsecurity[[:space:]]+(find-(generic|internet)-password|dump-keychain|export)\b' "$norm" ||
+     _cp_env_dump_invoked "$1" || _cp_secret_var_expanded "$norm"; then
     printf 'credential-value access remains human-only\n'
   # Terrence's authorized loosening, 2026-09-24: a credential-shaped VALUE
   # typed directly into the command (not a path/command match above) is
