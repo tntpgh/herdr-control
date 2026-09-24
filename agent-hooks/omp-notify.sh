@@ -125,6 +125,16 @@ fi
 # All the guards (agent-pane gate, conductor pane-birth revalidation, prompt_id
 # capture, delivery-outcome recording) live in lib/push-wake.sh, shared with
 # claude-notify.sh so the two cannot drift.
-push_wake "$msg" "$where" "$full_cmd" >/dev/null 2>&1 || true
+#
+# Claimed through the SAME attn_track_<key> the attention controller uses
+# (lib/attention-key.sh) before calling push_wake at all — PR #132 review,
+# item 6: a firing on a still-open prompt the controller (or an earlier
+# firing) already owns must not call push_wake again — that is what turned
+# one held prompt into two delivered wakes (item 1). HERDR_WAKE_LEGACY=1 is
+# the rollback: every firing calls push_wake again, unclaimed.
+. "$here/lib/attention-key.sh"
+if attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$(prompt_id "$pane" 2>/dev/null)"; then
+  push_wake "$msg" "$where" "$full_cmd" >/dev/null 2>&1 || true
+fi
 
 exit 0

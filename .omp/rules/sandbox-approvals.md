@@ -48,5 +48,3 @@ not-yet-prompting pane (Step 7's write-path check) is not the same as watching
 it correctly REFUSE a live prompt whose command classifies as `escalate` or
 `deny`. Report exactly which of these you watched happen versus which you are
 inferring from reading the code.
-</content>
-<parameter name="i">Write sandbox-approvals.md rule file

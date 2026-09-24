@@ -178,6 +178,11 @@ fi
 # already sitting in the composer (an operator typed it directly, or a prior
 # send-to-agent.sh call left it stranded) — this call exists only to press
 # Enter and confirm.
+# Captured BEFORE any typing touches the pane: this is what a later
+# owner_acted record (below) correlates against — the prompt this delivery
+# was actually answering, not whatever the composer shows after we typed
+# into it.
+_pre_pid="$(prompt_id "$pane" 2>/dev/null)"
 if [ "$submit_only" -eq 0 ]; then
   herdr pane send-text "$pane" "$text" >/dev/null 2>&1 || {
     echo "ERROR: 'herdr pane send-text $pane' failed — pane target valid? socket allowlisted?" >&2
@@ -250,6 +255,25 @@ for _ in 1 2 3 4 5 6; do
     unreadable=0
     if [ "$baseline_ok" -eq 1 ] && [ "$after" != "$baseline" ] && ! _still_in_composer "$after"; then
       echo "SUBMITTED: $pane composer changed"
+      # Best-effort, never able to affect the exit code above: if the SENDER
+      # is this pane's own registered conductor, the attention controller
+      # (item 3a, PR #132 review item 5) needs to know the owner already
+      # acted on the prompt captured as _pre_pid, even if a later tick's
+      # repaint has not cleared it yet. HERDR_PANE_ID here is the CALLER's
+      # own pane (the conductor invoking this script), never the target.
+      if [ -n "${HERDR_PANE_ID:-}" ] && [ -f "$_here/lib/run-registry.sh" ]; then
+        (
+          . "$_here/lib/run-registry.sh" 2>/dev/null
+          _owner_task="$(task_for_pane "$pane" 2>/dev/null)"
+          _owner_conductor="$(printf '%s' "$_owner_task" | jq -r '.conductor_pane_id // empty' 2>/dev/null)"
+          if [ -n "$_owner_conductor" ] && [ "$_owner_conductor" = "$HERDR_PANE_ID" ]; then
+            append_event "$(printf '%s' "$_owner_task" | jq -r '.run_id // empty')" \
+              "$(printf '%s' "$_owner_task" | jq -r '.task_id // empty')" "owner_acted" \
+              "$(jq -nc --arg p "$pane" --arg pid "$_pre_pid" --arg f "$HERDR_PANE_ID" \
+                 '{pane:$p, prompt_id:$pid, from:$f}')" >/dev/null 2>&1
+          fi
+        ) 2>/dev/null
+      fi
       exit 0
     fi
     baseline="$after"; baseline_ok=1

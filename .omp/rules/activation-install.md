@@ -86,5 +86,3 @@ hand-started Claude session already has.
 
 If the operator does not use omp, skip this entirely: nothing else in this
 runbook depends on it, and it does not affect the Claude hook wiring above.
-</content>
-<parameter name="i">Write activation-install.md rule file

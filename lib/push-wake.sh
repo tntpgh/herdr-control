@@ -186,9 +186,10 @@ push_wake() {
   [ -n "$pid" ] && wake="$wake  [prompt_id=$pid]"
   if [ -n "${HERDR_PANE_ID:-}" ]; then
     wake="$wake  ·  READ IT: herdr pane read ${HERDR_PANE_ID} --source visible --lines 30"
-    # No --authority needed: a non-interactive caller now defaults to `peer`, so
-    # command policy gates this automatically and a destructive prompt comes back
-    # exit 8 rather than being auto-approved.
+    # No --authority needed: every caller without an explicit flag (or the
+    # Slack button) is `peer`, terminal-attached or not, so command policy
+    # gates this and a destructive prompt comes back exit 8 rather than
+    # being auto-approved.
     wake="$wake  ·  ANSWER IT: $_pw_dir/herdr-select.sh ${HERDR_PANE_ID} <option>"
     [ -n "$pid" ] && wake="$wake --expect-prompt-id $pid"
   fi
@@ -262,10 +263,78 @@ push_wake() {
       "${base}_result_${attempt_uniq}" >/dev/null 2>&1 || true
   fi
 
+  # A conductor wake that did not land is exactly the case Slack's own hold
+  # (lib/alert-gate.sh) cannot see: that mechanism watches the PANE, not
+  # whether the peer notification path actually reached anyone. Give it
+  # HERDR_WAKE_FAIL_ALERT_S to resolve itself before paging directly.
+  [ "$rc" -eq 0 ] || _pw_wake_fail_realert "${HERDR_PANE_ID:-}" "$pid" \
+    "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$outcome"
   # A wake that was typed but never submitted is a FAILED wake, and the log now
   # says so rather than implying the conductor was reached.
   [ "$rc" -eq 0 ] && return 0
   printf 'push-wake: wake to %s ended %s (exit %s) — conductor may not have seen it\n' \
     "$cpane" "$outcome" "$rc" >&2
   return 1
+}
+
+# ---- symptom: the conductor wake failed and nobody has noticed ------------
+# .handoffs/SPEC.md KEEP list: "a wake that failed delivery (refused/
+# unsubmitted) and no one answered within 10 min". Measured on this machine's
+# own registry (48h window): 176 of 353 wake_result events were NOT
+# `submitted` (116 `unknown`, 56 `unsubmitted`, 4 `refused`) — roughly half
+# the time the ONE channel meant to catch a blocked worker (a peer reading
+# the steering queue) silently did not land, with nothing watching for it.
+#
+# lib/alert-gate.sh's grace hold cannot see this: it watches the PANE (is a
+# prompt still up), never whether the wake meant to surface that pane to a
+# peer actually arrived. This is the backstop for THAT gap specifically —
+# it runs only when push_wake's own delivery already failed.
+#
+# Deliberately re-checks the TASK, not just the pane, before paging: the
+# operator may have answered directly in the worker's own terminal, which
+# unblocks the task even though the conductor never got the wake at all —
+# that must read as resolved, not as "still nobody noticed".
+#
+# Runs detached, same discipline as grace_realert: a hook must never hold the
+# agent's turn on a 10-minute sleep. The eventual herdr-notify.sh call goes
+# through the SAME prompt_id dedupe as every other caller (lib/alert-gate.sh
+# alert_claim), so if the primary alert path already posted for this exact
+# prompt, this backstop silently no-ops instead of paging twice.
+_pw_wake_fail_realert() {
+  local pane="$1" pid="$2" run="$3" task="$4" outcome="$5"
+  [ -n "$pane" ] || return 0
+  local secs="${HERDR_WAKE_FAIL_ALERT_S:-600}"
+  case "$secs" in ''|*[!0-9]*) secs=600 ;; esac
+  (
+    sleep "$secs"
+    if [ -n "$run" ] && [ -n "$task" ]; then
+      local st
+      st="$(read_task "$run" "$task" 2>/dev/null | jq -r '.state // empty' 2>/dev/null)"
+      [ "$st" = "blocked" ] || exit 0
+    fi
+    prompt_menu_visible "$pane" 2>/dev/null || [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || exit 0
+    local notify
+    for notify in "${HERDR_NOTIFY:-}" "$_pw_dir/slack-bridge/herdr-notify.sh" \
+                  "$HOME/.claude/skills/herdr-ops/scripts/slack-bridge/herdr-notify.sh"; do
+      [ -n "$notify" ] && [ -f "$notify" ] && break
+    done
+    [ -n "${notify:-}" ] && [ -f "$notify" ] || exit 0
+    bash "$notify" --choices --pane "$pane" \
+      "conductor wake ${outcome} and still unanswered after ${secs}s — the peer-notify path is broken, this needs you directly" \
+      >/dev/null 2>&1 || true
+    if [ -n "$run" ] && [ -n "$task" ]; then
+      # Keyed by prompt_id, not a fresh random id: two independent failed-wake
+      # timers for the SAME still-unanswered prompt both reach this line (the
+      # SECOND one's herdr-notify.sh call is silently deduped, exit 0 either
+      # way — see lib/alert-gate.sh alert_claim), so without a deterministic
+      # id the ledger would claim two alerts for a symptom Slack only saw once.
+      local wf_eid=""
+      [ -n "$pid" ] && wf_eid="wakefail_${pid}"
+      append_event "$run" "$task" "wake_fail_alerted" \
+        "$(jq -nc --arg p "$pane" --arg pid "$pid" --arg o "$outcome" --arg s "$secs" \
+           '{pane:$p, prompt_id:$pid, outcome:$o, wait_seconds:($s|tonumber)}')" \
+        "$wf_eid" >/dev/null 2>&1 || true
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
 }

@@ -69,11 +69,16 @@
 # and a keypress.
 #
 # A caller is treated as human only when it is DEMONSTRABLY human:
-#   * HERDR_SELECT_VIA is a slack-* value — the bridge sets that for both the
-#     threaded-number and button routes, and only after its own user allowlist
-#     check, so a real person acted.
-#   * stdin is an interactive terminal — a person typing the command.
-# Everything else (an agent's non-interactive shell, a cron, a script) is `peer`.
+#   * HERDR_SELECT_VIA=slack-button — the bridge sets it only after its own
+#     user allowlist check, and the button is bound to one prompt fingerprint.
+#   * an explicit `--authority human` / HERDR_SELECT_AUTHORITY=human.
+# Everything else is `peer`, INCLUDING a terminal-attached stdin. `[ -t 0 ]`
+# used to count as human, but an agent's own bash tool can run with a PTY
+# (omp `pty: true`), so isatty proved only that fd 0 was a terminal device,
+# not that a person was reading THIS prompt. Any agent that never thought
+# about authority silently inherited a human's, which is the accident
+# this default exists to prevent (PR #134 security review, HERDR-SELECT-TTY-HUMAN).
+# A person at a keyboard types `--authority human`.
 #
 # Not a containment boundary, and worth being precise about: an agent that can
 # set an env var can also just pass --authority human, and one holding the herdr
@@ -127,7 +132,6 @@ _default_authority() {
     slack-button) printf 'human\n'; return 0 ;;
     slack-reply)  printf 'peer\n';  return 0 ;;
   esac
-  [ -t 0 ] && { printf 'human\n'; return 0; }
   printf 'peer\n'
 }
 authority="${HERDR_SELECT_AUTHORITY:-$(_default_authority)}"

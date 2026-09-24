@@ -644,6 +644,30 @@ append_event() {
   return 1
 }
 
+# claim_once <event_id> [run_id] [task_id] [type] [payload] -> 0 the FIRST
+# time this event_id is claimed (the row was actually inserted), 1 every
+# subsequent call (someone already claimed it — another process, or an
+# earlier pass of this same one).
+#
+# append_event's own INSERT OR IGNORE already makes a retried append safe,
+# but it cannot tell its caller whether THIS call was the one that landed —
+# every call "succeeds" whether or not a row was written. The attention
+# controller (thurber-os docs/project-contract-plan.md §3a) needs exactly
+# that signal: "act on this key once, however many passes ask" is a claim,
+# not an append. SQLite serializes the INSERT and the changes() read on one
+# connection, so this reflects THIS call's own effect even when a concurrent
+# process's insert is the one that actually won the UNIQUE(event_id) race.
+claim_once() {                          # event_id [run_id] [task_id] [type] [payload]
+  local eid="$1" run_id="${2:-}" task_id="${3:-}" type="${4:-claim}" payload="${5:-{\}}"
+  registry_init || return 1
+  printf '%s' "$payload" | jq -e . >/dev/null 2>&1 || payload='{}'
+  local changed
+  changed="$(_sql "INSERT OR IGNORE INTO events (event_id, run_id, task_id, type, occurred_at, payload)
+      VALUES ($(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), $(_sq "$type"),
+        $(_sq "$(_now_iso)"), $(_sq "$payload")); SELECT changes();" 2>/dev/null)"
+  [ "$changed" = "1" ]
+}
+
 # task_input_required_command <run_id> <task_id> <prompt_id> -> the
 # untruncated command recorded on the input_required event for THIS exact
 # prompt, or empty.
