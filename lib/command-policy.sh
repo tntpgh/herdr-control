@@ -862,11 +862,32 @@ _cp_flatten_substitutions() {
 # still open, i.e. the one this occurrence would be an argument of, if
 # it is one at all.
 #
-# Case-insensitive on the word itself (`ENV`, `Printenv`) — this file's
-# original behaviour — but the exemption keywords (`const `/`let `/
-# `var `) are real, always-lowercase JS syntax and stay case-sensitive:
-# over-matching an exemption is the one direction this function must
-# never take.
+# Case-INSENSITIVE on the word itself — this file's original
+# behaviour, kept through round 5c, briefly narrowed to lowercase-only
+# in round 5d, and restored here in round 5e: on this filesystem
+# (case-insensitive APFS, and Windows/case-insensitive-mount hosts
+# generally), `ENV`, `Env`, and `PRINTENV` are not stylistic variants —
+# they resolve and execute the SAME `/usr/bin/env` binary as lowercase
+# `env`. Proved live: a marker var set before `ENV` and before
+# `PRINTENV` both came back in the output. Round 5d's fix for
+# `grep -n ENV Dockerfile` traded a real hole (mixed-case env dumps
+# auto-approving) for a cosmetic one (a grep target reads as code); the
+# conductor called that the wrong trade and asked for the revert —
+# `grep -n ENV Dockerfile` now escalates too, deliberately. Case
+# sensitivity also makes the general boundary scan catch a
+# case-varied PATH form for free — `/usr/bin/ENV` is just `ENV` with a
+# `/` before it, which already isn't an identifier character, so the
+# same tolower() comparison that catches bare `ENV` catches it too; no
+# separate path-specific pattern exists or is needed. The exemption
+# keywords (`const `/`let `/`var `) are real, always-lowercase JS syntax
+# and stay case-sensitive: over-matching an exemption is the one
+# direction this function must never take. `ENV`'s OWN hash/array
+# access shapes (`ENV.map`, `ENV['KEY']`, a bare `$ENV`/`%ENV`) are
+# additionally covered by a separate, narrower round-5d check below
+# (`_CP_ENVDUMP_GETENV_RE`/`_CP_ENVDUMP_ENV_HASH_RE`) — redundant with
+# this word scan now that it's case-insensitive again, but kept: it is
+# also what catches `getenv()`/`ENVIRON`, which never contain the word
+# `env` as a standalone token at all.
 _cp_envdump_word_is_dump() {            # norm -> 0 (true) if it dumps env/printenv, anywhere but the 5 exemptions
   printf '%s' "$1" | awk '
     function is_ident(c) { return (c ~ /[A-Za-z0-9_]/) }
@@ -944,11 +965,27 @@ _cp_envdump_word_is_dump() {            # norm -> 0 (true) if it dumps env/print
 _CP_ENVDUMP_OTHER_RE='\b(export|set)([[:space:]]*($|[;&|])|[[:space:]]+-p\b)|\b(declare|typeset)[[:space:]]+-[A-Za-z]*[xp]|\bcompgen[[:space:]]+-[A-Za-z]*[ev]|\blaunchctl[[:space:]]+(getenv|export)\b|/proc/[^[:space:]]*/environ\b|\bos\.environ\b|%ENV\b|\bENV\[|\bp[[:space:]]+ENV\b'
 _CP_ENVDUMP_PS_RE='\bps[[:space:]]+([A-Za-z]*e[A-Za-z]*\b|-[A-Za-z]*E[A-Za-z]*)'
 
+# Round 5d (pre-existing on main AND this branch): interpreter-language
+# environment access that never says `env`/`printenv` at all — Ruby/
+# Perl's `ENV` hash, awk's `ENVIRON` array, PHP/Lua's `getenv()`,
+# Python's `os.getenv`/`os.environ` (the latter already covered above).
+# `getenv`/`ENVIRON` are checked case-insensitively; the `ENV` half
+# fires only when actually used as a hash/array — `ENV.map`/
+# `ENV['KEY']`/`ENV.to_h`/a bare `$ENV`/`%ENV`. As of round 5e the word
+# scan above already catches bare `ENV` case-insensitively too, so this
+# is now redundant coverage for that shape specifically — kept because
+# it is still the ONLY thing that catches `getenv()`/`ENVIRON`, neither
+# of which contains the word `env` as a standalone token.
+_CP_ENVDUMP_GETENV_RE='\bgetenv\b|\bENVIRON\b'
+_CP_ENVDUMP_ENV_HASH_RE='\bENV[[:space:]]*[.[{]|[%$]ENV\b'
+
 _cp_env_dump_invoked() {                # raw -> 0 (true) if env/printenv is invoked to dump the environment
   local raw="$1" norm
   norm="$(scannable_command "$raw")"
   [ "$(_cp_envdump_word_is_dump "$norm")" = 1 ] && return 0
   _cp_imatch "$_CP_ENVDUMP_OTHER_RE" "$norm" && return 0
+  _cp_imatch "$_CP_ENVDUMP_GETENV_RE" "$norm" && return 0
+  _cp_match "$_CP_ENVDUMP_ENV_HASH_RE" "$norm" && return 0
   _cp_match "$_CP_ENVDUMP_PS_RE" "$norm" && return 0
   return 1
 }
