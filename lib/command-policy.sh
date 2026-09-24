@@ -822,12 +822,45 @@ _cp_flatten_substitutions() {
 #   2. followed by optional spaces then `=` (not `==`) const env = {...}
 #   3. followed by optional spaces then `:`            { env: x }
 #   4. preceded by `const `, `let `, or `var `         let env;
-#   5. preceded by `(` that itself directly follows an identifier
-#      character, or by `,`/`, `                       fn(env), fetch(req, env)
+#   5. an argument inside a genuine call's argument list — see the
+#      unified call-context rule below         fn(env), fetch(req, env)
 # Anything else counts as a dump. `let env; env = {}` needs no special
 # case: it is two occurrences (split by the `;`, though this rule no
 # longer even looks at segments) — the first is exempted by rule 4, the
 # second by rule 2.
+#
+# Round 5c (conductor's live probe, /tmp/probe-comma.sh): rule 5's
+# comma half originally exempted ANY `env` preceded by a comma, with no
+# check on what followed it — `FOO=a, env` auto-approved and bash
+# genuinely ran `env` (the `,` is just part of the literal value
+# assigned to `FOO`, not a call's argument separator; `x=1, env | grep
+# -i token`, `LC_ALL=C, printenv`, `sudo -u root, env`, `echo | xargs
+# -d, env` were the same shape).
+#
+# Round 5c AMENDMENT (same probe, next pass): closing the comma hole by
+# requiring `env` to be followed by `)`/`,` was still not enough —
+# `)` is a REAL shell token too, so `(FOO=a, env)` is a genuine subshell
+# that dumps the environment, `)` and all. Rule 5 is now ONE unified
+# call-context check, replacing both the old comma half and the old
+# `(`-preceded half: `env` is an argument ONLY when ALL three hold —
+#   (a) the NEAREST UNMATCHED `(` scanning backward from this
+#       occurrence is itself immediately preceded by an identifier
+#       character (`[A-Za-z0-9_.\]]` — a call like `fetch(`/`fn(`/
+#       `obj.m(`), never by `$`, `=`, a shell operator, whitespace, or
+#       nothing (string start) — which is exactly what rules out a bare
+#       subshell `(`, an array assignment `x=(...)`, and a command
+#       substitution `$(...)` (already flattened away by the time this
+#       runs, so it never even has a `(` left to find);
+#   (b) the text between that `(` and `env` contains none of
+#       `;`/`&`/`|`/a backtick/`$(` — still the SAME simple statement,
+#       not a fresh command smuggled inside the parens; and
+#   (c) `env` is followed by optional spaces then `)` or `,` (unchanged
+#       from the first round-5c pass).
+# `nearest_unmatched_open` finds (a)'s target with a plain depth
+# counter over everything before this position — the position at the
+# TOP of that count when the scan reaches `env` is the innermost paren
+# still open, i.e. the one this occurrence would be an argument of, if
+# it is one at all.
 #
 # Case-insensitive on the word itself (`ENV`, `Printenv`) — this file's
 # original behaviour — but the exemption keywords (`const `/`let `/
@@ -837,6 +870,17 @@ _cp_flatten_substitutions() {
 _cp_envdump_word_is_dump() {            # norm -> 0 (true) if it dumps env/printenv, anywhere but the 5 exemptions
   printf '%s' "$1" | awk '
     function is_ident(c) { return (c ~ /[A-Za-z0-9_]/) }
+    function is_call_char(c) { return (c ~ /[]A-Za-z0-9_.]/) }
+    function nearest_unmatched_open(line, uptoPos,    depth, k, ch) {
+      depth = 0
+      for (k = 1; k < uptoPos; k++) {
+        ch = substr(line, k, 1)
+        if (ch == "(") { depth++; openpos[depth] = k }
+        else if (ch == ")") { if (depth > 0) depth-- }
+      }
+      if (depth > 0) return openpos[depth]
+      return 0
+    }
     {
       line = $0; n = length(line); i = 1; found = 0
       while (i <= n) {
@@ -863,15 +907,18 @@ _cp_envdump_word_is_dump() {            # norm -> 0 (true) if it dumps env/print
           else if (substr(line, i - 4, 4) == "var ") exempt = 1
         }
         if (!exempt) {
-          p1 = (i > 1) ? substr(line, i - 1, 1) : ""
-          if (p1 == "(") {
-            p2 = (i > 2) ? substr(line, i - 2, 1) : ""
-            if (is_ident(p2)) exempt = 1
-          } else if (p1 == ",") {
-            exempt = 1
-          } else if (p1 == " ") {
-            p2 = (i > 2) ? substr(line, i - 2, 1) : ""
-            if (p2 == ",") exempt = 1
+          popen = nearest_unmatched_open(line, i)
+          if (popen > 0) {
+            pchar = (popen > 1) ? substr(line, popen - 1, 1) : ""
+            if (pchar != "" && is_call_char(pchar)) {
+              between = substr(line, popen + 1, i - popen - 1)
+              if (between !~ /[;&|`]/ && index(between, "$(") == 0) {
+                k = i + wlen
+                while (substr(line, k, 1) == " " || substr(line, k, 1) == "\t") k++
+                fchar = substr(line, k, 1)
+                if (fchar == ")" || fchar == ",") exempt = 1
+              }
+            }
           }
         }
         if (!exempt) found = 1
