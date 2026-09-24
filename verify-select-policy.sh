@@ -172,6 +172,17 @@ sel 1; rc=$?
 [ "$rc" -eq 8 ] && ok "exit 8 with no flag — defaults to peer" || bad "exit $rc (expected 8); default is not failing closed"
 [ "$(keys_pressed)" = "0" ] && ok "no key pressed" || bad "keys pressed=$(keys_pressed)"
 
+printf '== NO flag, stdin IS a terminal (an agent bash with pty:true) -> still PEER ==\n'
+# isatty(0) used to mean human. An agent's own PTY-backed shell satisfies it, so
+# this case runs the call under a real pty via script(1). CI runs non-tty, so
+# without this case the hole would stay invisible.
+set_screen "rm -rf /tmp/scratch"; reset_keys
+script -q /dev/null bash "$here/herdr-select.sh" "$PANE" 1 >"$WORK/out.txt" 2>"$WORK/err.txt" </dev/null; rc=$?
+grep -q 'exit 8\|REFUSED\|refused' "$WORK/out.txt" "$WORK/err.txt" 2>/dev/null || [ "$rc" -eq 8 ] \
+  && ok "a terminal-attached caller with no flag is refused (peer), not human" \
+  || bad "tty caller got through: rc=$rc; $(cat "$WORK/out.txt" | head -3)"
+[ "$(keys_pressed)" = "0" ] && ok "no key pressed for the tty caller" || bad "tty caller pressed keys=$(keys_pressed)"
+
 printf '== a SAFE command still passes on the peer default ==\n'
 set_screen "ls -la /tmp"; reset_keys
 sel 1; rc=$?
