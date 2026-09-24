@@ -133,13 +133,23 @@
 # the prompt changes/resolves — this file's own value never resets the clock.
 : "${HERDR_WAKE_RESPONSE_S:=600}"
 # Pane id of the top-level operator session ("Main") that receives an
-# escalation when a task's own conductor does not act in time. Empty = no
-# Main to escalate to; the controller still serves the form on schedule.
+# escalation when a task's own conductor does not act in time, plus its birth
+# fingerprint (herdr's terminal_id) for the recycled-pane refusal every other
+# send here gets (refuses only on a POSITIVE mismatch).
+#
+# Set by `designate-main.sh` from the Main session, NOT here: Main's pane id
+# changes every session, so a static value was always empty or stale. An
+# explicit environment value still wins. The file is re-read every tick
+# (attention-tick.sh sources this file each pass). Empty = no Main; the
+# escalation is recorded as skipped and the form is still served on schedule.
+if [ -z "${HERDR_MAIN_PANE_ID:-}" ]; then
+  _herdr_main_role="${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}/roles/main"
+  if [ -s "$_herdr_main_role" ]; then
+    read -r HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH < "$_herdr_main_role" || true
+  fi
+  unset _herdr_main_role
+fi
 : "${HERDR_MAIN_PANE_ID:=}"
-# Main's own birth fingerprint (herdr's terminal_id), for the same recycled-
-# pane refusal every other send in this codebase gets. Empty = unchecked
-# (the common case — role addressing with an automatic fingerprint is item 4
-# of the plan doc, not yet built). Refuses only on a POSITIVE mismatch.
 : "${HERDR_MAIN_PANE_BIRTH:=}"
 # Delivery-only rollback: 1 makes agent-hooks/omp-notify.sh and
 # agent-hooks/claude-notify.sh call push_wake on every firing again instead

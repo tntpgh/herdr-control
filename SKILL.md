@@ -213,6 +213,13 @@ workspace's default empty root tab (see `ensure-workspace.sh`'s own comment
 about this gap) was never used, close that too — `spawn-task.sh` now does
 this automatically, best-effort, only for a tab with no agent set at all.
 
+**Be Main.** The operator-facing conductor runs `./designate-main.sh` at session
+start. It records this pane and its birth fingerprint, so the attention
+controller escalates here when a worker's own conductor does not answer. The
+next tick picks it up, with no hub restart, once the deployed hub is at or past
+this revision (`restart.sh --deploy`). Without it, escalations are recorded as
+"Main could not be reached". `--show` prints it, and `--clear` removes it on exit.
+
 **Conductor exit.** Before a conductor stops, meaning it has saved its session
 and handoff and retained its lessons, it closes its shipped workers:
 

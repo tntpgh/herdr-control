@@ -283,10 +283,13 @@ CURRENT state every `HERDR_ATTENTION_INTERVAL_S` (default 15s) instead:
    gets to call `push_wake` for it. Every later pass just re-reads that
    timestamp, which is what makes `HERDR_WAKE_RESPONSE_S` (default 600s)
    measure from a fixed point instead of resetting on every pass.
-4. Unanswered past that window: one escalation to `HERDR_MAIN_PANE_ID`.
-   Unanswered past twice that: one local hub form (`formserve.py`,
-   `--timeout 86400`). A deny-verdict or conductor-reserved prompt
-   (`lib/command-policy.sh`) skips the ladder and gets the form immediately.
+4. Unanswered past that window: one escalation to Main, the pane recorded by
+   `designate-main.sh` (or `HERDR_MAIN_PANE_ID` if set explicitly), refused if
+   that pane has since been recycled. Unanswered past twice that: one local
+   hub form (`formserve.py`, `--timeout 86400`). A deny-verdict or
+   conductor-reserved prompt (`lib/command-policy.sh`) skips the Main
+   escalation, since only a human can approve it, but still waits the owner's
+   window before its form, because its conductor can deny or redirect it.
    Every decision is a registry event (`attention_tracking`,
    `attention_escalated`, `attention_form_served`), each claimed once per key.
 
