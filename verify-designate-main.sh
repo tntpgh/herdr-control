@@ -60,6 +60,15 @@ check "designated live Main -> deliver" "$(env -u HERDR_MAIN_PANE_ID -u HERDR_MA
 check "same pane id, new occupant (recycled) -> refused" \
   "$(env -u HERDR_MAIN_PANE_ID -u HERDR_MAIN_PANE_BIRTH MAIN_BIRTH=term_other bash -c "$(declare -f reachable); here='$here'; reachable")" "refused"
 
+printf '== the REAL controller reads the designation (file -> attention-tick.sh seam) ==\n'
+check "sourcing attention-tick.sh with no env yields the designated Main" \
+  "$(env -u HERDR_MAIN_PANE_ID -u HERDR_MAIN_PANE_BIRTH bash -c '. "$1/attention-tick.sh"; printf "%s|%s" "$HERDR_MAIN_PANE_ID" "$HERDR_MAIN_PANE_BIRTH"' _ "$here")" "M1|term_main_1"
+
+printf '== a failed write is reported, not a false success ==\n'
+ro="$(mktemp -d)"; chmod 500 "$ro"
+HERDR_RUN_STATE_DIR="$ro/runs" HERDR_PANE_ID=M1 bash "$here/designate-main.sh" >/dev/null 2>&1; check "exit 1 when the role file cannot be written" "$?" "1"
+chmod 700 "$ro"
+
 printf '== --show / --clear ==\n'
 check "--show prints the designation" "$(bash "$here/designate-main.sh" --show)" "M1 term_main_1"
 bash "$here/designate-main.sh" --clear >/dev/null

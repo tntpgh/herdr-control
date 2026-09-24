@@ -45,7 +45,7 @@ pane_is_agent "$pane" || { echo "designate-main: $pane is not running an agent; 
 birth="$(pane_birth_now "$pane")"
 [ -n "$birth" ] || { echo "designate-main: could not read $pane's birth fingerprint; refusing" >&2; exit 3; }
 
-mkdir -p "$(dirname "$role_file")"
 tmp="$role_file.tmp.$$"
-printf '%s %s\n' "$pane" "$birth" > "$tmp" && mv -f "$tmp" "$role_file"
+mkdir -p "$(dirname "$role_file")" && printf '%s %s\n' "$pane" "$birth" > "$tmp" && mv -f "$tmp" "$role_file" \
+  || { rm -f "$tmp"; echo "designate-main: could not write $role_file" >&2; exit 1; }
 echo "Main = $pane (birth $birth)"
