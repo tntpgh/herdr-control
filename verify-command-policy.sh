@@ -1201,6 +1201,35 @@ check "perl -e with unrelated content stays allow" "perl -e 'print 1' /tmp/p.jso
 check "node --eval with unrelated content stays allow" "node --eval 'x' /tmp/p.json" allow
 
 echo
+echo "== round 5g: flag clusters (-pe/-ep) and case (NODE) both bypassed round 5f =="
+# Found by a fresh review, confirmed live with a marker var: node -pe
+# really dumps env on this Mac. (1) _CP_JS_INLINE_RE only matched a
+# single flag (-e xor -p) with its own word boundary, so a CLUSTERED
+# short flag combining both — node -pe, node -ep, bun -pe — matched
+# neither token whole and fell through. Matched clusters instead: any
+# -prefixed run of letters ENDING in the flag that matters. (2) all 8
+# interpreter regexes, plus the heredoc keep_body prefix check, were
+# case-sensitive, and APFS runs NODE/Node as node exactly like it runs
+# ENV as env — NODE -e, Node -e, and a NODE heredoc all matched
+# nothing. Switched every one to case-insensitive matching.
+check_reserved "clustered flags, eval+print (-pe)" \
+  "node -pe \"let {env: e} = process; e\""
+check "clustered flags, eval+print (-pe) escalates" \
+  "node -pe \"let {env: e} = process; e\"" escalate
+check_reserved "clustered flags, reversed order (-ep)" \
+  "node -ep \"process\""
+check_reserved "bun with clustered flags (-pe)" \
+  "bun -pe \"process\""
+check_reserved "uppercase NODE -e (APFS runs it as node)" \
+  "NODE -e \"const {env: e} = process; console.log(e)\""
+check "uppercase NODE -e escalates" \
+  "NODE -e \"const {env: e} = process; console.log(e)\"" escalate
+check_reserved "capitalized Node -e" \
+  "Node -e \"console.log(process)\""
+node_heredoc_upper="$(printf "NODE <<'EOF'\nconsole.log(process)\nEOF")"
+check_reserved "heredoc body: uppercase NODE prefix" "$node_heredoc_upper"
+
+echo
 echo "== round 5, section D: secret-named \$VAR expansion (the worst finding) =="
 # 2026-09-19: a live token was echoed into a session transcript this
 # exact way and had to be rotated. Any \$NAME/\${NAME...} where NAME

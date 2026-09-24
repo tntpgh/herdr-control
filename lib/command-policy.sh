@@ -731,9 +731,13 @@ _cp_strip_heredocs() {
         # function we can't see inside) is treated as inert — a real
         # limitation of a static text scanner, not a parser, documented
         # rather than hidden.
+        # Round 5g: case-INSENSITIVE (`grep -qi`) — APFS runs `NODE`/
+        # `Node` as `node` exactly like it runs `ENV` as `env`, so
+        # `NODE <<EOF ... EOF` was still an inert-data verdict before
+        # this fix even though it genuinely executes the body as JS.
         keep_body=0
         prefix="${line%%<<*}"
-        printf '%s' "$prefix" | grep -qE '\b(bash|sh|zsh|dash|ksh|ash|node|nodejs|bun|deno|ruby|perl|php|osascript)\b|\bpython[0-9.]*\b|\bpypy[0-9.]*\b|\blua[0-9.]*\b' && keep_body=1
+        printf '%s' "$prefix" | grep -qiE '\b(bash|sh|zsh|dash|ksh|ash|node|nodejs|bun|deno|ruby|perl|php|osascript)\b|\bpython[0-9.]*\b|\bpypy[0-9.]*\b|\blua[0-9.]*\b' && keep_body=1
       fi
     fi
   done <<CPEOF
@@ -1025,26 +1029,42 @@ _CP_ENVDUMP_ENV_HASH_RE='\bENV[[:space:]]*[.[{]|[%$]ENV\b'
 # call (round 5f design) is that a human should look at inline
 # interpreter code touching either at all, not that this scanner
 # should try to prove intent.
-_CP_JS_INLINE_RE='\b(node|nodejs|bun|deno)\b[^;&|]*[[:space:]](-e|-p|--eval|--print)\b|\bdeno[[:space:]]+eval\b'
+# Round 5g, 2 more found live by a fresh review, confirmed with a
+# marker var (`node -pe` really dumps env on this Mac): (1) these were
+# single-flag only (`-e` xor `-p`), so a CLUSTERED short flag —
+# `node -pe`, `node -ep`, `bun -pe` (print AND eval combined, in
+# either order) — matched neither `-e` nor `-p` as its own token and
+# fell through. Matched as a CLUSTER instead: any `-`-prefixed run of
+# letters ENDING in the flag that matters (`-[A-Za-z]*[ep]` for node/
+# bun/deno, `c` for python, `e`/`E` for ruby/perl, `r` for php, `e` for
+# lua/osascript) — `-pe` and `-ep` both end their run in a matching
+# letter, `-r`/`-m`/`-B`/`-O` don't. (2) all 8 of these regexes, and
+# the `keep_body` prefix check above, were case-SENSITIVE, and APFS
+# runs `NODE`/`Node` as `node` — `NODE -e ...`, `Node -e ...`, and a
+# `NODE <<EOF` heredoc all matched nothing. Switched every one of the
+# 8 to `_cp_imatch`. The `process`/`os` keyword checks below stay
+# case-SENSITIVE on purpose — real JS/Python identifiers are
+# case-sensitive language syntax, not filesystem lookups.
+_CP_JS_INLINE_RE='\b(node|nodejs|bun|deno)\b[^;&|]*[[:space:]](-[A-Za-z]*[ep]\b|--eval\b|--print\b)|\bdeno[[:space:]]+eval\b'
 _CP_JS_HEREDOC_RE='\b(node|nodejs|bun|deno)\b[^;&|<]*<<<?'
-_CP_PY_INLINE_RE='\b(python[0-9.]*|pypy[0-9.]*)\b[^;&|]*[[:space:]]-c\b'
+_CP_PY_INLINE_RE='\b(python[0-9.]*|pypy[0-9.]*)\b[^;&|]*[[:space:]]-[A-Za-z]*c\b'
 _CP_PY_HEREDOC_RE='\b(python[0-9.]*|pypy[0-9.]*)\b[^;&|<]*<<<?'
-_CP_RUBYPERL_INLINE_RE='\bruby\b[^;&|]*[[:space:]]-e\b|\bperl\b[^;&|]*[[:space:]](-e|-E)\b'
+_CP_RUBYPERL_INLINE_RE='\bruby\b[^;&|]*[[:space:]]-[A-Za-z]*[eE]\b|\bperl\b[^;&|]*[[:space:]]-[A-Za-z]*[eE]\b'
 _CP_RUBYPERL_HEREDOC_RE='\b(ruby|perl)\b[^;&|<]*<<<?'
-_CP_OTHER_INLINE_RE='\bphp\b[^;&|]*[[:space:]]-r\b|\blua[0-9.]*\b[^;&|]*[[:space:]]-e\b|\bosascript\b[^;&|]*[[:space:]]-e\b'
+_CP_OTHER_INLINE_RE='\bphp\b[^;&|]*[[:space:]]-[A-Za-z]*r\b|\blua[0-9.]*\b[^;&|]*[[:space:]]-[A-Za-z]*e\b|\bosascript\b[^;&|]*[[:space:]]-[A-Za-z]*e\b'
 _CP_OTHER_HEREDOC_RE='\b(php|lua[0-9.]*|osascript)\b[^;&|<]*<<<?'
 
 _cp_js_inline_code() {         # norm -> 0 (true) if a JS runtime is running inline code
-  _cp_match "$_CP_JS_INLINE_RE" "$1" || _cp_match "$_CP_JS_HEREDOC_RE" "$1"
+  _cp_imatch "$_CP_JS_INLINE_RE" "$1" || _cp_imatch "$_CP_JS_HEREDOC_RE" "$1"
 }
 _cp_python_inline_code() {     # norm -> 0 (true) if python/pypy is running inline code
-  _cp_match "$_CP_PY_INLINE_RE" "$1" || _cp_match "$_CP_PY_HEREDOC_RE" "$1"
+  _cp_imatch "$_CP_PY_INLINE_RE" "$1" || _cp_imatch "$_CP_PY_HEREDOC_RE" "$1"
 }
 _cp_rubyperl_inline_code() {   # norm -> 0 (true) if ruby/perl is running inline code
-  _cp_match "$_CP_RUBYPERL_INLINE_RE" "$1" || _cp_match "$_CP_RUBYPERL_HEREDOC_RE" "$1"
+  _cp_imatch "$_CP_RUBYPERL_INLINE_RE" "$1" || _cp_imatch "$_CP_RUBYPERL_HEREDOC_RE" "$1"
 }
 _cp_other_inline_code() {      # norm -> 0 (true) if php/lua/osascript is running inline code
-  _cp_match "$_CP_OTHER_INLINE_RE" "$1" || _cp_match "$_CP_OTHER_HEREDOC_RE" "$1"
+  _cp_imatch "$_CP_OTHER_INLINE_RE" "$1" || _cp_imatch "$_CP_OTHER_HEREDOC_RE" "$1"
 }
 _cp_any_interpreter_inline_code() {   # norm -> 0 (true) if ANY of the above
   _cp_js_inline_code "$1" || _cp_python_inline_code "$1" || \
