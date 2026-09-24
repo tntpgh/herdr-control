@@ -136,9 +136,16 @@
 # escalation when a task's own conductor does not act in time. Empty = no
 # Main to escalate to; the controller still serves the form on schedule.
 : "${HERDR_MAIN_PANE_ID:=}"
-# Rollback switch only: 1 makes the controller call push_wake on every pass
-# for a still-blocked prompt instead of at most once. push_wake's own
-# per-hook-firing behavior (agent-hooks/*.sh) is unaffected either way.
+# Main's own birth fingerprint (herdr's terminal_id), for the same recycled-
+# pane refusal every other send in this codebase gets. Empty = unchecked
+# (the common case — role addressing with an automatic fingerprint is item 4
+# of the plan doc, not yet built). Refuses only on a POSITIVE mismatch.
+: "${HERDR_MAIN_PANE_BIRTH:=}"
+# Rollback switch: 1 restores the pre-controller shape everywhere it applies
+# — the controller calls push_wake on every pass for a still-blocked prompt
+# instead of at most once, AND agent-hooks/omp-notify.sh /
+# agent-hooks/claude-notify.sh call push_wake on every firing again instead
+# of claiming attn_track_<key> first.
 : "${HERDR_WAKE_LEGACY:=0}"
 
 # ============================================================================
@@ -150,5 +157,5 @@ export HERDR_RECONCILE_INTERVAL_S HERDR_TASK_RETENTION_DAYS
 export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES HERDR_CANONICAL_RULES
 export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_BACKEND SMART_NAME_MODEL SMART_NAME_TIMEOUT
 export SMART_NAME_COOLDOWN SMART_NAME_EVIDENCE_CHARS HERDR_STALL_SECS
-export HERDR_ATTENTION_INTERVAL_S HERDR_WAKE_RESPONSE_S HERDR_MAIN_PANE_ID HERDR_WAKE_LEGACY
+export HERDR_ATTENTION_INTERVAL_S HERDR_WAKE_RESPONSE_S HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH HERDR_WAKE_LEGACY
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"

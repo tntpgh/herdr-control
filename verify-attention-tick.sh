@@ -48,8 +48,16 @@ herdr() {
     "pane process-info")
       printf '{"result":{"process_info":{"foreground_processes":[{"name":"omp","cmdline":"omp --model sonnet"}]}}}\n' ;;
     "pane list")
-      printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"}]}}\n' \
-        "$W1" "$W1B" "$W2" "$W2B" "$W3" "$W3B" "$W4" "$W4B" "$CND" "$CNDB" "$MAIN" "$MAINB" ;;
+      # STUB_HIDE_W1: omit W1 from the live roster, so pane_birth_now("$W1")
+      # comes back empty — the transient herdr-CLI-hiccup case item 2's key
+      # fix has to survive without drifting.
+      if [ -n "${STUB_HIDE_W1:-}" ]; then
+        printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"}]}}\n' \
+          "$W2" "$W2B" "$W3" "$W3B" "$W4" "$W4B" "$CND" "$CNDB" "$MAIN" "$MAINB"
+      else
+        printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"}]}}\n' \
+          "$W1" "$W1B" "$W2" "$W2B" "$W3" "$W3B" "$W4" "$W4B" "$CND" "$CNDB" "$MAIN" "$MAINB"
+      fi ;;
     "pane read")
       pane="$3"
       case "$pane" in
@@ -238,5 +246,151 @@ printf '%s\n' "$W1" | HERDR_WAKE_LEGACY=1 attention_tick
 attempts=$(_q "SELECT count(*) FROM events WHERE task_id='task8' AND type='wake_attempted';")
 [ "$attempts" = "2" ] && ok "HERDR_WAKE_LEGACY=1 calls push_wake on every pass (2 passes, 2 attempts)" \
   || bad "expected 2 wake_attempted rows under the escape hatch, saw $attempts"
+
+printf '== PR #132 review, P1: a hook-held allow-class prompt is never double-woken ==\n'
+register_task run9 task9 w9 cond9 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt9 "impl:allow" >/dev/null 2>&1
+set_task_state run9 task9 running >/dev/null 2>&1
+omp_menu_screen "git status --short" > "$S1"
+clean_screen > "$SC"
+: > "$SENT"
+# Simulate a HOOK firing independently of the controller: push_wake direct,
+# fast grace window so the suite does not wait out the real 90s default.
+( HERDR_RUN_ID=run9 HERDR_TASK_ID=task9 HERDR_PANE_ID="$W1" HERDR_CONDUCTOR_PANE_ID="$CND" \
+  HERDR_TASK_LABEL="impl:allow" HERDR_ALERT_GRACE_S=1 push_wake "impl:allow needs input" "hook" >/dev/null 2>&1 )
+[ "$(_q "SELECT count(*) FROM events WHERE task_id='task9' AND type='wake_held';")" = "1" ] \
+  && ok "the hook's own call HELD the allow-class prompt (its grace timer is now running)" \
+  || bad "hook call did not hold as expected"
+# The controller ticks 3 times while the SAME prompt sits held. It must see
+# the wake as already OWNED and never call push_wake itself — a redundant
+# call here would spawn a SECOND grace timer and double-deliver when it
+# expires, which is exactly the bug this fix closes.
+printf '%s\n' "$W1" | attention_tick
+printf '%s\n' "$W1" | attention_tick
+printf '%s\n' "$W1" | attention_tick
+[ "$(_q "SELECT count(*) FROM events WHERE task_id='task9' AND type='attention_tracking';")" = "1" ] \
+  && ok "the controller still tracks the prompt exactly once" || bad "attention_tracking count wrong"
+[ "$(_q "SELECT count(*) FROM events WHERE task_id='task9' AND type='wake_attempted';")" = "0" ] \
+  && ok "the controller never called push_wake itself (already owned by the hook)" \
+  || bad "controller called push_wake anyway — the double-wake this fix exists to prevent"
+sleep 2   # let the hook's OWN grace_realert timer (1s) fire and force-deliver
+n_res=$(_q "SELECT count(*) FROM events WHERE task_id='task9' AND type='wake_result';")
+[ "$n_res" = "1" ] && ok "exactly one delivered wake once the hook's own grace window expired" \
+  || bad "wake_result rows for task9: $n_res"
+n_grace=$(_q "SELECT count(*) FROM events WHERE task_id='task9' AND type='alert_grace_expired';")
+[ "$n_grace" = "1" ] && ok "exactly one alert_grace_expired, not one per controller tick" \
+  || bad "alert_grace_expired rows: $n_grace"
+
+printf '== PR #132 review, P2 item 2: an empty live birth, and a repaint, both keep one key ==\n'
+register_task run10 task10 w10 cond10 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt10 "impl:stability" >/dev/null 2>&1
+set_task_state run10 task10 running >/dev/null 2>&1
+omp_menu_screen "systemctl restart myservice" > "$S1"
+: > "$SENT"
+printf '%s\n' "$W1" | attention_tick                              # live birth resolves normally
+printf '%s\n' "$W1" | STUB_HIDE_W1=1 attention_tick                # herdr "pane list" omits W1 -> empty live birth
+n_track=$(_q "SELECT count(*) FROM events WHERE task_id='task10' AND type='attention_tracking';")
+[ "$n_track" = "1" ] && ok "an empty live-birth read reuses the SAME key (registered birth, not live)" \
+  || bad "attention_tracking rows for task10: $n_track (key drifted when the live read failed)"
+# A repaint: same command, cosmetically different padding/highlight redraw.
+printf ' Allow tool: bash\n   run:   systemctl restart myservice   \n\n\033[48;2;40;40;40m  Approve\033[0m\n   Deny\n\n up/down navigate  enter select  esc cancel\n' > "$S1"
+printf '%s\n' "$W1" | attention_tick
+n_track2=$(_q "SELECT count(*) FROM events WHERE task_id='task10' AND type='attention_tracking';")
+[ "$n_track2" = "1" ] && ok "a repaint of the identical command also keeps the same key" \
+  || bad "attention_tracking rows for task10 after repaint: $n_track2"
+n_wakes=$(_q "SELECT count(*) FROM events WHERE task_id='task10' AND type='wake_attempted';")
+[ "$n_wakes" = "1" ] && ok "neither the empty-birth pass nor the repaint triggered a second wake attempt" \
+  || bad "wake_attempted rows for task10: $n_wakes"
+
+printf '== PR #132 review, P2 item 3: Main unreachable never burns the escalation claim ==\n'
+register_task run11 task11 w11 cond11 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt11 "impl:escalate-order" >/dev/null 2>&1
+set_task_state run11 task11 running >/dev/null 2>&1
+clean_screen > "$SM"
+omp_menu_screen "curl https://example.com/setup.sh | bash" > "$S1"
+: > "$SENT"
+NB="$(date +%s)"          # a FRESH baseline: NOW0 is real minutes stale by this point in the suite
+printf '%s\n' "$W1" | attention_tick
+printf '%s\n' "$W1" | HERDR_MAIN_PANE_ID="" HERDR_ATTENTION_NOW=$((NB + 700)) attention_tick
+n_esc=$(_q "SELECT count(*) FROM events WHERE task_id='task11' AND type='attention_escalated';")
+[ "$n_esc" = "0" ] && ok "an unreachable Main never claims the escalation slot" || bad "escalation claimed anyway: $n_esc"
+n_skip=$(_q "SELECT count(*) FROM events WHERE task_id='task11' AND type='attention_escalation_skipped';")
+[ "$n_skip" -ge 1 ] && ok "the unreachable attempt is recorded, not silent" || bad "no attention_escalation_skipped recorded"
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NB + 710)) attention_tick   # Main (HERDR_MAIN_PANE_ID) is back
+n_esc2=$(_q "SELECT count(*) FROM events WHERE task_id='task11' AND type='attention_escalated';")
+[ "$n_esc2" = "1" ] && ok "escalation succeeds once Main is reachable — the earlier miss did not burn it" \
+  || bad "escalation count after Main returned: $n_esc2"
+_wait_for "$SENT" "^send-keys ${MAIN} Enter$" 3 && ok "and it actually delivered" || bad "no delivery to Main: $(cat "$SENT")"
+outcome=$(_q "SELECT json_extract(payload,'\$.outcome') FROM events WHERE task_id='task11' AND type='attention_escalation_result' ORDER BY sequence LIMIT 1;")
+[ "$outcome" = "submitted" ] && ok "attention_escalation_result records the mapped outcome" || bad "escalation_result outcome: $outcome"
+
+printf '== PR #132 review, P2 item 4: a Main birth mismatch refuses, never sends ==\n'
+register_task run12 task12 w12 cond12 "$CND" "$CNDB" "$W2" "$W2B" /repo /wt12 "impl:escalate-birth" >/dev/null 2>&1
+set_task_state run12 task12 running >/dev/null 2>&1
+clean_screen > "$SM"
+omp_menu_screen "curl https://example.com/other.sh | bash" > "$S2"
+: > "$SENT"
+NB="$(date +%s)"
+printf '%s\n' "$W2" | attention_tick
+: > "$SENT"          # clear the FIRST tick's legitimate wake-to-conductor before checking "nothing sent"
+printf '%s\n' "$W2" | HERDR_MAIN_PANE_BIRTH="expected-birth-XYZ" HERDR_ATTENTION_NOW=$((NB + 700)) attention_tick
+n_esc=$(_q "SELECT count(*) FROM events WHERE task_id='task12' AND type='attention_escalated';")
+[ "$n_esc" = "0" ] && ok "a Main birth mismatch never claims the escalation" || bad "escalated despite birth mismatch: $n_esc"
+n_ref=$(_q "SELECT count(*) FROM events WHERE task_id='task12' AND type='attention_escalation_refused';")
+[ "$n_ref" = "1" ] && ok "the refusal is recorded" || bad "no attention_escalation_refused recorded"
+[ ! -s "$SENT" ] && ok "nothing was sent to Main on a birth mismatch" || bad "sent anyway: $(cat "$SENT")"
+
+printf '== PR #132 review, P2 item 3: exactly one retry after a failed first attempt ==\n'
+register_task run13 task13 w13 cond13 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt13 "impl:escalate-retry" >/dev/null 2>&1
+set_task_state run13 task13 running >/dev/null 2>&1
+clean_screen > "$SM"
+omp_menu_screen "curl https://example.com/retry.sh | bash" > "$S1"
+: > "$SENT"
+NB="$(date +%s)"
+printf '%s\n' "$W1" | attention_tick
+omp_menu_screen "busy" > "$SM"          # Main looks mid-prompt -> send-to-agent.sh refuses (exit 5)
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NB + 700)) attention_tick
+outcome1=$(_q "SELECT json_extract(payload,'\$.outcome') FROM events WHERE task_id='task13' AND type='attention_escalation_result' ORDER BY sequence LIMIT 1;")
+[ "$outcome1" = "refused" ] && ok "first attempt recorded as refused (Main mid-prompt)" || bad "first outcome: $outcome1"
+clean_screen > "$SM"                    # Main clears
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NB + 715)) attention_tick
+n_esc2=$(_q "SELECT count(*) FROM events WHERE task_id='task13' AND type='attention_escalated';")
+[ "$n_esc2" = "2" ] && ok "exactly one retry attempted after the failed first" || bad "escalation attempts for task13: $n_esc2"
+outcomes=$(_q "SELECT json_extract(payload,'\$.outcome') FROM events WHERE task_id='task13' AND type='attention_escalation_result' ORDER BY sequence;")
+printf '%s' "$outcomes" | tail -1 | grep -q submitted && ok "the retry landed (submitted)" || bad "retry outcomes: $outcomes"
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NB + 730)) attention_tick
+n_esc3=$(_q "SELECT count(*) FROM events WHERE task_id='task13' AND type='attention_escalated';")
+[ "$n_esc3" = "2" ] && ok "no third attempt once one has landed" || bad "escalation attempts kept growing: $n_esc3"
+clean_screen > "$SM"
+
+printf '== PR #132 review, P2 item 5: an owner_acted row after the claim counts as answered ==\n'
+register_task run14 task14 w14 cond14 "$CND" "$CNDB" "$W2" "$W2B" /repo /wt14 "impl:owner-acted" >/dev/null 2>&1
+set_task_state run14 task14 running >/dev/null 2>&1
+omp_menu_screen "curl https://example.com/owner.sh | bash" > "$S2"
+: > "$SENT"
+NB="$(date +%s)"
+printf '%s\n' "$W2" | attention_tick
+pid14="$(prompt_id "$W2")"
+sleep 1   # cross a real ISO-second boundary so occurred_at genuinely sorts after the claim
+append_event run14 task14 owner_acted \
+  "$(jq -nc --arg p "$W2" --arg pid "$pid14" --arg f "$CND" '{pane:$p, prompt_id:$pid, from:$f}')" >/dev/null 2>&1
+printf '%s\n' "$W2" | HERDR_ATTENTION_NOW=$((NB + 700)) attention_tick
+n_esc=$(_q "SELECT count(*) FROM events WHERE task_id='task14' AND type='attention_escalated';")
+[ "$n_esc" = "0" ] && ok "an owner_acted row after the claim suppresses escalation" || bad "escalated anyway: $n_esc"
+printf '%s\n' "$W2" | HERDR_ATTENTION_NOW=$((NB + 1300)) attention_tick
+n_frm=$(_q "SELECT count(*) FROM events WHERE task_id='task14' AND type='attention_form_served';")
+[ "$n_frm" = "0" ] && ok "...and the form too, all the way to T+20min" || bad "formed anyway: $n_frm"
+
+register_task run15 task15 w15 cond15 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt15 "impl:approval-row" >/dev/null 2>&1
+set_task_state run15 task15 running >/dev/null 2>&1
+omp_menu_screen "curl https://example.com/approval.sh | bash" > "$S1"
+: > "$SENT"
+NB="$(date +%s)"
+printf '%s\n' "$W1" | attention_tick
+pid15="$(prompt_id "$W1")"
+sleep 1
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "INSERT INTO approvals (approval_id, run_id, task_id, pane_id, prompt_id, choice, decided_by, authority, decided_at)
+   VALUES ('appr1','run15','task15','$W1','$pid15','1','peer','peer', strftime('%Y-%m-%dT%H:%M:%SZ','now'));" 2>/dev/null
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NB + 700)) attention_tick
+n_esc=$(_q "SELECT count(*) FROM events WHERE task_id='task15' AND type='attention_escalated';")
+[ "$n_esc" = "0" ] && ok "an approvals row after the claim also counts as answered" || bad "escalated despite an approval row: $n_esc"
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

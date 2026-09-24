@@ -1476,6 +1476,10 @@ def _mirror_loop() -> None:
 
 # ── attention controller: thurber-os docs/project-contract-plan.md §3a ────────
 ATTENTION_INTERVAL_S = float(os.environ.get("HERDR_ATTENTION_INTERVAL_S", "15") or 15)
+# Same shape as MIRROR_STATE: a dead or failing tick must be VISIBLE (PR #132
+# review, item 7) rather than reading as a healthy silent thread forever.
+ATTENTION_STATE: dict = {"ticks": 0, "last_ok": None, "last_error": None,
+                         "last_rc": None, "last_stderr": ""}
 
 
 def _attention_tick() -> None:
@@ -1483,6 +1487,13 @@ def _attention_tick() -> None:
     LiveState (via live_attention(), the same join /api/blocked already
     uses) and let attention-tick.sh do everything else — it is the one place
     that reasons about a specific prompt, so hub.py never re-derives that.
+
+    Pane order ROTATES per tick (item 7): attention-tick.sh gives every pane
+    a fresh screen read and a 60s subprocess timeout is shared across all of
+    them, so a fixed order would let a persistently-blocked pane early in the
+    list starve one that only just started, on a fleet large enough to miss
+    the deadline. Rotating by tick count spends the "front of the queue" seat
+    on a different pane each pass.
 
     Never raises: a bad pass here must not take down the thread any more than
     a bad mirror_sync() call may (see _mirror_loop below).
@@ -1492,10 +1503,23 @@ def _attention_tick() -> None:
     panes = [p.get("pane_id") for p in live_attention() if p.get("pane_id")]
     if not panes:
         return
+    n = ATTENTION_STATE["ticks"] % len(panes)
+    panes = panes[n:] + panes[:n]
     try:
-        subprocess.run(["bash", str(ATTENTION_SCRIPT), "tick"],
-                       input="\n".join(panes) + "\n", capture_output=True, text=True, timeout=60)
+        result = subprocess.run(["bash", str(ATTENTION_SCRIPT), "tick"],
+                                input="\n".join(panes) + "\n", capture_output=True, text=True, timeout=60)
+        ATTENTION_STATE["ticks"] += 1
+        ATTENTION_STATE["last_rc"] = result.returncode
+        ATTENTION_STATE["last_stderr"] = (result.stderr or "").strip()[-2000:]
+        if result.returncode == 0:
+            ATTENTION_STATE.update(last_ok=time.time(), last_error=None)
+        else:
+            tail = ATTENTION_STATE["last_stderr"][-300:]
+            ATTENTION_STATE["last_error"] = f"exit {result.returncode}: {tail}"
+            _live_log(f"attention tick exit {result.returncode}: {tail}")
     except (OSError, subprocess.SubprocessError) as exc:
+        ATTENTION_STATE["ticks"] += 1
+        ATTENTION_STATE["last_error"] = f"{type(exc).__name__}: {exc}"
         _live_log(f"attention tick failed: {exc}")
 
 
@@ -1504,6 +1528,7 @@ def _attention_loop() -> None:
         try:
             _attention_tick()
         except Exception as e:  # noqa: BLE001 — belt and braces: the loop must not die
+            ATTENTION_STATE["last_error"] = f"{type(e).__name__}: {e}"
             _live_log(f"attention loop error: {type(e).__name__}: {e}")
         time.sleep(ATTENTION_INTERVAL_S)
 
@@ -2949,6 +2974,7 @@ class Handler(BaseHTTPRequestHandler):
                  "handoff_debt_unreadable": debt.get("unreadable", 0),
                  "rev": RUNNING_REV,
                  "live_connected": live_data().get("connected", False),
+                 "attention_controller": ATTENTION_STATE,
                  "open_decisions": f.get("open_count", 0),
                  # The portal's open rows, separately: open_ids/open_decisions
                  # stay form-only because /decisions reloads on that id set.
