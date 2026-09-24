@@ -36,7 +36,12 @@
 # the key, PR #132 review item 2) + a whitespace-normalised hash of
 # prompt_command_text (not prompt_id: prompt_id hashes the whole
 # question+options block and moves on a mere repaint or terminal resize,
-# which is not a new prompt). lib/attention-key.sh is the one place this is
+# which is not a new prompt) + the pane's latest prompt-appearance EDGE
+# sequence (lib/attention-key.sh's `attention_edge_sequence` — the hooks mark
+# one edge per genuine new prompt; this controller's own tick never marks
+# one, only reads it, so the key stays put across every tick of one
+# continuous prompt and steps forward only when the SAME command is
+# genuinely re-asked). lib/attention-key.sh is the one place this is
 # computed, shared with the hooks (item 6) so the two cannot drift apart.
 # prompt_id is still carried in every payload, for forensics only.
 #
@@ -304,6 +309,12 @@ _attn_maybe_form() {                    # run_id task_id pane key reason label c
 # decision, human or peer) both qualify — anything timestamped after the
 # tracking claim means someone already acted on this exact prompt.
 #
+# `>=`, not `>`: a decision confirmed in the SAME wall-clock second as the
+# tracking claim (both share the registry's one-second ISO timestamp
+# resolution) used to fail the strict `>` and read as unanswered — the other
+# half of the w1Q:p6 incident (2026-09-24): a confirmed approval landed in
+# the same second as `attn_track_<key>`'s own claim, so this check missed it.
+#
 # An approvals row only counts once `confirmed_at IS NOT NULL` (PR #132
 # re-review item 1): `decided_at` alone means a choice was RECORDED, not that
 # it was delivered — the same three-phase distinction push_wake's own
@@ -317,10 +328,10 @@ _attn_answered_since() {                # pane_id prompt_id since_iso -> 0 if an
   n="$(_sql "SELECT count(*) FROM events WHERE type='owner_acted'
     AND json_extract(payload,'\$.pane')=$(_sq "$pane")
     AND json_extract(payload,'\$.prompt_id')=$(_sq "$pid")
-    AND occurred_at > $(_sq "$since_iso");" 2>/dev/null)"
+    AND occurred_at >= $(_sq "$since_iso");" 2>/dev/null)"
   [ "${n:-0}" -gt 0 ] && return 0
   n="$(_sql "SELECT count(*) FROM approvals WHERE pane_id=$(_sq "$pane")
-    AND prompt_id=$(_sq "$pid") AND decided_at > $(_sq "$since_iso")
+    AND prompt_id=$(_sq "$pid") AND decided_at >= $(_sq "$since_iso")
     AND confirmed_at IS NOT NULL;" 2>/dev/null)"
   [ "${n:-0}" -gt 0 ]
 }
