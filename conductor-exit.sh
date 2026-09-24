@@ -42,6 +42,8 @@ live_panes=$(herdr pane list 2>/dev/null | jq -r '(.result.panes // .panes)[]?.p
 is_live() { printf '%s\n' "$live_panes" | grep -qxF "$1"; }
 
 if [ "$orphans" = 1 ]; then
+  # An empty pane list (herdr down) would make every conductor look gone.
+  [ -n "$live_panes" ] || { echo "conductor-exit: herdr returned no panes; refusing --orphans" >&2; exit 3; }
   scope="conductor_pane_id IS NOT NULL AND conductor_pane_id != ''"
 else
   [ -n "$conductor" ] || { echo "conductor-exit: no conductor pane (set HERDR_PANE_ID or pass --conductor=)" >&2; exit 2; }

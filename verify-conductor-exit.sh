@@ -94,6 +94,12 @@ out=$(bash "$here/conductor-exit.sh" --orphans 2>&1)
 printf '%s\n' "$out" | grep -q 'ship .*orphan-work' && ok "orphan (conductor GONE) found" || bad "orphan missing: $out"
 printf '%s\n' "$out" | grep -q 'open-pr-work\|no-pr-work' && bad "live conductor's workers treated as orphans" || ok "live conductor's workers excluded"
 
+printf '== --orphans with an empty herdr pane list -> refuse (exit 3), close nothing ==\n'
+herdr() { printf '%s\n' "$*" >> "$CALLS"; printf '{}\n'; }; export -f herdr
+: > "$CALLS"
+bash "$here/conductor-exit.sh" --orphans --apply >/dev/null 2>&1; check "exit 3 when herdr lists no panes" "$?" "3"
+grep -q 'pane close' "$CALLS" && bad "closed a pane with no pane list" || ok "nothing closed without a pane list"
+
 printf '== no conductor at all -> usage error, not "every task" ==\n'
 HERDR_PANE_ID= bash "$here/conductor-exit.sh" >/dev/null 2>&1; check "exit 2 without a conductor" "$?" "2"
 
