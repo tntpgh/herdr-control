@@ -213,6 +213,21 @@ workspace's default empty root tab (see `ensure-workspace.sh`'s own comment
 about this gap) was never used, close that too — `spawn-task.sh` now does
 this automatically, best-effort, only for a tab with no agent set at all.
 
+**Conductor exit.** Before a conductor stops, meaning it has saved its session
+and handoff and retained its lessons, it closes its shipped workers:
+
+```bash
+./conductor-exit.sh                 # dry run: ship/HOLD per worker this pane conducts
+./conductor-exit.sh --apply         # close only workers whose PR MERGED; proof = PR URL + merge sha
+./conductor-exit.sh --orphans       # workers whose conductor pane is already gone
+```
+
+Open-PR and no-PR workers are held and printed; name them in the handoff.
+It reuses `close-done-workers.sh` for the pane safety checks (not working,
+clean tree, nothing unpushed), so it never closes more than that would. The
+omp hook's `session_stop` handler reminds a conductor once, at its first stop,
+whenever `--summary` reports closable workers. It never blocks.
+
 ---
 
 ## omp workers push too

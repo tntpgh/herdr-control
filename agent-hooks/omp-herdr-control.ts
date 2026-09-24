@@ -39,6 +39,7 @@ const ROOT = process.env.HERDR_CONTROL_DIR?.trim() || path.dirname(HERE);
 const NOTIFY_SH = path.join(ROOT, "agent-hooks", "omp-notify.sh");
 const RECONCILE_SH = path.join(ROOT, "agent-hooks", "omp-reconcile.sh");
 const RESOLVE_SH = path.join(ROOT, "herdr-resolve.sh");
+const CONDUCTOR_EXIT_SH = path.join(ROOT, "conductor-exit.sh");
 const HUB_PY = path.join(ROOT, "hub.py");
 const HUB_PORT = Number(process.env.HERDR_HUB_PORT) || 8600;
 const HUB_URL = `http://127.0.0.1:${HUB_PORT}/`;
@@ -562,6 +563,42 @@ function onAgentEnd(): undefined {
   return undefined;
 }
 
+// Conductor exit. A conductor that saves its session and lessons then stops
+// used to leave every finished worker's pane open and its registry row
+// `running` (2026-09-24: a closed conductor tab left four workers whose PRs
+// had merged hours earlier). At the FIRST stop, if this pane conducts workers
+// whose PRs have merged, tell it once to run conductor-exit.sh. Advisory,
+// never a block: closing panes is cheap to do by hand later, and a stop that
+// fails for another reason must not be turned into two problems. A pane with
+// no HERDR_PANE_ID, or no closable workers, costs one short subprocess and
+// says nothing.
+let exitNudged = false;
+function onSessionStop(): { continue: true; additionalContext: string } | undefined {
+  try {
+    if (exitNudged) return undefined;
+    const pane = process.env.HERDR_PANE_ID?.trim();
+    if (!pane || !safeExists(CONDUCTOR_EXIT_SH)) return undefined;
+    const r = spawnSync("bash", [CONDUCTOR_EXIT_SH, `--conductor=${pane}`, "--summary"], {
+      encoding: "utf8",
+      timeout: 20_000,
+    });
+    const [closable, held] = (r.stdout ?? "").trim().split(/\s+/).map((n) => Number.parseInt(n, 10));
+    if (!(closable > 0)) return undefined;
+    exitNudged = true;
+    return {
+      continue: true,
+      additionalContext:
+        `<system-reminder>\nBefore finishing: this pane (${pane}) conducts ${closable} worker(s) whose PR has merged` +
+        `${held > 0 ? ` and ${held} still open or unshipped` : ""}. Close the shipped ones through the gate:\n\n` +
+        `  bash ${CONDUCTOR_EXIT_SH}            # dry run: shows ship/HOLD per worker\n` +
+        `  bash ${CONDUCTOR_EXIT_SH} --apply    # closes only merged-PR workers, proof = PR URL + merge sha\n\n` +
+        `Held workers stay open; name them in your handoff. This reminder fires once.\n</system-reminder>`,
+    };
+  } catch {
+    return undefined; // see onToolResult(): a hook must never throw into the session.
+  }
+}
+
 export default function (pi: HookAPI): void {
   pi.on("tool_approval_requested", onApprovalRequested);
   pi.on("tool_approval_resolved", onApprovalResolved);
@@ -570,4 +607,5 @@ export default function (pi: HookAPI): void {
   pi.on("before_agent_start", onBeforeAgentStart);
   pi.on("tool_result", onToolResult);
   pi.on("agent_end", onAgentEnd);
+  pi.on("session_stop", onSessionStop);
 }
