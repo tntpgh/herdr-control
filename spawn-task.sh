@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus] [--no-secrets]
+# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus] [--no-secrets] [--brief FILE]
 #
 # Every worker starts with the 1Password service-account identity (one vault,
 # 249 items, READ-ONLY) so an unattended run never stops to ask for a
@@ -59,7 +59,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 # --secrets, typed by a human or a conductor that holds it, lifts that.
 secrets_req=""
 [ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && secrets_req=withhold
-base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; positional=()
+base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; brief_file=""; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base="$2"; shift 2 ;;
@@ -69,6 +69,9 @@ while [ $# -gt 0 ]; do
     # Credential posture for this spawn — see lib/op-env.sh for why the managed
     # default is ON and the unmanaged default is OFF.
     --no-secrets) secrets_req=withhold; shift ;;
+    # SPEC.md is filled from this file's content when passed; otherwise a
+    # template (see _spec_template below). Never required.
+    --brief) brief_file="${2:?spawn-task: --brief needs a file path}"; shift 2 ;;
     --secrets) secrets_req=grant; shift ;;
     --dry-run|-n) dry=1; shift ;;
     --focus) foc=--focus; shift ;;
@@ -86,6 +89,7 @@ job="${3:-implement}"
 shift 3 2>/dev/null || shift $#
 rest=("$@"); [ "${#rest[@]}" -eq 0 ] && rest=(claude)
 agent="${rest[0]}"
+[ -z "$brief_file" ] || [ -r "$brief_file" ] || { echo "spawn-task: --brief file not readable: $brief_file" >&2; exit 1; }
 
 # ---- MODEL MAP (job-class -> model / reasoning-effort) ----------------------
 # Table lives in lib/agent-profiles.sh (model_for_agent); this wrapper only
@@ -270,6 +274,7 @@ if [ "$dry" = 1 ]; then
   echo "              ^ run BACKGROUNDED (run_in_background/async:true) — a blocking"
   echo "                foreground call strands you idle until re-prompted by hand"
   echo "  registry  : run=$run_id task=$task_id conductor_pane=${conductor_pane_id:-<none — not running inside a herdr pane>} conductor_pane_birth=${conductor_pane_birth:-<none>}"
+  echo "  spec      : $(handoff_spec "$wt")  (${brief_file:+from --brief $brief_file}${brief_file:-template — no --brief passed})"
   exit 0
 fi
 
@@ -321,6 +326,71 @@ mkdir -p "$(dirname "$events_file")"
 # whole thing as nothing. A worker then can't accidentally commit its own
 # coordination log into the branch it was sent to write.
 printf '*\n' > "$(dirname "$events_file")/.gitignore"
+
+# ---- SPEC.md / PROOF.md: written FIRST, before any herdr/registry side
+# effect (tab, pane, task registration, claim) — a write failure here exits
+# clean with nothing else created yet.
+#
+# project-contract-plan.md item 1: "done" was a claim in an agent's own TODO
+# that nothing checked. SPEC.md is the acceptance criteria a worker is
+# actually held to — the brief's own text when one is passed via --brief,
+# else a bare template — plus the proof contract every worker now needs to
+# close as `completed`. PROOF.md is the evidence the worker collects into as
+# it works; `shipped` may point a proof reference at a section of it
+# (lib/run-registry.sh's `_valid_proof_ref`).
+#
+# NEVER an unconditional write: spawn-task.sh also handles RE-SPAWNING into
+# an existing worktree (same branch, worker respawned), and `.handoffs/` is
+# self-gitignored, so an unconditional `> SPEC.md` / `: > PROOF.md` here
+# would silently DESTROY a worker's already-collected evidence with no git
+# history to recover it from — measured: a 36-byte PROOF.md went to 0 bytes,
+# a real brief got replaced by the bare template, and
+# `--brief <same-worktree>/.handoffs/SPEC.md` truncated the file the `cat`
+# below was about to read (a same-file read-then-clobber). So PROOF.md is
+# created only if it does not already exist, and SPEC.md is written via a
+# TEMP FILE + atomic `mv` — which is also what makes
+# `--brief <wt>/.handoffs/SPEC.md` safe (the read completes before the
+# target path is ever touched), and re-spawning WITHOUT --brief on a
+# worktree that already has a real SPEC.md leaves it alone instead of
+# overwriting it with the template.
+_spec_proof_contract() {
+  cat <<'EOF'
+
+## Proof contract
+`set_task_state <run> <task> completed <reason> [proof]` (lib/run-registry.sh)
+refuses a `completed` transition without a closure reason:
+  shipped | handed_off_to:<task|role> | blocked_on:<thing> | canceled | no-follow-on
+`shipped` additionally requires a proof reference: `<PR URL> <merge sha>`, or
+a section id in this worktree's `.handoffs/PROOF.md#<section>` (created
+empty alongside this file — it must actually hold something; an empty file
+is not proof) naming the check that ran and its output. Write what you
+verified into PROOF.md before closing the task `shipped`.
+EOF
+}
+
+_spec_template() {
+  cat <<'EOF'
+# SPEC
+
+## Goal
+(no brief was passed to spawn-task.sh — fill this in: what is this task for?)
+
+## Acceptance
+- [ ] (one checkbox per acceptance criterion)
+EOF
+  _spec_proof_contract
+}
+
+spec_path="$(handoff_spec "$wt")"
+proof_path="$(handoff_proof "$wt")"
+if [ -n "$brief_file" ]; then
+  tmp_spec=$(mktemp "$(dirname "$spec_path")/.SPEC.XXXXXX") || { echo "spawn-task: failed to write $spec_path" >&2; exit 1; }
+  { cat "$brief_file"; printf '\n'; _spec_proof_contract; } > "$tmp_spec" && mv -f "$tmp_spec" "$spec_path"
+elif [ ! -s "$spec_path" ]; then
+  _spec_template > "$spec_path" 2>/dev/null
+fi
+[ -s "$spec_path" ] || { echo "spawn-task: failed to write $spec_path" >&2; exit 1; }
+[ -e "$proof_path" ] || : > "$proof_path" 2>/dev/null || { echo "spawn-task: failed to write $proof_path" >&2; exit 1; }
 
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
 ws=$(bash "$here/ensure-workspace.sh" --no-focus "$root") || exit 1
@@ -381,17 +451,20 @@ fi
 # The example is built here rather than inside jq: a nested quoting puzzle in
 # the generator is how this file ends up emitting a command the worker cannot
 # paste back.
-identity_example="printf '{\"event\":\"$wake_pattern\",\"status\":\"completed\"}\n' >> $events_file"
+identity_example="printf '{\"event\":\"$wake_pattern\",\"status\":\"completed\",\"reason\":\"shipped\",\"proof\":\".handoffs/PROOF.md#<section> or <PR URL> <merge sha>\"}\n' >> $events_file"
 jq -n \
   --arg run "$run_id" --arg task "$task_id" --arg worker "$worker_id" \
   --arg conductor "$conductor_id" --arg pane "$pane" --arg label "$label" \
   --arg event "$wake_pattern" --arg events "$events_file" \
   --arg worktree "$wt" --arg branch "$branch" --arg repo "$root" \
   --arg example "$identity_example" \
+  --arg spec "$(handoff_spec "$wt")" --arg proof_file "$(handoff_proof "$wt")" \
   '{run_id:$run, task_id:$task, worker_id:$worker, conductor_id:$conductor,
     pane_id:$pane, label:$label, completion_event:$event,
     events_file:$events, worktree:$worktree, branch:$branch, repo:$repo,
-    how_to_complete:"Append one JSON line to events_file, using completion_event verbatim. Read these values HERE — do not try env/printenv, that is human-reserved and will stall you until a human answers.",
+    spec_file:$spec, proof_file:$proof_file,
+    how_to_complete:"Append one JSON line to events_file, using completion_event verbatim, PLUS a closure reason field: shipped | handed_off_to:<task|role> | blocked_on:<thing> | canceled | no-follow-on. `shipped` also needs a proof field — a PR URL + merge sha, or a section id in proof_file written as \".handoffs/PROOF.md#<section>\" (it must actually hold something you wrote, not stay empty) — the registry refuses `completed` without one (lib/run-registry.sh). Read spec_file for the acceptance checklist and write what you verified into proof_file before closing shipped. Read these values HERE — do not try env/printenv, that is human-reserved and will stall you until a human answers.",
+    closure_reasons:["shipped","handed_off_to:<task|role>","blocked_on:<thing>","canceled","no-follow-on"],
     example:$example}' \
   > "$(handoff_identity "$wt")" 2>/dev/null || {
     # Never fail a spawn over the convenience file — the worker can still be

@@ -993,6 +993,70 @@ class EvidenceAtIsScoped(unittest.TestCase):
         self.assertEqual(calls, [], "a passed-in completion must not be recomputed")
 
 
+class ClosureReasonJoin(unittest.TestCase):
+    """herdr_data() joins each `completed` task to the closure reason ITS OWN
+    `state_changed` event recorded (project-contract-plan.md item 1: "the
+    hub shows a task as done only from the registry transition, with its
+    reason"). Two shapes: a real gated completion, and pre-gate data with no
+    reason on record — the second must say so plainly, not silently omit it
+    or invent one.
+    """
+
+    def _registry(self, d, rows, events):
+        import sqlite3
+        db = Path(d) / "registry.sqlite3"
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE tasks (task_id TEXT, run_id TEXT, label TEXT, repo TEXT, state TEXT,"
+            " pane_id TEXT, conductor_id TEXT, worktree TEXT, created_at TEXT, updated_at TEXT);"
+            "CREATE TABLE events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT,"
+            " task_id TEXT, occurred_at TEXT, payload TEXT);"
+            "CREATE TABLE checkpoints (conductor_id TEXT, last_event_seq INT, updated_at TEXT);")
+        for row in rows:
+            conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)", row)
+        for ev in events:
+            conn.execute("INSERT INTO events (type, task_id, occurred_at, payload) VALUES (?,?,?,?)", ev)
+        conn.commit(); conn.close()
+        return db
+
+    def test_a_reasoned_completion_is_joined_and_rendered(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d,
+                [("t_shipped", "r", "shipped task", "repo", "completed", "", "", "/nonexistent",
+                  "2026-09-23T09:00:00Z", "2026-09-23T09:30:00Z")],
+                [("state_changed", "t_shipped", "2026-09-23T09:30:00Z",
+                  json.dumps({"state": "completed", "from": "running",
+                              "reason": "shipped", "proof": "https://x/pr/1 abc1234"}))])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "pane_statuses", lambda: {}):
+                row = hub.herdr_data()["tasks"][0]
+        self.assertEqual(row["closure_reason"], "shipped")
+        self.assertEqual(row["closure_proof"], "https://x/pr/1 abc1234")
+        rendered = hub.task_rows([row])
+        self.assertIn("closure reason", rendered)
+        self.assertIn("shipped", rendered)
+
+    def test_a_pre_gate_completion_says_so_plainly(self):
+        """A `completed` row with no matching `state_changed` reason (data
+        from before this gate existed, or a direct DB edit) must not be
+        silently blank — the whole point of the gate is that this is
+        visible, not that a missing reason renders as an empty cell that
+        reads exactly like a genuinely gated completion."""
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d,
+                [("t_old", "r", "old task", "repo", "completed", "", "", "/nonexistent",
+                  "2026-08-01T09:00:00Z", "2026-08-01T09:30:00Z")],
+                [])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "pane_statuses", lambda: {}):
+                row = hub.herdr_data()["tasks"][0]
+        self.assertIsNone(row["closure_reason"])
+        rendered = hub.task_rows([row])
+        self.assertIn("no reason recorded", rendered)
+
+
 class BlockedDebounce(unittest.TestCase):
     """A worker is blocked for a second or two every time it asks anything.
 

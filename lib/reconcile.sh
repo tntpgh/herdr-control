@@ -239,11 +239,46 @@ run_reconciliation() {
             local done_ev
             done_ev="$(_done_event_for_task "$task_json")"
             if [ -n "$done_ev" ]; then
-              set_task_state "$run_id" "$task_id" "completed"
-              append_event "$run_id" "$task_id" "completion_recorded" \
-                "$(jq -nc --arg r "$reason" --arg pane "$pane_id" --argjson ev "$done_ev" \
-                  '{source:"worktree_handoff_event", pane_reason:$r, pane_id:$pane, event:$ev}')" \
-                "complete_${task_id}_$(printf '%s' "$done_ev" | jq -r '.event')"
+              # The worker's OWN completion claim now has to carry the same
+              # closure reason set_task_state requires of every other caller
+              # (project-contract-plan.md item 1) — `.handoffs/SPEC.md`'s
+              # proof contract, spawn-task.sh, tells it so. A `_done` line
+              # with no reason (or `shipped` with no proof) is exactly the
+              # unchecked claim this gate exists to stop trusting.
+              #
+              # Pre-validated HERE, not just left to set_task_state's own
+              # refusal: every sweep re-reads this same stuck task (nothing
+              # else will ever mark it lost or completed for it), and
+              # letting set_task_state's stderr refusal fire on every single
+              # sweep is noise with no reader — this computes `why` once and
+              # skips the call entirely when it already knows the answer.
+              local ev_reason ev_proof ev_why=""
+              ev_reason="$(printf '%s' "$done_ev" | jq -r '.reason // empty')"
+              ev_proof="$(printf '%s' "$done_ev" | jq -r '.proof // empty')"
+              if ! _valid_closure_reason "$ev_reason"; then
+                ev_why="closure reason missing/invalid: ${ev_reason:-<empty>}"
+              elif [ "$ev_reason" = shipped ] && ! _valid_proof_ref "$ev_proof" "$(printf '%s' "$task_json" | jq -r '.worktree // empty')"; then
+                ev_why="shipped proof missing/invalid or PROOF.md still empty"
+              fi
+              if [ -z "$ev_why" ] && set_task_state "$run_id" "$task_id" "completed" "$ev_reason" "$ev_proof"; then
+                append_event "$run_id" "$task_id" "completion_recorded" \
+                  "$(jq -nc --arg r "$reason" --arg pane "$pane_id" --argjson ev "$done_ev" \
+                    '{source:"worktree_handoff_event", pane_reason:$r, pane_id:$pane, event:$ev}')" \
+                  "complete_${task_id}_$(printf '%s' "$done_ev" | jq -r '.event')"
+              else
+                # Leave state as-is (the pane is gone either way): a human or
+                # conductor closes it explicitly with a real reason (or
+                # `close-done-workers.sh --task=<id> --reason=... [--proof=]`
+                # once one is available), or a later sweep tries again once
+                # the worker's own event is fixed. Recorded, never silent —
+                # and never falls through to `lost`, which would misreport a
+                # worker that DID finish.
+                [ -n "$ev_why" ] || ev_why="registry refused the transition"
+                append_event "$run_id" "$task_id" "completion_evidence_rejected" \
+                  "$(jq -nc --arg r "$reason" --arg pane "$pane_id" --argjson ev "$done_ev" --arg why "$ev_why" \
+                    '{source:"worktree_handoff_event", pane_reason:$r, pane_id:$pane, event:$ev, why:$why}')" \
+                  "reject_${task_id}_$(printf '%s' "$done_ev" | jq -r '.event')"
+              fi
             else
               set_task_state "$run_id" "$task_id" "lost"
               append_event "$run_id" "$task_id" "lost_detected" \
@@ -339,7 +374,7 @@ run_reconciliation() {
     [ "$ev_seq" -gt "$max_seq" ] && max_seq="$ev_seq"
     ev_type=$(printf '%s' "$ev_json" | jq -r '.type // empty')
     case "$ev_type" in
-      input_required|push_wake_refused|pane_identity_uncertain|conductor_identity_uncertain|stale_worker_hook_refused|completion_evidence) ;;
+      input_required|push_wake_refused|pane_identity_uncertain|conductor_identity_uncertain|stale_worker_hook_refused|completion_evidence|completion_evidence_rejected) ;;
       wake_result)
         # A submitted wake needs no report — the conductor it woke IS the
         # audience. Only failures are silent and need surfacing.
@@ -348,8 +383,6 @@ run_reconciliation() {
     esac
     ev_owner=$(printf '%s' "$ev_json" | jq -r '.task_conductor_id // empty')
     case "$ev_owner" in ''|conductor_unknown|"$conductor_id") ;; *) continue ;; esac
-    # Bounded: a conductor whose cursor has never advanced (first pass after
-    # this feature, or a long-dead checkpoint) may face a deep backlog; a
     # session-start injection must not be 500 lines of history. Everything
     # scanned is still acknowledged via max_seq — elided lines are counted,
     # not lost silently.
@@ -361,7 +394,7 @@ run_reconciliation() {
     ev_repo=$(printf '%s' "$ev_json" | jq -r '.repo // "" | split("/") | last // ""')
     ev_at=$(printf '%s' "$ev_json" | jq -r '.occurred_at // "?"')
     ev_detail=$(printf '%s' "$ev_json" | jq -r \
-      '[(.payload.reason // empty), (.payload.outcome // empty),
+      '[(.payload.reason // empty), (.payload.outcome // empty), (.payload.why // empty),
         (if (.payload.prompt_id // "") != "" then "prompt=" + .payload.prompt_id else empty end)]
        | map(select(. != "")) | join(" ")')
     report_lines="${report_lines}- ${ev_type}: ${ev_label} (${ev_repo:-?})${ev_detail:+ — ${ev_detail}}  [${ev_at}]"$'\n'

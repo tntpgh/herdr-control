@@ -609,7 +609,7 @@ printf '== terminal task: hook rejected BEFORE state change or actionable event 
 # hook already in flight can fire after the sweep buried its task. Neither
 # may resurrect state OR append a fresh "needs input" fact for a dead task.
 set_task_state run1 task1 running >/dev/null 2>&1
-set_task_state run1 task1 completed >/dev/null 2>&1
+set_task_state run1 task1 completed no-follow-on >/dev/null 2>&1
 omp_menu_screen "stale-test-cmd" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
 : > "$SENT"

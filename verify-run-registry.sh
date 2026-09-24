@@ -57,8 +57,89 @@ set_task_state run1 task1 running || bad "starting -> running refused"
 check "now running" "$(read_task run1 task1 | jq -r .state)" "running"
 set_task_state run1 task1 blocked || bad "running -> blocked refused"
 set_task_state run1 task1 running || bad "blocked -> running refused"
-set_task_state run1 task1 completed || bad "running -> completed refused"
-check "now completed" "$(read_task run1 task1 | jq -r .state)" "completed"
+
+printf '== closure-reason gate on completed (project-contract-plan item 1) ==\n'
+if set_task_state run1 task1 completed 2>/dev/null; then
+  bad "completed with no closure reason was ACCEPTED"
+else
+  ok "completed with no closure reason refused"
+fi
+check "state unchanged after refusal" "$(read_task run1 task1 | jq -r .state)" "running"
+check "no state_changed(completed) event written" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='task1' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';")" \
+  "0"
+if set_task_state run1 task1 completed "not-a-real-reason" 2>/dev/null; then
+  bad "completed with a garbage closure reason was ACCEPTED"
+else
+  ok "completed with a garbage closure reason refused"
+fi
+if set_task_state run1 task1 completed shipped 2>/dev/null; then
+  bad "shipped with no proof was ACCEPTED"
+else
+  ok "shipped with no proof refused"
+fi
+if set_task_state run1 task1 completed shipped "not a real proof" 2>/dev/null; then
+  bad "shipped with a malformed proof (no URL, no sha, no PROOF.md) was ACCEPTED"
+else
+  ok "shipped with a malformed proof refused"
+fi
+check "state still unchanged after every refusal" "$(read_task run1 task1 | jq -r .state)" "running"
+set_task_state run1 task1 completed "handed_off_to:reviewer" \
+  || bad "handed_off_to needs no proof and was refused"
+check "handed_off_to closes without proof" "$(read_task run1 task1 | jq -r .state)" "completed"
+
+printf '== shipped WITH a valid proof: accepted, event carries both ==\n'
+register_task runShip taskShip w c cp cb paneShip birthShip /repo/s /wt/s "ship" \
+  || bad "register taskShip failed"
+set_task_state runShip taskShip running || bad "taskShip -> running failed (setup)"
+set_task_state runShip taskShip completed shipped \
+  "https://github.com/tntpgh/herdr-control/pull/69 abc1234" \
+  || bad "shipped with a valid PR+sha proof refused"
+check "now completed" "$(read_task runShip taskShip | jq -r .state)" "completed"
+check "event carries the reason" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.reason') FROM events WHERE task_id='taskShip' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';")" \
+  "shipped"
+check "event carries the proof" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.proof') FROM events WHERE task_id='taskShip' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';")" \
+  "https://github.com/tntpgh/herdr-control/pull/69 abc1234"
+set_task_state runShip taskShip completed || bad "idempotent re-assert with no reason refused"
+ok "idempotent re-assert of an already-completed task needs no reason"
+
+printf '== _valid_proof_ref: a PROOF.md reference is checked against the REAL file ==\n'
+wtreal=$(mktemp -d)/wt-real; mkdir -p "$wtreal/.handoffs"
+if _valid_proof_ref ".handoffs/PROOF.md#x" "$wtreal" 2>/dev/null; then
+  bad "an EMPTY PROOF.md counted as proof"
+else
+  ok "an empty real PROOF.md is refused"
+fi
+printf 'verified: ran X, 5/5 passed\n' > "$wtreal/.handoffs/PROOF.md"
+_valid_proof_ref ".handoffs/PROOF.md#x" "$wtreal" \
+  && ok "a non-empty real PROOF.md is accepted" || bad "a real, non-empty PROOF.md refused"
+_valid_proof_ref ".handoffs/PROOF.md#x" "" \
+  && ok "no worktree on record falls back to the name-shape check" \
+  || bad "no-worktree fallback refused a PROOF.md-shaped proof"
+if _valid_proof_ref ".handoffs/PROOF.md#x" "/no/such/worktree" 2>/dev/null; then
+  bad "a nonexistent worktree path was accepted"
+else
+  ok "a worktree that doesn't exist on disk is refused (no PROOF.md to check)"
+fi
+
+printf '== proof shape: a PROOF.md section reference is checked via set_task_state'"'"'s own worktree lookup ==\n'
+wtPf=$(mktemp -d)/wt-pf; mkdir -p "$wtPf/.handoffs"
+register_task runPf taskPf w c cp cb panePf birthPf /repo/p "$wtPf" "pf" || bad "register taskPf failed"
+set_task_state runPf taskPf running || bad "taskPf -> running failed (setup)"
+if set_task_state runPf taskPf completed shipped ".handoffs/PROOF.md#verify-run-registry" 2>/dev/null; then
+  bad "shipped accepted against an EMPTY PROOF.md (via set_task_state's own worktree lookup)"
+else
+  ok "shipped refused: the task's real PROOF.md exists but is empty"
+fi
+check "state unchanged by the refusal" "$(read_task runPf taskPf | jq -r .state)" "running"
+printf 'verified: ran verify-run-registry.sh itself, all green\n' > "$wtPf/.handoffs/PROOF.md"
+set_task_state runPf taskPf completed shipped ".handoffs/PROOF.md#verify-run-registry" \
+  || bad "shipped refused with a real, non-empty PROOF.md"
+check "PROOF.md-referencing proof accepted once the file actually holds something" \
+  "$(read_task runPf taskPf | jq -r .state)" "completed"
+
 
 # The gap correction 2 named: "nothing stops completed -> running".
 if set_task_state run1 task1 running 2>/dev/null; then
@@ -142,7 +223,7 @@ check "all $n_writers concurrent events landed" "$rows" "$n_writers"
 check "every sequence is unique"                "$uniq_seqs" "$n_writers"
 
 printf '== all_tasks_json ==\n'
-check "one line per task" "$(all_tasks_json | wc -l | tr -d ' ')" "3"
+check "one line per task" "$(all_tasks_json | wc -l | tr -d ' ')" "5"
 all_tasks_json | while IFS= read -r l; do
   printf '%s' "$l" | jq -e . >/dev/null 2>&1 || { printf '  FAIL  non-JSON row\n'; exit 1; }
 done || bad "all_tasks_json emitted a non-JSON row"
