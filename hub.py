@@ -956,6 +956,7 @@ def herdr_data(event_limit: int = 100) -> dict:
 LIVE: herdr_live.LiveState | None = None
 AGENT_EDGE = Path(__file__).resolve().parent / "agent-edge.sh"
 HUB_CONNECTION_ALERT = Path(__file__).resolve().parent / "hub-connection-alert.sh"
+DEPLOY_DRIFT_ALERT = Path(__file__).resolve().parent / "deploy-drift-alert.sh"
 
 
 def _live_log(msg: str) -> None:
@@ -1526,10 +1527,46 @@ def _mirror_loop() -> None:
 DEPLOY_DRIFT_PRIME_EVERY_S = 60
 
 
+def _deploy_drift_alert_check(dd: dict) -> None:
+    """.handoffs/SPEC.md KEEP list: 'deploy drift > 30 min'. Reuses the SAME
+    threshold and cache the dashboard card already uses (deploy_drift_rows'
+    `hot = m > 30`) rather than inventing a second notion of "drifted" — see
+    deploy-drift-alert.sh's own header for why this only became reachable
+    once PR #130 landed deploy_drift_data().
+
+    An unverified repo (fetch failed, or an error) leaves the CURRENT alert
+    state alone rather than guessing either direction: a transient fetch
+    failure must not manufacture a false "back in sync" recovery post, and
+    must not manufacture a false "drifted" page either.
+
+    Fire-and-forget, same as _on_agent_edge/_on_connection_change: this runs
+    on the prime-loop thread, which must never die on a spawn failure.
+    """
+    if not DEPLOY_DRIFT_ALERT.exists():
+        return
+    for r in dd.get("repos", []):
+        if r.get("error") or r.get("fetch_ok") is False:
+            continue
+        repo = r.get("repo") or ""
+        if not repo:
+            continue
+        minutes = r.get("behind_minutes") or 0
+        status = "drifted" if minutes > 30 else "synced"
+        try:
+            subprocess.Popen(
+                ["bash", str(DEPLOY_DRIFT_ALERT), repo, status, str(minutes),
+                 r.get("deployed") or "", r.get("main") or ""],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            _live_log(f"deploy-drift-alert spawn failed for {repo}: {exc}")
+
+
 def _deploy_drift_prime_loop() -> None:
     while True:
         try:
-            CACHES["deploy_drift"].get()
+            _deploy_drift_alert_check(CACHES["deploy_drift"].get())
         except Exception:  # noqa: BLE001 — belt and braces: the loop must not die
             pass
         time.sleep(DEPLOY_DRIFT_PRIME_EVERY_S)

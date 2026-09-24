@@ -289,7 +289,10 @@ once per prompt (.handoffs/SPEC.md, 2026-09-24). Concretely:
   and is still unanswered after `HERDR_WAKE_FAIL_ALERT_S` (default 600s);
   the herdr control-plane subscription itself going down or coming back
   (`hub-connection-alert.sh`, graced by `HERDR_HUB_ALERT_GRACE_S`, default
-  30s, so a reconnect blip never pages).
+  30s, so a reconnect blip never pages); a repo more than 30 minutes behind
+  `origin/main` in its deploy (`deploy-drift-alert.sh`, reusing hub.py's
+  own `deploy_drift_data()` cache and its dashboard card's `>30min` "hot"
+  threshold — one page per drift episode, one recovery line when it clears).
 - **DROPPED**: allow-class prompts (a peer answers them); a duplicate post
   for a prompt already alerted; a post for a prompt that was already
   answered by the time the send would go out.
@@ -297,9 +300,10 @@ once per prompt (.handoffs/SPEC.md, 2026-09-24). Concretely:
   on every path above — set it on one shell to debug an alert that looks
   like it should have fired.
 
-`verify-slack-symptoms.sh` and `verify-hub-connection-alert.sh` are the
-acceptance suites for this; run either after touching `herdr-notify.sh`,
-`lib/alert-gate.sh`, `lib/push-wake.sh`, or `hub-connection-alert.sh`.
+`verify-slack-symptoms.sh`, `verify-hub-connection-alert.sh`, and
+`verify-deploy-drift-alert.sh` are the acceptance suites for this; run the
+relevant one after touching `herdr-notify.sh`, `lib/alert-gate.sh`,
+`lib/push-wake.sh`, `hub-connection-alert.sh`, or `deploy-drift-alert.sh`.
 
 ### Replying with free text
 
