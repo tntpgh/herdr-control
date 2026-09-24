@@ -294,6 +294,50 @@ fi
 # the verdict for them is attribution, not permission. For automation the
 # verdict is a gate.
 cmd_text="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
+
+# One task lookup, reused here AND by the approval-record / task-state-clear
+# code further down (previously a second, separate task_for_pane call).
+own_task_json="$(task_for_pane "$pane" 2>/dev/null)"
+own_run=$(printf '%s' "$own_task_json" | jq -r '.run_id // empty' 2>/dev/null)
+own_task=$(printf '%s' "$own_task_json" | jq -r '.task_id // empty' 2>/dev/null)
+own_worktree=$(printf '%s' "$own_task_json" | jq -r '.worktree // empty' 2>/dev/null)
+own_branch=$(printf '%s' "$own_task_json" | jq -r '.branch // empty' 2>/dev/null)
+own_trunk=$(printf '%s' "$own_task_json" | jq -r '.trunk // empty' 2>/dev/null)
+
+# ---- prefer the untruncated command recorded on tool_approval_requested
+# over the scraped panel text, when the two AGREE (project-contract-plan.md
+# #3b, item 2). Wrapped commands break across multiple TUI rows and reflow
+# oddly when scraped (measured: 45 of 103 human escalations were exactly
+# this, "executes a data file" on an otherwise ordinary command); the
+# registry event carries the model's own untruncated argument text with no
+# terminal involved at all. Consulted only when CONSISTENT with what is
+# actually on screen right now: the panel is almost always more than the bare
+# command (headers, a description, "Do you want to proceed?"), so
+# "consistent" means the recorded command appears, whitespace-collapsed, as a
+# contiguous run of words somewhere in the whitespace-collapsed panel — never
+# an exact match on the whole panel, and never trusted blind. A recorded
+# command that does not appear on screen at all refuses instead of
+# arbitrating between two different realities. Skipped for a human: a person
+# reading their own screen is the authority regardless of what any hook
+# recorded.
+if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
+  registry_cmd="$(task_input_required_command "$own_run" "$own_task" "$current_prompt_id" 2>/dev/null)"
+  if [ -n "$registry_cmd" ]; then
+    _collapse_ws() { printf '%s' "$1" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'; }
+    _panel_collapsed="$(_collapse_ws "$cmd_text")"
+    _registry_collapsed="$(_collapse_ws "$registry_cmd")"
+    case "$_panel_collapsed" in
+      *"$_registry_collapsed"*) cmd_text="$registry_cmd" ;;
+      *)
+        if [ -n "${cmd_text//[[:space:]]/}" ]; then
+          echo "herdr-select: the recorded command for this prompt does not match what is on screen in $pane — refusing." >&2
+          exit 8
+        fi
+        ;;
+    esac
+  fi
+fi
+
 policy_verdict="$(classify_command "$cmd_text")"
 policy_reason="$(classify_reason)"
 
@@ -326,6 +370,22 @@ if [ "$authority" = conductor ] && [ "$declining" = 0 ]; then
 fi
 
 if [ "$authority" = peer ] && [ "$declining" = 0 ]; then
+  # ---- ownership grant fast path (project-contract-plan.md #3b, item 3) ----
+  # Checked BEFORE the reserved-list/classify_command text rules below: an
+  # EXACT own-branch git/gh action, parsed with a strict no-eval tokenizer
+  # against THIS task's own registered repo/branch/trunk
+  # (lib/command-policy.sh's _cp_grant_action), never needs the text rules to
+  # agree — a `git commit -m "...guard rails..."` no longer trips the
+  # reserved-list's mention of herdr-select.sh/command-policy.sh inside a
+  # commit MESSAGE (24 of 103 human escalations were exactly this class). A
+  # non-match changes nothing: falls straight through to the checks below,
+  # unchanged from before this fast path existed.
+  grant_desc="$(_cp_grant_action "$cmd_text" "$own_worktree" "$own_branch" "$own_trunk" 2>/dev/null)"
+  if [ -n "$grant_desc" ]; then
+    policy_verdict=allow
+    policy_reason="ownership grant: $grant_desc"
+    authority=grant
+  else
   # Unreadable prompt text means the classifier had nothing to judge. For
   # automation that must refuse, not pass: the codebase's own rule everywhere
   # else (send-to-agent.sh's unreadable-pane path, herdr-resolve.sh's ambiguous
@@ -357,6 +417,7 @@ if [ "$authority" = peer ] && [ "$declining" = 0 ]; then
       "$(jq -nc --arg v "$policy_verdict" --arg r "$policy_reason" --arg p "$pane" \
          '{verdict:$v, reason:$r, pane:$p}')" >/dev/null 2>&1 || true
     exit 8
+  fi
   fi
 fi
 
@@ -397,9 +458,8 @@ jq -nc --arg pane "$pane" --arg choice "$choice" --arg label "$label" --arg mech
 # imply it was delivered." Three separate writes, so "we decided and typed
 # nothing" can never again read the same as "the agent received it".
 approval_id="$(gen_id appr)"
-_own="$(task_for_pane "$pane" 2>/dev/null)"
-_run=$(printf '%s' "$_own" | jq -r '.run_id // empty' 2>/dev/null)
-_task=$(printf '%s' "$_own" | jq -r '.task_id // empty' 2>/dev/null)
+_run="$own_run"
+_task="$own_task"
 # One line, bounded: this is an audit field, not a transcript.
 _cmd_record=$(printf '%s' "$cmd_text" | tr '\n' ' ' | cut -c1-500)
 approval_decided "$approval_id" "$pane" "$current_prompt_id" "$choice" "$label" \

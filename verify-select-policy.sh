@@ -143,7 +143,16 @@ done
 last_verdict=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT json_extract(payload,'$.verdict') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")
 [ "$last_verdict" = "reserved" ] && ok "escalation event carries verdict=reserved (F1)" || bad "escalation verdict=$last_verdict (expected reserved)"
 printf '== positive controls: the worker flow the lab depends on is STILL allowed ==\n'
-for allowed in "git push -u origin HEAD" "gh pr create --base main --fill" "gh issue edit 5 --add-label ready-for-review" "set -euo pipefail" "export UV_CACHE_DIR=/tmp/uv" "bash scripts/ci.sh"; do
+# `git push -u origin HEAD` used to be in this list. #135 (2026-09-24,
+# independent security review, HIGH) closed exactly that gap on purpose —
+# `git push origin HEAD` resolves to whatever branch $PWD happens to be on,
+# which can be the default branch, and the old text rules never reserved it.
+# `_cp_push_is_safe` is now deny-by-default: safe only when the target
+# literally matches the fleet's own `type/slug` branch convention. Full
+# coverage (`check_reserved "-u origin HEAD"` and 20+ related DWIM/refspec
+# cases) lives in `verify-command-policy.sh`; asserting it here too would
+# duplicate that suite, not add coverage.
+for allowed in "gh pr create --base main --fill" "gh issue edit 5 --add-label ready-for-review" "set -euo pipefail" "export UV_CACHE_DIR=/tmp/uv" "bash scripts/ci.sh"; do
   set_screen "$allowed"; reset_keys
   sel 1 --authority peer; rc=$?
   [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "'$allowed' still allowed for peer" || bad "'$allowed' now refused: rc=$rc; $(grep -m1 REFUSED "$WORK/err.txt")"
@@ -497,6 +506,78 @@ reset_keys
 set_task_state run1 task1 completed no-follow-on >/dev/null 2>&1
 conductor_select; rc=$?
 [ "$rc" = 8 ] && [ "$(keys_pressed)" = 0 ] && ok "completed task no longer grants conductor authority" || bad "terminal task accepted"
+
+printf '== #3b: ownership grant — strict tokenizer, own repo/branch only ==\n'
+# thurber-os docs/project-contract-plan.md #3b. Grant checks need a CLEAN,
+# single-line command (never the whole scraped panel, which always carries
+# header/footer chrome) — so every case here also seeds the registry's own
+# untruncated `input_required.command`, exactly what push_wake now writes,
+# which is what item 2's resolution swaps in before item 3's tokenizer ever
+# runs. seed_input_required mirrors that write directly against the DB.
+GBRANCH="feat/grant-test"; GTRUNK="main"
+register_task runG taskG wG cG "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/grant "impl:grant" "$GBRANCH" "$GTRUNK" >/dev/null 2>&1
+set_task_state runG taskG running >/dev/null 2>&1
+seed_input_required() {                 # <run> <task> <command>
+  append_event "$1" "$2" input_required \
+    "$(jq -nc --arg msg "omp needs permission" --arg pid "$(prompt_id "$PANE")" --arg cmd "$3" \
+       '{message:$msg, prompt_id:$pid, command:$cmd}')" >/dev/null 2>&1
+}
+
+for grant_cmd in "git push origin $GBRANCH" "gh pr create --head $GBRANCH" \
+                 "gh pr create --head $GBRANCH --base $GTRUNK" "git add -A" \
+                 "git commit -m note" "cd /wt/grant && git push origin $GBRANCH"; do
+  set_screen "$grant_cmd"; reset_keys
+  seed_input_required runG taskG "$grant_cmd"
+  sel 1 --authority peer; rc=$?
+  [ "$rc" -eq 0 ] && ok "grant allows: $grant_cmd" || bad "grant refused: $grant_cmd (rc=$rc); stderr: $(cat "$WORK/err.txt")"
+  [ "$(q_appr authority)" = "grant" ] && ok "authority recorded as grant" || bad "authority=$(q_appr authority) for: $grant_cmd"
+done
+
+# The exact motivating false positive (24 of 103 human escalations): the
+# reserved-list's own mention of herdr-select.sh/command-policy.sh matches
+# ANYWHERE in the text, including inside a commit MESSAGE about hardening
+# them. Without the grant this is reserved and refused; the grant never
+# consults that list for add/commit at all.
+GITMSG='harden herdr-select.sh escalation path'
+set_screen "git commit -m \"$GITMSG\""; reset_keys
+seed_input_required runG taskG "git commit -m \"$GITMSG\""
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && ok "commit message mentioning herdr-select.sh no longer reserved under the grant" \
+  || bad "grant leaked into the text rules: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+
+printf '== #3b: exact non-grant variants of the SAME verbs still refused ==\n'
+for bad_cmd in "git push origin main" "git push -f origin $GBRANCH" "git push origin HEAD:main" \
+               "git push origin $GBRANCH && git push origin main" "gh pr merge $GBRANCH"; do
+  set_screen "$bad_cmd"; reset_keys
+  seed_input_required runG taskG "$bad_cmd"
+  sel 1 --authority peer; rc=$?
+  [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "still refused: $bad_cmd" || bad "leaked through the grant: $bad_cmd (rc=$rc keys=$(keys_pressed))"
+done
+
+printf '== #3b item 2: a wrapped display reflows into a false escalation; the registry text (confirmed on screen) fixes it ==\n'
+# Real mechanism, not a stand-in: a genuine terminal-wrap artifact splits an
+# ARGUMENT onto its own line. classify_command's per-line walker then reads
+# that lone line as its own "command", and `./report.md` in command position
+# trips the "executes a data file directly" rule that never fires when the
+# same text is read as one line (measured: 45 of 103 human escalations were
+# exactly this class). WRAP_CMD is not a git/gh verb, so item 3's grant never
+# engages either — this is item 2 working on its own. Reuses taskG (still
+# `running`, and the pane's most-recently-touched task by now).
+WRAP_CMD="bash deploy.sh --file ./report.md"
+set_screen "$(printf 'bash deploy.sh --file\n./report.md')"; reset_keys
+seed_input_required runG taskG "$WRAP_CMD"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && ok "wrapped allow-class command classified via the untruncated registry text" \
+  || bad "still escalated on the wrap artifact: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+
+printf '== #3b item 2: a recorded command absent from the actual screen refuses ==\n'
+set_screen "git status --short"; reset_keys
+seed_input_required runG taskG "gh pr merge 5 --squash"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "recorded command disagreeing with the panel refuses" \
+  || bad "mismatched recorded command was not refused: rc=$rc keys=$(keys_pressed)"
+set_task_state runG taskG completed no-follow-on >/dev/null 2>&1
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

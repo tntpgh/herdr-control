@@ -165,7 +165,20 @@ _cp_data_run_ext='(html?|json|xml|csv|tsv|txt|md|log|ya?ml|png|jpe?g|gif|svg|pdf
 #
 # The control bytes survive into the tokens, which is harmless: they are
 # stripped again by `_cp_is_data_path`, and no rule prints a token.
-_cp_walk_prep() {                       # raw
+# _cp_protect_text <raw> -> same text, one line per input line, with every
+# operator/space INSIDE a quote or escaped turned into a control byte
+# (space->\x01, ;->\x02, &->\x03, |->\x04, (->\x05, )->\x06, <->\x07,
+# >->\x0E), quote characters themselves dropped, and every command
+# substitution ($(...) or `...`) collapsed to the literal token @SUB@ —
+# UNCONDITIONALLY, so a caller never has to execute one to know it was
+# there. An operator OUTSIDE any quote is left exactly as typed. Factored
+# out of `_cp_walk_prep` (below) so `lib/command-policy.sh`'s ownership-grant
+# tokenizer (`_cp_grant_action`, project-contract-plan.md #3b) can reuse the
+# SAME reviewed quote/substitution handling without re-deriving it, while
+# still telling apart "this text is one simple command" (nothing but real
+# whitespace survives unprotected) from "this text has real shell structure"
+# — the split `_cp_walk_prep` performs next throws that distinction away.
+_cp_protect_text() {                    # raw
   printf '%s' "$1" | awk '
     function prot(c) {
       if (c == " ")  return sprintf("%c", 1)
@@ -211,8 +224,119 @@ _cp_walk_prep() {                       # raw
         out = out prot(c); i++; continue
       }
       print out
-    }' |
+    }'
+}
+
+_cp_walk_prep() {                       # raw
+  _cp_protect_text "$1" |
     sed -E 's/<\(/<@LP@/g; s/>\(/>@LP@/g; s/(\&\&|\|\||[;|&()])/\n/g; s/@LP@/(/g'
+}
+
+# ---- ownership grant fast path (thurber-os docs/project-contract-plan.md
+# #3b) -------------------------------------------------------------------
+# `_cp_grant_action <raw> <worktree> <branch> <trunk>` -> prints a one-line
+# description and returns 0 when <raw> is EXACTLY one of the actions granted
+# to a worker registered for its OWN repo/branch (spawn-task.sh records
+# branch/trunk on the task row; lib/run-registry.sh); returns 1 — falling
+# through to classify_command's text rules UNCHANGED — for anything else,
+# including anything this function cannot parse with full confidence.
+# herdr-select.sh consults this BEFORE the reserved-list/verdict text rules,
+# for --authority peer only; a non-match changes nothing about how the
+# command is classified afterward.
+#
+# No shell eval anywhere: `_cp_protect_text` (shared with the walk-based
+# rules above) turns every quoted/escaped operator into a control byte and
+# every command substitution into the literal token @SUB@, so a real,
+# UNquoted structural character is the only thing that can still read as one
+# after protection — exactly what "this is one simple command" needs to mean
+# for a fast-path allow to be safe. Word-splitting reuses the protected-space
+# idiom `_cp_rm_targets_are_local` already relies on: a real space splits, a
+# quoted one (now \x01) stays glued inside its token; `set -f` around the
+# split for the same reason that function needs it — an unprotected `*`/`?`/
+# `[` inside e.g. a commit message must never glob-expand against the cwd.
+#
+# Deliberately narrow, matching the plan doc's own wording with nothing
+# added: `git add`/`git commit` take ANY arguments (both are local-only, no
+# ref crosses a boundary); `git push` must be EXACTLY `origin <branch>` — no
+# force flag, no other refspec, no `-u`; `gh pr create` must be EXACTLY
+# `--head <branch>`, optionally `--base <trunk>` — no other flag. A
+# worktree/branch this task was never registered with is a hole this
+# function refuses to guess at: an unregistered pane (branch empty) never
+# matches anything.
+_cp_has_unquoted_operator() {           # protected-text -> 0 if a REAL
+  # (unquoted, top-level) shell operator survived _cp_protect_text — meaning
+  # the text is not one simple command. Quoted/escaped instances of every one
+  # of these were already turned into control bytes; a literal instance
+  # still present here was outside any quote.
+  case "$1" in
+    *';'*|*'&'*|*'|'*|*'('*|*')'*|*'<'*|*'>'*|*'`'*|*'@SUB@'*) return 0 ;;
+  esac
+  return 1
+}
+
+_cp_grant_action() {                    # raw wt branch trunk
+  local raw="$1" wt="$2" branch="$3" trunk="$4"
+  [ -n "$wt" ] && [ -n "$branch" ] || return 1
+  case "$raw" in *$'\n'*) return 1 ;; esac   # single line only, see header
+
+  # Exactly one optional `cd <own worktree> && ` prefix, matched literally —
+  # this does not attempt to parse a QUOTED cd target; a worktree path with a
+  # space in it (spawn-task.sh discourages but does not forbid one) simply
+  # never matches this fast path and falls through unaffected.
+  local rest="$raw" cdpfx="cd ${wt} && "
+  case "$raw" in
+    "$cdpfx"*) rest="${raw#$cdpfx}" ;;
+  esac
+  [ -n "$rest" ] || return 1
+
+  local protected; protected="$(_cp_protect_text "$rest")"
+  _cp_has_unquoted_operator "$protected" && return 1
+
+  local oldopts; case "$-" in *f*) oldopts=set ;; *) oldopts=unset ;; esac
+  set -f
+  local IFS=$' \t'
+  local -a w=()
+  local word
+  # shellcheck disable=SC2086
+  for word in $protected; do w+=("$word"); done
+  [ "$oldopts" = unset ] && set +f
+  [ "${#w[@]}" -ge 2 ] || return 1
+
+  case "${w[0]}" in
+    git)
+      case "${w[1]}" in
+        add|commit)
+          printf 'git %s in %s (own worktree, local-only)\n' "${w[1]}" "$wt"
+          return 0 ;;
+        push)
+          # exactly: git push origin <branch> — no force, no other refspec,
+          # no other flag of any kind.
+          if [ "${#w[@]}" -eq 4 ] && [ "${w[2]}" = origin ] && [ "${w[3]}" = "$branch" ]; then
+            printf 'git push origin %s (own branch)\n' "$branch"
+            return 0
+          fi
+          return 1 ;;
+        *) return 1 ;;
+      esac ;;
+    gh)
+      # exactly: gh pr create --head <branch> [--base <trunk>]
+      if [ "${w[1]:-}" = pr ] && [ "${w[2]:-}" = create ] && [ "${w[3]:-}" = --head ] && [ "${w[4]:-}" = "$branch" ]; then
+        case "${#w[@]}" in
+          5)
+            printf 'gh pr create --head %s (own branch, default base)\n' "$branch"
+            return 0 ;;
+          7)
+            if [ "${w[5]}" = --base ] && [ -n "$trunk" ] && [ "${w[6]}" = "$trunk" ]; then
+              printf 'gh pr create --head %s --base %s (own branch to trunk)\n' "$branch" "$trunk"
+              return 0
+            fi
+            return 1 ;;
+          *) return 1 ;;
+        esac
+      fi
+      return 1 ;;
+    *) return 1 ;;
+  esac
 }
 
 # ---- _cp_procsub_bodies -----------------------------------------------------

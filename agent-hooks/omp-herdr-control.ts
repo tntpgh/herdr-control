@@ -166,6 +166,18 @@ function describeToolCall(toolName: string, input: unknown): string | undefined 
   }
 }
 
+// The UNTRUNCATED command behind a bash/shell approval (project-contract-plan.md
+// #3b, item 2) — never truncated, unlike describeToolCall's `detail` above.
+// herdr-select.sh needs the model's own complete argument text to classify a
+// command whose TUI panel wrapped across rows and scraped back wrong (measured:
+// 45 of 103 human escalations were exactly that). Only for bash/shell; every
+// other tool has no single "command" concept worth carrying separately.
+function rawBashCommand(toolName: string, input: unknown): string | undefined {
+  if (toolName.toLowerCase() !== "bash" && toolName.toLowerCase() !== "shell") return undefined;
+  const rec = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+  return typeof rec.command === "string" && rec.command.length > 0 ? rec.command : undefined;
+}
+
 // Fires ONLY when omp actually needs a human: `tool_approval_requested` (the
 // approval menu) and `tool_execution_start` for the `ask` tool (the numbered
 // question prompt). Both are documented observability events
@@ -187,20 +199,27 @@ function describeToolCall(toolName: string, input: unknown): string | undefined 
 // It also drops this file out of omp's fail-closed dispatch: `tool_call`
 // handler errors block the tool, approval/execution events are observability
 // and do not. The defensive style stays anyway.
-function notifyForPrompt(toolName: string, message: string): void {
+function notifyForPrompt(toolName: string, message: string, command?: string): void {
   if (!notifyAvailable) return;
-  spawnDetached([NOTIFY_SH], JSON.stringify({ tool: toolName, message, cwd: process.cwd() }));
+  const payload: Record<string, unknown> = { tool: toolName, message, cwd: process.cwd() };
+  if (command) payload.command = command;
+  spawnDetached([NOTIFY_SH], JSON.stringify(payload));
 }
 
 function onApprovalRequested(event: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     const toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
+    const input = e.input ?? e.args;
     // `reason` is the approval's own words when omp supplies one; the argument
     // summary is the fallback, and still the more useful line for bash.
-    const detail = describeToolCall(toolName, e.input ?? e.args)
+    const detail = describeToolCall(toolName, input)
       ?? (typeof e.reason === "string" && e.reason ? truncate(e.reason) : undefined);
-    notifyForPrompt(toolName, detail ? `${toolName}: ${detail}` : `omp needs your permission to use ${toolName}`);
+    notifyForPrompt(
+      toolName,
+      detail ? `${toolName}: ${detail}` : `omp needs your permission to use ${toolName}`,
+      rawBashCommand(toolName, input),
+    );
   } catch {
     // MUST NOT throw — see the fail-closed contract at the top of this file.
   }

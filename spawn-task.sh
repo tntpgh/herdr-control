@@ -303,6 +303,22 @@ else
   git -C "$root" worktree add -b "$branch" "$wt" ${base:+"$base"} >/dev/null 2>&1 || { echo "spawn-task: worktree add -b failed" >&2; exit 1; }
 fi
 
+# ---- trunk resolution (project-contract-plan.md #3b) -----------------------
+# The repo's default branch, bare name (e.g. "main") — recorded on the task
+# row as the ONLY base a granted `gh pr create` may target. Already resolved
+# above as $def when this spawn cut a brand-new branch with no explicit
+# --base; for a re-spawn into an existing branch, or an explicit --base, redo
+# the same origin/HEAD lookup here. Best-effort: an unresolved trunk simply
+# narrows the grant (gh pr create --head <branch> still matches; the
+# --base <trunk> form never will) rather than failing the spawn.
+trunk="${def:-}"
+if [ -z "$trunk" ]; then
+  trunk=$(git -C "$root" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null); trunk=${trunk#origin/}
+  if [ -z "$trunk" ]; then
+    trunk=$(git -C "$root" remote show origin 2>/dev/null | sed -n 's/^ *HEAD branch: //p')
+  fi
+fi
+
 # ---- coordination scaffold --------------------------------------------------
 # The herdr-ops protocol: a worker appends its completion event to its own
 # .handoffs/events.jsonl (lib/handoff.sh — was .omc/handoffs, a third-party
@@ -408,7 +424,7 @@ pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 [ -n "$tab" ] && [ -n "$pane" ] || { echo "spawn-task: tab create failed in $ws" >&2; exit 1; }
 
 register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
-  "$pane" "$pane_birth" "$root" "$wt" "$label"
+  "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk"
 
 # ---- claim the worktree on the worker's behalf ------------------------------
 # A spawned worker will never type `claim.sh take`, and neither will anyone

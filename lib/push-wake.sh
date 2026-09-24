@@ -63,14 +63,24 @@ _wake_outcome_for() {                   # <exit-code> -> token
   esac
 }
 
-# push_wake <message> [where-label]
+# push_wake <message> [where-label] [full-command]
+#
+# full-command (project-contract-plan.md #3b, item 2) is the UNTRUNCATED
+# command text behind the prompt, when the caller has it (omp-notify.sh, from
+# agent-hooks/omp-herdr-control.ts's tool_approval_requested handler) — kept
+# separate from `message`, which stays the display-truncated text the Slack
+# alert and the conductor wake actually show. Recorded on the SAME
+# input_required row so herdr-select.sh can look it up by prompt_id and
+# classify complete arguments instead of whatever a wrapped TUI panel
+# scraped back. Empty for every caller that does not pass it (claude-notify.sh,
+# any older wiring) — same as today, no behavior change.
 #
 # Exit 0 when a wake was delivered AND confirmed submitted; 1 otherwise
 # (including "nothing to do"). Callers treat this as best-effort — a hook must
 # never fail its agent because a peer could not be woken — but the exit status is
 # available for a caller that wants to retry.
 push_wake() {
-  local msg="$1" where="${2:-}"
+  local msg="$1" where="${2:-}" full_cmd="${3:-}"
   local cpane="${HERDR_CONDUCTOR_PANE_ID:-}"
   # Persist the worker's state independently of notification delivery. A
   # scheduled worker can have no conductor; a stopped/recycled conductor
@@ -128,7 +138,8 @@ push_wake() {
   if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
     set_task_state "$HERDR_RUN_ID" "$HERDR_TASK_ID" "blocked" >/dev/null 2>&1 || true
     append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
-      "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" '{message:$msg, prompt_id:$prompt_id}')" \
+      "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg cmd "$full_cmd" \
+         '{message:$msg, prompt_id:$prompt_id, command:$cmd}')" \
       "${base}_input" >/dev/null 2>&1 || true
   fi
   [ -n "$cpane" ] || return 1
@@ -216,8 +227,8 @@ push_wake() {
           HERDR_PANE_ID="${HERDR_PANE_ID}" HERDR_CONDUCTOR_PANE_ID="$cpane" \
           HERDR_RUN_ID="${HERDR_RUN_ID:-}" HERDR_TASK_ID="${HERDR_TASK_ID:-}" \
           HERDR_TASK_LABEL="${HERDR_TASK_LABEL:-}" \
-          bash -c '. "$0/lib/pane-guard.sh"; . "$0/lib/prompt-parse.sh"; . "$0/lib/run-registry.sh"; . "$0/lib/push-wake.sh"; push_wake "$1" "$2"' \
-          "$_pw_dir" "$msg" "$where"
+          bash -c '. "$0/lib/pane-guard.sh"; . "$0/lib/prompt-parse.sh"; . "$0/lib/run-registry.sh"; . "$0/lib/push-wake.sh"; push_wake "$1" "$2" "$3"' \
+          "$_pw_dir" "$msg" "$where" "$full_cmd"
     # A held wake has NOT been delivered, so it does not report success — the
     # documented contract is "0 only when delivered AND confirmed submitted"
     # (HERDR-AG-09). 2 distinguishes held from a transport failure.

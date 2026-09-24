@@ -35,6 +35,12 @@ input="$(cat 2>/dev/null || true)"
 tool="$(printf '%s' "$input" | jq -r '.tool // ""' 2>/dev/null || printf '')"
 msg="$(printf '%s' "$input" | jq -r '.message // ""' 2>/dev/null || printf '')"
 cwd="$(printf '%s' "$input" | jq -r '.cwd // ""' 2>/dev/null || printf '')"
+# Untruncated command (project-contract-plan.md #3b, item 2), when the caller
+# has it — agent-hooks/omp-herdr-control.ts sends this only for a bash/shell
+# tool_approval_requested, separate from `message` (which stays truncated for
+# display). herdr-select.sh reads it back from the input_required event this
+# script writes via push_wake, keyed to the same prompt_id.
+full_cmd="$(printf '%s' "$input" | jq -r '.command // ""' 2>/dev/null || printf '')"
 [ -n "$msg" ] || msg="omp needs your permission${tool:+ to use $tool}"
 
 # The worker's own pane. Without it there is no way to confirm a prompt is real,
@@ -128,7 +134,7 @@ fi
 # the rollback: every firing calls push_wake again, unclaimed.
 . "$here/lib/attention-key.sh"
 if attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$(prompt_id "$pane" 2>/dev/null)"; then
-  push_wake "$msg" "$where" >/dev/null 2>&1 || true
+  push_wake "$msg" "$where" "$full_cmd" >/dev/null 2>&1 || true
 fi
 
 exit 0
