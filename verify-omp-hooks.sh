@@ -740,8 +740,8 @@ handlers["agent_end"]({});
 await new Promise(r => setTimeout(r, 600));
 ' 2>&1)"
   printf '%s' "$shim_out" \
-    | grep -q 'EVENTS:agent_end,before_agent_start,tool_approval_requested,tool_approval_resolved,tool_execution_end,tool_execution_start,tool_result' \
-    && ok "every event is registered, and tool_call is NOT one of them" || bad "events: $shim_out"
+    | grep -q 'EVENTS:agent_end,before_agent_start,session_stop,tool_approval_requested,tool_approval_resolved,tool_execution_end,tool_execution_start,tool_result' \
+    && ok "every event is registered (incl. session_stop for conductor exit), and tool_call is NOT one of them" || bad "events: $shim_out"
   # Every handler must return undefined on every path. tool_call used to be the
   # fail-closed one (a throw blocked the agent's tool); these are observability
   # events, but the contract is kept so the wiring can move again safely.
