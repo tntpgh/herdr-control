@@ -129,12 +129,24 @@ fi
 # session transcript. A failed wake is not lost by that: push_wake records
 # `wake_result` with the real outcome in the registry, which is what the
 # reconciliation sweep reports and what an operator can query later.
+# Claimed through the SAME attn_track_<key> the attention controller uses
+# (lib/attention-key.sh) before calling push_wake at all — PR #132 review,
+# item 6: a firing on a still-open prompt the controller (or an earlier
+# firing) already owns must not call push_wake again (item 1's double-wake).
+# HERDR_WAKE_LEGACY=1 is the rollback: every firing calls push_wake again,
+# unclaimed. No HERDR_PANE_ID to build a key from is not a refusal — that
+# population (a hand-started session outside spawn-task.sh) had no per-key
+# dedupe before this either, so push_wake runs exactly as it always did.
 if [ -n "${HERDR_CONDUCTOR_PANE_ID:-}" ]; then
   . "$_hook_dir/../lib/pane-guard.sh"
   . "$_hook_dir/../lib/prompt-parse.sh"
   . "$_hook_dir/../lib/run-registry.sh"
   . "$_hook_dir/../lib/push-wake.sh"
-  push_wake "$msg" "$where" >/dev/null 2>&1 || true
+  . "$_hook_dir/../lib/attention-key.sh"
+  _cn_pane="${HERDR_PANE_ID:-}"
+  if [ -z "$_cn_pane" ] || attn_track_claim "$_cn_pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$(prompt_id "$_cn_pane" 2>/dev/null)"; then
+    push_wake "$msg" "$where" >/dev/null 2>&1 || true
+  fi
 fi
 
 # The legacy one-way webhook is GONE. It posted the same text to a bot you could

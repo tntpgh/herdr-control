@@ -957,6 +957,12 @@ LIVE: herdr_live.LiveState | None = None
 AGENT_EDGE = Path(__file__).resolve().parent / "agent-edge.sh"
 HUB_CONNECTION_ALERT = Path(__file__).resolve().parent / "hub-connection-alert.sh"
 DEPLOY_DRIFT_ALERT = Path(__file__).resolve().parent / "deploy-drift-alert.sh"
+# thurber-os docs/project-contract-plan.md §3a — the level-triggered
+# attention controller. See attention-tick.sh's own header for the design;
+# this hub thread only feeds it the CURRENTLY blocked pane ids and reuses
+# live_attention() (already joins herdr_live.py's LiveState to the registry)
+# instead of re-deriving "who's blocked" a second way.
+ATTENTION_SCRIPT = Path(__file__).resolve().parent / "attention-tick.sh"
 
 
 def _live_log(msg: str) -> None:
@@ -1513,6 +1519,82 @@ def _mirror_loop() -> None:
         except Exception as e:  # noqa: BLE001 — belt and braces: the loop must not die
             MIRROR_STATE["last_error"] = f"{type(e).__name__}: {e}"
         time.sleep(MIRROR_EVERY_S)
+
+
+# ── attention controller: thurber-os docs/project-contract-plan.md §3a ────────
+ATTENTION_INTERVAL_S = float(os.environ.get("HERDR_ATTENTION_INTERVAL_S", "15") or 15)
+# Same shape as MIRROR_STATE: a dead or failing tick must be VISIBLE (PR #132
+# review, item 7) rather than reading as a healthy silent thread forever.
+ATTENTION_STATE: dict = {"ticks": 0, "last_ok": None, "last_error": None,
+                         "last_rc": None, "last_stderr": "", "skipped_recycled_panes": 0}
+
+
+def _attention_skipped_count() -> int:
+    """How many distinct (pane, registered, live) recycled-pane skips the
+    controller has ever recorded. PR #132 re-review item 3: a birth mismatch
+    used to just `continue` silently in attention-tick.sh; it is now a
+    claimed `attention_skipped` event, and this is what surfaces that count
+    on /api/summary instead of it living only in the registry."""
+    try:
+        conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+        try:
+            row = conn.execute("SELECT count(*) FROM events WHERE type='attention_skipped';").fetchone()
+        finally:
+            conn.close()
+        return int(row[0]) if row else 0
+    except sqlite3.Error:
+        return 0
+
+def _attention_tick() -> None:
+    """One pass: hand the controller the CURRENTLY blocked pane ids from
+    LiveState (via live_attention(), the same join /api/blocked already
+    uses) and let attention-tick.sh do everything else — it is the one place
+    that reasons about a specific prompt, so hub.py never re-derives that.
+
+    Pane order ROTATES per tick (item 7): attention-tick.sh gives every pane
+    a fresh screen read and a 60s subprocess timeout is shared across all of
+    them, so a fixed order would let a persistently-blocked pane early in the
+    list starve one that only just started, on a fleet large enough to miss
+    the deadline. Rotating by tick count spends the "front of the queue" seat
+    on a different pane each pass.
+
+    Never raises: a bad pass here must not take down the thread any more than
+    a bad mirror_sync() call may (see _mirror_loop below).
+    """
+    if LIVE is None or not ATTENTION_SCRIPT.exists():
+        return
+    panes = [p.get("pane_id") for p in live_attention() if p.get("pane_id")]
+    if not panes:
+        return
+    n = ATTENTION_STATE["ticks"] % len(panes)
+    panes = panes[n:] + panes[:n]
+    try:
+        result = subprocess.run(["bash", str(ATTENTION_SCRIPT), "tick"],
+                                input="\n".join(panes) + "\n", capture_output=True, text=True, timeout=60)
+        ATTENTION_STATE["ticks"] += 1
+        ATTENTION_STATE["last_rc"] = result.returncode
+        ATTENTION_STATE["last_stderr"] = (result.stderr or "").strip()[-2000:]
+        if result.returncode == 0:
+            ATTENTION_STATE.update(last_ok=time.time(), last_error=None)
+        else:
+            tail = ATTENTION_STATE["last_stderr"][-300:]
+            ATTENTION_STATE["last_error"] = f"exit {result.returncode}: {tail}"
+            _live_log(f"attention tick exit {result.returncode}: {tail}")
+        ATTENTION_STATE["skipped_recycled_panes"] = _attention_skipped_count()
+    except (OSError, subprocess.SubprocessError) as exc:
+        ATTENTION_STATE["ticks"] += 1
+        ATTENTION_STATE["last_error"] = f"{type(exc).__name__}: {exc}"
+        _live_log(f"attention tick failed: {exc}")
+
+
+def _attention_loop() -> None:
+    while True:
+        try:
+            _attention_tick()
+        except Exception as e:  # noqa: BLE001 — belt and braces: the loop must not die
+            ATTENTION_STATE["last_error"] = f"{type(e).__name__}: {e}"
+            _live_log(f"attention loop error: {type(e).__name__}: {e}")
+        time.sleep(ATTENTION_INTERVAL_S)
 
 
 # DEPLOY_DRIFT_PRIME_EVERY_S — independent of any reader, unlike every other
@@ -3180,6 +3262,7 @@ class Handler(BaseHTTPRequestHandler):
                  "deploy_drift": dd.get("repos", []) if dd is not None else [],
                  "deploy_drift_checked": dd is not None,
                  "live_connected": live_data().get("connected", False),
+                 "attention_controller": ATTENTION_STATE,
                  "open_decisions": f.get("open_count", 0),
                  # The portal's open rows, separately: open_ids/open_decisions
                  # stay form-only because /decisions reloads on that id set.
@@ -3312,6 +3395,8 @@ def main() -> int:
                     help="do not subscribe to herdr (pages fall back to the registry only)")
     ap.add_argument("--no-mirror", action="store_true",
                     help="do not sync forms to dashboard.teamthurber.com/decisions (smoke runs)")
+    ap.add_argument("--no-attention", action="store_true",
+                    help="do not run the attention controller sweep (smoke runs)")
     args = ap.parse_args()
     if port_open(args.port):
         print(f"hub: already serving on http://127.0.0.1:{args.port}/", file=sys.stderr)
@@ -3327,6 +3412,8 @@ def main() -> int:
         LIVE.start()
     if not args.no_mirror:
         threading.Thread(target=_mirror_loop, name="dashboard-mirror", daemon=True).start()
+    if not args.no_attention:
+        threading.Thread(target=_attention_loop, name="attention-controller", daemon=True).start()
     # Unconditional (no --no-X flag): two small git fetches against repos we
     # own, nowhere near mirror's cost, and skipping it would reopen exactly
     # the inline-fetch-on-cold-read bug it exists to close.

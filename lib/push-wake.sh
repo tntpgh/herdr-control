@@ -175,9 +175,10 @@ push_wake() {
   [ -n "$pid" ] && wake="$wake  [prompt_id=$pid]"
   if [ -n "${HERDR_PANE_ID:-}" ]; then
     wake="$wake  ·  READ IT: herdr pane read ${HERDR_PANE_ID} --source visible --lines 30"
-    # No --authority needed: a non-interactive caller now defaults to `peer`, so
-    # command policy gates this automatically and a destructive prompt comes back
-    # exit 8 rather than being auto-approved.
+    # No --authority needed: every caller without an explicit flag (or the
+    # Slack button) is `peer`, terminal-attached or not, so command policy
+    # gates this and a destructive prompt comes back exit 8 rather than
+    # being auto-approved.
     wake="$wake  ·  ANSWER IT: $_pw_dir/herdr-select.sh ${HERDR_PANE_ID} <option>"
     [ -n "$pid" ] && wake="$wake --expect-prompt-id $pid"
   fi
