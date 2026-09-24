@@ -15,6 +15,10 @@ WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 export HERDR_BRIDGE_STATE="$WORK/state"
 export HERDR_BRIDGE_ENV="$WORK/env"
 export SCREEN="$WORK/screen.txt"
+# herdr-notify.sh now claims a prompt_id in the run registry before posting
+# (lib/alert-gate.sh alert_claim) — without this, every run here wrote a
+# throwaway claim row into this machine's REAL ~/.local/state/herdr registry.
+export HERDR_RUN_STATE_DIR="$WORK/runs"
 mkdir -p "$HERDR_BRIDGE_STATE"
 printf 'export SLACK_BOT_TOKEN=placeholder-not-a-token\nexport HERDR_BRIDGE_ALLOW_USERS=U000TEST\n' > "$HERDR_BRIDGE_ENV"
 

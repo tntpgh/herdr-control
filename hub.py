@@ -939,6 +939,7 @@ def herdr_data(event_limit: int = 100) -> dict:
 # Where they disagree, the page SAYS SO rather than picking silently.
 LIVE: herdr_live.LiveState | None = None
 AGENT_EDGE = Path(__file__).resolve().parent / "agent-edge.sh"
+HUB_CONNECTION_ALERT = Path(__file__).resolve().parent / "hub-connection-alert.sh"
 
 
 def _live_log(msg: str) -> None:
@@ -1025,6 +1026,35 @@ def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dic
             _EDGE_INFLIGHT.append(child)
     except OSError as exc:
         _live_log(f"edge spawn failed for {pane_id}: {exc}")
+
+
+def _on_connection_change(connected: bool, err: str | None) -> None:
+    """The herdr subscription itself went up or down — the ONE symptom no
+    per-pane alert can see, because while it is down every consumer (agent-
+    edge.sh's own probe included) is guessing rather than knowing.
+
+    Fires on a genuine flip only (LiveState debounces same-state re-affirms),
+    so this is called at most once per real outage and once per recovery —
+    hub-connection-alert.sh still applies its own grace window before paging,
+    so a reconnect that lands within a few seconds never reaches Slack.
+    """
+    if not HUB_CONNECTION_ALERT.exists():
+        return
+    if not _edge_slot():
+        _live_log(f"connection-alert dropped ({'connected' if connected else 'disconnected'}): "
+                  f"{EDGE_MAX_INFLIGHT} edge slots already in flight")
+        return
+    try:
+        child = subprocess.Popen(
+            ["bash", str(HUB_CONNECTION_ALERT), "connected" if connected else "disconnected",
+             (err or "")[:200]],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        with _EDGE_LOCK:
+            _EDGE_INFLIGHT.append(child)
+    except OSError as exc:
+        _live_log(f"connection-alert spawn failed: {exc}")
 
 
 def live_data() -> dict:
@@ -3051,7 +3081,8 @@ def main() -> int:
         # daemon thread: if it cannot reach herdr the hub still serves, with
         # `connected: false` saying plainly that the live rows are absent
         # rather than quietly showing a stale fleet.
-        LIVE = herdr_live.LiveState(on_transition=_on_agent_edge, log=_live_log)
+        LIVE = herdr_live.LiveState(on_transition=_on_agent_edge, log=_live_log,
+                                     on_connection_change=_on_connection_change)
         LIVE.start()
     if not args.no_mirror:
         threading.Thread(target=_mirror_loop, name="dashboard-mirror", daemon=True).start()

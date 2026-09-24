@@ -12,6 +12,14 @@
 # Reads SLACK_BOT_TOKEN + HERDR_BRIDGE_ALLOW_USERS from the bridge env file. Posts
 # to the first allowlisted user's DM (chat.postMessage channel=<user id>, works
 # with chat:write — no im:write needed). Prints the ts.
+#
+# Symptoms-only filtering (.handoffs/SPEC.md, 2026-09-24): a --choices alert
+# with nothing to show (no numbered/menu options AND no plain context — the
+# prompt this call was about already vanished) is DROPPED, not posted blind.
+# And at most ONE real post ever goes out per prompt_id, however many times a
+# caller re-fires for the same still-unanswered prompt (see lib/alert-gate.sh
+# alert_claim). HERDR_SLACK_VERBOSE=1 disables both and restores the old
+# always-post behaviour.
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
 
@@ -300,7 +308,43 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
     ctx=$(prompt_context "$pane")
     if [ -n "$ctx" ]; then
       body="$(_hdr)"$'\n\n```\n'"${ctx}"$'\n```'
+    else
+      nothing_to_show=1
     fi
+  fi
+fi
+
+# ---- drop: the prompt this call was about is already gone -----------------
+# choices=1 with no numbered/menu options AND no plain context means nothing
+# is actually on screen to alert about — the common cause is the prompt was
+# answered between the hook firing and this poll finishing. Posting the bare
+# header anyway ("<agent> needs input  ·  <pane>") used to ship a
+# content-free ping every time that race lost (SPEC: "anything already
+# answered by the time the post would go out"). HERDR_SLACK_VERBOSE=1
+# restores the old always-post behaviour.
+if [ "${nothing_to_show:-0}" = 1 ] && [ "${HERDR_SLACK_VERBOSE:-0}" != 1 ]; then
+  if [ "$dry" = 1 ]; then
+    echo "dry-run: would SKIP — no prompt or context visible on $pane (already answered?)"
+    exit 0
+  fi
+  echo "herdr-notify: no prompt or context visible for $pane; skipping (already answered?)" >&2
+  exit 0
+fi
+
+# ---- dedupe: at most ONE Slack post per prompt_id, ever -------------------
+# Three hook firings for the same still-unanswered prompt used to post three
+# times — see lib/alert-gate.sh's alert_claim for the measurement and the
+# reasoning. HERDR_SLACK_VERBOSE=1 restores the old always-post behaviour.
+if [ -n "$pid" ] && [ "${HERDR_SLACK_VERBOSE:-0}" != 1 ]; then
+  . "$_lib/alert-gate.sh"
+  if [ "$dry" = 1 ]; then
+    if alert_already_posted "$pid"; then
+      echo "dry-run: would SKIP — prompt $pid already alerted (duplicate)"
+      exit 0
+    fi
+  elif ! alert_claim "$pid"; then
+    echo "herdr-notify: prompt $pid already alerted, skipping duplicate" >&2
+    exit 0
   fi
 fi
 
@@ -321,6 +365,10 @@ resp=$(printf 'header = "Authorization: Bearer %s"\n' "$SLACK_BOT_TOKEN" \
       https://slack.com/api/chat.postMessage 2>/dev/null)
 if [ "$(printf '%s' "$resp" | jq -r '.ok')" != true ]; then
   echo "herdr-notify: slack error: $(printf '%s' "$resp" | jq -r '.error // "unknown"')" >&2
+  # This claim protected a send that did NOT happen — release it so a later
+  # retry (grace_realert, the wake-fail backstop, a fresh hook firing) is not
+  # permanently told "already posted" for a prompt Slack never actually saw.
+  [ -n "$pid" ] && command -v alert_release >/dev/null 2>&1 && alert_release "$pid"
   exit 1
 fi
 ts=$(printf '%s' "$resp" | jq -r '.ts')

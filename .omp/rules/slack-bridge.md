@@ -54,5 +54,3 @@ herdr bridge up — allowlist=['U…'] team=T… channel=any deliver=…
 ```
 
 `team=ANY (unbound)` means `HERDR_BRIDGE_TEAM` did not load — go back to step 4.
-</content>
-<parameter name="i">Write slack-bridge.md rule file

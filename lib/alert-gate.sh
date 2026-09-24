@@ -31,6 +31,8 @@ _HERDR_ALERT_GATE_SH=1
 _ag_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_ag_dir/prompt-parse.sh"
 . "$_ag_dir/command-policy.sh"
+. "$_ag_dir/run-registry.sh"
+. "$_ag_dir/pending-queue.sh"
 
 # 0 = a human must answer this. 1 = peer authority may take it.
 # Unreadable, unclassifiable, or no prompt at all -> 0. Telling a person about
@@ -131,4 +133,93 @@ grace_realert() {
     fi
   ) </dev/null >/dev/null 2>&1 &
   disown 2>/dev/null || true
+}
+
+# ---- dedupe: at most ONE Slack post per prompt_id, ever --------------------
+# .handoffs/SPEC.md "Slack gets symptoms only": a genuinely human-required
+# prompt (escalate/reserved/deny) posts immediately, with no grace delay — so
+# unlike the held/allow-class path above, nothing naturally stopped THREE
+# Notification/tool_call firings for the SAME still-unanswered prompt from
+# posting three separate Slack messages. Measured on this machine's own
+# registry.jsonl: 192 of 364 posts in a 48h window were exact duplicates of an
+# already-posted prompt_id (up to 19 posts for one prompt). Every caller —
+# the immediate branch in claude-notify.sh/omp-notify.sh, a delayed
+# grace_realert, and agent-edge.sh's backstop — funnels through
+# slack-bridge/herdr-notify.sh, so ONE claim ledger there, keyed by
+# prompt_id, catches all three without each caller having to coordinate.
+#
+# Backed by the SAME registry everything else here uses: INSERT OR IGNORE on
+# a UNIQUE event_id is a real atomic claim, not a check-then-write race
+# (lib/run-registry.sh's own reasoning for using SQLite over a JSONL spool).
+# run_id/task_id are deliberately blank — this ledger is per PROMPT, not per
+# task, so a claim survives being asked from a different call site than the
+# one that eventually re-derives the same prompt_id.
+
+# alert_claim <prompt_id> -> 0 if THIS call wins the right to post (first
+# claim for this prompt_id), 1 if another call already claimed it (skip).
+# Registry unavailable (no sqlite3, unwritable state dir) fails OPEN: the
+# alert still posts, exactly like every other "could not tell" case in this
+# file — a possible duplicate is recoverable, a dropped human-required alert
+# is not.
+alert_claim() {
+  local pid="$1" changes lockdir
+  [ -n "$pid" ] || return 0
+  # Serialized, not left to SQLite's own UNIQUE constraint: two herdr-notify.sh
+  # PROCESSES racing to claim the SAME prompt_id (three hook firings landing
+  # close together, or the immediate alert and a wake-fail backstop firing
+  # near-simultaneously) were measured to both fail OPEN — registry_init()
+  # racing its own one-time CREATE TABLE/PRAGMA DDL against a second process
+  # doing the same against a not-yet-existing database file returned a
+  # transient error to one or both callers, and alert_claim's own
+  # "can't tell, fail open" rule then let EVERY racer post. Reproduced
+  # directly (repeatable within ~30 concurrent runs) once two separate bash
+  # processes raced first-time registry_init rather than one process priming
+  # the schema before the other started.
+  #
+  # registry_init lives INSIDE the lock, not just the insert: a lock that only
+  # wrapped the INSERT would still let two processes race the schema creation
+  # itself. mkdir -p is safe to call unlocked (it is idempotent/race-safe by
+  # design, unlike a multi-statement CREATE TABLE + PRAGMA batch) — it only
+  # has to exist before `mkdir "$lockdir"` can succeed.
+  lockdir="$(run_state_root)/.alert-claim.lock"
+  mkdir -p "$(run_state_root)" 2>/dev/null || return 0
+  pending_lock "$lockdir" || true   # best-effort wait; never skip the claim
+                                     # over an exhausted wait — proceed anyway
+  if ! registry_init >/dev/null 2>&1; then
+    pending_unlock "$lockdir"
+    return 0
+  fi
+  changes="$(_sql "INSERT OR IGNORE INTO events (event_id, run_id, task_id, type, occurred_at, payload)
+    VALUES ($(_sq "slack_alert_${pid}"), '', '', 'slack_alert_posted', $(_sq "$(_now_iso)"),
+      $(_sq "{\"prompt_id\":\"${pid}\"}"));
+    SELECT changes();" 2>/dev/null)"
+  pending_unlock "$lockdir"
+  [ "$changes" = "1" ]
+}
+
+# alert_already_posted <prompt_id> -> 0 (true) if a claim exists already.
+# Read-only PEEK, never mutates — this is what --dry-run uses to report the
+# same decision alert_claim would make without poisoning the real ledger with
+# a test/preview run (a dry-run that CLAIMED would silently drop the real
+# alert that follows it).
+alert_already_posted() {
+  local pid="$1" n
+  [ -n "$pid" ] || return 1
+  registry_init >/dev/null 2>&1 || return 1
+  n="$(_sql "SELECT COUNT(*) FROM events WHERE event_id=$(_sq "slack_alert_${pid}");" 2>/dev/null)"
+  [ "${n:-0}" -gt 0 ] 2>/dev/null
+}
+
+# alert_release <prompt_id> -> undo a claim after the send it protected
+# FAILED (e.g. a Slack API error). Without this, a curl/API failure would
+# permanently "have posted" a prompt that never actually reached Slack,
+# silently poisoning every later retry — a delayed grace_realert, the
+# wake-fail backstop (lib/push-wake.sh), or a fresh hook firing — for that
+# prompt's whole lifetime. Claim-before-send stays atomic (race-safe); this
+# is the compensating action for the one path that legitimately did not send.
+alert_release() {
+  local pid="$1"
+  [ -n "$pid" ] || return 0
+  registry_init >/dev/null 2>&1 || return 0
+  _sql "DELETE FROM events WHERE event_id=$(_sq "slack_alert_${pid}");" >/dev/null 2>&1 || true
 }

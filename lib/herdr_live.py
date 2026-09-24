@@ -204,11 +204,17 @@ class LiveState:
     def __init__(
         self,
         on_transition: Callable[[str, str | None, str | None, dict], None] | None = None,
+        # Fires ONLY on a genuine connected<->disconnected flip (never on a
+        # same-state resubscribe or a redundant re-affirm), so a caller can
+        # page once per real outage instead of once per reconnect attempt.
+        # `err` is the exception text on a disconnect, None on a reconnect.
+        on_connection_change: Callable[[bool, str | None], None] | None = None,
         log: Callable[[str], None] | None = None,
         resync_every_s: float = 10.0,
         max_backoff_s: float = 30.0,
     ):
         self._on_transition = on_transition
+        self._on_connection_change = on_connection_change
         self._log = log or (lambda _msg: None)
         self._resync_every_s = resync_every_s
         self._max_backoff_s = max_backoff_s
@@ -615,10 +621,16 @@ class LiveState:
             # Bootstrap AFTER the subscription is live (see module docstring).
             self._emit(self._apply_snapshot(request("session.snapshot")))
             with self._lock:
+                was_connected = self.stats["connected"]
                 self.stats["connected"] = True
                 self.stats["connected_since"] = time.time()
                 self.stats["last_error"] = None
                 uncovered = set() if degraded else set(self._panes) - covered
+            if not was_connected and self._on_connection_change:
+                try:
+                    self._on_connection_change(True, None)
+                except Exception:
+                    pass
             if uncovered:
                 # Every pane needs its own `pane.agent_status_changed`
                 # subscription (the schema requires a pane_id), and the first
@@ -693,8 +705,14 @@ class LiveState:
                     self._stop.wait(pause)
             except Exception as exc:
                 with self._lock:
+                    was_connected = self.stats["connected"]
                     self.stats["connected"] = False
                     self.stats["last_error"] = f"{type(exc).__name__}: {exc}"
+                if was_connected and self._on_connection_change:
+                    try:
+                        self._on_connection_change(False, f"{type(exc).__name__}: {exc}")
+                    except Exception:
+                        pass
                 self._log(f"herdr stream lost ({exc!r}); retrying in {backoff:.1f}s")
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, self._max_backoff_s)

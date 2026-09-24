@@ -278,6 +278,29 @@ When there is no numbered list to parse (a non-numbered confirmation, a plan
 approval, or a prompt that was auto-approved before the hook could read it), the
 alert carries **what is on screen** instead, so you are never answering blind.
 
+### Symptoms only, not status
+
+Slack gets a prompt only when a human genuinely has to act on it, at most
+once per prompt (.handoffs/SPEC.md, 2026-09-24). Concretely:
+
+- **KEPT**: an escalate/reserved/deny-class prompt still unanswered — ONE
+  post per prompt, however many times the hook re-fires for it while it
+  sits there; a conductor wake that failed delivery (refused/unsubmitted)
+  and is still unanswered after `HERDR_WAKE_FAIL_ALERT_S` (default 600s);
+  the herdr control-plane subscription itself going down or coming back
+  (`hub-connection-alert.sh`, graced by `HERDR_HUB_ALERT_GRACE_S`, default
+  30s, so a reconnect blip never pages).
+- **DROPPED**: allow-class prompts (a peer answers them); a duplicate post
+  for a prompt already alerted; a post for a prompt that was already
+  answered by the time the send would go out.
+- **`HERDR_SLACK_VERBOSE=1`** restores the pre-filter always-post behaviour
+  on every path above — set it on one shell to debug an alert that looks
+  like it should have fired.
+
+`verify-slack-symptoms.sh` and `verify-hub-connection-alert.sh` are the
+acceptance suites for this; run either after touching `herdr-notify.sh`,
+`lib/alert-gate.sh`, `lib/push-wake.sh`, or `hub-connection-alert.sh`.
+
 ### Replying with free text
 
 ```bash
