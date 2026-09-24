@@ -402,9 +402,15 @@ attention_tick() {
 
     [ "$elapsed" -ge "$response_window" ] \
       && _attn_maybe_escalate "$run_id" "$task_id" "$pane" "$conductor_pane_id" "$key" "$label" "$elapsed"
-    [ "$elapsed" -ge $(( response_window * 2 )) ] \
-      && _attn_maybe_form "$run_id" "$task_id" "$pane" "$key" \
-           "No response ${elapsed}s after its conductor was woken, and after one escalation to Main." "$label" "$cmd"
+    if [ "$elapsed" -ge $(( response_window * 2 )) ]; then
+      # Say only what the registry proves happened: this page is read with
+      # no terminal, so an unverified "Main was escalated to" hides the
+      # reason nobody answered.
+      local esc_note="Main could not be reached"
+      _attn_escalation_landed "$task_id" "$key" && esc_note="one escalation to Main went unanswered"
+      _attn_maybe_form "$run_id" "$task_id" "$pane" "$key" \
+        "No response ${elapsed}s after its conductor was alerted; ${esc_note}." "$label" "$cmd"
+    fi
   done
   return 0
 }

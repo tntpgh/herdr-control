@@ -195,14 +195,20 @@ register_task run4 task4 w4 cond4 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt4 "impl:d
 set_task_state run4 task4 running >/dev/null 2>&1
 omp_menu_screen "mkfs.ext4 /dev/sda1" > "$S1"
 : > "$SENT"
+NB="$(date +%s)"                        # NOW0 is real minutes stale by this point
 printf '%s\n' "$W1" | attention_tick
+_wait_for "$SENT" "^send-text ${CND}$" 3 \
+  && ok "a deny-class prompt wakes its conductor at first sight (so it can deny)" \
+  || bad "deny-class prompt never woke its conductor: $(cat "$SENT")"
 [ "$(_q "SELECT count(*) FROM events WHERE task_id='task4' AND type='attention_form_served';")" = "0" ] \
   && ok "a deny-class prompt is NOT formed on first sight (its conductor may still deny it)" \
   || bad "deny-class prompt was formed before its conductor had a chance"
 [ "$(_q "SELECT count(*) FROM events WHERE task_id='task4' AND type='attention_tracking';")" = "1" ] \
   && ok "a deny-class prompt is tracked so its window has a clock" || bad "deny-class prompt not tracked"
-printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NOW0 + 605)) attention_tick
-printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NOW0 + 610)) attention_tick
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NB + 605)) attention_tick
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NB + 610)) attention_tick
+[ "$(grep -c "^send-text ${CND}$" "$SENT")" = "1" ] \
+  && ok "the owner-window ticks add no further conductor wakes" || bad "extra conductor wakes: $(cat "$SENT")"
 [ "$(_q "SELECT count(*) FROM events WHERE task_id='task4' AND type='attention_form_served';")" = "1" ] \
   && ok "still blocked after the owner's window -> exactly one form" || bad "deny-class form count after window wrong"
 [ "$(_q "SELECT count(*) FROM events WHERE task_id='task4' AND type='attention_escalated';")" = "0" ] \
@@ -218,9 +224,10 @@ register_task run5 task5 w5 cond5 "$CND" "$CNDB" "$W2" "$W2B" /repo /wt5 "impl:r
 set_task_state run5 task5 running >/dev/null 2>&1
 omp_menu_screen "wrangler deploy" > "$S2"
 : > "$SENT"
+NB="$(date +%s)"
 printf '%s\n' "$W2" | attention_tick
 clean_screen > "$S2"                    # conductor denied/redirected; the prompt cleared
-printf '%s\n' "$W2" | HERDR_ATTENTION_NOW=$((NOW0 + 700)) attention_tick
+printf '%s\n' "$W2" | HERDR_ATTENTION_NOW=$((NB + 700)) attention_tick
 [ "$(_q "SELECT count(*) FROM events WHERE task_id='task5' AND type='attention_form_served';")" = "0" ] \
   && ok "a reserved prompt its conductor already handled is never formed" \
   || bad "reserved prompt formed after the conductor handled it (the w1Q:p6 dead form)"
