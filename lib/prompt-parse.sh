@@ -778,9 +778,12 @@ elif mode == "question":
     # the next. `question` degenerate here means len == 1, just the header
     # — a real command/diff/detail row from any OTHER tool already makes it
     # longer, so this never touches an already-distinguishing panel.
-    if len(question) == 1 and pending_running:
-        question = question + pending_running
-    print(" ; ".join(question), end="")
+    # Rows in a rendered tool panel are visual wraps, not shell separators.
+    # Joining them with ` ; ` fabricated a second command from arguments such
+    # as `git commit -F` followed by its message path, and made data-file
+    # extensions appear executable. Preserve the visible text without adding
+    # operators; policy still escalates any real operator present in a row.
+    print(" ".join(question), end="")
 ' "$1"
 }
 

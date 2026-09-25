@@ -113,16 +113,28 @@ _ag_grace_seconds() {                   # [raw] -> integer seconds
 
 grace_realert() {
   local pane="$1" pid="$2" run="$3" task="$4"; shift 4
-  local grace; grace="$(_ag_grace_seconds)"
+  local grace hold_at
+  grace="$(_ag_grace_seconds)"
+  hold_at="$(_now_iso 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
   (
     sleep "$grace"
     prompt_menu_visible "$pane" 2>/dev/null || [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || exit 0
+    # A later prompt on this task supersedes this timer. Without this check,
+    # every repeated hook created another timer that eventually woke the
+    # conductor for whichever prompt happened to be current at T+grace.
+    if [ -n "$run" ] && [ -n "$task" ]; then
+      later="$(_sql "SELECT count(*) FROM events WHERE run_id=$(_sq "$run")
+        AND task_id=$(_sq "$task") AND type='input_required'
+        AND occurred_at > $(_sq "$hold_at");" 2>/dev/null)"
+      [ "${later:-0}" = 0 ] || exit 0
+      claim_once "grace_realert_${run}_${task}_${pid}" "$run" "$task" \
+        grace_realert_claim \
+        "$(jq -nc --arg p "$pane" --arg pid "$pid" '{pane:$p,prompt_id:$pid}')" \
+        || exit 0
+    fi
     local now_pid rc=0
     now_pid="$(prompt_id "$pane" 2>/dev/null || printf '')"
     "$@" >/dev/null 2>&1 || rc=$?
-    # Recorded AFTER the send, carrying its real outcome. Written before, it
-    # claimed a delivery that had not happened yet (HERDR-AG-03), which is the
-    # same lie push_wake's three-record contract exists to prevent.
     if [ -n "$run" ] && [ -n "$task" ]; then
       append_event "$run" "$task" "alert_grace_expired" \
         "$(jq -nc --arg p "$pane" --arg pid "$pid" --arg now "$now_pid" --arg g "$grace" --argjson rc "$rc" \

@@ -1228,14 +1228,61 @@ _cp_secret_var_expanded() {             # norm -> 0 (true) if a secret-named $VA
 }
 
 
+_cp_non_shell_panel() {
+  case "$1" in
+    "Allow tool: bash"*|"Allow tool: shell"*) return 1 ;;
+    "Allow tool: "*) return 0 ;;
+  esac
+  return 1
+}
+
+# A script runner's quoted arguments are data to its script, not command
+# position. Do not let a prose/data argument such as
+# `bash probe.sh 'git push origin feat/x'` reserve the outer approval. Inline
+# evaluators stay unmasked; their quoted argument is code, not data.
+_cp_mask_script_data() {
+  local raw="$1"
+  case "$raw" in
+    "Allow tool: bash"*Command:\ *) raw="${raw#*Command: }" ;;
+    "Allow tool: shell"*Command:\ *) raw="${raw#*Command: }" ;;
+  esac
+  case "$raw" in
+    *" -c "*|*" -e "*|*" --command "*|*" --eval "*) printf '%s' "$raw"; return ;;
+    bash\ *|sh\ *|zsh\ *|python\ *|python3\ *|node\ *|ruby\ *|perl\ *) ;;
+    *) printf '%s' "$raw"; return ;;
+  esac
+  printf '%s' "$raw" | awk '
+    BEGIN { q = "" }
+    {
+      out = ""
+      for (i = 1; i <= length($0); i++) {
+        c = substr($0, i, 1)
+        if (q == "") {
+          if (c == "'"'"'" || c == "\"") q = c
+          out = out c
+        } else if (c == q) {
+          q = ""
+          out = out c
+        } else {
+          out = out " "
+        }
+      }
+      print out
+    }'
+}
+
 classify_command() {
   if [ "$#" -lt 1 ]; then
     printf 'command-policy: classify_command requires a <command> argument\n' >&2
     return 2
   fi
   local raw="$1" norm
+  if _cp_non_shell_panel "$raw"; then
+    : > "$(_cp_reason_file)"
+    printf 'allow\n'
+    return 0
+  fi
   norm="$(scannable_command "$raw")"
-  # Decided ONCE, from the raw text, and consulted by every split below. See
   # _cp_quoting_is_simple: when the quoting is not boring we do not split at
   # all, which merges text toward the dangerous command instead of away from it.
   local _cp_split=1
@@ -1912,9 +1959,10 @@ _cp_push_is_safe() {                    # norm -> 0 (true) only for git push [-u
 # Operator-added restrictions remain hard stops even when a built-in rule
 # with equal severity supplied classify_reason's first-match explanation.
 conductor_reserved_reason() {
-  local norm
-  norm="$(scannable_command "$1")"
-  _cp_best_v=0; _cp_best_r=""
+  local raw="$1" norm action_norm
+  _cp_non_shell_panel "$raw" && return 0
+  norm="$(scannable_command "$raw")"
+  action_norm="$(scannable_command "$(_cp_mask_script_data "$raw")")"
   _cp_apply_operator_rules "$norm"
   if [ "$_cp_best_v" -gt 0 ]; then printf '%s\n' "$_cp_best_r"; return; fi
   # Widened 2026-09-12 (security review of PR #57, findings F2–F6): once the
@@ -1946,19 +1994,13 @@ conductor_reserved_reason() {
   # branch identified as exfiltration paths — -T/--upload-file, -F/--form,
   # --json — were allow AND unreserved: no second layer at all behind the one
   # classify_command rule. Review called that out (F8) and it is the right
-  # call: the two lists are derived from the same reasoning and must not drift.
-  elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--request[[:space:]]+(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]]|(^|[[:space:]])-T([[:space:]]|=)|--upload-file|(^|[[:space:]])-F([[:space:]]|=)|--form([[:space:]]|=)|--json([[:space:]]|=))|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$norm"; then
+  elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--request[[:space:]]+(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]]|(^|[[:space:]])-T([[:space:]]|=)|--upload-file|(^|[[:space:]])-F([[:space:]]|=)|--form([[:space:]]|=)|--json([[:space:]]|=))|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$action_norm"; then
     printf 'remote mutation remains human-only\n'
   # CLOSED 2026-09-24 (Terrence's authorized loosening, then hardened
   # round 4 by an independent security review): _cp_push_is_safe is
   # cwd-INDEPENDENT and deny-by-default — `git push origin <name>`,
   # `git push -u origin <name>`, and `git push --set-upstream origin
-  # <name>` are unreserved ONLY when <name> fully matches the fleet's own
-  # `type/slug` branch-naming allowlist. Bare `git push`, any other flag,
-  # a `-C`, and any `cd … &&` prefix all fail to match this shape and
-  # stay reserved below — see _cp_push_is_safe's own header for the full
-  # design and the two security-review rounds that shaped it.
-  elif { _cp_match '\bgit\b' "$norm" && _cp_match '\bpush\b' "$norm" && ! _cp_push_is_safe "$norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|command-policy\.sh|herdr-select\.sh)\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$norm"; then
+  elif { _cp_match '\bgit\b' "$action_norm" && _cp_match '\bpush\b' "$action_norm" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|command-policy\.sh|herdr-select\.sh)\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto|--permission-mode[=[:space:]]+bypass' "$action_norm"; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
   fi
 }
