@@ -3,7 +3,11 @@
 # evidence file. Watches the FILE (durable), never the terminal (which echoes
 # your own kick-off that quotes the marker → false positives).
 #
-# Usage:  wake-on-evidence.sh <file> <pattern> [max_polls] [interval_s]
+# Usage: wake-on-evidence.sh <file> <pattern> [max_polls] [interval_s]
+# For a long watch, start it through the caller's background facility (for
+# omp, `bash run_in_background wake-on-evidence.sh ...`). A foreground tool
+# timeout sends termination to the watcher; it cannot safely outlive that
+# parent unless the caller owns the detached process.
 #   file       path to the peer's append-only events file (may not exist yet)
 #   pattern    grep -E pattern that appears ONLY on real completion
 #   max_polls  polls before timeout (default 480)
@@ -18,6 +22,9 @@ f="${1:?usage: wake-on-evidence.sh <file> <pattern> [max_polls] [interval_s]}"
 pat="${2:?pattern required}"
 max="${3:-480}"
 interval="${4:-30}"
+started="$(date +%s)"
+trap 'printf "WATCH_INTERRUPTED after %ss; run this watcher in the background for long waits\n" "$(( $(date +%s) - started ))" >&2; exit 4' HUP INT TERM
+
 
 # A worker briefed before 2026-09-09 appends to the legacy
 # `<worktree>/.omc/handoffs/events.jsonl` instead of `<worktree>/.handoffs/`
