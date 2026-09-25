@@ -13,15 +13,17 @@
 // this file INSIDE the checkout, not the ~/.omp symlink, and an edit here is
 // live on the next omp session start with no reinstall.
 //
-// THE ONE RULE THAT MATTERS: no handler here may ever throw back into the
-// agent it observes, and none may return anything but undefined. This file
-// used to register `tool_call`, whose dispatch is FAIL-CLOSED — per omp's own
-// docs, "if handler throws, wrapper fails closed and blocks execution", and
-// emitToolCall does NOT swallow handler errors the way it swallows every other
-// event's. It no longer registers that event (see the notification section
-// below), so nothing here can wedge a tool call any more; the exhaustive
-// try/catch and the explicit `return undefined` stay regardless, so nobody has
-// to re-derive "is this one safe" event by event if the wiring changes again.
+// This extension has two classes of handlers:
+//   * observability handlers below, which must never throw into the agent; and
+//   * the `tool_call` registration/ownership guard, which deliberately returns
+//     `{block:true}` for a fleet-creating tool that has no live central task
+//     registration. A failed guard is also a block: otherwise a conductor can
+//     create invisible nested work and a recycled worker can act as its old
+//     generation.
+//
+// The guard is deliberately narrow. Ordinary tool calls remain governed by
+// omp's own approval layer and herdr-select.sh's human-only command policy;
+// this extension never adopts Firstmate's approval-bypass posture.
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -38,6 +40,7 @@ const ROOT = process.env.HERDR_CONTROL_DIR?.trim() || path.dirname(HERE);
 
 const NOTIFY_SH = path.join(ROOT, "agent-hooks", "omp-notify.sh");
 const RECONCILE_SH = path.join(ROOT, "agent-hooks", "omp-reconcile.sh");
+const PRETOOL_REGISTRATION_SH = path.join(ROOT, "lib", "pretool-registration.sh");
 const RESOLVE_SH = path.join(ROOT, "herdr-resolve.sh");
 const CONDUCTOR_EXIT_SH = path.join(ROOT, "conductor-exit.sh");
 const HUB_PY = path.join(ROOT, "hub.py");
@@ -186,6 +189,70 @@ function rawBashCommand(toolName: string, input: unknown): string | undefined {
   return typeof rec.command === "string" && rec.command.length > 0 ? rec.command : undefined;
 }
 
+// Firstmate's guard classifies delegation by shape rather than a fixed list.
+// Keep the same exclusions for observer/todo tools. The shell guard remains
+// the authority for registry, pane-generation, and worktree ownership; this
+// local check only avoids starting a shell for ordinary tool calls.
+const NON_FLEET_TOOLS: Record<string, true> = {
+  taskoutput: true,
+  taskstop: true,
+  taskget: true,
+  tasklist: true,
+  cronlist: true,
+  bashoutput: true,
+  killshell: true,
+  taskcreate: true,
+  taskupdate: true,
+};
+
+function isFleetCreatingTool(toolName: string): boolean {
+  const normalized = toolName.toLowerCase().replace(/[^a-z0-9_:-]/g, "");
+  if (normalized.startsWith("mcp__") || NON_FLEET_TOOLS[normalized]) return false;
+  return [
+    "agent",
+    "subagent",
+    "task",
+    "workflow",
+    "cron",
+    "schedul",
+    "worktree",
+    "delegate",
+    "spawn",
+    "dispatch",
+    "handoff",
+    "remote",
+    "sendmessage",
+    "monitor",
+  ].some((stem) => normalized.includes(stem));
+}
+
+function onToolCall(event: unknown): { block: true; reason: string } | undefined {
+  try {
+    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    const toolName = typeof e.toolName === "string" ? e.toolName : "";
+    if (!isFleetCreatingTool(toolName)) return undefined;
+    if (!safeExists(PRETOOL_REGISTRATION_SH)) {
+      return { block: true, reason: "herdr pretool guard is unavailable; refusing unregistered fleet work" };
+    }
+    const input = e.input && typeof e.input === "object" ? (e.input as Record<string, unknown>) : {};
+    const cwd = typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : process.cwd();
+    const result = spawnSync("bash", [PRETOOL_REGISTRATION_SH, toolName, cwd], {
+      encoding: "utf8",
+      timeout: 5_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (result.status === 0) return undefined;
+    const detail = `${result.stderr ?? ""}\n${result.stdout ?? ""}`.replace(/\s+/g, " ").trim();
+    return {
+      block: true,
+      reason: detail.slice(0, 500) || "herdr pretool registration/ownership check refused the fleet-creating tool",
+    };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return { block: true, reason: `herdr pretool guard failed closed: ${detail}` };
+  }
+}
+
 // Fires ONLY when omp actually needs a human: `tool_approval_requested` (the
 // approval menu) and `tool_execution_start` for the `ask` tool (the numbered
 // question prompt). Both are documented observability events
@@ -194,19 +261,13 @@ function rawBashCommand(toolName: string, input: unknown): string | undefined {
 // integration (~/.omp/agent/extensions/herdr-omp-agent-state.ts) already
 // drives pane.report_agent blocked/idle off exactly this pair.
 //
-// This used to hang off `tool_call`, which fires before EVERY tool call
-// whether or not anything is ever asked, on the stated premise that "omp has
-// no such event". That premise was wrong (and the events pre-date this file's
-// last edit), and the cost of the workaround was real: omp-notify.sh had to
-// verify by screen-scraping its own pane, 20 `herdr pane read` RPCs and 10
-// python spawns per tool call per worker, which is what pushed herdr's socket
-// p95 from 9ms to 136ms with the fleet working (measured 2026-09-14). Now the
-// script runs only when there IS something to alert about, so the common tool
-// call costs zero RPCs.
-//
-// It also drops this file out of omp's fail-closed dispatch: `tool_call`
-// handler errors block the tool, approval/execution events are observability
-// and do not. The defensive style stays anyway.
+// Notification deliberately does NOT use `tool_call`: that event fires before
+// every approved call and would force a screen scrape just to discover whether
+// an approval menu appeared. The narrow `onToolCall` guard above is different:
+// it runs only for delegation-shaped tools and synchronously checks the
+// central registration/generation record before omp can create invisible work.
+// Approval notifications remain attached only to events emitted when omp
+// actually needs a human, so ordinary calls cost zero herdr RPCs here.
 function notifyForPrompt(toolName: string, message: string, command?: string): void {
   if (!notifyAvailable) return;
   const payload: Record<string, unknown> = { tool: toolName, message, cwd: process.cwd() };
@@ -777,6 +838,7 @@ function onSessionStop(): { continue: true; additionalContext: string } | undefi
 }
 
 export default function (pi: HookAPI): void {
+  pi.on("tool_call", onToolCall);
   pi.on("tool_approval_requested", onApprovalRequested);
   pi.on("tool_approval_resolved", onApprovalResolved);
   pi.on("tool_execution_start", onExecutionStart);
