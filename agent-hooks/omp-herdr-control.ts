@@ -390,24 +390,57 @@ interface ProjectCard {
   open_decisions: number;
 }
 
-function isProjectRowFor(p: unknown, repoName: string): p is { project: unknown; repo?: unknown; next_step?: unknown; needs_wake?: unknown; tasks?: unknown; prs?: unknown; open_decisions?: unknown } {
+// A spawned worker runs in ~/.herdr/worktrees/<repo>/<branch...>, so its
+// basename is a branch leaf, not the repo — matching by basename alone (the
+// original cut) matched no project for exactly the sessions this card exists
+// for. Match by PATH instead: cwd is inside a project's own `repo`, or
+// inside one of its tasks' `worktree`; `git rev-parse --git-common-dir`'s
+// parent resolves a linked worktree back to the MAIN checkout, which
+// /api/projects keys tasks by. The basename check survives as a last resort
+// for a project registered before this field existed (no worktree on any of
+// its task rows).
+function isUnderPath(cwd: string, base: unknown): boolean {
+  return typeof base === "string" && base.length > 0 && (cwd === base || cwd.startsWith(`${base}/`));
+}
+
+function taskWorktreeMatches(task: unknown, cwd: string): boolean {
+  return !!task && typeof task === "object" && "worktree" in task && isUnderPath(cwd, task.worktree);
+}
+
+function isProjectRowFor(
+  p: unknown,
+  cwd: string,
+  repoRoot: string | null,
+  fallbackRepoName: string,
+): p is { project: unknown; repo?: unknown; next_step?: unknown; needs_wake?: unknown; tasks?: unknown; prs?: unknown; open_decisions?: unknown } {
   if (!p || typeof p !== "object" || !("project" in p)) return false;
-  if (p.project === repoName) return true;
-  return "repo" in p && typeof p.repo === "string" && p.repo.endsWith(`/${repoName}`);
+  if ("repo" in p && isUnderPath(cwd, p.repo)) return true;
+  if (repoRoot && "repo" in p && p.repo === repoRoot) return true;
+  if ("tasks" in p && Array.isArray(p.tasks) && p.tasks.some((t) => taskWorktreeMatches(t, cwd))) return true;
+  if (p.project === fallbackRepoName) return true;
+  return "repo" in p && typeof p.repo === "string" && p.repo.endsWith(`/${fallbackRepoName}`);
+}
+
+function gitCommonDirRepoRoot(cwd: string): string | null {
+  const r = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, encoding: "utf8" });
+  if (r.error || r.status !== 0 || !r.stdout) return null;
+  const commonDir = r.stdout.trim();
+  return commonDir ? path.dirname(commonDir) : null;
 }
 
 function projectSummary(cwd: string): ProjectCard | undefined {
   try {
-    const repoName = cwd.split(path.sep).filter(Boolean).pop();
-    if (!repoName) return undefined;
+    const fallbackRepoName = cwd.split(path.sep).filter(Boolean).pop();
+    if (!fallbackRepoName) return undefined;
     const r = spawnSync("curl", ["-s", "--max-time", "2", `${HUB_URL}api/projects`], { encoding: "utf8" });
     if (r.error || r.status !== 0 || !r.stdout) return undefined;
     const j: unknown = JSON.parse(r.stdout);
     if (!j || typeof j !== "object" || !("projects" in j) || !Array.isArray(j.projects)) return undefined;
-    const row = j.projects.find((p: unknown) => isProjectRowFor(p, repoName));
+    const repoRoot = gitCommonDirRepoRoot(cwd);
+    const row = j.projects.find((p: unknown) => isProjectRowFor(p, cwd, repoRoot, fallbackRepoName));
     if (!row) return undefined;
     return {
-      project: typeof row.project === "string" ? row.project : repoName,
+      project: typeof row.project === "string" ? row.project : fallbackRepoName,
       next_step: typeof row.next_step === "string" ? row.next_step : null,
       needs_wake: row.needs_wake === true,
       workers: Array.isArray(row.tasks) ? row.tasks.length : 0,

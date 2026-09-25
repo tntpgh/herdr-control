@@ -226,7 +226,14 @@ APP_ROOT = Path(__file__).resolve().parent
 #
 # A source absent from this map gets DEFAULT_STALE_MAX, deliberately short: a
 # new network cache stays conservative until someone decides otherwise.
-STALE_MAX = {"loops": 40.0, "links": 90.0, "search": 600.0, "kb": 1200.0, "deploy_drift": 900.0}
+STALE_MAX = {"loops": 40.0, "links": 90.0, "search": 600.0, "kb": 1200.0, "deploy_drift": 900.0,
+             # projects_data() can run up to ~16 sequential `gh` calls on a
+             # cold fill (measured 9.2s against the live registry) — well
+             # past what a 2s-budgeted caller (the ambient card, project_status)
+             # can wait for. 600s means a reader more than 10 minutes past the
+             # last fill pays the cold cost; anything sooner gets the stale
+             # value while a background refresh runs (see Cached.get()).
+             "projects": 600.0}
 DEFAULT_STALE_MAX = 30.0
 
 # No single fill may run longer than this. It is the bound that makes "refresh
@@ -2741,6 +2748,12 @@ def project_key(task: dict) -> str:
 
 
 _SPEC_CHECKBOX = re.compile(r"^-\s*\[([ xX])\]\s*(.+?)\s*$")
+# spawn-task.sh's own _spec_template writes this literal line into every
+# worktree that was never given a --brief. A worker that closes `shipped`
+# without ever touching SPEC.md leaves it behind verbatim — measured live,
+# on the first tick after this feature deployed, as next_step for two
+# already-finished projects. Never a real acceptance item.
+_SPEC_PLACEHOLDER = "(one checkbox per acceptance criterion)"
 
 
 def spec_checklist(worktree: str | None) -> tuple[list[dict], str | None]:
@@ -2748,19 +2761,30 @@ def spec_checklist(worktree: str | None) -> tuple[list[dict], str | None]:
     section.
 
     Only `- [ ] text` / `- [x] text` lines count — spawn-task.sh's own
-    template writes exactly that shape (_spec_template), and a worker is
-    expected to tick a box as it verifies that criterion: the same "done is a
-    registry fact, not a claim" discipline item 1 already enforces for task
-    completion, applied to the acceptance list itself. A `--brief` SPEC.md
+    template writes exactly that shape (_spec_template). A `--brief` SPEC.md
     that is free prose with no checkboxes at all (real example: knowledge-
     base's fub-content-layer brief, a numbered "Scope" list) has no items and
     no next step — reported as such, never guessed at, because inventing a
     next step from prose is exactly the unchecked claim item 1 exists to stop.
 
+    A line that starts with whitespace and is not itself a new checkbox is a
+    WRAPPED CONTINUATION of the previous item — appended to its text rather
+    than dropped. Without this, an item that wraps onto an indented second
+    line (this file's own SPEC.md acceptance list does) truncated at the
+    wrap point everywhere next_step is shown: the wake card, the ambient
+    card, and project_status.
+
+    A checkbox's OWN mark (`[ ]` vs `[x]`) is read here only to decide
+    ordering among items that have no other signal; project_needs_wake does
+    NOT trust it to mean "this criterion is done" — see that function's own
+    docstring for why (workers write PROOF.md and close the task; they are
+    not expected to also tick SPEC.md).
+
     next_step is the first unticked item's text, or None once every item is
-    ticked (or there were none to begin with) — "None" here means "nothing
+    ticked (or there were none to begin with, or the only line present was
+    the unfilled template placeholder) — "None" here means "nothing
     outstanding in the checklist", not "the project is done"; the caller
-    layers PR/decision state on top before deciding that.
+    layers closure/PR/decision state on top before deciding that.
     """
     if not worktree:
         return [], None
@@ -2778,34 +2802,62 @@ def spec_checklist(worktree: str | None) -> tuple[list[dict], str | None]:
             continue
         m = _SPEC_CHECKBOX.match(line)
         if m:
-            items.append({"text": m.group(2), "done": m.group(1).lower() == "x"})
+            item_text = m.group(2)
+            if item_text.strip() == _SPEC_PLACEHOLDER:
+                continue
+            items.append({"text": item_text, "done": m.group(1).lower() == "x"})
+            continue
+        if items and line.strip() and line[:1] in (" ", "\t"):
+            items[-1]["text"] = f"{items[-1]['text']} {line.strip()}"
     next_step = next((it["text"] for it in items if not it["done"]), None)
     return items, next_step
 
 
-def project_needs_wake(task_states: list, next_step: str | None, open_forms: int) -> bool:
+# A closure reason that means the project's story is DONE, not merely that
+# its latest worker exited. Set only by a real `set_task_state … completed
+# <reason>` call, which already required a valid proof reference
+# (lib/run-registry.sh's closure-reason gate, item 1) — a stronger signal
+# than an unticked SPEC.md checkbox, which a worker is never required to
+# maintain. `handed_off_to:<x>` is matched by prefix (the `<x>` varies).
+_CLOSED_REASONS = frozenset(("shipped", "canceled", "no-follow-on"))
+
+
+def project_needs_wake(task_states: list, next_step: str | None, open_forms: int,
+                       closure_reason: str | None = None) -> bool:
     """thurber-os docs/project-contract-plan.md item 3, 'carry to completion':
     a project gets woken to Main when it has a next step, no live worker, and
     nothing it is waiting on from Terrence.
 
-    * a next step must exist — a finished checklist (or a --brief SPEC.md
-      with no checkboxes at all, where next_step is always None) has nothing
-      to carry forward.
-    * 'no live worker' is the ABSENCE of starting/running/blocked among this
-      project's tasks. `blocked` counts as LIVE on purpose: a worker sitting
-      on a blocked prompt is already being carried by attention-tick.sh's own
-      per-pane escalation ladder, and paging Main a second time for the same
-      stuck worker through a different channel is exactly the double-wake
-      PR #132 exists to prevent, one layer up.
+    * a next step must exist — a finished checklist, a --brief SPEC.md with
+      no checkboxes (next_step always None), or a SPEC.md whose only line
+      was the unfilled template placeholder (filtered in spec_checklist) has
+      nothing to carry forward.
+    * 'no live worker' is read from task_states, which the caller populates
+      from the REGISTRY's stored state, never the page's derived one — see
+      the caller (projects_data()) for why `stalled` and `ready_review` are
+      NOT live-worker signals to trust here. `blocked` counts as LIVE on
+      purpose: a worker sitting on a blocked prompt is already being carried
+      by attention-tick.sh's own per-pane escalation ladder, and paging Main
+      a second time for the same stuck worker through a different channel is
+      exactly the double-wake PR #132 exists to prevent, one layer up.
     * 'nothing waiting on Terrence' — an open decision form for this project
       already covers it; a second page for the same gap is the noise item
       3a's own dedupe ladder exists to prevent, just at project granularity.
+    * a CLOSED latest task (shipped/canceled/no-follow-on/handed_off_to:*)
+      means a human-reviewed gate already decided this project's outcome;
+      an unticked SPEC.md box left behind by a worker that never edited the
+      file is not grounds to re-open it. Measured live: on the first tick
+      after this feature deployed, two already-`shipped` projects
+      (tourguide, watchdog-worker) paged Main with the template placeholder
+      as their "next step" before this gate existed.
     """
     if not next_step:
         return False
     if any(s in RUNNING_TASK_STATES for s in task_states):
         return False
     if open_forms > 0:
+        return False
+    if closure_reason and (closure_reason in _CLOSED_REASONS or closure_reason.startswith("handed_off_to:")):
         return False
     return True
 
@@ -2837,41 +2889,52 @@ def _claims_by_worktree() -> dict:
 
 
 # ---- open PRs for a project's branches, via `gh` -----------------------------
-# `gh` is a network call (~0.3-1s), so it gets its OWN small cache rather than
-# riding CACHES["projects"]'s ttl — several projects sharing one page render
-# must not each force a fresh `gh pr list` on every cold projects_data() call.
+# `gh` is a network call, so it gets its OWN cache rather than riding
+# CACHES["projects"]'s ttl. ONE call per REPO (not per branch): the original
+# cut ran `gh pr list --head <branch>` for every DISTINCT branch of every
+# task ever registered (completed and lost ones included) — on the live
+# registry that was 16 calls/tick, ~960/hr, growing with every spawn, and at
+# ~140 branches a cold fill would exceed Cached's own FILL_BUDGET_S (70s)
+# and never complete. `gh pr list --state open` with no `--head` returns
+# every open PR for the repo in one call; matching a branch to its PR is a
+# local dict lookup on `headRefName`, not a second network round trip.
 _PR_CACHE: dict = {}
 _PR_CACHE_LOCK = threading.Lock()
-PR_CACHE_TTL_S = 30.0
+# Above the 60s attention-tick interval so a tick that already warmed this
+# via CACHES["projects"] does not force a second cold `gh` call a few
+# seconds later from a page view landing between ticks.
+PR_CACHE_TTL_S = 90.0
 
 
-def open_prs_for_branch(repo: str | None, branch: str | None) -> list:
-    """Open PRs on `branch`, via `gh pr list` run with cwd=repo (the MAIN
-    checkout — task.repo — not the worktree; both share the same origin, and
-    the main checkout is guaranteed to still exist after a worktree is
-    removed). Never raises: gh missing, unauthenticated, or offline all
-    degrade to an empty list rather than breaking the page."""
-    if not repo or not branch:
-        return []
-    key = (repo, branch)
+def _open_prs_for_repo(repo: str | None) -> dict:
+    """{headRefName: pr_dict} for every OPEN PR in `repo` (the MAIN checkout —
+    task.repo, not the worktree; both share the same origin, and the main
+    checkout is guaranteed to still exist after a worktree is removed).
+    `--state open` excludes merged/closed PRs at the source — no client-side
+    state filter needed. Never raises: gh missing, unauthenticated, or
+    offline all degrade to no PRs rather than breaking the page."""
+    if not repo:
+        return {}
     now = time.monotonic()
     with _PR_CACHE_LOCK:
-        cached = _PR_CACHE.get(key)
+        cached = _PR_CACHE.get(repo)
         if cached and now - cached[0] < PR_CACHE_TTL_S:
             return cached[1]
-    prs: list = []
+    by_branch: dict = {}
     try:
         r = subprocess.run(
-            ["gh", "pr", "list", "--head", branch, "--state", "all",
-             "--json", "number,url,title,state,isDraft,mergeable,statusCheckRollup"],
+            ["gh", "pr", "list", "--state", "open",
+             "--json", "number,url,title,headRefName,isDraft,mergeable,statusCheckRollup"],
             cwd=repo, capture_output=True, text=True, timeout=15)
         if r.returncode == 0:
-            prs = json.loads(r.stdout or "[]")
+            for pr in json.loads(r.stdout or "[]"):
+                if isinstance(pr, dict) and pr.get("headRefName"):
+                    by_branch[pr["headRefName"]] = pr
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        prs = []
+        by_branch = {}
     with _PR_CACHE_LOCK:
-        _PR_CACHE[key] = (now, prs)
-    return prs
+        _PR_CACHE[repo] = (now, by_branch)
+    return by_branch
 
 
 def _project_open_forms(pane_ids: set, labels: set, forms: dict) -> list:
@@ -2949,27 +3012,56 @@ def projects_data() -> dict:
         pane_ids = {t.get("pane_id") for t in ptasks if t.get("pane_id")}
         labels = {t.get("label") for t in ptasks if t.get("label")}
         open_forms = _project_open_forms(pane_ids, labels, forms)
-        branches = sorted({t.get("branch") for t in ptasks if t.get("branch")})
-        prs: list = []
-        for br in branches:
-            prs.extend(open_prs_for_branch(latest.get("repo"), br))
+        branches = {t.get("branch") for t in ptasks if t.get("branch")}
+        # ONE gh call per REPO (see _open_prs_for_repo), matched locally to
+        # this project's own branches — never a call per branch.
+        repo_prs = _open_prs_for_repo(latest.get("repo"))
+        prs = [repo_prs[b] for b in sorted(branches) if b in repo_prs]
 
         task_rows_out = []
         for t in ptasks:
             row = {"task_id": t.get("task_id"), "state": t.get("state"),
                    "pane_id": t.get("pane_id"), "label": t.get("label"),
-                   "branch": t.get("branch"), "updated_at": t.get("updated_at")}
+                   "branch": t.get("branch"), "worktree": t.get("worktree"),
+                   "updated_at": t.get("updated_at")}
             claim = claims.get(t.get("worktree") or "")
             if claim:
                 row["claim"] = claim
             if t.get("state") == "blocked":
                 since = _iso_epoch(t.get("updated_at"))
                 row["blocked_minutes"] = round((time.time() - since) / 60, 1) if since else None
+                # Redacted to the bare executable name — herdr_live's own
+                # pane record deliberately carries no screen content ("so
+                # nothing here can leak a command or a credential"), and this
+                # unauthenticated endpoint must keep that guarantee: an
+                # approval prompt routinely shows a command with an inline
+                # token (`curl -H 'Authorization: Bearer …'`) or a path that
+                # discloses a client name. The first whitespace-separated
+                # token names the tool (bash, gh, curl, …) without any of
+                # its arguments.
                 probe = _pane_probe(t.get("pane_id") or "")
-                row["blocked_on"] = probe.get("command_text") if probe.get("visible") else None
+                cmd = probe.get("command_text") if probe.get("visible") else None
+                row["blocked_on"] = cmd.split()[0] if cmd and cmd.split() else None
             task_rows_out.append(row)
 
-        task_states = [t.get("state") for t in ptasks]
+        # Liveness for project_needs_wake is the REGISTRY's own stored state
+        # (starting/running/blocked/completed/…), never the page's DERIVED
+        # one: derive() maps a live worker with no completion evidence yet to
+        # `stalled`, and a finished worker awaiting Terrence's PR review to
+        # `ready_review` — both of which have stored_state == "running"
+        # because nothing has transitioned them, and both mean "not actually
+        # abandoned". Reading the derived state here made a project with an
+        # alive idle pane, or one already waiting on Terrence's own review,
+        # read as "no live worker" and page Main anyway.
+        task_states = [t.get("stored_state") or t.get("state") for t in ptasks]
+        # The LATEST task's closure — set only by a real `set_task_state …
+        # completed <reason>` call, which already required a valid proof
+        # reference (lib/run-registry.sh's closure-reason gate, item 1). A
+        # project whose most recent task closed shipped/canceled/no-follow-on
+        # or was handed off has a definitive, human-reviewed outcome; SPEC.md
+        # checkboxes are not re-derived against it because workers are not
+        # expected to tick them — they write PROOF.md and close the task.
+        closure_reason = latest.get("closure_reason")
         next_step_line = next_step or (
             "waiting on: decision" if open_forms else
             ("waiting on: review" if any(t.get("state") == "ready_review" for t in ptasks) else None))
@@ -2979,7 +3071,7 @@ def projects_data() -> dict:
             "open_decisions": [{"id": f.get("id"), "title": f.get("title"), "status": f.get("status")}
                                for f in open_forms],
             "spec_items": items, "next_step": next_step_line,
-            "needs_wake": project_needs_wake(task_states, next_step, len(open_forms)),
+            "needs_wake": project_needs_wake(task_states, next_step, len(open_forms), closure_reason),
         })
     return {"projects": projects}
 
@@ -2994,8 +3086,19 @@ def _project_attention_tick() -> None:
     handing each one needing a wake to project-wake.sh, which owns the
     dedupe/Main-resolution/send discipline (same separation of concerns as
     attention-tick.sh itself: this file decides WHAT needs attention, the
-    bash script decides HOW to deliver it safely)."""
-    data = projects_data()
+    bash script decides HOW to deliver it safely).
+
+    Reads CACHES["projects"].get(), never projects_data() directly: this is
+    the only periodic reader that runs unconditionally every
+    PROJECT_ATTENTION_INTERVAL_S regardless of whether a human is looking,
+    so it is what keeps the cache warm (Cached's own docstring: "a
+    background refresh is only ever kicked by a read") — calling the bare
+    function bypassed the cache entirely and left it to go cold between page
+    views, which is what made the ambient card's 2s-budgeted curl time out
+    after any idle gap past DEFAULT_STALE_MAX (measured: a cold fill against
+    the live registry's ~16 branches took 9.2s).
+    """
+    data = CACHES["projects"].get()
     if data.get("error"):
         return
     if not PROJECT_WAKE_SCRIPT.exists():
@@ -3006,8 +3109,14 @@ def _project_attention_tick() -> None:
         next_step = p.get("next_step") or ""
         card = f"{p['project']}: next — {next_step} (no live worker, nothing open for you)"
         try:
+            # send-to-agent.sh's own retry loop (composer-stability polling)
+            # can run several seconds; 15s was tight enough to risk killing
+            # the script BETWEEN claim_once and recording project_wake_result
+            # (review #146 finding 5) — burning the one-shot slot with no
+            # outcome to retry against. 25s gives it more headroom without
+            # blocking this tick's other projects for long.
             subprocess.run(["bash", str(PROJECT_WAKE_SCRIPT), p["project"], next_step, card],
-                           capture_output=True, timeout=15)
+                           capture_output=True, timeout=25)
         except (OSError, subprocess.TimeoutExpired):
             pass
 

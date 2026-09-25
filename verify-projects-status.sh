@@ -104,10 +104,30 @@ write_spec("# Brief: something\n\n## Goal\nprose only, no checkboxes\n")
 items, next_step = hub.spec_checklist(wt)
 results["no_checklist"] = items == [] and next_step is None
 
-# ---- project_needs_wake() ----
+# spawn-task.sh's own unfilled template placeholder line is never a real
+# item (review #146 finding 2: it paged Main on the first tick after deploy
+# for two already-shipped projects whose workers never touched SPEC.md).
+write_spec("# SPEC\n\n## Acceptance\n- [ ] (one checkbox per acceptance criterion)\n")
+items, next_step = hub.spec_checklist(wt)
+results["placeholder_filtered"] = items == [] and next_step is None
+
+# A wrapped acceptance item (an indented continuation line) is joined to the
+# previous item's text, not truncated (review #146 finding 9 — measured live:
+# herdr-control's own next_step came out truncated at the wrap point).
+write_spec(
+    "# SPEC\n\n## Acceptance\n"
+    "- [ ] PR against main with every CI check consumed on the final SHA (opened,\n"
+    "      not yet merged -- Main merges).\n"
+)
+items, next_step = hub.spec_checklist(wt)
+results["wrapped_line_joined"] = next_step == "PR against main with every CI check consumed on the final SHA (opened, not yet merged -- Main merges)."
+
+# ---- project_needs_wake() (pure function; task_states is whatever the
+# CALLER passes — see the full-join test below for proof the caller now
+# passes the REGISTRY's stored state, not the page's derived one) ----
 # No live worker + a next step + nothing waiting on Terrence -> wake.
 results["wake_when_stalled_with_next_step"] = hub.project_needs_wake(
-    task_states=["stalled"], next_step="first thing", open_forms=0) is True
+    task_states=["lost"], next_step="first thing", open_forms=0) is True
 
 # A running/blocked worker present -> never wake, even with a next step.
 results["no_wake_when_running"] = hub.project_needs_wake(
@@ -121,7 +141,97 @@ results["no_wake_when_done"] = hub.project_needs_wake(
 
 # An open decision already covers it -> the human already knows; don't page.
 results["no_wake_when_decision_open"] = hub.project_needs_wake(
-    task_states=["stalled"], next_step="first thing", open_forms=1) is False
+    task_states=["lost"], next_step="first thing", open_forms=1) is False
+
+# A closed latest task (shipped/canceled/no-follow-on/handed_off_to:*) means
+# a human-reviewed gate already decided the outcome; an unticked SPEC.md box
+# is not grounds to re-open it (review #146 finding 2).
+for reason in ("shipped", "canceled", "no-follow-on", "handed_off_to:qa-team"):
+    results[f"no_wake_when_closed_{reason.split(':')[0]}"] = hub.project_needs_wake(
+        task_states=["lost"], next_step="first thing", open_forms=0, closure_reason=reason) is False
+
+# A lost/failed task with NO closure reason recorded still needs a wake --
+# closure is a gate, not a requirement to have one at all.
+results["wake_when_lost_no_closure_reason"] = hub.project_needs_wake(
+    task_states=["lost"], next_step="first thing", open_forms=0, closure_reason=None) is True
+
+# ---- full join: projects_data() against realistic herdr_data()-shaped
+# fixtures (review #146 finding 8: prior coverage only exercised the pure
+# helpers with a hand-picked task_states=["stalled"], which encoded the bug
+# rather than catching it). Every external dependency is monkeypatched so
+# this never touches the real registry, gh, or a live pane.
+
+
+class _FakeCache:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
+def _spec_with_unfinished_item(text_of_item):
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, ".handoffs"), exist_ok=True)
+    with open(os.path.join(d, ".handoffs", "SPEC.md"), "w") as f:
+        f.write(f"# SPEC\n\n## Acceptance\n- [ ] {text_of_item}\n")
+    return d
+
+
+def _spec_with_placeholder_only():
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, ".handoffs"), exist_ok=True)
+    with open(os.path.join(d, ".handoffs", "SPEC.md"), "w") as f:
+        f.write("# SPEC\n\n## Acceptance\n- [ ] (one checkbox per acceptance criterion)\n")
+    return d
+
+
+# tourguide-like: latest task CLOSED shipped, worker never touched SPEC.md
+# (template placeholder left behind) -> must never wake.
+wt_tourguide = _spec_with_placeholder_only()
+task_tourguide = {
+    "task_id": "t-tourguide", "state": "completed", "stored_state": "completed",
+    "pane_id": "", "label": "implement:x", "branch": "feat/x", "worktree": wt_tourguide,
+    "repo": "/repo/tourguide", "project": "", "updated_at": "2026-09-01T00:00:00Z",
+    "closure_reason": "shipped",
+}
+
+# watchdog-worker-like: worker FINISHED and is awaiting Terrence's PR review
+# (derived "ready_review"), but the REGISTRY never explicitly closed it —
+# stored_state stays "running". A real unfinished checklist item is present.
+# Must never wake: the worker is live/awaiting review, not abandoned.
+wt_watchdog = _spec_with_unfinished_item("open the PR")
+task_watchdog = {
+    "task_id": "t-watchdog", "state": "ready_review", "stored_state": "running",
+    "pane_id": "", "label": "implement:y", "branch": "feat/y", "worktree": wt_watchdog,
+    "repo": "/repo/watchdog-worker", "project": "", "updated_at": "2026-09-01T00:00:00Z",
+    "closure_reason": None,
+}
+
+# genuinely-abandoned: the registry marked it LOST (a real terminal state, no
+# live pane), no closure reason was ever recorded, and real work remains.
+# THIS is the case the whole feature exists for -> must wake.
+wt_abandoned = _spec_with_unfinished_item("finish the migration")
+task_abandoned = {
+    "task_id": "t-abandoned", "state": "lost", "stored_state": "lost",
+    "pane_id": "", "label": "implement:z", "branch": "feat/z", "worktree": wt_abandoned,
+    "repo": "/repo/scratch-project", "project": "", "updated_at": "2026-09-01T00:00:00Z",
+    "closure_reason": None,
+}
+
+hub.CACHES["herdr"] = _FakeCache({"tasks": [task_tourguide, task_watchdog, task_abandoned]})
+hub.CACHES["forms"] = _FakeCache({"open": []})
+hub._claims_by_worktree = lambda: {}
+hub._open_prs_for_repo = lambda repo: {}
+hub._pane_probe = lambda pane_id: {}
+
+joined = hub.projects_data()
+by_project = {p["project"]: p for p in joined["projects"]}
+
+results["join_tourguide_no_wake"] = by_project.get("tourguide", {}).get("needs_wake") is False
+results["join_watchdog_no_wake"] = by_project.get("watchdog-worker", {}).get("needs_wake") is False
+results["join_abandoned_wakes"] = by_project.get("scratch-project", {}).get("needs_wake") is True
+results["join_tourguide_next_step_none"] = by_project.get("tourguide", {}).get("next_step") is None
 
 print(json.dumps(results))
 PYEOF

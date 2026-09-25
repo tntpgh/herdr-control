@@ -89,6 +89,32 @@ n_sent4=$(grep -c "send-text" "$SENT" || true)
 n_skip=$(_q "SELECT count(*) FROM events WHERE type='project_wake_skipped' AND task_id='scratch-project';")
 [ "$n_skip" = "1" ] && ok "the skip is recorded" || bad "expected 1 project_wake_skipped event, got $n_skip"
 
+echo "== Main mid-turn on a permission prompt: first attempt REFUSED, retried on the next tick =="
+# thurber-os docs/project-contract-plan.md #146 review finding 5: claim only
+# after a successful send, or retry once next tick — same ladder
+# attention-tick.sh's own _attn_maybe_escalate uses.
+: > "$SENT"
+printf ' Allow tool: bash\n   run: rm -rf /tmp/x\n\n\033[48;2;40;40;40m  Approve\033[0m\n   Deny\n\n up/down navigate  enter select  esc cancel\n' > "$SM"
+bash "$here/project-wake.sh" retry-project "the next step" "retry-project: next — the next step"
+n_sent_r1=$(grep -c "send-text $MAIN" "$SENT" || true)
+[ "$n_sent_r1" = "0" ] && ok "send-to-agent.sh refuses on a permission prompt before ever typing" \
+  || bad "expected 0 send-text calls on the refused attempt, got $n_sent_r1"
+outcome1=$(_q "SELECT json_extract(payload,'\$.outcome') FROM events WHERE type='project_wake_result' AND task_id='retry-project' ORDER BY sequence ASC LIMIT 1;")
+[ "$outcome1" != "submitted" ] && [ -n "$outcome1" ] && ok "first attempt outcome recorded as non-submitted ($outcome1)" \
+  || bad "expected a non-submitted first outcome, got '$outcome1'"
+printf ' $ \n ready\n' > "$SM"
+bash "$here/project-wake.sh" retry-project "the next step" "retry-project: next — the next step"
+n_sent_r2=$(grep -c "send-text $MAIN" "$SENT" || true)
+[ "$n_sent_r2" = "1" ] && ok "the retry on a clear pane sends" || bad "expected 1 send on retry, got $n_sent_r2"
+n_results=$(_q "SELECT count(*) FROM events WHERE type='project_wake_result' AND task_id='retry-project';")
+[ "$n_results" = "2" ] && ok "exactly two attempts recorded (no unbounded retry)" || bad "expected 2 project_wake_result events, got $n_results"
+: > "$SENT"
+bash "$here/project-wake.sh" retry-project "the next step" "retry-project: next — the next step"
+n_sent_r3=$(grep -c "send-text $MAIN" "$SENT" || true)
+[ "$n_sent_r3" = "0" ] && ok "a third call after a submitted retry sends nothing (retry budget spent)" \
+  || bad "sent a third time after the retry already landed: $n_sent_r3"
+
+
 echo
 echo "===== VERIFY ====="
 printf 'passed=%d failed=%d\n' "$pass" "$fail"

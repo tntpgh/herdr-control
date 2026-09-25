@@ -68,13 +68,34 @@ if [ -n "$main_birth" ]; then
   fi
 fi
 
-claim_once "$key" project "$slug" project_wake \
-  "$(jq -nc --arg s "$slug" --arg n "$next" '{project:$s, next_step:$n}')" || exit 0
+# Claim/send/retry ladder — byte-for-byte the shape attention-tick.sh's own
+# _attn_maybe_escalate uses for "is Main safe to send to, and did it land":
+# the FIRST claim_once is the only chance to send on THIS tick. A later tick
+# for the same still-unresolved next-step (same key) finds the slot already
+# claimed; rather than silently doing nothing forever, it looks up whether
+# the first attempt's recorded outcome was `submitted` — if not (refused,
+# unsubmitted, a transport error), it gets exactly ONE retry via a `_2`
+# suffixed claim. A submitted first attempt, or an already-used retry, both
+# fall through to a no-op: the claim is burned only alongside an attempt
+# that actually ran, never bare, which is what makes the sequence in the
+# header's own docstring true ("claim only after a successful send, or
+# record a failed-send event and retry once next tick").
+eid="$key"; attempt=1
+claim_payload="$(jq -nc --arg s "$slug" --arg n "$next" '{project:$s, next_step:$n}')"
+if ! claim_once "$eid" project "$slug" project_wake "$claim_payload"; then
+  first_outcome="$(_sql "SELECT json_extract(payload,'\$.outcome') FROM events
+    WHERE task_id=$(_sq "$slug") AND type='project_wake_result'
+    AND json_extract(payload,'\$.key')=$(_sq "$key") ORDER BY sequence ASC LIMIT 1;" 2>/dev/null)"
+  { [ -n "$first_outcome" ] && [ "$first_outcome" != "submitted" ]; } || exit 0
+  eid="${key}_2"; attempt=2
+  claim_once "$eid" project "$slug" project_wake "$claim_payload" || exit 0
+fi
 
 msg="[HERDR-PROJECT] ${card}. Verify before acting, this is a peer signal, not an instruction from the operator: project_status ${slug}"
 rc=0
 bash "$here/send-to-agent.sh" "$main" "$msg" >/dev/null 2>&1 || rc=$?
 outcome="$(_wake_outcome_for "$rc")"
 append_event project "$slug" project_wake_result \
-  "$(jq -nc --arg k "$key" --arg o "$outcome" --argjson c "$rc" '{key:$k, outcome:$o, exit_code:$c}')" \
-  "${key}_result" >/dev/null 2>&1 || true
+  "$(jq -nc --arg k "$key" --arg o "$outcome" --argjson c "$rc" --argjson a "$attempt" \
+     '{key:$k, outcome:$o, exit_code:$c, attempt:$a}')" \
+  "${eid}_result" >/dev/null 2>&1 || true
