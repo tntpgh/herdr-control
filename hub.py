@@ -13,7 +13,9 @@ the two things that need a human — attention items and open decisions.
   /search      consensus-search memory: totals, last queries, replay counts
   /kb          knowledge-base: nightly ledger, heartbeat, repeat-view signal audits
   /links       every surface with a liveness dot
+  /projects    thurber-os docs/project-contract-plan.md §2: per project, live tasks, open PRs, open decisions, SPEC.md checklist, next step
   /api/summary {attention, attention_tasks, handoff_debt, open_decisions, deploy_drift} — what the omp extension's one-liner reads
+  /api/projects same join as /projects, JSON — what fleet-tools.ts's project_status tool and the ambient card read
   /api/panes   every pane herdr knows, with its agent and live agent_status
   /api/blocked just the panes waiting on a person, joined to their task
   /api/blocked/wait?since=N&timeout=S  long-poll: returns the instant that changes
@@ -851,8 +853,19 @@ def herdr_data(event_limit: int = 100) -> dict:
     conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
     conn.row_factory = sqlite3.Row
     try:
+        # branch/project were added by lib/run-registry.sh's v4/v5 ALTERs.
+        # This connection is read-only (mode=ro) and cannot run them itself,
+        # so a registry a bash script hasn't touched yet (spawn-task.sh,
+        # claim.sh, …) since this hub's own deploy would otherwise 500 the
+        # whole page on "no such column" — checked once per call rather than
+        # assumed, so the join degrades to empty strings instead of crashing
+        # until the first bash writer migrates the file.
+        cols = {r[0] for r in conn.execute("SELECT name FROM pragma_table_info('tasks')")}
+        branch_col = "branch" if "branch" in cols else "'' AS branch"
+        project_col = "project" if "project" in cols else "'' AS project"
         tasks = [dict(r) for r in conn.execute(
-            "SELECT task_id, run_id, label, repo, state, pane_id, conductor_id, worktree, created_at, updated_at "
+            "SELECT task_id, run_id, label, repo, state, pane_id, conductor_id, worktree, "
+            f"{branch_col}, {project_col}, created_at, updated_at "
             "FROM tasks ORDER BY updated_at DESC")]
         events = []
         for r in conn.execute("SELECT sequence, type, task_id, occurred_at, payload FROM events "
@@ -2570,7 +2583,7 @@ STYLE = """
  .chips a.chip.on{border-color:#6aa6ff;color:#cfe0f5;background:#11161d}
  .chips a.chip.hot{border-color:#ff7a7a} .chips a.chip.hot small{color:#ff9d9d}
 """
-NAV = [("/", "overview"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
+NAV = [("/", "overview"), ("/projects", "projects"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
 
 # ---- SCOPE: one hub, many projects ------------------------------------------
 # Every task in the registry already carries the repo it belongs to, and the
@@ -2661,6 +2674,315 @@ def scope_chips(d: dict, path: str, scope: str) -> str:
                    f"<b>{_esc(scope)}</b> — showing nothing, not nothing to show</div>")
     return f"<div class=chips>{''.join(out)}</div>{unknown}"
 
+
+
+# ---- PROJECTS: thurber-os docs/project-contract-plan.md §2 ------------------
+# A project is a repo plus an optional `project:` label (task.project, from
+# spawn-task.sh --project); default is the repo's own basename. This joins,
+# per project: live tasks (state/pane/claim/blocked-minutes), open PRs for
+# their branches (gh, cached), open decision forms delivered to one of its
+# panes, the worktree's SPEC.md acceptance checklist, and a next-step line.
+# `docs/project-status.md` stays the human narrative; /api/projects is the
+# live truth, and every surface (this page, the agent tool, the ambient
+# card) reads the SAME payload — "one source, four surfaces".
+RUNNING_TASK_STATES = frozenset(("starting", "running", "blocked"))
+
+
+def project_key(task: dict) -> str:
+    """The project a task belongs to: its explicit label, or its repo's own
+    basename when spawn-task.sh was never told --project (every task
+    registered before this feature, and every unlabeled one after it)."""
+    repo = (task.get("repo") or "").rstrip("/")
+    return task.get("project") or (repo.rsplit("/", 1)[-1] if repo else "(unknown)")
+
+
+_SPEC_CHECKBOX = re.compile(r"^-\s*\[([ xX])\]\s*(.+?)\s*$")
+
+
+def spec_checklist(worktree: str | None) -> tuple[list[dict], str | None]:
+    """(items, next_step) from <worktree>/.handoffs/SPEC.md's `## Acceptance`
+    section.
+
+    Only `- [ ] text` / `- [x] text` lines count — spawn-task.sh's own
+    template writes exactly that shape (_spec_template), and a worker is
+    expected to tick a box as it verifies that criterion: the same "done is a
+    registry fact, not a claim" discipline item 1 already enforces for task
+    completion, applied to the acceptance list itself. A `--brief` SPEC.md
+    that is free prose with no checkboxes at all (real example: knowledge-
+    base's fub-content-layer brief, a numbered "Scope" list) has no items and
+    no next step — reported as such, never guessed at, because inventing a
+    next step from prose is exactly the unchecked claim item 1 exists to stop.
+
+    next_step is the first unticked item's text, or None once every item is
+    ticked (or there were none to begin with) — "None" here means "nothing
+    outstanding in the checklist", not "the project is done"; the caller
+    layers PR/decision state on top before deciding that.
+    """
+    if not worktree:
+        return [], None
+    try:
+        text = (Path(worktree) / ".handoffs" / "SPEC.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [], None
+    items: list[dict] = []
+    in_acceptance = False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            in_acceptance = line.strip().lower() == "## acceptance"
+            continue
+        if not in_acceptance:
+            continue
+        m = _SPEC_CHECKBOX.match(line)
+        if m:
+            items.append({"text": m.group(2), "done": m.group(1).lower() == "x"})
+    next_step = next((it["text"] for it in items if not it["done"]), None)
+    return items, next_step
+
+
+def project_needs_wake(task_states: list, next_step: str | None, open_forms: int) -> bool:
+    """thurber-os docs/project-contract-plan.md item 3, 'carry to completion':
+    a project gets woken to Main when it has a next step, no live worker, and
+    nothing it is waiting on from Terrence.
+
+    * a next step must exist — a finished checklist (or a --brief SPEC.md
+      with no checkboxes at all, where next_step is always None) has nothing
+      to carry forward.
+    * 'no live worker' is the ABSENCE of starting/running/blocked among this
+      project's tasks. `blocked` counts as LIVE on purpose: a worker sitting
+      on a blocked prompt is already being carried by attention-tick.sh's own
+      per-pane escalation ladder, and paging Main a second time for the same
+      stuck worker through a different channel is exactly the double-wake
+      PR #132 exists to prevent, one layer up.
+    * 'nothing waiting on Terrence' — an open decision form for this project
+      already covers it; a second page for the same gap is the noise item
+      3a's own dedupe ladder exists to prevent, just at project granularity.
+    """
+    if not next_step:
+        return False
+    if any(s in RUNNING_TASK_STATES for s in task_states):
+        return False
+    if open_forms > 0:
+        return False
+    return True
+
+
+def _now_iso_utc() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _claims_by_worktree() -> dict:
+    """worktree path -> live claim record, straight from the registry's own
+    `claims` table (lib/claims.sh) — same read-only connection discipline as
+    herdr_data(). Empty when the registry or the table doesn't exist yet (a
+    host that has never run claim_acquire, or an old schema)."""
+    if not REGISTRY.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT scope, pane_id, purpose, expires_at FROM claims "
+                "WHERE released_at IS NULL AND expires_at > ?", (_now_iso_utc(),)).fetchall()
+            return {r["scope"]: {"pane_id": r["pane_id"], "purpose": r["purpose"],
+                                  "expires_at": r["expires_at"]} for r in rows}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+
+
+# ---- open PRs for a project's branches, via `gh` -----------------------------
+# `gh` is a network call (~0.3-1s), so it gets its OWN small cache rather than
+# riding CACHES["projects"]'s ttl — several projects sharing one page render
+# must not each force a fresh `gh pr list` on every cold projects_data() call.
+_PR_CACHE: dict = {}
+_PR_CACHE_LOCK = threading.Lock()
+PR_CACHE_TTL_S = 30.0
+
+
+def open_prs_for_branch(repo: str | None, branch: str | None) -> list:
+    """Open PRs on `branch`, via `gh pr list` run with cwd=repo (the MAIN
+    checkout — task.repo — not the worktree; both share the same origin, and
+    the main checkout is guaranteed to still exist after a worktree is
+    removed). Never raises: gh missing, unauthenticated, or offline all
+    degrade to an empty list rather than breaking the page."""
+    if not repo or not branch:
+        return []
+    key = (repo, branch)
+    now = time.monotonic()
+    with _PR_CACHE_LOCK:
+        cached = _PR_CACHE.get(key)
+        if cached and now - cached[0] < PR_CACHE_TTL_S:
+            return cached[1]
+    prs: list = []
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "list", "--head", branch, "--state", "all",
+             "--json", "number,url,title,state,isDraft,mergeable,statusCheckRollup"],
+            cwd=repo, capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            prs = json.loads(r.stdout or "[]")
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        prs = []
+    with _PR_CACHE_LOCK:
+        _PR_CACHE[key] = (now, prs)
+    return prs
+
+
+def _project_open_forms(pane_ids: set, labels: set, forms: dict) -> list:
+    """Open decision forms delivered to one of this project's panes.
+    `deliver_to` (formserve.py --deliver) is a herdr pane/tab/label string —
+    matched against this project's live pane ids and its task labels, the two
+    shapes --deliver is normally given. Not scoped by repo at all when
+    `deliver_to` is empty (a form served with no --deliver): those are fleet-
+    wide decisions, correctly excluded from every project's own list."""
+    out = []
+    for f in forms.get("open", []):
+        d = f.get("deliver_to") or ""
+        if not d:
+            continue
+        if d in pane_ids or d in labels or any(lbl and lbl in d for lbl in labels):
+            out.append(f)
+    return out
+
+
+# ---- a project's live blocked-prompt text, via attention-tick.sh's own probe -
+# herdr_live.py's pane record deliberately carries NO screen content
+# (_pane_record's own docstring: "no screen content, so nothing here can leak
+# a command or a credential"), so "what is it blocked ON" has exactly one
+# sanctioned reader in this codebase: attention_probe (attention-tick.sh),
+# which already does the one pane read this whole repo allows for that
+# purpose. Reused via its `probe` CLI verb rather than re-implemented.
+_PROBE_CACHE: dict = {}
+_PROBE_CACHE_LOCK = threading.Lock()
+PROBE_CACHE_TTL_S = 5.0
+ATTENTION_TICK_SCRIPT = Path(__file__).resolve().parent / "attention-tick.sh"
+
+
+def _pane_probe(pane_id: str) -> dict:
+    if not pane_id:
+        return {}
+    now = time.monotonic()
+    with _PROBE_CACHE_LOCK:
+        cached = _PROBE_CACHE.get(pane_id)
+        if cached and now - cached[0] < PROBE_CACHE_TTL_S:
+            return cached[1]
+    result: dict = {}
+    if ATTENTION_TICK_SCRIPT.exists():
+        try:
+            r = subprocess.run(["bash", str(ATTENTION_TICK_SCRIPT), "probe", pane_id],
+                                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                result = json.loads(r.stdout or "{}")
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            result = {}
+    with _PROBE_CACHE_LOCK:
+        _PROBE_CACHE[pane_id] = (now, result)
+    return result
+
+
+def projects_data() -> dict:
+    """The one join every /projects surface reads (§2's 'one source, four
+    surfaces'): per project, live tasks, open PRs, open decisions delivered to
+    its panes, the SPEC.md checklist, and a next-step line."""
+    h = CACHES["herdr"].get() or {}
+    if h.get("error"):
+        return {"error": h["error"], "projects": []}
+    tasks = h.get("tasks") or []
+    claims = _claims_by_worktree()
+    forms = CACHES["forms"].get() or {}
+
+    by_project: dict = {}
+    for t in tasks:
+        by_project.setdefault(project_key(t), []).append(t)
+
+    projects = []
+    for slug, ptasks in sorted(by_project.items()):
+        ptasks = sorted(ptasks, key=lambda t: t.get("updated_at") or "", reverse=True)
+        latest = ptasks[0]
+        items, next_step = spec_checklist(latest.get("worktree"))
+        pane_ids = {t.get("pane_id") for t in ptasks if t.get("pane_id")}
+        labels = {t.get("label") for t in ptasks if t.get("label")}
+        open_forms = _project_open_forms(pane_ids, labels, forms)
+        branches = sorted({t.get("branch") for t in ptasks if t.get("branch")})
+        prs: list = []
+        for br in branches:
+            prs.extend(open_prs_for_branch(latest.get("repo"), br))
+
+        task_rows_out = []
+        for t in ptasks:
+            row = {"task_id": t.get("task_id"), "state": t.get("state"),
+                   "pane_id": t.get("pane_id"), "label": t.get("label"),
+                   "branch": t.get("branch"), "updated_at": t.get("updated_at")}
+            claim = claims.get(t.get("worktree") or "")
+            if claim:
+                row["claim"] = claim
+            if t.get("state") == "blocked":
+                since = _iso_epoch(t.get("updated_at"))
+                row["blocked_minutes"] = round((time.time() - since) / 60, 1) if since else None
+                probe = _pane_probe(t.get("pane_id") or "")
+                row["blocked_on"] = probe.get("command_text") if probe.get("visible") else None
+            task_rows_out.append(row)
+
+        task_states = [t.get("state") for t in ptasks]
+        next_step_line = next_step or (
+            "waiting on: decision" if open_forms else
+            ("waiting on: review" if any(t.get("state") == "ready_review" for t in ptasks) else None))
+        projects.append({
+            "project": slug, "repo": latest.get("repo"),
+            "tasks": task_rows_out, "prs": prs,
+            "open_decisions": [{"id": f.get("id"), "title": f.get("title"), "status": f.get("status")}
+                               for f in open_forms],
+            "spec_items": items, "next_step": next_step_line,
+            "needs_wake": project_needs_wake(task_states, next_step, len(open_forms)),
+        })
+    return {"projects": projects}
+
+
+# ---- project-level "carry to completion" wake (item 3, on top of §3a) -------
+PROJECT_WAKE_SCRIPT = Path(__file__).resolve().parent / "project-wake.sh"
+PROJECT_ATTENTION_INTERVAL_S = float(os.environ.get("HERDR_PROJECT_ATTENTION_INTERVAL_S", "60") or 60)
+
+
+def _project_attention_tick() -> None:
+    """One pass over every project's CURRENT computed state — never an edge —
+    handing each one needing a wake to project-wake.sh, which owns the
+    dedupe/Main-resolution/send discipline (same separation of concerns as
+    attention-tick.sh itself: this file decides WHAT needs attention, the
+    bash script decides HOW to deliver it safely)."""
+    data = projects_data()
+    if data.get("error"):
+        return
+    if not PROJECT_WAKE_SCRIPT.exists():
+        return
+    for p in data.get("projects", []):
+        if not p.get("needs_wake"):
+            continue
+        next_step = p.get("next_step") or ""
+        card = f"{p['project']}: next — {next_step} (no live worker, nothing open for you)"
+        try:
+            subprocess.run(["bash", str(PROJECT_WAKE_SCRIPT), p["project"], next_step, card],
+                           capture_output=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _project_attention_loop() -> None:
+    while True:
+        try:
+            _project_attention_tick()
+        except Exception:  # noqa: BLE001 — belt and braces: the loop must not die
+            pass
+        time.sleep(PROJECT_ATTENTION_INTERVAL_S)
+
+
+# Registered here, not in the CACHES literal above (which is defined before
+# projects_data exists in this file) — same dict, same TTL discipline, just a
+# statement that runs after the function it names. `gh`/pane-probe calls
+# inside projects_data are their own small caches (PR_CACHE/PROBE_CACHE), so
+# this outer ttl mainly bounds how often the SPEC.md/claims/join work reruns.
+CACHES["projects"] = Cached(10, projects_data, stale_ok=True, name="projects")
 
 
 def page(title: str, path: str, body: str, refresh: int = 15, scope: str = "") -> str:
@@ -3146,6 +3468,116 @@ def render_links() -> str:
     return page("links", "/links", f"<h2>Surfaces</h2><table>{rows}</table>", refresh=60)
 
 
+# ---- SLO header (project-contract-plan.md §2, "symptom SLOs, not per-event
+# pings"): time-to-unblock percentiles and wake delivery rate, both derived
+# from timestamps the registry already carries — no new table.
+def slo_data() -> dict:
+    empty = {"p50": None, "p90": None, "p99": None, "samples": 0,
+             "wake_total": 0, "wake_submitted": 0, "wake_rate_pct": None}
+    if not REGISTRY.exists():
+        return empty
+    try:
+        conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+        conn.row_factory = sqlite3.Row
+        try:
+            # time-to-unblock: for every task_id, pair each state_changed-into-
+            # 'blocked' event with the NEXT state_changed event for that same
+            # task_id — the gap between them is one unblock latency sample.
+            rows = conn.execute(
+                "SELECT task_id, sequence, occurred_at, "
+                "json_extract(payload,'$.state') AS state "
+                "FROM events WHERE type='state_changed' ORDER BY task_id, sequence").fetchall()
+            durations: list = []
+            pending: dict = {}
+            for r in rows:
+                tid = r["task_id"]
+                if r["state"] == "blocked":
+                    pending[tid] = r["occurred_at"]
+                elif tid in pending:
+                    start = _iso_epoch(pending.pop(tid))
+                    end = _iso_epoch(r["occurred_at"])
+                    if start is not None and end is not None and end >= start:
+                        durations.append(end - start)
+            wake_rows = conn.execute(
+                "SELECT json_extract(payload,'$.outcome') AS outcome FROM events "
+                "WHERE type IN ('wake_result','attention_escalation_result','project_wake_result')").fetchall()
+            wake_total = len(wake_rows)
+            wake_submitted = sum(1 for r in wake_rows if r["outcome"] == "submitted")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return empty
+    if not durations:
+        return {**empty, "wake_total": wake_total, "wake_submitted": wake_submitted,
+                "wake_rate_pct": round(100 * wake_submitted / wake_total, 1) if wake_total else None}
+    durations.sort()
+
+    def pct(p: float) -> int:
+        idx = min(len(durations) - 1, int(p * len(durations)))
+        return int(durations[idx])
+    return {"p50": pct(0.50), "p90": pct(0.90), "p99": pct(0.99), "samples": len(durations),
+            "wake_total": wake_total, "wake_submitted": wake_submitted,
+            "wake_rate_pct": round(100 * wake_submitted / wake_total, 1) if wake_total else None}
+
+
+def _project_task_row(t: dict) -> str:
+    cls = "hot" if t["state"] in ATTENTION else ("ok" if t["state"] == "completed" else "")
+    extra = ""
+    if t.get("blocked_minutes") is not None:
+        extra = f" — blocked {t['blocked_minutes']}m"
+        if t.get("blocked_on"):
+            extra += f" on <code>{_esc(t['blocked_on'][:80])}</code>"
+    claim = t.get("claim")
+    claim_note = f" · claimed by {_esc(claim['pane_id'])}" if claim else ""
+    return (f"<tr><td><span class='pill {cls}'>{_esc(t['state'])}</span></td>"
+            f"<td>{_esc(t.get('label') or t['task_id'])}</td>"
+            f"<td class=dim>{_esc(t.get('pane_id'))}{claim_note}</td>"
+            f"<td class=dim>{_esc(t.get('branch'))}{extra}</td>"
+            f"<td class=age>{_age(t.get('updated_at'))}</td></tr>")
+
+
+def _project_card(p: dict) -> str:
+    tasks_html = "".join(_project_task_row(t) for t in p["tasks"]) or "<tr><td class=dim colspan=5>no tasks</td></tr>"
+    prs_html = "".join(
+        f"<span class='pill {'hot' if pr.get('state') == 'OPEN' else ''}'>"
+        f"<a href='{_esc(pr.get('url'))}' target=_blank>#{pr.get('number')}</a> {_esc(pr.get('state'))}"
+        f"{' draft' if pr.get('isDraft') else ''}</span> "
+        for pr in p["prs"]) or "<span class=dim>none</span>"
+    dec_html = "".join(
+        f"<span class='pill hot'>{_esc(d.get('title') or d.get('id'))}</span> " for d in p["open_decisions"]
+    ) or "<span class=dim>none</span>"
+    checklist_html = "".join(
+        f"<li class='{'done' if it['done'] else ''}'>{'☑' if it['done'] else '☐'} {_esc(it['text'])}</li>"
+        for it in p["spec_items"]) or "<li class=dim>no `- [ ]` checklist in this project's SPEC.md</li>"
+    next_step = p.get("next_step")
+    next_html = (f"<p><b>next:</b> {_esc(next_step)}</p>" if next_step
+                 else "<p class=dim><b>next:</b> nothing outstanding</p>")
+    wake_note = (" <span class='pill hot'>needs Terrence — no live worker, nothing open</span>"
+                if p.get("needs_wake") else "")
+    return (f"<div class=card style='margin-bottom:18px'>"
+            f"<h2>{_esc(p['project'])}{wake_note}</h2>"
+            f"<p class=dim>{_esc(p.get('repo'))}</p>"
+            f"{next_html}"
+            f"<table>{tasks_html}</table>"
+            f"<p><b>PRs:</b> {prs_html}</p>"
+            f"<p><b>open decisions:</b> {dec_html}</p>"
+            f"<details><summary>SPEC.md acceptance</summary><ul>{checklist_html}</ul></details>"
+            f"</div>")
+
+
+def render_projects() -> str:
+    d = CACHES["projects"].get()
+    if d.get("error"):
+        return page("projects", "/projects", f"<pre>{_esc(d['error'])}</pre>")
+    slo = slo_data()
+    slo_html = (f"<p class=dim>time-to-unblock p50 {slo['p50']}s · p90 {slo['p90']}s · p99 {slo['p99']}s · "
+                f"wake delivery {slo['wake_rate_pct']}% ({slo['wake_submitted']}/{slo['wake_total']})</p>"
+                if slo.get("samples") else "<p class=dim>no time-to-unblock samples yet</p>")
+    body = slo_html + "".join(_project_card(p) for p in d.get("projects") or [])
+    return page("projects", "/projects", body or "<p class=dim>no projects registered yet</p>", refresh=15)
+
+
+
 # ── HTTP ───────────────────────────────────────────────────────────────────────
 def _suggestion_row(s: dict) -> str:
     dec = s.get("decision") or {}
@@ -3192,7 +3624,7 @@ def render_loops() -> str:
 SCOPED_PAGES = ("/", "/herdr")
 PAGES = {"/": (render_overview, None), "/herdr": (render_herdr, "herdr"), "/decisions": (render_decisions, "forms"),
          "/loops": (render_loops, "loops"), "/search": (render_search, "search"), "/kb": (render_kb, "kb"),
-         "/links": (render_links, "links")}
+         "/links": (render_links, "links"), "/projects": (render_projects, "projects")}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3277,6 +3709,8 @@ class Handler(BaseHTTPRequestHandler):
                  "scope": scope,
                  "scope_known": h.get("scope_known", True) if scope else True,
                  "open_ids": ",".join(sorted(x["id"] for x in f.get("open", [])))}).encode())
+        if path == "/api/projects":
+            return self._send(200, "application/json", json.dumps(CACHES["projects"].get(), default=str).encode())
         if path == "/api/panes":
             return self._send(200, "application/json", json.dumps(live_data(), default=str).encode())
         if path == "/api/blocked":
@@ -3414,6 +3848,13 @@ def main() -> int:
         threading.Thread(target=_mirror_loop, name="dashboard-mirror", daemon=True).start()
     if not args.no_attention:
         threading.Thread(target=_attention_loop, name="attention-controller", daemon=True).start()
+        # project-contract-plan.md item 3, "carry to completion" — a separate
+        # thread, not folded into _attention_loop: that one reacts to CURRENTLY
+        # blocked panes (an edge-fed list from herdr_live), this one sweeps
+        # every project's computed state on its own slower cadence and can fire
+        # with NO pane blocked at all (every worker for the project already
+        # exited). Same --no-attention flag disables both.
+        threading.Thread(target=_project_attention_loop, name="project-attention", daemon=True).start()
     # Unconditional (no --no-X flag): two small git fetches against repos we
     # own, nowhere near mirror's cost, and skipping it would reopen exactly
     # the inline-fetch-on-cold-read bug it exists to close.

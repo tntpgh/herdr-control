@@ -55,6 +55,14 @@ const ATTENTION_CURSOR_PATH = path.join(
   process.env.HERDR_RUN_STATE_DIR?.trim() || path.join(process.env.HOME ?? "", ".local/state/herdr/runs"),
   "attention-announce-cursor.json",
 );
+// project-contract-plan.md §2 surface 2 (the ambient card). One JSON object,
+// keyed by project slug, so a session that visits several projects across a
+// day keeps each project's own "have I already said this" state instead of
+// one cursor being clobbered by whichever project was looked at last.
+const PROJECT_CURSOR_PATH = path.join(
+  process.env.HERDR_RUN_STATE_DIR?.trim() || path.join(process.env.HOME ?? "", ".local/state/herdr/runs"),
+  "project-announce-cursor.json",
+);
 
 // existsSync can throw on a permission-denied ancestor directory, which is
 // exactly the kind of environment surprise this file must survive without
@@ -367,6 +375,92 @@ function hubSummary(): { attention: number; handoff_debt: number; open_decisions
   }
 }
 
+// ---- project ambient card (project-contract-plan.md §2, surface 2) ---------
+// The cwd's own project card — worker state, next step, needs_wake — from the
+// SAME /api/projects join the hub page and the `project_status` tool read.
+// undefined when the hub is down, the endpoint is unrecognised (an older
+// hub), or cwd matches no known project — a session outside any project's
+// repo says nothing, same as a fresh machine before this feature existed.
+interface ProjectCard {
+  project: string;
+  next_step: string | null;
+  needs_wake: boolean;
+  workers: number;
+  open_prs: number;
+  open_decisions: number;
+}
+
+function isProjectRowFor(p: unknown, repoName: string): p is { project: unknown; repo?: unknown; next_step?: unknown; needs_wake?: unknown; tasks?: unknown; prs?: unknown; open_decisions?: unknown } {
+  if (!p || typeof p !== "object" || !("project" in p)) return false;
+  if (p.project === repoName) return true;
+  return "repo" in p && typeof p.repo === "string" && p.repo.endsWith(`/${repoName}`);
+}
+
+function projectSummary(cwd: string): ProjectCard | undefined {
+  try {
+    const repoName = cwd.split(path.sep).filter(Boolean).pop();
+    if (!repoName) return undefined;
+    const r = spawnSync("curl", ["-s", "--max-time", "2", `${HUB_URL}api/projects`], { encoding: "utf8" });
+    if (r.error || r.status !== 0 || !r.stdout) return undefined;
+    const j: unknown = JSON.parse(r.stdout);
+    if (!j || typeof j !== "object" || !("projects" in j) || !Array.isArray(j.projects)) return undefined;
+    const row = j.projects.find((p: unknown) => isProjectRowFor(p, repoName));
+    if (!row) return undefined;
+    return {
+      project: typeof row.project === "string" ? row.project : repoName,
+      next_step: typeof row.next_step === "string" ? row.next_step : null,
+      needs_wake: row.needs_wake === true,
+      workers: Array.isArray(row.tasks) ? row.tasks.length : 0,
+      open_prs: Array.isArray(row.prs) ? row.prs.length : 0,
+      open_decisions: Array.isArray(row.open_decisions) ? row.open_decisions.length : 0,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+interface ProjectAnnounceCursor {
+  signature: string;
+  announced_at: number;
+}
+
+function readProjectCursors(): Record<string, ProjectAnnounceCursor> {
+  try {
+    const raw = readFileSync(PROJECT_CURSOR_PATH, "utf8");
+    const j: unknown = JSON.parse(raw);
+    return j && typeof j === "object" ? (j as Record<string, ProjectAnnounceCursor>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeProjectCursors(all: Record<string, ProjectAnnounceCursor>): void {
+  try {
+    mkdirSync(path.dirname(PROJECT_CURSOR_PATH), { recursive: true });
+    const tmp = `${PROJECT_CURSOR_PATH}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(all), "utf8");
+    renameSync(tmp, PROJECT_CURSOR_PATH);
+  } catch {
+    // Worst case: the next turn re-announces something already seen once.
+  }
+}
+
+// Same "announce on change, or after the remind floor" rule as
+// shouldAnnounce above, applied to one project's signature instead of the
+// fleet-wide tuple — kept as its own pure function for the same reason:
+// unit-testable without a real cursor file or a real hub.
+export function shouldAnnounceProject(
+  signature: string,
+  cursor: ProjectAnnounceCursor | undefined,
+  now: number,
+  remindAfterMs: number,
+): boolean {
+  if (!cursor) return true;
+  if (cursor.signature !== signature) return true;
+  return now - cursor.announced_at >= remindAfterMs;
+}
+
+
 // ---- announce throttle -------------------------------------------------------
 // Terrence, 2026-09-22: "less noise, more of the right kind" — measured
 // against this exact banner, which repeated the SAME unresolved count on
@@ -478,32 +572,63 @@ function onBeforeAgentStart():
       }
     }
     const s = hubSummary();
-    if (!s || s.attention + s.open_decisions === 0) {
+    const cwd = process.cwd();
+    const project = projectSummary(cwd);
+    // Worth a line only when there is something outstanding — a healthy
+    // project (no next step, no wake) says nothing, same as the fleet card
+    // when nothing needs a human.
+    const projectWorthAnnouncing = project !== undefined && (project.next_step !== null || project.needs_wake);
+    const now = Date.now();
+    const parts: string[] = [];
+
+    if (s && s.attention + s.open_decisions > 0) {
+      // `attention` carries both halves; subtract the one with its own noun
+      // so neither is dropped and neither is miscalled. Clamped at 0 so a
+      // hub mid-deploy (new field, old count, or the reverse) can only
+      // understate the task half, never print a negative.
+      const current = {
+        tasks: Math.max(0, s.attention - s.handoff_debt),
+        handoff_debt: s.handoff_debt,
+        open_decisions: s.open_decisions,
+      };
+      if (shouldAnnounce(current, readAnnounceCursor(), now, REMIND_AFTER_MS)) {
+        writeAnnounceCursor({ ...current, announced_at: now });
+        if (current.tasks) parts.push(`${current.tasks} task(s) need attention`);
+        if (current.handoff_debt) parts.push(`${current.handoff_debt} repo(s) owe a handoff`);
+        if (current.open_decisions) parts.push(`${current.open_decisions} decision(s) open`);
+      }
+    } else {
       // Nothing needs a human right now. Reset the cursor to zero (rather
       // than leaving whatever was last announced) so that if the SAME count
       // reappears later — the queue drained, then filled back up to the
       // identical number — it is treated as fresh news, not as "unchanged
       // since an hour ago", which it is not: something resolved in between.
-      writeAnnounceCursor({ tasks: 0, handoff_debt: 0, open_decisions: 0, announced_at: Date.now() });
-      return undefined;
+      writeAnnounceCursor({ tasks: 0, handoff_debt: 0, open_decisions: 0, announced_at: now });
     }
-    // `attention` carries both halves; subtract the one with its own noun so
-    // neither is dropped and neither is miscalled. Clamped at 0 so a hub
-    // mid-deploy (new field, old count, or the reverse) can only understate
-    // the task half, never print a negative.
-    const current = {
-      tasks: Math.max(0, s.attention - s.handoff_debt),
-      handoff_debt: s.handoff_debt,
-      open_decisions: s.open_decisions,
-    };
-    const now = Date.now();
-    if (!shouldAnnounce(current, readAnnounceCursor(), now, REMIND_AFTER_MS)) return undefined;
-    writeAnnounceCursor({ ...current, announced_at: now });
 
-    const parts = [];
-    if (current.tasks) parts.push(`${current.tasks} task(s) need attention`);
-    if (current.handoff_debt) parts.push(`${current.handoff_debt} repo(s) owe a handoff`);
-    if (current.open_decisions) parts.push(`${current.open_decisions} decision(s) open`);
+    if (project && projectWorthAnnouncing) {
+      const signature = `${project.next_step ?? ""}|${project.needs_wake}|${project.workers}|${project.open_prs}`;
+      const cursors = readProjectCursors();
+      if (shouldAnnounceProject(signature, cursors[project.project], now, REMIND_AFTER_MS)) {
+        cursors[project.project] = { signature, announced_at: now };
+        writeProjectCursors(cursors);
+        const wakeNote = project.needs_wake ? " — needs you, no live worker" : "";
+        parts.push(
+          `project ${project.project}: next — ${project.next_step ?? "nothing outstanding"}${wakeNote} ` +
+            `(${project.workers} worker(s), ${project.open_prs} PR(s))`,
+        );
+      }
+    } else if (project) {
+      // Resolved since the last announcement — drop its cursor so a future
+      // regression to the SAME signature reads as fresh news, not stale.
+      const cursors = readProjectCursors();
+      if (project.project in cursors) {
+        delete cursors[project.project];
+        writeProjectCursors(cursors);
+      }
+    }
+
+    if (parts.length === 0) return undefined;
     return {
       message: {
         customType: "herdr-reconcile",
