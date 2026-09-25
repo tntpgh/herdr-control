@@ -575,6 +575,21 @@ clean_screen > "$COND_SCREEN"
 run_notify bash
 [ -s "$NOTIFIED" ] && ok "unrecognized choices still produce an alert" || bad "strict selection parser hid a real prompt"
 
+printf '== approval event with NO menu up -> silent, even if a numbered list is on screen ==\n'
+# 2026-09-24: a worker streaming a Write preview of a numbered markdown list
+# (no approval panel painted) produced a peer signal, because the numbered
+# prompt shape matched the file body and the gate then classified screen text.
+# The list below mentions `rm -rf`, so the old path also CLASSIFIED it
+# escalate and woke the conductor for a prompt that did not exist.
+printf ' Write tmp/geo/REPORT.md\n\n 1. Fix robots.txt\n 2. Remove stale pages: rm -rf tmp/geo/old\n 3. Add sameAs links\n' > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+: > "$SENT"; : > "$NOTIFIED"
+n_in_before="$(q_event input_required)"
+run_notify write
+[ ! -s "$NOTIFIED" ] && [ ! -s "$SENT" ] && [ "$(q_event input_required)" = "$n_in_before" ] \
+  && ok "numbered transcript text is not an approval prompt (no alert, no wake, no input_required)" \
+  || bad "false peer signal on a numbered list with no menu: notified=$(cat "$NOTIFIED") sent=$(cat "$SENT")"
+
 printf '== no HERDR_PANE_ID -> silent (cannot verify a prompt, so must not alert) ==\n'
 omp_menu_screen "rm -rf /" > "$WORKER_SCREEN"
 : > "$SENT"; : > "$NOTIFIED"
@@ -723,13 +738,16 @@ const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
 console.log("EVENTS:" + Object.keys(handlers).sort().join(","));
-// The notification path is the APPROVAL event now, not tool_call. tool_call
-// fired before every tool call whether or not anything was ever asked, and
-// the script had to screen-scrape its own pane to find out — 20 `herdr pane
-// read` RPCs per tool call per worker. omp emits tool_approval_requested /
-// tool_approval_resolved (docs/extensions.md) and its own herdr integration
-// already reports blocked/idle off exactly that pair.
-const ar = handlers["tool_approval_requested"]({ toolName: "bash", input: { command: "git push --force" }, reason: "destructive" });
+// The notification path is the APPROVAL event, not tool_call. tool_call fires
+// before every tool call, so it only remembers bash input (a Map write) —
+// because omp v18.3.0 sends tool_approval_requested WITHOUT the arguments:
+// {sessionId, toolName, toolCallId, reason?, approvalMode}. The shape below
+// is the real one, so the untruncated command must come from the cache.
+const tc = handlers["tool_call"]({ toolName: "bash", toolCallId: "call-1", input: { command: "git push --force" } });
+console.log("TOOLCALL_RETURN:" + (tc === undefined ? "undefined" : JSON.stringify(tc)));
+const tcBad = handlers["tool_call"](null);
+console.log("TOOLCALL_NULL_RETURN:" + (tcBad === undefined ? "undefined" : JSON.stringify(tcBad)));
+const ar = handlers["tool_approval_requested"]({ toolName: "bash", toolCallId: "call-1", reason: "destructive", approvalMode: "write" });
 console.log("APPROVAL_RETURN:" + (ar === undefined ? "undefined" : JSON.stringify(ar)));
 const bas = handlers["before_agent_start"]({});
 console.log("INJECTED:" + (bas && bas.message ? bas.message.content : "none"));
@@ -740,13 +758,18 @@ handlers["agent_end"]({});
 await new Promise(r => setTimeout(r, 600));
 ' 2>&1)"
   printf '%s' "$shim_out" \
-    | grep -q 'EVENTS:agent_end,before_agent_start,session_stop,tool_approval_requested,tool_approval_resolved,tool_execution_end,tool_execution_start,tool_result' \
-    && ok "every event is registered (incl. session_stop for conductor exit), and tool_call is NOT one of them" || bad "events: $shim_out"
-  # Every handler must return undefined on every path. tool_call used to be the
-  # fail-closed one (a throw blocked the agent's tool); these are observability
-  # events, but the contract is kept so the wiring can move again safely.
+    | grep -q 'EVENTS:agent_end,before_agent_start,session_stop,tool_approval_requested,tool_approval_resolved,tool_call,tool_execution_end,tool_execution_start,tool_result' \
+    && ok "every event is registered (incl. session_stop for conductor exit, tool_call for the input cache)" || bad "events: $shim_out"
+  # Every handler must return undefined on every path. tool_call is omp's
+  # fail-closed dispatch (a throw or a {block} return stops the agent's tool),
+  # so its handler is held to it hardest: garbage in, undefined out.
+  printf '%s' "$shim_out" | grep -q 'TOOLCALL_RETURN:undefined' && printf '%s' "$shim_out" | grep -q 'TOOLCALL_NULL_RETURN:undefined' \
+    && ok "the tool_call handler returns undefined, even on garbage (never blocks a tool)" || bad "tool_call handler returned non-undefined: $shim_out"
   printf '%s' "$shim_out" | grep -q 'APPROVAL_RETURN:undefined' \
     && ok "the approval handler returns undefined (never blocks the agent)" || bad "approval handler returned non-undefined"
+  jq -e '.command == "git push --force"' "$REC.notify" >/dev/null 2>&1 \
+    && ok "the untruncated command reaches omp-notify.sh from the tool_call cache (omp's approval event carries no input)" \
+    || bad "command field missing from notify JSON: $(cat "$REC.notify" 2>/dev/null)"
   # #37 moved the reconciliation report to the hub page and left AT MOST a
   # one-line hub summary in the prompt; 0fbece0's report-injection contract is
   # gone. What must hold now is that nothing else leaks into context — a raw

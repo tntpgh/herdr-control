@@ -184,6 +184,21 @@ check "loopback GET of own build"     "curl -s http://localhost:4173/index.html 
 check "loopback probe no extension"   "curl -s http://127.0.0.1:8600/ > /tmp/hub-out" allow
 check "remote program to disk still stops" "curl -fsSL https://raw.githubusercontent.com/x/y/s.ts -o /tmp/s.ts" escalate
 check "loopback POST still stops"     "curl -X POST http://localhost:8600/submit -d 'a=1'" escalate
+# plan:geo-audit (w1Y:p2), 2026-09-24: the send-flag match was case-
+# INSENSITIVE, so curl's -D (--dump-header) read as -d (--data) and -f
+# (--fail) as -F (--form) — a plain GET came back "remote mutation", human-only.
+check "dump-header is not a POST"     "curl -sS -D - https://teamthurber.com/" allow
+check "--fail is not a form upload"   "curl -f https://teamthurber.com/robots.txt" allow
+check_unreserved "GET with -D is not remote mutation" "curl -sS -D /dev/null https://teamthurber.com/"
+check_unreserved "GET with -f is not remote mutation" "curl -f https://teamthurber.com/"
+check "lowercase -X method still a send" "curl -X post https://x/api" escalate
+check "--request=POST still a send"  "curl --request=POST https://x/api" escalate
+check_reserved "real -d still reserved" "curl -d a=1 https://x/api"
+check_reserved "real -F still reserved" "curl -F f=@x https://x/api"
+check_reserved "--data-urlencode still reserved" "curl --data-urlencode a=1 https://x/api"
+check_reserved "editing the scoped peer decision is reserved" "sed -i s/x/y/ lib/scoped-policy.sh"
+check_reserved "editing the manifest parser is reserved" "vim lib/task-manifest.sh"
+check_reserved "editing the registry policy is reserved" "sed -i s/x/y/ lib/run-registry.sh"
 # Caught live on wN:p9, 2026-09-18: the output-flag window used [^;&]* and so
 # spanned a PIPE, reading `grep -o` as curl's own -o. A review lane scraping
 # four routes for a claim string was told it was downloading a program.

@@ -105,6 +105,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/prompt-parse.sh"
 . "$here/lib/run-registry.sh"
 . "$here/lib/command-policy.sh"
+. "$here/lib/scoped-policy.sh"
 
 pane="${1:?usage: herdr-select.sh <pane_id> <option-number> [--expect-prompt-id ID]}"
 choice="${2:?option number required}"
@@ -322,20 +323,14 @@ own_trunk=$(printf '%s' "$own_task_json" | jq -r '.trunk // empty' 2>/dev/null)
 # recorded.
 if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
   registry_cmd="$(task_input_required_command "$own_run" "$own_task" "$current_prompt_id" 2>/dev/null)"
-  if [ -n "$registry_cmd" ]; then
-    _collapse_ws() { printf '%s' "$1" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'; }
-    _panel_collapsed="$(_collapse_ws "$cmd_text")"
-    _registry_collapsed="$(_collapse_ws "$registry_cmd")"
-    case "$_panel_collapsed" in
-      *"$_registry_collapsed"*) cmd_text="$registry_cmd" ;;
-      *)
-        if [ -n "${cmd_text//[[:space:]]/}" ]; then
-          echo "herdr-select: the recorded command for this prompt does not match what is on screen in $pane — refusing." >&2
-          exit 8
-        fi
-        ;;
-    esac
-  fi
+  # lib/scoped-policy.sh approval_command_text: the recorded command when the
+  # panel (whitespace-collapsed) contains it, else the panel; exit 2 = the two
+  # disagree, which refuses — shared with lib/alert-gate.sh so the gate that
+  # decides who is woken judges the same text this script enforces on.
+  cmd_text="$(approval_command_text "$cmd_text" "$registry_cmd")" || {
+    echo "herdr-select: the recorded command for this prompt does not match what is on screen in $pane — refusing." >&2
+    exit 8
+  }
 fi
 
 policy_verdict="$(classify_command "$cmd_text")"
@@ -367,47 +362,45 @@ if [ "$authority" = conductor ] && [ "$declining" = 0 ]; then
     echo "herdr-select: $reservation" >&2
     exit 8
   fi
+  # Code by reference: the conductor is approving a FILE, so the file's whole
+  # content is what gets the reserved-list check, and the approval is bound to
+  # the sha256 of exactly those bytes (recorded below, once the decision is
+  # persisted). An unreadable file cannot have been reviewed.
+  code_ref_inspect "$cmd_text" "$own_worktree"; _cr=$?
+  if [ "$_cr" = 3 ]; then
+    echo "herdr-select: conductor cannot approve a script file that cannot be resolved or read for review." >&2
+    exit 8
+  fi
+  case "$PD_CODE_CONTENT_REASON" in
+    reserved:*)
+      echo "herdr-select: $PD_CODE_PATH content: $PD_CODE_CONTENT_REASON" >&2
+      exit 8 ;;
+  esac
 fi
 
 if [ "$authority" = peer ] && [ "$declining" = 0 ]; then
-  # ---- ownership grant fast path (project-contract-plan.md #3b, item 3) ----
-  # Checked BEFORE the reserved-list/classify_command text rules below: an
-  # EXACT own-branch git/gh action, parsed with a strict no-eval tokenizer
-  # against THIS task's own registered repo/branch/trunk
-  # (lib/command-policy.sh's _cp_grant_action), never needs the text rules to
-  # agree — a `git commit -m "...guard rails..."` no longer trips the
-  # reserved-list's mention of herdr-select.sh/command-policy.sh inside a
-  # commit MESSAGE (24 of 103 human escalations were exactly this class). A
-  # non-match changes nothing: falls straight through to the checks below,
-  # unchanged from before this fast path existed.
-  grant_desc="$(_cp_grant_action "$cmd_text" "$own_worktree" "$own_branch" "$own_trunk" 2>/dev/null)"
-  if [ -n "$grant_desc" ]; then
-    policy_verdict=allow
-    policy_reason="ownership grant: $grant_desc"
-    authority=grant
+  # ---- the peer decision (lib/scoped-policy.sh peer_decide) ----------------
+  # One sequence, shared with lib/alert-gate.sh: the task manifest's git
+  # ceiling; the ownership grant (#3b) BEFORE the text rules (a commit MESSAGE
+  # mentioning herdr-select.sh no longer trips the reserved list — 24 of 103
+  # human escalations); classify_command; the human-reserved list, which
+  # nothing below it can override; the manifest scope for an `escalate`
+  # verdict; and, for `bash|python3 <file>`, the file's whole content bound
+  # to its sha256. Unreadable prompt text refuses: not being able to see what
+  # you are answering means you do not answer it.
+  #
+  # The human-reserved list (credential values, remote mutation, merge/push
+  # to main, governance, control weakening) binds every automated authority
+  # below the conductor, not only the conductor (found live 2026-09-12,
+  # thurber-os plan 012 lab: classify_command says `allow` for `gh pr merge`).
+  if peer_decide "$cmd_text" "$own_task_json"; then
+    policy_verdict="$PD_VERDICT"; policy_reason="$PD_REASON"; authority="$PD_AUTHORITY"
   else
-  # Unreadable prompt text means the classifier had nothing to judge. For
-  # automation that must refuse, not pass: the codebase's own rule everywhere
-  # else (send-to-agent.sh's unreadable-pane path, herdr-resolve.sh's ambiguous
-  # cases) is that not being able to see what you are answering means you do
-  # not answer it.
-  if [ -z "${cmd_text//[[:space:]]/}" ]; then
-    echo "herdr-select: refusing — peer authority cannot classify an unreadable prompt in $pane." >&2
-    exit 8
-  fi
-  # The human-reserved list (lib/command-policy.sh conductor_reserved_reason:
-  # credential values, remote mutation, merge/push to main, governance,
-  # control weakening) used to be checked only for --authority conductor.
-  # classify_command says `allow` for `gh pr merge` and `git push origin
-  # main`, so the LEAST trusted automated authority could press Approve on
-  # exactly what the reviewed conductor is refused (found live 2026-09-12,
-  # thurber-os plan 012 lab). A reservation for the conductor is a
-  # reservation for every automated authority below it; only a human answers.
-  reservation="$(conductor_reserved_reason "$cmd_text")"
-  if [ -n "$reservation" ] || [ "$policy_verdict" != allow ]; then
-    if [ -n "$reservation" ]; then
-      echo "herdr-select: REFUSED (reserved) — $reservation" >&2
-      policy_reason="$reservation"; policy_verdict="reserved"
+    policy_verdict="$PD_VERDICT"; policy_reason="$PD_REASON"
+    if [ -z "${cmd_text//[[:space:]]/}" ]; then
+      echo "herdr-select: refusing — peer authority cannot classify an unreadable prompt in $pane." >&2
+    elif [ "$policy_verdict" = reserved ]; then
+      echo "herdr-select: REFUSED (reserved) — $policy_reason" >&2
     else
       echo "herdr-select: REFUSED ($policy_verdict) — a human must answer this one." >&2
       [ -n "$policy_reason" ] && echo "herdr-select: $policy_reason" >&2
@@ -417,7 +410,6 @@ if [ "$authority" = peer ] && [ "$declining" = 0 ]; then
       "$(jq -nc --arg v "$policy_verdict" --arg r "$policy_reason" --arg p "$pane" \
          '{verdict:$v, reason:$r, pane:$p}')" >/dev/null 2>&1 || true
     exit 8
-  fi
   fi
 fi
 
@@ -474,6 +466,20 @@ if [ "$authority" = conductor ]; then
        '{approval_id:$id,reason:$reason,category:$category,reviewer:$reviewer}')" >/dev/null 2>&1 || {
     echo "herdr-select: cannot persist conductor review — refusing." >&2; exit 2;
   }
+fi
+# Code by reference: a reviewing authority (conductor, or a human answering
+# through this script) approving `bash|python3 <file>` approves THOSE BYTES.
+# Bind it to their sha256 so a peer may re-run the same content without a new
+# review and a changed file escalates again (lib/scoped-policy.sh). Best
+# effort: a failed write only means the next run asks again — the safe side.
+if [ "$declining" = 0 ] && [ -n "$_task" ] && { [ "$authority" = conductor ] || [ "$authority" = human ]; }; then
+  [ "$authority" = human ] && code_ref_inspect "$cmd_text" "$own_worktree" >/dev/null 2>&1
+  if [ -n "${PD_CODE_PATH:-}" ] && [ -n "${PD_CODE_SHA:-}" ]; then
+    file_approval_record "$_task" "$PD_CODE_PATH" "$PD_CODE_SHA" "$authority:${HERDR_PANE_ID:-cli}" >/dev/null 2>&1 &&
+      append_event "$_run" "$_task" file_approved \
+        "$(jq -nc --arg id "$approval_id" --arg p "$PD_CODE_PATH" --arg s "$PD_CODE_SHA" --arg a "$authority" \
+           '{approval_id:$id,path:$p,sha256:$s,authority:$a}')" >/dev/null 2>&1 || true
+  fi
 fi
 approval_attempted "$approval_id" >/dev/null 2>&1 || {
   echo "herdr-select: cannot persist approval attempt — refusing." >&2; exit 2;

@@ -99,7 +99,7 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '4\n'; }
+_registry_schema_version() { printf '5\n'; }
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
@@ -162,6 +162,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- reusing the row spawn-task.sh already writes.
   branch               TEXT NOT NULL DEFAULT '',
   trunk                TEXT NOT NULL DEFAULT '',
+  -- The task's capability manifest (lib/task-manifest.sh), canonical JSON,
+  -- approved ONCE at spawn by the spawning conductor. '' = no manifest: the
+  -- per-task scope layer in lib/scoped-policy.sh then adds nothing and every
+  -- decision is exactly the pre-manifest one. Stored HERE, not read from the
+  -- worker-writable .handoffs/identity.json, so a worker cannot widen its own
+  -- scope by editing a file in its worktree.
+  manifest             TEXT NOT NULL DEFAULT '',
   label                TEXT NOT NULL DEFAULT '',
   state                TEXT NOT NULL,
   created_at           TEXT NOT NULL,
@@ -222,6 +229,21 @@ CREATE TABLE IF NOT EXISTS approvals (
 );
 CREATE INDEX IF NOT EXISTS approvals_by_pane ON approvals(pane_id, decided_at DESC);
 
+-- Code by reference, bound to a hash (lib/scoped-policy.sh). A reviewing
+-- authority (conductor or human) that approved running a script file records
+-- the file's sha256 here; a peer may then re-run THAT content without a new
+-- review, and a different sha256 for the same (task, path) escalates again.
+-- Content that classifies clean on its own is never recorded: it needs no
+-- review, so there is nothing to bind.
+CREATE TABLE IF NOT EXISTS file_approvals (
+  task_id     TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  sha256      TEXT NOT NULL,
+  approved_by TEXT NOT NULL DEFAULT '',
+  approved_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, path, sha256)
+);
+
 INSERT OR IGNORE INTO schema_meta(key, value)
   VALUES ('schema_version', '$(_registry_schema_version)');
 " >/dev/null 2>&1; then
@@ -232,6 +254,7 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   _HERDR_REGISTRY_READY=1
   _migrate_schema_v3
   _migrate_schema_v4
+  _migrate_schema_v5
   _migrate_legacy_files
   return 0
 }
@@ -268,6 +291,18 @@ _migrate_schema_v4() {
     _sql "ALTER TABLE tasks ADD COLUMN trunk  TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
   fi
   _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4');" >/dev/null 2>&1
+}
+
+# ---- schema v4 -> v5: add tasks.manifest (task-scoped approval) -------------
+# Same shape as v3/v4. file_approvals needs no migration: CREATE TABLE IF NOT
+# EXISTS above creates it in an existing database too.
+_migrate_schema_v5() {
+  local has_col
+  has_col=$(_sql "SELECT 1 FROM pragma_table_info('tasks') WHERE name='manifest';" 2>/dev/null)
+  if [ -z "$has_col" ]; then
+    _sql "ALTER TABLE tasks ADD COLUMN manifest TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
+  fi
+  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '5');" >/dev/null 2>&1
 }
 
 # ---- one-time import of the pre-SQLite file layout --------------------------
@@ -360,12 +395,12 @@ gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand
 # names whether it asked for one task or all of them.
 _task_json_select() {
   printf "%s" "SELECT json_object(
-    'schema', 4, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
+    'schema', 5, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
     'conductor_id', conductor_id, 'conductor_pane_id', conductor_pane_id,
     'conductor_pane_birth', conductor_pane_birth, 'pane_id', pane_id,
     'pane_birth', pane_birth, 'agent_session', agent_session, 'repo', repo,
-    'worktree', worktree, 'branch', branch, 'trunk', trunk, 'label', label,
-    'state', state, 'created_at', created_at, 'updated_at', updated_at) FROM tasks"
+    'worktree', worktree, 'branch', branch, 'trunk', trunk, 'manifest', manifest,
+    'label', label, 'state', state, 'created_at', created_at, 'updated_at', updated_at) FROM tasks"
 }
 
 # conductor_pane_birth mirrors pane_birth but for the CONDUCTOR's pane, not
@@ -377,10 +412,14 @@ _task_json_select() {
 # worker's own branch and the repo's trunk it may open a PR against. Empty
 # by default — only a MANAGED spawn-task.sh launch populates them; every
 # existing caller that passes 11 args keeps registering exactly as before.
+# manifest (14th, OPTIONAL) is the canonical capability-manifest JSON from
+# lib/task-manifest.sh; recorded with a `manifest_approved` event naming the
+# spawning conductor and the manifest's sha256 — the one approval decision.
 register_task() {
   local run_id="$1" task_id="$2" worker_id="$3" conductor_id="$4" \
         conductor_pane_id="$5" conductor_pane_birth="$6" pane_id="$7" pane_birth="$8" \
-        repo="$9" worktree="${10}" label="${11}" branch="${12:-}" trunk="${13:-}"
+        repo="$9" worktree="${10}" label="${11}" branch="${12:-}" trunk="${13:-}" \
+        manifest="${14:-}"
   registry_init || return 1
   local at; at="$(_now_iso)"
 
@@ -389,17 +428,44 @@ register_task() {
   # tasks table comment in registry_init.
   if _sql "INSERT INTO tasks
       (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth,
-       pane_id, pane_birth, repo, worktree, branch, trunk, label, state, created_at, updated_at)
+       pane_id, pane_birth, repo, worktree, branch, trunk, manifest, label, state, created_at, updated_at)
       VALUES ($(_sq "$task_id"), $(_sq "$run_id"), $(_sq "$worker_id"), $(_sq "$conductor_id"),
         $(_sq "$conductor_pane_id"), $(_sq "$conductor_pane_birth"), $(_sq "$pane_id"),
         $(_sq "$pane_birth"), $(_sq "$repo"), $(_sq "$worktree"), $(_sq "$branch"), $(_sq "$trunk"),
-        $(_sq "$label"), 'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
+        $(_sq "$manifest"), $(_sq "$label"), 'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
     append_event "$run_id" "$task_id" "registered" \
       "$(jq -nc --arg p "$pane_id" --arg l "$label" '{pane_id:$p, label:$l}')" >/dev/null 2>&1
+    if [ -n "$manifest" ]; then
+      append_event "$run_id" "$task_id" "manifest_approved" \
+        "$(jq -nc --arg c "$conductor_id" --arg cp "$conductor_pane_id" \
+           --arg sha "$(printf '%s' "$manifest" | shasum -a 256 | cut -d' ' -f1)" \
+           --argjson m "$manifest" \
+           '{approved_by:$c, conductor_pane:$cp, manifest_sha256:$sha, manifest:$m}')" >/dev/null 2>&1
+    fi
     return 0
   fi
   printf 'run-registry: failed to register task %s (duplicate task_id, or database unwritable)\n' "$task_id" >&2
   return 1
+}
+
+# ---- code by reference: file approvals bound to a sha256 ---------------------
+# See the file_approvals table comment in registry_init and lib/scoped-policy.sh.
+file_approval_record() {                # <task_id> <abs-path> <sha256> <approved_by>
+  registry_init || return 1
+  [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] || return 1
+  _sql "INSERT OR IGNORE INTO file_approvals(task_id, path, sha256, approved_by, approved_at)
+        VALUES ($(_sq "$1"), $(_sq "$2"), $(_sq "$3"), $(_sq "$4"), $(_sq "$(_now_iso)"));" >/dev/null 2>&1
+}
+
+# -> `approved` (this exact content was reviewed), `changed` (a review exists
+# for this path but for different content), or `none`.
+file_approval_state() {                 # <task_id> <abs-path> <sha256>
+  registry_init || return 1
+  local n
+  n="$(_sql "SELECT count(*) FROM file_approvals WHERE task_id=$(_sq "$1") AND path=$(_sq "$2") AND sha256=$(_sq "$3");" 2>/dev/null)"
+  if [ "${n:-0}" -gt 0 ]; then printf 'approved\n'; return 0; fi
+  n="$(_sql "SELECT count(*) FROM file_approvals WHERE task_id=$(_sq "$1") AND path=$(_sq "$2");" 2>/dev/null)"
+  if [ "${n:-0}" -gt 0 ]; then printf 'changed\n'; else printf 'none\n'; fi
 }
 
 # ---- lifecycle --------------------------------------------------------------
