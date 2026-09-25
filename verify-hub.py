@@ -1763,5 +1763,72 @@ class RepoScope(unittest.TestCase):
         self.assertEqual(hub._events_window_note(self.snap, dict(self.snap, tasks=[]), "x"), "")
 
 
+class EdgeCoalescing(unittest.TestCase):
+    """At most one live edge handler per pane (fix/edge-slot-starvation,
+    2026-09-25). A pane flipping blocked<->working every few seconds under
+    --approval-mode write used to fork a fresh agent-edge.sh per flap, and
+    each one held its slot for the whole grace window even though the
+    prompt it was answering was long gone — 12 slots filled by two such
+    panes, starving every other pane's edge (782 `edge dropped ... 12
+    already in flight` lines in one incident). A new actionable edge for a
+    pane that already has a live handler must supersede it, not queue
+    behind it."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        script = Path(self.tmpdir.name) / "fake-edge.sh"
+        # Long enough to still be alive when the next edge fires, so the
+        # test can prove it was killed rather than left to finish on its own.
+        script.write_text("#!/usr/bin/env bash\nsleep 5\n")
+        script.chmod(0o755)
+        self._orig_agent_edge = hub.AGENT_EDGE
+        self._orig_cap = hub.EDGE_MAX_INFLIGHT
+        hub.AGENT_EDGE = script
+        hub._EDGE_INFLIGHT.clear()
+        hub._EDGE_INFLIGHT_BY_PANE.clear()
+
+    def tearDown(self):
+        hub.AGENT_EDGE = self._orig_agent_edge
+        hub.EDGE_MAX_INFLIGHT = self._orig_cap
+        for p in list(hub._EDGE_INFLIGHT):
+            with contextlib.suppress(Exception):
+                p.terminate()
+                p.wait(timeout=2)
+        hub._EDGE_INFLIGHT.clear()
+        hub._EDGE_INFLIGHT_BY_PANE.clear()
+        self.tmpdir.cleanup()
+
+    def test_second_blocked_edge_for_same_pane_kills_the_first(self):
+        rec = {"agent": "omp", "birth": "b1"}
+        hub._on_agent_edge("wX:pY", None, "blocked", rec)          # first observation
+        first = hub._EDGE_INFLIGHT_BY_PANE.get("wX:pY")
+        self.assertIsNotNone(first, "first edge did not spawn a handler")
+        self.assertIsNone(first.poll(), "handler exited before the test could supersede it")
+
+        hub._on_agent_edge("wX:pY", "working", "blocked", rec)    # a real re-block
+        second = hub._EDGE_INFLIGHT_BY_PANE.get("wX:pY")
+        self.assertIsNotNone(second)
+        self.assertIsNot(second, first, "a new edge for a busy pane must replace, not queue")
+
+        first.wait(timeout=2)
+        self.assertNotEqual(first.returncode, 0,
+                             "the superseded handler ran to completion instead of being killed")
+        self.assertEqual(
+            sum(1 for p in hub._EDGE_INFLIGHT if p.poll() is None), 1,
+            "exactly one live handler for this pane after coalescing")
+        second.terminate()
+        second.wait(timeout=2)
+
+    def test_cap_still_enforced_across_distinct_panes(self):
+        rec = {"agent": "omp", "birth": "b1"}
+        hub.EDGE_MAX_INFLIGHT = 2
+        hub._on_agent_edge("p1", None, "blocked", rec)
+        hub._on_agent_edge("p2", None, "blocked", rec)
+        hub._on_agent_edge("p3", None, "blocked", rec)             # cap hit, distinct pane
+        self.assertNotIn("p3", hub._EDGE_INFLIGHT_BY_PANE,
+                          "a genuinely distinct third pane must still be dropped at the cap")
+        self.assertEqual(len(hub._EDGE_INFLIGHT), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

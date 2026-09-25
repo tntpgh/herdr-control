@@ -1008,6 +1008,25 @@ def edge_is_actionable(before: str | None, after: str | None) -> bool:
 # correct either way (the next transition or a periodic resync re-derives it).
 EDGE_MAX_INFLIGHT = int(os.environ.get("HERDR_EDGE_MAX_INFLIGHT", "12"))
 _EDGE_INFLIGHT: list[subprocess.Popen] = []
+# Per-pane coalescing (2026-09-25, edge-slot-starvation): two panes flipping
+# blocked<->working every few seconds under --approval-mode write filled all
+# 12 slots with handlers for THEMSELVES — each blocked edge forks a fresh
+# agent-edge.sh that holds its slot for the whole grace window (measured
+# 46-83s) even though its own peer-answer call finished in the first second.
+# A pane in mid-flap can rack up a dozen such handlers well before the first
+# one's grace timer expires, starving every OTHER pane's edge (`edge dropped
+# ... 12 already in flight`, 782 times in one incident).
+#
+# At most one live handler per pane fixes this at the source: a new
+# actionable edge for a pane that already has one SUPERSEDES it (SIGTERM,
+# `_edge_supersede`) rather than piling on. This is strictly better than
+# letting the old one run to grace expiry — its prompt is superseded by
+# definition (the pane moved again), so nothing it could still do (probe,
+# backstop-alert) would describe the pane's current state. A live process
+# killed mid-sleep cannot deliver that stale backstop alert; the fresh
+# handler this spawns immediately runs peer-answer against the pane's
+# CURRENT prompt instead.
+_EDGE_INFLIGHT_BY_PANE: dict[str, subprocess.Popen] = {}
 _EDGE_LOCK = threading.Lock()
 
 # Parked /api/blocked/wait requests. One per supervisor is the expected load;
@@ -1022,9 +1041,32 @@ def _edge_slot() -> bool:
     """Reap finished edge children, then take a slot if one is free."""
     with _EDGE_LOCK:
         _EDGE_INFLIGHT[:] = [p for p in _EDGE_INFLIGHT if p.poll() is None]
+        for pane_id, p in list(_EDGE_INFLIGHT_BY_PANE.items()):
+            if p.poll() is not None:
+                del _EDGE_INFLIGHT_BY_PANE[pane_id]
         if len(_EDGE_INFLIGHT) >= EDGE_MAX_INFLIGHT:
             return False
         return True
+
+
+def _edge_supersede(pane_id: str) -> None:
+    """Kill this pane's existing edge handler, if one is still alive.
+
+    Called before every spawn so a flapping pane never holds more than one
+    slot. `terminate()` sends SIGTERM to the handler's own bash process (its
+    `start_new_session=True` makes it a session leader, not a child of this
+    process, but still a direct signal target); the script installs no trap,
+    so bash's default disposition ends it immediately, mid `sleep "$GRACE"` if
+    that is where it is. Freed here, not left to expire on its own timer.
+    """
+    with _EDGE_LOCK:
+        old = _EDGE_INFLIGHT_BY_PANE.pop(pane_id, None)
+        if old is not None and old.poll() is None:
+            try:
+                old.terminate()
+            except OSError:
+                pass
+            _EDGE_INFLIGHT[:] = [p for p in _EDGE_INFLIGHT if p is not old]
 
 
 def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dict) -> None:
@@ -1046,6 +1088,7 @@ def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dic
         return  # a plain shell pane has no prompt to alert and no task to follow
     if not edge_is_actionable(before, after):
         return
+    _edge_supersede(pane_id)
     if not _edge_slot():
         _live_log(f"edge dropped for {pane_id} {before}->{after}: "
                   f"{EDGE_MAX_INFLIGHT} already in flight")
@@ -1060,6 +1103,7 @@ def _on_agent_edge(pane_id: str, before: str | None, after: str | None, rec: dic
         )
         with _EDGE_LOCK:
             _EDGE_INFLIGHT.append(child)
+            _EDGE_INFLIGHT_BY_PANE[pane_id] = child
     except OSError as exc:
         _live_log(f"edge spawn failed for {pane_id}: {exc}")
 
