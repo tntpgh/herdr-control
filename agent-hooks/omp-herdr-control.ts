@@ -204,9 +204,10 @@ function rawBashCommand(toolName: string, input: unknown): string | undefined {
 // script runs only when there IS something to alert about, so the common tool
 // call costs zero RPCs.
 //
-// It also drops this file out of omp's fail-closed dispatch: `tool_call`
-// handler errors block the tool, approval/execution events are observability
-// and do not. The defensive style stays anyway.
+// The alert itself never runs from `tool_call`. The only `tool_call` handler
+// (onToolCall, below) is an in-memory Map write that remembers bash input
+// for the approval event, spawns nothing, and cannot throw — `tool_call` is
+// omp's fail-closed dispatch, where a handler error blocks the tool.
 function notifyForPrompt(toolName: string, message: string, command?: string): void {
   if (!notifyAvailable) return;
   const payload: Record<string, unknown> = { tool: toolName, message, cwd: process.cwd() };
@@ -214,11 +215,50 @@ function notifyForPrompt(toolName: string, message: string, command?: string): v
   spawnDetached([NOTIFY_SH], JSON.stringify(payload));
 }
 
+// omp (verified against the v18.3.0 binary, 2026-09-24) emits
+// `tool_approval_requested` with ONLY {sessionId, toolName, toolCallId,
+// reason?, approvalMode} — no `input`, no `args`. So `e.input ?? e.args` was
+// always undefined: every alert read "omp needs your permission to use bash"
+// and the untruncated-command channel (#3b item 2) recorded `command: ""` on
+// every input_required event (measured: all of plan:geo-audit's, 2026-09-24),
+// which left herdr-select.sh judging the scraped panel and the ownership
+// grant unable to ever match. The arguments DO arrive earlier, on `tool_call`
+// ({toolName, toolCallId, input}), which omp emits for every call before it
+// decides whether approval is needed. Cache bash/shell inputs by toolCallId
+// there and look them up here. Bounded (oldest evicted) so a long session
+// never grows it; bash/shell only, the one tool whose argument this carries.
+//
+// Registering on `tool_call` puts this file back in omp's fail-closed
+// dispatch (a THROWING tool_call handler blocks the tool), so the handler is
+// a try/catch around a Map write and always returns undefined — it never
+// blocks and never rewrites input.
+const INPUT_CACHE_MAX = 32;
+const inputByCallId = new Map<string, unknown>();
+
+function onToolCall(event: unknown): undefined {
+  try {
+    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    const name = typeof e.toolName === "string" ? e.toolName.toLowerCase() : "";
+    if ((name !== "bash" && name !== "shell") || typeof e.toolCallId !== "string") return undefined;
+    inputByCallId.set(e.toolCallId, e.input);
+    while (inputByCallId.size > INPUT_CACHE_MAX) {
+      const oldest = inputByCallId.keys().next().value;
+      if (oldest === undefined) break;
+      inputByCallId.delete(oldest);
+    }
+  } catch {
+    // MUST NOT throw — a throwing tool_call handler blocks the tool.
+  }
+  return undefined;
+}
+
 function onApprovalRequested(event: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     const toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
-    const input = e.input ?? e.args;
+    const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
+    const input = e.input ?? e.args ?? (callId !== undefined ? inputByCallId.get(callId) : undefined);
+    if (callId !== undefined) inputByCallId.delete(callId);
     // `reason` is the approval's own words when omp supplies one; the argument
     // summary is the fallback, and still the more useful line for bash.
     const detail = describeToolCall(toolName, input)
@@ -777,6 +817,7 @@ function onSessionStop(): { continue: true; additionalContext: string } | undefi
 }
 
 export default function (pi: HookAPI): void {
+  pi.on("tool_call", onToolCall);
   pi.on("tool_approval_requested", onApprovalRequested);
   pi.on("tool_approval_resolved", onApprovalResolved);
   pi.on("tool_execution_start", onExecutionStart);

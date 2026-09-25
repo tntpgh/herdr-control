@@ -53,18 +53,28 @@ full_cmd="$(printf '%s' "$input" | jq -r '.command // ""' 2>/dev/null || printf 
 pane="${HERDR_PANE_ID:-}"
 [ -n "$pane" ] || exit 0
 
-# Is a prompt actually on screen? Checks BOTH shapes rather than assuming omp's:
-# lib/prompt-parse.sh already knows the menu shape (highlight detected via its
-# ANSI background-colour escape) and the numbered shape, and a caller here has
-# no business caring which one a given omp build renders.
+# Is a prompt actually on screen? For an `ask` question, either shape counts:
+# prompt_any_visible answers the menu shape and the numbered shape from ONE
+# `herdr pane read` (two separate predicates cost 20 CLI spawns and 10 python3
+# spawns per tool call per worker, ~1.86s of CPU, measured 2026-09-14).
 #
-# prompt_any_visible answers both from ONE `herdr pane read`. Calling the two
-# predicates separately cost two reads per attempt — 20 CLI spawns and 10
-# python3 spawns per tool call per worker (~1.86s of CPU, measured 2026-09-14),
-# every one of them an RPC into the single-threaded herdr server. With ~8 live
-# workers that is what made herdr's own UI feel laggy, for the answer "nothing
-# is asking" on the overwhelming majority of tool calls.
-_prompt_is_up() { prompt_any_visible "$pane" 2>/dev/null; }
+# For an APPROVAL event only the approval panel counts: prompt_menu_visible,
+# which needs the `Allow tool:` header, an Approve row AND the navigation
+# footer at the bottom of the pane — still one read. Accepting the numbered
+# shape here is how a peer signal fired on 2026-09-24 while a worker was
+# streaming a Write panel with no menu up: the file body being previewed was a
+# numbered markdown list, `N. text` in the last 20 rows matched the numbered
+# extractor, and the alert gate then classified that screen text as if it were
+# a command. omp approval prompts are never numbered (lib/agent-profiles.sh
+# declares omp `menu-prompt` only), so for them a numbered match is always
+# transcript, never a question. An unrecognized approval menu (Approve /
+# Always allow / Deny) still counts: the parser marks it visible, just not
+# complete, and the gate hands it to a person.
+if [ "$tool" = ask ]; then
+  _prompt_is_up() { prompt_any_visible "$pane" 2>/dev/null; }
+else
+  _prompt_is_up() { prompt_menu_visible "$pane" 2>/dev/null; }
+fi
 
 # tool_call fires BEFORE omp paints the approval menu, so a single check would
 # usually miss it. Poll briefly. Each attempt costs one `herdr pane read`; the
@@ -112,7 +122,7 @@ if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
   # seconds, and paging for it is what turned an afternoon of ordinary worker
   # activity into a Slack flood on 2026-09-12. Held, never dropped — if the
   # prompt outlives the grace window the alert is sent after all.
-  if human_must_answer "$pane"; then
+  if human_must_answer "$pane" "$full_cmd"; then
     bash "$notify" --choices --pane "$pane" "$msg" >/dev/null 2>&1 || true
   else
     grace_realert "$pane" "$(prompt_id "$pane" 2>/dev/null || printf '')" \
