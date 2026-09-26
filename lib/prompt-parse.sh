@@ -447,13 +447,38 @@ composer_looks_actively_typed() {
 # and 60 in three others is the same bug wearing a different line number.
 _PANE_WINDOW_LINES=1000
 
+# tmux truncates a captured line at the pane's column width, and that cut can
+# land INSIDE a multibyte UTF-8 character — the box edge of a wrapped commit
+# message with an em-dash near the wrap column, for instance. The orphaned
+# lead byte(s) are not valid UTF-8, and every awk/sed downstream in this file
+# runs in a UTF-8 locale so it can match real glyphs (box-drawing, arrows,
+# the private-use status glyph) by character. Confirmed live: a truncated
+# em-dash (bytes e2 80 with no third byte) makes BSD sed exit 2 "stream did
+# not contain valid UTF-8", which empties a `$(...)` pipeline the caller
+# never checks the exit code of — the parse goes quietly wrong instead of
+# loudly crashing. `iconv -c` DROPS invalid bytes and passes valid multibyte
+# characters through unchanged, so this is the one place to fix it: every
+# consumer below stays UTF-8-aware, and a torn character is gone rather than
+# poisoning the whole scrape. `2>/dev/null` matches the `herdr pane read`
+# call it wraps — an unreadable pane already returns empty, not an error.
+_sanitize_utf8() { iconv -c -f UTF-8 -t UTF-8 2>/dev/null; }
+
+# Unsanitized: the same window `_menu_window`/`_pane_visible` read, before
+# `_sanitize_utf8` drops anything. Exists so `prompt_command_torn` below can
+# check the RAW bytes for validity without re-deriving the `herdr pane read`
+# invocation a second, differently-spelled way.
+_pane_read_raw() {                      # <pane> [herdr-pane-read-extra-args...]
+  local pane="$1"; shift
+  herdr pane read "$pane" --source visible --lines "$_PANE_WINDOW_LINES" "$@" 2>/dev/null
+}
+
 _menu_window() {
-  herdr pane read "$1" --source visible --lines "$_PANE_WINDOW_LINES" --format ansi 2>/dev/null
+  _pane_read_raw "$1" --format ansi | _sanitize_utf8
 }
 
 # The same window, without ANSI — for the scrapes that work on plain text.
 _pane_visible() {
-  herdr pane read "$1" --source visible --lines "$_PANE_WINDOW_LINES" 2>/dev/null
+  _pane_read_raw "$1" | _sanitize_utf8
 }
 
 # A NECESSARY condition for either pass below, decided in the shell with no
@@ -899,6 +924,72 @@ prompt_question() {
 # Never reuse prompt_context's display trimming (8 lines, 200 columns).
 # Selection separately refuses explicit elision markers. This is still only
 # a visible-text guard, not proof about an indirect script or a sandbox.
+# Does the RAW capture behind prompt_command_text below contain a byte that
+# is not valid UTF-8, BEFORE _sanitize_utf8 drops it, WITHIN the text that
+# actually gets classified?
+#
+# PR #147 hold (Main's live probe table, 2026-09-25): _sanitize_utf8's
+# `iconv -c` is right for MENU PARSING — a torn byte must never crash the
+# parser, which is what stranded a pane before that fix — but it is never
+# safe for the text a peer-authority decision is CLASSIFIED against.
+# Dropping the byte classifies whatever SURVIVES, and the live probe table
+# showed that turns escalate/deny into allow: a recursive delete of a local
+# dir plus one torn byte at the row end, and a curl download plus one torn
+# byte, both went from escalate to allow; `x` plus a torn byte plus a
+# recursive delete of `/` went from deny to allow. Reading LESS of a
+# dangerous command is not the same as reading NONE of it — a classifier
+# that only ever sees the surviving bytes can be steered toward its
+# blindest verdict by whichever byte gets torn off. herdr-select.sh consults
+# this and forces escalate whenever it is true, never trusting an allow
+# computed on a possibly-redacted capture.
+#
+# Reads the pane a second time rather than threading a flag out of
+# prompt_command_text: that function's result crosses a `$(...)` command
+# substitution at every call site, so a variable it set would not survive
+# back to the caller. This runs once per actual answer decision (not in any
+# hot poll loop), so the extra read costs nothing that matters here.
+#
+# UNREADABLE COUNTS AS TORN (independent review of PR #147, finding
+# torn-gate-unreadable-fail-open): an empty second read used to return
+# "clean", so a transient `herdr pane read` failure on THIS call silently
+# stood on the allow verdict computed by prompt_command_text's own read
+# moments earlier — the exact fail-open this function exists to close, one
+# read later. herdr-select.sh already refuses empty cmd_text for every
+# non-human authority, so returning torn here costs no real liveness.
+#
+# SCOPED TO WHAT WAS ACTUALLY CLASSIFIED (independent review, finding
+# torn-gate-scope-liveness): prompt_command_text's omp-menu branch classifies
+# only the panel's own header/detail rows, never the whole 1000-line window —
+# but the first cut of this function validated the WHOLE window regardless of
+# shape, so a torn byte anywhere in old transcript scrollback escalated every
+# peer approval on that pane while that unrelated row stayed on screen. Fixed
+# by parsing the SAME rows prompt_command_text would, twice — once from the
+# raw bytes (python's own `decode(..., "replace")` degrades a torn byte to
+# U+FFFD rather than crashing, so this is safe) and once from the
+# `_sanitize_utf8`-cleaned bytes — and comparing: identical output means
+# nothing inside the classified rows was torn, even if the wider window was.
+# A torn byte outside the panel changes neither reading. The NUMBERED shape
+# (Claude/Codex) has no such row boundary — prompt_command_text classifies
+# its whole window — so that branch keeps whole-window validation.
+prompt_command_torn() {                 # <pane> -> 0 torn(-or-unreadable) / 1 proven clean
+  local raw_menu clean_q raw_q raw_win
+  raw_menu="$(_pane_read_raw "$1" --format ansi)"
+  if [ -n "$raw_menu" ]; then
+    clean_q="$(printf '%s' "$raw_menu" | _sanitize_utf8 | _prompt_menu_parse question 2>/dev/null)"
+    if [ -n "$clean_q" ]; then
+      raw_q="$(printf '%s' "$raw_menu" | _prompt_menu_parse question 2>/dev/null)"
+      [ "$raw_q" = "$clean_q" ] && return 1 || return 0
+    fi
+    # No complete menu panel either way: prompt_command_text falls through
+    # to the whole-window numbered/plain path below, so validate THAT.
+  fi
+  raw_win="$(_pane_read_raw "$1")"
+  [ -n "$raw_win" ] || return 0
+  printf '%s' "$raw_win" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && return 1
+  return 0
+}
+
+
 prompt_command_text() {
   local menu win
   menu="$(prompt_menu_question "$1" 2>/dev/null)" || menu=""

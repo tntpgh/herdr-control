@@ -295,6 +295,16 @@ fi
 # verdict is a gate.
 cmd_text="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
 
+# PR #147 hold: a scraped capture containing invalid UTF-8 must never be
+# auto-approved on the strength of whatever _sanitize_utf8 (lib/prompt-parse.sh)
+# let survive — see prompt_command_torn's own comment for the live probe
+# table and the independent-review fixes (unreadable now counts as torn;
+# the menu shape is checked against only the rows it actually classifies).
+# Recorded before the registry substitution below: registry text never came
+# from a scrape and is never torn by construction, so it is exempt.
+cmd_torn=0; cmd_text_is_scrape=1
+prompt_command_torn "$pane" 2>/dev/null && cmd_torn=1
+
 # One task lookup, reused here AND by the approval-record / task-state-clear
 # code further down (previously a second, separate task_for_pane call).
 own_task_json="$(task_for_pane "$pane" 2>/dev/null)"
@@ -327,7 +337,7 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
     _panel_collapsed="$(_collapse_ws "$cmd_text")"
     _registry_collapsed="$(_collapse_ws "$registry_cmd")"
     case "$_panel_collapsed" in
-      *"$_registry_collapsed"*) cmd_text="$registry_cmd" ;;
+      *"$_registry_collapsed"*) cmd_text="$registry_cmd"; cmd_text_is_scrape=0 ;;
       *)
         if [ -n "${cmd_text//[[:space:]]/}" ]; then
           echo "herdr-select: the recorded command for this prompt does not match what is on screen in $pane — refusing." >&2
@@ -340,6 +350,10 @@ fi
 
 policy_verdict="$(classify_command "$cmd_text")"
 policy_reason="$(classify_reason)"
+if [ "$cmd_text_is_scrape" = 1 ] && [ "$cmd_torn" = 1 ] && [ "$policy_verdict" != deny ]; then
+  policy_verdict=escalate
+  policy_reason="the captured command text contained invalid UTF-8 — refusing to trust a verdict computed on a possibly-redacted capture, a human must review"
+fi
 
 # Refusing a known Deny choice executes no requested action. Conversely, an
 # approval whose arguments the TUI elided is not a complete review surface.
@@ -358,6 +372,21 @@ if [ "$authority" != human ] && [ "$declining" = 0 ] && [ "$mechanism" = menu ];
 fi
 
 if [ "$authority" = conductor ] && [ "$declining" = 0 ]; then
+  # A torn capture is refused even for the reviewed conductor — independent
+  # review of PR #147 (torn-gate-conductor-bypass): the conductor's own gate
+  # below only refuses `deny`/empty/reserved text, evaluated on the CLEANED
+  # capture, and herdr-gates.sh shows the conductor that same cleaned text
+  # with no sign anything was torn. Main's probe row 3 (`x`+torn+`rm -rf /`)
+  # classifies deny on the byte-for-byte capture but allow once the torn
+  # byte is dropped — silently handing a registered conductor exactly the
+  # command the peer path now refuses.
+  if [ "$cmd_text_is_scrape" = 1 ] && [ "$cmd_torn" = 1 ]; then
+    echo "herdr-select: conductor cannot approve a capture containing invalid UTF-8 — a human must review it." >&2
+    append_event "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "approval_escalated" \
+      "$(jq -nc --arg v "escalate" --arg r "torn capture" --arg p "$pane" \
+         '{verdict:$v, reason:$r, pane:$p}')" >/dev/null 2>&1 || true
+    exit 8
+  fi
   if [ -z "${cmd_text//[[:space:]]/}" ] || [ "$policy_verdict" = deny ]; then
     echo "herdr-select: conductor cannot approve unreadable or deny-class actions." >&2
     exit 8

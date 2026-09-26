@@ -268,6 +268,123 @@ case "$(prompt_options fake:pane | tr '\n' ' ')" in
   *X*Y*) ok "with two lists on screen, only the newest is offered" ;;
   *) no "two lists" "offered [$(prompt_options fake:pane | tr '\n' '|')]" ;;
 esac
+unset -f _prompt_window; . "$HERE/lib/prompt-parse.sh"   # restore the real _prompt_window/_pane_visible
+
+echo
+echo "== a pane line truncated mid multibyte character must not crash the parser =="
+# tmux captures a pane at its column width, and that cut can land inside a
+# multibyte UTF-8 character (e.g. an em-dash, U+2014, e2 80 94 — the wrap
+# lops off the trailing byte). Confirmed live: BSD sed under a UTF-8 locale
+# exits 2 "stream did not contain valid UTF-8" on exactly that input, which
+# used to empty prompt_options/prompt_command_text's `$(...)` pipeline
+# silently rather than crash loudly — either way the prompt went unanswerable.
+# This drives the REAL `_pane_visible`/`_menu_window` (the `_prompt_window`
+# override above is gone now), so it exercises the actual `herdr pane read`
+# boundary where the fix (iconv -c) lives.
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      printf '1. Yes \342\200X\n2. No\n'
+      ;;
+  esac
+}
+_broken_opts="$(prompt_options fake:pane)"; _broken_rc=$?
+[ "$_broken_rc" -eq 0 ] \
+  && ok "truncated multibyte line does not abort the parser (rc=$_broken_rc)" \
+  || no "truncated multibyte" "parser exited $_broken_rc instead of continuing"
+case "$_broken_opts" in
+  *"1"*"Yes"*"2"*"No"*) ok "options either side of the torn character still parse" ;;
+  *) no "truncated multibyte options" "got [$_broken_opts]" ;;
+esac
+# A VALID em-dash (all three bytes intact) is unaffected by the same fix.
+herdr() {
+  case "$1 $2" in
+    "pane read") printf '1. Yes \342\200\224 and remember\n2. No\n' ;;
+  esac
+}
+case "$(prompt_options fake:pane)" in
+  *$'\342\200\224'*) ok "an intact em-dash still renders as a real character" ;;
+  *) no "intact em-dash" "got [$(prompt_options fake:pane)]" ;;
+esac
+unset -f herdr
+
+echo
+echo "== prompt_command_torn: detects invalid UTF-8 in the RAW capture (PR #147 hold) =="
+# _sanitize_utf8 (iconv -c) drops an invalid byte before menu/numbered parsing
+# ever sees it, which is right for PARSING but wrong for CLASSIFICATION: see
+# lib/prompt-parse.sh's prompt_command_torn comment for the live probe table
+# that made dropping alone dangerous (an escalate/deny verdict became allow).
+# herdr-select.sh consults this to force escalate on a torn capture.
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      # a numbered-shape screen (no "Allow tool:" header), with a torn byte
+      # sitting in the middle of the command text — the shape prompt_command_text
+      # falls back to when no omp menu panel is present.
+      printf 'Bash command\n  curl https://example.com/x \342\200 -o /tmp/p.json\n\n1. Yes\n2. No\n'
+      ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 0 ] && ok "a torn byte in the raw capture is detected" \
+  || no "torn detection" "prompt_command_torn did not report torn"
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      printf 'Bash command\n  curl https://example.com/x -o /tmp/p.json\n\n1. Yes\n2. No\n'
+      ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 1 ] && ok "a clean capture is not flagged torn" \
+  || no "clean detection" "prompt_command_torn wrongly reported torn on clean text"
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      printf 'Allow tool: bash\nCommand: curl https://example.com/x \342\200 -o /tmp/p.json\n\n\x1b[48;2;42;47;65m Approve\x1b[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n'
+      ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 0 ] && ok "menu-shape (omp) torn byte in a classified panel row is detected" \
+  || no "menu-shape torn" "prompt_command_torn did not report torn on a torn omp panel row"
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      printf 'Allow tool: bash\nCommand: curl https://example.com/x -o /tmp/p.json\n\n\x1b[48;2;42;47;65m Approve\x1b[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n'
+      ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 1 ] && ok "menu-shape (omp) clean capture is not flagged torn" \
+  || no "menu-shape clean" "prompt_command_torn wrongly reported torn on a clean omp panel"
+# F3 (independent review, torn-gate-scope-liveness): a torn byte OUTSIDE the
+# classified panel rows (old transcript above the panel) must not flag every
+# future approval on this pane torn — prompt_command_text never reads that
+# transcript either.
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      printf 'earlier output \342\200 with a torn byte, never classified\nAllow tool: bash\nCommand: curl https://example.com/x -o /tmp/p.json\n\n\x1b[48;2;42;47;65m Approve\x1b[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n'
+      ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 1 ] && ok "a torn byte outside the classified panel rows is not flagged (F3 scope)" \
+  || no "F3 scope" "a torn byte in unrelated transcript wrongly escalated every future approval"
+# F2 (independent review, torn-gate-unreadable-fail-open): an unreadable
+# capture must count as torn, never clean -- an empty read here used to
+# return "clean", silently trusting whatever verdict was computed moments
+# earlier on a DIFFERENT (successful) read.
+herdr() {
+  case "$1 $2" in
+    "pane read") printf '' ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 0 ] && ok "an unreadable capture counts as torn, not clean (F2)" \
+  || no "F2 empty read" "prompt_command_torn reported an unreadable pane as clean"
+unset -f herdr
 unset -f _prompt_window
 
 echo
