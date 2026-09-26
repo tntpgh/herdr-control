@@ -369,7 +369,7 @@ lc_pending "$A1" "$A2"
 mkdir -p "$LC/.pending.lock"
 ( sleep 1; rmdir "$LC/.pending.lock" ) &        # a sweep holding it, then done
 HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS="$T1" \
-  PENDING_LOCK_WAIT_S=5 bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer \
+  PENDING_LOCK_WAIT_S=5 bash "$here/herdr-select.sh" "$WPANE" 1 --authority human \
   >/dev/null 2>&1
 wait
 [ "$(lc_ts)" = "$T2 " ] \
@@ -431,7 +431,7 @@ HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-select.sh" "$WPANE" 1 --authority pee
 # retracting it would delete the operator's own decision. Untrack THAT alert —
 # and only that one, because a pane can have several queued.
 HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS="$T1" \
-  bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer >/dev/null 2>&1
+  bash "$here/herdr-select.sh" "$WPANE" 1 --authority human >/dev/null 2>&1
 [ "$(lc_ts)" = "$T2 " ] \
   && ok "a Slack answer untracks only the alert that carried it" \
   || bad "wrong alerts untracked: $(lc_ts)"
@@ -738,13 +738,14 @@ const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
 console.log("EVENTS:" + Object.keys(handlers).sort().join(","));
-// The notification path is the APPROVAL event, not tool_call. tool_call fires
-// before every tool call, so it only remembers bash input (a Map write) —
-// because omp v18.3.0 sends tool_approval_requested WITHOUT the arguments:
-// {sessionId, toolName, toolCallId, reason?, approvalMode}. The shape below
-// is the real one, so the untruncated command must come from the cache.
+// Approval notifications stay on approval events. tool_call is registered for
+// two bounded pre-work duties: cache bash input for omp v18.3 approval events
+// that omit input, and run the pre-tool fleet guard. Ordinary/non-delegating
+// calls must pass undefined.
 const tc = handlers["tool_call"]({ toolName: "bash", toolCallId: "call-1", input: { command: "git push --force" } });
 console.log("TOOLCALL_RETURN:" + (tc === undefined ? "undefined" : JSON.stringify(tc)));
+const tcRead = handlers["tool_call"]({ toolName: "read", input: { path: "/x" } });
+console.log("TOOL_CALL_RETURN:" + (tcRead === undefined ? "undefined" : JSON.stringify(tcRead)));
 const tcBad = handlers["tool_call"](null);
 console.log("TOOLCALL_NULL_RETURN:" + (tcBad === undefined ? "undefined" : JSON.stringify(tcBad)));
 const ar = handlers["tool_approval_requested"]({ toolName: "bash", toolCallId: "call-1", reason: "destructive", approvalMode: "write" });
@@ -759,12 +760,11 @@ await new Promise(r => setTimeout(r, 600));
 ' 2>&1)"
   printf '%s' "$shim_out" \
     | grep -q 'EVENTS:agent_end,before_agent_start,session_stop,tool_approval_requested,tool_approval_resolved,tool_call,tool_execution_end,tool_execution_start,tool_result' \
-    && ok "every event is registered (incl. session_stop for conductor exit, tool_call for the input cache)" || bad "events: $shim_out"
-  # Every handler must return undefined on every path. tool_call is omp's
-  # fail-closed dispatch (a throw or a {block} return stops the agent's tool),
-  # so its handler is held to it hardest: garbage in, undefined out.
-  printf '%s' "$shim_out" | grep -q 'TOOLCALL_RETURN:undefined' && printf '%s' "$shim_out" | grep -q 'TOOLCALL_NULL_RETURN:undefined' \
-    && ok "the tool_call handler returns undefined, even on garbage (never blocks a tool)" || bad "tool_call handler returned non-undefined: $shim_out"
+    && ok "every event is registered, including tool_call cache and pre-tool guard" || bad "events: $shim_out"
+  printf '%s' "$shim_out" | grep -q 'TOOLCALL_RETURN:undefined' && printf '%s' "$shim_out" | grep -q 'TOOL_CALL_RETURN:undefined' && printf '%s' "$shim_out" | grep -q 'TOOLCALL_NULL_RETURN:undefined' \
+    && ok "tool_call caches bash input and passes ordinary/garbage inputs" || bad "tool_call handler returned non-undefined unexpectedly: $shim_out"
+  # Observability handlers return undefined; the pre-tool handler returns
+  # undefined for ordinary calls and a block object only for refused delegation.
   printf '%s' "$shim_out" | grep -q 'APPROVAL_RETURN:undefined' \
     && ok "the approval handler returns undefined (never blocks the agent)" || bad "approval handler returned non-undefined"
   jq -e '.command == "git push --force"' "$REC.notify" >/dev/null 2>&1 \

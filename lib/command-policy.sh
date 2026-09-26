@@ -1745,14 +1745,80 @@ _cp_net_sends() {                       # text -> 0 (true) if a send/upload flag
   _cp_match "$_CP_NET_SEND_SHORT_RE" "$1" || _cp_imatch "$_CP_NET_SEND_LONG_RE" "$1"
 }
 
+_cp_non_shell_panel_tool() {
+  case "$1" in
+    "Allow tool: "*) ;;
+    *) return 1 ;;
+  esac
+  local tool
+  tool="${1#Allow tool: }"
+  tool="${tool%%[ ;:	]*}"
+  tool="$(printf '%s' "$tool" | tr '[:upper:]' '[:lower:]')"
+  case "$tool" in bash|shell|sh|zsh) return 1 ;; esac
+  printf '%s' "$tool"
+}
+
+_cp_safe_non_shell_panel() {
+  local tool
+  tool="$(_cp_non_shell_panel_tool "$1" 2>/dev/null)" || return 1
+  case "$tool" in
+    read|grep|glob|web_search) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A script runner's quoted arguments are data to its script, not command
+# position. Do not let a prose/data argument such as
+# `bash probe.sh 'git push origin feat/x'` reserve the outer approval. Inline
+# evaluators stay unmasked; their quoted argument is code, not data.
+_cp_mask_script_data() {
+  local raw="$1"
+  case "$raw" in
+    "Allow tool: bash"*Command:\ *) raw="${raw#*Command: }" ;;
+    "Allow tool: shell"*Command:\ *) raw="${raw#*Command: }" ;;
+  esac
+  case "$raw" in
+    *" -c "*|*" -e "*|*" --command "*|*" --eval "*) printf '%s' "$raw"; return ;;
+    bash\ *|sh\ *|zsh\ *|python\ *|python3\ *|node\ *|ruby\ *|perl\ *) ;;
+    *) printf '%s' "$raw"; return ;;
+  esac
+  printf '%s' "$raw" | awk '
+    BEGIN { q = "" }
+    {
+      out = ""
+      for (i = 1; i <= length($0); i++) {
+        c = substr($0, i, 1)
+        if (q == "") {
+          if (c == "'"'"'" || c == "\"") q = c
+          out = out c
+        } else if (c == q) {
+          q = ""
+          out = out c
+        } else {
+          out = out " "
+        }
+      }
+      print out
+    }'
+}
+
 classify_command() {
   if [ "$#" -lt 1 ]; then
     printf 'command-policy: classify_command requires a <command> argument\n' >&2
     return 2
   fi
   local raw="$1" norm
+  if [ -n "$(_cp_non_shell_panel_tool "$raw" 2>/dev/null)" ]; then
+    if _cp_safe_non_shell_panel "$raw"; then
+      : > "$(_cp_reason_file)"
+      printf 'allow\n'
+      return 0
+    fi
+    printf 'unknown or executing tool approval remains human-only\n' > "$(_cp_reason_file)"
+    printf 'escalate\n'
+    return 0
+  fi
   norm="$(scannable_command "$raw")"
-  # Decided ONCE, from the raw text, and consulted by every split below. See
   # _cp_quoting_is_simple: when the quoting is not boring we do not split at
   # all, which merges text toward the dangerous command instead of away from it.
   local _cp_split=1
@@ -2191,6 +2257,20 @@ EOF
   # `wrangler deploy --env production`, `ssh prod`, `psql -h live.…` — and the
   # infrastructure-verb rule below is untouched and independent.
   #
+  # Four false positives from the live approver-hardening run are pinned by
+  # verify-command-policy.sh: a repo-local verifier named `verify-herdr-live.sh`
+  # is not itself a production target just because "live" is in its filename.
+  # Neutralize that exact token only when it is the local script being invoked,
+  # not when it is a remote target (`ssh verify-herdr-live.sh`,
+  # `psql -h verify-herdr-live.sh`, ...). Any real target argument beside it
+  # (`--context live`, `ssh live`, `live.db.internal`, ...) remains in the
+  # string and still escalates.
+  local _cp_prod_norm
+  _cp_prod_norm="$norm"
+  case "$norm" in
+    verify-herdr-live.sh*|./verify-herdr-live.sh*|bash\ verify-herdr-live.sh*|bash\ ./verify-herdr-live.sh*|sh\ verify-herdr-live.sh*|sh\ ./verify-herdr-live.sh*)
+      _cp_prod_norm="$(printf '%s' "$norm" | sed -E 's#^((bash|sh)[[:space:]]+(\./)?verify-herdr-live\.sh|(\./)?verify-herdr-live\.sh)([[:space:]]|$)# #')" ;;
+  esac
   # Three gaps the security review found in the first cut of this, all closed
   # here and all of them real infrastructure commands:
   #   * `--project` and `--subscription` were missing, so `gcloud --project
@@ -2203,7 +2283,7 @@ EOF
   #     `--project live-site` slipped. Values may now be suffixed.
   #   * `\b` cannot match between `_` and `E`, so `VERCEL_ENV=production` and
   #     `MY_ENV=production` were missed. Any `*_ENV=` counts now.
-  _cp_imatch '(--(context|env|environment|profile|namespace|target|app|stage|remote|host|project|subscription|account|cluster|instance|database|db|region|org|space|site)([[:space:]]+|=)[^[:space:]]*(prod|production|live)|(^|[[:space:]])-[aeEpnc][[:space:]]+[^[:space:]]*(prod|production|live)[^[:space:]]*([[:space:]]|$)|(^|[[:space:]])[A-Za-z_]*(ENV|STAGE)=(prod|production|live)[^[:space:]]*([[:space:]]|$)|\b(ssh|scp|rsync|psql|mysql|redis-cli|mongosh|wrangler|vercel|netlify|fly|flyctl|heroku|gcloud|az|aws|doctl|eksctl|kubectl|helm|gh)\b[^;&|]*\b(prod|production|live)[a-z0-9-]*\b|\b(prod|production|live)[a-z0-9-]*\.[a-z0-9][a-z0-9.-]*\b)' "$norm" &&
+  _cp_imatch '(--(context|env|environment|profile|namespace|target|app|stage|remote|host|project|subscription|account|cluster|instance|database|db|region|org|space|site)([[:space:]]+|=)[^[:space:]]*(prod|production|live)|(^|[[:space:]])-[aeEpnc][[:space:]]+[^[:space:]]*(prod|production|live)[^[:space:]]*([[:space:]]|$)|(^|[[:space:]])[A-Za-z_]*(ENV|STAGE)=(prod|production|live)[^[:space:]]*([[:space:]]|$)|\b(ssh|scp|rsync|psql|mysql|redis-cli|mongosh|wrangler|vercel|netlify|fly|flyctl|heroku|gcloud|az|aws|doctl|eksctl|kubectl|helm|gh)\b[^;&|]*\b(prod|production|live)[a-z0-9-]*\b|\b(prod|production|live)[a-z0-9-]*\.[a-z0-9][a-z0-9.-]*\b)' "$_cp_prod_norm" &&
     _cp_consider 1 "names a production target"
   _cp_imatch '\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(delete|drain|scale)\b|\bhelm[[:space:]]+(delete|uninstall)\b|\bflyctl?[[:space:]]+(deploy|destroy)\b' "$norm" &&
     _cp_consider 1 "infrastructure scope change"
@@ -2436,8 +2516,10 @@ _cp_push_is_safe() {                    # norm -> 0 (true) only for git push [-u
 # access is reserved by that caller instead (_CP_PY_ENV_RE). Everything
 # else on this list applies to python content unchanged.
 conductor_reserved_reason() {
-  local norm mode="${2:-shell}"
-  norm="$(scannable_command "$1")"
+  local raw="$1" mode="${2:-shell}" norm action_norm fleet_norm
+  norm="$(scannable_command "$raw")"
+  action_norm="$(scannable_command "$(_cp_mask_script_data "$raw")")"
+  fleet_norm="$(printf '%s' "$norm" | sed -E 's/\$\{IFS[^}]*\}/ /g; s/\$IFS\b/ /g; s/\$\{[A-Za-z_][A-Za-z0-9_]*[^}]*\}//g; s/\$[A-Za-z_][A-Za-z0-9_]*\b//g')"
   _cp_best_v=0; _cp_best_r=""
   _cp_apply_operator_rules "$norm"
   if [ "$_cp_best_v" -gt 0 ]; then printf '%s\n' "$_cp_best_r"; return; fi
@@ -2471,10 +2553,12 @@ conductor_reserved_reason() {
   # --json — were allow AND unreserved: no second layer at all behind the one
   # classify_command rule. Review called that out (F8) and it is the right
   # call: the two lists are derived from the same reasoning and must not drift.
-  elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$norm" ||
-       _cp_imatch '\bcurl\b.*'"$_CP_NET_SEND_LONG_RE" "$norm" ||
-       _cp_match '\b[Cc][Uu][Rr][Ll]\b.*'"$_CP_NET_SEND_SHORT_RE" "$norm"; then
+  elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$action_norm" ||
+       { _cp_imatch '\bcurl\b' "$action_norm" && _cp_net_sends "$action_norm"; }; then
     printf 'remote mutation remains human-only\n'
+  elif _cp_imatch '\bherdr\b.*\b(tab|pane)\b.*\b(create|run)\b|\bspawn-agent\b.*(\.sh|sh\b)' "$norm" ||
+       _cp_imatch '(^|[[:space:];|&()])([^[:space:];|&()]*/)?spawn-agent\.sh\b|\bherdr[[:space:]]+tab[[:space:]]+create\b|\bherdr[[:space:]]+pane[[:space:]]+run\b' "$fleet_norm"; then
+    printf 'unregistered fleet creation remains human-only\n'
   # CLOSED 2026-09-24 (Terrence's authorized loosening, then hardened
   # round 4 by an independent security review): _cp_push_is_safe is
   # cwd-INDEPENDENT and deny-by-default — `git push origin <name>`,
@@ -2484,7 +2568,7 @@ conductor_reserved_reason() {
   # a `-C`, and any `cd … &&` prefix all fail to match this shape and
   # stay reserved below — see _cp_push_is_safe's own header for the full
   # design and the two security-review rounds that shaped it.
-  elif { _cp_match '\bgit\b' "$norm" && _cp_match '\bpush\b' "$norm" && ! _cp_push_is_safe "$norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|command-policy\.sh|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|alert-gate\.sh|prompt-parse\.sh)\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$norm"; then
+  elif { _cp_match '\bgit\b' "$action_norm" && _cp_match '\bpush\b' "$action_norm" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|alert-gate\.sh|prompt-parse\.sh)\b|(^|[^A-Za-z0-9_-])command-policy\.sh\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm"; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
   fi
 }

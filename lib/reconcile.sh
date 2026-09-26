@@ -116,7 +116,20 @@ run_reconciliation() {
     printf '%s' "$live_json" | jq -r --arg p "$1" \
       '(.result.panes // .panes)[]? | select(.pane_id==$p) | .agent_session.value // empty' 2>/dev/null
   }
-
+  # A pane list is a snapshot. A new task can be registered after this pass
+  # captured it, and a tab create can briefly be absent while herdr publishes
+  # the new pane. Confirm a missing pane once before burying its task;
+  # otherwise the normal spawn/register race becomes `running -> lost`.
+  _refresh_live_birth_for() {
+    local fresh
+    fresh="$(herdr pane list 2>/dev/null || true)"
+    printf '%s' "$fresh" | jq -e '(.result.panes // .panes) | type == "array"' >/dev/null 2>&1 || {
+      printf ''
+      return 0
+    }
+    printf '%s' "$fresh" | jq -r --arg p "$1" \
+      '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null
+  }
   local checkpoint new_checkpoint report_lines="" report_count=0
   checkpoint="$(read_checkpoint "$conductor_id")"
   new_checkpoint="$checkpoint"
@@ -175,12 +188,17 @@ run_reconciliation() {
     reg_session=$(printf '%s' "$task_json" | jq -r '.agent_session // empty')
     [ -n "$run_id" ] && [ -n "$task_id" ] || continue
 
-    # ---- lost detection — only tasks that could still be alive ------------
     case "$state" in
       starting|running|blocked)
         if [ "$have_live" = 1 ] && [ -n "$pane_id" ]; then
           local live_birth reason=""
           live_birth="$(_live_birth_for "$pane_id")"
+          if [ -z "$live_birth" ]; then
+            # Reconcile against a fresh pane snapshot before calling a task
+            # lost. This closes the registration/tab-publication race without
+            # weakening the pane-birth check for a genuinely recycled pane.
+            live_birth="$(_refresh_live_birth_for "$pane_id")"
+          fi
           if [ -z "$live_birth" ]; then
             reason="pane_gone"
           elif [ -n "$pane_birth" ] && [ "$live_birth" != "$pane_birth" ]; then

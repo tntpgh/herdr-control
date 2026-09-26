@@ -198,21 +198,19 @@ case "$status" in
       # and command-policy decides, so this answers exactly what it would have
       # answered one transition later. Alerting stays suppressed either way.
       if [ "${HERDR_EDGE_PEER_ANSWER:-0}" = "1" ]; then
-        bash "$PEER_ANSWER" --max-rounds 1 ${agent:+--agent "$agent"} "$pane" >/dev/null 2>&1 || true
-        note "peer-answer(first observation) $reg"
+        bash "$PEER_ANSWER" --interval 1 --max-rounds 3 ${agent:+--agent "$agent"} "$pane" >/dev/null 2>&1 || true
+        note "peer-answer(first observation, 3 rounds) $reg"
       else
         note "registry-follow-only (first observation) $reg"
       fi
       exit 0
     fi
     if [ "${HERDR_EDGE_PEER_ANSWER:-0}" = "1" ]; then
-      # One round, this pane only. peer-answer re-parses and refuses anything
-      # that is not a complete recognised menu, and command-policy decides
-      # whether it may answer at all. `--agent` is passed because the
-      # capability profile is meant to be DECLARED for the agent actually in
-      # the pane (docs/approval-policy.md rule 4), not defaulted to omp.
-      bash "$PEER_ANSWER" --max-rounds 1 ${agent:+--agent "$agent"} "$pane" >/dev/null 2>&1 || true
-      note "peer-answer(1 round)"
+      # The blocked edge can precede the menu paint by a frame. Three short
+      # rounds preserve the one-pane edge cost while retrying that race; a
+      # policy refusal is still remembered by peer-answer and is not nagged.
+      bash "$PEER_ANSWER" --interval 1 --max-rounds 3 ${agent:+--agent "$agent"} "$pane" >/dev/null 2>&1 || true
+      note "peer-answer(3 rounds)"
     fi
     sleep "$GRACE"
     case "$(pane_probe)" in
