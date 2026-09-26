@@ -596,15 +596,18 @@ PII_EXCLUDES=(
 # Paths exempt from the STREET-ADDRESS detector ONLY. Everything here is still
 # read by the phone and email detectors, and by the credential scan, which is
 # what keeps a public-output path from becoming a general PII bypass.
-# tntpgh-dev's asset manifests (2026-09-26): each property entry's `source` is
-# the MLS original's filename, i.e. the published listing's street address.
-# CI commits them on every data run; only a local commit ever hits this check.
 ADDRESS_ONLY_EXCLUDES=(
     ':(exclude)src/data/videos.json'
     ':(exclude)public/sitemap.xml'
-    ':(exclude)src/assets/asset-manifest.json'
-    ':(exclude)src/assets/asset-manifest-hero.json'
 )
+# Per-repo opt-out of the STREET detector only (2026-09-26): a listing site
+# (tntpgh-dev) publishes street addresses as its product — listing data,
+# asset manifests keyed by MLS filenames, blog posts — and a path allowlist
+# chasing each new file blocked real fixes. `git config
+# secretscan.allowStreetAddresses true` in that repo; worktrees share it.
+# Phone, email and the credential scan still read every line there.
+STREET_CHECK_OFF=0
+[[ "$(git config --bool secretscan.allowStreetAddresses 2>/dev/null)" == "true" ]] && STREET_CHECK_OFF=1
 # The added lines to judge, per SOURCE. In push mode that is one call per
 # commit being sent, so a finding can name the commit to rewrite — the first
 # version concatenated every commit into one blob and could only say "a
@@ -782,6 +785,7 @@ check_pii() {                   # <label> <added text> [<address-scoped text>]
     # text for both is what turned two public-output paths into general PII
     # bypasses (found in review, 2026-09-16).
     local label="$1" text="$2" addr_text="${3-$2}"
+    (( STREET_CHECK_OFF )) && addr_text=""
     [[ -n "$text$addr_text" ]] || return 0
     # street address: <number> <Name> <suffix>, excluding the fixture words.
     #
