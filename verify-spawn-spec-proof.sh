@@ -125,6 +125,25 @@ check "proof_file points at PROOF.md" "$(jq -r .proof_file "$idjson" 2>/dev/null
 printf '%s' "$(jq -r .how_to_complete "$idjson" 2>/dev/null)" | grep -qi 'closure reason' \
   && ok "how_to_complete explains the closure-reason requirement" || bad "how_to_complete silent on closure reasons"
 
+printf '== --dry-run --brief FILE: spec line shows the brief path exactly once (regression) ==\n'
+dryrun_brief=$(mktemp)
+printf '# dry run brief\n' > "$dryrun_brief"
+dryrun_out=$(env HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" \
+  HERDR_WT_DIR="$WT_ROOT" HERDR_RUN_STATE_DIR="$(mktemp -d)" \
+  bash "$here/spawn-task.sh" "$probe_repo" dry-brief-branch quick /bin/true --dry-run --brief "$dryrun_brief" 2>&1)
+spec_line=$(printf '%s\n' "$dryrun_out" | grep '^  spec ')
+occurrences=$(printf '%s' "$spec_line" | grep -o -F "$dryrun_brief" | wc -l | tr -d ' ')
+check "dry-run spec line shows brief path exactly once" "$occurrences" "1"
+printf '%s' "$spec_line" | grep -qF "(from --brief $dryrun_brief)" \
+  && ok "dry-run spec line format matches 'from --brief <path>'" || bad "dry-run spec line malformed: $spec_line"
+
+printf '== --dry-run with no --brief: spec line still says template — no --brief passed ==\n'
+dryrun_out2=$(env HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" \
+  HERDR_WT_DIR="$WT_ROOT" HERDR_RUN_STATE_DIR="$(mktemp -d)" \
+  bash "$here/spawn-task.sh" "$probe_repo" dry-nobrief-branch quick /bin/true --dry-run 2>&1)
+printf '%s' "$dryrun_out2" | grep -qF '(template — no --brief passed)' \
+  && ok "dry-run no-brief spec line unchanged" || bad "dry-run no-brief spec line wrong: $dryrun_out2"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi

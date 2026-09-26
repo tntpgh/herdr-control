@@ -307,7 +307,8 @@ if [ "$dry" = 1 ]; then
   echo "              ^ run BACKGROUNDED (run_in_background/async:true) — a blocking"
   echo "                foreground call strands you idle until re-prompted by hand"
   echo "  registry  : run=$run_id task=$task_id conductor_pane=${conductor_pane_id:-<none — not running inside a herdr pane>} conductor_pane_birth=${conductor_pane_birth:-<none>}"
-  echo "  spec      : $(handoff_spec "$wt")  (${brief_file:+from --brief $brief_file}${brief_file:-template — no --brief passed})"
+  spec_note="template — no --brief passed"; [ -n "$brief_file" ] && spec_note="from --brief $brief_file"
+  echo "  spec      : $(handoff_spec "$wt")  ($spec_note)"
   exit 0
 fi
 
