@@ -99,7 +99,7 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '4\n'; }
+_registry_schema_version() { printf '5\n'; }
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
@@ -162,6 +162,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- reusing the row spawn-task.sh already writes.
   branch               TEXT NOT NULL DEFAULT '',
   trunk                TEXT NOT NULL DEFAULT '',
+  -- thurber-os docs/project-contract-plan.md #2: a project is a repo plus an
+  -- OPTIONAL label (spawn-task.sh --project). Default is the repo's own
+  -- basename, computed by the CALLER, never here — every existing register_task
+  -- call that passes 13 args keeps registering with an empty project, and
+  -- every reader treats empty as use-the-repo-basename rather than a
+  -- distinct project of its own.
+  project               TEXT NOT NULL DEFAULT '',
   label                TEXT NOT NULL DEFAULT '',
   state                TEXT NOT NULL,
   created_at           TEXT NOT NULL,
@@ -232,6 +239,7 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   _HERDR_REGISTRY_READY=1
   _migrate_schema_v3
   _migrate_schema_v4
+  _migrate_schema_v5
   _migrate_legacy_files
   return 0
 }
@@ -268,6 +276,21 @@ _migrate_schema_v4() {
     _sql "ALTER TABLE tasks ADD COLUMN trunk  TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
   fi
   _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4');" >/dev/null 2>&1
+}
+
+# ---- schema v4 -> v5: add tasks.project (project-contract-plan.md #2) -------
+# A project is a repo plus an OPTIONAL project: label from spawn-task.sh
+# --project; default is the repo's own basename, computed by the CALLER
+# (spawn-task.sh), never here — the registry only stores what it was given.
+# Same ALTER-guarded shape as v3/v4: a brand-new database gets the column
+# from CREATE TABLE IF NOT EXISTS; an existing v4 db needs it added.
+_migrate_schema_v5() {
+  local has_col
+  has_col=$(_sql "SELECT 1 FROM pragma_table_info('tasks') WHERE name='project';" 2>/dev/null)
+  if [ -z "$has_col" ]; then
+    _sql "ALTER TABLE tasks ADD COLUMN project TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
+  fi
+  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '5');" >/dev/null 2>&1
 }
 
 # ---- one-time import of the pre-SQLite file layout --------------------------
@@ -360,12 +383,12 @@ gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand
 # names whether it asked for one task or all of them.
 _task_json_select() {
   printf "%s" "SELECT json_object(
-    'schema', 4, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
+    'schema', 5, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
     'conductor_id', conductor_id, 'conductor_pane_id', conductor_pane_id,
     'conductor_pane_birth', conductor_pane_birth, 'pane_id', pane_id,
     'pane_birth', pane_birth, 'agent_session', agent_session, 'repo', repo,
-    'worktree', worktree, 'branch', branch, 'trunk', trunk, 'label', label,
-    'state', state, 'created_at', created_at, 'updated_at', updated_at) FROM tasks"
+    'worktree', worktree, 'branch', branch, 'trunk', trunk, 'project', project,
+    'label', label, 'state', state, 'created_at', created_at, 'updated_at', updated_at) FROM tasks"
 }
 
 # conductor_pane_birth mirrors pane_birth but for the CONDUCTOR's pane, not
@@ -377,10 +400,12 @@ _task_json_select() {
 # worker's own branch and the repo's trunk it may open a PR against. Empty
 # by default — only a MANAGED spawn-task.sh launch populates them; every
 # existing caller that passes 11 args keeps registering exactly as before.
+# project (14th, OPTIONAL) is the project-contract-plan.md #2 label; empty
+# means "no explicit project — every reader falls back to the repo basename".
 register_task() {
   local run_id="$1" task_id="$2" worker_id="$3" conductor_id="$4" \
         conductor_pane_id="$5" conductor_pane_birth="$6" pane_id="$7" pane_birth="$8" \
-        repo="$9" worktree="${10}" label="${11}" branch="${12:-}" trunk="${13:-}"
+        repo="$9" worktree="${10}" label="${11}" branch="${12:-}" trunk="${13:-}" project="${14:-}"
   registry_init || return 1
   local at; at="$(_now_iso)"
 
@@ -389,11 +414,11 @@ register_task() {
   # tasks table comment in registry_init.
   if _sql "INSERT INTO tasks
       (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth,
-       pane_id, pane_birth, repo, worktree, branch, trunk, label, state, created_at, updated_at)
+       pane_id, pane_birth, repo, worktree, branch, trunk, project, label, state, created_at, updated_at)
       VALUES ($(_sq "$task_id"), $(_sq "$run_id"), $(_sq "$worker_id"), $(_sq "$conductor_id"),
         $(_sq "$conductor_pane_id"), $(_sq "$conductor_pane_birth"), $(_sq "$pane_id"),
         $(_sq "$pane_birth"), $(_sq "$repo"), $(_sq "$worktree"), $(_sq "$branch"), $(_sq "$trunk"),
-        $(_sq "$label"), 'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
+        $(_sq "$project"), $(_sq "$label"), 'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
     append_event "$run_id" "$task_id" "registered" \
       "$(jq -nc --arg p "$pane_id" --arg l "$label" '{pane_id:$p, label:$l}')" >/dev/null 2>&1
     return 0

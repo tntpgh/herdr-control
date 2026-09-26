@@ -59,13 +59,18 @@ here=$(cd "$(dirname "$0")" && pwd)
 # --secrets, typed by a human or a conductor that holds it, lifts that.
 secrets_req=""
 [ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && secrets_req=withhold
-base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; brief_file=""; positional=()
+base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; brief_file=""; project_label=""; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base="$2"; shift 2 ;;
     --model) model_override="$2"; shift 2 ;;
     --effort) effort_override="$2"; shift 2 ;;
     --posture) posture_req="${2:?spawn-task: --posture needs a value (yolo|write|strict)}"; shift 2 ;;
+    # thurber-os docs/project-contract-plan.md #2: the project label a task
+    # is grouped under on the hub's /projects page. Default (when omitted) is
+    # the repo's own basename, computed below once $root is resolved — never
+    # here, where only the raw <project> arg (a path, not yet a repo) exists.
+    --project) project_label="${2:?spawn-task: --project needs a value}"; shift 2 ;;
     # Credential posture for this spawn — see lib/op-env.sh for why the managed
     # default is ON and the unmanaged default is OFF.
     --no-secrets) secrets_req=withhold; shift ;;
@@ -188,6 +193,10 @@ root=$(repo_root "$proj")
   echo "  The first argument is a PATH, not a repo name: ~/Code/<repo>" >&2
   exit 1; }
 [ -d "$root/.git" ] || git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || { echo "spawn-task: not a git repo: $root" >&2; exit 1; }
+# Default project label = the repo's own basename (project-contract-plan.md
+# #2). --project overrides it; two workers on two branches of the SAME repo
+# share this project unless one is given a narrower --project of its own.
+[ -n "$project_label" ] || project_label="$(basename "$root")"
 wt="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$root")/${branch}"
 # BELT, because the layout is herdr's and this builds it by hand. herdr owns
 # `~/.herdr/worktrees/<repo>/<branch>` and `herdr worktree create` returns the
@@ -255,6 +264,7 @@ fi
 if [ "$dry" = 1 ]; then
   echo "spawn-task (dry-run):"
   echo "  repo      : $root"
+  echo "  project   : $project_label"
   echo "  worktree  : $wt   (branch ${branch}${base:+ off ${base}})"
   echo "  workspace : $(bash "$here/ensure-workspace.sh" --no-focus "$root" 2>/dev/null || echo '<would create>')"
   echo "  tab label : $label"
@@ -424,7 +434,7 @@ pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 [ -n "$tab" ] && [ -n "$pane" ] || { echo "spawn-task: tab create failed in $ws" >&2; exit 1; }
 
 register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
-  "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk"
+  "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk" "$project_label"
 
 # ---- claim the worktree on the worker's behalf ------------------------------
 # A spawned worker will never type `claim.sh take`, and neither will anyone
@@ -480,12 +490,13 @@ jq -n \
   --arg conductor "$conductor_id" --arg pane "$pane" --arg label "$label" \
   --arg event "$wake_pattern" --arg events "$events_file" \
   --arg worktree "$wt" --arg branch "$branch" --arg repo "$root" \
+  --arg project "$project_label" \
   --arg example "$identity_example" \
   --arg spec "$(handoff_spec "$wt")" --arg proof_file "$(handoff_proof "$wt")" \
   '{run_id:$run, task_id:$task, worker_id:$worker, conductor_id:$conductor,
     pane_id:$pane, label:$label, completion_event:$event,
     events_file:$events, worktree:$worktree, branch:$branch, repo:$repo,
-    spec_file:$spec, proof_file:$proof_file,
+    project:$project, spec_file:$spec, proof_file:$proof_file,
     how_to_complete:"Append one JSON line to events_file, using completion_event verbatim, PLUS a closure reason field: shipped | handed_off_to:<task|role> | blocked_on:<thing> | canceled | no-follow-on. `shipped` also needs a proof field — a PR URL + merge sha, or a section id in proof_file written as \".handoffs/PROOF.md#<section>\" (it must actually hold something you wrote, not stay empty) — the registry refuses `completed` without one (lib/run-registry.sh). Read spec_file for the acceptance checklist and write what you verified into proof_file before closing shipped. Read these values HERE — do not try env/printenv, that is human-reserved and will stall you until a human answers.",
     closure_reasons:["shipped","handed_off_to:<task|role>","blocked_on:<thing>","canceled","no-follow-on"],
     example:$example}' \

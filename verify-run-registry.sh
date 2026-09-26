@@ -202,8 +202,10 @@ check "branch column exists (#3b ownership grant)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='branch';")" "1"
 check "trunk column exists (#3b ownership grant)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='trunk';")" "1"
-check "schema_version is 4" \
-  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "4"
+check "schema_version is 5 (v5 adds tasks.project — project-contract-plan.md #2)" \
+  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "5"
+check "project column exists (project-contract-plan.md #2)" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='project';")" "1"
 
 printf '== event dedup on an explicit event_id (at-least-once retry safety) ==\n'
 before=$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")
