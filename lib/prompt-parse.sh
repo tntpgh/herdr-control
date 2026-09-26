@@ -925,7 +925,8 @@ prompt_question() {
 # Selection separately refuses explicit elision markers. This is still only
 # a visible-text guard, not proof about an indirect script or a sandbox.
 # Does the RAW capture behind prompt_command_text below contain a byte that
-# is not valid UTF-8, BEFORE _sanitize_utf8 drops it?
+# is not valid UTF-8, BEFORE _sanitize_utf8 drops it, WITHIN the text that
+# actually gets classified?
 #
 # PR #147 hold (Main's live probe table, 2026-09-25): _sanitize_utf8's
 # `iconv -c` is right for MENU PARSING — a torn byte must never crash the
@@ -947,17 +948,47 @@ prompt_question() {
 # substitution at every call site, so a variable it set would not survive
 # back to the caller. This runs once per actual answer decision (not in any
 # hot poll loop), so the extra read costs nothing that matters here.
-prompt_command_torn() {                 # <pane> -> 0 torn / 1 clean-or-unreadable
-  local raw
-  if [ -n "$(prompt_menu_question "$1" 2>/dev/null)" ]; then
-    raw="$(_pane_read_raw "$1" --format ansi)"
-  else
-    raw="$(_pane_read_raw "$1")"
+#
+# UNREADABLE COUNTS AS TORN (independent review of PR #147, finding
+# torn-gate-unreadable-fail-open): an empty second read used to return
+# "clean", so a transient `herdr pane read` failure on THIS call silently
+# stood on the allow verdict computed by prompt_command_text's own read
+# moments earlier — the exact fail-open this function exists to close, one
+# read later. herdr-select.sh already refuses empty cmd_text for every
+# non-human authority, so returning torn here costs no real liveness.
+#
+# SCOPED TO WHAT WAS ACTUALLY CLASSIFIED (independent review, finding
+# torn-gate-scope-liveness): prompt_command_text's omp-menu branch classifies
+# only the panel's own header/detail rows, never the whole 1000-line window —
+# but the first cut of this function validated the WHOLE window regardless of
+# shape, so a torn byte anywhere in old transcript scrollback escalated every
+# peer approval on that pane while that unrelated row stayed on screen. Fixed
+# by parsing the SAME rows prompt_command_text would, twice — once from the
+# raw bytes (python's own `decode(..., "replace")` degrades a torn byte to
+# U+FFFD rather than crashing, so this is safe) and once from the
+# `_sanitize_utf8`-cleaned bytes — and comparing: identical output means
+# nothing inside the classified rows was torn, even if the wider window was.
+# A torn byte outside the panel changes neither reading. The NUMBERED shape
+# (Claude/Codex) has no such row boundary — prompt_command_text classifies
+# its whole window — so that branch keeps whole-window validation.
+prompt_command_torn() {                 # <pane> -> 0 torn(-or-unreadable) / 1 proven clean
+  local raw_menu clean_q raw_q raw_win
+  raw_menu="$(_pane_read_raw "$1" --format ansi)"
+  if [ -n "$raw_menu" ]; then
+    clean_q="$(printf '%s' "$raw_menu" | _sanitize_utf8 | _prompt_menu_parse question 2>/dev/null)"
+    if [ -n "$clean_q" ]; then
+      raw_q="$(printf '%s' "$raw_menu" | _prompt_menu_parse question 2>/dev/null)"
+      [ "$raw_q" = "$clean_q" ] && return 1 || return 0
+    fi
+    # No complete menu panel either way: prompt_command_text falls through
+    # to the whole-window numbered/plain path below, so validate THAT.
   fi
-  [ -n "$raw" ] || return 1
-  printf '%s' "$raw" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && return 1
+  raw_win="$(_pane_read_raw "$1")"
+  [ -n "$raw_win" ] || return 0
+  printf '%s' "$raw_win" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && return 1
   return 0
 }
+
 
 prompt_command_text() {
   local menu win

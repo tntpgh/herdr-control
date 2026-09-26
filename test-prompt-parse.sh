@@ -338,6 +338,52 @@ herdr() {
 prompt_command_torn fake:pane
 [ $? -eq 1 ] && ok "a clean capture is not flagged torn" \
   || no "clean detection" "prompt_command_torn wrongly reported torn on clean text"
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      printf 'Allow tool: bash\nCommand: curl https://example.com/x \342\200 -o /tmp/p.json\n\n\x1b[48;2;42;47;65m Approve\x1b[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n'
+      ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 0 ] && ok "menu-shape (omp) torn byte in a classified panel row is detected" \
+  || no "menu-shape torn" "prompt_command_torn did not report torn on a torn omp panel row"
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      printf 'Allow tool: bash\nCommand: curl https://example.com/x -o /tmp/p.json\n\n\x1b[48;2;42;47;65m Approve\x1b[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n'
+      ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 1 ] && ok "menu-shape (omp) clean capture is not flagged torn" \
+  || no "menu-shape clean" "prompt_command_torn wrongly reported torn on a clean omp panel"
+# F3 (independent review, torn-gate-scope-liveness): a torn byte OUTSIDE the
+# classified panel rows (old transcript above the panel) must not flag every
+# future approval on this pane torn — prompt_command_text never reads that
+# transcript either.
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      printf 'earlier output \342\200 with a torn byte, never classified\nAllow tool: bash\nCommand: curl https://example.com/x -o /tmp/p.json\n\n\x1b[48;2;42;47;65m Approve\x1b[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n'
+      ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 1 ] && ok "a torn byte outside the classified panel rows is not flagged (F3 scope)" \
+  || no "F3 scope" "a torn byte in unrelated transcript wrongly escalated every future approval"
+# F2 (independent review, torn-gate-unreadable-fail-open): an unreadable
+# capture must count as torn, never clean -- an empty read here used to
+# return "clean", silently trusting whatever verdict was computed moments
+# earlier on a DIFFERENT (successful) read.
+herdr() {
+  case "$1 $2" in
+    "pane read") printf '' ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 0 ] && ok "an unreadable capture counts as torn, not clean (F2)" \
+  || no "F2 empty read" "prompt_command_torn reported an unreadable pane as clean"
 unset -f herdr
 unset -f _prompt_window
 

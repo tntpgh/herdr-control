@@ -298,8 +298,10 @@ cmd_text="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
 # PR #147 hold: a scraped capture containing invalid UTF-8 must never be
 # auto-approved on the strength of whatever _sanitize_utf8 (lib/prompt-parse.sh)
 # let survive — see prompt_command_torn's own comment for the live probe
-# table. Recorded before the registry substitution below: registry text never
-# came from a scrape and is never torn by construction, so it is exempt.
+# table and the independent-review fixes (unreadable now counts as torn;
+# the menu shape is checked against only the rows it actually classifies).
+# Recorded before the registry substitution below: registry text never came
+# from a scrape and is never torn by construction, so it is exempt.
 cmd_torn=0; cmd_text_is_scrape=1
 prompt_command_torn "$pane" 2>/dev/null && cmd_torn=1
 
@@ -370,6 +372,21 @@ if [ "$authority" != human ] && [ "$declining" = 0 ] && [ "$mechanism" = menu ];
 fi
 
 if [ "$authority" = conductor ] && [ "$declining" = 0 ]; then
+  # A torn capture is refused even for the reviewed conductor — independent
+  # review of PR #147 (torn-gate-conductor-bypass): the conductor's own gate
+  # below only refuses `deny`/empty/reserved text, evaluated on the CLEANED
+  # capture, and herdr-gates.sh shows the conductor that same cleaned text
+  # with no sign anything was torn. Main's probe row 3 (`x`+torn+`rm -rf /`)
+  # classifies deny on the byte-for-byte capture but allow once the torn
+  # byte is dropped — silently handing a registered conductor exactly the
+  # command the peer path now refuses.
+  if [ "$cmd_text_is_scrape" = 1 ] && [ "$cmd_torn" = 1 ]; then
+    echo "herdr-select: conductor cannot approve a capture containing invalid UTF-8 — a human must review it." >&2
+    append_event "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "approval_escalated" \
+      "$(jq -nc --arg v "escalate" --arg r "torn capture" --arg p "$pane" \
+         '{verdict:$v, reason:$r, pane:$p}')" >/dev/null 2>&1 || true
+    exit 8
+  fi
   if [ -z "${cmd_text//[[:space:]]/}" ] || [ "$policy_verdict" = deny ]; then
     echo "herdr-select: conductor cannot approve unreadable or deny-class actions." >&2
     exit 8

@@ -33,7 +33,7 @@ export PANE BIRTH
 #   pane list                       pane_birth_now / require_pane_birth_match
 #   pane read <id> ...              lib/prompt-parse.sh, both prompt shapes
 #   pane send-keys <id> <key>       the thing that must NOT happen on a refusal
-herdr() {
+_std_herdr_stub() {
   case "$1 $2" in
     "pane process-info")
       printf '{"result":{"process_info":{"foreground_processes":[{"name":"claude","cmdline":"claude --model sonnet"}]}}}\n' ;;
@@ -47,6 +47,8 @@ herdr() {
     *) return 0 ;;
   esac
 }
+herdr() { _std_herdr_stub "$@"; }
+export -f _std_herdr_stub
 export -f herdr
 
 pass=0 fail=0
@@ -611,6 +613,87 @@ seed_input_required runG taskG "$WRAP_CMD"
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "wrapped allow-class command classified via the untruncated registry text" \
   || bad "still escalated on the wrap artifact: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+
+printf '== PR #147 hold, independent review: menu-shape (omp) torn capture also escalates ==\n'
+# Every existing torn case above uses the numbered (Claude) screen via
+# set_screen -- prompt_command_torn's --format ansi menu branch, the ONLY
+# shape peer-answer.sh actually acts on, was never exercised (finding
+# torn-gate-test-gaps).
+set_menu_torn() {                       # <command-text>
+  printf 'Allow tool: bash\nCommand: %s %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' \
+    "$1" "$(printf '\342\200')" > "$SCREEN"
+}
+set_menu "curl https://example.com/report -o /tmp/report.json"; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && ok "menu-shape clean capture: allowed (baseline)" \
+  || bad "menu-shape clean capture refused: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+set_menu_torn "curl https://example.com/report -o /tmp/report.json"; reset_keys
+before_esc=$(count_events approval_escalated)
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "menu-shape torn capture: REFUSED" \
+  || bad "menu-shape torn capture not refused: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+[ "$(keys_pressed)" = "0" ] && ok "no key pressed on menu-shape torn capture" || bad "keys pressed=$(keys_pressed)"
+[ "$(( $(count_events approval_escalated) - before_esc ))" = "1" ] && ok "approval_escalated recorded for menu-shape torn capture" || bad "escalation not recorded"
+
+printf '== PR #147 hold, independent review: reviewed conductor authority also refuses a torn capture (F1) ==\n'
+set_menu_torn "curl https://example.com/report -o /tmp/report.json"; reset_keys
+conductor_select; rc=$?
+[ "$rc" -eq 8 ] && ok "conductor authority refused a torn capture" \
+  || bad "conductor approved a torn capture: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+[ "$(keys_pressed)" = "0" ] && ok "no key pressed (conductor, torn)" || bad "keys pressed=$(keys_pressed)"
+
+printf '== PR #147 hold, independent review: an unreadable second read counts as torn, never clean (F2) ==\n'
+set_menu "curl https://example.com/report -o /tmp/report.json"; reset_keys
+# The first 5 reads (offer parsing, prompt_id, the re-offer check, and
+# prompt_command_text's own capture) succeed with the real screen, which
+# computes an ALLOW verdict on this command; from the 6th read on --
+# prompt_command_torn's OWN read -- herdr goes unreadable. Before F2 that
+# came back "clean", so the earlier allow verdict stood; after F2 it must
+# be treated as torn (fail closed), never trusted.
+READS="$WORK/read-count"; : > "$READS"; export READS
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      printf 'x\n' >> "$READS"
+      [ "$(wc -l < "$READS" | tr -d ' ')" -ge 6 ] && printf '' || cat "$SCREEN"
+      ;;
+    *) _std_herdr_stub "$@" ;;
+  esac
+}
+export -f herdr
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "an unreadable second read is treated as torn, not clean" \
+  || bad "F2 regressed: an unreadable second read was trusted as clean, exit $rc (expected 8); stderr: $(cat "$WORK/err.txt")"
+[ "$(keys_pressed)" = "0" ] && ok "no key pressed (F2)" || bad "keys pressed=$(keys_pressed) (F2)"
+herdr() { _std_herdr_stub "$@"; }
+export -f herdr
+
+printf '== PR #147 hold, independent review: the registry-text exemption still holds when the on-screen SCRAPE was torn ==\n'
+# Reuses runG/taskG (registered earlier, still running) rather than
+# registering a new task for this pane: task_for_pane resolves the most
+# recently touched task per pane, and a fresh registration here would have
+# outlived this one test and silently broken the #3b item 2 tests below,
+# which depend on runG/taskG still being the pane's owning task.
+CLEAN_CMD="ls -la /tmp"
+set_menu_torn "$CLEAN_CMD"; reset_keys
+seed_input_required runG taskG "$CLEAN_CMD"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && ok "a torn on-screen scrape is exempt once the registry text (never scraped) confirms and replaces it" \
+  || bad "registry exemption regressed under a torn scrape: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+
+printf '== PR #147 hold, independent review: a torn deny-class capture records deny, not a relabelled escalate (F5) ==\n'
+# The earlier "stays refused" assertion only checked rc=8 and no keys, which
+# an escalate satisfies too -- so removing the override's `!= deny` guard
+# could not fail it. This asserts the actual recorded verdict.
+set_menu_torn "rm -rf ~"; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "torn deny-class capture refused" || bad "torn deny-class capture not refused: rc=$rc"
+[ "$(keys_pressed)" = "0" ] && ok "no key pressed (torn deny-class)" || bad "keys pressed=$(keys_pressed)"
+last_verdict="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT json_extract(payload,'\$.verdict') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+[ "$last_verdict" = "deny" ] && ok "the recorded verdict is deny, not a relabelled escalate" \
+  || bad "expected the last approval_escalated event verdict to be deny, got '$last_verdict'"
+
 
 printf '== #3b item 2: a recorded command absent from the actual screen refuses ==\n'
 set_screen "git status --short"; reset_keys
