@@ -1912,8 +1912,9 @@ _cp_push_is_safe() {                    # norm -> 0 (true) only for git push [-u
 # Operator-added restrictions remain hard stops even when a built-in rule
 # with equal severity supplied classify_reason's first-match explanation.
 conductor_reserved_reason() {
-  local norm
+  local norm fleet_norm
   norm="$(scannable_command "$1")"
+  fleet_norm="$(printf '%s' "$norm" | sed -E 's/\$\{?IFS\}?/ /g; s/\$\{?[A-Za-z_][A-Za-z0-9_]*\}?//g')"
   _cp_best_v=0; _cp_best_r=""
   _cp_apply_operator_rules "$norm"
   if [ "$_cp_best_v" -gt 0 ]; then printf '%s\n' "$_cp_best_r"; return; fi
@@ -1949,7 +1950,7 @@ conductor_reserved_reason() {
   # call: the two lists are derived from the same reasoning and must not drift.
   elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--request[[:space:]]+(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]]|(^|[[:space:]])-T([[:space:]]|=)|--upload-file|(^|[[:space:]])-F([[:space:]]|=)|--form([[:space:]]|=)|--json([[:space:]]|=))|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$norm"; then
     printf 'remote mutation remains human-only\n'
-  elif _cp_imatch '(^|[[:space:];|&()])([^[:space:];|&()]+/)?spawn-agent\.sh\b|\bherdr[[:space:]]+tab[[:space:]]+create\b|\bherdr[[:space:]]+pane[[:space:]]+run\b' "$norm"; then
+  elif _cp_imatch '(^|[[:space:];|&()])([^[:space:];|&()]*/)?spawn-agent\.sh\b|\bherdr[[:space:]]+tab[[:space:]]+create\b|\bherdr[[:space:]]+pane[[:space:]]+run\b' "$fleet_norm"; then
     printf 'unregistered fleet creation remains human-only\n'
   # CLOSED 2026-09-24 (Terrence's authorized loosening, then hardened
   # round 4 by an independent security review): _cp_push_is_safe is

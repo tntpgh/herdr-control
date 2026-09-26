@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Red proof for the pre-tool registration/ownership guard.
-# A fleet-creating tool is allowed only for the current registered pane
-# generation and worktree; ordinary tools still follow their existing policy.
+# Red proof for the pre-tool native-delegation guard.
+# Fleet-creating native tools are always refused; ordinary tools still follow
+# their existing policy.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
@@ -35,34 +35,24 @@ ok() { good=$((good + 1)); printf '  ok    %s\n' "$1"; }
 not_ok() { bad=$((bad + 1)); printf '  FAIL  %s\n' "$1"; }
 run_guard() { bash "$here/lib/pretool-registration.sh" "$@" >/dev/null 2>"$work/err"; }
 
-printf '== unregistered worker refuses a fleet-creating tool ==\n'
+printf '== native fleet creation refuses even for registered workers ==\n'
 HERDR_TASK_ID=missing run_guard task "$wt"; rc=$?
-[ "$rc" -eq 8 ] && ok 'unregistered identity refused' || not_ok "unregistered rc=$rc"
-grep -q 'not registered' "$work/err" && ok 'refusal names registration' || not_ok "message: $(cat "$work/err")"
+[ "$rc" -eq 8 ] && ok 'unregistered delegation refused' || not_ok "unregistered rc=$rc"
+grep -q 'spawn-task.sh' "$work/err" && ok 'refusal points to registered spawn path' || not_ok "message: $(cat "$work/err")"
+run_guard task "$wt/src"; rc=$?
+[ "$rc" -eq 8 ] && ok 'current registered worker still cannot create native task descendants' || not_ok "current task rc=$rc"
+run_guard agent "$wt/src"; rc=$?
+[ "$rc" -eq 8 ] && ok 'native agent creation refused' || not_ok "native agent rc=$rc"
 run_extension_guard() {
   TEST_CWD="$1" bun -e 'const mod = await import("./agent-hooks/omp-herdr-control.ts"); const handlers = {}; mod.default({on: (event, handler) => { handlers[event] = handler; }}); const result = handlers.tool_call({toolName:"task", input:{cwd:process.env.TEST_CWD}}); console.log(result?.block ? "BLOCK" : "ALLOW");' 2>"$work/bun.err"
 }
 
-printf '== recycled pane generation refuses before the tool runs ==\n'
-BIRTH=generation-2 run_guard task "$wt"; rc=$?
-[ "$rc" -eq 8 ] && ok 'stale generation refused' || not_ok "stale generation rc=$rc"
-grep -q 'recycled' "$work/err" && ok 'refusal names recycled pane' || not_ok "message: $(cat "$work/err")"
-BIRTH=generation-1
-
-printf '== current registered task owns the pane and worktree ==\n'
-run_guard task "$wt/src"; rc=$?
-[ "$rc" -eq 0 ] && ok 'current generation allowed' || not_ok "current task rc=$rc: $(cat "$work/err")"
-printf '== OMP tool_call wiring blocks and allows the same cases ==\n'
+printf '== OMP tool_call wiring blocks native delegation ==\n'
 [ "$(HERDR_TASK_ID=missing run_extension_guard "$wt")" = BLOCK ] \
-  && ok 'OMP hook blocks an unregistered delegation' \
+  && ok 'OMP hook blocks unregistered native delegation' \
   || not_ok "OMP unregistered result: $(cat "$work/bun.err")"
-BIRTH=generation-2
-[ "$(run_extension_guard "$wt")" = BLOCK ] \
-  && ok 'OMP hook blocks a recycled generation' \
-  || not_ok "OMP stale-generation result: $(cat "$work/bun.err")"
-BIRTH=generation-1
-[ "$(run_extension_guard "$wt/src")" = ALLOW ] \
-  && ok 'OMP hook allows the current registered task' \
+[ "$(run_extension_guard "$wt/src")" = BLOCK ] \
+  && ok 'OMP hook blocks current registered native delegation' \
   || not_ok "OMP current-task result: $(cat "$work/bun.err")"
 
 
