@@ -1460,6 +1460,39 @@ check_scope_ceiling "commit-only: commit mentioning push stays in scope" \
 check_scope_ceiling "commit-only: a real push stays refused" \
   'git push origin feat/x' '{"git":"commit-only"}' yes
 
+# -- H1 (independent review of #157): a redirect glued to a git global
+# option must not let its TARGET word read as the subcommand.
+check_reserved "H1: -P> glues a redirect to a global option"     'git -P> status push origin main'
+check_reserved "H1: -c consumes an option value with a redirect" 'git -c a=b> log push origin main'
+check_reserved "H1: -C consumes a dir value with a redirect"     'git -C /tmp/x> status push origin main'
+check_reserved "H1: doubled >> redirect on --no-pager"           'git --no-pager>> diff push origin main'
+check_reserved "H1: same shape wrapped in sh -c"                 "bash -c 'git -P> status push origin main'"
+check "H1: redirect-glued option also hides a force-push" \
+  "git -P> status --force push origin main" escalate
+
+# -- H2 (independent review of #157): git grep -O (--open-files-in-pager)
+# runs its value through the shell; grep must not be on the local-only
+# allowlist that would let a push hidden inside that value through.
+check_reserved "H2: git grep -O smuggles a push"          "git grep -O'git push origin main #' -e ."
+check_reserved "H2: git grep -O smuggles a force-push"    "git grep -O'git push -f origin main #' -e ."
+check_reserved "H2: git grep -O wrapped in sh -c"         'sh -c "git grep -O'"'"'git push origin main #'"'"' -e ."'
+
+# -- H3 (independent review of #157): git subcommands are separate
+# git-<subcommand> binaries found via $PATH, and http-push is a real
+# (ancient) push subcommand — neither goes through the "git push" literal.
+check_reserved "H3: absolute git-push binary path" \
+  '/Library/Developer/CommandLineTools/usr/libexec/git-core/git-push origin main'
+check_reserved "H3: PATH-prefixed git-push binary" \
+  'PATH=/Library/Developer/CommandLineTools/usr/libexec/git-core:$PATH git-push origin main'
+check_reserved "H3: git-http-push fused binary"    'git-http-push <url> main'
+check_reserved "H3: git http-push subcommand"      'git http-push <url> main'
+check_reserved "H3/xiv: git send-pack subcommand"  'git send-pack origin main'
+check_reserved "H3/xiv: absolute git-send-pack binary path" \
+  '/Library/Developer/CommandLineTools/usr/libexec/git-core/git-send-pack origin main'
+check "H1: force via glued redirect" 'git -P> status push -f origin main' escalate
+
+
+
 echo
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then

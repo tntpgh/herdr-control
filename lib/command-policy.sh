@@ -1469,11 +1469,42 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
   pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
   pre="$(printf '%s' "$pre" | sed "s/['\"\\\\]//g")"
   pre="$(printf '%s' "$pre" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
-  segmented="$(printf '%s' "$pre" | sed -E 's/[;&|()`]/\n/g')"
+  # H1 (independent review of #157): a `<`/`>` redirect glued directly onto
+  # a git global-option token (`git -P> status push origin main`) made the
+  # redirect's TARGET word read as the subcommand, while bash actually runs
+  # `git -P push …` with stdout redirected to a file named `status`. `<`/`>`
+  # are shell operators, never legal inside a git argument, so they get the
+  # same segment-delimiter treatment as `;`/`&`/`|` — the option token and
+  # anything after the redirect end up in different segments, and a git
+  # invocation left with nothing before its own segment boundary falls into
+  # the existing "subcommand slot missing" deny-by-default path.
+  segmented="$(printf '%s' "$pre" | sed -E 's/[;&|()`<>]/\n/g')"
   out="$(printf '%s\n' "$segmented" | awk '
-    function is_local_only(s) { return (s ~ /^(status|diff|log|show|commit|add|rm|mv|restore|grep|blame|ls-files|stash|branch|tag|rev-parse|cat-file|reflog|shortlog|describe|checkout|switch)$/) }
+    # H2 (independent review of #157): grep does NOT belong on this list.
+    # git grep -O<cmd> -e . (--open-files-in-pager) runs <cmd> through the
+    # shell — a crafted -O value containing a real push released one. No
+    # other entry here exposes an inline arbitrary-command option the same
+    # way (checked: diff/log/show have a file-path -O, ordering only, not a
+    # command; commit/tag/branch --edit variants open $EDITOR from
+    # config/env, never an inline command argument; cat-file
+    # --textconv/--filters runs a PRE-CONFIGURED driver, not one typed on
+    # this command line) — grep alone is dropped.
+    function is_local_only(s) { return (s ~ /^(status|diff|log|show|commit|add|rm|mv|restore|blame|ls-files|stash|branch|tag|rev-parse|cat-file|reflog|shortlog|describe|checkout|switch)$/) }
     function is_consuming(s)  { return (s ~ /^(-C|-c|--git-dir|--work-tree|--namespace|--config-env|--exec-path|--super-prefix|--attr-source)$/) }
     function is_git(s,    n) { n = length(s); return (s == "git" || (n > 4 && substr(s, n - 3) == "/git")) }
+    # H3 (independent review of #157): git subcommands are separate binaries
+    # named git-<subcommand> in libexec, so `git-push origin main` (found via
+    # $PATH, no literal "git push" text) never went through is_git()/the
+    # subcommand slot at all. `http-push` and `send-pack` are real (if
+    # ancient) git push subcommand names too, so they need the same
+    # push-equivalence as the literal word.
+    function is_git_push_bin(s,    L) {
+      L = length(s)
+      return (s == "git-push" || s == "git-http-push" || s == "git-send-pack" ||
+              (L >= 9  && substr(s, L - 8)  == "/git-push") ||
+              (L >= 14 && substr(s, L - 13) == "/git-http-push") ||
+              (L >= 14 && substr(s, L - 13) == "/git-send-pack"))
+    }
     {
       n = split($0, tok, /[ \t]+/)
       lastsub = ""
@@ -1502,7 +1533,7 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
           }
           if (!found) {
             missing = 1; lastsub = ""
-          } else if (subcmd == "push") {
+          } else if (subcmd == "push" || subcmd == "http-push" || subcmd == "send-pack") {
             reserve = 1; lastsub = "push"; i++
           } else if (subcmd ~ /^[a-z][a-z0-9-]*$/) {
             lastsub = subcmd; i++
@@ -1511,6 +1542,7 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
           }
           continue
         }
+        if (is_git_push_bin(t)) { reserve = 1; i++; continue }
         m = split(t, sw, "=")
         for (k = 1; k <= m; k++) {
           if (sw[k] == "push" && !(lastsub != "" && is_local_only(lastsub))) reserve = 1
