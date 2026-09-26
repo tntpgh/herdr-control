@@ -155,6 +155,12 @@ for reason in ("shipped", "canceled", "no-follow-on", "handed_off_to:qa-team"):
 results["wake_when_lost_no_closure_reason"] = hub.project_needs_wake(
     task_states=["lost"], next_step="first thing", open_forms=0, closure_reason=None) is True
 
+# Worker gone (task reconciled to lost) but its PR is open in review -> the
+# work is in Terrence's queue, not abandoned; never page Main to carry it.
+results["no_wake_when_pr_open_in_review"] = hub.project_needs_wake(
+    task_states=["lost"], next_step="first thing", open_forms=0, closure_reason=None,
+    open_prs=1) is False
+
 # ---- full join: projects_data() against realistic herdr_data()-shaped
 # fixtures (review #146 finding 8: prior coverage only exercised the pure
 # helpers with a hand-picked task_states=["stalled"], which encoded the bug
@@ -235,7 +241,12 @@ results["join_tourguide_next_step_none"] = by_project.get("tourguide", {}).get("
 
 print(json.dumps(results))
 PYEOF
-  py_out="$(python3 "$PYFILE" "$here")"
+  if ! py_out="$(python3 "$PYFILE" "$here")"; then
+    # A crash here used to report failed=0 with every check below silently
+    # skipped (seen live: a TypeError on a new kwarg read as green).
+    bad "hub.py check block crashed — every spec_checklist/project_needs_wake/join case is unverified"
+    py_out='{}'
+  fi
   echo "$py_out" | python3 -c "
 import json, sys
 r = json.loads(sys.stdin.read().strip().splitlines()[-1])

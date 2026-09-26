@@ -2823,7 +2823,7 @@ _CLOSED_REASONS = frozenset(("shipped", "canceled", "no-follow-on"))
 
 
 def project_needs_wake(task_states: list, next_step: str | None, open_forms: int,
-                       closure_reason: str | None = None) -> bool:
+                       closure_reason: str | None = None, open_prs: int = 0) -> bool:
     """thurber-os docs/project-contract-plan.md item 3, 'carry to completion':
     a project gets woken to Main when it has a next step, no live worker, and
     nothing it is waiting on from Terrence.
@@ -2843,6 +2843,10 @@ def project_needs_wake(task_states: list, next_step: str | None, open_forms: int
     * 'nothing waiting on Terrence' — an open decision form for this project
       already covers it; a second page for the same gap is the noise item
       3a's own dedupe ladder exists to prevent, just at project granularity.
+    * an open PR means the work is in review (Terrence's queue), even when its
+      worker pane is gone and the task reconciled to `lost` — paging Main to
+      "carry" it would be the respawn-reviewed-work failure (second review
+      of #146, P2).
     * a CLOSED latest task (shipped/canceled/no-follow-on/handed_off_to:*)
       means a human-reviewed gate already decided this project's outcome;
       an unticked SPEC.md box left behind by a worker that never edited the
@@ -2856,6 +2860,8 @@ def project_needs_wake(task_states: list, next_step: str | None, open_forms: int
     if any(s in RUNNING_TASK_STATES for s in task_states):
         return False
     if open_forms > 0:
+        return False
+    if open_prs > 0:
         return False
     if closure_reason and (closure_reason in _CLOSED_REASONS or closure_reason.startswith("handed_off_to:")):
         return False
@@ -2924,7 +2930,7 @@ def _open_prs_for_repo(repo: str | None) -> dict:
     try:
         r = subprocess.run(
             ["gh", "pr", "list", "--state", "open",
-             "--json", "number,url,title,headRefName,isDraft,mergeable,statusCheckRollup"],
+             "--json", "number,url,title,state,headRefName,isDraft,mergeable,statusCheckRollup"],
             cwd=repo, capture_output=True, text=True, timeout=15)
         if r.returncode == 0:
             for pr in json.loads(r.stdout or "[]"):
@@ -3071,7 +3077,8 @@ def projects_data() -> dict:
             "open_decisions": [{"id": f.get("id"), "title": f.get("title"), "status": f.get("status")}
                                for f in open_forms],
             "spec_items": items, "next_step": next_step_line,
-            "needs_wake": project_needs_wake(task_states, next_step, len(open_forms), closure_reason),
+            "needs_wake": project_needs_wake(task_states, next_step, len(open_forms), closure_reason,
+                                             open_prs=len(prs)),
         })
     return {"projects": projects}
 
