@@ -214,7 +214,8 @@ for p in "https://github.com/tntpgh/herdr-control/issues/154 eb55756" \
          "https://github。com/tntpgh/herdr-control/pull/154 eb55756" \
          "$pr153/../154 f1579a6" \
          "$pr153/%2e%2e/154 f1579a6" \
-         "$pr153#"$'\n'"$pr154 f1579a6"; do
+         "$pr153#"$'\n'"$pr154 f1579a6" \
+         "https:ｇithub.com/tntpgh/herdr-control/pull/154?u=https://x eb55756"; do
   if _valid_proof_ref "$p"; then
     bad "alias/encoded/normalising PR spelling accepted on shape alone: $p"
   else
@@ -224,10 +225,18 @@ done
 # Not PR claims: these keep the shape check exactly as before, escapes and all.
 for p in "https://github.com/tntpgh/herdr-control/commit/eb55756 eb55756" \
          "https://github.com/tntpgh/herdr-control/blob/main/docs/a%20b.md eb55756" \
-         "https://github.com/tntpgh/herdr-control/tree/fix%2Fshipped eb55756"; do
-  _valid_proof_ref "$p" && ok "non-PR GitHub URL keeps the shape check: ${p%% *}" \
-    || bad "non-PR GitHub URL refused: $p ($_PROOF_REF_WHY)"
+         "https://github.com/tntpgh/herdr-control/tree/fix%2Fshipped eb55756" \
+         "https://codeberg.org/o/r/pulls/3 eb55756 (mirrored to github.com/o/r)" \
+         "https://xn--bcher-kva.example/release/1 eb55756"; do
+  _valid_proof_ref "$p" && ok "non-PR URL keeps the shape check: ${p%% *}" \
+    || bad "non-PR URL refused: $p ($_PROOF_REF_WHY)"
 done
+long="https://example.com/$(printf 'a%.0s' $(seq 1 3000)) eb55756"
+if _valid_proof_ref "$long"; then
+  bad "a 3000-char first word was decoded and accepted"
+else
+  case "$_PROOF_REF_WHY" in *"over 2048"*) ok "an overlong first word is refused before decoding" ;; *) bad "why: $_PROOF_REF_WHY" ;; esac
+fi
 _valid_proof_ref "$pr153/files/abc1234..f1579a6 f1579a6" \
   && ok "a '..' inside a segment (PR commit-range view) is not a dot-segment" \
   || bad "commit-range PR URL refused: $_PROOF_REF_WHY"
