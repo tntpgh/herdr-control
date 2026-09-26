@@ -46,8 +46,12 @@
 		     the `allow` class; `escalate` (credentials, production targets,
 		     remote mutation) and `deny` still stop, and a reserved action can be
 		     DECLINED but never approved by automation. -->
+		<!-- TEMPORARILY 0 (2026-09-26): approval_command_text accepted a
+		     recorded command as a bare SUBSTRING of the panel, so a mis-recorded
+		     row (parallel tool calls) let a peer press Approve on an unjudged
+		     command. Restore to 1 once the anchored-corroboration fix deploys. -->
 		<key>HERDR_EDGE_PEER_ANSWER</key>
-		<string>1</string>
+		<string>0</string>
 	</dict>
 	<key>RunAtLoad</key>
 	<true/>
