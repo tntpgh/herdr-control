@@ -723,12 +723,11 @@ const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
 console.log("EVENTS:" + Object.keys(handlers).sort().join(","));
-// The notification path is the APPROVAL event now, not tool_call. tool_call
-// fired before every tool call whether or not anything was ever asked, and
-// the script had to screen-scrape its own pane to find out — 20 `herdr pane
-// read` RPCs per tool call per worker. omp emits tool_approval_requested /
-// tool_approval_resolved (docs/extensions.md) and its own herdr integration
-// already reports blocked/idle off exactly that pair.
+// Approval notifications stay on the approval events. tool_call is now also
+// registered, narrowly, for the pre-tool fleet registration/ownership guard;
+// ordinary tools must pass without a shell guard refusal.
+const tc = handlers["tool_call"]({ toolName: "read", input: { path: "/x" } });
+console.log("TOOL_CALL_RETURN:" + (tc === undefined ? "undefined" : JSON.stringify(tc)));
 const ar = handlers["tool_approval_requested"]({ toolName: "bash", input: { command: "git push --force" }, reason: "destructive" });
 console.log("APPROVAL_RETURN:" + (ar === undefined ? "undefined" : JSON.stringify(ar)));
 const bas = handlers["before_agent_start"]({});
@@ -740,11 +739,12 @@ handlers["agent_end"]({});
 await new Promise(r => setTimeout(r, 600));
 ' 2>&1)"
   printf '%s' "$shim_out" \
-    | grep -q 'EVENTS:agent_end,before_agent_start,session_stop,tool_approval_requested,tool_approval_resolved,tool_execution_end,tool_execution_start,tool_result' \
-    && ok "every event is registered (incl. session_stop for conductor exit), and tool_call is NOT one of them" || bad "events: $shim_out"
-  # Every handler must return undefined on every path. tool_call used to be the
-  # fail-closed one (a throw blocked the agent's tool); these are observability
-  # events, but the contract is kept so the wiring can move again safely.
+    | grep -q 'EVENTS:agent_end,before_agent_start,session_stop,tool_approval_requested,tool_approval_resolved,tool_call,tool_execution_end,tool_execution_start,tool_result' \
+    && ok "every event is registered, including the fail-closed pre-tool guard" || bad "events: $shim_out"
+  printf '%s' "$shim_out" | grep -q 'TOOL_CALL_RETURN:undefined' \
+    && ok "ordinary tool call passes the pre-tool guard" || bad "tool_call guard changed ordinary input: $shim_out"
+  # Observability handlers return undefined; the pre-tool handler returns
+  # undefined for ordinary calls and a block object only for refused delegation.
   printf '%s' "$shim_out" | grep -q 'APPROVAL_RETURN:undefined' \
     && ok "the approval handler returns undefined (never blocks the agent)" || bad "approval handler returned non-undefined"
   # #37 moved the reconciliation report to the hub page and left AT MOST a
