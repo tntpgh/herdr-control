@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-task.sh <project> <branch> [job-class] [agent-or-command...] [--base REF] [--dry-run] [--focus] [--no-secrets] [--brief FILE]
+# spawn-task.sh <project> <branch> [job-class|auto] [agent-or-command...] [--route deterministic|jev] [--base REF] [--dry-run] [--focus] [--no-secrets] [--brief FILE]
 #
 # Every worker starts with the 1Password service-account identity (one vault,
 # 249 items, READ-ONLY) so an unattended run never stops to ask for a
@@ -59,7 +59,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 # --secrets, typed by a human or a conductor that holds it, lifts that.
 secrets_req=""
 [ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && secrets_req=withhold
-base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; brief_file=""; project_label=""; positional=()
+base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; brief_file=""; project_label=""; route_provider=""; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base="$2"; shift 2 ;;
@@ -77,6 +77,7 @@ while [ $# -gt 0 ]; do
     # SPEC.md is filled from this file's content when passed; otherwise a
     # template (see _spec_template below). Never required.
     --brief) brief_file="${2:?spawn-task: --brief needs a file path}"; shift 2 ;;
+    --route) route_provider="${2:?spawn-task: --route needs deterministic or jev}"; shift 2 ;;
     --secrets) secrets_req=grant; shift ;;
     --dry-run|-n) dry=1; shift ;;
     --focus) foc=--focus; shift ;;
@@ -95,6 +96,27 @@ shift 3 2>/dev/null || shift $#
 rest=("$@"); [ "${#rest[@]}" -eq 0 ] && rest=(claude)
 agent="${rest[0]}"
 [ -z "$brief_file" ] || [ -r "$brief_file" ] || { echo "spawn-task: --brief file not readable: $brief_file" >&2; exit 1; }
+if [ -n "$route_provider" ] || [ "$job" = auto ]; then
+  [ -n "$brief_file" ] || { echo "spawn-task: --route/auto requires --brief" >&2; exit 2; }
+  [ -n "$route_provider" ] || route_provider=deterministic
+  case "$route_provider" in deterministic|jev) ;; *) echo "spawn-task: unknown route provider: $route_provider" >&2; exit 2 ;; esac
+  if [ "$route_provider" = deterministic ]; then
+    . "$here/lib/task-routing.sh"
+    route_json=$(route_task_deterministic "$(cat "$brief_file")")
+    route_status=$?
+  else
+    route_json=$(python3 "$here/scripts/jev_route.py" --brief "$brief_file" 2>/dev/null)
+    route_status=$?
+    if [ "$route_status" -ne 0 ]; then
+      echo "spawn-task: JEV routing failed closed (no spawn performed)" >&2
+    fi
+  fi
+  routed_role=$(printf '%s' "$route_json" | jq -r '.role // empty')
+  routed_job=$(printf '%s' "$route_json" | jq -r '.job_class // empty')
+  [ -n "$routed_role" ] && [ -n "$routed_job" ] || { echo "spawn-task: invalid route output" >&2; exit 1; }
+  [ "$routed_role" != escalate ] || { printf '%s\n' "$route_json"; exit 1; }
+  job="$routed_job"
+fi
 
 # ---- MODEL MAP (job-class -> model / reasoning-effort) ----------------------
 # Table lives in lib/agent-profiles.sh (model_for_agent); this wrapper only
