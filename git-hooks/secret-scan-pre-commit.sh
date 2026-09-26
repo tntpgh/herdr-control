@@ -596,9 +596,14 @@ PII_EXCLUDES=(
 # Paths exempt from the STREET-ADDRESS detector ONLY. Everything here is still
 # read by the phone and email detectors, and by the credential scan, which is
 # what keeps a public-output path from becoming a general PII bypass.
+# tntpgh-dev's asset manifests (2026-09-26): each property entry's `source` is
+# the MLS original's filename, i.e. the published listing's street address.
+# CI commits them on every data run; only a local commit ever hits this check.
 ADDRESS_ONLY_EXCLUDES=(
     ':(exclude)src/data/videos.json'
     ':(exclude)public/sitemap.xml'
+    ':(exclude)src/assets/asset-manifest.json'
+    ':(exclude)src/assets/asset-manifest-hero.json'
 )
 # The added lines to judge, per SOURCE. In push mode that is one call per
 # commit being sent, so a finding can name the commit to rewrite — the first

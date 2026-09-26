@@ -426,6 +426,36 @@ printf '<video:description>call %s</video:description>\n' "$BADPHONE" > "$R/publ
 git -C "$R" add public/sitemap.xml
 blocks "$R" "a real phone in the address-exempt sitemap.xml still blocks"
 
+# tntpgh-dev's image ASSET MANIFESTS are the same published listing pipeline
+# output: every property entry's `source` is the MLS original's filename, which
+# is the listing's street address. CI commits them on every data run (no hook
+# on the runner), so the tracked files already hold thousands of these lines;
+# only a local commit ever hits the street check (2026-09-26, market-listing
+# media backfill). Street-detector exemption only, like videos.json above.
+R="$(new_repo)"
+mkdir -p "$R/src/assets"
+printf '{"variants":[{"source":"src/assets/originals/properties/%s 1.webp"}]}\n' "$BADSTREET" > "$R/src/assets/asset-manifest.json"
+git -C "$R" add src/assets/asset-manifest.json
+allows "$R" "a listing address in src/assets/asset-manifest.json is published pipeline output"
+
+R="$(new_repo)"
+mkdir -p "$R/src/assets"
+printf '{"variants":[{"source":"src/assets/originals/properties/%s 1.webp"}]}\n' "$BADSTREET" > "$R/src/assets/asset-manifest-hero.json"
+git -C "$R" add src/assets/asset-manifest-hero.json
+allows "$R" "the same address in src/assets/asset-manifest-hero.json is allowed too"
+
+R="$(new_repo)"
+mkdir -p "$R/src/assets"
+printf '{"variants":[{"contact":"%s"}]}\n' "$BADMAIL" > "$R/src/assets/asset-manifest.json"
+git -C "$R" add src/assets/asset-manifest.json
+blocks "$R" "a third-party email in the address-exempt asset-manifest.json still blocks"
+
+R="$(new_repo)"
+mkdir -p "$R/src/assets"
+printf '{"client":{"addr":"%s"}}\n' "$BADSTREET" > "$R/src/assets/clients.json"
+git -C "$R" add src/assets/clients.json
+blocks "$R" "the same address in a NON-manifest src/assets file still blocks"
+
 printf '== ...and real-looking PII still blocks ==\n'
 R="$(new_repo)"
 printf 'owner = "%s"\n' "$BADMAIL" > "$R/crm.py"
