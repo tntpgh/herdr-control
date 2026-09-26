@@ -552,6 +552,96 @@ run_notify bash
 [ "$(q_state)" = blocked ] && ok "blocked state survives unreachable conductor" || bad "worker hidden by failed conductor delivery"
 CBIRTH="cterm-1"
 
+printf '== change 4: the same kind of prompt, but a peer already refused THIS one -> delivered immediately, never held ==\n'
+omp_menu_screen "git log --oneline -3" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+pid_c4="$(prompt_id "$WPANE")"
+append_event run1 task1 approval_escalated \
+  "$(jq -nc --arg v escalate --arg r "peer refused earlier" --arg p "$WPANE" --arg pid "$pid_c4" \
+     '{verdict:$v, reason:$r, pane:$p, prompt_id:$pid}')" >/dev/null 2>&1
+: > "$SENT"
+before_held=$(q_event wake_held)
+before_att=$(q_event wake_attempted)
+run_notify bash
+[ "$(q_event wake_held)" = "$before_held" ] && ok "no NEW wake_held once a peer already refused this exact prompt" || bad "wake_held written despite a prior refusal"
+[ "$(q_event wake_attempted)" -gt "$before_att" ] && ok "delivery attempted immediately instead" || bad "no delivery attempted"
+grep -q "send-text $CPANE" "$SENT" && ok "wake text reached the conductor pane" || bad "not delivered: $(cat "$SENT")"
+
+printf '== fix/peer-waits-for-record change 5: a corroborated recorded command (matches the live panel) passes through unchanged ==\n'
+run_notify_cmd() {                      # <tool> <command>
+  jq -nc --arg tool "$1" --arg cmd "$2" \
+    '{tool:$tool, message:"omp needs permission", cwd:"/tmp/repo", command:$cmd}' \
+    | ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" \
+               HERDR_RUN_ID=run1 HERDR_TASK_ID=task1 HERDR_TASK_LABEL="impl:omp-test"
+        bash "$here/agent-hooks/omp-notify.sh" >"$WORK/n.out" 2>"$WORK/n.err" )
+}
+omp_menu_screen "wrangler deploy --env prod" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+: > "$SENT"
+run_notify_cmd bash "wrangler deploy --env prod"
+printf '%s' "$(q_payload input_required)" | jq -e '.command == "wrangler deploy --env prod"' >/dev/null 2>&1 \
+  && ok "a recorded command that matches the live panel passes through unchanged" \
+  || bad "corroborated command payload: $(q_payload input_required)"
+printf '%s' "$(q_payload input_required)" | jq -e '.command_uncorroborated == true' >/dev/null 2>&1 \
+  && bad "a corroborated command was flagged uncorroborated" \
+  || ok "no uncorroborated flag on a corroborated command"
+
+printf '== change 5: an UNcorroborated recorded command (panel shows A, hook fires with B) is dropped, not trusted ==\n'
+# Live canary, 2026-09-26 20:54:33Z: two bash tool calls in one turn painted
+# tool call A's panel; the hook firing for tool call B fingerprinted A's
+# still-painted panel while recording B's different command under A's
+# prompt_id. Reproduced directly: the SCREEN shows one command, the hook
+# payload's "command" field names a completely different one.
+omp_menu_screen "git fetch --all --prune" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+: > "$SENT"
+run_notify_cmd bash "rm -rf /tmp/nowhere-near-the-panel"
+payload="$(q_payload input_required)"
+printf '%s' "$payload" | jq -e '.command == ""' >/dev/null 2>&1 \
+  && ok "the mismatched command is never written into the row (empty, not trusted)" \
+  || bad "uncorroborated payload kept the mismatched command: $payload"
+printf '%s' "$payload" | jq -e '.command_uncorroborated == true' >/dev/null 2>&1 \
+  && ok "the row is flagged command_uncorroborated" \
+  || bad "no command_uncorroborated flag: $payload"
+printf '%s' "$payload" | jq -r '.command_hint' | grep -q 'rm -rf /tmp/nowhere-near-the-panel' \
+  && ok "command_hint preserves the mismatched text for forensics" \
+  || bad "command_hint missing or wrong: $payload"
+# The gate that decides who is woken must judge the SAME (absent) text —
+# "git fetch --all --prune" is itself allow-class, so this must be HELD,
+# never delivered on the strength of the mismatched rm -rf text.
+[ ! -s "$SENT" ] && ok "delivery gated on the corroborated (absent) command, not the mismatched rm -rf" \
+  || bad "delivered immediately as if the mismatched rm -rf text was trusted: $(cat "$SENT")"
+# Held (allow-class), so push_wake spawned a real 90s grace_realert timer for
+# this prompt — claim its idempotency key now so that timer's own claim_once
+# finds it taken and self-suppresses instead of typing a stray wake into
+# $SENT during a later, unrelated test (the exact mechanism release_wake_hold
+# uses in lib/push-wake.sh).
+claim_once "grace_realert_run1_task1_$(prompt_id "$WPANE")" run1 task1 grace_realert_claim '{}' >/dev/null 2>&1
+set_task_state run1 task1 running >/dev/null 2>&1
+
+printf '== HIGH (PR #158 review): a recorded command that is a SUBSTRING of the panel text must not corroborate ==\n'
+# The exact HIGH exploit shape: the old rule accepted `recorded` whenever its
+# collapsed text occurred ANYWHERE in the collapsed panel. "ls" is a literal
+# substring of "pulls" here — the old rule would have corroborated it and let
+# it through as the judged command; the anchored rule requires equality
+# against the command region and refuses.
+omp_menu_screen "gh api -X PUT repos/o/r/pulls/7/merge" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+: > "$SENT"
+run_notify_cmd bash "ls"
+payload="$(q_payload input_required)"
+printf '%s' "$payload" | jq -e '.command == ""' >/dev/null 2>&1 \
+  && ok "'ls' (a substring of '...pulls...') is never written as the recorded command" \
+  || bad "substring false positive: $payload"
+printf '%s' "$payload" | jq -e '.command_uncorroborated == true' >/dev/null 2>&1 \
+  && ok "flagged command_uncorroborated" \
+  || bad "no command_uncorroborated flag: $payload"
+# The panel's OWN command (a PUT merge) is human-reserved -> must still be
+# HELD/gated the same as any other human-class prompt, never delivered on
+# the strength of the allow-class "ls" that almost slipped through.
+claim_once "grace_realert_run1_task1_$(prompt_id "$WPANE")" run1 task1 grace_realert_claim '{}' >/dev/null 2>&1
+set_task_state run1 task1 running >/dev/null 2>&1
+
 printf '== conductorless worker still persists its verified input request ==\n'
 set_task_state run1 task1 running >/dev/null 2>&1
 CPANE=""
