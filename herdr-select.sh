@@ -335,11 +335,18 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
   registry_cmd="$(task_input_required_command "$own_run" "$own_task" "$current_prompt_id" 2>/dev/null)"
   # lib/scoped-policy.sh approval_command_text: the recorded command when the
   # panel (whitespace-collapsed) contains it, else the panel; exit 2 = the two
-  # disagree, which refuses — shared with lib/alert-gate.sh so the gate that
-  # decides who is woken judges the same text this script enforces on.
+  # disagree, which refuses Approve — shared with lib/alert-gate.sh so the
+  # gate that decides who is woken judges the same text this enforces on. A
+  # Deny approves nothing, so a mismatch here is not a reason to withhold it:
+  # keep cmd_text as the scraped panel text already captured above (the
+  # audit record still shows what was on screen) and let the decline proceed.
+  panel_scrape="$cmd_text"
   cmd_text="$(approval_command_text "$cmd_text" "$registry_cmd")" || {
-    echo "herdr-select: the recorded command for this prompt does not match what is on screen in $pane — refusing." >&2
-    exit 8
+    if [ "$declining" = 0 ]; then
+      echo "herdr-select: the recorded command for this prompt does not match what is on screen in $pane — refusing." >&2
+      exit 8
+    fi
+    cmd_text="$panel_scrape"
   }
   [ -n "$registry_cmd" ] && [ "$cmd_text" = "$registry_cmd" ] && cmd_text_is_scrape=0
 fi
