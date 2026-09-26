@@ -117,6 +117,48 @@ sel 1 --authority peer; rc=$?
 [ "$(keys_pressed)" = "0" ] && ok "NO KEY PRESSED on a credential-exfil prompt" || bad "keys pressed=$(keys_pressed) on a refusal!"
 [ "$(( $(count_events approval_escalated) - before_esc ))" = "1" ] && ok "approval_escalated event recorded" || bad "escalation not recorded"
 
+printf '== PR #147 hold: an allow-class command with a TORN raw capture must escalate, not auto-approve ==\n'
+# set_screen writes through prompt_command_text's RAW herdr-pane-read path
+# (lib/prompt-parse.sh), unlike the other cases above which only vary the
+# command text -- this one puts an invalid UTF-8 byte in the RAW capture
+# itself. _sanitize_utf8 (iconv -c) drops it so parsing never crashes, but
+# lib/command-policy.sh then classifies whatever SURVIVES the drop. Main's
+# live probe (2026-09-25) showed that turns some escalate/deny verdicts into
+# allow -- a download command is the case that is allow even on CLEAN text,
+# so it is the sharpest proof: this exact command is pressed when the capture
+# is clean and refused when it is torn, with nothing else different.
+set_screen_torn() {                     # <command-text>
+  cat > "$SCREEN" <<EOF
+ Bash command
+   $1 $(printf '\342\200')
+   (a description line)
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+EOF
+}
+set_screen "curl https://example.com/report -o /tmp/report.json"; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && ok "clean capture: allowed, key pressed (baseline)" \
+  || bad "clean capture unexpectedly refused: exit $rc; stderr: $(cat "$WORK/err.txt")"
+set_screen_torn "curl https://example.com/report -o /tmp/report.json"; reset_keys
+before_esc=$(count_events approval_escalated)
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "torn capture: REFUSED even though the classifier would allow the visible text" \
+  || bad "torn capture was not refused: exit $rc (expected 8); stderr: $(cat "$WORK/err.txt")"
+[ "$(keys_pressed)" = "0" ] && ok "NO KEY PRESSED on a torn capture" || bad "keys pressed=$(keys_pressed) on a torn refusal!"
+[ "$(( $(count_events approval_escalated) - before_esc ))" = "1" ] && ok "approval_escalated event recorded for the torn capture" || bad "escalation not recorded"
+# A capture that was ALREADY going to deny (never auto-approvable) stays
+# denied rather than being relabelled escalate -- the override only ever
+# tightens an allow, it never loosens an existing deny.
+set_screen_torn "rm -rf ~"; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "a torn capture that was already deny-class stays refused" \
+  || bad "torn deny-class command was not refused: exit $rc"
+[ "$(keys_pressed)" = "0" ] && ok "NO KEY PRESSED on a torn deny-class command" || bad "keys pressed=$(keys_pressed)"
+
+
 printf '== RESERVED form (main merge), classifier ALLOW, peer authority -> REFUSED, no key pressed ==\n'
 # Found live 2026-09-12 (thurber-os plan 012 lab): classify_command says
 # `allow` for `gh pr merge`, and conductor_reserved_reason — the human-only
