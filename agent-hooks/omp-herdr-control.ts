@@ -251,7 +251,7 @@ function isFleetCreatingTool(toolName: string): boolean {
   ].some((stem) => normalized.includes(stem));
 }
 
-function onToolCall(event: unknown): { block: true; reason: string } | undefined {
+function pretoolRegistrationBlock(event: unknown): { block: true; reason: string } | undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     const toolName = typeof e.toolName === "string" ? e.toolName : "";
@@ -288,11 +288,10 @@ function onToolCall(event: unknown): { block: true; reason: string } | undefined
 //
 // Notification deliberately does NOT use `tool_call`: that event fires before
 // every approved call and would force a screen scrape just to discover whether
-// an approval menu appeared. The narrow `onToolCall` guard above is different:
-// it runs only for delegation-shaped tools and synchronously checks the
-// central registration/generation record before omp can create invisible work.
-// Approval notifications remain attached only to events emitted when omp
-// actually needs a human, so ordinary calls cost zero herdr RPCs here.
+// an approval menu appeared. The one registered `tool_call` handler below does
+// only bounded pre-work: cache bash/shell input for the later approval event and
+// run the fail-closed registration guard for delegation-shaped tools. Ordinary
+// tool calls return undefined and cost zero herdr RPCs here.
 function notifyForPrompt(toolName: string, message: string, command?: string): void {
   if (!notifyAvailable) return;
   const payload: Record<string, unknown> = { tool: toolName, message, cwd: process.cwd() };
@@ -300,11 +299,55 @@ function notifyForPrompt(toolName: string, message: string, command?: string): v
   spawnDetached([NOTIFY_SH], JSON.stringify(payload));
 }
 
+// omp (verified against the v18.3.0 binary, 2026-09-24) emits
+// `tool_approval_requested` with ONLY {sessionId, toolName, toolCallId,
+// reason?, approvalMode} — no `input`, no `args`. So `e.input ?? e.args` was
+// always undefined: every alert read "omp needs your permission to use bash"
+// and the untruncated-command channel (#3b item 2) recorded `command: ""` on
+// every input_required event (measured: all of plan:geo-audit's, 2026-09-24),
+// which left herdr-select.sh judging the scraped panel and the ownership
+// grant unable to ever match. The arguments DO arrive earlier, on `tool_call`
+// ({toolName, toolCallId, input}), which omp emits for every call before it
+// decides whether approval is needed. Cache bash/shell inputs by toolCallId
+// there and look them up here. Bounded (oldest evicted) so a long session
+// never grows it; bash/shell only, the one tool whose argument this carries.
+//
+// Registering on `tool_call` puts this file back in omp's fail-closed
+// dispatch (a THROWING tool_call handler blocks the tool), so the cache path is
+// a try/catch around a Map write and ordinary calls return undefined. The same
+// handler may deliberately return `{block:true}` for delegation-shaped tools
+// that fail the central registration/generation check.
+const INPUT_CACHE_MAX = 32;
+const inputByCallId = new Map<string, unknown>();
+
+function cacheBashInput(event: unknown): void {
+  try {
+    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    const name = typeof e.toolName === "string" ? e.toolName.toLowerCase() : "";
+    if ((name !== "bash" && name !== "shell") || typeof e.toolCallId !== "string") return;
+    inputByCallId.set(e.toolCallId, e.input);
+    while (inputByCallId.size > INPUT_CACHE_MAX) {
+      const oldest = inputByCallId.keys().next().value;
+      if (oldest === undefined) break;
+      inputByCallId.delete(oldest);
+    }
+  } catch {
+    // MUST NOT throw — a throwing tool_call handler blocks the tool.
+  }
+}
+
+function onToolCall(event: unknown): { block: true; reason: string } | undefined {
+  cacheBashInput(event);
+  return pretoolRegistrationBlock(event);
+}
+
 function onApprovalRequested(event: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     const toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
-    const input = e.input ?? e.args;
+    const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
+    const input = e.input ?? e.args ?? (callId !== undefined ? inputByCallId.get(callId) : undefined);
+    if (callId !== undefined) inputByCallId.delete(callId);
     // `reason` is the approval's own words when omp supplies one; the argument
     // summary is the fallback, and still the more useful line for bash.
     const detail = describeToolCall(toolName, input)

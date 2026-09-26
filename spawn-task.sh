@@ -50,6 +50,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/agent-profiles.sh"
 . "$here/lib/repo-root.sh"
 . "$here/lib/handoff.sh"
+. "$here/lib/task-manifest.sh"
 . "$here/lib/op-env.sh"
 
 # ---- args ------------------------------------------------------------------
@@ -447,6 +448,43 @@ fi
 [ -s "$spec_path" ] || { echo "spawn-task: failed to write $spec_path" >&2; exit 1; }
 [ -e "$proof_path" ] || : > "$proof_path" 2>/dev/null || { echo "spawn-task: failed to write $proof_path" >&2; exit 1; }
 
+# ---- capability manifest: approved ONCE, here, by the spawning conductor ---
+# lib/task-manifest.sh. The ```herdr-manifest block in the conductor's brief
+# is what this task may do without a per-call review (GETs to named hosts into
+# named paths; a git ceiling). Writing the brief and running this spawn is the
+# one decision; the registry records it (manifest_approved: sha256 +
+# conductor) and the policy reads it from there, never from the worktree.
+#
+# Parsed ONLY from a --brief that lives OUTSIDE the worktree. The worktree's
+# .handoffs/SPEC.md is worker-writable, and a re-spawn keeps it (or reads it
+# back via `--brief <wt>/.handoffs/SPEC.md`), so parsing it would let a worker
+# write its own manifest and have the next re-spawn stamp it "approved"
+# (security review SCOPE-02, 2026-09-24). Any other re-spawn carries the
+# worktree's previously APPROVED manifest forward from the registry, and a
+# differing block in SPEC.md is ignored, loudly. Invalid refuses the spawn —
+# still before any herdr/registry side effect.
+manifest_json=""
+_brief_outside_wt=0
+if [ -n "$brief_file" ]; then
+  _brief_real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$brief_file" 2>/dev/null)" || _brief_real=""
+  _wt_real="$(cd "$wt" 2>/dev/null && pwd -P)"
+  [ -n "$_brief_real" ] || { echo "spawn-task: --brief path cannot be resolved" >&2; exit 1; }
+  case "$_brief_real" in "$_wt_real"/*) ;; *) _brief_outside_wt=1 ;; esac
+fi
+if [ "$_brief_outside_wt" = 1 ]; then
+  manifest_json="$(manifest_from_spec "$brief_file")" || {
+    echo "spawn-task: refusing — the herdr-manifest block in $brief_file is invalid (see above)" >&2
+    exit 1
+  }
+else
+  manifest_json="$(task_for_worktree "$wt" 2>/dev/null | jq -r '.manifest // empty' 2>/dev/null)"
+  _spec_manifest="$(manifest_from_spec "$spec_path" 2>/dev/null)"
+  if [ -n "$_spec_manifest" ] && [ "$_spec_manifest" != "$manifest_json" ]; then
+    echo "spawn-task: WARNING — $spec_path carries a herdr-manifest that was never approved; IGNORED." >&2
+    echo "spawn-task: to approve one, pass --brief <file outside the worktree> containing it." >&2
+  fi
+fi
+
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
 ws=$(bash "$here/ensure-workspace.sh" --no-focus "$root") || exit 1
 tc=$(herdr tab create --workspace "$ws" --cwd "$wt" --label "$label" "$foc" 2>/dev/null)
@@ -456,7 +494,7 @@ pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 [ -n "$tab" ] && [ -n "$pane" ] || { echo "spawn-task: tab create failed in $ws" >&2; exit 1; }
 
 register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
-  "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk" "$project_label"
+  "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk" "$project_label" "$manifest_json"
 
 # ---- claim the worktree on the worker's behalf ------------------------------
 # A spawned worker will never type `claim.sh take`, and neither will anyone
@@ -514,11 +552,14 @@ jq -n \
   --arg worktree "$wt" --arg branch "$branch" --arg repo "$root" \
   --arg project "$project_label" \
   --arg example "$identity_example" \
+  --arg manifest "$manifest_json" \
   --arg spec "$(handoff_spec "$wt")" --arg proof_file "$(handoff_proof "$wt")" \
   '{run_id:$run, task_id:$task, worker_id:$worker, conductor_id:$conductor,
     pane_id:$pane, label:$label, completion_event:$event,
     events_file:$events, worktree:$worktree, branch:$branch, repo:$repo,
     project:$project, spec_file:$spec, proof_file:$proof_file,
+    capability_manifest:(if $manifest == "" then null else ($manifest|fromjson) end),
+    capability_manifest_note:"Approved once at spawn by the conductor (registry event manifest_approved). Inside it, approvals clear without a per-call review; outside it they escalate exactly as before. This copy is informational — editing it changes nothing the approver reads.",
     how_to_complete:"Append one JSON line to events_file, using completion_event verbatim, PLUS a closure reason field: shipped | handed_off_to:<task|role> | blocked_on:<thing> | canceled | no-follow-on. `shipped` also needs a proof field — a PR URL + merge sha, or a section id in proof_file written as \".handoffs/PROOF.md#<section>\" (it must actually hold something you wrote, not stay empty) — the registry refuses `completed` without one (lib/run-registry.sh). Read spec_file for the acceptance checklist and write what you verified into proof_file before closing shipped. Read these values HERE — do not try env/printenv, that is human-reserved and will stall you until a human answers.",
     closure_reasons:["shipped","handed_off_to:<task|role>","blocked_on:<thing>","canceled","no-follow-on"],
     example:$example}' \
@@ -646,5 +687,11 @@ printf '    or have the task call append_event() from lib/run-registry.sh direct
 printf '    (writes to the central registry, survives worktree removal) before it\n'
 printf '    removes its own worktree.\n'
 printf '  registry: %s  (run=%s task=%s)\n' "$(registry_db)" "$run_id" "$task_id"
+if [ -n "$manifest_json" ]; then
+  printf '  capability manifest APPROVED at spawn by %s (sha256 %s):\n    %s\n' \
+    "${conductor_pane_id:-$conductor_id}" "$(manifest_sha "$manifest_json" | cut -c1-12)" "$manifest_json"
+else
+  printf '  capability manifest: none (no ```herdr-manifest block in SPEC.md) — every approval is judged per call, as before\n'
+fi
 printf '  conductor: %s%s\n' "${conductor_pane_id:-<none — spawned outside a herdr pane, no push wake>}" \
   "${conductor_pane_id:+ (push wake wired if the worker hits an input-needed event)}"

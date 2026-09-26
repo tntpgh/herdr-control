@@ -436,6 +436,14 @@ canonical_rules_compose() {  # <':'-joined sources> -> composed cache file path;
       printf -- '\n<!-- source: %s -->\n' "$one"
       cat "$one" || exit 1
     done
+    # herdr-control's own worker rules (how approvals work for a spawned
+    # worker: code by reference, briefs by reference, the capability
+    # manifest). Tracked in this repo, so they ship with the policy they
+    # describe instead of living in an operator file that can drift from it.
+    if [ -r "$_ap_dir/worker-rules.md" ]; then
+      printf -- '\n'
+      cat "$_ap_dir/worker-rules.md" || exit 1
+    fi
   ) > "$out.tmp.$$" || { rm -f "$out.tmp.$$"; return 1; }
   mv -f "$out.tmp.$$" "$out" || return 1
   printf '%s\n' "$out"

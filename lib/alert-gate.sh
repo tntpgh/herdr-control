@@ -2,7 +2,7 @@
 # alert-gate.sh — decide whether a prompt on a worker pane is one a HUMAN must
 # answer, or one an automated peer is allowed to take.
 #
-# Provides: human_must_answer <pane_id>   0 = tell a person, 1 = a peer may take it
+# Provides: human_must_answer <pane_id> [recorded-cmd]   0 = tell a person, 1 = a peer may take it
 #           grace_realert <pane_id> <prompt_id> <run> <task> <cmd...>
 #
 # Why this exists: every approval prompt used to produce a Slack alert AND a
@@ -32,13 +32,19 @@ _ag_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_ag_dir/prompt-parse.sh"
 . "$_ag_dir/command-policy.sh"
 . "$_ag_dir/run-registry.sh"
+. "$_ag_dir/scoped-policy.sh"
 . "$_ag_dir/pending-queue.sh"
 
 # 0 = a human must answer this. 1 = peer authority may take it.
 # Unreadable, unclassifiable, or no prompt at all -> 0. Telling a person about
 # something we could not read is the safe direction; staying quiet is not.
+# [recorded-cmd] is the untruncated command the hook recorded for this prompt
+# (agent-hooks/omp-herdr-control.ts); judged instead of the panel only when the
+# panel contains it — lib/scoped-policy.sh approval_command_text, the same
+# rule herdr-select.sh enforces, as is the peer decision itself (peer_decide),
+# so this gate and the answer path cannot disagree about who owns a prompt.
 human_must_answer() {
-  local pane="$1" cmd verdict
+  local pane="$1" recorded="${2:-}" cmd task
   [ -n "$pane" ] || return 0
   # A COMPLETE recognized prompt must be on screen before anything is classified.
   # Two distinct reasons, both found by tests rather than by reasoning:
@@ -65,12 +71,12 @@ human_must_answer() {
     [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || return 0
   fi
   cmd="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
+  cmd="$(approval_command_text "$cmd" "$recorded")" || return 0
   [ -n "${cmd//[[:space:]]/}" ] || return 0
   case "$cmd" in *elided*|*truncated*) return 0 ;; esac
-  [ -n "$(conductor_reserved_reason "$cmd")" ] && return 0
-  verdict="$(classify_command "$cmd" 2>/dev/null || printf 'escalate')"
-  [ "$verdict" = allow ] || return 0
-  return 1
+  task="$(task_for_pane "$pane" 2>/dev/null)"
+  peer_decide "$cmd" "$task" && return 1
+  return 0
 }
 
 # Re-check after the grace window and alert if a prompt outlived it.

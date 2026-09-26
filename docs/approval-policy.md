@@ -147,6 +147,11 @@ belong in a text scanner; the real defence is that the RUN step is what needs
 review, and `sh|bash|python3 <file>` paired with a downloader in one command
 already escalates.
 
+*Update 2026-09-24 (task-scoped approval):* for a pane with a registered task,
+`bash|sh|python3 <file>` is no longer judged by its command line alone — the
+file's whole content is (rule 9), so this limit now applies only to panes with
+no registered task.
+
 **`wget -O-` and `wget -qO-` escalate, which is a false positive.** Stdout is
 recognised only POSITIVELY, by the extracted output target being `-` or
 `/dev/null`; the attached `-qO-` form is not extractable, so it lands in the
@@ -165,6 +170,30 @@ the attached `-O-` form as a target of `-`. **Never revive the negative test.**
 Every consequence rule in that file is positive on purpose, so extra text can
 only ever ADD an escalation — and that property is exactly what makes it safe
 for the classifier to refuse to split a command it cannot parse confidently.
+
+## 9. Task scope is approved once, at spawn, and only narrows or pre-reviews
+
+`lib/scoped-policy.sh` `peer_decide` is the one peer decision, called by both
+`herdr-select.sh` and `lib/alert-gate.sh`. It adds the task's own context to
+the context-free text rules, in this order: the manifest's `git` ceiling → the
+#3b ownership grant → `classify_command` → **the human-reserved list, which
+nothing after it can override** → the manifest scope (only ever clears an
+`escalate`) → code by reference.
+
+- **The capability manifest** (```` ```herdr-manifest ```` in SPEC.md,
+  `lib/task-manifest.sh`) is approved by the conductor that runs
+  `spawn-task.sh` — one decision, recorded as `manifest_approved` with its
+  sha256 — and stored on the registry row. The worker-writable
+  `identity.json` copy is never read by the policy. It can only name what
+  that conductor could already approve per call (GETs to exact hosts into
+  worktree paths; a git ceiling); `net_write` accepts only `none`.
+- **Code by reference**: a reviewing authority's approval of a script file is
+  bound to `(task, realpath, sha256)` in `file_approvals`; the same bytes
+  re-run without review, different bytes for that path escalate again, and a
+  file whose content is human-reserved cannot be approved by the conductor.
+  This is rule 6's content-hash trust step applied to worker code.
+
+Design and prior art: `docs/research/scoped-approval.md`.
 
 ---
 

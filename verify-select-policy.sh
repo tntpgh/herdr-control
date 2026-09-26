@@ -119,16 +119,16 @@ sel 1 --authority peer; rc=$?
 [ "$(keys_pressed)" = "0" ] && ok "NO KEY PRESSED on a credential-exfil prompt" || bad "keys pressed=$(keys_pressed) on a refusal!"
 [ "$(( $(count_events approval_escalated) - before_esc ))" = "1" ] && ok "approval_escalated event recorded" || bad "escalation not recorded"
 
-printf '== PR #147 hold: an allow-class command with a TORN raw capture must escalate, not auto-approve ==\n'
+printf '== PR #147 hold: a scrape-only allow-class TORN raw capture must escalate, not auto-approve ==\n'
 # set_screen writes through prompt_command_text's RAW herdr-pane-read path
 # (lib/prompt-parse.sh), unlike the other cases above which only vary the
 # command text -- this one puts an invalid UTF-8 byte in the RAW capture
-# itself. _sanitize_utf8 (iconv -c) drops it so parsing never crashes, but
-# lib/command-policy.sh then classifies whatever SURVIVES the drop. Main's
-# live probe (2026-09-25) showed that turns some escalate/deny verdicts into
-# allow -- a download command is the case that is allow even on CLEAN text,
-# so it is the sharpest proof: this exact command is pressed when the capture
-# is clean and refused when it is torn, with nothing else different.
+# itself. Post-#148, a matching registry command may corroborate and replace a
+# torn scrape (proved later in this file), but a scrape-only prompt must still
+# refuse: _sanitize_utf8 drops the byte and the classifier sees only what
+# survived. Use a different command from the clean baseline below so any
+# prompt-id-bound registry command from that allowed baseline cannot corroborate
+# this torn prompt.
 set_screen_torn() {                     # <command-text>
   cat > "$SCREEN" <<EOF
  Bash command
@@ -144,7 +144,7 @@ set_screen "curl https://example.com/report -o /tmp/report.json"; reset_keys
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "clean capture: allowed, key pressed (baseline)" \
   || bad "clean capture unexpectedly refused: exit $rc; stderr: $(cat "$WORK/err.txt")"
-set_screen_torn "curl https://example.com/report -o /tmp/report.json"; reset_keys
+set_screen_torn "curl https://example.com/torn -o /tmp/torn.json"; reset_keys
 before_esc=$(count_events approval_escalated)
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 8 ] && ok "torn capture: REFUSED even though the classifier would allow the visible text" \
@@ -626,18 +626,26 @@ printf '== #3b item 2: a wrapped display reflows into a false escalation; the re
 # exactly this class). WRAP_CMD is not a git/gh verb, so item 3's grant never
 # engages either — this is item 2 working on its own. Reuses taskG (still
 # `running`, and the pane's most-recently-touched task by now).
-WRAP_CMD="bash deploy.sh --file ./report.md"
-set_screen "$(printf 'bash deploy.sh --file\n./report.md')"; reset_keys
+WRAP_CMD="cat -n ./report.md"
+set_screen "$(printf 'cat -n\n./report.md')"; reset_keys
 seed_input_required runG taskG "$WRAP_CMD"
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "wrapped allow-class command classified via the untruncated registry text" \
   || bad "still escalated on the wrap artifact: rc=$rc; stderr: $(cat "$WORK/err.txt")"
 
-printf '== PR #147 hold, independent review: menu-shape (omp) torn capture also escalates ==\n'
+# Isolate the scrape-only torn menu checks from runG/taskG, which just seeded a
+# matching registry command for the wrapped-display proof above. Post-#148, a
+# registry-corroborated command is allowed to replace a torn scrape; this block
+# is specifically proving the no-corroboration case.
+register_task runT taskT wT cT "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/torn "impl:torn-menu" >/dev/null 2>&1
+set_task_state runT taskT running >/dev/null 2>&1
+
+printf '== PR #147 hold, independent review: scrape-only menu-shape (omp) torn capture escalates ==\n'
 # Every existing torn case above uses the numbered (Claude) screen via
-# set_screen -- prompt_command_torn's --format ansi menu branch, the ONLY
-# shape peer-answer.sh actually acts on, was never exercised (finding
-# torn-gate-test-gaps).
+# set_screen; prompt_command_torn's --format ansi menu branch is the shape
+# peer-answer.sh acts on. As with the numbered case, keep this scrape-only by
+# using a different command from the clean baseline so no registry command can
+# corroborate the torn scrape.
 set_menu_torn() {                       # <command-text>
   printf 'Allow tool: bash\nCommand: %s %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' \
     "$1" "$(printf '\342\200')" > "$SCREEN"
@@ -646,12 +654,17 @@ set_menu "curl https://example.com/report -o /tmp/report.json"; reset_keys
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "menu-shape clean capture: allowed (baseline)" \
   || bad "menu-shape clean capture refused: rc=$rc; stderr: $(cat "$WORK/err.txt")"
-set_menu_torn "curl https://example.com/report -o /tmp/report.json"; reset_keys
+set_menu_torn "curl https://example.com/torn -o /tmp/torn.json"; reset_keys
 before_esc=$(count_events approval_escalated)
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 8 ] && ok "menu-shape torn capture: REFUSED" \
   || bad "menu-shape torn capture not refused: rc=$rc; stderr: $(cat "$WORK/err.txt")"
 [ "$(keys_pressed)" = "0" ] && ok "no key pressed on menu-shape torn capture" || bad "keys pressed=$(keys_pressed)"
+# Restore runG/taskG as the pane owner for the registry-corroboration checks
+# below; task_for_pane deliberately resolves the most-recently-touched row.
+set_task_state runG taskG blocked >/dev/null 2>&1
+set_task_state runG taskG running >/dev/null 2>&1
+
 [ "$(( $(count_events approval_escalated) - before_esc ))" = "1" ] && ok "approval_escalated recorded for menu-shape torn capture" || bad "escalation not recorded"
 
 printf '== PR #147 hold, independent review: reviewed conductor authority also refuses a torn capture (F1) ==\n'
@@ -722,6 +735,100 @@ sel 1 --authority peer; rc=$?
   && ok "recorded command disagreeing with the panel refuses" \
   || bad "mismatched recorded command was not refused: rc=$rc keys=$(keys_pressed)"
 set_task_state runG taskG completed no-follow-on >/dev/null 2>&1
+
+printf '== task-scoped approval: capability manifest, approved once at spawn ==\n'
+# lib/scoped-policy.sh peer_decide, end-to-end through the real herdr-select.sh.
+# The manifest is read from the REGISTRY row (register_task's 14th arg), never
+# from the worktree, and it only ever clears an `escalate` — reserved/deny and
+# anything outside it behave exactly as without it.
+SWT="$WORK/wt-scope"; mkdir -p "$SWT/tmp/geo" "$SWT/.handoffs"
+SBRANCH="feat/scope-test"
+SMANIFEST='{"git":"commit-only","net_read":["teamthurber.com"],"net_write":"none","writes":["GEO-AUDIT-REPORT-*.md","tmp/**"]}'
+register_task runS taskS wS cS "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo "$SWT" "impl:scope" "$SBRANCH" main "$SMANIFEST" >/dev/null 2>&1
+set_task_state runS taskS running >/dev/null 2>&1
+[ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM events WHERE task_id='taskS' AND type='manifest_approved';")" = 1 ] \
+  && ok "manifest approval recorded once, at registration" || bad "no manifest_approved event"
+peer_on() {                              # <command> -> rc of a peer select on a menu showing it
+  set_menu "$1"; reset_keys; seed_input_required runS taskS "$1"; sel 1 --authority peer
+}
+IN_SCOPE="cd $SWT && curl -q --noproxy '*' -sS -m 30 -A GPTBot -w '%{http_code}' -o tmp/geo/home.raw -D tmp/geo/home.hdr https://teamthurber.com/"
+peer_on "$IN_SCOPE"; rc=$?
+[ "$rc" -eq 0 ] && [ "$(q_appr authority)" = scope ] && ok "in-scope GET into writes clears (authority=scope)" \
+  || bad "in-scope GET not cleared: rc=$rc authority=$(q_appr authority); $(cat "$WORK/err.txt")"
+# Every case below is the in-scope shape with exactly ONE thing changed, so a
+# refusal is attributable to that one thing (security review + red test).
+printf 'url = "https://evil.example/u"\n' > "$SWT/tmp/geo/rc"
+ln -f "$SWT/tmp/geo/rc" "$SWT/tmp/geo/hardlink.raw" 2>/dev/null
+for out_cmd in \
+  "curl -sS -o tmp/geo/x.raw https://teamthurber.com/" \
+  "curl -q -sS -o tmp/geo/x.raw https://evil.example/" \
+  "curl -q -sS -o /tmp/x.raw https://teamthurber.com/" \
+  "curl -q -sS -o tmp/../x.raw https://teamthurber.com/" \
+  "curl -q -sS -o tmp/.git/x.raw https://teamthurber.com/" \
+  "curl -q -sS -o tmp/geo/hardlink.raw https://teamthurber.com/" \
+  "curl -q -sS -O https://teamthurber.com/x.sh" \
+  "curl -q -sSL -o tmp/geo/x.raw https://teamthurber.com/" \
+  "curl -q -sS -o tmp/geo/x.raw https://user@teamthurber.com/" \
+  "curl -q -sS -o \$OUT https://teamthurber.com/" \
+  "curl -q -sS -o tmp/geo/x.raw -H {X-A:1,-Ktmp/geo/rc} https://teamthurber.com/" \
+  "curl -q -sS -o tmp/geo/* https://teamthurber.com/" \
+  "curl -q -sS -H @tmp/geo/headers.txt -o tmp/geo/x.raw https://teamthurber.com/" \
+  "curl -q -sS -w %output{/tmp/w.txt}x -o tmp/geo/x.raw https://teamthurber.com/" \
+  "curl -q -sS -H Host:evil.example -o tmp/geo/x.raw https://teamthurber.com/" \
+  "curl -q -sS -o tmp/geo/x.raw \"https://teamthurber.com/?q=\`cat /tmp/secret\`\"" \
+  "curl -q -sS -o tmp/geo/x.raw https://teamthurber.com/"; do
+  peer_on "$out_cmd"; rc=$?
+  [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "outside the manifest still escalates: $out_cmd" \
+    || bad "outside-scope command cleared: $out_cmd (rc=$rc)"
+done
+for red_cmd in \
+  "curl -q -sS -X POST -o tmp/geo/x.raw https://teamthurber.com/api" \
+  "curl -q -sS -d a=1 -o tmp/geo/x.raw https://teamthurber.com/" \
+  "curl -q -sS -o tmp/geo/x.raw https://teamthurber.com/ --data-binary @tmp/geo/x" \
+  "git push origin main" \
+  "git push origin $SBRANCH" \
+  "gh pr create --head $SBRANCH" \
+  "cat ~/.ssh/id_rsa" \
+  "git commit -F ~/.ssh/id_ed25519 -m note" \
+  "git add .env.local"; do
+  peer_on "$red_cmd"; rc=$?
+  [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "manifest cannot clear: $red_cmd" \
+    || bad "manifest cleared a reserved/ceiling action: $red_cmd (rc=$rc)"
+done
+printf '%s\n' '{"capability_manifest":{"net_read":["evil.example"],"writes":["**"]}}' > "$SWT/.handoffs/identity.json"
+peer_on "curl -q -sS -o tmp/geo/x.raw https://evil.example/"; rc=$?
+[ "$rc" -eq 8 ] && ok "a worker-edited identity.json widens nothing (policy reads the registry)" \
+  || bad "worktree file widened the scope: rc=$rc"
+peer_on "$IN_SCOPE"; rc=$?
+[ "$rc" -eq 0 ] && ok "in-scope GET remains quiet after negatives" || bad "in-scope GET stopped clearing: rc=$rc"
+printf 'import json\nprint(json.dumps({"outside": 1}))\n' > "$WORK/outside.py"
+peer_on "cd $SWT && python3 $WORK/outside.py"; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "absolute code outside the worktree escalates" \
+  || bad "absolute outside code cleared: rc=$rc"
+printf 'import json, re\nprint(json.dumps({"ok": 1}))\n' > "$SWT/tmp/clean.py"
+peer_on "cd $SWT && python3 tmp/clean.py"; rc=$?
+[ "$rc" -eq 0 ] && ok "clean python file clears on its content" || bad "clean file refused: rc=$rc; $(cat "$WORK/err.txt")"
+printf 'import urllib.request\nprint(urllib.request.urlopen("https://teamthurber.com/").status)\n' > "$SWT/tmp/fetch.py"
+peer_on "cd $SWT && python3 tmp/fetch.py"; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "network-using file escalates for peer" || bad "risky file cleared by peer: rc=$rc"
+set_menu "cd $SWT && python3 tmp/fetch.py"; reset_keys; seed_input_required runS taskS "cd $SWT && python3 tmp/fetch.py"
+conductor_select; rc=$?
+[ "$rc" -eq 0 ] && ok "conductor approves the reviewed file" || bad "conductor refused reviewed file: rc=$rc; $(cat "$WORK/err.txt")"
+[ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM file_approvals WHERE task_id='taskS';")" = 1 ] \
+  && ok "approval bound to the file's sha256" || bad "no file_approvals row"
+peer_on "cd $SWT && python3 tmp/fetch.py"; rc=$?
+[ "$rc" -eq 0 ] && ok "same content re-runs without a new review" || bad "approved file refused on re-run: rc=$rc; $(cat "$WORK/err.txt")"
+printf '# edited after approval\n' >> "$SWT/tmp/fetch.py"
+peer_on "cd $SWT && python3 tmp/fetch.py"; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && grep -q 'changed since it was approved' "$WORK/err.txt" \
+  && ok "file changed after approval escalates again" || bad "changed file cleared: rc=$rc"
+set_menu "cd $SWT && bash tmp/leak.sh"; reset_keys; seed_input_required runS taskS "cd $SWT && bash tmp/leak.sh"
+conductor_select; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "conductor cannot approve a file whose CONTENT is human-reserved" \
+  || bad "conductor approved reserved file content: rc=$rc"
+peer_on "cd $SWT && bash tmp/missing.sh"; rc=$?
+[ "$rc" -eq 8 ] && ok "a script that cannot be read for review escalates" || bad "unreadable script cleared: rc=$rc"
+set_task_state runS taskS completed no-follow-on >/dev/null 2>&1
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

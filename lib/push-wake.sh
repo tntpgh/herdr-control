@@ -215,7 +215,7 @@ push_wake() {
   # neither check, and $wake embeds agent-controlled $msg — so that was
   # agent-influenced text typed and Entered into an unvalidated pane. A delayed
   # delivery must be a delivery, not a shortcut around the delivery's guards.
-  if [ -z "${HERDR_ALERT_FORCE:-}" ] && [ -n "${HERDR_PANE_ID:-}" ] && ! human_must_answer "${HERDR_PANE_ID}"; then
+  if [ -z "${HERDR_ALERT_FORCE:-}" ] && [ -n "${HERDR_PANE_ID:-}" ] && ! human_must_answer "${HERDR_PANE_ID}" "$full_cmd"; then
     if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
       append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "wake_held" \
         "$(jq -nc --arg p "$cpane" --arg pid "$pid" --arg k "$base" \

@@ -369,7 +369,7 @@ lc_pending "$A1" "$A2"
 mkdir -p "$LC/.pending.lock"
 ( sleep 1; rmdir "$LC/.pending.lock" ) &        # a sweep holding it, then done
 HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS="$T1" \
-  PENDING_LOCK_WAIT_S=5 bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer \
+  PENDING_LOCK_WAIT_S=5 bash "$here/herdr-select.sh" "$WPANE" 1 --authority human \
   >/dev/null 2>&1
 wait
 [ "$(lc_ts)" = "$T2 " ] \
@@ -431,7 +431,7 @@ HERDR_BRIDGE_STATE="$LC" bash "$here/herdr-select.sh" "$WPANE" 1 --authority pee
 # retracting it would delete the operator's own decision. Untrack THAT alert —
 # and only that one, because a pane can have several queued.
 HERDR_BRIDGE_STATE="$LC" HERDR_SELECT_VIA=slack-button HERDR_SELECT_TS="$T1" \
-  bash "$here/herdr-select.sh" "$WPANE" 1 --authority peer >/dev/null 2>&1
+  bash "$here/herdr-select.sh" "$WPANE" 1 --authority human >/dev/null 2>&1
 [ "$(lc_ts)" = "$T2 " ] \
   && ok "a Slack answer untracks only the alert that carried it" \
   || bad "wrong alerts untracked: $(lc_ts)"
@@ -574,6 +574,21 @@ clean_screen > "$COND_SCREEN"
 : > "$NOTIFIED"
 run_notify bash
 [ -s "$NOTIFIED" ] && ok "unrecognized choices still produce an alert" || bad "strict selection parser hid a real prompt"
+
+printf '== approval event with NO menu up -> silent, even if a numbered list is on screen ==\n'
+# 2026-09-24: a worker streaming a Write preview of a numbered markdown list
+# (no approval panel painted) produced a peer signal, because the numbered
+# prompt shape matched the file body and the gate then classified screen text.
+# The list below mentions `rm -rf`, so the old path also CLASSIFIED it
+# escalate and woke the conductor for a prompt that did not exist.
+printf ' Write tmp/geo/REPORT.md\n\n 1. Fix robots.txt\n 2. Remove stale pages: rm -rf tmp/geo/old\n 3. Add sameAs links\n' > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+: > "$SENT"; : > "$NOTIFIED"
+n_in_before="$(q_event input_required)"
+run_notify write
+[ ! -s "$NOTIFIED" ] && [ ! -s "$SENT" ] && [ "$(q_event input_required)" = "$n_in_before" ] \
+  && ok "numbered transcript text is not an approval prompt (no alert, no wake, no input_required)" \
+  || bad "false peer signal on a numbered list with no menu: notified=$(cat "$NOTIFIED") sent=$(cat "$SENT")"
 
 printf '== no HERDR_PANE_ID -> silent (cannot verify a prompt, so must not alert) ==\n'
 omp_menu_screen "rm -rf /" > "$WORKER_SCREEN"
@@ -723,12 +738,17 @@ const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
 console.log("EVENTS:" + Object.keys(handlers).sort().join(","));
-// Approval notifications stay on the approval events. tool_call is now also
-// registered, narrowly, for the pre-tool fleet registration/ownership guard;
-// ordinary tools must pass without a shell guard refusal.
-const tc = handlers["tool_call"]({ toolName: "read", input: { path: "/x" } });
-console.log("TOOL_CALL_RETURN:" + (tc === undefined ? "undefined" : JSON.stringify(tc)));
-const ar = handlers["tool_approval_requested"]({ toolName: "bash", input: { command: "git push --force" }, reason: "destructive" });
+// Approval notifications stay on approval events. tool_call is registered for
+// two bounded pre-work duties: cache bash input for omp v18.3 approval events
+// that omit input, and run the pre-tool fleet guard. Ordinary/non-delegating
+// calls must pass undefined.
+const tc = handlers["tool_call"]({ toolName: "bash", toolCallId: "call-1", input: { command: "git push --force" } });
+console.log("TOOLCALL_RETURN:" + (tc === undefined ? "undefined" : JSON.stringify(tc)));
+const tcRead = handlers["tool_call"]({ toolName: "read", input: { path: "/x" } });
+console.log("TOOL_CALL_RETURN:" + (tcRead === undefined ? "undefined" : JSON.stringify(tcRead)));
+const tcBad = handlers["tool_call"](null);
+console.log("TOOLCALL_NULL_RETURN:" + (tcBad === undefined ? "undefined" : JSON.stringify(tcBad)));
+const ar = handlers["tool_approval_requested"]({ toolName: "bash", toolCallId: "call-1", reason: "destructive", approvalMode: "write" });
 console.log("APPROVAL_RETURN:" + (ar === undefined ? "undefined" : JSON.stringify(ar)));
 const bas = handlers["before_agent_start"]({});
 console.log("INJECTED:" + (bas && bas.message ? bas.message.content : "none"));
@@ -740,13 +760,16 @@ await new Promise(r => setTimeout(r, 600));
 ' 2>&1)"
   printf '%s' "$shim_out" \
     | grep -q 'EVENTS:agent_end,before_agent_start,session_stop,tool_approval_requested,tool_approval_resolved,tool_call,tool_execution_end,tool_execution_start,tool_result' \
-    && ok "every event is registered, including the fail-closed pre-tool guard" || bad "events: $shim_out"
-  printf '%s' "$shim_out" | grep -q 'TOOL_CALL_RETURN:undefined' \
-    && ok "ordinary tool call passes the pre-tool guard" || bad "tool_call guard changed ordinary input: $shim_out"
+    && ok "every event is registered, including tool_call cache and pre-tool guard" || bad "events: $shim_out"
+  printf '%s' "$shim_out" | grep -q 'TOOLCALL_RETURN:undefined' && printf '%s' "$shim_out" | grep -q 'TOOL_CALL_RETURN:undefined' && printf '%s' "$shim_out" | grep -q 'TOOLCALL_NULL_RETURN:undefined' \
+    && ok "tool_call caches bash input and passes ordinary/garbage inputs" || bad "tool_call handler returned non-undefined unexpectedly: $shim_out"
   # Observability handlers return undefined; the pre-tool handler returns
   # undefined for ordinary calls and a block object only for refused delegation.
   printf '%s' "$shim_out" | grep -q 'APPROVAL_RETURN:undefined' \
     && ok "the approval handler returns undefined (never blocks the agent)" || bad "approval handler returned non-undefined"
+  jq -e '.command == "git push --force"' "$REC.notify" >/dev/null 2>&1 \
+    && ok "the untruncated command reaches omp-notify.sh from the tool_call cache (omp's approval event carries no input)" \
+    || bad "command field missing from notify JSON: $(cat "$REC.notify" 2>/dev/null)"
   # #37 moved the reconciliation report to the hub page and left AT MOST a
   # one-line hub summary in the prompt; 0fbece0's report-injection contract is
   # gone. What must hold now is that nothing else leaks into context — a raw

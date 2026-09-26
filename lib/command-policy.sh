@@ -274,9 +274,17 @@ _cp_has_unquoted_operator() {           # protected-text -> 0 if a REAL
   return 1
 }
 
-_cp_grant_action() {                    # raw wt branch trunk
-  local raw="$1" wt="$2" branch="$3" trunk="$4"
-  [ -n "$wt" ] && [ -n "$branch" ] || return 1
+# _cp_simple_words <raw> <worktree> -> fills the global array _CP_W with the
+# words of RAW when, and only when, RAW is ONE simple command (single line, no
+# unquoted operator, no substitution), after stripping exactly one optional
+# literal `cd <worktree> && ` prefix. Returns 1 — leaving _CP_W empty — for
+# anything else. Shared by every strict fast path in this file (the ownership
+# grant, the task-manifest scope, code-by-reference), so all of them agree on
+# what "one simple command" means and none re-derives the quoting rules.
+_CP_W=()
+_cp_simple_words() {                    # raw wt
+  local raw="$1" wt="$2"
+  _CP_W=()
   case "$raw" in *$'\n'*) return 1 ;; esac   # single line only, see header
 
   # Exactly one optional `cd <own worktree> && ` prefix, matched literally —
@@ -284,9 +292,11 @@ _cp_grant_action() {                    # raw wt branch trunk
   # space in it (spawn-task.sh discourages but does not forbid one) simply
   # never matches this fast path and falls through unaffected.
   local rest="$raw" cdpfx="cd ${wt} && "
-  case "$raw" in
-    "$cdpfx"*) rest="${raw#$cdpfx}" ;;
-  esac
+  if [ -n "$wt" ]; then
+    case "$raw" in
+      "$cdpfx"*) rest="${raw#"$cdpfx"}" ;;
+    esac
+  fi
   [ -n "$rest" ] || return 1
 
   local protected; protected="$(_cp_protect_text "$rest")"
@@ -295,17 +305,32 @@ _cp_grant_action() {                    # raw wt branch trunk
   local oldopts; case "$-" in *f*) oldopts=set ;; *) oldopts=unset ;; esac
   set -f
   local IFS=$' \t'
-  local -a w=()
   local word
   # shellcheck disable=SC2086
-  for word in $protected; do w+=("$word"); done
+  for word in $protected; do _CP_W+=("$word"); done
   [ "$oldopts" = unset ] && set +f
+  [ "${#_CP_W[@]}" -ge 1 ]
+}
+
+_cp_grant_action() {                    # raw wt branch trunk
+  local raw="$1" wt="$2" branch="$3" trunk="$4"
+  [ -n "$wt" ] && [ -n "$branch" ] || return 1
+  _cp_simple_words "$raw" "$wt" || return 1
+  local -a w=("${_CP_W[@]}")
   [ "${#w[@]}" -ge 2 ] || return 1
 
   case "${w[0]}" in
     git)
       case "${w[1]}" in
         add|commit)
+          # Never a commit that skips the pre-commit hooks (the shared secret
+          # scan lives there): --no-verify, or any short cluster with `n`.
+          if [ "${w[1]}" = commit ]; then
+            local x
+            for x in "${w[@]:2}"; do
+              case "$x" in --no-verify|--no-verify=*) return 1 ;; --*) ;; -*n*) return 1 ;; esac
+            done
+          fi
           printf 'git %s in %s (own worktree, local-only)\n' "${w[1]}" "$wt"
           return 0 ;;
         push)
@@ -337,6 +362,481 @@ _cp_grant_action() {                    # raw wt branch trunk
       return 1 ;;
     *) return 1 ;;
   esac
+}
+
+# `_cp_strip_commit_message <raw> <worktree>` -> RAW with only the VALUE of
+# an exact `-m`/`--message` argument removed. Attached `-mVALUE` and
+# `--message=VALUE` are removed in-place. A short cluster is treated as a
+# message cluster only when every flag before its final `m` is one of git's
+# no-argument commit flags; `-tm` is kept whole, because its following word
+# is a real template/path argument (security review NEW-2).
+_cp_strip_commit_message() {            # raw wt
+  _cp_simple_words "$1" "$2" || return 1
+  local -a w=("${_CP_W[@]}") out=()
+  local i=0 n="${#_CP_W[@]}" token prefix
+  while [ "$i" -lt "$n" ]; do
+    token="${w[$i]}"
+    case "$token" in
+      --message=*) ;;
+      -m|--message) i=$((i + 1)) ;;
+      -m?*) ;;
+      -[aqsvez]m)
+        i=$((i + 1)) ;;
+      *) out+=("$token") ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s' "${out[*]}" | tr '\001-\016' ' '
+}
+
+# ---- task-manifest scope (lib/task-manifest.sh, lib/scoped-policy.sh) -------
+# `_cp_scope_action <raw> <worktree> <manifest-json>` -> prints a one-line
+# description and returns 0 when RAW is EXACTLY a shape the task's approved
+# manifest covers; returns 1 — the verdict stays whatever the text rules said
+# — for anything else, including anything it cannot parse with confidence.
+#
+# Only ONE shape today, because it is the measured one (plan:geo-audit,
+# 2026-09-24): a curl GET to a `net_read` host whose output files all land
+# inside `writes`. The text rules escalate that ("downloads a program to disk":
+# a `.raw`/`.hdr` target is not a data extension) and are right to in general;
+# the manifest is what says this task was sent to fetch exactly these pages
+# into exactly these paths.
+#
+# Same discipline as _cp_grant_action: one simple command via
+# _cp_simple_words, no eval, deny-by-default flags. Additionally:
+#   * no `$` or `~` anywhere, quoted or not — a variable could be anything, so
+#     it is never "in scope"; no UNQUOTED `{ } * ? [ ]` (brace/glob expansion
+#     rewrites the words after this parse — _cp_has_unquoted_expansion);
+#   * `-q`/`--disable` is the FIRST argument, so no curlrc is read;
+#   * every flag must be on the allowlist below. Sending flags (-d/-F/-T/
+#     --json/--data*/-X other than GET|HEAD), config/credential/cookie/proxy
+#     flags (-K -u -b -c -x --unix-socket), redirects (-L), and name-derived
+#     outputs (-O -J --output-dir --create-dirs) are simply absent from it;
+#   * every URL is http(s), has no userinfo (`@`), and its host is EXACTLY in
+#     net_read (case-insensitive, as DNS is); no `Host:` header;
+#   * every output target (-o/--output, -D/--dump-header) is `-`, /dev/null, or
+#     a worktree-relative path (or an absolute one under the worktree) with no
+#     `.`/`..`/.git/.handoffs/.env* segment that matches a `writes` glob, is
+#     not a symlink or hard link, and whose existing parent resolves (pwd -P)
+#     inside the worktree;
+#   * no option value starting with `@` (curl reads that FILE into the value:
+#     `-H @file` sends it as headers) and no `-w %output{…}` (writes a file).
+# It is consulted only AFTER the human-reserved list, and only for a text
+# verdict of `escalate` — never `deny`, never a reservation.
+_cp_glob_to_ere() {                     # glob -> anchored ERE (`*` in-segment, `**` any depth)
+  printf '^%s$\n' "$(printf '%s' "$1" | sed -e 's/\*\*/%%/g' -e 's/[.+]/\\&/g' \
+    -e 's/\*/[^\/]*/g' -e 's/%%/.*/g')"
+}
+
+_cp_path_in_writes() {                  # path wt manifest -> 0 if in a writes glob
+  local p="$1" wt="$2" manifest="$3" rel g ere parent real realwt real_rel
+  case "$p" in -|/dev/null) return 0 ;; esac
+  case "$p" in *[$'\001'-$'\037']*|'~'*|*'$'*|*'#'*) return 1 ;; esac
+  case "$p" in
+    "$wt"/*) rel="${p#"$wt"/}" ;;
+    /*) return 1 ;;
+    *) rel="$p" ;;
+  esac
+  # No empty, `.` or `..` segment — pattern tests, never a split (a `*` in a
+  # path must not glob-expand against the cwd).
+  case "/$rel/" in *//*|*/./*|*/../*) return 1 ;; esac
+  # The manifest parser refuses these as GLOB segments, but `writes: [**]`
+  # would still MATCH them as paths — so refuse them as paths too.
+  case "/$(printf '%s' "$rel" | tr 'A-Z' 'a-z')/" in */.git/*|*/.handoffs/*|*/.env*) return 1 ;; esac
+  local hit=1
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    ere="$(_cp_glob_to_ere "$g")"
+    [[ "$rel" =~ $ere ]] && { hit=0; break; }
+  done <<EOF
+$(printf '%s' "$manifest" | jq -r '.writes[]?' 2>/dev/null)
+EOF
+  [ "$hit" = 0 ] || return 1
+  [ -L "$wt/$rel" ] && return 1
+  # A hard link is the symlink's quieter twin: curl's truncating open writes
+  # through it to wherever else the inode lives.
+  if [ -e "$wt/$rel" ]; then
+    local links; links="$(stat -f %l "$wt/$rel" 2>/dev/null || stat -c %h "$wt/$rel" 2>/dev/null)"
+    [ "${links:-2}" = 1 ] || return 1
+  fi
+  parent="$(dirname "$wt/$rel")"
+  if [ -d "$parent" ]; then
+    real="$(cd "$parent" 2>/dev/null && pwd -P)" || return 1
+    realwt="$(cd "$wt" 2>/dev/null && pwd -P)" || return 1
+    case "$real/" in "$realwt"/*) ;; *) return 1 ;; esac
+    real_rel="${real#"$realwt"/}"
+    case "/$(printf '%s' "$real_rel" | tr 'A-Z' 'a-z')/" in
+      */.git/*|*/.handoffs/*|*/.env*) return 1 ;;
+    esac
+  fi
+  return 0
+}
+
+_cp_url_host_in_scope() {               # url manifest -> 0 if http(s) to a net_read host
+  local u="$1" manifest="$2" auth host
+  # curl URL globbing can substitute paths containing `..` into an output
+  # filename (`-o tmp/#1`), so the scope rejects every glob/fragment marker.
+  case "$u" in *[$'\001'-$'\037']*|*'$'*|*'~'*|*'{'*|*'}'*|*'['*|*']'*|*'#'*) return 1 ;; esac
+  [[ "$u" =~ ^[Hh][Tt][Tt][Pp][Ss]?://([^/?#]+) ]] || return 1
+  auth="${BASH_REMATCH[1]}"
+  case "$auth" in *@*|*%*) return 1 ;; esac
+  host="${auth%:*}"
+  [ "$host" = "$auth" ] || [[ "${auth##*:}" =~ ^[0-9]{1,5}$ ]] || return 1
+  host="$(printf '%s' "$host" | tr 'A-Z' 'a-z')"
+  printf '%s' "$manifest" | jq -e --arg h "$host" '(.net_read // []) | index($h) != null' >/dev/null 2>&1
+}
+
+# Brace and glob expansion run AFTER this parse and BEFORE curl: an allowed
+# value like `-H {x,-Krc}` becomes `-H x -Krc` (security review SCOPE-01,
+# 2026-09-24), and `-o tmp/*` becomes whatever files exist. So any UNQUOTED,
+# unescaped `{ } * ? [ ]` refuses the scope; quoted ones (`-w '%{http_code}'`)
+# are literal to the shell and fine.
+_cp_has_unquoted_expansion() {          # raw -> 0 if an unquoted { } * ? [ ] is present
+  printf '%s' "$1" | awk '
+    BEGIN { SQ = sprintf("%c", 39); DQ = "\""; found = 0 }
+    {
+      line = $0; n = length(line); st = 0
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (st == 0) {
+          if (c == "\\") { i++; continue }
+          if (c == SQ) { st = 1; continue }
+          if (c == DQ) { st = 2; continue }
+          if (index("{}*?[]", c)) { found = 1 }
+        } else if (st == 1) {
+          if (c == SQ) st = 0
+        } else {
+          if (c == "\\") { i++; continue }
+          if (c == DQ) st = 0
+        }
+      }
+    }
+    END { exit found ? 0 : 1 }'
+}
+
+_cp_scope_action() {                    # raw wt manifest
+  local raw="$1" wt="$2" manifest="$3" cwd_bound=0
+  [ -n "$wt" ] && [ -n "$manifest" ] || return 1
+  case "$raw" in *'$'*|*'~'*|*'`'*) return 1 ;; esac
+  _cp_has_unquoted_expansion "$raw" && return 1
+  case "$raw" in "cd ${wt} && "*) cwd_bound=1 ;; esac
+  _cp_simple_words "$raw" "$wt" || return 1
+  local -a w=("${_CP_W[@]}")
+  case "${w[0]}" in curl|/usr/bin/curl|/opt/homebrew/bin/curl) ;; *) return 1 ;; esac
+  # `-q`/`--disable` FIRST turns off every curlrc curl would otherwise read
+  # ($CURL_HOME, $XDG_CONFIG_HOME, ~) from the WORKER's environment, which
+  # this approver cannot see (security review SCOPE-03). Required, not probed.
+  case "${w[1]:-}" in -q|--disable) ;; *) return 1 ;; esac
+  local i=2 n="${#w[@]}" a v urls=0 outs="" hosts=""
+  while [ "$i" -lt "$n" ]; do
+    a="${w[$i]}"; v=""
+    case "$a" in
+      --*=*) v="${a#*=}"; a="${a%%=*}" ;;
+    esac
+    case "$a" in
+      # No -L/--location: a redirect leaves net_read (security review
+      # SCOPE-05 — including loopback services and link-local metadata).
+      -s|-S|-I|-f|-i|-v|-g|--silent|--show-error|--head|--fail|--fail-with-body|--compressed|--include|--verbose|--no-progress-meter|--globoff)
+        [ -z "$v" ] || return 1 ;;
+      -[sSIfivg]*)
+        [[ "$a" =~ ^-[sSIfivg]+$ ]] || return 1 ;;
+      -m|--max-time|--connect-timeout|-A|--user-agent|-w|--write-out|-H|--header|-e|--referer|--retry|--retry-delay|--max-filesize|-r|--range|-o|--output|-D|--dump-header|-X|--request|--noproxy)
+        if [ -z "$v" ]; then
+          i=$((i + 1)); [ "$i" -lt "$n" ] || return 1
+          v="${w[$i]}"
+        fi
+        # `@file` makes curl READ a local file into the value (-H @file sends
+        # its lines as headers); -w `%output{f}` makes it WRITE a file.
+        case "$v" in @*) return 1 ;; esac
+        case "$a:$v" in -w:*output\{*|--write-out:*output\{*) return 1 ;; esac
+        # A Host header re-points the request at another virtual host on the
+        # same address — a read from a host net_read never named.
+        case "$a" in -H|--header)
+          [[ "$(printf '%s' "$v" | tr 'A-Z\001' 'a-z ')" =~ ^[[:space:]]*host[[:space:]]*: ]] && return 1 ;;
+        esac
+        case "$a" in
+          --noproxy)
+            [ "$(printf '%s' "$v" | tr -d '\001-\016')" = "*" ] || return 1 ;;
+        esac
+        case "$a" in
+          -o|--output|-D|--dump-header)
+            case "$v" in /*|-|/dev/null) ;; *) [ "$cwd_bound" = 1 ] || return 1 ;; esac
+            _cp_path_in_writes "$v" "$wt" "$manifest" || return 1
+            outs="$outs ${v}" ;;
+          -X|--request)
+            case "$v" in GET|HEAD) ;; *) return 1 ;; esac ;;
+        esac ;;
+      -*) return 1 ;;
+      *)
+        _cp_url_host_in_scope "$a" "$manifest" || return 1
+        urls=$((urls + 1))
+        v="${a#*://}"; hosts="$hosts ${v%%[/?#]*}" ;;
+    esac
+    i=$((i + 1))
+  done
+  [ "$urls" -ge 1 ] || return 1
+  printf 'GET to net_read host(s)%s -> writes%s (task manifest)\n' "${hosts:- ?}" "${outs:- (stdout)}"
+}
+
+# `_cp_scope_ceiling <raw> <manifest-json>` -> prints a reason when the
+# manifest's `git` value forbids what RAW does. A ceiling only adds an
+# escalation: `commit-only` refuses a peer push or PR creation; `none` allows
+# only a single read-only git command (`status`, `log`, `diff`, `show`,
+# `ls-files`, `rev-parse`, `blame`, `grep`) and refuses every other git shape.
+_cp_scope_ceiling() {                   # raw manifest
+  local norm git protected
+  [ -n "$2" ] || return 0
+  git="$(printf '%s' "$2" | jq -r '.git // "push-own-branch"' 2>/dev/null)"
+  norm="$(scannable_command "$1")"
+  case "$git" in
+    commit-only|none)
+      if _cp_imatch '\bgit\b.*\bpush\b|\bgh\b.*\bpr\b.*\bcreate\b' "$norm"; then
+        printf 'outside the task manifest (git: %s) — push/PR creation is not in scope\n' "$git"; return 0
+      fi ;;
+  esac
+  if [ "$git" = none ] && _cp_match '\bgit\b' "$norm"; then
+    protected="$(_cp_protect_text "$norm")"
+    if _cp_has_unquoted_operator "$protected"; then
+      printf 'outside the task manifest (git: none) — compound git actions are not in scope\n'
+      return 0
+    fi
+    case "$norm" in
+      git\ status*|git\ log*|git\ diff*|git\ show*|git\ ls-files*|git\ rev-parse*|git\ blame*|git\ grep*) ;;
+      *) printf 'outside the task manifest (git: none) — git writes are not in scope\n' ;;
+    esac
+  fi
+}
+
+# ---- code by reference -------------------------------------------------------
+# `_cp_code_ref <raw> <worktree>` recognizes `cd <worktree> && <interpreter>
+# [flags] <file> [args...]` as one simple command, where the interpreter is
+# bash/sh/zsh/dash or python/python3[.N] (a path to one counts). A relative
+# file is only judged when the command binds its cwd to the worktree; an
+# absolute file must already be under it. This prevents judging `$wt/f.py`
+# while a persistent worker shell actually runs `sub/f.py` (security review
+# SCOPE-04b). The flags are only harmless run-mode letters (`-u -B -e -v`;
+# `-x` is refused because it changes Python's cookie line numbering).
+_cp_code_ref() {                        # raw wt
+  local raw="$1" wt="$2" kind base i=1 f abs real cwd_bound=0
+  case "$raw" in "cd ${wt} && "*) cwd_bound=1 ;; esac
+  _cp_simple_words "$raw" "$wt" || return 1
+  local -a w=("${_CP_W[@]}")
+  base="${w[0]##*/}"
+  case "$base" in
+    bash|sh|zsh|dash) kind=shell ;;
+    python|python3|python3.[0-9]|python3.[0-9][0-9]) kind=python ;;
+    *) return 1 ;;
+  esac
+  while [ "$i" -lt "${#w[@]}" ]; do
+    case "${w[$i]}" in
+      -[uBev]|-[uBev][uBev]|-[uBev][uBev][uBev]) i=$((i + 1)) ;;
+      -*) return 1 ;;
+      *) break ;;
+    esac
+  done
+  [ "$i" -lt "${#w[@]}" ] || return 1
+  f="$(printf '%s' "${w[$i]}" | tr '\001' ' ')"
+  case "$f" in *[$'\001'-$'\037']*|*@SUB@*) return 3 ;; esac
+  case "$f" in
+    /*) abs="$f" ;;
+    '~'*|*'$'*) return 3 ;;
+    *) [ "$cwd_bound" = 1 ] && [ -n "$wt" ] || return 3; abs="$wt/$f" ;;
+  esac
+  [ -f "$abs" ] && [ -r "$abs" ] || return 3
+  real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$abs" 2>/dev/null)" || return 3
+  [ -n "$real" ] || return 3
+  local realwt
+  realwt="$(cd "$wt" 2>/dev/null && pwd -P)" || return 3
+  case "$real/" in "$realwt"/*) ;; *) return 3 ;; esac
+  printf '%s\t%s\n' "$kind" "$real"
+}
+
+# Python source is not shell: running the shell rules over it is a category
+# error (every `re.sub(...)` looks like structure). So python content gets the
+# human-reserved list (credential paths, .env, policy files — those match on
+# plain words) plus this: a POSITIVE list of the capabilities that make a
+# script more than local data processing. Any hit escalates to a reviewing
+# authority, whose approval then binds to the file's sha256.
+#
+# The list includes the ways to reach those capabilities without spelling
+# `os.system` (red test, 2026-09-24). A regex over source stays obfuscatable;
+# the AST alias pass closes the common `import os as z; z.system(...)` shape.
+_CP_PY_RISK_RE='\b(subprocess|os\.system|os\.popen|os\.exec[a-z]*|os\.spawn[a-z]*|os\.posix_spawn[a-z]*|os\.startfile|os\.fork|os\.kill|os\.symlink|os\.link|pty|posix|socket|urllib|http\.client|requests|httpx|aiohttp|smtplib|ftplib|paramiko|websockets?|importlib|runpy|ctypes|marshal|pickle|shutil\.rmtree|rmtree|os\.remove|os\.unlink|os\.rmdir|os\.chmod|expanduser|keyring|webbrowser|pwd|builtins|sys\.path|sys\.modules)\b|\bfrom[[:space:]]+(os|shutil|subprocess|sys|pwd|runpy|importlib)[[:space:]]+import\b|\bgetattr[[:space:]]*\(|\.unlink\(|\.rmdir\(|\.chmod\(|Path\.home|__import__|(^|[^.A-Za-z0-9_])(eval|exec|compile)\(|~/'
+_cp_python_ast_risk() {
+  printf '%s' "$1" | python3 -c '
+import ast, sys
+try:
+    tree = ast.parse(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+aliases = {}
+danger = {"system","popen","execv","execve","execvp","spawn","spawnv","posix_spawn","startfile","kill","symlink","link","remove","unlink","rmdir","chmod"}
+for n in ast.walk(tree):
+    if isinstance(n, ast.Import):
+        for a in n.names:
+            aliases[a.asname or a.name.split(".")[0]] = a.name
+    elif isinstance(n, ast.ImportFrom):
+        for a in n.names:
+            aliases[a.asname or a.name] = (n.module or "") + "." + a.name
+for n in ast.walk(tree):
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name):
+        root = aliases.get(n.func.value.id, "")
+        if root.split(".")[0] in {"os","subprocess","shutil"} and n.func.attr in danger:
+            print("aliased " + root + "." + n.func.attr); sys.exit(0)
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in danger:
+        if any(v.split(".")[0] in {"os","subprocess","shutil"} for v in aliases.values()):
+            print("aliased " + n.func.id); sys.exit(0)
+sys.exit(1)
+' 2>/dev/null
+}
+_CP_PY_ENV_RE='\b(environ|environb|getenv|putenv|unsetenv)\b'
+_cp_python_risk() {                     # text -> prints a reason, 0 when risky
+  local hit
+  hit="$(printf '%s' "$1" | grep -oE "$_CP_PY_RISK_RE" 2>/dev/null | head -1)"
+  [ -n "$hit" ] || hit="$(_cp_python_ast_risk "$1" 2>/dev/null || true)"
+  [ -n "$hit" ] || return 1
+  printf 'python uses %s (process/network/deletion/env/dynamic-code) — needs a reviewing authority\n' "$hit"
+}
+
+# Code by reference judges ONE file, so a file that runs or imports ANOTHER
+# local file is not clean on its own content (red test H4: `. inner.sh`,
+# `source`, a nested `bash x.sh`, `sh -c "$(cat x)"`, `./x`, and a python
+# `import helper` resolving to a sibling helper.py all moved reviewed-looking
+# work into a file nobody hashed). Shell: any interpreter word, source/`.`,
+# eval/exec, or a `./path` run escalates. Python: an import whose top-level
+# name is a .py file or package directory beside the script (sys.path[0] when
+# run as `python3 <file>`), or any relative import, escalates.
+_cp_shell_nested() {                    # shell source -> 0 when it runs another file/program
+  printf '%s' "$1" | python3 -c '
+import re, sys
+s = sys.stdin.read()
+prefix = r"(?:^|[;&|({`\x22\x27\\\s])"
+interp = r"(?:[^;&|(){}\s]+/)?(?:bash|sh|zsh|dash|ksh|fish|python[0-9.]*|pypy[0-9.]*|perl|ruby|node|deno|bun|php|lua|osascript|eval|exec|xargs)(?:\s|$)"
+source = r"(?:^|[;&|({`\x22\x27\\\s])(?:\.|source)(?:\s|$)"
+direct = r"(?:^|[;&|({`\x22\x27])(?:[^;&|(){}\s]+/)[^;&|(){}\s]+(?:\s|$)"
+sys.exit(0 if re.search(prefix + interp, s, re.I) or re.search(source, s, re.I) or re.search(direct, s, re.I) else 1)
+'
+}
+_cp_python_local_imports() {            # content origdir -> prints local module names, 0 if any
+  local names
+  names="$(printf '%s' "$1" | python3 -c '
+import ast, os, sys
+base = sys.argv[1]
+try:
+    tree = ast.parse(sys.stdin.read())
+except Exception:
+    print("<unparseable>"); sys.exit(0)
+hits = []
+for node in ast.walk(tree):
+    mods = []
+    if isinstance(node, ast.Import):
+        mods = [a.name for a in node.names]
+    elif isinstance(node, ast.ImportFrom):
+        if node.level:
+            hits.append("." * node.level + (node.module or "")); continue
+        mods = [node.module or ""]
+    for m in mods:
+        top = m.split(".")[0]
+        if top and (os.path.exists(os.path.join(base, top + ".py")) or os.path.isdir(os.path.join(base, top))):
+            hits.append(top)
+print(" ".join(sorted(set(hits))))
+' "$2" 2>/dev/null)" || names="<unparseable>"
+  [ -n "$names" ] || return 1
+  printf '%s' "$names"
+}
+
+# `_cp_code_content_reason <kind> <path> [origdir]` -> prints why this file's CONTENT
+# needs review (prefixed `reserved: ` when it is on the human-only list), or
+# nothing when it classifies clean. Shell content goes through the SAME
+# classify_command + conductor_reserved_reason as a typed command; python
+# through the reserved list + _cp_python_risk. Oversized (>256 KB) or binary
+# content is never "clean": it cannot be reviewed.
+_cp_code_content_reason() {             # kind path
+  local kind="$1" path="$2" content size res v
+  size="$(wc -c < "$path" 2>/dev/null | tr -d ' ')" || size=""
+  [ -n "$size" ] || { printf 'cannot read %s\n' "$path"; return 0; }
+  [ "$size" -le 262144 ] || { printf 'file too large to review (%s bytes)\n' "$size"; return 0; }
+  if ! LC_ALL=C tr -d '\000' < "$path" | cmp -s - "$path"; then
+    printf 'binary content cannot be reviewed\n'; return 0
+  fi
+  # What the interpreter will EXECUTE, not prose about it. Measured on the 30
+  # scripts plan:geo-audit ran (2026-09-24): 6 read as "credential-value
+  # access" only because `#!/usr/bin/env python3` is an env invocation to
+  # the env-dump detector, and 1 because its module docstring said
+  # "credentials". A shebang is never run when the file is passed to an
+  # interpreter by name (`python3 f.py`, `bash f.sh`) — the only shape
+  # _cp_code_ref accepts — so line 1's `#!` is dropped for both kinds; for
+  # python, comments and the module docstring are dropped too (tokenize/ast,
+  # so a `#` inside a string survives). String literals and code are judged
+  # in full. A file python cannot parse is judged raw — the stricter reading.
+  content="$(sed '1{/^#!/d;}' "$path")"
+  if [ "$kind" = python ]; then
+    # Use CPython's detector on the original bytes. A grep for `coding` is
+    # not equivalent: cookie case and line eligibility matter, and `-x` is
+    # deliberately not an accepted code-ref flag (security review NEW-3).
+    local encoding
+    encoding="$(python3 - "$path" <<'PY' 2>/dev/null
+import sys, tokenize
+try:
+    with open(sys.argv[1], "rb") as f:
+        print(tokenize.detect_encoding(f.readline)[0].lower())
+except Exception:
+    print("invalid")
+PY
+)"
+    case "$encoding" in
+      utf-8|utf-8-sig|ascii|us-ascii) ;;
+      *) printf 'python source declares encoding %s — not reviewable as text\n' "${encoding:-unknown}"; return 0 ;;
+    esac
+    content="$(printf '%s\n' "$content" | python3 -c '
+import ast, io, sys, tokenize, unicodedata
+# NFKC first: Python folds identifiers that way, so a fullwidth
+# `ｓｕｂｐｒｏｃｅｓｓ` IS `subprocess` to the interpreter and must be to the
+# ASCII tripwires below (security review CODEREF-01).
+src = sys.stdin.read()
+try:
+    tree = ast.parse(src)
+    doc = None
+    if tree.body and isinstance(tree.body[0], ast.Expr) and isinstance(getattr(tree.body[0], "value", None), ast.Constant) and isinstance(tree.body[0].value.value, str):
+        doc = (tree.body[0].value.lineno, tree.body[0].value.col_offset)
+    out = []
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        # Only the docstring STRING token itself — never its whole line, or
+        # `"""doc"""; import subprocess` would hide the import.
+        if tok.type == tokenize.COMMENT or (tok.type == tokenize.STRING and tok.start == doc):
+            continue
+        out.append(tok)
+    sys.stdout.write(unicodedata.normalize("NFKC", tokenize.untokenize(out)))
+except Exception:
+    sys.stdout.write(unicodedata.normalize("NFKC", src))
+' 2>/dev/null)" || content="$(cat "$path")"
+  fi
+  if [ "$kind" = python ]; then
+    res="$(conductor_reserved_reason "$content" python)"
+    [ -n "$res" ] || ! _cp_match "$_CP_PY_ENV_RE" "$content" ||
+      res="python reads the process environment — credential-value access remains human-only"
+  else
+    res="$(conductor_reserved_reason "$content")"
+  fi
+  if [ -n "$res" ]; then printf 'reserved: %s\n' "$res"; return 0; fi
+  case "$kind" in
+    shell)
+      if _cp_shell_nested "$content"; then
+        printf 'nested: script runs another program or file — review what it runs\n'
+        return 0
+      fi
+      v="$(classify_command "$content")"
+      [ "$v" = allow ] || printf 'script content classifies %s: %s\n' "$v" "$(classify_reason)" ;;
+    python)
+      local locals
+      if locals="$(_cp_python_local_imports "$content" "${3:-$(dirname "$path")}")"; then
+        printf 'nested: python imports local module(s) %s — code by reference judges one file; review them\n' "$locals"
+        return 0
+      fi
+      _cp_python_risk "$content" || true ;;
+    *) printf 'unknown interpreter kind\n' ;;
+  esac
+  return 0
 }
 
 # ---- _cp_procsub_bodies -----------------------------------------------------
@@ -1227,6 +1727,23 @@ _cp_secret_var_expanded() {             # norm -> 0 (true) if a secret-named $VA
   _cp_imatch "$_CP_SECRET_VAR_RE" "$1"
 }
 
+# ---- "sends data" flags on a downloader, shared by classify_command and
+# conductor_reserved_reason so the two lists cannot drift (review F8 said they
+# must not). SHORT flags are matched case-SENSITIVELY because curl's own flags
+# are: `-D FILE` is --dump-header and `-f` is --fail, neither sends a byte, but
+# the old case-insensitive `-d`/`-F` alternatives read both as a POST/form
+# upload. Measured 2026-09-24 on plan:geo-audit (w1Y:p2): a plain GET to our
+# own site with `-D "$f.hdr"` came back "remote mutation — human-only", which
+# neither peer nor conductor may answer. Nothing is lost by the change: curl
+# never treats `-D`/`-f`/`-t`/`-x` as a send, whatever case the BINARY name
+# resolves under on APFS. Method names stay case-insensitive (`-X post` is
+# still a POST to most servers); long options stay case-insensitive as before,
+# and `--data*` now also covers `--request=POST` and every `--data-*` spelling.
+_CP_NET_SEND_SHORT_RE='(-X[[:space:]]*([Pp][Oo][Ss][Tt]|[Pp][Uu][Tt]|[Pp][Aa][Tt][Cc][Hh]|[Dd][Ee][Ll][Ee][Tt][Ee])|(^|[[:space:]])-d([[:space:]]|=)|(^|[[:space:]])-F([[:space:]]|=)|(^|[[:space:]])-T([[:space:]]|=))'
+_CP_NET_SEND_LONG_RE='(--request[[:space:]=]+(POST|PUT|PATCH|DELETE)|--data[A-Za-z-]*([[:space:]]|=)|--form([[:space:]]|=)|--upload-file|--json([[:space:]]|=))'
+_cp_net_sends() {                       # text -> 0 (true) if a send/upload flag is present
+  _cp_match "$_CP_NET_SEND_SHORT_RE" "$1" || _cp_imatch "$_CP_NET_SEND_LONG_RE" "$1"
+}
 
 _cp_non_shell_panel_tool() {
   case "$1" in
@@ -1674,7 +2191,7 @@ OUTS
     # A plain `"$P$u"` variable is NOT a substitution and stays allow, which
     # matters: that is the shape review lanes use to walk a preview deploy.
     # Loopback is NOT exempt for any of this.
-    _cp_imatch '(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--request[[:space:]]+(POST|PUT|PATCH|DELETE)|(^|[[:space:]])-d([[:space:]]|=)|--data(-raw|-binary|-urlencode|-ascii)?([[:space:]]|=)|(^|[[:space:]])-F([[:space:]]|=)|--form([[:space:]]|=)|(^|[[:space:]])-T([[:space:]]|=)|--upload-file|--json([[:space:]]|=))' "$_cp_fields" &&
+    _cp_net_sends "$_cp_fields" &&
       _cp_consider 1 "sends data to the network — remote mutation or an exfiltration path"
     _cp_imatch '(curl|wget|aria2c)[^;&]*([$`]\(|`|@[/~.])' "$raw" &&
       _cp_consider 1 "interpolates a substitution or @file into a network request — an exfiltration path"
@@ -1991,8 +2508,15 @@ _cp_push_is_safe() {                    # norm -> 0 (true) only for git push [-u
 # scripts still require the trusted conductor to inspect their complete body.
 # Operator-added restrictions remain hard stops even when a built-in rule
 # with equal severity supplied classify_reason's first-match explanation.
+#
+# [mode] `python` (only lib/command-policy.sh _cp_code_content_reason passes
+# it, for a python FILE's content) skips the shell env-dump detector, which
+# reads Python as shell: `('$'+ps).lower()` in an f-string came back
+# "credential-value access" (plan:geo-audit, 2026-09-24). Python's own env
+# access is reserved by that caller instead (_CP_PY_ENV_RE). Everything
+# else on this list applies to python content unchanged.
 conductor_reserved_reason() {
-  local raw="$1" norm action_norm fleet_norm
+  local raw="$1" mode="${2:-shell}" norm action_norm fleet_norm
   norm="$(scannable_command "$raw")"
   action_norm="$(scannable_command "$(_cp_mask_script_data "$raw")")"
   fleet_norm="$(printf '%s' "$norm" | sed -E 's/\$\{IFS[^}]*\}/ /g; s/\$IFS\b/ /g; s/\$\{[A-Za-z_][A-Za-z0-9_]*[^}]*\}//g; s/\$[A-Za-z_][A-Za-z0-9_]*\b//g')"
@@ -2016,7 +2540,7 @@ conductor_reserved_reason() {
   # token`/`gcloud auth print-*-token`/`fly auth token`/`git credential`/
   # `security dump-keychain`/`security export`.
   if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env[A-Za-z0-9_.-]*\b|\bcredentials\b|\bop[[:space:]]+(read|item[[:space:]]+get|inject|run|document[[:space:]]+get)\b|\bgh[[:space:]]+secret\b|\bgh\b.*\bauth\b.*(\btoken\b|\bstatus\b.*(-t\b|--show-token))|\bgcloud\b.*\bauth\b.*\bprint-(access|identity)-token\b|\b(fly|flyctl)\b.*\bauth\b.*\btoken\b|\bgit\b.*\bcredential(-[A-Za-z0-9_-]+)?\b|\bsecurity[[:space:]]+(find-(generic|internet)-password|dump-keychain|export)\b' "$norm" ||
-     _cp_env_dump_invoked "$1" || _cp_secret_var_expanded "$norm"; then
+     { [ "$mode" != python ] && _cp_env_dump_invoked "$1"; } || _cp_secret_var_expanded "$norm"; then
     printf 'credential-value access remains human-only\n'
   # Terrence's authorized loosening, 2026-09-24: a credential-shaped VALUE
   # typed directly into the command (not a path/command match above) is
@@ -2028,7 +2552,9 @@ conductor_reserved_reason() {
   # branch identified as exfiltration paths — -T/--upload-file, -F/--form,
   # --json — were allow AND unreserved: no second layer at all behind the one
   # classify_command rule. Review called that out (F8) and it is the right
-  elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--request[[:space:]]+(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]]|(^|[[:space:]])-T([[:space:]]|=)|--upload-file|(^|[[:space:]])-F([[:space:]]|=)|--form([[:space:]]|=)|--json([[:space:]]|=))|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$action_norm"; then
+  # call: the two lists are derived from the same reasoning and must not drift.
+  elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$action_norm" ||
+       { _cp_imatch '\bcurl\b' "$action_norm" && _cp_net_sends "$action_norm"; }; then
     printf 'remote mutation remains human-only\n'
   elif _cp_imatch '\bherdr\b.*\b(tab|pane)\b.*\b(create|run)\b|\bspawn-agent\b.*(\.sh|sh\b)' "$norm" ||
        _cp_imatch '(^|[[:space:];|&()])([^[:space:];|&()]*/)?spawn-agent\.sh\b|\bherdr[[:space:]]+tab[[:space:]]+create\b|\bherdr[[:space:]]+pane[[:space:]]+run\b' "$fleet_norm"; then
@@ -2037,7 +2563,12 @@ conductor_reserved_reason() {
   # round 4 by an independent security review): _cp_push_is_safe is
   # cwd-INDEPENDENT and deny-by-default — `git push origin <name>`,
   # `git push -u origin <name>`, and `git push --set-upstream origin
-  elif { _cp_match '\bgit\b' "$action_norm" && _cp_match '\bpush\b' "$action_norm" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|herdr-select\.sh)\b|(^|[^A-Za-z0-9_-])command-policy\.sh\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm"; then
+  # <name>` are unreserved ONLY when <name> fully matches the fleet's own
+  # `type/slug` branch-naming allowlist. Bare `git push`, any other flag,
+  # a `-C`, and any `cd … &&` prefix all fail to match this shape and
+  # stay reserved below — see _cp_push_is_safe's own header for the full
+  # design and the two security-review rounds that shaped it.
+  elif { _cp_match '\bgit\b' "$action_norm" && _cp_match '\bpush\b' "$action_norm" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|alert-gate\.sh|prompt-parse\.sh)\b|(^|[^A-Za-z0-9_-])command-policy\.sh\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm"; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
   fi
 }
