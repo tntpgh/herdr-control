@@ -1674,6 +1674,14 @@ EOF
   # `wrangler deploy --env production`, `ssh prod`, `psql -h live.…` — and the
   # infrastructure-verb rule below is untouched and independent.
   #
+  # Four false positives from the live approver-hardening run are pinned by
+  # verify-command-policy.sh: a repo-local verifier named `verify-herdr-live.sh`
+  # is not itself a production target just because "live" is in its filename.
+  # Remove that exact script token before target matching; any real target
+  # argument beside it (`--context live`, `ssh live`, `live.db.internal`, ...)
+  # remains in the string and still escalates.
+  local _cp_prod_norm
+  _cp_prod_norm="$(printf '%s' "$norm" | sed -E 's#(^|[[:space:]/])(\./)?verify-herdr-live\.sh([[:space:]]|$)# #g')"
   # Three gaps the security review found in the first cut of this, all closed
   # here and all of them real infrastructure commands:
   #   * `--project` and `--subscription` were missing, so `gcloud --project
@@ -1686,7 +1694,7 @@ EOF
   #     `--project live-site` slipped. Values may now be suffixed.
   #   * `\b` cannot match between `_` and `E`, so `VERCEL_ENV=production` and
   #     `MY_ENV=production` were missed. Any `*_ENV=` counts now.
-  _cp_imatch '(--(context|env|environment|profile|namespace|target|app|stage|remote|host|project|subscription|account|cluster|instance|database|db|region|org|space|site)([[:space:]]+|=)[^[:space:]]*(prod|production|live)|(^|[[:space:]])-[aeEpnc][[:space:]]+[^[:space:]]*(prod|production|live)[^[:space:]]*([[:space:]]|$)|(^|[[:space:]])[A-Za-z_]*(ENV|STAGE)=(prod|production|live)[^[:space:]]*([[:space:]]|$)|\b(ssh|scp|rsync|psql|mysql|redis-cli|mongosh|wrangler|vercel|netlify|fly|flyctl|heroku|gcloud|az|aws|doctl|eksctl|kubectl|helm|gh)\b[^;&|]*\b(prod|production|live)[a-z0-9-]*\b|\b(prod|production|live)[a-z0-9-]*\.[a-z0-9][a-z0-9.-]*\b)' "$norm" &&
+  _cp_imatch '(--(context|env|environment|profile|namespace|target|app|stage|remote|host|project|subscription|account|cluster|instance|database|db|region|org|space|site)([[:space:]]+|=)[^[:space:]]*(prod|production|live)|(^|[[:space:]])-[aeEpnc][[:space:]]+[^[:space:]]*(prod|production|live)[^[:space:]]*([[:space:]]|$)|(^|[[:space:]])[A-Za-z_]*(ENV|STAGE)=(prod|production|live)[^[:space:]]*([[:space:]]|$)|\b(ssh|scp|rsync|psql|mysql|redis-cli|mongosh|wrangler|vercel|netlify|fly|flyctl|heroku|gcloud|az|aws|doctl|eksctl|kubectl|helm|gh)\b[^;&|]*\b(prod|production|live)[a-z0-9-]*\b|\b(prod|production|live)[a-z0-9-]*\.[a-z0-9][a-z0-9.-]*\b)' "$_cp_prod_norm" &&
     _cp_consider 1 "names a production target"
   _cp_imatch '\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(delete|drain|scale)\b|\bhelm[[:space:]]+(delete|uninstall)\b|\bflyctl?[[:space:]]+(deploy|destroy)\b' "$norm" &&
     _cp_consider 1 "infrastructure scope change"
@@ -1949,16 +1957,7 @@ conductor_reserved_reason() {
   # call: the two lists are derived from the same reasoning and must not drift.
   elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--request[[:space:]]+(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]]|(^|[[:space:]])-T([[:space:]]|=)|--upload-file|(^|[[:space:]])-F([[:space:]]|=)|--form([[:space:]]|=)|--json([[:space:]]|=))|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$norm"; then
     printf 'remote mutation remains human-only\n'
-  # CLOSED 2026-09-24 (Terrence's authorized loosening, then hardened
-  # round 4 by an independent security review): _cp_push_is_safe is
-  # cwd-INDEPENDENT and deny-by-default — `git push origin <name>`,
-  # `git push -u origin <name>`, and `git push --set-upstream origin
-  # <name>` are unreserved ONLY when <name> fully matches the fleet's own
-  # `type/slug` branch-naming allowlist. Bare `git push`, any other flag,
-  # a `-C`, and any `cd … &&` prefix all fail to match this shape and
-  # stay reserved below — see _cp_push_is_safe's own header for the full
-  # design and the two security-review rounds that shaped it.
-  elif { _cp_match '\bgit\b' "$norm" && _cp_match '\bpush\b' "$norm" && ! _cp_push_is_safe "$norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|command-policy\.sh|herdr-select\.sh)\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$norm"; then
+  elif { _cp_match '\bgit\b' "$norm" && _cp_match '\bpush\b' "$norm" && ! _cp_push_is_safe "$norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|herdr-select\.sh)\b|(^|[^A-Za-z0-9_-])command-policy\.sh\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$norm"; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
   fi
 }
