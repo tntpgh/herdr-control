@@ -767,8 +767,8 @@ sel 2 --authority peer; rc=$?
 # Carry-over from PR #155 review: the approvals row on a Deny-mismatch must
 # record the PANEL SCRAPE cmd_text fell back to, never empty and never the
 # mismatched registry command it just refused to trust.
-[ "$(q_appr command)" = "git status" ] \
-  && ok "approvals row records the panel scrape (git status) on a Deny-mismatch, not the mismatched registry text or empty" \
+[ "$(q_appr command)" = "Allow tool: bash Command: git status" ] \
+  && ok "approvals row records the whole panel scrape on a Deny-mismatch, not the mismatched registry text or empty" \
   || bad "approvals command on Deny-mismatch: '$(q_appr command)'"
 
 set_menu_deny "git status"; reset_keys
