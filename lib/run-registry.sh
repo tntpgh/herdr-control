@@ -531,19 +531,51 @@ _valid_closure_reason() {               # reason -> 0 if one of the five
   esac
 }
 
-# _valid_proof_ref <proof> [worktree] -> 0 if it looks like a checkable
-# pointer, not a bare assertion. Two shapes, both named in the plan doc:
-# "<PR URL> <merge sha>" (space-separated; the sha is loosely checked as
-# 7-40 hex characters, what `git rev-parse --short`..full sha40 both
-# produce) or a `.handoffs/PROOF.md` section reference. When a worktree is
-# on record, a PROOF.md reference is checked against the REAL file: every
-# worktree gets one created EMPTY at spawn time (spawn-task.sh), so a bare
-# mention of the filename passed even when nobody had written anything into
-# it — measured live. A caller with no worktree context (a unit test, a
-# synthetic proof) falls back to the name-shape check alone. An empty
-# string is never proof.
+# _gh_pr_lookup <owner/repo> (--number <n> | --head <branch>) -> prints
+# "STATE|URL|MERGE_OID" (MERGE_OID empty unless merged). Nonzero when gh is
+# missing or the call fails — callers must treat that as "unknown", never as
+# "fine". The ONE place that asks GitHub whether a PR merged and at what sha:
+# conductor-exit.sh finds a worktree's PR by branch, _valid_proof_ref checks a
+# cited PR by number; both read the same three fields the same way. By branch,
+# a MERGED PR sorts first (a branch can carry an older CLOSED one too).
+_gh_pr_lookup() {
+  local slug="$1" how="$2" sel="$3" fmt='"\(.state)|\(.url)|\(.mergeCommit.oid // "")"'
+  command -v gh >/dev/null 2>&1 || return 127
+  case "$how" in
+    --number) gh pr view "$sel" -R "$slug" --json url,state,mergeCommit -q "$fmt" 2>/dev/null ;;
+    --head)   gh pr list -R "$slug" --head "$sel" --state all --json url,state,mergeCommit \
+                -q "sort_by(.state != \"MERGED\") | .[0] // empty | $fmt" 2>/dev/null ;;
+    *) return 2 ;;
+  esac
+}
+
+# _valid_proof_ref <proof> [worktree] -> 0 if it is a checkable pointer, not a
+# bare assertion. Only ever asked about a `shipped` closure. Two shapes, both
+# named in the plan doc: "<PR URL> <sha>" (space-separated; sha is 7-40 hex,
+# what `git rev-parse --short`..full sha40 both produce) or a
+# `.handoffs/PROOF.md` section reference. When a worktree is on record, a
+# PROOF.md reference is checked against the REAL file: every worktree gets one
+# created EMPTY at spawn time (spawn-task.sh), so a bare mention of the
+# filename passed even when nobody had written anything into it — measured
+# live. A caller with no worktree context (a unit test, a synthetic proof)
+# falls back to the name-shape check alone. An empty string is never proof.
+#
+# A GitHub PR URL is checked against GitHub itself: the PR must be MERGED and
+# the sha must be a prefix of its merge commit. The shape check alone accepted
+# `…/pull/154 eb55756` — the HEAD sha of a PR that was still OPEN (2026-09-26,
+# herdr-control notepad item vi); reconcile.sh would have recorded
+# completed/shipped the moment the worker's pane went away. If gh is missing
+# or fails, the answer is "not proven" — a shipped claim is never waved
+# through because the check could not run. Anything on a github.com host that
+# names a pull but does not parse as one is refused rather than falling back
+# to the shape check. Other URLs keep the shape check.
+#
+# On refusal of a PR proof, _PROOF_REF_WHY says why (reconcile.sh and
+# close-done-workers.sh surface it); it is empty for every other refusal.
+_PROOF_REF_WHY=""
 _valid_proof_ref() {
-  local proof="$1" wt="${2:-}" url rest sha
+  local proof="$1" wt="${2:-}" url rest sha lc pr_re slug num info state oid
+  _PROOF_REF_WHY=""
   [ -n "$proof" ] || return 1
   case "$proof" in
     *PROOF.md*)
@@ -558,7 +590,33 @@ _valid_proof_ref() {
   sha="${rest%% *}"
   case "$url" in *'://'*) ;; *) return 1 ;; esac
   case "$sha" in *[!0-9a-fA-F]*|'') return 1 ;; esac
-  [ "${#sha}" -ge 7 ] && [ "${#sha}" -le 40 ]
+  [ "${#sha}" -ge 7 ] && [ "${#sha}" -le 40 ] || return 1
+
+  lc=$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')
+  [ -n "$lc" ] || { _PROOF_REF_WHY="could not normalize proof URL: $url"; return 1; }
+  case "$lc" in *github.com*/pull/*|*github.com*/pulls/*) ;; *) return 0 ;; esac
+  pr_re='^https?://(www\.)?github\.com/([^/?#]+)/([^/?#]+)/pull/([0-9]+)([/?#].*)?$'
+  if ! [[ "$lc" =~ $pr_re ]]; then
+    _PROOF_REF_WHY="unrecognized GitHub PR URL: $url"
+    return 1
+  fi
+  slug="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}" num="${BASH_REMATCH[4]}"
+  if ! info=$(_gh_pr_lookup "$slug" --number "$num") || [ -z "$info" ]; then
+    _PROOF_REF_WHY="could not confirm $url is merged (gh unavailable or failed)"
+    return 1
+  fi
+  IFS='|' read -r state _ oid <<<"$info"
+  if [ "$state" != MERGED ]; then
+    _PROOF_REF_WHY="PR not merged (state ${state:-unknown}): $url"
+    return 1
+  fi
+  sha=$(printf '%s' "$sha" | tr '[:upper:]' '[:lower:]')
+  oid=$(printf '%s' "$oid" | tr '[:upper:]' '[:lower:]')
+  if [ -n "$sha" ] && [ -n "$oid" ]; then
+    case "$oid" in "$sha"*) return 0 ;; esac
+  fi
+  _PROOF_REF_WHY="sha $sha is not the merge commit of $url (${oid:-none reported})"
+  return 1
 }
 
 set_task_state() {                      # run_id task_id state [reason] [proof]
@@ -597,8 +655,8 @@ set_task_state() {                      # run_id task_id state [reason] [proof]
           *PROOF.md*) proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null) ;;
         esac
         if ! _valid_proof_ref "$proof" "$proof_wt"; then
-          printf 'run-registry: refusing shipped completion for %s/%s: proof missing/invalid (need "<PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)\n' \
-            "$run_id" "$task_id" >&2
+          printf 'run-registry: refusing shipped completion for %s/%s: proof missing/invalid (need "<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)%s\n' \
+            "$run_id" "$task_id" "${_PROOF_REF_WHY:+: $_PROOF_REF_WHY}" >&2
           return 1
         fi
       fi

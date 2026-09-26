@@ -24,16 +24,27 @@ herdr() {
   esac
 }
 # gh pr list -R <slug> --head <branch> ... -q <jq>: answer by branch name.
+# gh pr view <n> ... -q <jq>: the same PRs by number — close-done-workers.sh
+# re-checks the proof against GitHub before recording `shipped`.
+# GH_FAIL=1 fails every call.
 gh() {
-  local br="" q="" prev=""
+  [ "${GH_FAIL:-0}" = 1 ] && { echo "gh: stub failure" >&2; return 1; }
+  local br="" q="" prev="" num=""
+  [ "$1 $2" = "pr view" ] && num="$3"
   for a in "$@"; do
     [ "$prev" = "--head" ] && br="$a"; [ "$prev" = "-q" ] && q="$a"; prev="$a"
   done
   local json='[]'
+  local all='[{"state":"CLOSED","url":"https://github.com/o/r/pull/1","mergeCommit":null},{"state":"MERGED","url":"https://github.com/o/r/pull/2","mergeCommit":{"oid":"abcdef0123456789abcdef0123456789abcdef01"}},{"state":"OPEN","url":"https://github.com/o/r/pull/3","mergeCommit":null},{"state":"MERGED","url":"https://github.com/o/r/pull/4","mergeCommit":{"oid":"1111111122222222333333334444444455555555"}}]'
+  if [ -n "$num" ]; then
+    printf '%s' "$all" | jq -e --arg n "/pull/$num" '.[] | select(.url|endswith($n))' >/dev/null || return 1
+    printf '%s' "$all" | jq -c --arg n "/pull/$num" '.[] | select(.url|endswith($n))' | jq -r "$q"
+    return
+  fi
   case "$br" in
-    feat/merged) json='[{"state":"CLOSED","url":"https://github.com/o/r/pull/1","mergeCommit":null},{"state":"MERGED","url":"https://github.com/o/r/pull/2","mergeCommit":{"oid":"abcdef0123456789abcdef0123456789abcdef01"}}]' ;;
-    feat/open)   json='[{"state":"OPEN","url":"https://github.com/o/r/pull/3","mergeCommit":null}]' ;;
-    feat/orphan) json='[{"state":"MERGED","url":"https://github.com/o/r/pull/4","mergeCommit":{"oid":"1111111122222222333333334444444455555555"}}]' ;;
+    feat/merged) json=$(printf '%s' "$all" | jq -c '[.[0], .[1]]') ;;
+    feat/open)   json=$(printf '%s' "$all" | jq -c '[.[2]]') ;;
+    feat/orphan) json=$(printf '%s' "$all" | jq -c '[.[3]]') ;;
   esac
   printf '%s' "$json" | jq -r "$q"
 }
@@ -76,6 +87,11 @@ check "merged task still running after dry-run" "$(state t_merged)" "running"
 
 printf '== --summary: one "<closable> <held>" line ==\n'
 check "summary counts" "$(bash "$here/conductor-exit.sh" --conductor=COND --summary)" "1 2"
+
+printf '== gh failing -> every task HELD (lookup failed), nothing shipped ==\n'
+out=$(GH_FAIL=1 bash "$here/conductor-exit.sh" --conductor=COND 2>&1)
+printf '%s\n' "$out" | grep -q 'HOLD .*merged-work.*gh lookup failed' && ok "merged-branch task held when gh fails" || bad "not held: $out"
+check "summary with gh failing" "$(GH_FAIL=1 bash "$here/conductor-exit.sh" --conductor=COND --summary)" "0 3"
 
 printf '== --apply: only the merged task closes, as shipped with its proof ==\n'
 : > "$CALLS"
