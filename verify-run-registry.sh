@@ -177,6 +177,11 @@ if _valid_proof_ref "HTTPS://GitHub.COM/tntpgh/herdr-control/pull/154/files eb55
 else
   ok "upper-case host and /files sub-path still go through the PR check"
 fi
+if _valid_proof_ref "$pr154 eb55756 .handoffs/PROOF.md#x" "$wtreal"; then
+  bad "naming PROOF.md next to an OPEN PR dodged the PR check"
+else
+  ok "a PR claim that also names PROOF.md is still checked as a PR claim"
+fi
 _valid_proof_ref "$pr153 f1579a6" && ok "short merge sha on a MERGED PR accepted" || bad "merged PR + merge sha refused: $_PROOF_REF_WHY"
 _valid_proof_ref "$pr153 F1579A62AAAABBBBCCCCDDDDEEEEFFFF00001111" \
   && ok "full merge sha accepted, case-insensitively" || bad "full merge sha refused: $_PROOF_REF_WHY"

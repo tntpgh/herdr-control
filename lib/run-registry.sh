@@ -566,40 +566,45 @@ _gh_pr_lookup() {
 # herdr-control notepad item vi); reconcile.sh would have recorded
 # completed/shipped the moment the worker's pane went away. If gh is missing
 # or fails, the answer is "not proven" — a shipped claim is never waved
-# through because the check could not run. Anything on a github.com host that
-# names a pull but does not parse as one is refused rather than falling back
-# to the shape check. Other URLs keep the shape check.
+# through because the check could not run. A proof that mentions a github.com
+# pull anywhere is a PR claim and must pass as one: its first token has to
+# parse as the PR URL (no fallback to the shape check, and no escaping into
+# the PROOF.md branch by also naming PROOF.md). Other URLs keep the shape
+# check; PROOF.md references are unchanged.
 #
 # On refusal of a PR proof, _PROOF_REF_WHY says why (reconcile.sh and
 # close-done-workers.sh surface it); it is empty for every other refusal.
 _PROOF_REF_WHY=""
 _valid_proof_ref() {
-  local proof="$1" wt="${2:-}" url rest sha lc pr_re slug num info state oid
+  local proof="$1" wt="${2:-}" url rest sha lc pr_claim=0 pr_re slug num info state oid
   _PROOF_REF_WHY=""
   [ -n "$proof" ] || return 1
-  case "$proof" in
-    *PROOF.md*)
-      [ -z "$wt" ] && return 0
-      [ -s "$wt/.handoffs/PROOF.md" ]
-      return $?
-      ;;
-  esac
+  lc=$(printf '%s' "$proof" | tr '[:upper:]' '[:lower:]')
+  [ -n "$lc" ] || { _PROOF_REF_WHY="could not normalize proof: $proof"; return 1; }
+  case "$lc" in *github.com*/pull/*|*github.com*/pulls/*) pr_claim=1 ;; esac
+  if [ "$pr_claim" = 0 ]; then
+    case "$proof" in
+      *PROOF.md*)
+        [ -z "$wt" ] && return 0
+        [ -s "$wt/.handoffs/PROOF.md" ]
+        return $?
+        ;;
+    esac
+  fi
   case "$proof" in *' '*) ;; *) return 1 ;; esac
   url="${proof%% *}"
   rest="${proof#* }"
   sha="${rest%% *}"
+  pr_re='^https?://(www\.)?github\.com/([^/?#]+)/([^/?#]+)/pull/([0-9]+)([/?#].*)?$'
+  if [ "$pr_claim" = 1 ] && ! [[ "${lc%% *}" =~ $pr_re ]]; then
+    _PROOF_REF_WHY="unrecognized GitHub PR URL (must be the first word): $url"
+    return 1
+  fi
   case "$url" in *'://'*) ;; *) return 1 ;; esac
   case "$sha" in *[!0-9a-fA-F]*|'') return 1 ;; esac
   [ "${#sha}" -ge 7 ] && [ "${#sha}" -le 40 ] || return 1
+  [ "$pr_claim" = 1 ] || return 0
 
-  lc=$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')
-  [ -n "$lc" ] || { _PROOF_REF_WHY="could not normalize proof URL: $url"; return 1; }
-  case "$lc" in *github.com*/pull/*|*github.com*/pulls/*) ;; *) return 0 ;; esac
-  pr_re='^https?://(www\.)?github\.com/([^/?#]+)/([^/?#]+)/pull/([0-9]+)([/?#].*)?$'
-  if ! [[ "$lc" =~ $pr_re ]]; then
-    _PROOF_REF_WHY="unrecognized GitHub PR URL: $url"
-    return 1
-  fi
   slug="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}" num="${BASH_REMATCH[4]}"
   if ! info=$(_gh_pr_lookup "$slug" --number "$num") || [ -z "$info" ]; then
     _PROOF_REF_WHY="could not confirm $url is merged (gh unavailable or failed)"
