@@ -268,6 +268,45 @@ case "$(prompt_options fake:pane | tr '\n' ' ')" in
   *X*Y*) ok "with two lists on screen, only the newest is offered" ;;
   *) no "two lists" "offered [$(prompt_options fake:pane | tr '\n' '|')]" ;;
 esac
+unset -f _prompt_window; . "$HERE/lib/prompt-parse.sh"   # restore the real _prompt_window/_pane_visible
+
+echo
+echo "== a pane line truncated mid multibyte character must not crash the parser =="
+# tmux captures a pane at its column width, and that cut can land inside a
+# multibyte UTF-8 character (e.g. an em-dash, U+2014, e2 80 94 — the wrap
+# lops off the trailing byte). Confirmed live: BSD sed under a UTF-8 locale
+# exits 2 "stream did not contain valid UTF-8" on exactly that input, which
+# used to empty prompt_options/prompt_command_text's `$(...)` pipeline
+# silently rather than crash loudly — either way the prompt went unanswerable.
+# This drives the REAL `_pane_visible`/`_menu_window` (the `_prompt_window`
+# override above is gone now), so it exercises the actual `herdr pane read`
+# boundary where the fix (iconv -c) lives.
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      printf '1. Yes \342\200X\n2. No\n'
+      ;;
+  esac
+}
+_broken_opts="$(prompt_options fake:pane)"; _broken_rc=$?
+[ "$_broken_rc" -eq 0 ] \
+  && ok "truncated multibyte line does not abort the parser (rc=$_broken_rc)" \
+  || no "truncated multibyte" "parser exited $_broken_rc instead of continuing"
+case "$_broken_opts" in
+  *"1"*"Yes"*"2"*"No"*) ok "options either side of the torn character still parse" ;;
+  *) no "truncated multibyte options" "got [$_broken_opts]" ;;
+esac
+# A VALID em-dash (all three bytes intact) is unaffected by the same fix.
+herdr() {
+  case "$1 $2" in
+    "pane read") printf '1. Yes \342\200\224 and remember\n2. No\n' ;;
+  esac
+}
+case "$(prompt_options fake:pane)" in
+  *$'\342\200\224'*) ok "an intact em-dash still renders as a real character" ;;
+  *) no "intact em-dash" "got [$(prompt_options fake:pane)]" ;;
+esac
+unset -f herdr
 unset -f _prompt_window
 
 echo

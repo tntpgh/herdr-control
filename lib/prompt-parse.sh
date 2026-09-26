@@ -447,13 +447,29 @@ composer_looks_actively_typed() {
 # and 60 in three others is the same bug wearing a different line number.
 _PANE_WINDOW_LINES=1000
 
+# tmux truncates a captured line at the pane's column width, and that cut can
+# land INSIDE a multibyte UTF-8 character — the box edge of a wrapped commit
+# message with an em-dash near the wrap column, for instance. The orphaned
+# lead byte(s) are not valid UTF-8, and every awk/sed downstream in this file
+# runs in a UTF-8 locale so it can match real glyphs (box-drawing, arrows,
+# the private-use status glyph) by character. Confirmed live: a truncated
+# em-dash (bytes e2 80 with no third byte) makes BSD sed exit 2 "stream did
+# not contain valid UTF-8", which empties a `$(...)` pipeline the caller
+# never checks the exit code of — the parse goes quietly wrong instead of
+# loudly crashing. `iconv -c` DROPS invalid bytes and passes valid multibyte
+# characters through unchanged, so this is the one place to fix it: every
+# consumer below stays UTF-8-aware, and a torn character is gone rather than
+# poisoning the whole scrape. `2>/dev/null` matches the `herdr pane read`
+# call it wraps — an unreadable pane already returns empty, not an error.
+_sanitize_utf8() { iconv -c -f UTF-8 -t UTF-8 2>/dev/null; }
+
 _menu_window() {
-  herdr pane read "$1" --source visible --lines "$_PANE_WINDOW_LINES" --format ansi 2>/dev/null
+  herdr pane read "$1" --source visible --lines "$_PANE_WINDOW_LINES" --format ansi 2>/dev/null | _sanitize_utf8
 }
 
 # The same window, without ANSI — for the scrapes that work on plain text.
 _pane_visible() {
-  herdr pane read "$1" --source visible --lines "$_PANE_WINDOW_LINES" 2>/dev/null
+  herdr pane read "$1" --source visible --lines "$_PANE_WINDOW_LINES" 2>/dev/null | _sanitize_utf8
 }
 
 # A NECESSARY condition for either pass below, decided in the shell with no
