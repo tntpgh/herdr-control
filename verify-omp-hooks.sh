@@ -1043,9 +1043,17 @@ for (const [name, toolName, input] of cases) {
   catch (err) { r = { threw: String(err) }; }
   const v = r && typeof r === "object" && (r as { block?: boolean }).block === true ? `BLOCK ${(r as { reason: string }).reason}` : r === undefined ? "ALLOW" : `OTHER ${JSON.stringify(r)}`;
   console.log(`${name}|${v.replace(/\n/g, " ")}`);
-  // Stand in for omp executing an allowed scratch write, so the next case can
-  // prove "this session created it" is what lets an existing scratch file through.
-  if (name === "scratch_new" && v === "ALLOW") await Bun.write((input as { path: string }).path, "x");
+  // Stand in for omp executing an allowed scratch write. scratch_new succeeds
+  // (so scratch_edit_own may touch it); scratch_failed errors, then a conductor
+  // creates the same file, which the worker must not be able to rewrite.
+  if (name === "scratch_new" && v === "ALLOW") {
+    await Bun.write((input as { path: string }).path, "x");
+    handlers.tool_result({ toolName, toolCallId: name, isError: false, content: [] });
+  }
+  if (name === "scratch_failed" && v === "ALLOW") {
+    handlers.tool_result({ toolName, toolCallId: name, isError: true, content: [] });
+    await Bun.write((input as { path: string }).path, "conductor");
+  }
 }
 EOS
   # name|tool|input-json — ${VARS} are expanded by the shell.
@@ -1080,8 +1088,31 @@ lsp_rename_out|lsp|{"action":"rename","file":"$MAIN/lib/x.sh","symbol":"a","new_
 lsp_unknown_action_out|lsp|{"action":"inline_refactor","file":"$MAIN/lib/x.sh"}
 generic_save_out|save_file|{"path":"$MAIN/lib/x.sh","content":"x"}
 scratch_existing|write|{"path":"$SCR/conductor-brief.md","content":"widened manifest"}
+at_abs|write|{"path":"@$MAIN/lib/x.sh","content":"x"}
+at_tilde|write|{"path":"@~/Code/herdr-control/.handoffs/notepad.md","content":"x"}
+colon_abs|write|{"path":":$MAIN/lib/x.sh","content":"x"}
+colon_dotdot|write|{"path":":../main/lib/x.sh","content":"x"}
+bracket_tag_abs|write|{"path":"[$MAIN/.handoffs/notepad.md#ABCD]","content":"x"}
+bracket_tag_rel|write|{"path":"[../main/lib/x.sh#1F2E]","content":"x"}
+bracket_plain|write|{"path":"[$MAIN/lib/x.sh]","content":"x"}
+edit_header_at|edit|{"input":"[@~/Code/herdr-control/.handoffs/notepad.md#ABCD]\nPUT >1:\n+IN PROGRESS"}
+edit_header_colon|edit|{"input":"[:$MAIN/lib/x.sh#ABCD]\nPUT >1:\n+x"}
+edit_header_indented|edit|{"input":"[lib/a.sh#ABCD]\nPUT >1:\n+ok\n  [$MAIN/lib/x.sh#ABCD]\nPUT >1:\n+no"}
+mv_indented|edit|{"input":"[lib/a.sh#ABCD]\n  MV $OTHER/moved-indented.sh"}
+mv_at|edit|{"input":"[lib/a.sh#ABCD]\nMV @$OTHER/moved.sh"}
+patch_mode_rename|edit|{"path":"lib/a.sh","edits":[{"op":"update","rename":"$MAIN/lib/planted.sh","diff":"@@\n-a\n+b"}]}
+ast_split_comma|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["lib/w.ts,../main/lib/m.ts"]}
+ast_split_semicolon|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["lib/w.ts;$MAIN/lib/m.ts"]}
+ast_split_space|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["lib/w.ts ../main/lib/m.ts"]}
+ast_quoted|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["\"../main/lib/m.ts\""]}
+lsp_rename_file_dest|lsp|{"action":"rename_file","file":"lib/a.sh","new_name":"$MAIN/lib/planted.sh"}
+xd_lsp_rename_file|write|{"path":"xd://lsp","content":"{\"action\":\"rename_file\",\"file\":\"lib/a.sh\",\"new_name\":\"$MAIN/lib/p.sh\"}"}
+scratch_failed|write|{"path":"$SCR/race.txt"}
+scratch_failed_then_conductor|edit|{"input":"[$SCR/race.txt#ABCD]\nPUT >1:\n+rewritten"}
 in_wt_relative_edit|edit|{"input":"[lib/a.sh#ABCD]\nPUT >1:\n+ok"}
 in_wt_absolute|write|{"path":"$WT/lib/new.sh","content":"x"}
+in_wt_at_prefix|write|{"path":"@$WT/lib/at.sh","content":"x"}
+in_wt_ast_brace|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["lib/{a,b}.sh"]}
 in_wt_outside_manifest_writes|write|{"path":"verify-new.sh","content":"x"}
 in_wt_tmp|write|{"path":"tmp/pr-body.md","content":"x"}
 in_wt_handoffs|write|{"path":".handoffs/PROOF.md","content":"x"}
@@ -1106,7 +1137,7 @@ EOF
   while IFS='|' read -r name _; do
     v="$(verdict "$worker_out" "$name")"
     case "$name" in
-      in_wt_*|scratch_new|scratch_edit_own|local_ok|peer_message|xd_resolve|read_main|grep_main|bash_main|lsp_read_main)
+      in_wt_*|scratch_new|scratch_edit_own|scratch_failed|local_ok|peer_message|xd_resolve|read_main|grep_main|bash_main|lsp_read_main)
         [ "$v" = ALLOW ] && ok "worker: $name allowed" || bad "worker: $name should be allowed, got: ${v:-<no line>}" ;;
       *)
         case "$v" in "BLOCK herdr write-scope: "*) ok "worker: $name blocked" ;; *) bad "worker: $name should be blocked, got: ${v:-<no line>}" ;; esac ;;

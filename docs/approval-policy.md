@@ -210,7 +210,8 @@ worker**. A registered worker is a session spawn-task.sh stamped with
 `HERDR_TASK_ID` + `HERDR_RUN_ID`, read once when the hook loads. Every other
 session (Main, conductors, Terrence's own) is never checked. The target must
 resolve inside the worktree on the task's registry row. The check follows
-symlinks (dangling ones too) and expands `..`, `~`, relative paths,
+symlinks (dangling ones too) and expands `..`, `~`, relative paths, every form omp itself
+rewrites a path to (a copied `[path#TAG]`, a leading `@`/`:`, ast_edit's split entries),
 `file://` and `archive:member`. Inside the worktree it refuses `.git`,
 `.env*` and hard-linked files. `.handoffs/**` stays writable. Scratch is
 allowed under `/tmp` or `$TMPDIR` only for a file that is new or that this

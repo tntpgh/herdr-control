@@ -308,7 +308,8 @@ function pretoolRegistrationBlock(event: unknown): { block: true; reason: string
 // path and not under a `.git` or `.env*` segment there. `.handoffs/**` inside
 // the worktree stays writable, because workers keep SPEC/PROOF/events there.
 // Scratch outside the worktree is allowed only under /tmp or $TMPDIR, and only
-// for a file that doesn't exist yet or that this session created. Live workers
+// for a file that doesn't exist yet or that this session created (recorded on
+// the call's successful tool_result, not when it is checked). Live workers
 // write commit messages and probes there, and the rule stops a worker
 // rewriting a conductor's /tmp brief or red tests. A file inside the worktree
 // that is a hard link (nlink > 1) is refused, since a write goes through it.
@@ -317,7 +318,10 @@ function pretoolRegistrationBlock(event: unknown): { block: true; reason: string
 // docs/approval-policy.md), every live manifest is `writes: [tmp/**]`, and
 // enforcing them would block every implement worker's source edits.
 //
-// HOW a target resolves: `~` / `~/` → $HOME at load (`~user` is refused);
+// HOW a target resolves: first every form omp itself may rewrite it to
+// (candidateForms: a copied `[path#TAG]`, a leading `@` or `:`, and ast_edit's
+// quote-strip and `;`/`,`/whitespace split), each checked. Then
+// `~` / `~/` → $HOME at load (`~user` is refused);
 // relative → the session cwd; `file://` → its path. Both spellings must land in
 // scope: (a) as given and (b) with `..` normalized lexically. omp may do
 // either before opening, and the kernel follows each symlink before applying
@@ -328,13 +332,15 @@ function pretoolRegistrationBlock(event: unknown): { block: true; reason: string
 // Internal URLs: `agent://` (a peer message) and `proc://` (stdin to the
 // worker's own job) write no file. `local://` is omp's per-session artifact dir
 // (~/.omp/agent/sessions/<cwd>/<session>/local/); omp itself refuses `..`
-// there, and this guard refuses `..`, a leading `/` and `~`. `xd://<device>`
-// is checked by the path fields of its JSON content (ast_edit's `paths`).
+// there, and this guard refuses `..`, a leading `/` and `~`. `write
+// xd://<device>` runs that device, so its JSON content is judged exactly as a
+// direct call to it would be (an unknown device by any path field it carries).
 // Every other scheme (`ssh://`, `memory://`, `skill://`, …) is refused.
 //
-// WHICH tools: write, edit (hashline `[PATH#TAG]` headers and `MV DEST`,
-// apply_patch `*** … File:` / `*** Move to:` lines, any path field),
-// multiedit, ast_edit, notebook*, lsp's mutating actions, and by shape any tool
+// WHICH tools: write, edit (hashline `[PATH#TAG]` headers and `MV DEST`, both
+// possibly indented; apply_patch `*** … File:` / `*** Move to:` lines; patch
+// mode `edits[].rename`; any path field), multiedit, ast_edit, notebook*, lsp
+// (every action not known read-only, incl. rename_file's `new_name`), and by shape any tool
 // whose name says it mutates (write/edit/patch/rename/…) AND carries a
 // path-like field. NOT covered here: `eval` (arbitrary code; omp's approval
 // layer governs it), bash (lib/command-policy.sh), and tools that write omp's
@@ -350,6 +356,7 @@ type Block = { block: true; reason: string };
 
 let registeredWorktreeReal: string | undefined; // cached after the first successful read
 const scratchCreatedHere = new Set<string>();
+const pendingScratch = new Map<string, string[]>(); // toolCallId -> scratch files it would create
 
 function readRegisteredWorktree(): { worktree: string } | { error: string } {
   if (registeredWorktreeReal) return { worktree: registeredWorktreeReal };
@@ -435,29 +442,32 @@ function pathFields(rec: Record<string, unknown>): string[] {
   return out;
 }
 
-// Every file an edit call's `input` touches. A line starting `[` is always a
-// section header (body rows start `+`), so one that doesn't parse refuses the
-// call rather than being skipped. A relative MV destination is checked against
-// both the cwd and the moved file's directory.
+// Every file an edit call's `input` touches. omp's hashline parser accepts
+// indented ops, so each line is judged on its trimmed form. A trimmed line
+// starting `[` is always a section header (body rows start `+`), and a header
+// or MV line that doesn't parse refuses the call rather than being skipped. A
+// relative MV destination is checked against both the cwd and the moved file's
+// directory.
 function editInputTargets(text: string): string[] | string {
   const out: string[] = [];
   let lastHeader = "";
-  for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith("[")) {
-      const m = /^\[(.+)#[0-9A-Fa-f]{4}\]\s*$/.exec(line);
-      if (!m) return `cannot parse the edit section header ${JSON.stringify(line.slice(0, 120))}`;
+  for (const line of text.split(/\r\n|\r|\n/)) {
+    const t = line.trim();
+    if (t.startsWith("[")) {
+      const m = /^\[(.+)#[0-9A-Fa-f]{4}\]$/.exec(t);
+      if (!m) return `cannot parse the edit section header ${JSON.stringify(t.slice(0, 120))}`;
       lastHeader = unquote(m[1]);
       out.push(lastHeader);
       continue;
     }
-    const mv = /^MV\s+(.+)$/.exec(line);
-    if (mv) {
-      const dest = unquote(mv[1]);
+    if (/^mv(\s|$)/i.test(t)) {
+      const dest = unquote(t.slice(2));
+      if (!dest) return "an MV op names no destination";
       out.push(dest);
-      if (lastHeader && !path.isAbsolute(dest) && !dest.startsWith("~")) out.push(path.join(path.dirname(lastHeader), dest));
+      if (lastHeader && !path.isAbsolute(dest) && !/^[~@:[]/.test(dest)) out.push(path.join(path.dirname(lastHeader), dest));
       continue;
     }
-    const patch = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to):\s*(.+)$/.exec(line);
+    const patch = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to):\s*(.+)$/.exec(t);
     if (patch) out.push(unquote(patch[1]));
   }
   return out;
@@ -492,6 +502,15 @@ function mutationTargets(toolName: string, rec: Record<string, unknown>): Mutati
       if (typeof got === "string") return got;
       targets.push(...got);
     }
+    // patch mode: {path, edits: [{op, rename, diff}]}; the move target is nested.
+    if (Array.isArray(rec.edits)) {
+      for (const entry of rec.edits) {
+        if (!entry || typeof entry !== "object") continue;
+        const e = entry as Record<string, unknown>;
+        targets.push(...pathFields(e));
+        if (typeof e.rename === "string" && e.rename) targets.push(e.rename);
+      }
+    }
     return targets.length > 0 ? { raw: targets } : "cannot tell which file this edit touches";
   }
   if (name === "lsp") {
@@ -501,6 +520,8 @@ function mutationTargets(toolName: string, rec: Record<string, unknown>): Mutati
     const action = typeof rec.action === "string" ? rec.action.toLowerCase() : "";
     if (LSP_READONLY_ACTION.test(action)) return undefined;
     const targets = pathFields(rec);
+    // rename_file / move_file take the destination in `new_name`.
+    if (action.includes("file") && typeof rec.new_name === "string" && rec.new_name) targets.push(rec.new_name);
     if (targets.length > 0) return { raw: targets };
     return LSP_MUTATING_ACTION.test(action) ? `lsp ${action} names no file` : undefined;
   }
@@ -598,6 +619,32 @@ function checkFileTarget(raw: string, globOk: boolean, cwd: string, wt: string, 
   return undefined;
 }
 
+// Every spelling omp itself may turn `raw` into before resolving it (omp 18.3.2
+// path-utils/write.ts, found by the PR #159 review). It unwraps a copied
+// `[path#TAG]` / `[path]`, drops a leading `@` before `/` or `~`, and drops a
+// leading `:` before `/`, `~`, `./` or `../`. ast_edit also strips surrounding
+// double quotes and splits one entry on `;`, `,` and whitespace. Every form is
+// checked, so whichever one omp opens is in scope.
+function candidateForms(raw: string, globOk: boolean): string[] {
+  const seen = new Set<string>();
+  const queue = [raw.trim()];
+  while (queue.length > 0 && seen.size < 64) {
+    const f = queue.shift() as string;
+    if (!f || seen.has(f)) continue;
+    seen.add(f);
+    const bracket = /^\[(.+?)(?:#[0-9A-Fa-f]{4})?\]$/.exec(f);
+    if (bracket) queue.push(bracket[1].trim());
+    if (/^@[/~]/.test(f)) queue.push(f.slice(1));
+    if (/^:(?:[/~]|\.\.?\/)/.test(f)) queue.push(f.slice(1));
+    if (globOk) {
+      if (f.length >= 2 && f.startsWith('"') && f.endsWith('"')) queue.push(f.slice(1, -1));
+      const parts = f.split(/[;,\s]+/).filter(Boolean);
+      if (parts.length > 1) queue.push(...parts);
+    }
+  }
+  return [...seen];
+}
+
 // undefined = allowed; otherwise why not. Internal URLs first (see HOW above).
 function checkTarget(
   raw: string,
@@ -606,10 +653,24 @@ function checkTarget(
   wt: string,
   newScratch: string[],
 ): string | undefined {
-  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(raw.trim());
+  for (const form of candidateForms(raw, targets.globOk === true)) {
+    const why = checkOneForm(form, targets, cwd, wt, newScratch);
+    if (why) return form === raw.trim() ? why : `${raw} (as ${form}): ${why}`;
+  }
+  return undefined;
+}
+
+function checkOneForm(
+  raw: string,
+  targets: MutationTargets,
+  cwd: string,
+  wt: string,
+  newScratch: string[],
+): string | undefined {
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(raw);
   if (!scheme || scheme[1].toLowerCase() === "file") return checkFileTarget(raw, targets.globOk === true, cwd, wt, newScratch);
   const kind = scheme[1].toLowerCase();
-  const rest = raw.trim().slice(scheme[0].length);
+  const rest = raw.slice(scheme[0].length);
   if (kind === "agent" || kind === "proc") return undefined;
   if (kind === "local") {
     let decoded = rest;
@@ -632,8 +693,14 @@ function checkTarget(
       return undefined; // a device that takes prose (resolve/reject), not a path
     }
     if (!args || typeof args !== "object") return undefined;
-    for (const inner of pathFields(args as Record<string, unknown>)) {
-      const why = checkTarget(inner, { raw: [inner], globOk: true }, cwd, wt, newScratch);
+    // `write xd://<tool>` runs <tool>: judge its JSON exactly as a direct call,
+    // and a device this file doesn't know by any path field it carries.
+    const device = rest.split(/[/?#]/)[0] ?? "";
+    const rec = args as Record<string, unknown>;
+    const inner = mutationTargets(device, rec) ?? { raw: pathFields(rec) };
+    if (typeof inner === "string") return `${raw}: ${inner}`;
+    for (const p of inner.raw) {
+      const why = checkTarget(p, inner, cwd, wt, newScratch);
       if (why) return `${raw}: ${why}`;
     }
     return undefined;
@@ -672,7 +739,17 @@ function workerWriteScopeBlock(event: unknown, ctx: unknown): Block | undefined 
       const why = checkTarget(raw, targets, cwd, scope.worktree, newScratch);
       if (why) return refuse(why);
     }
-    for (const p of newScratch) scratchCreatedHere.add(p);
+    // Recorded as this session's own only once omp reports the call succeeded
+    // (onToolResult), so an allowed-but-failed write can't pre-claim a path a
+    // conductor creates later.
+    if (newScratch.length > 0 && typeof e.toolCallId === "string") {
+      pendingScratch.set(e.toolCallId, newScratch);
+      while (pendingScratch.size > INPUT_CACHE_MAX) {
+        const oldest = pendingScratch.keys().next().value;
+        if (oldest === undefined) break;
+        pendingScratch.delete(oldest);
+      }
+    }
     return undefined;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -1245,9 +1322,17 @@ function runIntervalReconcile(): void {
   }
 }
 
-function onToolResult(): undefined {
+function onToolResult(event?: unknown): undefined {
   try {
-    // Reconciliation only. Retraction moved to the approval/ask events above:
+    // The write-scope guard's scratch files become "created by this session"
+    // only when the call that creates them actually succeeded.
+    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    if (typeof e.toolCallId === "string") {
+      const created = pendingScratch.get(e.toolCallId);
+      pendingScratch.delete(e.toolCallId);
+      if (created && e.isError !== true) for (const p of created) scratchCreatedHere.add(p);
+    }
+    // Reconciliation. Retraction moved to the approval/ask events above:
     // sweeping here fired it on every tool call in every session, and while
     // any worker sat blocked the queue was non-empty, so it always did work.
     if (reconcileAvailable) runIntervalReconcile();
