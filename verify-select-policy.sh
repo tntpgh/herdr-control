@@ -611,6 +611,19 @@ sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "commit message mentioning herdr-select.sh no longer reserved under the grant" \
   || bad "grant leaked into the text rules: rc=$rc; stderr: $(cat "$WORK/err.txt")"
 
+printf '== reserved-git-subcommand fix: a worktree PATH containing "push" is not a git push ==\n'
+# The push rule used to fire on the WORD "push" anywhere "git" also
+# appeared, so a registered worktree whose path happens to contain "push"
+# turned every `git status` in it into a human-only escalation (confirmed
+# live 2026-09-26, herdr-control notepad item i).
+PUSHWT_CMD="cd /Users/thurbs/Code/.worktrees/fix/push-grant-upstream-shape && git status --short"
+set_screen "$PUSHWT_CMD"; reset_keys
+seed_input_required runG taskG "$PUSHWT_CMD"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "worktree path containing 'push' no longer reserved" \
+  || bad "worktree path 'push' still reserved: rc=$rc; $(cat "$WORK/err.txt")"
+
+
 printf '== #3b: exact non-grant variants of the SAME verbs still refused ==\n'
 for bad_cmd in "git push origin main" "git push -f origin $GBRANCH" "git push origin HEAD:main" \
                "git push origin $GBRANCH && git push origin main" "gh pr merge $GBRANCH" \
