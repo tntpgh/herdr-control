@@ -617,7 +617,7 @@ printf '== reserved-git-subcommand fix: a worktree PATH containing "push" is not
 # turned every `git status` in it into a human-only escalation (confirmed
 # live 2026-09-26, herdr-control notepad item i).
 PUSHWT_CMD="cd /Users/thurbs/Code/.worktrees/fix/push-grant-upstream-shape && git status --short"
-set_screen "$PUSHWT_CMD"; reset_keys
+set_menu "$PUSHWT_CMD"; reset_keys
 seed_input_required runG taskG "$PUSHWT_CMD"
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "worktree path containing 'push' no longer reserved" \
