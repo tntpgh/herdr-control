@@ -1914,7 +1914,7 @@ _cp_push_is_safe() {                    # norm -> 0 (true) only for git push [-u
 conductor_reserved_reason() {
   local norm fleet_norm
   norm="$(scannable_command "$1")"
-  fleet_norm="$(printf '%s' "$norm" | sed -E 's/\$\{?IFS\}?/ /g; s/\$\{?[A-Za-z_][A-Za-z0-9_]*\}?//g')"
+  fleet_norm="$(printf '%s' "$norm" | sed -E 's/\$\{IFS[^}]*\}/ /g; s/\$IFS\b/ /g; s/\$\{[A-Za-z_][A-Za-z0-9_]*[^}]*\}//g; s/\$[A-Za-z_][A-Za-z0-9_]*\b//g')"
   _cp_best_v=0; _cp_best_r=""
   _cp_apply_operator_rules "$norm"
   if [ "$_cp_best_v" -gt 0 ]; then printf '%s\n' "$_cp_best_r"; return; fi

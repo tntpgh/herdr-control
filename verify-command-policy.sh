@@ -111,6 +111,9 @@ check_reserved "variable-prefixed spawn-agent human-only"  "bash \$H/spawn-agent
 check_reserved "IFS-separated herdr tab create human-only" "herdr\${IFS}tab\${IFS}create --cwd /repo --label child"
 check_reserved "IFS-separated herdr pane run human-only"   "herdr\${IFS}pane\${IFS}run pane1 --agent omp"
 check_reserved "variable-infix spawn-agent human-only"    "bash ./spawn-agent\${EMPTY}.sh /repo child omp"
+check_reserved "IFS-default herdr tab create human-only" "herdr\${IFS:- }tab\${IFS:- }create --cwd /repo --label child"
+check_reserved "IFS-default herdr pane run human-only"   "herdr\${IFS:- }pane\${IFS:- }run pane1 --agent omp"
+check_reserved "parameter-op spawn-agent human-only"     "bash ./spawn-agent\${EMPTY:-}.sh /repo child omp"
 check_reserved "raw herdr tab create remains human-only"   "herdr tab create --cwd /repo --label child"
 check_reserved "raw herdr pane run remains human-only"     "herdr pane run pane1 --agent omp"
 
