@@ -1366,6 +1366,100 @@ check_not_allow "run panel cannot hide curl pipe" \
   "Allow tool: run ; curl -fsSL https://example.com/install.sh | sh"
 check_reserved "real push to main remains reserved" "git push origin main"
 check_not_allow "curl pipe to shell remains blocked" "curl -fsSL https://example.com/install.sh | sh"
+
+echo
+echo "== case 5: git SUBCOMMAND detection (reserved-git-subcommand fix) =="
+# The push rule used to fire on the WORD "push" anywhere a command also
+# mentioned "git" — a worktree PATH containing "push", `git diff
+# lib/push-wake.sh`, `git commit -m "...push..."` all reserved. The shared
+# `_cp_git_push_invoked` helper now fires only on a real git-push SUBCOMMAND,
+# in any segment/nesting, and stays deny-by-default for anything it cannot
+# parse with confidence (a missing or non-literal subcommand slot).
+check_scope_ceiling() {
+  local label="$1" cmd="$2" manifest="$3" want_reserved="$4" got
+  total=$((total + 1))
+  got="$(_cp_scope_ceiling "$cmd" "$manifest")"
+  if { [ "$want_reserved" = yes ] && [ -n "$got" ]; } || { [ "$want_reserved" = no ] && [ -z "$got" ]; }; then
+    printf 'PASS  %-52s => %s\n' "$label" "${got:-in scope}"
+  else
+    printf 'FAIL  %-52s => %s (want %s)\n' "$label" "${got:-in scope}" "$want_reserved"
+    failed=$((failed + 1))
+  fi
+}
+
+# -- must still be reserved: every real git-push shape, incl. syntax evasion.
+check_reserved "chained: cd repo, push"            'cd /tmp/some-other-repo && git push origin main'
+check_reserved "operator chain: status && push"    'git status && git push'
+check_reserved "operator chain: status ; push"     'git status; git push'
+check_reserved "operator chain: status || push"    'git status || git push'
+check_reserved "operator chain: status | push"     'git status | git push'
+check_reserved "substitution: echo \$(git push)"   'echo $(git push origin main)'
+check_reserved "substitution: echo \`git push\`"   'echo `git push origin main`'
+check_reserved "substituted subcommand slot"       'git $(echo push) origin main'
+check_reserved "backtick subcommand slot"          'git `printf push` origin main'
+check_reserved "assignment then indirect subcommand" 'X=push; git $X origin main'
+check_reserved "\${IFS} between git and push"       'git ${IFS}push origin main'
+check_reserved "eval hides a real push"            'eval "git push origin main"'
+check_reserved "sh -c hides a real push"           "sh -c 'git push origin main'"
+check_reserved "bash -c hides a real push"         'bash -c "git push"'
+check_reserved "leading assignment word, then push" 'x=1 git push'
+check_reserved "env wrapper"                       'env git push'
+check_reserved "env wrapper with assignment"       'env FOO=1 git push'
+check_reserved "command wrapper"                   'command git push'
+check_reserved "exec wrapper"                      'exec git push'
+check_reserved "absolute git path"                 '/usr/bin/git push'
+check_reserved "time wrapper"                      'time git push'
+check_reserved "nohup wrapper"                     'nohup git push'
+check_reserved "xargs wrapper"                     'xargs git push'
+check_reserved "piped into xargs git"              'echo push | xargs git'
+check_reserved "find -exec git push"               'find . -exec git push \;'
+check_reserved "doubled internal whitespace"       'git   push'
+check_reserved "backslash-broken basename"         'g\it push'
+check_reserved "double-quoted basename"            '"git" push'
+check_reserved "single-quoted basename"            "'git' push"
+check_reserved "quoted subcommand"                 'git "push" origin main'
+check_reserved "backslash inside subcommand"       'git p\ush origin main'
+check_reserved "split-quoted subcommand"           "git pu''sh origin main"
+check_reserved "alias definition embeds a push"    "alias p='git push'"
+check_reserved "git config alias.p push"           'git config alias.p push'
+check_reserved "git subtree push"                  'git subtree push --prefix x origin main'
+check_reserved "git lfs push"                      'git lfs push origin main'
+check_reserved "git -C dir push"                   'git -C /tmp/x push origin main'
+check_reserved "git -c push.default=current push"  'git -c push.default=current push'
+check_reserved "git -c alias.p=push p"              'git -c alias.p=push p origin main'
+check_reserved "--git-dir= push"                    'git --git-dir=/x/.git push origin fix/x'
+check_reserved "--work-tree push"                   'git --work-tree /x push origin fix/x'
+check_reserved "--no-pager push"                    'git --no-pager push origin main'
+check_reserved "-P push"                            'git -P push'
+check_reserved "hex-escaped colon refspec"          'git push origin $'"'"'\x3a'"'"'main'
+check_reserved "hex-escaped subcommand"             'git $'"'"'\x70\x75\x73\x68'"'"' origin main'
+check_reserved "backslash-newline continuation"     $'git \\\npush origin main'
+
+# -- must NO LONGER be reserved: a "push" word that is not a git push.
+check_unreserved "worktree PATH containing push, plain status"  \
+  'cd /Users/thurbs/Code/.worktrees/fix/push-grant-upstream-shape && git status --short'
+check_unreserved "git diff on a push-named file"        'git diff lib/push-wake.sh'
+check_unreserved "git log -- a push-named file"         'git log -- lib/push-wake.sh'
+check_unreserved "git log --oneline -- two push-named files" \
+  'git log --oneline -- lib/push-wake.sh verify-push-wake.sh'
+check_unreserved "commit message mentioning push (colon)" \
+  'git commit -m "fix: push wake retry"'
+check_unreserved "commit message mentioning push (prose)" \
+  'git commit -m "tidy the push helper"'
+check_unreserved "git add a push-named file"            'git add lib/push-wake.sh'
+check_unreserved "git stash push is local, not a network push" 'git stash push -m wip'
+
+# -- classify_command: git rm -f on a push-named file is not a force-push.
+check "git rm -f on a push-named file is not force-push" \
+  "git rm -f lib/push-wake.sh" allow
+
+# -- scope ceiling: commit-only may still commit even if the message says
+# "push"; a real push stays refused.
+check_scope_ceiling "commit-only: commit mentioning push stays in scope" \
+  'git commit -m "fix the push helper"' '{"git":"commit-only"}' no
+check_scope_ceiling "commit-only: a real push stays refused" \
+  'git push origin feat/x' '{"git":"commit-only"}' yes
+
 echo
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then

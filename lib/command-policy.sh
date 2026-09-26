@@ -607,7 +607,7 @@ _cp_scope_ceiling() {                   # raw manifest
   norm="$(scannable_command "$1")"
   case "$git" in
     commit-only|none)
-      if _cp_imatch '\bgit\b.*\bpush\b|\bgh\b.*\bpr\b.*\bcreate\b' "$norm"; then
+      if _cp_git_push_invoked "$1" || _cp_imatch '\bgh\b.*\bpr\b.*\bcreate\b' "$norm"; then
         printf 'outside the task manifest (git: %s) — push/PR creation is not in scope\n' "$git"; return 0
       fi ;;
   esac
@@ -1442,6 +1442,93 @@ _cp_flatten_substitutions() {
   printf '%s' "$text"
 }
 
+# `_cp_git_push_invoked <raw>` -> 0 (true) when RAW invokes a real git push
+# anywhere (any segment of a chain, any nesting) — shared by
+# conductor_reserved_reason, classify_command's force-push escalate, and
+# _cp_scope_ceiling so the three free-text `\bgit\b`+`\bpush\b` copies (which
+# fired on the WORD "push" anywhere a "git" also appeared — a worktree path
+# containing "push", `git diff lib/push-wake.sh`, `git commit -m "...push..."`
+# all reserved) cannot drift out of sync again. DENY BY DEFAULT: this only
+# RELEASES a text when it can positively show no `push` in it is a git push;
+# anything it cannot parse with confidence keeps today's behaviour.
+#
+# Runs on the ANSI-decoded, quote-stripped text BEFORE `_cp_flatten_substitutions`
+# — deliberately, not scannable_command's fully-flattened output. Flattening
+# a substitution used AS the subcommand slot (`git $(echo push) origin main`
+# -> `git  echo push  origin main`) makes the slot look like the literal word
+# "echo", losing the one signal that it was never a literal subcommand. Left
+# unflattened, the same text's `(`/`)`/backtick are also segment delimiters
+# (see below), so `git $(echo push)…` naturally splits into a `git $` segment
+# — subcommand slot MISSING — and its own `echo push` segment, both handled
+# by the ordinary rules with no separate flattened pass needed.
+_cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invoked
+  local LC_ALL=C LANG=C
+  local raw="$1" pre segmented out wide=1
+  pre="$(_cp_strip_heredocs "$raw")"
+  pre="$(_cp_decode_ansi_c "$pre")"
+  pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
+  pre="$(printf '%s' "$pre" | sed "s/['\"\\\\]//g")"
+  pre="$(printf '%s' "$pre" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
+  segmented="$(printf '%s' "$pre" | sed -E 's/[;&|()`]/\n/g')"
+  out="$(printf '%s\n' "$segmented" | awk '
+    function is_local_only(s) { return (s ~ /^(status|diff|log|show|commit|add|rm|mv|restore|grep|blame|ls-files|stash|branch|tag|rev-parse|cat-file|reflog|shortlog|describe|checkout|switch)$/) }
+    function is_consuming(s)  { return (s ~ /^(-C|-c|--git-dir|--work-tree|--namespace|--config-env|--exec-path|--super-prefix|--attr-source)$/) }
+    function is_git(s,    n) { n = length(s); return (s == "git" || (n > 4 && substr(s, n - 3) == "/git")) }
+    {
+      n = split($0, tok, /[ \t]+/)
+      lastsub = ""
+      i = 1
+      while (i <= n) {
+        t = tok[i]
+        if (t == "") { i++; continue }
+        if (is_git(t)) {
+          i++
+          found = 0; subcmd = ""
+          while (i <= n) {
+            t2 = tok[i]
+            if (t2 == "") { i++; continue }
+            if (substr(t2, 1, 1) == "-") {
+              if (index(t2, "push") > 0) reserve = 1
+              eq = index(t2, "=")
+              name = (eq > 0) ? substr(t2, 1, eq - 1) : t2
+              i++
+              if (eq == 0 && is_consuming(name)) {
+                while (i <= n && tok[i] == "") i++
+                if (i <= n) { if (index(tok[i], "push") > 0) reserve = 1; i++ }
+              }
+              continue
+            }
+            subcmd = t2; found = 1; break
+          }
+          if (!found) {
+            missing = 1; lastsub = ""
+          } else if (subcmd == "push") {
+            reserve = 1; lastsub = "push"; i++
+          } else if (subcmd ~ /^[a-z][a-z0-9-]*$/) {
+            lastsub = subcmd; i++
+          } else {
+            nonliteral = 1; lastsub = ""; i++
+          }
+          continue
+        }
+        m = split(t, sw, "=")
+        for (k = 1; k <= m; k++) {
+          if (sw[k] == "push" && !(lastsub != "" && is_local_only(lastsub))) reserve = 1
+        }
+        i++
+      }
+    }
+    END {
+      if (reserve) print "push"; else if (missing || nonliteral) print "ambiguous"; else print "safe"
+    }
+  ')"
+  case "$out" in
+    push) return 0 ;;
+    ambiguous) _cp_match '\bpush\b' "$pre" ;;
+    *) return 1 ;;
+  esac
+}
+
 # ---- the floor rule table (ported from qm's command-policy.ts) ------------
 # Applies in EVERY posture — there is no "trusted mode" that skips these.
 # Deny rules are checked ahead of require_approval ones so a command that
@@ -1922,7 +2009,7 @@ classify_command() {
   # already have pulled; the target branch needs a human's eyes, not an
   # automated yes. Flag matched as a CLUSTER (-uf, -fu, ...), not just a
   # bare -f, since git accepts short options combined.
-  { _cp_match '\bgit\b' "$norm" && _cp_match '\bpush\b' "$norm" &&
+  { _cp_git_push_invoked "$raw" &&
     _cp_match '(^|[[:space:]])(-[A-Za-z]*f[A-Za-z]*|--force(-with-lease)?)([[:space:]]|$)' "$norm"; } &&
     _cp_consider 1 "git push --force/-f rewrites remote history"
 
@@ -2585,7 +2672,7 @@ conductor_reserved_reason() {
   # a `-C`, and any `cd … &&` prefix all fail to match this shape and
   # stay reserved below — see _cp_push_is_safe's own header for the full
   # design and the two security-review rounds that shaped it.
-  elif { _cp_match '\bgit\b' "$action_norm" && _cp_match '\bpush\b' "$action_norm" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|alert-gate\.sh|prompt-parse\.sh)\b|(^|[^A-Za-z0-9_-])command-policy\.sh\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm"; then
+  elif { _cp_git_push_invoked "$(_cp_mask_script_data "$raw")" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|alert-gate\.sh|prompt-parse\.sh)\b|(^|[^A-Za-z0-9_-])command-policy\.sh\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm"; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
   fi
 }
