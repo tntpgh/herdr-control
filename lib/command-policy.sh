@@ -334,12 +334,28 @@ _cp_grant_action() {                    # raw wt branch trunk
           printf 'git %s in %s (own worktree, local-only)\n' "${w[1]}" "$wt"
           return 0 ;;
         push)
-          # exactly: git push origin <branch> — no force, no other refspec,
-          # no other flag of any kind.
-          if [ "${#w[@]}" -eq 4 ] && [ "${w[2]}" = origin ] && [ "${w[3]}" = "$branch" ]; then
-            printf 'git push origin %s (own branch)\n' "$branch"
-            return 0
-          fi
+          # exactly: git push [-u|--set-upstream] origin <branch> — no
+          # force, no other refspec, no other flag of any kind, and the
+          # optional upstream flag may appear at most once, only in this
+          # exact position.
+          case "${#w[@]}" in
+            4)
+              if [ "${w[2]}" = origin ] && [ "${w[3]}" = "$branch" ]; then
+                printf 'git push origin %s (own branch)\n' "$branch"
+                return 0
+              fi
+              ;;
+            5)
+              case "${w[2]}" in
+                -u|--set-upstream)
+                  if [ "${w[3]}" = origin ] && [ "${w[4]}" = "$branch" ]; then
+                    printf 'git push %s origin %s (own branch)\n' "${w[2]}" "$branch"
+                    return 0
+                  fi
+                  ;;
+              esac
+              ;;
+          esac
           return 1 ;;
         *) return 1 ;;
       esac ;;
