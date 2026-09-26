@@ -25,7 +25,7 @@ cwd=${2:-${PWD:-}}
 tool_norm=$(printf '%s' "$tool" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]_:-')
 case "$tool_norm" in
   mcp__*) exit 0 ;;
-  taskoutput|taskstop|taskget|tasklist|cronlist|bashoutput|killshell|taskcreate|taskupdate) exit 0 ;;
+  taskoutput|taskstop|taskget|tasklist|cronlist|bashoutput|killshell|taskupdate) exit 0 ;;
   *agent*|*subagent*|*task*|*workflow*|*cron*|*schedul*|*worktree*|*delegate*|*spawn*|*dispatch*|*handoff*|*remote*|*sendmessage*|*monitor*) ;;
   *) exit 0 ;;
 esac

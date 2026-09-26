@@ -201,7 +201,6 @@ const NON_FLEET_TOOLS: Record<string, true> = {
   cronlist: true,
   bashoutput: true,
   killshell: true,
-  taskcreate: true,
   taskupdate: true,
 };
 

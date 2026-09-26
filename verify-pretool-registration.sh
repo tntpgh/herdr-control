@@ -38,22 +38,37 @@ run_guard() { bash "$here/lib/pretool-registration.sh" "$@" >/dev/null 2>"$work/
 printf '== native fleet creation refuses even for registered workers ==\n'
 HERDR_TASK_ID=missing run_guard task "$wt"; rc=$?
 [ "$rc" -eq 8 ] && ok 'unregistered delegation refused' || not_ok "unregistered rc=$rc"
+HERDR_TASK_ID=missing run_guard taskcreate "$wt"; rc=$?
+[ "$rc" -eq 8 ] && ok 'unregistered taskcreate refused' || not_ok "unregistered taskcreate rc=$rc"
 grep -q 'spawn-task.sh' "$work/err" && ok 'refusal points to registered spawn path' || not_ok "message: $(cat "$work/err")"
 run_guard task "$wt/src"; rc=$?
 [ "$rc" -eq 8 ] && ok 'current registered worker still cannot create native task descendants' || not_ok "current task rc=$rc"
 run_guard agent "$wt/src"; rc=$?
 [ "$rc" -eq 8 ] && ok 'native agent creation refused' || not_ok "native agent rc=$rc"
+run_guard taskcreate "$wt/src"; rc=$?
+[ "$rc" -eq 8 ] && ok 'current registered worker still cannot taskcreate native descendants' || not_ok "current taskcreate rc=$rc"
 run_extension_guard() {
-  TEST_CWD="$1" bun -e 'const mod = await import("./agent-hooks/omp-herdr-control.ts"); const handlers = {}; mod.default({on: (event, handler) => { handlers[event] = handler; }}); const result = handlers.tool_call({toolName:"task", input:{cwd:process.env.TEST_CWD}}); console.log(result?.block ? "BLOCK" : "ALLOW");' 2>"$work/bun.err"
+  TEST_CWD="$1" TEST_TOOL="${2:-task}" bun -e 'const mod = await import("./agent-hooks/omp-herdr-control.ts"); const handlers = {}; mod.default({on: (event, handler) => { handlers[event] = handler; }}); const result = handlers.tool_call({toolName:process.env.TEST_TOOL, input:{cwd:process.env.TEST_CWD}}); console.log(result?.block ? "BLOCK" : "ALLOW");' 2>"$work/bun.err"
 }
 
 printf '== OMP tool_call wiring blocks native delegation ==\n'
 [ "$(HERDR_TASK_ID=missing run_extension_guard "$wt")" = BLOCK ] \
   && ok 'OMP hook blocks unregistered native delegation' \
   || not_ok "OMP unregistered result: $(cat "$work/bun.err")"
+[ "$(HERDR_TASK_ID=missing run_extension_guard "$wt" taskcreate)" = BLOCK ] \
+  && ok 'OMP hook blocks unregistered native taskcreate' \
+  || not_ok "OMP unregistered taskcreate result: $(cat "$work/bun.err")"
 [ "$(run_extension_guard "$wt/src")" = BLOCK ] \
   && ok 'OMP hook blocks current registered native delegation' \
   || not_ok "OMP current-task result: $(cat "$work/bun.err")"
+[ "$(run_extension_guard "$wt/src" taskcreate)" = BLOCK ] \
+  && ok 'OMP hook blocks current registered native taskcreate' \
+  || not_ok "OMP current-task taskcreate result: $(cat "$work/bun.err")"
+run_guard taskupdate "$wt/src"; rc=$?
+[ "$rc" -eq 0 ] && ok 'native taskupdate observer stays allowed' || not_ok "taskupdate rc=$rc"
+[ "$(run_extension_guard "$wt/src" taskupdate)" = ALLOW ] \
+  && ok 'OMP hook leaves native taskupdate allowed' \
+  || not_ok "OMP taskupdate result: $(cat "$work/bun.err")"
 
 
 printf '== unregistered ordinary tools remain outside this guard ==\n'
