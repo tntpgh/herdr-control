@@ -219,7 +219,11 @@ session created, so a worker can't rewrite a conductor's `/tmp` brief. Live
 workers write commit messages and probes to `/tmp`, which is why it isn't
 refused outright. Internal URLs: `agent://` and `proc://` pass, `local://`
 passes unless it tries to climb out, `xd://` is judged by its JSON `paths`,
-and every other scheme is refused. A registry row that can't be read blocks
+and every other scheme is refused (so is `<file>:conflict://N`, which omp routes to
+the conflict handler). notepad.ts's `notepad_append`/`notepad_priority` (direct or
+`write xd://notepad_append`) are judged on the file they write: `$NOTEPAD_PATH`, or the
+session cwd's `.handoffs/notepad.md`. lsp `request` is refused, because a server edit it
+triggers can land anywhere. A registry row that can't be read blocks
 every mutating call except a peer message.
 
 **The manifest's `writes` globs are deliberately not enforced here.** `writes`

@@ -340,7 +340,9 @@ function pretoolRegistrationBlock(event: unknown): { block: true; reason: string
 // WHICH tools: write, edit (hashline `[PATH#TAG]` headers and `MV DEST`, both
 // possibly indented; apply_patch `*** … File:` / `*** Move to:` lines; patch
 // mode `edits[].rename`; any path field), multiedit, ast_edit, notebook*, lsp
-// (every action not known read-only, incl. rename_file's `new_name`), and by shape any tool
+// (every action not known read-only, incl. rename_file's `new_name`; `request`
+// refused), notepad.ts's notepad_append/priority (on the notepad file they
+// write), and by shape any tool
 // whose name says it mutates (write/edit/patch/rename/…) AND carries a
 // path-like field. NOT covered here: `eval` (arbitrary code; omp's approval
 // layer governs it), bash (lib/command-policy.sh), and tools that write omp's
@@ -350,6 +352,12 @@ const WORKER_RUN_ID = process.env.HERDR_RUN_ID?.trim() ?? "";
 const LOAD_HOME = process.env.HOME?.trim() || homedir();
 const LOAD_TMPDIR = process.env.TMPDIR?.trim() ?? "";
 const LOAD_RUN_STATE_DIR = process.env.HERDR_RUN_STATE_DIR?.trim() ?? "";
+// ~/.omp/agent/extensions/notepad.ts writes $NOTEPAD_PATH (absolute, or
+// relative to the session cwd) when set, else <cwd>/.handoffs/notepad.md or
+// the legacy <cwd>/.omc/notepad.md. Its mutating tools are judged on exactly
+// those files, whether called directly or as `write xd://notepad_append`.
+const LOAD_NOTEPAD_PATH = process.env.NOTEPAD_PATH?.trim() ?? "";
+const NOTEPAD_READONLY_TOOLS: Record<string, true> = { notepad_read: true, notepad_stats: true };
 const RUN_REGISTRY_SH = path.join(ROOT, "lib", "run-registry.sh");
 
 type Block = { block: true; reason: string };
@@ -467,14 +475,16 @@ function editInputTargets(text: string): string[] | string {
       if (lastHeader && !path.isAbsolute(dest) && !/^[~@:[]/.test(dest)) out.push(path.join(path.dirname(lastHeader), dest));
       continue;
     }
-    const patch = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to):\s*(.+)$/.exec(t);
+    const patch = /^\*{3}\s+(?:(?:Add|Update|Delete|Edit)\s+File|Move\s+to):\s*(.+)$/i.exec(t);
     if (patch) out.push(unquote(patch[1]));
   }
   return out;
 }
 
 const MUTATING_NAME = /(write|edit|patch|notebook|rename|move|delete|remove|mkdir|create|replace|append|save)/;
-const LSP_MUTATING_ACTION = /(rename|code_?action|format|fix|organi[sz]e|apply)/;
+// `request` sends an arbitrary LSP method; the server can answer with a
+// workspace/applyEdit that omp applies to any URI, so it counts as mutating.
+const LSP_MUTATING_ACTION = /(rename|code_?action|format|fix|organi[sz]e|apply|request)/;
 const LSP_READONLY_ACTION =
   /^(definition|type_?definition|declaration|implementation|references|hover|signature(_help)?|symbols?|document_symbols?|workspace_symbols?|diagnostics|status|incoming_calls|outgoing_calls|call_hierarchy|completion|highlight)$/;
 
@@ -519,11 +529,16 @@ function mutationTargets(toolName: string, rec: Record<string, unknown>): Mutati
     // a file, and a known-mutating one that names none is refused.
     const action = typeof rec.action === "string" ? rec.action.toLowerCase() : "";
     if (LSP_READONLY_ACTION.test(action)) return undefined;
+    if (action === "request") return "lsp request can apply a server edit to any file; not available to a worker";
     const targets = pathFields(rec);
     // rename_file / move_file take the destination in `new_name`.
     if (action.includes("file") && typeof rec.new_name === "string" && rec.new_name) targets.push(rec.new_name);
     if (targets.length > 0) return { raw: targets };
     return LSP_MUTATING_ACTION.test(action) ? `lsp ${action} names no file` : undefined;
+  }
+  if (name.startsWith("notepad_")) {
+    if (NOTEPAD_READONLY_TOOLS[name]) return undefined;
+    return { raw: LOAD_NOTEPAD_PATH ? [LOAD_NOTEPAD_PATH] : [".handoffs/notepad.md", ".omc/notepad.md"] };
   }
   if (name === "ast_edit" || name === "astedit") {
     const targets = pathFields(rec);
@@ -620,22 +635,32 @@ function checkFileTarget(raw: string, globOk: boolean, cwd: string, wt: string, 
 }
 
 // Every spelling omp itself may turn `raw` into before resolving it (omp 18.3.2
-// path-utils/write.ts, found by the PR #159 review). It unwraps a copied
-// `[path#TAG]` / `[path]`, drops a leading `@` before `/` or `~`, and drops a
-// leading `:` before `/`, `~`, `./` or `../`. ast_edit also strips surrounding
-// double quotes and splits one entry on `;`, `,` and whitespace. Every form is
-// checked, so whichever one omp opens is in scope.
-function candidateForms(raw: string, globOk: boolean): string[] {
+// path-utils/write.ts/conflict-detect.ts, found by the PR #159 reviews). It
+// unwraps a copied `[path#TAG]` / `[path]`, drops a leading `@` before `/` or
+// `~`, drops a leading `:` before `/`, `~`, `./` or `../`, and routes
+// `<file>:conflict://N` to the conflict:// handler (refused below). ast_edit
+// also turns `\` into `/`, strips surrounding double quotes, and splits one
+// entry on `;`, `,` and whitespace with no limit. `\`→`/` is queued for every
+// tool, since an extra form can only add a check. Every form is checked, so
+// whichever one omp opens is in scope. Past MAX_FORMS the whole target is
+// refused rather than judged on a partial list.
+const MAX_FORMS = 512;
+
+function candidateForms(raw: string, globOk: boolean): string[] | string {
   const seen = new Set<string>();
   const queue = [raw.trim()];
-  while (queue.length > 0 && seen.size < 64) {
+  while (queue.length > 0) {
     const f = queue.shift() as string;
     if (!f || seen.has(f)) continue;
+    if (seen.size >= MAX_FORMS) return `${raw.slice(0, 120)} expands to more than ${MAX_FORMS} path forms`;
     seen.add(f);
     const bracket = /^\[(.+?)(?:#[0-9A-Fa-f]{4})?\]$/.exec(f);
     if (bracket) queue.push(bracket[1].trim());
     if (/^@[/~]/.test(f)) queue.push(f.slice(1));
     if (/^:(?:[/~]|\.\.?\/)/.test(f)) queue.push(f.slice(1));
+    const conflict = /^(.+):(conflict:\/\/.+)$/i.exec(f);
+    if (conflict) queue.push(conflict[2]);
+    if (f.includes("\\") && !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(f)) queue.push(f.replace(/\\/g, "/"));
     if (globOk) {
       if (f.length >= 2 && f.startsWith('"') && f.endsWith('"')) queue.push(f.slice(1, -1));
       const parts = f.split(/[;,\s]+/).filter(Boolean);
@@ -653,7 +678,9 @@ function checkTarget(
   wt: string,
   newScratch: string[],
 ): string | undefined {
-  for (const form of candidateForms(raw, targets.globOk === true)) {
+  const forms = candidateForms(raw, targets.globOk === true);
+  if (typeof forms === "string") return forms;
+  for (const form of forms) {
     const why = checkOneForm(form, targets, cwd, wt, newScratch);
     if (why) return form === raw.trim() ? why : `${raw} (as ${form}): ${why}`;
   }
@@ -1330,7 +1357,18 @@ function onToolResult(event?: unknown): undefined {
     if (typeof e.toolCallId === "string") {
       const created = pendingScratch.get(e.toolCallId);
       pendingScratch.delete(e.toolCallId);
-      if (created && e.isError !== true) for (const p of created) scratchCreatedHere.add(p);
+      // Only a file that now exists was created by this call (an lsp rename of
+      // a missing file returns a non-error result and creates nothing).
+      if (created && e.isError !== true) {
+        for (const p of created) {
+          try {
+            lstatSync(p);
+            scratchCreatedHere.add(p);
+          } catch {
+            // not created: stays unclaimed
+          }
+        }
+      }
     }
     // Reconciliation. Retraction moved to the approval/ask events above:
     // sweeping here fired it on every tool call in every session, and while

@@ -1050,6 +1050,10 @@ for (const [name, toolName, input] of cases) {
     await Bun.write((input as { path: string }).path, "x");
     handlers.tool_result({ toolName, toolCallId: name, isError: false, content: [] });
   }
+  if (name === "scratch_lsp_nonexistent" && v === "ALLOW") {
+    handlers.tool_result({ toolName, toolCallId: name, isError: false, content: [] });
+    await Bun.write((input as { file: string }).file, "conductor");
+  }
   if (name === "scratch_failed" && v === "ALLOW") {
     handlers.tool_result({ toolName, toolCallId: name, isError: true, content: [] });
     await Bun.write((input as { path: string }).path, "conductor");
@@ -1057,6 +1061,7 @@ for (const [name, toolName, input] of cases) {
 }
 EOS
   # name|tool|input-json — ${VARS} are expanded by the shell.
+  CAP="$(printf 'a%d;' $(seq 0 69))"   # 70 split parts: past any small form cap
   cat > "$WORK/scope-cases.txt" <<EOF
 main_notepad_edit|edit|{"input":"[$MAIN/.handoffs/notepad.md#ABCD]\nPUT >1:\n+IN PROGRESS"}
 main_notepad_write|write|{"path":"$MAIN/.handoffs/notepad.md","content":"x"}
@@ -1107,6 +1112,20 @@ ast_split_space|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["lib/w.ts ../ma
 ast_quoted|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["\"../main/lib/m.ts\""]}
 lsp_rename_file_dest|lsp|{"action":"rename_file","file":"lib/a.sh","new_name":"$MAIN/lib/planted.sh"}
 xd_lsp_rename_file|write|{"path":"xd://lsp","content":"{\"action\":\"rename_file\",\"file\":\"lib/a.sh\",\"new_name\":\"$MAIN/lib/p.sh\"}"}
+ast_backslash_rel|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["..\\\\main\\\\lib\\\\m.ts"]}
+ast_backslash_glob|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["..\\\\main\\\\**\\\\*.ts"]}
+ast_form_cap|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["${CAP}../main/lib/m.ts"]}
+xd_ast_form_cap|write|{"path":"xd://ast_edit","content":"{\"ops\":[{\"pat\":\"a\",\"out\":\"b\"}],\"paths\":[\"${CAP}../main/lib/m.ts\"]}"}
+conflict_prefix|write|{"path":"lib/a.sh:conflict://1","content":"x"}
+lsp_request|lsp|{"action":"request","query":"workspace/executeCommand","payload":"{}"}
+sloppy_decoy|edit|{"input":"*** Edit File: $MAIN/lib/x.sh\n*** Find\nx\n*** Replace\npwn\n[lib/a.sh#ABCD]"}
+scratch_lsp_nonexistent|lsp|{"action":"rename","file":"$SCR/future-brief.md","new_name":"b"}
+scratch_lsp_then_conductor|write|{"path":"$SCR/future-brief.md","content":"widened"}
+memory_url|write|{"path":"memory://root/x","content":"x"}
+skill_url|write|{"path":"skill://foo/SKILL.md","content":"x"}
+artifact_url|write|{"path":"artifact://12","content":"x"}
+conflict_url|write|{"path":"conflict://1","content":"x"}
+xd_unknown_device_out|write|{"path":"xd://some_device","content":"{\"path\":\"$MAIN/lib/x.sh\"}"}
 scratch_failed|write|{"path":"$SCR/race.txt"}
 scratch_failed_then_conductor|edit|{"input":"[$SCR/race.txt#ABCD]\nPUT >1:\n+rewritten"}
 in_wt_relative_edit|edit|{"input":"[lib/a.sh#ABCD]\nPUT >1:\n+ok"}
@@ -1124,6 +1143,9 @@ scratch_edit_own|edit|{"input":"[$SCR/probe.sh#ABCD]\nPUT >1:\n+y"}
 local_ok|write|{"path":"local://notes.md","content":"x"}
 peer_message|write|{"path":"agent://Main","content":"hi"}
 xd_resolve|write|{"path":"xd://resolve","content":"apply the staged rewrite"}
+in_wt_xd_notepad_append|write|{"path":"xd://notepad_append","content":"{\"heading\":\"h\",\"content\":\"c\"}"}
+in_wt_notepad_append|notepad_append|{"heading":"h","content":"c"}
+notepad_read_ok|notepad_read|{}
 read_main|read|{"path":"$MAIN/.handoffs/notepad.md"}
 grep_main|grep|{"pattern":"x","path":"$MAIN"}
 bash_main|bash|{"command":"cat $MAIN/.handoffs/notepad.md"}
@@ -1137,7 +1159,7 @@ EOF
   while IFS='|' read -r name _; do
     v="$(verdict "$worker_out" "$name")"
     case "$name" in
-      in_wt_*|scratch_new|scratch_edit_own|scratch_failed|local_ok|peer_message|xd_resolve|read_main|grep_main|bash_main|lsp_read_main)
+      in_wt_*|scratch_new|scratch_edit_own|scratch_failed|scratch_lsp_nonexistent|notepad_read_ok|local_ok|peer_message|xd_resolve|read_main|grep_main|bash_main|lsp_read_main)
         [ "$v" = ALLOW ] && ok "worker: $name allowed" || bad "worker: $name should be allowed, got: ${v:-<no line>}" ;;
       *)
         case "$v" in "BLOCK herdr write-scope: "*) ok "worker: $name blocked" ;; *) bad "worker: $name should be blocked, got: ${v:-<no line>}" ;; esac ;;
@@ -1153,6 +1175,17 @@ EOF
   n_allow="$(printf '%s\n' "$nonworker_out" | grep -c '|ALLOW$')"; n_all="$(grep -c . "$WORK/scope-cases.txt")"
   [ "$n_allow" = "$n_all" ] && ok "non-worker session: all $n_all cases allowed (edit/write anywhere untouched)" \
     || bad "non-worker session blocked something: $(printf '%s\n' "$nonworker_out" | grep -v '|ALLOW$' | head -3)"
+
+  # notepad.ts's mutating tools: the file they write is the cwd's notepad, or
+  # $NOTEPAD_PATH. A worker running from the main checkout, or with
+  # NOTEPAD_PATH aimed there, must not reach it (direct or via xd://).
+  printf '[["np_direct","notepad_append",{"heading":"h","content":"c"}],["np_xd","write",{"path":"xd://notepad_append","content":"{\\"heading\\":\\"h\\",\\"content\\":\\"c\\"}"}],["np_priority","notepad_priority",{"content":"p"}]]' > "$WORK/scope-np.json"
+  np_cwd_out="$(env -u HERDR_CONTROL_DIR "${scope_env[@]}" CASES="$WORK/scope-np.json" WT="$MAIN" HERDR_TASK_ID=taskW HERDR_RUN_ID=runW bun "$WORK/scope-run.ts" 2>&1)"
+  np_env_out="$(env -u HERDR_CONTROL_DIR "${scope_env[@]}" CASES="$WORK/scope-np.json" NOTEPAD_PATH="$MAIN/.handoffs/notepad.md" HERDR_TASK_ID=taskW HERDR_RUN_ID=runW bun "$WORK/scope-run.ts" 2>&1)"
+  for c in np_direct np_xd np_priority; do
+    case "$(verdict "$np_cwd_out" "$c")" in *"outside your worktree"*) ok "worker in the main checkout: $c blocked" ;; *) bad "cwd=main $c: $np_cwd_out" ;; esac
+    case "$(verdict "$np_env_out" "$c")" in *"outside your worktree"*) ok "worker with NOTEPAD_PATH=main: $c blocked" ;; *) bad "NOTEPAD_PATH $c: $np_env_out" ;; esac
+  done
 
   # Fail closed: the env names a task but its row can't be read.
   printf '[["main_notepad_write","write",{"path":"%s/.handoffs/notepad.md"}],["in_wt","write",{"path":"lib/a.sh"}],["peer","write",{"path":"agent://Main","content":"stuck"}]]' "$MAIN" > "$WORK/scope-min.json"
