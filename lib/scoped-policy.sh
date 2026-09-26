@@ -56,7 +56,12 @@ _sp_collapse_ws() { printf '%s' "$1" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -
 # prompt_menu_command (lib/prompt-parse.sh _prompt_menu_parse, mode=command)
 # always emits "Allow tool: <tool> " followed by the body rows space-joined,
 # one of which is the literal "Command: <cmd>" (or "run: <cmd>", omp's other
-# shape — verify-omp-hooks.sh's own omp_menu_screen fixture uses it) row. The
+# shape — verify-omp-hooks.sh's own omp_menu_screen fixture uses it) row.
+# Between the header and that row, omp (18.3.2) may also render, in this
+# fixed order, "Origin: MCP server tool " (only for mcp__ tools) and
+# "Reason: <varies>" (whenever omp's own policy flags the command, e.g.
+# `rg -n shutdown lib/`, `rm -rf /abs/path`) — both stripped below, each
+# optional and each at most once, before the Command:/run: case runs. The
 # Claude/Codex numbered fallback (prompt_command_text's OTHER branch, the
 # whole visible window) carries neither: those hooks never pass a recorded
 # command at all (claude-notify.sh calls push_wake with no third argument),
@@ -68,6 +73,8 @@ _sp_command_region() {
     "Allow tool: "*) rest="${panel#Allow tool: }"; rest="${rest#* }" ;;
     *) rest="$panel" ;;
   esac
+  case "$rest" in "Origin: MCP server tool "*) rest="${rest#Origin: MCP server tool }" ;; esac
+  case "$rest" in "Reason: "*" Command:"*) rest="Command:${rest#* Command:}" ;; esac
   case "$rest" in
     "Command:"*) printf '%s' "${rest#Command:}"; return 0 ;;
     "run:"*)     printf '%s' "${rest#run:}"; return 0 ;;

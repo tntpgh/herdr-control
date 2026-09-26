@@ -704,6 +704,35 @@ sel 1 --authority peer; rc=$?
   && ok "word-boundary-wrapped allow-class command corroborates and is approved" \
   || bad "wrapped command failed to corroborate: rc=$rc keys=$(keys_pressed); stderr: $(cat "$WORK/err.txt")"
 
+printf '== MEDIUM (PR #162 review): omp Reason: row before Command: must not fail closed on a correct recorded command ==\n'
+set_menu_reason() {                     # <reason-text> <command-text>
+  printf 'Allow tool: bash\nReason: %s\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' "$1" "$2" > "$SCREEN"
+}
+REASON_CMD="rg -n shutdown lib/"
+set_menu_reason "Critical pattern detected" "$REASON_CMD"; reset_keys
+seed_input_required runG taskG "$REASON_CMD"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 1 ] \
+  && ok "byte-identical recorded command corroborates past an omp Reason: row" \
+  || bad "Reason: row wrongly refused a matching command: rc=$rc keys=$(keys_pressed); stderr: $(cat "$WORK/err.txt")"
+
+printf '== MEDIUM: the same Reason: row does not block a reviewed conductor owned-cleanup rm -rf ==\n'
+CLEANUP_CMD="rm -rf /wt/grant/build"
+set_menu_reason "Critical pattern detected" "$CLEANUP_CMD"; reset_keys
+seed_input_required runG taskG "$CLEANUP_CMD"
+conductor_select; rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = Enter ] \
+  && ok "conductor owned-cleanup rm -rf corroborates past an omp Reason: row" \
+  || bad "Reason: row wrongly refused the reviewed conductor cleanup: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+
+printf '== MEDIUM: a Reason: row does not weaken anchoring — a mismatched recorded command still refuses ==\n'
+set_menu_reason "Critical pattern detected" "gh api -X PUT repos/o/r/pulls/7/merge"; reset_keys
+seed_input_required runG taskG "ls"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "'ls' still does not corroborate a Reason:-prefixed merge panel; refused, no key pressed" \
+  || bad "SUBSTRING FALSE POSITIVE past a Reason: row: rc=$rc keys=$(keys_pressed)"
+
 # Isolate the scrape-only torn menu checks from runG/taskG, which just seeded a
 # matching registry command for the wrapped-display proof above. Post-#148, a
 # registry-corroborated command is allowed to replace a torn scrape; this block
