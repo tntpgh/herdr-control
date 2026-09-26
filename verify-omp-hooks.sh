@@ -1014,6 +1014,161 @@ r("same_total_different_mix_announces", shouldAnnounce({ tasks: 5, handoff_debt:
   printf '%s' "$edge_out" | grep -q '^same_total_different_mix_announces:true$' && ok "same total, different mix (a decision opened, a debt cleared) still announces" || bad "$edge_out"
 fi
 
+printf '== worker write scope: a registered worker'"'"'s edit/write stays inside its worktree (backlog xi) ==\n'
+# The incident: worker w2F:p6 (manifest `writes: [tmp/**]`) appended to the MAIN
+# checkout's .handoffs/notepad.md with omp's edit tool, and nothing checked it.
+# Each identity scenario is its own bun process, because the hook reads
+# HERDR_TASK_ID/HERDR_RUN_ID once, at module load.
+if ! command -v bun >/dev/null 2>&1; then
+  bad "bun not on PATH — the write-scope guard is untested"
+else
+  F="$WORK/scope"; MAIN="$F/main"; WT="$F/wt"; OTHER="$F/other"; SCR="$WORK/scratch"; FHOME="$F/home"
+  mkdir -p "$MAIN/.handoffs" "$MAIN/lib" "$WT/lib" "$WT/tmp" "$WT/.handoffs" "$OTHER" "$SCR" "$FHOME"
+  printf 'notes\n' > "$MAIN/.handoffs/notepad.md"; printf 'x\n' > "$MAIN/lib/x.sh"; printf 'a\n' > "$WT/lib/a.sh"
+  printf 'gitdir: %s/.git/worktrees/wt\n' "$MAIN" > "$WT/.git"; printf 'shared\n' > "$MAIN/hl.txt"
+  printf 'conductor brief\n' > "$SCR/conductor-brief.md"
+  ln -s "$MAIN" "$WT/escape"; ln -s "$OTHER/created-by-link" "$WT/dangling"; ln "$MAIN/hl.txt" "$WT/hl.txt"
+  ln -s ../lib "$WT/lib/self"   # an in-tree link: allowed
+  case "$(cd "$F" && pwd -P)/" in /tmp/*|/private/tmp/*) bad "fixture resolves under /tmp: outside-worktree cases would read as scratch" ;; esac
+  register_task runW taskW wW condW "$CPANE" "$CBIRTH" "w9:p1" "wterm-9" "$MAIN" "$WT" "impl:write-scope" fix/x main "" \
+    '{"git":"push-own-branch","net_read":[],"net_write":"none","writes":["tmp/**"]}' >/dev/null 2>&1
+  cat > "$WORK/scope-run.ts" <<'EOS'
+const mod = await import(process.env.HOOK as string);
+const handlers: Record<string, (e: unknown, c?: unknown) => unknown> = {};
+mod.default({ on: (ev: string, fn: (e: unknown, c?: unknown) => unknown) => { handlers[ev] = fn; } });
+const cases = JSON.parse(await Bun.file(process.env.CASES as string).text());
+for (const [name, toolName, input] of cases) {
+  let r: unknown;
+  try { r = handlers.tool_call({ toolName, toolCallId: name, input }, { cwd: process.env.WT }); }
+  catch (err) { r = { threw: String(err) }; }
+  const v = r && typeof r === "object" && (r as { block?: boolean }).block === true ? `BLOCK ${(r as { reason: string }).reason}` : r === undefined ? "ALLOW" : `OTHER ${JSON.stringify(r)}`;
+  console.log(`${name}|${v.replace(/\n/g, " ")}`);
+  // Stand in for omp executing an allowed scratch write. scratch_new succeeds
+  // (so scratch_edit_own may touch it); scratch_failed errors, then a conductor
+  // creates the same file, which the worker must not be able to rewrite.
+  if (name === "scratch_new" && v === "ALLOW") {
+    await Bun.write((input as { path: string }).path, "x");
+    handlers.tool_result({ toolName, toolCallId: name, isError: false, content: [] });
+  }
+  if (name === "scratch_failed" && v === "ALLOW") {
+    handlers.tool_result({ toolName, toolCallId: name, isError: true, content: [] });
+    await Bun.write((input as { path: string }).path, "conductor");
+  }
+}
+EOS
+  # name|tool|input-json — ${VARS} are expanded by the shell.
+  cat > "$WORK/scope-cases.txt" <<EOF
+main_notepad_edit|edit|{"input":"[$MAIN/.handoffs/notepad.md#ABCD]\nPUT >1:\n+IN PROGRESS"}
+main_notepad_write|write|{"path":"$MAIN/.handoffs/notepad.md","content":"x"}
+dotdot_new_file|write|{"path":"../other/new.sh","content":"x"}
+dotdot_inside_prefix|write|{"path":"lib/../../main/lib/x.sh","content":"x"}
+symlink_out|write|{"path":"escape/lib/new.sh","content":"x"}
+symlink_then_dotdot|write|{"path":"escape/../other/y.sh","content":"x"}
+dangling_link|write|{"path":"dangling","content":"x"}
+tilde_home|write|{"path":"~/Code/herdr-control/.handoffs/notepad.md","content":"x"}
+tilde_user|write|{"path":"~root/x","content":"x"}
+file_url_out|write|{"path":"file://$MAIN/lib/x.sh","content":"x"}
+hard_link|write|{"path":"hl.txt","content":"x"}
+git_pointer|write|{"path":".git","content":"gitdir: /elsewhere"}
+env_file|write|{"path":".env.local","content":"K=V"}
+mv_out|edit|{"input":"[lib/a.sh#ABCD]\nMV ../../other/moved.sh"}
+second_file_out|edit|{"input":"[lib/a.sh#ABCD]\nPUT >1:\n+ok\n[$OTHER/b.sh#ABCD]\nPUT >1:\n+no"}
+bad_header|edit|{"input":"[lib/a.sh\nPUT >1:\n+x"}
+no_target|edit|{"input":"PUT >1:\n+x"}
+apply_patch_out|edit|{"input":"*** Begin Patch\n*** Update File: $MAIN/lib/x.sh\n@@\n-x\n+y\n*** End Patch"}
+archive_member|write|{"path":"$MAIN/pack.zip:inner.txt","content":"x"}
+ssh_url|write|{"path":"ssh://host/etc/x","content":"x"}
+local_dotdot|write|{"path":"local://../x.md","content":"x"}
+local_encoded_dotdot|write|{"path":"local://%2e%2e/x.md","content":"x"}
+xd_ast_edit_out|write|{"path":"xd://ast_edit","content":"{\"ops\":[{\"pat\":\"a\",\"out\":\"b\"}],\"paths\":[\"$MAIN/lib\"]}"}
+ast_edit_glob_out|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["../main/**/*.sh"]}
+ast_edit_glob_climb|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["lib/*/../../../main/x.sh"]}
+notebook_out|notebook|{"notebook_path":"$OTHER/n.ipynb","cell":0}
+lsp_rename_out|lsp|{"action":"rename","file":"$MAIN/lib/x.sh","symbol":"a","new_name":"b"}
+lsp_unknown_action_out|lsp|{"action":"inline_refactor","file":"$MAIN/lib/x.sh"}
+generic_save_out|save_file|{"path":"$MAIN/lib/x.sh","content":"x"}
+scratch_existing|write|{"path":"$SCR/conductor-brief.md","content":"widened manifest"}
+at_abs|write|{"path":"@$MAIN/lib/x.sh","content":"x"}
+at_tilde|write|{"path":"@~/Code/herdr-control/.handoffs/notepad.md","content":"x"}
+colon_abs|write|{"path":":$MAIN/lib/x.sh","content":"x"}
+colon_dotdot|write|{"path":":../main/lib/x.sh","content":"x"}
+bracket_tag_abs|write|{"path":"[$MAIN/.handoffs/notepad.md#ABCD]","content":"x"}
+bracket_tag_rel|write|{"path":"[../main/lib/x.sh#1F2E]","content":"x"}
+bracket_plain|write|{"path":"[$MAIN/lib/x.sh]","content":"x"}
+edit_header_at|edit|{"input":"[@~/Code/herdr-control/.handoffs/notepad.md#ABCD]\nPUT >1:\n+IN PROGRESS"}
+edit_header_colon|edit|{"input":"[:$MAIN/lib/x.sh#ABCD]\nPUT >1:\n+x"}
+edit_header_indented|edit|{"input":"[lib/a.sh#ABCD]\nPUT >1:\n+ok\n  [$MAIN/lib/x.sh#ABCD]\nPUT >1:\n+no"}
+mv_indented|edit|{"input":"[lib/a.sh#ABCD]\n  MV $OTHER/moved-indented.sh"}
+mv_at|edit|{"input":"[lib/a.sh#ABCD]\nMV @$OTHER/moved.sh"}
+patch_mode_rename|edit|{"path":"lib/a.sh","edits":[{"op":"update","rename":"$MAIN/lib/planted.sh","diff":"@@\n-a\n+b"}]}
+ast_split_comma|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["lib/w.ts,../main/lib/m.ts"]}
+ast_split_semicolon|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["lib/w.ts;$MAIN/lib/m.ts"]}
+ast_split_space|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["lib/w.ts ../main/lib/m.ts"]}
+ast_quoted|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["\"../main/lib/m.ts\""]}
+lsp_rename_file_dest|lsp|{"action":"rename_file","file":"lib/a.sh","new_name":"$MAIN/lib/planted.sh"}
+xd_lsp_rename_file|write|{"path":"xd://lsp","content":"{\"action\":\"rename_file\",\"file\":\"lib/a.sh\",\"new_name\":\"$MAIN/lib/p.sh\"}"}
+scratch_failed|write|{"path":"$SCR/race.txt"}
+scratch_failed_then_conductor|edit|{"input":"[$SCR/race.txt#ABCD]\nPUT >1:\n+rewritten"}
+in_wt_relative_edit|edit|{"input":"[lib/a.sh#ABCD]\nPUT >1:\n+ok"}
+in_wt_absolute|write|{"path":"$WT/lib/new.sh","content":"x"}
+in_wt_at_prefix|write|{"path":"@$WT/lib/at.sh","content":"x"}
+in_wt_ast_brace|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["lib/{a,b}.sh"]}
+in_wt_outside_manifest_writes|write|{"path":"verify-new.sh","content":"x"}
+in_wt_tmp|write|{"path":"tmp/pr-body.md","content":"x"}
+in_wt_handoffs|write|{"path":".handoffs/PROOF.md","content":"x"}
+in_wt_link_inside|write|{"path":"lib/self/a.sh","content":"x"}
+in_wt_dotdot_back|write|{"path":"lib/../lib/a.sh","content":"x"}
+in_wt_ast_glob|ast_edit|{"ops":[{"pat":"a","out":"b"}],"paths":["lib/**/*.sh"]}
+scratch_new|write|{"path":"$SCR/probe.sh","content":"x"}
+scratch_edit_own|edit|{"input":"[$SCR/probe.sh#ABCD]\nPUT >1:\n+y"}
+local_ok|write|{"path":"local://notes.md","content":"x"}
+peer_message|write|{"path":"agent://Main","content":"hi"}
+xd_resolve|write|{"path":"xd://resolve","content":"apply the staged rewrite"}
+read_main|read|{"path":"$MAIN/.handoffs/notepad.md"}
+grep_main|grep|{"pattern":"x","path":"$MAIN"}
+bash_main|bash|{"command":"cat $MAIN/.handoffs/notepad.md"}
+lsp_read_main|lsp|{"action":"definition","file":"$MAIN/lib/x.sh"}
+EOF
+  jq -Rn '[inputs | split("|") | [.[0], .[1], (.[2:] | join("|") | fromjson)]]' "$WORK/scope-cases.txt" > "$WORK/scope-cases.json" \
+    || bad "scope case table does not parse"
+  scope_env=(HOOK="$here/agent-hooks/omp-herdr-control.ts" CASES="$WORK/scope-cases.json" WT="$WT" HOME="$FHOME" TMPDIR="$SCR")
+  worker_out="$(env -u HERDR_CONTROL_DIR "${scope_env[@]}" HERDR_TASK_ID=taskW HERDR_RUN_ID=runW bun "$WORK/scope-run.ts" 2>&1)"
+  verdict() { printf '%s\n' "$1" | awk -F'|' -v n="$2" '$1 == n { print $2; exit }'; }
+  while IFS='|' read -r name _; do
+    v="$(verdict "$worker_out" "$name")"
+    case "$name" in
+      in_wt_*|scratch_new|scratch_edit_own|scratch_failed|local_ok|peer_message|xd_resolve|read_main|grep_main|bash_main|lsp_read_main)
+        [ "$v" = ALLOW ] && ok "worker: $name allowed" || bad "worker: $name should be allowed, got: ${v:-<no line>}" ;;
+      *)
+        case "$v" in "BLOCK herdr write-scope: "*) ok "worker: $name blocked" ;; *) bad "worker: $name should be blocked, got: ${v:-<no line>}" ;; esac ;;
+    esac
+  done < "$WORK/scope-cases.txt"
+  v="$(verdict "$worker_out" main_notepad_edit)"
+  case "$v" in *"outside your worktree"*"$WT"*"ask your conductor/operator"*) ok "the refusal names the worktree and says to ask the operator" ;;
+    *) bad "refusal text: $v" ;; esac
+  [ "$(cat "$MAIN/.handoffs/notepad.md")" = notes ] && ok "the main checkout's notepad is untouched" || bad "main notepad changed"
+
+  # Not a registered worker (Main, a conductor, Terrence): never checked.
+  nonworker_out="$(env -u HERDR_CONTROL_DIR -u HERDR_TASK_ID -u HERDR_RUN_ID "${scope_env[@]}" bun "$WORK/scope-run.ts" 2>&1)"
+  n_allow="$(printf '%s\n' "$nonworker_out" | grep -c '|ALLOW$')"; n_all="$(grep -c . "$WORK/scope-cases.txt")"
+  [ "$n_allow" = "$n_all" ] && ok "non-worker session: all $n_all cases allowed (edit/write anywhere untouched)" \
+    || bad "non-worker session blocked something: $(printf '%s\n' "$nonworker_out" | grep -v '|ALLOW$' | head -3)"
+
+  # Fail closed: the env names a task but its row can't be read.
+  printf '[["main_notepad_write","write",{"path":"%s/.handoffs/notepad.md"}],["in_wt","write",{"path":"lib/a.sh"}],["peer","write",{"path":"agent://Main","content":"stuck"}]]' "$MAIN" > "$WORK/scope-min.json"
+  norow_out="$(env -u HERDR_CONTROL_DIR "${scope_env[@]}" CASES="$WORK/scope-min.json" HERDR_TASK_ID=taskNOPE HERDR_RUN_ID=runW bun "$WORK/scope-run.ts" 2>&1)"
+  [ "$(verdict "$norow_out" in_wt)" != ALLOW ] && verdict "$norow_out" in_wt | grep -q 'cannot verify your registered worktree' \
+    && ok "worker with no registry row: even an in-worktree write blocks (fail closed)" || bad "no-row: $norow_out"
+  [ "$(verdict "$norow_out" peer)" = ALLOW ] && ok "worker with no registry row can still message its conductor" || bad "no-row peer: $norow_out"
+  norun_out="$(env -u HERDR_CONTROL_DIR -u HERDR_RUN_ID "${scope_env[@]}" CASES="$WORK/scope-min.json" HERDR_TASK_ID=taskW bun "$WORK/scope-run.ts" 2>&1)"
+  verdict "$norun_out" main_notepad_write | grep -q 'HERDR_RUN_ID is not' \
+    && ok "HERDR_TASK_ID without HERDR_RUN_ID blocks (fail closed)" || bad "no-run-id: $norun_out"
+  : > "$WORK/registry-parent-is-a-file"
+  bogus_out="$(env -u HERDR_CONTROL_DIR "${scope_env[@]}" CASES="$WORK/scope-min.json" HERDR_TASK_ID=taskW HERDR_RUN_ID=runW \
+    HERDR_RUN_STATE_DIR="$WORK/registry-parent-is-a-file/runs" bun "$WORK/scope-run.ts" 2>&1)"
+  verdict "$bogus_out" in_wt | grep -q "cannot verify your registered worktree: the registry read failed" && ok "worker whose registry is unreadable blocks writes (fail closed)" || bad "bad registry dir: $bogus_out"
+fi
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi
