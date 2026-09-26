@@ -215,7 +215,9 @@ for p in "https://github.com/tntpgh/herdr-control/issues/154 eb55756" \
          "$pr153/../154 f1579a6" \
          "$pr153/%2e%2e/154 f1579a6" \
          "$pr153#"$'\n'"$pr154 f1579a6" \
-         "https:ｇithub.com/tntpgh/herdr-control/pull/154?u=https://x eb55756"; do
+         "https:ｇithub.com/tntpgh/herdr-control/pull/154?u=https://x eb55756" \
+         $'\x01'"https://ｇithub.com/tntpgh/herdr-control/pull/154 eb55756" \
+         "https:///ｇithub.com/tntpgh/herdr-control/pull/154 eb55756"; do
   if _valid_proof_ref "$p"; then
     bad "alias/encoded/normalising PR spelling accepted on shape alone: $p"
   else
@@ -230,6 +232,10 @@ for p in "https://github.com/tntpgh/herdr-control/commit/eb55756 eb55756" \
          "https://xn--bcher-kva.example/release/1 eb55756"; do
   _valid_proof_ref "$p" && ok "non-PR URL keeps the shape check: ${p%% *}" \
     || bad "non-PR URL refused: $p ($_PROOF_REF_WHY)"
+done
+for p in "PROOF.md:§2" "PROOF.md:“Shipped”" "section:—.handoffs/PROOF.md"; do
+  _valid_proof_ref "$p" "$wtreal" && ok "PROOF.md ref with a colon + non-ASCII text is not read as a URL host: $p" \
+    || bad "PROOF.md ref refused: $p ($_PROOF_REF_WHY)"
 done
 long="https://example.com/$(printf 'a%.0s' $(seq 1 3000)) eb55756"
 if _valid_proof_ref "$long"; then

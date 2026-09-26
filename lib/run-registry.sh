@@ -570,19 +570,20 @@ _gh_pr_lookup() {
 # PROOF.md references are unchanged.
 #
 # What counts as a PR claim is decided on the first word AS A BROWSER WOULD
-# NAVIGATE IT (_url_nav_form: %XX decoded, `\` read as `/`, TAB/CR/LF
-# dropped), and separately the whole proof string: any mention of a
-# github.com pull or issue (GitHub redirects a PR's /issues/<n> to
-# /pull/<n>). A first word whose host (with or without `//` after the scheme)
-# has non-ASCII bytes is refused outright: it may be a full-width/IDNA
-# look-alike of github.com, and the punycode spelling (xn--…) still passes.
+# NAVIGATE IT (_url_nav_form: leading C0/space stripped, %XX decoded, `\`
+# read as `/`, TAB/CR/LF dropped), and separately the whole proof string: any
+# mention of a github.com pull or issue (GitHub redirects a PR's /issues/<n>
+# to /pull/<n>). An http(s)/ws(s)/ftp first word whose host (after any number
+# of slashes) has non-ASCII bytes is refused outright: it may be a
+# full-width/IDNA look-alike of github.com; the punycode spelling (xn--…)
+# still passes, and non-URL words (PROOF.md refs) are never read for a host.
 # A claim cannot escape into the PROOF.md branch by also naming PROOF.md, and
 # must then be the canonical PR URL, literally: no percent-escapes or `\`
 # before any ?/#, no `..` path segment, no control characters — spellings a
 # browser would resolve to a different PR than the one checked. Legitimate
 # non-PR GitHub URLs with escapes (blob/…/a%20b.md, tree/fix%2Fx) are not
-# claims and keep the shape check. A first word over 2048 characters is
-# refused before decoding (the decode loop is quadratic on bash 3.2).
+# claims and keep the shape check. A first word over 2048 bytes is refused
+# before decoding (the decode loop is quadratic on bash 3.2).
 #
 # On refusal of a PR proof, _PROOF_REF_WHY says why (reconcile.sh and
 # close-done-workers.sh surface it); it is empty for every other refusal.
@@ -600,6 +601,7 @@ _url_nav_form() (                       # subshell: LC_ALL=C stays in here
     esac
     out="$out$c"
   done
+  while :; do case "$out" in [[:cntrl:]' ']*) out="${out:1}" ;; *) break ;; esac; done
   printf '%s' "$out" | tr '[:upper:]' '[:lower:]'
 )
 _PROOF_REF_WHY=""
@@ -610,18 +612,16 @@ _valid_proof_ref() {
   lc=$(printf '%s' "$proof" | LC_ALL=C tr '[:upper:]' '[:lower:]')
   [ -n "$lc" ] || { _PROOF_REF_WHY="could not normalize proof: $proof"; return 1; }
   first="${lc%% *}"
-  [ "${#first}" -le 2048 ] || { _PROOF_REF_WHY="proof's first word is over 2048 characters"; return 1; }
+  [ "$(LC_ALL=C; printf '%s' "${#first}")" -le 2048 ] || { _PROOF_REF_WHY="proof's first word is over 2048 bytes"; return 1; }
   nav=$(_url_nav_form "$first")
   case "$lc" in *github.com*/pull/*|*github.com*/pulls/*|*github.com*/issues/*) pr_claim=1 ;; esac
   case "$nav" in *github.com*/pull/*|*github.com*/pulls/*|*github.com*/issues/*) pr_claim=1 ;; esac
   host=""
   case "$nav" in
-    [a-z]*:*)                           # first word has a URL scheme: take its host
-      host="${nav%%:*}"
-      case "$host" in
-        *[!a-z0-9+.-]*) host="" ;;
-        *) host="${nav#*:}"; host="${host#/}"; host="${host#/}"; host="${host%%[/?#]*}" ;;
-      esac ;;
+    http:*|https:*|ws:*|wss:*|ftp:*)    # special schemes: any run of slashes precedes the host
+      host="${nav#*:}"
+      while [ "${host#/}" != "$host" ]; do host="${host#/}"; done
+      host="${host%%[/?#]*}" ;;
   esac
   if [ -n "$(printf '%s' "$host" | LC_ALL=C tr -d '\000-\177')" ]; then
     _PROOF_REF_WHY="non-ASCII host (possible github.com look-alike; use the punycode form): ${proof%% *}"
