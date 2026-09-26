@@ -410,7 +410,9 @@ _spec_proof_contract() {
 `set_task_state <run> <task> completed <reason> [proof]` (lib/run-registry.sh)
 refuses a `completed` transition without a closure reason:
   shipped | handed_off_to:<task|role> | blocked_on:<thing> | canceled | no-follow-on
-`shipped` additionally requires a proof reference: `<PR URL> <merge sha>`, or
+`shipped` additionally requires a proof reference: `<PR URL> <merge sha>` — the
+PR must already be MERGED and the sha must be its merge commit (checked with
+gh; an open PR or its head sha is refused) — or
 a section id in this worktree's `.handoffs/PROOF.md#<section>` (created
 empty alongside this file — it must actually hold something; an empty file
 is not proof) naming the check that ran and its output. Write what you
@@ -561,7 +563,7 @@ jq -n \
     project:$project, spec_file:$spec, proof_file:$proof_file,
     capability_manifest:(if $manifest == "" then null else ($manifest|fromjson) end),
     capability_manifest_note:"Approved once at spawn by the conductor (registry event manifest_approved). Inside it, approvals clear without a per-call review; outside it they escalate exactly as before. This copy is informational — editing it changes nothing the approver reads.",
-    how_to_complete:"Append one JSON line to events_file, using completion_event verbatim, PLUS a closure reason field: shipped | handed_off_to:<task|role> | blocked_on:<thing> | canceled | no-follow-on. `shipped` also needs a proof field — a PR URL + merge sha, or a section id in proof_file written as \".handoffs/PROOF.md#<section>\" (it must actually hold something you wrote, not stay empty) — the registry refuses `completed` without one (lib/run-registry.sh). Read spec_file for the acceptance checklist and write what you verified into proof_file before closing shipped. Read these values HERE — do not try env/printenv, that is human-reserved and will stall you until a human answers.",
+    how_to_complete:"Append one JSON line to events_file, using completion_event verbatim, PLUS a closure reason field: shipped | handed_off_to:<task|role> | blocked_on:<thing> | canceled | no-follow-on. `shipped` also needs a proof field — the URL of a MERGED PR + its merge-commit sha (checked with gh: an open PR, or its head sha, is refused), or a section id in proof_file written as \".handoffs/PROOF.md#<section>\" (it must actually hold something you wrote, not stay empty) — the registry refuses `completed` without one (lib/run-registry.sh). Read spec_file for the acceptance checklist and write what you verified into proof_file before closing shipped. Read these values HERE — do not try env/printenv, that is human-reserved and will stall you until a human answers.",
     closure_reasons:["shipped","handed_off_to:<task|role>","blocked_on:<thing>","canceled","no-follow-on"],
     example:$example}' \
   > "$(handoff_identity "$wt")" 2>/dev/null || {

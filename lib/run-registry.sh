@@ -531,34 +531,155 @@ _valid_closure_reason() {               # reason -> 0 if one of the five
   esac
 }
 
-# _valid_proof_ref <proof> [worktree] -> 0 if it looks like a checkable
-# pointer, not a bare assertion. Two shapes, both named in the plan doc:
-# "<PR URL> <merge sha>" (space-separated; the sha is loosely checked as
-# 7-40 hex characters, what `git rev-parse --short`..full sha40 both
-# produce) or a `.handoffs/PROOF.md` section reference. When a worktree is
-# on record, a PROOF.md reference is checked against the REAL file: every
-# worktree gets one created EMPTY at spawn time (spawn-task.sh), so a bare
-# mention of the filename passed even when nobody had written anything into
-# it — measured live. A caller with no worktree context (a unit test, a
-# synthetic proof) falls back to the name-shape check alone. An empty
-# string is never proof.
-_valid_proof_ref() {
-  local proof="$1" wt="${2:-}" url rest sha
-  [ -n "$proof" ] || return 1
-  case "$proof" in
-    *PROOF.md*)
-      [ -z "$wt" ] && return 0
-      [ -s "$wt/.handoffs/PROOF.md" ]
-      return $?
-      ;;
+# _gh_pr_lookup <owner/repo> (--number <n> | --head <branch>) -> prints
+# "STATE|URL|MERGE_OID" (MERGE_OID empty unless merged). Nonzero when gh is
+# missing or the call fails — callers must treat that as "unknown", never as
+# "fine". The ONE place that asks GitHub whether a PR merged and at what sha:
+# conductor-exit.sh finds a worktree's PR by branch, _valid_proof_ref checks a
+# cited PR by number; both read the same three fields the same way. By branch,
+# a MERGED PR sorts first (a branch can carry an older CLOSED one too).
+_gh_pr_lookup() {
+  local slug="$1" how="$2" sel="$3" fmt='"\(.state)|\(.url)|\(.mergeCommit.oid // "")"'
+  command -v gh >/dev/null 2>&1 || return 127
+  case "$how" in
+    --number) gh pr view "$sel" -R "$slug" --json url,state,mergeCommit -q "$fmt" 2>/dev/null ;;
+    --head)   gh pr list -R "$slug" --head "$sel" --state all --json url,state,mergeCommit \
+                -q "sort_by(.state != \"MERGED\") | .[0] // empty | $fmt" 2>/dev/null ;;
+    *) return 2 ;;
   esac
+}
+
+# _valid_proof_ref <proof> [worktree] -> 0 if it is a checkable pointer, not a
+# bare assertion. Only ever asked about a `shipped` closure. Two shapes, both
+# named in the plan doc: "<PR URL> <sha>" (space-separated; sha is 7-40 hex,
+# what `git rev-parse --short`..full sha40 both produce) or a
+# `.handoffs/PROOF.md` section reference. When a worktree is on record, a
+# PROOF.md reference is checked against the REAL file: every worktree gets one
+# created EMPTY at spawn time (spawn-task.sh), so a bare mention of the
+# filename passed even when nobody had written anything into it — measured
+# live. A caller with no worktree context (a unit test, a synthetic proof)
+# falls back to the name-shape check alone. An empty string is never proof.
+#
+# A GitHub PR URL is checked against GitHub itself: the PR must be MERGED and
+# the sha must be a prefix of its merge commit. The shape check alone accepted
+# `…/pull/154 eb55756` — the HEAD sha of a PR that was still OPEN (2026-09-26,
+# herdr-control notepad item vi); reconcile.sh would have recorded
+# completed/shipped the moment the worker's pane went away. If gh is missing
+# or fails, the answer is "not proven" — a shipped claim is never waved
+# through because the check could not run. Other URLs keep the shape check;
+# PROOF.md references are unchanged.
+#
+# What counts as a PR claim is decided on the first word AS A BROWSER WOULD
+# NAVIGATE IT (_url_nav_form: leading C0/space stripped, %XX decoded, `\`
+# read as `/`, TAB/CR/LF dropped), and separately the whole proof string: any
+# mention of a github.com pull or issue (GitHub redirects a PR's /issues/<n>
+# to /pull/<n>). An http(s)/ws(s)/ftp first word whose host (after any number
+# of slashes) has non-ASCII bytes is refused outright: it may be a
+# full-width/IDNA look-alike of github.com; the punycode spelling (xn--…)
+# still passes, and non-URL words (PROOF.md refs) are never read for a host.
+# A claim cannot escape into the PROOF.md branch by also naming PROOF.md, and
+# must then be the canonical PR URL, literally: no percent-escapes or `\`
+# before any ?/#, no `..` path segment, no control characters — spellings a
+# browser would resolve to a different PR than the one checked. Legitimate
+# non-PR GitHub URLs with escapes (blob/…/a%20b.md, tree/fix%2Fx) are not
+# claims and keep the shape check. A first word over 2048 bytes is refused
+# before decoding (the decode loop is quadratic on bash 3.2).
+#
+# On refusal of a PR proof, _PROOF_REF_WHY says why (reconcile.sh and
+# close-done-workers.sh surface it); it is empty for every other refusal.
+_url_nav_form() (                       # subshell: LC_ALL=C stays in here
+  LC_ALL=C
+  local s="$1" out="" c
+  while [ -n "$s" ]; do
+    c="${s:0:1}"; s="${s:1}"
+    if [ "$c" = % ]; then
+      case "${s:0:2}" in [0-9a-fA-F][0-9a-fA-F]) c=$(printf "\\x${s:0:2}"); s="${s:2}" ;; esac
+    fi
+    case "$c" in
+      '\') c=/ ;;
+      $'\t'|$'\r'|$'\n') c="" ;;
+    esac
+    out="$out$c"
+  done
+  while :; do case "$out" in [[:cntrl:]' ']*) out="${out:1}" ;; *) break ;; esac; done
+  printf '%s' "$out" | tr '[:upper:]' '[:lower:]'
+)
+_PROOF_REF_WHY=""
+_valid_proof_ref() {
+  local proof="$1" wt="${2:-}" url rest sha lc first nav host pre pr_claim=0 pr_re slug num info state oid
+  _PROOF_REF_WHY=""
+  [ -n "$proof" ] || return 1
+  lc=$(printf '%s' "$proof" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+  [ -n "$lc" ] || { _PROOF_REF_WHY="could not normalize proof: $proof"; return 1; }
+  first="${lc%% *}"
+  [ "$(LC_ALL=C; printf '%s' "${#first}")" -le 2048 ] || { _PROOF_REF_WHY="proof's first word is over 2048 bytes"; return 1; }
+  nav=$(_url_nav_form "$first")
+  case "$lc" in *github.com*/pull/*|*github.com*/pulls/*|*github.com*/issues/*) pr_claim=1 ;; esac
+  case "$nav" in *github.com*/pull/*|*github.com*/pulls/*|*github.com*/issues/*) pr_claim=1 ;; esac
+  host=""
+  case "$nav" in
+    http:*|https:*|ws:*|wss:*|ftp:*)    # special schemes: any run of slashes precedes the host
+      host="${nav#*:}"
+      while [ "${host#/}" != "$host" ]; do host="${host#/}"; done
+      host="${host%%[/?#]*}" ;;
+  esac
+  if [ -n "$(printf '%s' "$host" | LC_ALL=C tr -d '\000-\177')" ]; then
+    _PROOF_REF_WHY="non-ASCII host (possible github.com look-alike; use the punycode form): ${proof%% *}"
+    return 1
+  fi
+  if [ "$pr_claim" = 0 ]; then
+    case "$proof" in
+      *PROOF.md*)
+        [ -z "$wt" ] && return 0
+        [ -s "$wt/.handoffs/PROOF.md" ]
+        return $?
+        ;;
+    esac
+  fi
   case "$proof" in *' '*) ;; *) return 1 ;; esac
   url="${proof%% *}"
   rest="${proof#* }"
   sha="${rest%% *}"
+  pr_re='^https?://(www\.)?github\.com/([^/?#]+)/([^/?#]+)/pull/([0-9]+)([/?#].*)?$'
+  if [ "$pr_claim" = 1 ]; then
+    pre="${first%%[?#]*}/"
+    case "$pre" in
+      *%*|*'\'*|*/../*)
+        _PROOF_REF_WHY="PR URL is not in canonical form (percent-escape, backslash or '..' segment): $url"
+        return 1 ;;
+    esac
+    case "$first" in
+      *[[:cntrl:]]*)
+        _PROOF_REF_WHY="PR URL contains control characters: $url"
+        return 1 ;;
+    esac
+    if ! [[ "$first" =~ $pr_re ]]; then
+      _PROOF_REF_WHY="unrecognized GitHub PR URL (must be the first word): $url"
+      return 1
+    fi
+  fi
   case "$url" in *'://'*) ;; *) return 1 ;; esac
   case "$sha" in *[!0-9a-fA-F]*|'') return 1 ;; esac
-  [ "${#sha}" -ge 7 ] && [ "${#sha}" -le 40 ]
+  [ "${#sha}" -ge 7 ] && [ "${#sha}" -le 40 ] || return 1
+  [ "$pr_claim" = 1 ] || return 0
+
+  slug="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}" num="${BASH_REMATCH[4]}"
+  if ! info=$(_gh_pr_lookup "$slug" --number "$num") || [ -z "$info" ]; then
+    _PROOF_REF_WHY="could not confirm $url is merged (gh unavailable or failed)"
+    return 1
+  fi
+  IFS='|' read -r state _ oid <<<"$info"
+  if [ "$state" != MERGED ]; then
+    _PROOF_REF_WHY="PR not merged (state ${state:-unknown}): $url"
+    return 1
+  fi
+  sha=$(printf '%s' "$sha" | tr '[:upper:]' '[:lower:]')
+  oid=$(printf '%s' "$oid" | tr '[:upper:]' '[:lower:]')
+  if [ -n "$sha" ] && [ -n "$oid" ]; then
+    case "$oid" in "$sha"*) return 0 ;; esac
+  fi
+  _PROOF_REF_WHY="sha $sha is not the merge commit of $url (${oid:-none reported})"
+  return 1
 }
 
 set_task_state() {                      # run_id task_id state [reason] [proof]
@@ -597,8 +718,8 @@ set_task_state() {                      # run_id task_id state [reason] [proof]
           *PROOF.md*) proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null) ;;
         esac
         if ! _valid_proof_ref "$proof" "$proof_wt"; then
-          printf 'run-registry: refusing shipped completion for %s/%s: proof missing/invalid (need "<PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)\n' \
-            "$run_id" "$task_id" >&2
+          printf 'run-registry: refusing shipped completion for %s/%s: proof missing/invalid (need "<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)%s\n' \
+            "$run_id" "$task_id" "${_PROOF_REF_WHY:+: $_PROOF_REF_WHY}" >&2
           return 1
         fi
       fi
