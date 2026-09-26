@@ -742,6 +742,89 @@ sel 1 --authority peer; rc=$?
 [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
   && ok "recorded command disagreeing with the panel refuses" \
   || bad "mismatched recorded command was not refused: rc=$rc keys=$(keys_pressed)"
+
+printf '== deny skips corroboration: a Deny on a disagreeing recorded command still presses Deny ==\n'
+# lib/scoped-policy.sh approval_command_text exit 2 (recorded disagrees with
+# the panel) used to refuse EVERY authority, Approve and Deny alike -- a
+# terminal that hard-wraps the recorded command mid-token (see the wrap case
+# below) stranded a Deny behind the same refusal a genuine Approve needed,
+# answerable only by closing the pane. A decline approves nothing, so the
+# mismatch is not a reason to withhold it.
+#
+# Deny is pre-highlighted here (unlike set_menu, which highlights Approve):
+# this harness's fake screen never moves on its own, so a test that needs
+# option 2 answered without 20 send-keys hitting the navigation-exhausted
+# refusal has to start the highlight where the choice already is.
+set_menu_deny() {                      # <command-text>
+  printf 'Allow tool: bash\nCommand: %s\n\nApprove\n\033[48;2;42;47;65m Deny\033[0m\n\nup/down navigate  enter select  esc cancel\n' "$1" > "$SCREEN"
+}
+set_menu_deny "git status"; reset_keys
+seed_input_required runG taskG "gh pr merge 5 --squash"
+sel 2 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 1 ] && [ "$(q_appr choice_text)" = "Deny" ] \
+  && ok "peer Deny presses through a disagreeing recorded command" \
+  || bad "peer Deny refused on mismatch: rc=$rc keys=$(keys_pressed) label=$(q_appr choice_text)"
+
+set_menu_deny "git status"; reset_keys
+( export HERDR_PANE_ID=w9:p9
+  sel 2 --authority conductor --review-category owned-cleanup \
+    --review-reason "Reviewed; declining a mismatched recorded command." \
+    --expect-prompt-id "$(prompt_id "$PANE")" ); rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 1 ] && [ "$(q_appr choice_text)" = "Deny" ] \
+  && ok "conductor Deny presses through the same disagreeing recorded command" \
+  || bad "conductor Deny refused on mismatch: rc=$rc keys=$(keys_pressed)"
+
+set_menu "git status"; reset_keys
+( export HERDR_PANE_ID=w9:p9
+  sel 2 --authority conductor --review-category owned-cleanup \
+    --review-reason "Reviewed; declining." \
+    --expect-prompt-id "wrong-prompt-id-0000" ); rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "conductor Deny with a wrong --expect-prompt-id still refuses (rc 6, no key)" \
+  || bad "wrong prompt id was not refused: rc=$rc keys=$(keys_pressed)"
+
+set_menu "git status"; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "peer Approve on the same disagreeing command is still refused" \
+  || bad "peer Approve leaked on mismatch: rc=$rc keys=$(keys_pressed)"
+
+set_menu "git status"; reset_keys
+conductor_select; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "conductor Approve on the same disagreeing command is still refused" \
+  || bad "conductor Approve leaked on mismatch: rc=$rc keys=$(keys_pressed)"
+
+printf '== a mid-token wrap: Approve stays strict, Deny still works (wrap tolerance is a separate PR) ==\n'
+# Real mechanism (2026-09-26, prompt 925e2d76): omp's own approval panel
+# hard-wraps a long command mid-token -- e.g. .../tntpgh/h | erdr-control/...
+# on two panel rows -- and prompt_command_text's own space-join (needed so
+# classify_command never sees a fake statement boundary) turns that wrap
+# into a stray extra space the collapsed-substring corroboration check does
+# not see past. Main decided wrap tolerance for Approve ships as a separate,
+# later PR; this pins that Approve is unaffected by today's Deny-only fix.
+set_rows_deny() {                      # each arg becomes one boxed panel row after "Command:"; Deny pre-highlighted
+  { printf '│ Allow tool: bash\n│ Command: %s\n' "$1"; shift
+    for row; do printf '│ %s\n' "$row"; done
+    printf '│\n│ Approve\n│ \033[48;2;42;47;65m Deny\033[0m\n│\n│ up/down navigate  enter select  esc cancel\n'; } > "$SCREEN"
+}
+WRAP_MISMATCH_CMD="ls -la /Users/thurbs/.herdr/worktrees/tntpgh/herdr-control/.handoffs"
+set_rows 'ls -la /Users/thurbs/.herdr/worktrees/tntpgh/h' 'erdr-control/.handoffs'; reset_keys
+seed_input_required runG taskG "$WRAP_MISMATCH_CMD"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "Approve on a mid-token wrap is still refused" \
+  || bad "Approve wrongly cleared a mid-token wrap: rc=$rc keys=$(keys_pressed)"
+
+set_rows_deny 'ls -la /Users/thurbs/.herdr/worktrees/tntpgh/h' 'erdr-control/.handoffs'; reset_keys
+( export HERDR_PANE_ID=w9:p9
+  sel 2 --authority conductor --review-category owned-cleanup \
+    --review-reason "Reviewed; declining a wrapped mismatch." \
+    --expect-prompt-id "$(prompt_id "$PANE")" ); rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 1 ] \
+  && ok "conductor Deny still works on the same mid-token wrap" \
+  || bad "conductor Deny refused on a wrap mismatch: rc=$rc keys=$(keys_pressed)"
+
 set_task_state runG taskG completed no-follow-on >/dev/null 2>&1
 
 printf '== task-scoped approval: capability manifest, approved once at spawn ==\n'
