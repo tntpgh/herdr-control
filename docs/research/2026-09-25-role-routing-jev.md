@@ -52,9 +52,9 @@ The client accepts only an `answers.role` object with `type: choice`, an exact
 allowed role, and numeric confidence in `[0, 1]`; confidence below `0.75`
 fails closed. It accepts only `answers.risk_high` with `type: noul` and numeric
 probability in `[0, 1]`; probability `>= 0.5` forces `escalate`. The emitted
-JSON is redacted to provider, role, job class, confidence, risk flag, reason,
-and model. API failures, malformed answers, low confidence, and high risk all
-return nonzero. The output never includes the API key or raw API state.
+JSON is limited to the routing choice (`role`, `job_class`) and never includes
+provider-returned metadata, model strings, the API key, or raw API state. API
+failures, malformed answers, low confidence, and high risk all return nonzero.
 
 ## Local capability
 

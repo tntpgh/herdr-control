@@ -12,11 +12,12 @@ import re
 import unicodedata
 
 HIGH_RISK_RE = re.compile(
-    r"\b(api[ -]?key|auth|authentication|credentials?|secrets?|tokens?|passwords?|oauth|permissions?|security|"
+    r"\b(api[ -]?keys?|access[ -]?keys?|private[ -]?keys?|signing[ -]?keys?|ssh[ -]?keys?|"
+    r"auth|authentication|credentials?|secrets?|tokens?|passwords?|oauth|permissions?|security|"
     r"vulnerabilit(?:y|ies)|exploit|encryption|money|payments?|billing|invoices?|refunds?|charges?|"
-    r"payouts?|financial|wire[ -]?transfer|external communications?|external comms|external email|email|"
-    r"slack|client|customer|publish|post public|production|prod|live|deploy|release|delete|remove|destroy|"
-    r"destructive|drop|truncate|erase|wipe|migration)\b",
+    r"payouts?|financial|wire[ -]?transfers?|external communications?|external comms|external emails?|emails?|"
+    r"slack|sms|messages?|clients?|customers?|publish|post public|production|prod|live|deploy|release|ship|delete|remove|purge|destroy|"
+    r"destructive|drop|truncate|erase|wipe|migrations?)\b",
     re.IGNORECASE,
 )
 
@@ -108,17 +109,9 @@ def parse_response(data: dict) -> dict:
     if risk_high:
         role = "escalate"
     job_class = ROLES[role]
-    reason = "JEV classified the brief with sufficient confidence"
-    if risk_high:
-        reason = "JEV risk signal requires human triage"
     return {
-        "provider": "jev",
         "role": role,
         "job_class": job_class,
-        "confidence": confidence,
-        "risk_high": risk_high,
-        "reason": reason,
-        "model": MODEL,
     }
 
 
@@ -131,10 +124,7 @@ def main(argv: list[str]) -> int:
         if not brief.strip():
             return fail("empty brief")
         if HIGH_RISK_RE.search(risk_text(brief)):
-            print(json.dumps({"provider": "jev", "role": "escalate", "job_class": None,
-                              "confidence": 1.0, "risk_high": True,
-                              "reason": "deterministic high-risk gate requires human triage",
-                              "model": MODEL}, separators=(",", ":"), sort_keys=True))
+            print(json.dumps({"role": "escalate", "job_class": None}, separators=(",", ":"), sort_keys=True))
             return 1
         result = parse_response(call_api(brief))
     except (OSError, RuntimeError, ValueError) as exc:

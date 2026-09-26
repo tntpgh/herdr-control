@@ -82,6 +82,18 @@ def check_no_leak(name, result, needle):
     else:
         print(f"  FAIL  {name}: leaked={needle in result.stdout or needle in result.stderr} rc={result.returncode} stdout={result.stdout.strip()} stderr={result.stderr.strip()}")
     return good
+
+def check_exact_keys(name, result):
+    try:
+        payload = json.loads(result.stdout)
+        good = result.returncode == 0 and set(payload) == {"role", "job_class"}
+    except Exception:
+        good = False
+    if good:
+        print(f"  ok    {name}")
+    else:
+        print(f"  FAIL  {name}: rc={result.returncode} stdout={result.stdout.strip()} stderr={result.stderr.strip()}")
+    return good
 def main():
     checks = [
         ("valid response routes", run(response()), True),
@@ -98,13 +110,17 @@ def main():
         ("JEV underreported remove customer brief fails closed", run(response(risk=0.1), "Remove customer records"), False),
         ("JEV underreported zero-width/live brief fails closed", run(response(risk=0.1), "Rotate se\u200bcret and ship to live"), False),
         ("JEV underreported percent-encoded brief fails closed", run(response(risk=0.1), "Rotate API%20key"), False),
+        ("JEV underreported plural API keys fails closed", run(response(risk=0.1), "Rotate API%20keys"), False),
+        ("JEV underreported plural transfers fails closed", run(response(risk=0.1), "Issue wire transfers"), False),
         ("missing key fails closed", run_missing_key(), False),
     ]
     passed = sum(check(name, result, expected) for name, result, expected in checks)
     leak_key = "Bearer fake-key-never-print"
     leak_check = check_no_leak("provider model metadata cannot echo bearer key", run(response_with_extra_model(leak_key)), leak_key)
     passed += 1 if leak_check else 0
-    total = len(checks) + 1
+    exact_check = check_exact_keys("JEV output key set is exactly role/job_class", run(response()))
+    passed += 1 if exact_check else 0
+    total = len(checks) + 2
     print(f"{passed} passed, {total - passed} failed")
     return 0 if passed == total else 1
 
