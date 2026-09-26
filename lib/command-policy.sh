@@ -1228,12 +1228,24 @@ _cp_secret_var_expanded() {             # norm -> 0 (true) if a secret-named $VA
 }
 
 
-_cp_non_shell_panel() {
+_cp_non_shell_panel_tool() {
   case "$1" in
-    "Allow tool: bash"*|"Allow tool: shell"*) return 1 ;;
-    "Allow tool: "*) return 0 ;;
+    "Allow tool: "*) ;;
+    *) return 1 ;;
   esac
-  return 1
+  local tool
+  tool="${1#Allow tool: }"
+  tool="${tool%%[ ;:	]*}"
+  printf '%s' "$tool" | tr '[:upper:]' '[:lower:]'
+}
+
+_cp_safe_non_shell_panel() {
+  local tool
+  tool="$(_cp_non_shell_panel_tool "$1" 2>/dev/null)" || return 1
+  case "$tool" in
+    read|grep|glob|web_search) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # A script runner's quoted arguments are data to its script, not command
@@ -1277,9 +1289,14 @@ classify_command() {
     return 2
   fi
   local raw="$1" norm
-  if _cp_non_shell_panel "$raw"; then
-    : > "$(_cp_reason_file)"
-    printf 'allow\n'
+  if [ -n "$(_cp_non_shell_panel_tool "$raw" 2>/dev/null)" ]; then
+    if _cp_safe_non_shell_panel "$raw"; then
+      : > "$(_cp_reason_file)"
+      printf 'allow\n'
+      return 0
+    fi
+    printf 'unknown or executing tool approval remains human-only\n' > "$(_cp_reason_file)"
+    printf 'escalate\n'
     return 0
   fi
   norm="$(scannable_command "$raw")"
