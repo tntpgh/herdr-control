@@ -28,11 +28,13 @@
 # consumed, for any reason; something changing means it was, for any reason
 # (a real submit, or the paste placeholder finally clearing).
 #
-# Usage:  send-to-agent.sh <pane_id> [--force] <text>
-#         send-to-agent.sh <pane_id> [--force] --submit-only
+# Usage:  send-to-agent.sh <pane_id> [--force] [--wait-clear SECONDS] <text>
+#         send-to-agent.sh <pane_id> [--force] [--wait-clear SECONDS] --submit-only
 #   pane_id       e.g. w2:p1 (from `herdr pane list` / pane-map.sh)
 #   --force       send even if the pane looks like it is on a permission prompt,
 #                 or if a human appears to be typing into it right now
+#   --wait-clear  when a menu is active, wait up to SECONDS for the worker to
+#                 clear it before delivering text; never presses Enter into it
 #   --submit-only press/retry Enter on text ALREADY in the composer (e.g. an
 #                 operator typed directly into the pane over herdr and the
 #                 Enter did not land) — types nothing, requires no text arg.
@@ -68,16 +70,21 @@ export HERDR_SANCTIONED_ANSWER=1
 _here=$(cd "$(dirname "$0")" && pwd)
 . "$_here/lib/prompt-parse.sh"
 
-pane="${1:?usage: send-to-agent.sh <pane_id> [--force] [--submit-only] <text>}"; shift
+pane="${1:?usage: send-to-agent.sh <pane_id> [--force] [--wait-clear SECONDS] [--submit-only] <text>}"; shift
 force=0
 submit_only=0
+wait_clear=0
 while :; do
   case "${1:-}" in
     --force)       force=1; shift ;;
+    --wait-clear)  wait_clear="${2:?seconds required after --wait-clear}"; shift 2 ;;
     --submit-only) submit_only=1; shift ;;
     *) break ;;
   esac
 done
+case "$wait_clear" in
+  ''|*[!0-9]*) echo "send-to-agent: --wait-clear requires non-negative seconds" >&2; exit 2 ;;
+esac
 if [ "$submit_only" -eq 1 ]; then
   text=""
 else
@@ -135,6 +142,15 @@ looks_like_permission_prompt() {
 
 if [ "$force" -eq 0 ]; then
   looks_like_permission_prompt; pr=$?
+  if [ "$pr" -eq 0 ] && [ "$wait_clear" -gt 0 ]; then
+    deadline=$(( $(date +%s) + wait_clear ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      sleep 1
+      looks_like_permission_prompt; pr=$?
+      [ "$pr" -eq 1 ] && break
+      [ "$pr" -eq 2 ] && break
+    done
+  fi
   if [ "$pr" -eq 0 ]; then
     echo "REFUSED: $pane is showing what looks like a permission/confirmation prompt." >&2
     echo "REFUSED: Enter would select its default option. Answer it yourself, or re-send with --force." >&2

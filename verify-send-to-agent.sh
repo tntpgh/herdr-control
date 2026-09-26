@@ -226,5 +226,28 @@ send "@/tmp/tourguide-agents-router-brief.md"; rc=$?
 grep -q '^SUBMITTED' "$WORK/out.txt" && ok "reported SUBMITTED only once the text LEFT the composer" || bad "stdout: $(cat "$WORK/out.txt")"
 [ "$(enters_pressed)" = "2" ] && ok "two Enters: the first only revealed the paste" || bad "Enters=$(enters_pressed)"
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
+printf '== --wait-clear waits for a live menu to disappear before sending ==\n'
+reset_state
+screen 0 <<'EOF'
+Allow tool: bash
+Approve
+Deny
+up/down navigate  enter select  esc cancel
+EOF
+screen 1 <<'EOF'
+⏺ Working on it now.
+╭── worker ──╮
+╰─
+EOF
+last_as 1
+( sleep 1
+  cat >"$SCREEN_DIR/0" <<'EOF'
+╭── worker ──╮
+╰─
+EOF
+) &
+send --wait-clear 3 "hello after menu"; rc=$?
+wait
+[ "$rc" -eq 0 ] && ok "--wait-clear submits after menu clears" || bad "--wait-clear exit $rc: $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "1" ] && ok "--wait-clear never presses into the menu" || bad "Enters=$(enters_pressed)"
 [ "$fail" -eq 0 ]

@@ -295,13 +295,16 @@ printf '%s\n' "$W1" | attention_tick
 printf '%s\n' "$W1" | attention_tick
 [ "$(_q "SELECT count(*) FROM events WHERE task_id='task9' AND type='attention_tracking';")" = "1" ] \
   && ok "the controller still tracks the prompt exactly once" || bad "attention_tracking count wrong"
-[ "$(_q "SELECT count(*) FROM events WHERE task_id='task9' AND type='wake_attempted';")" = "0" ] \
-  && ok "the controller never called push_wake itself (already owned by the hook)" \
-  || bad "controller called push_wake anyway — the double-wake this fix exists to prevent"
+[ "$(_q "SELECT count(*) FROM events WHERE task_id='task9' AND type='wake_held';")" = "1" ] \
+  && ok "the controller never created a second held wake (already owned by the hook)" \
+  || bad "held-wake count changed — the double-wake this fix exists to prevent"
 sleep 2   # let the hook's OWN grace_realert timer (1s) fire and force-deliver
 n_res=$(_q "SELECT count(*) FROM events WHERE task_id='task9' AND type='wake_result';")
 [ "$n_res" = "1" ] && ok "exactly one delivered wake once the hook's own grace window expired" \
   || bad "wake_result rows for task9: $n_res"
+n_att=$(_q "SELECT count(*) FROM events WHERE task_id='task9' AND type='wake_attempted';")
+[ "$n_att" = "1" ] && ok "exactly one wake_attempted row, from the hook's grace timer" \
+  || bad "wake_attempted rows for task9 after hook grace: $n_att"
 n_grace=$(_q "SELECT count(*) FROM events WHERE task_id='task9' AND type='alert_grace_expired';")
 [ "$n_grace" = "1" ] && ok "exactly one alert_grace_expired, not one per controller tick" \
   || bad "alert_grace_expired rows: $n_grace"
