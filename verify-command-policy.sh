@@ -103,6 +103,9 @@ check_reserved "git -C <dir> push (breaks push adjacency)"   "git -C /Users/thur
 check_reserved "bare git push (no named target)"             "git push"
 check_reserved "gh api --method=PUT .../merge (= form)"      "gh api --method=PUT repos/o/r/pulls/1/merge"
 check_reserved "gh api path ending /merge"                   "gh api repos/o/r/pulls/1/merge -X PUT"
+check_reserved "spawn-agent remains human-only"            "bash ./spawn-agent.sh /repo child omp"
+check_reserved "raw herdr tab create remains human-only"   "herdr tab create --cwd /repo --label child"
+check_reserved "raw herdr pane run remains human-only"     "herdr pane run pane1 --agent omp"
 
 echo "== the worker flow stays peer-answerable (else the alert flood returns) =="
 check_unreserved "push a feature branch"        "git push -u origin feat/x"
