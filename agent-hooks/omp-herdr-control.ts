@@ -190,9 +190,12 @@ function rawBashCommand(toolName: string, input: unknown): string | undefined {
 }
 
 // Firstmate's guard classifies delegation by shape rather than a fixed list.
-// Keep the same exclusions for observer/todo tools. The shell guard remains
-// the authority for registry, pane-generation, and worktree ownership; this
-// local check only avoids starting a shell for ordinary tool calls.
+// Keep the same exclusions for observer/todo tools. MCP tools are not blanket
+// safe: only read-only observer-shaped MCP names bypass the pretool block, and
+// unknown or delegation-shaped MCP tools fail closed before any server code runs.
+// The shell guard remains the authority for registry, pane-generation, and
+// worktree ownership; this local check only avoids starting a shell for ordinary
+// tool calls.
 const NON_FLEET_TOOLS: Record<string, true> = {
   taskoutput: true,
   taskstop: true,
@@ -204,9 +207,32 @@ const NON_FLEET_TOOLS: Record<string, true> = {
   taskupdate: true,
 };
 
+const SAFE_MCP_OBSERVER_PREFIXES = [
+  "read",
+  "get",
+  "list",
+  "search",
+  "fetch",
+  "lookup",
+  "inspect",
+  "show",
+  "find",
+  "grep",
+  "glob",
+  "status",
+  "metadata",
+];
+
+function isSafeMcpObserverTool(normalized: string): boolean {
+  if (!normalized.startsWith("mcp__")) return false;
+  const leaf = normalized.split("__").filter(Boolean).pop() ?? "";
+  return SAFE_MCP_OBSERVER_PREFIXES.some((prefix) => leaf === prefix || leaf.startsWith(`${prefix}_`));
+}
+
 function isFleetCreatingTool(toolName: string): boolean {
   const normalized = toolName.toLowerCase().replace(/[^a-z0-9_:-]/g, "");
-  if (normalized.startsWith("mcp__") || NON_FLEET_TOOLS[normalized]) return false;
+  if (NON_FLEET_TOOLS[normalized]) return false;
+  if (normalized.startsWith("mcp__")) return !isSafeMcpObserverTool(normalized);
   return [
     "agent",
     "subagent",

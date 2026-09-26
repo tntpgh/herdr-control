@@ -26,9 +26,10 @@ keeps herdr-control's controls intact:
 - The registry row must own the current `HERDR_PANE_ID`; its `pane_birth` must
   equal the live `herdr pane list` generation; and the tool cwd must remain
   under the registered worktree. Missing or unreadable proof refuses.
-- Observer/todo names and MCP tools are not delegation creation, matching
-  Firstmate's explicit exclusions. Ordinary tools are untouched and continue
-  through omp approvals and `herdr-select.sh`.
+- Observer/todo names and explicitly read-only MCP observer tools are not
+  delegation creation; unknown or delegation-shaped MCP tools fail closed.
+  Ordinary tools are untouched and continue through omp approvals and
+  `herdr-select.sh`.
 - The OMP extension returns `{block:true}` on refusal. It does not enable
   auto-approval, alter `herdr-select.sh`, weaken human-only command classes,
   bypass audit rows, or read worker-writable identity files as authority.

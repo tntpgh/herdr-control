@@ -21,11 +21,21 @@ cwd=${2:-${PWD:-}}
 
 # Shape-match future delegation tools instead of maintaining a fixed allowlist.
 # These stems and the safe observer/todo exclusions follow Firstmate's
-# b42d4fa8a752fad9a5f0235783b02534bce29219 subagent guard.
+# b42d4fa8a752fad9a5f0235783b02534bce29219 subagent guard. MCP tools are not
+# blanket-safe: only read-only observer-shaped MCP names bypass this block;
+# unknown or delegation-shaped MCP tools fail closed before server code runs.
 tool_norm=$(printf '%s' "$tool" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]_:-')
+mcp_tool_is_safe_observer() {
+  case "$1" in mcp__*) ;; *) return 1 ;; esac
+  local leaf="${1##*__}"
+  case "$leaf" in
+    read|read_*|get|get_*|list|list_*|search|search_*|fetch|fetch_*|lookup|lookup_*|inspect|inspect_*|show|show_*|find|find_*|grep|grep_*|glob|glob_*|status|status_*|metadata|metadata_*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 case "$tool_norm" in
-  mcp__*) exit 0 ;;
   taskoutput|taskstop|taskget|tasklist|cronlist|bashoutput|killshell|taskupdate) exit 0 ;;
+  mcp__*) mcp_tool_is_safe_observer "$tool_norm" && exit 0 ;;
   *agent*|*subagent*|*task*|*workflow*|*cron*|*schedul*|*worktree*|*delegate*|*spawn*|*dispatch*|*handoff*|*remote*|*sendmessage*|*monitor*) ;;
   *) exit 0 ;;
 esac

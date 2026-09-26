@@ -47,6 +47,15 @@ run_guard agent "$wt/src"; rc=$?
 [ "$rc" -eq 8 ] && ok 'native agent creation refused' || not_ok "native agent rc=$rc"
 run_guard taskcreate "$wt/src"; rc=$?
 [ "$rc" -eq 8 ] && ok 'current registered worker still cannot taskcreate native descendants' || not_ok "current taskcreate rc=$rc"
+
+printf '== MCP delegation-shaped tools fail closed, read-only MCP observers pass ==\n'
+for tool in mcp__taskcreate mcp__spawn mcp__delegate; do
+  run_guard "$tool" "$wt/src"; rc=$?
+  [ "$rc" -eq 8 ] && ok "shell guard blocks $tool" || not_ok "$tool rc=$rc"
+done
+run_guard mcp__filesystem__read_file "$wt/src"; rc=$?
+[ "$rc" -eq 0 ] && ok 'shell guard allows audited safe MCP read' || not_ok "safe MCP read rc=$rc"
+
 run_extension_guard() {
   TEST_CWD="$1" TEST_TOOL="${2:-task}" bun -e 'const mod = await import("./agent-hooks/omp-herdr-control.ts"); const handlers = {}; mod.default({on: (event, handler) => { handlers[event] = handler; }}); const result = handlers.tool_call({toolName:process.env.TEST_TOOL, input:{cwd:process.env.TEST_CWD}}); console.log(result?.block ? "BLOCK" : "ALLOW");' 2>"$work/bun.err"
 }
@@ -64,6 +73,14 @@ printf '== OMP tool_call wiring blocks native delegation ==\n'
 [ "$(run_extension_guard "$wt/src" taskcreate)" = BLOCK ] \
   && ok 'OMP hook blocks current registered native taskcreate' \
   || not_ok "OMP current-task taskcreate result: $(cat "$work/bun.err")"
+for tool in mcp__taskcreate mcp__spawn mcp__delegate; do
+  [ "$(run_extension_guard "$wt/src" "$tool")" = BLOCK ] \
+    && ok "OMP hook blocks $tool" \
+    || not_ok "OMP $tool result: $(cat "$work/bun.err")"
+done
+[ "$(run_extension_guard "$wt/src" mcp__filesystem__read_file)" = ALLOW ] \
+  && ok 'OMP hook allows audited safe MCP read' \
+  || not_ok "OMP safe MCP read result: $(cat "$work/bun.err")"
 run_guard taskupdate "$wt/src"; rc=$?
 [ "$rc" -eq 0 ] && ok 'native taskupdate observer stays allowed' || not_ok "taskupdate rc=$rc"
 [ "$(run_extension_guard "$wt/src" taskupdate)" = ALLOW ] \
