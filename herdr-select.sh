@@ -349,11 +349,14 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
 fi
 menu_rows_ambiguous=0
 if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
-  menu_command_rows="$(prompt_menu_command_rows "$pane" 2>/dev/null || printf '0')"
-  case "$menu_command_rows" in
-    ''|*[!0-9]*) menu_command_rows=0 ;;
-  esac
-  [ "$menu_command_rows" -gt 1 ] && menu_rows_ambiguous=1
+  if menu_command_rows="$(prompt_menu_command_rows "$pane" 2>/dev/null)"; then
+    case "$menu_command_rows" in
+      ''|*[!0-9]*) menu_rows_ambiguous=1 ;;
+      *) [ "$menu_command_rows" -gt 1 ] && menu_rows_ambiguous=1 ;;
+    esac
+  else
+    menu_rows_ambiguous=1
+  fi
 fi
 
 
@@ -363,9 +366,18 @@ if [ "$cmd_text_is_scrape" = 1 ] && [ "$cmd_torn" = 1 ] && [ "$policy_verdict" !
   policy_verdict=escalate
   policy_reason="the captured command text contained invalid UTF-8 — refusing to trust a verdict computed on a possibly-redacted capture, a human must review"
 fi
-if [ "$menu_rows_ambiguous" = 1 ] && [ "$policy_verdict" != deny ]; then
+if [ "$menu_rows_ambiguous" = 1 ]; then
   policy_verdict=escalate
-  policy_reason="multi-row menu command was scraped without a matching registry command — refusing to guess whether rows are terminal wrap or real shell newlines"
+  policy_reason="multi-row or unreadable menu command rows without a matching registry command — refusing to guess whether rows are terminal wrap or real shell newlines"
+  if [ "$authority" != human ] && [ "$declining" = 0 ]; then
+    echo "herdr-select: REFUSED (escalate) — a human must answer this one." >&2
+    echo "herdr-select: $policy_reason" >&2
+    echo "herdr-select: option $choice ($label) in $pane was NOT pressed." >&2
+    append_event "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "approval_escalated" \
+      "$(jq -nc --arg v "$policy_verdict" --arg r "$policy_reason" --arg p "$pane" \
+         '{verdict:$v, reason:$r, pane:$p}')" >/dev/null 2>&1 || true
+    exit 8
+  fi
 fi
 
 # Refusing a known Deny choice executes no requested action. Conversely, an
