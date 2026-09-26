@@ -110,12 +110,18 @@ check_unreserved "open a PR"                    "gh pr create --base main --fill
 check_unreserved "hand off for review"          "gh issue edit 5 --add-label ready-for-review"
 check_unreserved "run the repo's checks"        "bash scripts/ci.sh"
 check_unreserved "read the tree"                "git status --short --branch"
+check_unreserved "run command-policy verifier" "bash verify-command-policy.sh"
+check_reserved "run policy script itself"      "bash lib/command-policy.sh"
 
 echo "== positive controls: ordinary read-only/build commands must stay allow =="
 check "ls -la"                       "ls -la"    allow
 check "git status"                   "git status" allow
 check "npm test"                     "npm test"  allow
 
+check "cat markdown file"            "cat /tmp/probe/notes.md"              allow
+check "sed text file"                "sed -n '1,5p' /tmp/probe/notes.txt"   allow
+check "grep markdown file"           "grep -n FIXME /tmp/probe/notes.md"    allow
+check "wrapped-row separator stays executable" "cat /tmp/probe ; /tmp/probe/notes.md" escalate
 echo
 echo "== the 5 floor rules (every posture, ported from qm) =="
 check "recursive rm -r"              "rm -r /tmp/x"                          escalate
@@ -348,11 +354,16 @@ echo "== production has to be a TARGET, not a substring =="
 # dist-prod-verified, a pytest node id containing "production".
 check "local prod-named folder"       "cp -r dist dist-prod-verified"          allow
 check "test name says production"     "pytest -k test_production_freshness"    allow
+check "run local live-named verifier" "bash verify-herdr-live.sh"            allow
+check "run ./ live-named verifier"    "bash ./verify-herdr-live.sh"          allow
+check "ssh verifier host still escalates" "ssh verify-herdr-live.sh uptime"     escalate
+check "psql verifier host still escalates" "psql -h verify-herdr-live.sh -d app -c 'select 1'" escalate
 check "kubectl --context production"  "kubectl --context production delete deploy api" escalate
 check "wrangler --env production"     "wrangler deploy --env production"       escalate
 check "ssh to a prod host"            "ssh prod 'systemctl restart api'"       escalate
 check "psql against live hostname"    "psql -h live.db.internal -d app -c 'select 1'" escalate
 check "NODE_ENV=production deploy"    "NODE_ENV=production npm run deploy"     escalate
+check "verifier with live target still escalates" "bash verify-herdr-live.sh --context live" escalate
 check "reads SSH private key"        "cat ~/.ssh/id_ed25519"                  escalate
 check "reads AWS credentials file"   "cat ~/.aws/credentials"                 escalate
 check "reads .env"                   "cat .env"                               escalate
@@ -836,6 +847,9 @@ check "cmp two files"                         "cmp a.json b.json"               
 check "diff of live command output"           "diff <(git show HEAD:f) <(git show main:f)"     allow
 check_unreserved "diff same shape"            "diff a/package.json b/package.json"
 check_unreserved "cmp same shape"             "cmp a.json b.json"
+check "git show markdown blob"        "git show HEAD~1:README.md"           allow
+check "git show text blob"            "git show HEAD~1:notes.txt"           allow
+check "computed markdown execution"   "bash \$(git show HEAD~1:README.md)"  escalate
 # ...but actually executing a data file is still an execution, wherever it
 # is hidden. Proved 2026-09-24: `diff <(bash x.json) b.txt` classified
 # allow before the walker learned to look inside a process substitution —

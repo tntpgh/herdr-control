@@ -803,11 +803,39 @@ elif mode == "question":
     # the next. `question` degenerate here means len == 1, just the header
     # — a real command/diff/detail row from any OTHER tool already makes it
     # longer, so this never touches an already-distinguishing panel.
-    # Rows in a rendered tool panel are visual wraps, not shell separators.
-    # Joining them with ` ; ` fabricated a second command from arguments such
-    # as `git commit -F` followed by its message path, and made data-file
-    # extensions appear executable. Preserve the visible text without adding
-    # operators; policy still escalates any real operator present in a row.
+    if len(question) == 1 and pending_running:
+        question = question + pending_running
+    print(" ; ".join(question), end="")
+elif mode == "command_rows":
+    if len(question) == 1 and pending_running:
+        question = question + pending_running
+    rows = question
+    for i, row in enumerate(question):
+        if row.startswith("Command:"):
+            rows = question[i:]
+            break
+    print(len([r for r in rows if r.strip()]), end="")
+elif mode == "command":
+    # For CLASSIFICATION ONLY (lib/command-policy.sh via prompt_command_text
+    # below), never for display or prompt_id: `" ; "` is a real shell
+    # separator. A long single command wraps across several terminal ROWS --
+    # a box width, not a statement boundary -- and each wrapped row becomes
+    # its own `question` entry the same as a genuinely distinct detail row.
+    # Joining those with `" ; "` manufactured a FAKE statement boundary that
+    # the walker in command-policy.sh then split on for real, so a long
+    # argument that landed alone on its own wrapped row (`/tmp/.../notes.md`
+    # with nothing else on that row) was read as a standalone segment whose
+    # "command word" IS that path: the rule in command-policy.sh for "no
+    # interpreter, the command word IS the file" then fired, escalating an
+    # ordinary `cat`/`sed`/`grep` of a long path as "executes a data file".
+    # A plain space reconstructs the original wrapped line instead: any
+    # REAL statement separator the agent actually typed is already a
+    # character INSIDE one of these rows (a literal `;`/`&&`/newline in the
+    # command text itself), so nothing that must escalate stops escalating —
+    # only the artificial row boundary this parser itself introduced is
+    # removed.
+    if len(question) == 1 and pending_running:
+        question = question + pending_running
     print(" ".join(question), end="")
 ' "$1"
 }
@@ -815,6 +843,8 @@ elif mode == "question":
 prompt_menu_options()  { _prompt_menu "$1" options; }
 prompt_menu_selected() { _prompt_menu "$1" selected; }
 prompt_menu_question() { _prompt_menu "$1" question; }
+prompt_menu_command()  { _prompt_menu "$1" command; }
+prompt_menu_command_rows() { _prompt_menu "$1" command_rows; }
 prompt_menu_visible()  { _prompt_menu "$1" visible; }
 
 # "Is EITHER prompt shape on screen?", from ONE pane read.
@@ -995,7 +1025,11 @@ prompt_command_torn() {                 # <pane> -> 0 torn(-or-unreadable) / 1 p
 
 prompt_command_text() {
   local menu win
-  menu="$(prompt_menu_question "$1" 2>/dev/null)" || menu=""
+  # `command`, not `question`: joins wrapped rows with a space instead of
+  # `" ; "`, so a long argument that landed alone on its own wrapped row is
+  # not read as its own fake statement. See the "command" mode comment in
+  # _prompt_menu_parse above for the full failure this avoids.
+  menu="$(prompt_menu_command "$1" 2>/dev/null)" || menu=""
   if [ -n "$menu" ]; then printf '%s\n' "$menu"; return 0; fi
   win="$(_pane_visible "$1")" || win=""
   printf '%s\n%s\n' "$menu" "$(
