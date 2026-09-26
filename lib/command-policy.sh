@@ -1960,7 +1960,6 @@ _cp_push_is_safe() {                    # norm -> 0 (true) only for git push [-u
 # with equal severity supplied classify_reason's first-match explanation.
 conductor_reserved_reason() {
   local raw="$1" norm action_norm
-  _cp_non_shell_panel "$raw" && return 0
   norm="$(scannable_command "$raw")"
   action_norm="$(scannable_command "$(_cp_mask_script_data "$raw")")"
   _cp_apply_operator_rules "$norm"

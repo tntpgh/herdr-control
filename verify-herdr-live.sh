@@ -524,8 +524,8 @@ case "$(did "$line")" in "registry-follow-only (first observation) reg="*) true 
 # further transition, so this is the only chance to clear it; three review
 # lanes sat stranded through exactly this gap on 2026-09-18.
 line=$(run_edge blocked "" HERDR_EDGE_PEER_ANSWER=1)
-case "$(did "$line")" in "peer-answer(first observation) reg="*) true ;; *) false ;; esac \
-  && grep -q "^peer-answer .*w1:p1" "$tmp/log" \
+case "$(did "$line")" in "peer-answer(first observation, 3 rounds) reg="*) true ;; *) false ;; esac \
+  && grep -q "^peer-answer --interval 1 --max-rounds 3 --agent omp w1:p1" "$tmp/log" \
   && ! grep -q "^notify" "$tmp/log" \
   && ok "first observation answers an allow-class prompt and still alerts nothing" \
   || no "first-observation peer-answer" "$line $(cat "$tmp/log")"
@@ -583,8 +583,8 @@ grep -q "^peer-answer" "$tmp/log" \
   || ok "auto-answering is off unless HERDR_EDGE_PEER_ANSWER=1"
 
 line=$(run_edge blocked working HERDR_EDGE_PEER_ANSWER=1)
-grep -q "^peer-answer --max-rounds 1 --agent omp w1:p1" "$tmp/log" \
-  && ok "opting in answers exactly one round, for that pane only" \
+grep -q "^peer-answer --interval 1 --max-rounds 3 --agent omp w1:p1" "$tmp/log" \
+  && ok "opting in answers three short rounds, for that pane only" \
   || no "peer-answer opt-in" "$(cat "$tmp/log")"
 
 line=$(run_edge working blocked)
