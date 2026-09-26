@@ -15,18 +15,25 @@
 //
 // This extension has two classes of handlers:
 //   * observability handlers below, which must never throw into the agent; and
-//   * the `tool_call` registration/ownership guard, which deliberately returns
-//     `{block:true}` for a fleet-creating tool that has no live central task
-//     registration. A failed guard is also a block: otherwise a conductor can
-//     create invisible nested work and a recycled worker can act as its old
-//     generation.
+//   * the `tool_call` guards, which deliberately return `{block:true}`:
+//       - the registration/ownership guard, for a fleet-creating tool that has
+//         no live central task registration; and
+//       - the write-scope guard, for a REGISTERED WORKER (spawn-task.sh stamped
+//         HERDR_TASK_ID + HERDR_RUN_ID) whose file-mutating tool call targets a
+//         path outside its registered worktree (see workerWriteScopeBlock).
+//     A failed guard is also a block: otherwise a conductor can create
+//     invisible nested work, a recycled worker can act as its old generation,
+//     and a worker whose registry row cannot be read writes anywhere.
 //
-// The guard is deliberately narrow. Ordinary tool calls remain governed by
+// The guards are deliberately narrow. Ordinary tool calls remain governed by
 // omp's own approval layer and herdr-select.sh's human-only command policy;
-// this extension never adopts Firstmate's approval-bypass posture.
+// this extension never adopts Firstmate's approval-bypass posture. A session
+// that is not a registered worker (Main, a conductor, Terrence's own) never
+// reaches the write-scope guard at all.
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, type Stats, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
@@ -278,6 +285,401 @@ function pretoolRegistrationBlock(event: unknown): { block: true; reason: string
   }
 }
 
+// ---- worker write scope ------------------------------------------------------
+// Backlog (xi), 2026-09-26: registered worker w2F:p6 (manifest `writes:
+// [tmp/**]`) appended to ~/Code/herdr-control/.handoffs/notepad.md with omp's
+// edit tool right after the same write as a bash command had been denied, and
+// worker w2F:p2 had edited the main checkout's lib/prompt-parse.sh the same
+// way. Workers run `--approval-mode write`, so edit/write never prompt, and
+// nothing checked them. lib/command-policy.sh judges the bash path; this
+// guard judges the edit/write path.
+//
+// WHO is checked: only a session spawn-task.sh stamped with BOTH HERDR_TASK_ID
+// and HERDR_RUN_ID. Both are read ONCE, at module load, so a later in-process
+// change to process.env cannot un-register the session. The worktree comes
+// from the registry row (read_task, lib/run-registry.sh), never from the
+// worker-writable .handoffs/identity.json. HERDR_PANE_ID is NOT an identity:
+// herdr sets it in every pane (Main's too) and recycles pane ids. When the env
+// names a task but its row can't be read or has no worktree, every
+// file-mutating call blocks (fail closed). A session with no HERDR_TASK_ID
+// returns before any of this runs.
+//
+// WHAT is allowed: the resolved target must be inside the worktree's resolved
+// path and not under a `.git` or `.env*` segment there. `.handoffs/**` inside
+// the worktree stays writable, because workers keep SPEC/PROOF/events there.
+// Scratch outside the worktree is allowed only under /tmp or $TMPDIR, and only
+// for a file that doesn't exist yet or that this session created. Live workers
+// write commit messages and probes there, and the rule stops a worker
+// rewriting a conductor's /tmp brief or red tests. A file inside the worktree
+// that is a hard link (nlink > 1) is refused, since a write goes through it.
+// The manifest's `writes` globs are NOT enforced here. They are the output
+// scope that lets a curl GET clear review (lib/task-manifest.sh,
+// docs/approval-policy.md), every live manifest is `writes: [tmp/**]`, and
+// enforcing them would block every implement worker's source edits.
+//
+// HOW a target resolves: `~` / `~/` → $HOME at load (`~user` is refused);
+// relative → the session cwd; `file://` → its path. Both spellings must land in
+// scope: (a) as given and (b) with `..` normalized lexically. omp may do
+// either before opening, and the kernel follows each symlink before applying
+// `..`. Each spelling is walked component by component with every existing
+// symlink followed, dangling ones included, because a write through a
+// dangling link creates its target. For `archive.zip:member` and
+// `db.sqlite:table`, every prefix ending before a `:` is checked too.
+// Internal URLs: `agent://` (a peer message) and `proc://` (stdin to the
+// worker's own job) write no file. `local://` is omp's per-session artifact dir
+// (~/.omp/agent/sessions/<cwd>/<session>/local/); omp itself refuses `..`
+// there, and this guard refuses `..`, a leading `/` and `~`. `xd://<device>`
+// is checked by the path fields of its JSON content (ast_edit's `paths`).
+// Every other scheme (`ssh://`, `memory://`, `skill://`, …) is refused.
+//
+// WHICH tools: write, edit (hashline `[PATH#TAG]` headers and `MV DEST`,
+// apply_patch `*** … File:` / `*** Move to:` lines, any path field),
+// multiedit, ast_edit, notebook*, lsp's mutating actions, and by shape any tool
+// whose name says it mutates (write/edit/patch/rename/…) AND carries a
+// path-like field. NOT covered here: `eval` (arbitrary code; omp's approval
+// layer governs it), bash (lib/command-policy.sh), and tools that write omp's
+// own state rather than a path (learn, manage_skill, retain).
+const WORKER_TASK_ID = process.env.HERDR_TASK_ID?.trim() ?? "";
+const WORKER_RUN_ID = process.env.HERDR_RUN_ID?.trim() ?? "";
+const LOAD_HOME = process.env.HOME?.trim() || homedir();
+const LOAD_TMPDIR = process.env.TMPDIR?.trim() ?? "";
+const LOAD_RUN_STATE_DIR = process.env.HERDR_RUN_STATE_DIR?.trim() ?? "";
+const RUN_REGISTRY_SH = path.join(ROOT, "lib", "run-registry.sh");
+
+type Block = { block: true; reason: string };
+
+let registeredWorktreeReal: string | undefined; // cached after the first successful read
+const scratchCreatedHere = new Set<string>();
+
+function readRegisteredWorktree(): { worktree: string } | { error: string } {
+  if (registeredWorktreeReal) return { worktree: registeredWorktreeReal };
+  if (!WORKER_RUN_ID) return { error: "HERDR_TASK_ID is set but HERDR_RUN_ID is not" };
+  if (!safeExists(RUN_REGISTRY_SH)) return { error: `${RUN_REGISTRY_SH} is missing` };
+  const env: Record<string, string | undefined> = { ...process.env, HOME: LOAD_HOME };
+  if (LOAD_RUN_STATE_DIR) env.HERDR_RUN_STATE_DIR = LOAD_RUN_STATE_DIR;
+  else delete env.HERDR_RUN_STATE_DIR;
+  const r = spawnSync(
+    "bash",
+    ["-c", '. "$1" && read_task "$2" "$3"', "herdr-write-scope", RUN_REGISTRY_SH, WORKER_RUN_ID, WORKER_TASK_ID],
+    { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "pipe"], env },
+  );
+  if (r.error || r.status !== 0) {
+    return { error: `the registry read failed (${r.error ? r.error.message : `exit ${r.status}`})` };
+  }
+  let row: unknown;
+  try {
+    row = JSON.parse((r.stdout ?? "").trim());
+  } catch {
+    return { error: `no registry row for run ${WORKER_RUN_ID} task ${WORKER_TASK_ID}` };
+  }
+  const wt = row && typeof row === "object" ? (row as Record<string, unknown>).worktree : undefined;
+  if (typeof wt !== "string" || !path.isAbsolute(wt)) return { error: "the registry row has no absolute worktree" };
+  const real = resolveFollowingLinks(wt);
+  if (!real || !safeExists(real)) return { error: `the registered worktree ${wt} does not resolve` };
+  registeredWorktreeReal = real;
+  return { worktree: real };
+}
+
+// The kernel's view of an absolute path: walk it component by component,
+// splicing in each symlink's target (dangling or not) before applying the next
+// `..`. An absent component is taken as-is, because a write creates it as a
+// real entry. undefined = more than 40 links (a loop).
+function resolveFollowingLinks(abs: string): string | undefined {
+  let pending = abs.split("/").filter(Boolean);
+  let cur = "/";
+  let hops = 0;
+  while (pending.length > 0) {
+    const seg = pending.shift() as string;
+    if (seg === ".") continue;
+    if (seg === "..") {
+      cur = path.dirname(cur);
+      continue;
+    }
+    const next = cur === "/" ? `/${seg}` : `${cur}/${seg}`;
+    let isLink = false;
+    try {
+      isLink = lstatSync(next).isSymbolicLink();
+    } catch {
+      // absent (or unreadable, which the write itself will hit): not a link
+    }
+    if (!isLink) {
+      cur = next;
+      continue;
+    }
+    if (++hops > 40) return undefined;
+    const target = readlinkSync(next);
+    if (target.startsWith("/")) cur = "/";
+    pending = [...target.split("/").filter(Boolean), ...pending];
+  }
+  return cur;
+}
+
+function isUnder(p: string, root: string): boolean {
+  return p === root || p.startsWith(root === "/" ? "/" : `${root}/`);
+}
+
+function unquote(s: string): string {
+  const t = s.trim();
+  return t.length >= 2 && (t[0] === '"' || t[0] === "'") && t[t.length - 1] === t[0] ? t.slice(1, -1) : t;
+}
+
+const PATH_FIELDS = ["path", "file_path", "filePath", "filepath", "file", "notebook_path", "target", "dest", "destination", "new_path", "newPath"];
+
+function pathFields(rec: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  for (const k of [...PATH_FIELDS, "paths", "files"]) {
+    const v = rec[k];
+    if (typeof v === "string" && v.length > 0) out.push(v);
+    else if (Array.isArray(v)) for (const x of v) if (typeof x === "string" && x.length > 0) out.push(x);
+  }
+  return out;
+}
+
+// Every file an edit call's `input` touches. A line starting `[` is always a
+// section header (body rows start `+`), so one that doesn't parse refuses the
+// call rather than being skipped. A relative MV destination is checked against
+// both the cwd and the moved file's directory.
+function editInputTargets(text: string): string[] | string {
+  const out: string[] = [];
+  let lastHeader = "";
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith("[")) {
+      const m = /^\[(.+)#[0-9A-Fa-f]{4}\]\s*$/.exec(line);
+      if (!m) return `cannot parse the edit section header ${JSON.stringify(line.slice(0, 120))}`;
+      lastHeader = unquote(m[1]);
+      out.push(lastHeader);
+      continue;
+    }
+    const mv = /^MV\s+(.+)$/.exec(line);
+    if (mv) {
+      const dest = unquote(mv[1]);
+      out.push(dest);
+      if (lastHeader && !path.isAbsolute(dest) && !dest.startsWith("~")) out.push(path.join(path.dirname(lastHeader), dest));
+      continue;
+    }
+    const patch = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to):\s*(.+)$/.exec(line);
+    if (patch) out.push(unquote(patch[1]));
+  }
+  return out;
+}
+
+const MUTATING_NAME = /(write|edit|patch|notebook|rename|move|delete|remove|mkdir|create|replace|append|save)/;
+const LSP_MUTATING_ACTION = /(rename|code_?action|format|fix|organi[sz]e|apply)/;
+const LSP_READONLY_ACTION =
+  /^(definition|type_?definition|declaration|implementation|references|hover|signature(_help)?|symbols?|document_symbols?|workspace_symbols?|diagnostics|status|incoming_calls|outgoing_calls|call_hierarchy|completion|highlight)$/;
+
+// The raw targets a file-mutating call names; undefined when the tool is not
+// file-mutating (it is never checked); a string when it is mutating but its
+// targets cannot be read (refused).
+interface MutationTargets {
+  raw: string[];
+  xdContent?: string; // write's content, parsed only for an xd:// target
+  globOk?: boolean; // ast_edit expands globs; every other tool takes a path literally
+}
+
+function mutationTargets(toolName: string, rec: Record<string, unknown>): MutationTargets | string | undefined {
+  const name = toolName.toLowerCase().replace(/[^a-z0-9_]/g, "");
+  if (name === "write") {
+    const targets = pathFields(rec);
+    if (targets.length === 0) return "write names no path";
+    return { raw: targets, xdContent: typeof rec.content === "string" ? rec.content : undefined };
+  }
+  if (name === "edit") {
+    const targets = pathFields(rec);
+    for (const k of ["input", "patch", "diff"]) {
+      if (typeof rec[k] !== "string") continue;
+      const got = editInputTargets(rec[k] as string);
+      if (typeof got === "string") return got;
+      targets.push(...got);
+    }
+    return targets.length > 0 ? { raw: targets } : "cannot tell which file this edit touches";
+  }
+  if (name === "lsp") {
+    // omp tiers lsp by a read-only action set it does not export, so this errs
+    // the other way: any action not known read-only is checked when it names
+    // a file, and a known-mutating one that names none is refused.
+    const action = typeof rec.action === "string" ? rec.action.toLowerCase() : "";
+    if (LSP_READONLY_ACTION.test(action)) return undefined;
+    const targets = pathFields(rec);
+    if (targets.length > 0) return { raw: targets };
+    return LSP_MUTATING_ACTION.test(action) ? `lsp ${action} names no file` : undefined;
+  }
+  if (name === "ast_edit" || name === "astedit") {
+    const targets = pathFields(rec);
+    return targets.length > 0 ? { raw: targets, globOk: true } : `${toolName} names no path`;
+  }
+  if (name === "multiedit" || name.startsWith("notebook")) {
+    const targets = pathFields(rec);
+    return targets.length > 0 ? { raw: targets } : `${toolName} names no path`;
+  }
+  if (MUTATING_NAME.test(name)) {
+    const targets = pathFields(rec);
+    return targets.length > 0 ? { raw: targets } : undefined;
+  }
+  return undefined;
+}
+
+// A file path's absolute spellings (see HOW above), or a refusal string.
+function absoluteSpellings(raw: string, cwd: string): string[] | string {
+  let p = raw.trim();
+  if (/^file:\/\//i.test(p)) {
+    try {
+      p = fileURLToPath(p);
+    } catch {
+      return `cannot parse the file URL ${raw}`;
+    }
+  }
+  if (p === "~" || p.startsWith("~/")) p = LOAD_HOME + p.slice(1);
+  else if (p.startsWith("~")) return `cannot resolve ${raw} (~user paths are refused)`;
+  const abs = path.isAbsolute(p) ? p : `${cwd}/${p}`;
+  const bases = [abs];
+  for (let i = abs.indexOf(":"); i > 0; i = abs.indexOf(":", i + 1)) bases.push(abs.slice(0, i));
+  const out: string[] = [];
+  for (const b of bases) {
+    for (const spelling of [b, path.resolve(b)]) {
+      const r = resolveFollowingLinks(spelling);
+      if (!r) return `${raw} is a symlink loop`;
+      out.push(r);
+    }
+  }
+  return out;
+}
+
+function scratchRoots(): string[] {
+  const roots: string[] = [];
+  for (const r of ["/tmp", LOAD_TMPDIR]) {
+    if (!r || !path.isAbsolute(r)) continue;
+    const real = resolveFollowingLinks(r);
+    if (real && real !== "/") roots.push(real.replace(/\/+$/, ""));
+  }
+  return roots;
+}
+
+// undefined = allowed; otherwise why not. `newScratch` collects the scratch
+// files this call would create, recorded only once the whole call is allowed.
+function checkFileTarget(raw: string, globOk: boolean, cwd: string, wt: string, newScratch: string[]): string | undefined {
+  const glob = globOk ? /[*?[\]{}]/.exec(raw) : null;
+  let target = raw;
+  if (glob) {
+    // ast_edit takes globs: the literal directory prefix must be in scope, and
+    // nothing after the first wildcard may climb out of it.
+    const cut = raw.lastIndexOf("/", glob.index);
+    if (raw.slice(cut + 1).split("/").includes("..")) return `the glob ${raw} climbs out with ..`;
+    target = cut < 0 ? "." : raw.slice(0, cut) || "/";
+  }
+  const spellings = absoluteSpellings(target, cwd);
+  if (typeof spellings === "string") return spellings;
+  const roots = scratchRoots();
+  for (const resolved of spellings) {
+    let st: Stats | undefined;
+    try {
+      st = lstatSync(resolved);
+    } catch {
+      st = undefined;
+    }
+    if (isUnder(resolved, wt)) {
+      const rel = resolved.slice(wt.length + 1).toLowerCase().split("/");
+      if (rel.includes(".git")) return `${raw} resolves to ${resolved}, inside .git`;
+      if (rel.some((s) => s.startsWith(".env"))) return `${raw} resolves to ${resolved}, a .env* file`;
+      if (st?.isFile() && st.nlink > 1) return `${raw} resolves to ${resolved}, a hard link (a write reaches its other names)`;
+      continue;
+    }
+    const root = roots.find((r) => resolved !== r && isUnder(resolved, r));
+    if (root && !glob) {
+      if (st && !scratchCreatedHere.has(resolved)) {
+        return `${raw} resolves to ${resolved}, an existing scratch file this session did not create`;
+      }
+      if (st?.isFile() && st.nlink > 1) return `${raw} resolves to ${resolved}, a hard link`;
+      newScratch.push(resolved);
+      continue;
+    }
+    return `${raw} resolves to ${resolved}, outside your worktree`;
+  }
+  return undefined;
+}
+
+// undefined = allowed; otherwise why not. Internal URLs first (see HOW above).
+function checkTarget(
+  raw: string,
+  targets: MutationTargets,
+  cwd: string,
+  wt: string,
+  newScratch: string[],
+): string | undefined {
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(raw.trim());
+  if (!scheme || scheme[1].toLowerCase() === "file") return checkFileTarget(raw, targets.globOk === true, cwd, wt, newScratch);
+  const kind = scheme[1].toLowerCase();
+  const rest = raw.trim().slice(scheme[0].length);
+  if (kind === "agent" || kind === "proc") return undefined;
+  if (kind === "local") {
+    let decoded = rest;
+    try {
+      decoded = decodeURIComponent(rest);
+    } catch {
+      return `cannot decode ${raw}`;
+    }
+    if (decoded.startsWith("/") || decoded.startsWith("~") || decoded.split(/[/\\]/).includes("..")) {
+      return `${raw} leaves the session's local:// dir`;
+    }
+    return undefined;
+  }
+  if (kind === "xd") {
+    if (targets.xdContent === undefined) return undefined;
+    let args: unknown;
+    try {
+      args = JSON.parse(targets.xdContent);
+    } catch {
+      return undefined; // a device that takes prose (resolve/reject), not a path
+    }
+    if (!args || typeof args !== "object") return undefined;
+    for (const inner of pathFields(args as Record<string, unknown>)) {
+      const why = checkTarget(inner, { raw: [inner], globOk: true }, cwd, wt, newScratch);
+      if (why) return `${raw}: ${why}`;
+    }
+    return undefined;
+  }
+  return `${kind}:// is outside your worktree`;
+}
+
+function workerWriteScopeBlock(event: unknown, ctx: unknown): Block | undefined {
+  if (!WORKER_TASK_ID) return undefined; // not a registered worker: never checked
+  let toolName = "tool";
+  try {
+    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
+    const input = e.input && typeof e.input === "object" ? (e.input as Record<string, unknown>) : {};
+    const targets = mutationTargets(toolName, input);
+    if (targets === undefined) return undefined;
+    // A peer message or a job's stdin names no file, and must still work when
+    // the registry is unreadable: it is how a stuck worker reports being stuck.
+    if (typeof targets !== "string" && targets.raw.every((r) => /^(agent|proc):\/\//i.test(r.trim()))) return undefined;
+    const scope = readRegisteredWorktree();
+    const wtNote = "worktree" in scope ? scope.worktree : "(unreadable)";
+    const refuse = (why: string): Block => ({
+      block: true,
+      reason:
+        `herdr write-scope: ${toolName} refused — ${why}. You are registered worker ${WORKER_TASK_ID}; ` +
+        `write only under your worktree ${wtNote} (scratch: its tmp/, or a NEW file under /tmp). ` +
+        "For anything else (the main checkout, another repo, a notepad that isn't yours) ask your " +
+        "conductor/operator to do it. Do not retry it through another tool.",
+    });
+    if (typeof targets === "string") return refuse(targets);
+    if ("error" in scope) return refuse(`cannot verify your registered worktree: ${scope.error}`);
+    const c = ctx && typeof ctx === "object" ? (ctx as Record<string, unknown>).cwd : undefined;
+    const cwd = typeof c === "string" && path.isAbsolute(c) ? c : process.cwd();
+    const newScratch: string[] = [];
+    for (const raw of targets.raw) {
+      const why = checkTarget(raw, targets, cwd, scope.worktree, newScratch);
+      if (why) return refuse(why);
+    }
+    for (const p of newScratch) scratchCreatedHere.add(p);
+    return undefined;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return { block: true, reason: `herdr write-scope guard failed closed on ${toolName}: ${detail}` };
+  }
+}
+
 // Fires ONLY when omp actually needs a human: `tool_approval_requested` (the
 // approval menu) and `tool_execution_start` for the `ask` tool (the numbered
 // question prompt). Both are documented observability events
@@ -316,7 +718,8 @@ function notifyForPrompt(toolName: string, message: string, command?: string): v
 // dispatch (a THROWING tool_call handler blocks the tool), so the cache path is
 // a try/catch around a Map write and ordinary calls return undefined. The same
 // handler may deliberately return `{block:true}` for delegation-shaped tools
-// that fail the central registration/generation check.
+// that fail the central registration/generation check, and for a registered
+// worker's file-mutating call outside its worktree (workerWriteScopeBlock).
 const INPUT_CACHE_MAX = 32;
 const inputByCallId = new Map<string, unknown>();
 
@@ -336,9 +739,9 @@ function cacheBashInput(event: unknown): void {
   }
 }
 
-function onToolCall(event: unknown): { block: true; reason: string } | undefined {
+function onToolCall(event: unknown, ctx?: unknown): Block | undefined {
   cacheBashInput(event);
-  return pretoolRegistrationBlock(event);
+  return pretoolRegistrationBlock(event) ?? workerWriteScopeBlock(event, ctx);
 }
 
 function onApprovalRequested(event: unknown): undefined {

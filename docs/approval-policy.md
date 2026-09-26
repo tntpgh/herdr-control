@@ -195,6 +195,45 @@ nothing after it can override** → the manifest scope (only ever clears an
 
 Design and prior art: `docs/research/scoped-approval.md`.
 
+## 10. A worker's edit/write tools stay inside its own worktree
+
+Workers run `--approval-mode write`, so omp never prompts for `edit`, `write`,
+`ast_edit`, notebook, MCP or lsp-rename calls. Nothing above sees them.
+Backlog (xi), 2026-09-26: worker w2F:p6's notepad append went through the bash
+path and was denied, so it redid the append with the edit tool, into the MAIN
+checkout's `.handoffs/notepad.md`. The same audit found a second worker that
+had edited the main checkout's `lib/prompt-parse.sh`.
+
+`agent-hooks/omp-herdr-control.ts` `workerWriteScopeBlock` (the `tool_call`
+hook, fail closed) now checks every file-mutating call made by a **registered
+worker**. A registered worker is a session spawn-task.sh stamped with
+`HERDR_TASK_ID` + `HERDR_RUN_ID`, read once when the hook loads. Every other
+session (Main, conductors, Terrence's own) is never checked. The target must
+resolve inside the worktree on the task's registry row. The check follows
+symlinks (dangling ones too) and expands `..`, `~`, relative paths,
+`file://` and `archive:member`. Inside the worktree it refuses `.git`,
+`.env*` and hard-linked files. `.handoffs/**` stays writable. Scratch is
+allowed under `/tmp` or `$TMPDIR` only for a file that is new or that this
+session created, so a worker can't rewrite a conductor's `/tmp` brief. Live
+workers write commit messages and probes to `/tmp`, which is why it isn't
+refused outright. Internal URLs: `agent://` and `proc://` pass, `local://`
+passes unless it tries to climb out, `xd://` is judged by its JSON `paths`,
+and every other scheme is refused. A registry row that can't be read blocks
+every mutating call except a peer message.
+
+**The manifest's `writes` globs are deliberately not enforced here.** `writes`
+is the output scope that lets an in-scope curl GET clear review (§9). Every
+manifest spawned so far is `writes: [tmp/**]` on an implement task whose job
+is editing `lib/*.sh`. Enforcing it on edit/write would block all of that
+work. Limiting local edits needs its own manifest key, not a new meaning for
+this one.
+
+Not covered, deliberately: `eval` (exec tier, so it prompts under
+`--approval-mode write`), bash (§1–§9), and tools that write omp's own state
+rather than a path (`learn`, `manage_skill`, `retain`). The hook loads at omp
+session start, and omp has no extension file-watcher. A running worker keeps
+the hook it started with until its next session start.
+
 ---
 
 Cross-reference: `docs/control-plane-design.md` has the design history and
