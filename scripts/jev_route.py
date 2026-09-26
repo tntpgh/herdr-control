@@ -2,6 +2,7 @@
 """Fail-closed TypeSafe JEV role router; stdlib only."""
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -115,9 +116,11 @@ def parse_response(data: dict) -> dict:
 
 
 def main(argv: list[str]) -> int:
-    path = None
+    parser = argparse.ArgumentParser(description="Route a task brief through TypeSafe JEV")
+    parser.add_argument("--brief", help="path to a task brief; stdin is used when omitted")
+    args = parser.parse_args(argv[1:])
     try:
-        brief = read_brief(path)
+        brief = read_brief(args.brief)
         if not brief.strip():
             return fail("empty brief")
         if HIGH_RISK_RE.search(brief):

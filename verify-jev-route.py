@@ -3,12 +3,15 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SCRIPT = ROOT / "scripts" / "jev_route.py"
+ROUTE = ROOT / "scripts" / "route-task.sh"
+SPAWN = ROOT / "spawn-task.sh"
 
 class Handler(BaseHTTPRequestHandler):
     response = {}
@@ -20,27 +23,46 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
-def run(response, brief="Implement parser"):
+def _brief_file(text):
+    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)
+    handle.write(text)
+    handle.close()
+    return handle.name
+
+def run(response, brief="Implement parser", argv=None):
     Handler.response = response
     server = HTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     env = os.environ.copy()
     env.update(TYPESAFE_API_KEY="test-key-not-a-secret", TYPESAFE_API_URL=f"http://127.0.0.1:{server.server_port}")
-    result = subprocess.run([sys.executable, str(SCRIPT)], input=brief, text=True, capture_output=True, env=env)
+    if argv is None:
+        path = _brief_file(brief)
+        argv = [sys.executable, str(SCRIPT), "--brief", path]
+    result = subprocess.run(argv, text=True, capture_output=True, env=env)
     server.shutdown()
     return result
 
 def run_missing_key():
     env = os.environ.copy()
     env.pop("TYPESAFE_API_KEY", None)
-    return subprocess.run([sys.executable, str(SCRIPT)], input="Implement parser", text=True, capture_output=True, env=env)
+    path = _brief_file("Implement parser")
+    return subprocess.run([sys.executable, str(SCRIPT), "--brief", path], text=True, capture_output=True, env=env)
 
 def response(role="implementer", confidence=0.9, risk=0.1, model="jev-test"):
     return {"model": model, "answers": {
         "role": {"type": "choice", "choice": role, "confidence": confidence},
         "risk_high": {"type": "noul", "noul": risk},
     }}
+
+def run_route_task(response_body, brief="Implement parser"):
+    path = _brief_file(brief)
+    return run(response_body, argv=["bash", str(ROUTE), "--provider", "jev", "--brief", path])
+
+def run_spawn_task(response_body, brief="Implement parser"):
+    path = _brief_file(brief)
+    return run(response_body, argv=["bash", str(SPAWN), "--route", "jev", "--brief", path, "--dry-run", str(ROOT), "tmp/jev-route-proof", "auto", "omp"])
+
 
 def check(name, result, expected_zero):
     good = (result.returncode == 0) == expected_zero
@@ -52,6 +74,8 @@ def check(name, result, expected_zero):
 def main():
     checks = [
         ("valid response routes", run(response()), True),
+        ("route-task --provider jev uses --brief file", run_route_task(response()), True),
+        ("spawn-task --route jev --dry-run routes before worktree creation", run_spawn_task(response()), True),
         ("malformed response fails closed", run({"answers": {}}), False),
         ("low confidence fails closed", run(response(confidence=0.4)), False),
         ("high risk fails closed", run(response(risk=0.9)), False),
