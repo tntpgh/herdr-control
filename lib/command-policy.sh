@@ -257,9 +257,10 @@ _cp_walk_prep() {                       # raw
 #
 # Deliberately narrow, matching the plan doc's own wording with nothing
 # added: `git add`/`git commit` take ANY arguments (both are local-only, no
-# ref crosses a boundary); `git push` must be EXACTLY `origin <branch>` — no
-# force flag, no other refspec, no `-u`; `gh pr create` must be EXACTLY
-# `--head <branch>`, optionally `--base <trunk>` — no other flag. A
+# ref crosses a boundary); `git push` must be EXACTLY `[-u|--set-upstream]
+# origin <branch>` — no force flag, no other refspec, no other flag of any
+# kind; `gh pr create` must be EXACTLY `--head <branch>`, optionally
+# `--base <trunk>` — no other flag. A
 # worktree/branch this task was never registered with is a hole this
 # function refuses to guess at: an unregistered pane (branch empty) never
 # matches anything.
