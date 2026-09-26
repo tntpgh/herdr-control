@@ -106,6 +106,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/run-registry.sh"
 . "$here/lib/command-policy.sh"
 . "$here/lib/scoped-policy.sh"
+. "$here/lib/push-wake.sh"
 
 pane="${1:?usage: herdr-select.sh <pane_id> <option-number> [--expect-prompt-id ID]}"
 choice="${2:?option number required}"
@@ -332,6 +333,14 @@ own_trunk=$(printf '%s' "$own_task_json" | jq -r '.trunk // empty' 2>/dev/null)
 # reading their own screen is the authority regardless of what any hook
 # recorded.
 if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
+  # fix/peer-waits-for-record change 1: give the hook's own write a brief
+  # head start before judging a raw scrape it was about to correct — see
+  # lib/scoped-policy.sh wait_for_input_required_row for the exact race.
+  # Peer-only (a human reviewing their own screen needs no registry text at
+  # all) and skipped on a Deny (which never needed corroboration — see the
+  # panel_scrape fallback below).
+  [ "$authority" = peer ] && [ "$declining" = 0 ] && \
+    wait_for_input_required_row "$own_run" "$own_task" "$current_prompt_id"
   registry_cmd="$(task_input_required_command "$own_run" "$own_task" "$current_prompt_id" 2>/dev/null)"
   # lib/scoped-policy.sh approval_command_text: the recorded command when the
   # panel (whitespace-collapsed) contains it, else the panel; exit 2 = the two
@@ -477,9 +486,25 @@ if [ "$authority" = peer ] && [ "$declining" = 0 ]; then
       [ -n "$policy_reason" ] && echo "herdr-select: $policy_reason" >&2
     fi
     echo "herdr-select: option $choice ($label) in $pane was NOT pressed." >&2
-    append_event "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "approval_escalated" \
-      "$(jq -nc --arg v "$policy_verdict" --arg r "$policy_reason" --arg p "$pane" \
-         '{verdict:$v, reason:$r, pane:$p}')" >/dev/null 2>&1 || true
+    # change 2: this must be the TASK's own run_id/task_id (own_run/own_task,
+    # already resolved from task_for_pane above), not HERDR_RUN_ID/HERDR_TASK_ID
+    # — those are empty on this edge path (herdr-select.sh called directly,
+    # not from a hook) — and must carry the prompt_id, or change 3/4's own
+    # queries below (and in lib/push-wake.sh) can never find this row.
+    append_event "$own_run" "$own_task" "approval_escalated" \
+      "$(jq -nc --arg v "$policy_verdict" --arg r "$policy_reason" --arg p "$pane" --arg pid "$current_prompt_id" \
+         '{verdict:$v, reason:$r, pane:$p, prompt_id:$pid}')" >/dev/null 2>&1 || true
+    # change 3: a wake push_wake already HELD for this exact prompt must not
+    # sit held for the full grace window once the peer path has just refused
+    # it — release it now (lib/push-wake.sh release_wake_hold). No-ops when
+    # nothing was held; best-effort and never blocks the exit below (the
+    # actual delivery runs detached).
+    own_cpane="$(printf '%s' "$own_task_json" | jq -r '.conductor_pane_id // empty' 2>/dev/null)"
+    own_label="$(printf '%s' "$own_task_json" | jq -r '.label // empty' 2>/dev/null)"
+    release_wake_hold "$pane" "$current_prompt_id" "$own_run" "$own_task" \
+      "$own_cpane" "$own_label" \
+      "a peer refused this prompt ($policy_verdict): ${policy_reason:-no reason given} — a human must answer it" \
+      "$own_label" "$cmd_text" "peer refused: $policy_verdict" >/dev/null 2>&1 || true
     exit 8
   fi
 fi

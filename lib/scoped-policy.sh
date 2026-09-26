@@ -59,6 +59,57 @@ approval_command_text() {               # panel recorded
   printf '%s' "$panel"
 }
 
+# _sp_clamp_wait_seconds <raw> -> a sane HERDR_SELECT_RECORD_WAIT_S: default
+# 4, clamped to 0..15. A non-numeric value (unset, empty, garbage) falls back
+# to the default rather than erroring or silently coercing to 0, which would
+# look identical to "no wait configured" — _ag_grace_seconds (lib/alert-gate.sh)
+# is the same pattern for the same reason.
+_sp_clamp_wait_seconds() {
+  local raw="${1:-}"
+  if ! [[ "$raw" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    printf '4\n'; return 0
+  fi
+  awk -v v="$raw" 'BEGIN{ if (v < 0) v = 0; if (v > 15) v = 15; printf "%s\n", v }'
+}
+
+# wait_for_input_required_row <run_id> <task_id> <prompt_id>
+#
+# fix/peer-waits-for-record change 1: an input_required row exists the
+# INSTANT the hook (agent-hooks/omp-notify.sh -> lib/push-wake.sh push_wake)
+# writes it, but herdr-select.sh can be called before that write lands — a
+# peer answering as fast as the alert path fires, or the omp hook itself
+# racing tool_approval_requested. Live registry, 2026-09-26: event 37805
+# input_required and 37806 wake_held landed the SAME second — a
+# herdr-select.sh lookup racing between the two found nothing, judged the
+# SCRAPED panel instead of the untruncated registry command, and a
+# grant-allowable commit (message containing "push") was refused as reserved.
+#
+# Polls for the ROW'S EXISTENCE, never for a non-empty command: a
+# command-less prompt legitimately records command:"" (lib/push-wake.sh
+# change 5), and waiting on non-empty would block every one of those for the
+# full window instead of the ~0s it actually needs. Bounded by
+# HERDR_SELECT_RECORD_WAIT_S (default 4, clamped 0..15, ~0.25s steps); no row
+# ever appearing (a hand-started session, an older omp build, a non-bash
+# prompt) falls through unchanged, after the wait, to the scraped-panel
+# behaviour that predates this function.
+wait_for_input_required_row() {
+  local run_id="$1" task_id="$2" prompt_id="$3"
+  [ -n "$prompt_id" ] || return 0
+  registry_init || return 0
+  local wait_s elapsed=0 step=0.25 n
+  wait_s="$(_sp_clamp_wait_seconds "${HERDR_SELECT_RECORD_WAIT_S:-}")"
+  while :; do
+    n="$(_sql "SELECT count(*) FROM events
+          WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id")
+            AND type='input_required'
+            AND json_extract(payload,'\$.prompt_id')=$(_sq "$prompt_id");" 2>/dev/null)"
+    [ "${n:-0}" -gt 0 ] 2>/dev/null && return 0
+    awk -v e="$elapsed" -v w="$wait_s" 'BEGIN{exit !(e < w)}' || return 1
+    sleep "$step"
+    elapsed="$(awk -v e="$elapsed" -v s="$step" 'BEGIN{printf "%.4f", e+s}')"
+  done
+}
+
 code_ref_inspect() {                    # cmd wt
   PD_CODE_KIND="" PD_CODE_PATH="" PD_CODE_SHA="" PD_CODE_CONTENT_REASON=""
   local out rc snap

@@ -118,5 +118,25 @@ cat > "$SCREEN" <<'EOF'
 EOF
 human_must_answer "$PANE" && bad "a plain allow-class numbered prompt should be held" || ok "numbered Claude/Codex prompt still gated normally"
 
+printf '== change 3 (fix/peer-waits-for-record): an early release claiming the grace key stops the LATE timer from double-waking ==\n'
+# herdr-select.sh's release_wake_hold claims grace_realert_${run}_${task}_${pid}
+# via claim_once the moment a peer refuses a prompt push_wake already HELD,
+# then delivers immediately itself. The 90s grace_realert timer already
+# running for that SAME hold claims the identical key when it wakes — this
+# proves the race the other way: the early release wins the claim FIRST
+# (simulated here by claiming it directly, well inside the grace window), so
+# the late timer's own claim_once finds it already taken and never calls its
+# delivery command at all.
+menu "git status --short"
+grace_pid=$(prompt_id "$PANE")
+grace_run="runGrace"; grace_task="taskGrace"
+: > "$SENT"
+HERDR_ALERT_GRACE_S=2 grace_realert "$PANE" "$grace_pid" "$grace_run" "$grace_task" fake_alert
+claim_once "grace_realert_${grace_run}_${grace_task}_${grace_pid}" "$grace_run" "$grace_task" \
+  grace_realert_claim '{}' >/dev/null 2>&1
+sleep 4
+[ ! -s "$SENT" ] && ok "the late grace timer no-ops once the early release already claimed the key" \
+  || bad "the grace timer delivered a SECOND wake despite the early release: $(cat "$SENT")"
+
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

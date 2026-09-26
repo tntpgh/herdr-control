@@ -63,6 +63,27 @@ _wake_outcome_for() {                   # <exit-code> -> token
   esac
 }
 
+# _pw_forced_wake_argv <pane> <cpane> <run> <task> <label> <msg> <where> <full_cmd>
+#
+# Builds, into _PW_FORCED_WAKE_ARGV (a bash array), the exact re-entry into
+# push_wake with HERDR_ALERT_FORCE=1 — the command grace_realert's own 90s
+# re-check fires when a held prompt outlives its window (below). Extracted
+# so an EARLY release (release_wake_hold, after push_wake below —
+# herdr-select.sh calls it the moment a peer refuses a prompt push_wake
+# already HELD) fires the IDENTICAL command instead of a second, driftable
+# copy of it.
+_pw_forced_wake_argv() {
+  local pane="$1" cpane="$2" run="$3" task="$4" label="$5" msg="$6" where="$7" full_cmd="$8"
+  _PW_FORCED_WAKE_ARGV=(
+    env HERDR_ALERT_FORCE=1
+        HERDR_PANE_ID="$pane" HERDR_CONDUCTOR_PANE_ID="$cpane"
+        HERDR_RUN_ID="$run" HERDR_TASK_ID="$task"
+        HERDR_TASK_LABEL="$label"
+        bash -c '. "$0/lib/pane-guard.sh"; . "$0/lib/prompt-parse.sh"; . "$0/lib/run-registry.sh"; . "$0/lib/push-wake.sh"; push_wake "$1" "$2" "$3"' \
+        "$_pw_dir" "$msg" "$where" "$full_cmd"
+  )
+}
+
 # push_wake <message> [where-label] [full-command]
 #
 # full-command (project-contract-plan.md #3b, item 2) is the UNTRUNCATED
@@ -135,12 +156,45 @@ push_wake() {
     fi
   fi
 
+  # ---- change 5 (fix/peer-waits-for-record): corroborate before trusting.
+  # Live canary, 2026-09-26 20:54:33Z: a worker issued two bash tool calls in
+  # one turn; omp painted tool call A's panel first, and the hook firing for
+  # tool call B fingerprinted A's still-painted panel while recording B's
+  # (different) command under A's prompt_id — the row's stable per-prompt id
+  # (INSERT OR IGNORE, below) means the FIRST hook's write wins, so the
+  # prompt now carries a command it never showed. herdr-select.sh's own
+  # short wait for this row (lib/scoped-policy.sh wait_for_input_required_row)
+  # would then WAIT for and TRUST exactly that wrong text, so the
+  # corroboration has to happen here, before the row is ever written — same
+  # substring-of-the-panel rule herdr-select.sh and human_must_answer already
+  # enforce (lib/scoped-policy.sh approval_command_text).
+  local recorded_ok=1 cmd_hint=""
+  if [ -n "${HERDR_PANE_ID:-}" ] && [ -n "$full_cmd" ]; then
+    local panel_now
+    panel_now="$(prompt_command_text "$HERDR_PANE_ID" 2>/dev/null || printf '')"
+    approval_command_text "$panel_now" "$full_cmd" >/dev/null 2>&1 || recorded_ok=0
+  fi
+  if [ "$recorded_ok" = 0 ]; then
+    cmd_hint="$(printf '%s' "$full_cmd" | cut -c1-200)"
+    # An uncorroborated command must not reach human_must_answer below
+    # either — the gate that decides who is woken has to judge the same
+    # (absent) text this row now carries, never the mismatched one nobody's
+    # screen shows.
+    full_cmd=""
+  fi
   if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
     set_task_state "$HERDR_RUN_ID" "$HERDR_TASK_ID" "blocked" >/dev/null 2>&1 || true
-    append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
-      "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg cmd "$full_cmd" \
-         '{message:$msg, prompt_id:$prompt_id, command:$cmd}')" \
-      "${base}_input" >/dev/null 2>&1 || true
+    if [ "$recorded_ok" = 0 ]; then
+      append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
+        "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg hint "$cmd_hint" \
+           '{message:$msg, prompt_id:$prompt_id, command:"", command_uncorroborated:true, command_hint:$hint}')" \
+        "${base}_input" >/dev/null 2>&1 || true
+    else
+      append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
+        "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg cmd "$full_cmd" \
+           '{message:$msg, prompt_id:$prompt_id, command:$cmd}')" \
+        "${base}_input" >/dev/null 2>&1 || true
+    fi
   fi
   [ -n "$cpane" ] || return 1
 
@@ -215,20 +269,34 @@ push_wake() {
   # neither check, and $wake embeds agent-controlled $msg — so that was
   # agent-influenced text typed and Entered into an unvalidated pane. A delayed
   # delivery must be a delivery, not a shortcut around the delivery's guards.
-  if [ -z "${HERDR_ALERT_FORCE:-}" ] && [ -n "${HERDR_PANE_ID:-}" ] && ! human_must_answer "${HERDR_PANE_ID}" "$full_cmd"; then
+  # ---- change 4 (fix/peer-waits-for-record): the reverse race. A peer can
+  # refuse this EXACT prompt (herdr-select.sh's approval_escalated event,
+  # authority=peer) before this hook ever fires for it — human_must_answer's
+  # own live re-classification would still say "peer may take it" (it has no
+  # way to know about the refusal), which used to HOLD the wake for a prompt
+  # a human is already known to be waited for. Skip the hold once a refusal
+  # for this exact (task, prompt_id) is already on record; deliver
+  # immediately, exactly as for a human-must-answer prompt.
+  local already_refused=0
+  if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ] && [ -n "$pid" ]; then
+    local refused_n
+    refused_n="$(_sql "SELECT count(*) FROM events
+          WHERE run_id=$(_sq "${HERDR_RUN_ID}") AND task_id=$(_sq "${HERDR_TASK_ID}")
+            AND type='approval_escalated'
+            AND json_extract(payload,'\$.prompt_id')=$(_sq "$pid");" 2>/dev/null)"
+    [ "${refused_n:-0}" -gt 0 ] 2>/dev/null && already_refused=1
+  fi
+  if [ -z "${HERDR_ALERT_FORCE:-}" ] && [ "$already_refused" = 0 ] && [ -n "${HERDR_PANE_ID:-}" ] && ! human_must_answer "${HERDR_PANE_ID}" "$full_cmd"; then
     if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
       append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "wake_held" \
         "$(jq -nc --arg p "$cpane" --arg pid "$pid" --arg k "$base" \
            '{conductor_pane:$p, prompt_id:$pid, wake_key:$k, reason:"allow-class and unreserved; a peer may answer it"}')" \
         "${base}_held" >/dev/null 2>&1 || true
     fi
+    _pw_forced_wake_argv "${HERDR_PANE_ID}" "$cpane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+      "${HERDR_TASK_LABEL:-}" "$msg" "$where" "$full_cmd"
     grace_realert "${HERDR_PANE_ID}" "$pid" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-      env HERDR_ALERT_FORCE=1 \
-          HERDR_PANE_ID="${HERDR_PANE_ID}" HERDR_CONDUCTOR_PANE_ID="$cpane" \
-          HERDR_RUN_ID="${HERDR_RUN_ID:-}" HERDR_TASK_ID="${HERDR_TASK_ID:-}" \
-          HERDR_TASK_LABEL="${HERDR_TASK_LABEL:-}" \
-          bash -c '. "$0/lib/pane-guard.sh"; . "$0/lib/prompt-parse.sh"; . "$0/lib/run-registry.sh"; . "$0/lib/push-wake.sh"; push_wake "$1" "$2" "$3"' \
-          "$_pw_dir" "$msg" "$where" "$full_cmd"
+      "${_PW_FORCED_WAKE_ARGV[@]}"
     # A held wake has NOT been delivered, so it does not report success — the
     # documented contract is "0 only when delivered AND confirmed submitted"
     # (HERDR-AG-09). 2 distinguishes held from a transport failure.
@@ -275,6 +343,49 @@ push_wake() {
   printf 'push-wake: wake to %s ended %s (exit %s) — conductor may not have seen it\n' \
     "$cpane" "$outcome" "$rc" >&2
   return 1
+}
+
+# release_wake_hold <pane> <pid> <run> <task> <cpane> <label> <msg> <where> <full_cmd> <reason>
+#
+# Change 3 (fix/peer-waits-for-record): a wake_held row means push_wake
+# decided "a peer may take it" for THIS exact prompt — but the peer path can
+# disagree a moment later (herdr-select.sh --authority peer refuses it), and
+# a held wake must not then sit held for the full grace window while a human
+# is genuinely needed. Call this right after that refusal; it no-ops
+# (returns 1) when no wake_held row exists for (run, task, pid) — most
+# refusals were never held at all.
+#
+# Claims the SAME idempotency key grace_realert's own 90s re-check uses
+# (grace_realert_${run}_${task}_${pid} via claim_once) BEFORE delivering, so
+# whichever of the two fires first wins and the other silently no-ops —
+# never a duplicate wake for one held prompt.
+#
+# The claim and the wake_hold_released record are synchronous (both a
+# single fast registry write); only the actual delivery — which re-enters
+# push_wake through a fresh bash process, exactly like a delayed
+# grace_realert — runs detached, so a caller that must still exit promptly
+# (herdr-select.sh, exit 8) is never held open by it.
+release_wake_hold() {
+  local pane="$1" pid="$2" run="$3" task="$4" cpane="$5" label="$6" msg="$7" where="$8" full_cmd="$9" reason="${10:-}"
+  [ -n "$run" ] && [ -n "$task" ] && [ -n "$pid" ] || return 1
+  registry_init || return 1
+  local held
+  held="$(_sql "SELECT count(*) FROM events
+        WHERE run_id=$(_sq "$run") AND task_id=$(_sq "$task")
+          AND type='wake_held'
+          AND json_extract(payload,'\$.prompt_id')=$(_sq "$pid");" 2>/dev/null)"
+  [ "${held:-0}" -gt 0 ] 2>/dev/null || return 1
+  claim_once "grace_realert_${run}_${task}_${pid}" "$run" "$task" \
+    grace_realert_claim \
+    "$(jq -nc --arg p "$pane" --arg pid "$pid" '{pane:$p,prompt_id:$pid}')" \
+    || return 1
+  append_event "$run" "$task" "wake_hold_released" \
+    "$(jq -nc --arg pid "$pid" --arg p "$pane" --arg r "$reason" '{prompt_id:$pid, pane:$p, reason:$r}')" \
+    >/dev/null 2>&1 || true
+  _pw_forced_wake_argv "$pane" "$cpane" "$run" "$task" "$label" "$msg" "$where" "$full_cmd"
+  ( "${_PW_FORCED_WAKE_ARGV[@]}" >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  return 0
 }
 
 # ---- symptom: the conductor wake failed and nobody has noticed ------------
