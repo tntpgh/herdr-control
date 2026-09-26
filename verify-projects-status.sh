@@ -225,10 +225,23 @@ task_abandoned = {
     "closure_reason": None,
 }
 
-hub.CACHES["herdr"] = _FakeCache({"tasks": [task_tourguide, task_watchdog, task_abandoned]})
+# in review: worker gone (LOST, no closure) with real work left, BUT its
+# branch has an open PR -> in Terrence's queue, must not wake. Exercises the
+# caller's open_prs wiring, not just the pure helper (delta review of #146).
+wt_inreview = _spec_with_unfinished_item("address review comments")
+task_inreview = {
+    "task_id": "t-inreview", "state": "lost", "stored_state": "lost",
+    "pane_id": "", "label": "implement:r", "branch": "feat/r", "worktree": wt_inreview,
+    "repo": "/repo/inreview-project", "project": "", "updated_at": "2026-09-01T00:00:00Z",
+    "closure_reason": None,
+}
+
+hub.CACHES["herdr"] = _FakeCache({"tasks": [task_tourguide, task_watchdog, task_abandoned, task_inreview]})
 hub.CACHES["forms"] = _FakeCache({"open": []})
 hub._claims_by_worktree = lambda: {}
-hub._open_prs_for_repo = lambda repo: {}
+hub._open_prs_for_repo = lambda repo: (
+    {"feat/r": {"number": 1, "state": "OPEN", "headRefName": "feat/r"}}
+    if repo == "/repo/inreview-project" else {})
 hub._pane_probe = lambda pane_id: {}
 
 joined = hub.projects_data()
@@ -237,6 +250,7 @@ by_project = {p["project"]: p for p in joined["projects"]}
 results["join_tourguide_no_wake"] = by_project.get("tourguide", {}).get("needs_wake") is False
 results["join_watchdog_no_wake"] = by_project.get("watchdog-worker", {}).get("needs_wake") is False
 results["join_abandoned_wakes"] = by_project.get("scratch-project", {}).get("needs_wake") is True
+results["join_inreview_no_wake"] = by_project.get("inreview-project", {}).get("needs_wake") is False
 results["join_tourguide_next_step_none"] = by_project.get("tourguide", {}).get("next_step") is None
 
 print(json.dumps(results))
