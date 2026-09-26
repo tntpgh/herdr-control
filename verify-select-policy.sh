@@ -588,7 +588,10 @@ seed_input_required() {                 # <run> <task> <command>
 
 for grant_cmd in "git push origin $GBRANCH" "gh pr create --head $GBRANCH" \
                  "gh pr create --head $GBRANCH --base $GTRUNK" "git add -A" \
-                 "git commit -m note" "cd /wt/grant && git push origin $GBRANCH"; do
+                 "git commit -m note" "cd /wt/grant && git push origin $GBRANCH" \
+                 "git push -u origin $GBRANCH" "git push --set-upstream origin $GBRANCH" \
+                 "cd /wt/grant && git push -u origin $GBRANCH" \
+                 "cd /wt/grant && git push --set-upstream origin $GBRANCH"; do
   set_screen "$grant_cmd"; reset_keys
   seed_input_required runG taskG "$grant_cmd"
   sel 1 --authority peer; rc=$?
@@ -610,7 +613,12 @@ sel 1 --authority peer; rc=$?
 
 printf '== #3b: exact non-grant variants of the SAME verbs still refused ==\n'
 for bad_cmd in "git push origin main" "git push -f origin $GBRANCH" "git push origin HEAD:main" \
-               "git push origin $GBRANCH && git push origin main" "gh pr merge $GBRANCH"; do
+               "git push origin $GBRANCH && git push origin main" "gh pr merge $GBRANCH" \
+               "git push -u origin main" "git push --force -u origin $GBRANCH" \
+               "git push -u --force-with-lease origin $GBRANCH" "git push -u origin +$GBRANCH" \
+               "git push -u upstream $GBRANCH" \
+               "cd /somewhere/else && git push -u origin $GBRANCH" \
+               "git push -u -u origin $GBRANCH"; do
   set_screen "$bad_cmd"; reset_keys
   seed_input_required runG taskG "$bad_cmd"
   sel 1 --authority peer; rc=$?
@@ -787,6 +795,7 @@ for red_cmd in \
   "curl -q -sS -o tmp/geo/x.raw https://teamthurber.com/ --data-binary @tmp/geo/x" \
   "git push origin main" \
   "git push origin $SBRANCH" \
+  "git push -u origin $SBRANCH" \
   "gh pr create --head $SBRANCH" \
   "cat ~/.ssh/id_rsa" \
   "git commit -F ~/.ssh/id_ed25519 -m note" \
