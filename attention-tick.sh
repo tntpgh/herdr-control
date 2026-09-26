@@ -109,10 +109,21 @@ _attn_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/
 # screen reads against the same repaint. {"visible":false} when nothing
 # recognizable is pending right now (answered, or never was one).
 attention_probe() {
-  local pane="$1" pid cmd reserved verdict
+  local pane="$1" pid cmd reserved verdict opts
   if ! prompt_any_visible "$pane" >/dev/null 2>&1; then
     printf '{"visible":false}\n'
     return 0
+  fi
+  # The numbered fallback is intentionally loose for unknown agent layouts,
+  # but ordinary finished output can also end in a numbered summary. The
+  # attention controller must require the parser that can actually answer it;
+  # otherwise a dead worker becomes an active debt item.
+  if ! prompt_menu_visible "$pane" >/dev/null 2>&1; then
+    opts="$(prompt_options "$pane" 2>/dev/null || true)"
+    [ -n "$opts" ] || {
+      printf '{"visible":false}\n'
+      return 0
+    }
   fi
   pid="$(prompt_id "$pane" 2>/dev/null)"
   cmd="$(prompt_command_text "$pane" 2>/dev/null)"
