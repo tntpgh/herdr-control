@@ -1236,7 +1236,9 @@ _cp_non_shell_panel_tool() {
   local tool
   tool="${1#Allow tool: }"
   tool="${tool%%[ ;:	]*}"
-  printf '%s' "$tool" | tr '[:upper:]' '[:lower:]'
+  tool="$(printf '%s' "$tool" | tr '[:upper:]' '[:lower:]')"
+  case "$tool" in bash|shell|sh|zsh) return 1 ;; esac
+  printf '%s' "$tool"
 }
 
 _cp_safe_non_shell_panel() {

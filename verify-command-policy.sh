@@ -1298,6 +1298,8 @@ check_unreserved "script argument mentioning a push" \
   "bash probe.sh \"\$PWD\" 'git push origin feat/x'"
 check "read-only panel stays auto-answerable" \
   "Allow tool: read ; Open README.md" allow
+check "bash panel dangerous command stays deny" \
+  "Allow tool: bash ; Command: mkfs.ext4 /dev/sda1" deny
 check_not_allow "task/native panel now fails closed" \
   "Allow tool: task ; Read tmp/brief.md and explain how curl downloads a file"
 check_not_allow "eval panel now fails closed" \
