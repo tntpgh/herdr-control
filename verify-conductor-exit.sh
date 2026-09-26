@@ -103,6 +103,16 @@ grep -q 'pane close' "$CALLS" && bad "a pane was closed without a confirmed proo
 printf '%s\n' "$out" | grep -q 'close-done-workers: --reason=shipped requires.*could not confirm' \
   && ok "close-done-workers' refusal reaches the operator" || bad "refusal swallowed: $out"
 
+printf '== close-done-workers HOLDs a dirty worktree -> conductor-exit shows the HOLD line (macOS sed) ==\n'
+wt_merged=$(read_task run_t_merged t_merged | jq -r .worktree)
+touch "$wt_merged/uncommitted.txt"
+: > "$CALLS"
+out=$(bash "$here/conductor-exit.sh" --conductor=COND --apply 2>&1)
+rm -f "$wt_merged/uncommitted.txt"
+check "dirty merged task not completed" "$(state t_merged)" "running"
+printf '%s\n' "$out" | grep -q 'close-done-workers: HOLD .*uncommitted' \
+  && ok "HOLD reason reaches the operator" || bad "HOLD line swallowed: $out"
+
 printf '== --apply: only the merged task closes, as shipped with its proof ==\n'
 : > "$CALLS"
 bash "$here/conductor-exit.sh" --conductor=COND --apply >/dev/null 2>&1

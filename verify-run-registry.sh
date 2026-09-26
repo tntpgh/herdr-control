@@ -202,12 +202,18 @@ else
 fi
 # Spellings that name the open #154 (or send a browser to it) without the
 # literal `github.com/…/pull/`: each must go through the PR check, not the
-# shape check. /issues/<n> of a PR is a real GitHub redirect to /pull/<n>.
+# shape check. /issues/<n> of a PR is a real GitHub redirect to /pull/<n>;
+# browsers decode %XX, read `\` as `/`, drop TAB/LF, and IDNA-map hosts.
 for p in "https://github.com/tntpgh/herdr-control/issues/154 eb55756" \
          "https://api.github.com/repos/tntpgh/herdr-control/issues/154 eb55756" \
          "https://%67ithub.com/tntpgh/herdr-control/pull/154 eb55756" \
          "https://github.com/tntpgh/herdr-control/%70ull/154 eb55756" \
+         'https://github.com\tntpgh\herdr-control\pull\154 eb55756' \
+         "https://github.com/tntpgh/herdr-control/pu"$'\t'"ll/154 eb55756" \
+         "https://ｇithub.com/tntpgh/herdr-control/pull/154 eb55756" \
+         "https://github。com/tntpgh/herdr-control/pull/154 eb55756" \
          "$pr153/../154 f1579a6" \
+         "$pr153/%2e%2e/154 f1579a6" \
          "$pr153#"$'\n'"$pr154 f1579a6"; do
   if _valid_proof_ref "$p"; then
     bad "alias/encoded/normalising PR spelling accepted on shape alone: $p"
@@ -215,8 +221,16 @@ for p in "https://github.com/tntpgh/herdr-control/issues/154 eb55756" \
     ok "refused as a PR claim: ${p%% *}"
   fi
 done
-_valid_proof_ref "https://github.com/tntpgh/herdr-control/commit/eb55756 eb55756" \
-  && ok "a GitHub commit URL is not a PR claim (shape check, unchanged)" || bad "commit URL refused: $_PROOF_REF_WHY"
+# Not PR claims: these keep the shape check exactly as before, escapes and all.
+for p in "https://github.com/tntpgh/herdr-control/commit/eb55756 eb55756" \
+         "https://github.com/tntpgh/herdr-control/blob/main/docs/a%20b.md eb55756" \
+         "https://github.com/tntpgh/herdr-control/tree/fix%2Fshipped eb55756"; do
+  _valid_proof_ref "$p" && ok "non-PR GitHub URL keeps the shape check: ${p%% *}" \
+    || bad "non-PR GitHub URL refused: $p ($_PROOF_REF_WHY)"
+done
+_valid_proof_ref "$pr153/files/abc1234..f1579a6 f1579a6" \
+  && ok "a '..' inside a segment (PR commit-range view) is not a dot-segment" \
+  || bad "commit-range PR URL refused: $_PROOF_REF_WHY"
 GH_FAIL=1
 if _valid_proof_ref "$pr153 f1579a6"; then
   bad "gh FAILING let a shipped PR proof through"

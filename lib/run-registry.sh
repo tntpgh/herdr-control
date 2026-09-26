@@ -566,33 +566,51 @@ _gh_pr_lookup() {
 # herdr-control notepad item vi); reconcile.sh would have recorded
 # completed/shipped the moment the worker's pane went away. If gh is missing
 # or fails, the answer is "not proven" — a shipped claim is never waved
-# through because the check could not run. A proof that mentions a github.com
-# pull (or issue — GitHub redirects /issues/<n> of a PR to /pull/<n>)
-# anywhere is a PR claim and must pass as one: its first word has to parse as
-# the canonical PR URL (no fallback to the shape check, and no escaping into
-# the PROOF.md branch by also naming PROOF.md). So is a first word whose host
-# is percent-encoded, or a GitHub URL that is percent-encoded anywhere — those
-# spellings exist only to dodge the literal match. A PR URL carrying `..` or
-# control characters is refused: a browser would normalise it to another PR
-# than the one checked. Other URLs keep the shape check; PROOF.md references
-# are unchanged.
+# through because the check could not run. Other URLs keep the shape check;
+# PROOF.md references are unchanged.
+#
+# What counts as a PR claim is decided on the first word AS A BROWSER WOULD
+# NAVIGATE IT (_url_nav_form: %XX decoded, `\` read as `/`, TAB/CR/LF
+# dropped), plus the whole proof string: any mention of a github.com pull or
+# issue (GitHub redirects a PR's /issues/<n> to /pull/<n>), or a first word
+# whose host has non-ASCII bytes (full-width/IDNA look-alikes of github.com).
+# A claim cannot escape into the PROOF.md branch by also naming PROOF.md, and
+# must then be the canonical PR URL, literally: no percent-escapes or `\`
+# before any ?/#, no `..` path segment, no control characters — spellings a
+# browser would resolve to a different PR than the one checked. Legitimate
+# non-PR GitHub URLs with escapes (blob/…/a%20b.md, tree/fix%2Fx) are not
+# claims and keep the shape check.
 #
 # On refusal of a PR proof, _PROOF_REF_WHY says why (reconcile.sh and
 # close-done-workers.sh surface it); it is empty for every other refusal.
+_url_nav_form() (                       # subshell: LC_ALL=C stays in here
+  LC_ALL=C
+  local s="$1" out="" c
+  while [ -n "$s" ]; do
+    c="${s:0:1}"; s="${s:1}"
+    if [ "$c" = % ]; then
+      case "${s:0:2}" in [0-9a-fA-F][0-9a-fA-F]) c=$(printf "\\x${s:0:2}"); s="${s:2}" ;; esac
+    fi
+    case "$c" in
+      '\') c=/ ;;
+      $'\t'|$'\r'|$'\n') c="" ;;
+    esac
+    out="$out$c"
+  done
+  printf '%s' "$out" | tr '[:upper:]' '[:lower:]'
+)
 _PROOF_REF_WHY=""
 _valid_proof_ref() {
-  local proof="$1" wt="${2:-}" url rest sha lc first host pr_claim=0 pr_re slug num info state oid
+  local proof="$1" wt="${2:-}" url rest sha lc first nav host pre pr_claim=0 pr_re slug num info state oid
   _PROOF_REF_WHY=""
   [ -n "$proof" ] || return 1
-  lc=$(printf '%s' "$proof" | tr '[:upper:]' '[:lower:]')
+  lc=$(printf '%s' "$proof" | LC_ALL=C tr '[:upper:]' '[:lower:]')
   [ -n "$lc" ] || { _PROOF_REF_WHY="could not normalize proof: $proof"; return 1; }
-  case "$lc" in *github.com*/pull/*|*github.com*/pulls/*|*github.com*/issues/*) pr_claim=1 ;; esac
-  first="${lc%% *}" host=""
-  case "$first" in *://*) host="${first#*://}"; host="${host%%[/?#]*}" ;; esac
-  case "$host" in
-    *%*) pr_claim=1 ;;
-    *github.com*) case "$first" in *%*) pr_claim=1 ;; esac ;;
-  esac
+  first="${lc%% *}"
+  nav=$(_url_nav_form "$first")
+  case "$lc $nav" in *github.com*/pull/*|*github.com*/pulls/*|*github.com*/issues/*) pr_claim=1 ;; esac
+  case "$nav" in *://*) host="${nav#*://}"; host="${host%%[/?#]*}" ;; *) host="" ;; esac
+  [ -n "$(printf '%s' "$host" | LC_ALL=C tr -d '\000-\177')" ] && pr_claim=1
   if [ "$pr_claim" = 0 ]; then
     case "$proof" in
       *PROOF.md*)
@@ -608,9 +626,15 @@ _valid_proof_ref() {
   sha="${rest%% *}"
   pr_re='^https?://(www\.)?github\.com/([^/?#]+)/([^/?#]+)/pull/([0-9]+)([/?#].*)?$'
   if [ "$pr_claim" = 1 ]; then
+    pre="${first%%[?#]*}/"
+    case "$pre" in
+      *%*|*'\'*|*/../*)
+        _PROOF_REF_WHY="PR URL is not in canonical form (percent-escape, backslash or '..' segment): $url"
+        return 1 ;;
+    esac
     case "$first" in
-      *..*|*[[:cntrl:]]*)
-        _PROOF_REF_WHY="PR URL contains '..' or control characters: $url"
+      *[[:cntrl:]]*)
+        _PROOF_REF_WHY="PR URL contains control characters: $url"
         return 1 ;;
     esac
     if ! [[ "$first" =~ $pr_re ]]; then
