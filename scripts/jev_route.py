@@ -7,15 +7,22 @@ import json
 import os
 import sys
 from urllib import error, request
+from urllib.parse import unquote_plus
 import re
+import unicodedata
 
 HIGH_RISK_RE = re.compile(
-    r"\b(auth|authentication|credentials?|secrets?|tokens?|passwords?|oauth|permissions?|security|"
+    r"\b(api[ -]?key|auth|authentication|credentials?|secrets?|tokens?|passwords?|oauth|permissions?|security|"
     r"vulnerabilit(?:y|ies)|exploit|encryption|money|payments?|billing|invoices?|refunds?|charges?|"
-    r"payouts?|financial|external communications?|external comms|external email|email|publish|post public|"
-    r"production|prod|deploy|release|delete|destroy|destructive|drop|truncate|erase|wipe|migration)\b",
+    r"payouts?|financial|wire[ -]?transfer|external communications?|external comms|external email|email|"
+    r"slack|client|customer|publish|post public|production|prod|live|deploy|release|delete|remove|destroy|"
+    r"destructive|drop|truncate|erase|wipe|migration)\b",
     re.IGNORECASE,
 )
+
+def risk_text(text: str) -> str:
+    decoded = unquote_plus(text)
+    return "".join(ch for ch in decoded if unicodedata.category(ch) != "Cf")
 ENDPOINT = os.environ.get("TYPESAFE_API_URL", "https://api.typesafe.ai/v1/systemone")
 MODEL = "jev-latest"
 ROLES = {"orchestrator": "plan", "planner": "plan", "implementer": "implement", "trivial": "mechanical", "escalate": None}
@@ -111,7 +118,7 @@ def parse_response(data: dict) -> dict:
         "confidence": confidence,
         "risk_high": risk_high,
         "reason": reason,
-        "model": data.get("model") if isinstance(data.get("model"), str) else MODEL,
+        "model": MODEL,
     }
 
 
@@ -123,7 +130,7 @@ def main(argv: list[str]) -> int:
         brief = read_brief(args.brief)
         if not brief.strip():
             return fail("empty brief")
-        if HIGH_RISK_RE.search(brief):
+        if HIGH_RISK_RE.search(risk_text(brief)):
             print(json.dumps({"provider": "jev", "role": "escalate", "job_class": None,
                               "confidence": 1.0, "risk_high": True,
                               "reason": "deterministic high-risk gate requires human triage",
