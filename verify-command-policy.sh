@@ -356,6 +356,8 @@ check "local prod-named folder"       "cp -r dist dist-prod-verified"          a
 check "test name says production"     "pytest -k test_production_freshness"    allow
 check "run local live-named verifier" "bash verify-herdr-live.sh"            allow
 check "run ./ live-named verifier"    "bash ./verify-herdr-live.sh"          allow
+check "ssh verifier host still escalates" "ssh verify-herdr-live.sh uptime"     escalate
+check "psql verifier host still escalates" "psql -h verify-herdr-live.sh -d app -c 'select 1'" escalate
 check "kubectl --context production"  "kubectl --context production delete deploy api" escalate
 check "wrangler --env production"     "wrangler deploy --env production"       escalate
 check "ssh to a prod host"            "ssh prod 'systemctl restart api'"       escalate

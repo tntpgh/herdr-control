@@ -806,6 +806,15 @@ elif mode == "question":
     if len(question) == 1 and pending_running:
         question = question + pending_running
     print(" ; ".join(question), end="")
+elif mode == "command_rows":
+    if len(question) == 1 and pending_running:
+        question = question + pending_running
+    rows = question
+    for i, row in enumerate(question):
+        if row.startswith("Command:"):
+            rows = question[i:]
+            break
+    print(len([r for r in rows if r.strip()]), end="")
 elif mode == "command":
     # For CLASSIFICATION ONLY (lib/command-policy.sh via prompt_command_text
     # below), never for display or prompt_id: `" ; "` is a real shell
@@ -835,6 +844,7 @@ prompt_menu_options()  { _prompt_menu "$1" options; }
 prompt_menu_selected() { _prompt_menu "$1" selected; }
 prompt_menu_question() { _prompt_menu "$1" question; }
 prompt_menu_command()  { _prompt_menu "$1" command; }
+prompt_menu_command_rows() { _prompt_menu "$1" command_rows; }
 prompt_menu_visible()  { _prompt_menu "$1" visible; }
 
 # "Is EITHER prompt shape on screen?", from ONE pane read.

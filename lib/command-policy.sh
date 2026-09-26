@@ -1677,11 +1677,17 @@ EOF
   # Four false positives from the live approver-hardening run are pinned by
   # verify-command-policy.sh: a repo-local verifier named `verify-herdr-live.sh`
   # is not itself a production target just because "live" is in its filename.
-  # Remove that exact script token before target matching; any real target
-  # argument beside it (`--context live`, `ssh live`, `live.db.internal`, ...)
-  # remains in the string and still escalates.
+  # Neutralize that exact token only when it is the local script being invoked,
+  # not when it is a remote target (`ssh verify-herdr-live.sh`,
+  # `psql -h verify-herdr-live.sh`, ...). Any real target argument beside it
+  # (`--context live`, `ssh live`, `live.db.internal`, ...) remains in the
+  # string and still escalates.
   local _cp_prod_norm
-  _cp_prod_norm="$(printf '%s' "$norm" | sed -E 's#(^|[[:space:]/])(\./)?verify-herdr-live\.sh([[:space:]]|$)# #g')"
+  _cp_prod_norm="$norm"
+  case "$norm" in
+    verify-herdr-live.sh*|./verify-herdr-live.sh*|bash\ verify-herdr-live.sh*|bash\ ./verify-herdr-live.sh*|sh\ verify-herdr-live.sh*|sh\ ./verify-herdr-live.sh*)
+      _cp_prod_norm="$(printf '%s' "$norm" | sed -E 's#^((bash|sh)[[:space:]]+(\./)?verify-herdr-live\.sh|(\./)?verify-herdr-live\.sh)([[:space:]]|$)# #')" ;;
+  esac
   # Three gaps the security review found in the first cut of this, all closed
   # here and all of them real infrastructure commands:
   #   * `--project` and `--subscription` were missing, so `gcloud --project

@@ -347,12 +347,25 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
     esac
   fi
 fi
+menu_rows_ambiguous=0
+if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
+  menu_command_rows="$(prompt_menu_command_rows "$pane" 2>/dev/null || printf '0')"
+  case "$menu_command_rows" in
+    ''|*[!0-9]*) menu_command_rows=0 ;;
+  esac
+  [ "$menu_command_rows" -gt 1 ] && menu_rows_ambiguous=1
+fi
+
 
 policy_verdict="$(classify_command "$cmd_text")"
 policy_reason="$(classify_reason)"
 if [ "$cmd_text_is_scrape" = 1 ] && [ "$cmd_torn" = 1 ] && [ "$policy_verdict" != deny ]; then
   policy_verdict=escalate
   policy_reason="the captured command text contained invalid UTF-8 — refusing to trust a verdict computed on a possibly-redacted capture, a human must review"
+fi
+if [ "$menu_rows_ambiguous" = 1 ] && [ "$policy_verdict" != deny ]; then
+  policy_verdict=escalate
+  policy_reason="multi-row menu command was scraped without a matching registry command — refusing to guess whether rows are terminal wrap or real shell newlines"
 fi
 
 # Refusing a known Deny choice executes no requested action. Conversely, an
