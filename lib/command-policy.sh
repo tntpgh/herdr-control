@@ -1950,7 +1950,7 @@ conductor_reserved_reason() {
   # call: the two lists are derived from the same reasoning and must not drift.
   elif _cp_imatch '\b(wrangler|fly|flyctl)[[:space:]]+(deploy|publish|destroy|secrets)\b|\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(apply|delete|drain|scale|exec)\b|\bhelm[[:space:]]+(install|upgrade|delete|uninstall)\b|\bcurl\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--request[[:space:]]+(POST|PUT|PATCH|DELETE)|--data|-d[[:space:]]|(^|[[:space:]])-T([[:space:]]|=)|--upload-file|(^|[[:space:]])-F([[:space:]]|=)|--form([[:space:]]|=)|--json([[:space:]]|=))|\bgh\b.*\bapi\b.*(-X[[:space:]]*(POST|PUT|PATCH|DELETE)|--method[[:space:]=]*(POST|PUT|PATCH|DELETE)|-f[[:space:]]|-F[[:space:]]|--input\b)|\bgh\b.*\bapi\b.*/(merge|merges)\b' "$norm"; then
     printf 'remote mutation remains human-only\n'
-  elif _cp_imatch '\bherdr\b[^;&|]*(tab|pane)[^;&|]*(create|run)\b|\bspawn-agent[^;&|]*(\.sh|sh\b)' "$norm" ||
+  elif _cp_imatch '\bherdr\b.*\b(tab|pane)\b.*\b(create|run)\b|\bspawn-agent\b.*(\.sh|sh\b)' "$norm" ||
        _cp_imatch '(^|[[:space:];|&()])([^[:space:];|&()]*/)?spawn-agent\.sh\b|\bherdr[[:space:]]+tab[[:space:]]+create\b|\bherdr[[:space:]]+pane[[:space:]]+run\b' "$fleet_norm"; then
     printf 'unregistered fleet creation remains human-only\n'
   # CLOSED 2026-09-24 (Terrence's authorized loosening, then hardened

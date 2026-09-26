@@ -117,6 +117,9 @@ check_reserved "parameter-op spawn-agent human-only"     "bash ./spawn-agent\${E
 check_reserved "indirect IFS herdr tab create human-only" "S=IFS; herdr\${!S}tab\${!S}create --cwd /repo --label child"
 check_reserved "substitution herdr pane run human-only"   "herdr\$(printf ' ')pane\$(printf ' ')run pane1 --agent omp"
 check_reserved "indirect variable spawn-agent human-only" "E=EMPTY; EMPTY=; bash ./spawn-agent\${!E}.sh /repo child omp"
+check_reserved "variable alias herdr tab create human-only" "H=herdr; \$H tab create --cwd /repo --label child"
+check_reserved "function alias herdr pane run human-only" "h(){ herdr \"\$@\"; }; h pane run pane1 --agent omp"
+check_reserved "variable alias spawn-agent human-only" "s=spawn-agent; bash ./\$s.sh /repo child omp"
 check_reserved "raw herdr tab create remains human-only"   "herdr tab create --cwd /repo --label child"
 check_reserved "raw herdr pane run remains human-only"     "herdr pane run pane1 --agent omp"
 
