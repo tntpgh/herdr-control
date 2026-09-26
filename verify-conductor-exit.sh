@@ -26,9 +26,11 @@ herdr() {
 # gh pr list -R <slug> --head <branch> ... -q <jq>: answer by branch name.
 # gh pr view <n> ... -q <jq>: the same PRs by number — close-done-workers.sh
 # re-checks the proof against GitHub before recording `shipped`.
-# GH_FAIL=1 fails every call.
+# GH_FAIL=1 fails every call; GH_FAIL_VIEW=1 fails only `pr view` (the
+# re-check), after `pr list` already found the merged PR.
 gh() {
   [ "${GH_FAIL:-0}" = 1 ] && { echo "gh: stub failure" >&2; return 1; }
+  [ "${GH_FAIL_VIEW:-0}" = 1 ] && [ "$1 $2" = "pr view" ] && { echo "gh: stub failure" >&2; return 1; }
   local br="" q="" prev="" num=""
   [ "$1 $2" = "pr view" ] && num="$3"
   for a in "$@"; do
@@ -92,6 +94,14 @@ printf '== gh failing -> every task HELD (lookup failed), nothing shipped ==\n'
 out=$(GH_FAIL=1 bash "$here/conductor-exit.sh" --conductor=COND 2>&1)
 printf '%s\n' "$out" | grep -q 'HOLD .*merged-work.*gh lookup failed' && ok "merged-branch task held when gh fails" || bad "not held: $out"
 check "summary with gh failing" "$(GH_FAIL=1 bash "$here/conductor-exit.sh" --conductor=COND --summary)" "0 3"
+
+printf '== re-check fails inside close-done-workers -> not closed, and conductor-exit SAYS why ==\n'
+: > "$CALLS"
+out=$(GH_FAIL_VIEW=1 bash "$here/conductor-exit.sh" --conductor=COND --apply 2>&1)
+check "merged task NOT completed when the re-check cannot run" "$(state t_merged)" "running"
+grep -q 'pane close' "$CALLS" && bad "a pane was closed without a confirmed proof" || ok "nothing closed"
+printf '%s\n' "$out" | grep -q 'close-done-workers: --reason=shipped requires.*could not confirm' \
+  && ok "close-done-workers' refusal reaches the operator" || bad "refusal swallowed: $out"
 
 printf '== --apply: only the merged task closes, as shipped with its proof ==\n'
 : > "$CALLS"

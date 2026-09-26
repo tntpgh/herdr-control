@@ -83,7 +83,7 @@ while IFS='|' read -r task_id pane cpane wt label; do
   printf '  ship   %-8s %-44s %s\n' "$pane" "$label" "$proof"
   [ "$apply" = 1 ] || continue
   bash "$HERE/close-done-workers.sh" --apply --reason=shipped --task="$task_id" --proof="$proof" 2>&1 \
-    | sed -n 's/^ *\(HOLD\|REFUSED\)/    close-done-workers: \1/p; /^closed /s/^/    /p'
+    | sed -n 's/^ *\(HOLD\|REFUSED\)/    close-done-workers: \1/p; /^closed /s/^/    /p; /^close-done-workers: /s/^/    /p'
 done < <(_sql "SELECT task_id || '|' || pane_id || '|' || conductor_pane_id || '|' || worktree || '|' || label
                FROM tasks WHERE state IN ('running','blocked','starting') AND $scope ORDER BY updated_at;")
 

@@ -567,21 +567,32 @@ _gh_pr_lookup() {
 # completed/shipped the moment the worker's pane went away. If gh is missing
 # or fails, the answer is "not proven" — a shipped claim is never waved
 # through because the check could not run. A proof that mentions a github.com
-# pull anywhere is a PR claim and must pass as one: its first token has to
-# parse as the PR URL (no fallback to the shape check, and no escaping into
-# the PROOF.md branch by also naming PROOF.md). Other URLs keep the shape
-# check; PROOF.md references are unchanged.
+# pull (or issue — GitHub redirects /issues/<n> of a PR to /pull/<n>)
+# anywhere is a PR claim and must pass as one: its first word has to parse as
+# the canonical PR URL (no fallback to the shape check, and no escaping into
+# the PROOF.md branch by also naming PROOF.md). So is a first word whose host
+# is percent-encoded, or a GitHub URL that is percent-encoded anywhere — those
+# spellings exist only to dodge the literal match. A PR URL carrying `..` or
+# control characters is refused: a browser would normalise it to another PR
+# than the one checked. Other URLs keep the shape check; PROOF.md references
+# are unchanged.
 #
 # On refusal of a PR proof, _PROOF_REF_WHY says why (reconcile.sh and
 # close-done-workers.sh surface it); it is empty for every other refusal.
 _PROOF_REF_WHY=""
 _valid_proof_ref() {
-  local proof="$1" wt="${2:-}" url rest sha lc pr_claim=0 pr_re slug num info state oid
+  local proof="$1" wt="${2:-}" url rest sha lc first host pr_claim=0 pr_re slug num info state oid
   _PROOF_REF_WHY=""
   [ -n "$proof" ] || return 1
   lc=$(printf '%s' "$proof" | tr '[:upper:]' '[:lower:]')
   [ -n "$lc" ] || { _PROOF_REF_WHY="could not normalize proof: $proof"; return 1; }
-  case "$lc" in *github.com*/pull/*|*github.com*/pulls/*) pr_claim=1 ;; esac
+  case "$lc" in *github.com*/pull/*|*github.com*/pulls/*|*github.com*/issues/*) pr_claim=1 ;; esac
+  first="${lc%% *}" host=""
+  case "$first" in *://*) host="${first#*://}"; host="${host%%[/?#]*}" ;; esac
+  case "$host" in
+    *%*) pr_claim=1 ;;
+    *github.com*) case "$first" in *%*) pr_claim=1 ;; esac ;;
+  esac
   if [ "$pr_claim" = 0 ]; then
     case "$proof" in
       *PROOF.md*)
@@ -596,9 +607,16 @@ _valid_proof_ref() {
   rest="${proof#* }"
   sha="${rest%% *}"
   pr_re='^https?://(www\.)?github\.com/([^/?#]+)/([^/?#]+)/pull/([0-9]+)([/?#].*)?$'
-  if [ "$pr_claim" = 1 ] && ! [[ "${lc%% *}" =~ $pr_re ]]; then
-    _PROOF_REF_WHY="unrecognized GitHub PR URL (must be the first word): $url"
-    return 1
+  if [ "$pr_claim" = 1 ]; then
+    case "$first" in
+      *..*|*[[:cntrl:]]*)
+        _PROOF_REF_WHY="PR URL contains '..' or control characters: $url"
+        return 1 ;;
+    esac
+    if ! [[ "$first" =~ $pr_re ]]; then
+      _PROOF_REF_WHY="unrecognized GitHub PR URL (must be the first word): $url"
+      return 1
+    fi
   fi
   case "$url" in *'://'*) ;; *) return 1 ;; esac
   case "$sha" in *[!0-9a-fA-F]*|'') return 1 ;; esac

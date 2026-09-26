@@ -200,6 +200,23 @@ if _valid_proof_ref "https://github.com/tntpgh/herdr-control/pull/x154 eb55756";
 else
   ok "a github pull URL that does not parse is refused, not shape-checked"
 fi
+# Spellings that name the open #154 (or send a browser to it) without the
+# literal `github.com/…/pull/`: each must go through the PR check, not the
+# shape check. /issues/<n> of a PR is a real GitHub redirect to /pull/<n>.
+for p in "https://github.com/tntpgh/herdr-control/issues/154 eb55756" \
+         "https://api.github.com/repos/tntpgh/herdr-control/issues/154 eb55756" \
+         "https://%67ithub.com/tntpgh/herdr-control/pull/154 eb55756" \
+         "https://github.com/tntpgh/herdr-control/%70ull/154 eb55756" \
+         "$pr153/../154 f1579a6" \
+         "$pr153#"$'\n'"$pr154 f1579a6"; do
+  if _valid_proof_ref "$p"; then
+    bad "alias/encoded/normalising PR spelling accepted on shape alone: $p"
+  else
+    ok "refused as a PR claim: ${p%% *}"
+  fi
+done
+_valid_proof_ref "https://github.com/tntpgh/herdr-control/commit/eb55756 eb55756" \
+  && ok "a GitHub commit URL is not a PR claim (shape check, unchanged)" || bad "commit URL refused: $_PROOF_REF_WHY"
 GH_FAIL=1
 if _valid_proof_ref "$pr153 f1579a6"; then
   bad "gh FAILING let a shipped PR proof through"
