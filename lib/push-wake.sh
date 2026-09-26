@@ -382,8 +382,26 @@ release_wake_hold() {
   append_event "$run" "$task" "wake_hold_released" \
     "$(jq -nc --arg pid "$pid" --arg p "$pane" --arg r "$reason" '{prompt_id:$pid, pane:$p, reason:$r}')" \
     >/dev/null 2>&1 || true
+  # MEDIUM-1 (PR #158 review): the held Slack alert (agent-hooks/omp-notify.sh
+  # / claude-notify.sh) claims this SAME idempotency key too — see their own
+  # grace_realert call sites, both `grace_realert_${run}_${task}_${pid}`. So
+  # winning the claim above (needed to stop the conductor-wake timer from
+  # double-waking) ALSO silences whichever Slack alert was still pending for
+  # this prompt, unless this function sends it itself. Same resolution order
+  # as _pw_wake_fail_realert below; herdr-notify.sh's own alert_claim (pane,
+  # key, TTL) still dedupes against a copy that already posted through the
+  # normal (unheld) path, so calling it here is never a double post.
   _pw_forced_wake_argv "$pane" "$cpane" "$run" "$task" "$label" "$msg" "$where" "$full_cmd"
-  ( "${_PW_FORCED_WAKE_ARGV[@]}" >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+  (
+    "${_PW_FORCED_WAKE_ARGV[@]}" >/dev/null 2>&1
+    local notify
+    for notify in "${HERDR_NOTIFY:-}" "$_pw_dir/slack-bridge/herdr-notify.sh" \
+                  "$HOME/.claude/skills/herdr-ops/scripts/slack-bridge/herdr-notify.sh"; do
+      [ -n "$notify" ] && [ -f "$notify" ] && break
+    done
+    [ -n "${notify:-}" ] && [ -f "$notify" ] && \
+      bash "$notify" --choices --pane "$pane" "$msg" >/dev/null 2>&1
+  ) </dev/null >/dev/null 2>&1 &
   disown 2>/dev/null || true
   return 0
 }

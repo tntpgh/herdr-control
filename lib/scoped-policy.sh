@@ -48,15 +48,65 @@ _sp_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 _sp_collapse_ws() { printf '%s' "$1" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'; }
 
-approval_command_text() {               # panel recorded
-  local panel="$1" recorded="$2" pc rc
-  if [ -z "$recorded" ]; then printf '%s' "$panel"; return 0; fi
-  pc="$(_sp_collapse_ws "$panel")"; rc="$(_sp_collapse_ws "$recorded")"
-  case "$pc" in
-    *"$rc"*) printf '%s' "$recorded"; return 0 ;;
+# _sp_command_region <panel> -> the text after the omp "Command:"/"run:"
+# label, or empty when the panel carries no such label.
+#
+# prompt_menu_command (lib/prompt-parse.sh _prompt_menu_parse, mode=command)
+# always emits "Allow tool: <tool> " followed by the body rows space-joined,
+# one of which is the literal "Command: <cmd>" (or "run: <cmd>", omp's other
+# shape — verify-omp-hooks.sh's own omp_menu_screen fixture uses it) row. The
+# Claude/Codex numbered fallback (prompt_command_text's OTHER branch, the
+# whole visible window) carries neither: those hooks never pass a recorded
+# command at all (claude-notify.sh calls push_wake with no third argument),
+# so a label-less panel has nothing structurally sound to anchor a recorded
+# command against.
+_sp_command_region() {
+  local panel="$1" rest
+  case "$panel" in
+    "Allow tool: "*) rest="${panel#Allow tool: }"; rest="${rest#* }" ;;
+    *) rest="$panel" ;;
   esac
-  if [ -n "${panel//[[:space:]]/}" ]; then return 2; fi
-  printf '%s' "$panel"
+  case "$rest" in
+    "Command:"*) printf '%s' "${rest#Command:}"; return 0 ;;
+    "run:"*)     printf '%s' "${rest#run:}"; return 0 ;;
+  esac
+  printf ''
+}
+
+# approval_command_text <panel> <recorded>
+#
+# PR #158 independent review, HIGH: the previous rule treated `recorded` as
+# corroborated whenever its collapsed text occurred ANYWHERE in the collapsed
+# panel — a plain substring match. Reproduced live: panel shows
+# `gh api -X PUT repos/o/r/pulls/7/merge`, a hook race records `ls` for the
+# SAME prompt_id (change 5's own failure mode before its fix, or any other
+# mis-keyed row) — "ls" IS a substring of "...pulls..." — and the wrongly
+# "corroborated" `ls` verdict got PRESSED as Approve on the unjudged merge.
+#
+# Anchored now: a non-empty `recorded` corroborates ONLY when its
+# whitespace-collapsed text EQUALS the whitespace-collapsed COMMAND REGION
+# (_sp_command_region — everything after Command:/run:, header stripped),
+# never a substring of the whole panel. A panel with no recognizable label
+# refuses a non-empty recorded command outright (return 2) rather than
+# falling back to a substring test against unstructured text — see
+# _sp_command_region's own comment for why that is safe (only omp ever pairs
+# a panel with a recorded command, and every omp panel carries one of these
+# labels). A wrapped command reflows correctly: prompt_menu_command already
+# space-joins wrapped rows before this ever runs, so the region for a
+# multi-row command is the SAME reconstructed string either way.
+approval_command_text() {               # panel recorded
+  local panel="$1" recorded="$2" region pc rc
+  if [ -z "$recorded" ]; then printf '%s' "$panel"; return 0; fi
+  region="$(_sp_command_region "$panel")"
+  if [ -z "$region" ]; then
+    if [ -n "${panel//[[:space:]]/}" ]; then return 2; fi
+    printf '%s' "$panel"; return 0
+  fi
+  pc="$(_sp_collapse_ws "$region")"; rc="$(_sp_collapse_ws "$recorded")"
+  if [ "$pc" = "$rc" ]; then
+    printf '%s' "$recorded"; return 0
+  fi
+  return 2
 }
 
 # _sp_clamp_wait_seconds <raw> -> a sane HERDR_SELECT_RECORD_WAIT_S: default

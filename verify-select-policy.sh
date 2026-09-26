@@ -592,7 +592,7 @@ for grant_cmd in "git push origin $GBRANCH" "gh pr create --head $GBRANCH" \
                  "git push -u origin $GBRANCH" "git push --set-upstream origin $GBRANCH" \
                  "cd /wt/grant && git push -u origin $GBRANCH" \
                  "cd /wt/grant && git push --set-upstream origin $GBRANCH"; do
-  set_screen "$grant_cmd"; reset_keys
+  set_menu "$grant_cmd"; reset_keys
   seed_input_required runG taskG "$grant_cmd"
   sel 1 --authority peer; rc=$?
   [ "$rc" -eq 0 ] && ok "grant allows: $grant_cmd" || bad "grant refused: $grant_cmd (rc=$rc); stderr: $(cat "$WORK/err.txt")"
@@ -605,7 +605,7 @@ done
 # them. Without the grant this is reserved and refused; the grant never
 # consults that list for add/commit at all.
 GITMSG='harden herdr-select.sh escalation path'
-set_screen "git commit -m \"$GITMSG\""; reset_keys
+set_menu "git commit -m \"$GITMSG\""; reset_keys
 seed_input_required runG taskG "git commit -m \"$GITMSG\""
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "commit message mentioning herdr-select.sh no longer reserved under the grant" \
@@ -635,7 +635,7 @@ printf '== #3b item 2: a wrapped display reflows into a false escalation; the re
 # engages either — this is item 2 working on its own. Reuses taskG (still
 # `running`, and the pane's most-recently-touched task by now).
 WRAP_CMD="cat -n ./report.md"
-set_screen "$(printf 'cat -n\n./report.md')"; reset_keys
+set_menu "$(printf 'cat -n\n./report.md')"; reset_keys
 seed_input_required runG taskG "$WRAP_CMD"
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "wrapped allow-class command classified via the untruncated registry text" \
@@ -938,18 +938,36 @@ set_task_state runS taskS completed no-follow-on >/dev/null 2>&1
 printf '== fix/peer-waits-for-record ==\n'
 now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 
+RBRANCH="fix/race-wait"; RTRUNK="main"
+register_task runR taskR wR cR "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/record-wait "impl:race" "$RBRANCH" "$RTRUNK" >/dev/null 2>&1
+set_task_state runR taskR running >/dev/null 2>&1
+
+# LOW-1 (PR #158 review): elapsed_ms >= 700 passed on main too, because ONE
+# herdr-select call already costs about 1.1s of subprocess overhead on this
+# machine. Measure that overhead directly — HERDR_SELECT_RECORD_WAIT_S=0, a
+# real call with the row already present, nothing to wait for — and assert
+# every timing case RELATIVE to it, so removing the wait can actually fail
+# these.
+BASELINE_TEXT="pwd"
+set_menu "$BASELINE_TEXT"; reset_keys
+seed_input_required runR taskR "$BASELINE_TEXT"
+t0=$(now_ms)
+HERDR_SELECT_RECORD_WAIT_S=0 sel 1 --authority peer; baseline_rc=$?
+t1=$(now_ms)
+baseline_ms=$((t1 - t0))
+[ "$baseline_rc" -eq 0 ] && ok "baseline call succeeds (row already present, nothing to wait for)" \
+  || bad "baseline call failed: rc=$baseline_rc"
+
 printf '== change 1: registry command missing at call time is worth a short wait ==\n'
 # Live registry, 2026-09-26 (SPEC.md): event 37805 input_required and 37806
 # wake_held landed the SAME second — a herdr-select.sh lookup racing between
 # the two found nothing and judged the raw panel, so a grant-allowable commit
-# (message containing "push") was refused as reserved. The observable here is
-# the SAME #3b grant machinery above: only the delayed REGISTRY text, never
-# the raw panel, can ever classify this as `grant`.
-RBRANCH="fix/race-wait"; RTRUNK="main"
-register_task runR taskR wR cR "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/record-wait "impl:race" "$RBRANCH" "$RTRUNK" >/dev/null 2>&1
+# (message containing "push") was refused as reserved. set_menu, not
+# set_screen: the anchored corroboration fix (PR #158 review, HIGH) only ever
+# trusts a recorded command against an omp Command:/run: label.
 set_task_state runR taskR running >/dev/null 2>&1
 RACE_MSG='git commit -m "docs(policy): grant header comment matches -u/--set-upstream push shape"'
-set_screen "$RACE_MSG"; reset_keys
+set_menu "$RACE_MSG"; reset_keys
 ( sleep 1; seed_input_required runR taskR "$RACE_MSG" ) &
 bg_pid=$!
 t0=$(now_ms)
@@ -961,10 +979,37 @@ elapsed_ms=$((t1 - t0))
   || bad "race not resolved: rc=$rc; stderr: $(cat "$WORK/err.txt")"
 [ "$(q_appr authority)" = "grant" ] && ok "authority recorded grant (registry text used, not the panel's 'push' word)" \
   || bad "authority=$(q_appr authority) — the ownership grant did not engage"
-[ "$elapsed_ms" -ge 700 ] && ok "actually waited for the delayed row (${elapsed_ms}ms)" \
-  || bad "returned too fast to have waited for the row: ${elapsed_ms}ms"
+[ "$elapsed_ms" -ge "$((baseline_ms + 700))" ] && ok "actually waited for the delayed row (${elapsed_ms}ms, baseline ${baseline_ms}ms)" \
+  || bad "returned too fast to have waited for the row: ${elapsed_ms}ms (baseline ${baseline_ms}ms)"
+
+printf '== HIGH (PR #158 review): a SHORT recorded command must not corroborate as a substring of unrelated panel text ==\n'
+# The exact reproduction: panel shows a merge, a hook race records "ls" for
+# the SAME prompt_id after the wait — "ls" IS a substring of "...pulls..." —
+# the old substring rule corroborated it and pressed Approve on the unjudged
+# merge; the anchored rule requires EQUALITY against the command region.
+set_task_state runR taskR running >/dev/null 2>&1
+PULLS_CMD="gh api -X PUT repos/o/r/pulls/7/merge"
+set_menu "$PULLS_CMD"; reset_keys
+( sleep 1; seed_input_required runR taskR "ls" ) &
+bg_pid=$!
+sel 1 --authority peer; rc=$?
+wait "$bg_pid" 2>/dev/null
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "'ls' inside '...pulls...' does not corroborate; Approve refused, no key pressed" \
+  || bad "SUBSTRING FALSE POSITIVE: rc=$rc keys=$(keys_pressed) — 'ls' wrongly corroborated the merge"
+
+printf '== HIGH: a recorded command that is a PREFIX of the panel text must not corroborate either ==\n'
+set_task_state runR taskR running >/dev/null 2>&1
+COMPOUND_CMD="git status && gh pr merge 99 --squash"
+set_menu "$COMPOUND_CMD"; reset_keys
+seed_input_required runR taskR "git status"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "recorded 'git status' does not equal the full compound command; refused, no key pressed" \
+  || bad "PREFIX FALSE POSITIVE: rc=$rc keys=$(keys_pressed)"
 
 printf '== change 1: a command-less registry row (command:"") never waits ==\n'
+set_task_state runR taskR running >/dev/null 2>&1
 seed_input_required_empty() {           # <run> <task>
   append_event "$1" "$2" input_required \
     "$(jq -nc --arg msg "omp needs permission" --arg pid "$(prompt_id "$PANE")" \
@@ -978,8 +1023,8 @@ sel 1 --authority peer; rc=$?
 t1=$(now_ms)
 elapsed_ms=$((t1 - t0))
 [ "$rc" -eq 0 ] && ok "a command-less row still answers from the panel" || bad "rc=$rc"
-[ "$elapsed_ms" -lt 2000 ] && ok "returned in ${elapsed_ms}ms — an EXISTING row (even command:\"\") never waits" \
-  || bad "took ${elapsed_ms}ms — waited despite an existing row"
+[ "$elapsed_ms" -lt "$((baseline_ms + 400))" ] && ok "returned in ${elapsed_ms}ms — an EXISTING row (even command:\"\") never waits (baseline ${baseline_ms}ms)" \
+  || bad "took ${elapsed_ms}ms — waited despite an existing row (baseline ${baseline_ms}ms)"
 
 printf '== change 1: no registry row ever appears -> bounded wait, then the scraped panel ==\n'
 FALLBACK_TEXT="git log --oneline -3"
@@ -990,12 +1035,12 @@ t1=$(now_ms)
 elapsed_ms=$((t1 - t0))
 [ "$rc" -eq 0 ] && ok "falls back to the scraped panel text when no row ever appears" \
   || bad "rc=$rc; stderr: $(cat "$WORK/err.txt")"
-[ "$elapsed_ms" -ge 700 ] && ok "waited out the full bounded window before falling back (${elapsed_ms}ms)" \
-  || bad "returned before the window elapsed: ${elapsed_ms}ms"
+[ "$elapsed_ms" -ge "$((baseline_ms + 700))" ] && ok "waited out the full bounded window before falling back (${elapsed_ms}ms, baseline ${baseline_ms}ms)" \
+  || bad "returned before the window elapsed: ${elapsed_ms}ms (baseline ${baseline_ms}ms)"
 
 printf '== change 2: a peer refusal records the TASKs own_run/own_task and the prompt_id ==\n'
 REFUSE_TEXT="gh pr merge 99 --squash"
-set_screen "$REFUSE_TEXT"; reset_keys
+set_menu "$REFUSE_TEXT"; reset_keys
 seed_input_required runR taskR "$REFUSE_TEXT"
 expect_pid="$(prompt_id "$PANE")"
 sel 1 --authority peer; rc=$?
@@ -1006,17 +1051,26 @@ esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   && ok "approval_escalated carries run_id=runR task_id=taskR prompt_id=$expect_pid, not the empty HERDR_RUN_ID/HERDR_TASK_ID" \
   || bad "approval_escalated row mismatch: got '$esc_row', want 'runR|taskR|$expect_pid'"
 
-printf '== change 3: a wake HELD before the refusal is released at refusal time, once ==\n'
+printf '== change 3 + MEDIUM-1: a wake HELD before the refusal is released at refusal time, once, with its Slack alert ==\n'
 HOLD_TEXT="git push origin main"
-set_screen "$HOLD_TEXT"; reset_keys
+set_menu "$HOLD_TEXT"; reset_keys
 seed_input_required runR taskR "$HOLD_TEXT"
 hold_pid="$(prompt_id "$PANE")"
 append_event runR taskR wake_held \
   "$(jq -nc --arg p w9:p9 --arg pid "$hold_pid" --arg k "wake_runR_taskR_${hold_pid}" \
      '{conductor_pane:$p, prompt_id:$pid, wake_key:$k, reason:"allow-class and unreserved; a peer may answer it"}')" >/dev/null 2>&1
+NOTIFY_STUB="$WORK/notify-stub.sh"; NOTIFY_LOG="$WORK/notify.log"
+cat > "$NOTIFY_STUB" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$NOTIFY_LOG"
+exit 0
+EOS
+chmod +x "$NOTIFY_STUB"
+export NOTIFY_LOG
+: > "$NOTIFY_LOG"
 before_released=$(count_events wake_hold_released)
 before_attempted=$(count_events wake_attempted)
-sel 1 --authority peer; rc=$?
+( export HERDR_NOTIFY="$NOTIFY_STUB"; sel 1 --authority peer ); rc=$?
 [ "$rc" -eq 8 ] && ok "the reserved push to main is still refused" || bad "rc=$rc (expected 8)"
 released=0
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -1044,6 +1098,70 @@ claimed="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   "SELECT count(*) FROM events WHERE type='grace_realert_claim' AND event_id='grace_realert_runR_taskR_${hold_pid}';")"
 [ "${claimed:-0}" -ge 1 ] && ok "claimed the SAME idempotency key grace_realert's own 90s re-check would use" \
   || bad "the grace_realert_* claim was never taken"
+notify_calls=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -s "$NOTIFY_LOG" ] && { notify_calls=$(wc -l < "$NOTIFY_LOG" | tr -d ' '); break; }
+  sleep 0.2
+done
+[ "$notify_calls" = "1" ] && ok "MEDIUM-1: the held Slack alert was sent exactly once on release" \
+  || bad "MEDIUM-1: notify calls on release: $notify_calls (want exactly 1)"
+grep -q -- "--choices --pane $PANE" "$NOTIFY_LOG" \
+  && ok "the Slack call names the right pane with --choices" || bad "notify call malformed: $(cat "$NOTIFY_LOG")"
+
+printf '== MEDIUM-2: a mid-token-wrap refusal ALSO releases a held wake (not just peer_decide) ==\n'
+set_task_state runR taskR running >/dev/null 2>&1
+MW_CMD="ls -la /Users/thurbs/.herdr/worktrees/tntpgh/herdr-control/.handoffs"
+set_rows 'ls -la /Users/thurbs/.herdr/worktrees/tntpgh/h' 'erdr-control/.handoffs'; reset_keys
+seed_input_required runR taskR "$MW_CMD"
+mw_pid="$(prompt_id "$PANE")"
+append_event runR taskR wake_held \
+  "$(jq -nc --arg p w9:p9 --arg pid "$mw_pid" --arg k "wake_runR_taskR_${mw_pid}" \
+     '{conductor_pane:$p, prompt_id:$pid, wake_key:$k, reason:"allow-class and unreserved; a peer may answer it"}')" >/dev/null 2>&1
+before_released=$(count_events wake_hold_released)
+before_attempted=$(count_events wake_attempted)
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "mid-token wrap: refused, no key pressed" \
+  || bad "mid-token wrap: rc=$rc keys=$(keys_pressed)"
+esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT run_id||'|'||task_id||'|'||json_extract(payload,'\$.prompt_id') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
+[ "$esc_row" = "runR|taskR|$mw_pid" ] \
+  && ok "mid-token wrap: approval_escalated carries run_id/task_id/prompt_id (not empty)" \
+  || bad "mid-token wrap: escalation identity: $esc_row"
+released=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(count_events wake_hold_released)" -gt "$before_released" ] && { released=1; break; }
+  sleep 0.2
+done
+[ "$released" = 1 ] && ok "mid-token wrap: held wake released" || bad "mid-token wrap: no wake_hold_released"
+attempted=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(count_events wake_attempted)" -gt "$before_attempted" ] && { attempted=1; break; }
+  sleep 0.2
+done
+[ "$attempted" = 1 ] && ok "mid-token wrap: forced wake_attempted fired" || bad "mid-token wrap: no forced wake_attempted"
+
+printf '== MEDIUM-2: torn-capture and ambiguous-menu-rows refusals also record run_id/task_id/prompt_id ==\n'
+set_task_state runR taskR running >/dev/null 2>&1
+set_menu_torn "curl https://example.com/report -o /tmp/report.json"; reset_keys
+tp_pid="$(prompt_id "$PANE")"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "torn capture: still refused" || bad "torn capture: rc=$rc"
+esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT run_id||'|'||task_id||'|'||json_extract(payload,'\$.prompt_id') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
+[ "$esc_row" = "runR|taskR|$tp_pid" ] \
+  && ok "torn capture: approval_escalated carries run_id/task_id/prompt_id" \
+  || bad "torn capture: escalation identity: $esc_row"
+
+set_task_state runR taskR running >/dev/null 2>&1
+set_rows 'echo hi' 'bash /tmp/notes.md'; reset_keys
+mra_pid="$(prompt_id "$PANE")"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "ambiguous menu rows: still refused" || bad "ambiguous menu rows: rc=$rc"
+esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT run_id||'|'||task_id||'|'||json_extract(payload,'\$.prompt_id') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
+[ "$esc_row" = "runR|taskR|$mra_pid" ] \
+  && ok "ambiguous menu rows: approval_escalated carries run_id/task_id/prompt_id" \
+  || bad "ambiguous menu rows: escalation identity: $esc_row"
 
 set_task_state runR taskR completed no-follow-on >/dev/null 2>&1
 

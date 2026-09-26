@@ -619,6 +619,29 @@ printf '%s' "$payload" | jq -r '.command_hint' | grep -q 'rm -rf /tmp/nowhere-ne
 claim_once "grace_realert_run1_task1_$(prompt_id "$WPANE")" run1 task1 grace_realert_claim '{}' >/dev/null 2>&1
 set_task_state run1 task1 running >/dev/null 2>&1
 
+printf '== HIGH (PR #158 review): a recorded command that is a SUBSTRING of the panel text must not corroborate ==\n'
+# The exact HIGH exploit shape: the old rule accepted `recorded` whenever its
+# collapsed text occurred ANYWHERE in the collapsed panel. "ls" is a literal
+# substring of "pulls" here — the old rule would have corroborated it and let
+# it through as the judged command; the anchored rule requires equality
+# against the command region and refuses.
+omp_menu_screen "gh api -X PUT repos/o/r/pulls/7/merge" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+: > "$SENT"
+run_notify_cmd bash "ls"
+payload="$(q_payload input_required)"
+printf '%s' "$payload" | jq -e '.command == ""' >/dev/null 2>&1 \
+  && ok "'ls' (a substring of '...pulls...') is never written as the recorded command" \
+  || bad "substring false positive: $payload"
+printf '%s' "$payload" | jq -e '.command_uncorroborated == true' >/dev/null 2>&1 \
+  && ok "flagged command_uncorroborated" \
+  || bad "no command_uncorroborated flag: $payload"
+# The panel's OWN command (a PUT merge) is human-reserved -> must still be
+# HELD/gated the same as any other human-class prompt, never delivered on
+# the strength of the allow-class "ls" that almost slipped through.
+claim_once "grace_realert_run1_task1_$(prompt_id "$WPANE")" run1 task1 grace_realert_claim '{}' >/dev/null 2>&1
+set_task_state run1 task1 running >/dev/null 2>&1
+
 printf '== conductorless worker still persists its verified input request ==\n'
 set_task_state run1 task1 running >/dev/null 2>&1
 CPANE=""
