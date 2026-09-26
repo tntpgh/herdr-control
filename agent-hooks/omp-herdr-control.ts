@@ -111,11 +111,12 @@ const hubAvailable = safeExists(HUB_PY);
 // surface as an unhandled rejection well after this function already
 // returned: a delayed, hard-to-attribute crash of exactly the kind the
 // fail-closed tool_call contract (see header) exists to prevent.
-function spawnDetached(args: string[], stdinInput?: string): void {
+function spawnDetached(args: string[], stdinInput?: string, env?: Record<string, string | undefined>): void {
   try {
     const child = spawn("bash", args, {
       detached: true,
       stdio: [stdinInput === undefined ? "ignore" : "pipe", "ignore", "ignore"],
+      ...(env ? { env } : {}),
     });
     child.on("error", () => {});
     if (stdinInput !== undefined && child.stdin) {
@@ -845,7 +846,50 @@ function cacheBashInput(event: unknown): void {
 
 function onToolCall(event: unknown, ctx?: unknown): Block | undefined {
   cacheBashInput(event);
-  return pretoolRegistrationBlock(event) ?? workerWriteScopeBlock(event, ctx);
+  const result = pretoolRegistrationBlock(event) ?? workerWriteScopeBlock(event, ctx);
+  recordShadowVerdict(event, ctx, result);
+  return result;
+}
+
+// SHADOW MODE (docs/design/pretool-approval.md): for a registered worker only,
+// hand the exact tool input to lib/pretool-shadow.sh, which computes the
+// hook-time verdict with the same policy the approval menu path uses and
+// appends it to the registry as a `pretool_verdict` event. Detached and
+// fire-and-forget: it never blocks, never changes `result` above (the guards'
+// return value is passed in only so a guard block is logged as the verdict),
+// and never touches the approval menu / herdr-select path. Identity is the
+// module-load snapshot (WORKER_TASK_ID/RUN_ID, WORKER_PANE_ID), never a later
+// process.env. A non-worker session returns before doing anything.
+const PRETOOL_SHADOW_SH = path.join(ROOT, "lib", "pretool-shadow.sh");
+const WORKER_PANE_ID = process.env.HERDR_PANE_ID?.trim() ?? "";
+
+function recordShadowVerdict(event: unknown, ctx: unknown, result: Block | undefined): void {
+  if (!WORKER_TASK_ID) return;
+  try {
+    if (!safeExists(PRETOOL_SHADOW_SH)) return;
+    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    const c = ctx && typeof ctx === "object" ? (ctx as Record<string, unknown>).cwd : undefined;
+    const payload = JSON.stringify({
+      tool: typeof e.toolName === "string" ? e.toolName : "",
+      call_id: typeof e.toolCallId === "string" ? e.toolCallId : "",
+      input: e.input ?? {},
+      cwd: typeof c === "string" ? c : process.cwd(),
+      guard_block: result?.reason ?? null,
+      t0_ms: Date.now(),
+    });
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      HOME: LOAD_HOME,
+      HERDR_TASK_ID: WORKER_TASK_ID,
+      HERDR_RUN_ID: WORKER_RUN_ID,
+      HERDR_PANE_ID: WORKER_PANE_ID,
+    };
+    if (LOAD_RUN_STATE_DIR) env.HERDR_RUN_STATE_DIR = LOAD_RUN_STATE_DIR;
+    else delete env.HERDR_RUN_STATE_DIR;
+    spawnDetached([PRETOOL_SHADOW_SH, "--record"], payload, env);
+  } catch {
+    // MUST NOT throw — a throwing tool_call handler blocks the tool.
+  }
 }
 
 function onApprovalRequested(event: unknown): undefined {
