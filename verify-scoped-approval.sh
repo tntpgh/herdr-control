@@ -169,5 +169,107 @@ composed="$(HERDR_STATE_DIR="$WORK/state" canonical_rules_compose "$WORK/AGENTS.
 grep -q 'OPERATOR RULE' "$composed" && grep -q 'More than ~10 lines of code goes in a file' "$composed" \
   && ok "operator rules + herdr-control worker rules both present" || bad "composed rules: $composed"
 
+printf '== code by reference: every script-executing segment of a compound command ==\n'
+# F8: _cp_code_ref used to return 1 ("not code by reference") for anything but
+# ONE simple command, so a pipe/redirect/chain/wrapper around `bash tmp/x.sh`
+# ran the file unjudged. Each form below must now resolve to the script
+# (rc 0 + its realpath) or refuse to guess (rc 3) — never rc 1.
+CRWT="$WORK/crwt"; mkdir -p "$CRWT/tmp"
+CRWT="$(cd "$CRWT" && pwd -P)"
+printf '#!/bin/sh\ngh pr merge 1 --squash\n' > "$CRWT/tmp/evil.sh"; chmod +x "$CRWT/tmp/evil.sh"
+printf 'import subprocess\nsubprocess.run(["gh","pr","merge","1"])\n' > "$CRWT/tmp/evil.py"
+printf '#!/bin/sh\necho hello\n' > "$CRWT/tmp/clean.sh"
+while IFS= read -r form; do
+  [ -n "$form" ] || continue
+  c="${form//@WT@/$CRWT}"
+  out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
+  case "$rc:$out" in
+    0:*/tmp/evil.sh|0:*/tmp/evil.py|3:*) ok "judged or refused (rc=$rc): $c" ;;
+    *) bad "script ran unjudged (rc=$rc '$out'): $c" ;;
+  esac
+done <<'EOF'
+cd @WT@ && bash tmp/evil.sh | tail -3
+cd @WT@ && bash tmp/evil.sh 2>&1 | tail -3
+cd @WT@ && bash tmp/evil.sh > /tmp/out.txt
+cd @WT@ && bash tmp/evil.sh 2>/dev/null
+cd @WT@ && bash tmp/evil.sh < /dev/null
+cd @WT@ && bash tmp/evil.sh && echo ok
+cd @WT@ && bash tmp/evil.sh; echo ok
+cd @WT@ && bash tmp/evil.sh || true
+cd @WT@ && true && bash tmp/evil.sh
+cd @WT@ && (bash tmp/evil.sh)
+cd @WT@ && { bash tmp/evil.sh; }
+cd @WT@ && echo $(bash tmp/evil.sh)
+cd @WT@ && echo `bash tmp/evil.sh`
+cd @WT@ && bash -c "bash tmp/evil.sh"
+cd @WT@ && sh -c 'bash tmp/evil.sh'
+cd @WT@ && eval "bash tmp/evil.sh"
+cd @WT@ && source tmp/evil.sh
+cd @WT@ && . tmp/evil.sh
+cd @WT@ && ./tmp/evil.sh
+@WT@/tmp/evil.sh
+@WT@/tmp/evil.sh | tail -1
+cd @WT@ && echo tmp/evil.sh | xargs bash
+cd @WT@ && find tmp -name evil.sh -exec bash {} \;
+cd @WT@ && find tmp -name evil.sh -exec {} \;
+cd @WT@ && env FOO=1 bash tmp/evil.sh
+cd @WT@ && nohup bash tmp/evil.sh
+cd @WT@ && time bash tmp/evil.sh
+cd @WT@ && timeout 5 bash tmp/evil.sh
+cd @WT@ && exec bash tmp/evil.sh
+cd @WT@ && command bash tmp/evil.sh
+cd @WT@ && nice -n 5 bash tmp/evil.sh
+cd @WT@ && bash < tmp/evil.sh
+cd @WT@ && cat tmp/evil.sh | bash
+cd @WT@ && bash -x tmp/evil.sh
+cd @WT@ && bash -- tmp/evil.sh
+cd @WT@ && bash tmp/evil.sh &
+cd @WT@ && python3 tmp/evil.py | tail -1
+cd @WT@ && python3 tmp/evil.py > /tmp/o.txt
+cd @WT@ && bash <(cat tmp/evil.sh)
+cd @WT@ && watch -n1 bash tmp/evil.sh
+cd @WT@ && bash tmp/clean.sh && bash tmp/evil.sh
+cd @WT@ && cd tmp && bash evil.sh
+bash tmp/evil.sh | tail -3
+bash @WT@/tmp/evil.sh | tail -3
+EOF
+out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh 2>&1 | tail -3" "$CRWT")"; rc=$?
+[ "$rc" = 0 ] && [ "$out" = "shell	$CRWT/tmp/clean.sh" ] \
+  && ok "a clean script inside a pipe resolves to that one file" || bad "clean piped script: rc=$rc '$out'"
+out="$(_cp_code_ref "cd $CRWT && git status --short | tail -3" "$CRWT")"; rc=$?
+[ "$rc" = 1 ] && ok "a compound command running no script is not code by reference" || bad "no-script compound: rc=$rc '$out'"
+out="$(_cp_code_ref "cd $CRWT && python3 -m json.tool tmp/x.json | head" "$CRWT")"; rc=$?
+[ "$rc" = 1 ] && ok "python3 -m stays out of scope (unchanged)" || bad "python -m: rc=$rc '$out'"
+
+printf '== code by reference: worker-written exec trampolines ==\n'
+# A script whose command word is its own argv (`"$@"`, `$cmd "$@"`,
+# `"$cmd" "$@"`) executes whatever the CALLER passes: approving its bytes
+# approves nothing. Its content must never classify clean or replayable, and
+# an argument substitution (`"$(pwd)"`) must not knock the command out of
+# code-by-reference (it used to: _cp_simple_words refuses @SUB@ -> rc 1).
+printf '#!/bin/sh\n"$@"\n' > "$CRWT/tmp/tramp1.sh"
+printf '#!/bin/sh\ncmd=$1; shift; $cmd "$@"\n' > "$CRWT/tmp/tramp2.sh"
+printf '#!/usr/bin/env bash\nroot="${1:?root}"\nlib="lib/x.sh"\n. "$root/$lib"\nshift\ncmd="$1"; shift\n"$cmd" "$@"\n' > "$CRWT/tmp/tramp3.sh"
+for t in tramp1 tramp2 tramp3; do
+  r="$(_cp_code_content_reason shell "$CRWT/tmp/$t.sh" "$CRWT/tmp")"
+  [ -n "$r" ] && ok "exec trampoline $t.sh is not clean: $r" || bad "exec trampoline $t.sh classifies clean"
+done
+cp "$CRWT/tmp/tramp3.sh" "$WORK/harness.sh"
+while IFS= read -r form; do
+  [ -n "$form" ] || continue
+  c="${form//@WT@/$CRWT}"; c="${c//@OUT@/$WORK}"
+  out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
+  case "$rc:$out" in
+    0:*/tmp/tramp*.sh|3:*) ok "trampoline judged or refused (rc=$rc): $c" ;;
+    *) bad "trampoline ran unjudged (rc=$rc '$out'): $c" ;;
+  esac
+done <<'EOF'
+bash @OUT@/harness.sh "$(pwd)" _cp_walk_prep 'cd /tmp/x && bash tmp/evil.sh 2>&1 | tail -3'
+bash @OUT@/harness.sh "$(pwd)" ls
+cd @WT@ && bash tmp/tramp3.sh "$(pwd)" ls
+cd @WT@ && bash tmp/tramp1.sh "$(printf gh)" pr view 1
+cd @WT@ && bash tmp/tramp2.sh `echo ls` -la
+EOF
+
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

@@ -933,6 +933,38 @@ conductor_select; rc=$?
   || bad "conductor approved reserved file content: rc=$rc"
 peer_on "cd $SWT && bash tmp/missing.sh"; rc=$?
 [ "$rc" -eq 8 ] && ok "a script that cannot be read for review escalates" || bad "unreadable script cleared: rc=$rc"
+
+printf '== fix/coderef-compound: reserved-content script inside a compound command refuses for peer, zero keys ==\n'
+printf '#!/bin/sh\ncat ~/.ssh/id_rsa\n' > "$SWT/tmp/reserved.sh"
+for compound in \
+  "cd $SWT && bash tmp/reserved.sh | tail -3" \
+  "cd $SWT && bash tmp/reserved.sh && echo done" \
+  "cd $SWT && echo \$(bash tmp/reserved.sh)"; do
+  peer_on "$compound"; rc=$?
+  [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+    && ok "refused, no key: $compound" || bad "leaked through: $compound (rc=$rc keys=$(keys_pressed))"
+done
+
+printf '== fix/coderef-compound: conductor path binds the sha for a compound command with one clean script ==\n'
+printf '#!/bin/sh\necho hi\n' > "$SWT/tmp/greet.sh"
+set_menu "cd $SWT && bash tmp/greet.sh | tail -1"; reset_keys
+seed_input_required runS taskS "cd $SWT && bash tmp/greet.sh | tail -1"
+conductor_select; rc=$?
+[ "$rc" -eq 0 ] && ok "conductor approves a compound command wrapping one clean script" \
+  || bad "conductor refused a clean piped script: rc=$rc; $(cat "$WORK/err.txt")"
+[ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+   "SELECT count(*) FROM file_approvals WHERE task_id='taskS' AND path LIKE '%/tmp/greet.sh';")" = 1 ] \
+  && ok "approval bound to greet.sh's sha256, not the raw command line" \
+  || bad "no file_approvals row for greet.sh"
+
+printf '== fix/coderef-compound: conductor path refuses a compound command with two distinct scripts (rc 8) ==\n'
+printf '#!/bin/sh\necho bye\n' > "$SWT/tmp/greet2.sh"
+set_menu "cd $SWT && bash tmp/greet.sh && bash tmp/greet2.sh"; reset_keys
+seed_input_required runS taskS "cd $SWT && bash tmp/greet.sh && bash tmp/greet2.sh"
+conductor_select; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "conductor refuses two distinct script files in one command" \
+  || bad "conductor approved a two-script command: rc=$rc keys=$(keys_pressed)"
 set_task_state runS taskS completed no-follow-on >/dev/null 2>&1
 
 printf '\n%s\n' "-----"
