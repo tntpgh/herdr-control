@@ -196,11 +196,22 @@ printf '== positive controls: the worker flow the lab depends on is STILL allowe
 # coverage (`check_reserved "-u origin HEAD"` and 20+ related DWIM/refspec
 # cases) lives in `verify-command-policy.sh`; asserting it here too would
 # duplicate that suite, not add coverage.
-for allowed in "gh pr create --base main --fill" "gh issue edit 5 --add-label ready-for-review" "set -euo pipefail" "export UV_CACHE_DIR=/tmp/uv" "bash scripts/ci.sh"; do
+for allowed in "gh pr create --base main --fill" "gh issue edit 5 --add-label ready-for-review" "set -euo pipefail" "export UV_CACHE_DIR=/tmp/uv"; do
   set_screen "$allowed"; reset_keys
   sel 1 --authority peer; rc=$?
   [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "'$allowed' still allowed for peer" || bad "'$allowed' now refused: rc=$rc; $(grep -m1 REFUSED "$WORK/err.txt")"
 done
+# `bash scripts/ci.sh` used to be a positive control here. It only passed
+# because a multi-line scraped panel skipped code by reference entirely (F8,
+# PR #160, review round 1 finding 1). For this registered task it is a
+# relative script without the `cd <wt> && ` binding, so it is unresolvable,
+# exactly like the single-line recorded form on main: escalate, not reserved,
+# and nothing pressed. `cd <wt> && bash scripts/ci.sh` is the reviewable spelling.
+set_screen "bash scripts/ci.sh"; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = "0" ] && grep -q 'REFUSED (escalate)' "$WORK/err.txt" \
+  && ok "'bash scripts/ci.sh' (unbound relative script) escalates, nothing pressed" \
+  || bad "'bash scripts/ci.sh': rc=$rc keys=$(keys_pressed); $(grep -m1 REFUSED "$WORK/err.txt")"
 printf '== the SAME reserved prompt, HUMAN authority -> allowed (a human is the authority) ==\n'
 set_screen "gh pr merge 5 --squash"; reset_keys
 sel 1 --authority human; rc=$?
@@ -1021,6 +1032,38 @@ conductor_select; rc=$?
   || bad "conductor approved reserved file content: rc=$rc"
 peer_on "cd $SWT && bash tmp/missing.sh"; rc=$?
 [ "$rc" -eq 8 ] && ok "a script that cannot be read for review escalates" || bad "unreadable script cleared: rc=$rc"
+
+printf '== fix/coderef-compound: reserved-content script inside a compound command refuses for peer, zero keys ==\n'
+printf '#!/bin/sh\ncat ~/.ssh/id_rsa\n' > "$SWT/tmp/reserved.sh"
+for compound in \
+  "cd $SWT && bash tmp/reserved.sh | tail -3" \
+  "cd $SWT && bash tmp/reserved.sh && echo done" \
+  "cd $SWT && echo \$(bash tmp/reserved.sh)"; do
+  peer_on "$compound"; rc=$?
+  [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+    && ok "refused, no key: $compound" || bad "leaked through: $compound (rc=$rc keys=$(keys_pressed))"
+done
+
+printf '== fix/coderef-compound: conductor path binds the sha for a compound command with one clean script ==\n'
+printf '#!/bin/sh\necho hi\n' > "$SWT/tmp/greet.sh"
+set_menu "cd $SWT && bash tmp/greet.sh | tail -1"; reset_keys
+seed_input_required runS taskS "cd $SWT && bash tmp/greet.sh | tail -1"
+conductor_select; rc=$?
+[ "$rc" -eq 0 ] && ok "conductor approves a compound command wrapping one clean script" \
+  || bad "conductor refused a clean piped script: rc=$rc; $(cat "$WORK/err.txt")"
+[ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+   "SELECT count(*) FROM file_approvals WHERE task_id='taskS' AND path LIKE '%/tmp/greet.sh';")" = 1 ] \
+  && ok "approval bound to greet.sh's sha256, not the raw command line" \
+  || bad "no file_approvals row for greet.sh"
+
+printf '== fix/coderef-compound: conductor path refuses a compound command with two distinct scripts (rc 8) ==\n'
+printf '#!/bin/sh\necho bye\n' > "$SWT/tmp/greet2.sh"
+set_menu "cd $SWT && bash tmp/greet.sh && bash tmp/greet2.sh"; reset_keys
+seed_input_required runS taskS "cd $SWT && bash tmp/greet.sh && bash tmp/greet2.sh"
+conductor_select; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "conductor refuses two distinct script files in one command" \
+  || bad "conductor approved a two-script command: rc=$rc keys=$(keys_pressed)"
 set_task_state runS taskS completed no-follow-on >/dev/null 2>&1
 
 printf '\n%s\n' "-----"
