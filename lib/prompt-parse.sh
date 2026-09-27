@@ -912,7 +912,29 @@ prompt_any_visible() {                 # <pane>
 # question or option is readable: a vanished prompt has no identity, and a
 # constant "empty" digest used to ship as an actionable Slack button.
 prompt_id() {
-  local q opts birth period
+  local content birth period
+  content="$(prompt_content "$1")" || return 1
+  birth="$(command -v pane_birth_now >/dev/null 2>&1 || . "$_PP_LIB_DIR/pane-guard.sh" >/dev/null 2>&1
+           pane_birth_now "$1" 2>/dev/null)"
+  period="$(prompt_period "$1")"
+  printf 'pane=%s\nbirth=%s\nperiod=%s\n%s' "$1" "$birth" "$period" "$content" \
+    | shasum -a 256 | cut -d' ' -f1
+}
+
+# prompt_content_digest <pane_id> -> the hash of WHAT is on screen, without the
+# occurrence salt. For the one caller that must re-check the screen after it
+# has itself closed the blocked period (herdr-select.sh, right before its
+# keystroke), where prompt_id has legitimately stepped.
+prompt_content_digest() {
+  local content
+  content="$(prompt_content "$1")" || return 1
+  printf '%s' "$content" | shasum -a 256 | cut -d' ' -f1
+}
+
+# prompt_content <pane_id> -> "<question>\n<options>", or rc 1 when neither is
+# readable. The content half of prompt_id.
+prompt_content() {
+  local q opts
   q="$(prompt_menu_question "$1" 2>/dev/null)"
   opts="$(prompt_menu_options "$1" 2>/dev/null)"
   if [ -z "$opts" ]; then
@@ -941,11 +963,7 @@ prompt_id() {
     [ -n "$menu_q" ] && q="$menu_q"$'\n'"$q"
   fi
   [ -n "$q$opts" ] || return 1
-  birth="$(command -v pane_birth_now >/dev/null 2>&1 || . "$_PP_LIB_DIR/pane-guard.sh" >/dev/null 2>&1
-           pane_birth_now "$1" 2>/dev/null)"
-  period="$(prompt_period "$1")"
-  printf 'pane=%s\nbirth=%s\nperiod=%s\n%s\n%s' "$1" "$birth" "$period" "$q" "$opts" \
-    | shasum -a 256 | cut -d' ' -f1
+  printf '%s\n%s' "$q" "$opts"
 }
 
 # prompt_period <pane_id> -> which blocked period of this pane we are in: the

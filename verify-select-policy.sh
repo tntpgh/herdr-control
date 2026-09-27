@@ -42,6 +42,9 @@ export PANE BIRTH
 #                  types the text into $SCREEN like a composer would
 #   CLEAR_ON_ENTER a screen file copied over $SCREEN on every Enter: the Deny
 #                  key clearing the menu, and later the composer submitting
+#   SWAP_TASK      a task_id: once that task is `running`, every pane read
+#                  returns $SWAP_SCREEN instead (a queued panel painting the
+#                  moment the prompt is answered)
 #   STATE_AT_ENTER a task_id: on Enter, append that task's registry state to
 #                  $SCREEN.state-at-enter (the close-before-keystroke case)
 _std_herdr_stub() {
@@ -51,7 +54,12 @@ _std_herdr_stub() {
     "pane list")
       printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s","cwd":"/tmp"},{"pane_id":"w9:p9","terminal_id":"cond-birth","cwd":"/tmp"}]}}\n' "$PANE" "$BIRTH" ;;
     "pane read")
-      cat "$SCREEN" ;;
+      if [ -n "${SWAP_TASK:-}" ] && [ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+           "SELECT state FROM tasks WHERE task_id='$SWAP_TASK';" 2>/dev/null)" = running ]; then
+        cat "$SWAP_SCREEN"
+      else
+        cat "$SCREEN"
+      fi ;;
     "pane send-keys")
       # argv is: pane send-keys <pane> <key> — the KEY is $4, not $3.
       printf '%s\n' "$4" >> "$KEYS"
@@ -1359,6 +1367,24 @@ STATE_AT_ENTER=taskK HERDR_SELECT_RECORD_WAIT_S=0 sel 1 --authority peer; rc=$?
   && ok "the task was already running when Enter landed (period closed first)" \
   || bad "task state when Enter landed: '$(cat "$SCREEN.state-at-enter")' (want running)"
 set_task_state runK taskK completed no-follow-on >/dev/null 2>&1
+
+printf '== the screen is re-read AFTER the close, right before the keystroke ==\n'
+# PR #168 review round 2 (High): set_task_state can wait seconds on the registry
+# lock. If the prompt is answered elsewhere in that gap and omp paints a queued
+# panel with Approve highlighted, an Enter sent on the strength of the read
+# BEFORE the close would approve a prompt nobody reviewed. Model it: once the
+# task is running (the close landed), the pane shows a different command.
+register_task runQ taskQ wQ cQ "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/queued "impl:queued" >/dev/null 2>&1
+set_task_state runQ taskQ blocked >/dev/null 2>&1
+set_menu "gh pr merge 7 --squash"; cp "$SCREEN" "$WORK/queued-screen.txt"
+set_menu "git status --short"; reset_keys
+SWAP_TASK=taskQ SWAP_SCREEN="$WORK/queued-screen.txt" HERDR_SELECT_RECORD_WAIT_S=0 sel 1 --authority peer; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "a panel that changed during the close is refused, no key pressed" \
+  || bad "rc=$rc keys=$(keys_pressed) — the keystroke went to the queued panel"
+[ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT state FROM tasks WHERE task_id='taskQ';")" = blocked ] \
+  && ok "the refused press put the task back to blocked" || bad "task state after the refusal: not blocked"
+set_task_state runQ taskQ completed no-follow-on >/dev/null 2>&1
 
 printf '== F7c: a peer/conductor Deny tells the worker WHY, once the menu has cleared ==\n'
 # A worker re-issued a denied reserved command (`bash -n lib/command-policy.sh

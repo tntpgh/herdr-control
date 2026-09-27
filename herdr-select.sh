@@ -222,6 +222,9 @@ esac
 # "immediately before injection" — confirm the prompt is still the one a
 # decision was made about, if the caller told us which one that was...
 current_prompt_id=$(prompt_id "$pane")
+# The same screen without the occurrence salt, for the re-check after
+# _close_blocked_period below (which steps prompt_id on purpose).
+current_content=$(prompt_content_digest "$pane")
 if [ -n "$expect_id" ] && [ "$current_prompt_id" != "$expect_id" ]; then
   echo "herdr-select: the prompt in $pane no longer matches the one the decision was made about." >&2
   echo "herdr-select: expected prompt_id $expect_id, currently $current_prompt_id — refusing to answer a different prompt." >&2
@@ -640,6 +643,20 @@ _reopen_blocked_period() {
   return 0
 }
 
+# The last screen read before the keystroke has to come AFTER the registry
+# write above: set_task_state can wait seconds on the registry lock, and in that
+# gap someone else can answer this prompt and omp can paint a queued one with
+# Approve highlighted (PR #168 review round 2, High). prompt_id has stepped by
+# now, so compare the content digest captured with it; on the omp path the
+# highlight must still be on the option being pressed.
+_require_unchanged_after_close() {
+  require_agent_pane "$pane" && require_pane_birth_match "$pane" &&
+    [ "$(prompt_content_digest "$pane")" = "$current_content" ] &&
+    { [ "$mechanism" = numbered ] || [ "$(prompt_menu_selected "$pane")" = "$choice" ]; } && return 0
+  _reopen_blocked_period
+  echo "herdr-select: the prompt in $pane changed while its answer was being recorded — refusing." >&2
+  return 1
+}
 _require_current_decision() {
   require_agent_pane "$pane" && require_pane_birth_match "$pane" || return 1
   [ "$(prompt_id "$pane")" = "$current_prompt_id" ] || {
@@ -654,6 +671,7 @@ if [ "$mechanism" = numbered ]; then
   # which is the point: Enter is the keystroke that accepts a DEFAULT, and a
   # default is precisely what we are refusing to send on someone's behalf.
   _close_blocked_period || true
+  _require_unchanged_after_close || exit 6
   herdr pane send-keys "$pane" "$choice" >/dev/null 2>&1 || {
     _reopen_blocked_period
     echo "herdr-select: failed to send key '$choice' to $pane" >&2
@@ -694,6 +712,7 @@ else
   done
   _require_current_decision || exit 6
   _close_blocked_period || true
+  _require_unchanged_after_close || exit 6
   herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || {
     _reopen_blocked_period
     echo "herdr-select: failed to send Enter to $pane" >&2
