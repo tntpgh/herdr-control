@@ -455,11 +455,15 @@ for form in "python3 -c 'import pkgr.evil'" "python3 -c 'from pkgr import evil'"
 done
 out="$(_cp_code_ref "cd $CRWT && python3 -c 'import json; print(json.dumps({}))'" "$CRWT")"; rc=$?
 [ "$rc" = 1 ] && ok "python -c with only stdlib imports is not code by reference" || bad "stdlib python -c over-blocked: rc=$rc '$out'"
-# The same clean script run twice (an idempotent retry) is not rewrite-then-run;
-# a writer between the two runs still is.
+# The same script run twice escalates (fails closed): a clean-classified
+# script can rewrite itself between the runs (review round 3, #160 —
+# `bash x.sh && bash x.sh` where x.sh does `cp evil x.sh`). A writer
+# between the two runs escalates too.
+printf 'cp tmp/evil.sh tmp/selfcp.sh\n' > "$CRWT/tmp/selfcp.sh"
+out="$(_cp_code_ref "cd $CRWT && bash tmp/selfcp.sh && bash tmp/selfcp.sh" "$CRWT")"; rc=$?
+[ "$rc" = 3 ] && ok "a self-rewriting script run twice escalates" || bad "self-rewrite between runs slipped: rc=$rc '$out'"
 out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh && bash tmp/clean.sh" "$CRWT")"; rc=$?
-[ "$rc" = 0 ] && [ "$out" = "shell	$CRWT/tmp/clean.sh" ] \
-  && ok "the same clean script twice resolves to that one file" || bad "repeat run over-blocked: rc=$rc '$out'"
+[ "$rc" = 3 ] && ok "the same script twice escalates (fails closed)" || bad "repeat run resolved: rc=$rc '$out'"
 out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh && cp tmp/evil.sh tmp/clean.sh && bash tmp/clean.sh" "$CRWT")"; rc=$?
 [ "$rc" = 3 ] && ok "a writer between two runs still escalates" || bad "writer between runs slipped: rc=$rc '$out'"
 out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh > tmp/clean.sh; bash tmp/clean.sh" "$CRWT")"; rc=$?
