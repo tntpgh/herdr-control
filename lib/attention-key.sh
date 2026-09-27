@@ -54,43 +54,23 @@ _HERDR_ATTENTION_KEY_SH=1
 # attn_track_claim exists). Marking an edge per call broke it: 3 firings, 3
 # edges, 3 unrelated keys, 3 deliveries.
 #
-# The key instead carries the pane's latest prompt-appearance EDGE sequence,
-# where an edge is a LEVEL TRANSITION, not a call: the task's own registered
-# `state` (lib/run-registry.sh, driven by push_wake's `set_task_state ...
-# blocked` and agent-edge.sh's `follow_registry` mapping omp's idle/working
-# status back to `running` once a prompt is actually answered and the agent
-# resumes) already models exactly "still the same blocked period" vs. "a
-# fresh one". `attn_track_claim` marks a new edge only when the state is NOT
-# already `blocked` at the moment it is called — true for the first firing of
-# a new occurrence, false for every repeat firing on a still-open one, since
-# the first firing's own push_wake call flips the state to `blocked` before
-# any repeat can observe it. attention-tick.sh's own tick loop is
-# level-triggered instead (it re-examines the same still-blocked pane every
-# interval) and must NEVER mark an edge itself — it only READS the latest
-# edge sequence when it computes the same key, so the key it forms is stable
-# for as long as the state stays `blocked`, and steps forward only once the
-# task has genuinely left and re-entered that state.
-attn_mark_edge() {                      # pane_id run_id task_id -> (best-effort, no output)
-  local pane="$1" run_id="${2:-}" task_id="${3:-}"
-  [ -n "$run_id" ] && [ -n "$task_id" ] || return 0
-  command -v task_for_pane >/dev/null 2>&1 || return 0
-  local state
-  state="$(task_for_pane "$pane" 2>/dev/null | jq -r '.state // empty' 2>/dev/null)"
-  [ "$state" = "blocked" ] && return 0   # still the SAME blocked period, not a new edge
-  command -v append_event >/dev/null 2>&1 || return 0
-  append_event "$run_id" "$task_id" "attn_prompt_edge" \
-    "$(jq -nc --arg p "$pane" '{pane:$p}')" >/dev/null 2>&1 || true
-}
-
-attention_edge_sequence() {             # pane_id -> latest edge's registry sequence, or 0
-  local pane="$1" n
-  command -v _sql >/dev/null 2>&1 || { printf '0'; return 0; }
-  n="$(_sql "SELECT max(sequence) FROM events WHERE type='attn_prompt_edge' AND json_extract(payload,'\$.pane')=$(_sq "$pane");" 2>/dev/null)"
-  printf '%s' "${n:-0}"
-}
+# The key carries the pane's blocked PERIOD, from the same prompt_period
+# (lib/prompt-parse.sh) that salts prompt_id: the registry sequence of the
+# latest time a task on this pane LEFT `blocked`. It is stable for every repeat
+# firing and every tick while a prompt stays open, and steps forward once the
+# prompt is answered and the task has genuinely left `blocked`.
+#
+# It used to be a START marker instead (attn_prompt_edge, written by the
+# hook's first firing when the task was not yet `blocked`). That raced every
+# other reader at the one moment they all look: live 2026-09-26 (events
+# 37680/37682), this controller's tick keyed the prompt before the hook marked
+# its edge, the two claims got different keys, and the conductor was woken
+# twice for one prompt. It also missed re-asks whenever agent-edge.sh had
+# already flipped the task to `blocked` before the hook ran. A close is
+# written long before the next prompt paints, so both readers agree.
 
 attention_dedupe_key() {                # pane_id [registered_birth] [command_text] -> key
-  local pane="$1" birth="${2:-}" cmd cmd_norm cmd_hash edge
+  local pane="$1" birth="${2:-}" cmd cmd_norm cmd_hash period
   if [ "$#" -ge 3 ]; then
     cmd="$3"
   else
@@ -98,8 +78,8 @@ attention_dedupe_key() {                # pane_id [registered_birth] [command_te
   fi
   cmd_norm="$(printf '%s' "$cmd" | tr -s '[:space:]' ' ' | sed -E 's/^ +| +$//')"
   cmd_hash="$(printf '%s' "$cmd_norm" | shasum -a 256 2>/dev/null | cut -d' ' -f1)"
-  edge="$(attention_edge_sequence "$pane")"
-  printf '%s__%s__%s__e%s\n' "$pane" "${birth:-nobirth}" "${cmd_hash:-nohash}" "${edge:-0}"
+  period="$(prompt_period "$pane")"
+  printf '%s__%s__%s__p%s\n' "$pane" "${birth:-nobirth}" "${cmd_hash:-nohash}" "${period:-0}"
 }
 
 # The registered pane_birth (task_for_pane's own record), NOT a fresh LIVE
@@ -115,7 +95,6 @@ attention_registered_birth() {          # pane_id -> registered pane_birth, or e
 attn_track_claim() {                    # pane_id run_id task_id [prompt_id] -> 0 owns it
   local pane="$1" run_id="$2" task_id="$3" pid="${4:-}"
   [ "${HERDR_WAKE_LEGACY:-0}" = "1" ] && return 0
-  attn_mark_edge "$pane" "$run_id" "$task_id"
   local birth key
   birth="$(attention_registered_birth "$pane")"
   key="$(attention_dedupe_key "$pane" "$birth")"

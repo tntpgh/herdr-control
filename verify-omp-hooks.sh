@@ -648,13 +648,12 @@ printf '%s' "$payload" | jq -e '.command_uncorroborated == true' >/dev/null 2>&1
 claim_once "grace_realert_run1_task1_$(prompt_id "$WPANE")" run1 task1 grace_realert_claim '{}' >/dev/null 2>&1
 set_task_state run1 task1 running >/dev/null 2>&1
 
-printf '== PR #158 round 2: a peer refusal releasing the hold does not silence the human-stale ERROR alert ==\n'
-# At HERDR_SLACK_LEVEL=errors the hook judges the RAW recorded command
-# (mismatch -> a human must answer) and arms the human-stale timer, while
-# push_wake judges the panel alone (change 5) and HOLDS it. A peer refusal
-# then runs release_wake_hold, which claims grace_realert_* — the same key
-# the human-stale timer used to claim, so the only ERROR-class post for this
-# prompt was silently dropped.
+printf '== the hook and push_wake classify a mismatched recorded command the same way ==\n'
+# PR #158 round 2: the hook judged the RAW recorded command (mismatch -> a
+# human must answer: needs-input sent, human-stale armed) while push_wake
+# judged the panel alone and HELD the wake, so one prompt was both "a human's"
+# and "a peer's". human_must_answer now drops a mismatched command itself, so
+# both judge the panel: held, and no human-only alert for an allow-class panel.
 register_task runHS taskHS wHS condHS "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wtHS "impl:human-stale" >/dev/null 2>&1
 omp_menu_screen "git fetch origin --prune" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
@@ -662,25 +661,34 @@ clean_screen > "$COND_SCREEN"
 jq -nc '{tool:"bash", message:"omp needs permission", cwd:"/tmp/repo", command:"gh pr merge 99 --squash"}' \
   | ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" \
              HERDR_RUN_ID=runHS HERDR_TASK_ID=taskHS HERDR_TASK_LABEL="impl:human-stale" \
-             HERDR_SLACK_LEVEL=errors HERDR_ALERT_GRACE_S=60 HERDR_HUMAN_ALERT_S=2
+             HERDR_SLACK_LEVEL=errors HERDR_ALERT_GRACE_S=60 HERDR_HUMAN_ALERT_S=60
       bash "$here/agent-hooks/omp-notify.sh" >/dev/null 2>&1 )
 hs_pid="$(prompt_id "$WPANE")"
 hs_ev() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   "SELECT count(*) FROM events WHERE task_id='taskHS' AND type='$1';" 2>/dev/null; }
-[ "$(hs_ev wake_held)" = 1 ] && ok "precondition: push_wake held the wake (panel judged alone)" \
-  || bad "precondition failed: wake_held=$(hs_ev wake_held)"
+[ "$(hs_ev wake_held)" = 1 ] && ok "push_wake held the wake (panel judged alone)" \
+  || bad "wake_held=$(hs_ev wake_held)"
+grep -q -- '--class needs-input' "$NOTIFIED" \
+  && bad "the hook treated the same prompt as human-only: $(cat "$NOTIFIED")" \
+  || ok "the hook did not call the held prompt human-only (no needs-input send)"
 ( . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
   release_wake_hold "$WPANE" "$hs_pid" runHS taskHS "$CPANE" "impl:human-stale" \
     "a peer refused this prompt" "impl:human-stale" "" "peer refused: escalate" ) \
   && ok "the peer refusal released the held wake" || bad "release_wake_hold refused"
-# Wait on the stub's log, not the clock: ~15s cap only so a regression fails.
-i=0; while [ "$i" -lt 150 ] && ! grep -q -- '--class human-stale' "$NOTIFIED"; do sleep 0.1; i=$((i + 1)); done
-[ "$(grep -c -- '--class human-stale' "$NOTIFIED")" = 1 ] \
-  && ok "the human-stale ERROR alert still posted exactly once after the release" \
-  || bad "human-stale posts: $(grep -c -- '--class human-stale' "$NOTIFIED"); notified: $(cat "$NOTIFIED")"
 i=0; while [ "$i" -lt 150 ] && [ "$(hs_ev wake_result)" = 0 ]; do sleep 0.1; i=$((i + 1)); done
 [ "$(hs_ev wake_attempted)" = 1 ] && ok "Main was woken exactly once (the forced wake)" \
   || bad "wake_attempted for taskHS: $(hs_ev wake_attempted)"
+# The human-stale ERROR timer keeps its own claim namespace, so a release or a
+# re-wake that took grace_realert_* for this prompt can never silence it.
+hs_trace="$WORK/hs-trace.log"; : > "$hs_trace"
+( export HERDR_ALERT_TRACE="$hs_trace"
+  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+  HERDR_ALERT_GRACE_S=1 HERDR_GRACE_CLAIM_KIND=human_stale \
+    grace_realert "$WPANE" "$hs_pid" runHS taskHS true )
+i=0; while [ "$i" -lt 100 ] && ! grep -q '^done ' "$hs_trace"; do sleep 0.1; i=$((i + 1)); done
+grep -q "^done human_stale $hs_pid fired$" "$hs_trace" \
+  && ok "a human-stale timer still fires after grace_realert_* was claimed" \
+  || bad "human-stale timer: $(cat "$hs_trace")"
 clean_screen > "$WORKER_SCREEN"
 set_task_state runHS taskHS completed no-follow-on >/dev/null 2>&1
 
@@ -1333,6 +1341,68 @@ EOF
     HERDR_RUN_STATE_DIR="$WORK/registry-parent-is-a-file/runs" bun "$WORK/scope-run.ts" 2>&1)"
   verdict "$bogus_out" in_wt | grep -q "cannot verify your registered worktree: the registry read failed" && ok "worker whose registry is unreadable blocks writes (fail closed)" || bad "bad registry dir: $bogus_out"
 fi
+
+printf '== F7b: one conductor wake per prompt occurrence ==\n'
+# Live 2026-09-26 (events 37680/37682): the hook's push_wake and
+# attention-tick.sh's both delivered for one prompt, because each caller's
+# "already woken?" was a read that ran before the other had written. push_wake
+# now takes one atomic owner claim per prompt occurrence.
+CPANE="w2:p1"; CBIRTH="cterm-1"
+register_task runF7 taskF7 wF7 condF7 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wtF7 "impl:f7" >/dev/null 2>&1
+set_task_state runF7 taskF7 running >/dev/null 2>&1
+f7_wake() {                             # <where> [extra env...] -> one push_wake call as that caller
+  local where="$1"; shift
+  ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" HERDR_RUN_ID=runF7 HERDR_TASK_ID=taskF7 \
+           HERDR_TASK_LABEL="impl:f7" "$@"
+    . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+    push_wake "impl:f7 needs input" "$where" >/dev/null 2>&1 )
+}
+f7_n() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE task_id='taskF7' AND type='$1';" 2>/dev/null; }
+omp_menu_screen "wrangler deploy --env f7" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+f7_wake agent-hook & f7_a=$!
+f7_wake attention-controller & f7_b=$!
+wait "$f7_a" "$f7_b"
+[ "$(f7_n wake_attempted)" = 1 ] && ok "two callers racing on one prompt: exactly one wake attempted" \
+  || bad "wake_attempted for one prompt: $(f7_n wake_attempted) (want 1)"
+f7_pid1="$(prompt_id "$WPANE")"
+
+# The same command re-asked after the prompt was answered: the task left
+# blocked (herdr-select.sh / agent-edge.sh write that close), so it is a new
+# occurrence with its own prompt_id, its own input_required row, its own wake.
+set_task_state runF7 taskF7 running >/dev/null 2>&1
+clean_screen > "$COND_SCREEN"
+omp_menu_screen "wrangler deploy --env f7" > "$WORKER_SCREEN"
+f7_pid2="$(prompt_id "$WPANE")"
+f7_wake agent-hook
+[ -n "$f7_pid1" ] && [ "$f7_pid1" != "$f7_pid2" ] && ok "the re-asked prompt has a new prompt_id" \
+  || bad "re-asked prompt kept its prompt_id: $f7_pid1"
+[ "$(f7_n input_required)" = 2 ] && ok "the re-asked prompt gets its own input_required row" \
+  || bad "input_required rows: $(f7_n input_required) (want 2; the re-ask was swallowed)"
+[ "$(f7_n wake_attempted)" = 2 ] && ok "the re-asked prompt wakes the conductor again" \
+  || bad "wake_attempted after a re-ask: $(f7_n wake_attempted) (want 2)"
+
+# A deliberate re-delivery (the grace timer, a released hold) is not blocked
+# by the owner claim.
+clean_screen > "$COND_SCREEN"
+f7_wake grace HERDR_ALERT_FORCE=1
+[ "$(f7_n wake_attempted)" = 3 ] && ok "a forced re-delivery still delivers past the owner claim" \
+  || bad "forced re-delivery blocked: wake_attempted=$(f7_n wake_attempted) (want 3)"
+
+# The wake-fail page is for a conductor nobody reached. An attempt for this
+# same occurrence was submitted above, so a later failed attempt's timer must
+# not page (live 2026-09-26, event 37775 paged on a redundant failed attempt).
+: > "$NOTIFIED"; f7_trace="$WORK/f7-alert-trace.log"; : > "$f7_trace"
+( export HERDR_ALERT_TRACE="$f7_trace" HERDR_WAKE_FAIL_ALERT_S=1
+  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+  _pw_wake_fail_realert "$WPANE" "$f7_pid2" runF7 taskF7 unsubmitted )
+i=0; while [ "$i" -lt 100 ] && ! grep -q '^done wakefail ' "$f7_trace"; do sleep 0.1; i=$((i + 1)); done
+grep -q "^done wakefail $f7_pid2 conductor_reached$" "$f7_trace" && ! grep -q 'wake-fail' "$NOTIFIED" \
+  && ok "no wake-fail page when an attempt for the same prompt was submitted" \
+  || bad "wake-fail timer: $(cat "$f7_trace"); notified: $(cat "$NOTIFIED")"
+set_task_state runF7 taskF7 completed no-follow-on >/dev/null 2>&1
+clean_screen > "$WORKER_SCREEN"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

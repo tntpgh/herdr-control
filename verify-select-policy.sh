@@ -28,11 +28,25 @@ BIRTH="term-abc-123"
 export PANE BIRTH
 
 # ---- the stub -------------------------------------------------------------
-# Implements exactly the four herdr calls this path makes:
+# Implements exactly the herdr calls this path makes:
 #   pane process-info --pane <id>   lib/pane-guard.sh: pane_is_agent
 #   pane list                       pane_birth_now / require_pane_birth_match
 #   pane read <id> ...              lib/prompt-parse.sh, both prompt shapes
 #   pane send-keys <id> <key>       the thing that must NOT happen on a refusal
+#   pane send-text <id> <text>      send-to-agent.sh (F7c deny reason); a no-op
+#                                   unless SENDS names a log
+# Two opt-in knobs for the F7c cases at the end, both unset everywhere else so
+# every earlier case sees the stub it always had:
+#   SENDS          send-text appends "<menu|clear><TAB><text>" — whether the
+#                  approval menu was still on screen at that moment — and
+#                  types the text into $SCREEN like a composer would
+#   CLEAR_ON_ENTER a screen file copied over $SCREEN on every Enter: the Deny
+#                  key clearing the menu, and later the composer submitting
+#   SWAP_TASK      a task_id: once that task is `running`, every pane read
+#                  returns $SWAP_SCREEN instead (a queued panel painting the
+#                  moment the prompt is answered)
+#   STATE_AT_ENTER a task_id: on Enter, append that task's registry state to
+#                  $SCREEN.state-at-enter (the close-before-keystroke case)
 _std_herdr_stub() {
   case "$1 $2" in
     "pane process-info")
@@ -40,10 +54,26 @@ _std_herdr_stub() {
     "pane list")
       printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s","cwd":"/tmp"},{"pane_id":"w9:p9","terminal_id":"cond-birth","cwd":"/tmp"}]}}\n' "$PANE" "$BIRTH" ;;
     "pane read")
-      cat "$SCREEN" ;;
+      if [ -n "${SWAP_TASK:-}" ] && [ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+           "SELECT state FROM tasks WHERE task_id='$SWAP_TASK';" 2>/dev/null)" = running ]; then
+        cat "$SWAP_SCREEN"
+      else
+        cat "$SCREEN"
+      fi ;;
     "pane send-keys")
       # argv is: pane send-keys <pane> <key> — the KEY is $4, not $3.
-      printf '%s\n' "$4" >> "$KEYS" ;;
+      printf '%s\n' "$4" >> "$KEYS"
+      if [ "$4" = Enter ] && [ -n "${STATE_AT_ENTER:-}" ]; then
+        sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+          "SELECT state FROM tasks WHERE task_id='$STATE_AT_ENTER';" >> "$SCREEN.state-at-enter" 2>/dev/null
+      fi
+      if [ "$4" = Enter ] && [ -n "${CLEAR_ON_ENTER:-}" ]; then cp "$CLEAR_ON_ENTER" "$SCREEN"; fi ;;
+    "pane send-text")
+      if [ -n "${SENDS:-}" ]; then
+        if grep -q 'Allow tool:' "$SCREEN"; then printf 'menu\t%s\n' "$4" >> "$SENDS"
+        else printf 'clear\t%s\n' "$4" >> "$SENDS"; fi
+        printf '%s\n' "$4" >> "$SCREEN"
+      fi ;;
     *) return 0 ;;
   esac
 }
@@ -1321,6 +1351,169 @@ esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   || bad "ambiguous menu rows: escalation identity: $esc_row"
 
 set_task_state runR taskR completed no-follow-on >/dev/null 2>&1
+
+printf '== the blocked period closes BEFORE the answering keystroke ==\n'
+# PR #168 review: the task's blocked->running transition is what closes a
+# prompt's blocked period (lib/prompt-parse.sh prompt_period). omp paints a
+# queued second tool call's panel the instant the first is answered, so a close
+# written after the keypress let that next panel be read under the old period
+# and re-keyed under the new one: one prompt, two ids, two wakes.
+register_task runK taskK wK cK "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/close "impl:close" >/dev/null 2>&1
+set_task_state runK taskK blocked >/dev/null 2>&1
+set_menu "git status --short --branch"; reset_keys; : > "$SCREEN.state-at-enter"
+STATE_AT_ENTER=taskK HERDR_SELECT_RECORD_WAIT_S=0 sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" -ge 1 ] && ok "peer Approve pressed" || bad "rc=$rc; stderr: $(cat "$WORK/err.txt")"
+[ "$(cat "$SCREEN.state-at-enter")" = running ] \
+  && ok "the task was already running when Enter landed (period closed first)" \
+  || bad "task state when Enter landed: '$(cat "$SCREEN.state-at-enter")' (want running)"
+set_task_state runK taskK completed no-follow-on >/dev/null 2>&1
+
+printf '== the screen is re-read AFTER the close, right before the keystroke ==\n'
+# PR #168 review round 2 (High): set_task_state can wait seconds on the registry
+# lock. If the prompt is answered elsewhere in that gap and omp paints a queued
+# panel with Approve highlighted, an Enter sent on the strength of the read
+# BEFORE the close would approve a prompt nobody reviewed. Model it: once the
+# task is running (the close landed), the pane shows a different command.
+register_task runQ taskQ wQ cQ "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/queued "impl:queued" >/dev/null 2>&1
+set_task_state runQ taskQ blocked >/dev/null 2>&1
+set_menu "gh pr merge 7 --squash"; cp "$SCREEN" "$WORK/queued-screen.txt"
+set_menu "git status --short"; reset_keys
+SWAP_TASK=taskQ SWAP_SCREEN="$WORK/queued-screen.txt" HERDR_SELECT_RECORD_WAIT_S=0 sel 1 --authority peer; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "a panel that changed during the close is refused, no key pressed" \
+  || bad "rc=$rc keys=$(keys_pressed) — the keystroke went to the queued panel"
+[ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT state FROM tasks WHERE task_id='taskQ';")" = blocked ] \
+  && ok "the refused press put the task back to blocked" || bad "task state after the refusal: not blocked"
+set_task_state runQ taskQ completed no-follow-on >/dev/null 2>&1
+
+printf '== F7c: a peer/conductor Deny tells the worker WHY, once the menu has cleared ==\n'
+# A worker re-issued a denied reserved command (`bash -n lib/command-policy.sh
+# ...`) three times — Denied 17:08:05, 17:08:30, 17:09:10 — because a bare Deny
+# tells omp only "denied". herdr-select.sh now follows an automated Deny with
+# ONE "[HERDR-DENIED] <reason>" line through the real send-to-agent.sh, from a
+# detached job that first waits for the menu to leave the pane.
+#
+# The stub's opt-in knobs model the pane: CLEAR_ON_ENTER swaps the menu for an
+# idle composer when the Deny key lands (and clears the composer again when
+# send-to-agent submits), and SENDS logs each send-text with whether the menu
+# was still up at that moment. The delivery is detached, so every case waits
+# on its deny_reason_delivered row — written LAST, after the send returns —
+# with a bounded poll. The negative cases (Approve, human) cannot be observed
+# by waiting for nothing, so each is followed by a conductor Deny control on a
+# fresh prompt: once the control's row lands, the send log must hold exactly
+# the control's line and the negative prompt must have no row.
+register_task runD taskD wD cD "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/deny "impl:deny" >/dev/null 2>&1
+set_task_state runD taskD running >/dev/null 2>&1
+CLEAN_SCREEN="$WORK/clean-screen.txt"
+printf 'worker idle at its composer\n' > "$CLEAN_SCREEN"
+export SENDS="$WORK/sends.log"
+sends_count() { wc -l < "$SENDS" | tr -d ' '; }
+deny_rows() {                           # <prompt_id> -> deny_reason_delivered rows for it on runD
+  sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    "SELECT count(*) FROM events WHERE type='deny_reason_delivered' AND run_id='runD' AND task_id='taskD'
+       AND json_extract(payload,'\$.prompt_id')='$1';" 2>/dev/null
+}
+deny_row() {                            # <prompt_id> -> "outcome|exit_code|pane" of its latest row
+  sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    "SELECT json_extract(payload,'\$.outcome')||'|'||COALESCE(json_extract(payload,'\$.exit_code'),'null')||'|'||json_extract(payload,'\$.pane')
+       FROM events WHERE type='deny_reason_delivered' AND run_id='runD' AND task_id='taskD'
+       AND json_extract(payload,'\$.prompt_id')='$1' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null
+}
+wait_deny_row() {                       # <prompt_id> — bounded (~20s), never a fixed sleep
+  local i=0
+  while [ "$i" -lt 200 ] && [ "$(deny_rows "$1")" = 0 ]; do sleep 0.1; i=$((i + 1)); done
+  [ "$(deny_rows "$1")" != 0 ]
+}
+conductor_deny() {                      # <reason> — Deny (option 2) on the prompt now on screen
+  ( export HERDR_PANE_ID=w9:p9
+    sel 2 --authority conductor --review-category owned-cleanup --review-reason "$1" \
+      --expect-prompt-id "$(prompt_id "$PANE")" )
+}
+deny_control() {                        # <command> <reason> — the positive control; waits for its row
+  set_menu_deny "$1"; reset_keys
+  ctl_pid="$(prompt_id "$PANE")"
+  CLEAR_ON_ENTER="$CLEAN_SCREEN" conductor_deny "$2"
+  wait_deny_row "$ctl_pid"
+}
+
+printf '== F7c 1: conductor Deny with --review-reason -> one [HERDR-DENIED] line after the menu clears ==\n'
+DENY_WHY="Reserved: lib/command-policy.sh is human-only; check syntax on a scratch copy under TMPDIR."
+set_menu_deny "bash -n lib/command-policy.sh"; reset_keys; : > "$SENDS"
+d1_pid="$(prompt_id "$PANE")"
+CLEAR_ON_ENTER="$CLEAN_SCREEN" conductor_deny "$DENY_WHY"; rc=$?
+[ "$rc" -eq 0 ] && [ "$(head -1 "$KEYS")" = Enter ] && ok "conductor Deny pressed (rc 0)" \
+  || bad "conductor Deny: rc=$rc keys=$(cat "$KEYS"); stderr: $(cat "$WORK/err.txt")"
+wait_deny_row "$d1_pid" && ok "deny_reason_delivered recorded for prompt $d1_pid" \
+  || bad "no deny_reason_delivered row for prompt $d1_pid"
+[ "$(deny_rows "$d1_pid")" = 1 ] && ok "exactly one deny_reason_delivered row" || bad "rows=$(deny_rows "$d1_pid")"
+[ "$(deny_row "$d1_pid")" = "delivered|0|$PANE" ] && ok "row: outcome=delivered exit_code=0 pane=$PANE" \
+  || bad "row: $(deny_row "$d1_pid")"
+[ "$(sends_count)" = 1 ] && ok "exactly one send-text line to the worker" || bad "send-text lines=$(sends_count): $(cat "$SENDS")"
+IFS=$'\t' read -r d1_state d1_text < "$SENDS"
+[ "$d1_state" = clear ] && ok "the line was typed only after the menu had cleared" \
+  || bad "the line was typed while the menu was still up (state=$d1_state)"
+case "$d1_text" in
+  "[HERDR-DENIED] $DENY_WHY — do not retry"*) ok "the line carries [HERDR-DENIED] and the review reason" ;;
+  *) bad "line: $d1_text" ;;
+esac
+
+printf '== F7c 2: conductor Approve with a reason -> no line, no row ==\n'
+set_menu "git status --porcelain"; reset_keys; : > "$SENDS"
+d2_pid="$(prompt_id "$PANE")"
+( export HERDR_PANE_ID=w9:p9
+  CLEAR_ON_ENTER="$CLEAN_SCREEN" sel 1 --authority conductor --review-category local-read \
+    --review-reason "APPROVE-WHY read-only status check" --expect-prompt-id "$d2_pid" ); rc=$?
+[ "$rc" -eq 0 ] && ok "conductor Approve pressed (rc 0)" || bad "conductor Approve: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+deny_control "rm -rf /wt/deny/control-2" "CONTROL-2 declined" \
+  && ok "control Deny after the Approve delivered its row" || bad "control Deny after the Approve recorded no row"
+[ "$(sends_count)" = 1 ] && ! grep -q 'APPROVE-WHY' "$SENDS" && grep -q 'CONTROL-2' "$SENDS" \
+  && ok "only the control's line was sent — nothing for the Approve" || bad "send log: $(cat "$SENDS")"
+[ "$(deny_rows "$d2_pid")" = 0 ] && ok "no deny_reason_delivered row for the Approve" || bad "Approve rows=$(deny_rows "$d2_pid")"
+
+printf '== F7c 3: human Deny -> no line ==\n'
+set_menu_deny "mkfs /dev/disk7"; reset_keys; : > "$SENDS"
+d3_pid="$(prompt_id "$PANE")"
+CLEAR_ON_ENTER="$CLEAN_SCREEN" sel 2 --authority human --review-reason "HUMAN-WHY typed by a person"; rc=$?
+[ "$rc" -eq 0 ] && ok "human Deny pressed (rc 0)" || bad "human Deny: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+deny_control "rm -rf /wt/deny/control-3" "CONTROL-3 declined" \
+  && ok "control Deny after the human Deny delivered its row" || bad "control Deny after the human Deny recorded no row"
+[ "$(sends_count)" = 1 ] && ! grep -q 'HUMAN-WHY' "$SENDS" && grep -q 'CONTROL-3' "$SENDS" \
+  && ok "only the control's line was sent — nothing for the human Deny" || bad "send log: $(cat "$SENDS")"
+[ "$(deny_rows "$d3_pid")" = 0 ] && ok "no deny_reason_delivered row for the human Deny" || bad "human rows=$(deny_rows "$d3_pid")"
+
+printf '== F7c 4: the menu never clears -> no line, outcome menu_never_cleared ==\n'
+set_menu_deny "rm -rf /wt/deny/stuck"; reset_keys; : > "$SENDS"
+d4_pid="$(prompt_id "$PANE")"
+# No CLEAR_ON_ENTER: the Deny key lands and the menu stays painted.
+HERDR_DENY_CLEAR_WAIT_S=1 conductor_deny "STUCK-WHY declined"; rc=$?
+[ "$rc" -eq 0 ] && ok "conductor Deny pressed (rc 0)" || bad "conductor Deny: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+wait_deny_row "$d4_pid" && ok "deny_reason_delivered recorded after the bounded wait" \
+  || bad "no deny_reason_delivered row for the stuck menu"
+[ "$(deny_row "$d4_pid")" = "menu_never_cleared|null|$PANE" ] && ok "row: outcome=menu_never_cleared, no exit code" \
+  || bad "row: $(deny_row "$d4_pid")"
+[ "$(sends_count)" = 0 ] && ok "no send-text into a pane still showing the menu" || bad "send log: $(cat "$SENDS")"
+[ "$(cat "$KEYS")" = Enter ] && ok "no key beyond the Deny itself" || bad "keys: $(cat "$KEYS")"
+
+printf '== F7c 5: peer Deny of a deny-class command, no --review-reason -> the policy reason ==\n'
+set_menu_deny "mkfs /dev/disk5"; reset_keys; : > "$SENDS"
+d5_pid="$(prompt_id "$PANE")"
+CLEAR_ON_ENTER="$CLEAN_SCREEN" sel 2 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && ok "peer Deny pressed (rc 0)" || bad "peer Deny: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+d5_sel="$(tail -1 "$HERDR_BRIDGE_STATE/selections.jsonl")"
+d5_reason="$(printf '%s' "$d5_sel" | jq -r '.policy_reason' | tr -s '[:space:]' ' ')"; d5_reason="${d5_reason% }"
+[ "$(printf '%s' "$d5_sel" | jq -r '.policy_verdict')" = deny ] && [ -n "$d5_reason" ] \
+  && ok "classified deny with a policy reason" || bad "selection: $d5_sel"
+wait_deny_row "$d5_pid" && ok "deny_reason_delivered recorded for the peer Deny" || bad "no row for the peer Deny"
+[ "$(deny_row "$d5_pid")" = "delivered|0|$PANE" ] && ok "row: outcome=delivered" || bad "row: $(deny_row "$d5_pid")"
+IFS=$'\t' read -r d5_state d5_text < "$SENDS"
+[ "$(sends_count)" = 1 ] && [ "$d5_state" = clear ] && ok "one line, after the menu cleared" \
+  || bad "send log: $(cat "$SENDS")"
+case "$d5_text" in
+  "[HERDR-DENIED] ${d5_reason:0:80}"*) ok "the line carries the policy reason" ;;
+  *) bad "line: '$d5_text' (want policy reason '$d5_reason')" ;;
+esac
+
+set_task_state runD taskD completed no-follow-on >/dev/null 2>&1
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
