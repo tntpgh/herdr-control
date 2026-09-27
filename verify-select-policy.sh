@@ -1218,8 +1218,9 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 [ "$notify_calls" = "1" ] && ok "MEDIUM-1: the held Slack alert was sent exactly once on release" \
   || bad "MEDIUM-1: notify calls on release: $notify_calls (want exactly 1)"
-grep -q -- "--choices --pane $PANE" "$NOTIFY_LOG" \
-  && ok "the Slack call names the right pane with --choices" || bad "notify call malformed: $(cat "$NOTIFY_LOG")"
+grep -q -- "--class held --choices --pane $PANE" "$NOTIFY_LOG" \
+  && ok "the Slack call is class held (errors-only level suppresses it like the held timer's own) and names the pane" \
+  || bad "notify call malformed: $(cat "$NOTIFY_LOG")"
 
 printf '== MEDIUM-2: a mid-token-wrap refusal ALSO releases a held wake (not just peer_decide) ==\n'
 set_task_state runR taskR running >/dev/null 2>&1
