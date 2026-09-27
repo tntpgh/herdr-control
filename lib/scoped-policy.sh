@@ -123,11 +123,23 @@ code_ref_inspect() {                    # cmd wt
   local out rc snap
   out="$(_cp_code_ref "$1" "$2")"; rc=$?
   [ "$rc" = 0 ] || return "$rc"
+  local order=0
+  case "$out" in *$'\t'order) order=1; out="${out%$'\t'order}" ;; esac
   PD_CODE_KIND="${out%%$'\t'*}"; PD_CODE_PATH="${out#*$'\t'}"
   snap="$(mktemp "${TMPDIR:-/tmp}/herdr-coderef.XXXXXX")" || return 3
   if ! cat "$PD_CODE_PATH" > "$snap" 2>/dev/null; then rm -f "$snap"; return 3; fi
   PD_CODE_SHA="$(shasum -a 256 < "$snap" | cut -d' ' -f1)"
   PD_CODE_CONTENT_REASON="$(_cp_code_content_reason "$PD_CODE_KIND" "$snap" "$(dirname "$PD_CODE_PATH")")"
+  # Something else in the command could rewrite or feed what this run
+  # executes (_cp_coderef_others_unsafe): the file stays bound, but it is
+  # reviewed every time and an earlier approval never replays. Reserved
+  # content keeps its stronger reason.
+  if [ "$order" = 1 ]; then
+    case "$PD_CODE_CONTENT_REASON" in
+      reserved:*) ;;
+      *) PD_CODE_CONTENT_REASON="nested: the command also runs something that could change $PD_CODE_PATH before or while it runs — review the whole command${PD_CODE_CONTENT_REASON:+; $PD_CODE_CONTENT_REASON}" ;;
+    esac
+  fi
   rm -f "$snap"
   return 0
 }
