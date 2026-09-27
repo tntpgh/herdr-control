@@ -1335,7 +1335,13 @@ EOF
         if [ "$_cp_wcmd" = git ] && [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$seg" | awk '{print $1}')" ]; then
           case "${_CP_LOC[1]:-}" in
             status|log|diff|show|branch|rev-parse|remote)
-              case " ${_CP_LOC[*]:2} " in *' --output'*|*' -o '*|*' --ext-diff'*) return 0 ;; esac
+              case " ${_CP_LOC[*]:2} " in *' --output'*|*' -o '*|*' --ext-di'*|*' --edit-description'*) return 0 ;; esac
+              # `remote` only as a listing: `add`/`set-url`/`update` write
+              # config or fetch (an `ext::` URL runs a command wherever git
+              # allows that transport) — #167 review MEDIUM.
+              if [ "${_CP_LOC[1]}" = remote ]; then
+                case "${_CP_LOC[2]:-}" in ''|-v|--verbose) ;; *) return 0 ;; esac
+              fi
               continue ;;
           esac
           return 0
