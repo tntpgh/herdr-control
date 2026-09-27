@@ -166,10 +166,12 @@ text="$*"
 # Ahead of the dedupe claim below on purpose: a suppressed needs-input call
 # must not claim (pane, prompt), or the later human-stale/stuck escalation for
 # that SAME still-open prompt would be deduped against a post that never went.
-. "$(cd "$(dirname "$0")/.." && pwd)/lib/slack-level.sh"
-if ! slack_should_send "$class"; then
+# If the lib cannot be loaded (a partial copy), the filter is skipped and the
+# alert posts: a broken filter must fail toward the operator hearing about it.
+if . "$(cd "$(dirname "$0")/.." && pwd)/lib/slack-level.sh" 2>/dev/null && ! slack_should_send "$class"; then
   _lvl="$(slack_level)"
   if [ "$dry" = 1 ]; then
+    echo "dry-run: pane=${pane:-none}"
     echo "dry-run: would SUPPRESS — class=${class:-unclassified} is not sent at HERDR_SLACK_LEVEL=${_lvl}"
     exit 0
   fi

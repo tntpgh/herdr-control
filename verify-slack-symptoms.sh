@@ -291,6 +291,14 @@ bogus_out="$(HERDR_SLACK_LEVEL=bogus bash "$here/slack-bridge/herdr-notify.sh" -
 printf '%s' "$bogus_out" | grep -q 'would SUPPRESS.*LEVEL=errors' \
   && ok "an unrecognised level falls back to errors, not off" || bad "bogus level: $bogus_out"
 
+printf '== errors level: a Claude session with no herdr pane still posts (unwatched) ==\n'
+: > "$POSTED"
+printf '{"message":"Claude needs your permission to use Bash","cwd":"/tmp/nopane"}' \
+  | ( unset HERDR_PANE_ID HERDR_CONDUCTOR_PANE_ID TMUX_PANE; export HERDR_SLACK_LEVEL=errors
+      bash "$here/agent-hooks/claude-notify.sh" >/dev/null 2>&1 )
+[ "$(n_posts)" = 1 ] && ok "no HERDR_PANE_ID: nothing automated can see it, so it posts at errors" \
+  || bad "pane-less Claude prompt was silenced: $(n_posts) posts"
+
 printf '== errors level, end to end through the hook: human-only prompt ==\n'
 omp_menu_screen "git push origin lvl-hook" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"

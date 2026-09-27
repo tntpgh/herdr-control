@@ -625,6 +625,16 @@ line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_STUCK_ALERT_S=1 H
   || no "stuck escalation" "$line $(cat "$tmp/log")"
 rm -f "$tmp/bridge/pending.jsonl"
 
+# A leftover pending entry for the pane (an earlier prompt's error alert) must
+# not end the handler at errors: the escalation is this prompt's only path.
+printf '{"ts":"1","pane":"w1:p1"}\n' > "$tmp/bridge/pending.jsonl"
+line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_STUCK_ALERT_S=1 HERDR_HUMAN_ALERT_S=1 \
+         HERDR_RUN_STATE_DIR="$tmp/runs-esc" HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen")
+[ "$(did "$line")" = "escalated to Slack as stuck after 1s" ] \
+  && ok "errors level: a stale pending entry for the pane does not swallow the escalation" \
+  || no "pending entry vs escalation" "$line $(cat "$tmp/log")"
+rm -f "$tmp/bridge/pending.jsonl"
+
 # Blocked past the backstop grace, cleared before the threshold: no error.
 rm -f "$tmp/log.probes"
 line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=1 HERDR_STUCK_ALERT_S=1 \

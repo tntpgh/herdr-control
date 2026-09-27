@@ -25,6 +25,9 @@
 #                    open after HERDR_WAKE_FAIL_ALERT_S (lib/push-wake.sh)
 #     control-plane  the hub's herdr subscription is down (hub-connection-alert.sh)
 #     deploy         a deploy is overdue past the drift threshold (deploy-drift-alert.sh)
+#     unwatched      a prompt from a session with no herdr pane (claude-notify.sh
+#                    without HERDR_PANE_ID): no conductor, edge or re-check can
+#                    see it, so a person is the only resolver
 #     crash          reserved for a component reporting its own crash
 #
 #   NOT AN ERROR (suppressed at `errors`, logged)

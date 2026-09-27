@@ -223,7 +223,13 @@ case "$status" in
         # is recoverable (the hook's own entry, if any, dedupes below).
         note "probe unreachable — alerting anyway" ;;
     esac
-    if pane_has_pending_alert; then
+    # At `errors` a pending entry is not proof THIS prompt was surfaced (it can
+    # be an earlier prompt's error alert that herdr-resolve keeps while any
+    # prompt is on screen), and the escalation below is the only Slack path for
+    # an allow-class prompt — so it must not end here. herdr-notify's
+    # alert_claim still dedupes per (pane, prompt).
+    . "$here/lib/slack-level.sh"
+    if [ "$(slack_level)" != errors ] && pane_has_pending_alert; then
       note "already alerted by the worker's own hook"
       exit 0
     fi
@@ -236,7 +242,6 @@ case "$status" in
     # message with no record" state it exists to prevent), invisible to the
     # dedupe above (so every later prompt on that pane posts another one), and
     # button-less, i.e. strictly weaker than the alert it stands in for.
-    . "$here/lib/slack-level.sh"
     bash "$NOTIFY" --class needs-input --choices --pane "$pane" \
       "${msg} (no hook alert after ${GRACE}s — control-plane backstop)" >/dev/null 2>&1 || true
     if ! slack_should_send needs-input; then

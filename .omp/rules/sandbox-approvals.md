@@ -20,8 +20,9 @@ to go — and it fails *silently*. See the `_sandbox_note` in
 ```
 
 `pane=<id>` must be the pane you ran it in. `pane=none` means resolution failed
-— check the tmux socket (step 6). Then send one for real (drop `--dry-run`) and
-confirm it arrives in Slack.
+— check the tmux socket (step 6). Then send one for real (drop `--dry-run`, and
+add `--class unwatched` — at the default `HERDR_SLACK_LEVEL=errors` an
+unclassified alert is suppressed and only logged) and confirm it arrives in Slack.
 
 **Write path.** Reply to that alert in the thread with a number. Because no
 prompt is on screen, the correct result is a refusal:

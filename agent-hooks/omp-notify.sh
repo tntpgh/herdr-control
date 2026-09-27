@@ -138,7 +138,11 @@ if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
   if human_must_answer "$pane" "$full_cmd"; then
     bash "$notify" --class needs-input --choices --pane "$pane" "$msg" >/dev/null 2>&1 || true
     [ "$(slack_level)" = errors ] && human_stale=1
-  else
+  elif slack_should_send held; then
+    # Armed only when it could post (level `all`). At `errors` a held timer can
+    # only be suppressed, and it shares grace_realert's claim key with the
+    # conductor re-wake push_wake arms for the same prompt — winning that
+    # claim to post nothing cost the conductor its wake (PR #166 review).
     grace_realert "$pane" "$(prompt_id "$pane" 2>/dev/null || printf '')" \
       "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
       bash "$notify" --class held --choices --pane "$pane" "$msg"

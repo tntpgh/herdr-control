@@ -105,16 +105,22 @@ if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
   # Classified for lib/slack-level.sh (2026-09-26) — same split as
   # omp-notify.sh: the immediate and held sends are suppressed at the default
   # level, a human-only prompt still open after HERDR_HUMAN_ALERT_S escalates as
-  # `human-stale`, and a pane with no HERDR_PANE_ID (nothing to re-check here)
-  # is covered by agent-edge.sh's `stuck`/`human-stale` backstop, which watches
-  # every herdr pane whatever hook it has. The escalation timer is armed after
+  # `human-stale`, and a session with no HERDR_PANE_ID posts at once as
+  # `unwatched` (nothing automated can see it). The escalation timer is armed after
   # push_wake below, for the reason omp-notify.sh gives.
   . "$_hook_dir/../lib/slack-level.sh"
   human_stale=0
-  if [ -z "${HERDR_PANE_ID:-}" ] || human_must_answer "${HERDR_PANE_ID}"; then
+  if [ -z "${HERDR_PANE_ID:-}" ]; then
+    # No herdr pane: nothing in the automation can see this session — no
+    # conductor to wake, no edge watching it, no pane to re-check. A person is
+    # the only resolver, so it is an error class and posts now, as before.
+    bash "$notify" --class unwatched --choices ${cwd:+--cwd "$cwd"} "$msg" >/dev/null 2>&1 || true
+  elif human_must_answer "${HERDR_PANE_ID}"; then
     bash "$notify" --class needs-input --choices ${cwd:+--cwd "$cwd"} "$msg" >/dev/null 2>&1 || true
-    [ -n "${HERDR_PANE_ID:-}" ] && [ "$(slack_level)" = errors ] && human_stale=1
-  else
+    [ "$(slack_level)" = errors ] && human_stale=1
+  elif slack_should_send held; then
+    # Only when it could post — see omp-notify.sh for why an always-suppressed
+    # held timer is harmful (it wins the conductor re-wake's claim).
     grace_realert "${HERDR_PANE_ID}" "$(prompt_id "${HERDR_PANE_ID}" 2>/dev/null || printf '')" \
       "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
       bash "$notify" --class held --choices ${cwd:+--cwd "$cwd"} "$msg"

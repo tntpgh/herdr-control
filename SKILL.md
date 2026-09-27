@@ -313,6 +313,7 @@ Slack gets only what the automation cannot fix itself (2026-09-26). Every
 | `wake-fail` | the conductor wake failed and the prompt is open after `HERDR_WAKE_FAIL_ALERT_S` | `lib/push-wake.sh` |
 | `control-plane` | the hub's herdr subscription is down / back | `hub-connection-alert.sh` |
 | `deploy` | a deploy is overdue / resolved | `deploy-drift-alert.sh` |
+| `unwatched` | a Claude prompt from a session with no herdr pane (no automation can see it) | `claude-notify.sh` |
 
 `needs-input` (the immediate prompt alert and the edge backstop), `held`
 (allow-class prompt past the peer grace), `info`, and an unclassified call are
