@@ -928,26 +928,26 @@ export const HERDR_HOOK_APPROVAL_PROTOCOL = 1;
 let registryApproval: "hook" | "menu" | undefined; // cached once the registry answers
 let registryApprovalReadFailed = false; // one failed sync read per session, then the env signal only
 
-const APPROVAL_READ_ARGS = ["-c", '. "$1" && read_task "$2" "$3"', "herdr-approval", RUN_REGISTRY_SH, WORKER_RUN_ID, WORKER_TASK_ID];
-
-function approvalReadEnv(): Record<string, string | undefined> {
-  const env: Record<string, string | undefined> = { ...process.env, HOME: LOAD_HOME };
-  if (LOAD_RUN_STATE_DIR) env.HERDR_RUN_STATE_DIR = LOAD_RUN_STATE_DIR;
-  else delete env.HERDR_RUN_STATE_DIR;
-  return env;
+// The row is read with a READ-ONLY query (sqlite3 -readonly, mode=ro): no
+// registry_init, so no migration/WAL pragma can lose a lock race with another
+// writer and turn "hook" into "unknown" (observed: an intermittent failed read
+// left a hook row unenforced for that call). A registry that predates schema
+// v6 has no approval column and therefore no hook rows: that answer is "menu".
+function sqlQuote(v: string): string {
+  return `'${v.replace(/'/g, "''")}'`;
 }
+const REGISTRY_DB = path.join(
+  LOAD_RUN_STATE_DIR || path.join(LOAD_HOME, ".local/state/herdr/runs"),
+  "registry.sqlite3",
+);
+const APPROVAL_SQL =
+  `SELECT approval FROM tasks WHERE run_id=${sqlQuote(WORKER_RUN_ID)} AND task_id=${sqlQuote(WORKER_TASK_ID)};`;
+const APPROVAL_READ_ARGS = ["-readonly", "-batch", "-noheader", "-cmd", ".timeout 3000", `file:${REGISTRY_DB}?mode=ro`, APPROVAL_SQL];
 
-// A read that succeeded with no row means "not a hook task" (menu), cached like
-// any answer — HERDR_APPROVAL=hook still tightens that session to refuse-all.
-function parseApprovalRow(stdout: string): "hook" | "menu" | undefined {
-  if (!stdout.trim()) return "menu";
-  try {
-    const row = JSON.parse(stdout.trim()) as Record<string, unknown>;
-    if (!row || typeof row !== "object" || row.task_id !== WORKER_TASK_ID) return undefined;
-    return row.approval === "hook" ? "hook" : "menu";
-  } catch {
-    return undefined;
-  }
+function parseApprovalRead(status: number | null, stdout: string, stderr: string): "hook" | "menu" | undefined {
+  if (status === 0) return stdout.trim() === "hook" ? "hook" : "menu"; // no row = not a hook task
+  if (/no such column: approval/.test(stderr)) return "menu";
+  return undefined;
 }
 
 // Prefetched once at module load (session start) so a menu worker's first tool
@@ -956,13 +956,15 @@ function parseApprovalRow(stdout: string): "hook" | "menu" | undefined {
 function prefetchRegistryApproval(): void {
   if (!WORKER_TASK_ID || !WORKER_RUN_ID) return;
   try {
-    if (!safeExists(RUN_REGISTRY_SH)) return;
-    const child = spawn("bash", APPROVAL_READ_ARGS, { stdio: ["ignore", "pipe", "ignore"], env: approvalReadEnv() });
+    if (!safeExists(REGISTRY_DB)) return;
+    const child = spawn("sqlite3", APPROVAL_READ_ARGS, { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
+    let err = "";
     child.on("error", () => {});
     child.stdout?.on("data", (d) => { out += String(d); });
+    child.stderr?.on("data", (d) => { err += String(d); });
     child.on("close", (code) => {
-      if (code === 0 && !registryApproval) registryApproval = parseApprovalRow(out);
+      if (!registryApproval) registryApproval = parseApprovalRead(code, out, err);
     });
     child.unref();
   } catch {
@@ -973,26 +975,40 @@ prefetchRegistryApproval();
 
 function readRegistryApproval(): "hook" | "menu" | undefined {
   if (registryApproval) return registryApproval;
-  if (registryApprovalReadFailed || !WORKER_RUN_ID || !safeExists(RUN_REGISTRY_SH)) return undefined;
-  const r = spawnSync("bash", APPROVAL_READ_ARGS, {
-    encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "pipe"], env: approvalReadEnv(),
-  });
-  registryApproval = r.error || r.status !== 0 ? undefined : parseApprovalRow(r.stdout ?? "");
+  if (registryApprovalReadFailed || !WORKER_RUN_ID || !safeExists(REGISTRY_DB)) return undefined;
+  for (let attempt = 0; attempt < 3 && !registryApproval; attempt++) {
+    const r = spawnSync("sqlite3", APPROVAL_READ_ARGS, { encoding: "utf8", timeout: 4_000, stdio: ["ignore", "pipe", "pipe"] });
+    registryApproval = r.error ? undefined : parseApprovalRead(r.status, r.stdout ?? "", r.stderr ?? "");
+  }
   // A menu worker must not pay a synchronous registry read on every call while
-  // the registry is unhealthy; a hook worker still fails closed through
-  // HERDR_APPROVAL=hook (and lib/pretool-shadow.sh reads the row itself).
+  // the registry is unhealthy. A worker launched without a menu is still
+  // enforced below (argv / env), and the enforcing lib reads the row itself.
   if (!registryApproval) registryApprovalReadFailed = true;
   return registryApproval;
 }
 
+// omp's own launch flags: a registered worker running with no approval menu is
+// ALWAYS judged by the hook, whatever the registry read says — a failed read
+// must never mean "no check at all". The flags are fixed at process start; the
+// worker cannot change them.
+const LOAD_NO_MENU = (() => {
+  const argv = process.argv;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--auto-approve" || a === "--yolo" || a === "--approval-mode=yolo") return true;
+    if (a === "--approval-mode" && argv[i + 1] === "yolo") return true;
+  }
+  return false;
+})();
+
 function hookApprovalEnforced(): boolean {
   if (!WORKER_TASK_ID) return false;
+  if (LOAD_NO_MENU || LOAD_APPROVAL_ENV === "hook") return true;
   try {
-    if (readRegistryApproval() === "hook") return true;
+    return readRegistryApproval() === "hook";
   } catch {
-    // fall through to the tighten-only env signal
+    return false;
   }
-  return LOAD_APPROVAL_ENV === "hook";
 }
 
 function enforceHookApproval(event: unknown, ctx: unknown): Block | undefined {

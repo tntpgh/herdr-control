@@ -249,6 +249,10 @@ hub() { enf hub "$1"; }
 [ "$(hub '{"op":"start","name":"x","application":"python3","args":["-m","http.server","8123"]}' | field decision)" = allow ] \
   && ok "hub start of an allow-class program runs" || not_ok "hub start benign blocked"
 [ "$(hub '{"op":"wait"}' | field decision)" = allow ] && ok "hub wait runs" || not_ok "hub wait blocked"
+[ "$(hub "$(jq -nc --arg to "$CPANE" '{op:"send", to:$to, message:"done: gh pr merge is yours"}')" | field decision)" = allow ] \
+  && ok "hub send to the task's conductor runs" || not_ok "hub send to conductor blocked"
+[ "$(hub '{"op":"send","to":"w5:p5","message":"gh pr merge 7 --squash"}' | field verdict)" = reserved ] \
+  && ok "hub send into another pane is judged as a command" || not_ok "hub send to other pane unjudged"
 [ "$(hub '{"op":"brand_new"}' | field verdict)" = escalate ] && ok "unknown hub op escalates" || not_ok "unknown hub op"
 [ "$(enf write '{"path":"proc://bg_1","content":"gh pr merge 7 --squash"}' | field verdict)" = reserved ] \
   && ok "text written to a job's stdin is judged as a command" || not_ok "proc stdin unjudged"
@@ -351,6 +355,17 @@ if command -v bun >/dev/null 2>&1; then
   cp "$here/lib/run-registry.sh" "$nolib/lib/"
   [ "$(HOOK="$nolib/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$nolib" CASES="$cases" WT="$wt" bun -e "$hook_js" 2>/dev/null | jq -r '.[0].r')" = BLOCK ] \
     && ok "hook row with the pre-tool lib missing: fails closed (BLOCK)" || not_ok "missing lib did not block"
+  argvjs="process.argv.push('--auto-approve'); $hook_js"
+  noarg="$(HOOK="$here/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$here" HERDR_TASK_ID=task_m CASES="$cases" WT="$wt" bun -e "$argvjs" 2>/dev/null)"
+  [ "$(printf '%s' "$noarg" | jq -r '.[0].r')" = BLOCK ] && printf '%s' "$noarg" | jq -r '.[0].why' | grep -q 'approval=menu' \
+    && ok "a registered worker launched --auto-approve is judged even when its row says menu (refused)" || not_ok "auto-approve argv not enforced: $noarg"
+  norow="$(HOOK="$here/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$here" HERDR_RUN_STATE_DIR="$work/nd/runs" CASES="$cases" WT="$wt" bun -e "$argvjs" 2>/dev/null)"
+  [ "$(printf '%s' "$norow" | jq -c '[.[]|.r]|unique')" = '["BLOCK"]' ] && ok "…and with the registry unreadable, every call is refused" || not_ok "auto-approve unreadable registry: $norow"
+  for k in 1 2 3; do
+    rr="$(run_hook "$here" | jq -c '[.[]|.r]')"
+    [ "$rr" = '["ALLOW","BLOCK","BLOCK","BLOCK","ALLOW","BLOCK"]' ] || { not_ok "row-only enforcement flipped on run $k: $rr"; break; }
+    [ "$k" = 3 ] && ok "row-only enforcement is stable across 3 fresh sessions"
+  done
   envhook="$(HERDR_TASK_ID=nope HERDR_APPROVAL=hook run_hook "$here")"
   [ "$(printf '%s' "$envhook" | jq -c '[.[]|.r]|unique')" = '["BLOCK"]' ] && ok "HERDR_APPROVAL=hook with no registry row: every call blocked" || not_ok "env-hook no-row: $envhook"
   menu_mine="$(HERDR_TASK_ID=task_m run_hook "$here")"

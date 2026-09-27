@@ -1,7 +1,7 @@
 # Pre-tool approval: the hook decides on the exact input
 
-Status (2026-09-27): **shadow for every worker; enforcement built but OFF by
-default.** The hook records a verdict for every registered-worker tool call.
+Status (2026-09-27): **shadow for every worker; enforcement built on an
+UNMERGED branch (PR #170), blocked on the open finding in §12.** The hook records a verdict for every registered-worker tool call.
 Enforcement exists only behind `spawn-task.sh --approval hook` (§11), which no
 default or existing spawn uses; the approval menu, `herdr-select.sh` and peer
 answering are unchanged for every other task. Terrence answered the cutover
@@ -334,7 +334,13 @@ Nothing here runs for a task spawned without the flag.
   it turns enforcement on so that an unreadable registry or a disagreeing row
   refuses every call. The existing guards (fleet registration, #159 write scope)
   still run first. Then `lib/pretool-shadow.sh --enforce --record` runs
-  synchronously (20 s timeout) on the exact input; any failure blocks.
+  synchronously (20 s timeout) on the exact input; any failure blocks. A
+  registered worker whose omp was launched with no approval menu
+  (`--auto-approve`, `--yolo`, `--approval-mode yolo` in omp's own argv) is
+  always enforced, whatever the row read says — the lib then refuses if the row
+  does not say `hook`. The row is read with a read-only query (no
+  `registry_init`), retried, so a lock race cannot flip a hook row to
+  unenforced (seen once in testing before this change).
 - **Verdict → answer**: allow runs; `deny`/`block` are refused with no request;
   `escalate`/`reserved`/`learn` look up `action_requests` for
   `(task, action_sha256)` — an approved one-shot grant is consumed (check-and-set
@@ -394,14 +400,48 @@ Nothing here runs for a task spawned without the flag.
     knows).
   - A menu worker whose registry read fails reads once, then relies on the
     env signal only.
-  - Residual, stated (rule 7): a same-uid process can still write the registry
-    or a form record by means the text rules do not recognise (obfuscated
-    paths, a script whose bytes the rules cannot read); `hub send` types a
-    message into another pane; `read http(s)://` and `web_search` stay
-    unscoped (q3); a bash call's persistent-shell cwd is not what the grant
-    binds when the call names no `cwd`.
+  - `hub send` to anything but the task's conductor pane is judged as a
+    command (it types into a pane that may be a shell).
+  - Residual, stated: `read http(s)://` and `web_search` stay unscoped (q3); a
+    bash call's persistent-shell cwd is not what the grant binds when the call
+    names no `cwd`; inline `GIT_CONFIG_*=…` / `export` shapes classify allow in
+    both modes (reviewer note, pre-existing).
 - **Differences from §4's sketch**: request state lives in an `action_requests`
   table (events alone cannot do an atomic one-shot consume); the Slack/form half
   runs in the hub, not the worker, because a `--no-secrets` worker has no Slack
   credential; conductor wakes use `send-to-agent.sh` directly rather than
   `lib/push-wake.sh`, whose prompt-id machinery this path exists to retire.
+
+## 12. OPEN, blocks merge: a same-uid worker can forge its own approval
+
+Review round 2 on `97ac9c8` (both reviewers, live-proven): the hook-approval
+rules are text patterns, and an allowed bash call that builds its target at
+run time (`$(printf %s <base64> | base64 -d)`, a glob like
+`~/.local/state/h*/runs/r*.sqlite3`, a symlink, or a script whose content is
+clean text) writes the registry or the pinned hub-form record. The next
+re-issue of a human-only call then runs as if Terrence had approved it. Both
+live reproductions were end to end: `gh pr merge … --admin` reserved → forged
+record/row → the tick applied it as `approved/human` → re-issue ran.
+
+This cannot be closed by more patterns or by path resolution: the worker, the
+decider (`herdr-action.sh`), the hub and the registry all run as one uid, so
+anything the hook can read the worker can write, and a clean-classified script
+runs with no review at all. docs/approval-policy.md rule 7 already says the
+approval layer is a trust boundary, not containment. The same class exists in
+the menu path today — measured on origin/main with peer authority:
+`herdr pane send-keys <own pane> Enter` → allow, and
+`(sleep 20; bash "$(printf %s <b64 of herdr-select.sh> | base64 -d)" <own pane> 1 --authority human) &` → allow.
+A worker can already press Approve on its own reserved menu with one allowed
+command.
+
+What hook mode changes is that no human glances at each call (§7), so the only
+thing between a deliberately adversarial worker and a reserved action is the
+worker's own honesty, in both modes. The decision needed before merge:
+
+- (A) accept this as the rule-7 residual for hook mode, as it is already
+  accepted for the menu path, and merge off-by-default; or
+- (B) require hook-approval workers to run isolated under a different uid or
+  container that cannot write `~/.local/state/herdr` or the herdr-control
+  checkout (`isolated-worker.py` is the existing starting point), and merge
+  only with that; or
+- (C) keep the branch unmerged and hook approval off.
