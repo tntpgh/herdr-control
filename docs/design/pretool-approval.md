@@ -1,7 +1,8 @@
 # Pre-tool approval: the hook decides on the exact input
 
-Status (2026-09-27): **shadow for every worker; enforcement built on an
-UNMERGED branch (PR #170), blocked on the open finding in §12.** The hook records a verdict for every registered-worker tool call.
+Status (2026-09-27): **shadow for every worker; enforcement merged but OFF by
+default** (PR #170, after Terrence accepted the §12 same-user residual). The
+hook records a verdict for every registered-worker tool call.
 Enforcement exists only behind `spawn-task.sh --approval hook` (§11), which no
 default or existing spawn uses; the approval menu, `herdr-select.sh` and peer
 answering are unchanged for every other task. Terrence answered the cutover
@@ -414,7 +415,7 @@ Nothing here runs for a task spawned without the flag.
   credential; conductor wakes use `send-to-agent.sh` directly rather than
   `lib/push-wake.sh`, whose prompt-id machinery this path exists to retire.
 
-## 12. OPEN, blocks merge: a same-uid worker can forge its own approval
+## 12. Same-uid residual: a worker can forge its own approval (DECIDED: A + B)
 
 Review round 2 on `97ac9c8` (both reviewers, live-proven): the hook-approval
 rules are text patterns, and an allowed bash call that builds its target at
@@ -447,3 +448,15 @@ worker's own honesty, in both modes. The decision needed before merge:
   checkout (`isolated-worker.py` is the existing starting point), and merge
   only with that; or
 - (C) keep the branch unmerged and hook approval off.
+
+**Decision (Terrence, 2026-09-27, hub form `20260927T022930-8742`, answered via
+the hub): (A) + (B).** Merge PR #170 with hook mode OFF by default, and record
+the same-user gap as the rule-7 residual for BOTH the menu path and hook mode.
+Open the isolation follow-up: run workers under a separate macOS user or a
+container that cannot write `~/.local/state/herdr`, the checkouts, or
+Terrence's gh/1Password credentials — required before hook mode becomes the
+default and for any task that reads untrusted input (starting point:
+`isolated-worker.py`). His note: "there are things like devcontainers that
+might work, but we'd have to be mindful of how our system works. Like the idea
+of getting better at our security with this." The 5-day shadow gate (§10 q1)
+still applies to any canary.
