@@ -196,11 +196,22 @@ printf '== positive controls: the worker flow the lab depends on is STILL allowe
 # coverage (`check_reserved "-u origin HEAD"` and 20+ related DWIM/refspec
 # cases) lives in `verify-command-policy.sh`; asserting it here too would
 # duplicate that suite, not add coverage.
-for allowed in "gh pr create --base main --fill" "gh issue edit 5 --add-label ready-for-review" "set -euo pipefail" "export UV_CACHE_DIR=/tmp/uv" "bash scripts/ci.sh"; do
+for allowed in "gh pr create --base main --fill" "gh issue edit 5 --add-label ready-for-review" "set -euo pipefail" "export UV_CACHE_DIR=/tmp/uv"; do
   set_screen "$allowed"; reset_keys
   sel 1 --authority peer; rc=$?
   [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] && ok "'$allowed' still allowed for peer" || bad "'$allowed' now refused: rc=$rc; $(grep -m1 REFUSED "$WORK/err.txt")"
 done
+# `bash scripts/ci.sh` used to be a positive control here. It only passed
+# because a multi-line scraped panel skipped code by reference entirely (F8,
+# PR #160, review round 1 finding 1). For this registered task it is a
+# relative script without the `cd <wt> && ` binding, so it is unresolvable,
+# exactly like the single-line recorded form on main: escalate, not reserved,
+# and nothing pressed. `cd <wt> && bash scripts/ci.sh` is the reviewable spelling.
+set_screen "bash scripts/ci.sh"; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = "0" ] && grep -q 'REFUSED (escalate)' "$WORK/err.txt" \
+  && ok "'bash scripts/ci.sh' (unbound relative script) escalates, nothing pressed" \
+  || bad "'bash scripts/ci.sh': rc=$rc keys=$(keys_pressed); $(grep -m1 REFUSED "$WORK/err.txt")"
 printf '== the SAME reserved prompt, HUMAN authority -> allowed (a human is the authority) ==\n'
 set_screen "gh pr merge 5 --squash"; reset_keys
 sel 1 --authority human; rc=$?
