@@ -573,6 +573,12 @@ f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
 rm -f "$F5W/new-helper.sh"
 f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
 [ "$rc" = 0 ] && ok "(b2) back to the approved state: replays again" || bad "(b2) restored state refused: $PD_VERDICT — $PD_REASON"
+printf 'x_ok() { echo hidden edit; }\n' > "$F5W/lib/x.sh"
+git -C "$F5W" update-index --assume-unchanged lib/x.sh
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" != 0 ] && ! f5_trunkish && ok "(j) an edit hidden by assume-unchanged disqualifies the trunk path" || bad "(j) assume-unchanged hid an edit: rc=$rc $PD_VERDICT — $PD_REASON"
+git -C "$F5W" update-index --no-assume-unchanged lib/x.sh
+git -C "$F5W" checkout -q -- lib/x.sh
 printf 'lib/hidden.sh\n' > "$F5W/.gitignore"
 f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
 [ "$rc" != 0 ] && ! f5_trunkish && ok "(h) a changed .gitignore disqualifies the trunk path" || bad "(h) .gitignore change kept the trunk path: rc=$rc $PD_VERDICT — $PD_REASON"

@@ -226,7 +226,10 @@ _sp_trunk_suite() {                     # wt path snap [trunk]
   git -C "$realwt" cat-file -e "$tip^{commit}" 2>/dev/null || return 1
   blob="$(git -C "$realwt" rev-parse --verify -q "$tip:$rel" 2>/dev/null)" || return 1
   [ "$blob" = "$(git -C "$realwt" hash-object --no-filters -- "$snap" 2>/dev/null)" ] || return 1
-  changed="$(git -C "$realwt" diff --name-only "$tip" 2>/dev/null)" || return 1
+  # A tracked edit hidden from `git diff` (assume-unchanged / skip-worktree
+  # index bits) must not read as "no change": any such bit disqualifies.
+  git -C "$realwt" ls-files -v 2>/dev/null | grep -qE '^([a-z]|S) ' && return 1
+  changed="$(git -C "$realwt" diff --no-ext-diff --no-textconv --name-only "$tip" 2>/dev/null)" || return 1
   case $'\n'"$changed" in *$'\n'.gitignore*|*/.gitignore*) return 1 ;; esac
   untracked="$(cd "$realwt" && git ls-files -o --exclude-per-directory=.gitignore -z 2>/dev/null | sort -z |
     xargs -0 -I{} sh -c 'printf "%s %s\n" "$(shasum -a 256 < "$1" | cut -d" " -f1)" "$1"' _ {} 2>/dev/null)"
@@ -234,7 +237,7 @@ _sp_trunk_suite() {                     # wt path snap [trunk]
   if [ -z "$changed" ] && [ -z "$untracked" ]; then
     printf 'clean %s\n' "${tip:0:12}"; return 0
   fi
-  digest="$( { git -C "$realwt" diff --binary "$tip" 2>/dev/null; printf '\n--untracked--\n%s\n' "$untracked"; } | shasum -a 256 | cut -d' ' -f1)"
+  digest="$( { git -C "$realwt" diff --no-ext-diff --no-textconv --binary "$tip" 2>/dev/null; printf '\n--untracked--\n%s\n' "$untracked"; } | shasum -a 256 | cut -d' ' -f1)"
   printf 'diff %s %s\n' "${tip:0:12}" "$digest"
 }
 
