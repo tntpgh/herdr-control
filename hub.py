@@ -1651,6 +1651,24 @@ def _attention_tick() -> None:
         _live_log(f"attention tick failed: {exc}")
 
 
+ACTION_SCRIPT = Path(__file__).resolve().parent / "herdr-action.sh"
+
+
+def _action_tick() -> None:
+    """Hook-approval action requests (docs/design/pretool-approval.md §4):
+    wake a conductor that was not woken, and for human-only (or stale)
+    requests post ONE Slack alert and keep a hub decision form open, applying
+    it once answered. Runs from the hub because the hub holds the Slack
+    credential a --no-secrets worker does not. A pass with nothing pending is
+    one SQLite query. Never raises."""
+    if not ACTION_SCRIPT.exists():
+        return
+    try:
+        subprocess.run(["bash", str(ACTION_SCRIPT), "tick"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _live_log(f"action tick failed: {exc}")
+
+
 def _attention_loop() -> None:
     while True:
         try:
@@ -1658,6 +1676,10 @@ def _attention_loop() -> None:
         except Exception as e:  # noqa: BLE001 — belt and braces: the loop must not die
             ATTENTION_STATE["last_error"] = f"{type(e).__name__}: {e}"
             _live_log(f"attention loop error: {type(e).__name__}: {e}")
+        try:
+            _action_tick()
+        except Exception as e:  # noqa: BLE001 — same: never kill the loop
+            _live_log(f"action tick error: {type(e).__name__}: {e}")
         time.sleep(ATTENTION_INTERVAL_S)
 
 

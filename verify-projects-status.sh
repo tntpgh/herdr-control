@@ -53,7 +53,7 @@ got_project2="$(read_task run1 task2 | jq -r '.project')"
   || bad "expected empty project, got '$got_project2'"
 
 schema_ver="$(_sql "SELECT value FROM schema_meta WHERE key='schema_version';")"
-[ "$schema_ver" = "5" ] && ok "schema_meta reports version 5" || bad "schema_version is '$schema_ver', expected 5"
+[ "$schema_ver" = "6" ] && ok "schema_meta reports version 6" || bad "schema_version is '$schema_ver', expected 6"
 
 # ── 2: hub.py spec_checklist() / project_needs_wake() ───────────────────────
 # Written to a real temp .py file rather than a heredoc inside $(...): this

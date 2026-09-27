@@ -99,7 +99,7 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '5\n'; }
+_registry_schema_version() { printf '6\n'; }
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
@@ -262,6 +262,7 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   _migrate_schema_v3
   _migrate_schema_v4
   _migrate_schema_v5
+  _migrate_schema_v6
   _migrate_legacy_files
   return 0
 }
@@ -314,6 +315,52 @@ _migrate_schema_v5() {
     _sql "ALTER TABLE tasks ADD COLUMN manifest TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
   fi
   _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '5');" >/dev/null 2>&1
+}
+
+# v6 (docs/design/pretool-approval.md, 2026-09-27): the approval posture a task
+# was SPAWNED with (`menu` = omp's approval menu + herdr-select, the default;
+# `hook` = omp --auto-approve + the enforcing pre-tool hook), fixed at
+# registration — nothing updates it afterwards, so a relaunch in the same pane
+# keeps it — and the action requests that enforcing hook hands to a conductor
+# or a human instead of painting a menu. A request row is the ONE state of an
+# escalated call: pending -> approved|declined, and an approved one-shot grant
+# -> consumed exactly once (check-and-set UPDATE). `action_sha256` is the
+# sha256 of the call's execution-relevant input (lib/pretool-shadow.sh
+# pretool_action_sha), so a grant can never be stretched to other bytes.
+_migrate_schema_v6() {
+  local has_approval
+  has_approval=$(_sql "SELECT 1 FROM pragma_table_info('tasks') WHERE name='approval';" 2>/dev/null)
+  if [ -z "$has_approval" ]; then
+    _sql "ALTER TABLE tasks ADD COLUMN approval TEXT NOT NULL DEFAULT 'menu';" >/dev/null 2>&1
+  fi
+  _sql "CREATE TABLE IF NOT EXISTS action_requests (
+      request_id      TEXT PRIMARY KEY,
+      run_id          TEXT NOT NULL DEFAULT '',
+      task_id         TEXT NOT NULL,
+      tool            TEXT NOT NULL DEFAULT '',
+      action_sha256   TEXT NOT NULL,
+      command         TEXT NOT NULL DEFAULT '',
+      verdict         TEXT NOT NULL DEFAULT '',
+      reason          TEXT NOT NULL DEFAULT '',
+      route           TEXT NOT NULL DEFAULT 'conductor',
+      grant_kind      TEXT NOT NULL DEFAULT 'once',
+      code_path       TEXT NOT NULL DEFAULT '',
+      code_sha256     TEXT NOT NULL DEFAULT '',
+      status          TEXT NOT NULL DEFAULT 'pending',
+      created_at      TEXT NOT NULL,
+      decided_at      TEXT,
+      decided_by      TEXT NOT NULL DEFAULT '',
+      authority       TEXT NOT NULL DEFAULT '',
+      review_category TEXT NOT NULL DEFAULT '',
+      decision_reason TEXT NOT NULL DEFAULT '',
+      consumed_at     TEXT,
+      surfaced_at     TEXT,
+      form_path       TEXT NOT NULL DEFAULT '',
+      form_record     TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS action_requests_by_task ON action_requests(task_id, action_sha256, created_at);
+    CREATE INDEX IF NOT EXISTS action_requests_pending ON action_requests(status) WHERE status='pending';" >/dev/null 2>&1
+  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '6');" >/dev/null 2>&1
 }
 
 # ---- one-time import of the pre-SQLite file layout --------------------------
@@ -406,12 +453,12 @@ gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand
 # names whether it asked for one task or all of them.
 _task_json_select() {
   printf "%s" "SELECT json_object(
-    'schema', 5, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
+    'schema', 6, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
     'conductor_id', conductor_id, 'conductor_pane_id', conductor_pane_id,
     'conductor_pane_birth', conductor_pane_birth, 'pane_id', pane_id,
     'pane_birth', pane_birth, 'agent_session', agent_session, 'repo', repo,
     'worktree', worktree, 'branch', branch, 'trunk', trunk, 'project', project,
-    'manifest', manifest,
+    'manifest', manifest, 'approval', approval,
     'label', label, 'state', state, 'created_at', created_at, 'updated_at', updated_at) FROM tasks"
 }
 
@@ -433,7 +480,11 @@ register_task() {
   local run_id="$1" task_id="$2" worker_id="$3" conductor_id="$4" \
         conductor_pane_id="$5" conductor_pane_birth="$6" pane_id="$7" pane_birth="$8" \
         repo="$9" worktree="${10}" label="${11}" branch="${12:-}" trunk="${13:-}" \
-        project="${14:-}" manifest="${15:-}"
+        project="${14:-}" manifest="${15:-}" approval="${16:-menu}"
+  case "$approval" in
+    menu|hook) ;;
+    *) printf 'run-registry: invalid approval posture %s (menu|hook)\n' "$approval" >&2; return 1 ;;
+  esac
   if [ -z "$manifest" ]; then
     case "$project" in
       \{*) manifest="$project"; project="" ;;
@@ -447,13 +498,18 @@ register_task() {
   # tasks table comment in registry_init.
   if _sql "INSERT INTO tasks
       (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth,
-       pane_id, pane_birth, repo, worktree, branch, trunk, project, manifest, label, state, created_at, updated_at)
+       pane_id, pane_birth, repo, worktree, branch, trunk, project, manifest, approval, label, state, created_at, updated_at)
       VALUES ($(_sq "$task_id"), $(_sq "$run_id"), $(_sq "$worker_id"), $(_sq "$conductor_id"),
         $(_sq "$conductor_pane_id"), $(_sq "$conductor_pane_birth"), $(_sq "$pane_id"),
         $(_sq "$pane_birth"), $(_sq "$repo"), $(_sq "$worktree"), $(_sq "$branch"), $(_sq "$trunk"),
-        $(_sq "$project"), $(_sq "$manifest"), $(_sq "$label"), 'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
+        $(_sq "$project"), $(_sq "$manifest"), $(_sq "$approval"), $(_sq "$label"), 'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
     append_event "$run_id" "$task_id" "registered" \
       "$(jq -nc --arg p "$pane_id" --arg l "$label" '{pane_id:$p, label:$l}')" >/dev/null 2>&1
+    if [ "$approval" = hook ]; then
+      append_event "$run_id" "$task_id" "approval_posture" \
+        "$(jq -nc --arg c "$conductor_id" --arg cp "$conductor_pane_id" \
+           '{approval:"hook", approved_by:$c, conductor_pane:$cp}')" >/dev/null 2>&1
+    fi
     if [ -n "$manifest" ]; then
       append_event "$run_id" "$task_id" "manifest_approved" \
         "$(jq -nc --arg c "$conductor_id" --arg cp "$conductor_pane_id" \

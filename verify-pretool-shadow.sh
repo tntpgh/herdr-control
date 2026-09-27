@@ -175,6 +175,7 @@ bash_payload ls dup1 | shadow --record >/dev/null
 printf '== the omp hook: return value unchanged, non-worker untouched, never throws ==\n'
 if command -v bun >/dev/null 2>&1; then
   hook_js='const mod = await import(process.env.HOOK); const h = {}; mod.default({on: (e, f) => { h[e] = f; }});
+    await new Promise((res) => setTimeout(res, 700)); // omp: session start precedes the first tool call
     const cases = JSON.parse(process.env.CASES); const out = [];
     for (const c of cases) { const t = performance.now(); let r; try { r = h.tool_call(c.ev, {cwd: process.env.WT}); } catch (err) { r = "THREW"; }
       out.push({id: c.id, r: r === "THREW" ? "THREW" : (r?.block ? "BLOCK" : "ALLOW"), ms: performance.now() - t}); }

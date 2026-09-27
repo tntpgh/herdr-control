@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-task.sh <project> <branch> [job-class|auto] [agent-or-command...] [--route deterministic|jev] [--base REF] [--dry-run] [--focus] [--no-secrets] [--brief FILE]
+# spawn-task.sh <project> <branch> [job-class|auto] [agent-or-command...] [--route deterministic|jev] [--base REF] [--dry-run] [--focus] [--no-secrets] [--brief FILE] [--approval menu|hook]
 #
 # Every worker starts with the 1Password service-account identity (one vault,
 # 249 items, READ-ONLY) so an unattended run never stops to ask for a
@@ -60,6 +60,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 # --secrets, typed by a human or a conductor that holds it, lifts that.
 secrets_req=""
 [ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && secrets_req=withhold
+approval_req=menu
 base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; brief_file=""; project_label=""; route_provider=""; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -80,6 +81,10 @@ while [ $# -gt 0 ]; do
     --brief) brief_file="${2:?spawn-task: --brief needs a file path}"; shift 2 ;;
     --route) route_provider="${2:?spawn-task: --route needs deterministic or jev}"; shift 2 ;;
     --secrets) secrets_req=grant; shift ;;
+    # docs/design/pretool-approval.md: `hook` = omp --auto-approve + the worker
+    # config overlay + the enforcing pre-tool hook, recorded on the registry
+    # row. Default `menu` is today's approval menu and changes nothing.
+    --approval) approval_req="${2:?spawn-task: --approval needs menu or hook}"; shift 2 ;;
     --dry-run|-n) dry=1; shift ;;
     --focus) foc=--focus; shift ;;
     # Everything after `--` belongs to the worker's own command, flags included.
@@ -198,6 +203,42 @@ fi
 # loosen past what this spawn was granted.
 eff_posture=$(resolved_posture "$posture_req")
 
+# ---- approval posture (menu | hook) -------------------------------------------
+# Validated here, before any worktree/registry/herdr side effect: an invalid
+# or impossible posture refuses the spawn — it never falls back to a posture
+# nobody chose. `hook` is only for a managed omp launch at the default `write`
+# floor: it swaps omp's approval menu for --auto-approve plus the worker
+# overlay (agent-hooks/omp-worker-overlay.yml: eval/python/browser/computer/
+# debug/paid tools denied), and the pre-tool hook then judges every call. A
+# stricter floor (strict = every call prompts) or a yolo request is refused
+# rather than silently re-interpreted. The posture is written to the registry
+# row once, at registration, and nothing updates it: a relaunch in this pane
+# keeps it (the hook reads the row, not the environment).
+case "$approval_req" in
+  menu) ;;
+  hook)
+    [ "$managed" = 1 ] || { echo "spawn-task: --approval hook needs a managed agent launch (claude|codex|omp), not a literal command" >&2; exit 2; }
+    case "$agent" in claude|codex|omp) ;; *) echo "spawn-task: --approval hook is omp-only; '$agent' launches its own harness" >&2; exit 2 ;; esac
+    [ "$eff_posture" = write ] || { echo "spawn-task: --approval hook requires the write posture floor (effective: $eff_posture) — refusing rather than loosening or re-interpreting it" >&2; exit 2; }
+    worker_overlay="$here/agent-hooks/omp-worker-overlay.yml"
+    [ -r "$worker_overlay" ] || { echo "spawn-task: --approval hook: worker overlay missing ($worker_overlay)" >&2; exit 2; }
+    # --auto-approve is only safe if the extension omp will load at session
+    # start IS this checkout's enforcing hook: otherwise (an older main
+    # checkout, a missing or foreign symlink) the worker runs with no judge.
+    omp_ext="${HERDR_OMP_EXTENSION:-$HOME/.omp/agent/extensions/herdr-control.ts}"
+    omp_ext_real="$(cd "$(dirname "$omp_ext")" 2>/dev/null && python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$omp_ext" 2>/dev/null)"
+    here_hook="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$here/agent-hooks/omp-herdr-control.ts" 2>/dev/null)"
+    if [ -z "$omp_ext_real" ] || [ "$omp_ext_real" != "$here_hook" ] || ! grep -q 'HERDR_HOOK_APPROVAL_PROTOCOL = 1' "$omp_ext_real" 2>/dev/null; then
+      echo "spawn-task: --approval hook: omp would load ${omp_ext_real:-<no extension>} at session start, not this checkout's enforcing hook ($here_hook) — refusing an --auto-approve worker with no judge" >&2
+      exit 2
+    fi
+    case "$cli" in
+      *" --approval-mode write") cli="${cli% --approval-mode write} --auto-approve --config $(printf '%q' "$worker_overlay")" ;;
+      *) echo "spawn-task: --approval hook: could not find the write-floor approval flag in the launch line; refusing" >&2; exit 2 ;;
+    esac ;;
+  *) echo "spawn-task: invalid --approval '$approval_req' (menu|hook) — refusing the spawn" >&2; exit 2 ;;
+esac
+
 # repo_root (lib/repo-root.sh): --show-toplevel alone returns a linked
 # worktree's own path, not the shared main-repo root — calling spawn-task.sh
 # against an existing task worktree would then scatter the new worktree
@@ -294,6 +335,7 @@ if [ "$dry" = 1 ]; then
   if [ "$managed" = 1 ]; then
     echo "  launch    : $cli"
     echo "  posture   : $eff_posture  (floor ${HERDR_POSTURE_FLOOR:-write}, request ${posture_req:-none}; stamped into the worker as HERDR_POSTURE_FLOOR — child spawns can only tighten)"
+    [ "$approval_req" = hook ] && echo "  approval  : hook — omp --auto-approve + worker overlay; the pre-tool hook decides every call and hands escalations to herdr-action.sh (registry row approval=hook)"
     echo "  rules     : ${CANONICAL_RULES_SRC:-<none — no ancestor AGENTS.md found/configured; normal project discovery only>}"
   else
     echo "  launch    : $cli"
@@ -496,8 +538,15 @@ pane=$(printf '%s' "$tc" | jq -r '.result.root_pane.pane_id // empty')
 pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 [ -n "$tab" ] && [ -n "$pane" ] || { echo "spawn-task: tab create failed in $ws" >&2; exit 1; }
 
-register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
-  "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk" "$project_label" "$manifest_json"
+if ! register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
+  "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk" "$project_label" "$manifest_json" "$approval_req"; then
+  # A menu worker has always launched anyway (its approvals still gate it); a
+  # hook worker runs with --auto-approve, so it is never launched unregistered.
+  if [ "$approval_req" = hook ]; then
+    echo "spawn-task: registration failed — a hook-approval worker is never launched without its registry row" >&2
+    exit 1
+  fi
+fi
 
 # ---- claim the worktree on the worker's behalf ------------------------------
 # A spawned worker will never type `claim.sh take`, and neither will anyone
@@ -628,6 +677,7 @@ true
 #     re-deriving from a possibly different tree — only when one resolved.
 stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_PANE_ID=%q HERDR_TASK_LABEL=%q HERDR_POSTURE_FLOOR=%q' \
   "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$eff_posture")
+[ "$approval_req" = hook ] && stamped_cli="$stamped_cli HERDR_APPROVAL=hook $(printf 'HERDR_CONTROL_DIR=%q' "$here")"
 [ -n "${HERDR_POLICY_EXTRA_RULES:-}" ] && stamped_cli="$stamped_cli $(printf 'HERDR_POLICY_EXTRA_RULES=%q' "$HERDR_POLICY_EXTRA_RULES")"
 [ -n "$CANONICAL_RULES_SRC" ] && stamped_cli="$stamped_cli $(printf 'HERDR_CANONICAL_RULES=%q' "$CANONICAL_RULES_SRC")"
 # The op prelude runs FIRST (lib/op-env.sh): a worker that has to hunt for a

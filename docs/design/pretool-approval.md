@@ -1,9 +1,13 @@
 # Pre-tool approval: the hook decides on the exact input
 
-Status: **shadow** (2026-09-26). The hook computes and records a verdict for every
-registered-worker tool call; nothing is enforced by it, and the approval menu,
-`herdr-select.sh` and peer answering are unchanged. Cutover is Terrence's
-decision after shadow data (§8).
+Status (2026-09-27): **shadow for every worker; enforcement merged but OFF by
+default** (PR #170, after Terrence accepted the §12 same-user residual). The
+hook records a verdict for every registered-worker tool call.
+Enforcement exists only behind `spawn-task.sh --approval hook` (§11), which no
+default or existing spawn uses; the approval menu, `herdr-select.sh` and peer
+answering are unchanged for every other task. Terrence answered the cutover
+questions on 2026-09-27 (§10); the first canary waits for the q1 gate
+(`scripts/shadow-compare.sh --gate`) and is scheduled by Main.
 
 ## 1. Goal and metric
 
@@ -76,8 +80,12 @@ cutover (`tools.approval.<tool>: deny`), with the hook as the backstop.
 | `read`, `grep`, `glob`, `find`, `ast_grep` | allow + credential check | allow; `reserved` when the path matches the reserved list's **credential** class (`conductor_reserved_reason "cat -- <path>"`, only its `credential-value` answer is used — its policy-filename rules are about editing and would reserve reading, backlog iii); `ssh://` → block |
 | `read` of `http(s)://`, `web_search` | allow | allow (a GET; same as today — `net_read` is not manifest-enforced for these, see §7) |
 | internal URLs (`skill://`, `rule://`, `artifact://`, `agent://`, `history://`, `pr://`, `issue://`, `local://`, `mcp://`) | allow | allow |
-| `todo`, `wait`, `ask`, `checkpoint`, `rewind`, `hub`, `resolve`, `security_scan`, `new_context`, `context_notes`, job observers | allow | allow |
-| `learn`, `retain`, `recall`, `reflect`, `report_issue` | allow | allow (omp memory, not a host action) — see open question 4 |
+| `hub` | split by `op` | `wait`/`inbox`/`list`/`jobs`/`logs`/`cancel`/`stop`/`send` allow; `start`/`restart` launch a program, so `application` + `args` are judged by peer_decide like a bash command (a service `env` escalates); any other op escalates |
+| `write proc://<job>` | verdict | the text written to a job's stdin is judged as a command |
+| `write` to any other URL scheme | escalate | except `agent://`, `local://`, `file://` (#159 containment) and `xd://` (device table); schemes are matched case-insensitively (`Xd://` is `xd://`) |
+| `todo`, `wait`, `ask`, `checkpoint`, `rewind`, `resolve`, `security_scan`, `new_context`, `context_notes`, job observers | allow | allow |
+| `learn` | conductor (q4) | escalate → an action request routed to the conductor; the lesson is saved only after review |
+| `retain`, `recall`, `reflect`, `report_issue` | allow | allow (omp memory, not a host action) |
 | read-only devices: `fleet_status`, `pr_ready`, `handoff_debt`, `single_copy_scan`, `worktree_debt`, `suite_wired`, `decisions_open`, `project_status`, `notepad_read`, `notepad_stats` | allow | allow |
 | `secret_present` | reserved | human-only: workers hold no credentials |
 | `memory_edit` | block | forgetting/invalidating shared memory is the conductor's |
@@ -103,7 +111,8 @@ hook cannot judge.
 
 ## 4. The one escalation channel (no menu)
 
-Enforcing-mode behaviour (design; not built this turn):
+Enforcing-mode behaviour (built 2026-09-27, behind `--approval hook`; §11 has the
+as-built differences):
 
 1. **Worker side.** The hook returns `{block: true, reason}` for `escalate` /
    `reserved`. Before returning it appends, with `claim_once`, an
@@ -237,7 +246,7 @@ that a reviewer cannot explain, `elapsed_ms` p95 recorded, and every
 `SHADOW_TIGHTER` row either accepted or turned into a policy fix in
 `lib/command-policy.sh` (one policy).
 
-Canary: one spawned task with an explicit `spawn-task.sh --pretool-enforce` flag
+Canary: one spawned task with an explicit `spawn-task.sh --approval hook` flag
 (stored on the registry row, so a relaunch keeps it): omp launched with
 `--auto-approve --config <worker overlay>` (`tools.approval.eval|python|browser|
 computer|debug|generate_image|tts|manage_skill: deny`) and the hook in enforcing
@@ -282,14 +291,173 @@ file_approvals), `lib/push-wake.sh`, `lib/pane-guard.sh`, `send-to-agent.sh`,
 - A shadow event can be lost if omp exits within milliseconds of the call (the
   detached child reads its payload from a pipe). Shadow data only; not a gate.
 
-## 10. Open questions for Terrence
+## 10. Terrence's decisions (2026-09-27)
 
-1. Cutover itself: auto-approve + enforcing hook for a canary task, after how much
-   shadow data?
-2. eval off for workers (files + code by reference instead): acceptable friction?
-3. `read`/`web_search` over HTTP stay unscoped as today — scope them to the
-   manifest's `net_read`, or leave it?
-4. `learn` writes lessons future sessions load (including Main's). Allow, or
-   route lesson text to the conductor?
-5. Human-route requests: Slack only, or also a formserve decision (durable,
-   expiry ≠ decline)?
+Answered on the hub form `20260927T001841-8741` (`answered_via: hub`); every
+recommended default was taken, no notes.
+
+1. **Canary gate:** start the 3-job canary only after **5 days** of shadow data
+   AND **≥ 1,000 shadow rows across ≥ 5 tasks**, with **≤ 2 % disagreement**, and
+   **every `SHADOW_LOOSER` row explained by hand**. Checked by
+   `scripts/shadow-compare.sh --gate` (explanations: `<seq>\t<why>` lines in
+   `~/.local/state/herdr/runs/shadow-explained.tsv`). Default after the canary
+   only if: zero reserved actions ran without a yes; ≤ 1 human question per job
+   (vs 5.06 baseline); no worker retries a blocked step more than once; every
+   handoff answered through the one channel and picked back up automatically.
+2. **eval / python / browser / debugger off for workers** (scripts run via bash
+   under code by reference instead), accepting the cost of the 244 historical
+   eval calls. Built as `agent-hooks/omp-worker-overlay.yml`, applied only with
+   `--approval hook`.
+3. **Web reads stay unscoped for now** (`read http(s)://`, `web_search`); revisit
+   after the canary.
+4. **`learn` goes to the conductor**: an action request; saved only if approved.
+5. **Human-route requests: Slack plus a durable hub decision form**; expiry is
+   never a decline.
+
+## 11. As built: enforcement behind `--approval hook` (2026-09-27)
+
+Nothing here runs for a task spawned without the flag.
+
+- **Spawn** (`spawn-task.sh --approval menu|hook`, default `menu`): `hook` is
+  validated before any side effect — managed omp launch only (claude/codex/omp
+  flavors), effective posture `write` only (a stricter floor or yolo refuses
+  rather than being re-interpreted), overlay present — and otherwise the spawn
+  is refused. It replaces `--approval-mode write` with
+  `--auto-approve --config agent-hooks/omp-worker-overlay.yml`, stamps
+  `HERDR_APPROVAL=hook`, and passes `approval=hook` to `register_task`, which
+  stores it on the row (schema v6 `tasks.approval`, default `menu`) and records
+  an `approval_posture` event. Nothing updates the column afterwards, so a
+  relaunch in that pane keeps it. A hook worker whose registration fails is never
+  launched. A default spawn's `--dry-run` output is byte-identical to before.
+- **Hook** (`agent-hooks/omp-herdr-control.ts`): enforcement is on only when the
+  task's **registry row** says `approval=hook` (read once per session, cached once
+  it answers). `HERDR_APPROVAL=hook` in the launch environment can only tighten:
+  it turns enforcement on so that an unreadable registry or a disagreeing row
+  refuses every call. The existing guards (fleet registration, #159 write scope)
+  still run first. Then `lib/pretool-shadow.sh --enforce --record` runs
+  synchronously (20 s timeout) on the exact input; any failure blocks. A
+  registered worker whose omp was launched with `--auto-approve` (or its alias
+  `--yolo`) — what `--approval hook` emits — is always enforced, whatever the
+  row read says; the lib then refuses if the row does not say `hook`. A
+  yolo-POSTURE menu spawn (`--approval-mode yolo`) is unchanged. The row is read
+  with a single SELECT on the plain path (no `registry_init`; not `-readonly`,
+  which cannot open a WAL database whose -wal/-shm files are absent), retried, so a lock race cannot flip a hook row to
+  unenforced (seen once in testing before this change).
+- **Verdict → answer**: allow runs; `deny`/`block` are refused with no request;
+  `escalate`/`reserved`/`learn` look up `action_requests` for
+  `(task, action_sha256)` — an approved one-shot grant is consumed (check-and-set
+  UPDATE; exactly one of N parallel identical calls runs) and the call runs; a
+  pending request blocks as "still waiting"; a declined one blocks with the
+  reviewer's reason and is not re-requested; otherwise a new request is created
+  (deterministic id, so parallel identical calls make one row) and the conductor
+  is woken immediately. `action_sha256` covers the execution-relevant input only
+  (bash: command, cwd, service env/name; other tools: the whole input minus the
+  model's free-text `i`), so a rephrased intent still matches and one changed byte
+  does not.
+- **Deciding** (`herdr-action.sh approve|decline <id>`): conductor authority as in
+  `herdr-select.sh` (caller pane = registered conductor pane with a live matching
+  generation, active task, operational category + reason; approve only
+  conductor-route requests; decline anything). Human authority only through an
+  **answered hub form for exactly that request** (`--form <id>`). Approve records
+  a one-shot grant, or for a code-by-reference script a `file_approvals` row bound
+  to the reviewed sha256; both write an `approvals` row and `action_decided`, and
+  the worker is told in its pane (`send-to-agent.sh`, after a pane-generation
+  check).
+- **Surfacing**: conductor route — `herdr-action.sh surface` wakes the conductor
+  pane once (from the hook, detached; the hub's tick is the backstop).
+  Human route — reserved requests, or conductor requests still pending after
+  `HERDR_ACTION_STALE_S` (900 s) — the hub's tick (`hub.py` `_action_tick`, every
+  15 s, one read-only query when nothing is pending) posts one Slack alert at
+  class `human-action` (`lib/slack-level.sh`: an error class, posted at the
+  default level) and serves a formserve decision; an answered form is applied as
+  human authority; an expired form is recorded as `action_form_expired` and
+  re-served — never a decline. `lib/reconcile.sh` reports `action_requested` to
+  the owning conductor at session start.
+- **Review round 1 (2026-09-27, two independent reviewers) and what changed**:
+  - *Self-approval*: a worker's allowed bash could UPDATE `action_requests`,
+    forge a form record, or edit the gate files (`lib/pretool-shadow.sh`,
+    `lib/action-request.sh`, `herdr-action.sh`, the hook, the overlay). Now
+    `lib/hook-approval-rules.tsv` joins the ONE policy through its operator-rule
+    channel (tighten-only; a match is human-only) for hook workers and shadow;
+    enforce refuses when the rules file is missing. A grant is consumed only if
+    its authority could have made it (human for a human-only request;
+    conductor only for a conductor-route request). A human decision counts only
+    from the formserve record pinned when the hub served that request's form.
+  - *Script swap*: a grant now folds the sha256 of any script the command
+    runs (code_ref_inspect; an explicit tool `cwd` resolves relative scripts);
+    a rewritten script no longer matches. A script that cannot be resolved,
+    or that runs other local files, is refused with no request.
+  - *Hidden cwd/env*: the review text is `(in <cwd>) <command>` plus
+    `[env] …`; a bash call that sets a service env escalates.
+  - *`hub start`* ran any program unjudged — now judged as a command (above).
+  - *Mixed-case schemes* (`Xd://secret_present`) and `file://` reads bypassed
+    the table — schemes are lowercased; `file://` is decoded; a glob pattern is
+    judged as a path (a grep pattern is not).
+  - *Installed hook*: `--approval hook` refuses unless the extension omp will
+    load resolves to this checkout's hook and carries
+    `HERDR_HOOK_APPROVAL_PROTOCOL = 1`; the worker gets `HERDR_CONTROL_DIR`
+    pinned to that checkout.
+  - *Slack*: the post carries the request id, tool and verdict only; the
+    command stays on the hub form (a webhook path is a secret no redactor
+    knows).
+  - A menu worker whose registry read fails reads once, then relies on the
+    env signal only.
+  - `hub send` stays allowed: in omp 18.3.2 it is in-process peer messaging
+    (delivered to an agent id in the same omp process, never typed into a
+    herdr pane), and the recipient's own tool calls are judged by this hook.
+  - Residual, stated: `read http(s)://` and `web_search` stay unscoped (q3); a
+    bash call's persistent-shell cwd is not what the grant binds when the call
+    names no `cwd`; inline `GIT_CONFIG_*=…` / `export` shapes classify allow in
+    both modes (reviewer note, pre-existing).
+- **Differences from §4's sketch**: request state lives in an `action_requests`
+  table (events alone cannot do an atomic one-shot consume); the Slack/form half
+  runs in the hub, not the worker, because a `--no-secrets` worker has no Slack
+  credential; conductor wakes use `send-to-agent.sh` directly rather than
+  `lib/push-wake.sh`, whose prompt-id machinery this path exists to retire.
+
+## 12. Same-uid residual: a worker can forge its own approval (DECIDED: A + B)
+
+Review round 2 on `97ac9c8` (both reviewers, live-proven): the hook-approval
+rules are text patterns, and an allowed bash call that builds its target at
+run time (`$(printf %s <base64> | base64 -d)`, a glob like
+`~/.local/state/h*/runs/r*.sqlite3`, a symlink, or a script whose content is
+clean text) writes the registry or the pinned hub-form record. The next
+re-issue of a human-only call then runs as if Terrence had approved it. Both
+live reproductions were end to end: `gh pr merge … --admin` reserved → forged
+record/row → the tick applied it as `approved/human` → re-issue ran.
+
+This cannot be closed by more patterns or by path resolution: the worker, the
+decider (`herdr-action.sh`), the hub and the registry all run as one uid, so
+anything the hook can read the worker can write, and a clean-classified script
+runs with no review at all. docs/approval-policy.md rule 7 already says the
+approval layer is a trust boundary, not containment. The same class exists in
+the menu path today — measured on origin/main with peer authority:
+`herdr pane send-keys <own pane> Enter` → allow, and
+`(sleep 20; bash "$(printf %s <b64 of herdr-select.sh> | base64 -d)" <own pane> 1 --authority human) &` → allow.
+A worker can already press Approve on its own reserved menu with one allowed
+command.
+
+What hook mode changes is that no human glances at each call (§7), so the only
+thing between a deliberately adversarial worker and a reserved action is the
+worker's own honesty, in both modes. The decision needed before merge:
+
+- (A) accept this as the rule-7 residual for hook mode, as it is already
+  accepted for the menu path, and merge off-by-default; or
+- (B) require hook-approval workers to run isolated under a different uid or
+  container that cannot write `~/.local/state/herdr` or the herdr-control
+  checkout (`isolated-worker.py` is the existing starting point), and merge
+  only with that; or
+- (C) keep the branch unmerged and hook approval off.
+
+**Decision (Terrence, 2026-09-27, hub form `20260927T022930-8742`, answered via
+the hub): (A) + (B).** Merge PR #170 with hook mode OFF by default, and record
+the same-user gap as the rule-7 residual for BOTH the menu path and hook mode.
+Open the isolation follow-up: run workers under a separate macOS user or a
+container that cannot write `~/.local/state/herdr`, the checkouts, or
+Terrence's gh/1Password credentials — required before hook mode becomes the
+default and for any task that reads untrusted input (starting point:
+`isolated-worker.py`). Tracked as
+[#172](https://github.com/tntpgh/herdr-control/issues/172). His note: "there are things like devcontainers that
+might work, but we'd have to be mindful of how our system works. Like the idea
+of getting better at our security with this." The 5-day shadow gate (§10 q1)
+still applies to any canary.

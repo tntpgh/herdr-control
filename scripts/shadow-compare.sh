@@ -9,6 +9,19 @@
 #       Join pretool_verdict events with the approvals table and
 #       approval_escalated events per task; print agreement/disagreement counts
 #       and EVERY disagreement row.
+#   scripts/shadow-compare.sh --gate [--explained FILE]
+#       Terrence's canary gate (hook-cutover decision q1, 2026-09-27): PASS
+#       only when ALL hold over shadow-mode rows —
+#         (a) at least 5 days since the first shadow row,
+#         (b) at least 1,000 rows across at least 5 tasks,
+#         (c) disagreement (SHADOW_LOOSER + SHADOW_TIGHTER) at most 2% of the
+#             rows that could be compared (a herdr decision is on record),
+#         (d) every SHADOW_LOOSER row explained by hand: a line
+#             "<seq><TAB><explanation>" in FILE (default
+#             $HERDR_RUN_STATE_DIR/shadow-explained.tsv).
+#       Prints one PASS/FAIL line per criterion and the verdict; exit 0 PASS,
+#       1 FAIL. Enforce-mode rows (hook-approval tasks) are not shadow data
+#       and are excluded.
 #   scripts/shadow-compare.sh --autonomy [--days N]
 #       The design goal's metric over tasks created in the last N days
 #       (default 7): share of tasks that closed with zero human input, and
@@ -37,6 +50,11 @@ from datetime import datetime, timedelta, timezone
 db, args = sys.argv[1], sys.argv[2:]
 def opt(name, default=None):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
+import os
+if not os.path.exists(db):
+    print(f"no registry at {db}")
+    if "--gate" in args: print("GATE: FAIL (no shadow data)")
+    sys.exit(1 if "--gate" in args else 0)
 conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
 conn.row_factory = sqlite3.Row
 
@@ -113,7 +131,9 @@ task_f, since = opt("--task"), opt("--since", "")
 import os
 shadow_db = os.path.join(os.path.dirname(db), "pretool-shadow.sqlite3")
 if not os.path.exists(shadow_db):
-    print(f"no shadow store at {shadow_db} — no worker has recorded a verdict yet"); sys.exit(0)
+    print(f"no shadow store at {shadow_db} — no worker has recorded a verdict yet")
+    if "--gate" in args: print("GATE: FAIL (no shadow data)")
+    sys.exit(1 if "--gate" in args else 0)
 sconn = sqlite3.connect(f"file:{shadow_db}?mode=ro", uri=True)
 sconn.row_factory = sqlite3.Row
 ev_sql = "SELECT sequence, task_id, occurred_at, payload FROM pretool_verdicts WHERE occurred_at >= ?"
@@ -124,7 +144,9 @@ for r in sconn.execute(ev_sql + " ORDER BY sequence", params):
     p = json.loads(r["payload"] or "{}")
     shadow.append(dict(p, seq=r["sequence"], task_id=r["task_id"], at=r["occurred_at"]))
 if not shadow:
-    print("no pretool_verdict rows" + (f" for task {task_f}" if task_f else "") + " — nothing to compare"); sys.exit(0)
+    print("no pretool_verdict rows" + (f" for task {task_f}" if task_f else "") + " — nothing to compare")
+    if "--gate" in args: print("GATE: FAIL (no shadow data)")
+    sys.exit(1 if "--gate" in args else 0)
 
 appr_all = [dict(r, pane=r["pane_id"]) for r in conn.execute(
     "SELECT approval_id, task_id, pane_id, authority, choice_text, command, decided_at FROM approvals WHERE decided_at >= ?",
@@ -169,6 +191,38 @@ for s in shadow:
     elif sv == "allow": kind = "SHADOW_LOOSER"
     else: kind = "SHADOW_TIGHTER"
     results.append(dict(s, today=today, via=via, kind=kind))
+
+if "--gate" in args:
+    rows = [r for r in results if r.get("mode", "shadow") == "shadow"]
+    explained_path = opt("--explained", os.path.join(os.path.dirname(db), "shadow-explained.tsv"))
+    explained = {}
+    if os.path.exists(explained_path):
+        for line in open(explained_path, encoding="utf-8", errors="replace"):
+            seq, _, why = line.rstrip("\n").partition("\t")
+            if seq.strip().isdigit() and why.strip():
+                explained[int(seq)] = why.strip()
+    first = min((ts(r["at"]) for r in rows if ts(r["at"])), default=None)
+    days = (datetime.now(timezone.utc) - first).total_seconds() / 86400 if first else 0.0
+    n_tasks = len({r["task_id"] for r in rows})
+    compared = [r for r in rows if r["kind"] in ("agree", "SHADOW_LOOSER", "SHADOW_TIGHTER")]
+    n_dis = sum(1 for r in compared if r["kind"] != "agree")
+    rate = n_dis / len(compared) if compared else None
+    loose = [r for r in rows if r["kind"] == "SHADOW_LOOSER"]
+    unexplained = [r for r in loose if r["seq"] not in explained]
+    checks = [
+        ("a", days >= 5, f"shadow data spans {days:.1f} days (need >= 5)"),
+        ("b", len(rows) >= 1000 and n_tasks >= 5, f"{len(rows)} rows across {n_tasks} tasks (need >= 1000 across >= 5)"),
+        ("c", rate is not None and rate <= 0.02,
+         f"disagreement {n_dis}/{len(compared)} compared rows = " + (f"{rate:.2%}" if rate is not None else "n/a (nothing comparable)") + " (need <= 2%)"),
+        ("d", not unexplained, f"{len(loose)} SHADOW_LOOSER rows, {len(unexplained)} unexplained (need 0; explain in {explained_path})"),
+    ]
+    for key, passed, text in checks:
+        print(f"{'PASS' if passed else 'FAIL'}  ({key}) {text}")
+    for r in unexplained[:50]:
+        print(f"      unexplained seq={r['seq']} task={r['task_id']} tool={r['tool']}: {(r.get('command') or r.get('reason') or '')[:160]}")
+    verdict = all(p for _, p, _ in checks)
+    print(f"GATE: {'PASS' if verdict else 'FAIL'}")
+    sys.exit(0 if verdict else 1)
 
 if "--json" in args:
     print(json.dumps(results, indent=1)); sys.exit(0)

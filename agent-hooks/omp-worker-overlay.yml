@@ -1,0 +1,25 @@
+# omp config overlay for hook-approval workers (spawn-task.sh --approval hook).
+#
+# docs/design/pretool-approval.md §3; Terrence's decision q2 (2026-09-27).
+# A hook-approval worker runs omp with --auto-approve: no approval menu, and
+# every call is judged by the pre-tool hook on its exact input. These tools run
+# arbitrary code, drive a browser/desktop/debugger, or spend money, with no
+# text the policy can judge — so they are OFF for those workers. A worker
+# writes code to a file under its worktree and runs it with bash instead, where
+# code by reference judges the whole file and binds any approval to its sha256.
+#
+# A user `deny` in tools.approval holds even under --auto-approve / yolo
+# (omp://approval-mode.md, "Resolution per tool call" step 2). The hook blocks
+# the same tools as a backstop. Applied ONLY with --approval hook; every other
+# spawn is unchanged.
+tools:
+  approval:
+    eval: deny
+    python: deny
+    browser: deny
+    computer: deny
+    debug: deny
+    generate_image: deny
+    tts: deny
+    manage_skill: deny
+    ida: deny
