@@ -912,24 +912,34 @@ prompt_any_visible() {                 # <pane>
 # question or option is readable: a vanished prompt has no identity, and a
 # constant "empty" digest used to ship as an actionable Slack button.
 prompt_id() {
-  local content birth period
+  local content
   content="$(prompt_content "$1")" || return 1
+  prompt_id_of "$1" "$content"
+}
+
+# prompt_id_of <pane_id> <content> -> prompt_id for content already read with
+# prompt_content, so a caller that also needs the content digest reads the
+# screen once, not twice (a second read can see a different frame).
+prompt_id_of() {
+  local birth period
   birth="$(command -v pane_birth_now >/dev/null 2>&1 || . "$_PP_LIB_DIR/pane-guard.sh" >/dev/null 2>&1
            pane_birth_now "$1" 2>/dev/null)"
   period="$(prompt_period "$1")"
-  printf 'pane=%s\nbirth=%s\nperiod=%s\n%s' "$1" "$birth" "$period" "$content" \
+  printf 'pane=%s\nbirth=%s\nperiod=%s\n%s' "$1" "$birth" "$period" "$2" \
     | shasum -a 256 | cut -d' ' -f1
 }
 
 # prompt_content_digest <pane_id> -> the hash of WHAT is on screen, without the
 # occurrence salt. For the one caller that must re-check the screen after it
 # has itself closed the blocked period (herdr-select.sh, right before its
-# keystroke), where prompt_id has legitimately stepped.
+# keystroke), where prompt_id has legitimately stepped. prompt_digest_of is the
+# same hash for content already read.
 prompt_content_digest() {
   local content
   content="$(prompt_content "$1")" || return 1
-  printf '%s' "$content" | shasum -a 256 | cut -d' ' -f1
+  prompt_digest_of "$content"
 }
+prompt_digest_of() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
 
 # prompt_content <pane_id> -> "<question>\n<options>", or rc 1 when neither is
 # readable. The content half of prompt_id.

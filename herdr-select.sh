@@ -221,10 +221,14 @@ esac
 # Right before we act — the closest this synchronous script can get to
 # "immediately before injection" — confirm the prompt is still the one a
 # decision was made about, if the caller told us which one that was...
-current_prompt_id=$(prompt_id "$pane")
-# The same screen without the occurrence salt, for the re-check after
-# _close_blocked_period below (which steps prompt_id on purpose).
-current_content=$(prompt_content_digest "$pane")
+# One screen read for both: the id, and the same screen without the occurrence
+# salt for the re-check after _close_blocked_period below (which steps
+# prompt_id on purpose).
+current_prompt_id="" current_content=""
+if _current_screen="$(prompt_content "$pane")"; then
+  current_prompt_id=$(prompt_id_of "$pane" "$_current_screen")
+  current_content=$(prompt_digest_of "$_current_screen")
+fi
 if [ -n "$expect_id" ] && [ "$current_prompt_id" != "$expect_id" ]; then
   echo "herdr-select: the prompt in $pane no longer matches the one the decision was made about." >&2
   echo "herdr-select: expected prompt_id $expect_id, currently $current_prompt_id — refusing to answer a different prompt." >&2
