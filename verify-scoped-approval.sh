@@ -184,7 +184,7 @@ while IFS= read -r form; do
   c="${form//@WT@/$CRWT}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.sh|0:*/tmp/evil.py|3:*) ok "judged or refused (rc=$rc): $c" ;;
+    0:*/tmp/evil.sh|0:*/tmp/evil.sh?order|0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "judged or refused (rc=$rc): $c" ;;
     *) bad "script ran unjudged (rc=$rc '$out'): $c" ;;
   esac
 done <<'EOF'
@@ -260,7 +260,7 @@ while IFS= read -r form; do
   c="${form//@WT@/$CRWT}"; c="${c//@OUT@/$WORK}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/tramp*.sh|3:*) ok "trampoline judged or refused (rc=$rc): $c" ;;
+    0:*/tmp/tramp*.sh|0:*/tmp/tramp*.sh?order|3:*) ok "trampoline judged or refused (rc=$rc): $c" ;;
     *) bad "trampoline ran unjudged (rc=$rc '$out'): $c" ;;
   esac
 done <<'EOF'
@@ -285,7 +285,7 @@ for mc in \
   c="${mc%%|*}"; label="${mc#*|}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.sh|3:*) ok "judged or refused (rc=$rc): $label" ;;
+    0:*/tmp/evil.sh|0:*/tmp/evil.sh?order|3:*) ok "judged or refused (rc=$rc): $label" ;;
     *) bad "script ran unjudged (rc=$rc '$out'): $label" ;;
   esac
 done
@@ -296,7 +296,7 @@ for mc in \
   c="${mc%%|*}"; label="${mc#*|}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/evil.sh|3:*) ok "judged or refused (rc=$rc): $label" ;;
+    0:*/evil.sh|0:*/evil.sh?order|3:*) ok "judged or refused (rc=$rc): $label" ;;
     *) bad "script ran unjudged (rc=$rc '$out'): $label" ;;
   esac
 done
@@ -312,7 +312,7 @@ while IFS= read -r form; do
   c="${form//@WT@/$CRWT}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.sh|0:*/tmp/evil.py|0:*/tmp/outlink.sh|3:*) ok "judged or refused (rc=$rc): $c" ;;
+    0:*/tmp/evil.sh|0:*/tmp/evil.sh?order|0:*/tmp/evil.py|0:*/tmp/evil.py?order|0:*/tmp/outlink.sh|0:*/tmp/outlink.sh?order|3:*) ok "judged or refused (rc=$rc): $c" ;;
     *) bad "script ran unjudged (rc=$rc '$out'): $c" ;;
   esac
 done <<EOF
@@ -355,30 +355,30 @@ printf '== finding 9: python flags other than -uBev still resolve the file slot 
 for pyflag in -I -O -S; do
   out="$(_cp_code_ref "cd $CRWT && python3 $pyflag tmp/evil.py" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.py) ok "python3 $pyflag resolves the file slot" ;;
+    0:*/tmp/evil.py|0:*/tmp/evil.py?order) ok "python3 $pyflag resolves the file slot" ;;
     *) bad "python3 $pyflag: rc=$rc '$out'" ;;
   esac
 done
 out="$(_cp_code_ref "cd $CRWT && python3 -W ignore tmp/evil.py" "$CRWT")"; rc=$?
-case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -W ignore resolves past its value" ;; *) bad "python3 -W: rc=$rc '$out'" ;; esac
+case "$rc:$out" in 0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "python3 -W ignore resolves past its value" ;; *) bad "python3 -W: rc=$rc '$out'" ;; esac
 out="$(_cp_code_ref "cd $CRWT && python3 -X utf8 tmp/evil.py" "$CRWT")"; rc=$?
-case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -X utf8 resolves past its value" ;; *) bad "python3 -X: rc=$rc '$out'" ;; esac
+case "$rc:$out" in 0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "python3 -X utf8 resolves past its value" ;; *) bad "python3 -X: rc=$rc '$out'" ;; esac
 
 printf '== finding 10: launcher option values and shell keywords no longer hide the script ==\n'
 for form in "timeout 5s bash tmp/evil.sh" "timeout 1.5m bash tmp/evil.sh" "exec -a foo bash tmp/evil.sh" \
             "coproc bash tmp/evil.sh" "function f { bash tmp/evil.sh; }; f"; do
   out="$(_cp_code_ref "cd $CRWT && $form" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.sh|3:*) ok "resolves past the launcher: $form" ;;
+    0:*/tmp/evil.sh|0:*/tmp/evil.sh?order|3:*) ok "resolves past the launcher: $form" ;;
     *) bad "launcher hid the script: $form (rc=$rc '$out')" ;;
   esac
 done
 
 printf '== finding 13: python3 -m <local.module> resolves to its worktree file ==\n'
 out="$(_cp_code_ref "cd $CRWT && python3 -m tmp.evil" "$CRWT")"; rc=$?
-case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -m tmp.evil resolves tmp/evil.py" ;; *) bad "python3 -m tmp.evil: rc=$rc '$out'" ;; esac
+case "$rc:$out" in 0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "python3 -m tmp.evil resolves tmp/evil.py" ;; *) bad "python3 -m tmp.evil: rc=$rc '$out'" ;; esac
 out="$(_cp_code_ref "cd $CRWT && python3 -m tmp.evil | tail -1" "$CRWT")"; rc=$?
-case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -m tmp.evil resolves past a trailing pipe" ;; *) bad "python3 -m piped: rc=$rc '$out'" ;; esac
+case "$rc:$out" in 0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "python3 -m tmp.evil resolves past a trailing pipe" ;; *) bad "python3 -m piped: rc=$rc '$out'" ;; esac
 out="$(_cp_code_ref "cd $CRWT && python3 -m json.tool tmp/x.json | head" "$CRWT")"; rc=$?
 [ "$rc" = 1 ] && ok "python3 -m json.tool (no matching worktree file) stays out of scope" || bad "json.tool: rc=$rc '$out'"
 
@@ -418,7 +418,7 @@ while IFS= read -r form; do
   c="${form//@WT@/$CRWT}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.sh|0:*/tmp/evil.py|3:*) ok "judged or refused (rc=$rc): $c" ;;
+    0:*/tmp/evil.sh|0:*/tmp/evil.sh?order|0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "judged or refused (rc=$rc): $c" ;;
     *) bad "interpreter not covered (rc=$rc '$out'): $c" ;;
   esac
 done <<EOF
@@ -468,5 +468,53 @@ out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh && cp tmp/evil.sh tmp/clean.s
 [ "$rc" = 3 ] && ok "a writer between two runs still escalates" || bad "writer between runs slipped: rc=$rc '$out'"
 out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh > tmp/clean.sh; bash tmp/clean.sh" "$CRWT")"; rc=$?
 [ "$rc" = 3 ] && ok "a run that redirects onto the script still escalates" || bad "redirect-onto-script slipped: rc=$rc '$out'"
+
+printf '== code by reference: order gate and unbound python -c (F8b, #160 round 3 H-b/H-c) ==\n'
+# A writer that BUILDS the script's name (glob, brace, $var, a python string
+# concat) is invisible to the name match; anything but read-only verbs
+# around the one run makes the binding `order` (reviewed every run).
+while IFS= read -r form; do
+  [ -n "$form" ] || continue
+  out="$(_cp_code_ref "cd $CRWT && $form" "$CRWT")"; rc=$?
+  case "$rc:$out" in
+    0:*"	order"|3:*) ok "order-unsafe is not a plain binding (rc=$rc): $form" ;;
+    *) bad "order-unsafe bound plainly (rc=$rc '$out'): $form" ;;
+  esac
+done <<'EOF'
+cp tmp/evil.sh tmp/clean.s?; bash tmp/clean.sh
+cat tmp/evil.sh > tmp/clea?.sh; bash tmp/clean.sh
+cp tmp/evil.sh tmp/clean.s[h]; bash tmp/clean.sh
+tee tmp/clean.s{h,x} < tmp/evil.sh; bash tmp/clean.sh
+d=tmp/clea; cp tmp/evil.sh ${d}n.sh; bash tmp/clean.sh
+python3 -c 'open("tmp/clea"+"n.sh","w").write("x")'; bash tmp/clean.sh
+cp tmp/evil.sh tmp/*an.sh; bash tmp/clean.sh
+bash tmp/clean.sh >> tmp/clea?.sh
+bash tmp/clean.sh | tee tmp/clean.s?
+git pull && bash tmp/clean.sh
+git diff --output=tmp/x && bash tmp/clean.sh
+git -c diff.external=x diff && bash tmp/clean.sh
+git stash && bash tmp/clean.sh
+GIT_EXTERNAL_DIFF=x git diff; bash tmp/clean.sh
+GIT_PAGER=x git log; bash tmp/clean.sh
+git remote add x 'ext::sh -c true' && git remote update x && bash tmp/clean.sh
+git branch --edit-description && bash tmp/clean.sh
+EOF
+for form in "bash tmp/clean.sh" "bash tmp/clean.sh 2>&1 | tail -3" "bash tmp/clean.sh && echo done" \
+            "bash tmp/clean.sh > /tmp/out.txt" "bash tmp/clean.sh | grep hello | wc -l" \
+            "bash tmp/clean.sh && git status" "git log --oneline -3 && bash tmp/clean.sh" "git remote -v && bash tmp/clean.sh"; do
+  out="$(_cp_code_ref "cd $CRWT && $form" "$CRWT")"; rc=$?
+  [ "$rc" = 0 ] && [ "$out" = "shell	$CRWT/tmp/clean.sh" ] \
+    && ok "read-only company keeps a plain binding: $form" || bad "over-block: rc=$rc '$out': $form"
+done
+for form in "cd $CRWT && cd tmp && python3 -c 'import evil'" "cd $CRWT/tmp && python3 -c 'import evil'" \
+            "cd $CRWT && (cd tmp; python3 -c 'import evil')" "cd $CRWT && pushd tmp && python3 -c 'import evil'" \
+            "python3 -c 'import evil'" "python3 -c 'from . import evil'"; do
+  out="$(_cp_code_ref "$form" "$CRWT")"; rc=$?
+  [ "$rc" = 3 ] && ok "unbound-cwd python -c import escalates: $form" || bad "unbound python -c ran unjudged (rc=$rc '$out'): $form"
+done
+for form in "python3 -c 'import json; print(1)'" "cd $CRWT && cd tmp && python3 -c 'import json'"; do
+  out="$(_cp_code_ref "$form" "$CRWT")"; rc=$?
+  [ "$rc" = 1 ] && ok "stdlib-only python -c stays out of scope: $form" || bad "stdlib python -c over-blocked (rc=$rc): $form"
+done
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }
