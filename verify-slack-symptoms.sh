@@ -29,6 +29,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 export HERDR_RUN_STATE_DIR="$WORK/runs"
 export HERDR_BRIDGE_STATE="$WORK/bridge"
+# Pinned to HERDR_SLACK_LEVEL=all: this suite proves what a post CONTAINS and
+# how it is deduped, which is downstream of the errors-only level filter
+# (lib/slack-level.sh; its own cases are in verify-slack-symptoms.sh). The
+# state dir keeps the filter's suppressed-alert log out of the real one.
+export HERDR_SLACK_LEVEL=all
+export HERDR_STATE_DIR="$WORK/state"
 export HERDR_BRIDGE_ENV="$WORK/bridge.env"
 # Not shaped like a real Slack token (no xoxb-/xapp- prefix) so the shared
 # pre-commit secret scanner never flags this fixture — see verify-omp-hooks.sh.
@@ -224,6 +230,94 @@ HERDR_BRIDGE_STATE="$WORK/p2" bash "$here/slack-bridge/herdr-notify.sh" --choice
 HERDR_BRIDGE_STATE="$WORK/p2" bash "$here/slack-bridge/herdr-notify.sh" --choices --pane "$WPANE" "needs input" >/dev/null 2>&1
 [ "$(n_posts)" = 1 ] && ok "plain-context prompt, 3 firings -> exactly 1 post ($(n_posts))" \
   || bad "plain-context branch is not deduped: $(n_posts) posts"
+
+printf '== errors-only level filter (lib/slack-level.sh, default HERDR_SLACK_LEVEL=errors) ==\n'
+SUPP="$HERDR_STATE_DIR/slack-suppressed.jsonl"
+n_supp() { jq -s --arg c "$1" '[.[] | select(.class==$c)] | length' "$SUPP" 2>/dev/null || echo 0; }
+notify_at() {                            # <level|""> <class|""> [notify args...]; "" level = unset (config.sh default)
+  local lvl="$1" cls="$2"; shift 2
+  if [ -n "$lvl" ]; then
+    HERDR_SLACK_LEVEL="$lvl" bash "$here/slack-bridge/herdr-notify.sh" ${cls:+--class "$cls"} "$@" >/dev/null 2>&1
+  else
+    env -u HERDR_SLACK_LEVEL bash "$here/slack-bridge/herdr-notify.sh" ${cls:+--class "$cls"} "$@" >/dev/null 2>&1
+  fi
+}
+
+omp_menu_screen "wrangler deploy --env lvl-err" > "$WORKER_SCREEN"; : > "$POSTED"
+notify_at "" wake-fail --choices --pane "$WPANE" "conductor wake refused"
+[ "$(n_posts)" = 1 ] && ok "default level: an error class (wake-fail) posts" || bad "error class did not post: $(n_posts)"
+
+omp_menu_screen "wrangler deploy --env lvl-ni" > "$WORKER_SCREEN"; : > "$POSTED"
+notify_at "" needs-input --choices --pane "$WPANE" "needs input"
+[ "$(n_posts)" = 0 ] && [ "$(n_supp needs-input)" = 1 ] \
+  && ok "default level: needs-input is suppressed and logged one line" \
+  || bad "needs-input: posts=$(n_posts) logged=$(n_supp needs-input)"
+
+: > "$POSTED"
+notify_at "" held --choices --pane "$WPANE" "held prompt outlived grace"
+[ "$(n_posts)" = 0 ] && [ "$(n_supp held)" = 1 ] \
+  && ok "default level: held is suppressed and logged" || bad "held: posts=$(n_posts) logged=$(n_supp held)"
+
+: > "$POSTED"
+notify_at "" "" --choices --pane "$WPANE" "no class given"
+[ "$(n_posts)" = 0 ] && [ "$(n_supp unclassified)" = 1 ] \
+  && ok "default level: an unclassified call is suppressed and logged as unclassified" \
+  || bad "unclassified: posts=$(n_posts) logged=$(n_supp unclassified)"
+
+rc_env=0
+HERDR_BRIDGE_ENV="$WORK/no-such.env" notify_at "" needs-input --choices --pane "$WPANE" "x" || rc_env=$?
+[ "$rc_env" = 0 ] && ok "a suppressed alert never loads the bridge env (no token, no op read)" \
+  || bad "suppressed alert still required the bridge env: rc=$rc_env"
+
+omp_menu_screen "wrangler deploy --env lvl-typo" > "$WORKER_SCREEN"; : > "$POSTED"
+notify_at "" wakefail-typo --choices --pane "$WPANE" "typo class"
+[ "$(n_posts)" = 1 ] && ok "an UNKNOWN class fails toward posting, never toward silence" \
+  || bad "unknown class was silenced: $(n_posts)"
+
+omp_menu_screen "wrangler deploy --env lvl-all" > "$WORKER_SCREEN"; : > "$POSTED"
+notify_at all needs-input --choices --pane "$WPANE" "needs input"
+notify_at all "" --pane "$WPANE" "unclassified info"
+[ "$(n_posts)" = 2 ] && ok "HERDR_SLACK_LEVEL=all restores the old behaviour (needs-input and unclassified post)" \
+  || bad "level all: $(n_posts) posts"
+
+omp_menu_screen "wrangler deploy --env lvl-off" > "$WORKER_SCREEN"; : > "$POSTED"
+before_off="$(n_supp wake-fail)"
+notify_at off wake-fail --choices --pane "$WPANE" "conductor wake refused"
+[ "$(n_posts)" = 0 ] && [ "$(n_supp wake-fail)" = $((before_off + 1)) ] \
+  && ok "HERDR_SLACK_LEVEL=off sends nothing, even an error, and logs it" \
+  || bad "level off: posts=$(n_posts)"
+
+bogus_out="$(HERDR_SLACK_LEVEL=bogus bash "$here/slack-bridge/herdr-notify.sh" --dry-run --class needs-input --pane "$WPANE" x 2>&1)"
+printf '%s' "$bogus_out" | grep -q 'would SUPPRESS.*LEVEL=errors' \
+  && ok "an unrecognised level falls back to errors, not off" || bad "bogus level: $bogus_out"
+
+printf '== errors level: a Claude session with no herdr pane still posts (unwatched) ==\n'
+: > "$POSTED"
+printf '{"message":"Claude needs your permission to use Bash","cwd":"/tmp/nopane"}' \
+  | ( unset HERDR_PANE_ID HERDR_CONDUCTOR_PANE_ID TMUX_PANE; export HERDR_SLACK_LEVEL=errors
+      bash "$here/agent-hooks/claude-notify.sh" >/dev/null 2>&1 )
+[ "$(n_posts)" = 1 ] && ok "no HERDR_PANE_ID: nothing automated can see it, so it posts at errors" \
+  || bad "pane-less Claude prompt was silenced: $(n_posts) posts"
+
+printf '== errors level, end to end through the hook: human-only prompt ==\n'
+omp_menu_screen "git push origin lvl-hook" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+: > "$POSTED"
+register_task run_lvl task_lvl w1 cond1 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt "impl:lvl" >/dev/null 2>&1
+run_hook run_lvl task_lvl HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=2
+[ "$(n_posts)" = 0 ] && ok "a human-only prompt does not page immediately" || bad "paged immediately: $(n_posts)"
+sleep 4
+[ "$(n_posts)" = 1 ] && grep -q 'only a human may answer' "$POSTED" \
+  && ok "still open after HERDR_HUMAN_ALERT_S -> exactly 1 human-stale post (the suppressed send claimed nothing)" \
+  || bad "human-stale escalation: $(n_posts) posts: $(cat "$POSTED")"
+
+omp_menu_screen "git push origin lvl-hook-2" > "$WORKER_SCREEN"
+: > "$POSTED"
+register_task run_lvl2 task_lvl2 w1 cond1 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt "impl:lvl2" >/dev/null 2>&1
+run_hook run_lvl2 task_lvl2 HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=2
+clean_screen > "$WORKER_SCREEN"          # the conductor/human resolved it inside the window
+sleep 4
+[ "$(n_posts)" = 0 ] && ok "resolved inside HERDR_HUMAN_ALERT_S -> 0 posts" || bad "posted after resolution: $(cat "$POSTED")"
 
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

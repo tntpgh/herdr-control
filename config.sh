@@ -132,6 +132,18 @@
 # start) before it serves a local hub form. A wake counts as answered when
 # the prompt changes/resolves — this file's own value never resets the clock.
 : "${HERDR_WAKE_RESPONSE_S:=600}"
+
+# ---- what reaches Slack (lib/slack-level.sh) ---------------------------------
+#   errors  only what the automation cannot fix itself: a human-only prompt
+#           still open after HERDR_HUMAN_ALERT_S (300s), a worker blocked on the
+#           same prompt after HERDR_STUCK_ALERT_S (900s), a failed conductor
+#           wake, the hub's subscription down, an overdue deploy
+#   all     every alert, the pre-2026-09-26 behaviour
+#   off     nothing
+# Suppressed alerts are logged one line each to
+# $HERDR_STATE_DIR/slack-suppressed.jsonl and stay visible on the hub.
+: "${HERDR_SLACK_LEVEL:=errors}"
+
 # Pane id of the top-level operator session ("Main") that receives an
 # escalation when a task's own conductor does not act in time, plus its birth
 # fingerprint (herdr's terminal_id) for the recycled-pane refusal every other
@@ -171,5 +183,5 @@ export HERDR_RECONCILE_INTERVAL_S HERDR_TASK_RETENTION_DAYS
 export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES HERDR_CANONICAL_RULES
 export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_BACKEND SMART_NAME_MODEL SMART_NAME_TIMEOUT
 export SMART_NAME_COOLDOWN SMART_NAME_EVIDENCE_CHARS HERDR_STALL_SECS
-export HERDR_ATTENTION_INTERVAL_S HERDR_WAKE_RESPONSE_S HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH HERDR_WAKE_LEGACY
+export HERDR_ATTENTION_INTERVAL_S HERDR_WAKE_RESPONSE_S HERDR_SLACK_LEVEL HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH HERDR_WAKE_LEGACY
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"

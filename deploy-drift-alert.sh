@@ -35,7 +35,7 @@ case "$status" in
     [ -e "$MARK" ] && exit 0   # already alerted for this drift episode
     : > "$MARK"
     [ -f "$NOTIFY" ] || exit 0
-    bash "$NOTIFY" \
+    bash "$NOTIFY" --class deploy \
       "deploy drift: ${repo} is ${minutes}m behind main (deployed ${deployed}, main ${main_sha}) — a deploy or restart.sh --verify is overdue" \
       >/dev/null 2>&1 || true
     ;;
@@ -43,7 +43,7 @@ case "$status" in
     [ -e "$MARK" ] || exit 0   # never alerted -> nothing to recover from
     rm -f "$MARK"
     [ -f "$NOTIFY" ] || exit 0
-    bash "$NOTIFY" "deploy drift resolved: ${repo} is back in sync with main" >/dev/null 2>&1 || true
+    bash "$NOTIFY" --class deploy "deploy drift resolved: ${repo} is back in sync with main" >/dev/null 2>&1 || true
     ;;
   *)
     echo "deploy-drift-alert: unknown status '$status'" >&2

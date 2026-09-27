@@ -13,6 +13,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 export HERDR_BRIDGE_STATE="$WORK/state"
+# Pinned to HERDR_SLACK_LEVEL=all: this suite proves what a post CONTAINS and
+# how it is deduped, which is downstream of the errors-only level filter
+# (lib/slack-level.sh; its own cases are in verify-slack-symptoms.sh). The
+# state dir keeps the filter's suppressed-alert log out of the real one.
+export HERDR_SLACK_LEVEL=all
+export HERDR_STATE_DIR="$WORK/state"
 export HERDR_BRIDGE_ENV="$WORK/env"
 export SCREEN="$WORK/screen.txt"
 # herdr-notify.sh now claims a prompt_id in the run registry before posting

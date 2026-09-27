@@ -223,7 +223,13 @@ case "$status" in
         # is recoverable (the hook's own entry, if any, dedupes below).
         note "probe unreachable — alerting anyway" ;;
     esac
-    if pane_has_pending_alert; then
+    # At `errors` a pending entry is not proof THIS prompt was surfaced (it can
+    # be an earlier prompt's error alert that herdr-resolve keeps while any
+    # prompt is on screen), and the escalation below is the only Slack path for
+    # an allow-class prompt — so it must not end here. herdr-notify's
+    # alert_claim still dedupes per (pane, prompt).
+    . "$here/lib/slack-level.sh"
+    if [ "$(slack_level)" != errors ] && pane_has_pending_alert; then
       note "already alerted by the worker's own hook"
       exit 0
     fi
@@ -236,13 +242,42 @@ case "$status" in
     # message with no record" state it exists to prevent), invisible to the
     # dedupe above (so every later prompt on that pane posts another one), and
     # button-less, i.e. strictly weaker than the alert it stands in for.
-    bash "$NOTIFY" --choices --pane "$pane" \
+    bash "$NOTIFY" --class needs-input --choices --pane "$pane" \
       "${msg} (no hook alert after ${GRACE}s — control-plane backstop)" >/dev/null 2>&1 || true
-    if pane_has_pending_alert; then
+    if ! slack_should_send needs-input; then
+      note "backstop suppressed (class needs-input, level $(slack_level)) $reg"
+    elif pane_has_pending_alert; then
       note "backstop alert (queued for retraction) $reg"
     else
       note "backstop alert NOT QUEUED — retraction will not find it $reg"
     fi
+    # ---- escalation: the errors-only Slack policy (lib/slack-level.sh) -----
+    # At the default level the backstop above is suppressed, so THIS is what
+    # tells a person about a worker nobody unblocked. It is also the one path
+    # that covers every herdr pane whatever hook it has (a pane with no
+    # HERDR_PANE_ID, a crashed hook). Still being alive here means the pane has
+    # not moved: hub.py supersedes this handler on the pane's next actionable
+    # edge, so a later probe that says `blocked` is the SAME block, not a new
+    # one. A human-only prompt escalates at HERDR_HUMAN_ALERT_S (300s), anything
+    # else at HERDR_STUCK_ALERT_S (900s): 97% of blocks clear within 90s and 19
+    # a week outlast 900s (registry, week to 2026-09-26). At level `all` the
+    # backstop above already posted, as before — no second message.
+    [ "$(slack_level)" = errors ] || exit 0
+    . "$here/lib/alert-gate.sh" 2>/dev/null || true
+    if command -v human_must_answer >/dev/null 2>&1 && human_must_answer "$pane"; then
+      esc=human-stale; esc_at="${HERDR_HUMAN_ALERT_S:-300}"
+    else
+      esc=stuck; esc_at="${HERDR_STUCK_ALERT_S:-900}"
+    fi
+    case "$esc_at" in ''|*[!0-9]*) esc_at=900 ;; esac
+    [ "$esc_at" -gt "$GRACE" ] && sleep $(( esc_at - GRACE ))
+    if [ "$(pane_probe)" = cleared ]; then
+      note "cleared before $esc escalation"
+      exit 0
+    fi
+    bash "$NOTIFY" --class "$esc" --choices --pane "$pane" \
+      "${msg}  ·  still blocked after ${esc_at}s — nothing in the automation resolved it" >/dev/null 2>&1 || true
+    note "escalated to Slack as $esc after ${esc_at}s"
     ;;
   working|idle)
     if [ -z "$previous" ]; then
