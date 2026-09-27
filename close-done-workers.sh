@@ -109,7 +109,7 @@ if [ "$apply" = 1 ] && [ "$closure_reason" = shipped ]; then
   fi
   proof_wt=$(_sql "SELECT worktree FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)
   _valid_proof_ref "$closure_proof" "$proof_wt" || {
-    printf 'close-done-workers: --reason=shipped requires --proof="<PR URL> <merge sha>" or a non-empty PROOF.md section in the selected task'"'"'s worktree\n' >&2
+    printf 'close-done-workers: --reason=shipped requires --proof="<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the selected task'"'"'s worktree%s\n' "${_PROOF_REF_WHY:+ ($_PROOF_REF_WHY)}" >&2
     exit 1
   }
 fi

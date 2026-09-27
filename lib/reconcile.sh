@@ -276,7 +276,7 @@ run_reconciliation() {
               if ! _valid_closure_reason "$ev_reason"; then
                 ev_why="closure reason missing/invalid: ${ev_reason:-<empty>}"
               elif [ "$ev_reason" = shipped ] && ! _valid_proof_ref "$ev_proof" "$(printf '%s' "$task_json" | jq -r '.worktree // empty')"; then
-                ev_why="shipped proof missing/invalid or PROOF.md still empty"
+                ev_why="${_PROOF_REF_WHY:-shipped proof missing/invalid or PROOF.md still empty}"
               fi
               if [ -z "$ev_why" ] && set_task_state "$run_id" "$task_id" "completed" "$ev_reason" "$ev_proof"; then
                 append_event "$run_id" "$task_id" "completion_recorded" \

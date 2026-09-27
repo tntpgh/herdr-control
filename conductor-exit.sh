@@ -61,15 +61,17 @@ while IFS='|' read -r task_id pane cpane wt label; do
   else
     br=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)
     slug=$(git -C "$wt" remote get-url origin 2>/dev/null | sed -E 's#^.*github\.com[:/]##; s#\.git$##')
-    pr=$(gh pr list -R "$slug" --head "$br" --state all --json url,state,mergeCommit \
-           -q 'sort_by(.state != "MERGED") | .[0] | "\(.state)|\(.url)|\((.mergeCommit.oid // "")[0:8])"' 2>/dev/null)
-    IFS='|' read -r pr_state pr_url pr_sha <<<"$pr"
-    case "$pr_state" in
-      MERGED) proof="$pr_url $pr_sha" ;;
-      OPEN)   why="PR still open: $pr_url" ;;
-      CLOSED) why="PR closed unmerged: $pr_url" ;;
-      *)      why="no PR for $slug:$br" ;;
-    esac
+    if ! pr=$(_gh_pr_lookup "$slug" --head "$br"); then
+      why="gh lookup failed for $slug:$br"
+    else
+      IFS='|' read -r pr_state pr_url pr_oid <<<"$pr"
+      case "$pr_state" in
+        MERGED) if [ -n "$pr_oid" ]; then proof="$pr_url ${pr_oid:0:8}"; else why="merged PR reports no merge commit: $pr_url"; fi ;;
+        OPEN)   why="PR still open: $pr_url" ;;
+        CLOSED) why="PR closed unmerged: $pr_url" ;;
+        *)      why="no PR for $slug:$br" ;;
+      esac
+    fi
   fi
   if [ -n "$why" ]; then
     held=$((held+1))
@@ -81,7 +83,7 @@ while IFS='|' read -r task_id pane cpane wt label; do
   printf '  ship   %-8s %-44s %s\n' "$pane" "$label" "$proof"
   [ "$apply" = 1 ] || continue
   bash "$HERE/close-done-workers.sh" --apply --reason=shipped --task="$task_id" --proof="$proof" 2>&1 \
-    | sed -n 's/^ *\(HOLD\|REFUSED\)/    close-done-workers: \1/p; /^closed /s/^/    /p'
+    | sed -En 's/^ *(HOLD|REFUSED)/    close-done-workers: \1/p; /^closed /s/^/    /p; /^close-done-workers: /s/^/    /p'
 done < <(_sql "SELECT task_id || '|' || pane_id || '|' || conductor_pane_id || '|' || worktree || '|' || label
                FROM tasks WHERE state IN ('running','blocked','starting') AND $scope ORDER BY updated_at;")
 

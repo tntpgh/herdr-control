@@ -29,6 +29,23 @@ herdr() {
   esac
 }
 export -f herdr
+# gh stub (exported: close-done-workers.sh runs as its own bash): `gh pr view
+# <n> -R <slug> … -q <jq>` answers from GH_PRS ("<slug>#<n> <STATE> <oid|->").
+export GH_PRS="org/repo#2 MERGED abc1234000000000000000000000000000000000
+org/repo#5 OPEN -"
+gh() {
+  local n="" slug="" q="" prev="" a key st oid
+  [ "$1 $2" = "pr view" ] && n="$3"
+  for a in "$@"; do [ "$prev" = -R ] && slug="$a"; [ "$prev" = -q ] && q="$a"; prev="$a"; done
+  while read -r key st oid; do
+    [ "$key" = "$slug#$n" ] || continue
+    jq -nc --arg s "$st" --arg u "https://github.com/$slug/pull/$n" --arg o "$oid" \
+      '{state:$s, url:$u, mergeCommit:(if $o=="-" then null else {oid:$o} end)}' | jq -r "$q"
+    return 0
+  done <<<"$GH_PRS"
+  echo "GraphQL: Could not resolve to a PullRequest" >&2; return 1
+}
+export -f gh
 
 export HERDR_RUN_STATE_DIR="$(mktemp -d)/runs"
 
@@ -106,6 +123,18 @@ check "task3 (NOT named) stays running — one proof scoped to one task" \
 check "task2's proof is exactly what was passed" \
   "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.proof') FROM events WHERE task_id='task2' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';")" \
   "https://github.com/org/repo/pull/2 abc1234"
+
+printf '== --reason=shipped citing an OPEN PR head sha: refused, says why, nothing closed ==\n'
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --apply --reason=shipped --task=task3 \
+    --proof="https://github.com/org/repo/pull/5 eb55756" >/tmp/cdw-out6b-$$.log 2>&1; then
+  bad "shipped ACCEPTED with an open PR's head sha"
+else
+  ok "shipped refused with an open PR's head sha"
+fi
+grep -q "PR not merged (state OPEN)" /tmp/cdw-out6b-$$.log && ok "refusal names the open PR" || bad "refusal text: $(cat /tmp/cdw-out6b-$$.log)"
+check "no herdr RPC was ever made" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
+check "task3 untouched" "$(read_task run3 task3 | jq -r .state)" "running"
 
 printf '== --reason=shipped --pane=<id> with a PROOF.md that is still empty: refused via the same worktree-aware check ==\n'
 wt3=$(mktemp -d)/wt3

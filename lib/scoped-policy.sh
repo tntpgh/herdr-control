@@ -21,10 +21,12 @@
 #
 # Provides:
 #   approval_command_text <panel-text> <recorded-cmd>
-#       -> the text to judge: the recorded untruncated command when the panel
-#          (whitespace-collapsed) contains it, else the panel. exit 2 when a
-#          recorded command is NOT on a non-empty panel (two different
-#          realities — the caller refuses, never arbitrates).
+#       -> the text to judge: the recorded untruncated command when it is
+#          whitespace-collapsed equal to the panel's Command:/run: region
+#          (_sp_command_region), else the panel. exit 2 when a non-empty
+#          recorded command is not equal to that region — including when the
+#          panel carries no such label at all (two different realities — the
+#          caller refuses, never arbitrates).
 #   peer_decide <cmd-text> <task-json>
 #       -> 0 when peer authority may press Approve, 1 when it may not; sets
 #          PD_VERDICT (allow|escalate|reserved|deny), PD_REASON, PD_AUTHORITY
@@ -54,7 +56,12 @@ _sp_collapse_ws() { printf '%s' "$1" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -
 # prompt_menu_command (lib/prompt-parse.sh _prompt_menu_parse, mode=command)
 # always emits "Allow tool: <tool> " followed by the body rows space-joined,
 # one of which is the literal "Command: <cmd>" (or "run: <cmd>", omp's other
-# shape — verify-omp-hooks.sh's own omp_menu_screen fixture uses it) row. The
+# shape — verify-omp-hooks.sh's own omp_menu_screen fixture uses it) row.
+# Between the header and that row, omp (18.3.2) may also render, in this
+# fixed order, "Origin: MCP server tool " (only for mcp__ tools) and
+# "Reason: <varies>" (whenever omp's own policy flags the command, e.g.
+# `rg -n shutdown lib/`, `rm -rf /abs/path`) — both stripped below, each
+# optional and each at most once, before the Command:/run: case runs. The
 # Claude/Codex numbered fallback (prompt_command_text's OTHER branch, the
 # whole visible window) carries neither: those hooks never pass a recorded
 # command at all (claude-notify.sh calls push_wake with no third argument),
@@ -66,6 +73,8 @@ _sp_command_region() {
     "Allow tool: "*) rest="${panel#Allow tool: }"; rest="${rest#* }" ;;
     *) rest="$panel" ;;
   esac
+  case "$rest" in "Origin: MCP server tool "*) rest="${rest#Origin: MCP server tool }" ;; esac
+  case "$rest" in "Reason: Critical pattern detected Command:"*) rest="${rest#Reason: Critical pattern detected }" ;; esac
   case "$rest" in
     "Command:"*) printf '%s' "${rest#Command:}"; return 0 ;;
     "run:"*)     printf '%s' "${rest#run:}"; return 0 ;;

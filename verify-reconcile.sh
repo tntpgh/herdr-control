@@ -51,6 +51,25 @@ PANEOF
   esac
 }
 
+# gh stub, same contract as verify-run-registry.sh's: `gh pr view <n> -R
+# <slug> … -q <jq>` answers from GH_PRS ("<slug>#<n> <STATE> <oid|->");
+# GH_FAIL=1 fails every call. Never the real binary.
+GH_PRS="o/r#3 OPEN -
+o/r#4 MERGED 4444444455555555666666667777777788888888" GH_FAIL=0
+gh() {
+  [ "$GH_FAIL" = 1 ] && { echo "gh: stub failure" >&2; return 1; }
+  local n="" slug="" q="" prev="" a key st oid
+  [ "$1 $2" = "pr view" ] && n="$3"
+  for a in "$@"; do [ "$prev" = -R ] && slug="$a"; [ "$prev" = -q ] && q="$a"; prev="$a"; done
+  while read -r key st oid; do
+    [ "$key" = "$slug#$n" ] || continue
+    jq -nc --arg s "$st" --arg u "https://github.com/$slug/pull/$n" --arg o "$oid" \
+      '{state:$s, url:$u, mergeCommit:(if $o=="-" then null else {oid:$o} end)}' | jq -r "$q"
+    return 0
+  done <<<"$GH_PRS"
+  echo "GraphQL: Could not resolve to a PullRequest" >&2; return 1
+}
+
 printf '== isolated mismatch, no corroboration -> lost (existing behavior preserved) ==\n'
 register_task runA taskA w c cp cb paneA birthA-old /repo/a /wt/a "isolated" || bad "register taskA failed"
 set_task_state runA taskA running || bad "taskA -> running failed"
@@ -132,6 +151,42 @@ check "why names the shipped/proof problem specifically" \
   "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.why') FROM events WHERE task_id='taskR2' AND type='completion_evidence_rejected';")" \
   "shipped proof missing/invalid or PROOF.md still empty"
 set_task_state runR2 taskR2 cancelled >/dev/null 2>&1
+
+printf '== pane_gone + shipped with an OPEN PR head sha -> held, NOT completed (notepad item vi) ==\n'
+WTO="$(dirname "$HERDR_RUN_STATE_DIR")/wt-openpr"; mkdir -p "$WTO/.handoffs"
+printf '%s\n' '{"event":"implement:feat/openpr_done","status":"completed","reason":"shipped","proof":"https://github.com/o/r/pull/3 eb55756"}' \
+  > "$WTO/.handoffs/events.jsonl"
+register_task runO taskO w condO cp cb paneO birthO /repo/o "$WTO" "open-pr-shipped" || bad "register taskO failed"
+set_task_state runO taskO running || bad "taskO -> running failed"
+_PANES=""
+run_reconciliation condO SessionStart --quiet-if-empty --no-hook-json >/dev/null 2>&1
+check "open-PR shipped claim stays running, not completed" "$(read_task runO taskO | jq -r .state)" "running"
+check "no completion_recorded for it" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskO' AND type='completion_recorded';")" "0"
+check "why says the PR is not merged" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.why') FROM events WHERE task_id='taskO' AND type='completion_evidence_rejected';")" \
+  "PR not merged (state OPEN): https://github.com/o/r/pull/3"
+set_task_state runO taskO cancelled >/dev/null 2>&1
+
+printf '== gh failing -> held with an explicit event; merged + merge sha completes once gh answers ==\n'
+WTG="$(dirname "$HERDR_RUN_STATE_DIR")/wt-ghfail"; mkdir -p "$WTG/.handoffs"
+printf '%s\n' '{"event":"implement:feat/ghfail_done","status":"completed","reason":"shipped","proof":"https://github.com/o/r/pull/4 44444444"}' \
+  > "$WTG/.handoffs/events.jsonl"
+register_task runGh taskGh w condGh cp cb paneGh birthGh /repo/g "$WTG" "gh-fail-shipped" || bad "register taskGh failed"
+set_task_state runGh taskGh running || bad "taskGh -> running failed"
+_PANES=""
+GH_FAIL=1
+run_reconciliation condGh SessionStart --quiet-if-empty --no-hook-json >/dev/null 2>&1
+GH_FAIL=0
+check "gh failure: held running, not shipped" "$(read_task runGh taskGh | jq -r .state)" "running"
+check "gh failure: rejection recorded with why" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.why') FROM events WHERE task_id='taskGh' AND type='completion_evidence_rejected';")" \
+  "could not confirm https://github.com/o/r/pull/4 is merged (gh unavailable or failed)"
+run_reconciliation condGh SessionStart --quiet-if-empty --no-hook-json >/dev/null 2>&1
+check "next sweep with gh answering: merged PR + merge sha -> completed" "$(read_task runGh taskGh | jq -r .state)" "completed"
+check "completed with reason shipped and the cited proof" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.reason') || ' ' || json_extract(payload,'\$.proof') FROM events WHERE task_id='taskGh' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';")" \
+  "shipped https://github.com/o/r/pull/4 44444444"
 
 printf '== a worker briefed BEFORE the path change still completes (legacy .omc/handoffs, 2026-09-09) ==\n'
 # The compat half of lib/handoff.sh. If the reader ever stops consulting the

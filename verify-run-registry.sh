@@ -15,6 +15,24 @@ trap 'rm -rf "$(dirname "$HERDR_RUN_STATE_DIR")"' EXIT
 
 . "$here/lib/run-registry.sh"
 
+# gh is a function stub, never the real binary: `gh pr view <n> -R <slug>
+# --json … -q <jq>` answers from GH_PRS ("<slug>#<n> <STATE> <merge oid|->"
+# per line); GH_FAIL=1 makes every call fail the way a network/auth error does.
+GH_PRS="tntpgh/herdr-control#69 MERGED abc1234def567890abc1234def567890abc12345" GH_FAIL=0
+gh() {
+  [ "$GH_FAIL" = 1 ] && { echo "gh: stub failure" >&2; return 1; }
+  local n="" slug="" q="" prev="" a key st oid
+  [ "$1 $2" = "pr view" ] && n="$3"
+  for a in "$@"; do [ "$prev" = -R ] && slug="$a"; [ "$prev" = -q ] && q="$a"; prev="$a"; done
+  while read -r key st oid; do
+    [ "$key" = "$slug#$n" ] || continue
+    jq -nc --arg s "$st" --arg u "https://github.com/$slug/pull/$n" --arg o "$oid" \
+      '{state:$s, url:$u, mergeCommit:(if $o=="-" then null else {oid:$o} end)}' | jq -r "$q"
+    return 0
+  done <<<"$GH_PRS"
+  echo "GraphQL: Could not resolve to a PullRequest" >&2; return 1
+}
+
 pass=0 fail=0
 ok()   { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
@@ -140,6 +158,121 @@ set_task_state runPf taskPf completed shipped ".handoffs/PROOF.md#verify-run-reg
 check "PROOF.md-referencing proof accepted once the file actually holds something" \
   "$(read_task runPf taskPf | jq -r .state)" "completed"
 
+printf '== a GitHub PR proof must name a MERGED PR and its merge commit (notepad item vi) ==\n'
+# Live shape that got through: `…/pull/154 eb55756` while #154 was OPEN and
+# eb55756 was its HEAD. #153's stub oid starts with its real merge sha (f1579a62).
+GH_PRS="tntpgh/herdr-control#154 OPEN -
+tntpgh/herdr-control#153 MERGED f1579a62aaaabbbbccccddddeeeeffff00001111
+tntpgh/herdr-control#150 CLOSED -"
+pr154="https://github.com/tntpgh/herdr-control/pull/154"
+pr153="https://github.com/tntpgh/herdr-control/pull/153"
+if _valid_proof_ref "$pr154 eb55756"; then
+  bad "head sha on an OPEN PR accepted as shipped proof"
+else
+  ok "head sha on an OPEN PR refused"
+fi
+case "$_PROOF_REF_WHY" in "PR not merged (state OPEN)"*) ok "why names the open state" ;; *) bad "why: $_PROOF_REF_WHY" ;; esac
+if _valid_proof_ref "HTTPS://GitHub.COM/tntpgh/herdr-control/pull/154/files eb55756"; then
+  bad "an upper-case host / sub-path dodged the PR check"
+else
+  ok "upper-case host and /files sub-path still go through the PR check"
+fi
+if _valid_proof_ref "$pr154 eb55756 .handoffs/PROOF.md#x" "$wtreal"; then
+  bad "naming PROOF.md next to an OPEN PR dodged the PR check"
+else
+  ok "a PR claim that also names PROOF.md is still checked as a PR claim"
+fi
+_valid_proof_ref "$pr153 f1579a6" && ok "short merge sha on a MERGED PR accepted" || bad "merged PR + merge sha refused: $_PROOF_REF_WHY"
+_valid_proof_ref "$pr153 F1579A62AAAABBBBCCCCDDDDEEEEFFFF00001111" \
+  && ok "full merge sha accepted, case-insensitively" || bad "full merge sha refused: $_PROOF_REF_WHY"
+if _valid_proof_ref "$pr153 eb55756"; then
+  bad "a sha that is not the merge commit accepted on a MERGED PR"
+else
+  ok "a non-merge sha on a MERGED PR refused"
+fi
+if _valid_proof_ref "https://github.com/tntpgh/herdr-control/pull/150 abc1234"; then
+  bad "a CLOSED-unmerged PR accepted"
+else
+  ok "a CLOSED-unmerged PR refused"
+fi
+if _valid_proof_ref "https://github.com/tntpgh/herdr-control/pull/x154 eb55756"; then
+  bad "a malformed github pull URL fell back to the shape check"
+else
+  ok "a github pull URL that does not parse is refused, not shape-checked"
+fi
+# Spellings that name the open #154 (or send a browser to it) without the
+# literal `github.com/…/pull/`: each must go through the PR check, not the
+# shape check. /issues/<n> of a PR is a real GitHub redirect to /pull/<n>;
+# browsers decode %XX, read `\` as `/`, drop TAB/LF, and IDNA-map hosts.
+for p in "https://github.com/tntpgh/herdr-control/issues/154 eb55756" \
+         "https://api.github.com/repos/tntpgh/herdr-control/issues/154 eb55756" \
+         "https://%67ithub.com/tntpgh/herdr-control/pull/154 eb55756" \
+         "https://github.com/tntpgh/herdr-control/%70ull/154 eb55756" \
+         'https://github.com\tntpgh\herdr-control\pull\154 eb55756' \
+         "https://github.com/tntpgh/herdr-control/pu"$'\t'"ll/154 eb55756" \
+         "https://ｇithub.com/tntpgh/herdr-control/pull/154 eb55756" \
+         "https://github。com/tntpgh/herdr-control/pull/154 eb55756" \
+         "$pr153/../154 f1579a6" \
+         "$pr153/%2e%2e/154 f1579a6" \
+         "$pr153#"$'\n'"$pr154 f1579a6" \
+         "https:ｇithub.com/tntpgh/herdr-control/pull/154?u=https://x eb55756" \
+         $'\x01'"https://ｇithub.com/tntpgh/herdr-control/pull/154 eb55756" \
+         "https:///ｇithub.com/tntpgh/herdr-control/pull/154 eb55756"; do
+  if _valid_proof_ref "$p"; then
+    bad "alias/encoded/normalising PR spelling accepted on shape alone: $p"
+  else
+    ok "refused as a PR claim: ${p%% *}"
+  fi
+done
+# Not PR claims: these keep the shape check exactly as before, escapes and all.
+for p in "https://github.com/tntpgh/herdr-control/commit/eb55756 eb55756" \
+         "https://github.com/tntpgh/herdr-control/blob/main/docs/a%20b.md eb55756" \
+         "https://github.com/tntpgh/herdr-control/tree/fix%2Fshipped eb55756" \
+         "https://codeberg.org/o/r/pulls/3 eb55756 (mirrored to github.com/o/r)" \
+         "https://xn--bcher-kva.example/release/1 eb55756"; do
+  _valid_proof_ref "$p" && ok "non-PR URL keeps the shape check: ${p%% *}" \
+    || bad "non-PR URL refused: $p ($_PROOF_REF_WHY)"
+done
+for p in "PROOF.md:§2" "PROOF.md:“Shipped”" "section:—.handoffs/PROOF.md"; do
+  _valid_proof_ref "$p" "$wtreal" && ok "PROOF.md ref with a colon + non-ASCII text is not read as a URL host: $p" \
+    || bad "PROOF.md ref refused: $p ($_PROOF_REF_WHY)"
+done
+long="https://example.com/$(printf 'a%.0s' $(seq 1 3000)) eb55756"
+if _valid_proof_ref "$long"; then
+  bad "a 3000-char first word was decoded and accepted"
+else
+  case "$_PROOF_REF_WHY" in *"over 2048"*) ok "an overlong first word is refused before decoding" ;; *) bad "why: $_PROOF_REF_WHY" ;; esac
+fi
+_valid_proof_ref "$pr153/files/abc1234..f1579a6 f1579a6" \
+  && ok "a '..' inside a segment (PR commit-range view) is not a dot-segment" \
+  || bad "commit-range PR URL refused: $_PROOF_REF_WHY"
+GH_FAIL=1
+if _valid_proof_ref "$pr153 f1579a6"; then
+  bad "gh FAILING let a shipped PR proof through"
+else
+  ok "gh failing -> PR proof not accepted"
+fi
+case "$_PROOF_REF_WHY" in "could not confirm"*) ok "why says the check could not run" ;; *) bad "why: $_PROOF_REF_WHY" ;; esac
+_valid_proof_ref ".handoffs/PROOF.md#x" "" \
+  && ok "PROOF.md reference unchanged (never asks gh)" || bad "PROOF.md ref refused while gh fails"
+_valid_proof_ref "https://example.com/pr/1 abc1234" \
+  && ok "non-GitHub URL proof unchanged (shape check only)" || bad "non-PR URL refused while gh fails"
+GH_FAIL=0
+if ( unset -f gh; PATH=/usr/bin:/bin; _valid_proof_ref "$pr153 f1579a6" ); then
+  bad "gh NOT INSTALLED let a shipped PR proof through"
+else
+  ok "gh absent from PATH -> PR proof not accepted"
+fi
+register_task runOpen taskOpen w c cp cb paneOpen birthOpen /repo/o /wt/o "open-pr" || bad "register taskOpen failed"
+set_task_state runOpen taskOpen running || bad "taskOpen -> running failed (setup)"
+err=$(set_task_state runOpen taskOpen completed shipped "$pr154 eb55756" 2>&1) \
+  && bad "set_task_state recorded shipped for an OPEN PR" || ok "set_task_state refuses shipped for an OPEN PR's head sha"
+check "state unchanged by the refusal" "$(read_task runOpen taskOpen | jq -r .state)" "running"
+case "$err" in *"PR not merged (state OPEN)"*) ok "refusal names why" ;; *) bad "refusal text: $err" ;; esac
+set_task_state runOpen taskOpen completed shipped "$pr153 f1579a62" \
+  || bad "set_task_state refused a merged PR's merge sha"
+check "merged PR + merge sha completes the task" "$(read_task runOpen taskOpen | jq -r .state)" "completed"
+
 
 # The gap correction 2 named: "nothing stops completed -> running".
 if set_task_state run1 task1 running 2>/dev/null; then
@@ -231,7 +364,7 @@ check "all $n_writers concurrent events landed" "$rows" "$n_writers"
 check "every sequence is unique"                "$uniq_seqs" "$n_writers"
 
 printf '== all_tasks_json ==\n'
-check "one line per task" "$(all_tasks_json | wc -l | tr -d ' ')" "5"
+check "one line per task" "$(all_tasks_json | wc -l | tr -d ' ')" "6"
 all_tasks_json | while IFS= read -r l; do
   printf '%s' "$l" | jq -e . >/dev/null 2>&1 || { printf '  FAIL  non-JSON row\n'; exit 1; }
 done || bad "all_tasks_json emitted a non-JSON row"

@@ -426,6 +426,34 @@ printf '<video:description>call %s</video:description>\n' "$BADPHONE" > "$R/publ
 git -C "$R" add public/sitemap.xml
 blocks "$R" "a real phone in the address-exempt sitemap.xml still blocks"
 
+# A listing site publishes street addresses as its product, so it opts out of
+# the STREET detector per repo: `git config secretscan.allowStreetAddresses
+# true` (tntpgh-dev, 2026-09-26). Street only — phone, email and credentials
+# still block in that same repo, and a repo without the switch still blocks.
+R="$(new_repo)"
+git -C "$R" config secretscan.allowStreetAddresses true
+mkdir -p "$R/src/assets"
+printf '{"variants":[{"source":"src/assets/originals/properties/%s 1.webp"}]}\n' "$BADSTREET" > "$R/src/assets/asset-manifest.json"
+git -C "$R" add src/assets/asset-manifest.json
+allows "$R" "a street address in a repo with secretscan.allowStreetAddresses=true"
+
+R="$(new_repo)"
+git -C "$R" config secretscan.allowStreetAddresses true
+printf 'owner = "%s"\n' "$BADMAIL" > "$R/crm.py"
+git -C "$R" add crm.py
+blocks "$R" "a third-party email still blocks in a street-opted-out repo"
+
+R="$(new_repo)"
+git -C "$R" config secretscan.allowStreetAddresses true
+printf 'call %s\n' "$BADPHONE" > "$R/notes.md"
+git -C "$R" add notes.md
+blocks "$R" "a real phone still blocks in a street-opted-out repo"
+
+R="$(new_repo)"
+printf '{"client":{"addr":"%s"}}\n' "$BADSTREET" > "$R/clients.json"
+git -C "$R" add clients.json
+blocks "$R" "the same address still blocks in a repo WITHOUT the switch"
+
 printf '== ...and real-looking PII still blocks ==\n'
 R="$(new_repo)"
 printf 'owner = "%s"\n' "$BADMAIL" > "$R/crm.py"
