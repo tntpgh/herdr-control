@@ -1327,7 +1327,12 @@ EOF
         # option (`git -c diff.external=… diff`) or any other subcommand
         # (pull, checkout, reset, stash, merge, rebase, …) stays unsafe, as
         # does an output file (`--output`, `-o`) or `--ext-diff`.
-        if [ "$_cp_wcmd" = git ]; then
+        # The segment must START with git itself: an env prefix
+        # (`GIT_EXTERNAL_DIFF=… git diff`, `GIT_PAGER=…`) runs a program.
+        # ceiling: repo config the worker set earlier (diff.external,
+        # core.pager, core.fsmonitor) is not visible in this command; a
+        # worker that can edit .git/config is outside what this gate sees.
+        if [ "$_cp_wcmd" = git ] && [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$seg" | awk '{print $1}')" ]; then
           case "${_CP_LOC[1]:-}" in
             status|log|diff|show|branch|rev-parse|remote)
               case " ${_CP_LOC[*]:2} " in *' --output'*|*' -o '*|*' --ext-diff'*) return 0 ;; esac

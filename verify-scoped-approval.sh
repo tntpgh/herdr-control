@@ -494,6 +494,8 @@ git pull && bash tmp/clean.sh
 git diff --output=tmp/x && bash tmp/clean.sh
 git -c diff.external=x diff && bash tmp/clean.sh
 git stash && bash tmp/clean.sh
+GIT_EXTERNAL_DIFF=x git diff; bash tmp/clean.sh
+GIT_PAGER=x git log; bash tmp/clean.sh
 EOF
 for form in "bash tmp/clean.sh" "bash tmp/clean.sh 2>&1 | tail -3" "bash tmp/clean.sh && echo done" \
             "bash tmp/clean.sh > /tmp/out.txt" "bash tmp/clean.sh | grep hello | wc -l" \
