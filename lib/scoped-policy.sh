@@ -151,19 +151,36 @@ _sp_clamp_wait_seconds() {
 # ever appearing (a hand-started session, an older omp build, a non-bash
 # prompt) falls through unchanged, after the wait, to the scraped-panel
 # behaviour that predates this function.
+#
+# HERDR_SELECT_WAIT_TRACE is a TEST SEAM, unset in every real deployment: when
+# it names a file, append one line per poll ("poll <n>") and a final "found"
+# or "timeout" line. PR #158 review round 2: elapsed-ms assertions raced the
+# machine's own speed (a run that should have waited returned in under the
+# threshold simply because this host was fast that second). A test can now
+# synchronize on the FILE's content — e.g. wait for "poll 1" to appear before
+# seeding the row a delayed test depends on — instead of guessing a sleep
+# long enough to outrun any machine.
 wait_for_input_required_row() {
   local run_id="$1" task_id="$2" prompt_id="$3"
   [ -n "$prompt_id" ] || return 0
   registry_init || return 0
-  local wait_s elapsed=0 step=0.25 n
+  local wait_s elapsed=0 step=0.25 n poll_n=0
   wait_s="$(_sp_clamp_wait_seconds "${HERDR_SELECT_RECORD_WAIT_S:-}")"
   while :; do
+    poll_n=$((poll_n + 1))
+    [ -n "${HERDR_SELECT_WAIT_TRACE:-}" ] && printf 'poll %s\n' "$poll_n" >> "$HERDR_SELECT_WAIT_TRACE"
     n="$(_sql "SELECT count(*) FROM events
           WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id")
             AND type='input_required'
             AND json_extract(payload,'\$.prompt_id')=$(_sq "$prompt_id");" 2>/dev/null)"
-    [ "${n:-0}" -gt 0 ] 2>/dev/null && return 0
-    awk -v e="$elapsed" -v w="$wait_s" 'BEGIN{exit !(e < w)}' || return 1
+    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+      [ -n "${HERDR_SELECT_WAIT_TRACE:-}" ] && printf 'found\n' >> "$HERDR_SELECT_WAIT_TRACE"
+      return 0
+    fi
+    if ! awk -v e="$elapsed" -v w="$wait_s" 'BEGIN{exit !(e < w)}'; then
+      [ -n "${HERDR_SELECT_WAIT_TRACE:-}" ] && printf 'timeout\n' >> "$HERDR_SELECT_WAIT_TRACE"
+      return 1
+    fi
     sleep "$step"
     elapsed="$(awk -v e="$elapsed" -v s="$step" 'BEGIN{printf "%.4f", e+s}')"
   done

@@ -1037,27 +1037,11 @@ peer_on "cd $SWT && bash tmp/missing.sh"; rc=$?
 set_task_state runS taskS completed no-follow-on >/dev/null 2>&1
 
 printf '== fix/peer-waits-for-record ==\n'
-now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 
 RBRANCH="fix/race-wait"; RTRUNK="main"
 register_task runR taskR wR cR "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/record-wait "impl:race" "$RBRANCH" "$RTRUNK" >/dev/null 2>&1
 set_task_state runR taskR running >/dev/null 2>&1
-
-# LOW-1 (PR #158 review): elapsed_ms >= 700 passed on main too, because ONE
-# herdr-select call already costs about 1.1s of subprocess overhead on this
-# machine. Measure that overhead directly — HERDR_SELECT_RECORD_WAIT_S=0, a
-# real call with the row already present, nothing to wait for — and assert
-# every timing case RELATIVE to it, so removing the wait can actually fail
-# these.
-BASELINE_TEXT="pwd"
-set_menu "$BASELINE_TEXT"; reset_keys
-seed_input_required runR taskR "$BASELINE_TEXT"
-t0=$(now_ms)
-HERDR_SELECT_RECORD_WAIT_S=0 sel 1 --authority peer; baseline_rc=$?
-t1=$(now_ms)
-baseline_ms=$((t1 - t0))
-[ "$baseline_rc" -eq 0 ] && ok "baseline call succeeds (row already present, nothing to wait for)" \
-  || bad "baseline call failed: rc=$baseline_rc"
+WAIT_TRACE="$WORK/wait-trace.log"
 
 printf '== change 1: registry command missing at call time is worth a short wait ==\n'
 # Live registry, 2026-09-26 (SPEC.md): event 37805 input_required and 37806
@@ -1066,22 +1050,33 @@ printf '== change 1: registry command missing at call time is worth a short wait
 # (message containing "push") was refused as reserved. set_menu, not
 # set_screen: the anchored corroboration fix (PR #158 review, HIGH) only ever
 # trusts a recorded command against an omp Command:/run: label.
+#
+# PR #158 review round 2: elapsed-ms comparisons raced the machine's own
+# speed ("returned before the window elapsed: 956ms (baseline 989ms)" — a
+# real failure on a fast run, not a real bug). Synchronized on the trace FILE
+# instead (HERDR_SELECT_WAIT_TRACE, lib/scoped-policy.sh): the background
+# seeder waits for "poll 1" to land in the trace before writing the row, so
+# this can never depend on how fast any particular machine happens to be.
 set_task_state runR taskR running >/dev/null 2>&1
 RACE_MSG='git commit -m "docs(policy): grant header comment matches -u/--set-upstream push shape"'
 set_menu "$RACE_MSG"; reset_keys
-( sleep 1; seed_input_required runR taskR "$RACE_MSG" ) &
+: > "$WAIT_TRACE"
+(
+  while ! grep -q '^poll 1$' "$WAIT_TRACE" 2>/dev/null; do sleep 0.05; done
+  seed_input_required runR taskR "$RACE_MSG"
+) &
 bg_pid=$!
-t0=$(now_ms)
-sel 1 --authority peer; rc=$?
-t1=$(now_ms)
+HERDR_SELECT_RECORD_WAIT_S=5 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
 wait "$bg_pid" 2>/dev/null
-elapsed_ms=$((t1 - t0))
 [ "$rc" -eq 0 ] && ok "waited for the delayed registry row instead of judging the raw panel" \
   || bad "race not resolved: rc=$rc; stderr: $(cat "$WORK/err.txt")"
 [ "$(q_appr authority)" = "grant" ] && ok "authority recorded grant (registry text used, not the panel's 'push' word)" \
   || bad "authority=$(q_appr authority) — the ownership grant did not engage"
-[ "$elapsed_ms" -ge "$((baseline_ms + 700))" ] && ok "actually waited for the delayed row (${elapsed_ms}ms, baseline ${baseline_ms}ms)" \
-  || bad "returned too fast to have waited for the row: ${elapsed_ms}ms (baseline ${baseline_ms}ms)"
+[ "$(tail -1 "$WAIT_TRACE")" = "found" ] && ok "trace ends in found" \
+  || bad "trace did not end in found: $(cat "$WAIT_TRACE")"
+poll_count=$(grep -c '^poll ' "$WAIT_TRACE")
+[ "$poll_count" -ge 2 ] && ok "at least one poll found nothing before the row landed ($poll_count polls)" \
+  || bad "only $poll_count poll(s) — the row must have already existed at call time: $(cat "$WAIT_TRACE")"
 
 printf '== HIGH (PR #158 review): a SHORT recorded command must not corroborate as a substring of unrelated panel text ==\n'
 # The exact reproduction: panel shows a merge, a hook race records "ls" for
@@ -1119,25 +1114,22 @@ seed_input_required_empty() {           # <run> <task>
 NOCMD_TEXT="git status --short"
 set_screen "$NOCMD_TEXT"; reset_keys
 seed_input_required_empty runR taskR
-t0=$(now_ms)
-sel 1 --authority peer; rc=$?
-t1=$(now_ms)
-elapsed_ms=$((t1 - t0))
+: > "$WAIT_TRACE"
+HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "a command-less row still answers from the panel" || bad "rc=$rc"
-[ "$elapsed_ms" -lt "$((baseline_ms + 400))" ] && ok "returned in ${elapsed_ms}ms — an EXISTING row (even command:\"\") never waits (baseline ${baseline_ms}ms)" \
-  || bad "took ${elapsed_ms}ms — waited despite an existing row (baseline ${baseline_ms}ms)"
+[ "$(cat "$WAIT_TRACE")" = "$(printf 'poll 1\nfound')" ] \
+  && ok "trace is exactly one poll followed by found — no timeout, no extra polling" \
+  || bad "trace: $(cat "$WAIT_TRACE")"
 
 printf '== change 1: no registry row ever appears -> bounded wait, then the scraped panel ==\n'
 FALLBACK_TEXT="git log --oneline -3"
 set_screen "$FALLBACK_TEXT"; reset_keys
-t0=$(now_ms)
-HERDR_SELECT_RECORD_WAIT_S=1 sel 1 --authority peer; rc=$?
-t1=$(now_ms)
-elapsed_ms=$((t1 - t0))
+: > "$WAIT_TRACE"
+HERDR_SELECT_RECORD_WAIT_S=1 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "falls back to the scraped panel text when no row ever appears" \
   || bad "rc=$rc; stderr: $(cat "$WORK/err.txt")"
-[ "$elapsed_ms" -ge "$((baseline_ms + 700))" ] && ok "waited out the full bounded window before falling back (${elapsed_ms}ms, baseline ${baseline_ms}ms)" \
-  || bad "returned before the window elapsed: ${elapsed_ms}ms (baseline ${baseline_ms}ms)"
+[ "$(tail -1 "$WAIT_TRACE")" = "timeout" ] && ok "trace ends in timeout" \
+  || bad "trace did not end in timeout: $(cat "$WAIT_TRACE")"
 
 printf '== change 2: a peer refusal records the TASKs own_run/own_task and the prompt_id ==\n'
 REFUSE_TEXT="gh pr merge 99 --squash"
