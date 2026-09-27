@@ -387,10 +387,17 @@ _cp_grant_action() {                    # raw wt branch trunk
 # message cluster only when every flag before its final `m` is one of git's
 # no-argument commit flags; `-tm` is kept whole, because its following word
 # is a real template/path argument (security review NEW-2).
+#
+# F6: for `git add`, a literal pathspec naming a governance file is dropped
+# too. The #3b grant already allows `git add -A` (which stages the same file)
+# and the commit on the task's own branch; the policy-file reservation exists
+# to stop EDITS to the gate, which happen through the edit tool, and pushes to
+# main stay human-only. Only plain paths go: an option, a glob, `$`, or a
+# credential path (`.env`, `~/.ssh/…`) is kept and still judged.
 _cp_strip_commit_message() {            # raw wt
   _cp_simple_words "$1" "$2" || return 1
   local -a w=("${_CP_W[@]}") out=()
-  local i=0 n="${#_CP_W[@]}" token prefix
+  local i=0 n="${#_CP_W[@]}" token prefix plain
   while [ "$i" -lt "$n" ]; do
     token="${w[$i]}"
     case "$token" in
@@ -399,7 +406,19 @@ _cp_strip_commit_message() {            # raw wt
       -m?*) ;;
       -[aqsvez]m)
         i=$((i + 1)) ;;
-      *) out+=("$token") ;;
+      *)
+        if [ "${w[1]:-}" = add ] && [ "$i" -ge 2 ]; then
+          plain="$(printf '%s' "$token" | tr '\001-\016' ' ')"
+          case "$plain" in
+            -*|*[\*\?\[\{\$\ ]*) ;;
+            *)
+              case "${plain##*/}" in
+                herdr-select.sh|scoped-policy.sh|task-manifest.sh|run-registry.sh|alert-gate.sh|prompt-parse.sh|command-policy.sh|approval-policy.md|gate-registry.yaml)
+                  i=$((i + 1)); continue ;;
+              esac ;;
+          esac
+        fi
+        out+=("$token") ;;
     esac
     i=$((i + 1))
   done
@@ -2496,6 +2515,39 @@ _cp_envdump_word_is_dump() {            # norm [noexempt] -> 0 (true) if it dump
       if (depth > 0) return openpos[depth]
       return 0
     }
+    # F6: `env NAME=val [NAME=val…] cmd …` only sets variables for cmd and
+    # prints nothing. Exempt ONLY that exact shape: one or more NAME=value
+    # words, then a present command word that is not an option and not
+    # env/printenv itself. A name that changes WHAT runs or what an
+    # interpreter loads (BASH_ENV, PATH, PYTHON*, LD_*/DYLD_*, GIT_*, …)
+    # never qualifies — `env BASH_ENV=x bash y` stays exactly as reserved as
+    # it was; so does any value carrying a shell operator.
+    function env_name_loads_code(nm) {
+      return (nm ~ /^(BASH_ENV|ENV|PATH|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|HOME|ZDOTDIR|TMPDIR|EDITOR|VISUAL|PAGER|MANPAGER|LESSOPEN|LESSCLOSE|BROWSER|SSH_ASKPASS|SUDO_ASKPASS|NODE_OPTIONS|NODE_PATH|PERLLIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|XDG_CONFIG_HOME|XDG_CONFIG_DIRS)$/ ||
+              nm ~ /^(PYTHON|PERL5|GIT_|LD_|DYLD_)/)
+    }
+    function env_assign_prefix(line, p,    rest, nt, toks, k, t, cnt, eq, nm, val, lt) {
+      rest = substr(line, p)
+      nt = split(rest, toks, /[ \t]+/)
+      cnt = 0
+      for (k = 1; k <= nt; k++) {
+        t = toks[k]
+        if (t == "") continue
+        if (t ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+          eq = index(t, "="); nm = substr(t, 1, eq - 1); val = substr(t, eq + 1)
+          if (env_name_loads_code(nm)) return 0
+          if (val ~ /[;&|<>`()]/) return 0
+          cnt++
+          continue
+        }
+        if (cnt == 0) return 0
+        if (t ~ /^[-;&|<>()]/) return 0
+        lt = tolower(t); sub(/.*\//, "", lt)
+        if (lt == "env" || lt == "printenv") return 0
+        return 1
+      }
+      return 0
+    }
     {
       line = $0; n = length(line); i = 1; found = 0
       while (i <= n) {
@@ -2510,6 +2562,7 @@ _cp_envdump_word_is_dump() {            # norm [noexempt] -> 0 (true) if it dump
         exempt = 0
         if (NOEXEMPT != "1") {
           if (after == ".") exempt = 1
+          if (!exempt && wlen == 3 && env_assign_prefix(line, i + 3)) exempt = 1
           if (!exempt) {
             j = i + wlen
             while (substr(line, j, 1) == " " || substr(line, j, 1) == "\t") j++
@@ -3513,7 +3566,53 @@ conductor_reserved_reason() {
   # a `-C`, and any `cd … &&` prefix all fail to match this shape and
   # stay reserved below — see _cp_push_is_safe's own header for the full
   # design and the two security-review rounds that shaped it.
-  elif { _cp_git_push_invoked "$(_cp_mask_script_data "$raw")" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|alert-gate\.sh|prompt-parse\.sh)\b|(^|[^A-Za-z0-9_-])command-policy\.sh\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm"; then
+  # The governance FILENAME list (F6): matched as a whole path component —
+  # `\b` treated `-` as a boundary, so `verify-alert-gate.sh` read as
+  # `alert-gate.sh` — and skipped when the whole command only READS
+  # (_cp_policy_mention_harmless: read-only verbs, or `sh -n <one path>`).
+  # Every other alternative on this list is unchanged.
+  elif { _cp_git_push_invoked "$(_cp_mask_script_data "$raw")" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm" ||
+       { _cp_imatch "$_CP_POLICY_FILE_RE" "$action_norm" && ! _cp_policy_mention_harmless "$raw"; }; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
   fi
+}
+
+# The governance files. A name counts only as a whole path component: the
+# character before it is not a word char or `-` (so `verify-alert-gate.sh`
+# and `my-herdr-select.sh.bak` are not these files; `lib/alert-gate.sh`,
+# `./herdr-select.sh`, `>herdr-select.sh` are).
+_CP_POLICY_FILE_RE='(^|[^A-Za-z0-9_-])(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|alert-gate\.sh|prompt-parse\.sh|command-policy\.sh)([^A-Za-z0-9_]|$)'
+
+# `_cp_policy_mention_harmless <raw>` -> 0 when naming a policy file cannot
+# change it: every segment's command word is a read-only verb, with no
+# output redirection, no `tee`, no `--output`, no substitution anywhere; or
+# the whole command is exactly `bash|sh|zsh|dash -n <one path>` (parse only).
+# Only the policy-FILENAME alternative is skipped; credential paths and
+# every other reserved shape are judged exactly as before.
+_CP_READONLY_VERBS=' cd cat wc head tail grep egrep fgrep rg diff cmp ls stat file shasum sha256sum md5 nl '
+_cp_policy_mention_harmless() {         # raw
+  local raw="$1" seg n=0
+  local tidy
+  # stderr-to-stdout and discard-to-/dev/null write nothing; any other `>` does.
+  tidy="$(printf '%s' "$raw" | sed -E 's#[0-9]*>&[0-9]##g; s#[0-9]*>[[:space:]]*/dev/null##g')"
+  case "$tidy" in *$'\n'*|*'`'*|*'$('*|*'<('*|*'>('*|*'>'*) return 1 ;; esac
+  if _cp_simple_words "$raw" ""; then
+    case "${#_CP_W[@]}:${_CP_W[0]##*/}:${_CP_W[1]:-}" in
+      3:bash:-n|3:sh:-n|3:zsh:-n|3:dash:-n)
+        case "${_CP_W[2]}" in -*|*'$'*|*'*'*|*'?'*|*'['*|*'{'*) return 1 ;; esac
+        return 0 ;;
+    esac
+  fi
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
+    n=$((n + 1))
+    case "$seg" in *--output*|*--pre*) return 1 ;; esac
+    _cp_locate_command_word "$seg" || return 1
+    [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$seg" | awk '{print $1}')" ] || return 1
+    case "$_CP_READONLY_VERBS" in *" $_cp_wcmd "*) ;; *) return 1 ;; esac
+  done <<EOF
+$(_cp_coderef_split "$tidy")
+EOF
+  [ "$n" -gt 0 ]
 }

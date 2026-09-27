@@ -632,7 +632,9 @@ for grant_cmd in "git push origin $GBRANCH" "gh pr create --head $GBRANCH" \
                  "git commit -m note" "cd /wt/grant && git push origin $GBRANCH" \
                  "git push -u origin $GBRANCH" "git push --set-upstream origin $GBRANCH" \
                  "cd /wt/grant && git push -u origin $GBRANCH" \
-                 "cd /wt/grant && git push --set-upstream origin $GBRANCH"; do
+                 "cd /wt/grant && git push --set-upstream origin $GBRANCH" \
+                 "git add lib/command-policy.sh herdr-select.sh" \
+                 "cd /wt/grant && git add verify-alert-gate.sh lib/scoped-policy.sh"; do
   set_menu "$grant_cmd"; reset_keys
   seed_input_required runG taskG "$grant_cmd"
   sel 1 --authority peer; rc=$?
@@ -666,7 +668,7 @@ sel 1 --authority peer; rc=$?
 
 
 printf '== #3b: exact non-grant variants of the SAME verbs still refused ==\n'
-for bad_cmd in "git push origin main" "git push -f origin $GBRANCH" "git push origin HEAD:main" \
+for bad_cmd in "git add .env lib/command-policy.sh" "git add -f .env" "git add ~/.ssh/id_rsa" "git push origin main" "git push -f origin $GBRANCH" "git push origin HEAD:main" \
                "git push origin $GBRANCH && git push origin main" "gh pr merge $GBRANCH" \
                "git push -u origin main" "git push --force -u origin $GBRANCH" \
                "git push -u --force-with-lease origin $GBRANCH" "git push -u origin +$GBRANCH" \
