@@ -460,6 +460,10 @@ echo "== edge dispatcher (agent-edge.sh, stubbed) =="
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/verify-edge.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/state" "$tmp/bridge"
+# These cases pin the backstop MECHANISM, so they run at HERDR_SLACK_LEVEL=all
+# (every class posts, as before 2026-09-26). The errors-only policy — what the
+# default level escalates and when — has its own cases below, which override it.
+export HERDR_SLACK_LEVEL=all
 
 # Stubs via the script's documented seams (config.sh exports its own PATH, so
 # PATH shadowing does not work here). Nothing real is reachable: no Slack, no
@@ -471,6 +475,12 @@ cat > "$tmp/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 echo "curl $*" >> "$STUB_LOG"
 [ -n "${STUB_DOWN:-}" ] && exit 7
+# STUB_CLEAR_FROM_CALL=N: blocked for the first N-1 probes, cleared after —
+# a block that outlives the backstop grace but clears before escalation.
+if [ -n "${STUB_CLEAR_FROM_CALL:-}" ]; then
+  n=$(( $(cat "$STUB_LOG.probes" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STUB_LOG.probes"
+  [ "$n" -ge "$STUB_CLEAR_FROM_CALL" ] && STUB_CLEARED=1
+fi
 if [ -n "${STUB_CLEARED:-}" ]; then echo '{"connected":true,"panes":[{"pane_id":"w1:p1","agent_status":"idle"},{"pane_id":"w1:p9","agent_status":"idle"}]}'
 else echo '{"connected":true,"panes":[{"pane_id":"w1:p1","agent_status":"blocked"},{"pane_id":"w1:p9","agent_status":"blocked"}]}'; fi
 STUB
@@ -491,7 +501,18 @@ case " $* " in *" --choices "*) ;; *) exit 0 ;; esac
 printf '{"ts":"%s","pane":"w1:p1"}\n' "$(date +%s)" >> "$STUB_PENDING"
 exit 0
 STUB
-chmod +x "$tmp/bin/curl" "$tmp/bin/record" "$tmp/bin/notify"
+# Only on PATH for the errors-level cases (via HERDR_EXTRA_PATH, which
+# config.sh puts first): the escalation asks human_must_answer about the pane,
+# and that must read this fixture, never a live herdr pane.
+cat > "$tmp/bin/herdr" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "pane read") [ -n "${STUB_SCREEN:-}" ] && cat "$STUB_SCREEN" ;;
+  *) echo '{}' ;;
+esac
+exit 0
+STUB
+chmod +x "$tmp/bin/curl" "$tmp/bin/record" "$tmp/bin/notify" "$tmp/bin/herdr"
 for name in resolve peer-answer; do cp "$tmp/bin/record" "$tmp/bin/$name"; done
 
 run_edge() {                            # <status> <previous> [env assignments...]
@@ -543,7 +564,7 @@ case "$(did "$line")" in "registry-heal (first observation) reg="*) [ ! -s "$tmp
 
 line=$(run_edge blocked working)
 case "$(did "$line")" in "backstop alert (queued for retraction) reg="*) true ;; *) false ;; esac \
-  && grep -q "^notify --choices --pane w1:p1" "$tmp/log" \
+  && grep -q "^notify --class needs-input --choices --pane w1:p1" "$tmp/log" \
   && ok "the backstop alerts WITH --choices, so the alert is queued and answerable" \
   || no "backstop" "$line $(cat "$tmp/log")"
 rm -f "$tmp/bridge/pending.jsonl"
@@ -566,7 +587,7 @@ line=$(run_edge blocked working STUB_CLEARED=1)
 # `cleared within grace` into the audit file while doing it.
 line=$(run_edge blocked working STUB_DOWN=1)
 case "$(did "$line")" in *"probe unreachable"*|*"NOT QUEUED"*|*"queued for retraction"*) true ;; *) false ;; esac \
-  && grep -q "^notify --choices" "$tmp/log" \
+  && grep -q "^notify --class needs-input --choices" "$tmp/log" \
   && ok "an unreachable probe alerts anyway, and says the probe failed" \
   || no "probe unknown" "$line $(cat "$tmp/log")"
 rm -f "$tmp/bridge/pending.jsonl"
@@ -575,6 +596,50 @@ printf '{"ts":"1","pane":"w1:p1"}\n' > "$tmp/bridge/pending.jsonl"
 line=$(run_edge blocked working)
 [ "$(did "$line")" = "already alerted by the worker's own hook" ] && ! grep -q "^notify" "$tmp/log" \
   && ok "no double alert when the hook already queued one" || no "dedupe" "$line"
+rm -f "$tmp/bridge/pending.jsonl"
+
+echo "== errors-only Slack policy at the backstop (HERDR_SLACK_LEVEL=errors) =="
+# A human-only prompt (nothing the peer path can parse) still blocked at the
+# threshold escalates as human-stale; the grace-time backstop is needs-input.
+printf ' \n' > "$tmp/screen"
+line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=1 \
+         HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen")
+[ "$(did "$line")" = "escalated to Slack as human-stale after 1s" ] \
+  && grep -q "^notify --class needs-input --choices --pane w1:p1" "$tmp/log" \
+  && grep -q "^notify --class human-stale --choices --pane w1:p1" "$tmp/log" \
+  && ok "errors level: a human-only prompt still blocked at the threshold escalates as human-stale" \
+  || no "human-stale escalation" "$line $(cat "$tmp/log")"
+rm -f "$tmp/bridge/pending.jsonl"
+
+# An allow-class prompt (a peer could take it) that is STILL blocked escalates
+# as stuck — the automation had its turn and did not clear it.
+printf ' Allow tool: bash\n   run: git status --short\n\n\033[48;2;40;40;40m  Approve\033[0m\n   Deny\n\n up/down navigate  enter select  esc cancel\n' > "$tmp/screen"
+env HERDR_RUN_STATE_DIR="$tmp/runs-esc" bash -c '
+  . "'"$HERE"'/lib/run-registry.sh"
+  register_task run_s task_s w1 cond1 c:p1 cb w1:p1 wb /repo /wt "impl:s" >/dev/null' 2>/dev/null
+line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_STUCK_ALERT_S=1 HERDR_HUMAN_ALERT_S=1 \
+         HERDR_RUN_STATE_DIR="$tmp/runs-esc" HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen")
+[ "$(did "$line")" = "escalated to Slack as stuck after 1s" ] \
+  && grep -q "^notify --class stuck --choices --pane w1:p1" "$tmp/log" \
+  && ok "errors level: an allow-class prompt still blocked at the threshold escalates as stuck" \
+  || no "stuck escalation" "$line $(cat "$tmp/log")"
+rm -f "$tmp/bridge/pending.jsonl"
+
+# Blocked past the backstop grace, cleared before the threshold: no error.
+rm -f "$tmp/log.probes"
+line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=1 \
+         HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen" STUB_CLEAR_FROM_CALL=2)
+[ "$(did "$line")" = "cleared before human-stale escalation" ] || [ "$(did "$line")" = "cleared before stuck escalation" ]
+[ $? = 0 ] && ! grep -q -- "--class human-stale\|--class stuck" "$tmp/log" \
+  && ok "errors level: a block that clears before the threshold escalates nothing" \
+  || no "cleared before escalation" "$line $(cat "$tmp/log")"
+rm -f "$tmp/bridge/pending.jsonl" "$tmp/log.probes"
+
+# At level all the backstop already posted; no second, escalation message.
+line=$(run_edge blocked working HERDR_HUMAN_ALERT_S=1 HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen")
+! grep -q -- "--class human-stale\|--class stuck" "$tmp/log" \
+  && ok "level all: the backstop posts as before and arms no escalation" \
+  || no "all-level escalation" "$line $(cat "$tmp/log")"
 rm -f "$tmp/bridge/pending.jsonl"
 
 line=$(run_edge blocked working)

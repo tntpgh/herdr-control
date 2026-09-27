@@ -319,7 +319,7 @@ _pw_wake_fail_realert() {
       [ -n "$notify" ] && [ -f "$notify" ] && break
     done
     [ -n "${notify:-}" ] && [ -f "$notify" ] || exit 0
-    bash "$notify" --choices --pane "$pane" \
+    bash "$notify" --class wake-fail --choices --pane "$pane" \
       "conductor wake ${outcome} and still unanswered after ${secs}s — the peer-notify path is broken, this needs you directly" \
       >/dev/null 2>&1 || true
     if [ -n "$run" ] && [ -n "$task" ]; then

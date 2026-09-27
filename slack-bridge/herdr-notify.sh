@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# herdr-notify.sh [--pane <id>] [--cwd <path>] [--dry-run] <text...>
+# herdr-notify.sh [--class <class>] [--pane <id>] [--cwd <path>] [--dry-run] [--choices] <text...>
 #
 # Post an alert to your herdrbot DM AS the bot (the outbound half of the 2-way
 # conversation — replaces the one-way OMC/OMX webhook). Tags the pane it's about
@@ -20,6 +20,14 @@
 # caller re-fires for the same still-unanswered prompt (see lib/alert-gate.sh
 # alert_claim). HERDR_SLACK_VERBOSE=1 disables both and restores the old
 # always-post behaviour.
+#
+# Errors only (2026-09-26): every caller passes `--class`, and at the default
+# HERDR_SLACK_LEVEL=errors only ERROR classes (human-stale, stuck, wake-fail,
+# control-plane, deploy, crash — the situations the automation cannot fix
+# itself) are posted. needs-input / held / info and an unclassified call are
+# suppressed and logged one line each to $HERDR_STATE_DIR/slack-suppressed.jsonl.
+# HERDR_SLACK_LEVEL=all restores every post, =off posts nothing. The class list,
+# the level resolution and the data behind it live in lib/slack-level.sh.
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
 
@@ -35,21 +43,17 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:$
 # tells an operator to dry-run this as a verification step; that step should not
 # cost a biometric prompt, and a test suite must never need a human finger.
 #
-# Pre-scanned rather than folded into the arg loop below, because the loop runs
-# well after this point and the whole aim is to decide BEFORE sourcing anything.
-_dry_prescan=0
-for _a in "$@"; do
-  [ "$_a" = "--dry-run" ] && { _dry_prescan=1; break; }
-done
-
+# So the bridge env is loaded only once a post is actually going to happen:
+# after the arg loop, after the level filter (a suppressed alert needs no
+# token either), and never for --dry-run.
 user=""
-if [ "$_dry_prescan" = 0 ]; then
+_load_bridge_env() {
   ENV_FILE="${HERDR_BRIDGE_ENV:-$HOME/.config/herdr-bridge.env}"
   [ -f "$ENV_FILE" ] && . "$ENV_FILE" || { echo "herdr-notify: no bridge env ($ENV_FILE)" >&2; exit 1; }
   : "${SLACK_BOT_TOKEN:?herdr-notify: SLACK_BOT_TOKEN unset}"
   user="${HERDR_BRIDGE_ALLOW_USERS%%,*}"
   [ -n "$user" ] || { echo "herdr-notify: HERDR_BRIDGE_ALLOW_USERS unset" >&2; exit 1; }
-fi
+}
 
 # ── pane resolution ─────────────────────────────────────────────────────────
 # Order: --pane > $HERDR_PANE_ID > tmux-session match > UNIQUE cwd > untagged.
@@ -116,6 +120,7 @@ pane=""
 cwd_hint=""
 dry=0
 choices=0
+class=""
 while :; do
   case "${1:-}" in
     # ${2:?} not ${2:-}: with a trailing flag and no value, `shift 2` FAILS and
@@ -137,6 +142,11 @@ while :; do
     --dry-run) dry=1; shift ;;
     # Show the agent's actual options and make them answerable.
     --choices) choices=1; shift ;;
+    # What KIND of alert this is — decides whether it reaches Slack at all
+    # (lib/slack-level.sh). Absent means unclassified, which is suppressed at
+    # the default level.
+    --class) [ $# -ge 2 ] || { echo "herdr-notify: --class needs a value" >&2; exit 2; }
+             class="$2"; shift 2 ;;
     *) break ;;
   esac
 done
@@ -151,6 +161,23 @@ done
 
 text="$*"
 [ -n "$text" ] || { echo "herdr-notify: empty text" >&2; exit 2; }
+
+# ---- level filter: Slack gets errors the automation cannot fix itself -----
+# Ahead of the dedupe claim below on purpose: a suppressed needs-input call
+# must not claim (pane, prompt), or the later human-stale/stuck escalation for
+# that SAME still-open prompt would be deduped against a post that never went.
+. "$(cd "$(dirname "$0")/.." && pwd)/lib/slack-level.sh"
+if ! slack_should_send "$class"; then
+  _lvl="$(slack_level)"
+  if [ "$dry" = 1 ]; then
+    echo "dry-run: would SUPPRESS — class=${class:-unclassified} is not sent at HERDR_SLACK_LEVEL=${_lvl}"
+    exit 0
+  fi
+  slack_log_suppressed "$class" "$_lvl" "$pane" "$text"
+  echo "herdr-notify: suppressed class=${class:-unclassified} at level=${_lvl} (logged to $(slack_suppressed_log))" >&2
+  exit 0
+fi
+[ "$dry" = 1 ] || _load_bridge_env
 
 _dry_report() {
   echo "dry-run: pane=${pane:-none}${blocks:+ (with buttons)}"

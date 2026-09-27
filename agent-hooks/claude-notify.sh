@@ -102,12 +102,22 @@ if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
   . "$_hook_dir/../lib/prompt-parse.sh"
   . "$_hook_dir/../lib/run-registry.sh"   # append_event, for alert_grace_expired
   . "$_hook_dir/../lib/alert-gate.sh"
+  # Classified for lib/slack-level.sh (2026-09-26) — same split as
+  # omp-notify.sh: the immediate and held sends are suppressed at the default
+  # level, a human-only prompt still open after HERDR_HUMAN_ALERT_S escalates as
+  # `human-stale`, and a pane with no HERDR_PANE_ID (nothing to re-check here)
+  # is covered by agent-edge.sh's `stuck`/`human-stale` backstop, which watches
+  # every herdr pane whatever hook it has. The escalation timer is armed after
+  # push_wake below, for the reason omp-notify.sh gives.
+  . "$_hook_dir/../lib/slack-level.sh"
+  human_stale=0
   if [ -z "${HERDR_PANE_ID:-}" ] || human_must_answer "${HERDR_PANE_ID}"; then
-    bash "$notify" --choices ${cwd:+--cwd "$cwd"} "$msg" >/dev/null 2>&1 || true
+    bash "$notify" --class needs-input --choices ${cwd:+--cwd "$cwd"} "$msg" >/dev/null 2>&1 || true
+    [ -n "${HERDR_PANE_ID:-}" ] && [ "$(slack_level)" = errors ] && human_stale=1
   else
     grace_realert "${HERDR_PANE_ID}" "$(prompt_id "${HERDR_PANE_ID}" 2>/dev/null || printf '')" \
       "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-      bash "$notify" --choices ${cwd:+--cwd "$cwd"} "$msg"
+      bash "$notify" --class held --choices ${cwd:+--cwd "$cwd"} "$msg"
   fi
 fi
 
@@ -147,6 +157,14 @@ if [ -n "${HERDR_CONDUCTOR_PANE_ID:-}" ]; then
   if [ -z "$_cn_pane" ] || attn_track_claim "$_cn_pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$(prompt_id "$_cn_pane" 2>/dev/null)"; then
     push_wake "$msg" "$where" >/dev/null 2>&1 || true
   fi
+fi
+
+if [ "${human_stale:-0}" = 1 ]; then
+  HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" \
+  grace_realert "${HERDR_PANE_ID}" "$(prompt_id "${HERDR_PANE_ID}" 2>/dev/null || printf '')" \
+    "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+    bash "$notify" --class human-stale --choices ${cwd:+--cwd "$cwd"} \
+    "$msg"$'\n'"only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s"
 fi
 
 # The legacy one-way webhook is GONE. It posted the same text to a bot you could
