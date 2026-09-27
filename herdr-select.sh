@@ -652,12 +652,16 @@ _reopen_blocked_period() {
 # gap someone else can answer this prompt and omp can paint a queued one with
 # Approve highlighted (PR #168 review round 2, High). prompt_id has stepped by
 # now, so compare the content digest captured with it; on the omp path the
-# highlight must still be on the option being pressed.
+# highlight must still be on the option being pressed. The digest is read LAST,
+# so the final read before the key is the content itself, as it was before this
+# re-check existed (round-3 review). A refusal puts the task back to blocked
+# only if a prompt is still on screen: a mismatch usually means someone else
+# answered, and a pane with nothing pending is running, not blocked.
 _require_unchanged_after_close() {
   require_agent_pane "$pane" && require_pane_birth_match "$pane" &&
-    [ "$(prompt_content_digest "$pane")" = "$current_content" ] &&
-    { [ "$mechanism" = numbered ] || [ "$(prompt_menu_selected "$pane")" = "$choice" ]; } && return 0
-  _reopen_blocked_period
+    { [ "$mechanism" = numbered ] || [ "$(prompt_menu_selected "$pane")" = "$choice" ]; } &&
+    [ "$(prompt_content_digest "$pane")" = "$current_content" ] && return 0
+  prompt_any_visible "$pane" >/dev/null 2>&1 && _reopen_blocked_period
   echo "herdr-select: the prompt in $pane changed while its answer was being recorded — refusing." >&2
   return 1
 }
