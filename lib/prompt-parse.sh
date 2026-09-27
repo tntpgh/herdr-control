@@ -988,7 +988,7 @@ prompt_content() {
     if [ -z "$menu_q" ]; then
       menu_q="$(_pane_visible "$1" \
         | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \
-        | sed -n '/Allow tool:/,/enter select/p' \
+        | sed -n '/Allow tool:/,/navigate.*select/p' \
         | sed -E 's/^[[:space:]│|]+//; s/[[:space:]│|]+$//' \
         | grep -vE '^$')"
     fi

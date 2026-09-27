@@ -167,15 +167,18 @@ _omp_footer_is_last() {                # <visible text>
   while [ "$i" -ge 0 ] && [[ ${rows[$i]} =~ $_BOX_ROW ]]; do i=$((i - 1)); done
   [ "$i" -ge 0 ] || return 1
   last=$(_omp_row "${rows[$i]}")
-  case "$last" in *'enter select'*) return 0 ;; esac
+  # omp 18.3.5 renders the key names as preset glyphs (nerd: an arrow pair and
+  # two private-use icons), so only the ACTION words are stable: match those.
+  case "$last" in *'enter select'*|*navigate*select*cancel) return 0 ;; esac
   # A narrow pane wraps the footer (lib/prompt-parse.sh, wN:p9 2026-09-18), so
   # its last row can be just "cancel" / "esc cancel". Accept that only as a
   # suffix of the footer phrase whose DIRECTLY preceding row completes it — a
   # blank or box row in between means a closed panel with output below it.
   [ "$i" -ge 1 ] || return 1
-  case " $_OMP_FOOTER" in *" $last") ;; *) return 1 ;; esac
+  case "$last" in *cancel) ;; *) return 1 ;; esac
+  local w; read -ra w <<<"$last"; [ "${#w[@]}" -le 2 ] || return 1
   prev=$(_omp_row "${rows[$((i - 1))]}")
-  case "$prev $last" in *'enter select'*) return 0 ;; esac
+  case "$prev $last" in *'enter select'*|*navigate*select*cancel) return 0 ;; esac
   return 1
 }
 
