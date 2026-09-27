@@ -679,7 +679,7 @@ i=0; while [ "$i" -lt 150 ] && ! grep -q -- '--class human-stale' "$NOTIFIED"; d
   && ok "the human-stale ERROR alert still posted exactly once after the release" \
   || bad "human-stale posts: $(grep -c -- '--class human-stale' "$NOTIFIED"); notified: $(cat "$NOTIFIED")"
 i=0; while [ "$i" -lt 150 ] && [ "$(hs_ev wake_result)" = 0 ]; do sleep 0.1; i=$((i + 1)); done
-[ "$(hs_ev wake_attempted)" = 1 ] && ok "Main was woken exactly once (the forced wake), the 60s re-wake stood down" \
+[ "$(hs_ev wake_attempted)" = 1 ] && ok "Main was woken exactly once (the forced wake)" \
   || bad "wake_attempted for taskHS: $(hs_ev wake_attempted)"
 clean_screen > "$WORKER_SCREEN"
 set_task_state runHS taskHS completed no-follow-on >/dev/null 2>&1
