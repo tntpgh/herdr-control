@@ -1501,9 +1501,9 @@ echo "== env NAME=val prefix, bash -n syntax check (F6) =="
 # every real environment dump and every real use of a policy/credential
 # file stays reserved.
 check_reserved   "env PATH=… with an interpreter stays reserved" 'env PATH=/usr/bin:/bin HERDR_WT_DIR=/tmp/x bash verify-spawn-spec-proof.sh'
-check_unreserved "env assignments then a command"          'env HERDR_WT_DIR=/tmp/x HERDR_RUN_STATE_DIR=/tmp/y bash verify-spawn-spec-proof.sh'
-check_unreserved "env two assignments then git"            'env FOO=1 BAR=2 git status'
-check_unreserved "env one assignment then a path command"  'env LC_ALL=C ./run.sh'
+check_reserved   "env assignments then a command"          'env HERDR_WT_DIR=/tmp/x HERDR_RUN_STATE_DIR=/tmp/y bash verify-spawn-spec-proof.sh'
+check_reserved   "env two assignments then git"            'env FOO=1 BAR=2 git status'
+check_reserved   "env one assignment then a path command"  'env LC_ALL=C ./run.sh'
 check_reserved   "bare env"                                'env'
 check_reserved   "env -0"                                  'env -0'
 check_reserved   "env piped"                               'env | grep X'
@@ -1541,7 +1541,7 @@ check_reserved   "env GIT_EXTERNAL_DIFF"                   'env GIT_EXTERNAL_DIF
 check_reserved   "env NODE_OPTIONS"                        'env NODE_OPTIONS=--require=/tmp/x.js node a.js'
 check_reserved   "env with a safe name mixed with PATH"    'env FOO=1 PATH=/tmp/evil bash tmp/x.sh'
 check_reserved   "env value carrying an operator"          'env FOO="1;env" git status'
-check_unreserved "env FOO=1 bash script (safe name)"       'env FOO=1 bash tmp/x.sh'
+check_reserved   "env FOO=1 bash script (safe name)"       'env FOO=1 bash tmp/x.sh'
 check_unreserved "verify-alert-gate.sh is not alert-gate.sh"  'wc -l verify-select-policy.sh verify-alert-gate.sh verify-omp-hooks.sh'
 check_unreserved "my-herdr-select.sh.bak is not the file"  'ls my-herdr-select.sh.bak'
 check_unreserved "wc on policy files"                      'wc -l lib/alert-gate.sh herdr-select.sh'
@@ -1588,13 +1588,23 @@ check_reserved   "fake command word before PATH"           'env FOO="a b" PATH=/
 check_reserved   "non-identifier word before PATH"         'env A=1 X.Y=1 PATH=/tmp/e git status'
 check_reserved   "fake command word before LD_PRELOAD"     'env FOO="a b" LD_PRELOAD=/tmp/x.so ls'
 check_reserved   "fake command word before BASH_ENV"       'env FOO="a b" BASH_ENV=x bash y'
-check_unreserved "cd then env prefix then git"             'cd /wt && env FOO=1 git status'
+check_reserved   "cd then env prefix then git"             'cd /wt && env FOO=1 git status'
 check_reserved   "a worker program named cat"              '/tmp/wt/cat lib/command-policy.sh'
 check_reserved   "a worker program named ls"               './ls herdr-select.sh'
 check_reserved   "a worker program named bash with -n"     './bash -n herdr-select.sh'
 check_reserved   "a dot-dot path to bash with -n"          'tmp/../bash -n herdr-select.sh'
 check_unreserved "absolute system bash -n"                 '/bin/bash -n herdr-select.sh'
 check_reserved   "rg --hostname-bin runs a program"        'rg --hostname-bin=/tmp/evil --hyperlink-format=default foo herdr-select.sh'
+# #171 review rounds 1-2: the env-prefix loosening was PARKED (two
+# Critical-class misses); env behaves exactly as on main. These cases stay as
+# regression evidence that every probed form is still a reservation.
+check_reserved   "env prefix then sh -c 'env;:'"           "env A=1 sh -c 'env;:'"
+check_reserved   "env prefix then sh -c 'env&'"            "env A=1 sh -c 'env&'"
+check_reserved   "env prefix then bash -c 'const;env'"     "env A=1 bash -c 'const;env'"
+check_reserved   "env prefix then sh -c 'env|cat'"         "env A=1 sh -c 'env|cat'"
+check_reserved   "env prefix then sh -c 'x=(env)'"         "env A=1 sh -c 'x=(env)'"
+check_reserved   "cd, env prefix, sh -c 'env;:'"           "cd /wt && env A=1 sh -c 'env;:'"
+check_reserved   "env prefix then git log --format"        "env A=1 git log --format='%h;%s'"
 
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
