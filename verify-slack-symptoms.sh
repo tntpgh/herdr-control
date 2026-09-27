@@ -93,6 +93,30 @@ export -f curl
 
 n_posts() { wc -l < "$POSTED" 2>/dev/null | tr -d ' '; }
 
+# Every detached alert timer (grace_realert, _pw_wake_fail_realert) logs
+# "armed <kind> <prompt_id>" / "done <kind> <prompt_id> <outcome>" here
+# (HERDR_ALERT_TRACE, a test seam in lib/alert-gate.sh). A case waits for the
+# timers it cares about to finish by reading the file, not by sleeping: under
+# load a 1s timer from case 3 used to post into case 4's window and fail it
+# (2 of 15 loaded runs on main, 2026-09-27). With no arguments it waits for
+# every grace timer armed so far; `timers_done wakefail <prompt_id>` waits for
+# that prompt's wake-fail timers only (the default 600s wake-fail timers other
+# cases arm never fire within this suite, and are not waited for). Capped at
+# ~30s only so a timer that never ends fails loudly instead of hanging.
+export HERDR_ALERT_TRACE="$WORK/alert-trace.log"; : > "$HERDR_ALERT_TRACE"
+timers_done() {                         # [wakefail <prompt_id>]
+  local i=0 armed done_n pat
+  if [ "$#" -ge 2 ]; then pat=" $1 $2"; else pat=' (grace_realert|human_stale) '; fi
+  while [ "$i" -lt 300 ]; do
+    armed=$(grep -cE "^armed${pat}" "$HERDR_ALERT_TRACE" 2>/dev/null)
+    done_n=$(grep -cE "^done${pat}" "$HERDR_ALERT_TRACE" 2>/dev/null)
+    [ "${armed:-0}" = "${done_n:-0}" ] && return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  bad "alert timers still running after 30s ($pat): $(tr '\n' ';' < "$HERDR_ALERT_TRACE")"
+  return 1
+}
+
 . "$here/lib/run-registry.sh"
 . "$here/lib/prompt-parse.sh"
 . "$here/lib/push-wake.sh"
@@ -113,6 +137,7 @@ register_task run_allow task_allow w1 cond1 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH
 run_hook run_allow task_allow HERDR_ALERT_GRACE_S=1
 [ "$(n_posts)" = 0 ] && ok "allow-class prompt: 0 posts (held)" || bad "posted for an allow-class prompt: $(cat "$POSTED")"
 
+timers_done
 printf '== 2) escalate-class prompt, 3 hook firings while unanswered -> exactly 1 post ==\n'
 omp_menu_screen "rm -rf /tmp/scratch" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
@@ -124,6 +149,7 @@ run_hook run_esc task_esc
 [ "$(n_posts)" = 1 ] && ok "exactly 1 post despite 3 hook firings ($(n_posts))" \
   || bad "expected 1 post, got $(n_posts): $(cat "$POSTED")"
 
+timers_done
 printf '== 3) allow-class prompt answered before grace elapses -> 0 posts ==\n'
 omp_menu_screen "git status --short" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
@@ -131,9 +157,10 @@ clean_screen > "$COND_SCREEN"
 register_task run_cleared task_cleared w1 cond1 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt "impl:cleared" >/dev/null 2>&1
 run_hook run_cleared task_cleared HERDR_ALERT_GRACE_S=1
 clean_screen > "$WORKER_SCREEN"          # answered in the terminal before the window elapses
-sleep 2
+timers_done
 [ "$(n_posts)" = 0 ] && ok "answered before grace: 0 posts" || bad "posted despite being answered: $(cat "$POSTED")"
 
+timers_done
 printf '== 4) conductor wake fails repeatedly, unanswered after the wait window -> exactly 1 post ==\n'
 omp_menu_screen "wrangler deploy" > "$WORKER_SCREEN"
 : > "$POSTED"
@@ -142,7 +169,7 @@ set_task_state run_wf task_wf blocked >/dev/null 2>&1
 want_pid="$(prompt_id "$WPANE")"
 HERDR_WAKE_FAIL_ALERT_S=1 _pw_wake_fail_realert "$WPANE" "$want_pid" run_wf task_wf refused
 HERDR_WAKE_FAIL_ALERT_S=1 _pw_wake_fail_realert "$WPANE" "$want_pid" run_wf task_wf unsubmitted   # a second failed attempt, same prompt
-sleep 2
+timers_done wakefail "$want_pid"
 [ "$(n_posts)" = 1 ] && ok "exactly 1 post after the wait window despite 2 failed wake attempts" \
   || bad "expected 1 post, got $(n_posts): $(cat "$POSTED")"
 grep -qi 'unanswered after' "$POSTED" && ok "post names the wake-failure symptom" || bad "wake-failure wording missing: $(cat "$POSTED")"
@@ -156,7 +183,7 @@ set_task_state run_wf2 task_wf2 blocked >/dev/null 2>&1
 pid2="$(prompt_id "$WPANE")"
 HERDR_WAKE_FAIL_ALERT_S=2 _pw_wake_fail_realert "$WPANE" "$pid2" run_wf2 task_wf2 refused
 set_task_state run_wf2 task_wf2 running >/dev/null 2>&1     # answered elsewhere before the window elapses
-sleep 3
+timers_done wakefail "$pid2"
 [ "$(n_posts)" = 0 ] && ok "resolved before the wait window: 0 posts" || bad "posted for an already-resolved wake failure: $(cat "$POSTED")"
 
 printf '== nothing visible (no menu, no numbered options, no context) -> DROP, no post ==\n'

@@ -13,22 +13,19 @@
 #   printf '%s\n' <pane_id>... | bash attention-tick.sh tick
 #   bash attention-tick.sh probe <pane_id>          # one pane's classification
 #
-# ---- why this does not touch lib/push-wake.sh ------------------------------
-# The obvious fix for "3 hook firings for one prompt woke the conductor 3
-# times" is a dedupe INSIDE push_wake. That is the wrong file: push_wake's own
-# per-attempt recording is deliberately NOT deduped by outcome —
-# verify-omp-hooks.sh pins "repeated wake attempts: every outcome recorded,
-# first result not frozen" (a wake that lands then a retry that finds the
-# conductor busy must both be visible, not swallowed) — and that is a hook
-# calling push_wake for itself, independent of this controller. Gating it
-# there would silently break that pinned regression for every hook, forever.
-#
-# So the dedupe lives HERE, entirely in this controller's own bookkeeping:
-# `_attn_track_and_wake` claims a stable per-(pane, live birth, prompt) key
-# exactly once and is the only place that decides whether THIS controller
-# calls push_wake at all. push_wake is called unmodified, at most once per
-# key, and left to make its own human_must_answer / grace_realert decisions
-# exactly as it always has for every other caller.
+# ---- who owns the conductor wake ---------------------------------------------
+# push_wake itself (lib/push-wake.sh) takes ONE atomic claim per prompt
+# occurrence (`<wake_key>_owner`, claim_once = INSERT OR IGNORE) before it
+# holds or delivers anything, so whichever caller gets there first (a hook
+# firing, or this controller) owns the wake and every later caller returns
+# without holding or delivering. This used to be a read-then-act here
+# (`_attn_wake_owned`, a query for wake_held/wake_attempted rows) and a
+# per-caller key in the hooks. Live 2026-09-26 (events 37680/37682), both
+# callers passed their own check before either had written a row, and the
+# conductor got two wakes for one prompt. Retries that are deliberate still
+# bypass the claim: the grace re-delivery and a released hold
+# (HERDR_ALERT_FORCE=1), and HERDR_WAKE_LEGACY=1, which keeps
+# verify-omp-hooks.sh's pinned "every outcome recorded" behaviour.
 #
 # ---- the ladder -------------------------------------------------------------
 # Dedupe key = pane id + its REGISTERED pane_birth (task_for_pane's own
@@ -36,24 +33,17 @@
 # the key, PR #132 review item 2) + a whitespace-normalised hash of
 # prompt_command_text (not prompt_id: prompt_id hashes the whole
 # question+options block and moves on a mere repaint or terminal resize,
-# which is not a new prompt) + the pane's latest prompt-appearance EDGE
-# sequence (lib/attention-key.sh's `attention_edge_sequence` — the hooks mark
-# one edge per genuine new prompt; this controller's own tick never marks
-# one, only reads it, so the key stays put across every tick of one
-# continuous prompt and steps forward only when the SAME command is
-# genuinely re-asked). lib/attention-key.sh is the one place this is
-# computed, shared with the hooks (item 6) so the two cannot drift apart.
-# prompt_id is still carried in every payload, for forensics only.
+# which is not a new prompt) + the pane's blocked period (prompt_period,
+# lib/prompt-parse.sh: the latest time a task on the pane LEFT `blocked`, so
+# the key stays put across every tick of one continuous prompt and steps
+# forward only once it was answered). lib/attention-key.sh is the one place
+# this is computed, shared with the hooks (item 6) so the two cannot drift
+# apart. prompt_id is still carried in every payload, for forensics only.
 #
 #   1. First sighting of a key claims "attn_track_<key>" — that claim's own
 #      timestamp is "since", and the one chance this controller gets to call
-#      push_wake for it. Skipped entirely if push_wake already OWNS this
-#      exact prompt (a `wake_held`, `wake_attempted`, or `wake_result` row
-#      already exists for its wake_key) — a hook firing independently, or an
-#      earlier pass of this controller, already has a grace_realert timer
-#      running or a delivery in flight; a second push_wake call here would
-#      spawn a SECOND timer that force-delivers a second wake when it expires
-#      (PR #132 review, P1 — the double-wake this exists to prevent).
+#      push_wake for it. push_wake's own owner claim decides whether that
+#      call holds or delivers anything (see above).
 #   2. A deny-verdict or conductor-reserved prompt skips the escalation rung
 #      (only a human can approve it) but still gets the owner's window: its
 #      conductor may deny/redirect, and usually does in seconds. Form only if
@@ -133,29 +123,6 @@ attention_probe() {
     '{visible:true, prompt_id:$pid, reserved:$r, verdict:$v, command_text:$cmd}'
 }
 
-# Has push_wake ALREADY owned this exact prompt — held it, attempted a
-# delivery, or delivered one — from ANY caller (a hook firing independently,
-# or an earlier pass of this controller)? Read-only; never writes, so it
-# never competes with push_wake's own idempotent recording.
-#
-# Checking only "submitted" (the original cut) missed the HELD case: an
-# allow-class prompt push_wake declines to deliver immediately spawns its own
-# grace_realert timer (lib/alert-gate.sh) regardless of who called it. A
-# second, redundant push_wake call for the same still-held prompt spawns a
-# SECOND timer, and when both expire the SAME still-open prompt gets FORCE
-# force-delivered twice — the double-wake PR #132 review found (P1). A
-# `wake_held` row already existing means a timer is already running; a
-# `wake_attempted` row already existing means a delivery is already in
-# flight or done. Either way, nothing here may call push_wake again.
-_attn_wake_owned() {                    # run_id task_id prompt_id -> 0 if owned
-  local run_id="$1" task_id="$2" pid="$3" base n
-  base="wake_${run_id:-norun}_${task_id:-notask}_${pid:-noprompt}"
-  n="$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq "$task_id")
-    AND type IN ('wake_held','wake_attempted','wake_result')
-    AND json_extract(payload,'\$.wake_key')=$(_sq "$base");" 2>/dev/null)"
-  [ "${n:-0}" -gt 0 ]
-}
-
 # The one-shot per-key gate: claims "since" for this prompt and, only on the
 # claiming call, gives push_wake its one chance to deliver. Every later call
 # for the same key (this tick or any future one) just re-reads the same
@@ -181,7 +148,7 @@ _attn_track_and_wake() {                # run_id task_id pane conductor_pane_id 
   local eid="attn_track_${key}" claimed=1
   local payload; payload="$(jq -nc --arg p "$pane" --arg k "$key" --arg pid "$pid" '{pane:$p, key:$k, prompt_id:$pid}')"
   claim_once "$eid" "$run_id" "$task_id" "attention_tracking" "$payload" || claimed=0
-  if [ "${HERDR_WAKE_LEGACY:-0}" != "1" ] && [ "$claimed" = "1" ] && ! _attn_wake_owned "$run_id" "$task_id" "$pid"; then
+  if [ "${HERDR_WAKE_LEGACY:-0}" != "1" ] && [ "$claimed" = "1" ]; then
     HERDR_RUN_ID="$run_id" HERDR_TASK_ID="$task_id" HERDR_PANE_ID="$pane" \
       HERDR_CONDUCTOR_PANE_ID="$conductor_pane_id" HERDR_TASK_LABEL="${label:-$task_id}" \
       push_wake "${label:-$task_id} needs input" "attention-controller" >/dev/null 2>&1 || true

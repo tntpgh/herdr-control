@@ -275,9 +275,10 @@ CURRENT state every `HERDR_ATTENTION_INTERVAL_S` (default 15s) instead:
 1. Feeds `attention-tick.sh` the pane ids `live_attention()` currently
    reports blocked (herdr_live.py's LiveState, not a re-scrape).
 2. Per pane, one fresh screen read decides prompt identity and command
-   classification. Dedupe key = pane id + its LIVE birth + the prompt's
-   fingerprint (prompt_id alone collides across panes — two panes showing the
-   identical command hash the same and must not share a clock).
+   classification. Dedupe key = pane id + its registered birth + the
+   whitespace-normalised command + the pane's blocked period (the same
+   `prompt_period` that salts `prompt_id`), shared with the hooks through
+   `lib/attention-key.sh`.
 3. First sighting of a key claims it (`claim_once`, `lib/run-registry.sh`) —
    the claim's own timestamp is "since", and the one chance this controller
    gets to call `push_wake` for it. Every later pass just re-reads that
@@ -293,12 +294,18 @@ CURRENT state every `HERDR_ATTENTION_INTERVAL_S` (default 15s) instead:
    Every decision is a registry event (`attention_tracking`,
    `attention_escalated`, `attention_form_served`), each claimed once per key.
 
-`push_wake` itself is untouched — `verify-omp-hooks.sh` pins "repeated wake
-attempts: every outcome recorded, first result not frozen" (a wake that lands
-then a retry that finds the conductor busy must both be visible), which is a
-hook's own retry, independent of this controller. `HERDR_WAKE_LEGACY=1` is
-the rollback: the controller calls `push_wake` on every pass again, exactly
-the pre-controller shape.
+`push_wake` owns the wake decision itself: one atomic claim per prompt
+occurrence (`<wake_key>_owner`) before it holds or delivers, so a hook firing
+and this controller racing on the same prompt produce exactly one wake (live
+2026-09-26, events 37680/37682, both delivered). The occurrence is the
+`prompt_id`, which carries the pane, its birth and its blocked period
+(`prompt_period` in `lib/prompt-parse.sh`: the latest time a task on the pane
+left `blocked`), so the same command re-asked after an answer is a new prompt
+and wakes again. The grace re-delivery and a released hold
+(`HERDR_ALERT_FORCE=1`) bypass the claim; `HERDR_WAKE_LEGACY=1` is the
+rollback, where every hook firing delivers and records again
+(`verify-omp-hooks.sh` pins "repeated wake attempts: every outcome recorded,
+first result not frozen").
 
 ```bash
 ./verify-attention-tick.sh    # 20 checks: dedupe, the wake/escalate/form

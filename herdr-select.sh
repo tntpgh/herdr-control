@@ -221,7 +221,14 @@ esac
 # Right before we act — the closest this synchronous script can get to
 # "immediately before injection" — confirm the prompt is still the one a
 # decision was made about, if the caller told us which one that was...
-current_prompt_id=$(prompt_id "$pane")
+# One screen read for both: the id, and the same screen without the occurrence
+# salt for the re-check after _close_blocked_period below (which steps
+# prompt_id on purpose).
+current_prompt_id="" current_content=""
+if _current_screen="$(prompt_content "$pane")"; then
+  current_prompt_id=$(prompt_id_of "$pane" "$_current_screen")
+  current_content=$(prompt_digest_of "$_current_screen")
+fi
 if [ -n "$expect_id" ] && [ "$current_prompt_id" != "$expect_id" ]; then
   echo "herdr-select: the prompt in $pane no longer matches the one the decision was made about." >&2
   echo "herdr-select: expected prompt_id $expect_id, currently $current_prompt_id — refusing to answer a different prompt." >&2
@@ -581,6 +588,83 @@ approval_attempted "$approval_id" >/dev/null 2>&1 || {
   echo "herdr-select: cannot persist approval attempt — refusing." >&2; exit 2;
 }
 
+# The answer unblocks the worker, so the task is running again — say so.
+# lib/push-wake.sh writes `blocked` when a prompt paints, and until now NOTHING
+# wrote the other half: not this script, not lib/reconcile.sh (which only
+# transitions tasks whose PANE is gone). So an answered, working task reported
+# `blocked` forever, and hub's "N task(s) need attention" counted live workers
+# as stalled — six pages for three tasks that were all fine (2026-09-12).
+# Scoped to the task registered for THIS pane, taken from the registry rather
+# than the caller's environment: a conductor or the Slack bridge answering a
+# worker's prompt is not running inside that worker's HERDR_TASK_ID.
+# Best-effort and last: a bookkeeping write must never fail an answer that has
+# already landed, and set_task_state refuses a terminal->running transition on
+# its own, so a completed or lost task is not resurrected here.
+# Two narrowings from the PR #59 review. F4: re-bind to the pane_birth already
+# validated before the keypress — task_for_pane takes the most recently updated
+# row for a pane id, so if two rows ever share one and a concurrent writer
+# reorders them between the guard and here, the write would land on the other
+# task. Blast radius is one bookkeeping field, but the fix is a comparison.
+# F6: a DECLINE that opens a composer (Claude's "No, and tell me what to do
+# differently") leaves the worker waiting on typed human input — recording that
+# as `running` is the same lie in the other direction, so only an answered
+# menu, or a decline that needs no typing, clears the state.
+# `declining` only marks the menu's own Deny (line 174), so it does not cover
+# Claude's third option — "No, and tell Claude what to do differently" — which
+# opens the composer and leaves the worker waiting on typed human input with no
+# further Notification hook to re-mark it. Recognise that shape by its label and
+# leave the task blocked: reporting it running is the same lie as the one this
+# block fixes, pointed the other way.
+#
+# Written BEFORE the final keystroke, not after (PR #168 review, 2026-09-27):
+# this transition is also what closes the prompt's blocked period
+# (lib/prompt-parse.sh prompt_period), and omp paints a QUEUED second tool
+# call's panel the instant the first is answered. Closing after the press left
+# a window where that next panel was read under the old period and re-keyed
+# under the new one, so one prompt carried two ids and got two wakes.
+_close_blocked_period() {               # -> 0 if this call moved the task blocked->running
+  local t run task state birth
+  case "$label" in
+    *"tell "*"what to do"*|*"and tell"*|*"provide instructions"*) return 1 ;;
+  esac
+  t="$(task_for_pane "$pane" 2>/dev/null || printf '')"
+  [ -n "$t" ] || return 1
+  run=$(printf '%s' "$t" | jq -r '.run_id // empty')
+  task=$(printf '%s' "$t" | jq -r '.task_id // empty')
+  state=$(printf '%s' "$t" | jq -r '.state // empty')
+  birth=$(printf '%s' "$t" | jq -r '.pane_birth // empty')
+  [ "$state" = blocked ] && [ -n "$run" ] && [ -n "$task" ] &&
+    [ -n "$birth" ] && [ "$birth" = "$(pane_birth_now "$pane" 2>/dev/null)" ] || return 1
+  set_task_state "$run" "$task" "running" >/dev/null 2>&1 || return 1
+  _closed_run="$run" _closed_task="$task"
+  return 0
+}
+# A keystroke that did not land leaves the prompt open: put the state back.
+# running->blocked is not a close (lib/prompt-parse.sh prompt_period counts
+# only transitions OUT of blocked), so the prompt keeps the id it now has.
+_reopen_blocked_period() {
+  [ -n "${_closed_task:-}" ] && set_task_state "$_closed_run" "$_closed_task" "blocked" >/dev/null 2>&1
+  return 0
+}
+
+# The last screen read before the keystroke has to come AFTER the registry
+# write above: set_task_state can wait seconds on the registry lock, and in that
+# gap someone else can answer this prompt and omp can paint a queued one with
+# Approve highlighted (PR #168 review round 2, High). prompt_id has stepped by
+# now, so compare the content digest captured with it; on the omp path the
+# highlight must still be on the option being pressed. The digest is read LAST,
+# so the final read before the key is the content itself, as it was before this
+# re-check existed (round-3 review). A refusal puts the task back to blocked
+# only if a prompt is still on screen: a mismatch usually means someone else
+# answered, and a pane with nothing pending is running, not blocked.
+_require_unchanged_after_close() {
+  require_agent_pane "$pane" && require_pane_birth_match "$pane" &&
+    { [ "$mechanism" = numbered ] || [ "$(prompt_menu_selected "$pane")" = "$choice" ]; } &&
+    [ "$(prompt_content_digest "$pane")" = "$current_content" ] && return 0
+  prompt_any_visible "$pane" >/dev/null 2>&1 && _reopen_blocked_period
+  echo "herdr-select: the prompt in $pane changed while its answer was being recorded — refusing." >&2
+  return 1
+}
 _require_current_decision() {
   require_agent_pane "$pane" && require_pane_birth_match "$pane" || return 1
   [ "$(prompt_id "$pane")" = "$current_prompt_id" ] || {
@@ -594,7 +678,10 @@ if [ "$mechanism" = numbered ]; then
   # Claude's and Codex's selection prompts take the bare digit — no Enter,
   # which is the point: Enter is the keystroke that accepts a DEFAULT, and a
   # default is precisely what we are refusing to send on someone's behalf.
+  _close_blocked_period || true
+  _require_unchanged_after_close || exit 6
   herdr pane send-keys "$pane" "$choice" >/dev/null 2>&1 || {
+    _reopen_blocked_period
     echo "herdr-select: failed to send key '$choice' to $pane" >&2
     exit 2
   }
@@ -632,7 +719,10 @@ else
     }
   done
   _require_current_decision || exit 6
+  _close_blocked_period || true
+  _require_unchanged_after_close || exit 6
   herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || {
+    _reopen_blocked_period
     echo "herdr-select: failed to send Enter to $pane" >&2
     exit 2
   }
@@ -647,48 +737,76 @@ fi
 approval_confirmed "$approval_id" "pressed" \
   "mechanism=$mechanism choice=$choice" >/dev/null 2>&1 || true
 
-# The answer unblocks the worker, so the task is running again — say so.
-# lib/push-wake.sh writes `blocked` when a prompt paints, and until now NOTHING
-# wrote the other half: not this script, not lib/reconcile.sh (which only
-# transitions tasks whose PANE is gone). So an answered, working task reported
-# `blocked` forever, and hub's "N task(s) need attention" counted live workers
-# as stalled — six pages for three tasks that were all fine (2026-09-12).
-# Scoped to the task registered for THIS pane, taken from the registry rather
-# than the caller's environment: a conductor or the Slack bridge answering a
-# worker's prompt is not running inside that worker's HERDR_TASK_ID.
-# Best-effort and last: a bookkeeping write must never fail an answer that has
-# already landed, and set_task_state refuses a terminal->running transition on
-# its own, so a completed or lost task is not resurrected here.
-# Two narrowings from the PR #59 review. F4: re-bind to the pane_birth already
-# validated before the keypress — task_for_pane takes the most recently updated
-# row for a pane id, so if two rows ever share one and a concurrent writer
-# reorders them between the guard and here, the write would land on the other
-# task. Blast radius is one bookkeeping field, but the fix is a comparison.
-# F6: a DECLINE that opens a composer (Claude's "No, and tell me what to do
-# differently") leaves the worker waiting on typed human input — recording that
-# as `running` is the same lie in the other direction, so only an answered
-# menu, or a decline that needs no typing, clears the state.
-# `declining` only marks the menu's own Deny (line 174), so it does not cover
-# Claude's third option — "No, and tell Claude what to do differently" — which
-# opens the composer and leaves the worker waiting on typed human input with no
-# further Notification hook to re-mark it. Recognise that shape by its label and
-# leave the task blocked: reporting it running is the same lie as the one this
-# block fixes, pointed the other way.
-case "$label" in
-  *"tell "*"what to do"*|*"and tell"*|*"provide instructions"*) _opens_composer=1 ;;
-  *) _opens_composer=0 ;;
-esac
-_answered_task="$(task_for_pane "$pane" 2>/dev/null || printf '')"
-if [ -n "$_answered_task" ] && [ "$_opens_composer" = 0 ]; then
-  _at_run=$(printf '%s' "$_answered_task" | jq -r '.run_id // empty')
-  _at_task=$(printf '%s' "$_answered_task" | jq -r '.task_id // empty')
-  _at_state=$(printf '%s' "$_answered_task" | jq -r '.state // empty')
-  _at_birth=$(printf '%s' "$_answered_task" | jq -r '.pane_birth // empty')
-  if [ "$_at_state" = blocked ] && [ -n "$_at_run" ] && [ -n "$_at_task" ] &&
-     [ -n "$_at_birth" ] && [ "$_at_birth" = "$(pane_birth_now "$pane" 2>/dev/null)" ]; then
-    set_task_state "$_at_run" "$_at_task" "running" >/dev/null 2>&1 || true
+# ---- F7c: a Deny pressed by automation tells the worker WHY ----------------
+# A bare Deny reaches omp as nothing but "denied", so the worker cannot tell
+# "this command is off-limits" from "try that again". Observed: a worker
+# re-issued a denied reserved command (`bash -n lib/command-policy.sh ...`)
+# three times — Denied 17:08:05, 17:08:30, 17:09:10 — before a hand-typed
+# redirect landed. So when a peer or the conductor declines, the reason it
+# already had to state (--review-reason, else the policy verdict's own reason)
+# follows the keypress as ONE line.
+#
+# Human Denies are left alone: a person at the pane can type their own
+# explanation, and an Approve has nothing to explain. No reason, no line —
+# never a placeholder.
+#
+# Ordering is the whole point: the line goes in only AFTER the approval menu
+# has left the pane. send-to-agent.sh refuses into a live menu anyway, but
+# waiting here means that refusal is never the expected path. Bounded (~5s at
+# 0.25s steps) and detached with release_wake_hold's discipline
+# (lib/push-wake.sh), so this script still returns the moment the key has
+# landed; a menu that never clears sends nothing. The pane is re-checked as
+# the same agent before sending — it was only proven so before the keypress,
+# and typed text into a recycled pane running a bare shell EXECUTES.
+#
+# HERDR_DENY_CLEAR_WAIT_S is a TEST SEAM only (verify-select-policy.sh), whole
+# seconds, default 5: it lets the never-clears case run out in ~1s.
+#
+# The outcome is recorded on the answered task as `deny_reason_delivered`
+# (delivered | send_failed | menu_never_cleared) — only when this pane has a
+# registered task to hang it on; the line itself does not need one.
+# A Slack reply or button is a PERSON answering, even though it runs at peer
+# authority (_default_authority): their Deny is theirs to explain, so no line
+# (PR #168 review).
+case "${HERDR_SELECT_VIA:-cli}" in slack-*) _deny_from_person=1 ;; *) _deny_from_person=0 ;; esac
+if [ "$declining" = 1 ] && [ "$_deny_from_person" = 0 ] && { [ "$authority" = conductor ] || [ "$authority" = peer ]; }; then
+  _deny_reason="$review_reason"
+  [ -n "${_deny_reason//[[:space:]]/}" ] || _deny_reason="$policy_reason"
+  # One line, bounded: CR/LF and runs of whitespace collapse to one space.
+  _deny_reason="$(printf '%s' "$_deny_reason" | tr -s '[:space:]' ' ')"
+  _deny_reason="${_deny_reason# }"; _deny_reason="${_deny_reason% }"
+  _deny_reason="${_deny_reason:0:300}"
+  if [ -n "$_deny_reason" ]; then
+    _deny_wait_s="${HERDR_DENY_CLEAR_WAIT_S:-5}"
+    case "$_deny_wait_s" in ''|*[!0-9]*) _deny_wait_s=5 ;; esac
+    (
+      _outcome=menu_never_cleared _rc=null _i=0
+      while :; do
+        if [ -z "$(_current_offer)" ] && ! prompt_menu_visible "$pane"; then
+          if ! require_agent_pane "$pane"; then _rc=3
+          elif ! require_pane_birth_match "$pane"; then _rc=7
+          else
+            bash "$here/send-to-agent.sh" "$pane" \
+              "[HERDR-DENIED] $_deny_reason — do not retry the same command; change approach."
+            _rc=$?
+          fi
+          if [ "$_rc" = 0 ]; then _outcome=delivered; else _outcome=send_failed; fi
+          break
+        fi
+        [ "$_i" -ge $((_deny_wait_s * 4)) ] && break
+        _i=$((_i + 1))
+        sleep 0.25
+      done
+      if [ -n "$own_run" ] && [ -n "$own_task" ]; then
+        append_event "$own_run" "$own_task" deny_reason_delivered \
+          "$(jq -nc --arg p "$pane" --arg pid "$current_prompt_id" --arg o "$_outcome" --argjson rc "$_rc" \
+             '{pane:$p, prompt_id:$pid, outcome:$o, exit_code:$rc}')"
+      fi
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
   fi
 fi
+
 
 # Stop tracking the alert as pending ONLY when the answer came from Slack. That
 # is the case the untrack exists for: the message carrying your choice also

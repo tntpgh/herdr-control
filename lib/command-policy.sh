@@ -387,10 +387,17 @@ _cp_grant_action() {                    # raw wt branch trunk
 # message cluster only when every flag before its final `m` is one of git's
 # no-argument commit flags; `-tm` is kept whole, because its following word
 # is a real template/path argument (security review NEW-2).
+#
+# F6: for `git add`, a literal pathspec naming a governance file is dropped
+# too. The #3b grant already allows `git add -A` (which stages the same file)
+# and the commit on the task's own branch; the policy-file reservation exists
+# to stop EDITS to the gate, which happen through the edit tool, and pushes to
+# main stay human-only. Only plain paths go: an option, a glob, `$`, or a
+# credential path (`.env`, `~/.ssh/…`) is kept and still judged.
 _cp_strip_commit_message() {            # raw wt
   _cp_simple_words "$1" "$2" || return 1
   local -a w=("${_CP_W[@]}") out=()
-  local i=0 n="${#_CP_W[@]}" token prefix
+  local i=0 n="${#_CP_W[@]}" token prefix plain
   while [ "$i" -lt "$n" ]; do
     token="${w[$i]}"
     case "$token" in
@@ -399,7 +406,19 @@ _cp_strip_commit_message() {            # raw wt
       -m?*) ;;
       -[aqsvez]m)
         i=$((i + 1)) ;;
-      *) out+=("$token") ;;
+      *)
+        if [ "${w[1]:-}" = add ] && [ "$i" -ge 2 ]; then
+          plain="$(printf '%s' "$token" | tr '\001-\016' ' ')"
+          case "$plain" in
+            -*|*[\*\?\[\{\$\ \~]*|.[A-Za-z]*/*|*/.[A-Za-z]*/*) ;;
+            *)
+              case "${plain##*/}" in
+                herdr-select.sh|scoped-policy.sh|task-manifest.sh|run-registry.sh|alert-gate.sh|prompt-parse.sh|command-policy.sh|approval-policy.md|gate-registry.yaml)
+                  i=$((i + 1)); continue ;;
+              esac ;;
+          esac
+        fi
+        out+=("$token") ;;
     esac
     i=$((i + 1))
   done
@@ -1121,12 +1140,17 @@ _cp_coderef_segment() {                 # seg wt cwd_bound pipe_flag depth env_p
                   _cp_python_risk "$pystr" >/dev/null && _cp_cr_unresolvable=1
                   # A plain `import tmp.evil` / `from tmp import evil` runs a
                   # worktree file with no risky keyword in the -c text itself
-                  # (review round 2, #160). `-c` puts the cwd on sys.path; the
-                  # worker's shell sits in its worktree, so resolve against it
-                  # whether or not the command spelled `cd <wt> && `.
-                  # ceiling: a -c run from some other cwd is judged against the
-                  # worktree, not that cwd.
-                  [ -n "$wt" ] && _cp_python_local_imports "$pystr" "$wt" >/dev/null && _cp_cr_unresolvable=1 ;;
+                  # (review round 2, #160). `-c` puts the cwd on sys.path.
+                  # Bound to the worktree root: resolve against it. Anything
+                  # else (no `cd <wt> && `, or a later cd/pushd, a subshell
+                  # cd — #160 round 3 H-c): the cwd is unknown, so every
+                  # imported top-level name must be a module found from a
+                  # neutral cwd AND must not be shadowed by a same-named
+                  # file/dir anywhere in the worktree.
+                  if [ -n "$wt" ]; then
+                    _cp_python_local_imports "$pystr" "$wt" >/dev/null && _cp_cr_unresolvable=1
+                    if [ "$cwd_bound" != 1 ] && _cp_python_imports_unbound_risky "$pystr" "$wt"; then _cp_cr_unresolvable=1; fi
+                  fi ;;
               esac
             fi
             return 0 ;;
@@ -1279,6 +1303,83 @@ _cp_coderef_file_named_elsewhere() {    # raw real
   [ "${hits:-0}" -gt 1 ]
 }
 
+# `_cp_coderef_others_unsafe <raw> [depth]` -> 0 when something in RAW other
+# than the ONE script run could change what that run executes (#160 round 3
+# H-b). The name-based check above misses writers that BUILD the name
+# (`cp evil tmp/clean.s?`, `${d}n.sh`, braces, a python string concat), so
+# this gates on what else runs instead: every other segment, at every
+# nesting level, must be a read-only verb from the list below (or a cd);
+# there is exactly one runner segment (interpreter, source/., path word) and
+# it carries no `-c`/eval program; and no output redirection anywhere
+# targets a glob, brace, `$`/substitution name. When it returns 0 the file
+# is still resolved and bound, but its approval is `nested:` — reviewed on
+# every run, never replayed (see code_ref_inspect).
+_CP_CODEREF_SAFE_VERBS=' cd pushd popd true false : echo printf cat head tail grep egrep fgrep rg wc cut tr ls pwd date sleep test [ jq column nl basename dirname less more '
+_cp_coderef_others_unsafe() {           # raw [depth] -> 0 unsafe; sets _cp_cr_runners
+  local raw="$1" depth="${2:-0}" seg body tgt
+  [ "$depth" = 0 ] && _cp_cr_runners=0
+  [ "$depth" -le 6 ] || return 0
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
+    # output redirections: fd dups and /dev/null are fine; a computed name is not
+    while IFS= read -r tgt; do
+      [ -n "$tgt" ] || continue
+      case "$tgt" in
+        '&'*|/dev/null) ;;
+        *'*'*|*'?'*|*'['*|*'{'*|*'$'*|*@SUB@*|*'`'*) return 0 ;;
+      esac
+    done <<EOF
+$(printf '%s' "$seg" | grep -oE '[0-9]*(>>|>\||&>>|&>|>)[[:space:]]*[^[:space:]]+' | sed -E 's/^[0-9]*(>>|>\||&>>|&>|>)[[:space:]]*//')
+EOF
+    _cp_locate_command_word "$seg" || continue
+    case "${_CP_LOC[0]:-}" in *'$'*|*@SUB@*) return 0 ;; esac
+    case "$_cp_wcmd" in
+      eval) return 0 ;;
+      bash|sh|zsh|dash|ksh|mksh|csh|tcsh|fish|python|python2|python3|python3.[0-9]|python3.[0-9][0-9]|pypy*|source|.)
+        case " ${_CP_LOC[*]:1} " in *' -c '*|*' -'[a-zA-Z]*c' '*|*' -'[a-zA-Z]*c[a-zA-Z]*' '*) return 0 ;; esac
+        _cp_cr_runners=$((_cp_cr_runners + 1)) ;;
+      *)
+        case "${_CP_LOC[0]:-}" in */*) _cp_cr_runners=$((_cp_cr_runners + 1)); continue ;; esac
+        # Read-only git subcommands cannot rewrite a worktree file (#167
+        # review, MEDIUM over-block). Checked on argv[1] exactly, so a global
+        # option (`git -c diff.external=… diff`) or any other subcommand
+        # (pull, checkout, reset, stash, merge, rebase, …) stays unsafe, as
+        # does an output file (`--output`, `-o`) or `--ext-diff`.
+        # The segment must START with git itself: an env prefix
+        # (`GIT_EXTERNAL_DIFF=… git diff`, `GIT_PAGER=…`) runs a program.
+        # ceiling: repo config the worker set earlier (diff.external,
+        # core.pager, core.fsmonitor) is not visible in this command; a
+        # worker that can edit .git/config is outside what this gate sees.
+        if [ "$_cp_wcmd" = git ] && [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$seg" | awk '{print $1}')" ]; then
+          case "${_CP_LOC[1]:-}" in
+            status|log|diff|show|branch|rev-parse|remote)
+              case " ${_CP_LOC[*]:2} " in *' --output'*|*' -o '*|*' --ext-di'*|*' --edit-description'*) return 0 ;; esac
+              # `remote` only as a listing: `add`/`set-url`/`update` write
+              # config or fetch (an `ext::` URL runs a command wherever git
+              # allows that transport) — #167 review MEDIUM.
+              if [ "${_CP_LOC[1]}" = remote ]; then
+                case "${_CP_LOC[2]:-}" in ''|-v|--verbose) ;; *) return 0 ;; esac
+              fi
+              continue ;;
+          esac
+          return 0
+        fi
+        case "$_CP_CODEREF_SAFE_VERBS" in *" $_cp_wcmd "*) ;; *) return 0 ;; esac ;;
+    esac
+  done <<EOF
+$(_cp_coderef_split "$raw")
+EOF
+  while IFS= read -r body; do
+    [ -n "$body" ] || continue
+    _cp_coderef_others_unsafe "$body" "$((depth + 1))" && return 0
+  done <<EOF
+$(_cp_coderef_immediate_bodies "$raw")
+EOF
+  [ "$depth" = 0 ] && [ "${_cp_cr_runners:-0}" -gt 1 ] && return 0
+  return 1
+}
+
 _cp_code_ref() {                        # raw wt
   local raw="$1" wt="$2" cwd_bound=0 n=0 line
   # ceiling: every multi-line RAW is walked, line by line, after dropping
@@ -1316,6 +1417,12 @@ EOF
     1)
       if _cp_coderef_file_named_elsewhere "$raw" "${_cp_cr_files#*$'\t'}"; then
         return 3
+      fi
+      # A third field `order` tells code_ref_inspect the file is bound but
+      # something else in the command could change what runs: review every
+      # time (nested:), never replay an earlier approval.
+      if _cp_coderef_others_unsafe "$raw"; then
+        printf '%s\torder\n' "$_cp_cr_files"; return 0
       fi
       printf '%s\n' "$_cp_cr_files"; return 0 ;;
     *) return 3 ;;
@@ -1421,6 +1528,41 @@ print(" ".join(sorted(set(hits))))
 ' "$2" 2>/dev/null)" || names="<unparseable>"
   [ -n "$names" ] || return 1
   printf '%s' "$names"
+}
+
+# `_cp_python_imports_unbound_risky <code> <wt>` -> 0 (risky) when python CODE,
+# run from an UNKNOWN cwd, could import a worker file: some imported
+# top-level name (a relative import counts) is not found from a neutral cwd
+# under `python3 -I`, or a `<name>.py` / `<name>/` exists anywhere in the
+# worktree and could shadow it from a subdirectory cwd. Unparseable code is
+# risky. Only stdlib/site-packages imports that nothing in the worktree
+# shadows come back 1.
+# ceiling: judged with this host's `python3 -I`; a worker venv with more
+# packages only makes this stricter (not found -> risky).
+_cp_python_imports_unbound_risky() {    # code wt
+  local code="$1" wt="$2" tops top
+  tops="$(printf '%s' "$code" | python3 -c '
+import ast, sys
+try:
+    tree = ast.parse(sys.stdin.read())
+except Exception:
+    print("<unparseable>"); sys.exit(0)
+out = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        out.update(a.name.split(".")[0] for a in node.names)
+    elif isinstance(node, ast.ImportFrom):
+        out.add("<relative>" if node.level else (node.module or "").split(".")[0])
+print(" ".join(sorted(n for n in out if n)))
+' 2>/dev/null)" || return 0
+  [ -n "$tops" ] || return 1
+  case " $tops " in *" <unparseable> "*|*" <relative> "*) return 0 ;; esac
+  for top in $tops; do
+    (cd / && python3 -I -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)' "$top") \
+      >/dev/null 2>&1 || return 0
+    [ -n "$(find "$wt" \( -name .git -o -name node_modules \) -prune -o \( -name "$top.py" -o -name "$top" -type d \) -print -quit 2>/dev/null)" ] && return 0
+  done
+  return 1
 }
 
 # `_cp_code_content_reason <kind> <path> [origdir]` -> prints why this file's CONTENT
@@ -3390,7 +3532,58 @@ conductor_reserved_reason() {
   # a `-C`, and any `cd … &&` prefix all fail to match this shape and
   # stay reserved below — see _cp_push_is_safe's own header for the full
   # design and the two security-review rounds that shaped it.
-  elif { _cp_git_push_invoked "$(_cp_mask_script_data "$raw")" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|alert-gate\.sh|prompt-parse\.sh)\b|(^|[^A-Za-z0-9_-])command-policy\.sh\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm"; then
+  # The governance FILENAME list (F6): matched as a whole path component —
+  # `\b` treated `-` as a boundary, so `verify-alert-gate.sh` read as
+  # `alert-gate.sh` — and skipped when the whole command only READS
+  # (_cp_policy_mention_harmless: read-only verbs, or `sh -n <one path>`).
+  # Every other alternative on this list is unchanged.
+  elif { _cp_git_push_invoked "$(_cp_mask_script_data "$raw")" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm" ||
+       { _cp_imatch "$_CP_POLICY_FILE_RE" "$action_norm" && ! _cp_policy_mention_harmless "$raw"; }; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
   fi
+}
+
+# The governance files. A name counts only as a whole path component: the
+# character before it is not a word char or `-` (so `verify-alert-gate.sh`
+# and `my-herdr-select.sh.bak` are not these files; `lib/alert-gate.sh`,
+# `./herdr-select.sh`, `>herdr-select.sh` are).
+_CP_POLICY_FILE_RE='(^|[^A-Za-z0-9_-])(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|alert-gate\.sh|prompt-parse\.sh|command-policy\.sh)([^A-Za-z0-9_]|$)'
+
+# `_cp_policy_mention_harmless <raw>` -> 0 when naming a policy file cannot
+# change it: every segment's command word is a read-only verb, with no
+# output redirection, no `tee`, no `--output`, no substitution anywhere; or
+# the whole command is exactly `bash|sh|zsh|dash -n <one path>` (parse only).
+# Only the policy-FILENAME alternative is skipped; credential paths and
+# every other reserved shape are judged exactly as before.
+_CP_READONLY_VERBS=' cd cat wc head tail grep egrep fgrep rg diff cmp ls stat file shasum sha256sum md5 nl '
+_cp_policy_mention_harmless() {         # raw
+  local raw="$1" seg n=0
+  local tidy
+  # stderr-to-stdout and discard-to-/dev/null write nothing; any other `>` does.
+  tidy="$(printf '%s' "$raw" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
+  case "$tidy" in *$'\n'*|*'`'*|*'$('*|*'<('*|*'>('*|*'>'*) return 1 ;; esac
+  if _cp_simple_words "$raw" ""; then
+    # The interpreter must be the real one by name or absolute system path:
+    # a worker-written `./bash` or `tmp/../bash` is a program, not a parser.
+    case "${#_CP_W[@]}:${_CP_W[0]}:${_CP_W[1]:-}" in
+      3:bash:-n|3:sh:-n|3:zsh:-n|3:dash:-n|3:/bin/bash:-n|3:/bin/sh:-n|3:/bin/zsh:-n|3:/bin/dash:-n)
+        case "${_CP_W[2]}" in -*|*'$'*|*'*'*|*'?'*|*'['*|*'{'*) return 1 ;; esac
+        return 0 ;;
+    esac
+  fi
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
+    n=$((n + 1))
+    case "$seg" in *--output*|*--pre*|*--hostname-bin*) return 1 ;; esac
+    _cp_locate_command_word "$seg" || return 1
+    # A path-form command word is a program the worker may have written
+    # (`./cat`, `/tmp/wt/ls`), not the read-only verb (#171 review MEDIUM).
+    case "${_CP_LOC[0]:-}" in */*) return 1 ;; esac
+    [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$seg" | awk '{print $1}')" ] || return 1
+    case "$_CP_READONLY_VERBS" in *" $_cp_wcmd "*) ;; *) return 1 ;; esac
+  done <<EOF
+$(_cp_coderef_split "$tidy")
+EOF
+  [ "$n" -gt 0 ]
 }

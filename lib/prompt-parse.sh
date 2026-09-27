@@ -901,7 +901,49 @@ prompt_any_visible() {                 # <pane>
 # and the mechanism now agree about which prompt is being answered. A pane
 # with no menu panel (Claude, Codex) is unaffected: its menu extractors return
 # nothing and the numbered path runs exactly as before.
+#
+# The id is an OCCURRENCE, not just content (2026-09-27, F7b). Content alone
+# collided across time and across panes: one id (9db57228…) covered 190 events
+# on 40 tasks, and a worker re-asking the identical `git status` an hour later
+# reused the first occurrence's input_required row (INSERT OR IGNORE on a
+# prompt_id-derived event id), its grace claims and its wake key. So the hash
+# also carries the pane id, the pane's live birth (herdr's terminal_id, never
+# reused) and prompt_period below. Prints nothing and returns 1 when no
+# question or option is readable: a vanished prompt has no identity, and a
+# constant "empty" digest used to ship as an actionable Slack button.
 prompt_id() {
+  local content
+  content="$(prompt_content "$1")" || return 1
+  prompt_id_of "$1" "$content"
+}
+
+# prompt_id_of <pane_id> <content> -> prompt_id for content already read with
+# prompt_content, so a caller that also needs the content digest reads the
+# screen once, not twice (a second read can see a different frame).
+prompt_id_of() {
+  local birth period
+  birth="$(command -v pane_birth_now >/dev/null 2>&1 || . "$_PP_LIB_DIR/pane-guard.sh" >/dev/null 2>&1
+           pane_birth_now "$1" 2>/dev/null)"
+  period="$(prompt_period "$1")"
+  printf 'pane=%s\nbirth=%s\nperiod=%s\n%s' "$1" "$birth" "$period" "$2" \
+    | shasum -a 256 | cut -d' ' -f1
+}
+
+# prompt_content_digest <pane_id> -> the hash of WHAT is on screen, without the
+# occurrence salt. For the one caller that must re-check the screen after it
+# has itself closed the blocked period (herdr-select.sh, right before its
+# keystroke), where prompt_id has legitimately stepped. prompt_digest_of is the
+# same hash for content already read.
+prompt_content_digest() {
+  local content
+  content="$(prompt_content "$1")" || return 1
+  prompt_digest_of "$content"
+}
+prompt_digest_of() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
+
+# prompt_content <pane_id> -> "<question>\n<options>", or rc 1 when neither is
+# readable. The content half of prompt_id.
+prompt_content() {
   local q opts
   q="$(prompt_menu_question "$1" 2>/dev/null)"
   opts="$(prompt_menu_options "$1" 2>/dev/null)"
@@ -930,7 +972,41 @@ prompt_id() {
     opts="$(prompt_options "$1")"
     [ -n "$menu_q" ] && q="$menu_q"$'\n'"$q"
   fi
-  printf '%s\n%s' "$q" "$opts" | shasum -a 256 | cut -d' ' -f1
+  [ -n "$q$opts" ] || return 1
+  printf '%s\n%s' "$q" "$opts"
+}
+
+# prompt_period <pane_id> -> which blocked period of this pane we are in: the
+# registry sequence of the latest time a task registered on the pane LEFT
+# `blocked` (a state_changed event with from=blocked), or 0.
+#
+# Keyed on the END of the previous period, never the start of this one. A
+# start marker (the old attn_prompt_edge, written by the hook's first firing)
+# races every other reader at exactly the moment they all look: live,
+# 2026-09-26 (events 37680/37682), attention-tick.sh read the pane before the
+# hook marked its edge, the two computed different keys, and the conductor was
+# woken twice for one prompt. A close is written when the previous prompt was
+# answered (herdr-select.sh after a confirmed press, agent-edge.sh when the
+# agent leaves `blocked`), long before the next prompt paints, so every reader
+# of the new prompt sees the same value. The id then steps exactly when the
+# prompt is answered, which is when a decision captured against it goes stale.
+# Only blocked->running counts: a previous occupant of a RECYCLED pane id
+# being moved blocked->lost by reconcile while the new occupant's prompt is
+# open must not step that prompt's id (PR #168 review). Unregistered panes (a
+# hand-started session) have no transitions: 0.
+# Read in a subshell so run-registry.sh's shell options never leak into a
+# caller that did not source it (herdr-notify.sh, sweep-approvals.sh, …).
+_PP_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+prompt_period() {                      # <pane_id>
+  (
+    command -v _sql >/dev/null 2>&1 || . "$_PP_LIB_DIR/run-registry.sh" >/dev/null 2>&1 || { printf '0'; exit 0; }
+    [ -f "$(registry_db)" ] || { printf '0'; exit 0; }
+    n="$(_sql "SELECT max(e.sequence) FROM events e JOIN tasks t ON t.task_id=e.task_id
+          WHERE t.pane_id=$(_sq "$1") AND e.type='state_changed'
+            AND json_extract(e.payload,'\$.from')='blocked'
+            AND json_extract(e.payload,'\$.state')='running';" 2>/dev/null)"
+    printf '%s' "${n:-0}"
+  )
 }
 
 prompt_question() {

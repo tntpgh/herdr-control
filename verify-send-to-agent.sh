@@ -250,4 +250,94 @@ send --wait-clear 3 "hello after menu"; rc=$?
 wait
 [ "$rc" -eq 0 ] && ok "--wait-clear submits after menu clears" || bad "--wait-clear exit $rc: $(cat "$WORK/err.txt")"
 [ "$(enters_pressed)" = "1" ] && ok "--wait-clear never presses into the menu" || bad "Enters=$(enters_pressed)"
+
+# 2026-09-26, three times: omp leaves an ANSWERED approval panel's text in the
+# transcript right above its composer, and the old bare grep for "Allow tool:"
+# in the bottom rows refused a pane with no menu on it (prompt_menu_options was
+# empty each time; the operator had to --force). Only a LIVE menu refuses now.
+printf '== omp: answered "Allow tool:" text in scrollback above an idle composer is NOT a prompt ==\n'
+reset_state
+screen 0 <<'EOF'
+ Allow tool: bash
+ Command: git status
+ ✔ bash git status
+   On branch main
+   nothing to commit, working tree clean
+ Tree is clean.
+╭── worker ── main ──╮
+ check the tree again
+╰─
+EOF
+screen 1 <<'EOF'
+ Allow tool: bash
+ Command: git status
+ Tree is clean.
+ check the tree again
+ Checking.
+╭── worker ── main ──╮
+╰─
+EOF
+last_as 1
+send "check the tree again"; rc=$?
+[ "$rc" -eq 0 ] && ok "exit 0, delivered past stale Allow tool: text" || bad "exit $rc: $(cat "$WORK/err.txt")"
+! grep -q 'REFUSED' "$WORK/err.txt" && ok "no REFUSED on a pane with no live menu" || bad "stderr: $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "1" ] && ok "one Enter" || bad "Enters=$(enters_pressed)"
+
+printf '== omp: a whole DISMISSED panel (footer included) above new output is NOT a prompt ==\n'
+reset_state
+screen 0 <<'EOF'
+╭─ Allow tool: bash ─╮
+│ Command: git status │
+│ Approve │
+│ Deny │
+│ up/down navigate  enter select  esc cancel │
+╰──╯
+ ✔ bash git status
+╭── worker ── main ──╮
+ next step please
+╰─
+EOF
+screen 1 <<'EOF'
+ next step please
+ On it.
+╭── worker ── main ──╮
+╰─
+EOF
+last_as 1
+send "next step please"; rc=$?
+[ "$rc" -eq 0 ] && ok "exit 0, dismissed panel does not block delivery" || bad "exit $rc: $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "1" ] && ok "one Enter" || bad "Enters=$(enters_pressed)"
+
+printf '== omp: LIVE approval menu (footer last, box closer below) still refuses ==\n'
+reset_state
+screen 0 <<'EOF'
+ Tree is clean.
+╭─ Allow tool: bash ─╮
+│ Command: git push origin main │
+│ Approve │
+│ Deny │
+│ up/down navigate  enter select  esc cancel │
+╰──╯
+EOF
+last_as 0
+send "some message"; rc=$?
+[ "$rc" -eq 5 ] && ok "exit 5 REFUSED" || bad "exit $rc: $(cat "$WORK/out.txt") / $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed into the live menu" || bad "Enters=$(enters_pressed)"
+[ ! -s "$SENDTEXT" ] && ok "text never typed into the live menu" || bad "typed into a menu: $(cat "$SENDTEXT")"
+
+printf '== omp: UNRECOGNIZED live menu (Approve / Always allow / Deny) still refuses ==\n'
+reset_state
+screen 0 <<'EOF'
+Allow tool: bash
+
+Approve
+Always allow
+Deny
+up/down navigate  enter select  esc cancel
+EOF
+last_as 0
+send "some message"; rc=$?
+[ "$rc" -eq 5 ] && ok "exit 5 REFUSED on a menu the parser does not recognize" || bad "exit $rc: $(cat "$WORK/out.txt") / $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed into the unrecognized menu" || bad "Enters=$(enters_pressed)"
+[ ! -s "$SENDTEXT" ] && ok "text never typed into the unrecognized menu" || bad "typed into a menu: $(cat "$SENDTEXT")"
 [ "$fail" -eq 0 ]

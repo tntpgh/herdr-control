@@ -184,7 +184,7 @@ while IFS= read -r form; do
   c="${form//@WT@/$CRWT}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.sh|0:*/tmp/evil.py|3:*) ok "judged or refused (rc=$rc): $c" ;;
+    0:*/tmp/evil.sh|0:*/tmp/evil.sh?order|0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "judged or refused (rc=$rc): $c" ;;
     *) bad "script ran unjudged (rc=$rc '$out'): $c" ;;
   esac
 done <<'EOF'
@@ -260,7 +260,7 @@ while IFS= read -r form; do
   c="${form//@WT@/$CRWT}"; c="${c//@OUT@/$WORK}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/tramp*.sh|3:*) ok "trampoline judged or refused (rc=$rc): $c" ;;
+    0:*/tmp/tramp*.sh|0:*/tmp/tramp*.sh?order|3:*) ok "trampoline judged or refused (rc=$rc): $c" ;;
     *) bad "trampoline ran unjudged (rc=$rc '$out'): $c" ;;
   esac
 done <<'EOF'
@@ -285,7 +285,7 @@ for mc in \
   c="${mc%%|*}"; label="${mc#*|}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.sh|3:*) ok "judged or refused (rc=$rc): $label" ;;
+    0:*/tmp/evil.sh|0:*/tmp/evil.sh?order|3:*) ok "judged or refused (rc=$rc): $label" ;;
     *) bad "script ran unjudged (rc=$rc '$out'): $label" ;;
   esac
 done
@@ -296,7 +296,7 @@ for mc in \
   c="${mc%%|*}"; label="${mc#*|}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/evil.sh|3:*) ok "judged or refused (rc=$rc): $label" ;;
+    0:*/evil.sh|0:*/evil.sh?order|3:*) ok "judged or refused (rc=$rc): $label" ;;
     *) bad "script ran unjudged (rc=$rc '$out'): $label" ;;
   esac
 done
@@ -312,7 +312,7 @@ while IFS= read -r form; do
   c="${form//@WT@/$CRWT}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.sh|0:*/tmp/evil.py|0:*/tmp/outlink.sh|3:*) ok "judged or refused (rc=$rc): $c" ;;
+    0:*/tmp/evil.sh|0:*/tmp/evil.sh?order|0:*/tmp/evil.py|0:*/tmp/evil.py?order|0:*/tmp/outlink.sh|0:*/tmp/outlink.sh?order|3:*) ok "judged or refused (rc=$rc): $c" ;;
     *) bad "script ran unjudged (rc=$rc '$out'): $c" ;;
   esac
 done <<EOF
@@ -355,30 +355,30 @@ printf '== finding 9: python flags other than -uBev still resolve the file slot 
 for pyflag in -I -O -S; do
   out="$(_cp_code_ref "cd $CRWT && python3 $pyflag tmp/evil.py" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.py) ok "python3 $pyflag resolves the file slot" ;;
+    0:*/tmp/evil.py|0:*/tmp/evil.py?order) ok "python3 $pyflag resolves the file slot" ;;
     *) bad "python3 $pyflag: rc=$rc '$out'" ;;
   esac
 done
 out="$(_cp_code_ref "cd $CRWT && python3 -W ignore tmp/evil.py" "$CRWT")"; rc=$?
-case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -W ignore resolves past its value" ;; *) bad "python3 -W: rc=$rc '$out'" ;; esac
+case "$rc:$out" in 0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "python3 -W ignore resolves past its value" ;; *) bad "python3 -W: rc=$rc '$out'" ;; esac
 out="$(_cp_code_ref "cd $CRWT && python3 -X utf8 tmp/evil.py" "$CRWT")"; rc=$?
-case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -X utf8 resolves past its value" ;; *) bad "python3 -X: rc=$rc '$out'" ;; esac
+case "$rc:$out" in 0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "python3 -X utf8 resolves past its value" ;; *) bad "python3 -X: rc=$rc '$out'" ;; esac
 
 printf '== finding 10: launcher option values and shell keywords no longer hide the script ==\n'
 for form in "timeout 5s bash tmp/evil.sh" "timeout 1.5m bash tmp/evil.sh" "exec -a foo bash tmp/evil.sh" \
             "coproc bash tmp/evil.sh" "function f { bash tmp/evil.sh; }; f"; do
   out="$(_cp_code_ref "cd $CRWT && $form" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.sh|3:*) ok "resolves past the launcher: $form" ;;
+    0:*/tmp/evil.sh|0:*/tmp/evil.sh?order|3:*) ok "resolves past the launcher: $form" ;;
     *) bad "launcher hid the script: $form (rc=$rc '$out')" ;;
   esac
 done
 
 printf '== finding 13: python3 -m <local.module> resolves to its worktree file ==\n'
 out="$(_cp_code_ref "cd $CRWT && python3 -m tmp.evil" "$CRWT")"; rc=$?
-case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -m tmp.evil resolves tmp/evil.py" ;; *) bad "python3 -m tmp.evil: rc=$rc '$out'" ;; esac
+case "$rc:$out" in 0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "python3 -m tmp.evil resolves tmp/evil.py" ;; *) bad "python3 -m tmp.evil: rc=$rc '$out'" ;; esac
 out="$(_cp_code_ref "cd $CRWT && python3 -m tmp.evil | tail -1" "$CRWT")"; rc=$?
-case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -m tmp.evil resolves past a trailing pipe" ;; *) bad "python3 -m piped: rc=$rc '$out'" ;; esac
+case "$rc:$out" in 0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "python3 -m tmp.evil resolves past a trailing pipe" ;; *) bad "python3 -m piped: rc=$rc '$out'" ;; esac
 out="$(_cp_code_ref "cd $CRWT && python3 -m json.tool tmp/x.json | head" "$CRWT")"; rc=$?
 [ "$rc" = 1 ] && ok "python3 -m json.tool (no matching worktree file) stays out of scope" || bad "json.tool: rc=$rc '$out'"
 
@@ -418,7 +418,7 @@ while IFS= read -r form; do
   c="${form//@WT@/$CRWT}"
   out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
   case "$rc:$out" in
-    0:*/tmp/evil.sh|0:*/tmp/evil.py|3:*) ok "judged or refused (rc=$rc): $c" ;;
+    0:*/tmp/evil.sh|0:*/tmp/evil.sh?order|0:*/tmp/evil.py|0:*/tmp/evil.py?order|3:*) ok "judged or refused (rc=$rc): $c" ;;
     *) bad "interpreter not covered (rc=$rc '$out'): $c" ;;
   esac
 done <<EOF
@@ -468,5 +468,154 @@ out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh && cp tmp/evil.sh tmp/clean.s
 [ "$rc" = 3 ] && ok "a writer between two runs still escalates" || bad "writer between runs slipped: rc=$rc '$out'"
 out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh > tmp/clean.sh; bash tmp/clean.sh" "$CRWT")"; rc=$?
 [ "$rc" = 3 ] && ok "a run that redirects onto the script still escalates" || bad "redirect-onto-script slipped: rc=$rc '$out'"
+
+printf '== code by reference: order gate and unbound python -c (F8b, #160 round 3 H-b/H-c) ==\n'
+# A writer that BUILDS the script's name (glob, brace, $var, a python string
+# concat) is invisible to the name match; anything but read-only verbs
+# around the one run makes the binding `order` (reviewed every run).
+while IFS= read -r form; do
+  [ -n "$form" ] || continue
+  out="$(_cp_code_ref "cd $CRWT && $form" "$CRWT")"; rc=$?
+  case "$rc:$out" in
+    0:*"	order"|3:*) ok "order-unsafe is not a plain binding (rc=$rc): $form" ;;
+    *) bad "order-unsafe bound plainly (rc=$rc '$out'): $form" ;;
+  esac
+done <<'EOF'
+cp tmp/evil.sh tmp/clean.s?; bash tmp/clean.sh
+cat tmp/evil.sh > tmp/clea?.sh; bash tmp/clean.sh
+cp tmp/evil.sh tmp/clean.s[h]; bash tmp/clean.sh
+tee tmp/clean.s{h,x} < tmp/evil.sh; bash tmp/clean.sh
+d=tmp/clea; cp tmp/evil.sh ${d}n.sh; bash tmp/clean.sh
+python3 -c 'open("tmp/clea"+"n.sh","w").write("x")'; bash tmp/clean.sh
+cp tmp/evil.sh tmp/*an.sh; bash tmp/clean.sh
+bash tmp/clean.sh >> tmp/clea?.sh
+bash tmp/clean.sh | tee tmp/clean.s?
+git pull && bash tmp/clean.sh
+git diff --output=tmp/x && bash tmp/clean.sh
+git -c diff.external=x diff && bash tmp/clean.sh
+git stash && bash tmp/clean.sh
+GIT_EXTERNAL_DIFF=x git diff; bash tmp/clean.sh
+GIT_PAGER=x git log; bash tmp/clean.sh
+git remote add x 'ext::sh -c true' && git remote update x && bash tmp/clean.sh
+git branch --edit-description && bash tmp/clean.sh
+EOF
+for form in "bash tmp/clean.sh" "bash tmp/clean.sh 2>&1 | tail -3" "bash tmp/clean.sh && echo done" \
+            "bash tmp/clean.sh > /tmp/out.txt" "bash tmp/clean.sh | grep hello | wc -l" \
+            "bash tmp/clean.sh && git status" "git log --oneline -3 && bash tmp/clean.sh" "git remote -v && bash tmp/clean.sh"; do
+  out="$(_cp_code_ref "cd $CRWT && $form" "$CRWT")"; rc=$?
+  [ "$rc" = 0 ] && [ "$out" = "shell	$CRWT/tmp/clean.sh" ] \
+    && ok "read-only company keeps a plain binding: $form" || bad "over-block: rc=$rc '$out': $form"
+done
+for form in "cd $CRWT && cd tmp && python3 -c 'import evil'" "cd $CRWT/tmp && python3 -c 'import evil'" \
+            "cd $CRWT && (cd tmp; python3 -c 'import evil')" "cd $CRWT && pushd tmp && python3 -c 'import evil'" \
+            "python3 -c 'import evil'" "python3 -c 'from . import evil'"; do
+  out="$(_cp_code_ref "$form" "$CRWT")"; rc=$?
+  [ "$rc" = 3 ] && ok "unbound-cwd python -c import escalates: $form" || bad "unbound python -c ran unjudged (rc=$rc '$out'): $form"
+done
+for form in "python3 -c 'import json; print(1)'" "cd $CRWT && cd tmp && python3 -c 'import json'"; do
+  out="$(_cp_code_ref "$form" "$CRWT")"; rc=$?
+  [ "$rc" = 1 ] && ok "stdlib-only python -c stays out of scope: $form" || bad "stdlib python -c over-blocked (rc=$rc): $form"
+done
+
+printf '== trunk-identical suite: one conductor review per worktree state (F5) ==\n'
+# A test suite byte-identical to the trunk tip (as the REMOTE reports it) was
+# reviewed at merge, so its reserved-looking FIXTURES are not a reason to
+# refuse it. But it runs the worktree's lib, so the binding covers the suite
+# AND the worktree's change-set: no change-set = only reviewed code runs
+# (peer allow); a change-set = one conductor review per state.
+command -v peer_decide >/dev/null 2>&1 || . "$here/lib/scoped-policy.sh"
+command -v file_approval_record >/dev/null 2>&1 || . "$here/lib/run-registry.sh"
+export HERDR_RUN_STATE_DIR="$WORK/f5-state"; mkdir -p "$HERDR_RUN_STATE_DIR"
+F5O="$WORK/f5-origin.git"; F5W="$WORK/f5-wt"
+git init -q --bare -b main "$F5O"
+git clone -q "$F5O" "$F5W" 2>/dev/null
+F5W="$(cd "$F5W" && pwd -P)"
+mkdir -p "$F5W/lib"
+printf 'x_ok() { echo fine; }\n' > "$F5W/lib/x.sh"
+printf '#!/usr/bin/env bash\n# fixture strings a real suite carries:\n# gh pr merge 1 --squash ; cat ~/.ssh/id_rsa\n. "$(dirname "$0")/lib/x.sh"\nx_ok\n' > "$F5W/verify-x.sh"
+printf 'notes\n' > "$F5W/README.md"
+git -C "$F5W" add -A && git -C "$F5W" -c user.email=t@t -c user.name=t commit -qm base
+git -C "$F5W" push -q origin HEAD:main 2>/dev/null
+git -C "$F5W" fetch -q origin
+git -C "$F5W" checkout -q -b fix/f5
+F5TASK="$(jq -nc --arg wt "$F5W" '{worktree:$wt,branch:"fix/f5",trunk:"main",manifest:"",task_id:"taskF5"}')"
+f5_decide() { peer_decide "$1" "$F5TASK"; }
+f5_trunkish() { case "$PD_REASON" in *trunk*) return 0 ;; esac; return 1; }
+
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" != 0 ] && [ "$PD_VERDICT" = escalate ] && f5_trunkish \
+  && ok "(A) unmodified suite, no worktree changes: still one conductor review (trunk path, not reserved)" \
+  || bad "(A) clean state: rc=$rc $PD_VERDICT — $PD_REASON"
+[ -n "$PD_CODE_SHA" ] && file_approval_record taskF5 "$PD_CODE_PATH" "$PD_CODE_SHA" conductor:test
+f5_decide "cd $F5W && bash verify-x.sh 2>&1 | tail -3"; rc=$?
+[ "$rc" = 0 ] && ok "(A-g) after approval, the piped form replays for the clean state" || bad "(A-g) clean replay: $PD_VERDICT — $PD_REASON"
+mkdir -p "$F5W/tools"
+printf '#!/bin/sh\n. "${NOTIFY_ENV:-$HOME/.config/x.env}"\ngh pr merge 1 --squash\n' > "$F5W/tools/notify.sh"
+git -C "$F5W" add tools/notify.sh && git -C "$F5W" -c user.email=t@t -c user.name=t commit -qm notify
+git -C "$F5W" push -q origin HEAD:main 2>/dev/null
+f5_decide "cd $F5W && bash tools/notify.sh"; rc=$?
+[ "$rc" != 0 ] && ! f5_trunkish && ok "(s) a trunk-identical script that is not a test entry point never takes the trunk path" \
+  || bad "(s) non-suite script took the trunk path: rc=$rc $PD_VERDICT — $PD_REASON"
+
+printf 'notes, edited\n' > "$F5W/README.md"
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" != 0 ] && [ "$PD_VERDICT" = escalate ] && f5_trunkish \
+  && ok "(a) a change-set makes it escalate on the trunk path, not reserved" \
+  || bad "(a) trunk suite: rc=$rc $PD_VERDICT — $PD_REASON"
+sha_a="$PD_CODE_SHA"; path_a="$PD_CODE_PATH"
+file_sha="$(shasum -a 256 < "$F5W/verify-x.sh" | cut -d' ' -f1)"
+[ -n "$sha_a" ] && [ "$sha_a" != "$file_sha" ] \
+  && ok "(a) the approval sha binds more than the file bytes" || bad "(a) PD_CODE_SHA is the bare file sha ($sha_a)"
+[ -n "$sha_a" ] && file_approval_record taskF5 "$path_a" "$sha_a" conductor:test
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" = 0 ] && ok "(b) approved suite + same worktree state re-runs for a peer" || bad "(b) replay refused: $PD_VERDICT — $PD_REASON"
+f5_decide "cd $F5W && bash verify-x.sh 2>&1 | tail -3"; rc=$?
+[ "$rc" = 0 ] && ok "(g) the piped form binds the same way" || bad "(g) piped replay: $PD_VERDICT — $PD_REASON"
+printf 'x_ok() { echo changed; }\n' > "$F5W/lib/x.sh"
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" != 0 ] && [ "$PD_VERDICT" = escalate ] && ok "(c) a lib edit changes the state: escalates again" || bad "(c) lib edit replayed: rc=$rc $PD_VERDICT"
+git -C "$F5W" checkout -q -- lib/x.sh
+printf 'echo new\n' > "$F5W/new-helper.sh"
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" != 0 ] && ok "(d) an untracked file changes the state: escalates again" || bad "(d) untracked file replayed"
+rm -f "$F5W/new-helper.sh"
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" = 0 ] && ok "(b2) back to the approved state: replays again" || bad "(b2) restored state refused: $PD_VERDICT — $PD_REASON"
+printf 'x_ok() { echo hidden edit; }\n' > "$F5W/lib/x.sh"
+git -C "$F5W" update-index --assume-unchanged lib/x.sh
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" != 0 ] && ok "(j) an edit hidden by assume-unchanged still changes the state (raw bytes): escalates" || bad "(j) assume-unchanged hid an edit: rc=$rc $PD_VERDICT — $PD_REASON"
+git -C "$F5W" update-index --no-assume-unchanged lib/x.sh
+git -C "$F5W" checkout -q -- lib/x.sh
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" = 0 ] && ok "(b3) approved state replays before the filter attack" || bad "(b3) approved state refused: $PD_VERDICT — $PD_REASON"
+F5GD="$(git -C "$F5W" rev-parse --absolute-git-dir)"; mkdir -p "$F5GD/info"
+printf 'lib/x.sh diff=fake filter=same\n' > "$F5GD/info/attributes"
+git -C "$F5W" config diff.fake.textconv 'echo FIXED'
+git -C "$F5W" config filter.same.clean "git -C $F5W show HEAD:lib/x.sh"
+printf 'x_ok() { echo filtered edit; }\n' > "$F5W/lib/x.sh"
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" != 0 ] && ok "(k) textconv/clean-filter cannot hide a lib edit from the change-set" || bad "(k) filter-hidden edit replayed: $PD_VERDICT — $PD_REASON"
+rm -f "$F5GD/info/attributes"; git -C "$F5W" config --unset diff.fake.textconv; git -C "$F5W" config --unset filter.same.clean
+git -C "$F5W" checkout -q -- lib/x.sh
+printf 'lib/hidden.sh\n' > "$F5W/.gitignore"
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" != 0 ] && ! f5_trunkish && ok "(h) a changed .gitignore disqualifies the trunk path" || bad "(h) .gitignore change kept the trunk path: rc=$rc $PD_VERDICT — $PD_REASON"
+rm -f "$F5W/.gitignore"
+f5_decide "cd $F5W && bash verify-x.sh; cp /dev/null lib/x.sh"; rc=$?
+[ "$rc" != 0 ] && ! f5_trunkish && ok "(i) the order gate beats the trunk path" || bad "(i) order-unsafe command took the trunk path: rc=$rc $PD_VERDICT — $PD_REASON"
+printf '# edited suite\n' >> "$F5W/verify-x.sh"
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" != 0 ] && ! f5_trunkish && ok "(e) a worker-modified suite leaves the trunk path ($PD_VERDICT)" || bad "(e) modified suite: rc=$rc $PD_VERDICT — $PD_REASON"
+git -C "$F5W" checkout -q -- verify-x.sh
+git -C "$F5W" -c user.email=t@t -c user.name=t commit -qam readme
+printf '# forged trunk\n' >> "$F5W/verify-x.sh"
+git -C "$F5W" -c user.email=t@t -c user.name=t commit -qam forged
+git -C "$F5W" update-ref refs/remotes/origin/main HEAD
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" != 0 ] && ! f5_trunkish && ok "(f) origin/main moved locally to the worker's commit: no trunk path" || bad "(f) forged trunk accepted: rc=$rc $PD_VERDICT — $PD_REASON"
+git -C "$F5W" push -q origin HEAD:refs/heads/fix/f5 2>/dev/null
+peer_decide "cd $F5W && bash verify-x.sh" "$F5TASK"; rc=$?
+[ "$rc" != 0 ] && ! f5_trunkish && ok "(f2) the worker's own branch on the remote is not trunk" || bad "(f2) own branch taken as trunk: rc=$rc $PD_VERDICT — $PD_REASON"
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }
