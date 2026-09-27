@@ -2523,8 +2523,8 @@ _cp_envdump_word_is_dump() {            # norm [noexempt] -> 0 (true) if it dump
     # never qualifies — `env BASH_ENV=x bash y` stays exactly as reserved as
     # it was; so does any value carrying a shell operator.
     function env_name_loads_code(nm) {
-      return (nm ~ /^(BASH_ENV|ENV|PATH|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|HOME|ZDOTDIR|TMPDIR|EDITOR|VISUAL|PAGER|MANPAGER|LESSOPEN|LESSCLOSE|BROWSER|SSH_ASKPASS|SUDO_ASKPASS|NODE_OPTIONS|NODE_PATH|PERLLIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|XDG_CONFIG_HOME|XDG_CONFIG_DIRS)$/ ||
-              nm ~ /^(PYTHON|PERL5|GIT_|LD_|DYLD_)/)
+      return (nm ~ /^(BASH_ENV|ENV|PATH|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|HOME|ZDOTDIR|TMPDIR|EDITOR|VISUAL|PAGER|MANPAGER|LESSOPEN|LESSCLOSE|BROWSER|SSH_ASKPASS|SUDO_ASKPASS|NODE_OPTIONS|NODE_PATH|PERLLIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|XDG_CONFIG_HOME|XDG_CONFIG_DIRS|GCONV_PATH|LOCPATH|NLSPATH|HOSTALIASES|RUSTC_WRAPPER|CC|CXX|MAKEFLAGS|HERDR_BRIDGE_ENV)$/ ||
+              nm ~ /^(PYTHON|PERL5|GIT_|LD_|DYLD_|MALLOC_|TERMINFO|CARGO_|npm_config_|NPM_CONFIG_)/)
     }
     function env_assign_prefix(line, p,    rest, nt, toks, k, t, cnt, eq, nm, val, lt) {
       rest = substr(line, p)
@@ -3594,7 +3594,7 @@ _cp_policy_mention_harmless() {         # raw
   local raw="$1" seg n=0
   local tidy
   # stderr-to-stdout and discard-to-/dev/null write nothing; any other `>` does.
-  tidy="$(printf '%s' "$raw" | sed -E 's#[0-9]*>&[0-9]##g; s#[0-9]*>[[:space:]]*/dev/null##g')"
+  tidy="$(printf '%s' "$raw" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
   case "$tidy" in *$'\n'*|*'`'*|*'$('*|*'<('*|*'>('*|*'>'*) return 1 ;; esac
   if _cp_simple_words "$raw" ""; then
     case "${#_CP_W[@]}:${_CP_W[0]##*/}:${_CP_W[1]:-}" in
