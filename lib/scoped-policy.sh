@@ -74,7 +74,7 @@ _sp_command_region() {
     *) rest="$panel" ;;
   esac
   case "$rest" in "Origin: MCP server tool "*) rest="${rest#Origin: MCP server tool }" ;; esac
-  case "$rest" in "Reason: "*" Command:"*) rest="Command:${rest#* Command:}" ;; esac
+  case "$rest" in "Reason: Critical pattern detected Command:"*) rest="${rest#Reason: Critical pattern detected }" ;; esac
   case "$rest" in
     "Command:"*) printf '%s' "${rest#Command:}"; return 0 ;;
     "run:"*)     printf '%s' "${rest#run:}"; return 0 ;;
