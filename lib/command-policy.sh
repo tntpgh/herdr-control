@@ -387,10 +387,17 @@ _cp_grant_action() {                    # raw wt branch trunk
 # message cluster only when every flag before its final `m` is one of git's
 # no-argument commit flags; `-tm` is kept whole, because its following word
 # is a real template/path argument (security review NEW-2).
+#
+# F6: for `git add`, a literal pathspec naming a governance file is dropped
+# too. The #3b grant already allows `git add -A` (which stages the same file)
+# and the commit on the task's own branch; the policy-file reservation exists
+# to stop EDITS to the gate, which happen through the edit tool, and pushes to
+# main stay human-only. Only plain paths go: an option, a glob, `$`, or a
+# credential path (`.env`, `~/.ssh/…`) is kept and still judged.
 _cp_strip_commit_message() {            # raw wt
   _cp_simple_words "$1" "$2" || return 1
   local -a w=("${_CP_W[@]}") out=()
-  local i=0 n="${#_CP_W[@]}" token prefix
+  local i=0 n="${#_CP_W[@]}" token prefix plain
   while [ "$i" -lt "$n" ]; do
     token="${w[$i]}"
     case "$token" in
@@ -399,7 +406,19 @@ _cp_strip_commit_message() {            # raw wt
       -m?*) ;;
       -[aqsvez]m)
         i=$((i + 1)) ;;
-      *) out+=("$token") ;;
+      *)
+        if [ "${w[1]:-}" = add ] && [ "$i" -ge 2 ]; then
+          plain="$(printf '%s' "$token" | tr '\001-\016' ' ')"
+          case "$plain" in
+            -*|*[\*\?\[\{\$\ \~]*|.[A-Za-z]*/*|*/.[A-Za-z]*/*) ;;
+            *)
+              case "${plain##*/}" in
+                herdr-select.sh|scoped-policy.sh|task-manifest.sh|run-registry.sh|alert-gate.sh|prompt-parse.sh|command-policy.sh|approval-policy.md|gate-registry.yaml)
+                  i=$((i + 1)); continue ;;
+              esac ;;
+          esac
+        fi
+        out+=("$token") ;;
     esac
     i=$((i + 1))
   done
@@ -3513,7 +3532,58 @@ conductor_reserved_reason() {
   # a `-C`, and any `cd … &&` prefix all fail to match this shape and
   # stay reserved below — see _cp_push_is_safe's own header for the full
   # design and the two security-review rounds that shaped it.
-  elif { _cp_git_push_invoked "$(_cp_mask_script_data "$raw")" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|\b(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|alert-gate\.sh|prompt-parse\.sh)\b|(^|[^A-Za-z0-9_-])command-policy\.sh\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm"; then
+  # The governance FILENAME list (F6): matched as a whole path component —
+  # `\b` treated `-` as a boundary, so `verify-alert-gate.sh` read as
+  # `alert-gate.sh` — and skipped when the whole command only READS
+  # (_cp_policy_mention_harmless: read-only verbs, or `sh -n <one path>`).
+  # Every other alternative on this list is unchanged.
+  elif { _cp_git_push_invoked "$(_cp_mask_script_data "$raw")" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm" ||
+       { _cp_imatch "$_CP_POLICY_FILE_RE" "$action_norm" && ! _cp_policy_mention_harmless "$raw"; }; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
   fi
+}
+
+# The governance files. A name counts only as a whole path component: the
+# character before it is not a word char or `-` (so `verify-alert-gate.sh`
+# and `my-herdr-select.sh.bak` are not these files; `lib/alert-gate.sh`,
+# `./herdr-select.sh`, `>herdr-select.sh` are).
+_CP_POLICY_FILE_RE='(^|[^A-Za-z0-9_-])(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|alert-gate\.sh|prompt-parse\.sh|command-policy\.sh)([^A-Za-z0-9_]|$)'
+
+# `_cp_policy_mention_harmless <raw>` -> 0 when naming a policy file cannot
+# change it: every segment's command word is a read-only verb, with no
+# output redirection, no `tee`, no `--output`, no substitution anywhere; or
+# the whole command is exactly `bash|sh|zsh|dash -n <one path>` (parse only).
+# Only the policy-FILENAME alternative is skipped; credential paths and
+# every other reserved shape are judged exactly as before.
+_CP_READONLY_VERBS=' cd cat wc head tail grep egrep fgrep rg diff cmp ls stat file shasum sha256sum md5 nl '
+_cp_policy_mention_harmless() {         # raw
+  local raw="$1" seg n=0
+  local tidy
+  # stderr-to-stdout and discard-to-/dev/null write nothing; any other `>` does.
+  tidy="$(printf '%s' "$raw" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
+  case "$tidy" in *$'\n'*|*'`'*|*'$('*|*'<('*|*'>('*|*'>'*) return 1 ;; esac
+  if _cp_simple_words "$raw" ""; then
+    # The interpreter must be the real one by name or absolute system path:
+    # a worker-written `./bash` or `tmp/../bash` is a program, not a parser.
+    case "${#_CP_W[@]}:${_CP_W[0]}:${_CP_W[1]:-}" in
+      3:bash:-n|3:sh:-n|3:zsh:-n|3:dash:-n|3:/bin/bash:-n|3:/bin/sh:-n|3:/bin/zsh:-n|3:/bin/dash:-n)
+        case "${_CP_W[2]}" in -*|*'$'*|*'*'*|*'?'*|*'['*|*'{'*) return 1 ;; esac
+        return 0 ;;
+    esac
+  fi
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
+    n=$((n + 1))
+    case "$seg" in *--output*|*--pre*|*--hostname-bin*) return 1 ;; esac
+    _cp_locate_command_word "$seg" || return 1
+    # A path-form command word is a program the worker may have written
+    # (`./cat`, `/tmp/wt/ls`), not the read-only verb (#171 review MEDIUM).
+    case "${_CP_LOC[0]:-}" in */*) return 1 ;; esac
+    [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$seg" | awk '{print $1}')" ] || return 1
+    case "$_CP_READONLY_VERBS" in *" $_cp_wcmd "*) ;; *) return 1 ;; esac
+  done <<EOF
+$(_cp_coderef_split "$tidy")
+EOF
+  [ "$n" -gt 0 ]
 }

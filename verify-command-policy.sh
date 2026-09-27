@@ -1494,6 +1494,118 @@ check "H1: force via glued redirect" 'git -P> status push -f origin main' escala
 
 
 echo
+echo
+echo "== env NAME=val prefix, bash -n syntax check (F6) =="
+# `env NAME=val … cmd` only sets variables for cmd; `bash -n f` parses and
+# runs nothing. Neither may be reserved for the words it contains — while
+# every real environment dump and every real use of a policy/credential
+# file stays reserved.
+check_reserved   "env PATH=… with an interpreter stays reserved" 'env PATH=/usr/bin:/bin HERDR_WT_DIR=/tmp/x bash verify-spawn-spec-proof.sh'
+check_reserved   "env assignments then a command"          'env HERDR_WT_DIR=/tmp/x HERDR_RUN_STATE_DIR=/tmp/y bash verify-spawn-spec-proof.sh'
+check_reserved   "env two assignments then git"            'env FOO=1 BAR=2 git status'
+check_reserved   "env one assignment then a path command"  'env LC_ALL=C ./run.sh'
+check_reserved   "bare env"                                'env'
+check_reserved   "env -0"                                  'env -0'
+check_reserved   "env piped"                               'env | grep X'
+check_reserved   "env -i with inner env"                   "env -i sh -c 'env'"
+check_reserved   "env -u X cmd (option)"                   'env -u X git status'
+check_reserved   "env -i cmd (option)"                     'env -i git status'
+check_reserved   "env assignment, no command"              'env FOO=1'
+check_reserved   "env assignment then env"                 'env FOO=1 env'
+check_reserved   "env assignment then printenv"            'env FOO=1 printenv'
+check_reserved   "env assignment then PRINTENV"            'env FOO=1 PRINTENV'
+check_reserved   "env assignment, inner sh -c env"         "env FOO=1 sh -c 'env'"
+check_reserved   "assignment before env"                   'FOO=1 env'
+check_reserved   "printenv"                                'printenv'
+check_reserved   "printenv NAME"                           'printenv PATH'
+check_reserved   "env assignment, secret var expanded"     'env X=$GITHUB_TOKEN git status'
+check_reserved   "env assignment, python inline os"        "env A=1 python3 -c 'import os; print(os.environ)'"
+check_unreserved "bash -n on a policy file"                'bash -n lib/command-policy.sh'
+check_unreserved "sh -n on a policy file"                  'sh -n herdr-select.sh'
+check_unreserved "zsh -n on a policy file"                 'zsh -n lib/scoped-policy.sh'
+check_reserved   "bash -n then another command"            'bash -n lib/command-policy.sh; rm x'
+check_reserved   "bash -nv (extra flag)"                   'bash -nv lib/command-policy.sh'
+check_reserved   "bash -n two files"                       'bash -n lib/command-policy.sh herdr-select.sh'
+check_reserved   "bash -n on a credential path"            'bash -n ~/.ssh/id_rsa'
+check_reserved   "bash -n on .env"                         'bash -n .env'
+check_reserved   "bash without -n on a policy file"        'bash lib/command-policy.sh'
+check_reserved   "bash -n via substitution"                'bash -n $(echo lib/command-policy.sh)'
+check_reserved   "env BASH_ENV then an interpreter"        'env BASH_ENV=tmp/evil.sh bash tmp/x.sh'
+check_reserved   "env ENV then sh"                         'env ENV=tmp/evil.sh sh tmp/x.sh'
+check_reserved   "env PATH then an interpreter"            'env PATH=/tmp/evil:/usr/bin bash tmp/x.sh'
+check_reserved   "env PATH then a plain command"           'env PATH=/tmp/evil git status'
+check_reserved   "env PYTHONPATH then python"              'env PYTHONPATH=tmp python3 tmp/x.py'
+check_reserved   "env LD_PRELOAD"                          'env LD_PRELOAD=/tmp/x.so ls'
+check_reserved   "env DYLD_INSERT_LIBRARIES"               'env DYLD_INSERT_LIBRARIES=/tmp/x.dylib ls'
+check_reserved   "env GIT_EXTERNAL_DIFF"                   'env GIT_EXTERNAL_DIFF=/tmp/x git diff'
+check_reserved   "env NODE_OPTIONS"                        'env NODE_OPTIONS=--require=/tmp/x.js node a.js'
+check_reserved   "env with a safe name mixed with PATH"    'env FOO=1 PATH=/tmp/evil bash tmp/x.sh'
+check_reserved   "env value carrying an operator"          'env FOO="1;env" git status'
+check_reserved   "env FOO=1 bash script (safe name)"       'env FOO=1 bash tmp/x.sh'
+check_unreserved "verify-alert-gate.sh is not alert-gate.sh"  'wc -l verify-select-policy.sh verify-alert-gate.sh verify-omp-hooks.sh'
+check_unreserved "my-herdr-select.sh.bak is not the file"  'ls my-herdr-select.sh.bak'
+check_unreserved "wc on policy files"                      'wc -l lib/alert-gate.sh herdr-select.sh'
+check_unreserved "grep in a policy file"                   'grep -n foo herdr-select.sh'
+check_unreserved "cat a policy file into head"             'cat lib/scoped-policy.sh | head -20'
+check_unreserved "cd then grep a policy file"              'cd /wt && grep -n foo lib/command-policy.sh'
+check_unreserved "grep with stderr to /dev/null"           'grep -n foo herdr-select.sh 2>/dev/null'
+check_reserved   "cat a policy file to another file"       'cat herdr-select.sh > /tmp/x'
+check_reserved   "redirect onto a policy file"             'cat /tmp/x > herdr-select.sh'
+check_reserved   "sed -i on a policy file"                 'sed -i s/a/b/ herdr-select.sh'
+check_reserved   "cp onto a policy file"                   'cp /tmp/x herdr-select.sh'
+check_reserved   "tee onto a policy file"                  'tee herdr-select.sh < /tmp/x'
+check_reserved   "read a policy file then something else"  'grep x herdr-select.sh; rm y'
+check_reserved   "rg --pre runs a program"                 'rg --pre=/tmp/x foo herdr-select.sh'
+check_reserved   "sudo cat a policy file"                  'sudo cat herdr-select.sh'
+check_reserved   "a credential path under a read verb"     'cat ~/.ssh/id_rsa'
+check_reserved   "grep in .env"                            'grep x .env'
+check_reserved   "lib/alert-gate.sh edited via python"     'python3 -c "open(\"lib/alert-gate.sh\",\"w\")"'
+check_reserved   "git add of a policy file (no grant here)" 'git add lib/command-policy.sh'
+check_reserved   "env GCONV_PATH (loads shared objects)"   'env GCONV_PATH=/tmp/x iconv -l'
+check_reserved   "env HERDR_BRIDGE_ENV (a sourced file)"   'env HERDR_BRIDGE_ENV=/tmp/bridge-cfg git status'
+check_reserved   "a /dev/null look-alike redirect target"  'cat herdr-select.sh 2>/dev/null.bak'
+check_reserved   "a path under /dev/null/.. is a real write" 'cat herdr-select.sh >/dev/null/../x'
+check_reserved   "env then xargs env"                      'env X=v xargs env'
+check_reserved   "env then sh -c env"                      "env X=v sh -c env"
+# #171 review round 1: env prints the whole environment when no command
+# follows its assignments, and every `=` word is an assignment.
+check_reserved   "env value with a quoted space"           'env FOO="a b"'
+check_reserved   "env value with a single-quoted space"    "env FOO='a b'"
+check_reserved   "env value with an escaped space"         'env FOO=a\ b'
+check_reserved   "env quoted assignment word"              'env FOO=1 "X Y=z"'
+check_reserved   "env non-identifier name"                 'env FOO=1 X.Y=z'
+check_reserved   "env numeric name"                        'env FOO=1 1=2'
+check_reserved   "env dashed name"                         'env FOO=1 a-b=c'
+check_reserved   "usr-bin env non-identifier name"         '/usr/bin/env FOO=1 X.Y=z'
+check_reserved   "env then an fd redirection"              'env FOO=1 2>&1'
+check_reserved   "env then stderr to /dev/null"            'env FOO=1 2>/dev/null'
+check_reserved   "env then a comment"                      'env FOO=1 # git status'
+check_reserved   "env then a brace assignment"             'env FOO=1 {a,b}=c'
+check_reserved   "env then a glob assignment"              'env FOO=1 *=x'
+check_reserved   "env then an empty expansion"             'env FOO=1 $NOPE'
+check_reserved   "env BASH_FUNC import"                    "env A=1 'BASH_FUNC_git%%=() { sh x; }' bash -c 'git status'"
+check_reserved   "fake command word before PATH"           'env FOO="a b" PATH=/tmp/evil git status'
+check_reserved   "non-identifier word before PATH"         'env A=1 X.Y=1 PATH=/tmp/e git status'
+check_reserved   "fake command word before LD_PRELOAD"     'env FOO="a b" LD_PRELOAD=/tmp/x.so ls'
+check_reserved   "fake command word before BASH_ENV"       'env FOO="a b" BASH_ENV=x bash y'
+check_reserved   "cd then env prefix then git"             'cd /wt && env FOO=1 git status'
+check_reserved   "a worker program named cat"              '/tmp/wt/cat lib/command-policy.sh'
+check_reserved   "a worker program named ls"               './ls herdr-select.sh'
+check_reserved   "a worker program named bash with -n"     './bash -n herdr-select.sh'
+check_reserved   "a dot-dot path to bash with -n"          'tmp/../bash -n herdr-select.sh'
+check_unreserved "absolute system bash -n"                 '/bin/bash -n herdr-select.sh'
+check_reserved   "rg --hostname-bin runs a program"        'rg --hostname-bin=/tmp/evil --hyperlink-format=default foo herdr-select.sh'
+# #171 review rounds 1-2: the env-prefix loosening was PARKED (two
+# Critical-class misses); env behaves exactly as on main. These cases stay as
+# regression evidence that every probed form is still a reservation.
+check_reserved   "env prefix then sh -c 'env;:'"           "env A=1 sh -c 'env;:'"
+check_reserved   "env prefix then sh -c 'env&'"            "env A=1 sh -c 'env&'"
+check_reserved   "env prefix then bash -c 'const;env'"     "env A=1 bash -c 'const;env'"
+check_reserved   "env prefix then sh -c 'env|cat'"         "env A=1 sh -c 'env|cat'"
+check_reserved   "env prefix then sh -c 'x=(env)'"         "env A=1 sh -c 'x=(env)'"
+check_reserved   "cd, env prefix, sh -c 'env;:'"           "cd /wt && env A=1 sh -c 'env;:'"
+check_reserved   "env prefix then git log --format"        "env A=1 git log --format='%h;%s'"
+
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
