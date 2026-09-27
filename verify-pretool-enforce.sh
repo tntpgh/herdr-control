@@ -378,8 +378,11 @@ if command -v bun >/dev/null 2>&1; then
   cold="$work/cold/runs"; mkdir -p "$cold"; sqlite3 "$(registry_db)" ".backup '$cold/registry.sqlite3'"
   [ ! -e "$cold/registry.sqlite3-shm" ] && [ "$(HERDR_RUN_STATE_DIR="$cold" run_hook "$here" | jq -r '.[1].r')" = BLOCK ] \
     && ok "row-only enforcement holds on a WAL registry with no -wal/-shm files" || not_ok "cold WAL registry read failed open"
+  # Count on the SOURCE: any connection to the copy would create its
+  # -wal/-shm files and hide the cold-open failure this case exists for.
+  t_before="$(q "SELECT count(*) FROM events WHERE type='action_form_served';")"
   cold2="$work/cold2/runs"; mkdir -p "$cold2"; sqlite3 "$(registry_db)" ".backup '$cold2/registry.sqlite3'"
-  t_before="$(sqlite3 "$cold2/registry.sqlite3" "SELECT count(*) FROM events WHERE type='action_form_served';")"
+  [ ! -e "$cold2/registry.sqlite3-shm" ] || not_ok "the cold2 copy unexpectedly has a -shm file"
   HERDR_RUN_STATE_DIR="$cold2" HERDR_ACTION_STALE_S=0 bash "$here/herdr-action.sh" tick
   [ "$(sqlite3 "$cold2/registry.sqlite3" "SELECT count(*) FROM events WHERE type='action_form_served';")" -gt "$t_before" ] \
     && ok "the hub tick is not skipped on a WAL registry with no -wal/-shm files" || not_ok "tick skipped on a cold registry"
