@@ -491,9 +491,13 @@ cp tmp/evil.sh tmp/*an.sh; bash tmp/clean.sh
 bash tmp/clean.sh >> tmp/clea?.sh
 bash tmp/clean.sh | tee tmp/clean.s?
 git pull && bash tmp/clean.sh
+git diff --output=tmp/x && bash tmp/clean.sh
+git -c diff.external=x diff && bash tmp/clean.sh
+git stash && bash tmp/clean.sh
 EOF
 for form in "bash tmp/clean.sh" "bash tmp/clean.sh 2>&1 | tail -3" "bash tmp/clean.sh && echo done" \
-            "bash tmp/clean.sh > /tmp/out.txt" "bash tmp/clean.sh | grep hello | wc -l"; do
+            "bash tmp/clean.sh > /tmp/out.txt" "bash tmp/clean.sh | grep hello | wc -l" \
+            "bash tmp/clean.sh && git status" "git log --oneline -3 && bash tmp/clean.sh"; do
   out="$(_cp_code_ref "cd $CRWT && $form" "$CRWT")"; rc=$?
   [ "$rc" = 0 ] && [ "$out" = "shell	$CRWT/tmp/clean.sh" ] \
     && ok "read-only company keeps a plain binding: $form" || bad "over-block: rc=$rc '$out': $form"

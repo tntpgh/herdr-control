@@ -1322,6 +1322,19 @@ EOF
         _cp_cr_runners=$((_cp_cr_runners + 1)) ;;
       *)
         case "${_CP_LOC[0]:-}" in */*) _cp_cr_runners=$((_cp_cr_runners + 1)); continue ;; esac
+        # Read-only git subcommands cannot rewrite a worktree file (#167
+        # review, MEDIUM over-block). Checked on argv[1] exactly, so a global
+        # option (`git -c diff.external=… diff`) or any other subcommand
+        # (pull, checkout, reset, stash, merge, rebase, …) stays unsafe, as
+        # does an output file (`--output`, `-o`) or `--ext-diff`.
+        if [ "$_cp_wcmd" = git ]; then
+          case "${_CP_LOC[1]:-}" in
+            status|log|diff|show|branch|rev-parse|remote)
+              case " ${_CP_LOC[*]:2} " in *' --output'*|*' -o '*|*' --ext-diff'*) return 0 ;; esac
+              continue ;;
+          esac
+          return 0
+        fi
         case "$_CP_CODEREF_SAFE_VERBS" in *" $_cp_wcmd "*) ;; *) return 0 ;; esac ;;
     esac
   done <<EOF
