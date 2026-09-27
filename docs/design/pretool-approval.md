@@ -79,7 +79,10 @@ cutover (`tools.approval.<tool>: deny`), with the hook as the backstop.
 | `read`, `grep`, `glob`, `find`, `ast_grep` | allow + credential check | allow; `reserved` when the path matches the reserved list's **credential** class (`conductor_reserved_reason "cat -- <path>"`, only its `credential-value` answer is used — its policy-filename rules are about editing and would reserve reading, backlog iii); `ssh://` → block |
 | `read` of `http(s)://`, `web_search` | allow | allow (a GET; same as today — `net_read` is not manifest-enforced for these, see §7) |
 | internal URLs (`skill://`, `rule://`, `artifact://`, `agent://`, `history://`, `pr://`, `issue://`, `local://`, `mcp://`) | allow | allow |
-| `todo`, `wait`, `ask`, `checkpoint`, `rewind`, `hub`, `resolve`, `security_scan`, `new_context`, `context_notes`, job observers | allow | allow |
+| `hub` | split by `op` | `wait`/`inbox`/`list`/`jobs`/`logs`/`cancel`/`stop`/`send` allow; `start`/`restart` launch a program, so `application` + `args` are judged by peer_decide like a bash command (a service `env` escalates); any other op escalates |
+| `write proc://<job>` | verdict | the text written to a job's stdin is judged as a command |
+| `write` to any other URL scheme | escalate | except `agent://`, `local://`, `file://` (#159 containment) and `xd://` (device table); schemes are matched case-insensitively (`Xd://` is `xd://`) |
+| `todo`, `wait`, `ask`, `checkpoint`, `rewind`, `resolve`, `security_scan`, `new_context`, `context_notes`, job observers | allow | allow |
 | `learn` | conductor (q4) | escalate → an action request routed to the conductor; the lesson is saved only after review |
 | `retain`, `recall`, `reflect`, `report_issue` | allow | allow (omp memory, not a host action) |
 | read-only devices: `fleet_status`, `pr_ready`, `handoff_debt`, `single_copy_scan`, `worktree_debt`, `suite_wired`, `decisions_open`, `project_status`, `notepad_read`, `notepad_stats` | allow | allow |
@@ -362,6 +365,41 @@ Nothing here runs for a task spawned without the flag.
   human authority; an expired form is recorded as `action_form_expired` and
   re-served — never a decline. `lib/reconcile.sh` reports `action_requested` to
   the owning conductor at session start.
+- **Review round 1 (2026-09-27, two independent reviewers) and what changed**:
+  - *Self-approval*: a worker's allowed bash could UPDATE `action_requests`,
+    forge a form record, or edit the gate files (`lib/pretool-shadow.sh`,
+    `lib/action-request.sh`, `herdr-action.sh`, the hook, the overlay). Now
+    `lib/hook-approval-rules.tsv` joins the ONE policy through its operator-rule
+    channel (tighten-only; a match is human-only) for hook workers and shadow;
+    enforce refuses when the rules file is missing. A grant is consumed only if
+    its authority could have made it (human for a human-only request;
+    conductor only for a conductor-route request). A human decision counts only
+    from the formserve record pinned when the hub served that request's form.
+  - *Script swap*: a grant now folds the sha256 of any script the command
+    runs (code_ref_inspect; an explicit tool `cwd` resolves relative scripts);
+    a rewritten script no longer matches. A script that cannot be resolved,
+    or that runs other local files, is refused with no request.
+  - *Hidden cwd/env*: the review text is `(in <cwd>) <command>` plus
+    `[env] …`; a bash call that sets a service env escalates.
+  - *`hub start`* ran any program unjudged — now judged as a command (above).
+  - *Mixed-case schemes* (`Xd://secret_present`) and `file://` reads bypassed
+    the table — schemes are lowercased; `file://` is decoded; a glob pattern is
+    judged as a path (a grep pattern is not).
+  - *Installed hook*: `--approval hook` refuses unless the extension omp will
+    load resolves to this checkout's hook and carries
+    `HERDR_HOOK_APPROVAL_PROTOCOL = 1`; the worker gets `HERDR_CONTROL_DIR`
+    pinned to that checkout.
+  - *Slack*: the post carries the request id, tool and verdict only; the
+    command stays on the hub form (a webhook path is a secret no redactor
+    knows).
+  - A menu worker whose registry read fails reads once, then relies on the
+    env signal only.
+  - Residual, stated (rule 7): a same-uid process can still write the registry
+    or a form record by means the text rules do not recognise (obfuscated
+    paths, a script whose bytes the rules cannot read); `hub send` types a
+    message into another pane; `read http(s)://` and `web_search` stay
+    unscoped (q3); a bash call's persistent-shell cwd is not what the grant
+    binds when the call names no `cwd`.
 - **Differences from §4's sketch**: request state lives in an `action_requests`
   table (events alone cannot do an atomic one-shot consume); the Slack/form half
   runs in the hub, not the worker, because a `--no-secrets` worker has no Slack

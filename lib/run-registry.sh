@@ -355,7 +355,8 @@ _migrate_schema_v6() {
       decision_reason TEXT NOT NULL DEFAULT '',
       consumed_at     TEXT,
       surfaced_at     TEXT,
-      form_path       TEXT NOT NULL DEFAULT ''
+      form_path       TEXT NOT NULL DEFAULT '',
+      form_record     TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS action_requests_by_task ON action_requests(task_id, action_sha256, created_at);
     CREATE INDEX IF NOT EXISTS action_requests_pending ON action_requests(status) WHERE status='pending';" >/dev/null 2>&1

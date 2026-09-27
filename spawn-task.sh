@@ -222,6 +222,16 @@ case "$approval_req" in
     [ "$eff_posture" = write ] || { echo "spawn-task: --approval hook requires the write posture floor (effective: $eff_posture) — refusing rather than loosening or re-interpreting it" >&2; exit 2; }
     worker_overlay="$here/agent-hooks/omp-worker-overlay.yml"
     [ -r "$worker_overlay" ] || { echo "spawn-task: --approval hook: worker overlay missing ($worker_overlay)" >&2; exit 2; }
+    # --auto-approve is only safe if the extension omp will load at session
+    # start IS this checkout's enforcing hook: otherwise (an older main
+    # checkout, a missing or foreign symlink) the worker runs with no judge.
+    omp_ext="${HERDR_OMP_EXTENSION:-$HOME/.omp/agent/extensions/herdr-control.ts}"
+    omp_ext_real="$(cd "$(dirname "$omp_ext")" 2>/dev/null && python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$omp_ext" 2>/dev/null)"
+    here_hook="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$here/agent-hooks/omp-herdr-control.ts" 2>/dev/null)"
+    if [ -z "$omp_ext_real" ] || [ "$omp_ext_real" != "$here_hook" ] || ! grep -q 'HERDR_HOOK_APPROVAL_PROTOCOL = 1' "$omp_ext_real" 2>/dev/null; then
+      echo "spawn-task: --approval hook: omp would load ${omp_ext_real:-<no extension>} at session start, not this checkout's enforcing hook ($here_hook) — refusing an --auto-approve worker with no judge" >&2
+      exit 2
+    fi
     case "$cli" in
       *" --approval-mode write") cli="${cli% --approval-mode write} --auto-approve --config $(printf '%q' "$worker_overlay")" ;;
       *) echo "spawn-task: --approval hook: could not find the write-floor approval flag in the launch line; refusing" >&2; exit 2 ;;
@@ -667,7 +677,7 @@ true
 #     re-deriving from a possibly different tree — only when one resolved.
 stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_PANE_ID=%q HERDR_TASK_LABEL=%q HERDR_POSTURE_FLOOR=%q' \
   "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$eff_posture")
-[ "$approval_req" = hook ] && stamped_cli="$stamped_cli HERDR_APPROVAL=hook"
+[ "$approval_req" = hook ] && stamped_cli="$stamped_cli HERDR_APPROVAL=hook $(printf 'HERDR_CONTROL_DIR=%q' "$here")"
 [ -n "${HERDR_POLICY_EXTRA_RULES:-}" ] && stamped_cli="$stamped_cli $(printf 'HERDR_POLICY_EXTRA_RULES=%q' "$HERDR_POLICY_EXTRA_RULES")"
 [ -n "$CANONICAL_RULES_SRC" ] && stamped_cli="$stamped_cli $(printf 'HERDR_CANONICAL_RULES=%q' "$CANONICAL_RULES_SRC")"
 # The op prelude runs FIRST (lib/op-env.sh): a worker that has to hunt for a

@@ -922,7 +922,11 @@ function recordShadowVerdict(event: unknown, ctx: unknown, result: Block | undef
 // consumed; deny/block is refused. Any failure here — a missing lib, a
 // timeout, garbage output, an exception — BLOCKS: fail closed.
 const LOAD_APPROVAL_ENV = process.env.HERDR_APPROVAL?.trim() ?? "";
+// spawn-task.sh --approval hook refuses unless the extension omp will load
+// carries this marker (an older hook would leave --auto-approve unjudged).
+export const HERDR_HOOK_APPROVAL_PROTOCOL = 1;
 let registryApproval: "hook" | "menu" | undefined; // cached once the registry answers
+let registryApprovalReadFailed = false; // one failed sync read per session, then the env signal only
 
 const APPROVAL_READ_ARGS = ["-c", '. "$1" && read_task "$2" "$3"', "herdr-approval", RUN_REGISTRY_SH, WORKER_RUN_ID, WORKER_TASK_ID];
 
@@ -969,12 +973,15 @@ prefetchRegistryApproval();
 
 function readRegistryApproval(): "hook" | "menu" | undefined {
   if (registryApproval) return registryApproval;
-  if (!WORKER_RUN_ID || !safeExists(RUN_REGISTRY_SH)) return undefined;
+  if (registryApprovalReadFailed || !WORKER_RUN_ID || !safeExists(RUN_REGISTRY_SH)) return undefined;
   const r = spawnSync("bash", APPROVAL_READ_ARGS, {
     encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "pipe"], env: approvalReadEnv(),
   });
-  if (r.error || r.status !== 0) return undefined;
-  registryApproval = parseApprovalRow(r.stdout ?? "");
+  registryApproval = r.error || r.status !== 0 ? undefined : parseApprovalRow(r.stdout ?? "");
+  // A menu worker must not pay a synchronous registry read on every call while
+  // the registry is unhealthy; a hook worker still fails closed through
+  // HERDR_APPROVAL=hook (and lib/pretool-shadow.sh reads the row itself).
+  if (!registryApproval) registryApprovalReadFailed = true;
   return registryApproval;
 }
 

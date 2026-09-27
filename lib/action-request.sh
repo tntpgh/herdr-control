@@ -47,7 +47,7 @@ _ar_row() {                             # request_id -> json row (empty if absen
       'grant_kind',grant_kind,'code_path',code_path,'code_sha256',code_sha256,'status',status,
       'created_at',created_at,'decided_at',decided_at,'decided_by',decided_by,'authority',authority,
       'review_category',review_category,'decision_reason',decision_reason,'consumed_at',consumed_at,
-      'surfaced_at',surfaced_at,'form_path',form_path)
+      'surfaced_at',surfaced_at,'form_path',form_path,'form_record',form_record)
     FROM action_requests WHERE request_id=$(_sq "$1");" 2>/dev/null
 }
 action_request_get() { _ar_row "$1"; }
@@ -104,7 +104,16 @@ action_request_resolve() {              # run task tool action_sha command verdi
     st="$(printf '%s' "$row" | jq -r '.status')"; id="$(printf '%s' "$row" | jq -r '.request_id')"
     case "$st" in
       approved)
-        if [ "$(printf '%s' "$row" | jq -r '.grant_kind')" = once ] && action_grant_consume "$id"; then
+        # Consume only a decision whose authority could have made it: a
+        # human-route request needs a human decision; a conductor decision
+        # counts only if the request was, and still is, conductor-route.
+        local auth rroute okauth=0
+        auth="$(printf '%s' "$row" | jq -r '.authority')"; rroute="$(printf '%s' "$row" | jq -r '.route')"
+        case "$auth" in
+          human) okauth=1 ;;
+          conductor) [ "$rroute" = conductor ] && [ "$8" = conductor ] && okauth=1 ;;
+        esac
+        if [ "$okauth" = 1 ] && [ "$(printf '%s' "$row" | jq -r '.grant_kind')" = once ] && action_grant_consume "$id"; then
           AR_DECISION=allow AR_REQUEST_ID="$id" AR_STATE=consumed
           append_event "$run" "$task" action_consumed "$(jq -nc --arg id "$id" '{request_id:$id}')" \
             "actcons_${id}" >/dev/null 2>&1 || true

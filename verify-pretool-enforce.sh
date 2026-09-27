@@ -88,7 +88,7 @@ rid="$(printf '%s' "$out" | field request_id)"
   && ok "escalate: blocked, request $rid, told it went to the conductor" || not_ok "escalate: rc=$rc $out"
 [ "$(q "SELECT route||'/'||grant_kind||'/'||status FROM action_requests WHERE request_id='$rid';")" = conductor/once/pending ] \
   && ok "request row: conductor / once / pending" || not_ok "row: $(q "SELECT * FROM action_requests WHERE request_id='$rid';")"
-[ "$(q "SELECT command FROM action_requests WHERE request_id='$rid';")" = "$ESC" ] && ok "the reviewer sees the exact command" || not_ok "command text wrong"
+[ "$(q "SELECT command FROM action_requests WHERE request_id='$rid';")" = "(in $wt) $ESC" ] && ok "the reviewer sees the exact command and where it runs" || not_ok "command text wrong: $(q "SELECT command FROM action_requests WHERE request_id='$rid';")"
 [ "$(q "SELECT count(*) FROM events WHERE type='action_requested' AND json_extract(payload,'\$.request_id')='$rid';")" = 1 ] \
   && ok "action_requested event recorded" || not_ok "no action_requested event"
 out="$(bashc "$ESC" 'second try, rephrased intent')"
@@ -127,8 +127,8 @@ rid2="$(printf '%s' "$out" | field request_id)"
 printf '== parallel: identical calls make one request; one grant runs once ==\n'
 PAR='chmod -R go-w tmp/par'
 for k in 1 2 3 4 5 6; do bashc "$PAR" "p$k" > "$work/par$k" & done; wait
-[ "$(q "SELECT count(*) FROM action_requests WHERE command='$PAR';")" = 1 ] && ok "6 parallel identical calls -> 1 request row" || not_ok "parallel rows: $(q "SELECT count(*) FROM action_requests WHERE command='$PAR';")"
-prid="$(q "SELECT request_id FROM action_requests WHERE command='$PAR';")"
+[ "$(q "SELECT count(*) FROM action_requests WHERE command LIKE '%) $PAR';")" = 1 ] && ok "6 parallel identical calls -> 1 request row" || not_ok "parallel rows: $(q "SELECT count(*) FROM action_requests WHERE command LIKE '%) $PAR';")"
+prid="$(q "SELECT request_id FROM action_requests WHERE command LIKE '%) $PAR';")"
 HERDR_PANE_ID="$CPANE" act approve "$prid" --authority conductor --review-category local-build --review-reason par >/dev/null
 for k in 1 2 3 4 5 6; do bashc "$PAR" "r$k" > "$work/rr$k" & done; wait
 n="$(cat "$work"/rr? | jq -r .decision | grep -c '^allow$')"
@@ -141,10 +141,19 @@ HERDR_PANE_ID="$CPANE" act decline "$rid3" --authority conductor --review-reason
 out="$(bashc "$DEC" 'again')"
 printf '%s' "$out" | grep -q "DECLINED (conductor): use a narrower mode" && [ "$(printf '%s' "$out" | field decision)" = block ] \
   && ok "re-issue after decline: blocked with the reviewer's reason" || not_ok "decline: $out"
-[ "$(q "SELECT count(*) FROM action_requests WHERE command='$DEC';")" = 1 ] && ok "no new request after a decline" || not_ok "decline re-requested"
+[ "$(q "SELECT count(*) FROM action_requests WHERE command LIKE '%) $DEC';")" = 1 ] && ok "no new request after a decline" || not_ok "decline re-requested"
 grep -q "\[HERDR-ACTION\] $rid3 DECLINED" "$work/sent" && ok "worker told it was declined" || not_ok "decline not sent"
 
-printf '== reserved: human only, through an answered hub form ==\n'
+printf '== reserved: human only, through the hub form served for it ==\n'
+pin_form() {                             # request_id -> pinned formserve record id (tick serves, next tick pins)
+  q "UPDATE action_requests SET route='human' WHERE request_id='$1';" >/dev/null
+  bash "$here/herdr-action.sh" tick; bash "$here/herdr-action.sh" tick
+  q "SELECT form_record FROM action_requests WHERE request_id='$1';"
+}
+answer_form() {                          # record-id request-id decision
+  local f="$HERDR_STATE_ROOT/forms/$1.json"
+  jq -c --arg id "$2" --arg d "$3" '.status="answered" | .answers={request_id:$id, decision:$d, reason:"ok"}' "$f" > "$f.t" && mv "$f.t" "$f"
+}
 RES='gh pr merge 7 --squash'
 out="$(bashc "$RES")"; hrid="$(printf '%s' "$out" | field request_id)"
 printf '%s' "$out" | grep -q "human-only: requested as $hrid" && ok "reserved -> human request $hrid" || not_ok "reserved: $out"
@@ -152,22 +161,47 @@ HERDR_PANE_ID="$CPANE" act approve "$hrid" --authority conductor --review-catego
 [ "$rc" = 8 ] && ok "conductor cannot approve a human-only request" || not_ok "conductor approved reserved rc=$rc"
 act approve "$hrid" --authority human >/dev/null 2>&1; rc=$?
 [ "$rc" = 8 ] && ok "bare --authority human (no form): refused" || not_ok "bare human rc=$rc"
-jq -nc --arg id "$hrid" '{status:"open", answers:{request_id:$id, decision:"approve"}}' > "$HERDR_STATE_ROOT/forms/F1.json"
-act approve "$hrid" --authority human --form F1 >/dev/null 2>&1; rc=$?
-[ "$rc" = 8 ] && ok "an OPEN (unanswered) form is not an approval" || not_ok "open form rc=$rc"
-jq -nc '{status:"answered", answers:{request_id:"ar_other", decision:"approve"}}' > "$HERDR_STATE_ROOT/forms/F2.json"
-act approve "$hrid" --authority human --form F2 >/dev/null 2>&1; rc=$?
-[ "$rc" = 8 ] && ok "a form answered for ANOTHER request is refused" || not_ok "wrong-request form rc=$rc"
-jq -nc --arg id "$hrid" '{status:"answered", answers:{request_id:$id, decision:"decline"}}' > "$HERDR_STATE_ROOT/forms/F3.json"
-act approve "$hrid" --authority human --form F3 >/dev/null 2>&1; rc=$?
+jq -nc --arg id "$hrid" '{status:"answered", answers:{request_id:$id, decision:"approve"}}' > "$HERDR_STATE_ROOT/forms/FORGED.json"
+act approve "$hrid" --authority human --form FORGED >/dev/null 2>&1; rc=$?
+[ "$rc" = 8 ] && ok "an answered record that is not the form served for it: refused" || not_ok "forged form rc=$rc"
+fid="$(pin_form "$hrid")"
+[ -n "$fid" ] && ok "the tick served a form and pinned its record ($fid)" || not_ok "no pinned form record"
+act approve "$hrid" --authority human --form "$fid" >/dev/null 2>&1; rc=$?
+[ "$rc" = 8 ] && ok "the pinned form while still OPEN is not an approval" || not_ok "open form rc=$rc"
+answer_form "$fid" ar_other approve
+act approve "$hrid" --authority human --form "$fid" >/dev/null 2>&1; rc=$?
+[ "$rc" = 8 ] && ok "the pinned form answered for ANOTHER request: refused" || not_ok "wrong-request form rc=$rc"
+answer_form "$fid" "$hrid" decline
+act approve "$hrid" --authority human --form "$fid" >/dev/null 2>&1; rc=$?
 [ "$rc" = 8 ] && ok "a form that says decline cannot approve" || not_ok "decline-form approve rc=$rc"
-act approve "$hrid" --authority human --form ../F3 >/dev/null 2>&1; rc=$?
-[ "$rc" = 8 ] && ok "a form id with a path is refused" || not_ok "path form id rc=$rc"
-jq -nc --arg id "$hrid" '{status:"answered", answers:{request_id:$id, decision:"approve", reason:"ship it"}}' > "$HERDR_STATE_ROOT/forms/F4.json"
-act approve "$hrid" --authority human --form F4 >/dev/null; rc=$?
+answer_form "$fid" "$hrid" approve
+act approve "$hrid" --authority human --form "$fid" >/dev/null; rc=$?
 [ "$rc" = 0 ] && [ "$(q "SELECT status||'/'||authority FROM action_requests WHERE request_id='$hrid';")" = approved/human ] \
-  && ok "an answered form for exactly this request approves (authority human)" || not_ok "human approve rc=$rc"
+  && ok "the pinned form answered approve for exactly this request approves (authority human)" || not_ok "human approve rc=$rc"
 [ "$(bashc "$RES" | field decision)" = allow ] && ok "the reserved call runs once after the human's yes" || not_ok "human grant not consumed"
+
+printf '== a decision that did not come from the right authority is never consumed ==\n'
+FORGE='gh pr merge 8 --squash'
+frid="$(bashc "$FORGE" | field request_id)"
+q "UPDATE action_requests SET status='approved' WHERE request_id='$frid';"
+[ "$(bashc "$FORGE" | field decision)" = block ] && ok "status=approved with no authority: not consumed" || not_ok "authority-less approval consumed"
+frid2="$(q "SELECT request_id FROM action_requests WHERE command LIKE '%$FORGE' AND status='pending';")"
+q "UPDATE action_requests SET status='approved', authority='conductor' WHERE request_id='$frid2';"
+[ "$(bashc "$FORGE" | field decision)" = block ] && ok "a conductor decision on a human-only request: not consumed" || not_ok "conductor decision consumed for reserved"
+
+printf '== the worker cannot approve itself through bash (hook-approval rules) ==\n'
+for c in "sqlite3 $HERDR_RUN_STATE_DIR/registry.sqlite3 \"UPDATE action_requests SET status='approved'\"" \
+         "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 .dump" \
+         "jq -n '{status:1}' > ~/.local/state/herdr/forms/F9.json" \
+         "printf x >> $here/lib/action-request.sh" \
+         "sed -i '' s/a/b/ $here/lib/pretool-shadow.sh" \
+         "bash $here/herdr-action.sh approve ar_x --authority conductor --review-category local-read --review-reason y" \
+         "cp tmp/x.ts ~/.omp/agent/extensions/y.ts" \
+         "python3 -c \"import sqlite3; sqlite3.connect('r').execute('update approvals set x=1')\""; do
+  v="$(bashc "$c" | field verdict)"
+  [ "$v" = reserved ] && ok "reserved: ${c:0:70}" || not_ok "not reserved ($v): $c"
+done
+[ "$(bashc 'git diff --stat' | field decision)" = allow ] && ok "ordinary git still runs" || not_ok "rules over-reach"
 
 printf '== code by reference: approval binds to the file sha, re-runs, re-escalates on edit ==\n'
 printf '#!/bin/bash\nchmod -R u+rw tmp/probe\n' > "$wt/tmp/esc.sh"
@@ -181,6 +215,53 @@ a1="$(bashc "$CR" | field decision)"; a2="$(bashc "$CR" | field decision)"
 [ "$a1/$a2" = allow/allow ] && ok "the same bytes re-run without review (twice)" || not_ok "file re-run: $a1/$a2"
 printf '#!/bin/bash\nchmod -R u+rwx tmp/probe\n' > "$wt/tmp/esc.sh"
 [ "$(bashc "$CR" | field decision)" = block ] && ok "an edited file escalates again" || not_ok "edited file ran"
+
+printf '== grants bind the script bytes a command runs ==\n'
+printf '#!/bin/bash\necho harmless\n' > "$wt/tmp/s3.sh"
+SW="cd $wt && chmod -R u+rw tmp/probe && bash tmp/s3.sh"
+swid="$(bashc "$SW" | field request_id)"
+HERDR_PANE_ID="$CPANE" act approve "$swid" --authority conductor --review-category local-build --review-reason ok >/dev/null
+printf '#!/bin/bash\ngh pr merge 7 --squash\n' > "$wt/tmp/s3.sh"
+out="$(bashc "$SW")"
+[ "$(printf '%s' "$out" | field decision)" = block ] && [ "$(q "SELECT status FROM action_requests WHERE request_id='$swid';")" = approved ] \
+  && ok "script rewritten after approval: the grant does not match, nothing consumed" || not_ok "script swap ran: $out"
+printf '#!/bin/bash\necho harmless\n' > "$wt/tmp/s3.sh"
+[ "$(bashc "$SW" | field decision)" = allow ] && ok "…the reviewed bytes still run once" || not_ok "reviewed bytes blocked"
+out="$(bashc 'bash tmp/missing.sh')"; rc=$?
+[ "$rc" = 8 ] && [ -z "$(printf '%s' "$out" | field request_id)" ] && printf '%s' "$out" | grep -q 'cannot be resolved for review' \
+  && ok "unresolvable script: refused with guidance, no request to approve" || not_ok "unresolvable: $out"
+printf '#!/bin/bash\nchmod -R u+rw tmp/probe\n' > "$wt/tmp/cw.sh"
+out="$(enf bash "$(jq -nc --arg w "$wt" '{command:"bash tmp/cw.sh", cwd:$w}')")"
+[ -n "$(printf '%s' "$out" | field request_id)" ] && ok "a relative script with an explicit tool cwd resolves and is requestable" || not_ok "cwd script: $out"
+
+printf '== the reviewer sees what the grant binds (cwd, env) ==\n'
+out="$(enf bash "$(jq -nc '{command:"git status --short", cwd:"/tmp", env:{GIT_CONFIG_COUNT:"1"}}')")"
+erid="$(printf '%s' "$out" | field request_id)"
+[ "$(printf '%s' "$out" | field verdict)" = escalate ] && ok "a bash call with a service env escalates" || not_ok "env: $out"
+cmdtxt="$(q "SELECT command FROM action_requests WHERE request_id='$erid';")"
+printf '%s' "$cmdtxt" | grep -q '^(in /tmp) git status --short' && printf '%s' "$cmdtxt" | grep -q '\[env\] GIT_CONFIG_COUNT=1' \
+  && ok "request text shows the cwd and the env" || not_ok "request text: $cmdtxt"
+
+printf '== every tool that can run a program is judged ==\n'
+hub() { enf hub "$1"; }
+[ "$(hub '{"op":"start","name":"x","application":"bash","args":["-c","gh pr merge 7 --squash --admin"]}' | field verdict)" = reserved ] \
+  && ok "hub start bash -c <reserved> is reserved" || not_ok "hub start reserved not caught"
+[ "$(hub '{"op":"start","name":"x","application":"python3","args":["-m","http.server","8123"]}' | field decision)" = allow ] \
+  && ok "hub start of an allow-class program runs" || not_ok "hub start benign blocked"
+[ "$(hub '{"op":"wait"}' | field decision)" = allow ] && ok "hub wait runs" || not_ok "hub wait blocked"
+[ "$(hub '{"op":"brand_new"}' | field verdict)" = escalate ] && ok "unknown hub op escalates" || not_ok "unknown hub op"
+[ "$(enf write '{"path":"proc://bg_1","content":"gh pr merge 7 --squash"}' | field verdict)" = reserved ] \
+  && ok "text written to a job's stdin is judged as a command" || not_ok "proc stdin unjudged"
+for pth in 'Xd://secret_present' 'xD://browser' 'XD://memory_edit'; do
+  v="$(enf write "$(jq -nc --arg p "$pth" '{path:$p, content:"{}"}')" | field decision)"
+  [ "$v" = block ] && ok "mixed-case scheme $pth is still judged" || not_ok "$pth ran ($v)"
+done
+[ "$(enf write '{"path":"Xd://brand_new_device","content":"{}"}' | field verdict)" = escalate ] && ok "unknown device via Xd:// escalates" || not_ok "Xd unknown device"
+[ "$(enf write '{"path":"weird://x","content":"{}"}' | field verdict)" = escalate ] && ok "write to an unknown URL scheme escalates" || not_ok "unknown scheme write"
+[ "$(enf read '{"path":"FILE:///Users/x/.ssh/id_rsa"}' | field verdict)" = reserved ] && ok "read FILE:// of a credential path is reserved" || not_ok "file:// read"
+[ "$(enf read '{"path":"SSH://host/etc/passwd"}' | field decision)" = block ] && ok "SSH:// read blocked" || not_ok "SSH read"
+[ "$(enf glob '{"pattern":"*","path":"~/.ssh"}' | field verdict)" = reserved ] && ok "glob over a credential directory is reserved" || not_ok "glob .ssh"
+[ "$(enf grep '{"pattern":".env","path":"src"}' | field decision)" = allow ] && ok "a grep PATTERN is not judged as a path" || not_ok "grep pattern FP"
 
 printf '== learn goes to the conductor (q4) ==\n'
 out="$(enf learn '{"memory":"lesson text","i":"x"}')"
@@ -201,6 +282,7 @@ out="$(HERDR_RUN_STATE_DIR="$work/nd/runs" bashc ls)"; rc=$?
 [ "$rc" = 8 ] && ok "unreadable registry: refused" || not_ok "unreadable rc=$rc"
 
 printf '== surfacing and the hub tick ==\n'
+rid2="$(bashc 'chmod -R u+rw tmp/surf' | field request_id)"
 : > "$work/sent"
 bash "$here/herdr-action.sh" surface "$rid2"; bash "$here/herdr-action.sh" surface "$rid2"
 [ "$(grep -c "^$CPANE \[HERDR-ACTION\].*$rid2" "$work/sent")" = 1 ] && ok "surface wakes the conductor pane exactly once" || not_ok "surface sends: $(cat "$work/sent")"
@@ -217,7 +299,8 @@ fp="$(q "SELECT form_path FROM action_requests WHERE request_id='$srid';")"
 [ -r "$fp" ] && grep -q "$srid" "$fp" && ok "tick served a hub decision form for the human request" || not_ok "no form: '$fp'"
 [ "$(grep -c -- "--class human-action" "$work/notified")" -ge 1 ] && [ "$(grep -c "$srid" "$work/notified")" = 1 ] \
   && ok "one Slack alert (class human-action) across two ticks" || not_ok "notify: $(cat "$work/notified")"
-rec="$(grep -l -F "\"form_path\":\"$fp\"" "$HERDR_STATE_ROOT"/forms/*.json | head -1)"
+! grep -q 'chmod' "$work/notified" && ok "the Slack text does not carry the command" || not_ok "command left the machine: $(cat "$work/notified")"
+rec="$HERDR_STATE_ROOT/forms/$(q "SELECT form_record FROM action_requests WHERE request_id='$srid';").json"
 jq -c '.status="expired"' "$rec" > "$rec.t" && mv "$rec.t" "$rec"
 bash "$here/herdr-action.sh" tick
 fp2="$(q "SELECT form_path FROM action_requests WHERE request_id='$srid';")"
@@ -225,7 +308,7 @@ fp2="$(q "SELECT form_path FROM action_requests WHERE request_id='$srid';")"
   && ok "expired form: request still pending, a fresh form is served (expiry is not a decline)" || not_ok "expiry: status $(q "SELECT status FROM action_requests WHERE request_id='$srid';")"
 [ "$(q "SELECT count(*) FROM events WHERE type='action_form_expired';")" -ge 1 ] && ok "action_form_expired recorded" || not_ok "no expiry event"
 [ "$(grep -c "$srid" "$work/notified")" = 1 ] && ok "no second Slack post for a re-served form" || not_ok "slack re-posted"
-rec2="$(grep -l -F "\"form_path\":\"$fp2\"" "$HERDR_STATE_ROOT"/forms/*.json | head -1)"
+rec2="$HERDR_STATE_ROOT/forms/$(q "SELECT form_record FROM action_requests WHERE request_id='$srid';").json"
 jq -c --arg id "$srid" '.status="answered" | .answers={request_id:$id, decision:"approve", reason:"fine"}' "$rec2" > "$rec2.t" && mv "$rec2.t" "$rec2"
 bash "$here/herdr-action.sh" tick
 [ "$(q "SELECT status||'/'||authority FROM action_requests WHERE request_id='$srid';")" = approved/human ] \
@@ -259,7 +342,7 @@ if command -v bun >/dev/null 2>&1; then
   [ "$(printf '%s' "$mine" | jq -c '[.[]|.r]')" = '["ALLOW","BLOCK","BLOCK","BLOCK","ALLOW","BLOCK"]' ] \
     && ok "hook row: allow runs; escalate/reserved/eval/junk blocked; read runs" || not_ok "hook row: $mine"
   printf '%s' "$mine" | jq -r '.[1].why' | grep -q 'Requested as ar_' && ok "escalate block reason names the request" || not_ok "reason: $(printf '%s' "$mine" | jq -r '.[1].why')"
-  hk="$(q "SELECT request_id FROM action_requests WHERE command='chmod -R u+rw tmp/hookcase';")"
+  hk="$(q "SELECT request_id FROM action_requests WHERE command LIKE '%) chmod -R u+rw tmp/hookcase';")"
   HERDR_PANE_ID="$CPANE" act approve "$hk" --authority conductor --review-category local-build --review-reason hook >/dev/null
   again="$(run_hook "$here")"
   [ "$(printf '%s' "$again" | jq -r '.[1].r')" = ALLOW ] && ok "after approval the hook lets the identical call run" || not_ok "post-approve: $again"
@@ -293,6 +376,7 @@ a="$(dry "$here" fix/x implement omp)"; b="$(dry "$base_dir" fix/x implement omp
 a="$(dry "$here" fix/x implement claude --approval menu)"; b="$(dry "$base_dir" fix/x implement claude)"
 [ "$a" = "$b" ] && ok "explicit --approval menu is byte-identical to origin/main's default" || not_ok "--approval menu differs"
 git -C "$here" worktree remove --force "$base_dir" 2>/dev/null
+export HERDR_OMP_EXTENSION="$here/agent-hooks/omp-herdr-control.ts"
 h="$(dry "$here" fix/x implement omp --approval hook)"
 launch="$(printf '%s\n' "$h" | grep '^  launch')"
 printf '%s' "$launch" | grep -q -- '--auto-approve --config .*agent-hooks/omp-worker-overlay.yml$' && ! printf '%s' "$launch" | grep -q -- '--approval-mode' \
@@ -307,6 +391,11 @@ out="$(dry "$here" fix/y implement omc --approval hook)"
 printf '%s' "$out" | grep -q 'omp-only' && ok "refused: --approval hook with omc" || not_ok "omc hook: $out"
 out="$(dry "$here" fix/y quick --approval hook -- echo hi)"
 printf '%s' "$out" | grep -q 'managed agent launch' && ok "refused: --approval hook with a literal command" || not_ok "literal hook: $out"
+out="$(HERDR_OMP_EXTENSION="$work/missing.ts" dry "$here" fix/y implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'not this checkout.s enforcing hook' && ok "refused: the extension omp would load is not this checkout's enforcing hook" || not_ok "ext check: $out"
+printf '// old hook\n' > "$work/old-hook.ts"
+out="$(HERDR_OMP_EXTENSION="$work/old-hook.ts" dry "$here" fix/y implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "refused: an installed hook without the enforcement protocol" || not_ok "old hook: $out"
 [ ! -d "$HOME/.herdr/worktrees/$(basename "$repo")" ] && ok "refused spawns created no worktree" || not_ok "a refused spawn left a worktree"
 
 printf '== shadow-compare.sh --gate (decision q1) ==\n'

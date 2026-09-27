@@ -172,7 +172,11 @@ cmd_decide() {                          # approve|decline id [flags]
       fi
       _ha_decide "$id" "$status" conductor "${HERDR_PANE_ID:-}" "$cat" "$why" ;;
     human)
-      local ans
+      local ans pinned
+      # Only the formserve record the hub tick pinned when it served THIS
+      # request's form counts — a record written later by anything else does not.
+      pinned="$(_ha_field "$row" form_record)"
+      [ -n "$pinned" ] && [ "$form" = "$pinned" ] || die "human authority needs --form <id> naming the hub decision form served for $id (${pinned:-none served yet})" 8
       ans="$(_ha_form_answer "$form" "$id")" || die "human authority needs --form <id>: an ANSWERED hub decision form for exactly $id" 8
       [ "$(_ha_field "$ans" decision)" = "$verb" ] || die "form $form answered '$(_ha_field "$ans" decision)', not '$verb'" 8
       _ha_decide "$id" "$status" human "hub form $form" "" "$(_ha_field "$ans" reason)" ;;
@@ -249,6 +253,24 @@ HTML
   printf '%s\n' "$f"
 }
 
+# formserve writes its record (status open) as it starts. Pin that record to
+# the request right away, so an answer given before the next tick still
+# counts; a slow start is pinned by a later tick, and only while still open.
+_ha_pin_form() {                        # request_id form-path -> 0 pinned
+  local k st fid
+  for k in 1 2 3 4 5 6 7 8 9 10; do
+    read -r st fid <<EOF
+$(_ha_form_status "$2")
+EOF
+    if [ "${st:-}" = open ] && [ -n "${fid:-}" ]; then
+      _sql "UPDATE action_requests SET form_record=$(_sq "$fid") WHERE request_id=$(_sq "$1") AND status='pending';" >/dev/null 2>&1
+      return 0
+    fi
+    sleep 0.3
+  done
+  return 1
+}
+
 _ha_form_status() {                     # form-path -> "<status> <form_id>" (empty if no record yet)
   local rec
   rec="$(grep -l -F "\"form_path\": \"$1\"" "$HA_FORMS_DIR"/*.json 2>/dev/null | head -1)"
@@ -261,9 +283,18 @@ _ha_human_route() {                     # id row task-json
   local id="$1" row="$2" tj="$3" fp st fid ans n disp
   fp="$(_ha_field "$row" form_path)"
   if [ -n "$fp" ]; then
-    read -r st fid <<EOF
+    fid="$(_ha_field "$row" form_record)"
+    if [ -z "$fid" ]; then
+      # Pin the formserve record the first time it is seen OPEN; from then on
+      # only that record is read.
+      read -r st fid <<EOF
 $(_ha_form_status "$fp")
 EOF
+      [ "${st:-}" = open ] || return 0
+      _sql "UPDATE action_requests SET form_record=$(_sq "$fid") WHERE request_id=$(_sq "$id") AND status='pending';" >/dev/null 2>&1
+      return 0
+    fi
+    st="$(jq -r '.status // empty' "$HA_FORMS_DIR/$fid.json" 2>/dev/null)"
     case "${st:-}" in
       answered)
         if ans="$(_ha_form_answer "$fid" "$id")"; then
@@ -281,16 +312,18 @@ EOF
     esac
   fi
   fp="$(_ha_serve_form "$row" "$tj")" || return 0
-  _sql "UPDATE action_requests SET form_path=$(_sq "$fp") WHERE request_id=$(_sq "$id") AND status='pending';" >/dev/null 2>&1
+  _sql "UPDATE action_requests SET form_path=$(_sq "$fp"), form_record='' WHERE request_id=$(_sq "$id") AND status='pending';" >/dev/null 2>&1
+  _ha_pin_form "$id" "$fp" || true
   append_event "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_form_served \
     "$(jq -nc --arg id "$id" --arg f "$fp" '{request_id:$id, form_path:$f}')" >/dev/null 2>&1 || true
   # One Slack post per request (not per re-served form): the alert says where
   # to decide; the form is what stays open.
   if claim_once "actslack_${id}" "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_slack_claimed \
        "$(jq -nc --arg id "$id" '{request_id:$id}')"; then
-    disp="$(pretool_redact "$(_ha_field "$row" command)" | tr '\n' ' ' | cut -c1-240)"
+    # The command itself stays on this machine (the hub form shows it): a
+    # command line can carry a secret no redactor recognises (webhook paths).
     bash "$HA_NOTIFY" --class human-action --pane "$(_ha_field "$tj" pane_id)" \
-      "$(_ha_field "$tj" label): needs YOUR OK for one action (request $id): ${disp} — decide at http://127.0.0.1:8600/decisions" \
+      "$(_ha_field "$tj" label): needs YOUR OK for one $(_ha_field "$row" tool) action (request $id, $(_ha_field "$row" verdict)) — see it and decide at http://127.0.0.1:8600/decisions" \
       >/dev/null 2>&1 || true
   fi
 }
