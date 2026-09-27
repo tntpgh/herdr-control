@@ -626,30 +626,110 @@ _cp_scope_ceiling() {                   # raw manifest
 
 # ---- code by reference -------------------------------------------------------
 # `_cp_code_ref <raw> <worktree>` examines EVERY script-executing segment of
-# RAW, at every nesting level — `;`/`&&`/`||`/`|`/`&`, `( … )`, `{ …; }`,
+# RAW, at every nesting level — `;`/`&&`/`||`/`|`/`|&`/`&`, `( … )`, `{ …; }`,
 # `$( … )`, backticks, `<( … )`/`>( … )`, and the program string of a
-# `bash|sh|zsh|dash|ksh|mksh -c '<string>'` or `eval` (recursed into) —
-# instead of only recognizing ONE simple `<interpreter> <file>` command.
-# fix/coderef-compound: before this, a pipe/redirect/chain/subshell/wrapper
-# around `bash tmp/x.sh` was invisible to code-by-reference entirely (rc 1,
-# "not code by reference"), so the raw command line alone classified the
-# prompt and a peer could press Approve on unreviewed bytes.
+# `bash|sh|zsh|dash|ksh|mksh|csh|tcsh|fish -c '<string>'` or `eval` (recursed
+# into) — instead of only recognizing ONE simple `<interpreter> <file>`
+# command. fix/coderef-compound: before this, a pipe/redirect/chain/
+# subshell/wrapper around `bash tmp/x.sh` was invisible to code-by-reference
+# entirely (rc 1, "not code by reference"), so the raw command line alone
+# classified the prompt and a peer could press Approve on unreviewed bytes.
 #
 # Every segment's command word is found by `_cp_locate_command_word` — the
 # SAME locator `_cp_walk_run` uses below — so the two walkers cannot
 # disagree about where it is. A segment executes a script when its word is
-# bash/sh/zsh/dash/ksh/mksh or python/python3[.N] with a file slot,
-# `source`/`.` with a file, or a path-form word (`./x`, `tmp/x`, `/abs/x`)
-# that resolves to a file INSIDE the worktree (judged by its shebang; a path
-# outside the worktree is not a script for this purpose, unchanged). Deny by
-# default — all of these ESCALATE (rc 3) rather than resolve or silently
-# pass: a relative slot when the command is not cwd-bound or follows a later
-# `cd`/`pushd`; a slot that is a substitution or contains `$`/`~`; an
-# interpreter reading its program from stdin or a process substitution;
-# `xargs`/`find -exec`/`watch`/`parallel` wrapping an interpreter or a
-# path-form word; more than ONE distinct script file. Contract unchanged:
-# rc 0 + `kind<TAB>path` for exactly one resolvable script, rc 1 only when
-# no segment anywhere runs a script, rc 3 for anything unresolvable.
+# bash/sh/zsh/dash/ksh/mksh/csh/tcsh/fish or python/python2/python3/pypy[.N]
+# with a file slot, `source`/`.` with a file, `python3 -m <local.module>`
+# resolved to its worktree file, or a path-form word (`./x`, `tmp/x`,
+# `/abs/x`) that resolves to a file INSIDE the worktree (judged by its
+# shebang; a path outside the worktree under a system prefix — /usr, /bin,
+# /sbin, /opt/homebrew, /Library, /System — is not a script for this
+# purpose, unchanged). `uv run`/`uvx`/`pipx run` unwrap to the command they
+# invoke before dispatch. Deny by default — all of these ESCALATE (rc 3)
+# rather than resolve or silently pass: a relative slot when the command is
+# not cwd-bound, follows a later `cd`/`pushd`/`popd`/`eval`/`source`/`.`, or
+# a `$`/substituted command word anywhere in the same nesting level; a slot
+# that is itself a substitution or contains `$`/`~`; a `$`/substitution
+# command word, or a `-c`/`eval` program string that is itself a
+# substitution; an interpreter reading its program from stdin, a pipe, or a
+# process/input substitution anywhere in the segment; `xargs`/
+# `find -exec|-execdir|-ok|-okdir`/`watch`/`parallel` wrapping an
+# interpreter (after skipping that tool's own value-taking options) or a
+# path-form word; a path-form word resolving outside the worktree via an
+# in-worktree symlink or a non-system absolute path; a segment or earlier
+# `export` assigning BASH_ENV/ENV/PYTHONPATH/PYTHONSTARTUP/PYTHONHOME/
+# PYTHONUSERBASE; more than ONE distinct (kind, script file) in the whole
+# command, INCLUDING a different segment naming the resolved file (typed
+# token or basename) as an argument or redirection target (rewrite-then-run
+# laundering). Contract unchanged: rc 0 + `kind<TAB>path` for exactly one
+# resolvable script, rc 1 only when no segment anywhere runs a script, rc 3
+# for anything unresolvable.
+
+# `_cp_coderef_is_chrome_line <line>` -> 0 when LINE is exact known chrome
+# from an approval panel (Claude Code's numbered "Bash command" header, its
+# option rows, its "Do you want to proceed?" prompt, a fully-parenthesized
+# description row; omp's "Allow tool:"/menu footer/button rows) rather than
+# real command text, blank lines included. See `_cp_coderef_delinearize`'s
+# header for why this exists and what it does NOT cover.
+_cp_coderef_is_chrome_line() {          # one line of a multi-line raw
+  local t
+  t="$(printf '%s' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  case "$t" in
+    ''|'Bash command'|'Do you want to proceed?'|'Allow tool: bash'|'Approve'|'Deny')
+      return 0 ;;
+    '('*')')
+      return 0 ;;
+  esac
+  printf '%s' "$t" | grep -qE '^(❯|>)?[[:space:]]*[0-9]+\.[[:space:]]' && return 0
+  printf '%s' "$t" | grep -qE 'up/down navigate|esc cancel' && return 0
+  return 1
+}
+
+# `_cp_coderef_delinearize <raw>` -> RAW with exact panel-chrome lines
+# dropped, everything else rejoined on real newlines.
+#
+# ceiling (PR #160 review round 1, finding 1): `_cp_code_ref` cannot see
+# herdr-select.sh's own recorded-vs-scrape distinction (`cmd_text_is_scrape`)
+# without a new parameter threaded through `peer_decide`/`code_ref_inspect`,
+# which the review explicitly scoped OUT of this fix (do not edit
+# herdr-select.sh). A genuinely multi-line RECORDED command — a real
+# heredoc, or a worker's trailing newline — must still be walked line by
+# line (a blanket `*$'\n'*) return 1` made every one of those forms an
+# unreviewed peer `allow` again); a scraped numbered-panel capture is NOT
+# real shell syntax and must not be walked as if it were. This drops only
+# the panel shapes this suite's fixtures actually exercise, by EXACT line —
+# an unlisted agent's panel wording could still misparse as a command word
+# (the numbered panel's own "Bash command" header lowercases to a `bash`
+# command word with slot "command" and escalated every safe prompt before
+# this list existed). Expand the list in `_cp_coderef_is_chrome_line` rather
+# than reintroducing the blanket bail this replaces.
+_cp_coderef_delinearize() {             # raw
+  local out="" first=1 ln
+  while IFS= read -r ln || [ -n "$ln" ]; do
+    _cp_coderef_is_chrome_line "$ln" && continue
+    if [ "$first" = 1 ]; then out="$ln"; first=0; else out="$out"$'\n'"$ln"; fi
+  done <<EOF
+$1
+EOF
+  printf '%s' "$out"
+}
+
+# `_cp_coderef_has_ansi_c_quote <text>` -> 0 if TEXT contains a literal `$'`
+# (the start of ANSI-C quoting). Both `_cp_protect_text` and
+# `_cp_quoted_subst_bodies_once` track single-quotes with no backslash
+# awareness — correct for a REAL single-quoted string, where `\` has no
+# special meaning, but `$'...'` is different: `\'` is an escaped quote, not
+# a closer, and the trackers desync on it (PR #160 review round 1, finding
+# 8: `echo $'\'' ; bash tmp/evil.sh` read as one open quote swallowing the
+# rest of the line, so the `;` split and the `$(...)` inside a second
+# example were both invisible). Rather than teach two separate awk state
+# machines a third quoting mode, fail closed: `_cp_coderef_walk` escalates
+# on sight of `$'` instead of trying to parse through it.
+_cp_coderef_has_ansi_c_quote() {        # text
+  local marker; marker="$(printf '$%s' "'")"
+  case "$1" in *"$marker"*) return 0 ;; esac
+  return 1
+}
 
 # `_cp_quoted_subst_bodies_once <text>` -> one `$(...)`/backtick body per
 # line, at the outermost nesting level of TEXT, skipping any that live
@@ -693,20 +773,26 @@ _cp_quoted_subst_bodies_once() {
 }
 
 # `_cp_coderef_split <text>` -> segments, one per line, split on `;`, `&&`,
-# `||`, `|`, `&`, `(`, `)` (same operator set `_cp_walk_prep` uses). A
-# segment that is the TARGET of a pipe — its stdin comes from the previous
-# command, e.g. `cat x | bash` — is prefixed with the literal token
-# `@PIPE@`, stripped by the caller: needed to tell that apart from a
-# genuinely bare invocation nothing feeds (spec: `x | bash` is UNRESOLVABLE,
-# a lone `bash` is not code by reference at all).
+# `||`, `|`, `|&`, `&`, `(`, `)` (same operator set `_cp_walk_prep` uses,
+# plus `|&`). `&>`/`&>>`/`>&` are protected from the bare-`&` split first —
+# `bash &>/dev/null < tmp/evil.sh` used to split on that `&`, stranding the
+# `<` in a segment with no command word to attach it to (PR #160 review
+# round 1, finding 5). A segment that is the TARGET of a pipe — its stdin
+# comes from the previous command, e.g. `cat x | bash` — is prefixed with
+# the literal token `@PIPE@`, stripped by the caller: needed to tell that
+# apart from a genuinely bare invocation nothing feeds (spec: `x | bash` is
+# UNRESOLVABLE, a lone `bash` is not code by reference at all).
 _cp_coderef_split() {                   # raw
   _cp_protect_text "$1" | sed -E '
     s/<\(/<@LP@/g
     s/>\(/>@LP@/g
+    s/\&(>>?)/@AMP@\1/g
     s/(\&\&|\|\|)/\n/g
+    s/\|&/\n@PIPE@/g
     s/\|/\n@PIPE@/g
     s/[;&()]/\n/g
     s/@LP@/(/g
+    s/@AMP@/\&/g
   '
 }
 
@@ -745,30 +831,74 @@ _cp_coderef_unprotect() {
   printf '%s' "$1" | tr $'\001\002\003\004\005\006\007\016' ' ;&|()<>'
 }
 
-# `_cp_coderef_first_nonflag <args...>` -> the first argument not starting
-# with `-`, empty (rc 1) if none — a cheap stand-in for "the command
-# xargs/watch/parallel is about to run", good enough for the forms these
-# tools are actually invoked with here.
-_cp_coderef_first_nonflag() {
-  local a
+# `_cp_coderef_wrapped_command <cmd> <args...>` -> prints the first word
+# that looks like the actual command <cmd> (xargs/watch/parallel) is about
+# to run, skipping THAT TOOL's OWN value-taking options — not just any word
+# starting with `-`, which used to let `-n 1`/`-I {}`/`-P 2`/`-j 2` leave
+# the OPTION VALUE mistaken for the command (PR #160 review round 1, finding
+# 6). rc 1 if none found.
+_cp_coderef_wrapped_command() {         # cmd args...
+  local cmd="$1" vopt=""; shift
+  case "$cmd" in
+    xargs)    vopt=' -I -L -n -P -s -d -E -e ' ;;
+    watch)    vopt=' -n -d -c -t -x -g ' ;;
+    parallel) vopt=' -j -P -N -S -n -L -C -d --jobs ' ;;
+  esac
+  local a skip=0 key
   for a in "$@"; do
-    case "$a" in -*) continue ;; esac
-    printf '%s' "$a"; return 0
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$a" in
+      --) continue ;;
+      -*)
+        key="${a%%=*}"
+        case "$vopt" in
+          *" $key "*) case "$a" in *=*) ;; *) skip=1 ;; esac ;;
+        esac
+        continue ;;
+      *) printf '%s' "$a"; return 0 ;;
+    esac
   done
   return 1
 }
 
-_cp_cr_files=""                         # kind<TAB>realpath, one per resolved file, deduped
+# `_cp_coderef_env_poisoned <text>` -> 0 when TEXT assigns (as a leading
+# `NAME=value` on any segment, or via `export NAME=value`) an env var that
+# makes bash or python load a SECOND, un-reviewed file before the one this
+# walker judged: BASH_ENV/ENV (bash/sh non-interactive startup file),
+# PYTHONPATH/PYTHONSTARTUP/PYTHONHOME/PYTHONUSERBASE (python import/startup
+# paths). PR #160 review round 1, finding 17: `BASH_ENV=tmp/evil.sh bash
+# tmp/clean.sh` judged and approved clean.sh's clean content while BASH_ENV
+# ran evil.sh first.
+_cp_coderef_env_poisoned() {            # text
+  local segments seg
+  segments="$(_cp_coderef_split "$1")"
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
+    printf '%s' "$seg" | grep -qE '(^|[^A-Za-z0-9_])(export[[:space:]]+)?(BASH_ENV|ENV|PYTHONPATH|PYTHONSTARTUP|PYTHONHOME|PYTHONUSERBASE)=' && return 0
+  done <<EOF
+$segments
+EOF
+  return 1
+}
+
+_cp_cr_files=""                         # kind<TAB>realpath, one per resolved (kind, file), deduped
 _cp_cr_unresolvable=0
 _cp_coderef_add_file() {                # kind real
-  local kind="$1" real="$2" line
+  # Dedup on the WHOLE `kind<TAB>path` line, not the path alone — finding 14:
+  # the SAME file judged as two different kinds by two different segments
+  # (`bash tmp/rm.py 2>/dev/null; python3 tmp/rm.py`) used to keep only the
+  # first kind seen and call it one script; it is two, judged two different
+  # ways, and must escalate as more-than-one.
+  local kind="$1" real="$2" line want
+  want="${kind}"$'\t'"${real}"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    [ "${line#*$'\t'}" = "$real" ] && return 0
+    [ "$line" = "$want" ] && return 0
   done <<EOF
 $_cp_cr_files
 EOF
-  _cp_cr_files="${_cp_cr_files}${_cp_cr_files:+$'\n'}${kind}"$'\t'"${real}"
+  _cp_cr_files="${_cp_cr_files}${_cp_cr_files:+$'\n'}${want}"
 }
 
 # `_cp_coderef_resolve_slot <token> <wt> <cwd_bound> <kind>` resolves an
@@ -804,17 +934,22 @@ _cp_coderef_resolve_slot() {            # token wt cwd_bound kind
 
 # `_cp_coderef_resolve_pathword <token> <wt> <cwd_bound>` resolves a
 # path-form COMMAND WORD with no explicit interpreter (`./x`, `tmp/x`,
-# `/abs/x`). A relative word when not cwd-bound still escalates; but a word
-# that simply does not exist, or resolves OUTSIDE the worktree
-# (`/usr/bin/git`), is not a script for this purpose and contributes
-# nothing — unchanged from today, and required so this new path-form case
-# does not turn every full-path system-binary invocation into an escalation.
+# `/abs/x`). A relative word when not cwd-bound still escalates; a word
+# that simply does not exist is not a script for this purpose and
+# contributes nothing. A word that resolves OUTSIDE the worktree escalates
+# UNLESS it was typed as an absolute path under a system prefix (/usr, /bin,
+# /sbin, /opt/homebrew, /Library, /System) — finding 11: a relative or
+# in-worktree-looking word resolving outside via a symlink the worker
+# itself created (or a plain /tmp path) used to contribute nothing, same as
+# `/usr/bin/git`; only the system-prefix case is genuinely "not a script for
+# this purpose".
 _cp_coderef_resolve_pathword() {        # token wt cwd_bound
-  local f="$1" wt="$2" cwd_bound="$3" abs real realwt kind
+  local f="$1" wt="$2" cwd_bound="$3" abs real realwt kind sys_abs=0
   f="$(printf '%s' "$f" | tr '\001' ' ')"
   case "$f" in *[$'\001'-$'\037']*|*@SUB@*) _cp_cr_unresolvable=1; return 0 ;; esac
   case "$f" in
     '~'*|*'$'*) _cp_cr_unresolvable=1; return 0 ;;
+    /usr/*|/bin/*|/sbin/*|/opt/homebrew/*|/Library/*|/System/*) abs="$f"; sys_abs=1 ;;
     /*) abs="$f" ;;
     *)
       if [ "$cwd_bound" = 1 ] && [ -n "$wt" ]; then
@@ -829,37 +964,74 @@ _cp_coderef_resolve_pathword() {        # token wt cwd_bound
   realwt="$(cd "$wt" 2>/dev/null && pwd -P)" || return 0
   case "$real/" in
     "$realwt"/*) ;;
-    *) return 0 ;;
+    *)
+      if [ "$sys_abs" = 1 ]; then return 0; else _cp_cr_unresolvable=1; return 0; fi ;;
   esac
   kind="$(_cp_shebang_kind "$real")" || { _cp_cr_unresolvable=1; return 0; }
   _cp_coderef_add_file "$kind" "$real"
 }
 
-# `_cp_coderef_segment <seg> <wt> <cwd_bound> <pipe_flag> <depth>` classifies
-# ONE segment: does its command word run a script, and if so where. Never
-# returns a signal itself — it only ever mutates `_cp_cr_files`/
-# `_cp_cr_unresolvable`, so a segment that runs nothing simply leaves both
-# alone.
-_cp_coderef_segment() {                 # seg wt cwd_bound pipe_flag depth
-  local seg="$1" wt="$2" cwd_bound="$3" pipe_flag="$4" depth="$5"
+# `_cp_coderef_resolve_pymodule <module> <wt> <cwd_bound>` resolves
+# `python3 -m a.b.c` to `<wt>/a/b/c.py` or `<wt>/a/b/c/__main__.py` when
+# cwd-bound and one of those exists (finding 13: this used to hit the
+# python branch's generic `-*) return 0` and drop the file entirely — one
+# keystroke undid the whole python half of this fix). Otherwise contributes
+# nothing (rc 1, unchanged) — `python3 -m json.tool`/`pytest` must stay out
+# of scope.
+_cp_coderef_resolve_pymodule() {        # module wt cwd_bound
+  local m="$1" wt="$2" cwd_bound="$3" rel cand
+  m="$(printf '%s' "$m" | tr '\001' ' ')"
+  case "$m" in *[$'\001'-$'\037']*|*@SUB@*|*'$'*|*'~'*|*'/'*) return 0 ;; esac
+  [ "$cwd_bound" = 1 ] && [ -n "$wt" ] || return 0
+  rel="$(printf '%s' "$m" | tr '.' '/')"
+  for cand in "$wt/$rel.py" "$wt/$rel/__main__.py"; do
+    if [ -f "$cand" ] && [ -r "$cand" ]; then
+      _cp_coderef_resolve_slot "$cand" "$wt" "$cwd_bound" python
+      return 0
+    fi
+  done
+  return 0
+}
+
+# `_cp_coderef_segment <seg> <wt> <cwd_bound> <pipe_flag> <depth>
+# <env_poisoned>` classifies ONE segment: does its command word run a
+# script, and if so where. Never returns a signal itself — it only ever
+# mutates `_cp_cr_files`/`_cp_cr_unresolvable`, so a segment that runs
+# nothing simply leaves both alone.
+_cp_coderef_segment() {                 # seg wt cwd_bound pipe_flag depth env_poisoned
+  local seg="$1" wt="$2" cwd_bound="$3" pipe_flag="$4" depth="$5" env_poisoned="$6"
   _cp_locate_command_word "$seg" || return 0
   local -a w=("${_CP_LOC[@]}")
   local cmd="$_cp_wcmd"
+
+  # `uv run <cmd>`, `uvx <cmd>`, `pipx run <cmd>` unwrap to the command
+  # they invoke before dispatch (finding 18) — otherwise `uv`/`uvx`/`pipx`
+  # themselves are just another unrecognised command word.
+  case "$cmd" in
+    uv|pipx)
+      if [ "${w[1]:-}" = run ]; then w=("${w[@]:2}"); else return 0; fi
+      [ "${#w[@]}" -ge 1 ] || return 0
+      cmd="$(printf '%s' "${w[0]##*/}" | tr 'A-Z' 'a-z')" ;;
+    uvx)
+      w=("${w[@]:1}")
+      [ "${#w[@]}" -ge 1 ] || return 0
+      cmd="$(printf '%s' "${w[0]##*/}" | tr 'A-Z' 'a-z')" ;;
+  esac
 
   case "$cmd" in
     find)
       local a
       for a in "${w[@]:1}"; do
-        case "$a" in -exec|-execdir|-ok) _cp_cr_unresolvable=1; return 0 ;; esac
+        case "$a" in -exec|-execdir|-ok|-okdir) _cp_cr_unresolvable=1; return 0 ;; esac
       done
       return 0 ;;
     xargs|watch|parallel)
       local cw base
-      cw="$(_cp_coderef_first_nonflag "${w[@]:1}")"
+      cw="$(_cp_coderef_wrapped_command "$cmd" "${w[@]:1}")"
       if [ -n "$cw" ]; then
         base="$(printf '%s' "${cw##*/}" | tr 'A-Z' 'a-z')"
         case "$base" in
-          bash|sh|zsh|dash|ksh|mksh|python|python2|python3|python3.[0-9]|python3.[0-9][0-9])
+          bash|sh|zsh|dash|ksh|mksh|csh|tcsh|fish|python|python2|python3|python3.[0-9]|python3.[0-9][0-9]|pypy*)
             _cp_cr_unresolvable=1 ;;
           *) case "$cw" in */*) _cp_cr_unresolvable=1 ;; esac ;;
         esac
@@ -870,30 +1042,63 @@ _cp_coderef_segment() {                 # seg wt cwd_bound pipe_flag depth
       return 0 ;;
     eval)
       if [ "${#w[@]}" -ge 2 ]; then
-        local j estr=""
+        local j estr="" has_sub=0
         for j in "${w[@]:1}"; do
+          case "$j" in *@SUB@*) has_sub=1 ;; esac
           estr="${estr:+$estr }$(_cp_coderef_unprotect "$j")"
         done
-        _cp_coderef_walk "$estr" "$wt" "$cwd_bound" "$((depth + 1))"
+        if [ "$has_sub" = 1 ]; then
+          _cp_cr_unresolvable=1
+        else
+          _cp_coderef_walk "$estr" "$wt" "$cwd_bound" "$((depth + 1))"
+        fi
       fi
       return 0 ;;
-    bash|sh|zsh|dash|ksh|mksh)
-      local i=1 n="${#w[@]}"
+    bash|sh|zsh|dash|ksh|mksh|csh|tcsh|fish)
+      local i=1 n="${#w[@]}" tok body has_n=0
+      [ "$env_poisoned" = 1 ] && { _cp_cr_unresolvable=1; return 0; }
       while [ "$i" -lt "$n" ]; do
-        case "${w[$i]}" in
+        tok="${w[$i]}"
+        case "$tok" in
           -c)
             if [ "$((i + 1))" -lt "$n" ]; then
-              local cstr; cstr="$(_cp_coderef_unprotect "${w[$((i + 1))]}")"
-              _cp_coderef_walk "$cstr" "$wt" "$cwd_bound" "$((depth + 1))"
+              case "${w[$((i + 1))]}" in
+                *@SUB@*) _cp_cr_unresolvable=1 ;;
+                *)
+                  local cstr; cstr="$(_cp_coderef_unprotect "${w[$((i + 1))]}")"
+                  _cp_coderef_walk "$cstr" "$wt" "$cwd_bound" "$((depth + 1))" ;;
+              esac
             fi
             return 0 ;;
+          -o|-O|+o|+O|--rcfile|--init-file) i=$((i + 2)); continue ;;
           --) i=$((i + 1)); break ;;
-          -*) i=$((i + 1)); continue ;;
+          '>'|'>>'|[0-9]'>'|[0-9]'>>'|'&>'|'&>>')
+            i=$((i + 1)); [ "$i" -lt "$n" ] && i=$((i + 1)); continue ;;
+          '>'*|[0-9]'>'*|'&>'*) i=$((i + 1)); continue ;;
+          '<'|'<>'|[0-9]'<'|'<'*|[0-9]'<'*) _cp_cr_unresolvable=1; return 0 ;;
+          -*)
+            body="${tok#-}"; body="${body#+}"
+            case "$body" in *n*) has_n=1 ;; esac
+            case "$body" in
+              *c)
+                if [ "$((i + 1))" -lt "$n" ]; then
+                  case "${w[$((i + 1))]}" in
+                    *@SUB@*) _cp_cr_unresolvable=1 ;;
+                    *)
+                      local cstr2; cstr2="$(_cp_coderef_unprotect "${w[$((i + 1))]}")"
+                      _cp_coderef_walk "$cstr2" "$wt" "$cwd_bound" "$((depth + 1))" ;;
+                  esac
+                fi
+                return 0 ;;
+              *o) i=$((i + 2)); continue ;;
+            esac
+            i=$((i + 1)); continue ;;
           *) break ;;
         esac
       done
+      [ "$has_n" = 1 ] && return 0
       if [ "$i" -ge "$n" ]; then
-        [ "$pipe_flag" = 1 ] && _cp_cr_unresolvable=1
+        case "$pipe_flag:$seg" in 1:*|*'<'*) _cp_cr_unresolvable=1 ;; esac
         return 0
       fi
       case "${w[$i]}" in
@@ -901,26 +1106,55 @@ _cp_coderef_segment() {                 # seg wt cwd_bound pipe_flag depth
       esac
       _cp_coderef_resolve_slot "${w[$i]}" "$wt" "$cwd_bound" shell
       return 0 ;;
-    python|python3|python3.[0-9]|python3.[0-9][0-9])
-      local i=1 n="${#w[@]}"
+    python|python2|python3|python3.[0-9]|python3.[0-9][0-9]|pypy*)
+      local i=1 n="${#w[@]}" tok body
+      [ "$env_poisoned" = 1 ] && { _cp_cr_unresolvable=1; return 0; }
       while [ "$i" -lt "$n" ]; do
-        case "${w[$i]}" in
-          -[uBev]|-[uBev][uBev]|-[uBev][uBev][uBev]) i=$((i + 1)) ;;
+        tok="${w[$i]}"
+        case "$tok" in
+          -c)
+            if [ "$((i + 1))" -lt "$n" ]; then
+              case "${w[$((i + 1))]}" in
+                *@SUB@*) _cp_cr_unresolvable=1 ;;
+                *)
+                  local pystr; pystr="$(_cp_coderef_unprotect "${w[$((i + 1))]}")"
+                  _cp_python_risk "$pystr" >/dev/null && _cp_cr_unresolvable=1 ;;
+              esac
+            fi
+            return 0 ;;
+          -m)
+            [ "$((i + 1))" -lt "$n" ] && _cp_coderef_resolve_pymodule "${w[$((i + 1))]}" "$wt" "$cwd_bound"
+            return 0 ;;
+          -x|-x*) _cp_cr_unresolvable=1; return 0 ;;
+          -W|-X) i=$((i + 2)); continue ;;
+          --) i=$((i + 1)); break ;;
+          '>'|'>>'|[0-9]'>'|[0-9]'>>'|'&>'|'&>>')
+            i=$((i + 1)); [ "$i" -lt "$n" ] && i=$((i + 1)); continue ;;
+          '>'*|[0-9]'>'*|'&>'*) i=$((i + 1)); continue ;;
+          '<'|'<>'|[0-9]'<'|'<'*|[0-9]'<'*) _cp_cr_unresolvable=1; return 0 ;;
+          -*)
+            body="${tok#-}"
+            case "$body" in
+              *[!bBdEhiIOqsSuvV]*) _cp_cr_unresolvable=1; return 0 ;;
+              *) i=$((i + 1)); continue ;;
+            esac ;;
           *) break ;;
         esac
       done
       if [ "$i" -ge "$n" ]; then
-        [ "$pipe_flag" = 1 ] && _cp_cr_unresolvable=1
+        case "$pipe_flag:$seg" in 1:*|*'<'*) _cp_cr_unresolvable=1 ;; esac
         return 0
       fi
       case "${w[$i]}" in
         -) _cp_cr_unresolvable=1; return 0 ;;
         '<'*|[0-9]'<'*) _cp_cr_unresolvable=1; return 0 ;;
-        -*) return 0 ;;
       esac
       _cp_coderef_resolve_slot "${w[$i]}" "$wt" "$cwd_bound" python
       return 0 ;;
     *)
+      case "${w[0]}" in
+        *'$'*|*'@SUB@'*) _cp_cr_unresolvable=1; return 0 ;;
+      esac
       case "${w[0]}" in
         */*) _cp_coderef_resolve_pathword "${w[0]}" "$wt" "$cwd_bound" ;;
       esac
@@ -930,14 +1164,20 @@ _cp_coderef_segment() {                 # seg wt cwd_bound pipe_flag depth
 
 # `_cp_coderef_walk <text> <wt> <cwd_bound> [depth]` examines every segment
 # of TEXT and recurses into every substitution/process-substitution body,
-# bounded to depth 6 (matches this file's other recursion bounds). A
-# `cd`/`pushd` anywhere in TEXT other than the one allowed leading
-# `cd <wt> && ` prefix turns OFF cwd-bound resolution for every segment at
-# THIS nesting level (spec: "follows any later cd/pushd" — conservative
-# rather than trying to order pipes/backgrounds/subshells against it).
+# bounded to depth 6 (matches this file's other recursion bounds) — past
+# that bound it ESCALATES rather than silently passing (finding 2: 7+ levels
+# of `eval`/`$(…)` nesting used to return 0 unresolved, same as running no
+# script at all). A `cd`/`pushd`/`popd`/`eval`/`source`/`.`, or a
+# `$`/substituted command word, anywhere in TEXT other than the one allowed
+# leading `cd <wt> && ` prefix turns OFF cwd-bound resolution for every
+# segment at THIS nesting level (spec: "follows any later cd/pushd" —
+# finding 7 widened this past a literal `cd`/`pushd` word, since `eval cd
+# tmp && bash run.sh` and `$(echo cd) tmp && bash run.sh` hid the SAME cwd
+# change from the old literal-only check and hashed the wrong file).
 _cp_coderef_walk() {                    # text wt cwd_bound depth
   local text="$1" wt="$2" cwd_bound="$3" depth="${4:-0}"
-  [ "$depth" -le 6 ] || return 0
+  if [ "$depth" -gt 6 ]; then _cp_cr_unresolvable=1; return 0; fi
+  _cp_coderef_has_ansi_c_quote "$text" && { _cp_cr_unresolvable=1; return 0; }
 
   local leading_cd_pfx=0
   case "$text" in "cd ${wt} && "*) leading_cd_pfx=1 ;; esac
@@ -953,7 +1193,10 @@ _cp_coderef_walk() {                    # text wt cwd_bound depth
     case "$_cp_wcmd" in
       cd|pushd)
         if [ "$segidx" = 1 ] && [ "$leading_cd_pfx" = 1 ]; then :; else later_cd=1; fi ;;
+      popd|eval|source|.)
+        later_cd=1 ;;
     esac
+    case "${_CP_LOC[0]:-}" in *'$'*|*'@SUB@'*) later_cd=1 ;; esac
   done <<EOF
 $segments
 EOF
@@ -961,12 +1204,15 @@ EOF
   local cwd_eff="$cwd_bound"
   [ "$later_cd" = 1 ] && cwd_eff=0
 
+  local env_poisoned=0
+  _cp_coderef_env_poisoned "$text" && env_poisoned=1
+
   local seg pipe_flag
   while IFS= read -r seg; do
     [ -n "$seg" ] || continue
     pipe_flag=0
     case "$seg" in @PIPE@*) pipe_flag=1; seg="${seg#@PIPE@}" ;; esac
-    _cp_coderef_segment "$seg" "$wt" "$cwd_eff" "$pipe_flag" "$depth"
+    _cp_coderef_segment "$seg" "$wt" "$cwd_eff" "$pipe_flag" "$depth" "$env_poisoned"
   done <<EOF
 $segments
 EOF
@@ -980,18 +1226,67 @@ $(_cp_coderef_immediate_bodies "$text")
 EOF
 }
 
+# `_cp_coderef_count_segments_mentioning <text> <basename> [depth]` -> the
+# number of DISTINCT segments, at any nesting level of TEXT, whose text
+# mentions BASENAME as an apparent path/word (not merely as a substring of
+# a longer name). Counting segments rather than occurrences means the
+# script's OWN invocation (`bash tmp/evil.sh tmp/evil.sh`) still counts
+# once, not twice.
+_cp_coderef_count_segments_mentioning() {   # text basename depth
+  local text="$1" base="$2" depth="${3:-0}" count=0 seg body sub
+  [ "$depth" -le 6 ] || { printf 0; return 0; }
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
+    if printf '%s' "$seg" | grep -qE "(^|[^A-Za-z0-9_.-])${base}([^A-Za-z0-9_.-]|\$)"; then
+      count=$((count + 1))
+    fi
+  done <<EOF
+$(_cp_coderef_split "$text")
+EOF
+  while IFS= read -r body; do
+    [ -n "$body" ] || continue
+    sub="$(_cp_coderef_count_segments_mentioning "$body" "$base" "$((depth + 1))")"
+    count=$((count + ${sub:-0}))
+  done <<EOF
+$(_cp_coderef_immediate_bodies "$text")
+EOF
+  printf '%s' "$count"
+}
+
+# `_cp_coderef_file_named_elsewhere <raw> <real>` -> 0 when more than one
+# segment (anywhere in RAW) names REAL's basename — meaning some OTHER
+# segment could have written, copied, or symlinked this file into place
+# before the segment that runs it does (finding 12: `cp tmp/evil.sh
+# tmp/clean.sh && bash tmp/clean.sh` hashed clean.sh's own (clean) bytes at
+# check time, blind to the `cp` segment that just replaced them).
+_cp_coderef_file_named_elsewhere() {    # raw real
+  local raw="$1" real="$2" base hits
+  base="${real##*/}"
+  [ -n "$base" ] || return 1
+  hits="$(_cp_coderef_count_segments_mentioning "$raw" "$base" 0)"
+  [ "${hits:-0}" -gt 1 ]
+}
+
 _cp_code_ref() {                        # raw wt
   local raw="$1" wt="$2" cwd_bound=0 n=0 line
-  # A multi-line RAW is never one command to this function — it used to be
-  # the recorded/cleaned command line, but code_ref_inspect is also called
-  # with a freshly scraped panel capture (prompt_command_text), which can be
-  # multi-line (or carry a non-ASCII menu glyph like the numbered panel's
-  # `>` marker) well before anything here gets a chance to single-line it.
-  # `_cp_simple_words` used to guarantee this for the old one-command-only
-  # `_cp_code_ref`; restore the same guarantee here — never code-by-reference
-  # (rc 1), exactly like a command that runs no script at all, rather than
-  # segment-walking scrape noise into a false escalation.
-  case "$raw" in *$'\n'*) return 1 ;; esac
+  # ceiling: every multi-line RAW is walked, line by line, after dropping
+  # only EXACT known panel-chrome lines (PR #160 review round 2, finding
+  # 1b) — gating the walk behind a leading `cd <wt> && ` prefix instead
+  # (round 2's first attempt) fixed the false escalation below but missed
+  # every absolute-path multi-line form with no cd prefix at all (`true⏎
+  # bash /abs/evil.sh`, a bare trailing newline, a path alone on its own
+  # line) — those must still resolve/escalate, so the walk cannot be
+  # conditional on a prefix. The residual risk is the mirror image: a
+  # RECORDED line that is *itself*, verbatim, one of the chrome strings in
+  # `_cp_coderef_is_chrome_line` (e.g. a script literally named `Bash
+  # command` run via `./"Bash command"`) is invisible to this walker. Never
+  # treat "a chrome line is present" as proof the whole capture is a
+  # harmless scrape — that direction is a worker-controllable bypass in
+  # the OTHER direction (append a chrome-looking line to disarm a REAL
+  # multi-segment command); this only ever DROPS individual matched lines
+  # before walking everything else that remains.
+  case "$raw" in *$'\n'*) raw="$(_cp_coderef_delinearize "$raw")" ;; esac
   case "$raw" in "cd ${wt} && "*) cwd_bound=1 ;; esac
   _cp_cr_unresolvable=0
   _cp_cr_files=""
@@ -1007,7 +1302,11 @@ $_cp_cr_files
 EOF
   case "$n" in
     0) return 1 ;;
-    1) printf '%s\n' "$_cp_cr_files"; return 0 ;;
+    1)
+      if _cp_coderef_file_named_elsewhere "$raw" "${_cp_cr_files#*$'\t'}"; then
+        return 3
+      fi
+      printf '%s\n' "$_cp_cr_files"; return 0 ;;
     *) return 3 ;;
   esac
 }
@@ -1301,7 +1600,11 @@ _cp_locate_command_word() {             # segment
   while [ "$#" -gt 0 ]; do
     _cp_wate=0
     case "$1" in
-      '!'|'{'|'}'|'('|')'|if|then|elif|else|fi|while|until|for|do|done|select|case|esac|in|'[['|']]')
+      function)
+        shift
+        case "${1:-}" in '{'|'(') ;; *) shift ;; esac
+        _cp_wate=1 ;;
+      '!'|'{'|'}'|'('|')'|coproc|if|then|elif|else|fi|while|until|for|do|done|select|case|esac|in|'[['|']]')
         shift; _cp_wate=1 ;;
       '>'|'>>'|'<'|'<>'|[0-9]'>'|[0-9]'>>'|[0-9]'<'|'&>'|'&>>')
         shift; [ "$#" -gt 0 ] && shift; _cp_wate=1 ;;
@@ -1321,15 +1624,16 @@ _cp_locate_command_word() {             # segment
     if [ "$_cp_wate" = 0 ]; then
       _cp_wl="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
       case "$_cp_wl" in
-        sudo|doas|su|env|nice|ionice|nohup|time|timeout|stdbuf|setsid|command|builtin|exec|caffeinate)
+        sudo|doas|su|env|nice|ionice|nohup|time|timeout|gtimeout|stdbuf|setsid|command|builtin|exec|caffeinate)
           case "$_cp_wl" in
             sudo)    _cp_wv='ugphCDRT'; _cp_wvl='user|group|host|prompt|chdir|close-from|role|type|other-user' ;;
             su)      _cp_wv='csl';      _cp_wvl='command|shell|user' ;;
-            timeout) _cp_wv='sk';       _cp_wvl='signal|kill-after' ;;
+            timeout|gtimeout) _cp_wv='sk'; _cp_wvl='signal|kill-after' ;;
             env)     _cp_wv='uSC';      _cp_wvl='unset|chdir|split-string' ;;
             nice)    _cp_wv='n';        _cp_wvl='adjustment' ;;
             ionice)  _cp_wv='cnpt';     _cp_wvl='class|classdata|pid' ;;
             stdbuf)  _cp_wv='ioe';      _cp_wvl='input|output|error' ;;
+            exec)    _cp_wv='a';        _cp_wvl='' ;;
             *)       _cp_wv=;           _cp_wvl= ;;
           esac
           shift
@@ -1359,7 +1663,16 @@ _cp_locate_command_word() {             # segment
               -*) shift ;;
               '>'|'>>'|'<'|'<>'|[0-9]'>'|[0-9]'>>'|[0-9]'<'|'&>'|'&>>') shift; [ "$#" -gt 0 ] && shift ;;
               '>'*|'<'*|[0-9]'>'*|[0-9]'<'*|'&>'*) shift ;;
-              [0-9]*) case "$1" in *[!0-9]*) break ;; esac; shift ;;
+              [0-9]*)
+                # `timeout`/`gtimeout`'s own positional DURATION, not an
+                # option value — accepts a trailing unit letter or a decimal
+                # point (`5s`, `1m`, `1.5`) alongside plain digits.
+                if [ "$_cp_wl" = timeout ] || [ "$_cp_wl" = gtimeout ]; then
+                  case "$1" in *[!0-9.smhd]*) break ;; esac
+                else
+                  case "$1" in *[!0-9]*) break ;; esac
+                fi
+                shift ;;
               [A-Za-z_]*=*) shift ;;
               *) break ;;
             esac

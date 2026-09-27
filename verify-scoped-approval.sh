@@ -271,5 +271,176 @@ cd @WT@ && bash tmp/tramp1.sh "$(printf gh)" pr view 1
 cd @WT@ && bash tmp/tramp2.sh `echo ls` -la
 EOF
 
+
+printf '== PR #160 review round 1: findings 1-11 must never allow, only judge (0) or refuse (3) ==\n'
+RWT="$WORK/routside"; mkdir -p "$RWT"
+printf '#!/bin/sh\ngh pr merge 1 --squash\n' > "$RWT/evil.sh"
+ln -s "$RWT/evil.sh" "$CRWT/tmp/outlink.sh"
+printf '#!/bin/sh\necho run\n' > "$CRWT/run.sh"
+printf '#!/bin/sh\ngh pr merge 1 --squash\n' > "$CRWT/tmp/run.sh"
+for mc in \
+  "cd $CRWT && true"$'\n'"bash tmp/evil.sh|multi-line: true then bash on its own line" \
+  "cd $CRWT && bash tmp/evil.sh"$'\n'"|trailing newline only" \
+  "cd $CRWT && bash <<HD"$'\n'"bash tmp/evil.sh"$'\n'"HD|heredoc feeding bash"; do
+  c="${mc%%|*}"; label="${mc#*|}"
+  out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
+  case "$rc:$out" in
+    0:*/tmp/evil.sh|3:*) ok "judged or refused (rc=$rc): $label" ;;
+    *) bad "script ran unjudged (rc=$rc '$out'): $label" ;;
+  esac
+done
+for mc in \
+  "true"$'\n'"bash $RWT/evil.sh|absolute path, no cd prefix: true then bash on its own line" \
+  "bash $RWT/evil.sh"$'\n'"|absolute path, trailing newline only, no cd prefix" \
+  "echo hi"$'\n'"$RWT/evil.sh|absolute path word alone on the second line, no cd prefix"; do
+  c="${mc%%|*}"; label="${mc#*|}"
+  out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
+  case "$rc:$out" in
+    0:*/evil.sh|3:*) ok "judged or refused (rc=$rc): $label" ;;
+    *) bad "script ran unjudged (rc=$rc '$out'): $label" ;;
+  esac
+done
+out="$(_cp_code_ref "git status"$'\n'"ls -la" "$CRWT")"; rc=$?
+[ "$rc" = 1 ] && ok "a genuine multi-line capture running no script anywhere stays rc 1" \
+  || bad "git status+ls -la: rc=$rc '$out'"
+panel_safe=" Bash command"$'\n'"   ls -la /tmp"$'\n'"   (a description line)"$'\n'""$'\n'" Do you want to proceed?"$'\n'" ❯ 1. Yes"$'\n'"   2. No"
+out="$(_cp_code_ref "$panel_safe" "$CRWT")"; rc=$?
+[ "$rc" = 1 ] && ok "a numbered-panel scrape with no real script stays rc 1 (its own chrome does not misparse)" \
+  || bad "panel chrome misparsed as a command: rc=$rc '$out'"
+while IFS= read -r form; do
+  [ -n "$form" ] || continue
+  c="${form//@WT@/$CRWT}"
+  out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
+  case "$rc:$out" in
+    0:*/tmp/evil.sh|0:*/tmp/evil.py|0:*/tmp/outlink.sh|3:*) ok "judged or refused (rc=$rc): $c" ;;
+    *) bad "script ran unjudged (rc=$rc '$out'): $c" ;;
+  esac
+done <<EOF
+cd @WT@ && eval eval eval eval eval eval eval bash tmp/evil.sh
+cd @WT@ && echo \$(echo \$(echo \$(echo \$(echo \$(echo \$(echo \$(bash tmp/evil.sh)))))))
+cd @WT@ && \$SHELL tmp/evil.sh
+cd @WT@ && "\$BASH" tmp/evil.sh
+cd @WT@ && \$0 tmp/evil.sh
+cd @WT@ && \$(which bash) tmp/evil.sh
+cd @WT@ && \`which bash\` tmp/evil.sh
+cd @WT@ && ba\$()sh tmp/evil.sh
+cd @WT@ && x=bash; \$x tmp/evil.sh
+cd @WT@ && bash -c "\$(cat tmp/evil.sh)"
+cd @WT@ && sh -c "\$(<tmp/evil.sh)"
+cd @WT@ && eval "\$(cat tmp/evil.sh)"
+cd @WT@ && cat tmp/evil.sh |& bash
+cd @WT@ && cat tmp/evil.sh |& bash -s
+cd @WT@ && < tmp/evil.sh bash
+<tmp/evil.sh sh
+0<tmp/evil.sh bash
+cd @WT@ && < tmp/evil.py python3
+cd @WT@ && bash &>/dev/null < tmp/evil.sh
+cd @WT@ && python3 &>/dev/null < tmp/evil.py
+cd @WT@ && echo tmp/evil.sh | xargs -n 1 bash
+cd @WT@ && echo tmp/evil.sh | xargs -I {} sh {}
+cd @WT@ && echo tmp/evil.sh | xargs -P 2 bash
+cd @WT@ && echo tmp/evil.sh | xargs -L 1 bash
+cd @WT@ && watch -n 1 bash tmp/evil.sh
+cd @WT@ && parallel -j 2 bash ::: tmp/evil.sh
+cd @WT@ && eval cd tmp && bash run.sh
+cd @WT@ && \$(echo cd) tmp && bash run.sh
+cd @WT@ && echo \$'\\'' ; bash tmp/evil.sh
+cd @WT@ && echo \$'it\\'s' \$(bash tmp/evil.sh)
+cd @WT@ && ./tmp/outlink.sh
+EOF
+out="$(_cp_code_ref "$RWT/evil.sh" "$CRWT")"; rc=$?
+[ "$rc" = 3 ] && ok "an absolute /tmp path outside the worktree escalates (finding 11)" || bad "outside-worktree absolute path: rc=$rc '$out'"
+
+printf '== finding 9: python flags other than -uBev still resolve the file slot ==\n'
+for pyflag in -I -O -S; do
+  out="$(_cp_code_ref "cd $CRWT && python3 $pyflag tmp/evil.py" "$CRWT")"; rc=$?
+  case "$rc:$out" in
+    0:*/tmp/evil.py) ok "python3 $pyflag resolves the file slot" ;;
+    *) bad "python3 $pyflag: rc=$rc '$out'" ;;
+  esac
+done
+out="$(_cp_code_ref "cd $CRWT && python3 -W ignore tmp/evil.py" "$CRWT")"; rc=$?
+case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -W ignore resolves past its value" ;; *) bad "python3 -W: rc=$rc '$out'" ;; esac
+out="$(_cp_code_ref "cd $CRWT && python3 -X utf8 tmp/evil.py" "$CRWT")"; rc=$?
+case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -X utf8 resolves past its value" ;; *) bad "python3 -X: rc=$rc '$out'" ;; esac
+
+printf '== finding 10: launcher option values and shell keywords no longer hide the script ==\n'
+for form in "timeout 5s bash tmp/evil.sh" "timeout 1.5m bash tmp/evil.sh" "exec -a foo bash tmp/evil.sh" \
+            "coproc bash tmp/evil.sh" "function f { bash tmp/evil.sh; }; f"; do
+  out="$(_cp_code_ref "cd $CRWT && $form" "$CRWT")"; rc=$?
+  case "$rc:$out" in
+    0:*/tmp/evil.sh|3:*) ok "resolves past the launcher: $form" ;;
+    *) bad "launcher hid the script: $form (rc=$rc '$out')" ;;
+  esac
+done
+
+printf '== finding 13: python3 -m <local.module> resolves to its worktree file ==\n'
+out="$(_cp_code_ref "cd $CRWT && python3 -m tmp.evil" "$CRWT")"; rc=$?
+case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -m tmp.evil resolves tmp/evil.py" ;; *) bad "python3 -m tmp.evil: rc=$rc '$out'" ;; esac
+out="$(_cp_code_ref "cd $CRWT && python3 -m tmp.evil | tail -1" "$CRWT")"; rc=$?
+case "$rc:$out" in 0:*/tmp/evil.py|3:*) ok "python3 -m tmp.evil resolves past a trailing pipe" ;; *) bad "python3 -m piped: rc=$rc '$out'" ;; esac
+out="$(_cp_code_ref "cd $CRWT && python3 -m json.tool tmp/x.json | head" "$CRWT")"; rc=$?
+[ "$rc" = 1 ] && ok "python3 -m json.tool (no matching worktree file) stays out of scope" || bad "json.tool: rc=$rc '$out'"
+
+printf '== finding 14: the same file judged as two different kinds counts as two scripts ==\n'
+printf 'import shutil\nshutil.rmtree("/Users")\n' > "$CRWT/tmp/rm.py"
+out="$(_cp_code_ref "cd $CRWT && python3 tmp/rm.py" "$CRWT")"; rc=$?
+[ "$rc" = 0 ] && ok "python3 tmp/rm.py resolves alone" || bad "python3 tmp/rm.py alone: rc=$rc"
+out="$(_cp_code_ref "cd $CRWT && bash tmp/rm.py 2>/dev/null; python3 tmp/rm.py" "$CRWT")"; rc=$?
+[ "$rc" = 3 ] && ok "the same path judged shell AND python counts as two scripts, escalates" \
+  || bad "two-kind same-path replay: rc=$rc '$out'"
+
+printf '== finding 15: clustered -c and value-taking shell options no longer over-escalate ==\n'
+for form in "bash -lc 'npm test'" "bash -ec 'npm test'" "sh -ec 'git status'" "zsh -lc 'git status'" \
+            "bash -o pipefail -c 'npm test | tail'" "bash -euo pipefail -c 'npm test'"; do
+  out="$(_cp_code_ref "cd $CRWT && $form" "$CRWT")"; rc=$?
+  [ "$rc" = 1 ] && ok "no over-escalation: $form" || bad "over-escalated: $form (rc=$rc '$out')"
+done
+out="$(_cp_code_ref "cd $CRWT && bash -n tmp/x.sh" "$CRWT")"; rc=$?
+[ "$rc" = 1 ] && ok "bash -n never executes, stays out of scope" || bad "bash -n tmp/x.sh: rc=$rc"
+out="$(_cp_code_ref "cd $CRWT && bash -n tmp/evil.sh" "$CRWT")"; rc=$?
+[ "$rc" = 1 ] && ok "bash -n tmp/evil.sh is not reserved either — it never executes" || bad "bash -n tmp/evil.sh: rc=$rc"
+
+printf '== finding 16: find -okdir escalates like -exec/-execdir/-ok ==\n'
+out="$(_cp_code_ref "cd $CRWT && find tmp -name evil.sh -okdir bash {} \\;" "$CRWT")"; rc=$?
+[ "$rc" = 3 ] && ok "find -okdir escalates" || bad "find -okdir: rc=$rc '$out'"
+
+printf '== finding 17: interpreter-loading env vars are treated as a second, unreviewed script ==\n'
+for form in "BASH_ENV=tmp/evil.sh bash tmp/clean.sh" "BASH_ENV=tmp/evil.sh bash -c true" \
+            "PYTHONPATH=tmp python3 tmp/clean.py" "export BASH_ENV=tmp/evil.sh; bash tmp/clean.sh"; do
+  out="$(_cp_code_ref "cd $CRWT && $form" "$CRWT")"; rc=$?
+  [ "$rc" = 3 ] && ok "env-poisoned invocation escalates: $form" || bad "env poisoning missed: $form (rc=$rc '$out')"
+done
+
+printf '== finding 18: csh/tcsh/fish, pypy, and uv run/uvx/pipx run are covered ==\n'
+while IFS= read -r form; do
+  [ -n "$form" ] || continue
+  c="${form//@WT@/$CRWT}"
+  out="$(_cp_code_ref "$c" "$CRWT")"; rc=$?
+  case "$rc:$out" in
+    0:*/tmp/evil.sh|0:*/tmp/evil.py|3:*) ok "judged or refused (rc=$rc): $c" ;;
+    *) bad "interpreter not covered (rc=$rc '$out'): $c" ;;
+  esac
+done <<EOF
+cd @WT@ && csh tmp/evil.sh
+cd @WT@ && tcsh tmp/evil.sh
+cd @WT@ && fish tmp/evil.sh
+cd @WT@ && pypy3 tmp/evil.py
+cd @WT@ && uv run python tmp/evil.py
+cd @WT@ && uv run tmp/evil.py
+EOF
+
+printf '== finding 12: rewriting the script another segment runs escalates (rename/copy laundering) ==\n'
+printf '#!/bin/sh\necho hello\n' > "$CRWT/tmp/laundered.sh"
+for form in "cp tmp/evil.sh tmp/laundered.sh && bash tmp/laundered.sh" \
+            "cat tmp/evil.sh > tmp/laundered.sh; bash tmp/laundered.sh" \
+            "ln -sf evil.sh tmp/laundered.sh && bash tmp/laundered.sh"; do
+  out="$(_cp_code_ref "cd $CRWT && $form" "$CRWT")"; rc=$?
+  [ "$rc" = 3 ] && ok "laundering escalates: $form" || bad "laundering slipped through: $form (rc=$rc '$out')"
+done
+out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh 2>&1 | tail -3" "$CRWT")"; rc=$?
+[ "$rc" = 0 ] && [ "$out" = "shell	$CRWT/tmp/clean.sh" ] \
+  && ok "a script named only in its own invocation still resolves and binds its sha" \
+  || bad "single-mention regression: rc=$rc '$out'"
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }
