@@ -1,9 +1,12 @@
 # Pre-tool approval: the hook decides on the exact input
 
-Status: **shadow** (2026-09-26). The hook computes and records a verdict for every
-registered-worker tool call; nothing is enforced by it, and the approval menu,
-`herdr-select.sh` and peer answering are unchanged. Cutover is Terrence's
-decision after shadow data (§8).
+Status (2026-09-27): **shadow for every worker; enforcement built but OFF by
+default.** The hook records a verdict for every registered-worker tool call.
+Enforcement exists only behind `spawn-task.sh --approval hook` (§11), which no
+default or existing spawn uses; the approval menu, `herdr-select.sh` and peer
+answering are unchanged for every other task. Terrence answered the cutover
+questions on 2026-09-27 (§10); the first canary waits for the q1 gate
+(`scripts/shadow-compare.sh --gate`) and is scheduled by Main.
 
 ## 1. Goal and metric
 
@@ -77,7 +80,8 @@ cutover (`tools.approval.<tool>: deny`), with the hook as the backstop.
 | `read` of `http(s)://`, `web_search` | allow | allow (a GET; same as today — `net_read` is not manifest-enforced for these, see §7) |
 | internal URLs (`skill://`, `rule://`, `artifact://`, `agent://`, `history://`, `pr://`, `issue://`, `local://`, `mcp://`) | allow | allow |
 | `todo`, `wait`, `ask`, `checkpoint`, `rewind`, `hub`, `resolve`, `security_scan`, `new_context`, `context_notes`, job observers | allow | allow |
-| `learn`, `retain`, `recall`, `reflect`, `report_issue` | allow | allow (omp memory, not a host action) — see open question 4 |
+| `learn` | conductor (q4) | escalate → an action request routed to the conductor; the lesson is saved only after review |
+| `retain`, `recall`, `reflect`, `report_issue` | allow | allow (omp memory, not a host action) |
 | read-only devices: `fleet_status`, `pr_ready`, `handoff_debt`, `single_copy_scan`, `worktree_debt`, `suite_wired`, `decisions_open`, `project_status`, `notepad_read`, `notepad_stats` | allow | allow |
 | `secret_present` | reserved | human-only: workers hold no credentials |
 | `memory_edit` | block | forgetting/invalidating shared memory is the conductor's |
@@ -103,7 +107,8 @@ hook cannot judge.
 
 ## 4. The one escalation channel (no menu)
 
-Enforcing-mode behaviour (design; not built this turn):
+Enforcing-mode behaviour (built 2026-09-27, behind `--approval hook`; §11 has the
+as-built differences):
 
 1. **Worker side.** The hook returns `{block: true, reason}` for `escalate` /
    `reserved`. Before returning it appends, with `claim_once`, an
@@ -237,7 +242,7 @@ that a reviewer cannot explain, `elapsed_ms` p95 recorded, and every
 `SHADOW_TIGHTER` row either accepted or turned into a policy fix in
 `lib/command-policy.sh` (one policy).
 
-Canary: one spawned task with an explicit `spawn-task.sh --pretool-enforce` flag
+Canary: one spawned task with an explicit `spawn-task.sh --approval hook` flag
 (stored on the registry row, so a relaunch keeps it): omp launched with
 `--auto-approve --config <worker overlay>` (`tools.approval.eval|python|browser|
 computer|debug|generate_image|tts|manage_skill: deny`) and the hook in enforcing
@@ -282,14 +287,83 @@ file_approvals), `lib/push-wake.sh`, `lib/pane-guard.sh`, `send-to-agent.sh`,
 - A shadow event can be lost if omp exits within milliseconds of the call (the
   detached child reads its payload from a pipe). Shadow data only; not a gate.
 
-## 10. Open questions for Terrence
+## 10. Terrence's decisions (2026-09-27)
 
-1. Cutover itself: auto-approve + enforcing hook for a canary task, after how much
-   shadow data?
-2. eval off for workers (files + code by reference instead): acceptable friction?
-3. `read`/`web_search` over HTTP stay unscoped as today — scope them to the
-   manifest's `net_read`, or leave it?
-4. `learn` writes lessons future sessions load (including Main's). Allow, or
-   route lesson text to the conductor?
-5. Human-route requests: Slack only, or also a formserve decision (durable,
-   expiry ≠ decline)?
+Answered on the hub form `20260927T001841-8741` (`answered_via: hub`); every
+recommended default was taken, no notes.
+
+1. **Canary gate:** start the 3-job canary only after **5 days** of shadow data
+   AND **≥ 1,000 shadow rows across ≥ 5 tasks**, with **≤ 2 % disagreement**, and
+   **every `SHADOW_LOOSER` row explained by hand**. Checked by
+   `scripts/shadow-compare.sh --gate` (explanations: `<seq>\t<why>` lines in
+   `~/.local/state/herdr/runs/shadow-explained.tsv`). Default after the canary
+   only if: zero reserved actions ran without a yes; ≤ 1 human question per job
+   (vs 5.06 baseline); no worker retries a blocked step more than once; every
+   handoff answered through the one channel and picked back up automatically.
+2. **eval / python / browser / debugger off for workers** (scripts run via bash
+   under code by reference instead), accepting the cost of the 244 historical
+   eval calls. Built as `agent-hooks/omp-worker-overlay.yml`, applied only with
+   `--approval hook`.
+3. **Web reads stay unscoped for now** (`read http(s)://`, `web_search`); revisit
+   after the canary.
+4. **`learn` goes to the conductor**: an action request; saved only if approved.
+5. **Human-route requests: Slack plus a durable hub decision form**; expiry is
+   never a decline.
+
+## 11. As built: enforcement behind `--approval hook` (2026-09-27)
+
+Nothing here runs for a task spawned without the flag.
+
+- **Spawn** (`spawn-task.sh --approval menu|hook`, default `menu`): `hook` is
+  validated before any side effect — managed omp launch only (claude/codex/omp
+  flavors), effective posture `write` only (a stricter floor or yolo refuses
+  rather than being re-interpreted), overlay present — and otherwise the spawn
+  is refused. It replaces `--approval-mode write` with
+  `--auto-approve --config agent-hooks/omp-worker-overlay.yml`, stamps
+  `HERDR_APPROVAL=hook`, and passes `approval=hook` to `register_task`, which
+  stores it on the row (schema v6 `tasks.approval`, default `menu`) and records
+  an `approval_posture` event. Nothing updates the column afterwards, so a
+  relaunch in that pane keeps it. A hook worker whose registration fails is never
+  launched. A default spawn's `--dry-run` output is byte-identical to before.
+- **Hook** (`agent-hooks/omp-herdr-control.ts`): enforcement is on only when the
+  task's **registry row** says `approval=hook` (read once per session, cached once
+  it answers). `HERDR_APPROVAL=hook` in the launch environment can only tighten:
+  it turns enforcement on so that an unreadable registry or a disagreeing row
+  refuses every call. The existing guards (fleet registration, #159 write scope)
+  still run first. Then `lib/pretool-shadow.sh --enforce --record` runs
+  synchronously (20 s timeout) on the exact input; any failure blocks.
+- **Verdict → answer**: allow runs; `deny`/`block` are refused with no request;
+  `escalate`/`reserved`/`learn` look up `action_requests` for
+  `(task, action_sha256)` — an approved one-shot grant is consumed (check-and-set
+  UPDATE; exactly one of N parallel identical calls runs) and the call runs; a
+  pending request blocks as "still waiting"; a declined one blocks with the
+  reviewer's reason and is not re-requested; otherwise a new request is created
+  (deterministic id, so parallel identical calls make one row) and the conductor
+  is woken immediately. `action_sha256` covers the execution-relevant input only
+  (bash: command, cwd, service env/name; other tools: the whole input minus the
+  model's free-text `i`), so a rephrased intent still matches and one changed byte
+  does not.
+- **Deciding** (`herdr-action.sh approve|decline <id>`): conductor authority as in
+  `herdr-select.sh` (caller pane = registered conductor pane with a live matching
+  generation, active task, operational category + reason; approve only
+  conductor-route requests; decline anything). Human authority only through an
+  **answered hub form for exactly that request** (`--form <id>`). Approve records
+  a one-shot grant, or for a code-by-reference script a `file_approvals` row bound
+  to the reviewed sha256; both write an `approvals` row and `action_decided`, and
+  the worker is told in its pane (`send-to-agent.sh`, after a pane-generation
+  check).
+- **Surfacing**: conductor route — `herdr-action.sh surface` wakes the conductor
+  pane once (from the hook, detached; the hub's tick is the backstop).
+  Human route — reserved requests, or conductor requests still pending after
+  `HERDR_ACTION_STALE_S` (900 s) — the hub's tick (`hub.py` `_action_tick`, every
+  15 s, one read-only query when nothing is pending) posts one Slack alert at
+  class `human-action` (`lib/slack-level.sh`: an error class, posted at the
+  default level) and serves a formserve decision; an answered form is applied as
+  human authority; an expired form is recorded as `action_form_expired` and
+  re-served — never a decline. `lib/reconcile.sh` reports `action_requested` to
+  the owning conductor at session start.
+- **Differences from §4's sketch**: request state lives in an `action_requests`
+  table (events alone cannot do an atomic one-shot consume); the Slack/form half
+  runs in the hub, not the worker, because a `--no-secrets` worker has no Slack
+  credential; conductor wakes use `send-to-agent.sh` directly rather than
+  `lib/push-wake.sh`, whose prompt-id machinery this path exists to retire.

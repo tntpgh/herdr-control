@@ -19,7 +19,9 @@
 # scripts/shadow-compare.sh can measure it against what the menu path actually
 # did.
 #
-# Usage: pretool-shadow.sh [--record]   (payload JSON on stdin)
+# Usage: pretool-shadow.sh [--record] [--enforce]   (payload JSON on stdin)
+#   --enforce: hook-approval tasks only (see pretool_enforce below); prints
+#   {decision, reason, request_id, verdict} for the hook instead of the row.
 #   payload: {tool, call_id, input, cwd, guard_block, t0_ms}
 #     guard_block: the reason string of a block the hook's existing guards
 #                  (pretool-registration, #159 write scope) returned, or null.
@@ -55,6 +57,7 @@ set -uo pipefail
 _ps_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_ps_dir/scoped-policy.sh"
 . "$_ps_dir/pane-guard.sh"
+. "$_ps_dir/action-request.sh"
 
 PS_CMD_CAP=2000
 
@@ -112,9 +115,16 @@ _ps_identity() {
   [ -n "${HERDR_RUN_ID:-}" ] || _ps_id_fail "HERDR_TASK_ID is set but HERDR_RUN_ID is not" || return 1
   [ -n "${HERDR_PANE_ID:-}" ] || _ps_id_fail "HERDR_PANE_ID is not set" || return 1
   # Read-only use of the registry: mark it ready so no helper here (read_task,
-  # file_approval_state inside peer_decide) runs registry_init's writes.
+  # file_approval_state inside peer_decide) runs registry_init's writes. The
+  # one exception is a registry not yet migrated to v6 (no tasks.approval):
+  # read_task needs that column, so the first shadow child after a deploy runs
+  # registry_init's idempotent migration once instead of failing every call.
   if [ ! -r "$(registry_db)" ] || ! _sql "SELECT count(*) FROM tasks LIMIT 1;" >/dev/null 2>&1; then
     PS_REGISTRY_OK=0; _ps_id_fail "registry unreadable ($(registry_db))"; return 1
+  fi
+  if ! _sql "SELECT approval FROM tasks LIMIT 0;" >/dev/null 2>&1 \
+     || ! _sql "SELECT 1 FROM action_requests LIMIT 0;" >/dev/null 2>&1; then
+    registry_init >/dev/null 2>&1 || { PS_REGISTRY_OK=0; _ps_id_fail "registry not migrated and migration failed"; return 1; }
   fi
   _HERDR_REGISTRY_READY=1
   PS_TASK_JSON="$(read_task "$HERDR_RUN_ID" "$HERDR_TASK_ID" 2>/dev/null)" || PS_TASK_JSON=""
@@ -222,8 +232,13 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
     read|grep|glob|find|ast_grep|search)
       PS_VERDICT=allow PS_REASON="read-only tool"
       _ps_read_paths "$input" ;;
-    todo|wait|ask|checkpoint|rewind|hub|resolve|web_search|security_scan|learn|new_context|context_notes|taskoutput|taskget|tasklist|bashoutput)
+    todo|wait|ask|checkpoint|rewind|hub|resolve|web_search|security_scan|new_context|context_notes|taskoutput|taskget|tasklist|bashoutput)
       PS_VERDICT=allow PS_REASON="no host side effect beyond this session" ;;
+    learn)
+      # Terrence, 2026-09-27 (hook-cutover decision q4): a lesson future
+      # sessions load (Main's included) is saved only after the conductor
+      # reviews it.
+      PS_VERDICT=escalate PS_REASON="a lesson that future sessions load is saved only after your conductor reviews it" ;;
     github)
       op="$(printf '%s' "$input" | jq -r '.op // empty' 2>/dev/null)"
       case "$op" in
@@ -264,22 +279,121 @@ pretool_payload_json() {                # payload-json elapsed-ms -> event/stdou
     --arg cmd "$cmd_store" --arg csha "$cmd_sha" --arg isha "$in_sha" \
     --arg cwd "$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null)" \
     --arg pane "${HERDR_PANE_ID:-}" --arg cp "$PS_CODE_PATH" --arg cs "$PS_CODE_SHA" --arg el "$elapsed" \
-    '{schema:1, mode:"shadow", tool:$tool, call_id:$call, verdict:$v, policy:$pol, reason:$r,
+    --arg mode "${PS_MODE:-shadow}" --arg dec "${PS_DECISION:-}" --arg rid "${PS_REQUEST_ID:-}" \
+    '{schema:1, mode:$mode, tool:$tool, call_id:$call, verdict:$v, policy:$pol, reason:$r,
       authority:$auth, command:$cmd, command_sha256:$csha, input_sha256:$isha, cwd:$cwd, pane:$pane,
-      code_path:$cp, code_sha256:$cs, elapsed_ms:(($el|tonumber?) // null)}'
+      code_path:$cp, code_sha256:$cs, elapsed_ms:(($el|tonumber?) // null)}
+     + (if $mode == "enforce" then {decision:$dec, request_id:$rid} else {} end)'
+}
+
+# ---- enforce mode (hook-approval tasks only) ----------------------------------
+# Only called by the omp hook for a task whose REGISTRY ROW says approval=hook
+# (or whose launch env claims it — which can only make this refuse, never
+# allow). Turns the verdict into the hook's answer:
+#   allow            -> run it
+#   escalate/reserved -> a one-shot grant already approved for these exact
+#                       bytes is consumed and the call runs; otherwise an
+#                       action request is (found or) created and it is blocked
+#   deny/block       -> blocked, nobody can approve it
+# Sets PS_DECISION (allow|block), PS_WORKER_REASON, PS_REQUEST_ID.
+_ps_request_command() {                 # input-json -> text the reviewer sees
+  if [ -n "$PS_CMD" ]; then
+    case "$PS_REASON" in
+      credential*|*"credential-value"*) printf '[credential withheld] %s' "$(pretool_redact "$PS_CMD")" ;;
+      *) printf '%s' "$PS_CMD" ;;
+    esac
+  else
+    printf '%s %s' "$PS_TOOL" "$(printf '%s' "$1" | jq -cS 'if type=="object" then del(.i) else . end' 2>/dev/null | head -c 20000)"
+  fi
+}
+
+pretool_enforce() {                     # payload-json (after pretool_decide) -> 0 allow, 8 block
+  local payload="$1" input cwd sha route kind cmd approval here_root
+  PS_DECISION=block PS_WORKER_REASON="" PS_REQUEST_ID=""
+  approval="$(printf '%s' "$PS_TASK_JSON" | jq -r '.approval // empty' 2>/dev/null)"
+  if [ "$PS_POLICY" = identity ] || [ -z "$PS_TASK_JSON" ]; then
+    PS_WORKER_REASON="herdr hook-approval: refused — $PS_REASON. The pre-tool check cannot prove this session is a live registered hook-approval worker, so nothing runs. Stop and tell your conductor."
+    return 8
+  fi
+  if [ "$approval" != hook ]; then
+    PS_VERDICT=block PS_POLICY=identity
+    PS_REASON="identity: this session was launched for hook approval but its registry row says approval=${approval:-menu}"
+    PS_WORKER_REASON="herdr hook-approval: refused — $PS_REASON. Nothing runs; tell your conductor."
+    return 8
+  fi
+  case "$PS_VERDICT" in
+    allow) PS_DECISION=allow; return 0 ;;
+    escalate|reserved) ;;
+    deny)
+      PS_WORKER_REASON="herdr: refused — ${PS_REASON}. Nobody can approve this. Do not retry it or work around it; change approach or end your turn."
+      return 8 ;;
+    *)
+      PS_WORKER_REASON="herdr: refused — ${PS_REASON}. Do not retry it or work around it."
+      return 8 ;;
+  esac
+  input="$(printf '%s' "$payload" | jq -c '.input // {}' 2>/dev/null)"
+  cwd="$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null)"
+  sha="$(pretool_action_sha "$PS_TOOL" "$input" "$cwd")"
+  route=conductor; [ "$PS_VERDICT" = reserved ] && route=human
+  kind=once; [ -n "$PS_CODE_PATH" ] && [ "$PS_VERDICT" = escalate ] && kind=file
+  cmd="$(_ps_request_command "$input")"
+  if ! action_request_resolve "$HERDR_RUN_ID" "$HERDR_TASK_ID" "$PS_TOOL" "$sha" "$cmd" "$PS_VERDICT" \
+       "$PS_REASON" "$route" "$kind" "$PS_CODE_PATH" "$PS_CODE_SHA"; then
+    PS_WORKER_REASON="herdr: not run — ${PS_REASON}. The request could not be recorded (registry write failed), so nothing runs. Tell your conductor."
+    return 8
+  fi
+  PS_REQUEST_ID="$AR_REQUEST_ID"
+  case "$AR_STATE" in
+    consumed)
+      PS_DECISION=allow
+      PS_REASON="approved request $AR_REQUEST_ID consumed (one-shot grant for these exact bytes)"
+      return 0 ;;
+    declined)
+      PS_WORKER_REASON="herdr: not run — request $AR_REQUEST_ID for this exact call was DECLINED (${AR_WHO:-reviewer}): ${AR_WHY:-no reason given}. Do not retry it or work around it; change approach or end your turn."
+      return 8 ;;
+    pending)
+      PS_WORKER_REASON="herdr: not run — still waiting on request $AR_REQUEST_ID (${PS_REASON}). Do not retry it or work around it; continue other work or end your turn. The answer arrives in this pane as [HERDR-ACTION] $AR_REQUEST_ID." ;;
+    new)
+      if [ "$route" = human ]; then
+        PS_WORKER_REASON="herdr: not run — ${PS_REASON}. This is human-only: requested as $AR_REQUEST_ID for Terrence (Slack + hub decision form). Do not retry it or work around it; continue other work or end your turn. The answer arrives in this pane as [HERDR-ACTION] $AR_REQUEST_ID; if approved, re-issue the IDENTICAL call."
+      else
+        PS_WORKER_REASON="herdr: not run — ${PS_REASON}. Requested as $AR_REQUEST_ID for your conductor. Do not retry it or work around it; continue other work or end your turn. The answer arrives in this pane as [HERDR-ACTION] $AR_REQUEST_ID; if approved, re-issue the IDENTICAL call (same command and arguments, byte for byte)."
+      fi
+      # Wake the conductor now (detached, every fd closed so the hook's
+      # spawnSync is not held open); the hub's tick is the backstop and
+      # owns the human route (it holds the Slack credential).
+      here_root="$(cd "$_ps_dir/.." && pwd)"
+      if [ "$route" = conductor ] && [ -z "${HERDR_ACTION_NO_SURFACE:-}" ]; then
+        ( nohup bash "$here_root/herdr-action.sh" surface "$AR_REQUEST_ID" </dev/null >/dev/null 2>&1 & ) 2>/dev/null
+      fi ;;
+  esac
+  return 8
 }
 
 pretool_shadow_main() {
-  local record=0 payload rc t0 now elapsed="" out eid call
-  [ "${1:-}" = --record ] && record=1
+  local record=0 enforce=0 payload rc t0 now elapsed="" out eid call a
+  for a in "$@"; do
+    case "$a" in --record) record=1 ;; --enforce) enforce=1 ;; esac
+  done
   payload="$(cat)"
   printf '%s' "$payload" | jq -e 'type=="object"' >/dev/null 2>&1 || payload='{}'
   pretool_decide "$payload"; rc=$?
+  if [ "$enforce" = 1 ]; then
+    PS_MODE=enforce
+    pretool_enforce "$payload"; rc=$?
+  fi
   t0="$(printf '%s' "$payload" | jq -r '.t0_ms // empty' 2>/dev/null)"
   now="$(_ps_now_ms)"
   case "$t0$now" in ''|*[!0-9]*) ;; *) [ -n "$t0" ] && [ -n "$now" ] && elapsed=$((now - t0)) ;; esac
   out="$(pretool_payload_json "$payload" "$elapsed")"
-  printf '%s\n' "$out"
+  if [ "$enforce" = 1 ]; then
+    # The hook reads ONE line: {decision, reason, request_id}. The reason is
+    # what the worker is told; it is never shown a secret it did not type.
+    jq -nc --arg d "$PS_DECISION" --arg r "$PS_WORKER_REASON" --arg id "$PS_REQUEST_ID" \
+      --arg v "$PS_VERDICT" '{decision:$d, reason:$r, request_id:$id, verdict:$v}'
+  else
+    printf '%s\n' "$out"
+  fi
   if [ "$record" = 1 ] && [ "${PS_REGISTRY_OK:-1}" = 1 ] && [ -n "${HERDR_TASK_ID:-}" ]; then
     call="$(printf '%s' "$payload" | jq -r '.call_id // empty' 2>/dev/null)"
     eid="$(gen_id ptv)"

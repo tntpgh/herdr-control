@@ -392,7 +392,7 @@ run_reconciliation() {
     [ "$ev_seq" -gt "$max_seq" ] && max_seq="$ev_seq"
     ev_type=$(printf '%s' "$ev_json" | jq -r '.type // empty')
     case "$ev_type" in
-      input_required|push_wake_refused|pane_identity_uncertain|conductor_identity_uncertain|stale_worker_hook_refused|completion_evidence|completion_evidence_rejected) ;;
+      input_required|push_wake_refused|pane_identity_uncertain|conductor_identity_uncertain|stale_worker_hook_refused|completion_evidence|completion_evidence_rejected|action_requested) ;;
       wake_result)
         # A submitted wake needs no report — the conductor it woke IS the
         # audience. Only failures are silent and need surfacing.

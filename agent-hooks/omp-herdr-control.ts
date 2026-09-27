@@ -847,8 +847,11 @@ function cacheBashInput(event: unknown): void {
 function onToolCall(event: unknown, ctx?: unknown): Block | undefined {
   cacheBashInput(event);
   const result = pretoolRegistrationBlock(event) ?? workerWriteScopeBlock(event, ctx);
-  recordShadowVerdict(event, ctx, result);
-  return result;
+  if (result || !hookApprovalEnforced()) {
+    recordShadowVerdict(event, ctx, result);
+    return result;
+  }
+  return enforceHookApproval(event, ctx);
 }
 
 // SHADOW MODE (docs/design/pretool-approval.md): for a registered worker only,
@@ -864,32 +867,154 @@ function onToolCall(event: unknown, ctx?: unknown): Block | undefined {
 const PRETOOL_SHADOW_SH = path.join(ROOT, "lib", "pretool-shadow.sh");
 const WORKER_PANE_ID = process.env.HERDR_PANE_ID?.trim() ?? "";
 
+function shadowPayload(event: unknown, ctx: unknown, result: Block | undefined): string {
+  const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+  const c = ctx && typeof ctx === "object" ? (ctx as Record<string, unknown>).cwd : undefined;
+  return JSON.stringify({
+    tool: typeof e.toolName === "string" ? e.toolName : "",
+    call_id: typeof e.toolCallId === "string" ? e.toolCallId : "",
+    input: e.input ?? {},
+    cwd: typeof c === "string" ? c : process.cwd(),
+    guard_block: result?.reason ?? null,
+    t0_ms: Date.now(),
+  });
+}
+
+function shadowEnv(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    HOME: LOAD_HOME,
+    HERDR_TASK_ID: WORKER_TASK_ID,
+    HERDR_RUN_ID: WORKER_RUN_ID,
+    HERDR_PANE_ID: WORKER_PANE_ID,
+  };
+  if (LOAD_RUN_STATE_DIR) env.HERDR_RUN_STATE_DIR = LOAD_RUN_STATE_DIR;
+  else delete env.HERDR_RUN_STATE_DIR;
+  return env;
+}
+
 function recordShadowVerdict(event: unknown, ctx: unknown, result: Block | undefined): void {
   if (!WORKER_TASK_ID) return;
   try {
     if (!safeExists(PRETOOL_SHADOW_SH)) return;
-    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
-    const c = ctx && typeof ctx === "object" ? (ctx as Record<string, unknown>).cwd : undefined;
-    const payload = JSON.stringify({
-      tool: typeof e.toolName === "string" ? e.toolName : "",
-      call_id: typeof e.toolCallId === "string" ? e.toolCallId : "",
-      input: e.input ?? {},
-      cwd: typeof c === "string" ? c : process.cwd(),
-      guard_block: result?.reason ?? null,
-      t0_ms: Date.now(),
-    });
-    const env: Record<string, string | undefined> = {
-      ...process.env,
-      HOME: LOAD_HOME,
-      HERDR_TASK_ID: WORKER_TASK_ID,
-      HERDR_RUN_ID: WORKER_RUN_ID,
-      HERDR_PANE_ID: WORKER_PANE_ID,
-    };
-    if (LOAD_RUN_STATE_DIR) env.HERDR_RUN_STATE_DIR = LOAD_RUN_STATE_DIR;
-    else delete env.HERDR_RUN_STATE_DIR;
-    spawnDetached([PRETOOL_SHADOW_SH, "--record"], payload, env);
+    spawnDetached([PRETOOL_SHADOW_SH, "--record"], shadowPayload(event, ctx, result), shadowEnv());
   } catch {
     // MUST NOT throw — a throwing tool_call handler blocks the tool.
+  }
+}
+
+// ENFORCING MODE — hook approval (docs/design/pretool-approval.md §4, §8).
+// Only for a task spawned with `spawn-task.sh --approval hook`, which launches
+// omp with --auto-approve (no approval menu ever paints) and records
+// approval=hook on the task's REGISTRY ROW. That row is the authority: it is
+// read once per session (read_task, cached once it answers) and nothing the
+// worker can edit feeds it. HERDR_APPROVAL=hook in the launch environment can
+// only TIGHTEN — it turns enforcement on so that an unreadable registry or a
+// row that disagrees makes lib/pretool-shadow.sh --enforce refuse every call
+// (an auto-approve session must never fall back to "no check at all"). It can
+// never turn enforcement off. Every other worker (approval=menu, the default)
+// keeps exactly the shadow path above and omp's own approval menu.
+//
+// The call is judged synchronously on its exact input: allow runs;
+// escalate/reserved is blocked with a reason telling the worker it was handed
+// to its conductor (or to Terrence) as an action request, unless a one-shot
+// grant for these exact bytes was approved (herdr-action.sh), which is then
+// consumed; deny/block is refused. Any failure here — a missing lib, a
+// timeout, garbage output, an exception — BLOCKS: fail closed.
+const LOAD_APPROVAL_ENV = process.env.HERDR_APPROVAL?.trim() ?? "";
+let registryApproval: "hook" | "menu" | undefined; // cached once the registry answers
+
+const APPROVAL_READ_ARGS = ["-c", '. "$1" && read_task "$2" "$3"', "herdr-approval", RUN_REGISTRY_SH, WORKER_RUN_ID, WORKER_TASK_ID];
+
+function approvalReadEnv(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env, HOME: LOAD_HOME };
+  if (LOAD_RUN_STATE_DIR) env.HERDR_RUN_STATE_DIR = LOAD_RUN_STATE_DIR;
+  else delete env.HERDR_RUN_STATE_DIR;
+  return env;
+}
+
+// A read that succeeded with no row means "not a hook task" (menu), cached like
+// any answer — HERDR_APPROVAL=hook still tightens that session to refuse-all.
+function parseApprovalRow(stdout: string): "hook" | "menu" | undefined {
+  if (!stdout.trim()) return "menu";
+  try {
+    const row = JSON.parse(stdout.trim()) as Record<string, unknown>;
+    if (!row || typeof row !== "object" || row.task_id !== WORKER_TASK_ID) return undefined;
+    return row.approval === "hook" ? "hook" : "menu";
+  } catch {
+    return undefined;
+  }
+}
+
+// Prefetched once at module load (session start) so a menu worker's first tool
+// call does not pay the registry read; a tool call that arrives before the
+// prefetch answers reads synchronously below.
+function prefetchRegistryApproval(): void {
+  if (!WORKER_TASK_ID || !WORKER_RUN_ID) return;
+  try {
+    if (!safeExists(RUN_REGISTRY_SH)) return;
+    const child = spawn("bash", APPROVAL_READ_ARGS, { stdio: ["ignore", "pipe", "ignore"], env: approvalReadEnv() });
+    let out = "";
+    child.on("error", () => {});
+    child.stdout?.on("data", (d) => { out += String(d); });
+    child.on("close", (code) => {
+      if (code === 0 && !registryApproval) registryApproval = parseApprovalRow(out);
+    });
+    child.unref();
+  } catch {
+    // best effort; the synchronous read is the fallback
+  }
+}
+prefetchRegistryApproval();
+
+function readRegistryApproval(): "hook" | "menu" | undefined {
+  if (registryApproval) return registryApproval;
+  if (!WORKER_RUN_ID || !safeExists(RUN_REGISTRY_SH)) return undefined;
+  const r = spawnSync("bash", APPROVAL_READ_ARGS, {
+    encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "pipe"], env: approvalReadEnv(),
+  });
+  if (r.error || r.status !== 0) return undefined;
+  registryApproval = parseApprovalRow(r.stdout ?? "");
+  return registryApproval;
+}
+
+function hookApprovalEnforced(): boolean {
+  if (!WORKER_TASK_ID) return false;
+  try {
+    if (readRegistryApproval() === "hook") return true;
+  } catch {
+    // fall through to the tighten-only env signal
+  }
+  return LOAD_APPROVAL_ENV === "hook";
+}
+
+function enforceHookApproval(event: unknown, ctx: unknown): Block | undefined {
+  const refuse = (why: string): Block => ({
+    block: true,
+    reason: `herdr hook-approval: refused — ${why}. Nothing ran; tell your conductor. Do not retry it through another tool.`,
+  });
+  try {
+    if (!safeExists(PRETOOL_SHADOW_SH)) return refuse("the pre-tool check (lib/pretool-shadow.sh) is missing");
+    const r = spawnSync("bash", [PRETOOL_SHADOW_SH, "--enforce", "--record"], {
+      input: shadowPayload(event, ctx, undefined),
+      encoding: "utf8",
+      timeout: 20_000,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: shadowEnv(),
+    });
+    if (r.error) return refuse(`the pre-tool check failed (${r.error.message})`);
+    const line = (r.stdout ?? "").trim().split("\n").pop() ?? "";
+    let out: Record<string, unknown>;
+    try {
+      out = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      return refuse(`the pre-tool check gave no verdict (exit ${r.status})`);
+    }
+    if (r.status === 0 && out.decision === "allow") return undefined;
+    const reason = typeof out.reason === "string" && out.reason ? out.reason : "";
+    return reason ? { block: true, reason } : refuse(`the pre-tool check refused this call (exit ${r.status})`);
+  } catch (error) {
+    return refuse(`the pre-tool check threw (${error instanceof Error ? error.message : String(error)})`);
   }
 }
 

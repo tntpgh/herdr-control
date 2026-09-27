@@ -29,6 +29,9 @@
 #                    without HERDR_PANE_ID): no conductor, edge or re-check can
 #                    see it, so a person is the only resolver
 #     crash          reserved for a component reporting its own crash
+#     human-action   a hook-approval worker's human-only action request
+#                    (herdr-action.sh tick, docs/design/pretool-approval.md): one
+#                    post per request; the decision itself is a hub form
 #
 #   NOT AN ERROR (suppressed at `errors`, logged)
 #     needs-input    a prompt the conductor/peer path is expected to answer
