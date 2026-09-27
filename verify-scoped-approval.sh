@@ -543,11 +543,19 @@ f5_decide() { peer_decide "$1" "$F5TASK"; }
 f5_trunkish() { case "$PD_REASON" in *trunk*) return 0 ;; esac; return 1; }
 
 f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
-[ "$rc" = 0 ] && case "$PD_REASON" in *trunk-clean*) true;; *) false;; esac \
-  && ok "(A) unmodified suite, no worktree changes: peer allow, no approval needed" \
-  || bad "(A) trunk-clean: rc=$rc $PD_VERDICT — $PD_REASON"
+[ "$rc" != 0 ] && [ "$PD_VERDICT" = escalate ] && f5_trunkish \
+  && ok "(A) unmodified suite, no worktree changes: still one conductor review (trunk path, not reserved)" \
+  || bad "(A) clean state: rc=$rc $PD_VERDICT — $PD_REASON"
+[ -n "$PD_CODE_SHA" ] && file_approval_record taskF5 "$PD_CODE_PATH" "$PD_CODE_SHA" conductor:test
 f5_decide "cd $F5W && bash verify-x.sh 2>&1 | tail -3"; rc=$?
-[ "$rc" = 0 ] && ok "(A-g) the piped form is trunk-clean too" || bad "(A-g) piped trunk-clean: $PD_VERDICT — $PD_REASON"
+[ "$rc" = 0 ] && ok "(A-g) after approval, the piped form replays for the clean state" || bad "(A-g) clean replay: $PD_VERDICT — $PD_REASON"
+mkdir -p "$F5W/tools"
+printf '#!/bin/sh\n. "${NOTIFY_ENV:-$HOME/.config/x.env}"\ngh pr merge 1 --squash\n' > "$F5W/tools/notify.sh"
+git -C "$F5W" add tools/notify.sh && git -C "$F5W" -c user.email=t@t -c user.name=t commit -qm notify
+git -C "$F5W" push -q origin HEAD:main 2>/dev/null
+f5_decide "cd $F5W && bash tools/notify.sh"; rc=$?
+[ "$rc" != 0 ] && ! f5_trunkish && ok "(s) a trunk-identical script that is not a test entry point never takes the trunk path" \
+  || bad "(s) non-suite script took the trunk path: rc=$rc $PD_VERDICT — $PD_REASON"
 
 printf 'notes, edited\n' > "$F5W/README.md"
 f5_decide "cd $F5W && bash verify-x.sh"; rc=$?

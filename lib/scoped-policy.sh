@@ -37,10 +37,10 @@
 #          from ONE snapshot copy so the hash and the judged bytes are the same.
 #          A tracked script byte-identical to the verified trunk tip whose own
 #          content is not clean takes the trunk path (_sp_trunk_suite): SHA
-#          binds the file AND the worktree's change-set; reason `trunk-clean:`
-#          (no change-set: only reviewed trunk code runs) or `trunk:` (one
-#          conductor review per change-set). TRUNK defaults to the registry
-#          row for WORKTREE.
+#          binds the file AND the worktree's change-set (raw bytes vs the
+#          tip); reason `trunk:` — one conductor review per state, then a peer
+#          replays it for exactly that state. Only a root verify-*.sh or
+#          scripts/ci.sh. TRUNK defaults to the registry row for WORKTREE.
 #
 # Not a containment boundary (docs/approval-policy.md rule 7): the file can
 # still change between this check and the interpreter opening it, by a process
@@ -193,7 +193,7 @@ wait_for_input_required_row() {
 }
 
 # _sp_trunk_suite <wt> <path> <snapshot> [trunk]
-#   -> 0 and prints `clean <trunk-sha12>` or `diff <trunk-sha12> <change-set sha256>`
+#   -> 0 and prints `diff <trunk-sha12> <change-set sha256> <summary…>`
 #      when PATH is tracked in WT and SNAPSHOT is byte-identical to that path at
 #      the trunk tip as the REMOTE reports it (never the worker-writable
 #      refs/remotes/origin/*); 1 otherwise (fall back to the file's own content).
@@ -205,11 +205,15 @@ wait_for_input_required_row() {
 # file's own sha is not enough (that would reopen red test H4, "nested"). The
 # change-set digest binds the whole worktree state: every tracked path's raw
 # on-disk bytes and mode against the tip's tree, plus every untracked,
-# non-ignored file. An empty change-set means only reviewed
-# trunk code can run. A changed .gitignore could hide a new file from the
+# non-ignored file. Even an EMPTY change-set needs one conductor approval
+# (bound to "no changes @tip"): a trunk script can still read paths named by
+# the persistent shell's environment or $HOME, outside any digest (#169
+# review round 2). A changed .gitignore could hide a new file from the
 # digest, so it disqualifies the trunk path.
-# ceiling: files ignored by the trunk's own .gitignore rules, and a worker that
-# rewrites the `origin` URL itself, are outside what this sees.
+# ceiling: files ignored by the trunk's own .gitignore rules, anything the
+# persistent shell environment points at (exported BASH_ENV, PATH, HERDR_*),
+# and a worker that rewrites the `origin` URL itself, are outside what this
+# sees — the same limit every sha-bound replay already has.
 _sp_trunk_suite() {                     # wt path snap [trunk]
   local wt="$1" path="$2" snap="$3" trunk="${4:-}" realwt rel tip tmo blob
   [ -n "$wt" ] && [ -d "$wt" ] || return 1
@@ -219,6 +223,13 @@ _sp_trunk_suite() {                     # wt path snap [trunk]
   [[ "$trunk" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || return 1
   realwt="$(cd "$wt" 2>/dev/null && pwd -P)" || return 1
   case "$path" in "$realwt"/*) rel="${path#"$realwt"/}" ;; *) return 1 ;; esac
+  # Scope: the repo's own test entry points only — a root-level verify-*.sh
+  # or scripts/ci.sh. Any other tracked script can reach outside the digest
+  # by design (#169 review round 2: slack-bridge/herdr-notify.sh sources
+  # ${HERDR_BRIDGE_ENV:-$HOME/.config/herdr-bridge.env}), so it never takes
+  # this path.
+  case "$rel" in verify-*.sh|scripts/ci.sh) ;; *) return 1 ;; esac
+  case "$rel" in verify-*/*) return 1 ;; esac
   git -C "$realwt" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 || return 1
   tmo="$(command -v timeout || command -v gtimeout)" || return 1
   tip="$("$tmo" 8 git -C "$realwt" ls-remote --exit-code origin "refs/heads/$trunk" 2>/dev/null | cut -f1)"
@@ -317,7 +328,7 @@ more = f" +{len(names) - 4} more" if len(names) > 4 else ""
 print("DIFF", hashlib.sha256(payload).hexdigest(), f"{len(names)} path(s): {shown}{more}")
 ' "$realwt" "$tip" 2>/dev/null)" || return 1
   case "$cs" in
-    CLEAN) printf 'clean %s\n' "${tip:0:12}"; return 0 ;;
+    CLEAN) printf 'diff %s %s %s\n' "${tip:0:12}" "$(printf 'clean %s' "$tip" | shasum -a 256 | cut -d' ' -f1)" "no changes against trunk"; return 0 ;;
     DIFF\ *) cs="${cs#DIFF }"; printf 'diff %s %s %s\n' "${tip:0:12}" "${cs%% *}" "${cs#* }"; return 0 ;;
     *) return 1 ;;
   esac
@@ -350,10 +361,7 @@ code_ref_inspect() {                    # cmd wt [trunk]
     local ts
     if ts="$(_sp_trunk_suite "$2" "$PD_CODE_PATH" "$snap" "${3:-}")"; then
       set -- $ts
-      if [ "$1" = clean ]; then
-        PD_CODE_CONTENT_REASON="trunk-clean: identical to trunk @$2 and the worktree has no changes against it — only reviewed trunk code runs"
-        PD_CODE_SHA="$(printf '%s\nclean %s\n' "$PD_CODE_SHA" "$2" | shasum -a 256 | cut -d' ' -f1)"
-      else
+      if [ "$1" = diff ]; then
         local tip12="$2" digest="$3"; shift 3
         PD_CODE_CONTENT_REASON="trunk: identical to trunk @$tip12 but it runs over worktree change-set ${digest:0:12} ($*) — a conductor may review those paths against $tip12 (\`git diff --no-ext-diff --no-textconv $tip12\` plus untracked files) and approve once for this state"
         PD_CODE_SHA="$(printf '%s\n%s\n' "$PD_CODE_SHA" "$digest" | shasum -a 256 | cut -d' ' -f1)"
@@ -428,11 +436,6 @@ peer_decide() {                         # cmd task-json
     *) PD_VERDICT=escalate PD_REASON="runs a script file that cannot be resolved or read for review"; return 1 ;;
   esac
   local short="${PD_CODE_SHA:0:12}"
-  # F5: a merged suite over a worktree with no changes against the verified
-  # trunk tip runs only reviewed code — no approval needed.
-  case "$PD_CODE_CONTENT_REASON" in
-    trunk-clean:*) PD_REASON="${PD_REASON:+$PD_REASON; }$PD_CODE_PATH $PD_CODE_CONTENT_REASON"; return 0 ;;
-  esac
   state=none
   [ -n "$task_id" ] && state="$(file_approval_state "$task_id" "$PD_CODE_PATH" "$PD_CODE_SHA")"
   case "$state" in
