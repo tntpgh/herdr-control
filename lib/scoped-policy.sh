@@ -203,15 +203,15 @@ wait_for_input_required_row() {
 # human. A suite identical to trunk was reviewed and merged — but it sources
 # and runs the worktree's lib/*.sh, which the worker may have edited, so the
 # file's own sha is not enough (that would reopen red test H4, "nested"). The
-# change-set digest binds the whole worktree state: `git diff --binary <tip>`
-# (committed, staged and unstaged tracked changes) plus every untracked,
-# non-ignored file's path and sha256. An empty change-set means only reviewed
+# change-set digest binds the whole worktree state: every tracked path's raw
+# on-disk bytes and mode against the tip's tree, plus every untracked,
+# non-ignored file. An empty change-set means only reviewed
 # trunk code can run. A changed .gitignore could hide a new file from the
 # digest, so it disqualifies the trunk path.
 # ceiling: files ignored by the trunk's own .gitignore rules, and a worker that
 # rewrites the `origin` URL itself, are outside what this sees.
 _sp_trunk_suite() {                     # wt path snap [trunk]
-  local wt="$1" path="$2" snap="$3" trunk="${4:-}" realwt rel tip tmo blob changed untracked digest
+  local wt="$1" path="$2" snap="$3" trunk="${4:-}" realwt rel tip tmo blob
   [ -n "$wt" ] && [ -d "$wt" ] || return 1
   if [ -z "$trunk" ] && command -v _sql >/dev/null 2>&1; then
     trunk="$(_sql "SELECT trunk FROM tasks WHERE worktree=$(_sq "$wt") ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)"
@@ -226,19 +226,101 @@ _sp_trunk_suite() {                     # wt path snap [trunk]
   git -C "$realwt" cat-file -e "$tip^{commit}" 2>/dev/null || return 1
   blob="$(git -C "$realwt" rev-parse --verify -q "$tip:$rel" 2>/dev/null)" || return 1
   [ "$blob" = "$(git -C "$realwt" hash-object --no-filters -- "$snap" 2>/dev/null)" ] || return 1
-  # A tracked edit hidden from `git diff` (assume-unchanged / skip-worktree
-  # index bits) must not read as "no change": any such bit disqualifies.
-  git -C "$realwt" ls-files -v 2>/dev/null | grep -qE '^([a-z]|S) ' && return 1
-  changed="$(git -C "$realwt" diff --no-ext-diff --no-textconv --name-only "$tip" 2>/dev/null)" || return 1
-  case $'\n'"$changed" in *$'\n'.gitignore*|*/.gitignore*) return 1 ;; esac
-  untracked="$(cd "$realwt" && git ls-files -o --exclude-per-directory=.gitignore -z 2>/dev/null | sort -z |
-    xargs -0 -I{} sh -c 'printf "%s %s\n" "$(shasum -a 256 < "$1" | cut -d" " -f1)" "$1"' _ {} 2>/dev/null)"
-  case $'\n'"$untracked" in *' .gitignore'*|*'/.gitignore'*) return 1 ;; esac
-  if [ -z "$changed" ] && [ -z "$untracked" ]; then
-    printf 'clean %s\n' "${tip:0:12}"; return 0
-  fi
-  digest="$( { git -C "$realwt" diff --no-ext-diff --no-textconv --binary "$tip" 2>/dev/null; printf '\n--untracked--\n%s\n' "$untracked"; } | shasum -a 256 | cut -d' ' -f1)"
-  printf 'diff %s %s\n' "${tip:0:12}" "$digest"
+  # The change-set is computed from RAW BYTES on disk against the tip's tree
+  # (review of #169: `git diff` can be blinded by assume-unchanged /
+  # skip-worktree index bits, and shaped by textconv / ext-diff / clean
+  # filters from worker-writable .gitattributes or .git/config). Every path
+  # in the tip or the index is hashed as a git blob straight from disk (mode
+  # included); untracked files not ignored by a .gitignore are listed too. A
+  # changed or new .gitignore/.gitattributes, a submodule, or a non-sha1 repo
+  # disqualifies the trunk path.
+  local cs
+  cs="$(python3 -c '
+import hashlib, json, os, stat, subprocess, sys
+
+wt, tip = sys.argv[1], sys.argv[2]
+
+
+def git(*args):
+    return subprocess.run(["git", "-C", wt, *args], capture_output=True, check=True).stdout
+
+
+if git("rev-parse", "--show-object-format").strip() != b"sha1":
+    print("UNSUPPORTED")
+    sys.exit(0)
+
+tree = {}
+for rec in git("ls-tree", "-r", "-z", "--full-tree", tip).split(b"\0"):
+    if not rec:
+        continue
+    meta, path = rec.split(b"\t", 1)
+    mode, _typ, blob = meta.split(b" ")
+    if mode == b"160000":
+        print("SUBMODULE")
+        sys.exit(0)
+    tree[path] = (mode, blob.decode())
+
+index_paths = {p for p in git("ls-files", "-z").split(b"\0") if p}
+untracked_paths = sorted(
+    p for p in git("ls-files", "-o", "--exclude-per-directory=.gitignore", "-z").split(b"\0") if p
+)
+
+
+def disk_object(path):
+    full = os.path.join(wt.encode(), path)
+    try:
+        st = os.lstat(full)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        data, mode = os.readlink(full), b"120000"
+    elif stat.S_ISREG(st.st_mode):
+        with open(full, "rb") as fh:
+            data = fh.read()
+        mode = b"100755" if st.st_mode & 0o111 else b"100644"
+    else:
+        return ("other", "-")
+    return (mode, hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest())
+
+
+changed = []
+for path in sorted(set(tree) | index_paths):
+    disk = disk_object(path)
+    want = tree.get(path)
+    if disk is None and want is None:
+        continue
+    if disk is None or want is None or disk[0] != want[0] or disk[1] != want[1]:
+        changed.append((path, disk))
+
+untracked = []
+for path in untracked_paths:
+    disk = disk_object(path)
+    untracked.append((path, disk))
+
+names = [p for p, _ in changed] + [p for p, _ in untracked]
+if any(os.path.basename(p) in (b".gitignore", b".gitattributes") for p in names):
+    print("IGNOREFILE")
+    sys.exit(0)
+if not changed and not untracked:
+    print("CLEAN")
+    sys.exit(0)
+payload = json.dumps(
+    {
+        "changed": [[p.decode("utf-8", "backslashreplace"), list(d) if d else None] for p, d in changed],
+        "untracked": [[p.decode("utf-8", "backslashreplace"), list(d) if d else None] for p, d in untracked],
+    },
+    sort_keys=True,
+    default=lambda b: b.decode(),
+).encode()
+shown = ", ".join(n.decode("utf-8", "backslashreplace") for n in names[:4])
+more = f" +{len(names) - 4} more" if len(names) > 4 else ""
+print("DIFF", hashlib.sha256(payload).hexdigest(), f"{len(names)} path(s): {shown}{more}")
+' "$realwt" "$tip" 2>/dev/null)" || return 1
+  case "$cs" in
+    CLEAN) printf 'clean %s\n' "${tip:0:12}"; return 0 ;;
+    DIFF\ *) cs="${cs#DIFF }"; printf 'diff %s %s %s\n' "${tip:0:12}" "${cs%% *}" "${cs#* }"; return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 code_ref_inspect() {                    # cmd wt [trunk]
@@ -272,8 +354,9 @@ code_ref_inspect() {                    # cmd wt [trunk]
         PD_CODE_CONTENT_REASON="trunk-clean: identical to trunk @$2 and the worktree has no changes against it — only reviewed trunk code runs"
         PD_CODE_SHA="$(printf '%s\nclean %s\n' "$PD_CODE_SHA" "$2" | shasum -a 256 | cut -d' ' -f1)"
       else
-        PD_CODE_CONTENT_REASON="trunk: identical to trunk @$2 but it runs over worktree change-set ${3:0:12} — a conductor may review \`git diff $2\` plus untracked files and approve once for this state"
-        PD_CODE_SHA="$(printf '%s\n%s\n' "$PD_CODE_SHA" "$3" | shasum -a 256 | cut -d' ' -f1)"
+        local tip12="$2" digest="$3"; shift 3
+        PD_CODE_CONTENT_REASON="trunk: identical to trunk @$tip12 but it runs over worktree change-set ${digest:0:12} ($*) — a conductor may review those paths against $tip12 (\`git diff --no-ext-diff --no-textconv $tip12\` plus untracked files) and approve once for this state"
+        PD_CODE_SHA="$(printf '%s\n%s\n' "$PD_CODE_SHA" "$digest" | shasum -a 256 | cut -d' ' -f1)"
       fi
     fi
   fi

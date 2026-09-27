@@ -576,8 +576,19 @@ f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
 printf 'x_ok() { echo hidden edit; }\n' > "$F5W/lib/x.sh"
 git -C "$F5W" update-index --assume-unchanged lib/x.sh
 f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
-[ "$rc" != 0 ] && ! f5_trunkish && ok "(j) an edit hidden by assume-unchanged disqualifies the trunk path" || bad "(j) assume-unchanged hid an edit: rc=$rc $PD_VERDICT — $PD_REASON"
+[ "$rc" != 0 ] && ok "(j) an edit hidden by assume-unchanged still changes the state (raw bytes): escalates" || bad "(j) assume-unchanged hid an edit: rc=$rc $PD_VERDICT — $PD_REASON"
 git -C "$F5W" update-index --no-assume-unchanged lib/x.sh
+git -C "$F5W" checkout -q -- lib/x.sh
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" = 0 ] && ok "(b3) approved state replays before the filter attack" || bad "(b3) approved state refused: $PD_VERDICT — $PD_REASON"
+F5GD="$(git -C "$F5W" rev-parse --absolute-git-dir)"; mkdir -p "$F5GD/info"
+printf 'lib/x.sh diff=fake filter=same\n' > "$F5GD/info/attributes"
+git -C "$F5W" config diff.fake.textconv 'echo FIXED'
+git -C "$F5W" config filter.same.clean "git -C $F5W show HEAD:lib/x.sh"
+printf 'x_ok() { echo filtered edit; }\n' > "$F5W/lib/x.sh"
+f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
+[ "$rc" != 0 ] && ok "(k) textconv/clean-filter cannot hide a lib edit from the change-set" || bad "(k) filter-hidden edit replayed: $PD_VERDICT — $PD_REASON"
+rm -f "$F5GD/info/attributes"; git -C "$F5W" config --unset diff.fake.textconv; git -C "$F5W" config --unset filter.same.clean
 git -C "$F5W" checkout -q -- lib/x.sh
 printf 'lib/hidden.sh\n' > "$F5W/.gitignore"
 f5_decide "cd $F5W && bash verify-x.sh"; rc=$?
