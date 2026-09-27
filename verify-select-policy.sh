@@ -42,6 +42,8 @@ export PANE BIRTH
 #                  types the text into $SCREEN like a composer would
 #   CLEAR_ON_ENTER a screen file copied over $SCREEN on every Enter: the Deny
 #                  key clearing the menu, and later the composer submitting
+#   STATE_AT_ENTER a task_id: on Enter, append that task's registry state to
+#                  $SCREEN.state-at-enter (the close-before-keystroke case)
 _std_herdr_stub() {
   case "$1 $2" in
     "pane process-info")
@@ -53,6 +55,10 @@ _std_herdr_stub() {
     "pane send-keys")
       # argv is: pane send-keys <pane> <key> — the KEY is $4, not $3.
       printf '%s\n' "$4" >> "$KEYS"
+      if [ "$4" = Enter ] && [ -n "${STATE_AT_ENTER:-}" ]; then
+        sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+          "SELECT state FROM tasks WHERE task_id='$STATE_AT_ENTER';" >> "$SCREEN.state-at-enter" 2>/dev/null
+      fi
       if [ "$4" = Enter ] && [ -n "${CLEAR_ON_ENTER:-}" ]; then cp "$CLEAR_ON_ENTER" "$SCREEN"; fi ;;
     "pane send-text")
       if [ -n "${SENDS:-}" ]; then
@@ -1337,6 +1343,22 @@ esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   || bad "ambiguous menu rows: escalation identity: $esc_row"
 
 set_task_state runR taskR completed no-follow-on >/dev/null 2>&1
+
+printf '== the blocked period closes BEFORE the answering keystroke ==\n'
+# PR #168 review: the task's blocked->running transition is what closes a
+# prompt's blocked period (lib/prompt-parse.sh prompt_period). omp paints a
+# queued second tool call's panel the instant the first is answered, so a close
+# written after the keypress let that next panel be read under the old period
+# and re-keyed under the new one: one prompt, two ids, two wakes.
+register_task runK taskK wK cK "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/close "impl:close" >/dev/null 2>&1
+set_task_state runK taskK blocked >/dev/null 2>&1
+set_menu "git status --short --branch"; reset_keys; : > "$SCREEN.state-at-enter"
+STATE_AT_ENTER=taskK HERDR_SELECT_RECORD_WAIT_S=0 sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" -ge 1 ] && ok "peer Approve pressed" || bad "rc=$rc; stderr: $(cat "$WORK/err.txt")"
+[ "$(cat "$SCREEN.state-at-enter")" = running ] \
+  && ok "the task was already running when Enter landed (period closed first)" \
+  || bad "task state when Enter landed: '$(cat "$SCREEN.state-at-enter")' (want running)"
+set_task_state runK taskK completed no-follow-on >/dev/null 2>&1
 
 printf '== F7c: a peer/conductor Deny tells the worker WHY, once the menu has cleared ==\n'
 # A worker re-issued a denied reserved command (`bash -n lib/command-policy.sh

@@ -962,7 +962,10 @@ prompt_id() {
 # agent leaves `blocked`), long before the next prompt paints, so every reader
 # of the new prompt sees the same value. The id then steps exactly when the
 # prompt is answered, which is when a decision captured against it goes stale.
-# Unregistered panes (a hand-started session) have no transitions: 0.
+# Only blocked->running counts: a previous occupant of a RECYCLED pane id
+# being moved blocked->lost by reconcile while the new occupant's prompt is
+# open must not step that prompt's id (PR #168 review). Unregistered panes (a
+# hand-started session) have no transitions: 0.
 # Read in a subshell so run-registry.sh's shell options never leak into a
 # caller that did not source it (herdr-notify.sh, sweep-approvals.sh, …).
 _PP_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -972,7 +975,8 @@ prompt_period() {                      # <pane_id>
     [ -f "$(registry_db)" ] || { printf '0'; exit 0; }
     n="$(_sql "SELECT max(e.sequence) FROM events e JOIN tasks t ON t.task_id=e.task_id
           WHERE t.pane_id=$(_sq "$1") AND e.type='state_changed'
-            AND json_extract(e.payload,'\$.from')='blocked';" 2>/dev/null)"
+            AND json_extract(e.payload,'\$.from')='blocked'
+            AND json_extract(e.payload,'\$.state')='running';" 2>/dev/null)"
     printf '%s' "${n:-0}"
   )
 }
