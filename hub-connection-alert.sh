@@ -48,7 +48,7 @@ case "$status" in
       # wait, no live re-verify, no outage-marker dedup — the same escape
       # hatch slack-bridge/herdr-notify.sh documents for its own gating.
       [ -f "$NOTIFY" ] || exit 0
-      bash "$NOTIFY" \
+      bash "$NOTIFY" --class control-plane \
         "herdr control-plane subscription is DOWN${err:+ ($err)} — every alert and backstop is blind until it reconnects" \
         >/dev/null 2>&1 || true
       exit 0
@@ -64,7 +64,7 @@ case "$status" in
     [ -e "$MARK" ] && exit 0   # already alerted for this outage
     : > "$MARK"
     [ -f "$NOTIFY" ] || exit 0
-    bash "$NOTIFY" \
+    bash "$NOTIFY" --class control-plane \
       "herdr control-plane subscription is DOWN${err:+ ($err)} — every alert and backstop is blind until it reconnects" \
       >/dev/null 2>&1 || true
     ;;
@@ -72,7 +72,7 @@ case "$status" in
     [ -e "$MARK" ] || exit 0   # never alerted for this outage -> nothing to recover from
     rm -f "$MARK"
     [ -f "$NOTIFY" ] || exit 0
-    bash "$NOTIFY" "herdr control-plane subscription is back up" >/dev/null 2>&1 || true
+    bash "$NOTIFY" --class control-plane "herdr control-plane subscription is back up" >/dev/null 2>&1 || true
     ;;
   *)
     echo "hub-connection-alert: unknown status '$status'" >&2

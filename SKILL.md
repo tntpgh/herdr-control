@@ -300,10 +300,31 @@ When there is no numbered list to parse (a non-numbered confirmation, a plan
 approval, or a prompt that was auto-approved before the hook could read it), the
 alert carries **what is on screen** instead, so you are never answering blind.
 
-### Symptoms only, not status
+### Errors only, not status
 
-Slack gets a prompt only when a human genuinely has to act on it, at most
-once per prompt (.handoffs/SPEC.md, 2026-09-24). Concretely:
+Slack gets only what the automation cannot fix itself (2026-09-26). Every
+`herdr-notify.sh` caller passes `--class`, and at the default
+`HERDR_SLACK_LEVEL=errors` (`config.sh`, or the env) only error classes post:
+
+| class | fires when | from |
+|---|---|---|
+| `human-stale` | a prompt only a human may answer is still open after `HERDR_HUMAN_ALERT_S` (300s) | omp/claude hooks, `agent-edge.sh` |
+| `stuck` | a worker is still blocked on the same prompt after `HERDR_STUCK_ALERT_S` (900s) | `agent-edge.sh` |
+| `wake-fail` | the conductor wake failed and the prompt is open after `HERDR_WAKE_FAIL_ALERT_S` | `lib/push-wake.sh` |
+| `control-plane` | the hub's herdr subscription is down / back | `hub-connection-alert.sh` |
+| `deploy` | a deploy is overdue / resolved | `deploy-drift-alert.sh` |
+| `unwatched` | a Claude prompt from a session with no herdr pane (no automation can see it) | `claude-notify.sh` |
+
+`needs-input` (the immediate prompt alert and the edge backstop), `held`
+(allow-class prompt past the peer grace), `info`, and an unclassified call are
+**suppressed** and logged one line each to
+`$HERDR_STATE_DIR/slack-suppressed.jsonl`; they stay on the hub. An unknown
+class name posts (a typo must not silence an error). `HERDR_SLACK_LEVEL=all`
+restores every post; `=off` posts nothing. Thresholds and the measurement
+behind them: `lib/slack-level.sh`.
+
+Below the level filter, the symptoms-only rules (.handoffs/SPEC.md,
+2026-09-24) still apply to whatever is posted:
 
 - **KEPT**: an escalate/reserved/deny-class prompt still unanswered — ONE
   post per (pane, prompt) within `HERDR_ALERT_DEDUP_TTL_S` (default 3600s;
@@ -332,10 +353,12 @@ once per prompt (.handoffs/SPEC.md, 2026-09-24). Concretely:
   needs `classify_command` or a wait for `HERDR_ALERT_GRACE_S`, not this
   flag (`.omp/rules/troubleshooting.md` has both cases split out).
 
-`verify-slack-symptoms.sh`, `verify-hub-connection-alert.sh`, and
+`verify-slack-symptoms.sh` (including the level-filter cases),
+`verify-herdr-live.sh` (edge escalation), `verify-hub-connection-alert.sh`, and
 `verify-deploy-drift-alert.sh` are the acceptance suites for this; run the
-relevant one after touching `herdr-notify.sh`, `lib/alert-gate.sh`,
-`lib/push-wake.sh`, `hub-connection-alert.sh`, or `deploy-drift-alert.sh`.
+relevant one after touching `herdr-notify.sh`, `lib/slack-level.sh`,
+`lib/alert-gate.sh`, `lib/push-wake.sh`, `agent-edge.sh`,
+`hub-connection-alert.sh`, or `deploy-drift-alert.sh`.
 
 ### Replying with free text
 

@@ -122,12 +122,30 @@ if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
   # seconds, and paging for it is what turned an afternoon of ordinary worker
   # activity into a Slack flood on 2026-09-12. Held, never dropped — if the
   # prompt outlives the grace window the alert is sent after all.
+  #
+  # Classified for lib/slack-level.sh (2026-09-26): neither send is an error by
+  # itself — the conductor is woken for both below — so at the default level
+  # both are suppressed and logged. What IS an error is a human-only prompt
+  # nobody resolved: that escalates as `human-stale` after HERDR_HUMAN_ALERT_S.
+  # A held prompt that stays stuck escalates from agent-edge.sh as `stuck`.
+  # At HERDR_SLACK_LEVEL=all no escalation timer is armed: the immediate post
+  # goes out, exactly as before. The timer itself is armed AFTER push_wake
+  # below: grace_realert stands down for any input_required recorded after it
+  # was armed, and push_wake records THIS prompt's input_required — armed
+  # first, a second boundary between the two silenced the escalation.
+  . "$here/lib/slack-level.sh"
+  human_stale=0
   if human_must_answer "$pane" "$full_cmd"; then
-    bash "$notify" --choices --pane "$pane" "$msg" >/dev/null 2>&1 || true
-  else
+    bash "$notify" --class needs-input --choices --pane "$pane" "$msg" >/dev/null 2>&1 || true
+    [ "$(slack_level)" = errors ] && human_stale=1
+  elif slack_should_send held; then
+    # Armed only when it could post (level `all`). At `errors` a held timer can
+    # only be suppressed, and it shares grace_realert's claim key with the
+    # conductor re-wake push_wake arms for the same prompt — winning that
+    # claim to post nothing cost the conductor its wake (PR #166 review).
     grace_realert "$pane" "$(prompt_id "$pane" 2>/dev/null || printf '')" \
       "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-      bash "$notify" --choices --pane "$pane" "$msg"
+      bash "$notify" --class held --choices --pane "$pane" "$msg"
   fi
 fi
 
@@ -145,6 +163,14 @@ fi
 . "$here/lib/attention-key.sh"
 if attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$(prompt_id "$pane" 2>/dev/null)"; then
   push_wake "$msg" "$where" "$full_cmd" >/dev/null 2>&1 || true
+fi
+
+if [ "${human_stale:-0}" = 1 ]; then
+  HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" \
+  grace_realert "$pane" "$(prompt_id "$pane" 2>/dev/null || printf '')" \
+    "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+    bash "$notify" --class human-stale --choices --pane "$pane" \
+    "$msg  ·  only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s"
 fi
 
 exit 0
