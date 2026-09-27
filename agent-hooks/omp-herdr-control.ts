@@ -854,7 +854,8 @@ function onToolCall(event: unknown, ctx?: unknown): Block | undefined {
 // SHADOW MODE (docs/design/pretool-approval.md): for a registered worker only,
 // hand the exact tool input to lib/pretool-shadow.sh, which computes the
 // hook-time verdict with the same policy the approval menu path uses and
-// appends it to the registry as a `pretool_verdict` event. Detached and
+// stores it as a `pretool_verdict` row in pretool-shadow.sqlite3 (never the
+// control-plane registry, which it only reads). Detached and
 // fire-and-forget: it never blocks, never changes `result` above (the guards'
 // return value is passed in only so a guard block is logged as the verdict),
 // and never touches the approval menu / herdr-select path. Identity is the

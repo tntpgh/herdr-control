@@ -24,6 +24,7 @@ chmod +x "$work/bin/herdr"
 export PATH="$work/bin:$PATH"
 
 . "$here/lib/scoped-policy.sh"
+SHADOW="$HERDR_RUN_STATE_DIR/pretool-shadow.sqlite3"
 register_task run1 task1 worker1 conductor1 w9:p9 cond-birth "$PANE" "$BIRTH" /repo "$wt" 'impl:shadow' feat/shadow main >/dev/null
 set_task_state run1 task1 running
 TASK_JSON="$(read_task run1 task1)"
@@ -131,17 +132,44 @@ tok="ghp_""ABCDEFGHIJKLMNOPQRSTUVWXYZ""0123456789"  # split so the secret scanne
 bash_payload "curl -H 'Authorization: Bearer $tok' https://api.github.com/user" sec1 | shadow --record >/dev/null
 bash_payload "export GH_TOKEN=$tok && gh api user" sec2 | shadow --record >/dev/null
 payload write "{\"path\":\"$wt/tmp/n.txt\",\"content\":\"password=$tok\"}" sec3 | shadow --record >/dev/null
-n="$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE type='pretool_verdict' AND payload LIKE '%$tok%';")"
-m="$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE type='pretool_verdict';")"
+pw="Zq8vN2k""Lp4Rt7wXy"                 # split so the secret scanner sees no literal
+i=0
+while IFS= read -r c; do
+  i=$((i + 1)); bash_payload "$c" "secf$i" | shadow --record >/dev/null
+done <<EOF2
+mysql -p$pw db
+curl -u admin:$pw https://example.com
+sshpass -p $pw ssh host
+psql --password=$pw
+PGPASSWORD=$pw psql
+API_KEY=$pw ./x.sh
+SLACK_TOKEN=$pw curl https://slack.com
+curl -H "Authorization: Basic $pw" https://example.com
+git clone https://someone:${pw}@example.com/o/r
+tool --api-key $pw
+EOF2
+n2="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE payload LIKE '%$pw%';")"
+m2="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE json_extract(payload,'\$.call_id') LIKE 'secf%';")"
+[ "$n2" = 0 ] && [ "$m2" = 10 ] && ok "credential flags/env/userinfo redacted in all $m2 rows" \
+  || not_ok "credential leaked in $n2 of $m2 rows: $(sqlite3 "$SHADOW" "SELECT json_extract(payload,'\$.command') FROM pretool_verdicts WHERE payload LIKE '%$pw%';")"
+n="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE type='pretool_verdict' AND payload LIKE '%$tok%';")"
+m="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE type='pretool_verdict';")"
 [ "$n" = 0 ] && [ "$m" -ge 3 ] && ok "token absent from all $m recorded events" || not_ok "token leaked in $n of $m events"
 sha="$(printf '%s' "curl -H 'Authorization: Bearer $tok' https://api.github.com/user" | shasum -a 256 | cut -d' ' -f1)"
-[ "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE type='pretool_verdict' AND json_extract(payload,'\$.command_sha256')='$sha';")" = 1 ] \
+[ "$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE type='pretool_verdict' AND json_extract(payload,'\$.command_sha256')='$sha';")" = 1 ] \
   && ok "the exact command is still joinable by sha256" || not_ok "command sha not recorded"
 
+printf '== the control-plane registry is never written ==\n'
+before_ev="$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")"
+before_ch="$(shasum "$(registry_db)" | cut -c1-40)"
+for k in 1 2 3; do bash_payload "git status" "cp$k" | shadow --record >/dev/null; done
+payload write '{"path":"xd://secret_present","content":"{}"}' cp4 | shadow --record >/dev/null
+[ "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")" = "$before_ev" ] && [ "$(shasum "$(registry_db)" | cut -c1-40)" = "$before_ch" ] \
+  && ok "registry file and events unchanged by 4 recorded verdicts" || not_ok "shadow wrote the control-plane registry"
 printf '== --record dedups one tool call ==\n'
 bash_payload ls dup1 | shadow --record >/dev/null
 bash_payload ls dup1 | shadow --record >/dev/null
-[ "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE type='pretool_verdict' AND json_extract(payload,'\$.call_id')='dup1';")" = 1 ] \
+[ "$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE type='pretool_verdict' AND json_extract(payload,'\$.call_id')='dup1';")" = 1 ] \
   && ok "same call_id recorded once" || not_ok "duplicate pretool_verdict rows"
 
 printf '== the omp hook: return value unchanged, non-worker untouched, never throws ==\n'
@@ -163,7 +191,7 @@ if command -v bun >/dev/null 2>&1; then
   # Baseline: origin/main's return values for the same events (shadow absent).
   base_dir="$work/base"; git -C "$here" worktree add -q --detach "$base_dir" origin/main 2>/dev/null
   run_hook() { HOOK="$1/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$1" CASES="$cases" WT="$wt" bun -e "$hook_js" 2>"$work/bun.err"; }
-  before="$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE type='pretool_verdict';")"
+  before="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE type='pretool_verdict';")"
   mine="$(run_hook "$here")"; base="$(run_hook "$base_dir")"
   git -C "$here" worktree remove --force "$base_dir" 2>/dev/null
   [ -n "$mine" ] && [ "$(printf '%s' "$mine" | jq -c '[.[]|{id,r}]')" = "$(printf '%s' "$base" | jq -c '[.[]|{id,r}]')" ] \
@@ -174,17 +202,17 @@ if command -v bun >/dev/null 2>&1; then
     && ok "handler cost for bash/eval calls < 50ms (max $(printf '%s' "$mine" | jq '[.[]|select(.id|test("^(bash|eval)"))|.ms]|max|floor')ms)" \
     || not_ok "handler too slow: $mine"
   for _ in $(seq 1 200); do
-    [ "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE type='pretool_verdict' AND json_extract(payload,'\$.call_id') LIKE 'h%';")" -ge 5 ] && break; sleep 0.2
+    [ "$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE type='pretool_verdict' AND json_extract(payload,'\$.call_id') LIKE 'h%';")" -ge 5 ] && break; sleep 0.2
   done
-  got="$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.call_id')||'='||json_extract(payload,'\$.verdict') FROM events WHERE type='pretool_verdict' AND json_extract(payload,'\$.call_id') LIKE 'h%' ORDER BY 1;" | tr '\n' ' ')"
+  got="$(sqlite3 "$SHADOW" "SELECT json_extract(payload,'\$.call_id')||'='||json_extract(payload,'\$.verdict') FROM pretool_verdicts WHERE type='pretool_verdict' AND json_extract(payload,'\$.call_id') LIKE 'h%' ORDER BY 1;" | tr '\n' ' ')"
   [ "$got" = "h1=reserved h2=allow h3=block h4=allow h5=block " ] \
     && ok "worker: detached shadow recorded every call ($got)" || not_ok "shadow events: '$got'"
-  printf '%s' "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.policy') FROM events WHERE type='pretool_verdict' AND json_extract(payload,'\$.call_id')='h3';")" | grep -q hook-guard \
+  printf '%s' "$(sqlite3 "$SHADOW" "SELECT json_extract(payload,'\$.policy') FROM pretool_verdicts WHERE type='pretool_verdict' AND json_extract(payload,'\$.call_id')='h3';")" | grep -q hook-guard \
     && ok "the #159 guard's block was logged as the verdict" || not_ok "h3 not logged as hook-guard"
-  before="$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")"
+  before="$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")/$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts;")"
   nw="$(env -u HERDR_TASK_ID -u HERDR_RUN_ID HOOK="$here/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$here" CASES="$cases" WT="$wt" bun -e "$hook_js" 2>/dev/null)"
   sleep 1
-  after="$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")"
+  after="$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")/$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts;")"
   printf '%s' "$nw" | jq -e 'all(.[]; .r == "ALLOW")' >/dev/null && [ "$before" = "$after" ] \
     && ok "non-worker session: nothing blocked, zero events written" || not_ok "non-worker: $nw events $before->$after"
 else

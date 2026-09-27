@@ -110,15 +110,21 @@ if "--autonomy" in args:
 
 # ------------------------------------------------------------------ compare
 task_f, since = opt("--task"), opt("--since", "")
-ev_sql = "SELECT sequence, task_id, occurred_at, payload FROM events WHERE type='pretool_verdict' AND occurred_at >= ?"
+import os
+shadow_db = os.path.join(os.path.dirname(db), "pretool-shadow.sqlite3")
+if not os.path.exists(shadow_db):
+    print(f"no shadow store at {shadow_db} — no worker has recorded a verdict yet"); sys.exit(0)
+sconn = sqlite3.connect(f"file:{shadow_db}?mode=ro", uri=True)
+sconn.row_factory = sqlite3.Row
+ev_sql = "SELECT sequence, task_id, occurred_at, payload FROM pretool_verdicts WHERE occurred_at >= ?"
 params = [since]
 if task_f: ev_sql += " AND task_id = ?"; params.append(task_f)
 shadow = []
-for r in conn.execute(ev_sql + " ORDER BY sequence", params):
+for r in sconn.execute(ev_sql + " ORDER BY sequence", params):
     p = json.loads(r["payload"] or "{}")
     shadow.append(dict(p, seq=r["sequence"], task_id=r["task_id"], at=r["occurred_at"]))
 if not shadow:
-    print("no pretool_verdict events" + (f" for task {task_f}" if task_f else "") + " — nothing to compare"); sys.exit(0)
+    print("no pretool_verdict rows" + (f" for task {task_f}" if task_f else "") + " — nothing to compare"); sys.exit(0)
 
 appr_all = [dict(r, pane=r["pane_id"]) for r in conn.execute(
     "SELECT approval_id, task_id, pane_id, authority, choice_text, command, decided_at FROM approvals WHERE decided_at >= ?",
@@ -167,7 +173,7 @@ for s in shadow:
 if "--json" in args:
     print(json.dumps(results, indent=1)); sys.exit(0)
 
-print(f"pretool_verdict events: {len(results)}  (registry {db}, read-only)")
+print(f"pretool_verdict rows: {len(results)}  (store {shadow_db}, registry {db}; both read-only)")
 tot = {}
 for r in results: tot[r["kind"]] = tot.get(r["kind"], 0) + 1
 print("overall: " + "  ".join(f"{k}={v}" for k, v in sorted(tot.items())))

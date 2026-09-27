@@ -875,10 +875,8 @@ def herdr_data(event_limit: int = 100) -> dict:
             f"{branch_col}, {project_col}, created_at, updated_at "
             "FROM tasks ORDER BY updated_at DESC")]
         events = []
-        # pretool_verdict is one shadow row per worker tool call
-        # (docs/design/pretool-approval.md); it would bury every other event.
         for r in conn.execute("SELECT sequence, type, task_id, occurred_at, payload FROM events "
-                              "WHERE type != 'pretool_verdict' ORDER BY sequence DESC LIMIT ?", (event_limit,)):
+                              "ORDER BY sequence DESC LIMIT ?", (event_limit,)):
             e = dict(r)
             try:
                 e["payload"] = json.loads(e["payload"] or "{}")

@@ -202,19 +202,33 @@ Stronger:
 
 Built now (this PR):
 - `lib/pretool-shadow.sh`: the verdict, identity checks, redaction; `--record`
-  appends `pretool_verdict` `{schema, mode:"shadow", tool, call_id, verdict, policy,
-  reason, authority, command (redacted, ≤2000 chars; withheld when the policy
-  says it carries a credential), command_sha256, input_sha256, cwd, pane,
-  code_path, code_sha256, elapsed_ms}` with event id `ptv_<task>_<sha(call_id)>`.
-  Raw tool input and file contents are never stored.
+  stores a `pretool_verdict` row `{schema, mode:"shadow", tool, call_id, verdict,
+  policy, reason, authority, command (redacted, ≤2000 chars; withheld when the
+  policy says it carries a credential), command_sha256, input_sha256, cwd, pane,
+  code_path, code_sha256, elapsed_ms}` keyed `ptv_<task>_<sha(call_id)>`. Raw tool
+  input and file contents are never stored. Redaction covers token shapes,
+  Authorization headers, `curl -u user:pass`, `mysql -p…`, `sshpass -p`,
+  `--password/--token/--api-key` values, `*KEY/TOKEN/SECRET/PASSWORD*=` in any case,
+  URL userinfo and private-key blocks.
+- **Storage: a separate file**, `pretool-shadow.sqlite3`, beside the registry
+  (table `pretool_verdicts`). The shadow reads the control-plane registry
+  read-only and never runs `registry_init`, so a burst of parallel tool calls
+  cannot hold the registry lock against push-wake, the alert gate or
+  herdr-select, and never enters `events_since`'s 500-row window or the hub's
+  event feed. (Review of PR #164 measured 7 of 62 rows dropped and live writers
+  at risk when the rows went into `registry.sqlite3`; with the separate file a
+  64-call burst plus a concurrent live writer recorded 64/64 and 20/20.) At
+  cutover, `action_requested`/`action_decided` DO belong in the registry: they
+  are low-volume and are what reconcile and push-wake consume.
 - `agent-hooks/omp-herdr-control.ts`: `onToolCall` computes the guards' result as
   before, calls `recordShadowVerdict(event, ctx, result)` (detached, stdin payload,
   module-load identity) and returns `result` unchanged.
-- `hub.py` leaves `pretool_verdict` out of its recent-events feed (one row per tool
-  call would bury everything else); `lib/reconcile.sh` already ignores unknown types.
 - `scripts/shadow-compare.sh` joins verdicts with approvals / approval_escalated
   (by command sha or collapsed text, never prompt_id) and lists every
-  disagreement; `--autonomy` is the §1 metric.
+  disagreement; `--autonomy` is the §1 metric. An `approval_escalated` event
+  carries no command, so that half of the join is by pane and a 10-minute window
+  and can mis-attribute under parallel calls; the `via` column says which join
+  produced each row.
 - The menu, scrape, `herdr-select.sh`, edge peer-answer and alert gate are
   untouched — both paths stay available (Terrence, 2026-09-26).
 
@@ -262,8 +276,8 @@ file_approvals), `lib/push-wake.sh`, `lib/pane-guard.sh`, `send-to-agent.sh`,
 - Lib cost (what an enforcing, synchronous hook would add): recorded per call as
   `elapsed_ms` (hook fire → verdict, includes bash start, registry read, `herdr pane
   list`, peer_decide). Offline, 42 bash calls over 14 canary commands (3 runs each)
-  with five verify suites running concurrently: p50 590 ms, p95 636 ms, max 707 ms.
-  Idle, a simple `peer_decide` is ~340 ms. Under the 1 s p95 budget, but an
+  with five verify suites running concurrently: p50 590 ms, p95 636 ms, max 707 ms;
+  the same set with the machine otherwise quiet: p50 410 ms, p95 445 ms, max 474 ms. Under the 1 s p95 budget, but an
   enforcing hook should keep one long-lived evaluator rather than a bash per call.
 - A shadow event can be lost if omp exits within milliseconds of the call (the
   detached child reads its payload from a pipe). Shadow data only; not a gate.

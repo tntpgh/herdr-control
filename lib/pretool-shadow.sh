@@ -15,7 +15,7 @@
 # SHADOW MODE ONLY. agent-hooks/omp-herdr-control.ts runs this detached, after
 # the existing guards have already returned, and ignores the result: nothing
 # here can block, allow, or change a current approval outcome. The verdict is
-# appended to the registry as a `pretool_verdict` event so
+# recorded as a `pretool_verdict` row in pretool-shadow.sqlite3 (see Storage) so
 # scripts/shadow-compare.sh can measure it against what the menu path actually
 # did.
 #
@@ -28,7 +28,7 @@
 #             values it captured at module load, never a later process.env.
 # Prints ONE JSON line: {verdict, policy, reason, authority, ...}.
 # Exit 0 when the verdict is `allow`, 8 otherwise (the future enforcing hook's
-# contract; the shadow hook discards it). --record also appends the event.
+# contract; the shadow hook discards it). --record also stores the row.
 #
 # Verdicts: allow | escalate (a conductor may review) | reserved (human-only) |
 #           deny (classifier deny; nobody approves) | block (tool off for
@@ -38,6 +38,15 @@
 # stores sha256 digests of the exact input and command, and for bash a
 # redacted, length-capped copy of the command (withheld entirely when the
 # policy itself says it carries a credential). File contents are never stored.
+#
+# Storage: the control-plane registry is READ ONLY here (identity, manifest,
+# file_approvals); registry_init is never run by this file, so no shadow child
+# takes a registry write lock. Verdicts go to a separate SQLite file,
+# pretool-shadow.sqlite3, beside the registry (pretool_shadow_db), so a burst
+# of parallel tool calls can only contend with other shadow writers — never
+# with push-wake, the alert gate or herdr-select — and never enters
+# events_since's window. A write that loses a lock race is dropped (shadow
+# data, not a gate).
 #
 # Not a containment boundary (docs/approval-policy.md rule 7): a same-user
 # process can write the registry and the files judged here.
@@ -49,19 +58,44 @@ _ps_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PS_CMD_CAP=2000
 
-# Same shapes smart-name.sh strips from pane scrapes before they leave the
-# machine, plus private-key blocks and URL userinfo.
+# The shapes smart-name.sh strips from pane scrapes, plus credential-carrying
+# flags (curl -u user:pass, mysql -p<pw>, sshpass -p, --password/--token=…),
+# Authorization headers, NAME=value where NAME says key/token/secret/password
+# (any case), private-key blocks and URL userinfo. perl for case-insensitive
+# matching (BSD sed has no /I).
 pretool_redact() {                      # text -> redacted, capped text
-  printf '%s' "$1" | LC_ALL=C sed -E \
-    's/(sk|rk|pk)-[A-Za-z0-9_-]{16,}/[redacted-key]/g;
-     s/(gh[posru]|xox[baprs]|github_pat)[-_][A-Za-z0-9_]{16,}/[redacted-token]/g;
-     s/AKIA[0-9A-Z]{12,}/[redacted-aws]/g;
-     s/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/[redacted-jwt]/g;
-     s/[Bb]earer[[:space:]]+[A-Za-z0-9._~+\/=-]{8,}/Bearer [redacted]/g;
-     s#(://)[^/@[:space:]]+:[^/@[:space:]]+@#\1[redacted]@#g;
-     s/-----BEGIN [A-Z ]*PRIVATE KEY-----/[redacted-private-key]/g;
-     s/(([Aa]pi[_-]?[Kk]ey|[Tt]oken|[Pp]assword|[Pp]asswd|[Ss]ecret|[Cc]redential)[A-Za-z0-9_]*[[:space:]]*[=:][[:space:]]*)[^[:space:]]+/\1[redacted]/g' \
-    | head -c "$PS_CMD_CAP"
+  printf '%s' "$1" | LC_ALL=C perl -0777 -pe '
+    s/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}/[redacted-key]/g;
+    s/\b(?:gh[posru]|xox[baprs]|github_pat)[-_][A-Za-z0-9_]{16,}/[redacted-token]/g;
+    s/\bAKIA[0-9A-Z]{12,}/[redacted-aws]/g;
+    s/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/[redacted-jwt]/g;
+    s/-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)/[redacted-private-key]/gs;
+    s/(authorization\s*:\s*)[^\x27"\n]+/$1\[redacted]/gi;
+    s/\b(bearer|basic|token)(\s+)[A-Za-z0-9._~+\/=-]{8,}/$1$2\[redacted]/gi;
+    s#(://)[^/@\s]+:[^/@\s]+@#$1\[redacted]@#g;
+    s/((?:^|\s)(?:-u|--user|--proxy-user)(?:\s+|=)?)[\x27"]?[^\s:\x27"]*:[^\s\x27"]+[\x27"]?/$1\[redacted]/g;
+    s/(\b(?:mysql|mysqldump|mariadb|mysqladmin)\b[^|;&\n]*?\s-p)(?!\s)[^\s]+/$1\[redacted]/gi;
+    s/(\bsshpass\s+-p\s*)\S+/$1\[redacted]/gi;
+    s/(--[A-Za-z0-9-]*(?:password|passwd|passphrase|token|secret|api-?key|auth)[A-Za-z0-9-]*(?:=|\s+))\S+/$1\[redacted]/gi;
+    s/(\b[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|token|password|passwd|passphrase|secret|credential|auth)[A-Za-z0-9_]*\s*[=:]\s*)[^\s]+/$1\[redacted]/gi;
+  ' 2>/dev/null | head -c "$PS_CMD_CAP"
+}
+
+# Shadow verdict store: its own file, never the control-plane registry.
+pretool_shadow_db() { printf '%s/pretool-shadow.sqlite3\n' "$(run_state_root)"; }
+
+_ps_shadow_sql() {
+  sqlite3 -batch -noheader -cmd ".timeout ${HERDR_SHADOW_BUSY_MS:-2000}" "$(pretool_shadow_db)" "$@"
+}
+
+pretool_shadow_append() {               # run_id task_id payload event_id
+  _ps_shadow_sql "PRAGMA journal_mode=WAL;" >/dev/null 2>&1
+  _ps_shadow_sql "CREATE TABLE IF NOT EXISTS pretool_verdicts (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+      run_id TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
+      type TEXT NOT NULL DEFAULT 'pretool_verdict', occurred_at TEXT NOT NULL, payload TEXT NOT NULL);
+    INSERT OR IGNORE INTO pretool_verdicts(event_id, run_id, task_id, occurred_at, payload)
+      VALUES ($(_sq "$4"), $(_sq "$1"), $(_sq "$2"), $(_sq "$(_now_iso)"), $(_sq "$3"));" >/dev/null 2>&1
 }
 
 _ps_sha() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
@@ -77,9 +111,12 @@ _ps_identity() {
   [ -n "${HERDR_TASK_ID:-}" ] || _ps_id_fail "HERDR_TASK_ID is not set" || return 1
   [ -n "${HERDR_RUN_ID:-}" ] || _ps_id_fail "HERDR_TASK_ID is set but HERDR_RUN_ID is not" || return 1
   [ -n "${HERDR_PANE_ID:-}" ] || _ps_id_fail "HERDR_PANE_ID is not set" || return 1
-  if ! registry_init >/dev/null 2>&1; then
+  # Read-only use of the registry: mark it ready so no helper here (read_task,
+  # file_approval_state inside peer_decide) runs registry_init's writes.
+  if [ ! -r "$(registry_db)" ] || ! _sql "SELECT count(*) FROM tasks LIMIT 1;" >/dev/null 2>&1; then
     PS_REGISTRY_OK=0; _ps_id_fail "registry unreadable ($(registry_db))"; return 1
   fi
+  _HERDR_REGISTRY_READY=1
   PS_TASK_JSON="$(read_task "$HERDR_RUN_ID" "$HERDR_TASK_ID" 2>/dev/null)" || PS_TASK_JSON=""
   if [ -z "$PS_TASK_JSON" ]; then _ps_id_fail "no registry row for $HERDR_RUN_ID/$HERDR_TASK_ID"; return 1; fi
   st="$(printf '%s' "$PS_TASK_JSON" | jq -r '.state // empty' 2>/dev/null)"
@@ -245,9 +282,9 @@ pretool_shadow_main() {
   printf '%s\n' "$out"
   if [ "$record" = 1 ] && [ "${PS_REGISTRY_OK:-1}" = 1 ] && [ -n "${HERDR_TASK_ID:-}" ]; then
     call="$(printf '%s' "$payload" | jq -r '.call_id // empty' 2>/dev/null)"
-    eid=""
+    eid="$(gen_id ptv)"
     [ -n "$call" ] && eid="ptv_${HERDR_TASK_ID}_$(_ps_sha "$call" | cut -c1-16)"
-    append_event "${HERDR_RUN_ID:-}" "$HERDR_TASK_ID" pretool_verdict "$out" "$eid" >/dev/null 2>&1 || true
+    pretool_shadow_append "${HERDR_RUN_ID:-}" "$HERDR_TASK_ID" "$out" "$eid" || true
   fi
   return "$rc"
 }
