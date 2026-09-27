@@ -268,14 +268,13 @@ if [ "$choices" = 1 ] && [ -n "$pane" ]; then
     sleep 0.25
   done
   # Fingerprint the prompt that produced THESE options, taken here rather than
-  # after the body is built. prompt_id has no failure mode: with the prompt gone
-  # it hashes two empty strings and returns the sha256 of a lone newline
-  # (observed constant below). Shipping that as a button value posts buttons
-  # that render as actionable but are refused on every click by herdr-select's
-  # --expect-prompt-id check, which is worse than no fingerprint at all.
+  # after the body is built. With the prompt gone prompt_id prints nothing
+  # (lib/prompt-parse.sh; until 2026-09-27 it returned a constant "empty"
+  # digest this compared against). Shipping no fingerprint as a button value
+  # posts buttons that render as actionable but are refused on every click by
+  # herdr-select's --expect-prompt-id check, which is worse than none at all.
   [ -n "$opts" ] && pid=$(prompt_id "$pane")
-  _EMPTY_PROMPT_ID=01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
-  if [ "$pid" = "$_EMPTY_PROMPT_ID" ]; then
+  if [ -n "$opts" ] && [ -z "$pid" ]; then
     # The prompt vanished between the poll and this read, so we have options
     # but no question to pin them to. This used to fall back to a two-field
     # button value and post the buttons anyway, reasoning that herdr-select

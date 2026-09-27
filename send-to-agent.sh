@@ -124,10 +124,60 @@ _PROMPT_YN='\([Yy]/[Nn]\)|\[[Yy]/[Nn]\]'
 # always-ask` pane: "Allow tool: bash" header, "Approve"/"Deny" rows,
 # "up/down navigate  enter select  esc cancel" footer. herdr-select.sh CAN now
 # answer this shape (capability `menu-prompt`, lib/agent-profiles.sh — it walks
-# the highlight and presses Enter); what this pattern does is stop ordinary TEXT
+# the highlight and presses Enter); what this check does is stop ordinary TEXT
 # delivery from blowing through the prompt with a bare Enter, same as any other
 # prompt shape.
-_PROMPT_OMP='Allow tool:|enter select'
+#
+# It used to be a bare grep for `Allow tool:|enter select` anywhere in the
+# bottom 12 rows. That refused panes with NO menu: omp leaves the text of an
+# ANSWERED panel ("Allow tool: bash" / "Command: ...") in the transcript right
+# above the composer, so the words stay inside the window after the menu is
+# gone. Hit 3 times on 2026-09-26; each time prompt_menu_options was empty and
+# the operator had to --force the send — teaching --force as the normal path,
+# which is the habit that answers a REAL menu. The omp shape now refuses only
+# on a menu that is actually live:
+#   - prompt_menu_options parses one (lib/prompt-parse.sh — the same parser
+#     herdr-select.sh answers from, which already rejects a dismissed panel
+#     with output below it), or
+#   - the navigation footer is the LAST row on screen. A live omp menu is
+#     bottom-anchored and always ends on that footer (only its box closer and
+#     blank rows below). This half is what still refuses a menu the parser
+#     does not recognize — e.g. Approve / Always allow / Deny, which
+#     prompt_menu_options fails closed on (verify-omp-hooks.sh) — because
+#     Enter there still selects the highlighted default.
+# The header text alone, anywhere, is no longer evidence of anything.
+_OMP_FOOTER='up/down navigate enter select esc cancel'
+_BOX_ROW='^[[:space:]─═│┌┐└┘├┤┬┴┼╭╮╰╯]*$'
+
+# One visible row with omp's side border dropped and whitespace (incl. the NBSP
+# the TUI paints) collapsed, so `│ up/down navigate  enter select  esc │`
+# compares as plain words.
+_omp_row() {                           # <row>
+  local IFS=' ' row="${1//$'\xc2\xa0'/ }" words
+  row="${row//│/ }"
+  read -ra words <<<"$row"
+  printf '%s' "${words[*]}"
+}
+
+# 0 = the omp navigation footer ends the visible text.
+_omp_footer_is_last() {                # <visible text>
+  local rows=() row i last prev
+  while IFS= read -r row; do rows+=("$row"); done <<<"$1"
+  i=$(( ${#rows[@]} - 1 ))
+  while [ "$i" -ge 0 ] && [[ ${rows[$i]} =~ $_BOX_ROW ]]; do i=$((i - 1)); done
+  [ "$i" -ge 0 ] || return 1
+  last=$(_omp_row "${rows[$i]}")
+  case "$last" in *'enter select'*) return 0 ;; esac
+  # A narrow pane wraps the footer (lib/prompt-parse.sh, wN:p9 2026-09-18), so
+  # its last row can be just "cancel" / "esc cancel". Accept that only as a
+  # suffix of the footer phrase whose DIRECTLY preceding row completes it — a
+  # blank or box row in between means a closed panel with output below it.
+  [ "$i" -ge 1 ] || return 1
+  case " $_OMP_FOOTER" in *" $last") ;; *) return 1 ;; esac
+  prev=$(_omp_row "${rows[$((i - 1))]}")
+  case "$prev $last" in *'enter select'*) return 0 ;; esac
+  return 1
+}
 
 looks_like_permission_prompt() {
   local vis win
@@ -136,7 +186,8 @@ looks_like_permission_prompt() {
   printf '%s' "$win" | grep -Eq "$_PROMPT_YN" && return 0
   printf '%s' "$win" | grep -Eq "$_PROMPT_ARROW" \
     && printf '%s' "$win" | grep -Eq "$_PROMPT_OPTION" && return 0
-  printf '%s' "$win" | grep -Eq "$_PROMPT_OMP" && return 0
+  _omp_footer_is_last "$vis" && return 0
+  [ -n "$(prompt_menu_options "$pane" 2>/dev/null)" ] && return 0
   return 1
 }
 

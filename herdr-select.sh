@@ -647,6 +647,72 @@ fi
 approval_confirmed "$approval_id" "pressed" \
   "mechanism=$mechanism choice=$choice" >/dev/null 2>&1 || true
 
+# ---- F7c: a Deny pressed by automation tells the worker WHY ----------------
+# A bare Deny reaches omp as nothing but "denied", so the worker cannot tell
+# "this command is off-limits" from "try that again". Observed: a worker
+# re-issued a denied reserved command (`bash -n lib/command-policy.sh ...`)
+# three times — Denied 17:08:05, 17:08:30, 17:09:10 — before a hand-typed
+# redirect landed. So when a peer or the conductor declines, the reason it
+# already had to state (--review-reason, else the policy verdict's own reason)
+# follows the keypress as ONE line.
+#
+# Human Denies are left alone: a person at the pane can type their own
+# explanation, and an Approve has nothing to explain. No reason, no line —
+# never a placeholder.
+#
+# Ordering is the whole point: the line goes in only AFTER the approval menu
+# has left the pane. send-to-agent.sh refuses into a live menu anyway, but
+# waiting here means that refusal is never the expected path. Bounded (~5s at
+# 0.25s steps) and detached with release_wake_hold's discipline
+# (lib/push-wake.sh), so this script still returns the moment the key has
+# landed; a menu that never clears sends nothing. The pane is re-checked as
+# the same agent before sending — it was only proven so before the keypress,
+# and typed text into a recycled pane running a bare shell EXECUTES.
+#
+# HERDR_DENY_CLEAR_WAIT_S is a TEST SEAM only (verify-select-policy.sh), whole
+# seconds, default 5: it lets the never-clears case run out in ~1s.
+#
+# The outcome is recorded on the answered task as `deny_reason_delivered`
+# (delivered | send_failed | menu_never_cleared) — only when this pane has a
+# registered task to hang it on; the line itself does not need one.
+if [ "$declining" = 1 ] && { [ "$authority" = conductor ] || [ "$authority" = peer ]; }; then
+  _deny_reason="$review_reason"
+  [ -n "${_deny_reason//[[:space:]]/}" ] || _deny_reason="$policy_reason"
+  # One line, bounded: CR/LF and runs of whitespace collapse to one space.
+  _deny_reason="$(printf '%s' "$_deny_reason" | tr -s '[:space:]' ' ')"
+  _deny_reason="${_deny_reason# }"; _deny_reason="${_deny_reason% }"
+  _deny_reason="${_deny_reason:0:300}"
+  if [ -n "$_deny_reason" ]; then
+    _deny_wait_s="${HERDR_DENY_CLEAR_WAIT_S:-5}"
+    case "$_deny_wait_s" in ''|*[!0-9]*) _deny_wait_s=5 ;; esac
+    (
+      _outcome=menu_never_cleared _rc=null _i=0
+      while :; do
+        if [ -z "$(_current_offer)" ] && ! prompt_menu_visible "$pane"; then
+          if ! require_agent_pane "$pane"; then _rc=3
+          elif ! require_pane_birth_match "$pane"; then _rc=7
+          else
+            bash "$here/send-to-agent.sh" "$pane" \
+              "[HERDR-DENIED] $_deny_reason — do not retry the same command; change approach."
+            _rc=$?
+          fi
+          if [ "$_rc" = 0 ]; then _outcome=delivered; else _outcome=send_failed; fi
+          break
+        fi
+        [ "$_i" -ge $((_deny_wait_s * 4)) ] && break
+        _i=$((_i + 1))
+        sleep 0.25
+      done
+      if [ -n "$own_run" ] && [ -n "$own_task" ]; then
+        append_event "$own_run" "$own_task" deny_reason_delivered \
+          "$(jq -nc --arg p "$pane" --arg pid "$current_prompt_id" --arg o "$_outcome" --argjson rc "$_rc" \
+             '{pane:$p, prompt_id:$pid, outcome:$o, exit_code:$rc}')"
+      fi
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
+fi
+
 # The answer unblocks the worker, so the task is running again — say so.
 # lib/push-wake.sh writes `blocked` when a prompt paints, and until now NOTHING
 # wrote the other half: not this script, not lib/reconcile.sh (which only

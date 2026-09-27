@@ -177,10 +177,10 @@ push_wake() {
   fi
   if [ "$recorded_ok" = 0 ]; then
     cmd_hint="$(printf '%s' "$full_cmd" | cut -c1-200)"
-    # An uncorroborated command must not reach human_must_answer below
-    # either — the gate that decides who is woken has to judge the same
-    # (absent) text this row now carries, never the mismatched one nobody's
-    # screen shows.
+    # The gate that decides who is woken judges the same (absent) text this
+    # row now carries, never the mismatched one nobody's screen shows.
+    # human_must_answer (lib/alert-gate.sh) also drops a mismatched command on
+    # its own, so the hook's own call with the raw text agrees with this one.
     full_cmd=""
   fi
   if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
@@ -216,6 +216,28 @@ push_wake() {
         return 1
       fi
     fi
+  fi
+
+  # ---- one conductor wake per prompt occurrence (F7b, 2026-09-27) ----------
+  # Live 2026-09-26 (events 37680/37682): the hook's push_wake and
+  # attention-tick.sh's both delivered a wake for one prompt, because each
+  # caller's "has anyone woken for this yet?" was a read that ran before the
+  # other had written anything. This claim is the decision instead: an INSERT
+  # OR IGNORE on a deterministic id, taken after every refusal above (so a
+  # caller that could not deliver never burns it) and before holding or
+  # delivering (so a second caller cannot spawn a second grace timer either).
+  # The id is per OCCURRENCE because $pid is (lib/prompt-parse.sh prompt_id
+  # carries the pane, its birth and its blocked period): the same command
+  # re-asked after an answer is a new prompt_id and gets its own wake.
+  # Deliberate second deliveries bypass it: the grace re-delivery and a
+  # released hold re-enter with HERDR_ALERT_FORCE=1 (they carry their own
+  # grace_realert_* claim), and HERDR_WAKE_LEGACY=1 keeps the pre-controller
+  # behaviour verify-omp-hooks.sh pins (every firing delivers and records).
+  if [ -z "${HERDR_ALERT_FORCE:-}" ] && [ "${HERDR_WAKE_LEGACY:-0}" != "1" ] &&
+     [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ] && [ -n "$pid" ]; then
+    claim_once "${base}_owner" "$HERDR_RUN_ID" "$HERDR_TASK_ID" "wake_owner" \
+      "$(jq -nc --arg pid "$pid" --arg k "$base" --arg w "$where" '{prompt_id:$pid, wake_key:$k, caller:$w}')" \
+      || return 1
   fi
 
   # The [HERDR-PEER-SIGNAL] prefix is machine-readable on purpose: once this
@@ -439,12 +461,26 @@ _pw_wake_fail_realert() {
   [ -n "$pane" ] || return 0
   local secs="${HERDR_WAKE_FAIL_ALERT_S:-600}"
   case "$secs" in ''|*[!0-9]*) secs=600 ;; esac
+  _ag_trace "armed wakefail ${pid:-noprompt}"      # test seam, lib/alert-gate.sh
   (
+    _ag_out=stood_down
+    trap '_ag_trace "done wakefail ${pid:-noprompt} $_ag_out"' EXIT
     sleep "$secs"
     if [ -n "$run" ] && [ -n "$task" ]; then
       local st
       st="$(read_task "$run" "$task" 2>/dev/null | jq -r '.state // empty' 2>/dev/null)"
       [ "$st" = "blocked" ] || exit 0
+      # The conductor WAS reached if any attempt for this same prompt
+      # occurrence was submitted. Live 2026-09-26 (event 37775): a page went
+      # out keyed to a redundant second attempt that failed while the first
+      # had been submitted. The owner claim above now stops the redundant
+      # attempt; this still covers a legacy or forced re-delivery failing
+      # after an earlier one landed.
+      local landed
+      landed="$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq "$task") AND type='wake_result'
+            AND json_extract(payload,'\$.wake_key')=$(_sq "wake_${run}_${task}_${pid:-noprompt}")
+            AND json_extract(payload,'\$.outcome')='submitted';" 2>/dev/null)"
+      [ "${landed:-0}" = 0 ] || { _ag_out=conductor_reached; exit 0; }
     fi
     prompt_menu_visible "$pane" 2>/dev/null || [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || exit 0
     local notify
@@ -456,6 +492,7 @@ _pw_wake_fail_realert() {
     bash "$notify" --class wake-fail --choices --pane "$pane" \
       "conductor wake ${outcome} and still unanswered after ${secs}s — the peer-notify path is broken, this needs you directly" \
       >/dev/null 2>&1 || true
+    _ag_out=fired
     if [ -n "$run" ] && [ -n "$task" ]; then
       # Keyed by prompt_id, not a fresh random id: two independent failed-wake
       # timers for the SAME still-unanswered prompt both reach this line (the

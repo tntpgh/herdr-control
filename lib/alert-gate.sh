@@ -39,10 +39,17 @@ _ag_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Unreadable, unclassifiable, or no prompt at all -> 0. Telling a person about
 # something we could not read is the safe direction; staying quiet is not.
 # [recorded-cmd] is the untruncated command the hook recorded for this prompt
-# (agent-hooks/omp-herdr-control.ts); judged instead of the panel only when the
-# panel contains it — lib/scoped-policy.sh approval_command_text, the same
-# rule herdr-select.sh enforces, as is the peer decision itself (peer_decide),
-# so this gate and the answer path cannot disagree about who owns a prompt.
+# (agent-hooks/omp-herdr-control.ts); judged instead of the panel only when it
+# EQUALS the panel's command region — lib/scoped-policy.sh
+# approval_command_text, the same rule herdr-select.sh enforces, as is the peer
+# decision itself (peer_decide), so this gate and the answer path cannot
+# disagree about who owns a prompt. A recorded command that does NOT match is
+# dropped and the panel is judged alone, which is exactly what push_wake does
+# with the same text (it blanks it before recording the row) and what
+# herdr-select.sh will judge when a peer answers. Until 2026-09-27 this
+# returned "a human must answer" on a mismatch instead, so the hook (raw text:
+# human) and push_wake (blanked text: peer may take it) classified one prompt
+# two ways, armed a human-stale page AND held the wake for it (PR #158 round 2).
 human_must_answer() {
   local pane="$1" recorded="${2:-}" cmd task
   [ -n "$pane" ] || return 0
@@ -71,7 +78,8 @@ human_must_answer() {
     [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || return 0
   fi
   cmd="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
-  cmd="$(approval_command_text "$cmd" "$recorded")" || return 0
+  local judged
+  judged="$(approval_command_text "$cmd" "$recorded")" && cmd="$judged"
   [ -n "${cmd//[[:space:]]/}" ] || return 0
   case "$cmd" in *elided*|*truncated*) return 0 ;; esac
   task="$(task_for_pane "$pane" 2>/dev/null)"
@@ -117,12 +125,28 @@ _ag_grace_seconds() {                   # [raw] -> integer seconds
   printf '%s\n' "$g"
 }
 
+# TEST SEAM, unset in every real deployment: when HERDR_ALERT_TRACE names a
+# file, each detached alert timer (grace_realert here, _pw_wake_fail_realert in
+# lib/push-wake.sh) appends "armed <kind> <prompt_id>" when it starts and
+# "done <kind> <prompt_id> <outcome>" when it exits, whatever the exit path. A
+# suite then waits for its timers to finish by reading the file, instead of
+# sleeping and hoping a slow run's timer has not yet posted into the NEXT
+# case's window (verify-slack-symptoms.sh case 4 did exactly that under load:
+# a case-3 timer posted during case 4).
+_ag_trace() {
+  [ -n "${HERDR_ALERT_TRACE:-}" ] && printf '%s\n' "$*" >> "$HERDR_ALERT_TRACE"
+  return 0
+}
+
 grace_realert() {
   local pane="$1" pid="$2" run="$3" task="$4"; shift 4
-  local grace hold_at
+  local grace hold_at kind="${HERDR_GRACE_CLAIM_KIND:-grace_realert}"
   grace="$(_ag_grace_seconds)"
   hold_at="$(_now_iso 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+  _ag_trace "armed $kind ${pid:-noprompt}"
   (
+    _ag_out=stood_down
+    trap '_ag_trace "done $kind ${pid:-noprompt} $_ag_out"' EXIT
     sleep "$grace"
     prompt_menu_visible "$pane" 2>/dev/null || [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || exit 0
     # A later prompt on this task supersedes this timer. Without this check,
@@ -147,6 +171,7 @@ grace_realert() {
     local now_pid rc=0
     now_pid="$(prompt_id "$pane" 2>/dev/null || printf '')"
     "$@" >/dev/null 2>&1 || rc=$?
+    _ag_out=fired
     if [ -n "$run" ] && [ -n "$task" ]; then
       append_event "$run" "$task" "alert_grace_expired" \
         "$(jq -nc --arg p "$pane" --arg pid "$pid" --arg now "$now_pid" --arg g "$grace" --argjson rc "$rc" \
