@@ -1118,7 +1118,15 @@ _cp_coderef_segment() {                 # seg wt cwd_bound pipe_flag depth env_p
                 *@SUB@*) _cp_cr_unresolvable=1 ;;
                 *)
                   local pystr; pystr="$(_cp_coderef_unprotect "${w[$((i + 1))]}")"
-                  _cp_python_risk "$pystr" >/dev/null && _cp_cr_unresolvable=1 ;;
+                  _cp_python_risk "$pystr" >/dev/null && _cp_cr_unresolvable=1
+                  # A plain `import tmp.evil` / `from tmp import evil` runs a
+                  # worktree file with no risky keyword in the -c text itself
+                  # (review round 2, #160). `-c` puts the cwd on sys.path; the
+                  # worker's shell sits in its worktree, so resolve against it
+                  # whether or not the command spelled `cd <wt> && `.
+                  # ceiling: a -c run from some other cwd is judged against the
+                  # worktree, not that cwd.
+                  [ -n "$wt" ] && _cp_python_local_imports "$pystr" "$wt" >/dev/null && _cp_cr_unresolvable=1 ;;
               esac
             fi
             return 0 ;;
@@ -1232,14 +1240,22 @@ EOF
 # a longer name). Counting segments rather than occurrences means the
 # script's OWN invocation (`bash tmp/evil.sh tmp/evil.sh`) still counts
 # once, not twice.
-_cp_coderef_count_segments_mentioning() {   # text basename depth
-  local text="$1" base="$2" depth="${3:-0}" count=0 seg body sub
-  [ "$depth" -le 6 ] || { printf 0; return 0; }
+_cp_coderef_count_segments_mentioning() {   # text basename depth -> "<mentions> <pure-runs>"
+  local text="$1" base="$2" depth="${3:-0}" count=0 pure=0 seg body sub bre
+  [ "$depth" -le 6 ] || { printf '0 0'; return 0; }
+  bre="$(printf '%s' "$base" | sed 's/[.[\*^$()+?{}|]/\\&/g')"
   while IFS= read -r seg; do
     [ -n "$seg" ] || continue
     case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
-    if printf '%s' "$seg" | grep -qE "(^|[^A-Za-z0-9_.-])${base}([^A-Za-z0-9_.-]|\$)"; then
+    if printf '%s' "$seg" | grep -qE "(^|[^A-Za-z0-9_.-])${bre}([^A-Za-z0-9_.-]|\$)"; then
       count=$((count + 1))
+      # A segment that only RUNS the file (`bash tmp/x.sh args`, no
+      # redirection anywhere) cannot have written it; counted separately so
+      # an idempotent retry `bash x.sh && bash x.sh` is not read as
+      # rewrite-then-run (review round 2, #160).
+      if printf '%s' "$seg" | grep -qE "^[[:space:]]*(bash|sh|zsh|dash|ksh|mksh|python[0-9.]*|pypy[0-9.]*|source|\\.)[[:space:]]+([^[:space:]<>]*/)?${bre}([[:space:]][^<>]*)?\$"; then
+        pure=$((pure + 1))
+      fi
     fi
   done <<EOF
 $(_cp_coderef_split "$text")
@@ -1247,11 +1263,11 @@ EOF
   while IFS= read -r body; do
     [ -n "$body" ] || continue
     sub="$(_cp_coderef_count_segments_mentioning "$body" "$base" "$((depth + 1))")"
-    count=$((count + ${sub:-0}))
+    count=$((count + ${sub%% *})); pure=$((pure + ${sub##* }))
   done <<EOF
 $(_cp_coderef_immediate_bodies "$text")
 EOF
-  printf '%s' "$count"
+  printf '%s %s' "$count" "$pure"
 }
 
 # `_cp_coderef_file_named_elsewhere <raw> <real>` -> 0 when more than one
@@ -1260,12 +1276,16 @@ EOF
 # before the segment that runs it does (finding 12: `cp tmp/evil.sh
 # tmp/clean.sh && bash tmp/clean.sh` hashed clean.sh's own (clean) bytes at
 # check time, blind to the `cp` segment that just replaced them).
+# Extra segments that only RUN the same file again do not count (they
+# cannot write it); the first running segment is the invocation itself.
 _cp_coderef_file_named_elsewhere() {    # raw real
-  local raw="$1" real="$2" base hits
+  local raw="$1" real="$2" base hits total pure
   base="${real##*/}"
   [ -n "$base" ] || return 1
   hits="$(_cp_coderef_count_segments_mentioning "$raw" "$base" 0)"
-  [ "${hits:-0}" -gt 1 ]
+  total="${hits%% *}"; pure="${hits##* }"
+  [ "${pure:-0}" -gt 1 ] && total=$((total - pure + 1))
+  [ "${total:-0}" -gt 1 ]
 }
 
 _cp_code_ref() {                        # raw wt

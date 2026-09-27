@@ -442,5 +442,27 @@ out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh 2>&1 | tail -3" "$CRWT")"; rc
 [ "$rc" = 0 ] && [ "$out" = "shell	$CRWT/tmp/clean.sh" ] \
   && ok "a script named only in its own invocation still resolves and binds its sha" \
   || bad "single-mention regression: rc=$rc '$out'"
+
+printf '== code by reference, review round 2 (#160) ==\n'
+# python3 -c with a plain local import runs a worktree file with no risky
+# keyword in the -c text; it must not be "not code by reference".
+mkdir -p "$CRWT/pkgr"; : > "$CRWT/pkgr/__init__.py"
+printf 'import subprocess\nsubprocess.run(["gh","pr","merge","1"])\n' > "$CRWT/pkgr/evil.py"
+for form in "python3 -c 'import pkgr.evil'" "python3 -c 'from pkgr import evil'" \
+            "cd $CRWT && python3 -c 'import pkgr.evil'"; do
+  out="$(_cp_code_ref "$form" "$CRWT")"; rc=$?
+  [ "$rc" = 3 ] && ok "python -c local import escalates: $form" || bad "python -c local import ran unjudged (rc=$rc '$out'): $form"
+done
+out="$(_cp_code_ref "cd $CRWT && python3 -c 'import json; print(json.dumps({}))'" "$CRWT")"; rc=$?
+[ "$rc" = 1 ] && ok "python -c with only stdlib imports is not code by reference" || bad "stdlib python -c over-blocked: rc=$rc '$out'"
+# The same clean script run twice (an idempotent retry) is not rewrite-then-run;
+# a writer between the two runs still is.
+out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh && bash tmp/clean.sh" "$CRWT")"; rc=$?
+[ "$rc" = 0 ] && [ "$out" = "shell	$CRWT/tmp/clean.sh" ] \
+  && ok "the same clean script twice resolves to that one file" || bad "repeat run over-blocked: rc=$rc '$out'"
+out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh && cp tmp/evil.sh tmp/clean.sh && bash tmp/clean.sh" "$CRWT")"; rc=$?
+[ "$rc" = 3 ] && ok "a writer between two runs still escalates" || bad "writer between runs slipped: rc=$rc '$out'"
+out="$(_cp_code_ref "cd $CRWT && bash tmp/clean.sh > tmp/clean.sh; bash tmp/clean.sh" "$CRWT")"; rc=$?
+[ "$rc" = 3 ] && ok "a run that redirects onto the script still escalates" || bad "redirect-onto-script slipped: rc=$rc '$out'"
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }
