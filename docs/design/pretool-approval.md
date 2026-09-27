@@ -456,7 +456,8 @@ Open the isolation follow-up: run workers under a separate macOS user or a
 container that cannot write `~/.local/state/herdr`, the checkouts, or
 Terrence's gh/1Password credentials — required before hook mode becomes the
 default and for any task that reads untrusted input (starting point:
-`isolated-worker.py`). His note: "there are things like devcontainers that
+`isolated-worker.py`). Tracked as
+[#172](https://github.com/tntpgh/herdr-control/issues/172). His note: "there are things like devcontainers that
 might work, but we'd have to be mindful of how our system works. Like the idea
 of getting better at our security with this." The 5-day shadow gate (§10 q1)
 still applies to any canary.
