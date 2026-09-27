@@ -1562,11 +1562,39 @@ check_reserved   "grep in .env"                            'grep x .env'
 check_reserved   "lib/alert-gate.sh edited via python"     'python3 -c "open(\"lib/alert-gate.sh\",\"w\")"'
 check_reserved   "git add of a policy file (no grant here)" 'git add lib/command-policy.sh'
 check_reserved   "env GCONV_PATH (loads shared objects)"   'env GCONV_PATH=/tmp/x iconv -l'
-check_reserved   "env HERDR_BRIDGE_ENV (a sourced file)"   'env HERDR_BRIDGE_ENV=/tmp/x.env git status'
+check_reserved   "env HERDR_BRIDGE_ENV (a sourced file)"   'env HERDR_BRIDGE_ENV=/tmp/bridge-cfg git status'
 check_reserved   "a /dev/null look-alike redirect target"  'cat herdr-select.sh 2>/dev/null.bak'
 check_reserved   "a path under /dev/null/.. is a real write" 'cat herdr-select.sh >/dev/null/../x'
 check_reserved   "env then xargs env"                      'env X=v xargs env'
 check_reserved   "env then sh -c env"                      "env X=v sh -c env"
+# #171 review round 1: env prints the whole environment when no command
+# follows its assignments, and every `=` word is an assignment.
+check_reserved   "env value with a quoted space"           'env FOO="a b"'
+check_reserved   "env value with a single-quoted space"    "env FOO='a b'"
+check_reserved   "env value with an escaped space"         'env FOO=a\ b'
+check_reserved   "env quoted assignment word"              'env FOO=1 "X Y=z"'
+check_reserved   "env non-identifier name"                 'env FOO=1 X.Y=z'
+check_reserved   "env numeric name"                        'env FOO=1 1=2'
+check_reserved   "env dashed name"                         'env FOO=1 a-b=c'
+check_reserved   "usr-bin env non-identifier name"         '/usr/bin/env FOO=1 X.Y=z'
+check_reserved   "env then an fd redirection"              'env FOO=1 2>&1'
+check_reserved   "env then stderr to /dev/null"            'env FOO=1 2>/dev/null'
+check_reserved   "env then a comment"                      'env FOO=1 # git status'
+check_reserved   "env then a brace assignment"             'env FOO=1 {a,b}=c'
+check_reserved   "env then a glob assignment"              'env FOO=1 *=x'
+check_reserved   "env then an empty expansion"             'env FOO=1 $NOPE'
+check_reserved   "env BASH_FUNC import"                    "env A=1 'BASH_FUNC_git%%=() { sh x; }' bash -c 'git status'"
+check_reserved   "fake command word before PATH"           'env FOO="a b" PATH=/tmp/evil git status'
+check_reserved   "non-identifier word before PATH"         'env A=1 X.Y=1 PATH=/tmp/e git status'
+check_reserved   "fake command word before LD_PRELOAD"     'env FOO="a b" LD_PRELOAD=/tmp/x.so ls'
+check_reserved   "fake command word before BASH_ENV"       'env FOO="a b" BASH_ENV=x bash y'
+check_unreserved "cd then env prefix then git"             'cd /wt && env FOO=1 git status'
+check_reserved   "a worker program named cat"              '/tmp/wt/cat lib/command-policy.sh'
+check_reserved   "a worker program named ls"               './ls herdr-select.sh'
+check_reserved   "a worker program named bash with -n"     './bash -n herdr-select.sh'
+check_reserved   "a dot-dot path to bash with -n"          'tmp/../bash -n herdr-select.sh'
+check_unreserved "absolute system bash -n"                 '/bin/bash -n herdr-select.sh'
+check_reserved   "rg --hostname-bin runs a program"        'rg --hostname-bin=/tmp/evil --hyperlink-format=default foo herdr-select.sh'
 
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then

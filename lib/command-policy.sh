@@ -410,7 +410,7 @@ _cp_strip_commit_message() {            # raw wt
         if [ "${w[1]:-}" = add ] && [ "$i" -ge 2 ]; then
           plain="$(printf '%s' "$token" | tr '\001-\016' ' ')"
           case "$plain" in
-            -*|*[\*\?\[\{\$\ ]*) ;;
+            -*|*[\*\?\[\{\$\ \~]*|.[A-Za-z]*/*|*/.[A-Za-z]*/*) ;;
             *)
               case "${plain##*/}" in
                 herdr-select.sh|scoped-policy.sh|task-manifest.sh|run-registry.sh|alert-gate.sh|prompt-parse.sh|command-policy.sh|approval-policy.md|gate-registry.yaml)
@@ -2515,39 +2515,6 @@ _cp_envdump_word_is_dump() {            # norm [noexempt] -> 0 (true) if it dump
       if (depth > 0) return openpos[depth]
       return 0
     }
-    # F6: `env NAME=val [NAME=val…] cmd …` only sets variables for cmd and
-    # prints nothing. Exempt ONLY that exact shape: one or more NAME=value
-    # words, then a present command word that is not an option and not
-    # env/printenv itself. A name that changes WHAT runs or what an
-    # interpreter loads (BASH_ENV, PATH, PYTHON*, LD_*/DYLD_*, GIT_*, …)
-    # never qualifies — `env BASH_ENV=x bash y` stays exactly as reserved as
-    # it was; so does any value carrying a shell operator.
-    function env_name_loads_code(nm) {
-      return (nm ~ /^(BASH_ENV|ENV|PATH|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|HOME|ZDOTDIR|TMPDIR|EDITOR|VISUAL|PAGER|MANPAGER|LESSOPEN|LESSCLOSE|BROWSER|SSH_ASKPASS|SUDO_ASKPASS|NODE_OPTIONS|NODE_PATH|PERLLIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|XDG_CONFIG_HOME|XDG_CONFIG_DIRS|GCONV_PATH|LOCPATH|NLSPATH|HOSTALIASES|RUSTC_WRAPPER|CC|CXX|MAKEFLAGS|HERDR_BRIDGE_ENV)$/ ||
-              nm ~ /^(PYTHON|PERL5|GIT_|LD_|DYLD_|MALLOC_|TERMINFO|CARGO_|npm_config_|NPM_CONFIG_)/)
-    }
-    function env_assign_prefix(line, p,    rest, nt, toks, k, t, cnt, eq, nm, val, lt) {
-      rest = substr(line, p)
-      nt = split(rest, toks, /[ \t]+/)
-      cnt = 0
-      for (k = 1; k <= nt; k++) {
-        t = toks[k]
-        if (t == "") continue
-        if (t ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
-          eq = index(t, "="); nm = substr(t, 1, eq - 1); val = substr(t, eq + 1)
-          if (env_name_loads_code(nm)) return 0
-          if (val ~ /[;&|<>`()]/) return 0
-          cnt++
-          continue
-        }
-        if (cnt == 0) return 0
-        if (t ~ /^[-;&|<>()]/) return 0
-        lt = tolower(t); sub(/.*\//, "", lt)
-        if (lt == "env" || lt == "printenv") return 0
-        return 1
-      }
-      return 0
-    }
     {
       line = $0; n = length(line); i = 1; found = 0
       while (i <= n) {
@@ -2562,7 +2529,6 @@ _cp_envdump_word_is_dump() {            # norm [noexempt] -> 0 (true) if it dump
         exempt = 0
         if (NOEXEMPT != "1") {
           if (after == ".") exempt = 1
-          if (!exempt && wlen == 3 && env_assign_prefix(line, i + 3)) exempt = 1
           if (!exempt) {
             j = i + wlen
             while (substr(line, j, 1) == " " || substr(line, j, 1) == "\t") j++
@@ -2693,11 +2659,61 @@ _cp_any_interpreter_inline_code() {   # norm -> 0 (true) if ANY of the above
     _cp_rubyperl_inline_code "$1" || _cp_other_inline_code "$1"
 }
 
+# F6: `env NAME=val [NAME=val…] cmd args…` only sets variables for cmd and
+# prints nothing. `_cp_env_prefix_rest <raw>` -> prints `cmd args…` and
+# returns 0 ONLY for exactly that shape, judged on the REAL argv
+# (_cp_simple_words: quoted spaces stay glued, any unquoted operator,
+# redirection or comment refuses; an optional leading `cd <dir> && ` is
+# allowed): the first word is exactly `env` or `/usr/bin/env`; one or more
+# words that are each `NAME=value` with an identifier NAME and a value free
+# of quoting, expansion, globs, braces, `#`, `~`; then a plain command word
+# (not an option, no `=`, not starting with a digit, not env/printenv). Every
+# NAME is checked against _CP_ENV_LOADS_CODE_RE — a name that changes WHAT
+# runs or what an interpreter loads keeps `env` a reservation exactly as on
+# main (`env BASH_ENV=x bash y`, `env PATH=… <anything>`). Anything else
+# stays a dump. #171 review round 1 (quoted values, non-identifier names,
+# fd redirections, comments, globs, BASH_FUNC_x%%=, a fake command word in
+# front of PATH) is why this is an argv walk, not a text scan.
+_CP_ENV_LOADS_CODE_RE='^(BASH_ENV|ENV|PATH|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|HOME|ZDOTDIR|TMPDIR|EDITOR|VISUAL|PAGER|MANPAGER|LESSOPEN|LESSCLOSE|LESS|BROWSER|SHELL|SSH_ASKPASS|SUDO_ASKPASS|NODE_OPTIONS|NODE_PATH|PERLLIB|RUBYOPT|RUBYLIB|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|XDG_CONFIG_HOME|XDG_CONFIG_DIRS|GCONV_PATH|LOCPATH|NLSPATH|HOSTALIASES|RUSTC_WRAPPER|CC|CXX|MAKEFLAGS|MAKEFILES|CURL_HOME|WGETRC|RIPGREP_CONFIG_PATH|HERDR_BRIDGE_ENV)$|^(PYTHON|PERL5|GIT_|LD_|DYLD_|MALLOC_|TERMINFO|CARGO_|npm_config_|NPM_CONFIG_|BASH_FUNC_)'
+_cp_env_prefix_rest() {                 # raw -> prints `cmd args…`, 0 when the shape holds
+  local raw="$1" i=1 n w nm
+  case "$raw" in
+    "cd "*" && "*)
+      local head="${raw%% && *}"
+      case "${head#cd }" in *[[:space:]\;\&\|\<\>\(\)\`\$\'\"\\]*) return 1 ;; esac
+      raw="${raw#* && }" ;;
+  esac
+  _cp_simple_words "$raw" "" || return 1
+  n="${#_CP_W[@]}"
+  case "${_CP_W[0]}" in env|/usr/bin/env) ;; *) return 1 ;; esac
+  while [ "$i" -lt "$n" ]; do
+    w="${_CP_W[$i]}"
+    case "$w" in *=*) ;; *) break ;; esac
+    case "$w" in *[$'\001'-$'\016']*|*[\$\`\*\?\[\{\#\~\\\'\"]*) return 1 ;; esac
+    [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || return 1
+    nm="${w%%=*}"
+    [[ "$nm" =~ $_CP_ENV_LOADS_CODE_RE ]] && return 1
+    i=$((i + 1))
+  done
+  [ "$i" -ge 2 ] && [ "$i" -lt "$n" ] || return 1
+  w="${_CP_W[$i]}"
+  [[ "$w" =~ ^[A-Za-z_./][A-Za-z0-9_./+-]*$ ]] || return 1
+  case "$(printf '%s' "${w##*/}" | tr 'A-Z' 'a-z')" in env|printenv) return 1 ;; esac
+  printf '%s' "${_CP_W[*]:$i}" | tr '\001-\016' ' '
+}
+
 _cp_env_dump_invoked() {                # raw -> 0 (true) if env/printenv is invoked to dump the environment
-  local raw="$1" norm noexempt=0
+  local raw="$1" norm noexempt=0 rest wordscan
   norm="$(scannable_command "$raw")"
   _cp_any_interpreter_inline_code "$norm" && noexempt=1
-  [ "$(_cp_envdump_word_is_dump "$norm" "$noexempt")" = 1 ] && return 0
+  # The word scan skips a leading `env NAME=val …` that only prefixes a
+  # command (_cp_env_prefix_rest); the command and its arguments are still
+  # scanned, so `env X=1 sh -c env` is still a dump.
+  wordscan="$norm"
+  if [ "$noexempt" = 0 ] && rest="$(_cp_env_prefix_rest "$raw")"; then
+    wordscan="$(scannable_command "$rest")"
+  fi
+  [ "$(_cp_envdump_word_is_dump "$wordscan" "$noexempt")" = 1 ] && return 0
   _cp_imatch "$_CP_ENVDUMP_OTHER_RE" "$norm" && return 0
   _cp_imatch "$_CP_ENVDUMP_GETENV_RE" "$norm" && return 0
   _cp_match "$_CP_ENVDUMP_ENV_HASH_RE" "$norm" && return 0
@@ -3597,8 +3613,10 @@ _cp_policy_mention_harmless() {         # raw
   tidy="$(printf '%s' "$raw" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
   case "$tidy" in *$'\n'*|*'`'*|*'$('*|*'<('*|*'>('*|*'>'*) return 1 ;; esac
   if _cp_simple_words "$raw" ""; then
-    case "${#_CP_W[@]}:${_CP_W[0]##*/}:${_CP_W[1]:-}" in
-      3:bash:-n|3:sh:-n|3:zsh:-n|3:dash:-n)
+    # The interpreter must be the real one by name or absolute system path:
+    # a worker-written `./bash` or `tmp/../bash` is a program, not a parser.
+    case "${#_CP_W[@]}:${_CP_W[0]}:${_CP_W[1]:-}" in
+      3:bash:-n|3:sh:-n|3:zsh:-n|3:dash:-n|3:/bin/bash:-n|3:/bin/sh:-n|3:/bin/zsh:-n|3:/bin/dash:-n)
         case "${_CP_W[2]}" in -*|*'$'*|*'*'*|*'?'*|*'['*|*'{'*) return 1 ;; esac
         return 0 ;;
     esac
@@ -3607,8 +3625,11 @@ _cp_policy_mention_harmless() {         # raw
     [ -n "$seg" ] || continue
     case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
     n=$((n + 1))
-    case "$seg" in *--output*|*--pre*) return 1 ;; esac
+    case "$seg" in *--output*|*--pre*|*--hostname-bin*) return 1 ;; esac
     _cp_locate_command_word "$seg" || return 1
+    # A path-form command word is a program the worker may have written
+    # (`./cat`, `/tmp/wt/ls`), not the read-only verb (#171 review MEDIUM).
+    case "${_CP_LOC[0]:-}" in */*) return 1 ;; esac
     [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$seg" | awk '{print $1}')" ] || return 1
     case "$_CP_READONLY_VERBS" in *" $_cp_wcmd "*) ;; *) return 1 ;; esac
   done <<EOF
