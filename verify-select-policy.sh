@@ -1054,17 +1054,24 @@ printf '== change 1: registry command missing at call time is worth a short wait
 # PR #158 review round 2: elapsed-ms comparisons raced the machine's own
 # speed ("returned before the window elapsed: 956ms (baseline 989ms)" — a
 # real failure on a fast run, not a real bug). Synchronized on the trace FILE
-# instead (HERDR_SELECT_WAIT_TRACE, lib/scoped-policy.sh): the background
-# seeder waits for "poll 1" to land in the trace before writing the row, so
-# this can never depend on how fast any particular machine happens to be.
+# instead (HERDR_SELECT_WAIT_TRACE, lib/scoped-policy.sh). The seeder waits
+# for "poll 2": wait_for_input_required_row writes "poll <n>" BEFORE poll n's
+# query, so "poll 2" on disk proves poll 1's query already ran and found
+# nothing. Waiting for "poll 1" instead would race poll 1's own query. The
+# file wait is capped (~10s) only so a regression that never polls fails the
+# assertions below instead of hanging the suite.
+seed_after_poll2() {                    # <run> <task> <command>
+  local i=0
+  while [ "$i" -lt 200 ] && ! grep -q '^poll 2$' "$WAIT_TRACE" 2>/dev/null; do
+    sleep 0.05; i=$((i + 1))
+  done
+  grep -q '^poll 2$' "$WAIT_TRACE" 2>/dev/null && seed_input_required "$1" "$2" "$3"
+}
 set_task_state runR taskR running >/dev/null 2>&1
 RACE_MSG='git commit -m "docs(policy): grant header comment matches -u/--set-upstream push shape"'
 set_menu "$RACE_MSG"; reset_keys
 : > "$WAIT_TRACE"
-(
-  while ! grep -q '^poll 1$' "$WAIT_TRACE" 2>/dev/null; do sleep 0.05; done
-  seed_input_required runR taskR "$RACE_MSG"
-) &
+seed_after_poll2 runR taskR "$RACE_MSG" &
 bg_pid=$!
 HERDR_SELECT_RECORD_WAIT_S=5 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
 wait "$bg_pid" 2>/dev/null
@@ -1086,13 +1093,16 @@ printf '== HIGH (PR #158 review): a SHORT recorded command must not corroborate 
 set_task_state runR taskR running >/dev/null 2>&1
 PULLS_CMD="gh api -X PUT repos/o/r/pulls/7/merge"
 set_menu "$PULLS_CMD"; reset_keys
-( sleep 1; seed_input_required runR taskR "ls" ) &
+: > "$WAIT_TRACE"
+seed_after_poll2 runR taskR "ls" &
 bg_pid=$!
-sel 1 --authority peer; rc=$?
+HERDR_SELECT_RECORD_WAIT_S=5 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
 wait "$bg_pid" 2>/dev/null
 [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
   && ok "'ls' inside '...pulls...' does not corroborate; Approve refused, no key pressed" \
   || bad "SUBSTRING FALSE POSITIVE: rc=$rc keys=$(keys_pressed) — 'ls' wrongly corroborated the merge"
+[ "$(tail -1 "$WAIT_TRACE")" = "found" ] && ok "the 'ls' row was found by the wait (the refusal is the corroboration check, not a timeout)" \
+  || bad "the delayed 'ls' row was never found: $(cat "$WAIT_TRACE")"
 
 printf '== HIGH: a recorded command that is a PREFIX of the panel text must not corroborate either ==\n'
 set_task_state runR taskR running >/dev/null 2>&1
@@ -1123,13 +1133,23 @@ HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
 
 printf '== change 1: no registry row ever appears -> bounded wait, then the scraped panel ==\n'
 FALLBACK_TEXT="git log --oneline -3"
-set_screen "$FALLBACK_TEXT"; reset_keys
+# set_menu, not set_screen: every set_screen panel hashes to the SAME
+# prompt_id (no parseable question rows), so the command-less row seeded just
+# above matched this prompt too and the "no row" case was really a found-at-
+# poll-1 case. That, not machine speed, is why the old elapsed-ms assertion
+# failed ("returned before the window elapsed: 956ms").
+set_menu "$FALLBACK_TEXT"; reset_keys
 : > "$WAIT_TRACE"
 HERDR_SELECT_RECORD_WAIT_S=1 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "falls back to the scraped panel text when no row ever appears" \
   || bad "rc=$rc; stderr: $(cat "$WORK/err.txt")"
-[ "$(tail -1 "$WAIT_TRACE")" = "timeout" ] && ok "trace ends in timeout" \
-  || bad "trace did not end in timeout: $(cat "$WAIT_TRACE")"
+[ "$(q_appr command)" = "Allow tool: bash Command: $FALLBACK_TEXT" ] && ok "the approvals row records the panel scrape it fell back to" \
+  || bad "approvals command on fallback: '$(q_appr command)'"
+# 1s window, 0.25s steps: polls at elapsed 0, .25, .5, .75, 1.0, then timeout.
+# Counting polls pins the full bounded window without reading the clock.
+[ "$(cat "$WAIT_TRACE")" = "$(printf 'poll 1\npoll 2\npoll 3\npoll 4\npoll 5\ntimeout')" ] \
+  && ok "waited out the whole 1s window (5 polls) and then timed out" \
+  || bad "trace: $(cat "$WAIT_TRACE")"
 
 printf '== change 2: a peer refusal records the TASKs own_run/own_task and the prompt_id ==\n'
 REFUSE_TEXT="gh pr merge 99 --squash"
