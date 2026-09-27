@@ -166,7 +166,9 @@ if [ -n "${HERDR_CONDUCTOR_PANE_ID:-}" ]; then
 fi
 
 if [ "${human_stale:-0}" = 1 ]; then
-  HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" \
+  # Own claim namespace (lib/alert-gate.sh): a peer refusal or the conductor
+  # re-wake takes grace_realert_*, and must not silence this ERROR post.
+  HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" HERDR_GRACE_CLAIM_KIND=human_stale \
   grace_realert "${HERDR_PANE_ID}" "$(prompt_id "${HERDR_PANE_ID}" 2>/dev/null || printf '')" \
     "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
     bash "$notify" --class human-stale --choices ${cwd:+--cwd "$cwd"} \

@@ -165,9 +165,10 @@ push_wake() {
   # prompt now carries a command it never showed. herdr-select.sh's own
   # short wait for this row (lib/scoped-policy.sh wait_for_input_required_row)
   # would then WAIT for and TRUST exactly that wrong text, so the
-  # corroboration has to happen here, before the row is ever written — same
-  # substring-of-the-panel rule herdr-select.sh and human_must_answer already
-  # enforce (lib/scoped-policy.sh approval_command_text).
+  # corroboration has to happen here, before the row is ever written — the
+  # same anchored rule herdr-select.sh and human_must_answer enforce: the
+  # collapsed recorded command must EQUAL the panel's collapsed Command:/run:
+  # region (lib/scoped-policy.sh approval_command_text).
   local recorded_ok=1 cmd_hint=""
   if [ -n "${HERDR_PANE_ID:-}" ] && [ -n "$full_cmd" ]; then
     local panel_now
@@ -383,17 +384,18 @@ release_wake_hold() {
     "$(jq -nc --arg pid "$pid" --arg p "$pane" --arg r "$reason" '{prompt_id:$pid, pane:$p, reason:$r}')" \
     >/dev/null 2>&1 || true
   # MEDIUM-1 (PR #158 review): the held Slack alert (agent-hooks/omp-notify.sh
-  # / claude-notify.sh) claims this SAME idempotency key too — see their own
-  # grace_realert call sites, both `grace_realert_${run}_${task}_${pid}`. So
-  # winning the claim above (needed to stop the conductor-wake timer from
-  # double-waking) ALSO silences whichever Slack alert was still pending for
-  # this prompt, unless this function sends it itself. Same resolution order
-  # as _pw_wake_fail_realert below; herdr-notify.sh's own alert_claim (pane,
-  # key, TTL) still dedupes against a copy that already posted through the
-  # normal (unheld) path, so calling it here is never a double post. It is the
-  # held alert, so it carries --class held: lib/slack-level.sh posts it at
-  # level `all` and suppresses (and logs) it at `errors`, exactly as it would
-  # the held timer's own copy. The forced wake above is what reaches Main.
+  # / claude-notify.sh, armed only at HERDR_SLACK_LEVEL=all) claims this SAME
+  # idempotency key too — `grace_realert_${run}_${task}_${pid}`. So winning
+  # the claim above (needed to stop the conductor-wake timer from
+  # double-waking) ALSO silences that Slack alert if it was still pending,
+  # unless this function sends it itself. Same resolution order as
+  # _pw_wake_fail_realert below; herdr-notify.sh's own alert_claim (pane, key,
+  # TTL) still dedupes against a copy that already posted through the normal
+  # (unheld) path, so calling it here is never a double post. It carries
+  # --class held like the timer's copy: posted at level `all`, suppressed and
+  # logged at `errors`. The hooks' human-stale ERROR timer claims its own
+  # human_stale_* key (HERDR_GRACE_CLAIM_KIND), so this claim never silences
+  # it. The forced wake above is what reaches Main.
   _pw_forced_wake_argv "$pane" "$cpane" "$run" "$task" "$label" "$msg" "$where" "$full_cmd"
   (
     "${_PW_FORCED_WAKE_ARGV[@]}" >/dev/null 2>&1

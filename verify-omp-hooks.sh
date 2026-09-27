@@ -648,6 +648,42 @@ printf '%s' "$payload" | jq -e '.command_uncorroborated == true' >/dev/null 2>&1
 claim_once "grace_realert_run1_task1_$(prompt_id "$WPANE")" run1 task1 grace_realert_claim '{}' >/dev/null 2>&1
 set_task_state run1 task1 running >/dev/null 2>&1
 
+printf '== PR #158 round 2: a peer refusal releasing the hold does not silence the human-stale ERROR alert ==\n'
+# At HERDR_SLACK_LEVEL=errors the hook judges the RAW recorded command
+# (mismatch -> a human must answer) and arms the human-stale timer, while
+# push_wake judges the panel alone (change 5) and HOLDS it. A peer refusal
+# then runs release_wake_hold, which claims grace_realert_* — the same key
+# the human-stale timer used to claim, so the only ERROR-class post for this
+# prompt was silently dropped.
+register_task runHS taskHS wHS condHS "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wtHS "impl:human-stale" >/dev/null 2>&1
+omp_menu_screen "git fetch origin --prune" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+: > "$NOTIFIED"
+jq -nc '{tool:"bash", message:"omp needs permission", cwd:"/tmp/repo", command:"gh pr merge 99 --squash"}' \
+  | ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" \
+             HERDR_RUN_ID=runHS HERDR_TASK_ID=taskHS HERDR_TASK_LABEL="impl:human-stale" \
+             HERDR_SLACK_LEVEL=errors HERDR_ALERT_GRACE_S=60 HERDR_HUMAN_ALERT_S=2
+      bash "$here/agent-hooks/omp-notify.sh" >/dev/null 2>&1 )
+hs_pid="$(prompt_id "$WPANE")"
+hs_ev() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE task_id='taskHS' AND type='$1';" 2>/dev/null; }
+[ "$(hs_ev wake_held)" = 1 ] && ok "precondition: push_wake held the wake (panel judged alone)" \
+  || bad "precondition failed: wake_held=$(hs_ev wake_held)"
+( . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+  release_wake_hold "$WPANE" "$hs_pid" runHS taskHS "$CPANE" "impl:human-stale" \
+    "a peer refused this prompt" "impl:human-stale" "" "peer refused: escalate" ) \
+  && ok "the peer refusal released the held wake" || bad "release_wake_hold refused"
+# Wait on the stub's log, not the clock: ~15s cap only so a regression fails.
+i=0; while [ "$i" -lt 150 ] && ! grep -q -- '--class human-stale' "$NOTIFIED"; do sleep 0.1; i=$((i + 1)); done
+[ "$(grep -c -- '--class human-stale' "$NOTIFIED")" = 1 ] \
+  && ok "the human-stale ERROR alert still posted exactly once after the release" \
+  || bad "human-stale posts: $(grep -c -- '--class human-stale' "$NOTIFIED"); notified: $(cat "$NOTIFIED")"
+i=0; while [ "$i" -lt 150 ] && [ "$(hs_ev wake_result)" = 0 ]; do sleep 0.1; i=$((i + 1)); done
+[ "$(hs_ev wake_attempted)" = 1 ] && ok "Main was woken exactly once (the forced wake), the 60s re-wake stood down" \
+  || bad "wake_attempted for taskHS: $(hs_ev wake_attempted)"
+clean_screen > "$WORKER_SCREEN"
+set_task_state runHS taskHS completed no-follow-on >/dev/null 2>&1
+
 printf '== conductorless worker still persists its verified input request ==\n'
 set_task_state run1 task1 running >/dev/null 2>&1
 CPANE=""

@@ -133,7 +133,13 @@ grace_realert() {
         AND task_id=$(_sq "$task") AND type='input_required'
         AND occurred_at > $(_sq "$hold_at");" 2>/dev/null)"
       [ "${later:-0}" = 0 ] || exit 0
-      claim_once "grace_realert_${run}_${task}_${pid}" "$run" "$task" \
+      # The claim is shared ON PURPOSE between the held Slack timer, the
+      # conductor re-wake push_wake arms, and release_wake_hold (one of them
+      # acts on a held prompt, never two). A caller whose alert is NOT an
+      # alternative to that wake sets HERDR_GRACE_CLAIM_KIND to its own name:
+      # the hooks' human-stale escalation (PR #158 round 2) must still post
+      # after a peer refusal or a re-wake has taken grace_realert_*.
+      claim_once "${HERDR_GRACE_CLAIM_KIND:-grace_realert}_${run}_${task}_${pid}" "$run" "$task" \
         grace_realert_claim \
         "$(jq -nc --arg p "$pane" --arg pid "$pid" '{pane:$p,prompt_id:$pid}')" \
         || exit 0
