@@ -602,7 +602,7 @@ echo "== errors-only Slack policy at the backstop (HERDR_SLACK_LEVEL=errors) =="
 # A human-only prompt (nothing the peer path can parse) still blocked at the
 # threshold escalates as human-stale; the grace-time backstop is needs-input.
 printf ' \n' > "$tmp/screen"
-line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=1 \
+line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=1 HERDR_STUCK_ALERT_S=1 \
          HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen")
 [ "$(did "$line")" = "escalated to Slack as human-stale after 1s" ] \
   && grep -q "^notify --class needs-input --choices --pane w1:p1" "$tmp/log" \
@@ -627,7 +627,7 @@ rm -f "$tmp/bridge/pending.jsonl"
 
 # Blocked past the backstop grace, cleared before the threshold: no error.
 rm -f "$tmp/log.probes"
-line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=1 \
+line=$(run_edge blocked working HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=1 HERDR_STUCK_ALERT_S=1 \
          HERDR_EXTRA_PATH="$tmp/bin" STUB_SCREEN="$tmp/screen" STUB_CLEAR_FROM_CALL=2)
 [ "$(did "$line")" = "cleared before human-stale escalation" ] || [ "$(did "$line")" = "cleared before stuck escalation" ]
 [ $? = 0 ] && ! grep -q -- "--class human-stale\|--class stuck" "$tmp/log" \
