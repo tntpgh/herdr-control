@@ -283,20 +283,11 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
       # allowed; a message to another pane is a peer message.
       op="$(printf '%s' "$input" | jq -r '.op // empty' 2>/dev/null)"
       case "$op" in
-        wait|inbox|list|jobs|logs|ps|describe|status|cancel|stop)
-          PS_VERDICT=allow PS_REASON="hub $op: observe or stop own jobs" ;;
-        send)
-          # `send` types a message into another herdr pane. To the task's own
-          # conductor that is the normal report; into any other pane (which
-          # may be a plain shell) the text is judged as a command.
-          if [ -n "$(printf '%s' "$input" | jq -r '.to // empty' 2>/dev/null)" ] \
-             && [ "$(printf '%s' "$input" | jq -r '.to // empty' 2>/dev/null)" = "$(printf '%s' "$PS_TASK_JSON" | jq -r '.conductor_pane_id // empty' 2>/dev/null)" ]; then
-            PS_VERDICT=allow PS_REASON="hub send to this task's conductor"
-          else
-            PS_CMD="$(printf '%s' "$input" | jq -r '.message // .text // .content // empty' 2>/dev/null)"
-            if [ -z "${PS_CMD//[[:space:]]/}" ]; then PS_VERDICT=allow PS_REASON="empty hub send"
-            else _ps_bash "$PS_CMD"; fi
-          fi ;;
+        # `send` is omp's in-process peer message (delivered to an agent id in
+        # this omp process, never typed into a herdr pane); the recipient's own
+        # tool calls are judged by this same hook.
+        wait|inbox|list|jobs|logs|ps|describe|status|cancel|stop|send)
+          PS_VERDICT=allow PS_REASON="hub $op: observe, message a peer agent, or stop own jobs" ;;
         start|restart)
           PS_CMD="$(printf '%s' "$input" | jq -r '[.application // ""] + (.args // [] | map(tostring)) | map(@sh) | join(" ")' 2>/dev/null)"
           if [ -z "$(printf '%s' "$input" | jq -r '.application // empty' 2>/dev/null)" ]; then

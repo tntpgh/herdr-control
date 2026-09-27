@@ -335,11 +335,12 @@ Nothing here runs for a task spawned without the flag.
   refuses every call. The existing guards (fleet registration, #159 write scope)
   still run first. Then `lib/pretool-shadow.sh --enforce --record` runs
   synchronously (20 s timeout) on the exact input; any failure blocks. A
-  registered worker whose omp was launched with no approval menu
-  (`--auto-approve`, `--yolo`, `--approval-mode yolo` in omp's own argv) is
-  always enforced, whatever the row read says — the lib then refuses if the row
-  does not say `hook`. The row is read with a read-only query (no
-  `registry_init`), retried, so a lock race cannot flip a hook row to
+  registered worker whose omp was launched with `--auto-approve` (or its alias
+  `--yolo`) — what `--approval hook` emits — is always enforced, whatever the
+  row read says; the lib then refuses if the row does not say `hook`. A
+  yolo-POSTURE menu spawn (`--approval-mode yolo`) is unchanged. The row is read
+  with a single SELECT on the plain path (no `registry_init`; not `-readonly`,
+  which cannot open a WAL database whose -wal/-shm files are absent), retried, so a lock race cannot flip a hook row to
   unenforced (seen once in testing before this change).
 - **Verdict → answer**: allow runs; `deny`/`block` are refused with no request;
   `escalate`/`reserved`/`learn` look up `action_requests` for
@@ -400,8 +401,9 @@ Nothing here runs for a task spawned without the flag.
     knows).
   - A menu worker whose registry read fails reads once, then relies on the
     env signal only.
-  - `hub send` to anything but the task's conductor pane is judged as a
-    command (it types into a pane that may be a shell).
+  - `hub send` stays allowed: in omp 18.3.2 it is in-process peer messaging
+    (delivered to an agent id in the same omp process, never typed into a
+    herdr pane), and the recipient's own tool calls are judged by this hook.
   - Residual, stated: `read http(s)://` and `web_search` stay unscoped (q3); a
     bash call's persistent-shell cwd is not what the grant binds when the call
     names no `cwd`; inline `GIT_CONFIG_*=…` / `export` shapes classify allow in

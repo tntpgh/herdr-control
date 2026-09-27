@@ -928,8 +928,8 @@ export const HERDR_HOOK_APPROVAL_PROTOCOL = 1;
 let registryApproval: "hook" | "menu" | undefined; // cached once the registry answers
 let registryApprovalReadFailed = false; // one failed sync read per session, then the env signal only
 
-// The row is read with a READ-ONLY query (sqlite3 -readonly, mode=ro): no
-// registry_init, so no migration/WAL pragma can lose a lock race with another
+// The row is read with a single SELECT and nothing else: no registry_init,
+// so no migration/WAL pragma can lose a lock race with another
 // writer and turn "hook" into "unknown" (observed: an intermittent failed read
 // left a hook row unenforced for that call). A registry that predates schema
 // v6 has no approval column and therefore no hook rows: that answer is "menu".
@@ -942,7 +942,13 @@ const REGISTRY_DB = path.join(
 );
 const APPROVAL_SQL =
   `SELECT approval FROM tasks WHERE run_id=${sqlQuote(WORKER_RUN_ID)} AND task_id=${sqlQuote(WORKER_TASK_ID)};`;
-const APPROVAL_READ_ARGS = ["-readonly", "-batch", "-noheader", "-cmd", ".timeout 3000", `file:${REGISTRY_DB}?mode=ro`, APPROVAL_SQL];
+// A plain path (a `file:` URI would need percent-encoding: '#', '?', '%' in
+// HOME or HERDR_RUN_STATE_DIR break it) and a plain SELECT on an ordinary
+// connection. NOT -readonly: a read-only connection cannot open a WAL database
+// whose -wal/-shm files are absent (SQLite deletes them when the last
+// connection closes) — measured: "unable to open database file", which would
+// read as "unknown" and leave a row-only hook task unenforced.
+const APPROVAL_READ_ARGS = ["-batch", "-noheader", "-cmd", ".timeout 3000", REGISTRY_DB, APPROVAL_SQL];
 
 function parseApprovalRead(status: number | null, stdout: string, stderr: string): "hook" | "menu" | undefined {
   if (status === 0) return stdout.trim() === "hook" ? "hook" : "menu"; // no row = not a hook task
@@ -987,19 +993,14 @@ function readRegistryApproval(): "hook" | "menu" | undefined {
   return registryApproval;
 }
 
-// omp's own launch flags: a registered worker running with no approval menu is
-// ALWAYS judged by the hook, whatever the registry read says — a failed read
-// must never mean "no check at all". The flags are fixed at process start; the
-// worker cannot change them.
-const LOAD_NO_MENU = (() => {
-  const argv = process.argv;
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "--auto-approve" || a === "--yolo" || a === "--approval-mode=yolo") return true;
-    if (a === "--approval-mode" && argv[i + 1] === "yolo") return true;
-  }
-  return false;
-})();
+// omp's own launch flags: spawn-task.sh --approval hook launches omp with
+// --auto-approve (omp's alias: --yolo), and a registered worker launched that
+// way is ALWAYS judged by the hook, whatever the registry read says — a failed
+// read must never mean "no check at all". The flags are fixed at process start;
+// the worker cannot change them. `--approval-mode yolo` is NOT matched: that is
+// the operator-chosen yolo POSTURE for a menu spawn (lib/posture.sh), whose
+// behaviour this change must not alter.
+const LOAD_NO_MENU = process.argv.some((a) => a === "--auto-approve" || a === "--yolo");
 
 function hookApprovalEnforced(): boolean {
   if (!WORKER_TASK_ID) return false;

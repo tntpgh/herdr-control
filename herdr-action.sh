@@ -47,7 +47,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "${1:-}" = tick ]; then
   _db="${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}/registry.sqlite3"
   [ -r "$_db" ] || exit 0
-  _n="$(sqlite3 -readonly "file:$_db?mode=ro" "SELECT count(*) FROM action_requests WHERE status='pending';" 2>/dev/null)"
+  # A plain SELECT on an ordinary connection: -readonly cannot open a WAL
+  # database whose -wal/-shm files are absent, which would skip every tick.
+  _n="$(sqlite3 -batch -noheader -cmd ".timeout 2000" "$_db" "SELECT count(*) FROM action_requests WHERE status='pending';" 2>/dev/null)"
   case "$_n" in ''|0) exit 0 ;; esac
 fi
 . "$here/lib/pretool-shadow.sh"          # run-registry, pane-guard, action-request, pretool_redact

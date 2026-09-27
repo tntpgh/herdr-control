@@ -249,10 +249,8 @@ hub() { enf hub "$1"; }
 [ "$(hub '{"op":"start","name":"x","application":"python3","args":["-m","http.server","8123"]}' | field decision)" = allow ] \
   && ok "hub start of an allow-class program runs" || not_ok "hub start benign blocked"
 [ "$(hub '{"op":"wait"}' | field decision)" = allow ] && ok "hub wait runs" || not_ok "hub wait blocked"
-[ "$(hub "$(jq -nc --arg to "$CPANE" '{op:"send", to:$to, message:"done: gh pr merge is yours"}')" | field decision)" = allow ] \
-  && ok "hub send to the task's conductor runs" || not_ok "hub send to conductor blocked"
-[ "$(hub '{"op":"send","to":"w5:p5","message":"gh pr merge 7 --squash"}' | field verdict)" = reserved ] \
-  && ok "hub send into another pane is judged as a command" || not_ok "hub send to other pane unjudged"
+[ "$(hub '{"op":"send","to":"Main","message":"done; please run the merge"}' | field decision)" = allow ] \
+  && ok "hub send (in-process peer message) runs and files no request" || not_ok "hub send blocked"
 [ "$(hub '{"op":"brand_new"}' | field verdict)" = escalate ] && ok "unknown hub op escalates" || not_ok "unknown hub op"
 [ "$(enf write '{"path":"proc://bg_1","content":"gh pr merge 7 --squash"}' | field verdict)" = reserved ] \
   && ok "text written to a job's stdin is judged as a command" || not_ok "proc stdin unjudged"
@@ -356,7 +354,13 @@ if command -v bun >/dev/null 2>&1; then
   [ "$(HOOK="$nolib/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$nolib" CASES="$cases" WT="$wt" bun -e "$hook_js" 2>/dev/null | jq -r '.[0].r')" = BLOCK ] \
     && ok "hook row with the pre-tool lib missing: fails closed (BLOCK)" || not_ok "missing lib did not block"
   argvjs="process.argv.push('--auto-approve'); $hook_js"
+  menu_base_rs='["ALLOW","ALLOW","ALLOW","ALLOW","ALLOW","ALLOW"]'   # origin/main's menu-worker answers (asserted below)
   noarg="$(HOOK="$here/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$here" HERDR_TASK_ID=task_m CASES="$cases" WT="$wt" bun -e "$argvjs" 2>/dev/null)"
+  for yflag in "'--approval-mode', 'yolo'" "'--approval-mode=yolo'"; do
+    ypost="$(HOOK="$here/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$here" HERDR_TASK_ID=task_m CASES="$cases" WT="$wt" bun -e "process.argv.push($yflag); $hook_js" 2>/dev/null)"
+    [ "$(printf '%s' "$ypost" | jq -c '[.[]|.r]')" = "$(printf '%s' "$menu_base_rs" | jq -c '.')" ] \
+      && ok "a yolo-POSTURE menu worker ($yflag) is unchanged — not treated as hook mode" || not_ok "yolo posture changed ($yflag): $ypost"
+  done
   [ "$(printf '%s' "$noarg" | jq -r '.[0].r')" = BLOCK ] && printf '%s' "$noarg" | jq -r '.[0].why' | grep -q 'approval=menu' \
     && ok "a registered worker launched --auto-approve is judged even when its row says menu (refused)" || not_ok "auto-approve argv not enforced: $noarg"
   norow="$(HOOK="$here/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$here" HERDR_RUN_STATE_DIR="$work/nd/runs" CASES="$cases" WT="$wt" bun -e "$argvjs" 2>/dev/null)"
@@ -366,6 +370,19 @@ if command -v bun >/dev/null 2>&1; then
     [ "$rr" = '["ALLOW","BLOCK","BLOCK","BLOCK","ALLOW","BLOCK"]' ] || { not_ok "row-only enforcement flipped on run $k: $rr"; break; }
     [ "$k" = 3 ] && ok "row-only enforcement is stable across 3 fresh sessions"
   done
+  hashdir="$work/st#a?te%41/runs"; mkdir -p "$hashdir"; sqlite3 "$(registry_db)" ".backup '$hashdir/registry.sqlite3'"
+  hr="$(HERDR_RUN_STATE_DIR="$hashdir" run_hook "$here" | jq -r '.[1].r')"
+  [ "$hr" = BLOCK ] && ok "row-only enforcement holds with '#', '?', '%' in the state path" || not_ok "special-char state path: escalate case $hr"
+  # A WAL registry with no -wal/-shm files (every connection closed) must
+  # still be read: .backup gives exactly that shape, and the hook reads it first.
+  cold="$work/cold/runs"; mkdir -p "$cold"; sqlite3 "$(registry_db)" ".backup '$cold/registry.sqlite3'"
+  [ ! -e "$cold/registry.sqlite3-shm" ] && [ "$(HERDR_RUN_STATE_DIR="$cold" run_hook "$here" | jq -r '.[1].r')" = BLOCK ] \
+    && ok "row-only enforcement holds on a WAL registry with no -wal/-shm files" || not_ok "cold WAL registry read failed open"
+  cold2="$work/cold2/runs"; mkdir -p "$cold2"; sqlite3 "$(registry_db)" ".backup '$cold2/registry.sqlite3'"
+  t_before="$(sqlite3 "$cold2/registry.sqlite3" "SELECT count(*) FROM events WHERE type='action_form_served';")"
+  HERDR_RUN_STATE_DIR="$cold2" HERDR_ACTION_STALE_S=0 bash "$here/herdr-action.sh" tick
+  [ "$(sqlite3 "$cold2/registry.sqlite3" "SELECT count(*) FROM events WHERE type='action_form_served';")" -gt "$t_before" ] \
+    && ok "the hub tick is not skipped on a WAL registry with no -wal/-shm files" || not_ok "tick skipped on a cold registry"
   envhook="$(HERDR_TASK_ID=nope HERDR_APPROVAL=hook run_hook "$here")"
   [ "$(printf '%s' "$envhook" | jq -c '[.[]|.r]|unique')" = '["BLOCK"]' ] && ok "HERDR_APPROVAL=hook with no registry row: every call blocked" || not_ok "env-hook no-row: $envhook"
   menu_mine="$(HERDR_TASK_ID=task_m run_hook "$here")"
