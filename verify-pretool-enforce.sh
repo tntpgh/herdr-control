@@ -217,15 +217,23 @@ printf '#!/bin/bash\nchmod -R u+rwx tmp/probe\n' > "$wt/tmp/esc.sh"
 [ "$(bashc "$CR" | field decision)" = block ] && ok "an edited file escalates again" || not_ok "edited file ran"
 
 printf '== grants bind the script bytes a command runs ==\n'
+# A script plus another segment that could change it (lib/command-policy.sh
+# order gate, #167) cannot be bound at all: refused, no request to approve.
 printf '#!/bin/bash\necho harmless\n' > "$wt/tmp/s3.sh"
-SW="cd $wt && chmod -R u+rw tmp/probe && bash tmp/s3.sh"
-swid="$(bashc "$SW" | field request_id)"
-HERDR_PANE_ID="$CPANE" act approve "$swid" --authority conductor --review-category local-build --review-reason ok >/dev/null
+out="$(bashc "cd $wt && chmod -R u+rw tmp/probe && bash tmp/s3.sh")"
+[ "$(printf '%s' "$out" | field decision)" = block ] && [ -z "$(printf '%s' "$out" | field request_id)" ] \
+  && ok "a script run alongside another segment: refused, no request" || not_ok "compound script: $out"
+# A human-only script: approved through its pinned hub form, then rewritten.
 printf '#!/bin/bash\ngh pr merge 7 --squash\n' > "$wt/tmp/s3.sh"
+SW="cd $wt && bash tmp/s3.sh"
+swid="$(bashc "$SW" | field request_id)"
+sfid="$(pin_form "$swid")"; answer_form "$sfid" "$swid" approve
+act approve "$swid" --authority human --form "$sfid" >/dev/null
+printf '#!/bin/bash\ngh pr merge 8 --squash --admin\n' > "$wt/tmp/s3.sh"
 out="$(bashc "$SW")"
-[ "$(printf '%s' "$out" | field decision)" = block ] && [ "$(q "SELECT status FROM action_requests WHERE request_id='$swid';")" = approved ] \
-  && ok "script rewritten after approval: the grant does not match, nothing consumed" || not_ok "script swap ran: $out"
-printf '#!/bin/bash\necho harmless\n' > "$wt/tmp/s3.sh"
+[ -n "$swid" ] && [ "$(printf '%s' "$out" | field decision)" = block ] && [ "$(q "SELECT status FROM action_requests WHERE request_id='$swid';")" = approved ] \
+  && ok "script rewritten after the human's approval: the grant does not match, nothing consumed" || not_ok "script swap ran: $out"
+printf '#!/bin/bash\ngh pr merge 7 --squash\n' > "$wt/tmp/s3.sh"
 [ "$(bashc "$SW" | field decision)" = allow ] && ok "…the reviewed bytes still run once" || not_ok "reviewed bytes blocked"
 out="$(bashc 'bash tmp/missing.sh')"; rc=$?
 [ "$rc" = 8 ] && [ -z "$(printf '%s' "$out" | field request_id)" ] && printf '%s' "$out" | grep -q 'cannot be resolved for review' \
