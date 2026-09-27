@@ -1561,6 +1561,12 @@ check_reserved   "a credential path under a read verb"     'cat ~/.ssh/id_rsa'
 check_reserved   "grep in .env"                            'grep x .env'
 check_reserved   "lib/alert-gate.sh edited via python"     'python3 -c "open(\"lib/alert-gate.sh\",\"w\")"'
 check_reserved   "git add of a policy file (no grant here)" 'git add lib/command-policy.sh'
+check_reserved   "env GCONV_PATH (loads shared objects)"   'env GCONV_PATH=/tmp/x iconv -l'
+check_reserved   "env HERDR_BRIDGE_ENV (a sourced file)"   'env HERDR_BRIDGE_ENV=/tmp/x.env git status'
+check_reserved   "a /dev/null look-alike redirect target"  'cat herdr-select.sh 2>/dev/null.bak'
+check_reserved   "a path under /dev/null/.. is a real write" 'cat herdr-select.sh >/dev/null/../x'
+check_reserved   "env then xargs env"                      'env X=v xargs env'
+check_reserved   "env then sh -c env"                      "env X=v sh -c env"
 
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
