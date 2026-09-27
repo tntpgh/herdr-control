@@ -106,6 +106,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/run-registry.sh"
 . "$here/lib/command-policy.sh"
 . "$here/lib/scoped-policy.sh"
+. "$here/lib/push-wake.sh"
 
 pane="${1:?usage: herdr-select.sh <pane_id> <option-number> [--expect-prompt-id ID]}"
 choice="${2:?option number required}"
@@ -315,6 +316,34 @@ own_worktree=$(printf '%s' "$own_task_json" | jq -r '.worktree // empty' 2>/dev/
 own_branch=$(printf '%s' "$own_task_json" | jq -r '.branch // empty' 2>/dev/null)
 own_trunk=$(printf '%s' "$own_task_json" | jq -r '.trunk // empty' 2>/dev/null)
 
+# _refuse_non_human <verdict> <reason>
+#
+# ONE refusal path for every approve-side exit reachable by a non-human
+# authority (peer or conductor). Review PR #158 MEDIUM-2: several of these
+# exits wrote approval_escalated with the empty ${HERDR_RUN_ID:-}/
+# ${HERDR_TASK_ID:-} (this script is called directly, not from a hook, so
+# those are always blank here) and no prompt_id — unfindable by change 3/4's
+# own queries — and several others (the unreadable/elided exits, every
+# conductor refusal below the torn-capture one) never recorded
+# approval_escalated at all. Worse: none of them released a wake push_wake
+# may have HELD for this exact prompt (an allow-class command "a peer may
+# take it" — lib/alert-gate.sh), so a refusal through any of these left a
+# human-required prompt sitting held for the full 90s grace window exactly
+# like the peer_decide race this branch exists to fix.
+_refuse_non_human() {                   # verdict reason
+  local v="$1" r="$2"
+  append_event "$own_run" "$own_task" "approval_escalated" \
+    "$(jq -nc --arg v "$v" --arg r "$r" --arg p "$pane" --arg pid "$current_prompt_id" \
+       '{verdict:$v, reason:$r, pane:$p, prompt_id:$pid}')" >/dev/null 2>&1 || true
+  own_cpane="$(printf '%s' "$own_task_json" | jq -r '.conductor_pane_id // empty' 2>/dev/null)"
+  own_label="$(printf '%s' "$own_task_json" | jq -r '.label // empty' 2>/dev/null)"
+  release_wake_hold "$pane" "$current_prompt_id" "$own_run" "$own_task" \
+    "$own_cpane" "$own_label" \
+    "a peer refused this prompt ($v): ${r:-no reason given} — a human must answer it" \
+    "$own_label" "$cmd_text" "peer refused: $v" >/dev/null 2>&1 || true
+  exit 8
+}
+
 # ---- prefer the untruncated command recorded on tool_approval_requested
 # over the scraped panel text, when the two AGREE (project-contract-plan.md
 # #3b, item 2). Wrapped commands break across multiple TUI rows and reflow
@@ -332,6 +361,14 @@ own_trunk=$(printf '%s' "$own_task_json" | jq -r '.trunk // empty' 2>/dev/null)
 # reading their own screen is the authority regardless of what any hook
 # recorded.
 if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
+  # fix/peer-waits-for-record change 1: give the hook's own write a brief
+  # head start before judging a raw scrape it was about to correct — see
+  # lib/scoped-policy.sh wait_for_input_required_row for the exact race.
+  # Peer-only (a human reviewing their own screen needs no registry text at
+  # all) and skipped on a Deny (which never needed corroboration — see the
+  # panel_scrape fallback below).
+  [ "$authority" = peer ] && [ "$declining" = 0 ] && \
+    wait_for_input_required_row "$own_run" "$own_task" "$current_prompt_id"
   registry_cmd="$(task_input_required_command "$own_run" "$own_task" "$current_prompt_id" 2>/dev/null)"
   # lib/scoped-policy.sh approval_command_text: the recorded command when the
   # panel (whitespace-collapsed) contains it, else the panel; exit 2 = the two
@@ -344,7 +381,7 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
   cmd_text="$(approval_command_text "$cmd_text" "$registry_cmd")" || {
     if [ "$declining" = 0 ]; then
       echo "herdr-select: the recorded command for this prompt does not match what is on screen in $pane — refusing." >&2
-      exit 8
+      _refuse_non_human "escalate" "the recorded command for this prompt does not match what is on screen"
     fi
     cmd_text="$panel_scrape"
   }
@@ -372,10 +409,7 @@ if [ "$cmd_text_is_scrape" = 1 ] && [ "$cmd_torn" = 1 ] && [ "$policy_verdict" !
     echo "herdr-select: REFUSED (escalate) — a human must answer this one." >&2
     echo "herdr-select: $policy_reason" >&2
     echo "herdr-select: option $choice ($label) in $pane was NOT pressed." >&2
-    append_event "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "approval_escalated" \
-      "$(jq -nc --arg v "$policy_verdict" --arg r "$policy_reason" --arg p "$pane" \
-         '{verdict:$v, reason:$r, pane:$p}')" >/dev/null 2>&1 || true
-    exit 8
+    _refuse_non_human "$policy_verdict" "$policy_reason"
   fi
 fi
 if [ "$menu_rows_ambiguous" = 1 ]; then
@@ -385,10 +419,7 @@ if [ "$menu_rows_ambiguous" = 1 ]; then
     echo "herdr-select: REFUSED (escalate) — a human must answer this one." >&2
     echo "herdr-select: $policy_reason" >&2
     echo "herdr-select: option $choice ($label) in $pane was NOT pressed." >&2
-    append_event "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "approval_escalated" \
-      "$(jq -nc --arg v "$policy_verdict" --arg r "$policy_reason" --arg p "$pane" \
-         '{verdict:$v, reason:$r, pane:$p}')" >/dev/null 2>&1 || true
-    exit 8
+    _refuse_non_human "$policy_verdict" "$policy_reason"
   fi
 fi
 
@@ -399,12 +430,12 @@ fi
 if [ "$authority" != human ] && [ "$declining" = 0 ] && [ "$mechanism" = menu ]; then
   if [ -z "${cmd_text//[[:space:]]/}" ]; then
     echo "herdr-select: refusing — cannot read the approval panel in $pane." >&2
-    exit 8
+    _refuse_non_human "escalate" "cannot read the approval panel"
   fi
   case "$cmd_text" in
     *"elided"*|*"truncated"*)
       echo "herdr-select: approval arguments are clipped; ask the worker for a complete, shorter request." >&2
-      exit 8 ;;
+      _refuse_non_human "escalate" "approval arguments are clipped" ;;
   esac
 fi
 
@@ -419,19 +450,16 @@ if [ "$authority" = conductor ] && [ "$declining" = 0 ]; then
   # command the peer path now refuses.
   if [ "$cmd_text_is_scrape" = 1 ] && [ "$cmd_torn" = 1 ]; then
     echo "herdr-select: conductor cannot approve a capture containing invalid UTF-8 — a human must review it." >&2
-    append_event "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "approval_escalated" \
-      "$(jq -nc --arg v "escalate" --arg r "torn capture" --arg p "$pane" \
-         '{verdict:$v, reason:$r, pane:$p}')" >/dev/null 2>&1 || true
-    exit 8
+    _refuse_non_human "escalate" "torn capture"
   fi
   if [ -z "${cmd_text//[[:space:]]/}" ] || [ "$policy_verdict" = deny ]; then
     echo "herdr-select: conductor cannot approve unreadable or deny-class actions." >&2
-    exit 8
+    _refuse_non_human "$policy_verdict" "conductor cannot approve unreadable or deny-class actions"
   fi
   reservation="$(conductor_reserved_reason "$cmd_text")"
   if [ -n "$reservation" ]; then
     echo "herdr-select: $reservation" >&2
-    exit 8
+    _refuse_non_human "reserved" "$reservation"
   fi
   # Code by reference: the conductor is approving a FILE, so the file's whole
   # content is what gets the reserved-list check, and the approval is bound to
@@ -440,12 +468,12 @@ if [ "$authority" = conductor ] && [ "$declining" = 0 ]; then
   code_ref_inspect "$cmd_text" "$own_worktree"; _cr=$?
   if [ "$_cr" = 3 ]; then
     echo "herdr-select: conductor cannot approve a script file that cannot be resolved or read for review." >&2
-    exit 8
+    _refuse_non_human "escalate" "conductor cannot approve a script file that cannot be resolved or read for review"
   fi
   case "$PD_CODE_CONTENT_REASON" in
     reserved:*)
       echo "herdr-select: $PD_CODE_PATH content: $PD_CODE_CONTENT_REASON" >&2
-      exit 8 ;;
+      _refuse_non_human "reserved" "$PD_CODE_PATH content: $PD_CODE_CONTENT_REASON" ;;
   esac
 fi
 
@@ -477,10 +505,7 @@ if [ "$authority" = peer ] && [ "$declining" = 0 ]; then
       [ -n "$policy_reason" ] && echo "herdr-select: $policy_reason" >&2
     fi
     echo "herdr-select: option $choice ($label) in $pane was NOT pressed." >&2
-    append_event "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "approval_escalated" \
-      "$(jq -nc --arg v "$policy_verdict" --arg r "$policy_reason" --arg p "$pane" \
-         '{verdict:$v, reason:$r, pane:$p}')" >/dev/null 2>&1 || true
-    exit 8
+    _refuse_non_human "$policy_verdict" "$policy_reason"
   fi
 fi
 

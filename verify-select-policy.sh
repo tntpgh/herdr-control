@@ -876,6 +876,12 @@ sel 2 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 1 ] && [ "$(q_appr choice_text)" = "Deny" ] \
   && ok "peer Deny presses through a disagreeing recorded command" \
   || bad "peer Deny refused on mismatch: rc=$rc keys=$(keys_pressed) label=$(q_appr choice_text)"
+# Carry-over from PR #155 review: the approvals row on a Deny-mismatch must
+# record the PANEL SCRAPE cmd_text fell back to, never empty and never the
+# mismatched registry command it just refused to trust.
+[ "$(q_appr command)" = "Allow tool: bash Command: git status" ] \
+  && ok "approvals row records the whole panel scrape on a Deny-mismatch, not the mismatched registry text or empty" \
+  || bad "approvals command on Deny-mismatch: '$(q_appr command)'"
 
 set_menu_deny "git status"; reset_keys
 ( export HERDR_PANE_ID=w9:p9
@@ -927,6 +933,13 @@ sel 1 --authority peer; rc=$?
 [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
   && ok "Approve on a mid-token wrap is still refused" \
   || bad "Approve wrongly cleared a mid-token wrap: rc=$rc keys=$(keys_pressed)"
+# Carry-over from PR #155 review: today menu_rows_ambiguous also refuses this
+# case, so the assertion above cannot fail if the corroboration mismatch
+# check is removed. Pin the SPECIFIC stderr text so removing corroboration
+# (rather than menu_rows_ambiguous) actually fails this.
+grep -q 'does not match what is on screen' "$WORK/err.txt" \
+  && ok "refused specifically for the corroboration mismatch, not just menu_rows_ambiguous" \
+  || bad "stderr does not name the corroboration mismatch: $(cat "$WORK/err.txt")"
 
 set_rows_deny 'ls -la /Users/thurbs/.herdr/worktrees/tntpgh/h' 'erdr-control/.handoffs'; reset_keys
 ( export HERDR_PANE_ID=w9:p9
@@ -1065,6 +1078,249 @@ conductor_select; rc=$?
   && ok "conductor refuses two distinct script files in one command" \
   || bad "conductor approved a two-script command: rc=$rc keys=$(keys_pressed)"
 set_task_state runS taskS completed no-follow-on >/dev/null 2>&1
+
+printf '== fix/peer-waits-for-record ==\n'
+
+RBRANCH="fix/race-wait"; RTRUNK="main"
+register_task runR taskR wR cR "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/record-wait "impl:race" "$RBRANCH" "$RTRUNK" >/dev/null 2>&1
+set_task_state runR taskR running >/dev/null 2>&1
+WAIT_TRACE="$WORK/wait-trace.log"
+
+printf '== change 1: registry command missing at call time is worth a short wait ==\n'
+# Live registry, 2026-09-26 (SPEC.md): event 37805 input_required and 37806
+# wake_held landed the SAME second — a herdr-select.sh lookup racing between
+# the two found nothing and judged the raw panel, so a grant-allowable commit
+# (message containing "push") was refused as reserved. set_menu, not
+# set_screen: the anchored corroboration fix (PR #158 review, HIGH) only ever
+# trusts a recorded command against an omp Command:/run: label.
+#
+# PR #158 review round 2: elapsed-ms comparisons raced the machine's own
+# speed ("returned before the window elapsed: 956ms (baseline 989ms)" — a
+# real failure on a fast run, not a real bug). Synchronized on the trace FILE
+# instead (HERDR_SELECT_WAIT_TRACE, lib/scoped-policy.sh). The seeder waits
+# for "poll 2": wait_for_input_required_row writes "poll <n>" BEFORE poll n's
+# query, so "poll 2" on disk proves poll 1's query already ran and found
+# nothing. Waiting for "poll 1" instead would race poll 1's own query. The
+# file wait is capped (~10s) only so a regression that never polls fails the
+# assertions below instead of hanging the suite.
+seed_after_poll2() {                    # <run> <task> <command>
+  local i=0
+  while [ "$i" -lt 200 ] && ! grep -q '^poll 2$' "$WAIT_TRACE" 2>/dev/null; do
+    sleep 0.05; i=$((i + 1))
+  done
+  grep -q '^poll 2$' "$WAIT_TRACE" 2>/dev/null && seed_input_required "$1" "$2" "$3"
+}
+set_task_state runR taskR running >/dev/null 2>&1
+RACE_MSG='git commit -m "docs(policy): grant header comment matches -u/--set-upstream push shape"'
+set_menu "$RACE_MSG"; reset_keys
+: > "$WAIT_TRACE"
+seed_after_poll2 runR taskR "$RACE_MSG" &
+bg_pid=$!
+HERDR_SELECT_RECORD_WAIT_S=5 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
+wait "$bg_pid" 2>/dev/null
+[ "$rc" -eq 0 ] && ok "waited for the delayed registry row instead of judging the raw panel" \
+  || bad "race not resolved: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+[ "$(q_appr authority)" = "grant" ] && ok "authority recorded grant (registry text used, not the panel's 'push' word)" \
+  || bad "authority=$(q_appr authority) — the ownership grant did not engage"
+[ "$(tail -1 "$WAIT_TRACE")" = "found" ] && ok "trace ends in found" \
+  || bad "trace did not end in found: $(cat "$WAIT_TRACE")"
+poll_count=$(grep -c '^poll ' "$WAIT_TRACE")
+[ "$poll_count" -ge 2 ] && ok "at least one poll found nothing before the row landed ($poll_count polls)" \
+  || bad "only $poll_count poll(s) — the row must have already existed at call time: $(cat "$WAIT_TRACE")"
+
+printf '== HIGH (PR #158 review): a SHORT recorded command must not corroborate as a substring of unrelated panel text ==\n'
+# The exact reproduction: panel shows a merge, a hook race records "ls" for
+# the SAME prompt_id after the wait — "ls" IS a substring of "...pulls..." —
+# the old substring rule corroborated it and pressed Approve on the unjudged
+# merge; the anchored rule requires EQUALITY against the command region.
+set_task_state runR taskR running >/dev/null 2>&1
+PULLS_CMD="gh api -X PUT repos/o/r/pulls/7/merge"
+set_menu "$PULLS_CMD"; reset_keys
+: > "$WAIT_TRACE"
+seed_after_poll2 runR taskR "ls" &
+bg_pid=$!
+HERDR_SELECT_RECORD_WAIT_S=5 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
+wait "$bg_pid" 2>/dev/null
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "'ls' inside '...pulls...' does not corroborate; Approve refused, no key pressed" \
+  || bad "SUBSTRING FALSE POSITIVE: rc=$rc keys=$(keys_pressed) — 'ls' wrongly corroborated the merge"
+[ "$(tail -1 "$WAIT_TRACE")" = "found" ] && ok "the 'ls' row was found by the wait (the refusal is the corroboration check, not a timeout)" \
+  || bad "the delayed 'ls' row was never found: $(cat "$WAIT_TRACE")"
+
+printf '== HIGH: a recorded command that is a PREFIX of the panel text must not corroborate either ==\n'
+set_task_state runR taskR running >/dev/null 2>&1
+COMPOUND_CMD="git status && gh pr merge 99 --squash"
+set_menu "$COMPOUND_CMD"; reset_keys
+seed_input_required runR taskR "git status"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "recorded 'git status' does not equal the full compound command; refused, no key pressed" \
+  || bad "PREFIX FALSE POSITIVE: rc=$rc keys=$(keys_pressed)"
+
+printf '== change 1: a command-less registry row (command:"") never waits ==\n'
+set_task_state runR taskR running >/dev/null 2>&1
+seed_input_required_empty() {           # <run> <task>
+  append_event "$1" "$2" input_required \
+    "$(jq -nc --arg msg "omp needs permission" --arg pid "$(prompt_id "$PANE")" \
+       '{message:$msg, prompt_id:$pid, command:""}')" >/dev/null 2>&1
+}
+NOCMD_TEXT="git status --short"
+set_screen "$NOCMD_TEXT"; reset_keys
+seed_input_required_empty runR taskR
+: > "$WAIT_TRACE"
+HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && ok "a command-less row still answers from the panel" || bad "rc=$rc"
+[ "$(cat "$WAIT_TRACE")" = "$(printf 'poll 1\nfound')" ] \
+  && ok "trace is exactly one poll followed by found — no timeout, no extra polling" \
+  || bad "trace: $(cat "$WAIT_TRACE")"
+
+printf '== change 1: no registry row ever appears -> bounded wait, then the scraped panel ==\n'
+FALLBACK_TEXT="git log --oneline -3"
+# set_menu, not set_screen: every set_screen panel hashes to the SAME
+# prompt_id (no parseable question rows), so the command-less row seeded just
+# above matched this prompt too and the "no row" case was really a found-at-
+# poll-1 case. That, not machine speed, is why the old elapsed-ms assertion
+# failed ("returned before the window elapsed: 956ms").
+set_menu "$FALLBACK_TEXT"; reset_keys
+: > "$WAIT_TRACE"
+HERDR_SELECT_RECORD_WAIT_S=1 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && ok "falls back to the scraped panel text when no row ever appears" \
+  || bad "rc=$rc; stderr: $(cat "$WORK/err.txt")"
+[ "$(q_appr command)" = "Allow tool: bash Command: $FALLBACK_TEXT" ] && ok "the approvals row records the panel scrape it fell back to" \
+  || bad "approvals command on fallback: '$(q_appr command)'"
+# 1s window, 0.25s steps: polls at elapsed 0, .25, .5, .75, 1.0, then timeout.
+# Counting polls pins the full bounded window without reading the clock.
+[ "$(cat "$WAIT_TRACE")" = "$(printf 'poll 1\npoll 2\npoll 3\npoll 4\npoll 5\ntimeout')" ] \
+  && ok "waited out the whole 1s window (5 polls) and then timed out" \
+  || bad "trace: $(cat "$WAIT_TRACE")"
+
+printf '== change 2: a peer refusal records the TASKs own_run/own_task and the prompt_id ==\n'
+REFUSE_TEXT="gh pr merge 99 --squash"
+set_menu "$REFUSE_TEXT"; reset_keys
+seed_input_required runR taskR "$REFUSE_TEXT"
+expect_pid="$(prompt_id "$PANE")"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "refused as expected" || bad "rc=$rc (expected 8)"
+esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT run_id||'|'||task_id||'|'||json_extract(payload,'\$.prompt_id') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
+[ "$esc_row" = "runR|taskR|$expect_pid" ] \
+  && ok "approval_escalated carries run_id=runR task_id=taskR prompt_id=$expect_pid, not the empty HERDR_RUN_ID/HERDR_TASK_ID" \
+  || bad "approval_escalated row mismatch: got '$esc_row', want 'runR|taskR|$expect_pid'"
+
+printf '== change 3 + MEDIUM-1: a wake HELD before the refusal is released at refusal time, once, with its Slack alert ==\n'
+HOLD_TEXT="git push origin main"
+set_menu "$HOLD_TEXT"; reset_keys
+seed_input_required runR taskR "$HOLD_TEXT"
+hold_pid="$(prompt_id "$PANE")"
+append_event runR taskR wake_held \
+  "$(jq -nc --arg p w9:p9 --arg pid "$hold_pid" --arg k "wake_runR_taskR_${hold_pid}" \
+     '{conductor_pane:$p, prompt_id:$pid, wake_key:$k, reason:"allow-class and unreserved; a peer may answer it"}')" >/dev/null 2>&1
+NOTIFY_STUB="$WORK/notify-stub.sh"; NOTIFY_LOG="$WORK/notify.log"
+cat > "$NOTIFY_STUB" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$NOTIFY_LOG"
+exit 0
+EOS
+chmod +x "$NOTIFY_STUB"
+export NOTIFY_LOG
+: > "$NOTIFY_LOG"
+before_released=$(count_events wake_hold_released)
+before_attempted=$(count_events wake_attempted)
+( export HERDR_NOTIFY="$NOTIFY_STUB"; sel 1 --authority peer ); rc=$?
+[ "$rc" -eq 8 ] && ok "the reserved push to main is still refused" || bad "rc=$rc (expected 8)"
+released=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(count_events wake_hold_released)" -gt "$before_released" ] && { released=1; break; }
+  sleep 0.2
+done
+[ "$released" = 1 ] && ok "wake_hold_released recorded" || bad "no wake_hold_released event appeared"
+rel_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT json_extract(payload,'\$.prompt_id')||'|'||json_extract(payload,'\$.pane')||'|'||json_extract(payload,'\$.reason') \
+   FROM events WHERE type='wake_hold_released' ORDER BY sequence DESC LIMIT 1;")"
+[ "$rel_row" = "$hold_pid|$PANE|peer refused: reserved" ] \
+  && ok "wake_hold_released names the prompt, pane, and 'peer refused: reserved'" \
+  || bad "wake_hold_released payload: $rel_row"
+attempted=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(count_events wake_attempted)" -gt "$before_attempted" ] && { attempted=1; break; }
+  sleep 0.2
+done
+[ "$attempted" = 1 ] && ok "a forced wake_attempted fired for the released hold" || bad "no forced wake_attempted appeared"
+[ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+     "SELECT count(*) FROM events WHERE type='wake_attempted' AND json_extract(payload,'\$.wake_key')='wake_runR_taskR_${hold_pid}';")" -ge 1 ] \
+  && ok "the forced attempt correlates to the SAME wake_key the held wake used" \
+  || bad "forced wake used a different wake_key"
+claimed="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE type='grace_realert_claim' AND event_id='grace_realert_runR_taskR_${hold_pid}';")"
+[ "${claimed:-0}" -ge 1 ] && ok "claimed the SAME idempotency key grace_realert's own 90s re-check would use" \
+  || bad "the grace_realert_* claim was never taken"
+notify_calls=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -s "$NOTIFY_LOG" ] && { notify_calls=$(wc -l < "$NOTIFY_LOG" | tr -d ' '); break; }
+  sleep 0.2
+done
+[ "$notify_calls" = "1" ] && ok "MEDIUM-1: the held Slack alert was sent exactly once on release" \
+  || bad "MEDIUM-1: notify calls on release: $notify_calls (want exactly 1)"
+grep -q -- "--class held --choices --pane $PANE" "$NOTIFY_LOG" \
+  && ok "the Slack call is class held (errors-only level suppresses it like the held timer's own) and names the pane" \
+  || bad "notify call malformed: $(cat "$NOTIFY_LOG")"
+
+printf '== MEDIUM-2: a mid-token-wrap refusal ALSO releases a held wake (not just peer_decide) ==\n'
+set_task_state runR taskR running >/dev/null 2>&1
+MW_CMD="ls -la /Users/thurbs/.herdr/worktrees/tntpgh/herdr-control/.handoffs"
+set_rows 'ls -la /Users/thurbs/.herdr/worktrees/tntpgh/h' 'erdr-control/.handoffs'; reset_keys
+seed_input_required runR taskR "$MW_CMD"
+mw_pid="$(prompt_id "$PANE")"
+append_event runR taskR wake_held \
+  "$(jq -nc --arg p w9:p9 --arg pid "$mw_pid" --arg k "wake_runR_taskR_${mw_pid}" \
+     '{conductor_pane:$p, prompt_id:$pid, wake_key:$k, reason:"allow-class and unreserved; a peer may answer it"}')" >/dev/null 2>&1
+before_released=$(count_events wake_hold_released)
+before_attempted=$(count_events wake_attempted)
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "mid-token wrap: refused, no key pressed" \
+  || bad "mid-token wrap: rc=$rc keys=$(keys_pressed)"
+esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT run_id||'|'||task_id||'|'||json_extract(payload,'\$.prompt_id') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
+[ "$esc_row" = "runR|taskR|$mw_pid" ] \
+  && ok "mid-token wrap: approval_escalated carries run_id/task_id/prompt_id (not empty)" \
+  || bad "mid-token wrap: escalation identity: $esc_row"
+released=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(count_events wake_hold_released)" -gt "$before_released" ] && { released=1; break; }
+  sleep 0.2
+done
+[ "$released" = 1 ] && ok "mid-token wrap: held wake released" || bad "mid-token wrap: no wake_hold_released"
+attempted=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ "$(count_events wake_attempted)" -gt "$before_attempted" ] && { attempted=1; break; }
+  sleep 0.2
+done
+[ "$attempted" = 1 ] && ok "mid-token wrap: forced wake_attempted fired" || bad "mid-token wrap: no forced wake_attempted"
+
+printf '== MEDIUM-2: torn-capture and ambiguous-menu-rows refusals also record run_id/task_id/prompt_id ==\n'
+set_task_state runR taskR running >/dev/null 2>&1
+set_menu_torn "curl https://example.com/report -o /tmp/report.json"; reset_keys
+tp_pid="$(prompt_id "$PANE")"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "torn capture: still refused" || bad "torn capture: rc=$rc"
+esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT run_id||'|'||task_id||'|'||json_extract(payload,'\$.prompt_id') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
+[ "$esc_row" = "runR|taskR|$tp_pid" ] \
+  && ok "torn capture: approval_escalated carries run_id/task_id/prompt_id" \
+  || bad "torn capture: escalation identity: $esc_row"
+
+set_task_state runR taskR running >/dev/null 2>&1
+set_rows 'echo hi' 'bash /tmp/notes.md'; reset_keys
+mra_pid="$(prompt_id "$PANE")"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "ambiguous menu rows: still refused" || bad "ambiguous menu rows: rc=$rc"
+esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT run_id||'|'||task_id||'|'||json_extract(payload,'\$.prompt_id') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
+[ "$esc_row" = "runR|taskR|$mra_pid" ] \
+  && ok "ambiguous menu rows: approval_escalated carries run_id/task_id/prompt_id" \
+  || bad "ambiguous menu rows: escalation identity: $esc_row"
+
+set_task_state runR taskR completed no-follow-on >/dev/null 2>&1
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
