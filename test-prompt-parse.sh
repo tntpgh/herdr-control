@@ -388,5 +388,41 @@ unset -f herdr
 unset -f _prompt_window
 
 echo
+echo "== omp 18.3.5 key-hint footers (symbolPreset glyphs, 2026-09-27) =="
+# The upgrade rendered the key names as preset symbols, the literal footer
+# stopped matching, and every omp worker started after it became unanswerable
+# while Approve/Deny sat on screen. Glyphs are written as raw UTF-8 bytes for
+# the bash 3.2 reason given at the top of this file.
+_menu_window() { printf '%s' "$FIXTURE"; }
+NF_ENTER=$'\363\260\214\221'     # U+F0311, the nerd-preset enter glyph
+NF_ESC=$'\363\261\212\267'       # U+F12B7, the nerd-preset esc glyph
+SAVED_FOOT="$FOOT"
+FOOT="│ ↑/↓ navigate  $NF_ENTER select  $NF_ESC cancel │"
+FIXTURE="$(panel 1 2 Approve)"
+[ "$(prompt_menu_selected fake:pane)" = 1 ] \
+  && ok "nerd-preset footer parses, Approve highlighted" || no "nerd footer" "menu not recognised"
+FIXTURE="$(panel 1 2 Approve | sed '$d')
+│ ↑/↓ navigate  $NF_ENTER select │
+│ $NF_ESC cancel │"
+[ -n "$(prompt_menu_options fake:pane)" ] \
+  && ok "nerd-preset footer wrapped across two rows still parses" || no "nerd wrap" "wrapped footer refused"
+FOOT='│ Up/Down navigate  Enter select  Esc cancel │'
+FIXTURE="$(panel 1 2 Approve)"
+[ -n "$(prompt_menu_options fake:pane)" ] \
+  && ok "capitalised key words parse" || no "capitalised footer" "refused"
+# Near-misses: the three action words without their keys are prose, a pipe
+# gutter is the ascii box (whose body rows keep a stray pipe, so it stays
+# unsupported), and an extra trailing word is not the footer.
+for bad in '│ navigate select cancel │' \
+           '| Up/Down navigate  Enter select  Esc cancel |' \
+           '│ ↑/↓ navigate  enter select  esc cancel now │' \
+           '│ x navigate  y select  z cancel │'; do
+  FOOT="$bad"; FIXTURE="$(panel 1 2 Approve)"
+  [ -z "$(prompt_menu_options fake:pane)" ] \
+    && ok "fails closed: $bad" || no "footer near-miss" "accepted [$bad]"
+done
+FOOT="$SAVED_FOOT"
+
+echo
 printf 'pass=%s fail=%s\n' "$pass" "$fail"
 [ "$fail" = 0 ]

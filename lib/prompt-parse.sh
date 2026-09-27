@@ -637,20 +637,45 @@ def _text(s):
 # the footer, revisit BOTH choices together.
 FOOTER = "up/down navigate enter select esc cancel"
 
+# omp 18.3.5 (installed 2026-09-27) renders the footer KEY names through its
+# symbolPreset instead of printing them as words. Measured on live panes:
+#   older omp : "up/down navigate  enter select  esc cancel"
+#   nerd      : "U+2191/U+2193 navigate  U+F0311 select  U+F12B7 cancel"
+#   ascii     : "Up/Down navigate  Enter select  Esc cancel"
+# The literal match above stopped matching every omp pane started after the
+# upgrade, so prompt_menu_visible went false while Approve/Deny sat on screen
+# and herdr-select/peer-answer refused every worker. The ACTION words never
+# changed, so the footer is recognised by SHAPE: key, navigate, key, select,
+# key, cancel. A key is one of the old key words, an arrow pair, or ONE glyph
+# from a private-use plane (nerd icons). Leading strip is whitespace and the
+# box-drawing gutter only, so an ascii-preset box ("| ... |") still fails
+# closed as it did before: its gutter is a pipe, which is not a key.
+_KEY = re.compile(r"^(?:up/down|enter|esc|[\u2190-\u21ff\u23ce](?:/[\u2190-\u21ff])?|[\ue000-\uf8ff\U000f0000-\U0010fffd])$")
+SHAPE = ["<k>", "navigate", "<k>", "select", "<k>", "cancel"]
+
+
+def _ftoks(s):
+    b = re.sub(r"^[\s\u2502]+", "", ansi.sub("", s)).rstrip(" \t\r\n\u2502\u2500\u256e")
+    return ["<k>" if _KEY.match(w) else w for w in b.lower().split()]
+
+
+def _is_footer(s):
+    return _ftoks(s) == SHAPE
+
 
 def _unwrap_footer(rows):
     out, i = [], 0
     while i < len(rows):
-        acc = " ".join(_text(rows[i]).split())
-        if acc and acc != FOOTER and FOOTER.startswith(acc):
+        acc = _ftoks(rows[i])
+        if acc and acc != SHAPE and SHAPE[:len(acc)] == acc:
             j = i + 1
-            while j < len(rows) and acc != FOOTER:
-                nxt = " ".join(_text(rows[j]).split())
-                cand = acc + " " + nxt if nxt else ""
-                if not nxt or not FOOTER.startswith(cand):
+            while j < len(rows) and acc != SHAPE:
+                nxt = _ftoks(rows[j])
+                cand = acc + nxt if nxt else []
+                if not nxt or SHAPE[:len(cand)] != cand:
                     break
                 acc, j = cand, j + 1
-            if acc == FOOTER:
+            if acc == SHAPE:
                 out.append(FOOTER + "\n")
                 i = j
                 continue
@@ -698,7 +723,7 @@ for line in lines:
         if text:
             complete = visible = False
         continue
-    if text.startswith("up/down navigate") and "enter select" in text:
+    if _is_footer(line):
         # `visible` requires an actual option ROW (state >= 2 means an
         # "Approve" line was consumed), not merely a header plus a footer.
         # Without that, a pane which merely DISPLAYS pane content — a
@@ -737,8 +762,7 @@ for line in lines:
 if not complete:
     foot = None
     for i in range(len(lines) - 1, -1, -1):
-        t = _text(lines[i])
-        if t.startswith("up/down navigate") and "enter select" in t:
+        if _is_footer(lines[i]):
             foot = i
             break
     # A panel is BOTTOM-ANCHORED: below its footer there is nothing but the
@@ -964,7 +988,7 @@ prompt_content() {
     if [ -z "$menu_q" ]; then
       menu_q="$(_pane_visible "$1" \
         | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \
-        | sed -n '/Allow tool:/,/enter select/p' \
+        | sed -n '/Allow tool:/,/navigate.*select/p' \
         | sed -E 's/^[[:space:]│|]+//; s/[[:space:]│|]+$//' \
         | grep -vE '^$')"
     fi
