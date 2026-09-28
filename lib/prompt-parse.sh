@@ -839,6 +839,30 @@ elif mode == "command_rows":
             rows = question[i:]
             break
     print(len([r for r in rows if r.strip()]), end="")
+elif mode == "command_wrapjoin":
+    # A candidate reconstruction for a MID-TOKEN terminal wrap: the same rows
+    # as "command" mode, but the rows from Command:/run: onward are joined
+    # with NO separator instead of a space. "command" modes space-join
+    # already corroborates a WORD-BOUNDARY wrap (the terminal wrapped between
+    # two arguments, so a space belongs between the rows); a wrap that splits
+    # a single token in two ("...tntpgh/h" / "erdr-control/...") needs the
+    # rows glued with nothing between them to reproduce the original text.
+    # Both are candidates, never a verdict on their own: herdr-select.sh only
+    # trusts whichever one, after whitespace-collapse, equals the SEPARATE
+    # hook-recorded command (lib/scoped-policy.sh approval_command_text) --
+    # this mode only supplies the second candidate string. No apostrophes in
+    # here: this whole parser is a single-quoted shell argument.
+    if len(question) == 1 and pending_running:
+        question = question + pending_running
+    idx = 0
+    for i, row in enumerate(question):
+        if row.startswith("Command:") or row.startswith("run:"):
+            idx = i
+            break
+    head, tail = question[:idx], question[idx:]
+    text = " ".join(head + tail[:1])
+    text += "".join(tail[1:])
+    print(text, end="")
 elif mode == "command":
     # For CLASSIFICATION ONLY (lib/command-policy.sh via prompt_command_text
     # below), never for display or prompt_id: `" ; "` is a real shell
@@ -869,6 +893,7 @@ prompt_menu_selected() { _prompt_menu "$1" selected; }
 prompt_menu_question() { _prompt_menu "$1" question; }
 prompt_menu_command()  { _prompt_menu "$1" command; }
 prompt_menu_command_rows() { _prompt_menu "$1" command_rows; }
+prompt_menu_command_wrapjoin() { _prompt_menu "$1" command_wrapjoin; }
 prompt_menu_visible()  { _prompt_menu "$1" visible; }
 
 # "Is EITHER prompt shape on screen?", from ONE pane read.

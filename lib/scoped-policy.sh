@@ -88,7 +88,7 @@ _sp_command_region() {
   printf ''
 }
 
-# approval_command_text <panel> <recorded>
+# approval_command_text <panel> <recorded> [wrapjoin_panel]
 #
 # PR #158 independent review, HIGH: the previous rule treated `recorded` as
 # corroborated whenever its collapsed text occurred ANYWHERE in the collapsed
@@ -106,20 +106,38 @@ _sp_command_region() {
 # falling back to a substring test against unstructured text — see
 # _sp_command_region's own comment for why that is safe (only omp ever pairs
 # a panel with a recorded command, and every omp panel carries one of these
-# labels). A wrapped command reflows correctly: prompt_menu_command already
-# space-joins wrapped rows before this ever runs, so the region for a
-# multi-row command is the SAME reconstructed string either way.
-approval_command_text() {               # panel recorded
-  local panel="$1" recorded="$2" region pc rc
+# labels). A WORD-BOUNDARY wrap reflows correctly on `panel` alone:
+# prompt_menu_command already space-joins wrapped rows before this ever
+# runs, so the region for a multi-row command is the SAME reconstructed
+# string either way.
+#
+# A MID-TOKEN wrap (the terminal splits a single argument across two rows,
+# no space belongs between them) does NOT reflow via a space-join — see
+# prompt_menu_command_wrapjoin's own comment. `wrapjoin_panel`, when given,
+# is tried ONLY after `panel` fails to corroborate, and only as an
+# ADDITIONAL candidate string subject to the exact same equality test: it
+# still corroborates only when its whitespace-collapsed command region
+# EQUALS `recorded` exactly. It never widens what corroborates — a genuinely
+# different command (a hidden `; rm -rf`, an injected second statement) does
+# not equal `recorded` under either join and still returns 2.
+approval_command_text() {               # panel recorded [wrapjoin_panel]
+  local panel="$1" recorded="$2" wrapjoin="${3:-}" region pc rc wregion
   if [ -z "$recorded" ]; then printf '%s' "$panel"; return 0; fi
   region="$(_sp_command_region "$panel")"
   if [ -z "$region" ]; then
     if [ -n "${panel//[[:space:]]/}" ]; then return 2; fi
     printf '%s' "$panel"; return 0
   fi
-  pc="$(_sp_collapse_ws "$region")"; rc="$(_sp_collapse_ws "$recorded")"
+  rc="$(_sp_collapse_ws "$recorded")"
+  pc="$(_sp_collapse_ws "$region")"
   if [ "$pc" = "$rc" ]; then
     printf '%s' "$recorded"; return 0
+  fi
+  if [ -n "$wrapjoin" ]; then
+    wregion="$(_sp_command_region "$wrapjoin")"
+    if [ -n "$wregion" ] && [ "$(_sp_collapse_ws "$wregion")" = "$rc" ]; then
+      printf '%s' "$recorded"; return 0
+    fi
   fi
   return 2
 }

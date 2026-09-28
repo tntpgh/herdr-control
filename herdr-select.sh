@@ -385,7 +385,18 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
   # keep cmd_text as the scraped panel text already captured above (the
   # audit record still shows what was on screen) and let the decline proceed.
   panel_scrape="$cmd_text"
-  cmd_text="$(approval_command_text "$cmd_text" "$registry_cmd")" || {
+  # PR #174 last paragraph / fix-approve-wrapped-commands: a second candidate
+  # for the SAME comparison, never a second source of truth. When the panel
+  # is the `menu` shape, prompt_menu_command_wrapjoin (lib/prompt-parse.sh)
+  # reconstructs the Command:/run: rows joined with NO separator instead of
+  # a space -- the shape a MID-TOKEN terminal wrap needs. approval_command_text
+  # only accepts it as corroboration when it equals $registry_cmd exactly
+  # after whitespace-collapse, same as $cmd_text; a hidden extra statement or
+  # an injected row that does not equal the registry text corroborates under
+  # neither join and still refuses below.
+  wrapjoin_text=""
+  [ "$mechanism" = menu ] && wrapjoin_text="$(prompt_menu_command_wrapjoin "$pane" 2>/dev/null || printf '')"
+  cmd_text="$(approval_command_text "$cmd_text" "$registry_cmd" "$wrapjoin_text")" || {
     # approval_command_text prints nothing on a mismatch, so the assignment
     # above left cmd_text empty: restore the scrape BEFORE refusing, or the
     # refusal's approval_escalated event records command:"" (PR #181 F1).
