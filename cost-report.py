@@ -43,14 +43,18 @@ SESSIONS_DIR = Path(os.environ.get("HERDR_SESSIONS_DIR", HOME / ".omp/agent/sess
 STATE = Path(os.environ.get("HERDR_STATE_ROOT", HOME / ".local/state/herdr"))
 OUT_PATH = Path(os.environ.get("HERDR_COST_REPORT_PATH", STATE / "cost-report.json"))
 
-# compaction.thresholdTokens, live 2026-09-27T20:00Z (SPEC.md). One turn above
+# compaction.thresholdTokens, live 2026-09-27T23:16:26Z — the config.yml write,
+# bracketed by omp's own "Auto-compaction threshold decision" log lines (last
+# 850000 at 23:05Z, first 300000 at 23:18Z; omp hot-reloads config, so running
+# sessions switched too). The 20:00Z first recorded here counted 257 pre-cap
+# turns as misses. One turn above
 # it is EXPECTED per compaction — the turn that crosses the threshold is what
 # triggers compaction — so the count of such turns is information, not an
 # alert. What the cap must prevent is a second consecutive over-threshold turn
 # with no compaction between: `cap_misses_since_cap`. Both split at CAP_LIVE_AT
 # so "backlog from before the fix" and "the fix didn't work" read apart.
 CONTEXT_ALERT_THRESHOLD = 300_000
-CAP_LIVE_AT = "2026-09-27T20:00:00+00:00"
+CAP_LIVE_AT = "2026-09-27T23:16:26+00:00"
 
 COST_BUCKETS = ("input", "output", "cacheRead", "cacheWrite")
 
