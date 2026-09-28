@@ -1188,6 +1188,113 @@ class ClosureReasonJoin(unittest.TestCase):
         self.assertIn("no reason recorded", rendered)
 
 
+class Timeline(unittest.TestCase):
+    """B1 (thurber-os docs/research/2026-09-27-epiq-review.md): a
+    read-only, time-windowed replay of the registry's own `events` table.
+    Never a derived or conductor-claimed status — only rows straight off
+    the registry, timestamped.
+    """
+
+    def _registry(self, d, tasks, events):
+        import sqlite3
+        db = Path(d) / "registry.sqlite3"
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE tasks (task_id TEXT, run_id TEXT, label TEXT, repo TEXT, state TEXT,"
+            " pane_id TEXT, conductor_id TEXT, worktree TEXT, branch TEXT, project TEXT,"
+            " created_at TEXT, updated_at TEXT);"
+            "CREATE TABLE events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT,"
+            " task_id TEXT, occurred_at TEXT, payload TEXT);")
+        for row in tasks:
+            conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", row)
+        for ev in events:
+            conn.execute("INSERT INTO events (type, task_id, occurred_at, payload) VALUES (?,?,?,?)", ev)
+        conn.commit(); conn.close()
+        return db
+
+    def _task(self, tid, repo="repo-a", branch="b"):
+        return (tid, "r", tid, repo, "running", "", "", "/nonexistent", branch, "",
+                "2026-09-27T00:00:00Z", "2026-09-27T00:00:00Z")
+
+    def test_window_bounds_are_inclusive_since_exclusive_until(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d, [self._task("t1")],
+                [("state_changed", "t1", "2026-09-27T10:00:00Z", "{}"),
+                 ("state_changed", "t1", "2026-09-27T11:00:00Z", "{}"),
+                 ("state_changed", "t1", "2026-09-27T12:00:00Z", "{}")])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}):
+                out = hub.timeline_data("2026-09-27T10:00:00Z", "2026-09-27T12:00:00Z")
+        seqs = sorted(e["occurred_at"] for e in out["events"])
+        self.assertEqual(seqs, ["2026-09-27T10:00:00Z", "2026-09-27T11:00:00Z"])
+
+    def test_scope_narrows_by_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d, [self._task("t1", repo="repo-a"), self._task("t2", repo="repo-b")],
+                [("state_changed", "t1", "2026-09-27T10:00:00Z", "{}"),
+                 ("state_changed", "t2", "2026-09-27T10:05:00Z", "{}")])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}):
+                out = hub.timeline_data("2026-09-27T00:00:00Z", "2026-09-27T23:59:59Z", scope="repo-a")
+        self.assertEqual([e["task_id"] for e in out["events"]], ["t1"])
+
+    def test_a_script_payload_is_escaped_on_the_rendered_page(self):
+        payload = json.dumps({"reason": "<script>alert(1)</script>"})
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d, [self._task("t1")],
+                [("state_changed", "t1", "2026-09-27T10:00:00Z", payload)])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                html = hub.render_timeline("since=2026-09-27T00:00:00Z&until=2026-09-27T23:59:59Z")
+        self.assertNotIn("<script>alert(1)</script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_a_capped_window_says_so(self):
+        events = [("state_changed", "t1", f"2026-09-27T10:{i:02d}:00Z", "{}") for i in range(3)]
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(d, [self._task("t1")], events)
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "TIMELINE_ROW_CAP", 2), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                out = hub.timeline_data("2026-09-27T00:00:00Z", "2026-09-27T23:59:59Z", limit=2)
+                html = hub.render_timeline("since=2026-09-27T00:00:00Z&until=2026-09-27T23:59:59Z")
+        self.assertTrue(out["capped"])
+        self.assertEqual(out["total_in_window"], 3)
+        self.assertIn("latest 2 of 3", html)
+
+    def test_an_empty_window_renders_an_answer_not_an_empty_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(d, [], [])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                html = hub.render_timeline("since=2026-09-27T00:00:00Z&until=2026-09-27T23:59:59Z")
+        self.assertIn("none in this window", html)
+
+    def test_the_page_never_emits_a_state_not_in_a_row(self):
+        """Only an event's OWN payload state reaches the page — never
+        `hub.derive`'s current-state machinery (contract-plan §1 "done is a
+        claim", conductor w19:p7, 2026-09-23)."""
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d, [self._task("t1")],
+                [("state_changed", "t1", "2026-09-27T10:00:00Z",
+                  json.dumps({"from": "running", "state": "blocked"}))])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                out = hub.timeline_data("2026-09-27T00:00:00Z", "2026-09-27T23:59:59Z")
+                html = hub.render_timeline("since=2026-09-27T00:00:00Z&until=2026-09-27T23:59:59Z")
+        self.assertEqual(out["events"][0]["payload"]["state"], "blocked")
+        self.assertIn("running", html)
+        self.assertIn("blocked", html)
+
+
 class BlockedDebounce(unittest.TestCase):
     """A worker is blocked for a second or two every time it asks anything.
 
