@@ -132,7 +132,16 @@ while IFS='|' read -r run_id task_id pane wt label; do
     [ "${dirty:-0}" != 0 ] && reason="$dirty uncommitted file(s)"
     if [ -z "$reason" ]; then
       if [ -z "$up" ]; then
-        reason="branch $br has no upstream (commits exist only here)"
+        # No upstream is only a risk when the branch holds commits no remote
+        # has. A review/probe branch created on an already-pushed commit has
+        # none — holding it made the conductor close such panes by hand, and
+        # every one landed in the registry as `lost` (2026-09-28).
+        only_here=$(git -C "$wt" rev-list --count "$br" --not --remotes 2>/dev/null)
+        case "$only_here" in
+          0) ;;
+          ''|*[!0-9]*) reason="branch $br has no upstream and its commits cannot be checked against the remotes" ;;
+          *) reason="branch $br has no upstream ($only_here commit(s) exist only here)" ;;
+        esac
       else
         un=$(git -C "$wt" rev-list --count "$up..$br" 2>/dev/null)
         [ "${un:-0}" != 0 ] && reason="$un unpushed commit(s) on $br"

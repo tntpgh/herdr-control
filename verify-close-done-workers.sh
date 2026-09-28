@@ -280,6 +280,21 @@ check "taskL is still lost, NOT silently cancelled" "$(read_task runL taskL | jq
 grep -q '^pane close$' "$CALLS" && bad "the pane was closed despite the refused transition" \
   || ok "the pane was left open, not closed, after the refusal"
 
+printf '== no upstream: held only when commits exist on no remote ==\n'
+nu_wt=$(mktemp -d)/wt-nu
+git init -q -b main "$nu_wt"
+git -C "$nu_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+mkdir -p "$nu_wt/.handoffs"; printf '*\n' > "$nu_wt/.handoffs/.gitignore"
+git -C "$nu_wt" update-ref refs/remotes/origin/main "$(git -C "$nu_wt" rev-parse HEAD)"
+git -C "$nu_wt" switch -q -c review/pr-x          # a review branch on an already-pushed commit, no upstream
+register_task runN taskN w c cp cb pY birthY "$nu_wt" "$nu_wt" "review:review/pr-x" || bad "register taskN failed"
+set_task_state runN taskN running || bad "taskN -> running failed (setup)"
+out=$(bash "$here/close-done-workers.sh" --task=taskN 2>&1)
+printf '%s' "$out" | grep -q '^  close  pY' && ok "a no-upstream branch with nothing unique is closable" || bad "held a branch with nothing to lose: $out"
+git -C "$nu_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "local only"
+out=$(bash "$here/close-done-workers.sh" --task=taskN 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*1 commit(s) exist only here' && ok "a no-upstream branch with a local-only commit is still held" || bad "local-only commit not held: $out"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi
