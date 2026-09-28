@@ -414,9 +414,12 @@ norm() { sed -E 's/(run|task|worker)_[0-9TZ_]+/\1_X/g; s/term_[0-9a-f]+/term_X/g
 repo="$work/repo"; git init -q "$repo" && git -C "$repo" commit -q --allow-empty -m init
 dry() { local d="$1"; shift; env -u HERDR_TASK_ID -u HERDR_RUN_ID HERDR_PANE_ID="$CPANE" bash "$d/spawn-task.sh" --dry-run --no-secrets "$repo" "$@" 2>&1 | norm | sed "s#$d/#<checkout>/#g"; }
 base_dir="$work/base2"; git -C "$here" worktree add -q --detach "$base_dir" origin/main 2>/dev/null
-a="$(dry "$here" fix/x implement omp)"; b="$(dry "$base_dir" fix/x implement omp)"
+# `--tools all` on this side only: the job-class tool set (lib/agent-profiles.sh
+# tools_for_job) changes the default launch line ON PURPOSE and is pinned by
+# verify-posture.sh. What THIS check guards is that --approval adds nothing.
+a="$(dry "$here" fix/x implement omp --tools all)"; b="$(dry "$base_dir" fix/x implement omp)"
 [ -n "$a" ] && [ "$a" = "$b" ] && ok "default spawn --dry-run is byte-identical to origin/main" || { not_ok "default dry-run differs"; diff <(printf '%s\n' "$b") <(printf '%s\n' "$a") | head; }
-a="$(dry "$here" fix/x implement claude --approval menu)"; b="$(dry "$base_dir" fix/x implement claude)"
+a="$(dry "$here" fix/x implement claude --approval menu --tools all)"; b="$(dry "$base_dir" fix/x implement claude)"
 [ "$a" = "$b" ] && ok "explicit --approval menu is byte-identical to origin/main's default" || not_ok "--approval menu differs"
 git -C "$here" worktree remove --force "$base_dir" 2>/dev/null
 export HERDR_OMP_EXTENSION="$here/agent-hooks/omp-herdr-control.ts"

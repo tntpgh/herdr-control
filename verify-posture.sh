@@ -136,6 +136,31 @@ if cli_for_agent definitely-not-an-agent x >/dev/null 2>&1; then
 else
   ok "unknown agent exits 1 (caller falls back to a literal command)"
 fi
+printf '== tool set by job class (omp --tools; measured 22.6k -> 19.7k / 17.6k tokens) ==\n'
+check "implement trims task/yield/ask and the rest of the unused built-ins" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet:medium '' implement)" \
+  "omp --model sonnet --thinking medium --tools read,bash,edit,write,grep,glob,todo,eval,wait --approval-mode write"
+check "explore is read-only plus web_search" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp haiku:low '' explore)" \
+  "omp --model haiku --thinking low --tools read,bash,grep,glob,todo,web_search --approval-mode write"
+check "review keeps every tool (a reviewer may still edit or delegate)" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp opus:high '' review)" \
+  "omp --model opus --thinking high --approval-mode write"
+check "an unrecognised class fails OPEN to all tools (a missing tool breaks work, it never exposes anything)" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet '' no-such-class)" \
+  "omp --model sonnet --approval-mode write"
+check "--tools all overrides the class table" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet '' implement all)" \
+  "omp --model sonnet --approval-mode write"
+check "an explicit --tools list wins over the class table" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet '' explore read,bash)" \
+  "omp --model sonnet --tools read,bash --approval-mode write"
+check "claude flavor under omp is trimmed too" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent claude sonnet '' implement)" \
+  "omp --model sonnet --models sonnet,openai-codex/gpt-5.5 --tools read,bash,edit,write,grep,glob,todo,eval,wait --approval-mode write"
+check "omc launches the real claude binary: no omp --tools flag" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omc sonnet '' implement)" \
+  "claude --model sonnet --permission-mode acceptEdits"
 
 printf '== model routing unchanged for every job class ==\n'
 for j in plan architect review design implement debug code explore quick mechanical docs weird; do
