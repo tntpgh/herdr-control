@@ -425,14 +425,27 @@ menu_rows_ambiguous=0
 # #187: this guard exists for a BASH command that terminal-wrapped mid-token
 # (#186) — real newlines and a genuine terminal wrap are indistinguishable
 # from row count alone, so a bash panel with more than one command row must
-# stay human-only. A non-bash "Allow tool: <name>" panel (`write`'s
-# `Path:`/`Content:` rows, `read`'s `Path:` row, ...) is FIELDS, not a shell
-# command that could wrap: its row count says nothing about a hidden
-# statement. `_cp_non_shell_panel_tool` is the exact same bash/shell/sh/zsh
-# vs. everything-else split classify_command itself uses below, so this
-# never drifts from what actually gets judged as a command.
-panel_tool="$(_cp_non_shell_panel_tool "$cmd_text" 2>/dev/null || true)"
-if [ -z "$panel_tool" ] && [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
+# stay human-only. A `write`-tool panel judged by `_cp_write_menu_verdict`
+# (`Path:`/`Content:` rows) is FIELDS, not a shell command that could wrap,
+# so it is exempt -- but ONLY when that function actually produced a
+# verdict for THIS exact text, never merely because the panel "looks"
+# non-bash. Security review round 1 of #187 (PR #189, F1): gating on tool
+# SHAPE (`_cp_non_shell_panel_tool` alone) let a conductor approve every
+# non-bash tool panel (eval/browser/edit/task, always >=2 rows by
+# construction) -- not the design #187 asked for -- and let a forged
+# "Allow tool: <safe-tool>" header printed above a real dangerous panel
+# borrow the same exemption. `_cp_write_menu_verdict` itself refuses
+# (returns nothing, exit 1) on exactly those forged/ambiguous shapes, so
+# gating on ITS verdict rather than the tool name cannot be tricked the
+# same way. Every other non-bash tool keeps exactly the guard main has
+# today.
+cp_write_menu_judged=0
+if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
+  if _cp_write_menu_verdict "$cmd_text" "$own_worktree" >/dev/null 2>&1; then
+    cp_write_menu_judged=1
+  fi
+fi
+if [ "$cp_write_menu_judged" = 0 ] && [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
   if menu_command_rows="$(prompt_menu_command_rows "$pane" 2>/dev/null)"; then
     case "$menu_command_rows" in
       ''|*[!0-9]*) menu_rows_ambiguous=1 ;;

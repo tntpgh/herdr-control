@@ -913,6 +913,23 @@ if mode == "visible":
     sys.exit(0 if visible else 1)
 if not complete or invalid:
     sys.exit(1)
+# #190 (security review round 1 of #187, PR #189): anchor tool/header
+# identification on the LAST "Allow tool:" row seen, not the first --
+# WITHOUT discarding anything already captured. The state machine above
+# intentionally never re-opens once a panel exists (see its own header
+# comment, and the "embedded Allow tool: row cannot restart the panel and
+# hide the real command" test this must not regress), so a genuine SECOND
+# header stays present in question but never displaces the first as index
+# 0. This relabels index 0 only; every row, including the original header
+# text, stays in the list at its own position, so nothing captured is ever
+# hidden from a caller that counts or classifies rows. classify_command
+# (lib/command-policy.sh) separately fails closed whenever the joined text
+# carries more than one "Allow tool:" occurrence, so this exists for every
+# OTHER consumer of this parser (prompt id, visibility, alerting) that
+# never goes through classify_command at all.
+_hdr_idx = [i for i, r in enumerate(question) if r.startswith("Allow tool:")]
+if len(_hdr_idx) > 1:
+    question[0] = question[_hdr_idx[-1]]
 if mode == "options":
     print("1\tApprove\n2\tDeny")
 elif mode == "selected":
