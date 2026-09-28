@@ -1188,6 +1188,172 @@ class ClosureReasonJoin(unittest.TestCase):
         self.assertIn("no reason recorded", rendered)
 
 
+class Timeline(unittest.TestCase):
+    """B1 (thurber-os docs/research/2026-09-27-epiq-review.md): a
+    read-only, time-windowed replay of the registry's own `events` table.
+    Never a derived or conductor-claimed status — only rows straight off
+    the registry, timestamped.
+    """
+
+    def _registry(self, d, tasks, events):
+        import sqlite3
+        db = Path(d) / "registry.sqlite3"
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE tasks (task_id TEXT, run_id TEXT, label TEXT, repo TEXT, state TEXT,"
+            " pane_id TEXT, conductor_id TEXT, worktree TEXT, branch TEXT, project TEXT,"
+            " created_at TEXT, updated_at TEXT);"
+            "CREATE TABLE events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT,"
+            " task_id TEXT, occurred_at TEXT, payload TEXT);")
+        for row in tasks:
+            conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", row)
+        for ev in events:
+            conn.execute("INSERT INTO events (type, task_id, occurred_at, payload) VALUES (?,?,?,?)", ev)
+        conn.commit(); conn.close()
+        return db
+
+    def _task(self, tid, repo="repo-a", branch="b", state="running"):
+        return (tid, "r", tid, repo, state, "", "", "/nonexistent", branch, "",
+                "2026-09-27T00:00:00Z", "2026-09-27T00:00:00Z")
+
+    def test_window_bounds_are_inclusive_since_exclusive_until(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d, [self._task("t1")],
+                [("state_changed", "t1", "2026-09-27T10:00:00Z", "{}"),
+                 ("state_changed", "t1", "2026-09-27T11:00:00Z", "{}"),
+                 ("state_changed", "t1", "2026-09-27T12:00:00Z", "{}")])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}):
+                out = hub.timeline_data("2026-09-27T10:00:00Z", "2026-09-27T12:00:00Z")
+        seqs = sorted(e["occurred_at"] for e in out["events"])
+        self.assertEqual(seqs, ["2026-09-27T10:00:00Z", "2026-09-27T11:00:00Z"])
+
+    def test_scope_narrows_by_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d, [self._task("t1", repo="repo-a"), self._task("t2", repo="repo-b")],
+                [("state_changed", "t1", "2026-09-27T10:00:00Z", "{}"),
+                 ("state_changed", "t2", "2026-09-27T10:05:00Z", "{}")])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}):
+                out = hub.timeline_data("2026-09-27T00:00:00Z", "2026-09-27T23:59:59Z", scope="repo-a")
+        self.assertEqual([e["task_id"] for e in out["events"]], ["t1"])
+
+    def test_scope_applies_before_the_cap(self):
+        # repo-a's one event is the OLDEST; three newer repo-b events would
+        # fill a cap of 2 and push it out if scope were applied after LIMIT.
+        events = [("state_changed", "t1", "2026-09-27T09:00:00Z", "{}")] + \
+                 [("state_changed", "t2", f"2026-09-27T10:0{i}:00Z", "{}") for i in range(3)]
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d, [self._task("t1", repo="repo-a"), self._task("t2", repo="repo-b")], events)
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}):
+                out = hub.timeline_data("2026-09-27T00:00:00Z", "2026-09-27T23:59:59Z",
+                                        scope="repo-a", limit=2)
+        self.assertEqual([e["task_id"] for e in out["events"]], ["t1"])
+        self.assertEqual((out["total_in_window"], out["capped"]), (1, False))
+
+    def test_an_unpadded_bound_is_normalized_not_compared_as_text(self):
+        # strptime accepts "2026-9-27T9:0:0Z"; compared as TEXT against
+        # "2026-09-27T10:00:00Z" it sorts AFTER it, so the 10:00 event would vanish.
+        since, until, note = hub._timeline_window("since=2026-9-27T9:0:0Z&until=2026-9-27T23:0:0Z")
+        self.assertEqual((since, until, note), ("2026-09-27T09:00:00Z", "2026-09-27T23:00:00Z", ""))
+
+    def test_a_window_over_the_span_limit_is_pulled_in_and_says_so(self):
+        since, until, note = hub._timeline_window("since=1970-01-01T00:00:00Z&until=2026-09-27T00:00:00Z")
+        self.assertEqual((since, until), ("2026-08-27T00:00:00Z", "2026-09-27T00:00:00Z"))
+        self.assertIn("longer than 31 days", note)
+
+    def test_the_json_link_carries_the_window_on_screen(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(d, [self._task("t1")], [])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                html = hub.render_timeline("since=2026-09-27T00:00:00Z&until=2026-09-27T23:59:59Z&repo=repo-a")
+        self.assertIn("/timeline?json=1&repo=repo-a&amp;since=2026-09-27T00%3A00%3A00Z"
+                      "&amp;until=2026-09-27T23%3A59%3A59Z", html)
+
+    def test_an_unknown_scope_is_said_not_rendered_as_calm(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(d, [self._task("t1", repo="repo-a")], [])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                html = hub.render_timeline("repo=repo-typo")
+        self.assertIn("unknown repo scope", html)
+        self.assertNotIn("none in this window", html)
+
+    def test_a_linked_pr_carries_only_number_and_url_never_live_status(self):
+        live = {"b": {"number": 7, "url": "https://github.com/o/r/pull/7", "state": "OPEN",
+                      "mergeable": "CONFLICTING", "statusCheckRollup": [{"conclusion": "FAILURE"}]}}
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(d, [self._task("t1")],
+                                [("state_changed", "t1", "2026-09-27T10:00:00Z", "{}")])
+            with patch.object(hub, "REGISTRY", db), patch.object(hub, "_open_prs_for_repo", lambda repo: live):
+                out = hub.timeline_data("2026-09-27T00:00:00Z", "2026-09-27T23:59:59Z")
+        self.assertEqual(out["events"][0]["pr"], {"number": 7, "url": "https://github.com/o/r/pull/7"})
+
+    def test_a_script_payload_is_escaped_on_the_rendered_page(self):
+        payload = json.dumps({"reason": "<script>alert(1)</script>"})
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d, [self._task("t1")],
+                [("state_changed", "t1", "2026-09-27T10:00:00Z", payload)])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                html = hub.render_timeline("since=2026-09-27T00:00:00Z&until=2026-09-27T23:59:59Z")
+        self.assertNotIn("<script>alert(1)</script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_a_capped_window_says_so(self):
+        events = [("state_changed", "t1", f"2026-09-27T10:{i:02d}:00Z", "{}") for i in range(3)]
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(d, [self._task("t1")], events)
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "TIMELINE_ROW_CAP", 2), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                out = hub.timeline_data("2026-09-27T00:00:00Z", "2026-09-27T23:59:59Z", limit=2)
+                html = hub.render_timeline("since=2026-09-27T00:00:00Z&until=2026-09-27T23:59:59Z")
+        self.assertTrue(out["capped"])
+        self.assertEqual(out["total_in_window"], 3)
+        self.assertIn("latest 2 of 3", html)
+
+    def test_an_empty_window_renders_an_answer_not_an_empty_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(d, [], [])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                html = hub.render_timeline("since=2026-09-27T00:00:00Z&until=2026-09-27T23:59:59Z")
+        self.assertIn("none in this window", html)
+
+    def test_the_page_never_emits_a_state_not_in_a_row(self):
+        """Only an event's OWN payload state reaches the page — never the
+        task's current `tasks.state` (contract-plan §1 "done is a claim",
+        conductor w19:p7, 2026-09-23). The task row carries a sentinel state
+        that appears in no event, so any leak is visible."""
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d, [self._task("t1", state="completed_CLAIM")],
+                [("state_changed", "t1", "2026-09-27T10:00:00Z",
+                  json.dumps({"from": "running", "state": "blocked"}))])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                out = hub.timeline_data("2026-09-27T00:00:00Z", "2026-09-27T23:59:59Z")
+                html = hub.render_timeline("since=2026-09-27T00:00:00Z&until=2026-09-27T23:59:59Z")
+        self.assertEqual(out["events"][0]["payload"]["state"], "blocked")
+        self.assertIn("running", html)
+        self.assertIn("blocked", html)
+        self.assertNotIn("completed_CLAIM", html)
+        self.assertNotIn("completed_CLAIM", json.dumps(out))
+
+
 class BlockedDebounce(unittest.TestCase):
     """A worker is blocked for a second or two every time it asks anything.
 

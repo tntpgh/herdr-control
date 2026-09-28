@@ -14,8 +14,10 @@ the two things that need a human — attention items and open decisions.
   /kb          knowledge-base: nightly ledger, heartbeat, repeat-view signal audits
   /links       every surface with a liveness dot
   /projects    thurber-os docs/project-contract-plan.md §2: per project, live tasks, open PRs, open decisions, SPEC.md checklist, next step
+  /timeline    registry events in a window (?since=&until=, default last 24h; ?repo= scope) — "what moved while I was away"
   /api/summary {attention, attention_tasks, handoff_debt, open_decisions, deploy_drift} — what the omp extension's one-liner reads
   /api/projects same join as /projects, JSON — what fleet-tools.ts's project_status tool and the ambient card read
+  /api/timeline same window as JSON: event rows only, never a derived task status
   /api/panes   every pane herdr knows, with its agent and live agent_status
   /api/blocked just the panes waiting on a person, joined to their task
   /api/blocked/wait?since=N&timeout=S  long-poll: returns the instant that changes
@@ -2733,7 +2735,7 @@ STYLE = """
  .chips a.chip.on{border-color:#6aa6ff;color:#cfe0f5;background:#11161d}
  .chips a.chip.hot{border-color:#ff7a7a} .chips a.chip.hot small{color:#ff9d9d}
 """
-NAV = [("/", "overview"), ("/projects", "projects"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
+NAV = [("/", "overview"), ("/projects", "projects"), ("/decisions", "decisions"), ("/loops", "loops"), ("/herdr", "herdr"), ("/timeline", "timeline"), ("/search", "search"), ("/kb", "kb"), ("/links", "links")]
 
 # ---- SCOPE: one hub, many projects ------------------------------------------
 # Every task in the registry already carries the repo it belongs to, and the
@@ -3244,12 +3246,13 @@ def _project_attention_loop() -> None:
 CACHES["projects"] = Cached(10, projects_data, stale_ok=True, name="projects")
 
 
-def page(title: str, path: str, body: str, refresh: int = 15, scope: str = "") -> str:
+def page(title: str, path: str, body: str, refresh: int = 15, scope: str = "", json_extra: str = "") -> str:
     """refresh=0 disables the meta-refresh; the caller supplies its own poller.
 
     `scope` is carried into the meta-refresh URL and the json link. Without it
     a scoped page silently reset to the whole fleet on its own 15s refresh —
-    a filter that undoes itself while you read is worse than no filter."""
+    a filter that undoes itself while you read is worse than no filter.
+    `json_extra` is appended to the json link only (e.g. /timeline's window)."""
     nav = " ".join(f"<a href='{p}' class='{'on' if p == path else ''}'>{n}</a>" for p, n in NAV)
     q = f"?repo={urllib.parse.quote(scope)}" if scope else ""
     meta = (f"<meta http-equiv=refresh content='{refresh};url={path}{q}'>" if refresh else "")
@@ -3257,7 +3260,7 @@ def page(title: str, path: str, body: str, refresh: int = 15, scope: str = "") -
     return (f"<!doctype html><html lang=en><head><meta charset=utf-8>{meta}"
             f"<title>{_esc(title)}</title><style>{STYLE}</style></head><body>"
             f"<header><b>hub</b>{nav}<span class=dim style='margin-left:auto'>{label} · "
-            f"<a href='{path}?json=1{('&repo=' + urllib.parse.quote(scope)) if scope else ''}'>json</a>"
+            f"<a href='{path}?json=1{('&repo=' + urllib.parse.quote(scope)) if scope else ''}{_esc(json_extra)}'>json</a>"
             f"</span></header><main>{body}</main></body></html>")
 
 
@@ -3844,6 +3847,188 @@ def render_projects() -> str:
     return page("projects", "/projects", body or "<p class=dim>no projects registered yet</p>", refresh=15)
 
 
+# ---- TIMELINE: thurber-os docs/research/2026-09-27-epiq-review.md §B1 -------
+# "What moved while I was away" — a read-only, time-windowed replay of the
+# registry's own `events` table. Every other reader here answers "what IS
+# happening"; this answers "what HAPPENED, in this window", without reading
+# a conductor transcript.
+#
+# Hard rule from B1's risk section: show ONLY registry event rows, never a
+# derived or conductor-claimed status — the incident this guards against is
+# contract-plan §1 "done is a claim" (conductor w19:p7, 2026-09-23) landing
+# again through a NEW surface. So `timeline_data` never calls `derive()` and
+# never reads `tasks.state`; the only per-task fields it joins in are
+# identity (label, repo, project, branch) — facts, not status. A `state`
+# shown here is always an event's OWN payload, never a task's current state.
+#
+# `scope` reuses `_repo_matches`/`scope_of` verbatim — the same matcher
+# `/herdr?repo=` and `/projects` use — rather than a second filter.
+TIMELINE_ROW_CAP = 500
+# The row cap bounds what is RENDERED; this bounds what is READ. There is no
+# index on occurred_at, and every row in the window is json-decoded before the
+# cap, so an unbounded `since=1970-…` would pull the whole table (30k+ rows,
+# 2026-09-28) into Python on every hit. ~3.1k events/day -> ~96k at 31 days.
+TIMELINE_MAX_DAYS = 31
+
+
+def _timeline_window(query: str) -> tuple[str, str, str]:
+    """(since, until, note) — canonical `...Z` bounds. Absent, unparseable or
+    inverted bounds become the last 24h; a span over TIMELINE_MAX_DAYS keeps
+    `until` and pulls `since` in. `note` says which happened ("" = as asked):
+    always a REAL window the caller labels, never a live total (B1)."""
+    q = urllib.parse.parse_qs(query)
+    now = dt.datetime.now(dt.timezone.utc)
+    default_since = (now - dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    default_until = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    since = (q.get("since") or [""])[0].strip() or default_since
+    until = (q.get("until") or [""])[0].strip() or default_until
+    se, ue = _iso_epoch(since), _iso_epoch(until)
+    if se is None or ue is None or se >= ue:
+        return default_since, default_until, "window bounds unset or invalid \u2014 showing the default (last 24h)."
+    note = ""
+    if ue - se > TIMELINE_MAX_DAYS * 86400:
+        se = ue - TIMELINE_MAX_DAYS * 86400
+        note = f"window longer than {TIMELINE_MAX_DAYS} days \u2014 showing the last {TIMELINE_MAX_DAYS} days before until."
+    # Re-emit canonically: strptime accepts `2026-9-7T1:2:3Z`, but the query
+    # compares occurred_at as TEXT, and "2026-9-…" sorts after every
+    # "2026-09-…" — an unpadded bound would silently select the wrong rows.
+    fmt = lambda e: dt.datetime.fromtimestamp(e, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return fmt(se), fmt(ue), note
+
+
+def timeline_data(since: str, until: str, scope: str = "", limit: int | None = None) -> dict:
+    """Registry `events` rows in `[since, until)` — since inclusive, until
+    exclusive, the half-open convention every other windowed query here
+    uses, so a boundary event is never lost between two adjacent windows.
+
+    Reuses the exact query shape `herdr_data`/`slo_data` already run against
+    this same `events` table, read-only — no new store, daemon, dependency.
+    The row cap bounds a single busy window (not the whole table); a capped
+    window says so rather than silently truncating. Scope is applied BEFORE
+    the cap, so "latest N of M" counts that project's events, and a scoped
+    view never loses its older rows to other projects' traffic (~3.1k
+    events/day, 2026-09-28 — a Python pass over one window is cheap).
+    """
+    limit = TIMELINE_ROW_CAP if limit is None else limit
+    empty = {"events": [], "since": since, "until": until, "scope": scope,
+             "capped": False, "total_in_window": 0}
+    if not REGISTRY.exists():
+        return {**empty, "error": f"registry not found: {REGISTRY}"}
+    conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Same defensive column check as herdr_data(): a registry a bash
+        # writer hasn't migrated yet must degrade, never 500 the page.
+        cols = {r[0] for r in conn.execute("SELECT name FROM pragma_table_info('tasks')")}
+        branch_col = "branch" if "branch" in cols else "'' AS branch"
+        project_col = "project" if "project" in cols else "'' AS project"
+        tasks = {r["task_id"]: dict(r) for r in conn.execute(
+            f"SELECT task_id, label, repo, {branch_col}, {project_col} FROM tasks")}
+        rows = conn.execute(
+            "SELECT sequence, type, task_id, occurred_at, payload FROM events "
+            "WHERE occurred_at >= ? AND occurred_at < ? ORDER BY sequence DESC",
+            (since, until)).fetchall()
+    finally:
+        conn.close()
+    events = []
+    for r in rows:
+        t = tasks.get(r["task_id"]) or {}
+        repo = t.get("repo") or ""
+        if scope and not _repo_matches(repo, scope):
+            continue
+        e = dict(r)
+        try:
+            e["payload"] = json.loads(e["payload"] or "{}")
+        except json.JSONDecodeError:
+            e["payload"] = {"_raw": e["payload"]}
+        if not isinstance(e["payload"], dict):
+            e["payload"] = {"_raw": e["payload"]}
+        e["label"] = t.get("label") or e["task_id"]
+        e["repo"] = repo
+        e["project"] = t.get("project") or ""
+        e["branch"] = t.get("branch") or ""
+        events.append(e)
+    total = len(events)
+    capped = total > limit
+    events = events[:limit]
+    # Linked PR, per distinct (repo, branch) actually shown — one cached
+    # `gh` lookup per repo (`_open_prs_for_repo`), never per event. Only
+    # number+url: the rest of that dict (state, mergeable, checks) is LIVE
+    # status, and stamping it onto a timestamped row is the "live presented
+    # as frozen" risk B1 names. It is an OPEN PR now, and is labeled so.
+    prs: dict = {}
+    for e in events:
+        key = (e["repo"], e["branch"])
+        if e["repo"] and e["branch"] and key not in prs:
+            pr = _open_prs_for_repo(e["repo"]).get(e["branch"])
+            prs[key] = {"number": pr.get("number"), "url": pr.get("url")} if pr else None
+    for e in events:
+        e["pr"] = prs.get((e["repo"], e["branch"]))
+    scope_known = not scope or any(_repo_matches(t.get("repo"), scope) for t in tasks.values())
+    return {"events": events, "since": since, "until": until, "scope": scope,
+            "scope_known": scope_known, "capped": capped, "total_in_window": total}
+
+
+def _timeline_from_query(query: str) -> dict:
+    since, until, note = _timeline_window(query)
+    d = timeline_data(since, until, scope_of(query))
+    d["note"] = note
+    return d
+
+
+def _timeline_row(e: dict) -> str:
+    """One row: event type, the few payload fields that matter (state
+    from→to, reason/outcome/detail, prompt id), linked PR if the registry
+    has one. Every worker-influenced value goes through `_esc`."""
+    p = e["payload"]
+    bits = []
+    if p.get("state") or p.get("from"):
+        bits.append(f"{_esc(p.get('from') or '?')}\u2192{_esc(p.get('state') or '?')}")
+    for k in ("reason", "outcome", "detail"):
+        if p.get(k):
+            bits.append(_esc(str(p[k])))
+    if p.get("prompt_id"):
+        bits.append(f"prompt={_esc(str(p['prompt_id'])[:12])}\u2026")
+    pr = e.get("pr")
+    pr_html = (f" <a href='{_esc(pr.get('url'))}' title='open PR on this branch now'>open PR #{_esc(pr.get('number'))}</a>"
+               if pr else "")
+    return (f"<tr><td class=dim>#{e['sequence']}</td>"
+            f"<td class=age title='{_esc(e['occurred_at'])}'>{_esc(e['occurred_at'])}</td>"
+            f"<td><span class=pill>{_esc(e['type'])}</span></td>"
+            f"<td>{_esc(e['label'])}</td><td class=dim>{_esc(e['repo'])}</td>"
+            f"<td class=dim>{' '.join(bits)}{pr_html}</td></tr>")
+
+
+def render_timeline(query: str = "") -> str:
+    d = _timeline_from_query(query)
+    since, until, scope = d["since"], d["until"], d["scope"]
+    if d.get("error"):
+        return page("timeline", "/timeline", f"<pre>{_esc(d['error'])}</pre>")
+    empty = ("unknown repo scope \u2014 no task in the registry matches it" if not d.get("scope_known", True)
+             else "none in this window")
+    rows = "".join(_timeline_row(e) for e in d["events"]) or \
+        f"<tr><td class=dim colspan=6>{_esc(empty)}</td></tr>"
+    notes = ""
+    if d.get("note"):
+        notes += f"<div class=dim style='margin:-4px 0 8px'>{_esc(d['note'])}</div>"
+    if d["capped"]:
+        notes += (f"<div class=dim style='margin:-4px 0 8px'>showing the latest {len(d['events'])} of "
+                  f"{d['total_in_window']} events in this window \u2014 narrow it to see the rest.</div>")
+    form = (f"<form method=get action=/timeline class=dim style='margin-bottom:10px'>"
+            f"since <input type=text name=since value='{_esc(since)}' size=20> "
+            f"until <input type=text name=until value='{_esc(until)}' size=20> "
+            f"<input type=hidden name=repo value='{_esc(scope)}'> "
+            f"<button type=submit>apply</button></form>")
+    body = (scope_chips(CACHES["herdr"].get(), "/timeline", scope)
+            + form
+            + f"<h2>Timeline \u2014 {_esc(since)} \u2192 {_esc(until)}</h2>"
+            + notes
+            + "<table><tr><th>#</th><th>when</th><th>event</th><th>task</th><th>repo</th><th>detail</th></tr>"
+            + rows + "</table>")
+    window_q = "&since=" + urllib.parse.quote(since) + "&until=" + urllib.parse.quote(until)
+    return page("timeline", "/timeline", body, refresh=0, scope=scope, json_extra=window_q)
+
+
 
 # ── HTTP ───────────────────────────────────────────────────────────────────────
 def _suggestion_row(s: dict) -> str:
@@ -4022,6 +4207,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "application/json", json.dumps(
                 {"connected": live.get("connected"), "version": version,
                  "changed": version != since, "blocked": live_attention()}, default=str).encode())
+        if path == "/api/timeline":
+            return self._send(200, "application/json",
+                              json.dumps(_timeline_from_query(query), default=str).encode())
+        if path == "/timeline":
+            if "json=1" in query:
+                return self._send(200, "application/json",
+                                  json.dumps(_timeline_from_query(query), default=str).encode())
+            return self._send(200, "text/html; charset=utf-8", render_timeline(query).encode())
         if path.startswith("/decisions/"):
             code, body = serve_stored_form(path[len("/decisions/"):].strip("/"))
             return self._send(code, "text/html; charset=utf-8" if code == 200 else "text/plain", body)
