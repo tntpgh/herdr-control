@@ -3169,12 +3169,13 @@ def _project_attention_loop() -> None:
 CACHES["projects"] = Cached(10, projects_data, stale_ok=True, name="projects")
 
 
-def page(title: str, path: str, body: str, refresh: int = 15, scope: str = "") -> str:
+def page(title: str, path: str, body: str, refresh: int = 15, scope: str = "", json_extra: str = "") -> str:
     """refresh=0 disables the meta-refresh; the caller supplies its own poller.
 
     `scope` is carried into the meta-refresh URL and the json link. Without it
     a scoped page silently reset to the whole fleet on its own 15s refresh —
-    a filter that undoes itself while you read is worse than no filter."""
+    a filter that undoes itself while you read is worse than no filter.
+    `json_extra` is appended to the json link only (e.g. /timeline's window)."""
     nav = " ".join(f"<a href='{p}' class='{'on' if p == path else ''}'>{n}</a>" for p, n in NAV)
     q = f"?repo={urllib.parse.quote(scope)}" if scope else ""
     meta = (f"<meta http-equiv=refresh content='{refresh};url={path}{q}'>" if refresh else "")
@@ -3182,7 +3183,7 @@ def page(title: str, path: str, body: str, refresh: int = 15, scope: str = "") -
     return (f"<!doctype html><html lang=en><head><meta charset=utf-8>{meta}"
             f"<title>{_esc(title)}</title><style>{STYLE}</style></head><body>"
             f"<header><b>hub</b>{nav}<span class=dim style='margin-left:auto'>{label} · "
-            f"<a href='{path}?json=1{('&repo=' + urllib.parse.quote(scope)) if scope else ''}'>json</a>"
+            f"<a href='{path}?json=1{('&repo=' + urllib.parse.quote(scope)) if scope else ''}{_esc(json_extra)}'>json</a>"
             f"</span></header><main>{body}</main></body></html>")
 
 
@@ -3778,13 +3779,18 @@ def render_projects() -> str:
 # `scope` reuses `_repo_matches`/`scope_of` verbatim — the same matcher
 # `/herdr?repo=` and `/projects` use — rather than a second filter.
 TIMELINE_ROW_CAP = 500
+# The row cap bounds what is RENDERED; this bounds what is READ. There is no
+# index on occurred_at, and every row in the window is json-decoded before the
+# cap, so an unbounded `since=1970-…` would pull the whole table (30k+ rows,
+# 2026-09-28) into Python on every hit. ~3.1k events/day -> ~96k at 31 days.
+TIMELINE_MAX_DAYS = 31
 
 
-def _timeline_window(query: str) -> tuple[str, str, bool]:
-    """(since, until, was_defaulted) — `...Z` bounds, defaulting to the last
-    24h when absent, unparseable, or inverted. Always a REAL window: the
-    caller labels it with these two values, never presents it as a live
-    total (B1's risk section)."""
+def _timeline_window(query: str) -> tuple[str, str, str]:
+    """(since, until, note) — canonical `...Z` bounds. Absent, unparseable or
+    inverted bounds become the last 24h; a span over TIMELINE_MAX_DAYS keeps
+    `until` and pulls `since` in. `note` says which happened ("" = as asked):
+    always a REAL window the caller labels, never a live total (B1)."""
     q = urllib.parse.parse_qs(query)
     now = dt.datetime.now(dt.timezone.utc)
     default_since = (now - dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3793,8 +3799,16 @@ def _timeline_window(query: str) -> tuple[str, str, bool]:
     until = (q.get("until") or [""])[0].strip() or default_until
     se, ue = _iso_epoch(since), _iso_epoch(until)
     if se is None or ue is None or se >= ue:
-        return default_since, default_until, True
-    return since, until, False
+        return default_since, default_until, "window bounds unset or invalid \u2014 showing the default (last 24h)."
+    note = ""
+    if ue - se > TIMELINE_MAX_DAYS * 86400:
+        se = ue - TIMELINE_MAX_DAYS * 86400
+        note = f"window longer than {TIMELINE_MAX_DAYS} days \u2014 showing the last {TIMELINE_MAX_DAYS} days before until."
+    # Re-emit canonically: strptime accepts `2026-9-7T1:2:3Z`, but the query
+    # compares occurred_at as TEXT, and "2026-9-…" sorts after every
+    # "2026-09-…" — an unpadded bound would silently select the wrong rows.
+    fmt = lambda e: dt.datetime.fromtimestamp(e, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return fmt(se), fmt(ue), note
 
 
 def timeline_data(since: str, until: str, scope: str = "", limit: int | None = None) -> dict:
@@ -3853,22 +3867,27 @@ def timeline_data(since: str, until: str, scope: str = "", limit: int | None = N
     capped = total > limit
     events = events[:limit]
     # Linked PR, per distinct (repo, branch) actually shown — one cached
-    # `gh` lookup per repo (`_open_prs_for_repo`), never per event.
+    # `gh` lookup per repo (`_open_prs_for_repo`), never per event. Only
+    # number+url: the rest of that dict (state, mergeable, checks) is LIVE
+    # status, and stamping it onto a timestamped row is the "live presented
+    # as frozen" risk B1 names. It is an OPEN PR now, and is labeled so.
     prs: dict = {}
     for e in events:
         key = (e["repo"], e["branch"])
         if e["repo"] and e["branch"] and key not in prs:
-            prs[key] = _open_prs_for_repo(e["repo"]).get(e["branch"])
+            pr = _open_prs_for_repo(e["repo"]).get(e["branch"])
+            prs[key] = {"number": pr.get("number"), "url": pr.get("url")} if pr else None
     for e in events:
         e["pr"] = prs.get((e["repo"], e["branch"]))
+    scope_known = not scope or any(_repo_matches(t.get("repo"), scope) for t in tasks.values())
     return {"events": events, "since": since, "until": until, "scope": scope,
-            "capped": capped, "total_in_window": total}
+            "scope_known": scope_known, "capped": capped, "total_in_window": total}
 
 
 def _timeline_from_query(query: str) -> dict:
-    since, until, defaulted = _timeline_window(query)
+    since, until, note = _timeline_window(query)
     d = timeline_data(since, until, scope_of(query))
-    d["defaulted"] = defaulted
+    d["note"] = note
     return d
 
 
@@ -3886,7 +3905,8 @@ def _timeline_row(e: dict) -> str:
     if p.get("prompt_id"):
         bits.append(f"prompt={_esc(str(p['prompt_id'])[:12])}\u2026")
     pr = e.get("pr")
-    pr_html = f" <a href='{_esc(pr.get('url'))}'>PR #{_esc(pr.get('number'))}</a>" if pr else ""
+    pr_html = (f" <a href='{_esc(pr.get('url'))}' title='open PR on this branch now'>open PR #{_esc(pr.get('number'))}</a>"
+               if pr else "")
     return (f"<tr><td class=dim>#{e['sequence']}</td>"
             f"<td class=age title='{_esc(e['occurred_at'])}'>{_esc(e['occurred_at'])}</td>"
             f"<td><span class=pill>{_esc(e['type'])}</span></td>"
@@ -3899,12 +3919,13 @@ def render_timeline(query: str = "") -> str:
     since, until, scope = d["since"], d["until"], d["scope"]
     if d.get("error"):
         return page("timeline", "/timeline", f"<pre>{_esc(d['error'])}</pre>")
+    empty = ("unknown repo scope \u2014 no task in the registry matches it" if not d.get("scope_known", True)
+             else "none in this window")
     rows = "".join(_timeline_row(e) for e in d["events"]) or \
-        "<tr><td class=dim colspan=6>none in this window</td></tr>"
+        f"<tr><td class=dim colspan=6>{_esc(empty)}</td></tr>"
     notes = ""
-    if d["defaulted"]:
-        notes += ("<div class=dim style='margin:-4px 0 8px'>window bounds unset or invalid "
-                  "\u2014 showing the default (last 24h).</div>")
+    if d.get("note"):
+        notes += f"<div class=dim style='margin:-4px 0 8px'>{_esc(d['note'])}</div>"
     if d["capped"]:
         notes += (f"<div class=dim style='margin:-4px 0 8px'>showing the latest {len(d['events'])} of "
                   f"{d['total_in_window']} events in this window \u2014 narrow it to see the rest.</div>")
@@ -3919,7 +3940,8 @@ def render_timeline(query: str = "") -> str:
             + notes
             + "<table><tr><th>#</th><th>when</th><th>event</th><th>task</th><th>repo</th><th>detail</th></tr>"
             + rows + "</table>")
-    return page("timeline", "/timeline", body, refresh=0, scope=scope)
+    window_q = "&since=" + urllib.parse.quote(since) + "&until=" + urllib.parse.quote(until)
+    return page("timeline", "/timeline", body, refresh=0, scope=scope, json_extra=window_q)
 
 
 

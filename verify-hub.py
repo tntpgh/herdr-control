@@ -1212,8 +1212,8 @@ class Timeline(unittest.TestCase):
         conn.commit(); conn.close()
         return db
 
-    def _task(self, tid, repo="repo-a", branch="b"):
-        return (tid, "r", tid, repo, "running", "", "", "/nonexistent", branch, "",
+    def _task(self, tid, repo="repo-a", branch="b", state="running"):
+        return (tid, "r", tid, repo, state, "", "", "/nonexistent", branch, "",
                 "2026-09-27T00:00:00Z", "2026-09-27T00:00:00Z")
 
     def test_window_bounds_are_inclusive_since_exclusive_until(self):
@@ -1255,6 +1255,47 @@ class Timeline(unittest.TestCase):
         self.assertEqual([e["task_id"] for e in out["events"]], ["t1"])
         self.assertEqual((out["total_in_window"], out["capped"]), (1, False))
 
+    def test_an_unpadded_bound_is_normalized_not_compared_as_text(self):
+        # strptime accepts "2026-9-27T9:0:0Z"; compared as TEXT against
+        # "2026-09-27T10:00:00Z" it sorts AFTER it, so the 10:00 event would vanish.
+        since, until, note = hub._timeline_window("since=2026-9-27T9:0:0Z&until=2026-9-27T23:0:0Z")
+        self.assertEqual((since, until, note), ("2026-09-27T09:00:00Z", "2026-09-27T23:00:00Z", ""))
+
+    def test_a_window_over_the_span_limit_is_pulled_in_and_says_so(self):
+        since, until, note = hub._timeline_window("since=1970-01-01T00:00:00Z&until=2026-09-27T00:00:00Z")
+        self.assertEqual((since, until), ("2026-08-27T00:00:00Z", "2026-09-27T00:00:00Z"))
+        self.assertIn("longer than 31 days", note)
+
+    def test_the_json_link_carries_the_window_on_screen(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(d, [self._task("t1")], [])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                html = hub.render_timeline("since=2026-09-27T00:00:00Z&until=2026-09-27T23:59:59Z&repo=repo-a")
+        self.assertIn("/timeline?json=1&repo=repo-a&amp;since=2026-09-27T00%3A00%3A00Z"
+                      "&amp;until=2026-09-27T23%3A59%3A59Z", html)
+
+    def test_an_unknown_scope_is_said_not_rendered_as_calm(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(d, [self._task("t1", repo="repo-a")], [])
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}), \
+                 patch.object(hub, "scope_chips", lambda *a, **k: ""):
+                html = hub.render_timeline("repo=repo-typo")
+        self.assertIn("unknown repo scope", html)
+        self.assertNotIn("none in this window", html)
+
+    def test_a_linked_pr_carries_only_number_and_url_never_live_status(self):
+        live = {"b": {"number": 7, "url": "https://github.com/o/r/pull/7", "state": "OPEN",
+                      "mergeable": "CONFLICTING", "statusCheckRollup": [{"conclusion": "FAILURE"}]}}
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(d, [self._task("t1")],
+                                [("state_changed", "t1", "2026-09-27T10:00:00Z", "{}")])
+            with patch.object(hub, "REGISTRY", db), patch.object(hub, "_open_prs_for_repo", lambda repo: live):
+                out = hub.timeline_data("2026-09-27T00:00:00Z", "2026-09-27T23:59:59Z")
+        self.assertEqual(out["events"][0]["pr"], {"number": 7, "url": "https://github.com/o/r/pull/7"})
+
     def test_a_script_payload_is_escaped_on_the_rendered_page(self):
         payload = json.dumps({"reason": "<script>alert(1)</script>"})
         with tempfile.TemporaryDirectory() as d:
@@ -1292,12 +1333,13 @@ class Timeline(unittest.TestCase):
         self.assertIn("none in this window", html)
 
     def test_the_page_never_emits_a_state_not_in_a_row(self):
-        """Only an event's OWN payload state reaches the page — never
-        `hub.derive`'s current-state machinery (contract-plan §1 "done is a
-        claim", conductor w19:p7, 2026-09-23)."""
+        """Only an event's OWN payload state reaches the page — never the
+        task's current `tasks.state` (contract-plan §1 "done is a claim",
+        conductor w19:p7, 2026-09-23). The task row carries a sentinel state
+        that appears in no event, so any leak is visible."""
         with tempfile.TemporaryDirectory() as d:
             db = self._registry(
-                d, [self._task("t1")],
+                d, [self._task("t1", state="completed_CLAIM")],
                 [("state_changed", "t1", "2026-09-27T10:00:00Z",
                   json.dumps({"from": "running", "state": "blocked"}))])
             with patch.object(hub, "REGISTRY", db), \
@@ -1308,6 +1350,8 @@ class Timeline(unittest.TestCase):
         self.assertEqual(out["events"][0]["payload"]["state"], "blocked")
         self.assertIn("running", html)
         self.assertIn("blocked", html)
+        self.assertNotIn("completed_CLAIM", html)
+        self.assertNotIn("completed_CLAIM", json.dumps(out))
 
 
 class BlockedDebounce(unittest.TestCase):
