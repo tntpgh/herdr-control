@@ -136,7 +136,7 @@ while IFS='|' read -r run_id task_id pane wt label; do
         # has. A review/probe branch created on an already-pushed commit has
         # none — holding it made the conductor close such panes by hand, and
         # every one landed in the registry as `lost` (2026-09-28).
-        only_here=$(git -C "$wt" rev-list --count "$br" --not --remotes 2>/dev/null)
+        only_here=$(git -C "$wt" rev-list --count "refs/heads/$br" --not --remotes 2>/dev/null)
         case "$only_here" in
           0) ;;
           ''|*[!0-9]*) reason="branch $br has no upstream and its commits cannot be checked against the remotes" ;;
