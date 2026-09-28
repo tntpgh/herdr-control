@@ -22,7 +22,7 @@ or side call:
 input + cacheRead + cacheWrite (SPEC.md), never totalTokens (that includes
 output, which was never in the prompt).
 
-Output: JSON written to the herdr state dir (default matches hub.py's STATE:
+Output: JSON written to the herdr state dir (default matches the hub's STATE:
 ~/.local/state/herdr/cost-report.json) — window totals, by cost bucket, by
 repo, top 10 sessions by cost, turns over the 300k context threshold, and the
 same set for the prior window so week-over-week is visible without a second
