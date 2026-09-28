@@ -14,8 +14,10 @@ the two things that need a human — attention items and open decisions.
   /kb          knowledge-base: nightly ledger, heartbeat, repeat-view signal audits
   /links       every surface with a liveness dot
   /projects    thurber-os docs/project-contract-plan.md §2: per project, live tasks, open PRs, open decisions, SPEC.md checklist, next step
+  /timeline    registry events in a window (?since=&until=, default last 24h; ?repo= scope) — "what moved while I was away"
   /api/summary {attention, attention_tasks, handoff_debt, open_decisions, deploy_drift} — what the omp extension's one-liner reads
   /api/projects same join as /projects, JSON — what fleet-tools.ts's project_status tool and the ambient card read
+  /api/timeline same window as JSON: event rows only, never a derived task status
   /api/panes   every pane herdr knows, with its agent and live agent_status
   /api/blocked just the panes waiting on a person, joined to their task
   /api/blocked/wait?since=N&timeout=S  long-poll: returns the instant that changes
