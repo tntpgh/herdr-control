@@ -1240,6 +1240,21 @@ class Timeline(unittest.TestCase):
                 out = hub.timeline_data("2026-09-27T00:00:00Z", "2026-09-27T23:59:59Z", scope="repo-a")
         self.assertEqual([e["task_id"] for e in out["events"]], ["t1"])
 
+    def test_scope_applies_before_the_cap(self):
+        # repo-a's one event is the OLDEST; three newer repo-b events would
+        # fill a cap of 2 and push it out if scope were applied after LIMIT.
+        events = [("state_changed", "t1", "2026-09-27T09:00:00Z", "{}")] + \
+                 [("state_changed", "t2", f"2026-09-27T10:0{i}:00Z", "{}") for i in range(3)]
+        with tempfile.TemporaryDirectory() as d:
+            db = self._registry(
+                d, [self._task("t1", repo="repo-a"), self._task("t2", repo="repo-b")], events)
+            with patch.object(hub, "REGISTRY", db), \
+                 patch.object(hub, "_open_prs_for_repo", lambda repo: {}):
+                out = hub.timeline_data("2026-09-27T00:00:00Z", "2026-09-27T23:59:59Z",
+                                        scope="repo-a", limit=2)
+        self.assertEqual([e["task_id"] for e in out["events"]], ["t1"])
+        self.assertEqual((out["total_in_window"], out["capped"]), (1, False))
+
     def test_a_script_payload_is_escaped_on_the_rendered_page(self):
         payload = json.dumps({"reason": "<script>alert(1)</script>"})
         with tempfile.TemporaryDirectory() as d:

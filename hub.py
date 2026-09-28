@@ -3795,7 +3795,7 @@ def _timeline_window(query: str) -> tuple[str, str, bool]:
     return since, until, False
 
 
-def timeline_data(since: str, until: str, scope: str = "", limit: int = TIMELINE_ROW_CAP) -> dict:
+def timeline_data(since: str, until: str, scope: str = "", limit: int | None = None) -> dict:
     """Registry `events` rows in `[since, until)` — since inclusive, until
     exclusive, the half-open convention every other windowed query here
     uses, so a boundary event is never lost between two adjacent windows.
@@ -3803,8 +3803,12 @@ def timeline_data(since: str, until: str, scope: str = "", limit: int = TIMELINE
     Reuses the exact query shape `herdr_data`/`slo_data` already run against
     this same `events` table, read-only — no new store, daemon, dependency.
     The row cap bounds a single busy window (not the whole table); a capped
-    window says so rather than silently truncating.
+    window says so rather than silently truncating. Scope is applied BEFORE
+    the cap, so "latest N of M" counts that project's events, and a scoped
+    view never loses its older rows to other projects' traffic (~3.1k
+    events/day, 2026-09-28 — a Python pass over one window is cheap).
     """
+    limit = TIMELINE_ROW_CAP if limit is None else limit
     empty = {"events": [], "since": since, "until": until, "scope": scope,
              "capped": False, "total_in_window": 0}
     if not REGISTRY.exists():
@@ -3819,32 +3823,33 @@ def timeline_data(since: str, until: str, scope: str = "", limit: int = TIMELINE
         project_col = "project" if "project" in cols else "'' AS project"
         tasks = {r["task_id"]: dict(r) for r in conn.execute(
             f"SELECT task_id, label, repo, {branch_col}, {project_col} FROM tasks")}
-        total = conn.execute(
-            "SELECT COUNT(*) FROM events WHERE occurred_at >= ? AND occurred_at < ?",
-            (since, until)).fetchone()[0]
         rows = conn.execute(
             "SELECT sequence, type, task_id, occurred_at, payload FROM events "
-            "WHERE occurred_at >= ? AND occurred_at < ? ORDER BY sequence DESC LIMIT ?",
-            (since, until, limit + 1)).fetchall()
+            "WHERE occurred_at >= ? AND occurred_at < ? ORDER BY sequence DESC",
+            (since, until)).fetchall()
     finally:
         conn.close()
-    capped = len(rows) > limit
-    rows = rows[:limit]
     events = []
     for r in rows:
+        t = tasks.get(r["task_id"]) or {}
+        repo = t.get("repo") or ""
+        if scope and not _repo_matches(repo, scope):
+            continue
         e = dict(r)
         try:
             e["payload"] = json.loads(e["payload"] or "{}")
         except json.JSONDecodeError:
             e["payload"] = {"_raw": e["payload"]}
-        t = tasks.get(e["task_id"]) or {}
+        if not isinstance(e["payload"], dict):
+            e["payload"] = {"_raw": e["payload"]}
         e["label"] = t.get("label") or e["task_id"]
-        e["repo"] = t.get("repo") or ""
+        e["repo"] = repo
         e["project"] = t.get("project") or ""
         e["branch"] = t.get("branch") or ""
-        if scope and not _repo_matches(e["repo"], scope):
-            continue
         events.append(e)
+    total = len(events)
+    capped = total > limit
+    events = events[:limit]
     # Linked PR, per distinct (repo, branch) actually shown — one cached
     # `gh` lookup per repo (`_open_prs_for_repo`), never per event.
     prs: dict = {}
