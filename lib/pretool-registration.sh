@@ -33,6 +33,23 @@ mcp_tool_is_safe_observer() {
     *) return 1 ;;
   esac
 }
+
+# omp's own read-only xd:// fleet-status devices (lib/pretool-shadow.sh:167
+# lists these exact names as read-only/session-memory, allowed through its
+# own tool-table) are reached here as a bare device name, or with an
+# `xd_`/`xd:` prefix depending on which caller invokes this script. Exclude
+# them by EXACT name before the stem match below — `handoff_debt` and
+# `worktree_debt` otherwise stem-match `*handoff*`/`*worktree*` and get
+# refused as fleet-creating (#182) even though neither creates a task or
+# pane; they only read the registry/git state. Every other name on this
+# list already falls through the stem match unmatched. The real `task`
+# tool, `spawn-task.sh`, and `spawn-agent.sh` are untouched — none of their
+# names appear here, so this opens no hole for actual delegation.
+xd_dev="${tool_norm#xd_}"; xd_dev="${xd_dev#xd:}"
+case "$xd_dev" in
+  notepad_read|notepad_stats|fleet_status|pr_ready|handoff_debt|single_copy_scan|worktree_debt|suite_wired|decisions_open|project_status|recall|reflect|retain|report_issue)
+    exit 0 ;;
+esac
 case "$tool_norm" in
   taskoutput|taskstop|taskget|tasklist|cronlist|bashoutput|killshell|taskupdate) exit 0 ;;
   mcp__*) mcp_tool_is_safe_observer "$tool_norm" && exit 0 ;;

@@ -1476,6 +1476,100 @@ _cp_python_risk() {                     # text -> prints a reason, 0 when risky
   printf 'python uses %s (process/network/deletion/env/dynamic-code) — needs a reviewing authority\n' "$hit"
 }
 
+# ---- python-mode env access, AST-based, key-name-aware (issue #174) --------
+# `_CP_PY_ENV_RE` below fires on the bare WORD `environ`/`getenv`/…, with no
+# idea which key is being fetched: `os.environ.get("HERDR_SESSIONS_DIR",
+# HOME / ".omp/agent/sessions")` — a non-secret path default, cost-report.py
+# — reserved exactly like `dict(os.environ)` or `os.environ["GITHUB_TOKEN"]`
+# would. The acceptance bar (#174) is narrower: a SPECIFIC, non-secret-named
+# key lookup is not a credential read; a secret-named key, a DYNAMIC key
+# (can't tell), or the environment used wholesale (dumped/iterated/passed to
+# `dict()`, not narrowed by `.get()`/`[]`) all still are.
+#
+# AST-based so `.get("KEY")`/`["KEY"]` can be told apart from every other use
+# of the same `os.environ` node — a flat regex or a parent-less walk cannot:
+# `ast.walk` yields the `os.environ` Attribute inside `os.environ.get(...)`
+# as its own node too, so parent pointers are threaded onto every node
+# first (one `iter_child_nodes` pass) and consulted before classifying it as
+# "used via .get()/[]" vs. "referenced bare — wholesale use". A file that
+# fails to parse exits 2 (distinct from "parsed clean, nothing risky", exit
+# 1) so the caller can fall back to `_CP_PY_ENV_RE`'s original blunt match
+# for text it cannot verify — same conservative-on-unparseable posture as
+# `_cp_python_cred_risk`, in the direction that never widens a hole.
+_cp_python_env_risk() {                 # content -> prints reason, 0 when reserved
+  local hit rc out
+  if _cp_match '\b(putenv|unsetenv)\b' "$1"; then
+    printf 'python mutates the process environment — credential-value access remains human-only\n'
+    return 0
+  fi
+  out="$(printf '%s' "$1" | python3 -c '
+import ast, re, sys
+try:
+    tree = ast.parse(sys.stdin.read())
+except Exception:
+    sys.exit(2)
+for node in ast.walk(tree):
+    for child in ast.iter_child_nodes(node):
+        child.parent = node
+SECRET_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|OP_SERVICE)", re.I)
+
+def const_str(n):
+    return n.value if isinstance(n, ast.Constant) and isinstance(n.value, str) else None
+
+def is_os_environ(n):
+    return isinstance(n, ast.Attribute) and n.attr in ("environ", "environb") and isinstance(n.value, ast.Name) and n.value.id == "os"
+
+def is_getenv_call(n):
+    if not isinstance(n, ast.Call):
+        return False
+    f = n.func
+    if isinstance(f, ast.Name) and f.id == "getenv":
+        return True
+    return isinstance(f, ast.Attribute) and f.attr == "getenv" and isinstance(f.value, ast.Name) and f.value.id == "os"
+
+hit = None
+for node in ast.walk(tree):
+    if is_getenv_call(node):
+        key = const_str(node.args[0]) if node.args else None
+        if key is None or SECRET_RE.search(key):
+            hit = "getenv(%s)" % (repr(key) if key else "<dynamic>")
+            break
+        continue
+    if not is_os_environ(node):
+        continue
+    parent = getattr(node, "parent", None)
+    if isinstance(parent, ast.Attribute) and parent.attr == "get" and parent.value is node:
+        call = getattr(parent, "parent", None)
+        if isinstance(call, ast.Call) and call.func is parent:
+            key = const_str(call.args[0]) if call.args else None
+            if key is None or SECRET_RE.search(key):
+                hit = "os.%s.get(%s)" % (node.attr, repr(key) if key else "<dynamic>")
+                break
+            continue
+    if isinstance(parent, ast.Subscript) and parent.value is node:
+        key = const_str(parent.slice)
+        if key is None or SECRET_RE.search(key):
+            hit = "os.%s[%s]" % (node.attr, repr(key) if key else "<dynamic>")
+            break
+        continue
+    hit = "os.%s" % node.attr
+    break
+if hit:
+    print(hit)
+    sys.exit(0)
+sys.exit(1)
+' 2>/dev/null)"
+  rc=$?
+  case "$rc" in
+    0) hit="$out" ;;
+    1) return 1 ;;
+    *)
+      _cp_match "$_CP_PY_ENV_RE" "$1" || return 1
+      hit="python reads the process environment" ;;
+  esac
+  printf '%s — credential-value access remains human-only\n' "$hit"
+}
+
 # Code by reference judges ONE file, so a file that runs or imports ANOTHER
 # local file is not clean on its own content (red test H4: `. inner.sh`,
 # `source`, a nested `bash x.sh`, `sh -c "$(cat x)"`, `./x`, and a python
@@ -1633,8 +1727,9 @@ except Exception:
   fi
   if [ "$kind" = python ]; then
     res="$(conductor_reserved_reason "$content" python)"
-    [ -n "$res" ] || ! _cp_match "$_CP_PY_ENV_RE" "$content" ||
-      res="python reads the process environment — credential-value access remains human-only"
+    if [ -z "$res" ]; then
+      res="$(_cp_python_env_risk "$content")" || res=""
+    fi
   else
     res="$(conductor_reserved_reason "$content")"
   fi
@@ -3194,7 +3289,16 @@ EOF
   # `.zshenv`/`.docker/config.json`/`.kube/config`/`.netrc`/`.npmrc`
   # are new; the latter two already lived in conductor_reserved_reason's
   # own copy and never made it here.
-  _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.netrc\b|\.npmrc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env[A-Za-z0-9_.-]*\b|\bcredentials\b' "$norm" &&
+  # `\.env[A-Za-z0-9_.-]*\b` used to match here — over-broad, since its
+  # `[A-Za-z0-9_.-]*` tail continuation reads `os.environ`/`os.environb` as
+  # a `.env`-suffixed dotenv path (issue #174): the literal `.` before
+  # `env` is identical whether it comes from a real dotenv filename or a
+  # python attribute access. `\.env(rc\b|[._-][A-Za-z0-9_.-]*\b|\b)` keeps
+  # every real shape (`.env`, `.envrc`, `.env.production`, `.env_local`,
+  # `.env-prod` — verify-command-policy.sh's own fixtures) while requiring
+  # the character right after `env` to be a boundary, `r`+`c`, or one of
+  # `._-`: none of which `environ`'s continuing `i` ever is.
+  _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.netrc\b|\.npmrc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env(rc\b|[._-][A-Za-z0-9_.-]*\b|\b)|\bcredentials\b' "$norm" &&
     _cp_consider 1 "reads credential material — a human must approve"
   # Round 5: `op inject`/`op run`/`op document get`, `gh auth token`/
   # `gh auth status --show-token|-t`, `gcloud auth print-*-token`,
@@ -3392,6 +3496,90 @@ EOF
   return 1
 }
 
+# ---- python-mode credential literal, AST-based (issue #174) ---------------
+# `_cp_cred_shaped_and_not_placeholder` above is a regex over TEXT: it has no
+# idea whether a `KEY[:=]value` shape it found is a real assignment, a dict
+# literal, a type annotation, an f-string format spec (`{tokens:>5}`), or
+# prose inside a docstring — and `scannable_command`'s global quote strip
+# (its own header comment, "blunt global strip") has already erased the one
+# signal (was the value quoted?) that could tell a hardcoded string secret
+# apart from a bare `None`/number/identifier. Applied to python content
+# unchanged, that regex reserved `BYTES_PER_TOKEN = 2.31`, `tokens = None`,
+# an f-string's `{tokens:>5}`, and a docstring's `thresholdTokens: 300000`
+# (issue #174, reproduced from thurber-os's audit_context_budget.py and this
+# repo's own cost-report.py) — none of them a credential.
+#
+# Python content can be parsed for real, so ask the AST instead of guessing
+# from text: a hardcoded secret is a `Name`/`Attribute`/dict-key whose
+# identifier contains KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL, assigned (via
+# `=`, an annotated `:`, or a dict literal) a STRING CONSTANT that fails the
+# same placeholder carve-out as the shell check
+# (`_cp_cred_value_is_placeholder`'s criteria, mirrored here). `None`, a
+# number, a bare name, an `os.environ.get(...)` call, and an f-string's
+# `FormattedValue`/format-spec are none of them a `Constant` string, so they
+# never match — no regex, no guessing about quotes. A file that fails to
+# parse (including a single bisected line, which is not valid python on its
+# own) returns 1: this check contributes nothing for it, same fail-open
+# scope `_cp_python_ast_risk` already has for the OTHER python-only check —
+# every other reserved-list rule in `conductor_reserved_reason` still runs
+# against that content unchanged.
+_cp_python_cred_risk() {                # content -> prints the matched name, 0 when a hardcoded secret literal is found
+  printf '%s' "$1" | python3 -c '
+import ast, re, sys
+try:
+    tree = ast.parse(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+NAME_RE = re.compile(r"(API_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)", re.I)
+PLACEHOLDER_RE = re.compile(r"(test|fake|dummy|probe|example|sample|placeholder|secret)", re.I)
+HIGH_ENTROPY_RE = re.compile(r"[A-Za-z0-9_+/=-]{20,}")
+KNOWN_PREFIXES = ("sk-", "ghp_", "github_pat_", "xox", "AKIA", "eyJ", "ops_")
+
+def is_placeholder(v):
+    if len(v) > 24 or not PLACEHOLDER_RE.search(v) or HIGH_ENTROPY_RE.search(v):
+        return False
+    return not v.startswith(KNOWN_PREFIXES)
+
+def target_name(t):
+    if isinstance(t, ast.Name):
+        return t.id
+    if isinstance(t, ast.Attribute):
+        return t.attr
+    if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and isinstance(t.slice.value, str):
+        return t.slice.value
+    return None
+
+def check(name, value):
+    if name is None or not NAME_RE.search(name):
+        return None
+    if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+        return None
+    return None if is_placeholder(value.value) else name
+
+hit = None
+for n in ast.walk(tree):
+    if isinstance(n, ast.Assign):
+        for t in n.targets:
+            hit = check(target_name(t), n.value)
+            if hit:
+                break
+    elif isinstance(n, ast.AnnAssign) and n.value is not None:
+        hit = check(target_name(n.target), n.value)
+    elif isinstance(n, ast.Dict):
+        for k, v in zip(n.keys, n.values):
+            if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                hit = check(k.value, v)
+                if hit:
+                    break
+    if hit:
+        break
+if hit:
+    print(hit)
+    sys.exit(0)
+sys.exit(1)
+' 2>/dev/null
+}
+
 # ---- git push: an explicit plain branch name, never HEAD or a refspec -----
 # HIGH, 2026-09-24 (round 2, conductor's live probe of tonight's actually-
 # refused commands): the FIRST version of this asked the checkout at a
@@ -3503,14 +3691,21 @@ conductor_reserved_reason() {
   # `.kube/config`, and `op inject`/`op run`/`op document get`/`gh auth
   # token`/`gcloud auth print-*-token`/`fly auth token`/`git credential`/
   # `security dump-keychain`/`security export`.
-  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env[A-Za-z0-9_.-]*\b|\bcredentials\b|\bop[[:space:]]+(read|item[[:space:]]+get|inject|run|document[[:space:]]+get)\b|\bgh[[:space:]]+secret\b|\bgh\b.*\bauth\b.*(\btoken\b|\bstatus\b.*(-t\b|--show-token))|\bgcloud\b.*\bauth\b.*\bprint-(access|identity)-token\b|\b(fly|flyctl)\b.*\bauth\b.*\btoken\b|\bgit\b.*\bcredential(-[A-Za-z0-9_-]+)?\b|\bsecurity[[:space:]]+(find-(generic|internet)-password|dump-keychain|export)\b' "$norm" ||
+  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env(rc\b|[._-][A-Za-z0-9_.-]*\b|\b)|\bcredentials\b|\bop[[:space:]]+(read|item[[:space:]]+get|inject|run|document[[:space:]]+get)\b|\bgh[[:space:]]+secret\b|\bgh\b.*\bauth\b.*(\btoken\b|\bstatus\b.*(-t\b|--show-token))|\bgcloud\b.*\bauth\b.*\bprint-(access|identity)-token\b|\b(fly|flyctl)\b.*\bauth\b.*\btoken\b|\bgit\b.*\bcredential(-[A-Za-z0-9_-]+)?\b|\bsecurity[[:space:]]+(find-(generic|internet)-password|dump-keychain|export)\b' "$norm" ||
      { [ "$mode" != python ] && _cp_env_dump_invoked "$1"; } || _cp_secret_var_expanded "$norm"; then
     printf 'credential-value access remains human-only\n'
   # Terrence's authorized loosening, 2026-09-24: a credential-shaped VALUE
   # typed directly into the command (not a path/command match above) is
   # reserved too, UNLESS it is an obvious test-code placeholder — see
   # _cp_cred_shaped_and_not_placeholder for the exact carve-out.
-  elif _cp_cred_shaped_and_not_placeholder "$norm"; then
+  #
+  # [mode] `python`, issue #174: the shell regex above guesses from
+  # quote-stripped TEXT and cannot tell a real `TOKEN="ghp_…"` assignment
+  # from `tokens = None`, an f-string format spec, or docstring prose — see
+  # `_cp_python_cred_risk`'s header for the repro and why python content
+  # gets the AST-based check instead.
+  elif { [ "$mode" = python ] && _cp_python_cred_risk "$raw" >/dev/null; } ||
+       { [ "$mode" != python ] && _cp_cred_shaped_and_not_placeholder "$norm"; }; then
     printf 'credential-value access remains human-only\n'
   # The curl clause knew only -X / --data / -d, so the upload verbs this same
   # branch identified as exfiltration paths — -T/--upload-file, -F/--form,
