@@ -234,12 +234,16 @@ Built now (this PR):
   module-load identity) and returns `result` unchanged.
 - `scripts/shadow-compare.sh` joins verdicts with approvals / approval_escalated
   (by command sha or collapsed text, never prompt_id) and lists every
-  disagreement; `--autonomy` is the §1 metric. An `approval_escalated` event
-  carries no command, so that half of the join is by pane and a 10-minute window
-  and can mis-attribute under parallel calls; the `via` column says which join
-  produced each row.
+  disagreement; `--autonomy` is the §1 metric. Every join is bound to the call:
+  bash by command sha or collapsed text (omp's `Allow tool: bash ; Command:`
+  prefix stripped), other tools by the tool the panel names. `approval_escalated`
+  records the captured `command` since 2026-09-28; an older event without one
+  joins nothing (pane + time alone produced most of the 41.7% first-gate
+  disagreement). The `via` column says which join produced each row.
 - The menu, scrape, `herdr-select.sh`, edge peer-answer and alert gate are
-  untouched — both paths stay available (Terrence, 2026-09-26).
+  untouched — both paths stay available (Terrence, 2026-09-26) — except that
+  `approval_escalated` now records the command (2026-09-28), and `--gate` check
+  (e) FAILs while any command-less escalation is still inside its window.
 
 Exit criteria for shadow: a week of worker traffic with zero `SHADOW_LOOSER` rows
 that a reviewer cannot explain, `elapsed_ms` p95 recorded, and every
