@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-task.sh <project> <branch> [job-class|auto] [agent-or-command...] [--route deterministic|jev] [--base REF] [--dry-run] [--focus] [--no-secrets] [--brief FILE] [--approval menu|hook]
+# spawn-task.sh <project> <branch> [job-class|auto] [agent-or-command...] [--route deterministic|jev] [--base REF] [--dry-run] [--focus] [--no-secrets] [--brief FILE] [--approval menu|hook] [--tools LIST|all]
 #
 # Every worker starts with the 1Password service-account identity (one vault,
 # 249 items, READ-ONLY) so an unattended run never stops to ask for a
@@ -61,7 +61,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 secrets_req=""
 [ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && secrets_req=withhold
 approval_req=menu
-base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; brief_file=""; project_label=""; route_provider=""; positional=()
+base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; brief_file=""; project_label=""; route_provider=""; tools_req=""; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base="$2"; shift 2 ;;
@@ -85,6 +85,10 @@ while [ $# -gt 0 ]; do
     # config overlay + the enforcing pre-tool hook, recorded on the registry
     # row. Default `menu` is today's approval menu and changes nothing.
     --approval) approval_req="${2:?spawn-task: --approval needs menu or hook}"; shift 2 ;;
+    # omp built-in tool set (lib/agent-profiles.sh tools_for_job). Default:
+    # chosen by job class; `all` = unrestricted; anything else is passed to
+    # `omp --tools` verbatim (omp rejects unknown names at launch).
+    --tools) tools_req="${2:?spawn-task: --tools needs a comma list or all}"; shift 2 ;;
     --dry-run|-n) dry=1; shift ;;
     --focus) foc=--focus; shift ;;
     # Everything after `--` belongs to the worker's own command, flags included.
@@ -145,7 +149,7 @@ model_for() {  # <agent> <job> -> "<model>" or "<model>:<effort>"
 # such below rather than dressed up as enforced.
 m=$(model_for "$agent" "$job")
 managed=1
-if cli=$(cli_for_agent "$agent" "$m" "$posture_req"); then
+if cli=$(cli_for_agent "$agent" "$m" "$posture_req" "$job" "$tools_req"); then
   # Extra flags/args after the agent name ride along %q-quoted — EXCEPT
   # flags that would override the approval posture, rule/extension loading,
   # or the system-prompt channel this script composes (managed_flag_rejected,

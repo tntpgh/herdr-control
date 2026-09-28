@@ -245,10 +245,65 @@ omp_cross_family_model() {   # <from-agent> <bare-model-name> -> "<omp-model> <t
   esac
 }
 
+# ---- tool set by job class ---------------------------------------------------
+# omp's default (--tools omitted) loads EVERY built-in tool's schema into the
+# first request. Measured live (2026-09-27/28, /tmp scratch, `omp -p --mode
+# json --no-session --thinking off "hi"`, summing usage.input+cacheRead+
+# cacheWrite so prompt-cache hits still count): all built-ins ~22.6k tokens;
+# read,bash,edit,write,grep,glob,todo,eval,wait only (no task/yield) ~19.7k;
+# read,bash,grep,glob,todo,web_search only ~17.6k. `manage_skill`, `learn`,
+# `write`, and every xd:// device tool (fleet_status, project_status, …) are
+# EXTENSION tools, not filtered by --tools at all — confirmed live with
+# `--no-tools`, which still left them callable. So `--tools` only ever trims
+# omp's OWN built-ins; an extension tool a job needs is never at risk of
+# being named wrong or dropped.
+#
+# `hub` (248 calls in worker sessions, 2026-09-14..27) is omp's own
+# agent-messaging tool (ops list/inbox/wait), not a herdr-control one. It is
+# NOT in `omp --tools`'s valid list (`--tools=hub` -> "Unknown tool"), and a
+# live probe on 2026-09-28 found it absent from freshly spawned workers both
+# WITH a class tool set and with `--tools all` — so this table neither grants
+# nor removes it. Never add `hub` to a list below: naming a tool omp has not
+# registered makes the launch fail.
+#
+# Every class that changes files (routers send rename/typo/format briefs to
+# `mechanical`; docs is "judgment work", above) keeps `edit`. Only `explore`
+# is trimmed to the read set. `ask` stays in both: it is herdr's structured
+# question channel (omp-herdr-control.ts alerts on it, herdr-select answers
+# it) — without it a worker that needs a decision prints text and goes idle
+# with no prompt_id. It costs ~0.7k tokens (interactive haiku probe, 13,358
+# -> 14,086). `ask` is valid in `--tools` only interactively; `omp -p`
+# rejects it, and workers are never launched with -p.
+#
+#   implement|debug|code|docs|mechanical|quick
+#                                  -> read,bash,edit,write,grep,glob,todo,eval,wait,ask
+#   explore                        -> read,bash,grep,glob,todo,web_search,ask
+#   plan|architect|review|design,
+#   and any unrecognised class     -> "" (all tools — unrestricted)
+#
+# plan/architect/review/design stay unrestricted rather than losing write/
+# edit: nothing in this codebase enforces that a `review` job never writes
+# (it still has to leave notes in PROOF.md, and a reviewer occasionally
+# proposes a diff), so a blanket "reviewers never edit" tool cut would be a
+# guess dressed up as a measurement. An unrecognised class fails the SAME
+# direction as secrets_default_for_job's fail-closed default LOOKS like it
+# should, but isn't: unlike a credential grant, a missing/wrong tool merely
+# breaks the job (a `read`-only worker asked to fix a bug just fails loudly
+# on its first `edit` call) rather than exposing anything, so the safe
+# default here is the FULL set, not the empty one.
+tools_for_job() {  # <job-class> -> comma-separated --tools value, or "" for unrestricted
+  case "$1" in
+    implement|debug|code|docs|mechanical|quick) printf 'read,bash,edit,write,grep,glob,todo,eval,wait,ask\n' ;;
+    explore)                                    printf 'read,bash,grep,glob,todo,web_search,ask\n' ;;
+    *)                             printf '\n' ;;   # plan/architect/review/design + unrecognised: unrestricted
+  esac
+}
+
 # ---- launch command ---------------------------------------------------------
-# cli_for_agent <agent> <model-spec> [posture-request] -> launch command, exit 0.
-# Exit 1 (no stdout) if <agent> isn't a known agent — caller falls back to
-# treating the original argv as a literal command.
+# cli_for_agent <agent> <model-spec> [posture-request] [job-class] [tools-override]
+# -> launch command, exit 0. Exit 1 (no stdout) if <agent> isn't a known
+# agent — caller falls back to treating the original argv as a literal
+# command.
 #
 # The posture argument is a REQUEST, not a setting: it goes through
 # resolved_posture, which composes it against HERDR_POSTURE_FLOOR and returns
@@ -271,8 +326,8 @@ _ap_emit() {                            # <argv...> -> one shell-safe launch lin
 }
 
 cli_for_agent() {
-  local a="$1" spec="$2" want="${3:-}" m e posture flag
-  local has_effort alt alt_model models
+  local a="$1" spec="$2" want="${3:-}" job="${4:-}" tools_req="${5:-}" m e posture flag
+  local has_effort alt alt_model models tools
   local -a argv
   posture="$(resolved_posture "$want")"
   case "$a" in
@@ -321,6 +376,19 @@ cli_for_agent() {
     *)
       return 1 ;;
   esac
+  # --tools trims omp's OWN built-ins (tools_for_job, above) — never emitted
+  # for omc, which launches the real claude binary and has no such flag.
+  # tools_req (the spawner's own --tools override) wins over the job-class
+  # table: "all" forces unrestricted, anything else is used verbatim, "" (the
+  # default) falls through to the table.
+  if [ "${argv[0]}" = omp ]; then
+    case "$tools_req" in
+      all) tools="" ;;
+      "")  tools="$(tools_for_job "$job")" ;;
+      *)   tools="$tools_req" ;;
+    esac
+    [ -n "$tools" ] && argv+=(--tools "$tools")
+  fi
   # $flag word-splits on purpose: its values come only from
   # posture_flag_for_agent's own fixed table ("--approval-mode write" is two
   # argv elements), never from caller input.
@@ -357,6 +425,7 @@ managed_flag_rejected() {               # <arg> -> exit 0 if forbidden on a mana
     --config|--config=*|--profile|--profile=*|--cwd|--cwd=*|\
     --hook|--hook=*|-e|--extension|--extension=*|--plugin-dir|--plugin-dir=*|--plugin-url|--plugin-url=*|\
     --mcp-config|--mcp-config=*|--strict-mcp-config|--agents|--agents=*|\
+    --tools|--tools=*|--no-tools|\
     --add-dir|--add-dir=*)
       return 0 ;;
   esac
