@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.herdr-control.cost-report</string>
+	<key>ProgramArguments</key>
+	<array>
+		<!-- cost-report.py reads only local session files and writes one JSON
+		     file; it never reaches `op`, so no service-account file is sourced.
+		     Render: __COST_REPORT_PY__ -> this checkout's cost-report.py,
+		     __LOG_PATH__ -> ~/Library/Logs/herdr-control-cost-report.log. -->
+		<string>/usr/bin/env</string>
+		<string>python3</string>
+		<string>__COST_REPORT_PY__</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<!-- Belt and braces, same as the hub: nothing here calls `op`, but a
+		     job that ever does must fail fast rather than paint a Touch ID
+		     prompt nobody is there to answer. -->
+		<key>OP_BIOMETRIC_UNLOCK_ENABLED</key>
+		<string>false</string>
+	</dict>
+	<!-- Hourly: the hub card calls the report stale after 3 hours. -->
+	<key>StartInterval</key>
+	<integer>3600</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__LOG_PATH__</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_PATH__</string>
+</dict>
+</plist>

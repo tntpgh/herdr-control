@@ -1830,5 +1830,126 @@ class EdgeCoalescing(unittest.TestCase):
         self.assertEqual(len(hub._EDGE_INFLIGHT), 2)
 
 
+_cr_spec = importlib.util.spec_from_file_location("cost_report", Path(__file__).with_name("cost-report.py"))
+cost_report = importlib.util.module_from_spec(_cr_spec)
+_cr_spec.loader.exec_module(cost_report)
+
+
+class CostReport(unittest.TestCase):
+    """Spend the operator can see without running a query.
+
+    cost-report.py reads omp's session transcripts, which carry client PII, so
+    every fixture here is synthetic and the assertions pin the one promise that
+    matters most: aggregates come out, message content never does. The hub side
+    must degrade like every other card — absent, malformed and stale are all
+    answers the page gives, never a page that fails to render."""
+
+    NOW = dt.datetime(2026, 9, 28, 12, tzinfo=dt.timezone.utc)
+    SECRET = "client-address-must-not-appear"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.sessions = self.root / "sessions"
+
+    def session(self, name, cwd, turns):
+        """turns: (hours_before_NOW, cost, context_tokens)."""
+        d = self.sessions / name
+        d.mkdir(parents=True, exist_ok=True)
+        lines = [{"type": "title", "title": self.SECRET},
+                 {"type": "session", "id": f"{name}-0000-sess", "cwd": cwd,
+                  "timestamp": (self.NOW - dt.timedelta(days=20)).isoformat()}]
+        for hours, cost, ctx in turns:
+            ts = (self.NOW - dt.timedelta(hours=hours)).isoformat()
+            lines.append({"type": "message", "timestamp": ts, "message": {
+                "role": "assistant", "content": [{"type": "text", "text": self.SECRET}],
+                "usage": {"input": 1, "output": 5, "cacheRead": ctx - 1, "cacheWrite": 0,
+                          "cost": {"input": 0, "output": 0, "cacheRead": cost, "cacheWrite": 0,
+                                   "total": cost}}}})
+        lines.append("{torn half-written line")
+        f = d / "s.jsonl"
+        f.write_text("\n".join(x if isinstance(x, str) else json.dumps(x) for x in lines) + "\n")
+        os.utime(f, (self.NOW.timestamp(), self.NOW.timestamp()))
+
+    def build(self):
+        with patch.object(cost_report, "HERDR_WORKTREES", self.root / ".herdr/worktrees"), \
+             patch.object(cost_report, "CODE_WORKTREES", self.root / "Code/.worktrees"), \
+             patch.object(cost_report, "CODE", self.root / "Code"):
+            return cost_report.build_report(self.sessions, None, 7, self.NOW)
+
+    def test_windows_repos_and_the_cap_split_are_counted_separately(self):
+        cap = dt.datetime.fromisoformat(cost_report.CAP_LIVE_AT)
+        since_cap_h = (self.NOW - cap).total_seconds() / 3600 - 1  # 1h after the cap
+        self.session("a", str(self.root / ".herdr/worktrees/tourguide/fix/x"),
+                     [(2, 1.5, 100_000), (since_cap_h, 2.0, 400_000), (24 * 9, 7.0, 500_000)])
+        self.session("b", str(self.root / "Code/knowledge-base"), [(since_cap_h + 3, 0.5, 350_000)])
+        self.session("c", str(self.root / "Code/.hc-smoke.AbC123"), [(3, 0.25, 10)])
+        r = self.build()
+        self.assertAlmostEqual(r["total_cost"], 4.25)
+        self.assertAlmostEqual(r["prev_total_cost"], 7.0)
+        self.assertEqual(r["cost_by_repo"], {"tourguide": 3.5, "knowledge-base": 0.5, "other": 0.25})
+        # 400k (after the cap) and 350k (before it) are both over 300k in-window;
+        # only the first says the cap failed. The 500k turn is last week's.
+        self.assertEqual((r["turns_over_300k"], r["turns_over_300k_since_cap"],
+                          r["prev_turns_over_300k"]), (2, 1, 1))
+        top = r["top_sessions"][0]
+        self.assertEqual((top["repo"], top["turns"], top["max_context"]), ("tourguide", 2, 400_000))
+        self.assertNotIn(self.SECRET, json.dumps(r) + cost_report.render_table(r))
+
+    def write_report(self, **kw):
+        rep = {"total_cost": 100.0, "prev_total_cost": 100.0, "turns_over_300k_since_cap": 0,
+               "context_alert_threshold": 300_000, "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+               "top_sessions": [{"id_prefix": "01a0c5f0", "repo": "thurber-os", "cost": 58.3,
+                                 "turns": 400, "max_context": 856_441}],
+               "cost_by_repo": {"thurber-os": 58.3}}
+        rep.update(kw)
+        path = self.root / "cost-report.json"
+        path.write_text(json.dumps(rep))
+        return path
+
+    def data(self, path):
+        with patch.object(hub, "COST_REPORT", path):
+            return hub.cost_report_data()
+
+    def test_a_fresh_flat_week_raises_no_alert(self):
+        d = self.data(self.write_report())
+        self.assertEqual((d["present"], d["alerts"]), (True, []))
+
+    def test_each_reason_to_look_raises_its_own_alert(self):
+        stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)).isoformat()
+        cases = {"cap": ({"turns_over_300k_since_cap": 3}, "since the compaction cap"),
+                 "growth": ({"total_cost": 126.0}, "week over week"),
+                 "stale": ({"generated_at": stale}, "stale"),
+                 "no timestamp": ({"generated_at": None}, "stale")}
+        for label, (kw, needle) in cases.items():
+            with self.subTest(label):
+                alerts = self.data(self.write_report(**kw))["alerts"]
+                self.assertEqual(len(alerts), 1, alerts)
+                self.assertIn(needle, alerts[0])
+
+    def test_absent_malformed_and_shapeless_reports_degrade_to_an_answer(self):
+        self.assertEqual(self.data(self.root / "missing.json"), {"present": False})
+        bad = self.root / "bad.json"
+        bad.write_text("{not json")
+        self.assertIn("JSONDecodeError", self.data(bad)["error"])
+        bad.write_text('{"top_sessions": []}')
+        self.assertIn("no total_cost", self.data(bad)["error"])
+
+    def test_the_overview_shows_the_card_hot_and_the_section_escaped(self):
+        path = self.write_report(turns_over_300k_since_cap=2,
+                                 cost_by_repo={"<script>x</script>": 1.0})
+        caches = {name: Mock(get=lambda: {}, peek=lambda: {}) for name in hub.CACHES}
+        caches["cost"] = hub.Cached(0, hub.cost_report_data, name="cost")
+        with patch.dict(hub.CACHES, caches), patch.object(hub, "COST_REPORT", path):
+            html_out = hub.render_overview()
+        card = re.search(r"<a class='card hot' href='#cost'>.*?</a>", html_out)
+        self.assertIsNotNone(card, "a turn over 300k since the cap must make the card hot")
+        self.assertIn("$100", card.group(0))
+        self.assertIn("<h2 id=cost>LLM spend</h2>", html_out)
+        self.assertIn("856,441", html_out)
+        self.assertNotIn("<script>x</script>", html_out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

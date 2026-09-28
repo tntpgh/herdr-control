@@ -2458,6 +2458,67 @@ def handoff_debt_data() -> dict:
             "lesson_debt": sum(1 for r in rows if r["lesson_debt"])}
 
 
+# Written hourly by cost-report.py (its LaunchAgent). Same env override the
+# writer honours, so a test or a relocated state dir moves both ends at once.
+COST_REPORT = Path(os.environ.get("HERDR_COST_REPORT_PATH", STATE / "cost-report.json"))
+# Hourly writer; three missed runs means the job stopped, and a spend number
+# that silently stops moving reads exactly like a quiet week.
+COST_REPORT_STALE_S = 3 * 3600
+# Week-over-week growth past this is worth a look even with no single outlier.
+COST_GROWTH_ALERT = 1.25
+
+
+def cost_report_data() -> dict:
+    """The last cost-report.py snapshot plus the three reasons to look at it.
+
+    Absent is not an error (the job may not be installed yet); unreadable,
+    shapeless and stale are, because each would otherwise show a number that
+    is no longer true."""
+    try:
+        d = json.loads(COST_REPORT.read_text())
+    except FileNotFoundError:
+        return {"present": False}
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"present": False, "error": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(d, dict) or not isinstance(d.get("total_cost"), (int, float)):
+        return {"present": False, "error": "cost-report.json has no total_cost"}
+    alerts = []
+    try:
+        gen = dt.datetime.fromisoformat(str(d.get("generated_at")).replace("Z", "+00:00"))
+        age = (dt.datetime.now(dt.timezone.utc) - gen).total_seconds()
+    except (TypeError, ValueError):
+        age = None
+    if age is None or age > COST_REPORT_STALE_S:
+        alerts.append("report is stale — is the cost-report job running?")
+    if d.get("turns_over_300k_since_cap"):
+        alerts.append(f"{d['turns_over_300k_since_cap']} turn(s) over "
+                      f"{d.get('context_alert_threshold', 300_000):,} context since the compaction cap")
+    prev = d.get("prev_total_cost") or 0
+    if prev and d["total_cost"] > prev * COST_GROWTH_ALERT:
+        alerts.append(f"spend up {(d['total_cost'] - prev) / prev * 100:.0f}% week over week")
+    return dict(d, present=True, alerts=alerts)
+
+
+def cost_rows(c: dict) -> str:
+    """Alerts first, then the sessions that cost the most, then spend by repo."""
+    if c.get("error"):
+        return f"<tr class=hot><td>{_esc(c['error'])}</td></tr>"
+    if not c.get("present"):
+        return "<tr><td class=dim>no cost report yet (cost-report.py has not run)</td></tr>"
+    out = [f"<tr class=hot><td colspan=5><span class='pill hot'>alert</span> {_esc(a)}</td></tr>"
+           for a in c.get("alerts", [])]
+    out.append("<tr><th>session</th><th>repo</th><th>cost</th><th>turns</th><th>max context</th></tr>")
+    for s in c.get("top_sessions") or []:
+        hot = (s.get("max_context") or 0) > c.get("context_alert_threshold", 300_000)
+        out.append(f"<tr{' class=hot' if hot else ''}><td>{_esc(s.get('id_prefix'))}</td>"
+                   f"<td>{_esc(s.get('repo'))}</td><td>${s.get('cost', 0):,.2f}</td>"
+                   f"<td>{s.get('turns', 0)}</td><td>{s.get('max_context', 0):,}</td></tr>")
+    repos = " · ".join(f"{_esc(r)} ${v:,.0f}" for r, v in (c.get("cost_by_repo") or {}).items())
+    out.append(f"<tr><td colspan=5 class=dim>by repo: {repos or '—'} · "
+               f"generated {_age(c.get('generated_at'))} ago</td></tr>")
+    return "".join(out)
+
+
 # ── deploy drift: is the code THIS PROCESS runs still what origin/main says? ──
 # The hub ran 3417af0 for hours while origin/main had fixes ahead of it, and
 # kb-deploy (KB_DEPLOY, above) lags until its nightly run — nobody saw either
@@ -2557,6 +2618,8 @@ CACHES = {
     # One local file read of a few lines: cheaper than the registry query
     # above, so it is filled inline like the other two and never served stale.
     "debt": Cached(5, handoff_debt_data, name="debt"),
+    # One local JSON read, rewritten hourly by cost-report.py.
+    "cost": Cached(30, cost_report_data, name="cost"),
     # Network-backed: ~350ms each, so a reader gets the stale value and the
     # refresh happens behind them.
     "search": Cached(120, search_data, stale_ok=True, name="search"),
@@ -3292,7 +3355,7 @@ def deploy_drift_rows(dd: dict) -> str:
 
 
 def render_overview(scope: str = "") -> str:
-    h_all, f, s, k, l, lo, dbt, pd, dd = (CACHES[n].get() for n in ("herdr", "forms", "search", "kb", "links", "loops", "debt", "portal", "deploy_drift"))
+    h_all, f, s, k, l, lo, dbt, pd, dd, cst = (CACHES[n].get() for n in ("herdr", "forms", "search", "kb", "links", "loops", "debt", "portal", "deploy_drift", "cost"))
     # Handoff debt (#102) is per-REPO in its own right, so it narrows with the
     # scope like everything else on this page; the ledger rows carry a repo.
     h = scoped(h_all, scope)
@@ -3348,6 +3411,13 @@ def render_overview(scope: str = "") -> str:
         ("#deploy-drift", f"{dd_in_sync}/{len(dd_repos)}", "in sync (deploy drift)",
          "; ".join(_drift_label(r) for r in dd_repos) if dd_repos else "no repos configured",
          bool(dd_bad) or bool(dd_unverified) or any((r.get("behind_minutes") or 0) > 30 for r in dd_drifted)),
+        # Machine-wide like deploy drift: spend is not narrowed by scope.
+        ("#cost", f"${cst['total_cost']:,.0f}" if cst.get("present") else "—", "LLM spend (7 days)",
+         cst.get("error") or ("; ".join(cst.get("alerts") or [])
+                              or (f"{(cst['total_cost'] - cst['prev_total_cost']) / cst['prev_total_cost'] * 100:+.0f}% vs prior week"
+                                  if cst.get("present") and cst.get("prev_total_cost") else
+                                  ("no prior-week data" if cst.get("present") else "cost-report.py has not run"))),
+         bool(cst.get("error")) or bool(cst.get("alerts"))),
     ]
     body = scope_chips(h_all, "/", scope) + "<div class=cards>" + "".join(
         f"<a class='card {'hot' if hot else ''}' href='{href}'><div class=t>{t}</div><div class=n>{n}</div><div class=s>{_esc(sub)}</div></a>"
@@ -3357,6 +3427,7 @@ def render_overview(scope: str = "") -> str:
     # is an answer the page gives rather than a section that silently vanished.
     body += "<h2 id=handoff-debt>Unpaid handoff debt</h2><table>" + debt_rows(dbt) + "</table>"
     body += "<h2 id=deploy-drift>Deploy drift</h2><table>" + deploy_drift_rows(dd) + "</table>"
+    body += "<h2 id=cost>LLM spend</h2><table>" + cost_rows(cst) + "</table>"
     if f.get("open"):
         body += "<h2>Open decisions</h2><table>" + "".join(
             f"<tr class=hot><td><span class='pill hot'>open</span></td><td><a href='/decisions'>{_esc(x.get('title') or x['id'])}</a>"
