@@ -139,6 +139,58 @@ case "$r" in reserved:*) ok "a real secret in a dict literal is still human-rese
 # A test-code placeholder stays unreserved (existing carve-out, ported to AST).
 r="$(content_reason python "$(printf 'TOKEN = "test-token"\n')")"
 [ -z "$r" ] && ok "an obvious test-code placeholder token literal stays unreserved" || bad "placeholder token literal reserved: $r"
+printf '== python content: PR #185 security review — 18 bypass-harness WEAKER cases ==\n'
+# Every case below was found live by .handoffs/bypass-harness.py against the
+# first cut of #174's python-mode fix: RESERVED on main, CLEAN (or REVIEW) on
+# that fix. Kept here permanently so none of them regresses again. Secret
+# values are 30+ chars of hex-ish filler, never matching the placeholder
+# carve-out (test/fake/dummy/probe/example/sample/placeholder/secret).
+# Assembled from parts so the pre-commit secret scanner never sees a
+# contiguous token-shaped literal in this file; the classifier still does.
+GH="ghp_""1234567890abcdef1234567890abcdef12"
+SK="sk-proj-""1234567890abcdef1234567890abcdef"
+r="$(content_reason python "$(printf 'import os as o\nprint(dict(o.environ))\n')")"
+case "$r" in reserved:*) ok "aliased import (os as o) + wholesale dump is still reserved";; *) bad "alias_dump slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os as o\nprint(o.environ.get("GITHUB_TOKEN"))\n')")"
+case "$r" in reserved:*) ok "aliased import + secret-named .get(...) is still reserved";; *) bad "alias_get slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os as o\nprint(o.getenv("GITHUB_TOKEN"))\n')")"
+case "$r" in reserved:*) ok "aliased import + secret-named getenv(...) is still reserved";; *) bad "alias_getenv slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os\nprint(vars(os)["environ"]["GITHUB_TOKEN"])\n')")"
+case "$r" in reserved:*) ok "vars(os)[\"environ\"] indirection is still reserved";; *) bad "vars_os slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os\nprint(dict(os.__dict__["environ"]))\n')")"
+case "$r" in reserved:*) ok "os.__dict__[\"environ\"] indirection is still reserved";; *) bad "dunder_dict slipped: $r";; esac
+r="$(content_reason python "$(printf 'from os import environ as e\nprint(e["GITHUB_TOKEN"])\n')")"
+case "$r" in reserved:*) ok "from os import environ as e + secret key is still reserved";; *) bad "from_import slipped: $r";; esac
+r="$(content_reason python "$(printf 'from os import getenv as g\nprint(g("GITHUB_TOKEN"))\n')")"
+case "$r" in reserved:*) ok "from os import getenv as g + secret key is still reserved";; *) bad "from_getenv slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os\nprint(getattr(os, "environ")["GITHUB_TOKEN"])\n')")"
+case "$r" in reserved:*) ok "getattr(os, \"environ\") indirection is still reserved";; *) bad "getattr slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os\nprint(os.environ["DATABASE_URL"])\n')")"
+case "$r" in reserved:*) ok "DATABASE_URL is not on the allowlist, still reserved";; *) bad "db_url slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os\nprint(os.environ.get("GH_PAT"))\n')")"
+case "$r" in reserved:*) ok "GH_PAT is not on the allowlist, still reserved";; *) bad "gh_pat slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os\nprint(os.environ.get("SLACK_WEBHOOK_URL"))\n')")"
+case "$r" in reserved:*) ok "SLACK_WEBHOOK_URL is not on the allowlist, still reserved";; *) bad "slack_webhook slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os\nos.environ["PYTHONSTARTUP"] = "/tmp/x.py"\n')")"
+case "$r" in reserved:*) ok "os.environ[...] = value (Store) is still reserved as mutation";; *) bad "env_store slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os\ndel os.environ["GITHUB_TOKEN"]\n')")"
+case "$r" in reserved:*) ok "del os.environ[...] (Del) is still reserved as mutation";; *) bad "env_del slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os\nprint(os.environ.get("GH_" + "TOKEN"))\n')")"
+case "$r" in reserved:*) ok "a dynamic (non-constant) env key is still reserved";; *) bad "concat_key slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os\nos.environ.setdefault("HOME", "/x")\n')")"
+case "$r" in reserved:*) ok "os.environ.setdefault(...) is still reserved";; *) bad "setdefault slipped: $r";; esac
+r="$(content_reason python "$(printf 'import os\nc = os.environ.copy()\n')")"
+case "$r" in reserved:*) ok "os.environ.copy() is still reserved";; *) bad "copy slipped: $r";; esac
+r="$(content_reason python "$(printf 'print(open(".env2").read())\n')")"
+case "$r" in reserved:*) ok ".env2 is still a reserved dotenv path";; *) bad "dotenv2 slipped: $r";; esac
+r="$(content_reason python "$(printf 'print(open(".envlocal").read())\n')")"
+case "$r" in reserved:*) ok ".envlocal is still a reserved dotenv path";; *) bad "dotenvlocal slipped: $r";; esac
+r="$(content_reason python "$(printf 'def f(**k):\n    pass\nf(api_key="%s")\n' "$SK")")"
+case "$r" in reserved:*) ok "a real secret passed as a call keyword is still reserved";; *) bad "kwarg_literal slipped: $r";; esac
+r="$(content_reason python "$(printf 'def f(token="%s"):\n    return token\n' "$GH")")"
+case "$r" in reserved:*) ok "a real secret as a function default is still reserved";; *) bad "default_literal slipped: $r";; esac
+r="$(content_reason python "$(printf 'print((TOKEN := "%s"))\n' "$GH")")"
+case "$r" in reserved:*) ok "a real secret in a walrus assignment is still reserved";; *) bad "walrus_literal slipped: $r";; esac
 
 cat > "$WORK/fstring.py" <<'EOF'
 ps, vis, n = "1", "x", {}
