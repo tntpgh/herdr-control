@@ -121,22 +121,39 @@ _sp_command_region() {
 # different command (a hidden `; rm -rf`, an injected second statement) does
 # not equal `recorded` under either join and still returns 2.
 #
-# fix/approve-wrapped-commands security review, F3/F4 defence in depth: a
-# wrap-join match is trusted only when the SPACE-join reading of the SAME
-# rows (`region`, already computed above) ALSO classifies `allow`. The
-# panel's own rows cannot say whether a row boundary is a real terminal
-# wrap or a genuine second statement/lost space, so wrap-join's glue is a
-# best-effort candidate, never proof; requiring the plain space-join
-# reading to independently classify allow catches the cases where gluing
-# (or a wrap that happened to land on a space) changed what the command
-# actually does — a stray extra argument, a second statement — even though
-# the glued text happens to equal `recorded` exactly. `region` is always
-# the classifier's own text, never substituted for `recorded`.
+# fix/approve-wrapped-commands security review round 1, F3/F4 defence in
+# depth: a wrap-join match is trusted only when the SPACE-join reading of
+# the SAME rows (`region`, already computed above) ALSO classifies
+# `allow`. The panel's own rows cannot say whether a row boundary is a
+# real terminal wrap or a genuine second statement/lost space, so
+# wrap-join's glue is a best-effort candidate, never proof; requiring the
+# plain space-join reading to independently classify allow catches the
+# cases where gluing (or a wrap that happened to land on a space) changed
+# what the command actually does — a stray extra argument, a second
+# statement — even though the glued text happens to equal `recorded`
+# exactly.
+#
+# Round 2, N6: classify_command alone is not the whole judgment —
+# herdr-select.sh and alert-gate.sh both also apply
+# conductor_reserved_reason to whatever text they judge, so a mis-keyed
+# space-join region that is human-reserved (credential-value access,
+# `.netrc`, …) must be rejected here too, not just an escalate/deny
+# verdict; the glued reading alone not being reserved is not enough.
+# `region` is always the classifier's own text, never substituted for
+# `recorded`.
 approval_command_text() {               # panel recorded [wrapjoin_panel]
   local panel="$1" recorded="$2" wrapjoin="${3:-}" region pc rc wregion
   if [ -z "$recorded" ]; then printf '%s' "$panel"; return 0; fi
   region="$(_sp_command_region "$panel")"
   if [ -z "$region" ]; then
+    # Round 2, N4/N7 follow-up: an EMPTY panel (corroboration_candidates
+    # fell back to nothing at all -- the command_both read was refused,
+    # and the caller had no earlier capture either) has nothing to
+    # disagree with a non-empty `recorded` about, but "nothing to
+    # disagree with" is not the same claim as "the numbered/label-less
+    # whole-window shape, which is legitimately blank-of-label but still
+    # actually SHOWS something" -- only the latter is trusted as-is.
+    if [ -z "$panel" ]; then return 2; fi
     if [ -n "${panel//[[:space:]]/}" ]; then return 2; fi
     printf '%s' "$panel"; return 0
   fi
@@ -147,8 +164,16 @@ approval_command_text() {               # panel recorded [wrapjoin_panel]
   fi
   if [ -n "$wrapjoin" ]; then
     wregion="$(_sp_command_region "$wrapjoin")"
+    # N6 (round-2 security review): classify_command alone is not the full
+    # herdr-select judgment -- conductor_reserved_reason (checked
+    # separately by callers, e.g. herdr-select.sh, alert-gate.sh) can
+    # reserve a command classify_command itself calls allow. A mis-keyed
+    # row whose SPACE-join reading is reserved (credential-value access,
+    # .netrc, …) must not corroborate just because its GLUED reading
+    # happens not to be, so both checks run on the same space-join region.
     if [ -n "$wregion" ] && [ "$(_sp_collapse_ws "$wregion")" = "$rc" ] \
-       && [ "$(classify_command "$region")" = allow ]; then
+       && [ "$(classify_command "$region")" = allow ] \
+       && [ -z "$(conductor_reserved_reason "$region")" ]; then
       printf '%s' "$recorded"; return 0
     fi
   fi
