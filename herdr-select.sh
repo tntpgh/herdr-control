@@ -394,9 +394,22 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
   # after whitespace-collapse, same as $cmd_text; a hidden extra statement or
   # an injected row that does not equal the registry text corroborates under
   # neither join and still refuses below.
+  #
+  # F6: both candidates come from the SAME screen snapshot
+  # (corroboration_candidates, lib/scoped-policy.sh) rather than two
+  # independent `herdr pane read` calls that could straddle a repaint --
+  # CC_PANEL replaces cmd_text as the comparison text ONLY when the pane is
+  # a complete menu right now; a numbered or unparseable shape leaves
+  # corrob_panel as the already-captured cmd_text, unchanged from before
+  # this fix.
+  corrob_panel="$cmd_text"
   wrapjoin_text=""
-  [ "$mechanism" = menu ] && wrapjoin_text="$(prompt_menu_command_wrapjoin "$pane" 2>/dev/null || printf '')"
-  cmd_text="$(approval_command_text "$cmd_text" "$registry_cmd" "$wrapjoin_text")" || {
+  if [ "$mechanism" = menu ]; then
+    corroboration_candidates "$pane" "$cmd_text"
+    corrob_panel="$CC_PANEL"
+    wrapjoin_text="$CC_WRAPJOIN"
+  fi
+  cmd_text="$(approval_command_text "$corrob_panel" "$registry_cmd" "$wrapjoin_text")" || {
     # approval_command_text prints nothing on a mismatch, so the assignment
     # above left cmd_text empty: restore the scrape BEFORE refusing, or the
     # refusal's approval_escalated event records command:"" (PR #181 F1).

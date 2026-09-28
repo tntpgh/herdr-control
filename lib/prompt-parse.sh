@@ -548,6 +548,13 @@ highlight = re.compile(r"\x1b\[48;2;[0-9]+;[0-9]+;[0-9]+m")
 lines = []
 state = 0
 question = []
+# fix/approve-wrapped-commands security review (F3): the RAW rendered
+# length (ANSI stripped, border included, before any body/text stripping)
+# of each row that lands in `question`, same indices. command_wrapjoin
+# glues a boundary with no separator only when the row ABOVE it reached
+# this panels own widest row -- a wrap only ever continues a row that
+# filled the terminal; a short non-final row is a real line break.
+question_rawlen = []
 selected = ""
 invalid = complete = visible = False
 truncated = False
@@ -699,6 +706,7 @@ for line in lines:
     if state == 0 and text.startswith("Allow tool:"):
         pending_running = list(running_lines)
         state, question, selected = 1, [text], ""
+        question_rawlen = [len(plain.rstrip("\r\n"))]
         invalid = complete = visible = False
         continue
     if state == 0:
@@ -750,6 +758,7 @@ for line in lines:
         state, n = 3, "2"
     elif state == 1:
         question.append(body)
+        question_rawlen.append(len(plain.rstrip("\r\n")))
         continue
     else:
         invalid = True
@@ -802,12 +811,53 @@ if not complete:
                     invalid = invalid or bool(selected)
                     selected = n
             question = ["[header off-screen]"]
+            question_rawlen = [-1]
             for k in range(max(0, rows["Approve"] - 6), rows["Approve"]):
                 b = re.sub(r"^[\s\u2502]+", "", ansi.sub("", lines[k])).rstrip(" \t\r\n\u2502\u2500\u256e")
                 if b:
                     question.append(b)
+                    question_rawlen.append(len(ansi.sub("", lines[k]).rstrip("\r\n")))
             if invalid:
                 complete = False
+# _wrapjoin(q, qlen) -> the mid-token wrap-join candidate for the
+# Command:/run: row onward, or None when no such row exists in q.
+#
+# fix/approve-wrapped-commands security review, F2: a panel with no
+# Command:/run: row at all (a header-only browser call, say) must never
+# fabricate one by gluing the tool-name header onto whatever text follows
+# -- so this returns None, never a guess, when no label row is found. The
+# head (everything through the label row itself) is joined with a plain
+# space, byte-identical to "command" mode; only rows AFTER the label row
+# are candidates for a no-separator glue.
+#
+# F3: a terminal only wraps a row that filled the pane -- so glue a
+# boundary with no separator only when the row immediately above it
+# reached this panels own widest captured row (qlen may be shorter than q,
+# or hold a -1 sentinel, for the header-off-screen fallback shape; treat
+# that as an unknown width, which never equals the max, so every such
+# boundary degrades to a plain space -- the same safe reading "command"
+# mode already produces).
+def _wrapjoin(q, qlen):
+    idx = None
+    for i, row in enumerate(q):
+        if row.startswith("Command:") or row.startswith("run:"):
+            idx = i
+            break
+    if idx is None:
+        return None
+    head, tail = q[:idx], q[idx:]
+    text = " ".join(head + tail[:1])
+    if len(qlen) == len(q):
+        width = max(qlen)
+        tail_len = qlen[idx:]
+    else:
+        width, tail_len = -1, [-1] * len(tail)
+    for i in range(1, len(tail)):
+        sep = "" if tail_len[i - 1] == width else " "
+        text += sep + tail[i]
+    return text
+
+
 mode = sys.argv[1]
 if mode == "visible":
     sys.exit(0 if visible else 1)
@@ -840,29 +890,19 @@ elif mode == "command_rows":
             break
     print(len([r for r in rows if r.strip()]), end="")
 elif mode == "command_wrapjoin":
-    # A candidate reconstruction for a MID-TOKEN terminal wrap: the same rows
-    # as "command" mode, but the rows from Command:/run: onward are joined
-    # with NO separator instead of a space. "command" modes space-join
-    # already corroborates a WORD-BOUNDARY wrap (the terminal wrapped between
-    # two arguments, so a space belongs between the rows); a wrap that splits
-    # a single token in two ("...tntpgh/h" / "erdr-control/...") needs the
-    # rows glued with nothing between them to reproduce the original text.
-    # Both are candidates, never a verdict on their own: herdr-select.sh only
-    # trusts whichever one, after whitespace-collapse, equals the SEPARATE
-    # hook-recorded command (lib/scoped-policy.sh approval_command_text) --
-    # this mode only supplies the second candidate string. No apostrophes in
-    # here: this whole parser is a single-quoted shell argument.
-    if len(question) == 1 and pending_running:
-        question = question + pending_running
-    idx = 0
-    for i, row in enumerate(question):
-        if row.startswith("Command:") or row.startswith("run:"):
-            idx = i
-            break
-    head, tail = question[:idx], question[idx:]
-    text = " ".join(head + tail[:1])
-    text += "".join(tail[1:])
-    print(text, end="")
+    # A candidate reconstruction for a MID-TOKEN terminal wrap -- see
+    # _wrapjoin above for the F2/F3 rules (no label row -> nothing; glue
+    # only past the label row, only at a full-width boundary). Both this
+    # and "command" are candidates, never a verdict on their own:
+    # herdr-select.sh only trusts whichever one, after whitespace-collapse,
+    # equals the SEPARATE hook-recorded command
+    # (lib/scoped-policy.sh approval_command_text) -- this mode only
+    # supplies the second candidate string. No apostrophes in here: this
+    # whole parser is a single-quoted shell argument.
+    wj = _wrapjoin(question, question_rawlen)
+    if wj is None:
+        sys.exit(1)
+    print(wj, end="")
 elif mode == "command":
     # For CLASSIFICATION ONLY (lib/command-policy.sh via prompt_command_text
     # below), never for display or prompt_id: `" ; "` is a real shell
@@ -885,6 +925,17 @@ elif mode == "command":
     if len(question) == 1 and pending_running:
         question = question + pending_running
     print(" ".join(question), end="")
+elif mode == "command_both":
+    # fix/approve-wrapped-commands security review, F6: ONE parser call,
+    # ONE `herdr pane read`, emitting BOTH corroboration candidates so a
+    # caller never pairs a space-join from one screen with a wrap-join
+    # from a later, possibly repainted one. Output is
+    # "<space-join>\x1e<wrap-join-or-empty>"; \x1e (ASCII record
+    # separator) is not producible from a bash command line the caller
+    # would ever need to split on, unlike a space or a newline.
+    sp_q = question + pending_running if len(question) == 1 and pending_running else question
+    wj = _wrapjoin(question, question_rawlen)
+    sys.stdout.write(" ".join(sp_q) + "\x1e" + (wj if wj is not None else ""))
 ' "$1"
 }
 
@@ -894,6 +945,7 @@ prompt_menu_question() { _prompt_menu "$1" question; }
 prompt_menu_command()  { _prompt_menu "$1" command; }
 prompt_menu_command_rows() { _prompt_menu "$1" command_rows; }
 prompt_menu_command_wrapjoin() { _prompt_menu "$1" command_wrapjoin; }
+prompt_menu_command_both() { _prompt_menu "$1" command_both; }
 prompt_menu_visible()  { _prompt_menu "$1" visible; }
 
 # "Is EITHER prompt shape on screen?", from ONE pane read.

@@ -120,6 +120,18 @@ _sp_command_region() {
 # EQUALS `recorded` exactly. It never widens what corroborates — a genuinely
 # different command (a hidden `; rm -rf`, an injected second statement) does
 # not equal `recorded` under either join and still returns 2.
+#
+# fix/approve-wrapped-commands security review, F3/F4 defence in depth: a
+# wrap-join match is trusted only when the SPACE-join reading of the SAME
+# rows (`region`, already computed above) ALSO classifies `allow`. The
+# panel's own rows cannot say whether a row boundary is a real terminal
+# wrap or a genuine second statement/lost space, so wrap-join's glue is a
+# best-effort candidate, never proof; requiring the plain space-join
+# reading to independently classify allow catches the cases where gluing
+# (or a wrap that happened to land on a space) changed what the command
+# actually does — a stray extra argument, a second statement — even though
+# the glued text happens to equal `recorded` exactly. `region` is always
+# the classifier's own text, never substituted for `recorded`.
 approval_command_text() {               # panel recorded [wrapjoin_panel]
   local panel="$1" recorded="$2" wrapjoin="${3:-}" region pc rc wregion
   if [ -z "$recorded" ]; then printf '%s' "$panel"; return 0; fi
@@ -135,11 +147,35 @@ approval_command_text() {               # panel recorded [wrapjoin_panel]
   fi
   if [ -n "$wrapjoin" ]; then
     wregion="$(_sp_command_region "$wrapjoin")"
-    if [ -n "$wregion" ] && [ "$(_sp_collapse_ws "$wregion")" = "$rc" ]; then
+    if [ -n "$wregion" ] && [ "$(_sp_collapse_ws "$wregion")" = "$rc" ] \
+       && [ "$(classify_command "$region")" = allow ]; then
       printf '%s' "$recorded"; return 0
     fi
   fi
   return 2
+}
+
+# corroboration_candidates <pane_id> <fallback_panel> -> sets CC_PANEL and
+# CC_WRAPJOIN.
+#
+# fix/approve-wrapped-commands security review, F6: every caller that
+# compares a wrap-join candidate against a space-join panel reading gets
+# BOTH from the SAME `herdr pane read` (prompt_menu_command_both, one
+# parser call), never two independent reads that could straddle a
+# repaint between them. Falls back to <fallback_panel> (whatever the
+# caller already captured) when the pane is not a complete omp menu right
+# now — a numbered Claude/Codex prompt, or a menu that failed to parse —
+# since that shape has no wrap-join candidate either way.
+corroboration_candidates() {            # pane_id fallback_panel
+  local pane="$1" fallback="$2" combined
+  combined="$(prompt_menu_command_both "$pane" 2>/dev/null || printf '')"
+  if [ -n "$combined" ]; then
+    CC_PANEL="${combined%%$'\x1e'*}"
+    CC_WRAPJOIN="${combined#*$'\x1e'}"
+  else
+    CC_PANEL="$fallback"
+    CC_WRAPJOIN=""
+  fi
 }
 
 # _sp_clamp_wait_seconds <raw> -> a sane HERDR_SELECT_RECORD_WAIT_S: default

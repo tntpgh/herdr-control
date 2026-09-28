@@ -173,7 +173,16 @@ push_wake() {
   if [ -n "${HERDR_PANE_ID:-}" ] && [ -n "$full_cmd" ]; then
     local panel_now
     panel_now="$(prompt_command_text "$HERDR_PANE_ID" 2>/dev/null || printf '')"
-    approval_command_text "$panel_now" "$full_cmd" >/dev/null 2>&1 || recorded_ok=0
+    # F1/F6 (fix/approve-wrapped-commands security review): the mid-token
+    # wrap-join candidate corroborates here too, only now that F2/F3/F4
+    # (lib/prompt-parse.sh _wrapjoin, lib/scoped-policy.sh
+    # approval_command_text) close the exploits a bare wrap-join would
+    # have opened at this write-time gate. Both candidates come from the
+    # SAME screen snapshot (corroboration_candidates) rather than a second
+    # independent read; a numbered or unparseable pane falls back to
+    # panel_now unchanged.
+    corroboration_candidates "$HERDR_PANE_ID" "$panel_now"
+    approval_command_text "$CC_PANEL" "$full_cmd" "$CC_WRAPJOIN" >/dev/null 2>&1 || recorded_ok=0
   fi
   if [ "$recorded_ok" = 0 ]; then
     cmd_hint="$(printf '%s' "$full_cmd" | cut -c1-200)"

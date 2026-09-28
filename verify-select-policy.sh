@@ -947,7 +947,7 @@ conductor_select; rc=$?
   && ok "conductor Approve on the same disagreeing command is still refused" \
   || bad "conductor Approve leaked on mismatch: rc=$rc keys=$(keys_pressed)"
 
-printf '== positive: a MID-TOKEN wrap whose rows join (no separator) into the exact registry command corroborates -- Approve is pressed (fix/approve-wrapped-commands) ==\n'
+printf '== positive: a MID-TOKEN wrap whose rows join (no separator) into the exact registry command corroborates through push_wake itself, not just herdr-select.sh -- Approve is pressed (fix/approve-wrapped-commands, F1) ==\n'
 # Real mechanism (2026-09-26, prompt 925e2d76): omp's own approval panel
 # hard-wraps a long command mid-token -- e.g. .../tntpgh/h | erdr-control/...
 # on two panel rows -- and prompt_command_text's own space-join (needed so
@@ -961,6 +961,15 @@ printf '== positive: a MID-TOKEN wrap whose rows join (no separator) into the ex
 # corroboration only when it equals the hook-recorded command exactly,
 # after whitespace-collapse; this case is red on origin/main (refused with
 # "does not match what is on screen").
+#
+# F1 (security review of this PR, 2026-09-29): the earlier version of this
+# case seeded the registry row directly with seed_input_required, which
+# skips push_wake's OWN write-time corroboration (lib/push-wake.sh:172-186)
+# -- the one call site that still blanked a wrapped command with the
+# 2-arg approval_command_text, so the suite stayed green while the fix was
+# inert live. Calling push_wake itself proves the write-time gate now
+# corroborates via the same wrap-join candidate, not just herdr-select.sh's
+# later read of whatever push_wake already wrote.
 set_rows_deny() {                      # each arg becomes one boxed panel row after "Command:"; Deny pre-highlighted
   { printf '│ Allow tool: bash\n│ Command: %s\n' "$1"; shift
     for row; do printf '│ %s\n' "$row"; done
@@ -968,7 +977,17 @@ set_rows_deny() {                      # each arg becomes one boxed panel row af
 }
 WRAP_JOIN_CMD="ls -la /Users/thurbs/.herdr/worktrees/tntpgh/herdr-control/.handoffs"
 set_rows 'ls -la /Users/thurbs/.herdr/worktrees/tntpgh/h' 'erdr-control/.handoffs'; reset_keys
-seed_input_required runG taskG "$WRAP_JOIN_CMD"
+set_task_state runG taskG running >/dev/null 2>&1
+( export HERDR_PANE_ID="$PANE" HERDR_CONDUCTOR_PANE_ID=w9:p9 HERDR_RUN_ID=runG HERDR_TASK_ID=taskG \
+         HERDR_TASK_LABEL="impl:wrapjoin"
+  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+  push_wake "impl:wrapjoin needs input" "hook" "$WRAP_JOIN_CMD" >/dev/null 2>&1 )
+wake_recorded="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT json_extract(payload,'\$.command') FROM events WHERE task_id='taskG' AND type='input_required' ORDER BY sequence DESC LIMIT 1;")"
+[ "$wake_recorded" = "$WRAP_JOIN_CMD" ] \
+  && ok "push_wake's OWN write-time gate corroborated the wrap via the wrap-join candidate (F1: not blanked)" \
+  || bad "push_wake blanked the wrapped command instead of corroborating it: got '$wake_recorded'"
+reset_keys
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 1 ] \
   && ok "mid-token wrap corroborates via the wrap-join candidate; Approve pressed" \
@@ -977,24 +996,44 @@ sel 1 --authority peer; rc=$?
   && ok "approvals row records the untruncated registry command, not the space-joined scrape" \
   || bad "approvals command: '$(q_appr command)'"
 
-printf '== negative: same wrapped rows, registry command hides an extra statement -- still refused, no key (fix/approve-wrapped-commands) ==\n'
+printf '== negative: same wrapped rows, registry command is a genuinely different (still allow-class) path -- still refused, no key (fix/approve-wrapped-commands, F5) ==\n'
 # The wrap-join candidate must never widen what corroborates: a registry
-# command that is NOT literally the rows-with-no-separator (here, a
-# trailing "; rm -rf ~" the panel never rendered) matches neither join and
-# refuses exactly like any other disagreeing recorded command -- this is
+# command that is NOT literally the rows-with-no-separator matches neither
+# join and refuses exactly like any other disagreeing recorded command --
 # the security invariant, proved directly: text the classifier never saw
 # still cannot be pressed.
+#
+# F5 (security review of this PR): the prior fixture appended a hidden
+# "; rm -rf ~", which is deny-class BY ITSELF -- the case would still exit
+# 8 even if this corroboration were deleted outright, so it never actually
+# proved the corroboration is what refused it. DIFF_CMD is allow-class on
+# its own (a plain ls -la) and differs from the glued rows only by a
+# missing trailing path segment, so a refusal here can only come from the
+# text genuinely not matching.
 before_approve=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM approvals WHERE choice_text='Approve';")
-TAMPERED_CMD="ls -la /Users/thurbs/.herdr/worktrees/tntpgh/herdr-control/.handoffs; rm -rf ~"
+before_esc=$(count_events approval_escalated)
+DIFF_CMD="ls -la /Users/thurbs/.herdr/worktrees/tntpgh/herdr-control"
 set_rows 'ls -la /Users/thurbs/.herdr/worktrees/tntpgh/h' 'erdr-control/.handoffs'; reset_keys
-seed_input_required runG taskG "$TAMPERED_CMD"
+seed_input_required runG taskG "$DIFF_CMD"
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
-  && ok "a registry command hiding an extra statement does not corroborate; refused, no key pressed" \
-  || bad "HIDDEN-STATEMENT FALSE POSITIVE: rc=$rc keys=$(keys_pressed)"
+  && ok "a genuinely differing allow-class registry command does not corroborate; refused, no key pressed" \
+  || bad "DIFFERING-COMMAND FALSE POSITIVE: rc=$rc keys=$(keys_pressed)"
+grep -q 'does not match what is on screen' "$WORK/err.txt" \
+  && ok "refused specifically for the mismatch reason on stderr" \
+  || bad "stderr does not name the mismatch: $(cat "$WORK/err.txt")"
 after_approve=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM approvals WHERE choice_text='Approve';")
 [ "$after_approve" = "$before_approve" ] && ok "no approvals row recorded choice Approve" \
   || bad "an Approve row was recorded despite the mismatch"
+[ "$(( $(count_events approval_escalated) - before_esc ))" = "1" ] \
+  && ok "approval_escalated event recorded" || bad "escalation not recorded"
+esc_cmd="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT json_extract(payload,'\$.command') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
+case "$esc_cmd" in
+  *"worktrees/tntpgh/h erdr-control/.handoffs"*)
+    ok "approval_escalated records the ON-SCREEN (space-joined) command, not the mismatched registry text or empty (PR #181 F1)" ;;
+  *) bad "escalation command not recorded as the on-screen text: '$esc_cmd'" ;;
+esac
 set_rows_deny 'ls -la /Users/thurbs/.herdr/worktrees/tntpgh/h' 'erdr-control/.handoffs'; reset_keys
 ( export HERDR_PANE_ID=w9:p9
   sel 2 --authority conductor --review-category owned-cleanup \
@@ -1040,6 +1079,94 @@ sel 1 --authority peer; rc=$?
 grep -q 'multi-row or unreadable menu command rows' "$WORK/err.txt" \
   && ok "refused specifically as menu_rows_ambiguous, the expected reason with no registry text" \
   || bad "stderr does not name menu_rows_ambiguous: $(cat "$WORK/err.txt")"
+
+printf '== negative: F2 -- a header-only panel with no Command:/run: row never fabricates one from a preceding running box (fix/approve-wrapped-commands, F2) ==\n'
+# Security review of this PR (F2): the first cut of command_wrapjoin fell
+# back to idx=0 when no row started with "Command:"/"run:", then glued
+# question[0] ("Allow tool: browser") onto whatever followed -- INCLUDING
+# the pending_running rows merged in for prompt_id distinctness (see
+# BROWSER_FALLBACK, lib/prompt-parse.sh "question" mode). A preceding
+# "running bash" box that happens to render a line containing the literal
+# text "Command: ls -la" (its OWN earlier command, echoed back, not this
+# panel's) then glued into "browserq Command: ls -la", and
+# _sp_command_region's "everything after the first space" strip turned
+# that into a fabricated label: ` ls -la`. A recorded `ls -la` then
+# corroborated a BROWSER call as if it were that bash command. Fixed
+# _wrapjoin (lib/prompt-parse.sh) now returns nothing when the panel
+# itself carries no Command:/run: row, so there is no glue to try, and
+# this refuses exactly like any other panel type mismatch.
+set_browser_header_after_running_command_row() {
+  { printf '│ running bash\n'
+    printf '│ q Command: ls -la\n'
+    printf '│ Allow tool: browser\n'
+    printf '│\n'
+    printf '│ \033[48;2;42;47;65m Approve\033[0m\n'
+    printf '│ Deny\n'
+    printf '│\n'
+    printf '│ up/down navigate  enter select  esc cancel\n'
+  } > "$SCREEN"
+}
+before_approve=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM approvals WHERE choice_text='Approve';")
+set_browser_header_after_running_command_row; reset_keys
+seed_input_required runG taskG "ls -la"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "F2: a header-only browser panel does not corroborate a bash command via a fabricated label; refused, no key pressed" \
+  || bad "F2 LABEL-FABRICATION FALSE POSITIVE: rc=$rc keys=$(keys_pressed)"
+after_approve=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM approvals WHERE choice_text='Approve';")
+[ "$after_approve" = "$before_approve" ] && ok "no approvals row recorded choice Approve" \
+  || bad "an Approve row was recorded despite the header-only panel"
+
+printf '== negative: F3 -- a short non-final row never glues as a full-token wrap (fix/approve-wrapped-commands, F3) ==\n'
+# Security review of this PR (F3): command_wrapjoin used to glue EVERY
+# boundary after the label row with no separator, so a genuine two-row
+# panel -- a real shell newline between "echo a" and "rm -rf ~", or any
+# mis-keyed recorded row landing on this panel's prompt_id -- corroborated
+# via the glued reading "echo arm -rf ~" even though the rows never
+# wrapped (the Command: row is short, well under this panel's own widest
+# row, the header). Fixed _wrapjoin (lib/prompt-parse.sh) now glues a
+# boundary with no separator ONLY when the row above it is full-width; a
+# short non-final row gets a plain space, same as "command" mode already
+# produces, so the fabricated no-separator reading no longer exists to
+# corroborate against.
+before_approve=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM approvals WHERE choice_text='Approve';")
+F3_GLUED="echo arm -rf ~"
+set_rows 'echo a' 'rm -rf ~'; reset_keys
+seed_input_required runG taskG "$F3_GLUED"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "F3: a no-separator glue no longer exists for a short non-final row; refused, no key pressed" \
+  || bad "F3 GLUE-WITHOUT-FULL-WIDTH FALSE POSITIVE: rc=$rc keys=$(keys_pressed)"
+after_approve=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM approvals WHERE choice_text='Approve';")
+[ "$after_approve" = "$before_approve" ] && ok "no approvals row recorded choice Approve" \
+  || bad "an Approve row was recorded despite the short-row glue"
+
+printf '== negative: F4 -- a wrap-join match that would let a lost space smuggle a different program past the classifier still refuses (fix/approve-wrapped-commands, F3/F4 defence in depth) ==\n'
+# Security review of this PR (F4): a hard wrap that lands exactly on a
+# space leaves no trace once both sides are border-stripped, so
+# "rm -rf /tmp/pr186-x" + "/" glues (no separator, full-width boundary,
+# the same rule F3 added) into "rm -rf /tmp/pr186-x/" -- which DOES equal
+# a recorded "rm -rf /tmp/pr186-x/" exactly, so the full-width rule alone
+# does not close this: the upper row is genuinely full-width either way.
+# What the panel could just as plausibly show, though, is TWO tokens with
+# a space between them -- "rm -rf /tmp/pr186-x /", a command that deletes
+# the filesystem root and classifies deny. approval_command_text
+# (lib/scoped-policy.sh) now also classifies the SPACE-join reading of the
+# same rows whenever wrap-join is what corroborated, and requires both
+# allow; the space-join reading here is deny, so this refuses even though
+# the glued text matches the recorded command exactly.
+before_approve=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM approvals WHERE choice_text='Approve';")
+F4_RECORDED="rm -rf /tmp/pr186-x/"
+set_rows 'rm -rf /tmp/pr186-x' '/'; reset_keys
+seed_input_required runG taskG "$F4_RECORDED"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "F4: wrap-join matches but the space-join reading classifies deny; refused, no key pressed" \
+  || bad "F4 LOST-SPACE FALSE POSITIVE: rc=$rc keys=$(keys_pressed)"
+after_approve=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM approvals WHERE choice_text='Approve';")
+[ "$after_approve" = "$before_approve" ] && ok "no approvals row recorded choice Approve" \
+  || bad "an Approve row was recorded despite the deny-class space-join reading"
+
 
 set_task_state runG taskG completed no-follow-on >/dev/null 2>&1
 
@@ -1361,10 +1488,15 @@ printf '== MEDIUM-2: a wrap-corroboration-mismatch refusal ALSO releases a held 
 set_task_state runR taskR running >/dev/null 2>&1
 # fix/approve-wrapped-commands: these exact rows now corroborate via the
 # wrap-join candidate (see the "positive" wrap-join case above), so this
-# fixture must hide a statement the panel never rendered to keep exercising
-# a genuine refusal -- same mechanism as the "hidden extra statement" case,
-# reused here to prove the held-wake release still fires on IT.
-MW_CMD="ls -la /Users/thurbs/.herdr/worktrees/tntpgh/herdr-control/.handoffs; rm -rf ~"
+# fixture must record a genuinely different command to keep exercising a
+# real refusal -- same mechanism as the "differing command" negative
+# above, reused here to prove the held-wake release still fires on IT.
+# F5 (security review): MW_CMD used to append a hidden "; rm -rf ~",
+# which is deny-class by itself and so cannot fail this assertion even if
+# the corroboration were deleted outright; DIFF_CMD is allow-class and
+# differs only by the missing trailing path segment, same as the
+# standalone negative case.
+MW_CMD="ls -la /Users/thurbs/.herdr/worktrees/tntpgh/herdr-control"
 set_rows 'ls -la /Users/thurbs/.herdr/worktrees/tntpgh/h' 'erdr-control/.handoffs'; reset_keys
 seed_input_required runR taskR "$MW_CMD"
 mw_pid="$(prompt_id "$PANE")"
@@ -1376,11 +1508,21 @@ before_attempted=$(count_events wake_attempted)
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "mid-token wrap: refused, no key pressed" \
   || bad "mid-token wrap: rc=$rc keys=$(keys_pressed)"
+grep -q 'does not match what is on screen' "$WORK/err.txt" \
+  && ok "mid-token wrap: refused specifically for the mismatch reason on stderr" \
+  || bad "mid-token wrap: stderr does not name the mismatch: $(cat "$WORK/err.txt")"
 esc_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   "SELECT run_id||'|'||task_id||'|'||json_extract(payload,'\$.prompt_id') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
 [ "$esc_row" = "runR|taskR|$mw_pid" ] \
   && ok "mid-token wrap: approval_escalated carries run_id/task_id/prompt_id (not empty)" \
   || bad "mid-token wrap: escalation identity: $esc_row"
+esc_cmd="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT json_extract(payload,'\$.command') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
+case "$esc_cmd" in
+  *"worktrees/tntpgh/h erdr-control/.handoffs"*)
+    ok "mid-token wrap: approval_escalated records the ON-SCREEN command, not the mismatched registry text or empty (PR #181 F1)" ;;
+  *) bad "mid-token wrap: escalation command not recorded as the on-screen text: '$esc_cmd'" ;;
+esac
 released=0
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   [ "$(count_events wake_hold_released)" -gt "$before_released" ] && { released=1; break; }
