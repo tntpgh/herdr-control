@@ -1270,6 +1270,8 @@ or queries Neon.
 | `config.sh` | **your config** — the only file to edit |
 | `hub.py` | loopback operator index, decisions inbox, read-only KB/heartbeat/signal-quality observation |
 | `verify-hub.py` | mock-only credential, observation-state, aggregate/heartbeat privacy, and HTML regressions |
+| `cost-report.py` | hourly LLM spend aggregate from omp session usage fields (never message content) → `~/.local/state/herdr/cost-report.json`, shown as the hub's "LLM spend" card; `--print` for a terminal table |
+| `com.herdr-control.cost-report.plist.template` | hourly LaunchAgent for `cost-report.py` (render `__COST_REPORT_PY__`/`__LOG_PATH__`; registry entry lives in thurber-os `launchd/agents.yaml`) |
 | `herdr-plugin.toml` | registers the herdr-socket-only tools (Projects, Quick Actions, sort/name/attention) as real herdr plugin actions, `--pick` tools via a pane — not yet live-verified, see its own header |
 | `pick-pane-open.sh` | dispatches an `[[actions]]` `--pick` invocation to its matching `[[panes]]` entry (herdr actions get no TTY; panes do) |
 | `ensure-workspace.sh` | focus-or-create a project's workspace |
