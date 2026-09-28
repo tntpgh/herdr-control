@@ -35,9 +35,13 @@
 #     whitespace-collapsed command (omp's "Allow tool: … Command:" panel prefix
 #     stripped) equals the event's stored command; nearest decided_at after the
 #     event, within 30 min. Failing that, the first approval_escalated event on
-#     the same pane within 10 min.
+#     the same pane within 10 min whose recorded command matches the same way.
 #   other tools: nearest approvals row / approval_escalated on the same pane
-#     within 120 s (only exec-tier tools such as eval ever reach a menu).
+#     within 120 s whose panel names the same tool ("Allow tool: <name>").
+#   An approval_escalated event with no recorded command (written before
+#   herdr-select.sh recorded one) joins nothing: pane + time alone attributed a
+#   neighbour's refusal to every read/grep/bash on that pane, which was most of
+#   the 2026-09-27 gate's 41.7% "disagreement".
 # Today's outcome classes: auto (peer/grant Approve), conductor, human, denied,
 # refused (approval_escalated), none (no record: auto-approved by omp's tier,
 # answered in the terminal by hand, or never answered).
@@ -64,7 +68,14 @@ def ts(s):
 def collapse(s): return re.sub(r"\s+", " ", s or "").strip()
 def strip_panel(s):
     s = collapse(s)
-    return re.sub(r"^(Allow tool: \S+ )?(Command|run): ", "", s)
+    return re.sub(r"^(Allow tool: \S+ (; )?)?(Command|run): ", "", s)
+def panel_tool(s):
+    """Tool named by an omp approval panel; a bare command is a shell prompt;
+    anything else (e.g. an off-screen header) names no tool."""
+    s = collapse(s)
+    m = re.match(r"^Allow tool: (\w+)", s)
+    if m: return m.group(1).lower()
+    return None if s.startswith("[") or not s else "bash"
 def sha(s): return hashlib.sha256((s or "").encode()).hexdigest()
 
 tasks = {r["task_id"]: dict(r) for r in conn.execute(
@@ -156,7 +167,15 @@ for r in conn.execute("SELECT sequence, task_id, occurred_at, payload FROM event
                       (min(s["at"] for s in shadow),)):
     p = json.loads(r["payload"] or "{}")
     esc_all.append({"task_id": r["task_id"], "pane": p.get("pane", ""), "occurred_at": r["occurred_at"],
-                    "verdict": p.get("verdict", ""), "reason": p.get("reason", ""), "seq": r["sequence"]})
+                    "verdict": p.get("verdict", ""), "reason": p.get("reason", ""), "seq": r["sequence"],
+                    "command": p.get("command")})
+
+def same_prompt(cmd, s, is_shell):
+    """Does a recorded panel/command belong to this shadow row's tool call?"""
+    if not cmd: return False
+    if is_shell:
+        return sha(cmd) == s.get("command_sha256") or strip_panel(cmd) == collapse(s.get("command"))
+    return panel_tool(cmd) == s.get("tool", "").lower()
 
 used_a, used_e = set(), set()
 results = []
@@ -171,17 +190,16 @@ for s in shadow:
     window = timedelta(minutes=30) if is_shell else timedelta(seconds=120)
     cands = [a for a in appr if a["approval_id"] not in used_a and ts(a["decided_at"]) and at
              and at - timedelta(seconds=2) <= ts(a["decided_at"]) <= at + window
-             and (not s.get("pane") or a["pane"] in ("", s.get("pane")))]
-    if is_shell:
-        cands = [a for a in cands if sha(a["command"]) == s.get("command_sha256")
-                 or strip_panel(a["command"]) == collapse(s.get("command"))]
+             and (not s.get("pane") or a["pane"] in ("", s.get("pane")))
+             and same_prompt(a["command"], s, is_shell)]
     if cands:
         match = min(cands, key=lambda a: a["decided_at"]); used_a.add(match["approval_id"])
         today, via = outcome(match), f"approvals:{match['approval_id']}"
     else:
         ew = timedelta(minutes=10) if is_shell else timedelta(seconds=120)
         ec = [e for e in esc if e["seq"] not in used_e and ts(e["occurred_at"]) and at
-              and at <= ts(e["occurred_at"]) <= at + ew and e["pane"] in ("", s.get("pane"))]
+              and at <= ts(e["occurred_at"]) <= at + ew and e["pane"] in ("", s.get("pane"))
+              and same_prompt(e["command"], s, is_shell)]
         if ec:
             e = min(ec, key=lambda e: e["occurred_at"]); used_e.add(e["seq"])
             today, via = "refused", f"approval_escalated:{e['seq']}({e['verdict']})"

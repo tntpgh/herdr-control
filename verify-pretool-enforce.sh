@@ -472,5 +472,26 @@ out="$(gate)"; rc=$?
 out="$(HERDR_RUN_STATE_DIR="$work/nogate" bash "$here/scripts/shadow-compare.sh" --gate)"; rc=$?
 [ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'GATE: FAIL' && ok "gate FAILs with no shadow data" || not_ok "gate (empty): rc=$rc $out"
 
+printf '== shadow-compare joins: bound to the command/tool, never pane + time alone ==\n'
+j="$work/join"; mkdir -p "$j"
+( export HERDR_RUN_STATE_DIR="$j"; . "$here/lib/run-registry.sh"; registry_init >/dev/null
+  sqlite3 "$j/pretool-shadow.sqlite3" "CREATE TABLE pretool_verdicts (sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT NOT NULL UNIQUE, run_id TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
+      type TEXT NOT NULL DEFAULT 'pretool_verdict', occurred_at TEXT NOT NULL, payload TEXT NOT NULL);
+    INSERT INTO pretool_verdicts(event_id, run_id, task_id, occurred_at, payload) VALUES
+      ('legacy','r1','t1',strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 seconds'), json_object('mode','shadow','tool','bash','verdict','allow','command','cat notes.txt','pane','w9:p1')),
+      ('bound', 'r1','t1',strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 seconds'), json_object('mode','shadow','tool','bash','verdict','allow','command','rm -r build','pane','w9:p1')),
+      ('read',  'r1','t1',strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 seconds'), json_object('mode','shadow','tool','read','verdict','allow','pane','w9:p1')),
+      ('panel', 'r1','t1',strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 seconds'), json_object('mode','shadow','tool','bash','verdict','allow','command','echo z','pane','w9:p1'));"
+  append_event r1 t1 approval_escalated '{"verdict":"escalate","reason":"legacy","pane":"w9:p1"}' >/dev/null
+  append_event r1 t1 approval_escalated '{"verdict":"deny","reason":"x","pane":"w9:p1","command":"rm -r build"}' >/dev/null
+  sqlite3 "$j/registry.sqlite3" "INSERT INTO approvals(approval_id, task_id, pane_id, authority, choice_text, command, decided_at) VALUES
+    ('p1','t1','w9:p1','peer','Approve','Allow tool: bash ; Command: echo z', strftime('%Y-%m-%dT%H:%M:%SZ','now','-25 seconds'));" )
+kinds="$(HERDR_RUN_STATE_DIR="$j" bash "$here/scripts/shadow-compare.sh" --json | jq -r 'sort_by(.seq)[] | "\(.command // .tool)=\(.kind)"' | tr '\n' ' ')"
+case "$kinds" in *"cat notes.txt=no-record"*) ok "a command-less (legacy) escalation on the pane is not pinned on an unrelated bash call" ;; *) not_ok "legacy escalation join: $kinds" ;; esac
+case "$kinds" in *"rm -r build=SHADOW_LOOSER"*) ok "an escalation recording the same command still joins (refused vs allow = looser)" ;; *) not_ok "bound escalation join: $kinds" ;; esac
+case "$kinds" in *"read=no-record"*) ok "a read call does not take a bash panel's approval on the same pane" ;; *) not_ok "cross-tool join: $kinds" ;; esac
+case "$kinds" in *"echo z=agree"*) ok "omp's 'Allow tool: bash ; Command:' panel matches its command" ;; *) not_ok "panel strip: $kinds" ;; esac
+
 printf '\npassed=%d failed=%d\n' "$good" "$bad"
 [ "$bad" -eq 0 ]

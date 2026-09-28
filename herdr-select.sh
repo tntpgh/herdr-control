@@ -340,8 +340,8 @@ own_trunk=$(printf '%s' "$own_task_json" | jq -r '.trunk // empty' 2>/dev/null)
 _refuse_non_human() {                   # verdict reason
   local v="$1" r="$2"
   append_event "$own_run" "$own_task" "approval_escalated" \
-    "$(jq -nc --arg v "$v" --arg r "$r" --arg p "$pane" --arg pid "$current_prompt_id" \
-       '{verdict:$v, reason:$r, pane:$p, prompt_id:$pid}')" >/dev/null 2>&1 || true
+    "$(jq -nc --arg v "$v" --arg r "$r" --arg p "$pane" --arg pid "$current_prompt_id" --arg c "$cmd_text" \
+       '{verdict:$v, reason:$r, pane:$p, prompt_id:$pid, command:$c}')" >/dev/null 2>&1 || true
   own_cpane="$(printf '%s' "$own_task_json" | jq -r '.conductor_pane_id // empty' 2>/dev/null)"
   own_label="$(printf '%s' "$own_task_json" | jq -r '.label // empty' 2>/dev/null)"
   release_wake_hold "$pane" "$current_prompt_id" "$own_run" "$own_task" \
