@@ -136,13 +136,18 @@ if cli_for_agent definitely-not-an-agent x >/dev/null 2>&1; then
 else
   ok "unknown agent exits 1 (caller falls back to a literal command)"
 fi
-printf '== tool set by job class (omp --tools; measured 22.6k -> 19.7k / 17.6k tokens) ==\n'
-check "implement trims task/yield/ask and the rest of the unused built-ins" \
+printf '== tool set by job class (omp --tools) ==\n'
+check "implement drops task/web_search but keeps ask (herdr's question channel)" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet:medium '' implement)" \
-  "omp --model sonnet --thinking medium --tools read,bash,edit,write,grep,glob,todo,eval,wait --approval-mode write"
-check "explore is read-only plus web_search" \
+  "omp --model sonnet --thinking medium --tools read,bash,edit,write,grep,glob,todo,eval,wait,ask --approval-mode write"
+for j in docs mechanical quick; do
+  check "$j keeps edit (routers send rename/typo/format briefs there)" \
+    "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp haiku:low '' $j)" \
+    "omp --model haiku --thinking low --tools read,bash,edit,write,grep,glob,todo,eval,wait,ask --approval-mode write"
+done
+check "explore gets no edit/eval/task, keeps ask and web_search" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp haiku:low '' explore)" \
-  "omp --model haiku --thinking low --tools read,bash,grep,glob,todo,web_search --approval-mode write"
+  "omp --model haiku --thinking low --tools read,bash,grep,glob,todo,web_search,ask --approval-mode write"
 check "review keeps every tool (a reviewer may still edit or delegate)" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp opus:high '' review)" \
   "omp --model opus --thinking high --approval-mode write"
@@ -157,7 +162,7 @@ check "an explicit --tools list wins over the class table" \
   "omp --model sonnet --tools read,bash --approval-mode write"
 check "claude flavor under omp is trimmed too" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent claude sonnet '' implement)" \
-  "omp --model sonnet --models sonnet,openai-codex/gpt-5.5 --tools read,bash,edit,write,grep,glob,todo,eval,wait --approval-mode write"
+  "omp --model sonnet --models sonnet,openai-codex/gpt-5.5 --tools read,bash,edit,write,grep,glob,todo,eval,wait,ask --approval-mode write"
 check "omc launches the real claude binary: no omp --tools flag" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omc sonnet '' implement)" \
   "claude --model sonnet --permission-mode acceptEdits"
@@ -219,7 +224,8 @@ for f in --approval-mode --permission-mode --auto-approve --yolo \
          --system-prompt-file --append-system-prompt-file=/x \
          --settings --setting-sources --add-dir \
          --config --config=/x --profile --cwd --cwd=/x \
-         --hook -e --extension --plugin-dir --mcp-config --strict-mcp-config --agents; do
+         --hook -e --extension --plugin-dir --mcp-config --strict-mcp-config --agents \
+         --tools --tools=read --no-tools; do
   managed_flag_rejected "$f" && ok "rejects $f" || bad "must reject $f"
 done
 for f in --resume --continue -p; do

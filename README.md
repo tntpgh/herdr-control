@@ -175,9 +175,10 @@ overridable as an environment variable per run.
 ./spawn-task.sh ~/src/app arch review codex            # codex, deep model
 ./spawn-task.sh ~/src/app fix-parser implement omp     # omp, sonnet (verified 2026-07-31)
 ./spawn-task.sh ~/src/app fix-worker implement --dry-run # preview, no changes
-# omp tool set follows the job class (implement: no task/ask/web_search;
-# explore/quick/docs: read-only + web_search; plan/review/design: all).
-# ~2.9k / ~5k fewer tokens per request; lib/agent-profiles.sh tools_for_job.
+# omp tool set follows the job class: explore drops edit/eval/task; every
+# editing class (implement/debug/code/docs/mechanical/quick) drops task and
+# web_search; plan/review/design keep all. ask always stays (herdr's question
+# channel). lib/agent-profiles.sh tools_for_job has the measurements.
 ./spawn-task.sh ~/src/app fix-worker implement omp --tools all   # opt out
 
 # Spread: multi-pane tab from a declarative layout (case by case, opt-in)

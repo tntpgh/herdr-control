@@ -266,12 +266,18 @@ omp_cross_family_model() {   # <from-agent> <bare-model-name> -> "<omp-model> <t
 # nor removes it. Never add `hub` to a list below: naming a tool omp has not
 # registered makes the launch fail.
 #
-# Job classes group differently here than model_for_agent's tiers: docs and
-# mechanical are read/report work (tool-wise, not model-wise), grouped with
-# explore/quick rather than with implement/debug/code.
+# Every class that changes files (routers send rename/typo/format briefs to
+# `mechanical`; docs is "judgment work", above) keeps `edit`. Only `explore`
+# is trimmed to the read set. `ask` stays in both: it is herdr's structured
+# question channel (omp-herdr-control.ts alerts on it, herdr-select answers
+# it) — without it a worker that needs a decision prints text and goes idle
+# with no prompt_id. It costs ~0.7k tokens (interactive haiku probe, 13,358
+# -> 14,086). `ask` is valid in `--tools` only interactively; `omp -p`
+# rejects it, and workers are never launched with -p.
 #
-#   implement|debug|code           -> read,bash,edit,write,grep,glob,todo,eval,wait
-#   explore|quick|docs|mechanical  -> read,bash,grep,glob,todo,web_search
+#   implement|debug|code|docs|mechanical|quick
+#                                  -> read,bash,edit,write,grep,glob,todo,eval,wait,ask
+#   explore                        -> read,bash,grep,glob,todo,web_search,ask
 #   plan|architect|review|design,
 #   and any unrecognised class     -> "" (all tools — unrestricted)
 #
@@ -287,8 +293,8 @@ omp_cross_family_model() {   # <from-agent> <bare-model-name> -> "<omp-model> <t
 # default here is the FULL set, not the empty one.
 tools_for_job() {  # <job-class> -> comma-separated --tools value, or "" for unrestricted
   case "$1" in
-    implement|debug|code)          printf 'read,bash,edit,write,grep,glob,todo,eval,wait\n' ;;
-    explore|quick|docs|mechanical) printf 'read,bash,grep,glob,todo,web_search\n' ;;
+    implement|debug|code|docs|mechanical|quick) printf 'read,bash,edit,write,grep,glob,todo,eval,wait,ask\n' ;;
+    explore)                                    printf 'read,bash,grep,glob,todo,web_search,ask\n' ;;
     *)                             printf '\n' ;;   # plan/architect/review/design + unrecognised: unrestricted
   esac
 }
@@ -419,6 +425,7 @@ managed_flag_rejected() {               # <arg> -> exit 0 if forbidden on a mana
     --config|--config=*|--profile|--profile=*|--cwd|--cwd=*|\
     --hook|--hook=*|-e|--extension|--extension=*|--plugin-dir|--plugin-dir=*|--plugin-url|--plugin-url=*|\
     --mcp-config|--mcp-config=*|--strict-mcp-config|--agents|--agents=*|\
+    --tools|--tools=*|--no-tools|\
     --add-dir|--add-dir=*)
       return 0 ;;
   esac
