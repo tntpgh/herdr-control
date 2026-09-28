@@ -66,23 +66,6 @@ _cp_consider() {                        # severity reason -> updates the running
 
 _cp_match()  { printf '%s' "$2" | grep -qE  "$1" 2>/dev/null; }   # pattern text
 _cp_imatch() { printf '%s' "$2" | grep -qiE "$1" 2>/dev/null; }   # pattern text (case-insensitive)
-# Security review of #174/#182 (PR #185), finding #5: the dotenv-path
-# regex `\.env[A-Za-z0-9_.-]*\b` needs to stay BROAD (`.env2`, `.envlocal`,
-# `.envprod`, … all real-enough dotenv-ish names to keep reserved) — a
-# narrowed character class that excluded `environ`'s continuing `iron`
-# ALSO silently stopped matching `.env2`/`.envlocal` (found live,
-# `dotenv2`/`dotenvlocal` WEAKER in the bypass harness). Fix instead by
-# excluding ONLY the literal substring `.environ`/`.environb` from the text
-# BEFORE the broad pattern ever sees it — case-sensitive, since python
-# identifiers are. Every other `.env*` shape is untouched.
-_cp_strip_environ_tokens() {            # text -> same text with `.environ`/`.environb` removed
-  # `\b` is a GNU sed extension; this repo's `sed -E` calls are all written
-  # portable for macOS's BSD sed, which treats `\b` as literal `b` and
-  # silently strips nothing (found live: `os.environ` survived this
-  # function untouched, PR #185 remediation round). `([^A-Za-z0-9_]|$)`,
-  # captured and put back via `\1`, is the boundary that works on both.
-  printf '%s' "$1" | sed -E 's/\.environb([^A-Za-z0-9_]|$)/\1/g; s/\.environ([^A-Za-z0-9_]|$)/\1/g'
-}
 
 # Every target of a recursive rm must be a single local path component. Written
 # as a walk rather than a regex because the question is per-TARGET ("is each of
@@ -1485,124 +1468,12 @@ sys.exit(1)
 ' 2>/dev/null
 }
 _CP_PY_ENV_RE='\b(environ|environb|getenv|putenv|unsetenv)\b'
-# Round 3 N9: the word above can be split across two string constants
-# (`'envi' + 'ron'`) so it never appears contiguously in the raw text, yet
-# still reach `os.environ`/`os.getenv` through an escape mechanism the AST
-# in `_cp_python_env_risk` already flags unconditionally once it runs. This
-# widens the pre-gate to ALSO run that AST whenever the text names the
-# escape MECHANISM itself — none of which is split in any known bypass —
-# rather than only the env-access payload word it's used to reach.
-_CP_PY_ENV_GATE_EXTRA_RE='__dict__|__getattribute__|getattr|setattr|vars\(|exec|eval|compile|__import__|importlib|sys\.modules|globals\(|locals\(|__builtins__'
 _cp_python_risk() {                     # text -> prints a reason, 0 when risky
   local hit
   hit="$(printf '%s' "$1" | grep -oE "$_CP_PY_RISK_RE" 2>/dev/null | head -1)"
   [ -n "$hit" ] || hit="$(_cp_python_ast_risk "$1" 2>/dev/null || true)"
   [ -n "$hit" ] || return 1
   printf 'python uses %s (process/network/deletion/env/dynamic-code) — needs a reviewing authority\n' "$hit"
-}
-
-# ---- python-mode env access: reserved unconditionally, no narrowing ------
-# (issue #174; PR #185 security review rounds 1-3 tried AST narrowing, round
-# 4 abandoned it — see below)
-#
-# `_CP_PY_ENV_RE` fires on the bare WORD `environ`/`getenv`/…, with no idea
-# which key is being fetched: `os.environ.get("HERDR_SESSIONS_DIR", HOME /
-# ".omp/agent/sessions")` — a non-secret path default, cost-report.py — is
-# reserved exactly like `dict(os.environ)` or `os.environ["GITHUB_TOKEN"]`
-# would be. #174 asked for the first to clear while the second stayed
-# reserved.
-#
-# Rounds 1-3 built that as AST narrowing: default-unsafe, a node only
-# clears by being POSITIVELY recognized as one of a few safe shapes
-# (a bare `import os` alias, `.get(key)`/`[key]` with a CONSTANT key on an
-# exact-name allowlist), with an ever-growing list of unconditional escape
-# hatches (`__dict__`, `getattr`/`exec`/`eval`/`compile`/`__import__`,
-# `from … import *`, a risky word inside a string constant, an
-# Attribute-form `__getattribute__` call, `__builtins__`) added each round
-# to close whatever indirection the previous round's enumeration missed.
-# Round 4's own harness (`.handoffs/r4-harness.out`) found the approach
-# itself unfixable by enumeration, not just under-enumerated: a REAL
-# secret read via `operator.attrgetter("...")(os)("KEY")`,
-# `f.__globals__["os"].environ`, `codecs.decode(s, "rot13")` where `s` is
-# itself split, `inspect.getmembers(os)`, `type.__subclasses__()` walks,
-# `functools.reduce(getattr, ...)`, and a `ctypes` libc `getenv` call each
-# reach `os.environ`/`os.getenv` through a shape no enumerated recognizer
-# had a rule for — 16 live regressions (main correctly reserved, the
-# narrowed PR incorrectly cleared) with no bound on how many more shapes
-# exist, because the safe/unsafe line here is "does this Python expression
-# eventually evaluate to an environment read", which is Rice's-theorem
-# undecidable by static enumeration in general.
-#
-# Decision (round 4, Terrence): ship WITHOUT the narrowing. `#174`'s
-# specific false positive (a non-secret KEY NAME under `os.environ.get`)
-# is not fixed — `os.environ.get("HERDR_SESSIONS_DIR", ...)` is reserved
-# again, exactly as `main` always reserved it, because a human approving a
-# few extra RESERVED prompts is a bounded, known cost and a narrowing that
-# can silently clear a real credential read is not.
-#
-# `_CP_PY_ENV_GATE_EXTRA_RE` (round 3's gate widening, matching
-# split-literal/indirection MECHANISM words like
-# `__dict__`/`getattr`/`exec`/`__getattribute__`) is kept, but a TEXT match
-# on one of these words used to BE the verdict directly, the same way
-# `_CP_PY_ENV_RE` still is — and unlike an env/getenv word, these are
-# common enough as substrings and identifiers in ordinary code that doing
-# so reserved files with no escape hatch and no environment access at all:
-# `con.execute(...)` (bare "exec" substring) and a docstring literally
-# using the word "eval" in prose both flipped
-# `.handoffs/acb-fixture.py` (thurber-os scripts/audit_context_budget.py,
-# the #174 acceptance script) to reserved, a real regression against #174
-# found via `.handoffs/acb-bisect.out`. A text match here may only decide
-# whether to RUN a small AST check — never the verdict by itself. The AST
-# confirms a GENUINE use, not merely the word's presence: a `Call` whose
-# `func` is a bare `Name` in `{getattr, setattr, exec, eval, compile,
-# __import__, vars, globals, locals}`, an Attribute-form call
-# (`x.__getattribute__(...)`/`x.__setattr__(...)`), any `Attribute` whose
-# `.attr` is `__dict__`/`__builtins__`, `sys.modules`, `from … import *`,
-# or `import importlib`. This is a mechanical shape check (a mechanism
-# actually being CALLED or ACCESSED), not an enumeration of safe/unsafe
-# environment-read shapes — round 4's finding was about the latter being
-# unenumerable, not about whether `exec(` is a real call. A parse failure
-# confirms (fails closed), matching every other AST helper in this file.
-_cp_python_env_risk() {                 # content -> prints reason, 0 when reserved
-  if _cp_match '\b(putenv|unsetenv)\b' "$1"; then
-    printf 'python mutates the process environment — credential-value access remains human-only\n'
-    return 0
-  fi
-  if _cp_match "$_CP_PY_ENV_RE" "$1"; then
-    printf 'python reads the process environment — credential-value access remains human-only\n'
-    return 0
-  fi
-  _cp_match "$_CP_PY_ENV_GATE_EXTRA_RE" "$1" || return 1
-  printf '%s' "$1" | python3 -c '
-import ast, sys
-ESCAPE_CALLS = {"getattr", "setattr", "exec", "eval", "compile", "__import__", "vars", "globals", "locals"}
-ESCAPE_ATTR_CALLS = {"__getattribute__", "__setattr__"}
-try:
-    tree = ast.parse(sys.stdin.read())
-except Exception:
-    sys.exit(0)
-for node in ast.walk(tree):
-    if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
-        sys.exit(0)
-    if isinstance(node, ast.Import) and any(a.name == "importlib" or a.name.startswith("importlib.") for a in node.names):
-        sys.exit(0)
-    if isinstance(node, ast.Name) and node.id == "__builtins__":
-        sys.exit(0)
-    if isinstance(node, ast.Attribute):
-        if node.attr in ("__dict__", "__builtins__"):
-            sys.exit(0)
-        if node.attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys":
-            sys.exit(0)
-    if isinstance(node, ast.Call):
-        f = node.func
-        if isinstance(f, ast.Name) and f.id in ESCAPE_CALLS:
-            sys.exit(0)
-        if isinstance(f, ast.Attribute) and f.attr in ESCAPE_ATTR_CALLS:
-            sys.exit(0)
-sys.exit(1)
-' >/dev/null 2>&1
-  [ "$?" -eq 0 ] || return 1
-  printf 'python uses a dynamic-code/indirection escape hatch (getattr/setattr/exec/eval/compile/__import__/vars/globals/locals/__dict__/__getattribute__/__setattr__/__builtins__/sys.modules/importlib/import *) — credential-value access remains human-only\n'
 }
 
 # Code by reference judges ONE file, so a file that runs or imports ANOTHER
@@ -1759,36 +1630,11 @@ try:
 except Exception:
     sys.stdout.write(unicodedata.normalize("NFKC", src))
 ' 2>/dev/null)" || content="$(cat "$path")"
-    # `tokenize.untokenize` fills the GAP left by a removed multi-line
-    # docstring with literal backslash-newline continuation lines (each a
-    # bare `\` on its own line) to keep every token AFTER it on its
-    # original line/column — real, reproduced on `.handoffs/acb-fixture.py`
-    # (thurber-os scripts/audit_context_budget.py, the #174 acceptance
-    # script): a 51-line module docstring left 50 lines of bare `\`.
-    # `scannable_command` (used below by `conductor_reserved_reason` to
-    # build `cred_norm`) folds a trailing `\` into its next line — real
-    # shell continuation handling, reused here — so those 50 filler lines
-    # collapse into ONE, shifting every subsequent line's number in
-    # `cred_norm` while `_cp_python_cred_narrow`'s own `ast.parse(content)`
-    # (which never runs `scannable_command`) reports the ORIGINAL,
-    # unshifted line. The two numbers stop matching, the
-    # `(lineno, name, val)` correlation the round-2 N2 fix relies on never
-    # finds its own binding, and a file with NO secret at all — only a
-    # long, well-documented docstring — comes out reserved
-    # (`.handoffs/acb-bisect.out`). A bare `\` on its own line is never
-    # valid, meaningful Python on its own (it is exactly this artifact, or
-    # a truly pointless no-op continuation to a blank line); blanking it to
-    # an empty line removes the only thing `scannable_command` would fold,
-    # is a no-op for `ast.parse` (blank lines change nothing), and does not
-    # touch a REAL backslash continuation — those always have code before
-    # the `\`, never a bare one alone on its line.
-    content="$(printf '%s\n' "$content" | sed -E 's/^\\+[[:space:]]*$//')"
   fi
   if [ "$kind" = python ]; then
     res="$(conductor_reserved_reason "$content" python)"
-    if [ -z "$res" ]; then
-      res="$(_cp_python_env_risk "$content")" || res=""
-    fi
+    [ -n "$res" ] || ! _cp_match "$_CP_PY_ENV_RE" "$content" ||
+      res="python reads the process environment — credential-value access remains human-only"
   else
     res="$(conductor_reserved_reason "$content")"
   fi
@@ -3348,17 +3194,7 @@ EOF
   # `.zshenv`/`.docker/config.json`/`.kube/config`/`.netrc`/`.npmrc`
   # are new; the latter two already lived in conductor_reserved_reason's
   # own copy and never made it here.
-  # `\.environ`/`\.environb` (python attribute access, issue #174) reads as
-  # a `.env`-suffixed dotenv path under the broad `[A-Za-z0-9_.-]*` tail —
-  # narrowing the CHARACTER CLASS to dodge it (a prior version of this fix)
-  # also silently stopped matching real shapes like `.env2`/`.envlocal`
-  # (PR #185 security review finding #5, bypass-harness `dotenv2`/
-  # `dotenvlocal`). Fixed instead with `_cp_strip_environ_tokens`: strip
-  # ONLY the literal `.environ`/`.environb` substring from the text before
-  # this (otherwise unchanged, still-broad) pattern runs.
-  local _cp_credpath_text
-  _cp_credpath_text="$(_cp_strip_environ_tokens "$norm")"
-  _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.netrc\b|\.npmrc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env[A-Za-z0-9_.-]*\b|\bcredentials\b' "$_cp_credpath_text" &&
+  _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.netrc\b|\.npmrc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env[A-Za-z0-9_.-]*\b|\bcredentials\b' "$norm" &&
     _cp_consider 1 "reads credential material — a human must approve"
   # Round 5: `op inject`/`op run`/`op document get`, `gh auth token`/
   # `gh auth status --show-token|-t`, `gcloud auth print-*-token`,
@@ -3556,256 +3392,6 @@ EOF
   return 1
 }
 
-# ---- python-mode credential literal: text regex gate, AST narrows only ----
-# (issue #174, then PR #185 security review round 1 Medium finding #4,
-# then round 2 High N2)
-#
-# Round 1 REPLACED `_cp_cred_shaped_and_not_placeholder` with an AST-only
-# scanner for python — which is a scan of what the AST recognizes, not of
-# what the source contains. A live review proved it auto-allowed a real
-# hardcoded secret passed as a call keyword (`f(api_key="sk-proj-…")`), a
-# function default (`def f(token="ghp_…")`), a tuple-unpack target
-# (`TOKEN, x = "ghp_…", 1`) and a walrus (`(TOKEN := "ghp_…")`) — none of
-# them an `Assign`/`AnnAssign`/dict literal, the only three shapes it knew.
-# Required design: the text regex is the gate, for python same as shell;
-# the AST only NARROWS an already-gated hit away, and only when it can
-# PROVE that hit's value is a non-string constant (`_cp_python_cred_narrow`,
-# below) — a real string secret is never droppable, however the AST
-# recognizes (or fails to recognize) the shape holding it.
-#
-# Round 2 found the narrowing itself unsound: it matched a text hit to a
-# safe AST binding by NAME alone, with three compounding defects (N2 High).
-# (a) the value was extracted by cutting at the LAST `:`/`=` in the
-# matched text, so a base64-padded value ending in `=` (`SECRET =
-# "Zm9v…=="`) cut itself down to an empty string. (b) the lookup was
-# `grep -F` without `-x`, so `SECRET\t<anything>` matched as a bare
-# SUBSTRING of an unrelated longer pair like `MY_SECRET\tNone`. (c) pairs
-# were compared by name only, never by position, so `MY_TOKEN = 12345678`
-# on one line vouched for a completely different `TOKEN = "1234"` on
-# another. Fixed: cut at the FIRST separator, not the last; match with
-# `grep -qxF` (the whole line, not a substring); and correlate a hit to a
-# binding by BOTH name and the physical LINE NUMBER it came from (the AST's
-# own `value.lineno`, since `cred_norm` preserves line structure one-for-one
-# with the content the AST parsed) — a hit only drops when a binding for
-# that exact name exists on that exact line and is provably non-string.
-#
-# The one gap text-gating reopens on its own is `{tokens:>5}` — an f-string
-# format spec reads as the identical `identifier[:=]value` shape as a real
-# dict/annotation once `scannable_command` strips the surrounding quotes,
-# and no text regex can tell them apart. `_cp_python_mask_fstring_specs`
-# closes exactly that gap, and only that gap: it finds every
-# `FormattedValue.format_spec` node via the AST, then blanks JUST that
-# node's own source SPAN (never the `{name}` expression itself, never
-# anything outside an f-string) to spaces before the credential-KV gate
-# ever runs — so a real secret sitting anywhere else in the same file,
-# including inside the SAME f-string's `{name}` part, is untouched.
-#
-# Round 2 (Low/info N4) found two more holes in the masking itself. On
-# CPython < 3.12, nested f-string position info is unreliable (PEP 701
-# landed in 3.12), so a span computed on an older interpreter cannot be
-# trusted not to overshoot into real code — skip masking entirely below
-# that version, keeping the original (more conservative) f-string-format-
-# spec false positive rather than risk hiding something real. And on ANY
-# version: a format spec can itself contain a nested `{expr}`, and that
-# expr can be a walrus — `f'{0:{(TOKEN := "ghp_…")}}'` hides a REAL secret
-# assignment inside what masking assumed was inert formatting syntax
-# (`fstring_walrus`, proven live). Fixed by never masking a format-spec
-# whose own subtree contains an `ast.NamedExpr` — a legitimate width/
-# precision spec never needs to assign anything.
-_cp_python_mask_fstring_specs() {       # content -> content with every f-string format-spec span blanked
-  printf '%s' "$1" | python3 -c '
-import ast, sys
-src = sys.stdin.read()
-if sys.version_info < (3, 12):
-    sys.stdout.write(src)
-    sys.exit(0)
-try:
-    tree = ast.parse(src)
-except Exception:
-    sys.stdout.write(src)
-    sys.exit(0)
-spans = []
-for node in ast.walk(tree):
-    if isinstance(node, ast.FormattedValue) and node.format_spec is not None:
-        fs = node.format_spec
-        if any(isinstance(n, ast.NamedExpr) for n in ast.walk(fs)):
-            continue
-        if all(hasattr(fs, a) for a in ("lineno", "col_offset", "end_lineno", "end_col_offset")):
-            spans.append((fs.lineno, fs.col_offset, fs.end_lineno, fs.end_col_offset))
-if not spans:
-    sys.stdout.write(src)
-    sys.exit(0)
-lines = src.splitlines(keepends=True)
-for sl, sc, el, ec in spans:
-    for li in range(sl - 1, el):
-        line = lines[li]
-        s = sc if li == sl - 1 else 0
-        e = ec if li == el - 1 else len(line.rstrip("\n"))
-        if 0 <= s <= e <= len(line):
-            lines[li] = line[:s] + (" " * (e - s)) + line[e:]
-sys.stdout.write("".join(lines))
-' 2>/dev/null || printf '%s' "$1"
-}
-
-# `_cp_python_cred_narrow <cred_norm> <raw-content>` -> 0 (true) iff EVERY
-# non-placeholder `_CP_CRED_KV_RE` hit in `cred_norm` corresponds — by name
-# AND by the physical line it appears on — to a binding (`Assign`,
-# `AnnAssign`, a dict literal, a call `keyword`, a function/lambda default,
-# a tuple/list-unpack target, or a walrus `NamedExpr`) the AST proves is a
-# non-string constant — `None`, a bool, or a number. A real string value is
-# NEVER recorded as droppable (`render()` returns nothing for a string
-# `Constant`), so a hit backed by an actual secret literal always survives
-# narrowing regardless of which of those shapes holds it, and regardless of
-# what else on a DIFFERENT line happens to share its name.
-#
-# `render()` also recognizes a call to `round`/`len`/`sum`/`abs` — builtins
-# whose return type can NEVER be `str` regardless of their arguments — and
-# renders it to the function's own bare name (`"round"`, not the argument
-# expression), matching what the bash side's own naive value-extraction
-# already captures for a `NAME(...)` call shape (`[^[:space:];&|(){}'",]+`
-# stops at the `(`). This is a type-signature fact about a fixed, tiny set
-# of builtins, not an enumeration of "safe" shapes reachable through
-# indirection — the distinction round 4 drew for `_cp_python_env_risk`.
-# Found via `.handoffs/acb-fixture.py` (thurber-os
-# scripts/audit_context_budget.py, the #174 acceptance script): `tokens`,
-# `session_tokens`, `worst_tokens` are LLM-token BYTE COUNTS computed as
-# `round(...)`/`sum(genexpr)`, matching `_CP_CRED_KV_RE`'s bare "TOKEN"
-# substring on a name never holding a credential.
-#
-# `op://` and an unparseable file both fall back to "not narrow" (reserved
-# stands) — same fail-closed posture as every other AST helper in this file.
-_cp_python_cred_narrow() {              # cred_norm raw -> 0 (true) if fully narrow-safe
-  local norm="$1" content="$2" safe lineno line m key val pair scan
-  _cp_match 'op://' "$norm" && return 1
-  # The caller's 2nd argument is `$raw` — unmasked, undocstring-stripped
-  # source — because line numbers below must match what `ast.parse` below
-  # reports, and only a transform that changes NO line's content or count
-  # keeps that true (`scannable_command`'s backslash-continuation fold does
-  # not: see the note below). Masking every f-string format-spec SPAN
-  # (review finding #4: `{tokens:>5}` text-matches `identifier[:=]value`
-  # once read as plain text) blanks characters in place — same line count,
-  # same AST shape — so it is safe to apply here, unlike scannable_command.
-  content="$(_cp_python_mask_fstring_specs "$content")"
-  safe="$(printf '%s' "$content" | python3 -c '
-import ast, re, sys
-try:
-    tree = ast.parse(sys.stdin.read())
-except Exception:
-    sys.exit(1)
-NAME_RE = re.compile(r"(API_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)", re.I)
-
-def target_names(t):
-    if isinstance(t, ast.Name):
-        return [t.id]
-    if isinstance(t, ast.Attribute):
-        return [t.attr]
-    if isinstance(t, (ast.Tuple, ast.List)):
-        out = []
-        for e in t.elts:
-            out += target_names(e)
-        return out
-    if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and isinstance(t.slice.value, str):
-        return [t.slice.value]
-    return []
-
-NEVER_STR_BUILTINS = {"round", "len", "sum", "abs"}
-
-def render(v):
-    if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id in NEVER_STR_BUILTINS:
-        return v.func.id
-    if not isinstance(v, ast.Constant) or isinstance(v.value, str):
-        return None
-    if v.value is None or isinstance(v.value, bool):
-        return str(v.value)
-    if isinstance(v.value, (int, float)):
-        return repr(v.value)
-    return None
-
-def record(pairs, lineno, name, rv):
-    if rv is not None and NAME_RE.search(name):
-        pairs.add((lineno, name, rv))
-
-pairs = set()
-for node in ast.walk(tree):
-    if isinstance(node, ast.Assign):
-        t0 = node.targets[0] if len(node.targets) == 1 else None
-        if isinstance(t0, (ast.Tuple, ast.List)) and isinstance(node.value, (ast.Tuple, ast.List)) and len(t0.elts) == len(node.value.elts):
-            for te, ve in zip(t0.elts, node.value.elts):
-                for name in target_names(te):
-                    record(pairs, ve.lineno, name, render(ve))
-        else:
-            rv = render(node.value)
-            for t in node.targets:
-                for name in target_names(t):
-                    record(pairs, node.value.lineno, name, rv)
-    elif isinstance(node, ast.AnnAssign) and node.value is not None:
-        rv = render(node.value)
-        for name in target_names(node.target):
-            record(pairs, node.value.lineno, name, rv)
-    elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
-        record(pairs, node.value.lineno, node.target.id, render(node.value))
-    elif isinstance(node, ast.keyword) and node.arg:
-        record(pairs, node.value.lineno, node.arg, render(node.value))
-    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-        a = node.args
-        for arg, dv in zip(reversed(a.args), reversed(a.defaults)):
-            record(pairs, dv.lineno, arg.arg, render(dv))
-        for arg, dv in zip(a.kwonlyargs, a.kw_defaults):
-            if dv is not None:
-                record(pairs, dv.lineno, arg.arg, render(dv))
-    elif isinstance(node, ast.Dict):
-        for k, v in zip(node.keys, node.values):
-            if isinstance(k, ast.Constant) and isinstance(k.value, str):
-                record(pairs, v.lineno, k.value, render(v))
-
-for lineno, name, val in sorted(pairs):
-    print(f"{lineno}\t{name}\t{val}")
-' 2>/dev/null)"
-  [ $? -eq 0 ] || return 1
-  lineno=0
-  # Walk `$scan`, not `$content` and not `$norm`/cred_norm. A dict-literal
-  # key is always quoted (`{"KEY": "value"}`) with the closing quote sitting
-  # directly between the key and its `:` separator — `_CP_CRED_KV_RE`
-  # cannot match across that quote character, so scanning `$content`
-  # (unstripped) finds NO hit at all for a quoted key and this loop's body
-  # never runs, silently "passing" (a REAL secret in a dict literal read as
-  # narrow-safe — a genuine loosening, caught by
-  # `verify-scoped-approval.sh`'s own `KB_API_KEY` regression test).
-  # `$norm`/cred_norm strips quotes but ALSO folds a trailing backslash into
-  # its next line (real shell-continuation handling, reused for cred_norm
-  # generally); a genuine multi-line python statement (`if … and \` /
-  # `… and \` / `else …`) or a tokenize-stripped docstring's gap-filler
-  # backslash lines both trigger that fold, collapsing N physical lines
-  # into 1 while the AST above still reports the ORIGINAL, unfolded line
-  # number for everything after the fold — the `(lineno, name, val)` triple
-  # this loop builds then never matches anything in `$safe`, and a file
-  # with no secret at all comes out reserved
-  # (`.handoffs/acb-fixture.py`, thurber-os scripts/audit_context_budget.py,
-  # the #174 acceptance script itself). `$scan` takes only the quote/
-  # backslash strip — same character class as `scannable_command`'s own
-  # `sed "s/['"'"'\"\\\\]//g"`, `LC_ALL=C` for the same reason
-  # (`scannable_command`'s own comment: BSD sed aborts on invalid UTF-8
-  # under any other locale) — with NO line-folding, so its line numbers
-  # stay identical to the AST's while quoted keys/values still match.
-  scan="$(printf '%s' "$content" | LC_ALL=C sed "s/['\"\\\\]//g")"
-  while IFS= read -r line; do
-    lineno=$((lineno + 1))
-    while IFS= read -r m; do
-      [ -n "$m" ] || continue
-      key="$(printf '%s' "$m" | sed -E "s/[[:space:]]*[:=].*//")"
-      val="$(printf '%s' "$m" | sed -E "s/^[^:=]*[:=][[:space:]]*['\"]?//")"
-      _cp_cred_value_is_placeholder "$val" && continue
-      pair="$(printf '%s\t%s\t%s' "$lineno" "$key" "$val")"
-      printf '%s\n' "$safe" | grep -qxF "$pair" || return 1
-    done <<EOF2
-$(printf '%s' "$line" | grep -oiE "$_CP_CRED_KV_RE" || true)
-EOF2
-  done <<EOF
-$scan
-EOF
-  return 0
-}
-
 # ---- git push: an explicit plain branch name, never HEAD or a refspec -----
 # HIGH, 2026-09-24 (round 2, conductor's live probe of tonight's actually-
 # refused commands): the FIRST version of this asked the checkout at a
@@ -3894,20 +3480,10 @@ _cp_push_is_safe() {                    # norm -> 0 (true) only for git push [-u
 # access is reserved by that caller instead (_CP_PY_ENV_RE). Everything
 # else on this list applies to python content unchanged.
 conductor_reserved_reason() {
-  local raw="$1" mode="${2:-shell}" norm action_norm fleet_norm cred_norm
+  local raw="$1" mode="${2:-shell}" norm action_norm fleet_norm
   norm="$(scannable_command "$raw")"
   action_norm="$(scannable_command "$(_cp_mask_script_data "$raw")")"
   fleet_norm="$(printf '%s' "$norm" | sed -E 's/\$\{IFS[^}]*\}/ /g; s/\$IFS\b/ /g; s/\$\{[A-Za-z_][A-Za-z0-9_]*[^}]*\}//g; s/\$[A-Za-z_][A-Za-z0-9_]*\b//g')"
-  # PR #185 security review, Medium finding #4: python's `{tokens:>5}`
-  # f-string format spec text-matches the SAME `KEY[:=]value` shape as a
-  # real dict/annotation once quotes are stripped, and cannot be told apart
-  # by text alone — this is why `_cp_python_mask_fstring_specs` exists,
-  # AST-verified and surgical (only the format-spec SPAN, nothing else, is
-  # blanked), so the credential-KV gate below never sees it while every
-  # real secret-shaped `identifier[:=]value`/dict-literal/kwarg/default/
-  # annotation stays exactly as visible to the gate as it always was.
-  cred_norm="$norm"
-  [ "$mode" = python ] && cred_norm="$(scannable_command "$(_cp_python_mask_fstring_specs "$raw")")"
   _cp_best_v=0; _cp_best_r=""
   _cp_apply_operator_rules "$norm"
   if [ "$_cp_best_v" -gt 0 ]; then printf '%s\n' "$_cp_best_r"; return; fi
@@ -3927,33 +3503,14 @@ conductor_reserved_reason() {
   # `.kube/config`, and `op inject`/`op run`/`op document get`/`gh auth
   # token`/`gcloud auth print-*-token`/`fly auth token`/`git credential`/
   # `security dump-keychain`/`security export`.
-  #
-  # `.env[A-Za-z0-9_.-]*\b` stays BROAD (see `_cp_strip_environ_tokens`'s
-  # header) — only the literal `.environ`/`.environb` substring is
-  # pre-stripped, never the character class itself (PR #185 finding #5).
-  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env[A-Za-z0-9_.-]*\b|\bcredentials\b|\bop[[:space:]]+(read|item[[:space:]]+get|inject|run|document[[:space:]]+get)\b|\bgh[[:space:]]+secret\b|\bgh\b.*\bauth\b.*(\btoken\b|\bstatus\b.*(-t\b|--show-token))|\bgcloud\b.*\bauth\b.*\bprint-(access|identity)-token\b|\b(fly|flyctl)\b.*\bauth\b.*\btoken\b|\bgit\b.*\bcredential(-[A-Za-z0-9_-]+)?\b|\bsecurity[[:space:]]+(find-(generic|internet)-password|dump-keychain|export)\b' "$(_cp_strip_environ_tokens "$norm")" ||
+  if _cp_imatch '\.ssh/|\.aws/|\.gnupg/|\.config/gcloud|\.config/gh/hosts\.yml|\.netrc\b|\.npmrc\b|\.pypirc\b|\.zshenv\b|\.dev\.vars\b|\.docker/config\.json\b|\.kube/config\b|id_(rsa|ed25519|ecdsa)\b|\.env[A-Za-z0-9_.-]*\b|\bcredentials\b|\bop[[:space:]]+(read|item[[:space:]]+get|inject|run|document[[:space:]]+get)\b|\bgh[[:space:]]+secret\b|\bgh\b.*\bauth\b.*(\btoken\b|\bstatus\b.*(-t\b|--show-token))|\bgcloud\b.*\bauth\b.*\bprint-(access|identity)-token\b|\b(fly|flyctl)\b.*\bauth\b.*\btoken\b|\bgit\b.*\bcredential(-[A-Za-z0-9_-]+)?\b|\bsecurity[[:space:]]+(find-(generic|internet)-password|dump-keychain|export)\b' "$norm" ||
      { [ "$mode" != python ] && _cp_env_dump_invoked "$1"; } || _cp_secret_var_expanded "$norm"; then
     printf 'credential-value access remains human-only\n'
   # Terrence's authorized loosening, 2026-09-24: a credential-shaped VALUE
   # typed directly into the command (not a path/command match above) is
   # reserved too, UNLESS it is an obvious test-code placeholder — see
   # _cp_cred_shaped_and_not_placeholder for the exact carve-out.
-  #
-  # PR #185 security review, Critical/High/Medium (findings #1-4): a prior
-  # version REPLACED this text check with an AST-only scanner for python
-  # mode, which is structurally a scan of what the AST recognizes, not of
-  # what the source contains — an import alias (`import os as o`), a
-  # kwarg/default/tuple-target/walrus secret, or `vars()`/`getattr()`/
-  # `__dict__` indirection all bypassed it, turning a RESERVED read into an
-  # auto-allow. The text regex is now the gate for python too, unchanged
-  # from shell mode; `_cp_python_cred_narrow` only NARROWS an already-gated
-  # hit away when the AST proves that specific identifier is bound to a
-  # non-string constant (`None`, a number, a bool) — a real string secret,
-  # anywhere the AST can see one bound (Assign, AnnAssign, dict literal,
-  # call keyword, function default, tuple-unpack target, walrus), is never
-  # droppable.
-  elif _cp_cred_shaped_and_not_placeholder "$cred_norm" &&
-       ! { [ "$mode" = python ] && _cp_python_cred_narrow "$cred_norm" "$raw"; }; then
+  elif _cp_cred_shaped_and_not_placeholder "$norm"; then
     printf 'credential-value access remains human-only\n'
   # The curl clause knew only -X / --data / -d, so the upload verbs this same
   # branch identified as exfiltration paths — -T/--upload-file, -F/--form,
