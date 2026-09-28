@@ -422,7 +422,17 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
   [ -n "$registry_cmd" ] && [ "$cmd_text" = "$registry_cmd" ] && cmd_text_is_scrape=0
 fi
 menu_rows_ambiguous=0
-if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
+# #187: this guard exists for a BASH command that terminal-wrapped mid-token
+# (#186) — real newlines and a genuine terminal wrap are indistinguishable
+# from row count alone, so a bash panel with more than one command row must
+# stay human-only. A non-bash "Allow tool: <name>" panel (`write`'s
+# `Path:`/`Content:` rows, `read`'s `Path:` row, ...) is FIELDS, not a shell
+# command that could wrap: its row count says nothing about a hidden
+# statement. `_cp_non_shell_panel_tool` is the exact same bash/shell/sh/zsh
+# vs. everything-else split classify_command itself uses below, so this
+# never drifts from what actually gets judged as a command.
+panel_tool="$(_cp_non_shell_panel_tool "$cmd_text" 2>/dev/null || true)"
+if [ -z "$panel_tool" ] && [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
   if menu_command_rows="$(prompt_menu_command_rows "$pane" 2>/dev/null)"; then
     case "$menu_command_rows" in
       ''|*[!0-9]*) menu_rows_ambiguous=1 ;;
@@ -434,7 +444,7 @@ if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ] 
 fi
 
 
-policy_verdict="$(classify_command "$cmd_text")"
+policy_verdict="$(classify_command "$cmd_text" "$own_worktree")"
 policy_reason="$(classify_reason)"
 if [ "$cmd_text_is_scrape" = 1 ] && [ "$cmd_torn" = 1 ] && [ "$policy_verdict" != deny ]; then
   policy_verdict=escalate

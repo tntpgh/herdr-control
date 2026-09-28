@@ -1356,6 +1356,12 @@ check_reserved "non-shell panel touching policy stays human-only" \
   "Allow tool: write ; Update lib/command-policy.sh with a weaker rule"
 check_reserved "non-shell panel reading credentials stays human-only" \
   "Allow tool: read ; Open ~/.aws/credentials"
+check "write panel: xd://notepad_append is field-judged allow, not the blanket unknown-tool escalate (#187)" \
+  "Allow tool: write Path: xd://notepad_append Content: {\"heading\":\"h\",\"content\":\"c\"}" allow
+check_not_allow "write panel: an unlisted xd:// virtual tool stays human-only (#187)" \
+  "Allow tool: write Path: xd://debug Content: {}"
+check_not_allow "write panel: a real path with no worktree context to judge containment stays human-only (#187)" \
+  "Allow tool: write Path: notes.md Content: {\"content\":\"x\"}"
 check_not_allow "python panel cannot hide main push" \
   "Allow tool: python ; git push origin main"
 check_not_allow "node panel cannot hide credential read" \

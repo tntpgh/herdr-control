@@ -2731,6 +2731,95 @@ _cp_safe_non_shell_panel() {
   esac
 }
 
+# _cp_lexical_abspath <path> -> prints a `/`-rooted, `.`/`..`-collapsed form
+# of <path> WITHOUT touching the filesystem — the write target may not exist
+# yet, so realpath(1) is not an option. String-lexical only: a symlink that
+# points outside the worktree is not caught here (that is the real
+# PreToolUse hook's job at #159; this is a second, coarser gate deciding
+# whether automation may press Approve on the omp confirm dialog at all).
+_cp_lexical_abspath() {
+  local p="$1" part
+  set --
+  local IFS=/
+  for part in $p; do
+    case "$part" in
+      ''|.) ;;
+      ..) [ "$#" -gt 0 ] && set -- "${@:1:$(($#-1))}" ;;
+      *) set -- "$@" "$part" ;;
+    esac
+  done
+  if [ "$#" -eq 0 ]; then printf '/'; return; fi
+  local out="" seg
+  for seg in "$@"; do out="$out/$seg"; done
+  printf '%s' "$out"
+}
+
+# _cp_path_within_worktree <path> <worktree> -> 0 when <path> (relative
+# paths resolved against <worktree>) lexically resolves inside it.
+_cp_path_within_worktree() {
+  local p="$1" wt="$2" abs wt_abs
+  [ -n "$wt" ] || return 1
+  case "$p" in
+    /*) abs="$p" ;;
+    '~'*) return 1 ;;
+    *) abs="$wt/$p" ;;
+  esac
+  abs="$(_cp_lexical_abspath "$abs")"
+  wt_abs="$(_cp_lexical_abspath "$wt")"
+  case "$abs" in
+    "$wt_abs"|"$wt_abs"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _cp_write_menu_verdict <raw panel text> <worktree> -> "allow" or
+# "escalate:<reason>" on stdout, or nothing (caller falls back to the
+# existing "unknown tool" escalate) when the shape cannot be judged safely.
+#
+# #187: the multi-row guard in herdr-select.sh exists for bash commands that
+# terminal-wrap mid-token (#186) — a field-labelled tool panel (`write`'s
+# `Path:`/`Content:` rows) is not a shell command at all, so herdr-select.sh
+# no longer runs that guard on it (see its own comment). This is the real
+# judgment that replaces it: the FIRST body row after the header is always
+# the tool's own `Path:` row in the omp panel layout, never something a
+# `Content:` VALUE can relocate — `raw` is `$panel_tool`'s header, one
+# space, then every subsequent row space-joined in order (prompt_command_text
+# / classify_command's normal input), so anchoring the match at `^Allow
+# tool: write Path: ` and cutting at the FIRST ` Content: ` after it reads
+# only the real Path row: a crafted Content VALUE lives strictly after that
+# literal marker and can never be mistaken for it. A Path token containing
+# whitespace (so the cut landed on something other than a bare token) fails
+# closed to "unjudged" rather than guessing.
+_cp_write_menu_verdict() {
+  local raw="$1" wt="$2" path
+  case "$raw" in
+    "Allow tool: write Path: "*" Content: "*)
+      path="${raw#Allow tool: write Path: }"
+      path="${path%% Content: *}"
+      ;;
+    *) return 1 ;;
+  esac
+  case "$path" in
+    ''|*[[:space:]]*) return 1 ;;
+  esac
+  case "$path" in
+    xd://notepad_append|xd://notepad_priority|xd://notepad_stats|xd://notepad_read)
+      printf 'allow'; return 0 ;;
+    xd://*)
+      return 1 ;;
+  esac
+  if [ -z "$wt" ]; then
+    printf 'escalate:worker worktree unknown — cannot judge write path containment'
+    return 0
+  fi
+  if _cp_path_within_worktree "$path" "$wt"; then
+    printf 'allow'
+  else
+    printf 'escalate:write path resolves outside the worker'"'"'s worktree — remains human-only'
+  fi
+  return 0
+}
+
 # A script runner's quoted arguments are data to its script, not command
 # position. Do not let a prose/data argument such as
 # `bash probe.sh 'git push origin feat/x'` reserve the outer approval. Inline
@@ -2766,18 +2855,30 @@ _cp_mask_script_data() {
     }'
 }
 
-classify_command() {
+classify_command() {                    # <panel/command text> [worktree]
   if [ "$#" -lt 1 ]; then
     printf 'command-policy: classify_command requires a <command> argument\n' >&2
     return 2
   fi
-  local raw="$1" norm
+  local raw="$1" wt="${2:-}" norm
   if [ -n "$(_cp_non_shell_panel_tool "$raw" 2>/dev/null)" ]; then
     if _cp_safe_non_shell_panel "$raw"; then
       : > "$(_cp_reason_file)"
       printf 'allow\n'
       return 0
     fi
+    local _cp_wv
+    _cp_wv="$(_cp_write_menu_verdict "$raw" "$wt" 2>/dev/null)"
+    case "$_cp_wv" in
+      allow)
+        : > "$(_cp_reason_file)"
+        printf 'allow\n'
+        return 0 ;;
+      escalate:*)
+        printf '%s\n' "${_cp_wv#escalate:}" > "$(_cp_reason_file)"
+        printf 'escalate\n'
+        return 0 ;;
+    esac
     printf 'unknown or executing tool approval remains human-only\n' > "$(_cp_reason_file)"
     printf 'escalate\n'
     return 0
