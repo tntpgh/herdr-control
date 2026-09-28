@@ -334,7 +334,7 @@ if [ "$dry" = 1 ]; then
   echo "  repo      : $root"
   echo "  project   : $project_label"
   echo "  worktree  : $wt   (branch ${branch}${base:+ off ${base}})"
-  echo "  workspace : $(bash "$here/ensure-workspace.sh" --no-focus "$root" 2>/dev/null || echo '<would create>')"
+  echo "  workspace : $(bash "$here/ensure-workspace.sh" --lookup "$root" 2>/dev/null || echo '<would create>')"
   echo "  tab label : $label"
   if [ "$managed" = 1 ]; then
     echo "  launch    : $cli"

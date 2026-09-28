@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
-# ensure-workspace.sh [--no-focus] <project-path>
+# ensure-workspace.sh [--no-focus|--lookup] <project-path>
 #
 # Print the workspace_id for a project, focusing an existing workspace if one is
 # already open on that repo, else creating one. "Open on that repo" is decided by
 # pane cwd (herdr pane list carries cwd + workspace_id) — the workspace `worktree`
 # field is only populated for herdr-managed worktrees, and labels are cosmetic, so
 # cwd is the reliable key. Matches by git top-level so a subdir pane still counts.
+#
+# --lookup: print an EXISTING workspace's id and exit 0, or exit 2 printing
+# nothing. Never creates or focuses. `spawn-task.sh --dry-run` uses it — a dry
+# run that created a real workspace leaked one "repo" workspace per
+# verify-pretool-enforce.sh run (nine found open on 2026-09-28).
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/config.sh"
 . "$here/lib/repo-root.sh"
 
-focus=1
-[ "${1:-}" = "--no-focus" ] && { focus=0; shift; }
-proj="${1:?usage: ensure-workspace.sh [--no-focus] <project-path>}"
+focus=1; lookup=0
+case "${1:-}" in
+  --no-focus) focus=0; shift ;;
+  --lookup)   focus=0; lookup=1; shift ;;
+esac
+proj="${1:?usage: ensure-workspace.sh [--no-focus|--lookup] <project-path>}"
 [ -d "$proj" ] || { echo "ensure-workspace: not a directory: $proj" >&2; exit 1; }
 
 # Canonical PROJECT root — repo_root (lib/repo-root.sh), shared with
@@ -40,6 +48,7 @@ if [ -n "$ws" ]; then
   printf '%s\n' "$ws"
   exit 0
 fi
+[ "$lookup" = 1 ] && exit 2
 
 # Create it. herdr auto-creates a root tab as part of workspace creation but
 # gives it no label of its own (herdr's bare default is just the tab's

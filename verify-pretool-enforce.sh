@@ -412,7 +412,22 @@ fi
 printf '== spawn-task.sh --approval ==\n'
 norm() { sed -E 's/(run|task|worker)_[0-9TZ_]+/\1_X/g; s/term_[0-9a-f]+/term_X/g'; }
 repo="$work/repo"; git init -q "$repo" && git -C "$repo" commit -q --allow-empty -m init
-dry() { local d="$1"; shift; env -u HERDR_TASK_ID -u HERDR_RUN_ID HERDR_PANE_ID="$CPANE" bash "$d/spawn-task.sh" --dry-run --no-secrets "$repo" "$@" 2>&1 | norm | sed "s#$d/#<checkout>/#g"; }
+# Every dry run here talks to a LOGGING stub herdr, never the live one: a dry
+# run that reached the real herdr created a workspace per suite run (#188).
+# The stub leads HERDR_EXTRA_PATH, because config.sh:187 puts that ahead of
+# PATH (and $work/bin/herdr, this suite's own fixture, is on PATH).
+stubbin="$work/stubbin"; mkdir -p "$stubbin"
+cat > "$stubbin/herdr" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "${HERDR_STUB_LOG:-/dev/null}"
+[ "$1 $2" = "pane list" ] && { echo '{"result":{"panes":[]}}'; exit 0; }
+exit 1
+EOF
+chmod +x "$stubbin/herdr"
+stub_env=(HERDR_EXTRA_PATH="$stubbin:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin")
+dry() { local d="$1" lg="$work/herdr-head.log"; shift; [ "$d" = "$here" ] || lg="$work/herdr-base.log"
+  env -u HERDR_TASK_ID -u HERDR_RUN_ID HERDR_PANE_ID="$CPANE" "${stub_env[@]}" HERDR_STUB_LOG="$lg" \
+    bash "$d/spawn-task.sh" --dry-run --no-secrets "$repo" "$@" 2>&1 | norm | sed "s#$d/#<checkout>/#g"; }
 base_dir="$work/base2"; git -C "$here" worktree add -q --detach "$base_dir" origin/main 2>/dev/null
 # The job-class tool set (lib/agent-profiles.sh tools_for_job, pinned by
 # verify-posture.sh) changes the launch line on purpose; what THIS check
@@ -444,6 +459,14 @@ printf '// old hook\n' > "$work/old-hook.ts"
 out="$(HERDR_OMP_EXTENSION="$work/old-hook.ts" dry "$here" fix/y implement omp --approval hook)"
 printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "refused: an installed hook without the enforcement protocol" || not_ok "old hook: $out"
 [ ! -d "$HOME/.herdr/worktrees/$(basename "$repo")" ] && ok "refused spawns created no worktree" || not_ok "a refused spawn left a worktree"
+# The log can see a create: the same stub, asked by ensure-workspace.sh's
+# create path, records one. Without this the check below could pass vacuously.
+env "${stub_env[@]}" HERDR_STUB_LOG="$work/herdr-control.log" bash "$here/ensure-workspace.sh" --no-focus "$repo" >/dev/null 2>&1
+grep -q '^workspace create' "$work/herdr-control.log" 2>/dev/null \
+  && ok "control: the stub log records a workspace create when one is attempted" || not_ok "control: stub log saw no create: $(cat "$work/herdr-control.log" 2>/dev/null | tr '\n' ';')"
+[ -s "$work/herdr-head.log" ] && ! grep -q -E '^workspace (create|focus)' "$work/herdr-head.log" \
+  && ok "HEAD dry runs never ask herdr to create or focus a workspace" \
+  || not_ok "a HEAD dry run touched workspaces: $(grep -E '^workspace' "$work/herdr-head.log" 2>/dev/null | tr '\n' ';')"
 
 printf '== shadow-compare.sh --gate (decision q1) ==\n'
 g="$work/gate"; mkdir -p "$g"
