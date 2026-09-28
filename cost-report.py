@@ -43,10 +43,12 @@ SESSIONS_DIR = Path(os.environ.get("HERDR_SESSIONS_DIR", HOME / ".omp/agent/sess
 STATE = Path(os.environ.get("HERDR_STATE_ROOT", HOME / ".local/state/herdr"))
 OUT_PATH = Path(os.environ.get("HERDR_COST_REPORT_PATH", STATE / "cost-report.json"))
 
-# compaction.thresholdTokens, live 2026-09-27T20:00Z (SPEC.md). A turn above
-# this is exactly the failure mode the cap exists to prevent; turns_over_300k
-# splits at CAP_LIVE_AT so "backlog from before the fix" and "the fix didn't
-# work" read as different numbers, not one blended count.
+# compaction.thresholdTokens, live 2026-09-27T20:00Z (SPEC.md). One turn above
+# it is EXPECTED per compaction — the turn that crosses the threshold is what
+# triggers compaction — so the count of such turns is information, not an
+# alert. What the cap must prevent is a second consecutive over-threshold turn
+# with no compaction between: `cap_misses_since_cap`. Both split at CAP_LIVE_AT
+# so "backlog from before the fix" and "the fix didn't work" read apart.
 CONTEXT_ALERT_THRESHOLD = 300_000
 CAP_LIVE_AT = "2026-09-27T20:00:00+00:00"
 
@@ -60,12 +62,16 @@ _GITDIR_RE = re.compile(r"gitdir:\s*(.+?)/\.git/worktrees/")
 
 
 def _parse_ts(s) -> dt.datetime | None:
+    """ISO string -> aware datetime. An offset-less value is read as UTC:
+    comparing a naive datetime with the aware window bounds raises TypeError,
+    and one such line would abort the whole hourly run."""
     if not isinstance(s, str) or not s:
         return None
     try:
-        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
 
 
 def _repo_from_git_pointer(worktree_root: Path) -> str | None:
@@ -109,6 +115,10 @@ def resolve_repo(cwd: str | None) -> str:
         rel = None
     if rel is not None and rel.parts:
         name = rel.parts[0]
+        # herdr-control's own smoke tests make ~/Code/.worktrees/.hc-smoke.XXXX
+        # scratch dirs; a dot-named entry is never a repo.
+        if name.startswith("."):
+            return "other"
         return _repo_from_git_pointer(CODE_WORKTREES / name) or name
 
     try:
@@ -117,6 +127,11 @@ def resolve_repo(cwd: str | None) -> str:
         rel = None
     # Dot-directories under ~/Code (.worktrees, .hc-smoke.XXXX scratch) are not repos.
     if rel is not None and rel.parts and not rel.parts[0].startswith("."):
+        # A repo may sit one level down (~/Code/Dev/conTNTainer): the nearest
+        # ancestor holding `.git` names it; the first component otherwise.
+        for depth in range(1, min(len(rel.parts), 3) + 1):
+            if (CODE.joinpath(*rel.parts[:depth]) / ".git").exists():
+                return rel.parts[depth - 1]
         return rel.parts[0]
 
     return "other"
@@ -124,7 +139,7 @@ def resolve_repo(cwd: str | None) -> str:
 
 def _empty_totals() -> dict:
     return {"cost": 0.0, "by_bucket": {b: 0.0 for b in COST_BUCKETS},
-            "turns": 0, "over_300k": 0, "over_300k_since_cap": 0}
+            "turns": 0, "over_300k": 0, "over_300k_since_cap": 0, "cap_misses_since_cap": 0}
 
 
 def _turn_usage(obj: dict) -> dict | None:
@@ -160,7 +175,13 @@ def scan(sessions_dir: Path, window_start: dt.datetime, window_end: dt.datetime,
     sessions: dict[str, dict] = {}
     unreadable = 0
 
-    for path in sessions_dir.glob("*/*.jsonl"):
+    # rglob, not */*.jsonl: omp writes `task` subagent transcripts one and two
+    # levels below their parent (sessions/<cwd>/<parent>/<child>.jsonl, and
+    # <child>/<grandchild>.jsonl) — 392 of 626 files touched in 14 days
+    # (2026-09-28). Each carries its own `session` line and assistant usage;
+    # the parent records their cost only inside a toolResult's details, which
+    # _turn_usage never reads, so nothing is counted twice.
+    for path in sessions_dir.rglob("*.jsonl"):
         try:
             mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
         except OSError:
@@ -168,8 +189,9 @@ def scan(sessions_dir: Path, window_start: dt.datetime, window_end: dt.datetime,
             continue
         if mtime < prev_start:
             continue
-        cwd = None
+        repo = resolve_repo(None)
         session_id = None
+        prev_over = False  # previous billed turn in this file was over threshold
         try:
             with path.open(errors="replace") as fh:
                 for line in fh:
@@ -185,10 +207,13 @@ def scan(sessions_dir: Path, window_start: dt.datetime, window_end: dt.datetime,
                     if obj.get("type") == "session":
                         c = obj.get("cwd")
                         if isinstance(c, str):
-                            cwd = c
+                            repo = resolve_repo(c)
                         sid = obj.get("id")
                         if isinstance(sid, str):
                             session_id = sid
+                        continue
+                    if obj.get("type") == "compaction":
+                        prev_over = False
                         continue
                     usage = _turn_usage(obj)
                     if not isinstance(usage, dict):
@@ -216,14 +241,18 @@ def scan(sessions_dir: Path, window_start: dt.datetime, window_end: dt.datetime,
                         v = cost.get(b)
                         if isinstance(v, (int, float)):
                             target["by_bucket"][b] += v
-                    if context > CONTEXT_ALERT_THRESHOLD:
+                    over = context > CONTEXT_ALERT_THRESHOLD
+                    since_cap = in_window and cap_live_at is not None and ts >= cap_live_at
+                    if over:
                         target["over_300k"] += 1
-                        if in_window and cap_live_at is not None and ts >= cap_live_at:
+                        if since_cap:
                             target["over_300k_since_cap"] += 1
-                    repo = resolve_repo(cwd)
+                            if prev_over:
+                                target["cap_misses_since_cap"] += 1
+                    prev_over = over
                     if in_window:
                         by_repo[repo] = by_repo.get(repo, 0.0) + turn_total
-                        s = sessions.setdefault(session_id or path.name,
+                        s = sessions.setdefault(session_id or path.stem,
                                                  {"repo": repo, "cost": 0.0, "turns": 0, "max_context": 0})
                         s["cost"] += turn_total
                         s["turns"] += 1
@@ -235,7 +264,7 @@ def scan(sessions_dir: Path, window_start: dt.datetime, window_end: dt.datetime,
             continue
 
     top = sorted(sessions.items(), key=lambda kv: kv[1]["cost"], reverse=True)[:10]
-    top_sessions = [{"id_prefix": sid[:8], "repo": v["repo"], "cost": round(v["cost"], 4),
+    top_sessions = [{"session_id": sid, "repo": v["repo"], "cost": round(v["cost"], 4),
                       "turns": v["turns"], "max_context": v["max_context"]} for sid, v in top]
 
     def _sorted_repo_costs(d: dict) -> dict:
@@ -254,6 +283,7 @@ def scan(sessions_dir: Path, window_start: dt.datetime, window_end: dt.datetime,
         "session_count": len(sessions),
         "turns_over_300k": totals["over_300k"],
         "turns_over_300k_since_cap": totals["over_300k_since_cap"],
+        "cap_misses_since_cap": totals["cap_misses_since_cap"],
         "prev_turns_over_300k": prev_totals["over_300k"],
         "unreadable_files": unreadable,
         "context_alert_threshold": CONTEXT_ALERT_THRESHOLD,
@@ -294,11 +324,12 @@ def render_table(report: dict) -> str:
     for repo, v in report["cost_by_repo"].items():
         lines.append(f"  {repo:<28} ${v:,.2f}")
     lines += ["", f"turns over {report['context_alert_threshold']:,} context: {report['turns_over_300k']}"
-              f" ({report['turns_over_300k_since_cap']} since cap {report['cap_live_at']})",
+              f" ({report['turns_over_300k_since_cap']} since cap {report['cap_live_at']},"
+              f" {report['cap_misses_since_cap']} with no compaction after the previous one)",
               "", "top sessions:",
-              f"  {'id':<10}{'repo':<28}{'cost':>10}  {'turns':>6}  {'max_ctx':>10}"]
+              f"  {'session':<38}{'repo':<22}{'cost':>10}  {'turns':>6}  {'max_ctx':>10}"]
     for s in report["top_sessions"]:
-        lines.append(f"  {s['id_prefix']:<10}{s['repo']:<28}{'$' + format(s['cost'], ',.2f'):>10}"
+        lines.append(f"  {s['session_id']:<38}{s['repo']:<22}{'$' + format(s['cost'], ',.2f'):>10}"
                       f"  {s['turns']:>6}  {s['max_context']:>10,}")
     if not report["top_sessions"]:
         lines.append("  (none in window)")

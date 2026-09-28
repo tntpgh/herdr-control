@@ -2490,17 +2490,27 @@ def cost_report_data() -> dict:
         age = None
     if age is None or age > COST_REPORT_STALE_S:
         alerts.append("report is stale — is the cost-report job running?")
-    if d.get("turns_over_300k_since_cap"):
-        alerts.append(f"{d['turns_over_300k_since_cap']} turn(s) over "
-                      f"{d.get('context_alert_threshold', 300_000):,} context since the compaction cap")
+    # One over-threshold turn per compaction is the cap WORKING (that turn is
+    # what triggers it); a second in a row with no compaction between is the
+    # cap failing — cost-report.py counts exactly that as cap_misses_since_cap.
+    if d.get("cap_misses_since_cap"):
+        alerts.append(f"{d['cap_misses_since_cap']} turn(s) stayed over "
+                      f"{_num(d.get('context_alert_threshold')) or 300_000:,} context with no compaction "
+                      f"since the cap")
     prev = d.get("prev_total_cost") or 0
     if prev and d["total_cost"] > prev * COST_GROWTH_ALERT:
         alerts.append(f"spend up {(d['total_cost'] - prev) / prev * 100:.0f}% week over week")
     return dict(d, present=True, alerts=alerts)
 
 
+def _num(v) -> float:
+    return v if isinstance(v, (int, float)) else 0
+
+
 def cost_rows(c: dict) -> str:
-    """Alerts first, then the sessions that cost the most, then spend by repo."""
+    """Alerts first, then the sessions that cost the most, then spend by repo.
+    Every number is coerced: a hand-edited or corrupt report degrades this
+    section, never the whole overview page (render_overview has one try)."""
     if c.get("error"):
         return f"<tr class=hot><td>{_esc(c['error'])}</td></tr>"
     if not c.get("present"):
@@ -2508,12 +2518,16 @@ def cost_rows(c: dict) -> str:
     out = [f"<tr class=hot><td colspan=5><span class='pill hot'>alert</span> {_esc(a)}</td></tr>"
            for a in c.get("alerts", [])]
     out.append("<tr><th>session</th><th>repo</th><th>cost</th><th>turns</th><th>max context</th></tr>")
+    threshold = _num(c.get("context_alert_threshold")) or 300_000
     for s in c.get("top_sessions") or []:
-        hot = (s.get("max_context") or 0) > c.get("context_alert_threshold", 300_000)
-        out.append(f"<tr{' class=hot' if hot else ''}><td>{_esc(s.get('id_prefix'))}</td>"
-                   f"<td>{_esc(s.get('repo'))}</td><td>${s.get('cost', 0):,.2f}</td>"
-                   f"<td>{s.get('turns', 0)}</td><td>{s.get('max_context', 0):,}</td></tr>")
-    repos = " · ".join(f"{_esc(r)} ${v:,.0f}" for r, v in (c.get("cost_by_repo") or {}).items())
+        if not isinstance(s, dict):
+            continue
+        ctx = int(_num(s.get("max_context")))
+        out.append(f"<tr{' class=hot' if ctx > threshold else ''}><td>{_esc(s.get('session_id'))}</td>"
+                   f"<td>{_esc(s.get('repo'))}</td><td>${_num(s.get('cost')):,.2f}</td>"
+                   f"<td>{int(_num(s.get('turns')))}</td><td>{ctx:,}</td></tr>")
+    by_repo = c.get("cost_by_repo") if isinstance(c.get("cost_by_repo"), dict) else {}
+    repos = " · ".join(f"{_esc(r)} ${_num(v):,.0f}" for r, v in by_repo.items())
     out.append(f"<tr><td colspan=5 class=dim>by repo: {repos or '—'} · "
                f"generated {_age(c.get('generated_at'))} ago</td></tr>")
     return "".join(out)

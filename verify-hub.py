@@ -1853,22 +1853,32 @@ class CostReport(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.sessions = self.root / "sessions"
 
-    def session(self, name, cwd, turns):
-        """turns: (hours_before_NOW, cost, context_tokens)."""
+    def session(self, name, cwd, turns, sub=None, naive=False):
+        """turns: (hours_before_NOW, cost, context_tokens), or "compact" for a
+        compaction entry. `sub` writes the file where omp puts a `task`
+        subagent: sessions/<name>/<parent>/<sub>.jsonl."""
         d = self.sessions / name
+        if sub:
+            d = d / "2026-09-28T00-00-00-000Z_parent"
         d.mkdir(parents=True, exist_ok=True)
+        sid = f"{name}-{sub or 'top'}-sess"
         lines = [{"type": "title", "title": self.SECRET},
-                 {"type": "session", "id": f"{name}-0000-sess", "cwd": cwd,
+                 {"type": "session", "id": sid, "cwd": cwd,
                   "timestamp": (self.NOW - dt.timedelta(days=20)).isoformat()}]
-        for hours, cost, ctx in turns:
-            ts = (self.NOW - dt.timedelta(hours=hours)).isoformat()
+        for t in turns:
+            if t == "compact":
+                lines.append({"type": "compaction", "summary": self.SECRET})
+                continue
+            hours, cost, ctx = t
+            when = self.NOW - dt.timedelta(hours=hours)
+            ts = (when.replace(tzinfo=None) if naive else when).isoformat()
             lines.append({"type": "message", "timestamp": ts, "message": {
                 "role": "assistant", "content": [{"type": "text", "text": self.SECRET}],
                 "usage": {"input": 1, "output": 5, "cacheRead": ctx - 1, "cacheWrite": 0,
                           "cost": {"input": 0, "output": 0, "cacheRead": cost, "cacheWrite": 0,
                                    "total": cost}}}})
         lines.append("{torn half-written line")
-        f = d / "s.jsonl"
+        f = d / f"{sub or 's'}.jsonl"
         f.write_text("\n".join(x if isinstance(x, str) else json.dumps(x) for x in lines) + "\n")
         os.utime(f, (self.NOW.timestamp(), self.NOW.timestamp()))
 
@@ -1881,26 +1891,39 @@ class CostReport(unittest.TestCase):
     def test_windows_repos_and_the_cap_split_are_counted_separately(self):
         cap = dt.datetime.fromisoformat(cost_report.CAP_LIVE_AT)
         since_cap_h = (self.NOW - cap).total_seconds() / 3600 - 1  # 1h after the cap
-        self.session("a", str(self.root / ".herdr/worktrees/tourguide/fix/x"),
-                     [(2, 1.5, 100_000), (since_cap_h, 2.0, 400_000), (24 * 9, 7.0, 500_000)])
+        tg = str(self.root / ".herdr/worktrees/tourguide/fix/x")
+        self.session("a", tg, [(2, 1.5, 100_000), (since_cap_h, 2.0, 400_000), (24 * 9, 7.0, 500_000)])
+        # A `task` subagent's own transcript, one level below its parent.
+        self.session("a", tg, [(1, 0.75, 1_000)], sub="Scout")
         self.session("b", str(self.root / "Code/knowledge-base"), [(since_cap_h + 3, 0.5, 350_000)])
         self.session("c", str(self.root / "Code/.hc-smoke.AbC123"), [(3, 0.25, 10)])
+        self.session("d", str(self.root / "Code/.worktrees/.hc-smoke.XyZ789/wt"), [(3, 0.25, 10)])
+        # Over, over again with no compaction (a cap MISS), compaction, over (expected).
+        self.session("m", str(self.root / "Code/thurber-os"),
+                     [(since_cap_h - 1, 0.1, 310_000), (since_cap_h - 2, 0.1, 320_000), "compact",
+                      (since_cap_h - 3, 0.1, 330_000)])
+        (self.root / "Code/Dev/conTNTainer/.git").mkdir(parents=True)
+        self.session("n", str(self.root / "Code/Dev/conTNTainer/src"), [(1, 0.05, 10)], naive=True)
         r = self.build()
-        self.assertAlmostEqual(r["total_cost"], 4.25)
+        self.assertAlmostEqual(r["total_cost"], 5.6)
         self.assertAlmostEqual(r["prev_total_cost"], 7.0)
-        self.assertEqual(r["cost_by_repo"], {"tourguide": 3.5, "knowledge-base": 0.5, "other": 0.25})
-        # 400k (after the cap) and 350k (before it) are both over 300k in-window;
-        # only the first says the cap failed. The 500k turn is last week's.
+        self.assertEqual(r["cost_by_repo"], {"tourguide": 4.25, "knowledge-base": 0.5, "thurber-os": 0.3,
+                                             "other": 0.5, "conTNTainer": 0.05})
+        # In-window over 300k: a's 400k, b's 350k (before the cap), m's three.
+        # Since the cap: a's one and m's three — but only m's second, with no
+        # compaction after the first, is the cap failing. 500k is last week's.
         self.assertEqual((r["turns_over_300k"], r["turns_over_300k_since_cap"],
-                          r["prev_turns_over_300k"]), (2, 1, 1))
+                          r["cap_misses_since_cap"], r["prev_turns_over_300k"]), (5, 4, 1, 1))
         top = r["top_sessions"][0]
-        self.assertEqual((top["repo"], top["turns"], top["max_context"]), ("tourguide", 2, 400_000))
+        self.assertEqual((top["session_id"], top["repo"], top["turns"], top["max_context"]),
+                         ("a-top-sess", "tourguide", 2, 400_000))
         self.assertNotIn(self.SECRET, json.dumps(r) + cost_report.render_table(r))
 
     def write_report(self, **kw):
-        rep = {"total_cost": 100.0, "prev_total_cost": 100.0, "turns_over_300k_since_cap": 0,
+        rep = {"total_cost": 100.0, "prev_total_cost": 100.0, "cap_misses_since_cap": 0,
+               "turns_over_300k_since_cap": 5,
                "context_alert_threshold": 300_000, "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-               "top_sessions": [{"id_prefix": "01a0c5f0", "repo": "thurber-os", "cost": 58.3,
+               "top_sessions": [{"session_id": "01a0c5f0-aaaa-7000-8000-00000000beef", "repo": "thurber-os", "cost": 58.3,
                                  "turns": 400, "max_context": 856_441}],
                "cost_by_repo": {"thurber-os": 58.3}}
         rep.update(kw)
@@ -1918,7 +1941,7 @@ class CostReport(unittest.TestCase):
 
     def test_each_reason_to_look_raises_its_own_alert(self):
         stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)).isoformat()
-        cases = {"cap": ({"turns_over_300k_since_cap": 3}, "since the compaction cap"),
+        cases = {"cap miss": ({"cap_misses_since_cap": 3}, "with no compaction since the cap"),
                  "growth": ({"total_cost": 126.0}, "week over week"),
                  "stale": ({"generated_at": stale}, "stale"),
                  "no timestamp": ({"generated_at": None}, "stale")}
@@ -1937,18 +1960,29 @@ class CostReport(unittest.TestCase):
         self.assertIn("no total_cost", self.data(bad)["error"])
 
     def test_the_overview_shows_the_card_hot_and_the_section_escaped(self):
-        path = self.write_report(turns_over_300k_since_cap=2,
+        path = self.write_report(cap_misses_since_cap=2,
                                  cost_by_repo={"<script>x</script>": 1.0})
         caches = {name: Mock(get=lambda: {}, peek=lambda: {}) for name in hub.CACHES}
         caches["cost"] = hub.Cached(0, hub.cost_report_data, name="cost")
         with patch.dict(hub.CACHES, caches), patch.object(hub, "COST_REPORT", path):
             html_out = hub.render_overview()
         card = re.search(r"<a class='card hot' href='#cost'>.*?</a>", html_out)
-        self.assertIsNotNone(card, "a turn over 300k since the cap must make the card hot")
+        self.assertIsNotNone(card, "a cap miss must make the card hot")
         self.assertIn("$100", card.group(0))
         self.assertIn("<h2 id=cost>LLM spend</h2>", html_out)
         self.assertIn("856,441", html_out)
+        self.assertIn("01a0c5f0-aaaa-7000-8000-00000000beef", html_out)
         self.assertNotIn("<script>x</script>", html_out)
+
+    def test_a_corrupt_row_degrades_the_section_not_the_page(self):
+        path = self.write_report(top_sessions=[{"session_id": "x", "cost": None, "turns": "?"}, "junk"],
+                                 cost_by_repo={"r": None}, context_alert_threshold="?")
+        caches = {name: Mock(get=lambda: {}, peek=lambda: {}) for name in hub.CACHES}
+        caches["cost"] = hub.Cached(0, hub.cost_report_data, name="cost")
+        with patch.dict(hub.CACHES, caches), patch.object(hub, "COST_REPORT", path):
+            html_out = hub.render_overview()
+        self.assertIn("<h2 id=cost>LLM spend</h2>", html_out)
+        self.assertIn("$0.00", html_out)
 
 
 if __name__ == "__main__":
