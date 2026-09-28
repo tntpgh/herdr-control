@@ -79,7 +79,13 @@ human_must_answer() {
   fi
   cmd="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
   local judged
-  judged="$(approval_command_text "$cmd" "$recorded")" && cmd="$judged"
+  # F1/F6 (fix/approve-wrapped-commands security review): same wrap-join
+  # corroboration herdr-select.sh and push_wake now apply, from the SAME
+  # screen snapshot as `cmd` (corroboration_candidates) rather than a
+  # second independent read; falls back to `cmd` unchanged for a numbered
+  # or unparseable pane.
+  corroboration_candidates "$pane" "$cmd"
+  judged="$(approval_command_text "$CC_PANEL" "$recorded" "$CC_WRAPJOIN")" && cmd="$judged"
   [ -n "${cmd//[[:space:]]/}" ] || return 0
   case "$cmd" in *elided*|*truncated*) return 0 ;; esac
   task="$(task_for_pane "$pane" 2>/dev/null)"

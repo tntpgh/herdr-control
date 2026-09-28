@@ -548,6 +548,31 @@ highlight = re.compile(r"\x1b\[48;2;[0-9]+;[0-9]+;[0-9]+m")
 lines = []
 state = 0
 question = []
+# fix/approve-wrapped-commands security review round 1 (F3) and round 2
+# (N5): per-row measurements needed to tell a genuine terminal wrap from a
+# real line break, same indices as `question`.
+#   question_rawlen      the RAW rendered length (ANSI stripped, before any
+#                         body/text stripping) of the row as captured.
+#   question_content_end  the column the rows own CONTENT ends at: raw
+#                         length minus whatever trailing padding/box-border
+#                         run (spaces, `|`/border-draw chars) was stripped.
+#                         In a padded, right-bordered box every rows RAW
+#                         length is the SAME (the box width) regardless of
+#                         how short its content is -- round 2s N5 finding:
+#                         using raw length alone as the "is this row full"
+#                         signal is vacuous there. content_end is what
+#                         actually varies with how much of the row a short
+#                         line fills.
+#   box_width             the right-bordered boxs own width (a `\u2571`/
+#                         corner-drawn header row was seen), or None when
+#                         this capture never showed a border at all -- a
+#                         left-gutter-only capture (no right border, no
+#                         padding) carries no reliable reference for "did
+#                         this row reach the edge", so it never glues
+#                         (round 2, N5/N2: "if theres no border, dont glue").
+question_rawlen = []
+question_content_end = []
+box_width = None
 selected = ""
 invalid = complete = visible = False
 truncated = False
@@ -687,6 +712,16 @@ def _unwrap_footer(rows):
 # Read bytes: a stray non-UTF-8 byte in a pane must degrade to U+FFFD, not
 # abort the parser and silence the wake path.
 lines = _unwrap_footer([raw.decode("utf-8", "replace") for raw in sys.stdin.buffer])
+_border_chars = "\u2500\u256d\u256e\u2570\u256f"  # ─ ╭ ╮ ╰ ╯
+
+
+def _row_metrics(plain_line):
+    raw = plain_line.rstrip("\r\n")
+    content_end = len(raw.rstrip(" \t\u2502" + _border_chars))
+    bordered = any(c in raw for c in _border_chars)
+    return len(raw), content_end, bordered
+
+
 for line in lines:
     plain = ansi.sub("", line)
     # `text` (leading punctuation stripped) is ONLY for header/option/footer
@@ -699,6 +734,10 @@ for line in lines:
     if state == 0 and text.startswith("Allow tool:"):
         pending_running = list(running_lines)
         state, question, selected = 1, [text], ""
+        _rawlen, _cend, _bordered = _row_metrics(plain)
+        question_rawlen = [_rawlen]
+        question_content_end = [_cend]
+        box_width = _rawlen if _bordered else None
         invalid = complete = visible = False
         continue
     if state == 0:
@@ -750,6 +789,9 @@ for line in lines:
         state, n = 3, "2"
     elif state == 1:
         question.append(body)
+        _rawlen, _cend, _ = _row_metrics(plain)
+        question_rawlen.append(_rawlen)
+        question_content_end.append(_cend)
         continue
     else:
         invalid = True
@@ -802,12 +844,70 @@ if not complete:
                     invalid = invalid or bool(selected)
                     selected = n
             question = ["[header off-screen]"]
+            question_rawlen = [-1]
+            question_content_end = [-1]
+            box_width = None
             for k in range(max(0, rows["Approve"] - 6), rows["Approve"]):
                 b = re.sub(r"^[\s\u2502]+", "", ansi.sub("", lines[k])).rstrip(" \t\r\n\u2502\u2500\u256e")
                 if b:
                     question.append(b)
+                    _rawlen, _cend, _ = _row_metrics(ansi.sub("", lines[k]))
+                    question_rawlen.append(_rawlen)
+                    question_content_end.append(_cend)
             if invalid:
                 complete = False
+# _wrapjoin(q, qlen, cend, box_w) -> the mid-token wrap-join candidate for
+# the Command:/run: row onward, or None when no such row exists in q.
+#
+# fix/approve-wrapped-commands security review round 1, F2: a panel with no
+# Command:/run: row at all (a header-only browser call, say) must never
+# fabricate one by gluing the tool-name header onto whatever text follows
+# -- so this returns None, never a guess, when no label row is found. The
+# head (everything through the label row itself) is joined with a plain
+# space, byte-identical to "command" mode; only rows AFTER the label row
+# are candidates for a no-separator glue.
+#
+# Round 1, F3 (superseded by round 2, N5): the first cut glued a boundary
+# whenever the row aboves RAW length equalled the widest raw row seen. That
+# is vacuous in a real, right-bordered omp panel: padding makes EVERY row
+# the same raw length regardless of its content, so every boundary passed.
+# It was also wrong the other way for a left-gutter-only capture (no right
+# border): the longest row always counts as "full" even when nothing
+# establishes that it reached the actual terminal edge.
+#
+# Round 2, N5 fix: only ever glue when a border was genuinely captured
+# (box_w is not None -- a `\u256d…\u256e`/`\u2570…\u256f` header or footer
+# row was seen for THIS panel); a left-gutter-only capture has no reference
+# for "the edge" at all and never glues. Where a border exists, compare
+# each rows CONTENT end column (its raw length minus trailing
+# padding/border, `question_content_end`) against the boxs own width, not
+# the rows raw length -- a short line inside a padded box has a small
+# content_end even though every row is padded to the same raw length.
+# SLACK absorbs the boxs own 1-2 column right margin (the mandatory space
+# before the border) without letting a genuinely short row pass.
+_WRAPJOIN_SLACK = 2
+
+
+def _wrapjoin(q, qlen, cend, box_w):
+    idx = None
+    for i, row in enumerate(q):
+        if row.startswith("Command:") or row.startswith("run:"):
+            idx = i
+            break
+    if idx is None:
+        return None
+    head, tail = q[:idx], q[idx:]
+    text = " ".join(head + tail[:1])
+    if box_w is not None and len(cend) == len(q):
+        tail_cend = cend[idx:]
+    else:
+        tail_cend = None
+    for i in range(1, len(tail)):
+        full = tail_cend is not None and tail_cend[i - 1] >= box_w - _WRAPJOIN_SLACK
+        text += ("" if full else " ") + tail[i]
+    return text
+
+
 mode = sys.argv[1]
 if mode == "visible":
     sys.exit(0 if visible else 1)
@@ -839,6 +939,20 @@ elif mode == "command_rows":
             rows = question[i:]
             break
     print(len([r for r in rows if r.strip()]), end="")
+elif mode == "command_wrapjoin":
+    # A candidate reconstruction for a MID-TOKEN terminal wrap -- see
+    # _wrapjoin above for the F2/N5 rules (no label row -> nothing; glue
+    # only past the label row, only at a full-width boundary in a
+    # genuinely bordered capture). Both this and "command" are candidates,
+    # never a verdict on their own: herdr-select.sh only trusts whichever
+    # one, after whitespace-collapse, equals the SEPARATE hook-recorded
+    # command (lib/scoped-policy.sh approval_command_text) -- this mode
+    # only supplies the second candidate string. No apostrophes in here:
+    # this whole parser is a single-quoted shell argument.
+    wj = _wrapjoin(question, question_rawlen, question_content_end, box_width)
+    if wj is None:
+        sys.exit(1)
+    print(wj, end="")
 elif mode == "command":
     # For CLASSIFICATION ONLY (lib/command-policy.sh via prompt_command_text
     # below), never for display or prompt_id: `" ; "` is a real shell
@@ -861,6 +975,26 @@ elif mode == "command":
     if len(question) == 1 and pending_running:
         question = question + pending_running
     print(" ".join(question), end="")
+elif mode == "command_both":
+    # fix/approve-wrapped-commands security review round 1, F6: ONE parser
+    # call, ONE `herdr pane read`, emitting BOTH corroboration candidates
+    # so a caller never pairs a space-join from one screen with a
+    # wrap-join from a later, possibly repainted one. Output is
+    # "<space-join>\x1e<wrap-join-or-empty>"; \x1e (ASCII record
+    # separator) is the split point the bash side uses.
+    #
+    # Round 2, N7: a captured row that itself contains a literal 0x1E
+    # would otherwise land inside the emitted text and shift that split
+    # point, truncating what the caller reads as CC_PANEL at the injected
+    # byte. A real terminal grid should never store a C0 control in a
+    # cell, but this is cheap to fail closed on rather than trust that:
+    # refuse to emit anything (exit 1, same as any other unparseable
+    # panel) when any captured row carries one.
+    if any("\x1e" in row for row in question + pending_running):
+        sys.exit(1)
+    sp_q = question + pending_running if len(question) == 1 and pending_running else question
+    wj = _wrapjoin(question, question_rawlen, question_content_end, box_width)
+    sys.stdout.write(" ".join(sp_q) + "\x1e" + (wj if wj is not None else ""))
 ' "$1"
 }
 
@@ -869,6 +1003,8 @@ prompt_menu_selected() { _prompt_menu "$1" selected; }
 prompt_menu_question() { _prompt_menu "$1" question; }
 prompt_menu_command()  { _prompt_menu "$1" command; }
 prompt_menu_command_rows() { _prompt_menu "$1" command_rows; }
+prompt_menu_command_wrapjoin() { _prompt_menu "$1" command_wrapjoin; }
+prompt_menu_command_both() { _prompt_menu "$1" command_both; }
 prompt_menu_visible()  { _prompt_menu "$1" visible; }
 
 # "Is EITHER prompt shape on screen?", from ONE pane read.
