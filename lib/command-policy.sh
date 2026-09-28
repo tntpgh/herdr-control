@@ -1494,46 +1494,59 @@ _cp_python_risk() {                     # text -> prints a reason, 0 when risky
 }
 
 # ---- python-mode env access: text regex gate, AST only narrows ------------
-# (issue #174, then PR #185 security review Critical/High/Low findings #1,
-# #2, #3, #6)
+# (issue #174, then PR #185 security review round 1 Critical/High/Low #1-3,
+# #6, then round 2 Critical N1, High N1b/N3)
 #
 # `_CP_PY_ENV_RE` fires on the bare WORD `environ`/`getenv`/…, with no idea
 # which key is being fetched: `os.environ.get("HERDR_SESSIONS_DIR", HOME /
 # ".omp/agent/sessions")` — a non-secret path default, cost-report.py — is
 # reserved exactly like `dict(os.environ)` or `os.environ["GITHUB_TOKEN"]`
-# would be. The acceptance bar (#174) is narrower: a specific,
-# ALLOWLISTED non-secret key lookup is not a credential read.
+# would be. The acceptance bar (#174) is narrower: a specific, allowlisted
+# non-secret key lookup is not a credential read.
 #
-# First cut inverted this: default-CLEAR unless the AST recognized a risky
-# shape, with a SECRET_RE blocklist and no import-alias resolution. A live
-# review found both wrong. `import os as o` then `o.environ`/`o.getenv(...)`,
-# `from os import environ as e`/`from os import getenv as g`, and
-# `vars(os)["environ"]`/`os.__dict__["environ"]`/`getattr(os, "environ")`
-# all bypassed the literal `Name.id == "os"` check entirely and read as
-# ordinary code (Critical #1, High #2) — the same alias-resolution gap
-# `_cp_python_ast_risk` above already closes for `os.system`, applied here.
-# A blocklist also misses whatever name it forgot: `DATABASE_URL`, `GH_PAT`,
-# `SLACK_WEBHOOK_URL` all slipped through clean (High #3). And
-# `os.environ["X"] = val` / `del os.environ["X"]` were never treated as
-# mutation at all (Low #6).
+# Round 1 inverted this: default-CLEAR unless the AST recognized a risky
+# shape. Round 2's review found the inversion only half-done: the walk
+# classified nodes it RECOGNIZED as an environ/getenv access as safe or
+# unsafe, but silently SKIPPED anything it didn't recognize the shape of —
+# `o = os; o.environ[...]` (reassignment, not an import alias),
+# `os.path.os.environ` / `posixpath.os.environ` (base is an Attribute
+# chain, not a bare Name), `def f(m): m.environ` (a function parameter),
+# `os.__dict__["envi" + "ron"]` (`+`-concatenated, so no `Constant` node
+# ever equals `"environ"`), `operator.attrgetter("environ.copy")(os)`, and
+# `exec(...)`/`__import__("os")`/`from os import *` all read as ordinary
+# code because none of them matched the recognizer's shape — proven live by
+# `.handoffs/r2-185-harness.py` (N1 Critical, N1b High). `HERDR_*` as a
+# PREFIX arm on the allowlist also let a real per-task relay token,
+# `HERDR_WORKER_MODEL_TOKEN` (isolated-worker.py), clear (N3 Medium).
 #
-# Required design: the gate is the OLD blunt `_CP_PY_ENV_RE` match, same as
-# it always was — reserved is the DEFAULT the moment that word appears
-# anywhere. The AST only NARROWS, and only by proving EVERY environ/getenv
-# occurrence in the whole file (aliases resolved the same way
-# `_cp_python_ast_risk` resolves them) is a `.get(...)`/`[...]`/`getenv(...)`
-# read, in Load context, with a CONSTANT key on the ALLOWLIST below — never
-# a blocklist, so an unrecognized secret-shaped name fails closed instead of
-# passing clean. Any `Store`/`Del` subscript context, any dynamic or
-# non-allowlisted key, any wholesale reference (`dict()`, iteration,
-# `.setdefault`/`.copy`/…), and any bare string constant spelling
-# `environ`/`environb`/`getenv`/`putenv`/`unsetenv` ANYWHERE in the file
-# (the `vars()`/`__dict__`/`getattr()` indirection shapes all pass one of
-# these as a plain string argument, with no `os.environ` Attribute node to
-# recognize at all) makes the whole file un-narrowable. A dedicated exit
-# code (10) means "parsed, and every occurrence is proven safe" — every
-# OTHER outcome (a proven-unsafe occurrence, a parse failure, anything
-# unexpected) falls back to the gate's reservation, never to clear (Low #7).
+# Required design (round 2): invert the proof for real. Default is unsafe.
+# A node only clears the bar by being POSITIVELY recognized as one of the
+# few safe shapes; everything else — unrecognized bases, indirection,
+# dynamic code execution, an unlisted key — marks the whole file
+# un-narrowable, it is never simply skipped. Concretely:
+#   - Any `Attribute` whose `.attr` is `environ`/`environb`/`getenv` counts
+#     as an occurrence NO MATTER what its base is; it only clears when that
+#     base is a bare `Name` resolving to a genuine `import os`/`import os as
+#     X` alias (never a plain reassignment, a function parameter, or a
+#     nested Attribute chain) AND the surrounding access is `.get(key)`/
+#     `[key]` in `Load` context with a CONSTANT key EXACTLY on the
+#     allowlist below (no prefix arms — N3).
+#   - Any `Attribute` whose `.attr` is `__dict__`, any `sys.modules`
+#     reference, any `importlib` import, any `vars(`/`getattr(`/`exec(`/
+#     `eval(`/`compile(`/`__import__(` call, and any `from … import *`
+#     unconditionally makes the file un-narrowable — these are exactly the
+#     indirection/dynamic-execution escape hatches N1/N1b found.
+#   - Any string `Constant` whose value contains `environ`/`environb`/
+#     `getenv`/`putenv`/`unsetenv` as a whole word (not just an exact match:
+#     `attrgetter("environ.copy")` and `exec("…os.environ[…]…")`'s own
+#     argument string both need to trip this) is likewise unconditional.
+#   - The allowlist is exact names only: `HOME`, `PATH`, `TMPDIR`, `USER`,
+#     `PWD`, `SHELL`, `LANG`, the one non-secret name #174's own repro
+#     needed (`HERDR_SESSIONS_DIR`), and the XDG base-dir names — no
+#     wildcard arm for either prefix.
+# A dedicated exit code (10) means "parsed, and every occurrence is proven
+# safe"; every OTHER outcome (a proven-unsafe occurrence, a parse failure,
+# anything unexpected) falls back to the gate's reservation, never clears.
 _cp_python_env_risk() {                 # content -> prints reason, 0 when reserved
   if _cp_match '\b(putenv|unsetenv)\b' "$1"; then
     printf 'python mutates the process environment — credential-value access remains human-only\n'
@@ -1549,15 +1562,20 @@ except Exception:
 for node in ast.walk(tree):
     for child in ast.iter_child_nodes(node):
         child.parent = node
-ALLOW = re.compile(r"^(HOME|PATH|TMPDIR|USER|PWD|SHELL|LANG|XDG_[A-Z0-9_]*|HERDR_[A-Z0-9_]*)$")
-RISKY_STRINGS = {"environ", "environb", "getenv", "putenv", "unsetenv"}
+ALLOW = {"HOME", "PATH", "TMPDIR", "USER", "PWD", "SHELL", "LANG",
+         "HERDR_SESSIONS_DIR",
+         "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"}
+RISKY_WORD_RE = re.compile(r"\b(environ|environb|getenv|putenv|unsetenv)\b")
+ESCAPE_CALLS = {"vars", "getattr", "exec", "eval", "compile", "__import__"}
 
 def allowed(key):
-    return key is not None and bool(ALLOW.match(key))
+    return key in ALLOW
 
 def const_str(n):
     return n.value if isinstance(n, ast.Constant) and isinstance(n.value, str) else None
 
+# A bare-alias import only — `import os`/`import os as X`, never a plain
+# reassignment (`o = os`), which round 2 requires stay unaccounted.
 os_aliases = {"os"}
 environ_name_aliases = set()
 getenv_name_aliases = {"getenv"}
@@ -1566,6 +1584,8 @@ for n in ast.walk(tree):
         for a in n.names:
             if a.name == "os":
                 os_aliases.add(a.asname or "os")
+            elif a.name == "importlib" or a.name.startswith("importlib."):
+                pass  # flagged unconditionally below, no alias tracking needed
     elif isinstance(n, ast.ImportFrom) and n.module == "os":
         for a in n.names:
             if a.name in ("environ", "environb"):
@@ -1573,41 +1593,70 @@ for n in ast.walk(tree):
             elif a.name == "getenv":
                 getenv_name_aliases.add(a.asname or a.name)
 
-def is_environ_ref(n):
-    if isinstance(n, ast.Attribute) and n.attr in ("environ", "environb") and isinstance(n.value, ast.Name):
-        return n.value.id in os_aliases
-    return isinstance(n, ast.Name) and n.id in environ_name_aliases
-
-def is_getenv_ref(n):
-    if isinstance(n, ast.Attribute) and n.attr == "getenv" and isinstance(n.value, ast.Name):
-        return n.value.id in os_aliases
-    return isinstance(n, ast.Name) and n.id in getenv_name_aliases
-
 found_any = False
 all_safe = True
+
+def unsafe():
+    global found_any, all_safe
+    found_any = True
+    all_safe = False
+
 for node in ast.walk(tree):
-    if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in RISKY_STRINGS:
-        found_any = True
-        all_safe = False
-        continue
-    if is_environ_ref(node):
-        found_any = True
+    if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+        unsafe(); continue
+    if isinstance(node, ast.Import) and any(a.name == "importlib" or a.name.startswith("importlib.") for a in node.names):
+        unsafe(); continue
+    if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+        unsafe(); continue
+    if isinstance(node, ast.Attribute) and node.attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys":
+        unsafe(); continue
+    if isinstance(node, ast.Name) and node.id in ESCAPE_CALLS:
         parent = getattr(node, "parent", None)
+        if isinstance(parent, ast.Call) and parent.func is node:
+            unsafe(); continue
+    if isinstance(node, ast.Constant) and isinstance(node.value, str) and RISKY_WORD_RE.search(node.value):
+        unsafe(); continue
+    if isinstance(node, ast.Attribute) and node.attr in ("environ", "environb"):
+        found_any = True
         ok = False
-        if isinstance(parent, ast.Attribute) and parent.attr == "get" and parent.value is node:
-            call = getattr(parent, "parent", None)
-            if isinstance(call, ast.Call) and call.func is parent and call.args:
-                ok = allowed(const_str(call.args[0]))
-        elif isinstance(parent, ast.Subscript) and parent.value is node:
-            if isinstance(parent.ctx, ast.Load):
+        if isinstance(node.value, ast.Name) and node.value.id in os_aliases:
+            parent = getattr(node, "parent", None)
+            if isinstance(parent, ast.Attribute) and parent.attr == "get" and parent.value is node:
+                call = getattr(parent, "parent", None)
+                if isinstance(call, ast.Call) and call.func is parent and call.args:
+                    ok = allowed(const_str(call.args[0]))
+            elif isinstance(parent, ast.Subscript) and parent.value is node and isinstance(parent.ctx, ast.Load):
                 ok = allowed(const_str(parent.slice))
         if not ok:
             all_safe = False
         continue
-    if is_getenv_ref(node):
+    if isinstance(node, ast.Attribute) and node.attr == "getenv":
         found_any = True
-        parent = getattr(node, "parent", None)
         ok = False
+        if isinstance(node.value, ast.Name) and node.value.id in os_aliases:
+            parent = getattr(node, "parent", None)
+            if isinstance(parent, ast.Call) and parent.func is node and parent.args:
+                ok = allowed(const_str(parent.args[0]))
+        if not ok:
+            all_safe = False
+        continue
+    if isinstance(node, ast.Name) and node.id in environ_name_aliases:
+        found_any = True
+        ok = False
+        parent = getattr(node, "parent", None)
+        if isinstance(parent, ast.Attribute) and parent.attr == "get" and parent.value is node:
+            call = getattr(parent, "parent", None)
+            if isinstance(call, ast.Call) and call.func is parent and call.args:
+                ok = allowed(const_str(call.args[0]))
+        elif isinstance(parent, ast.Subscript) and parent.value is node and isinstance(parent.ctx, ast.Load):
+            ok = allowed(const_str(parent.slice))
+        if not ok:
+            all_safe = False
+        continue
+    if isinstance(node, ast.Name) and node.id in getenv_name_aliases:
+        found_any = True
+        ok = False
+        parent = getattr(node, "parent", None)
         if isinstance(parent, ast.Call) and parent.func is node and parent.args:
             ok = allowed(const_str(parent.args[0]))
         if not ok:
@@ -3549,9 +3598,10 @@ EOF
 }
 
 # ---- python-mode credential literal: text regex gate, AST narrows only ----
-# (issue #174, then PR #185 security review Medium finding #4)
+# (issue #174, then PR #185 security review round 1 Medium finding #4,
+# then round 2 High N2)
 #
-# First cut REPLACED `_cp_cred_shaped_and_not_placeholder` with an AST-only
+# Round 1 REPLACED `_cp_cred_shaped_and_not_placeholder` with an AST-only
 # scanner for python — which is a scan of what the AST recognizes, not of
 # what the source contains. A live review proved it auto-allowed a real
 # hardcoded secret passed as a call keyword (`f(api_key="sk-proj-…")`), a
@@ -3564,6 +3614,22 @@ EOF
 # below) — a real string secret is never droppable, however the AST
 # recognizes (or fails to recognize) the shape holding it.
 #
+# Round 2 found the narrowing itself unsound: it matched a text hit to a
+# safe AST binding by NAME alone, with three compounding defects (N2 High).
+# (a) the value was extracted by cutting at the LAST `:`/`=` in the
+# matched text, so a base64-padded value ending in `=` (`SECRET =
+# "Zm9v…=="`) cut itself down to an empty string. (b) the lookup was
+# `grep -F` without `-x`, so `SECRET\t<anything>` matched as a bare
+# SUBSTRING of an unrelated longer pair like `MY_SECRET\tNone`. (c) pairs
+# were compared by name only, never by position, so `MY_TOKEN = 12345678`
+# on one line vouched for a completely different `TOKEN = "1234"` on
+# another. Fixed: cut at the FIRST separator, not the last; match with
+# `grep -qxF` (the whole line, not a substring); and correlate a hit to a
+# binding by BOTH name and the physical LINE NUMBER it came from (the AST's
+# own `value.lineno`, since `cred_norm` preserves line structure one-for-one
+# with the content the AST parsed) — a hit only drops when a binding for
+# that exact name exists on that exact line and is provably non-string.
+#
 # The one gap text-gating reopens on its own is `{tokens:>5}` — an f-string
 # format spec reads as the identical `identifier[:=]value` shape as a real
 # dict/annotation once `scannable_command` strips the surrounding quotes,
@@ -3574,10 +3640,26 @@ EOF
 # anything outside an f-string) to spaces before the credential-KV gate
 # ever runs — so a real secret sitting anywhere else in the same file,
 # including inside the SAME f-string's `{name}` part, is untouched.
+#
+# Round 2 (Low/info N4) found two more holes in the masking itself. On
+# CPython < 3.12, nested f-string position info is unreliable (PEP 701
+# landed in 3.12), so a span computed on an older interpreter cannot be
+# trusted not to overshoot into real code — skip masking entirely below
+# that version, keeping the original (more conservative) f-string-format-
+# spec false positive rather than risk hiding something real. And on ANY
+# version: a format spec can itself contain a nested `{expr}`, and that
+# expr can be a walrus — `f'{0:{(TOKEN := "ghp_…")}}'` hides a REAL secret
+# assignment inside what masking assumed was inert formatting syntax
+# (`fstring_walrus`, proven live). Fixed by never masking a format-spec
+# whose own subtree contains an `ast.NamedExpr` — a legitimate width/
+# precision spec never needs to assign anything.
 _cp_python_mask_fstring_specs() {       # content -> content with every f-string format-spec span blanked
   printf '%s' "$1" | python3 -c '
 import ast, sys
 src = sys.stdin.read()
+if sys.version_info < (3, 12):
+    sys.stdout.write(src)
+    sys.exit(0)
 try:
     tree = ast.parse(src)
 except Exception:
@@ -3587,6 +3669,8 @@ spans = []
 for node in ast.walk(tree):
     if isinstance(node, ast.FormattedValue) and node.format_spec is not None:
         fs = node.format_spec
+        if any(isinstance(n, ast.NamedExpr) for n in ast.walk(fs)):
+            continue
         if all(hasattr(fs, a) for a in ("lineno", "col_offset", "end_lineno", "end_col_offset")):
             spans.append((fs.lineno, fs.col_offset, fs.end_lineno, fs.end_col_offset))
 if not spans:
@@ -3605,20 +3689,19 @@ sys.stdout.write("".join(lines))
 }
 
 # `_cp_python_cred_narrow <cred_norm> <raw-content>` -> 0 (true) iff EVERY
-# non-placeholder `_CP_CRED_KV_RE` hit in `cred_norm` corresponds to an
-# identifier the AST proves is bound (via `Assign`, `AnnAssign`, a dict
-# literal, a call `keyword`, a function/lambda default, a tuple/list-unpack
-# target, or a walrus `NamedExpr`) to a non-string constant — `None`, a
-# bool, or a number. A real string value is NEVER recorded as droppable
-# (`render()` returns nothing for a string `Constant`), so a hit backed by
-# an actual secret literal always survives this narrowing, regardless of
-# which of those shapes holds it. `op://` and an unparseable file both fall
-# back to "not narrow" (reserved stands) — same fail-closed posture as
-# every other AST helper in this file.
+# non-placeholder `_CP_CRED_KV_RE` hit in `cred_norm` corresponds — by name
+# AND by the physical line it appears on — to a binding (`Assign`,
+# `AnnAssign`, a dict literal, a call `keyword`, a function/lambda default,
+# a tuple/list-unpack target, or a walrus `NamedExpr`) the AST proves is a
+# non-string constant — `None`, a bool, or a number. A real string value is
+# NEVER recorded as droppable (`render()` returns nothing for a string
+# `Constant`), so a hit backed by an actual secret literal always survives
+# narrowing regardless of which of those shapes holds it, and regardless of
+# what else on a DIFFERENT line happens to share its name. `op://` and an
+# unparseable file both fall back to "not narrow" (reserved stands) — same
+# fail-closed posture as every other AST helper in this file.
 _cp_python_cred_narrow() {              # cred_norm content -> 0 (true) if fully narrow-safe
-  local norm="$1" content="$2" matches m key val safe pair
-  matches="$(printf '%s' "$norm" | grep -oiE "$_CP_CRED_KV_RE" || true)"
-  [ -n "$matches" ] || return 0
+  local norm="$1" content="$2" safe lineno line m key val pair
   _cp_match 'op://' "$norm" && return 1
   safe="$(printf '%s' "$content" | python3 -c '
 import ast, re, sys
@@ -3651,9 +3734,9 @@ def render(v):
         return repr(v.value)
     return None
 
-def record(pairs, name, rv):
+def record(pairs, lineno, name, rv):
     if rv is not None and NAME_RE.search(name):
-        pairs.add((name, rv))
+        pairs.add((lineno, name, rv))
 
 pairs = set()
 for node in ast.walk(tree):
@@ -3662,45 +3745,51 @@ for node in ast.walk(tree):
         if isinstance(t0, (ast.Tuple, ast.List)) and isinstance(node.value, (ast.Tuple, ast.List)) and len(t0.elts) == len(node.value.elts):
             for te, ve in zip(t0.elts, node.value.elts):
                 for name in target_names(te):
-                    record(pairs, name, render(ve))
+                    record(pairs, ve.lineno, name, render(ve))
         else:
             rv = render(node.value)
             for t in node.targets:
                 for name in target_names(t):
-                    record(pairs, name, rv)
+                    record(pairs, node.value.lineno, name, rv)
     elif isinstance(node, ast.AnnAssign) and node.value is not None:
         rv = render(node.value)
         for name in target_names(node.target):
-            record(pairs, name, rv)
+            record(pairs, node.value.lineno, name, rv)
     elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
-        record(pairs, node.target.id, render(node.value))
+        record(pairs, node.value.lineno, node.target.id, render(node.value))
     elif isinstance(node, ast.keyword) and node.arg:
-        record(pairs, node.arg, render(node.value))
+        record(pairs, node.value.lineno, node.arg, render(node.value))
     elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
         a = node.args
         for arg, dv in zip(reversed(a.args), reversed(a.defaults)):
-            record(pairs, arg.arg, render(dv))
+            record(pairs, dv.lineno, arg.arg, render(dv))
         for arg, dv in zip(a.kwonlyargs, a.kw_defaults):
             if dv is not None:
-                record(pairs, arg.arg, render(dv))
+                record(pairs, dv.lineno, arg.arg, render(dv))
     elif isinstance(node, ast.Dict):
         for k, v in zip(node.keys, node.values):
             if isinstance(k, ast.Constant) and isinstance(k.value, str):
-                record(pairs, k.value, render(v))
+                record(pairs, v.lineno, k.value, render(v))
 
-for name, val in sorted(pairs):
-    print(name + "\t" + val)
+for lineno, name, val in sorted(pairs):
+    print(f"{lineno}\t{name}\t{val}")
 ' 2>/dev/null)"
   [ $? -eq 0 ] || return 1
-  while IFS= read -r m; do
-    [ -n "$m" ] || continue
-    key="$(printf '%s' "$m" | sed -E "s/[[:space:]]*[:=].*//")"
-    val="$(printf '%s' "$m" | sed -E "s/^.*[:=][[:space:]]*['\"]?//")"
-    _cp_cred_value_is_placeholder "$val" && continue
-    pair="$(printf '%s\t%s' "$key" "$val")"
-    printf '%s\n' "$safe" | grep -qF "$pair" || return 1
+  lineno=0
+  while IFS= read -r line; do
+    lineno=$((lineno + 1))
+    while IFS= read -r m; do
+      [ -n "$m" ] || continue
+      key="$(printf '%s' "$m" | sed -E "s/[[:space:]]*[:=].*//")"
+      val="$(printf '%s' "$m" | sed -E "s/^[^:=]*[:=][[:space:]]*['\"]?//")"
+      _cp_cred_value_is_placeholder "$val" && continue
+      pair="$(printf '%s\t%s\t%s' "$lineno" "$key" "$val")"
+      printf '%s\n' "$safe" | grep -qxF "$pair" || return 1
+    done <<EOF2
+$(printf '%s' "$line" | grep -oiE "$_CP_CRED_KV_RE" || true)
+EOF2
   done <<EOF
-$matches
+$norm
 EOF
   return 0
 }

@@ -191,6 +191,45 @@ r="$(content_reason python "$(printf 'def f(token="%s"):\n    return token\n' "$
 case "$r" in reserved:*) ok "a real secret as a function default is still reserved";; *) bad "default_literal slipped: $r";; esac
 r="$(content_reason python "$(printf 'print((TOKEN := "%s"))\n' "$GH")")"
 case "$r" in reserved:*) ok "a real secret in a walrus assignment is still reserved";; *) bad "walrus_literal slipped: $r";; esac
+printf '== python content: PR #185 round-2 security review — 14 bypass-harness WEAKER cases ==\n'
+# Round 2 (.handoffs/REVIEW-r2.md, .handoffs/r2-185-harness.py) proved the
+# round-1 narrowing recognized SOME risky shapes but silently SKIPPED any
+# occurrence it didn't recognize instead of counting it unsafe (N1/N1b), let
+# a namespace-PREFIX allowlist arm clear a real secret name (N3), matched a
+# credential-literal narrow by NAME alone with a substring `grep -F` (N2),
+# and could mask a real secret hidden behind a walrus inside an f-string
+# format spec (N4). Each stays reserved permanently below. Every fixture
+# but `herdr_token`/the credential-literal ones opens with one provably-safe
+# `os.environ.get("HOME")` read, so the file would otherwise clear if the
+# SECOND, unsafe occurrence were silently skipped rather than counted.
+r="$(content_reason python "$(printf "import os\nh = os.environ.get(\"HOME\")\no = os\nprint(o.environ[\"GITHUB_TOKEN\"])\n")")"
+case "$r" in reserved:*) ok "a decoy safe read plus a reassigned (not imported) alias is still reserved";; *) bad "alias_assign slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nh = os.environ.get(\"HOME\")\nprint(dict(os.path.os.environ))\n")")"
+case "$r" in reserved:*) ok "an Attribute-chain base (os.path.os.environ) is still reserved";; *) bad "ospath_os slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nh = os.environ.get(\"HOME\")\nimport posixpath\nprint(dict(posixpath.os.environ))\n")")"
+case "$r" in reserved:*) ok "posixpath.os.environ (Attribute-chain base) is still reserved";; *) bad "posixpath_os slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nh = os.environ.get(\"HOME\")\ndef f(m):\n    return dict(m.environ)\nprint(f(os))\n")")"
+case "$r" in reserved:*) ok "a function parameter base (m.environ) is still reserved";; *) bad "func_param slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nh = os.environ.get(\"HOME\")\nprint(os.__dict__[\"envi\" + \"ron\"][\"GITHUB_TOKEN\"])\n")")"
+case "$r" in reserved:*) ok "os.__dict__ indirection is still reserved even with a concatenated key";; *) bad "dict_concat slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nh = os.environ.get(\"HOME\")\nimport operator\nprint(operator.attrgetter(\"environ.copy\")(os)())\n")")"
+case "$r" in reserved:*) ok "a risky word inside an unrelated string constant is still reserved";; *) bad "attrgetter_dot slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nh = os.environ.get(\"HOME\")\nexec('print(os.environ[\"GITHUB_TOKEN\"])')\n")")"
+case "$r" in reserved:*) ok "exec() reaching environ through a string is still reserved (not just REVIEW)";; *) bad "exec_string slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nh = os.environ.get(\"HOME\")\nprint(__import__('os').environ[\"GITHUB_TOKEN\"])\n")")"
+case "$r" in reserved:*) ok "__import__('os').environ is still reserved (not just REVIEW)";; *) bad "dunder_import slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nh = os.environ.get(\"HOME\")\nfrom os import *\nprint(environ[\"GITHUB_TOKEN\"])\n")")"
+case "$r" in reserved:*) ok "from os import * is still reserved (not just REVIEW)";; *) bad "from_star slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nprint(os.environ.get(\"HERDR_WORKER_MODEL_TOKEN\"))\n")")"
+case "$r" in reserved:*) ok "a real secret name under the HERDR_ namespace is still reserved (exact allowlist, no prefix arm)";; *) bad "herdr_token slipped: $r";; esac
+r="$(content_reason python "$(printf "MY_SECRET = None\nSECRET = \"Zm9vZm9vZm9vZm9vZm9vZm9vZm9vZm9vZm9vZm9v==\"\n")")"
+case "$r" in reserved:*) ok "a base64-padded secret (trailing =) is still reserved despite a decoy binding elsewhere";; *) bad "b64_pad_decoy slipped: $r";; esac
+r="$(content_reason python "$(printf "X_TOKEN = None\nTOKEN = \"%s=\" [:-1]\n" "$GH")")"
+case "$r" in reserved:*) ok "a sliced secret literal is still reserved despite a same-suffix decoy name";; *) bad "slice_decoy slipped: $r";; esac
+r="$(content_reason python "$(printf "MY_TOKEN = 12345678\nTOKEN = \"1234\"\n")")"
+case "$r" in reserved:*) ok "a numeric decoy on one line never vouches for a string literal on another";; *) bad "numeric_prefix slipped: $r";; esac
+r="$(content_reason python "$(printf "n = 0\nprint(f'{0:{(TOKEN := \"%s\")}}')\n" "$GH")")"
+case "$r" in reserved:*) ok "a real secret hidden in a walrus inside an f-string format spec is still reserved";; *) bad "fstring_walrus slipped: $r";; esac
 
 cat > "$WORK/fstring.py" <<'EOF'
 ps, vis, n = "1", "x", {}
