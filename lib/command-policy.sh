@@ -1501,213 +1501,108 @@ _cp_python_risk() {                     # text -> prints a reason, 0 when risky
   printf 'python uses %s (process/network/deletion/env/dynamic-code) — needs a reviewing authority\n' "$hit"
 }
 
-# ---- python-mode env access: text regex gate, AST only narrows ------------
-# (issue #174, then PR #185 security review round 1 Critical/High/Low #1-3,
-# #6, then round 2 Critical N1, High N1b/N3)
+# ---- python-mode env access: reserved unconditionally, no narrowing ------
+# (issue #174; PR #185 security review rounds 1-3 tried AST narrowing, round
+# 4 abandoned it — see below)
 #
 # `_CP_PY_ENV_RE` fires on the bare WORD `environ`/`getenv`/…, with no idea
 # which key is being fetched: `os.environ.get("HERDR_SESSIONS_DIR", HOME /
 # ".omp/agent/sessions")` — a non-secret path default, cost-report.py — is
 # reserved exactly like `dict(os.environ)` or `os.environ["GITHUB_TOKEN"]`
-# would be. The acceptance bar (#174) is narrower: a specific, allowlisted
-# non-secret key lookup is not a credential read.
+# would be. #174 asked for the first to clear while the second stayed
+# reserved.
 #
-# Round 1 inverted this: default-CLEAR unless the AST recognized a risky
-# shape. Round 2's review found the inversion only half-done: the walk
-# classified nodes it RECOGNIZED as an environ/getenv access as safe or
-# unsafe, but silently SKIPPED anything it didn't recognize the shape of —
-# `o = os; o.environ[...]` (reassignment, not an import alias),
-# `os.path.os.environ` / `posixpath.os.environ` (base is an Attribute
-# chain, not a bare Name), `def f(m): m.environ` (a function parameter),
-# `os.__dict__["envi" + "ron"]` (`+`-concatenated, so no `Constant` node
-# ever equals `"environ"`), `operator.attrgetter("environ.copy")(os)`, and
-# `exec(...)`/`__import__("os")`/`from os import *` all read as ordinary
-# code because none of them matched the recognizer's shape — proven live by
-# `.handoffs/r2-185-harness.py` (N1 Critical, N1b High). `HERDR_*` as a
-# PREFIX arm on the allowlist also let a real per-task relay token,
-# `HERDR_WORKER_MODEL_TOKEN` (isolated-worker.py), clear (N3 Medium).
+# Rounds 1-3 built that as AST narrowing: default-unsafe, a node only
+# clears by being POSITIVELY recognized as one of a few safe shapes
+# (a bare `import os` alias, `.get(key)`/`[key]` with a CONSTANT key on an
+# exact-name allowlist), with an ever-growing list of unconditional escape
+# hatches (`__dict__`, `getattr`/`exec`/`eval`/`compile`/`__import__`,
+# `from … import *`, a risky word inside a string constant, an
+# Attribute-form `__getattribute__` call, `__builtins__`) added each round
+# to close whatever indirection the previous round's enumeration missed.
+# Round 4's own harness (`.handoffs/r4-harness.out`) found the approach
+# itself unfixable by enumeration, not just under-enumerated: a REAL
+# secret read via `operator.attrgetter("...")(os)("KEY")`,
+# `f.__globals__["os"].environ`, `codecs.decode(s, "rot13")` where `s` is
+# itself split, `inspect.getmembers(os)`, `type.__subclasses__()` walks,
+# `functools.reduce(getattr, ...)`, and a `ctypes` libc `getenv` call each
+# reach `os.environ`/`os.getenv` through a shape no enumerated recognizer
+# had a rule for — 16 live regressions (main correctly reserved, the
+# narrowed PR incorrectly cleared) with no bound on how many more shapes
+# exist, because the safe/unsafe line here is "does this Python expression
+# eventually evaluate to an environment read", which is Rice's-theorem
+# undecidable by static enumeration in general.
 #
-# Required design (round 2): invert the proof for real. Default is unsafe.
-# A node only clears the bar by being POSITIVELY recognized as one of the
-# few safe shapes; everything else — unrecognized bases, indirection,
-# dynamic code execution, an unlisted key — marks the whole file
-# un-narrowable, it is never simply skipped. Concretely:
-#   - Any `Attribute` whose `.attr` is `environ`/`environb`/`getenv` counts
-#     as an occurrence NO MATTER what its base is; it only clears when that
-#     base is a bare `Name` resolving to a genuine `import os`/`import os as
-#     X` alias (never a plain reassignment, a function parameter, or a
-#     nested Attribute chain) AND the surrounding access is `.get(key)`/
-#     `[key]` in `Load` context with a CONSTANT key EXACTLY on the
-#     allowlist below (no prefix arms — N3).
-#   - Any `Attribute` whose `.attr` is `__dict__`, any `sys.modules`
-#     reference, any `importlib` import, any `vars(`/`getattr(`/`exec(`/
-#     `eval(`/`compile(`/`__import__(` call, and any `from … import *`
-#     unconditionally makes the file un-narrowable — these are exactly the
-#     indirection/dynamic-execution escape hatches N1/N1b found.
-#   - Any string `Constant` whose value contains `environ`/`environb`/
-#     `getenv`/`putenv`/`unsetenv` as a whole word (not just an exact match:
-#     `attrgetter("environ.copy")` and `exec("…os.environ[…]…")`'s own
-#     argument string both need to trip this) is likewise unconditional.
-#   - The allowlist is exact names only: `HOME`, `PATH`, `TMPDIR`, `USER`,
-#     `PWD`, `SHELL`, `LANG`, the one non-secret name #174's own repro
-#     needed (`HERDR_SESSIONS_DIR`), and the XDG base-dir names — no
-#     wildcard arm for either prefix.
-# A dedicated exit code (10) means "parsed, and every occurrence is proven
-# safe"; every OTHER outcome (a proven-unsafe occurrence, a parse failure,
-# anything unexpected) falls back to the gate's reservation, never clears.
+# Decision (round 4, Terrence): ship WITHOUT the narrowing. `#174`'s
+# specific false positive (a non-secret KEY NAME under `os.environ.get`)
+# is not fixed — `os.environ.get("HERDR_SESSIONS_DIR", ...)` is reserved
+# again, exactly as `main` always reserved it, because a human approving a
+# few extra RESERVED prompts is a bounded, known cost and a narrowing that
+# can silently clear a real credential read is not.
 #
-# Round 3 (N9, Critical): the AST above only runs when a bash-level TEXT
-# pre-gate (`_CP_PY_ENV_RE`, a contiguous-substring match on the literal
-# word `environ`/`getenv`/…) matches first — and the whole "invert the
-# proof" design is void whenever it doesn't, because the AST is simply
-# never invoked. `os.__dict__['envi' + 'ron']['GITHUB_TOKEN']` — the exact
-# shape round 2 unconditionally flags once the AST sees it — has no
-# CONTIGUOUS "environ" substring anywhere in the file once split across two
-# string constants, so the gate never let the walk run at all
-# (`.handoffs/r3-185-harness.py` N9). Same trick reaches `getattr(os, 'envi'
-# + 'ron')`, `os.__getattribute__('get' + 'env')` (an Attribute-form call
-# ESCAPE_CALLS never checked even if the AST had run), and `exec(...)`.
-# Fixed two ways: (1) the bash gate also runs the AST whenever the raw text
-# contains any of a wider set of indirection/dynamic-execution keywords
-# that themselves are NOT split in any of these shapes (`__dict__`,
-# `__getattribute__`, `getattr`, `setattr`, `vars(`, `exec`, `eval`,
-# `compile`, `__import__`, `importlib`, `sys.modules`, `globals(`,
-# `locals(`, `__builtins__`) — the escape MECHANISM word, not the env-word
-# payload it's used to reach, is what the gate now keys on; (2) inside the
-# AST, ESCAPE_CALLS now also matches an Attribute-form call
-# (`x.__getattribute__(...)`), not just a bare `Name`, and a bare/Attribute
-# reference to `__builtins__` is unconditionally unsafe. Any escape hatch
-# reached this way is `unsafe()` — RESERVED, never the older REVIEW-class
-# `_cp_python_risk` path, because `_cp_code_content_reason` calls
-# `_cp_python_env_risk` first and short-circuits on a non-empty reason.
+# `_CP_PY_ENV_GATE_EXTRA_RE` (round 3's gate widening, matching
+# split-literal/indirection MECHANISM words like
+# `__dict__`/`getattr`/`exec`/`__getattribute__`) is kept, but a TEXT match
+# on one of these words used to BE the verdict directly, the same way
+# `_CP_PY_ENV_RE` still is — and unlike an env/getenv word, these are
+# common enough as substrings and identifiers in ordinary code that doing
+# so reserved files with no escape hatch and no environment access at all:
+# `con.execute(...)` (bare "exec" substring) and a docstring literally
+# using the word "eval" in prose both flipped
+# `.handoffs/acb-fixture.py` (thurber-os scripts/audit_context_budget.py,
+# the #174 acceptance script) to reserved, a real regression against #174
+# found via `.handoffs/acb-bisect.out`. A text match here may only decide
+# whether to RUN a small AST check — never the verdict by itself. The AST
+# confirms a GENUINE use, not merely the word's presence: a `Call` whose
+# `func` is a bare `Name` in `{getattr, setattr, exec, eval, compile,
+# __import__, vars, globals, locals}`, an Attribute-form call
+# (`x.__getattribute__(...)`/`x.__setattr__(...)`), any `Attribute` whose
+# `.attr` is `__dict__`/`__builtins__`, `sys.modules`, `from … import *`,
+# or `import importlib`. This is a mechanical shape check (a mechanism
+# actually being CALLED or ACCESSED), not an enumeration of safe/unsafe
+# environment-read shapes — round 4's finding was about the latter being
+# unenumerable, not about whether `exec(` is a real call. A parse failure
+# confirms (fails closed), matching every other AST helper in this file.
 _cp_python_env_risk() {                 # content -> prints reason, 0 when reserved
   if _cp_match '\b(putenv|unsetenv)\b' "$1"; then
     printf 'python mutates the process environment — credential-value access remains human-only\n'
     return 0
   fi
-  { _cp_match "$_CP_PY_ENV_RE" "$1" || _cp_match "$_CP_PY_ENV_GATE_EXTRA_RE" "$1"; } || return 1
+  if _cp_match "$_CP_PY_ENV_RE" "$1"; then
+    printf 'python reads the process environment — credential-value access remains human-only\n'
+    return 0
+  fi
+  _cp_match "$_CP_PY_ENV_GATE_EXTRA_RE" "$1" || return 1
   printf '%s' "$1" | python3 -c '
-import ast, re, sys
+import ast, sys
+ESCAPE_CALLS = {"getattr", "setattr", "exec", "eval", "compile", "__import__", "vars", "globals", "locals"}
+ESCAPE_ATTR_CALLS = {"__getattribute__", "__setattr__"}
 try:
     tree = ast.parse(sys.stdin.read())
 except Exception:
-    sys.exit(2)
-for node in ast.walk(tree):
-    for child in ast.iter_child_nodes(node):
-        child.parent = node
-ALLOW = {"HOME", "PATH", "TMPDIR", "USER", "PWD", "SHELL", "LANG",
-         "HERDR_SESSIONS_DIR",
-         "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"}
-RISKY_WORD_RE = re.compile(r"\b(environ|environb|getenv|putenv|unsetenv)\b")
-ESCAPE_CALLS = {"vars", "getattr", "exec", "eval", "compile", "__import__", "setattr", "globals", "locals"}
-ESCAPE_ATTR_CALLS = {"__getattribute__", "__setattr__"}
-
-def allowed(key):
-    return key in ALLOW
-
-def const_str(n):
-    return n.value if isinstance(n, ast.Constant) and isinstance(n.value, str) else None
-
-# A bare-alias import only — `import os`/`import os as X`, never a plain
-# reassignment (`o = os`), which round 2 requires stay unaccounted.
-os_aliases = {"os"}
-environ_name_aliases = set()
-getenv_name_aliases = {"getenv"}
-for n in ast.walk(tree):
-    if isinstance(n, ast.Import):
-        for a in n.names:
-            if a.name == "os":
-                os_aliases.add(a.asname or "os")
-            elif a.name == "importlib" or a.name.startswith("importlib."):
-                pass  # flagged unconditionally below, no alias tracking needed
-    elif isinstance(n, ast.ImportFrom) and n.module == "os":
-        for a in n.names:
-            if a.name in ("environ", "environb"):
-                environ_name_aliases.add(a.asname or a.name)
-            elif a.name == "getenv":
-                getenv_name_aliases.add(a.asname or a.name)
-
-found_any = False
-all_safe = True
-
-def unsafe():
-    global found_any, all_safe
-    found_any = True
-    all_safe = False
-
+    sys.exit(0)
 for node in ast.walk(tree):
     if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
-        unsafe(); continue
+        sys.exit(0)
     if isinstance(node, ast.Import) and any(a.name == "importlib" or a.name.startswith("importlib.") for a in node.names):
-        unsafe(); continue
-    if isinstance(node, ast.Attribute) and node.attr == "__dict__":
-        unsafe(); continue
-    if isinstance(node, ast.Attribute) and node.attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys":
-        unsafe(); continue
-    if isinstance(node, ast.Attribute) and node.attr in ESCAPE_ATTR_CALLS:
-        parent = getattr(node, "parent", None)
-        if isinstance(parent, ast.Call) and parent.func is node:
-            unsafe(); continue
-    if (isinstance(node, ast.Name) and node.id == "__builtins__") or (isinstance(node, ast.Attribute) and node.attr == "__builtins__"):
-        unsafe(); continue
-    if isinstance(node, ast.Name) and node.id in ESCAPE_CALLS:
-        parent = getattr(node, "parent", None)
-        if isinstance(parent, ast.Call) and parent.func is node:
-            unsafe(); continue
-    if isinstance(node, ast.Constant) and isinstance(node.value, str) and RISKY_WORD_RE.search(node.value):
-        unsafe(); continue
-    if isinstance(node, ast.Attribute) and node.attr in ("environ", "environb"):
-        found_any = True
-        ok = False
-        if isinstance(node.value, ast.Name) and node.value.id in os_aliases:
-            parent = getattr(node, "parent", None)
-            if isinstance(parent, ast.Attribute) and parent.attr == "get" and parent.value is node:
-                call = getattr(parent, "parent", None)
-                if isinstance(call, ast.Call) and call.func is parent and call.args:
-                    ok = allowed(const_str(call.args[0]))
-            elif isinstance(parent, ast.Subscript) and parent.value is node and isinstance(parent.ctx, ast.Load):
-                ok = allowed(const_str(parent.slice))
-        if not ok:
-            all_safe = False
-        continue
-    if isinstance(node, ast.Attribute) and node.attr == "getenv":
-        found_any = True
-        ok = False
-        if isinstance(node.value, ast.Name) and node.value.id in os_aliases:
-            parent = getattr(node, "parent", None)
-            if isinstance(parent, ast.Call) and parent.func is node and parent.args:
-                ok = allowed(const_str(parent.args[0]))
-        if not ok:
-            all_safe = False
-        continue
-    if isinstance(node, ast.Name) and node.id in environ_name_aliases:
-        found_any = True
-        ok = False
-        parent = getattr(node, "parent", None)
-        if isinstance(parent, ast.Attribute) and parent.attr == "get" and parent.value is node:
-            call = getattr(parent, "parent", None)
-            if isinstance(call, ast.Call) and call.func is parent and call.args:
-                ok = allowed(const_str(call.args[0]))
-        elif isinstance(parent, ast.Subscript) and parent.value is node and isinstance(parent.ctx, ast.Load):
-            ok = allowed(const_str(parent.slice))
-        if not ok:
-            all_safe = False
-        continue
-    if isinstance(node, ast.Name) and node.id in getenv_name_aliases:
-        found_any = True
-        ok = False
-        parent = getattr(node, "parent", None)
-        if isinstance(parent, ast.Call) and parent.func is node and parent.args:
-            ok = allowed(const_str(parent.args[0]))
-        if not ok:
-            all_safe = False
-
-sys.exit(10 if (found_any and all_safe) else 1)
+        sys.exit(0)
+    if isinstance(node, ast.Name) and node.id == "__builtins__":
+        sys.exit(0)
+    if isinstance(node, ast.Attribute):
+        if node.attr in ("__dict__", "__builtins__"):
+            sys.exit(0)
+        if node.attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys":
+            sys.exit(0)
+    if isinstance(node, ast.Call):
+        f = node.func
+        if isinstance(f, ast.Name) and f.id in ESCAPE_CALLS:
+            sys.exit(0)
+        if isinstance(f, ast.Attribute) and f.attr in ESCAPE_ATTR_CALLS:
+            sys.exit(0)
+sys.exit(1)
 ' >/dev/null 2>&1
-  if [ "$?" -eq 10 ]; then
-    return 1
-  fi
-  printf 'python reads the process environment — credential-value access remains human-only\n'
+  [ "$?" -eq 0 ] || return 1
+  printf 'python uses a dynamic-code/indirection escape hatch (getattr/setattr/exec/eval/compile/__import__/vars/globals/locals/__dict__/__getattribute__/__setattr__/__builtins__/sys.modules/importlib/import *) — credential-value access remains human-only\n'
 }
 
 # Code by reference judges ONE file, so a file that runs or imports ANOTHER
@@ -1864,6 +1759,30 @@ try:
 except Exception:
     sys.stdout.write(unicodedata.normalize("NFKC", src))
 ' 2>/dev/null)" || content="$(cat "$path")"
+    # `tokenize.untokenize` fills the GAP left by a removed multi-line
+    # docstring with literal backslash-newline continuation lines (each a
+    # bare `\` on its own line) to keep every token AFTER it on its
+    # original line/column — real, reproduced on `.handoffs/acb-fixture.py`
+    # (thurber-os scripts/audit_context_budget.py, the #174 acceptance
+    # script): a 51-line module docstring left 50 lines of bare `\`.
+    # `scannable_command` (used below by `conductor_reserved_reason` to
+    # build `cred_norm`) folds a trailing `\` into its next line — real
+    # shell continuation handling, reused here — so those 50 filler lines
+    # collapse into ONE, shifting every subsequent line's number in
+    # `cred_norm` while `_cp_python_cred_narrow`'s own `ast.parse(content)`
+    # (which never runs `scannable_command`) reports the ORIGINAL,
+    # unshifted line. The two numbers stop matching, the
+    # `(lineno, name, val)` correlation the round-2 N2 fix relies on never
+    # finds its own binding, and a file with NO secret at all — only a
+    # long, well-documented docstring — comes out reserved
+    # (`.handoffs/acb-bisect.out`). A bare `\` on its own line is never
+    # valid, meaningful Python on its own (it is exactly this artifact, or
+    # a truly pointless no-op continuation to a blank line); blanking it to
+    # an empty line removes the only thing `scannable_command` would fold,
+    # is a no-op for `ast.parse` (blank lines change nothing), and does not
+    # touch a REAL backslash continuation — those always have code before
+    # the `\`, never a bare one alone on its line.
+    content="$(printf '%s\n' "$content" | sed -E 's/^\\+[[:space:]]*$//')"
   fi
   if [ "$kind" = python ]; then
     res="$(conductor_reserved_reason "$content" python)"
@@ -3737,12 +3656,36 @@ sys.stdout.write("".join(lines))
 # NEVER recorded as droppable (`render()` returns nothing for a string
 # `Constant`), so a hit backed by an actual secret literal always survives
 # narrowing regardless of which of those shapes holds it, and regardless of
-# what else on a DIFFERENT line happens to share its name. `op://` and an
-# unparseable file both fall back to "not narrow" (reserved stands) — same
-# fail-closed posture as every other AST helper in this file.
-_cp_python_cred_narrow() {              # cred_norm content -> 0 (true) if fully narrow-safe
-  local norm="$1" content="$2" safe lineno line m key val pair
+# what else on a DIFFERENT line happens to share its name.
+#
+# `render()` also recognizes a call to `round`/`len`/`sum`/`abs` — builtins
+# whose return type can NEVER be `str` regardless of their arguments — and
+# renders it to the function's own bare name (`"round"`, not the argument
+# expression), matching what the bash side's own naive value-extraction
+# already captures for a `NAME(...)` call shape (`[^[:space:];&|(){}'",]+`
+# stops at the `(`). This is a type-signature fact about a fixed, tiny set
+# of builtins, not an enumeration of "safe" shapes reachable through
+# indirection — the distinction round 4 drew for `_cp_python_env_risk`.
+# Found via `.handoffs/acb-fixture.py` (thurber-os
+# scripts/audit_context_budget.py, the #174 acceptance script): `tokens`,
+# `session_tokens`, `worst_tokens` are LLM-token BYTE COUNTS computed as
+# `round(...)`/`sum(genexpr)`, matching `_CP_CRED_KV_RE`'s bare "TOKEN"
+# substring on a name never holding a credential.
+#
+# `op://` and an unparseable file both fall back to "not narrow" (reserved
+# stands) — same fail-closed posture as every other AST helper in this file.
+_cp_python_cred_narrow() {              # cred_norm raw -> 0 (true) if fully narrow-safe
+  local norm="$1" content="$2" safe lineno line m key val pair scan
   _cp_match 'op://' "$norm" && return 1
+  # The caller's 2nd argument is `$raw` — unmasked, undocstring-stripped
+  # source — because line numbers below must match what `ast.parse` below
+  # reports, and only a transform that changes NO line's content or count
+  # keeps that true (`scannable_command`'s backslash-continuation fold does
+  # not: see the note below). Masking every f-string format-spec SPAN
+  # (review finding #4: `{tokens:>5}` text-matches `identifier[:=]value`
+  # once read as plain text) blanks characters in place — same line count,
+  # same AST shape — so it is safe to apply here, unlike scannable_command.
+  content="$(_cp_python_mask_fstring_specs "$content")"
   safe="$(printf '%s' "$content" | python3 -c '
 import ast, re, sys
 try:
@@ -3765,7 +3708,11 @@ def target_names(t):
         return [t.slice.value]
     return []
 
+NEVER_STR_BUILTINS = {"round", "len", "sum", "abs"}
+
 def render(v):
+    if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id in NEVER_STR_BUILTINS:
+        return v.func.id
     if not isinstance(v, ast.Constant) or isinstance(v.value, str):
         return None
     if v.value is None or isinstance(v.value, bool):
@@ -3816,6 +3763,31 @@ for lineno, name, val in sorted(pairs):
 ' 2>/dev/null)"
   [ $? -eq 0 ] || return 1
   lineno=0
+  # Walk `$scan`, not `$content` and not `$norm`/cred_norm. A dict-literal
+  # key is always quoted (`{"KEY": "value"}`) with the closing quote sitting
+  # directly between the key and its `:` separator — `_CP_CRED_KV_RE`
+  # cannot match across that quote character, so scanning `$content`
+  # (unstripped) finds NO hit at all for a quoted key and this loop's body
+  # never runs, silently "passing" (a REAL secret in a dict literal read as
+  # narrow-safe — a genuine loosening, caught by
+  # `verify-scoped-approval.sh`'s own `KB_API_KEY` regression test).
+  # `$norm`/cred_norm strips quotes but ALSO folds a trailing backslash into
+  # its next line (real shell-continuation handling, reused for cred_norm
+  # generally); a genuine multi-line python statement (`if … and \` /
+  # `… and \` / `else …`) or a tokenize-stripped docstring's gap-filler
+  # backslash lines both trigger that fold, collapsing N physical lines
+  # into 1 while the AST above still reports the ORIGINAL, unfolded line
+  # number for everything after the fold — the `(lineno, name, val)` triple
+  # this loop builds then never matches anything in `$safe`, and a file
+  # with no secret at all comes out reserved
+  # (`.handoffs/acb-fixture.py`, thurber-os scripts/audit_context_budget.py,
+  # the #174 acceptance script itself). `$scan` takes only the quote/
+  # backslash strip — same character class as `scannable_command`'s own
+  # `sed "s/['"'"'\"\\\\]//g"`, `LC_ALL=C` for the same reason
+  # (`scannable_command`'s own comment: BSD sed aborts on invalid UTF-8
+  # under any other locale) — with NO line-folding, so its line numbers
+  # stay identical to the AST's while quoted keys/values still match.
+  scan="$(printf '%s' "$content" | LC_ALL=C sed "s/['\"\\\\]//g")"
   while IFS= read -r line; do
     lineno=$((lineno + 1))
     while IFS= read -r m; do
@@ -3829,7 +3801,7 @@ for lineno, name, val in sorted(pairs):
 $(printf '%s' "$line" | grep -oiE "$_CP_CRED_KV_RE" || true)
 EOF2
   done <<EOF
-$norm
+$scan
 EOF
   return 0
 }
