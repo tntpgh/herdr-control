@@ -386,11 +386,14 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
   # audit record still shows what was on screen) and let the decline proceed.
   panel_scrape="$cmd_text"
   cmd_text="$(approval_command_text "$cmd_text" "$registry_cmd")" || {
+    # approval_command_text prints nothing on a mismatch, so the assignment
+    # above left cmd_text empty: restore the scrape BEFORE refusing, or the
+    # refusal's approval_escalated event records command:"" (PR #181 F1).
+    cmd_text="$panel_scrape"
     if [ "$declining" = 0 ]; then
       echo "herdr-select: the recorded command for this prompt does not match what is on screen in $pane — refusing." >&2
       _refuse_non_human "escalate" "the recorded command for this prompt does not match what is on screen"
     fi
-    cmd_text="$panel_scrape"
   }
   [ -n "$registry_cmd" ] && [ "$cmd_text" = "$registry_cmd" ] && cmd_text_is_scrape=0
 fi

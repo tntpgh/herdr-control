@@ -68,12 +68,16 @@ def ts(s):
 def collapse(s): return re.sub(r"\s+", " ", s or "").strip()
 def strip_panel(s):
     s = collapse(s)
-    return re.sub(r"^(Allow tool: \S+ (; )?)?(Command|run): ", "", s)
+    # Same rows lib/scoped-policy.sh _sp_command_region skips: omp puts
+    # "Origin: MCP server tool" / "Reason: Critical pattern detected" between
+    # the header and Command: (PR #181 F3).
+    return re.sub(r"^(Allow tool: \S+ (; )?)?(Origin: MCP server tool (; )?)?"
+                  r"(Reason: Critical pattern detected (; )?)?(Command|run): ", "", s)
 def panel_tool(s):
     """Tool named by an omp approval panel; a bare command is a shell prompt;
     anything else (e.g. an off-screen header) names no tool."""
     s = collapse(s)
-    m = re.match(r"^Allow tool: (\w+)", s)
+    m = re.match(r"^Allow tool: ([^\s;]+)", s)
     if m: return m.group(1).lower()
     return None if s.startswith("[") or not s else "bash"
 def sha(s): return hashlib.sha256((s or "").encode()).hexdigest()
@@ -172,7 +176,7 @@ for r in conn.execute("SELECT sequence, task_id, occurred_at, payload FROM event
 
 def same_prompt(cmd, s, is_shell):
     """Does a recorded panel/command belong to this shadow row's tool call?"""
-    if not cmd: return False
+    if not collapse(cmd): return False
     if is_shell:
         return sha(cmd) == s.get("command_sha256") or strip_panel(cmd) == collapse(s.get("command"))
     return panel_tool(cmd) == s.get("tool", "").lower()
@@ -227,12 +231,19 @@ if "--gate" in args:
     rate = n_dis / len(compared) if compared else None
     loose = [r for r in rows if r["kind"] == "SHADOW_LOOSER"]
     unexplained = [r for r in loose if r["seq"] not in explained]
+    # An escalation with no recorded command (written before herdr-select.sh
+    # recorded one, or an unreadable panel) can join nothing, so every refusal
+    # it stands for is silently absent from (c)/(d). Until those age out of the
+    # window the gate cannot have compared refusals at all (PR #181 F2).
+    uncompared = [e for e in esc_all if not collapse(e.get("command"))]
     checks = [
         ("a", days >= 5, f"shadow data spans {days:.1f} days (need >= 5)"),
         ("b", len(rows) >= 1000 and n_tasks >= 5, f"{len(rows)} rows across {n_tasks} tasks (need >= 1000 across >= 5)"),
         ("c", rate is not None and rate <= 0.02,
          f"disagreement {n_dis}/{len(compared)} compared rows = " + (f"{rate:.2%}" if rate is not None else "n/a (nothing comparable)") + " (need <= 2%)"),
         ("d", not unexplained, f"{len(loose)} SHADOW_LOOSER rows, {len(unexplained)} unexplained (need 0; explain in {explained_path})"),
+        ("e", not uncompared, f"{len(uncompared)} approval_escalated events in the window record no command — "
+                              "those refusals cannot be compared (need 0; they age out of the window)"),
     ]
     for key, passed, text in checks:
         print(f"{'PASS' if passed else 'FAIL'}  ({key}) {text}")

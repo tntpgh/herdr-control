@@ -241,7 +241,9 @@ Built now (this PR):
   joins nothing (pane + time alone produced most of the 41.7% first-gate
   disagreement). The `via` column says which join produced each row.
 - The menu, scrape, `herdr-select.sh`, edge peer-answer and alert gate are
-  untouched — both paths stay available (Terrence, 2026-09-26).
+  untouched — both paths stay available (Terrence, 2026-09-26) — except that
+  `approval_escalated` now records the command (2026-09-28), and `--gate` check
+  (e) FAILs while any command-less escalation is still inside its window.
 
 Exit criteria for shadow: a week of worker traffic with zero `SHADOW_LOOSER` rows
 that a reviewer cannot explain, `elapsed_ms` p95 recorded, and every

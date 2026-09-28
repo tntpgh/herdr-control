@@ -135,6 +135,8 @@ sel 1 --authority peer; rc=$?
 [ "$(keys_pressed)" = "0" ] && ok "NO KEY PRESSED — the property that matters" || bad "keys pressed=$(keys_pressed) on a refusal!"
 grep -q 'REFUSED' "$WORK/err.txt" && ok "refusal explained on stderr" || bad "no REFUSED on stderr"
 [ "$(( $(count_events approval_escalated) - before_esc ))" = "1" ] && ok "approval_escalated event recorded" || bad "escalation not recorded"
+esc_cmd="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT json_extract(payload,'\$.command') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
+case "$esc_cmd" in *"rm -rf /tmp/scratch"*) ok "approval_escalated records the refused command (shadow-compare joins on it)" ;; *) bad "escalation command not recorded: '$esc_cmd'" ;; esac
 
 printf '== CREDENTIAL-shaped command, peer authority -> REFUSED, no key pressed ==\n'
 # Exercises the peer-refusal path on something other than rm — the
@@ -972,6 +974,8 @@ sel 1 --authority peer; rc=$?
 grep -q 'does not match what is on screen' "$WORK/err.txt" \
   && ok "refused specifically for the corroboration mismatch, not just menu_rows_ambiguous" \
   || bad "stderr does not name the corroboration mismatch: $(cat "$WORK/err.txt")"
+esc_cmd="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT json_extract(payload,'\$.command') FROM events WHERE type='approval_escalated' ORDER BY sequence DESC LIMIT 1;")"
+case "$esc_cmd" in *"ls -la /Users/thurbs/.herdr/worktrees/tntpgh/h"*) ok "a corroboration-mismatch refusal records the on-screen command, not \"\" (PR #181 F1)" ;; *) bad "mismatch refusal recorded command='$esc_cmd'" ;; esac
 
 set_rows_deny 'ls -la /Users/thurbs/.herdr/worktrees/tntpgh/h' 'erdr-control/.handoffs'; reset_keys
 ( export HERDR_PANE_ID=w9:p9
