@@ -410,27 +410,32 @@ else
 fi
 
 printf '== spawn-task.sh --approval ==\n'
-# The workspace line is masked: origin/main's dry-run CREATED a workspace to
-# print its id (fixed by --lookup), so the two sides cannot agree on it.
-norm() { sed -E 's/(run|task|worker)_[0-9TZ_]+/\1_X/g; s/term_[0-9a-f]+/term_X/g; s/^(  workspace : ).*/\1X/'; }
+norm() { sed -E 's/(run|task|worker)_[0-9TZ_]+/\1_X/g; s/term_[0-9a-f]+/term_X/g'; }
 repo="$work/repo"; git init -q "$repo" && git -C "$repo" commit -q --allow-empty -m init
-dry() { local d="$1"; shift; env -u HERDR_TASK_ID -u HERDR_RUN_ID HERDR_PANE_ID="$CPANE" bash "$d/spawn-task.sh" --dry-run --no-secrets "$repo" "$@" 2>&1 | norm | sed "s#$d/#<checkout>/#g"; }
-# The byte-identical comparisons run BOTH sides against a stub herdr (no panes,
-# every other call fails): origin/main's dry run creates a real workspace, and
-# nothing those comparisons check depends on the live herdr.
+# Every dry run here talks to a LOGGING stub herdr, never the live one: a dry
+# run that reached the real herdr created a workspace per suite run (#188).
+# The stub leads HERDR_EXTRA_PATH, because config.sh:187 puts that ahead of
+# PATH (and $work/bin/herdr, this suite's own fixture, is on PATH).
 stubbin="$work/stubbin"; mkdir -p "$stubbin"
-printf '#!/bin/sh\n[ "$1 $2" = "pane list" ] && { echo %s; exit 0; }\nexit 1\n' "'{\"result\":{\"panes\":[]}}'" > "$stubbin/herdr"; chmod +x "$stubbin/herdr"
-# config.sh:187 prepends HERDR_EXTRA_PATH (/opt/homebrew/bin) ahead of PATH, so
-# the stub has to lead that variable, not PATH, or the real herdr answers.
-sdry() { HERDR_EXTRA_PATH="$stubbin:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin" PATH="$stubbin:$PATH" dry "$@"; }
+cat > "$stubbin/herdr" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "${HERDR_STUB_LOG:-/dev/null}"
+[ "$1 $2" = "pane list" ] && { echo '{"result":{"panes":[]}}'; exit 0; }
+exit 1
+EOF
+chmod +x "$stubbin/herdr"
+stub_env=(HERDR_EXTRA_PATH="$stubbin:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin")
+dry() { local d="$1" lg="$work/herdr-head.log"; shift; [ "$d" = "$here" ] || lg="$work/herdr-base.log"
+  env -u HERDR_TASK_ID -u HERDR_RUN_ID HERDR_PANE_ID="$CPANE" "${stub_env[@]}" HERDR_STUB_LOG="$lg" \
+    bash "$d/spawn-task.sh" --dry-run --no-secrets "$repo" "$@" 2>&1 | norm | sed "s#$d/#<checkout>/#g"; }
 base_dir="$work/base2"; git -C "$here" worktree add -q --detach "$base_dir" origin/main 2>/dev/null
 # The job-class tool set (lib/agent-profiles.sh tools_for_job, pinned by
 # verify-posture.sh) changes the launch line on purpose; what THIS check
 # guards is that --approval adds nothing. Strip `--tools <list>` from both
 # sides so it compares the same thing before and after that table lands.
-a="$(sdry "$here" fix/x implement omp | sed -E 's/ --tools [^ ]+//')"; b="$(sdry "$base_dir" fix/x implement omp | sed -E 's/ --tools [^ ]+//')"
+a="$(dry "$here" fix/x implement omp | sed -E 's/ --tools [^ ]+//')"; b="$(dry "$base_dir" fix/x implement omp | sed -E 's/ --tools [^ ]+//')"
 [ -n "$a" ] && [ "$a" = "$b" ] && ok "default spawn --dry-run is byte-identical to origin/main" || { not_ok "default dry-run differs"; diff <(printf '%s\n' "$b") <(printf '%s\n' "$a") | head; }
-a="$(sdry "$here" fix/x implement claude --approval menu | sed -E 's/ --tools [^ ]+//')"; b="$(sdry "$base_dir" fix/x implement claude | sed -E 's/ --tools [^ ]+//')"
+a="$(dry "$here" fix/x implement claude --approval menu | sed -E 's/ --tools [^ ]+//')"; b="$(dry "$base_dir" fix/x implement claude | sed -E 's/ --tools [^ ]+//')"
 [ "$a" = "$b" ] && ok "explicit --approval menu is byte-identical to origin/main's default" || not_ok "--approval menu differs"
 git -C "$here" worktree remove --force "$base_dir" 2>/dev/null
 export HERDR_OMP_EXTENSION="$here/agent-hooks/omp-herdr-control.ts"
@@ -454,11 +459,14 @@ printf '// old hook\n' > "$work/old-hook.ts"
 out="$(HERDR_OMP_EXTENSION="$work/old-hook.ts" dry "$here" fix/y implement omp --approval hook)"
 printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "refused: an installed hook without the enforcement protocol" || not_ok "old hook: $out"
 [ ! -d "$HOME/.herdr/worktrees/$(basename "$repo")" ] && ok "refused spawns created no worktree" || not_ok "a refused spawn left a worktree"
-if command -v herdr >/dev/null 2>&1 && herdr pane list >/dev/null 2>&1; then
-  # A dry run must leave nothing behind: HEAD's dry runs above ran on "$repo".
-  leaked="$(bash "$here/ensure-workspace.sh" --lookup "$repo" 2>/dev/null)"
-  [ -z "$leaked" ] && ok "dry runs created no herdr workspace" || { not_ok "a dry run left workspace $leaked open"; herdr workspace close "$leaked" >/dev/null 2>&1; }
-fi
+# The log can see a create: the same stub, asked by ensure-workspace.sh's
+# create path, records one. Without this the check below could pass vacuously.
+env "${stub_env[@]}" HERDR_STUB_LOG="$work/herdr-control.log" bash "$here/ensure-workspace.sh" --no-focus "$repo" >/dev/null 2>&1
+grep -q '^workspace create' "$work/herdr-control.log" 2>/dev/null \
+  && ok "control: the stub log records a workspace create when one is attempted" || not_ok "control: stub log saw no create: $(cat "$work/herdr-control.log" 2>/dev/null | tr '\n' ';')"
+[ -s "$work/herdr-head.log" ] && ! grep -q -E '^workspace (create|focus)' "$work/herdr-head.log" \
+  && ok "HEAD dry runs never ask herdr to create or focus a workspace" \
+  || not_ok "a HEAD dry run touched workspaces: $(grep -E '^workspace' "$work/herdr-head.log" 2>/dev/null | tr '\n' ';')"
 
 printf '== shadow-compare.sh --gate (decision q1) ==\n'
 g="$work/gate"; mkdir -p "$g"
