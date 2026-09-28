@@ -1485,6 +1485,14 @@ sys.exit(1)
 ' 2>/dev/null
 }
 _CP_PY_ENV_RE='\b(environ|environb|getenv|putenv|unsetenv)\b'
+# Round 3 N9: the word above can be split across two string constants
+# (`'envi' + 'ron'`) so it never appears contiguously in the raw text, yet
+# still reach `os.environ`/`os.getenv` through an escape mechanism the AST
+# in `_cp_python_env_risk` already flags unconditionally once it runs. This
+# widens the pre-gate to ALSO run that AST whenever the text names the
+# escape MECHANISM itself — none of which is split in any known bypass —
+# rather than only the env-access payload word it's used to reach.
+_CP_PY_ENV_GATE_EXTRA_RE='__dict__|__getattribute__|getattr|setattr|vars\(|exec|eval|compile|__import__|importlib|sys\.modules|globals\(|locals\(|__builtins__'
 _cp_python_risk() {                     # text -> prints a reason, 0 when risky
   local hit
   hit="$(printf '%s' "$1" | grep -oE "$_CP_PY_RISK_RE" 2>/dev/null | head -1)"
@@ -1547,12 +1555,37 @@ _cp_python_risk() {                     # text -> prints a reason, 0 when risky
 # A dedicated exit code (10) means "parsed, and every occurrence is proven
 # safe"; every OTHER outcome (a proven-unsafe occurrence, a parse failure,
 # anything unexpected) falls back to the gate's reservation, never clears.
+#
+# Round 3 (N9, Critical): the AST above only runs when a bash-level TEXT
+# pre-gate (`_CP_PY_ENV_RE`, a contiguous-substring match on the literal
+# word `environ`/`getenv`/…) matches first — and the whole "invert the
+# proof" design is void whenever it doesn't, because the AST is simply
+# never invoked. `os.__dict__['envi' + 'ron']['GITHUB_TOKEN']` — the exact
+# shape round 2 unconditionally flags once the AST sees it — has no
+# CONTIGUOUS "environ" substring anywhere in the file once split across two
+# string constants, so the gate never let the walk run at all
+# (`.handoffs/r3-185-harness.py` N9). Same trick reaches `getattr(os, 'envi'
+# + 'ron')`, `os.__getattribute__('get' + 'env')` (an Attribute-form call
+# ESCAPE_CALLS never checked even if the AST had run), and `exec(...)`.
+# Fixed two ways: (1) the bash gate also runs the AST whenever the raw text
+# contains any of a wider set of indirection/dynamic-execution keywords
+# that themselves are NOT split in any of these shapes (`__dict__`,
+# `__getattribute__`, `getattr`, `setattr`, `vars(`, `exec`, `eval`,
+# `compile`, `__import__`, `importlib`, `sys.modules`, `globals(`,
+# `locals(`, `__builtins__`) — the escape MECHANISM word, not the env-word
+# payload it's used to reach, is what the gate now keys on; (2) inside the
+# AST, ESCAPE_CALLS now also matches an Attribute-form call
+# (`x.__getattribute__(...)`), not just a bare `Name`, and a bare/Attribute
+# reference to `__builtins__` is unconditionally unsafe. Any escape hatch
+# reached this way is `unsafe()` — RESERVED, never the older REVIEW-class
+# `_cp_python_risk` path, because `_cp_code_content_reason` calls
+# `_cp_python_env_risk` first and short-circuits on a non-empty reason.
 _cp_python_env_risk() {                 # content -> prints reason, 0 when reserved
   if _cp_match '\b(putenv|unsetenv)\b' "$1"; then
     printf 'python mutates the process environment — credential-value access remains human-only\n'
     return 0
   fi
-  _cp_match "$_CP_PY_ENV_RE" "$1" || return 1
+  { _cp_match "$_CP_PY_ENV_RE" "$1" || _cp_match "$_CP_PY_ENV_GATE_EXTRA_RE" "$1"; } || return 1
   printf '%s' "$1" | python3 -c '
 import ast, re, sys
 try:
@@ -1566,7 +1599,8 @@ ALLOW = {"HOME", "PATH", "TMPDIR", "USER", "PWD", "SHELL", "LANG",
          "HERDR_SESSIONS_DIR",
          "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"}
 RISKY_WORD_RE = re.compile(r"\b(environ|environb|getenv|putenv|unsetenv)\b")
-ESCAPE_CALLS = {"vars", "getattr", "exec", "eval", "compile", "__import__"}
+ESCAPE_CALLS = {"vars", "getattr", "exec", "eval", "compile", "__import__", "setattr", "globals", "locals"}
+ESCAPE_ATTR_CALLS = {"__getattribute__", "__setattr__"}
 
 def allowed(key):
     return key in ALLOW
@@ -1609,6 +1643,12 @@ for node in ast.walk(tree):
     if isinstance(node, ast.Attribute) and node.attr == "__dict__":
         unsafe(); continue
     if isinstance(node, ast.Attribute) and node.attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys":
+        unsafe(); continue
+    if isinstance(node, ast.Attribute) and node.attr in ESCAPE_ATTR_CALLS:
+        parent = getattr(node, "parent", None)
+        if isinstance(parent, ast.Call) and parent.func is node:
+            unsafe(); continue
+    if (isinstance(node, ast.Name) and node.id == "__builtins__") or (isinstance(node, ast.Attribute) and node.attr == "__builtins__"):
         unsafe(); continue
     if isinstance(node, ast.Name) and node.id in ESCAPE_CALLS:
         parent = getattr(node, "parent", None)

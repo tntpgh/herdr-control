@@ -231,6 +231,27 @@ case "$r" in reserved:*) ok "a numeric decoy on one line never vouches for a str
 r="$(content_reason python "$(printf "n = 0\nprint(f'{0:{(TOKEN := \"%s\")}}')\n" "$GH")")"
 case "$r" in reserved:*) ok "a real secret hidden in a walrus inside an f-string format spec is still reserved";; *) bad "fstring_walrus slipped: $r";; esac
 
+printf '== python content: PR #185 round-3 security review — N9 split-literal AST-gate bypass ==\n'
+# Round 3 (.handoffs/REVIEW-r3.md, .handoffs/r3-185-repro.py,
+# .handoffs/r3-185-repro2.py) proved the round-2 AST's "invert the proof"
+# design was void whenever the raw text never spells `environ`/`getenv`/…
+# as a CONTIGUOUS substring: a bash-level text pre-gate decided whether the
+# AST ran at all, and splitting the risky word across two string constants
+# (`'envi' + 'ron'`) defeated it before the walk ever saw `os.__dict__`,
+# `getattr`, `os.__getattribute__`, or `exec`. None of these fixtures carry
+# a decoy — the escape mechanism word itself (never split) is what must now
+# open the gate, not the env-word payload it reaches.
+r="$(content_reason python "$(printf "import os\nprint(os.__dict__[\"envi\" + \"ron\"][\"GITHUB_TOKEN\"])\n")")"
+case "$r" in reserved:*) ok "a split-literal os.__dict__ key with no decoy is still reserved";; *) bad "dict_concat_NO_decoy slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nprint(os.__getattribute__(\"envi\" + \"ron\")[\"GITHUB_TOKEN\"])\n")")"
+case "$r" in reserved:*) ok "an Attribute-form __getattribute__ call with a split literal is still reserved";; *) bad "getattribute_split_NO_decoy slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nprint(getattr(os, \"envi\" + \"ron\")[\"GITHUB_TOKEN\"])\n")")"
+case "$r" in reserved:*) ok "a bare getattr() call with a split literal is still reserved (RESERVED, not just REVIEW)";; *) bad "getattr_bare_split_NO_decoy slipped: $r";; esac
+r="$(content_reason python "$(printf "import os\nprint(os.__getattribute__(\"get\" + \"env\")(\"GITHUB_TOKEN\"))\n")")"
+case "$r" in reserved:*) ok "os.__getattribute__ reaching getenv via a split literal is still reserved";; *) bad "getattribute_getenv_split slipped: $r";; esac
+r="$(content_reason python "$(printf "exec(\"import os; print(os.__dict__['envi'+'ron']['GITHUB_TOKEN'])\")\n")")"
+case "$r" in reserved:*) ok "exec() reaching os.__dict__ via a split literal, with no incidental dotenv collision, is still reserved";; *) bad "exec_dict_split_no_dot slipped: $r";; esac
+
 cat > "$WORK/fstring.py" <<'EOF'
 ps, vis, n = "1", "x", {}
 print(f"  {n.get('name')!r:45} vis={('$'+ps).lower() in vis if ps else None}")
