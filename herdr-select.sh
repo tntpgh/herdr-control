@@ -440,8 +440,16 @@ menu_rows_ambiguous=0
 # same way. Every other non-bash tool keeps exactly the guard main has
 # today.
 cp_write_menu_judged=0
+# Round-2 security review of #187 (PR #189), R7: "judged" originally meant
+# ANY exit-0 verdict, including `escalate:<reason>` for a write path
+# outside the worker's worktree -- for the CONDUCTOR, escalate is only
+# advisory (only deny/empty/reserved refuse below), so an out-of-worktree
+# write skipped the row guard and then sailed through as an advisory
+# escalate a conductor could still press past. Only an exact `allow`
+# verdict means this function actually cleared the panel; an `escalate:`
+# verdict must fall through to the same row guard every other panel gets.
 if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
-  if _cp_write_menu_verdict "$cmd_text" "$own_worktree" >/dev/null 2>&1; then
+  if [ "$(_cp_write_menu_verdict "$cmd_text" "$own_worktree" 2>/dev/null)" = allow ]; then
     cp_write_menu_judged=1
   fi
 fi

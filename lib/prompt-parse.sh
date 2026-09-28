@@ -713,7 +713,18 @@ def _unwrap_footer(rows):
 # abort the parser and silence the wake path.
 lines = _unwrap_footer([raw.decode("utf-8", "replace") for raw in sys.stdin.buffer])
 _border_chars = "\u2500\u256d\u256e\u2570\u256f"  # ─ ╭ ╮ ╰ ╯
-
+# #191 (herdr-control PR #189 round-2 security review, P2/CRITICAL): the
+# pass-1 opener used to accept ANY non-alnum prefix (`text`, stripped at
+# `^[^A-Za-z0-9]+`), so a Python COMMENT inside a real eval body --
+# `# Allow tool: read Path: README.md` -- opened a fake one-row "read"
+# panel once the genuine header had scrolled off the top of the captured
+# window (a tall eval body, the wM:p4 shape). A real omp panel header is
+# never preceded by anything but whitespace or the box-drawing border this
+# parser already tracks (`_border_chars`, plus the vertical bar `│`); an
+# arbitrary prefix like `#`, `//`, `*` or a quote character means the row
+# is BODY TEXT that merely contains the literal string, never a real
+# header omp rendered.
+_HEADER_PREFIX_RE = re.compile(r"^[\s\u2502" + _border_chars + r"]+")
 
 def _row_metrics(plain_line):
     raw = plain_line.rstrip("\r\n")
@@ -731,7 +742,11 @@ for line in lines:
     body = re.sub(r"^[\s│]+", "", plain).rstrip(" \t\r\n│─╮")
     # A header row only OPENS a panel; inside one it is command content
     # (a multi-line command can contain the literal text "Allow tool:").
-    if state == 0 and text.startswith("Allow tool:"):
+    # #191: the opener itself checks `header_text` (whitespace/border-char
+    # prefix only), never the looser `text` used for option/footer
+    # matching below -- see the `_HEADER_PREFIX_RE` comment above.
+    header_text = _HEADER_PREFIX_RE.sub("", plain)
+    if state == 0 and header_text.startswith("Allow tool:"):
         pending_running = list(running_lines)
         state, question, selected = 1, [text], ""
         _rawlen, _cend, _bordered = _row_metrics(plain)
@@ -913,23 +928,6 @@ if mode == "visible":
     sys.exit(0 if visible else 1)
 if not complete or invalid:
     sys.exit(1)
-# #190 (security review round 1 of #187, PR #189): anchor tool/header
-# identification on the LAST "Allow tool:" row seen, not the first --
-# WITHOUT discarding anything already captured. The state machine above
-# intentionally never re-opens once a panel exists (see its own header
-# comment, and the "embedded Allow tool: row cannot restart the panel and
-# hide the real command" test this must not regress), so a genuine SECOND
-# header stays present in question but never displaces the first as index
-# 0. This relabels index 0 only; every row, including the original header
-# text, stays in the list at its own position, so nothing captured is ever
-# hidden from a caller that counts or classifies rows. classify_command
-# (lib/command-policy.sh) separately fails closed whenever the joined text
-# carries more than one "Allow tool:" occurrence, so this exists for every
-# OTHER consumer of this parser (prompt id, visibility, alerting) that
-# never goes through classify_command at all.
-_hdr_idx = [i for i, r in enumerate(question) if r.startswith("Allow tool:")]
-if len(_hdr_idx) > 1:
-    question[0] = question[_hdr_idx[-1]]
 if mode == "options":
     print("1\tApprove\n2\tDeny")
 elif mode == "selected":
