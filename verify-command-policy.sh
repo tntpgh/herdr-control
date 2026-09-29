@@ -1663,6 +1663,23 @@ check_wt "bash redirect to /dev/null"         "$WT_184" "> /dev/null 2>&1"      
 check_wt "bash cd tracking, target inside"    "$WT_184" "cd sub && echo x > y"                    allow
 check_wt "bash rm of an in-worktree build dir stays governed by the rm rule, not this one" \
   "$WT_184" "rm -rf dist" allow
+
+# herdr-control#192 — three parser gaps found in review, all in the shared
+# lib/bash-write-targets.sh parser both layers call.
+check_wt "bash multi-line quoted string doesn't hide the redirect after it (#192 bypass A)" \
+  "$WT_184" "$(printf 'echo "line1\nline2" > /outside/x.txt')" escalate
+check_wt "bash <> read-write redirect creates a file outside (#192 bypass B)" \
+  "$WT_184" ": <> /outside/f" escalate
+check_wt "bash fd-prefixed <> outside (#192 bypass B, glued)" \
+  "$WT_184" "exec 3<> /outside/f2" escalate
+check_wt "bash find -exec touch outside is unwrapped and escalates (#192 bypass C)" \
+  "$WT_184" 'find . -maxdepth 0 -exec touch /outside/marker \;' escalate
+check_wt "bash piped to xargs touch outside is unwrapped and escalates (#192 bypass C)" \
+  "$WT_184" 'echo /outside/marker | xargs touch' escalate
+check_wt "bash find -exec touch fully inside the worktree allows (unwrap, not blanket fail-closed)" \
+  "$WT_184" 'find . -exec touch .handoffs/x \;' allow
+check_wt "bash plain find with no -exec writes nothing, allows (the dominant real-world find shape)" \
+  "$WT_184" "find . -name '*.log'" allow
 check "bash write-scope rule is a no-op with no worktree context" \
   "cat f >> /outside" allow
 

@@ -190,8 +190,23 @@ _cp_data_run_ext='(html?|json|xml|csv|tsv|txt|md|log|ya?ml|png|jpe?g|gif|svg|pdf
 # still telling apart "this text is one simple command" (nothing but real
 # whitespace survives unprotected) from "this text has real shell structure"
 # — the split `_cp_walk_prep` performs next throws that distinction away.
+#
+# Quote state spans a REAL embedded newline (a legitimately multi-line
+# quoted string — `echo "line1<NL>line2" > f` is ordinary bash). AWK has no
+# `BEGIN{RS=...}` here, so its default per-line record processing would
+# otherwise reset the quote-state variable at the start of every physical
+# line, closing the string early and reading the far side's closing quote
+# as OPENING a new one — silently swallowing a real, unquoted operator
+# after it (herdr-control#192, bypass A: a multi-line `echo "..." > outside`
+# produced zero write targets). Fixed the same way
+# `_cp_bwt_unterminated_quote` already does it: flatten every real `\n` to
+# an unused control byte (`\x0F`, one past `>`'s `\x0E`) BEFORE awk sees the
+# text, so the whole command is exactly one record and `st` is naturally
+# never reset mid-command; restore real newlines in the output afterward.
+# A literal `\x0F` byte in the ORIGINAL command text would collide — the
+# same accepted risk this function already takes for bytes 1-7 and 14.
 _cp_protect_text() {                    # raw
-  printf '%s' "$1" | awk '
+  printf '%s' "$1" | tr '\n' '\017' | awk '
     function prot(c) {
       if (c == " ")  return sprintf("%c", 1)
       if (c == ";")  return sprintf("%c", 2)
@@ -236,7 +251,7 @@ _cp_protect_text() {                    # raw
         out = out prot(c); i++; continue
       }
       print out
-    }'
+    }' | tr '\017' '\n'
 }
 
 _cp_walk_prep() {                       # raw
@@ -2853,10 +2868,15 @@ _cp_bwt_classify_target() {
 
 # _cp_bwt_scan_redirects <segment> -> classify_target for EVERY output
 # redirection in one operator-split segment (`>`, `>>`, `>|`, `&>`, `&>>`,
-# `N>`, `N>>`, both `op target` and glued `opTARGET` spellings); fd dups
-# (`>&N`, `N>&M`) and input redirections (`<`, heredocs `<<`/`<<-`, `<<<`,
-# `<>`) are consumed but never a target. Globbing is disabled while
-# splitting, same reason _cp_rm_targets_are_local disables it.
+# `N>`, `N>>`, `<>`/`N<>` — bare and glued spellings for all of them); fd
+# dups (`>&N`, `N>&M`) and PURE input redirections (`<`, heredocs
+# `<<`/`<<-`, `<<<`) are consumed but never a target. `<>` is listed
+# alongside the OUTPUT forms, not the input ones, on purpose: bash opens it
+# read+write and CREATES the file if it does not exist (herdr-control#192,
+# bypass B — `: <> outside/f` wrote a real file with nothing here to catch
+# it) — a write primitive wearing an input-shaped token. Globbing is
+# disabled while splitting, same reason _cp_rm_targets_are_local disables
+# it.
 _cp_bwt_scan_redirects() {
   local seg="$1"
   case "$-" in *f*) local oldf=set ;; *) local oldf=unset ;; esac
@@ -2865,7 +2885,7 @@ _cp_bwt_scan_redirects() {
   set -- $seg
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      '>'|'>>'|'>|'|'&>'|'&>>'|[0-9]'>'|[0-9]'>>')
+      '>'|'>>'|'>|'|'&>'|'&>>'|[0-9]'>'|[0-9]'>>'|'<>'|[0-9]'<>')
         shift
         if [ "$#" -gt 0 ]; then
           case "$1" in
@@ -2875,14 +2895,14 @@ _cp_bwt_scan_redirects() {
           shift
         fi
         continue ;;
-      '>'*|[0-9]'>'*|'&>'*)
+      '>'*|[0-9]'>'*|'&>'*|'<>'*|[0-9]'<>'*)
         case "$1" in
           *'>&'*) ;;
           *)
-            _cp_bwt_classify_target "$(_cp_bwt_unprotect "$(printf '%s' "$1" | sed -E 's/^[0-9]*(>>|>\||&>>|&>|>)//')")" ;;
+            _cp_bwt_classify_target "$(_cp_bwt_unprotect "$(printf '%s' "$1" | sed -E 's/^[0-9]*(>>|>\||&>>|&>|>|<>)//')")" ;;
         esac
         shift; continue ;;
-      '<'|'<>'|[0-9]'<')
+      '<'|[0-9]'<')
         shift; [ "$#" -gt 0 ] && shift; continue ;;
       '<'*|[0-9]'<'*)
         shift; continue ;;
@@ -2931,7 +2951,33 @@ _cp_bwt_inplace_targets() {
 # _cp_bwt_verb_targets <command word> <non-redirect argv...> -> classify
 # every destination `cp`/`mv`/`install`/`ln` (last non-option arg, or the
 # `-t DIR`/`--target-directory=DIR` value), `dd of=`, in-place `sed`/`perl`,
-# `touch`, `truncate`, and `tee [-a]` argument names.
+# `touch`, `truncate`, and `tee [-a]` argument names; `find -exec/-execdir/
+# -ok .../\;`|`+` and `xargs`/`parallel`'s trailing command are unwrapped
+# (herdr-control#192, bypass C) and their own verb + args re-classified
+# through this same function, rather than blanket-failing every `find`/
+# `xargs` closed — measured liveness showed that costs ~3% of ALL matched
+# candidates fleet-wide over 3 days, because a bare `find … -name …`
+# search with no `-exec` at all (no write possible) was the overwhelming
+# majority. A wrapped verb this file doesn't otherwise govern (`rm`,
+# `chmod`, …) still emits nothing — same ceiling a bare top-level
+# invocation of that verb already has, #184 never promised to cover it.
+
+# _cp_bwt_dispatch_wrapped <verb> [args...] -> re-runs _cp_bwt_verb_targets
+# on a command find/xargs/parallel exposes as its own literal, static argv
+# (a find `-exec`/`-execdir`/`-ok` clause's command, or xargs/parallel's
+# trailing command). COMPUTED when the verb token itself is unreadable (a
+# `$VAR`/glob/@SUB@ — e.g. `find . -exec "$CMD" {} \;`); otherwise the
+# SAME classification a top-level invocation of that verb would get.
+_cp_bwt_dispatch_wrapped() {
+  local verb="$1"; shift
+  case "$verb" in
+    *'@SUB@'*|*'$'*|*'*'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*)
+      printf 'COMPUTED\t%s\n' "a wrapped command whose name cannot be read statically" ;;
+    *)
+      _cp_bwt_verb_targets "$verb" ${1+"$@"} ;;
+  esac
+}
+
 _cp_bwt_verb_targets() {
   local cmd="$1"; shift
   case "$cmd" in
@@ -2975,6 +3021,58 @@ _cp_bwt_verb_targets() {
       for a in "$@"; do
         case "$a" in -*) ;; *) _cp_bwt_classify_target "$a" ;; esac
       done ;;
+    find)
+      # herdr-control#192, bypass C: `-exec CMD ARGS... \;` (or `+`,
+      # or `-execdir`/`-ok`) names a real, static, wrapped verb this
+      # scanner used to silently skip — not the #174 interpreter-source
+      # ceiling (no code evaluation needed to read the clause), just an
+      # unhandled wrapper. A bare `find … -name …` with NO `-exec` clause
+      # at all writes nothing and is left alone (measured: the dominant
+      # real-world shape by far).
+      local -a a=("$@") wrapped=()
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -exec|-execdir|-ok)
+            i=$((i + 1)); wrapped=()
+            while [ "$i" -lt "$n" ] && [ "${a[$i]}" != ';' ] && [ "${a[$i]}" != '+' ]; do
+              wrapped+=("${a[$i]}"); i=$((i + 1))
+            done
+            [ "$i" -lt "$n" ] && i=$((i + 1))
+            [ "${#wrapped[@]}" -gt 0 ] && _cp_bwt_dispatch_wrapped "${wrapped[@]}" ;;
+          *) i=$((i + 1)) ;;
+        esac
+      done ;;
+    xargs|parallel)
+      # herdr-control#192, bypass C: xargs/parallel's own flags come first
+      # (a small known set take a following value — the rest are skipped
+      # bare), then the first non-option token is the wrapped verb, same
+      # unwrap `find -exec` gets above. Unlike `find -exec` (a fixed,
+      # complete argv), xargs/parallel APPEND the piped input as trailing
+      # args at runtime — invisible to a static scanner. So when the
+      # wrapped verb's own LITERAL argv (no placeholder, e.g. no `-I{}`)
+      # produces no target at all, that means its real target is the
+      # piped data, not "no target": fail closed instead of silently
+      # matching this file's normal "empty output = allowed" contract.
+      local -a a=("$@") wrapped=()
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -I|-i|-L|-l|-n|-P|-s|-a|-E|-d) i=$((i + 2)) ;;
+          -*) i=$((i + 1)) ;;
+          *) break ;;
+        esac
+      done
+      while [ "$i" -lt "$n" ]; do wrapped+=("${a[$i]}"); i=$((i + 1)); done
+      if [ "${#wrapped[@]}" -gt 0 ]; then
+        local out
+        out="$(_cp_bwt_dispatch_wrapped "${wrapped[@]}")"
+        if [ -n "$out" ]; then
+          printf '%s\n' "$out"
+        else
+          printf 'COMPUTED\t%s\n' "xargs/parallel appends piped input as trailing args this scanner cannot see"
+        fi
+      fi ;;
   esac
 }
 

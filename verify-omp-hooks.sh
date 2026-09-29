@@ -1296,6 +1296,13 @@ bash_heredoc_redirect_out|bash|{"command":"cat > $OTHER/y.txt <<EOF\nhi\nEOF"}
 bash_tee_append_out|bash|{"command":"tee -a $OTHER/z.txt"}
 bash_cp_dest_out|bash|{"command":"cp lib/a.sh $OTHER/b.sh"}
 bash_computed_home_out|bash|{"command":"echo x > \"\$HOME/x\""}
+bash_multiline_quote_hides_redirect_out|bash|{"command":"echo \"line1\nline2\" > $OTHER/x.txt"}
+bash_rw_redirect_creates_file_out|bash|{"command":": <> $OTHER/f2"}
+bash_fd_rw_redirect_out|bash|{"command":"exec 3<> $OTHER/f3"}
+bash_find_exec_wraps_verb_out|bash|{"command":"find . -maxdepth 0 -exec touch $OTHER/marker \\\\;"}
+bash_xargs_wraps_verb_out|bash|{"command":"echo $OTHER/marker | xargs touch"}
+in_wt_bash_find_exec_inside|bash|{"command":"find . -exec touch .handoffs/x \\\\;"}
+in_wt_bash_find_no_exec|bash|{"command":"find . -name '*.log'"}
 in_wt_bash_append|bash|{"command":">> .handoffs/x.out"}
 in_wt_bash_devnull|bash|{"command":"> /dev/null 2>&1"}
 in_wt_bash_cd_sub|bash|{"command":"cd sub && echo x > y"}
