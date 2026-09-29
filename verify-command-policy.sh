@@ -1937,6 +1937,17 @@ check_wt "c\$''p (fused empty dollar-quote mid-word) is still read as cp, not si
   "$WT_184" "c\$''p src.txt /outside/dest.txt" escalate
 check_wt "c\$\"\"p (fused empty dollar-double-quote mid-word) is still read as cp (#192 round 7 F3, not masked by F2)" \
   "$WT_184" "c\$\"\"p src.txt /outside/dest.txt" escalate
+
+# herdr-control#192 round 8, F4: `_cp_coderef_has_ansi_c_quote`'s own
+# substring test for `$'` misses a backslash-newline line continuation
+# sitting between the `$` and the `'` — bash deletes that pair BEFORE
+# quote parsing starts, so it's real ANSI-C quoting even though the
+# literal 3-byte `$'` sequence never appears. Today it still fails closed
+# only by accident, via the unrelated unterminated-quote path; fixed in
+# the guard itself so its own contract holds without relying on that.
+r8_f4_cmd="$(printf 'cat tmp/decoy.txt$\\\n%s\\%s%s ; cp file.txt /outside/dest.txt' "'" "'" "'")"
+check_wt "a backslash-newline line continuation between \$ and ' is still read as ANSI-C quoting, not just an unterminated quote (#192 round 8 F4)" \
+  "$WT_184" "$r8_f4_cmd" escalate
 check "bash write-scope rule is a no-op with no worktree context" \
   "cat f >> /outside" allow
 

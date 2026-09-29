@@ -872,9 +872,24 @@ EOF
 # example were both invisible). Rather than teach two separate awk state
 # machines a third quoting mode, fail closed: `_cp_coderef_walk` escalates
 # on sight of `$'` instead of trying to parse through it.
+# herdr-control#192 round 8, F4: a literal backslash-newline pair between
+# the `$` and the `'` (a shell line continuation) defeats the plain
+# substring test above — bash deletes a backslash-newline pair BEFORE
+# quote parsing even starts, so `$<backslash><newline>'...'` is real
+# ANSI-C quoting to bash but doesn't contain the literal 3-byte `$'`
+# sequence this function greps for. Today that shape still fails closed
+# only by accident, via the unrelated unterminated-quote check elsewhere
+# in `bash_write_targets` — this function's OWN contract ("0 if TEXT
+# contains a literal `$'`, the start of ANSI-C quoting") should hold on
+# its own. Fix: delete every backslash-newline pair from a local copy of
+# TEXT first, matching bash's own line-continuation removal, before the
+# substring test — no other behavior change.
 _cp_coderef_has_ansi_c_quote() {        # text
-  local marker; marker="$(printf '$%s' "'")"
-  case "$1" in *"$marker"*) return 0 ;; esac
+  local marker text bs nl
+  marker="$(printf '$%s' "'")"
+  bs='\'; nl=$'\n'
+  text="${1//"$bs$nl"/}"
+  case "$text" in *"$marker"*) return 0 ;; esac
   return 1
 }
 
