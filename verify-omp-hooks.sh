@@ -1163,7 +1163,7 @@ if ! command -v bun >/dev/null 2>&1; then
   bad "bun not on PATH — the write-scope guard is untested"
 else
   F="$WORK/scope"; MAIN="$F/main"; WT="$F/wt"; OTHER="$F/other"; SCR="$WORK/scratch"; FHOME="$F/home"
-  mkdir -p "$MAIN/.handoffs" "$MAIN/lib" "$WT/lib" "$WT/tmp" "$WT/.handoffs" "$OTHER" "$SCR" "$FHOME"
+  mkdir -p "$MAIN/.handoffs" "$MAIN/lib" "$WT/lib" "$WT/tmp" "$WT/.handoffs" "$WT/sub" "$OTHER" "$SCR" "$FHOME"
   printf 'notes\n' > "$MAIN/.handoffs/notepad.md"; printf 'x\n' > "$MAIN/lib/x.sh"; printf 'a\n' > "$WT/lib/a.sh"
   printf 'gitdir: %s/.git/worktrees/wt\n' "$MAIN" > "$WT/.git"; printf 'shared\n' > "$MAIN/hl.txt"
   printf 'conductor brief\n' > "$SCR/conductor-brief.md"
@@ -1290,6 +1290,15 @@ read_main|read|{"path":"$MAIN/.handoffs/notepad.md"}
 grep_main|grep|{"pattern":"x","path":"$MAIN"}
 bash_main|bash|{"command":"cat $MAIN/.handoffs/notepad.md"}
 lsp_read_main|lsp|{"action":"definition","file":"$MAIN/lib/x.sh"}
+bash_append_notepad_out|bash|{"command":"printf x >> $MAIN/.handoffs/notepad.md"}
+bash_cat_append_out|bash|{"command":"cat f >> $OTHER/x.txt"}
+bash_heredoc_redirect_out|bash|{"command":"cat > $OTHER/y.txt <<EOF\nhi\nEOF"}
+bash_tee_append_out|bash|{"command":"tee -a $OTHER/z.txt"}
+bash_cp_dest_out|bash|{"command":"cp lib/a.sh $OTHER/b.sh"}
+bash_computed_home_out|bash|{"command":"echo x > \"\$HOME/x\""}
+in_wt_bash_append|bash|{"command":">> .handoffs/x.out"}
+in_wt_bash_devnull|bash|{"command":"> /dev/null 2>&1"}
+in_wt_bash_cd_sub|bash|{"command":"cd sub && echo x > y"}
 EOF
   jq -Rn '[inputs | split("|") | [.[0], .[1], (.[2:] | join("|") | fromjson)]]' "$WORK/scope-cases.txt" > "$WORK/scope-cases.json" \
     || bad "scope case table does not parse"

@@ -35,6 +35,22 @@ check() {
   fi
 }
 
+# check_wt <label> <worktree> <command> <expected-verdict> — same as check(),
+# but with a worktree passed to classify_command (herdr-select.sh's
+# `own_worktree` positional) so the #184 bash write-scope rule can fire.
+check_wt() {
+  local label="$1" wt="$2" cmd="$3" want="$4" got reason
+  total=$((total + 1))
+  got="$(classify_command "$cmd" "$wt")"
+  reason="$(classify_reason)"
+  if [ "$got" = "$want" ]; then
+    printf 'PASS  %-52s => %-9s\n' "$label" "$got"
+  else
+    printf 'FAIL  %-52s => %-9s (want %s; reason=%s)\n' "$label" "$got" "$want" "$reason"
+    failed=$((failed + 1))
+  fi
+}
+
 # check_not_allow <label> <command> — must escalate or deny, either is fine
 # (used where the exact tier is less interesting than "not auto-answerable").
 check_not_allow() {
@@ -1623,6 +1639,32 @@ check_reserved   "env prefix then sh -c 'env|cat'"         "env A=1 sh -c 'env|c
 check_reserved   "env prefix then sh -c 'x=(env)'"         "env A=1 sh -c 'x=(env)'"
 check_reserved   "cd, env prefix, sh -c 'env;:'"           "cd /wt && env A=1 sh -c 'env;:'"
 check_reserved   "env prefix then git log --format"        "env A=1 git log --format='%h;%s'"
+
+echo
+echo "== #184: a bash write outside the pane's registered worktree escalates (peer may not auto-approve) =="
+# The live instance: `edit` blocked by #159, so the worker tried a bash
+# append to the main checkout's notepad instead, and a peer pressed Approve
+# on it (2026-09-28). classify_command's own containment check (shared
+# lib/bash-write-targets.sh parser, agent-hooks/omp-herdr-control.ts) must
+# now escalate every one of these instead.
+WT_184="/tmp/verify-cp-wt-184"
+check_wt "bash append to the main checkout's notepad (#184 live instance)" "$WT_184" \
+  "cat $WT_184/.handoffs/notepad.md >> /Users/thurbs/Code/herdr-control/.handoffs/notepad.md" escalate
+check_wt "bash cat append outside"            "$WT_184" "cat f >> /outside"                    escalate
+check_wt "bash heredoc redirect outside"      "$WT_184" "$(printf 'cat > /outside <<EOF\nhi\nEOF')" escalate
+check_wt "bash tee -a outside"                "$WT_184" "tee -a /outside"                       escalate
+check_wt "bash cp destination outside"        "$WT_184" "cp a /outside/b"                        escalate
+check_wt "bash computed \$HOME target"        "$WT_184" 'echo x > "$HOME/x"'                     escalate
+check_wt "bash mv destination outside"        "$WT_184" "mv a.sh /outside/b.sh"                  escalate
+check_wt "bash dd of= outside"                "$WT_184" "dd if=a of=/outside/b"                  escalate
+check_wt "bash sed -i outside"                "$WT_184" "sed -i 's/a/b/' /outside/c.txt"          escalate
+check_wt "bash append in-worktree"            "$WT_184" "printf x >> .handoffs/x.out"             allow
+check_wt "bash redirect to /dev/null"         "$WT_184" "> /dev/null 2>&1"                        allow
+check_wt "bash cd tracking, target inside"    "$WT_184" "cd sub && echo x > y"                    allow
+check_wt "bash rm of an in-worktree build dir stays governed by the rm rule, not this one" \
+  "$WT_184" "rm -rf dist" allow
+check "bash write-scope rule is a no-op with no worktree context" \
+  "cat f >> /outside" allow
 
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
