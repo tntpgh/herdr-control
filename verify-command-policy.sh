@@ -35,6 +35,22 @@ check() {
   fi
 }
 
+# check_wt <label> <worktree> <command> <expected-verdict> — same as check(),
+# but with a worktree passed to classify_command (herdr-select.sh's
+# `own_worktree` positional) so the #184 bash write-scope rule can fire.
+check_wt() {
+  local label="$1" wt="$2" cmd="$3" want="$4" got reason
+  total=$((total + 1))
+  got="$(classify_command "$cmd" "$wt")"
+  reason="$(classify_reason)"
+  if [ "$got" = "$want" ]; then
+    printf 'PASS  %-52s => %-9s\n' "$label" "$got"
+  else
+    printf 'FAIL  %-52s => %-9s (want %s; reason=%s)\n' "$label" "$got" "$want" "$reason"
+    failed=$((failed + 1))
+  fi
+}
+
 # check_not_allow <label> <command> — must escalate or deny, either is fine
 # (used where the exact tier is less interesting than "not auto-answerable").
 check_not_allow() {
@@ -1681,6 +1697,259 @@ check_reserved   "env prefix then sh -c 'env|cat'"         "env A=1 sh -c 'env|c
 check_reserved   "env prefix then sh -c 'x=(env)'"         "env A=1 sh -c 'x=(env)'"
 check_reserved   "cd, env prefix, sh -c 'env;:'"           "cd /wt && env A=1 sh -c 'env;:'"
 check_reserved   "env prefix then git log --format"        "env A=1 git log --format='%h;%s'"
+
+echo
+echo "== #184: a bash write outside the pane's registered worktree escalates (peer may not auto-approve) =="
+# The live instance: `edit` blocked by #159, so the worker tried a bash
+# append to the main checkout's notepad instead, and a peer pressed Approve
+# on it (2026-09-28). classify_command's own containment check (shared
+# lib/bash-write-targets.sh parser, agent-hooks/omp-herdr-control.ts) must
+# now escalate every one of these instead.
+WT_184="/tmp/verify-cp-wt-184"
+check_wt "bash append to the main checkout's notepad (#184 live instance)" "$WT_184" \
+  "cat $WT_184/.handoffs/notepad.md >> /Users/thurbs/Code/herdr-control/.handoffs/notepad.md" escalate
+check_wt "bash cat append outside"            "$WT_184" "cat f >> /outside"                    escalate
+check_wt "bash heredoc redirect outside"      "$WT_184" "$(printf 'cat > /outside <<EOF\nhi\nEOF')" escalate
+check_wt "bash tee -a outside"                "$WT_184" "tee -a /outside"                       escalate
+check_wt "bash cp destination outside"        "$WT_184" "cp a /outside/b"                        escalate
+check_wt "bash computed \$HOME target"        "$WT_184" 'echo x > "$HOME/x"'                     escalate
+check_wt "bash mv destination outside"        "$WT_184" "mv a.sh /outside/b.sh"                  escalate
+check_wt "bash dd of= outside"                "$WT_184" "dd if=a of=/outside/b"                  escalate
+check_wt "bash sed -i outside"                "$WT_184" "sed -i 's/a/b/' /outside/c.txt"          escalate
+check_wt "bash append in-worktree"            "$WT_184" "printf x >> .handoffs/x.out"             allow
+check_wt "bash redirect to /dev/null"         "$WT_184" "> /dev/null 2>&1"                        allow
+check_wt "bash cd tracking, target inside"    "$WT_184" "cd sub && echo x > y"                    allow
+check_wt "bash rm of an in-worktree build dir stays governed by the rm rule, not this one" \
+  "$WT_184" "rm -rf dist" allow
+
+# herdr-control#192 — three parser gaps found in review, all in the shared
+# lib/bash-write-targets.sh parser both layers call.
+check_wt "bash multi-line quoted string doesn't hide the redirect after it (#192 bypass A)" \
+  "$WT_184" "$(printf 'echo "line1\nline2" > /outside/x.txt')" escalate
+check_wt "bash <> read-write redirect creates a file outside (#192 bypass B)" \
+  "$WT_184" ": <> /outside/f" escalate
+check_wt "bash fd-prefixed <> outside (#192 bypass B, glued)" \
+  "$WT_184" "exec 3<> /outside/f2" escalate
+check_wt "bash find -exec touch outside is unwrapped and escalates (#192 bypass C)" \
+  "$WT_184" 'find . -maxdepth 0 -exec touch /outside/marker \;' escalate
+check_wt "bash piped to xargs touch outside is unwrapped and escalates (#192 bypass C)" \
+  "$WT_184" 'echo /outside/marker | xargs touch' escalate
+check_wt "bash find -exec touch fully inside the worktree allows (unwrap, not blanket fail-closed)" \
+  "$WT_184" 'find . -exec touch .handoffs/x \;' allow
+check_wt "bash plain find with no -exec writes nothing, allows (the dominant real-world find shape)" \
+  "$WT_184" "find . -name '*.log'" allow
+
+# herdr-control#192 round 2 — three MORE parser gaps found on re-review.
+check_wt "bash -c wraps a real bash string, unwrapped and escalates (#192 round 2 bypass D)" \
+  "$WT_184" "bash -c 'echo x > /outside/bashc-out.txt'" escalate
+check_wt "sh -c wraps a real bash string, unwrapped and escalates (#192 round 2 bypass D)" \
+  "$WT_184" "sh -c 'echo x > /outside/shc-out.txt'" escalate
+check_wt "bash -lc (combined cluster) still finds the -c string (#192 round 2 bypass D)" \
+  "$WT_184" "bash -lc 'echo x > /outside/f'" escalate
+check_wt "bash -c with a non-literal argument fails closed, not silently allowed (#192 round 2 bypass D)" \
+  "$WT_184" 'bash -c "echo x > $TARGETVAR"' escalate
+check_wt "bash -c fully inside the worktree allows (unwrap, not blanket fail-closed)" \
+  "$WT_184" "bash -c 'echo x >> .handoffs/x.out'" allow
+check_wt "tar -xf -C names a real extraction destination (#192 round 2 bypass E)" \
+  "$WT_184" "tar -xf a.tar -C /outside" escalate
+check_wt "tar -cf names a real archive destination (#192 round 2 bypass E)" \
+  "$WT_184" "tar -cf /outside/a.tar ." escalate
+check_wt "tar -xf with no -C writes nothing extra, allows" \
+  "$WT_184" "tar -xf a.tar" allow
+check_wt "rsync last-arg destination outside (#192 round 2 bypass E)" \
+  "$WT_184" "rsync -a src.txt /outside/dest.txt" escalate
+check_wt "scp last-arg destination outside (#192 round 2 bypass E)" \
+  "$WT_184" "scp src.txt /outside/dest.txt" escalate
+check_wt "sort -o outside (#192 round 2 bypass E)" \
+  "$WT_184" "sort -o /outside/out.txt src.txt" escalate
+check_wt "split prefix outside (#192 round 2 bypass E)" \
+  "$WT_184" "split -b 2 src.txt /outside/prefix-" escalate
+check_wt "mkfifo outside (#192 round 2 bypass E)" \
+  "$WT_184" "mkfifo /outside/fifo1" escalate
+check_wt "curl -o outside (#192 round 2 bypass E)" \
+  "$WT_184" "curl -o /outside/f https://example.com" escalate
+check_wt "wget -O outside (#192 round 2 bypass E)" \
+  "$WT_184" "wget -O /outside/f https://example.com" escalate
+check_wt "patch -o outside (#192 round 2 bypass E)" \
+  "$WT_184" "patch -o /outside/f target.diff" escalate
+check_wt "git clone explicit dest outside (#192 round 2 bypass E)" \
+  "$WT_184" "git clone https://example.com/r.git /outside/r" escalate
+check_wt "perl -pi combined cluster in-place, unwrapped and escalates (#192 round 2 bypass F)" \
+  "$WT_184" "perl -pi -e 's/a/b/' /outside/perl-pi-target.txt" escalate
+check_wt "sed -ni combined cluster in-place, unwrapped and escalates (#192 round 2 bypass F)" \
+  "$WT_184" "sed -ni 's/a/b/p' /outside/f" escalate
+check_wt "sed -i '' (BSD mandatory empty-suffix arg) still caught correctly, no regression" \
+  "$WT_184" "sed -i '' 's/a/b/' /outside/f" escalate
+check_wt "xargs -I{} placeholder fails closed, not silently allowed" \
+  "$WT_184" 'echo /outside/marker | xargs -I{} touch {}' escalate
+
+# herdr-control#192 round 3 — four MORE gaps found on re-review.
+check_wt "git clone --depth 1 (value-taking flag before URL) still finds the real dest (#192 round 3 F1)" \
+  "$WT_184" "git clone --depth 1 https://example.com/r.git /outside/r" escalate
+check_wt "git clone -b BRANCH (value-taking flag before URL) still finds the real dest (#192 round 3 F1)" \
+  "$WT_184" "git clone -b main https://example.com/r.git /outside/r" escalate
+check_wt "git clone --separate-git-dir names a write destination of its own (#192 round 3 F1)" \
+  "$WT_184" "git clone --separate-git-dir /outside/gitdir https://example.com/r.git" escalate
+check_wt "git clone with no explicit dest, fully inside (derived name), allows" \
+  "$WT_184" "git clone https://example.com/r.git" allow
+check_wt "rsync dest then --timeout VALUE trailing doesn't defeat last-nonopt (#192 round 3 F2)" \
+  "$WT_184" "rsync -a src.txt /outside/dest.txt --timeout 30" escalate
+check_wt "rsync dest then --exclude PATTERN trailing doesn't defeat last-nonopt (#192 round 3 F2)" \
+  "$WT_184" "rsync -a src.txt /outside/dest.txt --exclude foo" escalate
+check_wt "rsync --log-file names a write destination of its own (#192 round 3 F2)" \
+  "$WT_184" "rsync -a src.txt dest.txt --log-file /outside/rsync.log" escalate
+check_wt "scp -P port (value-taking flag) doesn't defeat last-nonopt (#192 round 3 F2)" \
+  "$WT_184" "scp -P 22 src.txt /outside/dest.txt" escalate
+check_wt "install dest then -m MODE trailing doesn't defeat last-nonopt (#192 round 3 F2)" \
+  "$WT_184" "install src.txt /outside/dest -m 644" escalate
+check_wt "cp dest then -S SUFFIX trailing doesn't defeat last-nonopt (#192 round 3 F2)" \
+  "$WT_184" "cp src.txt /outside/dest.txt -S .bak" escalate
+check_wt "gcp (Homebrew GNU coreutils g-prefix) is dispatched as cp (#192 round 3 F3)" \
+  "$WT_184" "gcp src.txt /outside/dest.txt" escalate
+check_wt "gtouch (Homebrew GNU coreutils g-prefix) is dispatched as touch (#192 round 3 F3)" \
+  "$WT_184" "gtouch /outside/f" escalate
+check_wt "gmkdir (Homebrew GNU coreutils g-prefix) is dispatched as mkdir (#192 round 3 F3)" \
+  "$WT_184" "gmkdir /outside/d" escalate
+check_wt "gtar (Homebrew GNU coreutils g-prefix) is dispatched as tar (#192 round 3 F3)" \
+  "$WT_184" "gtar -xf a.tar -C /outside" escalate
+check_wt "tar --exclude (long option containing x/c/f as substrings) is not misread as a mode cluster, allows" \
+  "$WT_184" "tar --exclude foo -xf a.tar" allow
+_f4cmd="echo x > /outside/deep.txt"
+for _f4i in 1 2 3 4 5 6 7 8 9 10; do
+  _f4cmd="bash -c $(printf '%q' "$_f4cmd")"
+done
+check_wt "bash -c nested past the depth cap fails closed, not silently allowed (#192 round 3 F4)" \
+  "$WT_184" "$_f4cmd" escalate
+
+# herdr-control#192 round 4 — generalized value-flag recognizer (glued
+# short flags, cluster-tail short flags, `--` end-of-options) routed
+# through every table below; plus a GNU-vs-BSD `install` divergence and a
+# shared depth cap for find/xargs/parallel wrapping.
+check_wt "gcp -tDIR (glued short target flag) still finds the real dest (#192 round 4 G1)" \
+  "$WT_184" "gcp -t/outside file.txt" escalate
+check_wt "gmv -tDIR (glued short target flag) still finds the real dest (#192 round 4 G1)" \
+  "$WT_184" "gmv -t/outside file.txt" escalate
+check_wt "gln -tDIR (glued short target flag) still finds the real dest (#192 round 4 G1)" \
+  "$WT_184" "gln -t/outside file.txt" escalate
+check_wt "ginstall -tDIR (glued short target flag) still finds the real dest (#192 round 4 G1)" \
+  "$WT_184" "ginstall -t/outside file.txt" escalate
+check_wt "cp -t DIR (space form) still escalates after the generic-helper refactor" \
+  "$WT_184" "cp -t /outside file.txt" escalate
+check_wt "ginstall -T TAG (GNU: boolean, no value) doesn't swallow the real dest (#192 round 4 G2)" \
+  "$WT_184" "ginstall -T src.txt /outside/dest" escalate
+check_wt "ginstall -D (GNU: boolean, no value) doesn't swallow the real dest (#192 round 4 G2)" \
+  "$WT_184" "ginstall -D src.txt /outside/dest" escalate
+check_wt "install -T TAG (BSD: value-taking) still finds the real dest, unchanged (#192 round 4 G2)" \
+  "$WT_184" "install -T tagname src.txt /outside/dest" escalate
+check_wt "cp -- protects a real dash-prefixed dest from being read as a flag (#192 round 4 G3)" \
+  "$WT_184" "cp -- src.txt /outside/-dashdest-cp" escalate
+check_wt "mv -- protects a real dash-prefixed dest from being read as a flag (#192 round 4 G3)" \
+  "$WT_184" "mv -- src.txt /outside/-dashdest-mv" escalate
+check_wt "install -- protects a real dash-prefixed dest from being read as a flag (#192 round 4 G3)" \
+  "$WT_184" "install -- src.txt /outside/-dashdest-install" escalate
+check_wt "rsync -a -- protects a real dash-prefixed dest from being read as a flag (#192 round 4 G3)" \
+  "$WT_184" "rsync -a -- src.txt /outside/-dashdest-rsync" escalate
+check_wt "scp -- protects a real dash-prefixed dest from being read as a flag (#192 round 4 G3)" \
+  "$WT_184" "scp -- src.txt /outside/-dashdest-scp" escalate
+check_wt "git clone --depth=1 (glued long form) still finds the real dest, unchanged" \
+  "$WT_184" "git clone --depth=1 file:///tmp/r.git /outside/clone-depth-eq" escalate
+check_wt "rsync -aTDIR (glued temp-dir short opt) still finds the real dest (#192 round 4 G4)" \
+  "$WT_184" "rsync -aT/outside file.txt file2.txt" escalate
+check_wt "curl -oFILE (glued short output flag) still finds the real dest (#192 round 4 G5)" \
+  "$WT_184" "curl -o/outside/g5-out http://example.com/f" escalate
+check_wt "wget -OFILE (glued short output flag) still finds the real dest (#192 round 4 G5)" \
+  "$WT_184" "wget -O/outside/g5w-out http://example.com/f" escalate
+check_wt "install dest then glued -m644 trailing doesn't defeat last-nonopt (#192 round 4 sanity)" \
+  "$WT_184" "install s1.txt /outside/s1-dest.txt -m644" escalate
+check_wt "tar -CDIR (glued directory, extraction) still finds the real dest (#192 round 4 static 2-4)" \
+  "$WT_184" "tar -x -C/outside -f a.tar" escalate
+check_wt "tar -fFILE (glued file, creation) still finds the real dest (#192 round 4 static 2-4)" \
+  "$WT_184" "tar -c -f/outside/out.tar ." escalate
+_f5cmd="touch /outside/deep5.txt"
+for _f5i in 1 2 3 4 5 6 7 8 9 10; do
+  _f5cmd="find . -maxdepth 0 -exec $_f5cmd \;"
+done
+check_wt "find -exec nested past the depth cap fails closed, not silently allowed (#192 round 4 static 5)" \
+  "$WT_184" "$_f5cmd" escalate
+
+# herdr-control#192 round 5 — one more gap found on re-confirmation: an
+# EMPTY quoted value (`''`/`""`/`$''`) given to a value-taking flag
+# vanished during word-splitting instead of surviving as a real, distinct
+# zero-length word, so the flag ate the NEXT real positional instead.
+check_wt "cp -S with an empty single-quoted value doesn't eat the real dest (#192 round 5)" \
+  "$WT_184" "cp -S '' file.txt /outside/dest.txt" escalate
+check_wt "gcp -S with an empty single-quoted value doesn't eat the real dest (#192 round 5)" \
+  "$WT_184" "gcp -S '' file.txt /outside/dest.txt" escalate
+check_wt "rsync --suffix with an empty single-quoted value doesn't eat the real dest (#192 round 5)" \
+  "$WT_184" "rsync -a --suffix '' src.txt /outside/dest.txt" escalate
+check_wt "install -S with an empty single-quoted value doesn't eat the real dest (#192 round 5)" \
+  "$WT_184" "install -S '' src.txt /outside/dest" escalate
+check_wt "cp -S with an empty ANSI-C-quoted value doesn't eat the real dest (#192 round 5)" \
+  "$WT_184" "cp -S \$'' file.txt /outside/dest.txt" escalate
+check_wt "cp -S with a non-empty value still works, no regression (#192 round 5 sanity)" \
+  "$WT_184" "cp -S .bak file.txt /outside/dest.txt" escalate
+
+# herdr-control#192 round 6 — round 5's fix regressed: the empty-word
+# sentinel was emitted for ANY empty quote pair, including one sitting
+# INSIDE a word (bash concatenates adjacent quoted strings with no
+# separating whitespace into ONE word — `c''p` really is just `cp`), so
+# the command-word matcher read a literal sentinel byte as part of the
+# verb name and matched nothing at all (silent allow). Fixed by only
+# emitting the sentinel for a genuinely STANDALONE empty word (bounded by
+# real word boundaries on both sides), not one touching other characters.
+check_wt "c''p (empty quote fused mid-word) is still read as cp, not silently allowed (#192 round 6)" \
+  "$WT_184" "c''p src.txt /outside/dest.txt" escalate
+check_wt "m\"\"v (empty quote fused mid-word) is still read as mv, not silently allowed (#192 round 6)" \
+  "$WT_184" "m\"\"v src.txt /outside/dest.txt" escalate
+check_wt "t''ee (empty quote fused mid-word) is still read as tee, not silently allowed (#192 round 6)" \
+  "$WT_184" "t''ee /outside/out.txt" escalate
+check_wt "b''ash -c (empty quote fused mid-word) is still unwrapped as bash -c (#192 round 6)" \
+  "$WT_184" "b''ash -c 'cp x /outside/y'" escalate
+check_wt "s''ed -i (empty quote fused mid-word) is still read as sed -i (#192 round 6)" \
+  "$WT_184" "s''ed -i 's/a/b/' /outside/f" escalate
+check_wt "a''b as a plain arg (empty quote fused mid-word, not a flag value) parses cleanly (#192 round 6)" \
+  "$WT_184" "cp a''b /outside/dest.txt" escalate
+check_wt "cp -S '' (genuine standalone empty value) still escalates after the round 6 fix (#192 round 5 no-regression)" \
+  "$WT_184" "cp -S '' src.txt /outside/dest.txt" escalate
+
+# herdr-control#192 round 7 — 3 more gaps: (F1) a RUN of directly-touching
+# empty quote pairs is one empty word in real bash, but each pair was
+# judged independently and the whole run vanished. (F2) `$'...'` with a
+# backslash-escaped quote inside it desyncs the tokenizer's quote state
+# (single-quote scanning has no escape awareness, correct for a REAL
+# single-quoted string but wrong for ANSI-C quoting) and hides everything
+# after it — reused the existing `_cp_coderef_has_ansi_c_quote` guard
+# (same one `_cp_coderef_walk` already relies on) to fail the whole
+# command UNPARSED rather than teach the tokenizer ANSI-C's escape rules.
+# (F3) `$''`/`$""` fused mid-word left a literal stray `$` in the command
+# word, matching no verb case.
+check_wt "cp -S with FOUR adjacent empty quotes ('''') is still one empty word (#192 round 7 F1)" \
+  "$WT_184" "cp -S '''' f /outside/d" escalate
+check_wt "cp -S with adjacent empty '' \"\" is still one empty word (#192 round 7 F1 variant)" \
+  "$WT_184" "cp -S ''\"\" f /outside/d" escalate
+check_wt "cp -S with adjacent empty \"\" '' is still one empty word (#192 round 7 F1 variant)" \
+  "$WT_184" "cp -S \"\"'' f /outside/d" escalate
+check_wt "a backslash-escaped quote inside \$'...' fails closed instead of hiding the real write (#192 round 7 F2)" \
+  "$WT_184" "cat x\$'\\'' ; cp f /outside/d" escalate
+check_wt "adjacent empty \$''\$'' (ANSI-C run) fails closed via the same ansi-c guard (#192 round 7 F1/F2 variant)" \
+  "$WT_184" "cp -S \$''\$'' f /outside/d" escalate
+check_wt "c\$''p (fused empty dollar-quote mid-word) is still read as cp, not silently allowed (#192 round 7 F3)" \
+  "$WT_184" "c\$''p src.txt /outside/dest.txt" escalate
+check_wt "c\$\"\"p (fused empty dollar-double-quote mid-word) is still read as cp (#192 round 7 F3, not masked by F2)" \
+  "$WT_184" "c\$\"\"p src.txt /outside/dest.txt" escalate
+
+# herdr-control#192 round 8, F4: `_cp_coderef_has_ansi_c_quote`'s own
+# substring test for `$'` misses a backslash-newline line continuation
+# sitting between the `$` and the `'` — bash deletes that pair BEFORE
+# quote parsing starts, so it's real ANSI-C quoting even though the
+# literal 3-byte `$'` sequence never appears. Today it still fails closed
+# only by accident, via the unrelated unterminated-quote path; fixed in
+# the guard itself so its own contract holds without relying on that.
+r8_f4_cmd="$(printf 'cat tmp/decoy.txt$\\\n%s\\%s%s ; cp file.txt /outside/dest.txt' "'" "'" "'")"
+check_wt "a backslash-newline line continuation between \$ and ' is still read as ANSI-C quoting, not just an unterminated quote (#192 round 8 F4)" \
+  "$WT_184" "$r8_f4_cmd" escalate
+check "bash write-scope rule is a no-op with no worktree context" \
+  "cat f >> /outside" allow
 
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then

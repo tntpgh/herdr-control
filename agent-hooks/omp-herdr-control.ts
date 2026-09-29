@@ -48,6 +48,7 @@ const ROOT = process.env.HERDR_CONTROL_DIR?.trim() || path.dirname(HERE);
 const NOTIFY_SH = path.join(ROOT, "agent-hooks", "omp-notify.sh");
 const RECONCILE_SH = path.join(ROOT, "agent-hooks", "omp-reconcile.sh");
 const PRETOOL_REGISTRATION_SH = path.join(ROOT, "lib", "pretool-registration.sh");
+const BASH_WRITE_TARGETS_SH = path.join(ROOT, "lib", "bash-write-targets.sh");
 const RESOLVE_SH = path.join(ROOT, "herdr-resolve.sh");
 const CONDUCTOR_EXIT_SH = path.join(ROOT, "conductor-exit.sh");
 const HUB_PY = path.join(ROOT, "hub.py");
@@ -343,11 +344,17 @@ function pretoolRegistrationBlock(event: unknown): { block: true; reason: string
 // mode `edits[].rename`; any path field), multiedit, ast_edit, notebook*, lsp
 // (every action not known read-only, incl. rename_file's `new_name`; `request`
 // refused), notepad.ts's notepad_append/priority (on the notepad file they
-// write), and by shape any tool
+// write), bash/shell (#184: redirect `>`/`>>`/`>|`/`&>`/`&>>`/`N>`/`N>>`,
+// `tee`, heredoc `cat > F <<EOF`, `cp`/`mv`/`install`/`ln` destination,
+// `dd of=`, `sed`/`perl -i`, `touch`, `truncate` targets — extracted by
+// lib/bash-write-targets.sh, the SAME parser lib/command-policy.sh's
+// classify_command uses for the peer-approval side of this guard; a
+// target it cannot read statically fails closed, same as everything
+// below), and by shape any tool
 // whose name says it mutates (write/edit/patch/rename/…) AND carries a
 // path-like field. NOT covered here: `eval` (arbitrary code; omp's approval
-// layer governs it), bash (lib/command-policy.sh), and tools that write omp's
-// own state rather than a path (learn, manage_skill, retain).
+// layer governs it — #174's closed-world design), and tools that write
+// omp's own state rather than a path (learn, manage_skill, retain).
 const WORKER_TASK_ID = process.env.HERDR_TASK_ID?.trim() ?? "";
 const WORKER_RUN_ID = process.env.HERDR_RUN_ID?.trim() ?? "";
 const LOAD_HOME = process.env.HOME?.trim() || homedir();
@@ -498,7 +505,7 @@ interface MutationTargets {
   globOk?: boolean; // ast_edit expands globs; every other tool takes a path literally
 }
 
-function mutationTargets(toolName: string, rec: Record<string, unknown>): MutationTargets | string | undefined {
+function mutationTargets(toolName: string, rec: Record<string, unknown>, cwd: string): MutationTargets | string | undefined {
   const name = toolName.toLowerCase().replace(/[^a-z0-9_]/g, "");
   if (name === "write") {
     const targets = pathFields(rec);
@@ -523,6 +530,45 @@ function mutationTargets(toolName: string, rec: Record<string, unknown>): Mutati
       }
     }
     return targets.length > 0 ? { raw: targets } : "cannot tell which file this edit touches";
+  }
+  if (name === "bash" || name === "shell") {
+    // #184: reuse lib/command-policy.sh's parser (lib/bash-write-targets.sh,
+    // same spawnSync-a-script pattern pretoolRegistrationBlock uses for
+    // lib/pretool-registration.sh) rather than reimplementing redirect/verb
+    // parsing here — one parser, shared with classify_command's peer-
+    // approval rule.
+    const command = typeof rec.command === "string" ? rec.command : "";
+    if (!command.trim()) return undefined;
+    const bashCwd = typeof rec.cwd === "string" && rec.cwd.length > 0 ? rec.cwd : cwd;
+    if (!safeExists(BASH_WRITE_TARGETS_SH)) {
+      return "herdr bash write-scope parser is unavailable; refusing to judge this command's write targets";
+    }
+    const r = spawnSync("bash", [BASH_WRITE_TARGETS_SH, command, bashCwd], {
+      encoding: "utf8",
+      timeout: 5_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (r.error || r.status !== 0) {
+      return `bash write-target extraction failed (${r.error ? r.error.message : `exit ${r.status}`})`;
+    }
+    const targets: string[] = [];
+    for (const line of (r.stdout ?? "").split("\n")) {
+      const l = line.trimEnd();
+      if (!l) continue;
+      const tab = l.indexOf("\t");
+      if (tab < 0) continue;
+      const kind = l.slice(0, tab);
+      const val = l.slice(tab + 1);
+      if (kind === "COMPUTED") return `bash write target ${JSON.stringify(val)} cannot be verified statically (substitution, unquoted $VAR, glob, or ~user)`;
+      if (kind === "UNPARSED") return `bash command cannot be parsed safely (${val})`;
+      if (kind === "TARGET") targets.push(val);
+    }
+    // Every target lib/bash-write-targets.sh emits is already an absolute,
+    // lexically-collapsed path (cwd-joined, cd-adjusted there since only it
+    // tracks the command's internal `cd DIR &&` chain) — globOk stays false
+    // so checkFileTarget resolves it exactly like an edit/write path, same
+    // symlink-following, .git/.env exclusion, and scratch-root rules.
+    return targets.length > 0 ? { raw: targets } : undefined;
   }
   if (name === "lsp") {
     // omp tiers lsp by a read-only action set it does not export, so this errs
@@ -725,7 +771,7 @@ function checkOneForm(
     // and a device this file doesn't know by any path field it carries.
     const device = rest.split(/[/?#]/)[0] ?? "";
     const rec = args as Record<string, unknown>;
-    const inner = mutationTargets(device, rec) ?? { raw: pathFields(rec) };
+    const inner = mutationTargets(device, rec, cwd) ?? { raw: pathFields(rec) };
     if (typeof inner === "string") return `${raw}: ${inner}`;
     for (const p of inner.raw) {
       const why = checkTarget(p, inner, cwd, wt, newScratch);
@@ -743,7 +789,9 @@ function workerWriteScopeBlock(event: unknown, ctx: unknown): Block | undefined 
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
     const input = e.input && typeof e.input === "object" ? (e.input as Record<string, unknown>) : {};
-    const targets = mutationTargets(toolName, input);
+    const c = ctx && typeof ctx === "object" ? (ctx as Record<string, unknown>).cwd : undefined;
+    const cwd = typeof c === "string" && path.isAbsolute(c) ? c : process.cwd();
+    const targets = mutationTargets(toolName, input, cwd);
     if (targets === undefined) return undefined;
     // A peer message or a job's stdin names no file, and must still work when
     // the registry is unreadable: it is how a stuck worker reports being stuck.
@@ -760,8 +808,6 @@ function workerWriteScopeBlock(event: unknown, ctx: unknown): Block | undefined 
     });
     if (typeof targets === "string") return refuse(targets);
     if ("error" in scope) return refuse(`cannot verify your registered worktree: ${scope.error}`);
-    const c = ctx && typeof ctx === "object" ? (ctx as Record<string, unknown>).cwd : undefined;
-    const cwd = typeof c === "string" && path.isAbsolute(c) ? c : process.cwd();
     const newScratch: string[] = [];
     for (const raw of targets.raw) {
       const why = checkTarget(raw, targets, cwd, scope.worktree, newScratch);

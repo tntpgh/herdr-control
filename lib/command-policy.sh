@@ -14,6 +14,18 @@
 # Provides: scannable_command <cmd>   -> normalized text on stdout
 #           classify_command <cmd>    -> verdict token (allow|escalate|deny)
 #           classify_reason           -> reason for the last classify_command
+#           bash_write_targets <cmd> <cwd>
+#                                     -> one "TARGET\t<abs path>",
+#                                        "COMPUTED\t<raw text>", or
+#                                        "UNPARSED\t<reason>" line per write
+#                                        target a bash command names
+#                                        (redirect/tee/cp/mv/install/ln/
+#                                        dd of=/sed|perl -i/touch/truncate);
+#                                        caller MUST treat COMPUTED and
+#                                        UNPARSED as "outside scope" — #184,
+#                                        shared with
+#                                        agent-hooks/omp-herdr-control.ts via
+#                                        lib/bash-write-targets.sh
 #
 # Ported in spirit from yc-software/qm's src/policy/command-policy.ts — same
 # five floor rules, same normalize-before-match shape — reimplemented here
@@ -178,8 +190,80 @@ _cp_data_run_ext='(html?|json|xml|csv|tsv|txt|md|log|ya?ml|png|jpe?g|gif|svg|pdf
 # still telling apart "this text is one simple command" (nothing but real
 # whitespace survives unprotected) from "this text has real shell structure"
 # — the split `_cp_walk_prep` performs next throws that distinction away.
+#
+# Quote state spans a REAL embedded newline (a legitimately multi-line
+# quoted string — `echo "line1<NL>line2" > f` is ordinary bash). AWK has no
+# `BEGIN{RS=...}` here, so its default per-line record processing would
+# otherwise reset the quote-state variable at the start of every physical
+# line, closing the string early and reading the far side's closing quote
+# as OPENING a new one — silently swallowing a real, unquoted operator
+# after it (herdr-control#192, bypass A: a multi-line `echo "..." > outside`
+# produced zero write targets). Fixed the same way
+# `_cp_bwt_unterminated_quote` already does it: flatten every real `\n` to
+# an unused control byte (`\x0F`, one past `>`'s `\x0E`) BEFORE awk sees the
+# text, so the whole command is exactly one record and `st` is naturally
+# never reset mid-command; restore real newlines in the output afterward.
+# A literal `\x0F` byte in the ORIGINAL command text would collide — the
+# same accepted risk this function already takes for bytes 1-7 and 14.
+#
+# herdr-control#192 round 5: a quote pair that opens and closes with NO
+# content between them (a bare pair of single or double quotes, or the
+# quoted half of an ANSI-C dollar-single-quote) is a real, distinct,
+# ZERO-LENGTH shell word — a flag given an explicitly empty value followed
+# by a real filename is three real words, not two. Emitting nothing for
+# it collapsed the surrounding real spaces together, and the unquoted
+# word-splitting downstream (`_cp_locate_command_word`'s `set -- $1`) then
+# silently swallowed that word entirely — a value-taking flag given an
+# explicit empty value ate the NEXT real positional instead. `qn` below
+# counts characters emitted since the quote opened; a zero count at close
+# emits one sentinel byte (0x10, otherwise unused by this protection
+# scheme) so the word survives splitting as a real (if invisible) token —
+# every unprotect step strips it back out, restoring true emptiness.
+#
+# herdr-control#192 round 6 (regression fix): round 5's first pass emitted
+# that sentinel for ANY empty quote pair, including one sitting INSIDE a
+# word (`c''p`, `b''ash -c '...'`) — real bash concatenates adjacent
+# quoted strings with no separating whitespace into ONE word, so `c''p`
+# really is just `cp`, but the command-word matcher never knew to strip
+# 0x10 out of what it reads as a literal verb name, so `c''p` matched NO
+# verb case at all (silent allow). Fixed at the SAME emission point, not
+# by teaching every consumer to strip a byte it doesn't expect: the
+# sentinel is now emitted ONLY when the quote pair is a genuine STANDALONE
+# empty word — bounded on both sides by a real word boundary (start/end
+# of the command, unquoted whitespace, the flattened-newline byte, or one
+# of `;`/`&`/`|`/`(`/`)`/`<`/`>`). A quote pair touching any other
+# character on either side (still inside the same word) goes back to the
+# original round-1 behavior: plain removal, contributing nothing.
+#
+# herdr-control#192 round 7: two more gaps in round 5/6's fix, both fixed
+# right here rather than at any consumer:
+#
+# F1 — a RUN of directly touching empty quote pairs (`''''`, `''""`,
+# `""''`) is ONE empty word in real bash (adjacent quoted strings with no
+# gap concatenate), but each pair was judged independently: the first
+# pair's "next char" is the SECOND pair's quote character, which isn't a
+# boundary, so NEITHER pair's own isolated check passed and the whole run
+# vanished again. `runopen` now tracks the position of the FIRST open in
+# a chain of touching pairs; a pair that closes empty with another quote
+# (bare or `$`-prefixed, see F3) immediately following DEFERS its
+# decision instead of resolving alone — `runopen` is preserved across the
+# defer so the eventual boundary check uses the WHOLE run's outer edges,
+# and exactly one sentinel is emitted for the run, not one per pair. A
+# pair that closes with real content (`qn>0`) breaks any deferred chain —
+# the earlier empty pairs already contributed nothing and stay that way.
+#
+# F3 — `$''`/`$""` (ANSI-C/empty-dollar-quoting) fused mid-word
+# (`c$''p`) left a literal stray `$` in the output, since the `$` was
+# emitted as an ordinary character by the catch-all BEFORE the following
+# quote was ever recognized as an opener — `c$''p` became `c$p`, matching
+# no verb case (silent allow), instead of the `cp` real bash resolves it
+# to. Fixed by recognizing `$'`/`$"` as a single two-character quote
+# opener in the same place `'`/`"` alone are recognized: the `$` is
+# consumed as PART of the opener (never emitted), so the boundary check
+# for F1/round-6 above correctly looks at what precedes the `$`, not what
+# precedes the quote character after it.
 _cp_protect_text() {                    # raw
-  printf '%s' "$1" | awk '
+  printf '%s' "$1" | tr '\n' '\017' | awk '
     function prot(c) {
       if (c == " ")  return sprintf("%c", 1)
       if (c == ";")  return sprintf("%c", 2)
@@ -190,6 +274,26 @@ _cp_protect_text() {                    # raw
       if (c == "<")  return sprintf("%c", 7)
       if (c == ">")  return sprintf("%c", 14)
       return c
+    }
+    function isbound(c) {
+      if (c == "")   return 1
+      if (c == " ")  return 1
+      if (c == "\t") return 1
+      if (c == "\017") return 1
+      if (c == ";")  return 1
+      if (c == "&")  return 1
+      if (c == "|")  return 1
+      if (c == "(")  return 1
+      if (c == ")")  return 1
+      if (c == "<")  return 1
+      if (c == ">")  return 1
+      return 0
+    }
+    function isqstart(line, pos,    c1, c2) {
+      c1 = substr(line, pos, 1)
+      if (c1 == SQ || c1 == DQ) return 1
+      if (c1 == "$") { c2 = substr(line, pos + 1, 1); if (c2 == SQ || c2 == DQ) return 1 }
+      return 0
     }
     function skipsub(line, start, n,    d, j, ch) {
       d = 1; j = start
@@ -203,13 +307,24 @@ _cp_protect_text() {                    # raw
     }
     {
       SQ = sprintf("%c", 39); DQ = "\""; BT = sprintf("%c", 96)
-      line = $0; n = length(line); st = 0; i = 1; out = ""
+      # `qn` counts characters emitted since the CURRENT pair opened;
+      # `runopen` is the RAW-line position of the FIRST open in a chain of
+      # directly-touching pairs (0 when no chain is in progress) — reset
+      # to 0 the moment a chain resolves (emits or not) or breaks (a pair
+      # in it had real content), and left UNCHANGED across a defer so the
+      # eventual boundary check spans the whole run, not just one pair.
+      line = $0; n = length(line); st = 0; i = 1; out = ""; qn = 0; runopen = 0
       while (i <= n) {
         c = substr(line, i, 1)
         if (st == 0) {
           if (c == "\\")      { out = out prot(substr(line, i+1, 1)); i += 2; continue }
-          if (c == SQ)        { st = 1; i++; continue }
-          if (c == DQ)        { st = 2; i++; continue }
+          if (c == "$" && (substr(line, i+1, 1) == SQ || substr(line, i+1, 1) == DQ)) {
+                                st = (substr(line, i+1, 1) == SQ) ? 1 : 2
+                                qn = 0
+                                if (runopen == 0) runopen = i
+                                i += 2; continue }
+          if (c == SQ)        { st = 1; qn = 0; if (runopen == 0) runopen = i; i++; continue }
+          if (c == DQ)        { st = 2; qn = 0; if (runopen == 0) runopen = i; i++; continue }
           if (c == BT)        { j = i+1; while (j <= n && substr(line, j, 1) != BT) j++
                                 out = out "@SUB@"; i = j+1; continue }
           if (c == "$" && substr(line, i+1, 1) == "(") {
@@ -217,14 +332,27 @@ _cp_protect_text() {                    # raw
           out = out c; i++; continue
         }
         q = (st == 1) ? SQ : DQ
-        if (c == q)           { st = 0; i++; continue }
-        if (st == 2 && c == "\\") { out = out prot(substr(line, i+1, 1)); i += 2; continue }
+        if (c == q) {
+          st = 0; i++
+          if (qn == 0) {
+            if (isqstart(line, i)) {
+              continue                                  # defer: chain continues, runopen unchanged
+            }
+            if (isbound(substr(line, runopen - 1, 1)) && isbound(substr(line, i, 1)))
+              out = out sprintf("%c", 16)
+            runopen = 0
+          } else {
+            runopen = 0                                 # real content: breaks any deferred chain
+          }
+          continue
+        }
+        if (st == 2 && c == "\\") { out = out prot(substr(line, i+1, 1)); i += 2; qn++; continue }
         if (st == 2 && c == "$" && substr(line, i+1, 1) == "(") {
-                                i = skipsub(line, i+2, n); out = out "@SUB@"; continue }
-        out = out prot(c); i++; continue
+                                i = skipsub(line, i+2, n); out = out "@SUB@"; qn++; continue }
+        out = out prot(c); i++; qn++; continue
       }
       print out
-    }'
+    }' | tr '\017' '\n'
 }
 
 _cp_walk_prep() {                       # raw
@@ -744,9 +872,24 @@ EOF
 # example were both invisible). Rather than teach two separate awk state
 # machines a third quoting mode, fail closed: `_cp_coderef_walk` escalates
 # on sight of `$'` instead of trying to parse through it.
+# herdr-control#192 round 8, F4: a literal backslash-newline pair between
+# the `$` and the `'` (a shell line continuation) defeats the plain
+# substring test above — bash deletes a backslash-newline pair BEFORE
+# quote parsing even starts, so `$<backslash><newline>'...'` is real
+# ANSI-C quoting to bash but doesn't contain the literal 3-byte `$'`
+# sequence this function greps for. Today that shape still fails closed
+# only by accident, via the unrelated unterminated-quote check elsewhere
+# in `bash_write_targets` — this function's OWN contract ("0 if TEXT
+# contains a literal `$'`, the start of ANSI-C quoting") should hold on
+# its own. Fix: delete every backslash-newline pair from a local copy of
+# TEXT first, matching bash's own line-continuation removal, before the
+# substring test — no other behavior change.
 _cp_coderef_has_ansi_c_quote() {        # text
-  local marker; marker="$(printf '$%s' "'")"
-  case "$1" in *"$marker"*) return 0 ;; esac
+  local marker text bs nl
+  marker="$(printf '$%s' "'")"
+  bs='\'; nl=$'\n'
+  text="${1//"$bs$nl"/}"
+  case "$text" in *"$marker"*) return 0 ;; esac
   return 1
 }
 
@@ -847,7 +990,11 @@ _cp_shebang_kind() {
 # arriving here as one protected token — can be handed to `_cp_coderef_walk`
 # as fresh raw text and re-split on its own real operators.
 _cp_coderef_unprotect() {
-  printf '%s' "$1" | tr $'\001\002\003\004\005\006\007\016' ' ;&|()<>'
+  # herdr-control#192 round 5: strip the empty-quoted-word sentinel
+  # (`_cp_protect_text`, 0x10) before restoring the real operator bytes —
+  # it exists only to keep an empty `''`/`""`/`$''` word from vanishing
+  # during upstream unquoted word-splitting, not to appear in the value.
+  printf '%s' "$1" | tr -d '\020' | tr $'\001\002\003\004\005\006\007\016' ' ;&|()<>'
 }
 
 # `_cp_coderef_wrapped_command <cmd> <args...>` -> prints the first word
@@ -2804,6 +2951,779 @@ _cp_path_within_worktree() {
   esac
 }
 
+# ---- #184: bash write-target extraction ------------------------------------
+# The hook (agent-hooks/omp-herdr-control.ts, #159) covers write/edit/patch/
+# notebook/lsp/notepad_* tool calls, but not bash: a worker whose `edit` was
+# blocked by #159 tried `cat <wt>/.handoffs/notepad.md >>
+# /Users/thurbs/Code/herdr-control/.handoffs/notepad.md` instead, and a peer
+# pressed Approve on it (real instance, 2026-09-28). This section is the ONE
+# parser both layers share: the hook shells out to it (lib/bash-write-
+# targets.sh, spawnSync, the same pattern pretoolRegistrationBlock already
+# uses for lib/pretool-registration.sh) rather than re-deriving redirect/verb
+# parsing in TypeScript, and classify_command below calls it directly.
+#
+# Fail-closed, deliberately coarse (same "second gate" caveat as
+# _cp_path_within_worktree above): a target this cannot read statically —
+# `$(…)`/`` ` ` `` (already collapsed to the literal token `@SUB@` by
+# _cp_protect_text before this ever runs), an unexpanded `$VAR`, a glob
+# (`*?[]{}`), or `~otheruser` — is reported COMPUTED, and every caller MUST
+# treat that the same as "outside scope". Ceiling, same as #159's own: an
+# arbitrary interpreter (`python -c`, `node -e`, a script) can still write
+# anywhere bash's own redirect/verb grammar doesn't reach — #174's
+# closed-world design, out of scope here.
+
+# _cp_bwt_unprotect <token> -> the token with _cp_protect_text's control
+# bytes restored to the real characters they stood in for (quote chars stay
+# dropped — a quoted filename's bytes are what a real shell would pass the
+# command anyway).
+_cp_bwt_unprotect() {
+  # herdr-control#192 round 5: strip the empty-quoted-word sentinel
+  # (`_cp_protect_text`, 0x10) before restoring the real operator bytes —
+  # it exists only to keep an empty `''`/`""`/`$''` word from vanishing
+  # during upstream unquoted word-splitting (`set -- $1` in
+  # `_cp_locate_command_word`, which previously swallowed a value-taking
+  # flag's explicit empty value AND the next real positional along with
+  # it), not to appear in the final literal value.
+  printf '%s' "$1" | tr -d '\020' | tr '\001\002\003\004\005\006\007\016' ' ;&|()<>'
+}
+
+# _cp_bwt_classify_target <literal token, unprotected> -> "TARGET\t<value>"
+# (an existing dev sink emits nothing — not a real write), "COMPUTED\t<value>"
+# (fail closed), or nothing for /dev/null|stdout|stderr|fd/*.
+_cp_bwt_classify_target() {
+  local u="$1"
+  case "$u" in
+    /dev/null|/dev/stdout|/dev/stderr|/dev/fd/*) return 0 ;;
+    *'@SUB@'*|*'$'*|*'*'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*)
+      printf 'COMPUTED\t%s\n' "$u"; return 0 ;;
+    '~')
+      printf 'TARGET\t%s\n' "$HOME"; return 0 ;;
+    '~/'*)
+      printf 'TARGET\t%s\n' "$HOME/${u#\~/}"; return 0 ;;
+    '~'*)
+      printf 'COMPUTED\t%s\n' "$u"; return 0 ;;
+  esac
+  printf 'TARGET\t%s\n' "$u"
+}
+
+# _cp_bwt_scan_redirects <segment> -> classify_target for EVERY output
+# redirection in one operator-split segment (`>`, `>>`, `>|`, `&>`, `&>>`,
+# `N>`, `N>>`, `<>`/`N<>` — bare and glued spellings for all of them); fd
+# dups (`>&N`, `N>&M`) and PURE input redirections (`<`, heredocs
+# `<<`/`<<-`, `<<<`) are consumed but never a target. `<>` is listed
+# alongside the OUTPUT forms, not the input ones, on purpose: bash opens it
+# read+write and CREATES the file if it does not exist (herdr-control#192,
+# bypass B — `: <> outside/f` wrote a real file with nothing here to catch
+# it) — a write primitive wearing an input-shaped token. Globbing is
+# disabled while splitting, same reason _cp_rm_targets_are_local disables
+# it.
+_cp_bwt_scan_redirects() {
+  local seg="$1"
+  case "$-" in *f*) local oldf=set ;; *) local oldf=unset ;; esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $seg
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      '>'|'>>'|'>|'|'&>'|'&>>'|[0-9]'>'|[0-9]'>>'|'<>'|[0-9]'<>')
+        shift
+        if [ "$#" -gt 0 ]; then
+          case "$1" in
+            '&'[0-9]*) ;;
+            *) _cp_bwt_classify_target "$(_cp_bwt_unprotect "$1")" ;;
+          esac
+          shift
+        fi
+        continue ;;
+      '>'*|[0-9]'>'*|'&>'*|'<>'*|[0-9]'<>'*)
+        case "$1" in
+          *'>&'*) ;;
+          *)
+            _cp_bwt_classify_target "$(_cp_bwt_unprotect "$(printf '%s' "$1" | sed -E 's/^[0-9]*(>>|>\||&>>|&>|>|<>)//')")" ;;
+        esac
+        shift; continue ;;
+      '<'|[0-9]'<')
+        shift; [ "$#" -gt 0 ] && shift; continue ;;
+      '<'*|[0-9]'<'*)
+        shift; continue ;;
+    esac
+    shift
+  done
+  [ "$oldf" = unset ] && set +f
+}
+
+# _cp_bwt_inplace_targets <argv...> -> classify_target for every FILE
+# argument of a sed/perl `-i`/`--in-place` invocation. Only fires when an
+# in-place flag is present — `-i`/`-i.SUFFIX`/`--in-place[=SUFFIX]`, OR `i`
+# ANYWHERE in a leading short-flag cluster (`-pi`, `-ni`, `-pie`,
+# herdr-control#192 round 2 bypass F: a literal `-i`-prefix match missed
+# perl's extremely common `-pi -e '...'` one-liner shape entirely). Treats
+# the first non-option argument as the script/expression (unless `-e`/`-f`
+# supplied one explicitly, which also consumes its own following value)
+# and every non-option argument after that as a file target — an
+# approximation (a second `-e` after files, `-f script.sed` after files,
+# ...) documented rather than hidden, same spirit as _cp_walk_run's own
+# documented misses.
+_cp_bwt_inplace_targets() {
+  local -a args=("$@")
+  local n="${#args[@]}" i=0 inplace=0 script_consumed=0 a
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    case "${args[$i]}" in
+      -i|-i.*|--in-place|--in-place=*) inplace=1 ;;
+      -[a-zA-Z]*) case "${args[$i]}" in *i*) inplace=1 ;; esac ;;
+    esac
+    i=$((i + 1))
+  done
+  [ "$inplace" = 1 ] || return 0
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    a="${args[$i]}"
+    case "$a" in
+      -i|-i.*|--in-place|--in-place=*) i=$((i + 1)); continue ;;
+      -e|-f) script_consumed=1; i=$((i + 2)); continue ;;
+      -e*|-f*) script_consumed=1; i=$((i + 1)); continue ;;
+      -*) i=$((i + 1)); continue ;;
+      *)
+        if [ "$script_consumed" = 0 ]; then
+          script_consumed=1
+        else
+          _cp_bwt_classify_target "$a"
+        fi
+        i=$((i + 1)) ;;
+    esac
+  done
+}
+
+# _cp_bwt_verb_targets <command word> <cwd> <non-redirect argv...> ->
+# classify every destination `cp`/`mv`/`install`/`ln` (last non-option arg,
+# or the `-t DIR`/`--target-directory=DIR` value), `dd of=`, in-place
+# `sed`/`perl`, `touch`, `truncate`, `tee [-a]`, `tar -C`/`-f` (bypass E),
+# `rsync`/`scp`'s destination, `sort -o`/`split`'s prefix, `curl -o`/`-O`,
+# `wget -O`/`-P`, `patch -o`, `mkfifo`/`mknod`/`mkdir`, `unzip -d`, `git
+# clone <dest>` argument names; `find -exec/-execdir/-ok .../\;`|`+` and
+# `xargs`/`parallel`'s trailing command are unwrapped (bypass C) and their
+# own verb + args re-classified through this same function, rather than
+# blanket-failing every `find`/`xargs` closed — measured liveness showed
+# that costs ~3% of ALL matched candidates fleet-wide over 3 days, because
+# a bare `find … -name …` search with no `-exec` at all (no write
+# possible) was the overwhelming majority; `bash -c`/`sh -c`/`zsh -c`/
+# `dash -c`/`ksh -c`/`mksh -c` (bypass D) recurse `bash_write_targets`
+# straight back into the literal `-c` string, the SAME grammar this
+# tokenizer already reads — not the #174 interpreter-source ceiling
+# (`python -c`, `node -e`), which is real code in a DIFFERENT language and
+# stays out of scope. `cwd` is threaded through for exactly that
+# recursion — everything else in this function ignores it.
+#
+# `find`/`xargs`/`parallel`'s wrapped verb, and any verb below not in this
+# list at all (`rm`, `chmod`, `kill`, a bare script file passed to `bash`/
+# `python`, …), still emits nothing from THIS function — same ceiling a
+# bare top-level invocation already has. This case statement is a
+# DENYLIST of ordinary write-shaped verbs (herdr-control#192 round 2), not
+# an exhaustive parse of every program that can create a file; the long
+# tail past it is #174's closed-world design, out of scope for #184.
+# Matching is on the basename this dispatch was called with, not on what
+# binary that name actually resolves to — `cp "$(command -v bash)" x; ./x
+# -c '...'` (or any other copy/rename of a real interpreter to an unlisted
+# name) is invisible here for the same reason: a DENYLIST can only ever
+# recognize the names it was given, inherent to the design, not a gap to
+# close incrementally.
+
+# _cp_bwt_dispatch_wrapped <cwd> <verb> [args...] -> re-runs
+# _cp_bwt_verb_targets on a command find/xargs/parallel exposes as its own
+# literal, static argv (a find `-exec`/`-execdir`/`-ok` clause's command,
+# or xargs/parallel's trailing command). COMPUTED when the verb token
+# itself is unreadable (a `$VAR`/glob/@SUB@ — e.g. `find . -exec "$CMD" {}
+# \;`); otherwise the SAME classification a top-level invocation of that
+# verb would get.
+_cp_bwt_dispatch_wrapped() {
+  local cwd="$1" verb="$2"; shift 2
+  # herdr-control#192 round 4, static finding 5: shares `_cp_bwt_depth`
+  # with `bash_write_targets`'s own cap (bash's dynamic scoping means this
+  # `local` sees whatever the caller already incremented) — a
+  # `find -exec find -exec find -exec ...` chain recurses entirely through
+  # THIS function without ever re-entering `bash_write_targets`, so it was
+  # previously uncapped even after the bash -c depth cap landed.
+  local _cp_bwt_depth="$(( ${_cp_bwt_depth:-0} + 1 ))"
+  if [ "$_cp_bwt_depth" -gt 8 ]; then
+    printf 'COMPUTED\t%s\n' "wrapped-command nesting is too deep for this scanner to follow safely"
+    return 0
+  fi
+  case "$verb" in
+    *'@SUB@'*|*'$'*|*'*'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*)
+      printf 'COMPUTED\t%s\n' "a wrapped command whose name cannot be read statically" ;;
+    *)
+      _cp_bwt_verb_targets "$verb" "$cwd" ${1+"$@"} ;;
+  esac
+}
+# _cp_bwt_scan_optvals <short-skip-letters> <short-target-letters>
+# <long-skip-names> <long-target-names> <argv...> -> herdr-control#192
+# round 4 (G1/G3/G4/G5): the ONE shared recognizer every value-taking-flag
+# table below is routed through, replacing what used to be a separate,
+# slightly different ad hoc loop per verb. Recognizes, for a short flag
+# named in <short-skip-letters>/<short-target-letters>, all three shapes
+# real getopt parsing accepts: bare with a following argv word (`-t DIR`),
+# glued (`-tDIR`), and as the LAST letter of an otherwise-boolean cluster
+# (`-vt DIR`, `-avtDIR`) — every letter before the matched one in a
+# cluster is left alone as an inert boolean, same as this file's other
+# `-*)` catch-alls. For a long flag named in <long-skip-names>/
+# <long-target-names>, both `--flag VALUE` and `--flag=VALUE`. `--` ends
+# option processing: every token after it is a positional even if it
+# starts with `-` (round 4, G3 — a real dash-prefixed filename protected
+# by `--` was previously swallowed as an unrecognized flag instead of
+# counted). A "skip" flag's value is consumed and discarded; a "target"
+# flag's value is itself a write destination, classified directly.
+# Populates two globals: `_CP_BWT_NONOPT` (every genuine positional, in
+# order — flags, their values, and `--` itself excluded) and
+# `_CP_BWT_TGT_HIT` (1 if any target flag fired, so a caller whose
+# destination is EITHER an explicit target flag OR the last positional —
+# never both — knows to skip the positional fallback).
+_cp_bwt_scan_optvals() {
+  local shortskip="$1" shorttgt="$2" longskip="$3" longtgt="$4"; shift 4
+  _CP_BWT_NONOPT=()
+  _CP_BWT_TGT_HIT=0
+  local -a a=("$@")
+  local i=0 n="${#a[@]}" tok endopts=0 lname lval w j len ch val handled
+  while [ "$i" -lt "$n" ]; do
+    tok="${a[$i]}"
+    if [ "$endopts" = 1 ]; then
+      _CP_BWT_NONOPT+=("$tok"); i=$((i + 1)); continue
+    fi
+    case "$tok" in
+      --) endopts=1; i=$((i + 1)); continue ;;
+      --*)
+        lname="${tok#--}"
+        case "$lname" in
+          *=*)
+            lval="${lname#*=}"; lname="${lname%%=*}"
+            for w in $longtgt; do
+              [ "$lname" = "$w" ] && { _cp_bwt_classify_target "$lval"; _CP_BWT_TGT_HIT=1; }
+            done ;;
+          *)
+            handled=0
+            for w in $longtgt; do
+              if [ "$lname" = "$w" ]; then
+                _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 1))
+                _CP_BWT_TGT_HIT=1; handled=1
+              fi
+            done
+            if [ "$handled" = 0 ]; then
+              for w in $longskip; do
+                [ "$lname" = "$w" ] && i=$((i + 1))
+              done
+            fi ;;
+        esac
+        i=$((i + 1)); continue ;;
+      -?*)
+        j=1; len=${#tok}; handled=0
+        while [ "$j" -lt "$len" ]; do
+          ch="${tok:$j:1}"
+          case "$shorttgt" in
+            *"$ch"*)
+              val="${tok:$((j + 1))}"
+              if [ -n "$val" ]; then _cp_bwt_classify_target "$val"
+              else _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 1))
+              fi
+              _CP_BWT_TGT_HIT=1; handled=1; break ;;
+          esac
+          case "$shortskip" in
+            *"$ch"*)
+              val="${tok:$((j + 1))}"
+              [ -z "$val" ] && i=$((i + 1))
+              handled=1; break ;;
+          esac
+          j=$((j + 1))
+        done
+        i=$((i + 1)); continue ;;
+      *)
+        _CP_BWT_NONOPT+=("$tok"); i=$((i + 1)); continue ;;
+    esac
+  done
+}
+
+
+_cp_bwt_verb_targets() {
+  local cmd="$1" cwd="$2"; shift 2
+  # herdr-control#192 round 4, G2: captured BEFORE the g-prefix strip below
+  # so the `install` case can tell `ginstall` (GNU semantics: `-T`/`-D`
+  # boolean) from bare `install` (BSD/macOS on this box: `-T`/`-D` take a
+  # value) apart.
+  local _cp_bwt_orig_cmd="$cmd"
+  # herdr-control#192 round 3, F3: Homebrew installs GNU coreutils under a
+  # `g`-prefixed name (`gcp`, `gmv`, …) so they don't shadow the BSD
+  # originals on PATH — an unwrapped `gcp src /outside/dest` matched no
+  # case below at all. Normalize the exact, unambiguous set to their base
+  # verb; this is a fixed allowlist, not a blind "strip a leading g" (that
+  # would mangle `grep`, `git`, `gzip`, …).
+  case "$cmd" in
+    gcp|gmv|gln|ginstall|gsort|gsplit|gdd|gtouch|gtruncate|gmkfifo|gmknod|gmkdir|gsed|gtar)
+      cmd="${cmd#g}" ;;
+  esac
+  case "$cmd" in
+    tee)
+      local a
+      for a in "$@"; do
+        case "$a" in
+          -a|--append|-) ;;
+          -*) ;;
+          *) _cp_bwt_classify_target "$a" ;;
+        esac
+      done ;;
+    cp|mv|ln)
+      # herdr-control#192 round 4, G1/G3: routed through the shared
+      # recognizer (glued `-tDIR`, `--` end-of-options).
+      _cp_bwt_scan_optvals "S" "t" "suffix" "target-directory" "$@"
+      if [ "$_CP_BWT_TGT_HIT" != 1 ] && [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ]; then
+        _cp_bwt_classify_target "${_CP_BWT_NONOPT[$((${#_CP_BWT_NONOPT[@]} - 1))]}"
+      fi ;;
+    install)
+      # herdr-control#192 round 4, G1/G2/G3: routed through the shared
+      # recognizer. GNU install's `-T`/`-D` are BOOLEAN (no value) —
+      # BSD/macOS's DO take one — live-confirmed the shared value-skip
+      # list wrongly swallowed the real `src` positional as `-T`'s/`-D`'s
+      # value on GNU. Resolved by the ORIGINAL (pre-g-normalization)
+      # command name: `ginstall` unambiguously means GNU semantics;
+      # anything else (bare `install` on this box) means BSD.
+      case "$_cp_bwt_orig_cmd" in
+        ginstall)
+          _cp_bwt_scan_optvals "mogfMhBNlS" "t" "suffix strip-program" "target-directory" "$@" ;;
+        *)
+          _cp_bwt_scan_optvals "mogfMhBNlSTD" "t" "suffix strip-program" "target-directory" "$@" ;;
+      esac
+      if [ "$_CP_BWT_TGT_HIT" != 1 ] && [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ]; then
+        _cp_bwt_classify_target "${_CP_BWT_NONOPT[$((${#_CP_BWT_NONOPT[@]} - 1))]}"
+      fi ;;
+    rsync)
+      # herdr-control#192 round 2/3/4, bypass E/F2/G1/G3/G4: last non-
+      # option argument is the destination — but NOT the same case as
+      # cp/mv/ln above (rsync's own `-t` means "preserve times", a bare
+      # boolean, not cp's "-t DIR"). `-T`/`--temp-dir`/`--log-file`/
+      # `--backup-dir`/`--partial-dir` each name a write destination of
+      # their OWN, not just the transfer destination — classified in
+      # addition to whatever the positional scan finds.
+      _cp_bwt_scan_optvals "e" "T" \
+        "rsh timeout exclude exclude-from include include-from filter files-from port password-file bwlimit min-size max-size modify-window compress-level checksum-seed outbuf contimeout address sockopts out-format stop-after stop-at" \
+        "temp-dir log-file backup-dir partial-dir" "$@"
+      [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ] && _cp_bwt_classify_target "${_CP_BWT_NONOPT[$((${#_CP_BWT_NONOPT[@]} - 1))]}" ;;
+    scp)
+      # herdr-control#192 round 3/4, F2/G3: same last-nonopt shape as
+      # rsync, but scp's own value-taking flags are a different, smaller
+      # set — none of them name a write destination of their own
+      # (identity file/config/cipher/jump-host are all READ paths or
+      # settings).
+      _cp_bwt_scan_optvals "PiFcJlSo" "" "" "" "$@"
+      [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ] && _cp_bwt_classify_target "${_CP_BWT_NONOPT[$((${#_CP_BWT_NONOPT[@]} - 1))]}" ;;
+    dd)
+      local a
+      for a in "$@"; do
+        case "$a" in of=*) _cp_bwt_classify_target "${a#of=}" ;; esac
+      done ;;
+    sed|perl)
+      _cp_bwt_inplace_targets "$@" ;;
+    touch|truncate)
+      local a
+      for a in "$@"; do
+        case "$a" in -*) ;; *) _cp_bwt_classify_target "$a" ;; esac
+      done ;;
+    mkfifo|mknod|mkdir)
+      # herdr-control#192 round 2, bypass E. `-m`/`--mode` takes a value —
+      # skip it, not a target; mknod's own TYPE/major/minor positionals
+      # after the name also get classified (harmless over-caution, same
+      # spirit as the rest of this file's documented approximations).
+      local -a a=("$@")
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -m|--mode) i=$((i + 2)) ;;
+          --mode=*) i=$((i + 1)) ;;
+          -*) i=$((i + 1)) ;;
+          *) _cp_bwt_classify_target "${a[$i]}"; i=$((i + 1)) ;;
+        esac
+      done ;;
+    unzip)
+      _cp_bwt_scan_optvals "" "d" "" "" "$@" ;;
+    sort)
+      _cp_bwt_scan_optvals "" "o" "" "output" "$@" ;;
+    split)
+      # the trailing PREFIX positional (the one AFTER the input file); a
+      # bare `split FILE` with no explicit prefix defaults to `x` in cwd —
+      # left alone, same "no visible target" ceiling as a bare `dd`.
+      _cp_bwt_scan_optvals "abClnt" "" "" "" "$@"
+      [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ] && _cp_bwt_classify_target "${_CP_BWT_NONOPT[1]}" ;;
+    curl)
+      _cp_bwt_scan_optvals "" "o" "" "output" "$@"
+      # `-O`/`--remote-name` takes NO value at all (writes a name derived
+      # from the URL, in cwd) — doesn't fit the value-flag model, so it's
+      # handled as its own separate pass rather than through the shared
+      # scanner above.
+      local a
+      for a in "$@"; do
+        case "$a" in -O|--remote-name) _cp_bwt_classify_target "." ;; esac
+      done ;;
+    wget)
+      _cp_bwt_scan_optvals "" "OP" "" "output-document directory-prefix" "$@" ;;
+    patch)
+      _cp_bwt_scan_optvals "" "o" "" "output" "$@" ;;
+    tar)
+      # herdr-control#192 round 2, bypass E. `-C`/`--directory` only matters
+      # as a WRITE destination during extraction; during creation it is
+      # just where tar reads members from. `-f`/`--file` only matters as a
+      # write destination during creation/append; during extraction it is
+      # the (read) source archive. Accepts both the dashed and the
+      # traditional bare-first-word mode-letter forms (`tar xf a.tar` /
+      # `tar -xf a.tar`), and `f` combined in a cluster (`-cf`, `-xf`) with
+      # its value either glued after it (`-cfa.tar`, rare) or the next argv
+      # word (`-cf a.tar`, the ordinary form). `-C`/`-f` ALSO glue directly
+      # to their own value with no mode letters at all (`-Cdir`, `-fa.tar`
+      # — herdr-control#192 round 4, static finding 2/3/4): matched here,
+      # BEFORE the mode-cluster scan below, or an uppercase `-Cdir` (never
+      # a mode-cluster candidate; tar's mode letters are lowercase) or a
+      # single-purpose `-fFILE` would otherwise reach the generic scan and
+      # either be silently skipped or misread.
+      local -a a=("$@")
+      local i=0 n="${#a[@]}" mode_x=0 mode_c=0 dirval="" fileval="" tok rest
+      while [ "$i" -lt "$n" ]; do
+        tok="${a[$i]}"
+        case "$tok" in
+          -C|--directory) dirval="${a[$((i + 1))]:-}"; i=$((i + 2)); continue ;;
+          --directory=*) dirval="${tok#*=}"; i=$((i + 1)); continue ;;
+          -C?*) dirval="${tok#-C}"; i=$((i + 1)); continue ;;
+          -f|--file) fileval="${a[$((i + 1))]:-}"; i=$((i + 2)); continue ;;
+          --file=*) fileval="${tok#*=}"; i=$((i + 1)); continue ;;
+          -f?*) fileval="${tok#-f}"; i=$((i + 1)); continue ;;
+        esac
+        case "$tok" in
+          --*) i=$((i + 1)); continue ;;  # a long option, never a mode cluster
+          -*|[!-]*)
+            if [ "${tok#-}" = "$tok" ] && [ "$i" -ne 0 ]; then
+              i=$((i + 1)); continue   # a bare positional, not index 0: not a mode cluster
+            fi
+            case "$tok" in *x*) mode_x=1 ;; esac
+            case "$tok" in *c*) mode_c=1 ;; esac
+            case "$tok" in
+              *f*)
+                rest="${tok#*f}"
+                if [ -n "$rest" ]; then fileval="$rest"; i=$((i + 1))
+                else fileval="${a[$((i + 1))]:-}"; i=$((i + 2))
+                fi
+                continue ;;
+            esac
+            i=$((i + 1)) ;;
+        esac
+      done
+      [ "$mode_x" = 1 ] && [ -n "$dirval" ] && _cp_bwt_classify_target "$dirval"
+      [ "$mode_c" = 1 ] && [ -n "$fileval" ] && _cp_bwt_classify_target "$fileval" ;;
+    git)
+      # herdr-control#192 round 2/3, bypass E/F1: `git clone [opts] REPO
+      # [DEST]` — every OTHER git subcommand (add/commit/push/...) is
+      # governed by entirely different existing classify_command rules,
+      # not this one. Round 3 live-confirmed `--depth 1`/`-b BRANCH`
+      # placed before the URL each shift `nonopt[1]` off the real DEST by
+      # one, since their SEPARATE value token was miscounted as a
+      # positional — skip every clone flag known to take one.
+      # `--separate-git-dir` is itself a write destination (where the
+      # actual `.git` lands), classified in addition to DEST.
+      case "${1:-}" in
+        clone)
+          shift
+          # herdr-control#192 round 4, G3: routed through the shared
+          # recognizer (glued `-bBRANCH`, `--depth=1`, `--`).
+          _cp_bwt_scan_optvals "bocju" "" \
+            "branch depth origin config reference reference-if-able template jobs filter shallow-since shallow-exclude upload-pack server-option bundle-uri" \
+            "separate-git-dir" "$@"
+          case "${#_CP_BWT_NONOPT[@]}" in
+            0) : ;;
+            1) _cp_bwt_classify_target "." ;;
+            *) _cp_bwt_classify_target "${_CP_BWT_NONOPT[1]}" ;;
+          esac ;;
+      esac ;;
+    bash|sh|zsh|dash|ksh|mksh)
+      # herdr-control#192 round 2, bypass D: `-c STRING` is real bash
+      # grammar — the SAME language this tokenizer already reads, unlike
+      # #174's genuine ceiling (`python -c`, `node -e`, a different
+      # language entirely) — so recurse the shared parser straight back
+      # into it rather than emitting nothing. Handles a `c` anywhere in a
+      # leading flag cluster (`-lc`, `-eu c`'s `-c` is separate, etc): the
+      # value is either the remainder of THAT cluster after `c`, glued
+      # (`-cSTRING`), or the next argv word.
+      local -a a=("$@")
+      local i=0 n="${#a[@]}" script="" found=0
+      while [ "$i" -lt "$n" ] && [ "$found" = 0 ]; do
+        case "${a[$i]}" in
+          --) break ;;
+          --*) ;;
+          -*c) script="${a[$((i + 1))]:-}"; found=1 ;;
+          -*c*) script="${a[$i]#*c}"; found=1 ;;
+        esac
+        i=$((i + 1))
+      done
+      if [ "$found" = 1 ] && [ -n "$script" ]; then
+        case "$script" in
+          *'@SUB@'*|*'$'*)
+            # Deliberately conservative: a `$VAR` ANYWHERE in the script
+            # (even used harmlessly, e.g. `echo "$HOME"`, nowhere near a
+            # redirect) fails the whole thing closed instead of recursing
+            # to find the actual, precisely-readable target — over-
+            # escalation, never the disallowed under-escalation, same
+            # tradeoff this file makes elsewhere.
+            printf 'COMPUTED\t%s\n' "a $cmd -c argument that is not a literal string cannot be read statically" ;;
+          *)
+            bash_write_targets "$script" "$cwd" ;;
+        esac
+      fi ;;
+    find)
+      # herdr-control#192, bypass C: `-exec CMD ARGS... \;` (or `+`,
+      # or `-execdir`/`-ok`) names a real, static, wrapped verb this
+      # scanner used to silently skip — not the #174 interpreter-source
+      # ceiling (no code evaluation needed to read the clause), just an
+      # unhandled wrapper. A bare `find … -name …` with NO `-exec` clause
+      # at all writes nothing and is left alone (measured: the dominant
+      # real-world shape by far).
+      local -a a=("$@") wrapped=()
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -exec|-execdir|-ok)
+            i=$((i + 1)); wrapped=()
+            while [ "$i" -lt "$n" ] && [ "${a[$i]}" != ';' ] && [ "${a[$i]}" != '+' ]; do
+              wrapped+=("${a[$i]}"); i=$((i + 1))
+            done
+            [ "$i" -lt "$n" ] && i=$((i + 1))
+            [ "${#wrapped[@]}" -gt 0 ] && _cp_bwt_dispatch_wrapped "$cwd" "${wrapped[@]}" ;;
+          *) i=$((i + 1)) ;;
+        esac
+      done ;;
+    xargs|parallel)
+      # herdr-control#192, bypass C: xargs/parallel's own flags come first
+      # (a small known set take a following value — the rest are skipped
+      # bare), then the first non-option token is the wrapped verb, same
+      # unwrap `find -exec` gets above. Unlike `find -exec` (a fixed,
+      # complete argv), xargs/parallel APPEND the piped input as trailing
+      # args at runtime — invisible to a static scanner. So when the
+      # wrapped verb's own LITERAL argv (no placeholder, e.g. no `-I{}`)
+      # produces no target at all, that means its real target is the
+      # piped data, not "no target": fail closed instead of silently
+      # matching this file's normal "empty output = allowed" contract.
+      local -a a=("$@") wrapped=()
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -I|-i|-L|-l|-n|-P|-s|-a|-E|-d) i=$((i + 2)) ;;
+          -*) i=$((i + 1)) ;;
+          *) break ;;
+        esac
+      done
+      while [ "$i" -lt "$n" ]; do wrapped+=("${a[$i]}"); i=$((i + 1)); done
+      if [ "${#wrapped[@]}" -gt 0 ]; then
+        local out
+        out="$(_cp_bwt_dispatch_wrapped "$cwd" "${wrapped[@]}")"
+        if [ -n "$out" ]; then
+          printf '%s\n' "$out"
+        else
+          printf 'COMPUTED\t%s\n' "xargs/parallel appends piped input as trailing args this scanner cannot see"
+        fi
+      fi ;;
+  esac
+}
+
+# _cp_bwt_segment <operator-split segment> <cwd> -> every classify_target
+# line this ONE segment names, redirects first (leading, middle, or
+# trailing — unlike _cp_locate_command_word, which only skips LEADING
+# ones), then a verb-specific pass over the command word plus every
+# argument that was not one of those redirects. `cwd` is only used to
+# recurse into a `bash -c`/`sh -c` literal string (bypass D).
+_cp_bwt_segment() {
+  local seg="$1" cwd="$2"
+  _cp_bwt_scan_redirects "$seg"
+  _cp_locate_command_word "$seg" || return 0
+  local cmd="$_cp_wcmd"
+  local -a argv=()
+  local w skip=0 first=1
+  for w in "${_CP_LOC[@]}"; do
+    if [ "$first" = 1 ]; then first=0; continue; fi   # _CP_LOC[0] is the command word itself; cmd already has it
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$w" in
+      '>'|'>>'|'>|'|'&>'|'&>>'|[0-9]'>'|[0-9]'>>'|'<'|'<>'|[0-9]'<')
+        skip=1; continue ;;
+      '>'*|[0-9]'>'*|'&>'*|'<'*|[0-9]'<'*)
+        continue ;;
+    esac
+    argv+=("$(_cp_bwt_unprotect "$w")")
+  done
+  _cp_bwt_verb_targets "$cmd" "$cwd" ${argv[@]+"${argv[@]}"}
+}
+
+# _cp_bwt_segment_cd <segment> <effective cwd> -> prints the new absolute
+# effective cwd when this segment is `cd DIR` and DIR is a literal (not
+# `$(…)`/`$VAR`/`~user`); nothing otherwise, including a computed DIR — cwd
+# tracking best-effort degrades rather than fails closed, since a target
+# resolved against a STALE cwd only risks a false escalate (a real path is
+# still a real path relative to SOME cwd), never a false allow.
+_cp_bwt_segment_cd() {
+  local seg="$1" cwd="$2"
+  _cp_locate_command_word "$seg" || return 0
+  [ "$_cp_wcmd" = cd ] || return 0
+  local -a a=("${_CP_LOC[@]}")
+  local dir="" i=1
+  while [ "$i" -lt "${#a[@]}" ]; do
+    case "${a[$i]}" in
+      -*) ;;
+      *) dir="$(_cp_bwt_unprotect "${a[$i]}")"; break ;;
+    esac
+    i=$((i + 1))
+  done
+  [ -n "$dir" ] || return 0
+  case "$dir" in *'@SUB@'*|*'$'*|'~'*) return 0 ;; esac
+  case "$dir" in
+    /*) _cp_lexical_abspath "$dir" ;;
+    *) _cp_lexical_abspath "$cwd/$dir" ;;
+  esac
+}
+
+# _cp_bwt_unterminated_quote <text> -> 0 (true) when the text ends still
+# "inside" a `'...'`/`"..."` — a real shell would refuse this as a syntax
+# error, so any parse of it is moot. Its own tiny state machine (not
+# _cp_quoting_is_simple, which exists to guard the OTHER, regex-based rules
+# in classify_command against an operator character hiding inside a quote —
+# a concern _cp_protect_text's real per-character quote tracking already
+# does not have, and rejecting on it live-measured 89 of 549 real worker
+# bash approvals as UNPARSED, most of them ordinary `sed $'...'`/`awk` one-
+# liners with completely well-formed quoting). Processes the WHOLE text as
+# one record (real newlines become a placeholder first) so a quote is not
+# falsely reported "closed" just because a line boundary reset the scan.
+_cp_bwt_unterminated_quote() {
+  printf '%s' "$1" | tr '\n' '\001' | awk '
+    {
+      SQ = sprintf("%c", 39); DQ = "\""
+      line = $0; n = length(line); st = 0; i = 1
+      while (i <= n) {
+        c = substr(line, i, 1)
+        if (st == 0) {
+          if (c == "\\")      { i += 2; continue }
+          if (c == SQ)        { st = 1; i++; continue }
+          if (c == DQ)        { st = 2; i++; continue }
+          i++; continue
+        }
+        if (c == (st == 1 ? SQ : DQ)) { st = 0; i++; continue }
+        if (st == 2 && c == "\\") { i += 2; continue }
+        i++
+      }
+      exit (st != 0) ? 0 : 1
+    }'
+}
+
+# bash_write_targets <raw shell command> <cwd> -> one "TARGET\t<abs-ish
+# path>" (cwd-joined, cd-adjusted, lexically `.`/`..`-collapsed — NOT
+# symlink-resolved; that is the hook's job, see _cp_lexical_abspath's own
+# header), "COMPUTED\t<raw text>" (a target this cannot read statically —
+# substitution, unquoted $VAR, glob, ~otheruser), or "UNPARSED\t<reason>"
+# (an unterminated quote — see _cp_bwt_unterminated_quote) line per write
+# target this command names. Every caller MUST treat COMPUTED and UNPARSED
+# identically to "outside scope" — a command that cannot be read is not
+# proof it writes nowhere. Genuinely empty output means this command names
+# no write target at all (`git status`). Runs _cp_strip_heredocs FIRST
+# (same function scannable_command uses): an inert heredoc body (`cat > f
+# <<EOF` — cat never executes it) is DATA, not a write target, and would
+# otherwise misread `cp`/`tee`/etc mentioned only in usage text inside the
+# body as a real command; a body a real shell/interpreter WOULD execute
+# (`bash <<EOF`) is kept, same as there — and stripping first also keeps an
+# intentionally-unbalanced quote INSIDE an inert heredoc body from tripping
+# the unterminated-quote check above. Then walks every operator-split
+# segment (`;`, `&&`, `||`, `|`, subshells, `<(…)`/`>(…)` bodies —
+# _cp_walk_segments already handles all of those) with a leading `cd DIR
+# &&` tracked into every later segment's cwd. Caps `bash -c`/`sh -c`
+# recursion (herdr-control#192 round 3, F4): each nested `bash -c "bash -c
+# ..."` re-enters this SAME function, and a deep chain got slow enough to
+# time out the hook's spawnSync call — a timeout the caller might not
+# treat as a refusal. `_cp_bwt_depth` is a `local` bash relies on dynamic
+# scoping for: each recursive call's own `local _cp_bwt_depth=$((...+1))`
+# reads the CALLER's value before shadowing it, so this needs no extra
+# parameter threaded through every helper the way `cwd` did.
+bash_write_targets() {
+  local raw="$1" cwd="${2:-.}" eff="${2:-.}" body line kind val nd stripped
+  local _cp_bwt_depth="$(( ${_cp_bwt_depth:-0} + 1 ))"
+  if [ "$_cp_bwt_depth" -gt 8 ]; then
+    printf 'COMPUTED\t%s\n' "bash -c nesting is too deep for this scanner to follow safely"
+    return 0
+  fi
+  stripped="$(_cp_strip_heredocs "$raw")"
+  # herdr-control#192 round 7, F2: `_cp_protect_text`'s single-quote scan
+  # has no backslash awareness inside a quote (correct for a REAL
+  # single-quoted string, where `\` is literal) — but `$'...'` is ANSI-C
+  # quoting, where `\'` is a real escaped quote that should NOT end the
+  # string. Live-confirmed `cat x$'\'' ; cp f /outside/d` desyncs the
+  # scanner's quote state at that `\'` and hides everything after it,
+  # including the real `cp` write. Rather than teach the tokenizer
+  # ANSI-C's escape rules (a much larger change), reuse the same coarse,
+  # already-reviewed guard `_cp_coderef_walk` uses for the identical
+  # reason: ANY `$'` in the text fails the whole command closed.
+  if _cp_coderef_has_ansi_c_quote "$stripped"; then
+    printf 'UNPARSED\tan ANSI-C dollar-quoted segment cannot be parsed statically\n'
+    return 0
+  fi
+  if _cp_bwt_unterminated_quote "$stripped"; then
+    printf 'UNPARSED\tan unterminated quote makes this command unparseable\n'
+    return 0
+  fi
+  while IFS= read -r body; do
+    [ -n "$body" ] || continue
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      kind="${line%%$'\t'*}"
+      val="${line#*$'\t'}"
+      if [ "$kind" = TARGET ]; then
+        case "$val" in
+          /*) printf 'TARGET\t%s\n' "$(_cp_lexical_abspath "$val")" ;;
+          *) printf 'TARGET\t%s\n' "$(_cp_lexical_abspath "$eff/$val")" ;;
+        esac
+      else
+        printf '%s\n' "$line"
+      fi
+    done <<EOF2
+$(_cp_bwt_segment "$body" "$eff")
+EOF2
+    nd="$(_cp_bwt_segment_cd "$body" "$eff")"
+    [ -n "$nd" ] && eff="$nd"
+  done <<EOF
+$(_cp_walk_segments "$stripped")
+EOF
+  return 0
+}
+
+# _cp_bash_write_scope_violation <raw> <worktree> -> the first offending
+# target (a plain path when it resolves outside <worktree> and outside
+# /tmp|$TMPDIR, "a computed write target (<text>) cannot be verified
+# statically" for a COMPUTED line, or the UNPARSED reason verbatim), or
+# nothing when <worktree> is unset (no boundary to judge against) or every
+# target is in scope.
+_cp_bash_write_scope_violation() {
+  local raw="$1" wt="$2"
+  [ -n "$wt" ] || return 0
+  local line kind val
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    kind="${line%%$'\t'*}"
+    val="${line#*$'\t'}"
+    if [ "$kind" = COMPUTED ]; then
+      printf 'a computed write target (%s) cannot be verified statically' "$val"
+      return 0
+    fi
+    if [ "$kind" = UNPARSED ]; then
+      printf '%s' "$val"
+      return 0
+    fi
+    _cp_path_within_worktree "$val" "$wt" && continue
+    case "$val" in /tmp|/tmp/*) continue ;; esac
+    if [ -n "${TMPDIR:-}" ]; then
+      case "$val" in "${TMPDIR%/}"|"${TMPDIR%/}"/*) continue ;; esac
+    fi
+    printf '%s' "$val"
+    return 0
+  done <<EOF
+$(bash_write_targets "$raw" "$wt")
+EOF
+}
+
 # _cp_write_menu_verdict <raw panel text> <worktree> -> "allow" or
 # "escalate:<reason>" on stdout, or nothing (caller falls back to the
 # existing "unknown tool" escalate) when the shape cannot be judged safely.
@@ -3452,6 +4372,26 @@ EOF
   # production-target fix above (2026-09-29). `fly(ctl)?` matches both.
   _cp_imatch '\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(delete|drain|scale)\b|\bhelm[[:space:]]+(delete|uninstall)\b|\bfly(ctl)?[[:space:]]+(deploy|destroy)\b' "$norm" &&
     _cp_consider 1 "infrastructure scope change"
+
+  # escalate — #184: a bash command whose redirect/tee/cp/mv/install/ln/
+  # dd-of/sed-or-perl--i/touch/truncate target resolves outside the pane's
+  # registered worktree (and outside /tmp|$TMPDIR) must not be auto-pressed
+  # `allow` by a peer. This is the SAME gap the real instance exploited:
+  # `edit` blocked by #159, so the worker tried
+  # `cat <wt>/.handoffs/notepad.md >> /Users/thurbs/Code/herdr-control/
+  # .handoffs/notepad.md` instead, and a peer approved it. The hook
+  # (workerWriteScopeBlock, agent-hooks/omp-herdr-control.ts) is the primary
+  # guard for a registered worker's own process; this is the backstop for
+  # everything upstream of that guard actually running (peer auto-approval
+  # happens at the confirm dialog, which a missing/failed hook does not
+  # gate). Uses $raw (unnormalized) since bash_write_targets does its own
+  # quote/substitution handling via _cp_walk_segments.
+  if [ -n "$wt" ]; then
+    local _cp_bwv
+    _cp_bwv="$(_cp_bash_write_scope_violation "$raw" "$wt")"
+    [ -n "$_cp_bwv" ] &&
+      _cp_consider 1 "bash write target ($_cp_bwv) resolves outside your worktree — remains human-only"
+  fi
 
   _cp_apply_operator_rules "$norm"
 

@@ -1172,7 +1172,7 @@ if ! command -v bun >/dev/null 2>&1; then
   bad "bun not on PATH — the write-scope guard is untested"
 else
   F="$WORK/scope"; MAIN="$F/main"; WT="$F/wt"; OTHER="$F/other"; SCR="$WORK/scratch"; FHOME="$F/home"
-  mkdir -p "$MAIN/.handoffs" "$MAIN/lib" "$WT/lib" "$WT/tmp" "$WT/.handoffs" "$OTHER" "$SCR" "$FHOME"
+  mkdir -p "$MAIN/.handoffs" "$MAIN/lib" "$WT/lib" "$WT/tmp" "$WT/.handoffs" "$WT/sub" "$OTHER" "$SCR" "$FHOME"
   printf 'notes\n' > "$MAIN/.handoffs/notepad.md"; printf 'x\n' > "$MAIN/lib/x.sh"; printf 'a\n' > "$WT/lib/a.sh"
   printf 'gitdir: %s/.git/worktrees/wt\n' "$MAIN" > "$WT/.git"; printf 'shared\n' > "$MAIN/hl.txt"
   printf 'conductor brief\n' > "$SCR/conductor-brief.md"
@@ -1299,6 +1299,53 @@ read_main|read|{"path":"$MAIN/.handoffs/notepad.md"}
 grep_main|grep|{"pattern":"x","path":"$MAIN"}
 bash_main|bash|{"command":"cat $MAIN/.handoffs/notepad.md"}
 lsp_read_main|lsp|{"action":"definition","file":"$MAIN/lib/x.sh"}
+bash_append_notepad_out|bash|{"command":"printf x >> $MAIN/.handoffs/notepad.md"}
+bash_cat_append_out|bash|{"command":"cat f >> $OTHER/x.txt"}
+bash_heredoc_redirect_out|bash|{"command":"cat > $OTHER/y.txt <<EOF\nhi\nEOF"}
+bash_tee_append_out|bash|{"command":"tee -a $OTHER/z.txt"}
+bash_cp_dest_out|bash|{"command":"cp lib/a.sh $OTHER/b.sh"}
+bash_computed_home_out|bash|{"command":"echo x > \"\$HOME/x\""}
+bash_multiline_quote_hides_redirect_out|bash|{"command":"echo \"line1\nline2\" > $OTHER/x.txt"}
+bash_rw_redirect_creates_file_out|bash|{"command":": <> $OTHER/f2"}
+bash_fd_rw_redirect_out|bash|{"command":"exec 3<> $OTHER/f3"}
+bash_find_exec_wraps_verb_out|bash|{"command":"find . -maxdepth 0 -exec touch $OTHER/marker \\\\;"}
+bash_xargs_wraps_verb_out|bash|{"command":"echo $OTHER/marker | xargs touch"}
+bash_c_wraps_string_out|bash|{"command":"bash -c 'echo x > $OTHER/bashc-out.txt'"}
+bash_lc_cluster_out|bash|{"command":"bash -lc 'echo x > $OTHER/f'"}
+bash_tar_xf_C_out|bash|{"command":"tar -xf a.tar -C $OTHER"}
+bash_rsync_dest_out|bash|{"command":"rsync -a src.txt $OTHER/dest.txt"}
+bash_sort_o_out|bash|{"command":"sort -o $OTHER/out.txt src.txt"}
+bash_mkfifo_out|bash|{"command":"mkfifo $OTHER/fifo1"}
+bash_curl_o_out|bash|{"command":"curl -o $OTHER/f https://example.com"}
+bash_git_clone_dest_out|bash|{"command":"git clone https://example.com/r.git $OTHER/r"}
+bash_perl_pi_cluster_out|bash|{"command":"perl -pi -e 's/a/b/' $OTHER/perl-pi-target.txt"}
+bash_git_clone_depth_out|bash|{"command":"git clone --depth 1 https://example.com/r.git $OTHER/r"}
+bash_rsync_trailing_timeout_out|bash|{"command":"rsync -a src.txt $OTHER/dest.txt --timeout 30"}
+bash_install_trailing_mode_out|bash|{"command":"install src.txt $OTHER/dest -m 644"}
+bash_gcp_out|bash|{"command":"gcp src.txt $OTHER/dest.txt"}
+bash_gtouch_out|bash|{"command":"gtouch $OTHER/f"}
+bash_gcp_glued_t_out|bash|{"command":"gcp -t$OTHER file.txt"}
+bash_ginstall_glued_t_out|bash|{"command":"ginstall -t$OTHER file.txt"}
+bash_ginstall_T_gnu_out|bash|{"command":"ginstall -T src.txt $OTHER/dest"}
+bash_install_T_bsd_out|bash|{"command":"install -T tagname src.txt $OTHER/dest"}
+bash_cp_dashdash_out|bash|{"command":"cp -- src.txt $OTHER/-dashdest"}
+bash_rsync_dashdash_out|bash|{"command":"rsync -a -- src.txt $OTHER/-dashdest"}
+bash_git_clone_depth_eq_out|bash|{"command":"git clone --depth=1 https://example.com/r.git $OTHER/r"}
+bash_rsync_glued_T_out|bash|{"command":"rsync -aT$OTHER file.txt file2.txt"}
+bash_curl_glued_o_out|bash|{"command":"curl -o$OTHER/f https://example.com"}
+bash_wget_glued_O_out|bash|{"command":"wget -O$OTHER/f https://example.com"}
+bash_tar_glued_C_out|bash|{"command":"tar -x -C$OTHER -f a.tar"}
+bash_cp_empty_S_out|bash|{"command":"cp -S '' file.txt $OTHER/dest.txt"}
+bash_gcp_empty_S_out|bash|{"command":"gcp -S '' file.txt $OTHER/dest.txt"}
+bash_rsync_empty_suffix_out|bash|{"command":"rsync -a --suffix '' src.txt $OTHER/dest.txt"}
+bash_install_empty_S_out|bash|{"command":"install -S '' src.txt $OTHER/dest"}
+in_wt_bash_find_exec_inside|bash|{"command":"find . -exec touch .handoffs/x \\\\;"}
+in_wt_bash_find_no_exec|bash|{"command":"find . -name '*.log'"}
+in_wt_bash_c_inside|bash|{"command":"bash -c 'echo x >> .handoffs/x.out'"}
+in_wt_bash_tar_no_C|bash|{"command":"tar -xf a.tar"}
+in_wt_bash_append|bash|{"command":">> .handoffs/x.out"}
+in_wt_bash_devnull|bash|{"command":"> /dev/null 2>&1"}
+in_wt_bash_cd_sub|bash|{"command":"cd sub && echo x > y"}
 EOF
   jq -Rn '[inputs | split("|") | [.[0], .[1], (.[2:] | join("|") | fromjson)]]' "$WORK/scope-cases.txt" > "$WORK/scope-cases.json" \
     || bad "scope case table does not parse"
