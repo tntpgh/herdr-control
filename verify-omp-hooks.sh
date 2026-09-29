@@ -1319,6 +1319,11 @@ bash_mkfifo_out|bash|{"command":"mkfifo $OTHER/fifo1"}
 bash_curl_o_out|bash|{"command":"curl -o $OTHER/f https://example.com"}
 bash_git_clone_dest_out|bash|{"command":"git clone https://example.com/r.git $OTHER/r"}
 bash_perl_pi_cluster_out|bash|{"command":"perl -pi -e 's/a/b/' $OTHER/perl-pi-target.txt"}
+bash_git_clone_depth_out|bash|{"command":"git clone --depth 1 https://example.com/r.git $OTHER/r"}
+bash_rsync_trailing_timeout_out|bash|{"command":"rsync -a src.txt $OTHER/dest.txt --timeout 30"}
+bash_install_trailing_mode_out|bash|{"command":"install src.txt $OTHER/dest -m 644"}
+bash_gcp_out|bash|{"command":"gcp src.txt $OTHER/dest.txt"}
+bash_gtouch_out|bash|{"command":"gtouch $OTHER/f"}
 in_wt_bash_find_exec_inside|bash|{"command":"find . -exec touch .handoffs/x \\\\;"}
 in_wt_bash_find_no_exec|bash|{"command":"find . -name '*.log'"}
 in_wt_bash_c_inside|bash|{"command":"bash -c 'echo x >> .handoffs/x.out'"}

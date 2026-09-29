@@ -1782,6 +1782,44 @@ check_wt "sed -i '' (BSD mandatory empty-suffix arg) still caught correctly, no 
   "$WT_184" "sed -i '' 's/a/b/' /outside/f" escalate
 check_wt "xargs -I{} placeholder fails closed, not silently allowed" \
   "$WT_184" 'echo /outside/marker | xargs -I{} touch {}' escalate
+
+# herdr-control#192 round 3 — four MORE gaps found on re-review.
+check_wt "git clone --depth 1 (value-taking flag before URL) still finds the real dest (#192 round 3 F1)" \
+  "$WT_184" "git clone --depth 1 https://example.com/r.git /outside/r" escalate
+check_wt "git clone -b BRANCH (value-taking flag before URL) still finds the real dest (#192 round 3 F1)" \
+  "$WT_184" "git clone -b main https://example.com/r.git /outside/r" escalate
+check_wt "git clone --separate-git-dir names a write destination of its own (#192 round 3 F1)" \
+  "$WT_184" "git clone --separate-git-dir /outside/gitdir https://example.com/r.git" escalate
+check_wt "git clone with no explicit dest, fully inside (derived name), allows" \
+  "$WT_184" "git clone https://example.com/r.git" allow
+check_wt "rsync dest then --timeout VALUE trailing doesn't defeat last-nonopt (#192 round 3 F2)" \
+  "$WT_184" "rsync -a src.txt /outside/dest.txt --timeout 30" escalate
+check_wt "rsync dest then --exclude PATTERN trailing doesn't defeat last-nonopt (#192 round 3 F2)" \
+  "$WT_184" "rsync -a src.txt /outside/dest.txt --exclude foo" escalate
+check_wt "rsync --log-file names a write destination of its own (#192 round 3 F2)" \
+  "$WT_184" "rsync -a src.txt dest.txt --log-file /outside/rsync.log" escalate
+check_wt "scp -P port (value-taking flag) doesn't defeat last-nonopt (#192 round 3 F2)" \
+  "$WT_184" "scp -P 22 src.txt /outside/dest.txt" escalate
+check_wt "install dest then -m MODE trailing doesn't defeat last-nonopt (#192 round 3 F2)" \
+  "$WT_184" "install src.txt /outside/dest -m 644" escalate
+check_wt "cp dest then -S SUFFIX trailing doesn't defeat last-nonopt (#192 round 3 F2)" \
+  "$WT_184" "cp src.txt /outside/dest.txt -S .bak" escalate
+check_wt "gcp (Homebrew GNU coreutils g-prefix) is dispatched as cp (#192 round 3 F3)" \
+  "$WT_184" "gcp src.txt /outside/dest.txt" escalate
+check_wt "gtouch (Homebrew GNU coreutils g-prefix) is dispatched as touch (#192 round 3 F3)" \
+  "$WT_184" "gtouch /outside/f" escalate
+check_wt "gmkdir (Homebrew GNU coreutils g-prefix) is dispatched as mkdir (#192 round 3 F3)" \
+  "$WT_184" "gmkdir /outside/d" escalate
+check_wt "gtar (Homebrew GNU coreutils g-prefix) is dispatched as tar (#192 round 3 F3)" \
+  "$WT_184" "gtar -xf a.tar -C /outside" escalate
+check_wt "tar --exclude (long option containing x/c/f as substrings) is not misread as a mode cluster, allows" \
+  "$WT_184" "tar --exclude foo -xf a.tar" allow
+_f4cmd="echo x > /outside/deep.txt"
+for _f4i in 1 2 3 4 5 6 7 8 9 10; do
+  _f4cmd="bash -c $(printf '%q' "$_f4cmd")"
+done
+check_wt "bash -c nested past the depth cap fails closed, not silently allowed (#192 round 3 F4)" \
+  "$WT_184" "$_f4cmd" escalate
 check "bash write-scope rule is a no-op with no worktree context" \
   "cat f >> /outside" allow
 

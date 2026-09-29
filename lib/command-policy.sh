@@ -2995,6 +2995,12 @@ _cp_bwt_inplace_targets() {
 # DENYLIST of ordinary write-shaped verbs (herdr-control#192 round 2), not
 # an exhaustive parse of every program that can create a file; the long
 # tail past it is #174's closed-world design, out of scope for #184.
+# Matching is on the basename this dispatch was called with, not on what
+# binary that name actually resolves to — `cp "$(command -v bash)" x; ./x
+# -c '...'` (or any other copy/rename of a real interpreter to an unlisted
+# name) is invisible here for the same reason: a DENYLIST can only ever
+# recognize the names it was given, inherent to the design, not a gap to
+# close incrementally.
 
 # _cp_bwt_dispatch_wrapped <cwd> <verb> [args...] -> re-runs
 # _cp_bwt_verb_targets on a command find/xargs/parallel exposes as its own
@@ -3015,6 +3021,16 @@ _cp_bwt_dispatch_wrapped() {
 
 _cp_bwt_verb_targets() {
   local cmd="$1" cwd="$2"; shift 2
+  # herdr-control#192 round 3, F3: Homebrew installs GNU coreutils under a
+  # `g`-prefixed name (`gcp`, `gmv`, …) so they don't shadow the BSD
+  # originals on PATH — an unwrapped `gcp src /outside/dest` matched no
+  # case below at all. Normalize the exact, unambiguous set to their base
+  # verb; this is a fixed allowlist, not a blind "strip a leading g" (that
+  # would mangle `grep`, `git`, `gzip`, …).
+  case "$cmd" in
+    gcp|gmv|gln|ginstall|gsort|gsplit|gdd|gtouch|gtruncate|gmkfifo|gmknod|gmkdir|gsed|gtar)
+      cmd="${cmd#g}" ;;
+  esac
   case "$cmd" in
     tee)
       local a
@@ -3025,16 +3041,22 @@ _cp_bwt_verb_targets() {
           *) _cp_bwt_classify_target "$a" ;;
         esac
       done ;;
-    cp|mv|install|ln)
+    cp|mv|ln)
+      # herdr-control#192 round 3, F2: `-S`/`--suffix` (backup suffix)
+      # takes a SEPARATE value token too — skip it the same way `-t` is,
+      # or that value gets miscounted as the real last-positional dest.
       local -a nonopt=()
       local a prev="" tflag=""
       for a in "$@"; do
         if [ -n "$prev" ]; then
-          tflag="$a"; prev=""; continue
+          [ "$prev" = target ] && tflag="$a"
+          prev=""; continue
         fi
         case "$a" in
-          -t|--target-directory) prev="$a" ;;
+          -t|--target-directory) prev=target ;;
           --target-directory=*) tflag="${a#*=}" ;;
+          -S|--suffix) prev=skip ;;
+          --suffix=*) ;;
           -*) ;;
           *) nonopt+=("$a") ;;
         esac
@@ -3044,16 +3066,81 @@ _cp_bwt_verb_targets() {
       elif [ "${#nonopt[@]}" -ge 2 ]; then
         _cp_bwt_classify_target "${nonopt[$((${#nonopt[@]} - 1))]}"
       fi ;;
-    rsync|scp)
-      # herdr-control#192 round 2, bypass E: last non-option argument is the
-      # destination, same shape as cp/mv/install/ln above — but NOT the
-      # SAME case (rsync's `-t` means "preserve times", a bare boolean, not
-      # cp's "-t DIR" target-directory; reusing that branch verbatim would
-      # have misread rsync's own `-t` as consuming the next word).
+    install)
+      # herdr-control#192 round 3, F2: BSD/macOS and GNU `install` both
+      # have several value-taking flags that can appear AFTER the real
+      # destination (live-confirmed: `install src dest -m 644`) — skip
+      # each one's value or it gets misread as the real target.
       local -a nonopt=()
-      local a
+      local a prev="" tflag=""
       for a in "$@"; do
-        case "$a" in -*) ;; *) nonopt+=("$a") ;; esac
+        if [ -n "$prev" ]; then
+          [ "$prev" = target ] && tflag="$a"
+          prev=""; continue
+        fi
+        case "$a" in
+          -t|--target-directory) prev=target ;;
+          --target-directory=*) tflag="${a#*=}" ;;
+          -m|-o|-g|-f|-M|-D|-h|-T|-B|-N|-l|-S) prev=skip ;;
+          --suffix=*|--strip-program=*) ;;
+          -*) ;;
+          *) nonopt+=("$a") ;;
+        esac
+      done
+      if [ -n "$tflag" ]; then
+        _cp_bwt_classify_target "$tflag"
+      elif [ "${#nonopt[@]}" -ge 2 ]; then
+        _cp_bwt_classify_target "${nonopt[$((${#nonopt[@]} - 1))]}"
+      fi ;;
+    rsync)
+      # herdr-control#192 round 2/3, bypass E/F2: last non-option argument
+      # is the destination — but NOT the same case as cp/mv/ln above
+      # (rsync's own `-t` means "preserve times", a bare boolean, not
+      # cp's "-t DIR"). Round 3 live-confirmed the naive "skip anything
+      # starting with -" filter is defeated by any value-taking flag
+      # placed AFTER the real destination (`--timeout 30`, `--exclude
+      # foo`, both very common real invocations) — its SEPARATE value
+      # token got miscounted as the last positional instead. A few flags
+      # name a write destination of their OWN, not just the transfer
+      # destination — classified in addition to whatever `nonopt` finds.
+      local -a nonopt=()
+      local a pending=""
+      for a in "$@"; do
+        if [ -n "$pending" ]; then
+          [ "$pending" = target ] && _cp_bwt_classify_target "$a"
+          pending=""; continue
+        fi
+        case "$a" in
+          -T|--temp-dir|--log-file|--backup-dir|--partial-dir) pending=target ;;
+          --temp-dir=*|--log-file=*|--backup-dir=*|--partial-dir=*)
+            _cp_bwt_classify_target "${a#*=}" ;;
+          -e|--rsh|--timeout|--exclude|--exclude-from|--include|--include-from|\
+          --filter|--files-from|--port|--password-file|--bwlimit|--min-size|\
+          --max-size|--modify-window|--compress-level|--checksum-seed|--outbuf|\
+          --contimeout|--address|--sockopts|--out-format|--stop-after|--stop-at)
+            pending=skip ;;
+          --rsh=*|--timeout=*|--exclude=*|--exclude-from=*|--include=*|\
+          --include-from=*|--filter=*|--files-from=*|--port=*|\
+          --password-file=*|--bwlimit=*) ;;
+          -*) ;;
+          *) nonopt+=("$a") ;;
+        esac
+      done
+      [ "${#nonopt[@]}" -ge 2 ] && _cp_bwt_classify_target "${nonopt[$((${#nonopt[@]} - 1))]}" ;;
+    scp)
+      # herdr-control#192 round 3, F2: same last-nonopt shape as rsync,
+      # but scp's own value-taking flags are a different, smaller set —
+      # none of them name a write destination of their own (identity
+      # file/config/cipher/jump-host are all READ paths or settings).
+      local -a nonopt=()
+      local a wantval=0
+      for a in "$@"; do
+        if [ "$wantval" = 1 ]; then wantval=0; continue; fi
+        case "$a" in
+          -P|-i|-o|-F|-c|-J|-l|-S) wantval=1 ;;
+          -*) ;;
+          *) nonopt+=("$a") ;;
+        esac
       done
       [ "${#nonopt[@]}" -ge 2 ] && _cp_bwt_classify_target "${nonopt[$((${#nonopt[@]} - 1))]}" ;;
     dd)
@@ -3061,7 +3148,7 @@ _cp_bwt_verb_targets() {
       for a in "$@"; do
         case "$a" in of=*) _cp_bwt_classify_target "${a#of=}" ;; esac
       done ;;
-    sed|gsed|perl)
+    sed|perl)
       _cp_bwt_inplace_targets "$@" ;;
     touch|truncate)
       local a
@@ -3173,6 +3260,7 @@ _cp_bwt_verb_targets() {
           --file=*) fileval="${tok#*=}"; i=$((i + 1)); continue ;;
         esac
         case "$tok" in
+          --*) i=$((i + 1)); continue ;;  # a long option, never a mode cluster
           -*|[!-]*)
             if [ "${tok#-}" = "$tok" ] && [ "$i" -ne 0 ]; then
               i=$((i + 1)); continue   # a bare positional, not index 0: not a mode cluster
@@ -3193,17 +3281,44 @@ _cp_bwt_verb_targets() {
       [ "$mode_x" = 1 ] && [ -n "$dirval" ] && _cp_bwt_classify_target "$dirval"
       [ "$mode_c" = 1 ] && [ -n "$fileval" ] && _cp_bwt_classify_target "$fileval" ;;
     git)
-      # herdr-control#192 round 2, bypass E: `git clone [opts] REPO [DEST]`
-      # — every OTHER git subcommand (add/commit/push/...) is governed by
-      # entirely different existing classify_command rules, not this one.
+      # herdr-control#192 round 2/3, bypass E/F1: `git clone [opts] REPO
+      # [DEST]` — every OTHER git subcommand (add/commit/push/...) is
+      # governed by entirely different existing classify_command rules,
+      # not this one. Round 3 live-confirmed `--depth 1`/`-b BRANCH`
+      # placed before the URL each shift `nonopt[1]` off the real DEST by
+      # one, since their SEPARATE value token was miscounted as a
+      # positional — skip every clone flag known to take one.
+      # `--separate-git-dir` is itself a write destination (where the
+      # actual `.git` lands), classified in addition to DEST.
       case "${1:-}" in
         clone)
           shift
           local -a nonopt=()
-          local a
+          local a wantval=0 sepgitdir=""
           for a in "$@"; do
-            case "$a" in -*) ;; *) nonopt+=("$a") ;; esac
+            if [ "$wantval" = 1 ]; then wantval=0; continue; fi
+            case "$a" in
+              --separate-git-dir=*) sepgitdir="${a#*=}" ;;
+              --separate-git-dir) sepgitdir="__NEXT__" ;;
+              -b|--branch|--depth|-o|--origin|-c|--config|--reference|\
+              --reference-if-able|--template|-j|--jobs|--filter|\
+              --shallow-since|--shallow-exclude|--upload-pack|-u|\
+              --server-option|--bundle-uri)
+                wantval=1 ;;
+              --branch=*|--depth=*|--origin=*|--config=*|--reference=*|\
+              --reference-if-able=*|--template=*|--jobs=*|--filter=*|\
+              --shallow-since=*|--shallow-exclude=*|--upload-pack=*|\
+              --server-option=*|--bundle-uri=*) ;;
+              -*) ;;
+              *)
+                if [ "$sepgitdir" = "__NEXT__" ]; then
+                  sepgitdir="$a"
+                else
+                  nonopt+=("$a")
+                fi ;;
+            esac
           done
+          [ -n "$sepgitdir" ] && [ "$sepgitdir" != "__NEXT__" ] && _cp_bwt_classify_target "$sepgitdir"
           case "${#nonopt[@]}" in
             0) : ;;
             1) _cp_bwt_classify_target "." ;;
@@ -3404,9 +3519,21 @@ _cp_bwt_unterminated_quote() {
 # the unterminated-quote check above. Then walks every operator-split
 # segment (`;`, `&&`, `||`, `|`, subshells, `<(…)`/`>(…)` bodies —
 # _cp_walk_segments already handles all of those) with a leading `cd DIR
-# &&` tracked into every later segment's cwd.
+# &&` tracked into every later segment's cwd. Caps `bash -c`/`sh -c`
+# recursion (herdr-control#192 round 3, F4): each nested `bash -c "bash -c
+# ..."` re-enters this SAME function, and a deep chain got slow enough to
+# time out the hook's spawnSync call — a timeout the caller might not
+# treat as a refusal. `_cp_bwt_depth` is a `local` bash relies on dynamic
+# scoping for: each recursive call's own `local _cp_bwt_depth=$((...+1))`
+# reads the CALLER's value before shadowing it, so this needs no extra
+# parameter threaded through every helper the way `cwd` did.
 bash_write_targets() {
   local raw="$1" cwd="${2:-.}" eff="${2:-.}" body line kind val nd stripped
+  local _cp_bwt_depth="$(( ${_cp_bwt_depth:-0} + 1 ))"
+  if [ "$_cp_bwt_depth" -gt 8 ]; then
+    printf 'COMPUTED\t%s\n' "bash -c nesting is too deep for this scanner to follow safely"
+    return 0
+  fi
   stripped="$(_cp_strip_heredocs "$raw")"
   if _cp_bwt_unterminated_quote "$stripped"; then
     printf 'UNPARSED\tan unterminated quote makes this command unparseable\n'
