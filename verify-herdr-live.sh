@@ -396,6 +396,13 @@ class LostWire:
     def read(self, timeout):
         self.n += 1
         lost = {"id": "herdr-live", "error": {"code": "events_lost", "message": "fell behind"}}
+        if LostWire.mode == "always":             # a reader that never catches up
+            if self.n == 1:
+                return {"id": "herdr-live", "result": {"type": "subscription_started"}}
+            if self.n == 2:
+                time.sleep(0.26)                  # each cycle outlasts the 0.25s rapid floor
+                return lost
+            raise ConnectionError("herdr socket closed")
         if self.first and LostWire.mode == "ack" and self.n == 1:
             LostWire.lost = True
             return lost
@@ -435,6 +442,21 @@ def events_lost_case(mode):
 
 results["events_lost_stream"] = events_lost_case("stream")
 results["events_lost_ack"] = events_lost_case("ack")
+
+# 18b. ...and a reader that STAYS behind must back off, not loop a full
+# snapshot every cycle: without the streak backoff, 2s is ~7 connects.
+LostWire.connects, LostWire.mode, LostWire.lost = 0, "always", False
+herdr_live._Wire = LostWire
+herdr_live.request = lambda *a, **k: two_panes("working")
+live = herdr_live.LiveState(resync_every_s=60)
+live._apply_snapshot(two_panes("working"))
+t = threading.Thread(target=live._stream_forever, daemon=True)
+t.start()
+time.sleep(2.0)
+live.stop()
+t.join(3)
+herdr_live._Wire = real_wire
+results["events_lost_backoff"] = [LostWire.connects <= 4, LostWire.connects]
 
 print(json.dumps(results))
 PY
@@ -508,6 +530,9 @@ get() { printf '%s' "$out" | jq -c ".$1"; }
 [ "$(get events_lost_ack)" = '[[[true,null]],1,true,"blocked"]' ] \
   && ok "an events_lost subscribe ack resubscribes instead of raising" \
   || no "events_lost ack" "$(get events_lost_ack)"
+[ "$(get 'events_lost_backoff[0]')" = 'true' ] \
+  && ok "repeated events_lost backs off instead of looping a snapshot per cycle" \
+  || no "events_lost backoff" "$(get events_lost_backoff)"
 [ "$(get fresh_process_coverage)" = '[true,[[],["w1:p1","w1:p2"]],["w1:p1","w1:p2"]]' ] \
   && ok "a fresh process resubscribes once and covers every pane" \
   || no "fresh process coverage" "$(get fresh_process_coverage)"

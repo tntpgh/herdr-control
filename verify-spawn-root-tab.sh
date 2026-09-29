@@ -21,7 +21,9 @@ repo=$(cd "$repo" && pwd -P)
 
 # EXISTING=1: the repo already has workspace w1 with a finished worker's tab
 # (tOld) whose pane is at a shell, so it reports no agent. EXISTING=0: no
-# workspace yet; `workspace create` returns w1 with auto root tab tRoot.
+# workspace yet; `workspace create` returns w1 with auto root tab tRoot — and a
+# second spawn racing us has already added its own tab (tRace) whose agent has
+# not reported yet.
 cat > "$work/herdr" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$work/herdr.log"
@@ -36,7 +38,7 @@ case "\$1 \$2" in
     if [ "\${EXISTING:-0}" = 1 ]; then
       printf '{"result":{"tabs":[{"tab_id":"tOld","workspace_id":"w1"},{"tab_id":"t1","workspace_id":"w1"}]}}\n'
     else
-      printf '{"result":{"tabs":[{"tab_id":"tRoot","workspace_id":"w1"},{"tab_id":"t1","workspace_id":"w1"}]}}\n'
+      printf '{"result":{"tabs":[{"tab_id":"tRoot","workspace_id":"w1","label":"repo"},{"tab_id":"tRace","workspace_id":"w1","label":"quick:other"},{"tab_id":"t1","workspace_id":"w1","label":"quick:fresh"}]}}\n'
     fi ;;
   "workspace create") printf '{"result":{"workspace":{"workspace_id":"w1","active_tab_id":"tRoot"}}}\n' ;;
   "tab create") printf '{"result":{"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"p1","terminal_id":"term1"}}}\n' ;;
@@ -63,7 +65,7 @@ fi
 
 spawn 0 fresh
 if grep -qx 'tab close tRoot' "$work/herdr.log" && [ "$(grep -c '^tab close' "$work/herdr.log")" = 1 ]; then
-  ok "a workspace this call created has its empty root tab closed, and only that"
+  ok "a workspace this call created has its empty root tab closed, and only that (a racing worker's tab survives)"
 else
   bad "new workspace root tab" "closes: $(grep '^tab close' "$work/herdr.log" | tr '\n' ';') log: $(grep -c . "$work/herdr.log") lines"
 fi

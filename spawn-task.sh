@@ -639,11 +639,16 @@ jq -n \
 # whose pane has no agent — relied on a finished worker's `--agent` stamp
 # outliving it. herdr 0.9.2 clears a self-reported agent ~0.5s after its pane
 # is back at an idle shell (herdr#4687), so a worker that exited to its shell
-# would lose its tab to the next spawn in the same repo. The agent check stays
-# as a second guard for two spawns racing to create the same workspace.
+# would lose its tab to the next spawn in the same repo.
+#
+# Two spawns can race to create the same workspace (both lookups miss), and a
+# racing worker's tab exists before its agent reports — so the agent check
+# alone could close it. Worker tabs are always labelled `<job>:<branch>`; the
+# root tab carries the repo name or herdr's bare position number. A tab whose
+# label has a `:` is never a candidate.
 if [ "$ws_existed" = 0 ]; then
   for _t in $(herdr tab list 2>/dev/null | jq -r --arg ws "$ws" --arg keep "$tab" \
-      '(.result.tabs // .tabs)[] | select(.workspace_id==$ws and .tab_id!=$keep) | .tab_id' 2>/dev/null); do
+      '(.result.tabs // .tabs)[] | select(.workspace_id==$ws and .tab_id!=$keep and ((.label // "") | contains(":") | not)) | .tab_id' 2>/dev/null); do
     _agent=$(herdr pane list 2>/dev/null | jq -r --arg t "$_t" \
       '(.result.panes // .panes)[] | select(.tab_id==$t) | .agent // empty' 2>/dev/null | head -1)
     [ -z "$_agent" ] && herdr tab close "$_t" >/dev/null 2>&1
