@@ -920,7 +920,9 @@ function readOnlyChildBlock(event: unknown, ctx?: unknown): Block | undefined {
   if (!Object.hasOwn(READONLY_CHILD_AGENTS, agent.name.toLowerCase())) return undefined;
   const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
   const tool = typeof e.toolName === "string" ? e.toolName : "";
-  if (Object.hasOwn(READONLY_CHILD_TOOLS, tool)) return undefined;
+  // `read ssh://host/path` runs local ssh with the user's keys (#203 re-review).
+  const readPath = tool === "read" && e.input && typeof e.input === "object" ? (e.input as Record<string, unknown>).path : undefined;
+  if (Object.hasOwn(READONLY_CHILD_TOOLS, tool) && !(typeof readPath === "string" && /^\s*ssh:/i.test(readPath))) return undefined;
   if (tool === "lsp") {
     const input = e.input && typeof e.input === "object" ? (e.input as Record<string, unknown>) : {};
     if (typeof input.action === "string" && Object.hasOwn(READONLY_LSP_ACTIONS, input.action)) return undefined;

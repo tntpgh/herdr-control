@@ -139,7 +139,7 @@ bun -e '
     ["scout", "sub", "mcp__fs__write_file", {}], ["security-reviewer", "sub", "lsp", { action: "rename" }],
     ["security-reviewer", "sub", "lsp", { action: "code_actions", apply: true }],
     ["security-reviewer", "sub", "lsp", { action: "request" }], ["security-reviewer", "sub", "lsp", {}],
-    ["Scout", "sub", "bash", {}],
+    ["Scout", "sub", "bash", {}], ["scout", "sub", "read", { path: "ssh://h/etc/hosts", action: "ssh" }],
     ["scout", "sub", "read", {}], ["scout", "sub", "grep", {}], ["scout", "sub", "web_search", {}],
     ["security-reviewer", "sub", "lsp", { action: "references" }], ["security-reviewer", "sub", "ast_grep", {}],
     ["scout", "main", "bash", {}], ["task", "sub", "bash", {}], ["reviewer", "sub", "bash", {}],
@@ -152,7 +152,7 @@ bun -e '
 for c in scout/sub/bash/ scout/sub/write/ scout/sub/edit/ scout/sub/eval/ scout/sub/task/ scout/sub/notepad_append/ \
          scout/sub/retain/ scout/sub/manage_skill/ scout/sub/learn/ scout/sub/mcp__fs__write_file/ \
          security-reviewer/sub/lsp/rename security-reviewer/sub/lsp/code_actions security-reviewer/sub/lsp/request \
-         security-reviewer/sub/lsp/ Scout/sub/bash/; do
+         security-reviewer/sub/lsp/ Scout/sub/bash/ scout/sub/read/ssh; do
   grep -qx "$c=RO_BLOCK" "$work/child" && ok "child blocked: $c" || not_ok "child should block $c: $(grep "^$c=" "$work/child") $(cat "$work/bun.err")"
 done
 for c in scout/sub/read/ scout/sub/grep/ scout/sub/web_search/ security-reviewer/sub/lsp/references \
