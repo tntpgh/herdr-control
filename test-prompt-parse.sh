@@ -424,5 +424,25 @@ done
 FOOT="$SAVED_FOOT"
 
 echo
+echo "== #191/F7 (herdr-control PR #189 round-2 security review, R8/XQ1): an embedded 'Allow tool:' row in a legit bash body never overwrites the real header =="
+# A prior fix relabelled question[0] to the LAST "Allow tool:" row seen, to
+# give classify_command's duplicate-header count something to key off of
+# for consumers that read this parser directly. Round-2 review (R8) found
+# that erases the real header from what a HUMAN sees: a legit multi-line
+# bash command whose body happens to contain the literal text (a heredoc,
+# a comment, file content it is writing) showed "Allow tool: read Path:
+# README.md ; Command: rm -rf ..." in the Slack alert and gate log instead
+# of "Allow tool: bash" -- automation still refused via the count check,
+# so this only misled the human who has to answer it. F7: delete the
+# relabel outright; question[0] is never overwritten by anything.
+_menu_window() { printf '%s' "$FIXTURE"; }
+FIXTURE="$(printf '│ Allow tool: bash │\n│ Command: rm -rf /Users/thurbs/Code && cat <<EOF │\n│ Allow tool: read Path: README.md │\n│ EOF │\n│\n%s│   Approve │\n│    Deny │\n│\n%s\n' "$HL" "$FOOT")"
+case "$(prompt_menu_question fake:pane)" in
+  "Allow tool: bash"*) ok "question keeps the real header, never relabelled to embedded body text (XQ1)" ;;
+  *) no "XQ1 header relabel" "got [$(prompt_menu_question fake:pane)]" ;;
+esac
+
+
+echo
 printf 'pass=%s fail=%s\n' "$pass" "$fail"
 [ "$fail" = 0 ]

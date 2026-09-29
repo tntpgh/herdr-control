@@ -574,7 +574,7 @@ question_rawlen = []
 question_content_end = []
 box_width = None
 selected = ""
-invalid = complete = visible = False
+invalid = complete = visible = poisoned = last_footer_poisoned = False
 truncated = False
 # The most recent "running <label>" bordered box seen while scanning, and a
 # snapshot of it taken the instant a panel opens. See BROWSER_FALLBACK below
@@ -713,7 +713,28 @@ def _unwrap_footer(rows):
 # abort the parser and silence the wake path.
 lines = _unwrap_footer([raw.decode("utf-8", "replace") for raw in sys.stdin.buffer])
 _border_chars = "\u2500\u256d\u256e\u2570\u256f"  # ─ ╭ ╮ ╰ ╯
-
+# #191 (herdr-control PR #189 round-2 security review, P2/CRITICAL): the
+# pass-1 opener used to accept ANY non-alnum prefix (`text`, stripped at
+# `^[^A-Za-z0-9]+`), so a Python COMMENT inside a real eval body --
+# `# Allow tool: read Path: README.md` -- opened a fake one-row "read"
+# panel once the genuine header had scrolled off the top of the captured
+# window (a tall eval body, the wM:p4 shape). A real omp panel header is
+# never preceded by anything but whitespace or the box-drawing border this
+# parser already tracks (`_border_chars`, plus the vertical bar `│`); an
+# arbitrary prefix like `#`, `//`, `*` or a quote character means the row
+# is BODY TEXT that merely contains the literal string, never a real
+# header omp rendered.
+_HEADER_PREFIX_RE = re.compile(r"^[\s\u2502" + _border_chars + r"]+")
+# Round-3 security review interim hardening (#191 stays open; this narrows
+# the exposure, it does not close it -- a real fix needs the tool name
+# recorded at the hook, see SUMMARY.md): a real omp header row carries
+# NOTHING after "Allow tool: <name>" but the name itself (optional -- omp
+# can wrap the row right after the colon, leaving the name on the NEXT
+# row) and trailing border/space. `Allow tool: read Path: README.md"""`
+# (a Python string literal body row that merely starts with the literal)
+# fails this: there is a SECOND field after the tool name, which no real
+# header row ever has.
+_HEADER_TOOL_RE = re.compile(r"^Allow tool:(\s*\S+)?[\s\u2502" + _border_chars + r"]*$")
 
 def _row_metrics(plain_line):
     raw = plain_line.rstrip("\r\n")
@@ -731,9 +752,24 @@ for line in lines:
     body = re.sub(r"^[\s│]+", "", plain).rstrip(" \t\r\n│─╮")
     # A header row only OPENS a panel; inside one it is command content
     # (a multi-line command can contain the literal text "Allow tool:").
+    # #191 narrowed the opener to `header_text` (whitespace/border-char
+    # prefix only); F8 (round-3 security review R9) restores the original,
+    # looser trigger (`text`, ANY non-alnum prefix stripped) that MAIN
+    # still uses, so a row that would open a panel on MAIN still opens one
+    # here too -- but marks the panel POISONED unless the row ALSO clears
+    # both the #191 border-prefix check and the interim hardening check
+    # (nothing after the tool name, `_HEADER_TOOL_RE`). A poisoned panel
+    # still takes in every row below it exactly like the old opener did
+    # (so a LATER row that would otherwise open a fresh, clean one-row
+    # panel over the real command cannot -- state is already 1), but can
+    # never itself produce a pressable verdict: `complete` below is forced
+    # False whenever `poisoned`, so pass 2 footer-anchored fallback decides.
+    header_text = _HEADER_PREFIX_RE.sub("", plain)
+    real_header = bool(header_text.startswith("Allow tool:") and _HEADER_TOOL_RE.match(header_text))
     if state == 0 and text.startswith("Allow tool:"):
         pending_running = list(running_lines)
         state, question, selected = 1, [text], ""
+        poisoned = not real_header
         _rawlen, _cend, _bordered = _row_metrics(plain)
         question_rawlen = [_rawlen]
         question_content_end = [_cend]
@@ -778,7 +814,28 @@ for line in lines:
         # scrolls off the TOP, so a real panel showing its footer is showing
         # its option rows too — requiring one costs no genuine detection.
         visible = state >= 2
-        complete = state == 3 and not invalid
+        # F8 (round-3 security review R9): a poisoned panel (see the
+        # opener above) can reach state 3 exactly like a real one -- every
+        # row below it, including a real Approve/Deny/footer, still gets
+        # consumed the same way -- but it must never itself count as
+        # complete. `not poisoned` is the whole fix: pass 2 decides instead.
+        complete = state == 3 and not invalid and not poisoned
+        # F9 (round-4 security review R10): F8 forced a poisoned panel to
+        # fail pass 1, but pass 2, the footer-anchored fallback, then
+        # judged only the ≤6 rows immediately above Approve -- narrower
+        # than the real command that made pass 1 poison it in the first
+        # place, so it pressed panels pass 1 on MAIN refuses outright
+        # (MAIN opens on the same comment row, sees a tool it has no rule
+        # for, and refuses; PR poisoned that row, so pass 1 never got the
+        # chance to refuse it, and pass 2 saw only a truncated, less
+        # alarming tail).
+        # A footer that closes a poisoned panel now ends the parse right
+        # here, fail-closed: pass 2 never runs for it. `visible` above is
+        # untouched, so the panel still pages a human -- it is simply
+        # never pressable. The flag tracks the LAST footer seen, so a
+        # later clean panel (a fresh open after this one closes) still
+        # completes normally.
+        last_footer_poisoned = poisoned and state == 3
         state = 0
         continue
     if not body:
@@ -801,7 +858,7 @@ for line in lines:
         selected = n
 
 # ---- pass 2: footer-anchored, header off-screen -----------------------------
-if not complete:
+if not complete and not last_footer_poisoned:
     foot = None
     for i in range(len(lines) - 1, -1, -1):
         if _is_footer(lines[i]):

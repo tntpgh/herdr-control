@@ -2709,6 +2709,25 @@ _cp_net_sends() {                       # text -> 0 (true) if a send/upload flag
   _cp_match "$_CP_NET_SEND_SHORT_RE" "$1" || _cp_imatch "$_CP_NET_SEND_LONG_RE" "$1"
 }
 
+# _cp_count_allow_tool_headers <text> -> prints how many times the literal
+# "Allow tool:" occurs in <text>. Shared by classify_command's top-level
+# fail-closed check (#190) and _cp_write_menu_verdict's own guard (#187 F2)
+# so the two can never drift on what counts as "more than one header".
+# Pure bash, no subprocess: a security-review-round-1 fixture is exactly
+# the shape ("Allow tool: read" text sitting above a real "Allow tool:
+# eval" panel) this exists to catch, so it must never depend on an
+# external tool that could itself be sandboxed away.
+_cp_count_allow_tool_headers() {
+  local rest="$1" n=0
+  while :; do
+    case "$rest" in
+      *"Allow tool:"*) n=$((n + 1)); rest="${rest#*Allow tool:}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$n"
+}
+
 _cp_non_shell_panel_tool() {
   case "$1" in
     "Allow tool: "*) ;;
@@ -2729,6 +2748,122 @@ _cp_safe_non_shell_panel() {
     read|grep|glob|web_search) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# _cp_lexical_abspath <path> -> prints a `/`-rooted, `.`/`..`-collapsed form
+# of <path> WITHOUT touching the filesystem — the write target may not exist
+# yet, so realpath(1) is not an option. String-lexical only: a symlink that
+# points outside the worktree is not caught here (that is the real
+# PreToolUse hook's job at #159; this is a second, coarser gate deciding
+# whether automation may press Approve on the omp confirm dialog at all).
+_cp_lexical_abspath() {
+  local p="$1" part
+  set --
+  local IFS=/
+  for part in $p; do
+    case "$part" in
+      ''|.) ;;
+      ..) [ "$#" -gt 0 ] && set -- "${@:1:$(($#-1))}" ;;
+      *) set -- "$@" "$part" ;;
+    esac
+  done
+  if [ "$#" -eq 0 ]; then printf '/'; return; fi
+  local out="" seg
+  for seg in "$@"; do out="$out/$seg"; done
+  printf '%s' "$out"
+}
+
+# _cp_path_within_worktree <path> <worktree> -> 0 when <path> (relative
+# paths resolved against <worktree>) lexically resolves inside it.
+_cp_path_within_worktree() {
+  local p="$1" wt="$2" abs wt_abs
+  [ -n "$wt" ] || return 1
+  case "$p" in
+    /*) abs="$p" ;;
+    '~'*) return 1 ;;
+    *) abs="$wt/$p" ;;
+  esac
+  abs="$(_cp_lexical_abspath "$abs")"
+  wt_abs="$(_cp_lexical_abspath "$wt")"
+  case "$abs" in
+    "$wt_abs"|"$wt_abs"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _cp_write_menu_verdict <raw panel text> <worktree> -> "allow" or
+# "escalate:<reason>" on stdout, or nothing (caller falls back to the
+# existing "unknown tool" escalate) when the shape cannot be judged safely.
+#
+# #187: the multi-row guard in herdr-select.sh exists for bash commands that
+# terminal-wrap mid-token (#186) — a field-labelled tool panel (`write`'s
+# `Path:`/`Content:` rows) is not a shell command at all, so herdr-select.sh
+# skips that guard only when THIS function actually returns a verdict (see
+# its own comment). This is the real judgment that replaces it.
+#
+# Security review round 1 of #187 (PR #189) findings, all fixed here:
+#   F2 (R1/R3 Q3): `raw` must carry exactly ONE "Allow tool:" occurrence.
+#     omp's panel parser can be made to read a forged header sitting above
+#     the real panel (a worker prints arbitrary transcript text; the parser
+#     opens on the FIRST "Allow tool:" row it sees and treats every later
+#     row, including a genuine second header, as body content — see #190).
+#     A forged "Allow tool: write Path: xd://notepad_append Content:"
+#     header above a REAL eval/bash panel would otherwise still read as an
+#     allowable notepad write even after F1 closed the tool-widening gap,
+#     because this function's own case-pattern match does not care what
+#     comes after the first matched " Content: ". Refuse to judge anything
+#     with more than one header rather than guess which one is real.
+#   F3 (R3): a REAL filesystem path must be a bare token of
+#     `[A-Za-z0-9._/-]` — no `@`/`:`/`[`/`]`/`~`/scheme prefix, all of which
+#     omp itself strips or routes to a different handler before a real path
+#     ever forms (#159, agent-hooks/omp-herdr-control.ts) — and `raw` must
+#     contain the literal ` Content: ` marker EXACTLY once, so the cut point
+#     this function relies on can only ever be the genuine field boundary,
+#     never attacker-chosen (`Path: a Content: /../../etc/zshenv Content: x`
+#     used to extract the harmless-looking `a` and ignore the real target).
+#     Neither rule applies to the `xd://notepad_*` allowlist below: those
+#     are exact-string matches, already immune to both concerns, and stay
+#     ahead of this check on purpose.
+_cp_write_menu_verdict() {
+  local raw="$1" wt="$2" path
+  [ "$(_cp_count_allow_tool_headers "$raw")" -gt 1 ] && return 1
+  case "$raw" in
+    "Allow tool: write Path: "*" Content: "*)
+      path="${raw#Allow tool: write Path: }"
+      path="${path%% Content: *}"
+      ;;
+    *) return 1 ;;
+  esac
+  case "$path" in
+    ''|*[[:space:]]*) return 1 ;;
+  esac
+  case "$path" in
+    xd://notepad_append|xd://notepad_priority|xd://notepad_stats|xd://notepad_read)
+      printf 'allow'; return 0 ;;
+    xd://*)
+      return 1 ;;
+  esac
+  case "$path" in
+    *[!A-Za-z0-9._/-]*) return 1 ;;
+  esac
+  local _c_rest="$raw" _c_n=0
+  while :; do
+    case "$_c_rest" in
+      *" Content: "*) _c_n=$((_c_n + 1)); _c_rest="${_c_rest#*" Content: "}" ;;
+      *) break ;;
+    esac
+  done
+  [ "$_c_n" -eq 1 ] || return 1
+  if [ -z "$wt" ]; then
+    printf 'escalate:worker worktree unknown — cannot judge write path containment'
+    return 0
+  fi
+  if _cp_path_within_worktree "$path" "$wt"; then
+    printf 'allow'
+  else
+    printf 'escalate:write path resolves outside the worker'"'"'s worktree — remains human-only'
+  fi
+  return 0
 }
 
 # A script runner's quoted arguments are data to its script, not command
@@ -2766,18 +2901,48 @@ _cp_mask_script_data() {
     }'
 }
 
-classify_command() {
+classify_command() {                    # <panel/command text> [worktree]
   if [ "$#" -lt 1 ]; then
     printf 'command-policy: classify_command requires a <command> argument\n' >&2
     return 2
   fi
-  local raw="$1" norm
+  local raw="$1" wt="${2:-}" norm
+  # #190 (pre-existing on main; folded into #187/PR-189's security-review
+  # fix round): a classified text carrying more than one literal
+  # "Allow tool:" occurrence cannot be trusted AT ALL, regardless of tool.
+  # omp's own panel parser opens on the FIRST such row and reads every
+  # LATER one as ordinary body/command text (lib/prompt-parse.sh), so a
+  # worker (or a compromised transcript) can print a harmless fake header
+  # above a real dangerous panel and have the whole thing classified as the
+  # fake tool. Measured live: `Allow tool: read` printed above a real
+  # `Allow tool: bash Command: rm -rf …` panel classified `allow` on main
+  # via `_cp_safe_non_shell_panel`'s blind trust of the `read` tool name.
+  # Fail closed before ANY tool-specific judgment — bash included, since
+  # the bash branch below has the identical blind-trust shape (it judges
+  # `$norm`, derived from the same untrustworthy `raw`).
+  if [ "$(_cp_count_allow_tool_headers "$raw")" -gt 1 ]; then
+    printf 'the classified text carries more than one "Allow tool:" header — refusing to guess which panel is real\n' > "$(_cp_reason_file)"
+    printf 'escalate\n'
+    return 0
+  fi
   if [ -n "$(_cp_non_shell_panel_tool "$raw" 2>/dev/null)" ]; then
     if _cp_safe_non_shell_panel "$raw"; then
       : > "$(_cp_reason_file)"
       printf 'allow\n'
       return 0
     fi
+    local _cp_wv
+    _cp_wv="$(_cp_write_menu_verdict "$raw" "$wt" 2>/dev/null)"
+    case "$_cp_wv" in
+      allow)
+        : > "$(_cp_reason_file)"
+        printf 'allow\n'
+        return 0 ;;
+      escalate:*)
+        printf '%s\n' "${_cp_wv#escalate:}" > "$(_cp_reason_file)"
+        printf 'escalate\n'
+        return 0 ;;
+    esac
     printf 'unknown or executing tool approval remains human-only\n' > "$(_cp_reason_file)"
     printf 'escalate\n'
     return 0
