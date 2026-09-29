@@ -22,6 +22,7 @@
 # (one HTTP call, zero herdr RPCs); only agent panes are then read.
 #
 # Usage: detect-dead-workers.sh [--lines N] [--json]
+#        detect-dead-workers.sh --scan-stdin   (classify one pane tail; prints the hit)
 # Exit:  0 nothing found · 1 candidates found · 2 usage/env error
 
 set -uo pipefail
@@ -29,23 +30,26 @@ set -uo pipefail
 HUB="${HERDR_HUB_URL:-http://127.0.0.1:8600}"
 LINES=25
 JSON=0
+SCAN_STDIN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --lines) LINES="${2:?--lines needs a value}"; shift 2 ;;
     --json)  JSON=1; shift ;;
-    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+    --scan-stdin) SCAN_STDIN=1; shift ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "detect-dead-workers: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
 
-command -v herdr >/dev/null || { echo "detect-dead-workers: herdr not on PATH" >&2; exit 2; }
-command -v jq    >/dev/null || { echo "detect-dead-workers: jq not on PATH" >&2; exit 2; }
-
 # Fatal signatures, every one observed in a real dead pane or in omp's own
 # documented retry dead-end (omp://non-compaction-retry-policy.md step 8).
 # Anchored to what the PROVIDER or the harness emits, never to prose an agent
-# might write about them.
-SIGS='usage_limit_reached|rate_limit_error|Retry failed after [0-9]+ attempts|exceeds retry\.maxDelayMs|Provider requested [0-9]+ms wait|The usage limit has been reached'
+# might write about them. Re-checked 2026-09-29 against the installed
+# binaries (`strings`): omp 18.4.2 still prints `Retry failed after N
+# attempts:` and `Provider requested Nms wait, exceeds retry.maxDelayMs`;
+# Codex 0.157 prints `You've hit your usage limit.` in its own TUI, not only
+# the raw `usage_limit_reached` code the 09-21 pane showed.
+SIGS="usage_limit_reached|rate_limit_error|Retry failed after [0-9]+ attempts|exceeds retry\\.maxDelayMs|Provider requested [0-9]+ms wait|The usage limit has been reached|You've hit your usage limit"
 
 # The signature alone is NOT enough, and this is not theoretical: the first
 # run of this script printed `usage_limit_reached` into the conductor's own
@@ -53,7 +57,21 @@ SIGS='usage_limit_reached|rate_limit_error|Retry failed after [0-9]+ attempts|ex
 # real death is an error-SHAPED line — the harness prefixes it (`Error:`), or
 # it carries the provider's own `code=` / retry phrasing. A report table, a
 # grep result, or an agent discussing these strings has none of that.
-ERRSHAPE='(^|[[:space:]])[Ee]rror:|code=|Retry failed|Provider requested'
+# Codex's friendly line is the whole line (after its error bullet, if any), so
+# it is anchored to the line start: a table cell or `file:12:` grep hit is not.
+ERRSHAPE="(^|[[:space:]])[Ee]rror:|code=|Retry failed|Provider requested|^[^[:alnum:]:|]*You've hit your usage limit"
+
+# One pane tail on stdin -> the signature it died on, or nothing.
+classify_tail() { grep -E "$ERRSHAPE" | grep -oE "$SIGS" | tail -1; }
+
+if [ "$SCAN_STDIN" = 1 ]; then
+  hit="$(classify_tail)"
+  [ -n "$hit" ] && { printf '%s\n' "$hit"; exit 1; }
+  exit 0
+fi
+
+command -v herdr >/dev/null || { echo "detect-dead-workers: herdr not on PATH" >&2; exit 2; }
+command -v jq    >/dev/null || { echo "detect-dead-workers: jq not on PATH" >&2; exit 2; }
 
 panes="$(curl -fsS --max-time 5 "$HUB/api/panes" 2>/dev/null \
          | jq -r '.panes[]? | select(.agent) | "\(.pane_id)\t\(.agent_status // "unknown")\t\(.label // .agent)"')" || {
@@ -70,10 +88,10 @@ while IFS=$'\t' read -r pane status label; do
   # The signature must be in the TAIL and on an error-shaped line. An agent
   # that merely quoted one of these strings mid-run keeps producing output,
   # which pushes it out of the window; a pane that DIED has it at the bottom.
-  hit="$(printf '%s\n' "$text" | grep -E "$ERRSHAPE" | grep -oE "$SIGS" | tail -1)"
+  hit="$(printf '%s\n' "$text" | classify_tail)"
   [ -n "$hit" ] || continue
   found=1
-  rows="${rows}${pane}\t${status}\t${label}\t${hit}\n"
+  rows+="$(printf '%s\t%s\t%s\t%s' "$pane" "$status" "$label" "$hit")"$'\n'
 done <<< "$panes"
 
 if [ "$found" = 0 ]; then
@@ -82,12 +100,12 @@ if [ "$found" = 0 ]; then
 fi
 
 if [ "$JSON" = 1 ]; then
-  printf "$rows" | jq -Rs 'split("\n")[:-1] | map(split("\t") |
+  printf '%s' "$rows" | jq -Rs 'split("\n")[:-1] | map(split("\t") |
     {pane: .[0], herdr_status: .[1], label: .[2], signature: .[3]}) | {candidates: .}'
 else
   printf 'DEAD-WORKER CANDIDATES (herdr status shown for contrast — it is why these hide)\n\n'
   printf 'PANE\tHERDR\tLABEL\tSIGNATURE\n'
-  printf "$rows"
+  printf '%s' "$rows"
   printf '\nConfirm before acting: read the pane, then resume it on a live model\n'
   printf 'or respawn. This script never kills or restarts anything.\n'
 fi
