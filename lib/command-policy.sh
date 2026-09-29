@@ -2755,7 +2755,15 @@ _cp_count_allow_tool_headers() {
   printf '%s' "$n"
 }
 
-_cp_non_shell_panel_tool() {
+# _cp_panel_header_tool <panel text> -> the lowercase tool name after
+# "Allow tool: " (bash/shell included), or nothing (exit 1) when <text>
+# does not open with that literal. herdr-control #191: shared by
+# _cp_non_shell_panel_tool below (which then excludes bash/shell/sh/zsh)
+# AND by herdr-select.sh's hook-record corroboration, which needs the
+# CLAIMED tool for every panel shape, bash included -- the two callers
+# must extract identically or a bash panel could be judged safe under one
+# reading and dangerous under the other.
+_cp_panel_header_tool() {
   case "$1" in
     "Allow tool: "*) ;;
     *) return 1 ;;
@@ -2763,7 +2771,12 @@ _cp_non_shell_panel_tool() {
   local tool
   tool="${1#Allow tool: }"
   tool="${tool%%[ ;:	]*}"
-  tool="$(printf '%s' "$tool" | tr '[:upper:]' '[:lower:]')"
+  printf '%s' "$tool" | tr '[:upper:]' '[:lower:]'
+}
+
+_cp_non_shell_panel_tool() {
+  local tool
+  tool="$(_cp_panel_header_tool "$1" 2>/dev/null)" || return 1
   case "$tool" in bash|shell|sh|zsh) return 1 ;; esac
   printf '%s' "$tool"
 }

@@ -421,6 +421,67 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
   }
   [ -n "$registry_cmd" ] && [ "$cmd_text" = "$registry_cmd" ] && cmd_text_is_scrape=0
 fi
+
+# ---- herdr-control #191: corroborate the panel's CLAIMED tool identity
+# against the hook-recorded one, for every omp menu panel — peer AND
+# conductor, registered task or not. #189's rounds 2-4 narrowed which ROWS
+# can open a fake panel (a comment prefix, a second field after the tool
+# name) but could not close the class: a body row that IS exactly
+# "Allow tool: read" (a wrapped comment continuation, a bare string
+# literal) is textually indistinguishable from a real header once the real
+# header has scrolled off-screen (REVIEW-189-r3 B1-B4; REVIEW-189-r4
+# B1S/B1C). `event.toolName` on tool_approval_requested is not scraped —
+# it is omp's own record of which tool is actually pending — so this
+# refuses any panel whose claimed header disagrees with it, and refuses
+# outright when no hook wrote one at all (a hand-started session, an older
+# omp build). Registered-task-only would leave exactly that hand-started
+# case open, so this runs whether or not own_run/own_task resolved — a
+# deliberate liveness cost over main, measured in SUMMARY.md.
+#
+# Bash headers are UNCHANGED in substance here: their corroboration is the
+# command-text block above (approval_command_text against the recorded
+# Command:/run: region), which already refuses a mismatched bash prompt
+# (REVIEW-189-r3 B8). This block adds the SAME "a hook record must exist"
+# requirement to a bash header too (no registry_tool at all now refuses a
+# bash panel exactly like any other), and for pass 2's synthetic
+# "[header off-screen]" literal it substitutes the recorded tool in place
+# of the literal so the existing non-bash dispatch judges the REAL tool
+# rather than treating that literal as if it were command text
+# (REVIEW-189-r4's pre-existing P1/P3: a tall eval with a blank or
+# `Command: ls` tail pressed on main and #189 alike).
+if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ]; then
+  registry_tool=""
+  if [ -n "$own_run" ] && [ -n "$own_task" ]; then
+    registry_tool="$(task_input_required_tool "$own_run" "$own_task" "$current_prompt_id" 2>/dev/null)"
+  fi
+  registry_tool_lc="$(printf '%s' "$registry_tool" | tr '[:upper:]' '[:lower:]')"
+  # The ORIGINAL scraped panel, before the bash block above may have
+  # substituted the registry command text for it: panel_scrape is only set
+  # when that block ran (own_run/own_task present); when it did not run,
+  # cmd_text itself is still untouched, so it doubles as the fallback.
+  panel_text_for_tool="${panel_scrape:-$cmd_text}"
+  case "$panel_text_for_tool" in
+    "[header off-screen]"*)
+      if [ -z "$registry_tool" ]; then
+        echo "herdr-select: $pane's approval header is off-screen and no hook recorded which tool is pending — refusing." >&2
+        _refuse_non_human "escalate" "off-screen approval header with no hook-recorded tool identity"
+      fi
+      case "$registry_tool_lc" in
+        bash|shell) ;; # governed by the command-text corroboration above
+        *)
+          cmd_text="Allow tool: ${registry_tool}${cmd_text#"[header off-screen]"}"
+          ;;
+      esac
+      ;;
+    "Allow tool:"*)
+      panel_tool="$(_cp_panel_header_tool "$panel_text_for_tool" 2>/dev/null)"
+      if [ -z "$registry_tool" ] || [ "$panel_tool" != "$registry_tool_lc" ]; then
+        echo "herdr-select: $pane's approval panel claims tool '$panel_tool' but the hook recorded '${registry_tool:-<none>}' for this prompt — refusing." >&2
+        _refuse_non_human "escalate" "the panel's claimed tool does not match the hook-recorded tool for this prompt"
+      fi
+      ;;
+  esac
+fi
 menu_rows_ambiguous=0
 # #187: this guard exists for a BASH command that terminal-wrapped mid-token
 # (#186) — real newlines and a genuine terminal wrap are indistinguishable

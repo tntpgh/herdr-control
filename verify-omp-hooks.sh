@@ -130,6 +130,15 @@ register_task run1 task1 w1 cond1 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /w
 . "$here/lib/prompt-parse.sh"
 printf '== current boxed omp menu: command details are not choices ==\n'
 printf '╭─ Allow tool: bash ─╮\n│\n│ Command: printf smoke │\n│\n│ \033[48;2;42;47;65m  Approve\033[0m │\n│ Deny │\n│\n│ up/down navigate  enter select  esc cancel │\n╰──╯\n' > "$WORKER_SCREEN"
+# herdr-control #191: herdr-select.sh now refuses a menu Approve with no
+# hook-recorded tool identity for this exact prompt_id (see
+# lib/run-registry.sh task_input_required_tool) -- seed the SAME record
+# push_wake would have written, the way verify-select-policy.sh's
+# _auto_seed_menu_tool does, so this test still exercises the boxed-menu
+# selection path it's actually about rather than the (separately covered)
+# no-record refusal.
+append_event run1 task1 input_required \
+  "$(jq -nc --arg pid "$(prompt_id "$WPANE")" '{message:"omp needs permission", prompt_id:$pid, command:"", tool:"bash"}')" >/dev/null 2>&1
 [ "$(prompt_menu_options "$WPANE")" = "$(printf '1\tApprove\n2\tDeny')" ] \
   && ok "only actual choices are offered" || bad "command detail parsed as an option"
 [ "$(prompt_menu_selected "$WPANE")" = 1 ] \

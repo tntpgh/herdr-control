@@ -154,6 +154,14 @@ fi
 # capture, delivery-outcome recording) live in lib/push-wake.sh, shared with
 # claude-notify.sh so the two cannot drift.
 #
+# `$tool` (herdr-control #191) is omp's own `event.toolName` from
+# tool_approval_requested, parsed above alongside $msg/$full_cmd — never
+# scraped panel text. push_wake records it on the SAME input_required row
+# unconditionally, and herdr-select.sh refuses any omp menu panel whose
+# scraped "Allow tool: <X>" header does not equal it, so a body row that
+# merely starts with that literal can no longer stand in for a real header
+# that scrolled off-screen.
+#
 # Claimed through the SAME attn_track_<key> the attention controller uses
 # (lib/attention-key.sh) before calling push_wake at all — PR #132 review,
 # item 6: a firing on a still-open prompt the controller (or an earlier
@@ -162,7 +170,7 @@ fi
 # the rollback: every firing calls push_wake again, unclaimed.
 . "$here/lib/attention-key.sh"
 if attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$(prompt_id "$pane" 2>/dev/null)"; then
-  push_wake "$msg" "$where" "$full_cmd" >/dev/null 2>&1 || true
+  push_wake "$msg" "$where" "$full_cmd" "$tool" >/dev/null 2>&1 || true
 fi
 
 if [ "${human_stale:-0}" = 1 ]; then

@@ -955,6 +955,33 @@ task_input_required_command() {
         ORDER BY sequence DESC LIMIT 1;" 2>/dev/null
 }
 
+# task_input_required_tool <run_id> <task_id> <prompt_id> -> the
+# hook-recorded tool name (event.toolName, omp-herdr-control.ts's
+# onApprovalRequested) for THIS exact prompt, or empty.
+#
+# herdr-control #191: the panel's own "Allow tool: <X>" header is scraped
+# TEXT — a body row that merely starts with that literal opens a fake
+# one-row panel over a real eval whose true header scrolled off-screen
+# (REVIEW-189-r3/r4). `toolName` on `tool_approval_requested` is not
+# scraped; it is the wrapper's own record of which tool omp is actually
+# asking about, so herdr-select.sh corroborates the CLAIMED header against
+# this recorded value rather than trusting the header alone. Same
+# prompt_id anchor as task_input_required_command, so a stale record from
+# an earlier prompt occurrence never matches the current one. Empty when
+# no such event exists (a hand-started session, an older omp build, or a
+# Claude/Codex numbered prompt, which never calls push_wake with a tool
+# at all) — callers must refuse rather than fall back to the header text.
+task_input_required_tool() {
+  local run_id="$1" task_id="$2" prompt_id="$3"
+  [ -n "$prompt_id" ] || return 0
+  registry_init || return 1
+  _sql "SELECT json_extract(payload,'\$.tool') FROM events
+        WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id")
+          AND type='input_required'
+          AND json_extract(payload,'\$.prompt_id')=$(_sq "$prompt_id")
+        ORDER BY sequence DESC LIMIT 1;" 2>/dev/null
+}
+
 read_task() {                           # run_id task_id -> json (empty if absent)
   registry_init || return 1
   _sql "$(_task_json_select) WHERE run_id=$(_sq "$1") AND task_id=$(_sq "$2");" 2>/dev/null
