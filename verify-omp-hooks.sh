@@ -674,6 +674,12 @@ pidR="$(prompt_id "$WPANE")"
 [ $? -ne 3 ] && ok "setup: the controller owns this prompt's attn_track claim" || bad "setup: controller could not take the claim"
 [ -z "$(task_input_required_tool run1 task1 "$pidR")" ] && ok "setup: the controller's row for this prompt carries no tool" || bad "setup: controller row already had a tool"
 sent_before="$(wc -l < "$SENT")"
+# Round-3 review: a hook for a DIFFERENT tool call in the same turn can
+# fingerprint this prompt's panel; its command does not corroborate, so it
+# must not take the controller's row over with its own tool.
+run_notify_cmd bash "git status --short"
+[ -z "$(task_input_required_tool run1 task1 "$pidR")" ] && ok "an uncorroborated hook does not take over the controller's row" \
+  || bad "uncorroborated hook replaced the row: tool '$(task_input_required_tool run1 task1 "$pidR")'"
 run_notify_cmd bash "git log --oneline -3"
 [ "$(task_input_required_tool run1 task1 "$pidR")" = bash ] && ok "the hook's later call fills in the tool" || bad "tool still '$(task_input_required_tool run1 task1 "$pidR")'"
 [ "$(task_input_required_command run1 task1 "$pidR")" = "git log --oneline -3" ] && ok "and the corroborated command" || bad "command '$(task_input_required_command run1 task1 "$pidR")'"

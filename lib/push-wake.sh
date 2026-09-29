@@ -232,7 +232,10 @@ push_wake() {
     # then refused every conductor/peer answer for them. So a hook's call
     # REPLACES a controller-marked row for this exact prompt; a hook's own
     # record is never replaced.
-    if [ "$where" != attention-controller ] && [ -n "$pid" ]; then
+    # Only a CORROBORATED record takes the row over (round-3 review): a hook
+    # for a different tool call that fingerprinted this prompt's panel fails
+    # corroboration, and must not replace the controller's row with its tool.
+    if [ "$where" != attention-controller ] && [ -n "$pid" ] && [ "$recorded_ok" = 1 ]; then
       _sql "UPDATE events SET payload=$(_sq "$ir_payload")
             WHERE event_id=$(_sq "${base}_input") AND type='input_required'
               AND json_extract(payload,'\$.recorded_by')='attention-controller';" >/dev/null 2>&1 || true
