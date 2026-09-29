@@ -345,8 +345,10 @@ EOF
 # Flip a form record open -> withdrawn under record_store's lock, so the hub
 # stops listing it and refuses an answer (409). A record already answered or
 # expired is left exactly as it is: a real answer is never overwritten.
-_ha_retire_form() {                     # record-path reason
-  "$HA_RECORD_PYTHON" - "$here/lib" "$1" "$2" >/dev/null 2>&1 <<'PY' || true
+# Prints what happened — withdrawn, kept:<status>[:<decision>], not-found,
+# error — so the withdrawal event says whether a human answer was dropped.
+_ha_retire_form() {                     # record-path reason -> outcome
+  "$HA_RECORD_PYTHON" - "$here/lib" "$1" "$2" 2>/dev/null <<'PY' || printf 'error\n'
 import sys, time
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
@@ -356,8 +358,12 @@ def _withdraw(row):
     return row
 try:
     claim_and_update(Path(sys.argv[2]), _withdraw)
-except (NotClaimable, FileNotFoundError):
-    pass
+    print("withdrawn")
+except NotClaimable as e:
+    decision = (e.row.get("answers") or {}).get("decision") if isinstance(e.row.get("answers"), dict) else None
+    print(f"kept:{e.state}" + (f":{decision}" if decision else ""))
+except FileNotFoundError:
+    print("not-found")
 PY
 }
 
@@ -367,7 +373,7 @@ PY
 # the tick skipped inactive tasks — so the inbox held questions nobody could
 # act on, and every tick re-read them.
 _ha_withdraw() {                        # id row task-json
-  local id="$1" row="$2" tj="$3" st why fp fid _st
+  local id="$1" row="$2" tj="$3" st why fp fid _st outcome
   st="$(_ha_field "$tj" state)"
   why="task $st before a decision; nothing is left to run it"
   action_request_withdraw "$id" "$why" || return 0
@@ -378,9 +384,12 @@ _ha_withdraw() {                        # id row task-json
 $(_ha_form_status "$fp")
 EOF
   fi
-  case "$fid" in ''|*/*|*..*) ;; *) _ha_retire_form "$HA_FORMS_DIR/$fid.json" "$why" ;; esac
+  case "$fid" in
+    ''|*/*|*..*) if [ -n "$fp" ]; then outcome=unpinned; else outcome=no-form; fi ;;
+    *) outcome="$(_ha_retire_form "$HA_FORMS_DIR/$fid.json" "$why")" ;;
+  esac
   append_event "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_withdrawn \
-    "$(jq -nc --arg id "$id" --arg s "$st" --arg f "$fid" '{request_id:$id, task_state:$s, form_record:$f}')" \
+    "$(jq -nc --arg id "$id" --arg s "$st" --arg f "$fid" --arg o "$outcome" '{request_id:$id, task_state:$s, form_record:$f, form_outcome:$o}')" \
     "actwd_${id}" >/dev/null 2>&1 || true
 }
 

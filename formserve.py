@@ -469,7 +469,7 @@ def main() -> int:
             if registry is not None:
                 try:
                     row = json.loads(registry.read_text())
-                    if row.get("status") in ("answered", "expired") and row.get("answered_via") != "port":
+                    if row.get("status") in ("answered", "expired", "withdrawn") and row.get("answered_via") != "port":
                         hub_row = row
                         break
                 except (OSError, json.JSONDecodeError):
@@ -493,6 +493,12 @@ def main() -> int:
             if args.deliver:
                 deliver(args.deliver, url, answers)
             return 0
+        if hub_row.get("status") == "withdrawn":
+            # herdr-action.sh withdrew the request (its task ended first).
+            # Stop serving live radio buttons for a question nobody can act on.
+            print(f"formserve: withdrawn, not answered ({hub_row.get('withdrawn_reason', 'no reason recorded')})",
+                  file=sys.stderr)
+            return 1
         print("formserve: the hub recorded this form as EXPIRED; still unanswered.", file=sys.stderr)
         return 1
 

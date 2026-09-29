@@ -360,6 +360,9 @@ bash "$here/herdr-action.sh" tick; bash "$here/herdr-action.sh" tick
 [ "$(q "SELECT status FROM action_requests WHERE request_id='${wd[2]}';")" = pending ] \
   && ok "a request whose task row is missing stays pending (never guessed at)" || not_ok "wd3 withdrawn without a terminal task"
 [ "$(q "SELECT count(*) FROM events WHERE type='action_withdrawn';")" = 2 ] && ok "one action_withdrawn event per request across two ticks" || not_ok "events: $(q "SELECT count(*) FROM events WHERE type='action_withdrawn';")"
+wdo() { q "SELECT json_extract(payload,'\$.form_outcome') FROM events WHERE type='action_withdrawn' AND json_extract(payload,'\$.request_id')='$1';"; }
+[ "$(wdo "${wd[0]}")" = withdrawn ] && [ "$(wdo "${wd[1]}")" = kept:answered:approve ] \
+  && ok "the event records the form outcome, including an approve that arrived too late" || not_ok "form_outcome: '$(wdo "${wd[0]}")' '$(wdo "${wd[1]}")'"
 q "UPDATE action_requests SET status='declined' WHERE request_id='${wd[2]}';"
 
 printf '== the omp hook: enforcing only for approval=hook rows ==\n'
