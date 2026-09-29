@@ -243,10 +243,13 @@ _sp_clamp_wait_seconds() {
 # SCRAPED panel instead of the untruncated registry command, and a
 # grant-allowable commit (message containing "push") was refused as reserved.
 #
-# Polls for the ROW'S EXISTENCE, never for a non-empty command: a
-# command-less prompt legitimately records command:"" (lib/push-wake.sh
-# change 5), and waiting on non-empty would block every one of those for the
-# full window instead of the ~0s it actually needs. Bounded by
+# Polls for a HOOK's row, never for a non-empty command: a command-less
+# prompt legitimately records command:"" (lib/push-wake.sh change 5), and
+# waiting on non-empty would block every one of those for the full window
+# instead of the ~0s it actually needs. The attention controller's row for
+# the same prompt (recorded_by:"attention-controller", no tool, no command)
+# does not count: counting it, as this did until 2026-09-29, ended the wait
+# before the hook's record existed. Bounded by
 # HERDR_SELECT_RECORD_WAIT_S (default 4, clamped 0..15, ~0.25s steps); no row
 # ever appearing (a hand-started session, an older omp build, a non-bash
 # prompt) falls through unchanged, after the wait, to the scraped-panel
@@ -272,7 +275,8 @@ wait_for_input_required_row() {
     n="$(_sql "SELECT count(*) FROM events
           WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id")
             AND type='input_required'
-            AND json_extract(payload,'\$.prompt_id')=$(_sq "$prompt_id");" 2>/dev/null)"
+            AND json_extract(payload,'\$.prompt_id')=$(_sq "$prompt_id")
+            AND COALESCE(json_extract(payload,'\$.recorded_by'),'')<>'attention-controller';" 2>/dev/null)"
     if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
       [ -n "${HERDR_SELECT_WAIT_TRACE:-}" ] && printf 'found\n' >> "$HERDR_SELECT_WAIT_TRACE"
       return 0

@@ -162,6 +162,10 @@ if [ -n "${HERDR_CONDUCTOR_PANE_ID:-}" ]; then
   _cn_pane="${HERDR_PANE_ID:-}"
   if [ -z "$_cn_pane" ] || attn_track_claim "$_cn_pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$(prompt_id "$_cn_pane" 2>/dev/null)"; then
     push_wake "$msg" "$where" >/dev/null 2>&1 || true
+  else
+    # Claim lost to the attention controller: record the hook's row anyway
+    # (lib/push-wake.sh record-only), no second wake.
+    push_wake "$msg" "$where" "" "" record-only >/dev/null 2>&1 || true
   fi
 fi
 

@@ -111,12 +111,17 @@ _pw_forced_wake_argv() {
 # "Allow tool: <X>" header does not equal this recorded value, and refuses
 # outright when it is empty (a hand-started session, an older omp build).
 #
+# mode "record-only" (5th arg): write this prompt's input_required row and
+# stop — no wake. A hook whose attn_track claim lost to the attention
+# controller (agent-hooks/omp-notify.sh) must still leave its tool and
+# corroborated command on the row, or herdr-select refuses every answer.
+#
 # Exit 0 when a wake was delivered AND confirmed submitted; 1 otherwise
-# (including "nothing to do"). Callers treat this as best-effort — a hook must
+# (including "nothing to do" and record-only). Callers treat this as best-effort — a hook must
 # never fail its agent because a peer could not be woken — but the exit status is
 # available for a caller that wants to retry.
 push_wake() {
-  local msg="$1" where="${2:-}" full_cmd="${3:-}" tool="${4:-}"
+  local msg="$1" where="${2:-}" full_cmd="${3:-}" tool="${4:-}" mode="${5:-}"
   local cpane="${HERDR_CONDUCTOR_PANE_ID:-}"
   # Persist the worker's state independently of notification delivery. A
   # scheduled worker can have no conductor; a stopped/recycled conductor
@@ -209,18 +214,34 @@ push_wake() {
   fi
   if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
     set_task_state "$HERDR_RUN_ID" "$HERDR_TASK_ID" "blocked" >/dev/null 2>&1 || true
+    local ir_payload
     if [ "$recorded_ok" = 0 ]; then
-      append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
-        "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg hint "$cmd_hint" --arg tool "$tool" \
-           '{message:$msg, prompt_id:$prompt_id, command:"", command_uncorroborated:true, command_hint:$hint, tool:$tool}')" \
-        "${base}_input" >/dev/null 2>&1 || true
+      ir_payload="$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg hint "$cmd_hint" --arg tool "$tool" \
+           '{message:$msg, prompt_id:$prompt_id, command:"", command_uncorroborated:true, command_hint:$hint, tool:$tool}')"
     else
-      append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
-        "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg cmd "$full_cmd" --arg tool "$tool" \
-           '{message:$msg, prompt_id:$prompt_id, command:$cmd, tool:$tool}')" \
-        "${base}_input" >/dev/null 2>&1 || true
+      ir_payload="$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg cmd "$full_cmd" --arg tool "$tool" \
+           '{message:$msg, prompt_id:$prompt_id, command:$cmd, tool:$tool}')"
+    fi
+    # The attention controller (attention-tick.sh) knows neither tool nor
+    # command; its row says so, so a hook's record can replace it below.
+    [ "$where" = attention-controller ] && ir_payload="$(printf '%s' "$ir_payload" | jq -c '.recorded_by="attention-controller"')"
+    append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" "$ir_payload" "${base}_input" >/dev/null 2>&1 || true
+    # One row per prompt, and the controller can win the INSERT OR IGNORE race
+    # against the hook's detached call. Measured 2026-09-29: 5 of 68 prompts
+    # lost their hook record that way, and herdr-select's #191 corroboration
+    # then refused every conductor/peer answer for them. So a hook's call
+    # REPLACES a controller-marked row for this exact prompt; a hook's own
+    # record is never replaced.
+    # Only a CORROBORATED record takes the row over (round-3 review): a hook
+    # for a different tool call that fingerprinted this prompt's panel fails
+    # corroboration, and must not replace the controller's row with its tool.
+    if [ "$where" != attention-controller ] && [ -n "$pid" ] && [ "$recorded_ok" = 1 ]; then
+      _sql "UPDATE events SET payload=$(_sq "$ir_payload")
+            WHERE event_id=$(_sq "${base}_input") AND type='input_required'
+              AND json_extract(payload,'\$.recorded_by')='attention-controller';" >/dev/null 2>&1 || true
     fi
   fi
+  [ "$mode" = record-only ] && return 1
   [ -n "$cpane" ] || return 1
 
   pane_is_agent "$cpane" || return 1
