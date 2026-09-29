@@ -4079,9 +4079,32 @@ EOF
   #     `--project live-site` slipped. Values may now be suffixed.
   #   * `\b` cannot match between `_` and `E`, so `VERCEL_ENV=production` and
   #     `MY_ENV=production` were missed. Any `*_ENV=` counts now.
-  _cp_imatch '(--(context|env|environment|profile|namespace|target|app|stage|remote|host|project|subscription|account|cluster|instance|database|db|region|org|space|site)([[:space:]]+|=)[^[:space:]]*(prod|production|live)|(^|[[:space:]])-[aeEpnc][[:space:]]+[^[:space:]]*(prod|production|live)[^[:space:]]*([[:space:]]|$)|(^|[[:space:]])[A-Za-z_]*(ENV|STAGE)=(prod|production|live)[^[:space:]]*([[:space:]]|$)|\b(ssh|scp|rsync|psql|mysql|redis-cli|mongosh|wrangler|vercel|netlify|fly|flyctl|heroku|gcloud|az|aws|doctl|eksctl|kubectl|helm|gh)\b[^;&|]*\b(prod|production|live)[a-z0-9-]*\b|\b(prod|production|live)[a-z0-9-]*\.[a-z0-9][a-z0-9.-]*\b)' "$_cp_prod_norm" &&
+  # ROUND 6 (2026-09-29): tourguide's report CODE lives in `ingest/produce/`,
+  # so `mkdir -p ingest/produce/shared`, `node -c ingest/produce/lib/x.js`
+  # escalated as "names a production target" (the `-p`/`-c` short-flag branch
+  # sees `\bprod` inside "produce"). A first fix required prod/live to END as
+  # a word; the security probe showed that silently allowed 19 real targets
+  # (`--context prod_us`, `ssh proddb`, `heroku -a myapp_prod`, `--env myprod`,
+  # `gcloud --project prodweb`, ...) because targets are routinely run-on or
+  # `_`-joined. So the regex below is origin/main's, unchanged, and instead a
+  # closed list of ordinary English words that merely START with prod/live is
+  # blanked first. "production" is deliberately not in the list.
+  _cp_prod_norm="$(printf '%s' "$_cp_prod_norm" | sed -E 's#(^|[^A-Za-z0-9_])([Pp]roduc(e|ed|er|ers|es|ing|t|ts|tive|tivity)|[Ll]iver|[Ll]ivery)([^A-Za-z0-9_]|$)#\1~\4#g')"
+  _cp_imatch '(--(context|env|environment|profile|namespace|target|app|stage|remote|host|project|subscription|account|cluster|instance|database|db|region|org|space|site)([[:space:]]+|=)[^[:space:]]*(prod|production|live)|(^|[[:space:]])-[aeEpnc][[:space:]]+[^[:space:]]*(prod|production|live)[^[:space:]]*([[:space:]]|$)|(^|[[:space:]])[A-Za-z_]*(ENV|STAGE)=[^[:space:]]*\b(prod|production|live)[^[:space:]]*([[:space:]]|$)|\b(ssh|scp|rsync|psql|mysql|redis-cli|mongosh|wrangler|vercel|netlify|fly|flyctl|heroku|gcloud|az|aws|doctl|eksctl|kubectl|helm|gh)\b[^;&|]*\b(prod|production|live)[a-z0-9-]*\b|\b(prod|production|live)[a-z0-9-]*\.[a-z0-9][a-z0-9.-]*\b)' "$_cp_prod_norm" &&
     _cp_consider 1 "names a production target"
-  _cp_imatch '\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(delete|drain|scale)\b|\bhelm[[:space:]]+(delete|uninstall)\b|\bflyctl?[[:space:]]+(deploy|destroy)\b' "$norm" &&
+  # ROUND 6b (2026-09-29, conductor): two real targets the red test showed
+  # passing as allow. `\b` never breaks inside SCREAMING_SNAKE, so an env-var
+  # reference like `$PROD_DATABASE_URL` / `${DB_PROD_URL}` slipped; and no
+  # branch covered a package-script name (`npm run deploy:prod`). Both need
+  # prod/production (live too, for vars) as a whole `_`/`:`/`-`-delimited
+  # token, so `$PRODUCT_ID` and `npm run produce` stay quiet.
+  _cp_imatch '\$\{?([a-z0-9]+_)*(prod|production|live)(_[a-z0-9]+)*\}?([^a-z0-9_]|$)|\b(npm|pnpm|yarn|bun)([[:space:]]+run)?[[:space:]]+([a-z0-9_-]*[:_-])?(prod|production)([:_-][a-z0-9:_-]*)?([[:space:]]|$)' "$_cp_prod_norm" &&
+    _cp_consider 1 "names a production target"
+  # `flyctl?` is "flyct" + optional "l" (the `?` binds to the immediately
+  # preceding atom only) — it never matched bare `fly deploy`, only
+  # `flyct(l) deploy`. Found via the red test added alongside the
+  # production-target fix above (2026-09-29). `fly(ctl)?` matches both.
+  _cp_imatch '\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(delete|drain|scale)\b|\bhelm[[:space:]]+(delete|uninstall)\b|\bfly(ctl)?[[:space:]]+(deploy|destroy)\b' "$norm" &&
     _cp_consider 1 "infrastructure scope change"
 
   # escalate — #184: a bash command whose redirect/tee/cp/mv/install/ln/

@@ -414,6 +414,64 @@ check "ssh to a prod host"            "ssh prod 'systemctl restart api'"       e
 check "psql against live hostname"    "psql -h live.db.internal -d app -c 'select 1'" escalate
 check "NODE_ENV=production deploy"    "NODE_ENV=production npm run deploy"     escalate
 check "verifier with live target still escalates" "bash verify-herdr-live.sh --context live" escalate
+
+echo
+echo "== a path SEGMENT containing 'prod'/'live' as a substring is not a target =="
+# lib/command-policy.sh worker corpus, 2026-09-28/29 (tourguide worker w4K):
+# `ingest/produce/` is the report-production CODE directory inside the
+# worker's own worktree, not a production environment. The word "prod" only
+# happens to be a PREFIX of "produce"; none of these commands can touch a
+# live system.
+check "mkdir under a produce/ code dir"  "mkdir -p ingest/produce/shared/fonts ingest/produce/shared/fixtures" allow
+check "cp under a produce/ code dir"     "cp ingest/produce/fonts/Inter_400.woff2 ingest/produce/shared/fonts/Inter_variable.woff2" allow
+check "node -c under a produce/ code dir" "node -c ingest/produce/lib/anchor_map.js && echo OK" allow
+# A real target hiding behind the same flag shape must still escalate.
+check "short flag, real prod host"       "kubectl -n prod-payments delete pod api-5f6" escalate
+check "short flag, real prod suffix"     "psql -h prod-2.db.internal -c 'select 1'"   escalate
+# Security probe 2026-09-29: a first cut (prod must END as a word) allowed
+# every one of these. Run-on and `_`-joined target names are normal.
+check "context prod_us"                  "kubectl --context prod_us get pods"      escalate
+check "short flag prod_us"               "kubectl -p prod_us get pods"             escalate
+check "ENV=prod_eu"                      "ENV=prod_eu ./run"                       escalate
+check "APP_STAGE=prod_eu"                "APP_STAGE=prod_eu ./deploy.sh"           escalate
+check "wrangler --env prod_eu"           "wrangler deploy --env prod_eu"           escalate
+check "wrangler --env PROD_EU"           "wrangler deploy --env PROD_EU"           escalate
+check "wrangler --env myprod"            "wrangler deploy --env myprod"            escalate
+check "uppercase context PROD_US"        "KUBECTL --CONTEXT PROD_US GET PODS"      escalate
+check "quoted context prod_us"           "kubectl --context 'prod_us' get pods"    escalate
+check "gke context ending _prod"         "kubectl --context gke_p_us-central1_prod apply -f x.yaml" escalate
+check "gke context _prod-cluster"        "kubectl --context gke_p_us-central1_prod-cluster get secrets" escalate
+check "heroku -a prodapp"                "heroku run -a prodapp bash"              escalate
+check "heroku -a myapp_prod"             "heroku run -a myapp_prod bash"           escalate
+check "ssh proddb"                       "ssh proddb uptime"                       escalate
+check "ssh prodweb01"                    "ssh prodweb01 uptime"                    escalate
+check "ssh liveserver"                   "ssh liveserver uptime"                   escalate
+check "gcloud --project prod_web"        "gcloud --project prod_web compute instances delete api-1" escalate
+check "gcloud --project prodweb"         "gcloud --project prodweb compute instances delete api-1" escalate
+check "az --subscription prod_main"      "az vm delete --subscription prod_main --name web-01" escalate
+check "product word under a -p flag"     "mkdir -p src/products/list"              allow
+# Security review round 2: an ENV/STAGE value names prod ANYWHERE, not only
+# at its start. main caught `product-prod` only by accident (the word
+# "product" starts with "prod") and never caught `staging-prod`.
+check "ENV value product-prod"           "APP_ENV=product-prod ./deploy.sh"        escalate
+check "STAGE value producer-live"        "STAGE=producer-live ./deploy.sh"         escalate
+check "ENV value products/prod"          "DEPLOY_ENV=products/prod ./deploy.sh"    escalate
+check "ENV value Product-prod"           "NODE_ENV=Product-prod node server.js"    escalate
+check "ENV value staging-prod (main gap)" "APP_ENV=staging-prod ./deploy.sh"       escalate
+check "ENV value names no prod"          "APP_ENV=product-staging ./deploy.sh"     allow
+
+echo
+echo "== more realistic production-target shapes, not just the pinned ones =="
+check "fly deploy, no flags"             "fly deploy"                              escalate
+check "wrangler deploy --env production, realistic" "wrangler deploy --env production --dry-run=false" escalate
+# ROUND 6b: env-var references and package-script names (were allow).
+check "psql against a PROD env var"      "psql \$PROD_DATABASE_URL -c 'select 1'"  escalate
+check "braced env var, prod mid-name"    "psql \${DB_PROD_URL} -c 'select 1'"      escalate
+check "npm run deploy:prod script"       "npm run deploy:prod"                    escalate
+check "pnpm prod-suffixed script"        "pnpm run release-production"            escalate
+check "PRODUCT env var is not prod"      "echo \$PRODUCT_ID"                       allow
+check "npm script named produce"         "npm run produce"                        allow
+check "npm script prod-less deploy name" "npm run build:preview"                  allow
 check "reads SSH private key"        "cat ~/.ssh/id_ed25519"                  escalate
 check "reads AWS credentials file"   "cat ~/.aws/credentials"                 escalate
 check "reads .env"                   "cat .env"                               escalate
