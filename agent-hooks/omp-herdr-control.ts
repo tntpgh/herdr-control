@@ -893,9 +893,47 @@ function cacheBashInput(event: unknown): void {
   }
 }
 
+// ---- read-only child enforcement ---------------------------------------------
+// lib/pretool-registration.sh lets a parent spawn native `task` children only
+// when every child is `scout` or `security-reviewer`. The PARENT cannot make
+// that safe: omp resolves agent names from many roots (project/user `.omp`,
+// extension packages, plugins, marketplace), any of which can redefine
+// `scout` with bash, and even the genuine bundled agents also receive
+// extension tools (notepad_append, retain), manage_skill, learn and MCP
+// proxies, all under a forced `yolo` approval mode (herdr-control #203
+// review, findings 1-5). So the guarantee lives HERE, in the child: this
+// extension is rebound into every subagent session, and a session running as
+// either name may call only this read allowlist, whatever its definition says.
+const READONLY_CHILD_AGENTS: Record<string, true> = { scout: true, "security-reviewer": true };
+const READONLY_CHILD_TOOLS: Record<string, true> = {
+  read: true, find: true, grep: true, glob: true, web_search: true, yield: true, ast_grep: true,
+};
+// lsp rename/rename_file/code_actions/request/reload can edit files; these cannot.
+const READONLY_LSP_ACTIONS: Record<string, true> = {
+  diagnostics: true, definition: true, references: true, hover: true, symbols: true,
+  type_definition: true, implementation: true, status: true, capabilities: true,
+};
+
+function readOnlyChildBlock(event: unknown, ctx?: unknown): Block | undefined {
+  const agent = (ctx as { agent?: { kind?: unknown; name?: unknown } } | undefined)?.agent;
+  if (!agent || agent.kind !== "sub" || typeof agent.name !== "string") return undefined;
+  if (!Object.hasOwn(READONLY_CHILD_AGENTS, agent.name.toLowerCase())) return undefined;
+  const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+  const tool = typeof e.toolName === "string" ? e.toolName : "";
+  if (Object.hasOwn(READONLY_CHILD_TOOLS, tool)) return undefined;
+  if (tool === "lsp") {
+    const input = e.input && typeof e.input === "object" ? (e.input as Record<string, unknown>) : {};
+    if (typeof input.action === "string" && Object.hasOwn(READONLY_LSP_ACTIONS, input.action)) return undefined;
+  }
+  return {
+    block: true,
+    reason: `herdr: '${agent.name}' subagents are read-only; '${tool}' is not on their tool allowlist (report findings to the parent instead)`,
+  };
+}
+
 function onToolCall(event: unknown, ctx?: unknown): Block | undefined {
   cacheBashInput(event);
-  const result = pretoolRegistrationBlock(event) ?? workerWriteScopeBlock(event, ctx);
+  const result = readOnlyChildBlock(event, ctx) ?? pretoolRegistrationBlock(event) ?? workerWriteScopeBlock(event, ctx);
   if (result || !hookApprovalEnforced()) {
     recordShadowVerdict(event, ctx, result);
     return result;

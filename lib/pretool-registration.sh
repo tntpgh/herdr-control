@@ -51,38 +51,37 @@ case "$xd_dev" in
     exit 0 ;;
 esac
 
-# The native `task` tool is exempt ONLY when every child is a bundled agent
-# whose tool list cannot mutate anything: no bash, write, edit, eval or
-# task (verified 2026-09-29 via `omp agents unpack`):
-#   scout              read find grep glob web_search yield
-#   security-reviewer  read find grep glob lsp ast_grep yield
-# Such a child cannot create a worktree, pane, commit or file, so there is
-# nothing for the registry to track; its only output is a report to the
-# parent. `reviewer` is NOT here — it has bash. Before this, a 60s review
-# needed a full spawn-task worktree + tab (2026-09-29, one hour lost).
-# Refused, so the exemption cannot be widened from the call site:
-#   * a child with no agent (defaults to `task`, which has every tool);
-#   * any `tools` entry (eval-defined tools run in the PARENT kernel);
-#   * a same-named agent file in the user or project agent dirs, which
-#     would shadow the bundled definition with a different tool list.
+# The native `task` tool is exempt ONLY for a batch whose every child is
+# `scout` or `security-reviewer`. The REAL guarantee is not here: omp can
+# resolve those names to any definition (project/user .omp, extension
+# packages, plugins), and even the bundled ones get extension tools, skills,
+# memory writes and MCP proxies under a forced `yolo` approval mode (#203
+# review). agent-hooks/omp-herdr-control.ts readOnlyChildBlock() runs INSIDE
+# each child and refuses every tool but a read allowlist for a session
+# running as either name. This check only keeps the parent's request to that
+# shape, strictly, so nothing else rides along:
+#   * top-level keys ⊆ {context, tasks}; per-child keys ⊆ {name, agent, task,
+#     solutionSpace, outputSchema, schemaMode, effort} — no `tools` (eval
+#     tools run in the PARENT kernel), no `isolated`, no `cwd`;
+#   * `agent` exactly "scout" or "security-reviewer" (an omitted agent
+#     defaults to `task`, which has every tool);
+#   * input under 1 MiB, parsed by jq; anything else is refused.
+# `reviewer` is NOT exempt — it has bash. Before this, a 60s read-only
+# review needed a full spawn-task worktree + tab (2026-09-29, one hour lost).
 readonly_task_batch() {
-  local input="$1" dir top name
-  [ -n "$input" ] || return 1
+  local input="$1"
+  [ -n "$input" ] && [ "${#input}" -lt 1048576 ] || return 1
   printf '%s' "$input" | /usr/bin/jq -e '
-    (.tasks | type == "array" and length > 0)
-    and all(.tasks[]; (.agent == "scout" or .agent == "security-reviewer")
-                      and ((.tools // []) | length == 0))
-    and ((.tools // []) | length == 0)' >/dev/null 2>&1 || return 1
-  top=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$cwd")
-  for name in scout security-reviewer; do
-    for dir in "$HOME/.omp/agent/agents" "$HOME/.claude/agents" "$cwd/.omp/agents" "$top/.omp/agents" "$cwd/.claude/agents" "$top/.claude/agents"; do
-      [ -e "$dir/$name.md" ] && return 1
-    done
-  done
-  return 0
+    type == "object"
+    and (keys - ["context", "tasks"] | length == 0)
+    and (.tasks | type == "array" and length > 0)
+    and all(.tasks[];
+      type == "object"
+      and (keys - ["name", "agent", "task", "solutionSpace", "outputSchema", "schemaMode", "effort"] | length == 0)
+      and (.agent == "scout" or .agent == "security-reviewer"))' >/dev/null 2>&1
 }
 if [ "$tool_norm" = task ] && [ ! -t 0 ]; then
-  readonly_task_batch "$(cat)" && exit 0
+  readonly_task_batch "$(head -c 1048576)" && exit 0
 fi
 case "$tool_norm" in
   taskoutput|taskstop|taskget|tasklist|cronlist|bashoutput|killshell|taskupdate) exit 0 ;;
