@@ -724,6 +724,22 @@ done
 
 set_task_state "$run_id" "$task_id" "running"
 
+# --brief used to stop at writing SPEC.md: the worker booted to an empty
+# composer and idled, while the conductor waited on a completion event that
+# could never come (2026-09-29, thurber-os #84 review: one hour lost; 60s once
+# prompted by hand). Deliver the kickoff here, after the agent's composer has
+# painted, via send-to-agent.sh so the submit is confirmed, not assumed.
+kickoff_note="none (no --brief; send the first prompt yourself)"
+if [ -n "$brief_file" ] && [ "$managed" = 1 ]; then
+  kickoff_msg="Your task brief is .handoffs/SPEC.md in this worktree — read it and execute it to Done. Your ids are in .handoffs/identity.json; when finished, append its completion_event to .handoffs/events.jsonl."
+  if herdr pane wait-output "$pane" --regex 'Model scope|to change thinking effort' --timeout 60000 >/dev/null 2>&1 \
+     && bash "$here/send-to-agent.sh" "$pane" "$kickoff_msg" >/dev/null 2>&1; then
+    kickoff_note="SENT (points the worker at .handoffs/SPEC.md)"
+  else
+    kickoff_note="⚠ NOT DELIVERED — the worker is idle. Send it yourself: bash $here/send-to-agent.sh $pane \"$kickoff_msg\""
+  fi
+fi
+
 bgtag="background"; [ "$foc" = --focus ] && bgtag="focused"
 printf 'spawned %-22s ws=%s tab=%s pane=%s  [%s]\n' "$label" "$ws" "$tab" "$pane" "$bgtag"
 printf '  worktree: %s\n  launch:   %s\n' "$wt" "$cli"
@@ -740,6 +756,7 @@ else
   printf '    only the env floor stamp reaches it; nothing here enforces approvals.\n'
 fi
 printf '  secrets:  %s\n' "$secrets_note"
+printf '  kickoff:  %s\n' "$kickoff_note"
 printf '  wake:     %s %s '"'"'%s'"'"'\n' "$here/wake-on-evidence.sh" "$events_file" "$wake_pattern"
 printf '            ^ run BACKGROUNDED (run_in_background/async:true) — a blocking\n'
 printf '              foreground call strands you idle until re-prompted by hand\n'
