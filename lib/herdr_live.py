@@ -234,6 +234,7 @@ class LiveState:
         self._cwd: dict[str, str] = {}
         self._workspaces: dict[str, str] = {}    # workspace_id -> label
         self._subscribe_failures = 0
+        self._lost_streak = 0  # consecutive events_lost; reset by a delivered event
         self._edges: queue.Queue = queue.Queue(maxsize=1024)
         self._stop = threading.Event()
         self.stats = {
@@ -248,6 +249,9 @@ class LiveState:
             # up as "stream lost", so every quiet period became a reconnect and
             # the safety net for a silently dead stream never once ran.
             "resyncs": 0,
+            # herdr >= 0.9.2 closes a subscription that fell behind its shared
+            # event history (herdr#4225); each one is a resubscribe, not an outage.
+            "events_lost": 0,
             "events": 0,
             "edges": 0,
             "edges_dropped": 0,
@@ -571,6 +575,30 @@ class LiveState:
         subs += [{"type": "pane.agent_status_changed", "pane_id": pid} for pid in known]
         return subs, set(known)
 
+    def _events_lost(self, msg: dict | None) -> bool:
+        """True when herdr dropped this subscription for falling behind.
+
+        herdr >= 0.9.2 answers with the subscribe request's id and
+        `error.code: "events_lost"`, then closes the connection — during setup
+        (as the ack) or mid-stream. The documented recovery is exactly our
+        connect path: subscribe again, then replace the cache from
+        `session.snapshot`, whose diff emits every edge the gap swallowed. So
+        the caller returns True (resubscribe): no backoff, and no connected
+        flip. Before this, a mid-stream one was skipped as a stray reply and
+        the EOF behind it — or a setup-time one, raised as "subscribe not
+        acknowledged" — reached the stream-lost handler, which pages a herdr
+        outage (hub-connection-alert.sh) for what is a slow reader.
+        """
+        err = (msg or {}).get("error") or {}
+        if err.get("code") != "events_lost":
+            return False
+        with self._lock:
+            self.stats["events_lost"] += 1
+            n = self.stats["events_lost"]
+            self._lost_streak += 1
+        self._log(f"herdr dropped the subscription (events_lost #{n}: {err.get('message')}); resubscribing")
+        return True
+
     def _subscribe_rejected(self, ack: dict | None) -> bool:
         """True when this rejection is recoverable and we should retry NOW.
 
@@ -625,7 +653,7 @@ class LiveState:
                        "params": {"subscriptions": subs}})
             ack = wire.read(timeout=5.0)
             if not ack or "result" not in ack:
-                if self._subscribe_rejected(ack):
+                if self._events_lost(ack) or self._subscribe_rejected(ack):
                     return True
                 raise ConnectionError(f"subscribe not acknowledged: {ack!r}")
             # NOT reset on a degraded ack. Clearing the counter here made the
@@ -676,10 +704,13 @@ class LiveState:
                 if msg is None:
                     continue
                 if "result" in msg or "error" in msg:
+                    if self._events_lost(msg):
+                        return True
                     continue
                 with self._lock:
                     self.stats["events"] += 1
                     self.stats["last_event_at"] = time.time()
+                    self._lost_streak = 0
                 self._emit(self._apply_event(msg))
                 if msg.get("event") in ("pane_created", "pane_agent_detected"):
                     return True
@@ -701,6 +732,16 @@ class LiveState:
                 backoff = 0.5
                 with self._lock:
                     self.stats["resubscribes" if resubscribe else "reconnects"] += 1
+                    streak = self._lost_streak
+                # A reader that STAYS behind gets events_lost again after every
+                # full snapshot; each cycle outlasts 0.25s, so the rapid-cycle
+                # floor below never engages. Back off per consecutive loss
+                # (reset by any delivered event) so a slow hub sheds load
+                # instead of adding a snapshot per loop.
+                if streak >= 2:
+                    pause = min(0.5 * 2 ** (streak - 2), self._max_backoff_s)
+                    self._log(f"events_lost {streak}x in a row; pausing {pause:.1f}s before resubscribing")
+                    self._stop.wait(pause)
                 # A FLOOR on the resubscribe path. It is deliberately not a
                 # failure (a new pane legitimately needs a wider subscription),
                 # so it does not back off — which means any bug that returns
