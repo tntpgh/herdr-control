@@ -1820,6 +1820,57 @@ for _f4i in 1 2 3 4 5 6 7 8 9 10; do
 done
 check_wt "bash -c nested past the depth cap fails closed, not silently allowed (#192 round 3 F4)" \
   "$WT_184" "$_f4cmd" escalate
+
+# herdr-control#192 round 4 — generalized value-flag recognizer (glued
+# short flags, cluster-tail short flags, `--` end-of-options) routed
+# through every table below; plus a GNU-vs-BSD `install` divergence and a
+# shared depth cap for find/xargs/parallel wrapping.
+check_wt "gcp -tDIR (glued short target flag) still finds the real dest (#192 round 4 G1)" \
+  "$WT_184" "gcp -t/outside file.txt" escalate
+check_wt "gmv -tDIR (glued short target flag) still finds the real dest (#192 round 4 G1)" \
+  "$WT_184" "gmv -t/outside file.txt" escalate
+check_wt "gln -tDIR (glued short target flag) still finds the real dest (#192 round 4 G1)" \
+  "$WT_184" "gln -t/outside file.txt" escalate
+check_wt "ginstall -tDIR (glued short target flag) still finds the real dest (#192 round 4 G1)" \
+  "$WT_184" "ginstall -t/outside file.txt" escalate
+check_wt "cp -t DIR (space form) still escalates after the generic-helper refactor" \
+  "$WT_184" "cp -t /outside file.txt" escalate
+check_wt "ginstall -T TAG (GNU: boolean, no value) doesn't swallow the real dest (#192 round 4 G2)" \
+  "$WT_184" "ginstall -T src.txt /outside/dest" escalate
+check_wt "ginstall -D (GNU: boolean, no value) doesn't swallow the real dest (#192 round 4 G2)" \
+  "$WT_184" "ginstall -D src.txt /outside/dest" escalate
+check_wt "install -T TAG (BSD: value-taking) still finds the real dest, unchanged (#192 round 4 G2)" \
+  "$WT_184" "install -T tagname src.txt /outside/dest" escalate
+check_wt "cp -- protects a real dash-prefixed dest from being read as a flag (#192 round 4 G3)" \
+  "$WT_184" "cp -- src.txt /outside/-dashdest-cp" escalate
+check_wt "mv -- protects a real dash-prefixed dest from being read as a flag (#192 round 4 G3)" \
+  "$WT_184" "mv -- src.txt /outside/-dashdest-mv" escalate
+check_wt "install -- protects a real dash-prefixed dest from being read as a flag (#192 round 4 G3)" \
+  "$WT_184" "install -- src.txt /outside/-dashdest-install" escalate
+check_wt "rsync -a -- protects a real dash-prefixed dest from being read as a flag (#192 round 4 G3)" \
+  "$WT_184" "rsync -a -- src.txt /outside/-dashdest-rsync" escalate
+check_wt "scp -- protects a real dash-prefixed dest from being read as a flag (#192 round 4 G3)" \
+  "$WT_184" "scp -- src.txt /outside/-dashdest-scp" escalate
+check_wt "git clone --depth=1 (glued long form) still finds the real dest, unchanged" \
+  "$WT_184" "git clone --depth=1 file:///tmp/r.git /outside/clone-depth-eq" escalate
+check_wt "rsync -aTDIR (glued temp-dir short opt) still finds the real dest (#192 round 4 G4)" \
+  "$WT_184" "rsync -aT/outside file.txt file2.txt" escalate
+check_wt "curl -oFILE (glued short output flag) still finds the real dest (#192 round 4 G5)" \
+  "$WT_184" "curl -o/outside/g5-out http://example.com/f" escalate
+check_wt "wget -OFILE (glued short output flag) still finds the real dest (#192 round 4 G5)" \
+  "$WT_184" "wget -O/outside/g5w-out http://example.com/f" escalate
+check_wt "install dest then glued -m644 trailing doesn't defeat last-nonopt (#192 round 4 sanity)" \
+  "$WT_184" "install s1.txt /outside/s1-dest.txt -m644" escalate
+check_wt "tar -CDIR (glued directory, extraction) still finds the real dest (#192 round 4 static 2-4)" \
+  "$WT_184" "tar -x -C/outside -f a.tar" escalate
+check_wt "tar -fFILE (glued file, creation) still finds the real dest (#192 round 4 static 2-4)" \
+  "$WT_184" "tar -c -f/outside/out.tar ." escalate
+_f5cmd="touch /outside/deep5.txt"
+for _f5i in 1 2 3 4 5 6 7 8 9 10; do
+  _f5cmd="find . -maxdepth 0 -exec $_f5cmd \;"
+done
+check_wt "find -exec nested past the depth cap fails closed, not silently allowed (#192 round 4 static 5)" \
+  "$WT_184" "$_f5cmd" escalate
 check "bash write-scope rule is a no-op with no worktree context" \
   "cat f >> /outside" allow
 

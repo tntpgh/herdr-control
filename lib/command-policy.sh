@@ -3011,6 +3011,17 @@ _cp_bwt_inplace_targets() {
 # verb would get.
 _cp_bwt_dispatch_wrapped() {
   local cwd="$1" verb="$2"; shift 2
+  # herdr-control#192 round 4, static finding 5: shares `_cp_bwt_depth`
+  # with `bash_write_targets`'s own cap (bash's dynamic scoping means this
+  # `local` sees whatever the caller already incremented) — a
+  # `find -exec find -exec find -exec ...` chain recurses entirely through
+  # THIS function without ever re-entering `bash_write_targets`, so it was
+  # previously uncapped even after the bash -c depth cap landed.
+  local _cp_bwt_depth="$(( ${_cp_bwt_depth:-0} + 1 ))"
+  if [ "$_cp_bwt_depth" -gt 8 ]; then
+    printf 'COMPUTED\t%s\n' "wrapped-command nesting is too deep for this scanner to follow safely"
+    return 0
+  fi
   case "$verb" in
     *'@SUB@'*|*'$'*|*'*'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*)
       printf 'COMPUTED\t%s\n' "a wrapped command whose name cannot be read statically" ;;
@@ -3018,9 +3029,99 @@ _cp_bwt_dispatch_wrapped() {
       _cp_bwt_verb_targets "$verb" "$cwd" ${1+"$@"} ;;
   esac
 }
+# _cp_bwt_scan_optvals <short-skip-letters> <short-target-letters>
+# <long-skip-names> <long-target-names> <argv...> -> herdr-control#192
+# round 4 (G1/G3/G4/G5): the ONE shared recognizer every value-taking-flag
+# table below is routed through, replacing what used to be a separate,
+# slightly different ad hoc loop per verb. Recognizes, for a short flag
+# named in <short-skip-letters>/<short-target-letters>, all three shapes
+# real getopt parsing accepts: bare with a following argv word (`-t DIR`),
+# glued (`-tDIR`), and as the LAST letter of an otherwise-boolean cluster
+# (`-vt DIR`, `-avtDIR`) — every letter before the matched one in a
+# cluster is left alone as an inert boolean, same as this file's other
+# `-*)` catch-alls. For a long flag named in <long-skip-names>/
+# <long-target-names>, both `--flag VALUE` and `--flag=VALUE`. `--` ends
+# option processing: every token after it is a positional even if it
+# starts with `-` (round 4, G3 — a real dash-prefixed filename protected
+# by `--` was previously swallowed as an unrecognized flag instead of
+# counted). A "skip" flag's value is consumed and discarded; a "target"
+# flag's value is itself a write destination, classified directly.
+# Populates two globals: `_CP_BWT_NONOPT` (every genuine positional, in
+# order — flags, their values, and `--` itself excluded) and
+# `_CP_BWT_TGT_HIT` (1 if any target flag fired, so a caller whose
+# destination is EITHER an explicit target flag OR the last positional —
+# never both — knows to skip the positional fallback).
+_cp_bwt_scan_optvals() {
+  local shortskip="$1" shorttgt="$2" longskip="$3" longtgt="$4"; shift 4
+  _CP_BWT_NONOPT=()
+  _CP_BWT_TGT_HIT=0
+  local -a a=("$@")
+  local i=0 n="${#a[@]}" tok endopts=0 lname lval w j len ch val handled
+  while [ "$i" -lt "$n" ]; do
+    tok="${a[$i]}"
+    if [ "$endopts" = 1 ]; then
+      _CP_BWT_NONOPT+=("$tok"); i=$((i + 1)); continue
+    fi
+    case "$tok" in
+      --) endopts=1; i=$((i + 1)); continue ;;
+      --*)
+        lname="${tok#--}"
+        case "$lname" in
+          *=*)
+            lval="${lname#*=}"; lname="${lname%%=*}"
+            for w in $longtgt; do
+              [ "$lname" = "$w" ] && { _cp_bwt_classify_target "$lval"; _CP_BWT_TGT_HIT=1; }
+            done ;;
+          *)
+            handled=0
+            for w in $longtgt; do
+              if [ "$lname" = "$w" ]; then
+                _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 1))
+                _CP_BWT_TGT_HIT=1; handled=1
+              fi
+            done
+            if [ "$handled" = 0 ]; then
+              for w in $longskip; do
+                [ "$lname" = "$w" ] && i=$((i + 1))
+              done
+            fi ;;
+        esac
+        i=$((i + 1)); continue ;;
+      -?*)
+        j=1; len=${#tok}; handled=0
+        while [ "$j" -lt "$len" ]; do
+          ch="${tok:$j:1}"
+          case "$shorttgt" in
+            *"$ch"*)
+              val="${tok:$((j + 1))}"
+              if [ -n "$val" ]; then _cp_bwt_classify_target "$val"
+              else _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 1))
+              fi
+              _CP_BWT_TGT_HIT=1; handled=1; break ;;
+          esac
+          case "$shortskip" in
+            *"$ch"*)
+              val="${tok:$((j + 1))}"
+              [ -z "$val" ] && i=$((i + 1))
+              handled=1; break ;;
+          esac
+          j=$((j + 1))
+        done
+        i=$((i + 1)); continue ;;
+      *)
+        _CP_BWT_NONOPT+=("$tok"); i=$((i + 1)); continue ;;
+    esac
+  done
+}
+
 
 _cp_bwt_verb_targets() {
   local cmd="$1" cwd="$2"; shift 2
+  # herdr-control#192 round 4, G2: captured BEFORE the g-prefix strip below
+  # so the `install` case can tell `ginstall` (GNU semantics: `-T`/`-D`
+  # boolean) from bare `install` (BSD/macOS on this box: `-T`/`-D` take a
+  # value) apart.
+  local _cp_bwt_orig_cmd="$cmd"
   # herdr-control#192 round 3, F3: Homebrew installs GNU coreutils under a
   # `g`-prefixed name (`gcp`, `gmv`, …) so they don't shadow the BSD
   # originals on PATH — an unwrapped `gcp src /outside/dest` matched no
@@ -3042,107 +3143,49 @@ _cp_bwt_verb_targets() {
         esac
       done ;;
     cp|mv|ln)
-      # herdr-control#192 round 3, F2: `-S`/`--suffix` (backup suffix)
-      # takes a SEPARATE value token too — skip it the same way `-t` is,
-      # or that value gets miscounted as the real last-positional dest.
-      local -a nonopt=()
-      local a prev="" tflag=""
-      for a in "$@"; do
-        if [ -n "$prev" ]; then
-          [ "$prev" = target ] && tflag="$a"
-          prev=""; continue
-        fi
-        case "$a" in
-          -t|--target-directory) prev=target ;;
-          --target-directory=*) tflag="${a#*=}" ;;
-          -S|--suffix) prev=skip ;;
-          --suffix=*) ;;
-          -*) ;;
-          *) nonopt+=("$a") ;;
-        esac
-      done
-      if [ -n "$tflag" ]; then
-        _cp_bwt_classify_target "$tflag"
-      elif [ "${#nonopt[@]}" -ge 2 ]; then
-        _cp_bwt_classify_target "${nonopt[$((${#nonopt[@]} - 1))]}"
+      # herdr-control#192 round 4, G1/G3: routed through the shared
+      # recognizer (glued `-tDIR`, `--` end-of-options).
+      _cp_bwt_scan_optvals "S" "t" "suffix" "target-directory" "$@"
+      if [ "$_CP_BWT_TGT_HIT" != 1 ] && [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ]; then
+        _cp_bwt_classify_target "${_CP_BWT_NONOPT[$((${#_CP_BWT_NONOPT[@]} - 1))]}"
       fi ;;
     install)
-      # herdr-control#192 round 3, F2: BSD/macOS and GNU `install` both
-      # have several value-taking flags that can appear AFTER the real
-      # destination (live-confirmed: `install src dest -m 644`) — skip
-      # each one's value or it gets misread as the real target.
-      local -a nonopt=()
-      local a prev="" tflag=""
-      for a in "$@"; do
-        if [ -n "$prev" ]; then
-          [ "$prev" = target ] && tflag="$a"
-          prev=""; continue
-        fi
-        case "$a" in
-          -t|--target-directory) prev=target ;;
-          --target-directory=*) tflag="${a#*=}" ;;
-          -m|-o|-g|-f|-M|-D|-h|-T|-B|-N|-l|-S) prev=skip ;;
-          --suffix=*|--strip-program=*) ;;
-          -*) ;;
-          *) nonopt+=("$a") ;;
-        esac
-      done
-      if [ -n "$tflag" ]; then
-        _cp_bwt_classify_target "$tflag"
-      elif [ "${#nonopt[@]}" -ge 2 ]; then
-        _cp_bwt_classify_target "${nonopt[$((${#nonopt[@]} - 1))]}"
+      # herdr-control#192 round 4, G1/G2/G3: routed through the shared
+      # recognizer. GNU install's `-T`/`-D` are BOOLEAN (no value) —
+      # BSD/macOS's DO take one — live-confirmed the shared value-skip
+      # list wrongly swallowed the real `src` positional as `-T`'s/`-D`'s
+      # value on GNU. Resolved by the ORIGINAL (pre-g-normalization)
+      # command name: `ginstall` unambiguously means GNU semantics;
+      # anything else (bare `install` on this box) means BSD.
+      case "$_cp_bwt_orig_cmd" in
+        ginstall)
+          _cp_bwt_scan_optvals "mogfMhBNlS" "t" "suffix strip-program" "target-directory" "$@" ;;
+        *)
+          _cp_bwt_scan_optvals "mogfMhBNlSTD" "t" "suffix strip-program" "target-directory" "$@" ;;
+      esac
+      if [ "$_CP_BWT_TGT_HIT" != 1 ] && [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ]; then
+        _cp_bwt_classify_target "${_CP_BWT_NONOPT[$((${#_CP_BWT_NONOPT[@]} - 1))]}"
       fi ;;
     rsync)
-      # herdr-control#192 round 2/3, bypass E/F2: last non-option argument
-      # is the destination — but NOT the same case as cp/mv/ln above
-      # (rsync's own `-t` means "preserve times", a bare boolean, not
-      # cp's "-t DIR"). Round 3 live-confirmed the naive "skip anything
-      # starting with -" filter is defeated by any value-taking flag
-      # placed AFTER the real destination (`--timeout 30`, `--exclude
-      # foo`, both very common real invocations) — its SEPARATE value
-      # token got miscounted as the last positional instead. A few flags
-      # name a write destination of their OWN, not just the transfer
-      # destination — classified in addition to whatever `nonopt` finds.
-      local -a nonopt=()
-      local a pending=""
-      for a in "$@"; do
-        if [ -n "$pending" ]; then
-          [ "$pending" = target ] && _cp_bwt_classify_target "$a"
-          pending=""; continue
-        fi
-        case "$a" in
-          -T|--temp-dir|--log-file|--backup-dir|--partial-dir) pending=target ;;
-          --temp-dir=*|--log-file=*|--backup-dir=*|--partial-dir=*)
-            _cp_bwt_classify_target "${a#*=}" ;;
-          -e|--rsh|--timeout|--exclude|--exclude-from|--include|--include-from|\
-          --filter|--files-from|--port|--password-file|--bwlimit|--min-size|\
-          --max-size|--modify-window|--compress-level|--checksum-seed|--outbuf|\
-          --contimeout|--address|--sockopts|--out-format|--stop-after|--stop-at)
-            pending=skip ;;
-          --rsh=*|--timeout=*|--exclude=*|--exclude-from=*|--include=*|\
-          --include-from=*|--filter=*|--files-from=*|--port=*|\
-          --password-file=*|--bwlimit=*) ;;
-          -*) ;;
-          *) nonopt+=("$a") ;;
-        esac
-      done
-      [ "${#nonopt[@]}" -ge 2 ] && _cp_bwt_classify_target "${nonopt[$((${#nonopt[@]} - 1))]}" ;;
+      # herdr-control#192 round 2/3/4, bypass E/F2/G1/G3/G4: last non-
+      # option argument is the destination — but NOT the same case as
+      # cp/mv/ln above (rsync's own `-t` means "preserve times", a bare
+      # boolean, not cp's "-t DIR"). `-T`/`--temp-dir`/`--log-file`/
+      # `--backup-dir`/`--partial-dir` each name a write destination of
+      # their OWN, not just the transfer destination — classified in
+      # addition to whatever the positional scan finds.
+      _cp_bwt_scan_optvals "e" "T" \
+        "rsh timeout exclude exclude-from include include-from filter files-from port password-file bwlimit min-size max-size modify-window compress-level checksum-seed outbuf contimeout address sockopts out-format stop-after stop-at" \
+        "temp-dir log-file backup-dir partial-dir" "$@"
+      [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ] && _cp_bwt_classify_target "${_CP_BWT_NONOPT[$((${#_CP_BWT_NONOPT[@]} - 1))]}" ;;
     scp)
-      # herdr-control#192 round 3, F2: same last-nonopt shape as rsync,
-      # but scp's own value-taking flags are a different, smaller set —
-      # none of them name a write destination of their own (identity
-      # file/config/cipher/jump-host are all READ paths or settings).
-      local -a nonopt=()
-      local a wantval=0
-      for a in "$@"; do
-        if [ "$wantval" = 1 ]; then wantval=0; continue; fi
-        case "$a" in
-          -P|-i|-o|-F|-c|-J|-l|-S) wantval=1 ;;
-          -*) ;;
-          *) nonopt+=("$a") ;;
-        esac
-      done
-      [ "${#nonopt[@]}" -ge 2 ] && _cp_bwt_classify_target "${nonopt[$((${#nonopt[@]} - 1))]}" ;;
+      # herdr-control#192 round 3/4, F2/G3: same last-nonopt shape as
+      # rsync, but scp's own value-taking flags are a different, smaller
+      # set — none of them name a write destination of their own
+      # (identity file/config/cipher/jump-host are all READ paths or
+      # settings).
+      _cp_bwt_scan_optvals "PiFcJlSo" "" "" "" "$@"
+      [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ] && _cp_bwt_classify_target "${_CP_BWT_NONOPT[$((${#_CP_BWT_NONOPT[@]} - 1))]}" ;;
     dd)
       local a
       for a in "$@"; do
@@ -3171,74 +3214,29 @@ _cp_bwt_verb_targets() {
         esac
       done ;;
     unzip)
-      local -a a=("$@")
-      local i=0 n="${#a[@]}"
-      while [ "$i" -lt "$n" ]; do
-        case "${a[$i]}" in
-          -d) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
-          *) i=$((i + 1)) ;;
-        esac
-      done ;;
+      _cp_bwt_scan_optvals "" "d" "" "" "$@" ;;
     sort)
-      local -a a=("$@")
-      local i=0 n="${#a[@]}"
-      while [ "$i" -lt "$n" ]; do
-        case "${a[$i]}" in
-          -o|--output) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
-          --output=*) _cp_bwt_classify_target "${a[$i]#*=}"; i=$((i + 1)) ;;
-          *) i=$((i + 1)) ;;
-        esac
-      done ;;
+      _cp_bwt_scan_optvals "" "o" "" "output" "$@" ;;
     split)
       # the trailing PREFIX positional (the one AFTER the input file); a
       # bare `split FILE` with no explicit prefix defaults to `x` in cwd —
-      # left alone, same "no visible target" ceiling as a bare `dd`. `-a`/
-      # `-b`/`-C`/`-l`/`-n`/`-t` each take a SEPARATE value token — skip
-      # both, or that value (e.g. `-b`'s byte count) gets miscounted as a
-      # positional and shifts which operand is really the prefix.
-      local -a a=("$@") nonopt=()
-      local i=0 n="${#a[@]}"
-      while [ "$i" -lt "$n" ]; do
-        case "${a[$i]}" in
-          -a|-b|-C|-l|-n|-t) i=$((i + 2)) ;;
-          -*) i=$((i + 1)) ;;
-          *) nonopt+=("${a[$i]}"); i=$((i + 1)) ;;
-        esac
-      done
-      [ "${#nonopt[@]}" -ge 2 ] && _cp_bwt_classify_target "${nonopt[1]}" ;;
+      # left alone, same "no visible target" ceiling as a bare `dd`.
+      _cp_bwt_scan_optvals "abClnt" "" "" "" "$@"
+      [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ] && _cp_bwt_classify_target "${_CP_BWT_NONOPT[1]}" ;;
     curl)
-      local -a a=("$@")
-      local i=0 n="${#a[@]}"
-      while [ "$i" -lt "$n" ]; do
-        case "${a[$i]}" in
-          -o|--output) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
-          --output=*) _cp_bwt_classify_target "${a[$i]#*=}"; i=$((i + 1)) ;;
-          -O|--remote-name) _cp_bwt_classify_target "."; i=$((i + 1)) ;;
-          *) i=$((i + 1)) ;;
-        esac
+      _cp_bwt_scan_optvals "" "o" "" "output" "$@"
+      # `-O`/`--remote-name` takes NO value at all (writes a name derived
+      # from the URL, in cwd) — doesn't fit the value-flag model, so it's
+      # handled as its own separate pass rather than through the shared
+      # scanner above.
+      local a
+      for a in "$@"; do
+        case "$a" in -O|--remote-name) _cp_bwt_classify_target "." ;; esac
       done ;;
     wget)
-      local -a a=("$@")
-      local i=0 n="${#a[@]}"
-      while [ "$i" -lt "$n" ]; do
-        case "${a[$i]}" in
-          -O|--output-document) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
-          --output-document=*) _cp_bwt_classify_target "${a[$i]#*=}"; i=$((i + 1)) ;;
-          -P|--directory-prefix) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
-          --directory-prefix=*) _cp_bwt_classify_target "${a[$i]#*=}"; i=$((i + 1)) ;;
-          *) i=$((i + 1)) ;;
-        esac
-      done ;;
+      _cp_bwt_scan_optvals "" "OP" "" "output-document directory-prefix" "$@" ;;
     patch)
-      local -a a=("$@")
-      local i=0 n="${#a[@]}"
-      while [ "$i" -lt "$n" ]; do
-        case "${a[$i]}" in
-          -o|--output) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
-          --output=*) _cp_bwt_classify_target "${a[$i]#*=}"; i=$((i + 1)) ;;
-          *) i=$((i + 1)) ;;
-        esac
-      done ;;
+      _cp_bwt_scan_optvals "" "o" "" "output" "$@" ;;
     tar)
       # herdr-control#192 round 2, bypass E. `-C`/`--directory` only matters
       # as a WRITE destination during extraction; during creation it is
@@ -3248,7 +3246,13 @@ _cp_bwt_verb_targets() {
       # traditional bare-first-word mode-letter forms (`tar xf a.tar` /
       # `tar -xf a.tar`), and `f` combined in a cluster (`-cf`, `-xf`) with
       # its value either glued after it (`-cfa.tar`, rare) or the next argv
-      # word (`-cf a.tar`, the ordinary form).
+      # word (`-cf a.tar`, the ordinary form). `-C`/`-f` ALSO glue directly
+      # to their own value with no mode letters at all (`-Cdir`, `-fa.tar`
+      # — herdr-control#192 round 4, static finding 2/3/4): matched here,
+      # BEFORE the mode-cluster scan below, or an uppercase `-Cdir` (never
+      # a mode-cluster candidate; tar's mode letters are lowercase) or a
+      # single-purpose `-fFILE` would otherwise reach the generic scan and
+      # either be silently skipped or misread.
       local -a a=("$@")
       local i=0 n="${#a[@]}" mode_x=0 mode_c=0 dirval="" fileval="" tok rest
       while [ "$i" -lt "$n" ]; do
@@ -3256,8 +3260,10 @@ _cp_bwt_verb_targets() {
         case "$tok" in
           -C|--directory) dirval="${a[$((i + 1))]:-}"; i=$((i + 2)); continue ;;
           --directory=*) dirval="${tok#*=}"; i=$((i + 1)); continue ;;
+          -C?*) dirval="${tok#-C}"; i=$((i + 1)); continue ;;
           -f|--file) fileval="${a[$((i + 1))]:-}"; i=$((i + 2)); continue ;;
           --file=*) fileval="${tok#*=}"; i=$((i + 1)); continue ;;
+          -f?*) fileval="${tok#-f}"; i=$((i + 1)); continue ;;
         esac
         case "$tok" in
           --*) i=$((i + 1)); continue ;;  # a long option, never a mode cluster
@@ -3293,36 +3299,15 @@ _cp_bwt_verb_targets() {
       case "${1:-}" in
         clone)
           shift
-          local -a nonopt=()
-          local a wantval=0 sepgitdir=""
-          for a in "$@"; do
-            if [ "$wantval" = 1 ]; then wantval=0; continue; fi
-            case "$a" in
-              --separate-git-dir=*) sepgitdir="${a#*=}" ;;
-              --separate-git-dir) sepgitdir="__NEXT__" ;;
-              -b|--branch|--depth|-o|--origin|-c|--config|--reference|\
-              --reference-if-able|--template|-j|--jobs|--filter|\
-              --shallow-since|--shallow-exclude|--upload-pack|-u|\
-              --server-option|--bundle-uri)
-                wantval=1 ;;
-              --branch=*|--depth=*|--origin=*|--config=*|--reference=*|\
-              --reference-if-able=*|--template=*|--jobs=*|--filter=*|\
-              --shallow-since=*|--shallow-exclude=*|--upload-pack=*|\
-              --server-option=*|--bundle-uri=*) ;;
-              -*) ;;
-              *)
-                if [ "$sepgitdir" = "__NEXT__" ]; then
-                  sepgitdir="$a"
-                else
-                  nonopt+=("$a")
-                fi ;;
-            esac
-          done
-          [ -n "$sepgitdir" ] && [ "$sepgitdir" != "__NEXT__" ] && _cp_bwt_classify_target "$sepgitdir"
-          case "${#nonopt[@]}" in
+          # herdr-control#192 round 4, G3: routed through the shared
+          # recognizer (glued `-bBRANCH`, `--depth=1`, `--`).
+          _cp_bwt_scan_optvals "bocju" "" \
+            "branch depth origin config reference reference-if-able template jobs filter shallow-since shallow-exclude upload-pack server-option bundle-uri" \
+            "separate-git-dir" "$@"
+          case "${#_CP_BWT_NONOPT[@]}" in
             0) : ;;
             1) _cp_bwt_classify_target "." ;;
-            *) _cp_bwt_classify_target "${nonopt[1]}" ;;
+            *) _cp_bwt_classify_target "${_CP_BWT_NONOPT[1]}" ;;
           esac ;;
       esac ;;
     bash|sh|zsh|dash|ksh|mksh)

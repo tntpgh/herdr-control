@@ -1324,6 +1324,17 @@ bash_rsync_trailing_timeout_out|bash|{"command":"rsync -a src.txt $OTHER/dest.tx
 bash_install_trailing_mode_out|bash|{"command":"install src.txt $OTHER/dest -m 644"}
 bash_gcp_out|bash|{"command":"gcp src.txt $OTHER/dest.txt"}
 bash_gtouch_out|bash|{"command":"gtouch $OTHER/f"}
+bash_gcp_glued_t_out|bash|{"command":"gcp -t$OTHER file.txt"}
+bash_ginstall_glued_t_out|bash|{"command":"ginstall -t$OTHER file.txt"}
+bash_ginstall_T_gnu_out|bash|{"command":"ginstall -T src.txt $OTHER/dest"}
+bash_install_T_bsd_out|bash|{"command":"install -T tagname src.txt $OTHER/dest"}
+bash_cp_dashdash_out|bash|{"command":"cp -- src.txt $OTHER/-dashdest"}
+bash_rsync_dashdash_out|bash|{"command":"rsync -a -- src.txt $OTHER/-dashdest"}
+bash_git_clone_depth_eq_out|bash|{"command":"git clone --depth=1 https://example.com/r.git $OTHER/r"}
+bash_rsync_glued_T_out|bash|{"command":"rsync -aT$OTHER file.txt file2.txt"}
+bash_curl_glued_o_out|bash|{"command":"curl -o$OTHER/f https://example.com"}
+bash_wget_glued_O_out|bash|{"command":"wget -O$OTHER/f https://example.com"}
+bash_tar_glued_C_out|bash|{"command":"tar -x -C$OTHER -f a.tar"}
 in_wt_bash_find_exec_inside|bash|{"command":"find . -exec touch .handoffs/x \\\\;"}
 in_wt_bash_find_no_exec|bash|{"command":"find . -name '*.log'"}
 in_wt_bash_c_inside|bash|{"command":"bash -c 'echo x >> .handoffs/x.out'"}
