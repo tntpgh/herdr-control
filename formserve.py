@@ -53,6 +53,7 @@ HERE = Path(__file__).resolve().parent
 
 sys.path.insert(0, str(HERE / "lib"))
 from record_store import NotClaimable, claim_and_update  # noqa: E402
+from form_theme import force_dark  # noqa: E402
 
 # Injected before </body> so a served page needs no boilerplate to answer back.
 SHIM = """
@@ -426,7 +427,7 @@ def main() -> int:
     # submitAnswers() posts to /decisions/<id>/submit. Handing it this
     # process's shimmed copy would point the hub's page at /submit on the hub,
     # which is a 404 — the form would render and then fail to send.
-    html = raw_html
+    html = force_dark(raw_html.decode("utf-8", errors="replace")).encode()
     lowered = html.lower()
     if b"</body>" in lowered:
         cut = lowered.rindex(b"</body>")

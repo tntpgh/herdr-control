@@ -5,13 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Decision — form template</title>
 <style>
+  /* Dark only (Terrence, 2026-09-29). The hub also forces this at serve time
+     (lib/form_theme.py), so a light palette here would never be seen. */
   :root {
-    --ground:#eef2f2; --surface:#fff; --line:#c9d4d4; --ink:#10191c;
-    --ink-2:#3d4e53; --accent:#1f6e7e; --accent-soft:#e2eef0;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root { --ground:#0c1316; --surface:#131e22; --line:#2c3b41; --ink:#e6edee;
-            --ink-2:#a9bcc1; --accent:#58b6c8; --accent-soft:#12323a; }
+    color-scheme: dark;
+    --ground:#0c1316; --surface:#131e22; --line:#2c3b41; --ink:#e6edee;
+    --ink-2:#a9bcc1; --accent:#58b6c8; --accent-soft:#12323a;
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--ground); color:var(--ink);
