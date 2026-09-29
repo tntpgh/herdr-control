@@ -85,8 +85,12 @@ for s in spawn-task.sh spawn-agent.sh; do
 	# `grep` for the call is not enough — it matches a COMMENTED-OUT line, so the
 	# check could stay green while every worker silently lost the prelude
 	# (SPAWN-OPENV-002). Strip comments before looking.
-	if sed 's/#.*//' "$here/$s" | grep -q 'op_env_prelude "$op_mode"' \
-		&& sed 's/#.*//' "$here/$s" | grep -q -- '--no-secrets) secrets_req=withhold'; then
+	# No `sed | grep -q` pipe: under pipefail, grep -q exits on an early match,
+	# sed dies of SIGPIPE (141) once the file outgrows the pipe buffer, and the
+	# check went red on a correct spawn-task.sh (47 KB, 2026-09-29).
+	code="$(sed 's/#.*//' "$here/$s")"
+	if grep -q 'op_env_prelude "$op_mode"' <<<"$code" \
+		&& grep -q -- '--no-secrets) secrets_req=withhold' <<<"$code"; then
 		check "$s wires the prelude and --no-secrets" 0 "live call (not a comment) + the flag"
 	else
 		check "$s wires the prelude and --no-secrets" 1 "missing, or only present in a comment, in $here/$s"
