@@ -315,6 +315,43 @@ printf '== prompt_id fingerprints the PANEL, not omp queued messages ==\n'
 # because prompt_options matched omp's "1. Conductor: …" queue instead of the
 # approval panel — which makes --expect-prompt-id assert the wrong prompt.
 . "$here/lib/prompt-parse.sh"
+# herdr-control #191: herdr-select.sh now refuses any omp menu panel whose
+# claimed "Allow tool: <X>" header (or pass-2's "[header off-screen]") is
+# not corroborated by a hook-recorded tool identity for the SAME prompt_id
+# — see lib/run-registry.sh task_input_required_tool. Every panel-building
+# helper below therefore seeds a matching record for whatever task
+# CURRENTLY owns $PANE (task_for_pane, the same resolution herdr-select.sh
+# itself uses), immediately after writing $SCREEN so prompt_id can be
+# computed from the real content. A no-op registry row when no task is
+# registered yet (the panel-fingerprint tests above, which never call
+# sel/herdr-select.sh at all).
+_auto_seed_menu_tool() {                # <tool>
+  # fix/peer-waits-for-record fixtures deliberately construct a panel with
+  # NO registry row yet (the race/bounded-wait/fallback cases below) --
+  # HERDR_TEST_SKIP_AUTOSEED lets those opt out of this otherwise-automatic
+  # seeding for exactly the calls that must start with nothing recorded.
+  [ -n "${HERDR_TEST_SKIP_AUTOSEED:-}" ] && return 0
+  local tool="$1" run task pid owner existing
+  owner="$(task_for_pane "$PANE" 2>/dev/null)"
+  run="$(printf '%s' "$owner" | jq -r '.run_id // empty' 2>/dev/null)"
+  task="$(printf '%s' "$owner" | jq -r '.task_id // empty' 2>/dev/null)"
+  [ -n "$run" ] && [ -n "$task" ] || return 0
+  pid="$(prompt_id "$PANE" 2>/dev/null)"
+  [ -n "$pid" ] || return 0
+  # A no-op once THIS exact prompt_id already carries a record (from an
+  # earlier auto-seed, or a fixture's own explicit seed_input_required) --
+  # prompt_id is a content fingerprint (stable across highlight/position,
+  # verified above), so an identical panel rendered again later (a
+  # deliberately mismatched recorded command replayed against the same
+  # "git status" text, say) must never have its command silently
+  # overwritten back to empty by a later, unrelated auto-seed.
+  existing="$(task_input_required_tool "$run" "$task" "$pid" 2>/dev/null)"
+  [ -n "$existing" ] && return 0
+  append_event "$run" "$task" input_required \
+    "$(jq -nc --arg msg "omp needs permission" --arg pid "$pid" --arg tool "$tool" \
+       '{message:$msg, prompt_id:$pid, command:"", tool:$tool}')" >/dev/null 2>&1
+}
+
 # The queue sits ABOVE the panel, which is where omp paints it (verified on a
 # live pane 2026-09-12). That position is what makes this a fingerprint bug
 # rather than a parse failure: the menu extractor opens at "Allow tool:" and
@@ -322,6 +359,7 @@ printf '== prompt_id fingerprints the PANEL, not omp queued messages ==\n'
 # region and matches them — so every panel on the pane hashed identically.
 menu_with_queue() {  # <command>
   printf ' Steering · 2\n   1. Conductor: do the thing\n   2. Conductor: and the other\n\nAllow tool: bash\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\n Deny\n\nup/down navigate  enter select  esc cancel\n' "$1" > "$SCREEN"
+  _auto_seed_menu_tool bash
 }
 menu_with_queue "git status --short"; id_a=$(prompt_id "$PANE")
 menu_with_queue "sed -n 1,150p tests/test_x.py"; id_b=$(prompt_id "$PANE")
@@ -336,6 +374,7 @@ printf '== F3: the id still separates panels when the panel parses INCOMPLETE ==
 # kept in the hash.
 menu_queue_below() {  # <command>
   printf 'Allow tool: bash\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\n Deny\n\nup/down navigate  enter select  esc cancel\n\n Steering · 2\n   1. Conductor: do the thing\n   2. Conductor: and the other\n' "$1" > "$SCREEN"
+  _auto_seed_menu_tool bash
 }
 menu_queue_below "git status --short"; id_d=$(prompt_id "$PANE")
 menu_queue_below "sed -n 1,150p tests/test_x.py"; id_e=$(prompt_id "$PANE")
@@ -516,6 +555,7 @@ printf '== reviewed conductor: owned task, exact prompt, attributed exception ==
 . "$here/lib/prompt-parse.sh"
 set_menu() {
   printf 'Allow tool: bash\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' "$1" > "$SCREEN"
+  _auto_seed_menu_tool bash
 }
 conductor_select() {
   ( export HERDR_PANE_ID=w9:p9
@@ -535,6 +575,7 @@ set_rows() {  # each arg becomes one boxed panel row after "Command:"
   { printf '│ Allow tool: bash\n│ Command: %s\n' "$1"; shift
     for row; do printf '│ %s\n' "$row"; done
     printf '│\n│ \033[48;2;42;47;65m Approve\033[0m\n│ Deny\n│\n│ up/down navigate  enter select  esc cancel\n'; } > "$SCREEN"
+  _auto_seed_menu_tool bash
 }
 set_rows 'rm \' '-rf /Users/thurbs/Code'; reset_keys
 sel 1 --authority peer; rc=$?
@@ -623,10 +664,10 @@ printf '== #3b: ownership grant — strict tokenizer, own repo/branch only ==\n'
 GBRANCH="feat/grant-test"; GTRUNK="main"
 register_task runG taskG wG cG "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/grant "impl:grant" "$GBRANCH" "$GTRUNK" >/dev/null 2>&1
 set_task_state runG taskG running >/dev/null 2>&1
-seed_input_required() {                 # <run> <task> <command>
+seed_input_required() {                 # <run> <task> <command> [tool=bash]
   append_event "$1" "$2" input_required \
-    "$(jq -nc --arg msg "omp needs permission" --arg pid "$(prompt_id "$PANE")" --arg cmd "$3" \
-       '{message:$msg, prompt_id:$pid, command:$cmd}')" >/dev/null 2>&1
+    "$(jq -nc --arg msg "omp needs permission" --arg pid "$(prompt_id "$PANE")" --arg cmd "$3" --arg tool "${4:-bash}" \
+       '{message:$msg, prompt_id:$pid, command:$cmd, tool:$tool}')" >/dev/null 2>&1
 }
 
 for grant_cmd in "git push origin $GBRANCH" "gh pr create --head $GBRANCH" \
@@ -752,6 +793,7 @@ sel 1 --authority peer; rc=$?
 printf '== MEDIUM (PR #162 review): omp Reason: row before Command: must not fail closed on a correct recorded command ==\n'
 set_menu_reason() {                     # <reason-text> <command-text>
   printf 'Allow tool: bash\nReason: %s\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' "$1" "$2" > "$SCREEN"
+  _auto_seed_menu_tool bash
 }
 REASON_CMD="rg -n shutdown lib/"
 set_menu_reason "Critical pattern detected" "$REASON_CMD"; reset_keys
@@ -803,6 +845,7 @@ printf '== PR #147 hold, independent review: scrape-only menu-shape (omp) torn c
 set_menu_torn() {                       # <command-text>
   printf 'Allow tool: bash\nCommand: %s %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' \
     "$1" "$(printf '\342\200')" > "$SCREEN"
+  _auto_seed_menu_tool bash
 }
 set_menu "curl https://example.com/report -o /tmp/report.json"; reset_keys
 sel 1 --authority peer; rc=$?
@@ -903,6 +946,7 @@ printf '== deny skips corroboration: a Deny on a disagreeing recorded command st
 # refusal has to start the highlight where the choice already is.
 set_menu_deny() {                      # <command-text>
   printf 'Allow tool: bash\nCommand: %s\n\nApprove\n\033[48;2;42;47;65m Deny\033[0m\n\nup/down navigate  enter select  esc cancel\n' "$1" > "$SCREEN"
+  _auto_seed_menu_tool bash
 }
 set_menu_deny "git status"; reset_keys
 seed_input_required runG taskG "gh pr merge 5 --squash"
@@ -974,6 +1018,7 @@ set_rows_deny() {                      # each arg becomes one boxed panel row af
   { printf '│ Allow tool: bash\n│ Command: %s\n' "$1"; shift
     for row; do printf '│ %s\n' "$row"; done
     printf '│\n│ Approve\n│ \033[48;2;42;47;65m Deny\033[0m\n│\n│ up/down navigate  enter select  esc cancel\n'; } > "$SCREEN"
+  _auto_seed_menu_tool bash
 }
 # boxed_panel: a right-bordered, padded box (real omp panel shape, same as
 # verify-sweep-approvals.sh:63-67 / verify-raw-answer-guard.sh:51-55) --
@@ -993,6 +1038,7 @@ boxed_panel() {                        # each arg becomes one right-bordered, pa
     printf '│ %-60s │\n' 'up/down navigate  enter select  esc cancel'
     printf '╰%s╯\n' "$(printf '─%.0s' $(seq 1 62))"
   } > "$SCREEN"
+  _auto_seed_menu_tool bash
 }
 WRAP_JOIN_CMD="ls -la /Users/thurbs/.herdr/worktrees/tntpgh/herdr-control/.handoffs"
 boxed_panel 'Command: ls -la /Users/thurbs/.herdr/worktrees/tntpgh/herdr-c' 'ontrol/.handoffs'; reset_keys
@@ -1000,7 +1046,7 @@ set_task_state runG taskG running >/dev/null 2>&1
 ( export HERDR_PANE_ID="$PANE" HERDR_CONDUCTOR_PANE_ID=w9:p9 HERDR_RUN_ID=runG HERDR_TASK_ID=taskG \
          HERDR_TASK_LABEL="impl:wrapjoin"
   . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
-  push_wake "impl:wrapjoin needs input" "hook" "$WRAP_JOIN_CMD" >/dev/null 2>&1 )
+  push_wake "impl:wrapjoin needs input" "hook" "$WRAP_JOIN_CMD" bash >/dev/null 2>&1 )
 wake_recorded="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   "SELECT json_extract(payload,'\$.command') FROM events WHERE task_id='taskG' AND type='input_required' ORDER BY sequence DESC LIMIT 1;")"
 [ "$wake_recorded" = "$WRAP_JOIN_CMD" ] \
@@ -1144,6 +1190,7 @@ printf '== #187: a non-bash write-tool menu is judged by its Path field, not the
 set_write_menu() {                     # <path> <content-json>
   printf 'Allow tool: write\nPath: %s\nContent: %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' \
     "$1" "$2" > "$SCREEN"
+  _auto_seed_menu_tool write
 }
 set_write_menu "xd://notepad_append" '{"heading":"h","content":"c"}'; reset_keys
 sel 1 --authority peer; rc=$?
@@ -1187,6 +1234,7 @@ printf '== #187: a Content value that fakes an extra Path/Content row never relo
 # only ever looks at the row immediately after "Allow tool: write Path: ",
 # up to the first " Content: " marker.
 printf 'Allow tool: write\nPath: xd://notepad_append\nContent: {"heading":"h","content":"x"}\nPath: /etc/passwd\nContent: {}\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' > "$SCREEN"
+_auto_seed_menu_tool write
 reset_keys
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] \
@@ -1711,7 +1759,7 @@ seed_after_poll2() {                    # <run> <task> <command>
 }
 set_task_state runR taskR running >/dev/null 2>&1
 RACE_MSG='git commit -m "docs(policy): grant header comment matches -u/--set-upstream push shape"'
-set_menu "$RACE_MSG"; reset_keys
+HERDR_TEST_SKIP_AUTOSEED=1 set_menu "$RACE_MSG"; reset_keys
 : > "$WAIT_TRACE"
 seed_after_poll2 runR taskR "$RACE_MSG" &
 bg_pid=$!
@@ -1734,7 +1782,7 @@ printf '== HIGH (PR #158 review): a SHORT recorded command must not corroborate 
 # merge; the anchored rule requires EQUALITY against the command region.
 set_task_state runR taskR running >/dev/null 2>&1
 PULLS_CMD="gh api -X PUT repos/o/r/pulls/7/merge"
-set_menu "$PULLS_CMD"; reset_keys
+HERDR_TEST_SKIP_AUTOSEED=1 set_menu "$PULLS_CMD"; reset_keys
 : > "$WAIT_TRACE"
 seed_after_poll2 runR taskR "ls" &
 bg_pid=$!
@@ -1773,22 +1821,34 @@ HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
   && ok "trace is exactly one poll followed by found — no timeout, no extra polling" \
   || bad "trace: $(cat "$WAIT_TRACE")"
 
-printf '== change 1: no registry row ever appears -> bounded wait, then the scraped panel ==\n'
+printf '== change 1: no registry row ever appears -> bounded wait, then refused (herdr-control #191 tightening) ==\n'
 FALLBACK_TEXT="git log --oneline -3"
 # set_menu, not set_screen: every set_screen panel hashes to the SAME
 # prompt_id (no parseable question rows), so the command-less row seeded just
 # above matched this prompt too and the "no row" case was really a found-at-
 # poll-1 case. That, not machine speed, is why the old elapsed-ms assertion
 # failed ("returned before the window elapsed: 956ms").
-set_menu "$FALLBACK_TEXT"; reset_keys
+#
+# herdr-control #191: before this fix, a command that never corroborated
+# fell back to trusting the scraped panel outright. Now a panel with no
+# hook-recorded TOOL identity at all -- which is exactly what "no registry
+# row ever appears" means, since #191 records tool unconditionally on the
+# same row -- refuses instead, even for an ordinary bash panel. The
+# bounded COMMAND wait below is unchanged (still 5 polls over 1s); only
+# what happens once it times out changed.
+HERDR_TEST_SKIP_AUTOSEED=1 set_menu "$FALLBACK_TEXT"; reset_keys
 : > "$WAIT_TRACE"
 HERDR_SELECT_RECORD_WAIT_S=1 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
-[ "$rc" -eq 0 ] && ok "falls back to the scraped panel text when no row ever appears" \
-  || bad "rc=$rc; stderr: $(cat "$WORK/err.txt")"
-[ "$(q_appr command)" = "Allow tool: bash Command: $FALLBACK_TEXT" ] && ok "the approvals row records the panel scrape it fell back to" \
-  || bad "approvals command on fallback: '$(q_appr command)'"
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "refused: no hook-recorded tool identity ever landed for this prompt (#191)" \
+  || bad "rc=$rc keys=$(keys_pressed); stderr: $(cat "$WORK/err.txt")"
+grep -q "hook recorded '<none>' for this prompt" "$WORK/err.txt" \
+  && ok "refusal names the missing hook record" \
+  || bad "stderr does not name the missing record: $(cat "$WORK/err.txt")"
 # 1s window, 0.25s steps: polls at elapsed 0, .25, .5, .75, 1.0, then timeout.
-# Counting polls pins the full bounded window without reading the clock.
+# Counting polls pins the full bounded window without reading the clock --
+# the COMMAND wait still runs to completion before #191's tool check ever
+# gets a chance to refuse.
 [ "$(cat "$WAIT_TRACE")" = "$(printf 'poll 1\npoll 2\npoll 3\npoll 4\npoll 5\ntimeout')" ] \
   && ok "waited out the whole 1s window (5 polls) and then timed out" \
   || bad "trace: $(cat "$WAIT_TRACE")"
@@ -1998,12 +2058,20 @@ printf 'worker idle at its composer\n' > "$CLEAN_SCREEN"
 export SENDS="$WORK/sends.log"
 sends_count() { wc -l < "$SENDS" | tr -d ' '; }
 deny_rows() {                           # <prompt_id> -> deny_reason_delivered rows for it on runD
-  sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  # Same .timeout dot-command as lib/run-registry.sh _sql() — this is a raw
+  # sqlite3 call outside that helper, and without it a transient
+  # SQLITE_BUSY during the disowned writer's commit makes this print
+  # EMPTY, not "0": wait_deny_row's `= 0` loop condition then reads empty
+  # as "not 0" (looks found) and exits early, and the immediately-following
+  # `!= 0` final check re-queries fresh and (correctly, but too late) sees
+  # "0" — reported as "recorded no row" when the row simply hadn't landed
+  # yet. Root cause of the intermittent F7c2 control-deny failure.
+  sqlite3 -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
     "SELECT count(*) FROM events WHERE type='deny_reason_delivered' AND run_id='runD' AND task_id='taskD'
        AND json_extract(payload,'\$.prompt_id')='$1';" 2>/dev/null
 }
 deny_row() {                            # <prompt_id> -> "outcome|exit_code|pane" of its latest row
-  sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  sqlite3 -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
     "SELECT json_extract(payload,'\$.outcome')||'|'||COALESCE(json_extract(payload,'\$.exit_code'),'null')||'|'||json_extract(payload,'\$.pane')
        FROM events WHERE type='deny_reason_delivered' AND run_id='runD' AND task_id='taskD'
        AND json_extract(payload,'\$.prompt_id')='$1' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null

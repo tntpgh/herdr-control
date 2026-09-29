@@ -63,7 +63,7 @@ _wake_outcome_for() {                   # <exit-code> -> token
   esac
 }
 
-# _pw_forced_wake_argv <pane> <cpane> <run> <task> <label> <msg> <where> <full_cmd>
+# _pw_forced_wake_argv <pane> <cpane> <run> <task> <label> <msg> <where> <full_cmd> <tool>
 #
 # Builds, into _PW_FORCED_WAKE_ARGV (a bash array), the exact re-entry into
 # push_wake with HERDR_ALERT_FORCE=1 — the command grace_realert's own 90s
@@ -72,19 +72,25 @@ _wake_outcome_for() {                   # <exit-code> -> token
 # herdr-select.sh calls it the moment a peer refuses a prompt push_wake
 # already HELD) fires the IDENTICAL command instead of a second, driftable
 # copy of it.
+#
+# <tool> is threaded through purely for defense in depth: append_event's
+# per-prompt dedupe key (`${base}_input`) means the ORIGINAL push_wake call
+# already recorded it before this re-entry could ever fire for the same
+# prompt_id, so this never overwrites a real recorded value with a missing
+# one.
 _pw_forced_wake_argv() {
-  local pane="$1" cpane="$2" run="$3" task="$4" label="$5" msg="$6" where="$7" full_cmd="$8"
+  local pane="$1" cpane="$2" run="$3" task="$4" label="$5" msg="$6" where="$7" full_cmd="$8" tool="${9:-}"
   _PW_FORCED_WAKE_ARGV=(
     env HERDR_ALERT_FORCE=1
         HERDR_PANE_ID="$pane" HERDR_CONDUCTOR_PANE_ID="$cpane"
         HERDR_RUN_ID="$run" HERDR_TASK_ID="$task"
         HERDR_TASK_LABEL="$label"
-        bash -c '. "$0/lib/pane-guard.sh"; . "$0/lib/prompt-parse.sh"; . "$0/lib/run-registry.sh"; . "$0/lib/push-wake.sh"; push_wake "$1" "$2" "$3"' \
-        "$_pw_dir" "$msg" "$where" "$full_cmd"
+        bash -c '. "$0/lib/pane-guard.sh"; . "$0/lib/prompt-parse.sh"; . "$0/lib/run-registry.sh"; . "$0/lib/push-wake.sh"; push_wake "$1" "$2" "$3" "$4"' \
+        "$_pw_dir" "$msg" "$where" "$full_cmd" "$tool"
   )
 }
 
-# push_wake <message> [where-label] [full-command]
+# push_wake <message> [where-label] [full-command] [tool]
 #
 # full-command (project-contract-plan.md #3b, item 2) is the UNTRUNCATED
 # command text behind the prompt, when the caller has it (omp-notify.sh, from
@@ -96,12 +102,21 @@ _pw_forced_wake_argv() {
 # scraped back. Empty for every caller that does not pass it (claude-notify.sh,
 # any older wiring) — same as today, no behavior change.
 #
+# tool (herdr-control #191) is `event.toolName` straight from omp's own
+# tool_approval_requested event, never scraped — recorded UNCONDITIONALLY
+# below, regardless of whether `full_cmd` corroborates, because tool
+# identity has nothing to disagree with: it is not text an agent's own
+# output can forge, unlike the panel header herdr-select.sh no longer
+# trusts alone. herdr-select.sh refuses any omp menu panel whose claimed
+# "Allow tool: <X>" header does not equal this recorded value, and refuses
+# outright when it is empty (a hand-started session, an older omp build).
+#
 # Exit 0 when a wake was delivered AND confirmed submitted; 1 otherwise
 # (including "nothing to do"). Callers treat this as best-effort — a hook must
 # never fail its agent because a peer could not be woken — but the exit status is
 # available for a caller that wants to retry.
 push_wake() {
-  local msg="$1" where="${2:-}" full_cmd="${3:-}"
+  local msg="$1" where="${2:-}" full_cmd="${3:-}" tool="${4:-}"
   local cpane="${HERDR_CONDUCTOR_PANE_ID:-}"
   # Persist the worker's state independently of notification delivery. A
   # scheduled worker can have no conductor; a stopped/recycled conductor
@@ -196,13 +211,13 @@ push_wake() {
     set_task_state "$HERDR_RUN_ID" "$HERDR_TASK_ID" "blocked" >/dev/null 2>&1 || true
     if [ "$recorded_ok" = 0 ]; then
       append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
-        "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg hint "$cmd_hint" \
-           '{message:$msg, prompt_id:$prompt_id, command:"", command_uncorroborated:true, command_hint:$hint}')" \
+        "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg hint "$cmd_hint" --arg tool "$tool" \
+           '{message:$msg, prompt_id:$prompt_id, command:"", command_uncorroborated:true, command_hint:$hint, tool:$tool}')" \
         "${base}_input" >/dev/null 2>&1 || true
     else
       append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
-        "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg cmd "$full_cmd" \
-           '{message:$msg, prompt_id:$prompt_id, command:$cmd}')" \
+        "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg cmd "$full_cmd" --arg tool "$tool" \
+           '{message:$msg, prompt_id:$prompt_id, command:$cmd, tool:$tool}')" \
         "${base}_input" >/dev/null 2>&1 || true
     fi
   fi
@@ -326,7 +341,7 @@ push_wake() {
         "${base}_held" >/dev/null 2>&1 || true
     fi
     _pw_forced_wake_argv "${HERDR_PANE_ID}" "$cpane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-      "${HERDR_TASK_LABEL:-}" "$msg" "$where" "$full_cmd"
+      "${HERDR_TASK_LABEL:-}" "$msg" "$where" "$full_cmd" "$tool"
     grace_realert "${HERDR_PANE_ID}" "$pid" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
       "${_PW_FORCED_WAKE_ARGV[@]}"
     # A held wake has NOT been delivered, so it does not report success — the
