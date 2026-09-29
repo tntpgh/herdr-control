@@ -3437,7 +3437,11 @@ EOF
   # "prod2", "live-site", and the full word "production" still do.
   _cp_imatch '(--(context|env|environment|profile|namespace|target|app|stage|remote|host|project|subscription|account|cluster|instance|database|db|region|org|space|site)([[:space:]]+|=)[^[:space:]]*\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b|(^|[[:space:]])-[aeEpnc][[:space:]]+[^[:space:]]*\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b[^[:space:]]*([[:space:]]|$)|(^|[[:space:]])[A-Za-z_]*(ENV|STAGE)=(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b[^[:space:]]*([[:space:]]|$)|\b(ssh|scp|rsync|psql|mysql|redis-cli|mongosh|wrangler|vercel|netlify|fly|flyctl|heroku|gcloud|az|aws|doctl|eksctl|kubectl|helm|gh)\b[^;&|]*\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b|\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\.[a-z0-9][a-z0-9.-]*\b)' "$_cp_prod_norm" &&
     _cp_consider 1 "names a production target"
-  _cp_imatch '\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(delete|drain|scale)\b|\bhelm[[:space:]]+(delete|uninstall)\b|\bflyctl?[[:space:]]+(deploy|destroy)\b' "$norm" &&
+  # `flyctl?` is "flyct" + optional "l" (the `?` binds to the immediately
+  # preceding atom only) — it never matched bare `fly deploy`, only
+  # `flyct(l) deploy`. Found via the red test added alongside the
+  # production-target fix above (2026-09-29). `fly(ctl)?` matches both.
+  _cp_imatch '\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(delete|drain|scale)\b|\bhelm[[:space:]]+(delete|uninstall)\b|\bfly(ctl)?[[:space:]]+(deploy|destroy)\b' "$norm" &&
     _cp_consider 1 "infrastructure scope change"
 
   _cp_apply_operator_rules "$norm"
