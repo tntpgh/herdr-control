@@ -658,20 +658,26 @@ claim_once "grace_realert_run1_task1_$(prompt_id "$WPANE")" run1 task1 grace_rea
 set_task_state run1 task1 running >/dev/null 2>&1
 
 printf '== 2026-09-29: the attention controller writes first; the hook still records its tool ==\n'
-# attention-tick.sh calls push_wake with neither command nor tool. When that
-# lands before the hook's detached omp-notify.sh, INSERT OR IGNORE on the one
-# per-prompt event id used to drop the hook's row, and herdr-select's #191
-# corroboration then refused every conductor/peer answer (live: 5 of 68).
+# attention-tick.sh (_attn_track_and_wake) claims attn_track_<key> and then
+# calls push_wake with neither command nor tool. The hook's omp-notify.sh then
+# LOSES that claim, and before this fix it skipped push_wake entirely, so the
+# tool-less row was the only record and herdr-select's #191 corroboration
+# refused every conductor/peer answer (live: 5 of 68).
 omp_menu_screen "git log --oneline -3" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
 : > "$SENT"
 pidR="$(prompt_id "$WPANE")"
 ( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" HERDR_RUN_ID=run1 HERDR_TASK_ID=task1 HERDR_TASK_LABEL="impl:omp-test"
-  bash -c '. "$0/lib/pane-guard.sh"; . "$0/lib/prompt-parse.sh"; . "$0/lib/run-registry.sh"; . "$0/lib/push-wake.sh"; push_wake "impl:omp-test needs input" attention-controller' "$here" ) >/dev/null 2>&1
+  bash -c '. "$0/lib/pane-guard.sh"; . "$0/lib/prompt-parse.sh"; . "$0/lib/run-registry.sh"; . "$0/lib/push-wake.sh"; . "$0/lib/attention-key.sh"
+    attn_track_claim "$HERDR_PANE_ID" run1 task1 "$1" || exit 3
+    push_wake "impl:omp-test needs input" attention-controller' "$here" "$pidR" ) >/dev/null 2>&1
+[ $? -ne 3 ] && ok "setup: the controller owns this prompt's attn_track claim" || bad "setup: controller could not take the claim"
 [ -z "$(task_input_required_tool run1 task1 "$pidR")" ] && ok "setup: the controller's row for this prompt carries no tool" || bad "setup: controller row already had a tool"
+sent_before="$(wc -l < "$SENT")"
 run_notify_cmd bash "git log --oneline -3"
 [ "$(task_input_required_tool run1 task1 "$pidR")" = bash ] && ok "the hook's later call fills in the tool" || bad "tool still '$(task_input_required_tool run1 task1 "$pidR")'"
 [ "$(task_input_required_command run1 task1 "$pidR")" = "git log --oneline -3" ] && ok "and the corroborated command" || bad "command '$(task_input_required_command run1 task1 "$pidR")'"
+[ "$(wc -l < "$SENT")" = "$sent_before" ] && ok "the hook that lost the claim sent no second wake" || bad "a second wake was sent"
 run_notify_cmd read "git log --oneline -3"
 [ "$(task_input_required_tool run1 task1 "$pidR")" = bash ] && ok "a recorded tool is never replaced by a later call" || bad "recorded tool replaced: '$(task_input_required_tool run1 task1 "$pidR")'"
 [ "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE type='input_required' AND json_extract(payload,'\$.prompt_id')='$pidR';")" = 1 ] \

@@ -111,12 +111,17 @@ _pw_forced_wake_argv() {
 # "Allow tool: <X>" header does not equal this recorded value, and refuses
 # outright when it is empty (a hand-started session, an older omp build).
 #
+# mode "record-only" (5th arg): write this prompt's input_required row and
+# stop — no wake. A hook whose attn_track claim lost to the attention
+# controller (agent-hooks/omp-notify.sh) must still leave its tool and
+# corroborated command on the row, or herdr-select refuses every answer.
+#
 # Exit 0 when a wake was delivered AND confirmed submitted; 1 otherwise
-# (including "nothing to do"). Callers treat this as best-effort — a hook must
+# (including "nothing to do" and record-only). Callers treat this as best-effort — a hook must
 # never fail its agent because a peer could not be woken — but the exit status is
 # available for a caller that wants to retry.
 push_wake() {
-  local msg="$1" where="${2:-}" full_cmd="${3:-}" tool="${4:-}"
+  local msg="$1" where="${2:-}" full_cmd="${3:-}" tool="${4:-}" mode="${5:-}"
   local cpane="${HERDR_CONDUCTOR_PANE_ID:-}"
   # Persist the worker's state independently of notification delivery. A
   # scheduled worker can have no conductor; a stopped/recycled conductor
@@ -233,6 +238,7 @@ push_wake() {
               AND json_extract(payload,'\$.recorded_by')='attention-controller';" >/dev/null 2>&1 || true
     fi
   fi
+  [ "$mode" = record-only ] && return 1
   [ -n "$cpane" ] || return 1
 
   pane_is_agent "$cpane" || return 1

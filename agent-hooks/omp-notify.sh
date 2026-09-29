@@ -168,9 +168,16 @@ fi
 # firing) already owns must not call push_wake again — that is what turned
 # one held prompt into two delivered wakes (item 1). HERDR_WAKE_LEGACY=1 is
 # the rollback: every firing calls push_wake again, unclaimed.
+#
+# Losing that claim still records: the controller's row (no tool, no command)
+# must not be the only record of this prompt, or herdr-select's #191 check
+# refuses every answer to it (live 2026-09-29, 5 of 68 prompts). Record-only
+# writes/replaces the row and sends no second wake.
 . "$here/lib/attention-key.sh"
 if attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$(prompt_id "$pane" 2>/dev/null)"; then
   push_wake "$msg" "$where" "$full_cmd" "$tool" >/dev/null 2>&1 || true
+else
+  push_wake "$msg" "$where" "$full_cmd" "$tool" record-only >/dev/null 2>&1 || true
 fi
 
 if [ "${human_stale:-0}" = 1 ]; then
