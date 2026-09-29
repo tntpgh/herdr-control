@@ -417,19 +417,14 @@ echo
 echo "== more realistic production-target shapes, not just the pinned ones =="
 check "fly deploy, no flags"             "fly deploy"                              escalate
 check "wrangler deploy --env production, realistic" "wrangler deploy --env production --dry-run=false" escalate
-# KNOWN GAP, recorded not silently dropped (2026-09-29): `\b` treats `_` as
-# a word character, so a SCREAMING_SNAKE_CASE env-var name never gets a
-# boundary right after "PROD" (`PROD_DATABASE_URL` has no break between
-# D and _). Fixing this generically means redefining "word" for every
-# alternative in this rule, not a boundary fix to the false positives
-# above — left to the conductor rather than guessed at.
-check "psql against a PROD env var"      "psql \$PROD_DATABASE_URL -c 'select 1'"  allow
-# KNOWN GAP, recorded not silently dropped (2026-09-29): none of the five
-# alternatives cover an npm/yarn/pnpm script-NAME shape (`run x:prod`) —
-# only explicit CLI names, `--flag`, and `ENV=` shapes. Adding one is new
-# rule surface, not a boundary fix — left to the conductor rather than
-# guessed at.
-check "npm run deploy:prod script"       "npm run deploy:prod"                    allow
+# ROUND 6b: env-var references and package-script names (were allow).
+check "psql against a PROD env var"      "psql \$PROD_DATABASE_URL -c 'select 1'"  escalate
+check "braced env var, prod mid-name"    "psql \${DB_PROD_URL} -c 'select 1'"      escalate
+check "npm run deploy:prod script"       "npm run deploy:prod"                    escalate
+check "pnpm prod-suffixed script"        "pnpm run release-production"            escalate
+check "PRODUCT env var is not prod"      "echo \$PRODUCT_ID"                       allow
+check "npm script named produce"         "npm run produce"                        allow
+check "npm script prod-less deploy name" "npm run build:preview"                  allow
 check "reads SSH private key"        "cat ~/.ssh/id_ed25519"                  escalate
 check "reads AWS credentials file"   "cat ~/.aws/credentials"                 escalate
 check "reads .env"                   "cat .env"                               escalate

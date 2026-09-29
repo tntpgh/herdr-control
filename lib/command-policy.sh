@@ -3437,6 +3437,14 @@ EOF
   # "prod2", "live-site", and the full word "production" still do.
   _cp_imatch '(--(context|env|environment|profile|namespace|target|app|stage|remote|host|project|subscription|account|cluster|instance|database|db|region|org|space|site)([[:space:]]+|=)[^[:space:]]*\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b|(^|[[:space:]])-[aeEpnc][[:space:]]+[^[:space:]]*\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b[^[:space:]]*([[:space:]]|$)|(^|[[:space:]])[A-Za-z_]*(ENV|STAGE)=(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b[^[:space:]]*([[:space:]]|$)|\b(ssh|scp|rsync|psql|mysql|redis-cli|mongosh|wrangler|vercel|netlify|fly|flyctl|heroku|gcloud|az|aws|doctl|eksctl|kubectl|helm|gh)\b[^;&|]*\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b|\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\.[a-z0-9][a-z0-9.-]*\b)' "$_cp_prod_norm" &&
     _cp_consider 1 "names a production target"
+  # ROUND 6b (2026-09-29, conductor): two real targets the red test showed
+  # passing as allow. `\b` never breaks inside SCREAMING_SNAKE, so an env-var
+  # reference like `$PROD_DATABASE_URL` / `${DB_PROD_URL}` slipped; and no
+  # branch covered a package-script name (`npm run deploy:prod`). Both need
+  # prod/production (live too, for vars) as a whole `_`/`:`/`-`-delimited
+  # token, so `$PRODUCT_ID` and `npm run produce` stay quiet.
+  _cp_imatch '\$\{?([a-z0-9]+_)*(prod|production|live)(_[a-z0-9]+)*\}?([^a-z0-9_]|$)|\b(npm|pnpm|yarn|bun)([[:space:]]+run)?[[:space:]]+([a-z0-9_-]*[:_-])?(prod|production)([:_-][a-z0-9:_-]*)?([[:space:]]|$)' "$_cp_prod_norm" &&
+    _cp_consider 1 "names a production target"
   # `flyctl?` is "flyct" + optional "l" (the `?` binds to the immediately
   # preceding atom only) — it never matched bare `fly deploy`, only
   # `flyct(l) deploy`. Found via the red test added alongside the
