@@ -69,6 +69,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from record_store import NotClaimable, claim_and_update  # noqa: E402
 import herdr_live  # noqa: E402
+from form_theme import force_dark  # noqa: E402
 
 DEFAULT_PORT = int(os.environ.get("HERDR_HUB_PORT", "8600"))
 STATE = Path(os.environ.get("HERDR_STATE_ROOT", Path.home() / ".local/state/herdr"))
@@ -1304,7 +1305,7 @@ def serve_stored_form(form_id: str) -> tuple[int, bytes]:
     if not body.exists():
         return 404, b"this decision predates hub-served forms; use its own port"
     try:
-        raw = body.read_text()
+        raw = force_dark(body.read_text())
     except OSError:
         return 500, b"decision body unreadable"
     if row.get("status") != "open":
@@ -2700,6 +2701,7 @@ def _drift_label(r: dict) -> str:
 
 
 STYLE = """
+ :root{color-scheme:dark}
  body{margin:0;background:#0f1115;color:#e6e9ef;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
  header{display:flex;gap:18px;align-items:center;padding:14px 20px;border-bottom:1px solid #272c37;background:#171a21}
  header b{font-size:16px} header a{color:#9aa3b2;text-decoration:none} header a.on{color:#e6e9ef;border-bottom:2px solid #e08a4a}
