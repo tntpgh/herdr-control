@@ -29,3 +29,10 @@ the panel is clipped. Shape your calls so the WHOLE action is reviewable:
   editing identity.json changes nothing.
 - **A script that runs or imports another local file is reviewed every
   run** — an approval binds one file's sha256. Keep reviewed logic in one file.
+- **A visual before/after difference above 0.000% needs a proven cause, not
+  an explanation.** Any pixel/rendering diff you report must come with
+  zoomed crops of the differing region, saved in your backup dir, plus a
+  cause you proved with the browser (e.g. `getComputedStyle`). Never write
+  off a diff as rounding, anti-aliasing, or nondeterminism without a
+  same-input repeat render that actually shows 0.000% — a "sub-pixel
+  rounding" explanation hid a real bug (lost borders) on 2026-09-28.
