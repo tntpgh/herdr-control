@@ -434,6 +434,15 @@ check "gcloud --project prod_web"        "gcloud --project prod_web compute inst
 check "gcloud --project prodweb"         "gcloud --project prodweb compute instances delete api-1" escalate
 check "az --subscription prod_main"      "az vm delete --subscription prod_main --name web-01" escalate
 check "product word under a -p flag"     "mkdir -p src/products/list"              allow
+# Security review round 2: an ENV/STAGE value names prod ANYWHERE, not only
+# at its start. main caught `product-prod` only by accident (the word
+# "product" starts with "prod") and never caught `staging-prod`.
+check "ENV value product-prod"           "APP_ENV=product-prod ./deploy.sh"        escalate
+check "STAGE value producer-live"        "STAGE=producer-live ./deploy.sh"         escalate
+check "ENV value products/prod"          "DEPLOY_ENV=products/prod ./deploy.sh"    escalate
+check "ENV value Product-prod"           "NODE_ENV=Product-prod node server.js"    escalate
+check "ENV value staging-prod (main gap)" "APP_ENV=staging-prod ./deploy.sh"       escalate
+check "ENV value names no prod"          "APP_ENV=product-staging ./deploy.sh"     allow
 
 echo
 echo "== more realistic production-target shapes, not just the pinned ones =="
