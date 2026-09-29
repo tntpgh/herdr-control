@@ -3412,7 +3412,30 @@ EOF
   #     `--project live-site` slipped. Values may now be suffixed.
   #   * `\b` cannot match between `_` and `E`, so `VERCEL_ENV=production` and
   #     `MY_ENV=production` were missed. Any `*_ENV=` counts now.
-  _cp_imatch '(--(context|env|environment|profile|namespace|target|app|stage|remote|host|project|subscription|account|cluster|instance|database|db|region|org|space|site)([[:space:]]+|=)[^[:space:]]*(prod|production|live)|(^|[[:space:]])-[aeEpnc][[:space:]]+[^[:space:]]*(prod|production|live)[^[:space:]]*([[:space:]]|$)|(^|[[:space:]])[A-Za-z_]*(ENV|STAGE)=(prod|production|live)[^[:space:]]*([[:space:]]|$)|\b(ssh|scp|rsync|psql|mysql|redis-cli|mongosh|wrangler|vercel|netlify|fly|flyctl|heroku|gcloud|az|aws|doctl|eksctl|kubectl|helm|gh)\b[^;&|]*\b(prod|production|live)[a-z0-9-]*\b|\b(prod|production|live)[a-z0-9-]*\.[a-z0-9][a-z0-9.-]*\b)' "$_cp_prod_norm" &&
+  # ROUND 6 (2026-09-29, herdr-select false positives on tourguide worker
+  # w4K, menu mode): `mkdir -p ingest/produce/shared/fonts`, `cp
+  # ingest/produce/fonts/... ingest/produce/shared/fonts/...`, and `node -c
+  # ingest/produce/lib/anchor_map.js` all escalated as "names a production
+  # target" — `ingest/produce/` is tourguide's report-production CODE
+  # directory inside the worker's OWN worktree, never a live system. Every
+  # branch below matched "prod"/"live" as a bare SUBSTRING with no boundary
+  # after it (`[a-z0-9-]*` happily eats the rest of an ordinary word: "prod"
+  # + "uce" = "produce", "live" + "r" = "liver"), so any word that merely
+  # STARTS with prod/live — produce, product, production (already its own
+  # alternative), liver, livestream — counted as a target. The two flag-
+  # value branches (`--project <val>`, `-p <val>`) had no boundary at all
+  # AFTER the match and the short-flag branch had none BEFORE it either.
+  #
+  # Fix: the word must actually END there. A real target may still be
+  # SUFFIXED (`prod-us`, `prod2`, `live-site` — needed for the selector
+  # cases above), but only by a separator-led continuation: a literal `-`
+  # or a leading digit, never a plain letter. `\b(prod|production|live)`
+  # plus a suffix group anchored the same way in every branch, verified by
+  # POSIX leftmost-longest ERE semantics (no backtracking priority issue):
+  # "produce"/"productive"/"liver"/"livestream" now have NO valid parse
+  # (the suffix group cannot consume a bare letter), while "prod-us",
+  # "prod2", "live-site", and the full word "production" still do.
+  _cp_imatch '(--(context|env|environment|profile|namespace|target|app|stage|remote|host|project|subscription|account|cluster|instance|database|db|region|org|space|site)([[:space:]]+|=)[^[:space:]]*\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b|(^|[[:space:]])-[aeEpnc][[:space:]]+[^[:space:]]*\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b[^[:space:]]*([[:space:]]|$)|(^|[[:space:]])[A-Za-z_]*(ENV|STAGE)=(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b[^[:space:]]*([[:space:]]|$)|\b(ssh|scp|rsync|psql|mysql|redis-cli|mongosh|wrangler|vercel|netlify|fly|flyctl|heroku|gcloud|az|aws|doctl|eksctl|kubectl|helm|gh)\b[^;&|]*\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\b|\b(prod|production|live)((-[a-z0-9]+)|([0-9][a-z0-9-]*))*\.[a-z0-9][a-z0-9.-]*\b)' "$_cp_prod_norm" &&
     _cp_consider 1 "names a production target"
   _cp_imatch '\bterraform[[:space:]]+(apply|destroy)\b|\bkubectl\b.*\b(delete|drain|scale)\b|\bhelm[[:space:]]+(delete|uninstall)\b|\bflyctl?[[:space:]]+(deploy|destroy)\b' "$norm" &&
     _cp_consider 1 "infrastructure scope change"
