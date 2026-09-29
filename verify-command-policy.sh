@@ -412,6 +412,28 @@ check "node -c under a produce/ code dir" "node -c ingest/produce/lib/anchor_map
 # A real target hiding behind the same flag shape must still escalate.
 check "short flag, real prod host"       "kubectl -n prod-payments delete pod api-5f6" escalate
 check "short flag, real prod suffix"     "psql -h prod-2.db.internal -c 'select 1'"   escalate
+# Security probe 2026-09-29: a first cut (prod must END as a word) allowed
+# every one of these. Run-on and `_`-joined target names are normal.
+check "context prod_us"                  "kubectl --context prod_us get pods"      escalate
+check "short flag prod_us"               "kubectl -p prod_us get pods"             escalate
+check "ENV=prod_eu"                      "ENV=prod_eu ./run"                       escalate
+check "APP_STAGE=prod_eu"                "APP_STAGE=prod_eu ./deploy.sh"           escalate
+check "wrangler --env prod_eu"           "wrangler deploy --env prod_eu"           escalate
+check "wrangler --env PROD_EU"           "wrangler deploy --env PROD_EU"           escalate
+check "wrangler --env myprod"            "wrangler deploy --env myprod"            escalate
+check "uppercase context PROD_US"        "KUBECTL --CONTEXT PROD_US GET PODS"      escalate
+check "quoted context prod_us"           "kubectl --context 'prod_us' get pods"    escalate
+check "gke context ending _prod"         "kubectl --context gke_p_us-central1_prod apply -f x.yaml" escalate
+check "gke context _prod-cluster"        "kubectl --context gke_p_us-central1_prod-cluster get secrets" escalate
+check "heroku -a prodapp"                "heroku run -a prodapp bash"              escalate
+check "heroku -a myapp_prod"             "heroku run -a myapp_prod bash"           escalate
+check "ssh proddb"                       "ssh proddb uptime"                       escalate
+check "ssh prodweb01"                    "ssh prodweb01 uptime"                    escalate
+check "ssh liveserver"                   "ssh liveserver uptime"                   escalate
+check "gcloud --project prod_web"        "gcloud --project prod_web compute instances delete api-1" escalate
+check "gcloud --project prodweb"         "gcloud --project prodweb compute instances delete api-1" escalate
+check "az --subscription prod_main"      "az vm delete --subscription prod_main --name web-01" escalate
+check "product word under a -p flag"     "mkdir -p src/products/list"              allow
 
 echo
 echo "== more realistic production-target shapes, not just the pinned ones =="
