@@ -333,6 +333,35 @@ HERDR_RUN_STATE_DIR="$emp" bash "$here/herdr-action.sh" tick
 t1=$(perl -MTime::HiRes=time -e 'printf "%d", time*1000')
 [ $((t1 - t0)) -lt 300 ] && ok "tick with no registry/pending work is cheap ($((t1 - t0))ms)" || not_ok "idle tick took $((t1 - t0))ms"
 
+printf '== withdrawal: a request whose task ended before a decision ==\n'
+register_task run1 taskw worker1 cond1 "$CPANE" "$CBIRTH" 'w1:p7' gen-7 /repo "$wt" impl:taskw feat/w main "" "" hook >/dev/null
+set_task_state run1 taskw running; set_task_state run1 taskw completed no-follow-on
+[ "$(read_task run1 taskw | field state)" = completed ] && ok "setup: taskw is completed" || not_ok "setup: taskw state $(read_task run1 taskw | field state)"
+wd=()
+for p in wd1 wd2 wd3; do
+  wd+=("$(bashc "chmod -R u+rw tmp/$p" | field request_id)")
+done
+for r in "${wd[@]}"; do q "UPDATE action_requests SET route='human', verdict='reserved' WHERE request_id='$r';"; done
+bash "$here/herdr-action.sh" tick; bash "$here/herdr-action.sh" tick
+wrec() { printf '%s/forms/%s.json' "$HERDR_STATE_ROOT" "$(q "SELECT form_record FROM action_requests WHERE request_id='$1';")"; }
+w1="$(wrec "${wd[0]}")"; w2="$(wrec "${wd[1]}")"
+[ "$(jq -r .status "$w1")" = open ] && [ "$(jq -r .status "$w2")" = open ] && ok "setup: two open, pinned forms" || not_ok "setup: forms not open ($w1, $w2)"
+# wd2's form is answered 'approve' — then its task ends before the tick applies it.
+jq -c --arg id "${wd[1]}" '.status="answered" | .answers={request_id:$id, decision:"approve", reason:"ok"}' "$w2" > "$w2.t" && mv "$w2.t" "$w2"
+q "UPDATE action_requests SET task_id='taskw' WHERE request_id IN ('${wd[0]}','${wd[1]}');"
+q "UPDATE action_requests SET task_id='ghost' WHERE request_id='${wd[2]}';"
+bash "$here/herdr-action.sh" tick; bash "$here/herdr-action.sh" tick
+[ "$(q "SELECT status||'/'||authority FROM action_requests WHERE request_id='${wd[0]}';")" = withdrawn/system ] \
+  && ok "terminal task: pending request withdrawn (authority system)" || not_ok "wd1: $(q "SELECT status, authority FROM action_requests WHERE request_id='${wd[0]}';")"
+[ "$(jq -r .status "$w1")" = withdrawn ] && ok "its open form record is withdrawn (hub drops it from /decisions)" || not_ok "wd1 form: $(jq -c . "$w1")"
+[ "$(q "SELECT status FROM action_requests WHERE request_id='${wd[1]}';")" = withdrawn ] \
+  && ok "an approve answered after the task ended grants nothing" || not_ok "wd2: $(q "SELECT status FROM action_requests WHERE request_id='${wd[1]}';")"
+[ "$(jq -r '.status + "/" + .answers.decision' "$w2")" = answered/approve ] && ok "the answered record is not overwritten" || not_ok "wd2 form: $(jq -c . "$w2")"
+[ "$(q "SELECT status FROM action_requests WHERE request_id='${wd[2]}';")" = pending ] \
+  && ok "a request whose task row is missing stays pending (never guessed at)" || not_ok "wd3 withdrawn without a terminal task"
+[ "$(q "SELECT count(*) FROM events WHERE type='action_withdrawn';")" = 2 ] && ok "one action_withdrawn event per request across two ticks" || not_ok "events: $(q "SELECT count(*) FROM events WHERE type='action_withdrawn';")"
+q "UPDATE action_requests SET status='declined' WHERE request_id='${wd[2]}';"
+
 printf '== the omp hook: enforcing only for approval=hook rows ==\n'
 if command -v bun >/dev/null 2>&1; then
   hook_js='const mod = await import(process.env.HOOK); const h = {}; mod.default({on: (e, f) => { h[e] = f; }});

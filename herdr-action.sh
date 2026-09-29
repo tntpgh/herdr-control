@@ -37,6 +37,10 @@
 # after HERDR_ACTION_STALE_S, default 900s): the tick posts ONE Slack alert
 # (class human-action, lib/slack-level.sh) and serves a formserve decision on
 # the hub, re-serving it when it expires. Expiry is never a decline.
+# A request whose task reaches a terminal state (completed/failed/cancelled/
+# lost) before a decision is withdrawn by the tick (status `withdrawn`), and
+# its form record, if still open, is flipped to `withdrawn` so /decisions
+# stops listing a question nobody can act on.
 #
 # Not a containment boundary (docs/approval-policy.md rule 7): a same-user
 # process can set HERDR_PANE_ID, write the registry or a form file.
@@ -58,6 +62,7 @@ HA_SEND="${HERDR_ACTION_SEND:-$here/send-to-agent.sh}"
 HA_NOTIFY="${HERDR_ACTION_NOTIFY:-$here/slack-bridge/herdr-notify.sh}"
 HA_FORMSERVE="${HERDR_ACTION_FORMSERVE:-$here/formserve.py}"
 HA_PYTHON="${HERDR_ACTION_PYTHON:-python3}"
+HA_RECORD_PYTHON="${HERDR_ACTION_RECORD_PYTHON:-python3}"
 HA_FORMS_DIR="${HERDR_STATE_ROOT:-$HOME/.local/state/herdr}/forms"
 HA_STALE_S="${HERDR_ACTION_STALE_S:-900}"
 
@@ -68,6 +73,13 @@ _ha_epoch() { date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -u
 
 _ha_task_active() {                     # task-json -> 0 if active
   case "$(_ha_field "$1" state)" in starting|running|blocked) return 0 ;; esac
+  return 1
+}
+
+# Terminal states never come back (`lost` included: reconcile's verdict is
+# final by design, verify-reconcile.sh).
+_ha_task_terminal() {                   # task-json -> 0 if terminal
+  case "$(_ha_field "$1" state)" in completed|failed|cancelled|lost) return 0 ;; esac
   return 1
 }
 
@@ -330,6 +342,48 @@ EOF
   fi
 }
 
+# Flip a form record open -> withdrawn under record_store's lock, so the hub
+# stops listing it and refuses an answer (409). A record already answered or
+# expired is left exactly as it is: a real answer is never overwritten.
+_ha_retire_form() {                     # record-path reason
+  "$HA_RECORD_PYTHON" - "$here/lib" "$1" "$2" >/dev/null 2>&1 <<'PY' || true
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from record_store import NotClaimable, claim_and_update
+def _withdraw(row):
+    row.update(status="withdrawn", withdrawn_reason=sys.argv[3], withdrawn_at=int(time.time() * 1000))
+    return row
+try:
+    claim_and_update(Path(sys.argv[2]), _withdraw)
+except (NotClaimable, FileNotFoundError):
+    pass
+PY
+}
+
+# A request whose task ended before anyone decided it: observed 2026-09-29,
+# 19 of them pending up to 15h after their workers completed or were lost,
+# 4 with forms still listed open on /decisions. Answering one did nothing —
+# the tick skipped inactive tasks — so the inbox held questions nobody could
+# act on, and every tick re-read them.
+_ha_withdraw() {                        # id row task-json
+  local id="$1" row="$2" tj="$3" st why fp fid _st
+  st="$(_ha_field "$tj" state)"
+  why="task $st before a decision; nothing is left to run it"
+  action_request_withdraw "$id" "$why" || return 0
+  fid="$(_ha_field "$row" form_record)"
+  fp="$(_ha_field "$row" form_path)"
+  if [ -z "$fid" ] && [ -n "$fp" ]; then
+    read -r _st fid <<EOF
+$(_ha_form_status "$fp")
+EOF
+  fi
+  case "$fid" in ''|*/*|*..*) ;; *) _ha_retire_form "$HA_FORMS_DIR/$fid.json" "$why" ;; esac
+  append_event "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_withdrawn \
+    "$(jq -nc --arg id "$id" --arg s "$st" --arg f "$fid" '{request_id:$id, task_state:$s, form_record:$f}')" \
+    "actwd_${id}" >/dev/null 2>&1 || true
+}
+
 cmd_tick() {
   local id row tj age now
   registry_init >/dev/null 2>&1 || return 0
@@ -338,7 +392,12 @@ cmd_tick() {
     [ -n "$id" ] || continue
     row="$(action_request_get "$id")"; [ -n "$row" ] || continue
     tj="$(read_task "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)")"
-    _ha_task_active "$tj" || continue
+    if ! _ha_task_active "$tj"; then
+      # Only a definite terminal state withdraws; an unreadable or missing
+      # task row is left pending rather than guessed at.
+      _ha_task_terminal "$tj" && _ha_withdraw "$id" "$row" "$tj"
+      continue
+    fi
     age=$(( now - $(_ha_epoch "$(_ha_field "$row" created_at)") ))
     if [ "$(_ha_field "$row" route)" = conductor ]; then
       cmd_surface "$id" >/dev/null 2>&1 || true
