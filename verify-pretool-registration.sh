@@ -33,7 +33,8 @@ good=0
 bad=0
 ok() { good=$((good + 1)); printf '  ok    %s\n' "$1"; }
 not_ok() { bad=$((bad + 1)); printf '  FAIL  %s\n' "$1"; }
-run_guard() { bash "$here/lib/pretool-registration.sh" "$@" >/dev/null 2>"$work/err"; }
+run_guard() { bash "$here/lib/pretool-registration.sh" "$@" </dev/null >/dev/null 2>"$work/err"; }
+guard_with() { local in="$1"; shift; printf '%s' "$in" | bash "$here/lib/pretool-registration.sh" "$@" >/dev/null 2>"$work/err"; }
 
 printf '== native fleet creation refuses even for registered workers ==\n'
 HERDR_TASK_ID=missing run_guard task "$wt"; rc=$?
@@ -97,6 +98,38 @@ run_guard task "$wt/src"; rc=$?
 run_guard xd_spawn_task "$wt/src"; rc=$?
 [ "$rc" -eq 8 ] && ok 'spawn-shaped xd device name still refused' || not_ok "xd_spawn_task rc=$rc"
 
+printf '== read-only task batches pass; anything that can mutate stays refused ==\n'
+real_home="$HOME"; export HOME="$work/home"; mkdir -p "$HOME"
+git -C "$wt" init -q  # so the project-root shadow check resolves $wt from $wt/src
+guard_with '{"tasks":[{"agent":"scout","task":"x"}]}' task "$wt/src"; rc=$?
+[ "$rc" -eq 0 ] && ok 'scout-only batch allowed' || not_ok "scout rc=$rc"
+guard_with '{"tasks":[{"agent":"scout","task":"x"},{"agent":"security-reviewer","task":"y"}]}' task "$wt/src"; rc=$?
+[ "$rc" -eq 0 ] && ok 'scout + security-reviewer batch allowed' || not_ok "mixed read-only rc=$rc"
+for unsafe in \
+  '{"tasks":[{"agent":"scout"},{"agent":"task"}]}' \
+  '{"tasks":[{"task":"no agent defaults to task"}]}' \
+  '{"tasks":[{"agent":"reviewer"}]}' \
+  '{"tasks":[{"agent":"scout","tools":["writer"]}]}' \
+  '{"tools":["writer"],"tasks":[{"agent":"scout"}]}' \
+  '{"tasks":[]}' \
+  'not json'; do
+  guard_with "$unsafe" task "$wt/src"; rc=$?
+  [ "$rc" -eq 8 ] && ok "refused: $unsafe" || not_ok "should refuse ($rc): $unsafe"
+done
+guard_with '{"tasks":[{"agent":"scout"}]}' agent "$wt/src"; rc=$?
+[ "$rc" -eq 8 ] && ok 'exemption is task-tool only (agent still refused)' || not_ok "agent rc=$rc"
+mkdir -p "$wt/.omp/agents" && printf -- '---\nname: scout\ntools: bash, write\n---\n' > "$wt/.omp/agents/scout.md"
+guard_with '{"tasks":[{"agent":"scout"}]}' task "$wt/src"; rc=$?
+[ "$rc" -eq 8 ] && ok 'project agent file shadowing scout refuses the exemption' || not_ok "shadowed scout rc=$rc"
+rm "$wt/.omp/agents/scout.md"
+mkdir -p "$HOME/.omp/agent/agents" && printf -- '---\nname: security-reviewer\n---\n' > "$HOME/.omp/agent/agents/security-reviewer.md"
+guard_with '{"tasks":[{"agent":"scout"}]}' task "$wt/src"; rc=$?
+[ "$rc" -eq 8 ] && ok 'user agent file shadowing an allowed name refuses the exemption' || not_ok "user shadow rc=$rc"
+rm "$HOME/.omp/agent/agents/security-reviewer.md"
+TEST_CWD="$wt/src" bun -e 'const mod = await import("./agent-hooks/omp-herdr-control.ts"); const h = {}; mod.default({on: (e, f) => { h[e] = f; }}); for (const agent of ["scout", "task"]) { const r = h.tool_call({toolName: "task", input: {tasks: [{agent, task: "x"}]}}); console.log(agent + "=" + (r?.block ? "BLOCK" : "ALLOW")); }' >"$work/ext" 2>"$work/bun.err"
+grep -qx 'scout=ALLOW' "$work/ext" && ok 'OMP hook allows a scout batch end to end' || not_ok "OMP scout: $(cat "$work/ext" "$work/bun.err")"
+grep -qx 'task=BLOCK' "$work/ext" && ok 'OMP hook still blocks a task-agent batch' || not_ok "OMP task: $(cat "$work/ext" "$work/bun.err")"
+export HOME="$real_home"
 
 printf '== unregistered ordinary tools remain outside this guard ==\n'
 HERDR_TASK_ID=missing run_guard bash "$wt"; rc=$?

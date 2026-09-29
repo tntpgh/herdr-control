@@ -273,7 +273,10 @@ function pretoolRegistrationBlock(event: unknown): { block: true; reason: string
     const result = spawnSync("bash", [PRETOOL_REGISTRATION_SH, toolName, cwd], {
       encoding: "utf8",
       timeout: 5_000,
-      stdio: ["ignore", "pipe", "pipe"],
+      // The guard reads the input to exempt read-only task batches (scout /
+      // security-reviewer only); anything it cannot parse stays refused.
+      input: JSON.stringify(input),
+      stdio: ["pipe", "pipe", "pipe"],
     });
     if (result.status === 0) return undefined;
     const detail = `${result.stderr ?? ""}\n${result.stdout ?? ""}`.replace(/\s+/g, " ").trim();
