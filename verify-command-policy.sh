@@ -1871,6 +1871,23 @@ for _f5i in 1 2 3 4 5 6 7 8 9 10; do
 done
 check_wt "find -exec nested past the depth cap fails closed, not silently allowed (#192 round 4 static 5)" \
   "$WT_184" "$_f5cmd" escalate
+
+# herdr-control#192 round 5 — one more gap found on re-confirmation: an
+# EMPTY quoted value (`''`/`""`/`$''`) given to a value-taking flag
+# vanished during word-splitting instead of surviving as a real, distinct
+# zero-length word, so the flag ate the NEXT real positional instead.
+check_wt "cp -S with an empty single-quoted value doesn't eat the real dest (#192 round 5)" \
+  "$WT_184" "cp -S '' file.txt /outside/dest.txt" escalate
+check_wt "gcp -S with an empty single-quoted value doesn't eat the real dest (#192 round 5)" \
+  "$WT_184" "gcp -S '' file.txt /outside/dest.txt" escalate
+check_wt "rsync --suffix with an empty single-quoted value doesn't eat the real dest (#192 round 5)" \
+  "$WT_184" "rsync -a --suffix '' src.txt /outside/dest.txt" escalate
+check_wt "install -S with an empty single-quoted value doesn't eat the real dest (#192 round 5)" \
+  "$WT_184" "install -S '' src.txt /outside/dest" escalate
+check_wt "cp -S with an empty ANSI-C-quoted value doesn't eat the real dest (#192 round 5)" \
+  "$WT_184" "cp -S \$'' file.txt /outside/dest.txt" escalate
+check_wt "cp -S with a non-empty value still works, no regression (#192 round 5 sanity)" \
+  "$WT_184" "cp -S .bak file.txt /outside/dest.txt" escalate
 check "bash write-scope rule is a no-op with no worktree context" \
   "cat f >> /outside" allow
 

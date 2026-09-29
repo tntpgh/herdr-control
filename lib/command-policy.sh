@@ -205,6 +205,20 @@ _cp_data_run_ext='(html?|json|xml|csv|tsv|txt|md|log|ya?ml|png|jpe?g|gif|svg|pdf
 # never reset mid-command; restore real newlines in the output afterward.
 # A literal `\x0F` byte in the ORIGINAL command text would collide — the
 # same accepted risk this function already takes for bytes 1-7 and 14.
+#
+# herdr-control#192 round 5: a quote pair that opens and closes with NO
+# content between them (a bare pair of single or double quotes, or the
+# quoted half of an ANSI-C dollar-single-quote) is a real, distinct,
+# ZERO-LENGTH shell word — a flag given an explicitly empty value followed
+# by a real filename is three real words, not two. Emitting nothing for
+# it collapsed the surrounding real spaces together, and the unquoted
+# word-splitting downstream (`_cp_locate_command_word`'s `set -- $1`) then
+# silently swallowed that word entirely — a value-taking flag given an
+# explicit empty value ate the NEXT real positional instead. `qn` below
+# counts characters emitted since the quote opened; a zero count at close
+# emits one sentinel byte (0x10, otherwise unused by this protection
+# scheme) so the word survives splitting as a real (if invisible) token —
+# every unprotect step strips it back out, restoring true emptiness.
 _cp_protect_text() {                    # raw
   printf '%s' "$1" | tr '\n' '\017' | awk '
     function prot(c) {
@@ -230,13 +244,16 @@ _cp_protect_text() {                    # raw
     }
     {
       SQ = sprintf("%c", 39); DQ = "\""; BT = sprintf("%c", 96)
-      line = $0; n = length(line); st = 0; i = 1; out = ""
+      # herdr-control#192 round 5: qn tracks characters emitted since the
+      # quote opened, so a same-position open/close pair (a genuinely
+      # empty quoted word) can emit the empty-word sentinel below.
+      line = $0; n = length(line); st = 0; i = 1; out = ""; qn = 0
       while (i <= n) {
         c = substr(line, i, 1)
         if (st == 0) {
           if (c == "\\")      { out = out prot(substr(line, i+1, 1)); i += 2; continue }
-          if (c == SQ)        { st = 1; i++; continue }
-          if (c == DQ)        { st = 2; i++; continue }
+          if (c == SQ)        { st = 1; qn = 0; i++; continue }
+          if (c == DQ)        { st = 2; qn = 0; i++; continue }
           if (c == BT)        { j = i+1; while (j <= n && substr(line, j, 1) != BT) j++
                                 out = out "@SUB@"; i = j+1; continue }
           if (c == "$" && substr(line, i+1, 1) == "(") {
@@ -244,11 +261,13 @@ _cp_protect_text() {                    # raw
           out = out c; i++; continue
         }
         q = (st == 1) ? SQ : DQ
-        if (c == q)           { st = 0; i++; continue }
-        if (st == 2 && c == "\\") { out = out prot(substr(line, i+1, 1)); i += 2; continue }
+        if (c == q)           { st = 0; i++
+                                if (qn == 0) out = out sprintf("%c", 16)
+                                continue }
+        if (st == 2 && c == "\\") { out = out prot(substr(line, i+1, 1)); i += 2; qn++; continue }
         if (st == 2 && c == "$" && substr(line, i+1, 1) == "(") {
-                                i = skipsub(line, i+2, n); out = out "@SUB@"; continue }
-        out = out prot(c); i++; continue
+                                i = skipsub(line, i+2, n); out = out "@SUB@"; qn++; continue }
+        out = out prot(c); i++; qn++; continue
       }
       print out
     }' | tr '\017' '\n'
@@ -874,7 +893,11 @@ _cp_shebang_kind() {
 # arriving here as one protected token — can be handed to `_cp_coderef_walk`
 # as fresh raw text and re-split on its own real operators.
 _cp_coderef_unprotect() {
-  printf '%s' "$1" | tr $'\001\002\003\004\005\006\007\016' ' ;&|()<>'
+  # herdr-control#192 round 5: strip the empty-quoted-word sentinel
+  # (`_cp_protect_text`, 0x10) before restoring the real operator bytes —
+  # it exists only to keep an empty `''`/`""`/`$''` word from vanishing
+  # during upstream unquoted word-splitting, not to appear in the value.
+  printf '%s' "$1" | tr -d '\020' | tr $'\001\002\003\004\005\006\007\016' ' ;&|()<>'
 }
 
 # `_cp_coderef_wrapped_command <cmd> <args...>` -> prints the first word
@@ -2857,7 +2880,14 @@ _cp_path_within_worktree() {
 # dropped — a quoted filename's bytes are what a real shell would pass the
 # command anyway).
 _cp_bwt_unprotect() {
-  printf '%s' "$1" | tr '\001\002\003\004\005\006\007\016' ' ;&|()<>'
+  # herdr-control#192 round 5: strip the empty-quoted-word sentinel
+  # (`_cp_protect_text`, 0x10) before restoring the real operator bytes —
+  # it exists only to keep an empty `''`/`""`/`$''` word from vanishing
+  # during upstream unquoted word-splitting (`set -- $1` in
+  # `_cp_locate_command_word`, which previously swallowed a value-taking
+  # flag's explicit empty value AND the next real positional along with
+  # it), not to appear in the final literal value.
+  printf '%s' "$1" | tr -d '\020' | tr '\001\002\003\004\005\006\007\016' ' ;&|()<>'
 }
 
 # _cp_bwt_classify_target <literal token, unprotected> -> "TARGET\t<value>"

@@ -1335,6 +1335,10 @@ bash_rsync_glued_T_out|bash|{"command":"rsync -aT$OTHER file.txt file2.txt"}
 bash_curl_glued_o_out|bash|{"command":"curl -o$OTHER/f https://example.com"}
 bash_wget_glued_O_out|bash|{"command":"wget -O$OTHER/f https://example.com"}
 bash_tar_glued_C_out|bash|{"command":"tar -x -C$OTHER -f a.tar"}
+bash_cp_empty_S_out|bash|{"command":"cp -S '' file.txt $OTHER/dest.txt"}
+bash_gcp_empty_S_out|bash|{"command":"gcp -S '' file.txt $OTHER/dest.txt"}
+bash_rsync_empty_suffix_out|bash|{"command":"rsync -a --suffix '' src.txt $OTHER/dest.txt"}
+bash_install_empty_S_out|bash|{"command":"install -S '' src.txt $OTHER/dest"}
 in_wt_bash_find_exec_inside|bash|{"command":"find . -exec touch .handoffs/x \\\\;"}
 in_wt_bash_find_no_exec|bash|{"command":"find . -name '*.log'"}
 in_wt_bash_c_inside|bash|{"command":"bash -c 'echo x >> .handoffs/x.out'"}
