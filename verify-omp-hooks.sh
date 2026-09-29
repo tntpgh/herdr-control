@@ -1301,8 +1301,19 @@ bash_rw_redirect_creates_file_out|bash|{"command":": <> $OTHER/f2"}
 bash_fd_rw_redirect_out|bash|{"command":"exec 3<> $OTHER/f3"}
 bash_find_exec_wraps_verb_out|bash|{"command":"find . -maxdepth 0 -exec touch $OTHER/marker \\\\;"}
 bash_xargs_wraps_verb_out|bash|{"command":"echo $OTHER/marker | xargs touch"}
+bash_c_wraps_string_out|bash|{"command":"bash -c 'echo x > $OTHER/bashc-out.txt'"}
+bash_lc_cluster_out|bash|{"command":"bash -lc 'echo x > $OTHER/f'"}
+bash_tar_xf_C_out|bash|{"command":"tar -xf a.tar -C $OTHER"}
+bash_rsync_dest_out|bash|{"command":"rsync -a src.txt $OTHER/dest.txt"}
+bash_sort_o_out|bash|{"command":"sort -o $OTHER/out.txt src.txt"}
+bash_mkfifo_out|bash|{"command":"mkfifo $OTHER/fifo1"}
+bash_curl_o_out|bash|{"command":"curl -o $OTHER/f https://example.com"}
+bash_git_clone_dest_out|bash|{"command":"git clone https://example.com/r.git $OTHER/r"}
+bash_perl_pi_cluster_out|bash|{"command":"perl -pi -e 's/a/b/' $OTHER/perl-pi-target.txt"}
 in_wt_bash_find_exec_inside|bash|{"command":"find . -exec touch .handoffs/x \\\\;"}
 in_wt_bash_find_no_exec|bash|{"command":"find . -name '*.log'"}
+in_wt_bash_c_inside|bash|{"command":"bash -c 'echo x >> .handoffs/x.out'"}
+in_wt_bash_tar_no_C|bash|{"command":"tar -xf a.tar"}
 in_wt_bash_append|bash|{"command":">> .handoffs/x.out"}
 in_wt_bash_devnull|bash|{"command":"> /dev/null 2>&1"}
 in_wt_bash_cd_sub|bash|{"command":"cd sub && echo x > y"}

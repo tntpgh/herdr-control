@@ -1680,6 +1680,50 @@ check_wt "bash find -exec touch fully inside the worktree allows (unwrap, not bl
   "$WT_184" 'find . -exec touch .handoffs/x \;' allow
 check_wt "bash plain find with no -exec writes nothing, allows (the dominant real-world find shape)" \
   "$WT_184" "find . -name '*.log'" allow
+
+# herdr-control#192 round 2 — three MORE parser gaps found on re-review.
+check_wt "bash -c wraps a real bash string, unwrapped and escalates (#192 round 2 bypass D)" \
+  "$WT_184" "bash -c 'echo x > /outside/bashc-out.txt'" escalate
+check_wt "sh -c wraps a real bash string, unwrapped and escalates (#192 round 2 bypass D)" \
+  "$WT_184" "sh -c 'echo x > /outside/shc-out.txt'" escalate
+check_wt "bash -lc (combined cluster) still finds the -c string (#192 round 2 bypass D)" \
+  "$WT_184" "bash -lc 'echo x > /outside/f'" escalate
+check_wt "bash -c with a non-literal argument fails closed, not silently allowed (#192 round 2 bypass D)" \
+  "$WT_184" 'bash -c "echo x > $TARGETVAR"' escalate
+check_wt "bash -c fully inside the worktree allows (unwrap, not blanket fail-closed)" \
+  "$WT_184" "bash -c 'echo x >> .handoffs/x.out'" allow
+check_wt "tar -xf -C names a real extraction destination (#192 round 2 bypass E)" \
+  "$WT_184" "tar -xf a.tar -C /outside" escalate
+check_wt "tar -cf names a real archive destination (#192 round 2 bypass E)" \
+  "$WT_184" "tar -cf /outside/a.tar ." escalate
+check_wt "tar -xf with no -C writes nothing extra, allows" \
+  "$WT_184" "tar -xf a.tar" allow
+check_wt "rsync last-arg destination outside (#192 round 2 bypass E)" \
+  "$WT_184" "rsync -a src.txt /outside/dest.txt" escalate
+check_wt "scp last-arg destination outside (#192 round 2 bypass E)" \
+  "$WT_184" "scp src.txt /outside/dest.txt" escalate
+check_wt "sort -o outside (#192 round 2 bypass E)" \
+  "$WT_184" "sort -o /outside/out.txt src.txt" escalate
+check_wt "split prefix outside (#192 round 2 bypass E)" \
+  "$WT_184" "split -b 2 src.txt /outside/prefix-" escalate
+check_wt "mkfifo outside (#192 round 2 bypass E)" \
+  "$WT_184" "mkfifo /outside/fifo1" escalate
+check_wt "curl -o outside (#192 round 2 bypass E)" \
+  "$WT_184" "curl -o /outside/f https://example.com" escalate
+check_wt "wget -O outside (#192 round 2 bypass E)" \
+  "$WT_184" "wget -O /outside/f https://example.com" escalate
+check_wt "patch -o outside (#192 round 2 bypass E)" \
+  "$WT_184" "patch -o /outside/f target.diff" escalate
+check_wt "git clone explicit dest outside (#192 round 2 bypass E)" \
+  "$WT_184" "git clone https://example.com/r.git /outside/r" escalate
+check_wt "perl -pi combined cluster in-place, unwrapped and escalates (#192 round 2 bypass F)" \
+  "$WT_184" "perl -pi -e 's/a/b/' /outside/perl-pi-target.txt" escalate
+check_wt "sed -ni combined cluster in-place, unwrapped and escalates (#192 round 2 bypass F)" \
+  "$WT_184" "sed -ni 's/a/b/p' /outside/f" escalate
+check_wt "sed -i '' (BSD mandatory empty-suffix arg) still caught correctly, no regression" \
+  "$WT_184" "sed -i '' 's/a/b/' /outside/f" escalate
+check_wt "xargs -I{} placeholder fails closed, not silently allowed" \
+  "$WT_184" 'echo /outside/marker | xargs -I{} touch {}' escalate
 check "bash write-scope rule is a no-op with no worktree context" \
   "cat f >> /outside" allow
 

@@ -2914,18 +2914,25 @@ _cp_bwt_scan_redirects() {
 
 # _cp_bwt_inplace_targets <argv...> -> classify_target for every FILE
 # argument of a sed/perl `-i`/`--in-place` invocation. Only fires when an
-# in-place flag is present; treats the first non-option argument as the
-# script/expression (unless `-e`/`-f` supplied one explicitly, which also
-# consumes its own following value) and every non-option argument after that
-# as a file target — an approximation (a second `-e` after files, `-f
-# script.sed` after files, ...) documented rather than hidden, same spirit
-# as _cp_walk_run's own documented misses.
+# in-place flag is present — `-i`/`-i.SUFFIX`/`--in-place[=SUFFIX]`, OR `i`
+# ANYWHERE in a leading short-flag cluster (`-pi`, `-ni`, `-pie`,
+# herdr-control#192 round 2 bypass F: a literal `-i`-prefix match missed
+# perl's extremely common `-pi -e '...'` one-liner shape entirely). Treats
+# the first non-option argument as the script/expression (unless `-e`/`-f`
+# supplied one explicitly, which also consumes its own following value)
+# and every non-option argument after that as a file target — an
+# approximation (a second `-e` after files, `-f script.sed` after files,
+# ...) documented rather than hidden, same spirit as _cp_walk_run's own
+# documented misses.
 _cp_bwt_inplace_targets() {
   local -a args=("$@")
   local n="${#args[@]}" i=0 inplace=0 script_consumed=0 a
   i=0
   while [ "$i" -lt "$n" ]; do
-    case "${args[$i]}" in -i|-i.*|--in-place|--in-place=*) inplace=1 ;; esac
+    case "${args[$i]}" in
+      -i|-i.*|--in-place|--in-place=*) inplace=1 ;;
+      -[a-zA-Z]*) case "${args[$i]}" in *i*) inplace=1 ;; esac ;;
+    esac
     i=$((i + 1))
   done
   [ "$inplace" = 1 ] || return 0
@@ -2948,38 +2955,53 @@ _cp_bwt_inplace_targets() {
   done
 }
 
-# _cp_bwt_verb_targets <command word> <non-redirect argv...> -> classify
-# every destination `cp`/`mv`/`install`/`ln` (last non-option arg, or the
-# `-t DIR`/`--target-directory=DIR` value), `dd of=`, in-place `sed`/`perl`,
-# `touch`, `truncate`, and `tee [-a]` argument names; `find -exec/-execdir/
-# -ok .../\;`|`+` and `xargs`/`parallel`'s trailing command are unwrapped
-# (herdr-control#192, bypass C) and their own verb + args re-classified
-# through this same function, rather than blanket-failing every `find`/
-# `xargs` closed — measured liveness showed that costs ~3% of ALL matched
-# candidates fleet-wide over 3 days, because a bare `find … -name …`
-# search with no `-exec` at all (no write possible) was the overwhelming
-# majority. A wrapped verb this file doesn't otherwise govern (`rm`,
-# `chmod`, …) still emits nothing — same ceiling a bare top-level
-# invocation of that verb already has, #184 never promised to cover it.
+# _cp_bwt_verb_targets <command word> <cwd> <non-redirect argv...> ->
+# classify every destination `cp`/`mv`/`install`/`ln` (last non-option arg,
+# or the `-t DIR`/`--target-directory=DIR` value), `dd of=`, in-place
+# `sed`/`perl`, `touch`, `truncate`, `tee [-a]`, `tar -C`/`-f` (bypass E),
+# `rsync`/`scp`'s destination, `sort -o`/`split`'s prefix, `curl -o`/`-O`,
+# `wget -O`/`-P`, `patch -o`, `mkfifo`/`mknod`/`mkdir`, `unzip -d`, `git
+# clone <dest>` argument names; `find -exec/-execdir/-ok .../\;`|`+` and
+# `xargs`/`parallel`'s trailing command are unwrapped (bypass C) and their
+# own verb + args re-classified through this same function, rather than
+# blanket-failing every `find`/`xargs` closed — measured liveness showed
+# that costs ~3% of ALL matched candidates fleet-wide over 3 days, because
+# a bare `find … -name …` search with no `-exec` at all (no write
+# possible) was the overwhelming majority; `bash -c`/`sh -c`/`zsh -c`/
+# `dash -c`/`ksh -c`/`mksh -c` (bypass D) recurse `bash_write_targets`
+# straight back into the literal `-c` string, the SAME grammar this
+# tokenizer already reads — not the #174 interpreter-source ceiling
+# (`python -c`, `node -e`), which is real code in a DIFFERENT language and
+# stays out of scope. `cwd` is threaded through for exactly that
+# recursion — everything else in this function ignores it.
+#
+# `find`/`xargs`/`parallel`'s wrapped verb, and any verb below not in this
+# list at all (`rm`, `chmod`, `kill`, a bare script file passed to `bash`/
+# `python`, …), still emits nothing from THIS function — same ceiling a
+# bare top-level invocation already has. This case statement is a
+# DENYLIST of ordinary write-shaped verbs (herdr-control#192 round 2), not
+# an exhaustive parse of every program that can create a file; the long
+# tail past it is #174's closed-world design, out of scope for #184.
 
-# _cp_bwt_dispatch_wrapped <verb> [args...] -> re-runs _cp_bwt_verb_targets
-# on a command find/xargs/parallel exposes as its own literal, static argv
-# (a find `-exec`/`-execdir`/`-ok` clause's command, or xargs/parallel's
-# trailing command). COMPUTED when the verb token itself is unreadable (a
-# `$VAR`/glob/@SUB@ — e.g. `find . -exec "$CMD" {} \;`); otherwise the
-# SAME classification a top-level invocation of that verb would get.
+# _cp_bwt_dispatch_wrapped <cwd> <verb> [args...] -> re-runs
+# _cp_bwt_verb_targets on a command find/xargs/parallel exposes as its own
+# literal, static argv (a find `-exec`/`-execdir`/`-ok` clause's command,
+# or xargs/parallel's trailing command). COMPUTED when the verb token
+# itself is unreadable (a `$VAR`/glob/@SUB@ — e.g. `find . -exec "$CMD" {}
+# \;`); otherwise the SAME classification a top-level invocation of that
+# verb would get.
 _cp_bwt_dispatch_wrapped() {
-  local verb="$1"; shift
+  local cwd="$1" verb="$2"; shift 2
   case "$verb" in
     *'@SUB@'*|*'$'*|*'*'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*)
       printf 'COMPUTED\t%s\n' "a wrapped command whose name cannot be read statically" ;;
     *)
-      _cp_bwt_verb_targets "$verb" ${1+"$@"} ;;
+      _cp_bwt_verb_targets "$verb" "$cwd" ${1+"$@"} ;;
   esac
 }
 
 _cp_bwt_verb_targets() {
-  local cmd="$1"; shift
+  local cmd="$1" cwd="$2"; shift 2
   case "$cmd" in
     tee)
       local a
@@ -3009,6 +3031,18 @@ _cp_bwt_verb_targets() {
       elif [ "${#nonopt[@]}" -ge 2 ]; then
         _cp_bwt_classify_target "${nonopt[$((${#nonopt[@]} - 1))]}"
       fi ;;
+    rsync|scp)
+      # herdr-control#192 round 2, bypass E: last non-option argument is the
+      # destination, same shape as cp/mv/install/ln above — but NOT the
+      # SAME case (rsync's `-t` means "preserve times", a bare boolean, not
+      # cp's "-t DIR" target-directory; reusing that branch verbatim would
+      # have misread rsync's own `-t` as consuming the next word).
+      local -a nonopt=()
+      local a
+      for a in "$@"; do
+        case "$a" in -*) ;; *) nonopt+=("$a") ;; esac
+      done
+      [ "${#nonopt[@]}" -ge 2 ] && _cp_bwt_classify_target "${nonopt[$((${#nonopt[@]} - 1))]}" ;;
     dd)
       local a
       for a in "$@"; do
@@ -3021,6 +3055,182 @@ _cp_bwt_verb_targets() {
       for a in "$@"; do
         case "$a" in -*) ;; *) _cp_bwt_classify_target "$a" ;; esac
       done ;;
+    mkfifo|mknod|mkdir)
+      # herdr-control#192 round 2, bypass E. `-m`/`--mode` takes a value —
+      # skip it, not a target; mknod's own TYPE/major/minor positionals
+      # after the name also get classified (harmless over-caution, same
+      # spirit as the rest of this file's documented approximations).
+      local -a a=("$@")
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -m|--mode) i=$((i + 2)) ;;
+          --mode=*) i=$((i + 1)) ;;
+          -*) i=$((i + 1)) ;;
+          *) _cp_bwt_classify_target "${a[$i]}"; i=$((i + 1)) ;;
+        esac
+      done ;;
+    unzip)
+      local -a a=("$@")
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -d) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
+          *) i=$((i + 1)) ;;
+        esac
+      done ;;
+    sort)
+      local -a a=("$@")
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -o|--output) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
+          --output=*) _cp_bwt_classify_target "${a[$i]#*=}"; i=$((i + 1)) ;;
+          *) i=$((i + 1)) ;;
+        esac
+      done ;;
+    split)
+      # the trailing PREFIX positional (the one AFTER the input file); a
+      # bare `split FILE` with no explicit prefix defaults to `x` in cwd —
+      # left alone, same "no visible target" ceiling as a bare `dd`. `-a`/
+      # `-b`/`-C`/`-l`/`-n`/`-t` each take a SEPARATE value token — skip
+      # both, or that value (e.g. `-b`'s byte count) gets miscounted as a
+      # positional and shifts which operand is really the prefix.
+      local -a a=("$@") nonopt=()
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -a|-b|-C|-l|-n|-t) i=$((i + 2)) ;;
+          -*) i=$((i + 1)) ;;
+          *) nonopt+=("${a[$i]}"); i=$((i + 1)) ;;
+        esac
+      done
+      [ "${#nonopt[@]}" -ge 2 ] && _cp_bwt_classify_target "${nonopt[1]}" ;;
+    curl)
+      local -a a=("$@")
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -o|--output) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
+          --output=*) _cp_bwt_classify_target "${a[$i]#*=}"; i=$((i + 1)) ;;
+          -O|--remote-name) _cp_bwt_classify_target "."; i=$((i + 1)) ;;
+          *) i=$((i + 1)) ;;
+        esac
+      done ;;
+    wget)
+      local -a a=("$@")
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -O|--output-document) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
+          --output-document=*) _cp_bwt_classify_target "${a[$i]#*=}"; i=$((i + 1)) ;;
+          -P|--directory-prefix) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
+          --directory-prefix=*) _cp_bwt_classify_target "${a[$i]#*=}"; i=$((i + 1)) ;;
+          *) i=$((i + 1)) ;;
+        esac
+      done ;;
+    patch)
+      local -a a=("$@")
+      local i=0 n="${#a[@]}"
+      while [ "$i" -lt "$n" ]; do
+        case "${a[$i]}" in
+          -o|--output) _cp_bwt_classify_target "${a[$((i + 1))]:-}"; i=$((i + 2)) ;;
+          --output=*) _cp_bwt_classify_target "${a[$i]#*=}"; i=$((i + 1)) ;;
+          *) i=$((i + 1)) ;;
+        esac
+      done ;;
+    tar)
+      # herdr-control#192 round 2, bypass E. `-C`/`--directory` only matters
+      # as a WRITE destination during extraction; during creation it is
+      # just where tar reads members from. `-f`/`--file` only matters as a
+      # write destination during creation/append; during extraction it is
+      # the (read) source archive. Accepts both the dashed and the
+      # traditional bare-first-word mode-letter forms (`tar xf a.tar` /
+      # `tar -xf a.tar`), and `f` combined in a cluster (`-cf`, `-xf`) with
+      # its value either glued after it (`-cfa.tar`, rare) or the next argv
+      # word (`-cf a.tar`, the ordinary form).
+      local -a a=("$@")
+      local i=0 n="${#a[@]}" mode_x=0 mode_c=0 dirval="" fileval="" tok rest
+      while [ "$i" -lt "$n" ]; do
+        tok="${a[$i]}"
+        case "$tok" in
+          -C|--directory) dirval="${a[$((i + 1))]:-}"; i=$((i + 2)); continue ;;
+          --directory=*) dirval="${tok#*=}"; i=$((i + 1)); continue ;;
+          -f|--file) fileval="${a[$((i + 1))]:-}"; i=$((i + 2)); continue ;;
+          --file=*) fileval="${tok#*=}"; i=$((i + 1)); continue ;;
+        esac
+        case "$tok" in
+          -*|[!-]*)
+            if [ "${tok#-}" = "$tok" ] && [ "$i" -ne 0 ]; then
+              i=$((i + 1)); continue   # a bare positional, not index 0: not a mode cluster
+            fi
+            case "$tok" in *x*) mode_x=1 ;; esac
+            case "$tok" in *c*) mode_c=1 ;; esac
+            case "$tok" in
+              *f*)
+                rest="${tok#*f}"
+                if [ -n "$rest" ]; then fileval="$rest"; i=$((i + 1))
+                else fileval="${a[$((i + 1))]:-}"; i=$((i + 2))
+                fi
+                continue ;;
+            esac
+            i=$((i + 1)) ;;
+        esac
+      done
+      [ "$mode_x" = 1 ] && [ -n "$dirval" ] && _cp_bwt_classify_target "$dirval"
+      [ "$mode_c" = 1 ] && [ -n "$fileval" ] && _cp_bwt_classify_target "$fileval" ;;
+    git)
+      # herdr-control#192 round 2, bypass E: `git clone [opts] REPO [DEST]`
+      # — every OTHER git subcommand (add/commit/push/...) is governed by
+      # entirely different existing classify_command rules, not this one.
+      case "${1:-}" in
+        clone)
+          shift
+          local -a nonopt=()
+          local a
+          for a in "$@"; do
+            case "$a" in -*) ;; *) nonopt+=("$a") ;; esac
+          done
+          case "${#nonopt[@]}" in
+            0) : ;;
+            1) _cp_bwt_classify_target "." ;;
+            *) _cp_bwt_classify_target "${nonopt[1]}" ;;
+          esac ;;
+      esac ;;
+    bash|sh|zsh|dash|ksh|mksh)
+      # herdr-control#192 round 2, bypass D: `-c STRING` is real bash
+      # grammar — the SAME language this tokenizer already reads, unlike
+      # #174's genuine ceiling (`python -c`, `node -e`, a different
+      # language entirely) — so recurse the shared parser straight back
+      # into it rather than emitting nothing. Handles a `c` anywhere in a
+      # leading flag cluster (`-lc`, `-eu c`'s `-c` is separate, etc): the
+      # value is either the remainder of THAT cluster after `c`, glued
+      # (`-cSTRING`), or the next argv word.
+      local -a a=("$@")
+      local i=0 n="${#a[@]}" script="" found=0
+      while [ "$i" -lt "$n" ] && [ "$found" = 0 ]; do
+        case "${a[$i]}" in
+          --) break ;;
+          --*) ;;
+          -*c) script="${a[$((i + 1))]:-}"; found=1 ;;
+          -*c*) script="${a[$i]#*c}"; found=1 ;;
+        esac
+        i=$((i + 1))
+      done
+      if [ "$found" = 1 ] && [ -n "$script" ]; then
+        case "$script" in
+          *'@SUB@'*|*'$'*)
+            # Deliberately conservative: a `$VAR` ANYWHERE in the script
+            # (even used harmlessly, e.g. `echo "$HOME"`, nowhere near a
+            # redirect) fails the whole thing closed instead of recursing
+            # to find the actual, precisely-readable target — over-
+            # escalation, never the disallowed under-escalation, same
+            # tradeoff this file makes elsewhere.
+            printf 'COMPUTED\t%s\n' "a $cmd -c argument that is not a literal string cannot be read statically" ;;
+          *)
+            bash_write_targets "$script" "$cwd" ;;
+        esac
+      fi ;;
     find)
       # herdr-control#192, bypass C: `-exec CMD ARGS... \;` (or `+`,
       # or `-execdir`/`-ok`) names a real, static, wrapped verb this
@@ -3039,7 +3249,7 @@ _cp_bwt_verb_targets() {
               wrapped+=("${a[$i]}"); i=$((i + 1))
             done
             [ "$i" -lt "$n" ] && i=$((i + 1))
-            [ "${#wrapped[@]}" -gt 0 ] && _cp_bwt_dispatch_wrapped "${wrapped[@]}" ;;
+            [ "${#wrapped[@]}" -gt 0 ] && _cp_bwt_dispatch_wrapped "$cwd" "${wrapped[@]}" ;;
           *) i=$((i + 1)) ;;
         esac
       done ;;
@@ -3066,7 +3276,7 @@ _cp_bwt_verb_targets() {
       while [ "$i" -lt "$n" ]; do wrapped+=("${a[$i]}"); i=$((i + 1)); done
       if [ "${#wrapped[@]}" -gt 0 ]; then
         local out
-        out="$(_cp_bwt_dispatch_wrapped "${wrapped[@]}")"
+        out="$(_cp_bwt_dispatch_wrapped "$cwd" "${wrapped[@]}")"
         if [ -n "$out" ]; then
           printf '%s\n' "$out"
         else
@@ -3076,13 +3286,14 @@ _cp_bwt_verb_targets() {
   esac
 }
 
-# _cp_bwt_segment <operator-split segment> -> every classify_target line this
-# ONE segment names, redirects first (leading, middle, or trailing — unlike
-# _cp_locate_command_word, which only skips LEADING ones), then a verb-
-# specific pass over the command word plus every argument that was not one of
-# those redirects.
+# _cp_bwt_segment <operator-split segment> <cwd> -> every classify_target
+# line this ONE segment names, redirects first (leading, middle, or
+# trailing — unlike _cp_locate_command_word, which only skips LEADING
+# ones), then a verb-specific pass over the command word plus every
+# argument that was not one of those redirects. `cwd` is only used to
+# recurse into a `bash -c`/`sh -c` literal string (bypass D).
 _cp_bwt_segment() {
-  local seg="$1"
+  local seg="$1" cwd="$2"
   _cp_bwt_scan_redirects "$seg"
   _cp_locate_command_word "$seg" || return 0
   local cmd="$_cp_wcmd"
@@ -3099,7 +3310,7 @@ _cp_bwt_segment() {
     esac
     argv+=("$(_cp_bwt_unprotect "$w")")
   done
-  _cp_bwt_verb_targets "$cmd" ${argv[@]+"${argv[@]}"}
+  _cp_bwt_verb_targets "$cmd" "$cwd" ${argv[@]+"${argv[@]}"}
 }
 
 # _cp_bwt_segment_cd <segment> <effective cwd> -> prints the new absolute
@@ -3203,7 +3414,7 @@ bash_write_targets() {
         printf '%s\n' "$line"
       fi
     done <<EOF2
-$(_cp_bwt_segment "$body")
+$(_cp_bwt_segment "$body" "$eff")
 EOF2
     nd="$(_cp_bwt_segment_cd "$body" "$eff")"
     [ -n "$nd" ] && eff="$nd"
