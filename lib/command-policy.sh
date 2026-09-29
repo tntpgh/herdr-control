@@ -219,6 +219,21 @@ _cp_data_run_ext='(html?|json|xml|csv|tsv|txt|md|log|ya?ml|png|jpe?g|gif|svg|pdf
 # emits one sentinel byte (0x10, otherwise unused by this protection
 # scheme) so the word survives splitting as a real (if invisible) token —
 # every unprotect step strips it back out, restoring true emptiness.
+#
+# herdr-control#192 round 6 (regression fix): round 5's first pass emitted
+# that sentinel for ANY empty quote pair, including one sitting INSIDE a
+# word (`c''p`, `b''ash -c '...'`) — real bash concatenates adjacent
+# quoted strings with no separating whitespace into ONE word, so `c''p`
+# really is just `cp`, but the command-word matcher never knew to strip
+# 0x10 out of what it reads as a literal verb name, so `c''p` matched NO
+# verb case at all (silent allow). Fixed at the SAME emission point, not
+# by teaching every consumer to strip a byte it doesn't expect: the
+# sentinel is now emitted ONLY when the quote pair is a genuine STANDALONE
+# empty word — bounded on both sides by a real word boundary (start/end
+# of the command, unquoted whitespace, the flattened-newline byte, or one
+# of `;`/`&`/`|`/`(`/`)`/`<`/`>`). A quote pair touching any other
+# character on either side (still inside the same word) goes back to the
+# original round-1 behavior: plain removal, contributing nothing.
 _cp_protect_text() {                    # raw
   printf '%s' "$1" | tr '\n' '\017' | awk '
     function prot(c) {
@@ -232,6 +247,20 @@ _cp_protect_text() {                    # raw
       if (c == ">")  return sprintf("%c", 14)
       return c
     }
+    function isbound(c) {
+      if (c == "")   return 1
+      if (c == " ")  return 1
+      if (c == "\t") return 1
+      if (c == "\017") return 1
+      if (c == ";")  return 1
+      if (c == "&")  return 1
+      if (c == "|")  return 1
+      if (c == "(")  return 1
+      if (c == ")")  return 1
+      if (c == "<")  return 1
+      if (c == ">")  return 1
+      return 0
+    }
     function skipsub(line, start, n,    d, j, ch) {
       d = 1; j = start
       while (j <= n && d > 0) {
@@ -244,16 +273,19 @@ _cp_protect_text() {                    # raw
     }
     {
       SQ = sprintf("%c", 39); DQ = "\""; BT = sprintf("%c", 96)
-      # herdr-control#192 round 5: qn tracks characters emitted since the
-      # quote opened, so a same-position open/close pair (a genuinely
-      # empty quoted word) can emit the empty-word sentinel below.
-      line = $0; n = length(line); st = 0; i = 1; out = ""; qn = 0
+      # `qn` counts characters emitted since the quote opened; `qopen` is
+      # the RAW-line position of the quote-open character itself, so the
+      # boundary check at close can look at the raw characters just
+      # before the open and just after the close (both, by construction,
+      # outside any quote — the one right before an unquoted open, the
+      # one right after we just returned to st==0).
+      line = $0; n = length(line); st = 0; i = 1; out = ""; qn = 0; qopen = 0
       while (i <= n) {
         c = substr(line, i, 1)
         if (st == 0) {
           if (c == "\\")      { out = out prot(substr(line, i+1, 1)); i += 2; continue }
-          if (c == SQ)        { st = 1; qn = 0; i++; continue }
-          if (c == DQ)        { st = 2; qn = 0; i++; continue }
+          if (c == SQ)        { st = 1; qn = 0; qopen = i; i++; continue }
+          if (c == DQ)        { st = 2; qn = 0; qopen = i; i++; continue }
           if (c == BT)        { j = i+1; while (j <= n && substr(line, j, 1) != BT) j++
                                 out = out "@SUB@"; i = j+1; continue }
           if (c == "$" && substr(line, i+1, 1) == "(") {
@@ -262,7 +294,8 @@ _cp_protect_text() {                    # raw
         }
         q = (st == 1) ? SQ : DQ
         if (c == q)           { st = 0; i++
-                                if (qn == 0) out = out sprintf("%c", 16)
+                                if (qn == 0 && isbound(substr(line, qopen - 1, 1)) && isbound(substr(line, i, 1)))
+                                  out = out sprintf("%c", 16)
                                 continue }
         if (st == 2 && c == "\\") { out = out prot(substr(line, i+1, 1)); i += 2; qn++; continue }
         if (st == 2 && c == "$" && substr(line, i+1, 1) == "(") {

@@ -1888,6 +1888,29 @@ check_wt "cp -S with an empty ANSI-C-quoted value doesn't eat the real dest (#19
   "$WT_184" "cp -S \$'' file.txt /outside/dest.txt" escalate
 check_wt "cp -S with a non-empty value still works, no regression (#192 round 5 sanity)" \
   "$WT_184" "cp -S .bak file.txt /outside/dest.txt" escalate
+
+# herdr-control#192 round 6 — round 5's fix regressed: the empty-word
+# sentinel was emitted for ANY empty quote pair, including one sitting
+# INSIDE a word (bash concatenates adjacent quoted strings with no
+# separating whitespace into ONE word — `c''p` really is just `cp`), so
+# the command-word matcher read a literal sentinel byte as part of the
+# verb name and matched nothing at all (silent allow). Fixed by only
+# emitting the sentinel for a genuinely STANDALONE empty word (bounded by
+# real word boundaries on both sides), not one touching other characters.
+check_wt "c''p (empty quote fused mid-word) is still read as cp, not silently allowed (#192 round 6)" \
+  "$WT_184" "c''p src.txt /outside/dest.txt" escalate
+check_wt "m\"\"v (empty quote fused mid-word) is still read as mv, not silently allowed (#192 round 6)" \
+  "$WT_184" "m\"\"v src.txt /outside/dest.txt" escalate
+check_wt "t''ee (empty quote fused mid-word) is still read as tee, not silently allowed (#192 round 6)" \
+  "$WT_184" "t''ee /outside/out.txt" escalate
+check_wt "b''ash -c (empty quote fused mid-word) is still unwrapped as bash -c (#192 round 6)" \
+  "$WT_184" "b''ash -c 'cp x /outside/y'" escalate
+check_wt "s''ed -i (empty quote fused mid-word) is still read as sed -i (#192 round 6)" \
+  "$WT_184" "s''ed -i 's/a/b/' /outside/f" escalate
+check_wt "a''b as a plain arg (empty quote fused mid-word, not a flag value) parses cleanly (#192 round 6)" \
+  "$WT_184" "cp a''b /outside/dest.txt" escalate
+check_wt "cp -S '' (genuine standalone empty value) still escalates after the round 6 fix (#192 round 5 no-regression)" \
+  "$WT_184" "cp -S '' src.txt /outside/dest.txt" escalate
 check "bash write-scope rule is a no-op with no worktree context" \
   "cat f >> /outside" allow
 
