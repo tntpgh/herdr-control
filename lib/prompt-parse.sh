@@ -574,7 +574,7 @@ question_rawlen = []
 question_content_end = []
 box_width = None
 selected = ""
-invalid = complete = visible = poisoned = False
+invalid = complete = visible = poisoned = last_footer_poisoned = False
 truncated = False
 # The most recent "running <label>" bordered box seen while scanning, and a
 # snapshot of it taken the instant a panel opens. See BROWSER_FALLBACK below
@@ -820,6 +820,22 @@ for line in lines:
         # consumed the same way -- but it must never itself count as
         # complete. `not poisoned` is the whole fix: pass 2 decides instead.
         complete = state == 3 and not invalid and not poisoned
+        # F9 (round-4 security review R10): F8 forced a poisoned panel to
+        # fail pass 1, but pass 2, the footer-anchored fallback, then
+        # judged only the ≤6 rows immediately above Approve -- narrower
+        # than the real command that made pass 1 poison it in the first
+        # place, so it pressed panels pass 1 on MAIN refuses outright
+        # (MAIN opens on the same comment row, sees a tool it has no rule
+        # for, and refuses; PR poisoned that row, so pass 1 never got the
+        # chance to refuse it, and pass 2 saw only a truncated, less
+        # alarming tail).
+        # A footer that closes a poisoned panel now ends the parse right
+        # here, fail-closed: pass 2 never runs for it. `visible` above is
+        # untouched, so the panel still pages a human -- it is simply
+        # never pressable. The flag tracks the LAST footer seen, so a
+        # later clean panel (a fresh open after this one closes) still
+        # completes normally.
+        last_footer_poisoned = poisoned and state == 3
         state = 0
         continue
     if not body:
@@ -842,7 +858,7 @@ for line in lines:
         selected = n
 
 # ---- pass 2: footer-anchored, header off-screen -----------------------------
-if not complete:
+if not complete and not last_footer_poisoned:
     foot = None
     for i in range(len(lines) - 1, -1, -1):
         if _is_footer(lines[i]):
