@@ -1853,6 +1853,19 @@ grep -q "hook recorded '<none>' for this prompt" "$WORK/err.txt" \
   && ok "waited out the whole 1s window (5 polls) and then timed out" \
   || bad "trace: $(cat "$WAIT_TRACE")"
 
+printf '== 2026-09-29: an attention-controller row alone does not end the wait ==\n'
+# attention-tick.sh records the prompt with no tool and no command
+# (recorded_by:"attention-controller"); counting it ended the peer's wait
+# before the hook's record landed, and #191 then refused a real prompt.
+HERDR_TEST_SKIP_AUTOSEED=1 set_menu "git log --oneline -7"; reset_keys
+append_event runR taskR input_required \
+  "$(jq -nc --arg pid "$(prompt_id "$PANE")" '{message:"needs input", prompt_id:$pid, command:"", tool:"", recorded_by:"attention-controller"}')" >/dev/null 2>&1
+: > "$WAIT_TRACE"
+HERDR_SELECT_RECORD_WAIT_S=1 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --authority peer; rc=$?
+[ "$(tail -1 "$WAIT_TRACE")" = timeout ] && [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "the controller's row is not the hook's record: waited the window, then refused" \
+  || bad "rc=$rc keys=$(keys_pressed) trace: $(cat "$WAIT_TRACE")"
+
 printf '== change 2: a peer refusal records the TASKs own_run/own_task and the prompt_id ==\n'
 REFUSE_TEXT="gh pr merge 99 --squash"
 set_menu "$REFUSE_TEXT"; reset_keys

@@ -209,16 +209,28 @@ push_wake() {
   fi
   if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
     set_task_state "$HERDR_RUN_ID" "$HERDR_TASK_ID" "blocked" >/dev/null 2>&1 || true
+    local ir_payload
     if [ "$recorded_ok" = 0 ]; then
-      append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
-        "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg hint "$cmd_hint" --arg tool "$tool" \
-           '{message:$msg, prompt_id:$prompt_id, command:"", command_uncorroborated:true, command_hint:$hint, tool:$tool}')" \
-        "${base}_input" >/dev/null 2>&1 || true
+      ir_payload="$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg hint "$cmd_hint" --arg tool "$tool" \
+           '{message:$msg, prompt_id:$prompt_id, command:"", command_uncorroborated:true, command_hint:$hint, tool:$tool}')"
     else
-      append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" \
-        "$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg cmd "$full_cmd" --arg tool "$tool" \
-           '{message:$msg, prompt_id:$prompt_id, command:$cmd, tool:$tool}')" \
-        "${base}_input" >/dev/null 2>&1 || true
+      ir_payload="$(jq -nc --arg msg "$msg" --arg prompt_id "$pid" --arg cmd "$full_cmd" --arg tool "$tool" \
+           '{message:$msg, prompt_id:$prompt_id, command:$cmd, tool:$tool}')"
+    fi
+    # The attention controller (attention-tick.sh) knows neither tool nor
+    # command; its row says so, so a hook's record can replace it below.
+    [ "$where" = attention-controller ] && ir_payload="$(printf '%s' "$ir_payload" | jq -c '.recorded_by="attention-controller"')"
+    append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "input_required" "$ir_payload" "${base}_input" >/dev/null 2>&1 || true
+    # One row per prompt, and the controller can win the INSERT OR IGNORE race
+    # against the hook's detached call. Measured 2026-09-29: 5 of 68 prompts
+    # lost their hook record that way, and herdr-select's #191 corroboration
+    # then refused every conductor/peer answer for them. So a hook's call
+    # REPLACES a controller-marked row for this exact prompt; a hook's own
+    # record is never replaced.
+    if [ "$where" != attention-controller ] && [ -n "$pid" ]; then
+      _sql "UPDATE events SET payload=$(_sq "$ir_payload")
+            WHERE event_id=$(_sq "${base}_input") AND type='input_required'
+              AND json_extract(payload,'\$.recorded_by')='attention-controller';" >/dev/null 2>&1 || true
     fi
   fi
   [ -n "$cpane" ] || return 1
