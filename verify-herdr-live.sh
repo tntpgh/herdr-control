@@ -376,6 +376,66 @@ conn_live._set_connected(True)                    # reconnect
 results["conn_flip_sequence_fires"] = len(conn_calls)
 results["conn_flip_sequence_values"] = conn_calls
 
+# 18. herdr >= 0.9.2 answers a subscriber that fell behind with `events_lost`
+# (as the ack during setup, or mid-stream) and closes it (herdr#4225). That is
+# a resubscribe: no connected flip — the flip is what pages a herdr outage —
+# and the reconnect snapshot must deliver the transition the gap swallowed.
+class LostWire:
+    connects = 0
+    mode = "stream"
+    lost = False
+
+    def __init__(self, *a, **k):
+        LostWire.connects += 1
+        self.first = LostWire.connects == 1
+        self.n = 0
+
+    def send(self, obj):
+        pass
+
+    def read(self, timeout):
+        self.n += 1
+        lost = {"id": "herdr-live", "error": {"code": "events_lost", "message": "fell behind"}}
+        if self.first and LostWire.mode == "ack" and self.n == 1:
+            LostWire.lost = True
+            return lost
+        if self.n == 1:
+            return {"id": "herdr-live", "result": {"type": "subscription_started"}}
+        if self.first and self.n == 2:
+            LostWire.lost = True
+            return lost
+        if self.first:
+            raise ConnectionError("herdr socket closed")   # the server closes after sending it
+        time.sleep(min(timeout, 0.02))
+        return None
+
+    def close(self):
+        pass
+
+
+def events_lost_case(mode):
+    LostWire.connects, LostWire.mode, LostWire.lost = 0, mode, False
+    calls = []
+    herdr_live._Wire = LostWire
+    # p1 went blocked while the subscription was losing events.
+    herdr_live.request = lambda *a, **k: two_panes("blocked" if LostWire.lost else "working")
+    live = herdr_live.LiveState(resync_every_s=60,
+                                on_connection_change=lambda c, e: calls.append([c, e]))
+    live._apply_snapshot(two_panes("working"))
+    t = threading.Thread(target=live._stream_forever, daemon=True)
+    t.start()
+    time.sleep(0.8)
+    live.stop()
+    t.join(2)
+    herdr_live._Wire = real_wire
+    st = live.data()["stats"]
+    # Not `reconnects`: stop() ends the final stream normally, which counts as one.
+    return [calls, st.get("events_lost"), st["resubscribes"] >= 1, live.status("w1:p1")]
+
+
+results["events_lost_stream"] = events_lost_case("stream")
+results["events_lost_ack"] = events_lost_case("ack")
+
 print(json.dumps(results))
 PY
 ) || { echo "  FAIL python harness did not run: $out"; exit 1; }
@@ -442,6 +502,12 @@ get() { printf '%s' "$out" | jq -c ".$1"; }
 [ "$(get busy_stream_resync)" = '["blocked",true,true]' ] \
   && ok "a busy stream still resyncs, so a quiet blocked pane is corrected" \
   || no "busy stream resync" "$(get busy_stream_resync)"
+[ "$(get events_lost_stream)" = '[[[true,null]],1,true,"blocked"]' ] \
+  && ok "a mid-stream events_lost resubscribes without an outage flip, and the snapshot fills the gap" \
+  || no "events_lost mid-stream" "$(get events_lost_stream)"
+[ "$(get events_lost_ack)" = '[[[true,null]],1,true,"blocked"]' ] \
+  && ok "an events_lost subscribe ack resubscribes instead of raising" \
+  || no "events_lost ack" "$(get events_lost_ack)"
 [ "$(get fresh_process_coverage)" = '[true,[[],["w1:p1","w1:p2"]],["w1:p1","w1:p2"]]' ] \
   && ok "a fresh process resubscribes once and covers every pane" \
   || no "fresh process coverage" "$(get fresh_process_coverage)"

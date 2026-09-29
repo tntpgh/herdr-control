@@ -535,6 +535,9 @@ else
 fi
 
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
+# Whether THIS call creates the workspace decides the root-tab cleanup below.
+ws_existed=0
+bash "$here/ensure-workspace.sh" --lookup "$root" >/dev/null 2>&1 && ws_existed=1
 ws=$(bash "$here/ensure-workspace.sh" --no-focus "$root") || exit 1
 tc=$(herdr tab create --workspace "$ws" --cwd "$wt" --label "$label" "$foc" 2>/dev/null)
 tab=$(printf '%s' "$tc" | jq -r '.result.tab.tab_id // empty')
@@ -630,17 +633,22 @@ jq -n \
 # auto-creates a root tab as part of workspace creation but gives it no
 # label of its own" — that script does a best-effort rename, but the tab
 # itself stays open and empty forever once THIS sub-tab is the one doing
-# real work. Best-effort, non-fatal, scoped tight: only closes a tab in
-# THIS workspace that is not the one just created AND has no agent set at
-# all (never ran anything) — a genuinely reused, active workspace with real
-# other work in it never loses a tab here, because that tab will have an
-# agent.
-for _t in $(herdr tab list 2>/dev/null | jq -r --arg ws "$ws" --arg keep "$tab" \
-    '(.result.tabs // .tabs)[] | select(.workspace_id==$ws and .tab_id!=$keep) | .tab_id' 2>/dev/null); do
-  _agent=$(herdr pane list 2>/dev/null | jq -r --arg t "$_t" \
-    '(.result.panes // .panes)[] | select(.tab_id==$t) | .agent // empty' 2>/dev/null | head -1)
-  [ -z "$_agent" ] && herdr tab close "$_t" >/dev/null 2>&1
-done
+# real work.
+#
+# Only when this call created the workspace. The old rule — any other tab
+# whose pane has no agent — relied on a finished worker's `--agent` stamp
+# outliving it. herdr 0.9.2 clears a self-reported agent ~0.5s after its pane
+# is back at an idle shell (herdr#4687), so a worker that exited to its shell
+# would lose its tab to the next spawn in the same repo. The agent check stays
+# as a second guard for two spawns racing to create the same workspace.
+if [ "$ws_existed" = 0 ]; then
+  for _t in $(herdr tab list 2>/dev/null | jq -r --arg ws "$ws" --arg keep "$tab" \
+      '(.result.tabs // .tabs)[] | select(.workspace_id==$ws and .tab_id!=$keep) | .tab_id' 2>/dev/null); do
+    _agent=$(herdr pane list 2>/dev/null | jq -r --arg t "$_t" \
+      '(.result.panes // .panes)[] | select(.tab_id==$t) | .agent // empty' 2>/dev/null | head -1)
+    [ -z "$_agent" ] && herdr tab close "$_t" >/dev/null 2>&1
+  done
+fi
 true
 
 # ---- launch the agent in the tab -------------------------------------------
