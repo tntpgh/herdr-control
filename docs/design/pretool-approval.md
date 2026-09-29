@@ -367,6 +367,14 @@ Nothing here runs for a task spawned without the flag.
   to the reviewed sha256; both write an `approvals` row and `action_decided`, and
   the worker is told in its pane (`send-to-agent.sh`, after a pane-generation
   check).
+- **Withdrawal** (`herdr-action.sh tick`, 2026-09-29): a pending request whose
+  task is terminal (`completed|failed|cancelled|lost`) becomes `withdrawn`
+  (authority `system`, event `action_withdrawn`) and its form record, if still
+  `open`, is flipped to `withdrawn` under `lib/record_store.py`'s lock — an
+  answered or expired record is never overwritten. Before this the tick skipped
+  inactive tasks, so such requests stayed pending forever and their forms stayed
+  listed on `/decisions` where an answer did nothing. A missing or unreadable
+  task row is left pending, never guessed at.
 - **Surfacing**: conductor route — `herdr-action.sh surface` wakes the conductor
   pane once (from the hook, detached; the hub's tick is the backstop).
   Human route — reserved requests, or conductor requests still pending after

@@ -141,6 +141,18 @@ action_request_decide() {               # request_id approved|declined authority
   [ "${n:-0}" = 1 ]
 }
 
+# Check-and-set pending -> withdrawn: the task ended (completed/failed/
+# cancelled/lost) before anyone decided, so nothing is left to run the action.
+# Not a decline and not an approval — no worker is told anything. 0 only for
+# the caller that won.
+action_request_withdraw() {             # request_id reason
+  local n
+  n="$(_sql "UPDATE action_requests SET status='withdrawn', decided_at=$(_sq "$(_now_iso)"),
+      authority='system', decided_by='herdr-action tick', decision_reason=$(_sq "$2")
+      WHERE request_id=$(_sq "$1") AND status='pending'; SELECT changes();" 2>/dev/null)"
+  [ "${n:-0}" = 1 ]
+}
+
 action_requests_pending() {             # -> one request_id per line
   _sql "SELECT request_id FROM action_requests WHERE status='pending' ORDER BY created_at;" 2>/dev/null
 }
