@@ -7,8 +7,8 @@
 # it does not prove the child will be registered. Keep the boundary simple and
 # fail closed: use spawn-task.sh from the conductor for new workers.
 #
-# Usage: pretool-registration.sh <tool-name> [cwd]
-# Exit 0: tool is not fleet-creating.
+# Usage: pretool-registration.sh <tool-name> [cwd]   (tool input JSON on stdin, optional)
+# Exit 0: tool is not fleet-creating, or is a read-only in-process task batch.
 # Exit 8: tool is fleet-creating and must use spawn-task.sh instead.
 set -uo pipefail
 
@@ -50,6 +50,39 @@ case "$xd_dev" in
   notepad_read|notepad_stats|fleet_status|pr_ready|handoff_debt|single_copy_scan|worktree_debt|suite_wired|decisions_open|project_status|recall|reflect|retain|report_issue)
     exit 0 ;;
 esac
+
+# The native `task` tool is exempt ONLY for a batch whose every child is
+# `scout` or `security-reviewer`. The REAL guarantee is not here: omp can
+# resolve those names to any definition (project/user .omp, extension
+# packages, plugins), and even the bundled ones get extension tools, skills,
+# memory writes and MCP proxies under a forced `yolo` approval mode (#203
+# review). agent-hooks/omp-herdr-control.ts readOnlyChildBlock() runs INSIDE
+# each child and refuses every tool but a read allowlist for a session
+# running as either name. This check only keeps the parent's request to that
+# shape, strictly, so nothing else rides along:
+#   * top-level keys ⊆ {context, tasks}; per-child keys ⊆ {name, agent, task,
+#     solutionSpace, outputSchema, schemaMode, effort} — no `tools` (eval
+#     tools run in the PARENT kernel), no `isolated`, no `cwd`;
+#   * `agent` exactly "scout" or "security-reviewer" (an omitted agent
+#     defaults to `task`, which has every tool);
+#   * input under 1 MiB, parsed by jq; anything else is refused.
+# `reviewer` is NOT exempt — it has bash. Before this, a 60s read-only
+# review needed a full spawn-task worktree + tab (2026-09-29, one hour lost).
+readonly_task_batch() {
+  local input="$1"
+  [ -n "$input" ] && [ "${#input}" -lt 1048576 ] || return 1
+  printf '%s' "$input" | /usr/bin/jq -e '
+    type == "object"
+    and (keys - ["context", "tasks"] | length == 0)
+    and (.tasks | type == "array" and length > 0)
+    and all(.tasks[];
+      type == "object"
+      and (keys - ["name", "agent", "task", "solutionSpace", "outputSchema", "schemaMode", "effort"] | length == 0)
+      and (.agent == "scout" or .agent == "security-reviewer"))' >/dev/null 2>&1
+}
+if [ "$tool_norm" = task ] && [ ! -t 0 ]; then
+  readonly_task_batch "$(head -c 1048576)" && exit 0
+fi
 case "$tool_norm" in
   taskoutput|taskstop|taskget|tasklist|cronlist|bashoutput|killshell|taskupdate) exit 0 ;;
   mcp__*) mcp_tool_is_safe_observer "$tool_norm" && exit 0 ;;

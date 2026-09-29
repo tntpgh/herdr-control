@@ -33,7 +33,8 @@ good=0
 bad=0
 ok() { good=$((good + 1)); printf '  ok    %s\n' "$1"; }
 not_ok() { bad=$((bad + 1)); printf '  FAIL  %s\n' "$1"; }
-run_guard() { bash "$here/lib/pretool-registration.sh" "$@" >/dev/null 2>"$work/err"; }
+run_guard() { bash "$here/lib/pretool-registration.sh" "$@" </dev/null >/dev/null 2>"$work/err"; }
+guard_with() { local in="$1"; shift; printf '%s' "$in" | bash "$here/lib/pretool-registration.sh" "$@" >/dev/null 2>"$work/err"; }
 
 printf '== native fleet creation refuses even for registered workers ==\n'
 HERDR_TASK_ID=missing run_guard task "$wt"; rc=$?
@@ -97,6 +98,67 @@ run_guard task "$wt/src"; rc=$?
 run_guard xd_spawn_task "$wt/src"; rc=$?
 [ "$rc" -eq 8 ] && ok 'spawn-shaped xd device name still refused' || not_ok "xd_spawn_task rc=$rc"
 
+printf '== parent: only a strict scout/security-reviewer batch passes ==\n'
+guard_with '{"tasks":[{"agent":"scout","task":"x"}]}' task "$wt/src"; rc=$?
+[ "$rc" -eq 0 ] && ok 'scout-only batch allowed' || not_ok "scout rc=$rc"
+guard_with '{"context":"c","tasks":[{"name":"A","agent":"scout","task":"x","solutionSpace":"s"},{"agent":"security-reviewer","task":"y","schemaMode":"strict"}]}' task "$wt/src"; rc=$?
+[ "$rc" -eq 0 ] && ok 'scout + security-reviewer batch with normal fields allowed' || not_ok "mixed read-only rc=$rc"
+for unsafe in \
+  '{"tasks":[{"agent":"scout"},{"agent":"task"}]}' \
+  '{"tasks":[{"task":"no agent defaults to task"}]}' \
+  '{"tasks":[{"agent":"reviewer"}]}' \
+  '{"tasks":[{"agent":"Scout"}]}' \
+  '{"tasks":[{"agent":"scout","tools":["writer"]}]}' \
+  '{"tasks":[{"agent":"scout","tools":{}}]}' \
+  '{"tasks":[{"agent":"scout","tools":null}]}' \
+  '{"tools":["writer"],"tasks":[{"agent":"scout"}]}' \
+  '{"tasks":[{"agent":"scout","isolated":true}]}' \
+  '{"cwd":"/","tasks":[{"agent":"scout"}]}' \
+  '{"agent":"task","tasks":[{"agent":"scout"}]}' \
+  '{"tasks":[null]}' \
+  '{"tasks":[]}' \
+  '[]' \
+  'not json'; do
+  guard_with "$unsafe" task "$wt/src"; rc=$?
+  [ "$rc" -eq 8 ] && ok "refused: $unsafe" || not_ok "should refuse ($rc): $unsafe"
+done
+guard_with '{"tasks":[{"agent":"scout"}]}' agent "$wt/src"; rc=$?
+[ "$rc" -eq 8 ] && ok 'exemption is task-tool only (agent still refused)' || not_ok "agent rc=$rc"
+big=$(python3 -c 'import json; print(json.dumps({"tasks":[{"agent":"scout","task":"x"*1100000}]}))')
+guard_with "$big" task "$wt/src"; rc=$?
+[ "$rc" -eq 8 ] && ok 'input over 1 MiB refused' || not_ok "big input rc=$rc"
+
+printf '== child: a session running as scout/security-reviewer may only read ==\n'
+bun -e '
+  const mod = await import("./agent-hooks/omp-herdr-control.ts"); const h = {};
+  mod.default({ on: (e, f) => { h[e] = f; } });
+  const cases = [
+    ["scout", "sub", "bash", {}], ["scout", "sub", "write", {}], ["scout", "sub", "edit", {}],
+    ["scout", "sub", "eval", {}], ["scout", "sub", "task", {}], ["scout", "sub", "notepad_append", {}],
+    ["scout", "sub", "retain", {}], ["scout", "sub", "manage_skill", {}], ["scout", "sub", "learn", {}],
+    ["scout", "sub", "mcp__fs__write_file", {}], ["security-reviewer", "sub", "lsp", { action: "rename" }],
+    ["security-reviewer", "sub", "lsp", { action: "code_actions", apply: true }],
+    ["security-reviewer", "sub", "lsp", { action: "request" }], ["security-reviewer", "sub", "lsp", {}],
+    ["Scout", "sub", "bash", {}], ["scout", "sub", "read", { path: "ssh://h/etc/hosts", action: "ssh" }],
+    ["scout", "sub", "read", {}], ["scout", "sub", "grep", {}], ["scout", "sub", "web_search", {}],
+    ["security-reviewer", "sub", "lsp", { action: "references" }], ["security-reviewer", "sub", "ast_grep", {}],
+    ["scout", "main", "bash", {}], ["task", "sub", "bash", {}], ["reviewer", "sub", "bash", {}],
+  ];
+  for (const [name, kind, toolName, input] of cases) {
+    const r = h.tool_call({ toolName, input }, { agent: { kind, name, id: "x", depth: 1 } });
+    const ro = Boolean(r?.block && String(r.reason).includes("subagents are read-only"));
+    console.log(`${name}/${kind}/${toolName}/${input.action ?? ""}=${ro ? "RO_BLOCK" : "PASS"}`);
+  }' >"$work/child" 2>"$work/bun.err"
+for c in scout/sub/bash/ scout/sub/write/ scout/sub/edit/ scout/sub/eval/ scout/sub/task/ scout/sub/notepad_append/ \
+         scout/sub/retain/ scout/sub/manage_skill/ scout/sub/learn/ scout/sub/mcp__fs__write_file/ \
+         security-reviewer/sub/lsp/rename security-reviewer/sub/lsp/code_actions security-reviewer/sub/lsp/request \
+         security-reviewer/sub/lsp/ Scout/sub/bash/ scout/sub/read/ssh; do
+  grep -qx "$c=RO_BLOCK" "$work/child" && ok "child blocked: $c" || not_ok "child should block $c: $(grep "^$c=" "$work/child") $(cat "$work/bun.err")"
+done
+for c in scout/sub/read/ scout/sub/grep/ scout/sub/web_search/ security-reviewer/sub/lsp/references \
+         security-reviewer/sub/ast_grep/ scout/main/bash/ task/sub/bash/ reviewer/sub/bash/; do
+  grep -qx "$c=PASS" "$work/child" && ok "child guard leaves alone: $c" || not_ok "child should pass $c: $(grep "^$c=" "$work/child") $(cat "$work/bun.err")"
+done
 
 printf '== unregistered ordinary tools remain outside this guard ==\n'
 HERDR_TASK_ID=missing run_guard bash "$wt"; rc=$?
