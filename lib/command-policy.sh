@@ -234,6 +234,34 @@ _cp_data_run_ext='(html?|json|xml|csv|tsv|txt|md|log|ya?ml|png|jpe?g|gif|svg|pdf
 # of `;`/`&`/`|`/`(`/`)`/`<`/`>`). A quote pair touching any other
 # character on either side (still inside the same word) goes back to the
 # original round-1 behavior: plain removal, contributing nothing.
+#
+# herdr-control#192 round 7: two more gaps in round 5/6's fix, both fixed
+# right here rather than at any consumer:
+#
+# F1 — a RUN of directly touching empty quote pairs (`''''`, `''""`,
+# `""''`) is ONE empty word in real bash (adjacent quoted strings with no
+# gap concatenate), but each pair was judged independently: the first
+# pair's "next char" is the SECOND pair's quote character, which isn't a
+# boundary, so NEITHER pair's own isolated check passed and the whole run
+# vanished again. `runopen` now tracks the position of the FIRST open in
+# a chain of touching pairs; a pair that closes empty with another quote
+# (bare or `$`-prefixed, see F3) immediately following DEFERS its
+# decision instead of resolving alone — `runopen` is preserved across the
+# defer so the eventual boundary check uses the WHOLE run's outer edges,
+# and exactly one sentinel is emitted for the run, not one per pair. A
+# pair that closes with real content (`qn>0`) breaks any deferred chain —
+# the earlier empty pairs already contributed nothing and stay that way.
+#
+# F3 — `$''`/`$""` (ANSI-C/empty-dollar-quoting) fused mid-word
+# (`c$''p`) left a literal stray `$` in the output, since the `$` was
+# emitted as an ordinary character by the catch-all BEFORE the following
+# quote was ever recognized as an opener — `c$''p` became `c$p`, matching
+# no verb case (silent allow), instead of the `cp` real bash resolves it
+# to. Fixed by recognizing `$'`/`$"` as a single two-character quote
+# opener in the same place `'`/`"` alone are recognized: the `$` is
+# consumed as PART of the opener (never emitted), so the boundary check
+# for F1/round-6 above correctly looks at what precedes the `$`, not what
+# precedes the quote character after it.
 _cp_protect_text() {                    # raw
   printf '%s' "$1" | tr '\n' '\017' | awk '
     function prot(c) {
@@ -261,6 +289,12 @@ _cp_protect_text() {                    # raw
       if (c == ">")  return 1
       return 0
     }
+    function isqstart(line, pos,    c1, c2) {
+      c1 = substr(line, pos, 1)
+      if (c1 == SQ || c1 == DQ) return 1
+      if (c1 == "$") { c2 = substr(line, pos + 1, 1); if (c2 == SQ || c2 == DQ) return 1 }
+      return 0
+    }
     function skipsub(line, start, n,    d, j, ch) {
       d = 1; j = start
       while (j <= n && d > 0) {
@@ -273,19 +307,24 @@ _cp_protect_text() {                    # raw
     }
     {
       SQ = sprintf("%c", 39); DQ = "\""; BT = sprintf("%c", 96)
-      # `qn` counts characters emitted since the quote opened; `qopen` is
-      # the RAW-line position of the quote-open character itself, so the
-      # boundary check at close can look at the raw characters just
-      # before the open and just after the close (both, by construction,
-      # outside any quote — the one right before an unquoted open, the
-      # one right after we just returned to st==0).
-      line = $0; n = length(line); st = 0; i = 1; out = ""; qn = 0; qopen = 0
+      # `qn` counts characters emitted since the CURRENT pair opened;
+      # `runopen` is the RAW-line position of the FIRST open in a chain of
+      # directly-touching pairs (0 when no chain is in progress) — reset
+      # to 0 the moment a chain resolves (emits or not) or breaks (a pair
+      # in it had real content), and left UNCHANGED across a defer so the
+      # eventual boundary check spans the whole run, not just one pair.
+      line = $0; n = length(line); st = 0; i = 1; out = ""; qn = 0; runopen = 0
       while (i <= n) {
         c = substr(line, i, 1)
         if (st == 0) {
           if (c == "\\")      { out = out prot(substr(line, i+1, 1)); i += 2; continue }
-          if (c == SQ)        { st = 1; qn = 0; qopen = i; i++; continue }
-          if (c == DQ)        { st = 2; qn = 0; qopen = i; i++; continue }
+          if (c == "$" && (substr(line, i+1, 1) == SQ || substr(line, i+1, 1) == DQ)) {
+                                st = (substr(line, i+1, 1) == SQ) ? 1 : 2
+                                qn = 0
+                                if (runopen == 0) runopen = i
+                                i += 2; continue }
+          if (c == SQ)        { st = 1; qn = 0; if (runopen == 0) runopen = i; i++; continue }
+          if (c == DQ)        { st = 2; qn = 0; if (runopen == 0) runopen = i; i++; continue }
           if (c == BT)        { j = i+1; while (j <= n && substr(line, j, 1) != BT) j++
                                 out = out "@SUB@"; i = j+1; continue }
           if (c == "$" && substr(line, i+1, 1) == "(") {
@@ -293,10 +332,20 @@ _cp_protect_text() {                    # raw
           out = out c; i++; continue
         }
         q = (st == 1) ? SQ : DQ
-        if (c == q)           { st = 0; i++
-                                if (qn == 0 && isbound(substr(line, qopen - 1, 1)) && isbound(substr(line, i, 1)))
-                                  out = out sprintf("%c", 16)
-                                continue }
+        if (c == q) {
+          st = 0; i++
+          if (qn == 0) {
+            if (isqstart(line, i)) {
+              continue                                  # defer: chain continues, runopen unchanged
+            }
+            if (isbound(substr(line, runopen - 1, 1)) && isbound(substr(line, i, 1)))
+              out = out sprintf("%c", 16)
+            runopen = 0
+          } else {
+            runopen = 0                                 # real content: breaks any deferred chain
+          }
+          continue
+        }
         if (st == 2 && c == "\\") { out = out prot(substr(line, i+1, 1)); i += 2; qn++; continue }
         if (st == 2 && c == "$" && substr(line, i+1, 1) == "(") {
                                 i = skipsub(line, i+2, n); out = out "@SUB@"; qn++; continue }
@@ -3583,6 +3632,20 @@ bash_write_targets() {
     return 0
   fi
   stripped="$(_cp_strip_heredocs "$raw")"
+  # herdr-control#192 round 7, F2: `_cp_protect_text`'s single-quote scan
+  # has no backslash awareness inside a quote (correct for a REAL
+  # single-quoted string, where `\` is literal) — but `$'...'` is ANSI-C
+  # quoting, where `\'` is a real escaped quote that should NOT end the
+  # string. Live-confirmed `cat x$'\'' ; cp f /outside/d` desyncs the
+  # scanner's quote state at that `\'` and hides everything after it,
+  # including the real `cp` write. Rather than teach the tokenizer
+  # ANSI-C's escape rules (a much larger change), reuse the same coarse,
+  # already-reviewed guard `_cp_coderef_walk` uses for the identical
+  # reason: ANY `$'` in the text fails the whole command closed.
+  if _cp_coderef_has_ansi_c_quote "$stripped"; then
+    printf 'UNPARSED\tan ANSI-C dollar-quoted segment cannot be parsed statically\n'
+    return 0
+  fi
   if _cp_bwt_unterminated_quote "$stripped"; then
     printf 'UNPARSED\tan unterminated quote makes this command unparseable\n'
     return 0

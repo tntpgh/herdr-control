@@ -1911,6 +1911,32 @@ check_wt "a''b as a plain arg (empty quote fused mid-word, not a flag value) par
   "$WT_184" "cp a''b /outside/dest.txt" escalate
 check_wt "cp -S '' (genuine standalone empty value) still escalates after the round 6 fix (#192 round 5 no-regression)" \
   "$WT_184" "cp -S '' src.txt /outside/dest.txt" escalate
+
+# herdr-control#192 round 7 — 3 more gaps: (F1) a RUN of directly-touching
+# empty quote pairs is one empty word in real bash, but each pair was
+# judged independently and the whole run vanished. (F2) `$'...'` with a
+# backslash-escaped quote inside it desyncs the tokenizer's quote state
+# (single-quote scanning has no escape awareness, correct for a REAL
+# single-quoted string but wrong for ANSI-C quoting) and hides everything
+# after it — reused the existing `_cp_coderef_has_ansi_c_quote` guard
+# (same one `_cp_coderef_walk` already relies on) to fail the whole
+# command UNPARSED rather than teach the tokenizer ANSI-C's escape rules.
+# (F3) `$''`/`$""` fused mid-word left a literal stray `$` in the command
+# word, matching no verb case.
+check_wt "cp -S with FOUR adjacent empty quotes ('''') is still one empty word (#192 round 7 F1)" \
+  "$WT_184" "cp -S '''' f /outside/d" escalate
+check_wt "cp -S with adjacent empty '' \"\" is still one empty word (#192 round 7 F1 variant)" \
+  "$WT_184" "cp -S ''\"\" f /outside/d" escalate
+check_wt "cp -S with adjacent empty \"\" '' is still one empty word (#192 round 7 F1 variant)" \
+  "$WT_184" "cp -S \"\"'' f /outside/d" escalate
+check_wt "a backslash-escaped quote inside \$'...' fails closed instead of hiding the real write (#192 round 7 F2)" \
+  "$WT_184" "cat x\$'\\'' ; cp f /outside/d" escalate
+check_wt "adjacent empty \$''\$'' (ANSI-C run) fails closed via the same ansi-c guard (#192 round 7 F1/F2 variant)" \
+  "$WT_184" "cp -S \$''\$'' f /outside/d" escalate
+check_wt "c\$''p (fused empty dollar-quote mid-word) is still read as cp, not silently allowed (#192 round 7 F3)" \
+  "$WT_184" "c\$''p src.txt /outside/dest.txt" escalate
+check_wt "c\$\"\"p (fused empty dollar-double-quote mid-word) is still read as cp (#192 round 7 F3, not masked by F2)" \
+  "$WT_184" "c\$\"\"p src.txt /outside/dest.txt" escalate
 check "bash write-scope rule is a no-op with no worktree context" \
   "cat f >> /outside" allow
 
