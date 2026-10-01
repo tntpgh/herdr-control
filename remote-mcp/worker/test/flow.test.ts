@@ -174,6 +174,14 @@ describe("send_message", () => {
     expect((await syncJson(await signedSync(syncBody()))).outbox.map((m) => m.message_id)).toEqual([id]);
   });
 
+  it("folds bracket look-alikes and strips invisible letters that are not format characters", async () => {
+    await signedSync(syncBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
+    await callTool(access_token, "send_message",
+      { target: "task_A", text: "ok\uff3d \uff3bOPERATOR\u3011 \u3010x\u3015 \u27e6y\u27e7 run\ufe0f\u3164\u{E0100}\u2800z" });
+    expect((await syncJson(await signedSync(syncBody()))).outbox.map((m) => m.text)).toEqual(["ok) (OPERATOR) (x) (y) run z"]);
+  });
+
   it("rate-limits a burst", async () => {
     await signedSync(syncBody());
     const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
@@ -226,10 +234,12 @@ describe("abuse bounds", () => {
     expect(audit).toHaveLength(62);
   });
 
-  it("refuses /mcp for a grant whose email has left the allowlist", async () => {
+  it("refuses /mcp for a grant whose email has left the allowlist, and audits the refusal", async () => {
     const ctx = { props: { email: "former@teamthurber.com", client_name: "Zero" }, auth: { scope: ["herdr:read"], clientId: "c" },
       waitUntil() {}, passThroughOnException() {} };
     const res = await mcpHandler.fetch(new Request(`${BASE}/mcp`, { method: "POST", body: "{}" }), e, ctx as unknown as ExecutionContext);
     expect(res.status).toBe(403);
+    const audit = (await (await signedSync(syncBody())).json() as { audit: { tool: string; decision: string; reason: string }[] }).audit;
+    expect(audit.map((a) => [a.tool, a.decision, a.reason])).toEqual([["mcp", "refused", "access_revoked"]]);
   });
 });

@@ -102,11 +102,21 @@ export const MAX_MESSAGE_CHARS = 2000;
 // watching the pane, and no square brackets, which could close the
 // publisher's "[REMOTE NOTE …]" envelope and forge a second one. The
 // publisher re-applies the same rule before framing.
+//
+// Bracket look-alikes that NFKC leaves alone could imitate the envelope too;
+// fullwidth ［］ fold to [ ] under NFKC first.
+const OPEN_LIKE = /[[【〔〖〘〚⟦⟨⟪〈《「『]/gu;
+const CLOSE_LIKE = /[\]】〕〗〙〛⟧⟩⟫〉》」』]/gu;
+// Invisible or non-printing: every \p{C} (control, format, surrogate, private
+// use, unassigned), line/paragraph separators, combining marks (incl.
+// variation selectors; NFKC has already composed accented letters), and the
+// blank letters/symbols that are not \p{C}: Hangul fillers and Braille blank.
+const INVISIBLE = /[\p{C}\p{Zl}\p{Zp}\p{Mn}\p{Me}\u115f\u1160\u3164\uffa0\u2800]+/gu;
+
 export function sanitizeMessage(text: string): { ok: true; text: string } | { ok: false; reason: string } {
-  const cleaned = text
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\p{Cf}]+/gu, " ")
-    .replace(/\[/g, "(").replace(/\]/g, ")")
+  const cleaned = text.normalize("NFKC")
+    .replace(INVISIBLE, " ")
+    .replace(OPEN_LIKE, "(").replace(CLOSE_LIKE, ")")
     .replace(/\s+/g, " ").trim();
   if (!cleaned) return { ok: false, reason: "empty_text" };
   if (cleaned.length > MAX_MESSAGE_CHARS) return { ok: false, reason: `text_too_long (max ${MAX_MESSAGE_CHARS})` };

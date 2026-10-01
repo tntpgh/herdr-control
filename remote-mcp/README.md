@@ -37,15 +37,26 @@ Scopes:
   Worker var `MESSAGING_ENABLED` (default `"false"`) decides whether the scope
   exists at all: while it is off the consent page does not offer it, the AS
   metadata does not advertise it, `send_message` is not listed, and the Durable
-  Object refuses messages even for a token granted while it was on. Turning it
-  on is a separate decision: set the var to `"true"`, redeploy, and reconnect
-  the client, ticking `herdr:message` deliberately (it is never pre-ticked).
+  Object refuses messages even for a token granted while it was on. The Mac
+  has its own switch too: the publisher refuses every leased message unless
+  its environment has `HERDR_MCP_MESSAGING=1` (the plist does not set it).
+
+Turning messaging on is a separate decision, and needs, in order:
+
+1. a way to revoke one grant without removing the only allowlisted email
+   (round-2 review N5; not built yet);
+2. `MESSAGING_ENABLED="true"` and a redeploy through `provision.sh`;
+3. `HERDR_MCP_MESSAGING=1` in the publisher's environment;
+4. a fresh consent that ticks `herdr:message` deliberately (it is never
+   pre-ticked). Grants minted while it was last on regain the scope, so
+   reconnect clients on purpose.
 
 Review finding M1 (a permission menu raised during `send-to-agent.sh`'s ~1 s
 typing check received the typed text) is fixed: the prompt is re-checked as
-the last step before typing (`verify-typing-guard.sh` has the regression). The
-window left is one pane read; herdr has no atomic check-and-type. Turning
-messaging on still waits for a separate decision.
+the last step before typing, and nothing else reads the pane between that
+check and `send-text` (`verify-typing-guard.sh` has the regression). What is
+left is the check's own reads (one for menus the parser knows, two for a
+Claude-style y/n menu); herdr has no atomic check-and-type.
 
 Allowlist: `ALLOWED_EMAILS` is checked at consent, on **every** `/mcp`
 request, and on every refresh (`invalid_grant`, which also revokes the grant),
@@ -106,9 +117,10 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
    messaging is now off, its sender has left the allowlist, or the sender no
    longer holds a live grant with `herdr:message` for that client (revoked,
    expired, re-consented without the scope). If the grant check cannot run,
-   nothing is leased that tick. Residual: a message already handed to the Mac
-   in the current tick (≤ 15 s) is in flight; a `retry` brings it back through
-   this check, and KV listing can show a deleted grant for up to ~60 s.
+   nothing is leased that tick. Residual: a message already leased is in
+   the Mac's hands; the publisher types it only within 60 s of its lease
+   (otherwise it acks `retry`, which brings it back through this check), and
+   KV listing can show a deleted grant for up to ~60 s.
 7. On the Mac: the task, pane and terminal are re-checked against that tick's
    state; the text is wrapped in a fixed envelope that starts with `[`
    (`[REMOTE NOTE via herdr-mcp from <client> · <msg id> · a collaborator's note,
@@ -224,8 +236,10 @@ first-deploy configuration, `messaging` = messaging on; OAuth flow, tools,
 scope, throttle and allowlist enforcement in workerd) and
 `python3 remote-mcp/verify-publisher.py` (snapshot, redaction, link and
 envelope handling, delivery re-checks, lost-ack dedup). CI:
-`.github/workflows/remote-mcp.yml`. Security review (posted on PR #206):
-findings M1–M8, L1–L4, I1, I2 fixed (M1 narrowed to one pane read).
+`.github/workflows/remote-mcp.yml`. Security review (two rounds, posted on
+PR #206): round 1 M1–M8, L1–L4, I1, I2 fixed; round 2 approved the read-only
+first connection, N1–N4, N6, N8, N10 fixed, N5 (single-grant revoke) open and
+required before messaging.
 
 Dependencies: `npm ci` is warning-free and `npm audit` reports 0. The test
 pool (`@cloudflare/vitest-pool-workers` 0.22.0, latest) pins an older

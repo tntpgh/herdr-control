@@ -38,7 +38,10 @@ fp() { shasum -a 256 | cut -c1-12; }
 for bin in jq curl op npx python3 shasum; do command -v "$bin" >/dev/null || { echo "missing: $bin" >&2; exit 2; }; done
 (( APPLY )) || echo "DRY RUN — nothing will change. Re-run with --apply."
 cd "$WORKER"
-[ -d node_modules ] || npm ci --silent
+# --apply bundles exactly the lockfile, never whatever node_modules is lying
+# around (stale, hand-patched, or from before an override): build_sha must
+# describe what runs.
+if (( APPLY )); then npm ci --silent; else [ -d node_modules ] || npm ci --silent; fi
 
 echo "== 1. KV namespace '$KV_TITLE'"
 kv_id() { npx wrangler kv namespace list 2>/dev/null | jq -r --arg t "$KV_TITLE" '.[] | select(.title==$t) | .id' | head -1; }

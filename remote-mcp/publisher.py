@@ -58,6 +58,14 @@ RESULT_READ_CAP = 1_000_000  # redaction runs over this much, then the result is
 RESULT_RESEND_S = 12 * 3600
 MAX_RESULTS_PER_SYNC = 50
 MAX_MESSAGE_CHARS = 2000
+# The Worker leases a message for 90 s and re-checks policy only at lease time.
+# Anything not typed within this many seconds of the lease goes back (retry) so
+# the next lease re-checks it: the in-flight window is bounded by the lease,
+# not by how long earlier deliveries in the same batch took.
+LEASE_LOCAL_S = 60
+# The Mac's own switch, independent of the Worker's MESSAGING_ENABLED: unless
+# this is "1" in the publisher's environment, every leased message is refused.
+MESSAGING_ON_MAC = os.environ.get("HERDR_MCP_MESSAGING") == "1"
 WORKTREE_ROOTS = (Path.home() / ".herdr/worktrees", Path.home() / "Code")
 
 # ceiling: pattern redaction catches common credential shapes, not every
@@ -77,17 +85,24 @@ REDACTIONS = [
     (re.compile(r"\bA[KS]IA[0-9A-Z]{16}\b"), "[REDACTED:aws-key]"),
     (re.compile(r"\bops_[A-Za-z0-9_\-]{20,}"), "[REDACTED:op-token]"),
     (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "[REDACTED:jwt]"),
-    (re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-~+/=]{16,}"), r"\1 [REDACTED]"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._\-~+/=]{16,}"), r"\1 [REDACTED]"),
     (re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s:/@]+:[^\s@/]+@"), r"\1[REDACTED]@"),
+    (re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/_\-]+"), "[REDACTED:slack-webhook]"),
+    # Signed-URL and query-string secrets (Azure SAS sig=, ?token=, &api_key=).
+    (re.compile(r"(?i)([?&](?:sig|signature|token|access_token|api[_\-]?key|key|secret)=)[^&\s\"'#]{8,}"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)\b(x-api-key|api-key|x-auth-token)\s*:\s*\S{8,}"), r"\1: [REDACTED]"),
     # "password": "…" / 'api_key': '…' (JSON, YAML flow, Python dicts).
     (re.compile(r"(?i)([\"'][a-z0-9_.\-]*(?:secret|token|password|passwd|passphrase|pwd|api[_\-]?key|private[_\-]?key|"
                 r"access[_\-]?key|auth|credential)[a-z0-9_.\-]*[\"']\s*:\s*)([\"'])[^\"']{4,}\2"), r'\1"[REDACTED]"'),
     # NAME=value / name: value for names that only ever hold secrets.
     (re.compile(r"(?i)\b([A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|PWD|CREDENTIALS?|API_?KEY|PRIVATE_?KEY|"
                 r"ACCESS_?KEY|DSN)[A-Z0-9_]*)\s*[=:]\s*(['\"]?)[^\s'\"]{6,}\2"), r"\1=[REDACTED]"),
-    # Env-style UPPER_CASE names with KEY/AUTH (HERDR_MCP_INGEST_KEY, TWILIO_AUTH):
-    # case-sensitive, so prose like "primary key: task_id" survives.
-    (re.compile(r"\b([A-Z][A-Z0-9_]*(?:KEY|AUTH)[A-Z0-9_]*)\s*[=:]\s*(['\"]?)[^\s'\"]{6,}\2"), r"\1=[REDACTED]"),
+    # Names with KEY/AUTH in them, any case (HERDR_MCP_INGEST_KEY, ingest_key,
+    # twilio_auth) with `=`; UPPER_CASE ones with `:` too, so prose like
+    # "primary key: task_id" survives.
+    (re.compile(r"(?i)\b([a-z][a-z0-9_]*_(?:key|auth)[a-z0-9_]*|[A-Z][A-Z0-9_]*(?:KEY|AUTH)[A-Z0-9_]*)\s*=\s*(['\"]?)[^\s'\"]{6,}\2"),
+     r"\1=[REDACTED]"),
+    (re.compile(r"\b([A-Z][A-Z0-9_]*(?:KEY|AUTH)[A-Z0-9_]*)\s*:\s*(['\"]?)[^\s'\"]{6,}\2"), r"\1=[REDACTED]"),
 ]
 
 
@@ -323,15 +338,26 @@ def post_sync(key: str, body: dict) -> dict:
 
 
 # ── delivery ───────────────────────────────────────────────────────────────────
+# Same rule as the Worker's sanitizeMessage (policy.ts), re-applied here.
+OPEN_LIKE = "[【〔〖〘〚⟦⟨⟪〈《「『"
+CLOSE_LIKE = "]】〕〗〙〛⟧⟩⟫〉》」』"
+BLANKS = "\u115f\u1160\u3164\uffa0\u2800"
+
+
 def frame(item: dict) -> str | None:
     """The fixed envelope. It always starts with "[", so the agent never sees
     a leading "/" (slash command) or "!" (shell escape). Same rule as the
-    Worker's sanitizeMessage, re-applied here: control and format characters
-    (bidi, zero-width, tag) become spaces, and brackets become parentheses so
-    the text cannot close the envelope and forge another."""
-    raw = str(item.get("text") or "")
-    text = "".join(" " if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c for c in raw)
-    text = re.sub(r"\s+", " ", text.replace("[", "(").replace("]", ")")).strip()
+    Worker's sanitizeMessage, re-applied here: NFKC fold, then invisible and
+    non-printing characters (control, format, private use, combining marks,
+    variation selectors, blank fillers) become spaces, and brackets and their
+    look-alikes become parentheses so the text cannot imitate or close the
+    envelope."""
+    raw = unicodedata.normalize("NFKC", str(item.get("text") or ""))
+    text = "".join(
+        " " if c in BLANKS or unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp", "Mn", "Me")
+        else "(" if c in OPEN_LIKE else ")" if c in CLOSE_LIKE else c
+        for c in raw)
+    text = re.sub(r"\s+", " ", text).strip()
     if not text or len(text) > MAX_MESSAGE_CHARS:
         return None
     who = re.sub(r"[^\w .@\-]", "", str(item.get("client_name") or "remote client"))[:40]
@@ -442,9 +468,14 @@ def main(argv: list[str]) -> int:
     # for a day: a crash between typing and acking must not type it twice.
     delivered = {k: v for k, v in st.get("delivered", {}).items() if now.timestamp() - v < 86_400}
     new_acks = []
+    leased_at = time.monotonic()
     for item in outbox:
         if item["message_id"] in delivered:
             a = {"message_id": item["message_id"], "outcome": "delivered", "detail": "already delivered (ack was lost)"}
+        elif not MESSAGING_ON_MAC:
+            a = {"message_id": item["message_id"], "outcome": "refused", "detail": "messaging is turned off on the Mac"}
+        elif time.monotonic() - leased_at > LEASE_LOCAL_S:
+            a = {"message_id": item["message_id"], "outcome": "retry", "detail": "lease ran out before delivery; re-checked next tick"}
         else:
             a = deliver(item, local)
             if a["outcome"] == "delivered":

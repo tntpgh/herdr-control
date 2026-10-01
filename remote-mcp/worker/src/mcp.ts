@@ -241,16 +241,22 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
 export const mcpHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const c = ctx as ExecutionContext & { props: GrantProps; auth: OAuthResourceAuth };
+    const caller: Caller = { email: c.props.email, client_id: c.auth?.clientId ?? "", client_name: c.props.client_name };
+    // Refusals before the server is built are audited too (throttled like every call).
+    const refuse = async (reason: string, res: Response) => {
+      await env.HERDR_STATE.get(env.HERDR_STATE.idFromName("fleet")).recordRejectedCall(Date.now(), caller, "mcp", "", reason);
+      return res;
+    };
     // Re-checked on every request, so removing an email cuts off grants already issued.
     if (!emailAllowed(env, c.props.email)) {
-      return Response.json({ error: "access_revoked", error_description: "This account is no longer allowed." }, { status: 403 });
+      return refuse("access_revoked",
+        Response.json({ error: "access_revoked", error_description: "This account is no longer allowed." }, { status: 403 }));
     }
     const offered = offeredScopes(env);
     const scopes = (c.auth?.scope ?? []).filter((s) => offered.includes(s));
     if (!scopes.includes(SCOPE_READ) && !scopes.includes(SCOPE_MESSAGE)) {
-      return insufficientScope(c.auth, [SCOPE_READ]);
+      return refuse("insufficient_scope", insufficientScope(c.auth, [SCOPE_READ]));
     }
-    const caller: Caller = { email: c.props.email, client_id: c.auth.clientId ?? "", client_name: c.props.client_name };
     const calls = toolCalls(await request.clone().text());
     const server = buildServer(env, caller, scopes);
     const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
