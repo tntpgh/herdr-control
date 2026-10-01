@@ -103,10 +103,18 @@ export const MAX_MESSAGE_CHARS = 2000;
 // publisher's "[REMOTE NOTE …]" envelope and forge a second one. The
 // publisher re-applies the same rule before framing.
 //
-// Bracket look-alikes that NFKC leaves alone could imitate the envelope too;
-// fullwidth ［］ fold to [ ] under NFKC first.
-const OPEN_LIKE = /[[【〔〖〘〚⟦⟨⟪〈《「『]/gu;
-const CLOSE_LIKE = /[\]】〕〗〙〛⟧⟩⟫〉》」』]/gu;
+// Every bracket shape could imitate the envelope: all opening/closing
+// punctuation (\p{Ps}/\p{Pe}: 【〔⟦❲⦋⸢⁅⌈﴾…, fullwidth already folded by NFKC)
+// becomes ( / ), except ASCII { } kept for code; the bracket-piece symbols
+// (⎛…⎳, category Sm) become spaces.
+const OPEN_LIKE = /[^\P{Ps}{]/gu;
+const CLOSE_LIKE = /[^\P{Pe}}]/gu;
+const BRACKET_PIECES = /[\u239b-\u23b3]/gu;
+// omp (and Claude Code) expand "@path" in a submitted prompt into that file's
+// contents with no tool call and no approval (round-3 review H1). The ASCII
+// "@" becomes the fullwidth "＠", which reads the same and no mention parser
+// matches. Applied after NFKC, which would fold it back.
+const AT = /@/g;
 // Invisible or non-printing: every \p{C} (control, format, surrogate, private
 // use, unassigned), line/paragraph separators, combining marks (incl.
 // variation selectors; NFKC has already composed accented letters), and the
@@ -116,7 +124,8 @@ const INVISIBLE = /[\p{C}\p{Zl}\p{Zp}\p{Mn}\p{Me}\u115f\u1160\u3164\uffa0\u2800]
 export function sanitizeMessage(text: string): { ok: true; text: string } | { ok: false; reason: string } {
   const cleaned = text.normalize("NFKC")
     .replace(INVISIBLE, " ")
-    .replace(OPEN_LIKE, "(").replace(CLOSE_LIKE, ")")
+    .replace(OPEN_LIKE, "(").replace(CLOSE_LIKE, ")").replace(BRACKET_PIECES, " ")
+    .replace(AT, "\uff20")
     .replace(/\s+/g, " ").trim();
   if (!cleaned) return { ok: false, reason: "empty_text" };
   if (cleaned.length > MAX_MESSAGE_CHARS) return { ok: false, reason: `text_too_long (max ${MAX_MESSAGE_CHARS})` };

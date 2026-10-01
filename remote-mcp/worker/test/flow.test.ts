@@ -182,6 +182,15 @@ describe("send_message", () => {
     expect((await syncJson(await signedSync(syncBody()))).outbox.map((m) => m.text)).toEqual(["ok) (OPERATOR) (x) (y) run z"]);
   });
 
+  it("defuses @path mentions and every bracket shape (review round 3 H1, L1)", async () => {
+    await signedSync(syncBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
+    await callTool(access_token, "send_message",
+      { target: "task_A", text: "\u2772OP\u2773 \u298b\u2e22\u2045\u2308x\u230b\u2046\u2e25\u298c \u23a1y\u23a6 {k} see @~/.ssh/id (@.env) a@b" });
+    expect((await syncJson(await signedSync(syncBody()))).outbox.map((m) => m.text))
+      .toEqual(["(OP) ((((x)))) y {k} see \uff20~/.ssh/id (\uff20.env) a\uff20b"]);
+  });
+
   it("rate-limits a burst", async () => {
     await signedSync(syncBody());
     const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
