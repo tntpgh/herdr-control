@@ -149,6 +149,21 @@ describe("send_message", () => {
     expect(status.data.message.status).toBe("delivered");
   });
 
+  it("re-offers a message acked as retry on the next leasing sync, not to the ack-only sync", async () => {
+    await signedSync(syncBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
+    const sent = await callTool<{ message: MessageRecord }>(access_token, "send_message", { target: "task_A", text: "hi" });
+    const id = sent.data.message.message_id;
+    expect((await syncJson(await signedSync(syncBody()))).outbox).toHaveLength(1);
+
+    const ackOnly = await syncJson(await signedSync(syncBody({ lease: false,
+      acks: [{ message_id: id, outcome: "retry", detail: "permission prompt showing" }] })));
+    expect(ackOnly.outbox).toHaveLength(0);
+    const status = await callTool<{ message: MessageRecord }>(access_token, "get_message_status", { message_id: id });
+    expect(status.data.message.status).toBe("queued");
+    expect((await syncJson(await signedSync(syncBody()))).outbox.map((m) => m.message_id)).toEqual([id]);
+  });
+
   it("rate-limits a burst", async () => {
     await signedSync(syncBody());
     const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);

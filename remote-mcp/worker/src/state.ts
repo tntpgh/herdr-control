@@ -38,6 +38,7 @@ const SyncSchema = z.object({
     message_id: str, outcome: z.enum(["delivered", "refused", "failed", "retry"]), detail: str,
   })).max(200),
   audit_cursor: z.number().int().min(0),
+  lease: z.boolean(),
 });
 
 export interface AuditRow {
@@ -239,11 +240,11 @@ export class HerdrState extends DurableObject<Env> {
       this.audit(nowMs, { ...sys, target: m.task_id, decision: status, reason: why, message_id: m.message_id, detail: m.detail });
     }
 
-    const due = this.sql.exec<{ message_id: string; task_id: string; pane_id: string; agent_id: string; label: string;
+    const due = body.lease ? this.sql.exec<{ message_id: string; task_id: string; pane_id: string; agent_id: string; label: string;
       text: string; actor: string; client_name: string; attempts: number }>(
       `SELECT message_id, task_id, pane_id, agent_id, label, text, actor, client_name, attempts FROM messages
        WHERE (status='queued' OR (status='delivering' AND lease_until < ?)) AND expires_at > ? ORDER BY created_at LIMIT 20`,
-      nowMs, nowMs).toArray();
+      nowMs, nowMs).toArray() : [];
     for (const m of due) {
       this.sql.exec(`UPDATE messages SET status='delivering', attempts=attempts+1, lease_until=?, updated_at=? WHERE message_id=?`,
         nowMs + LEASE_MS, nowMs, m.message_id);

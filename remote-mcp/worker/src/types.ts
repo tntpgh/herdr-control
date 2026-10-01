@@ -100,6 +100,9 @@ export interface SyncBody {
   results: ResultDoc[];
   acks: DeliveryAck[];
   audit_cursor: number;
+  // false on the publisher's ack-only follow-up sync, whose outbox it never reads:
+  // leasing there would mark messages "delivering" that nobody is delivering.
+  lease: boolean;
 }
 
 export interface OutboxItem {

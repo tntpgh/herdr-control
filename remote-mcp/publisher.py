@@ -385,7 +385,8 @@ def main(argv: list[str]) -> int:
 
     acks = st.get("pending_acks", [])
     try:
-        reply = post_sync(key, {"snapshot": snapshot, "results": results, "acks": acks, "audit_cursor": st.get("audit_cursor", 0)})
+        reply = post_sync(key, {"snapshot": snapshot, "results": results, "acks": acks,
+                                "audit_cursor": st.get("audit_cursor", 0), "lease": True})
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log(f"sync failed: {exc}")
         return 1
@@ -408,7 +409,8 @@ def main(argv: list[str]) -> int:
     st["pending_acks"] = new_acks
     save_state(st)
     try:  # second sync: report outcomes now rather than next tick
-        reply = post_sync(key, {"snapshot": snapshot, "results": [], "acks": new_acks, "audit_cursor": st["audit_cursor"]})
+        reply = post_sync(key, {"snapshot": snapshot, "results": [], "acks": new_acks,
+                                "audit_cursor": st["audit_cursor"], "lease": False})
         st["pending_acks"] = []
         append_audit(reply.get("audit") or [])
         st["audit_cursor"] = reply.get("audit_cursor", st["audit_cursor"])

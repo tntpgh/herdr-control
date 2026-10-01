@@ -127,5 +127,5 @@ export function snapshot(overrides: Partial<Snapshot> = {}): Snapshot {
 }
 
 export function syncBody(over: Partial<SyncBody> = {}): SyncBody {
-  return { snapshot: snapshot(), results: [], acks: [], audit_cursor: 0, ...over };
+  return { snapshot: snapshot(), results: [], acks: [], audit_cursor: 0, lease: true, ...over };
 }
