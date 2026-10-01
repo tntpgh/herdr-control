@@ -33,23 +33,29 @@ stays loopback-only.
 Scopes:
 
 - `herdr:read` — every read tool. Pre-ticked on the consent page.
-- `herdr:message` — `send_message` only. **Off at first connection.** The
-  Worker var `MESSAGING_ENABLED` (default `"false"`) decides whether the scope
-  exists at all: while it is off the consent page does not offer it, the AS
-  metadata does not advertise it, `send_message` is not listed, and the Durable
-  Object refuses messages even for a token granted while it was on. The Mac
-  has its own switch too: the publisher refuses every leased message unless
-  its environment has `HERDR_MCP_MESSAGING=1` (the plist does not set it).
+- `herdr:message` — `send_message` only. The Worker var `MESSAGING_ENABLED`
+  decides whether the scope exists at all: while it is `"false"` the consent
+  page does not offer it, the AS metadata does not advertise it,
+  `send_message` is not listed, and the Durable Object refuses messages even
+  for a token granted while it was on. The Mac has its own switch: the
+  publisher refuses every leased message unless its environment has
+  `HERDR_MCP_MESSAGING=1`, which only `install.sh --remote-mcp-messaging` sets.
 
-Turning messaging on is a separate decision, and needs, in order:
+Messaging was off for the first connection and turned on as its own decision.
+Turning it on, in order:
 
-1. a way to revoke one connection without removing the only allowlisted
-   email: `scripts/grants.py` (round-2 review N5, see Operations);
-2. `MESSAGING_ENABLED="true"` and a redeploy through `provision.sh`;
-3. `HERDR_MCP_MESSAGING=1` in the publisher's environment;
+1. `scripts/grants.py` exists to revoke one connection without removing the
+   only allowlisted email (round-2 review N5, see Operations);
+2. `MESSAGING_ENABLED="true"` (in `wrangler.jsonc`), merged, then a redeploy
+   through `provision.sh --apply`; `/healthz` must show
+   `messaging_enabled:true` and the merged commit;
+3. `./install.sh --apply --remote-mcp-messaging` on the Mac;
 4. a fresh consent that ticks `herdr:message` deliberately (it is never
-   pre-ticked). Grants minted while it was last on regain the scope, so
-   reconnect clients on purpose.
+   pre-ticked): disconnect and reconnect the client.
+
+Turning it off: `"false"` + redeploy (queued messages are cancelled on the
+next sync), and `./install.sh --apply --remote-mcp` (Mac switch off). Either
+alone stops delivery.
 
 Review finding M1 (a permission menu raised during `send-to-agent.sh`'s ~1 s
 typing check received the typed text) is fixed: the prompt is re-checked as

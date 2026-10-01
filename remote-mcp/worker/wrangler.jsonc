@@ -21,9 +21,10 @@
     "ACCESS_AUD": "8c1120f68ebc19debcb90cf85642449fa8d37064d0240d7962dc6a54c2e707eb",
     "ALLOWED_EMAILS": "tnt@teamthurber.com",
     "STALE_AFTER_S": "90",
-    // Off for the first connection: read-only. Turning it on is its own decision,
-    // a redeploy, and a fresh consent that ticks herdr:message.
-    "MESSAGING_ENABLED": "false",
+    // On since 2026-10-01 (Terrence, go-live form for messaging). Set "false" and
+    // redeploy to turn it off: new sends are refused and every queued message is
+    // cancelled on the next sync. The Mac has its own switch (install.sh).
+    "MESSAGING_ENABLED": "true",
     // The commit this deploy was built from. provision.sh overrides it with
     // `--var BUILD_SHA:<sha>` from a clean, pushed tree; /healthz reports it.
     "BUILD_SHA": "unstamped"
