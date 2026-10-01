@@ -1,0 +1,25 @@
+{
+  // herdr-mcp — authenticated remote MCP over herdr-control status.
+  // Deploy: see ../README.md "Deploy". Secrets (never committed):
+  //   wrangler secret put INGEST_KEY   (same value as HERDR_MCP_INGEST_KEY in
+  //                                     ~/.config/op/launchd-secrets.env)
+  "name": "herdr-mcp",
+  "compatibility_date": "2026-08-15",
+  // global_fetch_strictly_public: SSRF guard the OAuth provider requires
+  // before it will fetch Client ID Metadata Documents.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": false,
+  "routes": [{ "pattern": "herdr-mcp.teamthurber.com", "custom_domain": true }],
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "__OAUTH_KV_ID__" }],
+  "durable_objects": { "bindings": [{ "name": "HERDR_STATE", "class_name": "HerdrState" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HerdrState"] }],
+  "vars": {
+    "PUBLIC_URL": "https://herdr-mcp.teamthurber.com",
+    "ACCESS_TEAM_DOMAIN": "thurberteam.cloudflareaccess.com",
+    // AUD of the path-scoped Access app "herdr-mcp-authorize" (scripts/provision-access-app.sh).
+    "ACCESS_AUD": "__ACCESS_AUD__",
+    "ALLOWED_EMAILS": "tnt@teamthurber.com",
+    "STALE_AFTER_S": "90"
+  },
+  "observability": { "enabled": true }
+}
