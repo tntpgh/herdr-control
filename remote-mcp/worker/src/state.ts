@@ -250,15 +250,27 @@ export class HerdrState extends DurableObject<Env> {
       `SELECT DISTINCT actor, client_id FROM messages WHERE status IN ('queued','delivering') AND expires_at > ?`, nowMs).toArray();
   }
 
+  // One table for every HMAC-signed request (sync and admin): a nonce is used once.
+  private takeNonce(nowMs: number, nonce: string): boolean {
+    this.sql.exec(`DELETE FROM nonces WHERE seen_at < ?`, nowMs - NONCE_TTL_MS);
+    if (this.sql.exec(`SELECT 1 FROM nonces WHERE nonce=?`, nonce).toArray().length) return false;
+    this.sql.exec(`INSERT INTO nonces (nonce, seen_at) VALUES (?, ?)`, nonce, nowMs);
+    return true;
+  }
+
+  // Mac-side grant administration (scripts/grants.py): consume the nonce and
+  // audit the action before the Worker performs it.
+  admitAdmin(nowMs: number, nonce: string, op: string, target: string): boolean {
+    if (!this.takeNonce(nowMs, nonce)) return false;
+    this.audit(nowMs, { actor: "mac-admin", client_id: "", tool: `admin_${op}`, target, decision: "allowed", reason: "signed", message_id: "", detail: "" });
+    return true;
+  }
+
   // Publisher sync: store the snapshot, apply delivery acks, re-check every
   // undelivered message against today's policy, expire, lease the outbox, and
   // hand back new audit rows for the Mac's local copy.
   sync(nowMs: number, nonce: string, rawBody: string, gate: DeliveryGate): { ok: true; response: SyncResponse } | { ok: false; status: number; reason: string } {
-    this.sql.exec(`DELETE FROM nonces WHERE seen_at < ?`, nowMs - NONCE_TTL_MS);
-    if (this.sql.exec(`SELECT 1 FROM nonces WHERE nonce=?`, nonce).toArray().length) {
-      return { ok: false, status: 409, reason: "replayed_nonce" };
-    }
-    this.sql.exec(`INSERT INTO nonces (nonce, seen_at) VALUES (?, ?)`, nonce, nowMs);
+    if (!this.takeNonce(nowMs, nonce)) return { ok: false, status: 409, reason: "replayed_nonce" };
     let json: unknown;
     try { json = JSON.parse(rawBody); } catch { return { ok: false, status: 400, reason: "bad_json" }; }
     const parsed = SyncSchema.safeParse(json);
