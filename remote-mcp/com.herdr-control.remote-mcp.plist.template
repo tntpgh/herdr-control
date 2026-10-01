@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.herdr-control.remote-mcp</string>
+	<key>ProgramArguments</key>
+	<array>
+		<!-- One publisher tick: push herdr status to herdr-mcp.teamthurber.com,
+		     deliver the messages it queued (remote-mcp/README.md). It reads its
+		     one credential, HERDR_MCP_INGEST_KEY, from
+		     ~/.config/op/launchd-secrets.env with the same literal parser as the
+		     hub, and never runs `op`, so no service-account file is sourced.
+		     Render (install.sh --remote-mcp): __REMOTE_MCP_PY__ -> the DEPLOYED
+		     app worktree's remote-mcp/publisher.py, __LOG_PATH__ ->
+		     ~/Library/Logs/com.herdr-control.remote-mcp.log. -->
+		<string>/usr/bin/env</string>
+		<string>python3</string>
+		<string>__REMOTE_MCP_PY__</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<!-- Same belt as the hub: nothing here calls `op`, but if a descendant
+		     ever does it must fail fast, never paint a Touch ID prompt. -->
+		<key>OP_BIOMETRIC_UNLOCK_ENABLED</key>
+		<string>false</string>
+	</dict>
+	<!-- 15 s: the Worker reports `disconnected` after 90 s without a sync,
+	     so six missed ticks in a row are what it takes to go dark. -->
+	<key>StartInterval</key>
+	<integer>15</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__LOG_PATH__</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_PATH__</string>
+</dict>
+</plist>

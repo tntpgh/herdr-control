@@ -10,6 +10,7 @@
 #   ./install.sh --apply --bridge     # also install the launchd bridge daemon (macOS)
 #   ./install.sh --apply --hub        # also install the launchd agent for hub.py (localhost:8600)
 #   ./install.sh --apply --auth       # also install the bounded-autonomy auth pair (macOS)
+#   ./install.sh --apply --remote-mcp # also install the herdr-mcp publisher (remote-mcp/README.md)
 #   ./install.sh --apply --repoint    # ALSO repoint any job already wired at a
 #                                      # different checkout (e.g. an APM-deployed
 #                                      # herdr-ops skill copy) to point at THIS one —
@@ -54,13 +55,14 @@ here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=launchd/agent-lib.sh
 . "$here/launchd/agent-lib.sh"
 
-APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0
+APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0
 for a in "$@"; do
   case "$a" in
     --apply)   APPLY=1 ;;
     --bridge)  BRIDGE=1 ;;
     --hub)     HUB=1 ;;
     --auth)    AUTH=1 ;;
+    --remote-mcp) REMOTE_MCP=1 ;;
     --repoint) REPOINT=1 ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
@@ -405,6 +407,44 @@ if [ "$HUB" = 1 ]; then
   else
     echo "  + would deploy $here -> $HERDR_APP_DIR (detached at ${HUB_REV:-origin/main})"
     echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/hub.py on :8600)"
+  fi
+fi
+
+# ---- herdr-mcp publisher (optional, macOS) ----------------------------------
+# Pushes status to the remote MCP Worker every 15 s and delivers its queued
+# messages (remote-mcp/README.md). Runs from the DEPLOYED app worktree, like
+# the hub. Registry entry: thurber-os launchd/agents.yaml.
+if [ "$REMOTE_MCP" = 1 ]; then
+  PLIST="$HOME/Library/LaunchAgents/com.herdr-control.remote-mcp.plist"
+  if [ "$APPLY" = 1 ]; then
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+    if deploy_app "${HUB_REV:-origin/main}"; then
+      sed -e "s|__REMOTE_MCP_PY__|$HERDR_APP_DIR/remote-mcp/publisher.py|" \
+          -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.remote-mcp.log|g" \
+        "$here/remote-mcp/com.herdr-control.remote-mcp.plist.template" > "$PLIST"
+      # Not reload_agent: that verifies a KeepAlive daemon stays up, and a
+      # 15 s interval job correctly exits after each tick. Load it, let the
+      # RunAtLoad tick finish, and read launchd's own last exit code.
+      domain="gui/$(id -u)"
+      if plutil -lint "$PLIST" >/dev/null; then
+        launchctl bootout "$domain/com.herdr-control.remote-mcp" 2>/dev/null; sleep 1
+        if launchctl bootstrap "$domain" "$PLIST"; then
+          sleep 5
+          rmcp_exit="$(launchctl print "$domain/com.herdr-control.remote-mcp" 2>/dev/null | awk -F'= ' '/last exit code/ {print $2; exit}')"
+          echo "  remote-mcp publisher loaded (every 15 s); first tick last exit code: ${rmcp_exit:-not yet run}"
+          [ "${rmcp_exit:-0}" = 0 ] || { INSTALL_RC=2; echo "  ! check ~/Library/Logs/com.herdr-control.remote-mcp.log" >&2; }
+        else
+          INSTALL_RC=2; echo "  ! remote-mcp publisher: bootstrap failed" >&2
+        fi
+      else
+        INSTALL_RC=2; echo "  ! remote-mcp publisher: rendered plist invalid ($PLIST)" >&2
+      fi
+    else
+      INSTALL_RC=2
+      echo "  ! remote-mcp publisher NOT installed: deploy failed (above)." >&2
+    fi
+  else
+    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/remote-mcp/publisher.py every 15 s)"
   fi
 fi
 

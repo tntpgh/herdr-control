@@ -1,0 +1,35 @@
+name: remote-mcp
+# The herdr-mcp Worker (OAuth + MCP + Durable Object) and its Mac publisher.
+# Both suites exercise behaviour end to end: the Worker suite runs the real
+# OAuth 2.1 + PKCE flow and every tool in workerd; the publisher suite builds
+# snapshots from a fixture hub and delivers to a fake herdr-deliver.
+on:
+  pull_request:
+    paths: ["remote-mcp/**", ".github/workflows/remote-mcp.yml"]
+  push:
+    branches: [main]
+    paths: ["remote-mcp/**", ".github/workflows/remote-mcp.yml"]
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: remote-mcp/worker
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+
+  publisher:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python3 remote-mcp/verify-publisher.py
