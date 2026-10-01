@@ -146,7 +146,14 @@ if (( APPLY )); then
     echo "   commit + push them, then re-run --apply; the deploy is stamped with that commit." >&2
     git -C "$HERE" status --short -- . >&2; exit 1; }
   npx wrangler deploy --var "BUILD_SHA:$SHA" --tag "${SHA:0:12}" --message "herdr-mcp ${SHA:0:12}" 2>&1 | grep -vE '^\s*$' | tail -8
-  printf %s "$KEY" | npx wrangler secret put INGEST_KEY >/dev/null && echo "   INGEST_KEY set"
+  # A secret upload publishes a new, untagged version on top of the stamped
+  # deploy, so only do it when the secret is missing (first deploy). /healthz
+  # build_sha is the proof either way: the secret version keeps every var.
+  if npx wrangler secret list 2>/dev/null | jq -e '.[] | select(.name=="INGEST_KEY")' >/dev/null; then
+    echo "   INGEST_KEY already set (key fingerprint above)"
+  else
+    printf %s "$KEY" | npx wrangler secret put INGEST_KEY >/dev/null && echo "   INGEST_KEY set"
+  fi
   CFK="$(op read 'op://secrets/shared-cloudflare-api-key/credential')"
   DOM="$(authed "$CFK" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/domains?hostname=$HOST" | jq -r '.result[0].service // empty')"
   if [[ "$DOM" != "herdr-mcp" ]]; then
