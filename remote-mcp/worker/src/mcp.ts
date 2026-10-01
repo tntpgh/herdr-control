@@ -1,15 +1,17 @@
 // The MCP surface: seven read tools (herdr:read) and send_message
-// (herdr:message). Stateless Streamable HTTP: one server per request, bound to
-// the caller's verified grant. No tool can run a command, press a key, answer
-// an approval, or reach the Mac's local hub; the Worker only holds what the
-// publisher pushed.
+// (herdr:message, listed only when the server has messaging on AND the token
+// holds the scope). Stateless Streamable HTTP: one server per request, bound
+// to the caller's verified grant. No tool can run a command, press a key,
+// answer an approval, or reach the Mac's local hub; the Worker only holds
+// what the publisher pushed.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
 import { z } from "zod";
 import { insufficientScope } from "@cloudflare/workers-oauth-provider";
 import type { OAuthResourceAuth } from "@cloudflare/workers-oauth-provider";
-import { messageable, MAX_MESSAGE_CHARS } from "./policy";
+import { emailAllowed } from "./access";
+import { messageable, MAX_MESSAGE_CHARS, offeredScopes } from "./policy";
 import type { Caller, View } from "./state";
 import type { Env, GrantProps, TaskRow } from "./types";
 import { SCOPE_MESSAGE, SCOPE_READ } from "./types";
@@ -41,24 +43,27 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
     {
       jsonSchemaValidator: new CfWorkerJsonSchemaValidator(),
       instructions:
-        "Read-only view of Terrence's herdr agent fleet (tasks, agents, blockers, results), synced from his Mac every ~15s, " +
-        "plus send_message to a live task's agent. Every response carries `connection`; when connection.state is " +
-        "'disconnected' the data is the last known state, not live. Messages are delivered as a peer note, never as an " +
-        "approval or command.",
+        "Read-only view of Terrence's herdr agent fleet (tasks, agents, blockers, results), synced from his Mac every ~15s" +
+        (scopes.includes(SCOPE_MESSAGE) ? ", plus send_message to a live task's agent (delivered as a peer note, never as an approval or command)" : "") +
+        ". Every response carries `connection`; when connection.state is 'disconnected' the data is the last known state, " +
+        "not live. get_status is the cheap, harmless first call.",
     },
   );
   const stub = env.HERDR_STATE.get(env.HERDR_STATE.idFromName("fleet"));
   const now = () => Date.now();
   const canRead = scopes.includes(SCOPE_READ);
 
-  // Every call is audited; reads without herdr:read are refused (the
-  // provider's requiredScopes is advertised, not enforced).
-  async function gate(tool: string, target: string): Promise<View | ToolResult> {
-    if (!canRead) {
-      await stub.recordToolCall(now(), caller, tool, target, "refused", "missing_scope herdr:read");
-      return fail("insufficient_scope", "This token lacks herdr:read. Reconnect and grant it.");
+  // Every call is throttled and audited in the DO before it runs. `needs` is
+  // the set of scopes any one of which admits the call (the provider's
+  // requiredScopes is advertised, not enforced).
+  async function gate(tool: string, target: string, needs: string[] = [SCOPE_READ]): Promise<View | ToolResult> {
+    const scopeRefusal = needs.some((s) => scopes.includes(s)) ? null : `missing_scope ${needs.join("|")}`;
+    const refused = await stub.admitToolCall(now(), caller, tool, target, scopeRefusal);
+    if (refused) {
+      return refused.startsWith("rate_limited")
+        ? fail("rate_limited", `Refused: ${refused}. Slow down; the fleet only changes every ~15s.`)
+        : fail("insufficient_scope", `This token lacks ${needs.join(" or ")}. Reconnect and grant it.`);
     }
-    await stub.recordToolCall(now(), caller, tool, target, "allowed", "");
     return stub.view(now());
   }
   const isView = (v: View | ToolResult): v is View => "connection" in v;
@@ -196,11 +201,13 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
     inputSchema: { message_id: z.string().min(1).max(100) },
     annotations: ro,
   }, async ({ message_id }) => {
-    const v = await gate("get_message_status", message_id);
+    const v = await gate("get_message_status", message_id, [SCOPE_READ, SCOPE_MESSAGE]);
     if (!isView(v)) return v;
     const m = await stub.messageStatus(message_id, caller.email);
     return m ? ok({ connection: v.connection, message: m }) : fail("not_found", "No message with that id was sent by you.");
   });
+
+  if (!scopes.includes(SCOPE_MESSAGE)) return server;
 
   server.registerTool("send_message", {
     title: "Send a message to a task's agent",
@@ -217,10 +224,11 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
   }, async ({ target, text }) => {
     const out = await stub.sendMessage(now(), caller, scopes, target, text);
     if (!out.ok) {
-      const v = await stub.view(now());
-      return fail(out.reason.split(" ")[0]!, `Refused: ${out.reason}.`, {
-        connection: v.connection, ...(out.candidates ? { candidates: out.candidates } : {}),
-      });
+      // Fleet details (connection, candidate task ids) only for a token that may read them.
+      const extra = canRead
+        ? { connection: (await stub.view(now())).connection, ...(out.candidates ? { candidates: out.candidates } : {}) }
+        : {};
+      return fail(out.reason.split(" ")[0]!, `Refused: ${out.reason}.`, extra);
     }
     return ok({ message: out.message });
   });
@@ -232,14 +240,58 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
 export const mcpHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const c = ctx as ExecutionContext & { props: GrantProps; auth: OAuthResourceAuth };
-    const scopes = c.auth?.scope ?? [];
+    // Re-checked on every request, so removing an email cuts off grants already issued.
+    if (!emailAllowed(env, c.props.email)) {
+      return Response.json({ error: "access_revoked", error_description: "This account is no longer allowed." }, { status: 403 });
+    }
+    const offered = offeredScopes(env);
+    const scopes = (c.auth?.scope ?? []).filter((s) => offered.includes(s));
     if (!scopes.includes(SCOPE_READ) && !scopes.includes(SCOPE_MESSAGE)) {
       return insufficientScope(c.auth, [SCOPE_READ]);
     }
     const caller: Caller = { email: c.props.email, client_id: c.auth.clientId ?? "", client_name: c.props.client_name };
+    const calls = toolCalls(await request.clone().text());
     const server = buildServer(env, caller, scopes);
     const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     await server.connect(transport);
-    return transport.handleRequest(request);
+    const response = await transport.handleRequest(request);
+    if (calls.size) await auditRejected(env, caller, calls, response.clone());
+    return response;
   },
 };
+
+// tools/call requests in a JSON-RPC body, by id: what was asked for, for the audit.
+function toolCalls(raw: string): Map<string | number, { tool: string; target: string }> {
+  const calls = new Map<string | number, { tool: string; target: string }>();
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return calls; }
+  for (const m of Array.isArray(parsed) ? parsed : [parsed]) {
+    if (!m || typeof m !== "object" || !("method" in m) || m.method !== "tools/call" || !("id" in m)) continue;
+    const params = "params" in m && m.params && typeof m.params === "object" ? m.params : {};
+    const tool = "name" in params && typeof params.name === "string" ? params.name.slice(0, 80) : "?";
+    const args = "arguments" in params && params.arguments && typeof params.arguments === "object" ? params.arguments : {};
+    const target = Object.values(args).find((v): v is string => typeof v === "string") ?? "";
+    if (typeof m.id === "string" || typeof m.id === "number") calls.set(m.id, { tool, target: target.slice(0, 200) });
+  }
+  return calls;
+}
+
+// Every handler returns structuredContent and audits itself. A tools/call
+// answered WITHOUT it was refused by the SDK before any handler ran (unknown
+// tool, schema violation), so it is audited here instead.
+async function auditRejected(env: Env, caller: Caller, calls: Map<string | number, { tool: string; target: string }>,
+  response: Response): Promise<void> {
+  let body: unknown;
+  try { body = await response.json(); } catch { return; }
+  const stub = env.HERDR_STATE.get(env.HERDR_STATE.idFromName("fleet"));
+  for (const r of Array.isArray(body) ? body : [body]) {
+    if (!r || typeof r !== "object" || !("id" in r) || (typeof r.id !== "string" && typeof r.id !== "number")) continue;
+    const call = calls.get(r.id);
+    if (!call) continue;
+    const result = "result" in r && r.result && typeof r.result === "object" ? r.result : null;
+    if (result && "structuredContent" in result) continue;
+    const why = "error" in r && r.error && typeof r.error === "object" && "message" in r.error ? String(r.error.message)
+      : result && "content" in result && Array.isArray(result.content) ? String(result.content[0]?.text ?? "") : "no result";
+    await stub.recordRejectedCall(Date.now(), caller, call.tool, call.target, `rejected_before_handler: ${why.slice(0, 200)}`);
+  }
+}

@@ -6,12 +6,13 @@
 //   /oauth/token, /register  handled by @cloudflare/workers-oauth-provider
 //   /.well-known/*           RFC 9728 / RFC 8414 discovery (provider)
 //   /ingest/sync             the Mac publisher's HMAC-signed push
-import OAuthProvider, { AuthorizationError, CimdFetchError } from "@cloudflare/workers-oauth-provider";
+import OAuthProvider, { AuthorizationError, CimdFetchError, OAuthError } from "@cloudflare/workers-oauth-provider";
 import type { ConsentDescription } from "@cloudflare/workers-oauth-provider";
-import { verifyAccess } from "./access";
+import { emailAllowed, verifyAccess } from "./access";
 import { verifyIngest } from "./ingest";
 import { mcpHandler } from "./mcp";
-import type { Env } from "./types";
+import { offeredScopes } from "./policy";
+import type { Env, GrantProps } from "./types";
 import { SCOPE_MESSAGE, SCOPE_READ } from "./types";
 
 export { HerdrState } from "./state";
@@ -23,15 +24,15 @@ const SCOPE_TEXT: Record<string, string> = {
   [SCOPE_MESSAGE]: "Send one-line notes to live task agents (audited, rate-limited, never an approval or command).",
 };
 
-function consentPage(d: ConsentDescription, handle: string, email: string): string {
+function consentPage(d: ConsentDescription, handle: string, email: string, offered: string[]): string {
   const origin = d.clientDomain
     ? `Published by <strong>${escape(d.clientDomain)}</strong>.`
     : "This app registered itself; its name is not verified.";
-  const boxes = [SCOPE_READ, SCOPE_MESSAGE].map((s) => {
+  const boxes = offered.map((s) => {
     // read is pre-ticked; message must be ticked deliberately.
     const checked = s === SCOPE_READ ? "checked" : "";
     return `<label><input type="checkbox" name="scope" value="${s}" ${checked}> <code>${s}</code> — ${escape(SCOPE_TEXT[s]!)}</label>`;
-  }).join("<br>");
+  }).join("<br>") + (offered.includes(SCOPE_MESSAGE) ? "" : "<p>Messaging agents is turned off on this server, so this connection is read-only.</p>");
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>herdr-mcp: authorize ${escape(d.clientName)}</title>
 <style>body{font:15px system-ui;background:#111;color:#eee;max-width:640px;margin:40px auto;padding:0 16px}
@@ -60,7 +61,7 @@ async function authorize(request: Request, env: Env): Promise<Response> {
       const details = await oauth.describeConsent(req);
       const consent = await oauth.beginConsent(req);
       consent.headers.set("content-type", "text/html; charset=utf-8");
-      return new Response(consentPage(details, consent.handle, who.email), { headers: consent.headers });
+      return new Response(consentPage(details, consent.handle, who.email, offeredScopes(env)), { headers: consent.headers });
     }
     if (request.method === "POST") {
       const form = await request.formData();
@@ -69,7 +70,8 @@ async function authorize(request: Request, env: Env): Promise<Response> {
         const denied = await oauth.denyConsent(request, handle);
         return new Response(null, { status: 302, headers: denied.headers });
       }
-      const picked = form.getAll("scope").map(String).filter((s) => s === SCOPE_READ || s === SCOPE_MESSAGE);
+      const offered = offeredScopes(env);
+      const picked = form.getAll("scope").map(String).filter((s) => offered.includes(s));
       if (picked.length === 0) return text("Pick at least one scope.", 400);
       const approved = await oauth.approveConsent(request, handle, { scope: picked });
       const details = await oauth.describeConsent(approved.request);
@@ -114,7 +116,7 @@ const defaultHandler = {
   },
 };
 
-export function makeProvider(publicUrl: string): OAuthProvider<Env> {
+export function makeProvider(publicUrl: string, scopes: string[]): OAuthProvider<Env> {
   return new OAuthProvider<Env>({
     apiRoute: "/mcp",
     apiHandler: mcpHandler,
@@ -122,7 +124,7 @@ export function makeProvider(publicUrl: string): OAuthProvider<Env> {
     authorizeEndpoint: "/authorize",
     tokenEndpoint: "/oauth/token",
     clientRegistrationEndpoint: "/oauth/register",
-    scopesSupported: [SCOPE_READ, SCOPE_MESSAGE],
+    scopesSupported: scopes,
     requiredScopes: [SCOPE_READ],
     resourceMetadata: {
       resource: `${publicUrl}/mcp`,
@@ -133,15 +135,22 @@ export function makeProvider(publicUrl: string): OAuthProvider<Env> {
     refreshTokenTTL: 30 * 86_400,
     refreshTokenIdleTTL: 7 * 86_400,
     clientIdMetadataDocumentEnabled: true,
+    // invalid_grant also revokes the grant, so a removed email loses it for good.
+    tokenExchangeCallback: ({ grantType, props, env }) => {
+      const email = (props as GrantProps).email;
+      if (grantType === "refresh_token" && !emailAllowed(env, email)) {
+        throw new OAuthError("invalid_grant", { description: "This account is no longer allowed to use herdr-mcp." });
+      }
+    },
   });
 }
 
-// The provider is configured once per isolate from PUBLIC_URL.
+// The provider is configured once per isolate from vars, which only change on deploy.
 let provider: OAuthProvider<Env> | null = null;
 
 export default {
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    provider ??= makeProvider(env.PUBLIC_URL);
+    provider ??= makeProvider(env.PUBLIC_URL, offeredScopes(env));
     return provider.fetch(request, env, ctx);
   },
 };

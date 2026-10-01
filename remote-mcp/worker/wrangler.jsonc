@@ -4,6 +4,7 @@
   //   wrangler secret put INGEST_KEY   (same value as HERDR_MCP_INGEST_KEY in
   //                                     ~/.config/op/launchd-secrets.env)
   "name": "herdr-mcp",
+  "main": "src/index.ts",
   "compatibility_date": "2026-08-15",
   // global_fetch_strictly_public: SSRF guard the OAuth provider requires
   // before it will fetch Client ID Metadata Documents.
@@ -19,7 +20,10 @@
     // AUD of the path-scoped Access app "herdr-mcp-authorize" (scripts/provision-access-app.sh).
     "ACCESS_AUD": "__ACCESS_AUD__",
     "ALLOWED_EMAILS": "tnt@teamthurber.com",
-    "STALE_AFTER_S": "90"
+    "STALE_AFTER_S": "90",
+    // Off for the first connection: read-only. Turning it on is its own decision,
+    // a redeploy, and a fresh consent that ticks herdr:message.
+    "MESSAGING_ENABLED": "false"
   },
   "observability": { "enabled": true }
 }

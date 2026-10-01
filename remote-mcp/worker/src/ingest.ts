@@ -31,8 +31,11 @@ export async function verifyIngest(request: Request, key: string | undefined, no
     return { ok: false, status: 401, reason: "bad_headers" };
   }
   if (Math.abs(nowS - Number(ts)) > MAX_SKEW_S) return { ok: false, status: 401, reason: "stale_timestamp" };
-  const len = Number(request.headers.get("content-length") ?? "0");
-  if (len > MAX_BODY_BYTES) return { ok: false, status: 413, reason: "too_large" };
+  // Required, so the cap is enforced before the body is buffered (a chunked
+  // body has no length and would otherwise be read in full, unauthenticated).
+  const lenHeader = request.headers.get("content-length");
+  if (lenHeader === null || !/^\d+$/.test(lenHeader)) return { ok: false, status: 411, reason: "length_required" };
+  if (Number(lenHeader) > MAX_BODY_BYTES) return { ok: false, status: 413, reason: "too_large" };
   const body = await request.text();
   if (body.length > MAX_BODY_BYTES) return { ok: false, status: 413, reason: "too_large" };
   const want = await sign(key, ts, nonce, body);

@@ -28,11 +28,13 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -52,6 +54,7 @@ MESSAGEABLE = {"starting", "running", "blocked", "stalled", "ready_review"}
 KEEP_TERMINAL_DAYS = 14
 RESULT_BUDGET_BYTES = 1_000_000  # the Worker refuses bodies over 2 MB; the rest go next tick
 RESULT_MAX_BYTES = 64_000
+RESULT_READ_CAP = 1_000_000  # redaction runs over this much, then the result is cut to RESULT_MAX_BYTES
 RESULT_RESEND_S = 12 * 3600
 MAX_RESULTS_PER_SYNC = 50
 MAX_MESSAGE_CHARS = 2000
@@ -62,8 +65,11 @@ WORKTREE_ROOTS = (Path.home() / ".herdr/worktrees", Path.home() / "Code")
 # fleet secret-scan patterns (git-hooks/secret-scan-pre-commit.sh) once they
 # are exposed as a library.
 REDACTIONS = [
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "[REDACTED:private-key]"),
+    # An unterminated block (a file cut mid-key) is redacted to the end.
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S), "[REDACTED:private-key]"),
     (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_\-]{16,}"), "[REDACTED:api-key]"),
+    (re.compile(r"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"), "[REDACTED:api-key]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{30,}"), "[REDACTED:google-api-key]"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "[REDACTED:github-token]"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[REDACTED:github-token]"),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}"), "[REDACTED:slack-token]"),
@@ -73,8 +79,15 @@ REDACTIONS = [
     (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "[REDACTED:jwt]"),
     (re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-~+/=]{16,}"), r"\1 [REDACTED]"),
     (re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^\s:/@]+:[^\s@/]+@"), r"\1[REDACTED]@"),
-    (re.compile(r"(?i)\b([A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|DSN)[A-Z0-9_]*)\s*[=:]\s*(['\"]?)[^\s'\"]{6,}\2"),
-     r"\1=[REDACTED]"),
+    # "password": "…" / 'api_key': '…' (JSON, YAML flow, Python dicts).
+    (re.compile(r"(?i)([\"'][a-z0-9_.\-]*(?:secret|token|password|passwd|passphrase|pwd|api[_\-]?key|private[_\-]?key|"
+                r"access[_\-]?key|auth|credential)[a-z0-9_.\-]*[\"']\s*:\s*)([\"'])[^\"']{4,}\2"), r'\1"[REDACTED]"'),
+    # NAME=value / name: value for names that only ever hold secrets.
+    (re.compile(r"(?i)\b([A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|PWD|CREDENTIALS?|API_?KEY|PRIVATE_?KEY|"
+                r"ACCESS_?KEY|DSN)[A-Z0-9_]*)\s*[=:]\s*(['\"]?)[^\s'\"]{6,}\2"), r"\1=[REDACTED]"),
+    # Env-style UPPER_CASE names with KEY/AUTH (HERDR_MCP_INGEST_KEY, TWILIO_AUTH):
+    # case-sensitive, so prose like "primary key: task_id" survives.
+    (re.compile(r"\b([A-Z][A-Z0-9_]*(?:KEY|AUTH)[A-Z0-9_]*)\s*[=:]\s*(['\"]?)[^\s'\"]{6,}\2"), r"\1=[REDACTED]"),
 ]
 
 
@@ -249,6 +262,21 @@ def worktree_ok(path: Path) -> bool:
     return any(rp == root.resolve() or root.resolve() in rp.parents for root in WORKTREE_ROOTS)
 
 
+def read_regular(path: Path) -> tuple[bytes, str]:
+    """Read at most RESULT_READ_CAP bytes of a plain file with one link: no
+    symlink (O_NOFOLLOW), no hard link to a file elsewhere (st_nlink == 1),
+    and the checks apply to the descriptor actually read."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise OSError(f"{path}: not a single-link regular file")
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read(RESULT_READ_CAP), iso(st.st_mtime)
+    finally:
+        os.close(fd)
+
+
 def changed_results(snapshot: dict, local: dict, cache: dict, now_s: float) -> list[dict]:
     out, used = [], 0
     order = sorted(snapshot["tasks"], key=lambda t: t["updated_at"], reverse=True)
@@ -257,15 +285,17 @@ def changed_results(snapshot: dict, local: dict, cache: dict, now_s: float) -> l
         if not wt:
             continue
         proof = wt / ".handoffs/PROOF.md"
+        if not worktree_ok(proof.parent):
+            continue
         try:
-            if proof.is_symlink() or not worktree_ok(proof.parent):
-                continue
-            raw = proof.read_bytes()
-            mtime = iso(proof.stat().st_mtime)
+            raw, mtime = read_regular(proof)
         except OSError:
             continue
-        truncated = len(raw) > RESULT_MAX_BYTES
-        text = redact(raw[:RESULT_MAX_BYTES].decode("utf-8", "replace"))
+        # Redact the whole read, THEN cut: a cut through a PEM block would
+        # strip the END marker the private-key rule needs.
+        full = redact(raw.decode("utf-8", "replace"))
+        truncated = len(raw) >= RESULT_READ_CAP or len(full) > RESULT_MAX_BYTES
+        text = full[:RESULT_MAX_BYTES]
         digest = hashlib.sha256(text.encode()).hexdigest()
         seen = cache.get(t["task_id"]) or {}
         if seen.get("sha256") == digest and now_s - seen.get("sent_at", 0) < RESULT_RESEND_S:
@@ -295,9 +325,13 @@ def post_sync(key: str, body: dict) -> dict:
 # ── delivery ───────────────────────────────────────────────────────────────────
 def frame(item: dict) -> str | None:
     """The fixed envelope. It always starts with "[", so the agent never sees
-    a leading "/" (slash command) or "!" (shell escape)."""
-    text = re.sub(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+", " ", str(item.get("text") or ""))
-    text = re.sub(r"\s+", " ", text).strip()
+    a leading "/" (slash command) or "!" (shell escape). Same rule as the
+    Worker's sanitizeMessage, re-applied here: control and format characters
+    (bidi, zero-width, tag) become spaces, and brackets become parentheses so
+    the text cannot close the envelope and forge another."""
+    raw = str(item.get("text") or "")
+    text = "".join(" " if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c for c in raw)
+    text = re.sub(r"\s+", " ", text.replace("[", "(").replace("]", ")")).strip()
     if not text or len(text) > MAX_MESSAGE_CHARS:
         return None
     who = re.sub(r"[^\w .@\-]", "", str(item.get("client_name") or "remote client"))[:40]
@@ -359,6 +393,7 @@ def append_audit(rows: list[dict]) -> None:
 
 
 def main(argv: list[str]) -> int:
+    os.umask(0o077)  # state.json / audit.jsonl carry emails and client ids
     if "--print-key-fingerprint" in argv:  # identity, never the value (provision.sh compares it to 1Password)
         key = ingest_key()
         if not key:
@@ -403,11 +438,21 @@ def main(argv: list[str]) -> int:
     if not outbox:
         log(f"synced {len(snapshot['tasks'])} tasks, {len(snapshot['agents'])} agents, {len(results)} results")
         return 0
-    new_acks = [deliver(item, local) for item in outbox]
-    for a in new_acks:
+    # Each outcome is saved the moment it is known, and delivered ids are kept
+    # for a day: a crash between typing and acking must not type it twice.
+    delivered = {k: v for k, v in st.get("delivered", {}).items() if now.timestamp() - v < 86_400}
+    new_acks = []
+    for item in outbox:
+        if item["message_id"] in delivered:
+            a = {"message_id": item["message_id"], "outcome": "delivered", "detail": "already delivered (ack was lost)"}
+        else:
+            a = deliver(item, local)
+            if a["outcome"] == "delivered":
+                delivered[a["message_id"]] = now.timestamp()
         log(f"message {a['message_id']}: {a['outcome']} ({a['detail']})")
-    st["pending_acks"] = new_acks
-    save_state(st)
+        new_acks.append(a)
+        st["delivered"], st["pending_acks"] = delivered, new_acks
+        save_state(st)
     try:  # second sync: report outcomes now rather than next tick
         reply = post_sync(key, {"snapshot": snapshot, "results": [], "acks": new_acks,
                                 "audit_cursor": st["audit_cursor"], "lease": False})

@@ -13,6 +13,13 @@ export interface AccessIdentity {
   sub: string;
 }
 
+// The one allowlist: checked at consent, on every /mcp request and on every
+// refresh, so removing an email cuts off grants already issued to it.
+export function emailAllowed(env: Env, email: string): boolean {
+  const want = email.trim().toLowerCase();
+  return want !== "" && env.ALLOWED_EMAILS.split(",").some((e) => e.trim().toLowerCase() === want);
+}
+
 export async function verifyAccess(request: Request, env: Env): Promise<AccessIdentity | null> {
   const token = request.headers.get("cf-access-jwt-assertion");
   if (!token || !env.ACCESS_AUD || !env.ACCESS_TEAM_DOMAIN) return null;
@@ -27,8 +34,7 @@ export async function verifyAccess(request: Request, env: Env): Promise<AccessId
       algorithms: ["RS256"],
     });
     const email = typeof payload.email === "string" ? payload.email.trim().toLowerCase() : "";
-    const allowed = env.ALLOWED_EMAILS.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
-    if (!email || !allowed.includes(email) || typeof payload.sub !== "string") return null;
+    if (!emailAllowed(env, email) || typeof payload.sub !== "string") return null;
     return { email, sub: payload.sub };
   } catch {
     return null;

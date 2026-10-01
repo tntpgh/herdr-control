@@ -14,6 +14,10 @@ export interface Env {
   ACCESS_AUD: string; // AUD of the path-scoped Access app on /authorize
   ALLOWED_EMAILS: string; // comma-separated; the only humans who may grant a token
   STALE_AFTER_S: string; // no sync for this long => disconnected
+  // "true" lets consent grant herdr:message and lets send_message run. Anything
+  // else is a read-only server: the scope is never granted, the tool is never
+  // listed, and tokens granted while it was on stop working for messages.
+  MESSAGING_ENABLED: string;
   INGEST_KEY: string; // secret: HMAC key shared with publisher.py
 }
 

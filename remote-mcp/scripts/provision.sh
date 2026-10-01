@@ -52,7 +52,9 @@ echo "   id=${KV_ID:-<missing>}"
 echo "== 2. Access app '$APP_NAME' on $HOST/$APP_PATH"
 ZT="$(op read 'op://secrets/shared-cloudflare-zero-trust-key/credential')"
 API="https://api.cloudflare.com/client/v4/accounts/$ACC/access"
-cf() { curl -sS -H "Authorization: Bearer $ZT" -H 'Content-Type: application/json' "$@"; }
+# Tokens go to curl as a header FILE (-H @fd), never in argv where `ps` shows them.
+authed() { local tok="$1"; shift; curl -sS -H @<(printf 'Authorization: Bearer %s\n' "$tok") -H 'Content-Type: application/json' "$@"; }
+cf() { authed "$ZT" "$@"; }
 IDP="$(cf "$API/identity_providers" | jq -r '[.result[]? | select(.type=="google-apps")][0].id // empty')"
 [[ -n "$IDP" ]] || { echo "   BLOCKER: Google Workspace IdP not found; allowed_idps must be pinned" >&2; exit 1; }
 APP_JSON="$(cf "$API/apps" | jq -c --arg n "$APP_NAME" 'first(.result[]? | select(.name==$n)) // empty')"
@@ -130,10 +132,10 @@ if (( APPLY )); then
   npx wrangler deploy 2>&1 | grep -vE '^\s*$' | tail -8
   printf %s "$KEY" | npx wrangler secret put INGEST_KEY >/dev/null && echo "   INGEST_KEY set"
   CFK="$(op read 'op://secrets/shared-cloudflare-api-key/credential')"
-  DOM="$(curl -sS -H "Authorization: Bearer $CFK" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/domains?hostname=$HOST" | jq -r '.result[0].service // empty')"
+  DOM="$(authed "$CFK" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/domains?hostname=$HOST" | jq -r '.result[0].service // empty')"
   if [[ "$DOM" != "herdr-mcp" ]]; then
-    ZONE="$(curl -sS -H "Authorization: Bearer $CFK" 'https://api.cloudflare.com/client/v4/zones?name=teamthurber.com' | jq -r '.result[0].id')"
-    curl -sS -X PUT -H "Authorization: Bearer $CFK" -H 'Content-Type: application/json' \
+    ZONE="$(authed "$CFK" 'https://api.cloudflare.com/client/v4/zones?name=teamthurber.com' | jq -r '.result[0].id')"
+    authed "$CFK" -X PUT \
       "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/domains" \
       -d "$(jq -nc --arg h "$HOST" --arg z "$ZONE" '{environment:"production", hostname:$h, service:"herdr-mcp", zone_id:$z}')" \
       | jq -c '{success, errors}'
@@ -152,6 +154,6 @@ echo "/ingest unsigned:      $(code -X POST "$B/ingest/sync")   (want 401; 503 =
 echo
 echo "ROLLBACK:"
 echo "  npx wrangler delete herdr-mcp            # Worker, DO, custom domain route"
-echo "  curl -X DELETE -H \"Authorization: Bearer \$ZT\" $API/apps/${APP_ID:-<id>}"
+echo "  curl -X DELETE -H @<(printf 'Authorization: Bearer %s\\n' \"\$ZT\") $API/apps/${APP_ID:-<id>}"
 echo "  npx wrangler kv namespace delete --namespace-id ${KV_ID:-<id>}"
 echo "  op-write item delete $ITEM --vault Secrets --archive; remove HERDR_MCP_INGEST_KEY from $SECRETS_FILE"

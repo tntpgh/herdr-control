@@ -9,25 +9,33 @@ const { publicKey, privateKey } = await generateKeyPair("RS256", { extractable: 
 const pub = { ...(await exportJWK(publicKey)), kid: "test-kid", alg: "RS256", use: "sig" };
 const priv = { ...(await exportJWK(privateKey)), kid: "test-kid", alg: "RS256" };
 
-export default defineConfig({
-  plugins: [
-    cloudflareTest({
-      main: "./src/index.ts",
-      wrangler: { configPath: "./wrangler.jsonc" },
-      miniflare: {
-        bindings: {
-          ACCESS_AUD: "test-aud",
-          INGEST_KEY: "k".repeat(48),
-          TEST_ACCESS_PRIVATE_JWK: JSON.stringify(priv),
-        },
-        outboundService: (request: Request) => {
-          const url = new URL(request.url);
-          if (url.hostname === "thurberteam.cloudflareaccess.com" && url.pathname === "/cdn-cgi/access/certs") {
-            return Response.json({ keys: [pub] });
-          }
-          return new Response("blocked in tests", { status: 599 });
-        },
+// The same Worker twice: as deployed first (messaging off, read-only) and with
+// messaging switched on. vars are fixed per isolate, so each mode is a project.
+const worker = (messaging: "true" | "false") =>
+  cloudflareTest({
+    wrangler: { configPath: "./wrangler.jsonc" },
+    miniflare: {
+      bindings: {
+        ACCESS_AUD: "test-aud",
+        INGEST_KEY: "k".repeat(48),
+        MESSAGING_ENABLED: messaging,
+        TEST_ACCESS_PRIVATE_JWK: JSON.stringify(priv),
       },
-    }),
-  ],
+      outboundService: (request: Request) => {
+        const url = new URL(request.url);
+        if (url.hostname === "thurberteam.cloudflareaccess.com" && url.pathname === "/cdn-cgi/access/certs") {
+          return Response.json({ keys: [pub] });
+        }
+        return new Response("blocked in tests", { status: 599 });
+      },
+    },
+  });
+
+export default defineConfig({
+  test: {
+    projects: [
+      { plugins: [worker("false")], test: { name: "read-only", include: ["test/readonly.test.ts"] } },
+      { plugins: [worker("true")], test: { name: "messaging", include: ["test/flow.test.ts"] } },
+    ],
+  },
 });

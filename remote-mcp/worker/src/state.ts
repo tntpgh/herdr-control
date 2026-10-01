@@ -94,6 +94,10 @@ const NONCE_TTL_MS = 15 * 60_000;
 // permission prompt or a typing human makes it retry, so 40 covers the TTL.
 const MAX_ATTEMPTS = 40;
 const AUDIT_KEEP_MS = 180 * 86_400_000;
+// Every tool call by one client (allowed or refused) counts. A ChatGPT session
+// makes a handful of calls per turn; these only bite a loop or a leaked token.
+const CALLS_PER_MINUTE = 60;
+const CALLS_PER_DAY = 2000;
 
 const iso = (ms: number) => new Date(ms).toISOString();
 
@@ -114,6 +118,7 @@ export class HerdrState extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL,
       actor TEXT NOT NULL, client_id TEXT NOT NULL, tool TEXT NOT NULL, target TEXT NOT NULL, decision TEXT NOT NULL,
       reason TEXT NOT NULL, message_id TEXT NOT NULL, detail TEXT NOT NULL)`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS audit_by_client ON audit(client_id, actor, at)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, seen_at INTEGER NOT NULL)`);
   }
 
@@ -130,12 +135,18 @@ export class HerdrState extends DurableObject<Env> {
     );
   }
 
+  // Parsed once per sync, not once per tool call (a snapshot can be ~2 MB).
+  private cached: { lastMs: number; snapshot: Snapshot | null } | null = null;
+
   view(nowMs: number): View {
-    const snapRow = this.sql.exec<{ v: string }>(`SELECT v FROM kv WHERE k='snapshot'`).toArray()[0];
     const syncRow = this.sql.exec<{ v: string }>(`SELECT v FROM kv WHERE k='last_sync_ms'`).toArray()[0];
-    const snapshot = snapRow ? (JSON.parse(snapRow.v) as Snapshot) : null;
     const last = syncRow ? Number(syncRow.v) : null;
-    return { snapshot, connection: connection(snapshot, last, nowMs, this.staleAfterS()) };
+    if (last === null) return { snapshot: null, connection: connection(null, null, nowMs, this.staleAfterS()) };
+    if (this.cached?.lastMs !== last) {
+      const snapRow = this.sql.exec<{ v: string }>(`SELECT v FROM kv WHERE k='snapshot'`).toArray()[0];
+      this.cached = { lastMs: last, snapshot: snapRow ? (JSON.parse(snapRow.v) as Snapshot) : null };
+    }
+    return { snapshot: this.cached.snapshot, connection: connection(this.cached.snapshot, last, nowMs, this.staleAfterS()) };
   }
 
   result(taskId: string): (ResultDoc & { synced_at: string }) | null {
@@ -145,8 +156,40 @@ export class HerdrState extends DurableObject<Env> {
     return { ...r, truncated_at_source: r.truncated_at_source === 1, synced_at: iso(r.synced_at) };
   }
 
-  recordToolCall(nowMs: number, caller: Caller, tool: string, target: string, decision: string, reason: string): void {
-    this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool, target, decision, reason, message_id: "", detail: "" });
+  // Bounds every client's call volume, and with it audit growth. Over the
+  // limit, one "throttled" row is written per window and later calls in that
+  // window are refused without a row, so a flood cannot grow storage.
+  private throttled(nowMs: number, caller: Caller, tool: string): string | null {
+    const count = (sinceMs: number) => this.sql.exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit WHERE client_id=? AND actor=? AND at > ?`, caller.client_id, caller.email, sinceMs,
+    ).one().n;
+    const window = count(nowMs - 60_000) >= CALLS_PER_MINUTE ? 60_000 : count(nowMs - 86_400_000) >= CALLS_PER_DAY ? 86_400_000 : 0;
+    if (!window) return null;
+    const reason = `rate_limited (${window === 60_000 ? `${CALLS_PER_MINUTE}/minute` : `${CALLS_PER_DAY}/day`})`;
+    const noted = this.sql.exec(`SELECT 1 FROM audit WHERE client_id=? AND actor=? AND decision='throttled' AND at > ?`,
+      caller.client_id, caller.email, nowMs - window).toArray().length > 0;
+    if (!noted) {
+      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool, target: "", decision: "throttled", reason,
+        message_id: "", detail: "" });
+    }
+    return reason;
+  }
+
+  // One audited decision per tool call: throttle first, then the scope verdict
+  // the caller computed. Returns the refusal reason, or null when allowed.
+  admitToolCall(nowMs: number, caller: Caller, tool: string, target: string, scopeRefusal: string | null): string | null {
+    const limited = this.throttled(nowMs, caller, tool);
+    if (limited) return limited;
+    this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool, target,
+      decision: scopeRefusal ? "refused" : "allowed", reason: scopeRefusal ?? "", message_id: "", detail: "" });
+    return scopeRefusal;
+  }
+
+  // A call the MCP SDK refused before any handler ran (unknown tool, schema).
+  recordRejectedCall(nowMs: number, caller: Caller, tool: string, target: string, reason: string): void {
+    if (this.throttled(nowMs, caller, tool)) return;
+    this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool, target, decision: "refused", reason,
+      message_id: "", detail: "" });
   }
 
   sendMessage(nowMs: number, caller: Caller, scopes: string[], target: string, rawText: string): SendOutcome {
@@ -155,6 +198,9 @@ export class HerdrState extends DurableObject<Env> {
         decision: "refused", reason, message_id: "", detail: `chars=${rawText.length}` });
       return candidates ? { ok: false, reason, candidates } : { ok: false, reason };
     };
+    const limited = this.throttled(nowMs, caller, "send_message");
+    if (limited) return { ok: false, reason: limited };
+    if (this.env.MESSAGING_ENABLED !== "true") return refuse("messaging_disabled");
     if (!scopes.includes("herdr:message")) return refuse("missing_scope herdr:message");
     const { snapshot, connection: conn } = this.view(nowMs);
     if (!snapshot || conn.state === "disconnected" || conn.state === "never_connected") {
@@ -167,8 +213,8 @@ export class HerdrState extends DurableObject<Env> {
     const recent = this.sql.exec<{ created_at: number }>(
       `SELECT created_at FROM messages WHERE actor=? AND created_at > ?`, caller.email, nowMs - 3_600_000,
     ).toArray().map((r) => r.created_at);
-    const limited = rateLimited(recent, nowMs);
-    if (limited) return refuse(limited);
+    const tooMany = rateLimited(recent, nowMs);
+    if (tooMany) return refuse(tooMany);
 
     const t = res.task;
     const id = `msg_${iso(nowMs).replace(/[-:.]/g, "").slice(0, 15)}Z_${crypto.randomUUID().slice(0, 8)}`;
@@ -212,6 +258,7 @@ export class HerdrState extends DurableObject<Env> {
 
     this.sql.exec(`INSERT OR REPLACE INTO kv (k, v) VALUES ('snapshot', ?)`, JSON.stringify(body.snapshot));
     this.sql.exec(`INSERT OR REPLACE INTO kv (k, v) VALUES ('last_sync_ms', ?)`, String(nowMs));
+    this.cached = { lastMs: nowMs, snapshot: body.snapshot };
     for (const r of body.results) {
       this.sql.exec(`INSERT OR REPLACE INTO results (task_id, source, text, sha256, source_mtime, truncated_at_source, synced_at)
         VALUES (?,?,?,?,?,?,?)`, r.task_id, r.source, r.text, r.sha256, r.source_mtime, r.truncated_at_source ? 1 : 0, nowMs);

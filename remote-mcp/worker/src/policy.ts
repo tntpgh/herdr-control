@@ -1,6 +1,14 @@
 // Pure policy: connection state, message-target resolution, message text
 // rules, rate limits. No I/O, so every rule here is unit-tested directly.
-import type { Snapshot, TaskRow } from "./types";
+import type { Env, Snapshot, TaskRow } from "./types";
+import { SCOPE_MESSAGE, SCOPE_READ } from "./types";
+
+// The scopes this deployment will grant and honour. A token's scopes are
+// always intersected with this, so turning messaging off takes effect on
+// the next request, not when existing tokens expire.
+export function offeredScopes(env: Env): string[] {
+  return env.MESSAGING_ENABLED === "true" ? [SCOPE_READ, SCOPE_MESSAGE] : [SCOPE_READ];
+}
 
 export type ConnectionState = "connected" | "degraded" | "disconnected" | "never_connected";
 
@@ -76,12 +84,18 @@ export function resolveTarget(snapshot: Snapshot, target: string): Resolution {
 export const MAX_MESSAGE_CHARS = 2000;
 
 // Delivery types the text into an agent's composer and presses Enter, so the
-// text must be exactly one line of printable characters: no control bytes
-// (ESC sequences, CR/LF that would submit early). The publisher adds a fixed
-// prefix, so the agent never sees text that starts with "/" or "!".
+// text must be exactly one line of visible characters: no control bytes (ESC
+// sequences, CR/LF that would submit early), no format characters (bidi
+// overrides, zero-width, tag characters) that hide text from the human
+// watching the pane, and no square brackets, which could close the
+// publisher's "[REMOTE NOTE …]" envelope and forge a second one. The
+// publisher re-applies the same rule before framing.
 export function sanitizeMessage(text: string): { ok: true; text: string } | { ok: false; reason: string } {
-  // eslint-disable-next-line no-control-regex
-  const cleaned = text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
+  const cleaned = text
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\p{Cf}]+/gu, " ")
+    .replace(/\[/g, "(").replace(/\]/g, ")")
+    .replace(/\s+/g, " ").trim();
   if (!cleaned) return { ok: false, reason: "empty_text" };
   if (cleaned.length > MAX_MESSAGE_CHARS) return { ok: false, reason: `text_too_long (max ${MAX_MESSAGE_CHARS})` };
   return { ok: true, text: cleaned };
