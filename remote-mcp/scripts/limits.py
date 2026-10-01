@@ -11,7 +11,8 @@ back to the defaults on its own (up to 7d); `--until-reset` keeps it until
 `reset`. The Worker refuses anything above its ceiling (30/minute, 300/hour);
 raising the ceiling is a code change. set/reset are dry runs unless --apply.
 Takes effect on the next send_message; no redeploy. Every call is audited
-(admin_limits_get / _set / _reset). Signed like grants.py.
+(admin_limits_get / _set / _reset). Signed like grants.py. The --reason text
+is shown to every messaging client (Zero) in get_status; keep it plain.
 """
 from __future__ import annotations
 
