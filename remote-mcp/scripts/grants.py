@@ -27,12 +27,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from publisher import URL, ingest_key, sign  # noqa: E402
 
 
-def call(key: str, body: dict) -> tuple[int, dict]:
+def call(key: str, body: dict, path: str = "/admin/grants") -> tuple[int, dict]:
+    """One signed POST to a Mac-only admin route (also used by limits.py)."""
     raw = json.dumps(body, separators=(",", ":")).encode()
     ts, nonce = str(int(time.time())), secrets.token_hex(16)
-    req = urllib.request.Request(f"{URL}/admin/grants", data=raw, method="POST", headers={
+    req = urllib.request.Request(f"{URL}{path}", data=raw, method="POST", headers={
         "content-type": "application/json", "x-herdr-ts": ts, "x-herdr-nonce": nonce,
-        "x-herdr-sig": sign(key, ts, nonce, raw), "user-agent": "herdr-mcp-grants/1",
+        "x-herdr-sig": sign(key, ts, nonce, raw), "user-agent": "herdr-mcp-admin/1",
     })
     try:
         with urllib.request.urlopen(req, timeout=30) as r:

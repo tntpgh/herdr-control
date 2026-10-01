@@ -94,6 +94,10 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
       } : null,
       your_scopes: scopes,
       server: serverInfo(env),
+      // Present when messaging is on: the limits in force and how many of them
+      // this user has used (all their clients together).
+      message_limits: serverInfo(env).messaging_enabled
+        ? { ...(await stub.messageLimits(now())), used: await stub.messagesUsed(now(), caller.email) } : null,
     });
   });
 

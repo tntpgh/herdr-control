@@ -274,6 +274,64 @@ describe("grant administration from the Mac (/admin/grants)", () => {
   });
 });
 
+describe("message limits from the Mac (/admin/limits)", () => {
+  type Limits = { per_minute: number; per_hour: number; source: string; until: string | null; used?: { last_minute: number; last_hour: number } };
+  const send = async (token: string, n: number) => {
+    const out: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const r = await callTool<{ message?: MessageRecord }>(token, "send_message", { target: "task_A", text: `n${i}` });
+      out.push(r.data.error ?? r.data.message!.status);
+    }
+    return out;
+  };
+
+  it("a raised limit admits more, get_status shows it, and reset restores the default", async () => {
+    await signedSync(syncBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
+    const set = await signedPost("/admin/limits", { op: "set", per_minute: 8, per_hour: 120, minutes: 240, reason: "busy day" });
+    expect(set.status).toBe(200);
+    expect(await send(access_token, 9)).toEqual([...Array(8).fill("queued"), "rate_limited"]);
+
+    const status = await callTool<{ message_limits: Limits }>(access_token, "get_status");
+    expect([status.data.message_limits.per_minute, status.data.message_limits.per_hour, status.data.message_limits.source,
+      status.data.message_limits.used?.last_minute]).toEqual([8, 120, "override", 8]);
+    expect(status.data.message_limits.until).not.toBeNull();
+
+    const reset: { limits: Limits } = await (await signedPost("/admin/limits", { op: "reset" })).json();
+    expect([reset.limits.per_minute, reset.limits.per_hour, reset.limits.source]).toEqual([5, 30, "default"]);
+  });
+
+  it("a temporary boost lapses back to the defaults on its own", async () => {
+    await signedSync(syncBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
+    await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.setMessageLimits(Date.now(), { per_minute: 20, per_hour: 200, until_ms: Date.now() - 1, reason: "expired boost" }));
+    expect(await send(access_token, 6)).toEqual([...Array(5).fill("queued"), "rate_limited"]);
+  });
+
+  it("refuses values above the ceiling or malformed, never clamping, and audits accepted changes", async () => {
+    const bad = [
+      { op: "set", per_minute: 31, per_hour: 100, minutes: 60, reason: "x" },
+      { op: "set", per_minute: 10, per_hour: 301, minutes: 60, reason: "x" },
+      { op: "set", per_minute: 10, per_hour: 5, minutes: 60, reason: "x" },
+      { op: "set", per_minute: 10, per_hour: 100, minutes: 60, reason: " " },
+      { op: "set", per_minute: 10, per_hour: 100, minutes: 0, reason: "x" },
+      { op: "set", per_minute: 1.5, per_hour: 100, minutes: null, reason: "x" },
+      { op: "raise_ceiling" },
+    ];
+    for (const b of bad) expect((await signedPost("/admin/limits", b)).status).toBe(400);
+    const unsigned = await SELF.fetch(`${BASE}/admin/limits`, { method: "POST", body: JSON.stringify({ op: "reset" }) });
+    expect(unsigned.status).toBe(401);
+    const got: { limits: Limits } = await (await signedPost("/admin/limits", { op: "get" })).json();
+    expect(got.limits.source).toBe("default");
+
+    await signedPost("/admin/limits", { op: "set", per_minute: 10, per_hour: 100, minutes: null, reason: "steady" });
+    const { audit } = await syncJson(await signedSync(syncBody()));
+    expect(audit.filter((a) => a.tool.startsWith("admin_limits")).map((a) => a.tool))
+      .toEqual(["admin_limits_get", "admin_limits_set"]);
+  });
+});
+
 describe("abuse bounds", () => {
   it("throttles a client past 60 calls a minute and audits the throttle once", async () => {
     const zero = { email: "tnt@teamthurber.com", client_id: "c-loop", client_name: "Zero" };
