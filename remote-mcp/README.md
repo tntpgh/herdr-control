@@ -41,10 +41,11 @@ Scopes:
   on is a separate decision: set the var to `"true"`, redeploy, and reconnect
   the client, ticking `herdr:message` deliberately (it is never pre-ticked).
 
-**Before turning messaging on:** fix review finding M1 in `send-to-agent.sh`
-(a permission menu that appears between its prompt check and `send-text`, a
-~1 s window, receives the typed text). It predates this feature, but a remote
-sender makes it reachable.
+Review finding M1 (a permission menu raised during `send-to-agent.sh`'s ~1 s
+typing check received the typed text) is fixed: the prompt is re-checked as
+the last step before typing (`verify-typing-guard.sh` has the regression). The
+window left is one pane read; herdr has no atomic check-and-type. Turning
+messaging on still waits for a separate decision.
 
 Allowlist: `ALLOWED_EMAILS` is checked at consent, on **every** `/mcp`
 request, and on every refresh (`invalid_grant`, which also revokes the grant),
@@ -224,7 +225,7 @@ scope, throttle and allowlist enforcement in workerd) and
 `python3 remote-mcp/verify-publisher.py` (snapshot, redaction, link and
 envelope handling, delivery re-checks, lost-ack dedup). CI:
 `.github/workflows/remote-mcp.yml`. Security review (posted on PR #206):
-findings M2–M8, L1–L4, I1, I2 fixed; M1 open, and it gates turning messaging on.
+findings M1–M8, L1–L4, I1, I2 fixed (M1 narrowed to one pane read).
 
 Dependencies: `npm ci` is warning-free and `npm audit` reports 0. The test
 pool (`@cloudflare/vitest-pool-workers` 0.22.0, latest) pins an older

@@ -238,6 +238,23 @@ if [ "$submit_only" -eq 0 ] && [ "$force" -eq 0 ]; then
   fi
 fi
 
+# The typing guard above spends up to ~1s reading the pane AFTER the permission
+# check, and a menu raised in that window would receive the typed text — a `y`
+# or a digit in it can answer the menu (PR #206 review, M1). So the last thing
+# before typing is another permission check. What remains is one pane-read's
+# latency; herdr has no check-and-type primitive that would close it.
+if [ "$submit_only" -eq 0 ] && [ "$force" -eq 0 ]; then
+  looks_like_permission_prompt; pr=$?
+  if [ "$pr" -eq 0 ]; then
+    echo "REFUSED: a prompt appeared in $pane just before typing — nothing was typed." >&2
+    exit 5
+  fi
+  if [ "$pr" -eq 2 ]; then
+    echo "REFUSED: cannot re-read $pane just before typing — refusing to send blind (use --force)." >&2
+    exit 5
+  fi
+fi
+
 # `herdr agent send` DOES NOT EXIST — the agent verbs are list/get/read/
 # send-keys/prompt/rename/focus/wait/attach. This call therefore failed on EVERY
 # invocation, which silently killed the Slack->herdr reply path: a choice tapped
