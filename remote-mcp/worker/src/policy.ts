@@ -1,13 +1,19 @@
 // Pure policy: connection state, message-target resolution, message text
 // rules, rate limits. No I/O, so every rule here is unit-tested directly.
 import type { Env, Snapshot, TaskRow } from "./types";
-import { SCOPE_MESSAGE, SCOPE_READ } from "./types";
+import { SCOPE_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
 
 // The scopes this deployment will grant and honour. A token's scopes are
-// always intersected with this, so turning messaging off takes effect on
-// the next request, not when existing tokens expire.
+// always intersected with this, so turning a switch off takes effect on
+// the next request, not when existing tokens expire. Task scopes are three,
+// not one, because research and implement are separately consentable (a
+// client can be trusted to start a read-only research task and never ticked
+// for implement at all) and herdr:task.cancel covers both cancel and resume.
 export function offeredScopes(env: Env): string[] {
-  return env.MESSAGING_ENABLED === "true" ? [SCOPE_READ, SCOPE_MESSAGE] : [SCOPE_READ];
+  const scopes = [SCOPE_READ];
+  if (env.MESSAGING_ENABLED === "true") scopes.push(SCOPE_MESSAGE);
+  if (env.TASKS_ENABLED === "true") scopes.push(SCOPE_TASK_START, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_CANCEL);
+  return scopes;
 }
 
 // What this deployment is and allows, so anyone can check it before
@@ -15,11 +21,13 @@ export function offeredScopes(env: Env): string[] {
 export interface ServerInfo {
   build_sha: string;
   messaging_enabled: boolean;
+  tasks_enabled: boolean;
   scopes_offered: string[];
 }
 
 export function serverInfo(env: Env): ServerInfo {
-  return { build_sha: env.BUILD_SHA, messaging_enabled: env.MESSAGING_ENABLED === "true", scopes_offered: offeredScopes(env) };
+  return { build_sha: env.BUILD_SHA, messaging_enabled: env.MESSAGING_ENABLED === "true",
+    tasks_enabled: env.TASKS_ENABLED === "true", scopes_offered: offeredScopes(env) };
 }
 
 export type ConnectionState = "connected" | "degraded" | "disconnected" | "never_connected";
@@ -129,6 +137,30 @@ export function sanitizeMessage(text: string): { ok: true; text: string } | { ok
     .replace(/\s+/g, " ").trim();
   if (!cleaned) return { ok: false, reason: "empty_text" };
   if (cleaned.length > MAX_MESSAGE_CHARS) return { ok: false, reason: `text_too_long (max ${MAX_MESSAGE_CHARS})` };
+  return { ok: true, text: cleaned };
+}
+
+// start_task's objective is embedded as a fenced UNTRUSTED block in the
+// spawned worker's own SPEC.md (remote-mcp/tasks.py), not typed into a
+// terminal composer, so it keeps its line structure -- unlike sanitizeMessage
+// it never collapses to one line. The same defusing applies regardless:
+// invisible/format characters hidden, every bracket shape neutralised (so
+// the objective cannot forge SPEC.md's own "## UNTRUSTED" fencing), and
+// "@path" defused (omp/Claude Code would otherwise expand it into that
+// file's contents with no tool call and no approval -- round-3 review H1,
+// the same hazard sanitizeMessage exists for).
+export const MAX_OBJECTIVE_CHARS = 4000;
+
+export function sanitizeObjective(text: string): { ok: true; text: string } | { ok: false; reason: string } {
+  const cleaned = text.normalize("NFKC")
+    .replace(INVISIBLE, " ")
+    .replace(OPEN_LIKE, "(").replace(CLOSE_LIKE, ")").replace(BRACKET_PIECES, " ")
+    .replace(AT, "\uff20")
+    .split("\n").map((line) => line.replace(/[ \t]+/g, " ").trim()).join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!cleaned) return { ok: false, reason: "empty_objective" };
+  if (cleaned.length > MAX_OBJECTIVE_CHARS) return { ok: false, reason: `objective_too_long (max ${MAX_OBJECTIVE_CHARS})` };
   return { ok: true, text: cleaned };
 }
 

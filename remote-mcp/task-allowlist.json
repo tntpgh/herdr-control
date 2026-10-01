@@ -1,0 +1,28 @@
+{
+  "_comment": "herdr-mcp remote task lifecycle (SPEC: form 20261001T230637-8744). The Worker only PRE-validates against a cached copy of this file (pushed every sync as snapshot.task_config); this copy, read directly by remote-mcp/tasks.py on the Mac, is the one that is actually enforced when a command is executed. Edit here, commit, push -- the next publisher tick picks it up with no redeploy.",
+  "repos": ["knowledge-base", "thurber-os", "tourguide", "tntpgh-dev"],
+  "modes": {
+    "research": {
+      "job_class": "research",
+      "secrets": "grant",
+      "_secrets_comment": "lib/agent-profiles.sh secrets_default_for_job withholds credentials for any job class matching *research* (it reads material we did not write). Terrene's authority for this feature explicitly grants the read-only vault identity (creds=readonly_vault) to a research task, so tasks.py passes spawn-task.sh an explicit --secrets to lift that default -- never a change to the shared job-class table, which stays withhold-by-default for every OTHER research-class spawn.",
+      "git": "none",
+      "writes": [".handoffs/**"],
+      "net_read": [],
+      "manifest_comment": "KB/tl;dv are reached through their own MCP tools, not raw curl, so net_read (lib/task-manifest.sh's GET-approval scope) has nothing to name here."
+    },
+    "implement": {
+      "job_class": "implement",
+      "secrets": "default",
+      "git": "push-own-branch",
+      "writes": ["**"],
+      "net_read": []
+    }
+  },
+  "caps": {
+    "max_concurrent": 4,
+    "max_per_day": 40,
+    "max_minutes": 60,
+    "_comment": "Hard ceiling, not yet adjustable from an admin route (SPEC: 'adjustable later via a signed admin route like /admin/limits' -- deliberately deferred). Enforced on the Mac (remote-mcp/tasks.py) and pre-checked on the Worker (remote-mcp/worker/src/policy.ts TASK_CAPS) from this same file's pushed copy."
+  }
+}

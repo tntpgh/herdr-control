@@ -12,8 +12,9 @@ import { emailAllowed, verifyAccess } from "./access";
 import { verifyIngest } from "./ingest";
 import { mcpHandler } from "./mcp";
 import { DEFAULT_LIMITS, MAX_LIMITS, offeredScopes, serverInfo } from "./policy";
+import type { ScopedSender } from "./state";
 import type { DeliveryGate, Env, GrantProps, Sender } from "./types";
-import { SCOPE_MESSAGE, SCOPE_READ } from "./types";
+import { SCOPE_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
 
 export { HerdrState } from "./state";
 
@@ -22,6 +23,9 @@ const escape = (v: string) => v.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)}
 const SCOPE_TEXT: Record<string, string> = {
   [SCOPE_READ]: "Read fleet status: agents, tasks, blockers, task results.",
   [SCOPE_MESSAGE]: "Send one-line notes to live task agents (audited, rate-limited, never an approval or command).",
+  [SCOPE_TASK_START]: "Start read-only research tasks (no git writes, no push) and read their answers.",
+  [SCOPE_TASK_IMPLEMENT]: "Start implement tasks that commit and push their own branch, and read their answers.",
+  [SCOPE_TASK_CANCEL]: "Cancel or resume a task this connection started.",
 };
 
 function consentPage(d: ConsentDescription, handle: string, email: string, offered: string[]): string {
@@ -29,10 +33,14 @@ function consentPage(d: ConsentDescription, handle: string, email: string, offer
     ? `Published by <strong>${escape(d.clientDomain)}</strong>.`
     : "This app registered itself; its name is not verified.";
   const boxes = offered.map((s) => {
-    // read is pre-ticked; message must be ticked deliberately.
+    // read is pre-ticked; every other scope (message, task.*) must be ticked deliberately.
     const checked = s === SCOPE_READ ? "checked" : "";
     return `<label><input type="checkbox" name="scope" value="${s}" ${checked}> <code>${s}</code> — ${escape(SCOPE_TEXT[s]!)}</label>`;
-  }).join("<br>") + (offered.includes(SCOPE_MESSAGE) ? "" : "<p>Messaging agents is turned off on this server, so this connection is read-only.</p>");
+  }).join("<br>");
+  const notes = [
+    !offered.includes(SCOPE_MESSAGE) ? "Messaging agents is turned off on this server." : "",
+    !offered.includes(SCOPE_TASK_START) && !offered.includes(SCOPE_TASK_IMPLEMENT) ? "Starting tasks is turned off on this server." : "",
+  ].filter(Boolean).join(" ");
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>herdr-mcp: authorize ${escape(d.clientName)}</title>
 <style>body{font:15px system-ui;background:#111;color:#eee;max-width:640px;margin:40px auto;padding:0 16px}
@@ -40,10 +48,11 @@ code{color:#9cf}label{display:block;margin:8px 0}button{font:inherit;padding:6px
 <h1>Allow <em>${escape(d.clientName)}</em> to use herdr-mcp?</h1>
 <p>${origin} Tokens go to <strong>${escape(d.redirectHost)}</strong>.</p>
 ${d.redirectIsLoopback ? "<p><strong>This sends access to an app on a local computer.</strong> Continue only if you just started this sign-in.</p>" : ""}
-<p>Signed in as ${escape(email)} (Cloudflare Access). Nothing here can run commands, press keys, or answer approvals.</p>
+<p>Signed in as ${escape(email)} (Cloudflare Access). Read and message scopes can never run commands, press keys, or answer approvals; the task scopes below can start a sandboxed worker in an allow-listed repo, nothing more.</p>
 <form method="post" action="/authorize">
 <input type="hidden" name="handle" value="${escape(handle)}">
 ${boxes}
+${notes ? `<p>${notes}</p>` : ""}
 <p><button name="decision" value="approve">Allow</button><button name="decision" value="deny">Deny</button></p>
 </form>`;
 }
@@ -94,29 +103,38 @@ async function authorize(request: Request, env: Env): Promise<Response> {
   }
 }
 
-// Does this sender still hold a live grant with herdr:message for that client?
-// Checked at delivery, so a revoked or expired grant stops messages it
-// already queued. (KV listing can lag a deletion by up to ~60 s.)
-async function deliveryGate(env: Env, senders: Sender[], nowMs: number): Promise<DeliveryGate> {
-  if (env.MESSAGING_ENABLED !== "true" || senders.length === 0) return { revoked: [], hold: false };
+// Does this (actor, client_id) still hold a live grant with the scope its own
+// queued item needs? Checked right before delivery/leasing, so a revoked or
+// expired grant stops a message already queued (scope herdr:message) or a
+// task command already queued (scope herdr:task.start/implement, per
+// request -- a research start and an implement start need different
+// scopes, so this takes the scope per-request rather than one for all).
+// (KV listing can lag a deletion by up to ~60 s.)
+async function grantGate(env: Env, enabled: boolean, requests: ScopedSender[], nowMs: number): Promise<DeliveryGate> {
+  if (!enabled || requests.length === 0) return { revoked: [], hold: false };
   try {
     const revoked: Sender[] = [];
-    for (const actor of new Set(senders.map((s) => s.actor))) {
-      const live = new Set<string>();
+    for (const actor of new Set(requests.map((r) => r.actor))) {
+      const liveScopesByClient = new Map<string, Set<string>>();
       let cursor: string | undefined;
       do {
         const page = await env.OAUTH_PROVIDER.listUserGrants(actor, { cursor });
         for (const g of page.items) {
-          if (g.scope.includes(SCOPE_MESSAGE) && (g.expiresAt === undefined || g.expiresAt * 1000 > nowMs)) live.add(g.clientId);
+          if (g.expiresAt !== undefined && g.expiresAt * 1000 <= nowMs) continue;
+          const scopes = liveScopesByClient.get(g.clientId) ?? new Set<string>();
+          for (const s of g.scope) scopes.add(s);
+          liveScopesByClient.set(g.clientId, scopes);
         }
         cursor = page.cursor;
       } while (cursor);
-      revoked.push(...senders.filter((s) => s.actor === actor && !live.has(s.client_id)));
+      for (const r of requests.filter((req) => req.actor === actor)) {
+        if (!liveScopesByClient.get(r.client_id)?.has(r.scope)) revoked.push({ actor: r.actor, client_id: r.client_id });
+      }
     }
     return { revoked, hold: false };
   } catch (error) {
-    // Fail closed without losing messages: deliver nothing this tick.
-    console.error("herdr-mcp: delivery grant check failed; holding the outbox", error);
+    // Fail closed without losing queued work: deliver/lease nothing this tick.
+    console.error("herdr-mcp: grant check failed; holding the queue", error);
     return { revoked: [], hold: true };
   }
 }
@@ -127,8 +145,10 @@ async function ingest(request: Request, env: Env): Promise<Response> {
   if (!check.ok) return Response.json({ error: check.reason }, { status: check.status });
   const stub = env.HERDR_STATE.get(env.HERDR_STATE.idFromName("fleet"));
   const now = Date.now();
-  const gate = await deliveryGate(env, await stub.pendingSenders(now), now);
-  const out = await stub.sync(Date.now(), check.nonce, check.body, gate);
+  const msgSenders: ScopedSender[] = (await stub.pendingSenders(now)).map((s) => ({ ...s, scope: SCOPE_MESSAGE }));
+  const gate = await grantGate(env, env.MESSAGING_ENABLED === "true", msgSenders, now);
+  const cmdGate = await grantGate(env, env.TASKS_ENABLED === "true", await stub.pendingCommandSenders(now), now);
+  const out = await stub.sync(Date.now(), check.nonce, check.body, gate, cmdGate);
   if (!out.ok) return Response.json({ error: out.reason }, { status: out.status });
   return Response.json(out.response, { headers: { "cache-control": "no-store" } });
 }
