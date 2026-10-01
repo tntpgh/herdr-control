@@ -17,13 +17,16 @@
   "vars": {
     "PUBLIC_URL": "https://herdr-mcp.teamthurber.com",
     "ACCESS_TEAM_DOMAIN": "thurberteam.cloudflareaccess.com",
-    // AUD of the path-scoped Access app "herdr-mcp-authorize" (scripts/provision-access-app.sh).
+    // AUD of the path-scoped Access app "herdr-mcp-authorize" (scripts/provision.sh).
     "ACCESS_AUD": "__ACCESS_AUD__",
     "ALLOWED_EMAILS": "tnt@teamthurber.com",
     "STALE_AFTER_S": "90",
     // Off for the first connection: read-only. Turning it on is its own decision,
     // a redeploy, and a fresh consent that ticks herdr:message.
-    "MESSAGING_ENABLED": "false"
+    "MESSAGING_ENABLED": "false",
+    // The commit this deploy was built from. provision.sh overrides it with
+    // `--var BUILD_SHA:<sha>` from a clean, pushed tree; /healthz reports it.
+    "BUILD_SHA": "unstamped"
   },
   "observability": { "enabled": true }
 }

@@ -11,8 +11,8 @@ import type { ConsentDescription } from "@cloudflare/workers-oauth-provider";
 import { emailAllowed, verifyAccess } from "./access";
 import { verifyIngest } from "./ingest";
 import { mcpHandler } from "./mcp";
-import { offeredScopes } from "./policy";
-import type { Env, GrantProps } from "./types";
+import { offeredScopes, serverInfo } from "./policy";
+import type { DeliveryGate, Env, GrantProps, Sender } from "./types";
 import { SCOPE_MESSAGE, SCOPE_READ } from "./types";
 
 export { HerdrState } from "./state";
@@ -94,12 +94,41 @@ async function authorize(request: Request, env: Env): Promise<Response> {
   }
 }
 
+// Does this sender still hold a live grant with herdr:message for that client?
+// Checked at delivery, so a revoked or expired grant stops messages it
+// already queued. (KV listing can lag a deletion by up to ~60 s.)
+async function deliveryGate(env: Env, senders: Sender[], nowMs: number): Promise<DeliveryGate> {
+  if (env.MESSAGING_ENABLED !== "true" || senders.length === 0) return { revoked: [], hold: false };
+  try {
+    const revoked: Sender[] = [];
+    for (const actor of new Set(senders.map((s) => s.actor))) {
+      const live = new Set<string>();
+      let cursor: string | undefined;
+      do {
+        const page = await env.OAUTH_PROVIDER.listUserGrants(actor, { cursor });
+        for (const g of page.items) {
+          if (g.scope.includes(SCOPE_MESSAGE) && (g.expiresAt === undefined || g.expiresAt * 1000 > nowMs)) live.add(g.clientId);
+        }
+        cursor = page.cursor;
+      } while (cursor);
+      revoked.push(...senders.filter((s) => s.actor === actor && !live.has(s.client_id)));
+    }
+    return { revoked, hold: false };
+  } catch (error) {
+    // Fail closed without losing messages: deliver nothing this tick.
+    console.error("herdr-mcp: delivery grant check failed; holding the outbox", error);
+    return { revoked: [], hold: true };
+  }
+}
+
 async function ingest(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return text("Method not allowed", 405);
   const check = await verifyIngest(request, env.INGEST_KEY, Math.floor(Date.now() / 1000));
   if (!check.ok) return Response.json({ error: check.reason }, { status: check.status });
   const stub = env.HERDR_STATE.get(env.HERDR_STATE.idFromName("fleet"));
-  const out = await stub.sync(Date.now(), check.nonce, check.body);
+  const now = Date.now();
+  const gate = await deliveryGate(env, await stub.pendingSenders(now), now);
+  const out = await stub.sync(Date.now(), check.nonce, check.body, gate);
   if (!out.ok) return Response.json({ error: out.reason }, { status: out.status });
   return Response.json(out.response, { headers: { "cache-control": "no-store" } });
 }
@@ -110,7 +139,8 @@ const defaultHandler = {
     if (pathname === "/authorize") return authorize(request, env);
     if (pathname === "/ingest/sync") return ingest(request, env);
     if (pathname === "/" || pathname === "/healthz") {
-      return text("herdr-mcp: MCP endpoint is /mcp (OAuth 2.1). See /.well-known/oauth-protected-resource/mcp.", 200);
+      return Response.json({ service: "herdr-mcp", mcp: `${env.PUBLIC_URL}/mcp`, auth: "OAuth 2.1 + PKCE", ...serverInfo(env) },
+        { headers: { "cache-control": "no-store" } });
     }
     return text("Not found", 404);
   },

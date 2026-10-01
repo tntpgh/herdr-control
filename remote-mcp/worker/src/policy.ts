@@ -10,6 +10,18 @@ export function offeredScopes(env: Env): string[] {
   return env.MESSAGING_ENABLED === "true" ? [SCOPE_READ, SCOPE_MESSAGE] : [SCOPE_READ];
 }
 
+// What this deployment is and allows, so anyone can check it before
+// connecting (/healthz) and after (get_status). Contains no secret.
+export interface ServerInfo {
+  build_sha: string;
+  messaging_enabled: boolean;
+  scopes_offered: string[];
+}
+
+export function serverInfo(env: Env): ServerInfo {
+  return { build_sha: env.BUILD_SHA, messaging_enabled: env.MESSAGING_ENABLED === "true", scopes_offered: offeredScopes(env) };
+}
+
 export type ConnectionState = "connected" | "degraded" | "disconnected" | "never_connected";
 
 export interface Connection {

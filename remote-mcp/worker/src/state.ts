@@ -3,9 +3,10 @@
 // the enqueue happen atomically against the same snapshot.
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
+import { emailAllowed } from "./access";
 import { connection, rateLimited, resolveTarget, sanitizeMessage } from "./policy";
 import type { Connection } from "./policy";
-import type { Env, OutboxItem, ResultDoc, Snapshot } from "./types";
+import type { DeliveryGate, Env, OutboxItem, ResultDoc, Sender, Snapshot } from "./types";
 import { SNAPSHOT_SCHEMA } from "./types";
 
 const str = z.string().max(4000);
@@ -242,9 +243,17 @@ export class HerdrState extends DurableObject<Env> {
     };
   }
 
-  // Publisher sync: store the snapshot, apply delivery acks, expire, lease the
-  // outbox, and hand back new audit rows for the Mac's local copy.
-  sync(nowMs: number, nonce: string, rawBody: string): { ok: true; response: SyncResponse } | { ok: false; status: number; reason: string } {
+  // Every sender with a message that could still be leased: the Worker checks
+  // each one's OAuth grant before the sync that would hand the message out.
+  pendingSenders(nowMs: number): Sender[] {
+    return this.sql.exec<{ actor: string; client_id: string }>(
+      `SELECT DISTINCT actor, client_id FROM messages WHERE status IN ('queued','delivering') AND expires_at > ?`, nowMs).toArray();
+  }
+
+  // Publisher sync: store the snapshot, apply delivery acks, re-check every
+  // undelivered message against today's policy, expire, lease the outbox, and
+  // hand back new audit rows for the Mac's local copy.
+  sync(nowMs: number, nonce: string, rawBody: string, gate: DeliveryGate): { ok: true; response: SyncResponse } | { ok: false; status: number; reason: string } {
     this.sql.exec(`DELETE FROM nonces WHERE seen_at < ?`, nowMs - NONCE_TTL_MS);
     if (this.sql.exec(`SELECT 1 FROM nonces WHERE nonce=?`, nonce).toArray().length) {
       return { ok: false, status: 409, reason: "replayed_nonce" };
@@ -276,6 +285,25 @@ export class HerdrState extends DurableObject<Env> {
         reason: a.detail, message_id: a.message_id, detail: "" });
     }
 
+    // A queued message was valid when it was sent, not necessarily now. Before
+    // anything is leased, refuse what the off switch, the allowlist, or a
+    // revoked grant no longer permits. A message already leased this tick is
+    // in the publisher's hands; a retry brings it back here first.
+    const enabled = this.env.MESSAGING_ENABLED === "true";
+    const revoked = new Set(gate.revoked.map((s) => `${s.actor}\n${s.client_id}`));
+    for (const m of this.sql.exec<{ message_id: string; task_id: string; actor: string; client_id: string }>(
+      `SELECT message_id, task_id, actor, client_id FROM messages
+       WHERE status='queued' OR (status='delivering' AND lease_until < ?)`, nowMs).toArray()) {
+      const why = !enabled ? "messaging_disabled"
+        : !emailAllowed(this.env, m.actor) ? "sender_not_allowed"
+        : revoked.has(`${m.actor}\n${m.client_id}`) ? "sender_grant_revoked" : null;
+      if (!why) continue;
+      this.sql.exec(`UPDATE messages SET status='refused', detail=?, updated_at=?, lease_until=0 WHERE message_id=?`,
+        `cancelled before delivery: ${why}`, nowMs, m.message_id);
+      this.audit(nowMs, { actor: m.actor, client_id: m.client_id, tool: "delivery", target: m.task_id,
+        decision: "cancelled_before_delivery", reason: why, message_id: m.message_id, detail: "" });
+    }
+
     for (const m of this.sql.exec<{ message_id: string; task_id: string; detail: string; attempts: number }>(
       `SELECT message_id, task_id, detail, attempts FROM messages
        WHERE status IN ('queued','delivering') AND (expires_at <= ? OR (attempts >= ? AND lease_until < ?))`,
@@ -287,7 +315,7 @@ export class HerdrState extends DurableObject<Env> {
       this.audit(nowMs, { ...sys, target: m.task_id, decision: status, reason: why, message_id: m.message_id, detail: m.detail });
     }
 
-    const due = body.lease ? this.sql.exec<{ message_id: string; task_id: string; pane_id: string; agent_id: string; label: string;
+    const due = body.lease && !gate.hold ? this.sql.exec<{ message_id: string; task_id: string; pane_id: string; agent_id: string; label: string;
       text: string; actor: string; client_name: string; attempts: number }>(
       `SELECT message_id, task_id, pane_id, agent_id, label, text, actor, client_name, attempts FROM messages
        WHERE (status='queued' OR (status='delivering' AND lease_until < ?)) AND expires_at > ? ORDER BY created_at LIMIT 20`,

@@ -129,3 +129,13 @@ export function snapshot(overrides: Partial<Snapshot> = {}): Snapshot {
 export function syncBody(over: Partial<SyncBody> = {}): SyncBody {
   return { snapshot: snapshot(), results: [], acks: [], audit_cursor: 0, lease: true, ...over };
 }
+
+// A message already sitting in the queue, as if sent under an earlier policy
+// (messaging on, sender still allowed). Returns its id.
+export function queueRaw(storage: DurableObjectStorage, actor = "tnt@teamthurber.com", clientId = "c"): string {
+  const id = `msg_${crypto.randomUUID()}`;
+  const now = Date.now();
+  storage.sql.exec(`INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, now, now, now + 900_000,
+    actor, clientId, "Zero", "task_A", "w1:term_a", "term_a", "implement:feat/a", "hi", "queued", "", 0, 0);
+  return id;
+}

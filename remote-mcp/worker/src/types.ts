@@ -19,6 +19,7 @@ export interface Env {
   // listed, and tokens granted while it was on stop working for messages.
   MESSAGING_ENABLED: string;
   INGEST_KEY: string; // secret: HMAC key shared with publisher.py
+  BUILD_SHA: string; // commit deployed; "unstamped" when not deployed by provision.sh
 }
 
 export interface HubSummary {
@@ -119,6 +120,20 @@ export interface OutboxItem {
   actor: string;
   client_name: string;
   attempts: number;
+}
+
+// Who queued a message: the grant's user (email) and the OAuth client.
+export interface Sender {
+  actor: string;
+  client_id: string;
+}
+
+// The Worker's grant check, handed to the DO's sync. `revoked`: senders whose
+// grant no longer holds herdr:message. `hold`: the check could not run, so
+// lease nothing this tick (messages stay queued until they expire).
+export interface DeliveryGate {
+  revoked: Sender[];
+  hold: boolean;
 }
 
 // What a granted token carries (set at /authorize, encrypted by the provider).

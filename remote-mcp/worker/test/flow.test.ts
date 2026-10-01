@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { sign } from "../src/ingest";
 import type { HerdrState, MessageRecord } from "../src/state";
 import type { BlockerRow, Env } from "../src/types";
-import { accessJwt, BASE, callTool, oauthToken, signedSync, snapshot, syncBody } from "./helpers";
+import { accessJwt, BASE, callTool, oauthToken, queueRaw, signedSync, snapshot, syncBody } from "./helpers";
 import { mcpHandler } from "../src/mcp";
 
 const e = env as unknown as Env; // the pool's env carries this Worker's bindings
@@ -182,6 +182,32 @@ describe("send_message", () => {
       outcomes.push((await callTool(access_token, "send_message", { target: "task_A", text: `n${i}` })).data.error ?? "ok");
     }
     expect(outcomes).toEqual(["ok", "ok", "ok", "ok", "ok", "rate_limited"]);
+  });
+
+  it("cancels a queued message, never leasing it, once its sender's grant is revoked", async () => {
+    await signedSync(syncBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
+    const sent = await callTool<{ message: MessageRecord }>(access_token, "send_message", { target: "task_A", text: "hi" });
+    const grants = await e.OAUTH_KV.list({ prefix: "grant:tnt@teamthurber.com:" });
+    expect(grants.keys.length).toBeGreaterThan(0);
+    for (const k of grants.keys) await e.OAUTH_KV.delete(k.name);
+
+    const reply = await syncJson(await signedSync(syncBody()));
+    expect(reply.outbox).toHaveLength(0);
+    const m = await runInDurableObject(fleet(), (o: HerdrState) => o.messageStatus(sent.data.message.message_id, "tnt@teamthurber.com"));
+    expect([m?.status, m?.detail]).toEqual(["refused", "cancelled before delivery: sender_grant_revoked"]);
+  });
+
+  it("cancels a queued message whose sender has left the allowlist, and still delivers others", async () => {
+    await signedSync(syncBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message"]);
+    const kept = await callTool<{ message: MessageRecord }>(access_token, "send_message", { target: "task_A", text: "kept" });
+    const gone = await runInDurableObject(fleet(), (_o: HerdrState, state) => queueRaw(state.storage, "former@teamthurber.com"));
+
+    const reply = await syncJson(await signedSync(syncBody()));
+    expect(reply.outbox.map((m) => m.message_id)).toEqual([kept.data.message.message_id]);
+    const m = await runInDurableObject(fleet(), (o: HerdrState) => o.messageStatus(gone, "former@teamthurber.com"));
+    expect(m?.detail).toBe("cancelled before delivery: sender_not_allowed");
   });
 });
 

@@ -126,10 +126,23 @@ else
   echo "   <missing>"
 fi
 
+# The deploy is stamped with the commit it was built from, so /healthz proves
+# what is running. Only a clean tree whose HEAD is on the remote gets stamped.
+SHA="$(git -C "$HERE" rev-parse HEAD)"
+DIRTY="$(git -C "$HERE" status --porcelain -- . | head -1)"
+PUSHED="$(git -C "$HERE" branch -r --contains "$SHA" 2>/dev/null | head -1)"
+echo "== build $SHA  clean=$([[ -z "$DIRTY" ]] && echo yes || echo no)  on-remote=$([[ -n "$PUSHED" ]] && echo yes || echo no)"
+
 if (( APPLY )); then
   echo "== 5. deploy"
   [[ -n "$KV_ID" && -n "$AUD" && -n "$KEY" ]] || { echo "   refusing: an id or the key is missing" >&2; exit 1; }
-  npx wrangler deploy 2>&1 | grep -vE '^\s*$' | tail -8
+  # First --apply fills the KV/AUD ids into wrangler.jsonc and stops here; commit
+  # and push them, then re-run, so the deployed config is exactly a commit.
+  [[ -z "$DIRTY" && -n "$PUSHED" ]] || {
+    echo "   stopping before deploy: remote-mcp/ has uncommitted or unpushed changes (first run: the filled-in ids)." >&2
+    echo "   commit + push them, then re-run --apply; the deploy is stamped with that commit." >&2
+    git -C "$HERE" status --short -- . >&2; exit 1; }
+  npx wrangler deploy --var "BUILD_SHA:$SHA" --tag "${SHA:0:12}" --message "herdr-mcp ${SHA:0:12}" 2>&1 | grep -vE '^\s*$' | tail -8
   printf %s "$KEY" | npx wrangler secret put INGEST_KEY >/dev/null && echo "   INGEST_KEY set"
   CFK="$(op read 'op://secrets/shared-cloudflare-api-key/credential')"
   DOM="$(authed "$CFK" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/domains?hostname=$HOST" | jq -r '.result[0].service // empty')"
@@ -148,6 +161,10 @@ B="https://$HOST"
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 echo "PRM resource:          $(curl -s "$B/.well-known/oauth-protected-resource/mcp" | jq -r '.resource // "FAIL"')   (want $B/mcp)"
 echo "AS issuer / S256 / iss: $(curl -s "$B/.well-known/oauth-authorization-server" | jq -r '"\(.issuer) / \(.code_challenge_methods_supported|index("S256")!=null) / \(.authorization_response_iss_parameter_supported)"')"
+echo "AS scopes_supported:   $(curl -s "$B/.well-known/oauth-authorization-server" | jq -c '.scopes_supported')   (want [\"herdr:read\"] while messaging is off)"
+echo "/healthz:              $(curl -s "$B/healthz" | jq -c '{build_sha, messaging_enabled, scopes_offered}')"
+echo "                       (want build_sha $SHA, messaging_enabled false)"
+echo "live version:          $(npx wrangler deployments status 2>/dev/null | grep -E 'Version|Tag|Message' | tr -s ' ' | paste -sd ';' -)"
 echo "/mcp no token:         $(code -X POST "$B/mcp")   (want 401)"
 echo "/authorize no session: $(curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}' "$B/authorize" | cut -c1-80)   (want 302 -> $TEAM)"
 echo "/ingest unsigned:      $(code -X POST "$B/ingest/sync")   (want 401; 503 = INGEST_KEY not set)"

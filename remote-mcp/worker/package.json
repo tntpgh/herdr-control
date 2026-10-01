@@ -24,9 +24,15 @@
     "vitest": "^4.1.0",
     "wrangler": "^4.140.0"
   },
+  "overrides": {
+    "miniflare": "5.20260930.0-alpha",
+    "wrangler": "$wrangler",
+    "undici": "^7.29.1"
+  },
   "allowScripts": {
     "esbuild@0.28.1": true,
-    "workerd@1.20260815.1": true,
-    "workerd@1.20260930.2": true
+    "fsevents@2.3.3": false,
+    "workerd@1.20260930.2": true,
+    "workerd@1.20261001.1": true
   }
 }

@@ -11,7 +11,7 @@ import { z } from "zod";
 import { insufficientScope } from "@cloudflare/workers-oauth-provider";
 import type { OAuthResourceAuth } from "@cloudflare/workers-oauth-provider";
 import { emailAllowed } from "./access";
-import { messageable, MAX_MESSAGE_CHARS, offeredScopes } from "./policy";
+import { messageable, MAX_MESSAGE_CHARS, offeredScopes, serverInfo } from "./policy";
 import type { Caller, View } from "./state";
 import type { Env, GrantProps, TaskRow } from "./types";
 import { SCOPE_MESSAGE, SCOPE_READ } from "./types";
@@ -93,6 +93,7 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
         handoff_debt: s.hub.handoff_debt,
       } : null,
       your_scopes: scopes,
+      server: serverInfo(env),
     });
   });
 
