@@ -4,8 +4,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { emailAllowed } from "./access";
-import { connection, rateLimited, resolveTarget, sanitizeMessage } from "./policy";
-import type { Connection } from "./policy";
+import { connection, DEFAULT_LIMITS, rateLimited, resolveTarget, sanitizeMessage } from "./policy";
+import type { Connection, MessageLimits } from "./policy";
 import type { DeliveryGate, Env, OutboxItem, ResultDoc, Sender, Snapshot } from "./types";
 import { SNAPSHOT_SCHEMA } from "./types";
 
@@ -214,7 +214,7 @@ export class HerdrState extends DurableObject<Env> {
     const recent = this.sql.exec<{ created_at: number }>(
       `SELECT created_at FROM messages WHERE actor=? AND created_at > ?`, caller.email, nowMs - 3_600_000,
     ).toArray().map((r) => r.created_at);
-    const tooMany = rateLimited(recent, nowMs);
+    const tooMany = rateLimited(recent, nowMs, this.messageLimits(nowMs));
     if (tooMany) return refuse(tooMany);
 
     const t = res.task;
@@ -264,6 +264,34 @@ export class HerdrState extends DurableObject<Env> {
     if (!this.takeNonce(nowMs, nonce)) return false;
     this.audit(nowMs, { actor: "mac-admin", client_id: "", tool: `admin_${op}`, target, decision: "allowed", reason: "signed", message_id: "", detail: "" });
     return true;
+  }
+
+  // The limits in force now: the override if one is set and not expired,
+  // else the defaults. An expired override simply stops applying.
+  messageLimits(nowMs: number): MessageLimits {
+    const row = this.sql.exec<{ v: string }>(`SELECT v FROM kv WHERE k='msg_limits'`).toArray()[0];
+    if (row) {
+      const o = JSON.parse(row.v) as { per_minute: number; per_hour: number; until_ms: number | null; reason: string };
+      if (o.until_ms === null || o.until_ms > nowMs) {
+        return { per_minute: o.per_minute, per_hour: o.per_hour, source: "override",
+          until: o.until_ms === null ? null : iso(o.until_ms), reason: o.reason };
+      }
+    }
+    return { ...DEFAULT_LIMITS, source: "default", until: null, reason: "" };
+  }
+
+  // Called only by /admin/limits after admitAdmin; bounds are checked there.
+  setMessageLimits(nowMs: number, o: { per_minute: number; per_hour: number; until_ms: number | null; reason: string } | null): MessageLimits {
+    if (o === null) this.sql.exec(`DELETE FROM kv WHERE k='msg_limits'`);
+    else this.sql.exec(`INSERT OR REPLACE INTO kv (k, v) VALUES ('msg_limits', ?)`, JSON.stringify(o));
+    return this.messageLimits(nowMs);
+  }
+
+  // Messages this user queued in the last minute / hour (for get_status).
+  messagesUsed(nowMs: number, actor: string): { last_minute: number; last_hour: number } {
+    const recent = this.sql.exec<{ created_at: number }>(
+      `SELECT created_at FROM messages WHERE actor=? AND created_at > ?`, actor, nowMs - 3_600_000).toArray();
+    return { last_minute: recent.filter((r) => nowMs - r.created_at < 60_000).length, last_hour: recent.length };
   }
 
   // Publisher sync: store the snapshot, apply delivery acks, re-check every

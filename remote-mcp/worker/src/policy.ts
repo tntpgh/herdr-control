@@ -132,13 +132,26 @@ export function sanitizeMessage(text: string): { ok: true; text: string } | { ok
   return { ok: true, text: cleaned };
 }
 
-export const RATE_PER_MINUTE = 5;
-export const RATE_PER_HOUR = 30;
+// Messages per user (all clients together). The defaults apply unless the Mac
+// has set an override (scripts/limits.py → /admin/limits), optionally until a
+// time, after which the defaults come back on their own.
+export const DEFAULT_LIMITS = { per_minute: 5, per_hour: 30 } as const;
+// ceiling: no override may exceed these. Raising the ceiling itself is a code
+// change and a security review, not an admin call.
+export const MAX_LIMITS = { per_minute: 30, per_hour: 300 } as const;
 
-export function rateLimited(recentMs: number[], nowMs: number): string | null {
+export interface MessageLimits {
+  per_minute: number;
+  per_hour: number;
+  source: "default" | "override";
+  until: string | null; // override expiry (ISO), null = until reset
+  reason: string;
+}
+
+export function rateLimited(recentMs: number[], nowMs: number, limits: Pick<MessageLimits, "per_minute" | "per_hour">): string | null {
   const minute = recentMs.filter((t) => nowMs - t < 60_000).length;
   const hour = recentMs.filter((t) => nowMs - t < 3_600_000).length;
-  if (minute >= RATE_PER_MINUTE) return `rate_limited (${RATE_PER_MINUTE}/minute)`;
-  if (hour >= RATE_PER_HOUR) return `rate_limited (${RATE_PER_HOUR}/hour)`;
+  if (minute >= limits.per_minute) return `rate_limited (${limits.per_minute}/minute)`;
+  if (hour >= limits.per_hour) return `rate_limited (${limits.per_hour}/hour)`;
   return null;
 }

@@ -116,7 +116,10 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
    (bidi overrides, zero-width, tag characters) become spaces, and `[` `]`
    become `(` `)` so the text cannot close the envelope and forge another;
    ≤ 2000 chars.
-5. ≤ 5 per minute, ≤ 30 per hour per user.
+5. Per user, all clients together: 5 per minute and 30 per hour by default,
+   adjustable from the Mac up to a hard ceiling of 30/minute and 300/hour
+   (`scripts/limits.py`, see Operations). `get_status` shows the limits in
+   force and how many this user has used (`message_limits`).
 6. **At delivery**, before every lease to the Mac, the queue is checked
    against the current policy again: a message is cancelled (`refused`,
    `cancelled before delivery: …`, audited `cancelled_before_delivery`) if
@@ -207,6 +210,13 @@ public internet.
 - Logs: `~/Library/Logs/com.herdr-control.remote-mcp.log` (publisher),
   `npx wrangler tail herdr-mcp` (Worker).
 - Dry run of what would be sent: `python3 remote-mcp/publisher.py --dry-run`.
+- **Change message limits** (no redeploy; takes effect on the next send):
+  `python3 remote-mcp/scripts/limits.py show`;
+  `… set --per-hour 120 --per-minute 10 --for 4h --reason "release day" --apply`
+  for a boost that lapses on its own (max 7d), or `--until-reset` for a new
+  normal; `… reset --apply` returns to 5/30. Route `/admin/limits`, signed
+  like `/admin/grants`, audited `admin_limits_*`. Values above the ceiling are
+  refused, not clamped; raising the ceiling is a code change and a review.
 - **Revoke one connection** (e.g. Zero's plugin) and nothing else:
   `python3 remote-mcp/scripts/grants.py list`, then
   `python3 remote-mcp/scripts/grants.py revoke <grant_id> --apply`. The Worker

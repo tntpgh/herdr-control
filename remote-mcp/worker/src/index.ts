@@ -11,7 +11,7 @@ import type { ConsentDescription } from "@cloudflare/workers-oauth-provider";
 import { emailAllowed, verifyAccess } from "./access";
 import { verifyIngest } from "./ingest";
 import { mcpHandler } from "./mcp";
-import { offeredScopes, serverInfo } from "./policy";
+import { DEFAULT_LIMITS, MAX_LIMITS, offeredScopes, serverInfo } from "./policy";
 import type { DeliveryGate, Env, GrantProps, Sender } from "./types";
 import { SCOPE_MESSAGE, SCOPE_READ } from "./types";
 
@@ -173,12 +173,50 @@ async function adminGrants(request: Request, env: Env): Promise<Response> {
   return Response.json({ revoked: grantId, user }, { headers: { "cache-control": "no-store" } });
 }
 
+// Mac-only message-limit administration, same signing as /admin/grants.
+//   {"op":"get"}
+//   {"op":"set","per_minute":N,"per_hour":N,"minutes":N|null,"reason":"…"}
+//   {"op":"reset"}                       back to DEFAULT_LIMITS
+// "minutes" makes the override temporary (a boost); null keeps it until reset.
+// Values above MAX_LIMITS are refused, never clamped, so a typo can't
+// silently become the ceiling.
+async function adminLimits(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return text("Method not allowed", 405);
+  const check = await verifyIngest(request, env.INGEST_KEY, Math.floor(Date.now() / 1000));
+  if (!check.ok) return Response.json({ error: check.reason }, { status: check.status });
+  let body: { op?: unknown; per_minute?: unknown; per_hour?: unknown; minutes?: unknown; reason?: unknown };
+  try { body = JSON.parse(check.body); } catch { return Response.json({ error: "bad_json" }, { status: 400 }); }
+  const { op } = body;
+  if (op !== "get" && op !== "set" && op !== "reset") return Response.json({ error: "bad_request" }, { status: 400 });
+  const int = (v: unknown, max: number) => typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= max;
+  if (op === "set") {
+    const { per_minute: pm, per_hour: ph, minutes, reason } = body;
+    if (!int(pm, MAX_LIMITS.per_minute) || !int(ph, MAX_LIMITS.per_hour) || (pm as number) > (ph as number)) {
+      return Response.json({ error: "out_of_bounds", max: MAX_LIMITS }, { status: 400 });
+    }
+    if (minutes !== null && !int(minutes, 7 * 24 * 60)) return Response.json({ error: "bad_minutes (1..10080 or null)" }, { status: 400 });
+    if (typeof reason !== "string" || !reason.trim() || reason.length > 200) return Response.json({ error: "reason_required" }, { status: 400 });
+  }
+  const stub = env.HERDR_STATE.get(env.HERDR_STATE.idFromName("fleet"));
+  const target = op === "set" ? `${String(body.per_minute)}/min ${String(body.per_hour)}/h for ${String(body.minutes ?? "until reset")}m: ${String(body.reason)}` : "";
+  const now = Date.now();
+  if (!(await stub.admitAdmin(now, check.nonce, `limits_${op}`, target))) {
+    return Response.json({ error: "replayed_nonce" }, { status: 409 });
+  }
+  const limits = op === "get" ? await stub.messageLimits(now)
+    : op === "reset" ? await stub.setMessageLimits(now, null)
+    : await stub.setMessageLimits(now, { per_minute: body.per_minute as number, per_hour: body.per_hour as number,
+        until_ms: body.minutes === null ? null : now + (body.minutes as number) * 60_000, reason: (body.reason as string).trim() });
+  return Response.json({ limits, defaults: DEFAULT_LIMITS, max: MAX_LIMITS }, { headers: { "cache-control": "no-store" } });
+}
+
 const defaultHandler = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const { pathname } = new URL(request.url);
     if (pathname === "/authorize") return authorize(request, env);
     if (pathname === "/ingest/sync") return ingest(request, env);
     if (pathname === "/admin/grants") return adminGrants(request, env);
+    if (pathname === "/admin/limits") return adminLimits(request, env);
     if (pathname === "/" || pathname === "/healthz") {
       return Response.json({ service: "herdr-mcp", mcp: `${env.PUBLIC_URL}/mcp`, auth: "OAuth 2.1 + PKCE", ...serverInfo(env) },
         { headers: { "cache-control": "no-store" } });
