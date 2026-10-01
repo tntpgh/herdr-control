@@ -133,11 +133,52 @@ async function ingest(request: Request, env: Env): Promise<Response> {
   return Response.json(out.response, { headers: { "cache-control": "no-store" } });
 }
 
+// Mac-only grant administration, signed with the same INGEST_KEY as /ingest
+// (the Mac already holds it; no user token can reach this). One grant can be
+// revoked without touching ALLOWED_EMAILS. Bodies:
+//   {"op":"list","user":"<email>"}
+//   {"op":"revoke","user":"<email>","grant_id":"<id>"}
+// Revocation deletes the grant and its tokens; queued messages from it are
+// then cancelled by deliveryGate on the next sync.
+async function adminGrants(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return text("Method not allowed", 405);
+  const check = await verifyIngest(request, env.INGEST_KEY, Math.floor(Date.now() / 1000));
+  if (!check.ok) return Response.json({ error: check.reason }, { status: check.status });
+  let body: { op?: unknown; user?: unknown; grant_id?: unknown };
+  try { body = JSON.parse(check.body); } catch { return Response.json({ error: "bad_json" }, { status: 400 }); }
+  const { op, user, grant_id: grantId } = body;
+  if ((op !== "list" && op !== "revoke") || typeof user !== "string" || !user || user.length > 320) {
+    return Response.json({ error: "bad_request" }, { status: 400 });
+  }
+  if (op === "revoke" && (typeof grantId !== "string" || !/^[\w:-]{1,200}$/.test(grantId))) {
+    return Response.json({ error: "bad_grant_id" }, { status: 400 });
+  }
+  const stub = env.HERDR_STATE.get(env.HERDR_STATE.idFromName("fleet"));
+  const target = op === "revoke" ? `${user} ${grantId as string}` : user;
+  if (!(await stub.admitAdmin(Date.now(), check.nonce, op, target))) {
+    return Response.json({ error: "replayed_nonce" }, { status: 409 });
+  }
+  const grants = [];
+  let cursor: string | undefined;
+  do {
+    const page = await env.OAUTH_PROVIDER.listUserGrants(user, { cursor });
+    grants.push(...page.items.map((g) => ({ grant_id: g.id, client_id: g.clientId, scope: g.scope,
+      created_at: new Date(g.createdAt * 1000).toISOString(),
+      expires_at: g.expiresAt === undefined ? null : new Date(g.expiresAt * 1000).toISOString() })));
+    cursor = page.cursor;
+  } while (cursor);
+  if (op === "list") return Response.json({ user, grants }, { headers: { "cache-control": "no-store" } });
+  if (!grants.some((g) => g.grant_id === grantId)) return Response.json({ error: "no_such_grant" }, { status: 404 });
+  await env.OAUTH_PROVIDER.revokeGrant(grantId as string, user);
+  return Response.json({ revoked: grantId, user }, { headers: { "cache-control": "no-store" } });
+}
+
 const defaultHandler = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const { pathname } = new URL(request.url);
     if (pathname === "/authorize") return authorize(request, env);
     if (pathname === "/ingest/sync") return ingest(request, env);
+    if (pathname === "/admin/grants") return adminGrants(request, env);
     if (pathname === "/" || pathname === "/healthz") {
       return Response.json({ service: "herdr-mcp", mcp: `${env.PUBLIC_URL}/mcp`, auth: "OAuth 2.1 + PKCE", ...serverInfo(env) },
         { headers: { "cache-control": "no-store" } });

@@ -43,8 +43,8 @@ Scopes:
 
 Turning messaging on is a separate decision, and needs, in order:
 
-1. a way to revoke one grant without removing the only allowlisted email
-   (round-2 review N5; not built yet);
+1. a way to revoke one connection without removing the only allowlisted
+   email: `scripts/grants.py` (round-2 review N5, see Operations);
 2. `MESSAGING_ENABLED="true"` and a redeploy through `provision.sh`;
 3. `HERDR_MCP_MESSAGING=1` in the publisher's environment;
 4. a fresh consent that ticks `herdr:message` deliberately (it is never
@@ -201,6 +201,13 @@ public internet.
 - Logs: `~/Library/Logs/com.herdr-control.remote-mcp.log` (publisher),
   `npx wrangler tail herdr-mcp` (Worker).
 - Dry run of what would be sent: `python3 remote-mcp/publisher.py --dry-run`.
+- **Revoke one connection** (e.g. Zero's plugin) and nothing else:
+  `python3 remote-mcp/scripts/grants.py list`, then
+  `python3 remote-mcp/scripts/grants.py revoke <grant_id> --apply`. The Worker
+  route `/admin/grants` is signed with `INGEST_KEY` (same HMAC, skew and
+  nonce rules as `/ingest/sync`; no user token reaches it) and audits every
+  call as `admin_list` / `admin_revoke`. The grant's tokens stop working at
+  once and anything it queued is cancelled before delivery on the next sync.
 - **Kill switches**, least to most: set `MESSAGING_ENABLED` to `"false"` and
   redeploy (new sends are refused and every queued message is cancelled on
   the next sync; reads continue); unload the
@@ -238,8 +245,8 @@ scope, throttle and allowlist enforcement in workerd) and
 envelope handling, delivery re-checks, lost-ack dedup). CI:
 `.github/workflows/remote-mcp.yml`. Security review (two rounds, posted on
 PR #206): round 1 M1–M8, L1–L4, I1, I2 fixed; round 2 approved the read-only
-first connection, N1–N4, N6, N8, N10 fixed, N5 (single-grant revoke) open and
-required before messaging.
+first connection, N1–N4, N6, N8, N10 fixed; N5 (single-grant revoke) added
+afterwards in `scripts/grants.py` + `/admin/grants`.
 
 Dependencies: `npm ci` is warning-free and `npm audit` reports 0. The test
 pool (`@cloudflare/vitest-pool-workers` 0.22.0, latest) pins an older

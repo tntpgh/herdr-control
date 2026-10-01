@@ -85,16 +85,19 @@ export async function callTool<T = Record<string, unknown>>(token: string, name:
   return { data: typed, isError };
 }
 
-export async function signedSync(body: SyncBody, opts: { nonce?: string; ts?: number; key?: string } = {}) {
+export async function signedPost(path: string, body: unknown, opts: { nonce?: string; ts?: number; key?: string } = {}) {
   const raw = JSON.stringify(body);
   const ts = String(opts.ts ?? Math.floor(Date.now() / 1000));
   const nonce = opts.nonce ?? [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
   const sig = await sign(opts.key ?? testEnv.INGEST_KEY, ts, nonce, raw);
-  return SELF.fetch(`${BASE}/ingest/sync`, {
+  return SELF.fetch(`${BASE}${path}`, {
     method: "POST", headers: { "content-type": "application/json", "x-herdr-ts": ts, "x-herdr-nonce": nonce, "x-herdr-sig": sig },
     body: raw,
   });
 }
+
+export const signedSync = (body: SyncBody, opts: { nonce?: string; ts?: number; key?: string } = {}) =>
+  signedPost("/ingest/sync", body, opts);
 
 export function snapshot(overrides: Partial<Snapshot> = {}): Snapshot {
   const now = new Date().toISOString();

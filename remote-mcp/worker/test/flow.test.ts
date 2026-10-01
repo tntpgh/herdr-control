@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { sign } from "../src/ingest";
 import type { HerdrState, MessageRecord } from "../src/state";
 import type { BlockerRow, Env } from "../src/types";
-import { accessJwt, BASE, callTool, oauthToken, queueRaw, signedSync, snapshot, syncBody } from "./helpers";
+import { accessJwt, BASE, callTool, oauthToken, queueRaw, signedPost, signedSync, snapshot, syncBody } from "./helpers";
 import { mcpHandler } from "../src/mcp";
 
 const e = env as unknown as Env; // the pool's env carries this Worker's bindings
@@ -216,6 +216,52 @@ describe("send_message", () => {
     expect(reply.outbox.map((m) => m.message_id)).toEqual([kept.data.message.message_id]);
     const m = await runInDurableObject(fleet(), (o: HerdrState) => o.messageStatus(gone, "former@teamthurber.com"));
     expect(m?.detail).toBe("cancelled before delivery: sender_not_allowed");
+  });
+});
+
+describe("grant administration from the Mac (/admin/grants)", () => {
+  interface Listed { grants: { grant_id: string; client_id: string; scope: string[] }[] }
+  const USER = "tnt@teamthurber.com";
+
+  it("revokes one connection, leaving the other working, and cancels what the revoked one queued", async () => {
+    await signedSync(syncBody());
+    const zero = await oauthToken(["herdr:read", "herdr:message"]);
+    const first: Listed = await (await signedPost("/admin/grants", { op: "list", user: USER })).json();
+    expect(first.grants).toHaveLength(1);
+    const zeroGrant = first.grants[0]!.grant_id;
+    const other = await oauthToken(["herdr:read", "herdr:message"]);
+    const queued = await callTool<{ message: MessageRecord }>(zero.access_token, "send_message", { target: "task_A", text: "from zero" });
+
+    const res = await signedPost("/admin/grants", { op: "revoke", user: USER, grant_id: zeroGrant });
+    expect(res.status).toBe(200);
+
+    const after: Listed = await (await signedPost("/admin/grants", { op: "list", user: USER })).json();
+    expect(after.grants.map((g) => g.grant_id)).toHaveLength(1);
+    expect(after.grants.map((g) => g.grant_id)).not.toContain(zeroGrant);
+    expect((await callTool(other.access_token, "get_status")).isError).toBe(false);
+    const dead = await SELF.fetch(`${BASE}/mcp`, { method: "POST", headers: { authorization: `Bearer ${zero.access_token}`,
+      "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+    expect(dead.status).toBe(401);
+
+    const reply = await syncJson(await signedSync(syncBody()));
+    expect(reply.outbox).toHaveLength(0);
+    const m = await runInDurableObject(fleet(), (o: HerdrState) => o.messageStatus(queued.data.message.message_id, USER));
+    expect(m?.detail).toBe("cancelled before delivery: sender_grant_revoked");
+    expect(reply.audit.filter((a) => a.tool.startsWith("admin_")).map((a) => [a.tool, a.decision]))
+      .toEqual([["admin_list", "allowed"], ["admin_revoke", "allowed"], ["admin_list", "allowed"]]);
+  });
+
+  it("refuses unsigned, wrongly signed, replayed and malformed admin requests", async () => {
+    const unsigned = await SELF.fetch(`${BASE}/admin/grants`, { method: "POST", body: JSON.stringify({ op: "list", user: USER }) });
+    expect(unsigned.status).toBe(401);
+    expect((await signedPost("/admin/grants", { op: "list", user: USER }, { key: "w".repeat(48) })).status).toBe(401);
+    const nonce = "ab".repeat(16);
+    expect((await signedPost("/admin/grants", { op: "list", user: USER }, { nonce })).status).toBe(200);
+    expect((await signedPost("/admin/grants", { op: "list", user: USER }, { nonce })).status).toBe(409);
+    expect((await signedPost("/admin/grants", { op: "delete_all", user: USER })).status).toBe(400);
+    expect((await signedPost("/admin/grants", { op: "revoke", user: USER, grant_id: "../x" })).status).toBe(400);
+    expect((await signedPost("/admin/grants", { op: "revoke", user: USER, grant_id: "nope" })).status).toBe(404);
   });
 });
 
