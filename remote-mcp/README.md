@@ -124,7 +124,7 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
 
 | Tool | Scope | Input | Returns |
 |---|---|---|---|
-| `get_status` | read | — | connection, fleet counts, your scopes, and `browser`: the Mac's real Chrome (running, relay connected\|no-extension\|down, `extensions` omp_relay/1password/chatgpt enabled\|disabled\|missing, stray omp Chromes, `healthy`) from `chrome-relay.py --status --json`, null when unknown. The harmless first call. |
+| `get_status` | read | — | connection, fleet counts, your scopes, and `browser`: the Mac's real Chrome (running, relay connected\|no-extension\|down, `extensions` omp_relay/1password/chatgpt enabled\|disabled\|missing\|unknown — unknown because the publisher's LaunchAgent cannot read Chrome's prefs; omp_relay is proven by a connected relay — stray omp Chromes, `healthy` = no evidence of a problem) from `chrome-relay.py --status --json`, null when unknown. The harmless first call. |
 | `list_agents` | read | `status?` idle\|working\|blocked\|done\|unknown | agents: `agent_id` (herdr terminal id, stable for the pane's life), `pane_id`, role worker\|conductor\|session, status, `status_since`, `task_id` |
 | `list_tasks` | read | `filter` active (default)\|attention\|done\|all, `project?`, `updated_since?` ISO, `limit` 1–100 (50) | tasks newest first: stable `task_id`, label, project, state, `created_at`/`updated_at`/`completed_at`, closure, `messageable` |
 | `get_task` | read | `task_id` | task, its agent, its blockers |

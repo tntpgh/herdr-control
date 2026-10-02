@@ -28,8 +28,9 @@ cannot be captured by a stray.
   chrome-relay.py --pause HOURS | --resume
                                stop / restart --ensure (you quit Chrome on purpose)
 
-Exit 0 = real Chrome running, all three extensions enabled, and the relay is
-not "no-extension" (relay "down" just means no omp session has started it).
+Exit 0 = real Chrome running, no extension disabled or missing, and the relay
+is not "no-extension" (relay "down" just means no omp session has started it).
+Extension state is "unknown" when run from launchd (see extensions()).
 --ensure ignores the relay: it is still handshaking right after a launch.
 Env: CHROME_PROFILE (default "Profile 1"), OMP_RELAY_PORT (default 9224).
 """
@@ -165,26 +166,42 @@ def relay_state() -> str:
         return "down"
 
 
-def extensions() -> dict[str, str]:
-    """enabled | disabled | missing, from the profile's own preference files."""
+def extensions(relay: str) -> dict[str, str]:
+    """enabled | disabled | missing | unknown, from the profile's preference
+    files. Under launchd those files are unreadable (macOS app-data protection:
+    PermissionError, measured 2026-10-02; the Terminal has Full Disk Access,
+    the LaunchAgent's python does not), so states are "unknown" there, except
+    omp_relay, which a connected relay proves enabled."""
     settings: dict = {}
+    readable = False
     for name in ("Preferences", "Secure Preferences"):
         try:
             doc = json.loads((UDD / PROFILE / name).read_text())
         except (OSError, ValueError):
             continue
+        readable = True
         for ext_id, v in (doc.get("extensions", {}).get("settings") or {}).items():
             settings.setdefault(ext_id, {}).update(v)
 
     def state(v: dict | None) -> str:
+        if not readable:
+            return "unknown"
         if not v:
             return "missing"
         disabled = v.get("disable_reasons") or v.get("state") == 0
         return "disabled" if disabled else "enabled"
 
-    relay = next((v for v in settings.values()
-                  if v.get("path") and Path(v["path"]).expanduser() == RELAY_EXT_DIR), None)
-    return {"omp_relay": state(relay), **{k: state(settings.get(i)) for k, i in STORE_IDS.items()}}
+    relay_ext = next((v for v in settings.values()
+                      if v.get("path") and Path(v["path"]).expanduser() == RELAY_EXT_DIR), None)
+    out = {"omp_relay": state(relay_ext), **{k: state(settings.get(i)) for k, i in STORE_IDS.items()}}
+    if relay == "connected":
+        out["omp_relay"] = "enabled"
+    return out
+
+
+def ext_ok(ext: dict[str, str]) -> bool:
+    """No evidence of a lost extension (unknown is not evidence)."""
+    return all(v in ("enabled", "unknown") for v in ext.values())
 
 
 def launch(background: bool) -> int | None:
@@ -234,8 +251,8 @@ def paused_until() -> float | None:
 
 
 def report(real: int | None, strays: list[dict]) -> dict:
-    ext = extensions()
     relay = relay_state()
+    ext = extensions(relay)
     return {
         "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "real_chrome_running": real is not None,
@@ -243,7 +260,7 @@ def report(real: int | None, strays: list[dict]) -> dict:
         "relay": relay,
         "extensions": ext,
         "stray_omp_chromes": len(strays),
-        "healthy": real is not None and relay != "no-extension" and all(v == "enabled" for v in ext.values()),
+        "healthy": real is not None and relay != "no-extension" and ext_ok(ext),
     }
 
 
@@ -283,8 +300,7 @@ def main(argv: list[str]) -> int:
     # --ensure's exit is launchd's "last exit code", which audit_launchd.py
     # alarms on: fail it for a dead Chrome or a lost extension, never for the
     # relay socket, which is still handshaking for a few seconds after launch.
-    ok = r["healthy"] if "--ensure" not in argv else (
-        r["real_chrome_running"] and all(v == "enabled" for v in r["extensions"].values()))
+    ok = r["healthy"] if "--ensure" not in argv else (r["real_chrome_running"] and ext_ok(r["extensions"]))
     if "--json" in argv:
         print(json.dumps(r))
     elif "--ensure" not in argv or not ok:

@@ -12,7 +12,7 @@ import type { CommandAck, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem,
 import { SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START, SNAPSHOT_SCHEMA } from "./types";
 
 const str = z.string().max(4000);
-const ExtState = z.enum(["enabled", "disabled", "missing"]);
+const ExtState = z.enum(["enabled", "disabled", "missing", "unknown"]);
 const nstr = str.nullable();
 const SyncSchema = z.object({
   snapshot: z.object({

@@ -48,7 +48,7 @@ it("reports the Mac's real-Chrome health from the snapshot, and null when the pu
 
   const browser = {
     checked_at: "2026-10-02T18:00:00Z", real_chrome_running: true, relay: "connected",
-    extensions: { omp_relay: "enabled", "1password": "enabled", chatgpt: "missing" } as const,
+    extensions: { omp_relay: "enabled", "1password": "unknown", chatgpt: "missing" } as const,
     stray_omp_chromes: 1, healthy: false,
   };
   await signedSync(syncBody({ snapshot: snapshot({ browser }) }));
