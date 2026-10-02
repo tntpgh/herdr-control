@@ -335,15 +335,28 @@ def changed_results(snapshot: dict, local: dict, cache: dict, now_s: float) -> l
     order = sorted(snapshot["tasks"], key=lambda t: t["updated_at"], reverse=True)
     for t in order:
         wt = local["worktrees"].get(t["task_id"])
-        if not wt or not worktree_ok(wt):
+        if not wt:
             continue
         # I2: research tasks never write PROOF.md (that's the implement-mode
         # closure proof) -- their deliverable is ANSWER.md. Sync both, same
         # redaction/cap/dedup, so get_task_answer.answer/latest_reply are
         # populated for research tasks too, not only in the tests that
         # inject these sources directly.
-        for source in (".handoffs/PROOF.md", ".handoffs/ANSWER.md"):
+        #
+        # N7: ANSWER.md is restricted to tasks that have a remote_task_id --
+        # a purely-local task (no remote_task_id) was never meant to be
+        # readable by any herdr:read client; only PROOF.md (the pre-existing,
+        # already-reviewed closure proof) stays unconditional.
+        sources = ((".handoffs/PROOF.md", ".handoffs/ANSWER.md") if t.get("remote_task_id")
+                   else (".handoffs/PROOF.md",))
+        for source in sources:
             path = wt / source
+            # N6: the symlink-safety check must run per source against the
+            # PARENT of the exact path about to be opened (worktree_ok(wt)
+            # alone does not catch ".handoffs" itself being a symlink --
+            # read_regular's O_NOFOLLOW only guards the final component).
+            if not worktree_ok(path.parent):
+                continue
             try:
                 raw, mtime = read_regular(path)
             except OSError:

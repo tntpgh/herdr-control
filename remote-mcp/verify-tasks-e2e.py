@@ -113,6 +113,39 @@ row2 = registry_row(task_id2)
 check("registry state is 'cancelled' after the real registry-bridge.sh cancel ran",
       bool(row2) and row2.get("state") == "cancelled", row2)
 
+print("== N5: real registry-bridge.sh cancel skips the pane close when `herdr pane list` itself fails ==")
+fake_herdr_dir = TMP / "fake-herdr-bin"
+fake_herdr_dir.mkdir()
+fake_herdr_log = TMP / "fake-herdr-calls.log"
+fake_herdr = fake_herdr_dir / "herdr"
+fake_herdr.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {fake_herdr_log}
+case "$1 $2" in
+  "pane list") exit 1 ;;
+esac
+exit 0
+""")
+fake_herdr.chmod(0o755)
+os.environ["PATH"] = f"{fake_herdr_dir}:{os.environ['PATH']}"
+out3 = tsk.process_command({
+    "command_id": "cmd_4", "op": "start", "remote_task_id": "rtask_20261002T000003Z_e2e00003",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "z"},
+})
+check("third start accepted", out3.get("outcome") == "accepted", json.dumps(out3))
+task_id3 = out3.get("local_task_id", "")
+cout3 = tsk.process_command({
+    "command_id": "cmd_5", "op": "cancel", "remote_task_id": "rtask_20261002T000003Z_e2e00003",
+    "payload": {"local_task_id": task_id3, "reason": "canceled"},
+})
+check("cancel accepted even though herdr pane list fails", cout3.get("outcome") == "accepted", json.dumps(cout3))
+row3 = registry_row(task_id3)
+check("registry state is still 'cancelled' (the state write does not depend on the pane close)",
+      bool(row3) and row3.get("state") == "cancelled", row3)
+herdr_calls = fake_herdr_log.read_text() if fake_herdr_log.exists() else ""
+check("`herdr pane list` was attempted", "pane list" in herdr_calls, herdr_calls)
+check("`herdr pane close` was NEVER attempted once `pane list` failed (N5, no fail-open)",
+      "pane close" not in herdr_calls, herdr_calls)
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 if failures:

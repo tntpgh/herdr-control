@@ -755,8 +755,17 @@ export class HerdrState extends DurableObject<Env> {
           this.recordTaskEvent(nowMs, c.remote_task_id, "cancel_requested", { reason: "cancelled while the start was still in flight" });
         } else if (cur && REMOTE_TERMINAL[cur.state]) {
           // Already terminal some other way (e.g. its lease expired and was
-          // marked failed before this late ack arrived): never revive it.
+          // marked failed before this late ack arrived, or a revoke
+          // cancelled it before delivery while the Mac was mid-spawn):
+          // never revive it, but if the ack proves the Mac actually
+          // spawned an agent, that agent is still running with nothing
+          // tracking it unless a cancel reaches it (N3).
           this.recordTaskEvent(nowMs, c.remote_task_id, "late_ack_ignored", { outcome: a.outcome, already: cur.state });
+          if (a.local_task_id) {
+            this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
+              `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", c.remote_task_id,
+              JSON.stringify({ local_task_id: a.local_task_id }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+          }
         } else {
           this.sql.exec(`UPDATE remote_tasks SET local_task_id=?, local_run_id=?, branch=?, pane_id=?, agent_id=?,
               state='running', capability_probe=?, updated_at=? WHERE remote_task_id=?`,
@@ -804,7 +813,14 @@ export class HerdrState extends DurableObject<Env> {
       const rt = this.sql.exec<{ requester_email: string; requester_client: string }>(
         `SELECT requester_email, requester_client FROM remote_tasks WHERE remote_task_id=?`, c.remote_task_id).toArray()[0];
       if (!rt) continue;
-      const why = (!tasksEnabled && c.op !== "cancel") ? "tasks_disabled"
+      // N4: op='cancel' is exempt from every sender refusal here, not only
+      // the tasks-disabled switch. A cancel only ever lowers risk; refusing
+      // one because the sender's email was later removed from the
+      // allowlist or their grant was revoked would block the Worker's own
+      // timeout cancel and the user's pending cancels while the Mac's
+      // deadline is still the only thing stopping the agent.
+      const why = c.op === "cancel" ? null
+        : !tasksEnabled ? "tasks_disabled"
         : !emailAllowed(this.env, rt.requester_email) ? "sender_not_allowed"
         : cmdRevoked.has(`${rt.requester_email}\n${rt.requester_client}`) ? "sender_grant_revoked" : null;
       if (!why) continue;
@@ -837,9 +853,18 @@ export class HerdrState extends DurableObject<Env> {
       const why = c.attempts >= MAX_ATTEMPTS ? `gave up after ${c.attempts} attempts` : "not delivered within 15 minutes";
       this.sql.exec(`UPDATE commands SET status='done', outcome=?, detail=?, updated_at=? WHERE command_id=?`,
         status, `${why}${c.detail ? `; last: ${c.detail}` : ""}`.slice(0, 300), nowMs, c.command_id);
-      if (c.op === "start") {
-        this.sql.exec(`UPDATE remote_tasks SET state='failed', updated_at=? WHERE remote_task_id=?`, nowMs, c.remote_task_id);
-        this.recordTaskEvent(nowMs, c.remote_task_id, "failed", { reason: why });
+      if (c.op === "start" || c.op === "resume") {
+        const cur = this.sql.exec<{ state: string }>(`SELECT state FROM remote_tasks WHERE remote_task_id=?`, c.remote_task_id).toArray()[0];
+        // N2: a cancel that raced ahead of the ack (M6) leaves the row
+        // 'cancelling' with no local_task_id to key a real cancel command
+        // on. If the start/resume itself then expires or exhausts its
+        // attempts instead of ever being acked, that row must resolve to
+        // 'cancelled' (the caller's actual intent), not get stuck
+        // forever excluded from both this loop and the deadline sweep
+        // below (both exclude 'cancelling').
+        const final = cur?.state === "cancelling" ? "cancelled" : "failed";
+        this.sql.exec(`UPDATE remote_tasks SET state=?, updated_at=? WHERE remote_task_id=?`, final, nowMs, c.remote_task_id);
+        this.recordTaskEvent(nowMs, c.remote_task_id, final, { reason: why });
       }
       this.audit(nowMs, { ...sys, target: c.remote_task_id, decision: status, reason: why, message_id: "", detail: c.detail });
     }

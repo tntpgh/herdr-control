@@ -171,6 +171,21 @@ def _read_identity(wt: Path) -> dict | None:
         return None
 
 
+def _cancel_after_spawn_failure(wt: Path, run_id: str = "", local_task_id: str = "") -> None:
+    """N1: every path that returns 'failed' AFTER spawn-task.sh has already
+    registered a pane must not leave that agent alive with nothing stopping
+    it -- best-effort cancel it now rather than relying only on sweep's
+    deadline fallback (which may be the very write that just failed). A
+    missing run_id/local_task_id (identity.json itself was unreadable) means
+    there is genuinely nothing to key a cancel on; this is then a no-op."""
+    if not run_id or not local_task_id:
+        identity = _read_identity(wt) if wt else None
+        if not identity:
+            return
+        run_id, local_task_id = identity["run_id"], identity["task_id"]
+    _bridge("cancel", run_id, local_task_id, "post_spawn_setup_failed")
+
+
 def _find_repo_root(repo: str) -> Path | None:
     root = CODE_ROOT / repo
     return root if (root / ".git").exists() else None
@@ -329,22 +344,30 @@ def _start(cmd: dict) -> dict:
         run_id, local_task_id = identity["run_id"], identity["task_id"]
     else:
         brief = _write_brief(mode, mcfg, objective, remote_id)
-        proc = _spawn(root, branch, mcfg, brief)
+        try:
+            proc = _spawn(root, branch, mcfg, brief)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            _cancel_after_spawn_failure(wt)
+            return {"command_id": cid, "outcome": "failed",
+                    "detail": f"spawn-task.sh crashed or did not finish in time: {exc}"[:300]}
         if proc.returncode != 0:
             return {"command_id": cid, "outcome": "failed",
                     "detail": f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:200]}"}
         identity = _read_identity(wt)
         if not identity:
+            _cancel_after_spawn_failure(wt)
             return {"command_id": cid, "outcome": "failed", "detail": "spawned, but identity.json was unreadable"}
         run_id, local_task_id = identity["run_id"], identity["task_id"]
     stamped = _bridge("set-remote-id", run_id, local_task_id, remote_id)
     if stamped.returncode != 0:
+        _cancel_after_spawn_failure(wt, run_id, local_task_id)
         return {"command_id": cid, "outcome": "failed",
                 "detail": "spawned, but could not stamp remote_task_id onto the registry row",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
     row = json.loads(stamped.stdout) if stamped.stdout.strip() else {}
     deadlined = _bridge("set-deadline", run_id, local_task_id, _iso_in(caps["max_minutes"] * 60))
     if deadlined.returncode != 0:
+        _cancel_after_spawn_failure(wt, run_id, local_task_id)
         return {"command_id": cid, "outcome": "failed",
                 "detail": "spawned, but could not set the deadline that is the only backstop on a runaway task",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
@@ -424,22 +447,30 @@ def _resume(cmd: dict) -> dict:
         return refuse(f"too_many_today on the Mac (max {caps['max_per_day']}/day)")
 
     brief = _write_brief(mode, mcfg, "(resumed -- see the follow-up note below, if any)", remote_id, follow_up)
-    proc = _spawn(root, branch, mcfg, brief)
+    try:
+        proc = _spawn(root, branch, mcfg, brief)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        _cancel_after_spawn_failure(wt)
+        return {"command_id": cid, "outcome": "failed",
+                "detail": f"spawn-task.sh crashed or did not finish in time: {exc}"[:300]}
     if proc.returncode != 0:
         return {"command_id": cid, "outcome": "failed",
                 "detail": f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:200]}"}
     identity = _read_identity(wt)
     if not identity:
+        _cancel_after_spawn_failure(wt)
         return {"command_id": cid, "outcome": "failed", "detail": "resumed, but identity.json was unreadable"}
     run_id, local_task_id = identity["run_id"], identity["task_id"]
     stamped = _bridge("set-remote-id", run_id, local_task_id, remote_id)
     if stamped.returncode != 0:
+        _cancel_after_spawn_failure(wt, run_id, local_task_id)
         return {"command_id": cid, "outcome": "failed",
                 "detail": "resumed, but could not stamp remote_task_id onto the registry row",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
     row = json.loads(stamped.stdout) if stamped.stdout.strip() else {}
     deadlined = _bridge("set-deadline", run_id, local_task_id, _iso_in(caps["max_minutes"] * 60))
     if deadlined.returncode != 0:
+        _cancel_after_spawn_failure(wt, run_id, local_task_id)
         return {"command_id": cid, "outcome": "failed",
                 "detail": "resumed, but could not set the deadline that is the only backstop on a runaway task",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
@@ -548,6 +579,17 @@ def sweep(tasks_by_id: dict[str, dict], now: datetime) -> list[dict]:
             continue
         if t["state"] in ("running", "starting", "blocked"):
             deadline = _parse_iso(remote["deadline_at"]) if remote["deadline_at"] else None
+            if deadline is None:
+                # N1: a post-spawn set-deadline failure (bridge write lost)
+                # must not leave the only backstop a remote task has
+                # permanently absent. Fall back to created_at plus the
+                # CURRENT allowlist's max_minutes.
+                created = _parse_iso(t.get("created_at") or "")
+                if created is not None:
+                    try:
+                        deadline = created + load_allowlist()["caps"]["max_minutes"] * 60
+                    except (OSError, ValueError, KeyError):
+                        deadline = None
             if deadline is not None and now.timestamp() > deadline:
                 logged.append(_force_cancel(t, "timed_out"))
                 continue

@@ -321,7 +321,11 @@ public internet.
   route `/admin/grants` is signed with `INGEST_KEY` (same HMAC, skew and
   nonce rules as `/ingest/sync`; no user token reaches it) and audits every
   call as `admin_list` / `admin_revoke`. The grant's tokens stop working at
-  once and anything it queued is cancelled before delivery on the next sync.
+  once and any queued start/resume of theirs is cancelled before delivery
+  on the next sync (their own pending cancels are exempt and still go
+  through, N4); a task of theirs already running on the Mac keeps running
+  until its own deadline backstop force-cancels it — revoke stops new
+  starts/resumes, not an in-flight one.
 - **Kill switches**, least to most: set `MESSAGING_ENABLED`/`TASKS_ENABLED` to
   `"false"` and redeploy (new sends/starts are refused and every queued
   message/command is cancelled on the next sync; a task already running on

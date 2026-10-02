@@ -238,6 +238,47 @@ class StartAccepted(unittest.TestCase):
         self.assertEqual(out["outcome"], "failed")
         self.assertIn("exit 1", out["detail"])
 
+    def test_set_remote_id_failure_cancels_the_orphaned_pane(self):
+        # N1: a post-spawn failure after spawn-task.sh has already registered
+        # a pane must not leave that agent alive with nothing stopping it.
+        fake = TMP / "fake-bridge-fail-remote-id.sh"
+        fake.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {FAKE_BRIDGE_LOG}
+case "$1" in
+  set-remote-id) exit 1 ;;
+esac
+exit 0
+""")
+        fake.chmod(0o755)
+        old = tsk.REGISTRY_BRIDGE
+        tsk.REGISTRY_BRIDGE = str(fake)
+        try:
+            out = tsk.process_command(_start_cmd())
+        finally:
+            tsk.REGISTRY_BRIDGE = old
+        self.assertEqual(out["outcome"], "failed")
+        self.assertIn("cancel run_fake1 task_fake1", FAKE_BRIDGE_LOG.read_text())
+
+    def test_set_deadline_failure_cancels_the_orphaned_pane(self):
+        fake = TMP / "fake-bridge-fail-deadline.sh"
+        fake.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {FAKE_BRIDGE_LOG}
+case "$1" in
+  set-remote-id) cat {FAKE_BRIDGE_ROW} ;;
+  set-deadline) exit 1 ;;
+esac
+exit 0
+""")
+        fake.chmod(0o755)
+        old = tsk.REGISTRY_BRIDGE
+        tsk.REGISTRY_BRIDGE = str(fake)
+        try:
+            out = tsk.process_command(_start_cmd())
+        finally:
+            tsk.REGISTRY_BRIDGE = old
+        self.assertEqual(out["outcome"], "failed")
+        self.assertIn("cancel run_fake1 task_fake1", FAKE_BRIDGE_LOG.read_text())
+
 
 class CancelCommand(unittest.TestCase):
     def setUp(self):
@@ -463,6 +504,17 @@ class Sweep(unittest.TestCase):
         self.assertEqual(actions[0]["action"], "force_cancel")
         self.assertTrue(actions[0]["ok"])
         self.assertIn("cancel run_x task_b timed_out", FAKE_BRIDGE_LOG.read_text())
+
+    def test_deadline_fallback_when_set_deadline_never_landed(self):
+        # N1: an empty deadline_at (a post-spawn set-deadline call that never
+        # landed) must not mean "never times out" -- sweep falls back to
+        # created_at + the allowlist's current max_minutes.
+        self._row("task_d", "rtask_d", deadline="")
+        t = {"task_id": "task_d", "run_id": "run_x", "state": "running", "worktree": str(self.wt),
+             "created_at": "2020-01-01T00:00:00Z"}
+        actions = tsk.sweep({"task_d": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        self.assertEqual(actions[0]["action"], "force_cancel")
+        self.assertTrue(actions[0]["ok"])
 
     def test_verify_runs_once_then_is_gated_by_verify_detail(self):
         self._row("task_c", "rtask_c", state="completed")

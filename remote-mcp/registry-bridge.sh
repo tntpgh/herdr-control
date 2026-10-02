@@ -25,8 +25,6 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)/..
 # shellcheck source=lib/run-registry.sh
 . "$HERE/lib/run-registry.sh"
-# shellcheck source=lib/pane-guard.sh
-. "$HERE/lib/pane-guard.sh"
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
@@ -60,11 +58,21 @@ case "$cmd" in
       # close-done-workers.sh --pane uses: only close when the currently
       # live occupant's terminal_id still matches what this row registered
       # (or the pane reports no live occupant at all, i.e. already gone).
+      #
+      # N5: pane_birth_now (lib/pane-guard.sh) swallows `herdr pane list`'s
+      # own exit code -- empty there means EITHER "pane gone" or "list
+      # failed," and treating a transient list failure as "gone" would
+      # fail OPEN into closing by bare id. Re-run the list here ourselves
+      # so a failed/unparseable list skips the close instead.
       registered_birth=$(printf '%s' "$row" | jq -r '.pane_birth // empty')
-      live_birth="$(pane_birth_now "$pane")"
-      if [ -z "$live_birth" ] || [ "$live_birth" = "$registered_birth" ]; then
-        [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
-        herdr pane close "$pane" >/dev/null 2>&1 || true
+      pane_list_json="$(herdr pane list 2>/dev/null)"
+      if [ $? -eq 0 ] && [ -n "$pane_list_json" ]; then
+        live_birth="$(printf '%s' "$pane_list_json" | jq -r --arg p "$pane" \
+          '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null)"
+        if [ -z "$live_birth" ] || [ "$live_birth" = "$registered_birth" ]; then
+          [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
+          herdr pane close "$pane" >/dev/null 2>&1 || true
+        fi
       fi
     fi
     ;;

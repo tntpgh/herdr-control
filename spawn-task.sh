@@ -534,6 +534,19 @@ else
   fi
 fi
 
+# N8 (round-2 security review): research/explore now carry the `write` tool
+# (lib/agent-profiles.sh tools_for_job) but must still write nothing outside
+# .handoffs -- `handoffs_write` names the one file (lib/command-policy.sh
+# _cp_write_menu_verdict) a worker's write tool may target. Merged in HERE,
+# never read from the task's own SPEC.md: manifest_from_spec's validator
+# rejects an unknown key, so a worker cannot forge or widen this by editing
+# its own worktree-writable brief and having a re-spawn "approve" it.
+case "$job" in
+  research|explore)
+    manifest_json="$(printf '%s' "${manifest_json:-\{\}}" | jq -c '. + {handoffs_write: "ANSWER.md"}')"
+    ;;
+esac
+
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
 # Whether THIS call creates the workspace decides the root-tab cleanup below.
 ws_existed=0

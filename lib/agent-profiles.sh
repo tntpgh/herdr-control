@@ -294,10 +294,18 @@ omp_cross_family_model() {   # <from-agent> <bare-model-name> -> "<omp-model> <t
 tools_for_job() {  # <job-class> -> comma-separated --tools value, or "" for unrestricted
   case "$1" in
     implement|debug|code|docs|mechanical|quick) printf 'read,bash,edit,write,grep,glob,todo,eval,wait,ask\n' ;;
-    # research is the remote-task mode whose only enforcement against
-    # writes IS this tool set -- the allowlist's `git: none` stops a
-    # pushed branch, not an edit inside the worktree (L4).
-    explore|research)                           printf 'read,bash,grep,glob,todo,web_search,ask\n' ;;
+    # research/explore keep no `edit` (no diff-style patching of tracked
+    # files) but DO get `write` back (N8, round-2 security review): their
+    # one legitimate deliverable is .handoffs/ANSWER.md, and with no write
+    # tool at all the only way to produce it was a bash heredoc, which an
+    # unattended remote spawn has nobody watching to approve. Safe because
+    # spawn-task.sh tags a research/explore task's manifest with
+    # `handoffs_write: ANSWER.md`, and _cp_write_menu_verdict
+    # (lib/command-policy.sh) narrows ANY task carrying that key to
+    # exactly that one .handoffs file -- never a broad in-worktree write
+    # the way implement/debug/etc above get. `git: none` (the allowlist's
+    # default ceiling for these job classes) still stops a pushed branch.
+    explore|research)                           printf 'read,bash,write,grep,glob,todo,web_search,ask\n' ;;
     *)                             printf '\n' ;;   # plan/architect/review/design + unrecognised: unrestricted
   esac
 }

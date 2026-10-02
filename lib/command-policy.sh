@@ -3758,7 +3758,7 @@ EOF
 #     are exact-string matches, already immune to both concerns, and stay
 #     ahead of this check on purpose.
 _cp_write_menu_verdict() {
-  local raw="$1" wt="$2" path
+  local raw="$1" wt="$2" manifest="${3:-}" path
   [ "$(_cp_count_allow_tool_headers "$raw")" -gt 1 ] && return 1
   case "$raw" in
     "Allow tool: write Path: "*" Content: "*)
@@ -3791,11 +3791,37 @@ _cp_write_menu_verdict() {
     printf 'escalate:worker worktree unknown — cannot judge write path containment'
     return 0
   fi
-  if _cp_path_within_worktree "$path" "$wt"; then
-    printf 'allow'
-  else
+  if ! _cp_path_within_worktree "$path" "$wt"; then
     printf 'escalate:write path resolves outside the worker'"'"'s worktree — remains human-only'
+    return 0
   fi
+  # N8 (round-2 security review): a manifest naming `handoffs_write` marks a
+  # write-restricted job class (research/explore, review L4 gave them no
+  # write/edit tool at all; spawn-task.sh sets this key, never SPEC.md --
+  # manifest_from_spec's validator rejects an unknown key, so a worker
+  # cannot forge or widen it). Its write tool may touch exactly that one
+  # .handoffs file (its deliverable, e.g. ANSWER.md) and nothing else --
+  # never the broad any-in-worktree-path allow every other write-enabled
+  # job class gets below, which is completely unchanged by this addition.
+  local hw
+  hw="$(printf '%s' "$manifest" | jq -r '.handoffs_write // empty' 2>/dev/null)"
+  if [ -n "$hw" ]; then
+    local abs wt_abs rel
+    case "$path" in
+      /*) abs="$path" ;;
+      *) abs="$wt/$path" ;;
+    esac
+    abs="$(_cp_lexical_abspath "$abs")"
+    wt_abs="$(_cp_lexical_abspath "$wt")"
+    rel="${abs#"$wt_abs"/}"
+    if [ "$rel" = ".handoffs/$hw" ]; then
+      printf 'allow'
+    else
+      printf 'escalate:this task'"'"'s manifest restricts its write tool to .handoffs/%s only' "$hw"
+    fi
+    return 0
+  fi
+  printf 'allow'
   return 0
 }
 
@@ -3834,12 +3860,12 @@ _cp_mask_script_data() {
     }'
 }
 
-classify_command() {                    # <panel/command text> [worktree]
+classify_command() {                    # <panel/command text> [worktree] [manifest]
   if [ "$#" -lt 1 ]; then
     printf 'command-policy: classify_command requires a <command> argument\n' >&2
     return 2
   fi
-  local raw="$1" wt="${2:-}" norm
+  local raw="$1" wt="${2:-}" cp_manifest="${3:-}" norm
   # #190 (pre-existing on main; folded into #187/PR-189's security-review
   # fix round): a classified text carrying more than one literal
   # "Allow tool:" occurrence cannot be trusted AT ALL, regardless of tool.
@@ -3865,7 +3891,7 @@ classify_command() {                    # <panel/command text> [worktree]
       return 0
     fi
     local _cp_wv
-    _cp_wv="$(_cp_write_menu_verdict "$raw" "$wt" 2>/dev/null)"
+    _cp_wv="$(_cp_write_menu_verdict "$raw" "$wt" "$cp_manifest" 2>/dev/null)"
     case "$_cp_wv" in
       allow)
         : > "$(_cp_reason_file)"

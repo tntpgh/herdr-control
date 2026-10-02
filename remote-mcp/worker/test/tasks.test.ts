@@ -380,6 +380,92 @@ describe("cancel_task / resume_task", () => {
     const childRow = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(childId));
     expect(childRow?.state).toBe("cancelled");
   });
+
+  it("a cancel race on a resume that then expires unacked resolves to cancelled, not stuck forever (N2)", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody()));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_n2", local_run_id: "run_n2", branch: "remote/n2",
+      pane_id: "w1:term_n2", agent_id: "term_n2", capability_probe: {} }] }));
+    await signedSync(syncBody({ snapshot: snapshot({ task_config: TASK_CONFIG,
+      tasks: [...snapshot().tasks, taskRow("task_n2", remoteTaskId, { closure_reason: "no-follow-on" })] }) }));
+
+    const resumed = await callTool<ResumeTaskResult>(tok, "resume_task", { task_id: remoteTaskId });
+    const childId = resumed.data.task_id;
+    // Lease the resume command (delivering, not yet acked).
+    await syncJson(await signedSync(taskConfigBody()));
+
+    // Cancel races ahead of the ack: no local_task_id for the child yet, so
+    // cancel_task can only mark the row cancelling, not cancelled.
+    const cancelled = await callTool<CancelTaskResult>(tok, "cancel_task", { task_id: childId });
+    expect(cancelled.data.state).toBe("cancelling");
+
+    // The resume is never acked and its 15-minute delivery TTL expires.
+    const future = Date.now() + 16 * 60_000;
+    const body = JSON.stringify(taskConfigBody());
+    const out = await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }));
+    expect(out.ok).toBe(true);
+    const childRow = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(childId));
+    expect(childRow?.state).toBe("cancelled");
+  });
+
+  it("a late accepted ack after the task already timed out still cancels the agent it proves was spawned (N3)", async () => {
+    const cfg = { caps: { ...CAPS, max_minutes: 1 } };
+    await signedSync(taskConfigBody(cfg));
+    const { access_token: startTok } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    const started = await callTool<StartTaskResult>(startTok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody(cfg)));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+
+    // The remote task's own deadline overruns WHILE the start command is
+    // still "delivering" (never acked yet) -- the row goes terminal
+    // (timed_out) by a path entirely independent of this command.
+    const future = Date.now() + 2 * 60_000;
+    const body = JSON.stringify(taskConfigBody(cfg));
+    await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }));
+    const beforeAck = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(beforeAck?.state).toBe("timed_out");
+
+    // The Mac's ack for the original start command now lands late, proving
+    // it really did spawn an agent -- that agent must be cancelled, not
+    // silently ignored as late_ack_ignored used to leave it.
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_n3", local_run_id: "run_n3", branch: "remote/n3",
+      pane_id: "w1:term_n3", agent_id: "term_n3", capability_probe: {} }] }));
+    const leased2 = await syncJson(await signedSync(taskConfigBody(cfg)));
+    const cancelCmd = leased2.commands.find((c) => c.remote_task_id === remoteTaskId && c.op === "cancel");
+    expect(cancelCmd?.payload).toMatchObject({ local_task_id: "task_n3" });
+  });
+
+  it("a revoked grant does not also refuse the sender's own pending cancel command (N4)", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody()));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_n4", local_run_id: "run_n4", branch: "remote/n4",
+      pane_id: "w1:term_n4", agent_id: "term_n4", capability_probe: {} }] }));
+
+    const cancelled = await callTool<CancelTaskResult>(tok, "cancel_task", { task_id: remoteTaskId });
+    expect(cancelled.isError).toBe(false);
+
+    // Revoke the sender's own grant before the cancel is ever delivered.
+    const grants = await e.OAUTH_KV.list({ prefix: "grant:tnt@teamthurber.com:" });
+    for (const k of grants.keys) await e.OAUTH_KV.delete(k.name);
+
+    const leased2 = await syncJson(await signedSync(taskConfigBody()));
+    const cancelCmd = leased2.commands.find((c) => c.remote_task_id === remoteTaskId && c.op === "cancel");
+    expect(cancelCmd?.payload).toMatchObject({ local_task_id: "task_n4" });
+  });
 });
 
 describe("follow_up", () => {
