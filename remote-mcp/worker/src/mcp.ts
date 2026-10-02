@@ -350,8 +350,9 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
     server.registerTool("start_task", {
       title: "Start a remote task",
       description: "Spawn a sandboxed worker in an allow-listed repo (list_capabilities shows which, and each mode's " +
-        "policy). mode=research: read-only, no git writes, no push, can only write .handoffs/**, runs with the " +
-        "read-only credential vault. mode=implement: commits and pushes its OWN branch, never main, never deploys. " +
+        "policy). mode=research: no edit/write tools are registered at all (read/bash/grep/glob/todo/web_search/ask " +
+        "only), no git push, runs with the read-only credential vault. mode=implement: commits and pushes its OWN " +
+        "branch, never main, never deploys. " +
         "Capped (list_capabilities shows max_concurrent/max_per_day/max_minutes); a task that outruns max_minutes is " +
         "cancelled automatically. Returns task_id immediately in state queued, before the Mac has acted on it. " +
         "Poll get_task_answer, or list_events/wait_for_events.",

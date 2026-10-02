@@ -184,15 +184,14 @@ describe("start_task: happy path through to get_task_answer", () => {
 describe("cancel_task / resume_task", () => {
   it("cancels a never-spawned task locally, with no command needed, and refuses it again (already terminal)", async () => {
     await signedSync(taskConfigBody());
-    const { access_token: startTok } = await oauthToken(["herdr:read", "herdr:task.start"]);
-    const started = await callTool<StartTaskResult>(startTok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
     const remoteTaskId = started.data.task_id;
 
-    const { access_token: cancelTok } = await oauthToken(["herdr:read", "herdr:task.cancel"]);
-    const cancelled = await callTool<CancelTaskResult>(cancelTok, "cancel_task", { task_id: remoteTaskId });
+    const cancelled = await callTool<CancelTaskResult>(tok, "cancel_task", { task_id: remoteTaskId });
     expect(cancelled.data.state).toBe("cancelled");
 
-    const again = await callTool(cancelTok, "cancel_task", { task_id: remoteTaskId });
+    const again = await callTool(tok, "cancel_task", { task_id: remoteTaskId });
     expect(again.data.error).toBe("already_terminal");
 
     // The queued start command must not reach the Mac on the next lease.
@@ -209,10 +208,23 @@ describe("cancel_task / resume_task", () => {
     expect(r.isError).toBe(true);
   });
 
-  it("queues a cancel command for an already-running task, acked to a terminal cancelled state", async () => {
+  it("refuses cancel_task and resume_task from a different client than the one that started the task (H1)", async () => {
     await signedSync(taskConfigBody());
     const { access_token: startTok } = await oauthToken(["herdr:read", "herdr:task.start"]);
     const started = await callTool<StartTaskResult>(startTok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    // A second client, same email, granted every scope -- scope alone must
+    // not be enough; this is a DIFFERENT DCR registration (requester_client).
+    const { access_token: otherTok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const cancelled = await callTool(otherTok, "cancel_task", { task_id: started.data.task_id });
+    expect(cancelled.data.error).toBe("not_your_task");
+    const resumed = await callTool(otherTok, "resume_task", { task_id: started.data.task_id });
+    expect(resumed.data.error).toBe("not_your_task");
+  });
+
+  it("queues a cancel command for an already-running task, acked to a terminal cancelled state", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
     const remoteTaskId = started.data.task_id;
     const leased = await syncJson(await signedSync(taskConfigBody()));
     const startCmd = leased.commands.find((c) => c.op === "start")!;
@@ -220,8 +232,7 @@ describe("cancel_task / resume_task", () => {
       detail: "spawned", local_task_id: "task_V2", local_run_id: "run_V2", branch: "remote/def456",
       pane_id: "w1:term_v2", agent_id: "term_v2", capability_probe: { secrets_granted: true } }] }));
 
-    const { access_token: cancelTok } = await oauthToken(["herdr:read", "herdr:task.cancel"]);
-    const cancelled = await callTool<CancelTaskResult>(cancelTok, "cancel_task", { task_id: remoteTaskId });
+    const cancelled = await callTool<CancelTaskResult>(tok, "cancel_task", { task_id: remoteTaskId });
     expect(cancelled.data.state).toBe("cancelling");
 
     const leased2 = await syncJson(await signedSync(taskConfigBody()));
@@ -230,6 +241,32 @@ describe("cancel_task / resume_task", () => {
     await signedSync(syncBody({ lease: false, command_acks: [{ command_id: cancelCmd.command_id, outcome: "accepted", detail: "cancelled (canceled)" }] }));
     const final = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
     expect(final?.state).toBe("cancelled");
+  });
+
+  it("cancelling a task whose start is still being delivered does not revive to running on a late ack (M6)", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody()));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+
+    // Cancel while the start command is still "delivering" (leased, not yet
+    // acked) -- there is no local_task_id yet, so cancelTask cannot queue a
+    // real cancel command; it must mark the row cancelling, not cancelled.
+    const cancelled = await callTool<CancelTaskResult>(tok, "cancel_task", { task_id: remoteTaskId });
+    expect(cancelled.data.state).toBe("cancelling");
+
+    // The start's ack now lands (race: the Mac had already spawned it).
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_race1", local_run_id: "run_race1", branch: "remote/race1",
+      pane_id: "w1:term_race1", agent_id: "term_race1", capability_probe: {} }] }));
+    const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(row?.state).toBe("cancelling");
+
+    const leased2 = await syncJson(await signedSync(taskConfigBody()));
+    const cancelCmd = leased2.commands.find((c) => c.remote_task_id === remoteTaskId && c.op === "cancel")!;
+    expect(cancelCmd.payload).toMatchObject({ local_task_id: "task_race1" });
   });
 
   it("auto-cancels (timed_out) a task that outran max_minutes, queuing a cancel command", async () => {
@@ -259,22 +296,21 @@ describe("cancel_task / resume_task", () => {
 
   it("refuses resume_task on a non-terminal task, then on the same task once cancelled before it ever spawned", async () => {
     await signedSync(taskConfigBody());
-    const { access_token: startTok } = await oauthToken(["herdr:read", "herdr:task.start"]);
-    const started = await callTool<StartTaskResult>(startTok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
-    const { access_token: cancelTok } = await oauthToken(["herdr:read", "herdr:task.cancel"]);
-    const notTerminal = await callTool(cancelTok, "resume_task", { task_id: started.data.task_id });
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const notTerminal = await callTool(tok, "resume_task", { task_id: started.data.task_id });
     expect(notTerminal.data.error).toBe("not_terminal");
 
-    const cancelled = await callTool<CancelTaskResult>(cancelTok, "cancel_task", { task_id: started.data.task_id });
+    const cancelled = await callTool<CancelTaskResult>(tok, "cancel_task", { task_id: started.data.task_id });
     expect(cancelled.data.state).toBe("cancelled");
-    const neverStarted = await callTool(cancelTok, "resume_task", { task_id: started.data.task_id });
+    const neverStarted = await callTool(tok, "resume_task", { task_id: started.data.task_id });
     expect(neverStarted.data.error).toBe("never_started");
   });
 
   it("resumes a terminal, previously-spawned task into a brand new task_id linked via parent_task_id", async () => {
     await signedSync(taskConfigBody());
-    const { access_token: startTok } = await oauthToken(["herdr:read", "herdr:task.start"]);
-    const started = await callTool<StartTaskResult>(startTok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
     const remoteTaskId = started.data.task_id;
     const leased = await syncJson(await signedSync(taskConfigBody()));
     const startCmd = leased.commands.find((c) => c.op === "start")!;
@@ -286,14 +322,63 @@ describe("cancel_task / resume_task", () => {
     const beforeResume = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
     expect(beforeResume?.state).toBe("finished");
 
-    const { access_token: cancelTok } = await oauthToken(["herdr:read", "herdr:task.cancel"]);
-    const resumed = await callTool<ResumeTaskResult>(cancelTok, "resume_task", { task_id: remoteTaskId, text: "one more thing" });
+    const resumed = await callTool<ResumeTaskResult>(tok, "resume_task", { task_id: remoteTaskId, text: "one more thing" });
     expect(resumed.isError).toBe(false);
     expect(resumed.data.parent_task_id).toBe(remoteTaskId);
     expect(resumed.data.task_id).not.toBe(remoteTaskId);
     const leased2 = await syncJson(await signedSync(taskConfigBody()));
     const resumeCmd = leased2.commands.find((c) => c.op === "resume" && c.remote_task_id === resumed.data.task_id);
     expect(resumeCmd?.payload).toMatchObject({ local_task_id: "task_V4", branch: "remote/t4", repo: "knowledge-base" });
+  });
+
+  it("counts resume_task against max_per_day, refusing once the cap is hit (M1)", async () => {
+    const cfg = { caps: { ...CAPS, max_per_day: 1 } };
+    await signedSync(taskConfigBody(cfg));
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody(cfg)));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_cap1", local_run_id: "run_cap1", branch: "remote/cap1",
+      pane_id: "w1:term_cap1", agent_id: "term_cap1", capability_probe: {} }] }));
+    await signedSync(syncBody({ snapshot: snapshot({ task_config: { ...TASK_CONFIG, ...cfg },
+      tasks: [...snapshot().tasks, taskRow("task_cap1", remoteTaskId, { closure_reason: "no-follow-on" })] }) }));
+
+    // A plain second start_task is already refused by the existing cap.
+    const secondStart = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "y" });
+    expect(secondStart.data.error).toBe("too_many_today");
+
+    // resume_task must not be a free pass around the same cap.
+    const resumed = await callTool(tok, "resume_task", { task_id: remoteTaskId, text: "again" });
+    expect(resumed.data.error).toBe("too_many_today");
+  });
+
+  it("a revoked grant also cancels a queued resume command, not just a queued start (M2)", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody()));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_rev1", local_run_id: "run_rev1", branch: "remote/rev1",
+      pane_id: "w1:term_rev1", agent_id: "term_rev1", capability_probe: {} }] }));
+    await signedSync(syncBody({ snapshot: snapshot({ task_config: TASK_CONFIG,
+      tasks: [...snapshot().tasks, taskRow("task_rev1", remoteTaskId, { closure_reason: "no-follow-on" })] }) }));
+
+    const resumed = await callTool<ResumeTaskResult>(tok, "resume_task", { task_id: remoteTaskId });
+    expect(resumed.isError).toBe(false);
+    const childId = resumed.data.task_id;
+
+    const grants = await e.OAUTH_KV.list({ prefix: "grant:tnt@teamthurber.com:" });
+    expect(grants.keys.length).toBeGreaterThan(0);
+    for (const k of grants.keys) await e.OAUTH_KV.delete(k.name);
+
+    const leased2 = await syncJson(await signedSync(taskConfigBody()));
+    expect(leased2.commands.find((c) => c.remote_task_id === childId)).toBeUndefined();
+    const childRow = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(childId));
+    expect(childRow?.state).toBe("cancelled");
   });
 });
 

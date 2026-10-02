@@ -25,6 +25,8 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)/..
 # shellcheck source=lib/run-registry.sh
 . "$HERE/lib/run-registry.sh"
+# shellcheck source=lib/pane-guard.sh
+. "$HERE/lib/pane-guard.sh"
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
@@ -51,8 +53,19 @@ case "$cmd" in
     set_task_state "$run_id" "$task_id" cancelled "$reason" || exit 1
     pane=$(printf '%s' "$row" | jq -r '.pane_id // empty')
     if [ -n "$pane" ]; then
-      [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
-      herdr pane close "$pane" >/dev/null 2>&1 || true
+      # M4: herdr reuses pane ids once a pane closes. If this task's own
+      # pane died while the row stayed non-terminal, herdr may already have
+      # handed that id to an unrelated worker -- closing by bare pane_id
+      # would close THEIR pane, not this cancelled task's. Same rule
+      # close-done-workers.sh --pane uses: only close when the currently
+      # live occupant's terminal_id still matches what this row registered
+      # (or the pane reports no live occupant at all, i.e. already gone).
+      registered_birth=$(printf '%s' "$row" | jq -r '.pane_birth // empty')
+      live_birth="$(pane_birth_now "$pane")"
+      if [ -z "$live_birth" ] || [ "$live_birth" = "$registered_birth" ]; then
+        [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
+        herdr pane close "$pane" >/dev/null 2>&1 || true
+      fi
     fi
     ;;
   *)

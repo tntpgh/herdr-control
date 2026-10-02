@@ -80,12 +80,13 @@ Tasks were off for the first connection too. Turning them on, in order:
 3. a fresh consent that ticks `herdr:task.start` and/or `herdr:task.implement`
    and `herdr:task.cancel` deliberately (never pre-ticked).
 
-Turning tasks off: `"false"` + redeploy (every queued start/cancel/resume
-command is cancelled on the next sync; a task already running on the Mac is
-NOT killed by this alone — see kill switches below), and
-`./install.sh --apply --remote-mcp` (Mac switch off; the next sweep force-
-cancels and closes anything still running, same as a task that outran
-`max_minutes`).
+Turning tasks off: `"false"` + redeploy (every queued start/resume command is
+cancelled on the next sync, a queued `cancel` still goes through, and a task
+already running on the Mac is NOT killed by this alone — see kill switches
+below), and `./install.sh --apply --remote-mcp` (Mac switch off: the Mac
+refuses every future leased start/resume, but a task already running keeps
+running until its own deadline backstop force-cancels it, same as a task
+that outran `max_minutes`).
 
 Review finding M1 (a permission menu raised during `send-to-agent.sh`'s ~1 s
 typing check received the typed text) is fixed: the prompt is re-checked as
@@ -198,9 +199,10 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
 4. `objective` (and a `resume_task` follow-up `text`) is sanitized the same
    way a message is (NFKC, invisible/format characters to spaces, every
    bracket shape to `(`/`)`, `@` to fullwidth `＠`) before it is ever stored —
-   it keeps its line structure (unlike a message, it is not collapsed to one
-   line) because it is embedded as a fenced UNTRUSTED block in the spawned
-   worker's own SPEC.md, never typed into a terminal composer.
+   including collapsing to one line, the same as a message, since
+   invisible/format characters are `\p{C}`, which includes newlines. It is
+   embedded as a fenced UNTRUSTED block in the spawned worker's own
+   SPEC.md, never typed into a terminal composer.
 5. Modes (`lib/task-manifest.sh`): **research** — git `none`, writes only
    `.handoffs/**`, the read-only credential vault, must run end to end with
    no approval escalation. **implement** — git `push-own-branch` only (never

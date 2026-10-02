@@ -131,7 +131,8 @@ class Snapshot(unittest.TestCase):
         res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
         self.assertEqual([r["task_id"] for r in res], ["task_A"])
         self.assertIn("[REDACTED:github-token]", res[0]["text"])
-        again = pub.changed_results(self.snap, self.local, {"task_A": {"sha256": res[0]["sha256"], "sent_at": NOW.timestamp()}},
+        again = pub.changed_results(self.snap, self.local,
+                                    {"task_A:.handoffs/PROOF.md": {"sha256": res[0]["sha256"], "sent_at": NOW.timestamp()}},
                                     NOW.timestamp())
         self.assertEqual(again, [])
 

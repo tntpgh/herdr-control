@@ -65,7 +65,7 @@ def registry_row(task_id: str) -> dict | None:
 
 print("== start_task: real register_task() + real registry-bridge.sh set-remote-id/set-deadline ==")
 out = tsk.process_command({
-    "command_id": "cmd_1", "op": "start", "remote_task_id": "rtask_e2e_1",
+    "command_id": "cmd_1", "op": "start", "remote_task_id": "rtask_20261002T000001Z_e2e00001",
     "payload": {"repo": "knowledge-base", "mode": "research",
                 "objective": "find the most recent tl;dv meeting in the KB and summarise it"},
 })
@@ -75,7 +75,7 @@ row = registry_row(task_id) if task_id else None
 check("registry row exists for real (schema v7, register_task())", row is not None)
 if row:
     check("remote_task_id round-tripped through real registry-bridge.sh set-remote-id",
-          row.get("remote_task_id") == "rtask_e2e_1", row.get("remote_task_id"))
+          row.get("remote_task_id") == "rtask_20261002T000001Z_e2e00001", row.get("remote_task_id"))
     check("deadline_at set by real registry-bridge.sh set-deadline", bool(row.get("deadline_at")))
     check("state is 'starting' immediately after register_task()", row.get("state") == "starting")
 
@@ -99,13 +99,13 @@ if wt:
 
 print("== a second task: real registry-bridge.sh cancel ==")
 out2 = tsk.process_command({
-    "command_id": "cmd_2", "op": "start", "remote_task_id": "rtask_e2e_2",
+    "command_id": "cmd_2", "op": "start", "remote_task_id": "rtask_20261002T000002Z_e2e00002",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "y"},
 })
 check("second start accepted", out2.get("outcome") == "accepted", json.dumps(out2))
 task_id2 = out2.get("local_task_id", "")
 cout = tsk.process_command({
-    "command_id": "cmd_3", "op": "cancel", "remote_task_id": "rtask_e2e_2",
+    "command_id": "cmd_3", "op": "cancel", "remote_task_id": "rtask_20261002T000002Z_e2e00002",
     "payload": {"local_task_id": task_id2, "reason": "canceled"},
 })
 check("cancel accepted", cout.get("outcome") == "accepted", json.dumps(cout))

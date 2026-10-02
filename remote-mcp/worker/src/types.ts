@@ -98,9 +98,9 @@ export interface TaskRow {
   // this task (remote-mcp/tasks.py); empty/null for every task not started
   // remotely. verified/verify_detail are the Mac's own check of the client's
   // done condition against a FINISHED task -- never re-derived here.
-  remote_task_id: string | null;
-  verified: boolean | null;
-  verify_detail: string | null;
+  remote_task_id?: string | null;
+  verified?: boolean | null;
+  verify_detail?: string | null;
 }
 
 export interface BlockerRow {
@@ -138,8 +138,9 @@ export interface Snapshot {
   blockers: BlockerRow[];
   // null until the Mac has synced at least once with HERDR_MCP_TASKS set;
   // absent entirely means this deployment predates the task config field
-  // (an older publisher.py), which the Worker treats the same as null.
-  task_config: TaskConfig | null;
+  // (an older publisher.py), which the Worker now actually treats the same
+  // as null (both the zod schema and this type mark it optional).
+  task_config?: TaskConfig | null;
 }
 
 export interface SyncBody {
@@ -151,7 +152,7 @@ export interface SyncBody {
   // separate array because the two queues are independent and a command
   // outcome carries fields (local_task_id, branch, pane_id, a capability
   // probe) a message delivery ack never does.
-  command_acks: CommandAck[];
+  command_acks?: CommandAck[];
   audit_cursor: number;
   // false on the publisher's ack-only follow-up sync, whose outbox it never reads:
   // leasing there would mark messages "delivering" that nobody is delivering.

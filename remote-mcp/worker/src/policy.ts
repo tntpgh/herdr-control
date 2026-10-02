@@ -142,13 +142,15 @@ export function sanitizeMessage(text: string): { ok: true; text: string } | { ok
 
 // start_task's objective is embedded as a fenced UNTRUSTED block in the
 // spawned worker's own SPEC.md (remote-mcp/tasks.py), not typed into a
-// terminal composer, so it keeps its line structure -- unlike sanitizeMessage
-// it never collapses to one line. The same defusing applies regardless:
-// invisible/format characters hidden, every bracket shape neutralised (so
-// the objective cannot forge SPEC.md's own "## UNTRUSTED" fencing), and
-// "@path" defused (omp/Claude Code would otherwise expand it into that
-// file's contents with no tool call and no approval -- round-3 review H1,
-// the same hazard sanitizeMessage exists for).
+// terminal composer -- but INVISIBLE (below) is \p{C}, which includes \n,
+// so this collapses to one line exactly like sanitizeMessage despite the
+// now-dead split/join step that follows it (kept harmless rather than
+// removed, since a one-line input makes it a no-op either way). The same
+// defusing applies regardless: invisible/format characters hidden, every
+// bracket shape neutralised (so the objective cannot forge SPEC.md's own
+// "## UNTRUSTED" fencing), and "@path" defused (omp/Claude Code would
+// otherwise expand it into that file's contents with no tool call and no
+// approval -- round-3 review H1, the same hazard sanitizeMessage exists for).
 export const MAX_OBJECTIVE_CHARS = 4000;
 
 export function sanitizeObjective(text: string): { ok: true; text: string } | { ok: false; reason: string } {

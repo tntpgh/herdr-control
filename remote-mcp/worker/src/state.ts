@@ -29,7 +29,7 @@ const SyncSchema = z.object({
       task_id: str, run_id: str, label: str, project: str, repo: str, branch: str, state: str,
       stored_state: nstr, state_source: nstr, created_at: str, updated_at: str, completed_at: nstr,
       closure_reason: nstr, closure_proof: nstr, pane_id: nstr, agent_id: nstr, agent_live: z.boolean(), has_result: z.boolean(),
-      remote_task_id: nstr, verified: z.boolean().nullable(), verify_detail: nstr,
+      remote_task_id: nstr.optional(), verified: z.boolean().nullable().optional(), verify_detail: nstr.optional(),
     })).max(2000),
     blockers: z.array(z.object({
       task_id: nstr, label: nstr, pane_id: nstr, agent_id: nstr, kind: str, tool: nstr, summary: nstr, since: nstr,
@@ -42,7 +42,7 @@ const SyncSchema = z.object({
         implement: z.object({ job_class: str, secrets: z.enum(["grant", "default"]), git: z.enum(["none", "commit-only", "push-own-branch"]), writes: z.array(str).max(50), net_read: z.array(str).max(50) }),
       }),
       caps: z.object({ max_concurrent: z.number().int().min(1).max(100), max_per_day: z.number().int().min(1).max(1000), max_minutes: z.number().int().min(1).max(1440) }),
-    }).nullable(),
+    }).nullable().optional(),
   }),
   results: z.array(z.object({
     task_id: str, source: str, text: z.string().max(70_000), sha256: str, source_mtime: nstr, truncated_at_source: z.boolean(),
@@ -54,7 +54,7 @@ const SyncSchema = z.object({
     command_id: str, outcome: z.enum(["accepted", "refused", "failed"]), detail: str,
     local_task_id: str.optional(), local_run_id: str.optional(), branch: str.optional(),
     pane_id: str.optional(), agent_id: str.optional(), capability_probe: z.record(z.string(), z.boolean()).optional(),
-  })).max(200),
+  })).max(200).optional(),
   audit_cursor: z.number().int().min(0),
   lease: z.boolean(),
 });
@@ -477,28 +477,44 @@ export class HerdrState extends DurableObject<Env> {
       return { ok: false, reason };
     };
     if (!scopes.includes(SCOPE_TASK_CANCEL)) return refuse(`missing_scope ${SCOPE_TASK_CANCEL}`);
-    const row = this.sql.exec<{ state: string; local_task_id: string }>(
-      `SELECT state, local_task_id FROM remote_tasks WHERE remote_task_id=?`, remoteTaskId).toArray()[0];
+    const row = this.sql.exec<{ state: string; local_task_id: string; requester_email: string; requester_client: string }>(
+      `SELECT state, local_task_id, requester_email, requester_client FROM remote_tasks WHERE remote_task_id=?`, remoteTaskId).toArray()[0];
     if (!row) return refuse("not_found");
+    // Consent text says "a task this connection started" -- the only
+    // exception SPEC makes is the Mac-driven timeout cancel, which never
+    // goes through this tool.
+    if (row.requester_email !== caller.email || row.requester_client !== caller.client_id) return refuse("not_your_task");
     if (REMOTE_TERMINAL[row.state]) return refuse(`already_terminal (${row.state})`);
-    if (!row.local_task_id) {
-      // Never actually spawned: purely local. Also retire the queued start
-      // command so a lease that is in flight right now cannot still hand it
-      // to the Mac after this decision was made.
+    if (row.state === "cancelling") return refuse("already_cancelling");
+    const pendingStart = this.sql.exec<{ command_id: string }>(
+      `SELECT command_id FROM commands WHERE remote_task_id=? AND op IN ('start','resume') AND status='queued'`,
+      remoteTaskId).toArray()[0];
+    if (!row.local_task_id && pendingStart) {
+      // Still sitting in the Worker's queue, never leased to the Mac: safe
+      // to cancel immediately and retire that command so a lease in flight
+      // right now cannot still hand it over after this decision was made.
       this.sql.exec(`UPDATE remote_tasks SET state='cancelled', updated_at=? WHERE remote_task_id=?`, nowMs, remoteTaskId);
       this.sql.exec(`UPDATE commands SET status='done', outcome='refused', detail='cancelled before it was spawned', updated_at=?
-        WHERE remote_task_id=? AND op='start' AND status='queued'`, nowMs, remoteTaskId);
+        WHERE command_id=?`, nowMs, pendingStart.command_id);
       this.recordTaskEvent(nowMs, remoteTaskId, "cancelled", { by: caller.email });
       this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "cancel_task", target: remoteTaskId,
         decision: "allowed", reason: "", message_id: "", detail: "cancelled before spawn" });
       return { ok: true, state: "cancelled" };
     }
-    this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
-      `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", remoteTaskId, JSON.stringify({ local_task_id: row.local_task_id }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+    // Either already spawned (local_task_id known), or its start/resume
+    // command is already leased/delivering and the Mac's ack hasn't arrived
+    // yet -- either way this cannot be declared cancelled outright (M6): if
+    // the Mac's ack later reports accepted, the sync handler queues the real
+    // cancel itself once it finally learns local_task_id, instead of
+    // reviving this row to running.
+    if (row.local_task_id) {
+      this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
+        `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", remoteTaskId, JSON.stringify({ local_task_id: row.local_task_id }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+    }
     this.sql.exec(`UPDATE remote_tasks SET state='cancelling', updated_at=? WHERE remote_task_id=?`, nowMs, remoteTaskId);
     this.recordTaskEvent(nowMs, remoteTaskId, "cancel_requested", { by: caller.email });
     this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "cancel_task", target: remoteTaskId,
-      decision: "allowed", reason: "", message_id: "", detail: "cancel queued for the Mac" });
+      decision: "allowed", reason: "", message_id: "", detail: row.local_task_id ? "cancel queued for the Mac" : "cancel queued; its start is still in flight" });
     return { ok: true, state: "cancelling" };
   }
 
@@ -510,19 +526,32 @@ export class HerdrState extends DurableObject<Env> {
     };
     if (!scopes.includes(SCOPE_TASK_CANCEL)) return refuse(`missing_scope ${SCOPE_TASK_CANCEL}`);
     if (this.env.TASKS_ENABLED !== "true") return refuse("tasks_disabled");
-    const row = this.sql.exec<{ state: string; mode: string; repo: string; local_task_id: string; local_run_id: string; branch: string; objective: string }>(
-      `SELECT state, mode, repo, local_task_id, local_run_id, branch, objective FROM remote_tasks WHERE remote_task_id=?`, remoteTaskId).toArray()[0];
+    const row = this.sql.exec<{ state: string; mode: string; repo: string; local_task_id: string; local_run_id: string;
+      branch: string; objective: string; requester_email: string; requester_client: string }>(
+      `SELECT state, mode, repo, local_task_id, local_run_id, branch, objective, requester_email, requester_client
+       FROM remote_tasks WHERE remote_task_id=?`, remoteTaskId).toArray()[0];
     if (!row) return refuse("not_found");
+    // H1 GAP #1: resuming another client's task must not be possible, and
+    // must not fall back to implement mode for a row this client never
+    // consented to -- refuse before ever looking at mode or state.
+    if (row.requester_email !== caller.email || row.requester_client !== caller.client_id) return refuse("not_your_task");
     if (!REMOTE_TERMINAL[row.state]) return refuse(`not_terminal (${row.state})`);
     if (!row.local_task_id) return refuse("never_started");
+    const neededScope = row.mode === "research" ? SCOPE_TASK_START : row.mode === "implement" ? SCOPE_TASK_IMPLEMENT : null;
+    if (!neededScope) return refuse(`bad_mode (${row.mode})`);
+    if (!scopes.includes(neededScope)) return refuse(`missing_scope ${neededScope}`);
     const { snapshot, connection: conn } = this.view(nowMs);
     const cfg = snapshot?.task_config ?? null;
     if (!cfg || !cfg.mac_enabled) return refuse("tasks_disabled_on_mac");
     if (conn.state === "disconnected" || conn.state === "never_connected") return refuse(`not_connected (${conn.state})`);
+    if (!cfg.repos.includes(row.repo)) return refuse(`repo_not_allowed (${row.repo})`);
     const caps = cfg.caps;
     const concurrent = this.sql.exec<{ n: number }>(
       `SELECT COUNT(*) AS n FROM remote_tasks WHERE state NOT IN ('finished','verified','failed','cancelled','lost','timed_out')`).one().n;
     if (concurrent >= caps.max_concurrent) return refuse(`too_many_concurrent (max ${caps.max_concurrent})`);
+    const today = this.sql.exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM remote_tasks WHERE created_at > ?`, nowMs - 86_400_000).one().n;
+    if (today >= caps.max_per_day) return refuse(`too_many_today (max ${caps.max_per_day})`);
     let text = "";
     if (rawText) {
       const cleaned = sanitizeObjective(rawText);
@@ -536,7 +565,7 @@ export class HerdrState extends DurableObject<Env> {
       newId, caller.email, caller.client_id, caller.client_name.slice(0, 80), row.mode, row.repo, row.objective, nowMs, nowMs, remoteTaskId);
     this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
       `cmd_${crypto.randomUUID().slice(0, 12)}`, "resume", newId,
-      JSON.stringify({ local_task_id: row.local_task_id, local_run_id: row.local_run_id, branch: row.branch, repo: row.repo, text }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+      JSON.stringify({ local_task_id: row.local_task_id, local_run_id: row.local_run_id, branch: row.branch, repo: row.repo, mode: row.mode, text }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
     this.recordTaskEvent(nowMs, newId, "task_started", { resumed_from: remoteTaskId, requester: caller.email });
     this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "resume_task", target: remoteTaskId,
       decision: "queued", reason: "", message_id: "", detail: `remote_task_id=${newId}` });
@@ -567,17 +596,17 @@ export class HerdrState extends DurableObject<Env> {
     };
   }
 
-  // Every sender with a QUEUED start command that could still be leased --
-  // the Worker re-checks the ORIGINAL caller's grant before handing a start
-  // to the Mac, same reasoning as pendingSenders() for messages (SPEC:
-  // revoking a connection "must stop that connection's tasks from being
-  // started"). Tagged with the scope that mode needed, since research and
-  // implement are different scopes.
+  // Every sender with a QUEUED start OR resume command that could still be
+  // leased -- the Worker re-checks the ORIGINAL caller's grant before
+  // handing either to the Mac, same reasoning as pendingSenders() for
+  // messages (SPEC: revoking a connection "must stop that connection's
+  // tasks from being started"). Tagged with the scope that mode needed,
+  // since research and implement are different scopes.
   pendingCommandSenders(nowMs: number): ScopedSender[] {
     return this.sql.exec<{ actor: string; client_id: string; mode: string }>(
       `SELECT DISTINCT rt.requester_email AS actor, rt.requester_client AS client_id, rt.mode AS mode
        FROM remote_tasks rt JOIN commands c ON c.remote_task_id = rt.remote_task_id
-       WHERE c.op='start' AND c.status='queued' AND c.expires_at > ?`, nowMs).toArray()
+       WHERE c.op IN ('start','resume') AND c.status='queued' AND c.expires_at > ?`, nowMs).toArray()
       .map((r) => ({ actor: r.actor, client_id: r.client_id, scope: r.mode === "research" ? SCOPE_TASK_START : SCOPE_TASK_IMPLEMENT }));
   }
 
@@ -697,7 +726,7 @@ export class HerdrState extends DurableObject<Env> {
     // start_task/cancel_task/resume_task's own acks: the Mac tells us what a
     // leased command actually did (spawned / refused / failed), which is how
     // a remote_tasks row first learns its local_task_id and pane.
-    for (const a of body.command_acks) {
+    for (const a of body.command_acks ?? []) {
       const c = this.sql.exec<{ status: string; op: CommandOp; remote_task_id: string }>(
         `SELECT status, op, remote_task_id FROM commands WHERE command_id=?`, a.command_id).toArray()[0];
       if (!c || c.status !== "delivering") continue;
@@ -706,12 +735,36 @@ export class HerdrState extends DurableObject<Env> {
       this.audit(nowMs, { ...sys, target: c.remote_task_id, decision: a.outcome === "accepted" ? "allowed" : "refused_at_delivery",
         reason: a.detail, message_id: "", detail: c.op });
       if (a.outcome === "accepted" && (c.op === "start" || c.op === "resume")) {
-        this.sql.exec(`UPDATE remote_tasks SET local_task_id=?, local_run_id=?, branch=?, pane_id=?, agent_id=?,
-            state='running', capability_probe=?, updated_at=? WHERE remote_task_id=?`,
-          a.local_task_id ?? "", a.local_run_id ?? "", a.branch ?? "", a.pane_id ?? "", a.agent_id ?? "",
-          JSON.stringify(a.capability_probe ?? {}), nowMs, c.remote_task_id);
-        this.recordTaskEvent(nowMs, c.remote_task_id, "state_changed", { state: "running" });
-        if (c.op === "start" && a.capability_probe) this.recordTaskEvent(nowMs, c.remote_task_id, "capability_probe", a.capability_probe);
+        const cur = this.sql.exec<{ state: string }>(`SELECT state FROM remote_tasks WHERE remote_task_id=?`, c.remote_task_id).toArray()[0];
+        if (cur?.state === "cancelling") {
+          // A cancel raced ahead of this ack (M6/R4): the task DID spawn, so
+          // stamp its identity -- the Mac needs local_task_id to actually
+          // close the pane -- but never revive a cancelling row to running;
+          // queue the real cancel now that local_task_id is finally known
+          // (any cancel queued earlier, before it was known, is a no-op on
+          // the Mac and is superseded by this one).
+          this.sql.exec(`UPDATE remote_tasks SET local_task_id=?, local_run_id=?, branch=?, pane_id=?, agent_id=?,
+              capability_probe=?, updated_at=? WHERE remote_task_id=?`,
+            a.local_task_id ?? "", a.local_run_id ?? "", a.branch ?? "", a.pane_id ?? "", a.agent_id ?? "",
+            JSON.stringify(a.capability_probe ?? {}), nowMs, c.remote_task_id);
+          if (a.local_task_id) {
+            this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
+              `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", c.remote_task_id,
+              JSON.stringify({ local_task_id: a.local_task_id }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+          }
+          this.recordTaskEvent(nowMs, c.remote_task_id, "cancel_requested", { reason: "cancelled while the start was still in flight" });
+        } else if (cur && REMOTE_TERMINAL[cur.state]) {
+          // Already terminal some other way (e.g. its lease expired and was
+          // marked failed before this late ack arrived): never revive it.
+          this.recordTaskEvent(nowMs, c.remote_task_id, "late_ack_ignored", { outcome: a.outcome, already: cur.state });
+        } else {
+          this.sql.exec(`UPDATE remote_tasks SET local_task_id=?, local_run_id=?, branch=?, pane_id=?, agent_id=?,
+              state='running', capability_probe=?, updated_at=? WHERE remote_task_id=?`,
+            a.local_task_id ?? "", a.local_run_id ?? "", a.branch ?? "", a.pane_id ?? "", a.agent_id ?? "",
+            JSON.stringify(a.capability_probe ?? {}), nowMs, c.remote_task_id);
+          this.recordTaskEvent(nowMs, c.remote_task_id, "state_changed", { state: "running" });
+          if (c.op === "start" && a.capability_probe) this.recordTaskEvent(nowMs, c.remote_task_id, "capability_probe", a.capability_probe);
+        }
       } else if (a.outcome !== "accepted" && (c.op === "start" || c.op === "resume")) {
         this.sql.exec(`UPDATE remote_tasks SET state='failed', updated_at=? WHERE remote_task_id=?`, nowMs, c.remote_task_id);
         this.recordTaskEvent(nowMs, c.remote_task_id, "failed", { reason: a.detail });
@@ -751,13 +804,13 @@ export class HerdrState extends DurableObject<Env> {
       const rt = this.sql.exec<{ requester_email: string; requester_client: string }>(
         `SELECT requester_email, requester_client FROM remote_tasks WHERE remote_task_id=?`, c.remote_task_id).toArray()[0];
       if (!rt) continue;
-      const why = !tasksEnabled ? "tasks_disabled"
+      const why = (!tasksEnabled && c.op !== "cancel") ? "tasks_disabled"
         : !emailAllowed(this.env, rt.requester_email) ? "sender_not_allowed"
         : cmdRevoked.has(`${rt.requester_email}\n${rt.requester_client}`) ? "sender_grant_revoked" : null;
       if (!why) continue;
       this.sql.exec(`UPDATE commands SET status='done', outcome='refused', detail=?, updated_at=?, lease_until=0 WHERE command_id=?`,
         `cancelled before delivery: ${why}`, nowMs, c.command_id);
-      if (c.op === "start") {
+      if (c.op === "start" || c.op === "resume") {
         this.sql.exec(`UPDATE remote_tasks SET state='cancelled', updated_at=? WHERE remote_task_id=?`, nowMs, c.remote_task_id);
         this.recordTaskEvent(nowMs, c.remote_task_id, "cancelled", { reason: why });
       }

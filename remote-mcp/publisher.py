@@ -335,29 +335,36 @@ def changed_results(snapshot: dict, local: dict, cache: dict, now_s: float) -> l
     order = sorted(snapshot["tasks"], key=lambda t: t["updated_at"], reverse=True)
     for t in order:
         wt = local["worktrees"].get(t["task_id"])
-        if not wt:
+        if not wt or not worktree_ok(wt):
             continue
-        proof = wt / ".handoffs/PROOF.md"
-        if not worktree_ok(proof.parent):
-            continue
-        try:
-            raw, mtime = read_regular(proof)
-        except OSError:
-            continue
-        # Redact the whole read, THEN cut: a cut through a PEM block would
-        # strip the END marker the private-key rule needs.
-        full = redact(raw.decode("utf-8", "replace"))
-        truncated = len(raw) >= RESULT_READ_CAP or len(full) > RESULT_MAX_BYTES
-        text = full[:RESULT_MAX_BYTES]
-        digest = hashlib.sha256(text.encode()).hexdigest()
-        seen = cache.get(t["task_id"]) or {}
-        if seen.get("sha256") == digest and now_s - seen.get("sent_at", 0) < RESULT_RESEND_S:
-            continue
-        used += len(text.encode())
-        if out and used > RESULT_BUDGET_BYTES:
-            break
-        out.append({"task_id": t["task_id"], "source": ".handoffs/PROOF.md", "text": text, "sha256": digest,
-                    "source_mtime": mtime, "truncated_at_source": truncated})
+        # I2: research tasks never write PROOF.md (that's the implement-mode
+        # closure proof) -- their deliverable is ANSWER.md. Sync both, same
+        # redaction/cap/dedup, so get_task_answer.answer/latest_reply are
+        # populated for research tasks too, not only in the tests that
+        # inject these sources directly.
+        for source in (".handoffs/PROOF.md", ".handoffs/ANSWER.md"):
+            path = wt / source
+            try:
+                raw, mtime = read_regular(path)
+            except OSError:
+                continue
+            # Redact the whole read, THEN cut: a cut through a PEM block would
+            # strip the END marker the private-key rule needs.
+            full = redact(raw.decode("utf-8", "replace"))
+            truncated = len(raw) >= RESULT_READ_CAP or len(full) > RESULT_MAX_BYTES
+            text = full[:RESULT_MAX_BYTES]
+            digest = hashlib.sha256(text.encode()).hexdigest()
+            cache_key = f"{t['task_id']}:{source}"
+            seen = cache.get(cache_key) or {}
+            if seen.get("sha256") == digest and now_s - seen.get("sent_at", 0) < RESULT_RESEND_S:
+                continue
+            used += len(text.encode())
+            if out and used > RESULT_BUDGET_BYTES:
+                break
+            out.append({"task_id": t["task_id"], "source": source, "text": text, "sha256": digest,
+                        "source_mtime": mtime, "truncated_at_source": truncated})
+            if len(out) >= MAX_RESULTS_PER_SYNC:
+                break
         if len(out) >= MAX_RESULTS_PER_SYNC:
             break
     return out
@@ -490,9 +497,9 @@ def main(argv: list[str]) -> int:
         log(f"sync failed: {exc}")
         return 1
     for r in results:
-        st.setdefault("results", {})[r["task_id"]] = {"sha256": r["sha256"], "sent_at": now.timestamp()}
+        st.setdefault("results", {})[f"{r['task_id']}:{r['source']}"] = {"sha256": r["sha256"], "sent_at": now.timestamp()}
     keep = {t["task_id"] for t in snapshot["tasks"]}
-    st["results"] = {k: v for k, v in st.get("results", {}).items() if k in keep}
+    st["results"] = {k: v for k, v in st.get("results", {}).items() if k.split(":", 1)[0] in keep}
     st["pending_acks"], st["pending_command_acks"] = [], []
     append_audit(reply.get("audit") or [])
     st["audit_cursor"] = reply.get("audit_cursor", st.get("audit_cursor", 0))

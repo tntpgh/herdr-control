@@ -57,8 +57,10 @@ WT_ROOT = Path(os.environ.get("HERDR_WT_DIR", Path.home() / ".herdr/worktrees"))
 CODE_ROOT = Path(os.environ.get("HERDR_CODE_DIR", Path.home() / "Code"))
 
 # The Mac's own switch, independent of the Worker's TASKS_ENABLED (same shape
-# as publisher.py's MESSAGING_ON_MAC): unless this is "1", every leased start/
-# resume is refused and the sweep still force-cancels anything already running.
+# as publisher.py's MESSAGING_ON_MAC): unless this is "1", every leased
+# start/resume is refused. Neither this switch nor the Worker's own one
+# stops a task already running on the Mac -- only the deadline (sweep's
+# force-cancel once max_minutes is up) and an explicit cancel_task do that.
 TASKS_ON_MAC = os.environ.get("HERDR_MCP_TASKS") == "1"
 
 KB_HEALTH_URL = "https://kb.teamthurber.com/health"
@@ -75,6 +77,12 @@ SOURCE_LINK_RE = re.compile(
     r"|\bkb_(?:entity|chunk)_[\w-]+\b",
     re.IGNORECASE,
 )
+
+# I4: the Worker mints remote_task_id and it is trusted into a filesystem
+# path (briefs/<id>.md) and a branch name -- the trust root is the TLS
+# response to the HMAC-signed sync, but a format check costs nothing and
+# turns any future minting bug into a refusal instead of a path surprise.
+REMOTE_TASK_ID_RE = re.compile(r"^rtask_\d{8}T\d{6}Z_[0-9a-f]{8}$")
 
 
 def _now_iso() -> str:
@@ -251,14 +259,21 @@ def process_commands(commands: list[dict]) -> list[dict]:
 
 
 def process_command(cmd: dict) -> dict:
-    op = cmd.get("op")
-    if op == "start":
-        return _start(cmd)
-    if op == "cancel":
-        return _cancel(cmd)
-    if op == "resume":
-        return _resume(cmd)
-    return {"command_id": cmd.get("command_id", ""), "outcome": "failed", "detail": f"unknown op {op!r}"}
+    cid, op = cmd.get("command_id", ""), cmd.get("op")
+    try:
+        if op == "start":
+            return _start(cmd)
+        if op == "cancel":
+            return _cancel(cmd)
+        if op == "resume":
+            return _resume(cmd)
+        return {"command_id": cid, "outcome": "failed", "detail": f"unknown op {op!r}"}
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        # M7: a slow tab/composer boot must never crash the publisher's
+        # whole tick -- that would also drop this command from `processed`,
+        # so the Worker re-leases it every 90s for up to its 15-minute TTL
+        # while this ack (which would have told it to stop) never lands.
+        return {"command_id": cid, "outcome": "failed", "detail": f"{op} crashed or did not finish in time: {exc}"[:300]}
 
 
 def _spawn(root: Path, branch: str, mcfg: dict, brief: Path) -> subprocess.CompletedProcess:
@@ -285,6 +300,8 @@ def _start(cmd: dict) -> dict:
 
     if not TASKS_ON_MAC:
         return refuse("task lifecycle is turned off on the Mac (HERDR_MCP_TASKS)")
+    if not REMOTE_TASK_ID_RE.fullmatch(remote_id):
+        return refuse(f"remote_task_id {remote_id!r} has an unexpected shape")
     a = load_allowlist()
     if repo not in a["repos"]:
         return refuse(f"repo {repo!r} is not allow-listed")
@@ -301,23 +318,36 @@ def _start(cmd: dict) -> dict:
         return refuse(f"too_many_today on the Mac (max {caps['max_per_day']}/day)")
 
     branch = f"remote/{remote_id.rsplit('_', 1)[-1]}"
-    brief = _write_brief(mode, mcfg, objective, remote_id)
-    proc = _spawn(root, branch, mcfg, brief)
-    if proc.returncode != 0:
-        return {"command_id": cid, "outcome": "failed",
-                "detail": f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:200]}"}
     wt = WT_ROOT / root.name / branch
     identity = _read_identity(wt)
-    if not identity:
-        return {"command_id": cid, "outcome": "failed", "detail": "spawned, but identity.json was unreadable"}
-    run_id, local_task_id = identity["run_id"], identity["task_id"]
+    if identity:
+        # M7: the Worker re-leases a start it never got an ack for every 90s
+        # for up to a 15-minute TTL. A previous attempt for this exact
+        # remote_task_id may already have registered a worktree/pane (slow
+        # composer boot, not a real failure) -- adopt it instead of spawning
+        # a second tab, which would escape the Mac's own concurrency cap.
+        run_id, local_task_id = identity["run_id"], identity["task_id"]
+    else:
+        brief = _write_brief(mode, mcfg, objective, remote_id)
+        proc = _spawn(root, branch, mcfg, brief)
+        if proc.returncode != 0:
+            return {"command_id": cid, "outcome": "failed",
+                    "detail": f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:200]}"}
+        identity = _read_identity(wt)
+        if not identity:
+            return {"command_id": cid, "outcome": "failed", "detail": "spawned, but identity.json was unreadable"}
+        run_id, local_task_id = identity["run_id"], identity["task_id"]
     stamped = _bridge("set-remote-id", run_id, local_task_id, remote_id)
     if stamped.returncode != 0:
         return {"command_id": cid, "outcome": "failed",
                 "detail": "spawned, but could not stamp remote_task_id onto the registry row",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
     row = json.loads(stamped.stdout) if stamped.stdout.strip() else {}
-    _bridge("set-deadline", run_id, local_task_id, _iso_in(caps["max_minutes"] * 60))
+    deadlined = _bridge("set-deadline", run_id, local_task_id, _iso_in(caps["max_minutes"] * 60))
+    if deadlined.returncode != 0:
+        return {"command_id": cid, "outcome": "failed",
+                "detail": "spawned, but could not set the deadline that is the only backstop on a runaway task",
+                "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
     probe = _capability_probe(repo, mcfg["secrets"] == "grant")
     return {"command_id": cid, "outcome": "accepted", "detail": "spawned",
             "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch,
@@ -352,25 +382,46 @@ def _resume(cmd: dict) -> dict:
 
     if not TASKS_ON_MAC:
         return refuse("task lifecycle is turned off on the Mac (HERDR_MCP_TASKS)")
+    if not REMOTE_TASK_ID_RE.fullmatch(remote_id):
+        return refuse(f"remote_task_id {remote_id!r} has an unexpected shape")
+    a = load_allowlist()
+    # M3: resume trusts the Worker's own payload.repo/branch to rebuild the
+    # worktree path -- re-check both the same way _start does, since the
+    # allowlist comment calls this copy "actually enforced".
+    if repo not in a["repos"]:
+        return refuse(f"repo {repo!r} is not allow-listed")
+    if not re.fullmatch(r"remote/[0-9a-f]{8}", branch):
+        return refuse(f"branch {branch!r} is not a remote task branch")
     root = _find_repo_root(repo)
-    if root is None or not branch:
-        return refuse("original repo/branch is unknown or no longer checked out locally")
+    if root is None:
+        return refuse(f"repo {repo!r} has no local checkout under {CODE_ROOT}")
     wt = WT_ROOT / root.name / branch
     if not wt.is_dir():
         return refuse(f"worktree {wt} no longer exists; nothing to resume into")
-    a = load_allowlist()
     old_row = _bridge("read", old_run_id, old_local_id)
+    if old_row.returncode != 0 or not old_row.stdout.strip():
+        # H1: the parent row is gone -- pruned past HERDR_TASK_RETENTION_DAYS
+        # (14d) while the Worker still remembers the remote task for 30d, or
+        # it never existed. Never default to implement here: that silently
+        # escalates git from none to push-own-branch, with credentials
+        # granted by default, for a client that only ever consented to
+        # research. No row, no resume.
+        return refuse("original task's registry row is gone; cannot tell what mode it ran in")
     mode = "implement"
-    if old_row.returncode == 0 and old_row.stdout.strip():
-        try:
-            if json.loads(json.loads(old_row.stdout).get("manifest") or "{}").get("git") == "none":
-                mode = "research"
-        except ValueError:
-            pass
+    try:
+        if json.loads(json.loads(old_row.stdout).get("manifest") or "{}").get("git") == "none":
+            mode = "research"
+    except ValueError:
+        pass
     mcfg = a["modes"].get(mode, a["modes"]["implement"])
     caps = a["caps"]
     if _count_remote("state IN ('starting','running','blocked')") >= caps["max_concurrent"]:
         return refuse(f"too_many_concurrent on the Mac (max {caps['max_concurrent']})")
+    if _count_remote("created_at > ?", (_iso_in(-86400),)) >= caps["max_per_day"]:
+        # M1: a repeated cancel+resume (or resuming the same terminal parent
+        # while under max_concurrent) must not be a free pass around the
+        # daily cap start_task already enforces.
+        return refuse(f"too_many_today on the Mac (max {caps['max_per_day']}/day)")
 
     brief = _write_brief(mode, mcfg, "(resumed -- see the follow-up note below, if any)", remote_id, follow_up)
     proc = _spawn(root, branch, mcfg, brief)
@@ -387,7 +438,11 @@ def _resume(cmd: dict) -> dict:
                 "detail": "resumed, but could not stamp remote_task_id onto the registry row",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
     row = json.loads(stamped.stdout) if stamped.stdout.strip() else {}
-    _bridge("set-deadline", run_id, local_task_id, _iso_in(caps["max_minutes"] * 60))
+    deadlined = _bridge("set-deadline", run_id, local_task_id, _iso_in(caps["max_minutes"] * 60))
+    if deadlined.returncode != 0:
+        return {"command_id": cid, "outcome": "failed",
+                "detail": "resumed, but could not set the deadline that is the only backstop on a runaway task",
+                "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
     probe = _capability_probe(repo, mcfg["secrets"] == "grant")
     return {"command_id": cid, "outcome": "accepted", "detail": "resumed",
             "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch,
@@ -440,15 +495,17 @@ def _verify_research(wt: Path) -> tuple[bool, str]:
     return True, "ANSWER.md exists with >=1 source link"
 
 
-def _verify_implement(wt: Path, proof: str) -> tuple[bool, str]:
+def _verify_implement(wt: Path, proof: str, expected_branch: str) -> tuple[bool, str]:
     parts = proof.split()
     if len(parts) != 2:
         return False, f"closure proof {proof!r} is not '<branch> <sha>'"
     branch, sha = parts
+    if branch != expected_branch:
+        return False, f"closure proof names branch {branch!r}, not this task's own {expected_branch!r}"
     try:
-        head = subprocess.run(["git", "-C", str(wt), "rev-parse", f"refs/heads/{branch}"],
+        head = subprocess.run(["git", "-C", str(wt), "rev-parse", "--verify", "--end-of-options", f"refs/heads/{branch}"],
                                capture_output=True, text=True, timeout=10).stdout.strip()
-        remote_out = subprocess.run(["git", "-C", str(wt), "ls-remote", "origin", branch],
+        remote_out = subprocess.run(["git", "-C", str(wt), "ls-remote", "origin", "--", branch],
                                      capture_output=True, text=True, timeout=15).stdout.split()
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, f"git check failed: {exc}"
@@ -467,7 +524,7 @@ def _verify(t: dict, remote: dict) -> dict:
     elif remote["mode"] == "research":
         ok, detail = _verify_research(wt)
     else:
-        ok, detail = _verify_implement(wt, t.get("closure_proof") or "")
+        ok, detail = _verify_implement(wt, t.get("closure_proof") or "", t.get("branch") or "")
     _bridge("set-verified", run_id, task_id, "1" if ok else "0", detail[:200])
     return {"task_id": task_id, "action": "verify", "ok": ok, "detail": detail}
 

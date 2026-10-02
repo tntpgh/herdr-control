@@ -379,15 +379,18 @@ _migrate_schema_v6() {
 # exactly like closure_reason/closure_proof already are; the Worker only
 # stores and serves what is written here, never re-derives it.
 _migrate_schema_v7() {
-  local has_col
-  has_col=$(_sql "SELECT 1 FROM pragma_table_info('tasks') WHERE name='remote_task_id';" 2>/dev/null)
-  if [ -z "$has_col" ]; then
-    _sql "ALTER TABLE tasks ADD COLUMN remote_task_id TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
-    _sql "ALTER TABLE tasks ADD COLUMN deadline_at    TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
-    _sql "ALTER TABLE tasks ADD COLUMN verified       INTEGER NOT NULL DEFAULT 0;" >/dev/null 2>&1
-    _sql "ALTER TABLE tasks ADD COLUMN verify_detail  TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
-    _sql "CREATE INDEX IF NOT EXISTS tasks_by_remote_id ON tasks(remote_task_id) WHERE remote_task_id<>'';" >/dev/null 2>&1
-  fi
+  local col
+  for col in \
+    "remote_task_id TEXT NOT NULL DEFAULT ''" \
+    "deadline_at    TEXT NOT NULL DEFAULT ''" \
+    "verified       INTEGER NOT NULL DEFAULT 0" \
+    "verify_detail  TEXT NOT NULL DEFAULT ''"; do
+    local name=${col%% *}
+    if [ -z "$(_sql "SELECT 1 FROM pragma_table_info('tasks') WHERE name='$name';" 2>/dev/null)" ]; then
+      _sql "ALTER TABLE tasks ADD COLUMN $col;" >/dev/null 2>&1
+    fi
+  done
+  _sql "CREATE INDEX IF NOT EXISTS tasks_by_remote_id ON tasks(remote_task_id) WHERE remote_task_id<>'';" >/dev/null 2>&1
   _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '7');" >/dev/null 2>&1
 }
 
@@ -926,11 +929,13 @@ rebaseline_pane_birth() {
 # silently overwriting the correlation an in-flight get_task_answer/
 # cancel_task call may already be relying on.
 set_task_remote_id() {
-  local run_id="$1" task_id="$2" remote_task_id="$3"
+  local run_id="$1" task_id="$2" remote_task_id="$3" changed
   registry_init || return 1
   [ -n "$remote_task_id" ] || return 1
-  _sql "UPDATE tasks SET remote_task_id=$(_sq "$remote_task_id")
-    WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id") AND remote_task_id='';" >/dev/null 2>&1
+  changed=$(_sql "UPDATE tasks SET remote_task_id=$(_sq "$remote_task_id")
+    WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id") AND remote_task_id='';
+    SELECT changes();" 2>/dev/null)
+  [ "$changed" = "1" ]
 }
 
 # set_task_deadline <run_id> <task_id> <deadline_iso>
@@ -941,11 +946,12 @@ set_task_remote_id() {
 # tick) reads this column and calls set_task_state(...,"cancelled","canceled")
 # on whatever it finds past it.
 set_task_deadline() {
-  local run_id="$1" task_id="$2" deadline_at="$3"
+  local run_id="$1" task_id="$2" deadline_at="$3" changed
   registry_init || return 1
   [ -n "$deadline_at" ] || return 1
-  _sql "UPDATE tasks SET deadline_at=$(_sq "$deadline_at")
-    WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" >/dev/null 2>&1
+  changed=$(_sql "UPDATE tasks SET deadline_at=$(_sq "$deadline_at")
+    WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id"); SELECT changes();" 2>/dev/null)
+  [ "$changed" = "1" ]
 }
 
 # set_task_verified <run_id> <task_id> <0|1> <detail>

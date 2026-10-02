@@ -123,7 +123,7 @@ answer_strategy_for_agent() {           # <agent> -> strategy
 # GRANT and printed "[managed default]", which reads like a decision rather
 # than a miss. An unrecognised class is withheld: a job nobody classified is
 # exactly the one nobody thought about.
-KNOWN_JOB_CLASSES="plan architect review design implement debug code docs explore quick mechanical"
+KNOWN_JOB_CLASSES="plan architect review design implement debug code docs explore research quick mechanical"
 secrets_default_for_job() {  # <job-class> -> "withhold" | ""
 	case "$1" in
 		*review*|*explore*|*audit*|*scrape*|*research*|*triage*) printf 'withhold\n'; return ;;
@@ -294,7 +294,10 @@ omp_cross_family_model() {   # <from-agent> <bare-model-name> -> "<omp-model> <t
 tools_for_job() {  # <job-class> -> comma-separated --tools value, or "" for unrestricted
   case "$1" in
     implement|debug|code|docs|mechanical|quick) printf 'read,bash,edit,write,grep,glob,todo,eval,wait,ask\n' ;;
-    explore)                                    printf 'read,bash,grep,glob,todo,web_search,ask\n' ;;
+    # research is the remote-task mode whose only enforcement against
+    # writes IS this tool set -- the allowlist's `git: none` stops a
+    # pushed branch, not an edit inside the worktree (L4).
+    explore|research)                           printf 'read,bash,grep,glob,todo,web_search,ask\n' ;;
     *)                             printf '\n' ;;   # plan/architect/review/design + unrecognised: unrestricted
   esac
 }

@@ -186,6 +186,16 @@ class StartRefusals(unittest.TestCase):
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("too_many_concurrent", out["detail"])
 
+    def test_bad_remote_task_id_shape_refused(self):
+        # I4: the Mac trusts the Worker's remote_task_id into a filesystem
+        # path and a branch name -- a format check turns a minting bug into
+        # a refusal instead of a path surprise.
+        cmd = _start_cmd()
+        cmd["remote_task_id"] = "not-the-right-shape"
+        out = tsk.process_command(cmd)
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("unexpected shape", out["detail"])
+
 
 class StartAccepted(unittest.TestCase):
     def setUp(self):
@@ -258,6 +268,102 @@ class CancelCommand(unittest.TestCase):
         self.assertEqual(out["outcome"], "failed")
 
 
+class ResumeCommand(unittest.TestCase):
+    def setUp(self):
+        _reset_registry()
+        con = sqlite3.connect(REGISTRY)
+        try:
+            con.execute("ALTER TABLE tasks ADD COLUMN state TEXT NOT NULL DEFAULT 'running'")
+        except sqlite3.OperationalError:
+            pass
+        con.commit(); con.close()
+        FAKE_SPAWN_OUT.write_text("0")
+        FAKE_BRIDGE_RC.write_text("0")
+        FAKE_BRIDGE_LOG.write_text("")
+        shutil.rmtree(WT_ROOT, ignore_errors=True)
+        self.wt = WT_ROOT / "knowledge-base" / "remote/abc12345"
+        self.wt.mkdir(parents=True)
+
+    def _cmd(self, branch="remote/abc12345", repo="knowledge-base", text=""):
+        return {"command_id": "cmd_r1", "op": "resume", "remote_task_id": "rtask_20261002T000000Z_deadbeef",
+                "payload": {"local_run_id": "run_old1", "local_task_id": "task_old1",
+                            "branch": branch, "repo": repo, "text": text}}
+
+    def test_refuses_when_parent_row_is_gone(self):
+        # H1: the fallback bug -- a missing/unreadable parent row must never
+        # silently default to implement (git push + credentials granted).
+        FAKE_BRIDGE_RC.write_text("1")
+        out = tsk.process_command(self._cmd())
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("registry row is gone", out["detail"])
+
+    def test_refuses_repo_not_allowlisted(self):
+        # M3: _resume must recheck the allowlist, same as _start -- removing
+        # a repo from task-allowlist.json must stop resumes into it too.
+        out = tsk.process_command(self._cmd(repo="not-a-repo"))
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("not allow-listed", out["detail"])
+
+    def test_refuses_malformed_branch(self):
+        # M3/I4: the branch must be the Worker-minted shape, not
+        # attacker-controlled free text reaching a worktree path.
+        out = tsk.process_command(self._cmd(branch="main"))
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("not a remote task branch", out["detail"])
+
+    def test_refuses_remote_task_id_bad_shape(self):
+        cmd = self._cmd()
+        cmd["remote_task_id"] = "not-the-right-shape"
+        out = tsk.process_command(cmd)
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("unexpected shape", out["detail"])
+
+    def test_refuses_over_daily_cap(self):
+        # M1: resume must not be a free pass around max_per_day (fixture caps it at 3).
+        _reset_registry([(f"t{i}", "r", f"rt{i}", "", 0, "", "", tsk._now_iso()) for i in range(3)])
+        con = sqlite3.connect(REGISTRY)
+        # Finished, not running: this must trip the DAILY cap, not the
+        # separate concurrent cap (setUp's `state` column defaults to
+        # 'running', which would otherwise also saturate max_concurrent).
+        con.execute("UPDATE tasks SET state='finished'")
+        con.commit(); con.close()
+        out = tsk.process_command(self._cmd())
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("too_many_today", out["detail"])
+
+    def test_happy_path_resumes(self):
+        out = tsk.process_command(self._cmd(text="one more thing"))
+        self.assertEqual(out["outcome"], "accepted")
+        self.assertEqual(out["local_task_id"], "task_fake1")
+        self.assertIn("set-deadline", FAKE_BRIDGE_LOG.read_text())
+
+
+class Robustness(unittest.TestCase):
+    def setUp(self):
+        _reset_registry()
+        con = sqlite3.connect(REGISTRY)
+        try:
+            con.execute("ALTER TABLE tasks ADD COLUMN state TEXT NOT NULL DEFAULT 'running'")
+        except sqlite3.OperationalError:
+            pass
+        con.commit(); con.close()
+        FAKE_SPAWN_OUT.write_text("0")
+        FAKE_BRIDGE_RC.write_text("0")
+        shutil.rmtree(WT_ROOT, ignore_errors=True)
+        self.old_spawn = tsk.SPAWN_TASK
+
+    def tearDown(self):
+        tsk.SPAWN_TASK = self.old_spawn
+
+    def test_spawn_crash_is_a_failed_ack_not_an_uncaught_exception(self):
+        # M7: a slow/crashed composer boot must never crash the whole
+        # publisher tick -- it must come back as a failed ack instead.
+        tsk.SPAWN_TASK = str(TMP / "does-not-exist.sh")
+        out = tsk.process_command(_start_cmd())
+        self.assertEqual(out["outcome"], "failed")
+        self.assertIn("crashed", out["detail"])
+
+
 class VerifyRules(unittest.TestCase):
     def setUp(self):
         self.wt = TMP / "verify-wt"
@@ -285,9 +391,16 @@ class VerifyRules(unittest.TestCase):
         self.assertTrue(ok)
 
     def test_implement_malformed_proof(self):
-        ok, detail = tsk._verify_implement(self.wt, "not-two-tokens")
+        ok, detail = tsk._verify_implement(self.wt, "not-two-tokens", "remote/abc123")
         self.assertFalse(ok)
         self.assertIn("not '<branch> <sha>'", detail)
+
+    def test_implement_branch_mismatch_refused(self):
+        # L1: the proof names a DIFFERENT branch than this task's own --
+        # must never be accepted as evidence for this task.
+        ok, detail = tsk._verify_implement(self.wt, "remote/not-mine deadbeef", "remote/abc123")
+        self.assertFalse(ok)
+        self.assertIn("not this task's own", detail)
 
     def test_implement_real_branch_matches(self):
         origin = TMP / "origin.git"
@@ -303,9 +416,9 @@ class VerifyRules(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.wt), "push", "-q", "origin", "remote/abc123"], check=True)
         sha = subprocess.run(["git", "-C", str(self.wt), "rev-parse", "remote/abc123"],
                               capture_output=True, text=True, check=True).stdout.strip()
-        ok, detail = tsk._verify_implement(self.wt, f"remote/abc123 {sha}")
+        ok, detail = tsk._verify_implement(self.wt, f"remote/abc123 {sha}", "remote/abc123")
         self.assertTrue(ok, detail)
-        ok, _ = tsk._verify_implement(self.wt, f"remote/abc123 {'f' * 40}")
+        ok, _ = tsk._verify_implement(self.wt, f"remote/abc123 {'f' * 40}", "remote/abc123")
         self.assertFalse(ok)
 
 
