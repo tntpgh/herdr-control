@@ -31,8 +31,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import signal
 import sqlite3
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -122,6 +125,16 @@ def has_v7_task_columns(con: sqlite3.Connection) -> bool:
     must tolerate its absence rather than crash every tick."""
     cols = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
     return {"remote_task_id", "deadline_at", "verified", "verify_detail"} <= cols
+
+
+def has_agent_session_column(con: sqlite3.Connection) -> bool:
+    """Same reasoning as has_v7_task_columns: agent_session has existed
+    since schema v3, but a read-only sqlite3.connect() (publisher.py's
+    registry_rows()) never triggers lib/run-registry.sh's own migrations,
+    so a registry opened before any bash caller has run past v2 -- or a
+    test fixture's hand-rolled schema -- may still lack it."""
+    cols = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
+    return "agent_session" in cols
 
 
 def _registry_query(where: str, params: tuple) -> list[tuple]:
@@ -220,11 +233,20 @@ def _find_repo_root(repo: str) -> Path | None:
 def _capability_probe(repo: str, secrets_granted: bool) -> dict:
     probe = {"secrets_granted": secrets_granted}
     if repo == "knowledge-base":
+        # SPEC fix (Zero's review item 3): named kb_http_reachable, not
+        # kb_reachable -- this is an HTTP-level reachability check (2xx),
+        # never proof of authenticated access. There is no kb_auth_ok
+        # here: this process runs on the Mac BEFORE a worker is spawned
+        # and never holds the KB credential itself (only the spawned
+        # worker's own .env.op bootstrap does), so there is no read-only
+        # call it could make under the worker's granted identity without
+        # inventing one; list_capabilities documents the omission instead
+        # of a probe that would claim more than was actually checked.
         try:
             with urllib.request.urlopen(KB_HEALTH_URL, timeout=8) as r:  # noqa: S310 (fixed https host)
-                probe["kb_reachable"] = 200 <= r.status < 500
+                probe["kb_http_reachable"] = 200 <= r.status < 300
         except (urllib.error.URLError, OSError, TimeoutError):
-            probe["kb_reachable"] = False
+            probe["kb_http_reachable"] = False
     return probe
 
 
@@ -330,6 +352,166 @@ def _spawn(root: Path, branch: str, mcfg: dict, brief: Path) -> subprocess.Compl
     finally:
         brief.unlink(missing_ok=True)
 
+# ── independent deadline backstop (SPEC item 5: must not depend on the
+# publisher process staying alive) ──────────────────────────────────────
+HARD_STOP_GRACE_S = 90  # slack past max_minutes before this backstop fires:
+# comfortably more than one publisher tick (~15s), so the normal path
+# (sweep's own deadline check, which DOES depend on the publisher) wins
+# the race in the common case; this only ever matters when it does not.
+
+
+def _popen_detached(argv: list[str]) -> subprocess.Popen:
+    """The one seam between _schedule_hard_stop and an actual background
+    process -- a real `sleep` here is exactly what verify-tasks.py's fully
+    faked suite must never spawn, so tests monkeypatch this one function
+    (the same pattern as the module-level REGISTRY_BRIDGE/SPAWN_TASK/
+    CLOSE_DONE path swaps) instead of every call site."""
+    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def _schedule_hard_stop(run_id: str, task_id: str, remote_id: str, delay_s: int) -> int | None:
+    """A detached `sleep <delay_s>` followed by registry-bridge.sh cancel,
+    started session-leader-detached (Python's start_new_session, the
+    nohup/setsid equivalent) so it survives the publisher LaunchAgent
+    dying or being reloaded -- the one thing on the Mac that still
+    enforces the deadline when nothing else is ticking. Goes through the
+    exact same pane-birth-checked cancel sweep()'s own force_cancel uses,
+    so it is a genuine belt, not a second mechanism with different rules:
+    a no-op against an already-terminal row (set_task_state refuses the
+    transition) or a recycled pane (the birth check skips the close).
+    Returns the spawned process's pid, or None if it could not even be
+    started -- never fails the start/resume itself, since the
+    publisher's own sweep is still the primary enforcement path.
+
+    delay_s is the caller's own responsibility (R2-4, round-2 review): at
+    _start/_resume time it is max_minutes*60+grace, the same instant the
+    real deadline_at was just set to; a sweep-side RETRY must instead use
+    the time remaining until the task's ALREADY-RECORDED deadline_at, not
+    max_minutes*60+grace measured from the retry's own now -- a task
+    already 50 of its 60 allotted minutes in that loses its scheduled
+    timer to a Popen failure would otherwise get a fresh 60-minute grant
+    from the retry instead of the ~10 minutes actually left, extending
+    its real deadline instead of just re-arming the same one."""
+    delay = max(0, delay_s)  # never negative
+    script = (f"sleep {delay}; exec {shlex.quote(REGISTRY_BRIDGE)} cancel "
+              f"{shlex.quote(run_id)} {shlex.quote(task_id)} timed_out {shlex.quote(remote_id)}")
+    try:
+        proc = _popen_detached(["/bin/bash", "-c", script])
+    except OSError:
+        return None
+    return proc.pid
+
+
+def _event_count(task_id: str, event_type: str) -> int:
+    """Read-only count of events of a given type for a task -- same
+    read-only sqlite3 pattern as _registry_query, but against `events`
+    directly (keyed on task_id alone; events are not remote-scoped)."""
+    if not REGISTRY.exists():
+        return 0
+    con = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=5)
+    try:
+        row = con.execute("SELECT COUNT(*) FROM events WHERE task_id=? AND type=?",
+                           (task_id, event_type)).fetchone()
+        return row[0] if row else 0
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        con.close()
+
+
+def _event_pids(task_id: str, event_type: str) -> list[int]:
+    """Read-only: every pid recorded in events of this type for a task,
+    oldest first -- an M7 re-lease storm could have scheduled more than
+    one before the dedup check in _start/_resume existed; killing ALL of
+    them on completion, not just the latest, is what actually closes the
+    leak for an already-duplicated row."""
+    if not REGISTRY.exists():
+        return []
+    con = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=5)
+    try:
+        rows = con.execute("SELECT payload FROM events WHERE task_id=? AND type=? ORDER BY sequence",
+                            (task_id, event_type)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        con.close()
+    pids = []
+    for (payload,) in rows:
+        try:
+            pid = json.loads(payload or "{}").get("pid")
+        except ValueError:
+            pid = None
+        if isinstance(pid, int) and pid > 0:
+            pids.append(pid)
+    return pids
+
+
+def _kill_hard_stop_timer(run_id: str, task_id: str) -> None:
+    """REVIEW-213 F9: _schedule_hard_stop's detached sleep+cancel process
+    used to never be killed on a NORMAL terminal transition -- it lingered
+    until its own deadline fired. Harmless against an already-terminal row
+    (registry-bridge.sh's cancel now refuses on sight, F2) but noisy: a
+    real process sitting in `ps` for up to max_minutes+grace after its
+    task is long done, and a live pid an operator has no reason to trust
+    is still meaningful.
+
+    Best-effort, never raises: a dead pid, a pid reused by an unrelated
+    process, or no hard_stop_scheduled event at all are all silently fine
+    outcomes, never a reason to fail the caller's own (already-succeeded)
+    terminal transition. Verifies the live process's OWN command line
+    still names this run_id/task_id before signalling it -- pid reuse by
+    an unrelated process over a 60+-minute window is unlikely but not
+    impossible, and this is the one place that would matter.
+
+    Signals the PROCESS GROUP (os.killpg), not just the recorded pid:
+    _popen_detached's start_new_session=True makes that pid both the
+    bash process and its own new process group's leader, but a plain
+    os.kill(pid, SIGTERM) while bash is blocked in wait() on the
+    foreground `sleep` child is deferred until sleep itself exits --
+    bash does not act on a pending SIGTERM until its wait() syscall
+    returns, so the parent survived the full sleep every time (verified
+    empirically: tmp/test-sigterm-sleep.py, this session). killpg signals
+    sleep directly too, which has no such deferral and dies immediately,
+    which is what actually tears bash's wait() down.
+
+    Reaps the pid after signalling it (bounded os.waitpid(..., WNOHANG)
+    poll, up to ~1s): _popen_detached's Popen call makes the publisher
+    process this timer's real UNIX parent (start_new_session only
+    detaches the process GROUP/session, not parentage), so a killed
+    timer this function never waits on becomes a zombie entry the
+    long-lived publisher process accumulates one of per cancelled/
+    completed task for as long as it keeps running -- not cleaned up
+    until the publisher itself restarts. Not our child (ValueError/
+    ChildProcessError from an unrelated pid, or process reuse) is a
+    silently fine outcome, same as every other case here."""
+    for pid in _event_pids(task_id, "hard_stop_scheduled"):
+        try:
+            # -ww: unlimited width. macOS `ps` otherwise truncates `command=`
+            # to the terminal's column width even when piped (no tty) -- a
+            # real run_id/task_id/remote_id/registry-bridge.sh path is long
+            # enough to get cut before the substring check below ever sees
+            # it, which silently never matched and never killed anything.
+            out = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
+                                  capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if f"cancel {run_id} {task_id} timed_out" not in out.stdout:
+            continue
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            try:
+                reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                break  # not our child (already reaped, or pid reuse)
+            if reaped_pid == pid:
+                break
+            time.sleep(0.05)
+
 
 def _start(cmd: dict) -> dict:
     cid, remote_id, p = cmd["command_id"], cmd["remote_task_id"], cmd["payload"]
@@ -397,6 +579,30 @@ def _start(cmd: dict) -> dict:
         return {"command_id": cid, "outcome": "failed",
                 "detail": "spawned, but could not set the deadline that is the only backstop on a runaway task",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
+    # REVIEW-213 F9: identity found via the M7-adopt branch above means
+    # this may be a re-lease retry of a start command already accepted --
+    # up to ~10 of those can arrive for one slow boot. Schedule at most
+    # once per task: a second timer for the same task_id/run_id is a pure
+    # duplicate (both would fire the identical cancel), never a second
+    # independent backstop.
+    if _event_count(local_task_id, "hard_stop_scheduled") == 0:
+        hard_stop_pid = _schedule_hard_stop(run_id, local_task_id, remote_id,
+                                             caps["max_minutes"] * 60 + HARD_STOP_GRACE_S)
+        if hard_stop_pid is not None:
+            _bridge("append-event", run_id, local_task_id, "hard_stop_scheduled",
+                    json.dumps({"pid": hard_stop_pid, "max_minutes": caps["max_minutes"], "grace_s": HARD_STOP_GRACE_S}))
+        else:
+            # ZR4 (ZERO-REVIEW-213-01 item 4): a scheduling failure must
+            # never be silent -- this task now has NO independent
+            # deadline backstop until sweep()'s own retry (same tick
+            # cadence, same backoff/cap as F6) lands one. Never fails the
+            # start itself: the publisher's own sweep deadline check is
+            # still the primary enforcement path, and refusing an
+            # otherwise-good spawn over a transient Popen failure (e.g.
+            # a process-table EAGAIN) would be a worse outcome than a
+            # loud, retried gap.
+            _bridge("append-event", run_id, local_task_id, "hard_stop_unscheduled",
+                    json.dumps({"max_minutes": caps["max_minutes"]}))
     probe = _capability_probe(repo, mcfg["secrets"] == "grant")
     return {"command_id": cid, "outcome": "accepted", "detail": "spawned",
             "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch,
@@ -418,6 +624,7 @@ def _cancel(cmd: dict) -> dict:
     if rc.returncode != 0:
         return {"command_id": cid, "outcome": "failed",
                 "detail": rc.stderr.strip()[:200] or "cancel refused (already terminal?)"}
+    _kill_hard_stop_timer(row["run_id"], row["task_id"])
     return {"command_id": cid, "outcome": "accepted", "detail": f"cancelled ({reason})"}
 
 
@@ -501,6 +708,20 @@ def _resume(cmd: dict) -> dict:
         return {"command_id": cid, "outcome": "failed",
                 "detail": "resumed, but could not set the deadline that is the only backstop on a runaway task",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
+    # REVIEW-213 F9/ZR4: _resume always spawns a fresh task_id (unlike
+    # _start's M7-adopt branch), so the dedup check is a no-op today --
+    # kept for symmetry with _start so this stays correct if resume ever
+    # grows its own re-lease-adopt path. The loud-failure-on-schedule-
+    # failure half is not a no-op: see _start's identical comment.
+    if _event_count(local_task_id, "hard_stop_scheduled") == 0:
+        hard_stop_pid = _schedule_hard_stop(run_id, local_task_id, remote_id,
+                                             caps["max_minutes"] * 60 + HARD_STOP_GRACE_S)
+        if hard_stop_pid is not None:
+            _bridge("append-event", run_id, local_task_id, "hard_stop_scheduled",
+                    json.dumps({"pid": hard_stop_pid, "max_minutes": caps["max_minutes"], "grace_s": HARD_STOP_GRACE_S}))
+        else:
+            _bridge("append-event", run_id, local_task_id, "hard_stop_unscheduled",
+                    json.dumps({"max_minutes": caps["max_minutes"]}))
     probe = _capability_probe(repo, mcfg["secrets"] == "grant")
     return {"command_id": cid, "outcome": "accepted", "detail": "resumed",
             "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch,
@@ -540,6 +761,8 @@ def _auto_close(t: dict, ev: dict) -> dict:
     proc = subprocess.run(args, capture_output=True, text=True, timeout=60, cwd=str(REPO))
     held = "HOLD" in proc.stdout or "REFUSED" in proc.stdout
     ok = proc.returncode == 0 and not held
+    if ok:
+        _kill_hard_stop_timer(t["run_id"], t["task_id"])
     return {"task_id": t["task_id"], "action": "auto_close", "ok": ok, "detail": proc.stdout.strip()[-400:]}
 
 
@@ -589,8 +812,61 @@ def _verify(t: dict, remote: dict) -> dict:
 
 def _force_cancel(t: dict, reason: str) -> dict:
     proc = _bridge("cancel", t["run_id"], t["task_id"], reason)
-    return {"task_id": t["task_id"], "action": "force_cancel", "ok": proc.returncode == 0,
+    ok = proc.returncode == 0
+    if ok:
+        _kill_hard_stop_timer(t["run_id"], t["task_id"])
+    return {"task_id": t["task_id"], "action": "force_cancel", "ok": ok,
             "detail": proc.stderr.strip()[:200]}
+
+
+# ZR4 (ZERO-REVIEW-213-01 item 4): retry is correct (sweep already re-runs
+# every tick); an unbounded SILENT retry is not -- same shape as F6's
+# cancel-retry cap, so a task that can never get its own backstop
+# scheduled becomes one visible event instead of infinite quiet attempts.
+HARD_STOP_RETRY_CAP = 5
+
+
+def _ensure_hard_stop_scheduled(t: dict, remote: dict, max_minutes: int, now_ts: float) -> dict | None:
+    """ZR4: _start/_resume's own scheduling attempt may have failed
+    (Popen error) and recorded hard_stop_unscheduled instead of silently
+    doing nothing (the old behaviour) -- retry it here, every tick, same
+    as any other sweep backstop, until it lands or HARD_STOP_RETRY_CAP is
+    reached. Returns a log entry only when it actually did something
+    (scheduled, failed again, or just hit the cap); None means "already
+    has one, nothing to do" -- the overwhelmingly common case, not worth
+    logging every tick.
+
+    R2-4 (round-2 review): the retried timer's delay comes from the
+    task's own ALREADY-RECORDED deadline_at, not a fresh
+    max_minutes*60+grace window measured from THIS retry's own now -- a
+    task already 50 of its 60 allotted minutes in when a Popen failure
+    loses its original timer would otherwise get a brand new 60-minute
+    grant from the retry instead of the ~10 minutes it actually has
+    left, extending its real deadline instead of just re-arming the one
+    it already has. Falls back to max_minutes*60+grace only when
+    deadline_at itself never landed (N1's own fallback case)."""
+    run_id, task_id = t["run_id"], t["task_id"]
+    if _event_count(task_id, "hard_stop_scheduled") > 0:
+        return None
+    failures = _event_count(task_id, "hard_stop_unscheduled")
+    if failures >= HARD_STOP_RETRY_CAP:
+        if _event_count(task_id, "hard_stop_stuck") == 0:
+            _bridge("append-event", run_id, task_id, "hard_stop_stuck", json.dumps({"attempts": failures}))
+            return {"task_id": task_id, "action": "hard_stop_retry", "ok": False,
+                    "detail": f"stuck after {failures} scheduling failures"}
+        return None
+    deadline_ts = _parse_iso(remote.get("deadline_at") or "")
+    if deadline_ts is not None:
+        delay_s = max(0, int(deadline_ts - now_ts)) + HARD_STOP_GRACE_S
+    else:
+        delay_s = max_minutes * 60 + HARD_STOP_GRACE_S
+    pid = _schedule_hard_stop(run_id, task_id, remote["remote_task_id"], delay_s)
+    if pid is not None:
+        _bridge("append-event", run_id, task_id, "hard_stop_scheduled",
+                json.dumps({"pid": pid, "delay_s": delay_s, "grace_s": HARD_STOP_GRACE_S, "retried": True}))
+        return {"task_id": task_id, "action": "hard_stop_retry", "ok": True, "detail": f"pid {pid}"}
+    _bridge("append-event", run_id, task_id, "hard_stop_unscheduled", json.dumps({"max_minutes": max_minutes}))
+    return {"task_id": task_id, "action": "hard_stop_retry", "ok": False, "detail": "Popen failed"}
 
 
 def sweep(tasks_by_id: dict[str, dict], now: datetime) -> list[dict]:
@@ -600,6 +876,10 @@ def sweep(tasks_by_id: dict[str, dict], now: datetime) -> list[dict]:
     the durable record, this return value is never persisted."""
     remotes = _remote_rows(list(tasks_by_id))
     logged = []
+    try:
+        sweep_max_minutes = load_allowlist()["caps"]["max_minutes"]
+    except (OSError, ValueError, KeyError):
+        sweep_max_minutes = None
     for task_id, remote in remotes.items():
         t = tasks_by_id.get(task_id)
         if not t:
@@ -620,6 +900,10 @@ def sweep(tasks_by_id: dict[str, dict], now: datetime) -> list[dict]:
             if deadline is not None and now.timestamp() > deadline:
                 logged.append(_force_cancel(t, "timed_out"))
                 continue
+            if sweep_max_minutes is not None:
+                retry = _ensure_hard_stop_scheduled(t, remote, sweep_max_minutes, now.timestamp())
+                if retry:
+                    logged.append(retry)
             wt = Path(t["worktree"]) if t.get("worktree") else None
             ev = _pending_completion(wt) if wt and wt.is_dir() else None
             if ev:

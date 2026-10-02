@@ -144,13 +144,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   conductor_pane_birth TEXT NOT NULL DEFAULT '',
   pane_id              TEXT NOT NULL DEFAULT '',
   pane_birth           TEXT NOT NULL DEFAULT '',
-  -- herdr's own agent_session (a claude/codex session id herdr reports
-  -- natively; empty for omp today, and possibly empty briefly right after
-  -- spawn before the agent has reported in). This is the identity that
+  -- herdr's own agent_session (REVIEW-213 F3 corrected this comment: omp
+  -- reports it too, as an ABSOLUTE PATH to its own session JSONL under
+  -- ~/.omp/agent/sessions, not a bare id like claude/codex's; possibly
+  -- empty briefly right after spawn before the agent has reported in,
+  -- or for a CLI that reports nothing at all). This is the identity that
   -- SURVIVES a herdr server crash+restart, unlike pane_birth/terminal_id,
   -- which herdr reissues for every pane it re-enumerates on reconnect even
   -- though the underlying agent process never died — see
-  -- lib/reconcile.sh's corroboration check.
+  -- lib/reconcile.sh's corroboration check and remote-mcp/publisher.py's
+  -- _resolve_session_jsonl for the two different shapes this column holds.
   agent_session        TEXT NOT NULL DEFAULT '',
   repo                 TEXT NOT NULL DEFAULT '',
   worktree             TEXT NOT NULL DEFAULT '',
@@ -868,15 +871,16 @@ set_task_state() {                      # run_id task_id state [reason] [proof]
 # set_task_agent_session <run_id> <task_id> <agent_session>
 #
 # Best-effort metadata capture, deliberately NOT a lifecycle transition (no
-# event, no state check) — herdr reports agent_session natively for
-# claude/codex once the CLI has actually started, which is AFTER
-# register_task() runs (spawn-task.sh registers the task the moment the pane
-# EXISTS, before the agent inside it does). Call this once the agent is
-# confirmed up (spawn-task.sh does so right where it flips starting->running)
-# and again opportunistically from a reconcile sweep for any task still
+# event, no state check) — herdr reports agent_session natively once the
+# CLI has actually started, which is AFTER register_task() runs
+# (spawn-task.sh registers the task the moment the pane EXISTS, before
+# the agent inside it does). Call this once the agent is confirmed up
+# (spawn-task.sh does so right where it flips starting->running) and
+# again opportunistically from a reconcile sweep for any task still
 # missing one — capturing it late is still useful, since it corroborates
-# identity across the NEXT herdr restart, not this one. Empty is a legitimate,
-# permanent answer for omp today; never treat empty as a caller mistake.
+# identity across the NEXT herdr restart, not this one. Empty remains a
+# legitimate answer for a CLI herdr has no native report for; never
+# treat empty as a caller mistake.
 set_task_agent_session() {
   local run_id="$1" task_id="$2" agent_session="${3:-}"
   registry_init || return 1
@@ -1043,6 +1047,31 @@ append_event() {
 # not an append. SQLite serializes the INSERT and the changes() read on one
 # connection, so this reflects THIS call's own effect even when a concurrent
 # process's insert is the one that actually won the UNIQUE(event_id) race.
+# task_event_count <run_id> <task_id> <type> -> integer count (0 on error)
+#
+# registry-bridge.sh's cancel case (REVIEW-213 F6) uses this to count
+# consecutive cancel-attempt failures without a second table or a counter
+# column — append_event already makes every attempt a queryable fact,
+# this just answers "how many so far," and since a terminal row refuses
+# any further cancel attempt (F2's guard), every row of this type for a
+# given task IS the consecutive run: nothing resets it except success.
+task_event_count() {
+  local run_id="$1" task_id="$2" type="$3" n
+  registry_init || { printf '0\n'; return 1; }
+  n="$(_sql "SELECT COUNT(*) FROM events WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id")
+    AND type=$(_sq "$type");" 2>/dev/null)"
+  printf '%s\n' "${n:-0}"
+}
+
+# task_last_event_payload <run_id> <task_id> <type> -> payload json of the
+# most recent event of that type for this task (empty if none)
+task_last_event_payload() {
+  local run_id="$1" task_id="$2" type="$3"
+  registry_init || return 1
+  _sql "SELECT payload FROM events WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id")
+    AND type=$(_sq "$type") ORDER BY sequence DESC LIMIT 1;" 2>/dev/null
+}
+
 claim_once() {                          # event_id [run_id] [task_id] [type] [payload]
   local eid="$1" run_id="${2:-}" task_id="${3:-}" type="${4:-claim}" payload="${5:-{\}}"
   registry_init || return 1

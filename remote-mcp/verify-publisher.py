@@ -324,13 +324,129 @@ class SchemaTolerance(unittest.TestCase):
         pub.REGISTRY = self.real_registry
 
     def test_registry_rows_tolerates_a_pre_v7_registry(self):
-        births, asks, remotes = pub.registry_rows(["task_v6"])
+        births, asks, remotes, sessions = pub.registry_rows(["task_v6"])
         self.assertEqual(births, {"task_v6": "term_v6"})
         self.assertEqual(remotes, {})
+        self.assertEqual(sessions, {})
 
     def test_build_does_not_crash_against_a_pre_v7_registry(self):
         snap, local = pub.build(NOW)
         self.assertIn("tasks", snap)
+
+
+class TranscriptSync(unittest.TestCase):
+    """changed_results()'s omp:transcript source: the registry's
+    agent_session column (REVIEW-213 F3: an ABSOLUTE PATH herdr reports
+    directly -- spawn-task.sh:749 stores `herdr pane get` .result.pane.
+    agent_session.value verbatim, never a bare session id) opened as an
+    exact file, never searched for by filename across directories
+    (REVIEW-213 F5: that search was how a same-root symlink escaped to a
+    DIFFERENT task's transcript), with the last assistant text extracted
+    and refused if ANY symlink sits anywhere in the resolved path."""
+
+    def setUp(self):
+        self.reg = TMP / f"registry-ts-{self._testMethodName}.sqlite3"
+        self.real_sessions_root = pub.SESSIONS_ROOT
+        self.sessions_root = TMP / f"sessions-{self._testMethodName}"
+        pub.SESSIONS_ROOT = self.sessions_root
+        self.session_dir = self.sessions_root / "-escaped-cwd"
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.session_path = self.session_dir / "2026-10-02T00-00-00_deadbeef-dead-beef-dead-beefdeadbeef.jsonl"
+
+        con = sqlite3.connect(self.reg)
+        con.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, pane_birth TEXT, remote_task_id TEXT DEFAULT '', "
+                    "deadline_at TEXT, verified INTEGER DEFAULT 0, verify_detail TEXT, manifest TEXT DEFAULT '', "
+                    "agent_session TEXT DEFAULT '')")
+        con.execute("CREATE TABLE events (sequence INTEGER PRIMARY KEY, task_id TEXT, type TEXT, occurred_at TEXT, payload TEXT)")
+        con.execute("INSERT INTO tasks (task_id, pane_birth, remote_task_id, agent_session) VALUES ('task_ts','term_ts','rtask_ts',?)",
+                     (str(self.session_path),))
+        con.commit()
+        con.close()
+        self.real_registry = pub.REGISTRY
+        pub.REGISTRY = self.reg
+
+        self.wt = WT_ROOT / "kb/feat-ts"
+        (self.wt / ".handoffs").mkdir(parents=True, exist_ok=True)
+        (self.wt / ".handoffs/PROOF.md").write_text("proof")
+
+        self.snap = {"tasks": [{"task_id": "task_ts", "updated_at": Z(NOW), "remote_task_id": "rtask_ts"}]}
+        self.local = {"worktrees": {"task_ts": self.wt}, "sessions": {"task_ts": str(self.session_path)}}
+
+    def tearDown(self):
+        pub.REGISTRY = self.real_registry
+        pub.SESSIONS_ROOT = self.real_sessions_root
+
+    def _write_session(self, records, path=None):
+        path = path or self.session_path
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        return path
+
+    def test_registry_rows_reads_the_agent_session_column(self):
+        births, asks, remotes, sessions = pub.registry_rows(["task_ts"])
+        self.assertEqual(sessions, {"task_ts": str(self.session_path)})
+
+    def test_latest_reply_is_the_last_assistant_text_skipping_thinking_and_tool_call(self):
+        self._write_session([
+            {"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "do the thing"}]}},
+            {"type": "thinking", "thinking": "hmm"},
+            {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "first reply"}]}},
+            {"type": "toolCall", "tool": "bash"},
+            {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "final reply"}]}},
+        ])
+        res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
+        transcripts = [r for r in res if r["source"] == "omp:transcript"]
+        self.assertEqual(len(transcripts), 1)
+        self.assertEqual(transcripts[0]["text"], "final reply")
+
+    def test_a_pure_tool_call_final_message_does_not_blank_the_latest_reply(self):
+        self._write_session([
+            {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "real reply"}]}},
+            {"type": "message", "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "x"}]}},
+        ])
+        res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
+        transcripts = [r for r in res if r["source"] == "omp:transcript"]
+        self.assertEqual(transcripts[0]["text"], "real reply")
+
+    def test_a_session_path_outside_sessions_root_is_never_read(self):
+        outside = TMP / "sessions-escape-real"
+        outside.mkdir(exist_ok=True)
+        evil = outside / "evil.jsonl"
+        evil.write_text(json.dumps({"type": "message", "message": {"role": "assistant",
+                    "content": [{"type": "text", "text": "exfiltrated"}]}}) + "\n")
+        os.symlink(evil, self.session_path)
+        res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
+        self.assertEqual([r for r in res if r["source"] == "omp:transcript"], [])
+
+    def test_f5_a_same_root_symlink_to_a_different_tasks_session_is_never_read(self):
+        """REVIEW-213 F5's exact repro: the symlink target is INSIDE
+        SESSIONS_ROOT, under a different task's own legitimate directory
+        -- the old filename-suffix glob matched it and the old
+        containment check (only verified the RESOLVED path landed under
+        the root) passed it through. Served "CONDUCTOR PRIVATE REPLY" to
+        a worker's task in the live repro (tmp/r213/repro-213-f5.py)."""
+        other_dir = self.sessions_root / "-other-conductor-cwd"
+        other_dir.mkdir(parents=True, exist_ok=True)
+        other_session = other_dir / "2026-10-02T00-00-01_other-task-session.jsonl"
+        other_session.write_text(json.dumps({"type": "message", "message": {"role": "assistant",
+                    "content": [{"type": "text", "text": "CONDUCTOR PRIVATE REPLY"}]}}) + "\n")
+        os.symlink(other_session, self.session_path)
+        res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
+        self.assertEqual([r for r in res if r["source"] == "omp:transcript"], [])
+
+    def test_no_session_recorded_means_no_transcript_source_and_no_crash(self):
+        self.local["sessions"] = {}
+        res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
+        self.assertEqual([r for r in res if r["source"] == "omp:transcript"], [])
+
+    def test_a_bare_session_id_without_a_path_shape_is_rejected(self):
+        """F3: the shape omp actually reports is an absolute path; a bare
+        id (what the prior regex accepted, and what production never
+        sends) must not be treated as a filename fragment to search for."""
+        self._write_session([{"type": "message", "message": {"role": "assistant",
+                    "content": [{"type": "text", "text": "should never surface"}]}}])
+        self.local["sessions"] = {"task_ts": "deadbeef-dead-beef-dead-beefdeadbeef"}
+        res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
+        self.assertEqual([r for r in res if r["source"] == "omp:transcript"], [])
 
 
 class ResultScoping(unittest.TestCase):

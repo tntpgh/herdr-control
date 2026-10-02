@@ -172,6 +172,11 @@ const NONCE_TTL_MS = 15 * 60_000;
 // Each publisher tick (~15s) that leases a message counts one attempt; a
 // permission prompt or a typing human makes it retry, so 40 covers the TTL.
 const MAX_ATTEMPTS = 40;
+// ZR1 (ZERO-REVIEW-213-01 item 1): how many times sync() re-queues a cancel
+// command after the Mac reports the PREVIOUS one failed, before giving up
+// and leaving a single cancel_stuck event instead of an unbounded flood --
+// same shape, same cap, as registry-bridge.sh's own CANCEL_STUCK_THRESHOLD.
+const CANCEL_RETRY_CAP = 5;
 const AUDIT_KEEP_MS = 180 * 86_400_000;
 // Every tool call by one client (allowed or refused) counts. A ChatGPT session
 // makes a handful of calls per turn; these only bite a loop or a leaked token.
@@ -610,6 +615,19 @@ export class HerdrState extends DurableObject<Env> {
       .map((r) => ({ actor: r.actor, client_id: r.client_id, scope: r.mode === "research" ? SCOPE_TASK_START : SCOPE_TASK_IMPLEMENT }));
   }
 
+  // Every sender with an ALREADY-RUNNING remote task (spawned, with a
+  // local_task_id, not yet terminal or already cancelling) -- the pending-
+  // command check above only ever sees a QUEUED start/resume; a task past
+  // that point has no command for cmdGate to see without this (SPEC fix:
+  // Zero's review item 4 -- "revoke stops in-flight tasks too", not only
+  // ones still waiting to be delivered).
+  activeTaskSenders(): ScopedSender[] {
+    return this.sql.exec<{ actor: string; client_id: string; mode: string }>(
+      `SELECT DISTINCT requester_email AS actor, requester_client AS client_id, mode AS mode
+       FROM remote_tasks WHERE local_task_id<>'' AND state IN ('running','starting','waiting_approval','blocked')`).toArray()
+      .map((r) => ({ actor: r.actor, client_id: r.client_id, scope: r.mode === "research" ? SCOPE_TASK_START : SCOPE_TASK_IMPLEMENT }));
+  }
+
   // get_task_answer's "progress" field: this one remote task's own recent
   // history, newest first (unlike listEvents' global ascending cursor feed).
   taskEventLog(remoteTaskId: string, limit: number): TaskEventRow[] {
@@ -778,8 +796,44 @@ export class HerdrState extends DurableObject<Env> {
         this.sql.exec(`UPDATE remote_tasks SET state='failed', updated_at=? WHERE remote_task_id=?`, nowMs, c.remote_task_id);
         this.recordTaskEvent(nowMs, c.remote_task_id, "failed", { reason: a.detail });
       } else if (c.op === "cancel" && a.outcome === "accepted") {
-        this.sql.exec(`UPDATE remote_tasks SET state='cancelled', updated_at=? WHERE remote_task_id=?`, nowMs, c.remote_task_id);
-        this.recordTaskEvent(nowMs, c.remote_task_id, "cancelled", {});
+        // R2-1 (round-2 review of ZR2): the ack landing here races the
+        // remap loop that normally recovers 'timed_out' from a
+        // timeout_detected event -- if THIS ack lands first, it used to
+        // always write the generic 'cancelled', permanently losing the
+        // distinct timed_out value (the remap loop never runs again once
+        // the row is already terminal). Same lookup the remap loop uses.
+        const finalState = this.sql.exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='timeout_detected'`,
+          c.remote_task_id).one().n > 0 ? "timed_out" : "cancelled";
+        this.sql.exec(`UPDATE remote_tasks SET state=?, updated_at=? WHERE remote_task_id=?`, finalState, nowMs, c.remote_task_id);
+        this.recordTaskEvent(nowMs, c.remote_task_id, finalState, {});
+      } else if (c.op === "cancel" && a.outcome !== "accepted") {
+        // ZR1 (ZERO-REVIEW-213-01 item 1): a FAILED cancel ack used to hit
+        // no branch at all here -- the command was still marked 'done'
+        // above (line 746), but the explicit cancel attempt it reported
+        // failing was then silently dropped: remote_tasks.state stayed
+        // 'cancelling' forever, with nothing ever retrying it. Re-queue a
+        // fresh cancel for the same local_task_id (same shape as the Z4
+        // revoke-while-running loop's own INSERT below), capped at
+        // CANCEL_RETRY_CAP like registry-bridge.sh's own cancel retries,
+        // so a cancel that can never land becomes one visible
+        // cancel_stuck event instead of an unbounded flood.
+        const curRow = this.sql.exec<{ state: string; local_task_id: string }>(
+          `SELECT state, local_task_id FROM remote_tasks WHERE remote_task_id=?`, c.remote_task_id).toArray()[0];
+        if (curRow && !REMOTE_TERMINAL[curRow.state] && curRow.local_task_id) {
+          const retries = this.sql.exec<{ n: number }>(
+            `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='cancel_retry_queued'`, c.remote_task_id).one().n;
+          if (retries < CANCEL_RETRY_CAP) {
+            this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
+              `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", c.remote_task_id,
+              JSON.stringify({ local_task_id: curRow.local_task_id }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+            this.recordTaskEvent(nowMs, c.remote_task_id, "cancel_retry_queued", { attempt: retries + 1, reason: a.detail });
+          } else {
+            const stuck = this.sql.exec<{ n: number }>(
+              `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='cancel_stuck'`, c.remote_task_id).one().n;
+            if (stuck === 0) this.recordTaskEvent(nowMs, c.remote_task_id, "cancel_stuck", { attempts: retries });
+          }
+        }
       }
     }
 
@@ -834,6 +888,37 @@ export class HerdrState extends DurableObject<Env> {
         decision: "cancelled_before_delivery", reason: why, message_id: "", detail: c.op });
     }
 
+    // Z4 (SPEC fix: Zero's review item 4): a sender's grant can be revoked
+    // (or their email removed from the allowlist) while their task is
+    // ALREADY RUNNING on the Mac, not only while a start/resume is still
+    // queued -- the loop above only ever re-checks commands, so a task with
+    // no pending command never got this check at all. Same cancel-command
+    // shape as cancelTask() itself: this never fails the task outright,
+    // only asks the Mac to stop it, and the state flip to 'cancelling'
+    // self-guards against queuing the same cancel twice on the next tick.
+    // This loop itself checks no separate tasksEnabled flag -- the
+    // sender_not_allowed arm (ALLOWED_EMAILS) always applies, and the
+    // sender_grant_revoked arm already inherits env.TASKS_ENABLED from
+    // cmdGate's own construction in ingest() (activeTaskSenders() is fed
+    // through the SAME grantGate call as pendingCommandSenders()): when
+    // tasks are globally off, grantGate reports nothing revoked, the same
+    // "ride to the deadline backstop" semantics the kill switch already
+    // documents, not a second one invented here.
+    for (const rt of this.sql.exec<{ remote_task_id: string; local_task_id: string; requester_email: string; requester_client: string }>(
+      `SELECT remote_task_id, local_task_id, requester_email, requester_client FROM remote_tasks
+       WHERE local_task_id<>'' AND state IN ('running','starting','waiting_approval','blocked')`).toArray()) {
+      const why = !emailAllowed(this.env, rt.requester_email) ? "sender_not_allowed"
+        : cmdRevoked.has(`${rt.requester_email}\n${rt.requester_client}`) ? "sender_grant_revoked" : null;
+      if (!why) continue;
+      this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
+        `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", rt.remote_task_id,
+        JSON.stringify({ local_task_id: rt.local_task_id, reason: why }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+      this.sql.exec(`UPDATE remote_tasks SET state='cancelling', updated_at=? WHERE remote_task_id=?`, nowMs, rt.remote_task_id);
+      this.recordTaskEvent(nowMs, rt.remote_task_id, "cancel_requested", { reason: why });
+      this.audit(nowMs, { actor: rt.requester_email, client_id: rt.requester_client, tool: "delivery", target: rt.remote_task_id,
+        decision: "revoked_while_running", reason: why, message_id: "", detail: "cancel" });
+    }
+
     for (const m of this.sql.exec<{ message_id: string; task_id: string; detail: string; attempts: number }>(
       `SELECT message_id, task_id, detail, attempts FROM messages
        WHERE status IN ('queued','delivering') AND (expires_at <= ? OR (attempts >= ? AND lease_until < ?))`,
@@ -881,9 +966,35 @@ export class HerdrState extends DurableObject<Env> {
       const t = localTasks.get(rt.local_task_id);
       if (!t) continue;
       const mapped = mapLocalState(t, livePermission.has(rt.local_task_id));
-      if (mapped !== rt.state) {
-        this.sql.exec(`UPDATE remote_tasks SET state=?, updated_at=? WHERE remote_task_id=?`, mapped, nowMs, rt.remote_task_id);
-        this.recordTaskEvent(nowMs, rt.remote_task_id, mapped === "waiting_approval" ? "approval_needed" : "state_changed", { state: mapped });
+      // F4 (REVIEW-213): 'cancelling' is a REMOTE-side intent the Mac has
+      // not yet confirmed -- its own local snapshot can still say
+      // 'running' for several ticks (the cancel command is leased, not
+      // yet delivered/acked). Remapping unconditionally off
+      // mapLocalState() here used to flip 'cancelling' straight back to
+      // 'running' on THIS SAME sync() call's remap pass, undoing the
+      // revoke-while-running loop's own flip above every tick and
+      // re-arming it -- a fresh cancel command, a fresh cancel_requested
+      // event, a fresh revoked_while_running audit row, every ~15s,
+      // forever. Only skip the remap while 'cancelling' AND the local
+      // state has not yet resolved to anything terminal; once it has
+      // (the Mac's own state finally confirms finished/cancelled/etc,
+      // whether via a normal completion racing the cancel or the cancel
+      // itself landing), let it through so 'cancelling' can actually
+      // resolve.
+      if (rt.state === "cancelling" && !REMOTE_TERMINAL[mapped]) {
+        // still in flight -- nothing to do until the Mac confirms.
+      } else if (mapped !== rt.state) {
+        // ZR2 (ZERO-REVIEW-213-01 item 2): preserve the distinct
+        // 'timed_out' value through this remap, rather than collapsing a
+        // timeout-triggered cancel into the generic 'cancelled' the
+        // underlying local state (and therefore mapLocalState) always
+        // reports once the Mac confirms it stopped.
+        const finalState = mapped === "cancelled" && rt.state === "cancelling"
+          && this.sql.exec<{ n: number }>(
+            `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='timeout_detected'`, rt.remote_task_id).one().n > 0
+          ? "timed_out" : mapped;
+        this.sql.exec(`UPDATE remote_tasks SET state=?, updated_at=? WHERE remote_task_id=?`, finalState, nowMs, rt.remote_task_id);
+        this.recordTaskEvent(nowMs, rt.remote_task_id, finalState === "waiting_approval" ? "approval_needed" : "state_changed", { state: finalState });
       }
       if (t.has_result) {
         const already = this.sql.exec<{ n: number }>(
@@ -900,13 +1011,29 @@ export class HerdrState extends DurableObject<Env> {
       `SELECT remote_task_id, created_at, local_task_id FROM remote_tasks
        WHERE state NOT IN ('finished','verified','failed','cancelled','lost','timed_out','cancelling')`).toArray()) {
       if (nowMs - rt.created_at < caps.max_minutes * 60_000) continue;
-      this.sql.exec(`UPDATE remote_tasks SET state='timed_out', updated_at=? WHERE remote_task_id=?`, nowMs, rt.remote_task_id);
-      this.recordTaskEvent(nowMs, rt.remote_task_id, "timed_out", { max_minutes: caps.max_minutes });
-      if (rt.local_task_id) {
-        this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
-          `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", rt.remote_task_id,
-          JSON.stringify({ local_task_id: rt.local_task_id, reason: "timed_out" }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+      // ZR2 (ZERO-REVIEW-213-01 item 2): a deadline firing used to write
+      // the TERMINAL 'timed_out' state immediately, before the Mac had
+      // confirmed anything actually stopped -- excluded from every later
+      // sync loop (including this very loop's own WHERE clause, and the
+      // command_acks loop's cancel-outcome handling) the instant it was
+      // written. An unspawned task (no local_task_id: nothing is running,
+      // the same "nothing to confirm" case the cancelled_before_delivery
+      // path above already treats as immediately terminal) is the one
+      // case safe to mark 'timed_out' directly; everything else goes
+      // through 'cancelling' like any other cancel, resolved by the
+      // remap loop above once the Mac confirms -- which recovers the
+      // distinct 'timed_out' value from the timeout_detected event
+      // recorded here, rather than losing it to a generic 'cancelled'.
+      if (!rt.local_task_id) {
+        this.sql.exec(`UPDATE remote_tasks SET state='timed_out', updated_at=? WHERE remote_task_id=?`, nowMs, rt.remote_task_id);
+        this.recordTaskEvent(nowMs, rt.remote_task_id, "timed_out", { max_minutes: caps.max_minutes });
+        continue;
       }
+      this.sql.exec(`UPDATE remote_tasks SET state='cancelling', updated_at=? WHERE remote_task_id=?`, nowMs, rt.remote_task_id);
+      this.recordTaskEvent(nowMs, rt.remote_task_id, "timeout_detected", { max_minutes: caps.max_minutes });
+      this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
+        `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", rt.remote_task_id,
+        JSON.stringify({ local_task_id: rt.local_task_id, reason: "timed_out" }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
     }
 
     const due = body.lease && !gate.hold ? this.sql.exec<{ message_id: string; task_id: string; pane_id: string; agent_id: string; label: string;

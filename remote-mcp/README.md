@@ -134,7 +134,7 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
 | `send_message` | message (listed only when enabled) | `target` (task_id, agent_id, or task label), `text` | `message_id`, status `queued`, resolved target |
 | `list_capabilities` | read | — | what `start_task` can do right now: `mac_enabled`, allow-listed `repos`, each mode's git/secrets/write policy, today's `caps` — from the Mac's own `task-allowlist.json`, never a hand-duplicated table |
 | `start_task` | task.start (research) or task.implement | `repo` (allow-listed), `mode` research\|implement, `objective` ≤4000 chars | `task_id` immediately, state `queued`, before the Mac has acted |
-| `get_task_answer` | read | `task_id` | state, mode, repo, objective, `progress` (recent events), `artifacts` (every `.handoffs/` file synced, size+sha256), `local_task` (incl. `verified`), `latest_reply` (the omp session's own last turn), and once ready, `answer` = `.handoffs/ANSWER.md` |
+| `get_task_answer` | read | `task_id` | state, mode, repo, objective, `verified_kind` (`source_link_present`/`pushed_sha_matches`, which closure check `verified` is), `progress` (recent events), `artifacts` (every `.handoffs/` file synced, size+sha256), `local_task` (incl. `verified`), `latest_reply` (the omp session's own last turn), and once ready, `answer` = `.handoffs/ANSWER.md` |
 | `follow_up` | message | `task_id`, `text` | = `send_message` addressed by remote `task_id`; refused if the task was never actually spawned |
 | `cancel_task` | task.cancel | `task_id` | new state (`cancelled` if never spawned, else `cancelling`); refused if already terminal |
 | `resume_task` | task.cancel | `task_id`, `text?` | re-enters the same worktree/branch as a brand new `task_id` (only a terminal task can be resumed), linked via `parent_task_id` |
@@ -194,8 +194,13 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
    `task-allowlist.json`, enforced on both sides): a 5th concurrent start, or
    one past the daily count, is refused `too_many_concurrent`/`too_many_today`
    before anything is queued. A task that outruns `max_minutes` is cancelled
-   automatically (`timed_out`), its pane closed the same way `cancel_task`
-   closes one.
+   automatically (`timed_out`) by two independent paths: the publisher's own
+   sweep tick (depends on the publisher process staying alive) and a
+   detached backstop timer `start_task`/`resume_task` schedules on the Mac
+   at spawn time (`max_minutes` + 90s grace, survives the publisher
+   LaunchAgent dying or being reloaded, recorded as a `hard_stop_scheduled`
+   event with its pid) — either path's cancel closes the pane the same way
+   `cancel_task` closes one.
 4. `objective` (and a `resume_task` follow-up `text`) is sanitized the same
    way a message is (NFKC, invisible/format characters to spaces, every
    bracket shape to `(`/`)`, `@` to fullwidth `＠`) before it is ever stored —
@@ -215,20 +220,32 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
    `cancelled`, `lost`, `timed_out`. `verified` = `finished` and its mode's
    check passed: research → `.handoffs/ANSWER.md` exists with ≥1 source link;
    implement → the branch named in its closure event is pushed and its head
-   sha matches. A finished research task is auto-closed
+   sha matches (`get_task_answer`'s `verified_kind`, `source_link_present` /
+   `pushed_sha_matches`, names which one — a FORMAT/CLOSURE check against
+   the task's own completion claim, never a semantic read of whether the
+   answer is actually correct). A finished research task is auto-closed
    (`close-done-workers.sh --task=<id> --apply`); a cancelled/timed-out
-   task's pane is closed and its state set — nothing is left `running` with
-   no pane.
+   task's pane is CONFIRMED gone -- closed by the cancel, or already
+   recycled to a different occupant -- before its state is ever set to a
+   terminal value: a `herdr pane list`/`close` failure, or a pane still
+   reporting the same occupant right after the close, leaves the row
+   non-terminal for the next retry instead of claiming victory early.
 7. **At delivery**, exactly like a message: a queued start/cancel/resume is
    cancelled before the Mac ever sees it if tasks are now off (Worker or Mac
    switch), the requester has left the allowlist, or no longer holds a live
    grant with the scope that command's mode needed (revoked, expired,
-   re-consented without it).
+   re-consented without it). The SAME re-check also covers a task that has
+   ALREADY been spawned and is running on the Mac with no queued command at
+   all: losing the allowlist or the grant queues a fresh `cancel` for it on
+   the next sync, same as `cancel_task` would.
 8. A real capability probe (never a guess) is recorded on every start:
    `secrets_granted` (was `--secrets` passed to `spawn-task.sh`) and, for
-   `knowledge-base`, `kb_reachable` (a plain HTTPS reachability check,
-   **never** a credential value) — both land in the task's own event feed
-   (`capability_probe`) and in `get_task_answer`.
+   `knowledge-base`, `kb_http_reachable` (a plain 2xx-only HTTPS
+   reachability check, **never** a credential value and never proof of
+   authenticated access -- there is no `kb_auth_ok`: this process runs on
+   the Mac before a worker is spawned and never holds the KB credential
+   itself) — both land in the task's own event feed (`capability_probe`)
+   and in `get_task_answer`.
 
 ### Audit and limits
 
@@ -251,11 +268,15 @@ closure reason/proof, pane id, terminal id, and (once a task is remote) its
 status. Blockers: tool + a redacted 240-char summary. Results: each task
 worktree's `.handoffs/*` files (`.handoffs/PROOF.md`, `.handoffs/ANSWER.md`,
 a remote task's own synced artifacts — each a single-link regular file,
-opened without following symlinks), redacted in full and then cut to 64 KB,
-only from worktrees under `~/.herdr/worktrees` or `~/Code`. **Never**: cwd,
+opened without following symlinks, only from worktrees under
+`~/.herdr/worktrees` or `~/Code`) plus, for a remote task, `omp:transcript`
+— its own omp session's LAST assistant text turn (never a thinking or
+tool-call block), the session JSONL resolved the same symlink-safe way but
+only under `~/.omp/agent/sessions`; all of it redacted in full and then cut
+to 64 KB. **Never**: cwd,
 screen contents, prompt ids, the hub, the registry file, secrets files, or a
 credential value from the capability probe (only booleans: was a secret
-grant passed, was KB reachable).
+grant passed, was KB HTTP-reachable).
 
 Redaction (`publisher.py` `REDACTIONS`) removes common credential shapes. It
 is a ceiling, not a guarantee, and it does not detect client names or
@@ -321,11 +342,14 @@ public internet.
   route `/admin/grants` is signed with `INGEST_KEY` (same HMAC, skew and
   nonce rules as `/ingest/sync`; no user token reaches it) and audits every
   call as `admin_list` / `admin_revoke`. The grant's tokens stop working at
-  once and any queued start/resume of theirs is cancelled before delivery
-  on the next sync (their own pending cancels are exempt and still go
-  through, N4); a task of theirs already running on the Mac keeps running
-  until its own deadline backstop force-cancels it — revoke stops new
-  starts/resumes, not an in-flight one.
+  once; any queued start/resume of theirs is cancelled before delivery on
+  the next sync (their own pending cancels are exempt and still go through,
+  N4), AND a task of theirs already running on the Mac is cancelled too — a
+  fresh `cancel` command is queued for it the same tick (same mechanism as
+  `cancel_task`, state `cancelling` until the Mac acks it). The one thing
+  revoke does not reach is the global `TASKS_ENABLED` kill switch below:
+  with that off, this per-sender check has nothing to revoke against, and a
+  running task rides out its own deadline backstop instead.
 - **Kill switches**, least to most: set `MESSAGING_ENABLED`/`TASKS_ENABLED` to
   `"false"` and redeploy (new sends/starts are refused and every queued
   message/command is cancelled on the next sync; a task already running on

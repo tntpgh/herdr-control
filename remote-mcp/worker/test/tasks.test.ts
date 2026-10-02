@@ -20,7 +20,7 @@ const syncJson = async (r: Response): Promise<SyncReply> => r.json();
 interface StartTaskResult { task_id: string; state: string }
 interface CancelTaskResult { task_id: string; state: string }
 interface ResumeTaskResult { task_id: string; parent_task_id: string; state: string }
-interface AnswerResult { state: string; local_task: unknown }
+interface AnswerResult { state: string; local_task: unknown; verified_kind: string }
 interface EventsResult { cursor: number; events: unknown[] }
 
 const CAPS = { max_concurrent: 1, max_per_day: 10, max_minutes: 60 };
@@ -157,11 +157,11 @@ describe("start_task: happy path through to get_task_answer", () => {
       lease: false,
       command_acks: [{ command_id: cmd!.command_id, outcome: "accepted", detail: "spawned",
         local_task_id: "task_V", local_run_id: "run_V", branch: "remote/abc123", pane_id: "w1:term_v", agent_id: "term_v",
-        capability_probe: { secrets_granted: true, kb_reachable: true } }],
+        capability_probe: { secrets_granted: true, kb_http_reachable: true } }],
     }));
     const running = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
     expect([running?.state, running?.local_task_id, running?.branch, running?.capability_probe])
-      .toEqual(["running", "task_V", "remote/abc123", { secrets_granted: true, kb_reachable: true }]);
+      .toEqual(["running", "task_V", "remote/abc123", { secrets_granted: true, kb_http_reachable: true }]);
 
     // The Mac's next tick reports the task finished and verified (research:
     // ANSWER.md had a source link) -- the remap in sync() should carry that
@@ -178,6 +178,7 @@ describe("start_task: happy path through to get_task_answer", () => {
     if (!isVerifiedTask(localTask)) throw new Error(`expected local_task with verified/verify_detail, got ${JSON.stringify(localTask)}`);
     expect(localTask.verified).toBe(true);
     expect(localTask.verify_detail).toBe("ANSWER.md has a source link");
+    expect(answer.data.verified_kind).toBe("source_link_present");
   });
 });
 
@@ -243,6 +244,45 @@ describe("cancel_task / resume_task", () => {
     expect(final?.state).toBe("cancelled");
   });
 
+  it("a repeatedly-failing cancel ack is retried up to CANCEL_RETRY_CAP, then gives up loudly instead of flooding (ZR1)", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody()));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_zr1", local_run_id: "run_zr1", branch: "remote/zr1",
+      pane_id: "w1:term_zr1", agent_id: "term_zr1", capability_probe: {} }] }));
+
+    const cancelled = await callTool<CancelTaskResult>(tok, "cancel_task", { task_id: remoteTaskId });
+    expect(cancelled.data.state).toBe("cancelling");
+
+    // The original cancel, plus CANCEL_RETRY_CAP (5) retries, each fail in
+    // turn -- 6 failed acks total before the cap is reached. Before ZR1,
+    // the FIRST failed ack already silently dropped the cancel: no branch
+    // handled it at all, and the row would have stayed 'cancelling'
+    // forever with nothing ever retrying it.
+    for (let i = 0; i < 6; i++) {
+      const l = await syncJson(await signedSync(taskConfigBody()));
+      const cancelCmd = l.commands.find((c) => c.remote_task_id === remoteTaskId && c.op === "cancel");
+      expect(cancelCmd).toBeDefined();
+      await signedSync(syncBody({ lease: false,
+        command_acks: [{ command_id: cancelCmd!.command_id, outcome: "failed", detail: "pane close failed" }] }));
+    }
+
+    const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(row?.state).toBe("cancelling"); // never silently resolved; still honestly in-flight
+
+    const events = await runInDurableObject(fleet(), (o: HerdrState) => o.taskEventLog(remoteTaskId, 50));
+    expect(events.filter((ev) => ev.type === "cancel_retry_queued").length).toBe(5); // CANCEL_RETRY_CAP
+    expect(events.filter((ev) => ev.type === "cancel_stuck").length).toBe(1); // exactly once, never flooded
+
+    // Past the cap: no further retry is queued.
+    const lFinal = await syncJson(await signedSync(taskConfigBody()));
+    expect(lFinal.commands.find((c) => c.remote_task_id === remoteTaskId && c.op === "cancel")).toBeUndefined();
+  });
+
   it("cancelling a task whose start is still being delivered does not revive to running on a late ack (M6)", async () => {
     await signedSync(taskConfigBody());
     const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
@@ -269,7 +309,7 @@ describe("cancel_task / resume_task", () => {
     expect(cancelCmd.payload).toMatchObject({ local_task_id: "task_race1" });
   });
 
-  it("auto-cancels (timed_out) a task that outran max_minutes, queuing a cancel command", async () => {
+  it("a task that outran max_minutes stays 'cancelling' until the Mac confirms, then resolves to timed_out (ZR2)", async () => {
     const cfg = { caps: { ...CAPS, max_minutes: 1 } };
     await signedSync(taskConfigBody(cfg));
     const { access_token: startTok } = await oauthToken(["herdr:read", "herdr:task.start"]);
@@ -289,9 +329,59 @@ describe("cancel_task / resume_task", () => {
     const out = await runInDurableObject(fleet(), (o: HerdrState) =>
       o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }));
     expect(out.ok).toBe(true);
+    // ZR2: a spawned agent is not yet confirmed stopped -- 'cancelling',
+    // never the TERMINAL 'timed_out' (which every later sync loop
+    // excludes), until the Mac's own local state actually says so.
     const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
-    expect(row?.state).toBe("timed_out");
+    expect(row?.state).toBe("cancelling");
     if (out.ok) expect(out.response.commands.some((c) => c.remote_task_id === remoteTaskId && c.op === "cancel")).toBe(true);
+
+    // The Mac's local state now confirms the task actually stopped (e.g.
+    // close-done-workers.sh ran after registry-bridge.sh's cancel landed).
+    const closedSnapshot = snapshot({ task_config: { ...TASK_CONFIG, ...cfg },
+      tasks: [taskRow("task_V3", remoteTaskId, { state: "cancelled", stored_state: "cancelled", has_result: false })] });
+    await signedSync(syncBody({ snapshot: closedSnapshot }));
+    // The remap loop recovers the DISTINCT 'timed_out' value from the
+    // timeout_detected event recorded above, instead of collapsing it to
+    // the generic 'cancelled' mapLocalState alone would report.
+    const finalRow = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(finalRow?.state).toBe("timed_out");
+  });
+
+  it("an accepted cancel ACK landing before the remap tick also preserves timed_out, not generic cancelled (R2-1)", async () => {
+    // Same setup as ZR2 above, but resolved via the OTHER path: the
+    // worker's own cancel ack (c.op === "cancel" && a.outcome ===
+    // "accepted") landing first, instead of the remap loop reading a
+    // closed snapshot. Both paths share the one timeout_detected event;
+    // before R2-1 only the remap loop checked it, so whichever path won
+    // the race determined whether the task's history shows timed_out or
+    // a generic cancelled forever.
+    const cfg = { caps: { ...CAPS, max_minutes: 1 } };
+    await signedSync(taskConfigBody(cfg));
+    const { access_token: startTok } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    const started = await callTool<StartTaskResult>(startTok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody(cfg)));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_R21", local_run_id: "run_R21", branch: "remote/r21",
+      pane_id: "w1:term_r21", agent_id: "term_r21", capability_probe: {} }] }));
+
+    const future = Date.now() + 2 * 60_000;
+    const body = JSON.stringify(taskConfigBody(cfg));
+    const out = await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }));
+    expect(out.ok).toBe(true);
+    const cancelCmd = out.ok ? out.response.commands.find((c) => c.remote_task_id === remoteTaskId && c.op === "cancel") : undefined;
+    expect(cancelCmd).toBeDefined();
+    const midRow = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(midRow?.state).toBe("cancelling");
+
+    // The Mac's cancel ack lands directly -- no snapshot, no remap tick.
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: cancelCmd!.command_id, outcome: "accepted",
+      detail: "cancelled" }] }));
+    const finalRow = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(finalRow?.state).toBe("timed_out");
   });
 
   it("refuses resume_task on a non-terminal task, then on the same task once cancelled before it ever spawned", async () => {
@@ -542,5 +632,104 @@ describe("per-connection revocation stops queued starts (SPEC item 6)", () => {
     expect(leased.commands.find((c) => c.remote_task_id === remoteTaskId)).toBeUndefined();
     const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
     expect(row?.state).toBe("cancelled");
+  });
+});
+
+describe("per-connection revocation also stops a task already running on the Mac (SPEC fix: Zero's review item 4)", () => {
+  it("queues a cancel for a spawned, running remote task once the starting connection's grant is revoked", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody()));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_revoke1", local_run_id: "run_revoke1", branch: "remote/revoke1",
+      pane_id: "w1:term_revoke1", agent_id: "term_revoke1", capability_probe: { secrets_granted: true } }] }));
+    const running = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(running?.state).toBe("running");
+
+    // Revoke the ONLY thing distinguishing this from "a start still queued":
+    // the Mac already has a local_task_id for it and reports it running, so
+    // the OLD code path (pendingCommandSenders -- only a QUEUED command) had
+    // nothing left to re-check.
+    const grants = await e.OAUTH_KV.list({ prefix: "grant:tnt@teamthurber.com:" });
+    expect(grants.keys.length).toBeGreaterThan(0);
+    for (const k of grants.keys) await e.OAUTH_KV.delete(k.name);
+
+    const leased2 = await syncJson(await signedSync(taskConfigBody()));
+    const cancelCmd = leased2.commands.find((c) => c.remote_task_id === remoteTaskId && c.op === "cancel");
+    expect(cancelCmd).toBeDefined();
+    expect(cancelCmd!.payload).toMatchObject({ local_task_id: "task_revoke1" });
+    const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(row?.state).toBe("cancelling");
+  });
+
+  it("a revoked task's 'cancelling' state survives repeated remap ticks while the Mac's local snapshot still says running (F4)", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody()));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_f4", local_run_id: "run_f4", branch: "remote/f4",
+      pane_id: "w1:term_f4", agent_id: "term_f4", capability_probe: {} }] }));
+
+    const grants = await e.OAUTH_KV.list({ prefix: "grant:tnt@teamthurber.com:" });
+    for (const k of grants.keys) await e.OAUTH_KV.delete(k.name);
+
+    // The Mac's own local snapshot still reports this task 'running' --
+    // the cancel command the revoke loop is about to queue has not been
+    // delivered/acked yet, so nothing has told the Mac to stop it.
+    const runningSnapshot = snapshot({ task_config: TASK_CONFIG,
+      tasks: [taskRow("task_f4", remoteTaskId, { state: "running", stored_state: "running", has_result: false })] });
+
+    // First tick: the revoke-while-running loop flips the row to
+    // cancelling and queues a cancel command.
+    await signedSync(syncBody({ snapshot: runningSnapshot }));
+    const afterFirst = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(afterFirst?.state).toBe("cancelling");
+
+    // Several MORE ticks, the Mac's own local snapshot STILL reporting
+    // 'running' -- before F4, the remap loop ran on the SAME sync() call
+    // right after the revoke loop and flipped this straight back to
+    // 'running', re-arming the revoke check into a fresh cancel every tick.
+    for (let i = 0; i < 3; i++) {
+      await signedSync(syncBody({ snapshot: runningSnapshot }));
+      const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+      expect(row?.state).toBe("cancelling");
+    }
+
+    // Only ONE cancel was ever requested across all those ticks -- the
+    // revoke loop's own self-guard (state already 'cancelling') stopped
+    // re-triggering, which only works because F4 stopped the remap loop
+    // from undoing the flip it is guarding against.
+    const events = await runInDurableObject(fleet(), (o: HerdrState) => o.taskEventLog(remoteTaskId, 50));
+    expect(events.filter((ev) => ev.type === "cancel_requested").length).toBe(1);
+
+    // The Mac's local state finally confirms the cancel landed.
+    const cancelledSnapshot = snapshot({ task_config: TASK_CONFIG,
+      tasks: [taskRow("task_f4", remoteTaskId, { state: "cancelled", stored_state: "cancelled", has_result: false })] });
+    await signedSync(syncBody({ snapshot: cancelledSnapshot }));
+    const final = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(final?.state).toBe("cancelled");
+  });
+
+  it("does not touch a running task whose OWN sender still holds a live grant", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody()));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_keep1", local_run_id: "run_keep1", branch: "remote/keep1",
+      pane_id: "w1:term_keep1", agent_id: "term_keep1", capability_probe: {} }] }));
+
+    const leased2 = await syncJson(await signedSync(taskConfigBody()));
+    expect(leased2.commands.find((c) => c.remote_task_id === remoteTaskId)).toBeUndefined();
+    const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(row?.state).toBe("running");
   });
 });
