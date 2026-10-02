@@ -34,9 +34,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
-import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from sanitize import clean
+import tasks as rtasks
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -63,6 +65,13 @@ MAX_MESSAGE_CHARS = 2000
 # the next lease re-checks it: the in-flight window is bounded by the lease,
 # not by how long earlier deliveries in the same batch took.
 LEASE_LOCAL_S = 60
+# Same idea for the Worker's `commands` outbox (start/cancel/resume): a
+# command not even ATTEMPTED within this many seconds of the lease is simply
+# left unacked -- there is no "retry" outcome in CommandAck, only
+# accepted/refused/failed, so omission (letting the Worker's own lease_until
+# expire and re-queue it) is how a command retries, the same end state a
+# message's explicit "retry" outcome reaches.
+COMMAND_LEASE_LOCAL_S = 60
 # The Mac's own switch, independent of the Worker's MESSAGING_ENABLED: unless
 # this is "1" in the publisher's environment, every leased message is refused.
 MESSAGING_ON_MAC = os.environ.get("HERDR_MCP_MESSAGING") == "1"
@@ -155,17 +164,27 @@ def hub_get(path: str):
         return json.load(r)
 
 
-def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict]]:
-    """pane_birth per task, and each task's newest input_required payload."""
+def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict], dict[str, dict]]:
+    """pane_birth per task, each task's newest input_required payload, and
+    (sparse -- only tasks herdr-mcp's tasks.py actually started remotely)
+    its remote_task_id/verified/verify_detail, for tasks[]'s SyncSchema
+    extension -- the Worker's own mapLocalState reads these columns, not a
+    second computation here."""
     births: dict[str, str] = {}
     asks: dict[str, dict] = {}
+    remotes: dict[str, dict] = {}
     if not task_ids or not REGISTRY.exists():
-        return births, asks
+        return births, asks, remotes
     con = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=5)
     try:
         marks = ",".join("?" * len(task_ids))
-        for tid, birth in con.execute(f"SELECT task_id, pane_birth FROM tasks WHERE task_id IN ({marks})", task_ids):
+        for tid, birth, remote_id, verified, detail in con.execute(
+            f"SELECT task_id, pane_birth, remote_task_id, verified, verify_detail FROM tasks WHERE task_id IN ({marks})",
+            task_ids,
+        ):
             births[tid] = birth or ""
+            if remote_id:
+                remotes[tid] = {"remote_task_id": remote_id, "verified": bool(verified), "verify_detail": detail or None}
         for tid, at, payload in con.execute(
             f"""SELECT task_id, occurred_at, payload FROM events WHERE type='input_required' AND task_id IN ({marks})
                 AND sequence IN (SELECT MAX(sequence) FROM events WHERE type='input_required' GROUP BY task_id)""",
@@ -178,7 +197,7 @@ def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict]]
             asks[tid] = {"at": at, "tool": p.get("tool"), "summary": p.get("message") or p.get("command")}
     finally:
         con.close()
-    return births, asks
+    return births, asks, remotes
 
 
 def build(now: datetime) -> tuple[dict, dict]:
@@ -198,7 +217,7 @@ def build(now: datetime) -> tuple[dict, dict]:
             continue
         if t.get("state") not in TERMINAL or updated >= cutoff:
             raw_tasks.append(t)
-    births, asks = registry_rows([t["task_id"] for t in raw_tasks])
+    births, asks, remotes = registry_rows([t["task_id"] for t in raw_tasks])
 
     tasks, worktrees, active_task_by_pane = [], {}, {}
     for t in raw_tasks:
@@ -212,6 +231,7 @@ def build(now: datetime) -> tuple[dict, dict]:
             worktrees[t["task_id"]] = Path(t["worktree"])
         if agent_live:
             active_task_by_pane.setdefault(pane, t["task_id"])
+        remote = remotes.get(t["task_id"]) or {}
         tasks.append({
             "task_id": t["task_id"], "run_id": t.get("run_id") or "", "label": t.get("label") or "",
             "project": t.get("project") or "", "repo": Path(t.get("repo") or "").name, "branch": t.get("branch") or "",
@@ -221,6 +241,8 @@ def build(now: datetime) -> tuple[dict, dict]:
             "closure_reason": t.get("closure_reason"), "closure_proof": redact(t["closure_proof"]) if t.get("closure_proof") else None,
             "pane_id": pane if agent_live else None, "agent_id": birth if agent_live else None,
             "agent_live": agent_live, "has_result": has_result,
+            "remote_task_id": remote.get("remote_task_id"), "verified": remote.get("verified"),
+            "verify_detail": remote.get("verify_detail"),
         })
 
     conductors = {str(t.get("conductor_id") or "").removeprefix("conductor_") for t in herdr.get("tasks") or []}
@@ -236,7 +258,13 @@ def build(now: datetime) -> tuple[dict, dict]:
         })
 
     blockers = []
-    by_id = {t["task_id"]: t for t in tasks}
+    # by_id is LOCAL-only (never sent to the Worker): sweep() needs the
+    # worktree's real path to find identity.json/events.jsonl/ANSWER.md,
+    # which the shared `tasks` list deliberately omits (same reason "repo"
+    # above is reduced to a basename -- the synced snapshot never carries a
+    # local filesystem path).
+    wt_by_task = {t["task_id"]: t.get("worktree") or "" for t in raw_tasks}
+    by_id = {t["task_id"]: {**t, "worktree": wt_by_task.get(t["task_id"], "")} for t in tasks}
     blocked_panes = {p["pane_id"] for p in panes if p.get("agent_status") == "blocked"}
     for t in tasks:
         live_blocked = t["pane_id"] in blocked_panes if t["pane_id"] else False
@@ -256,6 +284,11 @@ def build(now: datetime) -> tuple[dict, dict]:
                              "kind": "permission", "tool": None, "summary": None, "since": iso(p.get("since"))})
 
     live = herdr.get("live") or {}
+    try:
+        task_config = rtasks.capabilities_snapshot()
+    except (OSError, ValueError, KeyError) as exc:
+        log(f"task-allowlist.json unreadable, task_config omitted this tick: {exc}")
+        task_config = None
     snapshot = {
         "schema": SCHEMA,
         "generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -264,7 +297,7 @@ def build(now: datetime) -> tuple[dict, dict]:
             "herdr_reachable": bool(herdr.get("herdr_reachable", True)), "attention": summary.get("attention"),
             "open_decisions": summary.get("open_decisions"), "handoff_debt": summary.get("handoff_debt"),
         },
-        "agents": agents, "tasks": tasks, "blockers": blockers,
+        "agents": agents, "tasks": tasks, "blockers": blockers, "task_config": task_config,
     }
     return snapshot, {"tasks": by_id, "panes": live_by_pane, "worktrees": worktrees}
 
@@ -338,29 +371,8 @@ def post_sync(key: str, body: dict) -> dict:
 
 
 # ── delivery ───────────────────────────────────────────────────────────────────
-# Same rule as the Worker's sanitizeMessage (policy.ts), re-applied here.
-BLANKS = "\u115f\u1160\u3164\uffa0\u2800"
-
-
-def clean(s: str) -> str:
-    """NFKC fold; invisible and non-printing characters (control, format,
-    private use, combining marks, variation selectors, blank fillers) and the
-    bracket-piece symbols U+239B-U+23B3 become spaces; every opening/closing
-    punctuation mark (Ps/Pe) except ASCII { } becomes ( / ), so nothing can
-    imitate or close the envelope; "@" becomes fullwidth "＠" so omp/Claude
-    Code never expand an @path mention into a file's contents (review H1)."""
-    out = []
-    for c in unicodedata.normalize("NFKC", s):
-        cat = unicodedata.category(c)
-        if c in BLANKS or cat[0] == "C" or cat in ("Zl", "Zp", "Mn", "Me") or "\u239b" <= c <= "\u23b3":
-            out.append(" ")
-        elif cat == "Ps" and c != "{":
-            out.append("(")
-        elif cat == "Pe" and c != "}":
-            out.append(")")
-        else:
-            out.append("\uff20" if c == "@" else c)
-    return re.sub(r"\s+", " ", "".join(out)).strip()
+# clean() moved to sanitize.py (both this file and tasks.py need it; tasks.py
+# needing publisher.py back for it would be a circular import).
 
 
 def frame(item: dict) -> str | None:
@@ -460,9 +472,14 @@ def main(argv: list[str]) -> int:
         log("HERDR_MCP_INGEST_KEY not set (env or ~/.config/op/launchd-secrets.env); nothing sent")
         return 1
 
+    for action in rtasks.sweep(local["tasks"], now):
+        ok = "ok" if action["ok"] else "NOT ok"
+        log(f"task {action['task_id']}: {action['action']} {ok} ({action['detail']})")
+
     acks = st.get("pending_acks", [])
+    command_acks = st.get("pending_command_acks", [])
     try:
-        reply = post_sync(key, {"snapshot": snapshot, "results": results, "acks": acks,
+        reply = post_sync(key, {"snapshot": snapshot, "results": results, "acks": acks, "command_acks": command_acks,
                                 "audit_cursor": st.get("audit_cursor", 0), "lease": True})
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log(f"sync failed: {exc}")
@@ -471,18 +488,20 @@ def main(argv: list[str]) -> int:
         st.setdefault("results", {})[r["task_id"]] = {"sha256": r["sha256"], "sent_at": now.timestamp()}
     keep = {t["task_id"] for t in snapshot["tasks"]}
     st["results"] = {k: v for k, v in st.get("results", {}).items() if k in keep}
-    st["pending_acks"] = []
+    st["pending_acks"], st["pending_command_acks"] = [], []
     append_audit(reply.get("audit") or [])
     st["audit_cursor"] = reply.get("audit_cursor", st.get("audit_cursor", 0))
     save_state(st)
 
     outbox = reply.get("outbox") or []
-    if not outbox:
+    commands = reply.get("commands") or []
+    if not outbox and not commands:
         log(f"synced {len(snapshot['tasks'])} tasks, {len(snapshot['agents'])} agents, {len(results)} results")
         return 0
-    # Each outcome is saved the moment it is known, and delivered ids are kept
-    # for a day: a crash between typing and acking must not type it twice.
+    # Each outcome is saved the moment it is known, and delivered/processed ids
+    # are kept for a day: a crash between acting and acking must not act twice.
     delivered = {k: v for k, v in st.get("delivered", {}).items() if now.timestamp() - v < 86_400}
+    processed = {k: v for k, v in st.get("processed_commands", {}).items() if now.timestamp() - v["at"] < 86_400}
     new_acks = []
     leased_at = time.monotonic()
     for item in outbox:
@@ -500,10 +519,27 @@ def main(argv: list[str]) -> int:
         new_acks.append(a)
         st["delivered"], st["pending_acks"] = delivered, new_acks
         save_state(st)
+
+    new_command_acks = []
+    cmd_leased_at = time.monotonic()
+    for cmd in commands:
+        cid = cmd["command_id"]
+        if cid in processed:
+            ack = processed[cid]["ack"]
+        elif time.monotonic() - cmd_leased_at > COMMAND_LEASE_LOCAL_S:
+            continue  # not even attempted this tick; the Worker's own lease expires and re-queues it
+        else:
+            ack = rtasks.process_command(cmd)
+            processed[cid] = {"at": now.timestamp(), "ack": ack}
+        log(f"command {cid} ({cmd.get('op')}): {ack['outcome']} ({ack.get('detail', '')})")
+        new_command_acks.append(ack)
+        st["processed_commands"], st["pending_command_acks"] = processed, new_command_acks
+        save_state(st)
+
     try:  # second sync: report outcomes now rather than next tick
-        reply = post_sync(key, {"snapshot": snapshot, "results": [], "acks": new_acks,
+        reply = post_sync(key, {"snapshot": snapshot, "results": [], "acks": new_acks, "command_acks": new_command_acks,
                                 "audit_cursor": st["audit_cursor"], "lease": False})
-        st["pending_acks"] = []
+        st["pending_acks"], st["pending_command_acks"] = [], []
         append_audit(reply.get("audit") or [])
         st["audit_cursor"] = reply.get("audit_cursor", st["audit_cursor"])
         save_state(st)

@@ -8,7 +8,7 @@ import { z } from "zod";
 import { emailAllowed } from "./access";
 import { connection, DEFAULT_LIMITS, rateLimited, resolveTarget, sanitizeMessage, sanitizeObjective } from "./policy";
 import type { Connection, MessageLimits } from "./policy";
-import type { CommandAck, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem, ResultDoc, Sender, Snapshot, TaskConfig, TaskRow } from "./types";
+import type { CommandAck, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem, ResultDoc, Sender, Snapshot, TaskCaps, TaskRow } from "./types";
 import { SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START, SNAPSHOT_SCHEMA } from "./types";
 
 const str = z.string().max(4000);
@@ -78,6 +78,8 @@ export interface SyncResponse {
   audit: AuditRow[];
   audit_cursor: number;
 }
+
+export type SyncOutcome = { ok: true; response: SyncResponse } | { ok: false; status: number; reason: string };
 
 export interface Caller {
   email: string;
@@ -149,7 +151,10 @@ export interface TaskEventRow {
   remote_task_id: string;
   type: string;
   at: string;
-  detail: Record<string, unknown>;
+  // Typed `object`, not `Record<string, unknown>`: see CommandItem.payload's
+  // comment in types.ts -- the latter breaks RPC Stubify discriminant
+  // narrowing for every caller of listEvents/waitForEvents/taskEventLog.
+  detail: object;
 }
 
 // A started remote task's own (actor, client_id), the way pendingSenders()
@@ -286,7 +291,22 @@ export class HerdrState extends DurableObject<Env> {
       const snapRow = this.sql.exec<{ v: string }>(`SELECT v FROM kv WHERE k='snapshot'`).toArray()[0];
       this.cached = { lastMs: last, snapshot: snapRow ? (JSON.parse(snapRow.v) as Snapshot) : null };
     }
-    return { snapshot: this.cached.snapshot, connection: connection(this.cached.snapshot, last, nowMs, this.staleAfterS()) };
+    const conn = connection(this.cached.snapshot, last, nowMs, this.staleAfterS());
+    this.noteConnectionTransition(nowMs, conn.state);
+    return { snapshot: this.cached.snapshot, connection: conn };
+  }
+
+  // disconnected/reconnected (SPEC item 5) can only be OBSERVED, never
+  // scheduled: a Worker has no background clock, only requests. Whichever
+  // tool call happens to be the first to see the connection cross the
+  // staleAfterS threshold (either direction) records the transition, once,
+  // as a global event (remote_task_id '' -- it is not about any one task).
+  private noteConnectionTransition(nowMs: number, state: string): void {
+    const up = state === "connected" || state === "degraded" ? "up" : "down";
+    const row = this.sql.exec<{ v: string }>(`SELECT v FROM kv WHERE k='conn_bucket'`).toArray()[0];
+    if (row?.v === up) return;
+    this.sql.exec(`INSERT OR REPLACE INTO kv (k, v) VALUES ('conn_bucket', ?)`, up);
+    if (row) this.recordTaskEvent(nowMs, "", up === "up" ? "reconnected" : "disconnected", { state });
   }
 
   result(taskId: string, source = ".handoffs/PROOF.md"): (ResultDoc & { synced_at: string }) | null {
@@ -402,7 +422,7 @@ export class HerdrState extends DurableObject<Env> {
 
   // Caps in force this tick: the Mac's own pushed config when we have one
   // synced, else the conservative built-in default (cold start only).
-  private taskCaps(nowMs: number): { max_concurrent: number; max_per_day: number; max_minutes: number } {
+  private taskCaps(nowMs: number): TaskCaps {
     return this.view(nowMs).snapshot?.task_config?.caps ?? DEFAULT_TASK_CAPS;
   }
 
@@ -557,8 +577,18 @@ export class HerdrState extends DurableObject<Env> {
     return this.sql.exec<{ actor: string; client_id: string; mode: string }>(
       `SELECT DISTINCT rt.requester_email AS actor, rt.requester_client AS client_id, rt.mode AS mode
        FROM remote_tasks rt JOIN commands c ON c.remote_task_id = rt.remote_task_id
-       WHERE c.op='start' AND c.status='queued'`, nowMs).toArray()
+       WHERE c.op='start' AND c.status='queued' AND c.expires_at > ?`, nowMs).toArray()
       .map((r) => ({ actor: r.actor, client_id: r.client_id, scope: r.mode === "research" ? SCOPE_TASK_START : SCOPE_TASK_IMPLEMENT }));
+  }
+
+  // get_task_answer's "progress" field: this one remote task's own recent
+  // history, newest first (unlike listEvents' global ascending cursor feed).
+  taskEventLog(remoteTaskId: string, limit: number): TaskEventRow[] {
+    return this.sql.exec<{ cursor: number; remote_task_id: string; type: string; at: number; detail: string }>(
+      `SELECT cursor, remote_task_id, type, at, detail FROM task_events WHERE remote_task_id=? ORDER BY cursor DESC LIMIT ?`,
+      remoteTaskId, limit,
+    ).toArray().map((r) => ({ cursor: r.cursor, remote_task_id: r.remote_task_id, type: r.type, at: iso(r.at),
+      detail: JSON.parse(r.detail || "{}") as object }));
   }
 
   listEvents(sinceCursor: number, limit: number): { cursor: number; events: TaskEventRow[] } {
@@ -568,7 +598,7 @@ export class HerdrState extends DurableObject<Env> {
     return {
       cursor: rows.length ? rows[rows.length - 1]!.cursor : sinceCursor,
       events: rows.map((r) => ({ cursor: r.cursor, remote_task_id: r.remote_task_id, type: r.type, at: iso(r.at),
-        detail: JSON.parse(r.detail || "{}") as Record<string, unknown> })),
+        detail: JSON.parse(r.detail || "{}") as object })),
     };
   }
 
@@ -636,8 +666,7 @@ export class HerdrState extends DurableObject<Env> {
   // enforce task deadlines, remap local task state onto the richer remote
   // vocabulary, expire, lease the outbox and the command queue, and hand
   // back new audit rows for the Mac's local copy.
-  sync(nowMs: number, nonce: string, rawBody: string, gate: DeliveryGate, cmdGate: DeliveryGate):
-      { ok: true; response: SyncResponse } | { ok: false; status: number; reason: string } {
+  sync(nowMs: number, nonce: string, rawBody: string, gate: DeliveryGate, cmdGate: DeliveryGate): SyncOutcome {
     if (!this.takeNonce(nowMs, nonce)) return { ok: false, status: 409, reason: "replayed_nonce" };
     let json: unknown;
     try { json = JSON.parse(rawBody); } catch { return { ok: false, status: 400, reason: "bad_json" }; }
@@ -682,6 +711,7 @@ export class HerdrState extends DurableObject<Env> {
           a.local_task_id ?? "", a.local_run_id ?? "", a.branch ?? "", a.pane_id ?? "", a.agent_id ?? "",
           JSON.stringify(a.capability_probe ?? {}), nowMs, c.remote_task_id);
         this.recordTaskEvent(nowMs, c.remote_task_id, "state_changed", { state: "running" });
+        if (c.op === "start" && a.capability_probe) this.recordTaskEvent(nowMs, c.remote_task_id, "capability_probe", a.capability_probe);
       } else if (a.outcome !== "accepted" && (c.op === "start" || c.op === "resume")) {
         this.sql.exec(`UPDATE remote_tasks SET state='failed', updated_at=? WHERE remote_task_id=?`, nowMs, c.remote_task_id);
         this.recordTaskEvent(nowMs, c.remote_task_id, "failed", { reason: a.detail });
@@ -840,7 +870,7 @@ export class HerdrState extends DurableObject<Env> {
       ok: true,
       response: {
         outbox: due.map((m) => ({ ...m, attempts: m.attempts + 1 })),
-        commands: dueCommands.map((c) => ({ ...c, payload: JSON.parse(c.payload) as Record<string, unknown>, attempts: c.attempts + 1 })),
+        commands: dueCommands.map((c) => ({ ...c, payload: JSON.parse(c.payload) as object, attempts: c.attempts + 1 })),
         audit, audit_cursor: cursor,
       },
     };

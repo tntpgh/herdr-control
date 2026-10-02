@@ -31,6 +31,11 @@
 		     leased message. Re-run without the flag to turn it off. -->
 		<key>HERDR_MCP_MESSAGING</key>
 		<string>__REMOTE_MCP_MESSAGING__</string>
+		<!-- Same shape, for the remote task lifecycle (start_task/cancel_task/
+		     resume_task): "1" only with install.sh --remote-mcp-tasks; anything
+		     else refuses a new start command and cancels every queued one. -->
+		<key>HERDR_MCP_TASKS</key>
+		<string>__REMOTE_MCP_TASKS__</string>
 	</dict>
 	<!-- 15 s: the Worker reports `disconnected` after 90 s without a sync,
 	     so six missed ticks in a row are what it takes to go dark. -->

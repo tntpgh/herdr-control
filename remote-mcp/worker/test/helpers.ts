@@ -105,6 +105,7 @@ export function snapshot(overrides: Partial<Snapshot> = {}): Snapshot {
     task_id: id, run_id: `run_${id}`, label, project: "knowledge-base", repo: "knowledge-base", branch: label,
     state, stored_state: state, state_source: "live", created_at: now, updated_at: now, completed_at: null,
     closure_reason: null, closure_proof: null, pane_id: agent ? `w1:${agent}` : null, agent_id: agent, agent_live: live, has_result: false,
+    remote_task_id: null, verified: null, verify_detail: null,
   });
   return {
     schema: 1,
@@ -125,12 +126,13 @@ export function snapshot(overrides: Partial<Snapshot> = {}): Snapshot {
     ],
     blockers: [{ task_id: "task_D2", label: "review:dup", pane_id: "w1:term_d2", agent_id: "term_d2", kind: "permission",
       tool: "bash", summary: "bash: git push origin feat/x", since: now }],
+    task_config: null,
     ...overrides,
   };
 }
 
 export function syncBody(over: Partial<SyncBody> = {}): SyncBody {
-  return { snapshot: snapshot(), results: [], acks: [], audit_cursor: 0, lease: true, ...over };
+  return { snapshot: snapshot(), results: [], acks: [], command_acks: [], audit_cursor: 0, lease: true, ...over };
 }
 
 // A message already sitting in the queue, as if sent under an earlier policy

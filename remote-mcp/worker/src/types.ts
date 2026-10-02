@@ -182,8 +182,12 @@ export interface CommandItem {
   // start: {repo, mode, objective}; cancel: {local_task_id, reason?};
   // resume: {local_task_id, local_run_id, branch, repo, text} -- everything
   // the Mac needs to re-enter the existing worktree without a second lookup.
-  payload: Record<string, unknown>;
-  attempts: number;
+  // Typed `object`, not `Record<string, unknown>`: the latter's `unknown`
+  // value type breaks Cloudflare's RPC Stubify<T> discriminant narrowing on
+  // SyncOutcome's `ok` field for every caller of stub.sync() (confirmed by
+  // bisection -- swapping this one field's type is what flips it). The Mac
+  // only ever reads this JSON-decoded, never indexes it generically here.
+  payload: object;
 }
 export interface CommandAck {
   command_id: string;
