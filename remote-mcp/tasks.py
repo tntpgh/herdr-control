@@ -171,19 +171,39 @@ def _read_identity(wt: Path) -> dict | None:
         return None
 
 
-def _cancel_after_spawn_failure(wt: Path, run_id: str = "", local_task_id: str = "") -> None:
+def _cancel_after_spawn_failure(wt: Path, run_id: str = "", local_task_id: str = "", expected_remote_id: str = "") -> None:
     """N1: every path that returns 'failed' AFTER spawn-task.sh has already
     registered a pane must not leave that agent alive with nothing stopping
     it -- best-effort cancel it now rather than relying only on sweep's
     deadline fallback (which may be the very write that just failed). A
     missing run_id/local_task_id (identity.json itself was unreadable) means
-    there is genuinely nothing to key a cancel on; this is then a no-op."""
+    there is genuinely nothing to key a cancel on; this is then a no-op.
+
+    R3-3: when run_id/local_task_id are not already in hand (the
+    TimeoutExpired/OSError path), this cold-reads identity.json from `wt`.
+    _resume reuses the PARENT's worktree, so if spawn-task.sh hung before
+    ever rewriting that file for THIS attempt, the read returns a STALE
+    identity belonging to a different, possibly still-live task -- cancelling
+    it would be cancelling the wrong agent. Before trusting a cold read,
+    confirm the registry's own row for the remote_task_id we were actually
+    trying to spawn names this exact run_id/task_id; registry-bridge's own
+    cancel re-checks the same thing (defense in depth)."""
     if not run_id or not local_task_id:
         identity = _read_identity(wt) if wt else None
         if not identity:
             return
         run_id, local_task_id = identity["run_id"], identity["task_id"]
-    _bridge("cancel", run_id, local_task_id, "post_spawn_setup_failed")
+        if expected_remote_id:
+            check = _bridge("read-by-remote", expected_remote_id)
+            if check.returncode != 0 or not check.stdout.strip():
+                return
+            try:
+                row = json.loads(check.stdout)
+            except ValueError:
+                return
+            if row.get("run_id") != run_id or row.get("task_id") != local_task_id:
+                return
+    _bridge("cancel", run_id, local_task_id, "post_spawn_setup_failed", expected_remote_id)
 
 
 def _find_repo_root(repo: str) -> Path | None:
@@ -347,7 +367,7 @@ def _start(cmd: dict) -> dict:
         try:
             proc = _spawn(root, branch, mcfg, brief)
         except (subprocess.TimeoutExpired, OSError) as exc:
-            _cancel_after_spawn_failure(wt)
+            _cancel_after_spawn_failure(wt, expected_remote_id=remote_id)
             return {"command_id": cid, "outcome": "failed",
                     "detail": f"spawn-task.sh crashed or did not finish in time: {exc}"[:300]}
         if proc.returncode != 0:
@@ -355,19 +375,19 @@ def _start(cmd: dict) -> dict:
                     "detail": f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:200]}"}
         identity = _read_identity(wt)
         if not identity:
-            _cancel_after_spawn_failure(wt)
+            _cancel_after_spawn_failure(wt, expected_remote_id=remote_id)
             return {"command_id": cid, "outcome": "failed", "detail": "spawned, but identity.json was unreadable"}
         run_id, local_task_id = identity["run_id"], identity["task_id"]
     stamped = _bridge("set-remote-id", run_id, local_task_id, remote_id)
     if stamped.returncode != 0:
-        _cancel_after_spawn_failure(wt, run_id, local_task_id)
+        _cancel_after_spawn_failure(wt, run_id, local_task_id, remote_id)
         return {"command_id": cid, "outcome": "failed",
                 "detail": "spawned, but could not stamp remote_task_id onto the registry row",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
     row = json.loads(stamped.stdout) if stamped.stdout.strip() else {}
     deadlined = _bridge("set-deadline", run_id, local_task_id, _iso_in(caps["max_minutes"] * 60))
     if deadlined.returncode != 0:
-        _cancel_after_spawn_failure(wt, run_id, local_task_id)
+        _cancel_after_spawn_failure(wt, run_id, local_task_id, remote_id)
         return {"command_id": cid, "outcome": "failed",
                 "detail": "spawned, but could not set the deadline that is the only backstop on a runaway task",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
@@ -388,7 +408,7 @@ def _cancel(cmd: dict) -> dict:
         return {"command_id": cid, "outcome": "failed", "detail": "no local registry record for that remote task"}
     row = json.loads(looked_up.stdout)
     reason = p.get("reason") or "canceled"
-    rc = _bridge("cancel", row["run_id"], row["task_id"], reason)
+    rc = _bridge("cancel", row["run_id"], row["task_id"], reason, remote_id)
     if rc.returncode != 0:
         return {"command_id": cid, "outcome": "failed",
                 "detail": rc.stderr.strip()[:200] or "cancel refused (already terminal?)"}
@@ -450,7 +470,7 @@ def _resume(cmd: dict) -> dict:
     try:
         proc = _spawn(root, branch, mcfg, brief)
     except (subprocess.TimeoutExpired, OSError) as exc:
-        _cancel_after_spawn_failure(wt)
+        _cancel_after_spawn_failure(wt, expected_remote_id=remote_id)
         return {"command_id": cid, "outcome": "failed",
                 "detail": f"spawn-task.sh crashed or did not finish in time: {exc}"[:300]}
     if proc.returncode != 0:
@@ -458,19 +478,19 @@ def _resume(cmd: dict) -> dict:
                 "detail": f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:200]}"}
     identity = _read_identity(wt)
     if not identity:
-        _cancel_after_spawn_failure(wt)
+        _cancel_after_spawn_failure(wt, expected_remote_id=remote_id)
         return {"command_id": cid, "outcome": "failed", "detail": "resumed, but identity.json was unreadable"}
     run_id, local_task_id = identity["run_id"], identity["task_id"]
     stamped = _bridge("set-remote-id", run_id, local_task_id, remote_id)
     if stamped.returncode != 0:
-        _cancel_after_spawn_failure(wt, run_id, local_task_id)
+        _cancel_after_spawn_failure(wt, run_id, local_task_id, remote_id)
         return {"command_id": cid, "outcome": "failed",
                 "detail": "resumed, but could not stamp remote_task_id onto the registry row",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
     row = json.loads(stamped.stdout) if stamped.stdout.strip() else {}
     deadlined = _bridge("set-deadline", run_id, local_task_id, _iso_in(caps["max_minutes"] * 60))
     if deadlined.returncode != 0:
-        _cancel_after_spawn_failure(wt, run_id, local_task_id)
+        _cancel_after_spawn_failure(wt, run_id, local_task_id, remote_id)
         return {"command_id": cid, "outcome": "failed",
                 "detail": "resumed, but could not set the deadline that is the only backstop on a runaway task",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}

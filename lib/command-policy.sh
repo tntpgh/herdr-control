@@ -3815,6 +3815,20 @@ _cp_write_menu_verdict() {
     wt_abs="$(_cp_lexical_abspath "$wt")"
     rel="${abs#"$wt_abs"/}"
     if [ "$rel" = ".handoffs/$hw" ]; then
+      # R3-4: the lexical check alone cannot see a symlink planted AT this
+      # exact path (e.g. by an earlier approved `ln -s ../src/x
+      # .handoffs/ANSWER.md`) -- the write tool follows it and lands
+      # somewhere else entirely while `rel` still looks exactly like the
+      # one safe path. Refuse when the real, symlink-resolved location
+      # differs from the lexical one.
+      if [ -e "$wt/$rel" ] || [ -L "$wt/$rel" ]; then
+        local real
+        real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt/$rel" 2>/dev/null)"
+        if [ -z "$real" ] || [ "$real" != "$abs" ]; then
+          printf 'escalate:this task'"'"'s one allowed .handoffs file is a symlink to somewhere else — remains human-only'
+          return 0
+        fi
+      fi
       printf 'allow'
     else
       printf 'escalate:this task'"'"'s manifest restricts its write tool to .handoffs/%s only' "$hw"

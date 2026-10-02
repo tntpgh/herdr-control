@@ -378,6 +378,49 @@ class ResumeCommand(unittest.TestCase):
         self.assertEqual(out["local_task_id"], "task_fake1")
         self.assertIn("set-deadline", FAKE_BRIDGE_LOG.read_text())
 
+    def test_resume_crash_with_a_stale_identity_in_the_reused_worktree_never_cancels_the_wrong_task(self):
+        # R3-3: _resume REUSES the parent's worktree (unlike _start, which
+        # always gets a fresh one). If spawn-task.sh hangs/crashes before
+        # ever rewriting identity.json for THIS attempt, the best-effort
+        # cleanup's cold _read_identity(wt) would previously trust whatever
+        # identity.json already sat there -- here, a DIFFERENT, still-live
+        # task's own ids, left over from whatever spawned into this
+        # worktree before. Cancelling on that read would cancel the wrong
+        # agent. The fix cross-checks the read-back run_id/task_id against
+        # the registry's own row for the remote_task_id we were actually
+        # trying to resume (read-by-remote) before ever calling cancel.
+        (self.wt / ".handoffs").mkdir(parents=True, exist_ok=True)
+        (self.wt / ".handoffs" / "identity.json").write_text(
+            json.dumps({"run_id": "run_STALE", "task_id": "task_STALE", "pane_id": "pane_STALE"}))
+        old_spawn = tsk.SPAWN_TASK
+        tsk.SPAWN_TASK = str(TMP / "does-not-exist-r33.sh")
+        try:
+            out = tsk.process_command(self._cmd())
+        finally:
+            tsk.SPAWN_TASK = old_spawn
+        self.assertEqual(out["outcome"], "failed")
+        log = FAKE_BRIDGE_LOG.read_text()
+        self.assertIn("read-by-remote rtask_20261002T000000Z_deadbeef", log)
+        self.assertNotIn("cancel run_STALE task_STALE", log)
+
+    def test_resume_crash_with_a_matching_identity_in_the_reused_worktree_still_cancels(self):
+        # Same crash, but identity.json in the reused worktree genuinely
+        # belongs to what we just tried to resume (matches the registry
+        # row read-by-remote would return) -- the cross-check must not
+        # turn into a no-op for the LEGITIMATE case, or N1's whole point
+        # (never leave a post-spawn-failure pane uncancelled) regresses.
+        (self.wt / ".handoffs").mkdir(parents=True, exist_ok=True)
+        (self.wt / ".handoffs" / "identity.json").write_text(
+            json.dumps({"run_id": "run_fake1", "task_id": "task_fake1", "pane_id": "pane_1"}))
+        old_spawn = tsk.SPAWN_TASK
+        tsk.SPAWN_TASK = str(TMP / "does-not-exist-r33b.sh")
+        try:
+            out = tsk.process_command(self._cmd())
+        finally:
+            tsk.SPAWN_TASK = old_spawn
+        self.assertEqual(out["outcome"], "failed")
+        self.assertIn("cancel run_fake1 task_fake1", FAKE_BRIDGE_LOG.read_text())
+
 
 class Robustness(unittest.TestCase):
     def setUp(self):

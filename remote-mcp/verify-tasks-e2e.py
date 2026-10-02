@@ -146,6 +146,58 @@ check("`herdr pane list` was attempted", "pane list" in herdr_calls, herdr_calls
 check("`herdr pane close` was NEVER attempted once `pane list` failed (N5, no fail-open)",
       "pane close" not in herdr_calls, herdr_calls)
 
+print("== R3-3: real registry-bridge.sh cancel refuses when the row's own remote_task_id does not match ==")
+import subprocess  # noqa: E402 (test-only, added for this direct bridge call)
+out4 = tsk.process_command({
+    "command_id": "cmd_6", "op": "start", "remote_task_id": "rtask_20261002T000004Z_e2e00004",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "w"},
+})
+check("fourth start accepted", out4.get("outcome") == "accepted", json.dumps(out4))
+task_id4, run_id4 = out4.get("local_task_id", ""), out4.get("local_run_id", "")
+bridge_out = subprocess.run(
+    [tsk.REGISTRY_BRIDGE, "cancel", run_id4, task_id4, "wrong_task_mismatch", "rtask_SOMEONE_ELSES_TASK"],
+    capture_output=True, text=True)
+check("registry-bridge.sh cancel exits nonzero on a remote_task_id mismatch", bridge_out.returncode != 0, bridge_out.stderr)
+row4 = registry_row(task_id4)
+check("registry state is untouched by the refused cancel (still starting/running, not cancelled)",
+      bool(row4) and row4.get("state") != "cancelled", row4)
+bridge_out2 = subprocess.run(
+    [tsk.REGISTRY_BRIDGE, "cancel", run_id4, task_id4, "correct_match", "rtask_20261002T000004Z_e2e00004"],
+    capture_output=True, text=True)
+check("registry-bridge.sh cancel succeeds when the expected remote_task_id matches the row's own",
+      bridge_out2.returncode == 0, bridge_out2.stderr)
+row4b = registry_row(task_id4)
+check("registry state is 'cancelled' once the remote_task_id actually matches",
+      bool(row4b) and row4b.get("state") == "cancelled", row4b)
+
+print("== R3-6: real registry-bridge.sh cancel skips the pane close when `herdr pane list` returns non-JSON with rc 0 ==")
+fake_herdr2_log = TMP / "fake-herdr2-calls.log"
+fake_herdr.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {fake_herdr2_log}
+case "$1 $2" in
+  "pane list") printf 'not json at all\\n'; exit 0 ;;
+esac
+exit 0
+""")
+out5 = tsk.process_command({
+    "command_id": "cmd_7", "op": "start", "remote_task_id": "rtask_20261002T000005Z_e2e00005",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "v"},
+})
+check("fifth start accepted", out5.get("outcome") == "accepted", json.dumps(out5))
+task_id5 = out5.get("local_task_id", "")
+cout5 = tsk.process_command({
+    "command_id": "cmd_8", "op": "cancel", "remote_task_id": "rtask_20261002T000005Z_e2e00005",
+    "payload": {"local_task_id": task_id5, "reason": "canceled"},
+})
+check("cancel still accepted when `herdr pane list` returns rc=0 but non-JSON", cout5.get("outcome") == "accepted", json.dumps(cout5))
+row5 = registry_row(task_id5)
+check("registry state is 'cancelled' regardless of the unparseable pane list",
+      bool(row5) and row5.get("state") == "cancelled", row5)
+herdr2_calls = fake_herdr2_log.read_text() if fake_herdr2_log.exists() else ""
+check("`herdr pane list` was attempted", "pane list" in herdr2_calls, herdr2_calls)
+check("`herdr pane close` was NEVER attempted when jq could not parse a rc=0 list (R3-6, no fail-open)",
+      "pane close" not in herdr2_calls, herdr2_calls)
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 if failures:
