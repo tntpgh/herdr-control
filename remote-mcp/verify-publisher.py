@@ -91,10 +91,19 @@ FAKE.write_text('#!/bin/bash\nfor a in "$@"; do printf "%s\\0" "$a"; done > "$FA
 FAKE.chmod(0o755)
 
 # A chrome-relay.py stand-in that also emits fields which must NOT be synced.
-CHROME = TMP / "fake-chrome-relay.py"
-CHROME.write_text("import json; print(json.dumps({'checked_at': 'T', 'real_chrome_running': True, 'real_chrome_pid': 4242, "
-                  f"'profile_dir': {str(TMP)!r}, 'relay': 'connected', 'extensions': {{'chatgpt': 'enabled'}}, "
-                  "'stray_omp_chromes': 0, 'healthy': True}))\n")
+GOOD_BROWSER = {"checked_at": "T", "real_chrome_running": True, "real_chrome_pid": 4242, "profile_dir": str(TMP),
+                "relay": "connected", "extensions": {"omp_relay": "enabled", "1password": "enabled", "chatgpt": "enabled"},
+                "stray_omp_chromes": 0, "healthy": True}
+
+
+def fake_chrome(name: str, doc: object) -> Path:
+    """A script printing `doc` as JSON, or verbatim when doc is a str."""
+    p = TMP / name
+    p.write_text(f"print({(doc if isinstance(doc, str) else json.dumps(doc))!r})\n")
+    return p
+
+
+CHROME = fake_chrome("fake-chrome-relay.py", GOOD_BROWSER)
 
 os.environ.update(HERDR_HUB_URL=f"http://127.0.0.1:{hub.server_port}", HERDR_RUN_REGISTRY=str(REG),
                   HERDR_STATE_DIR=str(TMP / "state"), HERDR_DELIVER=str(FAKE), FAKE_ARGV=str(TMP / "argv"),
@@ -139,12 +148,20 @@ class Snapshot(unittest.TestCase):
         self.assertTrue(self.snap["browser"]["healthy"])
         self.assertNotIn("4242", json.dumps(self.snap))
 
-    def test_unreadable_browser_status_is_omitted_not_fatal(self):
-        bad = TMP / "bad-chrome-relay.py"
-        bad.write_text("print('not json')\n")
-        saved, pub.CHROME_RELAY = pub.CHROME_RELAY, str(bad)
+    def test_bad_browser_output_is_omitted_so_the_worker_never_rejects_the_sync(self):
+        drift = [
+            "not json",
+            {**GOOD_BROWSER, "extensions": {"chatgpt": "enabled"}},                       # missing keys
+            {**GOOD_BROWSER, "extensions": {**GOOD_BROWSER["extensions"], "chatgpt": "blocked"}},  # new state
+            {**GOOD_BROWSER, "relay": "connected to /Users/x"},                         # free text
+            {**GOOD_BROWSER, "stray_omp_chromes": "2"},
+        ]
+        saved = pub.CHROME_RELAY
         try:
-            self.assertIsNone(pub.browser_status())
+            for i, doc in enumerate(drift):
+                with self.subTest(doc=doc):
+                    pub.CHROME_RELAY = str(fake_chrome(f"drift-{i}.py", doc))
+                    self.assertIsNone(pub.browser_status())
         finally:
             pub.CHROME_RELAY = saved
 

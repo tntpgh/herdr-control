@@ -358,11 +358,7 @@ if [ "$BRIDGE" = 1 ]; then
     echo "  ! or remove it first. Skipping the bridge step." >&2
   elif [ "$APPLY" = 1 ]; then
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-    # `&` in a sed replacement means "the whole match", and a `|` would end the
-    # expression, so a checkout path or $HOME containing either renders a
-    # corrupted path — silently, into a file launchd runs at every login.
-    # Escape both before substituting.
-    _sed_rhs() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
+    # _sed_rhs (agent-lib.sh) escapes `&`, `|` and `\` before substituting.
     sed -e "s|__RUN_BRIDGE__|$(_sed_rhs "$here/slack-bridge/run-bridge.sh")|" \
         -e "s|__HOME__|$(_sed_rhs "$HOME")|g" \
         -e "s|__LOG_PATH__|$(_sed_rhs "$HOME/Library/Logs/com.herdr-control.bridge.log")|g" \
@@ -455,10 +451,13 @@ if [ "$CHROME" = 1 ]; then
   if [ "$APPLY" = 1 ]; then
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
     if deploy_app "${HUB_REV:-origin/main}"; then
-      sed -e "s|__CHROME_RELAY_PY__|$HERDR_APP_DIR/chrome-relay.py|" \
-          -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.chrome-relay.log|g" \
-        "$here/launchd/com.herdr-control.chrome-relay.plist.template" > "$PLIST"
-      if chrome_exit="$(load_interval_agent com.herdr-control.chrome-relay "$PLIST")"; then
+      # Render beside the live plist and lint it first, so a bad render never
+      # replaces a working one.
+      sed -e "s|__CHROME_RELAY_PY__|$(_sed_rhs "$HERDR_APP_DIR/chrome-relay.py")|" \
+          -e "s|__LOG_PATH__|$(_sed_rhs "$HOME/Library/Logs/com.herdr-control.chrome-relay.log")|g" \
+        "$here/launchd/com.herdr-control.chrome-relay.plist.template" > "$PLIST.tmp"
+      if plutil -lint "$PLIST.tmp" >/dev/null && mv "$PLIST.tmp" "$PLIST" \
+         && chrome_exit="$(load_interval_agent com.herdr-control.chrome-relay "$PLIST")"; then
         echo "  chrome-relay keeper loaded (login + every 5 min); first tick last exit code: $chrome_exit"
       else
         INSTALL_RC=2; echo "  ! chrome-relay keeper: first tick exit ${chrome_exit:-?}; check ~/Library/Logs/com.herdr-control.chrome-relay.log" >&2

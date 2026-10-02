@@ -52,6 +52,8 @@ DELIVER = os.environ.get("HERDR_DELIVER", str(REPO / "herdr-deliver.sh"))
 CHROME_RELAY = os.environ.get("HERDR_CHROME_RELAY", str(REPO / "chrome-relay.py"))
 # The only browser fields that leave the Mac: booleans, enums and a count.
 BROWSER_FIELDS = ("checked_at", "real_chrome_running", "relay", "extensions", "stray_omp_chromes", "healthy")
+EXTENSIONS = ("omp_relay", "1password", "chatgpt")  # must match the Worker's schema
+EXT_STATES = ("enabled", "disabled", "missing")
 
 SCHEMA = 1
 TERMINAL = {"completed", "cancelled", "lost", "gone", "error"}
@@ -210,12 +212,22 @@ def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict],
 
 def browser_status() -> dict | None:
     """Is the real Chrome up for Zero and omp (chrome-relay.py --status --json)?
-    None when it cannot say; the rest of the snapshot never waits on it."""
+    None when it cannot say. The shape is checked HERE, against the Worker's
+    schema, because the Worker rejects a whole sync on one bad field."""
     try:
         out = subprocess.run([sys.executable, CHROME_RELAY, "--status", "--json"],
                              capture_output=True, text=True, timeout=10).stdout
         r = json.loads(out)
-        return {k: r[k] for k in BROWSER_FIELDS}
+        b = {k: r[k] for k in BROWSER_FIELDS}
+        ext = b["extensions"]
+        if not (isinstance(b["checked_at"], str) and len(b["checked_at"]) <= 40
+                and all(type(b[k]) is bool for k in ("real_chrome_running", "healthy"))
+                and type(b["stray_omp_chromes"]) is int and 0 <= b["stray_omp_chromes"] <= 1000
+                and isinstance(b["relay"], str) and re.fullmatch(r"connected|no-extension|down|http-\d{3}", b["relay"])
+                and isinstance(ext, dict) and set(ext) == set(EXTENSIONS)
+                and all(v in EXT_STATES for v in ext.values())):
+            raise ValueError(f"unexpected shape: {json.dumps(b)[:200]}")
+        return b
     except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as exc:
         log(f"chrome-relay status unavailable, browser omitted this tick: {exc!r}")
         return None

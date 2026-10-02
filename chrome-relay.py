@@ -18,12 +18,15 @@ click opens a window in THAT instance: "signed out, extensions gone".
 cannot be captured by a stray.
 
   chrome-relay.py              open a window in the real Chrome (launch if needed)
-  chrome-relay.py --ensure     launchd tick: launch it in the background only if
-                               not running; close omp-profile Chromes nobody is
-                               attached to. Never opens a window otherwise.
+  chrome-relay.py --ensure     launchd tick: start it in the background if it is
+                               not running, then close omp-profile Chromes that
+                               had no CDP client on two ticks in a row. Never
+                               opens a window otherwise.
   chrome-relay.py --status [--json]
                                report; --json is what remote-mcp/publisher.py
                                syncs to Zero (no paths, URLs or account names)
+  chrome-relay.py --pause HOURS | --resume
+                               stop / restart --ensure (you quit Chrome on purpose)
 
 Exit 0 = real Chrome running, all three extensions enabled, and the relay is
 not "no-extension" (relay "down" just means no omp session has started it).
@@ -50,60 +53,95 @@ HOME = Path.home()
 UDD = HOME / "Library/Application Support/Google/Chrome"
 OMP_PROFILES = HOME / ".omp/browser-profiles"
 RELAY_EXT_DIR = HOME / ".omp/browser-relay/extension"
+STATE = HOME / ".local/state/herdr"
+IDLE_FILE = STATE / "chrome-relay-idle.json"   # strays seen idle last tick
+PAUSE_FILE = STATE / "chrome-relay.pause"      # epoch seconds the pause ends
 PROFILE = os.environ.get("CHROME_PROFILE", "Profile 1")
 RELAY_PORT = int(os.environ.get("OMP_RELAY_PORT", "9224"))
+MIN_STRAY_AGE_S = 120  # never touch a browser omp may still be connecting to
 # Chrome Web Store IDs are fixed; the relay's unpacked ID depends on its path,
 # so it is matched by path instead.
 STORE_IDS = {"1password": "aeblfdkhhhdcdjpifhhbdiojplfjncoa", "chatgpt": "hehggadaopoacecdllhhajmbjkdcmajg"}
+UDD_FLAG = r"(?:^| )--user-data-dir="
 
 
 def chrome_kind(args: str) -> str | None:
     """real | omp | None (another data dir). `ps` joins argv with spaces and the
     default data dir has spaces in it, so match known prefixes, never split."""
-    if "--user-data-dir=" not in args:
+    if not re.search(UDD_FLAG, args):
         return "real"
-    if re.search(rf"--user-data-dir={re.escape(str(UDD))}/?(?: |$)", args):
+    if re.search(UDD_FLAG + rf"{re.escape(str(UDD))}/?(?: |$)", args):
         return "real"
-    if f"--user-data-dir={OMP_PROFILES}/" in args:
+    if re.search(UDD_FLAG + re.escape(f"{OMP_PROFILES}/"), args):
         return "omp"
     return None
 
 
-def omp_cdp_port(args: str) -> int | None:
+def etime_s(etime: str) -> int:
+    """ps etime `[[dd-]hh:]mm:ss` -> seconds."""
+    days, _, hms = etime.strip().rpartition("-")
+    parts = [int(p) for p in hms.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return (int(days) if days else 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def omp_cdp_port(args: str, started_at: float) -> int | None:
     m = re.search(r"--remote-debugging-port=(\d+)", args)
     if m and m.group(1) != "0":
         return int(m.group(1))
     # Port 0: Chrome writes the chosen one into the profile. omp profile names
-    # have no spaces, so the dir ends at the next space.
-    m = re.search(rf"--user-data-dir=({re.escape(str(OMP_PROFILES))}/\S+)", args)
+    # have no spaces, so the dir ends at the next space. The profile dir is
+    # persistent, so a file older than this process is a previous run's.
+    m = re.search(UDD_FLAG + rf"({re.escape(str(OMP_PROFILES))}/\S+)", args)
     try:
-        return int((Path(m.group(1)) / "DevToolsActivePort").read_text().split()[0]) if m else None
+        f = Path(m.group(1)) / "DevToolsActivePort" if m else None
+        if f is None or f.stat().st_mtime < started_at - 1:
+            return None
+        return int(f.read_text().split()[0])
     except (OSError, IndexError, ValueError):
         return None
 
 
-def chrome_mains() -> list[tuple[int, str]]:
-    """Main Chrome processes; helpers live under Frameworks/, a different path."""
-    out = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, check=True).stdout
+def chrome_mains() -> list[dict]:
+    """This user's main Chrome processes (helpers live under Frameworks/)."""
+    out = subprocess.run(["ps", "-x", "-U", str(os.getuid()), "-o", "pid=,etime=,lstart=,args="],
+                         capture_output=True, text=True, check=True).stdout
     rows = []
     for line in out.splitlines():
-        pid, _, args = line.strip().partition(" ")
+        # pid, etime, then lstart is always 5 tokens ("Thu Oct  1 22:19:57 2026").
+        f = line.split(None, 7)
+        if len(f) < 8:
+            continue
+        args = f[7]
         if args == BIN or args.startswith(BIN + " "):
-            rows.append((int(pid), args))
+            rows.append({"pid": int(f[0]), "age_s": etime_s(f[1]), "lstart": " ".join(f[2:7]), "args": args})
     return rows
 
 
+def singleton_pid() -> int | None:
+    """Chrome's own lock on the default data dir: SingletonLock -> 'host-<pid>'.
+    Catches a real Chrome that `ps` matching missed (other bundle path)."""
+    try:
+        pid = int(os.readlink(UDD / "SingletonLock").rsplit("-", 1)[1])
+        comm = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True).stdout
+        return pid if comm.strip().endswith("/Google Chrome") else None  # a stale lock's pid may be reused
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def classify() -> tuple[int | None, list[dict]]:
-    real, strays = None, []
-    for pid, args in chrome_mains():
-        kind = chrome_kind(args)
+    real, strays, now = None, [], time.time()
+    for p in chrome_mains():
+        kind = chrome_kind(p["args"])
         if kind == "real":
-            real = pid
+            real = p["pid"]
         elif kind == "omp":
-            strays.append({"pid": pid, "cdp_port": omp_cdp_port(args)})
+            strays.append({"pid": p["pid"], "age_s": p["age_s"], "lstart": p["lstart"],
+                           "cdp_port": omp_cdp_port(p["args"], now - p["age_s"])})
     for s in strays:
         s["cdp_clients"] = cdp_clients(s["pid"], s["cdp_port"])
-    return real, strays
+    return real or singleton_pid(), strays
 
 
 def cdp_clients(pid: int, port: int | None) -> list[int]:
@@ -161,16 +199,38 @@ def launch(background: bool) -> int | None:
 
 
 def close_idle(strays: list[dict]) -> None:
+    """SIGTERM an omp-profile Chrome only when it is older than MIN_STRAY_AGE_S
+    and had a known CDP port with no client on this tick AND the previous one
+    (same pid and start time, so pid reuse cannot match)."""
+    try:
+        before = json.loads(IDLE_FILE.read_text())
+    except (OSError, ValueError):
+        before = {}
+    idle_now = {}
     for s in strays:
-        # Unknown port = cannot prove nobody is driving it, so it stays.
-        if s["cdp_port"] is None or s["cdp_clients"]:
-            print(f"stray omp Chrome pid={s['pid']} kept: cdp={s['cdp_port']} clients={s['cdp_clients'] or 'unknown'}")
+        idle = s["cdp_port"] is not None and not s["cdp_clients"] and s["age_s"] >= MIN_STRAY_AGE_S
+        if not idle:
+            continue
+        key = str(s["pid"])
+        if before.get(key) != s["lstart"]:
+            idle_now[key] = s["lstart"]
+            print(f"stray omp Chrome pid={key} idle; closing next tick if still idle")
             continue
         try:
             os.kill(s["pid"], signal.SIGTERM)
-            print(f"stray omp Chrome pid={s['pid']} closed (no CDP client)")
+            print(f"stray omp Chrome pid={key} closed (no CDP client on two ticks)")
         except ProcessLookupError:
             pass
+    STATE.mkdir(parents=True, exist_ok=True)
+    IDLE_FILE.write_text(json.dumps(idle_now))
+
+
+def paused_until() -> float | None:
+    try:
+        until = float(PAUSE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    return until if until > time.time() else None
 
 
 def report(real: int | None, strays: list[dict]) -> dict:
@@ -188,6 +248,16 @@ def report(real: int | None, strays: list[dict]) -> dict:
 
 
 def main(argv: list[str]) -> int:
+    if argv[:1] == ["--pause"] and len(argv) == 2:
+        STATE.mkdir(parents=True, exist_ok=True)
+        until = time.time() + float(argv[1]) * 3600
+        PAUSE_FILE.write_text(str(until))
+        print(f"--ensure paused until {datetime.fromtimestamp(until).isoformat(timespec='minutes')}")
+        return 0
+    if argv == ["--resume"]:
+        PAUSE_FILE.unlink(missing_ok=True)
+        print("--ensure resumed")
+        return 0
     unknown = set(argv) - {"--ensure", "--status", "--json"}
     if unknown or ("--ensure" in argv and "--status" in argv):
         print(__doc__, file=sys.stderr)
@@ -198,10 +268,13 @@ def main(argv: list[str]) -> int:
 
     real, strays = classify()
     if "--ensure" in argv:
-        close_idle(strays)
-        if real is None:
+        if (until := paused_until()) is not None:
+            print(f"paused until {datetime.fromtimestamp(until).isoformat(timespec='minutes')}; nothing done")
+            return 0
+        if real is None:  # real Chrome first, so a stray never was the only one
             real = launch(background=True)
             print(f"real Chrome was not running; launched pid={real}")
+        close_idle(strays)
         real, strays = classify()
     elif "--status" not in argv:
         real = launch(background=False)  # opens a window, launching if needed
@@ -218,8 +291,11 @@ def main(argv: list[str]) -> int:
         print(f"real Chrome: {'pid=' + str(real) if real else 'NOT running'} profile='{PROFILE}'")
         print(f"relay: {r['relay']} (:{RELAY_PORT})")
         print("extensions: " + ", ".join(f"{k}={v}" for k, v in r["extensions"].items()))
+        if (until := paused_until()) is not None:
+            print(f"--ensure paused until {datetime.fromtimestamp(until).isoformat(timespec='minutes')}")
         for s in strays:
-            print(f"stray omp Chrome pid={s['pid']} cdp={s['cdp_port']} clients={s['cdp_clients'] or 'none'}")
+            print(f"stray omp Chrome pid={s['pid']} age={s['age_s']}s cdp={s['cdp_port']} "
+                  f"clients={s['cdp_clients'] or 'none'}")
     return 0 if ok else 1
 
 

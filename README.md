@@ -1328,7 +1328,8 @@ or queries Neon.
 | `docs/herdr-config-snippet.toml` | sidebar rows + keybindings for the two tools above |
 | `slack-bridge/` | two-way Slack bot: outbound alerts + reply routing |
 | `herdr-rpc.py` | socket JSON-RPC for verbless methods (`tab.move`) |
-| `chrome-relay.py` | keeps the REAL Chrome up for omp and Zero (default data dir, `Profile 1`: OMP Browser Relay + 1Password + ChatGPT). No args opens a window; `--status [--json]` reports Chrome/relay/extension health (synced to Zero's `get_status` as `browser`); `--ensure` is the `com.herdr-control.chrome-relay` LaunchAgent tick (`install.sh --apply --chrome`): start Chrome in the background if it is down, close omp-profile Chromes (`~/.omp/browser-profiles/*`) with no CDP client, which otherwise capture a Dock click |
+| `chrome-relay.py` | keeps the REAL Chrome up for omp and Zero (default data dir, `Profile 1`: OMP Browser Relay + 1Password + ChatGPT). No args opens a window; `--status [--json]` reports Chrome/relay/extension health (synced to Zero's `get_status` as `browser`); `--ensure` is the `com.herdr-control.chrome-relay` LaunchAgent tick (`install.sh --apply --chrome`): start Chrome in the background if it is down, then close omp-profile Chromes (`~/.omp/browser-profiles/*`, which otherwise capture a Dock click) that are >2 min old and had no CDP client on two ticks in a row; `--pause HOURS` / `--resume` when you quit Chrome on purpose |
+| `verify-chrome-relay.py` | the kill decision: real vs omp-profile classification, stale DevToolsActivePort, the two-tick idle rule, pid reuse (CI: `.github/workflows/chrome-relay.yml`) |
 | `launchd/com.herdr-control.chrome-relay.plist.template` | login + every-5-min LaunchAgent for `chrome-relay.py --ensure`, run from the deployed app worktree |
 
 ### Why `agent-hooks/` and not `hooks/`

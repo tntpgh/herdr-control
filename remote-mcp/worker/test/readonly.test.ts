@@ -53,6 +53,11 @@ it("reports the Mac's real-Chrome health from the snapshot, and null when the pu
   };
   await signedSync(syncBody({ snapshot: snapshot({ browser }) }));
   expect((await callTool<{ browser: unknown }>(access_token, "get_status")).data.browser).toEqual(browser);
+
+  // Drift on the Mac must not cost the sync: the block degrades to null.
+  const res = await signedSync(syncBody({ snapshot: snapshot({ browser: { ...browser, relay: "connected to /Users/x" } }) }));
+  expect(res.status).toBe(200);
+  expect((await callTool<{ browser: unknown }>(access_token, "get_status")).data.browser).toBeNull();
 });
 
 it("refuses and audits a message in the Durable Object regardless of the scopes passed in", async () => {
