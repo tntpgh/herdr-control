@@ -335,8 +335,8 @@ check "branch column exists (#3b ownership grant)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='branch';")" "1"
 check "trunk column exists (#3b ownership grant)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='trunk';")" "1"
-check "schema_version is 7 (v7 adds tasks.remote_task_id/deadline_at/verified/verify_detail)" \
-  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "7"
+check "schema_version is 8 (v8 adds the owners table for the remote owner inbox)" \
+  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "8"
 check "project column exists (project-contract-plan.md #2)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='project';")" "1"
 check "manifest column exists (task-scoped approval)" \

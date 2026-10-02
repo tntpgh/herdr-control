@@ -25,6 +25,16 @@ export interface Env {
   // snapshot.task_config.mac_enabled: either off refuses a new start and
   // cancels everything still queued -- same two-switch shape as messaging.
   TASKS_ENABLED: string;
+  // "true" lets consent grant herdr:message.owner and lists send_owner_message/
+  // get_owner_message_status/get_owner_reply. A separate route from
+  // herdr:message: it targets a NAMED long-lived owning session (conductor,
+  // dedicated tab), never a task's agent, writes the body to a FILE on the
+  // Mac (never types it into a pane), and carries its own, lower rate limit.
+  // Same all-or-nothing shape as the other two switches: off hides the scope
+  // and tool, and the Durable Object refuses even a token granted while it
+  // was on. The Mac has its own switch, HERDR_MCP_OWNER_INBOX, set only by
+  // install.sh --remote-mcp-owner-inbox.
+  OWNER_INBOX_ENABLED: string;
   INGEST_KEY: string; // secret: HMAC key shared with publisher.py
   BUILD_SHA: string; // commit deployed; "unstamped" when not deployed by provision.sh
 }
@@ -155,6 +165,11 @@ export interface Snapshot {
   task_config?: TaskConfig | null;
   // null when the Mac could not read it this tick; absent from an older publisher.
   browser?: BrowserSummary | null;
+  // The owner registry (register-owner.sh), label + a liveness bool ONLY --
+  // never the pane id or a path (README "What leaves the Mac"). Absent/null
+  // means no owner is registered, or an older publisher: send_owner_message
+  // then refuses every target with owner_not_registered.
+  owners?: { label: string; live: boolean }[] | null;
 }
 
 export interface SyncBody {
@@ -167,6 +182,17 @@ export interface SyncBody {
   // outcome carries fields (local_task_id, branch, pane_id, a capability
   // probe) a message delivery ack never does.
   command_acks?: CommandAck[];
+  // Outcomes of this sync's owner_outbox leased on an earlier tick -- same
+  // idea as acks/command_acks, a separate array because send_owner_message's
+  // queue is independent (its own table, its own rate limit) and an ack here
+  // is always "delivered" or "blocked:<reason>", never "refused"/"failed"
+  // (SPEC: explicit blocked:<reason> states, never a silent fallback).
+  owner_acks?: OwnerAck[];
+  // A reply the owner wrote to ~/.local/state/herdr/inbox/<label>/replies/
+  // <exchange_id>.md, picked up and reported once. owner_label/session are
+  // the Mac's OWN knowledge of who this reply came from (the registration's
+  // directory/session), never trusted from the file's own claimed header.
+  owner_replies?: OwnerReplySync[];
   audit_cursor: number;
   // false on the publisher's ack-only follow-up sync, whose outbox it never reads:
   // leasing there would mark messages "delivering" that nobody is delivering.
@@ -183,6 +209,37 @@ export interface OutboxItem {
   actor: string;
   client_name: string;
   attempts: number;
+}
+
+// Worker -> Mac: one owner message leased for delivery. The publisher writes
+// `body` to ~/.local/state/herdr/inbox/<owner_label>/messages/<exchange_id>.md
+// (never typed into a pane) and delivers only the fixed notice text itself.
+export interface OwnerOutboxItem {
+  exchange_id: string;
+  owner_label: string;
+  client_msg_id: string;
+  body: string;
+  sender: string; // the validated grant email, never free text
+  client_name: string;
+  attempts: number;
+}
+
+export interface OwnerAck {
+  exchange_id: string;
+  outcome: "delivered" | "blocked";
+  // One of the SPEC blocked states (owner_not_registered, owner_pane_gone,
+  // owner_identity_changed, owner_at_approval_prompt, deliver_failed:<rc>);
+  // required when outcome is "blocked", ignored otherwise.
+  reason?: string;
+}
+
+export interface OwnerReplySync {
+  exchange_id: string;
+  owner_label: string; // the Mac's own registration directory, never file-claimed
+  body: string;
+  responded_at: string;
+  artifact_revision: string;
+  session: string; // the registration's live agent_session, as recorded by the Mac
 }
 
 // Worker -> Mac directive: start/cancel/resume, leased like a message (the
@@ -244,3 +301,7 @@ export const SCOPE_MESSAGE = "herdr:message";
 export const SCOPE_TASK_START = "herdr:task.start";
 export const SCOPE_TASK_IMPLEMENT = "herdr:task.implement";
 export const SCOPE_TASK_CANCEL = "herdr:task.cancel";
+// send_owner_message/get_owner_message_status/get_owner_reply, addressed to
+// a NAMED owning session, never a task's agent -- a separate route and
+// scope from herdr:message (SPEC: ZERO-LOOP-001 #5).
+export const SCOPE_OWNER_MESSAGE = "herdr:message.owner";

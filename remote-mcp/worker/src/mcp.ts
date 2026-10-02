@@ -11,10 +11,10 @@ import { z } from "zod";
 import { insufficientScope } from "@cloudflare/workers-oauth-provider";
 import type { OAuthResourceAuth } from "@cloudflare/workers-oauth-provider";
 import { emailAllowed } from "./access";
-import { messageable, MAX_MESSAGE_CHARS, offeredScopes, serverInfo } from "./policy";
+import { messageable, MAX_MESSAGE_CHARS, offeredScopes, OWNER_LIMITS, serverInfo } from "./policy";
 import type { Caller, View } from "./state";
 import type { Env, GrantProps, TaskRow } from "./types";
-import { SCOPE_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
+import { SCOPE_MESSAGE, SCOPE_OWNER_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
 
 export const SERVER_VERSION = "0.1.0";
 const MAX_RESULT_CHUNK = 16_000;
@@ -47,6 +47,8 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
         (scopes.includes(SCOPE_MESSAGE) ? ", plus send_message to a live task's agent (delivered as a peer note, never as an approval or command)" : "") +
         (scopes.includes(SCOPE_TASK_START) || scopes.includes(SCOPE_TASK_IMPLEMENT)
           ? ", plus start_task to spawn a sandboxed worker in an allow-listed repo (list_capabilities first)" : "") +
+        (scopes.includes(SCOPE_OWNER_MESSAGE)
+          ? ", plus send_owner_message to a named owning session (written to a file, never typed or auto-approved)" : "") +
         ". Every response carries `connection`; when connection.state is 'disconnected' the data is the last known state, " +
         "not live. get_status is the cheap, harmless first call.",
     },
@@ -218,6 +220,34 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
     return m ? ok({ connection: v.connection, message: m }) : fail("not_found", "No message with that id was sent by you.");
   });
 
+  server.registerTool("get_owner_message_status", {
+    title: "Get owner-message status",
+    description: "Delivery status of a message you sent to a named owning session: queued | delivered | " +
+      "blocked:<owner_not_registered|owner_pane_gone|owner_identity_changed|owner_at_approval_prompt|" +
+      "deliver_failed:<rc>|sender_revoked|owner_inbox_disabled> | replied. Requires herdr:message.owner.",
+    inputSchema: { exchange_id: z.string().min(1).max(100) },
+    annotations: ro,
+  }, async ({ exchange_id }) => {
+    const v = await gate("get_owner_message_status", exchange_id, [SCOPE_READ, SCOPE_OWNER_MESSAGE]);
+    if (!isView(v)) return v;
+    const m = await stub.ownerMessageStatus(exchange_id, caller.email);
+    return m ? ok({ connection: v.connection, owner_message: m }) : fail("not_found", "No owner message with that id was sent by you.");
+  });
+
+  server.registerTool("get_owner_reply", {
+    title: "Get an owner's reply",
+    description: "The owner's written reply to a message you sent (status replied). Only the original sender can " +
+      "read it. Readback: send a normal send_owner_message, `READBACK <exchange_id> ok`, to confirm receipt -- " +
+      "no separate tool is needed. Requires herdr:message.owner.",
+    inputSchema: { exchange_id: z.string().min(1).max(100) },
+    annotations: ro,
+  }, async ({ exchange_id }) => {
+    const v = await gate("get_owner_reply", exchange_id, [SCOPE_READ, SCOPE_OWNER_MESSAGE]);
+    if (!isView(v)) return v;
+    const r = await stub.ownerReply(exchange_id, caller.email);
+    return r ? ok({ connection: v.connection, reply: r }) : fail("not_found", "No reply yet for that exchange_id (or it is not yours).");
+  });
+
   server.registerTool("list_capabilities", {
     title: "List task capabilities",
     description: "What start_task can do right now: allow-listed repos, each mode's git/secrets/write policy, and " +
@@ -236,6 +266,7 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
     return ok({
       connection: v.connection, tasks_enabled: serverInfo(env).tasks_enabled, mac_enabled: cfg?.mac_enabled ?? false,
       repos: cfg?.repos ?? [], modes: cfg?.modes ?? null, caps: cfg?.caps ?? null, your_scopes: scopes,
+      owner_inbox: { enabled: serverInfo(env).owner_inbox_enabled, scope: SCOPE_OWNER_MESSAGE, limits: OWNER_LIMITS },
     });
   });
 
@@ -411,6 +442,33 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
       const out = await stub.resumeTask(now(), caller, scopes, task_id, text);
       if (!out.ok) return fail(out.reason.split(" ")[0]!, `Refused: ${out.reason}.`, { connection: v.connection });
       return ok({ connection: v.connection, task_id: out.remote_task_id, parent_task_id: out.parent_remote_task_id, state: out.state });
+    });
+  }
+
+  if (scopes.includes(SCOPE_OWNER_MESSAGE)) {
+    server.registerTool("send_owner_message", {
+      title: "Send a message to a named owning session",
+      description:
+        `Queue a note (<= ${MAX_MESSAGE_CHARS} chars) for a REGISTERED owning session (register-owner.sh): a ` +
+        "conductor, a dedicated tab -- never a spawned task's agent (use send_message for that). The body is " +
+        "written to a FILE on the Mac and never typed into a pane, so it reaches the owner as data to read, not " +
+        "as a command or an approval. client_msg_id makes a retry safe: the same id returns the ORIGINAL " +
+        `exchange_id and state instead of queuing twice. Own limits: ${OWNER_LIMITS.per_minute}/minute, ` +
+        `${OWNER_LIMITS.per_hour}/hour. Requires herdr:message.owner. Poll get_owner_message_status, then ` +
+        "get_owner_reply once it shows replied.",
+      inputSchema: {
+        owner_label: z.string().min(1).max(50),
+        body: z.string().min(1).max(MAX_MESSAGE_CHARS * 2),
+        client_msg_id: z.string().min(1).max(200),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    }, async ({ owner_label, body, client_msg_id }) => {
+      const out = await stub.sendOwnerMessage(now(), caller, scopes, owner_label, body, client_msg_id);
+      if (!out.ok) {
+        const extra = canRead ? { connection: (await stub.view(now())).connection } : {};
+        return fail(out.reason.split(" ")[0]!, `Refused: ${out.reason}.`, extra);
+      }
+      return ok({ exchange_id: out.exchange_id, state: out.state });
     });
   }
 

@@ -33,3 +33,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 remote-mcp/verify-publisher.py
+      - run: python3 remote-mcp/verify-owner-inbox.py

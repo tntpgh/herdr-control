@@ -12,11 +12,12 @@ key, answers or lists answerable approval prompts, or reaches the loopback hub.
 flowchart LR
   C[MCP client] -- OAuth 2.1 bearer --> W[Worker herdr-mcp<br/>/mcp tools]
   C -. browser .-> A[Cloudflare Access<br/>Google SSO] --> AU[/authorize consent/]
-  W <--> DO[(Durable Object<br/>snapshot · results · messages · audit)]
+  W <--> DO[(Durable Object<br/>snapshot · results · messages · owner messages · audit)]
   P[publisher.py on the Mac<br/>every 15 s] -- HMAC-signed sync --> W
   W -- outbox --> P
   P -- loopback GET --> H[hub 127.0.0.1:8600]
   P -- herdr-deliver.sh, no --force --> PANE[agent pane]
+  P -- write-only, never typed --> INBOX[(~/.local/state/herdr/inbox/&lt;label&gt;/)]
 ```
 
 The Mac only makes outbound HTTPS calls. Nothing new listens on it, and the hub
@@ -52,6 +53,16 @@ Scopes:
   `HERDR_MCP_TASKS=1`, set only by `install.sh --remote-mcp-tasks`; `list_capabilities`
   reports `mac_enabled` so a client can tell "off on the Worker" from "off on
   the Mac" before ever calling `start_task`.
+- `herdr:message.owner` — `send_owner_message`, `get_owner_message_status`,
+  `get_owner_reply`. Targets a REGISTERED owning session (a conductor, a
+  dedicated long-lived tab — `register-owner.sh`), never a spawned task's
+  agent (that is `send_message`). The body is written to a file on the Mac
+  and never typed into a pane: it reaches the owner as data to read, never
+  as a command or an approval. Same `OWNER_INBOX_ENABLED` all-or-nothing gate
+  as the other two, plus its own Mac switch `HERDR_MCP_OWNER_INBOX=1`
+  (`install.sh --remote-mcp-owner-inbox`), plus its own fixed, non-adjustable
+  rate limit (2/minute, 20/hour per sender) separate from message/task
+  limits. `list_capabilities` reports `owner_inbox: {enabled, scope, limits}`.
 
 Messaging was off for the first connection and turned on as its own decision.
 Turning it on, in order:
@@ -88,6 +99,29 @@ refuses every future leased start/resume, but a task already running keeps
 running until its own deadline backstop force-cancels it, same as a task
 that outran `max_minutes`).
 
+Owner messaging (ZERO-LOOP-001 #5) was off for the first connection too, and
+ships OFF by default even once this code deploys (`OWNER_INBOX_ENABLED` is
+`"false"` in `wrangler.jsonc`) — it is design-approval-only pending
+Terrence's review of this feature, not just another default-off switch.
+Turning it on, in order:
+
+1. Register the target session first: `./register-owner.sh <label> <pane>`
+   (e.g. a conductor tab) writes the `owners` row (`lib/run-registry.sh`
+   schema v8) the publisher checks before every delivery;
+   `./unregister-owner.sh <label>` removes it.
+2. `OWNER_INBOX_ENABLED="true"` (in `wrangler.jsonc`), merged, then a
+   redeploy through `provision.sh --apply`; `/healthz` must show
+   `owner_inbox_enabled:true` and the merged commit;
+3. `./install.sh --apply --remote-mcp-owner-inbox` on the Mac;
+4. a fresh consent that ticks `herdr:message.owner` deliberately (never
+   pre-ticked).
+
+Turning it off: `"false"` + redeploy (every queued owner message is
+cancelled on the next sync with `blocked:owner_inbox_disabled`), and
+`./install.sh --apply --remote-mcp` (Mac switch off: the Mac refuses every
+future leased owner message and stops scanning for replies). Either alone
+stops delivery.
+
 Review finding M1 (a permission menu raised during `send-to-agent.sh`'s ~1 s
 typing check received the typed text) is fixed: the prompt is re-checked as
 the last step before typing, and nothing else reads the pane between that
@@ -106,7 +140,8 @@ Public and unauthenticated, so it can be checked before anyone connects:
 ```
 curl -s https://herdr-mcp.teamthurber.com/healthz
 {"service":"herdr-mcp","mcp":"https://herdr-mcp.teamthurber.com/mcp","auth":"OAuth 2.1 + PKCE",
- "build_sha":"<commit>","messaging_enabled":false,"tasks_enabled":false,"scopes_offered":["herdr:read"]}
+ "build_sha":"<commit>","messaging_enabled":false,"tasks_enabled":false,"owner_inbox_enabled":false,
+ "scopes_offered":["herdr:read"]}
 ```
 
 `build_sha` is the commit `provision.sh` deployed; it refuses to deploy from a
@@ -140,6 +175,9 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
 | `resume_task` | task.cancel | `task_id`, `text?` | re-enters the same worktree/branch as a brand new `task_id` (only a terminal task can be resumed), linked via `parent_task_id` |
 | `list_events` | read | `since_cursor` (0), `limit` 1–500 (100) | the global event feed since that cursor: `task_started`, `state_changed`, `approval_needed`, `capability_probe`, `answer_ready`, `finished`, `verified`, `failed`, `cancelled`, `timed_out`, `disconnected`/`reconnected` |
 | `wait_for_events` | read | `since_cursor` (0), `timeout_s` 1–25 (20) | holds the call open until a new event lands or `timeout_s` elapses (true server push is not possible over Streamable HTTP; poll this instead of `list_events` in a tight loop) |
+| `send_owner_message` | message.owner (listed only when enabled) | `owner_label`, `body` (≤4000 chars), `client_msg_id` | `exchange_id`, `state` `queued` |
+| `get_owner_message_status` | read or message.owner | `exchange_id` | status + detail (only your own messages) |
+| `get_owner_reply` | read or message.owner | `exchange_id` | the owner's reply (body, `session`, `responded_at`) once one exists (only your own messages) |
 
 `tools/list` on the live server is the authoritative JSON Schema.
 
@@ -247,6 +285,63 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
    itself) — both land in the task's own event feed (`capability_probe`)
    and in `get_task_answer`.
 
+### Owner message rules (server-side, then re-checked on the Mac)
+
+1. Token has `herdr:message.owner`. `connection.state` is `connected` or
+   `degraded`.
+2. `owner_label` matches register-owner.sh's own `^[a-z0-9][a-z0-9-]{1,40}$`
+   and names a label the `owners` registry currently has a row for (checked
+   against the latest synced snapshot — not resolved against a task, agent,
+   or pane, the way `send_message`'s `target` is).
+3. `body` is sanitized the same way an objective is (NFKC, invisible/format
+   characters to spaces per LINE so multi-line structure survives, every
+   bracket shape to `(`/`)`, `@` to fullwidth `＠`), ≤ `MAX_MESSAGE_CHARS`
+   (2000).
+4. `client_msg_id` makes a retry safe, checked BEFORE any other validation:
+   the same id from the same sender returns the ORIGINAL `exchange_id` and
+   state instead of queuing twice, even if the retry's own label or body
+   would otherwise be refused.
+5. Per sender, all clients together: a fixed 2/minute and 20/hour — not
+   adjustable from the Mac the way message limits are (`OWNER_LIMITS` in
+   `policy.ts`, a code change and a review, never `scripts/limits.py`).
+6. **At delivery**, before every lease to the Mac, the queue is checked
+   against the current policy again — same shape as a message's own
+   re-check: a message is cancelled (`blocked`, `owner_inbox_disabled` or
+   `sender_revoked`) if the Worker switch is now off, the sender has left
+   the allowlist, or no longer holds a live grant with the scope.
+7. **On the Mac**, the pane register-owner.sh recorded is re-checked right
+   before delivery (not just trusted from the last sync): `owner_not_registered`
+   (label was never registered, or was unregistered), `owner_pane_gone` (the
+   pane id is no longer live), `owner_identity_changed` (same pane id, but
+   its terminal was replaced — a herdr restart reissues terminal ids,
+   review F1) each refuse with that specific `blocked:<reason>`, never a
+   silent retry; re-registering with `register-owner.sh` clears it.
+8. On `ok`, the body is written to
+   `~/.local/state/herdr/inbox/<label>/messages/<exchange_id>.md` (mode
+   0600, atomic temp+rename, dedupes on an existing exchange_id so a retried
+   delivery never overwrites what the owner may already be reading) —
+   **never typed**. Only a FIXED notice pointing at that file (sender,
+   exchange_id, reply path; no `[`/`]` from the sender can imitate or close
+   it, same bracket-defuse as a message's envelope) is handed to
+   `herdr-deliver.sh` as one argv element, **without `--force`**. A pane
+   showing a permission prompt refuses it: `blocked:owner_at_approval_prompt`,
+   retried up to `APPROVAL_RETRY_CAP` (10) sync ticks before it gives up and
+   stays blocked (not retried forever, unlike a message's 15-minute
+   envelope-level expiry). Any other non-zero `herdr-deliver.sh` exit, or a
+   timeout, is a terminal `blocked:deliver_failed:<rc|timeout>`.
+9. A reply is a file the owner (human or agent) writes themselves:
+   `~/.local/state/herdr/inbox/<label>/replies/<exchange_id>.md` — never
+   typed by anything, never auto-generated. The publisher scans for new
+   ones every tick (symlink-safe the same way `get_task_result`'s worktree
+   reads are: the resolved path must stay inside the per-owner tree, and the
+   leaf must be a single-link regular file), redacts and caps the body, and
+   fills in `session` from the Mac's OWN live `owners` registry row — never
+   from the reply file's own header, which is untrusted data like the
+   message body it is answering. `get_owner_reply` returns it once synced;
+   a reply naming the wrong `owner_label` for that `exchange_id` is ignored
+   (the exchange stays `delivered`, unreadable) rather than accepted on the
+   file's own say-so.
+
 ### Audit and limits
 
 Every tool call (allowed or refused, including calls the MCP SDK rejects
@@ -273,7 +368,10 @@ opened without following symlinks, only from worktrees under
 — its own omp session's LAST assistant text turn (never a thinking or
 tool-call block), the session JSONL resolved the same symlink-safe way but
 only under `~/.omp/agent/sessions`; all of it redacted in full and then cut
-to 64 KB. **Never**: cwd,
+to 64 KB. Per registered owner: `label` and `live` only (never `pane_id`,
+`agent_session`, or `workspace`). A reply once scanned: `exchange_id`,
+`owner_label`, redacted+capped body, `session` (filled in from the Mac's own
+registry row, never the reply file itself), `responded_at`. **Never**: cwd,
 screen contents, prompt ids, the hub, the registry file, secrets files, or a
 credential value from the capability probe (only booleans: was a secret
 grant passed, was KB HTTP-reachable).
@@ -329,6 +427,13 @@ public internet.
 - Logs: `~/Library/Logs/com.herdr-control.remote-mcp.log` (publisher),
   `npx wrangler tail herdr-mcp` (Worker).
 - Dry run of what would be sent: `python3 remote-mcp/publisher.py --dry-run`.
+- **Register/unregister an owning session** (a conductor, a dedicated
+  long-lived tab — never a spawned task's pane, which register-owner.sh's
+  own `require_agent_pane` check does not distinguish from one, so don't
+  point it at one): `./register-owner.sh <label> <pane>` (same pane
+  resolution as `herdr-deliver.sh`: `w1:p2`, `w1:t2`, or a herdr label),
+  `./unregister-owner.sh <label>` (idempotent). Prints the registry row;
+  re-registering the same label preserves its original `registered_at`.
 - **Change message limits** (no redeploy; takes effect on the next send):
   `python3 remote-mcp/scripts/limits.py show`;
   `… set --per-hour 120 --per-minute 10 --for 4h --reason "release day" --apply`
@@ -350,9 +455,10 @@ public internet.
   revoke does not reach is the global `TASKS_ENABLED` kill switch below:
   with that off, this per-sender check has nothing to revoke against, and a
   running task rides out its own deadline backstop instead.
-- **Kill switches**, least to most: set `MESSAGING_ENABLED`/`TASKS_ENABLED` to
-  `"false"` and redeploy (new sends/starts are refused and every queued
-  message/command is cancelled on the next sync; a task already running on
+- **Kill switches**, least to most: set `MESSAGING_ENABLED`/`TASKS_ENABLED`/
+  `OWNER_INBOX_ENABLED` to `"false"` and redeploy (new sends/starts/owner
+  messages are refused and every queued message/command/owner message is
+  cancelled on the next sync; a task already running on
   the Mac keeps running until its own deadline backstop force-cancels it —
   reads continue); unload the publisher
   (`launchctl bootout gui/$(id -u)/com.herdr-control.remote-mcp` → clients see
@@ -360,8 +466,8 @@ public internet.
   running task just sits there with a stale state, including past its own
   `max_minutes` deadline, until the publisher is reloaded); remove the email
   from `ALLOWED_EMAILS` and the Access policy (its grants stop on the next
-  request, its queued messages/commands are cancelled, and it is revoked on
-  the next refresh); rotate `INGEST_KEY`; `npx wrangler delete herdr-mcp`.
+  request, its queued messages/commands/owner messages are cancelled, and it
+  is revoked on the next refresh); rotate `INGEST_KEY`; `npx wrangler delete herdr-mcp`.
 - Open DCR (review I3): anyone can register a client, which costs a KV write
   and grants nothing without an allowlisted sign-in. Add a Cloudflare
   rate-limit rule on `/oauth/register` if it is ever abused.
@@ -382,18 +488,23 @@ All from `remote-mcp/`:
    Cloudflare version, 401/302 boundaries).
 3. After merge: `./install.sh --apply --remote-mcp` (repo root) installs the
    publisher LaunchAgent from the deployed app worktree; its registry entry is
-   thurber-os `launchd/agents.yaml`. `--remote-mcp-messaging` and
-   `--remote-mcp-tasks` are each turned on later, as their own decision (see
-   "Turning it on" above).
+   thurber-os `launchd/agents.yaml`. `--remote-mcp-messaging`,
+   `--remote-mcp-tasks` and `--remote-mcp-owner-inbox` are each turned on
+   later, as their own decision (see "Turning it on" above).
 
-Tests: `cd worker && npx vitest run` (three projects: `read-only` = the
+Tests: `cd worker && npx vitest run` (four projects: `read-only` = the
 first-deploy configuration, `messaging` = messaging on, `tasks` = messaging
-and tasks both on; OAuth flow, tools, scope, throttle, allowlist and
+and tasks both on, `owner-inbox` = messaging and the owner-inbox scope both
+on; OAuth flow, tools, scope, throttle, allowlist and
 task-lifecycle enforcement in workerd) and `python3
 remote-mcp/verify-publisher.py` (snapshot, redaction, link and envelope
 handling, delivery re-checks, lost-ack dedup, and graceful degradation
 against a genuine pre-v7 registry — the publisher's own registry read never
 triggers `lib/run-registry.sh`'s schema migration) plus `python3
+remote-mcp/verify-owner-inbox.py` (registry read, the F1 pane-identity
+re-check, symlink-refused inbox writes and reply scans, and
+`herdr-deliver.sh`'s exit-code mapping, including exit 5 →
+`owner_at_approval_prompt`) plus `python3
 remote-mcp/verify-tasks.py` (allowlist/caps refusals, objective sanitization,
 start/cancel/resume command processing, verify-research/verify-implement,
 deadline force-cancel — against fake `spawn-task.sh`/`close-done-workers.sh`/

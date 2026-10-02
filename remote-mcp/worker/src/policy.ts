@@ -1,7 +1,7 @@
 // Pure policy: connection state, message-target resolution, message text
 // rules, rate limits. No I/O, so every rule here is unit-tested directly.
 import type { Env, Snapshot, TaskRow } from "./types";
-import { SCOPE_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
+import { SCOPE_MESSAGE, SCOPE_OWNER_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
 
 // The scopes this deployment will grant and honour. A token's scopes are
 // always intersected with this, so turning a switch off takes effect on
@@ -13,6 +13,7 @@ export function offeredScopes(env: Env): string[] {
   const scopes = [SCOPE_READ];
   if (env.MESSAGING_ENABLED === "true") scopes.push(SCOPE_MESSAGE);
   if (env.TASKS_ENABLED === "true") scopes.push(SCOPE_TASK_START, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_CANCEL);
+  if (env.OWNER_INBOX_ENABLED === "true") scopes.push(SCOPE_OWNER_MESSAGE);
   return scopes;
 }
 
@@ -22,12 +23,14 @@ export interface ServerInfo {
   build_sha: string;
   messaging_enabled: boolean;
   tasks_enabled: boolean;
+  owner_inbox_enabled: boolean;
   scopes_offered: string[];
 }
 
 export function serverInfo(env: Env): ServerInfo {
   return { build_sha: env.BUILD_SHA, messaging_enabled: env.MESSAGING_ENABLED === "true",
-    tasks_enabled: env.TASKS_ENABLED === "true", scopes_offered: offeredScopes(env) };
+    tasks_enabled: env.TASKS_ENABLED === "true", owner_inbox_enabled: env.OWNER_INBOX_ENABLED === "true",
+    scopes_offered: offeredScopes(env) };
 }
 
 export type ConnectionState = "connected" | "degraded" | "disconnected" | "never_connected";
@@ -142,27 +145,51 @@ export function sanitizeMessage(text: string): { ok: true; text: string } | { ok
 
 // start_task's objective is embedded as a fenced UNTRUSTED block in the
 // spawned worker's own SPEC.md (remote-mcp/tasks.py), not typed into a
-// terminal composer -- but INVISIBLE (below) is \p{C}, which includes \n,
-// so this collapses to one line exactly like sanitizeMessage despite the
-// now-dead split/join step that follows it (kept harmless rather than
-// removed, since a one-line input makes it a no-op either way). The same
-// defusing applies regardless: invisible/format characters hidden, every
-// bracket shape neutralised (so the objective cannot forge SPEC.md's own
-// "## UNTRUSTED" fencing), and "@path" defused (omp/Claude Code would
+// terminal composer, so (via cleanMultiline below) its newlines survive --
+// unlike sanitizeMessage. Invisible/format characters are still hidden,
+// every bracket shape neutralised (so the objective cannot forge SPEC.md's
+// own "## UNTRUSTED" fencing), and "@path" defused (omp/Claude Code would
 // otherwise expand it into that file's contents with no tool call and no
 // approval -- round-3 review H1, the same hazard sanitizeMessage exists for).
 export const MAX_OBJECTIVE_CHARS = 4000;
 
-export function sanitizeObjective(text: string): { ok: true; text: string } | { ok: false; reason: string } {
-  const cleaned = text.normalize("NFKC")
-    .replace(INVISIBLE, " ")
-    .replace(OPEN_LIKE, "(").replace(CLOSE_LIKE, ")").replace(BRACKET_PIECES, " ")
-    .replace(AT, "\uff20")
-    .split("\n").map((line) => line.replace(/[ \t]+/g, " ").trim()).join("\n")
+// Shared by sanitizeObjective and sanitizeOwnerMessage: both embed multi-line
+// untrusted text into a FILE (SPEC.md's fenced block / the inbox markdown
+// doc), never type it into a pane composer, so -- unlike sanitizeMessage --
+// newlines survive. Everything else is identical: NFKC, invisible/format
+// characters to spaces, every bracket shape neutralised, "@" defused.
+function cleanMultiline(text: string): string {
+  // Split on "\n" FIRST: INVISIBLE matches \p{C}, which includes the
+  // newline itself, so cleaning the whole string in one pass (as
+  // sanitizeMessage does) would silently collapse every line break. Clean
+  // each line in isolation, then rejoin, so the newlines the comment above
+  // promises actually survive.
+  return text.normalize("NFKC").split("\n")
+    .map((line) => line
+      .replace(INVISIBLE, " ")
+      .replace(OPEN_LIKE, "(").replace(CLOSE_LIKE, ")").replace(BRACKET_PIECES, " ")
+      .replace(AT, "\uff20")
+      .replace(/[ \t]+/g, " ").trim())
+    .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+export function sanitizeObjective(text: string): { ok: true; text: string } | { ok: false; reason: string } {
+  const cleaned = cleanMultiline(text);
   if (!cleaned) return { ok: false, reason: "empty_objective" };
   if (cleaned.length > MAX_OBJECTIVE_CHARS) return { ok: false, reason: `objective_too_long (max ${MAX_OBJECTIVE_CHARS})` };
+  return { ok: true, text: cleaned };
+}
+
+// send_owner_message's body: same multi-line cleaning as an objective, but
+// capped at the existing message size (SPEC: "size cap reuses the existing
+// message cap"), since this reaches a human/agent inbox, not a spawned
+// worker's SPEC.md.
+export function sanitizeOwnerMessage(text: string): { ok: true; text: string } | { ok: false; reason: string } {
+  const cleaned = cleanMultiline(text);
+  if (!cleaned) return { ok: false, reason: "empty_body" };
+  if (cleaned.length > MAX_MESSAGE_CHARS) return { ok: false, reason: `body_too_long (max ${MAX_MESSAGE_CHARS})` };
   return { ok: true, text: cleaned };
 }
 
@@ -173,6 +200,16 @@ export const DEFAULT_LIMITS = { per_minute: 5, per_hour: 30 } as const;
 // ceiling: no override may exceed these. Raising the ceiling itself is a code
 // change and a security review, not an admin call.
 export const MAX_LIMITS = { per_minute: 30, per_hour: 300 } as const;
+
+// send_owner_message: fixed, lower, and NOT admin-adjustable (Terrence's
+// decision, form 20261002T142819-8748: "separate, lower limits" for this
+// route) -- raising these is a code change and a security review, exactly
+// like MAX_LIMITS above, not an scripts/limits.py-style runtime override.
+export const OWNER_LIMITS = { per_minute: 2, per_hour: 20 } as const;
+
+// register-owner.sh's own label regex, re-checked here so a send targeting a
+// syntactically-invalid label is refused the same way an unregistered one is.
+export const OWNER_LABEL = /^[a-z0-9][a-z0-9-]{1,40}$/;
 
 export interface MessageLimits {
   per_minute: number;

@@ -99,7 +99,7 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '7\n'; }
+_registry_schema_version() { printf '8\n'; }
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
@@ -267,6 +267,7 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   _migrate_schema_v5
   _migrate_schema_v6
   _migrate_schema_v7
+  _migrate_schema_v8
   _migrate_legacy_files
   return 0
 }
@@ -395,6 +396,28 @@ _migrate_schema_v7() {
   done
   _sql "CREATE INDEX IF NOT EXISTS tasks_by_remote_id ON tasks(remote_task_id) WHERE remote_task_id<>'';" >/dev/null 2>&1
   _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '7');" >/dev/null 2>&1
+}
+
+# ---- schema v7 -> v8: add the owners table (ZERO-LOOP-001 #5, Terrence's
+# design-approval-only decision, form 20261002T142819-8748) -------------------
+# A wholly new table, unlike v3-v7's column ALTERs, so (like v6's
+# action_requests) it lives in its own migration function rather than the
+# unconditional DDL block in registry_init: CREATE TABLE IF NOT EXISTS is
+# just as safe to run against an existing v7 database as a brand-new one, but
+# keeping every table's FIRST appearance behind a numbered migration is what
+# makes schema_version a trustworthy audit trail of what a given database has
+# actually been through.
+_migrate_schema_v8() {
+  _sql "CREATE TABLE IF NOT EXISTS owners (
+      label          TEXT PRIMARY KEY,
+      pane_id        TEXT NOT NULL,
+      pane_birth     TEXT NOT NULL DEFAULT '',
+      agent_session  TEXT NOT NULL DEFAULT '',
+      workspace      TEXT NOT NULL DEFAULT '',
+      registered_at  TEXT NOT NULL,
+      updated_at     TEXT NOT NULL
+    );" >/dev/null 2>&1
+  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '8');" >/dev/null 2>&1
 }
 
 # ---- one-time import of the pre-SQLite file layout --------------------------
@@ -1204,6 +1227,50 @@ prune_completed_tasks() {               # max_age_days
      WHERE state IN ('completed','failed','cancelled','lost')
        AND julianday(updated_at) < julianday('now', '-${days} days');
     COMMIT;" >/dev/null 2>&1
+}
+
+# ---- owner inbox: named long-lived sessions ---------------------------------
+# A REGISTERED pane a remote MCP client can address by name
+# (send_owner_message, remote-mcp/README.md) -- a conductor, a dedicated tab
+# -- never a spawned task's agent (that is send_message's job, keyed off the
+# tasks table above). One row per label, no run_id/task_id/lifecycle/events:
+# an owner is not a task. pane_birth/agent_session mirror tasks' own identity
+# columns, reused by publisher.py's own re-check (the same algorithm
+# registry-bridge.sh's cancel subcommand uses) before ever delivering to this
+# pane. workspace is NOT a filesystem cwd -- herdr's own `pane list` JSON
+# carries no such field -- kept only as a human-reference hint; only label and
+# liveness ever leave the Mac (remote-mcp/publisher.py's snapshot.owners).
+register_owner() {                      # label pane_id pane_birth agent_session [workspace]
+  local label="$1" pane_id="$2" pane_birth="$3" agent_session="$4" workspace="${5:-}"
+  registry_init || return 1
+  local at; at="$(_now_iso)"
+  # Re-registering the same label (Mac restart, a moved tab) must UPDATE, not
+  # collide -- unlike register_task's plain INSERT, where a task_id collision
+  # is a bug worth refusing loudly. registered_at survives the re-register.
+  local created
+  created=$(_sql "SELECT registered_at FROM owners WHERE label=$(_sq "$label");" 2>/dev/null)
+  [ -z "$created" ] && created="$at"
+  if _sql "INSERT OR REPLACE INTO owners
+      (label, pane_id, pane_birth, agent_session, workspace, registered_at, updated_at)
+      VALUES ($(_sq "$label"), $(_sq "$pane_id"), $(_sq "$pane_birth"), $(_sq "$agent_session"),
+        $(_sq "$workspace"), $(_sq "$created"), $(_sq "$at"));" >/dev/null 2>&1; then
+    return 0
+  fi
+  printf 'run-registry: failed to register owner %s (database unwritable)\n' "$label" >&2
+  return 1
+}
+
+unregister_owner() {                    # label
+  registry_init || return 1
+  _sql "DELETE FROM owners WHERE label=$(_sq "$1");" >/dev/null 2>&1
+}
+
+read_owner() {                          # label -> json (empty if absent)
+  registry_init || return 1
+  _sql "SELECT json_object('label', label, 'pane_id', pane_id, 'pane_birth', pane_birth,
+          'agent_session', agent_session, 'workspace', workspace,
+          'registered_at', registered_at, 'updated_at', updated_at)
+        FROM owners WHERE label=$(_sq "$1");" 2>/dev/null
 }
 
 # ---- consumer checkpoints ---------------------------------------------------
