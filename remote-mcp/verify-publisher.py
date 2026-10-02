@@ -324,13 +324,103 @@ class SchemaTolerance(unittest.TestCase):
         pub.REGISTRY = self.real_registry
 
     def test_registry_rows_tolerates_a_pre_v7_registry(self):
-        births, asks, remotes = pub.registry_rows(["task_v6"])
+        births, asks, remotes, sessions = pub.registry_rows(["task_v6"])
         self.assertEqual(births, {"task_v6": "term_v6"})
         self.assertEqual(remotes, {})
+        self.assertEqual(sessions, {})
 
     def test_build_does_not_crash_against_a_pre_v7_registry(self):
         snap, local = pub.build(NOW)
         self.assertIn("tasks", snap)
+
+
+class TranscriptSync(unittest.TestCase):
+    """changed_results()'s omp:transcript source: the registry's
+    agent_session column resolved into a real session JSONL under
+    SESSIONS_ROOT, with the last assistant text extracted and the same
+    "never outside the root, even via a symlink" safety the worktree
+    sources get, applied to the SESSION path instead."""
+
+    SESSION_ID = "deadbeef-dead-beef-dead-beefdeadbeef"
+
+    def setUp(self):
+        self.reg = TMP / f"registry-ts-{self._testMethodName}.sqlite3"
+        con = sqlite3.connect(self.reg)
+        con.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, pane_birth TEXT, remote_task_id TEXT DEFAULT '', "
+                    "deadline_at TEXT, verified INTEGER DEFAULT 0, verify_detail TEXT, manifest TEXT DEFAULT '', "
+                    "agent_session TEXT DEFAULT '')")
+        con.execute("CREATE TABLE events (sequence INTEGER PRIMARY KEY, task_id TEXT, type TEXT, occurred_at TEXT, payload TEXT)")
+        con.execute("INSERT INTO tasks (task_id, pane_birth, remote_task_id, agent_session) VALUES ('task_ts','term_ts','rtask_ts',?)",
+                     (self.SESSION_ID,))
+        con.commit()
+        con.close()
+        self.real_registry = pub.REGISTRY
+        pub.REGISTRY = self.reg
+
+        self.wt = WT_ROOT / "kb/feat-ts"
+        (self.wt / ".handoffs").mkdir(parents=True, exist_ok=True)
+        (self.wt / ".handoffs/PROOF.md").write_text("proof")
+
+        self.real_sessions_root = pub.SESSIONS_ROOT
+        self.sessions_root = TMP / f"sessions-{self._testMethodName}"
+        pub.SESSIONS_ROOT = self.sessions_root
+
+        self.snap = {"tasks": [{"task_id": "task_ts", "updated_at": Z(NOW), "remote_task_id": "rtask_ts"}]}
+        self.local = {"worktrees": {"task_ts": self.wt}, "sessions": {"task_ts": self.SESSION_ID}}
+
+    def tearDown(self):
+        pub.REGISTRY = self.real_registry
+        pub.SESSIONS_ROOT = self.real_sessions_root
+
+    def _write_session(self, records):
+        d = self.sessions_root / "-escaped-cwd"
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"2026-10-02T00-00-00_{self.SESSION_ID}.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        return path
+
+    def test_registry_rows_reads_the_agent_session_column(self):
+        births, asks, remotes, sessions = pub.registry_rows(["task_ts"])
+        self.assertEqual(sessions, {"task_ts": self.SESSION_ID})
+
+    def test_latest_reply_is_the_last_assistant_text_skipping_thinking_and_tool_call(self):
+        self._write_session([
+            {"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "do the thing"}]}},
+            {"type": "thinking", "thinking": "hmm"},
+            {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "first reply"}]}},
+            {"type": "toolCall", "tool": "bash"},
+            {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "final reply"}]}},
+        ])
+        res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
+        transcripts = [r for r in res if r["source"] == "omp:transcript"]
+        self.assertEqual(len(transcripts), 1)
+        self.assertEqual(transcripts[0]["text"], "final reply")
+
+    def test_a_pure_tool_call_final_message_does_not_blank_the_latest_reply(self):
+        self._write_session([
+            {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "real reply"}]}},
+            {"type": "message", "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "x"}]}},
+        ])
+        res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
+        transcripts = [r for r in res if r["source"] == "omp:transcript"]
+        self.assertEqual(transcripts[0]["text"], "real reply")
+
+    def test_a_session_path_outside_sessions_root_is_never_read(self):
+        outside = TMP / "sessions-escape-real"
+        outside.mkdir(exist_ok=True)
+        (outside / f"evil_{self.SESSION_ID}.jsonl").write_text(
+            json.dumps({"type": "message", "message": {"role": "assistant",
+                        "content": [{"type": "text", "text": "exfiltrated"}]}}) + "\n")
+        d = self.sessions_root / "-escaped-cwd"
+        d.mkdir(parents=True, exist_ok=True)
+        os.symlink(outside / f"evil_{self.SESSION_ID}.jsonl", d / f"ts_{self.SESSION_ID}.jsonl")
+        res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
+        self.assertEqual([r for r in res if r["source"] == "omp:transcript"], [])
+
+    def test_no_session_recorded_means_no_transcript_source_and_no_crash(self):
+        self.local["sessions"] = {}
+        res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
+        self.assertEqual([r for r in res if r["source"] == "omp:transcript"], [])
 
 
 class ResultScoping(unittest.TestCase):

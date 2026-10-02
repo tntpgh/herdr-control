@@ -147,7 +147,8 @@ async function ingest(request: Request, env: Env): Promise<Response> {
   const now = Date.now();
   const msgSenders: ScopedSender[] = (await stub.pendingSenders(now)).map((s) => ({ ...s, scope: SCOPE_MESSAGE }));
   const gate = await grantGate(env, env.MESSAGING_ENABLED === "true", msgSenders, now);
-  const cmdGate = await grantGate(env, env.TASKS_ENABLED === "true", await stub.pendingCommandSenders(now), now);
+  const cmdGate = await grantGate(env, env.TASKS_ENABLED === "true",
+    [...(await stub.pendingCommandSenders(now)), ...(await stub.activeTaskSenders())], now);
   const out = await stub.sync(Date.now(), check.nonce, check.body, gate, cmdGate);
   if (!out.ok) return Response.json({ error: out.reason }, { status: out.status });
   return Response.json(out.response, { headers: { "cache-control": "no-store" } });

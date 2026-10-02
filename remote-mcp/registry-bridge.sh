@@ -72,42 +72,73 @@ case "$cmd" in
         exit 1
       }
     fi
-    set_task_state "$run_id" "$task_id" cancelled "$reason" || exit 1
+    # Z1 (SPEC fix: Zero's acceptance review item 1): the pane must be
+    # CONFIRMED gone -- closed by us, or already recycled to a different
+    # occupant -- BEFORE the row is ever marked cancelled. The old order
+    # (state flip first, `herdr pane close ... || true` second) could
+    # report a task cancelled while its agent kept running: a failed or
+    # unmatched `herdr pane list` silently skipped the close, and the
+    # state write had already happened. Any list failure, close failure,
+    # or a pane that is STILL the registered occupant after the close
+    # leaves this row NON-TERMINAL and exits nonzero: the caller
+    # (tasks.py _cancel/_force_cancel) reports `failed`, and the next
+    # sweep tick retries it (a timeout's deadline is already past, so
+    # every tick retries; an explicit cancel's command is re-leased by
+    # the Worker) -- this is the retry/backoff path, not a bug.
     pane=$(printf '%s' "$row" | jq -r '.pane_id // empty')
     if [ -n "$pane" ]; then
-      # M4: herdr reuses pane ids once a pane closes. If this task's own
-      # pane died while the row stayed non-terminal, herdr may already have
-      # handed that id to an unrelated worker -- closing by bare pane_id
-      # would close THEIR pane, not this cancelled task's. Same rule
-      # close-done-workers.sh --pane uses: only close when the currently
-      # live occupant's terminal_id still matches what this row registered
-      # (or the pane reports no live occupant at all, i.e. already gone).
-      #
-      # N5: pane_birth_now (lib/pane-guard.sh) swallows `herdr pane list`'s
-      # own exit code -- empty there means EITHER "pane gone" or "list
-      # failed," and treating a transient list failure as "gone" would
-      # fail OPEN into closing by bare id. Re-run the list here ourselves
-      # so a failed/unparseable list skips the close instead.
-      #
-      # R3-6: a non-JSON list with rc 0 made jq itself fail silently
-      # (stderr suppressed) while `live_birth` just read empty -- which
-      # looked identical to "jq succeeded, pane genuinely absent" and still
-      # fail-opened into closing by bare id. Capture jq's own exit status
-      # (pipefail is set at the top of this file) and only close when jq
-      # actually succeeded.
+      # M4/N5/R3-6 (unchanged): a bare pane_id can already belong to an
+      # unrelated worker herdr handed it to after this task's own pane
+      # died, so only ever act on it when the live occupant's terminal_id
+      # still matches what this row registered -- a list that fails or
+      # does not parse must never fail OPEN into closing by bare id.
       registered_birth=$(printf '%s' "$row" | jq -r '.pane_birth // empty')
       pane_list_json="$(herdr pane list 2>/dev/null)"
-      if [ $? -eq 0 ] && [ -n "$pane_list_json" ]; then
-        if live_birth="$(printf '%s' "$pane_list_json" | jq -r --arg p "$pane" \
-            '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null)"; then
-          if [ -z "$live_birth" ] || [ "$live_birth" = "$registered_birth" ]; then
-            [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
-            herdr pane close "$pane" >/dev/null 2>&1 || true
-          fi
-        fi
+      if [ $? -ne 0 ] || [ -z "$pane_list_json" ]; then
+        echo "registry-bridge: cancel $run_id/$task_id -- herdr pane list failed; leaving the row non-terminal for the next retry (backoff)" >&2
+        exit 1
       fi
+      if ! live_birth="$(printf '%s' "$pane_list_json" | jq -r --arg p "$pane" \
+          '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null)"; then
+        echo "registry-bridge: cancel $run_id/$task_id -- herdr pane list did not parse; leaving the row non-terminal for the next retry (backoff)" >&2
+        exit 1
+      fi
+      if [ -n "$live_birth" ] && [ "$live_birth" = "$registered_birth" ]; then
+        # Still our own live pane: close it, then re-list to PROVE it is
+        # actually gone (or recycled to someone else) before we claim victory.
+        [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
+        if ! herdr pane close "$pane" >/dev/null 2>&1; then
+          echo "registry-bridge: cancel $run_id/$task_id -- herdr pane close failed; leaving the row non-terminal for the next retry (backoff)" >&2
+          exit 1
+        fi
+        post_list_json="$(herdr pane list 2>/dev/null)"
+        if [ $? -ne 0 ] || [ -z "$post_list_json" ]; then
+          echo "registry-bridge: cancel $run_id/$task_id -- post-close herdr pane list failed; leaving the row non-terminal for the next retry (backoff)" >&2
+          exit 1
+        fi
+        if ! post_birth="$(printf '%s' "$post_list_json" | jq -r --arg p "$pane" \
+            '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null)"; then
+          echo "registry-bridge: cancel $run_id/$task_id -- post-close herdr pane list did not parse; leaving the row non-terminal for the next retry (backoff)" >&2
+          exit 1
+        fi
+        if [ -n "$post_birth" ] && [ "$post_birth" = "$registered_birth" ]; then
+          echo "registry-bridge: cancel $run_id/$task_id -- pane $pane is still alive after the close; leaving the row non-terminal for the next retry (backoff)" >&2
+          exit 1
+        fi
+        # post_birth empty (pane genuinely gone) or different (recycled to
+        # a new occupant) -- either way, confirmed: nothing of ours remains.
+      fi
+      # live_birth empty (already gone before we even tried) or different
+      # from registered_birth (already recycled) -- nothing of ours to
+      # kill; proceed straight to marking the row cancelled.
     fi
+    set_task_state "$run_id" "$task_id" cancelled "$reason" || exit 1
     ;;
+  append-event)
+    type_arg="$3"; payload="${4:-}"; [ -n "$payload" ] || payload='{}'
+    append_event "$1" "$2" "$type_arg" "$payload" || exit 1
+    ;;
+
   *)
     echo "registry-bridge: unknown subcommand '$cmd'" >&2
     exit 2

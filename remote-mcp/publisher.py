@@ -164,32 +164,43 @@ def hub_get(path: str):
         return json.load(r)
 
 
-def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict], dict[str, dict]]:
-    """pane_birth per task, each task's newest input_required payload, and
+def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict], dict[str, dict], dict[str, str]]:
+    """pane_birth per task, each task's newest input_required payload,
     (sparse -- only tasks herdr-mcp's tasks.py actually started remotely)
-    its remote_task_id/verified/verify_detail, for tasks[]'s SyncSchema
-    extension -- the Worker's own mapLocalState reads these columns, not a
-    second computation here."""
+    its remote_task_id/verified/verify_detail for tasks[]'s SyncSchema
+    extension, and (same sparseness) its agent_session -- the omp session
+    id changed_results() resolves into the "omp:transcript" source. The
+    Worker's own mapLocalState reads the remote_task_id/verified columns,
+    not a second computation here."""
     births: dict[str, str] = {}
     asks: dict[str, dict] = {}
     remotes: dict[str, dict] = {}
+    sessions: dict[str, str] = {}
     if not task_ids or not REGISTRY.exists():
-        return births, asks, remotes
+        return births, asks, remotes, sessions
     con = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=5)
     try:
         has_v7 = rtasks.has_v7_task_columns(con)
+        has_session = rtasks.has_agent_session_column(con)
         remote_cols = ", remote_task_id, verified, verify_detail" if has_v7 else ""
+        session_col = ", agent_session" if has_session else ""
         marks = ",".join("?" * len(task_ids))
+        con.row_factory = sqlite3.Row
         for row in con.execute(
-            f"SELECT task_id, pane_birth{remote_cols} FROM tasks WHERE task_id IN ({marks})",
+            f"SELECT task_id, pane_birth{remote_cols}{session_col} FROM tasks WHERE task_id IN ({marks})",
             task_ids,
         ):
-            tid, birth = row[0], row[1]
-            births[tid] = birth or ""
+            tid = row["task_id"]
+            births[tid] = row["pane_birth"] or ""
             if has_v7:
-                remote_id, verified, detail = row[2], row[3], row[4]
+                remote_id = row["remote_task_id"]
                 if remote_id:
-                    remotes[tid] = {"remote_task_id": remote_id, "verified": bool(verified), "verify_detail": detail or None}
+                    remotes[tid] = {"remote_task_id": remote_id, "verified": bool(row["verified"]),
+                                     "verify_detail": row["verify_detail"] or None}
+            if has_session:
+                agent_session = row["agent_session"]
+                if agent_session:
+                    sessions[tid] = agent_session
         for tid, at, payload in con.execute(
             f"""SELECT task_id, occurred_at, payload FROM events WHERE type='input_required' AND task_id IN ({marks})
                 AND sequence IN (SELECT MAX(sequence) FROM events WHERE type='input_required' GROUP BY task_id)""",
@@ -202,7 +213,7 @@ def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict],
             asks[tid] = {"at": at, "tool": p.get("tool"), "summary": p.get("message") or p.get("command")}
     finally:
         con.close()
-    return births, asks, remotes
+    return births, asks, remotes, sessions
 
 
 def build(now: datetime) -> tuple[dict, dict]:
@@ -222,7 +233,7 @@ def build(now: datetime) -> tuple[dict, dict]:
             continue
         if t.get("state") not in TERMINAL or updated >= cutoff:
             raw_tasks.append(t)
-    births, asks, remotes = registry_rows([t["task_id"] for t in raw_tasks])
+    births, asks, remotes, sessions = registry_rows([t["task_id"] for t in raw_tasks])
 
     tasks, worktrees, active_task_by_pane = [], {}, {}
     for t in raw_tasks:
@@ -304,7 +315,7 @@ def build(now: datetime) -> tuple[dict, dict]:
         },
         "agents": agents, "tasks": tasks, "blockers": blockers, "task_config": task_config,
     }
-    return snapshot, {"tasks": by_id, "panes": live_by_pane, "worktrees": worktrees}
+    return snapshot, {"tasks": by_id, "panes": live_by_pane, "worktrees": worktrees, "sessions": sessions}
 
 
 def worktree_ok(path: Path) -> bool:
@@ -330,8 +341,144 @@ def read_regular(path: Path) -> tuple[bytes, str]:
         os.close(fd)
 
 
+SESSIONS_ROOT = Path.home() / ".omp/agent/sessions"
+# omp's own session id shape (a herdr-reported UUID, lib/run-registry.sh's
+# agent_session column) -- charset-checked before it ever reaches a glob
+# pattern or a path, same spirit as tasks.py's REMOTE_TASK_ID_RE.
+AGENT_SESSION_RE = re.compile(r"^[0-9a-f-]{8,64}$")
+SESSION_READ_CAP = 1_000_000  # a JSONL transcript is append-only; read the
+# TAIL up to this many bytes, not the head read_regular() uses for a
+# writer-bounded .handoffs/ file -- the newest (last) assistant message is
+# always near EOF, so truncating the head would lose exactly what this
+# source exists to carry.
+
+
+def _resolve_session_jsonl(agent_session: str) -> Path | None:
+    """SPEC fix item 2's path-safety requirement: the session path must
+    resolve under SESSIONS_ROOT, never a symlink / `..` / absolute
+    elsewhere. agent_session is herdr's own report of the CLI's session id
+    (locally observed, not remote-client input), but validated the same
+    way regardless: charset-checked, globbed by its exact filename suffix
+    one directory level down (the real layout is
+    SESSIONS_ROOT/<escaped-cwd>/<timestamp>_<session>.jsonl), and the
+    match's REAL (symlink-resolved) path is re-checked to still be inside
+    SESSIONS_ROOT before anything is ever opened."""
+    if not AGENT_SESSION_RE.fullmatch(agent_session):
+        return None
+    try:
+        root = SESSIONS_ROOT.resolve(strict=True)
+    except OSError:
+        return None
+    try:
+        matches = sorted(SESSIONS_ROOT.glob(f"*/*_{agent_session}.jsonl"))
+    except OSError:
+        return None
+    for m in matches:
+        try:
+            rp = m.resolve(strict=True)
+        except OSError:
+            continue
+        if (rp == root or root in rp.parents) and rp.is_file():
+            return rp
+    return None
+
+
+def _read_session_tail(path: Path) -> tuple[bytes, bool]:
+    """Same single-link-regular-file safety as read_regular, but reads
+    from the END: a JSONL transcript is append-only and can run well past
+    SESSION_READ_CAP for a long task, and the text this source exists to
+    carry -- the LAST assistant message -- is always near EOF. Returns
+    (bytes, hit_cap) so the caller can tell truncated_at_source apart from
+    "the whole file fit"."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise OSError(f"{path}: not a single-link regular file")
+        hit_cap = st.st_size > SESSION_READ_CAP
+        if hit_cap:
+            os.lseek(fd, -SESSION_READ_CAP, os.SEEK_END)
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read(), hit_cap
+    finally:
+        os.close(fd)
+
+
+def _last_assistant_text(raw: bytes) -> str | None:
+    """SPEC item 2's exact shape: records with type=="message",
+    message.role=="assistant", content[] blocks with type=="text" --
+    thinking/toolCall blocks are never surfaced to a remote client. "Last"
+    means the last assistant message that actually produced text: a final
+    turn that was pure tool-call/thinking carries nothing a remote client
+    would recognize as a reply, so it is skipped in favour of the most
+    recent one that did."""
+    last = None
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("type") != "message":
+            continue
+        msg = rec.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        blocks = msg.get("content")
+        if not isinstance(blocks, list):
+            continue
+        text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+        if text:
+            last = text
+    return last
+
+
+def _open_source(wt: Path, source: str, task_id: str, sessions: dict[str, str]) -> tuple[bytes, str | None, bool] | None:
+    """One safety-checked read for a result source, whatever kind it is --
+    (bytes, iso mtime or None, source_truncated) or None if the source
+    does not exist / fails its own safety check this tick. `.handoffs/*`
+    sources are worktree files (read_regular's O_NOFOLLOW + single-link
+    check, read from the START -- writer-bounded, small by construction).
+    `omp:transcript` is the task's own omp session JSONL (registry
+    agent_session), read from the END and resolved only under
+    SESSIONS_ROOT; `bytes` here is the EXTRACTED last-assistant text, not
+    the raw JSONL, so the caller's redact/cap/hash/dedup pipeline runs over
+    the same thing for every source without having to know which kind this
+    one is."""
+    if source == "omp:transcript":
+        agent_session = sessions.get(task_id)
+        if not agent_session:
+            return None
+        path = _resolve_session_jsonl(agent_session)
+        if path is None:
+            return None
+        try:
+            tail, hit_cap = _read_session_tail(path)
+        except OSError:
+            return None
+        text = _last_assistant_text(tail)
+        if not text:
+            return None
+        return text.encode("utf-8"), iso(path.stat().st_mtime), hit_cap
+    path = wt / source
+    # N6: checked against the PARENT of the exact path about to be opened,
+    # not once per worktree -- a single hoisted worktree_ok(wt) check does
+    # not catch ".handoffs" itself being a symlink (read_regular's
+    # O_NOFOLLOW only guards the final path component).
+    if not worktree_ok(path.parent):
+        return None
+    try:
+        raw, mtime = read_regular(path)
+    except OSError:
+        return None
+    return raw, mtime, len(raw) >= RESULT_READ_CAP
+
+
 def changed_results(snapshot: dict, local: dict, cache: dict, now_s: float) -> list[dict]:
     out, used = [], 0
+    sessions = local.get("sessions", {})
     order = sorted(snapshot["tasks"], key=lambda t: t["updated_at"], reverse=True)
     for t in order:
         wt = local["worktrees"].get(t["task_id"])
@@ -343,28 +490,22 @@ def changed_results(snapshot: dict, local: dict, cache: dict, now_s: float) -> l
         # populated for research tasks too, not only in the tests that
         # inject these sources directly.
         #
-        # N7: ANSWER.md is restricted to tasks that have a remote_task_id --
-        # a purely-local task (no remote_task_id) was never meant to be
-        # readable by any herdr:read client; only PROOF.md (the pre-existing,
-        # already-reviewed closure proof) stays unconditional.
-        sources = ((".handoffs/PROOF.md", ".handoffs/ANSWER.md") if t.get("remote_task_id")
+        # N7: ANSWER.md and omp:transcript are restricted to tasks that have
+        # a remote_task_id -- a purely-local task (no remote_task_id) was
+        # never meant to be readable by any herdr:read client; only
+        # PROOF.md (the pre-existing, already-reviewed closure proof) stays
+        # unconditional.
+        sources = ((".handoffs/PROOF.md", ".handoffs/ANSWER.md", "omp:transcript") if t.get("remote_task_id")
                    else (".handoffs/PROOF.md",))
         for source in sources:
-            path = wt / source
-            # N6: the symlink-safety check must run per source against the
-            # PARENT of the exact path about to be opened (worktree_ok(wt)
-            # alone does not catch ".handoffs" itself being a symlink --
-            # read_regular's O_NOFOLLOW only guards the final component).
-            if not worktree_ok(path.parent):
+            opened = _open_source(wt, source, t["task_id"], sessions)
+            if opened is None:
                 continue
-            try:
-                raw, mtime = read_regular(path)
-            except OSError:
-                continue
+            raw, mtime, source_truncated = opened
             # Redact the whole read, THEN cut: a cut through a PEM block would
             # strip the END marker the private-key rule needs.
             full = redact(raw.decode("utf-8", "replace"))
-            truncated = len(raw) >= RESULT_READ_CAP or len(full) > RESULT_MAX_BYTES
+            truncated = source_truncated or len(full) > RESULT_MAX_BYTES
             text = full[:RESULT_MAX_BYTES]
             digest = hashlib.sha256(text.encode()).hexdigest()
             cache_key = f"{t['task_id']}:{source}"

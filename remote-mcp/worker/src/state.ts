@@ -610,6 +610,19 @@ export class HerdrState extends DurableObject<Env> {
       .map((r) => ({ actor: r.actor, client_id: r.client_id, scope: r.mode === "research" ? SCOPE_TASK_START : SCOPE_TASK_IMPLEMENT }));
   }
 
+  // Every sender with an ALREADY-RUNNING remote task (spawned, with a
+  // local_task_id, not yet terminal or already cancelling) -- the pending-
+  // command check above only ever sees a QUEUED start/resume; a task past
+  // that point has no command for cmdGate to see without this (SPEC fix:
+  // Zero's review item 4 -- "revoke stops in-flight tasks too", not only
+  // ones still waiting to be delivered).
+  activeTaskSenders(): ScopedSender[] {
+    return this.sql.exec<{ actor: string; client_id: string; mode: string }>(
+      `SELECT DISTINCT requester_email AS actor, requester_client AS client_id, mode AS mode
+       FROM remote_tasks WHERE local_task_id<>'' AND state IN ('running','starting','waiting_approval','blocked')`).toArray()
+      .map((r) => ({ actor: r.actor, client_id: r.client_id, scope: r.mode === "research" ? SCOPE_TASK_START : SCOPE_TASK_IMPLEMENT }));
+  }
+
   // get_task_answer's "progress" field: this one remote task's own recent
   // history, newest first (unlike listEvents' global ascending cursor feed).
   taskEventLog(remoteTaskId: string, limit: number): TaskEventRow[] {
@@ -832,6 +845,37 @@ export class HerdrState extends DurableObject<Env> {
       }
       this.audit(nowMs, { actor: rt.requester_email, client_id: rt.requester_client, tool: "delivery", target: c.remote_task_id,
         decision: "cancelled_before_delivery", reason: why, message_id: "", detail: c.op });
+    }
+
+    // Z4 (SPEC fix: Zero's review item 4): a sender's grant can be revoked
+    // (or their email removed from the allowlist) while their task is
+    // ALREADY RUNNING on the Mac, not only while a start/resume is still
+    // queued -- the loop above only ever re-checks commands, so a task with
+    // no pending command never got this check at all. Same cancel-command
+    // shape as cancelTask() itself: this never fails the task outright,
+    // only asks the Mac to stop it, and the state flip to 'cancelling'
+    // self-guards against queuing the same cancel twice on the next tick.
+    // This loop itself checks no separate tasksEnabled flag -- the
+    // sender_not_allowed arm (ALLOWED_EMAILS) always applies, and the
+    // sender_grant_revoked arm already inherits env.TASKS_ENABLED from
+    // cmdGate's own construction in ingest() (activeTaskSenders() is fed
+    // through the SAME grantGate call as pendingCommandSenders()): when
+    // tasks are globally off, grantGate reports nothing revoked, the same
+    // "ride to the deadline backstop" semantics the kill switch already
+    // documents, not a second one invented here.
+    for (const rt of this.sql.exec<{ remote_task_id: string; local_task_id: string; requester_email: string; requester_client: string }>(
+      `SELECT remote_task_id, local_task_id, requester_email, requester_client FROM remote_tasks
+       WHERE local_task_id<>'' AND state IN ('running','starting','waiting_approval','blocked')`).toArray()) {
+      const why = !emailAllowed(this.env, rt.requester_email) ? "sender_not_allowed"
+        : cmdRevoked.has(`${rt.requester_email}\n${rt.requester_client}`) ? "sender_grant_revoked" : null;
+      if (!why) continue;
+      this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
+        `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", rt.remote_task_id,
+        JSON.stringify({ local_task_id: rt.local_task_id, reason: why }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+      this.sql.exec(`UPDATE remote_tasks SET state='cancelling', updated_at=? WHERE remote_task_id=?`, nowMs, rt.remote_task_id);
+      this.recordTaskEvent(nowMs, rt.remote_task_id, "cancel_requested", { reason: why });
+      this.audit(nowMs, { actor: rt.requester_email, client_id: rt.requester_client, tool: "delivery", target: rt.remote_task_id,
+        decision: "revoked_while_running", reason: why, message_id: "", detail: "cancel" });
     }
 
     for (const m of this.sql.exec<{ message_id: string; task_id: string; detail: string; attempts: number }>(

@@ -18,7 +18,10 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -115,6 +118,24 @@ tsk.WT_ROOT = WT_ROOT
 tsk.CODE_ROOT = CODE_ROOT
 tsk.TASKS_ON_MAC = True
 
+# Fix 5's hard-stop timer spawns a REAL detached `sleep` process -- this
+# whole file is otherwise fully faked (module docstring) and must stay
+# that way. Record calls instead of actually spawning; HardStop's own test
+# class restores the real one only when it explicitly wants it.
+HARD_STOP_CALLS: list[list[str]] = []
+
+
+def _record_hard_stop(argv: list[str]):
+    HARD_STOP_CALLS.append(argv)
+
+    class _FakeProc:
+        pid = -1
+
+    return _FakeProc()
+
+_REAL_POPEN_DETACHED = tsk._popen_detached
+tsk._popen_detached = _record_hard_stop
+
 
 def _reset_registry(rows: list[tuple] = ()):
     con = sqlite3.connect(REGISTRY)
@@ -141,6 +162,58 @@ class Capabilities(unittest.TestCase):
         tsk.TASKS_ON_MAC = False
         self.assertFalse(tsk.capabilities_snapshot()["mac_enabled"])
         tsk.TASKS_ON_MAC = True
+
+
+class CapabilityProbe(unittest.TestCase):
+    """_capability_probe()'s kb_http_reachable: a 2xx-only HTTP reachability
+    check, named honestly -- never kb_reachable (which read as "the agent
+    can actually use it"), and no kb_auth_ok: this process runs on the Mac
+    BEFORE a worker is spawned and never holds the KB credential itself."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.status = 200
+
+        class Health(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(CapabilityProbe.status)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        cls.server = HTTPServer(("127.0.0.1", 0), Health)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.real_url = tsk.KB_HEALTH_URL
+        tsk.KB_HEALTH_URL = f"http://127.0.0.1:{cls.server.server_port}/health"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        tsk.KB_HEALTH_URL = cls.real_url
+
+    def test_a_2xx_response_is_reachable(self):
+        CapabilityProbe.status = 200
+        probe = tsk._capability_probe("knowledge-base", False)
+        self.assertIs(probe["kb_http_reachable"], True)
+        self.assertNotIn("kb_reachable", probe)
+
+    def test_a_401_response_is_not_reachable_and_the_field_is_renamed(self):
+        # The 401-counts-as-reachable claim this fix's SPEC started from was
+        # itself wrong: urllib raises HTTPError (a URLError subclass) on a
+        # non-2xx status, so the OLD probe already returned False here too.
+        # Pinned anyway: the field must still be kb_http_reachable, never
+        # kb_reachable, and kb_auth_ok must not exist (no probe makes an
+        # authenticated call at this privilege level).
+        CapabilityProbe.status = 401
+        probe = tsk._capability_probe("knowledge-base", False)
+        self.assertIs(probe["kb_http_reachable"], False)
+        self.assertNotIn("kb_reachable", probe)
+        self.assertNotIn("kb_auth_ok", probe)
+
+    def test_a_non_kb_repo_gets_no_probe_at_all(self):
+        probe = tsk._capability_probe("some-other-repo", True)
+        self.assertEqual(probe, {"secrets_granted": True})
 
 
 class StartRefusals(unittest.TestCase):
@@ -579,6 +652,81 @@ class Sweep(unittest.TestCase):
         self._row("task_c", "rtask_c", state="completed", verify_detail="already checked")
         actions2 = tsk.sweep({"task_c": t}, now)
         self.assertEqual(actions2, [])
+
+
+class HardStop(unittest.TestCase):
+    """SPEC fix item 5: every accepted start/resume schedules a detached
+    timer independent of the publisher process staying alive -- sweep()'s
+    own deadline check depends on the publisher still ticking; this does
+    not. _popen_detached is this fully-faked suite's seam (module-level
+    patch above): no real `sleep` ever runs here for the SCHEDULING tests
+    below. The last test in this class is the one exception: it restores
+    the real _popen_detached and proves actual independent firing, with
+    the grace window shrunk so it does not need to wait a real hour --
+    verify-tasks-e2e.py separately proves a REAL pid survives at full
+    production delay (and reaps it immediately after)."""
+
+    def setUp(self):
+        _reset_registry()
+        con = sqlite3.connect(REGISTRY)
+        try:
+            con.execute("ALTER TABLE tasks ADD COLUMN state TEXT NOT NULL DEFAULT 'running'")
+        except sqlite3.OperationalError:
+            pass
+        con.commit(); con.close()
+        FAKE_SPAWN_OUT.write_text("0")
+        FAKE_BRIDGE_RC.write_text("0")
+        FAKE_BRIDGE_LOG.write_text("")
+        FAKE_BRIDGE_FIND_SPAWNED.write_text("")
+        shutil.rmtree(WT_ROOT, ignore_errors=True)
+        HARD_STOP_CALLS.clear()
+
+    def test_an_accepted_start_schedules_exactly_one_hard_stop_at_max_minutes_plus_grace(self):
+        out = tsk.process_command(_start_cmd())
+        self.assertEqual(out["outcome"], "accepted")
+        self.assertEqual(len(HARD_STOP_CALLS), 1)
+        script = HARD_STOP_CALLS[0][2]  # ["/bin/bash", "-c", script]
+        self.assertIn(f"sleep {60 * 60 + tsk.HARD_STOP_GRACE_S};", script)
+        self.assertIn("cancel run_fake1 task_fake1 timed_out rtask_20261002T000000Z_deadbeef", script)
+        self.assertIn("hard_stop_scheduled", FAKE_BRIDGE_LOG.read_text())
+
+    def test_scheduling_failure_does_not_fail_the_start_itself(self):
+        def _boom(argv):
+            raise OSError("no process slots")
+        old = tsk._popen_detached
+        tsk._popen_detached = _boom
+        try:
+            out = tsk.process_command(_start_cmd())
+        finally:
+            tsk._popen_detached = old
+        self.assertEqual(out["outcome"], "accepted")
+        self.assertNotIn("hard_stop_scheduled", FAKE_BRIDGE_LOG.read_text())
+
+    def test_the_scheduled_timer_actually_fires_its_own_cancel_with_nothing_else_watching(self):
+        # The two tests above only prove _schedule_hard_stop was CALLED
+        # correctly (module-level fake records the argv). This proves the
+        # thing it schedules is a REAL, independently-firing process: no
+        # sweep(), no publisher tick, nothing but the detached sleep+exec
+        # itself drives this cancel call into the bridge log.
+        old_popen, old_grace = tsk._popen_detached, tsk.HARD_STOP_GRACE_S
+        tsk._popen_detached = _REAL_POPEN_DETACHED
+        tsk.HARD_STOP_GRACE_S = 1  # keep the test fast; delay = 0*60 + 1 = 1s
+        try:
+            pid = tsk._schedule_hard_stop("run_real", "task_real", "rtask_real", 0)
+        finally:
+            tsk._popen_detached = old_popen
+            tsk.HARD_STOP_GRACE_S = old_grace
+        self.assertIsNotNone(pid, "a real detached process must have been started")
+        deadline = time.time() + 5
+        seen = ""
+        while time.time() < deadline:
+            seen = FAKE_BRIDGE_LOG.read_text()
+            if "cancel run_real task_real timed_out rtask_real" in seen:
+                break
+            time.sleep(0.1)
+        self.assertIn("cancel run_real task_real timed_out rtask_real", seen,
+                       "the detached timer never fired its own cancel within 5s -- "
+                       "nothing but the scheduled process itself was supposed to drive this")
 
 
 if __name__ == "__main__":

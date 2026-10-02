@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import urllib.error
@@ -122,6 +123,16 @@ def has_v7_task_columns(con: sqlite3.Connection) -> bool:
     must tolerate its absence rather than crash every tick."""
     cols = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
     return {"remote_task_id", "deadline_at", "verified", "verify_detail"} <= cols
+
+
+def has_agent_session_column(con: sqlite3.Connection) -> bool:
+    """Same reasoning as has_v7_task_columns: agent_session has existed
+    since schema v3, but a read-only sqlite3.connect() (publisher.py's
+    registry_rows()) never triggers lib/run-registry.sh's own migrations,
+    so a registry opened before any bash caller has run past v2 -- or a
+    test fixture's hand-rolled schema -- may still lack it."""
+    cols = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
+    return "agent_session" in cols
 
 
 def _registry_query(where: str, params: tuple) -> list[tuple]:
@@ -220,11 +231,20 @@ def _find_repo_root(repo: str) -> Path | None:
 def _capability_probe(repo: str, secrets_granted: bool) -> dict:
     probe = {"secrets_granted": secrets_granted}
     if repo == "knowledge-base":
+        # SPEC fix (Zero's review item 3): named kb_http_reachable, not
+        # kb_reachable -- this is an HTTP-level reachability check (2xx),
+        # never proof of authenticated access. There is no kb_auth_ok
+        # here: this process runs on the Mac BEFORE a worker is spawned
+        # and never holds the KB credential itself (only the spawned
+        # worker's own .env.op bootstrap does), so there is no read-only
+        # call it could make under the worker's granted identity without
+        # inventing one; list_capabilities documents the omission instead
+        # of a probe that would claim more than was actually checked.
         try:
             with urllib.request.urlopen(KB_HEALTH_URL, timeout=8) as r:  # noqa: S310 (fixed https host)
-                probe["kb_reachable"] = 200 <= r.status < 500
+                probe["kb_http_reachable"] = 200 <= r.status < 300
         except (urllib.error.URLError, OSError, TimeoutError):
-            probe["kb_reachable"] = False
+            probe["kb_http_reachable"] = False
     return probe
 
 
@@ -330,6 +350,47 @@ def _spawn(root: Path, branch: str, mcfg: dict, brief: Path) -> subprocess.Compl
     finally:
         brief.unlink(missing_ok=True)
 
+# ── independent deadline backstop (SPEC item 5: must not depend on the
+# publisher process staying alive) ──────────────────────────────────────
+HARD_STOP_GRACE_S = 90  # slack past max_minutes before this backstop fires:
+# comfortably more than one publisher tick (~15s), so the normal path
+# (sweep's own deadline check, which DOES depend on the publisher) wins
+# the race in the common case; this only ever matters when it does not.
+
+
+def _popen_detached(argv: list[str]) -> subprocess.Popen:
+    """The one seam between _schedule_hard_stop and an actual background
+    process -- a real `sleep` here is exactly what verify-tasks.py's fully
+    faked suite must never spawn, so tests monkeypatch this one function
+    (the same pattern as the module-level REGISTRY_BRIDGE/SPAWN_TASK/
+    CLOSE_DONE path swaps) instead of every call site."""
+    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def _schedule_hard_stop(run_id: str, task_id: str, remote_id: str, max_minutes: int) -> int | None:
+    """A detached `sleep <max_minutes*60+grace>` followed by registry-
+    bridge.sh cancel, started session-leader-detached (Python's
+    start_new_session, the nohup/setsid equivalent) so it survives the
+    publisher LaunchAgent dying or being reloaded -- the one thing on the
+    Mac that still enforces the deadline when nothing else is ticking.
+    Goes through the exact same pane-birth-checked cancel sweep()'s own
+    force_cancel uses, so it is a genuine belt, not a second mechanism
+    with different rules: a no-op against an already-terminal row
+    (set_task_state refuses the transition) or a recycled pane (the birth
+    check skips the close). Returns the spawned process's pid, or None if
+    it could not even be started -- never fails the start/resume itself,
+    since the publisher's own sweep is still the primary enforcement
+    path."""
+    delay = max(0, max_minutes) * 60 + HARD_STOP_GRACE_S  # never negative; a misconfigured max_minutes<=0 fires at just the grace period, not instantly or negatively
+    script = (f"sleep {delay}; exec {shlex.quote(REGISTRY_BRIDGE)} cancel "
+              f"{shlex.quote(run_id)} {shlex.quote(task_id)} timed_out {shlex.quote(remote_id)}")
+    try:
+        proc = _popen_detached(["/bin/bash", "-c", script])
+    except OSError:
+        return None
+    return proc.pid
+
 
 def _start(cmd: dict) -> dict:
     cid, remote_id, p = cmd["command_id"], cmd["remote_task_id"], cmd["payload"]
@@ -397,6 +458,10 @@ def _start(cmd: dict) -> dict:
         return {"command_id": cid, "outcome": "failed",
                 "detail": "spawned, but could not set the deadline that is the only backstop on a runaway task",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
+    hard_stop_pid = _schedule_hard_stop(run_id, local_task_id, remote_id, caps["max_minutes"])
+    if hard_stop_pid is not None:
+        _bridge("append-event", run_id, local_task_id, "hard_stop_scheduled",
+                json.dumps({"pid": hard_stop_pid, "max_minutes": caps["max_minutes"], "grace_s": HARD_STOP_GRACE_S}))
     probe = _capability_probe(repo, mcfg["secrets"] == "grant")
     return {"command_id": cid, "outcome": "accepted", "detail": "spawned",
             "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch,
@@ -501,6 +566,10 @@ def _resume(cmd: dict) -> dict:
         return {"command_id": cid, "outcome": "failed",
                 "detail": "resumed, but could not set the deadline that is the only backstop on a runaway task",
                 "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
+    hard_stop_pid = _schedule_hard_stop(run_id, local_task_id, remote_id, caps["max_minutes"])
+    if hard_stop_pid is not None:
+        _bridge("append-event", run_id, local_task_id, "hard_stop_scheduled",
+                json.dumps({"pid": hard_stop_pid, "max_minutes": caps["max_minutes"], "grace_s": HARD_STOP_GRACE_S}))
     probe = _capability_probe(repo, mcfg["secrets"] == "grant")
     return {"command_id": cid, "outcome": "accepted", "detail": "resumed",
             "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch,

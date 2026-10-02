@@ -220,8 +220,10 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
   server.registerTool("list_capabilities", {
     title: "List task capabilities",
     description: "What start_task can do right now: allow-listed repos, each mode's git/secrets/write policy, and " +
-      "today's caps (max_concurrent/max_per_day/max_minutes). Pre-flight check before start_task; answers from the " +
-      "Mac's own tracked allowlist file (remote-mcp/task-allowlist.json), never a hand-duplicated table.",
+      "today's caps (max_concurrent/max_per_day/max_minutes -- there is no separate $/token budget). Each task runs " +
+      "in its own sandboxed herdr pane via spawn-task.sh, not an omp-attach session. Pre-flight check before " +
+      "start_task; answers from the Mac's own tracked allowlist file (remote-mcp/task-allowlist.json), never a " +
+      "hand-duplicated table.",
     inputSchema: {},
     annotations: ro,
   }, async () => {
@@ -238,7 +240,9 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
     title: "Get a remote task's answer",
     description: "State, objective, progress (recent events), artifacts (every .handoffs/ file synced for it, with " +
       "size/sha256 -- fetch one with get_task_result's path argument), the omp session's latest assistant reply, and " +
-      "(once answer_ready) the written answer, .handoffs/ANSWER.md.",
+      "(once answer_ready) the written answer, .handoffs/ANSWER.md. local_task.verified (and verified_kind: " +
+      "source_link_present for research, pushed_sha_matches for implement) is a FORMAT/CLOSURE check the Mac ran " +
+      "against the task's own completion claim -- never a semantic read of whether the answer is actually correct.",
     inputSchema: { task_id: z.string().min(1).max(100) },
     annotations: ro,
   }, async ({ task_id }) => {
@@ -256,6 +260,10 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
       connection: v.connection, task_id: rt.remote_task_id, state: rt.state, mode: rt.mode, repo: rt.repo,
       objective: rt.objective, created_at: rt.created_at, updated_at: rt.updated_at,
       parent_task_id: rt.parent_remote_task_id, capability_probe: rt.capability_probe,
+      // Z3 (SPEC fix: Zero's review item 3): a static function of mode, not a
+      // registry column -- what "verified" WOULD mean if/when it is true,
+      // independent of the task's current state.
+      verified_kind: rt.mode === "research" ? "source_link_present" : "pushed_sha_matches",
       local_task: localTask ? publicTask(localTask) : null, progress,
       artifacts: artifacts.map((a) => ({ path: a.source, size: a.size, sha256: a.sha256, synced_at: a.synced_at })),
       latest_reply: reply ? reply.text.slice(0, MAX_RESULT_CHUNK) : null,

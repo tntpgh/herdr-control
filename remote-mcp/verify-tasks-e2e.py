@@ -21,6 +21,7 @@ live e2e (see .handoffs/PROOF.md).
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import sys
 import tempfile
@@ -61,6 +62,37 @@ def registry_row(task_id: str) -> dict | None:
     row = con.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
     con.close()
     return dict(row) if row else None
+
+
+def restore_working_herdr_and_free_slot(fake_herdr_path: Path, log_path: Path, cmd_id: str,
+                                         remote_task_id: str, local_task_id: str) -> None:
+    """Each negative-outcome section below points `fake_herdr_path` (the
+    single file on PATH all of them share) at a DIFFERENT broken `herdr`
+    to prove its own failure mode. Left as-is, that broken fake leaks
+    into whichever section runs next (R3-3's own real cancel needs a
+    WORKING `herdr pane list`), and the section's own task -- correctly
+    left non-terminal by the fix under test -- keeps holding one of the
+    allowlist's 4 concurrent slots forever, starving every later start.
+    Point `herdr pane list` at an always-empty, always-succeeding
+    response (nothing of ours is in it, so registry-bridge.sh's cancel
+    takes the "already gone" branch with no close needed) and cancel the
+    section's task for real, freeing both the PATH and the slot before
+    the next section assumes a clean slate."""
+    log_path.write_text("")
+    fake_herdr_path.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {log_path}
+case "$1 $2" in
+  "pane list") printf '{{"result":{{"panes":[]}}}}\\n'; exit 0 ;;
+esac
+exit 0
+""")
+    out = tsk.process_command({
+        "command_id": cmd_id, "op": "cancel", "remote_task_id": remote_task_id,
+        "payload": {"local_task_id": local_task_id, "reason": "test_cleanup"},
+    })
+    check(f"cleanup ({cmd_id}): task cancelled for real once the pane is confirmed gone "
+          "(restores a working `herdr` and frees the concurrency slot for later sections)",
+          out.get("outcome") == "accepted", json.dumps(out))
 
 
 print("== start_task: real register_task() + real registry-bridge.sh set-remote-id/set-deadline ==")
@@ -137,14 +169,18 @@ cout3 = tsk.process_command({
     "command_id": "cmd_5", "op": "cancel", "remote_task_id": "rtask_20261002T000003Z_e2e00003",
     "payload": {"local_task_id": task_id3, "reason": "canceled"},
 })
-check("cancel accepted even though herdr pane list fails", cout3.get("outcome") == "accepted", json.dumps(cout3))
+check("cancel FAILS (not accepted) when herdr pane list itself fails -- Z1: the row must never be marked cancelled on an unconfirmed pane",
+      cout3.get("outcome") == "failed", json.dumps(cout3))
 row3 = registry_row(task_id3)
-check("registry state is still 'cancelled' (the state write does not depend on the pane close)",
-      bool(row3) and row3.get("state") == "cancelled", row3)
+check("registry state is NOT 'cancelled' (stays non-terminal for the next retry)",
+      bool(row3) and row3.get("state") != "cancelled", row3)
 herdr_calls = fake_herdr_log.read_text() if fake_herdr_log.exists() else ""
 check("`herdr pane list` was attempted", "pane list" in herdr_calls, herdr_calls)
 check("`herdr pane close` was NEVER attempted once `pane list` failed (N5, no fail-open)",
       "pane close" not in herdr_calls, herdr_calls)
+restore_working_herdr_and_free_slot(fake_herdr, fake_herdr_log, "cmd_n5_cleanup",
+                                     "rtask_20261002T000003Z_e2e00003", task_id3)
+
 
 print("== R3-3: real registry-bridge.sh cancel refuses when the row's own remote_task_id does not match ==")
 import subprocess  # noqa: E402 (test-only, added for this direct bridge call)
@@ -189,14 +225,80 @@ cout5 = tsk.process_command({
     "command_id": "cmd_8", "op": "cancel", "remote_task_id": "rtask_20261002T000005Z_e2e00005",
     "payload": {"local_task_id": task_id5, "reason": "canceled"},
 })
-check("cancel still accepted when `herdr pane list` returns rc=0 but non-JSON", cout5.get("outcome") == "accepted", json.dumps(cout5))
+check("cancel FAILS (not accepted) when `herdr pane list` returns rc=0 but non-JSON -- Z1: an unparseable list must never fail open",
+      cout5.get("outcome") == "failed", json.dumps(cout5))
 row5 = registry_row(task_id5)
-check("registry state is 'cancelled' regardless of the unparseable pane list",
-      bool(row5) and row5.get("state") == "cancelled", row5)
+check("registry state is NOT 'cancelled' when the pane list could not be parsed",
+      bool(row5) and row5.get("state") != "cancelled", row5)
 herdr2_calls = fake_herdr2_log.read_text() if fake_herdr2_log.exists() else ""
 check("`herdr pane list` was attempted", "pane list" in herdr2_calls, herdr2_calls)
 check("`herdr pane close` was NEVER attempted when jq could not parse a rc=0 list (R3-6, no fail-open)",
       "pane close" not in herdr2_calls, herdr2_calls)
+restore_working_herdr_and_free_slot(fake_herdr, fake_herdr2_log, "cmd_r36_cleanup",
+                                     "rtask_20261002T000005Z_e2e00005", task_id5)
+
+
+print("== Z1: real registry-bridge.sh cancel fails (stays non-terminal) when `herdr pane close` itself fails ==")
+fake_herdr3_log = TMP / "fake-herdr3-calls.log"
+fake_herdr.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {fake_herdr3_log}
+case "$1 $2" in
+  "pane list") printf '{{"result":{{"panes":[{{"pane_id":"pane_e2e_fake","terminal_id":"birth_e2e_fake"}}]}}}}\\n'; exit 0 ;;
+  "pane close") exit 1 ;;
+esac
+exit 0
+""")
+out6 = tsk.process_command({
+    "command_id": "cmd_9", "op": "start", "remote_task_id": "rtask_20261002T000007Z_e2e00007",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "w"},
+})
+check("sixth start accepted", out6.get("outcome") == "accepted", json.dumps(out6))
+task_id6 = out6.get("local_task_id", "")
+cout6 = tsk.process_command({
+    "command_id": "cmd_10", "op": "cancel", "remote_task_id": "rtask_20261002T000007Z_e2e00007",
+    "payload": {"local_task_id": task_id6, "reason": "canceled"},
+})
+check("cancel fails when herdr pane close itself fails", cout6.get("outcome") == "failed", json.dumps(cout6))
+row6 = registry_row(task_id6)
+check("registry state is NOT 'cancelled' when the close failed (nothing of ours was actually confirmed gone)",
+      bool(row6) and row6.get("state") != "cancelled", row6)
+herdr3_calls = fake_herdr3_log.read_text() if fake_herdr3_log.exists() else ""
+check("`herdr pane close` WAS attempted (the live pane matched the registered birth)", "pane close" in herdr3_calls, herdr3_calls)
+restore_working_herdr_and_free_slot(fake_herdr, fake_herdr3_log, "cmd_z1a_cleanup",
+                                     "rtask_20261002T000007Z_e2e00007", task_id6)
+
+
+print("== Z1: real registry-bridge.sh cancel refuses to mark cancelled when the pane is STILL alive after close (no fail-open on a survivor) ==")
+fake_herdr4_log = TMP / "fake-herdr4-calls.log"
+fake_herdr.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {fake_herdr4_log}
+case "$1 $2" in
+  "pane list") printf '{{"result":{{"panes":[{{"pane_id":"pane_e2e_fake","terminal_id":"birth_e2e_fake"}}]}}}}\\n'; exit 0 ;;
+  "pane close") exit 0 ;;
+esac
+exit 0
+""")
+out7 = tsk.process_command({
+    "command_id": "cmd_11", "op": "start", "remote_task_id": "rtask_20261002T000008Z_e2e00008",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "u"},
+})
+check("seventh start accepted", out7.get("outcome") == "accepted", json.dumps(out7))
+task_id7 = out7.get("local_task_id", "")
+cout7 = tsk.process_command({
+    "command_id": "cmd_12", "op": "cancel", "remote_task_id": "rtask_20261002T000008Z_e2e00008",
+    "payload": {"local_task_id": task_id7, "reason": "canceled"},
+})
+check("cancel fails when the pane is STILL reported alive after close (fake herdr's close is a no-op on the fixture pane)",
+      cout7.get("outcome") == "failed", json.dumps(cout7))
+row7 = registry_row(task_id7)
+check("registry state is NOT 'cancelled' when the post-close list still shows the SAME pane alive",
+      bool(row7) and row7.get("state") != "cancelled", row7)
+herdr4_calls = fake_herdr4_log.read_text() if fake_herdr4_log.exists() else ""
+check("`herdr pane close` WAS attempted before the row was ever refused", "pane close" in herdr4_calls, herdr4_calls)
+check("`herdr pane list` was called TWICE (once before the close, once after, to prove the pane survived it)",
+      herdr4_calls.count("pane list") >= 2, herdr4_calls)
+restore_working_herdr_and_free_slot(fake_herdr, fake_herdr4_log, "cmd_z1b_cleanup",
+                                     "rtask_20261002T000008Z_e2e00008", task_id7)
 
 print("== R4-1: a spawn timeout BEFORE remote_task_id is ever stamped still gets the orphan cancelled (real registry-bridge.sh, real registry) ==")
 # Mirrors spawn-task.sh's own real sequence: register_task() runs long
@@ -268,6 +370,33 @@ check("registry-bridge.sh cancel succeeds against an unstamped row (no false ref
 row_after = registry_row(task_id_r41b)
 check("state is 'cancelled' after cancelling the unstamped row",
       bool(row_after) and row_after.get("state") == "cancelled", row_after)
+
+print("== Z5: every accepted start/resume schedules a real, independently-firing hard-stop timer ==")
+con = sqlite3.connect(tsk.REGISTRY)
+con.row_factory = sqlite3.Row
+hard_stop_rows = con.execute("SELECT task_id, payload FROM events WHERE type='hard_stop_scheduled'").fetchall()
+con.close()
+check("at least one hard_stop_scheduled event was recorded across this run's start/resume calls", len(hard_stop_rows) > 0, len(hard_stop_rows))
+killed, still_alive_at_check = 0, 0
+for r in hard_stop_rows:
+    try:
+        payload = json.loads(r["payload"])
+    except ValueError:
+        payload = {}
+    pid = payload.get("pid")
+    check(f"hard_stop_scheduled for {r['task_id']} carries a real numeric pid", isinstance(pid, int) and pid > 0, payload)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.kill(pid, 0)  # signal 0: existence check only, nothing sent
+            still_alive_at_check += 1
+            os.kill(pid, signal.SIGTERM)  # reap it now; it would otherwise sleep ~62 real minutes
+            killed += 1
+        except ProcessLookupError:
+            pass
+check("every scheduled hard-stop pid was a REAL, live detached process (not a placeholder) at check time",
+      still_alive_at_check == len(hard_stop_rows), f"{still_alive_at_check}/{len(hard_stop_rows)}")
+print(f"  (reaped {killed} detached hard-stop sleep process(es) spawned by this run)")
+
 
 shutil.rmtree(TMP, ignore_errors=True)
 print()
