@@ -180,6 +180,44 @@ class Capabilities(unittest.TestCase):
         tsk.TASKS_ON_MAC = True
 
 
+class SpawnArgvAgainstRealParser(unittest.TestCase):
+    """Every other test here fakes spawn-task.sh, so a flag tasks.py passes
+    that the real parser doesn't know is invisible to them: `--no-focus` fell
+    through to positional and reached omp's argv ("unknown flag"), and no
+    remote start ever launched an agent (2026-10-02, Zero's first live task).
+    Capture _spawn's exact argv and replay it through the REAL spawn-task.sh
+    in --dry-run: no tasks.py flag may survive onto the omp launch line."""
+
+    def test_tasks_argv_parses_in_real_spawn_task(self):
+        repo = TMP / "argv-repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "init"], check=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+        brief = TMP / "argv-brief.md"
+        brief.write_text("objective\n")
+        captured: list[list[str]] = []
+        real_run = tsk.subprocess.run
+        tsk.subprocess.run = lambda argv, **kw: captured.append(list(argv)) or subprocess.CompletedProcess(argv, 0, "", "")
+        try:
+            for secrets in ("grant", "withhold"):
+                tsk._spawn(repo, "remote/argv-check", {"job_class": "research", "secrets": secrets}, brief)
+        finally:
+            tsk.subprocess.run = real_run
+        self.assertEqual(len(captured), 2)
+        real_spawn = str(HERE.parent / "spawn-task.sh")
+        for argv in captured:
+            brief.write_text("objective\n")  # _spawn unlinks its brief once spawn-task.sh returns
+            out = subprocess.run(["bash", real_spawn, *argv[1:], "--dry-run"], capture_output=True, text=True,
+                                 timeout=60, env={**os.environ, "HERDR_RUN_STATE_DIR": str(TMP / "argv-runs")})
+            self.assertEqual(out.returncode, 0, out.stderr[-500:])
+            launch = next((l for l in out.stdout.splitlines() if l.strip().startswith("launch")), "")
+            self.assertTrue(launch, out.stdout[-500:])
+            tokens = launch.split()
+            for flag in (a for a in argv[1:] if a.startswith("--")):
+                self.assertNotIn(flag, tokens, f"{flag} leaked onto the omp command line: {launch}")
+
+
 class CapabilityProbe(unittest.TestCase):
     """_capability_probe()'s kb_http_reachable: a 2xx-only HTTP reachability
     check, named honestly -- never kb_reachable (which read as "the agent
