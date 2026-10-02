@@ -348,6 +348,42 @@ describe("cancel_task / resume_task", () => {
     expect(finalRow?.state).toBe("timed_out");
   });
 
+  it("an accepted cancel ACK landing before the remap tick also preserves timed_out, not generic cancelled (R2-1)", async () => {
+    // Same setup as ZR2 above, but resolved via the OTHER path: the
+    // worker's own cancel ack (c.op === "cancel" && a.outcome ===
+    // "accepted") landing first, instead of the remap loop reading a
+    // closed snapshot. Both paths share the one timeout_detected event;
+    // before R2-1 only the remap loop checked it, so whichever path won
+    // the race determined whether the task's history shows timed_out or
+    // a generic cancelled forever.
+    const cfg = { caps: { ...CAPS, max_minutes: 1 } };
+    await signedSync(taskConfigBody(cfg));
+    const { access_token: startTok } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    const started = await callTool<StartTaskResult>(startTok, "start_task", { repo: "knowledge-base", mode: "research", objective: "x" });
+    const remoteTaskId = started.data.task_id;
+    const leased = await syncJson(await signedSync(taskConfigBody(cfg)));
+    const startCmd = leased.commands.find((c) => c.op === "start")!;
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: startCmd.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_R21", local_run_id: "run_R21", branch: "remote/r21",
+      pane_id: "w1:term_r21", agent_id: "term_r21", capability_probe: {} }] }));
+
+    const future = Date.now() + 2 * 60_000;
+    const body = JSON.stringify(taskConfigBody(cfg));
+    const out = await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }));
+    expect(out.ok).toBe(true);
+    const cancelCmd = out.ok ? out.response.commands.find((c) => c.remote_task_id === remoteTaskId && c.op === "cancel") : undefined;
+    expect(cancelCmd).toBeDefined();
+    const midRow = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(midRow?.state).toBe("cancelling");
+
+    // The Mac's cancel ack lands directly -- no snapshot, no remap tick.
+    await signedSync(syncBody({ lease: false, command_acks: [{ command_id: cancelCmd!.command_id, outcome: "accepted",
+      detail: "cancelled" }] }));
+    const finalRow = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
+    expect(finalRow?.state).toBe("timed_out");
+  });
+
   it("refuses resume_task on a non-terminal task, then on the same task once cancelled before it ever spawned", async () => {
     await signedSync(taskConfigBody());
     const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);

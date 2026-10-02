@@ -25,6 +25,7 @@ import signal
 import sqlite3
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -322,10 +323,22 @@ check("F2 first cancel (real pane, real herdr fake) accepted", cout_f2_first.get
 fake_herdr_log.write_text("")  # restore_working_herdr_and_free_slot already left a working herdr on PATH
 f2_second_argv = [tsk.REGISTRY_BRIDGE, "cancel", run_id_f2, task_id_f2, "second_cancel_attempt"]
 bridge_out_f2_second = subprocess.run(f2_second_argv, capture_output=True, text=True)
-check("F2: a SECOND cancel on the now-terminal row exits nonzero", bridge_out_f2_second.returncode != 0, bridge_out_f2_second.stderr)
-check("F2: the refusal message says 'already terminal'", "already terminal" in bridge_out_f2_second.stderr, bridge_out_f2_second.stderr)
+check("R2-2: a SECOND cancel on an ALREADY-CANCELLED row is idempotent (exits 0, not an error)",
+      bridge_out_f2_second.returncode == 0, bridge_out_f2_second.stderr)
 check("F2: no `herdr pane list` or `pane close` call was ever made for the already-terminal row (refused before touching any pane)",
       fake_herdr_log.read_text().strip() == "", fake_herdr_log.read_text())
+# F2's OWN refusal (a cancel that must NOT succeed) only still applies to
+# completed/failed/lost, per R2-2 -- the very first task in this file
+# auto-closed to 'completed' at the top and is still in scope.
+fake_herdr_log.write_text("")
+f2_completed_argv = [tsk.REGISTRY_BRIDGE, "cancel", run_id, task_id, "cancel_a_completed_task"]
+bridge_out_f2_completed = subprocess.run(f2_completed_argv, capture_output=True, text=True)
+check("F2: a cancel on a COMPLETED row (not idempotently-cancellable) still refuses and exits nonzero",
+      bridge_out_f2_completed.returncode != 0, bridge_out_f2_completed.stderr)
+check("F2: the refusal message says 'already terminal'", "already terminal" in bridge_out_f2_completed.stderr, bridge_out_f2_completed.stderr)
+check("F2: no `herdr pane list` or `pane close` call was ever made for the completed row either",
+      fake_herdr_log.read_text().strip() == "", fake_herdr_log.read_text())
+
 
 print("== F1: real registry-bridge.sh cancel corroborates a terminal_id mismatch via agent_session (herdr restart case) ==")
 
@@ -584,6 +597,38 @@ def _hard_stop_pid(task_id: str) -> int | None:
     return pid if isinstance(pid, int) and pid > 0 else None
 
 
+def _reap_or_confirm_dead(pid: int, timeout_s: float = 2.0) -> bool:
+    """Kill a hard-stop timer's process group and confirm it is actually
+    gone before anything calls it a leak. Fix for a conductor-reported
+    flake: `os.kill(pid, 0)` alone returns success for an unreaped
+    ZOMBIE (signalled but never waited on) -- this script is the real
+    parent of every timer it schedules (tasks.py's real, unfaked Popen
+    runs in-process here), so a plain killpg without a reap leaves
+    exactly that zombie, which then looks indistinguishable from "still
+    running" to anything checking with signal 0 alone. Reaps via
+    waitpid when this process is still the pid's parent; falls back to
+    polling `ps`'s own STAT column (Z or no row at all means dead) for a
+    pid this process is no longer the parent of (e.g. already reaped by
+    tasks.py's own _kill_hard_stop_timer through a real _cancel() call
+    earlier in this same run)."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
+            if reaped_pid == pid:
+                return True
+        except ChildProcessError:
+            out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+            if out.stdout.strip() in ("", ) or out.stdout.strip().startswith("Z"):
+                return True
+        time.sleep(0.05)
+    return False
+
+
 pid_z5a = _hard_stop_pid(task_id_z5a)
 check("a real numeric hard-stop pid was recorded for Z5a's start", pid_z5a is not None, pid_z5a)
 alive_before_cancel = False
@@ -632,13 +677,27 @@ if pid_z5b is not None:
 check("Z5b's hard-stop pid is still alive -- nothing killed it while the task is still running",
       still_alive_z5b, pid_z5b)
 if pid_z5b is not None and still_alive_z5b:
-    try:
-        os.killpg(pid_z5b, signal.SIGTERM)  # reap it now; it would otherwise sleep ~62 real minutes
-    except OSError:
-        pass
+    _reap_or_confirm_dead(pid_z5b)  # it would otherwise sleep ~62 real minutes
 
-
-
+# Conductor's own nit (round-2 review): every per-section cleanup above
+# handles its OWN out-of-band shortcut; this is the blanket safety net
+# for anything missed -- every hard_stop_scheduled pid this run ever
+# recorded gets confirmed (and if needed, reaped) dead before teardown,
+# so this suite never leaks a real sleep process regardless of which
+# section scheduled it, and never flags a zombie it just killed itself
+# as a false leak either (the fix for the flake: a plain `os.kill(pid,
+# 0)` right after killpg sees a just-killed-but-unreaped zombie as
+# "still alive").
+con_cleanup = sqlite3.connect(tsk.REGISTRY)
+con_cleanup.row_factory = sqlite3.Row
+leftover_pids = [
+    json.loads(r["payload"]).get("pid")
+    for r in con_cleanup.execute("SELECT payload FROM events WHERE type='hard_stop_scheduled'").fetchall()
+]
+con_cleanup.close()
+leaked = [pid for pid in leftover_pids if pid is not None and not _reap_or_confirm_dead(pid)]
+check("teardown: no hard-stop timer scheduled anywhere in this run was left alive",
+      leaked == [], leaked)
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 if failures:

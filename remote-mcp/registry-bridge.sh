@@ -133,7 +133,16 @@ case "$cmd" in
     # cancelled/lost.)
     row_state=$(printf '%s' "$row" | jq -r '.state // empty')
     case "$row_state" in
-      completed|failed|cancelled|lost)
+      cancelled)
+        # R2-2 (round-2 review of F2): cancel is idempotent against a row
+        # ALREADY cancelled -- a duplicate/retried cancel (the exact case
+        # F6's own retry loop produces) must succeed quietly, not refuse.
+        # Refusing here made a second cancel ack 'failed', which ZR1's
+        # retry loop re-queued, which eventually raised a false
+        # cancel_stuck alert for a task that was already fully cancelled.
+        exit 0
+        ;;
+      completed|failed|lost)
         echo "registry-bridge: cancel $run_id/$task_id -- already terminal ($row_state); refusing before touching any pane" >&2
         exit 1
         ;;

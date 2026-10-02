@@ -796,8 +796,17 @@ export class HerdrState extends DurableObject<Env> {
         this.sql.exec(`UPDATE remote_tasks SET state='failed', updated_at=? WHERE remote_task_id=?`, nowMs, c.remote_task_id);
         this.recordTaskEvent(nowMs, c.remote_task_id, "failed", { reason: a.detail });
       } else if (c.op === "cancel" && a.outcome === "accepted") {
-        this.sql.exec(`UPDATE remote_tasks SET state='cancelled', updated_at=? WHERE remote_task_id=?`, nowMs, c.remote_task_id);
-        this.recordTaskEvent(nowMs, c.remote_task_id, "cancelled", {});
+        // R2-1 (round-2 review of ZR2): the ack landing here races the
+        // remap loop that normally recovers 'timed_out' from a
+        // timeout_detected event -- if THIS ack lands first, it used to
+        // always write the generic 'cancelled', permanently losing the
+        // distinct timed_out value (the remap loop never runs again once
+        // the row is already terminal). Same lookup the remap loop uses.
+        const finalState = this.sql.exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='timeout_detected'`,
+          c.remote_task_id).one().n > 0 ? "timed_out" : "cancelled";
+        this.sql.exec(`UPDATE remote_tasks SET state=?, updated_at=? WHERE remote_task_id=?`, finalState, nowMs, c.remote_task_id);
+        this.recordTaskEvent(nowMs, c.remote_task_id, finalState, {});
       } else if (c.op === "cancel" && a.outcome !== "accepted") {
         // ZR1 (ZERO-REVIEW-213-01 item 1): a FAILED cancel ack used to hit
         // no branch at all here -- the command was still marked 'done'

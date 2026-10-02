@@ -370,21 +370,30 @@ def _popen_detached(argv: list[str]) -> subprocess.Popen:
                              stderr=subprocess.DEVNULL, start_new_session=True)
 
 
-def _schedule_hard_stop(run_id: str, task_id: str, remote_id: str, max_minutes: int) -> int | None:
-    """A detached `sleep <max_minutes*60+grace>` followed by registry-
-    bridge.sh cancel, started session-leader-detached (Python's
-    start_new_session, the nohup/setsid equivalent) so it survives the
-    publisher LaunchAgent dying or being reloaded -- the one thing on the
-    Mac that still enforces the deadline when nothing else is ticking.
-    Goes through the exact same pane-birth-checked cancel sweep()'s own
-    force_cancel uses, so it is a genuine belt, not a second mechanism
-    with different rules: a no-op against an already-terminal row
-    (set_task_state refuses the transition) or a recycled pane (the birth
-    check skips the close). Returns the spawned process's pid, or None if
-    it could not even be started -- never fails the start/resume itself,
-    since the publisher's own sweep is still the primary enforcement
-    path."""
-    delay = max(0, max_minutes) * 60 + HARD_STOP_GRACE_S  # never negative; a misconfigured max_minutes<=0 fires at just the grace period, not instantly or negatively
+def _schedule_hard_stop(run_id: str, task_id: str, remote_id: str, delay_s: int) -> int | None:
+    """A detached `sleep <delay_s>` followed by registry-bridge.sh cancel,
+    started session-leader-detached (Python's start_new_session, the
+    nohup/setsid equivalent) so it survives the publisher LaunchAgent
+    dying or being reloaded -- the one thing on the Mac that still
+    enforces the deadline when nothing else is ticking. Goes through the
+    exact same pane-birth-checked cancel sweep()'s own force_cancel uses,
+    so it is a genuine belt, not a second mechanism with different rules:
+    a no-op against an already-terminal row (set_task_state refuses the
+    transition) or a recycled pane (the birth check skips the close).
+    Returns the spawned process's pid, or None if it could not even be
+    started -- never fails the start/resume itself, since the
+    publisher's own sweep is still the primary enforcement path.
+
+    delay_s is the caller's own responsibility (R2-4, round-2 review): at
+    _start/_resume time it is max_minutes*60+grace, the same instant the
+    real deadline_at was just set to; a sweep-side RETRY must instead use
+    the time remaining until the task's ALREADY-RECORDED deadline_at, not
+    max_minutes*60+grace measured from the retry's own now -- a task
+    already 50 of its 60 allotted minutes in that loses its scheduled
+    timer to a Popen failure would otherwise get a fresh 60-minute grant
+    from the retry instead of the ~10 minutes actually left, extending
+    its real deadline instead of just re-arming the same one."""
+    delay = max(0, delay_s)  # never negative
     script = (f"sleep {delay}; exec {shlex.quote(REGISTRY_BRIDGE)} cancel "
               f"{shlex.quote(run_id)} {shlex.quote(task_id)} timed_out {shlex.quote(remote_id)}")
     try:
@@ -577,7 +586,8 @@ def _start(cmd: dict) -> dict:
     # duplicate (both would fire the identical cancel), never a second
     # independent backstop.
     if _event_count(local_task_id, "hard_stop_scheduled") == 0:
-        hard_stop_pid = _schedule_hard_stop(run_id, local_task_id, remote_id, caps["max_minutes"])
+        hard_stop_pid = _schedule_hard_stop(run_id, local_task_id, remote_id,
+                                             caps["max_minutes"] * 60 + HARD_STOP_GRACE_S)
         if hard_stop_pid is not None:
             _bridge("append-event", run_id, local_task_id, "hard_stop_scheduled",
                     json.dumps({"pid": hard_stop_pid, "max_minutes": caps["max_minutes"], "grace_s": HARD_STOP_GRACE_S}))
@@ -704,7 +714,8 @@ def _resume(cmd: dict) -> dict:
     # grows its own re-lease-adopt path. The loud-failure-on-schedule-
     # failure half is not a no-op: see _start's identical comment.
     if _event_count(local_task_id, "hard_stop_scheduled") == 0:
-        hard_stop_pid = _schedule_hard_stop(run_id, local_task_id, remote_id, caps["max_minutes"])
+        hard_stop_pid = _schedule_hard_stop(run_id, local_task_id, remote_id,
+                                             caps["max_minutes"] * 60 + HARD_STOP_GRACE_S)
         if hard_stop_pid is not None:
             _bridge("append-event", run_id, local_task_id, "hard_stop_scheduled",
                     json.dumps({"pid": hard_stop_pid, "max_minutes": caps["max_minutes"], "grace_s": HARD_STOP_GRACE_S}))
@@ -815,7 +826,7 @@ def _force_cancel(t: dict, reason: str) -> dict:
 HARD_STOP_RETRY_CAP = 5
 
 
-def _ensure_hard_stop_scheduled(t: dict, remote: dict, max_minutes: int) -> dict | None:
+def _ensure_hard_stop_scheduled(t: dict, remote: dict, max_minutes: int, now_ts: float) -> dict | None:
     """ZR4: _start/_resume's own scheduling attempt may have failed
     (Popen error) and recorded hard_stop_unscheduled instead of silently
     doing nothing (the old behaviour) -- retry it here, every tick, same
@@ -823,7 +834,17 @@ def _ensure_hard_stop_scheduled(t: dict, remote: dict, max_minutes: int) -> dict
     reached. Returns a log entry only when it actually did something
     (scheduled, failed again, or just hit the cap); None means "already
     has one, nothing to do" -- the overwhelmingly common case, not worth
-    logging every tick."""
+    logging every tick.
+
+    R2-4 (round-2 review): the retried timer's delay comes from the
+    task's own ALREADY-RECORDED deadline_at, not a fresh
+    max_minutes*60+grace window measured from THIS retry's own now -- a
+    task already 50 of its 60 allotted minutes in when a Popen failure
+    loses its original timer would otherwise get a brand new 60-minute
+    grant from the retry instead of the ~10 minutes it actually has
+    left, extending its real deadline instead of just re-arming the one
+    it already has. Falls back to max_minutes*60+grace only when
+    deadline_at itself never landed (N1's own fallback case)."""
     run_id, task_id = t["run_id"], t["task_id"]
     if _event_count(task_id, "hard_stop_scheduled") > 0:
         return None
@@ -834,10 +855,15 @@ def _ensure_hard_stop_scheduled(t: dict, remote: dict, max_minutes: int) -> dict
             return {"task_id": task_id, "action": "hard_stop_retry", "ok": False,
                     "detail": f"stuck after {failures} scheduling failures"}
         return None
-    pid = _schedule_hard_stop(run_id, task_id, remote["remote_task_id"], max_minutes)
+    deadline_ts = _parse_iso(remote.get("deadline_at") or "")
+    if deadline_ts is not None:
+        delay_s = max(0, int(deadline_ts - now_ts)) + HARD_STOP_GRACE_S
+    else:
+        delay_s = max_minutes * 60 + HARD_STOP_GRACE_S
+    pid = _schedule_hard_stop(run_id, task_id, remote["remote_task_id"], delay_s)
     if pid is not None:
         _bridge("append-event", run_id, task_id, "hard_stop_scheduled",
-                json.dumps({"pid": pid, "max_minutes": max_minutes, "grace_s": HARD_STOP_GRACE_S, "retried": True}))
+                json.dumps({"pid": pid, "delay_s": delay_s, "grace_s": HARD_STOP_GRACE_S, "retried": True}))
         return {"task_id": task_id, "action": "hard_stop_retry", "ok": True, "detail": f"pid {pid}"}
     _bridge("append-event", run_id, task_id, "hard_stop_unscheduled", json.dumps({"max_minutes": max_minutes}))
     return {"task_id": task_id, "action": "hard_stop_retry", "ok": False, "detail": "Popen failed"}
@@ -875,7 +901,7 @@ def sweep(tasks_by_id: dict[str, dict], now: datetime) -> list[dict]:
                 logged.append(_force_cancel(t, "timed_out"))
                 continue
             if sweep_max_minutes is not None:
-                retry = _ensure_hard_stop_scheduled(t, remote, sweep_max_minutes)
+                retry = _ensure_hard_stop_scheduled(t, remote, sweep_max_minutes, now.timestamp())
                 if retry:
                     logged.append(retry)
             wt = Path(t["worktree"]) if t.get("worktree") else None

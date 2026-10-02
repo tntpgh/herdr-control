@@ -699,6 +699,29 @@ class Sweep(unittest.TestCase):
         self.assertFalse(any(a["action"] == "hard_stop_retry" for a in actions2))
         self.assertEqual(len(HARD_STOP_CALLS), before + 1)
 
+    def test_sweep_retried_hard_stop_uses_the_remaining_deadline_not_a_fresh_window(self):
+        # R2-4 (round-2 review of ZR4): a task already most of the way
+        # through its max_minutes allotment when its ORIGINAL timer is
+        # lost to a Popen failure must get a retry timer for the time it
+        # actually has LEFT, not a brand-new full-length window measured
+        # from the retry's own now -- the latter would silently double a
+        # task's real deadline.
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc)
+        deadline = now + _dt.timedelta(minutes=5)  # 5 min left, not a fresh 60
+        self._row("task_g", "rtask_g", deadline=deadline.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        t = {"task_id": "task_g", "run_id": "run_x", "state": "running", "worktree": str(self.wt)}
+        actions = tsk.sweep({"task_g": t}, now)
+        retry = next(a for a in actions if a["action"] == "hard_stop_retry")
+        self.assertTrue(retry["ok"])
+        script = HARD_STOP_CALLS[-1][2]
+        delay = int(script.split("sleep ", 1)[1].split(";", 1)[0])
+        # ~5 min (300s) + grace, with slack for test wall-clock drift --
+        # must be nowhere near a fresh max_minutes*60+grace window (the
+        # allowlist cap used elsewhere in this file is 60 minutes).
+        self.assertLess(delay, 600 + tsk.HARD_STOP_GRACE_S)
+        self.assertGreater(delay, tsk.HARD_STOP_GRACE_S)
+
     def test_sweep_gives_up_loudly_after_hard_stop_retry_cap(self):
         # ZR4: a scheduling call that keeps failing (e.g. the Mac is out of
         # process slots) must not retry silently forever -- after
