@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-task.sh <project> <branch> [job-class|auto] [agent-or-command...] [--route deterministic|jev] [--base REF] [--dry-run] [--focus] [--no-secrets] [--brief FILE] [--approval menu|hook] [--tools LIST|all]
+# spawn-task.sh <project> <branch> [job-class|auto] [agent-or-command...] [--route deterministic|jev] [--base REF] [--dry-run] [--focus|--no-focus] [--no-secrets] [--brief FILE] [--approval menu|hook] [--tools LIST|all]
 #
 # Every worker starts with the 1Password service-account identity (one vault,
 # 249 items, READ-ONLY) so an unattended run never stops to ask for a
@@ -91,6 +91,9 @@ while [ $# -gt 0 ]; do
     --tools) tools_req="${2:?spawn-task: --tools needs a comma list or all}"; shift 2 ;;
     --dry-run|-n) dry=1; shift ;;
     --focus) foc=--focus; shift ;;
+    # Explicit form of the default. remote-mcp/tasks.py passes it; before this
+    # case existed it fell through to positional and reached omp's argv.
+    --no-focus) foc=--no-focus; shift ;;
     # Everything after `--` belongs to the worker's own command, flags included.
     # Without this, `spawn-task.sh ~/repo t quick ./tool --no-secrets` silently
     # ate the worker's argument and changed this spawn's credential posture.
