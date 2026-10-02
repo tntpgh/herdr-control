@@ -1379,6 +1379,9 @@ def record_answer(form_id: str, payload: dict) -> tuple[int, bytes]:
         return 500, f"could not record: {e}".encode()
     CACHES["forms"].invalidate()
     notify_owner(row)
+    key = _sidecar_key(row.get("form_path"))
+    if key and key.startswith(RATINGS_KEY_PREFIX):
+        _dispatch_ratings_answer(key[len(RATINGS_KEY_PREFIX):], row)
     return 200, b'{"ok":true}'
 
 
@@ -1523,7 +1526,52 @@ def record_remote_answer(form_id: str, pending: dict, key: bytes) -> str:
         return "missing"
     CACHES["forms"].invalidate()
     notify_owner(row)
+    key = _sidecar_key(row.get("form_path"))
+    if key and key.startswith(RATINGS_KEY_PREFIX):
+        _dispatch_ratings_answer(key[len(RATINGS_KEY_PREFIX):], row)
     return "delivered"
+
+
+def _dispatch_ratings_answer(run_id: str, row: dict) -> None:
+    """Write the hub's ratings answers into kb.section_ratings, channel='hub'
+    (server/ratings.py's `hub-answer` CLI -- the one write path, never a bare
+    INSERT, so the one-live-row invariant and the 24h correction window are
+    enforced identically to the mailed /rate link). Best-effort, off a
+    background thread: the answer is ALREADY durably recorded in the local
+    hub registry by the caller (above) regardless of whether this KB write
+    succeeds -- a failure here is logged to stderr, never raised, and never
+    loses the recorded local answer, and never delays the submit response."""
+    answers = (row.get("answers") or {}).get("ratings")
+    if not isinstance(answers, dict) or not answers:
+        return
+    payload = {"run_id": run_id, "attempt_number": 1,
+               "answers": [{"section_key": k, "rating": v} for k, v in answers.items()]}
+    threading.Thread(target=_dispatch_ratings_answer_now, args=(run_id, payload),
+                     daemon=True).start()
+
+
+def _dispatch_ratings_answer_now(run_id: str, payload: dict) -> None:
+    try:
+        dsn = secret("NEON_CONNECTION_STRING")
+    except ValueError:
+        dsn = None
+    if not dsn:
+        print(f"hub: ratings dispatch for {run_id} skipped: NEON_CONNECTION_STRING unavailable",
+              file=sys.stderr)
+        return
+    env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if k in os.environ}
+    env["NEON_CONNECTION_STRING"] = dsn
+    try:
+        r = subprocess.run([str(KB_PYTHON), "-m", "server.ratings", "hub-answer"],
+                           cwd=KB_DEPLOY, env=env, input=json.dumps(payload),
+                           capture_output=True, text=True, timeout=30)
+        result = json.loads(r.stdout) if r.stdout else {}
+        errors = result.get("errors") or []
+        if r.returncode != 0 or errors:
+            print(f"hub: ratings dispatch for {run_id}: exit {r.returncode}, "
+                  f"{len(errors)} error(s): {errors}", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as e:
+        print(f"hub: ratings dispatch for {run_id} failed: {e}", file=sys.stderr)
 
 
 def mirror_sync() -> None:
@@ -1544,6 +1592,8 @@ def mirror_sync() -> None:
             token = (row or {}).get("token") or ""
             if not f.get("hub_servable") or not token:
                 continue
+            if (_sidecar_key(f.get("form_path")) or "").startswith(RATINGS_KEY_PREFIX):
+                continue  # ratings stay local-only -- never mirrored to the dashboard
             try:
                 html_text = form_html(f["id"]).read_text()
             except OSError:
@@ -2373,6 +2423,96 @@ def serve_loop_decision(key: str) -> str | None:
     CACHES["loops"].invalidate()   # re-read on next view so the row shows "deciding"
     CACHES["forms"].invalidate()
     return title
+
+# ── ratings publish: knowledge-base's nightly POSTs here after [8j] ──────────
+# (B1.2 v2 / closure #1, thurber-os docs/tracking/2026-09-30-feedback-loop-
+# audit.md §1, §5 #1, §Decided. Terrence, formserve 20260930T150421-8722:
+# ratings=hub_inline.) The mailed Access-gated /rate link answered 0 of 221
+# asks in the 51 days before this closure; Terrence already answers every
+# other local decision here, so the rating ask gets the SAME surface.
+# Loopback, unauthenticated — same posture as every other endpoint on this
+# hub. The nightly job runs on this same Mac (launchd com.teamthurber.kb-nightly,
+# not Fly), so this is a same-machine call, never a network hop.
+RATINGS_KEY_PREFIX = "ratings:"
+
+RATINGS_FORM = """<!doctype html><html lang=en><head><meta charset=utf-8><title>{title}</title>
+<style>:root{{--ground:#0f1115;--surface:#171a21;--line:#272c37;--ink:#e6e9ef;--dim:#9aa3b2;--accent:#6aa6ff}}
+body{{margin:0;background:var(--ground);color:var(--ink);font:15px/1.5 system-ui,sans-serif}} main{{max-width:720px;margin:0 auto;padding:32px 24px 110px}}
+h1{{font-size:22px;margin:0 0 6px}} .sub{{color:var(--dim);margin:0 0 22px}} fieldset{{border:1px solid var(--line);border-radius:8px;background:var(--surface);padding:14px 16px;margin:0 0 16px}}
+legend{{color:var(--dim);font-size:12px;letter-spacing:.08em;text-transform:uppercase;padding:0 6px}} .opt{{display:flex;gap:10px;padding:8px 6px;border-radius:6px;cursor:pointer}} .opt:hover{{background:#1d2129}}
+.summary{{color:var(--dim);font-size:13px;margin:0 0 10px}}
+.bar{{position:fixed;left:0;right:0;bottom:0;background:var(--surface);border-top:1px solid var(--line);padding:12px 24px;display:flex;gap:10px;justify-content:flex-end}}
+button{{font:600 14px system-ui;padding:10px 18px;border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:#0b1020;cursor:pointer}}</style></head><body><main>
+<h1>{title}</h1><p class=sub>Today's Morning Briefing sections the demand budget selected. One tap per section; skip any you don't have an opinion on.</p>
+<form id=f>{fields}</form></main>
+<div class=bar><button type=submit form=f>Send answers</button></div>
+<script>document.getElementById("f").addEventListener("submit",function(e){{e.preventDefault();var fd=new FormData(e.target);
+var ratings={{}};fd.forEach(function(v,k){{if(k.indexOf("section:")===0)ratings[k.slice(8)]=v;}});
+window.submitAnswers({{run_id:{run_id_json},ratings:ratings}})}});</script></body></html>"""
+
+RATINGS_FIELD = """<fieldset><legend>{title}</legend>{summary}
+<label class=opt><input type=radio name="section:{slug}" value=acted_on required><span>Acted on</span></label>
+<label class=opt><input type=radio name="section:{slug}" value=reviewed_no_action><span>Read, no action</span></label>
+<label class=opt><input type=radio name="section:{slug}" value=noise><span>Noise</span></label>
+</fieldset>"""
+
+
+def _ratings_key(run_id: str) -> str:
+    return RATINGS_KEY_PREFIX + run_id
+
+
+def _open_ratings_form_id(run_id: str) -> str | None:
+    """An already-published form (open OR answered) for this run_id, or None.
+    Makes publish_ratings_form idempotent against a nightly retry -- mirrors
+    scripts/nightly_automation.py's own _briefing_already_sent dedup."""
+    want = _ratings_key(run_id)
+    for path in sorted(FORMS_DIR.glob("*.json")):
+        try:
+            f = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if _sidecar_key(f.get("form_path")) == want:
+            return f.get("id")
+    return None
+
+
+def publish_ratings_form(payload: dict) -> tuple[int, bytes]:
+    """Register one formserve form covering every section KB's nightly asked
+    about today. Returns (status, json-or-text body)."""
+    run_id = str(payload.get("run_id") or "").strip()
+    sections = payload.get("sections")
+    if not run_id or not isinstance(sections, list) or not sections:
+        return 400, b"run_id and a non-empty sections list are required"
+    existing = _open_ratings_form_id(run_id)
+    if existing is not None:
+        return 200, json.dumps({"ok": True, "id": existing, "already_published": True}).encode()
+    fields = []
+    for s in sections:
+        if not isinstance(s, dict):
+            continue
+        slug = str(s.get("slug") or "")
+        if not slug:
+            continue
+        title = str(s.get("title") or slug)
+        summary = str(s.get("summary") or "")
+        summary_html = f"<p class=summary>{_esc(summary)}</p>" if summary else ""
+        fields.append(RATINGS_FIELD.format(title=_esc(title), slug=_esc(slug), summary=summary_html))
+    if not fields:
+        return 400, b"no valid sections in payload"
+    FORMS_DIR.mkdir(parents=True, exist_ok=True)
+    title = f"ratings: {time.strftime('%Y-%m-%d', time.localtime())} ({len(fields)} sections)"
+    form = FORMS_DIR / f"ratings-{_slug(run_id)}-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}.html"
+    form.write_text(RATINGS_FORM.format(
+        title=_esc(title), fields="".join(fields), run_id_json=json.dumps(run_id)))
+    form.with_suffix(".key").write_text(_ratings_key(run_id))
+    # 24h timeout, matching the rating's own correction window -- answerable
+    # any time that day, not just the minutes right after the briefing sends.
+    subprocess.Popen([sys.executable, str(APP_ROOT / "formserve.py"), str(form),
+                      "--timeout", "86400", "--no-open"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    CACHES["forms"].invalidate()
+    return 200, json.dumps({"ok": True, "already_published": False}).encode()
+
 
 
 # ── handoff debt: a repo someone changed and never wrote up ───────────────────
@@ -4260,6 +4400,20 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 return self._send(400, "text/plain", b"answers must be a JSON object")
             code, body = record_answer(form_id, payload)
+            return self._send(code, "application/json" if code == 200 else "text/plain", body)
+        if path == "/ratings/publish":
+            ctype = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                return self._send(400, "text/plain", b"Content-Type must be application/json")
+            n = int(self.headers.get("content-length") or 0)
+            raw = self.rfile.read(n) if n > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                return self._send(400, "text/plain", f"bad json: {e}".encode())
+            if not isinstance(payload, dict):
+                return self._send(400, "text/plain", b"payload must be a JSON object")
+            code, body = publish_ratings_form(payload)
             return self._send(code, "application/json" if code == 200 else "text/plain", body)
         if path != "/loops/decide":
             return self._send(404, "text/plain", b"not found")
