@@ -64,7 +64,7 @@ export interface HubSummary {
 
 // The Mac's real Chrome (chrome-relay.py): the browser Zero's ChatGPT
 // extension and omp's browser relay both live in. Enums and counts only.
-export type ExtensionState = "enabled" | "disabled" | "missing";
+export type ExtensionState = "enabled" | "disabled" | "missing" | "unknown"; // unknown: unreadable from launchd
 export interface BrowserSummary {
   checked_at: string;
   real_chrome_running: boolean;

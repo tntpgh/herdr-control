@@ -53,7 +53,7 @@ CHROME_RELAY = os.environ.get("HERDR_CHROME_RELAY", str(REPO / "chrome-relay.py"
 # The only browser fields that leave the Mac: booleans, enums and a count.
 BROWSER_FIELDS = ("checked_at", "real_chrome_running", "relay", "extensions", "stray_omp_chromes", "healthy")
 EXTENSIONS = ("omp_relay", "1password", "chatgpt")  # must match the Worker's schema
-EXT_STATES = ("enabled", "disabled", "missing")
+EXT_STATES = ("enabled", "disabled", "missing", "unknown")
 
 SCHEMA = 1
 TERMINAL = {"completed", "cancelled", "lost", "gone", "error"}
