@@ -1,0 +1,29 @@
+{
+  "_comment": "herdr-mcp remote task lifecycle (SPEC: form 20261001T230637-8744). The Worker only PRE-validates against a cached copy of this file (pushed every sync as snapshot.task_config); this copy, read directly by remote-mcp/tasks.py on the Mac, is the one that is actually enforced when a command is executed. Edit here, commit, push -- the next publisher tick picks it up with no redeploy.",
+  "repos": ["knowledge-base", "thurber-os", "tourguide", "tntpgh-dev"],
+  "modes": {
+    "research": {
+      "job_class": "research",
+      "secrets": "grant",
+      "_secrets_comment": "lib/agent-profiles.sh secrets_default_for_job withholds credentials for any job class matching *research* (it reads material we did not write). Terrence's authority for this feature explicitly grants the read-only vault identity (creds=readonly_vault) to a research task, so tasks.py passes spawn-task.sh an explicit --secrets to lift that default -- never a change to the shared job-class table, which stays withhold-by-default for every OTHER research-class spawn.",
+      "git": "none",
+      "writes": [],
+      "net_read": [],
+      "manifest_comment": "KB/tl;dv are reached through their own MCP tools, not raw curl, so net_read/writes (lib/task-manifest.sh's GET-approval-and-output-target scope -- 'writes' names where an in-scope GET's response may be SAVED, never a general filesystem grant; it also fails closed on any .handoffs segment) have nothing to name here. The task still writes .handoffs/ANSWER.md -- that is an ordinary worktree write classified by command-policy.sh, not this manifest."
+    },
+    "implement": {
+      "job_class": "implement",
+      "secrets": "default",
+      "git": "push-own-branch",
+      "writes": [],
+      "net_read": [],
+      "manifest_comment": "Same as research: no raw GET is approved for this mode either, so writes stays empty. A later repo that genuinely needs one adds net_read/writes together, here."
+    }
+  },
+  "caps": {
+    "max_concurrent": 4,
+    "max_per_day": 40,
+    "max_minutes": 60,
+    "_comment": "Hard ceiling, not yet adjustable from an admin route (SPEC: 'adjustable later via a signed admin route like /admin/limits' -- deliberately deferred). Enforced on the Mac (remote-mcp/tasks.py) and pre-checked on the Worker (remote-mcp/worker/src/state.ts DEFAULT_TASK_CAPS, used only until the Mac's first sync pushes this file's own copy) from this same file's pushed copy."
+  }
+}

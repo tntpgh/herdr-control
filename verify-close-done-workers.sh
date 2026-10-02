@@ -68,6 +68,36 @@ fi
 check "no herdr RPC was ever made" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
 check "task state untouched" "$(read_task run1 task1 | jq -r .state)" "running"
 
+printf '== --task= (empty) is refused, never treated as "no filter" — the empty-task-closes-everything bug (2026-09-30) ==\n'
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --task= >/tmp/cdw-out1b-$$.log 2>&1; then
+  bad "--task= (empty) was ACCEPTED and ran as an unfiltered batch"
+else
+  ok "--task= (empty) refused"
+fi
+check "no herdr RPC was ever made" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
+check "task1 untouched by the refused empty --task=" "$(read_task run1 task1 | jq -r .state)" "running"
+grep -q 'given but empty' /tmp/cdw-out1b-$$.log && ok "refusal names the empty --task" || bad "refusal text: $(cat /tmp/cdw-out1b-$$.log)"
+
+printf '== --task="   " (whitespace-only) is refused the same way ==\n'
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --task="   " >/tmp/cdw-out1c-$$.log 2>&1; then
+  bad "--task=\"   \" (whitespace-only) was ACCEPTED"
+else
+  ok "--task=\"   \" (whitespace-only) refused"
+fi
+check "no herdr RPC was ever made" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
+check "task1 untouched by the refused whitespace --task=" "$(read_task run1 task1 | jq -r .state)" "running"
+
+printf '== a dry run (no --apply) with --task= empty is refused too, not silently scanning everything ==\n'
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --task= >/tmp/cdw-out1d-$$.log 2>&1; then
+  bad "dry-run with --task= (empty) was ACCEPTED"
+else
+  ok "dry-run with --task= (empty) refused"
+fi
+check "no herdr RPC was ever made" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
+
 printf '== --apply --reason=shipped with no --proof: refused before any herdr call ==\n'
 : > "$CALLS"
 if bash "$here/close-done-workers.sh" --apply --reason=shipped >/tmp/cdw-out2-$$.log 2>&1; then
@@ -294,6 +324,21 @@ printf '%s' "$out" | grep -q '^  close  pY' && ok "a no-upstream branch with not
 git -C "$nu_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "local only"
 out=$(bash "$here/close-done-workers.sh" --task=taskN 2>&1)
 printf '%s' "$out" | grep -q 'HOLD.*1 commit(s) exist only here' && ok "a no-upstream branch with a local-only commit is still held" || bad "local-only commit not held: $out"
+
+printf '== no upstream AND no remote-tracking ref at all: closable when nothing exists beyond the task'"'"'s own recorded trunk ==\n'
+rt_wt=$(mktemp -d)/wt-trunk
+git init -q -b main "$rt_wt"
+git -C "$rt_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+mkdir -p "$rt_wt/.handoffs"; printf '*\n' > "$rt_wt/.handoffs/.gitignore"
+git -C "$rt_wt" switch -q -c remote/research-1   # no refs/remotes/origin/* at all -- a research task never fetches/pushes
+register_task runT1 taskT1 w c cp cb pT1 birthT1 "$rt_wt" "$rt_wt" "research:remote/research-1" remote/research-1 main \
+  || bad "register taskT1 failed"
+set_task_state runT1 taskT1 running || bad "taskT1 -> running failed (setup)"
+out=$(bash "$here/close-done-workers.sh" --task=taskT1 2>&1)
+printf '%s' "$out" | grep -q '^  close  pT1' && ok "a branch with no remote tracking but zero commits beyond its recorded trunk is closable" || bad "held a research branch with nothing to lose: $out"
+git -C "$rt_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "research wrote something it should not have"
+out=$(bash "$here/close-done-workers.sh" --task=taskT1 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*1 commit(s) exist only here' && ok "a commit beyond trunk is still held -- trunk-awareness does not weaken the gate" || bad "commit beyond trunk not held: $out"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

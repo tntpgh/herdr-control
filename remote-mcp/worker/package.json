@@ -1,0 +1,38 @@
+{
+  "name": "herdr-remote-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Authenticated remote MCP over herdr-control status (read tools + one scoped message tool). Data is pushed by ../publisher.py; nothing here reaches the Mac.",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "@cfworker/json-schema": "^4.1.1",
+    "@cloudflare/workers-oauth-provider": "^1.2.1",
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "jose": "^6.2.12",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20261001.1",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.140.0"
+  },
+  "overrides": {
+    "miniflare": "5.20260930.0-alpha",
+    "wrangler": "$wrangler",
+    "undici": "^7.29.1"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "fsevents@2.3.3": false,
+    "workerd@1.20260930.2": true,
+    "workerd@1.20261001.1": true
+  }
+}

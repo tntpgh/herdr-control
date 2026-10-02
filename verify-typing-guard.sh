@@ -18,6 +18,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export SCREEN_DIR="$WORK/screens"
 export READ_COUNTER="$WORK/read-count"
+export PERM_COUNTER="$WORK/perm-read-count"
 export KEYS="$WORK/keys.log"
 export SENDTEXT="$WORK/send-text.log"
 mkdir -p "$SCREEN_DIR"
@@ -32,19 +33,31 @@ export PANE
 # steady-state tail does not need one file per read.
 #
 # Keyed on the `--lines` value (`$7`), not on call order: looks_like_
-# permission_prompt reads with --lines 30 BEFORE the typing guard ever runs,
-# and composer_stable_snapshot (both the guard and the post-injection submit
-# loop) reads with --lines 12. Counting every read regardless of caller would
-# make the permission check's own read silently consume index 1 of every
-# scenario, shifting every fixture by one and making the arithmetic below
-# impossible to get right by inspection. This way the permission check
-# always sees one fixed, safe screen, and the counter tracks only the reads
-# the guard itself is making.
+# permission_prompt reads with --lines 30 and then (prompt_menu_options) with
+# --lines 1000, BEFORE the typing guard ever runs, and composer_stable_snapshot
+# (both the guard and the post-injection submit loop) reads with --lines 12.
+# Counting every read regardless of caller would make the permission check's
+# own reads silently consume the first indexes of every scenario, shifting
+# every fixture and making the arithmetic below impossible to get right by
+# inspection. (Exactly that broke five checks here once the 1000-line menu
+# read was added and this stub still only diverted --lines 30.) So only
+# --lines 12 reads advance the guard's counter.
 herdr() {
   case "$1 $2" in
     "pane read")
       if [ "${7:-}" = "30" ]; then
-        cat "$SCREEN_DIR/not-a-prompt" 2>/dev/null
+        # Each permission check: perm-<n> for the n-th, then perm-last, then
+        # the scenario's fixed not-a-prompt screen. Its menu read (below)
+        # sees the same screen.
+        local pn; pn=$(cat "$PERM_COUNTER" 2>/dev/null); pn=$(( ${pn:-0} + 1 )); echo "$pn" >"$PERM_COUNTER"
+        if [ -f "$SCREEN_DIR/perm-$pn" ]; then cp "$SCREEN_DIR/perm-$pn" "$SCREEN_DIR/.perm-now"
+        elif [ -f "$SCREEN_DIR/perm-last" ]; then cp "$SCREEN_DIR/perm-last" "$SCREEN_DIR/.perm-now"
+        else cp "$SCREEN_DIR/not-a-prompt" "$SCREEN_DIR/.perm-now" 2>/dev/null; fi
+        cat "$SCREEN_DIR/.perm-now" 2>/dev/null
+        return 0
+      fi
+      if [ "${7:-}" != "12" ]; then
+        cat "$SCREEN_DIR/.perm-now" 2>/dev/null
         return 0
       fi
       local idx f
@@ -72,7 +85,7 @@ bad() { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; }
 
 reset_state() {
   rm -rf "$SCREEN_DIR"; mkdir -p "$SCREEN_DIR"
-  echo 0 >"$READ_COUNTER"; : >"$KEYS"; : >"$SENDTEXT"
+  echo 0 >"$READ_COUNTER"; echo 0 >"$PERM_COUNTER"; : >"$KEYS"; : >"$SENDTEXT"
   # Consumed by looks_like_permission_prompt's own --lines 30 read, which
   # runs before the typing guard on every call that isn't --force. Ordinary
   # ready-prompt shape — matches none of send-to-agent.sh's prompt regexes,
@@ -219,6 +232,27 @@ EOF
 send "some message"; rc=$?
 [ "$rc" -eq 5 ] && ok "exit 5 REFUSED (permission prompt), not 6" || bad "exit $rc (expected 5): $(cat "$WORK/out.txt")"
 [ ! -s "$SENDTEXT" ] && ok "text never typed into a live prompt" || bad "typed into a prompt"
+
+# PR #206 review M1: the menu appears AFTER the first permission check passed,
+# while the typing guard is still reading. Before the fix, the text was typed
+# straight into it.
+printf '\n== a prompt that appears during the typing check -> REFUSED before typing ==\n'
+reset_state
+cp "$SCREEN_DIR/not-a-prompt" "$SCREEN_DIR/perm-1"
+cat >"$SCREEN_DIR/perm-last" <<'EOF'
+ Do you want to proceed?
+❯ 1. Yes
+  2. No
+EOF
+screen 1 <<'EOF'
+  Ready
+❯
+EOF
+last_as 1
+send "yes, go ahead"; rc=$?
+[ "$rc" -eq 5 ] && ok "exit 5 REFUSED on the re-check" || bad "exit $rc (expected 5): $(cat "$WORK/err.txt")"
+[ ! -s "$SENDTEXT" ] && ok "nothing typed into the late prompt" || bad "typed into the late prompt: $(cat "$SENDTEXT")"
+grep -q "just before typing" "$WORK/err.txt" && ok "refusal says when it caught it" || bad "stderr: $(cat "$WORK/err.txt")"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -238,6 +238,31 @@ if [ "$submit_only" -eq 0 ] && [ "$force" -eq 0 ]; then
   fi
 fi
 
+# Captured BEFORE any typing touches the pane: this is what a later
+# owner_acted record (below) correlates against — the prompt this delivery
+# was actually answering, not whatever the composer shows after we typed
+# into it.
+_pre_pid="$(prompt_id "$pane" 2>/dev/null)"
+
+# The typing guard above spends up to ~1s reading the pane AFTER the permission
+# check, and a menu raised in that window would receive the typed text — a `y`
+# or a digit in it can answer the menu (PR #206 review, M1). So the last thing
+# before typing is another permission check: nothing else may read the pane
+# between it and `send-text` (the prompt_id capture above used to, and saw the
+# menu without acting on it). What remains is one pane-read's latency; herdr
+# has no check-and-type primitive that would close it.
+if [ "$submit_only" -eq 0 ] && [ "$force" -eq 0 ]; then
+  looks_like_permission_prompt; pr=$?
+  if [ "$pr" -eq 0 ]; then
+    echo "REFUSED: a prompt appeared in $pane just before typing — nothing was typed." >&2
+    exit 5
+  fi
+  if [ "$pr" -eq 2 ]; then
+    echo "REFUSED: cannot re-read $pane just before typing — refusing to send blind (use --force)." >&2
+    exit 5
+  fi
+fi
+
 # `herdr agent send` DOES NOT EXIST — the agent verbs are list/get/read/
 # send-keys/prompt/rename/focus/wait/attach. This call therefore failed on EVERY
 # invocation, which silently killed the Slack->herdr reply path: a choice tapped
@@ -248,11 +273,6 @@ fi
 # already sitting in the composer (an operator typed it directly, or a prior
 # send-to-agent.sh call left it stranded) — this call exists only to press
 # Enter and confirm.
-# Captured BEFORE any typing touches the pane: this is what a later
-# owner_acted record (below) correlates against — the prompt this delivery
-# was actually answering, not whatever the composer shows after we typed
-# into it.
-_pre_pid="$(prompt_id "$pane" 2>/dev/null)"
 if [ "$submit_only" -eq 0 ]; then
   herdr pane send-text "$pane" "$text" >/dev/null 2>&1 || {
     echo "ERROR: 'herdr pane send-text $pane' failed — pane target valid? socket allowlisted?" >&2

@@ -512,7 +512,7 @@ peer_decide() {                         # cmd task-json
     PD_VERDICT=allow PD_AUTHORITY=grant PD_REASON="ownership grant: $s"; return 0
   fi
 
-  PD_VERDICT="$(classify_command "$cmd" "$wt")"; PD_REASON="$(classify_reason)"
+  PD_VERDICT="$(classify_command "$cmd" "$wt" "$manifest")"; PD_REASON="$(classify_reason)"
   res="$(conductor_reserved_reason "$cmd")"
   if [ -n "$res" ]; then PD_VERDICT=reserved PD_REASON="$res"; return 1; fi
 

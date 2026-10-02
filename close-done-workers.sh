@@ -41,7 +41,7 @@ source "$HERE/lib/run-registry.sh"
 # shellcheck source=lib/pane-guard.sh
 source "$HERE/lib/pane-guard.sh"
 
-apply=0; include_lost=0; closure_reason=""; closure_proof=""; pane_filter=""; task_filter=""
+apply=0; include_lost=0; closure_reason=""; closure_proof=""; pane_filter=""; task_filter=""; task_given=0
 for a in "$@"; do
   case "$a" in
     --apply) apply=1 ;;
@@ -53,11 +53,21 @@ for a in "$@"; do
     --reason=*) closure_reason="${a#--reason=}" ;;
     --proof=*) closure_proof="${a#--proof=}" ;;
     --pane=*) pane_filter="${a#--pane=}" ;;
-    --task=*) task_filter="${a#--task=}" ;;
+    --task=*) task_filter="${a#--task=}"; task_given=1 ;;
     -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'close-done-workers: unknown flag %s\n' "$a" >&2; exit 1 ;;
   esac
 done
+# An empty (or whitespace-only) --task= is never "no filter" — it is a
+# caller bug (e.g. `--task=$(jq -r .task_id identity.json)` against a
+# missing/malformed identity.json). Falling through to the unfiltered scan
+# closed EVERY eligible pane fleet-wide, twice, 2026-09-30. A flag that was
+# never passed at all (task_given=0) is the one case that legitimately
+# means batch mode and must keep working.
+if [ "$task_given" = 1 ] && [ -z "${task_filter//[[:space:]]/}" ]; then
+  printf 'close-done-workers: --task= was given but empty — refusing (an empty filter would match every task; omit --task entirely for batch mode)\n' >&2
+  exit 1
+fi
 if [ "$apply" = 1 ]; then
   _valid_closure_reason "$closure_reason" || {
     printf 'close-done-workers: --apply requires --reason=<shipped|handed_off_to:<x>|blocked_on:<x>|canceled|no-follow-on>\n' >&2
@@ -118,7 +128,7 @@ panes_json=$(herdr pane list 2>/dev/null)
 pane_status() { printf '%s' "$panes_json" | jq -r --arg p "$1" '((.result.panes // .panes)[]|select(.pane_id==$p)|.agent_status) // "absent"'; }
 
 closable=0; held=0; refused=0
-while IFS='|' read -r run_id task_id pane wt label; do
+while IFS='|' read -r run_id task_id pane wt label trunk; do
   [ -n "$pane" ] || continue
   st=$(pane_status "$pane")
   reason=""
@@ -135,8 +145,23 @@ while IFS='|' read -r run_id task_id pane wt label; do
         # No upstream is only a risk when the branch holds commits no remote
         # has. A review/probe branch created on an already-pushed commit has
         # none — holding it made the conductor close such panes by hand, and
-        # every one landed in the registry as `lost` (2026-09-28).
-        only_here=$(git -C "$wt" rev-list --count "refs/heads/$br" --not --remotes 2>/dev/null)
+        # every one landed in the registry as `lost` (2026-09-28). A
+        # research task's branch (git: none) is never pushed at all, so
+        # `--remotes` alone is the wrong bar for it: also exclude whatever
+        # the task's own recorded trunk resolves to (local or
+        # remote-tracking) -- a branch still sitting on its base has
+        # nothing any remote could lose, pushed or not. Without this, every
+        # finished research task held forever since none ever push
+        # (2026-10-02, caught by remote-mcp/verify-tasks-e2e.py).
+        excl=(--remotes)
+        if [ -n "$trunk" ]; then
+          if git -C "$wt" show-ref --verify -q "refs/remotes/origin/$trunk"; then
+            excl+=("refs/remotes/origin/$trunk")
+          elif git -C "$wt" show-ref --verify -q "refs/heads/$trunk"; then
+            excl+=("refs/heads/$trunk")
+          fi
+        fi
+        only_here=$(git -C "$wt" rev-list --count "refs/heads/$br" --not "${excl[@]}" 2>/dev/null)
         case "$only_here" in
           0) ;;
           ''|*[!0-9]*) reason="branch $br has no upstream and its commits cannot be checked against the remotes" ;;
@@ -175,7 +200,7 @@ while IFS='|' read -r run_id task_id pane wt label; do
   fi
   [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
   [ "$(pane_status "$pane")" = absent ] || herdr pane close "$pane" >/dev/null 2>&1
-done < <(_sql "SELECT run_id || '|' || task_id || '|' || pane_id || '|' || worktree || '|' || label
+done < <(_sql "SELECT run_id || '|' || task_id || '|' || pane_id || '|' || worktree || '|' || label || '|' || trunk
                FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at;")
 
 echo
