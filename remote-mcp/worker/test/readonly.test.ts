@@ -5,7 +5,7 @@ import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
 import { beforeEach, expect, it } from "vitest";
 import type { HerdrState } from "../src/state";
 import type { Env } from "../src/types";
-import { accessJwt, BASE, callTool, oauthToken, queueRaw, signedSync, syncBody } from "./helpers";
+import { accessJwt, BASE, callTool, oauthToken, queueRaw, signedSync, snapshot, syncBody } from "./helpers";
 
 const e = env as unknown as Env;
 beforeEach(() => reset());
@@ -39,6 +39,25 @@ it("offers no messaging checkbox and grants read only, even when the client asks
   const status = await callTool<{ your_scopes: string[]; server: { messaging_enabled: boolean } }>(access_token, "get_status");
   expect([status.data.connection?.state, status.data.your_scopes, status.data.server.messaging_enabled])
     .toEqual(["connected", ["herdr:read"], false]);
+});
+
+it("reports the Mac's real-Chrome health from the snapshot, and null when the publisher sent none", async () => {
+  const { access_token } = await oauthToken(["herdr:read"]);
+  await signedSync(syncBody());
+  expect((await callTool<{ browser: unknown }>(access_token, "get_status")).data.browser).toBeNull();
+
+  const browser = {
+    checked_at: "2026-10-02T18:00:00Z", real_chrome_running: true, relay: "connected",
+    extensions: { omp_relay: "enabled", "1password": "enabled", chatgpt: "missing" } as const,
+    stray_omp_chromes: 1, healthy: false,
+  };
+  await signedSync(syncBody({ snapshot: snapshot({ browser }) }));
+  expect((await callTool<{ browser: unknown }>(access_token, "get_status")).data.browser).toEqual(browser);
+
+  // Drift on the Mac must not cost the sync: the block degrades to null.
+  const res = await signedSync(syncBody({ snapshot: snapshot({ browser: { ...browser, relay: "connected to /Users/x" } }) }));
+  expect(res.status).toBe(200);
+  expect((await callTool<{ browser: unknown }>(access_token, "get_status")).data.browser).toBeNull();
 });
 
 it("refuses and audits a message in the Durable Object regardless of the scopes passed in", async () => {

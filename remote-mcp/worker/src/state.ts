@@ -12,6 +12,7 @@ import type { CommandAck, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem,
 import { SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START, SNAPSHOT_SCHEMA } from "./types";
 
 const str = z.string().max(4000);
+const ExtState = z.enum(["enabled", "disabled", "missing"]);
 const nstr = str.nullable();
 const SyncSchema = z.object({
   snapshot: z.object({
@@ -43,6 +44,14 @@ const SyncSchema = z.object({
       }),
       caps: z.object({ max_concurrent: z.number().int().min(1).max(100), max_per_day: z.number().int().min(1).max(1000), max_minutes: z.number().int().min(1).max(1440) }),
     }).nullable().optional(),
+    // A bad browser block becomes null rather than failing the whole sync
+    // (results, acks and command acks ride in the same body).
+    browser: z.object({
+      checked_at: z.string().max(40), real_chrome_running: z.boolean(),
+      relay: z.string().regex(/^(connected|no-extension|down|http-\d{3})$/),
+      extensions: z.object({ omp_relay: ExtState, "1password": ExtState, chatgpt: ExtState }),
+      stray_omp_chromes: z.number().int().min(0).max(1000), healthy: z.boolean(),
+    }).nullable().optional().catch(null),
   }),
   results: z.array(z.object({
     task_id: str, source: str, text: z.string().max(70_000), sha256: str, source_mtime: nstr, truncated_at_source: z.boolean(),

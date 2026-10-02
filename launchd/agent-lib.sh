@@ -26,8 +26,10 @@
 #  3. Nothing verified the service was RUNNING afterwards, only that the
 #     bootstrap command returned 0. A KeepAlive job that crash-loops reports a
 #     pid of "-"; that is a failure and must be reported as one.
-reload_agent() {
-  local label="$1" plist="$2" domain="gui/$(id -u)" i pid pid2
+# _bootout_bootstrap LABEL PLIST — lint, bootout, wait for teardown, bootstrap
+# with one retry on the race. Shared by reload_agent and load_interval_agent.
+_bootout_bootstrap() {
+  local label="$1" plist="$2" domain="gui/$(id -u)" i
 
   if ! plutil -lint "$plist" >/dev/null 2>&1; then
     echo "  ! $label: rendered plist is not valid ($plist) — refusing to load" >&2
@@ -50,6 +52,11 @@ reload_agent() {
       return 1
     fi
   fi
+}
+
+reload_agent() {
+  local label="$1" plist="$2" i pid pid2
+  _bootout_bootstrap "$label" "$plist" || return 1
 
   # Verify it is actually RUNNING, not merely accepted. Two samples ~1.2s
   # apart, because one sample is not enough: a job that exits immediately is
@@ -81,6 +88,32 @@ reload_agent() {
   fi
   return 1
 }
+
+# ── load_interval_agent LABEL PLIST ──────────────────────────────────────────
+# For StartInterval jobs. Not reload_agent: that verifies a KeepAlive daemon
+# stays up, and an interval job correctly exits after each tick. Lint, reload,
+# let the RunAtLoad tick finish, and read launchd's own last exit code.
+# Prints that code; returns nonzero on any failure, including a first tick
+# that is still running after 25 s (chrome-relay's launch waits up to 15 s).
+load_interval_agent() {
+  local label="$1" plist="$2" domain="gui/$(id -u)" code i
+  _bootout_bootstrap "$label" "$plist" || return 1
+  for i in $(seq 1 25); do
+    sleep 1
+    code="$(launchctl print "$domain/$label" 2>/dev/null | awk -F'= ' '/last exit code/ {print $2; exit}')"
+    case "$code" in ""|*never*) continue ;; esac
+    echo "$code"
+    [ "$code" = 0 ]; return
+  done
+  echo "${code:-unknown} after 25 s"
+  return 1
+}
+
+# ── _sed_rhs VALUE ───────────────────────────────────────────────────────────
+# `&` in a sed replacement means "the whole match", and a `|` would end the
+# expression, so a checkout path or $HOME containing either renders a
+# corrupted path — silently, into a file launchd runs at every login.
+_sed_rhs() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
 
 # ── agent_status LABEL ───────────────────────────────────────────────────────
 # Prints "RUNNING pid=N last_exit=S", "LOADED-NOT-RUNNING", or "NOT-LOADED".

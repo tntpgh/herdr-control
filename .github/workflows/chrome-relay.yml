@@ -1,0 +1,19 @@
+name: chrome-relay
+# chrome-relay.py decides which Chrome processes get SIGTERM; these checks pin
+# that decision (real vs omp-profile classification, the two-tick idle rule).
+on:
+  pull_request:
+    paths: ["chrome-relay.py", "verify-chrome-relay.py", ".github/workflows/chrome-relay.yml"]
+  push:
+    branches: [main]
+    paths: ["chrome-relay.py", "verify-chrome-relay.py", ".github/workflows/chrome-relay.yml"]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python3 verify-chrome-relay.py

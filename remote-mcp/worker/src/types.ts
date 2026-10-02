@@ -62,6 +62,18 @@ export interface HubSummary {
   handoff_debt: number | null;
 }
 
+// The Mac's real Chrome (chrome-relay.py): the browser Zero's ChatGPT
+// extension and omp's browser relay both live in. Enums and counts only.
+export type ExtensionState = "enabled" | "disabled" | "missing";
+export interface BrowserSummary {
+  checked_at: string;
+  real_chrome_running: boolean;
+  relay: string; // connected | no-extension | down (no omp session has started it)
+  extensions: { omp_relay: ExtensionState; "1password": ExtensionState; chatgpt: ExtensionState };
+  stray_omp_chromes: number;
+  healthy: boolean;
+}
+
 export interface AgentRow {
   agent_id: string; // herdr terminal id: stable for the life of the pane's terminal
   pane_id: string; // herdr location; can be reused by another terminal later
@@ -141,6 +153,8 @@ export interface Snapshot {
   // (an older publisher.py), which the Worker now actually treats the same
   // as null (both the zod schema and this type mark it optional).
   task_config?: TaskConfig | null;
+  // null when the Mac could not read it this tick; absent from an older publisher.
+  browser?: BrowserSummary | null;
 }
 
 export interface SyncBody {

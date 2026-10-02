@@ -74,7 +74,7 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
 
   server.registerTool("get_status", {
     title: "Fleet connection and summary",
-    description: "Connection state (connected | degraded | disconnected | never_connected) with last sync time, plus fleet counts.",
+    description: "Connection state (connected | degraded | disconnected | never_connected) with last sync time, plus fleet counts, plus `browser`: whether the Mac's real Chrome is running with the ChatGPT, 1Password and omp relay extensions enabled (null when unknown).",
     inputSchema: {},
     annotations: ro,
   }, async () => {
@@ -94,6 +94,7 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
         open_decisions: s.hub.open_decisions,
         handoff_debt: s.hub.handoff_debt,
       } : null,
+      browser: s?.browser ?? null,
       your_scopes: scopes,
       server: serverInfo(env),
       // Present when messaging is on: the limits in force and how many of them

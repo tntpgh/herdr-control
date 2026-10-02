@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.herdr-control.chrome-relay</string>
+	<key>ProgramArguments</key>
+	<array>
+		<!-- chrome-relay.py --ensure: start the REAL Chrome (Profile 1: omp
+		     relay, 1Password, ChatGPT for Zero) in the background if it is not
+		     running, and close omp-profile Chromes nobody is attached to. It
+		     never reaches `op`, so no service-account file is sourced.
+		     Render: __CHROME_RELAY_PY__ -> the deployed app's chrome-relay.py,
+		     __LOG_PATH__ -> ~/Library/Logs/com.herdr-control.chrome-relay.log.
+		     Pause: launchctl bootout gui/$(id -u)/com.herdr-control.chrome-relay -->
+		<string>/usr/bin/env</string>
+		<string>python3</string>
+		<string>__CHROME_RELAY_PY__</string>
+		<string>--ensure</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin</string>
+		<key>OP_BIOMETRIC_UNLOCK_ENABLED</key>
+		<string>false</string>
+	</dict>
+	<!-- At login, then every 5 minutes: a quit or crashed Chrome is back
+	     within one tick, and Zero's extension with it. -->
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__LOG_PATH__</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_PATH__</string>
+</dict>
+</plist>
