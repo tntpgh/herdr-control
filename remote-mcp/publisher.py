@@ -342,10 +342,6 @@ def read_regular(path: Path) -> tuple[bytes, str]:
 
 
 SESSIONS_ROOT = Path.home() / ".omp/agent/sessions"
-# omp's own session id shape (a herdr-reported UUID, lib/run-registry.sh's
-# agent_session column) -- charset-checked before it ever reaches a glob
-# pattern or a path, same spirit as tasks.py's REMOTE_TASK_ID_RE.
-AGENT_SESSION_RE = re.compile(r"^[0-9a-f-]{8,64}$")
 SESSION_READ_CAP = 1_000_000  # a JSONL transcript is append-only; read the
 # TAIL up to this many bytes, not the head read_regular() uses for a
 # writer-bounded .handoffs/ file -- the newest (last) assistant message is
@@ -354,33 +350,83 @@ SESSION_READ_CAP = 1_000_000  # a JSONL transcript is append-only; read the
 
 
 def _resolve_session_jsonl(agent_session: str) -> Path | None:
-    """SPEC fix item 2's path-safety requirement: the session path must
-    resolve under SESSIONS_ROOT, never a symlink / `..` / absolute
-    elsewhere. agent_session is herdr's own report of the CLI's session id
-    (locally observed, not remote-client input), but validated the same
-    way regardless: charset-checked, globbed by its exact filename suffix
-    one directory level down (the real layout is
-    SESSIONS_ROOT/<escaped-cwd>/<timestamp>_<session>.jsonl), and the
-    match's REAL (symlink-resolved) path is re-checked to still be inside
-    SESSIONS_ROOT before anything is ever opened."""
-    if not AGENT_SESSION_RE.fullmatch(agent_session):
+    """REVIEW-213 F3 (shape) + F5 (symlink containment), fixed together per
+    the review's own ordering: shipping F3 alone would have started
+    serving transcripts through the exact cross-directory glob F5
+    demonstrates escapes SESSIONS_ROOT.
+
+    F3: agent_session is NOT a bare session id -- it is herdr's own report
+    of the CLI's session id, and for omp that report is an ABSOLUTE PATH
+    to the transcript file itself (`herdr pane get` .result.pane.
+    agent_session.value, captured once at spawn by spawn-task.sh:749 and
+    stored verbatim by lib/run-registry.sh's set_task_agent_session). The
+    prior version of this function validated a bare-UUID shape instead
+    (comment said "empty for omp today" -- stale: omp has reported this
+    path shape since it started reporting agent_session at all) and so
+    AGENT_SESSION_RE never matched a real value; omp:transcript was
+    silently null for every production task. There is no bare-id fallback
+    here: remote-mcp only ever spawns omp workers, so a value that is not
+    this exact path shape is not a format production sends, and treating
+    it as "maybe a different shape" would just resurrect the same
+    silent-null bug under a new guise.
+
+    F5: agent_session is therefore used as an EXACT path, never a
+    filename fragment searched for across directories. The prior
+    SESSIONS_ROOT.glob(f"*/*_{agent_session}.jsonl") searched every
+    session directory by filename suffix and then only checked that the
+    RESOLVED match landed under SESSIONS_ROOT -- a worker's own session
+    file symlinked to a DIFFERENT task's transcript (same root, different
+    directory) matched the glob and passed that check, serving a
+    conductor's private reply to a worker's own task (tmp/r213/
+    repro-213-f5.py). herdr reported this value directly for THIS task at
+    spawn time; there is nothing to search for.
+
+    The containment check compares the resolved path against the
+    resolved root PLUS THE UNCHANGED SUFFIX (not "resolves somewhere
+    under the root"), so it refuses a symlink anywhere in the per-task
+    portion of the path -- leaf or a session subdirectory -- while
+    tolerating a symlink shared by SESSIONS_ROOT's own ancestor chain
+    (not an attack surface this code controls). This closes both the
+    out-of-root escape the old code already caught and the same-root
+    cross-directory escape it didn't.
+
+    Deliberately NOT independently recomputing herdr's cwd -> directory-
+    name scheme for a second "is this really this task's own directory"
+    check: that algorithm is undocumented, and two real observed session
+    directory names disagreed under every formula tried while building
+    this fix (.handoffs/PROOF.md). A guessed formula fails in both unsafe
+    directions -- too strict breaks the feature for every real task, too
+    loose proves nothing the old regex didn't already fail to prove.
+    Eliminating the glob instead closes the DEMONSTRATED vulnerability
+    without depending on an unverified one.
+    """
+    root_str = str(SESSIONS_ROOT)
+    if not agent_session.startswith(root_str + "/") or not agent_session.endswith(".jsonl"):
         return None
+    suffix = agent_session[len(root_str):]
+    candidate = Path(agent_session)
     try:
         root = SESSIONS_ROOT.resolve(strict=True)
+        rp = candidate.resolve(strict=True)
     except OSError:
+        return None
+    # Compare against root+suffix, not candidate itself: SESSIONS_ROOT's
+    # own resolution above already walks through any symlink in its own
+    # ANCESTOR chain (e.g. a sandboxed test's tmpdir under a platform
+    # /tmp -> /private/tmp alias) -- that is not an attack surface this
+    # code controls, and comparing candidate to rp directly refused every
+    # real task over it. A symlink anywhere in the per-task PORTION of the
+    # path (the part F5's attack actually targets: a session file, or a
+    # session directory, made to point elsewhere) changes what resolving
+    # it produces relative to the already-resolved root, and is refused.
+    if str(rp) != f"{root}{suffix}":
         return None
     try:
-        matches = sorted(SESSIONS_ROOT.glob(f"*/*_{agent_session}.jsonl"))
+        if not rp.is_file():
+            return None
     except OSError:
         return None
-    for m in matches:
-        try:
-            rp = m.resolve(strict=True)
-        except OSError:
-            continue
-        if (rp == root or root in rp.parents) and rp.is_file():
-            return rp
-    return None
+    return rp
 
 
 def _read_session_tail(path: Path) -> tuple[bytes, bool]:

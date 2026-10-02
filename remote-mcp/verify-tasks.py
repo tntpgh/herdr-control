@@ -47,6 +47,13 @@ con = sqlite3.connect(REGISTRY)
 con.execute("""CREATE TABLE tasks (task_id TEXT PRIMARY KEY, run_id TEXT, remote_task_id TEXT NOT NULL DEFAULT '',
              deadline_at TEXT NOT NULL DEFAULT '', verified INTEGER NOT NULL DEFAULT 0,
              verify_detail TEXT NOT NULL DEFAULT '', manifest TEXT NOT NULL DEFAULT '', created_at TEXT)""")
+# F9/ZR4 (REVIEW-213): tasks.py's _event_count/_event_pids read this table
+# directly (read-only), the same way the real lib/run-registry.sh events
+# table backs them in production -- minimal columns, no explicit sequence
+# (tasks.py orders by rowid, which this table has implicitly like any
+# other). FAKE_BRIDGE's append-event case below is this fixture's only
+# writer, mirroring what registry-bridge.sh's real append_event does.
+con.execute("CREATE TABLE events (run_id TEXT, task_id TEXT, type TEXT, payload TEXT)")
 con.commit()
 con.close()
 
@@ -90,6 +97,15 @@ case "$1" in
   set-remote-id|read|read-by-remote) [ "$rc" = 0 ] && cat {FAKE_BRIDGE_ROW} ;;
   find-spawned)
     if [ -s {FAKE_BRIDGE_FIND_SPAWNED} ]; then cat {FAKE_BRIDGE_FIND_SPAWNED}; exit 0; else exit 1; fi
+    ;;
+  append-event)
+    python3 -c "
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute('INSERT INTO events (run_id, task_id, type, payload) VALUES (?,?,?,?)',
+             (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else '{{}}'))
+con.commit()
+" {REGISTRY} "$2" "$3" "$4" "${{5:-{{\\}}}}"
     ;;
 esac
 exit "$rc"
@@ -606,8 +622,19 @@ class Sweep(unittest.TestCase):
                      (task_id, "run_x", remote_id, deadline, verify_detail, json.dumps({"git": "none"}), "", state))
         con.commit(); con.close()
 
+    def _event(self, task_id, type_, payload="{}"):
+        con = sqlite3.connect(REGISTRY)
+        con.execute("INSERT INTO events (run_id, task_id, type, payload) VALUES (?,?,?,?)",
+                     ("run_x", task_id, type_, payload))
+        con.commit(); con.close()
+
     def test_auto_close_on_pending_completion(self):
         self._row("task_a", "rtask_a")
+        # F9/ZR4: a task reaching sweep() via the normal _start() path
+        # already has its hard-stop timer scheduled and recorded -- seed
+        # that baseline so this auto_close-only test is not also exercising
+        # the separate hard_stop_retry path (covered by its own tests below).
+        self._event("task_a", "hard_stop_scheduled", json.dumps({"pid": 1}))
         (self.wt / ".handoffs/identity.json").write_text(json.dumps({"completion_event": "x_done"}))
         (self.wt / ".handoffs/events.jsonl").write_text(
             json.dumps({"event": "x_done", "status": "completed", "reason": "no-follow-on"}) + "\n")
@@ -652,6 +679,57 @@ class Sweep(unittest.TestCase):
         self._row("task_c", "rtask_c", state="completed", verify_detail="already checked")
         actions2 = tsk.sweep({"task_c": t}, now)
         self.assertEqual(actions2, [])
+
+    def test_sweep_retries_a_missing_hard_stop_timer_for_a_running_task(self):
+        # ZR4: a task with NO hard_stop_scheduled event (the Popen call in
+        # _start/_resume failed, or in this fixture simply never ran)
+        # must not be left with no backstop forever -- sweep's own pass
+        # schedules it, exactly like _start's own call would have.
+        self._row("task_e", "rtask_e")
+        t = {"task_id": "task_e", "run_id": "run_x", "state": "running", "worktree": str(self.wt)}
+        before = len(HARD_STOP_CALLS)
+        actions = tsk.sweep({"task_e": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        retry = next(a for a in actions if a["action"] == "hard_stop_retry")
+        self.assertTrue(retry["ok"])
+        self.assertEqual(len(HARD_STOP_CALLS), before + 1)
+        self.assertIn("hard_stop_scheduled", FAKE_BRIDGE_LOG.read_text())
+        # A second sweep tick must NOT retry again -- the event just
+        # recorded satisfies the dedup check.
+        actions2 = tsk.sweep({"task_e": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        self.assertFalse(any(a["action"] == "hard_stop_retry" for a in actions2))
+        self.assertEqual(len(HARD_STOP_CALLS), before + 1)
+
+    def test_sweep_gives_up_loudly_after_hard_stop_retry_cap(self):
+        # ZR4: a scheduling call that keeps failing (e.g. the Mac is out of
+        # process slots) must not retry silently forever -- after
+        # HARD_STOP_RETRY_CAP failures, exactly ONE hard_stop_stuck event
+        # fires and further ticks go quiet instead of flooding.
+        self._row("task_f", "rtask_f")
+        t = {"task_id": "task_f", "run_id": "run_x", "state": "running", "worktree": str(self.wt)}
+
+        def _boom(argv):
+            raise OSError("no process slots")
+        old = tsk._popen_detached
+        tsk._popen_detached = _boom
+        try:
+            for _ in range(tsk.HARD_STOP_RETRY_CAP):
+                actions = tsk.sweep({"task_f": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+                retry = next(a for a in actions if a["action"] == "hard_stop_retry")
+                self.assertFalse(retry["ok"])
+            # One more tick past the cap: a single loud hard_stop_stuck,
+            # not another retry attempt.
+            stuck_actions = tsk.sweep({"task_f": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+            stuck = next(a for a in stuck_actions if a["action"] == "hard_stop_retry")
+            self.assertFalse(stuck["ok"])
+            self.assertIn("stuck", stuck["detail"])
+            log = FAKE_BRIDGE_LOG.read_text()
+            self.assertEqual(log.count("hard_stop_stuck"), 1)
+            # Further ticks stay silent -- the cap's own dedup (one
+            # hard_stop_stuck already recorded) stops re-firing.
+            quiet = tsk.sweep({"task_f": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+            self.assertFalse(any(a["action"] == "hard_stop_retry" for a in quiet))
+        finally:
+            tsk._popen_detached = old
 
 
 class HardStop(unittest.TestCase):

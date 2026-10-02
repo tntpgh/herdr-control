@@ -205,6 +205,13 @@ check("registry-bridge.sh cancel succeeds when the expected remote_task_id match
 row4b = registry_row(task_id4)
 check("registry state is 'cancelled' once the remote_task_id actually matches",
       bool(row4b) and row4b.get("state") == "cancelled", row4b)
+# This cancel went through registry-bridge.sh DIRECTLY (subprocess.run
+# above), bypassing tasks.py's own _cancel() and the
+# _kill_hard_stop_timer() call it makes on success -- a real gap only a
+# test taking this out-of-band shortcut hits (production cancels always
+# go through _cancel()); reap it here so this suite does not itself leak
+# a ~62-minute sleep process.
+tsk._kill_hard_stop_timer(run_id4, task_id4)
 
 print("== R3-6: real registry-bridge.sh cancel skips the pane close when `herdr pane list` returns non-JSON with rc 0 ==")
 fake_herdr2_log = TMP / "fake-herdr2-calls.log"
@@ -300,6 +307,187 @@ check("`herdr pane list` was called TWICE (once before the close, once after, to
 restore_working_herdr_and_free_slot(fake_herdr, fake_herdr4_log, "cmd_z1b_cleanup",
                                      "rtask_20261002T000008Z_e2e00008", task_id7)
 
+print("== F2: real registry-bridge.sh cancel on an already-terminal row refuses BEFORE touching any pane ==")
+out_f2 = tsk.process_command({
+    "command_id": "cmd_f2", "op": "start", "remote_task_id": "rtask_20261002T000011Z_0000f2f2",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "f2"},
+})
+check("F2 start accepted", out_f2.get("outcome") == "accepted", json.dumps(out_f2))
+task_id_f2, run_id_f2 = out_f2.get("local_task_id", ""), out_f2.get("local_run_id", "")
+cout_f2_first = tsk.process_command({
+    "command_id": "cmd_f2_cancel1", "op": "cancel", "remote_task_id": "rtask_20261002T000011Z_0000f2f2",
+    "payload": {"local_task_id": task_id_f2, "reason": "canceled"},
+})
+check("F2 first cancel (real pane, real herdr fake) accepted", cout_f2_first.get("outcome") == "accepted", json.dumps(cout_f2_first))
+fake_herdr_log.write_text("")  # restore_working_herdr_and_free_slot already left a working herdr on PATH
+f2_second_argv = [tsk.REGISTRY_BRIDGE, "cancel", run_id_f2, task_id_f2, "second_cancel_attempt"]
+bridge_out_f2_second = subprocess.run(f2_second_argv, capture_output=True, text=True)
+check("F2: a SECOND cancel on the now-terminal row exits nonzero", bridge_out_f2_second.returncode != 0, bridge_out_f2_second.stderr)
+check("F2: the refusal message says 'already terminal'", "already terminal" in bridge_out_f2_second.stderr, bridge_out_f2_second.stderr)
+check("F2: no `herdr pane list` or `pane close` call was ever made for the already-terminal row (refused before touching any pane)",
+      fake_herdr_log.read_text().strip() == "", fake_herdr_log.read_text())
+
+print("== F1: real registry-bridge.sh cancel corroborates a terminal_id mismatch via agent_session (herdr restart case) ==")
+
+
+def _set_agent_session(run_id: str, task_id: str, session: str) -> None:
+    script = TMP / f"set-session-{task_id}.sh"
+    script.write_text(f"""#!/usr/bin/env bash
+set -euo pipefail
+. "{HERE.parent}/lib/run-registry.sh"
+set_task_agent_session {run_id} {task_id} {session}
+""")
+    script.chmod(0o755)
+    out = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    check(f"setup: agent_session stamped for {task_id}", out.returncode == 0, out.stderr)
+
+
+fake_herdr_f1a_log = TMP / "fake-herdr-f1a-calls.log"
+out_f1a = tsk.process_command({
+    "command_id": "cmd_f1a", "op": "start", "remote_task_id": "rtask_20261002T000012Z_0000f1a1",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "f1a"},
+})
+check("F1a start accepted", out_f1a.get("outcome") == "accepted", json.dumps(out_f1a))
+task_id_f1a, run_id_f1a = out_f1a.get("local_task_id", ""), out_f1a.get("local_run_id", "")
+_set_agent_session(run_id_f1a, task_id_f1a, "/Users/thurbs/.omp/agent/sessions/f1a/session.jsonl")
+# herdr restarted: same pane_id, a FRESH terminal_id (never equal to the
+# registered pane_birth), but the SAME agent_session -- the underlying
+# agent process survived (lib/reconcile.sh:139-142); this must corroborate
+# as "still ours" and proceed to close.
+fake_herdr.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {fake_herdr_f1a_log}
+case "$1 $2" in
+  "pane list") printf '{{"result":{{"panes":[{{"pane_id":"pane_e2e_fake","terminal_id":"fresh_after_restart","agent_session":{{"value":"/Users/thurbs/.omp/agent/sessions/f1a/session.jsonl"}}}}]}}}}\\n'; exit 0 ;;
+  "pane close") exit 1 ;;
+esac
+exit 0
+""")
+cout_f1a = tsk.process_command({
+    "command_id": "cmd_f1a_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000012Z_0000f1a1",
+    "payload": {"local_task_id": task_id_f1a, "reason": "canceled"},
+})
+f1a_calls = fake_herdr_f1a_log.read_text() if fake_herdr_f1a_log.exists() else ""
+check("F1a: pane close WAS attempted (same agent_session corroborated 'still ours' despite the terminal_id mismatch)",
+      "pane close" in f1a_calls, f1a_calls)
+check("F1a: cancel fails here only because this fixture's `pane close` itself fails (proves the match, not the close)",
+      cout_f1a.get("outcome") == "failed", json.dumps(cout_f1a))
+restore_working_herdr_and_free_slot(fake_herdr, fake_herdr_f1a_log, "cmd_f1a_cleanup",
+                                     "rtask_20261002T000012Z_0000f1a1", task_id_f1a)
+
+fake_herdr_f1b_log = TMP / "fake-herdr-f1b-calls.log"
+out_f1b = tsk.process_command({
+    "command_id": "cmd_f1b", "op": "start", "remote_task_id": "rtask_20261002T000013Z_0000f1b1",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "f1b"},
+})
+check("F1b start accepted", out_f1b.get("outcome") == "accepted", json.dumps(out_f1b))
+task_id_f1b, run_id_f1b = out_f1b.get("local_task_id", ""), out_f1b.get("local_run_id", "")
+_set_agent_session(run_id_f1b, task_id_f1b, "/Users/thurbs/.omp/agent/sessions/f1b/session.jsonl")
+# A DIFFERENT occupant now reports this pane_id: different terminal_id AND
+# a different agent_session -- two independent signals confirm our own
+# pane is genuinely gone (recycled). Nothing of ours to close; proceeds
+# straight to marking the row cancelled.
+fake_herdr.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {fake_herdr_f1b_log}
+case "$1 $2" in
+  "pane list") printf '{{"result":{{"panes":[{{"pane_id":"pane_e2e_fake","terminal_id":"someone_elses_pane","agent_session":{{"value":"/Users/thurbs/.omp/agent/sessions/different-task/other.jsonl"}}}}]}}}}\\n'; exit 0 ;;
+esac
+exit 0
+""")
+cout_f1b = tsk.process_command({
+    "command_id": "cmd_f1b_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000013Z_0000f1b1",
+    "payload": {"local_task_id": task_id_f1b, "reason": "canceled"},
+})
+check("F1b: cancel SUCCEEDS when a disagreeing agent_session confirms a different occupant (nothing of ours to close)",
+      cout_f1b.get("outcome") == "accepted", json.dumps(cout_f1b))
+f1b_calls = fake_herdr_f1b_log.read_text() if fake_herdr_f1b_log.exists() else ""
+check("F1b: `herdr pane close` was NEVER attempted (not our pane)", "pane close" not in f1b_calls, f1b_calls)
+row_f1b = registry_row(task_id_f1b)
+check("F1b: registry state is 'cancelled'", bool(row_f1b) and row_f1b.get("state") == "cancelled", row_f1b)
+
+fake_herdr_f1c_log = TMP / "fake-herdr-f1c-calls.log"
+out_f1c = tsk.process_command({
+    "command_id": "cmd_f1c", "op": "start", "remote_task_id": "rtask_20261002T000014Z_0000f1c1",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "f1c"},
+})
+check("F1c start accepted", out_f1c.get("outcome") == "accepted", json.dumps(out_f1c))
+task_id_f1c = out_f1c.get("local_task_id", "")
+# agent_session was never stamped for this row (still empty) -- terminal_id
+# differs and there is nothing to corroborate with on our own side. Must
+# fail closed, never guess.
+fake_herdr.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {fake_herdr_f1c_log}
+case "$1 $2" in
+  "pane list") printf '{{"result":{{"panes":[{{"pane_id":"pane_e2e_fake","terminal_id":"ambiguous_after_restart","agent_session":{{"value":"/Users/thurbs/.omp/agent/sessions/whoever/other.jsonl"}}}}]}}}}\\n'; exit 0 ;;
+esac
+exit 0
+""")
+cout_f1c = tsk.process_command({
+    "command_id": "cmd_f1c_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000014Z_0000f1c1",
+    "payload": {"local_task_id": task_id_f1c, "reason": "canceled"},
+})
+check("F1c: cancel FAILS when our own side has no agent_session to corroborate with (fail closed, never guess)",
+      cout_f1c.get("outcome") == "failed", json.dumps(cout_f1c))
+row_f1c = registry_row(task_id_f1c)
+check("F1c: registry state is NOT 'cancelled' (stays non-terminal for the next retry)",
+      bool(row_f1c) and row_f1c.get("state") != "cancelled", row_f1c)
+restore_working_herdr_and_free_slot(fake_herdr, fake_herdr_f1c_log, "cmd_f1c_cleanup",
+                                     "rtask_20261002T000014Z_0000f1c1", task_id_f1c)
+
+print("== Fz: real registry-bridge.sh cancel treats a wrong-shaped-but-valid-JSON `herdr pane list` as UNPARSEABLE, never 'gone' ==")
+fake_herdr_fza_log = TMP / "fake-herdr-fza-calls.log"
+out_fza = tsk.process_command({
+    "command_id": "cmd_fza", "op": "start", "remote_task_id": "rtask_20261002T000015Z_0000fda1",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "fza"},
+})
+check("Fz-a start accepted", out_fza.get("outcome") == "accepted", json.dumps(out_fza))
+task_id_fza = out_fza.get("local_task_id", "")
+# Valid JSON, but an error envelope -- no .result.panes/.panes array at all.
+fake_herdr.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {fake_herdr_fza_log}
+case "$1 $2" in
+  "pane list") printf '{{"error":{{"code":"rate_limited","message":"slow down"}}}}\\n'; exit 0 ;;
+esac
+exit 0
+""")
+cout_fza = tsk.process_command({
+    "command_id": "cmd_fza_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000015Z_0000fda1",
+    "payload": {"local_task_id": task_id_fza, "reason": "canceled"},
+})
+check("Fz-a: cancel FAILS on a valid-JSON error envelope (never mistaken for an empty/gone list)",
+      cout_fza.get("outcome") == "failed", json.dumps(cout_fza))
+fza_calls = fake_herdr_fza_log.read_text() if fake_herdr_fza_log.exists() else ""
+check("Fz-a: `herdr pane close` was NEVER attempted on an unparseable shape", "pane close" not in fza_calls, fza_calls)
+restore_working_herdr_and_free_slot(fake_herdr, fake_herdr_fza_log, "cmd_fza_cleanup",
+                                     "rtask_20261002T000015Z_0000fda1", task_id_fza)
+
+fake_herdr_fzb_log = TMP / "fake-herdr-fzb-calls.log"
+out_fzb = tsk.process_command({
+    "command_id": "cmd_fzb", "op": "start", "remote_task_id": "rtask_20261002T000016Z_0000fdb1",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "fzb"},
+})
+check("Fz-b start accepted", out_fzb.get("outcome") == "accepted", json.dumps(out_fzb))
+task_id_fzb = out_fzb.get("local_task_id", "")
+# The pane_id MATCHES -- a real entry exists -- but that entry is missing
+# terminal_id entirely. A pane we can SEE must never read as "gone".
+fake_herdr.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {fake_herdr_fzb_log}
+case "$1 $2" in
+  "pane list") printf '{{"result":{{"panes":[{{"pane_id":"pane_e2e_fake","label":"renamed, no terminal_id field"}}]}}}}\\n'; exit 0 ;;
+esac
+exit 0
+""")
+cout_fzb = tsk.process_command({
+    "command_id": "cmd_fzb_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000016Z_0000fdb1",
+    "payload": {"local_task_id": task_id_fzb, "reason": "canceled"},
+})
+check("Fz-b: cancel FAILS when the matched pane entry is missing terminal_id (found-but-unreadable is never 'absent')",
+      cout_fzb.get("outcome") == "failed", json.dumps(cout_fzb))
+fzb_calls = fake_herdr_fzb_log.read_text() if fake_herdr_fzb_log.exists() else ""
+check("Fz-b: `herdr pane close` was NEVER attempted (never confirmed as our own live pane, never confirmed gone either)",
+      "pane close" not in fzb_calls, fzb_calls)
+restore_working_herdr_and_free_slot(fake_herdr, fake_herdr_fzb_log, "cmd_fzb_cleanup",
+                                     "rtask_20261002T000016Z_0000fdb1", task_id_fzb)
+
 print("== R4-1: a spawn timeout BEFORE remote_task_id is ever stamped still gets the orphan cancelled (real registry-bridge.sh, real registry) ==")
 # Mirrors spawn-task.sh's own real sequence: register_task() runs long
 # before the caller ever calls set-remote-id -- a crash/timeout in that
@@ -371,31 +559,84 @@ row_after = registry_row(task_id_r41b)
 check("state is 'cancelled' after cancelling the unstamped row",
       bool(row_after) and row_after.get("state") == "cancelled", row_after)
 
-print("== Z5: every accepted start/resume schedules a real, independently-firing hard-stop timer ==")
-con = sqlite3.connect(tsk.REGISTRY)
-con.row_factory = sqlite3.Row
-hard_stop_rows = con.execute("SELECT task_id, payload FROM events WHERE type='hard_stop_scheduled'").fetchall()
-con.close()
-check("at least one hard_stop_scheduled event was recorded across this run's start/resume calls", len(hard_stop_rows) > 0, len(hard_stop_rows))
-killed, still_alive_at_check = 0, 0
-for r in hard_stop_rows:
+print("== Z5: every accepted start schedules a real, independently-firing hard-stop timer, "
+      "killed on a real cancel but NOT while the task is still running (F9) ==")
+out_z5a = tsk.process_command({
+    "command_id": "cmd_z5a", "op": "start", "remote_task_id": "rtask_20261002T000009Z_00005a01",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "z5a"},
+})
+check("Z5a start accepted", out_z5a.get("outcome") == "accepted", json.dumps(out_z5a))
+task_id_z5a, run_id_z5a = out_z5a.get("local_task_id", ""), out_z5a.get("local_run_id", "")
+
+
+def _hard_stop_pid(task_id: str) -> int | None:
+    con = sqlite3.connect(tsk.REGISTRY)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT payload FROM events WHERE task_id=? AND type='hard_stop_scheduled' "
+                       "ORDER BY sequence DESC LIMIT 1", (task_id,)).fetchone()
+    con.close()
+    if not row:
+        return None
     try:
-        payload = json.loads(r["payload"])
+        pid = json.loads(row["payload"]).get("pid")
     except ValueError:
-        payload = {}
-    pid = payload.get("pid")
-    check(f"hard_stop_scheduled for {r['task_id']} carries a real numeric pid", isinstance(pid, int) and pid > 0, payload)
-    if isinstance(pid, int) and pid > 0:
-        try:
-            os.kill(pid, 0)  # signal 0: existence check only, nothing sent
-            still_alive_at_check += 1
-            os.kill(pid, signal.SIGTERM)  # reap it now; it would otherwise sleep ~62 real minutes
-            killed += 1
-        except ProcessLookupError:
-            pass
-check("every scheduled hard-stop pid was a REAL, live detached process (not a placeholder) at check time",
-      still_alive_at_check == len(hard_stop_rows), f"{still_alive_at_check}/{len(hard_stop_rows)}")
-print(f"  (reaped {killed} detached hard-stop sleep process(es) spawned by this run)")
+        return None
+    return pid if isinstance(pid, int) and pid > 0 else None
+
+
+pid_z5a = _hard_stop_pid(task_id_z5a)
+check("a real numeric hard-stop pid was recorded for Z5a's start", pid_z5a is not None, pid_z5a)
+alive_before_cancel = False
+if pid_z5a is not None:
+    try:
+        os.kill(pid_z5a, 0)
+        alive_before_cancel = True
+    except ProcessLookupError:
+        pass
+check("Z5a's hard-stop pid is a REAL, live detached process before cancel (not a placeholder)",
+      alive_before_cancel, pid_z5a)
+
+cout_z5a = tsk.process_command({
+    "command_id": "cmd_z5a_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000009Z_00005a01",
+    "payload": {"local_task_id": task_id_z5a, "reason": "canceled"},
+})
+check("Z5a cancel (through tasks.py's own process_command, the real production path) accepted",
+      cout_z5a.get("outcome") == "accepted", json.dumps(cout_z5a))
+still_alive_after_cancel = True
+if pid_z5a is not None:
+    try:
+        os.kill(pid_z5a, 0)
+    except ProcessLookupError:
+        still_alive_after_cancel = False
+check("F9: Z5a's hard-stop pid was killed by the cancel it went through -- no 60+-minute leaked sleep",
+      not still_alive_after_cancel, pid_z5a)
+
+print("== Z5b: a hard-stop timer is NOT killed while its task is still running (F9 only fires on a terminal transition) ==")
+out_z5b = tsk.process_command({
+    "command_id": "cmd_z5b", "op": "start", "remote_task_id": "rtask_20261002T000010Z_00005b01",
+    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "z5b"},
+})
+check("Z5b start accepted", out_z5b.get("outcome") == "accepted", json.dumps(out_z5b))
+task_id_z5b = out_z5b.get("local_task_id", "")
+pid_z5b = _hard_stop_pid(task_id_z5b)
+check("a real numeric hard-stop pid was recorded for Z5b's start", pid_z5b is not None, pid_z5b)
+# No cancel, no auto_close, no sweep() here -- Z5b's task stays 'running'.
+# Its timer must still be alive; F9 only kills on a terminal transition.
+still_alive_z5b = False
+if pid_z5b is not None:
+    try:
+        os.kill(pid_z5b, 0)
+        still_alive_z5b = True
+    except ProcessLookupError:
+        pass
+check("Z5b's hard-stop pid is still alive -- nothing killed it while the task is still running",
+      still_alive_z5b, pid_z5b)
+if pid_z5b is not None and still_alive_z5b:
+    try:
+        os.killpg(pid_z5b, signal.SIGTERM)  # reap it now; it would otherwise sleep ~62 real minutes
+    except OSError:
+        pass
+
 
 
 shutil.rmtree(TMP, ignore_errors=True)

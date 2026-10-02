@@ -221,9 +221,11 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
     title: "List task capabilities",
     description: "What start_task can do right now: allow-listed repos, each mode's git/secrets/write policy, and " +
       "today's caps (max_concurrent/max_per_day/max_minutes -- there is no separate $/token budget). Each task runs " +
-      "in its own sandboxed herdr pane via spawn-task.sh, not an omp-attach session. Pre-flight check before " +
-      "start_task; answers from the Mac's own tracked allowlist file (remote-mcp/task-allowlist.json), never a " +
-      "hand-duplicated table.",
+      "in its own herdr pane via spawn-task.sh, under the same macOS user as every other session on that machine " +
+      "(no separate OS user, container, or filesystem sandbox) -- isolation comes from its own git worktree/branch " +
+      "and the Mac's own command-approval policy gating what it can run, not from the pane itself. Pre-flight " +
+      "check before start_task; answers from the Mac's own tracked allowlist file (remote-mcp/task-allowlist.json), " +
+      "never a hand-duplicated table.",
     inputSchema: {},
     annotations: ro,
   }, async () => {

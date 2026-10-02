@@ -172,6 +172,11 @@ const NONCE_TTL_MS = 15 * 60_000;
 // Each publisher tick (~15s) that leases a message counts one attempt; a
 // permission prompt or a typing human makes it retry, so 40 covers the TTL.
 const MAX_ATTEMPTS = 40;
+// ZR1 (ZERO-REVIEW-213-01 item 1): how many times sync() re-queues a cancel
+// command after the Mac reports the PREVIOUS one failed, before giving up
+// and leaving a single cancel_stuck event instead of an unbounded flood --
+// same shape, same cap, as registry-bridge.sh's own CANCEL_STUCK_THRESHOLD.
+const CANCEL_RETRY_CAP = 5;
 const AUDIT_KEEP_MS = 180 * 86_400_000;
 // Every tool call by one client (allowed or refused) counts. A ChatGPT session
 // makes a handful of calls per turn; these only bite a loop or a leaked token.
@@ -793,6 +798,33 @@ export class HerdrState extends DurableObject<Env> {
       } else if (c.op === "cancel" && a.outcome === "accepted") {
         this.sql.exec(`UPDATE remote_tasks SET state='cancelled', updated_at=? WHERE remote_task_id=?`, nowMs, c.remote_task_id);
         this.recordTaskEvent(nowMs, c.remote_task_id, "cancelled", {});
+      } else if (c.op === "cancel" && a.outcome !== "accepted") {
+        // ZR1 (ZERO-REVIEW-213-01 item 1): a FAILED cancel ack used to hit
+        // no branch at all here -- the command was still marked 'done'
+        // above (line 746), but the explicit cancel attempt it reported
+        // failing was then silently dropped: remote_tasks.state stayed
+        // 'cancelling' forever, with nothing ever retrying it. Re-queue a
+        // fresh cancel for the same local_task_id (same shape as the Z4
+        // revoke-while-running loop's own INSERT below), capped at
+        // CANCEL_RETRY_CAP like registry-bridge.sh's own cancel retries,
+        // so a cancel that can never land becomes one visible
+        // cancel_stuck event instead of an unbounded flood.
+        const curRow = this.sql.exec<{ state: string; local_task_id: string }>(
+          `SELECT state, local_task_id FROM remote_tasks WHERE remote_task_id=?`, c.remote_task_id).toArray()[0];
+        if (curRow && !REMOTE_TERMINAL[curRow.state] && curRow.local_task_id) {
+          const retries = this.sql.exec<{ n: number }>(
+            `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='cancel_retry_queued'`, c.remote_task_id).one().n;
+          if (retries < CANCEL_RETRY_CAP) {
+            this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
+              `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", c.remote_task_id,
+              JSON.stringify({ local_task_id: curRow.local_task_id }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+            this.recordTaskEvent(nowMs, c.remote_task_id, "cancel_retry_queued", { attempt: retries + 1, reason: a.detail });
+          } else {
+            const stuck = this.sql.exec<{ n: number }>(
+              `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='cancel_stuck'`, c.remote_task_id).one().n;
+            if (stuck === 0) this.recordTaskEvent(nowMs, c.remote_task_id, "cancel_stuck", { attempts: retries });
+          }
+        }
       }
     }
 
@@ -925,9 +957,35 @@ export class HerdrState extends DurableObject<Env> {
       const t = localTasks.get(rt.local_task_id);
       if (!t) continue;
       const mapped = mapLocalState(t, livePermission.has(rt.local_task_id));
-      if (mapped !== rt.state) {
-        this.sql.exec(`UPDATE remote_tasks SET state=?, updated_at=? WHERE remote_task_id=?`, mapped, nowMs, rt.remote_task_id);
-        this.recordTaskEvent(nowMs, rt.remote_task_id, mapped === "waiting_approval" ? "approval_needed" : "state_changed", { state: mapped });
+      // F4 (REVIEW-213): 'cancelling' is a REMOTE-side intent the Mac has
+      // not yet confirmed -- its own local snapshot can still say
+      // 'running' for several ticks (the cancel command is leased, not
+      // yet delivered/acked). Remapping unconditionally off
+      // mapLocalState() here used to flip 'cancelling' straight back to
+      // 'running' on THIS SAME sync() call's remap pass, undoing the
+      // revoke-while-running loop's own flip above every tick and
+      // re-arming it -- a fresh cancel command, a fresh cancel_requested
+      // event, a fresh revoked_while_running audit row, every ~15s,
+      // forever. Only skip the remap while 'cancelling' AND the local
+      // state has not yet resolved to anything terminal; once it has
+      // (the Mac's own state finally confirms finished/cancelled/etc,
+      // whether via a normal completion racing the cancel or the cancel
+      // itself landing), let it through so 'cancelling' can actually
+      // resolve.
+      if (rt.state === "cancelling" && !REMOTE_TERMINAL[mapped]) {
+        // still in flight -- nothing to do until the Mac confirms.
+      } else if (mapped !== rt.state) {
+        // ZR2 (ZERO-REVIEW-213-01 item 2): preserve the distinct
+        // 'timed_out' value through this remap, rather than collapsing a
+        // timeout-triggered cancel into the generic 'cancelled' the
+        // underlying local state (and therefore mapLocalState) always
+        // reports once the Mac confirms it stopped.
+        const finalState = mapped === "cancelled" && rt.state === "cancelling"
+          && this.sql.exec<{ n: number }>(
+            `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='timeout_detected'`, rt.remote_task_id).one().n > 0
+          ? "timed_out" : mapped;
+        this.sql.exec(`UPDATE remote_tasks SET state=?, updated_at=? WHERE remote_task_id=?`, finalState, nowMs, rt.remote_task_id);
+        this.recordTaskEvent(nowMs, rt.remote_task_id, finalState === "waiting_approval" ? "approval_needed" : "state_changed", { state: finalState });
       }
       if (t.has_result) {
         const already = this.sql.exec<{ n: number }>(
@@ -944,13 +1002,29 @@ export class HerdrState extends DurableObject<Env> {
       `SELECT remote_task_id, created_at, local_task_id FROM remote_tasks
        WHERE state NOT IN ('finished','verified','failed','cancelled','lost','timed_out','cancelling')`).toArray()) {
       if (nowMs - rt.created_at < caps.max_minutes * 60_000) continue;
-      this.sql.exec(`UPDATE remote_tasks SET state='timed_out', updated_at=? WHERE remote_task_id=?`, nowMs, rt.remote_task_id);
-      this.recordTaskEvent(nowMs, rt.remote_task_id, "timed_out", { max_minutes: caps.max_minutes });
-      if (rt.local_task_id) {
-        this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
-          `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", rt.remote_task_id,
-          JSON.stringify({ local_task_id: rt.local_task_id, reason: "timed_out" }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+      // ZR2 (ZERO-REVIEW-213-01 item 2): a deadline firing used to write
+      // the TERMINAL 'timed_out' state immediately, before the Mac had
+      // confirmed anything actually stopped -- excluded from every later
+      // sync loop (including this very loop's own WHERE clause, and the
+      // command_acks loop's cancel-outcome handling) the instant it was
+      // written. An unspawned task (no local_task_id: nothing is running,
+      // the same "nothing to confirm" case the cancelled_before_delivery
+      // path above already treats as immediately terminal) is the one
+      // case safe to mark 'timed_out' directly; everything else goes
+      // through 'cancelling' like any other cancel, resolved by the
+      // remap loop above once the Mac confirms -- which recovers the
+      // distinct 'timed_out' value from the timeout_detected event
+      // recorded here, rather than losing it to a generic 'cancelled'.
+      if (!rt.local_task_id) {
+        this.sql.exec(`UPDATE remote_tasks SET state='timed_out', updated_at=? WHERE remote_task_id=?`, nowMs, rt.remote_task_id);
+        this.recordTaskEvent(nowMs, rt.remote_task_id, "timed_out", { max_minutes: caps.max_minutes });
+        continue;
       }
+      this.sql.exec(`UPDATE remote_tasks SET state='cancelling', updated_at=? WHERE remote_task_id=?`, nowMs, rt.remote_task_id);
+      this.recordTaskEvent(nowMs, rt.remote_task_id, "timeout_detected", { max_minutes: caps.max_minutes });
+      this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
+        `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", rt.remote_task_id,
+        JSON.stringify({ local_task_id: rt.local_task_id, reason: "timed_out" }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
     }
 
     const due = body.lease && !gate.hold ? this.sql.exec<{ message_id: string; task_id: string; pane_id: string; agent_id: string; label: string;
