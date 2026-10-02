@@ -78,11 +78,16 @@ FAKE_BRIDGE_LOG = TMP / "bridge-calls.jsonl"
 FAKE_BRIDGE_ROW = TMP / "fake-bridge-row.json"
 FAKE_BRIDGE_ROW.write_text(json.dumps({"run_id": "run_fake1", "task_id": "task_fake1", "pane_id": "pane_1", "pane_birth": "birth_1"}))
 FAKE_BRIDGE_RC = TMP / "fake-bridge-rc"
+FAKE_BRIDGE_FIND_SPAWNED = TMP / "fake-bridge-find-spawned.json"  # empty = no matching orphan row
+FAKE_BRIDGE_FIND_SPAWNED.write_text("")
 FAKE_BRIDGE = _fake("fake-registry-bridge.sh", f"""
 printf '%s\\n' "$*" >> {FAKE_BRIDGE_LOG}
 rc=$(cat {FAKE_BRIDGE_RC} 2>/dev/null || echo 0)
 case "$1" in
   set-remote-id|read|read-by-remote) [ "$rc" = 0 ] && cat {FAKE_BRIDGE_ROW} ;;
+  find-spawned)
+    if [ -s {FAKE_BRIDGE_FIND_SPAWNED} ]; then cat {FAKE_BRIDGE_FIND_SPAWNED}; exit 0; else exit 1; fi
+    ;;
 esac
 exit "$rc"
 """)
@@ -209,6 +214,7 @@ class StartAccepted(unittest.TestCase):
         FAKE_SPAWN_OUT.write_text("0")
         FAKE_BRIDGE_RC.write_text("0")
         FAKE_BRIDGE_LOG.write_text("")
+        FAKE_BRIDGE_FIND_SPAWNED.write_text("")
         shutil.rmtree(WT_ROOT, ignore_errors=True)
 
     def test_happy_path_accepted(self):
@@ -321,6 +327,7 @@ class ResumeCommand(unittest.TestCase):
         FAKE_SPAWN_OUT.write_text("0")
         FAKE_BRIDGE_RC.write_text("0")
         FAKE_BRIDGE_LOG.write_text("")
+        FAKE_BRIDGE_FIND_SPAWNED.write_text("")
         shutil.rmtree(WT_ROOT, ignore_errors=True)
         self.wt = WT_ROOT / "knowledge-base" / "remote/abc12345"
         self.wt.mkdir(parents=True)
@@ -378,20 +385,17 @@ class ResumeCommand(unittest.TestCase):
         self.assertEqual(out["local_task_id"], "task_fake1")
         self.assertIn("set-deadline", FAKE_BRIDGE_LOG.read_text())
 
-    def test_resume_crash_with_a_stale_identity_in_the_reused_worktree_never_cancels_the_wrong_task(self):
-        # R3-3: _resume REUSES the parent's worktree (unlike _start, which
-        # always gets a fresh one). If spawn-task.sh hangs/crashes before
-        # ever rewriting identity.json for THIS attempt, the best-effort
-        # cleanup's cold _read_identity(wt) would previously trust whatever
-        # identity.json already sat there -- here, a DIFFERENT, still-live
-        # task's own ids, left over from whatever spawned into this
-        # worktree before. Cancelling on that read would cancel the wrong
-        # agent. The fix cross-checks the read-back run_id/task_id against
-        # the registry's own row for the remote_task_id we were actually
-        # trying to resume (read-by-remote) before ever calling cancel.
-        (self.wt / ".handoffs").mkdir(parents=True, exist_ok=True)
-        (self.wt / ".handoffs" / "identity.json").write_text(
-            json.dumps({"run_id": "run_STALE", "task_id": "task_STALE", "pane_id": "pane_STALE"}))
+    def test_resume_crash_before_identity_is_written_looks_up_find_spawned_and_cancels_the_returned_row(self):
+        # R3-3/R4-1: a spawn timeout/crash before identity.json is ever
+        # written for THIS attempt must not go looking at identity.json at
+        # all (worker-writable, and on a REUSED worktree it may hold a
+        # different task's stale ids) -- it must ask the registry itself,
+        # by worktree + branch + a since-floor, for the row THIS attempt
+        # just registered. This only proves the WIRING (right subcommand,
+        # right args, cancels whatever the registry says); the real
+        # worktree/branch/created_at matching semantics are proved against
+        # the REAL registry-bridge.sh in verify-tasks-e2e.py, not this fake.
+        FAKE_BRIDGE_FIND_SPAWNED.write_text(json.dumps({"run_id": "run_fake1", "task_id": "task_fake1"}))
         old_spawn = tsk.SPAWN_TASK
         tsk.SPAWN_TASK = str(TMP / "does-not-exist-r33.sh")
         try:
@@ -400,18 +404,18 @@ class ResumeCommand(unittest.TestCase):
             tsk.SPAWN_TASK = old_spawn
         self.assertEqual(out["outcome"], "failed")
         log = FAKE_BRIDGE_LOG.read_text()
-        self.assertIn("read-by-remote rtask_20261002T000000Z_deadbeef", log)
-        self.assertNotIn("cancel run_STALE task_STALE", log)
+        self.assertIn("find-spawned", log)
+        self.assertIn("remote/abc12345", log)  # the branch we tried to resume
+        self.assertIn(str(self.wt), log)       # the (possibly reused) worktree
+        self.assertIn("rtask_20261002T000000Z_deadbeef", log)  # expected_remote_task_id
+        self.assertIn("cancel run_fake1 task_fake1", log)
 
-    def test_resume_crash_with_a_matching_identity_in_the_reused_worktree_still_cancels(self):
-        # Same crash, but identity.json in the reused worktree genuinely
-        # belongs to what we just tried to resume (matches the registry
-        # row read-by-remote would return) -- the cross-check must not
-        # turn into a no-op for the LEGITIMATE case, or N1's whole point
-        # (never leave a post-spawn-failure pane uncancelled) regresses.
-        (self.wt / ".handoffs").mkdir(parents=True, exist_ok=True)
-        (self.wt / ".handoffs" / "identity.json").write_text(
-            json.dumps({"run_id": "run_fake1", "task_id": "task_fake1", "pane_id": "pane_1"}))
+    def test_resume_crash_with_no_matching_registry_row_is_a_safe_no_op(self):
+        # find-spawned returning nothing (e.g. spawn-task.sh crashed before
+        # ever calling register_task) must never fall back to trusting
+        # identity.json -- there is genuinely nothing registered yet, so no
+        # cancel is issued.
+        FAKE_BRIDGE_FIND_SPAWNED.write_text("")
         old_spawn = tsk.SPAWN_TASK
         tsk.SPAWN_TASK = str(TMP / "does-not-exist-r33b.sh")
         try:
@@ -419,7 +423,7 @@ class ResumeCommand(unittest.TestCase):
         finally:
             tsk.SPAWN_TASK = old_spawn
         self.assertEqual(out["outcome"], "failed")
-        self.assertIn("cancel run_fake1 task_fake1", FAKE_BRIDGE_LOG.read_text())
+        self.assertNotIn("cancel ", FAKE_BRIDGE_LOG.read_text())
 
 
 class Robustness(unittest.TestCase):

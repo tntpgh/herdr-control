@@ -983,6 +983,33 @@ read_task_by_remote_id() {
   _sql "$(_task_json_select) WHERE remote_task_id=$(_sq "$1") LIMIT 1;" 2>/dev/null
 }
 
+# R4-1 (round-4 security review): tasks.py's post-spawn-failure cleanup must
+# find the row a crashed/timed-out spawn just registered WITHOUT trusting
+# worker-writable identity.json, and WITHOUT requiring remote_task_id to
+# already be stamped -- register_task runs long before the caller stamps
+# remote_task_id (set_task_remote_id), so a timeout/crash in that window
+# left the row unstamped and read_task_by_remote_id could never find it,
+# bringing back the very orphan this cleanup exists to prevent.
+#
+# Keyed instead on worktree + branch (both decided by the CALLER before
+# spawn-task.sh ever runs, never worker-writable) and a created_at floor the
+# caller captures immediately before its own spawn attempt -- a stale row
+# from an EARLIER occupant of a reused worktree (_resume's case) has an
+# OLDER created_at and can never match, so this is safe even when a worktree
+# is reused. remote_task_id must be empty (not yet stamped, the normal case
+# this exists for) or equal to the caller's own expected id (an already
+# partially-stamped retry of the SAME attempt) -- never a DIFFERENT,
+# already-stamped task's id. Only a non-terminal state is eligible: a row
+# already completed/failed/cancelled/lost needs no cleanup.
+task_for_orphan_cleanup() {             # worktree branch since_iso expected_remote_task_id -> json or empty
+  registry_init || return 1
+  _sql "$(_task_json_select) WHERE worktree=$(_sq "$1") AND branch=$(_sq "$2")
+    AND created_at >= $(_sq "$3")
+    AND state IN ('starting','running','blocked')
+    AND (remote_task_id='' OR remote_task_id=$(_sq "$4"))
+    ORDER BY created_at DESC LIMIT 1;" 2>/dev/null
+}
+
 # append_event <run_id> <task_id> <type> [payload_json] [event_id]
 #
 # Supplying event_id makes the append IDEMPOTENT — the UNIQUE constraint turns

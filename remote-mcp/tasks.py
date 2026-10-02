@@ -171,38 +171,43 @@ def _read_identity(wt: Path) -> dict | None:
         return None
 
 
-def _cancel_after_spawn_failure(wt: Path, run_id: str = "", local_task_id: str = "", expected_remote_id: str = "") -> None:
+def _cancel_after_spawn_failure(wt: Path, run_id: str = "", local_task_id: str = "",
+                                 expected_remote_id: str = "", branch: str = "", since: str = "") -> None:
     """N1: every path that returns 'failed' AFTER spawn-task.sh has already
     registered a pane must not leave that agent alive with nothing stopping
     it -- best-effort cancel it now rather than relying only on sweep's
-    deadline fallback (which may be the very write that just failed). A
-    missing run_id/local_task_id (identity.json itself was unreadable) means
-    there is genuinely nothing to key a cancel on; this is then a no-op.
+    deadline fallback (which may be the very write that just failed).
 
-    R3-3: when run_id/local_task_id are not already in hand (the
-    TimeoutExpired/OSError path), this cold-reads identity.json from `wt`.
-    _resume reuses the PARENT's worktree, so if spawn-task.sh hung before
-    ever rewriting that file for THIS attempt, the read returns a STALE
-    identity belonging to a different, possibly still-live task -- cancelling
-    it would be cancelling the wrong agent. Before trusting a cold read,
-    confirm the registry's own row for the remote_task_id we were actually
-    trying to spawn names this exact run_id/task_id; registry-bridge's own
-    cancel re-checks the same thing (defense in depth)."""
+    R3-3/R4-1: a cold read of identity.json (the TimeoutExpired/OSError path)
+    is worker-writable and, on _resume's REUSED worktree, can be the PARENT
+    task's own stale file if spawn-task.sh hung before rewriting it for this
+    attempt -- trusting its run_id/task_id would risk cancelling an unrelated
+    task. But register_task stamps remote_task_id onto the registry row only
+    AFTER a successful spawn returns (set-remote-id, below), so the row this
+    very attempt just registered is NOT YET findable by remote_task_id either
+    (R4-1: an earlier fix that required an exact remote_task_id match left
+    this exact window's orphan uncancelled again). Never read identity.json
+    for this path at all: look the row up in the registry itself, keyed on
+    worktree + branch (both decided by US, before spawn-task.sh ever ran,
+    never worker-writable) + a created_at floor captured right before this
+    attempt's own _spawn() call (so a stale PARENT row, with an OLDER
+    created_at, can never match) + non-terminal state + remote_task_id
+    empty-or-ours (never a DIFFERENT already-stamped task's id).
+    registry-bridge's own cancel re-checks remote_task_id the same way,
+    as defense in depth independent of this lookup."""
     if not run_id or not local_task_id:
-        identity = _read_identity(wt) if wt else None
-        if not identity:
+        if not (wt and branch and since):
             return
-        run_id, local_task_id = identity["run_id"], identity["task_id"]
-        if expected_remote_id:
-            check = _bridge("read-by-remote", expected_remote_id)
-            if check.returncode != 0 or not check.stdout.strip():
-                return
-            try:
-                row = json.loads(check.stdout)
-            except ValueError:
-                return
-            if row.get("run_id") != run_id or row.get("task_id") != local_task_id:
-                return
+        found = _bridge("find-spawned", str(wt), branch, since, expected_remote_id)
+        if found.returncode != 0 or not found.stdout.strip():
+            return
+        try:
+            row = json.loads(found.stdout)
+        except ValueError:
+            return
+        run_id, local_task_id = row.get("run_id", ""), row.get("task_id", "")
+        if not run_id or not local_task_id:
+            return
     _bridge("cancel", run_id, local_task_id, "post_spawn_setup_failed", expected_remote_id)
 
 
@@ -364,10 +369,11 @@ def _start(cmd: dict) -> dict:
         run_id, local_task_id = identity["run_id"], identity["task_id"]
     else:
         brief = _write_brief(mode, mcfg, objective, remote_id)
+        spawn_since = _now_iso()
         try:
             proc = _spawn(root, branch, mcfg, brief)
         except (subprocess.TimeoutExpired, OSError) as exc:
-            _cancel_after_spawn_failure(wt, expected_remote_id=remote_id)
+            _cancel_after_spawn_failure(wt, expected_remote_id=remote_id, branch=branch, since=spawn_since)
             return {"command_id": cid, "outcome": "failed",
                     "detail": f"spawn-task.sh crashed or did not finish in time: {exc}"[:300]}
         if proc.returncode != 0:
@@ -375,7 +381,7 @@ def _start(cmd: dict) -> dict:
                     "detail": f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:200]}"}
         identity = _read_identity(wt)
         if not identity:
-            _cancel_after_spawn_failure(wt, expected_remote_id=remote_id)
+            _cancel_after_spawn_failure(wt, expected_remote_id=remote_id, branch=branch, since=spawn_since)
             return {"command_id": cid, "outcome": "failed", "detail": "spawned, but identity.json was unreadable"}
         run_id, local_task_id = identity["run_id"], identity["task_id"]
     stamped = _bridge("set-remote-id", run_id, local_task_id, remote_id)
@@ -467,10 +473,11 @@ def _resume(cmd: dict) -> dict:
         return refuse(f"too_many_today on the Mac (max {caps['max_per_day']}/day)")
 
     brief = _write_brief(mode, mcfg, "(resumed -- see the follow-up note below, if any)", remote_id, follow_up)
+    spawn_since = _now_iso()
     try:
         proc = _spawn(root, branch, mcfg, brief)
     except (subprocess.TimeoutExpired, OSError) as exc:
-        _cancel_after_spawn_failure(wt, expected_remote_id=remote_id)
+        _cancel_after_spawn_failure(wt, expected_remote_id=remote_id, branch=branch, since=spawn_since)
         return {"command_id": cid, "outcome": "failed",
                 "detail": f"spawn-task.sh crashed or did not finish in time: {exc}"[:300]}
     if proc.returncode != 0:
@@ -478,7 +485,7 @@ def _resume(cmd: dict) -> dict:
                 "detail": f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:200]}"}
     identity = _read_identity(wt)
     if not identity:
-        _cancel_after_spawn_failure(wt, expected_remote_id=remote_id)
+        _cancel_after_spawn_failure(wt, expected_remote_id=remote_id, branch=branch, since=spawn_since)
         return {"command_id": cid, "outcome": "failed", "detail": "resumed, but identity.json was unreadable"}
     run_id, local_task_id = identity["run_id"], identity["task_id"]
     stamped = _bridge("set-remote-id", run_id, local_task_id, remote_id)

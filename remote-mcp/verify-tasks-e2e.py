@@ -198,6 +198,77 @@ check("`herdr pane list` was attempted", "pane list" in herdr2_calls, herdr2_cal
 check("`herdr pane close` was NEVER attempted when jq could not parse a rc=0 list (R3-6, no fail-open)",
       "pane close" not in herdr2_calls, herdr2_calls)
 
+print("== R4-1: a spawn timeout BEFORE remote_task_id is ever stamped still gets the orphan cancelled (real registry-bridge.sh, real registry) ==")
+# Mirrors spawn-task.sh's own real sequence: register_task() runs long
+# before the caller ever calls set-remote-id -- a crash/timeout in that
+# window must not bring back the pre-R3-3 orphan (M7/N1). _start derives
+# worktree/branch from remote_task_id by a fixed formula, so both are
+# precomputed here to match exactly what _start will itself compute.
+remote_id_r41 = "rtask_20261002T000006Z_0000a41f"
+run_id_r41, task_id_r41 = "run_r41", "task_r41"
+branch_r41 = f"remote/{remote_id_r41.rsplit('_', 1)[-1]}"
+wt_r41 = TMP / "worktrees" / "knowledge-base" / branch_r41
+wt_r41.mkdir(parents=True)
+reg_script = TMP / "register-r41.sh"
+reg_script.write_text(f"""#!/usr/bin/env bash
+set -euo pipefail
+. "{HERE.parent}/lib/run-registry.sh"
+register_task {run_id_r41} {task_id_r41} worker1 cond1 cpane1 cbirth1 pane_r41 birth_r41 \\
+  knowledge-base {wt_r41} remote:r41 {branch_r41} main "" "" menu
+""")
+reg_script.chmod(0o755)
+
+
+def _spawn_registers_then_times_out(root, branch, mcfg, brief):
+    # Simulates spawn-task.sh: register the task for real (remote_task_id
+    # stays empty, exactly as it is until a LATER set-remote-id call), then
+    # hang/crash before ever returning or writing identity.json.
+    reg_out = subprocess.run(["bash", str(reg_script)], capture_output=True, text=True)
+    if reg_out.returncode != 0:
+        raise RuntimeError(f"test setup: register_task failed: {reg_out.stderr}")
+    raise subprocess.TimeoutExpired(cmd="spawn-task.sh", timeout=75)
+
+
+old_spawn_fn = tsk._spawn
+tsk._spawn = _spawn_registers_then_times_out
+try:
+    out_r41 = tsk.process_command({
+        "command_id": "cmd_r41", "op": "start", "remote_task_id": remote_id_r41,
+        "payload": {"repo": "knowledge-base", "mode": "research", "objective": "r41"},
+    })
+finally:
+    tsk._spawn = old_spawn_fn
+check("start returns failed (spawn timed out)", out_r41.get("outcome") == "failed", json.dumps(out_r41))
+row_r41 = registry_row(task_id_r41)
+check("the orphaned row (registered before the timeout, remote_task_id never stamped) IS cancelled",
+      bool(row_r41) and row_r41.get("state") == "cancelled", row_r41)
+
+print("== R4-1: real registry-bridge.sh cancel accepts an UNSTAMPED row (set-remote-id failure window) ==")
+run_id_r41b, task_id_r41b = "run_r41b", "task_r41b"
+branch_r41b = "remote/r41borphan"
+wt_r41b = TMP / "worktrees" / "knowledge-base" / branch_r41b
+wt_r41b.mkdir(parents=True)
+reg_script_b = TMP / "register-r41b.sh"
+reg_script_b.write_text(f"""#!/usr/bin/env bash
+set -euo pipefail
+. "{HERE.parent}/lib/run-registry.sh"
+register_task {run_id_r41b} {task_id_r41b} worker1 cond1 cpane1 cbirth1 pane_r41b birth_r41b \\
+  knowledge-base {wt_r41b} remote:r41b {branch_r41b} main "" "" menu
+""")
+reg_script_b.chmod(0o755)
+reg_out_b = subprocess.run(["bash", str(reg_script_b)], capture_output=True, text=True)
+check("setup: register_task for the never-stamped row succeeded", reg_out_b.returncode == 0, reg_out_b.stderr)
+row_before = registry_row(task_id_r41b)
+check("the freshly-registered row's remote_task_id is genuinely still empty", (row_before or {}).get("remote_task_id", "x") == "")
+bridge_out_r41b = subprocess.run(
+    [tsk.REGISTRY_BRIDGE, "cancel", run_id_r41b, task_id_r41b, "post_spawn_setup_failed", "rtask_whatever_was_expected"],
+    capture_output=True, text=True)
+check("registry-bridge.sh cancel succeeds against an unstamped row (no false refusal)",
+      bridge_out_r41b.returncode == 0, bridge_out_r41b.stderr)
+row_after = registry_row(task_id_r41b)
+check("state is 'cancelled' after cancelling the unstamped row",
+      bool(row_after) and row_after.get("state") == "cancelled", row_after)
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 if failures:

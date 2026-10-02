@@ -14,6 +14,7 @@
 #
 #   registry-bridge.sh read <run_id> <task_id>
 #   registry-bridge.sh read-by-remote <remote_task_id>
+#   registry-bridge.sh find-spawned <worktree> <branch> <since_iso> <expected_remote_task_id>
 #   registry-bridge.sh set-remote-id <run_id> <task_id> <remote_task_id>
 #   registry-bridge.sh set-deadline <run_id> <task_id> <deadline_iso>
 #   registry-bridge.sh set-verified <run_id> <task_id> 0|1 [detail]
@@ -34,6 +35,9 @@ case "$cmd" in
   read-by-remote)
     read_task_by_remote_id "$1"
     ;;
+  find-spawned)
+    task_for_orphan_cleanup "$1" "$2" "$3" "$4"
+    ;;
   set-remote-id)
     set_task_remote_id "$1" "$2" "$3" || exit 1
     read_task "$1" "$2"
@@ -53,11 +57,17 @@ case "$cmd" in
       # run_id/task_id read cold from identity.json in a worktree _resume
       # reused from a PARENT task -- if spawn-task.sh hung before rewriting
       # that file for THIS attempt, the read names a different, possibly
-      # still-live task. Refuse outright rather than trust the caller's
-      # read: this row's OWN remote_task_id must match what was actually
-      # being spawned.
+      # still-live task. Refuse when this row's OWN remote_task_id is a
+      # DIFFERENT, already-stamped task's id.
+      #
+      # R4-1: register_task runs long before the caller ever stamps
+      # remote_task_id (set-remote-id) -- a timeout/crash in that window is
+      # exactly the common case this cleanup exists for, and the row is
+      # legitimately still unstamped ('') then. Refusing on EMPTY brought
+      # back the orphan (no cancel at all); only a NON-EMPTY, DIFFERENT
+      # remote_task_id is a real mismatch worth refusing.
       actual_remote=$(printf '%s' "$row" | jq -r '.remote_task_id // empty')
-      [ "$actual_remote" = "$expected_remote" ] || {
+      [ -z "$actual_remote" ] || [ "$actual_remote" = "$expected_remote" ] || {
         echo "registry-bridge: refusing cancel — $run_id/$task_id's remote_task_id ($actual_remote) does not match the expected $expected_remote" >&2
         exit 1
       }

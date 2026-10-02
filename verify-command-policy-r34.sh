@@ -28,6 +28,19 @@ printf '== the ordinary case: a real, non-symlinked ANSWER.md still allows ==\n'
 out="$(_cp_write_menu_verdict 'Allow tool: write Path: .handoffs/ANSWER.md Content: hi' "$wt" "$manifest")"
 [ "$out" = "allow" ] && ok "plain file (no symlink yet) allows" || bad "expected allow, got: $out"
 
+printf '== R4-2: an existing REGULAR (non-symlink) ANSWER.md still allows, even when\n'
+printf '   the worktree itself sits under a symlinked ancestor path -- the r3-4 test\n'
+printf '   above never actually created the file, so it never exercised this branch;\n'
+printf '   forced under /var explicitly (macOS: /var -> /private/var) rather than\n'
+printf '   relying on $TMPDIR happening to land there ==\n'
+var_work=$(mktemp -d /var/tmp/herdr-r34-XXXXXX); trap 'rm -rf "$work" "$var_work"' EXIT
+var_wt="$var_work/wt"; mkdir -p "$var_wt/.handoffs"
+printf 'already here\n' > "$var_wt/.handoffs/ANSWER.md"
+out="$(_cp_write_menu_verdict 'Allow tool: write Path: .handoffs/ANSWER.md Content: more' "$var_wt" "$manifest")"
+[ "$out" = "allow" ] \
+  && ok "existing regular ANSWER.md under a symlinked worktree ancestor still allows (a second write)" \
+  || bad "expected allow (ordinary file, symlinked ancestor only), got: $out"
+
 printf '== R3-4: ANSWER.md is a symlink escaping to src/ -- must escalate, not allow ==\n'
 ln -s ../src/x "$wt/.handoffs/ANSWER.md"
 out="$(_cp_write_menu_verdict 'Allow tool: write Path: .handoffs/ANSWER.md Content: hi' "$wt" "$manifest")"

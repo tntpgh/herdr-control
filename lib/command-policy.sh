@@ -3821,10 +3821,21 @@ _cp_write_menu_verdict() {
       # somewhere else entirely while `rel` still looks exactly like the
       # one safe path. Refuse when the real, symlink-resolved location
       # differs from the lexical one.
+      #
+      # R4-2: comparing against the LEXICAL `abs` false-escalated every
+      # write to an ORDINARY, already-existing ANSWER.md whenever any
+      # component of the worktree's own path is itself a symlink (macOS
+      # /var -> /private/var, /tmp -> /private/tmp) -- realpath resolves
+      # that too, so `real` would legitimately differ from the unresolved
+      # `abs` with no symlink anywhere near ANSWER.md itself. Resolve the
+      # worktree root the SAME way and compare against ITS real path plus
+      # `rel`, so only a symlink inside the write target (not the
+      # worktree's own ancestor path) can cause a mismatch.
       if [ -e "$wt/$rel" ] || [ -L "$wt/$rel" ]; then
-        local real
+        local real real_wt
         real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt/$rel" 2>/dev/null)"
-        if [ -z "$real" ] || [ "$real" != "$abs" ]; then
+        real_wt="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt" 2>/dev/null)"
+        if [ -z "$real" ] || [ -z "$real_wt" ] || [ "$real" != "$real_wt/$rel" ]; then
           printf 'escalate:this task'"'"'s one allowed .handoffs file is a symlink to somewhere else — remains human-only'
           return 0
         fi
