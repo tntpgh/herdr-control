@@ -40,6 +40,18 @@ Scopes:
   for a token granted while it was on. The Mac has its own switch: the
   publisher refuses every leased message unless its environment has
   `HERDR_MCP_MESSAGING=1`, which only `install.sh --remote-mcp-messaging` sets.
+- `herdr:task.start` — `start_task` in research mode (read-only, no git
+  writes), plus reading that task's own answer/events. `herdr:task.implement`
+  — `start_task` in implement mode (commits and pushes its own branch); a
+  separate tick so research can be granted without implement. `herdr:task.cancel`
+  — `cancel_task` and `resume_task` for a task this connection started. All
+  three exist only while the Worker var `TASKS_ENABLED` is `"true"` (same
+  all-or-nothing gate as `MESSAGING_ENABLED`: off hides them from the consent
+  page and the AS metadata, and the Durable Object refuses every task tool
+  even for a token granted while it was on). The Mac has its own switch:
+  `HERDR_MCP_TASKS=1`, set only by `install.sh --remote-mcp-tasks`; `list_capabilities`
+  reports `mac_enabled` so a client can tell "off on the Worker" from "off on
+  the Mac" before ever calling `start_task`.
 
 Messaging was off for the first connection and turned on as its own decision.
 Turning it on, in order:
@@ -56,6 +68,25 @@ Turning it on, in order:
 Turning it off: `"false"` + redeploy (queued messages are cancelled on the
 next sync), and `./install.sh --apply --remote-mcp` (Mac switch off). Either
 alone stops delivery.
+
+Tasks were off for the first connection too. Turning them on, in order:
+
+1. `TASKS_ENABLED="true"` (in `wrangler.jsonc`), merged, then a redeploy
+   through `provision.sh --apply`; `/healthz` must show `tasks_enabled:true`
+   and the merged commit;
+2. `./install.sh --apply --remote-mcp-tasks` on the Mac (also sets
+   `remote-mcp/task-allowlist.json`'s repos/modes/caps — edit that file, not
+   a hand-duplicated table, to change what a task can reach);
+3. a fresh consent that ticks `herdr:task.start` and/or `herdr:task.implement`
+   and `herdr:task.cancel` deliberately (never pre-ticked).
+
+Turning tasks off: `"false"` + redeploy (every queued start/resume command is
+cancelled on the next sync, a queued `cancel` still goes through, and a task
+already running on the Mac is NOT killed by this alone — see kill switches
+below), and `./install.sh --apply --remote-mcp` (Mac switch off: the Mac
+refuses every future leased start/resume, but a task already running keeps
+running until its own deadline backstop force-cancels it, same as a task
+that outran `max_minutes`).
 
 Review finding M1 (a permission menu raised during `send-to-agent.sh`'s ~1 s
 typing check received the typed text) is fixed: the prompt is re-checked as
@@ -75,7 +106,7 @@ Public and unauthenticated, so it can be checked before anyone connects:
 ```
 curl -s https://herdr-mcp.teamthurber.com/healthz
 {"service":"herdr-mcp","mcp":"https://herdr-mcp.teamthurber.com/mcp","auth":"OAuth 2.1 + PKCE",
- "build_sha":"<commit>","messaging_enabled":false,"scopes_offered":["herdr:read"]}
+ "build_sha":"<commit>","messaging_enabled":false,"tasks_enabled":false,"scopes_offered":["herdr:read"]}
 ```
 
 `build_sha` is the commit `provision.sh` deployed; it refuses to deploy from a
@@ -98,9 +129,17 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
 | `list_tasks` | read | `filter` active (default)\|attention\|done\|all, `project?`, `updated_since?` ISO, `limit` 1–100 (50) | tasks newest first: stable `task_id`, label, project, state, `created_at`/`updated_at`/`completed_at`, closure, `messageable` |
 | `get_task` | read | `task_id` | task, its agent, its blockers |
 | `list_blockers` | read | — | permission prompts / stalls: kind, tool, redacted summary (≤240 chars), since |
-| `get_task_result` | read | `task_id`, `offset` (0), `max_chars` 1–16000 (4000) | closure reason/proof + `.handoffs/PROOF.md` page: `total_chars`, `next_offset`, `sha256`, `source_mtime` |
+| `get_task_result` | read | `task_id`, `path` (`.handoffs/PROOF.md`), `offset` (0), `max_chars` 1–16000 (4000) | closure reason/proof + a paged, redacted file: `total_chars`, `next_offset`, `sha256`, `source_mtime` |
 | `get_message_status` | read or message | `message_id` | queued\|delivering\|delivered\|refused\|failed\|expired + detail (only your own messages) |
 | `send_message` | message (listed only when enabled) | `target` (task_id, agent_id, or task label), `text` | `message_id`, status `queued`, resolved target |
+| `list_capabilities` | read | — | what `start_task` can do right now: `mac_enabled`, allow-listed `repos`, each mode's git/secrets/write policy, today's `caps` — from the Mac's own `task-allowlist.json`, never a hand-duplicated table |
+| `start_task` | task.start (research) or task.implement | `repo` (allow-listed), `mode` research\|implement, `objective` ≤4000 chars | `task_id` immediately, state `queued`, before the Mac has acted |
+| `get_task_answer` | read | `task_id` | state, mode, repo, objective, `progress` (recent events), `artifacts` (every `.handoffs/` file synced, size+sha256), `local_task` (incl. `verified`), `latest_reply` (the omp session's own last turn), and once ready, `answer` = `.handoffs/ANSWER.md` |
+| `follow_up` | message | `task_id`, `text` | = `send_message` addressed by remote `task_id`; refused if the task was never actually spawned |
+| `cancel_task` | task.cancel | `task_id` | new state (`cancelled` if never spawned, else `cancelling`); refused if already terminal |
+| `resume_task` | task.cancel | `task_id`, `text?` | re-enters the same worktree/branch as a brand new `task_id` (only a terminal task can be resumed), linked via `parent_task_id` |
+| `list_events` | read | `since_cursor` (0), `limit` 1–500 (100) | the global event feed since that cursor: `task_started`, `state_changed`, `approval_needed`, `capability_probe`, `answer_ready`, `finished`, `verified`, `failed`, `cancelled`, `timed_out`, `disconnected`/`reconnected` |
+| `wait_for_events` | read | `since_cursor` (0), `timeout_s` 1–25 (20) | holds the call open until a new event lands or `timeout_s` elapses (true server push is not possible over Streamable HTTP; poll this instead of `list_events` in a tight loop) |
 
 `tools/list` on the live server is the authoritative JSON Schema.
 
@@ -140,6 +179,57 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
    Each outcome is saved as soon as it is known, and delivered ids are kept
    for a day, so a crash before the ack never types a message twice.
 
+### Task rules (server-side, then re-checked on the Mac)
+
+1. `start_task` needs `herdr:task.start` for `mode: research`, or
+   `herdr:task.implement` for `mode: implement` — two separate scopes so
+   research can be granted without implement; `cancel_task` and
+   `resume_task` need `herdr:task.cancel`. `follow_up` is `send_message`
+   under the covers (`herdr:message`).
+2. `repo` must be in the Mac's own allow-listed `repos` (`list_capabilities`
+   shows it); `connection.state` must not be `disconnected`/`never_connected`;
+   `task_config.mac_enabled` must be true (the Mac's own `HERDR_MCP_TASKS`
+   switch, independent of the Worker's `TASKS_ENABLED`).
+3. Caps (today: 4 concurrent, 40/day, 60 min/task, from the Mac's
+   `task-allowlist.json`, enforced on both sides): a 5th concurrent start, or
+   one past the daily count, is refused `too_many_concurrent`/`too_many_today`
+   before anything is queued. A task that outruns `max_minutes` is cancelled
+   automatically (`timed_out`), its pane closed the same way `cancel_task`
+   closes one.
+4. `objective` (and a `resume_task` follow-up `text`) is sanitized the same
+   way a message is (NFKC, invisible/format characters to spaces, every
+   bracket shape to `(`/`)`, `@` to fullwidth `＠`) before it is ever stored —
+   including collapsing to one line, the same as a message, since
+   invisible/format characters are `\p{C}`, which includes newlines. It is
+   embedded as a fenced UNTRUSTED block in the spawned worker's own
+   SPEC.md, never typed into a terminal composer.
+5. Modes (`lib/task-manifest.sh`): **research** — git `none`, writes only
+   `.handoffs/**`, the read-only credential vault, must run end to end with
+   no approval escalation. **implement** — git `push-own-branch` only (never
+   merge, never main, never deploy), may open a draft PR. Neither the
+   objective nor a follow-up is ever treated as an approval; what the
+   objective asks for is work, not permission.
+6. Lifecycle states shown to a client: `queued`, `starting`, `running`,
+   `waiting_approval` (a live permission prompt), `blocked` (something else),
+   `finished` (its `completion_event` landed), `verified`, `failed`,
+   `cancelled`, `lost`, `timed_out`. `verified` = `finished` and its mode's
+   check passed: research → `.handoffs/ANSWER.md` exists with ≥1 source link;
+   implement → the branch named in its closure event is pushed and its head
+   sha matches. A finished research task is auto-closed
+   (`close-done-workers.sh --task=<id> --apply`); a cancelled/timed-out
+   task's pane is closed and its state set — nothing is left `running` with
+   no pane.
+7. **At delivery**, exactly like a message: a queued start/cancel/resume is
+   cancelled before the Mac ever sees it if tasks are now off (Worker or Mac
+   switch), the requester has left the allowlist, or no longer holds a live
+   grant with the scope that command's mode needed (revoked, expired,
+   re-consented without it).
+8. A real capability probe (never a guess) is recorded on every start:
+   `secrets_granted` (was `--secrets` passed to `spawn-task.sh`) and, for
+   `knowledge-base`, `kb_reachable` (a plain HTTPS reachability check,
+   **never** a credential value) — both land in the task's own event feed
+   (`capability_probe`) and in `get_task_answer`.
+
 ### Audit and limits
 
 Every tool call (allowed or refused, including calls the MCP SDK rejects
@@ -156,12 +246,16 @@ rows, so a loop or a leaked token cannot grow storage.
 ## What leaves the Mac
 
 Per task: id, run id, label, project, repo **name**, branch, state, times,
-closure reason/proof, pane id, terminal id. Per agent: ids, workspace, kind,
+closure reason/proof, pane id, terminal id, and (once a task is remote) its
+`remote_task_id`/`verified`/`verify_detail`. Per agent: ids, workspace, kind,
 status. Blockers: tool + a redacted 240-char summary. Results: each task
-worktree's `.handoffs/PROOF.md` (a single-link regular file, opened without
-following symlinks), redacted in full and then cut to 64 KB, only from
-worktrees under `~/.herdr/worktrees` or `~/Code`. **Never**: cwd, screen
-contents, prompt ids, the hub, the registry file, secrets files.
+worktree's `.handoffs/*` files (`.handoffs/PROOF.md`, `.handoffs/ANSWER.md`,
+a remote task's own synced artifacts — each a single-link regular file,
+opened without following symlinks), redacted in full and then cut to 64 KB,
+only from worktrees under `~/.herdr/worktrees` or `~/Code`. **Never**: cwd,
+screen contents, prompt ids, the hub, the registry file, secrets files, or a
+credential value from the capability probe (only booleans: was a secret
+grant passed, was KB reachable).
 
 Redaction (`publisher.py` `REDACTIONS`) removes common credential shapes. It
 is a ceiling, not a guarantee, and it does not detect client names or
@@ -184,7 +278,11 @@ ChatGPT ([OpenAI: connect and test](https://developers.openai.com/plugins/deploy
 3. The sign-in opens Google via Cloudflare Access. Only an `ALLOWED_EMAILS`
    account can finish it; with messaging off the consent page offers read only
    → **Allow**.
-4. Check: the discovered tools are the seven read tools (no `send_message`).
+4. Check: the discovered tools are the eleven read tools — the original
+   seven plus `list_capabilities`, `get_task_answer`, `list_events`,
+   `wait_for_events` (always offered; they degrade gracefully when tasks are
+   off rather than disappearing, same as `get_status`'s `message_limits`) —
+   with no `send_message`/`follow_up`/`start_task`/`cancel_task`/`resume_task`.
    In a new chat, add the connection and ask for the fleet status; it should
    call `get_status` and report `connection.state`.
 
@@ -223,15 +321,23 @@ public internet.
   route `/admin/grants` is signed with `INGEST_KEY` (same HMAC, skew and
   nonce rules as `/ingest/sync`; no user token reaches it) and audits every
   call as `admin_list` / `admin_revoke`. The grant's tokens stop working at
-  once and anything it queued is cancelled before delivery on the next sync.
-- **Kill switches**, least to most: set `MESSAGING_ENABLED` to `"false"` and
-  redeploy (new sends are refused and every queued message is cancelled on
-  the next sync; reads continue); unload the
-  publisher (`launchctl bootout gui/$(id -u)/com.herdr-control.remote-mcp` →
-  clients see `disconnected`, nothing is delivered); remove the email from
-  `ALLOWED_EMAILS` and the Access policy (its grants stop on the next request,
-  its queued messages are cancelled, and it is revoked on the next refresh);
-  rotate `INGEST_KEY`; `npx wrangler delete herdr-mcp`.
+  once and any queued start/resume of theirs is cancelled before delivery
+  on the next sync (their own pending cancels are exempt and still go
+  through, N4); a task of theirs already running on the Mac keeps running
+  until its own deadline backstop force-cancels it — revoke stops new
+  starts/resumes, not an in-flight one.
+- **Kill switches**, least to most: set `MESSAGING_ENABLED`/`TASKS_ENABLED` to
+  `"false"` and redeploy (new sends/starts are refused and every queued
+  message/command is cancelled on the next sync; a task already running on
+  the Mac keeps running until its own deadline backstop force-cancels it —
+  reads continue); unload the publisher
+  (`launchctl bootout gui/$(id -u)/com.herdr-control.remote-mcp` → clients see
+  `disconnected`, nothing is delivered, and nothing is swept either: a
+  running task just sits there with a stale state, including past its own
+  `max_minutes` deadline, until the publisher is reloaded); remove the email
+  from `ALLOWED_EMAILS` and the Access policy (its grants stop on the next
+  request, its queued messages/commands are cancelled, and it is revoked on
+  the next refresh); rotate `INGEST_KEY`; `npx wrangler delete herdr-mcp`.
 - Open DCR (review I3): anyone can register a client, which costs a KV write
   and grants nothing without an allowlisted sign-in. Add a Cloudflare
   rate-limit rule on `/oauth/register` if it is ever abused.
@@ -252,17 +358,31 @@ All from `remote-mcp/`:
    Cloudflare version, 401/302 boundaries).
 3. After merge: `./install.sh --apply --remote-mcp` (repo root) installs the
    publisher LaunchAgent from the deployed app worktree; its registry entry is
-   thurber-os `launchd/agents.yaml`.
+   thurber-os `launchd/agents.yaml`. `--remote-mcp-messaging` and
+   `--remote-mcp-tasks` are each turned on later, as their own decision (see
+   "Turning it on" above).
 
-Tests: `cd worker && npx vitest run` (two projects: `read-only` = the
-first-deploy configuration, `messaging` = messaging on; OAuth flow, tools,
-scope, throttle and allowlist enforcement in workerd) and
-`python3 remote-mcp/verify-publisher.py` (snapshot, redaction, link and
-envelope handling, delivery re-checks, lost-ack dedup). CI:
-`.github/workflows/remote-mcp.yml`. Security review (two rounds, posted on
-PR #206): round 1 M1–M8, L1–L4, I1, I2 fixed; round 2 approved the read-only
-first connection, N1–N4, N6, N8, N10 fixed; N5 (single-grant revoke) added
-afterwards in `scripts/grants.py` + `/admin/grants`.
+Tests: `cd worker && npx vitest run` (three projects: `read-only` = the
+first-deploy configuration, `messaging` = messaging on, `tasks` = messaging
+and tasks both on; OAuth flow, tools, scope, throttle, allowlist and
+task-lifecycle enforcement in workerd) and `python3
+remote-mcp/verify-publisher.py` (snapshot, redaction, link and envelope
+handling, delivery re-checks, lost-ack dedup, and graceful degradation
+against a genuine pre-v7 registry — the publisher's own registry read never
+triggers `lib/run-registry.sh`'s schema migration) plus `python3
+remote-mcp/verify-tasks.py` (allowlist/caps refusals, objective sanitization,
+start/cancel/resume command processing, verify-research/verify-implement,
+deadline force-cancel — against fake `spawn-task.sh`/`close-done-workers.sh`/
+`registry-bridge.sh` scripts and a scratch sqlite registry, never the live
+one) and `python3 remote-mcp/verify-tasks-e2e.py` (the same command
+pipeline, but through the REAL `registry-bridge.sh`/`lib/run-registry.sh`/
+`close-done-workers.sh` against a scratch `HERDR_RUN_STATE_DIR` — only
+`spawn-task.sh`'s actual pane/tab/agent launch is stubbed, proving tasks.py's
+schema assumptions match what registry migration v7 really produces).
+CI: `.github/workflows/remote-mcp.yml`. Security review (two rounds,
+posted on PR #206): round 1 M1–M8, L1–L4, I1, I2 fixed; round 2 approved the
+read-only first connection, N1–N4, N6, N8, N10 fixed; N5 (single-grant
+revoke) added afterwards in `scripts/grants.py` + `/admin/grants`.
 
 Dependencies: `npm ci` is warning-free and `npm audit` reports 0. The test
 pool (`@cloudflare/vitest-pool-workers` 0.22.0, latest) pins an older

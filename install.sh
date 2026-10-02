@@ -12,6 +12,8 @@
 #   ./install.sh --apply --auth       # also install the bounded-autonomy auth pair (macOS)
 #   ./install.sh --apply --remote-mcp # also install the herdr-mcp publisher (remote-mcp/README.md)
 #   ./install.sh --apply --remote-mcp-messaging # same, with the Mac's messaging switch ON
+#   ./install.sh --apply --remote-mcp-tasks     # same, with the Mac's task-lifecycle switch ON
+#                                      # (start_task/cancel_task/resume_task; remote-mcp/README.md)
 #   ./install.sh --apply --repoint    # ALSO repoint any job already wired at a
 #                                      # different checkout (e.g. an APM-deployed
 #                                      # herdr-ops skill copy) to point at THIS one —
@@ -56,7 +58,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=launchd/agent-lib.sh
 . "$here/launchd/agent-lib.sh"
 
-APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0; REMOTE_MCP_MESSAGING=0
+APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0; REMOTE_MCP_MESSAGING=0; REMOTE_MCP_TASKS=0
 for a in "$@"; do
   case "$a" in
     --apply)   APPLY=1 ;;
@@ -65,6 +67,7 @@ for a in "$@"; do
     --auth)    AUTH=1 ;;
     --remote-mcp) REMOTE_MCP=1 ;;
     --remote-mcp-messaging) REMOTE_MCP=1; REMOTE_MCP_MESSAGING=1 ;;
+    --remote-mcp-tasks) REMOTE_MCP=1; REMOTE_MCP_TASKS=1 ;;
     --repoint) REPOINT=1 ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
@@ -423,6 +426,7 @@ if [ "$REMOTE_MCP" = 1 ]; then
     if deploy_app "${HUB_REV:-origin/main}"; then
       sed -e "s|__REMOTE_MCP_PY__|$HERDR_APP_DIR/remote-mcp/publisher.py|" \
           -e "s|__REMOTE_MCP_MESSAGING__|$REMOTE_MCP_MESSAGING|" \
+          -e "s|__REMOTE_MCP_TASKS__|$REMOTE_MCP_TASKS|" \
           -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.remote-mcp.log|g" \
         "$here/remote-mcp/com.herdr-control.remote-mcp.plist.template" > "$PLIST"
       # Not reload_agent: that verifies a KeepAlive daemon stays up, and a
@@ -434,7 +438,7 @@ if [ "$REMOTE_MCP" = 1 ]; then
         if launchctl bootstrap "$domain" "$PLIST"; then
           sleep 5
           rmcp_exit="$(launchctl print "$domain/com.herdr-control.remote-mcp" 2>/dev/null | awk -F'= ' '/last exit code/ {print $2; exit}')"
-          echo "  remote-mcp publisher loaded (every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off)); first tick last exit code: ${rmcp_exit:-not yet run}"
+          echo "  remote-mcp publisher loaded (every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off)); first tick last exit code: ${rmcp_exit:-not yet run}"
           [ "${rmcp_exit:-0}" = 0 ] || { INSTALL_RC=2; echo "  ! check ~/Library/Logs/com.herdr-control.remote-mcp.log" >&2; }
         else
           INSTALL_RC=2; echo "  ! remote-mcp publisher: bootstrap failed" >&2
@@ -447,7 +451,7 @@ if [ "$REMOTE_MCP" = 1 ]; then
       echo "  ! remote-mcp publisher NOT installed: deploy failed (above)." >&2
     fi
   else
-    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/remote-mcp/publisher.py every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off))"
+    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/remote-mcp/publisher.py every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off))"
   fi
 fi
 

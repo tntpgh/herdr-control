@@ -205,7 +205,13 @@ fi
 # request — can only tighten). Stamped into the worker below as ITS floor,
 # so a child spawn from inside the worktree can tighten further but never
 # loosen past what this spawn was granted.
-eff_posture=$(resolved_posture "$posture_req")
+#
+# R3-1 follow-up: must apply the SAME job-based override cli_for_agent
+# applies internally (lib/agent-profiles.sh posture_want_for_job) --
+# otherwise a research/explore worker's own launch gets --approval-mode
+# always-ask while its STAMPED floor stays `write`, letting any grandchild
+# IT spawns inherit a looser floor than its own parent actually ran at.
+eff_posture=$(resolved_posture "$(posture_want_for_job "$posture_req" "$job")")
 
 # ---- approval posture (menu | hook) -------------------------------------------
 # Validated here, before any worktree/registry/herdr side effect: an invalid
@@ -534,6 +540,30 @@ else
   fi
 fi
 
+# N8 (round-2 security review): research/explore now carry the `write` tool
+# (lib/agent-profiles.sh tools_for_job) but must still write nothing outside
+# .handoffs -- `handoffs_write` names the one file (lib/command-policy.sh
+# _cp_write_menu_verdict) a worker's write tool may target. Merged in HERE,
+# never read from the task's own SPEC.md: manifest_from_spec's validator
+# rejects an unknown key, so a worker cannot forge or widen this by editing
+# its own worktree-writable brief and having a re-spawn "approve" it.
+case "$job" in
+  research|explore)
+    # R3-2: the previous `"${manifest_json:-\{\}}"` kept the backslashes
+    # literal inside double quotes (jq saw `\{\}`, a parse error, and with
+    # no `set -e` here that silently produced empty -- a research/explore
+    # spawn with no manifest block lost handoffs_write and got the broad
+    # any-in-worktree write allow instead of failing closed). Default to a
+    # real empty object, and refuse the spawn outright if jq still fails
+    # rather than let it fall through un-merged.
+    [ -n "$manifest_json" ] || manifest_json='{}'
+    manifest_json="$(printf '%s' "$manifest_json" | jq -c '. + {handoffs_write: "ANSWER.md"}')" || {
+      echo "spawn-task: refusing — could not merge handoffs_write into the manifest for job class '$job'" >&2
+      exit 1
+    }
+    ;;
+esac
+
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
 # Whether THIS call creates the workspace decides the root-tab cleanup below.
 ws_existed=0
@@ -544,43 +574,6 @@ tab=$(printf '%s' "$tc" | jq -r '.result.tab.tab_id // empty')
 pane=$(printf '%s' "$tc" | jq -r '.result.root_pane.pane_id // empty')
 pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 [ -n "$tab" ] && [ -n "$pane" ] || { echo "spawn-task: tab create failed in $ws" >&2; exit 1; }
-
-if ! register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
-  "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk" "$project_label" "$manifest_json" "$approval_req"; then
-  # A menu worker has always launched anyway (its approvals still gate it); a
-  # hook worker runs with --auto-approve, so it is never launched unregistered.
-  if [ "$approval_req" = hook ]; then
-    echo "spawn-task: registration failed — a hook-approval worker is never launched without its registry row" >&2
-    exit 1
-  fi
-fi
-
-# ---- claim the worktree on the worker's behalf ------------------------------
-# A spawned worker will never type `claim.sh take`, and neither will anyone
-# else on its behalf — so without this, the ownership view added to
-# attention.sh reports every worker task as UNOWNED forever, which is
-# technically true and permanently uninformative. Claiming here is what makes
-# that list DISCRIMINATING: owned work drops off it, and what remains is
-# genuinely orphaned.
-#
-# The scope is the WORKTREE, not the repo root, and that distinction is the
-# point: two workers on two branches of the same repo are legitimately
-# concurrent (that is the whole spawn-task pattern), and claiming $root would
-# make them collide with each other and with the operator's own main checkout.
-# Worktree paths are disjoint by construction, so the claim is precise.
-#
-# Best-effort: a claims failure must never stop a spawn. The worker is already
-# registered by this point, and a missing claim degrades to exactly the
-# pre-claims behaviour (reported unowned) rather than losing the task.
-#
-# No explicit release on completion: the TTL is the reaper, and the state a
-# terminal task leaves behind is already recorded in the registry. An explicit
-# release would only narrow the window, and it would need a handler on every
-# exit path including the ones that crash — which is the failure mode TTL
-# exists to make unnecessary.
-if [ -x "$here/claim.sh" ]; then
-  HERDR_PANE_ID="$pane" "$here/claim.sh" take "$wt" -m "$label" >/dev/null 2>&1 || true
-fi
 
 # ---- hand the worker its own identity --------------------------------------
 # Measured 2026-09-21 across three workers and ~12 wasted round trips: a
@@ -627,6 +620,43 @@ jq -n \
     # told its ids by hand, which is exactly the status quo this replaces.
     echo "spawn-task: warning — could not write $(handoff_identity "$wt")" >&2
   }
+
+if ! register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
+  "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk" "$project_label" "$manifest_json" "$approval_req"; then
+  # A menu worker has always launched anyway (its approvals still gate it); a
+  # hook worker runs with --auto-approve, so it is never launched unregistered.
+  if [ "$approval_req" = hook ]; then
+    echo "spawn-task: registration failed — a hook-approval worker is never launched without its registry row" >&2
+    exit 1
+  fi
+fi
+
+# ---- claim the worktree on the worker's behalf ------------------------------
+# A spawned worker will never type `claim.sh take`, and neither will anyone
+# else on its behalf — so without this, the ownership view added to
+# attention.sh reports every worker task as UNOWNED forever, which is
+# technically true and permanently uninformative. Claiming here is what makes
+# that list DISCRIMINATING: owned work drops off it, and what remains is
+# genuinely orphaned.
+#
+# The scope is the WORKTREE, not the repo root, and that distinction is the
+# point: two workers on two branches of the same repo are legitimately
+# concurrent (that is the whole spawn-task pattern), and claiming $root would
+# make them collide with each other and with the operator's own main checkout.
+# Worktree paths are disjoint by construction, so the claim is precise.
+#
+# Best-effort: a claims failure must never stop a spawn. The worker is already
+# registered by this point, and a missing claim degrades to exactly the
+# pre-claims behaviour (reported unowned) rather than losing the task.
+#
+# No explicit release on completion: the TTL is the reaper, and the state a
+# terminal task leaves behind is already recorded in the registry. An explicit
+# release would only narrow the window, and it would need a handler on every
+# exit path including the ones that crash — which is the failure mode TTL
+# exists to make unnecessary.
+if [ -x "$here/claim.sh" ]; then
+  HERDR_PANE_ID="$pane" "$here/claim.sh" take "$wt" -m "$label" >/dev/null 2>&1 || true
+fi
 
 # ---- close an empty default root tab, if this call just created one --------
 # ensure-workspace.sh's own comment already names this gap: "herdr

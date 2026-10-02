@@ -25,6 +25,11 @@
     // redeploy to turn it off: new sends are refused and every queued message is
     // cancelled on the next sync. The Mac has its own switch (install.sh).
     "MESSAGING_ENABLED": "true",
+    // Remote task lifecycle (start_task/cancel_task/resume_task). Deliberately
+    // "false" until a separate security review signs off and the conductor
+    // flips it + redeploys; the Mac has its own switch, HERDR_MCP_TASKS
+    // (install.sh --remote-mcp-tasks), and either off refuses/cancels.
+    "TASKS_ENABLED": "false",
     // The commit this deploy was built from. provision.sh overrides it with
     // `--var BUILD_SHA:<sha>` from a clean, pushed tree; /healthz reports it.
     "BUILD_SHA": "unstamped"

@@ -295,6 +295,21 @@ git -C "$nu_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "loc
 out=$(bash "$here/close-done-workers.sh" --task=taskN 2>&1)
 printf '%s' "$out" | grep -q 'HOLD.*1 commit(s) exist only here' && ok "a no-upstream branch with a local-only commit is still held" || bad "local-only commit not held: $out"
 
+printf '== no upstream AND no remote-tracking ref at all: closable when nothing exists beyond the task'"'"'s own recorded trunk ==\n'
+rt_wt=$(mktemp -d)/wt-trunk
+git init -q -b main "$rt_wt"
+git -C "$rt_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+mkdir -p "$rt_wt/.handoffs"; printf '*\n' > "$rt_wt/.handoffs/.gitignore"
+git -C "$rt_wt" switch -q -c remote/research-1   # no refs/remotes/origin/* at all -- a research task never fetches/pushes
+register_task runT1 taskT1 w c cp cb pT1 birthT1 "$rt_wt" "$rt_wt" "research:remote/research-1" remote/research-1 main \
+  || bad "register taskT1 failed"
+set_task_state runT1 taskT1 running || bad "taskT1 -> running failed (setup)"
+out=$(bash "$here/close-done-workers.sh" --task=taskT1 2>&1)
+printf '%s' "$out" | grep -q '^  close  pT1' && ok "a branch with no remote tracking but zero commits beyond its recorded trunk is closable" || bad "held a research branch with nothing to lose: $out"
+git -C "$rt_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "research wrote something it should not have"
+out=$(bash "$here/close-done-workers.sh" --task=taskT1 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*1 commit(s) exist only here' && ok "a commit beyond trunk is still held -- trunk-awareness does not weaken the gate" || bad "commit beyond trunk not held: $out"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi

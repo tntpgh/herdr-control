@@ -145,9 +145,9 @@ for j in docs mechanical quick; do
     "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp haiku:low '' $j)" \
     "omp --model haiku --thinking low --tools read,bash,edit,write,grep,glob,todo,eval,wait,ask --approval-mode write"
 done
-check "explore gets no edit/eval/task, keeps ask and web_search" \
+check "explore gets no edit/eval/task, keeps write/ask/web_search, and (R3-1) its tool class also forces strict posture" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp haiku:low '' explore)" \
-  "omp --model haiku --thinking low --tools read,bash,grep,glob,todo,web_search,ask --approval-mode write"
+  "omp --model haiku --thinking low --tools read,bash,write,grep,glob,todo,web_search,ask --approval-mode always-ask"
 check "review keeps every tool (a reviewer may still edit or delegate)" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp opus:high '' review)" \
   "omp --model opus --thinking high --approval-mode write"
@@ -157,15 +157,34 @@ check "an unrecognised class fails OPEN to all tools (a missing tool breaks work
 check "--tools all overrides the class table" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet '' implement all)" \
   "omp --model sonnet --approval-mode write"
-check "an explicit --tools list wins over the class table" \
+check "an explicit --tools list wins over the class table, but (R3-1) posture force is independent of tools" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet '' explore read,bash)" \
-  "omp --model sonnet --tools read,bash --approval-mode write"
+  "omp --model sonnet --tools read,bash --approval-mode always-ask"
 check "claude flavor under omp is trimmed too" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent claude sonnet '' implement)" \
   "omp --model sonnet --models sonnet,openai-codex/gpt-5.5 --tools read,bash,edit,write,grep,glob,todo,eval,wait,ask --approval-mode write"
 check "omc launches the real claude binary: no omp --tools flag" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omc sonnet '' implement)" \
   "claude --model sonnet --permission-mode acceptEdits"
+
+printf '== R3-1 (round-3 security review): research/explore always launch at strict\n'
+printf '   posture, even at the default write floor with no posture requested --\n'
+printf '   previously they got the `write` tool (added in round 2) but ran at\n'
+printf '   `write` posture, which auto-allows every in-worktree write with no menu\n'
+printf '   shown at all, so handoffs_write (lib/command-policy.sh) was never\n'
+printf '   consulted and these classes got unrestricted, unprompted write access ==\n'
+check "explore at the write floor with no posture requested is forced to strict" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet '' explore)" \
+  "omp --model sonnet --tools read,bash,write,grep,glob,todo,web_search,ask --approval-mode always-ask"
+check "research at the write floor with no posture requested is forced to strict" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet '' research)" \
+  "omp --model sonnet --tools read,bash,write,grep,glob,todo,web_search,ask --approval-mode always-ask"
+check "explore at a YOLO floor is still forced to strict (job force beats a loose floor too)" \
+  "$(HERDR_POSTURE_FLOOR=yolo cli_for_agent omp sonnet '' explore)" \
+  "omp --model sonnet --tools read,bash,write,grep,glob,todo,web_search,ask --approval-mode always-ask"
+check "implement (not write-restricted) is unaffected: still just the floor" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet '' implement)" \
+  "omp --model sonnet --tools read,bash,edit,write,grep,glob,todo,eval,wait,ask --approval-mode write"
 
 printf '== model routing unchanged for every job class ==\n'
 for j in plan architect review design implement debug code explore quick mechanical docs weird; do
@@ -368,6 +387,13 @@ printf '%s\n' "$out" | grep -q "secrets   : WITHHELD \[job class 'review'" \
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 explore omp 2>&1)
 printf '%s\n' "$out" | grep -q 'secrets   : WITHHELD' \
   && ok "explore class is withheld by default" || bad "explore class got a credential: $out"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t10 explore omp 2>&1)
+printf '%s\n' "$out" | grep -q 'posture   : strict' \
+  && ok "R3-1 end-to-end: an explore spawn-task.sh dry run reports strict posture" \
+  || bad "R3-1: explore dry-run did not report strict posture: $out"
+printf '%s\n' "$out" | grep -q -- '--approval-mode always-ask' \
+  && ok "R3-1 end-to-end: the launch line itself carries the strict flag" \
+  || bad "R3-1: explore launch missing --approval-mode always-ask: $out"
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 implement omp 2>&1)
 printf '%s\n' "$out" | grep -q 'secrets   : service account' \
   && ok "implement class keeps the credential (the unattended-run case)" || bad "implement lost its credential: $out"

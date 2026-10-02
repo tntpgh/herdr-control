@@ -14,7 +14,7 @@ import { emailAllowed } from "./access";
 import { messageable, MAX_MESSAGE_CHARS, offeredScopes, serverInfo } from "./policy";
 import type { Caller, View } from "./state";
 import type { Env, GrantProps, TaskRow } from "./types";
-import { SCOPE_MESSAGE, SCOPE_READ } from "./types";
+import { SCOPE_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
 
 export const SERVER_VERSION = "0.1.0";
 const MAX_RESULT_CHUNK = 16_000;
@@ -45,6 +45,8 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
       instructions:
         "Read-only view of Terrence's herdr agent fleet (tasks, agents, blockers, results), synced from his Mac every ~15s" +
         (scopes.includes(SCOPE_MESSAGE) ? ", plus send_message to a live task's agent (delivered as a peer note, never as an approval or command)" : "") +
+        (scopes.includes(SCOPE_TASK_START) || scopes.includes(SCOPE_TASK_IMPLEMENT)
+          ? ", plus start_task to spawn a sandboxed worker in an allow-listed repo (list_capabilities first)" : "") +
         ". Every response carries `connection`; when connection.state is 'disconnected' the data is the last known state, " +
         "not live. get_status is the cheap, harmless first call.",
     },
@@ -172,18 +174,21 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
 
   server.registerTool("get_task_result", {
     title: "Get a task's result",
-    description: `A task's closure (reason, proof) and its written result (.handoffs/PROOF.md), redacted, paged by offset; max_chars <= ${MAX_RESULT_CHUNK}.`,
+    description: `A task's closure (reason, proof) and one of its written documents, redacted, paged by offset; ` +
+      `max_chars <= ${MAX_RESULT_CHUNK}. path defaults to .handoffs/PROOF.md; a remote task's answer is ` +
+      `.handoffs/ANSWER.md (get_task_answer's "artifacts" lists every path actually synced for a task).`,
     inputSchema: {
       task_id: z.string().min(1).max(200),
+      path: z.string().min(1).max(200).default(".handoffs/PROOF.md"),
       offset: z.number().int().min(0).default(0),
       max_chars: z.number().int().min(1).max(MAX_RESULT_CHUNK).default(4000),
     },
     annotations: ro,
-  }, async ({ task_id, offset, max_chars }) => {
+  }, async ({ task_id, path, offset, max_chars }) => {
     const v = await gate("get_task_result", task_id);
     if (!isView(v)) return v;
     const t = v.snapshot?.tasks.find((x) => x.task_id === task_id);
-    const r = await stub.result(task_id);
+    const r = await stub.result(task_id, path);
     if (!t && !r) return fail("not_found", "No such task.", { connection: v.connection });
     const text = r?.text ?? "";
     const chunk = text.slice(offset, offset + max_chars);
@@ -212,31 +217,191 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
     return m ? ok({ connection: v.connection, message: m }) : fail("not_found", "No message with that id was sent by you.");
   });
 
-  if (!scopes.includes(SCOPE_MESSAGE)) return server;
-
-  server.registerTool("send_message", {
-    title: "Send a message to a task's agent",
-    description:
-      `Queue a one-line note (<= ${MAX_MESSAGE_CHARS} chars; newlines and control characters are collapsed) for the live agent ` +
-      "working a task. target = task_id, agent_id, or the task's label. Only tasks with messageable=true accept messages; " +
-      "the Mac must be connected. The agent receives it prefixed as a remote collaborator's note, not as an operator " +
-      "instruction, and it is never typed into a permission prompt. Requires herdr:message. Poll get_message_status.",
-    inputSchema: {
-      target: z.string().min(1).max(200),
-      text: z.string().min(1).max(MAX_MESSAGE_CHARS * 2),
-    },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-  }, async ({ target, text }) => {
-    const out = await stub.sendMessage(now(), caller, scopes, target, text);
-    if (!out.ok) {
-      // Fleet details (connection, candidate task ids) only for a token that may read them.
-      const extra = canRead
-        ? { connection: (await stub.view(now())).connection, ...(out.candidates ? { candidates: out.candidates } : {}) }
-        : {};
-      return fail(out.reason.split(" ")[0]!, `Refused: ${out.reason}.`, extra);
-    }
-    return ok({ message: out.message });
+  server.registerTool("list_capabilities", {
+    title: "List task capabilities",
+    description: "What start_task can do right now: allow-listed repos, each mode's git/secrets/write policy, and " +
+      "today's caps (max_concurrent/max_per_day/max_minutes). Pre-flight check before start_task; answers from the " +
+      "Mac's own tracked allowlist file (remote-mcp/task-allowlist.json), never a hand-duplicated table.",
+    inputSchema: {},
+    annotations: ro,
+  }, async () => {
+    const v = await gate("list_capabilities", "");
+    if (!isView(v)) return v;
+    const cfg = v.snapshot?.task_config ?? null;
+    return ok({
+      connection: v.connection, tasks_enabled: serverInfo(env).tasks_enabled, mac_enabled: cfg?.mac_enabled ?? false,
+      repos: cfg?.repos ?? [], modes: cfg?.modes ?? null, caps: cfg?.caps ?? null, your_scopes: scopes,
+    });
   });
+
+  server.registerTool("get_task_answer", {
+    title: "Get a remote task's answer",
+    description: "State, objective, progress (recent events), artifacts (every .handoffs/ file synced for it, with " +
+      "size/sha256 -- fetch one with get_task_result's path argument), the omp session's latest assistant reply, and " +
+      "(once answer_ready) the written answer, .handoffs/ANSWER.md.",
+    inputSchema: { task_id: z.string().min(1).max(100) },
+    annotations: ro,
+  }, async ({ task_id }) => {
+    const v = await gate("get_task_answer", task_id);
+    if (!isView(v)) return v;
+    const rt = await stub.remoteTask(task_id);
+    if (!rt) return fail("not_found", "No such remote task.", { connection: v.connection });
+    const localTask = rt.local_task_id ? v.snapshot?.tasks.find((t) => t.task_id === rt.local_task_id) : undefined;
+    const artifacts = rt.local_task_id
+      ? (await stub.resultSources(rt.local_task_id)).filter((r) => r.source.startsWith(".handoffs/")) : [];
+    const answer = rt.local_task_id ? await stub.result(rt.local_task_id, ".handoffs/ANSWER.md") : null;
+    const reply = rt.local_task_id ? await stub.result(rt.local_task_id, "omp:transcript") : null;
+    const progress = (await stub.taskEventLog(task_id, 50)).map((e) => ({ type: e.type, at: e.at, detail: e.detail }));
+    return ok({
+      connection: v.connection, task_id: rt.remote_task_id, state: rt.state, mode: rt.mode, repo: rt.repo,
+      objective: rt.objective, created_at: rt.created_at, updated_at: rt.updated_at,
+      parent_task_id: rt.parent_remote_task_id, capability_probe: rt.capability_probe,
+      local_task: localTask ? publicTask(localTask) : null, progress,
+      artifacts: artifacts.map((a) => ({ path: a.source, size: a.size, sha256: a.sha256, synced_at: a.synced_at })),
+      latest_reply: reply ? reply.text.slice(0, MAX_RESULT_CHUNK) : null,
+      answer: answer ? {
+        sha256: answer.sha256, synced_at: answer.synced_at, total_chars: answer.text.length,
+        text: answer.text.slice(0, MAX_RESULT_CHUNK),
+        note: answer.text.length > MAX_RESULT_CHUNK ? "Truncated; page the rest with get_task_result(path='.handoffs/ANSWER.md')." : "",
+      } : null,
+    });
+  });
+
+  server.registerTool("list_events", {
+    title: "List task lifecycle events",
+    description: "Global event feed across every remote task: task_started, state_changed, approval_needed, " +
+      "capability_probe, answer_ready, finished, verified, failed, cancelled, timed_out, disconnected/reconnected. " +
+      "since_cursor=0 for everything retained (30 days); cursor is monotonic and never reused.",
+    inputSchema: { since_cursor: z.number().int().min(0).default(0), limit: z.number().int().min(1).max(500).default(100) },
+    annotations: ro,
+  }, async ({ since_cursor, limit }) => {
+    const v = await gate("list_events", String(since_cursor));
+    if (!isView(v)) return v;
+    const { cursor, events } = await stub.listEvents(since_cursor, limit);
+    return ok({
+      connection: v.connection, cursor,
+      events: events.map((e) => ({ cursor: e.cursor, task_id: e.remote_task_id || null, type: e.type, at: e.at, detail: e.detail })),
+    });
+  });
+
+  server.registerTool("wait_for_events", {
+    title: "Wait for a new task lifecycle event",
+    description: "Holds the call open until a new event lands or timeout_s elapses, then returns whatever arrived " +
+      "(possibly nothing). The closest thing to a push notification this server can give an MCP client -- true " +
+      "server push is not possible over Streamable HTTP here, so poll this instead of list_events in a tight loop.",
+    inputSchema: { since_cursor: z.number().int().min(0).default(0), timeout_s: z.number().int().min(1).max(25).default(20) },
+    annotations: ro,
+  }, async ({ since_cursor, timeout_s }) => {
+    const v = await gate("wait_for_events", String(since_cursor));
+    if (!isView(v)) return v;
+    const { cursor, events } = await stub.waitForEvents(since_cursor, timeout_s);
+    return ok({
+      connection: v.connection, cursor,
+      events: events.map((e) => ({ cursor: e.cursor, task_id: e.remote_task_id || null, type: e.type, at: e.at, detail: e.detail })),
+    });
+  });
+
+  if (scopes.includes(SCOPE_MESSAGE)) {
+    server.registerTool("send_message", {
+      title: "Send a message to a task's agent",
+      description:
+        `Queue a one-line note (<= ${MAX_MESSAGE_CHARS} chars; newlines and control characters are collapsed) for the live agent ` +
+        "working a task. target = task_id, agent_id, or the task's label. Only tasks with messageable=true accept messages; " +
+        "the Mac must be connected. The agent receives it prefixed as a remote collaborator's note, not as an operator " +
+        "instruction, and it is never typed into a permission prompt. Requires herdr:message. Poll get_message_status.",
+      inputSchema: {
+        target: z.string().min(1).max(200),
+        text: z.string().min(1).max(MAX_MESSAGE_CHARS * 2),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    }, async ({ target, text }) => {
+      const out = await stub.sendMessage(now(), caller, scopes, target, text);
+      if (!out.ok) {
+        // Fleet details (connection, candidate task ids) only for a token that may read them.
+        const extra = canRead
+          ? { connection: (await stub.view(now())).connection, ...(out.candidates ? { candidates: out.candidates } : {}) }
+          : {};
+        return fail(out.reason.split(" ")[0]!, `Refused: ${out.reason}.`, extra);
+      }
+      return ok({ message: out.message });
+    });
+
+    server.registerTool("follow_up", {
+      title: "Send a follow-up note to a remote task",
+      description: "= send_message, addressed by the remote task's task_id instead of a local task_id/label. " +
+        "Refused if that remote task was never actually spawned (no live pane to message yet). Requires herdr:message.",
+      inputSchema: { task_id: z.string().min(1).max(100), text: z.string().min(1).max(MAX_MESSAGE_CHARS * 2) },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    }, async ({ task_id, text }) => {
+      const localId = await stub.remoteTaskLocalId(task_id);
+      if (!localId) return fail("not_found", "That remote task was never spawned (no live pane to message).");
+      const out = await stub.sendMessage(now(), caller, scopes, localId, text);
+      if (!out.ok) {
+        const extra = canRead
+          ? { connection: (await stub.view(now())).connection, ...(out.candidates ? { candidates: out.candidates } : {}) }
+          : {};
+        return fail(out.reason.split(" ")[0]!, `Refused: ${out.reason}.`, extra);
+      }
+      return ok({ message: out.message });
+    });
+  }
+
+  if (scopes.includes(SCOPE_TASK_START) || scopes.includes(SCOPE_TASK_IMPLEMENT)) {
+    server.registerTool("start_task", {
+      title: "Start a remote task",
+      description: "Spawn a sandboxed worker in an allow-listed repo (list_capabilities shows which, and each mode's " +
+        "policy). mode=research: no edit/write tools are registered at all (read/bash/grep/glob/todo/web_search/ask " +
+        "only), no git push, runs with the read-only credential vault. mode=implement: commits and pushes its OWN " +
+        "branch, never main, never deploys. " +
+        "Capped (list_capabilities shows max_concurrent/max_per_day/max_minutes); a task that outruns max_minutes is " +
+        "cancelled automatically. Returns task_id immediately in state queued, before the Mac has acted on it. " +
+        "Poll get_task_answer, or list_events/wait_for_events.",
+      inputSchema: {
+        repo: z.string().min(1).max(100),
+        mode: z.enum(["research", "implement"]),
+        objective: z.string().min(1).max(4000),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    }, async ({ repo, mode, objective }) => {
+      const needs = mode === "implement" ? [SCOPE_TASK_IMPLEMENT] : [SCOPE_TASK_START];
+      const v = await gate("start_task", `${mode}:${repo}`, needs);
+      if (!isView(v)) return v;
+      const out = await stub.startTask(now(), caller, scopes, repo, mode, objective);
+      if (!out.ok) return fail(out.reason.split(" ")[0]!, `Refused: ${out.reason}.`, { connection: v.connection });
+      return ok({ connection: v.connection, task_id: out.remote_task_id, state: out.state });
+    });
+  }
+
+  if (scopes.includes(SCOPE_TASK_CANCEL)) {
+    server.registerTool("cancel_task", {
+      title: "Cancel a remote task",
+      description: "Cancel a remote task before it finishes. Refused (not a no-op) if it is already terminal " +
+        "(finished/verified/failed/cancelled/lost/timed_out).",
+      inputSchema: { task_id: z.string().min(1).max(100) },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    }, async ({ task_id }) => {
+      const v = await gate("cancel_task", task_id, [SCOPE_TASK_CANCEL]);
+      if (!isView(v)) return v;
+      const out = await stub.cancelTask(now(), caller, scopes, task_id);
+      if (!out.ok) return fail(out.reason.split(" ")[0]!, `Refused: ${out.reason}.`, { connection: v.connection });
+      return ok({ connection: v.connection, task_id, state: out.state });
+    });
+
+    server.registerTool("resume_task", {
+      title: "Resume a finished remote task",
+      description: "Re-enter the same repo/branch/worktree as a brand new remote task (new task_id, linked via " +
+        "parent_task_id), optionally with a follow-up note. Only a terminal task can be resumed; the registry " +
+        "forbids terminal -> running on the SAME task_id, which is why this always returns a new one.",
+      inputSchema: { task_id: z.string().min(1).max(100), text: z.string().max(MAX_MESSAGE_CHARS * 2).optional() },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    }, async ({ task_id, text }) => {
+      const v = await gate("resume_task", task_id, [SCOPE_TASK_CANCEL]);
+      if (!isView(v)) return v;
+      const out = await stub.resumeTask(now(), caller, scopes, task_id, text);
+      if (!out.ok) return fail(out.reason.split(" ")[0]!, `Refused: ${out.reason}.`, { connection: v.connection });
+      return ok({ connection: v.connection, task_id: out.remote_task_id, parent_task_id: out.parent_remote_task_id, state: out.state });
+    });
+  }
 
   return server;
 }
@@ -258,7 +423,8 @@ export const mcpHandler = {
     }
     const offered = offeredScopes(env);
     const scopes = (c.auth?.scope ?? []).filter((s) => offered.includes(s));
-    if (!scopes.includes(SCOPE_READ) && !scopes.includes(SCOPE_MESSAGE)) {
+    if (!scopes.includes(SCOPE_READ) && !scopes.includes(SCOPE_MESSAGE) && !scopes.includes(SCOPE_TASK_START)
+        && !scopes.includes(SCOPE_TASK_IMPLEMENT) && !scopes.includes(SCOPE_TASK_CANCEL)) {
       return refuse("insufficient_scope", insufficientScope(c.auth, [SCOPE_READ]));
     }
     const calls = toolCalls(await request.clone().text());

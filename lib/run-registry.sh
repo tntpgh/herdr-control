@@ -99,7 +99,7 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '6\n'; }
+_registry_schema_version() { printf '7\n'; }
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
@@ -263,6 +263,7 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   _migrate_schema_v4
   _migrate_schema_v5
   _migrate_schema_v6
+  _migrate_schema_v7
   _migrate_legacy_files
   return 0
 }
@@ -363,6 +364,36 @@ _migrate_schema_v6() {
   _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '6');" >/dev/null 2>&1
 }
 
+# v7 (herdr-mcp remote task lifecycle, remote-mcp/README.md): four columns a
+# task spawned via herdr-mcp's start_task carries that no prior caller needed.
+# `remote_task_id` correlates this row back to the Worker-side mapping (set
+# once the Mac's command processor has actually spawned the task — empty for
+# every task not started remotely, which is every task before this change).
+# `deadline_at` is the 60-minute wall-clock cap (SPEC's caps.max_minutes):
+# publisher.py's own tick sweeps for a non-terminal task past this and cancels
+# it with reason `timed_out`, enforced on the Mac, not trusted from the Worker.
+# `verified`/`verify_detail` are the Mac's own check of the client's own done
+# condition (research: ANSWER.md exists and names >=1 source; implement: the
+# branch in the closure event is pushed and its head sha matches) — computed
+# once, on the Mac, where the git/filesystem truth lives, and carried through
+# exactly like closure_reason/closure_proof already are; the Worker only
+# stores and serves what is written here, never re-derives it.
+_migrate_schema_v7() {
+  local col
+  for col in \
+    "remote_task_id TEXT NOT NULL DEFAULT ''" \
+    "deadline_at    TEXT NOT NULL DEFAULT ''" \
+    "verified       INTEGER NOT NULL DEFAULT 0" \
+    "verify_detail  TEXT NOT NULL DEFAULT ''"; do
+    local name=${col%% *}
+    if [ -z "$(_sql "SELECT 1 FROM pragma_table_info('tasks') WHERE name='$name';" 2>/dev/null)" ]; then
+      _sql "ALTER TABLE tasks ADD COLUMN $col;" >/dev/null 2>&1
+    fi
+  done
+  _sql "CREATE INDEX IF NOT EXISTS tasks_by_remote_id ON tasks(remote_task_id) WHERE remote_task_id<>'';" >/dev/null 2>&1
+  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '7');" >/dev/null 2>&1
+}
+
 # ---- one-time import of the pre-SQLite file layout --------------------------
 # A registry holding LIVE task state cannot simply be abandoned: dropping a
 # running worker's registration is not a clean slate, it silently disables
@@ -453,12 +484,14 @@ gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand
 # names whether it asked for one task or all of them.
 _task_json_select() {
   printf "%s" "SELECT json_object(
-    'schema', 6, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
+    'schema', 7, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
     'conductor_id', conductor_id, 'conductor_pane_id', conductor_pane_id,
     'conductor_pane_birth', conductor_pane_birth, 'pane_id', pane_id,
     'pane_birth', pane_birth, 'agent_session', agent_session, 'repo', repo,
     'worktree', worktree, 'branch', branch, 'trunk', trunk, 'project', project,
     'manifest', manifest, 'approval', approval,
+    'remote_task_id', remote_task_id, 'deadline_at', deadline_at,
+    'verified', (verified = 1), 'verify_detail', verify_detail,
     'label', label, 'state', state, 'created_at', created_at, 'updated_at', updated_at) FROM tasks"
 }
 
@@ -884,6 +917,97 @@ rebaseline_pane_birth() {
   append_event "$run_id" "$task_id" "pane_birth_rebaselined" \
     "$(jq -nc --arg old "$old_birth" --arg new "$new_birth" --arg reason "$reason" \
       '{old_pane_birth:$old, new_pane_birth:$new, reason:$reason}')" >/dev/null 2>&1
+}
+
+# set_task_remote_id <run_id> <task_id> <remote_task_id>
+#
+# Stamps the herdr-mcp Worker's remote_task_id onto the local row the moment
+# the Mac's command processor has actually spawned it (remote-mcp/tasks.py),
+# so read_task_by_remote_id can find it from then on. Write-once, like
+# set_task_agent_session: a remote task is never re-parented to a different
+# remote id, so a second call with a DIFFERENT value is refused rather than
+# silently overwriting the correlation an in-flight get_task_answer/
+# cancel_task call may already be relying on.
+set_task_remote_id() {
+  local run_id="$1" task_id="$2" remote_task_id="$3" changed
+  registry_init || return 1
+  [ -n "$remote_task_id" ] || return 1
+  changed=$(_sql "UPDATE tasks SET remote_task_id=$(_sq "$remote_task_id")
+    WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id") AND remote_task_id='';
+    SELECT changes();" 2>/dev/null)
+  [ "$changed" = "1" ]
+}
+
+# set_task_deadline <run_id> <task_id> <deadline_iso>
+#
+# The wall-clock cap a remote task was spawned under (SPEC's 60-minute
+# caps.max_minutes). Best-effort metadata, not a lifecycle transition — the
+# sweep that actually enforces it (remote-mcp/tasks.py, run from publisher.py's
+# tick) reads this column and calls set_task_state(...,"cancelled","canceled")
+# on whatever it finds past it.
+set_task_deadline() {
+  local run_id="$1" task_id="$2" deadline_at="$3" changed
+  registry_init || return 1
+  [ -n "$deadline_at" ] || return 1
+  changed=$(_sql "UPDATE tasks SET deadline_at=$(_sq "$deadline_at")
+    WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id"); SELECT changes();" 2>/dev/null)
+  [ "$changed" = "1" ]
+}
+
+# set_task_verified <run_id> <task_id> <0|1> <detail>
+#
+# Records the Mac's own check of the client's done-condition against a
+# FINISHED task (research: .handoffs/ANSWER.md exists and names >=1 source;
+# implement: the branch named in the completion event is pushed and its head
+# sha matches the event's proof) — never re-derived by the Worker, which has
+# no git or filesystem access of its own. Idempotent re-assert of the same
+# verdict is a no-op; a differing verdict (e.g. a later check corrects an
+# earlier false negative) overwrites it, since this is metadata, not a
+# lifecycle transition.
+set_task_verified() {
+  local run_id="$1" task_id="$2" verified="$3" detail="${4:-}"
+  registry_init || return 1
+  case "$verified" in 0|1) ;; *) return 1 ;; esac
+  _sql "UPDATE tasks SET verified=$verified, verify_detail=$(_sq "$detail")
+    WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" >/dev/null 2>&1
+}
+
+# read_task_by_remote_id <remote_task_id> -> json (empty if absent)
+#
+# The reverse of read_task's run_id+task_id lookup, for a caller (tasks.py)
+# that only knows the herdr-mcp Worker's id. remote_task_id is unique by
+# construction (minted once per start_task/resume_task call and written here
+# exactly once by set_task_remote_id), so at most one row ever matches.
+read_task_by_remote_id() {
+  registry_init || return 1
+  _sql "$(_task_json_select) WHERE remote_task_id=$(_sq "$1") LIMIT 1;" 2>/dev/null
+}
+
+# R4-1 (round-4 security review): tasks.py's post-spawn-failure cleanup must
+# find the row a crashed/timed-out spawn just registered WITHOUT trusting
+# worker-writable identity.json, and WITHOUT requiring remote_task_id to
+# already be stamped -- register_task runs long before the caller stamps
+# remote_task_id (set_task_remote_id), so a timeout/crash in that window
+# left the row unstamped and read_task_by_remote_id could never find it,
+# bringing back the very orphan this cleanup exists to prevent.
+#
+# Keyed instead on worktree + branch (both decided by the CALLER before
+# spawn-task.sh ever runs, never worker-writable) and a created_at floor the
+# caller captures immediately before its own spawn attempt -- a stale row
+# from an EARLIER occupant of a reused worktree (_resume's case) has an
+# OLDER created_at and can never match, so this is safe even when a worktree
+# is reused. remote_task_id must be empty (not yet stamped, the normal case
+# this exists for) or equal to the caller's own expected id (an already
+# partially-stamped retry of the SAME attempt) -- never a DIFFERENT,
+# already-stamped task's id. Only a non-terminal state is eligible: a row
+# already completed/failed/cancelled/lost needs no cleanup.
+task_for_orphan_cleanup() {             # worktree branch since_iso expected_remote_task_id -> json or empty
+  registry_init || return 1
+  _sql "$(_task_json_select) WHERE worktree=$(_sq "$1") AND branch=$(_sq "$2")
+    AND created_at >= $(_sq "$3")
+    AND state IN ('starting','running','blocked')
+    AND (remote_task_id='' OR remote_task_id=$(_sq "$4"))
+    ORDER BY created_at DESC LIMIT 1;" 2>/dev/null
 }
 
 # append_event <run_id> <task_id> <type> [payload_json] [event_id]

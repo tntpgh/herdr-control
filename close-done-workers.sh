@@ -118,7 +118,7 @@ panes_json=$(herdr pane list 2>/dev/null)
 pane_status() { printf '%s' "$panes_json" | jq -r --arg p "$1" '((.result.panes // .panes)[]|select(.pane_id==$p)|.agent_status) // "absent"'; }
 
 closable=0; held=0; refused=0
-while IFS='|' read -r run_id task_id pane wt label; do
+while IFS='|' read -r run_id task_id pane wt label trunk; do
   [ -n "$pane" ] || continue
   st=$(pane_status "$pane")
   reason=""
@@ -135,8 +135,23 @@ while IFS='|' read -r run_id task_id pane wt label; do
         # No upstream is only a risk when the branch holds commits no remote
         # has. A review/probe branch created on an already-pushed commit has
         # none — holding it made the conductor close such panes by hand, and
-        # every one landed in the registry as `lost` (2026-09-28).
-        only_here=$(git -C "$wt" rev-list --count "refs/heads/$br" --not --remotes 2>/dev/null)
+        # every one landed in the registry as `lost` (2026-09-28). A
+        # research task's branch (git: none) is never pushed at all, so
+        # `--remotes` alone is the wrong bar for it: also exclude whatever
+        # the task's own recorded trunk resolves to (local or
+        # remote-tracking) -- a branch still sitting on its base has
+        # nothing any remote could lose, pushed or not. Without this, every
+        # finished research task held forever since none ever push
+        # (2026-10-02, caught by remote-mcp/verify-tasks-e2e.py).
+        excl=(--remotes)
+        if [ -n "$trunk" ]; then
+          if git -C "$wt" show-ref --verify -q "refs/remotes/origin/$trunk"; then
+            excl+=("refs/remotes/origin/$trunk")
+          elif git -C "$wt" show-ref --verify -q "refs/heads/$trunk"; then
+            excl+=("refs/heads/$trunk")
+          fi
+        fi
+        only_here=$(git -C "$wt" rev-list --count "refs/heads/$br" --not "${excl[@]}" 2>/dev/null)
         case "$only_here" in
           0) ;;
           ''|*[!0-9]*) reason="branch $br has no upstream and its commits cannot be checked against the remotes" ;;
@@ -175,7 +190,7 @@ while IFS='|' read -r run_id task_id pane wt label; do
   fi
   [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
   [ "$(pane_status "$pane")" = absent ] || herdr pane close "$pane" >/dev/null 2>&1
-done < <(_sql "SELECT run_id || '|' || task_id || '|' || pane_id || '|' || worktree || '|' || label
+done < <(_sql "SELECT run_id || '|' || task_id || '|' || pane_id || '|' || worktree || '|' || label || '|' || trunk
                FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at;")
 
 echo

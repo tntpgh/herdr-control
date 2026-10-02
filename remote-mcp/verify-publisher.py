@@ -56,9 +56,11 @@ PANES = [
 ]
 REG = TMP / "registry.sqlite3"
 con = sqlite3.connect(REG)
-con.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, pane_birth TEXT)")
+con.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, pane_birth TEXT, remote_task_id TEXT DEFAULT '', "
+            "deadline_at TEXT, verified INTEGER DEFAULT 0, verify_detail TEXT, manifest TEXT DEFAULT '')")
 con.execute("CREATE TABLE events (sequence INTEGER PRIMARY KEY, task_id TEXT, type TEXT, occurred_at TEXT, payload TEXT)")
-con.executemany("INSERT INTO tasks VALUES (?,?)", [("task_A", "term_a"), ("task_R", "term_OLD"), ("task_OLD", "")])
+con.executemany("INSERT INTO tasks (task_id, pane_birth) VALUES (?,?)",
+                 [("task_A", "term_a"), ("task_R", "term_OLD"), ("task_OLD", "")])
 con.execute("INSERT INTO events VALUES (1,'task_A','input_required',?,?)", (Z(NOW), json.dumps({"tool": "bash", "message": "bash: git status"})))
 con.execute("INSERT INTO events VALUES (2,'task_A','input_required',?,?)",
             (Z(NOW), json.dumps({"tool": "bash", "message": "bash: curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' x"})))
@@ -129,7 +131,8 @@ class Snapshot(unittest.TestCase):
         res = pub.changed_results(self.snap, self.local, {}, NOW.timestamp())
         self.assertEqual([r["task_id"] for r in res], ["task_A"])
         self.assertIn("[REDACTED:github-token]", res[0]["text"])
-        again = pub.changed_results(self.snap, self.local, {"task_A": {"sha256": res[0]["sha256"], "sent_at": NOW.timestamp()}},
+        again = pub.changed_results(self.snap, self.local,
+                                    {"task_A:.handoffs/PROOF.md": {"sha256": res[0]["sha256"], "sent_at": NOW.timestamp()}},
                                     NOW.timestamp())
         self.assertEqual(again, [])
 
@@ -299,6 +302,84 @@ class Delivery(unittest.TestCase):
             pub.post_sync, pub.deliver, pub.MESSAGING_ON_MAC = real_post, real_deliver, False
         self.assertEqual(typed, ["msg_1"])
         self.assertEqual(pub.load_state()["pending_acks"][0]["detail"], "already delivered (ack was lost)")
+
+class SchemaTolerance(unittest.TestCase):
+    """registry_rows() opens the registry read-only via sqlite3.connect()
+    directly -- it never goes through lib/run-registry.sh's own
+    ensure-schema step, so it never triggers a v6->v7 migration itself. A
+    LaunchAgent started before any bash caller has ever migrated a fresh
+    registry must degrade gracefully, not crash every tick."""
+    def setUp(self):
+        self.v6 = TMP / f"registry-v6-{self._testMethodName}.sqlite3"
+        con = sqlite3.connect(self.v6)
+        con.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, pane_birth TEXT)")
+        con.execute("CREATE TABLE events (sequence INTEGER PRIMARY KEY, task_id TEXT, type TEXT, occurred_at TEXT, payload TEXT)")
+        con.execute("INSERT INTO tasks VALUES ('task_v6', 'term_v6')")
+        con.commit()
+        con.close()
+        self.real_registry = pub.REGISTRY
+        pub.REGISTRY = self.v6
+
+    def tearDown(self):
+        pub.REGISTRY = self.real_registry
+
+    def test_registry_rows_tolerates_a_pre_v7_registry(self):
+        births, asks, remotes = pub.registry_rows(["task_v6"])
+        self.assertEqual(births, {"task_v6": "term_v6"})
+        self.assertEqual(remotes, {})
+
+    def test_build_does_not_crash_against_a_pre_v7_registry(self):
+        snap, local = pub.build(NOW)
+        self.assertIn("tasks", snap)
+
+
+class ResultScoping(unittest.TestCase):
+    def test_answer_md_is_never_synced_for_a_task_with_no_remote_task_id(self):
+        wt = WT_ROOT / "kb/feat-a"
+        (wt / ".handoffs/ANSWER.md").write_text("local-only deliverable")
+        try:
+            snap, local = pub.build(NOW)
+            res = pub.changed_results(snap, local, {}, NOW.timestamp())
+            sources = [(r["task_id"], r["source"]) for r in res]
+            self.assertNotIn(("task_A", ".handoffs/ANSWER.md"), sources)
+        finally:
+            (wt / ".handoffs/ANSWER.md").unlink()
+
+    def test_answer_md_syncs_once_the_task_has_a_remote_task_id(self):
+        wt = WT_ROOT / "kb/feat-a"
+        (wt / ".handoffs/ANSWER.md").write_text("remote deliverable")
+        con = sqlite3.connect(REG)
+        con.execute("UPDATE tasks SET remote_task_id='rtask_x' WHERE task_id='task_A'")
+        con.commit(); con.close()
+        try:
+            snap, local = pub.build(NOW)
+            res = pub.changed_results(snap, local, {}, NOW.timestamp())
+            sources = [(r["task_id"], r["source"]) for r in res]
+            self.assertIn(("task_A", ".handoffs/ANSWER.md"), sources)
+        finally:
+            (wt / ".handoffs/ANSWER.md").unlink()
+            con = sqlite3.connect(REG)
+            con.execute("UPDATE tasks SET remote_task_id='' WHERE task_id='task_A'")
+            con.commit(); con.close()
+
+    def test_a_symlinked_handoffs_directory_is_never_read(self):
+        # N6: changed_results must check worktree_ok on the PARENT of the
+        # exact path it is about to open, per source -- a single hoisted
+        # worktree_ok(wt) check does not catch ".handoffs" itself being a
+        # symlink (read_regular's O_NOFOLLOW only guards the final
+        # component, not an intermediate directory).
+        real_dir = TMP / "symlink-escape-real"
+        real_dir.mkdir(exist_ok=True)
+        (real_dir / "PROOF.md").write_text("exfiltrated")
+        wt = WT_ROOT / "kb/feat-symlink"
+        wt.mkdir(parents=True, exist_ok=True)
+        os.symlink(real_dir, wt / ".handoffs")
+        try:
+            res = pub.changed_results({"tasks": [{"task_id": "task_sym", "updated_at": Z(NOW)}]},
+                                       {"worktrees": {"task_sym": wt}}, {}, NOW.timestamp())
+            self.assertEqual(res, [])
+        finally:
+            (wt / ".handoffs").unlink()
 
 
 if __name__ == "__main__":

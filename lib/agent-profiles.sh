@@ -123,7 +123,7 @@ answer_strategy_for_agent() {           # <agent> -> strategy
 # GRANT and printed "[managed default]", which reads like a decision rather
 # than a miss. An unrecognised class is withheld: a job nobody classified is
 # exactly the one nobody thought about.
-KNOWN_JOB_CLASSES="plan architect review design implement debug code docs explore quick mechanical"
+KNOWN_JOB_CLASSES="plan architect review design implement debug code docs explore research quick mechanical"
 secrets_default_for_job() {  # <job-class> -> "withhold" | ""
 	case "$1" in
 		*review*|*explore*|*audit*|*scrape*|*research*|*triage*) printf 'withhold\n'; return ;;
@@ -294,7 +294,18 @@ omp_cross_family_model() {   # <from-agent> <bare-model-name> -> "<omp-model> <t
 tools_for_job() {  # <job-class> -> comma-separated --tools value, or "" for unrestricted
   case "$1" in
     implement|debug|code|docs|mechanical|quick) printf 'read,bash,edit,write,grep,glob,todo,eval,wait,ask\n' ;;
-    explore)                                    printf 'read,bash,grep,glob,todo,web_search,ask\n' ;;
+    # research/explore keep no `edit` (no diff-style patching of tracked
+    # files) but DO get `write` back (N8, round-2 security review): their
+    # one legitimate deliverable is .handoffs/ANSWER.md, and with no write
+    # tool at all the only way to produce it was a bash heredoc, which an
+    # unattended remote spawn has nobody watching to approve. Safe because
+    # spawn-task.sh tags a research/explore task's manifest with
+    # `handoffs_write: ANSWER.md`, and _cp_write_menu_verdict
+    # (lib/command-policy.sh) narrows ANY task carrying that key to
+    # exactly that one .handoffs file -- never a broad in-worktree write
+    # the way implement/debug/etc above get. `git: none` (the allowlist's
+    # default ceiling for these job classes) still stops a pushed branch.
+    explore|research)                           printf 'read,bash,write,grep,glob,todo,web_search,ask\n' ;;
     *)                             printf '\n' ;;   # plan/architect/review/design + unrecognised: unrestricted
   esac
 }
@@ -325,10 +336,39 @@ _ap_emit() {                            # <argv...> -> one shell-safe launch lin
   printf '%s\n' "$out"
 }
 
+# R3-1 follow-up (conductor's live repro): the job-based posture override
+# must be the SAME decision everywhere a posture gets computed, not just
+# inside cli_for_agent's own launch flag -- spawn-task.sh separately computes
+# its own `eff_posture` (stamped into the worker's environment as
+# HERDR_POSTURE_FLOOR, which governs any GRANDCHILD this worker itself
+# spawns) via resolved_posture directly, with no knowledge of job class. Two
+# independent computations of "what posture does this spawn get" drift by
+# construction -- a research/explore worker's own launch got --approval-mode
+# always-ask, but its stamped floor stayed `write`, so a grandchild it spun
+# up could inherit a LOOSER floor than its own parent, defeating tighten-only
+# inheritance. One function, called from both places.
+posture_want_for_job() {  # <want> <job> -> effective want request (job-class floors win)
+  local want="$1" job="${2:-}"
+  case "$job" in
+    research|explore) printf 'strict\n' ;;
+    *) printf '%s\n' "$want" ;;
+  esac
+}
+
 cli_for_agent() {
   local a="$1" spec="$2" want="${3:-}" job="${4:-}" tools_req="${5:-}" m e posture flag
   local has_effort alt alt_model models tools
   local -a argv
+  # R3-1 (round-3 security review): research/explore's whole write
+  # restriction (handoffs_write, N8) is enforced by _cp_write_menu_verdict,
+  # which only ever judges a MENU panel. At the default `write` posture omp
+  # auto-approves every in-worktree write with no menu at all, so the
+  # restriction never runs and these job classes get an unrestricted,
+  # unprompted write tool. Force `strict` here -- the single point every
+  # spawn (local or the remote-mcp publisher's own _spawn, which passes no
+  # --posture at all) funnels through -- so a caller's lesser request can
+  # never leave a write unjudged for these two classes.
+  want="$(posture_want_for_job "$want" "$job")"
   posture="$(resolved_posture "$want")"
   case "$a" in
     claude|codex)
