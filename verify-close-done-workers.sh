@@ -68,6 +68,36 @@ fi
 check "no herdr RPC was ever made" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
 check "task state untouched" "$(read_task run1 task1 | jq -r .state)" "running"
 
+printf '== --task= (empty) is refused, never treated as "no filter" — the empty-task-closes-everything bug (2026-09-30) ==\n'
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --task= >/tmp/cdw-out1b-$$.log 2>&1; then
+  bad "--task= (empty) was ACCEPTED and ran as an unfiltered batch"
+else
+  ok "--task= (empty) refused"
+fi
+check "no herdr RPC was ever made" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
+check "task1 untouched by the refused empty --task=" "$(read_task run1 task1 | jq -r .state)" "running"
+grep -q 'given but empty' /tmp/cdw-out1b-$$.log && ok "refusal names the empty --task" || bad "refusal text: $(cat /tmp/cdw-out1b-$$.log)"
+
+printf '== --task="   " (whitespace-only) is refused the same way ==\n'
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --task="   " >/tmp/cdw-out1c-$$.log 2>&1; then
+  bad "--task=\"   \" (whitespace-only) was ACCEPTED"
+else
+  ok "--task=\"   \" (whitespace-only) refused"
+fi
+check "no herdr RPC was ever made" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
+check "task1 untouched by the refused whitespace --task=" "$(read_task run1 task1 | jq -r .state)" "running"
+
+printf '== a dry run (no --apply) with --task= empty is refused too, not silently scanning everything ==\n'
+: > "$CALLS"
+if bash "$here/close-done-workers.sh" --task= >/tmp/cdw-out1d-$$.log 2>&1; then
+  bad "dry-run with --task= (empty) was ACCEPTED"
+else
+  ok "dry-run with --task= (empty) refused"
+fi
+check "no herdr RPC was ever made" "$(wc -l < "$CALLS" | tr -d ' ')" "0"
+
 printf '== --apply --reason=shipped with no --proof: refused before any herdr call ==\n'
 : > "$CALLS"
 if bash "$here/close-done-workers.sh" --apply --reason=shipped >/tmp/cdw-out2-$$.log 2>&1; then
