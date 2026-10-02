@@ -12,6 +12,7 @@ import type { CommandAck, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem,
 import { SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START, SNAPSHOT_SCHEMA } from "./types";
 
 const str = z.string().max(4000);
+const ExtState = z.enum(["enabled", "disabled", "missing"]);
 const nstr = str.nullable();
 const SyncSchema = z.object({
   snapshot: z.object({
@@ -42,6 +43,11 @@ const SyncSchema = z.object({
         implement: z.object({ job_class: str, secrets: z.enum(["grant", "default"]), git: z.enum(["none", "commit-only", "push-own-branch"]), writes: z.array(str).max(50), net_read: z.array(str).max(50) }),
       }),
       caps: z.object({ max_concurrent: z.number().int().min(1).max(100), max_per_day: z.number().int().min(1).max(1000), max_minutes: z.number().int().min(1).max(1440) }),
+    }).nullable().optional(),
+    browser: z.object({
+      checked_at: str, real_chrome_running: z.boolean(), relay: z.string().max(40),
+      extensions: z.object({ omp_relay: ExtState, "1password": ExtState, chatgpt: ExtState }),
+      stray_omp_chromes: z.number().int().min(0).max(1000), healthy: z.boolean(),
     }).nullable().optional(),
   }),
   results: z.array(z.object({

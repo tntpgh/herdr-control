@@ -14,6 +14,7 @@
 #   ./install.sh --apply --remote-mcp-messaging # same, with the Mac's messaging switch ON
 #   ./install.sh --apply --remote-mcp-tasks     # same, with the Mac's task-lifecycle switch ON
 #                                      # (start_task/cancel_task/resume_task; remote-mcp/README.md)
+#   ./install.sh --apply --chrome     # also keep the real Chrome up (chrome-relay.py --ensure)
 #   ./install.sh --apply --repoint    # ALSO repoint any job already wired at a
 #                                      # different checkout (e.g. an APM-deployed
 #                                      # herdr-ops skill copy) to point at THIS one —
@@ -58,7 +59,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=launchd/agent-lib.sh
 . "$here/launchd/agent-lib.sh"
 
-APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0; REMOTE_MCP_MESSAGING=0; REMOTE_MCP_TASKS=0
+APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0; REMOTE_MCP_MESSAGING=0; REMOTE_MCP_TASKS=0; CHROME=0
 for a in "$@"; do
   case "$a" in
     --apply)   APPLY=1 ;;
@@ -68,6 +69,7 @@ for a in "$@"; do
     --remote-mcp) REMOTE_MCP=1 ;;
     --remote-mcp-messaging) REMOTE_MCP=1; REMOTE_MCP_MESSAGING=1 ;;
     --remote-mcp-tasks) REMOTE_MCP=1; REMOTE_MCP_TASKS=1 ;;
+    --chrome)  CHROME=1 ;;
     --repoint) REPOINT=1 ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
@@ -429,22 +431,10 @@ if [ "$REMOTE_MCP" = 1 ]; then
           -e "s|__REMOTE_MCP_TASKS__|$REMOTE_MCP_TASKS|" \
           -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.remote-mcp.log|g" \
         "$here/remote-mcp/com.herdr-control.remote-mcp.plist.template" > "$PLIST"
-      # Not reload_agent: that verifies a KeepAlive daemon stays up, and a
-      # 15 s interval job correctly exits after each tick. Load it, let the
-      # RunAtLoad tick finish, and read launchd's own last exit code.
-      domain="gui/$(id -u)"
-      if plutil -lint "$PLIST" >/dev/null; then
-        launchctl bootout "$domain/com.herdr-control.remote-mcp" 2>/dev/null; sleep 1
-        if launchctl bootstrap "$domain" "$PLIST"; then
-          sleep 5
-          rmcp_exit="$(launchctl print "$domain/com.herdr-control.remote-mcp" 2>/dev/null | awk -F'= ' '/last exit code/ {print $2; exit}')"
-          echo "  remote-mcp publisher loaded (every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off)); first tick last exit code: ${rmcp_exit:-not yet run}"
-          [ "${rmcp_exit:-0}" = 0 ] || { INSTALL_RC=2; echo "  ! check ~/Library/Logs/com.herdr-control.remote-mcp.log" >&2; }
-        else
-          INSTALL_RC=2; echo "  ! remote-mcp publisher: bootstrap failed" >&2
-        fi
+      if rmcp_exit="$(load_interval_agent com.herdr-control.remote-mcp "$PLIST")"; then
+        echo "  remote-mcp publisher loaded (every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off)); first tick last exit code: $rmcp_exit"
       else
-        INSTALL_RC=2; echo "  ! remote-mcp publisher: rendered plist invalid ($PLIST)" >&2
+        INSTALL_RC=2; echo "  ! remote-mcp publisher: first tick exit ${rmcp_exit:-?}; check ~/Library/Logs/com.herdr-control.remote-mcp.log" >&2
       fi
     else
       INSTALL_RC=2
@@ -452,6 +442,33 @@ if [ "$REMOTE_MCP" = 1 ]; then
     fi
   else
     echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/remote-mcp/publisher.py every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off))"
+  fi
+fi
+
+# ---- real Chrome keeper (optional, macOS) -----------------------------------
+# chrome-relay.py --ensure at login and every 5 min: the real Chrome (Profile 1:
+# omp relay, 1Password, ChatGPT for Zero) is started if it is not running, and
+# idle omp-profile Chromes, which capture a Dock click, are closed. Runs from
+# the DEPLOYED app worktree. Registry entry: thurber-os launchd/agents.yaml.
+if [ "$CHROME" = 1 ]; then
+  PLIST="$HOME/Library/LaunchAgents/com.herdr-control.chrome-relay.plist"
+  if [ "$APPLY" = 1 ]; then
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+    if deploy_app "${HUB_REV:-origin/main}"; then
+      sed -e "s|__CHROME_RELAY_PY__|$HERDR_APP_DIR/chrome-relay.py|" \
+          -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.chrome-relay.log|g" \
+        "$here/launchd/com.herdr-control.chrome-relay.plist.template" > "$PLIST"
+      if chrome_exit="$(load_interval_agent com.herdr-control.chrome-relay "$PLIST")"; then
+        echo "  chrome-relay keeper loaded (login + every 5 min); first tick last exit code: $chrome_exit"
+      else
+        INSTALL_RC=2; echo "  ! chrome-relay keeper: first tick exit ${chrome_exit:-?}; check ~/Library/Logs/com.herdr-control.chrome-relay.log" >&2
+      fi
+    else
+      INSTALL_RC=2
+      echo "  ! chrome-relay keeper NOT installed: deploy failed (above)." >&2
+    fi
+  else
+    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/chrome-relay.py --ensure at login + every 5 min)"
   fi
 fi
 

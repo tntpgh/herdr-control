@@ -82,6 +82,26 @@ reload_agent() {
   return 1
 }
 
+# ── load_interval_agent LABEL PLIST ──────────────────────────────────────────
+# For StartInterval jobs. Not reload_agent: that verifies a KeepAlive daemon
+# stays up, and an interval job correctly exits after each tick. Lint, reload,
+# let the RunAtLoad tick finish, and read launchd's own last exit code.
+# Prints that code (or "not yet run"); returns nonzero on any failure.
+load_interval_agent() {
+  local label="$1" plist="$2" domain code
+  domain="gui/$(id -u)"
+  plutil -lint "$plist" >/dev/null || { echo "  ! $label: rendered plist invalid ($plist)" >&2; return 1; }
+  launchctl bootout "$domain/$label" 2>/dev/null; sleep 1
+  launchctl bootstrap "$domain" "$plist" || { echo "  ! $label: bootstrap failed" >&2; return 1; }
+  sleep 5
+  code="$(launchctl print "$domain/$label" 2>/dev/null | awk -F'= ' '/last exit code/ {print $2; exit}')"
+  # "(never exited)" = the first tick is still running (a Chrome launch waits
+  # up to 15 s); that is not a failure.
+  case "$code" in ""|*never*) echo "not yet run"; return 0 ;; esac
+  echo "$code"
+  [ "$code" = 0 ]
+}
+
 # ── agent_status LABEL ───────────────────────────────────────────────────────
 # Prints "RUNNING pid=N last_exit=S", "LOADED-NOT-RUNNING", or "NOT-LOADED".
 agent_status() {

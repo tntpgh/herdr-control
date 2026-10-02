@@ -1328,7 +1328,8 @@ or queries Neon.
 | `docs/herdr-config-snippet.toml` | sidebar rows + keybindings for the two tools above |
 | `slack-bridge/` | two-way Slack bot: outbound alerts + reply routing |
 | `herdr-rpc.py` | socket JSON-RPC for verbless methods (`tab.move`) |
-| `chrome-relay.sh` | open the REAL Chrome (default data dir, `Profile 1`: OMP Browser Relay + 1Password + ChatGPT) and confirm the relay connected; `--status` reports only, `--close-strays` closes idle omp-profile Chromes (`~/.omp/browser-profiles/*`), the instance a Dock click lands on when the real one isn't running |
+| `chrome-relay.py` | keeps the REAL Chrome up for omp and Zero (default data dir, `Profile 1`: OMP Browser Relay + 1Password + ChatGPT). No args opens a window; `--status [--json]` reports Chrome/relay/extension health (synced to Zero's `get_status` as `browser`); `--ensure` is the `com.herdr-control.chrome-relay` LaunchAgent tick (`install.sh --apply --chrome`): start Chrome in the background if it is down, close omp-profile Chromes (`~/.omp/browser-profiles/*`) with no CDP client, which otherwise capture a Dock click |
+| `launchd/com.herdr-control.chrome-relay.plist.template` | login + every-5-min LaunchAgent for `chrome-relay.py --ensure`, run from the deployed app worktree |
 
 ### Why `agent-hooks/` and not `hooks/`
 
