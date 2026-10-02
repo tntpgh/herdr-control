@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Behaviour checks for tasks.py. No real spawn-task.sh/close-done-workers.sh/
-registry-bridge.sh ever runs: each is replaced by a tiny fake script that
-records its argv and returns canned output, so this never touches a real
-worktree, herdr pane, or the live run registry. Run with HERDR_RUN_STATE_DIR
+"""Behaviour checks for tasks.py. spawn-task.sh/close-done-workers.sh/
+registry-bridge.sh are replaced by tiny fake scripts that record their argv
+and return canned output, so this never touches a real worktree, herdr pane,
+or the live run registry. One exception: SpawnArgvAgainstRealParser runs the
+REAL spawn-task.sh in --dry-run, so tasks.py's argv is checked against the
+real parser (nothing is spawned). Run with HERDR_RUN_STATE_DIR
 pointed at a scratch dir, same as verify-run-registry.sh, even though this
 script's own sqlite fixture never shares a path with the real one.
 

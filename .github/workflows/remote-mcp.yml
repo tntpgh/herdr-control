@@ -5,10 +5,10 @@ name: remote-mcp
 # snapshots from a fixture hub and delivers to a fake herdr-deliver.
 on:
   pull_request:
-    paths: ["remote-mcp/**", ".github/workflows/remote-mcp.yml"]
+    paths: ["remote-mcp/**", "spawn-task.sh", "lib/**", ".github/workflows/remote-mcp.yml"]
   push:
     branches: [main]
-    paths: ["remote-mcp/**", ".github/workflows/remote-mcp.yml"]
+    paths: ["remote-mcp/**", "spawn-task.sh", "lib/**", ".github/workflows/remote-mcp.yml"]
 
 jobs:
   worker:
@@ -33,3 +33,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 remote-mcp/verify-publisher.py
+      # SpawnArgvAgainstRealParser replays tasks.py's argv through the real
+      # spawn-task.sh, hence spawn-task.sh and lib/** in the path filter.
+      - run: HERDR_RUN_STATE_DIR="$(mktemp -d)/runs" python3 remote-mcp/verify-tasks.py
