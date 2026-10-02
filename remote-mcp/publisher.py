@@ -177,14 +177,19 @@ def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict],
         return births, asks, remotes
     con = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=5)
     try:
+        has_v7 = rtasks.has_v7_task_columns(con)
+        remote_cols = ", remote_task_id, verified, verify_detail" if has_v7 else ""
         marks = ",".join("?" * len(task_ids))
-        for tid, birth, remote_id, verified, detail in con.execute(
-            f"SELECT task_id, pane_birth, remote_task_id, verified, verify_detail FROM tasks WHERE task_id IN ({marks})",
+        for row in con.execute(
+            f"SELECT task_id, pane_birth{remote_cols} FROM tasks WHERE task_id IN ({marks})",
             task_ids,
         ):
+            tid, birth = row[0], row[1]
             births[tid] = birth or ""
-            if remote_id:
-                remotes[tid] = {"remote_task_id": remote_id, "verified": bool(verified), "verify_detail": detail or None}
+            if has_v7:
+                remote_id, verified, detail = row[2], row[3], row[4]
+                if remote_id:
+                    remotes[tid] = {"remote_task_id": remote_id, "verified": bool(verified), "verify_detail": detail or None}
         for tid, at, payload in con.execute(
             f"""SELECT task_id, occurred_at, payload FROM events WHERE type='input_required' AND task_id IN ({marks})
                 AND sequence IN (SELECT MAX(sequence) FROM events WHERE type='input_required' GROUP BY task_id)""",

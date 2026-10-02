@@ -105,11 +105,24 @@ def capabilities_snapshot() -> dict:
 
 
 # ── registry: read-only (writes go through registry-bridge.sh) ─────────────────
+def has_v7_task_columns(con: sqlite3.Connection) -> bool:
+    """True once the tasks table carries the v7 remote-task columns. A
+    long-running publisher LaunchAgent can open the registry before any
+    bash caller (register_task et al, via lib/run-registry.sh's own
+    ensure-schema step) has ever migrated it past v6 -- this read-only
+    sqlite3.connect() never triggers that migration itself, so callers
+    must tolerate its absence rather than crash every tick."""
+    cols = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
+    return {"remote_task_id", "deadline_at", "verified", "verify_detail"} <= cols
+
+
 def _registry_query(where: str, params: tuple) -> list[tuple]:
     if not REGISTRY.exists():
         return []
     con = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=5)
     try:
+        if not has_v7_task_columns(con):
+            return []  # pre-v7 registry: no remote task has ever been possible
         return con.execute(
             f"SELECT task_id, remote_task_id, deadline_at, verified, verify_detail, manifest "
             f"FROM tasks WHERE remote_task_id<>'' AND {where}", params).fetchall()

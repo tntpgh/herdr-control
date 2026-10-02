@@ -361,12 +361,19 @@ first-deploy configuration, `messaging` = messaging on, `tasks` = messaging
 and tasks both on; OAuth flow, tools, scope, throttle, allowlist and
 task-lifecycle enforcement in workerd) and `python3
 remote-mcp/verify-publisher.py` (snapshot, redaction, link and envelope
-handling, delivery re-checks, lost-ack dedup) plus `python3
+handling, delivery re-checks, lost-ack dedup, and graceful degradation
+against a genuine pre-v7 registry — the publisher's own registry read never
+triggers `lib/run-registry.sh`'s schema migration) plus `python3
 remote-mcp/verify-tasks.py` (allowlist/caps refusals, objective sanitization,
 start/cancel/resume command processing, verify-research/verify-implement,
 deadline force-cancel — against fake `spawn-task.sh`/`close-done-workers.sh`/
 `registry-bridge.sh` scripts and a scratch sqlite registry, never the live
-one). CI: `.github/workflows/remote-mcp.yml`. Security review (two rounds,
+one) and `python3 remote-mcp/verify-tasks-e2e.py` (the same command
+pipeline, but through the REAL `registry-bridge.sh`/`lib/run-registry.sh`/
+`close-done-workers.sh` against a scratch `HERDR_RUN_STATE_DIR` — only
+`spawn-task.sh`'s actual pane/tab/agent launch is stubbed, proving tasks.py's
+schema assumptions match what registry migration v7 really produces).
+CI: `.github/workflows/remote-mcp.yml`. Security review (two rounds,
 posted on PR #206): round 1 M1–M8, L1–L4, I1, I2 fixed; round 2 approved the
 read-only first connection, N1–N4, N6, N8, N10 fixed; N5 (single-grant
 revoke) added afterwards in `scripts/grants.py` + `/admin/grants`.

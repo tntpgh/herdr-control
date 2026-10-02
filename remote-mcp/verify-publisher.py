@@ -56,9 +56,11 @@ PANES = [
 ]
 REG = TMP / "registry.sqlite3"
 con = sqlite3.connect(REG)
-con.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, pane_birth TEXT)")
+con.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, pane_birth TEXT, remote_task_id TEXT DEFAULT '', "
+            "deadline_at TEXT, verified INTEGER DEFAULT 0, verify_detail TEXT, manifest TEXT DEFAULT '')")
 con.execute("CREATE TABLE events (sequence INTEGER PRIMARY KEY, task_id TEXT, type TEXT, occurred_at TEXT, payload TEXT)")
-con.executemany("INSERT INTO tasks VALUES (?,?)", [("task_A", "term_a"), ("task_R", "term_OLD"), ("task_OLD", "")])
+con.executemany("INSERT INTO tasks (task_id, pane_birth) VALUES (?,?)",
+                 [("task_A", "term_a"), ("task_R", "term_OLD"), ("task_OLD", "")])
 con.execute("INSERT INTO events VALUES (1,'task_A','input_required',?,?)", (Z(NOW), json.dumps({"tool": "bash", "message": "bash: git status"})))
 con.execute("INSERT INTO events VALUES (2,'task_A','input_required',?,?)",
             (Z(NOW), json.dumps({"tool": "bash", "message": "bash: curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' x"})))
@@ -299,6 +301,36 @@ class Delivery(unittest.TestCase):
             pub.post_sync, pub.deliver, pub.MESSAGING_ON_MAC = real_post, real_deliver, False
         self.assertEqual(typed, ["msg_1"])
         self.assertEqual(pub.load_state()["pending_acks"][0]["detail"], "already delivered (ack was lost)")
+
+class SchemaTolerance(unittest.TestCase):
+    """registry_rows() opens the registry read-only via sqlite3.connect()
+    directly -- it never goes through lib/run-registry.sh's own
+    ensure-schema step, so it never triggers a v6->v7 migration itself. A
+    LaunchAgent started before any bash caller has ever migrated a fresh
+    registry must degrade gracefully, not crash every tick."""
+    def setUp(self):
+        self.v6 = TMP / f"registry-v6-{self._testMethodName}.sqlite3"
+        con = sqlite3.connect(self.v6)
+        con.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, pane_birth TEXT)")
+        con.execute("CREATE TABLE events (sequence INTEGER PRIMARY KEY, task_id TEXT, type TEXT, occurred_at TEXT, payload TEXT)")
+        con.execute("INSERT INTO tasks VALUES ('task_v6', 'term_v6')")
+        con.commit()
+        con.close()
+        self.real_registry = pub.REGISTRY
+        pub.REGISTRY = self.v6
+
+    def tearDown(self):
+        pub.REGISTRY = self.real_registry
+
+    def test_registry_rows_tolerates_a_pre_v7_registry(self):
+        births, asks, remotes = pub.registry_rows(["task_v6"])
+        self.assertEqual(births, {"task_v6": "term_v6"})
+        self.assertEqual(remotes, {})
+
+    def test_build_does_not_crash_against_a_pre_v7_registry(self):
+        snap, local = pub.build(NOW)
+        self.assertIn("tasks", snap)
+
 
 
 if __name__ == "__main__":
