@@ -525,6 +525,43 @@ cp -R "$work/mirror" "$work/added-file-mirror"
 printf '# nothing security-relevant, but it is a NEW file under lib/\n' > "$work/added-file-mirror/lib/zz-unexpected-file.sh"
 out="$(HERDR_OMP_EXTENSION="$work/added-file-mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/z2 implement omp --approval hook)"
 printf '%s' "$out" | grep -q 'content does not match' && ok "F6: an ADDED file anywhere under lib/ also refuses (whole-tree hash, no file list to fall out of sync)" || not_ok "F6 added file: $out"
+# F6 round 2 (security review): the REAL app copy and the dev checkout
+# differ only in lib/__pycache__/*.pyc (compiler output, python
+# version/build-environment dependent, never source) -- hashing them
+# verbatim refused EVERY production spawn on pure noise. A stray .pyc
+# present on only ONE side must not affect the verdict; a changed .sh must
+# still refuse regardless of any .pyc noise sitting alongside it.
+cp -R "$work/mirror" "$work/pyc-noise-mirror"
+mkdir -p "$work/pyc-noise-mirror/lib/__pycache__"
+printf '\x00garbage-bytecode-that-matches-nothing-on-the-other-side' > "$work/pyc-noise-mirror/lib/__pycache__/herdr_live.cpython-314.pyc"
+printf 'not real bytecode either' > "$work/pyc-noise-mirror/lib/stray.pyc"
+out="$(HERDR_OMP_EXTENSION="$work/pyc-noise-mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/z3 implement omp --approval hook)"
+printf '%s' "$out" | grep -q '^  approval  : hook' && ok "F6 r2: a stray __pycache__/*.pyc present on only one side does not affect the verdict (build noise, never source)" || not_ok "F6 pyc noise: $out"
+cp -R "$work/pyc-noise-mirror" "$work/pyc-noise-plus-real-change-mirror"
+printf '\n# a real, security-relevant change\n' >> "$work/pyc-noise-plus-real-change-mirror/lib/scoped-policy.sh"
+out="$(HERDR_OMP_EXTENSION="$work/pyc-noise-plus-real-change-mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/z4 implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'content does not match' && ok "F6 r2: a changed .sh still refuses even with .pyc noise sitting alongside it" || not_ok "F6 changed sh with pyc noise: $out"
+# N1 (security review round 2): per conductor guidance, never read the
+# live deployed install from a test (environment-dependent -- it is
+# main, not this branch, and will always differ pre-deploy). Build the
+# "app copy" by copying THIS WORKING TREE (git archive HEAD would miss
+# this branch's own uncommitted fixes, including this very test's
+# subject), add synthetic pyc noise on top, and prove the SAME two
+# outcomes the F6 r2 tests above prove: untouched content with pyc noise
+# passes, a real .sh change still refuses. A separate scratch copy (not
+# a reuse of $work/mirror) so this test does not depend on test order.
+mkdir -p "$work/n1-mirror/agent-hooks" "$work/n1-mirror/lib"
+cp "$here/agent-hooks/omp-herdr-control.ts" "$work/n1-mirror/agent-hooks/omp-herdr-control.ts"
+cp -R "$here/lib/." "$work/n1-mirror/lib/"
+rm -rf "$work/n1-mirror/lib/__pycache__"
+mkdir -p "$work/n1-mirror/lib/__pycache__"
+printf '\x00garbage-bytecode-from-a-different-python-build' > "$work/n1-mirror/lib/__pycache__/herdr_live.cpython-314.pyc"
+out="$(HERDR_OMP_EXTENSION="$work/n1-mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/n1a implement omp --approval hook)"
+printf '%s' "$out" | grep -q '^  approval  : hook' && ok "N1: a scratch copy of this working tree (the shape a deploy produces) with pyc noise on top is accepted" || not_ok "N1 mirror: $out"
+cp -R "$work/n1-mirror" "$work/n1-mirror-changed"
+printf '\n# a real, security-relevant change\n' >> "$work/n1-mirror-changed/lib/scoped-policy.sh"
+out="$(HERDR_OMP_EXTENSION="$work/n1-mirror-changed/agent-hooks/omp-herdr-control.ts" dry "$here" fix/n1b implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'content does not match' && ok "N1: the SAME scratch copy with a real .sh change still refuses" || not_ok "N1 mirror changed: $out"
 # F9 (security review PR #220): a research/explore worker's OWN hook-mode
 # launch correctly runs at `write` (needed for the --auto-approve swap),
 # but what it stamps as a GRANDCHILD's HERDR_POSTURE_FLOOR must stay the

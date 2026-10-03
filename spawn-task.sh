@@ -276,10 +276,17 @@ case "$approval_req" in
     here_hook="$here/agent-hooks/omp-herdr-control.ts"
     omp_ext_sha="$(shasum -a 256 "$omp_ext_real" 2>/dev/null | cut -d' ' -f1)"
     here_hook_sha="$(shasum -a 256 "$here_hook" 2>/dev/null | cut -d' ' -f1)"
-    _herdr_tree_sha() {  # dir -> sha256 of (relpath, content-sha256) for every regular file, sorted by relpath
+    _herdr_tree_sha() {  # dir -> sha256 of (relpath, content-sha256) for every regular SOURCE file, sorted by relpath
       local d="$1"
       [ -d "$d" ] || return 1
-      ( cd "$d" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done ) 2>/dev/null | shasum -a 256 | cut -d' ' -f1
+      # __pycache__/*.pyc are compiler output, not source -- they differ by
+      # python version/mtime/build environment between two otherwise
+      # byte-identical checkouts (confirmed: the real app copy and the dev
+      # checkout differ ONLY in a stray .pyc), so hashing them refused
+      # every production spawn on pure noise. Skip anything a worktree's
+      # own .gitignore already treats as build output, never source.
+      ( cd "$d" && find . -type f -not -path '*/__pycache__/*' -not -name '*.pyc' -not -name '*.pyo' -not -name '.DS_Store' \
+          | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done ) 2>/dev/null | shasum -a 256 | cut -d' ' -f1
     }
     canon_root="$(cd "$(dirname "$omp_ext_real")/.." 2>/dev/null && pwd)"
     here_lib_sha="$(_herdr_tree_sha "$here/lib")"
@@ -392,10 +399,27 @@ if [ -z "$conductor_pane_id" ] && [ -n "${HERDR_MCP_CONDUCTOR_PANE:-}" ] \
   # "approve ... --authority conductor" prompt this fallback enables would
   # otherwise be typed straight into that worker's session.
   fallback_occupant_state="$(task_for_pane "$HERDR_MCP_CONDUCTOR_PANE" 2>/dev/null | jq -r '.state // empty' 2>/dev/null)"
+  fallback_reject_reason=""
   case "$fallback_occupant_state" in
-    running|starting|blocked) ;;  # it's a live worker right now — leave conductor_pane_id empty
-    *) conductor_pane_id="$HERDR_MCP_CONDUCTOR_PANE" ;;
+    running|starting|blocked) fallback_reject_reason="pane is a registered worker's own active task pane" ;;
   esac
+  # R3 (security review round 2): F8's check only proves "not a currently
+  # registered worker" -- a recycled id hosting any OTHER unregistered
+  # session (a reviewer pane, another conductor) still passed. When the
+  # publisher's config pins the pane's EXPECTED birth (HERDR_MCP_CONDUCTOR_
+  # BIRTH, optional -- a plist value stamped once, same as the pane id
+  # itself), refuse on any mismatch too.
+  if [ -z "$fallback_reject_reason" ] && [ -n "${HERDR_MCP_CONDUCTOR_BIRTH:-}" ]; then
+    live_birth="$(pane_birth_now "$HERDR_MCP_CONDUCTOR_PANE" 2>/dev/null)"
+    [ "$live_birth" = "$HERDR_MCP_CONDUCTOR_BIRTH" ] || fallback_reject_reason="pane birth ${live_birth:-<gone>} does not match the pinned HERDR_MCP_CONDUCTOR_BIRTH"
+  fi
+  if [ -n "$fallback_reject_reason" ]; then
+    # R3: a rejected fallback used to leave no trace at all.
+    append_event "$run_id" "$task_id" conductor_fallback_rejected \
+      "$(jq -nc --arg p "$HERDR_MCP_CONDUCTOR_PANE" --arg r "$fallback_reject_reason" '{pane:$p, reason:$r}')" >/dev/null 2>&1 || true
+  else
+    conductor_pane_id="$HERDR_MCP_CONDUCTOR_PANE"
+  fi
 fi
 conductor_id="${HERDR_CONDUCTOR_ID:-conductor_${conductor_pane_id:-unknown}}"
 

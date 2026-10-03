@@ -160,10 +160,30 @@ out="$(enf write '{"path":"xd://retain","content":"{\"content\":\"x\"}"}')"; rc=
   && ok "F2: a write-restricted task's write xd://retain escalates (no xd:// device is the one allowed file)" \
   || not_ok "expected escalate (xd:// bypass), got rc=$rc: $out"
 
+out="$(enf retain '{"content":"x"}')"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'restricts its write tool to .handoffs/ANSWER.md only' \
+  && ok "R2: the bare 'retain' tool name (not routed through write xd://) also escalates under handoffs_write" \
+  || not_ok "expected escalate (bare retain), got rc=$rc: $out"
+
+out="$(enf xd_retain '{"content":"x"}')"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'restricts its write tool to .handoffs/ANSWER.md only' \
+  && ok "R2: the bare 'xd_retain' tool name also escalates under handoffs_write" \
+  || not_ok "expected escalate (xd_retain), got rc=$rc: $out"
+
+out="$(enf write '{"path":"local://note.md","content":"x"}')"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'restricts its write tool to .handoffs/ANSWER.md only' \
+  && ok "R2: write local://note.md escalates under handoffs_write (not the one allowed file either)" \
+  || not_ok "expected escalate (local://), got rc=$rc: $out"
+
 out="$(enf write '{"path":".handoffs/ANSWER.md\n","content":"x"}')"; rc=$?
-[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'contains a newline' \
-  && ok "F4: a trailing newline in the structured path escalates (a later \$(...) strip would silently hide it from the judge)" \
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'contains a control byte' \
+  && ok "F4: a trailing newline in the structured path escalates (a later \$(...) strip would silently hide it from the judge; R4 broadened this to the full control-byte range)" \
   || not_ok "expected escalate (newline), got rc=$rc: $out"
+
+out="$(enf write '{"path":".handoffs/ANSWER\u0000.md","content":"x"}')"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'contains a control byte' \
+  && ok "R4: an embedded NUL byte in the structured path also escalates (same \$(...)-strips-the-byte risk as the newline case)" \
+  || not_ok "expected escalate (NUL byte), got rc=$rc: $out"
 
 out="$(enf write '{"path":".h*/ANSWER.md","content":"x"}')"; rc=$?
 [ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'restricts its write tool to .handoffs/ANSWER.md only' \
@@ -192,6 +212,16 @@ out="$(enf write '{"path":"src/other.txt","content":"unrestricted"}' task_nomani
 out="$(enf write '{"path":"xd://retain","content":"{\"content\":\"x\"}"}' task_nomanifest)"; rc=$?
 [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | field decision)" = allow ] \
   && ok "F2 control: no handoffs_write manifest — xd://retain still runs the ordinary device table, unaffected by this fix" \
+  || not_ok "expected allow rc=0, got rc=$rc: $out"
+
+out="$(enf retain '{"content":"x"}' task_nomanifest)"; rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | field decision)" = allow ] \
+  && ok "R2 control: no handoffs_write manifest — the bare 'retain' tool name still allows, unaffected by this fix" \
+  || not_ok "expected allow rc=0, got rc=$rc: $out"
+
+out="$(enf write '{"path":"local://note.md","content":"x"}' task_nomanifest)"; rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | field decision)" = allow ] \
+  && ok "R2 control: no handoffs_write manifest — write local://note.md still allows, unaffected by this fix" \
   || not_ok "expected allow rc=0, got rc=$rc: $out"
 
 printf '== B: herdr-action.sh distinguishes conductor_unconfigured from conductor_unreachable ==\n'
@@ -245,6 +275,7 @@ chmod +x "$work/bin/herdr"
 # config.sh puts HERDR_EXTRA_PATH ahead of PATH, so an ambient real herdr
 # install would otherwise shadow this stub inside spawn-task.sh itself.
 dryc() { env -u HERDR_TASK_ID -u HERDR_RUN_ID -u HERDR_PANE_ID HERDR_EXTRA_PATH="$work/bin" "$@" bash "$here/spawn-task.sh" --dry-run --no-secrets "$repo" fix/mcp-fallback implement omp 2>&1; }
+q() { sqlite3 "$(registry_db)" "$1"; }
 
 out="$(HERDR_MCP_CONDUCTOR_PANE="$AGENT_PANE" dryc)"
 printf '%s' "$out" | grep -q "conductor_pane=$AGENT_PANE " \
@@ -263,6 +294,20 @@ printf '%s' "$out" | grep -q "conductor_pane=$AGENT_PANE " \
   && ok "F8 control: once that task is terminal, the SAME pane is adoptable again" \
   || not_ok "a freed pane was still refused: $(printf '%s' "$out" | grep registry)"
 
+out="$(HERDR_MCP_CONDUCTOR_PANE="$AGENT_PANE" HERDR_MCP_CONDUCTOR_BIRTH='expected-birth-that-does-not-match' dryc)"
+printf '%s' "$out" | grep -q 'conductor_pane=<none' \
+  && ok "R3: a pinned HERDR_MCP_CONDUCTOR_BIRTH that does not match the pane's live terminal_id refuses the fallback (recycled to an unrelated, unregistered session)" \
+  || not_ok "birth-mismatched pane was adopted anyway: $(printf '%s' "$out" | grep registry)"
+row="$(q "SELECT payload FROM events WHERE type='conductor_fallback_rejected' ORDER BY sequence DESC LIMIT 1;")"
+printf '%s' "$row" | grep -q 'does not match the pinned HERDR_MCP_CONDUCTOR_BIRTH' \
+  && ok "R3: the rejected fallback is now recorded as a conductor_fallback_rejected event (used to leave no trace)" \
+  || not_ok "no conductor_fallback_rejected event recorded for the birth mismatch: $row"
+
+out="$(HERDR_MCP_CONDUCTOR_PANE="$AGENT_PANE" HERDR_MCP_CONDUCTOR_BIRTH='gen-agent' dryc)"
+printf '%s' "$out" | grep -q "conductor_pane=$AGENT_PANE " \
+  && ok "R3 control: a pinned HERDR_MCP_CONDUCTOR_BIRTH that MATCHES the live pane still adopts it" \
+  || not_ok "birth-matched pane was refused: $(printf '%s' "$out" | grep registry)"
+
 out="$(HERDR_MCP_CONDUCTOR_PANE='w6:p6' dryc)"    # not in the fake herdr's pane list at all
 printf '%s' "$out" | grep -q 'conductor_pane=<none' \
   && ok "HERDR_MCP_CONDUCTOR_PANE naming a dead/unknown pane: left empty exactly as before, task still starts" \
@@ -272,6 +317,29 @@ out="$(env -u HERDR_TASK_ID -u HERDR_RUN_ID HERDR_PANE_ID="$PANE" HERDR_MCP_COND
 printf '%s' "$out" | grep -q "conductor_pane=$PANE " \
   && ok "an interactive HERDR_PANE_ID is never overridden by HERDR_MCP_CONDUCTOR_PANE" \
   || not_ok "interactive pane was overridden: $(printf '%s' "$out" | grep registry)"
+
+printf '== D: lib/command-policy.sh _cp_lexical_abspath (R1, security review round 2) ==\n'
+# R1: this used to pop a ".." component via `set -- "${@:1:$(($#-1))}"` on
+# the bash POSITIONAL PARAMETERS while `IFS=/` was active for the split.
+# Confirmed live on this machine's /bin/bash (GNU bash 3.2.57): that does
+# not even preserve the split, let alone pop the right element -- the
+# reviewer's exact repro strings below must resolve to their lexical
+# normal form, not a corrupted, space-merged string.
+( . "$here/lib/command-policy.sh" >/dev/null 2>&1
+  lex_check() {
+    local got; got="$(_cp_lexical_abspath "$1")"
+    [ "$got" = "$2" ] && echo "ok $1" || echo "FAIL $1 -> '$got' (want '$2')"
+  }
+  lex_check /w/t/src/../x /w/t/x
+  lex_check /w/t/a/b/../../x /w/t/x
+  lex_check /w/t/src/../.handoffs/ANSWER.md /w/t/.handoffs/ANSWER.md
+) > "$work/r1.out"
+while IFS= read -r line; do
+  case "$line" in
+    ok\ *) ok "R1: ${line#ok }" ;;
+    FAIL*) not_ok "R1: $line" ;;
+  esac
+done < "$work/r1.out"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

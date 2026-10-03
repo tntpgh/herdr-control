@@ -297,7 +297,7 @@ _ps_plain_write_verdict() {
 }
 
 pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8 not
-  local payload="$1" tool norm input guard dev cmd op
+  local payload="$1" tool norm input guard dev cmd op manifest hw
   PS_VERDICT=escalate PS_POLICY=tool-table PS_REASON="" PS_AUTHORITY="" PS_REGISTRY_OK=1
   PS_CODE_PATH="" PS_CODE_SHA="" PS_CMD="" PS_TOOL=""
   tool="$(printf '%s' "$payload" | jq -r '.tool // empty' 2>/dev/null)"
@@ -311,7 +311,13 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
   if [ -n "$guard" ]; then
     PS_VERDICT=block PS_POLICY=hook-guard PS_REASON="$guard"; return 8
   fi
-
+  # R2 (security review PR #220 round 2): hoisted here (not just inside the
+  # write case) so EVERY dispatch path that can reach a write-capable
+  # device -- write xd://, the bare xd_<dev> tool name, and the bare
+  # <dev> tool name (retain, notepad_append, ...) -- can gate on the same
+  # handoffs_write restriction, not just the one this PR originally fixed.
+  manifest="$(printf '%s' "$PS_TASK_JSON" | jq -r '.manifest // empty' 2>/dev/null)"
+  hw="$(printf '%s' "$manifest" | jq -r '.handoffs_write // empty' 2>/dev/null)"
   case "$norm" in
     bash|shell)
       if [ -z "${PS_CMD//[[:space:]]/}" ]; then
@@ -327,18 +333,18 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
     eval|python|js|javascript|repl|notebook_eval)
       PS_VERDICT=block PS_REASON="eval runs arbitrary code with no text the policy can judge; disabled for workers — write the code to a file under your worktree and run it via bash (code by reference)" ;;
     write)
-      local manifest hw
-      manifest="$(printf '%s' "$PS_TASK_JSON" | jq -r '.manifest // empty' 2>/dev/null)"
-      hw="$(printf '%s' "$manifest" | jq -r '.handoffs_write // empty' 2>/dev/null)"
       # F4 (security review PR #220): every `.path` extraction below goes
       # through a bash $(...) command substitution, which SILENTLY STRIPS a
       # trailing newline -- so a path judged as the clean string would not
       # be the literal bytes omp actually writes to (node fs does not strip
-      # it). Test the RAW json for ANY embedded newline here, before that
-      # stripping can happen, and refuse outright rather than judge a
-      # string that might not match the real write target.
-      if [ "$(printf '%s' "$input" | jq -r '((.path // "") | test("\n")) // false' 2>/dev/null)" = true ]; then
-        PS_VERDICT=escalate PS_REASON="write path contains a newline, which a later \$(...) substitution would silently drop — the judged string could differ from what omp actually writes; a conductor must review it"
+      # it). Test the RAW json for ANY embedded control byte (round 2 (R4):
+      # NOT just \n -- \0 survives the same $(...) stripping on this
+      # machine's bash and is otherwise a harmless no-op path component,
+      # but judging it is still wrong) here, before that stripping can
+      # happen, and refuse outright rather than judge a string that might
+      # not match the real write target.
+      if [ "$(printf '%s' "$input" | jq -r '((.path // "") | test("[\\x00-\\x1f]")) // false' 2>/dev/null)" = true ]; then
+        PS_VERDICT=escalate PS_REASON="write path contains a control byte, which a later \$(...) substitution can silently drop — the judged string could differ from what omp actually writes; a conductor must review it"
       else
       # omp resolves URL schemes case-insensitively (Xd:// dispatches the
       # device), so the scheme is lowercased before the table.
@@ -369,7 +375,17 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
           _ps_plain_write_verdict "$(printf '%s' "$input" | jq -r '.path' 2>/dev/null | sed -E 's#^[Ff][Ii][Ll][Ee]://##')" ;;
         *://*)
           case "$(_ps_lower_scheme "$(printf '%s' "$input" | jq -r '.path' 2>/dev/null)")" in
-            agent://*|local://*) PS_VERDICT=allow PS_POLICY=containment-159 PS_REASON="write to $(printf '%s' "$input" | jq -r '.path' | sed -E 's#://.*#://#'); containment enforced by the #159 write-scope guard" ;;
+            agent://*) PS_VERDICT=allow PS_POLICY=containment-159 PS_REASON="write to $(printf '%s' "$input" | jq -r '.path' | sed -E 's#://.*#://#'); containment enforced by the #159 write-scope guard" ;;
+            local://*)
+              if [ -n "$hw" ]; then
+                # R2 (security review PR #220 round 2): local:// is omp's
+                # per-session artifact directory -- not the one allowed
+                # file either, so it gets the same treatment as xd:// above
+                # once handoffs_write narrows the write tool.
+                PS_VERDICT=escalate PS_REASON="this task's manifest restricts its write tool to .handoffs/$hw only; local:// is not that file — a conductor must review it"
+              else
+                PS_VERDICT=allow PS_POLICY=containment-159 PS_REASON="write to $(printf '%s' "$input" | jq -r '.path' | sed -E 's#://.*#://#'); containment enforced by the #159 write-scope guard"
+              fi ;;
             *) PS_VERDICT=escalate PS_REASON="write to an unrecognised URL scheme: a conductor must review it" ;;
           esac ;;
         *) _ps_plain_write_verdict "$(printf '%s' "$input" | jq -r '.path // empty' 2>/dev/null)" ;;
@@ -424,9 +440,22 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
         ida|manage_skill) PS_VERDICT=block PS_REASON="$norm is not a worker tool (skills are shared config; ask your conductor)" ;;
       esac ;;
     xd_*)
-      _ps_device "${norm#xd_}" ;;
+      # R2 (security review PR #220 round 2): the SAME device reached as a
+      # bare `xd_<dev>` tool name (not through `write xd://...`) bypassed
+      # the handoffs_write gate above entirely.
+      if [ -n "$hw" ]; then
+        PS_VERDICT=escalate PS_REASON="this task's manifest restricts its write tool to .handoffs/$hw only; xd://${norm#xd_} is not that file — a conductor must review it"
+      else
+        _ps_device "${norm#xd_}"
+      fi ;;
     notepad_append|notepad_priority|notepad_read|notepad_stats|fleet_status|pr_ready|handoff_debt|single_copy_scan|worktree_debt|suite_wired|decisions_open|project_status|recall|reflect|retain|report_issue)
-      _ps_device "$norm" ;;
+      # R2: same gate for the BARE device tool name (e.g. `retain`, which
+      # writes the global memory bank -- not the one allowed file either).
+      if [ -n "$hw" ]; then
+        PS_VERDICT=escalate PS_REASON="this task's manifest restricts its write tool to .handoffs/$hw only; xd://$norm is not that file — a conductor must review it"
+      else
+        _ps_device "$norm"
+      fi ;;
     mcp__*)
       PS_VERDICT=allow PS_REASON="read-only MCP observer (the registration guard blocks every other MCP tool)" ;;
     '')
