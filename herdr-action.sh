@@ -211,7 +211,9 @@ cmd_surface() {                         # id -> wake the conductor once
   label="$(_ha_field "$tj" label)"
   disp="$(pretool_redact "$(_ha_field "$row" command)" | tr '\n' ' ' | cut -c1-300)"
   msg="[HERDR-ACTION] ${label:-$(_ha_field "$row" task_id)} ($(_ha_field "$tj" pane_id)) asks to run: ${disp} — $(_ha_field "$row" reason | cut -c1-200). Request $id. Review the complete action (herdr-action.sh show $id), then: $here/herdr-action.sh approve $id --authority conductor --review-category <local-read|local-build|branch-work|owned-cleanup> --review-reason '<why>'  OR  $here/herdr-action.sh decline $id --authority conductor --review-reason '<why>'"
-  if [ -z "$cpane" ] || [ -z "$cbirth" ] || [ "$cbirth" != "$(pane_birth_now "$cpane")" ]; then
+  if [ -z "$cpane" ]; then
+    outcome=conductor_unconfigured
+  elif [ -z "$cbirth" ] || [ "$cbirth" != "$(pane_birth_now "$cpane")" ]; then
     outcome=conductor_unreachable
   else
     bash "$HA_SEND" "$cpane" "$msg" >/dev/null 2>&1; rc=$?
@@ -393,6 +395,17 @@ EOF
     "actwd_${id}" >/dev/null 2>&1 || true
 }
 
+# _ha_surface_outcome <request_id> -> the outcome recorded on this request's
+# newest action_surfaced event, or empty if it has never been surfaced.
+# cmd_surface only emits one such event per request (claim_once-guarded), so
+# a later tick must read it back here rather than relying on cmd_surface's
+# own (silently swallowed, `|| true`) exit status.
+_ha_surface_outcome() {
+  _sql "SELECT json_extract(payload,'\$.outcome') FROM events
+        WHERE type='action_surfaced' AND json_extract(payload,'\$.request_id')=$(_sq "$1")
+        ORDER BY sequence DESC LIMIT 1;" 2>/dev/null
+}
+
 cmd_tick() {
   local id row tj age now
   registry_init >/dev/null 2>&1 || return 0
@@ -410,7 +423,15 @@ cmd_tick() {
     age=$(( now - $(_ha_epoch "$(_ha_field "$row" created_at)") ))
     if [ "$(_ha_field "$row" route)" = conductor ]; then
       cmd_surface "$id" >/dev/null 2>&1 || true
-      [ "$age" -ge "$HA_STALE_S" ] || continue
+      # remote-research-answer-approval (2026-10-02): a request with NO
+      # conductor pane configured at all (spawn-task.sh recorded none —
+      # never a recycled/stale one, which keeps today's HA_STALE_S wait)
+      # has nobody who could ever see the conductor alert; waiting out the
+      # normal window before the human route only delays a question that
+      # was never going anywhere. Escalate on the very next tick instead.
+      if [ "$(_ha_surface_outcome "$id")" != conductor_unconfigured ]; then
+        [ "$age" -ge "$HA_STALE_S" ] || continue
+      fi
     fi
     ( _ha_human_route "$id" "$row" "$tj" ) >/dev/null 2>&1
   done < <(action_requests_pending)

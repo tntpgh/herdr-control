@@ -336,27 +336,57 @@ _ap_emit() {                            # <argv...> -> one shell-safe launch lin
   printf '%s\n' "$out"
 }
 
-# R3-1 follow-up (conductor's live repro): the job-based posture override
-# must be the SAME decision everywhere a posture gets computed, not just
-# inside cli_for_agent's own launch flag -- spawn-task.sh separately computes
-# its own `eff_posture` (stamped into the worker's environment as
-# HERDR_POSTURE_FLOOR, which governs any GRANDCHILD this worker itself
-# spawns) via resolved_posture directly, with no knowledge of job class. Two
-# independent computations of "what posture does this spawn get" drift by
-# construction -- a research/explore worker's own launch got --approval-mode
-# always-ask, but its stamped floor stayed `write`, so a grandchild it spun
-# up could inherit a LOOSER floor than its own parent, defeating tighten-only
-# inheritance. One function, called from both places.
-posture_want_for_job() {  # <want> <job> -> effective want request (job-class floors win)
-  local want="$1" job="${2:-}"
+# R3-1 follow-up: the job-based posture override must be the SAME decision
+# everywhere a posture gets computed, not just inside cli_for_agent's own
+# launch flag -- spawn-task.sh separately computes its own `eff_posture`
+# (stamped into the worker's environment as HERDR_POSTURE_FLOOR, which
+# governs any GRANDCHILD this worker itself spawns) via resolved_posture
+# directly, with no knowledge of job class. Two independent computations of
+# "what posture does this spawn get" drift by construction -- a
+# research/explore worker's own launch got --approval-mode always-ask, but
+# its stamped floor stayed `write`, so a grandchild it spun up could inherit
+# a LOOSER floor than its own parent, defeating tighten-only inheritance.
+# One function, called from both places.
+#
+# The force is skipped for `approval=hook` (remote-research-answer-approval,
+# 2026-10-02): the whole reason research/explore are forced to `strict` is
+# so their write calls hit an omp MENU, which is the only thing that made
+# _cp_write_menu_verdict's handoffs_write narrowing (lib/command-policy.sh,
+# N8) run at all. A hook-approval task never paints a menu (--auto-approve)
+# and instead has EVERY call -- write included -- judged synchronously by
+# lib/pretool-shadow.sh's pretool_enforce, whose `write` case now applies
+# the identical handoffs_write narrowing to the exact structured path (see
+# _ps_plain_write_verdict) -- never a scraped, possibly-clipped panel. So
+# for a hook task's OWN launch, `write` is the correct posture: forcing
+# `strict` would only block spawn-task.sh's own `--approval hook requires
+# the write posture floor` check for no safety gain. menu-mode
+# research/explore keeps the original force unchanged.
+#
+# `purpose` (F9, security review PR #220): a GRANDCHILD this worker spawns
+# does not inherit the hook's per-call write judge -- only the worker's own
+# session does. `purpose=stamp` (spawn-task.sh's HERDR_POSTURE_FLOOR, which
+# every child spawn composes against and can only tighten past) must stay
+# `strict` for research/explore in EITHER approval mode; `purpose=launch`
+# (the default; what cli_for_agent uses to build --approval-mode) keeps the
+# hook-mode `write` carve-out so the hook's own auto-approve swap still
+# works. The two no longer have to agree.
+posture_want_for_job() {  # <want> <job> [approval] [purpose=launch|stamp] -> effective want request
+  local want="$1" job="${2:-}" approval="${3:-menu}" purpose="${4:-launch}"
   case "$job" in
-    research|explore) printf 'strict\n' ;;
+    research|explore)
+      if [ "$purpose" = stamp ]; then
+        printf 'strict\n'
+      elif [ "$approval" = hook ]; then
+        printf '%s\n' "$want"
+      else
+        printf 'strict\n'
+      fi ;;
     *) printf '%s\n' "$want" ;;
   esac
 }
 
 cli_for_agent() {
-  local a="$1" spec="$2" want="${3:-}" job="${4:-}" tools_req="${5:-}" m e posture flag
+  local a="$1" spec="$2" want="${3:-}" job="${4:-}" tools_req="${5:-}" approval="${6:-menu}" m e posture flag
   local has_effort alt alt_model models tools
   local -a argv
   # R3-1 (round-3 security review): research/explore's whole write
@@ -367,8 +397,9 @@ cli_for_agent() {
   # unprompted write tool. Force `strict` here -- the single point every
   # spawn (local or the remote-mcp publisher's own _spawn, which passes no
   # --posture at all) funnels through -- so a caller's lesser request can
-  # never leave a write unjudged for these two classes.
-  want="$(posture_want_for_job "$want" "$job")"
+  # never leave a write unjudged for these two classes. Skipped for
+  # `approval=hook` -- see posture_want_for_job's own comment.
+  want="$(posture_want_for_job "$want" "$job" "$approval")"
   posture="$(resolved_posture "$want")"
   case "$a" in
     claude|codex)
