@@ -221,6 +221,78 @@ _ps_bash() {                            # command
   case "$PS_VERDICT" in allow|escalate|reserved|deny) ;; *) PS_VERDICT=escalate ;; esac
 }
 
+# _ps_plain_write_verdict <path> -> sets PS_VERDICT/PS_POLICY/PS_REASON (and
+# PS_CMD, for the audit record) for a `write` tool call whose target is an
+# ordinary filesystem path (not a proc:///xd:///other-scheme target, already
+# routed elsewhere in pretool_decide's `write)` case). The #159 guard
+# (agent-hooks/omp-herdr-control.ts, checked earlier via `guard_block` —
+# see pretool_decide) has ALREADY confined this call inside the worktree,
+# which permits all of `.handoffs/**` there; a manifest naming
+# `handoffs_write` (spawn-task.sh, research/explore job classes — N8,
+# lib/command-policy.sh) narrows a write-restricted task further, to
+# exactly its one `.handoffs/<name>` deliverable.
+#
+# This is the SAME narrowing `_cp_write_menu_verdict` applies for the menu
+# path, mirrored here because the input this judges is the STRUCTURED,
+# untruncated `input.path` the omp `tool_call` hook handed us — never a
+# scraped, possibly-clipped approval panel (the failure this replaces:
+# task_20261002T191316Z_54877_5893, SPEC.md). An empty/missing path
+# escalates rather than falling through to containment-159's broad allow —
+# "unknown" must never read as "allowed".
+_ps_plain_write_verdict() {
+  local path="$1" wt manifest hw abs wt_abs rel real real_wt
+  # No PS_CMD here: pretool_enforce's escalate path treats a non-empty
+  # PS_CMD as a COMMAND whose bytes must resolve to a reviewable script
+  # (code_ref_inspect) -- a write tool call is a path+content, not a
+  # command, and setting it made every escalation here refuse outright
+  # ("runs a script that cannot be resolved for review") instead of
+  # creating a reviewable action_requests row. The structured `input`
+  # (and its input_sha256) already carries the path for the audit record.
+  wt="$(printf '%s' "$PS_TASK_JSON" | jq -r '.worktree // empty' 2>/dev/null)"
+  manifest="$(printf '%s' "$PS_TASK_JSON" | jq -r '.manifest // empty' 2>/dev/null)"
+  hw="$(printf '%s' "$manifest" | jq -r '.handoffs_write // empty' 2>/dev/null)"
+  if [ -z "$hw" ]; then
+    PS_VERDICT=allow PS_POLICY=containment-159 PS_REASON="file write; worktree containment enforced by the #159 write-scope guard"
+    return
+  fi
+  PS_POLICY=handoffs-write
+  if [ -z "${path//[[:space:]]/}" ]; then
+    PS_VERDICT=escalate PS_REASON="write call carries no usable structured path — a conductor must review it"
+    return
+  fi
+  if [ -z "$wt" ]; then
+    PS_VERDICT=escalate PS_REASON="worker worktree unknown — cannot judge write path containment"
+    return
+  fi
+  case "$path" in
+    /*) abs="$path" ;;
+    '~'*) PS_VERDICT=escalate PS_REASON="this task's manifest restricts its write tool to .handoffs/$hw only"; return ;;
+    *) abs="$wt/$path" ;;
+  esac
+  abs="$(_cp_lexical_abspath "$abs")"
+  wt_abs="$(_cp_lexical_abspath "$wt")"
+  rel=".handoffs/$hw"
+  if [ "$abs" != "$wt_abs/$rel" ]; then
+    PS_VERDICT=escalate PS_REASON="this task's manifest restricts its write tool to .handoffs/$hw only"
+    return
+  fi
+  # R3-4/R4-2 equivalent (lib/command-policy.sh): the lexical check alone
+  # cannot see a symlink planted AT this exact path. Refuse when the real,
+  # symlink-resolved location differs from the lexical one; compare against
+  # the worktree's OWN resolved root (macOS /tmp -> /private/tmp, etc.) so
+  # only a symlink inside the write target — not an ancestor of the
+  # worktree — can cause a mismatch.
+  if [ -e "$wt/$rel" ] || [ -L "$wt/$rel" ]; then
+    real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt/$rel" 2>/dev/null)"
+    real_wt="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt" 2>/dev/null)"
+    if [ -z "$real" ] || [ -z "$real_wt" ] || [ "$real" != "$real_wt/$rel" ]; then
+      PS_VERDICT=escalate PS_REASON="this task's one allowed .handoffs file is a symlink to somewhere else — remains human-only"
+      return
+    fi
+  fi
+  PS_VERDICT=allow PS_REASON="exact match for this task's one allowed deliverable (.handoffs/$hw)"
+}
+
 pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8 not
   local payload="$1" tool norm input guard dev cmd op
   PS_VERDICT=escalate PS_POLICY=tool-table PS_REASON="" PS_AUTHORITY="" PS_REGISTRY_OK=1
@@ -269,7 +341,7 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
             agent://*|local://*|file://*) PS_VERDICT=allow PS_POLICY=containment-159 PS_REASON="write to $(printf '%s' "$input" | jq -r '.path' | sed -E 's#://.*#://#'); containment enforced by the #159 write-scope guard" ;;
             *) PS_VERDICT=escalate PS_REASON="write to an unrecognised URL scheme: a conductor must review it" ;;
           esac ;;
-        *) PS_VERDICT=allow PS_POLICY=containment-159 PS_REASON="file write; worktree containment enforced by the #159 write-scope guard" ;;
+        *) _ps_plain_write_verdict "$(printf '%s' "$input" | jq -r '.path // empty' 2>/dev/null)" ;;
       esac ;;
     edit|ast_edit|multiedit|notebook|notebook_edit|apply_patch|lsp)
       PS_VERDICT=allow PS_POLICY=containment-159 PS_REASON="file mutation; worktree containment enforced by the #159 write-scope guard" ;;

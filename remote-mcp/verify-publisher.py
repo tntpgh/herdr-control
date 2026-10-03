@@ -372,6 +372,93 @@ class SchemaTolerance(unittest.TestCase):
         self.assertIn("tasks", snap)
 
 
+class HookApprovalBlocker(unittest.TestCase):
+    """remote-research-answer-approval (2026-10-02): a --approval hook
+    task's escalation is an action_requests row, never an input_required
+    event (no omp menu ever paints for it). registry_rows() must surface
+    it as an `ask` the same way, and when conductor_pane_id was never
+    configured at spawn time the summary must say so explicitly (SPEC.md:
+    "so Zero sees why") rather than carry the bare policy reason."""
+
+    def setUp(self):
+        self.reg = TMP / f"registry-hook-{self._testMethodName}.sqlite3"
+        con = sqlite3.connect(self.reg)
+        con.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, pane_birth TEXT, remote_task_id TEXT DEFAULT '', "
+                    "deadline_at TEXT, verified INTEGER DEFAULT 0, verify_detail TEXT, manifest TEXT DEFAULT '')")
+        con.execute("CREATE TABLE events (sequence INTEGER PRIMARY KEY, task_id TEXT, type TEXT, occurred_at TEXT, payload TEXT)")
+        con.execute("CREATE TABLE action_requests (request_id TEXT PRIMARY KEY, task_id TEXT, tool TEXT, reason TEXT, "
+                    "status TEXT, created_at TEXT)")
+        con.execute("INSERT INTO tasks (task_id, pane_birth) VALUES ('task_hook','term_hook')")
+        con.execute("INSERT INTO action_requests VALUES ('ar_1','task_hook','write',"
+                    "'this task''s manifest restricts its write tool to .handoffs/ANSWER.md only','pending',?)", (Z(NOW),))
+        con.execute("INSERT INTO events VALUES (1,'task_hook','action_surfaced',?,?)",
+                    (Z(NOW), json.dumps({"request_id": "ar_1", "outcome": "conductor_unconfigured"})))
+        con.commit()
+        con.close()
+        self.real_registry = pub.REGISTRY
+        pub.REGISTRY = self.reg
+
+    def tearDown(self):
+        pub.REGISTRY = self.real_registry
+
+    def test_registry_rows_surfaces_a_pending_hook_request_as_an_ask(self):
+        _, asks, _, _ = pub.registry_rows(["task_hook"])
+        self.assertEqual(asks["task_hook"]["kind"], "permission")
+        self.assertEqual(asks["task_hook"]["tool"], "write")
+
+    def test_unconfigured_conductor_summary_tells_zero_why(self):
+        _, asks, _, _ = pub.registry_rows(["task_hook"])
+        self.assertEqual(asks["task_hook"]["summary"], "awaiting_owner_approval: no conductor configured")
+
+    def test_a_configured_conductor_keeps_the_policy_reason(self):
+        con = sqlite3.connect(self.reg)
+        con.execute("UPDATE events SET payload=? WHERE sequence=1",
+                    (json.dumps({"request_id": "ar_1", "outcome": "submitted"}),))
+        con.commit(); con.close()
+        _, asks, _, _ = pub.registry_rows(["task_hook"])
+        self.assertIn("restricts its write tool", asks["task_hook"]["summary"])
+
+    def test_decided_requests_are_never_surfaced_as_a_current_blocker(self):
+        con = sqlite3.connect(self.reg)
+        con.execute("UPDATE action_requests SET status='approved' WHERE request_id='ar_1'")
+        con.commit(); con.close()
+        _, asks, _, _ = pub.registry_rows(["task_hook"])
+        self.assertNotIn("task_hook", asks)
+
+    def test_an_input_required_ask_always_wins_over_an_action_request(self):
+        con = sqlite3.connect(self.reg)
+        con.execute("INSERT INTO events VALUES (2,'task_hook','input_required',?,?)",
+                    (Z(NOW), json.dumps({"tool": "bash", "message": "menu-mode ask"})))
+        con.commit(); con.close()
+        _, asks, _, _ = pub.registry_rows(["task_hook"])
+        self.assertEqual(asks["task_hook"]["tool"], "bash")
+        self.assertNotIn("kind", asks["task_hook"])
+
+    def test_build_surfaces_a_running_hook_task_stuck_on_a_pending_request_as_a_blocker(self):
+        wt = WT_ROOT / "kb/feat-hook"
+        (wt / ".handoffs").mkdir(parents=True, exist_ok=True)
+        (wt / ".handoffs/PROOF.md").write_text("proof")
+        task = dict(task_id="task_hook", run_id="r9", label="research:feat/hook", repo="/x/kb", state="running",
+                    pane_id="", conductor_id="conductor_unknown", worktree=str(wt), branch="feat/hook",
+                    project="kb", created_at=Z(NOW), updated_at=Z(NOW))
+        real_hub_get = pub.hub_get
+
+        def fake_hub_get(path):
+            if path == "/herdr?json=1":
+                return {"tasks": [task], "herdr_reachable": True, "live": {"connected": True}}
+            if path == "/api/panes":
+                return {"panes": []}
+            return {}
+        pub.hub_get = fake_hub_get
+        try:
+            snap, _ = pub.build(NOW)
+        finally:
+            pub.hub_get = real_hub_get
+        (b,) = [x for x in snap["blockers"] if x["task_id"] == "task_hook"]
+        self.assertEqual(b["kind"], "permission")
+        self.assertEqual(b["summary"], "awaiting_owner_approval: no conductor configured")
+
+
 class TranscriptSync(unittest.TestCase):
     """changed_results()'s omp:transcript source: the registry's
     agent_session column (REVIEW-213 F3: an ABSOLUTE PATH herdr reports

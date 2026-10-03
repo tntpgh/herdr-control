@@ -486,10 +486,21 @@ printf '%s' "$out" | grep -q 'omp-only' && ok "refused: --approval hook with omc
 out="$(dry "$here" fix/y quick --approval hook -- echo hi)"
 printf '%s' "$out" | grep -q 'managed agent launch' && ok "refused: --approval hook with a literal command" || not_ok "literal hook: $out"
 out="$(HERDR_OMP_EXTENSION="$work/missing.ts" dry "$here" fix/y implement omp --approval hook)"
-printf '%s' "$out" | grep -q 'not this checkout.s enforcing hook' && ok "refused: the extension omp would load is not this checkout's enforcing hook" || not_ok "ext check: $out"
+printf '%s' "$out" | grep -q 'content does not match' && ok "refused: the extension omp would load does not exist (content check, R5 sha256 not path identity)" || not_ok "ext check: $out"
 printf '// old hook\n' > "$work/old-hook.ts"
 out="$(HERDR_OMP_EXTENSION="$work/old-hook.ts" dry "$here" fix/y implement omp --approval hook)"
 printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "refused: an installed hook without the enforcement protocol" || not_ok "old hook: $out"
+# R5 (2026-10-02, remote-research-answer-approval conductor live-test
+# finding): the deployed app copy's $here is never the dev checkout the
+# omp extension symlink points at, so the check must pass on matching
+# CONTENT at a DIFFERENT path, and still refuse one differing byte even
+# with the marker present.
+cp "$here/agent-hooks/omp-herdr-control.ts" "$work/identical-hook.ts"
+out="$(HERDR_OMP_EXTENSION="$work/identical-hook.ts" dry "$here" fix/x implement omp --approval hook)"
+printf '%s' "$out" | grep -q '^  approval  : hook' && ok "R5: byte-identical hook content at a DIFFERENT path is accepted (sha256, not path identity)" || not_ok "R5 identical content: $out"
+{ cat "$here/agent-hooks/omp-herdr-control.ts"; printf '// one extra byte\n'; } > "$work/altered-hook.ts"
+out="$(HERDR_OMP_EXTENSION="$work/altered-hook.ts" dry "$here" fix/y implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'content does not match' && ok "R5: one differing byte (marker still present) still refuses" || not_ok "R5 altered content: $out"
 [ ! -d "$HOME/.herdr/worktrees/$(basename "$repo")" ] && ok "refused spawns created no worktree" || not_ok "a refused spawn left a worktree"
 # The log can see a create: the same stub, asked by ensure-workspace.sh's
 # create path, records one. Without this the check below could pass vacuously.

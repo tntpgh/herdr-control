@@ -339,8 +339,26 @@ def process_command(cmd: dict) -> dict:
 
 
 def _spawn(root: Path, branch: str, mcfg: dict, brief: Path) -> subprocess.CompletedProcess:
+    # remote-research-answer-approval (2026-10-02): research/explore -- never
+    # `implement` -- get --approval hook, never menu. A menu panel in a
+    # narrow herdr pane truncated the write tool's Path:/Content: fields
+    # (task_20261002T191316Z_54877_5893, SPEC.md): the policy could not
+    # verify the write targeted the one allowed .handoffs file, and
+    # conductor_id came back "conductor_unknown" (this Mac process has no
+    # HERDR_PANE_ID), so the escalation had nowhere fast to go either. hook
+    # mode never paints a menu -- every call, the write included, is judged
+    # synchronously on the exact structured path (lib/pretool-shadow.sh's
+    # _ps_plain_write_verdict), never a scraped/clippable panel, and
+    # spawn-task.sh now stamps HERDR_MCP_CONDUCTOR_PANE (when the Mac's
+    # launch environment sets it) as this task's conductor so an escalation
+    # has somewhere to go immediately instead of conductor_unknown.
+    # implement (push-own-branch, no handoffs_write restriction) is
+    # unaffected -- its posture floor already resolves to `write` with no
+    # job-class force, so it needed none of this to use hook mode, and SPEC
+    # does not ask for it here.
+    approval = "hook" if mcfg["job_class"] in ("research", "explore") else "menu"
     args = [SPAWN_TASK, str(root), branch, mcfg["job_class"], "claude", "--no-focus",
-            "--approval", "menu", "--brief", str(brief)]
+            "--approval", approval, "--brief", str(brief)]
     if mcfg["secrets"] == "grant":
         args.append("--secrets")
     try:
@@ -884,7 +902,16 @@ def sweep(tasks_by_id: dict[str, dict], now: datetime) -> list[dict]:
         t = tasks_by_id.get(task_id)
         if not t:
             continue
-        if t["state"] in ("running", "starting", "blocked"):
+        # remote-research-answer-approval (2026-10-03, conductor live-test
+        # finding): t["state"] is the HUB-DERIVED state (publisher.py
+        # build()). Once a worker's completion event lands, derived state
+        # becomes "ready_review" while the registry's own stored_state is
+        # still "running" -- this check used to test derived state, so a
+        # finished task fell out of the running/starting/blocked set
+        # forever and was never auto-closed, never re-checked for its
+        # deadline, and never had its hard-stop timer re-armed (all three
+        # live in this same branch). Decide on stored_state instead.
+        if (t.get("stored_state") or t["state"]) in ("running", "starting", "blocked"):
             deadline = _parse_iso(remote["deadline_at"]) if remote["deadline_at"] else None
             if deadline is None:
                 # N1: a post-spawn set-deadline failure (bridge write lost)

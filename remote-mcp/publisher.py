@@ -216,6 +216,39 @@ def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict],
             except ValueError:
                 p = {}
             asks[tid] = {"at": at, "tool": p.get("tool"), "summary": p.get("message") or p.get("command")}
+        # remote-research-answer-approval (2026-10-02): a `--approval hook`
+        # task (research/explore) never paints an omp menu and so never
+        # writes an input_required event -- its escalations are
+        # action_requests rows (lib/action-request.sh) instead. Without this,
+        # Zero's list_blockers/get_task never saw a hook task stuck on a
+        # pending action, however long it waited. Only the newest PENDING
+        # request per task (a decided/withdrawn one is not a current
+        # blocker); never overrides an input_required ask, since the two
+        # sources are mutually exclusive per task (menu vs hook approval).
+        # Best-effort: a registry older than schema v6 has no such table.
+        try:
+            for tid, rid, tool, reason, at in con.execute(
+                f"""SELECT task_id, request_id, tool, reason, created_at FROM action_requests ar
+                    WHERE task_id IN ({marks}) AND status='pending'
+                      AND created_at = (SELECT MAX(created_at) FROM action_requests
+                                        WHERE task_id = ar.task_id AND status='pending')""",
+                task_ids,
+            ):
+                if tid in asks:
+                    continue
+                outcome = con.execute(
+                    """SELECT json_extract(payload,'$.outcome') FROM events
+                       WHERE task_id=? AND type='action_surfaced' AND json_extract(payload,'$.request_id')=?
+                       ORDER BY sequence DESC LIMIT 1""",
+                    (tid, rid),
+                ).fetchone()
+                summary = reason
+                kind = "permission"
+                if outcome and outcome[0] == "conductor_unconfigured":
+                    summary = "awaiting_owner_approval: no conductor configured"
+                asks[tid] = {"at": at, "tool": tool, "summary": summary, "kind": kind}
+        except sqlite3.OperationalError:
+            pass
     finally:
         con.close()
     return births, asks, remotes, sessions
@@ -312,12 +345,16 @@ def build(now: datetime) -> tuple[dict, dict]:
     blocked_panes = {p["pane_id"] for p in panes if p.get("agent_status") == "blocked"}
     for t in tasks:
         live_blocked = t["pane_id"] in blocked_panes if t["pane_id"] else False
-        if not (live_blocked or t["state"] in ("blocked", "stalled")):
-            continue
         ask = asks.get(t["task_id"])
+        # A hook-approval task's pending action_request (see registry_rows)
+        # never shows up as live_blocked (no omp menu ever paints) or as
+        # registry state blocked/stalled -- the ask's own presence is the
+        # only signal it is stuck, so it must gate this loop too.
+        if not (live_blocked or t["state"] in ("blocked", "stalled") or ask):
+            continue
         blockers.append({
             "task_id": t["task_id"], "label": t["label"], "pane_id": t["pane_id"], "agent_id": t["agent_id"],
-            "kind": "permission" if live_blocked else t["state"],
+            "kind": "permission" if live_blocked else ((ask or {}).get("kind") or t["state"]),
             "tool": ask.get("tool") if ask else None,
             "summary": redact(str(ask["summary"]))[:240] if ask and ask.get("summary") else None,
             "since": iso(ask["at"]) if ask else t["updated_at"],

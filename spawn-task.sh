@@ -52,6 +52,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/handoff.sh"
 . "$here/lib/task-manifest.sh"
 . "$here/lib/op-env.sh"
+. "$here/lib/pane-guard.sh"
 
 # ---- args ------------------------------------------------------------------
 # op_mode inherits TIGHTEN-ONLY, the same shape as HERDR_POSTURE_FLOOR: a worker
@@ -152,7 +153,7 @@ model_for() {  # <agent> <job> -> "<model>" or "<model>:<effort>"
 # such below rather than dressed up as enforced.
 m=$(model_for "$agent" "$job")
 managed=1
-if cli=$(cli_for_agent "$agent" "$m" "$posture_req" "$job" "$tools_req"); then
+if cli=$(cli_for_agent "$agent" "$m" "$posture_req" "$job" "$tools_req" "$approval_req"); then
   # Extra flags/args after the agent name ride along %q-quoted — EXCEPT
   # flags that would override the approval posture, rule/extension loading,
   # or the system-prompt channel this script composes (managed_flag_rejected,
@@ -214,7 +215,7 @@ fi
 # otherwise a research/explore worker's own launch gets --approval-mode
 # always-ask while its STAMPED floor stays `write`, letting any grandchild
 # IT spawns inherit a looser floor than its own parent actually ran at.
-eff_posture=$(resolved_posture "$(posture_want_for_job "$posture_req" "$job")")
+eff_posture=$(resolved_posture "$(posture_want_for_job "$posture_req" "$job" "$approval_req")")
 
 # ---- approval posture (menu | hook) -------------------------------------------
 # Validated here, before any worktree/registry/herdr side effect: an invalid
@@ -238,11 +239,26 @@ case "$approval_req" in
     # --auto-approve is only safe if the extension omp will load at session
     # start IS this checkout's enforcing hook: otherwise (an older main
     # checkout, a missing or foreign symlink) the worker runs with no judge.
+    #
+    # remote-research-answer-approval (2026-10-02, conductor live-test
+    # finding): compared by PATH identity until this fix, which refused
+    # every production spawn -- the publisher runs tasks.py from the
+    # deployed app copy (~/.local/share/herdr-control/app), so $here there
+    # is NOT ~/Code/herdr-control, yet ~/.omp/agent/extensions/herdr-control.ts
+    # is symlinked to the latter. Compare by CONTENT (sha256) instead: sound
+    # because spawn-task.sh stamps HERDR_CONTROL_DIR=$here below, so the
+    # hook's library root (lib/pretool-shadow.sh, etc.) comes from $here
+    # regardless of which byte-identical copy of the .ts file omp actually
+    # loaded. Still refuses on a missing/unreadable file, any byte
+    # difference, or a missing enforcement-protocol marker.
     omp_ext="${HERDR_OMP_EXTENSION:-$HOME/.omp/agent/extensions/herdr-control.ts}"
     omp_ext_real="$(cd "$(dirname "$omp_ext")" 2>/dev/null && python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$omp_ext" 2>/dev/null)"
-    here_hook="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$here/agent-hooks/omp-herdr-control.ts" 2>/dev/null)"
-    if [ -z "$omp_ext_real" ] || [ "$omp_ext_real" != "$here_hook" ] || ! grep -q 'HERDR_HOOK_APPROVAL_PROTOCOL = 1' "$omp_ext_real" 2>/dev/null; then
-      echo "spawn-task: --approval hook: omp would load ${omp_ext_real:-<no extension>} at session start, not this checkout's enforcing hook ($here_hook) — refusing an --auto-approve worker with no judge" >&2
+    here_hook="$here/agent-hooks/omp-herdr-control.ts"
+    omp_ext_sha="$(shasum -a 256 "$omp_ext_real" 2>/dev/null | cut -d' ' -f1)"
+    here_hook_sha="$(shasum -a 256 "$here_hook" 2>/dev/null | cut -d' ' -f1)"
+    if [ -z "$omp_ext_real" ] || [ -z "$omp_ext_sha" ] || [ "$omp_ext_sha" != "$here_hook_sha" ] \
+       || ! grep -q 'HERDR_HOOK_APPROVAL_PROTOCOL = 1' "$omp_ext_real" 2>/dev/null; then
+      echo "spawn-task: --approval hook: omp would load ${omp_ext_real:-<no extension>} at session start, whose content does not match this checkout's enforcing hook ($here_hook) — refusing an --auto-approve worker with no judge" >&2
       exit 2
     fi
     case "$cli" in
@@ -324,6 +340,22 @@ run_id="${HERDR_RUN_ID:-$(gen_id run)}"
 task_id=$(gen_id task)
 worker_id=$(gen_id worker)
 conductor_pane_id="${HERDR_PANE_ID:-}"
+# remote-research-answer-approval (2026-10-02): a spawn with no HERDR_PANE_ID
+# (the remote-mcp publisher's own _spawn call, which runs on the Mac outside
+# any herdr pane) got conductor_pane_id="" and conductor_id="conductor_unknown"
+# -- its escalations (input_required/action_requests) had nowhere to go but
+# the slow Main/stale-window fallback (task_20261002T191316Z_54877_5893,
+# SPEC.md). HERDR_MCP_CONDUCTOR_PANE names a standing conductor pane for
+# exactly that case (a publisher setting, e.g. its launchd plist env) --
+# used ONLY as a fallback, never overriding a real HERDR_PANE_ID (an
+# interactive spawn already has its own conductor). Validated live here, at
+# spawn time: an unset or dead pane leaves conductor_pane_id empty exactly
+# as before -- the task still starts regardless -- rather than registering
+# a conductor that can never answer.
+if [ -z "$conductor_pane_id" ] && [ -n "${HERDR_MCP_CONDUCTOR_PANE:-}" ] \
+   && pane_is_agent "$HERDR_MCP_CONDUCTOR_PANE" 2>/dev/null; then
+  conductor_pane_id="$HERDR_MCP_CONDUCTOR_PANE"
+fi
 conductor_id="${HERDR_CONDUCTOR_ID:-conductor_${conductor_pane_id:-unknown}}"
 
 # The conductor pane's birth fingerprint (herdr's terminal_id), captured NOW

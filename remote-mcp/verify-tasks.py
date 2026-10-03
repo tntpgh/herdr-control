@@ -208,10 +208,20 @@ class SpawnArgvAgainstRealParser(unittest.TestCase):
             tsk.subprocess.run = real_run
         self.assertEqual(len(captured), 2)
         real_spawn = str(HERE.parent / "spawn-task.sh")
+        # research now spawns with --approval hook (remote-research-answer-
+        # answer-approval, 2026-10-02): spawn-task.sh's own safety check
+        # refuses --auto-approve unless the omp extension it would load IS
+        # this checkout's enforcing hook (never true for ~/.omp/agent/
+        # extensions/herdr-control.ts, which is normally symlinked to the
+        # deployed MAIN checkout, not this test's worktree) --
+        # HERDR_OMP_EXTENSION overrides that lookup for exactly this reason
+        # (same seam verify-pretool-enforce.sh's own hook dry-run tests use).
+        hook_env = {**os.environ, "HERDR_RUN_STATE_DIR": str(TMP / "argv-runs"),
+                    "HERDR_OMP_EXTENSION": str(HERE.parent / "agent-hooks" / "omp-herdr-control.ts")}
         for argv in captured:
             brief.write_text("objective\n")  # _spawn unlinks its brief once spawn-task.sh returns
             out = subprocess.run(["bash", real_spawn, *argv[1:], "--dry-run"], capture_output=True, text=True,
-                                 timeout=60, env={**os.environ, "HERDR_RUN_STATE_DIR": str(TMP / "argv-runs")})
+                                 timeout=60, env=hook_env)
             self.assertEqual(out.returncode, 0, out.stderr[-500:])
             launch = next((l for l in out.stdout.splitlines() if l.strip().startswith("launch")), "")
             self.assertTrue(launch, out.stdout[-500:])
@@ -793,6 +803,40 @@ class Sweep(unittest.TestCase):
             self.assertFalse(any(a["action"] == "hard_stop_retry" for a in quiet))
         finally:
             tsk._popen_detached = old
+
+    def test_sweep_retries_auto_close_when_derived_state_moved_to_ready_review_but_stored_state_is_still_live(self):
+        # remote-research-answer-approval (2026-10-03, conductor live-test
+        # finding): publisher.py's `state` field is the HUB-DERIVED state
+        # (ready_review once a worker's completion event lands), while the
+        # registry's own stored_state stays "running" until
+        # close-done-workers.sh actually closes it. sweep() used to gate on
+        # DERIVED state, so a finished task fell out of the
+        # running/starting/blocked set the instant its completion event
+        # landed and was never auto_closed again -- including never
+        # retried past a transient HOLD (pane still WORKING).
+        self._row("task_e", "rtask_e")
+        self._event("task_e", "hard_stop_scheduled", json.dumps({"pid": 1}))
+        (self.wt / ".handoffs/identity.json").write_text(json.dumps({"completion_event": "x_done"}))
+        (self.wt / ".handoffs/events.jsonl").write_text(
+            json.dumps({"event": "x_done", "status": "completed", "reason": "no-follow-on"}) + "\n")
+        t = {"task_id": "task_e", "run_id": "run_x", "state": "ready_review", "stored_state": "running",
+             "worktree": str(self.wt)}
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        FAKE_CLOSE_OUT.write_text("  HOLD: pane is WORKING\n")
+        try:
+            actions = tsk.sweep({"task_e": t}, now)
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["action"], "auto_close")
+            self.assertFalse(actions[0]["ok"], "a HOLD must be reported, not silently dropped")
+            # Retried on the next tick (same ready_review/running pairing):
+            # the first HOLD must not have been the sweep's last look at it.
+            FAKE_CLOSE_OUT.write_text("  close    pane_1   label    (idle)\n")
+            actions2 = tsk.sweep({"task_e": t}, now)
+            self.assertEqual(len(actions2), 1)
+            self.assertEqual(actions2[0]["action"], "auto_close")
+            self.assertTrue(actions2[0]["ok"])
+        finally:
+            FAKE_CLOSE_OUT.write_text("  close    pane_1   label    (idle)\n")
 
 
 class HardStop(unittest.TestCase):
