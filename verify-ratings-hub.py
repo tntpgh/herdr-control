@@ -137,6 +137,36 @@ class PublishTests(unittest.TestCase):
                 self.assertEqual(code, 400)
         self.assertEqual(self.popen_calls, [])
 
+    def test_sections_are_not_required_a_partial_submit_is_allowed(self):
+        # PR #214 review LOW F4: every section's copy says "skip any you
+        # don't have an opinion on" (RATINGS_FORM), but `required` on the
+        # radio group made a partial submit impossible even though KB
+        # accepts partial batches.
+        payload = {"run_id": "run-partial",
+                   "sections": [{"slug": "a", "title": "A"}, {"slug": "b", "title": "B"}]}
+        code, _ = hub.publish_ratings_form(payload)
+        self.assertEqual(code, 200)
+        html_text = self._form_html("run-partial").read_text()
+        self.assertNotIn("required", html_text,
+                          "a section's radio group must not be required: skipping it is allowed")
+
+    def test_run_id_cannot_break_out_of_the_inline_script(self):
+        # PR #214 review LOW F3: run_id goes into RATINGS_FORM's inline
+        # <script> through json.dumps, which leaves a literal </script>
+        # intact and lets a crafted run_id close the block early and run
+        # markup/script in the hub's own origin.
+        evil = "run</script><script>window.pwned=1</script>"
+        payload = {"run_id": evil, "sections": [{"slug": "a", "title": "A"}]}
+        code, _ = hub.publish_ratings_form(payload)
+        self.assertEqual(code, 200)
+        forms = sorted((STATE / "forms").glob("ratings-*.html"))
+        self.assertEqual(len(forms), 1, f"expected exactly one published form, got {forms}")
+        html_text = forms[0].read_text()
+        self.assertNotIn("</script><script>window.pwned",
+                          html_text, "run_id must not be able to close the inline <script> early")
+        self.assertIn("\\u003c/script>\\u003cscript>window.pwned", html_text,
+                       "run_id's < characters must be escaped inside the inline <script>")
+
 
 class PublishHttpTests(unittest.TestCase):
     """The Content-Type gate lives in do_POST, not publish_ratings_form -- a
@@ -319,6 +349,80 @@ class MirrorExclusionTests(unittest.TestCase):
         self.assertNotIn("ratings-form", ids, "a ratings form must never reach the dashboard mirror")
         self.assertIn("decision-form", ids)
         self.assertIsNone(hub.MIRROR_STATE["last_error"])
+
+
+class PortAnswerDispatchTests(unittest.TestCase):
+    """PR #214 review MEDIUM F1: `record_answer` and `record_remote_answer`
+    dispatch inline because THIS HUB recorded the answer. An answer that
+    lands on formserve's own port (answered_via=port) never goes through
+    either -- formserve.py writes straight to the registry and never imports
+    this module -- so without the reconciler it is recorded locally but
+    never reaches kb.section_ratings, and nothing logs it."""
+
+    def setUp(self):
+        for p in sorted(STATE.glob("forms/*")):
+            p.unlink()
+        self.run_calls = []
+        self.secret_patcher = patch.object(hub, "secret", return_value="postgres://dsn")
+        self.secret_patcher.start()
+        self.addCleanup(self.secret_patcher.stop)
+
+    def _run(self, result):
+        def fake_run(argv, **kw):
+            self.run_calls.append((argv, kw.get("input")))
+            return result
+        return patch.object(hub.subprocess, "run", side_effect=fake_run)
+
+    def test_port_answered_ratings_form_is_dispatched_and_marked(self):
+        make_form("p1", key="ratings:run-port", status="answered", answered_via="port",
+                  answers={"ratings": {"kb-nightly": "acted_on"}})
+        result = subprocess.CompletedProcess([], 0, json.dumps({"recorded": ["kb-nightly"], "errors": []}), "")
+        with self._run(result):
+            hub._reconcile_port_ratings_answers()
+        self.assertEqual(len(self.run_calls), 1)
+        argv, stdin = self.run_calls[0]
+        self.assertEqual(argv, [str(hub.KB_PYTHON), "-m", "server.ratings", "hub-answer"])
+        sent = json.loads(stdin)
+        self.assertEqual(sent["run_id"], "run-port")
+        self.assertEqual({a["section_key"]: a["rating"] for a in sent["answers"]},
+                         {"kb-nightly": "acted_on"})
+        self.assertIsNotNone(local("p1").get("ratings_dispatched_at"),
+                              "a successful dispatch must be marked so it is never re-sent")
+
+    def test_already_dispatched_port_answer_is_never_resent(self):
+        make_form("p2", key="ratings:run-done", status="answered", answered_via="port",
+                  answers={"ratings": {"s": "noise"}}, ratings_dispatched_at=123)
+        with self._run(subprocess.CompletedProcess([], 0, "{}", "")):
+            hub._reconcile_port_ratings_answers()
+        self.assertEqual(self.run_calls, [])
+
+    def test_failed_dispatch_is_logged_and_left_unmarked_for_retry(self):
+        make_form("p3", key="ratings:run-retry", status="answered", answered_via="port",
+                  answers={"ratings": {"s": "acted_on"}})
+        with self._run(subprocess.CompletedProcess([], 1, "", "boom")):
+            with patch.object(hub.sys, "stderr") as mock_stderr:
+                hub._reconcile_port_ratings_answers()
+        self.assertTrue(mock_stderr.write.called, "a failed dispatch must be logged")
+        logged = "".join(c.args[0] for c in mock_stderr.write.call_args_list)
+        self.assertIn("run-retry", logged)
+        self.assertIsNone(local("p3").get("ratings_dispatched_at"),
+                           "a failed dispatch must stay unmarked so the next cycle retries it")
+
+    def test_hub_or_dashboard_answered_rows_are_never_touched(self):
+        # Those paths already dispatched inline at answer time (above); the
+        # reconciler exists only for the port path.
+        make_form("p4", key="ratings:run-hub", status="answered", answered_via="hub",
+                  answers={"ratings": {"s": "acted_on"}})
+        with self._run(subprocess.CompletedProcess([], 0, "{}", "")):
+            hub._reconcile_port_ratings_answers()
+        self.assertEqual(self.run_calls, [])
+
+    def test_open_forms_and_non_ratings_port_answers_are_ignored(self):
+        make_form("p5", status="open")
+        make_form("p6", status="answered", answered_via="port")  # no ratings sidecar key
+        with self._run(subprocess.CompletedProcess([], 0, "{}", "")):
+            hub._reconcile_port_ratings_answers()
+        self.assertEqual(self.run_calls, [])
 
 
 if __name__ == "__main__":

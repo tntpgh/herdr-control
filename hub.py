@@ -1550,7 +1550,11 @@ def _dispatch_ratings_answer(run_id: str, row: dict) -> None:
                      daemon=True).start()
 
 
-def _dispatch_ratings_answer_now(run_id: str, payload: dict) -> None:
+def _dispatch_ratings_answer_now(run_id: str, payload: dict) -> bool:
+    """Returns True once KB confirms the write (exit 0, no partial `errors`).
+    Callers that fire this off a thread (above) don't read the return value;
+    `_reconcile_port_ratings_answers` below does, to decide whether an
+    answer needs a retry next cycle."""
     try:
         dsn = secret("NEON_CONNECTION_STRING")
     except ValueError:
@@ -1558,7 +1562,7 @@ def _dispatch_ratings_answer_now(run_id: str, payload: dict) -> None:
     if not dsn:
         print(f"hub: ratings dispatch for {run_id} skipped: NEON_CONNECTION_STRING unavailable",
               file=sys.stderr)
-        return
+        return False
     env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if k in os.environ}
     env["NEON_CONNECTION_STRING"] = dsn
     try:
@@ -1570,8 +1574,83 @@ def _dispatch_ratings_answer_now(run_id: str, payload: dict) -> None:
         if r.returncode != 0 or errors:
             print(f"hub: ratings dispatch for {run_id}: exit {r.returncode}, "
                   f"{len(errors)} error(s): {errors}", file=sys.stderr)
+            return False
+        return True
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as e:
         print(f"hub: ratings dispatch for {run_id} failed: {e}", file=sys.stderr)
+        return False
+
+
+# PR #214 review MEDIUM F1: `record_answer` and `record_remote_answer` above
+# dispatch inline because an answer there was recorded BY THIS HUB. An answer
+# that lands on formserve's own port never goes through either -- that
+# process (formserve.py) writes straight to the registry file via
+# record_store and has no import of this module, so nothing ever called
+# `_dispatch_ratings_answer` for it. It sat in the registry, recorded and
+# durable, but never reached kb.section_ratings and nothing logged it. This
+# reconciler is the catch-all: it finds that row later, from the registry
+# itself, and dispatches it the identical way.
+RATINGS_RECONCILE_EVERY_S = float(os.environ.get("HERDR_RATINGS_RECONCILE_EVERY_S", "30"))
+
+
+def _undispatched_port_ratings_answers() -> list[tuple[Path, dict]]:
+    """Every answered-via-port ratings row this hub has not yet dispatched."""
+    out: list[tuple[Path, dict]] = []
+    if not FORMS_DIR.is_dir():
+        return out
+    for path in sorted(FORMS_DIR.glob("*.json")):
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if row.get("status") != "answered" or row.get("answered_via") != "port":
+            continue
+        if row.get("ratings_dispatched_at"):
+            continue
+        key = _sidecar_key(row.get("form_path"))
+        if key and key.startswith(RATINGS_KEY_PREFIX):
+            out.append((path, row))
+    return out
+
+
+def _mark_ratings_dispatched(row: dict) -> dict:
+    row["ratings_dispatched_at"] = int(time.time() * 1000)
+    return row
+
+
+def _reconcile_port_ratings_answers() -> None:
+    """Best-effort, same posture as mirror_sync: never raises, a failure is
+    logged and left for the next cycle to retry, success is marked durably on
+    the row (`ratings_dispatched_at`) so a dispatched answer is never
+    re-sent."""
+    for path, row in _undispatched_port_ratings_answers():
+        key = _sidecar_key(row.get("form_path")) or ""
+        run_id = key[len(RATINGS_KEY_PREFIX):]
+        answers = (row.get("answers") or {}).get("ratings")
+        if not isinstance(answers, dict) or not answers:
+            continue
+        payload = {"run_id": run_id, "attempt_number": 1,
+                   "answers": [{"section_key": k, "rating": v} for k, v in answers.items()]}
+        if not _dispatch_ratings_answer_now(run_id, payload):
+            continue  # already logged by _dispatch_ratings_answer_now; retried next cycle
+        try:
+            claim_and_update(path, _mark_ratings_dispatched, require_status="answered")
+        except (NotClaimable, FileNotFoundError, OSError, json.JSONDecodeError) as e:
+            # The KB write already landed -- only the local marker failed, so
+            # the next cycle dispatches again. server.ratings hub-answer is a
+            # same-run_id/section_key upsert inside the 24h correction window
+            # (one live row per section), so a duplicate dispatch overwrites,
+            # never double-counts.
+            print(f"hub: ratings reconcile marker for {run_id} not written: {e}", file=sys.stderr)
+
+
+def _ratings_reconcile_loop() -> None:
+    while True:
+        try:
+            _reconcile_port_ratings_answers()
+        except Exception as e:  # noqa: BLE001 — belt and braces: the loop must not die
+            print(f"hub: ratings reconcile loop error: {type(e).__name__}: {e}", file=sys.stderr)
+        time.sleep(RATINGS_RECONCILE_EVERY_S)
 
 
 def mirror_sync() -> None:
@@ -2451,7 +2530,7 @@ var ratings={{}};fd.forEach(function(v,k){{if(k.indexOf("section:")===0)ratings[
 window.submitAnswers({{run_id:{run_id_json},ratings:ratings}})}});</script></body></html>"""
 
 RATINGS_FIELD = """<fieldset><legend>{title}</legend>{summary}
-<label class=opt><input type=radio name="section:{slug}" value=acted_on required><span>Acted on</span></label>
+<label class=opt><input type=radio name="section:{slug}" value=acted_on><span>Acted on</span></label>
 <label class=opt><input type=radio name="section:{slug}" value=reviewed_no_action><span>Read, no action</span></label>
 <label class=opt><input type=radio name="section:{slug}" value=noise><span>Noise</span></label>
 </fieldset>"""
@@ -2503,7 +2582,7 @@ def publish_ratings_form(payload: dict) -> tuple[int, bytes]:
     title = f"ratings: {time.strftime('%Y-%m-%d', time.localtime())} ({len(fields)} sections)"
     form = FORMS_DIR / f"ratings-{_slug(run_id)}-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}.html"
     form.write_text(RATINGS_FORM.format(
-        title=_esc(title), fields="".join(fields), run_id_json=json.dumps(run_id)))
+        title=_esc(title), fields="".join(fields), run_id_json=_script_json(run_id)))
     form.with_suffix(".key").write_text(_ratings_key(run_id))
     # 24h timeout, matching the rating's own correction window -- answerable
     # any time that day, not just the minutes right after the briefing sends.
@@ -2796,6 +2875,15 @@ CACHES = {
 # ── rendering ──────────────────────────────────────────────────────────────────
 def _esc(v) -> str:
     return html.escape(str(v if v is not None else ""))
+
+
+def _script_json(v) -> str:
+    """json.dumps with `<` escaped to `\\u003c` so the result is safe to
+    inline inside a `<script>` block -- a value containing a literal
+    `</script>` would otherwise close the block early and run as markup/script
+    in the hub's own origin (PR #214 review LOW F3, e.g. RATINGS_FORM's
+    `run_id_json`)."""
+    return json.dumps(v).replace("<", "\\u003c")
 
 
 def _age(iso) -> str:
@@ -4462,6 +4550,10 @@ def main() -> int:
         LIVE.start()
     if not args.no_mirror:
         threading.Thread(target=_mirror_loop, name="dashboard-mirror", daemon=True).start()
+        # Same smoke-run flag: both need NEON_CONNECTION_STRING and shell out
+        # to the kb-deploy checkout, and both degrade to a logged no-op
+        # without it (PR #214 review MEDIUM F1's reconciler).
+        threading.Thread(target=_ratings_reconcile_loop, name="ratings-reconcile", daemon=True).start()
     if not args.no_attention:
         threading.Thread(target=_attention_loop, name="attention-controller", daemon=True).start()
         # project-contract-plan.md item 3, "carry to completion" — a separate
