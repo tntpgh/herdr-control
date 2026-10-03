@@ -5,7 +5,7 @@ import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
 import { beforeEach, expect, it } from "vitest";
 import type { HerdrState } from "../src/state";
 import type { Env } from "../src/types";
-import { accessJwt, BASE, callTool, oauthToken, queueRaw, signedSync, snapshot, syncBody } from "./helpers";
+import { accessJwt, BASE, callTool, oauthToken, queueRaw, queueRawOwner, signedSync, snapshot, syncBody } from "./helpers";
 
 const e = env as unknown as Env;
 beforeEach(() => reset());
@@ -15,6 +15,28 @@ it("advertises only herdr:read, and says so on /healthz before anyone connects",
   expect(as.scopes_supported).toEqual(["herdr:read"]);
   const health = await (await SELF.fetch(`${BASE}/healthz`)).json();
   expect(health).toMatchObject({ messaging_enabled: false, scopes_offered: ["herdr:read"], build_sha: "unstamped" });
+});
+
+it("offers no owner-inbox scope and refuses send_owner_message in the Durable Object, off by default", async () => {
+  const as: { scopes_supported?: string[] } = await (await SELF.fetch(`${BASE}/.well-known/oauth-authorization-server`)).json();
+  expect(as.scopes_supported).not.toContain("herdr:message.owner");
+  const health = await (await SELF.fetch(`${BASE}/healthz`)).json();
+  expect(health).toMatchObject({ owner_inbox_enabled: false });
+  const out = await runInDurableObject(e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet")), (o: HerdrState) =>
+    o.sendOwnerMessage(Date.now(), { email: "tnt@teamthurber.com", client_id: "c", client_name: "Zero" },
+      ["herdr:read", "herdr:message.owner"], "conductor", "hi", "cm1"));
+  expect(out).toEqual({ ok: false, reason: "owner_inbox_disabled" });
+});
+
+it("never hands out an owner message queued before owner-inbox was switched off", async () => {
+  await signedSync(syncBody());
+  const fleet = e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet"));
+  const id = await runInDurableObject(fleet, (_o: HerdrState, state) => queueRawOwner(state.storage));
+  const reply = (await (await signedSync(syncBody())).json()) as { owner_outbox: unknown[]; audit: { decision: string; reason: string }[] };
+  expect(reply.owner_outbox).toHaveLength(0);
+  expect(reply.audit.find((a) => a.decision === "cancelled_before_delivery")?.reason).toBe("owner_inbox_disabled");
+  const m = await runInDurableObject(fleet, (o: HerdrState) => o.ownerMessageStatus(id, "tnt@teamthurber.com"));
+  expect([m?.status, m?.detail]).toEqual(["blocked:owner_inbox_disabled", "owner_inbox_disabled"]);
 });
 
 it("offers no messaging checkbox and grants read only, even when the client asks for herdr:message", async () => {

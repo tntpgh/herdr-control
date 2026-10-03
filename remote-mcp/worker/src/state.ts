@@ -6,10 +6,10 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import { emailAllowed } from "./access";
-import { connection, DEFAULT_LIMITS, rateLimited, resolveTarget, sanitizeMessage, sanitizeObjective } from "./policy";
+import { connection, DEFAULT_LIMITS, OWNER_LABEL, OWNER_LIMITS, rateLimited, resolveTarget, sanitizeMessage, sanitizeObjective, sanitizeOwnerMessage } from "./policy";
 import type { Connection, MessageLimits } from "./policy";
-import type { CommandAck, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem, ResultDoc, Sender, Snapshot, TaskCaps, TaskRow } from "./types";
-import { SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START, SNAPSHOT_SCHEMA } from "./types";
+import type { CommandAck, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem, OwnerAck, OwnerOutboxItem, OwnerReplySync, ResultDoc, Sender, Snapshot, TaskCaps, TaskRow } from "./types";
+import { SCOPE_OWNER_MESSAGE, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START, SNAPSHOT_SCHEMA } from "./types";
 
 const str = z.string().max(4000);
 const ExtState = z.enum(["enabled", "disabled", "missing", "unknown"]);
@@ -52,6 +52,8 @@ const SyncSchema = z.object({
       extensions: z.object({ omp_relay: ExtState, "1password": ExtState, chatgpt: ExtState }),
       stray_omp_chromes: z.number().int().min(0).max(1000), healthy: z.boolean(),
     }).nullable().optional().catch(null),
+    // label + liveness only -- never pane_id/cwd (README "What leaves the Mac").
+    owners: z.array(z.object({ label: str, live: z.boolean() })).max(200).nullable().optional(),
   }),
   results: z.array(z.object({
     task_id: str, source: str, text: z.string().max(70_000), sha256: str, source_mtime: nstr, truncated_at_source: z.boolean(),
@@ -63,6 +65,13 @@ const SyncSchema = z.object({
     command_id: str, outcome: z.enum(["accepted", "refused", "failed"]), detail: str,
     local_task_id: str.optional(), local_run_id: str.optional(), branch: str.optional(),
     pane_id: str.optional(), agent_id: str.optional(), capability_probe: z.record(z.string(), z.boolean()).optional(),
+  })).max(200).optional(),
+  owner_acks: z.array(z.object({
+    exchange_id: str, outcome: z.enum(["delivered", "blocked"]), reason: str.optional(),
+  })).max(200).optional(),
+  owner_replies: z.array(z.object({
+    exchange_id: str, owner_label: str, body: z.string().max(70_000), responded_at: str,
+    artifact_revision: str, session: str,
   })).max(200).optional(),
   audit_cursor: z.number().int().min(0),
   lease: z.boolean(),
@@ -84,6 +93,7 @@ export interface AuditRow {
 export interface SyncResponse {
   outbox: OutboxItem[];
   commands: CommandItem[];
+  owner_outbox: OwnerOutboxItem[];
   audit: AuditRow[];
   audit_cursor: number;
 }
@@ -111,6 +121,31 @@ export interface MessageRecord {
 export type SendOutcome =
   | { ok: true; message: MessageRecord }
   | { ok: false; reason: string; candidates?: string[] };
+
+export interface OwnerMessageRecord {
+  exchange_id: string;
+  created_at: string;
+  updated_at: string;
+  status: string; // queued | delivered | blocked:<reason> | replied
+  detail: string;
+  attempts: number;
+  owner_label: string;
+  delivered_at: string | null;
+  body_chars: number;
+}
+
+export type SendOwnerMessageOutcome =
+  | { ok: true; exchange_id: string; state: string }
+  | { ok: false; reason: string };
+
+export interface OwnerReplyRecord {
+  exchange_id: string;
+  owner_label: string;
+  session: string;
+  responded_at: string;
+  artifact_revision: string;
+  body: string;
+}
 
 export interface View {
   snapshot: Snapshot | null;
@@ -186,6 +221,10 @@ const MAX_ATTEMPTS = 40;
 // and leaving a single cancel_stuck event instead of an unbounded flood --
 // same shape, same cap, as registry-bridge.sh's own CANCEL_STUCK_THRESHOLD.
 const CANCEL_RETRY_CAP = 5;
+// SPEC: "Retry on later ticks; after N ticks, stay blocked" for
+// owner_at_approval_prompt specifically -- every OTHER owner-message blocked
+// reason finalizes on first report (there is nothing to wait out).
+const APPROVAL_RETRY_CAP = 10;
 const AUDIT_KEEP_MS = 180 * 86_400_000;
 // Every tool call by one client (allowed or refused) counts. A ChatGPT session
 // makes a handful of calls per turn; these only bite a loop or a leaked token.
@@ -279,6 +318,25 @@ export class HerdrState extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS task_events (cursor INTEGER PRIMARY KEY AUTOINCREMENT,
       remote_task_id TEXT NOT NULL, type TEXT NOT NULL, at INTEGER NOT NULL, detail TEXT NOT NULL DEFAULT '{}')`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS task_events_by_task ON task_events(remote_task_id, cursor)`);
+    // send_owner_message's own queue, independent of `messages` (different
+    // rate limit, different target shape -- a named owning session, never a
+    // task's agent -- different ack vocabulary: delivered/blocked/replied,
+    // no "refused"/"failed"/"expired"). UNIQUE(sender_actor, sender_client,
+    // client_msg_id) is the dedupe key SPEC asks for: a repeat send with the
+    // same client_msg_id must return the ORIGINAL exchange_id, never queue
+    // twice. The reply_* columns are filled in once, by sendOwnerReply's own
+    // validated sync() path -- never by the sender.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS owner_messages (exchange_id TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+      sender_actor TEXT NOT NULL, sender_client TEXT NOT NULL, sender_client_name TEXT NOT NULL DEFAULT '',
+      client_msg_id TEXT NOT NULL, owner_label TEXT NOT NULL, body TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued', detail TEXT NOT NULL DEFAULT '',
+      attempts INTEGER NOT NULL DEFAULT 0, lease_until INTEGER NOT NULL DEFAULT 0, delivered_at INTEGER,
+      reply_body TEXT NOT NULL DEFAULT '', reply_session TEXT NOT NULL DEFAULT '',
+      reply_artifact_revision TEXT NOT NULL DEFAULT '', replied_at INTEGER)`);
+    this.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS owner_messages_dedupe
+      ON owner_messages(sender_actor, sender_client, client_msg_id)`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS owner_messages_by_status ON owner_messages(status, created_at)`);
   }
 
   private staleAfterS(): number {
@@ -432,6 +490,92 @@ export class HerdrState extends DurableObject<Env> {
   pendingSenders(nowMs: number): Sender[] {
     return this.sql.exec<{ actor: string; client_id: string }>(
       `SELECT DISTINCT actor, client_id FROM messages WHERE status IN ('queued','delivering') AND expires_at > ?`, nowMs).toArray();
+  }
+
+  sendOwnerMessage(nowMs: number, caller: Caller, scopes: string[], ownerLabel: string, rawBody: string,
+      clientMsgId: string): SendOwnerMessageOutcome {
+    const refuse = (reason: string): SendOwnerMessageOutcome => {
+      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "send_owner_message", target: ownerLabel,
+        decision: "refused", reason, message_id: "", detail: `chars=${rawBody.length}` });
+      return { ok: false, reason };
+    };
+    const limited = this.throttled(nowMs, caller, "send_owner_message");
+    if (limited) return { ok: false, reason: limited };
+    if (this.env.OWNER_INBOX_ENABLED !== "true") return refuse("owner_inbox_disabled");
+    if (!scopes.includes(SCOPE_OWNER_MESSAGE)) return refuse(`missing_scope ${SCOPE_OWNER_MESSAGE}`);
+    if (!clientMsgId || clientMsgId.length > 200) return refuse("bad_client_msg_id");
+    // Dedup BEFORE any other validation: a retried send with the same id
+    // must return the ORIGINAL outcome even if, say, this retry's body
+    // would itself fail to sanitize -- the caller is retrying, not asking
+    // a new question (SPEC: "a repeat returns the original exchange_id
+    // and state").
+    const existing = this.sql.exec<{ exchange_id: string; status: string }>(
+      `SELECT exchange_id, status FROM owner_messages WHERE sender_actor=? AND sender_client=? AND client_msg_id=?`,
+      caller.email, caller.client_id, clientMsgId).toArray()[0];
+    if (existing) return { ok: true, exchange_id: existing.exchange_id, state: existing.status };
+    if (!OWNER_LABEL.test(ownerLabel)) return refuse("owner_label_invalid");
+    const { snapshot, connection: conn } = this.view(nowMs);
+    if (!snapshot || conn.state === "disconnected" || conn.state === "never_connected") {
+      return refuse(`not_connected (${conn.state})`);
+    }
+    if (!(snapshot.owners ?? []).some((o) => o.label === ownerLabel)) return refuse("owner_not_registered");
+    const text = sanitizeOwnerMessage(rawBody);
+    if (!text.ok) return refuse(text.reason);
+    const recent = this.sql.exec<{ created_at: number }>(
+      `SELECT created_at FROM owner_messages WHERE sender_actor=? AND created_at > ?`, caller.email, nowMs - 3_600_000,
+    ).toArray().map((r) => r.created_at);
+    const tooMany = rateLimited(recent, nowMs, OWNER_LIMITS);
+    if (tooMany) return refuse(tooMany);
+
+    const id = `oex_${iso(nowMs).replace(/[-:.]/g, "").slice(0, 15)}Z_${crypto.randomUUID().slice(0, 8)}`;
+    this.sql.exec(
+      `INSERT INTO owner_messages (exchange_id, created_at, updated_at, expires_at, sender_actor, sender_client,
+        sender_client_name, client_msg_id, owner_label, body, status, detail, attempts, lease_until)
+       VALUES (?,?,?,?,?,?,?,?,?,?,'queued','',0,0)`,
+      id, nowMs, nowMs, nowMs + MESSAGE_TTL_MS, caller.email, caller.client_id, caller.client_name.slice(0, 80),
+      clientMsgId, ownerLabel, text.text,
+    );
+    this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "send_owner_message", target: ownerLabel,
+      decision: "queued", reason: "", message_id: id, detail: `chars=${text.text.length}` });
+    return { ok: true, exchange_id: id, state: "queued" };
+  }
+
+  ownerMessageStatus(exchangeId: string, actor: string): OwnerMessageRecord | null {
+    const m = this.sql.exec<{ exchange_id: string; created_at: number; updated_at: number; status: string; detail: string;
+      attempts: number; owner_label: string; delivered_at: number | null; body: string }>(
+      `SELECT exchange_id, created_at, updated_at, status, detail, attempts, owner_label, delivered_at, body
+       FROM owner_messages WHERE exchange_id=? AND sender_actor=?`, exchangeId, actor,
+    ).toArray()[0];
+    if (!m) return null;
+    return {
+      exchange_id: m.exchange_id, created_at: iso(m.created_at), updated_at: iso(m.updated_at),
+      status: m.status, detail: m.detail, attempts: m.attempts, owner_label: m.owner_label,
+      delivered_at: m.delivered_at === null ? null : iso(m.delivered_at), body_chars: m.body.length,
+    };
+  }
+
+  // Only the ORIGINAL sender may read a reply (SPEC item 4). A non-sender
+  // (or a wrong exchange_id) gets the identical null -- never a distinct
+  // "forbidden" that would confirm the exchange_id exists to someone else.
+  ownerReply(exchangeId: string, actor: string): OwnerReplyRecord | null {
+    const m = this.sql.exec<{ owner_label: string; status: string; reply_body: string; reply_session: string;
+      reply_artifact_revision: string; replied_at: number | null }>(
+      `SELECT owner_label, status, reply_body, reply_session, reply_artifact_revision, replied_at
+       FROM owner_messages WHERE exchange_id=? AND sender_actor=?`, exchangeId, actor,
+    ).toArray()[0];
+    if (!m || m.status !== "replied" || m.replied_at === null) return null;
+    return {
+      exchange_id: exchangeId, owner_label: m.owner_label, session: m.reply_session,
+      responded_at: iso(m.replied_at), artifact_revision: m.reply_artifact_revision, body: m.reply_body,
+    };
+  }
+
+  // Every sender with an owner message that could still be leased: the same
+  // pre-lease grant re-check as pendingSenders, on herdr:message.owner.
+  pendingOwnerSenders(nowMs: number): Sender[] {
+    return this.sql.exec<{ actor: string; client_id: string }>(
+      `SELECT DISTINCT sender_actor AS actor, sender_client AS client_id FROM owner_messages
+       WHERE status IN ('queued','delivering') AND expires_at > ?`, nowMs).toArray();
   }
 
   // Caps in force this tick: the Mac's own pushed config when we have one
@@ -722,7 +866,7 @@ export class HerdrState extends DurableObject<Env> {
   // enforce task deadlines, remap local task state onto the richer remote
   // vocabulary, expire, lease the outbox and the command queue, and hand
   // back new audit rows for the Mac's local copy.
-  sync(nowMs: number, nonce: string, rawBody: string, gate: DeliveryGate, cmdGate: DeliveryGate): SyncOutcome {
+  sync(nowMs: number, nonce: string, rawBody: string, gate: DeliveryGate, cmdGate: DeliveryGate, ownerGate: DeliveryGate): SyncOutcome {
     if (!this.takeNonce(nowMs, nonce)) return { ok: false, status: 409, reason: "replayed_nonce" };
     let json: unknown;
     try { json = JSON.parse(rawBody); } catch { return { ok: false, status: 400, reason: "bad_json" }; }
@@ -846,6 +990,52 @@ export class HerdrState extends DurableObject<Env> {
       }
     }
 
+    // send_owner_message's own acks: delivered (terminal), or blocked with a
+    // reason. owner_at_approval_prompt alone gets bounded retries (SPEC:
+    // "retry on later ticks; after N ticks, stay blocked") -- every other
+    // reason finalizes on first report, since there is nothing to wait out.
+    for (const a of body.owner_acks ?? []) {
+      const m = this.sql.exec<{ status: string; owner_label: string; attempts: number }>(
+        `SELECT status, owner_label, attempts FROM owner_messages WHERE exchange_id=?`, a.exchange_id).toArray()[0];
+      if (!m || m.status !== "delivering") continue;
+      if (a.outcome === "delivered") {
+        this.sql.exec(`UPDATE owner_messages SET status='delivered', delivered_at=?, detail='', updated_at=?, lease_until=0 WHERE exchange_id=?`,
+          nowMs, nowMs, a.exchange_id);
+        this.audit(nowMs, { ...sys, target: m.owner_label, decision: "delivered", reason: "", message_id: a.exchange_id, detail: "" });
+        continue;
+      }
+      const reason = a.reason ?? "unknown";
+      if (reason === "owner_at_approval_prompt" && m.attempts < APPROVAL_RETRY_CAP) {
+        this.sql.exec(`UPDATE owner_messages SET status='queued', detail=?, updated_at=?, lease_until=0 WHERE exchange_id=?`,
+          reason, nowMs, a.exchange_id);
+        this.audit(nowMs, { ...sys, target: m.owner_label, decision: "retry", reason, message_id: a.exchange_id, detail: `attempt ${m.attempts}` });
+        continue;
+      }
+      this.sql.exec(`UPDATE owner_messages SET status=?, detail=?, updated_at=?, lease_until=0 WHERE exchange_id=?`,
+        `blocked:${reason}`, reason, nowMs, a.exchange_id);
+      this.audit(nowMs, { ...sys, target: m.owner_label, decision: "blocked", reason, message_id: a.exchange_id, detail: "" });
+    }
+
+    // A reply the owner wrote on the Mac. "header must match the exchange"
+    // (SPEC item 4): the reported owner_label must equal THIS exchange's own
+    // target (the Mac's directory-scoped knowledge, re-validated here).
+    // M3 (REVIEW-219): only a message that actually reached 'delivered' can
+    // be replied to -- a late reply must never resurrect a message the
+    // sender was revoked out from under (status moved to a terminal
+    // 'blocked:sender_revoked' after delivery) or any other blocked/queued
+    // state, and a second report of an already-replied exchange is ignored
+    // (idempotent against a re-synced file).
+    for (const r of body.owner_replies ?? []) {
+      const m = this.sql.exec<{ owner_label: string; status: string }>(
+        `SELECT owner_label, status FROM owner_messages WHERE exchange_id=?`, r.exchange_id).toArray()[0];
+      if (!m || m.owner_label !== r.owner_label || m.status !== "delivered") continue;
+      const respondedMs = Date.parse(r.responded_at);
+      this.sql.exec(`UPDATE owner_messages SET status='replied', reply_body=?, reply_session=?,
+          reply_artifact_revision=?, replied_at=?, updated_at=? WHERE exchange_id=?`,
+        r.body, r.session, r.artifact_revision, Number.isFinite(respondedMs) ? respondedMs : nowMs, nowMs, r.exchange_id);
+      this.audit(nowMs, { ...sys, target: m.owner_label, decision: "replied", reason: "", message_id: r.exchange_id, detail: "" });
+    }
+
     // A queued message was valid when it was sent, not necessarily now. Before
     // anything is leased, refuse what the off switch, the allowlist, or a
     // revoked grant no longer permits. A message already leased this tick is
@@ -863,6 +1053,27 @@ export class HerdrState extends DurableObject<Env> {
         `cancelled before delivery: ${why}`, nowMs, m.message_id);
       this.audit(nowMs, { actor: m.actor, client_id: m.client_id, tool: "delivery", target: m.task_id,
         decision: "cancelled_before_delivery", reason: why, message_id: m.message_id, detail: "" });
+    }
+
+    // Same re-check for every queued/overdue owner message: the off switch,
+    // an allowlist removal, or a revoked grant stops it before the Mac ever
+    // sees it -- SPEC item 6, exact wording: "the state becomes
+    // blocked:sender_revoked" (both reasons collapse to that one name; the
+    // off switch itself is reported separately since it is not about the
+    // sender at all).
+    const ownerEnabled = this.env.OWNER_INBOX_ENABLED === "true";
+    const ownerRevoked = new Set(ownerGate.revoked.map((s) => `${s.actor}\n${s.client_id}`));
+    for (const m of this.sql.exec<{ exchange_id: string; owner_label: string; sender_actor: string; sender_client: string }>(
+      `SELECT exchange_id, owner_label, sender_actor, sender_client FROM owner_messages
+       WHERE status='queued' OR (status='delivering' AND lease_until < ?)`, nowMs).toArray()) {
+      const why = !ownerEnabled ? "owner_inbox_disabled"
+        : !emailAllowed(this.env, m.sender_actor) ? "sender_revoked"
+        : ownerRevoked.has(`${m.sender_actor}\n${m.sender_client}`) ? "sender_revoked" : null;
+      if (!why) continue;
+      this.sql.exec(`UPDATE owner_messages SET status=?, detail=?, updated_at=?, lease_until=0 WHERE exchange_id=?`,
+        `blocked:${why}`, why, nowMs, m.exchange_id);
+      this.audit(nowMs, { actor: m.sender_actor, client_id: m.sender_client, tool: "delivery", target: m.owner_label,
+        decision: "cancelled_before_delivery", reason: why, message_id: m.exchange_id, detail: "" });
     }
 
     // Same re-check for every queued/overdue command: a revoked grant must
@@ -961,6 +1172,21 @@ export class HerdrState extends DurableObject<Env> {
         this.recordTaskEvent(nowMs, c.remote_task_id, final, { reason: why });
       }
       this.audit(nowMs, { ...sys, target: c.remote_task_id, decision: status, reason: why, message_id: "", detail: c.detail });
+    }
+
+    // Never delivered within the TTL, or the Mac never got a single
+    // non-approval-prompt attempt to land within MAX_ATTEMPTS: finalize as
+    // deliver_failed, the same shape as the SPEC's other blocked reasons.
+    for (const m of this.sql.exec<{ exchange_id: string; owner_label: string; detail: string; attempts: number }>(
+      `SELECT exchange_id, owner_label, detail, attempts FROM owner_messages
+       WHERE status IN ('queued','delivering') AND (expires_at <= ? OR (attempts >= ? AND lease_until < ?))`,
+      nowMs, MAX_ATTEMPTS, nowMs).toArray()) {
+      const rc = m.attempts >= MAX_ATTEMPTS ? "max_attempts" : "timeout";
+      const why = `deliver_failed:${rc}`;
+      const note = rc === "max_attempts" ? `gave up after ${m.attempts} attempts` : "not delivered within 15 minutes";
+      this.sql.exec(`UPDATE owner_messages SET status=?, detail=?, updated_at=? WHERE exchange_id=?`,
+        `blocked:${why}`, `${note}${m.detail ? `; last: ${m.detail}` : ""}`.slice(0, 300), nowMs, m.exchange_id);
+      this.audit(nowMs, { ...sys, target: m.owner_label, decision: "blocked", reason: why, message_id: m.exchange_id, detail: m.detail });
     }
 
     // Local -> remote state remap, once per still-open remote task, every
@@ -1065,6 +1291,16 @@ export class HerdrState extends DurableObject<Env> {
         nowMs + LEASE_MS, nowMs, c.command_id);
     }
 
+    const dueOwners = body.lease && !ownerGate.hold ? this.sql.exec<{ exchange_id: string; owner_label: string; client_msg_id: string;
+      body: string; sender_actor: string; sender_client_name: string; attempts: number }>(
+      `SELECT exchange_id, owner_label, client_msg_id, body, sender_actor, sender_client_name, attempts FROM owner_messages
+       WHERE (status='queued' OR (status='delivering' AND lease_until < ?)) AND expires_at > ? ORDER BY created_at LIMIT 20`,
+      nowMs, nowMs).toArray() : [];
+    for (const m of dueOwners) {
+      this.sql.exec(`UPDATE owner_messages SET status='delivering', attempts=attempts+1, lease_until=?, updated_at=? WHERE exchange_id=?`,
+        nowMs + LEASE_MS, nowMs, m.exchange_id);
+    }
+
     this.sql.exec(`DELETE FROM audit WHERE at < ?`, nowMs - AUDIT_KEEP_MS);
     this.sql.exec(`DELETE FROM messages WHERE status IN ('delivered','refused','failed','expired') AND updated_at < ?`, nowMs - 30 * 86_400_000);
     this.sql.exec(`DELETE FROM results WHERE synced_at < ?`, nowMs - 30 * 86_400_000);
@@ -1073,6 +1309,9 @@ export class HerdrState extends DurableObject<Env> {
       (SELECT remote_task_id FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out'))`,
       nowMs - 30 * 86_400_000);
     this.sql.exec(`DELETE FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out') AND updated_at < ?`,
+      nowMs - 30 * 86_400_000);
+
+    this.sql.exec(`DELETE FROM owner_messages WHERE (status='delivered' OR status='replied' OR status LIKE 'blocked:%') AND updated_at < ?`,
       nowMs - 30 * 86_400_000);
 
     const audit = this.sql.exec<{ seq: number; at: number; actor: string; client_id: string; tool: string; target: string;
@@ -1085,6 +1324,10 @@ export class HerdrState extends DurableObject<Env> {
       response: {
         outbox: due.map((m) => ({ ...m, attempts: m.attempts + 1 })),
         commands: dueCommands.map((c) => ({ ...c, payload: JSON.parse(c.payload) as object, attempts: c.attempts + 1 })),
+        owner_outbox: dueOwners.map((m) => ({
+          exchange_id: m.exchange_id, owner_label: m.owner_label, client_msg_id: m.client_msg_id, body: m.body,
+          sender: m.sender_actor, client_name: m.sender_client_name, attempts: m.attempts + 1,
+        })),
         audit, audit_cursor: cursor,
       },
     };

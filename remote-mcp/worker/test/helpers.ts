@@ -144,3 +144,18 @@ export function queueRaw(storage: DurableObjectStorage, actor = "tnt@teamthurber
     actor, clientId, "Zero", "task_A", "w1:term_a", "term_a", "implement:feat/a", "hi", "queued", "", 0, 0);
   return id;
 }
+
+// An owner message already sitting in the queue, as if sent under an earlier
+// policy (owner inbox on, sender still allowed). Returns its exchange_id.
+export function queueRawOwner(storage: DurableObjectStorage, ownerLabel = "conductor",
+    actor = "tnt@teamthurber.com", clientId = "c"): string {
+  const id = `oex_${crypto.randomUUID()}`;
+  const now = Date.now();
+  storage.sql.exec(
+    `INSERT INTO owner_messages (exchange_id, created_at, updated_at, expires_at, sender_actor, sender_client,
+      sender_client_name, client_msg_id, owner_label, body, status, detail, attempts, lease_until)
+     VALUES (?,?,?,?,?,?,?,?,?,?,'queued','',0,0)`,
+    id, now, now, now + 900_000, actor, clientId, "Zero", `cm_${id}`, ownerLabel, "hi",
+  );
+  return id;
+}

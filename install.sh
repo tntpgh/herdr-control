@@ -14,6 +14,10 @@
 #   ./install.sh --apply --remote-mcp-messaging # same, with the Mac's messaging switch ON
 #   ./install.sh --apply --remote-mcp-tasks     # same, with the Mac's task-lifecycle switch ON
 #                                      # (start_task/cancel_task/resume_task; remote-mcp/README.md)
+#   ./install.sh --apply --remote-mcp-owner-inbox # same, with the Mac's owner-inbox switch ON
+#                                      # (send_owner_message to a registered long-lived pane,
+#                                      # NOT a spawned task; ZERO-LOOP-001 #5, design-approval-only;
+#                                      # OFF on the Worker too by default -- remote-mcp/README.md)
 #   ./install.sh --apply --chrome     # also keep the real Chrome up (chrome-relay.py --ensure)
 #   ./install.sh --apply --repoint    # ALSO repoint any job already wired at a
 #                                      # different checkout (e.g. an APM-deployed
@@ -59,7 +63,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=launchd/agent-lib.sh
 . "$here/launchd/agent-lib.sh"
 
-APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0; REMOTE_MCP_MESSAGING=0; REMOTE_MCP_TASKS=0; CHROME=0
+APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0; REMOTE_MCP_MESSAGING=0; REMOTE_MCP_TASKS=0; REMOTE_MCP_OWNER_INBOX=0; CHROME=0
 for a in "$@"; do
   case "$a" in
     --apply)   APPLY=1 ;;
@@ -69,6 +73,7 @@ for a in "$@"; do
     --remote-mcp) REMOTE_MCP=1 ;;
     --remote-mcp-messaging) REMOTE_MCP=1; REMOTE_MCP_MESSAGING=1 ;;
     --remote-mcp-tasks) REMOTE_MCP=1; REMOTE_MCP_TASKS=1 ;;
+    --remote-mcp-owner-inbox) REMOTE_MCP=1; REMOTE_MCP_OWNER_INBOX=1 ;;
     --chrome)  CHROME=1 ;;
     --repoint) REPOINT=1 ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
@@ -419,16 +424,41 @@ fi
 # the hub. Registry entry: thurber-os launchd/agents.yaml.
 if [ "$REMOTE_MCP" = 1 ]; then
   PLIST="$HOME/Library/LaunchAgents/com.herdr-control.remote-mcp.plist"
+  # REVIEW-219 M6: the plist below is rewritten WHOLE from only the flags
+  # passed to THIS invocation -- a switch not named here goes back to off,
+  # even if an earlier --apply turned it on (README's own documented
+  # go-live step 3, `--apply --remote-mcp-owner-inbox` alone, would
+  # silently turn messaging/tasks off if they were on). Read what is
+  # CURRENTLY deployed first and warn loudly on any switch THIS invocation
+  # turns off; this never changes what gets applied -- omitting a flag is
+  # still how you turn that switch off, same as README's documented
+  # "turning it off" section relies on -- it only makes sure that is seen,
+  # not discovered later.
+  prior_messaging=0; prior_tasks=0; prior_owner_inbox=0
+  if [ -f "$PLIST" ] && command -v /usr/libexec/PlistBuddy >/dev/null 2>&1; then
+    prior_messaging=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HERDR_MCP_MESSAGING" "$PLIST" 2>/dev/null) || prior_messaging=0
+    prior_tasks=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HERDR_MCP_TASKS" "$PLIST" 2>/dev/null) || prior_tasks=0
+    prior_owner_inbox=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HERDR_MCP_OWNER_INBOX" "$PLIST" 2>/dev/null) || prior_owner_inbox=0
+  fi
+  for pair in "messaging $prior_messaging $REMOTE_MCP_MESSAGING --remote-mcp-messaging" \
+              "tasks $prior_tasks $REMOTE_MCP_TASKS --remote-mcp-tasks" \
+              "owner-inbox $prior_owner_inbox $REMOTE_MCP_OWNER_INBOX --remote-mcp-owner-inbox"; do
+    set -- $pair
+    if [ "$2" = 1 ] && [ "$3" != 1 ]; then
+      echo "  ! WARNING: this install turns the Mac $1 switch OFF (it is currently ON) -- pass $4 too if that is not intended" >&2
+    fi
+  done
   if [ "$APPLY" = 1 ]; then
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
     if deploy_app "${HUB_REV:-origin/main}"; then
       sed -e "s|__REMOTE_MCP_PY__|$HERDR_APP_DIR/remote-mcp/publisher.py|" \
           -e "s|__REMOTE_MCP_MESSAGING__|$REMOTE_MCP_MESSAGING|" \
           -e "s|__REMOTE_MCP_TASKS__|$REMOTE_MCP_TASKS|" \
+          -e "s|__REMOTE_MCP_OWNER_INBOX__|$REMOTE_MCP_OWNER_INBOX|" \
           -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.remote-mcp.log|g" \
         "$here/remote-mcp/com.herdr-control.remote-mcp.plist.template" > "$PLIST"
       if rmcp_exit="$(load_interval_agent com.herdr-control.remote-mcp "$PLIST")"; then
-        echo "  remote-mcp publisher loaded (every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off)); first tick last exit code: $rmcp_exit"
+        echo "  remote-mcp publisher loaded (every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off), Mac owner-inbox switch $([ "$REMOTE_MCP_OWNER_INBOX" = 1 ] && echo ON || echo off)); first tick last exit code: $rmcp_exit"
       else
         INSTALL_RC=2; echo "  ! remote-mcp publisher: first tick exit ${rmcp_exit:-?}; check ~/Library/Logs/com.herdr-control.remote-mcp.log" >&2
       fi
@@ -437,7 +467,7 @@ if [ "$REMOTE_MCP" = 1 ]; then
       echo "  ! remote-mcp publisher NOT installed: deploy failed (above)." >&2
     fi
   else
-    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/remote-mcp/publisher.py every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off))"
+    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/remote-mcp/publisher.py every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off), Mac owner-inbox switch $([ "$REMOTE_MCP_OWNER_INBOX" = 1 ] && echo ON || echo off))"
   fi
 fi
 

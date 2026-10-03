@@ -14,7 +14,7 @@ import { mcpHandler } from "./mcp";
 import { DEFAULT_LIMITS, MAX_LIMITS, offeredScopes, serverInfo } from "./policy";
 import type { ScopedSender } from "./state";
 import type { DeliveryGate, Env, GrantProps, Sender } from "./types";
-import { SCOPE_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
+import { SCOPE_MESSAGE, SCOPE_OWNER_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START } from "./types";
 
 export { HerdrState } from "./state";
 
@@ -26,6 +26,7 @@ const SCOPE_TEXT: Record<string, string> = {
   [SCOPE_TASK_START]: "Start read-only research tasks (no git writes, no push) and read their answers.",
   [SCOPE_TASK_IMPLEMENT]: "Start implement tasks that commit and push their own branch, and read their answers.",
   [SCOPE_TASK_CANCEL]: "Cancel or resume a task this connection started.",
+  [SCOPE_OWNER_MESSAGE]: "Send a note to a named owning session (conductor, a dedicated tab) -- written to a file, read by a human/agent, never typed or auto-approved; own rate limit.",
 };
 
 function consentPage(d: ConsentDescription, handle: string, email: string, offered: string[]): string {
@@ -149,7 +150,9 @@ async function ingest(request: Request, env: Env): Promise<Response> {
   const gate = await grantGate(env, env.MESSAGING_ENABLED === "true", msgSenders, now);
   const cmdGate = await grantGate(env, env.TASKS_ENABLED === "true",
     [...(await stub.pendingCommandSenders(now)), ...(await stub.activeTaskSenders())], now);
-  const out = await stub.sync(Date.now(), check.nonce, check.body, gate, cmdGate);
+  const ownerSenders: ScopedSender[] = (await stub.pendingOwnerSenders(now)).map((s) => ({ ...s, scope: SCOPE_OWNER_MESSAGE }));
+  const ownerGate = await grantGate(env, env.OWNER_INBOX_ENABLED === "true", ownerSenders, now);
+  const out = await stub.sync(Date.now(), check.nonce, check.body, gate, cmdGate, ownerGate);
   if (!out.ok) return Response.json({ error: out.reason }, { status: out.status });
   return Response.json(out.response, { headers: { "cache-control": "no-store" } });
 }

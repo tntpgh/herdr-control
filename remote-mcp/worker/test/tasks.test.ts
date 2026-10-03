@@ -327,7 +327,7 @@ describe("cancel_task / resume_task", () => {
     const future = Date.now() + 2 * 60_000;
     const body = JSON.stringify(taskConfigBody(cfg));
     const out = await runInDurableObject(fleet(), (o: HerdrState) =>
-      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }));
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
     expect(out.ok).toBe(true);
     // ZR2: a spawned agent is not yet confirmed stopped -- 'cancelling',
     // never the TERMINAL 'timed_out' (which every later sync loop
@@ -370,7 +370,7 @@ describe("cancel_task / resume_task", () => {
     const future = Date.now() + 2 * 60_000;
     const body = JSON.stringify(taskConfigBody(cfg));
     const out = await runInDurableObject(fleet(), (o: HerdrState) =>
-      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }));
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
     expect(out.ok).toBe(true);
     const cancelCmd = out.ok ? out.response.commands.find((c) => c.remote_task_id === remoteTaskId && c.op === "cancel") : undefined;
     expect(cancelCmd).toBeDefined();
@@ -498,7 +498,7 @@ describe("cancel_task / resume_task", () => {
     const future = Date.now() + 16 * 60_000;
     const body = JSON.stringify(taskConfigBody());
     const out = await runInDurableObject(fleet(), (o: HerdrState) =>
-      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }));
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
     expect(out.ok).toBe(true);
     const childRow = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(childId));
     expect(childRow?.state).toBe("cancelled");
@@ -519,7 +519,7 @@ describe("cancel_task / resume_task", () => {
     const future = Date.now() + 2 * 60_000;
     const body = JSON.stringify(taskConfigBody(cfg));
     await runInDurableObject(fleet(), (o: HerdrState) =>
-      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }));
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
     const beforeAck = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(remoteTaskId));
     expect(beforeAck?.state).toBe("timed_out");
 
