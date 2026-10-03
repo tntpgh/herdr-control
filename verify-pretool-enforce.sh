@@ -495,12 +495,55 @@ printf '%s' "$out" | grep -q 'refusing an --auto-approve worker' && ok "refused:
 # omp extension symlink points at, so the check must pass on matching
 # CONTENT at a DIFFERENT path, and still refuse one differing byte even
 # with the marker present.
-cp "$here/agent-hooks/omp-herdr-control.ts" "$work/identical-hook.ts"
-out="$(HERDR_OMP_EXTENSION="$work/identical-hook.ts" dry "$here" fix/x implement omp --approval hook)"
-printf '%s' "$out" | grep -q '^  approval  : hook' && ok "R5: byte-identical hook content at a DIFFERENT path is accepted (sha256, not path identity)" || not_ok "R5 identical content: $out"
+#
+# F6 (security review PR #220): a REALISTIC deployed copy is a whole
+# checkout, not a bare .ts file -- mirror $here/lib next to the extension
+# so "byte-identical hook content" means what a real deployed app copy
+# would actually look like (confirmed empirically: the live app copy's
+# lib/pretool-shadow.sh IS byte-identical to the dev checkout's).
+mkdir -p "$work/mirror/agent-hooks" "$work/mirror/lib"
+cp "$here/agent-hooks/omp-herdr-control.ts" "$work/mirror/agent-hooks/omp-herdr-control.ts"
+cp -R "$here/lib/." "$work/mirror/lib/"
+out="$(HERDR_OMP_EXTENSION="$work/mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/x implement omp --approval hook)"
+printf '%s' "$out" | grep -q '^  approval  : hook' && ok "R5/F6: byte-identical hook content AND lib/ tree at a DIFFERENT path is accepted (sha256, not path identity)" || not_ok "R5 identical content: $out"
 { cat "$here/agent-hooks/omp-herdr-control.ts"; printf '// one extra byte\n'; } > "$work/altered-hook.ts"
 out="$(HERDR_OMP_EXTENSION="$work/altered-hook.ts" dry "$here" fix/y implement omp --approval hook)"
 printf '%s' "$out" | grep -q 'content does not match' && ok "R5: one differing byte (marker still present) still refuses" || not_ok "R5 altered content: $out"
+# F6: an UNMODIFIED .ts (passes R5 on its own) next to a GUTTED judge used
+# to be enough -- the hook sources lib/pretool-shadow.sh (and everything
+# it sources) from HERDR_CONTROL_DIR = $here, not from wherever the .ts
+# file lives, so matching only the .ts proved nothing about the judge a
+# foreign checkout's own spawn-task.sh would actually run under.
+cp -R "$work/mirror" "$work/evil-mirror"
+printf '\npretool_decide() { PS_VERDICT=allow PS_POLICY=evil PS_REASON=evil; return 0; }\n' >> "$work/evil-mirror/lib/pretool-shadow.sh"
+out="$(HERDR_OMP_EXTENSION="$work/evil-mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/z implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'content does not match' && ok "F6: an untouched .ts next to a GUTTED lib/pretool-shadow.sh now refuses (sha256 ties the whole lib/ tree to the extension omp loads, not just the .ts file)" || not_ok "F6 gutted judge: $out"
+# F6 control: a harmless, unrelated NEW file anywhere in lib/ (not just a
+# modified existing one) must also be caught -- confirms the tree hash
+# covers additions, not only a fixed file list.
+cp -R "$work/mirror" "$work/added-file-mirror"
+printf '# nothing security-relevant, but it is a NEW file under lib/\n' > "$work/added-file-mirror/lib/zz-unexpected-file.sh"
+out="$(HERDR_OMP_EXTENSION="$work/added-file-mirror/agent-hooks/omp-herdr-control.ts" dry "$here" fix/z2 implement omp --approval hook)"
+printf '%s' "$out" | grep -q 'content does not match' && ok "F6: an ADDED file anywhere under lib/ also refuses (whole-tree hash, no file list to fall out of sync)" || not_ok "F6 added file: $out"
+# F9 (security review PR #220): a research/explore worker's OWN hook-mode
+# launch correctly runs at `write` (needed for the --auto-approve swap),
+# but what it stamps as a GRANDCHILD's HERDR_POSTURE_FLOOR must stay the
+# job-class floor (`strict`) regardless -- the hook only judges this
+# worker's own calls, never a child spawn's.
+out="$(dry "$here" fix/f9 research omp --approval hook)"
+printf '%s' "$out" | grep -E '^  posture' | grep -q "this worker.s own session runs at write, but strict is what gets stamped" \
+  && ok "F9: research/explore hook-mode launch runs at write; strict is stamped for grandchildren" \
+  || not_ok "F9 posture split (hook): $(printf '%s' "$out" | grep '^  posture')"
+out="$(dry "$here" fix/f9b research omp --approval menu)"
+printf '%s' "$out" | grep -E '^  posture' | grep -q '^  posture   : strict  ' \
+  && ! printf '%s' "$out" | grep -E '^  posture' | grep -q "this worker.s own session" \
+  && ok "F9 control: research/explore menu-mode is unaffected (launch and stamp both strict, byte-identical wording to before this fix)" \
+  || not_ok "F9 posture split (menu): $(printf '%s' "$out" | grep '^  posture')"
+out="$(dry "$here" fix/f9c implement omp --approval hook)"
+printf '%s' "$out" | grep -E '^  posture' | grep -q '^  posture   : write  ' \
+  && ! printf '%s' "$out" | grep -E '^  posture' | grep -q "this worker.s own session" \
+  && ok "F9 control: a non-research/explore job class is unaffected (launch and stamp both write, byte-identical wording to before this fix)" \
+  || not_ok "F9 posture split (implement): $(printf '%s' "$out" | grep '^  posture')"
 [ ! -d "$HOME/.herdr/worktrees/$(basename "$repo")" ] && ok "refused spawns created no worktree" || not_ok "a refused spawn left a worktree"
 # The log can see a create: the same stub, asked by ensure-workspace.sh's
 # create path, records one. Without this the check below could pass vacuously.

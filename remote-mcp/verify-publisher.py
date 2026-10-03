@@ -458,6 +458,47 @@ class HookApprovalBlocker(unittest.TestCase):
         self.assertEqual(b["kind"], "permission")
         self.assertEqual(b["summary"], "awaiting_owner_approval: no conductor configured")
 
+    def test_build_never_surfaces_a_stale_menu_mode_ask_as_a_blocker(self):
+        # F7 (security review PR #220): registry_rows' input_required query
+        # (menu mode) has no "resolved" event to check -- it grabs the
+        # newest input_required EVER, answered or not. The `or ask` clause
+        # this fix added to the blocker gate (above) used to let that
+        # stale ask alone qualify ANY task, running OR completed, as a
+        # permanent blocker. Only the hook-mode ask (action_requests,
+        # status='pending', carries "kind") may do that; a bare
+        # input_required ask must still need live_blocked or a
+        # blocked/stalled state, exactly as before this PR.
+        con = sqlite3.connect(self.reg)
+        con.execute("DELETE FROM action_requests")
+        for tid in ("task_run", "task_done"):
+            con.execute("INSERT OR REPLACE INTO tasks (task_id, pane_birth) VALUES (?,'term_x')", (tid,))
+            con.execute("INSERT INTO events (task_id, type, occurred_at, payload) VALUES (?,'input_required',?,?)",
+                        (tid, "2026-10-01T00:00:00Z", json.dumps({"tool": "bash", "message": "old, already answered"})))
+        con.commit(); con.close()
+        wt = WT_ROOT / "kb/feat-stale-ask"
+        (wt / ".handoffs").mkdir(parents=True, exist_ok=True)
+        (wt / ".handoffs/PROOF.md").write_text("proof")
+        base = dict(run_id="r9", repo="/x/kb", pane_id="", conductor_id="conductor_w1:p1", worktree=str(wt),
+                    project="kb", created_at=Z(NOW), updated_at=Z(NOW))
+        tasks = [dict(base, task_id="task_run", label="implement:feat/run", branch="feat/run", state="running"),
+                 dict(base, task_id="task_done", label="implement:feat/done", branch="feat/done", state="completed")]
+        real_hub_get = pub.hub_get
+
+        def fake_hub_get(path):
+            if path == "/herdr?json=1":
+                return {"tasks": tasks, "herdr_reachable": True, "live": {"connected": True}}
+            if path == "/api/panes":
+                return {"panes": []}
+            return {}
+        pub.hub_get = fake_hub_get
+        try:
+            snap, _ = pub.build(NOW)
+        finally:
+            pub.hub_get = real_hub_get
+        ids = {b["task_id"] for b in snap["blockers"]}
+        self.assertNotIn("task_run", ids)
+        self.assertNotIn("task_done", ids)
+
 
 class TranscriptSync(unittest.TestCase):
     """changed_results()'s omp:transcript source: the registry's

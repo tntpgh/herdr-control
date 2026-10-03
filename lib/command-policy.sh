@@ -2917,7 +2917,16 @@ _cp_safe_non_shell_panel() {
 # PreToolUse hook's job at #159; this is a second, coarser gate deciding
 # whether automation may press Approve on the omp confirm dialog at all).
 _cp_lexical_abspath() {
-  local p="$1" part
+  local p="$1" part was_noglob=0
+  # F4 (security review PR #220): `for part in $p` deliberately word-splits
+  # on IFS=/ to walk path components, but an unquoted expansion ALSO
+  # undergoes pathname (glob) expansion -- so a component like `.h*` or
+  # `.handoff[s]` silently expanded against the CWD (the worktree root at
+  # call time) to whatever matched on disk, including `.handoffs` itself,
+  # letting a glob alias its way past handoffs_write's exact-match check.
+  # Disable globbing for the split only; nothing here needs it.
+  case $- in *f*) was_noglob=1 ;; esac
+  set -f
   set --
   local IFS=/
   for part in $p; do
@@ -2927,6 +2936,7 @@ _cp_lexical_abspath() {
       *) set -- "$@" "$part" ;;
     esac
   done
+  [ "$was_noglob" = 1 ] || set +f
   if [ "$#" -eq 0 ]; then printf '/'; return; fi
   local out="" seg
   for seg in "$@"; do out="$out/$seg"; done

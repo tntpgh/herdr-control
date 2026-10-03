@@ -357,14 +357,30 @@ _ap_emit() {                            # <argv...> -> one shell-safe launch lin
 # lib/pretool-shadow.sh's pretool_enforce, whose `write` case now applies
 # the identical handoffs_write narrowing to the exact structured path (see
 # _ps_plain_write_verdict) -- never a scraped, possibly-clipped panel. So
-# for a hook task the write restriction is enforced regardless of posture,
-# and forcing `strict` would only block spawn-task.sh's own
-# `--approval hook requires the write posture floor` check for no safety
-# gain. menu-mode research/explore keeps the original force unchanged.
-posture_want_for_job() {  # <want> <job> [approval] -> effective want request
-  local want="$1" job="${2:-}" approval="${3:-menu}"
+# for a hook task's OWN launch, `write` is the correct posture: forcing
+# `strict` would only block spawn-task.sh's own `--approval hook requires
+# the write posture floor` check for no safety gain. menu-mode
+# research/explore keeps the original force unchanged.
+#
+# `purpose` (F9, security review PR #220): a GRANDCHILD this worker spawns
+# does not inherit the hook's per-call write judge -- only the worker's own
+# session does. `purpose=stamp` (spawn-task.sh's HERDR_POSTURE_FLOOR, which
+# every child spawn composes against and can only tighten past) must stay
+# `strict` for research/explore in EITHER approval mode; `purpose=launch`
+# (the default; what cli_for_agent uses to build --approval-mode) keeps the
+# hook-mode `write` carve-out so the hook's own auto-approve swap still
+# works. The two no longer have to agree.
+posture_want_for_job() {  # <want> <job> [approval] [purpose=launch|stamp] -> effective want request
+  local want="$1" job="${2:-}" approval="${3:-menu}" purpose="${4:-launch}"
   case "$job" in
-    research|explore) [ "$approval" = hook ] && printf '%s\n' "$want" || printf 'strict\n' ;;
+    research|explore)
+      if [ "$purpose" = stamp ]; then
+        printf 'strict\n'
+      elif [ "$approval" = hook ]; then
+        printf '%s\n' "$want"
+      else
+        printf 'strict\n'
+      fi ;;
     *) printf '%s\n' "$want" ;;
   esac
 }

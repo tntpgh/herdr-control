@@ -912,6 +912,18 @@ def sweep(tasks_by_id: dict[str, dict], now: datetime) -> list[dict]:
         # deadline, and never had its hard-stop timer re-armed (all three
         # live in this same branch). Decide on stored_state instead.
         if (t.get("stored_state") or t["state"]) in ("running", "starting", "blocked"):
+            # F10 (security review PR #220): this used to check the
+            # deadline BEFORE looking for a pending completion, so a task
+            # whose worker had already delivered its completion event --
+            # just waiting on a HOLD-retried auto_close (pane busy) -- could
+            # still be force-cancelled timed_out past its deadline,
+            # discarding an answer that was already on disk. A completion
+            # event already delivered always wins over the timer.
+            wt = Path(t["worktree"]) if t.get("worktree") else None
+            ev = _pending_completion(wt) if wt and wt.is_dir() else None
+            if ev:
+                logged.append(_auto_close(t, ev))
+                continue
             deadline = _parse_iso(remote["deadline_at"]) if remote["deadline_at"] else None
             if deadline is None:
                 # N1: a post-spawn set-deadline failure (bridge write lost)
@@ -931,10 +943,6 @@ def sweep(tasks_by_id: dict[str, dict], now: datetime) -> list[dict]:
                 retry = _ensure_hard_stop_scheduled(t, remote, sweep_max_minutes, now.timestamp())
                 if retry:
                     logged.append(retry)
-            wt = Path(t["worktree"]) if t.get("worktree") else None
-            ev = _pending_completion(wt) if wt and wt.is_dir() else None
-            if ev:
-                logged.append(_auto_close(t, ev))
         elif t["state"] == "completed" and not remote["verify_detail"]:
             logged.append(_verify(t, remote))
     return logged

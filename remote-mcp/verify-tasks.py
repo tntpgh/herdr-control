@@ -702,6 +702,26 @@ class Sweep(unittest.TestCase):
         self.assertTrue(actions[0]["ok"])
         self.assertIn("cancel run_x task_b timed_out", FAKE_BRIDGE_LOG.read_text())
 
+    def test_pending_completion_wins_over_an_overrun_deadline(self):
+        # F10 (security review PR #220): the deadline check used to run
+        # BEFORE the pending-completion check, so a task whose worker had
+        # already delivered its completion event -- just waiting on a
+        # HOLD-retried auto_close (pane busy) -- could still be
+        # force-cancelled timed_out past its deadline, discarding an
+        # answer that was already on disk. A delivered completion event
+        # must always win over the timer.
+        self._row("task_c", "rtask_c", deadline="2020-01-01T00:00:00Z")
+        self._event("task_c", "hard_stop_scheduled", json.dumps({"pid": 1}))
+        (self.wt / ".handoffs/identity.json").write_text(json.dumps({"completion_event": "y_done"}))
+        (self.wt / ".handoffs/events.jsonl").write_text(
+            json.dumps({"event": "y_done", "status": "completed", "reason": "no-follow-on"}) + "\n")
+        t = {"task_id": "task_c", "run_id": "run_x", "state": "running", "worktree": str(self.wt)}
+        actions = tsk.sweep({"task_c": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["action"], "auto_close")
+        self.assertTrue(actions[0]["ok"])
+        self.assertNotIn("timed_out", FAKE_BRIDGE_LOG.read_text())
+
     def test_deadline_fallback_when_set_deadline_never_landed(self):
         # N1: an empty deadline_at (a post-spawn set-deadline call that never
         # landed) must not mean "never times out" -- sweep falls back to

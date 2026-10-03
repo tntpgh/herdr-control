@@ -277,18 +277,21 @@ _ps_plain_write_verdict() {
     return
   fi
   # R3-4/R4-2 equivalent (lib/command-policy.sh): the lexical check alone
-  # cannot see a symlink planted AT this exact path. Refuse when the real,
-  # symlink-resolved location differs from the lexical one; compare against
-  # the worktree's OWN resolved root (macOS /tmp -> /private/tmp, etc.) so
-  # only a symlink inside the write target — not an ancestor of the
-  # worktree — can cause a mismatch.
-  if [ -e "$wt/$rel" ] || [ -L "$wt/$rel" ]; then
-    real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt/$rel" 2>/dev/null)"
-    real_wt="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt" 2>/dev/null)"
-    if [ -z "$real" ] || [ -z "$real_wt" ] || [ "$real" != "$real_wt/$rel" ]; then
-      PS_VERDICT=escalate PS_REASON="this task's one allowed .handoffs file is a symlink to somewhere else — remains human-only"
-      return
-    fi
+  # cannot see a symlink planted AT this exact path, OR ABOVE it (F5,
+  # security review PR #220: .handoffs itself replaced by a directory
+  # symlink, with ANSWER.md not yet existing, passed the OLD `-e`/`-L`
+  # gate below since the leaf was neither). realpath resolves every
+  # ancestor component even when the leaf itself is missing, so run the
+  # comparison unconditionally; refuse when the real, symlink-resolved
+  # location differs from the lexical one. Compare against the worktree's
+  # OWN resolved root (macOS /tmp -> /private/tmp, etc.) so only a symlink
+  # inside the write target's path — not an ancestor of the worktree
+  # itself — can cause a mismatch.
+  real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt/$rel" 2>/dev/null)"
+  real_wt="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt" 2>/dev/null)"
+  if [ -z "$real" ] || [ -z "$real_wt" ] || [ "$real" != "$real_wt/$rel" ]; then
+    PS_VERDICT=escalate PS_REASON="this task's one allowed .handoffs file is a symlink to somewhere else — remains human-only"
+    return
   fi
   PS_VERDICT=allow PS_REASON="exact match for this task's one allowed deliverable (.handoffs/$hw)"
 }
@@ -324,6 +327,19 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
     eval|python|js|javascript|repl|notebook_eval)
       PS_VERDICT=block PS_REASON="eval runs arbitrary code with no text the policy can judge; disabled for workers — write the code to a file under your worktree and run it via bash (code by reference)" ;;
     write)
+      local manifest hw
+      manifest="$(printf '%s' "$PS_TASK_JSON" | jq -r '.manifest // empty' 2>/dev/null)"
+      hw="$(printf '%s' "$manifest" | jq -r '.handoffs_write // empty' 2>/dev/null)"
+      # F4 (security review PR #220): every `.path` extraction below goes
+      # through a bash $(...) command substitution, which SILENTLY STRIPS a
+      # trailing newline -- so a path judged as the clean string would not
+      # be the literal bytes omp actually writes to (node fs does not strip
+      # it). Test the RAW json for ANY embedded newline here, before that
+      # stripping can happen, and refuse outright rather than judge a
+      # string that might not match the real write target.
+      if [ "$(printf '%s' "$input" | jq -r '((.path // "") | test("\n")) // false' 2>/dev/null)" = true ]; then
+        PS_VERDICT=escalate PS_REASON="write path contains a newline, which a later \$(...) substitution would silently drop — the judged string could differ from what omp actually writes; a conductor must review it"
+      else
       # omp resolves URL schemes case-insensitively (Xd:// dispatches the
       # device), so the scheme is lowercased before the table.
       case "$(_ps_lower_scheme "$(printf '%s' "$input" | jq -r '.path // empty' 2>/dev/null)")" in
@@ -335,14 +351,30 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
           else _ps_bash "$PS_CMD"; fi ;;
         xd://*)
           dev="$(printf '%s' "$input" | jq -r '.path' | sed -E 's#^[A-Za-z]+://##; s#[/?\#].*$##' | tr '[:upper:]' '[:lower:]')"
-          _ps_device "$dev" ;;
+          if [ -n "$hw" ]; then
+            # F2: a write-restricted task's write tool may touch exactly
+            # one file -- no xd:// device writes THAT file, so none of
+            # them can be a blanket allow once handoffs_write narrows the
+            # tool (menu mode escalated every xd:// device but notepad_*).
+            PS_VERDICT=escalate PS_REASON="this task's manifest restricts its write tool to .handoffs/$hw only; xd://$dev is not that file — a conductor must review it"
+          else
+            _ps_device "$dev"
+          fi ;;
+        file://*)
+          # F1: file:// names a REAL filesystem path with the same power
+          # as a plain path (unlike agent:///local://, below, which are
+          # not raw filesystem writes) -- judge it exactly like one
+          # instead of the blanket containment-159 allow this used to
+          # fall into, which bypassed handoffs_write narrowing entirely.
+          _ps_plain_write_verdict "$(printf '%s' "$input" | jq -r '.path' 2>/dev/null | sed -E 's#^[Ff][Ii][Ll][Ee]://##')" ;;
         *://*)
           case "$(_ps_lower_scheme "$(printf '%s' "$input" | jq -r '.path' 2>/dev/null)")" in
-            agent://*|local://*|file://*) PS_VERDICT=allow PS_POLICY=containment-159 PS_REASON="write to $(printf '%s' "$input" | jq -r '.path' | sed -E 's#://.*#://#'); containment enforced by the #159 write-scope guard" ;;
+            agent://*|local://*) PS_VERDICT=allow PS_POLICY=containment-159 PS_REASON="write to $(printf '%s' "$input" | jq -r '.path' | sed -E 's#://.*#://#'); containment enforced by the #159 write-scope guard" ;;
             *) PS_VERDICT=escalate PS_REASON="write to an unrecognised URL scheme: a conductor must review it" ;;
           esac ;;
         *) _ps_plain_write_verdict "$(printf '%s' "$input" | jq -r '.path // empty' 2>/dev/null)" ;;
-      esac ;;
+      esac
+      fi ;;
     edit|ast_edit|multiedit|notebook|notebook_edit|apply_patch|lsp)
       PS_VERDICT=allow PS_POLICY=containment-159 PS_REASON="file mutation; worktree containment enforced by the #159 write-scope guard" ;;
     read|grep|glob|find|ast_grep|search)

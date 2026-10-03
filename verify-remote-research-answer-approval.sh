@@ -139,11 +139,59 @@ out="$(enf write '{"path":"","content":"empty path"}')"; rc=$?
   && ok "a write call with an EMPTY structured path escalates" \
   || not_ok "expected escalate (empty path), got rc=$rc: $out"
 
+printf -- '-- security review PR #220 --\n'
+out="$(enf write "$(jq -nc --arg p "file://$wt/.handoffs/ANSWER.md" '{path:$p, content:"via file://"}')")"; rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | field decision)" = allow ] \
+  && ok "F1 control: file:// spelling of the exact ANSWER.md still allows" \
+  || not_ok "expected allow rc=0, got rc=$rc: $out"
+
+out="$(enf write "$(jq -nc --arg p "file://$wt/.handoffs/OTHER.md" '{path:$p, content:"via file://"}')")"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'restricts its write tool to .handoffs/ANSWER.md only' \
+  && ok "F1: a file:// write to a DIFFERENT .handoffs file escalates exactly like the plain-path form (not a blanket containment-159 allow)" \
+  || not_ok "expected escalate (file:// bypass), got rc=$rc: $out"
+
+out="$(enf write "$(jq -nc --arg p "FILE://$wt/src/evil.py" '{path:$p, content:"upper-case scheme"}')")"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'restricts its write tool to .handoffs/ANSWER.md only' \
+  && ok "F1: an upper-case FILE:// scheme is lowered the same way and still escalates" \
+  || not_ok "expected escalate (FILE:// bypass), got rc=$rc: $out"
+
+out="$(enf write '{"path":"xd://retain","content":"{\"content\":\"x\"}"}')"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'restricts its write tool to .handoffs/ANSWER.md only' \
+  && ok "F2: a write-restricted task's write xd://retain escalates (no xd:// device is the one allowed file)" \
+  || not_ok "expected escalate (xd:// bypass), got rc=$rc: $out"
+
+out="$(enf write '{"path":".handoffs/ANSWER.md\n","content":"x"}')"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'contains a newline' \
+  && ok "F4: a trailing newline in the structured path escalates (a later \$(...) strip would silently hide it from the judge)" \
+  || not_ok "expected escalate (newline), got rc=$rc: $out"
+
+out="$(enf write '{"path":".h*/ANSWER.md","content":"x"}')"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'restricts its write tool to .handoffs/ANSWER.md only' \
+  && ok "F4: a glob path component (.h*) is judged LITERALLY, never expanded against the worktree cwd" \
+  || not_ok "expected escalate (glob), got rc=$rc: $out"
+
+out="$(enf write '{"path":".handoff[s]/ANSWER.md","content":"x"}')"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'restricts its write tool to .handoffs/ANSWER.md only' \
+  && ok "F4: a bracket-glob path component is also judged literally" \
+  || not_ok "expected escalate (bracket glob), got rc=$rc: $out"
+
+rm -rf "$wt/.handoffs"; ln -s src "$wt/.handoffs"
+out="$(enf write '{"path":".handoffs/ANSWER.md","content":"x"}')"; rc=$?
+rm -f "$wt/.handoffs"; mkdir -p "$wt/.handoffs"
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'symlink to somewhere else' \
+  && ok "F5: .handoffs itself replaced by a directory symlink, ANSWER.md not yet existing, still escalates (realpath resolves the missing leaf's ancestors)" \
+  || not_ok "expected escalate (dir symlink, missing leaf), got rc=$rc: $out"
+
 register_task run1 task_nomanifest worker1 cond1 "$CPANE" "$CBIRTH" "$PANE" "$BIRTH" /repo "$wt" impl:task_nomanifest feat/y main "" "" hook >/dev/null
 set_task_state run1 task_nomanifest running
 out="$(enf write '{"path":"src/other.txt","content":"unrestricted"}' task_nomanifest)"; rc=$?
 [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | field decision)" = allow ] \
   && ok "no handoffs_write manifest: an ordinary worktree write still allows (containment-159, unaffected by this fix)" \
+  || not_ok "expected allow rc=0, got rc=$rc: $out"
+
+out="$(enf write '{"path":"xd://retain","content":"{\"content\":\"x\"}"}' task_nomanifest)"; rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | field decision)" = allow ] \
+  && ok "F2 control: no handoffs_write manifest — xd://retain still runs the ordinary device table, unaffected by this fix" \
   || not_ok "expected allow rc=0, got rc=$rc: $out"
 
 printf '== B: herdr-action.sh distinguishes conductor_unconfigured from conductor_unreachable ==\n'
@@ -202,6 +250,18 @@ out="$(HERDR_MCP_CONDUCTOR_PANE="$AGENT_PANE" dryc)"
 printf '%s' "$out" | grep -q "conductor_pane=$AGENT_PANE " \
   && ok "no HERDR_PANE_ID, a live agent pane named by HERDR_MCP_CONDUCTOR_PANE: adopted as the fallback conductor" \
   || not_ok "fallback not adopted: $(printf '%s' "$out" | grep registry)"
+
+register_task run1 task_occupant worker1 cond1 "$CPANE" "$CBIRTH" "$AGENT_PANE" gen-agent /repo "$wt" impl:task_occupant feat/occ main "" "" hook >/dev/null
+set_task_state run1 task_occupant running
+out="$(HERDR_MCP_CONDUCTOR_PANE="$AGENT_PANE" dryc)"
+printf '%s' "$out" | grep -q 'conductor_pane=<none' \
+  && ok "F8: a pane that is CURRENTLY an active worker's own task pane is refused as a conductor fallback, even though pane_is_agent says yes (a worker is never a conductor)" \
+  || not_ok "an active worker's pane was adopted as the conductor: $(printf '%s' "$out" | grep registry)"
+set_task_state run1 task_occupant completed no-follow-on >/dev/null
+out="$(HERDR_MCP_CONDUCTOR_PANE="$AGENT_PANE" dryc)"
+printf '%s' "$out" | grep -q "conductor_pane=$AGENT_PANE " \
+  && ok "F8 control: once that task is terminal, the SAME pane is adoptable again" \
+  || not_ok "a freed pane was still refused: $(printf '%s' "$out" | grep registry)"
 
 out="$(HERDR_MCP_CONDUCTOR_PANE='w6:p6' dryc)"    # not in the fake herdr's pane list at all
 printf '%s' "$out" | grep -q 'conductor_pane=<none' \

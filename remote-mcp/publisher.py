@@ -349,8 +349,18 @@ def build(now: datetime) -> tuple[dict, dict]:
         # A hook-approval task's pending action_request (see registry_rows)
         # never shows up as live_blocked (no omp menu ever paints) or as
         # registry state blocked/stalled -- the ask's own presence is the
-        # only signal it is stuck, so it must gate this loop too.
-        if not (live_blocked or t["state"] in ("blocked", "stalled") or ask):
+        # only signal it is stuck, so it must gate this loop too. But the
+        # OLD input_required source (menu mode) has no "resolved" event at
+        # all -- registry_rows grabs the newest input_required EVER, so an
+        # old, long-since-answered ask stayed in `asks` forever (F7,
+        # security review PR #220: a running AND a completed task with a
+        # stale menu ask both showed up as permanent blockers). Only the
+        # NEW, action_requests-sourced ask carries "kind" (set to
+        # "permission" at registry_rows, filtered to status='pending'
+        # there) -- gate on that, not on `ask`'s mere presence, so a stale
+        # menu ask never re-enters the set this clause used to exclude it
+        # from.
+        if not (live_blocked or t["state"] in ("blocked", "stalled") or (ask and ask.get("kind"))):
             continue
         blockers.append({
             "task_id": t["task_id"], "label": t["label"], "pane_id": t["pane_id"], "agent_id": t["agent_id"],
