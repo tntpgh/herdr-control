@@ -680,14 +680,29 @@ REPLY_HEADER_LINE_RE = re.compile(r"^-\s*(exchange_id|owner_label|artifact_revis
 
 
 def _split_reply_header(text: str) -> tuple[dict[str, str], str]:
+    """REVIEW-219 R2-2: `text.partition('\\n---\\n')` alone treated ANY
+    `---` on its own line as the header/body divider, even a reply that
+    uses `---` as an ordinary horizontal rule with no header at all --
+    silently eating everything above it as a "header" with zero matching
+    lines, and returning only the text after the rule. A candidate head is
+    now a REAL header only when every one of its non-empty lines matches
+    REPLY_HEADER_LINE_RE, and at least one line does; anything else (no
+    match, a stray prose line, or a head with no lines at all) means this
+    `---` was not a header divider, and the ENTIRE original text is
+    returned unsplit."""
     head, sep, rest = text.partition("\n---\n")
     if not sep:
         return {}, text
     header: dict[str, str] = {}
     for line in head.splitlines():
+        if not line.strip():
+            continue
         m = REPLY_HEADER_LINE_RE.match(line)
-        if m:
-            header[m.group(1)] = m.group(2)
+        if not m:
+            return {}, text
+        header[m.group(1)] = m.group(2)
+    if not header:
+        return {}, text
     return header, rest
 
 

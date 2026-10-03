@@ -178,7 +178,21 @@ check "the owners table actually exists after migrating" "$([ "$owners_exists" =
 )
 regressed_check=$(sqlite3 "$M5_DB" "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)
 check "an older checkout's own v7 migration never regresses an already-v8 stamp" "$([ "$regressed_check" = "8" ] && echo 0 || echo 1)" "regressed_check=$regressed_check"
-export HERDR_RUN_STATE_DIR="$WORK/runs"
+
+# REVIEW-219 R2-1: simulate an ACTUAL older checkout's own unconditional
+# `INSERT OR REPLACE INTO schema_meta ... '7'` (main's real v7 code, not
+# this lib's own already-monotonic _migrate_schema_v7) by writing the
+# regression directly -- the owners table itself is untouched, exactly
+# what happens when an old binary runs against an already-migrated db.
+sqlite3 "$M5_DB" "UPDATE schema_meta SET value='7' WHERE key='schema_version';" >/dev/null 2>&1
+( set -uo pipefail
+  . "$here/lib/run-registry.sh"
+  registry_init  # the owners table already exists; this must NOT take a second backup
+)
+post_regress_count=$(find "$M5_DIR" -maxdepth 1 -name 'registry.sqlite3.*.v8.bak' 2>/dev/null | wc -l | tr -d ' ')
+check "R2-1: re-migrating after an old binary regresses the stamp takes NO second backup" "$([ "$post_regress_count" = "1" ] && echo 0 || echo 1)" "post_regress_count=$post_regress_count"
+post_regress_version=$(sqlite3 "$M5_DB" "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)
+check "R2-1: the stamp is brought back up to '8' without a backup" "$([ "$post_regress_version" = "8" ] && echo 0 || echo 1)" "post_regress_version=$post_regress_version"
 echo
 if [ "$failures" -gt 0 ]; then
   echo "FAILED: $failures check(s)"

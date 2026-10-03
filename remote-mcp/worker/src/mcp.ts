@@ -237,7 +237,9 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
   server.registerTool("get_owner_reply", {
     title: "Get an owner's reply",
     description: "The owner's written reply to a message you sent (status replied). Only the original sender can " +
-      "read it. Readback: send a normal send_owner_message, `READBACK <exchange_id> ok`, to confirm receipt -- " +
+      "read it. Attribution is filesystem-scoped, not pane-authenticated: it means a process running as the Mac " +
+      "user wrote the reply file to the owner's reply path, not that the registered owner pane itself typed it. " +
+      "Readback: send a normal send_owner_message, `READBACK <exchange_id> ok`, to confirm receipt -- " +
       "no separate tool is needed. Requires herdr:message.owner.",
     inputSchema: { exchange_id: z.string().min(1).max(100) },
     annotations: ro,

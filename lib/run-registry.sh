@@ -467,16 +467,34 @@ _migrate_schema_v7() {
 # makes schema_version a trustworthy audit trail of what a given database has
 # actually been through.
 _migrate_schema_v8() {
-  # REVIEW-219 M5: back up only on an ACTUAL upgrade (stored version below
-  # 8), never on a brand-new database (already stamped '8' by registry_init's
-  # own INSERT OR IGNORE, so current is '8' here and there is nothing
-  # pre-v8 to preserve) and never on a process that runs this twice (the
-  # version is already 8 after the first call). The backup is VERIFIED
-  # (integrity_check + its own schema_version) before anything is touched;
-  # either check failing aborts this migration outright -- the db stays at
-  # its prior, still-working version. Stamping is gated on the CREATE
-  # actually succeeding, not unconditional.
-  local current
+  # REVIEW-219 R2-1: the gate used to be "stored schema_version < 8", but
+  # an older v7 checkout (main, an APM copy, a stale worktree) is still
+  # running _migrate_schema_v7's own unconditional `INSERT OR REPLACE ...
+  # '7'` -- every time it touches this db AFTER a v8 process already
+  # created the owners table, it knocks the stamp back to 7, and the NEXT
+  # v8 registry_init then saw "current < 8" again and took ANOTHER full
+  # backup of a database whose owners table never actually changed.
+  #
+  # Short-circuit on the one fact that is actually idempotent and cannot
+  # regress: does the `owners` table exist yet. If it does, there is
+  # nothing left to migrate or back up -- a stale old process may still be
+  # flapping the version number, but that is cosmetic; just bring the
+  # stamp back up to 8 (monotonic, so this can never fight the old code's
+  # '7' indefinitely) and return.
+  #
+  # Otherwise (owners does not exist yet), STILL gate the backup on
+  # "current < 8", same as before R2-1: a genuinely brand-new database has
+  # already been stamped to the target version by registry_init's own
+  # bootstrap (`INSERT OR IGNORE ... _registry_schema_version`) BEFORE
+  # this function ever runs, so current is already 8 here with nothing
+  # pre-v8 to preserve -- only a database whose stamp is genuinely below 8
+  # (an actual pre-existing pre-v8 database) takes a backup.
+  local owners_exists current
+  owners_exists=$(_sql "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='owners';" 2>/dev/null)
+  if [ "$owners_exists" = "1" ]; then
+    _stamp_schema_version 8
+    return 0
+  fi
   current=$(_sql "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)
   case "$current" in '' | *[!0-9]*) current=0 ;; esac
   if [ "$current" -lt 8 ]; then

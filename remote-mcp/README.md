@@ -350,7 +350,11 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
    message body it is answering. `get_owner_reply` returns it once synced;
    a reply naming the wrong `owner_label` for that `exchange_id` is ignored
    (the exchange stays `delivered`, unreadable) rather than accepted on the
-   file's own say-so.
+   file's own say-so. Attribution is filesystem-scoped, not
+   pane-authenticated: "the owner replied" means a process running as the
+   same Mac user wrote this file to this path, not that the registered
+   owner pane itself typed it — any other same-uid process on the Mac
+   could write a reply file too (REVIEW-219 R2-3).
 
 ### Audit and limits
 

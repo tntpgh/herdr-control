@@ -302,6 +302,32 @@ class ReplyScan(unittest.TestCase):
         self.assertIn("looks good", row["body"])
         self.assertNotIn("artifact_revision", row["body"])  # header consumed, not left in the body
 
+    # ---- R2-2: a bare `---` used as an ordinary horizontal rule, not a
+    # header divider, must never be treated as one and silently eat
+    # everything above it -----------------------------------------------
+    def test_split_reply_header_leaves_a_headerless_horizontal_rule_intact(self):
+        text = "Summary: shipped the fix.\n---\nDetails below the rule."
+        header, body = pub._split_reply_header(text)
+        self.assertEqual(header, {})
+        self.assertEqual(body, text)
+
+    def test_a_reply_using_a_horizontal_rule_keeps_its_full_text(self):
+        d = pub.INBOX_ROOT / "conductor/replies"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "oex_r6.md").write_text("Summary: shipped the fix.\n---\nDetails below the rule.")
+        out = pub.scan_owner_replies(set())
+        (row,) = [r for r in out if r["exchange_id"] == "oex_r6"]
+        self.assertIn("Summary: shipped the fix.", row["body"])
+        self.assertIn("Details below the rule.", row["body"])
+
+    def test_split_reply_header_requires_every_nonblank_head_line_to_match(self):
+        # one real header line plus one stray prose line above the rule:
+        # not a valid header, must not be partially parsed either
+        text = "- exchange_id: oex_r7\nsome unrelated prose\n---\nbody text"
+        header, body = pub._split_reply_header(text)
+        self.assertEqual(header, {})
+        self.assertEqual(body, text)
+
 
 class Deliver(unittest.TestCase):
     def setUp(self):
