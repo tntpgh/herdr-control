@@ -205,4 +205,51 @@ describe("get_owner_reply", () => {
     const reply = await callTool<{ error?: string }>(access_token, "get_owner_reply", { exchange_id: id });
     expect(reply.data.error).toBe("not_found");
   });
+
+  it("refuses a late reply from reviving an already-cancelled blocked:sender_revoked message (REVIEW-219 M3)", async () => {
+    await signedSync(syncBody({ snapshot: ownerSnapshot() }));
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const sent = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",
+      { owner_label: "conductor", body: "hi", client_msg_id: "cm-m3" });
+    const id = sent.data.exchange_id;
+
+    // Leased (status -> delivering), as if the Mac picked it up this tick
+    // but the ack for "delivered" never made it back (a crash, a dropped
+    // sync, or simply the next tick running first).
+    await signedSync(syncBody({ snapshot: ownerSnapshot() }));
+
+    // The sender's grant is pulled before that ack ever arrives.
+    const grants = await e.OAUTH_KV.list({ prefix: "grant:tnt@teamthurber.com:" });
+    for (const k of grants.keys) await e.OAUTH_KV.delete(k.name);
+
+    // Past the 90s lease: the revoke-sweep now sees status='delivering' AND
+    // lease_until < now, and cancels it to blocked:sender_revoked -- the
+    // same path the "cancels a queued owner message" test exercises for a
+    // still-'queued' row, here through the 'delivering, lease expired' half
+    // of that same WHERE clause. Direct DO call (not signedSync/HTTP): the
+    // HTTP route always uses the real Date.now(), and this needs to land
+    // past the lease without a real 90s wait.
+    const future = Date.now() + 120_000;
+    const pendingOwners = await runInDurableObject(fleet(), (o: HerdrState) => o.pendingOwnerSenders(future));
+    await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future, crypto.randomUUID(), JSON.stringify(syncBody({ snapshot: ownerSnapshot() })),
+        { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: pendingOwners, hold: false }));
+    const cancelled = await runInDurableObject(fleet(), (o: HerdrState) => o.ownerMessageStatus(id, "tnt@teamthurber.com"));
+    expect([cancelled?.status, cancelled?.detail]).toEqual(["blocked:sender_revoked", "sender_revoked"]);
+
+    // The owner, unaware the message was just revoked server-side, still
+    // writes a reply to the file they already had open locally. M3: this
+    // must never resurrect the exchange back to 'replied'.
+    await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future + 1_000, crypto.randomUUID(), JSON.stringify(syncBody({
+        snapshot: ownerSnapshot(),
+        owner_replies: [{ exchange_id: id, owner_label: "conductor", body: "late reply", responded_at: new Date().toISOString(),
+          artifact_revision: "", session: "w1:p1" }],
+      })), { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
+
+    const after = await runInDurableObject(fleet(), (o: HerdrState) => o.ownerMessageStatus(id, "tnt@teamthurber.com"));
+    expect([after?.status, after?.detail]).toEqual(["blocked:sender_revoked", "sender_revoked"]);
+    const reply = await runInDurableObject(fleet(), (o: HerdrState) => o.ownerReply(id, "tnt@teamthurber.com"));
+    expect(reply).toBeNull();
+  });
 });

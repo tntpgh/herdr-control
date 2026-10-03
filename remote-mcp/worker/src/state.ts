@@ -1018,13 +1018,17 @@ export class HerdrState extends DurableObject<Env> {
 
     // A reply the owner wrote on the Mac. "header must match the exchange"
     // (SPEC item 4): the reported owner_label must equal THIS exchange's own
-    // target (the Mac's directory-scoped knowledge, re-validated here), and
-    // a second report of an already-replied exchange is ignored (idempotent
-    // against a re-synced file).
+    // target (the Mac's directory-scoped knowledge, re-validated here).
+    // M3 (REVIEW-219): only a message that actually reached 'delivered' can
+    // be replied to -- a late reply must never resurrect a message the
+    // sender was revoked out from under (status moved to a terminal
+    // 'blocked:sender_revoked' after delivery) or any other blocked/queued
+    // state, and a second report of an already-replied exchange is ignored
+    // (idempotent against a re-synced file).
     for (const r of body.owner_replies ?? []) {
       const m = this.sql.exec<{ owner_label: string; status: string }>(
         `SELECT owner_label, status FROM owner_messages WHERE exchange_id=?`, r.exchange_id).toArray()[0];
-      if (!m || m.owner_label !== r.owner_label || m.status === "replied") continue;
+      if (!m || m.owner_label !== r.owner_label || m.status !== "delivered") continue;
       const respondedMs = Date.parse(r.responded_at);
       this.sql.exec(`UPDATE owner_messages SET status='replied', reply_body=?, reply_session=?,
           reply_artifact_revision=?, replied_at=?, updated_at=? WHERE exchange_id=?`,

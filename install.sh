@@ -424,6 +424,30 @@ fi
 # the hub. Registry entry: thurber-os launchd/agents.yaml.
 if [ "$REMOTE_MCP" = 1 ]; then
   PLIST="$HOME/Library/LaunchAgents/com.herdr-control.remote-mcp.plist"
+  # REVIEW-219 M6: the plist below is rewritten WHOLE from only the flags
+  # passed to THIS invocation -- a switch not named here goes back to off,
+  # even if an earlier --apply turned it on (README's own documented
+  # go-live step 3, `--apply --remote-mcp-owner-inbox` alone, would
+  # silently turn messaging/tasks off if they were on). Read what is
+  # CURRENTLY deployed first and warn loudly on any switch THIS invocation
+  # turns off; this never changes what gets applied -- omitting a flag is
+  # still how you turn that switch off, same as README's documented
+  # "turning it off" section relies on -- it only makes sure that is seen,
+  # not discovered later.
+  prior_messaging=0; prior_tasks=0; prior_owner_inbox=0
+  if [ -f "$PLIST" ] && command -v /usr/libexec/PlistBuddy >/dev/null 2>&1; then
+    prior_messaging=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HERDR_MCP_MESSAGING" "$PLIST" 2>/dev/null) || prior_messaging=0
+    prior_tasks=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HERDR_MCP_TASKS" "$PLIST" 2>/dev/null) || prior_tasks=0
+    prior_owner_inbox=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HERDR_MCP_OWNER_INBOX" "$PLIST" 2>/dev/null) || prior_owner_inbox=0
+  fi
+  for pair in "messaging $prior_messaging $REMOTE_MCP_MESSAGING --remote-mcp-messaging" \
+              "tasks $prior_tasks $REMOTE_MCP_TASKS --remote-mcp-tasks" \
+              "owner-inbox $prior_owner_inbox $REMOTE_MCP_OWNER_INBOX --remote-mcp-owner-inbox"; do
+    set -- $pair
+    if [ "$2" = 1 ] && [ "$3" != 1 ]; then
+      echo "  ! WARNING: this install turns the Mac $1 switch OFF (it is currently ON) -- pass $4 too if that is not intended" >&2
+    fi
+  done
   if [ "$APPLY" = 1 ]; then
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
     if deploy_app "${HUB_REV:-origin/main}"; then

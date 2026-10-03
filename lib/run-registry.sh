@@ -272,6 +272,65 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   return 0
 }
 
+# ---- migration safety helpers (REVIEW-219 M5) --------------------------------
+# _stamp_schema_version only ever RAISES the stored value. Every
+# _migrate_schema_vN below used to end with an unconditional
+# `INSERT OR REPLACE`, which is fine within ONE process's own strictly-
+# ordered v3..v8 chain (the last call always wins, and it is always the
+# highest version this script knows about) but is wrong across DIFFERENT
+# checkouts sharing the same registry file: an older copy of this script
+# (an APM-deployed copy, a stale worktree) that has never heard of v8 still
+# runs its own chain ending at v7, and an unconditional write there would
+# silently regress the stamp from '8' back to '7' on a database a newer
+# checkout already migrated -- wrong as an audit trail even though v3-v8's
+# own DDL is additive/idempotent and no actual data is lost.
+_stamp_schema_version() {
+  _sql "INSERT INTO schema_meta(key, value) VALUES ('schema_version', '$1')
+        ON CONFLICT(key) DO UPDATE SET value='$1'
+        WHERE CAST('$1' AS INTEGER) > CAST(schema_meta.value AS INTEGER);" >/dev/null 2>&1
+}
+
+# One snapshot before a migration that actually changes schema on an
+# EXISTING database -- never a per-call cost, since callers only invoke
+# this when the stored version is below the one about to run (a brand-new
+# database has nothing worth preserving). SQLite's own online backup
+# (`.backup`), not a plain `cp` of the live file: `cp` reads the main db
+# file only, and WAL-mode writes (every writer here, including a
+# concurrent hook) land in the `-wal` sidecar first, checkpointed back to
+# the main file on no fixed schedule -- a `cp` taken at the wrong instant
+# could silently omit already-committed rows. `.backup` goes through
+# SQLite's own backup API, which is WAL-aware and produces a consistent
+# snapshot regardless of checkpoint timing or a concurrent writer.
+#
+# Verified immediately after, not just taken on faith: PRAGMA
+# integrity_check must say 'ok', and the backup's OWN schema_version must
+# equal the version we are migrating FROM ($2) -- a backup that is corrupt,
+# truncated, or silently of the WRONG database state is worse than no
+# backup (it would pass a later "a backup exists" check without being a
+# usable restore point). The caller aborts the migration entirely on
+# either failure (REVIEW-219 M5, conductor's own call: "abort if either
+# fails" -- the db stays at its prior, still-working version rather than
+# proceeding on an unverified safety net).
+_backup_registry_before_migration() {
+  local db backup ok ver
+  db="$(registry_db)"
+  [ -f "$db" ] || return 0
+  backup="${db}.$(date -u +%Y%m%dT%H%M%SZ).$1.bak"
+  if ! sqlite3 -batch "$db" ".backup '$backup'" >/dev/null 2>&1; then
+    printf 'run-registry: WARNING could not back up %s before migration %s; migration aborted\n' "$db" "$1" >&2
+    return 1
+  fi
+  ok=$(sqlite3 -batch "$backup" "PRAGMA integrity_check;" 2>/dev/null)
+  ver=$(sqlite3 -batch -noheader "$backup" "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)
+  if [ "$ok" != "ok" ] || [ "$ver" != "$2" ]; then
+    printf 'run-registry: WARNING backup %s failed verification (integrity=%s version=%s, expected %s); migration aborted\n' \
+      "$backup" "${ok:-<none>}" "${ver:-<none>}" "$2" >&2
+    return 1
+  fi
+  printf 'run-registry: backed up %s -> %s before migration %s (integrity+version verified)\n' "$db" "$backup" "$1" >&2
+  return 0
+}
+
 # ---- schema v2 -> v3: add tasks.agent_session -------------------------------
 # CREATE TABLE IF NOT EXISTS above only shapes a BRAND NEW database; an
 # existing one (schema_version '2') already has a `tasks` table without this
@@ -286,7 +345,7 @@ _migrate_schema_v3() {
   if [ -z "$has_col" ]; then
     _sql "ALTER TABLE tasks ADD COLUMN agent_session TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
   fi
-  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3');" >/dev/null 2>&1
+  _stamp_schema_version 3
 }
 
 # ---- schema v3 -> v4: add tasks.branch / tasks.trunk (project-contract-plan
@@ -303,7 +362,7 @@ _migrate_schema_v4() {
     _sql "ALTER TABLE tasks ADD COLUMN branch TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
     _sql "ALTER TABLE tasks ADD COLUMN trunk  TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
   fi
-  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4');" >/dev/null 2>&1
+  _stamp_schema_version 4
 }
 
 # ---- schema v4 -> v5: add tasks.project and tasks.manifest ------------------
@@ -319,7 +378,7 @@ _migrate_schema_v5() {
   if [ -z "$has_manifest" ]; then
     _sql "ALTER TABLE tasks ADD COLUMN manifest TEXT NOT NULL DEFAULT '';" >/dev/null 2>&1
   fi
-  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '5');" >/dev/null 2>&1
+  _stamp_schema_version 5
 }
 
 # v6 (docs/design/pretool-approval.md, 2026-09-27): the approval posture a task
@@ -365,7 +424,7 @@ _migrate_schema_v6() {
     );
     CREATE INDEX IF NOT EXISTS action_requests_by_task ON action_requests(task_id, action_sha256, created_at);
     CREATE INDEX IF NOT EXISTS action_requests_pending ON action_requests(status) WHERE status='pending';" >/dev/null 2>&1
-  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '6');" >/dev/null 2>&1
+  _stamp_schema_version 6
 }
 
 # v7 (herdr-mcp remote task lifecycle, remote-mcp/README.md): four columns a
@@ -395,7 +454,7 @@ _migrate_schema_v7() {
     fi
   done
   _sql "CREATE INDEX IF NOT EXISTS tasks_by_remote_id ON tasks(remote_task_id) WHERE remote_task_id<>'';" >/dev/null 2>&1
-  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '7');" >/dev/null 2>&1
+  _stamp_schema_version 7
 }
 
 # ---- schema v7 -> v8: add the owners table (ZERO-LOOP-001 #5, Terrence's
@@ -408,7 +467,24 @@ _migrate_schema_v7() {
 # makes schema_version a trustworthy audit trail of what a given database has
 # actually been through.
 _migrate_schema_v8() {
-  _sql "CREATE TABLE IF NOT EXISTS owners (
+  # REVIEW-219 M5: back up only on an ACTUAL upgrade (stored version below
+  # 8), never on a brand-new database (already stamped '8' by registry_init's
+  # own INSERT OR IGNORE, so current is '8' here and there is nothing
+  # pre-v8 to preserve) and never on a process that runs this twice (the
+  # version is already 8 after the first call). The backup is VERIFIED
+  # (integrity_check + its own schema_version) before anything is touched;
+  # either check failing aborts this migration outright -- the db stays at
+  # its prior, still-working version. Stamping is gated on the CREATE
+  # actually succeeding, not unconditional.
+  local current
+  current=$(_sql "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)
+  case "$current" in '' | *[!0-9]*) current=0 ;; esac
+  if [ "$current" -lt 8 ]; then
+    if ! _backup_registry_before_migration v8 "$current"; then
+      return 1
+    fi
+  fi
+  if _sql "CREATE TABLE IF NOT EXISTS owners (
       label          TEXT PRIMARY KEY,
       pane_id        TEXT NOT NULL,
       pane_birth     TEXT NOT NULL DEFAULT '',
@@ -416,8 +492,11 @@ _migrate_schema_v8() {
       workspace      TEXT NOT NULL DEFAULT '',
       registered_at  TEXT NOT NULL,
       updated_at     TEXT NOT NULL
-    );" >/dev/null 2>&1
-  _sql "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '8');" >/dev/null 2>&1
+    );" >/dev/null 2>&1; then
+    _stamp_schema_version 8
+  else
+    printf 'run-registry: v8 migration (owners table) failed; schema_version NOT advanced\n' >&2
+  fi
 }
 
 # ---- one-time import of the pre-SQLite file layout --------------------------

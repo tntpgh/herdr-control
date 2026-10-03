@@ -136,6 +136,49 @@ print('status_unregistered', pub.owner_pane_status('conductor', rows, {'w1:p1': 
 check "owner_pane_status() is 'not_registered' once unregister-owner.sh has removed the row" \
   "$(echo "$py_out4" | grep -qx 'status_unregistered not_registered' && echo 0 || echo 1)" "$py_out4"
 
+echo "== M5 (REVIEW-219): a real v7-schema registry is backed up before the v8 migration, and the stamp never regresses =="
+M5_DIR="$WORK/m5"
+mkdir -p "$M5_DIR"
+export HERDR_RUN_STATE_DIR="$M5_DIR"
+M5_DB="$M5_DIR/registry.sqlite3"
+
+# A hand-built partial schema would fail registry_init's own unconditional
+# CREATE INDEX block (tasks_by_pane references columns only a real v3-v7
+# lineage already has) -- so build an authentic one instead: run the real
+# migration chain once to get a genuine, fully-shaped v8 database, then roll
+# JUST the v8 bit back (drop the owners table, restamp '7'), leaving every
+# other column/table exactly as a real pre-existing v7 registry would have
+# them. The upgrade below is then a real v7->v8 transition, in place.
+( set -uo pipefail
+  . "$here/lib/run-registry.sh"
+  registry_init
+)
+sqlite3 "$M5_DB" "DROP TABLE owners; UPDATE schema_meta SET value='7' WHERE key='schema_version';" >/dev/null 2>&1
+pre_count=$(find "$M5_DIR" -maxdepth 1 -name 'registry.sqlite3.*.bak' 2>/dev/null | wc -l | tr -d ' ')
+check "no backup exists yet (nothing has migrated this db)" "$([ "$pre_count" = "0" ] && echo 0 || echo 1)" "pre_count=$pre_count"
+
+( set -uo pipefail
+  # shellcheck source=lib/run-registry.sh
+  . "$here/lib/run-registry.sh"
+  registry_init
+)
+post_count=$(find "$M5_DIR" -maxdepth 1 -name 'registry.sqlite3.*.v8.bak' 2>/dev/null | wc -l | tr -d ' ')
+check "exactly one backup was taken for this real v7->v8 upgrade" "$([ "$post_count" = "1" ] && echo 0 || echo 1)" "post_count=$post_count"
+backup_file=$(find "$M5_DIR" -maxdepth 1 -name 'registry.sqlite3.*.v8.bak' 2>/dev/null | head -1)
+backup_version=$(sqlite3 "$backup_file" "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)
+check "the backup preserves the PRE-migration schema_version ('7')" "$([ "$backup_version" = "7" ] && echo 0 || echo 1)" "backup_version=$backup_version"
+new_version=$(sqlite3 "$M5_DB" "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)
+check "the live db is stamped to the current version ('8') after migrating" "$([ "$new_version" = "8" ] && echo 0 || echo 1)" "new_version=$new_version"
+owners_exists=$(sqlite3 "$M5_DB" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='owners';" 2>/dev/null)
+check "the owners table actually exists after migrating" "$([ "$owners_exists" = "1" ] && echo 0 || echo 1)" "owners_exists=$owners_exists"
+
+( set -uo pipefail
+  . "$here/lib/run-registry.sh"
+  _migrate_schema_v7  # simulates an OLDER checkout (no _migrate_schema_v8 defined) re-running its own chain
+)
+regressed_check=$(sqlite3 "$M5_DB" "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)
+check "an older checkout's own v7 migration never regresses an already-v8 stamp" "$([ "$regressed_check" = "8" ] && echo 0 || echo 1)" "regressed_check=$regressed_check"
+export HERDR_RUN_STATE_DIR="$WORK/runs"
 echo
 if [ "$failures" -gt 0 ]; then
   echo "FAILED: $failures check(s)"

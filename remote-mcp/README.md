@@ -112,15 +112,25 @@ Turning it on, in order:
 2. `OWNER_INBOX_ENABLED="true"` (in `wrangler.jsonc`), merged, then a
    redeploy through `provision.sh --apply`; `/healthz` must show
    `owner_inbox_enabled:true` and the merged commit;
-3. `./install.sh --apply --remote-mcp-owner-inbox` on the Mac;
+3. `./install.sh --apply --remote-mcp-messaging --remote-mcp-tasks --remote-mcp-owner-inbox`
+   on the Mac -- **every** Mac switch you want left ON, every time, not just
+   the new one: the plist is rewritten WHOLE from only the flags passed to
+   THAT invocation, so `--remote-mcp-owner-inbox` alone silently turns
+   messaging and tasks back off if they were on (install.sh itself now
+   warns loudly, to stderr, on any switch a given `--apply` is about to
+   turn off, REVIEW-219 M6);
 4. a fresh consent that ticks `herdr:message.owner` deliberately (never
    pre-ticked).
 
 Turning it off: `"false"` + redeploy (every queued owner message is
 cancelled on the next sync with `blocked:owner_inbox_disabled`), and
-`./install.sh --apply --remote-mcp` (Mac switch off: the Mac refuses every
-future leased owner message and stops scanning for replies). Either alone
-stops delivery.
+`./install.sh --apply --remote-mcp-messaging --remote-mcp-tasks` (owner-inbox
+flag omitted, Mac switch off: the Mac refuses every future leased owner
+message and stops scanning for replies) -- pass the OTHER switches you want
+to keep, same "every switch together" rule as turning it on; passing bare
+`--remote-mcp` turns messaging and tasks off too, not just owner-inbox.
+Either `OWNER_INBOX_ENABLED="false"` or the Mac switch off, alone, stops
+delivery.
 
 Review finding M1 (a permission menu raised during `send-to-agent.sh`'s ~1 s
 typing check received the typed text) is fixed: the prompt is re-checked as
