@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Behaviour checks for tasks.py. No real spawn-task.sh/close-done-workers.sh/
-registry-bridge.sh ever runs: each is replaced by a tiny fake script that
-records its argv and returns canned output, so this never touches a real
-worktree, herdr pane, or the live run registry. Run with HERDR_RUN_STATE_DIR
+"""Behaviour checks for tasks.py. spawn-task.sh/close-done-workers.sh/
+registry-bridge.sh are replaced by tiny fake scripts that record their argv
+and return canned output, so this never touches a real worktree, herdr pane,
+or the live run registry. One exception: SpawnArgvAgainstRealParser runs the
+REAL spawn-task.sh in --dry-run, so tasks.py's argv is checked against the
+real parser (nothing is spawned). Run with HERDR_RUN_STATE_DIR
 pointed at a scratch dir, same as verify-run-registry.sh, even though this
 script's own sqlite fixture never shares a path with the real one.
 
@@ -178,6 +180,54 @@ class Capabilities(unittest.TestCase):
         tsk.TASKS_ON_MAC = False
         self.assertFalse(tsk.capabilities_snapshot()["mac_enabled"])
         tsk.TASKS_ON_MAC = True
+
+
+class SpawnArgvAgainstRealParser(unittest.TestCase):
+    """Every other test here fakes spawn-task.sh, so a flag tasks.py passes
+    that the real parser doesn't know is invisible to them: `--no-focus` fell
+    through to positional and reached omp's argv ("unknown flag"), and no
+    remote start ever launched an agent (2026-10-02, Zero's first live task).
+    Capture _spawn's exact argv and replay it through the REAL spawn-task.sh
+    in --dry-run: no tasks.py flag may survive onto the omp launch line."""
+
+    def test_tasks_argv_parses_in_real_spawn_task(self):
+        repo = TMP / "argv-repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "init"], check=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+        brief = TMP / "argv-brief.md"
+        brief.write_text("objective\n")
+        captured: list[list[str]] = []
+        real_run = tsk.subprocess.run
+        tsk.subprocess.run = lambda argv, **kw: captured.append(list(argv)) or subprocess.CompletedProcess(argv, 0, "", "")
+        try:
+            for secrets in ("grant", "withhold"):
+                tsk._spawn(repo, "remote/argv-check", {"job_class": "research", "secrets": secrets}, brief)
+        finally:
+            tsk.subprocess.run = real_run
+        self.assertEqual(len(captured), 2)
+        real_spawn = str(HERE.parent / "spawn-task.sh")
+        # research now spawns with --approval hook (remote-research-answer-
+        # answer-approval, 2026-10-02): spawn-task.sh's own safety check
+        # refuses --auto-approve unless the omp extension it would load IS
+        # this checkout's enforcing hook (never true for ~/.omp/agent/
+        # extensions/herdr-control.ts, which is normally symlinked to the
+        # deployed MAIN checkout, not this test's worktree) --
+        # HERDR_OMP_EXTENSION overrides that lookup for exactly this reason
+        # (same seam verify-pretool-enforce.sh's own hook dry-run tests use).
+        hook_env = {**os.environ, "HERDR_RUN_STATE_DIR": str(TMP / "argv-runs"),
+                    "HERDR_OMP_EXTENSION": str(HERE.parent / "agent-hooks" / "omp-herdr-control.ts")}
+        for argv in captured:
+            brief.write_text("objective\n")  # _spawn unlinks its brief once spawn-task.sh returns
+            out = subprocess.run(["bash", real_spawn, *argv[1:], "--dry-run"], capture_output=True, text=True,
+                                 timeout=60, env=hook_env)
+            self.assertEqual(out.returncode, 0, out.stderr[-500:])
+            launch = next((l for l in out.stdout.splitlines() if l.strip().startswith("launch")), "")
+            self.assertTrue(launch, out.stdout[-500:])
+            tokens = launch.split()
+            for flag in (a for a in argv[1:] if a.startswith("--")):
+                self.assertNotIn(flag, tokens, f"{flag} leaked onto the omp command line: {launch}")
 
 
 class CapabilityProbe(unittest.TestCase):
@@ -652,6 +702,26 @@ class Sweep(unittest.TestCase):
         self.assertTrue(actions[0]["ok"])
         self.assertIn("cancel run_x task_b timed_out", FAKE_BRIDGE_LOG.read_text())
 
+    def test_pending_completion_wins_over_an_overrun_deadline(self):
+        # F10 (security review PR #220): the deadline check used to run
+        # BEFORE the pending-completion check, so a task whose worker had
+        # already delivered its completion event -- just waiting on a
+        # HOLD-retried auto_close (pane busy) -- could still be
+        # force-cancelled timed_out past its deadline, discarding an
+        # answer that was already on disk. A delivered completion event
+        # must always win over the timer.
+        self._row("task_c", "rtask_c", deadline="2020-01-01T00:00:00Z")
+        self._event("task_c", "hard_stop_scheduled", json.dumps({"pid": 1}))
+        (self.wt / ".handoffs/identity.json").write_text(json.dumps({"completion_event": "y_done"}))
+        (self.wt / ".handoffs/events.jsonl").write_text(
+            json.dumps({"event": "y_done", "status": "completed", "reason": "no-follow-on"}) + "\n")
+        t = {"task_id": "task_c", "run_id": "run_x", "state": "running", "worktree": str(self.wt)}
+        actions = tsk.sweep({"task_c": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["action"], "auto_close")
+        self.assertTrue(actions[0]["ok"])
+        self.assertNotIn("timed_out", FAKE_BRIDGE_LOG.read_text())
+
     def test_deadline_fallback_when_set_deadline_never_landed(self):
         # N1: an empty deadline_at (a post-spawn set-deadline call that never
         # landed) must not mean "never times out" -- sweep falls back to
@@ -753,6 +823,40 @@ class Sweep(unittest.TestCase):
             self.assertFalse(any(a["action"] == "hard_stop_retry" for a in quiet))
         finally:
             tsk._popen_detached = old
+
+    def test_sweep_retries_auto_close_when_derived_state_moved_to_ready_review_but_stored_state_is_still_live(self):
+        # remote-research-answer-approval (2026-10-03, conductor live-test
+        # finding): publisher.py's `state` field is the HUB-DERIVED state
+        # (ready_review once a worker's completion event lands), while the
+        # registry's own stored_state stays "running" until
+        # close-done-workers.sh actually closes it. sweep() used to gate on
+        # DERIVED state, so a finished task fell out of the
+        # running/starting/blocked set the instant its completion event
+        # landed and was never auto_closed again -- including never
+        # retried past a transient HOLD (pane still WORKING).
+        self._row("task_e", "rtask_e")
+        self._event("task_e", "hard_stop_scheduled", json.dumps({"pid": 1}))
+        (self.wt / ".handoffs/identity.json").write_text(json.dumps({"completion_event": "x_done"}))
+        (self.wt / ".handoffs/events.jsonl").write_text(
+            json.dumps({"event": "x_done", "status": "completed", "reason": "no-follow-on"}) + "\n")
+        t = {"task_id": "task_e", "run_id": "run_x", "state": "ready_review", "stored_state": "running",
+             "worktree": str(self.wt)}
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        FAKE_CLOSE_OUT.write_text("  HOLD: pane is WORKING\n")
+        try:
+            actions = tsk.sweep({"task_e": t}, now)
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["action"], "auto_close")
+            self.assertFalse(actions[0]["ok"], "a HOLD must be reported, not silently dropped")
+            # Retried on the next tick (same ready_review/running pairing):
+            # the first HOLD must not have been the sweep's last look at it.
+            FAKE_CLOSE_OUT.write_text("  close    pane_1   label    (idle)\n")
+            actions2 = tsk.sweep({"task_e": t}, now)
+            self.assertEqual(len(actions2), 1)
+            self.assertEqual(actions2[0]["action"], "auto_close")
+            self.assertTrue(actions2[0]["ok"])
+        finally:
+            FAKE_CLOSE_OUT.write_text("  close    pane_1   label    (idle)\n")
 
 
 class HardStop(unittest.TestCase):

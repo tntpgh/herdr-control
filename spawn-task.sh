@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spawn-task.sh <project> <branch> [job-class|auto] [agent-or-command...] [--route deterministic|jev] [--base REF] [--dry-run] [--focus] [--no-secrets] [--brief FILE] [--approval menu|hook] [--tools LIST|all]
+# spawn-task.sh <project> <branch> [job-class|auto] [agent-or-command...] [--route deterministic|jev] [--base REF] [--dry-run] [--focus|--no-focus] [--no-secrets] [--brief FILE] [--approval menu|hook] [--tools LIST|all]
 #
 # Every worker starts with the 1Password service-account identity (one vault,
 # 249 items, READ-ONLY) so an unattended run never stops to ask for a
@@ -52,6 +52,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/handoff.sh"
 . "$here/lib/task-manifest.sh"
 . "$here/lib/op-env.sh"
+. "$here/lib/pane-guard.sh"
 
 # ---- args ------------------------------------------------------------------
 # op_mode inherits TIGHTEN-ONLY, the same shape as HERDR_POSTURE_FLOOR: a worker
@@ -91,6 +92,9 @@ while [ $# -gt 0 ]; do
     --tools) tools_req="${2:?spawn-task: --tools needs a comma list or all}"; shift 2 ;;
     --dry-run|-n) dry=1; shift ;;
     --focus) foc=--focus; shift ;;
+    # Explicit form of the default. remote-mcp/tasks.py passes it; before this
+    # case existed it fell through to positional and reached omp's argv.
+    --no-focus) foc=--no-focus; shift ;;
     # Everything after `--` belongs to the worker's own command, flags included.
     # Without this, `spawn-task.sh ~/repo t quick ./tool --no-secrets` silently
     # ate the worker's argument and changed this spawn's credential posture.
@@ -149,7 +153,7 @@ model_for() {  # <agent> <job> -> "<model>" or "<model>:<effort>"
 # such below rather than dressed up as enforced.
 m=$(model_for "$agent" "$job")
 managed=1
-if cli=$(cli_for_agent "$agent" "$m" "$posture_req" "$job" "$tools_req"); then
+if cli=$(cli_for_agent "$agent" "$m" "$posture_req" "$job" "$tools_req" "$approval_req"); then
   # Extra flags/args after the agent name ride along %q-quoted — EXCEPT
   # flags that would override the approval posture, rule/extension loading,
   # or the system-prompt channel this script composes (managed_flag_rejected,
@@ -211,7 +215,14 @@ fi
 # otherwise a research/explore worker's own launch gets --approval-mode
 # always-ask while its STAMPED floor stays `write`, letting any grandchild
 # IT spawns inherit a looser floor than its own parent actually ran at.
-eff_posture=$(resolved_posture "$(posture_want_for_job "$posture_req" "$job")")
+eff_posture=$(resolved_posture "$(posture_want_for_job "$posture_req" "$job" "$approval_req")")
+# F9 (security review PR #220): eff_posture above is the LAUNCH posture
+# (write, for a hook-mode worker's own --auto-approve swap). What a
+# GRANDCHILD inherits via HERDR_POSTURE_FLOOR must stay the job-class floor
+# (strict for research/explore) in EITHER approval mode -- the hook only
+# judges this worker's own calls, not a child spawn's. Computed separately
+# so the two no longer have to agree.
+stamp_posture=$(resolved_posture "$(posture_want_for_job "$posture_req" "$job" "$approval_req" stamp)")
 
 # ---- approval posture (menu | hook) -------------------------------------------
 # Validated here, before any worktree/registry/herdr side effect: an invalid
@@ -235,11 +246,55 @@ case "$approval_req" in
     # --auto-approve is only safe if the extension omp will load at session
     # start IS this checkout's enforcing hook: otherwise (an older main
     # checkout, a missing or foreign symlink) the worker runs with no judge.
+    #
+    # remote-research-answer-approval (2026-10-02, conductor live-test
+    # finding): compared by PATH identity until this fix, which refused
+    # every production spawn -- the publisher runs tasks.py from the
+    # deployed app copy (~/.local/share/herdr-control/app), so $here there
+    # is NOT ~/Code/herdr-control, yet ~/.omp/agent/extensions/herdr-control.ts
+    # is symlinked to the latter. Compare by CONTENT (sha256) instead: sound
+    # because spawn-task.sh stamps HERDR_CONTROL_DIR=$here below, so the
+    # hook's library root (lib/pretool-shadow.sh, etc.) comes from $here
+    # regardless of which byte-identical copy of the .ts file omp actually
+    # loaded. Still refuses on a missing/unreadable file, any byte
+    # difference, or a missing enforcement-protocol marker.
+    #
+    # F6 (security review PR #220): matching only the .ts file proves
+    # nothing about the JUDGE it loads -- the hook sources lib/pretool-
+    # shadow.sh (and everything it sources in turn: command-policy.sh,
+    # hook-approval-rules.tsv, bash-write-targets.sh, ...) from
+    # HERDR_CONTROL_DIR, i.e. $here, not from wherever the .ts file itself
+    # lives. A foreign checkout with an untouched .ts but a gutted
+    # lib/pretool-shadow.sh passed the check above and then ran under its
+    # own gutted judge. Tie $here's WHOLE lib/ tree (every file the judge
+    # loads, present and future, with no file list to keep in sync here) to
+    # the lib/ tree sitting next to the extension omp actually resolved —
+    # and stamp HERDR_CONTROL_DIR to THAT validated directory below, never
+    # the raw, unvalidated $here.
     omp_ext="${HERDR_OMP_EXTENSION:-$HOME/.omp/agent/extensions/herdr-control.ts}"
     omp_ext_real="$(cd "$(dirname "$omp_ext")" 2>/dev/null && python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$omp_ext" 2>/dev/null)"
-    here_hook="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$here/agent-hooks/omp-herdr-control.ts" 2>/dev/null)"
-    if [ -z "$omp_ext_real" ] || [ "$omp_ext_real" != "$here_hook" ] || ! grep -q 'HERDR_HOOK_APPROVAL_PROTOCOL = 1' "$omp_ext_real" 2>/dev/null; then
-      echo "spawn-task: --approval hook: omp would load ${omp_ext_real:-<no extension>} at session start, not this checkout's enforcing hook ($here_hook) — refusing an --auto-approve worker with no judge" >&2
+    here_hook="$here/agent-hooks/omp-herdr-control.ts"
+    omp_ext_sha="$(shasum -a 256 "$omp_ext_real" 2>/dev/null | cut -d' ' -f1)"
+    here_hook_sha="$(shasum -a 256 "$here_hook" 2>/dev/null | cut -d' ' -f1)"
+    _herdr_tree_sha() {  # dir -> sha256 of (relpath, content-sha256) for every regular SOURCE file, sorted by relpath
+      local d="$1"
+      [ -d "$d" ] || return 1
+      # __pycache__/*.pyc are compiler output, not source -- they differ by
+      # python version/mtime/build environment between two otherwise
+      # byte-identical checkouts (confirmed: the real app copy and the dev
+      # checkout differ ONLY in a stray .pyc), so hashing them refused
+      # every production spawn on pure noise. Skip anything a worktree's
+      # own .gitignore already treats as build output, never source.
+      ( cd "$d" && find . -type f -not -path '*/__pycache__/*' -not -name '*.pyc' -not -name '*.pyo' -not -name '.DS_Store' \
+          | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done ) 2>/dev/null | shasum -a 256 | cut -d' ' -f1
+    }
+    canon_root="$(cd "$(dirname "$omp_ext_real")/.." 2>/dev/null && pwd)"
+    here_lib_sha="$(_herdr_tree_sha "$here/lib")"
+    canon_lib_sha="$(_herdr_tree_sha "$canon_root/lib")"
+    if [ -z "$omp_ext_real" ] || [ -z "$omp_ext_sha" ] || [ "$omp_ext_sha" != "$here_hook_sha" ] \
+       || ! grep -q 'HERDR_HOOK_APPROVAL_PROTOCOL = 1' "$omp_ext_real" 2>/dev/null \
+       || [ -z "$canon_root" ] || [ -z "$here_lib_sha" ] || [ -z "$canon_lib_sha" ] || [ "$here_lib_sha" != "$canon_lib_sha" ]; then
+      echo "spawn-task: --approval hook: omp would load ${omp_ext_real:-<no extension>} at session start, whose content does not match this checkout's enforcing hook ($here_hook), or whose lib/ judge tree at $here does not match the lib/ tree next to it — refusing an --auto-approve worker with no judge" >&2
       exit 2
     fi
     case "$cli" in
@@ -321,6 +376,51 @@ run_id="${HERDR_RUN_ID:-$(gen_id run)}"
 task_id=$(gen_id task)
 worker_id=$(gen_id worker)
 conductor_pane_id="${HERDR_PANE_ID:-}"
+# remote-research-answer-approval (2026-10-02): a spawn with no HERDR_PANE_ID
+# (the remote-mcp publisher's own _spawn call, which runs on the Mac outside
+# any herdr pane) got conductor_pane_id="" and conductor_id="conductor_unknown"
+# -- its escalations (input_required/action_requests) had nowhere to go but
+# the slow Main/stale-window fallback (task_20261002T191316Z_54877_5893,
+# SPEC.md). HERDR_MCP_CONDUCTOR_PANE names a standing conductor pane for
+# exactly that case (a publisher setting, e.g. its launchd plist env) --
+# used ONLY as a fallback, never overriding a real HERDR_PANE_ID (an
+# interactive spawn already has its own conductor). Validated live here, at
+# spawn time: an unset or dead pane leaves conductor_pane_id empty exactly
+# as before -- the task still starts regardless -- rather than registering
+# a conductor that can never answer.
+if [ -z "$conductor_pane_id" ] && [ -n "${HERDR_MCP_CONDUCTOR_PANE:-}" ] \
+   && pane_is_agent "$HERDR_MCP_CONDUCTOR_PANE" 2>/dev/null; then
+  # F8 (security review PR #220): pane_is_agent proves only that SOME agent
+  # process is running there now -- a herdr-recycled pane id can belong to
+  # an unrelated WORKER (any agent process satisfies it), and a static
+  # plist value has no way to notice the pane changed hands. Refuse the
+  # fallback when the pane is CURRENTLY a registered worker's own active
+  # task pane: a worker is never a conductor, and every
+  # "approve ... --authority conductor" prompt this fallback enables would
+  # otherwise be typed straight into that worker's session.
+  fallback_occupant_state="$(task_for_pane "$HERDR_MCP_CONDUCTOR_PANE" 2>/dev/null | jq -r '.state // empty' 2>/dev/null)"
+  fallback_reject_reason=""
+  case "$fallback_occupant_state" in
+    running|starting|blocked) fallback_reject_reason="pane is a registered worker's own active task pane" ;;
+  esac
+  # R3 (security review round 2): F8's check only proves "not a currently
+  # registered worker" -- a recycled id hosting any OTHER unregistered
+  # session (a reviewer pane, another conductor) still passed. When the
+  # publisher's config pins the pane's EXPECTED birth (HERDR_MCP_CONDUCTOR_
+  # BIRTH, optional -- a plist value stamped once, same as the pane id
+  # itself), refuse on any mismatch too.
+  if [ -z "$fallback_reject_reason" ] && [ -n "${HERDR_MCP_CONDUCTOR_BIRTH:-}" ]; then
+    live_birth="$(pane_birth_now "$HERDR_MCP_CONDUCTOR_PANE" 2>/dev/null)"
+    [ "$live_birth" = "$HERDR_MCP_CONDUCTOR_BIRTH" ] || fallback_reject_reason="pane birth ${live_birth:-<gone>} does not match the pinned HERDR_MCP_CONDUCTOR_BIRTH"
+  fi
+  if [ -n "$fallback_reject_reason" ]; then
+    # R3: a rejected fallback used to leave no trace at all.
+    append_event "$run_id" "$task_id" conductor_fallback_rejected \
+      "$(jq -nc --arg p "$HERDR_MCP_CONDUCTOR_PANE" --arg r "$fallback_reject_reason" '{pane:$p, reason:$r}')" >/dev/null 2>&1 || true
+  else
+    conductor_pane_id="$HERDR_MCP_CONDUCTOR_PANE"
+  fi
+fi
 conductor_id="${HERDR_CONDUCTOR_ID:-conductor_${conductor_pane_id:-unknown}}"
 
 # The conductor pane's birth fingerprint (herdr's terminal_id), captured NOW
@@ -344,7 +444,13 @@ if [ "$dry" = 1 ]; then
   echo "  tab label : $label"
   if [ "$managed" = 1 ]; then
     echo "  launch    : $cli"
-    echo "  posture   : $eff_posture  (floor ${HERDR_POSTURE_FLOOR:-write}, request ${posture_req:-none}; stamped into the worker as HERDR_POSTURE_FLOOR — child spawns can only tighten)"
+    posture_note="$eff_posture  (floor ${HERDR_POSTURE_FLOOR:-write}, request ${posture_req:-none}; stamped into the worker as HERDR_POSTURE_FLOOR — child spawns can only tighten)"
+    # F9 (security review PR #220): only say more when there IS more to say
+    # -- research/explore hook mode is the one case where this worker's own
+    # launch posture and what it stamps for a grandchild now diverge.
+    # Everywhere else this line must stay byte-identical to its prior text.
+    [ "$stamp_posture" != "$eff_posture" ] && posture_note="$eff_posture  (floor ${HERDR_POSTURE_FLOOR:-write}, request ${posture_req:-none}; this worker's own session runs at $eff_posture, but $stamp_posture is what gets stamped as ITS children's HERDR_POSTURE_FLOOR instead — child spawns can only tighten)"
+    echo "  posture   : $posture_note"
     [ "$approval_req" = hook ] && echo "  approval  : hook — omp --auto-approve + worker overlay; the pre-tool hook decides every call and hands escalations to herdr-action.sh (registry row approval=hook)"
     echo "  rules     : ${CANONICAL_RULES_SRC:-<none — no ancestor AGENTS.md found/configured; normal project discovery only>}"
   else
@@ -723,8 +829,8 @@ true
 #     descendant spawn keeps the same explicit operator source instead of
 #     re-deriving from a possibly different tree — only when one resolved.
 stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_PANE_ID=%q HERDR_TASK_LABEL=%q HERDR_POSTURE_FLOOR=%q' \
-  "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$eff_posture")
-[ "$approval_req" = hook ] && stamped_cli="$stamped_cli HERDR_APPROVAL=hook $(printf 'HERDR_CONTROL_DIR=%q' "$here")"
+  "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$stamp_posture")
+[ "$approval_req" = hook ] && stamped_cli="$stamped_cli HERDR_APPROVAL=hook $(printf 'HERDR_CONTROL_DIR=%q' "$canon_root")"
 [ -n "${HERDR_POLICY_EXTRA_RULES:-}" ] && stamped_cli="$stamped_cli $(printf 'HERDR_POLICY_EXTRA_RULES=%q' "$HERDR_POLICY_EXTRA_RULES")"
 [ -n "$CANONICAL_RULES_SRC" ] && stamped_cli="$stamped_cli $(printf 'HERDR_CANONICAL_RULES=%q' "$CANONICAL_RULES_SRC")"
 # The op prelude runs FIRST (lib/op-env.sh): a worker that has to hunt for a
@@ -774,8 +880,13 @@ bgtag="background"; [ "$foc" = --focus ] && bgtag="focused"
 printf 'spawned %-22s ws=%s tab=%s pane=%s  [%s]\n' "$label" "$ws" "$tab" "$pane" "$bgtag"
 printf '  worktree: %s\n  launch:   %s\n' "$wt" "$cli"
 if [ "$managed" = 1 ]; then
-  printf '  posture:  %s  (floor %s, request %s; stamped as the worker'"'"'s own floor)\n' \
-    "$eff_posture" "${HERDR_POSTURE_FLOOR:-write}" "${posture_req:-none}"
+  if [ "$stamp_posture" != "$eff_posture" ]; then
+    printf '  posture:  %s  (floor %s, request %s; this worker runs at %s, but %s is stamped as its children'"'"' HERDR_POSTURE_FLOOR instead)\n' \
+      "$eff_posture" "${HERDR_POSTURE_FLOOR:-write}" "${posture_req:-none}" "$eff_posture" "$stamp_posture"
+  else
+    printf '  posture:  %s  (floor %s, request %s; stamped as the worker'"'"'s own floor)\n' \
+      "$eff_posture" "${HERDR_POSTURE_FLOOR:-write}" "${posture_req:-none}"
+  fi
   if [ -n "$CANONICAL_RULES_SRC" ]; then
     printf '  rules:    %s (appended with provenance; normal project discovery untouched)\n' "$CANONICAL_RULES_SRC"
   else

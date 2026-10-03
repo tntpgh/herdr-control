@@ -869,6 +869,9 @@ def build_plan(a, task_id, task_dir, commit, main_root, operator_rules, image_id
         "--tmpfs", f"/home/worker:rw,nosuid,nodev,size={a.home_size},uid={uid},gid={gid},mode=0700",
         "--env-file", d("secrets", "worker.env"),
         "--env", "HOME=/home/worker", "--env", "OMP_SKIP_SETUP=1", "--env", "TERM=dumb", "--env", "LANG=C.UTF-8",
+        # No __pycache__ in /workspace: a stray .pyc lands in changes.json and
+        # trips stage2-diagnose.sh's doc-only scope guard (2026-10-02 run).
+        "--env", "PYTHONDONTWRITEBYTECODE=1",
         "--env", "HERDR_ISOLATED_WORKER=1", "--env", f"HERDR_TASK_ID={task_id}", "--env", f"HERDR_SOURCE_COMMIT={commit}",
         "--env", f"HERDR_WORKER_GIT_INIT={'0' if a.no_workspace_git else '1'}",
         "--workdir", "/workspace",
