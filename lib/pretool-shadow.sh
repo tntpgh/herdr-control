@@ -317,7 +317,9 @@ _ps_plain_write_verdict() {
 #     command word (all launchers, e.g. `env -S ...`) escalates.
 # Anything else — interpreters, shells, compilers, archivers, package
 # runners, sed/awk, cp/mv/ln — escalates to the conductor. Reads stay allowed.
-_PS_HW_SAFE=' cat head tail wc ls grep egrep fgrep rg find echo printf tee cd pwd sort cut tr diff cmp
+# No `cd`: omp's bash is a persistent shell, so a `cd` in one call would move
+# every later call away from the cwd this check resolves targets against.
+_PS_HW_SAFE=' cat head tail wc ls grep egrep fgrep rg find echo printf tee pwd sort cut tr diff cmp
  stat file basename dirname realpath readlink date true false test [ jq column nl comm fold expand
  shasum sha256sum mkdir touch git '
 _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an allow
@@ -328,11 +330,31 @@ _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an
   fi
   wt_abs="$(_cp_lexical_abspath "$wt")"
   [ -n "$cwd" ] || cwd="$wt_abs"
+  # R2-1: a command substitution's body is collapsed to @SUB@ before either
+  # the segment walk or the target parser sees it, so `cat "$(echo x >
+  # src/a)"` would read as a bare `cat`. Nothing a research task needs.
+  case "$(_cp_protect_text "$cmd")" in
+    *@SUB@*)
+      PS_VERDICT=escalate PS_POLICY=handoffs-write
+      PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; a command substitution runs code this policy cannot see — a conductor must review it"
+      return ;;
+  esac
   while IFS= read -r seg; do
     [ -n "${seg//[[:space:]]/}" ] || continue
     if ! _cp_locate_command_word "$seg"; then
       PS_VERDICT=escalate PS_POLICY=handoffs-write
       PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; a command segment has no command word this policy can identify — a conductor must review it"
+      return
+    fi
+    # R2-3: the command word must be the segment's FIRST word. A launcher
+    # (`env -C dir`, `nice`, `timeout`) or a leading assignment
+    # (`GIT_EXTERNAL_DIFF=x git diff`) changes where or what the allowed
+    # command runs, and target resolution would not follow it.
+    local -a _hw_toks
+    set -f; read -r -a _hw_toks <<<"$seg"; set +f
+    if [ "${_hw_toks[0]:-}" != "${_CP_LOC[0]:-}" ]; then
+      PS_VERDICT=escalate PS_POLICY=handoffs-write
+      PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '${_hw_toks[0]:-}' wraps or prefixes '$_cp_wcmd' — a conductor must review it"
       return
     fi
     case "$_PS_HW_SAFE" in
@@ -345,7 +367,7 @@ _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an
     # find/git are reads only without their own writing/exec options.
     for a in "${_CP_LOC[@]:1}"; do
       case "$_cp_wcmd:$a" in
-        find:-exec*|find:-ok*|find:-delete|find:-fprint*|find:-fls|rg:--pre*|git:-o|git:--output*|git:-c|git:--exec-path*|git:-C)
+        find:-exec*|find:-ok*|find:-delete|find:-fprint*|find:-fls|rg:--pre*|git:-[!-]*[oCc]*|git:--output*|git:--exec-path*|git:--ext-diff|git:--textconv)
           PS_VERDICT=escalate PS_POLICY=handoffs-write
           PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '$_cp_wcmd $a' can write or run code — a conductor must review it"
           return ;;

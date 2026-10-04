@@ -401,10 +401,22 @@ escalate|git -C src log
 escalate|git checkout -- README.md
 escalate|rg --pre ./tmp/x foo
 escalate|cp -l src/x tmp/hl
+escalate|cat "$(echo x > src/evil)"
+escalate|printf '%s' "$(echo x > src/evil-2)"
+escalate|cat `echo x > src/evil-3`
+escalate|X=$(echo x > src/evil-4) cat README.md
+escalate|git diff -osrc/git-glued-output
+escalate|git show -osrc/x HEAD
+escalate|git -Csrc log
+escalate|git log --output=src/x
+escalate|git diff --ext-diff
+escalate|nice tee tmp/out
+escalate|GIT_EXTERNAL_DIFF=./tmp/x git diff
+escalate|LC_ALL=C grep foo README.md
 EOF
 # These are refused by peer_decide before F3 runs (find -exec/-delete, xargs,
-# $VAR, unreviewable scripts, env -S credential rule); they must stay refused.
-for c in 'find . -name a -exec cp {} src/b \;' 'find . -name a -delete' 'echo src/z | xargs touch' 'echo x > "$OUT"' 'python3 tmp/probe.py' 'timeout 5 python3 tmp/p.py' "env -S \"python3 -c 'open(\\\"src/a\\\",\\\"w\\\")'\""; do
+# $VAR, unreviewable scripts, the env credential rule); they must stay refused.
+for c in 'find . -name a -exec cp {} src/b \;' 'find . -name a -delete' 'echo src/z | xargs touch' 'echo x > "$OUT"' 'python3 tmp/probe.py' 'timeout 5 python3 tmp/p.py' "env -S \"python3 -c 'open(\\\"src/a\\\",\\\"w\\\")'\"" 'env --chdir=src tee tmp/out' 'env -C src touch tmp/out'; do
   out="$(enf bash "$(jq -nc --arg c "$c" '{command:$c}')")"; rc=$?
   [ "$rc" = 8 ] && ok "F3 still refused: $c" || not_ok "F3 expected refusal for [$c], got rc=$rc: $out"
 done
