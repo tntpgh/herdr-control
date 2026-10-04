@@ -507,6 +507,29 @@ cands = hub.stall_watchdog_candidates(
 results["H1_the_old_20row_window_would_have_missed_it"] = not any(
     c["signal"] == "conductor_prompt" for c in cands)
 
+# ---- review M2 (r5): `--source visible` caps at the pane's LIVE SCREEN
+# HEIGHT, never at `--lines` -- measured live: 29-35 rows on every
+# 46-column w5B pane for BOTH `--lines 60` and `--lines 200`, so the
+# window the H1 fixture above exercises can never actually arrive on a
+# real narrow/short pane. `--source recent` returns exactly `--lines`
+# rows regardless of screen height (measured live: 60 of 60, 200 of 200
+# on the same panes). Captured via a real subprocess.run monkeypatch, not
+# a source-text grep, so this proves the actual call hub.py makes.
+_m2_calls = []
+_m2_real_run = hub.subprocess.run
+def _m2_fake_run(argv, **kw):
+    _m2_calls.append(argv)
+    class _R:
+        stdout = "ok\n"
+    return _R()
+hub.subprocess.run = _m2_fake_run
+hub._pane_last_output("somepane", lines=60)
+hub.subprocess.run = _m2_real_run
+_m2_argv = _m2_calls[0]
+_m2_src_idx = _m2_argv.index("--source")
+results["M2_pane_read_uses_a_source_with_no_screen_height_cap"] = (
+    _m2_argv[_m2_src_idx + 1] == "recent")
+
 # ---- review M1 (r3): the last-non-blank-row check above was itself still
 # too narrow — silent the moment the request wraps across terminal columns,
 # the moment the worker's own recap/status block follows it, or the moment
@@ -559,15 +582,32 @@ results["M1_a_rerendered_recap_is_not_a_new_fingerprint"] = fp_recap_a == fp_rec
 # request text, broken at different columns, must mint the SAME
 # fingerprint -- the live review measured the old code breaking this (a
 # long path wrapped differently at each width it was resized to).
-_L1_REQUEST = ("CONDUCTOR: please confirm the rollback plan before I proceed because the "
-              "change touches the production webhook handler and a wrong call cannot be "
-              "undone once it ships")
+#
+# Review M1 (r5): word-wrap (textwrap) only ever breaks AT A SPACE, so
+# rejoining word-wrapped continuation rows with " " reconstructs the exact
+# original string no matter where the wrap fell -- raw-line hashing
+# (8a0095e) passed this fixture too, so it could never actually FAIL on a
+# revert. A real terminal hard-wraps mid-token the instant a long path or
+# URL exceeds the column, which textwrap never does; this fixture
+# character-wraps a long path instead, so the two widths split it at
+# DIFFERENT characters and the raw join reconstructs two DIFFERENT
+# strings -- proven directly below -- while only whitespace-stripped
+# normalization (what head actually ships) reconstructs the identical one.
+_L1_REQUEST = ("CONDUCTOR: run /Users/thurbs/.herdr/worktrees/herdr-control/fix/"
+              "stall-watchdog-m1/tmp/r2_probe.py and keep its output in tmp/r2_probe.out")
+def _l1_char_wrap(s, width):
+    return [s[i:i + width] for i in range(0, len(s), width)]
 def _l1_chrome_at(width):
-    lines = textwrap.wrap(_L1_REQUEST, width=width)
+    lines = _l1_char_wrap(_L1_REQUEST, width)
     return ("an earlier line of agent output\n" + "\n".join(lines) + "\n"
             "\u256d\u2500\u2500 omp \u00b7 sonnet \u00b7 ctx 42% \u2500\u2500\u256e\n"
             "\u2502 >                                          \u2502\n"
             "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n")
+_l1_joined_46 = " ".join(l.strip() for l in _l1_char_wrap(_L1_REQUEST, 46))
+_l1_joined_70 = " ".join(l.strip() for l in _l1_char_wrap(_L1_REQUEST, 70))
+results["M1_fixture_would_hash_differently_raw_at_the_two_widths"] = (
+    hub.hashlib.sha256(_l1_joined_46.encode()).hexdigest()
+    != hub.hashlib.sha256(_l1_joined_70.encode()).hexdigest())
 cands_46 = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
     pane_read_fn=lambda pane: _l1_chrome_at(46), pane_birth_fn=lambda pane: "pb1")
@@ -590,29 +630,72 @@ cands = hub.stall_watchdog_candidates(
 results["M1_fires_on_a_bold_markdown_conductor_marker"] = any(
     c["signal"] == "conductor_prompt" for c in cands)
 
-# ---- review M1 (r4): an ALREADY-ANSWERED request must not re-fire. A
-# plain send-to-agent.sh reply writes only `message_delivered` (not an
-# owner-activity event -- review H1/H2), so the only place this can be
-# detected at all is the pane text itself: once a SECOND, non-recap
-# paragraph follows the request, the worker has gone on to something else.
-CHROME_ANSWERED = ("an earlier line of agent output\n"
-                   "CONDUCTOR: approve request ar_12 or tell me why not\n"
-                   "\n"
-                   "Thanks -- picking back up on the migration script while that's pending.\n"
-                   "\u256d\u2500\u2500 omp \u00b7 sonnet \u00b7 ctx 51% \u2500\u2500\u256e\n"
-                   "\u2502 >                                          \u2502\n"
-                   "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n")
+# ---- review H1 (r5): "already answered" is no longer inferred from pane
+# SHAPE -- r4's guard dropped the result the moment a SECOND, non-recap
+# paragraph followed the request, and round-2 review found it ate the
+# round-1 live incident's own shape (a trailing paragraph, then omp's own
+# recap) plus six other ordinary shapes a worker writes while STILL
+# waiting. Every one of F1-F7 below must FIRE: none of them is an actual
+# reply, so the fix must never treat them as "answered".
+_H1R5_REQ = ("**CONDUCTOR: run `/Users/thurbs/.herdr/worktrees/herdr-control/fix/"
+            "stall-watchdog-m1/tmp/r2_probe.py` and keep its output in tmp/r2_probe.out; "
+            "it is read-only and uses only herdr pane list and pane read.**")
+_H1R5_TRAIL = "I'll wait here and keep working on the migration script while that's pending."
+_H1R5_OMP_RECAP = ("\u203b recap: static review done; waiting on the conductor to run the "
+                   "probe script before writing the verdict. (disable recaps in /config)")
+
+def _h1r5_pane(paragraphs, width=46):
+    """One agent-output line, then each paragraph (word-wrapped at `width`,
+    or a literal list of rows) separated by a blank row, then the omp
+    composer -- the same shape every CHROME_* fixture above hand-built,
+    generalized so F1-F7 do not need seven more hand-wrapped literals."""
+    rows = ["an earlier line of agent output"]
+    for p in paragraphs:
+        rows.append("")
+        rows.extend(p if isinstance(p, list) else (textwrap.wrap(p, width=width) or [p]))
+    return ("\n".join(rows) + "\n"
+            "\u256d\u2500\u2500 omp \u00b7 sonnet \u00b7 ctx 42% \u2500\u2500\u256e\n"
+            "\u2502 >                                          \u2502\n"
+            "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n")
+
+_H1R5_CASES = [
+    ("F1_r1_live_shape_bold_wrapped_request_plus_trailing_para_plus_omp_recap_FIRES",
+     [_H1R5_REQ, _H1R5_TRAIL, _H1R5_OMP_RECAP]),
+    ("F2_request_plus_one_plain_trailing_sentence_FIRES",
+     ["CONDUCTOR: run /abs/tmp/x.sh", "I'll wait for the output before going on."]),
+    ("F3_request_plus_an_indented_command_block_FIRES",
+     ["CONDUCTOR: please run this for me:", ["    bash /abs/tmp/x.sh"]]),
+    ("F4_request_plus_an_evidence_list_FIRES",
+     ["CONDUCTOR: approve ar_7 or tell me why not.", ["Evidence:", "- tests 76/0", "- probe rc=0"]]),
+    ("F5_request_plus_a_2paragraph_omp_recap_FIRES",
+     [_H1R5_REQ, "\u203b recap: waiting on the conductor.", "Next: write REVIEW.md."]),
+    ("F6_request_plus_Recap_colon_outside_bold_FIRES",
+     ["CONDUCTOR: run /abs/tmp/x.sh", "**Recap**: waiting on you."]),
+    ("F7_request_plus_a_Status_line_FIRES",
+     ["CONDUCTOR: run /abs/tmp/x.sh", "Status: blocked on the run above."]),
+]
+for _h1r5_key, _h1r5_paras in _H1R5_CASES:
+    _h1r5_text = _h1r5_pane(_h1r5_paras)
+    cands = hub.stall_watchdog_candidates(
+        [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+        pane_read_fn=lambda pane, _t=_h1r5_text: _t, pane_birth_fn=lambda pane: "pb1")
+    results[_h1r5_key] = any(c["signal"] == "conductor_prompt" for c in cands)
+
+# ---- review H1 (r5): the REAL answered check -- a `message_delivered`
+# event from the registry, never pane shape. AT OR AFTER the task's own
+# `updated_at` (the moment this CONDUCTOR: line went idle) silences it; a
+# STALE reply from before the request does not.
+_H1R5_SINCE = hub._iso_epoch(t7["updated_at"])
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME_ANSWERED, pane_birth_fn=lambda pane: "pb1")
-results["M1_r4_silent_once_the_worker_went_on_past_the_request"] = not any(
-    c["signal"] == "conductor_prompt" for c in cands)
-# A recap paragraph (the shape M1 r3 already covers, CHROME_RECAP_A) must
-# still fire -- the answered-guard must not be so broad it eats recaps too.
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
+    replied={"t1": _H1R5_SINCE + 5})
+results["H1_r5_silent_once_a_real_reply_was_delivered_after_the_request"] = cands == []
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME_RECAP_A, pane_birth_fn=lambda pane: "pb1")
-results["M1_r4_recap_still_fires_with_the_answered_guard_in_place"] = any(
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
+    replied={"t1": _H1R5_SINCE - 5000})
+results["H1_r5_a_stale_reply_from_before_the_request_still_fires"] = any(
     c["signal"] == "conductor_prompt" for c in cands)
 
 # ---- mutation harness: each revert variant is installed, exercised and
@@ -632,26 +715,6 @@ def _naive_last_conductor_prompt_line(text):
         if not line:
             continue
         return line if line.startswith("CONDUCTOR:") else None
-    return None
-
-def _pre_answered_guard_conductor_prompt_line(text):
-    """head 8a0095e, this round's OWN starting point: the full bottom-up
-    scan, markdown strip and continuation join -- but no check at all for
-    whether the worker went on to something else after the request."""
-    if not text:
-        return None
-    rows = [hub._ANSI_RE.sub("", ln).rstrip() for ln in hub._agent_output_lines(text)]
-    for i in range(len(rows) - 1, -1, -1):
-        row = hub._MD_LEADING_RE.sub("", rows[i].strip())
-        if not row or not row.startswith("CONDUCTOR:"):
-            continue
-        parts = [row]
-        for nxt in rows[i + 1:]:
-            nxt = nxt.strip()
-            if not nxt:
-                break
-            parts.append(nxt)
-        return " ".join(parts)
     return None
 
 real_last_conductor_prompt_line = hub._last_conductor_prompt_line
@@ -682,10 +745,6 @@ _run_mutant("REVERT_full_naive", _naive_last_conductor_prompt_line, [
     ("REVERT_M1_recap_fix_caught_on_revert", CHROME_RECAP_A, False),
     ("REVERT_M1_bold_fix_caught_on_revert", CHROME_BOLD, False),
     ("REVERT_M1_plain_case_unaffected_by_the_revert", CHROME, True),
-])
-_run_mutant("REVERT_pre_answered_guard", _pre_answered_guard_conductor_prompt_line, [
-    ("REVERT_M1r4_answered_fix_caught_on_8a0095e", CHROME_ANSWERED, True),
-    ("REVERT_M1r4_wrap_still_fires_on_8a0095e", CHROME_WRAPPED, True),
 ])
 
 cands = hub.stall_watchdog_candidates(
@@ -722,9 +781,13 @@ conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, 
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('ev1','drun','dtask','message_delivered','2026-01-01T00:00:00Z','{}')")
 conn.commit(); conn.close()
-denied, delivered, owner_acted = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+denied, delivered, owner_acted, replied = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["M2_denied_query_finds_the_approval_escalated_row"] = denied.get("dtask", {}).get("fingerprint") == "esc1"
 results["delivered_query_finds_an_unprocessed_message"] = "dtask" in delivered
+# review H1 (r5): `replied` is populated from the SAME message_delivered
+# row `delivered` reads above, regardless of what happens after it --
+# unlike `delivered`, it is never cleared by later worker activity.
+results["H1_r5_replied_query_finds_the_message_delivered_row"] = "dtask" in replied
 
 # review M-c(2): a WAY-older approval_escalated row, with no later worker
 # activity, falls outside the window and must not populate `denied` —
@@ -735,7 +798,7 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('esc_old','drun','dtask_old','approval_escalated','2020-01-01T00:00:00Z','{}')")
 conn.commit(); conn.close()
-denied_old, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+denied_old, _, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["Mc2_a_window_bounded_scan_excludes_ancient_rows"] = "dtask_old" not in denied_old
 
 # review M2: a HUMAN pressing Approve on a deny-CLASSIFIED prompt (policy_verdict
@@ -746,7 +809,7 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO approvals (approval_id, task_id, authority, policy_verdict, choice_text, decided_at) "
              "VALUES ('appr_human_ok','dtask2','human','deny','Approve','2026-01-01T00:00:00Z')")
 conn.commit(); conn.close()
-denied2, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+denied2, _, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["M2_human_approve_on_a_deny_classified_prompt_never_fires_denied"] = "dtask2" not in denied2
 
 # A human's OWN declining choice (independent of policy_verdict) is still the
@@ -757,7 +820,7 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO approvals (approval_id, task_id, authority, policy_verdict, choice_text, decided_at) "
              "VALUES ('appr_deny3','dtask3','human','allow','2. Deny','2026-01-01T00:00:00Z')")
 conn.commit(); conn.close()
-denied3, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+denied3, _, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["M2_a_humans_own_decline_still_fires_denied"] = denied3.get("dtask3", {}).get("fingerprint") == "appr_deny3"
 
 # review H4: herdr-deliver.sh's REAL ordering — send-to-agent.sh's
@@ -774,7 +837,7 @@ conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, 
              "('w1','drun','t_worker_acted','message_delivered','2026-01-01T01:00:00Z','{}'),"
              "('w2','drun','t_worker_acted','input_required','2026-01-01T01:00:05Z','{}')")
 conn.commit(); conn.close()
-_, delivered4, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+_, delivered4, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["H4_herdr_deliver_ordering_still_reads_as_unprocessed"] = "t_deliver" in delivered4
 results["H4_genuine_worker_activity_clears_unprocessed"] = "t_worker_acted" not in delivered4
 
@@ -785,7 +848,7 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('oa1','drun','t_owner','owner_acted','2026-01-01T02:00:00Z','{}')")
 conn.commit(); conn.close()
-_, _, owner_acted2 = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+_, _, owner_acted2, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["owner_acted_populated_from_owner_acted_events"] = "t_owner" in owner_acted2
 
 # A later event from the SAME task (real worker activity) clears "unprocessed".
@@ -793,7 +856,7 @@ conn = sqlite3.connect(str(hub.REGISTRY))
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('ev2','drun','dtask','input_required','2026-01-01T00:05:00Z','{}')")
 conn.commit(); conn.close()
-_, delivered5, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+_, delivered5, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["delivered_cleared_once_the_worker_did_something"] = "dtask" not in delivered5
 
 # ---- review M-a: the boot floor persists across a restart --------------------

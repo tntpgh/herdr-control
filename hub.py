@@ -3692,12 +3692,10 @@ _ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
 
 
 def _pane_last_output(pane_id: str, lines: int = 60) -> str:
-    """Review M1's pane-text source — same `herdr pane read ... --source
-    visible --lines N` shape attention.sh already uses (_vishash), just
-    called from hub.py since this signal lives beside the other four pure
-    ones. Gated the same way they are (only for a task already idle past
-    threshold), so this adds no RPC for a task any other signal already
-    explains.
+    """Review M1's pane-text source, called from hub.py since this signal
+    lives beside the other four pure ones. Gated the same way they are
+    (only for a task already idle past threshold), so this adds no RPC for
+    a task any other signal already explains.
 
     Review H1 (r4): a hard-coded 20 silently dropped the exact request
     this signal exists to catch — in a real 46-column omp pane, a wrapped
@@ -3706,9 +3704,19 @@ def _pane_last_output(pane_id: str, lines: int = 60) -> str:
     a 20-row tail. 60 keeps a live pane's wrapped-request-plus-recap shape
     inside the window with room to spare, at no added per-tick cost — this
     is still only called once a task has already cleared the state/birth
-    gates above."""
+    gates above.
+
+    Review M2 (r5): `--source visible` — the shape attention.sh's own
+    `_vishash` uses — caps at the pane's LIVE SCREEN HEIGHT, never at
+    `--lines`: measured 29-35 rows on every 46-column w5B pane regardless
+    of whether `--lines` asked for 60 or 200, so a short/narrow real pane
+    never got this signal the window the paragraph above claims. `recent`
+    (the CLI's own default) returns exactly `--lines` rows of scrollback
+    instead, independent of the live terminal size — measured live:
+    `recent --lines 60` -> 60 rows on the same panes `visible` capped at
+    35, for both `--lines 60` and `--lines 200`."""
     try:
-        r = subprocess.run(["herdr", "pane", "read", pane_id, "--source", "visible", "--lines", str(lines)],
+        r = subprocess.run(["herdr", "pane", "read", pane_id, "--source", "recent", "--lines", str(lines)],
                            capture_output=True, text=True, timeout=5)
         return r.stdout or ""
     except Exception:
@@ -3739,9 +3747,6 @@ def _agent_output_lines(text: str) -> list[str]:
 
 
 _MD_LEADING_RE = re.compile(r'^[\*_]+')   # **CONDUCTOR:** / __CONDUCTOR:__
-_RECAP_MARKER_RE = re.compile(r'^[\*_]*(\u203b|recap:)', re.IGNORECASE)   # omp's own ※ status
-                                                                           # block, or a worker's
-                                                                           # own "Recap:" paragraph
 
 
 def _last_conductor_prompt_line(text: str | None) -> str | None:
@@ -3762,17 +3767,20 @@ def _last_conductor_prompt_line(text: str | None) -> str | None:
     continuation rows — rows that immediately follow with no blank row
     between them — onto the line it returns.
 
-    Review M1 (r4): that bottom-up scan alone re-fires on an ALREADY
-    ANSWERED request — a plain `send-to-agent.sh` reply writes only
-    `message_delivered`, not an owner-activity event, so nothing else
-    silences it once the worker keeps working. The real tell is in the
-    pane text itself: past the request's own wrap-continuation, at most
-    ONE trailing paragraph may follow and still count as the SAME
-    unanswered ask — the worker's own recap/status paragraph, or omp's
-    own `※` block (`_RECAP_MARKER_RE`). A second, non-recap paragraph is
-    the omp user-message boundary: the conductor replied and the worker
-    went on to something else, so this returns None rather than a stale
-    line a re-render would also leave unchanged."""
+    Review H1 (r5): r4 added a guard here that dropped the result as soon
+    as a SECOND, non-recap paragraph followed the request, trying to infer
+    "the conductor already answered" from pane SHAPE alone. It could not:
+    the round-1 live incident's own shape — a trailing paragraph, then
+    omp's `※` recap — went silent under it, and so did six other ordinary
+    UNANSWERED shapes a worker writes while still waiting (a plain
+    sentence, an indented command block, an evidence list, a `**Recap**:`
+    or `Status:` line — none of them an actual reply). Pane text cannot
+    tell "the worker kept narrating" from "the conductor replied and the
+    worker moved on"; only the registry can. `stall_watchdog_candidates`'s
+    own `replied` argument does that instead, comparing a real
+    `message_delivered` event's timestamp against the task's `updated_at`
+    — so this function goes back to always returning the request plus its
+    wrap continuation, with no shape-based answered guard."""
     if not text:
         return None
     rows = [_ANSI_RE.sub("", ln).rstrip() for ln in _agent_output_lines(text)]
@@ -3785,20 +3793,6 @@ def _last_conductor_prompt_line(text: str | None) -> str | None:
         while j < len(rows) and rows[j].strip():
             parts.append(rows[j].strip())
             j += 1
-        k = j
-        answered = False
-        while k < len(rows):
-            if not rows[k].strip():
-                k += 1
-                continue
-            para = rows[k].strip()
-            while k < len(rows) and rows[k].strip():
-                k += 1
-            if not _RECAP_MARKER_RE.match(para):
-                answered = True
-                break
-        if answered:
-            return None
         return " ".join(parts)
     return None
 
@@ -3818,7 +3812,7 @@ def _live_pane_birth(pane_id: str) -> str | None:
 
 def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                               denied: dict | None = None, delivered: dict | None = None,
-                              owner_acted: dict | None = None,
+                              owner_acted: dict | None = None, replied: dict | None = None,
                               stat_fn=None, live_done_fn=None, pane_read_fn=None,
                               pane_birth_fn=None,
                               threshold_s: float | None = None,
@@ -3826,9 +3820,10 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
     """Which (task, signal) pairs have sat idle/done, owing the conductor an
     action, for at least `threshold_s` (HERDR_STALL_WATCHDOG_THRESHOLD_S).
 
-    `denied`/`delivered`/`owner_acted` are precomputed {task_id: {"epoch":…,
-    "fingerprint":…}} (or, for `owner_acted`, {task_id: epoch}) maps for
-    facts `herdr_data()` cannot see on its own — see `_stall_task_signals`.
+    `denied`/`delivered`/`owner_acted`/`replied` are precomputed {task_id:
+    {"epoch":…, "fingerprint":…}} (or, for `owner_acted`/`replied`,
+    {task_id: epoch}) maps for facts `herdr_data()` cannot see on its own
+    — see `_stall_task_signals`.
     `stat_fn`/`live_done_fn` are injectable (signal 2's artifact mtime+size,
     signal 1's live-bus read) so this stays a pure function callers can test
     with plain dicts, no filesystem or registry required — same testability
@@ -3874,17 +3869,24 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                     idle with its own last pane output asking the
                     conductor directly (the `CONDUCTOR: ...` line this very
                     codebase's own workers write — see
-                    `_last_conductor_prompt_line` for the wrap/recap/
-                    already-answered handling). Review M-b: verifies the
-                    live pane's birth still matches the one this task
-                    registered before ever reading it — `state != completed`
-                    used to include `lost`/`cancelled`/`failed`/`gone`, any
-                    of which can mean herdr already recycled the pane id to
-                    an unrelated task. Review L1 (r4): the fingerprint
-                    hashes the line with ALL whitespace stripped, so a pane
+                    `_last_conductor_prompt_line` for the wrap/bold
+                    handling). Review M-b: verifies the live pane's birth
+                    still matches the one this task registered before ever
+                    reading it — `state != completed` used to include
+                    `lost`/`cancelled`/`failed`/`gone`, any of which can
+                    mean herdr already recycled the pane id to an
+                    unrelated task. Review L1 (r4): the fingerprint hashes
+                    the line with ALL whitespace stripped, so a pane
                     resize that re-wraps the same request at a different
                     column — and so re-places the space the continuation
-                    join inserts — still hashes to the same key.
+                    join inserts — still hashes to the same key. Review H1
+                    (r5): "already answered" is no longer inferred from
+                    pane shape (that dropped real unanswered requests —
+                    see `_last_conductor_prompt_line`); `replied[tid]`, the
+                    latest `message_delivered` event for this task from
+                    the registry, silences it only once that event is AT
+                    OR AFTER the task's own `updated_at` — a real reply,
+                    not a guess.
     """
     now = time.time() if now is None else now
     threshold = STALL_WATCHDOG_THRESHOLD_S if threshold_s is None else threshold_s
@@ -3892,6 +3894,7 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
     denied = denied or {}
     delivered = delivered or {}
     owner_acted = owner_acted or {}
+    replied = replied or {}
     if stat_fn is None:
         def stat_fn(p):
             st = os.stat(p)
@@ -3972,8 +3975,10 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
         if state in IDLE_STATES and t.get("pane_id"):
             since = _iso_epoch(t.get("updated_at"))
             owner_epoch = owner_acted.get(tid)
+            reply_epoch = replied.get(tid)
             if (since is not None and since >= boot and now - since >= threshold
-                    and (owner_epoch is None or owner_epoch < since)):
+                    and (owner_epoch is None or owner_epoch < since)
+                    and (reply_epoch is None or reply_epoch < since)):
                 live_birth = pane_birth_fn(t["pane_id"])
                 reg_birth = t.get("pane_birth") or ""
                 if live_birth and reg_birth and live_birth == reg_birth:
@@ -4012,12 +4017,15 @@ _STALL_OWNER_ACTIVITY_TYPES = ("owner_acted", "brief_delivered", "reply_delivere
 _STALL_DENY_CHOICE_RE = re.compile(r"\b(deny|no|reject)\b", re.IGNORECASE)
 
 
-def _stall_task_signals(now: float | None = None, threshold_s: float | None = None) -> tuple[dict, dict, dict]:
-    """The three supplemental facts `herdr_data()` does not carry, from one
+def _stall_task_signals(now: float | None = None, threshold_s: float | None = None) -> tuple[dict, dict, dict, dict]:
+    """The four supplemental facts `herdr_data()` does not carry, from one
     registry connection: the latest DENIED approval per task, the latest
-    `message_delivered` event per task with no later WORKER event, and the
-    latest owner-side action epoch per task (PR #223 review H1's "newer
-    than the conductor's last action").
+    `message_delivered` event per task with no later WORKER event, the
+    latest owner-side action epoch per task (PR #223 review H1/M-a's "newer
+    than the conductor's last action"), and the latest `message_delivered`
+    event per task regardless of what happened after (review H1 r5's
+    `replied` — the one registry fact that proves a human/conductor
+    replied to a `conductor_prompt` signal, since pane SHAPE cannot).
 
     `denied` (review M2): a policy refusal is `approval_escalated`
     (`herdr-select.sh`'s `_refuse_non_human`, fired only when the policy
@@ -4041,15 +4049,16 @@ def _stall_task_signals(now: float | None = None, threshold_s: float | None = No
     denied: dict = {}
     delivered: dict = {}
     owner_acted: dict = {}
+    replied: dict = {}
     now = time.time() if now is None else now
     threshold = STALL_WATCHDOG_THRESHOLD_S if threshold_s is None else threshold_s
     cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - threshold * 8))
     if not REGISTRY.exists():
-        return denied, delivered, owner_acted
+        return denied, delivered, owner_acted, replied
     try:
         conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
     except sqlite3.Error:
-        return denied, delivered, owner_acted
+        return denied, delivered, owner_acted, replied
     try:
         act_placeholders = ",".join("?" for _ in _STALL_WORKER_ACTIVITY_TYPES)
 
@@ -4102,9 +4111,21 @@ def _stall_task_signals(now: float | None = None, threshold_s: float | None = No
             ep = _iso_epoch(occurred_at)
             if ep is not None:
                 owner_acted[tid] = ep
+        # Review H1 (r5): same shape as `delivered` above but WITHOUT the
+        # "no later worker activity" filter — a `conductor_prompt` signal
+        # is answered the instant the conductor sends anything back,
+        # whether or not the worker goes on to process it (that is
+        # `delivered`'s own, separate concern).
+        for tid, occurred_at in conn.execute(
+                "SELECT task_id, MAX(occurred_at) FROM events WHERE task_id != '' "
+                "AND type='message_delivered' AND occurred_at >= ? GROUP BY task_id",
+                (cutoff,)):
+            ep = _iso_epoch(occurred_at)
+            if ep is not None:
+                replied[tid] = ep
     finally:
         conn.close()
-    return denied, delivered, owner_acted
+    return denied, delivered, owner_acted, replied
 
 
 # Mirrors ATTENTION_STATE's shape (review M4: "failures are invisible... the
@@ -4186,9 +4207,9 @@ def _stall_watchdog_tick() -> None:
     if not h or h.get("error"):
         return
     now = time.time()
-    denied, delivered, owner_acted = _stall_task_signals(now=now)
+    denied, delivered, owner_acted, replied = _stall_task_signals(now=now)
     candidates = stall_watchdog_candidates(h.get("tasks") or [], now=now, denied=denied,
-                                           delivered=delivered, owner_acted=owner_acted)
+                                           delivered=delivered, owner_acted=owner_acted, replied=replied)
     resolved: set[str] = set()
     if REGISTRY.exists():
         try:
