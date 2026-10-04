@@ -351,16 +351,31 @@ for _ in 1 2 3 4 5 6; do
       # acted on the prompt captured as _pre_pid, even if a later tick's
       # repaint has not cleared it yet. HERDR_PANE_ID here is the CALLER's
       # own pane (the conductor invoking this script), never the target.
-      if [ -n "${HERDR_PANE_ID:-}" ] && [ -f "$_here/lib/run-registry.sh" ]; then
+      if [ -f "$_here/lib/run-registry.sh" ]; then
         (
           . "$_here/lib/run-registry.sh" 2>/dev/null
           _owner_task="$(task_for_pane "$pane" 2>/dev/null)"
+          _owner_run="$(printf '%s' "$_owner_task" | jq -r '.run_id // empty' 2>/dev/null)"
+          _owner_tid="$(printf '%s' "$_owner_task" | jq -r '.task_id // empty' 2>/dev/null)"
           _owner_conductor="$(printf '%s' "$_owner_task" | jq -r '.conductor_pane_id // empty' 2>/dev/null)"
-          if [ -n "$_owner_conductor" ] && [ "$_owner_conductor" = "$HERDR_PANE_ID" ]; then
-            append_event "$(printf '%s' "$_owner_task" | jq -r '.run_id // empty')" \
-              "$(printf '%s' "$_owner_task" | jq -r '.task_id // empty')" "owner_acted" \
+          if [ -n "${HERDR_PANE_ID:-}" ] && [ -n "$_owner_conductor" ] && [ "$_owner_conductor" = "$HERDR_PANE_ID" ]; then
+            append_event "$_owner_run" "$_owner_tid" "owner_acted" \
               "$(jq -nc --arg p "$pane" --arg pid "$_pre_pid" --arg f "$HERDR_PANE_ID" \
                  '{pane:$p, prompt_id:$pid, from:$f}')" >/dev/null 2>&1
+          fi
+          # feat/stall-watchdog signal 4 ("a delivered message the worker
+          # never processed", .handoffs/SPEC.md): record that SOMETHING
+          # reached a registered worker's composer and actually submitted.
+          # hub.py's stall watchdog later checks for NO event from this task
+          # AFTER this one — a busy worker generates its own events within
+          # seconds of reading a note; an idle one does not, and that
+          # silence is the signal. Recorded for every sender, not only the
+          # conductor: incident 3's owner was the worker's parent conductor,
+          # but "delivered, nothing told anyone it sat unread" is not
+          # specific to who sent it.
+          if [ -n "$_owner_tid" ]; then
+            append_event "$_owner_run" "$_owner_tid" "message_delivered" \
+              "$(jq -nc --arg p "$pane" --arg f "${HERDR_PANE_ID:-}" '{pane:$p, from:$f}')" >/dev/null 2>&1
           fi
         ) 2>/dev/null
       fi

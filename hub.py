@@ -873,8 +873,12 @@ def herdr_data(event_limit: int = 100) -> dict:
         cols = {r[0] for r in conn.execute("SELECT name FROM pragma_table_info('tasks')")}
         branch_col = "branch" if "branch" in cols else "'' AS branch"
         project_col = "project" if "project" in cols else "'' AS project"
+        cpid_col = "conductor_pane_id" if "conductor_pane_id" in cols else "'' AS conductor_pane_id"
+        cpbirth_col = "conductor_pane_birth" if "conductor_pane_birth" in cols else "'' AS conductor_pane_birth"
+        pbirth_col = "pane_birth" if "pane_birth" in cols else "'' AS pane_birth"
         tasks = [dict(r) for r in conn.execute(
-            "SELECT task_id, run_id, label, repo, state, pane_id, conductor_id, worktree, "
+            "SELECT task_id, run_id, label, repo, state, pane_id, conductor_id, "
+            f"{pbirth_col}, {cpid_col}, {cpbirth_col}, worktree, "
             f"{branch_col}, {project_col}, created_at, updated_at "
             "FROM tasks ORDER BY updated_at DESC")]
         events = []
@@ -3551,6 +3555,596 @@ def _project_attention_loop() -> None:
 # this outer ttl mainly bounds how often the SPEC.md/claims/join work reruns.
 CACHES["projects"] = Cached(10, projects_data, stale_ok=True, name="projects")
 
+# ---- stall watchdog: idle/done while still owing the conductor an action ---
+# .handoffs/SPEC.md (feat/stall-watchdog): three real incidents, 8-14h each
+# (2026-10-02/03), every one a task whose pane went idle or finished while a
+# signal sat on it that nothing ever turned into a wake — the hub's own
+# "N task(s) need attention" COUNT was accurate and ignored the whole time.
+#
+# Same split as project-wake.sh ("hub.py decides WHAT, bash decides HOW"):
+# this is the WHAT half, a pure function over the already-derived task list
+# herdr_data() produces (idle/done is `derive()`'s job, not re-implemented
+# here) plus two small supplemental facts herdr_data() does not carry.
+STALL_SIGNAL_ARTIFACTS = ("tmp/commit-msg.txt", "tmp/REVIEW.md", ".handoffs/PROOF.md")
+STALL_WATCHDOG_THRESHOLD_S = float(os.environ.get("HERDR_STALL_WATCHDOG_THRESHOLD_S", "600") or 600)
+# PR #223 review H1: without a floor, the first tick after EVERY deploy fires
+# on every already-idle/completed row in the registry (254 completed rows,
+# 160+ worktrees' empty PROOF.md, measured live) — a wake+Slack storm for
+# work that finished long before this code existed to watch it. Each
+# signal's own evidence epoch must be AT OR AFTER this floor to ever become
+# a candidate; nothing here can be older than the watchdog itself.
+# Injectable (`boot_epoch=`) so a test can pin it without sleeping.
+#
+# Review M-a: a bare `time.time()` constant re-floors on EVERY hub restart,
+# not just the first deploy ever — a restart mid-incident silently drops any
+# stall whose own evidence predates it, forever, until the task's state
+# changes again. Persisted ONCE via a `claim_once`-style event (the claim
+# dedupe this feature already relies on everywhere else already survives a
+# restart in the registry; the floor only needs the same property) and
+# cached in-process after the first read — not recomputed every tick.
+_STALL_BOOT_EPOCH_CACHE: list[float] = []
+_STALL_BOOT_EPOCH_EVENT_ID = "stall_watchdog_epoch"
+
+
+def _stall_boot_epoch() -> float:
+    if _STALL_BOOT_EPOCH_CACHE:
+        return _STALL_BOOT_EPOCH_CACHE[0]
+    epoch = time.time()
+    if REGISTRY.exists():
+        try:
+            conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+            try:
+                row = conn.execute("SELECT occurred_at FROM events WHERE event_id=?",
+                                   (_STALL_BOOT_EPOCH_EVENT_ID,)).fetchone()
+            finally:
+                conn.close()
+            if row and row[0]:
+                persisted = _iso_epoch(row[0])
+                if persisted is not None:
+                    _STALL_BOOT_EPOCH_CACHE.append(persisted)
+                    return persisted
+        except sqlite3.Error:
+            pass
+        # First boot ever (no persisted floor yet): claim it now, the same
+        # INSERT-OR-IGNORE idempotence `claim_once` itself uses, so two
+        # processes racing this on the same registry still agree on one
+        # floor (whichever insert wins, both then read it back above on
+        # their next call — this process just uses its own `epoch` this
+        # one time rather than paying a second read).
+        try:
+            conn = sqlite3.connect(str(REGISTRY), timeout=2)
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+                    "VALUES (?, '', '', 'stall_watchdog_epoch', ?, '{}')",
+                    (_STALL_BOOT_EPOCH_EVENT_ID, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))))
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass
+    _STALL_BOOT_EPOCH_CACHE.append(epoch)
+    return epoch
+
+_REASON_RE = re.compile(rb'"reason"\s*:\s*"([^"]*)"')
+
+
+def _is_handoff_reason(reason: str | None) -> bool:
+    """Any `handed_off_to:<target>` closure reason needs a wake — SPEC.md
+    says "a handoff event to the conductor", but `register_task`'s own
+    `_valid_closure_reason` accepts `handed_off_to:<task|role>` for ANY
+    role (conductor, Main, review, conductor-merge, a specific pane id…).
+    PR #223 review H5: requiring the exact literal `handed_off_to:conductor`
+    matched 7 of 40 real closures live. Case/whitespace-tolerant because a
+    worker's own closure reason is free text, not a validated enum value at
+    the point this reads it (`_valid_closure_reason` only checks the bash
+    side's own writes, not a worktree's local events.jsonl, see below)."""
+    return bool(reason) and reason.strip().lower().startswith("handed_off_to:")
+
+
+def _live_done_info(worktree: str | None) -> tuple[float | None, str | None]:
+    """(epoch, reason) of the newest readable `_done` line in the worker's
+    OWN handoff bus — PR #223 review H5's fix for incident 1's exact shape:
+    while the pane stays alive, `lib/reconcile.sh` only ingests a
+    worktree's `_done` once the pane is GONE, so the registry row can sit
+    `running`/derive `ready_review` all night with no closure_reason at
+    all, which is precisely what left incident 1 undetected. Same bus
+    files, same byte-level never-decode discipline, and the same
+    last-line-only mtime fallback as `_evidence_at` — reused rather than
+    re-derived so the two readers can never disagree about which file.
+    """
+    if not worktree:
+        return None, None
+    best_epoch: float | None = None
+    best_reason: str | None = None
+    for rel in _bus_relpaths():
+        p = Path(worktree) / rel
+        try:
+            if not p.stat().st_size:
+                continue
+            last_ts: bytes | None = None
+            last_reason: str | None = None
+            done_is_last = False
+            with p.open("rb") as fh:
+                for ln in fh:
+                    if not ln.strip():
+                        continue
+                    if _DONE_RE.search(ln):
+                        m = _TS_RE.search(ln)
+                        last_ts = m.group(1) if m else None
+                        rm = _REASON_RE.search(ln)
+                        last_reason = rm.group(1).decode("ascii", "replace") if rm else None
+                        done_is_last = True
+                    else:
+                        done_is_last = False
+            if last_ts is None and not done_is_last:
+                continue
+            epoch = _iso_epoch(last_ts.decode("ascii", "replace")) if last_ts else None
+            if epoch is None and done_is_last:
+                epoch = p.stat().st_mtime
+            if epoch is not None and (best_epoch is None or epoch > best_epoch):
+                best_epoch, best_reason = epoch, last_reason
+        except OSError:
+            continue
+    return best_epoch, best_reason
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+
+
+def _pane_last_output(pane_id: str, lines: int = 20) -> str:
+    """Review M1's pane-text source — same `herdr pane read ... --source
+    visible --lines N` shape attention.sh already uses (_vishash), just
+    called from hub.py since this signal lives beside the other four pure
+    ones. Gated the same way they are (only for a task already idle past
+    threshold), so this adds no RPC for a task any other signal already
+    explains."""
+    try:
+        r = subprocess.run(["herdr", "pane", "read", pane_id, "--source", "visible", "--lines", str(lines)],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout or ""
+    except Exception:
+        return ""
+
+
+_CHROME_COMPOSER_TOP_RE = re.compile(r'^\s*\u256d')   # ╭
+
+
+def _agent_output_lines(text: str) -> list[str]:
+    """Everything ABOVE the omp composer's own top border — review N3: the
+    LAST rows of an idle omp pane are the composer's status bar and input
+    box (`lib/prompt-parse.sh:355-361`'s own `_composer_input_rows`, whose
+    "rows below the last `\u256d`" definition this takes the complement of),
+    never agent output. Requiring the literal last captured row to start
+    with `CONDUCTOR:`, as the first cut did, can never match a real omp
+    pane — the box is always what is actually last. No `\u256d` in the
+    window (a bare `\u276f` composer, or input tall enough to scroll its own
+    border out of view) leaves nothing distinguishable as output, the same
+    edge case `_composer_input_rows` documents; returns none rather than
+    guessing."""
+    raw = text.splitlines()
+    top = None
+    for i, line in enumerate(raw):
+        if _CHROME_COMPOSER_TOP_RE.match(_ANSI_RE.sub("", line)):
+            top = i
+    return raw[:top] if top is not None else []
+
+
+def _last_conductor_prompt_line(text: str | None) -> str | None:
+    """The last non-blank line of genuine agent OUTPUT (never the composer
+    chrome below it — see `_agent_output_lines`), if it is a worker's own
+    `CONDUCTOR: ...` line — incident 2's actual shape (SPEC.md:51): no
+    deny, no delivery, no handoff event, just a worker asking directly."""
+    if not text:
+        return None
+    for line in reversed(_agent_output_lines(text)):
+        line = _ANSI_RE.sub("", line).strip()
+        if not line:
+            continue
+        return line if line.startswith("CONDUCTOR:") else None
+    return None
+
+
+def _live_pane_birth(pane_id: str) -> str | None:
+    """Review M-b's liveness check: the pane's CURRENT `terminal_id` from
+    the already-maintained live subscription (`pane_statuses()`), not a
+    fresh RPC — a herdr re-enumeration reissues this on every reconnect,
+    the same fingerprint `derive()` itself compares against a task's
+    registered `pane_birth` to call a pane `gone`."""
+    statuses = pane_statuses()
+    if not statuses:
+        return None
+    rec = statuses.get(pane_id)
+    return rec.get("birth") if rec else None
+
+
+def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
+                              denied: dict | None = None, delivered: dict | None = None,
+                              owner_acted: dict | None = None,
+                              stat_fn=None, live_done_fn=None, pane_read_fn=None,
+                              pane_birth_fn=None,
+                              threshold_s: float | None = None,
+                              boot_epoch: float | None = None) -> list[dict]:
+    """Which (task, signal) pairs have sat idle/done, owing the conductor an
+    action, for at least `threshold_s` (HERDR_STALL_WATCHDOG_THRESHOLD_S).
+
+    `denied`/`delivered`/`owner_acted` are precomputed {task_id: {"epoch":…,
+    "fingerprint":…}} (or, for `owner_acted`, {task_id: epoch}) maps for
+    facts `herdr_data()` cannot see on its own — see `_stall_task_signals`.
+    `stat_fn`/`live_done_fn` are injectable (signal 2's artifact mtime+size,
+    signal 1's live-bus read) so this stays a pure function callers can test
+    with plain dicts, no filesystem or registry required — same testability
+    as `project_needs_wake`. `boot_epoch` (PR #223 review H1/M-a) floors every
+    signal's own evidence epoch so a deploy (or a restart mid-incident)
+    never wakes on history; defaults to the persisted `_stall_boot_epoch()`.
+
+    Five signals, each its own `fingerprint` (what the claim_once key in
+    stall-watchdog.sh re-arms on when it changes). IDLE_STATES (`stalled`,
+    `ready_review`) gates every one of them: review N1 — once a task is
+    `completed`, the conductor closing it IS the action owed, whatever
+    closed it; nothing fires again after that, for any signal.
+      handoff     — the worker's OWN worktree bus says `handed_off_to:
+                    <anything>` (review H5: not just the literal
+                    `:conductor`) while its pane is STILL the one this task
+                    registered (review N2: a registry-side `completed` +
+                    `updated_at` branch used to ALSO fire on the close
+                    itself — the exact timestamp of the conductor having
+                    just acted — and produced a second claim key for the
+                    same handoff; dropped entirely, live bus is now the
+                    only source).
+      artifact    — the single NEWEST of the three named files that is
+                    non-empty, idle past threshold, and newer than the
+                    conductor's own last recorded action on the task
+                    (review H1: an unconditional stat fired on the 0-byte
+                    PROOF.md `spawn-task.sh` creates in every worktree;
+                    review N1: used to also run on `completed` rows, so
+                    reading the artifact and closing the task — the
+                    NORMAL way a conductor handles one — still woke 10
+                    minutes later and escalated 20 minutes after that).
+      denied      — the worker's last approval was a DENY, then went idle.
+      unprocessed — a message was delivered to this pane and nothing (no
+                    later WORKER-originated event) has happened since.
+      conductor_prompt — review M1: incident 2 had 8 approvals, all
+                    `allow` — no deny, no delivery, no handoff; it just sat
+                    idle with its own last pane output asking the
+                    conductor directly (the `CONDUCTOR: ...` line this very
+                    codebase's own workers write). Review M-b: verifies the
+                    live pane's birth still matches the one this task
+                    registered before ever reading it — `state != completed`
+                    used to include `lost`/`cancelled`/`failed`/`gone`, any
+                    of which can mean herdr already recycled the pane id to
+                    an unrelated task.
+    """
+    now = time.time() if now is None else now
+    threshold = STALL_WATCHDOG_THRESHOLD_S if threshold_s is None else threshold_s
+    boot = _stall_boot_epoch() if boot_epoch is None else boot_epoch
+    denied = denied or {}
+    delivered = delivered or {}
+    owner_acted = owner_acted or {}
+    if stat_fn is None:
+        def stat_fn(p):
+            st = os.stat(p)
+            return st.st_size, st.st_mtime
+    if live_done_fn is None:
+        live_done_fn = _live_done_info
+    if pane_read_fn is None:
+        pane_read_fn = _pane_last_output
+    if pane_birth_fn is None:
+        pane_birth_fn = _live_pane_birth
+    IDLE_STATES = ("stalled", "ready_review")
+    out: list[dict] = []
+    for t in tasks:
+        tid = t.get("task_id")
+        if not tid:
+            continue
+        state = t.get("state")
+        base = {"task_id": tid, "run_id": t.get("run_id") or "",
+                "label": t.get("label") or tid, "pane_id": t.get("pane_id") or "",
+                "conductor_pane_id": t.get("conductor_pane_id") or "",
+                "conductor_pane_birth": t.get("conductor_pane_birth") or ""}
+
+        # ---- signal 1: handoff --------------------------------------------
+        if state in IDLE_STATES and t.get("worktree"):
+            live_epoch, live_reason = live_done_fn(t["worktree"])
+            since = live_epoch if _is_handoff_reason(live_reason) else None
+            fingerprint = f"live:{live_epoch}"
+        else:
+            since = None
+            fingerprint = None
+        if since is not None and since >= boot and now - since >= threshold:
+            out.append({**base, "signal": "handoff", "fingerprint": fingerprint,
+                       "detail": "closed handed_off_to:... ; the conductor was never told",
+                       "artifact": ""})
+
+        # ---- signal 2: artifact --------------------------------------------
+        if state in IDLE_STATES and t.get("worktree"):
+            owner_epoch = owner_acted.get(tid)
+            best: tuple[str, float] | None = None   # (rel, mtime) of the newest qualifier
+            for rel in STALL_SIGNAL_ARTIFACTS:
+                try:
+                    size, mtime = stat_fn(os.path.join(t["worktree"], rel))
+                except OSError:
+                    continue
+                if not size or mtime is None:
+                    continue                                   # empty file: nothing was WRITTEN
+                if mtime < boot or now - mtime < threshold:
+                    continue
+                if owner_epoch is not None and owner_epoch >= mtime:
+                    continue                                   # the conductor already acted since
+                if best is None or mtime > best[1]:
+                    best = (rel, mtime)
+            if best is not None:
+                rel, mtime = best
+                out.append({**base, "signal": "artifact", "fingerprint": f"{rel}:{int(mtime)}",
+                           "detail": f"{rel} has sat ready {int((now - mtime) / 60)}m with no action",
+                           "artifact": rel})
+
+        # ---- signal 3/4: denied, unprocessed --------------------------------
+        if state == "stalled":
+            d = denied.get(tid)
+            if d and d["epoch"] >= boot and now - d["epoch"] >= threshold:
+                out.append({**base, "signal": "denied", "fingerprint": d["fingerprint"],
+                           "detail": "a policy-refused prompt was denied, then the worker went idle",
+                           "artifact": ""})
+            m = delivered.get(tid)
+            if m and m["epoch"] >= boot and now - m["epoch"] >= threshold:
+                out.append({**base, "signal": "unprocessed", "fingerprint": m["fingerprint"],
+                           "detail": "a message was delivered to this pane and never processed",
+                           "artifact": ""})
+
+        # ---- signal 5: conductor_prompt (review M1) -------------------------
+        if state in IDLE_STATES and t.get("pane_id"):
+            since = _iso_epoch(t.get("updated_at"))
+            owner_epoch = owner_acted.get(tid)
+            if (since is not None and since >= boot and now - since >= threshold
+                    and (owner_epoch is None or owner_epoch < since)):
+                live_birth = pane_birth_fn(t["pane_id"])
+                reg_birth = t.get("pane_birth") or ""
+                if live_birth and reg_birth and live_birth == reg_birth:
+                    line = _last_conductor_prompt_line(pane_read_fn(t["pane_id"]))
+                    if line:
+                        out.append({**base, "signal": "conductor_prompt",
+                                   "fingerprint": f"cprompt:{hashlib.sha256(line.encode()).hexdigest()[:16]}",
+                                   "detail": line[:200], "artifact": ""})
+    return out
+
+
+STALL_WATCHDOG_SCRIPT = Path(__file__).resolve().parent / "stall-watchdog.sh"
+# Positive list of WORKER-originated activity (PR #223 review H4): the
+# previous shape excluded stall-watchdog's own bookkeeping types and
+# treated everything else as "the worker did something" — but
+# `herdr-deliver.sh` itself appends `brief_delivered`/`reply_delivered`
+# right after `send-to-agent.sh` returns, so EVERY delivery through the
+# real delivery path (incident 3's own path) immediately read as its own
+# resolution. A positive list cannot make that mistake: only genuine
+# worker-side facts count. `state_changed` to `running` specifically
+# (a worker resuming, or reconcile ingesting it) counts; a transition TO
+# `completed` does not — that is the conductor/registry side closing the
+# loop, not the worker doing something new.
+_STALL_WORKER_ACTIVITY_TYPES = ("input_required", "completion_recorded")
+# Owner-side activity (review H1/H2): anything a human/conductor did on
+# this task, from the OTHER real paths (not just stall-ack.sh) that
+# already existed before this feature — reused as both "the conductor
+# already acted on this artifact" (H1) and "treat it the same as an ack"
+# (H2, enforced in stall-watchdog.sh's own event query, not here).
+_STALL_OWNER_ACTIVITY_TYPES = ("owner_acted", "brief_delivered", "reply_delivered", "approval_reviewed")
+_STALL_DENY_CHOICE_RE = re.compile(r"\b(deny|no|reject)\b", re.IGNORECASE)
+
+
+def _stall_task_signals(now: float | None = None, threshold_s: float | None = None) -> tuple[dict, dict, dict]:
+    """The three supplemental facts `herdr_data()` does not carry, from one
+    registry connection: the latest DENIED approval per task, the latest
+    `message_delivered` event per task with no later WORKER event, and the
+    latest owner-side action epoch per task (PR #223 review H1's "newer
+    than the conductor's last action").
+
+    `denied` (review M2): a policy refusal is `approval_escalated`
+    (`herdr-select.sh`'s `_refuse_non_human`, fired only when the policy
+    itself refused), not an `approvals` row with `policy_verdict='deny'` —
+    a HUMAN pressing Approve on a deny-classified prompt writes that same
+    verdict, and the old query could not tell the two apart. A human's own
+    declining CHOICE (`choice_text` deny/no/reject, independent of what
+    the policy classified) is the other real source for the same signal.
+    Either way, "then the worker went idle" (SPEC.md) is enforced here,
+    the same positive-activity check as `delivered` below, not left to the
+    caller's `state == "stalled"` gate alone.
+
+    Review M-c(2): each loop below previously scanned EVERY matching row
+    ever written, paying one extra `_no_worker_activity_since` query per
+    unresolved one (N+1). A task still worth waking about is, by
+    definition, within a few multiples of the escalate window of now —
+    `occurred_at >= cutoff` bounds every scan there; anything older either
+    already escalated or will never qualify, and does not need rescanning
+    every tick forever.
+    """
+    denied: dict = {}
+    delivered: dict = {}
+    owner_acted: dict = {}
+    now = time.time() if now is None else now
+    threshold = STALL_WATCHDOG_THRESHOLD_S if threshold_s is None else threshold_s
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - threshold * 8))
+    if not REGISTRY.exists():
+        return denied, delivered, owner_acted
+    try:
+        conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return denied, delivered, owner_acted
+    try:
+        act_placeholders = ",".join("?" for _ in _STALL_WORKER_ACTIVITY_TYPES)
+
+        def _no_worker_activity_since(tid: str, seq: int) -> bool:
+            later = conn.execute(
+                f"SELECT count(*) FROM events WHERE task_id=? AND sequence>? AND "
+                f"(type IN ({act_placeholders}) OR "
+                "(type='state_changed' AND json_extract(payload,'$.state')='running'))",
+                (tid, seq, *_STALL_WORKER_ACTIVITY_TYPES)).fetchone()[0]
+            return later == 0
+
+        for tid, seq, occurred_at in conn.execute(
+                "SELECT task_id, sequence, occurred_at FROM events "
+                "WHERE type='approval_escalated' AND task_id != '' AND occurred_at >= ? ORDER BY sequence DESC",
+                (cutoff,)):
+            if tid in denied or not _no_worker_activity_since(tid, seq):
+                continue
+            ep = _iso_epoch(occurred_at)
+            if ep is not None:
+                denied[tid] = {"epoch": ep, "fingerprint": f"esc{seq}"}
+        for tid, decided_at, approval_id, choice_text in conn.execute(
+                "SELECT task_id, decided_at, approval_id, choice_text FROM approvals "
+                "WHERE task_id != '' AND decided_at >= ? ORDER BY decided_at DESC",
+                (cutoff,)):
+            if tid in denied or not _STALL_DENY_CHOICE_RE.search(choice_text or ""):
+                continue
+            seq_row = conn.execute(
+                "SELECT MAX(sequence) FROM events WHERE task_id=? AND occurred_at<=?",
+                (tid, decided_at)).fetchone()
+            seq = seq_row[0] if seq_row and seq_row[0] is not None else 0
+            if not _no_worker_activity_since(tid, seq):
+                continue
+            ep = _iso_epoch(decided_at)
+            if ep is not None:
+                denied[tid] = {"epoch": ep, "fingerprint": approval_id}
+        for tid, seq, occurred_at in conn.execute(
+                "SELECT task_id, sequence, occurred_at FROM events "
+                "WHERE type='message_delivered' AND task_id != '' AND occurred_at >= ? ORDER BY sequence DESC",
+                (cutoff,)):
+            if tid in delivered or not _no_worker_activity_since(tid, seq):
+                continue
+            ep = _iso_epoch(occurred_at)
+            if ep is not None:
+                delivered[tid] = {"epoch": ep, "fingerprint": str(seq)}
+        own_placeholders = ",".join("?" for _ in _STALL_OWNER_ACTIVITY_TYPES)
+        for tid, occurred_at in conn.execute(
+                f"SELECT task_id, MAX(occurred_at) FROM events WHERE task_id != '' "
+                f"AND type IN ({own_placeholders}) GROUP BY task_id",
+                _STALL_OWNER_ACTIVITY_TYPES):
+            ep = _iso_epoch(occurred_at)
+            if ep is not None:
+                owner_acted[tid] = ep
+    finally:
+        conn.close()
+    return denied, delivered, owner_acted
+
+
+# Mirrors ATTENTION_STATE's shape (review M4: "failures are invisible... the
+# loop swallows every exception with no state") — exposed on /api/summary
+# alongside it so a dead/erroring thread reads as one rather than a silent
+# "0 tasks need attention" forever.
+STALL_WATCHDOG_STATE: dict = {"ticks": 0, "last_ok": None, "last_error": None,
+                              "last_candidates": 0, "last_dispatched": 0}
+
+
+def _sw_digest(text: str) -> str:
+    """Python mirror of stall-watchdog.sh's `_sw_digest` (shasum -a 256 |
+    cut -c1-16) — needed to reconstruct the SAME claim_once key the bash
+    side computes, so the Python filter below and the bash dedupe can
+    never disagree about which fingerprint a key names."""
+    return hashlib.sha256((text or "").encode()).hexdigest()[:16]
+
+
+def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None) -> set[str]:
+    """claim_once keys that are ALREADY woken AND acked (review M4): the
+    daemon must not spawn a subprocess plus two herdr RPCs every tick,
+    forever, for a fingerprint stall-watchdog.sh would itself immediately
+    recognize as handled. Filtering here is pure cost control — bash still
+    owns the actual ack/escalate decision; a key this misses just costs one
+    extra (cheap, no-op) dispatch, never a missed wake.
+
+    Review M-c(1): an escalated or owner-unowned key is TERMINAL — bash's
+    own `claim_once` on `${key}_escalate`/`${key}_unowned` already
+    guarantees it never fires again, but paid `_sw_owner_status`'s 2 herdr
+    RPCs to discover that every tick anyway, forever. An owner-acted task
+    is the same waste for H2's own reason. All three are filtered here the
+    same way the ack case always was."""
+    owner_acted = owner_acted or {}
+    claims: dict[str, tuple[str, str, str]] = {}
+    for eid, tid, occurred_at, payload in conn.execute(
+            "SELECT event_id, task_id, occurred_at, payload FROM events WHERE type='stall_wake'"):
+        try:
+            sig = json.loads(payload or "{}").get("signal", "")
+        except json.JSONDecodeError:
+            sig = ""
+        claims[eid] = (tid, sig, occurred_at)
+    acks: dict[str, list[tuple[str, str]]] = {}
+    for tid, payload, occurred_at in conn.execute(
+            "SELECT task_id, payload, occurred_at FROM events WHERE type='stall_acked'"):
+        try:
+            sig = json.loads(payload or "{}").get("signal", "all")
+        except json.JSONDecodeError:
+            sig = "all"
+        acks.setdefault(tid, []).append((sig, occurred_at))
+    resolved: set[str] = set()
+    for eid, (tid, sig, claimed_at) in claims.items():
+        for ack_sig, acked_at in acks.get(tid, []):
+            if ack_sig in (sig, "all") and acked_at > claimed_at:
+                resolved.add(eid)
+                break
+        if eid in resolved:
+            continue
+        owner_epoch = owner_acted.get(tid)
+        if owner_epoch is not None:
+            claimed_epoch = _iso_epoch(claimed_at)
+            if claimed_epoch is not None and owner_epoch >= claimed_epoch:
+                resolved.add(eid)
+    for (eid,) in conn.execute("SELECT event_id FROM events WHERE type='stall_escalate_claim'"):
+        if eid.endswith("_escalate"):
+            resolved.add(eid[: -len("_escalate")])
+    for (eid,) in conn.execute("SELECT event_id FROM events WHERE type='stall_wake_unowned'"):
+        if eid.endswith("_unowned"):
+            resolved.add(eid[: -len("_unowned")])
+    return resolved
+
+
+def _stall_watchdog_tick() -> None:
+    """One pass: compute the candidates against the SAME cached herdr_data()
+    every other read uses, then hand each UNRESOLVED one to stall-watchdog.sh,
+    which owns dedupe/delivery/escalation. Never raises."""
+    if not STALL_WATCHDOG_SCRIPT.exists():
+        return
+    h = CACHES["herdr"].get()
+    if not h or h.get("error"):
+        return
+    now = time.time()
+    denied, delivered, owner_acted = _stall_task_signals(now=now)
+    candidates = stall_watchdog_candidates(h.get("tasks") or [], now=now, denied=denied,
+                                           delivered=delivered, owner_acted=owner_acted)
+    resolved: set[str] = set()
+    if REGISTRY.exists():
+        try:
+            conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+            try:
+                resolved = _sw_resolved_keys(conn, owner_acted=owner_acted)
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            resolved = set()
+    dispatched = 0
+    for c in candidates:
+        key = f"stall_{c['task_id']}_{c['signal']}_{_sw_digest(c['fingerprint'])}"
+        if key in resolved:
+            continue
+        dispatched += 1
+        try:
+            subprocess.run(["bash", str(STALL_WATCHDOG_SCRIPT), "wake", c["task_id"], c["signal"],
+                            c["fingerprint"], c["detail"], c.get("artifact") or ""],
+                           capture_output=True, timeout=25)
+        except (OSError, subprocess.SubprocessError) as exc:
+            STALL_WATCHDOG_STATE["last_error"] = f"{c['task_id']}/{c['signal']}: {exc}"
+            _live_log(f"stall watchdog wake failed for {c['task_id']}/{c['signal']}: {exc}")
+    STALL_WATCHDOG_STATE["ticks"] += 1
+    STALL_WATCHDOG_STATE["last_ok"] = time.time()
+    STALL_WATCHDOG_STATE["last_candidates"] = len(candidates)
+    STALL_WATCHDOG_STATE["last_dispatched"] = dispatched
+
+
+def _stall_watchdog_loop() -> None:
+    while True:
+        try:
+            _stall_watchdog_tick()
+        except Exception as e:  # noqa: BLE001 — belt and braces: the loop must not die
+            STALL_WATCHDOG_STATE["last_error"] = f"{type(e).__name__}: {e}"
+            _live_log(f"stall watchdog loop error: {type(e).__name__}: {e}")
+        time.sleep(ATTENTION_INTERVAL_S)
+
 
 def page(title: str, path: str, body: str, refresh: int = 15, scope: str = "", json_extra: str = "") -> str:
     """refresh=0 disables the meta-refresh; the caller supplies its own poller.
@@ -4462,6 +5056,7 @@ class Handler(BaseHTTPRequestHandler):
                  "deploy_drift_checked": dd is not None,
                  "live_connected": live_data().get("connected", False),
                  "attention_controller": ATTENTION_STATE,
+                 "stall_watchdog": STALL_WATCHDOG_STATE,
                  "open_decisions": f.get("open_count", 0),
                  # The portal's open rows, separately: open_ids/open_decisions
                  # stay form-only because /decisions reloads on that id set.
@@ -4648,6 +5243,12 @@ def main() -> int:
         # with NO pane blocked at all (every worker for the project already
         # exited). Same --no-attention flag disables both.
         threading.Thread(target=_project_attention_loop, name="project-attention", daemon=True).start()
+        # feat/stall-watchdog — a THIRD thread, same split again: an idle/done
+        # task owing the conductor an action is neither "a pane blocked right
+        # now" (attention-controller) nor "a project with no live worker"
+        # (project-attention), so it gets its own sweep rather than being
+        # folded into either. Same --no-attention flag disables all three.
+        threading.Thread(target=_stall_watchdog_loop, name="stall-watchdog", daemon=True).start()
     # Unconditional (no --no-X flag): two small git fetches against repos we
     # own, nowhere near mirror's cost, and skipping it would reopen exactly
     # the inline-fetch-on-cold-read bug it exists to close.
