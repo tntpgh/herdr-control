@@ -1586,14 +1586,17 @@ export class HerdrState extends DurableObject<Env> {
     // capture the highest cursor THIS delete may remove and raise the
     // durable floor before it runs, never after (a crash between the two
     // would otherwise let a stale cursor read past a gap it can't see).
+    // Owner events (subject_kind='owner_exchange') carry remote_task_id=''
+    // and so never match the terminal-task subquery; they expire on age
+    // alone, the same 30-day window Terrence chose for the event log
+    // (hub form 20261004T205923-8776, retention=30d).
     const pruneCutoff = nowMs - 30 * 86_400_000;
-    const pruneMax = this.sql.exec<{ c: number | null }>(`SELECT MAX(cursor) AS c FROM task_events WHERE at < ? AND remote_task_id IN
-      (SELECT remote_task_id FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out'))`,
+    const prunable = `at < ? AND (subject_kind='owner_exchange' OR remote_task_id IN
+      (SELECT remote_task_id FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out')))`;
+    const pruneMax = this.sql.exec<{ c: number | null }>(`SELECT MAX(cursor) AS c FROM task_events WHERE ${prunable}`,
       pruneCutoff).one().c;
     this.raiseReplayFloor(pruneMax);
-    this.sql.exec(`DELETE FROM task_events WHERE at < ? AND remote_task_id IN
-      (SELECT remote_task_id FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out'))`,
-      pruneCutoff);
+    this.sql.exec(`DELETE FROM task_events WHERE ${prunable}`, pruneCutoff);
     this.sql.exec(`DELETE FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out') AND updated_at < ?`,
       nowMs - 30 * 86_400_000);
 

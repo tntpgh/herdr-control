@@ -363,6 +363,26 @@ describe("list_events/wait_for_events: pruning, scope and pagination", () => {
     expect(fromZero.result).toBe("ok");
   });
 
+  it("owner.reply_ready events expire after 30 days (they have no remote task) and raise the replay floor; younger ones survive", async () => {
+    await signedSync(syncBody({ snapshot: ownerSnapshot() }));
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const oldId = await deliveredExchangeAndReply(access_token, "cm-old");
+    const newId = await deliveredExchangeAndReply(access_token, "cm-new");
+    const oldCursor = await runInDurableObject(fleet(), (_o: HerdrState, state) => {
+      const row = state.storage.sql.exec<{ cursor: number }>(
+        `SELECT cursor FROM task_events WHERE type='owner.reply_ready' AND subject_id=?`, oldId).one();
+      state.storage.sql.exec(`UPDATE task_events SET at=? WHERE cursor=?`, Date.now() - 31 * 86_400_000, row.cursor);
+      return row.cursor;
+    });
+    await signedSync(syncBody({ snapshot: ownerSnapshot() })); // the prune runs inside sync()
+    const left = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ subject_id: string }>(
+        `SELECT subject_id FROM task_events WHERE type='owner.reply_ready'`).toArray().map((r) => r.subject_id));
+    expect(left).toEqual([newId]);
+    const page = await runInDurableObject(fleet(), (o: HerdrState) => o.listEvents(1, null, reader, 100));
+    expect(page.replay_floor_cursor).toBeGreaterThanOrEqual(oldCursor);
+  });
+
   it("a cursor replayed under a changed authorization scope returns cursor_scope_mismatch, not an empty ok page", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
     const first = await runInDurableObject(fleet(), (o: HerdrState) => o.listEvents(0, null, reader, 100));
