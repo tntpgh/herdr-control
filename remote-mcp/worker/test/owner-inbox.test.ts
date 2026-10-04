@@ -79,15 +79,45 @@ describe("send_owner_message", () => {
     expect((await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot() })))).owner_outbox).toHaveLength(1);
   });
 
-  it("rate-limits a burst at 2/minute, independent of the generic per-client throttle", async () => {
+  it("rate-limits a burst at 10/minute, independent of the generic per-client throttle", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
     const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
     const outcomes: string[] = [];
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 11; i++) {
       outcomes.push((await callTool(access_token, "send_owner_message",
         { owner_label: "conductor", body: `n${i}`, client_msg_id: `cm${i}` })).data.error ?? "ok");
     }
-    expect(outcomes).toEqual(["ok", "ok", "rate_limited"]);
+    expect(outcomes).toEqual([...Array(10).fill("ok"), "rate_limited"]);
+  });
+
+  it("rate-limits at 120/hour even when no single minute is over 10", async () => {
+    await signedSync(syncBody({ snapshot: ownerSnapshot() }));
+    const zero = { email: "tnt@teamthurber.com", client_id: "c", client_name: "Zero" };
+    const scopes = ["herdr:read", "herdr:message.owner"];
+    const now = Date.now();
+    const out = await runInDurableObject(fleet(), (o: HerdrState) => {
+      const r: string[] = [];
+      // 119 sends 29s apart (at most 3 in any minute) ending 99s ago, then two now.
+      for (let i = 0; i < 119; i++) {
+        const at = now - 99_000 - (118 - i) * 29_000;
+        const s = o.sendOwnerMessage(at, zero, scopes, "conductor", `h${i}`, `ch${i}`);
+        r.push(s.ok ? "ok" : s.reason);
+      }
+      for (const k of ["a", "b"]) {
+        const s = o.sendOwnerMessage(now, zero, scopes, "conductor", k, `cn-${k}`);
+        r.push(s.ok ? "ok" : s.reason);
+      }
+      return r;
+    });
+    expect(out.slice(0, 120)).toEqual(Array(120).fill("ok"));
+    expect(out[120]).toBe("rate_limited (120/hour)");
+  });
+
+  it("reports the owner limits, not the send_message limits, in list_capabilities", async () => {
+    await signedSync(syncBody({ snapshot: ownerSnapshot() }));
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const caps = await callTool<{ owner_inbox: { limits: { per_minute: number; per_hour: number } } }>(access_token, "list_capabilities");
+    expect(caps.data.owner_inbox.limits).toEqual({ per_minute: 10, per_hour: 120 });
   });
 
   it("cancels a queued owner message, never leasing it, once its sender's grant is revoked", async () => {

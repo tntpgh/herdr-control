@@ -61,7 +61,7 @@ Scopes:
   as a command or an approval. Same `OWNER_INBOX_ENABLED` all-or-nothing gate
   as the other two, plus its own Mac switch `HERDR_MCP_OWNER_INBOX=1`
   (`install.sh --remote-mcp-owner-inbox`), plus its own fixed, non-adjustable
-  rate limit (2/minute, 20/hour per sender) separate from message/task
+  rate limit (10/minute, 120/hour per sender) separate from message/task
   limits. `list_capabilities` reports `owner_inbox: {enabled, scope, limits}`.
 
 Messaging was off for the first connection and turned on as its own decision.
@@ -311,7 +311,7 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
    the same id from the same sender returns the ORIGINAL `exchange_id` and
    state instead of queuing twice, even if the retry's own label or body
    would otherwise be refused.
-5. Per sender, all clients together: a fixed 2/minute and 20/hour — not
+5. Per sender, all clients together: a fixed 10/minute and 120/hour — not
    adjustable from the Mac the way message limits are (`OWNER_LIMITS` in
    `policy.ts`, a code change and a review, never `scripts/limits.py`).
 6. **At delivery**, before every lease to the Mac, the queue is checked

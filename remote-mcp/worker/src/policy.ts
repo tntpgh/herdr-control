@@ -201,11 +201,13 @@ export const DEFAULT_LIMITS = { per_minute: 5, per_hour: 30 } as const;
 // change and a security review, not an admin call.
 export const MAX_LIMITS = { per_minute: 30, per_hour: 300 } as const;
 
-// send_owner_message: fixed, lower, and NOT admin-adjustable (Terrence's
-// decision, form 20261002T142819-8748: "separate, lower limits" for this
-// route) -- raising these is a code change and a security review, exactly
-// like MAX_LIMITS above, not an scripts/limits.py-style runtime override.
-export const OWNER_LIMITS = { per_minute: 2, per_hour: 20 } as const;
+// send_owner_message: fixed and NOT admin-adjustable (Terrence's decision,
+// form 20261002T142819-8748: "separate, lower limits" for this route; raised
+// from 2/20 to 10/120 on his 2026-10-04 approval) -- changing these is a code
+// change and a security review, exactly like MAX_LIMITS above, not an
+// scripts/limits.py-style runtime override. Still well under the generic
+// per-client throttle (CALLS_PER_MINUTE=60 in state.ts), so it binds first.
+export const OWNER_LIMITS = { per_minute: 10, per_hour: 120 } as const;
 
 // register-owner.sh's own label regex, re-checked here so a send targeting a
 // syntactically-invalid label is refused the same way an unregistered one is.
