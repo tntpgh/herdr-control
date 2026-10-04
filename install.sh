@@ -18,6 +18,11 @@
 #                                      # (send_owner_message to a registered long-lived pane,
 #                                      # NOT a spawned task; ZERO-LOOP-001 #5, design-approval-only;
 #                                      # OFF on the Worker too by default -- remote-mcp/README.md)
+#   ./install.sh --apply --remote-mcp-conductor-pane=w5B:p16 # same, naming a standing
+#                                      # conductor pane every remote-mcp task falls back to
+#                                      # when it has no live interactive conductor of its own
+#                                      # (research-task-closure defect 2) -- must already be a
+#                                      # live agent pane; refuses otherwise
 #   ./install.sh --apply --chrome     # also keep the real Chrome up (chrome-relay.py --ensure)
 #   ./install.sh --apply --repoint    # ALSO repoint any job already wired at a
 #                                      # different checkout (e.g. an APM-deployed
@@ -62,8 +67,11 @@ here=$(cd "$(dirname "$0")" && pwd)
 # place, shared with restart.sh, so the launchd rules are never re-derived.
 # shellcheck source=launchd/agent-lib.sh
 . "$here/launchd/agent-lib.sh"
+# shellcheck source=lib/pane-guard.sh
+. "$here/lib/pane-guard.sh"
 
 APPLY=0; BRIDGE=0; HUB=0; AUTH=0; REPOINT=0; REMOTE_MCP=0; REMOTE_MCP_MESSAGING=0; REMOTE_MCP_TASKS=0; REMOTE_MCP_OWNER_INBOX=0; CHROME=0
+REMOTE_MCP_CONDUCTOR_PANE=""
 for a in "$@"; do
   case "$a" in
     --apply)   APPLY=1 ;;
@@ -74,6 +82,7 @@ for a in "$@"; do
     --remote-mcp-messaging) REMOTE_MCP=1; REMOTE_MCP_MESSAGING=1 ;;
     --remote-mcp-tasks) REMOTE_MCP=1; REMOTE_MCP_TASKS=1 ;;
     --remote-mcp-owner-inbox) REMOTE_MCP=1; REMOTE_MCP_OWNER_INBOX=1 ;;
+    --remote-mcp-conductor-pane=*) REMOTE_MCP=1; REMOTE_MCP_CONDUCTOR_PANE="${a#*=}" ;;
     --chrome)  CHROME=1 ;;
     --repoint) REPOINT=1 ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
@@ -448,6 +457,42 @@ if [ "$REMOTE_MCP" = 1 ]; then
       echo "  ! WARNING: this install turns the Mac $1 switch OFF (it is currently ON) -- pass $4 too if that is not intended" >&2
     fi
   done
+  REMOTE_MCP_CONDUCTOR_BIRTH=""
+  if [ -n "$REMOTE_MCP_CONDUCTOR_PANE" ]; then
+    # F11 (security review round 2, 2026-10-04): both values go straight
+    # into `sed "s|…|$VAR|"` and then into plist XML. The liveness check
+    # below already requires an exact pane-list match today, so a value
+    # containing `|&<>"'` can't actually pass it -- this is defence in
+    # depth, never the only guard, for the day that check changes.
+    case "$REMOTE_MCP_CONDUCTOR_PANE" in
+      *[!A-Za-z0-9:_-]*)
+        echo "  ! --remote-mcp-conductor-pane=$REMOTE_MCP_CONDUCTOR_PANE has an unexpected character -- refusing" >&2
+        exit 2 ;;
+    esac
+    if ! pane_is_agent "$REMOTE_MCP_CONDUCTOR_PANE" 2>/dev/null; then
+      echo "  ! --remote-mcp-conductor-pane=$REMOTE_MCP_CONDUCTOR_PANE is not a live agent pane right now -- refusing" >&2
+      exit 2
+    fi
+    REMOTE_MCP_CONDUCTOR_BIRTH="$(pane_birth_now "$REMOTE_MCP_CONDUCTOR_PANE" 2>/dev/null)"
+    [ -n "$REMOTE_MCP_CONDUCTOR_BIRTH" ] || { echo "  ! could not read a terminal_id for $REMOTE_MCP_CONDUCTOR_PANE -- refusing" >&2; exit 2; }
+    case "$REMOTE_MCP_CONDUCTOR_BIRTH" in
+      *[!A-Za-z0-9:_-]*)
+        echo "  ! terminal_id for $REMOTE_MCP_CONDUCTOR_PANE has an unexpected character -- refusing" >&2
+        exit 2 ;;
+    esac
+  elif [ -f "$PLIST" ] && command -v /usr/libexec/PlistBuddy >/dev/null 2>&1; then
+    # F11: re-running --apply --remote-mcp (e.g. only to flip the
+    # messaging/tasks/owner-inbox switches) WITHOUT repeating
+    # --remote-mcp-conductor-pane used to silently clear a previously
+    # configured conductor fallback -- the flag's absence looked
+    # identical to "never configure one" instead of "nothing new to say
+    # about it". Preserve whatever is already deployed when the flag is
+    # absent, same as the messaging/tasks/owner-inbox switches already do
+    # above (prior_messaging/prior_tasks/prior_owner_inbox).
+    REMOTE_MCP_CONDUCTOR_PANE="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HERDR_MCP_CONDUCTOR_PANE" "$PLIST" 2>/dev/null)" || REMOTE_MCP_CONDUCTOR_PANE=""
+    REMOTE_MCP_CONDUCTOR_BIRTH="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HERDR_MCP_CONDUCTOR_BIRTH" "$PLIST" 2>/dev/null)" || REMOTE_MCP_CONDUCTOR_BIRTH=""
+  fi
+  cond_note="conductor pane: $([ -n "$REMOTE_MCP_CONDUCTOR_PANE" ] && echo "$REMOTE_MCP_CONDUCTOR_PANE" || echo "none (falls back to owner-inbox/human-notify per-escalation)")"
   if [ "$APPLY" = 1 ]; then
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
     if deploy_app "${HUB_REV:-origin/main}"; then
@@ -455,10 +500,12 @@ if [ "$REMOTE_MCP" = 1 ]; then
           -e "s|__REMOTE_MCP_MESSAGING__|$REMOTE_MCP_MESSAGING|" \
           -e "s|__REMOTE_MCP_TASKS__|$REMOTE_MCP_TASKS|" \
           -e "s|__REMOTE_MCP_OWNER_INBOX__|$REMOTE_MCP_OWNER_INBOX|" \
+          -e "s|__REMOTE_MCP_CONDUCTOR_PANE__|$REMOTE_MCP_CONDUCTOR_PANE|" \
+          -e "s|__REMOTE_MCP_CONDUCTOR_BIRTH__|$REMOTE_MCP_CONDUCTOR_BIRTH|" \
           -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.remote-mcp.log|g" \
         "$here/remote-mcp/com.herdr-control.remote-mcp.plist.template" > "$PLIST"
       if rmcp_exit="$(load_interval_agent com.herdr-control.remote-mcp "$PLIST")"; then
-        echo "  remote-mcp publisher loaded (every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off), Mac owner-inbox switch $([ "$REMOTE_MCP_OWNER_INBOX" = 1 ] && echo ON || echo off)); first tick last exit code: $rmcp_exit"
+        echo "  remote-mcp publisher loaded (every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off), Mac owner-inbox switch $([ "$REMOTE_MCP_OWNER_INBOX" = 1 ] && echo ON || echo off), $cond_note); first tick last exit code: $rmcp_exit"
       else
         INSTALL_RC=2; echo "  ! remote-mcp publisher: first tick exit ${rmcp_exit:-?}; check ~/Library/Logs/com.herdr-control.remote-mcp.log" >&2
       fi
@@ -467,7 +514,7 @@ if [ "$REMOTE_MCP" = 1 ]; then
       echo "  ! remote-mcp publisher NOT installed: deploy failed (above)." >&2
     fi
   else
-    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/remote-mcp/publisher.py every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off), Mac owner-inbox switch $([ "$REMOTE_MCP_OWNER_INBOX" = 1 ] && echo ON || echo off))"
+    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/remote-mcp/publisher.py every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off), Mac owner-inbox switch $([ "$REMOTE_MCP_OWNER_INBOX" = 1 ] && echo ON || echo off), $cond_note)"
   fi
 fi
 

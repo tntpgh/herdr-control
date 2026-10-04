@@ -39,7 +39,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sanitize import clean
+from sanitize import clean, read_single_link_regular
 import tasks as rtasks
 
 HERE = Path(__file__).resolve().parent
@@ -407,7 +407,7 @@ def build(now: datetime) -> tuple[dict, dict]:
             raw_tasks.append(t)
     births, asks, remotes, sessions = registry_rows([t["task_id"] for t in raw_tasks])
 
-    tasks, worktrees, active_task_by_pane = [], {}, {}
+    tasks, worktrees, active_task_by_pane, extra_by_task = [], {}, {}, {}
     for t in raw_tasks:
         pane = t.get("pane_id") or None
         live = live_by_pane.get(pane) if pane else None
@@ -417,9 +417,44 @@ def build(now: datetime) -> tuple[dict, dict]:
         has_result = bool(proof and worktree_ok(Path(t["worktree"])) and proof.is_file())
         if has_result:
             worktrees[t["task_id"]] = Path(t["worktree"])
+        # research-task-closure defect 3 (2026-10-04): answer_ready used to
+        # fire off has_result alone, i.e. PROOF.md's mere EXISTENCE -- and
+        # PROOF.md is created EMPTY alongside every task's SPEC.md, so it
+        # fired the instant a worktree was spawned, long before ANSWER.md
+        # (a research task's actual deliverable) existed
+        # (rtask_20261004T120322Z_17df2d64: answer_ready at 12:03:57 from an
+        # empty PROOF.md, ANSWER.md not written until 12:05:03). has_answer
+        # is the narrower, correct signal: ANSWER.md itself, present AND
+        # non-empty.
+        # F4(b) (security review round 2, 2026-10-04): is_file()/stat()
+        # follow a symlink and have no hard-link/size-cap check, unlike
+        # tasks.py's own ANSWER.md read (sanitize.read_single_link_regular) --
+        # a worker's worktree is untrusted, same as any other file it wrote.
+        # Use the identical primitive so both sides of this signal agree on
+        # what "exists" means for the exact same path.
+        has_answer = False
+        if t.get("worktree") and worktree_ok(Path(t["worktree"])):
+            try:
+                has_answer = len(read_single_link_regular(Path(t["worktree"]) / ".handoffs/ANSWER.md", 1)) > 0
+            except OSError:
+                has_answer = False
         if agent_live:
             active_task_by_pane.setdefault(pane, t["task_id"])
         remote = remotes.get(t["task_id"]) or {}
+        # F2 (security review round 2, 2026-10-04): LOCAL-only signals for
+        # the orchestrator's own close gate (tasks.py's
+        # _orchestrator_close_research), never sent to the Worker -- merged
+        # into by_id below, not into the public tasks.append dict. Mirrors
+        # the exact `ask and ask.get("kind")` gate the blockers loop below
+        # already uses for "this task has a pending action_request", so a
+        # hook-mode research worker waiting on one (which shows as neither
+        # live_blocked nor registry state blocked/stalled -- see that
+        # loop's own comment) is never treated as idle here either.
+        ask = asks.get(t["task_id"])
+        extra_by_task[t["task_id"]] = {
+            "pane_status": (live.get("agent_status") if live else None) if agent_live else None,
+            "has_pending_request": bool(ask and ask.get("kind")),
+        }
         tasks.append({
             "task_id": t["task_id"], "run_id": t.get("run_id") or "", "label": t.get("label") or "",
             "project": t.get("project") or "", "repo": Path(t.get("repo") or "").name, "branch": t.get("branch") or "",
@@ -428,7 +463,7 @@ def build(now: datetime) -> tuple[dict, dict]:
             "completed_at": iso(t.get("evidence_at")) if t.get("state") in TERMINAL or t.get("state") == "ready_review" else None,
             "closure_reason": t.get("closure_reason"), "closure_proof": redact(t["closure_proof"]) if t.get("closure_proof") else None,
             "pane_id": pane if agent_live else None, "agent_id": birth if agent_live else None,
-            "agent_live": agent_live, "has_result": has_result,
+            "agent_live": agent_live, "has_result": has_result, "has_answer": has_answer,
             "remote_task_id": remote.get("remote_task_id"), "verified": remote.get("verified"),
             "verify_detail": remote.get("verify_detail"),
         })
@@ -452,7 +487,8 @@ def build(now: datetime) -> tuple[dict, dict]:
     # above is reduced to a basename -- the synced snapshot never carries a
     # local filesystem path).
     wt_by_task = {t["task_id"]: t.get("worktree") or "" for t in raw_tasks}
-    by_id = {t["task_id"]: {**t, "worktree": wt_by_task.get(t["task_id"], "")} for t in tasks}
+    by_id = {t["task_id"]: {**t, "worktree": wt_by_task.get(t["task_id"], ""), **extra_by_task.get(t["task_id"], {})}
+             for t in tasks}
     blocked_panes = {p["pane_id"] for p in panes if p.get("agent_status") == "blocked"}
     for t in tasks:
         live_blocked = t["pane_id"] in blocked_panes if t["pane_id"] else False

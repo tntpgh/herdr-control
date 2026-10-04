@@ -340,6 +340,43 @@ git -C "$rt_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "res
 out=$(bash "$here/close-done-workers.sh" --task=taskT1 2>&1)
 printf '%s' "$out" | grep -q 'HOLD.*1 commit(s) exist only here' && ok "a commit beyond trunk is still held -- trunk-awareness does not weaken the gate" || bad "commit beyond trunk not held: $out"
 
+printf '== --task=<id> whose registered pane_birth does NOT match the LIVE occupant of that pane_id: HOLD, never closed (F1) ==\n'
+# F1 (security review round 2, 2026-10-04): unlike --pane=<id> (which has
+# always filtered on a live-birth match), --task=<id> mode used to trust
+# pane_id ALONE -- a stale row recorded against a pane_id herdr has since
+# reissued to a brand-new, unrelated live occupant (pX, terminal_id
+# "birthX" per the herdr stub above) was treated as closable/idle just
+# because that OTHER occupant happens to report idle right now.
+register_task runRec taskRecycled w c cp cb pX birthX-OLD /repo/rec /does/not/exist "recycled-via-task" \
+  || bad "register taskRecycled failed"
+set_task_state runRec taskRecycled running || bad "taskRecycled -> running failed (setup)"
+out=$(bash "$here/close-done-workers.sh" --task=taskRecycled 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*pane_id recycled to a different session' \
+  && ok "F1: --task mode holds a row whose pane_birth does not match the pane's LIVE occupant" \
+  || bad "F1: recycled pane_id was not held via --task mode: $out"
+check "taskRecycled untouched" "$(read_task runRec taskRecycled | jq -r .state)" "running"
+
+printf '== herdr pane list unavailable/unparseable: every row HOLDs, none fall through to closable (F2) ==\n'
+# F2 (security review round 2, 2026-10-04): a failed/garbled `herdr pane
+# list` used to make pane_status() print nothing (jq's own stderr-only
+# failure), st="", which matched NEITHER case arm below and fell through
+# to CLOSABLE -- the opposite of fail-closed for a check that exists to
+# gate on whether a pane is still in use.
+old_herdr_fn="$(declare -f herdr)"
+herdr() { printf '%s\n' "$1 $2" >> "$CALLS"; printf 'not valid json\n'; }
+export -f herdr
+register_task runNL taskNoList w c cp cb pNL birthNL /repo/nl /does/not/exist "no-pane-list" \
+  || bad "register taskNoList failed"
+set_task_state runNL taskNoList running || bad "taskNoList -> running failed (setup)"
+out=$(bash "$here/close-done-workers.sh" --task=taskNoList 2>&1)
+printf '%s' "$out" | grep -q 'HOLD.*pane list is unavailable or unparseable' \
+  && ok "F2: an unparseable herdr pane list holds every row instead of treating it as closable" \
+  || bad "F2: unparseable pane list did not hold the row: $out"
+check "taskNoList untouched" "$(read_task runNL taskNoList | jq -r .state)" "running"
+eval "$old_herdr_fn"
+export -f herdr
+
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi

@@ -69,6 +69,7 @@ def _fake(name: str, body: str) -> Path:
 
 CAPTURE = TMP / "captured-brief.md"
 FAKE_SPAWN_OUT = TMP / "fake-spawn-outcome"  # "0 ok" or "1" to force a failure
+FAKE_SPAWN_ENV_CAPTURE = TMP / "fake-spawn-env-capture"  # F7: records HERDR_MCP_REMOTE_SPAWN per call
 FAKE_SPAWN = _fake("fake-spawn-task.sh", f"""
 root="$1"; branch="$2"
 brief=""
@@ -77,6 +78,7 @@ for a in "$@"; do
   prev="$a"
 done
 [ -n "$brief" ] && cp "$brief" {CAPTURE}
+printf '%s\\n' "${{HERDR_MCP_REMOTE_SPAWN:-}}" > {FAKE_SPAWN_ENV_CAPTURE}
 rc=$(cat {FAKE_SPAWN_OUT} 2>/dev/null || echo 0)
 [ "$rc" = 0 ] || exit "$rc"
 wt="{WT_ROOT}/$(basename "$root")/$branch"
@@ -114,7 +116,11 @@ exit "$rc"
 """)
 
 FAKE_CLOSE_OUT = TMP / "fake-close-stdout"
-FAKE_CLOSE_OUT.write_text("  close    pane_1   label    (idle)\n")
+# F10 (security review round 2, 2026-10-04): _orchestrator_close_research
+# now requires the real close-done-workers.sh "closed N" summary line
+# (N >= 1), not just rc=0 with no HOLD/REFUSED substring -- match what the
+# real script actually prints on a successful --apply.
+FAKE_CLOSE_OUT.write_text("  close    pane_1   label    (idle)\nclosed 1, held back 0, refused 0\n")
 FAKE_CLOSE_RC = TMP / "fake-close-rc"
 FAKE_CLOSE = _fake("fake-close-done-workers.sh", f"""
 cat {FAKE_CLOSE_OUT}
@@ -524,6 +530,34 @@ class ResumeCommand(unittest.TestCase):
         self.assertEqual(out["local_task_id"], "task_fake1")
         self.assertIn("set-deadline", FAKE_BRIDGE_LOG.read_text())
 
+    def test_resume_renames_a_stale_answer_aside_before_respawning(self):
+        # F3 (security review round 2, 2026-10-04): _resume respawns into
+        # the SAME worktree, and spawn-task.sh deliberately keeps
+        # .handoffs/ -- a previous run's ANSWER.md left sitting there used
+        # to pass _verify_research on the very first sweep after a resume,
+        # closing the resumed task on the OLD answer before the new worker
+        # (or the follow-up note) ever got a turn.
+        (self.wt / ".handoffs").mkdir(parents=True, exist_ok=True)
+        (self.wt / ".handoffs/ANSWER.md").write_text("STALE: from the previous run, must never be read as current.")
+        out = tsk.process_command(self._cmd(text="one more thing"))
+        self.assertEqual(out["outcome"], "accepted")
+        self.assertFalse((self.wt / ".handoffs/ANSWER.md").exists(),
+                          "a stale ANSWER.md must not still be at the path _verify_research reads")
+        self.assertEqual((self.wt / ".handoffs/ANSWER.prev.md").read_text(),
+                          "STALE: from the previous run, must never be read as current.")
+        ok, detail = tsk._verify_research(self.wt)
+        self.assertFalse(ok, f"_verify_research must not pass on the stale answer: {detail}")
+
+    def test_resume_spawns_with_the_remote_spawn_marker_set(self):
+        # F7 (security review round 2, 2026-10-04): orchestrator_closes
+        # (spawn-task.sh) must only ever fire for a spawn THIS module will
+        # actually sweep() -- tasks.py's own _spawn() is the one call site
+        # that both creates a remote_task_id row and runs sweep() over it,
+        # so it must mark itself, never rely on job_class alone (a LOCAL
+        # research/explore spawn shares that job_class and is never swept).
+        tsk.process_command(self._cmd(text="one more thing"))
+        self.assertEqual(FAKE_SPAWN_ENV_CAPTURE.read_text().strip(), "1")
+
     def test_resume_crash_before_identity_is_written_looks_up_find_spawned_and_cancels_the_returned_row(self):
         # R3-3/R4-1: a spawn timeout/crash before identity.json is ever
         # written for THIS attempt must not go looking at identity.json at
@@ -612,10 +646,64 @@ class VerifyRules(unittest.TestCase):
         ok, _ = tsk._verify_research(self.wt)
         self.assertTrue(ok)
 
-    def test_research_file_line_source_link(self):
+    def test_research_file_line_source_link_alone_is_no_longer_sufficient(self):
+        # research-task-closure defect 4 (2026-10-04): the incident's
+        # ANSWER.md had only a bare path:line reference -- the old regex
+        # accepted that as a "source link" and let answer_ready fire on an
+        # answer nobody could click through to verify. Only a real https://
+        # URL counts now.
         (self.wt / ".handoffs/ANSWER.md").write_text("See server/main.py:42 for the handler.")
+        ok, detail = tsk._verify_research(self.wt)
+        self.assertFalse(ok)
+        self.assertIn("no https:// source link", detail)
+
+    def test_research_answer_symlink_is_refused_not_followed(self):
+        # F4(b) (security review round 2, 2026-10-04): is_file()/read_text()
+        # follow a symlink -- a worker's worktree is untrusted, same as any
+        # other file it wrote, and the old code would happily verify
+        # (and later hash) whatever ANSWER.md pointed at outside the
+        # worktree. read_single_link_regular's O_NOFOLLOW must refuse it.
+        target = self.wt / "outside-answer.md"
+        target.write_text("Found it: https://kb.teamthurber.com/entity/123")
+        (self.wt / ".handoffs/ANSWER.md").symlink_to(target)
+        ok, detail = tsk._verify_research(self.wt)
+        self.assertFalse(ok, f"a symlinked ANSWER.md must never verify: {detail}")
+
+    def test_research_answer_hard_link_is_refused(self):
+        # F4(b): st_nlink == 1 check -- a hard link means the same bytes are
+        # reachable from a path outside anything this check controls.
+        target = self.wt / "hardlinked-answer.md"
+        target.write_text("Found it: https://kb.teamthurber.com/entity/123")
+        answer = self.wt / ".handoffs/ANSWER.md"
+        os.link(target, answer)
+        ok, detail = tsk._verify_research(self.wt)
+        self.assertFalse(ok, f"a hard-linked ANSWER.md must never verify: {detail}")
+
+    def test_research_template_placeholder_link_is_not_a_real_source(self):
+        # F9 (security review round 2, 2026-10-04): the brief's own unfilled
+        # template text (spawn-task.sh's identity_how_to_complete) copied
+        # back verbatim must never satisfy the check -- the placeholder
+        # angle brackets immediately follow the otherwise-real github.com
+        # host with no whitespace between them, so the WHOLE run must be
+        # rejected, not truncated down to a plausible-looking prefix.
+        (self.wt / ".handoffs/ANSWER.md").write_text(
+            "See https://github.com/<owner>/<repo>/blob/<ref>/<path> for the source.")
+        ok, detail = tsk._verify_research(self.wt)
+        self.assertFalse(ok, f"an unfilled template link must not verify: {detail}")
+
+    def test_research_bare_host_with_no_dot_is_not_a_real_source(self):
+        # F9: https://x (or https://localhost) names no real internet host.
+        (self.wt / ".handoffs/ANSWER.md").write_text("done: https://x/y")
         ok, _ = tsk._verify_research(self.wt)
-        self.assertTrue(ok)
+        self.assertFalse(ok)
+
+    def test_research_link_inside_a_fenced_code_block_does_not_count(self):
+        # F9: a link quoted ONLY as an example inside a code fence must not
+        # satisfy the check.
+        (self.wt / ".handoffs/ANSWER.md").write_text(
+            "No real source here.\n```\nhttps://kb.teamthurber.com/entity/123\n```\n")
+        ok, detail = tsk._verify_research(self.wt)
+        self.assertFalse(ok, f"a fenced-code-block-only link must not verify: {detail}")
 
     def test_implement_malformed_proof(self):
         ok, detail = tsk._verify_implement(self.wt, "not-two-tokens", "remote/abc123")
@@ -665,11 +753,12 @@ class Sweep(unittest.TestCase):
         FAKE_BRIDGE_LOG.write_text("")
         FAKE_CLOSE_RC.write_text("0")
 
-    def _row(self, task_id, remote_id, state="running", deadline="", verify_detail=""):
+    def _row(self, task_id, remote_id, state="running", deadline="", verify_detail="", manifest=None):
         con = sqlite3.connect(REGISTRY)
         con.execute("INSERT OR REPLACE INTO tasks (task_id, run_id, remote_task_id, deadline_at, verified, "
                      "verify_detail, manifest, created_at, state) VALUES (?,?,?,?,0,?,?,?,?)",
-                     (task_id, "run_x", remote_id, deadline, verify_detail, json.dumps({"git": "none"}), "", state))
+                     (task_id, "run_x", remote_id, deadline, verify_detail,
+                      manifest if manifest is not None else json.dumps({"git": "none"}), "", state))
         con.commit(); con.close()
 
     def _event(self, task_id, type_, payload="{}"):
@@ -679,7 +768,13 @@ class Sweep(unittest.TestCase):
         con.commit(); con.close()
 
     def test_auto_close_on_pending_completion(self):
-        self._row("task_a", "rtask_a")
+        # research-task-closure defect 1: a self-reported completion_event
+        # only ever reaches sweep() via _pending_completion for a task whose
+        # manifest does NOT restrict its write tool (implement mode) -- a
+        # git:none/research row is now routed to _orchestrator_close_research
+        # instead (its own tests below), since a research worker can never
+        # write events.jsonl in the first place.
+        self._row("task_a", "rtask_a", manifest=json.dumps({"git": "push-own-branch"}))
         # F9/ZR4: a task reaching sweep() via the normal _start() path
         # already has its hard-stop timer scheduled and recorded -- seed
         # that baseline so this auto_close-only test is not also exercising
@@ -710,7 +805,7 @@ class Sweep(unittest.TestCase):
         # force-cancelled timed_out past its deadline, discarding an
         # answer that was already on disk. A delivered completion event
         # must always win over the timer.
-        self._row("task_c", "rtask_c", deadline="2020-01-01T00:00:00Z")
+        self._row("task_c", "rtask_c", deadline="2020-01-01T00:00:00Z", manifest=json.dumps({"git": "push-own-branch"}))
         self._event("task_c", "hard_stop_scheduled", json.dumps({"pid": 1}))
         (self.wt / ".handoffs/identity.json").write_text(json.dumps({"completion_event": "y_done"}))
         (self.wt / ".handoffs/events.jsonl").write_text(
@@ -721,6 +816,136 @@ class Sweep(unittest.TestCase):
         self.assertEqual(actions[0]["action"], "auto_close")
         self.assertTrue(actions[0]["ok"])
         self.assertNotIn("timed_out", FAKE_BRIDGE_LOG.read_text())
+
+    def test_orchestrator_closes_a_verified_research_task_itself(self):
+        # research-task-closure defect 1 (2026-10-04): a research/explore
+        # task's manifest restricts its write tool to .handoffs/ANSWER.md
+        # (handoffs_write), so it can never append its own completion_event
+        # to events.jsonl the way an implement task does -- _pending_completion
+        # finds nothing and the task sat open forever. A git:none row with a
+        # valid ANSWER.md must now self-close via the orchestrator path,
+        # with no events.jsonl / completion_event involved at all.
+        self._row("task_r", "rtask_r")  # default manifest: git:none == research
+        (self.wt / ".handoffs/ANSWER.md").write_text("Answer: see https://example.com/evidence for the source.")
+        t = {"task_id": "task_r", "run_id": "run_x", "state": "running", "worktree": str(self.wt),
+             "agent_live": True, "pane_status": "idle", "has_pending_request": False}
+        actions = tsk.sweep({"task_r": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["action"], "orchestrator_close")
+        self.assertTrue(actions[0]["ok"])
+        con = sqlite3.connect(REGISTRY)
+        rows = con.execute("SELECT type, payload FROM events WHERE task_id='task_r'").fetchall()
+        con.close()
+        kinds = [r[0] for r in rows]
+        self.assertIn("orchestrator_closed", kinds)
+        payload = json.loads(next(p for k, p in rows if k == "orchestrator_closed"))
+        self.assertEqual(payload["actor"], "orchestrator")
+        self.assertEqual(payload["reason"], "no-follow-on")
+        self.assertTrue(payload["proof"])  # the ANSWER.md sha256, never blank
+
+    def test_orchestrator_never_closes_when_agent_live_is_false(self):
+        # F2 (security review round 2, 2026-10-04): a valid ANSWER.md alone
+        # is never enough -- the live snapshot must agree the worker's own
+        # pane is actually occupied by THIS task's birth-verified process
+        # (publisher.py's agent_live). Without it, this is retried, never
+        # closed, same as finding no answer at all.
+        self._row("task_live", "rtask_live")
+        self._event("task_live", "hard_stop_scheduled", json.dumps({"pid": 1}))
+        (self.wt / ".handoffs/ANSWER.md").write_text("Answer: see https://example.com/evidence for the source.")
+        t = {"task_id": "task_live", "run_id": "run_x", "state": "running", "worktree": str(self.wt),
+             "agent_live": False, "pane_status": "idle", "has_pending_request": False}
+        actions = tsk.sweep({"task_live": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        self.assertEqual(actions, [])
+        con = sqlite3.connect(REGISTRY)
+        n = con.execute("SELECT COUNT(*) FROM events WHERE task_id='task_live' AND type='orchestrator_closed'").fetchone()[0]
+        con.close()
+        self.assertEqual(n, 0)
+
+    def test_orchestrator_never_closes_when_pane_status_is_not_idle_or_done(self):
+        # F2: a hook-mode research worker with a pending action_request
+        # never shows up as `blocked`/live_blocked -- pane_status is the
+        # only signal, and an unrecognized/working/blocked status must
+        # never be treated as safe to close on.
+        self._row("task_blk", "rtask_blk")
+        self._event("task_blk", "hard_stop_scheduled", json.dumps({"pid": 1}))
+        (self.wt / ".handoffs/ANSWER.md").write_text("Answer: see https://example.com/evidence for the source.")
+        t = {"task_id": "task_blk", "run_id": "run_x", "state": "running", "worktree": str(self.wt),
+             "agent_live": True, "pane_status": "blocked", "has_pending_request": False}
+        actions = tsk.sweep({"task_blk": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        self.assertEqual(actions, [])
+
+    def test_orchestrator_never_closes_with_a_pending_action_request(self):
+        # F2: an outstanding action_request this pane is waiting on means
+        # the worker's turn is NOT actually over, regardless of pane_status.
+        self._row("task_pend", "rtask_pend")
+        self._event("task_pend", "hard_stop_scheduled", json.dumps({"pid": 1}))
+        (self.wt / ".handoffs/ANSWER.md").write_text("Answer: see https://example.com/evidence for the source.")
+        t = {"task_id": "task_pend", "run_id": "run_x", "state": "running", "worktree": str(self.wt),
+             "agent_live": True, "pane_status": "idle", "has_pending_request": True}
+        actions = tsk.sweep({"task_pend": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        self.assertEqual(actions, [])
+
+    def test_orchestrator_close_requires_the_summary_to_say_it_actually_closed_something(self):
+        # F10 (security review round 2, 2026-10-04): rc=0 with no
+        # HOLD/REFUSED substring is also what "closed 0" looks like -- an
+        # empty pane_id hitting close-done's own `continue`, or a row that
+        # left the running states between this sweep's snapshot and the
+        # call. Must not be recorded as a confirmed close.
+        self._row("task_n0", "rtask_n0")
+        (self.wt / ".handoffs/ANSWER.md").write_text("Answer: see https://example.com/evidence for the source.")
+        t = {"task_id": "task_n0", "run_id": "run_x", "state": "running", "worktree": str(self.wt),
+             "agent_live": True, "pane_status": "idle", "has_pending_request": False}
+        FAKE_CLOSE_OUT.write_text("closed 0, held back 0, refused 0\n")
+        try:
+            actions = tsk.sweep({"task_n0": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        finally:
+            FAKE_CLOSE_OUT.write_text("  close    pane_1   label    (idle)\nclosed 1, held back 0, refused 0\n")
+        close_actions = [a for a in actions if a["action"] == "orchestrator_close"]
+        self.assertEqual(len(close_actions), 1)
+        self.assertFalse(close_actions[0]["ok"], "closed 0 must never be recorded as a confirmed close")
+        con = sqlite3.connect(REGISTRY)
+        n = con.execute("SELECT COUNT(*) FROM events WHERE task_id='task_n0' AND type='orchestrator_closed'").fetchone()[0]
+        con.close()
+        self.assertEqual(n, 0)
+
+    def test_orchestrator_hold_falls_through_to_the_hard_stop_backstop_same_tick(self):
+        # F8 (security review round 2, 2026-10-04): close-done-workers.sh
+        # HOLDing (pane still mid-turn, worktree dirty, etc.) means the task
+        # is NOT actually done -- the old `if action: ... continue` treated
+        # a HOLD exactly like a confirmed close and skipped the
+        # deadline/hard-stop check below for the rest of this tick, which
+        # could silently let a hard-stop timer never get (re)armed.
+        self._row("task_hold", "rtask_hold")
+        (self.wt / ".handoffs/ANSWER.md").write_text("Answer: see https://example.com/evidence for the source.")
+        t = {"task_id": "task_hold", "run_id": "run_x", "state": "running", "worktree": str(self.wt),
+             "agent_live": True, "pane_status": "idle", "has_pending_request": False}
+        FAKE_CLOSE_OUT.write_text("  HOLD   pane_1   label    1 uncommitted file(s)\n")
+        try:
+            actions = tsk.sweep({"task_hold": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        finally:
+            FAKE_CLOSE_OUT.write_text("  close    pane_1   label    (idle)\nclosed 1, held back 0, refused 0\n")
+        kinds = [a["action"] for a in actions]
+        self.assertIn("orchestrator_close", kinds)
+        close_action = next(a for a in actions if a["action"] == "orchestrator_close")
+        self.assertFalse(close_action["ok"])
+        self.assertIn("hard_stop_retry", kinds,
+                       "a HOLD must still fall through to the hard-stop backstop check on the same tick")
+
+    def test_orchestrator_never_closes_a_research_task_whose_answer_has_no_url(self):
+        # defect 4 paired with defect 1: a bare path:line ANSWER.md must
+        # never be treated as done just because sweep() now knows how to
+        # self-close research tasks -- it must keep retrying (same as
+        # _pending_completion finding nothing) until a real source lands.
+        self._row("task_s", "rtask_s")
+        self._event("task_s", "hard_stop_scheduled", json.dumps({"pid": 1}))  # isolate from that retry path
+        (self.wt / ".handoffs/ANSWER.md").write_text("See server/main.py:42 for the handler.")
+        t = {"task_id": "task_s", "run_id": "run_x", "state": "running", "worktree": str(self.wt)}
+        actions = tsk.sweep({"task_s": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+        self.assertEqual(actions, [])
+        con = sqlite3.connect(REGISTRY)
+        n = con.execute("SELECT COUNT(*) FROM events WHERE task_id='task_s' AND type='orchestrator_closed'").fetchone()[0]
+        con.close()
+        self.assertEqual(n, 0)
 
     def test_deadline_fallback_when_set_deadline_never_landed(self):
         # N1: an empty deadline_at (a post-spawn set-deadline call that never
@@ -735,7 +960,7 @@ class Sweep(unittest.TestCase):
 
     def test_verify_runs_once_then_is_gated_by_verify_detail(self):
         self._row("task_c", "rtask_c", state="completed")
-        (self.wt / ".handoffs/ANSWER.md").write_text("done: https://x/y")
+        (self.wt / ".handoffs/ANSWER.md").write_text("done: https://kb.teamthurber.com/entity/123")
         t = {"task_id": "task_c", "run_id": "run_x", "state": "completed", "worktree": str(self.wt)}
         import datetime as dt
         now = dt.datetime.now(dt.timezone.utc)
@@ -834,7 +1059,7 @@ class Sweep(unittest.TestCase):
         # running/starting/blocked set the instant its completion event
         # landed and was never auto_closed again -- including never
         # retried past a transient HOLD (pane still WORKING).
-        self._row("task_e", "rtask_e")
+        self._row("task_e", "rtask_e", manifest=json.dumps({"git": "push-own-branch"}))
         self._event("task_e", "hard_stop_scheduled", json.dumps({"pid": 1}))
         (self.wt / ".handoffs/identity.json").write_text(json.dumps({"completion_event": "x_done"}))
         (self.wt / ".handoffs/events.jsonl").write_text(

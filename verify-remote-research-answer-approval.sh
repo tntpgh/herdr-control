@@ -7,7 +7,7 @@
 # task_20261002T191316Z_54877_5893), and the remote-mcp publisher's own
 # spawns had no conductor pane to escalate to in the first place.
 #
-# Three independent fixes, three sections below:
+# Fixes, section per fix:
 #   A. _ps_plain_write_verdict (lib/pretool-shadow.sh) judges the STRUCTURED
 #      input.path a hook-mode write call carries — never a scraped panel —
 #      so switching research/explore to --approval hook (remote-mcp/tasks.py)
@@ -22,6 +22,15 @@
 #      real, live-validated conductor pane when the publisher's own
 #      environment names a standing one, without ever overriding an
 #      interactive HERDR_PANE_ID.
+#   D/E. lib/command-policy.sh's handoffs_write narrows BOTH the write tool
+#      and bash (F3) to .handoffs/ANSWER.md for a research/explore task.
+#   F. research-task-closure defect 2 (2026-10-04): when a task has NO
+#      conductor pane at all, herdr-action.sh now tries every registered,
+#      currently-live owner (register-owner.sh) before falling back to
+#      conductor_unconfigured's existing hub-form/human-notify path — never
+#      a new approval authority, a faster NAMED notification so a request
+#      is never silently unrouted. A stale/recycled owner is never routed
+#      to (same liveness proof as the conductor fallback).
 #
 #   bash verify-remote-research-answer-approval.sh
 set -uo pipefail
@@ -462,6 +471,125 @@ register_task run1 task_impl worker1 cond1 "$CPANE" "$CBIRTH" "$PANE" "$BIRTH" /
 set_task_state run1 task_impl running
 out="$(enf bash '{"command":"echo x > src/x.py"}' task_impl)"; rc=$?
 [ "$rc" = 0 ] && ok "F3: a task with no handoffs_write still allows in-worktree bash writes" || not_ok "F3 no-hw task: rc=$rc: $out"
+
+printf '== F: herdr-action.sh falls back to a live registered owner before conductor_unconfigured (research-task-closure defect 2) ==\n'
+OPANE='w7:p7'; OBIRTH='owner-gen-1'
+cat > "$work/bin/herdr" <<EOF
+#!/bin/bash
+case "\$1 \$2" in
+  "pane list")
+    printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"}]}}\n' \
+      "$PANE" "\${FAKE_BIRTH:-$BIRTH}" "$OPANE" "\${FAKE_OBIRTH:-$OBIRTH}" ;;
+  "pane process-info")
+    [ "\$4" = "$OPANE" ] && echo '{"result":{"process_info":{"foreground_processes":[{"name":"claude","cmdline":"claude --model sonnet"}]}}}' || exit 1 ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$work/bin/herdr"
+register_owner editor "$OPANE" "$OBIRTH" "" >/dev/null
+
+register_task run1 task_owned worker1 cond_x "" "" "$PANE" "$BIRTH" /repo "$wt" impl:task_owned feat/o1 main "" "$manifest" hook >/dev/null
+set_task_state run1 task_owned running
+out="$(enf write '{"path":".handoffs/OTHER.md","content":"x"}' task_owned)"
+rid_owned="$(printf '%s' "$out" | field request_id)"
+[ -n "$rid_owned" ] || not_ok "setup failed: no pending request for task_owned: $out"
+rm -f "$work/sent"
+bash "$here/herdr-action.sh" tick
+[ "$(_sql "SELECT json_extract(payload,'\$.outcome') FROM events WHERE type='action_surfaced' AND json_extract(payload,'\$.request_id')=$(_sq "$rid_owned") ORDER BY sequence DESC LIMIT 1;")" = owner:editor ] \
+  && ok "a task with no conductor pane but a LIVE registered owner: outcome=owner:editor (names who got it)" \
+  || not_ok "owned outcome: $(_sql "SELECT payload FROM events WHERE type='action_surfaced' AND json_extract(payload,'\$.request_id')=$(_sq "$rid_owned");")"
+grep -q "$OPANE" "$work/sent" 2>/dev/null && grep -q 'has no conductor configured' "$work/sent" 2>/dev/null \
+  && ok "the owner's pane was messaged directly, on the SAME tick (never a second channel)" \
+  || not_ok "owner pane never messaged: $(cat "$work/sent" 2>/dev/null)"
+# F5 (security review round 2, 2026-10-04): the owner message's own text
+# says "Decide at http://127.0.0.1:8600/decisions" -- that promise is only
+# true if the hub form actually exists. An owner:<label> outcome must now
+# bypass HA_STALE_S the same way conductor_unconfigured already does, so
+# the form is served the SAME tick the owner is messaged, not ~900s later.
+[ "$(_sql "SELECT count(*) FROM events WHERE task_id='task_owned' AND type='action_form_served';")" = 1 ] \
+  && ok "owner routed AND the hub form it points to is served on the SAME tick (F5)" \
+  || not_ok "task_owned never got action_form_served despite owner_msg pointing at the hub decisions page"
+
+unregister_owner editor >/dev/null 2>&1 || true
+register_owner stale-editor "$OPANE" "a-recycled-birth-nobody-has" "" >/dev/null
+register_task run1 task_unconf2 worker1 cond_x "" "" "$PANE" "$BIRTH" /repo "$wt" impl:task_unconf2 feat/o2 main "" "$manifest" hook >/dev/null
+set_task_state run1 task_unconf2 running
+out="$(enf write '{"path":".handoffs/OTHER.md","content":"x"}' task_unconf2)"
+rid_unconf2="$(printf '%s' "$out" | field request_id)"
+bash "$here/herdr-action.sh" tick
+[ "$(_sql "SELECT json_extract(payload,'\$.outcome') FROM events WHERE type='action_surfaced' AND json_extract(payload,'\$.request_id')=$(_sq "$rid_unconf2") ORDER BY sequence DESC LIMIT 1;")" = conductor_unconfigured ] \
+  && ok "a STALE registered owner (recycled pane_id, wrong birth) is never routed to: falls through to conductor_unconfigured unchanged" \
+  || not_ok "unconf2 outcome: $(_sql "SELECT payload FROM events WHERE type='action_surfaced' AND json_extract(payload,'\$.request_id')=$(_sq "$rid_unconf2");")"
+unregister_owner stale-editor >/dev/null 2>&1 || true
+
+printf '== G: herdr-action.sh never routes an owner request to an ACTIVE worker'"'"'s own pane or the requester'"'"'s own pane (F6a) ==\n'
+OPANE2='w8:p8'; OBIRTH2='owner-gen-2'
+BPANE='w6:p6'; BBIRTH='busy-gen-1'
+cat > "$work/bin/herdr" <<EOF
+#!/bin/bash
+case "\$1 \$2" in
+  "pane list")
+    printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"}]}}\n' \
+      "$PANE" "$BIRTH" "$OPANE2" "$OBIRTH2" "$BPANE" "$BBIRTH" ;;
+  "pane process-info")
+    case "\$4" in "$OPANE2"|"$BPANE"|"$PANE") echo '{"result":{"process_info":{"foreground_processes":[{"name":"claude","cmdline":"claude --model sonnet"}]}}}' ;; *) exit 1 ;; esac ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$work/bin/herdr"
+register_task runB task_busy workerB condB "" "" "$BPANE" "$BBIRTH" /repo "$wt" busy:task_busy feat/busy main "" '{}' hook >/dev/null
+set_task_state runB task_busy running
+register_owner self-owner "$PANE" "$BIRTH" "" >/dev/null       # the REQUESTER's own pane
+register_owner busy-owner "$BPANE" "$BBIRTH" "" >/dev/null     # an ACTIVE worker's own pane
+register_owner editor2 "$OPANE2" "$OBIRTH2" "" >/dev/null      # the only legitimate decision-maker
+register_task run1 task_g worker1 cond_x "" "" "$PANE" "$BIRTH" /repo "$wt" impl:task_g feat/g main "" "$manifest" hook >/dev/null
+set_task_state run1 task_g running
+rm -f "$work/sent"
+out="$(enf write '{"path":".handoffs/OTHER.md","content":"x"}' task_g)"
+rid_g="$(printf '%s' "$out" | field request_id)"
+[ -n "$rid_g" ] || not_ok "setup failed: no pending request for task_g: $out"
+bash "$here/herdr-action.sh" tick
+[ "$(_sql "SELECT json_extract(payload,'\$.outcome') FROM events WHERE type='action_surfaced' AND json_extract(payload,'\$.request_id')=$(_sq "$rid_g") ORDER BY sequence DESC LIMIT 1;")" = owner:editor2 ] \
+  && ok "F6a: self-owner (requester's own pane) and busy-owner (an active worker's own pane) are both skipped; editor2 reached" \
+  || not_ok "task_g outcome: $(_sql "SELECT payload FROM events WHERE type='action_surfaced' AND json_extract(payload,'\$.request_id')=$(_sq "$rid_g");")"
+grep -q "^$PANE " "$work/sent" 2>/dev/null && not_ok "F6a: the requester's OWN pane was messaged as if it were an owner" || ok "F6a: requester's own pane never messaged"
+grep -q "^$BPANE " "$work/sent" 2>/dev/null && not_ok "F6a: an ACTIVE worker's own pane was messaged as a decision-maker" || ok "F6a: active worker's own pane never messaged"
+unregister_owner self-owner >/dev/null 2>&1 || true
+unregister_owner busy-owner >/dev/null 2>&1 || true
+unregister_owner editor2 >/dev/null 2>&1 || true
+
+printf '== H: herdr-action.sh stops after a refused/unsubmitted owner send, never tries the next owner (F6b) ==\n'
+OPANE3='w10:p10'; OBIRTH3='owner-gen-3'
+OPANE4='w11:p11'; OBIRTH4='owner-gen-4'
+cat > "$work/bin/herdr" <<EOF
+#!/bin/bash
+case "\$1 \$2" in
+  "pane list")
+    printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"}]}}\n' \
+      "$PANE" "$BIRTH" "$OPANE3" "$OBIRTH3" "$OPANE4" "$OBIRTH4" ;;
+  "pane process-info")
+    case "\$4" in "$OPANE3"|"$OPANE4") echo '{"result":{"process_info":{"foreground_processes":[{"name":"claude","cmdline":"claude --model sonnet"}]}}}' ;; *) exit 1 ;; esac ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$work/bin/herdr"
+register_owner first-owner "$OPANE3" "$OBIRTH3" "" >/dev/null
+register_owner second-owner "$OPANE4" "$OBIRTH4" "" >/dev/null
+register_task run1 task_h worker1 cond_x "" "" "$PANE" "$BIRTH" /repo "$wt" impl:task_h feat/h main "" "$manifest" hook >/dev/null
+set_task_state run1 task_h running
+rm -f "$work/sent"
+out="$(enf write '{"path":".handoffs/OTHER.md","content":"x"}' task_h)"
+rid_h="$(printf '%s' "$out" | field request_id)"
+FAKE_SEND_RC=5 bash "$here/herdr-action.sh" tick
+[ "$(_sql "SELECT json_extract(payload,'\$.outcome') FROM events WHERE type='action_surfaced' AND json_extract(payload,'\$.request_id')=$(_sq "$rid_h") ORDER BY sequence DESC LIMIT 1;")" = conductor_unconfigured ] \
+  && ok "F6b: a refused owner send stops routing -- falls through to conductor_unconfigured, not the next owner" \
+  || not_ok "task_h outcome: $(_sql "SELECT payload FROM events WHERE type='action_surfaced' AND json_extract(payload,'\$.request_id')=$(_sq "$rid_h");")"
+[ "$(grep -c . "$work/sent" 2>/dev/null || echo 0)" = 1 ] \
+  && ok "F6b: exactly ONE owner send was attempted, never a second" \
+  || not_ok "F6b: expected exactly 1 send attempt, got: $(cat "$work/sent" 2>/dev/null)"
+unregister_owner first-owner >/dev/null 2>&1 || true
+unregister_owner second-owner >/dev/null 2>&1 || true
+
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
