@@ -2151,5 +2151,63 @@ class CostReport(unittest.TestCase):
         self.assertIn("$0.00", html_out)
 
 
+class SentinelTrend(unittest.TestCase):
+    """.handoffs/SPEC.md (fix/sentinel-trend-display): rating_usefulness is a
+    TRAILING 14-DAY count (thurber-os runtime/local_sentinel.py
+    compute_health), not a live check like ledger_liveness/watchdog. A signal
+    is a trend iff its OWN dict carries `window_days` — never inferred from
+    its name — and a failing trend alone must not degrade the loop's outcome,
+    only report its numbers in the detail."""
+
+    def _result(self, signals, status, failed, checked_at=None):
+        verdict = {"status": status, "checked_at": checked_at or NOW.isoformat(),
+                   "signals": signals, "failed_signals": failed}
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "heartbeat.json"
+            path.write_text(json.dumps({"verdict": verdict}))
+            with patch.object(hub, "SENTINEL_HEARTBEAT", path):
+                return hub._loop_sentinel()
+
+    def test_trend_only_failure_does_not_degrade_the_outcome(self):
+        loop = self._result(
+            signals={"ledger_liveness": {"ok": True},
+                     "watchdog": {"ok": True},
+                     "rating_usefulness": {"ok": False, "observed_useful_days": 6,
+                                           "threshold_useful_days": 10, "window_days": 14}},
+            status="degraded", failed=["rating_usefulness"])
+        self.assertEqual(loop["outcome"], "ok")
+        self.assertIn("rating trend: 6/10 useful days over trailing 14d (below floor)", loop["detail"])
+
+    def test_instant_failure_plus_trend_failure_is_degraded(self):
+        loop = self._result(
+            signals={"ledger_liveness": {"ok": False},
+                     "watchdog": {"ok": True},
+                     "rating_usefulness": {"ok": False, "observed_useful_days": 6,
+                                           "threshold_useful_days": 10, "window_days": 14}},
+            status="degraded", failed=["ledger_liveness", "rating_usefulness"])
+        self.assertEqual(loop["outcome"], "degraded")
+        self.assertIn("failed signals: ledger_liveness", loop["detail"])
+        self.assertIn("rating trend: 6/10 useful days over trailing 14d (below floor)", loop["detail"])
+
+    def test_all_signals_ok_is_ok(self):
+        loop = self._result(
+            signals={"ledger_liveness": {"ok": True},
+                     "watchdog": {"ok": True},
+                     "rating_usefulness": {"ok": True, "observed_useful_days": 10,
+                                           "threshold_useful_days": 10, "window_days": 14}},
+            status="healthy", failed=[])
+        self.assertEqual(loop["outcome"], "ok")
+        self.assertIn("rating trend: 10/10 useful days over trailing 14d", loop["detail"])
+        self.assertNotIn("below floor", loop["detail"])
+
+    def test_a_failing_signal_without_window_days_still_counts_as_instant(self):
+        loop = self._result(
+            signals={"rating_usefulness": {"ok": False, "observed_useful_days": 6,
+                                           "threshold_useful_days": 10}},
+            status="degraded", failed=["rating_usefulness"])
+        self.assertEqual(loop["outcome"], "degraded")
+        self.assertIn("failed signals: rating_usefulness", loop["detail"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
