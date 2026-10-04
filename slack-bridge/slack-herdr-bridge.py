@@ -24,6 +24,13 @@ Env:
                                         to one workspace; member ids are unique
                                         per workspace, not globally)
   HERDR_BRIDGE_CHANNEL       C0789     (optional — only handle this channel)
+  HERDR_BRIDGE_IGNORE_CHANNELS C0C6R1HLM0C,C0ABC  (optional — comma-separated
+                                        channel ids where this bridge takes NO
+                                        action at all: no auth check, no
+                                        routing, no say(). Checked first, in
+                                        on_message and every interactive
+                                        handler. A malformed entry refuses to
+                                        start.)
 
 Run via run-bridge.sh (which sources tokens from 1Password). Needs slack_bolt
 (pip install -r requirements.txt).
@@ -98,6 +105,20 @@ def pane_for_thread(thread_ts):
 
 ALLOW = {u.strip() for u in os.environ.get("HERDR_BRIDGE_ALLOW_USERS", "").split(",") if u.strip()}
 CHANNEL = os.environ.get("HERDR_BRIDGE_CHANNEL", "").strip()
+# Checked FIRST in on_message and on_choice_button, before auth, routing or
+# say() -- a channel here (e.g. the zero-wake bell channel, publisher.py's
+# HERDR_ZERO_WAKE_CHANNEL) gets zero herdr calls and zero replies from this
+# bridge, full stop. A malformed entry refuses to start rather than silently
+# not-ignoring a channel the operator meant to exclude.
+_IGNORE_CHANNEL_RE = re.compile(r"^[CGD][A-Z0-9]{8,}$")
+IGNORE_CHANNELS = set()
+for _entry in os.environ.get("HERDR_BRIDGE_IGNORE_CHANNELS", "").split(","):
+    _entry = _entry.strip()
+    if not _entry:
+        continue
+    if not _IGNORE_CHANNEL_RE.match(_entry):
+        sys.exit(f"refusing to start: HERDR_BRIDGE_IGNORE_CHANNELS entry {_entry!r} is not a valid Slack channel id")
+    IGNORE_CHANNELS.add(_entry)
 # Slack member ids are unique per WORKSPACE, not globally. In a Slack Connect or
 # shared channel, an external-org user posts under their home-org id — so a
 # foreign account that happens to carry our allowlisted id would pass the only
@@ -226,13 +247,9 @@ def message_team(event, body):
 
 @app.event("message")
 def on_message(event, say, logger, body):
+    if event.get("channel") in IGNORE_CHANNELS:
+        return
     if event.get("subtype") or event.get("bot_id"):
-        return  # edits/joins/bot echoes
-    # The workspace is checked BEFORE the id is trusted: same id, different team
-    # is a different human. Unattributable is refused, and logged at WARNING —
-    # a silent drop of a legitimate reply is indistinguishable from the bridge
-    # being down, and you would have no way to tell which.
-    if not authorized(event.get("user", ""), message_team(event, body), logger, "message"):
         return
     if CHANNEL and event.get("channel") != CHANNEL:
         return
@@ -311,6 +328,8 @@ def on_choice_button(ack, body, say, logger):
     renders the buttons but never delivers the click, and the numbered-reply
     route is what actually works. Nothing here is load-bearing for that route.
     """
+    if (body.get("channel") or {}).get("id") in IGNORE_CHANNELS:
+        return
     ack()
     user = (body.get("user") or {}).get("id", "")
     team = (body.get("team") or {}).get("id") or body.get("team_id")

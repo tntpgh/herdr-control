@@ -486,6 +486,57 @@ public internet.
   and grants nothing without an allowlisted sign-in. Add a Cloudflare
   rate-limit rule on `/oauth/register` if it is ever abused.
 
+## Zero-wake (bounded Slack bell)
+
+A separate, durable "something needs you" notification, independent of the
+inbound Slack bridge's own channel/token use (`slack-bridge/slack-herdr-bridge.py`,
+`.handoffs/designs/zero-wake-design.md`). `HERDR_ZERO_WAKE_CHANNEL` (empty or
+malformed = off, logged) posts `[zero-wake] <kind> <ref> <event_id>` — no
+body, no client data — with the same bot token the bridge uses, no new
+scope. Before the bot is added to that channel, the bridge's
+`HERDR_BRIDGE_IGNORE_CHANNELS` must already list it (checked first, before
+auth/routing/`say()`, in both `on_message` and the button handler), or a
+reply typed there would be routed like any other bridge traffic.
+
+Everything else lives in `remote-mcp/zero_wake.py`, a pure outbox kept in
+`state.json["zero_wake"]` — publisher.py only decides WHEN to call it:
+
+- `kind ∈ reply_ready | task_finished | blocked | decision_needed`, `ref`
+  must match `(oex|rtask)_...` AND be a live id publisher.py actually knows
+  about, or `raise_event` refuses and logs it.
+- One live event per `(kind, ref, state_key)`; a repeat while pending/posted
+  only bumps `last_at`.
+- `tick()` posts what's due (oldest first, ≤10/tick), retries ≤5 times with
+  exponential backoff capped at 1 h then `failed`, and keeps the SAME
+  `event_id` on an ambiguous outcome (timeout/5xx) rather than risk a silent
+  drop.
+- `consume_ack()` is the only way an event becomes `acked`: an owner-inbox
+  message to `zero_wake.OWNER_LABEL` (`herdr-control-dots`) whose body is
+  exactly `ack <event_id>` is matched and answered `delivered` straight in
+  publisher.py's `owner_outbox` loop — it never reaches `deliver_owner`, so
+  it is never typed into any pane. Unknown/duplicate ids are a no-op.
+- `tombstone_finished`/`prune_tombstones`: acked/failed rows move out of the
+  live list (stop being postable or coalesce targets) and age out after 30
+  days or past a 5000-row hard cap, oldest first; a pending/posted row is
+  never touched.
+
+Wiring (publisher.py `main()`, each a few lines next to the logic it reuses,
+documented inline as "Zero-wake wiring N/4"): `reply_ready` when an owner
+reply is accepted; `task_finished` when `tasks.sweep()`'s own verify/
+auto_close succeeds; `decision_needed`/`blocked` from `snapshot["blockers"]`
+(permission vs. stuck-task); `blocked` again when `deliver_owner` itself
+can't reach the owner's pane. No deploy, no live Slack post, no new scope —
+this PR ships the mechanism off by default (`HERDR_ZERO_WAKE_CHANNEL` unset).
+
+Tests: `python3 remote-mcp/verify-zero-wake.py` (outbox: coalescing, ref
+validation, retry/backoff/cap, ambiguous-keeps-event_id, ack/duplicate-ack/
+tombstone-dedupe, retention cap; plus one `publisher.main()` integration
+case proving an ack is consumed before `deliver_owner` and never typed) and
+`python3 slack-bridge/verify-bridge-ignore-channels.py` (message/thread/
+digit/button isolation, malformed-config refusal, DM routing unchanged, no
+feedback loop on a bot's own post) — both offline, stubbed Slack/herdr,
+and both fail against main 3c47bca (neither file/code path exists there).
+
 ## Deploy (first time)
 
 All from `remote-mcp/`:

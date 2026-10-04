@@ -41,6 +41,7 @@ from pathlib import Path
 
 from sanitize import clean
 import tasks as rtasks
+import zero_wake as zw
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -122,6 +123,13 @@ OWNER_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 # oex_<15 compact-iso digits>Z_<8 hex>, the Worker's own id shape (state.ts) --
 # constrained here too since it becomes a filename.
 EXCHANGE_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,100}$")
+# Zero-wake (SPEC zero-wake-design.md): a bounded, durable Slack bell
+# separate from the inbound bridge's own channel/token use. Empty/malformed
+# HERDR_ZERO_WAKE_CHANNEL means the emitter is off (zw.wake_channel logs the
+# malformed case). Posts with the SAME bot token the Slack bridge uses --
+# no new scope, no new credential.
+HERDR_ZERO_WAKE_CHANNEL = os.environ.get("HERDR_ZERO_WAKE_CHANNEL", "")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 
 # ceiling: pattern redaction catches common credential shapes, not every
 # secret or every piece of client data. Upgrade path: route text through the
@@ -1477,6 +1485,8 @@ def main(argv: list[str]) -> int:
         log(f"hub/registry unreadable, not syncing (the Worker will report disconnected): {exc}")
         return 1
     st = load_state()
+    ob = st.get("zero_wake") or zw.new_outbox()
+    st["zero_wake"] = ob
     results = changed_results(snapshot, local, st.get("results", {}), now.timestamp())
     if "--dry-run" in argv:
         json.dump({"snapshot": snapshot, "results": [{**r, "text": f"<{len(r['text'])} chars>"} for r in results]},
@@ -1491,6 +1501,31 @@ def main(argv: list[str]) -> int:
     for action in rtasks.sweep(local["tasks"], now):
         ok = "ok" if action["ok"] else "NOT ok"
         log(f"task {action['task_id']}: {action['action']} {ok} ({action['detail']})")
+        # Zero-wake wiring 1/4: sweep's own verify/auto_close is already
+        # "this task is finished" from the owner's point of view -- reuse
+        # its verdict rather than re-deriving one. ref is the task's own
+        # remote_task_id, so it is a live id by construction.
+        if action["ok"] and action["action"] in ("verify", "auto_close"):
+            remote_id = (local["tasks"].get(action["task_id"]) or {}).get("remote_task_id")
+            if remote_id:
+                state_key = f"{action['action']}:{(local['tasks'].get(action['task_id']) or {}).get('state')}"
+                zw.raise_event(ob, "task_finished", remote_id, state_key, {remote_id}, now.timestamp())
+
+    # Zero-wake wiring 2/4: snapshot["blockers"] (build()) is already this
+    # file's own deduped "stuck and needs a human" list. kind "permission"
+    # means the OWNER must decide something (decision_needed); state
+    # blocked/stalled means the task itself is stuck (blocked). state_key
+    # is the blocker's own `since`, so a fresh stuck episode is a new
+    # event and a repeated tick on the same one just bumps last_at via
+    # raise_event's own coalescing.
+    for b in snapshot["blockers"]:
+        if not b["task_id"]:
+            continue
+        remote_id = (local["tasks"].get(b["task_id"]) or {}).get("remote_task_id")
+        if not remote_id:
+            continue
+        kind = "decision_needed" if b["kind"] == "permission" else "blocked"
+        zw.raise_event(ob, kind, remote_id, b["since"] or "", {remote_id}, now.timestamp())
 
     acks = st.get("pending_acks", [])
     command_acks = st.get("pending_command_acks", [])
@@ -1565,6 +1600,11 @@ def main(argv: list[str]) -> int:
         if outcome in ("accepted", "duplicate"):
             if _move_reply_to_sent(r["owner_label"], r["exchange_id"]):
                 st.setdefault("owner_replies_accepted", {})[f"{r['owner_label']}/{r['exchange_id']}"] = now.timestamp()
+                # Zero-wake wiring 3/4: an owner reply the Worker just
+                # accepted IS "reply_ready" -- Zero can read it now. ref is
+                # this exchange id, known by construction (it's the id we
+                # just accepted).
+                zw.raise_event(ob, "reply_ready", r["exchange_id"], "accepted", {r["exchange_id"]}, now.timestamp())
         elif outcome and outcome.startswith("ignored:") and not outcome.startswith(("ignored:queued", "ignored:delivering")):
             _move_reply_to_rejected(r["owner_label"], r["exchange_id"])
             log(f"owner reply {r['owner_label']}/{r['exchange_id']} rejected by the Worker ({outcome}); moved to replies/rejected/")
@@ -1587,6 +1627,19 @@ def main(argv: list[str]) -> int:
         if pruned_sent:
             st["owner_replies_accepted"] = {k: v for k, v in st.get("owner_replies_accepted", {}).items()
                                              if k not in pruned_sent}
+    save_state(st)
+
+    # Zero-wake wiring 4/4: post whatever is due -- including a retry
+    # raised on a PREVIOUS tick by the owner-message-blocked case below,
+    # which runs AFTER this point in the function -- every tick, BEFORE the
+    # "nothing to do" early return just below, so a quiet tick for the
+    # normal outbox/commands/owner_outbox paths still drains zero-wake
+    # retries instead of starving them the way #225 item 3 flagged for
+    # inbox pruning.
+    for outcome in zw.tick(ob, zw.wake_channel(HERDR_ZERO_WAKE_CHANNEL), SLACK_BOT_TOKEN, now.timestamp()):
+        log(f"zero-wake {outcome['event_id']} ({outcome['kind']} {outcome['ref']}): {outcome['outcome']} ({outcome['detail']})")
+    zw.tombstone_finished(ob, now.timestamp())
+    zw.prune_tombstones(ob, now.timestamp())
     save_state(st)
 
     outbox = reply.get("outbox") or []
@@ -1628,6 +1681,20 @@ def main(argv: list[str]) -> int:
     owner_leased_at = time.monotonic()
     for item in owner_outbox:
         eid = item["exchange_id"]
+        # Zero-wake ACK: consumed BEFORE delivery, never typed into any
+        # pane. An owner-inbox message addressed to zw.OWNER_LABEL whose
+        # body is exactly "ack <event_id>" short-circuits the normal
+        # deliver_owner path entirely -- it is answered "delivered" here so
+        # the Worker stops re-queueing it, and that's the only effect.
+        if item.get("owner_label") == zw.OWNER_LABEL:
+            ack_match = zw.ACK_RE.match(str(item.get("body") or ""))
+            if ack_match:
+                ack_outcome = zw.consume_ack(ob, ack_match.group(1), now.timestamp())
+                log(f"zero-wake ack {ack_match.group(1)}: {ack_outcome}")
+                new_owner_acks.append({"exchange_id": eid, "outcome": "delivered"})
+                st["pending_owner_acks"] = new_owner_acks
+                save_state(st)
+                continue
         if eid in owner_delivered:
             a = {"exchange_id": eid, "outcome": "delivered"}
         elif not OWNER_INBOX_ON_MAC:
@@ -1647,6 +1714,12 @@ def main(argv: list[str]) -> int:
                 # never-time-filtered map, trimmed only when prune_inbox
                 # deletes the matching messages/ file.
                 st.setdefault("owner_message_delivered", {})[eid] = now.timestamp()
+        if a["outcome"] == "blocked":
+            # Zero-wake wiring: an owner message that could not be
+            # delivered is itself something that needs attention. ref is
+            # this exchange id, known by construction (it's the item we
+            # just tried to deliver).
+            zw.raise_event(ob, "blocked", eid, a.get("reason", ""), {eid}, now.timestamp())
         log(f"owner message {eid}: {a['outcome']} ({a.get('reason', '')})")
         new_owner_acks.append(a)
         st["owner_delivered"], st["pending_owner_acks"] = owner_delivered, new_owner_acks
