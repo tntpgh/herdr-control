@@ -7,6 +7,7 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { EventPage, HerdrState } from "../src/state";
+import { namespacedEventId } from "../src/state";
 import type { Env } from "../src/types";
 import { callTool, oauthToken, signedSync, snapshot, syncBody } from "./helpers";
 
@@ -90,7 +91,10 @@ describe("owner.reply_ready: envelope and acceptance", () => {
     expect(ev).toBeDefined();
     expect(ev?.subject).toEqual({ kind: "owner_exchange", id });
     expect(ev?.source).toBe("owner_inbox");
-    expect(ev?.event_id).toBe(`hev:worker:owner_reply:${id}:sha256:abc`);
+    // Namespaced by producer ("srv") and tenant/owner scope (an FNV hash of
+    // the sender, not asserted literally here -- the collision test below
+    // proves two different senders get two different hashes).
+    expect(ev?.event_id).toMatch(new RegExp(`^srv:[0-9a-f]{8}:owner\\.reply_ready:${id}:sha256:abc$`));
     // SPEC item 4: "the events carry no reply text" -- data is owner_label only.
     expect(JSON.stringify(ev?.detail)).not.toContain("secret answer");
     expect(ev?.detail).toEqual({ owner_label: "conductor" });
@@ -152,6 +156,91 @@ describe("owner.reply_ready: envelope and acceptance", () => {
     expect(after.events.filter((x) => x.type === "owner.reply_ready")).toHaveLength(1); // still exactly one -- the no-op minted nothing
   });
 
+  it("an injected throwing event insert rolls back the whole reply (status stays delivered), proving the " +
+    "transactionSync wrapper actually rolls back a thrown exception, not just the specific rejected-outcome branch", async () => {
+    await signedSync(syncBody({ snapshot: ownerSnapshot() }));
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const id = await deliveredExchange(access_token);
+    const reply = { exchange_id: id, owner_label: "conductor", body: "boom", responded_at: new Date().toISOString(),
+      artifact_revision: "rev1", session: "w1:p1" };
+
+    // Monkey-patch insertEvent on this instance to throw -- a generic proof
+    // the DO transaction really rolls back on an exception, independent of
+    // insertEvent's own rejected-outcome logic (that path is test below).
+    // All in one runInDurableObject call so the patch and the sync() that
+    // exercises it run against the exact same instance.
+    const outcome = await runInDurableObject(fleet(), (o: HerdrState) => {
+      internal(o).insertEvent = () => { throw new Error("boom: injected"); };
+      const out = o.sync(Date.now(), crypto.randomUUID(), JSON.stringify(syncBody({ snapshot: ownerSnapshot(), owner_replies: [reply] })),
+        { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false });
+      return out.ok ? out.response.owner_reply_results : null;
+    });
+    expect(outcome).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "rejected:event_conflict" }]);
+
+    const row = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ status: string }>(`SELECT status FROM owner_messages WHERE exchange_id=?`, id).toArray()[0]);
+    expect(row?.status).toBe("delivered"); // rolled back -- not stuck at 'replied' with no durable event
+  });
+
+  it("a pre-seeded conflicting stable event_id makes the full sync NOT commit acceptance", async () => {
+    await signedSync(syncBody({ snapshot: ownerSnapshot() }));
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const id = await deliveredExchange(access_token);
+    const mine = await senderOf(id);
+
+    // Pre-seed a conflicting row under the EXACT id the real reply below
+    // will derive (same producer/tenant/type/subject_id/suffix) but a
+    // different payload -- simulating a real event_id collision (e.g. a
+    // crash-retry that minted a different-shaped envelope under this id).
+    const conflictId = namespacedEventId("srv", mine, "owner.reply_ready", id, "rev1");
+    await runInDurableObject(fleet(), (o: HerdrState) =>
+      internal(o).insertEvent(Date.now(), { eventId: conflictId, remoteTaskId: "", type: "owner.reply_ready",
+        source: "owner_inbox", subjectKind: "owner_exchange", subjectId: id, visibility: "owner_private",
+        senderActor: mine.email, senderClient: mine.client_id, correlationId: id,
+        data: { owner_label: "a-different-conflicting-payload" } }));
+
+    const reply = { exchange_id: id, owner_label: "conductor", body: "ok", responded_at: new Date().toISOString(),
+      artifact_revision: "rev1", session: "w1:p1" };
+    const res = await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [reply] })));
+    expect(res.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "rejected:event_conflict" }]);
+
+    const row = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ status: string }>(`SELECT status FROM owner_messages WHERE exchange_id=?`, id).toArray()[0]);
+    expect(row?.status).toBe("delivered"); // the full sync did NOT commit acceptance
+
+    const page = await runInDurableObject(fleet(), (o: HerdrState) => o.listEvents(0, null, mine, 500));
+    const replyReady = page.events.filter((x) => x.type === "owner.reply_ready");
+    expect(replyReady).toHaveLength(1); // only the pre-seeded conflicting row -- the real reply never minted a second
+    expect(replyReady[0]?.detail).toEqual({ owner_label: "a-different-conflicting-payload" });
+  });
+
+  it("a never-delivered (still-queued) exchange gets neither a reply-acceptance transition nor an event", async () => {
+    await signedSync(syncBody({ snapshot: ownerSnapshot() }));
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const sent = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",
+      { owner_label: "conductor", body: "hi", client_msg_id: "cm1" });
+    const id = sent.data.exchange_id;
+    const mine = await senderOf(id);
+
+    // No lease, no owner_ack -- the exchange is still 'queued', never 'delivered'.
+    const res = await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [
+      { exchange_id: id, owner_label: "conductor", body: "too early", responded_at: new Date().toISOString(),
+        artifact_revision: "", session: "w1:p1" },
+    ] })));
+    expect(res.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "ignored:queued" }]);
+
+    const row = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ status: string }>(`SELECT status FROM owner_messages WHERE exchange_id=?`, id).toArray()[0]);
+    // the SAME sync tick's unconditional leasing step also advances a due
+    // 'queued' row to 'delivering' regardless of the reply attempt -- that
+    // is unrelated to the reply-acceptance path under test here. The
+    // invariant this test actually proves: it never reached 'replied'.
+    expect(row?.status).not.toBe("replied");
+
+    const page = await runInDurableObject(fleet(), (o: HerdrState) => o.listEvents(0, null, mine, 500));
+    expect(page.events.filter((x) => x.type === "owner.reply_ready")).toHaveLength(0); // and no event
+  });
+
   it("a mismatched duplicate under the same event id is rejected, not silently accepted or overwritten", async () => {
     // Direct call: no legitimate caller can ever reuse one exchange's event_id
     // with a different payload (it's derived from exchange_id+artifact_revision,
@@ -177,6 +266,37 @@ describe("owner.reply_ready: envelope and acceptance", () => {
     expect(page.events.filter((x) => x.event_id === "hev:test:collision")).toHaveLength(1); // never duplicated or corrupted
   });
 
+  it("event_id is namespaced by tenant/owner scope and producer: the same subject_id under two different " +
+    "senders yields two distinct, non-colliding events, never one accepted and one wrongly deduped", async () => {
+    // Plan section 1: "event_id is namespaced by tenant and producer". Two
+    // different owner exchanges can never actually share an exchange_id in
+    // production, so this proves the namespacing mechanism directly: the
+    // SAME subject_id under two different tenants (senders) must not
+    // collide into duplicate_same_payload/rejected -- each is its own row.
+    const nowMs = Date.now();
+    const tenantA = { email: "tnt@teamthurber.com", client_id: "cA" };
+    const tenantB = { email: "tnt@teamthurber.com", client_id: "cB" }; // same owner, different OAuth client
+    const idA = namespacedEventId("srv", tenantA, "owner.reply_ready", "oex_shared", "r1");
+    const idB = namespacedEventId("srv", tenantB, "owner.reply_ready", "oex_shared", "r1");
+    expect(idA).not.toBe(idB); // distinct tenant segment even though producer/type/subject_id/suffix all match
+    const insert = (eventId: string, senderClient: string) => runInDurableObject(fleet(), (o: HerdrState) =>
+      internal(o).insertEvent(nowMs, { eventId, remoteTaskId: "", type: "owner.reply_ready",
+        source: "owner_inbox", subjectKind: "owner_exchange", subjectId: "oex_shared", visibility: "owner_private",
+        senderActor: "tnt@teamthurber.com", senderClient, correlationId: "oex_shared",
+        data: { owner_label: "conductor" } }));
+    const resultA = await insert(idA, "cA");
+    const resultB = await insert(idB, "cB");
+    expect(resultA.outcome).toBe("accepted"); // both accepted -- neither sees the other as a duplicate
+    expect(resultB.outcome).toBe("accepted");
+    expect(resultB.cursor).not.toBe(resultA.cursor); // two real rows, not one row reused
+    const pageA = await runInDurableObject(fleet(), (o: HerdrState) => o.listEvents(0, null, caller("tnt@teamthurber.com", "cA"), 500));
+    const pageB = await runInDurableObject(fleet(), (o: HerdrState) => o.listEvents(0, null, caller("tnt@teamthurber.com", "cB"), 500));
+    expect(pageA.events.some((x) => x.event_id === idA)).toBe(true); // A sees only its own
+    expect(pageA.events.some((x) => x.event_id === idB)).toBe(false);
+    expect(pageB.events.some((x) => x.event_id === idB)).toBe(true); // B sees only its own
+    expect(pageB.events.some((x) => x.event_id === idA)).toBe(false);
+  });
+
   it("publisher-originated input cannot forge owner.reply_ready or any other event: there is no field that sets type/event_id/visibility", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot() }));
     const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
@@ -200,7 +320,8 @@ describe("owner.reply_ready: envelope and acceptance", () => {
     const page = await runInDurableObject(fleet(), (o: HerdrState) => o.listEvents(0, null, mine, 500));
     expect(page.events.some((x) => x.event_id === "hev:forged")).toBe(false); // the forged id never landed
     const ev = page.events.find((x) => x.type === "owner.reply_ready");
-    expect(ev?.event_id).toBe(`hev:worker:owner_reply:${id}:none`); // the Worker's own derivation, not the attacker's
+    // the Worker's own namespaced derivation, not the attacker's forged id
+    expect(ev?.event_id).toMatch(new RegExp(`^srv:[0-9a-f]{8}:owner\\.reply_ready:${id}:none$`));
   });
 
   it("old-publisher/new-Worker skew: a legacy sync body (no new fields at all) still completes the transaction and mints the event", async () => {

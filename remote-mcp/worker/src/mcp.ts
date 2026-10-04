@@ -314,8 +314,9 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
   server.registerTool("list_events", {
     title: "List task lifecycle events",
     description: "Global event feed: task_started, state_changed, approval_needed, capability_probe, answer_ready, " +
-      "finished, verified, failed, cancelled, timed_out, disconnected/reconnected, and (herdr:message.owner only, " +
-      "and only for the owner message's original sender) owner.reply_ready -- never the reply text itself, fetch " +
+      "finished, verified, failed, cancelled, timed_out, disconnected/reconnected, and owner.reply_ready -- visible " +
+      "only to the owner message's original sender/client (identity match, not a live-scope check: a token that " +
+      "sent it sees it even if it no longer holds herdr:message.owner) -- never the reply text itself, fetch " +
       "that with get_owner_reply. since_cursor=0 for everything retained; cursor is monotonic and never reused. " +
       "Watcher recipe: call once with since_cursor=0 to capture `scope_hash`, pass it back as since_scope_hash on " +
       "every later call (a cursor scoped to a revoked or changed authorization returns cursor_scope_mismatch, " +

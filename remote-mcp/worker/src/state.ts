@@ -294,6 +294,26 @@ function scopeHash(caller: { email: string; client_id: string }): string {
   return (h >>> 0).toString(16).padStart(8, "0");
 }
 
+// Namespaces an event_id by producer and tenant/owner scope (plan section
+// 1: "event_id is namespaced by tenant and producer... D1 enforces
+// uniqueness on (tenant_id, event_id)"). This deployment has no separate
+// multi-tenant/account concept (one DO, one operator) -- the owner
+// exchange's own (sender_actor, sender_client) pair IS the tenant/owner
+// scope boundary here, the same pair listEvents already gates
+// owner_private visibility on, so reusing scopeHash for it costs nothing
+// new and stays short/non-PII (no raw email baked into a value that can
+// end up in a log line). producer is "srv" for every Worker-owned event in
+// this MVP (owner-reply acceptance is the only keyed producer); "pub" is
+// reserved for a future Mac-local-source producer (Phase 2) so the two
+// axes can never collide even if a subject_id were ever reused across them.
+// Exported (not just used internally) so a test can construct the exact
+// production id shape directly and prove two different tenants never
+// collide under the same subject_id, without duplicating the hash here.
+export function namespacedEventId(producer: "srv" | "pub", tenant: { email: string; client_id: string },
+    type: string, subjectId: string, suffix: string): string {
+  return `${producer}:${scopeHash(tenant)}:${type}:${subjectId}:${suffix}`;
+}
+
 // Maps a local registry task's own state (synced each tick in
 // snapshot.tasks, whose vocabulary is lib/run-registry.sh's lifecycle) onto
 // the richer set a remote-task client is shown (SPEC). "blocked" splits
@@ -1243,29 +1263,52 @@ export class HerdrState extends DurableObject<Env> {
         continue;
       }
       const respondedMs = Date.parse(r.responded_at);
-      this.sql.exec(`UPDATE owner_messages SET status='replied', reply_body=?, reply_session=?,
-          reply_artifact_revision=?, replied_at=?, updated_at=? WHERE exchange_id=?`,
-        r.body, r.session, r.artifact_revision, Number.isFinite(respondedMs) ? respondedMs : nowMs, nowMs, r.exchange_id);
-      this.audit(nowMs, { ...sys, target: m.owner_label, decision: "replied", reason: "", message_id: r.exchange_id, detail: "" });
       // Plan section 3: "conditionally update owner_messages AND insert
-      // owner.reply_ready in the same D1 transaction, using a stable
+      // owner.reply_ready in the same transaction, using a stable
       // transition ID derived from the exchange and accepted reply
-      // revision" -- reached ONLY from the UPDATE above (a guarded/no-op
-      // update, every branch above this one, emits nothing), and atomic
-      // with it: sync() has no await between them, so no other request can
-      // observe the owner_messages row as 'replied' without this event
-      // already being durable, or vice versa. data carries owner_label
-      // only -- never reply_body (plan section 4: "the events carry no
-      // reply text"); visibility owner_private restricts it to this
-      // exchange's own sender (listEvents/waitForEvents).
-      this.insertEvent(nowMs, {
-        eventId: `hev:worker:owner_reply:${r.exchange_id}:${r.artifact_revision || "none"}`,
-        remoteTaskId: "", type: "owner.reply_ready", source: "owner_inbox",
-        subjectKind: "owner_exchange", subjectId: r.exchange_id, visibility: "owner_private",
-        senderActor: m.sender_actor, senderClient: m.sender_client, correlationId: r.exchange_id,
-        data: { owner_label: m.owner_label },
-      });
-      ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome: "accepted" });
+      // revision" -- reached ONLY from the branch above (a guarded/no-op
+      // update, every branch above this one, emits nothing). This is a
+      // SQLite-backed Durable Object (ctx.storage.sql), never D1 -- "D1"
+      // in the plan doc is legacy wording from an earlier draft.
+      // Wrapped in an explicit transactionSync so insertEvent's RETURN
+      // VALUE, not just its side effect, gates whether status='replied'
+      // ever commits (Zero's read-only review at be289f8 state.ts:1261:
+      // the old code called insertEvent and ignored what it returned, so
+      // a rejected:duplicate_payload_mismatch -- an event_id collision --
+      // still committed the UPDATE and reported "accepted", with no
+      // durable event and no retry path to repair it). A bad outcome
+      // throws inside the closure, which rolls back BOTH the UPDATE and
+      // the audit row: the exchange stays 'delivered' and the Mac's next
+      // sync tick re-reports the same reply, this time (if the collision
+      // has cleared) succeeding for real.
+      let outcome: string;
+      try {
+        outcome = this.ctx.storage.transactionSync(() => {
+          this.sql.exec(`UPDATE owner_messages SET status='replied', reply_body=?, reply_session=?,
+              reply_artifact_revision=?, replied_at=?, updated_at=? WHERE exchange_id=?`,
+            r.body, r.session, r.artifact_revision, Number.isFinite(respondedMs) ? respondedMs : nowMs, nowMs, r.exchange_id);
+          this.audit(nowMs, { ...sys, target: m.owner_label, decision: "replied", reason: "", message_id: r.exchange_id, detail: "" });
+          // data carries owner_label only -- never reply_body (plan
+          // section 4: "the events carry no reply text"); visibility
+          // owner_private restricts it to this exchange's own sender
+          // (listEvents/waitForEvents).
+          const result = this.insertEvent(nowMs, {
+            eventId: namespacedEventId("srv", { email: m.sender_actor, client_id: m.sender_client },
+              "owner.reply_ready", r.exchange_id, r.artifact_revision || "none"),
+            remoteTaskId: "", type: "owner.reply_ready", source: "owner_inbox",
+            subjectKind: "owner_exchange", subjectId: r.exchange_id, visibility: "owner_private",
+            senderActor: m.sender_actor, senderClient: m.sender_client, correlationId: r.exchange_id,
+            data: { owner_label: m.owner_label },
+          });
+          if (result.outcome !== "accepted" && result.outcome !== "duplicate_same_payload") {
+            throw new Error(`event_conflict:${result.outcome}`);
+          }
+          return "accepted";
+        });
+      } catch {
+        outcome = "rejected:event_conflict";
+      }
+      ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome });
     }
 
     // A queued message was valid when it was sent, not necessarily now. Before
