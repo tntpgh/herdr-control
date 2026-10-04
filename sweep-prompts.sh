@@ -36,7 +36,16 @@ MODE="${3:-review}"
 DEADLINE=$(( $(date +%s) + MAX_MIN * 60 ))
 
 # Credentials, destruction, escalation, deploys, publishes, history rewrites.
-COMMON='rm[[:space:]]+-rf?|op[[:space:]]+read|OP_SERVICE|printenv|(^|[;&|[:space:]])env[[:space:]]+\||cat[[:space:]][^|]*\.env|sudo|wrangler[[:space:]]+(deploy|publish)|supabase[[:space:]]+db[[:space:]]+push|npm[[:space:]]+publish|gh[[:space:]]+pr[[:space:]]+(merge|close)|--no-verify|push[[:space:]]+--force|push[[:space:]]+-f[[:space:]]|force-with-lease|push[[:space:]]+[^|;&]*origin[[:space:]]+main|push[[:space:]]+[^|;&]*HEAD:main|:main[[:space:]]*$|filter-branch|reset[[:space:]]+--hard'
+# The destructive-command clause matches the COMMAND, not the word: a left
+# boundary (start of string, `;&|` or whitespace, `(` or a backtick — which
+# also covers `$(rm` and a path prefix like `/bin/rm`) then the token, then a
+# right boundary (whitespace or end of string). That is what tells `confirm`,
+# `perform`, `arm64`, `npm run` and docker's `--rm` flag apart from the
+# command: none of them has "rm" preceded by one of those boundary chars AND
+# followed by whitespace/EOS. `git rm` needs no special case — the space
+# before "rm" is already a left boundary. Evidence:
+# .handoffs/reviews/2026-10-04-sweeper-rm-denylist-evidence.md
+COMMON='(^|[;&|[:space:](`])((/[A-Za-z0-9_./-]+/)?rm|unlink|shred|trash|rmdir)([[:space:]]|$)|find[[:space:]][^|;&]*-delete([[:space:]]|$)|op[[:space:]]+read|OP_SERVICE|printenv|(^|[;&|[:space:]])env[[:space:]]+\||cat[[:space:]][^|]*\.env|sudo|wrangler[[:space:]]+(deploy|publish)|supabase[[:space:]]+db[[:space:]]+push|npm[[:space:]]+publish|gh[[:space:]]+pr[[:space:]]+(merge|close)|--no-verify|push[[:space:]]+--force|push[[:space:]]+-f[[:space:]]|force-with-lease|push[[:space:]]+[^|;&]*origin[[:space:]]+main|push[[:space:]]+[^|;&]*HEAD:main|:main[[:space:]]*$|filter-branch|reset[[:space:]]+--hard'
 if [ "$MODE" = "implement" ]; then
   DENY="$COMMON"
 else
