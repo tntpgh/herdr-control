@@ -44,6 +44,26 @@
 		     both must be on for a message to actually reach a pane. -->
 		<key>HERDR_MCP_OWNER_INBOX</key>
 		<string>__REMOTE_MCP_OWNER_INBOX__</string>
+		<!-- research-task-closure defect 2 (2026-10-04): names a standing
+		     conductor pane spawn-task.sh falls back to (its own env read,
+		     ~line 390) when a spawned task has no live interactive conductor
+		     of its own -- without this, every remote-mcp task got
+		     conductor_unknown/conductor_unconfigured, and an escalation had
+		     nowhere fast to go until the owner-inbox/human-notify fallback
+		     (herdr-action.sh). Both empty (the default) is unchanged
+		     behaviour -- that fallback is skipped exactly as before, never a
+		     spawn failure. Set with install.sh
+		     --remote-mcp-conductor-pane=<pane_id> (resolves BIRTH itself from
+		     the live pane at install time; refuses if the pane is not a live
+		     agent pane). BIRTH is spawn-task.sh's own liveness proof
+		     (terminal_id) -- a plain pane_id survives herdr recycling it to an
+		     unrelated occupant, BIRTH does not, so a stale pair safely
+		     degrades to the same fallback as unset rather than messaging a
+		     stranger's pane. -->
+		<key>HERDR_MCP_CONDUCTOR_PANE</key>
+		<string>__REMOTE_MCP_CONDUCTOR_PANE__</string>
+		<key>HERDR_MCP_CONDUCTOR_BIRTH</key>
+		<string>__REMOTE_MCP_CONDUCTOR_BIRTH__</string>
 	</dict>
 	<!-- 15 s: the Worker reports `disconnected` after 90 s without a sync,
 	     so six missed ticks in a row are what it takes to go dark. -->

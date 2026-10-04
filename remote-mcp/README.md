@@ -263,21 +263,33 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
    objective nor a follow-up is ever treated as an approval; what the
    objective asks for is work, not permission.
 6. Lifecycle states shown to a client: `queued`, `starting`, `running`,
-   `waiting_approval` (a live permission prompt), `blocked` (something else),
-   `finished` (its `completion_event` landed), `verified`, `failed`,
+   `finished` (research: ANSWER.md verified and the orchestrator closed it;
+   implement: its `completion_event` landed), `verified`, `failed`,
    `cancelled`, `lost`, `timed_out`. `verified` = `finished` and its mode's
-   check passed: research → `.handoffs/ANSWER.md` exists with ≥1 source link;
-   implement → the branch named in its closure event is pushed and its head
-   sha matches (`get_task_answer`'s `verified_kind`, `source_link_present` /
-   `pushed_sha_matches`, names which one — a FORMAT/CLOSURE check against
-   the task's own completion claim, never a semantic read of whether the
-   answer is actually correct). A finished research task is auto-closed
-   (`close-done-workers.sh --task=<id> --apply`); a cancelled/timed-out
-   task's pane is CONFIRMED gone -- closed by the cancel, or already
-   recycled to a different occupant -- before its state is ever set to a
-   terminal value: a `herdr pane list`/`close` failure, or a pane still
-   reporting the same occupant right after the close, leaves the row
-   non-terminal for the next retry instead of claiming victory early.
+   check passed: research → `.handoffs/ANSWER.md` is non-empty and contains
+   ≥1 real source link (a GitHub permalink
+   `https://github.com/<owner>/<repo>/(blob|tree)/<ref>/<path>`, optionally
+   `#L..`, or any other `https://` URL — a bare `path:line` reference does
+   NOT count); implement → the branch named in its closure event is pushed
+   and its head sha matches (`get_task_answer`'s `verified_kind`,
+   `source_link_present` / `pushed_sha_matches`, names which one — a
+   FORMAT/CLOSURE check against the task's own completion claim, never a
+   semantic read of whether the answer is actually correct). A research
+   task can never close itself — its manifest restricts the write tool to
+   `.handoffs/ANSWER.md` (`handoffs_write`), so it has no way to append a
+   completion event — and is never told to try: the TRUSTED orchestrator
+   (`remote-mcp/tasks.py`'s `sweep()`, outside the worker's own write
+   authority) closes it once ANSWER.md verifies and the pane goes idle
+   (`close-done-workers.sh --task=<id> --apply --reason=no-follow-on
+   --proof=<answer sha256>`), and records `actor: "orchestrator"` on the
+   closure event so it is never mistaken for one the worker performed
+   itself. An implement task still reports its own `completion_event` (its
+   manifest carries no such restriction) and is auto-closed the same way.
+   A cancelled/timed-out task's pane is CONFIRMED gone -- closed by the
+   cancel, or already recycled to a different occupant -- before its state
+   is ever set to a terminal value: a `herdr pane list`/`close` failure, or
+   a pane still reporting the same occupant right after the close, leaves
+   the row non-terminal for the next retry instead of claiming victory early.
 7. **At delivery**, exactly like a message: a queued start/cancel/resume is
    cancelled before the Mac ever sees it if tasks are now off (Worker or Mac
    switch), the requester has left the allowlist, or no longer holds a live

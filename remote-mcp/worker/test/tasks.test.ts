@@ -164,11 +164,11 @@ describe("start_task: happy path through to get_task_answer", () => {
       .toEqual(["running", "task_V", "remote/abc123", { secrets_granted: true, kb_http_reachable: true }]);
 
     // The Mac's next tick reports the task finished and verified (research:
-    // ANSWER.md had a source link) -- the remap in sync() should carry that
-    // straight through to get_task_answer's local_task.
+    // ANSWER.md had an https:// source link) -- the remap in sync() should
+    // carry that straight through to get_task_answer's local_task.
     const withLocalTask = snapshot({
       task_config: TASK_CONFIG,
-      tasks: [...snapshot().tasks, taskRow("task_V", remoteTaskId, { verified: true, verify_detail: "ANSWER.md has a source link" })],
+      tasks: [...snapshot().tasks, taskRow("task_V", remoteTaskId, { verified: true, verify_detail: "ANSWER.md has a https:// source link" })],
     });
     await signedSync(syncBody({ snapshot: withLocalTask }));
 
@@ -177,8 +177,54 @@ describe("start_task: happy path through to get_task_answer", () => {
     const localTask = answer.data.local_task;
     if (!isVerifiedTask(localTask)) throw new Error(`expected local_task with verified/verify_detail, got ${JSON.stringify(localTask)}`);
     expect(localTask.verified).toBe(true);
-    expect(localTask.verify_detail).toBe("ANSWER.md has a source link");
+    expect(localTask.verify_detail).toBe("ANSWER.md has a https:// source link");
     expect(answer.data.verified_kind).toBe("source_link_present");
+  });
+});
+
+describe("answer_ready gating (research-task-closure defect 3)", () => {
+  const hasType = (ev: unknown, type: string): boolean =>
+    !!ev && typeof ev === "object" && "type" in ev && ev.type === type;
+  it("fires only once ANSWER.md itself is present (has_answer), never on PROOF.md's mere existence (has_result)", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task",
+      { repo: "knowledge-base", mode: "research", objective: "find X" });
+    const remoteTaskId = started.data.task_id;
+
+    const leased = await syncJson(await signedSync(taskConfigBody()));
+    const cmd = leased.commands.find((c) => c.remote_task_id === remoteTaskId && c.op === "start");
+    await signedSync(syncBody({
+      lease: false,
+      command_acks: [{ command_id: cmd!.command_id, outcome: "accepted", detail: "spawned",
+        local_task_id: "task_AR", local_run_id: "run_AR", branch: "remote/arabc", pane_id: "w1:term_ar", agent_id: "term_ar" }],
+    }));
+
+    // The worker is still running, its SPEC.md's companion PROOF.md already
+    // exists (created empty, same as every task) -- has_result is true, but
+    // ANSWER.md has not been written yet (has_answer false). The pre-fix
+    // code keyed answer_ready off has_result alone and would have fired
+    // here already (rtask_20261004T120322Z_17df2d64: fired from an empty
+    // PROOF.md before ANSWER.md existed).
+    const before = await callTool<EventsResult>(access_token, "list_events", { since_cursor: 0 });
+    const beforeCursor = before.data.cursor;
+    const runningNoAnswer = snapshot({ task_config: TASK_CONFIG,
+      tasks: [...snapshot().tasks, taskRow("task_AR", remoteTaskId,
+        { state: "running", stored_state: "running", completed_at: null, closure_reason: null,
+          has_result: true, has_answer: false })] });
+    await signedSync(syncBody({ snapshot: runningNoAnswer }));
+    const afterEmpty = await callTool<EventsResult>(access_token, "list_events", { since_cursor: beforeCursor });
+    expect(afterEmpty.data.events.some((ev) => hasType(ev, "answer_ready"))).toBe(false);
+
+    // ANSWER.md now exists and is non-empty -- has_answer flips true, and
+    // THIS is what should fire answer_ready.
+    const runningWithAnswer = snapshot({ task_config: TASK_CONFIG,
+      tasks: [...snapshot().tasks, taskRow("task_AR", remoteTaskId,
+        { state: "running", stored_state: "running", completed_at: null, closure_reason: null,
+          has_result: true, has_answer: true })] });
+    await signedSync(syncBody({ snapshot: runningWithAnswer }));
+    const afterAnswer = await callTool<EventsResult>(access_token, "list_events", { since_cursor: beforeCursor });
+    expect(afterAnswer.data.events.some((ev) => hasType(ev, "answer_ready"))).toBe(true);
   });
 });
 

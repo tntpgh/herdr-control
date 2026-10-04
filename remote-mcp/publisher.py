@@ -417,6 +417,17 @@ def build(now: datetime) -> tuple[dict, dict]:
         has_result = bool(proof and worktree_ok(Path(t["worktree"])) and proof.is_file())
         if has_result:
             worktrees[t["task_id"]] = Path(t["worktree"])
+        # research-task-closure defect 3 (2026-10-04): answer_ready used to
+        # fire off has_result alone, i.e. PROOF.md's mere EXISTENCE -- and
+        # PROOF.md is created EMPTY alongside every task's SPEC.md, so it
+        # fired the instant a worktree was spawned, long before ANSWER.md
+        # (a research task's actual deliverable) existed
+        # (rtask_20261004T120322Z_17df2d64: answer_ready at 12:03:57 from an
+        # empty PROOF.md, ANSWER.md not written until 12:05:03). has_answer
+        # is the narrower, correct signal: ANSWER.md itself, present AND
+        # non-empty.
+        answer = Path(t["worktree"]) / ".handoffs/ANSWER.md" if t.get("worktree") else None
+        has_answer = bool(answer and worktree_ok(Path(t["worktree"])) and answer.is_file() and answer.stat().st_size > 0)
         if agent_live:
             active_task_by_pane.setdefault(pane, t["task_id"])
         remote = remotes.get(t["task_id"]) or {}
@@ -428,7 +439,7 @@ def build(now: datetime) -> tuple[dict, dict]:
             "completed_at": iso(t.get("evidence_at")) if t.get("state") in TERMINAL or t.get("state") == "ready_review" else None,
             "closure_reason": t.get("closure_reason"), "closure_proof": redact(t["closure_proof"]) if t.get("closure_proof") else None,
             "pane_id": pane if agent_live else None, "agent_id": birth if agent_live else None,
-            "agent_live": agent_live, "has_result": has_result,
+            "agent_live": agent_live, "has_result": has_result, "has_answer": has_answer,
             "remote_task_id": remote.get("remote_task_id"), "verified": remote.get("verified"),
             "verify_detail": remote.get("verify_detail"),
         })

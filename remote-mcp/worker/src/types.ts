@@ -116,6 +116,13 @@ export interface TaskRow {
   agent_id: string | null;
   agent_live: boolean;
   has_result: boolean;
+  // research-task-closure defect 3: has_result is PROOF.md's mere
+  // existence (created empty alongside every task's SPEC.md); has_answer
+  // is the narrower signal answer_ready actually needs -- ANSWER.md
+  // present AND non-empty. Optional: a publisher that predates this field
+  // sends neither, which must degrade to "no answer_ready" rather than a
+  // validation failure.
+  has_answer?: boolean;
   // Set once a herdr-mcp start_task/resume_task command actually spawned
   // this task (remote-mcp/tasks.py); empty/null for every task not started
   // remotely. verified/verify_detail are the Mac's own check of the client's

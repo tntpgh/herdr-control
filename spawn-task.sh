@@ -653,8 +653,18 @@ fi
 # never read from the task's own SPEC.md: manifest_from_spec's validator
 # rejects an unknown key, so a worker cannot forge or widen this by editing
 # its own worktree-writable brief and having a re-spawn "approve" it.
+# research-task-closure defect 1 (2026-10-04): a handoffs_write-restricted
+# worker (research/explore) can never append its own completion_event to
+# events.jsonl -- its write tool reaches only ANSWER.md, so the generic
+# kickoff/identity.json instructions below ("append ... when finished") are
+# actively wrong for it. orchestrator_closes marks exactly that case, so
+# both get mode-specific text instead: the trusted orchestrator (remote-mcp/
+# tasks.py's sweep(), never the worker) closes the task once ANSWER.md
+# verifies and the pane goes idle.
+orchestrator_closes=0
 case "$job" in
   research|explore)
+    orchestrator_closes=1
     # R3-2: the previous `"${manifest_json:-\{\}}"` kept the backslashes
     # literal inside double quotes (jq saw `\{\}`, a parse error, and with
     # no `set -e` here that silently produced empty -- a research/explore
@@ -699,17 +709,26 @@ pane_birth=$(printf '%s' "$tc" | jq -r '.result.root_pane.terminal_id // empty')
 #
 # `event` is pre-filled with the EXACT marker wake-on-evidence.sh watches, so
 # the worker never has to reconstruct it from its label.
-# The example is built here rather than inside jq: a nested quoting puzzle in
-# the generator is how this file ends up emitting a command the worker cannot
-# paste back.
-identity_example="printf '{\"event\":\"$wake_pattern\",\"status\":\"completed\",\"reason\":\"shipped\",\"proof\":\".handoffs/PROOF.md#<section> or <PR URL> <merge sha>\"}\n' >> $events_file"
+if [ "$orchestrator_closes" = 1 ]; then
+  identity_example="(nothing to append — see how_to_complete)"
+  identity_how_to_complete="This task's manifest restricts your write tool to .handoffs/ANSWER.md only (handoffs_write) — do NOT append to events_file; that write is refused and escalated for nothing, and so is any cd/git/other attempt to close yourself. Write .handoffs/ANSWER.md (plain English, at least one real source link per claim: a GitHub permalink https://github.com/<owner>/<repo>/(blob|tree)/<ref>/<path> or any other https:// URL — a bare path:line reference does not verify) and then stop; that file is the ONLY thing read back as your answer. The trusted orchestrator (remote-mcp/tasks.py's sweep, never you) closes this task once ANSWER.md verifies and this pane goes idle — reason no-follow-on, proof the answer's own sha256. There is no closure command for you to run."
+  identity_closure_reasons='[]'
+else
+  # The example is built here rather than inside jq: a nested quoting puzzle in
+  # the generator is how this file ends up emitting a command the worker cannot
+  # paste back.
+  identity_example="printf '{\"event\":\"$wake_pattern\",\"status\":\"completed\",\"reason\":\"shipped\",\"proof\":\".handoffs/PROOF.md#<section> or <PR URL> <merge sha>\"}\n' >> $events_file"
+  identity_how_to_complete="Append one JSON line to events_file, using completion_event verbatim, PLUS a closure reason field: shipped | handed_off_to:<task|role> | blocked_on:<thing> | canceled | no-follow-on. \`shipped\` also needs a proof field — the URL of a MERGED PR + its merge-commit sha (checked with gh: an open PR, or its head sha, is refused), or a section id in proof_file written as \".handoffs/PROOF.md#<section>\" (it must actually hold something you wrote, not stay empty) — the registry refuses \`completed\` without one (lib/run-registry.sh). Read spec_file for the acceptance checklist and write what you verified into proof_file before closing shipped. Read these values HERE — do not try env/printenv, that is human-reserved and will stall you until a human answers."
+  identity_closure_reasons='["shipped","handed_off_to:<task|role>","blocked_on:<thing>","canceled","no-follow-on"]'
+fi
 jq -n \
   --arg run "$run_id" --arg task "$task_id" --arg worker "$worker_id" \
   --arg conductor "$conductor_id" --arg pane "$pane" --arg label "$label" \
   --arg event "$wake_pattern" --arg events "$events_file" \
   --arg worktree "$wt" --arg branch "$branch" --arg repo "$root" \
   --arg project "$project_label" \
-  --arg example "$identity_example" \
+  --arg example "$identity_example" --arg how_to_complete "$identity_how_to_complete" \
+  --argjson closure_reasons "$identity_closure_reasons" \
   --arg manifest "$manifest_json" \
   --arg spec "$(handoff_spec "$wt")" --arg proof_file "$(handoff_proof "$wt")" \
   '{run_id:$run, task_id:$task, worker_id:$worker, conductor_id:$conductor,
@@ -718,8 +737,8 @@ jq -n \
     project:$project, spec_file:$spec, proof_file:$proof_file,
     capability_manifest:(if $manifest == "" then null else ($manifest|fromjson) end),
     capability_manifest_note:"Approved once at spawn by the conductor (registry event manifest_approved). Inside it, approvals clear without a per-call review; outside it they escalate exactly as before. This copy is informational — editing it changes nothing the approver reads.",
-    how_to_complete:"Append one JSON line to events_file, using completion_event verbatim, PLUS a closure reason field: shipped | handed_off_to:<task|role> | blocked_on:<thing> | canceled | no-follow-on. `shipped` also needs a proof field — the URL of a MERGED PR + its merge-commit sha (checked with gh: an open PR, or its head sha, is refused), or a section id in proof_file written as \".handoffs/PROOF.md#<section>\" (it must actually hold something you wrote, not stay empty) — the registry refuses `completed` without one (lib/run-registry.sh). Read spec_file for the acceptance checklist and write what you verified into proof_file before closing shipped. Read these values HERE — do not try env/printenv, that is human-reserved and will stall you until a human answers.",
-    closure_reasons:["shipped","handed_off_to:<task|role>","blocked_on:<thing>","canceled","no-follow-on"],
+    how_to_complete:$how_to_complete,
+    closure_reasons:$closure_reasons,
     example:$example}' \
   > "$(handoff_identity "$wt")" 2>/dev/null || {
     # Never fail a spawn over the convenience file — the worker can still be
@@ -867,7 +886,11 @@ set_task_state "$run_id" "$task_id" "running"
 # painted, via send-to-agent.sh so the submit is confirmed, not assumed.
 kickoff_note="none (no --brief; send the first prompt yourself)"
 if [ -n "$brief_file" ] && [ "$managed" = 1 ]; then
-  kickoff_msg="Your task brief is .handoffs/SPEC.md in this worktree — read it and execute it to Done. Your ids are in .handoffs/identity.json; when finished, append its completion_event to .handoffs/events.jsonl."
+  if [ "$orchestrator_closes" = 1 ]; then
+    kickoff_msg="Your task brief is .handoffs/SPEC.md in this worktree — read it and execute it to Done. Your ids are in .handoffs/identity.json. Your write tool reaches only .handoffs/ANSWER.md (handoffs_write) — do NOT append to events.jsonl or try any other way to close this task yourself; that is refused and escalated for nothing. Write ANSWER.md, then stop: the orchestrator closes this task once it verifies and this session goes idle."
+  else
+    kickoff_msg="Your task brief is .handoffs/SPEC.md in this worktree — read it and execute it to Done. Your ids are in .handoffs/identity.json; when finished, append its completion_event to .handoffs/events.jsonl."
+  fi
   if herdr pane wait-output "$pane" --regex 'Model scope|to change thinking effort' --timeout 60000 >/dev/null 2>&1 \
      && bash "$here/send-to-agent.sh" "$pane" "$kickoff_msg" >/dev/null 2>&1; then
     kickoff_note="SENT (points the worker at .handoffs/SPEC.md)"

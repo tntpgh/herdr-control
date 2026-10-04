@@ -28,6 +28,7 @@ registry_rows() already does -- a read needs no locking, only a write does.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -70,16 +71,16 @@ KB_HEALTH_URL = "https://kb.teamthurber.com/health"
 TERMINAL = {"completed", "failed", "cancelled", "lost", "gone"}
 MODE_FIELDS = ("job_class", "secrets", "git", "writes", "net_read")
 
-# A claimed "source link" in ANSWER.md: a URL, a file:line / file#Lline
-# reference, or a KB entity/chunk id. Loose on purpose -- this gates
-# `verified`, not correctness of the answer itself (SPEC: "research -> ANSWER.md
-# exists and has >=1 source link").
-SOURCE_LINK_RE = re.compile(
-    r"https?://\S+"
-    r"|\b[\w./-]+\.[A-Za-z0-9]+(?::\d+|#L\d+)\b"
-    r"|\bkb_(?:entity|chunk)_[\w-]+\b",
-    re.IGNORECASE,
-)
+# A claimed "source link" in ANSWER.md (research-task-closure defect 4,
+# 2026-10-04: a bare `path:line` reference was previously enough to pass,
+# and ANSWER.md for rtask_20261004T120322Z_17df2d64 had only those --
+# `verified` certified an answer that named no fetchable source at all).
+# Required shape now: a GitHub blob/tree permalink
+# (`https://github.com/<owner>/<repo>/(blob|tree)/<ref>/<path>`, optional
+# `#L..`) or any other `https://` URL -- either is a link a reader can
+# actually open; a repo-relative `path:line` is not. This gates `verified`,
+# not correctness of the answer itself.
+SOURCE_LINK_RE = re.compile(r"https://\S+", re.IGNORECASE)
 
 # I4: the Worker mints remote_task_id and it is trusted into a filesystem
 # path (briefs/<id>.md) and a branch name -- the trust root is the TLS
@@ -270,14 +271,19 @@ def _brief_text(mode: str, mcfg: dict, objective: str, remote_task_id: str, foll
     if mode == "research":
         lines += [
             "- [ ] The objective above is actually answered.",
-            "- [ ] `.handoffs/ANSWER.md` is written, in plain English, with at least one source "
-            "link per claim (a KB entity/chunk id, a URL, or a `path/to/file:line` reference). "
+            "- [ ] `.handoffs/ANSWER.md` is written, in plain English, with at least one real "
+            "source link per claim -- a GitHub permalink "
+            "(`https://github.com/<owner>/<repo>/(blob|tree)/<ref>/<path>`, optionally `#L..`) "
+            "or any other `https://` URL. A bare `path/to/file:line` reference does not count. "
             "This is the ONLY thing the remote client ever reads back as your answer.",
             "- [ ] No approval escalation was needed. This mode's manifest is read-only, "
             ".handoffs/** only; if a step genuinely needs more than that, say so IN ANSWER.md "
             "instead of trying to escalate.",
-            "- [ ] Close with `no-follow-on` (research changes nothing outside .handoffs/**, so "
-            "there is nothing to hand off) -- see the proof contract below for the command.",
+            "- [ ] Do NOT try to close this task yourself -- your write tool reaches only "
+            "ANSWER.md (handoffs_write), so an attempt to append to events.jsonl, or to `cd`/"
+            "chain your way there, is refused and escalated for nothing. Once ANSWER.md passes "
+            "the check above and this session goes idle, the orchestrator closes the task for "
+            "you (reason `no-follow-on`) -- there is nothing further to do or run.",
         ]
     else:
         lines += [
@@ -784,14 +790,54 @@ def _auto_close(t: dict, ev: dict) -> dict:
     return {"task_id": t["task_id"], "action": "auto_close", "ok": ok, "detail": proc.stdout.strip()[-400:]}
 
 
+def _answer_sha256(wt: Path) -> str:
+    return hashlib.sha256((wt / ".handoffs/ANSWER.md").read_bytes()).hexdigest()
+
+
+# research-task-closure defect 1 (2026-10-04, rtask_20261004T120322Z_17df2d64):
+# a research task's manifest restricts its write tool to .handoffs/ANSWER.md
+# (spawn-task.sh's handoffs_write), so it can never append its own
+# completion_event to events.jsonl the way an implement-mode task does --
+# every attempt to do so (or to `cd`/chain its way there) is refused and
+# escalated, and the SPEC/identity.json that told it to try were simply
+# wrong. The worker is never widened to permit this (no permission
+# expansion anywhere); instead THIS function, run every sweep tick by the
+# trusted orchestrator (this process, outside the worker's write
+# authority), closes a research task once its own two conditions hold:
+# ANSWER.md passes `_verify_research` (content check) AND
+# close-done-workers.sh's own pane-idle/worktree-clean checks agree the
+# worker's turn has actually ended (timing check) -- the same two gates
+# `_auto_close` would apply to a self-reported completion, just reached
+# without the worker's participation. Reason is always `no-follow-on`
+# (research changes nothing outside .handoffs/**); proof is the answer's
+# own sha256, and the registry event names actor=orchestrator so this
+# closure is never confused for one the worker performed itself.
+def _orchestrator_close_research(t: dict, wt: Path) -> dict | None:
+    ok, _detail = _verify_research(wt)
+    if not ok:
+        return None  # not ready yet -- retried next tick, same as _pending_completion finding nothing
+    proof = _answer_sha256(wt)
+    args = [CLOSE_DONE, f"--task={t['task_id']}", "--apply", "--reason=no-follow-on", f"--proof={proof}"]
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=60, cwd=str(REPO))
+    held = "HOLD" in proc.stdout or "REFUSED" in proc.stdout
+    okc = proc.returncode == 0 and not held
+    if okc:
+        _bridge("append-event", t["run_id"], t["task_id"], "orchestrator_closed",
+                json.dumps({"actor": "orchestrator", "reason": "no-follow-on", "proof": proof}))
+        _kill_hard_stop_timer(t["run_id"], t["task_id"])
+    return {"task_id": t["task_id"], "action": "orchestrator_close", "ok": okc, "detail": proc.stdout.strip()[-400:]}
+
+
 def _verify_research(wt: Path) -> tuple[bool, str]:
     answer = wt / ".handoffs/ANSWER.md"
     if not answer.is_file():
         return False, "ANSWER.md is missing"
     text = answer.read_text(encoding="utf-8", errors="replace")
+    if not text.strip():
+        return False, "ANSWER.md is empty"
     if not SOURCE_LINK_RE.search(text):
-        return False, "ANSWER.md has no source link (URL, file:line, or KB id)"
-    return True, "ANSWER.md exists with >=1 source link"
+        return False, "ANSWER.md has no https:// source link (a bare path:line reference does not count)"
+    return True, "ANSWER.md exists with >=1 https:// source link"
 
 
 def _verify_implement(wt: Path, proof: str, expected_branch: str) -> tuple[bool, str]:
@@ -918,12 +964,23 @@ def sweep(tasks_by_id: dict[str, dict], now: datetime) -> list[dict]:
             # just waiting on a HOLD-retried auto_close (pane busy) -- could
             # still be force-cancelled timed_out past its deadline,
             # discarding an answer that was already on disk. A completion
-            # event already delivered always wins over the timer.
+            # event already delivered always wins over the timer. A research
+            # task never gets that event at all (defect 1: its manifest
+            # restricts the write tool to ANSWER.md, so it cannot append to
+            # events.jsonl) -- an ANSWER.md that already passes
+            # _verify_research wins over the timer the same way, via the
+            # trusted orchestrator instead of a self-reported event.
             wt = Path(t["worktree"]) if t.get("worktree") else None
-            ev = _pending_completion(wt) if wt and wt.is_dir() else None
-            if ev:
-                logged.append(_auto_close(t, ev))
-                continue
+            if remote["mode"] == "research":
+                action = _orchestrator_close_research(t, wt) if wt and wt.is_dir() else None
+                if action:
+                    logged.append(action)
+                    continue
+            else:
+                ev = _pending_completion(wt) if wt and wt.is_dir() else None
+                if ev:
+                    logged.append(_auto_close(t, ev))
+                    continue
             deadline = _parse_iso(remote["deadline_at"]) if remote["deadline_at"] else None
             if deadline is None:
                 # N1: a post-spawn set-deadline failure (bridge write lost)

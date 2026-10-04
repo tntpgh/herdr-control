@@ -33,6 +33,14 @@
 # Either way an approvals row and an action_decided event are recorded, and the
 # worker is told in its pane (send-to-agent.sh) to re-issue the identical call.
 #
+# A request with no conductor pane configured at all (conductor_unconfigured)
+# first tries every registered owner (register-owner.sh; owners table) whose
+# pane is currently live, same tick, before falling to the human route below
+# -- never a new approval authority, just a faster named notification
+# (research-task-closure defect 2, 2026-10-04). The action_surfaced event's
+# outcome names which owner got it (`owner:<label>`), or stays
+# conductor_unconfigured when none is reachable.
+#
 # The human route (route=human, or a conductor-route request still pending
 # after HERDR_ACTION_STALE_S, default 900s): the tick posts ONE Slack alert
 # (class human-action, lib/slack-level.sh) and serves a formserve decision on
@@ -198,8 +206,40 @@ cmd_decide() {                          # approve|decline id [flags]
   esac
 }
 
+# research-task-closure defect 2 (2026-10-04, rtask_20261004T120322Z_17df2d64):
+# a task spawned with no conductor pane configured (HERDR_MCP_CONDUCTOR_PANE
+# absent/stale at spawn time) got outcome=conductor_unconfigured and NOTHING
+# else tried to reach anyone until the next tick's stale-wait-skipping human
+# route -- which does fire on the very same tick, but as a passive hub form
+# plus one Slack-class notify, easy to miss when three near-identical
+# requests land a minute apart. Before giving up to that fallback, try every
+# registered owner (register-owner.sh; owners table, label -> pane) whose
+# pane is CURRENTLY LIVE (birth matches, still an agent pane -- the same
+# liveness proof spawn-task.sh's own HERDR_MCP_CONDUCTOR_PANE fallback
+# requires, never a recycled pane_id alone) and message it directly, same
+# content as the conductor alert. Never a new approval authority -- cmd_decide
+# still only accepts conductor|human -- just a faster, NAMED notification
+# path so a request is never silently unrouted. Returns the owner's label on
+# stdout (and exit 0) if one was messaged; exit 1 if none is reachable, in
+# which case the caller falls through to today's conductor_unconfigured path
+# unchanged.
+_ha_route_to_owner() {                  # id row task-json msg -> owner label on stdout, exit 1 if none reachable
+  local id="$1" tj="$3" msg="$4" label pane birth live
+  while IFS='|' read -r label pane birth; do
+    [ -n "$label" ] && [ -n "$pane" ] || continue
+    live="$(pane_birth_now "$pane" 2>/dev/null)"
+    [ -n "$live" ] && [ "$live" = "$birth" ] || continue
+    pane_is_agent "$pane" 2>/dev/null || continue
+    if bash "$HA_SEND" "$pane" "$msg" >/dev/null 2>&1; then
+      printf '%s\n' "$label"
+      return 0
+    fi
+  done < <(_sql "SELECT label||'|'||pane_id||'|'||pane_birth FROM owners ORDER BY label;" 2>/dev/null)
+  return 1
+}
+
 cmd_surface() {                         # id -> wake the conductor once
-  local id="$1" row tj cpane cbirth msg rc outcome disp label
+  local id="$1" row tj cpane cbirth msg owner_msg owner_label rc outcome disp label
   registry_init || return 1
   row="$(action_request_get "$id")"; [ -n "$row" ] || return 3
   [ "$(_ha_field "$row" status)" = pending ] || return 0
@@ -212,7 +252,12 @@ cmd_surface() {                         # id -> wake the conductor once
   disp="$(pretool_redact "$(_ha_field "$row" command)" | tr '\n' ' ' | cut -c1-300)"
   msg="[HERDR-ACTION] ${label:-$(_ha_field "$row" task_id)} ($(_ha_field "$tj" pane_id)) asks to run: ${disp} — $(_ha_field "$row" reason | cut -c1-200). Request $id. Review the complete action (herdr-action.sh show $id), then: $here/herdr-action.sh approve $id --authority conductor --review-category <local-read|local-build|branch-work|owned-cleanup> --review-reason '<why>'  OR  $here/herdr-action.sh decline $id --authority conductor --review-reason '<why>'"
   if [ -z "$cpane" ]; then
-    outcome=conductor_unconfigured
+    owner_msg="[HERDR-ACTION] ${label:-$(_ha_field "$row" task_id)} ($(_ha_field "$tj" pane_id)) has no conductor configured and asks to run: ${disp} — $(_ha_field "$row" reason | cut -c1-200). Request $id. Decide at http://127.0.0.1:8600/decisions."
+    if owner_label="$(_ha_route_to_owner "$id" "$row" "$tj" "$owner_msg")"; then
+      outcome="owner:${owner_label}"
+    else
+      outcome=conductor_unconfigured
+    fi
   elif [ -z "$cbirth" ] || [ "$cbirth" != "$(pane_birth_now "$cpane")" ]; then
     outcome=conductor_unreachable
   else

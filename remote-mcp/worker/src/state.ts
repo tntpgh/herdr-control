@@ -30,6 +30,7 @@ const SyncSchema = z.object({
       task_id: str, run_id: str, label: str, project: str, repo: str, branch: str, state: str,
       stored_state: nstr, state_source: nstr, created_at: str, updated_at: str, completed_at: nstr,
       closure_reason: nstr, closure_proof: nstr, pane_id: nstr, agent_id: nstr, agent_live: z.boolean(), has_result: z.boolean(),
+      has_answer: z.boolean().optional(),
       remote_task_id: nstr.optional(), verified: z.boolean().nullable().optional(), verify_detail: nstr.optional(),
     })).max(2000),
     blockers: z.array(z.object({
@@ -1277,7 +1278,12 @@ export class HerdrState extends DurableObject<Env> {
         this.sql.exec(`UPDATE remote_tasks SET state=?, updated_at=? WHERE remote_task_id=?`, finalState, nowMs, rt.remote_task_id);
         this.recordTaskEvent(nowMs, rt.remote_task_id, finalState === "waiting_approval" ? "approval_needed" : "state_changed", { state: finalState });
       }
-      if (t.has_result) {
+      // research-task-closure defect 3: has_result is PROOF.md's mere
+      // existence (created empty alongside every task's SPEC.md, so it was
+      // already true before a research task had written anything at all);
+      // has_answer is ANSWER.md itself, present and non-empty -- the
+      // actual condition a client's answer_ready should mean.
+      if (t.has_answer) {
         const already = this.sql.exec<{ n: number }>(
           `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='answer_ready'`, rt.remote_task_id).one().n;
         if (already === 0) this.recordTaskEvent(nowMs, rt.remote_task_id, "answer_ready", {});
