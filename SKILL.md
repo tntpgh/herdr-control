@@ -48,9 +48,13 @@ something already running elsewhere, `herdr tab create` + `herdr pane run` is wh
 
 `spawn-task.sh` maps a **job class** to a model, so a mechanical task does not
 burn your best model and a design task does not get your cheapest:
-`plan|architect|review|design` → deep, `implement|debug|code` → standard,
-`explore|quick|docs` → fast. Claude uses the standard aliases; Codex model names
-are yours to set in `config.sh`.
+`plan|architect|design|deep-review` → deep, `review|implement|debug|code` →
+standard (`review` runs the standard model at HIGH effort — Terrence's
+decision 2026-10-04, form 20261004T181727-8798, models=risk_based_default:
+`deep-review` only for auth/secrets/money/deploy/concurrency work or
+plan/design; routine review stays `review`), `explore|quick|docs` → fast.
+Claude uses the standard aliases; Codex model names are yours to set in
+`config.sh`.
 
 **Agent-agnostic by construction.** `lib/agent-profiles.sh` is the single
 table of known agent process names, job-class→model routing, launch flags,

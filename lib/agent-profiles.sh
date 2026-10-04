@@ -89,9 +89,18 @@ answer_strategy_for_agent() {           # <agent> -> strategy
 # ---- model routing ----------------------------------------------------------
 # model_for_agent <agent> <job-class> -> "<model>" or "<model>:<thinking-or-effort>"
 #
-# job-class tiers: plan|architect|review|design (deep) ·
-#                  implement|debug|code|docs (standard) ·
+# job-class tiers: plan|architect|design|deep-review (deep) ·
+#                  review|implement|debug|code|docs (standard — review runs
+#                  the standard model at HIGH effort: omp sonnet:high, same
+#                  sonnet alias as implement for claude/omc, $HERDR_CODEX_STD
+#                  for codex) ·
 #                  explore|quick|mechanical (fast)
+# Terrence's decision 2026-10-04 (form 20261004T181727-8798,
+# models=risk_based_default): Opus/`deep-review` only for work touching
+# auth, secrets, money, deploys/CI/build, data deletion or migrations, or
+# concurrency/races, and for plan/architect/design. Routine review uses
+# `review` (standard model, high effort) — a flat Opus-for-every-review
+# default burned budget on work that didn't need it.
 # `docs` moved fast -> standard 2026-09-05: restructuring a governance doc
 # (which rules have incidents behind them) came up Haiku and had to be
 # killed and respawned. Docs work is judgment work; only explore/quick/
@@ -123,7 +132,7 @@ answer_strategy_for_agent() {           # <agent> -> strategy
 # GRANT and printed "[managed default]", which reads like a decision rather
 # than a miss. An unrecognised class is withheld: a job nobody classified is
 # exactly the one nobody thought about.
-KNOWN_JOB_CLASSES="plan architect review design implement debug code docs explore research quick mechanical"
+KNOWN_JOB_CLASSES="plan architect review deep-review design implement debug code docs explore research quick mechanical"
 secrets_default_for_job() {  # <job-class> -> "withhold" | ""
 	case "$1" in
 		*review*|*explore*|*audit*|*scrape*|*research*|*triage*) printf 'withhold\n'; return ;;
@@ -137,26 +146,31 @@ secrets_default_for_job() {  # <job-class> -> "withhold" | ""
 model_for_agent() {
   local a="$1" j="$2"
   case "$a:$j" in
-    claude:plan|claude:architect|claude:review|claude:design)   printf 'opus\n' ;;
-    claude:implement|claude:debug|claude:code|claude:docs)      printf 'sonnet\n' ;;
+    claude:deep-review)                                          printf 'opus\n' ;;
+    claude:plan|claude:architect|claude:design)                  printf 'opus\n' ;;
+    claude:review|claude:implement|claude:debug|claude:code|claude:docs) printf 'sonnet\n' ;;
     claude:explore|claude:quick|claude:mechanical)               printf 'haiku\n' ;;
     claude:*)                                                   printf 'sonnet\n' ;;
     # omc launches the real claude binary (cli_for_agent below), so it uses
     # claude's model aliases. These rows were MISSING until 2026-09-04:
     # model_for_agent returned empty for omc, and spawn-task.sh then built
     # `claude --model ` — a broken launch that looked routed but wasn't.
-    omc:plan|omc:architect|omc:review|omc:design)               printf 'opus\n' ;;
-    omc:implement|omc:debug|omc:code|omc:docs)                  printf 'sonnet\n' ;;
-    omc:explore|omc:quick|omc:mechanical)                       printf 'haiku\n' ;;
-    omc:*)                                                      printf 'sonnet\n' ;;
-    codex:plan|codex:architect|codex:review|codex:design)        printf '%s\n' "$HERDR_CODEX_DEEP" ;;
-    codex:implement|codex:debug|codex:code|codex:docs)           printf '%s\n' "$HERDR_CODEX_STD" ;;
-    codex:explore|codex:quick|codex:mechanical)                  printf '%s\n' "$HERDR_CODEX_FAST" ;;
-    codex:*)                                                     printf '%s\n' "$HERDR_CODEX_STD" ;;
+    omc:deep-review)                                             printf 'opus\n' ;;
+    omc:plan|omc:architect|omc:design)                           printf 'opus\n' ;;
+    omc:review|omc:implement|omc:debug|omc:code|omc:docs)        printf 'sonnet\n' ;;
+    omc:explore|omc:quick|omc:mechanical)                        printf 'haiku\n' ;;
+    omc:*)                                                       printf 'sonnet\n' ;;
+    codex:deep-review)                                            printf '%s\n' "$HERDR_CODEX_DEEP" ;;
+    codex:plan|codex:architect|codex:design)                      printf '%s\n' "$HERDR_CODEX_DEEP" ;;
+    codex:review|codex:implement|codex:debug|codex:code|codex:docs) printf '%s\n' "$HERDR_CODEX_STD" ;;
+    codex:explore|codex:quick|codex:mechanical)                   printf '%s\n' "$HERDR_CODEX_FAST" ;;
+    codex:*)                                                      printf '%s\n' "$HERDR_CODEX_STD" ;;
     # omp's reasoning dial is --thinking (off/minimal/low/medium/high/xhigh/max).
     # Verified 2026-07-31 (`omp --help`, live `omp -p` call): `--model <alias>`
     # fuzzy-matches opus/sonnet/haiku the same as Claude Code.
-    omp:plan|omp:architect|omp:review|omp:design)               printf 'opus:high\n' ;;
+    omp:deep-review)                                              printf 'opus:high\n' ;;
+    omp:plan|omp:architect|omp:design)                            printf 'opus:high\n' ;;
+    omp:review)                                                   printf 'sonnet:high\n' ;;
     omp:implement|omp:debug|omp:code|omp:docs)                  printf 'sonnet:medium\n' ;;
     omp:explore|omp:quick|omp:mechanical)                       printf 'haiku:low\n' ;;
     omp:*)                                                      printf 'sonnet:medium\n' ;;
@@ -278,10 +292,10 @@ omp_cross_family_model() {   # <from-agent> <bare-model-name> -> "<omp-model> <t
 #   implement|debug|code|docs|mechanical|quick
 #                                  -> read,bash,edit,write,grep,glob,todo,eval,wait,ask
 #   explore                        -> read,bash,grep,glob,todo,web_search,ask
-#   plan|architect|review|design,
+#   plan|architect|review|design|deep-review,
 #   and any unrecognised class     -> "" (all tools — unrestricted)
 #
-# plan/architect/review/design stay unrestricted rather than losing write/
+# plan/architect/review/design/deep-review stay unrestricted rather than losing write/
 # edit: nothing in this codebase enforces that a `review` job never writes
 # (it still has to leave notes in PROOF.md, and a reviewer occasionally
 # proposes a diff), so a blanket "reviewers never edit" tool cut would be a
@@ -306,7 +320,7 @@ tools_for_job() {  # <job-class> -> comma-separated --tools value, or "" for unr
     # the way implement/debug/etc above get. `git: none` (the allowlist's
     # default ceiling for these job classes) still stops a pushed branch.
     explore|research)                           printf 'read,bash,write,grep,glob,todo,web_search,ask\n' ;;
-    *)                             printf '\n' ;;   # plan/architect/review/design + unrecognised: unrestricted
+    *)                             printf '\n' ;;   # plan/architect/review/design/deep-review + unrecognised: unrestricted
   esac
 }
 
