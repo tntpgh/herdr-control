@@ -341,6 +341,128 @@ while IFS= read -r line; do
   esac
 done < "$work/r1.out"
 
+printf '== E: F3 — handoffs_write also narrows bash, not just the write tool ==\n'
+# Before the fix every escalate row below auto-allowed: peer_decide never saw
+# handoffs_write, and the outer #184 hook only proves "inside the worktree".
+rm -f "$wt/.handoffs/ANSWER.md"; mkdir -p "$wt/tmp"
+bash_case() {                           # want(allow|escalate) command
+  local want="$1" c="$2" out rc d
+  out="$(enf bash "$(jq -nc --arg c "$c" '{command:$c}')")"; rc=$?
+  d="$(printf '%s' "$out" | field decision)"
+  if [ "$want" = allow ]; then
+    [ "$rc" = 0 ] && [ "$d" = allow ] && ok "F3 allow: $c" || not_ok "F3 expected allow for [$c], got rc=$rc: $out"
+  else
+    [ "$rc" = 8 ] && [ -n "$(printf '%s' "$out" | field request_id)" ] && printf '%s' "$out" | field reason | grep -q 'restricts writes to .handoffs/ANSWER.md only' \
+      && ok "F3 escalate: $c" || not_ok "F3 expected handoffs-write escalation for [$c], got rc=$rc: $out"
+  fi
+}
+while IFS='|' read -r want c; do
+  [ -n "$want" ] && bash_case "$want" "$c"
+done <<'EOF'
+allow|echo x > .handoffs/ANSWER.md
+allow|printf x | tee .handoffs/ANSWER.md
+allow|echo x > tmp/scratch.txt
+allow|echo x > /tmp/f3-scratch-new
+allow|cat README.md
+allow|grep -rn foo . | head -5
+allow|git log --oneline -3
+allow|git diff HEAD -- src
+allow|find . -name '*.py' -type f
+allow|rg -n foo src | sort | head -20
+allow|mkdir -p tmp/work && echo x > tmp/work/notes.txt
+escalate|echo x > src/x.py
+escalate|echo x > .handoffs/OTHER.md
+escalate|echo x >> README.md
+escalate|cd src && echo x > a.txt
+escalate|echo x > tmp/../src/x.py
+escalate|cat <<X > src/y.py
+escalate|printf x | tee src/x.py
+escalate|cp README.md src/copy.md
+escalate|mv README.md src/moved.md
+escalate|touch src/new
+escalate|mkdir src/d
+escalate|ln -s ../x .handoffs/ANSWER.md
+escalate|sed -i '' s/a/b/ README.md
+escalate|bash -c 'echo x > src/c'
+escalate|tar -xf a.tar -C src
+escalate|rsync a src/b
+escalate|curl -o src/page.html https://example.com
+escalate|perl -pi -e s/a/b/ README.md
+escalate|awk '{print > "src/out"}' README.md
+escalate|python3 -c 'open("src/p","w")'
+escalate|node -e 'require("fs").writeFileSync("src/n","x")'
+escalate|make
+escalate|echo x > ../outside
+escalate|tar -xf a.tar
+escalate|cc -o src/evil tmp/x.c
+escalate|timeout 5 cat README.md > src/a
+escalate|sed -n p README.md
+escalate|git -C src log
+escalate|git checkout -- README.md
+escalate|rg --pre ./tmp/x foo
+escalate|cp -l src/x tmp/hl
+escalate|cat "$(echo x > src/evil)"
+escalate|printf '%s' "$(echo x > src/evil-2)"
+escalate|cat `echo x > src/evil-3`
+escalate|X=$(echo x > src/evil-4) cat README.md
+escalate|git diff -osrc/git-glued-output
+escalate|git show -osrc/x HEAD
+escalate|git -Csrc log
+escalate|git log --output=src/x
+escalate|git diff --ext-diff
+escalate|nice tee tmp/out
+escalate|GIT_EXTERNAL_DIFF=./tmp/x git diff
+escalate|LC_ALL=C grep foo README.md
+EOF
+# These are refused by peer_decide before F3 runs (find -exec/-delete, xargs,
+# $VAR, unreviewable scripts, the env credential rule); they must stay refused.
+for c in 'find . -name a -exec cp {} src/b \;' 'find . -name a -delete' 'echo src/z | xargs touch' 'echo x > "$OUT"' 'python3 tmp/probe.py' 'timeout 5 python3 tmp/p.py' "env -S \"python3 -c 'open(\\\"src/a\\\",\\\"w\\\")'\"" 'env --chdir=src tee tmp/out' 'env -C src touch tmp/out'; do
+  out="$(enf bash "$(jq -nc --arg c "$c" '{command:$c}')")"; rc=$?
+  [ "$rc" = 8 ] && ok "F3 still refused: $c" || not_ok "F3 expected refusal for [$c], got rc=$rc: $out"
+done
+# The deliverable itself replaced by a symlink: a bash redirect must refuse too.
+ln -s ../src/x "$wt/.handoffs/ANSWER.md"
+out="$(enf bash '{"command":"echo x > .handoffs/ANSWER.md"}')"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'symlink' \
+  && ok "F3: bash redirect into a symlinked ANSWER.md escalates" || not_ok "F3 symlinked ANSWER.md: rc=$rc: $out"
+rm -f "$wt/.handoffs/ANSWER.md"
+# Link planting through scratch or the deliverable (Zero review scope): every
+# allowed target is resolved on disk, never matched lexically.
+link_case() {                           # label command
+  local out rc
+  out="$(enf bash "$(jq -nc --arg c "$2" '{command:$c}')")"; rc=$?
+  [ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -qE 'symlink|hard link|restricts writes' \
+    && ok "F3 link: $1" || not_ok "F3 link [$1] expected escalation, got rc=$rc: $out"
+}
+printf 'tracked\n' > "$wt/src/victim"
+ln "$wt/src/victim" "$wt/.handoffs/ANSWER.md"
+link_case "ANSWER.md hard-linked to src/victim" 'echo x > .handoffs/ANSWER.md'
+rm -f "$wt/.handoffs/ANSWER.md"
+ln -s ../src/victim "$wt/tmp/sl"
+link_case "tmp/ file is a symlink into src/" 'echo x > tmp/sl'
+rm -f "$wt/tmp/sl"
+ln "$wt/src/victim" "$wt/tmp/hl"
+link_case "tmp/ file is a hard link to src/victim" 'echo x > tmp/hl'
+rm -f "$wt/tmp/hl"
+mv "$wt/tmp" "$wt/tmp.real"; ln -s src "$wt/tmp"
+link_case "tmp/ itself is a symlink to src/" 'echo x > tmp/new.txt'
+rm -f "$wt/tmp"; mv "$wt/tmp.real" "$wt/tmp"
+tlnk="$(mktemp -u /tmp/f3-hl.XXXXXX)"; ln "$wt/src/victim" "$tlnk"
+link_case "/tmp file is a hard link to src/victim" "echo x > $tlnk"
+rm -f "$tlnk"; ln -s "$wt/src/victim" "$tlnk"
+link_case "/tmp file is a symlink into the worktree" "echo x > $tlnk"
+rm -f "$tlnk"
+mv "$wt/.handoffs" "$wt/.handoffs.real"; ln -s src "$wt/.handoffs"
+link_case ".handoffs itself is a symlink to src/" 'echo x > .handoffs/ANSWER.md'
+rm -f "$wt/.handoffs"; mv "$wt/.handoffs.real" "$wt/.handoffs"
+[ "$(cat "$wt/src/victim")" = tracked ] && ok "F3 link: src/victim untouched (judging only, nothing ran)" || not_ok "src/victim changed"
+bash_case allow 'echo x > tmp/sub/new.txt'
+# A task WITHOUT handoffs_write is unchanged (in-worktree bash write allowed).
+register_task run1 task_impl worker1 cond1 "$CPANE" "$CBIRTH" "$PANE" "$BIRTH" /repo "$wt" impl:task_impl feat/y main "" '{}' hook >/dev/null
+set_task_state run1 task_impl running
+out="$(enf bash '{"command":"echo x > src/x.py"}' task_impl)"; rc=$?
+[ "$rc" = 0 ] && ok "F3: a task with no handoffs_write still allows in-worktree bash writes" || not_ok "F3 no-hw task: rc=$rc: $out"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi
