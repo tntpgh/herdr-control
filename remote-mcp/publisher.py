@@ -66,6 +66,15 @@ RESULT_READ_CAP = 1_000_000  # redaction runs over this much, then the result is
 RESULT_RESEND_S = 12 * 3600
 MAX_RESULTS_PER_SYNC = 50
 MAX_MESSAGE_CHARS = 2000
+# #225: exact mirror of the Worker's owner_replies .max(200) (state.ts
+# ~75); exceeding it trips bad_shape and rejects the WHOLE sync, not just
+# the overflow, so this is the one shared cap scan_owner_replies enforces
+# locally before anything is ever posted.
+OWNER_REPLIES_CAP = 200
+# Matches the Worker's own owner_messages retention (state.ts ~1314), so
+# the Mac-side copies (inbox/<label>/messages/, inbox/<label>/replies/sent/)
+# age out on the same schedule as the server-side rows they mirror.
+OWNER_INBOX_RETENTION_DAYS = 30
 # The Worker leases a message for 90 s and re-checks policy only at lease time.
 # Anything not typed within this many seconds of the lease goes back (retry) so
 # the next lease re-checks it: the in-flight window is bounded by the lease,
@@ -618,8 +627,13 @@ def _resolve_inbox_leaf(label: str, kind: str, name: str) -> Path | None:
     replies/ directory, or the label directory itself, made to point
     elsewhere -- not just a symlinked leaf file. Returns None for a path
     that does not exist OR escapes containment; the caller cannot tell
-    which, by design (both mean "nothing safe to read here")."""
-    if not OWNER_LABEL_RE.match(label) or kind not in ("messages", "replies") or not EXCHANGE_ID_RE.match(name):
+    which, by design (both mean "nothing safe to read here").
+
+    kind "replies/sent" (#225) is the durable "already acked" tree: a
+    reply moved here by _move_reply_to_sent after a sync carrying it
+    returned 200. Same containment shape as "messages"/"replies", just
+    one path segment deeper."""
+    if not OWNER_LABEL_RE.match(label) or kind not in ("messages", "replies", "replies/sent") or not EXCHANGE_ID_RE.match(name):
         return None
     suffix = f"/{label}/{kind}/{name}.md"
     candidate = Path(f"{INBOX_ROOT}{suffix}")
@@ -753,15 +767,32 @@ def _split_reply_header(text: str) -> tuple[dict[str, str], str]:
     return header, rest
 
 
-def scan_owner_replies(already_sent: set) -> list[dict]:
-    """New files under inbox/<label>/replies/ since the last tick a sync
-    actually succeeded (already_sent, state.json). owner_label comes from
-    the DIRECTORY the file was found in; `session` is left blank here and
-    filled in by the caller from the Mac's own live registry read -- never
-    from the file's own claimed header (SPEC: the reply's header is
-    untrusted; only its exchange_id, used as the filename, is a
-    correlation key, and even that is re-validated against the real row
-    server-side, never trusted from this scan alone).
+def scan_owner_replies(cap: int = OWNER_REPLIES_CAP) -> list[dict]:
+    """Every file under inbox/<label>/replies/ (not yet moved to
+    inbox/<label>/replies/sent/) is, by definition, unacked (#225): this
+    module ONLY moves a reply out of replies/ in _move_reply_to_sent,
+    called from main() after a sync that carried it returns 200. So
+    presence in replies/ -- not a separate durable set -- IS "not yet
+    sent", with no window to fall out of: the old `sent_replies` state.json
+    list kept only the last 500 keys and silently forgot anything older
+    once ~700 reply files had ever existed, at which point every tick
+    re-posted the whole backlog and 400'd forever (issue #225).
+
+    Collected across every label, sorted oldest mtime first (ties broken
+    on the label/exchange_id key for determinism), and capped at `cap` --
+    one shared constant, OWNER_REPLIES_CAP, mirroring the Worker's own
+    owner_replies .max(200) exactly, since exceeding it rejects the WHOLE
+    sync, not just the overflow. A backlog over the cap simply waits: the
+    oldest `cap` replies go this tick, the rest are still sitting in
+    replies/ (never touched, never lost) and are picked up again next
+    tick once this tick's survivors have moved to sent/.
+
+    owner_label comes from the DIRECTORY the file was found in; `session`
+    is left blank here and filled in by the caller from the Mac's own live
+    registry read -- never from the file's own claimed header (SPEC: the
+    reply's header is untrusted; only its exchange_id, used as the
+    filename, is a correlation key, and even that is re-validated against
+    the real row server-side, never trusted from this scan alone).
 
     M3 (REVIEW-219): the header is now actually parsed (_split_reply_header)
     instead of silently ignored. A header that explicitly CLAIMS a
@@ -771,10 +802,18 @@ def scan_owner_replies(already_sent: set) -> list[dict]:
     internally-contradictory file is treated as untrustworthy rather than
     "probably fine". `artifact_revision` is read from the header instead of
     always being the empty string; still length-capped and still only a
-    claim the server re-validates, never trusted as-is."""
-    out: list[dict] = []
+    claim the server re-validates, never trusted as-is.
+
+    #225 item 4: a file this can't safely read (symlink, non-regular,
+    removed mid-scan, permission error), or one at/above RESULT_READ_CAP
+    (oversized -- read_regular would only hand back a cap-sized prefix,
+    and silently posting a chopped reply as if it were complete is worse
+    than not sending it this tick), is logged and skipped -- it never
+    raises, so one poisoned or oversized reply can never wedge the scan
+    for every other label's replies."""
+    candidates: list[tuple[float, str, dict]] = []
     if not INBOX_ROOT.is_dir():
-        return out
+        return []
     for label_dir in sorted(INBOX_ROOT.iterdir()):
         if not label_dir.is_dir() or not OWNER_LABEL_RE.match(label_dir.name):
             continue
@@ -784,14 +823,19 @@ def scan_owner_replies(already_sent: set) -> list[dict]:
         for f in sorted(replies_dir.glob("*.md")):
             exchange_id = f.stem
             key = f"{label_dir.name}/{exchange_id}"
-            if key in already_sent or not EXCHANGE_ID_RE.match(exchange_id):
+            if not EXCHANGE_ID_RE.match(exchange_id):
                 continue
             path = _resolve_inbox_leaf(label_dir.name, "replies", exchange_id)
             if path is None:
                 continue  # symlink, or otherwise unsafe: silently skipped, never read
             try:
                 raw, mtime_iso = read_regular(path)
-            except OSError:
+                mtime_s = path.stat().st_mtime
+            except OSError as exc:
+                log(f"owner reply {key} skipped (unreadable): {exc}")
+                continue
+            if len(raw) >= RESULT_READ_CAP:
+                log(f"owner reply {key} skipped (oversized, >= {RESULT_READ_CAP} bytes)")
                 continue
             header, body_text = _split_reply_header(raw.decode("utf-8", "replace"))
             claimed_eid = header.get("exchange_id")
@@ -802,12 +846,42 @@ def scan_owner_replies(already_sent: set) -> list[dict]:
             if claimed_label and claimed_label != label_dir.name:
                 log(f"owner reply {key} refused: header claims owner_label {claimed_label!r}")
                 continue
-            out.append({"exchange_id": exchange_id, "owner_label": label_dir.name,
+            candidates.append((mtime_s, key, {"exchange_id": exchange_id, "owner_label": label_dir.name,
                         "body": redact(body_text).strip()[:MAX_MESSAGE_CHARS],
                         "responded_at": mtime_iso or iso(time.time()),
                         "artifact_revision": header.get("artifact_revision", "")[:200],
-                        "session": "", "_key": key})
-    return out
+                        "session": "", "_key": key}))
+    candidates.sort(key=lambda t: (t[0], t[1]))
+    return [row for _, _, row in candidates[:cap]]
+
+
+def _move_reply_to_sent(label: str, exchange_id: str) -> bool:
+    """Called ONLY from main() after a sync that carried this reply
+    returned 200 (#225 item 2): moves inbox/<label>/replies/<id>.md to
+    inbox/<label>/replies/sent/<id>.md. Presence under replies/sent/ IS the
+    durable "already acked" record scan_owner_replies reads by omission --
+    there is no separate set to maintain, back up, or let fall out of a
+    window. A reply not yet moved here (sync failed before this ran, or the
+    move itself failed) is simply found again by scan_owner_replies next
+    tick, exactly like any other unsent file; the Worker's own dedupe
+    (state.ts ~1028, `status != 'delivered'` skips the row) means a
+    retried move, or a retried send caused by one, is never double-acted
+    on server-side either."""
+    src = _resolve_inbox_leaf(label, "replies", exchange_id)
+    if src is None:
+        return False
+    try:
+        sent_dir = src.parent / "sent"
+        sent_dir.mkdir(mode=0o700, exist_ok=True)
+        root = INBOX_ROOT.resolve(strict=True)
+        if sent_dir.resolve(strict=True) != root / label / "replies" / "sent":
+            log(f"owner reply {label}/{exchange_id} sent-move refused: a symlink stands in for the sent directory")
+            return False
+        os.replace(src, sent_dir / f"{exchange_id}.md")
+        return True
+    except OSError as exc:
+        log(f"owner reply {label}/{exchange_id} sent-move failed: {exc}")
+        return False
 
 
 def _last_assistant_text(raw: bytes) -> str | None:
@@ -1081,6 +1155,86 @@ def append_audit(rows: list[dict]) -> None:
             f.write(json.dumps(r, separators=(",", ":")) + "\n")
 
 
+def _sha256_file(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def prune_inbox(owner_message_delivered: dict, now_s: float) -> set:
+    """Bounded retention for the owner inbox tree (#225 item 3), matching
+    the Worker's own 30-day owner_messages retention (state.ts ~1314) so
+    the two sides age out on the same schedule. Deletes only:
+      - inbox/<label>/messages/<id>.md whose exchange_id is a key in
+        owner_message_delivered (this Mac actually typed the notice into
+        the owner's pane -- the durable, never-time-windowed record of
+        that, set in main()'s owner_outbox loop) AND whose mtime is older
+        than OWNER_INBOX_RETENTION_DAYS;
+      - inbox/<label>/replies/sent/<id>.md older than
+        OWNER_INBOX_RETENTION_DAYS (already acked by definition: nothing
+        reaches replies/sent/ except via _move_reply_to_sent, called only
+        after a sync carrying it returned 200).
+    A message never confirmed delivered, or a reply still sitting in
+    replies/ (unacked), is NEVER touched here, however old -- SPEC item 3.
+    Every delete is audited (id, label, mtime, sha256) via the existing
+    publisher audit log BEFORE the unlink, so a bug here stays provable
+    even if the file is already gone. Returns the set of message exchange
+    ids actually pruned, so the caller can drop them from the durable
+    owner_message_delivered map and stop it growing forever."""
+    pruned_messages: set = set()
+    if not INBOX_ROOT.is_dir():
+        return pruned_messages
+    cutoff = now_s - OWNER_INBOX_RETENTION_DAYS * 86_400
+    rows: list[dict] = []
+    for label_dir in sorted(INBOX_ROOT.iterdir()):
+        if not label_dir.is_dir() or not OWNER_LABEL_RE.match(label_dir.name):
+            continue
+        label = label_dir.name
+        for f in sorted((label_dir / "messages").glob("*.md")) if (label_dir / "messages").is_dir() else []:
+            exchange_id = f.stem
+            if exchange_id not in owner_message_delivered or not EXCHANGE_ID_RE.match(exchange_id):
+                continue  # never delivered (or not provably so): never touched
+            path = _resolve_inbox_leaf(label, "messages", exchange_id)
+            if path is None:
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= cutoff:
+                continue
+            rows.append({"kind": "prune", "tree": "messages", "id": exchange_id, "label": label,
+                         "mtime": iso(mtime), "sha256": _sha256_file(path)})
+            try:
+                path.unlink()
+                pruned_messages.add(exchange_id)
+            except OSError as exc:
+                log(f"owner inbox prune: failed to delete messages/{label}/{exchange_id}: {exc}")
+        sent_dir = label_dir / "replies" / "sent"
+        for f in sorted(sent_dir.glob("*.md")) if sent_dir.is_dir() else []:
+            exchange_id = f.stem
+            if not EXCHANGE_ID_RE.match(exchange_id):
+                continue
+            path = _resolve_inbox_leaf(label, "replies/sent", exchange_id)
+            if path is None:
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= cutoff:
+                continue
+            rows.append({"kind": "prune", "tree": "replies/sent", "id": exchange_id, "label": label,
+                         "mtime": iso(mtime), "sha256": _sha256_file(path)})
+            try:
+                path.unlink()
+            except OSError as exc:
+                log(f"owner inbox prune: failed to delete replies/sent/{label}/{exchange_id}: {exc}")
+    append_audit(rows)
+    return pruned_messages
+
+
 def main(argv: list[str]) -> int:
     os.umask(0o077)  # state.json / audit.jsonl carry emails and client ids
     if "--print-key-fingerprint" in argv:  # identity, never the value (provision.sh compares it to 1Password)
@@ -1117,9 +1271,10 @@ def main(argv: list[str]) -> int:
     # Replies are independent of leasing -- scanned and sent every tick they
     # exist, not gated behind "lease". `session` is filled in HERE, from the
     # Mac's own live registry read, never from the reply file itself (SPEC:
-    # the file's header is untrusted).
-    sent_replies = set(st.get("sent_replies", []))
-    owner_replies_raw = scan_owner_replies(sent_replies) if OWNER_INBOX_ON_MAC else []
+    # the file's header is untrusted). #225: no durable set to load here --
+    # a file still sitting in replies/ (not yet moved to replies/sent/) IS
+    # "unsent"; scan_owner_replies enforces the per-tick cap itself.
+    owner_replies_raw = scan_owner_replies() if OWNER_INBOX_ON_MAC else []
     owners_now = local.get("owners", {})
     owner_replies = [{**{k: v for k, v in r.items() if k != "_key"},
                        "session": _owner_session_token(r["owner_label"], owners_now.get(r["owner_label"], {}))}
@@ -1131,14 +1286,28 @@ def main(argv: list[str]) -> int:
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log(f"sync failed: {exc}")
         return 1
+    # #225 item 2: only now, after the Worker has actually accepted this
+    # tick's sync (200), do the replies that rode along in it get moved to
+    # replies/sent/ -- a reply whose sync failed above never reaches this
+    # line, so it is found unmoved by scan_owner_replies next tick, same as
+    # any other unsent reply.
+    for r in owner_replies_raw:
+        _move_reply_to_sent(r["owner_label"], r["exchange_id"])
     for r in results:
         st.setdefault("results", {})[f"{r['task_id']}:{r['source']}"] = {"sha256": r["sha256"], "sent_at": now.timestamp()}
     keep = {t["task_id"] for t in snapshot["tasks"]}
     st["results"] = {k: v for k, v in st.get("results", {}).items() if k.split(":", 1)[0] in keep}
     st["pending_acks"], st["pending_command_acks"], st["pending_owner_acks"] = [], [], []
-    st["sent_replies"] = sorted(sent_replies | {r["_key"] for r in owner_replies_raw})[-500:]
     append_audit(reply.get("audit") or [])
     st["audit_cursor"] = reply.get("audit_cursor", st.get("audit_cursor", 0))
+    if OWNER_INBOX_ON_MAC:
+        # #225 item 3: bounded retention runs every tick, independent of
+        # whether there is anything to deliver this time -- the early
+        # return just below would otherwise starve it on a quiet inbox.
+        pruned = prune_inbox(st.get("owner_message_delivered", {}), now.timestamp())
+        if pruned:
+            st["owner_message_delivered"] = {k: v for k, v in st.get("owner_message_delivered", {}).items()
+                                              if k not in pruned}
     save_state(st)
 
     outbox = reply.get("outbox") or []
@@ -1192,6 +1361,13 @@ def main(argv: list[str]) -> int:
                 continue  # M1: couldn't refresh identity this tick (hub hiccup); retried next tick
             if a["outcome"] == "delivered":
                 owner_delivered[eid] = now.timestamp()
+                # #225 item 3: owner_delivered above is a 24h cache for
+                # ack-retry dedup and is pruned by that window; prune_inbox
+                # needs "was this ever actually typed into the owner's
+                # pane" to survive to 30 days, so it gets its own
+                # never-time-filtered map, trimmed only when prune_inbox
+                # deletes the matching messages/ file.
+                st.setdefault("owner_message_delivered", {})[eid] = now.timestamp()
         log(f"owner message {eid}: {a['outcome']} ({a.get('reason', '')})")
         new_owner_acks.append(a)
         st["owner_delivered"], st["pending_owner_acks"] = owner_delivered, new_owner_acks
