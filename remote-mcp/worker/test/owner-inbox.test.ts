@@ -15,7 +15,7 @@ const fleet = () => e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet"));
 
 interface SyncReply { owner_outbox: { exchange_id: string; owner_label: string; body: string }[];
   audit: { tool: string; decision: string; reason: string; message_id: string }[];
-  owner_reply_results: { exchange_id: string; outcome: string }[] }
+  owner_reply_results: { exchange_id: string; owner_label: string; outcome: string }[] }
 const syncJson = async (r: Response): Promise<SyncReply> => r.json();
 
 const ownerSnapshot = (labels: { label: string; live: boolean }[] = [{ label: "conductor", live: true }]) =>
@@ -178,7 +178,7 @@ describe("get_owner_reply", () => {
     const first = await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [replyBody] })));
     // #225 review H1: the Mac only moves a reply to replies/sent/ once it
     // sees "accepted" (or "duplicate") here -- a 200 alone is not enough.
-    expect(first.owner_reply_results).toEqual([{ exchange_id: id, outcome: "accepted" }]);
+    expect(first.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "accepted" }]);
 
     const mine = await callTool<{ reply: OwnerReplyRecord }>(access_token, "get_owner_reply", { exchange_id: id });
     expect(mine.data.reply).toMatchObject({ exchange_id: id, owner_label: "conductor", body: "ok, done", session: "w5B:pG" });
@@ -190,7 +190,7 @@ describe("get_owner_reply", () => {
     // the Mac still moves it to replies/sent/ rather than resending it
     // forever.
     const retry = await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [replyBody] })));
-    expect(retry.owner_reply_results).toEqual([{ exchange_id: id, outcome: "duplicate" }]);
+    expect(retry.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "duplicate" }]);
 
     // ALLOWED_EMAILS is a single address in this deployment, so "someone
     // else" cannot be reached through the real OAuth flow; call the
@@ -198,6 +198,30 @@ describe("get_owner_reply", () => {
     // edge cases a live token can never reach.
     const theirs = await runInDurableObject(fleet(), (o: HerdrState) => o.ownerReply(id, "intruder@teamthurber.com"));
     expect(theirs).toBeNull();
+  });
+
+  it("reports ignored:replied (not duplicate) when a resend's body differs from what was stored (REVIEW-225-r2 N3)", async () => {
+    await signedSync(syncBody({ snapshot: ownerSnapshot() }));
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const id = await deliveredExchange(access_token);
+
+    await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [
+      { exchange_id: id, owner_label: "conductor", body: "v1: approve", responded_at: new Date().toISOString(),
+        artifact_revision: "", session: "w1:p1" },
+    ] }));
+    // The owner changes their mind and re-sends a DIFFERENT body for the
+    // same exchange -- the Worker only ever stored v1; this must NEVER
+    // be reported as "duplicate" (which the Mac reads as "safe to treat
+    // as sent"), since the Mac would then move v2 into replies/sent/ as
+    // if it had been delivered, with no record it was actually dropped.
+    const second = await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [
+      { exchange_id: id, owner_label: "conductor", body: "v2: actually, REJECT -- changed my mind",
+        responded_at: new Date().toISOString(), artifact_revision: "", session: "w1:p1" },
+    ] })));
+    expect(second.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "ignored:replied" }]);
+
+    const mine = await callTool<{ reply: OwnerReplyRecord }>(access_token, "get_owner_reply", { exchange_id: id });
+    expect(mine.data.reply.body).toBe("v1: approve"); // the Worker's stored copy is still v1, untouched by v2
   });
 
   it("reports ignored:queued for a reply that arrives before the message is delivered", async () => {
@@ -215,7 +239,7 @@ describe("get_owner_reply", () => {
       owner_replies: [{ exchange_id: id, owner_label: "conductor", body: "too early", responded_at: new Date().toISOString(),
         artifact_revision: "", session: "w1:p1" }],
     })));
-    expect(reply.owner_reply_results).toEqual([{ exchange_id: id, outcome: "ignored:queued" }]);
+    expect(reply.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "ignored:queued" }]);
     const status = await callTool<{ owner_message: OwnerMessageRecord }>(access_token, "get_owner_message_status", { exchange_id: id });
     expect(status.data.owner_message.status).toBe("queued"); // untouched, not silently consumed
   });
@@ -230,7 +254,7 @@ describe("get_owner_reply", () => {
       owner_replies: [{ exchange_id: id, owner_label: "other-tab", body: "spoofed", responded_at: new Date().toISOString(),
         artifact_revision: "", session: "w1:pX" }],
     })));
-    expect(reply.owner_reply_results).toEqual([{ exchange_id: id, outcome: "ignored:missing" }]);
+    expect(reply.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "other-tab", outcome: "ignored:missing" }]);
 
     const status = await callTool<{ owner_message: OwnerMessageRecord }>(access_token, "get_owner_message_status", { exchange_id: id });
     expect(status.data.owner_message.status).toBe("delivered");
@@ -282,7 +306,7 @@ describe("get_owner_reply", () => {
     // -- "ignored:blocked:..." (the status column's real value), never a
     // bare 200 the Mac would read as proof of delivery.
     expect(lateOutcome.ok && lateOutcome.response.owner_reply_results)
-      .toEqual([{ exchange_id: id, outcome: "ignored:blocked:sender_revoked" }]);
+      .toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "ignored:blocked:sender_revoked" }]);
 
     const after = await runInDurableObject(fleet(), (o: HerdrState) => o.ownerMessageStatus(id, "tnt@teamthurber.com"));
     expect([after?.status, after?.detail]).toEqual(["blocked:sender_revoked", "sender_revoked"]);

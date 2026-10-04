@@ -102,10 +102,18 @@ export interface SyncResponse {
   // row's status was not 'delivered') -- a 200 response alone was being
   // read as universal acceptance, which let a dropped reply get pruned at
   // 30 days without the Worker ever having seen it. outcome is one of
-  // "accepted" | "duplicate" (status was already 'replied') |
-  // `ignored:${status}` (row missing/label mismatch -> "ignored:missing",
-  // otherwise the row's own status, e.g. "ignored:queued").
-  owner_reply_results: { exchange_id: string; outcome: string }[];
+  // "accepted" | "duplicate" (status already 'replied' AND the stored
+  // reply_body matches this resend -- #225 review round 3 N3) |
+  // "ignored:replied" (status already 'replied' but with a DIFFERENT
+  // body: the owner changed their mind after the Worker stored the
+  // first reply) | `ignored:${status}` (row missing/label mismatch ->
+  // "ignored:missing", otherwise the row's own status, e.g.
+  // "ignored:queued"). owner_label is always the REQUESTED label from
+  // the reply itself (#225 review round 3 N1), echoed back so the Mac
+  // can key results by (owner_label, exchange_id) -- matching by
+  // exchange_id alone would let a reply misfiled under the wrong label
+  // directory be matched against a DIFFERENT exchange's real result.
+  owner_reply_results: { exchange_id: string; owner_label: string; outcome: string }[];
 }
 
 export type SyncOutcome = { ok: true; response: SyncResponse } | { ok: false; status: number; reason: string };
@@ -1035,23 +1043,35 @@ export class HerdrState extends DurableObject<Env> {
     // 'blocked:sender_revoked' after delivery) or any other blocked/queued
     // state, and a second report of an already-replied exchange is ignored
     // (idempotent against a re-synced file).
-    const ownerReplyResults: { exchange_id: string; outcome: string }[] = [];
+    const ownerReplyResults: { exchange_id: string; owner_label: string; outcome: string }[] = [];
     for (const r of body.owner_replies ?? []) {
-      const m = this.sql.exec<{ owner_label: string; status: string }>(
-        `SELECT owner_label, status FROM owner_messages WHERE exchange_id=?`, r.exchange_id).toArray()[0];
+      // #225 review round 3 N1: a reply file under the WRONG label
+      // directory (same exchange_id, different owner_label claim) must
+      // never be matched against the right one by exchange_id alone --
+      // echo back the REQUESTED owner_label on every result so the Mac
+      // can key by (owner_label, exchange_id), not exchange_id alone.
+      const m = this.sql.exec<{ owner_label: string; status: string; reply_body: string | null }>(
+        `SELECT owner_label, status, reply_body FROM owner_messages WHERE exchange_id=?`, r.exchange_id).toArray()[0];
       if (!m || m.owner_label !== r.owner_label) {
-        ownerReplyResults.push({ exchange_id: r.exchange_id, outcome: "ignored:missing" });
+        ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome: "ignored:missing" });
         continue;
       }
       if (m.status === "replied") {
-        // already accepted by an earlier sync -- idempotent re-send of the
-        // same file (a retried tick, or the Mac resending after a lost
-        // ack): tell the Mac it is safe to treat this as accepted too.
-        ownerReplyResults.push({ exchange_id: r.exchange_id, outcome: "duplicate" });
+        // #225 review round 3 N3: "duplicate" must mean the Worker
+        // actually stored THIS text, not merely that the exchange was
+        // already replied to -- an owner who changes their mind and
+        // re-sends a DIFFERENT body must never have the second file
+        // silently treated as equivalent to the first (which is all the
+        // Worker ever recorded). Only an exact re-send of the stored
+        // body is a true duplicate (a retried tick, or a resend after a
+        // lost ack); any other second body is ignored:replied, which the
+        // Mac routes to replies/rejected/, never sent/.
+        const outcome = m.reply_body === r.body ? "duplicate" : "ignored:replied";
+        ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome });
         continue;
       }
       if (m.status !== "delivered") {
-        ownerReplyResults.push({ exchange_id: r.exchange_id, outcome: `ignored:${m.status}` });
+        ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome: `ignored:${m.status}` });
         continue;
       }
       const respondedMs = Date.parse(r.responded_at);
@@ -1059,7 +1079,7 @@ export class HerdrState extends DurableObject<Env> {
           reply_artifact_revision=?, replied_at=?, updated_at=? WHERE exchange_id=?`,
         r.body, r.session, r.artifact_revision, Number.isFinite(respondedMs) ? respondedMs : nowMs, nowMs, r.exchange_id);
       this.audit(nowMs, { ...sys, target: m.owner_label, decision: "replied", reason: "", message_id: r.exchange_id, detail: "" });
-      ownerReplyResults.push({ exchange_id: r.exchange_id, outcome: "accepted" });
+      ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome: "accepted" });
     }
 
     // A queued message was valid when it was sent, not necessarily now. Before

@@ -21,6 +21,7 @@ Exit 0 on success, 1 when the Worker or the hub was unreachable (logged).
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -889,6 +890,34 @@ def scan_owner_replies(cap: int = OWNER_REPLIES_CAP) -> list[dict]:
     return [row for _, _, row in candidates[:cap]]
 
 
+def _link_move_no_overwrite(src: Path, dest_dir: Path, exchange_id: str) -> tuple[Path, bool]:
+    """#225 review round 3 I2: os.link fails atomically with
+    FileExistsError if the destination already exists, closing the
+    TOCTOU window the previous dest.exists()-then-os.replace() left open
+    (a concurrent same-uid writer could slip a file in between the check
+    and the write; launchd never runs two ticks at once, but this is now
+    race-free regardless). Tries <id>.md first, then <id>-dup1.md,
+    <id>-dup2.md, ... until a link succeeds -- each attempt is itself
+    atomic, so two callers (or two attempts of the same call) can never
+    collide on one destination. The caller unlinks `src` once this
+    returns, completing the move; this function never touches src.
+    Returns (dest_path, was_dup)."""
+    dest = dest_dir / f"{exchange_id}.md"
+    try:
+        os.link(src, dest)
+        return dest, False
+    except FileExistsError:
+        pass
+    n = 1
+    while True:
+        dup_dest = dest_dir / f"{exchange_id}-dup{n}.md"
+        try:
+            os.link(src, dup_dest)
+            return dup_dest, True
+        except FileExistsError:
+            n += 1
+
+
 def _move_reply_to_sent(label: str, exchange_id: str) -> bool:
     """Called ONLY from main() once the Worker's sync response says this
     exchange_id's outcome was "accepted" or "duplicate" (#225 review H1 --
@@ -905,7 +934,8 @@ def _move_reply_to_sent(label: str, exchange_id: str) -> bool:
     second file at this exchange_id (the owner re-wrote replies/<id>.md
     after the Worker already said 'replied', or a partial-write race)
     is kept SEPARATELY as sent/<id>-dupN.md and audited, never silently
-    replacing the text the Worker actually accepted."""
+    replacing the text the Worker actually accepted. I2 (#225 review
+    round 3): the no-overwrite check itself is race-free (_link_move_no_overwrite)."""
     src = _resolve_inbox_leaf(label, "replies", exchange_id)
     if src is None:
         return False
@@ -916,20 +946,14 @@ def _move_reply_to_sent(label: str, exchange_id: str) -> bool:
         if sent_dir.resolve(strict=True) != root / label / "replies" / "sent":
             log(f"owner reply {label}/{exchange_id} sent-move refused: a symlink stands in for the sent directory")
             return False
-        dest = sent_dir / f"{exchange_id}.md"
-        if dest.exists():
-            n = 1
-            while (sent_dir / f"{exchange_id}-dup{n}.md").exists():
-                n += 1
-            dup_dest = sent_dir / f"{exchange_id}-dup{n}.md"
-            os.replace(src, dup_dest)
+        dest, was_dup = _link_move_no_overwrite(src, sent_dir, exchange_id)
+        os.unlink(src)
+        if was_dup:
             try:
-                append_audit([{"kind": "reply_dup_kept", "id": exchange_id, "label": label, "dup_path": dup_dest.name}])
+                append_audit([{"kind": "reply_dup_kept", "id": exchange_id, "label": label, "dup_path": dest.name}])
             except OSError as exc:
                 log(f"owner reply {label}/{exchange_id} dup-kept audit failed: {exc}")
-            log(f"owner reply {label}/{exchange_id}: sent/{exchange_id}.md already exists; kept as {dup_dest.name}")
-            return True
-        os.replace(src, dest)
+            log(f"owner reply {label}/{exchange_id}: sent/{exchange_id}.md already exists; kept as {dest.name}")
         return True
     except OSError as exc:
         log(f"owner reply {label}/{exchange_id} sent-move failed: {exc}")
@@ -943,7 +967,9 @@ def _move_reply_to_rejected(label: str, exchange_id: str) -> bool:
     transient "ignored:queued"/"ignored:delivering" is left untouched in
     replies/ to retry, never moved here. prune_inbox NEVER touches
     replies/rejected/ -- kept for a human to look at, not silently
-    deleted the way a dropped reply used to be before this fix."""
+    deleted the way a dropped reply used to be before this fix. I2 (#225
+    review round 3): uses the same race-free link-then-unlink move as
+    _move_reply_to_sent."""
     src = _resolve_inbox_leaf(label, "replies", exchange_id)
     if src is None:
         return False
@@ -954,13 +980,8 @@ def _move_reply_to_rejected(label: str, exchange_id: str) -> bool:
         if rej_dir.resolve(strict=True) != root / label / "replies" / "rejected":
             log(f"owner reply {label}/{exchange_id} rejected-move refused: a symlink stands in for the rejected directory")
             return False
-        dest = rej_dir / f"{exchange_id}.md"
-        if dest.exists():
-            n = 1
-            while (rej_dir / f"{exchange_id}-dup{n}.md").exists():
-                n += 1
-            dest = rej_dir / f"{exchange_id}-dup{n}.md"
-        os.replace(src, dest)
+        _link_move_no_overwrite(src, rej_dir, exchange_id)
+        os.unlink(src)
         return True
     except OSError as exc:
         log(f"owner reply {label}/{exchange_id} rejected-move failed: {exc}")
@@ -1075,7 +1096,14 @@ def changed_results(snapshot: dict, local: dict, cache: dict, now_s: float) -> l
             seen = cache.get(cache_key) or {}
             if seen.get("sha256") == digest and now_s - seen.get("sent_at", 0) < RESULT_RESEND_S:
                 continue
-            used += len(text.encode())
+            # #225 review round 3 N4: budgeted on the encoded WIRE size
+            # (what post_sync's json.dumps(..., ensure_ascii=True)
+            # actually sends), not raw UTF-8 bytes -- those differ sharply
+            # for non-ASCII text (every non-ASCII char becomes a 6-12
+            # byte \uXXXX escape), so a UTF-8-measured budget of 1 MB can
+            # reach ~3 MB on the wire and 413 the whole sync, same shape
+            # as M2's reply-budget bug.
+            used += len(json.dumps(text, separators=(",", ":")).encode())
             if out and used > RESULT_BUDGET_BYTES:
                 break
             out.append({"task_id": t["task_id"], "source": source, "text": text, "sha256": digest,
@@ -1229,11 +1257,32 @@ def save_state(st: dict) -> None:
     tmp.replace(OUT / "state.json")
 
 
+def _durable_fsync(fd: int) -> None:
+    """#225 review round 3 N5: plain fsync(2) on macOS only pushes to the
+    drive's volatile write cache, not to permanent storage (man 2 fsync:
+    "Applications ... that require a strict ordering of writes should use
+    F_FULLFSYNC") -- on power loss (not just a process crash, which
+    fsync already covers), the unlink that follows an audit write could
+    reach the disk before the audit row does. F_FULLFSYNC asks the drive
+    to flush buffered data to permanent storage; it is darwin-only, so
+    any other OSError (including ENOTTY on a non-disk fd, or running on
+    a non-APFS/HFS+ filesystem that does not support it) falls back to
+    plain fsync, same as every other platform."""
+    if sys.platform == "darwin":
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except OSError:
+            pass
+    os.fsync(fd)
+
+
 def append_audit(rows: list[dict]) -> None:
     """#225 review H2: flushes and fsyncs after writing. prune_inbox relies
     on a successful return here as proof the row survives a crash BEFORE
     it unlinks anything -- a write that only reached the page cache is
-    not that proof."""
+    not that proof. #225 review round 3 N5: fsync alone is not enough on
+    darwin for a power-loss guarantee -- see _durable_fsync."""
     if not rows:
         return
     OUT.mkdir(parents=True, exist_ok=True)
@@ -1241,7 +1290,7 @@ def append_audit(rows: list[dict]) -> None:
         for r in rows:
             f.write(json.dumps(r, separators=(",", ":")) + "\n")
         f.flush()
-        os.fsync(f.fileno())
+        _durable_fsync(f.fileno())
 
 
 def _sha256_file(path: Path) -> str | None:
@@ -1368,8 +1417,12 @@ def prune_inbox(owner_message_delivered: dict, owner_replies_accepted: dict, now
         sent_dir = label_dir / "replies" / "sent"
         for f in sorted(sent_dir.glob("*.md")) if sent_dir.is_dir() else []:
             exchange_id = f.stem
-            if exchange_id not in owner_replies_accepted or not EXCHANGE_ID_RE.match(exchange_id):
-                continue  # never provably Worker-accepted: never touched
+            accepted_key = f"{label}/{exchange_id}"
+            # #225 review round 3 N1: keyed by (label, exchange_id), not
+            # exchange_id alone -- the same id sitting in two labels'
+            # sent/ directories must never share one accepted-record.
+            if accepted_key not in owner_replies_accepted or not EXCHANGE_ID_RE.match(exchange_id):
+                continue  # never provably Worker-accepted under THIS label: never touched
             path = _resolve_inbox_leaf(label, "replies/sent", exchange_id)
             if path is None:
                 continue
@@ -1383,7 +1436,7 @@ def prune_inbox(owner_message_delivered: dict, owner_replies_accepted: dict, now
             if outcome is None:
                 return pruned_messages, pruned_sent
             if outcome == "deleted":
-                pruned_sent.add(exchange_id)
+                pruned_sent.add(accepted_key)
     return pruned_messages, pruned_sent
 
 
@@ -1473,21 +1526,45 @@ def main(argv: list[str]) -> int:
     # 200 as full acceptance used to move a dropped reply to sent/ anyway,
     # where it was permanently deleted 30 days later having never actually
     # been seen by the Worker. owner_reply_results carries the REAL
-    # per-reply outcome now (state.ts ~1038-1063): "accepted"/"duplicate"
+    # per-reply outcome now (state.ts ~1039-1074): "accepted"/"duplicate"
     # moves to sent/ (and records the durable accepted-marker prune_inbox
     # requires, L3); "ignored:queued"/"ignored:delivering" is transient --
     # left untouched in replies/, retried next tick; anything else
-    # ("ignored:missing", "ignored:blocked:...", or any unrecognized
-    # status) is durably refused and moved to replies/rejected/, never
-    # pruned. A reply this field says nothing about (an older Worker, or
-    # one this tick's M2 budget trim left out of owner_replies_raw
-    # entirely) is also left untouched -- the safest default.
-    reply_outcomes = {r.get("exchange_id"): r.get("outcome", "") for r in (reply.get("owner_reply_results") or [])}
+    # ("ignored:missing", "ignored:replied" -- #225 review round 3 N3, a
+    # resend whose body the Worker never actually stored --
+    # "ignored:blocked:...", or any unrecognized status) is durably
+    # refused and moved to replies/rejected/, never pruned. A reply this
+    # field says nothing about (an older Worker, or one this tick's M2
+    # budget trim left out of owner_replies_raw entirely) is also left
+    # untouched -- the safest default.
+    #
+    # #225 review round 3 N1: keyed by (owner_label, exchange_id), NOT
+    # exchange_id alone -- a reply file dropped under the WRONG label
+    # directory shares its exchange_id with the real one, and matching by
+    # id alone would apply the real reply's "accepted" outcome to the
+    # wrong-label file (moving it to sent/ and marking it durably
+    # accepted) while filing the genuine reply as "rejected". The Worker
+    # echoes back the REQUESTED owner_label on every result (state.ts),
+    # so the two can never collide here.
+    #
+    # #225 review round 3 I1: a malformed entry (not a dict, or missing/
+    # wrong-typed fields -- only a faulty Worker could send one) is
+    # skipped rather than raising, since .get() on a non-dict would abort
+    # this whole loop via AttributeError before save_state ever runs,
+    # losing every OTHER reply's routing along with it.
+    reply_outcomes: dict[tuple[str, str], str] = {}
+    for r in (reply.get("owner_reply_results") or []):
+        if not isinstance(r, dict):
+            continue
+        eid, label, outcome = r.get("exchange_id"), r.get("owner_label"), r.get("outcome")
+        if not isinstance(eid, str) or not isinstance(label, str) or not isinstance(outcome, str):
+            continue
+        reply_outcomes[(label, eid)] = outcome
     for r in owner_replies_raw:
-        outcome = reply_outcomes.get(r["exchange_id"])
+        outcome = reply_outcomes.get((r["owner_label"], r["exchange_id"]))
         if outcome in ("accepted", "duplicate"):
             if _move_reply_to_sent(r["owner_label"], r["exchange_id"]):
-                st.setdefault("owner_replies_accepted", {})[r["exchange_id"]] = now.timestamp()
+                st.setdefault("owner_replies_accepted", {})[f"{r['owner_label']}/{r['exchange_id']}"] = now.timestamp()
         elif outcome and outcome.startswith("ignored:") and not outcome.startswith(("ignored:queued", "ignored:delivering")):
             _move_reply_to_rejected(r["owner_label"], r["exchange_id"])
             log(f"owner reply {r['owner_label']}/{r['exchange_id']} rejected by the Worker ({outcome}); moved to replies/rejected/")

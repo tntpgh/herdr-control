@@ -513,7 +513,7 @@ class OwnerReplySyncLifecycle(unittest.TestCase):
                 # proving "no outcome -> left alone", not "accepted ->
                 # moved to sent/".
                 return {"audit": [], "audit_cursor": 0,
-                        "owner_reply_results": [{"exchange_id": "oex_fail1", "outcome": "accepted"}]}
+                        "owner_reply_results": [{"exchange_id": "oex_fail1", "owner_label": label, "outcome": "accepted"}]}
 
             pub.post_sync = succeeding_post
             self.assertEqual(pub.main([]), 0)
@@ -538,10 +538,10 @@ class OwnerReplySyncLifecycle(unittest.TestCase):
         try:
             def mixed_post(key, body):
                 return {"audit": [], "audit_cursor": 0, "owner_reply_results": [
-                    {"exchange_id": "oex_mix_accepted", "outcome": "accepted"},
-                    {"exchange_id": "oex_mix_dup", "outcome": "duplicate"},
-                    {"exchange_id": "oex_mix_queued", "outcome": "ignored:queued"},
-                    {"exchange_id": "oex_mix_blocked", "outcome": "ignored:blocked:sender_revoked"},
+                    {"exchange_id": "oex_mix_accepted", "owner_label": label, "outcome": "accepted"},
+                    {"exchange_id": "oex_mix_dup", "owner_label": label, "outcome": "duplicate"},
+                    {"exchange_id": "oex_mix_queued", "owner_label": label, "outcome": "ignored:queued"},
+                    {"exchange_id": "oex_mix_blocked", "owner_label": label, "outcome": "ignored:blocked:sender_revoked"},
                     # oex_mix_unreported deliberately has NO entry here
                 ]}
 
@@ -602,8 +602,8 @@ class OwnerReplySyncLifecycle(unittest.TestCase):
             def capturing_post(key, body):
                 carried.append(body["owner_replies"])
                 return {"audit": [], "audit_cursor": 0,
-                        "owner_reply_results": [{"exchange_id": r["exchange_id"], "outcome": "accepted"}
-                                                 for r in body["owner_replies"]]}
+                        "owner_reply_results": [{"exchange_id": r["exchange_id"], "owner_label": r["owner_label"],
+                                                  "outcome": "accepted"} for r in body["owner_replies"]]}
 
             pub.post_sync = capturing_post
             self.assertEqual(pub.main([]), 0)
@@ -620,6 +620,187 @@ class OwnerReplySyncLifecycle(unittest.TestCase):
             self.assertEqual(len(remaining), n - len(sent_batch))
         finally:
             shutil.rmtree(pub.INBOX_ROOT / label, ignore_errors=True)
+
+    def test_same_exchange_id_under_two_labels_is_never_cross_filed(self):
+        """#225 review round 3 N1: reply_outcomes and owner_replies_accepted
+        are keyed by (owner_label, exchange_id), never exchange_id alone.
+        A reply file dropped under the WRONG label directory shares its
+        exchange_id with the genuine one; before this fix the Worker's
+        "accepted" result for the real reply would also move the
+        wrong-label file to ITS OWN sent/ and durably mark it accepted,
+        getting it silently pruned 30 days later having never actually
+        been seen by the Worker. Run with the wrong-label file BOTH older
+        and newer than the real one, since scan order is oldest-first
+        globally across labels."""
+        real_label, wrong_label = "crosslabelreal", "crosslabelwrong"
+        for wrong_older in (True, False):
+            with self.subTest(wrong_older=wrong_older):
+                real_d = pub.INBOX_ROOT / real_label / "replies"
+                wrong_d = pub.INBOX_ROOT / wrong_label / "replies"
+                real_d.mkdir(parents=True, exist_ok=True)
+                wrong_d.mkdir(parents=True, exist_ok=True)
+                _write_reply(real_d / "oex_x1.md", "the owner's real reply",
+                             age_s=900 if wrong_older else 600)
+                _write_reply(wrong_d / "oex_x1.md", "NOT the owner's reply (wrong label)",
+                             age_s=600 if wrong_older else 900)
+                try:
+                    def worker_post(key, body):
+                        res = []
+                        for r in body["owner_replies"]:
+                            if r["owner_label"] == real_label:
+                                res.append({"exchange_id": "oex_x1", "owner_label": real_label, "outcome": "accepted"})
+                            else:
+                                res.append({"exchange_id": "oex_x1", "owner_label": r["owner_label"], "outcome": "ignored:missing"})
+                        return {"audit": [], "audit_cursor": 0, "owner_reply_results": res}
+
+                    pub.post_sync = worker_post
+                    self.assertEqual(pub.main([]), 0)
+
+                    self.assertTrue((real_d / "sent" / "oex_x1.md").exists())
+                    self.assertFalse((real_d / "rejected" / "oex_x1.md").exists())
+                    self.assertFalse((wrong_d / "sent" / "oex_x1.md").exists())
+                    self.assertTrue((wrong_d / "rejected" / "oex_x1.md").exists())
+
+                    st = json.loads((pub.OUT / "state.json").read_text())
+                    accepted = st.get("owner_replies_accepted", {})
+                    self.assertIn(f"{real_label}/oex_x1", accepted)
+                    self.assertNotIn(f"{wrong_label}/oex_x1", accepted)
+
+                    future = time.time() + (pub.OWNER_INBOX_RETENTION_DAYS + 1) * 86_400
+                    _, pruned_sent = pub.prune_inbox(st.get("owner_message_delivered", {}), accepted, future)
+                    self.assertEqual(pruned_sent, {f"{real_label}/oex_x1"})
+                    self.assertTrue((wrong_d / "rejected" / "oex_x1.md").exists())  # rejected/ never pruned
+                finally:
+                    shutil.rmtree(pub.INBOX_ROOT / real_label, ignore_errors=True)
+                    shutil.rmtree(pub.INBOX_ROOT / wrong_label, ignore_errors=True)
+
+    def test_a_malformed_owner_reply_result_entry_is_skipped_not_fatal(self):
+        """#225 review round 3 I1: an entry that isn't a dict, or is
+        missing/wrong-typed exchange_id/owner_label/outcome (only a
+        faulty Worker could send one), must be SKIPPED, not raise --
+        .get() on a non-dict would abort the whole routing loop via
+        AttributeError before save_state ever runs, losing every OTHER
+        reply's routing along with it, not just the malformed one's."""
+        label = "malformedresult"
+        d = pub.INBOX_ROOT / label / "replies"
+        d.mkdir(parents=True, exist_ok=True)
+        _write_reply(d / "oex_malformed1.md", "body")
+        _write_reply(d / "oex_malformed2.md", "body2", age_s=pub.REPLY_MIN_AGE_S + 1)
+        try:
+            def bad_post(key, body):
+                return {"audit": [], "audit_cursor": 0, "owner_reply_results": [
+                    "not-a-dict",
+                    {"exchange_id": "oex_malformed1", "owner_label": label},  # missing outcome
+                    {"exchange_id": 123, "owner_label": label, "outcome": "accepted"},  # wrong type
+                    {"exchange_id": "oex_malformed2", "owner_label": label, "outcome": "accepted"},  # valid
+                ]}
+
+            pub.post_sync = bad_post
+            self.assertEqual(pub.main([]), 0)  # never raises
+            self.assertTrue((d / "oex_malformed1.md").exists())  # no valid outcome found: left alone
+            self.assertFalse((d / "oex_malformed2.md").exists())  # the one valid entry still routes correctly
+            self.assertTrue((d / "sent" / "oex_malformed2.md").exists())
+            self.assertTrue((pub.OUT / "state.json").exists())  # save_state still ran
+        finally:
+            shutil.rmtree(pub.INBOX_ROOT / label, ignore_errors=True)
+
+
+class LinkMoveNoOverwrite(unittest.TestCase):
+    """#225 review round 3 I2: _link_move_no_overwrite uses os.link, which
+    fails atomically (FileExistsError) instead of a separate exists()
+    check that could go stale between the check and the write. Pins that
+    it finds the next free dup slot when several already exist, and
+    never touches src itself (the caller unlinks it after)."""
+
+    def test_finds_the_next_free_dup_slot_without_touching_existing_files(self):
+        d = TMP / "linkmove-no-overwrite"
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True)
+        try:
+            src = d / "src.md"
+            src.write_text("incoming")
+            (d / "oex_lm1.md").write_text("original")
+            (d / "oex_lm1-dup1.md").write_text("dup1")
+            (d / "oex_lm1-dup2.md").write_text("dup2")
+            dest, was_dup = pub._link_move_no_overwrite(src, d, "oex_lm1")
+            self.assertTrue(was_dup)
+            self.assertEqual(dest.name, "oex_lm1-dup3.md")
+            self.assertEqual(dest.read_text(), "incoming")
+            self.assertTrue(src.exists())  # never touched by this helper; caller unlinks it
+            self.assertEqual((d / "oex_lm1.md").read_text(), "original")
+            self.assertEqual((d / "oex_lm1-dup1.md").read_text(), "dup1")
+            self.assertEqual((d / "oex_lm1-dup2.md").read_text(), "dup2")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_links_directly_when_no_destination_exists_yet(self):
+        d = TMP / "linkmove-fresh"
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True)
+        try:
+            src = d / "src.md"
+            src.write_text("incoming")
+            dest, was_dup = pub._link_move_no_overwrite(src, d, "oex_lm2")
+            self.assertFalse(was_dup)
+            self.assertEqual(dest.name, "oex_lm2.md")
+            self.assertEqual(dest.read_text(), "incoming")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class DurableFsync(unittest.TestCase):
+    """#225 review round 3 N5: append_audit must request F_FULLFSYNC on
+    darwin (plain fsync(2) there only reaches the drive's volatile write
+    cache, not permanent storage), falling back to plain fsync anywhere
+    F_FULLFSYNC is unavailable or fails."""
+
+    def test_uses_f_fullfsync_on_darwin(self):
+        if sys.platform != "darwin":
+            self.skipTest("F_FULLFSYNC is darwin-only")
+        calls = []
+        real_fcntl = pub.fcntl.fcntl
+
+        def spy(fd, cmd, *a):
+            calls.append(cmd)
+            return real_fcntl(fd, cmd, *a)
+
+        pub.fcntl.fcntl = spy
+        try:
+            p = TMP / "fsync-darwin-test.txt"
+            with p.open("w") as f:
+                f.write("x")
+                f.flush()
+                pub._durable_fsync(f.fileno())
+        finally:
+            pub.fcntl.fcntl = real_fcntl
+            (TMP / "fsync-darwin-test.txt").unlink(missing_ok=True)
+        self.assertIn(pub.fcntl.F_FULLFSYNC, calls)
+
+    def test_falls_back_to_plain_fsync_when_f_fullfsync_is_unavailable(self):
+        fsync_calls = []
+        real_fsync = pub.os.fsync
+        real_fcntl = pub.fcntl.fcntl
+
+        def failing_fcntl(fd, cmd, *a):
+            raise OSError("simulated: F_FULLFSYNC unsupported on this filesystem")
+
+        def spy_fsync(fd):
+            fsync_calls.append(fd)
+
+        pub.fcntl.fcntl = failing_fcntl
+        pub.os.fsync = spy_fsync
+        try:
+            p = TMP / "fsync-fallback-test.txt"
+            with p.open("w") as f:
+                f.write("x")
+                f.flush()
+                pub._durable_fsync(f.fileno())
+            self.assertEqual(len(fsync_calls), 1)
+        finally:
+            pub.fcntl.fcntl = real_fcntl
+            pub.os.fsync = real_fsync
+            (TMP / "fsync-fallback-test.txt").unlink(missing_ok=True)
+
 
 
 class OwnerInboxRetention(unittest.TestCase):
@@ -674,11 +855,14 @@ class OwnerInboxRetention(unittest.TestCase):
             os.utime(old_rejected, (old_s, old_s))
 
             owner_message_delivered = {"oex_old_delivered": old_s, "oex_recent_delivered": recent_s}
-            owner_replies_accepted = {"oex_old_sent": old_s}
+            # #225 review round 3 N1: keyed by "label/exchange_id", not
+            # bare exchange_id -- the same id in two labels' sent/ dirs
+            # must never share one accepted record.
+            owner_replies_accepted = {f"{label}/oex_old_sent": old_s}
             pruned_messages, pruned_sent = pub.prune_inbox(owner_message_delivered, owner_replies_accepted, time.time())
 
             self.assertEqual(pruned_messages, {"oex_old_delivered"})
-            self.assertEqual(pruned_sent, {"oex_old_sent"})
+            self.assertEqual(pruned_sent, {f"{label}/oex_old_sent"})
             self.assertFalse(old_delivered.exists())  # old + delivered: pruned
             self.assertTrue(recent_delivered.exists())  # delivered but too young: kept
             self.assertTrue(old_undelivered.exists())  # old but never delivered: NEVER touched
@@ -750,7 +934,7 @@ class OwnerInboxRetention(unittest.TestCase):
         try:
             (label_dir / "replies").mkdir(parents=True)
             (label_dir / "replies" / "sent").symlink_to(outside)
-            owner_replies_accepted = {"oex_prunesym1": old_s}
+            owner_replies_accepted = {f"{label}/oex_prunesym1": old_s}
             pruned_messages, pruned_sent = pub.prune_inbox({}, owner_replies_accepted, time.time())
             self.assertEqual(pruned_sent, set())
             self.assertTrue(planted.exists())  # never reached, let alone deleted
