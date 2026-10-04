@@ -24,6 +24,7 @@ _lc() { wc -l < "$1" 2>/dev/null | tr -d ' '; }   # BSD wc pads its count with s
 
 # ═══════════════════════ Section A — stall-watchdog.sh ═══════════════════════
 WORK="$(mktemp -d)"
+export WORK
 export HERDR_RUN_STATE_DIR="$WORK/runs"
 export SENT="$WORK/sent.log"
 export NOTIFIED="$WORK/notified.log"
@@ -38,9 +39,16 @@ printf ' $ \n ready\n' > "$CM"
 herdr() {
   case "$1 $2" in
     "pane process-info")
+      [ -e "$WORK/herdr_down" ] && return 1
+      [ -e "$WORK/cond_pane_gone" ] && return 1
       printf '{"result":{"process_info":{"foreground_processes":[{"name":"omp","cmdline":"omp --model sonnet"}]}}}\n' ;;
     "pane list")
-      printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"}]}}\n' "$COND" "$CONDB" ;;
+      [ -e "$WORK/herdr_down" ] && return 1
+      if [ -e "$WORK/cond_pane_gone" ]; then
+        printf '{"result":{"panes":[]}}\n'
+      else
+        printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"}]}}\n' "$COND" "$CONDB"
+      fi ;;
     "pane read")
       cat "$CM" 2>/dev/null ;;
     "pane send-text")
@@ -130,6 +138,45 @@ bash "$here/stall-watchdog.sh" wake taskC denied approvalX "a deny was never fol
 [ "$(_lc "$SENT")" = "0" ] && ok "recycled conductor pane: never sends into the wrong occupant" || bad "sent to a recycled pane"
 [ "$(_lc "$NOTIFIED")" = "1" ] && ok "recycled conductor pane: escalates instead" || bad "did not escalate for a dead owner"
 
+echo "== A8 (review H2): the owner acted (messaged the worker) but never ran stall-ack — must not escalate =="
+register_task runD taskD workerD condD "$COND" "$CONDB" paneD paneDbirth repo/d "$WORK/wtD" labelD >/dev/null
+: > "$SENT"; : > "$NOTIFIED"
+bash "$here/stall-watchdog.sh" wake taskD artifact "tmp/REVIEW.md:7" "ready" "tmp/REVIEW.md"
+sleep 1.2
+_sql_runD() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "$1" 2>/dev/null; }
+_sql_runD "INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload)
+  VALUES ('ev_ownerD','runD','taskD','owner_acted','$(date -u +%Y-%m-%dT%H:%M:%SZ)','{}');"
+: > "$SENT"; : > "$NOTIFIED"
+HERDR_STALL_WATCHDOG_ESCALATE_S=0 bash "$here/stall-watchdog.sh" wake taskD artifact "tmp/REVIEW.md:7" "ready" "tmp/REVIEW.md"
+[ "$(_lc "$NOTIFIED")" = "0" ] && ok "H2: owner_acted after the wake counts as handled — no escalation without stall-ack" \
+  || bad "H2 REGRESSION: escalated despite owner_acted — $(cat "$NOTIFIED")"
+
+echo "== A9 (review H3): an ack survives the conductor pane later going away — no re-escalation =="
+register_task runE taskE workerE condE "$COND" "$CONDB" paneE paneEbirth repo/e "$WORK/wtE" labelE >/dev/null
+: > "$SENT"; : > "$NOTIFIED"
+bash "$here/stall-watchdog.sh" wake taskE artifact "tmp/commit-msg.txt:999" "ready" "tmp/commit-msg.txt"
+first_sentE=$(grep -c "send-text $COND" "$SENT" || true)
+sleep 1.2
+bash "$here/stall-ack.sh" taskE artifact >/dev/null
+touch "$WORK/cond_pane_gone"
+: > "$SENT"; : > "$NOTIFIED"
+HERDR_STALL_WATCHDOG_ESCALATE_S=0 bash "$here/stall-watchdog.sh" wake taskE artifact "tmp/commit-msg.txt:999" "ready" "tmp/commit-msg.txt"
+rm -f "$WORK/cond_pane_gone"
+[ "$first_sentE" = "1" ] && [ "$(_lc "$NOTIFIED")" = "0" ] && ok "H3: acked wake stays silent even once the conductor pane is gone" \
+  || bad "H3 REGRESSION: first_sent=$first_sentE notified=$(_lc "$NOTIFIED") — acked wake re-escalated after the pane vanished"
+
+echo "== A10 (review H3): a transient herdr outage on first sighting must SKIP, not escalate =="
+register_task runF taskF workerF condF "$COND" "$CONDB" paneF paneFbirth repo/f "$WORK/wtF" labelF >/dev/null
+: > "$SENT"; : > "$NOTIFIED"
+touch "$WORK/herdr_down"
+bash "$here/stall-watchdog.sh" wake taskF handoff fpF "closed handed_off_to:conductor"
+a1=$(_lc "$NOTIFIED"); s1=$(_lc "$SENT")
+rm -f "$WORK/herdr_down"
+bash "$here/stall-watchdog.sh" wake taskF handoff fpF "closed handed_off_to:conductor"
+[ "$a1" = "0" ] && [ "$s1" = "0" ] && [ "$(grep -c "send-text $COND" "$SENT" || true)" = "1" ] \
+  && ok "H3: herdr-unreachable on first sighting skips silently, then wakes normally once herdr recovers" \
+  || bad "H3 REGRESSION: while-down alerts=$a1 sends=$s1; after recovery sends=$(grep -c "send-text $COND" "$SENT" || true)"
+
 echo
 echo "===== Section A ====="
 printf 'passed=%d failed=%d\n' "$pass" "$fail"
@@ -154,6 +201,11 @@ NOW = 1_767_300_000.0  # 2026-01-01T20:40:00Z — well after base_task()'s defau
                        # actually lands positive instead of a 1970-epoch NOW
                        # racing a 2026 updated_at.
 THRESH = 600.0
+BOOT = NOW - 100_000.0   # review H1: every evidence epoch below is constructed
+                        # relative to NOW, comfortably after this fixed boot
+                        # floor, so passing it explicitly isolates every
+                        # existing case from H1's OWN dedicated tests further
+                        # down (which move it instead of the evidence).
 
 def base_task(**over):
     t = {"task_id": "t1", "run_id": "r1", "label": "widget", "pane_id": "p1",
@@ -163,58 +215,154 @@ def base_task(**over):
     t.update(over)
     return t
 
-# ---- signal 1: handoff ------------------------------------------------------
+def cw(now_epoch, reason=None):   # stub live_done_fn: constant (epoch, reason)
+    return lambda worktree: (now_epoch, reason)
+
+# ---- signal 1: handoff -------------------------------------------------------
 t = base_task(state="completed", stored_state="completed", closure_reason="handed_off_to:conductor")
-cands = hub.stall_watchdog_candidates([t], now=NOW, threshold_s=THRESH)
+cands = hub.stall_watchdog_candidates([t], now=NOW, threshold_s=THRESH, boot_epoch=BOOT)
 results["handoff_fires_on_terminal_handed_off_task"] = (
     len(cands) == 1 and cands[0]["signal"] == "handoff" and cands[0]["task_id"] == "t1")
 
 # A plain completion (no handed_off_to:conductor reason) never fires signal 1.
 t2 = base_task(state="completed", stored_state="completed", closure_reason="shipped")
-results["handoff_silent_on_a_shipped_close"] = hub.stall_watchdog_candidates([t2], now=NOW, threshold_s=THRESH) == []
+results["handoff_silent_on_a_shipped_close"] = hub.stall_watchdog_candidates(
+    [t2], now=NOW, threshold_s=THRESH, boot_epoch=BOOT) == []
 
-# ---- signal 2: artifact (injectable stat_fn — no real filesystem needed) ---
-mtimes = {"/wt/tmp/commit-msg.txt": NOW - THRESH - 1}
+# ---- review H5: handoff variants other than the exact literal must ALSO fire -
+for reason in ("handed_off_to:conductor", "handed_off_to: conductor", "handed_off_to:w4P:p1",
+               "handed_off_to:conductor-merge", "handed_off_to:Main", "handed_off_to:review"):
+    th = base_task(state="completed", stored_state="completed", closure_reason=reason)
+    cands = hub.stall_watchdog_candidates([th], now=NOW, threshold_s=THRESH, boot_epoch=BOOT)
+    results[f"H5_handoff_fires_for[{reason}]"] = any(c["signal"] == "handoff" for c in cands)
+# A reason that merely CONTAINS the word is not a handoff.
+th2 = base_task(state="completed", stored_state="completed", closure_reason="shipped, handed_off_to is a misnomer")
+results["H5_handoff_silent_on_a_reason_that_only_mentions_the_word"] = hub.stall_watchdog_candidates(
+    [th2], now=NOW, threshold_s=THRESH, boot_epoch=BOOT) == []
+
+# ---- review H5: incident 1's exact shape — pane still alive, registry row
+# never promoted to `completed` (derives ready_review, closure_reason=None),
+# but the worker's OWN worktree bus already has the handoff written. Must
+# fire from the LIVE bus, via the injectable live_done_fn (no real filesystem).
+t_live = base_task(state="ready_review", stored_state="running", closure_reason=None, worktree="/wt-live")
+cands = hub.stall_watchdog_candidates(
+    [t_live], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(NOW - THRESH - 30, "handed_off_to:conductor"))
+results["H5_incident1_live_bus_shape_fires"] = any(c["signal"] == "handoff" for c in cands)
+# Still `running` (genuinely active, not idle) -> never consult the live bus.
+t_live_running = base_task(state="running", stored_state="running", closure_reason=None, worktree="/wt-live")
+cands = hub.stall_watchdog_candidates(
+    [t_live_running], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(NOW - THRESH - 30, "handed_off_to:conductor"))
+results["H5_live_bus_never_consulted_while_genuinely_running"] = cands == []
+
+# ---- review H1: a deploy must never wake on evidence OLDER than the watchdog
+# itself existing to watch it — same handoff fixture, but its evidence
+# predates the (explicit) boot floor this time.
+t_old = base_task(state="completed", stored_state="completed", closure_reason="handed_off_to:conductor",
+                  updated_at="2020-01-01T00:00:00Z")
+cands = hub.stall_watchdog_candidates([t_old], now=NOW, threshold_s=THRESH, boot_epoch=BOOT)
+results["H1_boot_epoch_floor_silences_pre_existing_evidence"] = cands == []
+
+# ---- signal 2: artifact (injectable stat_fn — no real filesystem needed) ----
+# stat_fn now returns (size, mtime): review H1's empty-file / owner-action gates.
+mtimes = {"/wt/tmp/commit-msg.txt": (400, NOW - THRESH - 1)}
 t3 = base_task(state="ready_review", stored_state="running", worktree="/wt")
-cands = hub.stall_watchdog_candidates([t3], now=NOW, threshold_s=THRESH,
-                                      stat_fn=lambda p: mtimes.get(p))
+cands = hub.stall_watchdog_candidates([t3], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+                                      stat_fn=lambda p: mtimes.get(p, (0, None)))
 results["artifact_fires_once_idle_past_threshold"] = any(
     c["signal"] == "artifact" and c["artifact"] == "tmp/commit-msg.txt" for c in cands)
 
 # Just UNDER the threshold: not yet.
-mtimes_fresh = {"/wt/tmp/commit-msg.txt": NOW - THRESH + 10}
-cands = hub.stall_watchdog_candidates([t3], now=NOW, threshold_s=THRESH,
-                                      stat_fn=lambda p: mtimes_fresh.get(p))
+mtimes_fresh = {"/wt/tmp/commit-msg.txt": (400, NOW - THRESH + 10)}
+cands = hub.stall_watchdog_candidates([t3], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+                                      stat_fn=lambda p: mtimes_fresh.get(p, (0, None)))
 results["artifact_silent_before_threshold"] = cands == []
 
 # A task still RUNNING (derived state, not just stored) never fires signal 2 —
 # the worker might still be about to overwrite the very file being judged.
 t4 = base_task(state="running", stored_state="running", worktree="/wt")
-cands = hub.stall_watchdog_candidates([t4], now=NOW, threshold_s=THRESH,
-                                      stat_fn=lambda p: mtimes.get(p))
+cands = hub.stall_watchdog_candidates([t4], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+                                      stat_fn=lambda p: mtimes.get(p, (0, None)))
 results["artifact_silent_while_task_is_running"] = cands == []
 
-# ---- signal 3: denied -------------------------------------------------------
+# ---- review H1: the 0-byte PROOF.md spawn-task.sh creates in EVERY worktree
+# must never fire — this is the exact deploy-storm shape (254 completed rows
+# live, every one with an empty PROOF.md).
+mtimes_empty = {"/wt/.handoffs/PROOF.md": (0, NOW - THRESH - 1)}
+t3b = base_task(state="completed", stored_state="completed", closure_reason="shipped", worktree="/wt")
+cands = hub.stall_watchdog_candidates([t3b], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+                                      stat_fn=lambda p: mtimes_empty.get(p, (0, None)))
+results["H1_empty_artifact_never_fires"] = cands == []
+
+# ---- review H1: newer than the conductor's OWN last action on the task —
+# the owner already acted AFTER the artifact was written, so it must not fire.
+cands = hub.stall_watchdog_candidates(
+    [t3], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    stat_fn=lambda p: mtimes.get(p, (0, None)),
+    owner_acted={"t1": NOW - THRESH + 100})   # acted AFTER the file's mtime
+results["H1_artifact_silent_once_owner_already_acted"] = cands == []
+# Owner acted BEFORE the artifact was (re)written: still fires.
+cands = hub.stall_watchdog_candidates(
+    [t3], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    stat_fn=lambda p: mtimes.get(p, (0, None)),
+    owner_acted={"t1": NOW - THRESH - 1000})  # acted BEFORE the file's mtime
+results["artifact_still_fires_when_owner_action_predates_the_file"] = any(
+    c["signal"] == "artifact" for c in cands)
+
+# ---- review L4 (opportunistic, fixed alongside H1): at most ONE artifact
+# candidate per task, even with several qualifying files.
+mtimes_multi = {"/wtm/tmp/commit-msg.txt": (10, NOW - THRESH - 500),
+               "/wtm/tmp/REVIEW.md": (10, NOW - THRESH - 50),
+               "/wtm/.handoffs/PROOF.md": (10, NOW - THRESH - 5)}
+t3c = base_task(state="ready_review", stored_state="running", worktree="/wtm")
+cands = hub.stall_watchdog_candidates([t3c], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+                                      stat_fn=lambda p: mtimes_multi.get(p, (0, None)))
+results["at_most_one_artifact_candidate_per_task"] = (
+    sum(1 for c in cands if c["signal"] == "artifact") == 1)
+
+# ---- signal 3: denied --------------------------------------------------------
 t5 = base_task(state="stalled")
 cands = hub.stall_watchdog_candidates(
-    [t5], now=NOW, threshold_s=THRESH,
+    [t5], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
     denied={"t1": {"epoch": NOW - THRESH - 5, "fingerprint": "appr_1"}})
 results["denied_fires_when_idle_after_a_deny"] = any(c["signal"] == "denied" for c in cands)
 # A task that resumed working after the deny (state != stalled) never fires.
 t5b = base_task(state="running")
 cands = hub.stall_watchdog_candidates(
-    [t5b], now=NOW, threshold_s=THRESH,
+    [t5b], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
     denied={"t1": {"epoch": NOW - THRESH - 5, "fingerprint": "appr_1"}})
 results["denied_silent_once_worker_resumed"] = cands == []
 
 # ---- signal 4: unprocessed ---------------------------------------------------
 t6 = base_task(state="stalled")
 cands = hub.stall_watchdog_candidates(
-    [t6], now=NOW, threshold_s=THRESH,
+    [t6], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
     delivered={"t1": {"epoch": NOW - THRESH - 5, "fingerprint": "42"}})
 results["unprocessed_fires_when_idle_after_delivery"] = any(c["signal"] == "unprocessed" for c in cands)
 
-# ---- _stall_denied_and_delivered(): real scratch registry -------------------
+# ---- review M1: incident 2's shape — all-allow approvals, no deny, no
+# delivery, no handoff; only the pane's own last output names the blocker.
+t7 = base_task(state="running", stored_state="running", pane_id="p1",
+               updated_at="2026-01-01T00:00:00Z")
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: "some earlier output\nCONDUCTOR: approve request ar_7 or tell me why not\n")
+results["M1_conductor_prompt_fires_on_idle_pane_with_no_other_signal"] = any(
+    c["signal"] == "conductor_prompt" for c in cands)
+# Ordinary scrollback with no such line never fires it.
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: "$ ready\n")
+results["M1_silent_without_a_conductor_line"] = cands == []
+# The owner already acted after the pane's last line -> silent.
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: "CONDUCTOR: still waiting\n",
+    owner_acted={"t1": NOW - 1})
+results["M1_silent_once_the_owner_already_acted"] = cands == []
+
+# ---- _stall_task_signals(): real scratch registry ----------------------------
 db_dir = os.path.join(os.environ["WORK"], "runs2")
 os.makedirs(db_dir, exist_ok=True)
 hub.REGISTRY = __import__("pathlib").Path(db_dir) / "registry.sqlite3"
@@ -227,24 +375,80 @@ subprocess.run(
 conn = sqlite3.connect(str(hub.REGISTRY))
 conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
              "VALUES ('dtask','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
-conn.execute("INSERT INTO approvals (approval_id, task_id, policy_verdict, choice_text, decided_at) "
-             "VALUES ('appr_x','dtask','deny','2. Deny','2026-01-01T00:00:00Z')")
+# review M2: a policy refusal is `approval_escalated` — the real signal a
+# deny-class prompt produces (herdr-select.sh `_refuse_non_human`).
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('esc1','drun','dtask','approval_escalated','2026-01-01T00:00:00Z',"
+             "'{\"verdict\":\"deny\",\"reason\":\"reserved\"}')")
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('ev1','drun','dtask','message_delivered','2026-01-01T00:00:00Z','{}')")
 conn.commit(); conn.close()
-denied, delivered = hub._stall_denied_and_delivered()
-results["denied_query_finds_the_real_deny_row"] = denied.get("dtask", {}).get("fingerprint") == "appr_x"
+denied, delivered, owner_acted = hub._stall_task_signals()
+results["M2_denied_query_finds_the_approval_escalated_row"] = denied.get("dtask", {}).get("fingerprint") == "esc1"
 results["delivered_query_finds_an_unprocessed_message"] = "dtask" in delivered
+
+# review M2: a HUMAN pressing Approve on a deny-CLASSIFIED prompt (policy_verdict
+# stayed 'deny', the human's own choice was Approve) must NEVER read as "denied".
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('dtask2','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+conn.execute("INSERT INTO approvals (approval_id, task_id, authority, policy_verdict, choice_text, decided_at) "
+             "VALUES ('appr_human_ok','dtask2','human','deny','Approve','2026-01-01T00:00:00Z')")
+conn.commit(); conn.close()
+denied2, _, _ = hub._stall_task_signals()
+results["M2_human_approve_on_a_deny_classified_prompt_never_fires_denied"] = "dtask2" not in denied2
+
+# A human's OWN declining choice (independent of policy_verdict) is still the
+# same real signal from the other path.
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('dtask3','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+conn.execute("INSERT INTO approvals (approval_id, task_id, authority, policy_verdict, choice_text, decided_at) "
+             "VALUES ('appr_deny3','dtask3','human','allow','2. Deny','2026-01-01T00:00:00Z')")
+conn.commit(); conn.close()
+denied3, _, _ = hub._stall_task_signals()
+results["M2_a_humans_own_decline_still_fires_denied"] = denied3.get("dtask3", {}).get("fingerprint") == "appr_deny3"
+
+# review H4: herdr-deliver.sh's REAL ordering — send-to-agent.sh's
+# message_delivered, THEN herdr-deliver.sh's own brief_delivered — must NOT
+# read as "the worker did something". A genuine worker signal
+# (input_required) DOES clear it.
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('t_deliver','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'),"
+             "('t_worker_acted','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) VALUES "
+             "('d1','drun','t_deliver','message_delivered','2026-01-01T01:00:00Z','{}'),"
+             "('d2','drun','t_deliver','brief_delivered','2026-01-01T01:00:00Z','{}'),"
+             "('w1','drun','t_worker_acted','message_delivered','2026-01-01T01:00:00Z','{}'),"
+             "('w2','drun','t_worker_acted','input_required','2026-01-01T01:00:05Z','{}')")
+conn.commit(); conn.close()
+_, delivered4, _ = hub._stall_task_signals()
+results["H4_herdr_deliver_ordering_still_reads_as_unprocessed"] = "t_deliver" in delivered4
+results["H4_genuine_worker_activity_clears_unprocessed"] = "t_worker_acted" not in delivered4
+
+# review H1: owner_acted is populated from the real owner-activity types.
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('t_owner','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('oa1','drun','t_owner','owner_acted','2026-01-01T02:00:00Z','{}')")
+conn.commit(); conn.close()
+_, _, owner_acted2 = hub._stall_task_signals()
+results["owner_acted_populated_from_owner_acted_events"] = "t_owner" in owner_acted2
 
 # A later event from the SAME task (real worker activity) clears "unprocessed".
 conn = sqlite3.connect(str(hub.REGISTRY))
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
-             "VALUES ('ev2','drun','dtask','worker_progress','2026-01-01T00:05:00Z','{}')")
+             "VALUES ('ev2','drun','dtask','input_required','2026-01-01T00:05:00Z','{}')")
 conn.commit(); conn.close()
-_, delivered2 = hub._stall_denied_and_delivered()
-results["delivered_cleared_once_the_worker_did_something"] = "dtask" not in delivered2
+_, delivered5, _ = hub._stall_task_signals()
+results["delivered_cleared_once_the_worker_did_something"] = "dtask" not in delivered5
 
-# ---- _stall_watchdog_tick(): the in-memory on/off switch --------------------
+# ---- _stall_watchdog_tick(): the in-memory on/off switch ---------------------
+# Isolated from the boot_epoch floor (its own dedicated tests are above):
+# this block is testing dispatch wiring, not H1's storm guard.
+hub.STALL_WATCHDOG_BOOT_EPOCH = 0.0
 calls = []
 real_run = hub.subprocess.run
 def fake_run(argv, **kw):
@@ -274,6 +478,20 @@ hub.STALL_WATCHDOG_SCRIPT = real_script
 hub._stall_watchdog_tick()
 results["rule_restored_fires_on_the_same_candidate"] = (
     len(calls) == 1 and calls[0][2] == "wake" and calls[0][3] == "t1" and calls[0][4] == "handoff")
+
+# review M4: an already claimed+acked key must not be re-dispatched.
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('t1','r1','completed','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+claim_key = f"stall_t1_handoff_{hub._sw_digest('2020-01-01T00:00:00Z')}"
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES (?,'r1','t1','stall_wake','2026-01-01T00:00:00Z','{\"signal\":\"handoff\"}')", (claim_key,))
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('ack1','r1','t1','stall_acked','2026-01-01T00:00:05Z','{\"signal\":\"handoff\"}')")
+conn.commit(); conn.close()
+calls.clear()
+hub._stall_watchdog_tick()
+results["M4_already_claimed_and_acked_key_is_never_redispatched"] = calls == []
 
 hub.subprocess.run = real_run
 

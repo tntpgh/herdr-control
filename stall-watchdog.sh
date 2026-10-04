@@ -114,6 +114,68 @@ _sw_acked_since() {                     # task_id signal since_iso -> 0 if acked
   [ "${n:-0}" -gt 0 ]
 }
 
+# Owner-side ACTIVITY (review H2): most real handling is never routed
+# through stall-ack.sh at all — a conductor just messages the worker
+# (owner_acted/brief_delivered/reply_delivered) or reviews an approval
+# (approval_reviewed). ANY of those after the wake's own claim counts the
+# same as an explicit ack; otherwise every wake the conductor handles the
+# NORMAL way still escalates to Slack 2x the threshold later regardless.
+_sw_owner_acted_since() {               # task_id since_iso -> 0 if owner activity happened after
+  local n
+  n="$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq "$1")
+        AND type IN ('owner_acted','brief_delivered','reply_delivered','approval_reviewed')
+        AND occurred_at > $(_sq "$2");" 2>/dev/null)"
+  [ "${n:-0}" -gt 0 ]
+}
+
+# Delivery CONFIRMATION (review M3): claim_once only ever meant "we decided
+# to wake for this fingerprint", not "the conductor received it" —
+# send-to-agent.sh can refuse a live prompt (exit 5/6) or report
+# UNSUBMITTED (exit 4), and the first cut here never retried; the only
+# fallback was a Slack alert a full escalate-window later. A confirmed
+# delivery is a stall_wake_result for this exact key with exit_code 0 —
+# append-only per attempt, same precedent as lib/push-wake.sh's own
+# wake_attempted/wake_result rows, so a retry's outcome is a new fact.
+_sw_wake_confirmed() {                  # task_id key -> 0 if delivered (rc=0) at least once
+  local n
+  n="$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq "$1") AND type='stall_wake_result'
+        AND json_extract(payload,'\$.key')=$(_sq "$2") AND json_extract(payload,'\$.exit_code')=0;" 2>/dev/null)"
+  [ "${n:-0}" -gt 0 ]
+}
+
+# Owner liveness, with the distinction review H3 asks for: "herdr itself is
+# unreachable right now" (echoes `unreachable`, skip this tick entirely —
+# try again next tick, no claim spent, no escalation) is NOT the same fact
+# as "this specific conductor pane is gone or not running an agent"
+# (`dead`, the real escalate-now case). `herdr pane list` succeeding (even
+# with zero panes) proves the daemon itself answered, so a SEPARATE
+# `pane_is_agent` failure immediately after that can only mean "no agent in
+# THIS pane", never "herdr is down" — the ambiguity pane_is_agent's own
+# single nonzero return code cannot resolve by itself (lib/pane-guard.sh:43).
+_sw_owner_status() {                    # conductor_pane conductor_birth -> ok|dead|unreachable
+  local conductor="$1" cond_birth="$2"
+  if [ -z "$conductor" ]; then
+    printf 'dead\n'; return
+  fi
+  local list_json
+  if ! list_json="$(herdr pane list 2>/dev/null)"; then
+    printf 'unreachable\n'; return
+  fi
+  local live_birth
+  live_birth="$(printf '%s' "$list_json" | jq -r --arg p "$conductor" \
+    '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null)"
+  if [ -z "$live_birth" ]; then
+    printf 'dead\n'; return                        # pane genuinely gone
+  fi
+  if [ -n "$cond_birth" ] && [ "$live_birth" != "$cond_birth" ]; then
+    printf 'dead\n'; return                        # recycled
+  fi
+  if ! pane_is_agent "$conductor" 2>/dev/null; then
+    printf 'dead\n'; return                        # herdr IS up; this pane just isn't an agent
+  fi
+  printf 'ok\n'
+}
+
 # alert_claim's event_id length budget: keep the dedupe key short (SQLite
 # TEXT has no hard limit, but a stable short id is easier to grep in the
 # registry and matches _ag_claim_id's own 'slack_alert_<pane>_<key>' shape).
@@ -123,7 +185,7 @@ _sw_escalate() {                        # task_id run_id signal label pane condu
   alert_claim "$alert_pane" "$key" || return 0   # already posted for this (task,signal) within the TTL
   local art_note=""
   [ -n "$artifact" ] && art_note=" ($artifact)"
-  local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. ${reason}. Nothing answers prompts or acts on the worker's behalf here — a human looks. Ack once handled: stall-ack.sh ${task_id} ${signal}"
+  local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. ${reason}. Nothing answers prompts or acts on the worker's behalf here — a human looks. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
   local rc=0
   if [ -n "$conductor" ]; then
     bash "$SW_NOTIFY" --pane "$conductor" --class stall-watchdog "$msg" >/dev/null 2>&1 || rc=$?
@@ -155,21 +217,70 @@ cmd_wake() {
   label="$(printf '%s' "$task_json" | jq -r '.label // empty')"
   [ -n "$label" ] || label="$task_id"
 
-  local digest key
+  local digest key payload
   digest="$(_sw_digest "$fingerprint")"
   key="stall_${task_id}_${signal}_${digest}"
+  payload="$(jq -nc --arg s "$signal" --arg f "$fingerprint" --arg d "$detail" --arg a "$artifact" \
+             --arg p "$pane" --arg c "$conductor" \
+             '{signal:$s, fingerprint:$f, detail:$d, artifact:$a, pane:$p, conductor:$c}')"
 
-  # Requirement 2: owner unknown or dead -> escalate directly, no owner window.
-  local owner_ok=1
-  if [ -z "$conductor" ] || ! pane_is_agent "$conductor" 2>/dev/null; then
-    owner_ok=0
-  elif [ -n "$conductor_birth" ]; then
-    local live_birth
-    live_birth="$(pane_birth_now "$conductor" 2>/dev/null)"
-    [ -n "$live_birth" ] && [ "$live_birth" != "$conductor_birth" ] && owner_ok=0
+  # Review H3: check an EXISTING claim, its ack, and any owner-side activity
+  # BEFORE ever resolving the owner's live state. An ack (or the owner
+  # simply acting — H2) must stop repeating even once the conductor pane
+  # later exits, which is routine at session end, not a reason to
+  # re-escalate a handled stall — the old order resolved owner health
+  # FIRST, so a dead conductor re-escalated an already-acked wake.
+  local claimed_iso
+  claimed_iso="$(_sql "SELECT occurred_at FROM events WHERE event_id=$(_sq "$key") LIMIT 1;" 2>/dev/null)"
+  if [ -n "$claimed_iso" ]; then
+    _sw_acked_since "$task_id" "$signal" "$claimed_iso" && return 0
+    _sw_owner_acted_since "$task_id" "$claimed_iso" && return 0
+
+    local claimed_epoch now_epoch window elapsed
+    claimed_epoch="$(_sw_claimed_at_epoch "$key")"
+    [ -n "$claimed_epoch" ] || return 0
+    now_epoch="$(date -u +%s)"
+    window="$(_sw_escalate_window_s)"
+    elapsed=$(( now_epoch - claimed_epoch ))
+
+    if [ "$elapsed" -lt "$window" ]; then
+      # Review M3: claim_once means "we decided to wake", never "the
+      # conductor received it" — retry delivery within the owner's own
+      # window instead of silently leaving an unconfirmed send to time out
+      # into a 2x-threshold Slack escalation regardless of what happened.
+      if ! _sw_wake_confirmed "$task_id" "$key"; then
+        if [ "$(_sw_owner_status "$conductor" "$conductor_birth")" = ok ]; then
+          local art_note="" rc=0
+          [ -n "$artifact" ] && art_note=" ($artifact)"
+          local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
+          bash "$SW_SEND" "$conductor" "$msg" >/dev/null 2>&1 || rc=$?
+          append_event "$run_id" "$task_id" stall_wake_result \
+            "$(jq -nc --arg k "$key" --arg s "$signal" --argjson rc "$rc" '{key:$k, signal:$s, exit_code:$rc}')" \
+            >/dev/null 2>&1 || true
+        fi
+      fi
+      return 0   # still inside the owner's window either way
+    fi
+
+    local status
+    status="$(_sw_owner_status "$conductor" "$conductor_birth")"
+    [ "$status" = unreachable ] && return 0   # herdr blip — retry next tick, no claim spent
+
+    claim_once "${key}_escalate" "$run_id" "$task_id" stall_escalate_claim "$payload" || return 0
+    local reason="the owner did not act within ${window}s of the wake"
+    [ "$status" = dead ] && reason="the conductor pane is gone or unreachable, and the owner never acted"
+    _sw_escalate "$task_id" "$run_id" "$signal" "$label" "$pane" "$conductor" "$detail" "$artifact" \
+      "$reason" "$digest"
+    return 0
   fi
 
-  if [ "$owner_ok" = 0 ]; then
+  # First sighting of this fingerprint.
+  local status
+  status="$(_sw_owner_status "$conductor" "$conductor_birth")"
+  if [ "$status" = unreachable ]; then
+    return 0   # herdr blip on the very first sighting — try again next tick, no claim spent
+  fi
+  if [ "$status" = dead ]; then
     claim_once "${key}_unowned" "$run_id" "$task_id" stall_wake_unowned \
       "$(jq -nc --arg s "$signal" --arg c "$conductor" '{signal:$s, conductor:$c}')" >/dev/null 2>&1 || return 0
     _sw_escalate "$task_id" "$run_id" "$signal" "$label" "$pane" "$conductor" "$detail" "$artifact" \
@@ -177,40 +288,15 @@ cmd_wake() {
     return 0
   fi
 
-  local payload
-  payload="$(jq -nc --arg s "$signal" --arg f "$fingerprint" --arg d "$detail" --arg a "$artifact" \
-             --arg p "$pane" --arg c "$conductor" \
-             '{signal:$s, fingerprint:$f, detail:$d, artifact:$a, pane:$p, conductor:$c}')"
-
   if claim_once "$key" "$run_id" "$task_id" stall_wake "$payload"; then
-    # First sighting of this exact fingerprint: this is the only chance to wake.
-    local art_note=""
+    local art_note="" rc=0
     [ -n "$artifact" ] && art_note=" ($artifact)"
-    local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: stall-ack.sh ${task_id} ${signal}"
-    local rc=0
+    local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
     bash "$SW_SEND" "$conductor" "$msg" >/dev/null 2>&1 || rc=$?
     append_event "$run_id" "$task_id" stall_wake_result \
       "$(jq -nc --arg k "$key" --arg s "$signal" --argjson rc "$rc" '{key:$k, signal:$s, exit_code:$rc}')" \
       >/dev/null 2>&1 || true
-    return 0
   fi
-
-  # Already woken for this fingerprint. Acknowledged -> stop repeating.
-  local claimed_iso claimed_epoch
-  claimed_iso="$(_sql "SELECT occurred_at FROM events WHERE event_id=$(_sq "$key") LIMIT 1;" 2>/dev/null)"
-  [ -n "$claimed_iso" ] || return 0
-  _sw_acked_since "$task_id" "$signal" "$claimed_iso" && return 0
-
-  claimed_epoch="$(_sw_claimed_at_epoch "$key")"
-  [ -n "$claimed_epoch" ] || return 0
-  local now_epoch window
-  now_epoch="$(date -u +%s)"
-  window="$(_sw_escalate_window_s)"
-  [ $(( now_epoch - claimed_epoch )) -ge "$window" ] || return 0   # still inside the owner's window
-
-  claim_once "${key}_escalate" "$run_id" "$task_id" stall_escalate_claim "$payload" || return 0
-  _sw_escalate "$task_id" "$run_id" "$signal" "$label" "$pane" "$conductor" "$detail" "$artifact" \
-    "the owner did not act within ${window}s of the wake" "$digest"
 }
 
 cmd_ack() {
