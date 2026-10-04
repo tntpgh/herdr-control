@@ -3729,18 +3729,43 @@ def _agent_output_lines(text: str) -> list[str]:
     return raw[:top] if top is not None else []
 
 
+_MD_LEADING_RE = re.compile(r'^[\*_]+')   # **CONDUCTOR:** / __CONDUCTOR:__
+
+
 def _last_conductor_prompt_line(text: str | None) -> str | None:
-    """The last non-blank line of genuine agent OUTPUT (never the composer
-    chrome below it — see `_agent_output_lines`), if it is a worker's own
-    `CONDUCTOR: ...` line — incident 2's actual shape (SPEC.md:51): no
-    deny, no delivery, no handoff event, just a worker asking directly."""
+    """The most recent worker-authored `CONDUCTOR: ...` line in genuine
+    agent OUTPUT (never the composer chrome below it — see
+    `_agent_output_lines`) — incident 2's actual shape (SPEC.md:51): no
+    deny, no delivery, no handoff event, just a worker asking directly.
+
+    Review M1: the first cut required the literal LAST non-blank row to
+    BE the whole line, so it went silent the moment the request wrapped
+    across terminal columns (the wrap's continuation row, not
+    `CONDUCTOR:...`, sat last), the moment the worker's own status/recap
+    block followed it (the recap sat last instead), or the moment the
+    worker bolded the marker (`**CONDUCTOR:**`, which a bare
+    `.startswith()` missed). This scans every captured output row from
+    the bottom instead, stripping a leading markdown emphasis run
+    (`*`/`_`) before the prefix test, and joins the wrap's own
+    continuation rows — rows that immediately follow with no blank row
+    between them and no `CONDUCTOR:` of their own — onto the line it
+    returns. A real recap block is always its own markdown paragraph
+    (blank row first), so it never joins in and never perturbs the
+    fingerprint a re-render or scroll produces."""
     if not text:
         return None
-    for line in reversed(_agent_output_lines(text)):
-        line = _ANSI_RE.sub("", line).strip()
-        if not line:
+    rows = [_ANSI_RE.sub("", ln).rstrip() for ln in _agent_output_lines(text)]
+    for i in range(len(rows) - 1, -1, -1):
+        row = _MD_LEADING_RE.sub("", rows[i].strip())
+        if not row or not row.startswith("CONDUCTOR:"):
             continue
-        return line if line.startswith("CONDUCTOR:") else None
+        parts = [row]
+        for nxt in rows[i + 1:]:
+            nxt = nxt.strip()
+            if not nxt or _MD_LEADING_RE.sub("", nxt).startswith("CONDUCTOR:"):
+                break
+            parts.append(nxt)
+        return " ".join(parts)
     return None
 
 

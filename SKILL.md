@@ -225,15 +225,18 @@ Three real incidents (2026-10-02/03) sat 8-14h each because the pane was
 idle or finished and nothing turned that into a wake — only into the hub's
 own "N task(s) need attention" COUNT, which nobody reads as an alert. A
 background sweep (same hub.py thread family as the attention controller,
-`--no-attention` disables it too) now watches for four signals and wakes
+`--no-attention` disables it too) now watches for five signals and wakes
 the task's recorded conductor pane directly:
 
-- a worker closed itself `handed_off_to:conductor` and nobody was told;
+- a worker closed itself `handed_off_to:<anything>` (read off its own live
+  worktree bus) and nobody was told;
 - `tmp/commit-msg.txt`, `tmp/REVIEW.md`, or `.handoffs/PROOF.md` has sat
   ready with no action;
 - a policy-refused prompt was denied, then the worker went idle;
 - a message was delivered to a worker's pane (`send-to-agent.sh`) and
-  nothing happened afterward — it was never processed.
+  nothing happened afterward — it was never processed;
+- the worker's own last pane output is a bare `CONDUCTOR: ...` line, with
+  no deny, delivery or handoff to explain the idle task.
 
 Idle past `HERDR_STALL_WATCHDOG_THRESHOLD_S` (default 600s) wakes the
 conductor once per (task, signal, occurrence) — `stall-watchdog.sh` claims

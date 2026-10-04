@@ -324,7 +324,8 @@ first result not frozen").
 (2026-10-02/03) that each sat 8–14h: a worker can go `done`/idle in a shape
 none of the above covers, because `ATTENTION = (blocked, stalled,
 ready_review)` deliberately excludes a completed task, and a handoff to the
-conductor is a terminal `state=completed` row, not a live prompt.
+conductor is read straight off the worker's own live worktree bus, not a
+registry row the conductor has to go look up.
 
 A new hub.py thread (same `--no-attention` switch disables it; no new
 daemon) ticks the SAME derived task rows `herdr_data()` already builds, plus
@@ -332,13 +333,20 @@ two supplemental queries (`approvals` for a denial never followed up,
 `events` for a `message_delivered` with no later activity), and asks a pure
 function — `stall_watchdog_candidates()`, unit-tested with injected
 clocks/`stat_fn`, no filesystem or registry needed — which rows match one of
-four signals:
+five signals, gated to `stalled`/`ready_review` only: once a task is
+`completed`, closing it IS the action owed, and nothing fires again for it:
 
-1. a `handed_off_to:conductor` closure never acted on;
+1. the worker's OWN worktree bus says `handed_off_to:<anything>` while
+   idle — not just the literal `:conductor`;
 2. `tmp/commit-msg.txt` / `tmp/REVIEW.md` / `.handoffs/PROOF.md` newer than
    the task's last recorded action;
 3. a policy denial, then the worker went idle;
-4. `message_delivered` (new event, `send-to-agent.sh`) with nothing after it.
+4. `message_delivered` (`send-to-agent.sh`) with nothing after it;
+5. the worker's own last pane output is a bare `CONDUCTOR: ...` line — no
+   deny, delivery or handoff to explain the idle task — matched across a
+   terminal wrap, a trailing status/recap block, or a bolded
+   `**CONDUCTOR:**` marker, and only once the pane's live birth still
+   matches what this task registered (a recycled pane id is never read).
 
 Each candidate dispatches to `stall-watchdog.sh wake`, which owns the
 SAME one-claim-per-occurrence shape `push_wake`/`attn_track_claim` use
@@ -362,7 +370,7 @@ a claim the work is done — and stops repeats/escalation for that fingerprint.
 ./stall-ack.sh <task_id> <signal>   # ack just one
 ./verify-stall-watchdog.sh          # bash: dedupe/owner-resolution/escalation
                                      # ladder against a real scratch registry;
-                                     # python: the four pure-function signals
+                                     # python: the five pure-function signals
                                      # plus the tick's on/off switch
 ```
 

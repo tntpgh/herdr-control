@@ -442,6 +442,112 @@ cands = hub.stall_watchdog_candidates(
     pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: None)
 results["Mb_conductor_prompt_silent_when_birth_cannot_be_confirmed"] = cands == []
 
+# ---- review M1 (r3): the last-non-blank-row check above was itself still
+# too narrow — silent the moment the request wraps across terminal columns,
+# the moment the worker's own recap/status block follows it, or the moment
+# the worker bolds the marker. All three are the SAME real omp shape: a
+# markdown message, written as one paragraph, that a terminal of any width
+# renders as however many physical rows it takes.
+CHROME_WRAPPED = ("an earlier line of agent output\n"
+                  "CONDUCTOR: please confirm the rollback plan before I proceed because the change touches\n"
+                  "the production webhook handler and a wrong call cannot be undone once it ships\n"
+                  "\u256d\u2500\u2500 omp \u00b7 sonnet \u00b7 ctx 42% \u2500\u2500\u256e\n"
+                  "\u2502 >                                          \u2502\n"
+                  "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n")
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME_WRAPPED, pane_birth_fn=lambda pane: "pb1")
+results["M1_fires_when_the_request_wraps_across_terminal_rows"] = any(
+    c["signal"] == "conductor_prompt" for c in cands)
+# The continuation row, joined on, is part of what gets hashed/shown.
+results["M1_wrapped_detail_includes_the_continuation_row"] = any(
+    c["signal"] == "conductor_prompt" and "undone once it ships" in c["detail"] for c in cands)
+
+# Real omp panes put a status/recap block below the request — its own
+# markdown paragraph, separated by a blank row — not the worker's last word.
+CHROME_RECAP_A = ("an earlier line of agent output\n"
+                  "CONDUCTOR: approve request ar_9 or tell me why not\n"
+                  "\n"
+                  "Recap: static review is done; only the test run is pending your reply.\n"
+                  "\u256d\u2500\u2500 omp \u00b7 sonnet \u00b7 ctx 42% \u2500\u2500\u256e\n"
+                  "\u2502 >                                          \u2502\n"
+                  "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n")
+CHROME_RECAP_B = CHROME_RECAP_A.replace(
+    "Recap: static review is done; only the test run is pending your reply.",
+    "Recap: review done, tests queued, waiting on your call.")
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME_RECAP_A, pane_birth_fn=lambda pane: "pb1")
+results["M1_fires_when_a_recap_block_follows_the_request"] = any(
+    c["signal"] == "conductor_prompt" for c in cands)
+fp_recap_a = next(c["fingerprint"] for c in cands if c["signal"] == "conductor_prompt")
+# A re-render/scroll that only changes the trailing recap text (same
+# request, same blank-line boundary) must NOT re-arm the claim.
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME_RECAP_B, pane_birth_fn=lambda pane: "pb1")
+fp_recap_b = next(c["fingerprint"] for c in cands if c["signal"] == "conductor_prompt")
+results["M1_a_rerendered_recap_is_not_a_new_fingerprint"] = fp_recap_a == fp_recap_b
+
+CHROME_BOLD = ("an earlier line of agent output\n"
+              "**CONDUCTOR:** approve request ar_11 or tell me why not\n"
+              "\u256d\u2500\u2500 omp \u00b7 sonnet \u00b7 ctx 42% \u2500\u2500\u256e\n"
+              "\u2502 >                                          \u2502\n"
+              "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n")
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME_BOLD, pane_birth_fn=lambda pane: "pb1")
+results["M1_fires_on_a_bold_markdown_conductor_marker"] = any(
+    c["signal"] == "conductor_prompt" for c in cands)
+
+# ---- M1 revert-proof: the PRE-FIX detector (literal last-non-blank-row,
+# no markdown strip) is installed in memory over the real one — no git
+# checkout/stash — and must go silent on exactly the three shapes above,
+# while the plain one-row case (N3, already fixed before this review round)
+# still fires either way.
+def _naive_last_conductor_prompt_line(text):
+    if not text:
+        return None
+    for line in reversed(hub._agent_output_lines(text)):
+        line = hub._ANSI_RE.sub("", line).strip()
+        if not line:
+            continue
+        return line if line.startswith("CONDUCTOR:") else None
+    return None
+
+real_last_conductor_prompt_line = hub._last_conductor_prompt_line
+hub._last_conductor_prompt_line = _naive_last_conductor_prompt_line
+
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME_WRAPPED, pane_birth_fn=lambda pane: "pb1")
+results["REVERT_M1_wrap_fix_caught_on_revert"] = not any(
+    c["signal"] == "conductor_prompt" for c in cands)
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME_RECAP_A, pane_birth_fn=lambda pane: "pb1")
+results["REVERT_M1_recap_fix_caught_on_revert"] = not any(
+    c["signal"] == "conductor_prompt" for c in cands)
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME_BOLD, pane_birth_fn=lambda pane: "pb1")
+results["REVERT_M1_bold_fix_caught_on_revert"] = not any(
+    c["signal"] == "conductor_prompt" for c in cands)
+# The plain one-row case predates this round's fix and must survive the
+# revert too — proof the mutation targets only what M1 actually changed.
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1")
+results["REVERT_M1_plain_case_unaffected_by_the_revert"] = any(
+    c["signal"] == "conductor_prompt" for c in cands)
+
+hub._last_conductor_prompt_line = real_last_conductor_prompt_line
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME_WRAPPED, pane_birth_fn=lambda pane: "pb1")
+results["REVERT_M1_restored_fix_fires_again"] = any(
+    c["signal"] == "conductor_prompt" for c in cands)
+
 # ---- _stall_task_signals(): real scratch registry ----------------------------
 db_dir = os.path.join(os.environ["WORK"], "runs2")
 os.makedirs(db_dir, exist_ok=True)
