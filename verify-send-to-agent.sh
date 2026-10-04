@@ -22,6 +22,16 @@ export SCREEN_DIR="$WORK/screens"
 export COUNTER="$WORK/enter-count"
 export KEYS="$WORK/keys.log"
 export SENDTEXT="$WORK/send-text.log"
+# feat/stall-watchdog: a registered-task SUBMITTED send now looks up
+# task_for_pane (lib/run-registry.sh) unconditionally, where before it only
+# ran when HERDR_PANE_ID was set. Isolated to a scratch registry so every
+# case below — none of which registers a task — stays a true no-op against
+# this, rather than quietly touching the real fleet registry at
+# ~/.local/state/herdr/runs.
+export HERDR_RUN_STATE_DIR="$WORK/runs"
+. "$here/lib/run-registry.sh"
+registry_init
+_q() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "$1" 2>/dev/null; }
 mkdir -p "$SCREEN_DIR"
 
 PANE="w1:p1"
@@ -340,4 +350,55 @@ send "some message"; rc=$?
 [ "$rc" -eq 5 ] && ok "exit 5 REFUSED on a menu the parser does not recognize" || bad "exit $rc: $(cat "$WORK/out.txt") / $(cat "$WORK/err.txt")"
 [ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed into the unrecognized menu" || bad "Enters=$(enters_pressed)"
 [ ! -s "$SENDTEXT" ] && ok "text never typed into the unrecognized menu" || bad "typed into a menu: $(cat "$SENDTEXT")"
+
+printf '== feat/stall-watchdog: a SUBMITTED send to a REGISTERED pane records message_delivered ==\n'
+reset_state
+register_task runX taskX workerX condX "" "" "$PANE" panebirthX repo/x /wt/x labelX >/dev/null
+screen 0 <<'EOF'
+  Ran 2 shell commands
+
+❯ a note for the worker
+
+  shortcuts
+EOF
+screen 1 <<'EOF'
+❯ a note for the worker
+
+⏺ Working on it now.
+❯
+
+  shortcuts
+EOF
+last_as 1
+send "a note for the worker"; rc=$?
+[ "$rc" -eq 0 ] && ok "exit 0" || bad "exit $rc: $(cat "$WORK/err.txt")"
+n_delivered=$(_q "SELECT count(*) FROM events WHERE type='message_delivered' AND task_id='taskX';")
+[ "$n_delivered" = "1" ] && ok "one message_delivered event recorded for the registered task" \
+  || bad "expected 1 message_delivered event, got $n_delivered"
+
+printf '== a SUBMITTED send to an UNREGISTERED pane records nothing (no task to attribute it to) ==\n'
+reset_state
+screen 0 <<'EOF'
+  Ran 2 shell commands
+
+❯ hello there
+
+  shortcuts
+EOF
+screen 1 <<'EOF'
+❯ hello there
+
+⏺ Working on it now.
+❯
+
+  shortcuts
+EOF
+last_as 1
+n_before=$(_q "SELECT count(*) FROM events WHERE type='message_delivered';")
+PANE="w9:p9" send "hello there"; rc=$?
+[ "$rc" -eq 0 ] && ok "exit 0" || bad "exit $rc: $(cat "$WORK/err.txt")"
+n_after=$(_q "SELECT count(*) FROM events WHERE type='message_delivered';")
+[ "$n_after" = "$n_before" ] && ok "no message_delivered event for an unregistered pane" \
+  || bad "expected $n_before message_delivered events, got $n_after"
+
 [ "$fail" -eq 0 ]

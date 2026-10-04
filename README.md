@@ -318,6 +318,54 @@ first result not frozen").
                                # reserved bypass, cross-pane independence
 ```
 
+### A done/idle task that still owes an action (`stall-watchdog.sh`)
+
+`.handoffs/SPEC.md` (feat/stall-watchdog), from three real incidents
+(2026-10-02/03) that each sat 8–14h: a worker can go `done`/idle in a shape
+none of the above covers, because `ATTENTION = (blocked, stalled,
+ready_review)` deliberately excludes a completed task, and a handoff to the
+conductor is a terminal `state=completed` row, not a live prompt.
+
+A new hub.py thread (same `--no-attention` switch disables it; no new
+daemon) ticks the SAME derived task rows `herdr_data()` already builds, plus
+two supplemental queries (`approvals` for a denial never followed up,
+`events` for a `message_delivered` with no later activity), and asks a pure
+function — `stall_watchdog_candidates()`, unit-tested with injected
+clocks/`stat_fn`, no filesystem or registry needed — which rows match one of
+four signals:
+
+1. a `handed_off_to:conductor` closure never acted on;
+2. `tmp/commit-msg.txt` / `tmp/REVIEW.md` / `.handoffs/PROOF.md` newer than
+   the task's last recorded action;
+3. a policy denial, then the worker went idle;
+4. `message_delivered` (new event, `send-to-agent.sh`) with nothing after it.
+
+Each candidate dispatches to `stall-watchdog.sh wake`, which owns the
+SAME one-claim-per-occurrence shape `push_wake`/`attn_track_claim` use
+(`claim_once`, keyed on task+signal+a fingerprint of the evidence — a
+rewritten artifact or a fresh denial is a NEW fingerprint and re-arms on its
+own): first sighting delivers to the task's registered
+`conductor_pane_id`/`conductor_pane_birth`, a later identical sighting is
+silent. A conductor pane that is empty, or whose live birth no longer
+matches what was registered (recycled), skips straight to escalation —
+there is no "wake" to attempt. Unacknowledged past
+`HERDR_STALL_WATCHDOG_ESCALATE_S` (default 2x
+`HERDR_STALL_WATCHDOG_THRESHOLD_S`, 600s): one escalation through the real
+alert path (`lib/alert-gate.sh`'s `alert_claim` + `slack-bridge/herdr-notify.sh
+--class stall-watchdog`), the same dedupe primitive `attention-tick.sh` uses
+for its own Main escalation. `./stall-ack.sh <task_id> [signal]` records that
+a human looked — the same honesty `ack.sh`'s ready_review marker keeps, not
+a claim the work is done — and stops repeats/escalation for that fingerprint.
+
+```bash
+./stall-ack.sh <task_id>            # ack every open signal on a task
+./stall-ack.sh <task_id> <signal>   # ack just one
+./verify-stall-watchdog.sh          # bash: dedupe/owner-resolution/escalation
+                                     # ladder against a real scratch registry;
+                                     # python: the four pure-function signals
+                                     # plus the tick's on/off switch
+```
+
 ### Multi-pane layouts, case by case (`spread-tab.sh`)
 
 `spawn-agent.sh`/`spawn-task.sh` only ever build ONE pane per tab — enough for

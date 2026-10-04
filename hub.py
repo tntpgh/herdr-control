@@ -873,8 +873,11 @@ def herdr_data(event_limit: int = 100) -> dict:
         cols = {r[0] for r in conn.execute("SELECT name FROM pragma_table_info('tasks')")}
         branch_col = "branch" if "branch" in cols else "'' AS branch"
         project_col = "project" if "project" in cols else "'' AS project"
+        cpid_col = "conductor_pane_id" if "conductor_pane_id" in cols else "'' AS conductor_pane_id"
+        cpbirth_col = "conductor_pane_birth" if "conductor_pane_birth" in cols else "'' AS conductor_pane_birth"
         tasks = [dict(r) for r in conn.execute(
-            "SELECT task_id, run_id, label, repo, state, pane_id, conductor_id, worktree, "
+            "SELECT task_id, run_id, label, repo, state, pane_id, conductor_id, "
+            f"{cpid_col}, {cpbirth_col}, worktree, "
             f"{branch_col}, {project_col}, created_at, updated_at "
             "FROM tasks ORDER BY updated_at DESC")]
         events = []
@@ -3247,6 +3250,174 @@ def _project_attention_loop() -> None:
 # this outer ttl mainly bounds how often the SPEC.md/claims/join work reruns.
 CACHES["projects"] = Cached(10, projects_data, stale_ok=True, name="projects")
 
+# ---- stall watchdog: idle/done while still owing the conductor an action ---
+# .handoffs/SPEC.md (feat/stall-watchdog): three real incidents, 8-14h each
+# (2026-10-02/03), every one a task whose pane went idle or finished while a
+# signal sat on it that nothing ever turned into a wake — the hub's own
+# "N task(s) need attention" COUNT was accurate and ignored the whole time.
+#
+# Same split as project-wake.sh ("hub.py decides WHAT, bash decides HOW"):
+# this is the WHAT half, a pure function over the already-derived task list
+# herdr_data() produces (idle/done is `derive()`'s job, not re-implemented
+# here) plus two small supplemental facts herdr_data() does not carry.
+STALL_SIGNAL_ARTIFACTS = ("tmp/commit-msg.txt", "tmp/REVIEW.md", ".handoffs/PROOF.md")
+STALL_WATCHDOG_THRESHOLD_S = float(os.environ.get("HERDR_STALL_WATCHDOG_THRESHOLD_S", "600") or 600)
+
+
+def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
+                              denied: dict | None = None, delivered: dict | None = None,
+                              stat_fn=None, threshold_s: float | None = None) -> list[dict]:
+    """Which (task, signal) pairs have sat idle/done, owing the conductor an
+    action, for at least `threshold_s` (HERDR_STALL_WATCHDOG_THRESHOLD_S).
+
+    `denied`/`delivered` are precomputed {task_id: {"epoch":…, "fingerprint":…}}
+    maps for the two signals `herdr_data()` cannot see on its own (a denied
+    approval, an unprocessed delivered message) — see `_stall_denied_and_delivered`.
+    `stat_fn` is injectable (signal 2's artifact mtime) so this stays a pure
+    function callers can test with plain dicts, no filesystem or registry
+    required — same testability as `project_needs_wake`.
+
+    Four signals, each its own `fingerprint` (what the claim_once key in
+    stall-watchdog.sh re-arms on when it changes):
+      handoff     — closed `handed_off_to:conductor`. TERMINAL rows are
+                    exactly what `ATTENTION` excludes by design, so this is
+                    the one signal that is not also `stalled`/`ready_review`
+                    — incident 1's bug lived in exactly that gap.
+      artifact    — one of the three named files exists, idle past threshold.
+      denied      — the worker's last approval was a DENY, then went idle.
+      unprocessed — a message was delivered to this pane and nothing (no
+                    later event from the worker) has happened since.
+    """
+    now = time.time() if now is None else now
+    threshold = STALL_WATCHDOG_THRESHOLD_S if threshold_s is None else threshold_s
+    denied = denied or {}
+    delivered = delivered or {}
+    if stat_fn is None:
+        def stat_fn(p):
+            return os.stat(p).st_mtime
+    out: list[dict] = []
+    for t in tasks:
+        tid = t.get("task_id")
+        if not tid:
+            continue
+        state = t.get("state")
+        base = {"task_id": tid, "run_id": t.get("run_id") or "",
+                "label": t.get("label") or tid, "pane_id": t.get("pane_id") or "",
+                "conductor_pane_id": t.get("conductor_pane_id") or "",
+                "conductor_pane_birth": t.get("conductor_pane_birth") or ""}
+
+        if state == "completed" and (t.get("closure_reason") or "") == "handed_off_to:conductor":
+            since = _iso_epoch(t.get("updated_at")) or now
+            if now - since >= threshold:
+                out.append({**base, "signal": "handoff", "fingerprint": t.get("updated_at") or tid,
+                           "detail": "closed handed_off_to:conductor; the conductor was never told",
+                           "artifact": ""})
+
+        if state in ("stalled", "ready_review", "completed") and t.get("worktree"):
+            for rel in STALL_SIGNAL_ARTIFACTS:
+                try:
+                    mtime = stat_fn(os.path.join(t["worktree"], rel))
+                except OSError:
+                    continue
+                if mtime is None or now - mtime < threshold:
+                    continue
+                out.append({**base, "signal": "artifact", "fingerprint": f"{rel}:{int(mtime)}",
+                           "detail": f"{rel} has sat ready {int((now - mtime) / 60)}m with no action",
+                           "artifact": rel})
+
+        if state == "stalled":
+            d = denied.get(tid)
+            if d and now - d["epoch"] >= threshold:
+                out.append({**base, "signal": "denied", "fingerprint": d["fingerprint"],
+                           "detail": "a policy-refused prompt was denied, then the worker went idle",
+                           "artifact": ""})
+            m = delivered.get(tid)
+            if m and now - m["epoch"] >= threshold:
+                out.append({**base, "signal": "unprocessed", "fingerprint": m["fingerprint"],
+                           "detail": "a message was delivered to this pane and never processed",
+                           "artifact": ""})
+    return out
+
+
+STALL_WATCHDOG_SCRIPT = Path(__file__).resolve().parent / "stall-watchdog.sh"
+# stall-watchdog.sh's own events (its wake/escalate/ack bookkeeping) must
+# never count as "something happened after delivery" for the `unprocessed`
+# signal — otherwise detecting it once would itself clear it.
+_STALL_OWN_EVENT_TYPES = ("message_delivered", "stall_wake", "stall_wake_result",
+                          "stall_wake_unowned", "stall_escalate_claim", "stall_escalated",
+                          "stall_acked")
+
+
+def _stall_denied_and_delivered() -> tuple[dict, dict]:
+    """The two supplemental facts `herdr_data()` does not carry: the latest
+    DENIED approval per task, and the latest `message_delivered` event per
+    task that has had no later event from that task at all (still genuinely
+    unprocessed — a worker that did ANYTHING since, including a routine
+    progress note, is not "never processed", only idle)."""
+    denied: dict = {}
+    delivered: dict = {}
+    if not REGISTRY.exists():
+        return denied, delivered
+    try:
+        conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return denied, delivered
+    try:
+        for tid, decided_at, approval_id in conn.execute(
+                "SELECT task_id, decided_at, approval_id FROM approvals "
+                "WHERE task_id != '' AND (policy_verdict='deny' OR choice_text LIKE '%Deny%') "
+                "ORDER BY decided_at DESC"):
+            if tid in denied:
+                continue
+            ep = _iso_epoch(decided_at)
+            if ep is not None:
+                denied[tid] = {"epoch": ep, "fingerprint": approval_id}
+        placeholders = ",".join("?" for _ in _STALL_OWN_EVENT_TYPES)
+        for tid, seq, occurred_at in conn.execute(
+                "SELECT task_id, sequence, occurred_at FROM events "
+                "WHERE type='message_delivered' AND task_id != '' ORDER BY sequence DESC"):
+            if tid in delivered:
+                continue
+            later = conn.execute(
+                f"SELECT count(*) FROM events WHERE task_id=? AND sequence>? AND type NOT IN ({placeholders})",
+                (tid, seq, *_STALL_OWN_EVENT_TYPES)).fetchone()[0]
+            if later:
+                continue
+            ep = _iso_epoch(occurred_at)
+            if ep is not None:
+                delivered[tid] = {"epoch": ep, "fingerprint": str(seq)}
+    finally:
+        conn.close()
+    return denied, delivered
+
+
+def _stall_watchdog_tick() -> None:
+    """One pass: compute the candidates against the SAME cached herdr_data()
+    every other read uses, then hand each one to stall-watchdog.sh, which
+    owns dedupe/delivery/escalation. Never raises."""
+    if not STALL_WATCHDOG_SCRIPT.exists():
+        return
+    h = CACHES["herdr"].get()
+    if not h or h.get("error"):
+        return
+    denied, delivered = _stall_denied_and_delivered()
+    for c in stall_watchdog_candidates(h.get("tasks") or [], denied=denied, delivered=delivered):
+        try:
+            subprocess.run(["bash", str(STALL_WATCHDOG_SCRIPT), "wake", c["task_id"], c["signal"],
+                            c["fingerprint"], c["detail"], c.get("artifact") or ""],
+                           capture_output=True, timeout=25)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _live_log(f"stall watchdog wake failed for {c['task_id']}/{c['signal']}: {exc}")
+
+
+def _stall_watchdog_loop() -> None:
+    while True:
+        try:
+            _stall_watchdog_tick()
+        except Exception:  # noqa: BLE001 — belt and braces: the loop must not die
+            pass
+        time.sleep(ATTENTION_INTERVAL_S)
+
 
 def page(title: str, path: str, body: str, refresh: int = 15, scope: str = "", json_extra: str = "") -> str:
     """refresh=0 disables the meta-refresh; the caller supplies its own poller.
@@ -4317,6 +4488,12 @@ def main() -> int:
         # with NO pane blocked at all (every worker for the project already
         # exited). Same --no-attention flag disables both.
         threading.Thread(target=_project_attention_loop, name="project-attention", daemon=True).start()
+        # feat/stall-watchdog — a THIRD thread, same split again: an idle/done
+        # task owing the conductor an action is neither "a pane blocked right
+        # now" (attention-controller) nor "a project with no live worker"
+        # (project-attention), so it gets its own sweep rather than being
+        # folded into either. Same --no-attention flag disables all three.
+        threading.Thread(target=_stall_watchdog_loop, name="stall-watchdog", daemon=True).start()
     # Unconditional (no --no-X flag): two small git fetches against repos we
     # own, nowhere near mirror's cost, and skipping it would reopen exactly
     # the inline-fetch-on-cold-read bug it exists to close.

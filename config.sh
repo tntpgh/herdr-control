@@ -174,6 +174,24 @@ fi
 # narrower one.
 : "${HERDR_WAKE_LEGACY:=0}"
 
+# ---- stall watchdog (.handoffs/SPEC.md feat/stall-watchdog) ----------------
+# A task whose pane has gone idle or finished while it still owes the
+# conductor an action (a handoff, a ready artifact, a denied prompt the
+# worker never followed up on, a delivered message never processed) used to
+# sit invisibly inside the hub's own "N task(s) need attention" COUNT — a
+# page nobody reads as a wake-up (three real incidents, 8-14h each,
+# 2026-10-02/03). hub.py's stall_watchdog_candidates() decides WHICH (task,
+# signal) pairs qualify on its own HERDR_ATTENTION_INTERVAL_S cadence
+# (--no-attention disables this too); stall-watchdog.sh owns dedupe,
+# conductor-pane resolution, delivery and the second-window escalation.
+#
+# How long a signal may sit idle before the owner is woken.
+: "${HERDR_STALL_WATCHDOG_THRESHOLD_S:=600}"
+# How long the owner then has, unacknowledged (stall-ack.sh), before a real
+# Slack alert goes out instead of just a wake in their pane. Unset means
+# 2x the detect threshold, the same ladder shape as HERDR_WAKE_RESPONSE_S.
+: "${HERDR_STALL_WATCHDOG_ESCALATE_S:=}"
+
 # ============================================================================
 #  End of your config — generic below.
 # ============================================================================
@@ -184,4 +202,5 @@ export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES HERDR_CANONICAL_RULES
 export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_BACKEND SMART_NAME_MODEL SMART_NAME_TIMEOUT
 export SMART_NAME_COOLDOWN SMART_NAME_EVIDENCE_CHARS HERDR_STALL_SECS
 export HERDR_ATTENTION_INTERVAL_S HERDR_WAKE_RESPONSE_S HERDR_SLACK_LEVEL HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH HERDR_WAKE_LEGACY
+export HERDR_STALL_WATCHDOG_THRESHOLD_S HERDR_STALL_WATCHDOG_ESCALATE_S
 export PATH="$HERDR_EXTRA_PATH:/usr/bin:/bin:${PATH:-}"

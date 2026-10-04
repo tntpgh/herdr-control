@@ -220,6 +220,40 @@ next tick picks it up, with no hub restart, once the deployed hub is at or past
 this revision (`restart.sh --deploy`). Without it, escalations are recorded as
 "Main could not be reached". `--show` prints it, and `--clear` removes it on exit.
 
+**Stall watchdog — an idle/done task that still owes YOU an action.**
+Three real incidents (2026-10-02/03) sat 8-14h each because the pane was
+idle or finished and nothing turned that into a wake — only into the hub's
+own "N task(s) need attention" COUNT, which nobody reads as an alert. A
+background sweep (same hub.py thread family as the attention controller,
+`--no-attention` disables it too) now watches for four signals and wakes
+the task's recorded conductor pane directly:
+
+- a worker closed itself `handed_off_to:conductor` and nobody was told;
+- `tmp/commit-msg.txt`, `tmp/REVIEW.md`, or `.handoffs/PROOF.md` has sat
+  ready with no action;
+- a policy-refused prompt was denied, then the worker went idle;
+- a message was delivered to a worker's pane (`send-to-agent.sh`) and
+  nothing happened afterward — it was never processed.
+
+Idle past `HERDR_STALL_WATCHDOG_THRESHOLD_S` (default 600s) wakes the
+conductor once per (task, signal, occurrence) — `stall-watchdog.sh` claims
+it, same one-shot shape `attn_track_claim` uses for a live prompt. Still
+unacknowledged past `HERDR_STALL_WATCHDOG_ESCALATE_S` (default 2x the
+threshold), or the conductor is unknown/dead (no pane recorded, or the
+pane's been recycled): it escalates through the SAME alert path a stuck
+prompt does (`slack-bridge/herdr-notify.sh --class stall-watchdog`), so
+Terrence gets a real notification, not just a hub count.
+
+```bash
+./stall-ack.sh <task_id>            # "I acted" — stops repeats/escalation
+./stall-ack.sh <task_id> <signal>   # ack just one signal
+```
+
+Acking is a record that a human looked, not a claim the work is done — the
+same honesty `ack.sh`'s own ready_review marker keeps. A signal whose
+underlying evidence CHANGES (the artifact is rewritten, a fresh denial
+lands) re-arms on its own regardless of an earlier ack.
+
 **Conductor exit.** Before a conductor stops, meaning it has saved its session
 and handoff and retained its lessons, it closes its shipped workers:
 
