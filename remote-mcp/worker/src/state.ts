@@ -217,6 +217,30 @@ export interface TaskEventRow {
   // comment in types.ts -- the latter breaks RPC Stubify discriminant
   // narrowing for every caller of listEvents/waitForEvents/taskEventLog.
   detail: object;
+  // Envelope (HERDR-REPLAYABLE-EVENTS-PLAN.md Phase 1, "canonical event
+  // envelope"): event_id is null for the Worker's own unkeyed lifecycle
+  // events (recordTaskEvent), set for a producer-keyed event
+  // (owner.reply_ready); subject is {kind,id} when one resource exists
+  // (never parsed from `detail` -- a typed column, so authorization never
+  // depends on parsing JSON).
+  event_id: string | null;
+  schema_version: number;
+  source: string;
+  subject: { kind: string; id: string } | null;
+}
+
+// list_events/wait_for_events' own page shape: replay_floor_cursor,
+// latest_cursor, scanned_through_cursor and a typed gap/scope result,
+// never inferred from MIN(cursor) or from the last VISIBLE row's cursor
+// (plan section 5) -- scanned_through_cursor is the last RAW row examined,
+// so a page containing only unauthorized/filtered rows still advances.
+export interface EventPage {
+  events: TaskEventRow[];
+  scanned_through_cursor: number;
+  latest_cursor: number;
+  replay_floor_cursor: number;
+  scope_hash: string;
+  result: "ok" | "cursor_pruned" | "cursor_scope_mismatch";
 }
 
 // A started remote task's own (actor, client_id), the way pendingSenders()
@@ -250,6 +274,25 @@ const CALLS_PER_MINUTE = 60;
 const CALLS_PER_DAY = 2000;
 
 const iso = (ms: number) => new Date(ms).toISOString();
+
+// A caller-bound opaque token for list_events/wait_for_events' cursor
+// contract (plan section 5, "a cursor is bound to a stable authorization/
+// filter scope hash"). FNV-1a, not crypto.subtle: sync() and listEvents()
+// are deliberately synchronous (no awaits between a SELECT and the UPDATE/
+// INSERT it gates, which is what makes the owner-reply acceptance
+// transaction atomic without an explicit DO transaction -- see sync()).
+// Not security-sensitive: it only needs to change when (email, client_id)
+// changes, not to resist a determined attacker who already holds a token
+// scoped to that identity.
+function scopeHash(caller: { email: string; client_id: string }): string {
+  let h = 0x811c9dc5;
+  const s = `${caller.email}\n${caller.client_id}`;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
 
 // Maps a local registry task's own state (synced each tick in
 // snapshot.tasks, whose vocabulary is lib/run-registry.sh's lifecycle) onto
@@ -336,6 +379,34 @@ export class HerdrState extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS task_events (cursor INTEGER PRIMARY KEY AUTOINCREMENT,
       remote_task_id TEXT NOT NULL, type TEXT NOT NULL, at INTEGER NOT NULL, detail TEXT NOT NULL DEFAULT '{}')`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS task_events_by_task ON task_events(remote_task_id, cursor)`);
+    // Replayable-events envelope (HERDR-REPLAYABLE-EVENTS-PLAN.md Phase 1):
+    // event_id is the stable idempotency key a producer supplies (null for
+    // the Worker's own unkeyed lifecycle events, which never need dedupe);
+    // subject_kind/subject_id are the typed nullable join the plan asks for
+    // (remote_task_id already serves that role for task events, so this is
+    // only populated beyond it for non-task subjects like an owner
+    // exchange); visibility/sender_actor/sender_client gate who may ever
+    // read a private event back out (listEvents/waitForEvents), never the
+    // publisher ingestion path -- this branch adds no channel through which
+    // the publisher can set any of these, so it cannot forge a
+    // Worker-owned event (OWNERSHIP.md). Detected via PRAGMA table_info,
+    // same idempotent-retry shape as the `results` PRIMARY KEY migration
+    // above; ADD COLUMN only, no rebuild needed.
+    const teCols = this.sql.exec<{ name: string }>(`PRAGMA table_info(task_events)`).toArray().map((r) => r.name);
+    if (!teCols.includes("event_id")) {
+      this.sql.exec(`ALTER TABLE task_events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1`);
+      this.sql.exec(`ALTER TABLE task_events ADD COLUMN event_id TEXT`);
+      this.sql.exec(`ALTER TABLE task_events ADD COLUMN source TEXT NOT NULL DEFAULT 'worker_internal'`);
+      this.sql.exec(`ALTER TABLE task_events ADD COLUMN subject_kind TEXT NOT NULL DEFAULT ''`);
+      this.sql.exec(`ALTER TABLE task_events ADD COLUMN subject_id TEXT NOT NULL DEFAULT ''`);
+      this.sql.exec(`ALTER TABLE task_events ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'`);
+      this.sql.exec(`ALTER TABLE task_events ADD COLUMN sender_actor TEXT NOT NULL DEFAULT ''`);
+      this.sql.exec(`ALTER TABLE task_events ADD COLUMN sender_client TEXT NOT NULL DEFAULT ''`);
+      this.sql.exec(`ALTER TABLE task_events ADD COLUMN correlation_id TEXT NOT NULL DEFAULT ''`);
+      this.sql.exec(`UPDATE task_events SET subject_kind='remote_task', subject_id=remote_task_id, correlation_id=remote_task_id
+        WHERE remote_task_id<>''`);
+    }
+    this.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS task_events_event_id ON task_events(event_id) WHERE event_id IS NOT NULL`);
     // send_owner_message's own queue, independent of `messages` (different
     // rate limit, different target shape -- a named owning session, never a
     // task's agent -- different ack vocabulary: delivered/blocked/replied,
@@ -602,9 +673,46 @@ export class HerdrState extends DurableObject<Env> {
     return this.view(nowMs).snapshot?.task_config?.caps ?? DEFAULT_TASK_CAPS;
   }
 
+  // Immutable-duplicate check (plan section 1): a null eventId (every
+  // existing internal lifecycle call site, via recordTaskEvent below)
+  // always inserts -- those events were never retried input, only the
+  // Worker's own one-shot state transitions. A non-null eventId is the
+  // stable transition id a producer supplies; a second insert attempt
+  // under the SAME id is compared field-for-field (not hashed -- sync()
+  // has no await between the SELECT and the owner_messages UPDATE it
+  // gates, which is what makes that acceptance atomic, so the comparator
+  // here stays synchronous too) against what is already stored: an exact
+  // match is "the same retried call, already durable" (duplicate_same_
+  // payload, no second row); a mismatch is a hard integrity error
+  // (rejected:duplicate_payload_mismatch, no second row either) -- never
+  // silently coerced into one or the other.
+  private insertEvent(nowMs: number, e: { eventId: string | null; remoteTaskId: string; type: string; source: string;
+      subjectKind: string; subjectId: string; visibility: "public" | "owner_private"; senderActor: string;
+      senderClient: string; correlationId: string; data: Record<string, unknown> }):
+      { outcome: "accepted" | "duplicate_same_payload" | "rejected:duplicate_payload_mismatch"; cursor: number | null } {
+    const dataJson = JSON.stringify(e.data).slice(0, 2000);
+    if (e.eventId) {
+      const existing = this.sql.exec<{ cursor: number; type: string; subject_kind: string; subject_id: string; detail: string }>(
+        `SELECT cursor, type, subject_kind, subject_id, detail FROM task_events WHERE event_id=?`, e.eventId).toArray()[0];
+      if (existing) {
+        const same = existing.type === e.type && existing.subject_kind === e.subjectKind
+          && existing.subject_id === e.subjectId && existing.detail === dataJson;
+        return { outcome: same ? "duplicate_same_payload" : "rejected:duplicate_payload_mismatch", cursor: same ? existing.cursor : null };
+      }
+    }
+    this.sql.exec(`INSERT INTO task_events (remote_task_id, type, at, detail, schema_version, event_id, source,
+        subject_kind, subject_id, visibility, sender_actor, sender_client, correlation_id)
+      VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?)`,
+      e.remoteTaskId, e.type, nowMs, dataJson, e.eventId, e.source, e.subjectKind, e.subjectId, e.visibility,
+      e.senderActor, e.senderClient, e.correlationId);
+    const cursor = this.sql.exec<{ c: number }>(`SELECT last_insert_rowid() AS c`).one().c;
+    return { outcome: "accepted", cursor };
+  }
+
   private recordTaskEvent(nowMs: number, remoteTaskId: string, type: string, detail: Record<string, unknown> = {}): void {
-    this.sql.exec(`INSERT INTO task_events (remote_task_id, type, at, detail) VALUES (?,?,?,?)`,
-      remoteTaskId, type, nowMs, JSON.stringify(detail).slice(0, 2000));
+    this.insertEvent(nowMs, { eventId: null, remoteTaskId, type, source: "worker_internal",
+      subjectKind: remoteTaskId ? "remote_task" : "", subjectId: remoteTaskId, visibility: "public",
+      senderActor: "", senderClient: "", correlationId: remoteTaskId, data: detail });
   }
 
   startTask(nowMs: number, caller: Caller, scopes: string[], repo: string, mode: "research" | "implement", rawObjective: string): StartTaskOutcome {
@@ -802,38 +910,96 @@ export class HerdrState extends DurableObject<Env> {
   // get_task_answer's "progress" field: this one remote task's own recent
   // history, newest first (unlike listEvents' global ascending cursor feed).
   taskEventLog(remoteTaskId: string, limit: number): TaskEventRow[] {
-    return this.sql.exec<{ cursor: number; remote_task_id: string; type: string; at: number; detail: string }>(
-      `SELECT cursor, remote_task_id, type, at, detail FROM task_events WHERE remote_task_id=? ORDER BY cursor DESC LIMIT ?`,
+    return this.sql.exec<{ cursor: number; remote_task_id: string; type: string; at: number; detail: string;
+      event_id: string | null; schema_version: number; source: string; subject_kind: string; subject_id: string }>(
+      `SELECT cursor, remote_task_id, type, at, detail, event_id, schema_version, source, subject_kind, subject_id
+       FROM task_events WHERE remote_task_id=? ORDER BY cursor DESC LIMIT ?`,
       remoteTaskId, limit,
     ).toArray().map((r) => ({ cursor: r.cursor, remote_task_id: r.remote_task_id, type: r.type, at: iso(r.at),
-      detail: JSON.parse(r.detail || "{}") as object }));
+      detail: JSON.parse(r.detail || "{}") as object, event_id: r.event_id, schema_version: r.schema_version,
+      source: r.source, subject: r.subject_kind ? { kind: r.subject_kind, id: r.subject_id } : null }));
   }
 
-  listEvents(sinceCursor: number, limit: number): { cursor: number; events: TaskEventRow[] } {
-    const rows = this.sql.exec<{ cursor: number; remote_task_id: string; type: string; at: number; detail: string }>(
-      `SELECT cursor, remote_task_id, type, at, detail FROM task_events WHERE cursor > ? ORDER BY cursor LIMIT ?`, sinceCursor, limit,
+  // Durable pruning bookkeeping (plan section 5): the highest cursor that
+  // MAY have been deleted by sync()'s own non-prefix prune (terminal-task
+  // events older than 30 days -- it can delete an old row for one task
+  // while a much OLDER row for a still-active task survives, so MIN(cursor)
+  // is never a safe floor). Monotonic: only ever raised, never lowered.
+  private replayFloorCursor(): number {
+    const row = this.sql.exec<{ v: string }>(`SELECT v FROM kv WHERE k='replay_floor_cursor'`).toArray()[0];
+    return row ? Number(row.v) : 0;
+  }
+
+  private raiseReplayFloor(candidateMax: number | null): void {
+    if (candidateMax === null || candidateMax <= this.replayFloorCursor()) return;
+    this.sql.exec(`INSERT OR REPLACE INTO kv (k, v) VALUES ('replay_floor_cursor', ?)`, String(candidateMax));
+  }
+
+  // The global feed, scope-bound (plan section 5 + section 7): sinceCursor
+  // is rejected as cursor_pruned below the durable replay floor (never
+  // trusted bare -- a stale cursor under a false "still complete" read
+  // would silently drop events); sinceScopeHash (echoed back every call as
+  // scope_hash) is rejected as cursor_scope_mismatch the instant the
+  // caller's own authorization identity changes, so a cursor minted under
+  // one identity can never be replayed as if it were another's. Owner-
+  // private rows (owner.reply_ready) are filtered to the original sender
+  // only (plan section 7: "owner exchange events are visible only ... to
+  // the original sender/client"); scanned_through_cursor is the last RAW
+  // row examined, not the last VISIBLE one, so a page of entirely filtered
+  // rows still advances a watcher's pagination instead of looping or
+  // silently truncating it (plan section 5, "filtered pagination advances
+  // with scanned_through_cursor").
+  listEvents(sinceCursor: number, sinceScopeHash: string | null, caller: Caller, limit: number): EventPage {
+    const hash = scopeHash(caller);
+    const latest = this.sql.exec<{ c: number | null }>(`SELECT MAX(cursor) AS c FROM task_events`).one().c ?? 0;
+    const floor = this.replayFloorCursor();
+    if (sinceScopeHash && sinceScopeHash !== hash) {
+      return { events: [], scanned_through_cursor: sinceCursor, latest_cursor: latest, replay_floor_cursor: floor,
+        scope_hash: hash, result: "cursor_scope_mismatch" };
+    }
+    if (sinceCursor > 0 && sinceCursor < floor) {
+      return { events: [], scanned_through_cursor: sinceCursor, latest_cursor: latest, replay_floor_cursor: floor,
+        scope_hash: hash, result: "cursor_pruned" };
+    }
+    const rows = this.sql.exec<{ cursor: number; remote_task_id: string; type: string; at: number; detail: string;
+      event_id: string | null; schema_version: number; source: string; subject_kind: string; subject_id: string;
+      visibility: string; sender_actor: string; sender_client: string }>(
+      `SELECT cursor, remote_task_id, type, at, detail, event_id, schema_version, source, subject_kind, subject_id,
+         visibility, sender_actor, sender_client
+       FROM task_events WHERE cursor > ? ORDER BY cursor LIMIT ?`, sinceCursor, limit,
     ).toArray();
+    const visible = rows.filter((r) => r.visibility !== "owner_private"
+      || (r.sender_actor === caller.email && r.sender_client === caller.client_id));
     return {
-      cursor: rows.length ? rows[rows.length - 1]!.cursor : sinceCursor,
-      events: rows.map((r) => ({ cursor: r.cursor, remote_task_id: r.remote_task_id, type: r.type, at: iso(r.at),
-        detail: JSON.parse(r.detail || "{}") as object })),
+      events: visible.map((r) => ({ cursor: r.cursor, remote_task_id: r.remote_task_id, type: r.type, at: iso(r.at),
+        detail: JSON.parse(r.detail || "{}") as object, event_id: r.event_id, schema_version: r.schema_version,
+        source: r.source, subject: r.subject_kind ? { kind: r.subject_kind, id: r.subject_id } : null })),
+      scanned_through_cursor: rows.length ? rows[rows.length - 1]!.cursor : sinceCursor,
+      latest_cursor: latest, replay_floor_cursor: floor, scope_hash: hash, result: "ok",
     };
   }
 
   // Holds the request open until a new event lands or timeoutS elapses --
   // the "notification" a ChatGPT-style client can actually receive without
   // true server push (SPEC item 5). timeoutS is already clamped <= 25 by the
-  // tool's own input schema before this is ever called.
-  async waitForEvents(sinceCursor: number, timeoutS: number): Promise<{ cursor: number; events: TaskEventRow[] }> {
+  // tool's own input schema before this is ever called. A pruned/scope-
+  // mismatched page returns immediately (nothing to wait out); an ok page
+  // with zero VISIBLE events still advances the poll cursor to
+  // scanned_through_cursor, so a long run of another caller's filtered
+  // owner events never makes this loop re-scan the same rows every 500ms.
+  async waitForEvents(sinceCursor: number, sinceScopeHash: string | null, caller: Caller, timeoutS: number): Promise<EventPage> {
     const deadline = Date.now() + timeoutS * 1000;
+    let cursor = sinceCursor;
     for (;;) {
-      const out = this.listEvents(sinceCursor, 200);
-      if (out.events.length > 0 || Date.now() >= deadline) return out;
+      const out = this.listEvents(cursor, sinceScopeHash, caller, 200);
+      if (out.result !== "ok" || out.events.length > 0 || Date.now() >= deadline) return out;
+      cursor = out.scanned_through_cursor;
       const { promise, resolve } = Promise.withResolvers<void>();
       setTimeout(resolve, 500);
       await promise;
     }
   }
+
 
   // One table for every HMAC-signed request (sync and admin): a nonce is used once.
   private takeNonce(nowMs: number, nonce: string): boolean {
@@ -1050,8 +1216,10 @@ export class HerdrState extends DurableObject<Env> {
       // never be matched against the right one by exchange_id alone --
       // echo back the REQUESTED owner_label on every result so the Mac
       // can key by (owner_label, exchange_id), not exchange_id alone.
-      const m = this.sql.exec<{ owner_label: string; status: string; reply_body: string | null }>(
-        `SELECT owner_label, status, reply_body FROM owner_messages WHERE exchange_id=?`, r.exchange_id).toArray()[0];
+      const m = this.sql.exec<{ owner_label: string; status: string; reply_body: string | null;
+        sender_actor: string; sender_client: string }>(
+        `SELECT owner_label, status, reply_body, sender_actor, sender_client FROM owner_messages WHERE exchange_id=?`,
+        r.exchange_id).toArray()[0];
       if (!m || m.owner_label !== r.owner_label) {
         ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome: "ignored:missing" });
         continue;
@@ -1079,6 +1247,24 @@ export class HerdrState extends DurableObject<Env> {
           reply_artifact_revision=?, replied_at=?, updated_at=? WHERE exchange_id=?`,
         r.body, r.session, r.artifact_revision, Number.isFinite(respondedMs) ? respondedMs : nowMs, nowMs, r.exchange_id);
       this.audit(nowMs, { ...sys, target: m.owner_label, decision: "replied", reason: "", message_id: r.exchange_id, detail: "" });
+      // Plan section 3: "conditionally update owner_messages AND insert
+      // owner.reply_ready in the same D1 transaction, using a stable
+      // transition ID derived from the exchange and accepted reply
+      // revision" -- reached ONLY from the UPDATE above (a guarded/no-op
+      // update, every branch above this one, emits nothing), and atomic
+      // with it: sync() has no await between them, so no other request can
+      // observe the owner_messages row as 'replied' without this event
+      // already being durable, or vice versa. data carries owner_label
+      // only -- never reply_body (plan section 4: "the events carry no
+      // reply text"); visibility owner_private restricts it to this
+      // exchange's own sender (listEvents/waitForEvents).
+      this.insertEvent(nowMs, {
+        eventId: `hev:worker:owner_reply:${r.exchange_id}:${r.artifact_revision || "none"}`,
+        remoteTaskId: "", type: "owner.reply_ready", source: "owner_inbox",
+        subjectKind: "owner_exchange", subjectId: r.exchange_id, visibility: "owner_private",
+        senderActor: m.sender_actor, senderClient: m.sender_client, correlationId: r.exchange_id,
+        data: { owner_label: m.owner_label },
+      });
       ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome: "accepted" });
     }
 
@@ -1351,9 +1537,20 @@ export class HerdrState extends DurableObject<Env> {
     this.sql.exec(`DELETE FROM messages WHERE status IN ('delivered','refused','failed','expired') AND updated_at < ?`, nowMs - 30 * 86_400_000);
     this.sql.exec(`DELETE FROM results WHERE synced_at < ?`, nowMs - 30 * 86_400_000);
     this.sql.exec(`DELETE FROM commands WHERE status='done' AND updated_at < ?`, nowMs - 30 * 86_400_000);
+    // Non-prefix prune (plan section 5): this can delete an old row for
+    // one terminal task while a much OLDER row for a still-active task
+    // survives, so MIN(cursor) afterward is never a safe replay floor --
+    // capture the highest cursor THIS delete may remove and raise the
+    // durable floor before it runs, never after (a crash between the two
+    // would otherwise let a stale cursor read past a gap it can't see).
+    const pruneCutoff = nowMs - 30 * 86_400_000;
+    const pruneMax = this.sql.exec<{ c: number | null }>(`SELECT MAX(cursor) AS c FROM task_events WHERE at < ? AND remote_task_id IN
+      (SELECT remote_task_id FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out'))`,
+      pruneCutoff).one().c;
+    this.raiseReplayFloor(pruneMax);
     this.sql.exec(`DELETE FROM task_events WHERE at < ? AND remote_task_id IN
       (SELECT remote_task_id FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out'))`,
-      nowMs - 30 * 86_400_000);
+      pruneCutoff);
     this.sql.exec(`DELETE FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out') AND updated_at < ?`,
       nowMs - 30 * 86_400_000);
 

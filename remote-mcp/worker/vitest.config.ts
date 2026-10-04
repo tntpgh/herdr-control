@@ -41,6 +41,7 @@ export default defineConfig({
       { plugins: [worker("true", "true")], test: { name: "tasks", include: ["test/tasks.test.ts"] } },
       { plugins: [worker("false")], test: { name: "read-only", include: ["test/readonly.test.ts"] } },
       { plugins: [worker("true", "false", "true")], test: { name: "owner-inbox", include: ["test/owner-inbox.test.ts"] } },
+      { plugins: [worker("true", "false", "true")], test: { name: "events", include: ["test/events.test.ts"] } },
     ],
   },
 });
