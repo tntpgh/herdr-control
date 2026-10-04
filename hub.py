@@ -2342,6 +2342,21 @@ def _signal_quality_loop(kb: dict) -> dict:
                  last.get("status", "missing"), detail if last else "no recorded audit runs", link="/kb")
 
 
+def _signal_detail(name: str, sig: dict) -> str:
+    """One trend signal's numbers, e.g. 'rating trend: 6/10 useful days over
+    trailing 14d (below floor)'. Generic over the observed_*/threshold_* pair
+    every trend signal carries (thurber-os compute_health's own shape) —
+    never hardcoded to `rating_usefulness` by name."""
+    window = sig.get("window_days")
+    observed_key = next((k for k in sig if k.startswith("observed_")), None)
+    threshold_key = next((k for k in sig if k.startswith("threshold_")), None)
+    unit = observed_key[len("observed_"):].replace("_", " ") if observed_key else "?"
+    label = name.split("_", 1)[0]
+    flag = "" if sig.get("ok") else " (below floor)"
+    return (f"{label} trend: {sig.get(observed_key)}/{sig.get(threshold_key)} {unit} "
+            f"over trailing {window}d{flag}")
+
+
 def _loop_sentinel() -> dict:
     if not SENTINEL_HEARTBEAT.exists():
         return _loop("local sentinel", "every 5 min", None, 900, "missing", f"no heartbeat at {SENTINEL_HEARTBEAT}")
@@ -2352,9 +2367,25 @@ def _loop_sentinel() -> dict:
             v = ast.literal_eval(v)
     except (OSError, ValueError, SyntaxError) as e:
         return _loop("local sentinel", "every 5 min", None, 900, "unreadable", str(e)[:120])
+    # Terrence's decision (form 20261004T152546-8797, rating_display=spawn_fix):
+    # rating_usefulness is a TRAILING 14-DAY count (thurber-os
+    # runtime/local_sentinel.py compute_health), not a live check like
+    # ledger_liveness/watchdog — a signal is a trend iff its dict carries
+    # `window_days`, never inferred from its name. A failing trend alone must
+    # not drive the loop's outcome (loops_data's outcome suggestion,
+    # render_overview's bad_loops, render_herdr's hot card all key off
+    # `outcome`); only the instant signals do. The trend's own numbers are
+    # always shown in the detail, alongside whatever instant signals failed.
+    signals = v.get("signals") or {}
     failed = v.get("failed_signals") or []
-    return _loop("local sentinel", "every 5 min", v.get("checked_at"), 900, v.get("status") or "?",
-                 f"failed signals: {', '.join(failed)}" if failed else "all signals healthy")
+    trend_names = {n for n, s in signals.items() if isinstance(s, dict) and "window_days" in s}
+    instant_failed = [n for n in failed if n not in trend_names]
+    outcome = "ok" if not instant_failed else (v.get("status") or "?")
+    instant_bit = (f"failed signals: {', '.join(instant_failed)}" if instant_failed
+                  else "all instant signals healthy" if signals else "all signals healthy")
+    trend_bits = [_signal_detail(n, signals[n]) for n in signals if n in trend_names]
+    return _loop("local sentinel", "every 5 min", v.get("checked_at"), 900, outcome,
+                 "; ".join([instant_bit] + trend_bits))
 
 
 def _loop_stage1() -> dict:
