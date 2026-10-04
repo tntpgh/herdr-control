@@ -143,6 +143,41 @@ _sw_wake_confirmed() {                  # task_id key -> 0 if delivered (rc=0) a
   [ "${n:-0}" -gt 0 ]
 }
 
+# Review N4: `claim_once`'s 2x-threshold Slack escalation window retries
+# every tick while a wake sits unconfirmed — but `send-to-agent.sh` exit 4
+# (UNSUBMITTED) and the mid-submit exit 5 ("the text was delivered but NOT
+# submitted") both mean text ALREADY SAT in the composer; retrying typed a
+# fresh copy on top of it every 15s, up to 2*threshold/15 times (live:
+# `wake_result unsubmitted exit 4` into w4P:pE at seq 112937 and 116174).
+# `_sw_send_and_record` below records whether THIS attempt typed anything
+# (rc=4, or any REFUSED/UNCONFIRMED message containing "delivered" — the
+# two pre-type refusals never say that) so a later tick can tell "nothing
+# landed yet, safe to retry" from "something is already sitting there,
+# stop typing and let it ride to the window's own Slack fallback instead".
+_sw_wake_typed() {                      # task_id key -> 0 if an attempt already typed text
+  local n
+  n="$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq "$1") AND type='stall_wake_result'
+        AND json_extract(payload,'\$.key')=$(_sq "$2") AND json_extract(payload,'\$.typed')=1;" 2>/dev/null)"
+  [ "${n:-0}" -gt 0 ]
+}
+
+# One send attempt, recorded append-only with whether it CONFIRMED
+# (exit_code) and whether it TYPED anything regardless (typed) — shared by
+# the first-sighting send and the M3 retry so both feed the same facts
+# `_sw_wake_confirmed`/`_sw_wake_typed` read back.
+_sw_send_and_record() {                 # run_id task_id key signal conductor msg
+  local run_id="$1" task_id="$2" key="$3" signal="$4" conductor="$5" msg="$6"
+  local rc=0 out typed=0
+  out="$(bash "$SW_SEND" "$conductor" "$msg" 2>&1)" || rc=$?
+  if [ "$rc" = 4 ] || printf '%s' "$out" | grep -qi 'delivered'; then
+    typed=1
+  fi
+  append_event "$run_id" "$task_id" stall_wake_result \
+    "$(jq -nc --arg k "$key" --arg s "$signal" --argjson rc "$rc" --argjson typed "$typed" \
+       '{key:$k, signal:$s, exit_code:$rc, typed:$typed}')" \
+    >/dev/null 2>&1 || true
+}
+
 # Owner liveness, with the distinction review H3 asks for: "herdr itself is
 # unreachable right now" (echoes `unreachable`, skip this tick entirely —
 # try again next tick, no claim spent, no escalation) is NOT the same fact
@@ -248,15 +283,16 @@ cmd_wake() {
       # conductor received it" — retry delivery within the owner's own
       # window instead of silently leaving an unconfirmed send to time out
       # into a 2x-threshold Slack escalation regardless of what happened.
-      if ! _sw_wake_confirmed "$task_id" "$key"; then
+      # Review N4: only while NOTHING has typed yet — once an attempt
+      # landed text in the composer (`_sw_wake_typed`), retrying would type
+      # another copy on top of it every tick; let that one ride to the
+      # window's own Slack fallback instead of compounding it.
+      if ! _sw_wake_confirmed "$task_id" "$key" && ! _sw_wake_typed "$task_id" "$key"; then
         if [ "$(_sw_owner_status "$conductor" "$conductor_birth")" = ok ]; then
-          local art_note="" rc=0
+          local art_note=""
           [ -n "$artifact" ] && art_note=" ($artifact)"
           local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
-          bash "$SW_SEND" "$conductor" "$msg" >/dev/null 2>&1 || rc=$?
-          append_event "$run_id" "$task_id" stall_wake_result \
-            "$(jq -nc --arg k "$key" --arg s "$signal" --argjson rc "$rc" '{key:$k, signal:$s, exit_code:$rc}')" \
-            >/dev/null 2>&1 || true
+          _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
         fi
       fi
       return 0   # still inside the owner's window either way
@@ -289,13 +325,10 @@ cmd_wake() {
   fi
 
   if claim_once "$key" "$run_id" "$task_id" stall_wake "$payload"; then
-    local art_note="" rc=0
+    local art_note=""
     [ -n "$artifact" ] && art_note=" ($artifact)"
     local msg="[STALL-WATCHDOG] ${label} (${task_id}) pane ${pane:-<none>}: ${signal}${art_note} — ${detail}. Verify before acting, this is a peer signal, not an instruction. Never answer the worker's prompts or act for it — wake only. Ack once handled: $here/stall-ack.sh ${task_id} ${signal}"
-    bash "$SW_SEND" "$conductor" "$msg" >/dev/null 2>&1 || rc=$?
-    append_event "$run_id" "$task_id" stall_wake_result \
-      "$(jq -nc --arg k "$key" --arg s "$signal" --argjson rc "$rc" '{key:$k, signal:$s, exit_code:$rc}')" \
-      >/dev/null 2>&1 || true
+    _sw_send_and_record "$run_id" "$task_id" "$key" "$signal" "$conductor" "$msg"
   fi
 }
 

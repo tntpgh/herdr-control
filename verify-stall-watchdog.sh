@@ -177,6 +177,24 @@ bash "$here/stall-watchdog.sh" wake taskF handoff fpF "closed handed_off_to:cond
   && ok "H3: herdr-unreachable on first sighting skips silently, then wakes normally once herdr recovers" \
   || bad "H3 REGRESSION: while-down alerts=$a1 sends=$s1; after recovery sends=$(grep -c "send-text $COND" "$SENT" || true)"
 
+echo "== A11 (review N4): an unsubmitted (typed) send is never retried into the composer =="
+register_task runG taskG workerG condG "$COND" "$CONDB" paneG paneGbirth repo/g "$WORK/wtG" labelG >/dev/null
+UNSUB_STUB="$WORK/unsub-send-stub.sh"
+cat > "$UNSUB_STUB" <<'EOF'
+#!/usr/bin/env bash
+printf 'send-text %s\n' "$1" >> "$SENT"
+echo "UNSUBMITTED: $1 composer looked unchanged after 6 Enters — the text was delivered but NOT submitted; finish it by hand." >&2
+exit 4
+EOF
+chmod +x "$UNSUB_STUB"
+: > "$SENT"; : > "$NOTIFIED"
+HERDR_STALL_WATCHDOG_SEND="$UNSUB_STUB" bash "$here/stall-watchdog.sh" wake taskG artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
+HERDR_STALL_WATCHDOG_SEND="$UNSUB_STUB" bash "$here/stall-watchdog.sh" wake taskG artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
+HERDR_STALL_WATCHDOG_SEND="$UNSUB_STUB" bash "$here/stall-watchdog.sh" wake taskG artifact "tmp/commit-msg.txt:1" "ready" "tmp/commit-msg.txt"
+n_sentG=$(grep -c "send-text $COND" "$SENT" || true)
+[ "$n_sentG" = "1" ] && ok "N4: an UNSUBMITTED (already-typed) send is never retried — 1 send-text across 3 ticks" \
+  || bad "N4 REGRESSION: expected 1 send-text total across 3 ticks, got $n_sentG"
+
 echo
 echo "===== Section A ====="
 printf 'passed=%d failed=%d\n' "$pass" "$fail"
@@ -187,7 +205,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 else
   PYFILE="$WORK/check_stall_watchdog.py"
   cat > "$PYFILE" <<'PYEOF'
-import sys, json, importlib.util, os, sqlite3, subprocess
+import sys, json, importlib.util, os, sqlite3, subprocess, time
 
 here = sys.argv[1]
 spec = importlib.util.spec_from_file_location("hub", os.path.join(here, "hub.py"))
@@ -209,7 +227,7 @@ BOOT = NOW - 100_000.0   # review H1: every evidence epoch below is constructed
 
 def base_task(**over):
     t = {"task_id": "t1", "run_id": "r1", "label": "widget", "pane_id": "p1",
-         "conductor_pane_id": "c1", "conductor_pane_birth": "cb1",
+         "pane_birth": "pb1", "conductor_pane_id": "c1", "conductor_pane_birth": "cb1",
          "worktree": "/nope", "state": "stalled", "stored_state": "stalled",
          "closure_reason": None, "updated_at": "2026-01-01T00:00:00Z"}
     t.update(over)
@@ -218,37 +236,51 @@ def base_task(**over):
 def cw(now_epoch, reason=None):   # stub live_done_fn: constant (epoch, reason)
     return lambda worktree: (now_epoch, reason)
 
-# ---- signal 1: handoff -------------------------------------------------------
-t = base_task(state="completed", stored_state="completed", closure_reason="handed_off_to:conductor")
-cands = hub.stall_watchdog_candidates([t], now=NOW, threshold_s=THRESH, boot_epoch=BOOT)
-results["handoff_fires_on_terminal_handed_off_task"] = (
-    len(cands) == 1 and cands[0]["signal"] == "handoff" and cands[0]["task_id"] == "t1")
-
-# A plain completion (no handed_off_to:conductor reason) never fires signal 1.
-t2 = base_task(state="completed", stored_state="completed", closure_reason="shipped")
-results["handoff_silent_on_a_shipped_close"] = hub.stall_watchdog_candidates(
-    [t2], now=NOW, threshold_s=THRESH, boot_epoch=BOOT) == []
-
-# ---- review H5: handoff variants other than the exact literal must ALSO fire -
-for reason in ("handed_off_to:conductor", "handed_off_to: conductor", "handed_off_to:w4P:p1",
-               "handed_off_to:conductor-merge", "handed_off_to:Main", "handed_off_to:review"):
-    th = base_task(state="completed", stored_state="completed", closure_reason=reason)
-    cands = hub.stall_watchdog_candidates([th], now=NOW, threshold_s=THRESH, boot_epoch=BOOT)
-    results[f"H5_handoff_fires_for[{reason}]"] = any(c["signal"] == "handoff" for c in cands)
-# A reason that merely CONTAINS the word is not a handoff.
-th2 = base_task(state="completed", stored_state="completed", closure_reason="shipped, handed_off_to is a misnomer")
-results["H5_handoff_silent_on_a_reason_that_only_mentions_the_word"] = hub.stall_watchdog_candidates(
-    [th2], now=NOW, threshold_s=THRESH, boot_epoch=BOOT) == []
-
-# ---- review H5: incident 1's exact shape — pane still alive, registry row
-# never promoted to `completed` (derives ready_review, closure_reason=None),
-# but the worker's OWN worktree bus already has the handoff written. Must
-# fire from the LIVE bus, via the injectable live_done_fn (no real filesystem).
+# ---- signal 1: handoff (review N1/N2: live bus ONLY, IDLE_STATES ONLY) ------
 t_live = base_task(state="ready_review", stored_state="running", closure_reason=None, worktree="/wt-live")
 cands = hub.stall_watchdog_candidates(
     [t_live], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
     live_done_fn=cw(NOW - THRESH - 30, "handed_off_to:conductor"))
-results["H5_incident1_live_bus_shape_fires"] = any(c["signal"] == "handoff" for c in cands)
+results["handoff_fires_from_the_live_bus_while_idle"] = any(c["signal"] == "handoff" for c in cands)
+
+# review N1/N2: the SAME live-bus evidence on a task the conductor has
+# since CLOSED (`completed`) must never fire — closing it IS the action
+# owed, and this is exactly how the old registry-path branch double-fired
+# on the close itself.
+t_closed = base_task(state="completed", stored_state="completed", closure_reason="handed_off_to:conductor",
+                     worktree="/wt-live")
+cands = hub.stall_watchdog_candidates(
+    [t_closed], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(NOW - THRESH - 30, "handed_off_to:conductor"))
+results["N1_N2_handoff_silent_once_the_task_is_completed"] = cands == []
+
+# A plain completion (no handed_off_to:conductor reason on the live bus)
+# never fires signal 1.
+t2 = base_task(state="ready_review", stored_state="running", worktree="/wt-live")
+cands = hub.stall_watchdog_candidates(
+    [t2], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(NOW - THRESH - 30, "shipped"))
+results["handoff_silent_on_a_shipped_close"] = cands == []
+
+# ---- review H5: handoff variants other than the exact literal must ALSO fire -
+for reason in ("handed_off_to:conductor", "handed_off_to: conductor", "handed_off_to:w4P:p1",
+               "handed_off_to:conductor-merge", "handed_off_to:Main", "handed_off_to:review"):
+    th = base_task(state="ready_review", stored_state="running", worktree="/wt-live")
+    cands = hub.stall_watchdog_candidates(
+        [th], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+        live_done_fn=cw(NOW - THRESH - 30, reason))
+    results[f"H5_handoff_fires_for[{reason}]"] = any(c["signal"] == "handoff" for c in cands)
+# A reason that merely CONTAINS the word is not a handoff.
+th2 = base_task(state="ready_review", stored_state="running", worktree="/wt-live")
+cands = hub.stall_watchdog_candidates(
+    [th2], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(NOW - THRESH - 30, "shipped, handed_off_to is a misnomer"))
+results["H5_handoff_silent_on_a_reason_that_only_mentions_the_word"] = cands == []
+
+# ---- review H5: incident 1's exact shape — pane still alive, registry row
+# never promoted to `completed` (derives ready_review, closure_reason=None),
+# but the worker's OWN worktree bus already has the handoff written.
+results["H5_incident1_live_bus_shape_fires"] = results["handoff_fires_from_the_live_bus_while_idle"]
 # Still `running` (genuinely active, not idle) -> never consult the live bus.
 t_live_running = base_task(state="running", stored_state="running", closure_reason=None, worktree="/wt-live")
 cands = hub.stall_watchdog_candidates(
@@ -257,11 +289,11 @@ cands = hub.stall_watchdog_candidates(
 results["H5_live_bus_never_consulted_while_genuinely_running"] = cands == []
 
 # ---- review H1: a deploy must never wake on evidence OLDER than the watchdog
-# itself existing to watch it — same handoff fixture, but its evidence
-# predates the (explicit) boot floor this time.
-t_old = base_task(state="completed", stored_state="completed", closure_reason="handed_off_to:conductor",
-                  updated_at="2020-01-01T00:00:00Z")
-cands = hub.stall_watchdog_candidates([t_old], now=NOW, threshold_s=THRESH, boot_epoch=BOOT)
+# itself existing to watch it.
+t_old = base_task(state="ready_review", stored_state="running", worktree="/wt-live")
+cands = hub.stall_watchdog_candidates(
+    [t_old], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(BOOT - 10, "handed_off_to:conductor"))
 results["H1_boot_epoch_floor_silences_pre_existing_evidence"] = cands == []
 
 # ---- signal 2: artifact (injectable stat_fn — no real filesystem needed) ----
@@ -286,11 +318,19 @@ cands = hub.stall_watchdog_candidates([t4], now=NOW, threshold_s=THRESH, boot_ep
                                       stat_fn=lambda p: mtimes.get(p, (0, None)))
 results["artifact_silent_while_task_is_running"] = cands == []
 
+# ---- review N1: the NORMAL way a conductor handles a task — read the
+# artifact, close it — must never wake 10 minutes later. Same qualifying
+# artifact as above, task now `completed`.
+t_done = base_task(state="completed", stored_state="completed", closure_reason="shipped", worktree="/wt")
+cands = hub.stall_watchdog_candidates([t_done], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+                                      stat_fn=lambda p: mtimes.get(p, (0, None)))
+results["N1_artifact_silent_once_the_task_is_completed"] = cands == []
+
 # ---- review H1: the 0-byte PROOF.md spawn-task.sh creates in EVERY worktree
-# must never fire — this is the exact deploy-storm shape (254 completed rows
-# live, every one with an empty PROOF.md).
+# must never fire, independent of the N1 completed-state gate above (this
+# fixture stays `ready_review` to isolate the size check itself).
 mtimes_empty = {"/wt/.handoffs/PROOF.md": (0, NOW - THRESH - 1)}
-t3b = base_task(state="completed", stored_state="completed", closure_reason="shipped", worktree="/wt")
+t3b = base_task(state="ready_review", stored_state="running", worktree="/wt")
 cands = hub.stall_watchdog_candidates([t3b], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
                                       stat_fn=lambda p: mtimes_empty.get(p, (0, None)))
 results["H1_empty_artifact_never_fires"] = cands == []
@@ -341,26 +381,66 @@ cands = hub.stall_watchdog_candidates(
     delivered={"t1": {"epoch": NOW - THRESH - 5, "fingerprint": "42"}})
 results["unprocessed_fires_when_idle_after_delivery"] = any(c["signal"] == "unprocessed" for c in cands)
 
-# ---- review M1: incident 2's shape — all-allow approvals, no deny, no
-# delivery, no handoff; only the pane's own last output names the blocker.
-t7 = base_task(state="running", stored_state="running", pane_id="p1",
+# ---- review M1/N3: incident 2's shape against a REALISTIC omp pane. The
+# composer box (`╭...╮` top border) sits BELOW the agent's own last output
+# line — the literal last row of a real `herdr pane read` is the box, never
+# the CONDUCTOR: line (review N3; `lib/prompt-parse.sh:355-361`,
+# `verify-typing-guard.sh:156-172`). review M-b: also requires the live
+# pane's birth to still match what this task registered.
+CHROME = ("an earlier line of agent output\n"
+         "CONDUCTOR: approve request ar_7 or tell me why not\n"
+         "\u256d\u2500\u2500 omp \u00b7 sonnet \u00b7 ctx 42% \u2500\u2500\u256e\n"
+         "\u2502 >                                          \u2502\n"
+         "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n")
+CHROME_NO_PROMPT = ("an earlier line of agent output\n"
+                    "ready\n"
+                    "\u256d\u2500\u2500 omp \u00b7 sonnet \u00b7 ctx 42% \u2500\u2500\u256e\n"
+                    "\u2502 >                                          \u2502\n"
+                    "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n")
+t7 = base_task(state="stalled", stored_state="stalled", pane_id="p1", pane_birth="pb1",
                updated_at="2026-01-01T00:00:00Z")
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: "some earlier output\nCONDUCTOR: approve request ar_7 or tell me why not\n")
-results["M1_conductor_prompt_fires_on_idle_pane_with_no_other_signal"] = any(
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1")
+results["N3_conductor_prompt_fires_against_realistic_omp_chrome"] = any(
     c["signal"] == "conductor_prompt" for c in cands)
+# The naive "literal last row" check this replaces would see the composer's
+# own closing border as the last line and never match — proven directly.
+results["N3_last_row_of_raw_chrome_is_not_the_conductor_line"] = (
+    not hub._ANSI_RE.sub("", CHROME).splitlines()[-2].strip().startswith("CONDUCTOR:"))
 # Ordinary scrollback with no such line never fires it.
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: "$ ready\n")
+    pane_read_fn=lambda pane: CHROME_NO_PROMPT, pane_birth_fn=lambda pane: "pb1")
 results["M1_silent_without_a_conductor_line"] = cands == []
 # The owner already acted after the pane's last line -> silent.
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: "CONDUCTOR: still waiting\n",
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
     owner_acted={"t1": NOW - 1})
 results["M1_silent_once_the_owner_already_acted"] = cands == []
+# A task state outside (stalled, ready_review) never reads the pane at all —
+# review N1/M-b's state-allowlist (`lost`/`cancelled`/`gone` used to be
+# included via `state != "completed"`).
+t7_gone = base_task(state="gone", stored_state="gone", pane_id="p1", pane_birth="pb1",
+                    updated_at="2026-01-01T00:00:00Z")
+cands = hub.stall_watchdog_candidates(
+    [t7_gone], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1")
+results["Mb_conductor_prompt_silent_outside_idle_states"] = cands == []
+# review M-b: the live pane's birth no longer matches what this task
+# registered (herdr recycled the pane id to an unrelated task) -> silent,
+# even with a real CONDUCTOR: line sitting there.
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "some-other-birth")
+results["Mb_conductor_prompt_silent_on_a_recycled_pane"] = cands == []
+# Live birth unknown (LIVE disconnected, or herdr never answered) -> fails
+# closed, same reasoning.
+cands = hub.stall_watchdog_candidates(
+    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: None)
+results["Mb_conductor_prompt_silent_when_birth_cannot_be_confirmed"] = cands == []
 
 # ---- _stall_task_signals(): real scratch registry ----------------------------
 db_dir = os.path.join(os.environ["WORK"], "runs2")
@@ -372,6 +452,13 @@ subprocess.run(
     ["bash", "-c",
      f". '{here}/lib/run-registry.sh'; HERDR_RUN_STATE_DIR='{db_dir}' registry_init"],
     check=True)
+# review M-c(2): the registry queries below are now windowed to
+# `now - threshold_s*8`. Every fixture in this section uses literal
+# "2026-01-01T0X:..." timestamps spanning ~3h — REG_NOW/REG_THRESH keep
+# all of them inside the window while still excluding a deliberately
+# ancient ("2020-01-01") row later on.
+REG_NOW = hub._iso_epoch("2026-01-01T03:00:00Z")
+REG_THRESH = 100_000.0
 conn = sqlite3.connect(str(hub.REGISTRY))
 conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
              "VALUES ('dtask','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
@@ -383,9 +470,21 @@ conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, 
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('ev1','drun','dtask','message_delivered','2026-01-01T00:00:00Z','{}')")
 conn.commit(); conn.close()
-denied, delivered, owner_acted = hub._stall_task_signals()
+denied, delivered, owner_acted = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["M2_denied_query_finds_the_approval_escalated_row"] = denied.get("dtask", {}).get("fingerprint") == "esc1"
 results["delivered_query_finds_an_unprocessed_message"] = "dtask" in delivered
+
+# review M-c(2): a WAY-older approval_escalated row, with no later worker
+# activity, falls outside the window and must not populate `denied` —
+# proof the bound is real, not just "still works for recent rows".
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('dtask_old','drun','stalled','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('esc_old','drun','dtask_old','approval_escalated','2020-01-01T00:00:00Z','{}')")
+conn.commit(); conn.close()
+denied_old, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+results["Mc2_a_window_bounded_scan_excludes_ancient_rows"] = "dtask_old" not in denied_old
 
 # review M2: a HUMAN pressing Approve on a deny-CLASSIFIED prompt (policy_verdict
 # stayed 'deny', the human's own choice was Approve) must NEVER read as "denied".
@@ -395,7 +494,7 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO approvals (approval_id, task_id, authority, policy_verdict, choice_text, decided_at) "
              "VALUES ('appr_human_ok','dtask2','human','deny','Approve','2026-01-01T00:00:00Z')")
 conn.commit(); conn.close()
-denied2, _, _ = hub._stall_task_signals()
+denied2, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["M2_human_approve_on_a_deny_classified_prompt_never_fires_denied"] = "dtask2" not in denied2
 
 # A human's OWN declining choice (independent of policy_verdict) is still the
@@ -406,7 +505,7 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO approvals (approval_id, task_id, authority, policy_verdict, choice_text, decided_at) "
              "VALUES ('appr_deny3','dtask3','human','allow','2. Deny','2026-01-01T00:00:00Z')")
 conn.commit(); conn.close()
-denied3, _, _ = hub._stall_task_signals()
+denied3, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["M2_a_humans_own_decline_still_fires_denied"] = denied3.get("dtask3", {}).get("fingerprint") == "appr_deny3"
 
 # review H4: herdr-deliver.sh's REAL ordering — send-to-agent.sh's
@@ -423,7 +522,7 @@ conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, 
              "('w1','drun','t_worker_acted','message_delivered','2026-01-01T01:00:00Z','{}'),"
              "('w2','drun','t_worker_acted','input_required','2026-01-01T01:00:05Z','{}')")
 conn.commit(); conn.close()
-_, delivered4, _ = hub._stall_task_signals()
+_, delivered4, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["H4_herdr_deliver_ordering_still_reads_as_unprocessed"] = "t_deliver" in delivered4
 results["H4_genuine_worker_activity_clears_unprocessed"] = "t_worker_acted" not in delivered4
 
@@ -434,7 +533,7 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('oa1','drun','t_owner','owner_acted','2026-01-01T02:00:00Z','{}')")
 conn.commit(); conn.close()
-_, _, owner_acted2 = hub._stall_task_signals()
+_, _, owner_acted2 = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["owner_acted_populated_from_owner_acted_events"] = "t_owner" in owner_acted2
 
 # A later event from the SAME task (real worker activity) clears "unprocessed".
@@ -442,13 +541,42 @@ conn = sqlite3.connect(str(hub.REGISTRY))
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('ev2','drun','dtask','input_required','2026-01-01T00:05:00Z','{}')")
 conn.commit(); conn.close()
-_, delivered5, _ = hub._stall_task_signals()
+_, delivered5, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
 results["delivered_cleared_once_the_worker_did_something"] = "dtask" not in delivered5
+
+# ---- review M-a: the boot floor persists across a restart --------------------
+hub._STALL_BOOT_EPOCH_CACHE.clear()
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('stall_watchdog_epoch','','','stall_watchdog_epoch','2026-01-01T00:00:00Z','{}')")
+conn.commit(); conn.close()
+persisted = hub._stall_boot_epoch()
+results["Ma_boot_epoch_persists_across_a_restart"] = abs(persisted - hub._iso_epoch("2026-01-01T00:00:00Z")) < 1
+# A second call must not re-floor to "now" either (cached, not re-queried).
+results["Ma_boot_epoch_stays_cached_on_a_second_call"] = hub._stall_boot_epoch() == persisted
+
+# ---- review M-c(1): an escalated/unowned claim is resolved without an ack ---
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('stall_dtaskX_denied_esc_escalate','drun','dtaskX','stall_escalate_claim',"
+             "'2026-01-01T00:00:00Z','{}')")
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('stall_dtaskY_denied_esc_unowned','drun','dtaskY','stall_wake_unowned',"
+             "'2026-01-01T00:00:00Z','{}')")
+conn.commit(); conn.close()
+ro = sqlite3.connect(f"file:{hub.REGISTRY}?mode=ro", uri=True)
+resolved_keys = hub._sw_resolved_keys(ro)
+ro.close()
+results["Mc1_escalated_key_resolved_without_an_ack"] = "stall_dtaskX_denied_esc" in resolved_keys
+results["Mc1_unowned_key_resolved_without_an_ack"] = "stall_dtaskY_denied_esc" in resolved_keys
 
 # ---- _stall_watchdog_tick(): the in-memory on/off switch ---------------------
 # Isolated from the boot_epoch floor (its own dedicated tests are above):
-# this block is testing dispatch wiring, not H1's storm guard.
-hub.STALL_WATCHDOG_BOOT_EPOCH = 0.0
+# this block is testing dispatch wiring, not H1's storm guard. `now` inside
+# _stall_watchdog_tick is real wall-clock time (not injectable), so this
+# fixture uses a REAL recent timestamp — just past threshold, well inside
+# the M-c(2) window — rather than a fixed literal.
+hub._STALL_BOOT_EPOCH_CACHE[:] = [0.0]
 calls = []
 real_run = hub.subprocess.run
 def fake_run(argv, **kw):
@@ -461,9 +589,17 @@ class FakeCache:
     def __init__(self, data): self._data = data
     def get(self): return self._data
 
-fake_herdr = {"tasks": [base_task(state="completed", stored_state="completed",
-                                  closure_reason="handed_off_to:conductor",
-                                  updated_at="2020-01-01T00:00:00Z")]}
+TICK_TS = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 700))
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('tick1','tickrun','stalled',?,?)", (TICK_TS, TICK_TS))
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('tick_esc','tickrun','tick1','approval_escalated',?,'{}')", (TICK_TS,))
+conn.commit()
+tick_seq = conn.execute("SELECT sequence FROM events WHERE event_id='tick_esc'").fetchone()[0]
+conn.close()
+fake_herdr = {"tasks": [base_task(task_id="tick1", run_id="tickrun", state="stalled", stored_state="stalled",
+                                  pane_id="tickpane", pane_birth="tickbirth", updated_at=TICK_TS)]}
 hub.CACHES["herdr"] = FakeCache(fake_herdr)
 
 # "removed" — the in-memory equivalent of the rule not existing: point the
@@ -477,17 +613,17 @@ results["rule_removed_stays_silent_on_a_real_candidate"] = calls == []
 hub.STALL_WATCHDOG_SCRIPT = real_script
 hub._stall_watchdog_tick()
 results["rule_restored_fires_on_the_same_candidate"] = (
-    len(calls) == 1 and calls[0][2] == "wake" and calls[0][3] == "t1" and calls[0][4] == "handoff")
+    len(calls) == 1 and calls[0][2] == "wake" and calls[0][3] == "tick1" and calls[0][4] == "denied")
 
 # review M4: an already claimed+acked key must not be re-dispatched.
+claim_key = f"stall_tick1_denied_{hub._sw_digest(f'esc{tick_seq}')}"
 conn = sqlite3.connect(str(hub.REGISTRY))
-conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
-             "VALUES ('t1','r1','completed','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
-claim_key = f"stall_t1_handoff_{hub._sw_digest('2020-01-01T00:00:00Z')}"
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
-             "VALUES (?,'r1','t1','stall_wake','2026-01-01T00:00:00Z','{\"signal\":\"handoff\"}')", (claim_key,))
+             "VALUES (?,'tickrun','tick1','stall_wake',?,'{\"signal\":\"denied\"}')",
+             (claim_key, TICK_TS))
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
-             "VALUES ('ack1','r1','t1','stall_acked','2026-01-01T00:00:05Z','{\"signal\":\"handoff\"}')")
+             "VALUES ('tick_ack','tickrun','tick1','stall_acked',?,'{\"signal\":\"denied\"}')",
+             (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600)),))
 conn.commit(); conn.close()
 calls.clear()
 hub._stall_watchdog_tick()
