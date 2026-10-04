@@ -3691,13 +3691,22 @@ def _live_done_info(worktree: str | None) -> tuple[float | None, str | None]:
 _ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
 
 
-def _pane_last_output(pane_id: str, lines: int = 20) -> str:
+def _pane_last_output(pane_id: str, lines: int = 60) -> str:
     """Review M1's pane-text source — same `herdr pane read ... --source
     visible --lines N` shape attention.sh already uses (_vishash), just
     called from hub.py since this signal lives beside the other four pure
     ones. Gated the same way they are (only for a task already idle past
     threshold), so this adds no RPC for a task any other signal already
-    explains."""
+    explains.
+
+    Review H1 (r4): a hard-coded 20 silently dropped the exact request
+    this signal exists to catch — in a real 46-column omp pane, a wrapped
+    request plus omp's own recap block already fills the 18 usable output
+    rows above the composer, so the `CONDUCTOR:` row itself scrolls out of
+    a 20-row tail. 60 keeps a live pane's wrapped-request-plus-recap shape
+    inside the window with room to spare, at no added per-tick cost — this
+    is still only called once a task has already cleared the state/birth
+    gates above."""
     try:
         r = subprocess.run(["herdr", "pane", "read", pane_id, "--source", "visible", "--lines", str(lines)],
                            capture_output=True, text=True, timeout=5)
@@ -3730,6 +3739,9 @@ def _agent_output_lines(text: str) -> list[str]:
 
 
 _MD_LEADING_RE = re.compile(r'^[\*_]+')   # **CONDUCTOR:** / __CONDUCTOR:__
+_RECAP_MARKER_RE = re.compile(r'^[\*_]*(\u203b|recap:)', re.IGNORECASE)   # omp's own ※ status
+                                                                           # block, or a worker's
+                                                                           # own "Recap:" paragraph
 
 
 def _last_conductor_prompt_line(text: str | None) -> str | None:
@@ -3738,8 +3750,8 @@ def _last_conductor_prompt_line(text: str | None) -> str | None:
     `_agent_output_lines`) — incident 2's actual shape (SPEC.md:51): no
     deny, no delivery, no handoff event, just a worker asking directly.
 
-    Review M1: the first cut required the literal LAST non-blank row to
-    BE the whole line, so it went silent the moment the request wrapped
+    Review M1 (r3): the first cut required the literal LAST non-blank row
+    to BE the whole line, so it went silent the moment the request wrapped
     across terminal columns (the wrap's continuation row, not
     `CONDUCTOR:...`, sat last), the moment the worker's own status/recap
     block followed it (the recap sat last instead), or the moment the
@@ -3748,10 +3760,19 @@ def _last_conductor_prompt_line(text: str | None) -> str | None:
     the bottom instead, stripping a leading markdown emphasis run
     (`*`/`_`) before the prefix test, and joins the wrap's own
     continuation rows — rows that immediately follow with no blank row
-    between them and no `CONDUCTOR:` of their own — onto the line it
-    returns. A real recap block is always its own markdown paragraph
-    (blank row first), so it never joins in and never perturbs the
-    fingerprint a re-render or scroll produces."""
+    between them — onto the line it returns.
+
+    Review M1 (r4): that bottom-up scan alone re-fires on an ALREADY
+    ANSWERED request — a plain `send-to-agent.sh` reply writes only
+    `message_delivered`, not an owner-activity event, so nothing else
+    silences it once the worker keeps working. The real tell is in the
+    pane text itself: past the request's own wrap-continuation, at most
+    ONE trailing paragraph may follow and still count as the SAME
+    unanswered ask — the worker's own recap/status paragraph, or omp's
+    own `※` block (`_RECAP_MARKER_RE`). A second, non-recap paragraph is
+    the omp user-message boundary: the conductor replied and the worker
+    went on to something else, so this returns None rather than a stale
+    line a re-render would also leave unchanged."""
     if not text:
         return None
     rows = [_ANSI_RE.sub("", ln).rstrip() for ln in _agent_output_lines(text)]
@@ -3760,11 +3781,24 @@ def _last_conductor_prompt_line(text: str | None) -> str | None:
         if not row or not row.startswith("CONDUCTOR:"):
             continue
         parts = [row]
-        for nxt in rows[i + 1:]:
-            nxt = nxt.strip()
-            if not nxt or _MD_LEADING_RE.sub("", nxt).startswith("CONDUCTOR:"):
+        j = i + 1
+        while j < len(rows) and rows[j].strip():
+            parts.append(rows[j].strip())
+            j += 1
+        k = j
+        answered = False
+        while k < len(rows):
+            if not rows[k].strip():
+                k += 1
+                continue
+            para = rows[k].strip()
+            while k < len(rows) and rows[k].strip():
+                k += 1
+            if not _RECAP_MARKER_RE.match(para):
+                answered = True
                 break
-            parts.append(nxt)
+        if answered:
+            return None
         return " ".join(parts)
     return None
 
@@ -3816,15 +3850,22 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                     just acted — and produced a second claim key for the
                     same handoff; dropped entirely, live bus is now the
                     only source).
-      artifact    — the single NEWEST of the three named files that is
-                    non-empty, idle past threshold, and newer than the
-                    conductor's own last recorded action on the task
+      artifact    — the single NEWEST (by mtime) of the three named files
+                    that is non-empty and newer than the conductor's own
+                    last recorded action on the task, idle past threshold
                     (review H1: an unconditional stat fired on the 0-byte
                     PROOF.md `spawn-task.sh` creates in every worktree;
                     review N1: used to also run on `completed` rows, so
                     reading the artifact and closing the task — the
                     NORMAL way a conductor handles one — still woke 10
                     minutes later and escalated 20 minutes after that).
+                    Review M2 (r4): the newest file is picked BEFORE the
+                    threshold check, and the threshold applies only to
+                    that one pick — an older artifact that crossed the
+                    threshold first never gets its own fingerprint while
+                    a newer one is still too fresh to qualify, which used
+                    to mint two wakes (one per file) seconds apart for a
+                    single handoff.
       denied      — the worker's last approval was a DENY, then went idle.
       unprocessed — a message was delivered to this pane and nothing (no
                     later WORKER-originated event) has happened since.
@@ -3832,12 +3873,18 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                     `allow` — no deny, no delivery, no handoff; it just sat
                     idle with its own last pane output asking the
                     conductor directly (the `CONDUCTOR: ...` line this very
-                    codebase's own workers write). Review M-b: verifies the
+                    codebase's own workers write — see
+                    `_last_conductor_prompt_line` for the wrap/recap/
+                    already-answered handling). Review M-b: verifies the
                     live pane's birth still matches the one this task
                     registered before ever reading it — `state != completed`
                     used to include `lost`/`cancelled`/`failed`/`gone`, any
                     of which can mean herdr already recycled the pane id to
-                    an unrelated task.
+                    an unrelated task. Review L1 (r4): the fingerprint
+                    hashes the line with ALL whitespace stripped, so a pane
+                    resize that re-wraps the same request at a different
+                    column — and so re-places the space the continuation
+                    join inserts — still hashes to the same key.
     """
     now = time.time() if now is None else now
     threshold = STALL_WATCHDOG_THRESHOLD_S if threshold_s is None else threshold_s
@@ -3891,13 +3938,18 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                     continue
                 if not size or mtime is None:
                     continue                                   # empty file: nothing was WRITTEN
-                if mtime < boot or now - mtime < threshold:
+                if mtime < boot:
                     continue
                 if owner_epoch is not None and owner_epoch >= mtime:
                     continue                                   # the conductor already acted since
                 if best is None or mtime > best[1]:
                     best = (rel, mtime)
-            if best is not None:
+            # Review M2 (r4): the threshold applies ONLY to the single
+            # newest pick, after it is chosen — never per-file. An older
+            # artifact that crossed the threshold first is never its own
+            # candidate while a newer one exists, so the two never mint
+            # separate fingerprints seconds apart for the same handoff.
+            if best is not None and now - best[1] >= threshold:
                 rel, mtime = best
                 out.append({**base, "signal": "artifact", "fingerprint": f"{rel}:{int(mtime)}",
                            "detail": f"{rel} has sat ready {int((now - mtime) / 60)}m with no action",
@@ -3927,8 +3979,13 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                 if live_birth and reg_birth and live_birth == reg_birth:
                     line = _last_conductor_prompt_line(pane_read_fn(t["pane_id"]))
                     if line:
+                        # Review L1 (r4): hash whitespace-free so a resize/
+                        # rewrap of the identical request — which moves
+                        # where the continuation join inserts its space —
+                        # mints the SAME fingerprint, not a second wake.
+                        norm = re.sub(r"\s+", "", line)
                         out.append({**base, "signal": "conductor_prompt",
-                                   "fingerprint": f"cprompt:{hashlib.sha256(line.encode()).hexdigest()[:16]}",
+                                   "fingerprint": f"cprompt:{hashlib.sha256(norm.encode()).hexdigest()[:16]}",
                                    "detail": line[:200], "artifact": ""})
     return out
 
