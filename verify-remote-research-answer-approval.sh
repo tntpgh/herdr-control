@@ -341,6 +341,72 @@ while IFS= read -r line; do
   esac
 done < "$work/r1.out"
 
+printf '== E: F3 — handoffs_write also narrows bash, not just the write tool ==\n'
+# Before the fix every escalate row below auto-allowed: peer_decide never saw
+# handoffs_write, and the outer #184 hook only proves "inside the worktree".
+rm -f "$wt/.handoffs/ANSWER.md"; mkdir -p "$wt/tmp"
+bash_case() {                           # want(allow|escalate) command
+  local want="$1" c="$2" out rc d
+  out="$(enf bash "$(jq -nc --arg c "$c" '{command:$c}')")"; rc=$?
+  d="$(printf '%s' "$out" | field decision)"
+  if [ "$want" = allow ]; then
+    [ "$rc" = 0 ] && [ "$d" = allow ] && ok "F3 allow: $c" || not_ok "F3 expected allow for [$c], got rc=$rc: $out"
+  else
+    [ "$rc" = 8 ] && [ -n "$(printf '%s' "$out" | field request_id)" ] && printf '%s' "$out" | field reason | grep -q 'restricts writes to .handoffs/ANSWER.md only' \
+      && ok "F3 escalate: $c" || not_ok "F3 expected handoffs-write escalation for [$c], got rc=$rc: $out"
+  fi
+}
+while IFS='|' read -r want c; do
+  [ -n "$want" ] && bash_case "$want" "$c"
+done <<'EOF'
+allow|echo x > .handoffs/ANSWER.md
+allow|printf x | tee .handoffs/ANSWER.md
+allow|echo x > tmp/scratch.txt
+allow|echo x > /tmp/f3-scratch-new
+allow|cat README.md
+allow|grep -rn foo . | head -5
+escalate|echo x > src/x.py
+escalate|echo x > .handoffs/OTHER.md
+escalate|echo x >> README.md
+escalate|cd src && echo x > a.txt
+escalate|echo x > tmp/../src/x.py
+escalate|cat <<X > src/y.py
+escalate|printf x | tee src/x.py
+escalate|cp README.md src/copy.md
+escalate|mv README.md src/moved.md
+escalate|touch src/new
+escalate|mkdir src/d
+escalate|ln -s ../x .handoffs/ANSWER.md
+escalate|sed -i '' s/a/b/ README.md
+escalate|bash -c 'echo x > src/c'
+escalate|tar -xf a.tar -C src
+escalate|rsync a src/b
+escalate|curl -o src/page.html https://example.com
+escalate|perl -pi -e s/a/b/ README.md
+escalate|awk '{print > "src/out"}' README.md
+escalate|python3 -c 'open("src/p","w")'
+escalate|node -e 'require("fs").writeFileSync("src/n","x")'
+escalate|make
+escalate|echo x > ../outside
+EOF
+# find -exec / xargs / $VAR / script runs were already refused by
+# peer_decide before F3; they must stay refused.
+for c in 'find . -name a -exec cp {} src/b \;' 'echo src/z | xargs touch' 'echo x > "$OUT"' 'python3 tmp/probe.py'; do
+  out="$(enf bash "$(jq -nc --arg c "$c" '{command:$c}')")"; rc=$?
+  [ "$rc" = 8 ] && ok "F3 still refused: $c" || not_ok "F3 expected refusal for [$c], got rc=$rc: $out"
+done
+# The deliverable itself replaced by a symlink: a bash redirect must refuse too.
+ln -s ../src/x "$wt/.handoffs/ANSWER.md"
+out="$(enf bash '{"command":"echo x > .handoffs/ANSWER.md"}')"; rc=$?
+[ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'symlink' \
+  && ok "F3: bash redirect into a symlinked ANSWER.md escalates" || not_ok "F3 symlinked ANSWER.md: rc=$rc: $out"
+rm -f "$wt/.handoffs/ANSWER.md"
+# A task WITHOUT handoffs_write is unchanged (in-worktree bash write allowed).
+register_task run1 task_impl worker1 cond1 "$CPANE" "$CBIRTH" "$PANE" "$BIRTH" /repo "$wt" impl:task_impl feat/y main "" '{}' hook >/dev/null
+set_task_state run1 task_impl running
+out="$(enf bash '{"command":"echo x > src/x.py"}' task_impl)"; rc=$?
+[ "$rc" = 0 ] && ok "F3: a task with no handoffs_write still allows in-worktree bash writes" || not_ok "F3 no-hw task: rc=$rc: $out"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi

@@ -296,6 +296,82 @@ _ps_plain_write_verdict() {
   PS_VERDICT=allow PS_REASON="exact match for this task's one allowed deliverable (.handoffs/$hw)"
 }
 
+# F3 (REVIEW-220): the write tool above is narrowed to .handoffs/<hw>, but a
+# bash call went straight to peer_decide, which knows nothing about
+# handoffs_write — so `echo x > src/a.py`, `tee`, `cp`, `sed -i`, `ln -s`
+# all auto-allowed anywhere inside the worktree for a research/explore task.
+# The outer hook (#184, workerWriteScopeBlock) only proves "inside the
+# worktree", never "is the deliverable". `_ps_bash_handoffs_verdict <cmd>
+# <cwd>` runs AFTER peer_decide said allow and can only tighten it:
+#   - every TARGET from the shared #184 parser (bash_write_targets — no
+#     second parser) must be exactly <wt>/.handoffs/<hw> (symlink-resolved,
+#     same check as the write tool) or scratch the outer hook already
+#     permits (<wt>/tmp/**, /tmp/**, /private/tmp/**);
+#   - COMPUTED/UNPARSED targets escalate (the parser's own contract);
+#   - any segment whose command word is an interpreter, shell, build/package
+#     runner, or awk escalates: the parser cannot see what a script or
+#     inline program writes (command-policy.sh's #184 ceiling), and a
+#     write-restricted task must not be able to route around that.
+# Ceiling: anything else that writes outside bash's own grammar (a binary
+# this list does not name) still relies on the outer hook's worktree
+# containment, exactly as before this rule.
+_PS_HW_RUNNERS='python python2 python3 pypy pypy3 node nodejs bun deno ruby perl php lua luajit osascript
+bash sh zsh dash ksh fish csh tcsh source . eval exec awk gawk mawk nawk make gmake npm npx pnpm yarn uv uvx pip pip3
+go cargo swift swiftc java tclsh expect'
+_ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an allow
+  local cmd="$1" cwd="$2" hw="$3" wt wt_abs line kind val seg w real real_wt
+  wt="$(printf '%s' "$PS_TASK_JSON" | jq -r '.worktree // empty' 2>/dev/null)"
+  if [ -z "$wt" ]; then
+    PS_VERDICT=escalate PS_POLICY=handoffs-write PS_REASON="worker worktree unknown — cannot judge this task's bash write scope"; return
+  fi
+  wt_abs="$(_cp_lexical_abspath "$wt")"
+  [ -n "$cwd" ] || cwd="$wt_abs"
+  while IFS= read -r seg; do
+    [ -n "${seg//[[:space:]]/}" ] || continue
+    _cp_locate_command_word "$seg" || continue
+    w="${_cp_wcmd%%[0-9.]*}"; [ -n "$w" ] || w="$_cp_wcmd"
+    case " $(printf '%s' "$_PS_HW_RUNNERS" | tr '\n' ' ') " in
+      *" $_cp_wcmd "*|*" $w "*)
+        PS_VERDICT=escalate PS_POLICY=handoffs-write
+        PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '$_cp_wcmd' runs code whose writes cannot be checked statically — a conductor must review it"
+        return ;;
+    esac
+    # A link AT the deliverable passes the realpath check while its target
+    # does not exist yet, then redirects every later write; a research task
+    # never needs to create one.
+    case "$_cp_wcmd" in
+      ln|link)
+        PS_VERDICT=escalate PS_POLICY=handoffs-write
+        PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; creating a link could redirect that file — a conductor must review it"
+        return ;;
+    esac
+  done < <(_cp_walk_segments "$cmd")
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    kind="${line%%$'\t'*}" val="${line#*$'\t'}"
+    if [ "$kind" != TARGET ]; then
+      PS_VERDICT=escalate PS_POLICY=handoffs-write
+      PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; a write target cannot be read statically ($kind) — a conductor must review it"
+      return
+    fi
+    case "$val" in
+      "$wt_abs/tmp/"*|/tmp/*|/private/tmp/*) continue ;;
+      "$wt_abs/.handoffs/$hw")
+        real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$val" 2>/dev/null)"
+        real_wt="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt" 2>/dev/null)"
+        if [ -z "$real" ] || [ -z "$real_wt" ] || [ "$real" != "$real_wt/.handoffs/$hw" ]; then
+          PS_VERDICT=escalate PS_POLICY=handoffs-write
+          PS_REASON="this task's one allowed .handoffs file is a symlink to somewhere else — remains human-only"
+          return
+        fi ;;
+      *)
+        PS_VERDICT=escalate PS_POLICY=handoffs-write
+        PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; this command writes ${val#"$wt_abs"/} — a conductor must review it"
+        return ;;
+    esac
+  done < <(bash_write_targets "$cmd" "$cwd")
+}
+
 pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8 not
   local payload="$1" tool norm input guard dev cmd op manifest hw
   PS_VERDICT=escalate PS_POLICY=tool-table PS_REASON="" PS_AUTHORITY="" PS_REGISTRY_OK=1
@@ -328,6 +404,15 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
         # not part of the text the policy judges.
         if [ "$PS_VERDICT" = allow ] && [ "$(printf '%s' "$input" | jq -r '(.env // {}) | length' 2>/dev/null)" != 0 ]; then
           PS_VERDICT=escalate PS_REASON="the call sets service environment variables, which the command policy does not judge"
+        fi
+        # F3: a write-restricted (handoffs_write) task's bash is narrowed
+        # the same way its write tool is; this can only tighten an allow.
+        if [ "$PS_VERDICT" = allow ] && [ -n "$hw" ]; then
+          # omp runs bash in input.cwd (relative to the session cwd) or the session cwd.
+          op="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
+          cmd="$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null)"
+          case "$op" in /*) ;; '') op="$cmd" ;; *) op="${cmd:+$cmd/}$op" ;; esac
+          _ps_bash_handoffs_verdict "$PS_CMD" "$op" "$hw"
         fi
       fi ;;
     eval|python|js|javascript|repl|notebook_eval)
