@@ -13,7 +13,9 @@ import { callTool, oauthToken, queueRawOwner, signedSync, snapshot, syncBody } f
 const e = env as unknown as Env;
 const fleet = () => e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet"));
 
-interface SyncReply { owner_outbox: { exchange_id: string; owner_label: string; body: string }[]; audit: { tool: string; decision: string; reason: string; message_id: string }[] }
+interface SyncReply { owner_outbox: { exchange_id: string; owner_label: string; body: string }[];
+  audit: { tool: string; decision: string; reason: string; message_id: string }[];
+  owner_reply_results: { exchange_id: string; outcome: string }[] }
 const syncJson = async (r: Response): Promise<SyncReply> => r.json();
 
 const ownerSnapshot = (labels: { label: string; live: boolean }[] = [{ label: "conductor", live: true }]) =>
@@ -171,15 +173,24 @@ describe("get_owner_reply", () => {
     const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
     const id = await deliveredExchange(access_token);
 
-    await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [
-      { exchange_id: id, owner_label: "conductor", body: "ok, done", responded_at: new Date().toISOString(),
-        artifact_revision: "sha256:abc", session: "w5B:pG" },
-    ] }));
+    const replyBody = { exchange_id: id, owner_label: "conductor", body: "ok, done", responded_at: new Date().toISOString(),
+      artifact_revision: "sha256:abc", session: "w5B:pG" };
+    const first = await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [replyBody] })));
+    // #225 review H1: the Mac only moves a reply to replies/sent/ once it
+    // sees "accepted" (or "duplicate") here -- a 200 alone is not enough.
+    expect(first.owner_reply_results).toEqual([{ exchange_id: id, outcome: "accepted" }]);
 
     const mine = await callTool<{ reply: OwnerReplyRecord }>(access_token, "get_owner_reply", { exchange_id: id });
     expect(mine.data.reply).toMatchObject({ exchange_id: id, owner_label: "conductor", body: "ok, done", session: "w5B:pG" });
     const status = await callTool<{ owner_message: OwnerMessageRecord }>(access_token, "get_owner_message_status", { exchange_id: id });
     expect(status.data.owner_message.status).toBe("replied");
+
+    // A retried tick (a crash, or a lost ack) resends the exact same
+    // file: the Worker must say "duplicate", not drop it silently, so
+    // the Mac still moves it to replies/sent/ rather than resending it
+    // forever.
+    const retry = await syncJson(await signedSync(syncBody({ snapshot: ownerSnapshot(), owner_replies: [replyBody] })));
+    expect(retry.owner_reply_results).toEqual([{ exchange_id: id, outcome: "duplicate" }]);
 
     // ALLOWED_EMAILS is a single address in this deployment, so "someone
     // else" cannot be reached through the real OAuth flow; call the
@@ -189,21 +200,42 @@ describe("get_owner_reply", () => {
     expect(theirs).toBeNull();
   });
 
+  it("reports ignored:queued for a reply that arrives before the message is delivered", async () => {
+    await signedSync(syncBody({ snapshot: ownerSnapshot() }));
+    const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
+    const sent = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",
+      { owner_label: "conductor", body: "hi", client_msg_id: "cm-queued" });
+    const id = sent.data.exchange_id;
+    // Not yet leased/delivered: status is still 'queued'. #225 review H1's
+    // realistic path -- an approval-prompt retry can put a DELIVERED
+    // message back to 'queued' the same way.
+    const reply = await syncJson(await signedSync(syncBody({
+      snapshot: ownerSnapshot(),
+      lease: false, // isolates the owner_replies outcome from this same call also leasing the message
+      owner_replies: [{ exchange_id: id, owner_label: "conductor", body: "too early", responded_at: new Date().toISOString(),
+        artifact_revision: "", session: "w1:p1" }],
+    })));
+    expect(reply.owner_reply_results).toEqual([{ exchange_id: id, outcome: "ignored:queued" }]);
+    const status = await callTool<{ owner_message: OwnerMessageRecord }>(access_token, "get_owner_message_status", { exchange_id: id });
+    expect(status.data.owner_message.status).toBe("queued"); // untouched, not silently consumed
+  });
+
   it("ignores a reply whose own owner_label does not match the exchange's real target (header mismatch)", async () => {
     await signedSync(syncBody({ snapshot: ownerSnapshot([{ label: "conductor", live: true }, { label: "other-tab", live: true }]) }));
     const { access_token } = await oauthToken(["herdr:read", "herdr:message.owner"]);
     const id = await deliveredExchange(access_token);
 
-    await signedSync(syncBody({
+    const reply = await syncJson(await signedSync(syncBody({
       snapshot: ownerSnapshot([{ label: "conductor", live: true }, { label: "other-tab", live: true }]),
       owner_replies: [{ exchange_id: id, owner_label: "other-tab", body: "spoofed", responded_at: new Date().toISOString(),
         artifact_revision: "", session: "w1:pX" }],
-    }));
+    })));
+    expect(reply.owner_reply_results).toEqual([{ exchange_id: id, outcome: "ignored:missing" }]);
 
     const status = await callTool<{ owner_message: OwnerMessageRecord }>(access_token, "get_owner_message_status", { exchange_id: id });
     expect(status.data.owner_message.status).toBe("delivered");
-    const reply = await callTool<{ error?: string }>(access_token, "get_owner_reply", { exchange_id: id });
-    expect(reply.data.error).toBe("not_found");
+    const getReply = await callTool<{ error?: string }>(access_token, "get_owner_reply", { exchange_id: id });
+    expect(getReply.data.error).toBe("not_found");
   });
 
   it("refuses a late reply from reviving an already-cancelled blocked:sender_revoked message (REVIEW-219 M3)", async () => {
@@ -240,12 +272,17 @@ describe("get_owner_reply", () => {
     // The owner, unaware the message was just revoked server-side, still
     // writes a reply to the file they already had open locally. M3: this
     // must never resurrect the exchange back to 'replied'.
-    await runInDurableObject(fleet(), (o: HerdrState) =>
+    const lateOutcome = await runInDurableObject(fleet(), (o: HerdrState) =>
       o.sync(future + 1_000, crypto.randomUUID(), JSON.stringify(syncBody({
         snapshot: ownerSnapshot(),
         owner_replies: [{ exchange_id: id, owner_label: "conductor", body: "late reply", responded_at: new Date().toISOString(),
           artifact_revision: "", session: "w1:p1" }],
       })), { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
+    // #225 review H1: the Mac must be told this was dropped, not accepted
+    // -- "ignored:blocked:..." (the status column's real value), never a
+    // bare 200 the Mac would read as proof of delivery.
+    expect(lateOutcome.ok && lateOutcome.response.owner_reply_results)
+      .toEqual([{ exchange_id: id, outcome: "ignored:blocked:sender_revoked" }]);
 
     const after = await runInDurableObject(fleet(), (o: HerdrState) => o.ownerMessageStatus(id, "tnt@teamthurber.com"));
     expect([after?.status, after?.detail]).toEqual(["blocked:sender_revoked", "sender_revoked"]);

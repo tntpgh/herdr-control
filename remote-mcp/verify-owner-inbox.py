@@ -101,6 +101,17 @@ spec.loader.exec_module(pub)
 pub.INBOX_ROOT = TMP / "inbox"
 
 
+def _write_reply(path: Path, text: str, age_s: float | None = None) -> None:
+    """#225 review M1: scan_owner_replies now skips a reply younger than
+    REPLY_MIN_AGE_S (a write-settling gate against reading mid-write).
+    Tests that write a reply file and immediately scan it need it
+    backdated past that gate; this is the one place that does it, so a
+    future change to REPLY_MIN_AGE_S only needs to change here."""
+    path.write_text(text)
+    t = time.time() - (pub.REPLY_MIN_AGE_S + 5 if age_s is None else age_s)
+    os.utime(path, (t, t))
+
+
 class RegistryAndStatus(unittest.TestCase):
     def test_registry_owners_reads_every_column(self):
         rows = pub.registry_owners()
@@ -253,7 +264,7 @@ class ReplyScan(unittest.TestCase):
     def test_reads_a_normal_reply_redacted_and_capped(self):
         d = pub.INBOX_ROOT / "conductor/replies"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "oex_r1.md").write_text("all done. token sk-" + "a" * 20)
+        _write_reply(d / "oex_r1.md", "all done. token sk-" + "a" * 20)
         out = pub.scan_owner_replies()
         (row,) = [r for r in out if r["exchange_id"] == "oex_r1"]
         self.assertEqual(row["owner_label"], "conductor")
@@ -273,7 +284,7 @@ class ReplyScan(unittest.TestCase):
     def test_move_to_sent_makes_a_reply_invisible_to_future_scans(self):
         d = pub.INBOX_ROOT / "conductor/replies"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "oex_movetest.md").write_text("done")
+        _write_reply(d / "oex_movetest.md", "done")
         self.assertIn("oex_movetest", {r["exchange_id"] for r in pub.scan_owner_replies()})
         self.assertTrue(pub._move_reply_to_sent("conductor", "oex_movetest"))
         self.assertFalse((d / "oex_movetest.md").exists())
@@ -296,11 +307,37 @@ class ReplyScan(unittest.TestCase):
         finally:
             shutil.rmtree(label_dir, ignore_errors=True)
 
+    # ---- #225 review M1: never overwrite an already-accepted sent/ copy
+    def test_move_to_sent_never_overwrites_keeps_both_and_audits(self):
+        label = "dupsentowner"
+        label_dir = pub.INBOX_ROOT / label
+        shutil.rmtree(label_dir, ignore_errors=True)
+        d = label_dir / "replies"
+        sent = d / "sent"
+        sent.mkdir(parents=True, exist_ok=True)
+        (sent / "oex_dup1.md").write_text("original, already accepted by the Worker")
+        (d / "oex_dup1.md").write_text("owner rewrote it after the fact / partial-write race")
+        try:
+            self.assertTrue(pub._move_reply_to_sent(label, "oex_dup1"))
+            self.assertEqual((sent / "oex_dup1.md").read_text(), "original, already accepted by the Worker")
+            self.assertFalse((d / "oex_dup1.md").exists())  # moved, not left duplicated in replies/
+            dup_files = list(sent.glob("oex_dup1-dup*.md"))
+            self.assertEqual(len(dup_files), 1)
+            self.assertEqual(dup_files[0].read_text(), "owner rewrote it after the fact / partial-write race")
+
+            audit_path = pub.OUT / "audit.jsonl"
+            rows = [json.loads(line) for line in audit_path.read_text().splitlines()]
+            dup_rows = [r for r in rows if r.get("kind") == "reply_dup_kept" and r.get("id") == "oex_dup1"]
+            self.assertEqual(len(dup_rows), 1)
+            self.assertEqual(dup_rows[0]["dup_path"], dup_files[0].name)
+        finally:
+            shutil.rmtree(label_dir, ignore_errors=True)
+
     # ---- #225 item 4: oversized is logged and skipped, never truncated-and-sent
     def test_an_oversized_reply_is_skipped_not_truncated(self):
         d = pub.INBOX_ROOT / "conductor/replies"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "oex_huge1.md").write_text("x" * (pub.RESULT_READ_CAP + 1))
+        _write_reply(d / "oex_huge1.md", "x" * (pub.RESULT_READ_CAP + 1))
         out = pub.scan_owner_replies()
         self.assertNotIn("oex_huge1", {r["exchange_id"] for r in out})
 
@@ -327,21 +364,21 @@ class ReplyScan(unittest.TestCase):
     def test_refuses_a_reply_whose_header_claims_a_different_exchange_id(self):
         d = pub.INBOX_ROOT / "conductor/replies"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "oex_r3.md").write_text("- exchange_id: oex_SOMETHING_ELSE\n---\nforged, not this exchange")
+        _write_reply(d / "oex_r3.md", "- exchange_id: oex_SOMETHING_ELSE\n---\nforged, not this exchange")
         out = pub.scan_owner_replies()
         self.assertNotIn("oex_r3", {r["exchange_id"] for r in out})
 
     def test_refuses_a_reply_whose_header_claims_a_different_owner_label(self):
         d = pub.INBOX_ROOT / "conductor/replies"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "oex_r4.md").write_text("- owner_label: not-this-owner\n---\nforged label claim")
+        _write_reply(d / "oex_r4.md", "- owner_label: not-this-owner\n---\nforged label claim")
         out = pub.scan_owner_replies()
         self.assertNotIn("oex_r4", {r["exchange_id"] for r in out})
 
     def test_accepts_a_matching_header_and_surfaces_artifact_revision(self):
         d = pub.INBOX_ROOT / "conductor/replies"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "oex_r5.md").write_text(
+        _write_reply(d / "oex_r5.md",
             "- exchange_id: oex_r5\n- owner_label: conductor\n- artifact_revision: deadbeef123\n---\nlooks good"
         )
         out = pub.scan_owner_replies()
@@ -362,7 +399,7 @@ class ReplyScan(unittest.TestCase):
     def test_a_reply_using_a_horizontal_rule_keeps_its_full_text(self):
         d = pub.INBOX_ROOT / "conductor/replies"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "oex_r6.md").write_text("Summary: shipped the fix.\n---\nDetails below the rule.")
+        _write_reply(d / "oex_r6.md", "Summary: shipped the fix.\n---\nDetails below the rule.")
         out = pub.scan_owner_replies()
         (row,) = [r for r in out if r["exchange_id"] == "oex_r6"]
         self.assertIn("Summary: shipped the fix.", row["body"])
@@ -457,7 +494,7 @@ class OwnerReplySyncLifecycle(unittest.TestCase):
         label = "failsync"
         d = pub.INBOX_ROOT / label / "replies"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "oex_fail1.md").write_text("body")
+        _write_reply(d / "oex_fail1.md", "body")
         try:
             def failing_post(key, body):
                 raise OSError("simulated network failure")
@@ -471,7 +508,12 @@ class OwnerReplySyncLifecycle(unittest.TestCase):
 
             def succeeding_post(key, body):
                 carried.append(body["owner_replies"])
-                return {"audit": [], "audit_cursor": 0}
+                # #225 review H1: a real Worker always reports a per-reply
+                # outcome now -- the fixture must too, or this test is only
+                # proving "no outcome -> left alone", not "accepted ->
+                # moved to sent/".
+                return {"audit": [], "audit_cursor": 0,
+                        "owner_reply_results": [{"exchange_id": "oex_fail1", "outcome": "accepted"}]}
 
             pub.post_sync = succeeding_post
             self.assertEqual(pub.main([]), 0)
@@ -481,12 +523,112 @@ class OwnerReplySyncLifecycle(unittest.TestCase):
         finally:
             shutil.rmtree(pub.INBOX_ROOT / label, ignore_errors=True)
 
+    def test_mixed_owner_reply_results_routes_each_reply_correctly(self):
+        """#225 review H1: a 200 sync response is not proof every reply in
+        it was accepted -- the Worker now reports a per-reply outcome, and
+        each of the four shapes routes differently. A reply this field
+        says NOTHING about (simulating an older Worker, or a reply the
+        caller never actually sent) is also left untouched -- the safest
+        default, never silently moved anywhere."""
+        label = "mixedoutcomes"
+        d = pub.INBOX_ROOT / label / "replies"
+        d.mkdir(parents=True, exist_ok=True)
+        for eid in ("oex_mix_accepted", "oex_mix_dup", "oex_mix_queued", "oex_mix_blocked", "oex_mix_unreported"):
+            _write_reply(d / f"{eid}.md", f"body for {eid}")
+        try:
+            def mixed_post(key, body):
+                return {"audit": [], "audit_cursor": 0, "owner_reply_results": [
+                    {"exchange_id": "oex_mix_accepted", "outcome": "accepted"},
+                    {"exchange_id": "oex_mix_dup", "outcome": "duplicate"},
+                    {"exchange_id": "oex_mix_queued", "outcome": "ignored:queued"},
+                    {"exchange_id": "oex_mix_blocked", "outcome": "ignored:blocked:sender_revoked"},
+                    # oex_mix_unreported deliberately has NO entry here
+                ]}
+
+            pub.post_sync = mixed_post
+            self.assertEqual(pub.main([]), 0)
+
+            self.assertTrue((d / "sent" / "oex_mix_accepted.md").exists())
+            self.assertTrue((d / "sent" / "oex_mix_dup.md").exists())
+            self.assertFalse((d / "oex_mix_accepted.md").exists())
+            self.assertFalse((d / "oex_mix_dup.md").exists())
+
+            # ignored:queued is transient -- left exactly where it was, to
+            # be retried, never moved to sent/ OR rejected/.
+            self.assertTrue((d / "oex_mix_queued.md").exists())
+            self.assertFalse((d / "sent" / "oex_mix_queued.md").exists())
+            self.assertFalse((d / "rejected" / "oex_mix_queued.md").exists())
+
+            # ignored:blocked:... is durable -- moved to rejected/, never
+            # sent/, and (SPEC item 3 for this new tree) never touched by
+            # prune_inbox even once "old".
+            self.assertFalse((d / "oex_mix_blocked.md").exists())
+            self.assertTrue((d / "rejected" / "oex_mix_blocked.md").exists())
+            self.assertFalse((d / "sent" / "oex_mix_blocked.md").exists())
+
+            # No result reported at all for this one: left exactly alone,
+            # same as the transient case -- never silently accepted,
+            # never silently thrown away.
+            self.assertTrue((d / "oex_mix_unreported.md").exists())
+            self.assertFalse((d / "sent" / "oex_mix_unreported.md").exists())
+            self.assertFalse((d / "rejected" / "oex_mix_unreported.md").exists())
+        finally:
+            shutil.rmtree(pub.INBOX_ROOT / label, ignore_errors=True)
+
+    def test_owner_replies_are_trimmed_to_the_byte_budget_at_least_one_always_sent(self):
+        """#225 review M2: the count cap alone does not bound bytes -- a
+        backlog of large non-ASCII bodies (each escaped to \\uXXXX by
+        json.dumps' default ensure_ascii=True) can blow past
+        OWNER_REPLIES_BUDGET_BYTES well under OWNER_REPLIES_CAP replies.
+        The posted batch must stay under budget, at least one reply must
+        always go, and whatever didn't fit stays in replies/ for a later
+        tick."""
+        label = "bytebudget"
+        d = pub.INBOX_ROOT / label / "replies"
+        d.mkdir(parents=True, exist_ok=True)
+        # Each body is MAX_MESSAGE_CHARS of a 3-byte-UTF8/6-byte-\u-escaped
+        # character: comfortably large enough that a handful blow the
+        # budget while staying well under OWNER_REPLIES_CAP (200).
+        heavy = "\u00e9" * pub.MAX_MESSAGE_CHARS  # é, non-ASCII
+        n = 50  # 50 * ~2000 non-ASCII chars (6 bytes/char when \u-escaped)
+        # comfortably exceeds OWNER_REPLIES_BUDGET_BYTES while staying
+        # well under OWNER_REPLIES_CAP (200): proves the byte budget, not
+        # the count cap, is what trims this batch.
+        for i in range(n):
+            _write_reply(d / f"oex_heavy{i:02d}.md", heavy, age_s=pub.REPLY_MIN_AGE_S + 5 + (n - i))
+        try:
+            carried = []
+
+            def capturing_post(key, body):
+                carried.append(body["owner_replies"])
+                return {"audit": [], "audit_cursor": 0,
+                        "owner_reply_results": [{"exchange_id": r["exchange_id"], "outcome": "accepted"}
+                                                 for r in body["owner_replies"]]}
+
+            pub.post_sync = capturing_post
+            self.assertEqual(pub.main([]), 0)
+            sent_batch = carried[0]
+            self.assertGreaterEqual(len(sent_batch), 1)  # at least one always goes
+            self.assertLess(len(sent_batch), n)  # the byte budget bit before the count cap did
+            encoded = len(json.dumps(sent_batch, separators=(",", ":")).encode())
+            self.assertLessEqual(encoded, pub.OWNER_REPLIES_BUDGET_BYTES)
+            # the oldest (lowest index) replies go first, same ordering as
+            # the count cap
+            self.assertEqual([r["exchange_id"] for r in sent_batch],
+                              [f"oex_heavy{i:02d}" for i in range(len(sent_batch))])
+            remaining = sorted(p.name for p in d.glob("*.md"))
+            self.assertEqual(len(remaining), n - len(sent_batch))
+        finally:
+            shutil.rmtree(pub.INBOX_ROOT / label, ignore_errors=True)
+
 
 class OwnerInboxRetention(unittest.TestCase):
     """SPEC item 3: prune_inbox deletes only acked files past
     OWNER_INBOX_RETENTION_DAYS (messages/ once this Mac confirmed delivery,
-    replies/sent/ once a sync acked it), audits every delete first, and
-    NEVER touches an unread message or an unacked reply, however old."""
+    replies/sent/ once the Worker confirmed the reply as accepted/duplicate
+    -- review L3's durable marker, not mere directory presence), audits
+    every delete first (review H2), and NEVER touches an unread message,
+    an unacked reply, or anything under replies/rejected/, however old."""
 
     def test_prunes_only_old_acked_files_and_audits_before_deleting(self):
         label = "retentionowner"
@@ -514,19 +656,36 @@ class OwnerInboxRetention(unittest.TestCase):
             old_sent.write_text("acked reply")
             os.utime(old_sent, (old_s, old_s))
 
+            # #225 review L3: sitting in sent/ is no longer sufficient on
+            # its own -- a file hand-placed here (never actually moved by
+            # _move_reply_to_sent after a real Worker acceptance) has no
+            # key in owner_replies_accepted and must survive forever.
+            old_sent_unmarked = label_dir / "replies" / "sent" / "oex_old_sent_unmarked.md"
+            old_sent_unmarked.write_text("placed here by hand, never actually accepted")
+            os.utime(old_sent_unmarked, (old_s, old_s))
+
             old_unacked = label_dir / "replies" / "oex_old_unacked.md"
             old_unacked.write_text("still waiting to be sent")
             os.utime(old_unacked, (old_s, old_s))
 
-            owner_message_delivered = {"oex_old_delivered": old_s, "oex_recent_delivered": recent_s}
-            pruned = pub.prune_inbox(owner_message_delivered, time.time())
+            (label_dir / "replies" / "rejected").mkdir(parents=True)
+            old_rejected = label_dir / "replies" / "rejected" / "oex_old_rejected.md"
+            old_rejected.write_text("durably refused by the Worker")
+            os.utime(old_rejected, (old_s, old_s))
 
-            self.assertEqual(pruned, {"oex_old_delivered"})
+            owner_message_delivered = {"oex_old_delivered": old_s, "oex_recent_delivered": recent_s}
+            owner_replies_accepted = {"oex_old_sent": old_s}
+            pruned_messages, pruned_sent = pub.prune_inbox(owner_message_delivered, owner_replies_accepted, time.time())
+
+            self.assertEqual(pruned_messages, {"oex_old_delivered"})
+            self.assertEqual(pruned_sent, {"oex_old_sent"})
             self.assertFalse(old_delivered.exists())  # old + delivered: pruned
             self.assertTrue(recent_delivered.exists())  # delivered but too young: kept
             self.assertTrue(old_undelivered.exists())  # old but never delivered: NEVER touched
-            self.assertFalse(old_sent.exists())  # old + acked (in sent/): pruned
+            self.assertFalse(old_sent.exists())  # old + Worker-accepted (marked): pruned
+            self.assertTrue(old_sent_unmarked.exists())  # old but unmarked: NEVER touched (L3)
             self.assertTrue(old_unacked.exists())  # old but unacked (still in replies/): NEVER touched
+            self.assertTrue(old_rejected.exists())  # replies/rejected/ is never pruned (H1)
 
             audit_path = pub.OUT / "audit.jsonl"
             rows = [json.loads(line) for line in audit_path.read_text().splitlines()]
@@ -536,8 +695,101 @@ class OwnerInboxRetention(unittest.TestCase):
             self.assertEqual(pruned_rows["oex_old_sent"]["tree"], "replies/sent")
             self.assertIsNotNone(pruned_rows["oex_old_delivered"]["sha256"])
             self.assertIsNotNone(pruned_rows["oex_old_sent"]["sha256"])
+            # #225 review H2/L1: a second row records the REAL outcome,
+            # written only after the unlink was attempted.
+            result_rows = {r["id"]: r for r in rows if r.get("kind") == "prune_result" and r.get("label") == label}
+            self.assertEqual(result_rows["oex_old_delivered"]["outcome"], "deleted")
+            self.assertEqual(result_rows["oex_old_sent"]["outcome"], "deleted")
         finally:
             shutil.rmtree(label_dir, ignore_errors=True)
+
+    def test_retention_boundary_mtime_equals_cutoff_is_kept_one_second_older_is_pruned(self):
+        """#225 review T1: pins the exact `mtime >= cutoff` boundary --
+        a file dated EXACTLY at the cutoff is kept (not yet old enough),
+        one second older is pruned."""
+        label = "retentionboundary"
+        label_dir = pub.INBOX_ROOT / label
+        shutil.rmtree(label_dir, ignore_errors=True)
+        try:
+            now_s = time.time()
+            cutoff = now_s - pub.OWNER_INBOX_RETENTION_DAYS * 86_400
+            (label_dir / "messages").mkdir(parents=True)
+            at_cutoff = label_dir / "messages" / "oex_at_cutoff.md"
+            at_cutoff.write_text("exactly at the boundary")
+            os.utime(at_cutoff, (cutoff, cutoff))
+            past_cutoff = label_dir / "messages" / "oex_past_cutoff.md"
+            past_cutoff.write_text("one second older than the boundary")
+            os.utime(past_cutoff, (cutoff - 1, cutoff - 1))
+
+            owner_message_delivered = {"oex_at_cutoff": cutoff, "oex_past_cutoff": cutoff - 1}
+            pruned_messages, _ = pub.prune_inbox(owner_message_delivered, {}, now_s)
+            self.assertEqual(pruned_messages, {"oex_past_cutoff"})
+            self.assertTrue(at_cutoff.exists())
+            self.assertFalse(past_cutoff.exists())
+        finally:
+            shutil.rmtree(label_dir, ignore_errors=True)
+
+    def test_prune_refuses_a_symlinked_sent_directory(self):
+        """#225 review T1: prune_inbox itself must refuse a symlinked
+        sent/ the same way _move_reply_to_sent's own symlink test already
+        pins for the move path -- containment is _resolve_inbox_leaf's
+        job either way, but prune_inbox is a different caller of it."""
+        outside = TMP / "outside-prune-sent"
+        outside.mkdir(parents=True, exist_ok=True)
+        real_elsewhere = TMP / "elsewhere-prune-sent"
+        real_elsewhere.mkdir(parents=True, exist_ok=True)
+        old_s = time.time() - (pub.OWNER_INBOX_RETENTION_DAYS + 1) * 86_400
+        planted = real_elsewhere / "oex_prunesym1.md"
+        planted.write_text("must not be reachable through the symlink")
+        os.utime(planted, (old_s, old_s))
+        (outside / "oex_prunesym1.md").symlink_to(planted)
+
+        label = "prunesymowner"
+        label_dir = pub.INBOX_ROOT / label
+        shutil.rmtree(label_dir, ignore_errors=True)
+        try:
+            (label_dir / "replies").mkdir(parents=True)
+            (label_dir / "replies" / "sent").symlink_to(outside)
+            owner_replies_accepted = {"oex_prunesym1": old_s}
+            pruned_messages, pruned_sent = pub.prune_inbox({}, owner_replies_accepted, time.time())
+            self.assertEqual(pruned_sent, set())
+            self.assertTrue(planted.exists())  # never reached, let alone deleted
+        finally:
+            shutil.rmtree(label_dir, ignore_errors=True)
+
+    def test_audit_write_failure_stops_the_prune_without_deleting_anything(self):
+        """#225 review H2: the pre-delete audit row is appended (and
+        fsynced) BEFORE the unlink -- if that append itself fails, this
+        file (and everything after it this tick) must be left alone,
+        never deleted on the strength of an audit entry that never made
+        it to disk."""
+        label = "pruneauditfail"
+        label_dir = pub.INBOX_ROOT / label
+        shutil.rmtree(label_dir, ignore_errors=True)
+        try:
+            old_s = time.time() - (pub.OWNER_INBOX_RETENTION_DAYS + 1) * 86_400
+            (label_dir / "messages").mkdir(parents=True)
+            victim = label_dir / "messages" / "oex_auditfail1.md"
+            victim.write_text("must survive an audit-write failure")
+            os.utime(victim, (old_s, old_s))
+
+            real_append = pub.append_audit
+
+            def failing_append(rows):
+                raise OSError("simulated audit disk failure")
+
+            pub.append_audit = failing_append
+            try:
+                pruned_messages, pruned_sent = pub.prune_inbox({"oex_auditfail1": old_s}, {}, time.time())
+            finally:
+                pub.append_audit = real_append
+            self.assertEqual(pruned_messages, set())
+            self.assertEqual(pruned_sent, set())
+            self.assertTrue(victim.exists())  # never unlinked: the audit row never landed
+        finally:
+            shutil.rmtree(label_dir, ignore_errors=True)
+
+
 
 
 class Deliver(unittest.TestCase):
