@@ -38,11 +38,12 @@ import sqlite3
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sanitize import clean
+from sanitize import clean, read_single_link_regular
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -80,7 +81,44 @@ MODE_FIELDS = ("job_class", "secrets", "git", "writes", "net_read")
 # `#L..`) or any other `https://` URL -- either is a link a reader can
 # actually open; a repo-relative `path:line` is not. This gates `verified`,
 # not correctness of the answer itself.
-SOURCE_LINK_RE = re.compile(r"https://\S+", re.IGNORECASE)
+#
+# F9 (security review round 2, 2026-10-04): a bare `https://\S+` regex
+# accepted `https://x` (no real host at all), the brief's own unfilled
+# template text (`https://github.com/<owner>/<repo>/...`) copied back
+# verbatim, and a link sitting inside a fenced code block or an HTML
+# comment -- none of those are a source a reader could actually open.
+# CANDIDATE_LINK_RE finds every `https://` run with no whitespace/angle
+# bracket in it; each candidate is then parsed for real: scheme must be
+# https (case-insensitive, matching the literal prefix) and the hostname
+# must contain a dot (rejects `https://x`, `https://localhost`, and the
+# template's own `<owner>` placeholder, none of which are a real
+# internet host). Code fences and HTML comments are stripped first so a
+# link quoted ONLY as an example never counts.
+CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+CANDIDATE_LINK_RE = re.compile(r"https://\S+", re.IGNORECASE)
+
+
+def _has_real_source_link(text: str) -> bool:
+    stripped = HTML_COMMENT_RE.sub(" ", CODE_FENCE_RE.sub(" ", text))
+    for m in CANDIDATE_LINK_RE.finditer(stripped):
+        url = m.group(0).rstrip(".,;:)]}\"'")
+        # The WHOLE non-whitespace run, not stopped at the first `<`/`>` --
+        # stopping there would let the brief's own unfilled template
+        # (`https://github.com/<owner>/<repo>/...`) parse as the real,
+        # dotted `github.com` prefix with the placeholder simply cut off.
+        # Reject the candidate outright instead.
+        if "<" in url or ">" in url:
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(url)
+        except ValueError:
+            continue
+        if parsed.scheme.lower() != "https":
+            continue
+        if "." in (parsed.hostname or ""):
+            return True
+    return False
 
 # I4: the Worker mints remote_task_id and it is trusted into a filesystem
 # path (briefs/<id>.md) and a branch name -- the trust root is the TLS
@@ -367,12 +405,19 @@ def _spawn(root: Path, branch: str, mcfg: dict, brief: Path) -> subprocess.Compl
             "--approval", approval, "--brief", str(brief)]
     if mcfg["secrets"] == "grant":
         args.append("--secrets")
+    # F7 (security review round 2, 2026-10-04): orchestrator_closes must
+    # only ever apply to a task THIS module will actually sweep() -- a
+    # local `spawn-task.sh … research` (AGENTS.md's fast lane) has no
+    # remote_task_id and nothing ever calls sweep() over it. Mark this
+    # spawn as remote-orchestrated; spawn-task.sh gates orchestrator_closes
+    # on exactly this env var, never on job_class alone.
+    env = {**os.environ, "HERDR_MCP_REMOTE_SPAWN": "1"}
     try:
         # Comfortably inside the Worker's 90s command lease (publisher.py's
         # COMMAND_LEASE_LOCAL_S budgets 60s to even START this call): spawning
         # a tab/worktree/registry row is orchestration, seconds not minutes --
         # anything slower than this is a genuine failure, not a slow success.
-        return subprocess.run(args, capture_output=True, text=True, timeout=75, cwd=str(REPO))
+        return subprocess.run(args, capture_output=True, text=True, timeout=75, cwd=str(REPO), env=env)
     finally:
         brief.unlink(missing_ok=True)
 
@@ -678,6 +723,19 @@ def _resume(cmd: dict) -> dict:
     wt = WT_ROOT / root.name / branch
     if not wt.is_dir():
         return refuse(f"worktree {wt} no longer exists; nothing to resume into")
+    # F3 (security review round 2, 2026-10-04): resume respawns into the
+    # SAME worktree, and spawn-task.sh deliberately keeps .handoffs/, so a
+    # previous run's ANSWER.md is still sitting there. The first sweep after
+    # this resume would otherwise pass `_verify_research` on that STALE
+    # answer and close the resumed task before the new worker (or the
+    # follow-up note above) ever gets a turn -- there is no boot-time
+    # window where that could be safe. Move it aside now, synchronously,
+    # before the new session starts: no TOCTOU window, no registry/schema
+    # change, and `_verify_research` correctly reports "missing" until the
+    # new run writes its own.
+    stale_answer = wt / ".handoffs/ANSWER.md"
+    if stale_answer.is_file():
+        stale_answer.replace(wt / ".handoffs/ANSWER.prev.md")
     old_row = _bridge("read", old_run_id, old_local_id)
     if old_row.returncode != 0 or not old_row.stdout.strip():
         # H1: the parent row is gone -- pruned past HERDR_TASK_RETENTION_DAYS
@@ -790,8 +848,32 @@ def _auto_close(t: dict, ev: dict) -> dict:
     return {"task_id": t["task_id"], "action": "auto_close", "ok": ok, "detail": proc.stdout.strip()[-400:]}
 
 
-def _answer_sha256(wt: Path) -> str:
-    return hashlib.sha256((wt / ".handoffs/ANSWER.md").read_bytes()).hexdigest()
+CLOSED_N_RE = re.compile(r"\bclosed (\d+)\b")
+
+
+def _read_answer(wt: Path) -> bytes | None:
+    """The one safe read of a research task's ANSWER.md (sanitize.py's
+    read_single_link_regular: O_NOFOLLOW, single-link regular file, capped)
+    -- F4(b). Both the content check and the proof hash below work off
+    this SAME buffer, never two independent reads of the path (F4(a)'s
+    TOCTOU: the old code read it once to verify and again to hash, so a
+    swap between the two reads could close on content that was never
+    actually checked)."""
+    try:
+        return read_single_link_regular(wt / ".handoffs/ANSWER.md")
+    except OSError:
+        return None
+
+
+def _verify_research_bytes(raw: bytes | None) -> tuple[bool, str]:
+    if raw is None:
+        return False, "ANSWER.md is missing, or not a plain single-link file"
+    if not raw.strip():
+        return False, "ANSWER.md is empty"
+    text = raw.decode("utf-8", errors="replace")
+    if not _has_real_source_link(text):
+        return False, "ANSWER.md has no https:// source link (a bare path:line reference does not count)"
+    return True, "ANSWER.md exists with >=1 https:// source link"
 
 
 # research-task-closure defect 1 (2026-10-04, rtask_20261004T120322Z_17df2d64):
@@ -803,24 +885,48 @@ def _answer_sha256(wt: Path) -> str:
 # wrong. The worker is never widened to permit this (no permission
 # expansion anywhere); instead THIS function, run every sweep tick by the
 # trusted orchestrator (this process, outside the worker's write
-# authority), closes a research task once its own two conditions hold:
-# ANSWER.md passes `_verify_research` (content check) AND
-# close-done-workers.sh's own pane-idle/worktree-clean checks agree the
-# worker's turn has actually ended (timing check) -- the same two gates
-# `_auto_close` would apply to a self-reported completion, just reached
-# without the worker's participation. Reason is always `no-follow-on`
-# (research changes nothing outside .handoffs/**); proof is the answer's
-# own sha256, and the registry event names actor=orchestrator so this
-# closure is never confused for one the worker performed itself.
+# authority), closes a research task once its own conditions hold:
+# ANSWER.md passes `_verify_research_bytes` (content check), the live
+# snapshot agrees the worker's own pane is idle/done with nothing it is
+# waiting on (F2: `agent_live` + `pane_status` + not `has_pending_request`,
+# all computed by publisher.py's build() from the SAME tick's herdr/ask
+# state), and close-done-workers.sh's own pane-identity/worktree-clean
+# checks agree too (F1: pane_birth match, done inside close-done itself).
+# Reason is always `no-follow-on` (research changes nothing outside
+# .handoffs/**); proof is the answer's own sha256 of the EXACT bytes that
+# passed the check above (F4(a)); the registry event names
+# actor=orchestrator so this closure is never confused for one the worker
+# performed itself.
 def _orchestrator_close_research(t: dict, wt: Path) -> dict | None:
-    ok, _detail = _verify_research(wt)
+    raw = _read_answer(wt)
+    ok, _detail = _verify_research_bytes(raw)
     if not ok:
         return None  # not ready yet -- retried next tick, same as _pending_completion finding nothing
-    proof = _answer_sha256(wt)
+    # F2: close only when the live snapshot agrees this worker's turn is
+    # actually over -- not merely that ANSWER.md happens to look done.
+    # `agent_live` (publisher.py's own birth-verified occupancy check) must
+    # be true, `pane_status` must be idle or done (never blocked/absent/
+    # working/unknown -- an unrecognized status is deliberately NOT treated
+    # as safe here), and there must be no pending action_request this pane
+    # is waiting on (a hook-mode research worker with one outstanding never
+    # shows as `blocked`, publisher.py's own blockers loop says so).
+    if not t.get("agent_live"):
+        return None
+    if t.get("pane_status") not in ("idle", "done"):
+        return None
+    if t.get("has_pending_request"):
+        return None
+    proof = hashlib.sha256(raw).hexdigest()
     args = [CLOSE_DONE, f"--task={t['task_id']}", "--apply", "--reason=no-follow-on", f"--proof={proof}"]
     proc = subprocess.run(args, capture_output=True, text=True, timeout=60, cwd=str(REPO))
     held = "HOLD" in proc.stdout or "REFUSED" in proc.stdout
-    okc = proc.returncode == 0 and not held
+    # F10: rc=0 with no HOLD/REFUSED substring is also what an empty
+    # pane_id (close-done's own `continue` before it ever prints anything)
+    # or a row that left the running states between this sweep's snapshot
+    # and the call looks like -- "closed 0". Require the summary to say it
+    # actually closed something before trusting it.
+    closed_n = CLOSED_N_RE.search(proc.stdout)
+    okc = proc.returncode == 0 and not held and bool(closed_n) and int(closed_n.group(1)) >= 1
     if okc:
         _bridge("append-event", t["run_id"], t["task_id"], "orchestrator_closed",
                 json.dumps({"actor": "orchestrator", "reason": "no-follow-on", "proof": proof}))
@@ -829,15 +935,7 @@ def _orchestrator_close_research(t: dict, wt: Path) -> dict | None:
 
 
 def _verify_research(wt: Path) -> tuple[bool, str]:
-    answer = wt / ".handoffs/ANSWER.md"
-    if not answer.is_file():
-        return False, "ANSWER.md is missing"
-    text = answer.read_text(encoding="utf-8", errors="replace")
-    if not text.strip():
-        return False, "ANSWER.md is empty"
-    if not SOURCE_LINK_RE.search(text):
-        return False, "ANSWER.md has no https:// source link (a bare path:line reference does not count)"
-    return True, "ANSWER.md exists with >=1 https:// source link"
+    return _verify_research_bytes(_read_answer(wt))
 
 
 def _verify_implement(wt: Path, proof: str, expected_branch: str) -> tuple[bool, str]:
@@ -948,58 +1046,80 @@ def sweep(tasks_by_id: dict[str, dict], now: datetime) -> list[dict]:
         t = tasks_by_id.get(task_id)
         if not t:
             continue
-        # remote-research-answer-approval (2026-10-03, conductor live-test
-        # finding): t["state"] is the HUB-DERIVED state (publisher.py
-        # build()). Once a worker's completion event lands, derived state
-        # becomes "ready_review" while the registry's own stored_state is
-        # still "running" -- this check used to test derived state, so a
-        # finished task fell out of the running/starting/blocked set
-        # forever and was never auto-closed, never re-checked for its
-        # deadline, and never had its hard-stop timer re-armed (all three
-        # live in this same branch). Decide on stored_state instead.
-        if (t.get("stored_state") or t["state"]) in ("running", "starting", "blocked"):
-            # F10 (security review PR #220): this used to check the
-            # deadline BEFORE looking for a pending completion, so a task
-            # whose worker had already delivered its completion event --
-            # just waiting on a HOLD-retried auto_close (pane busy) -- could
-            # still be force-cancelled timed_out past its deadline,
-            # discarding an answer that was already on disk. A completion
-            # event already delivered always wins over the timer. A research
-            # task never gets that event at all (defect 1: its manifest
-            # restricts the write tool to ANSWER.md, so it cannot append to
-            # events.jsonl) -- an ANSWER.md that already passes
-            # _verify_research wins over the timer the same way, via the
-            # trusted orchestrator instead of a self-reported event.
-            wt = Path(t["worktree"]) if t.get("worktree") else None
-            if remote["mode"] == "research":
-                action = _orchestrator_close_research(t, wt) if wt and wt.is_dir() else None
-                if action:
-                    logged.append(action)
+        try:
+            # remote-research-answer-approval (2026-10-03, conductor live-test
+            # finding): t["state"] is the HUB-DERIVED state (publisher.py
+            # build()). Once a worker's completion event lands, derived state
+            # becomes "ready_review" while the registry's own stored_state is
+            # still "running" -- this check used to test derived state, so a
+            # finished task fell out of the running/starting/blocked set
+            # forever and was never auto-closed, never re-checked for its
+            # deadline, and never had its hard-stop timer re-armed (all three
+            # live in this same branch). Decide on stored_state instead.
+            if (t.get("stored_state") or t["state"]) in ("running", "starting", "blocked"):
+                # F10 (security review PR #220): this used to check the
+                # deadline BEFORE looking for a pending completion, so a task
+                # whose worker had already delivered its completion event --
+                # just waiting on a HOLD-retried auto_close (pane busy) --
+                # could still be force-cancelled timed_out past its deadline,
+                # discarding an answer that was already on disk. A completion
+                # event already delivered always wins over the timer. A
+                # research task never gets that event at all (defect 1: its
+                # manifest restricts the write tool to ANSWER.md, so it
+                # cannot append to events.jsonl) -- an ANSWER.md that already
+                # passes _verify_research wins over the timer the same way,
+                # via the trusted orchestrator instead of a self-reported
+                # event.
+                wt = Path(t["worktree"]) if t.get("worktree") else None
+                if remote["mode"] == "research":
+                    action = _orchestrator_close_research(t, wt) if wt and wt.is_dir() else None
+                    if action:
+                        logged.append(action)
+                        # F8 (security review round 2, 2026-10-04): only a
+                        # CONFIRMED close (ok=True) means the task is
+                        # actually done -- close-done-workers.sh HOLDing or
+                        # REFUSING (ok=False) means it is NOT, and must
+                        # still fall through to the deadline/hard-stop check
+                        # below on this same tick, exactly like finding no
+                        # action at all. The old `if action: ... continue`
+                        # treated a HOLD the same as a confirmed close and
+                        # let it kill the hard-stop timer's only backstop.
+                        if action["ok"]:
+                            continue
+                else:
+                    ev = _pending_completion(wt) if wt and wt.is_dir() else None
+                    if ev:
+                        logged.append(_auto_close(t, ev))
+                        continue
+                deadline = _parse_iso(remote["deadline_at"]) if remote["deadline_at"] else None
+                if deadline is None:
+                    # N1: a post-spawn set-deadline failure (bridge write lost)
+                    # must not leave the only backstop a remote task has
+                    # permanently absent. Fall back to created_at plus the
+                    # CURRENT allowlist's max_minutes.
+                    created = _parse_iso(t.get("created_at") or "")
+                    if created is not None:
+                        try:
+                            deadline = created + load_allowlist()["caps"]["max_minutes"] * 60
+                        except (OSError, ValueError, KeyError):
+                            deadline = None
+                if deadline is not None and now.timestamp() > deadline:
+                    logged.append(_force_cancel(t, "timed_out"))
                     continue
-            else:
-                ev = _pending_completion(wt) if wt and wt.is_dir() else None
-                if ev:
-                    logged.append(_auto_close(t, ev))
-                    continue
-            deadline = _parse_iso(remote["deadline_at"]) if remote["deadline_at"] else None
-            if deadline is None:
-                # N1: a post-spawn set-deadline failure (bridge write lost)
-                # must not leave the only backstop a remote task has
-                # permanently absent. Fall back to created_at plus the
-                # CURRENT allowlist's max_minutes.
-                created = _parse_iso(t.get("created_at") or "")
-                if created is not None:
-                    try:
-                        deadline = created + load_allowlist()["caps"]["max_minutes"] * 60
-                    except (OSError, ValueError, KeyError):
-                        deadline = None
-            if deadline is not None and now.timestamp() > deadline:
-                logged.append(_force_cancel(t, "timed_out"))
-                continue
-            if sweep_max_minutes is not None:
-                retry = _ensure_hard_stop_scheduled(t, remote, sweep_max_minutes, now.timestamp())
-                if retry:
-                    logged.append(retry)
-        elif t["state"] == "completed" and not remote["verify_detail"]:
-            logged.append(_verify(t, remote))
+                if sweep_max_minutes is not None:
+                    retry = _ensure_hard_stop_scheduled(t, remote, sweep_max_minutes, now.timestamp())
+                    if retry:
+                        logged.append(retry)
+            elif t["state"] == "completed" and not remote["verify_detail"]:
+                logged.append(_verify(t, remote))
+        except (OSError, subprocess.SubprocessError) as exc:
+            # F4(c) (security review round 2, 2026-10-04): a transient read
+            # error (worktree yanked mid-check) or a hung close-done-
+            # workers.sh/git call used to propagate OUT of sweep() entirely
+            # -- publisher.py's own tick calls sweep() unguarded (build()
+            # line ~1502), so ONE poisoned task used to crash the whole
+            # publisher process before it ever reached sync(), taking down
+            # every OTHER task's deadline/hard-stop backstop with it. Log
+            # and move on to the next task instead.
+            logged.append({"task_id": task_id, "action": "sweep_error", "ok": False, "detail": str(exc)[:300]})
     return logged

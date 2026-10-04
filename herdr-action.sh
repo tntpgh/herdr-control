@@ -224,16 +224,38 @@ cmd_decide() {                          # approve|decline id [flags]
 # which case the caller falls through to today's conductor_unconfigured path
 # unchanged.
 _ha_route_to_owner() {                  # id row task-json msg -> owner label on stdout, exit 1 if none reachable
-  local id="$1" tj="$3" msg="$4" label pane birth live
+  local id="$1" tj="$3" msg="$4" label pane birth live requester_pane owner_task owner_state rc
+  requester_pane="$(_ha_field "$tj" pane_id)"
   while IFS='|' read -r label pane birth; do
     [ -n "$label" ] && [ -n "$pane" ] || continue
+    # F6 (security review round 2, 2026-10-04): a candidate owner pane that
+    # is itself an ACTIVE worker's own task pane (running/starting/blocked)
+    # is not a decision-maker standing by -- it is the thing being asked
+    # about, or an unrelated task mid-work. Never message it, and never the
+    # REQUESTING task's own pane either (a worker cannot approve itself by
+    # also being registered as an owner).
+    [ -n "$requester_pane" ] && [ "$pane" = "$requester_pane" ] && continue
+    owner_task="$(task_for_pane "$pane" 2>/dev/null)"
+    if [ -n "$owner_task" ]; then
+      owner_state="$(_ha_field "$owner_task" state)"
+      case "$owner_state" in running|starting|blocked) continue ;; esac
+    fi
     live="$(pane_birth_now "$pane" 2>/dev/null)"
     [ -n "$live" ] && [ "$live" = "$birth" ] || continue
     pane_is_agent "$pane" 2>/dev/null || continue
-    if bash "$HA_SEND" "$pane" "$msg" >/dev/null 2>&1; then
+    bash "$HA_SEND" "$pane" "$msg" >/dev/null 2>&1; rc=$?
+    if [ "$rc" -eq 0 ]; then
       printf '%s\n' "$label"
       return 0
     fi
+    # rc 4/5 (typed-but-not-submitted / refused) means the SEND mechanism
+    # itself is impaired right now (a menu/approval already painted in that
+    # pane, or the type was rejected) -- not that this one owner happened to
+    # be unreachable. Trying the next owner would fire the same send path
+    # again for no better reason to expect success; stop and fall through to
+    # the human route instead of silently spraying the same broken send at
+    # every registered owner.
+    case "$rc" in 4|5) return 1 ;; esac
   done < <(_sql "SELECT label||'|'||pane_id||'|'||pane_birth FROM owners ORDER BY label;" 2>/dev/null)
   return 1
 }
@@ -474,9 +496,15 @@ cmd_tick() {
       # has nobody who could ever see the conductor alert; waiting out the
       # normal window before the human route only delays a question that
       # was never going anywhere. Escalate on the very next tick instead.
-      if [ "$(_ha_surface_outcome "$id")" != conductor_unconfigured ]; then
-        [ "$age" -ge "$HA_STALE_S" ] || continue
-      fi
+      # F5 (security review round 2, 2026-10-04): an `owner:<label>`
+      # outcome is the SAME case -- a named owner pane got a best-effort
+      # notify, never a new approval authority, so the human route (the
+      # hub form this message's own text points at) must be served on the
+      # same tick too, not after a 900s wait nobody told the human about.
+      case "$(_ha_surface_outcome "$id")" in
+        conductor_unconfigured|owner:*) ;;
+        *) [ "$age" -ge "$HA_STALE_S" ] || continue ;;
+      esac
     fi
     ( _ha_human_route "$id" "$row" "$tj" ) >/dev/null 2>&1
   done < <(action_requests_pending)

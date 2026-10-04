@@ -8,12 +8,19 @@ Worker already did.
 A separate module, not a function importable from publisher.py, because
 tasks.py needs it and publisher.py will need tasks.py (to push task_config
 and process leased commands) -- `from publisher import clean` there would be
-a circular import the moment that wiring lands.
+a circular import the moment that wiring lands. read_single_link_regular
+below lives here for the identical reason: F4 (security review round 2,
+2026-10-04) wants tasks.py's ANSWER.md read and publisher.py's has_answer
+check to use the exact same safe-read primitive, and publisher.py already
+imports tasks.py.
 """
 from __future__ import annotations
 
+import os
 import re
+import stat as _stat
 import unicodedata
+from pathlib import Path
 
 BLANKS = "\u115f\u1160\u3164\uffa0\u2800"
 
@@ -37,3 +44,26 @@ def clean(s: str) -> str:
         else:
             out.append("\uff20" if c == "@" else c)
     return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+READ_CAP_DEFAULT = 1_000_000  # matches publisher.py's RESULT_READ_CAP
+
+
+def read_single_link_regular(path: Path, cap: int = READ_CAP_DEFAULT) -> bytes:
+    """Read at most `cap` bytes of a plain file with exactly one link: no
+    symlink (O_NOFOLLOW), not a hard link to a file reachable elsewhere
+    (st_nlink == 1), and both checks apply to the descriptor actually read
+    (never a path re-resolved after the check, which a rename/symlink swap
+    between stat and read could defeat). Raises OSError if the path is
+    missing or fails either check. The one safe reader for a file an
+    untrusted worker's pane wrote into its own worktree -- ANSWER.md here,
+    publisher.py's read_regular is the same primitive for a synced reply."""
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise OSError(f"{path}: not a single-link regular file")
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read(cap)
+    finally:
+        os.close(fd)

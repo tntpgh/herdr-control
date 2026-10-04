@@ -125,16 +125,49 @@ if [ "$apply" = 1 ] && [ "$closure_reason" = shipped ]; then
 fi
 
 panes_json=$(herdr pane list 2>/dev/null)
-pane_status() { printf '%s' "$panes_json" | jq -r --arg p "$1" '((.result.panes // .panes)[]|select(.pane_id==$p)|.agent_status) // "absent"'; }
+# F2 (security review round 2, 2026-10-04): `herdr pane list` failing (empty
+# output, or any shape jq cannot walk) used to make every status query
+# return "" from jq's own stderr-only failure, which matched none of the
+# case arms below and fell through to CLOSABLE -- the exact opposite of
+# "fail closed" for a check that exists to gate on whether a pane is still
+# being used. Validate the shape ONCE, and every row holds, not passes,
+# when it cannot be verified at all.
+panes_ok=0
+printf '%s' "$panes_json" | jq -e '(.result.panes // .panes) | type == "array"' >/dev/null 2>&1 && panes_ok=1
+pane_status() {
+  [ "$panes_ok" = 1 ] || { printf 'unknown'; return; }
+  printf '%s' "$panes_json" | jq -r --arg p "$1" '((.result.panes // .panes)[]|select(.pane_id==$p)|.agent_status) // "absent"'
+}
+# F1: herdr reuses a pane_id once a pane closes (documented above, lines
+# 78-86) -- a row's pane_id alone can match a DIFFERENT, unrelated live
+# session. Only a pane whose LIVE terminal_id (birth) matches what this row
+# registered is actually the session this row thinks it is; a pane with NO
+# live occupant at all (closed, never recycled) has nothing else it could
+# be confused with and stays matchable by id alone.
+pane_live_birth() {
+  [ "$panes_ok" = 1 ] || { printf ''; return; }
+  printf '%s' "$panes_json" | jq -r --arg p "$1" '((.result.panes // .panes)[]|select(.pane_id==$p)|.terminal_id) // empty'
+}
 
 closable=0; held=0; refused=0
-while IFS='|' read -r run_id task_id pane wt label trunk; do
+while IFS='|' read -r run_id task_id pane pane_birth wt label trunk; do
   [ -n "$pane" ] || continue
-  st=$(pane_status "$pane")
-  reason=""
-  case "$st" in
-    working) reason="pane is WORKING" ;;
-  esac
+  if [ "$panes_ok" != 1 ]; then
+    reason="herdr pane list is unavailable or unparseable; status cannot be verified"
+  else
+    st=$(pane_status "$pane")
+    reason=""
+    case "$st" in
+      working) reason="pane is WORKING" ;;
+      ''|unknown) reason="pane status unknown" ;;
+    esac
+    if [ -z "$reason" ]; then
+      live_birth=$(pane_live_birth "$pane")
+      if [ -n "$live_birth" ] && [ -n "$pane_birth" ] && [ "$live_birth" != "$pane_birth" ]; then
+        reason="pane_id recycled to a different session (pane_birth mismatch)"
+      fi
+    fi
+  fi
   if [ -z "$reason" ] && [ -d "$wt" ]; then
     br=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)
     dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
@@ -200,7 +233,7 @@ while IFS='|' read -r run_id task_id pane wt label trunk; do
   fi
   [ -x "$HERE/claim.sh" ] && HERDR_PANE_ID="$pane" "$HERE/claim.sh" drop >/dev/null 2>&1
   [ "$(pane_status "$pane")" = absent ] || herdr pane close "$pane" >/dev/null 2>&1
-done < <(_sql "SELECT run_id || '|' || task_id || '|' || pane_id || '|' || worktree || '|' || label || '|' || trunk
+done < <(_sql "SELECT run_id || '|' || task_id || '|' || pane_id || '|' || pane_birth || '|' || worktree || '|' || label || '|' || trunk
                FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at;")
 
 echo

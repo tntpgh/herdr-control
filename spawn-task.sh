@@ -661,10 +661,20 @@ fi
 # both get mode-specific text instead: the trusted orchestrator (remote-mcp/
 # tasks.py's sweep(), never the worker) closes the task once ANSWER.md
 # verifies and the pane goes idle.
+#
+# F7 (security review round 2, 2026-10-04): this must NEVER fire for a
+# LOCAL research/explore spawn (AGENTS.md's fast lane) -- the orchestrator
+# only ever sweeps _remote_rows (a remote_task_id set), so a local task
+# told "the orchestrator closes this" would simply never close: nothing
+# watches ANSWER.md, and the worker is told not to use the one path
+# (events.jsonl) its own conductor could otherwise see and approve.
+# HERDR_MCP_REMOTE_SPAWN is set ONLY by remote-mcp/tasks.py's own _spawn(),
+# never by an interactive caller -- the one place that both creates a
+# remote_task_id row AND actually runs sweep().
 orchestrator_closes=0
 case "$job" in
   research|explore)
-    orchestrator_closes=1
+    [ "${HERDR_MCP_REMOTE_SPAWN:-}" = 1 ] && orchestrator_closes=1
     # R3-2: the previous `"${manifest_json:-\{\}}"` kept the backslashes
     # literal inside double quotes (jq saw `\{\}`, a parse error, and with
     # no `set -e` here that silently produced empty -- a research/explore

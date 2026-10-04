@@ -459,12 +459,38 @@ if [ "$REMOTE_MCP" = 1 ]; then
   done
   REMOTE_MCP_CONDUCTOR_BIRTH=""
   if [ -n "$REMOTE_MCP_CONDUCTOR_PANE" ]; then
+    # F11 (security review round 2, 2026-10-04): both values go straight
+    # into `sed "s|…|$VAR|"` and then into plist XML. The liveness check
+    # below already requires an exact pane-list match today, so a value
+    # containing `|&<>"'` can't actually pass it -- this is defence in
+    # depth, never the only guard, for the day that check changes.
+    case "$REMOTE_MCP_CONDUCTOR_PANE" in
+      *[!A-Za-z0-9:_-]*)
+        echo "  ! --remote-mcp-conductor-pane=$REMOTE_MCP_CONDUCTOR_PANE has an unexpected character -- refusing" >&2
+        exit 2 ;;
+    esac
     if ! pane_is_agent "$REMOTE_MCP_CONDUCTOR_PANE" 2>/dev/null; then
       echo "  ! --remote-mcp-conductor-pane=$REMOTE_MCP_CONDUCTOR_PANE is not a live agent pane right now -- refusing" >&2
       exit 2
     fi
     REMOTE_MCP_CONDUCTOR_BIRTH="$(pane_birth_now "$REMOTE_MCP_CONDUCTOR_PANE" 2>/dev/null)"
     [ -n "$REMOTE_MCP_CONDUCTOR_BIRTH" ] || { echo "  ! could not read a terminal_id for $REMOTE_MCP_CONDUCTOR_PANE -- refusing" >&2; exit 2; }
+    case "$REMOTE_MCP_CONDUCTOR_BIRTH" in
+      *[!A-Za-z0-9:_-]*)
+        echo "  ! terminal_id for $REMOTE_MCP_CONDUCTOR_PANE has an unexpected character -- refusing" >&2
+        exit 2 ;;
+    esac
+  elif [ -f "$PLIST" ] && command -v /usr/libexec/PlistBuddy >/dev/null 2>&1; then
+    # F11: re-running --apply --remote-mcp (e.g. only to flip the
+    # messaging/tasks/owner-inbox switches) WITHOUT repeating
+    # --remote-mcp-conductor-pane used to silently clear a previously
+    # configured conductor fallback -- the flag's absence looked
+    # identical to "never configure one" instead of "nothing new to say
+    # about it". Preserve whatever is already deployed when the flag is
+    # absent, same as the messaging/tasks/owner-inbox switches already do
+    # above (prior_messaging/prior_tasks/prior_owner_inbox).
+    REMOTE_MCP_CONDUCTOR_PANE="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HERDR_MCP_CONDUCTOR_PANE" "$PLIST" 2>/dev/null)" || REMOTE_MCP_CONDUCTOR_PANE=""
+    REMOTE_MCP_CONDUCTOR_BIRTH="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HERDR_MCP_CONDUCTOR_BIRTH" "$PLIST" 2>/dev/null)" || REMOTE_MCP_CONDUCTOR_BIRTH=""
   fi
   cond_note="conductor pane: $([ -n "$REMOTE_MCP_CONDUCTOR_PANE" ] && echo "$REMOTE_MCP_CONDUCTOR_PANE" || echo "none (falls back to owner-inbox/human-notify per-escalation)")"
   if [ "$APPLY" = 1 ]; then
