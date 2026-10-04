@@ -506,6 +506,22 @@ All from `remote-mcp/`:
    `--remote-mcp-tasks` and `--remote-mcp-owner-inbox` are each turned on
    later, as their own decision (see "Turning it on" above).
 
+### Deploy order on later releases (Worker before the Mac)
+
+Once `owner_reply_results` exists (#225 review round 3 N1/N3), a release
+changing the sync response shape must land on the Worker BEFORE the Mac
+publisher that depends on it: `provision.sh --apply` (step 2 above) first,
+`./install.sh --apply --remote-mcp…` (step 3) second. Deploying the Mac
+side first is safe but not useful -- an old Worker's `/ingest/sync`
+response simply has no `owner_reply_results` field, so a newer publisher
+treats every owner reply as "this field says nothing about it" (the
+documented safest default: left untouched in `replies/`, retried next
+tick) until the Worker catches up. Nothing is lost or misfiled either
+way; new-Mac-old-Worker just delays owner replies until the Worker
+deploys. The reverse order (old Mac, new Worker) is always safe: the
+`/ingest/sync` REQUEST schema is unchanged by this field, so an old
+publisher keeps working against a new Worker without modification.
+
 Tests: `cd worker && npx vitest run` (four projects: `read-only` = the
 first-deploy configuration, `messaging` = messaging on, `tasks` = messaging
 and tasks both on, `owner-inbox` = messaging and the owner-inbox scope both

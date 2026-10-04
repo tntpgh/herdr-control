@@ -21,6 +21,7 @@ Exit 0 on success, 1 when the Worker or the hub was unreachable (logged).
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -66,6 +67,32 @@ RESULT_READ_CAP = 1_000_000  # redaction runs over this much, then the result is
 RESULT_RESEND_S = 12 * 3600
 MAX_RESULTS_PER_SYNC = 50
 MAX_MESSAGE_CHARS = 2000
+# #225: exact mirror of the Worker's owner_replies .max(200) (state.ts
+# ~75); exceeding it trips bad_shape and rejects the WHOLE sync, not just
+# the overflow, so this is the one shared cap scan_owner_replies enforces
+# locally before anything is ever posted.
+OWNER_REPLIES_CAP = 200
+# Matches the Worker's own owner_messages retention (state.ts ~1314), so
+# the Mac-side copies (inbox/<label>/messages/, inbox/<label>/replies/sent/)
+# age out on the same schedule as the server-side rows they mirror.
+OWNER_INBOX_RETENTION_DAYS = 30
+# #225 review M2: the count cap alone does not bound bytes -- 200 replies
+# of 2000 chars each, posted through post_sync's json.dumps(ensure_ascii=True),
+# can reach ~4.8 MB for non-ASCII text (every non-ASCII char becomes a
+# 6-12 byte \uXXXX escape), well past the Worker's MAX_BODY_BYTES = 2_000_000
+# (ingest.ts:9) -- which 413s the WHOLE sync, every tick, deterministically
+# (the oldest-first batch never changes), reproducing #225's wedge through
+# bytes instead of count. This budgets owner_replies' own encoded bytes
+# with headroom for the snapshot, results (up to RESULT_BUDGET_BYTES) and
+# JSON envelope in the same body; main() trims the newest-first until
+# under budget (at least one reply always goes), and the rest wait in
+# replies/ for a later tick -- same "drains over several ticks" shape as
+# the count cap.
+OWNER_REPLIES_BUDGET_BYTES = 500_000
+# #225 review M1: a reply is skipped by scan_owner_replies until its mtime
+# is at least this old, so a file still being written (a multi-step save,
+# or an append-mode editor) is never read and posted mid-write.
+REPLY_MIN_AGE_S = 30
 # The Worker leases a message for 90 s and re-checks policy only at lease time.
 # Anything not typed within this many seconds of the lease goes back (retry) so
 # the next lease re-checks it: the in-flight window is bounded by the lease,
@@ -618,15 +645,28 @@ def _resolve_inbox_leaf(label: str, kind: str, name: str) -> Path | None:
     replies/ directory, or the label directory itself, made to point
     elsewhere -- not just a symlinked leaf file. Returns None for a path
     that does not exist OR escapes containment; the caller cannot tell
-    which, by design (both mean "nothing safe to read here")."""
-    if not OWNER_LABEL_RE.match(label) or kind not in ("messages", "replies") or not EXCHANGE_ID_RE.match(name):
+    which, by design (both mean "nothing safe to read here").
+
+    kind "replies/sent" (#225) is the durable "already acked" tree: a
+    reply moved here by _move_reply_to_sent, only once the Worker's own
+    sync response says this exchange_id was "accepted" or "duplicate"
+    (review H1). kind "replies/rejected" (review H1) holds a reply the
+    Worker durably refused (a missing/mismatched row, or a terminal
+    status like blocked:*) -- never pruned, kept for a human to look at.
+
+    I1 (#225 review): on Python 3.10-3.12, resolve(strict=True) on a
+    symlink LOOP raises RuntimeError, not OSError; catching only OSError
+    would let that escape scan_owner_replies/prune_inbox and abort the
+    whole tick over one poisoned file."""
+    if (not OWNER_LABEL_RE.match(label) or kind not in ("messages", "replies", "replies/sent", "replies/rejected")
+            or not EXCHANGE_ID_RE.match(name)):
         return None
     suffix = f"/{label}/{kind}/{name}.md"
     candidate = Path(f"{INBOX_ROOT}{suffix}")
     try:
         root = INBOX_ROOT.resolve(strict=True)
         rp = candidate.resolve(strict=True)
-    except OSError:
+    except (OSError, RuntimeError):
         return None
     if str(rp) != f"{root}{suffix}":
         return None
@@ -753,15 +793,32 @@ def _split_reply_header(text: str) -> tuple[dict[str, str], str]:
     return header, rest
 
 
-def scan_owner_replies(already_sent: set) -> list[dict]:
-    """New files under inbox/<label>/replies/ since the last tick a sync
-    actually succeeded (already_sent, state.json). owner_label comes from
-    the DIRECTORY the file was found in; `session` is left blank here and
-    filled in by the caller from the Mac's own live registry read -- never
-    from the file's own claimed header (SPEC: the reply's header is
-    untrusted; only its exchange_id, used as the filename, is a
-    correlation key, and even that is re-validated against the real row
-    server-side, never trusted from this scan alone).
+def scan_owner_replies(cap: int = OWNER_REPLIES_CAP) -> list[dict]:
+    """Every file under inbox/<label>/replies/ (not yet moved to
+    inbox/<label>/replies/sent/) is, by definition, unacked (#225): this
+    module ONLY moves a reply out of replies/ in _move_reply_to_sent,
+    called from main() after a sync that carried it returns 200. So
+    presence in replies/ -- not a separate durable set -- IS "not yet
+    sent", with no window to fall out of: the old `sent_replies` state.json
+    list kept only the last 500 keys and silently forgot anything older
+    once ~700 reply files had ever existed, at which point every tick
+    re-posted the whole backlog and 400'd forever (issue #225).
+
+    Collected across every label, sorted oldest mtime first (ties broken
+    on the label/exchange_id key for determinism), and capped at `cap` --
+    one shared constant, OWNER_REPLIES_CAP, mirroring the Worker's own
+    owner_replies .max(200) exactly, since exceeding it rejects the WHOLE
+    sync, not just the overflow. A backlog over the cap simply waits: the
+    oldest `cap` replies go this tick, the rest are still sitting in
+    replies/ (never touched, never lost) and are picked up again next
+    tick once this tick's survivors have moved to sent/.
+
+    owner_label comes from the DIRECTORY the file was found in; `session`
+    is left blank here and filled in by the caller from the Mac's own live
+    registry read -- never from the file's own claimed header (SPEC: the
+    reply's header is untrusted; only its exchange_id, used as the
+    filename, is a correlation key, and even that is re-validated against
+    the real row server-side, never trusted from this scan alone).
 
     M3 (REVIEW-219): the header is now actually parsed (_split_reply_header)
     instead of silently ignored. A header that explicitly CLAIMS a
@@ -771,10 +828,18 @@ def scan_owner_replies(already_sent: set) -> list[dict]:
     internally-contradictory file is treated as untrustworthy rather than
     "probably fine". `artifact_revision` is read from the header instead of
     always being the empty string; still length-capped and still only a
-    claim the server re-validates, never trusted as-is."""
-    out: list[dict] = []
+    claim the server re-validates, never trusted as-is.
+
+    #225 item 4: a file this can't safely read (symlink, non-regular,
+    removed mid-scan, permission error), or one at/above RESULT_READ_CAP
+    (oversized -- read_regular would only hand back a cap-sized prefix,
+    and silently posting a chopped reply as if it were complete is worse
+    than not sending it this tick), is logged and skipped -- it never
+    raises, so one poisoned or oversized reply can never wedge the scan
+    for every other label's replies."""
+    candidates: list[tuple[float, str, dict]] = []
     if not INBOX_ROOT.is_dir():
-        return out
+        return []
     for label_dir in sorted(INBOX_ROOT.iterdir()):
         if not label_dir.is_dir() or not OWNER_LABEL_RE.match(label_dir.name):
             continue
@@ -784,14 +849,28 @@ def scan_owner_replies(already_sent: set) -> list[dict]:
         for f in sorted(replies_dir.glob("*.md")):
             exchange_id = f.stem
             key = f"{label_dir.name}/{exchange_id}"
-            if key in already_sent or not EXCHANGE_ID_RE.match(exchange_id):
+            if not EXCHANGE_ID_RE.match(exchange_id):
                 continue
             path = _resolve_inbox_leaf(label_dir.name, "replies", exchange_id)
             if path is None:
                 continue  # symlink, or otherwise unsafe: silently skipped, never read
             try:
+                mtime_s = path.stat().st_mtime
+            except OSError as exc:
+                log(f"owner reply {key} skipped (unreadable): {exc}")
+                continue
+            # #225 review M1: a reply still being written (a multi-step
+            # save, or `>>` append) is left for a later tick, never read
+            # mid-write.
+            if time.time() - mtime_s < REPLY_MIN_AGE_S:
+                continue
+            try:
                 raw, mtime_iso = read_regular(path)
-            except OSError:
+            except OSError as exc:
+                log(f"owner reply {key} skipped (unreadable): {exc}")
+                continue
+            if len(raw) >= RESULT_READ_CAP:
+                log(f"owner reply {key} skipped (oversized, >= {RESULT_READ_CAP} bytes)")
                 continue
             header, body_text = _split_reply_header(raw.decode("utf-8", "replace"))
             claimed_eid = header.get("exchange_id")
@@ -802,12 +881,111 @@ def scan_owner_replies(already_sent: set) -> list[dict]:
             if claimed_label and claimed_label != label_dir.name:
                 log(f"owner reply {key} refused: header claims owner_label {claimed_label!r}")
                 continue
-            out.append({"exchange_id": exchange_id, "owner_label": label_dir.name,
+            candidates.append((mtime_s, key, {"exchange_id": exchange_id, "owner_label": label_dir.name,
                         "body": redact(body_text).strip()[:MAX_MESSAGE_CHARS],
                         "responded_at": mtime_iso or iso(time.time()),
                         "artifact_revision": header.get("artifact_revision", "")[:200],
-                        "session": "", "_key": key})
-    return out
+                        "session": "", "_key": key}))
+    candidates.sort(key=lambda t: (t[0], t[1]))
+    return [row for _, _, row in candidates[:cap]]
+
+
+def _link_move_no_overwrite(src: Path, dest_dir: Path, exchange_id: str) -> tuple[Path, bool]:
+    """#225 review round 3 I2: os.link fails atomically with
+    FileExistsError if the destination already exists, closing the
+    TOCTOU window the previous dest.exists()-then-os.replace() left open
+    (a concurrent same-uid writer could slip a file in between the check
+    and the write; launchd never runs two ticks at once, but this is now
+    race-free regardless). Tries <id>.md first, then <id>-dup1.md,
+    <id>-dup2.md, ... until a link succeeds -- each attempt is itself
+    atomic, so two callers (or two attempts of the same call) can never
+    collide on one destination. The caller unlinks `src` once this
+    returns, completing the move; this function never touches src.
+    Returns (dest_path, was_dup)."""
+    dest = dest_dir / f"{exchange_id}.md"
+    try:
+        os.link(src, dest)
+        return dest, False
+    except FileExistsError:
+        pass
+    n = 1
+    while True:
+        dup_dest = dest_dir / f"{exchange_id}-dup{n}.md"
+        try:
+            os.link(src, dup_dest)
+            return dup_dest, True
+        except FileExistsError:
+            n += 1
+
+
+def _move_reply_to_sent(label: str, exchange_id: str) -> bool:
+    """Called ONLY from main() once the Worker's sync response says this
+    exchange_id's outcome was "accepted" or "duplicate" (#225 review H1 --
+    a bare 200 is not proof the Worker accepted the reply; see main()).
+    Moves inbox/<label>/replies/<id>.md to inbox/<label>/replies/sent/<id>.md.
+    Presence under replies/sent/ IS the durable "already acked" record
+    scan_owner_replies reads by omission -- no separate set to maintain,
+    back up, or let fall out of a window. A reply not yet moved here
+    (sync failed before this ran, or the move itself failed) is simply
+    found again by scan_owner_replies next tick, exactly like any other
+    unsent file.
+
+    M1 (#225 review): NEVER overwrites an existing sent/<id>.md -- a
+    second file at this exchange_id (the owner re-wrote replies/<id>.md
+    after the Worker already said 'replied', or a partial-write race)
+    is kept SEPARATELY as sent/<id>-dupN.md and audited, never silently
+    replacing the text the Worker actually accepted. I2 (#225 review
+    round 3): the no-overwrite check itself is race-free (_link_move_no_overwrite)."""
+    src = _resolve_inbox_leaf(label, "replies", exchange_id)
+    if src is None:
+        return False
+    try:
+        sent_dir = src.parent / "sent"
+        sent_dir.mkdir(mode=0o700, exist_ok=True)
+        root = INBOX_ROOT.resolve(strict=True)
+        if sent_dir.resolve(strict=True) != root / label / "replies" / "sent":
+            log(f"owner reply {label}/{exchange_id} sent-move refused: a symlink stands in for the sent directory")
+            return False
+        dest, was_dup = _link_move_no_overwrite(src, sent_dir, exchange_id)
+        os.unlink(src)
+        if was_dup:
+            try:
+                append_audit([{"kind": "reply_dup_kept", "id": exchange_id, "label": label, "dup_path": dest.name}])
+            except OSError as exc:
+                log(f"owner reply {label}/{exchange_id} dup-kept audit failed: {exc}")
+            log(f"owner reply {label}/{exchange_id}: sent/{exchange_id}.md already exists; kept as {dest.name}")
+        return True
+    except OSError as exc:
+        log(f"owner reply {label}/{exchange_id} sent-move failed: {exc}")
+        return False
+
+
+def _move_reply_to_rejected(label: str, exchange_id: str) -> bool:
+    """#225 review H1: a reply the Worker durably refused -- its row is
+    missing/label-mismatched ("ignored:missing"), or its status is a
+    terminal blocked:* -- is moved here instead of replies/sent/. A
+    transient "ignored:queued"/"ignored:delivering" is left untouched in
+    replies/ to retry, never moved here. prune_inbox NEVER touches
+    replies/rejected/ -- kept for a human to look at, not silently
+    deleted the way a dropped reply used to be before this fix. I2 (#225
+    review round 3): uses the same race-free link-then-unlink move as
+    _move_reply_to_sent."""
+    src = _resolve_inbox_leaf(label, "replies", exchange_id)
+    if src is None:
+        return False
+    try:
+        rej_dir = src.parent / "rejected"
+        rej_dir.mkdir(mode=0o700, exist_ok=True)
+        root = INBOX_ROOT.resolve(strict=True)
+        if rej_dir.resolve(strict=True) != root / label / "replies" / "rejected":
+            log(f"owner reply {label}/{exchange_id} rejected-move refused: a symlink stands in for the rejected directory")
+            return False
+        _link_move_no_overwrite(src, rej_dir, exchange_id)
+        os.unlink(src)
+        return True
+    except OSError as exc:
+        log(f"owner reply {label}/{exchange_id} rejected-move failed: {exc}")
+        return False
 
 
 def _last_assistant_text(raw: bytes) -> str | None:
@@ -918,7 +1096,14 @@ def changed_results(snapshot: dict, local: dict, cache: dict, now_s: float) -> l
             seen = cache.get(cache_key) or {}
             if seen.get("sha256") == digest and now_s - seen.get("sent_at", 0) < RESULT_RESEND_S:
                 continue
-            used += len(text.encode())
+            # #225 review round 3 N4: budgeted on the encoded WIRE size
+            # (what post_sync's json.dumps(..., ensure_ascii=True)
+            # actually sends), not raw UTF-8 bytes -- those differ sharply
+            # for non-ASCII text (every non-ASCII char becomes a 6-12
+            # byte \uXXXX escape), so a UTF-8-measured budget of 1 MB can
+            # reach ~3 MB on the wire and 413 the whole sync, same shape
+            # as M2's reply-budget bug.
+            used += len(json.dumps(text, separators=(",", ":")).encode())
             if out and used > RESULT_BUDGET_BYTES:
                 break
             out.append({"task_id": t["task_id"], "source": source, "text": text, "sha256": digest,
@@ -1072,13 +1257,209 @@ def save_state(st: dict) -> None:
     tmp.replace(OUT / "state.json")
 
 
+def _durable_fsync(fd: int) -> None:
+    """#225 review round 3 N5: plain fsync(2) on macOS only pushes to the
+    drive's volatile write cache, not to permanent storage (man 2 fsync:
+    "Applications ... that require a strict ordering of writes should use
+    F_FULLFSYNC") -- on power loss (not just a process crash, which
+    fsync already covers), the unlink that follows an audit write could
+    reach the disk before the audit row does. F_FULLFSYNC asks the drive
+    to flush buffered data to permanent storage; it is darwin-only, so
+    any other OSError (including ENOTTY on a non-disk fd, or running on
+    a non-APFS/HFS+ filesystem that does not support it) falls back to
+    plain fsync, same as every other platform."""
+    if sys.platform == "darwin":
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except OSError:
+            pass
+    os.fsync(fd)
+
+
 def append_audit(rows: list[dict]) -> None:
+    """#225 review H2: flushes and fsyncs after writing. prune_inbox relies
+    on a successful return here as proof the row survives a crash BEFORE
+    it unlinks anything -- a write that only reached the page cache is
+    not that proof. #225 review round 3 N5: fsync alone is not enough on
+    darwin for a power-loss guarantee -- see _durable_fsync."""
     if not rows:
         return
     OUT.mkdir(parents=True, exist_ok=True)
     with (OUT / "audit.jsonl").open("a") as f:
         for r in rows:
             f.write(json.dumps(r, separators=(",", ":")) + "\n")
+        f.flush()
+        _durable_fsync(f.fileno())
+
+
+def _sha256_file(path: Path) -> str | None:
+    """#225 review L1: same single-link-regular-file safety as
+    read_regular (O_NOFOLLOW, st_nlink == 1, an fstat S_ISREG check on
+    the descriptor actually read), plus O_NONBLOCK so opening a FIFO
+    returns immediately instead of hanging forever (P9: a FIFO placed at
+    sent/<id>.md with an old mtime used to wedge prune_inbox, and the
+    whole publisher behind it, under launchd's StartInterval). Returns
+    None for anything not safely hashable this way -- the caller MUST
+    treat None as "do not delete this", never as "deleted, hash
+    unknown" (P6: a directory at sent/<id>.md used to get hashed as
+    None and then fail to unlink with EPERM while the audit row still
+    claimed a prune had happened)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            return None
+        h = hashlib.sha256()
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _prune_one(path: Path, exchange_id: str, label: str, tree: str, mtime: float) -> str | None:
+    """Shared per-file step for prune_inbox (#225 review H2/L1): hashes,
+    then audits (fsynced) BEFORE any unlink is attempted -- if that first
+    audit write itself raises, this returns None and the caller MUST
+    stop pruning for the rest of this tick (nothing after an unaudited
+    file may ever be deleted; the previous version collected every row
+    in memory and wrote them all in one append_audit() call at the very
+    end, AFTER every unlink, which is a bug, not the ordering its own
+    docstring claimed). A sha of None (not a safely hashable regular
+    file: a FIFO, a directory, a hard link) skips the delete entirely --
+    the audited "prune_result" row then says "skipped", not "deleted".
+    The second (prune_result) audit row is best-effort: losing it is far
+    less severe than losing the pre-delete row, so it never fails the
+    tick."""
+    sha = _sha256_file(path)
+    try:
+        append_audit([{"kind": "prune", "tree": tree, "id": exchange_id, "label": label, "mtime": iso(mtime), "sha256": sha}])
+    except OSError as exc:
+        log(f"owner inbox prune: audit write failed for {tree}/{label}/{exchange_id}, stopping this tick (fail closed): {exc}")
+        return None
+    if sha is None:
+        log(f"owner inbox prune: {tree}/{label}/{exchange_id} skipped (not a safely hashable regular file)")
+        outcome = "skipped"
+    else:
+        try:
+            path.unlink()
+            outcome = "deleted"
+        except OSError as exc:
+            outcome = f"failed:{exc.errno}"
+            log(f"owner inbox prune: failed to delete {tree}/{label}/{exchange_id}: {exc}")
+    try:
+        append_audit([{"kind": "prune_result", "tree": tree, "id": exchange_id, "label": label, "outcome": outcome}])
+    except OSError:
+        pass
+    return outcome
+
+
+def prune_inbox(owner_message_delivered: dict, owner_replies_accepted: dict, now_s: float) -> tuple[set, set]:
+    """Bounded retention for the owner inbox tree (#225 item 3), matching
+    the Worker's own 30-day owner_messages retention (state.ts ~1314) so
+    the two sides age out on the same schedule. Deletes only:
+      - inbox/<label>/messages/<id>.md whose exchange_id is a key in
+        owner_message_delivered (this Mac actually typed the notice into
+        the owner's pane -- the durable, never-time-windowed record of
+        that, set in main()'s owner_outbox loop) AND whose mtime is older
+        than OWNER_INBOX_RETENTION_DAYS;
+      - inbox/<label>/replies/sent/<id>.md whose exchange_id is a key in
+        owner_replies_accepted (#225 review L3: the durable record
+        _move_reply_to_sent's caller in main() writes ONLY when the
+        Worker's own sync response confirmed this exchange_id as
+        "accepted"/"duplicate" -- a file someone hand-placed directly
+        into sent/, bypassing that path, has no such key and is never
+        pruned, however old) AND older than OWNER_INBOX_RETENTION_DAYS.
+    A message never confirmed delivered, a reply still sitting in
+    replies/ (unacked), or anything under replies/rejected/ (#225 review
+    H1 -- a reply the Worker durably refused, kept for a human) is NEVER
+    touched here, however old -- SPEC item 3.
+    Every delete is audited (id, label, tree, mtime, sha256) BEFORE the
+    unlink via _prune_one, which also fails this whole tick closed (no
+    further deletes) the moment an audit write itself fails. Returns
+    (pruned_message_ids, pruned_sent_ids) so the caller can drop them
+    from the durable owner_message_delivered / owner_replies_accepted
+    maps and stop either growing forever."""
+    pruned_messages: set = set()
+    pruned_sent: set = set()
+    if not INBOX_ROOT.is_dir():
+        return pruned_messages, pruned_sent
+    cutoff = now_s - OWNER_INBOX_RETENTION_DAYS * 86_400
+    for label_dir in sorted(INBOX_ROOT.iterdir()):
+        if not label_dir.is_dir() or not OWNER_LABEL_RE.match(label_dir.name):
+            continue
+        label = label_dir.name
+        for f in sorted((label_dir / "messages").glob("*.md")) if (label_dir / "messages").is_dir() else []:
+            exchange_id = f.stem
+            if exchange_id not in owner_message_delivered or not EXCHANGE_ID_RE.match(exchange_id):
+                continue  # never delivered (or not provably so): never touched
+            path = _resolve_inbox_leaf(label, "messages", exchange_id)
+            if path is None:
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= cutoff:
+                continue
+            outcome = _prune_one(path, exchange_id, label, "messages", mtime)
+            if outcome is None:
+                return pruned_messages, pruned_sent  # audit write failed: fail closed, stop this tick
+            if outcome == "deleted":
+                pruned_messages.add(exchange_id)
+        sent_dir = label_dir / "replies" / "sent"
+        for f in sorted(sent_dir.glob("*.md")) if sent_dir.is_dir() else []:
+            exchange_id = f.stem
+            accepted_key = f"{label}/{exchange_id}"
+            # #225 review round 3 N1: keyed by (label, exchange_id), not
+            # exchange_id alone -- the same id sitting in two labels'
+            # sent/ directories must never share one accepted-record.
+            if accepted_key not in owner_replies_accepted or not EXCHANGE_ID_RE.match(exchange_id):
+                continue  # never provably Worker-accepted under THIS label: never touched
+            path = _resolve_inbox_leaf(label, "replies/sent", exchange_id)
+            if path is None:
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= cutoff:
+                continue
+            outcome = _prune_one(path, exchange_id, label, "replies/sent", mtime)
+            if outcome is None:
+                return pruned_messages, pruned_sent
+            if outcome == "deleted":
+                pruned_sent.add(accepted_key)
+    return pruned_messages, pruned_sent
+
+
+def _trim_owner_replies_to_budget(rows: list[dict], raw: list[dict], budget: int) -> tuple[list[dict], list[dict]]:
+    """#225 review M2: the count cap (OWNER_REPLIES_CAP) does not bound
+    bytes -- json.dumps' default ensure_ascii=True escapes every
+    non-ASCII character (emoji, accents) as a \\uXXXX sequence, so 200
+    replies of MAX_MESSAGE_CHARS each can reach several MB, well past
+    the Worker's MAX_BODY_BYTES (ingest.ts:9), 413ing the WHOLE sync
+    every tick -- #225's wedge again, reached through bytes instead of
+    count. `rows` and `raw` are the SAME list in the SAME order (the
+    posted dict and its local/_key-bearing counterpart); trims both in
+    lockstep from the newest (tail) end, under the exact
+    json.dumps(..., separators=(",", ":")) encoding post_sync actually
+    sends, until encoded `rows` fits the budget. Always leaves at least
+    one reply (even one that alone exceeds budget) so a single
+    pathologically large reply can never starve the whole backlog
+    forever; the rest simply wait in replies/ for a later tick, same
+    shape as the count cap."""
+    while len(rows) > 1 and len(json.dumps(rows, separators=(",", ":")).encode()) > budget:
+        rows = rows[:-1]
+        raw = raw[:-1]
+    return rows, raw
 
 
 def main(argv: list[str]) -> int:
@@ -1117,13 +1498,19 @@ def main(argv: list[str]) -> int:
     # Replies are independent of leasing -- scanned and sent every tick they
     # exist, not gated behind "lease". `session` is filled in HERE, from the
     # Mac's own live registry read, never from the reply file itself (SPEC:
-    # the file's header is untrusted).
-    sent_replies = set(st.get("sent_replies", []))
-    owner_replies_raw = scan_owner_replies(sent_replies) if OWNER_INBOX_ON_MAC else []
+    # the file's header is untrusted). #225: no durable set to load here --
+    # a file still sitting in replies/ (not yet moved to replies/sent/) IS
+    # "unsent"; scan_owner_replies enforces the per-tick cap itself.
+    owner_replies_raw = scan_owner_replies() if OWNER_INBOX_ON_MAC else []
     owners_now = local.get("owners", {})
     owner_replies = [{**{k: v for k, v in r.items() if k != "_key"},
                        "session": _owner_session_token(r["owner_label"], owners_now.get(r["owner_label"], {}))}
                       for r in owner_replies_raw]
+    # #225 review M2: trims both lists in lockstep so owner_replies_raw
+    # (used below to route this tick's ACTUAL posted replies) never
+    # disagrees with what owner_replies (what was actually sent) was
+    # trimmed down to.
+    owner_replies, owner_replies_raw = _trim_owner_replies_to_budget(owner_replies, owner_replies_raw, OWNER_REPLIES_BUDGET_BYTES)
     try:
         reply = post_sync(key, {"snapshot": snapshot, "results": results, "acks": acks, "command_acks": command_acks,
                                 "owner_acks": owner_acks, "owner_replies": owner_replies,
@@ -1131,14 +1518,75 @@ def main(argv: list[str]) -> int:
     except (urllib.error.URLError, OSError, ValueError) as exc:
         log(f"sync failed: {exc}")
         return 1
+    # #225 review H1: a 200 here means the WHOLE sync was accepted, not
+    # that every reply in it was -- the Worker silently drops a reply
+    # whose row isn't 'delivered' at the moment it arrives (an
+    # approval-prompt retry put it back to 'queued', it's blocked, or the
+    # Worker's own 30-day purge already deleted the row). Treating any
+    # 200 as full acceptance used to move a dropped reply to sent/ anyway,
+    # where it was permanently deleted 30 days later having never actually
+    # been seen by the Worker. owner_reply_results carries the REAL
+    # per-reply outcome now (state.ts ~1039-1074): "accepted"/"duplicate"
+    # moves to sent/ (and records the durable accepted-marker prune_inbox
+    # requires, L3); "ignored:queued"/"ignored:delivering" is transient --
+    # left untouched in replies/, retried next tick; anything else
+    # ("ignored:missing", "ignored:replied" -- #225 review round 3 N3, a
+    # resend whose body the Worker never actually stored --
+    # "ignored:blocked:...", or any unrecognized status) is durably
+    # refused and moved to replies/rejected/, never pruned. A reply this
+    # field says nothing about (an older Worker, or one this tick's M2
+    # budget trim left out of owner_replies_raw entirely) is also left
+    # untouched -- the safest default.
+    #
+    # #225 review round 3 N1: keyed by (owner_label, exchange_id), NOT
+    # exchange_id alone -- a reply file dropped under the WRONG label
+    # directory shares its exchange_id with the real one, and matching by
+    # id alone would apply the real reply's "accepted" outcome to the
+    # wrong-label file (moving it to sent/ and marking it durably
+    # accepted) while filing the genuine reply as "rejected". The Worker
+    # echoes back the REQUESTED owner_label on every result (state.ts),
+    # so the two can never collide here.
+    #
+    # #225 review round 3 I1: a malformed entry (not a dict, or missing/
+    # wrong-typed fields -- only a faulty Worker could send one) is
+    # skipped rather than raising, since .get() on a non-dict would abort
+    # this whole loop via AttributeError before save_state ever runs,
+    # losing every OTHER reply's routing along with it.
+    reply_outcomes: dict[tuple[str, str], str] = {}
+    for r in (reply.get("owner_reply_results") or []):
+        if not isinstance(r, dict):
+            continue
+        eid, label, outcome = r.get("exchange_id"), r.get("owner_label"), r.get("outcome")
+        if not isinstance(eid, str) or not isinstance(label, str) or not isinstance(outcome, str):
+            continue
+        reply_outcomes[(label, eid)] = outcome
+    for r in owner_replies_raw:
+        outcome = reply_outcomes.get((r["owner_label"], r["exchange_id"]))
+        if outcome in ("accepted", "duplicate"):
+            if _move_reply_to_sent(r["owner_label"], r["exchange_id"]):
+                st.setdefault("owner_replies_accepted", {})[f"{r['owner_label']}/{r['exchange_id']}"] = now.timestamp()
+        elif outcome and outcome.startswith("ignored:") and not outcome.startswith(("ignored:queued", "ignored:delivering")):
+            _move_reply_to_rejected(r["owner_label"], r["exchange_id"])
+            log(f"owner reply {r['owner_label']}/{r['exchange_id']} rejected by the Worker ({outcome}); moved to replies/rejected/")
     for r in results:
         st.setdefault("results", {})[f"{r['task_id']}:{r['source']}"] = {"sha256": r["sha256"], "sent_at": now.timestamp()}
     keep = {t["task_id"] for t in snapshot["tasks"]}
     st["results"] = {k: v for k, v in st.get("results", {}).items() if k.split(":", 1)[0] in keep}
     st["pending_acks"], st["pending_command_acks"], st["pending_owner_acks"] = [], [], []
-    st["sent_replies"] = sorted(sent_replies | {r["_key"] for r in owner_replies_raw})[-500:]
     append_audit(reply.get("audit") or [])
     st["audit_cursor"] = reply.get("audit_cursor", st.get("audit_cursor", 0))
+    if OWNER_INBOX_ON_MAC:
+        # #225 item 3: bounded retention runs every tick, independent of
+        # whether there is anything to deliver this time -- the early
+        # return just below would otherwise starve it on a quiet inbox.
+        pruned_messages, pruned_sent = prune_inbox(st.get("owner_message_delivered", {}),
+                                                    st.get("owner_replies_accepted", {}), now.timestamp())
+        if pruned_messages:
+            st["owner_message_delivered"] = {k: v for k, v in st.get("owner_message_delivered", {}).items()
+                                              if k not in pruned_messages}
+        if pruned_sent:
+            st["owner_replies_accepted"] = {k: v for k, v in st.get("owner_replies_accepted", {}).items()
+                                             if k not in pruned_sent}
     save_state(st)
 
     outbox = reply.get("outbox") or []
@@ -1192,6 +1640,13 @@ def main(argv: list[str]) -> int:
                 continue  # M1: couldn't refresh identity this tick (hub hiccup); retried next tick
             if a["outcome"] == "delivered":
                 owner_delivered[eid] = now.timestamp()
+                # #225 item 3: owner_delivered above is a 24h cache for
+                # ack-retry dedup and is pruned by that window; prune_inbox
+                # needs "was this ever actually typed into the owner's
+                # pane" to survive to 30 days, so it gets its own
+                # never-time-filtered map, trimmed only when prune_inbox
+                # deletes the matching messages/ file.
+                st.setdefault("owner_message_delivered", {})[eid] = now.timestamp()
         log(f"owner message {eid}: {a['outcome']} ({a.get('reason', '')})")
         new_owner_acks.append(a)
         st["owner_delivered"], st["pending_owner_acks"] = owner_delivered, new_owner_acks
