@@ -1379,6 +1379,9 @@ def record_answer(form_id: str, payload: dict) -> tuple[int, bytes]:
         return 500, f"could not record: {e}".encode()
     CACHES["forms"].invalidate()
     notify_owner(row)
+    key = _sidecar_key(row.get("form_path"))
+    if key and key.startswith(RATINGS_KEY_PREFIX):
+        _dispatch_ratings_answer(key[len(RATINGS_KEY_PREFIX):], row)
     return 200, b'{"ok":true}'
 
 
@@ -1523,7 +1526,207 @@ def record_remote_answer(form_id: str, pending: dict, key: bytes) -> str:
         return "missing"
     CACHES["forms"].invalidate()
     notify_owner(row)
+    key = _sidecar_key(row.get("form_path"))
+    if key and key.startswith(RATINGS_KEY_PREFIX):
+        _dispatch_ratings_answer(key[len(RATINGS_KEY_PREFIX):], row)
     return "delivered"
+
+
+def _dispatch_ratings_answer(run_id: str, row: dict) -> None:
+    """Write the hub's ratings answers into kb.section_ratings, channel='hub'
+    (server/ratings.py's `hub-answer` CLI -- the one write path, never a bare
+    INSERT, so the one-live-row invariant and the 24h correction window are
+    enforced identically to the mailed /rate link). Best-effort, off a
+    background thread: the answer is ALREADY durably recorded in the local
+    hub registry by the caller (above) regardless of whether this KB write
+    succeeds -- a failure here is logged to stderr, never raised, and never
+    loses the recorded local answer, and never delays the submit response."""
+    answers = (row.get("answers") or {}).get("ratings")
+    if not isinstance(answers, dict) or not answers:
+        return
+    payload = {"run_id": run_id, "attempt_number": 1,
+               "answers": [{"section_key": k, "rating": v} for k, v in answers.items()]}
+    threading.Thread(target=_dispatch_ratings_answer_now, args=(run_id, payload),
+                     daemon=True).start()
+
+
+def _dispatch_ratings_answer_now(run_id: str, payload: dict) -> tuple[bool, dict | None]:
+    """Returns (final, result). `final=True` means KB gave a parseable,
+    authoritative answer -- `result` is its {"recorded": [...], "errors": [...]}
+    body. A per-section error (unknown section_key, a correction window that
+    already closed, ...) is treated exactly like success: KB has SEEN the
+    request and decided, so resending cannot change the outcome and would
+    only add another correction row to a section it already recorded (PR
+    #214 review R2-1). `final=False` means a genuine TRANSPORT failure -- no
+    DSN, the subprocess itself erroring or timing out, or stdout that did not
+    parse -- the one case where KB never actually saw the request and a
+    bounded, backed-off retry might still land it. Callers that fire this off
+    a thread (above) don't read the return value; `_reconcile_port_ratings_answers`
+    below does, to decide final-vs-retry."""
+    try:
+        dsn = secret("NEON_CONNECTION_STRING")
+    except ValueError:
+        dsn = None
+    if not dsn:
+        print(f"hub: ratings dispatch for {run_id} skipped: NEON_CONNECTION_STRING unavailable",
+              file=sys.stderr)
+        return False, None
+    env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if k in os.environ}
+    env["NEON_CONNECTION_STRING"] = dsn
+    try:
+        r = subprocess.run([str(KB_PYTHON), "-m", "server.ratings", "hub-answer"],
+                           cwd=KB_DEPLOY, env=env, input=json.dumps(payload),
+                           capture_output=True, text=True, timeout=30)
+        result = json.loads(r.stdout) if r.stdout else None
+        if not isinstance(result, dict) or "recorded" not in result or "errors" not in result:
+            print(f"hub: ratings dispatch for {run_id} failed: unparseable response "
+                  f"(exit {r.returncode}): stdout={r.stdout!r} stderr={r.stderr!r}", file=sys.stderr)
+            return False, None
+        errors = result.get("errors") or []
+        if errors:
+            print(f"hub: ratings dispatch for {run_id}: KB recorded "
+                  f"{len(result.get('recorded') or [])}, {len(errors)} error(s), "
+                  f"final (not retried): {errors}", file=sys.stderr)
+        return True, result
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as e:
+        print(f"hub: ratings dispatch for {run_id} failed: {e}", file=sys.stderr)
+        return False, None
+
+
+# PR #214 review MEDIUM F1: `record_answer` and `record_remote_answer` above
+# dispatch inline because an answer there was recorded BY THIS HUB. An answer
+# that lands on formserve's own port never goes through either -- that
+# process (formserve.py) writes straight to the registry file via
+# record_store and has no import of this module, so nothing ever called
+# `_dispatch_ratings_answer` for it. It sat in the registry, recorded and
+# durable, but never reached kb.section_ratings and nothing logged it. This
+# reconciler is the catch-all: it finds that row later, from the registry
+# itself, and dispatches it the identical way.
+RATINGS_RECONCILE_EVERY_S = float(os.environ.get("HERDR_RATINGS_RECONCILE_EVERY_S", "30"))
+
+# PR #214 review R2-1: the first fix dispatch marked a row done only on full
+# success, so ANY error in a batch -- including a section KB already
+# accepted, or one past its 24h correction window -- left the whole row
+# unmarked and resent it every cycle forever; each resend of an already-live
+# section is a NEW correction row in kb.section_ratings. A genuine transport
+# failure (no DSN, a dead subprocess, unparseable stdout) is the only case
+# worth retrying, and even that must stop: bounded attempts with exponential
+# backoff, then a terminal "gave up" state that is logged and surfaced on the
+# hub (RATINGS_RECONCILE_STATE, rendered in render_decisions() the same way
+# MIRROR_STATE is) instead of silently dropping the rating forever.
+RATINGS_DISPATCH_MAX_ATTEMPTS = int(os.environ.get("HERDR_RATINGS_DISPATCH_MAX_ATTEMPTS", "8"))
+RATINGS_DISPATCH_BACKOFF_BASE_S = float(os.environ.get("HERDR_RATINGS_DISPATCH_BACKOFF_BASE_S", "30"))
+RATINGS_DISPATCH_BACKOFF_MAX_S = float(os.environ.get("HERDR_RATINGS_DISPATCH_BACKOFF_MAX_S", "3600"))
+RATINGS_RECONCILE_STATE: dict = {"gave_up": {}}  # run_id -> {error, attempts, gave_up_at}
+
+
+def _undispatched_port_ratings_answers() -> list[tuple[Path, dict]]:
+    """Every answered-via-port ratings row this hub still owes KB an attempt
+    on: not yet dispatched (`ratings_dispatched_at`), not given up on
+    (`ratings_dispatch_gave_up_at`), and not inside its current backoff
+    window (`ratings_dispatch_next_at`)."""
+    out: list[tuple[Path, dict]] = []
+    if not FORMS_DIR.is_dir():
+        return out
+    for path in sorted(FORMS_DIR.glob("*.json")):
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if row.get("status") != "answered" or row.get("answered_via") != "port":
+            continue
+        if row.get("ratings_dispatched_at") or row.get("ratings_dispatch_gave_up_at"):
+            continue
+        next_at = row.get("ratings_dispatch_next_at")
+        if isinstance(next_at, (int, float)) and time.time() * 1000 < next_at:
+            continue
+        key = _sidecar_key(row.get("form_path"))
+        if key and key.startswith(RATINGS_KEY_PREFIX):
+            out.append((path, row))
+    return out
+
+
+def _mark_ratings_dispatched(result: dict):
+    """KB gave a final, parseable answer (PR #214 review R2-1): mark it done
+    regardless of per-section errors so it is never resent, and drop any
+    retry bookkeeping left over from an earlier transport failure on this
+    same row."""
+    def _mark(row: dict) -> dict:
+        row["ratings_dispatched_at"] = int(time.time() * 1000)
+        row["ratings_dispatch_result"] = result
+        row.pop("ratings_dispatch_attempts", None)
+        row.pop("ratings_dispatch_next_at", None)
+        row.pop("ratings_dispatch_last_error", None)
+        return row
+    return _mark
+
+
+def _mark_ratings_retry(run_id: str, error: str):
+    """A transport failure: bump the attempt count, schedule the next try
+    with exponential backoff, and give up for good past
+    RATINGS_DISPATCH_MAX_ATTEMPTS. Giving up is recorded on the row (so it is
+    never retried again) and in RATINGS_RECONCILE_STATE (so it is visible on
+    /decisions instead of a silently dropped rating)."""
+    def _mark(row: dict) -> dict:
+        attempts = int(row.get("ratings_dispatch_attempts") or 0) + 1
+        row["ratings_dispatch_attempts"] = attempts
+        row["ratings_dispatch_last_error"] = error
+        if attempts >= RATINGS_DISPATCH_MAX_ATTEMPTS:
+            gave_up_at = int(time.time() * 1000)
+            row["ratings_dispatch_gave_up_at"] = gave_up_at
+            row.pop("ratings_dispatch_next_at", None)
+            RATINGS_RECONCILE_STATE["gave_up"][run_id] = {
+                "error": error, "attempts": attempts, "gave_up_at": gave_up_at}
+            print(f"hub: ratings dispatch for {run_id} gave up after {attempts} attempts: {error}",
+                  file=sys.stderr)
+        else:
+            backoff = min(RATINGS_DISPATCH_BACKOFF_BASE_S * (2 ** (attempts - 1)),
+                         RATINGS_DISPATCH_BACKOFF_MAX_S)
+            row["ratings_dispatch_next_at"] = int(time.time() * 1000 + backoff * 1000)
+        return row
+    return _mark
+
+
+def _reconcile_port_ratings_answers() -> None:
+    """Best-effort, same posture as mirror_sync: never raises. A KB response
+    that parses (recorded/errors) is FINAL and marked durably
+    (`ratings_dispatched_at`) so it is never resent, even with per-section
+    errors -- a closed 24h correction window is exactly as unretryable as
+    success (PR #214 review R2-1). Only a genuine transport failure is
+    retried, bounded and backed off by `_mark_ratings_retry`."""
+    for path, row in _undispatched_port_ratings_answers():
+        key = _sidecar_key(row.get("form_path")) or ""
+        run_id = key[len(RATINGS_KEY_PREFIX):]
+        answers = (row.get("answers") or {}).get("ratings")
+        if not isinstance(answers, dict) or not answers:
+            continue
+        payload = {"run_id": run_id, "attempt_number": 1,
+                   "answers": [{"section_key": k, "rating": v} for k, v in answers.items()]}
+        final, result = _dispatch_ratings_answer_now(run_id, payload)
+        try:
+            if final:
+                claim_and_update(path, _mark_ratings_dispatched(result), require_status="answered")
+            else:
+                claim_and_update(path, _mark_ratings_retry(run_id, "dispatch transport failure, see hub log"),
+                                 require_status="answered")
+        except (NotClaimable, FileNotFoundError, OSError, json.JSONDecodeError) as e:
+            # The KB write already landed (if final) -- only the local marker
+            # failed, so the next cycle dispatches again. server.ratings
+            # hub-answer is a same-run_id/section_key upsert inside the 24h
+            # correction window (one live row per section), so a duplicate
+            # dispatch overwrites, never double-counts -- but see R2-1 above:
+            # that overwrite is still a new correction row, which is exactly
+            # why `final` is marked BEFORE we'd ever reach here on success.
+            print(f"hub: ratings reconcile marker for {run_id} not written: {e}", file=sys.stderr)
+
+
+def _ratings_reconcile_loop() -> None:
+    while True:
+        try:
+            _reconcile_port_ratings_answers()
+        except Exception as e:  # noqa: BLE001 — belt and braces: the loop must not die
+            print(f"hub: ratings reconcile loop error: {type(e).__name__}: {e}", file=sys.stderr)
+        time.sleep(RATINGS_RECONCILE_EVERY_S)
 
 
 def mirror_sync() -> None:
@@ -1544,6 +1747,8 @@ def mirror_sync() -> None:
             token = (row or {}).get("token") or ""
             if not f.get("hub_servable") or not token:
                 continue
+            if (_sidecar_key(f.get("form_path")) or "").startswith(RATINGS_KEY_PREFIX):
+                continue  # ratings stay local-only -- never mirrored to the dashboard
             try:
                 html_text = form_html(f["id"]).read_text()
             except OSError:
@@ -2374,6 +2579,96 @@ def serve_loop_decision(key: str) -> str | None:
     CACHES["forms"].invalidate()
     return title
 
+# ── ratings publish: knowledge-base's nightly POSTs here after [8j] ──────────
+# (B1.2 v2 / closure #1, thurber-os docs/tracking/2026-09-30-feedback-loop-
+# audit.md §1, §5 #1, §Decided. Terrence, formserve 20260930T150421-8722:
+# ratings=hub_inline.) The mailed Access-gated /rate link answered 0 of 221
+# asks in the 51 days before this closure; Terrence already answers every
+# other local decision here, so the rating ask gets the SAME surface.
+# Loopback, unauthenticated — same posture as every other endpoint on this
+# hub. The nightly job runs on this same Mac (launchd com.teamthurber.kb-nightly,
+# not Fly), so this is a same-machine call, never a network hop.
+RATINGS_KEY_PREFIX = "ratings:"
+
+RATINGS_FORM = """<!doctype html><html lang=en><head><meta charset=utf-8><title>{title}</title>
+<style>:root{{--ground:#0f1115;--surface:#171a21;--line:#272c37;--ink:#e6e9ef;--dim:#9aa3b2;--accent:#6aa6ff}}
+body{{margin:0;background:var(--ground);color:var(--ink);font:15px/1.5 system-ui,sans-serif}} main{{max-width:720px;margin:0 auto;padding:32px 24px 110px}}
+h1{{font-size:22px;margin:0 0 6px}} .sub{{color:var(--dim);margin:0 0 22px}} fieldset{{border:1px solid var(--line);border-radius:8px;background:var(--surface);padding:14px 16px;margin:0 0 16px}}
+legend{{color:var(--dim);font-size:12px;letter-spacing:.08em;text-transform:uppercase;padding:0 6px}} .opt{{display:flex;gap:10px;padding:8px 6px;border-radius:6px;cursor:pointer}} .opt:hover{{background:#1d2129}}
+.summary{{color:var(--dim);font-size:13px;margin:0 0 10px}}
+.bar{{position:fixed;left:0;right:0;bottom:0;background:var(--surface);border-top:1px solid var(--line);padding:12px 24px;display:flex;gap:10px;justify-content:flex-end}}
+button{{font:600 14px system-ui;padding:10px 18px;border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:#0b1020;cursor:pointer}}</style></head><body><main>
+<h1>{title}</h1><p class=sub>Today's Morning Briefing sections the demand budget selected. One tap per section; skip any you don't have an opinion on.</p>
+<form id=f>{fields}</form></main>
+<div class=bar><button type=submit form=f>Send answers</button></div>
+<script>document.getElementById("f").addEventListener("submit",function(e){{e.preventDefault();var fd=new FormData(e.target);
+var ratings={{}};fd.forEach(function(v,k){{if(k.indexOf("section:")===0)ratings[k.slice(8)]=v;}});
+window.submitAnswers({{run_id:{run_id_json},ratings:ratings}})}});</script></body></html>"""
+
+RATINGS_FIELD = """<fieldset><legend>{title}</legend>{summary}
+<label class=opt><input type=radio name="section:{slug}" value=acted_on><span>Acted on</span></label>
+<label class=opt><input type=radio name="section:{slug}" value=reviewed_no_action><span>Read, no action</span></label>
+<label class=opt><input type=radio name="section:{slug}" value=noise><span>Noise</span></label>
+</fieldset>"""
+
+
+def _ratings_key(run_id: str) -> str:
+    return RATINGS_KEY_PREFIX + run_id
+
+
+def _open_ratings_form_id(run_id: str) -> str | None:
+    """An already-published form (open OR answered) for this run_id, or None.
+    Makes publish_ratings_form idempotent against a nightly retry -- mirrors
+    scripts/nightly_automation.py's own _briefing_already_sent dedup."""
+    want = _ratings_key(run_id)
+    for path in sorted(FORMS_DIR.glob("*.json")):
+        try:
+            f = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if _sidecar_key(f.get("form_path")) == want:
+            return f.get("id")
+    return None
+
+
+def publish_ratings_form(payload: dict) -> tuple[int, bytes]:
+    """Register one formserve form covering every section KB's nightly asked
+    about today. Returns (status, json-or-text body)."""
+    run_id = str(payload.get("run_id") or "").strip()
+    sections = payload.get("sections")
+    if not run_id or not isinstance(sections, list) or not sections:
+        return 400, b"run_id and a non-empty sections list are required"
+    existing = _open_ratings_form_id(run_id)
+    if existing is not None:
+        return 200, json.dumps({"ok": True, "id": existing, "already_published": True}).encode()
+    fields = []
+    for s in sections:
+        if not isinstance(s, dict):
+            continue
+        slug = str(s.get("slug") or "")
+        if not slug:
+            continue
+        title = str(s.get("title") or slug)
+        summary = str(s.get("summary") or "")
+        summary_html = f"<p class=summary>{_esc(summary)}</p>" if summary else ""
+        fields.append(RATINGS_FIELD.format(title=_esc(title), slug=_esc(slug), summary=summary_html))
+    if not fields:
+        return 400, b"no valid sections in payload"
+    FORMS_DIR.mkdir(parents=True, exist_ok=True)
+    title = f"ratings: {time.strftime('%Y-%m-%d', time.localtime())} ({len(fields)} sections)"
+    form = FORMS_DIR / f"ratings-{_slug(run_id)}-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}.html"
+    form.write_text(RATINGS_FORM.format(
+        title=_esc(title), fields="".join(fields), run_id_json=_script_json(run_id)))
+    form.with_suffix(".key").write_text(_ratings_key(run_id))
+    # 24h timeout, matching the rating's own correction window -- answerable
+    # any time that day, not just the minutes right after the briefing sends.
+    subprocess.Popen([sys.executable, str(APP_ROOT / "formserve.py"), str(form),
+                      "--timeout", "86400", "--no-open"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    CACHES["forms"].invalidate()
+    return 200, json.dumps({"ok": True, "already_published": False}).encode()
+
+
 
 # ── handoff debt: a repo someone changed and never wrote up ───────────────────
 # Written by the omp extension `handoff-coverage.ts` (omp-harness#9), never by
@@ -2656,6 +2951,15 @@ CACHES = {
 # ── rendering ──────────────────────────────────────────────────────────────────
 def _esc(v) -> str:
     return html.escape(str(v if v is not None else ""))
+
+
+def _script_json(v) -> str:
+    """json.dumps with `<` escaped to `\\u003c` so the result is safe to
+    inline inside a `<script>` block -- a value containing a literal
+    `</script>` would otherwise close the block early and run as markup/script
+    in the hub's own origin (PR #214 review LOW F3, e.g. RATINGS_FORM's
+    `run_id_json`)."""
+    return json.dumps(v).replace("<", "\\u003c")
 
 
 def _age(iso) -> str:
@@ -3583,6 +3887,15 @@ def render_decisions() -> str:
     if ms.get("rejected"):
         body += (f"<p><span class='pill bad'>rejected</span> {ms['rejected']} dashboard answer(s) failed "
                  f"verification and were NOT delivered — last: {_esc(ms.get('last_rejection'))}</p>")
+    gave_up = RATINGS_RECONCILE_STATE.get("gave_up") or {}
+    if gave_up:
+        items = "".join(
+            f"<li>{_esc(run_id)}: {info['attempts']} attempt(s), gave up {_age(info['gave_up_at'])} ago — "
+            f"{_esc(info.get('error', ''))}</li>"
+            for run_id, info in sorted(gave_up.items()))
+        body += (f"<p><span class='pill bad'>ratings dispatch</span> {len(gave_up)} run(s) gave up after "
+                 f"{RATINGS_DISPATCH_MAX_ATTEMPTS} failed attempts — these ratings never reached "
+                 f"kb.section_ratings and need a manual resend:</p><ul>{items}</ul>")
     p = CACHES["portal"].get()
     if p.get("error"):
         body += (f"<h2>Legacy portal · unreadable</h2><p><span class='pill bad'>error</span> {_esc(p['error'])}</p>")
@@ -4261,6 +4574,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, "text/plain", b"answers must be a JSON object")
             code, body = record_answer(form_id, payload)
             return self._send(code, "application/json" if code == 200 else "text/plain", body)
+        if path == "/ratings/publish":
+            ctype = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                return self._send(400, "text/plain", b"Content-Type must be application/json")
+            n = int(self.headers.get("content-length") or 0)
+            raw = self.rfile.read(n) if n > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                return self._send(400, "text/plain", f"bad json: {e}".encode())
+            if not isinstance(payload, dict):
+                return self._send(400, "text/plain", b"payload must be a JSON object")
+            code, body = publish_ratings_form(payload)
+            return self._send(code, "application/json" if code == 200 else "text/plain", body)
         if path != "/loops/decide":
             return self._send(404, "text/plain", b"not found")
         n = int(self.headers.get("content-length") or 0)
@@ -4308,6 +4635,10 @@ def main() -> int:
         LIVE.start()
     if not args.no_mirror:
         threading.Thread(target=_mirror_loop, name="dashboard-mirror", daemon=True).start()
+        # Same smoke-run flag: both need NEON_CONNECTION_STRING and shell out
+        # to the kb-deploy checkout, and both degrade to a logged no-op
+        # without it (PR #214 review MEDIUM F1's reconciler).
+        threading.Thread(target=_ratings_reconcile_loop, name="ratings-reconcile", daemon=True).start()
     if not args.no_attention:
         threading.Thread(target=_attention_loop, name="attention-controller", daemon=True).start()
         # project-contract-plan.md item 3, "carry to completion" — a separate
