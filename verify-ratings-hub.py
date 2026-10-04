@@ -424,6 +424,72 @@ class PortAnswerDispatchTests(unittest.TestCase):
             hub._reconcile_port_ratings_answers()
         self.assertEqual(self.run_calls, [])
 
+    def test_partial_error_response_is_final_and_dispatched_exactly_once(self):
+        # PR #214 review R2-1: a batch where ONE section errors must not keep
+        # resending the whole batch -- a resend of a section KB already
+        # recorded would insert another correction row every cycle.
+        make_form("p7", key="ratings:run-partial", status="answered", answered_via="port",
+                  answers={"ratings": {"good": "acted_on", "bad": "noise"}})
+        result = subprocess.CompletedProcess(
+            [], 1, json.dumps({"recorded": [{"section_key": "good", "rating_id": 1, "corrected": False}],
+                              "errors": [{"section_key": "bad", "error": "unknown section_key 'bad'"}]}), "")
+        with self._run(result):
+            hub._reconcile_port_ratings_answers()
+        self.assertEqual(len(self.run_calls), 1)
+        self.assertIsNotNone(local("p7").get("ratings_dispatched_at"),
+                             "a parseable KB response is final even with a per-section error")
+        with self._run(result):
+            hub._reconcile_port_ratings_answers()
+        self.assertEqual(len(self.run_calls), 1, "a dispatched row must never be resent")
+
+    def test_correction_window_closed_error_is_terminal_not_retried(self):
+        # KB's 24h correction window closing is a settled fact, not a
+        # transport hiccup -- retrying it can never succeed.
+        make_form("p8", key="ratings:run-closed", status="answered", answered_via="port",
+                  answers={"ratings": {"s": "acted_on"}})
+        result = subprocess.CompletedProcess(
+            [], 1, json.dumps({"recorded": [],
+                              "errors": [{"section_key": "s",
+                                         "error": "correction window closed (24h) — rating is settled"}]}), "")
+        with self._run(result):
+            hub._reconcile_port_ratings_answers()
+        self.assertEqual(len(self.run_calls), 1)
+        self.assertIsNotNone(local("p8").get("ratings_dispatched_at"),
+                             "a closed correction window is terminal, not retryable")
+        with self._run(result):
+            hub._reconcile_port_ratings_answers()
+        self.assertEqual(len(self.run_calls), 1, "a closed-window row must never be retried")
+
+    def test_transport_failure_retries_bounded_then_gives_up(self):
+        # PR #214 review R2-1: an unreachable KB (no DSN, dead subprocess,
+        # unparseable stdout) must stop retrying eventually, and giving up
+        # must be visible, not a silently dropped rating.
+        make_form("p9", key="ratings:run-giveup", status="answered", answered_via="port",
+                  answers={"ratings": {"s": "acted_on"}})
+        hub.RATINGS_RECONCILE_STATE["gave_up"].clear()
+        self.addCleanup(hub.RATINGS_RECONCILE_STATE["gave_up"].clear)
+        clock = [1_000_000.0]
+
+        def fake_time():
+            clock[0] += 100_000  # always clears any backoff window (max 3600s)
+            return clock[0]
+
+        with self._run(subprocess.CompletedProcess([], 1, "", "boom")):
+            with patch.object(hub.time, "time", side_effect=fake_time):
+                for _ in range(hub.RATINGS_DISPATCH_MAX_ATTEMPTS):
+                    hub._reconcile_port_ratings_answers()
+        self.assertEqual(len(self.run_calls), hub.RATINGS_DISPATCH_MAX_ATTEMPTS)
+        row = local("p9")
+        self.assertIsNotNone(row.get("ratings_dispatch_gave_up_at"),
+                             f"must give up after {hub.RATINGS_DISPATCH_MAX_ATTEMPTS} attempts")
+        self.assertIn("run-giveup", hub.RATINGS_RECONCILE_STATE["gave_up"],
+                      "a given-up row must be surfaced on the hub")
+        with self._run(subprocess.CompletedProcess([], 1, "", "boom")):
+            with patch.object(hub.time, "time", side_effect=fake_time):
+                hub._reconcile_port_ratings_answers()
+        self.assertEqual(len(self.run_calls), hub.RATINGS_DISPATCH_MAX_ATTEMPTS,
+                         "a given-up row must never be retried again")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

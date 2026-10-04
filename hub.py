@@ -1550,11 +1550,19 @@ def _dispatch_ratings_answer(run_id: str, row: dict) -> None:
                      daemon=True).start()
 
 
-def _dispatch_ratings_answer_now(run_id: str, payload: dict) -> bool:
-    """Returns True once KB confirms the write (exit 0, no partial `errors`).
-    Callers that fire this off a thread (above) don't read the return value;
-    `_reconcile_port_ratings_answers` below does, to decide whether an
-    answer needs a retry next cycle."""
+def _dispatch_ratings_answer_now(run_id: str, payload: dict) -> tuple[bool, dict | None]:
+    """Returns (final, result). `final=True` means KB gave a parseable,
+    authoritative answer -- `result` is its {"recorded": [...], "errors": [...]}
+    body. A per-section error (unknown section_key, a correction window that
+    already closed, ...) is treated exactly like success: KB has SEEN the
+    request and decided, so resending cannot change the outcome and would
+    only add another correction row to a section it already recorded (PR
+    #214 review R2-1). `final=False` means a genuine TRANSPORT failure -- no
+    DSN, the subprocess itself erroring or timing out, or stdout that did not
+    parse -- the one case where KB never actually saw the request and a
+    bounded, backed-off retry might still land it. Callers that fire this off
+    a thread (above) don't read the return value; `_reconcile_port_ratings_answers`
+    below does, to decide final-vs-retry."""
     try:
         dsn = secret("NEON_CONNECTION_STRING")
     except ValueError:
@@ -1562,23 +1570,27 @@ def _dispatch_ratings_answer_now(run_id: str, payload: dict) -> bool:
     if not dsn:
         print(f"hub: ratings dispatch for {run_id} skipped: NEON_CONNECTION_STRING unavailable",
               file=sys.stderr)
-        return False
+        return False, None
     env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if k in os.environ}
     env["NEON_CONNECTION_STRING"] = dsn
     try:
         r = subprocess.run([str(KB_PYTHON), "-m", "server.ratings", "hub-answer"],
                            cwd=KB_DEPLOY, env=env, input=json.dumps(payload),
                            capture_output=True, text=True, timeout=30)
-        result = json.loads(r.stdout) if r.stdout else {}
+        result = json.loads(r.stdout) if r.stdout else None
+        if not isinstance(result, dict) or "recorded" not in result or "errors" not in result:
+            print(f"hub: ratings dispatch for {run_id} failed: unparseable response "
+                  f"(exit {r.returncode}): stdout={r.stdout!r} stderr={r.stderr!r}", file=sys.stderr)
+            return False, None
         errors = result.get("errors") or []
-        if r.returncode != 0 or errors:
-            print(f"hub: ratings dispatch for {run_id}: exit {r.returncode}, "
-                  f"{len(errors)} error(s): {errors}", file=sys.stderr)
-            return False
-        return True
+        if errors:
+            print(f"hub: ratings dispatch for {run_id}: KB recorded "
+                  f"{len(result.get('recorded') or [])}, {len(errors)} error(s), "
+                  f"final (not retried): {errors}", file=sys.stderr)
+        return True, result
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as e:
         print(f"hub: ratings dispatch for {run_id} failed: {e}", file=sys.stderr)
-        return False
+        return False, None
 
 
 # PR #214 review MEDIUM F1: `record_answer` and `record_remote_answer` above
@@ -1592,9 +1604,27 @@ def _dispatch_ratings_answer_now(run_id: str, payload: dict) -> bool:
 # itself, and dispatches it the identical way.
 RATINGS_RECONCILE_EVERY_S = float(os.environ.get("HERDR_RATINGS_RECONCILE_EVERY_S", "30"))
 
+# PR #214 review R2-1: the first fix dispatch marked a row done only on full
+# success, so ANY error in a batch -- including a section KB already
+# accepted, or one past its 24h correction window -- left the whole row
+# unmarked and resent it every cycle forever; each resend of an already-live
+# section is a NEW correction row in kb.section_ratings. A genuine transport
+# failure (no DSN, a dead subprocess, unparseable stdout) is the only case
+# worth retrying, and even that must stop: bounded attempts with exponential
+# backoff, then a terminal "gave up" state that is logged and surfaced on the
+# hub (RATINGS_RECONCILE_STATE, rendered in render_decisions() the same way
+# MIRROR_STATE is) instead of silently dropping the rating forever.
+RATINGS_DISPATCH_MAX_ATTEMPTS = int(os.environ.get("HERDR_RATINGS_DISPATCH_MAX_ATTEMPTS", "8"))
+RATINGS_DISPATCH_BACKOFF_BASE_S = float(os.environ.get("HERDR_RATINGS_DISPATCH_BACKOFF_BASE_S", "30"))
+RATINGS_DISPATCH_BACKOFF_MAX_S = float(os.environ.get("HERDR_RATINGS_DISPATCH_BACKOFF_MAX_S", "3600"))
+RATINGS_RECONCILE_STATE: dict = {"gave_up": {}}  # run_id -> {error, attempts, gave_up_at}
+
 
 def _undispatched_port_ratings_answers() -> list[tuple[Path, dict]]:
-    """Every answered-via-port ratings row this hub has not yet dispatched."""
+    """Every answered-via-port ratings row this hub still owes KB an attempt
+    on: not yet dispatched (`ratings_dispatched_at`), not given up on
+    (`ratings_dispatch_gave_up_at`), and not inside its current backoff
+    window (`ratings_dispatch_next_at`)."""
     out: list[tuple[Path, dict]] = []
     if not FORMS_DIR.is_dir():
         return out
@@ -1605,7 +1635,10 @@ def _undispatched_port_ratings_answers() -> list[tuple[Path, dict]]:
             continue
         if row.get("status") != "answered" or row.get("answered_via") != "port":
             continue
-        if row.get("ratings_dispatched_at"):
+        if row.get("ratings_dispatched_at") or row.get("ratings_dispatch_gave_up_at"):
+            continue
+        next_at = row.get("ratings_dispatch_next_at")
+        if isinstance(next_at, (int, float)) and time.time() * 1000 < next_at:
             continue
         key = _sidecar_key(row.get("form_path"))
         if key and key.startswith(RATINGS_KEY_PREFIX):
@@ -1613,16 +1646,54 @@ def _undispatched_port_ratings_answers() -> list[tuple[Path, dict]]:
     return out
 
 
-def _mark_ratings_dispatched(row: dict) -> dict:
-    row["ratings_dispatched_at"] = int(time.time() * 1000)
-    return row
+def _mark_ratings_dispatched(result: dict):
+    """KB gave a final, parseable answer (PR #214 review R2-1): mark it done
+    regardless of per-section errors so it is never resent, and drop any
+    retry bookkeeping left over from an earlier transport failure on this
+    same row."""
+    def _mark(row: dict) -> dict:
+        row["ratings_dispatched_at"] = int(time.time() * 1000)
+        row["ratings_dispatch_result"] = result
+        row.pop("ratings_dispatch_attempts", None)
+        row.pop("ratings_dispatch_next_at", None)
+        row.pop("ratings_dispatch_last_error", None)
+        return row
+    return _mark
+
+
+def _mark_ratings_retry(run_id: str, error: str):
+    """A transport failure: bump the attempt count, schedule the next try
+    with exponential backoff, and give up for good past
+    RATINGS_DISPATCH_MAX_ATTEMPTS. Giving up is recorded on the row (so it is
+    never retried again) and in RATINGS_RECONCILE_STATE (so it is visible on
+    /decisions instead of a silently dropped rating)."""
+    def _mark(row: dict) -> dict:
+        attempts = int(row.get("ratings_dispatch_attempts") or 0) + 1
+        row["ratings_dispatch_attempts"] = attempts
+        row["ratings_dispatch_last_error"] = error
+        if attempts >= RATINGS_DISPATCH_MAX_ATTEMPTS:
+            gave_up_at = int(time.time() * 1000)
+            row["ratings_dispatch_gave_up_at"] = gave_up_at
+            row.pop("ratings_dispatch_next_at", None)
+            RATINGS_RECONCILE_STATE["gave_up"][run_id] = {
+                "error": error, "attempts": attempts, "gave_up_at": gave_up_at}
+            print(f"hub: ratings dispatch for {run_id} gave up after {attempts} attempts: {error}",
+                  file=sys.stderr)
+        else:
+            backoff = min(RATINGS_DISPATCH_BACKOFF_BASE_S * (2 ** (attempts - 1)),
+                         RATINGS_DISPATCH_BACKOFF_MAX_S)
+            row["ratings_dispatch_next_at"] = int(time.time() * 1000 + backoff * 1000)
+        return row
+    return _mark
 
 
 def _reconcile_port_ratings_answers() -> None:
-    """Best-effort, same posture as mirror_sync: never raises, a failure is
-    logged and left for the next cycle to retry, success is marked durably on
-    the row (`ratings_dispatched_at`) so a dispatched answer is never
-    re-sent."""
+    """Best-effort, same posture as mirror_sync: never raises. A KB response
+    that parses (recorded/errors) is FINAL and marked durably
+    (`ratings_dispatched_at`) so it is never resent, even with per-section
+    errors -- a closed 24h correction window is exactly as unretryable as
+    success (PR #214 review R2-1). Only a genuine transport failure is
+    retried, bounded and backed off by `_mark_ratings_retry`."""
     for path, row in _undispatched_port_ratings_answers():
         key = _sidecar_key(row.get("form_path")) or ""
         run_id = key[len(RATINGS_KEY_PREFIX):]
@@ -1631,16 +1702,21 @@ def _reconcile_port_ratings_answers() -> None:
             continue
         payload = {"run_id": run_id, "attempt_number": 1,
                    "answers": [{"section_key": k, "rating": v} for k, v in answers.items()]}
-        if not _dispatch_ratings_answer_now(run_id, payload):
-            continue  # already logged by _dispatch_ratings_answer_now; retried next cycle
+        final, result = _dispatch_ratings_answer_now(run_id, payload)
         try:
-            claim_and_update(path, _mark_ratings_dispatched, require_status="answered")
+            if final:
+                claim_and_update(path, _mark_ratings_dispatched(result), require_status="answered")
+            else:
+                claim_and_update(path, _mark_ratings_retry(run_id, "dispatch transport failure, see hub log"),
+                                 require_status="answered")
         except (NotClaimable, FileNotFoundError, OSError, json.JSONDecodeError) as e:
-            # The KB write already landed -- only the local marker failed, so
-            # the next cycle dispatches again. server.ratings hub-answer is a
-            # same-run_id/section_key upsert inside the 24h correction window
-            # (one live row per section), so a duplicate dispatch overwrites,
-            # never double-counts.
+            # The KB write already landed (if final) -- only the local marker
+            # failed, so the next cycle dispatches again. server.ratings
+            # hub-answer is a same-run_id/section_key upsert inside the 24h
+            # correction window (one live row per section), so a duplicate
+            # dispatch overwrites, never double-counts -- but see R2-1 above:
+            # that overwrite is still a new correction row, which is exactly
+            # why `final` is marked BEFORE we'd ever reach here on success.
             print(f"hub: ratings reconcile marker for {run_id} not written: {e}", file=sys.stderr)
 
 
@@ -3811,6 +3887,15 @@ def render_decisions() -> str:
     if ms.get("rejected"):
         body += (f"<p><span class='pill bad'>rejected</span> {ms['rejected']} dashboard answer(s) failed "
                  f"verification and were NOT delivered — last: {_esc(ms.get('last_rejection'))}</p>")
+    gave_up = RATINGS_RECONCILE_STATE.get("gave_up") or {}
+    if gave_up:
+        items = "".join(
+            f"<li>{_esc(run_id)}: {info['attempts']} attempt(s), gave up {_age(info['gave_up_at'])} ago — "
+            f"{_esc(info.get('error', ''))}</li>"
+            for run_id, info in sorted(gave_up.items()))
+        body += (f"<p><span class='pill bad'>ratings dispatch</span> {len(gave_up)} run(s) gave up after "
+                 f"{RATINGS_DISPATCH_MAX_ATTEMPTS} failed attempts — these ratings never reached "
+                 f"kb.section_ratings and need a manual resend:</p><ul>{items}</ul>")
     p = CACHES["portal"].get()
     if p.get("error"):
         body += (f"<h2>Legacy portal · unreadable</h2><p><span class='pill bad'>error</span> {_esc(p['error'])}</p>")
