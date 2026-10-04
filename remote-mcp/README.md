@@ -183,13 +183,49 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
 | `follow_up` | message | `task_id`, `text` | = `send_message` addressed by remote `task_id`; refused if the task was never actually spawned |
 | `cancel_task` | task.cancel | `task_id` | new state (`cancelled` if never spawned, else `cancelling`); refused if already terminal |
 | `resume_task` | task.cancel | `task_id`, `text?` | re-enters the same worktree/branch as a brand new `task_id` (only a terminal task can be resumed), linked via `parent_task_id` |
-| `list_events` | read | `since_cursor` (0), `limit` 1–500 (100) | the global event feed since that cursor: `task_started`, `state_changed`, `approval_needed`, `capability_probe`, `answer_ready`, `finished`, `verified`, `failed`, `cancelled`, `timed_out`, `disconnected`/`reconnected` |
-| `wait_for_events` | read | `since_cursor` (0), `timeout_s` 1–25 (20) | holds the call open until a new event lands or `timeout_s` elapses (true server push is not possible over Streamable HTTP; poll this instead of `list_events` in a tight loop) |
+| `list_events` | read | `since_cursor` (0), `since_scope_hash?`, `limit` 1–500 (100) | `result` ok\|cursor_pruned\|cursor_scope_mismatch, `scanned_through_cursor`, `latest_cursor`, `replay_floor_cursor`, `scope_hash`, and `events`: `task_started`, `state_changed`, `approval_needed`, `capability_probe`, `answer_ready`, `finished`, `verified`, `failed`, `cancelled`, `timed_out`, `disconnected`/`reconnected`, and (visible only to the original sender/client, by identity match — not gated on currently holding `herdr:message.owner`) `owner.reply_ready` — never the reply text itself. See "Watching for an owner reply" below. |
+| `wait_for_events` | read | `since_cursor` (0), `since_scope_hash?`, `timeout_s` 1–25 (20) | holds the call open until a new event lands or `timeout_s` elapses (true server push is not possible over Streamable HTTP; poll this instead of `list_events` in a tight loop). Same `result`/cursor contract as `list_events`. |
 | `send_owner_message` | message.owner (listed only when enabled) | `owner_label`, `body` (≤4000 chars), `client_msg_id` | `exchange_id`, `state` `queued` |
 | `get_owner_message_status` | read or message.owner | `exchange_id` | status + detail (only your own messages) |
 | `get_owner_reply` | read or message.owner | `exchange_id` | the owner's reply (body, `session`, `responded_at`) once one exists (only your own messages) |
 
 `tools/list` on the live server is the authoritative JSON Schema.
+
+### Watching for an owner reply (the watcher recipe)
+
+`send_owner_message` queues a note to a registered owning session; the
+reply, once the owner writes one, is only ever visible through
+`get_owner_reply` -- `list_events`/`wait_for_events` tell you WHEN one is
+ready (`owner.reply_ready`), never the body itself. A delegated read-only
+watcher (one bounded `wait_for_events` call, repeated by the orchestration
+platform's own retry/resume) should follow this sequence exactly:
+
+1. **Capture cursor and scope once.** `list_events(since_cursor: 0)` and keep
+   its `scope_hash` -- pass it back as `since_scope_hash` on every later
+   call. A cursor replayed under a changed authorization (grant revoked,
+   re-consented with different scopes) returns `cursor_scope_mismatch`
+   instead of silently coming back empty.
+2. **Catch up across multiple pages.** A reply created BEFORE the watcher
+   started is still in the stream; page with
+   `since_cursor: <the previous response's scanned_through_cursor>` (not the
+   last event's own `cursor` -- a page that is entirely filtered out by
+   authorization still has to advance) until `scanned_through_cursor ===
+   latest_cursor`. If a page ever comes back `cursor_pruned`, restart the
+   catch-up from that response's own `latest_cursor` (the safe resume
+   boundary) rather than trusting the stale cursor.
+3. **Wait.** Once caught up, `wait_for_events(since_cursor: <caught-up
+   cursor>, since_scope_hash, timeout_s: 20)` holds the call open for a new
+   `owner.reply_ready` (or any other event) and returns as soon as one
+   lands, or after the timeout with nothing.
+4. **Fetch the reply separately.** `get_owner_reply(exchange_id)` -- the
+   event's `subject.id` -- once `owner.reply_ready` for that exchange has
+   appeared. Never read reply text out of the event itself; it never
+   carries any (`data` is sanitized metadata only).
+5. **Return.** A single bounded `wait_for_events` call is what lets the
+   orchestration platform's own task-completion callback notify its parent;
+   it does not survive the watcher task ending or an executor crash (that
+   is Phase 3/4 territory -- named consumer checkpoints and Slack/other
+   adapters -- not this MVP).
 
 ### Message rules (server-side, then re-checked on the Mac)
 

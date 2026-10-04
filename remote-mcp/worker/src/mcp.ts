@@ -313,18 +313,32 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
 
   server.registerTool("list_events", {
     title: "List task lifecycle events",
-    description: "Global event feed across every remote task: task_started, state_changed, approval_needed, " +
-      "capability_probe, answer_ready, finished, verified, failed, cancelled, timed_out, disconnected/reconnected. " +
-      "since_cursor=0 for everything retained (30 days); cursor is monotonic and never reused.",
-    inputSchema: { since_cursor: z.number().int().min(0).default(0), limit: z.number().int().min(1).max(500).default(100) },
+    description: "Global event feed: task_started, state_changed, approval_needed, capability_probe, answer_ready, " +
+      "finished, verified, failed, cancelled, timed_out, disconnected/reconnected, and owner.reply_ready -- visible " +
+      "only to the owner message's original sender/client (identity match, not a live-scope check: a token that " +
+      "sent it sees it even if it no longer holds herdr:message.owner) -- never the reply text itself, fetch " +
+      "that with get_owner_reply. since_cursor=0 for everything retained; cursor is monotonic and never reused. " +
+      "Watcher recipe: call once with since_cursor=0 to capture `scope_hash`, pass it back as since_scope_hash on " +
+      "every later call (a cursor scoped to a revoked or changed authorization returns cursor_scope_mismatch, " +
+      "never silently empty data); if result is cursor_pruned, restart from the returned latest_cursor as the " +
+      "resume boundary. Page with since_cursor=scanned_through_cursor (not the last event's own cursor -- a page " +
+      "of entirely filtered events still has to advance) until scanned_through_cursor===latest_cursor.",
+    inputSchema: {
+      since_cursor: z.number().int().min(0).default(0),
+      since_scope_hash: z.string().max(16).optional().describe("scope_hash from a previous call; omit only on the first call."),
+      limit: z.number().int().min(1).max(500).default(100),
+    },
     annotations: ro,
-  }, async ({ since_cursor, limit }) => {
+  }, async ({ since_cursor, since_scope_hash, limit }) => {
     const v = await gate("list_events", String(since_cursor));
     if (!isView(v)) return v;
-    const { cursor, events } = await stub.listEvents(since_cursor, limit);
+    const page = await stub.listEvents(since_cursor, since_scope_hash ?? null, caller, limit);
     return ok({
-      connection: v.connection, cursor,
-      events: events.map((e) => ({ cursor: e.cursor, task_id: e.remote_task_id || null, type: e.type, at: e.at, detail: e.detail })),
+      connection: v.connection, result: page.result, cursor: page.scanned_through_cursor,
+      scanned_through_cursor: page.scanned_through_cursor, latest_cursor: page.latest_cursor,
+      replay_floor_cursor: page.replay_floor_cursor, scope_hash: page.scope_hash,
+      events: page.events.map((e) => ({ cursor: e.cursor, event_id: e.event_id, task_id: e.remote_task_id || null,
+        type: e.type, source: e.source, subject: e.subject, at: e.at, detail: e.detail })),
     });
   });
 
@@ -332,16 +346,24 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
     title: "Wait for a new task lifecycle event",
     description: "Holds the call open until a new event lands or timeout_s elapses, then returns whatever arrived " +
       "(possibly nothing). The closest thing to a push notification this server can give an MCP client -- true " +
-      "server push is not possible over Streamable HTTP here, so poll this instead of list_events in a tight loop.",
-    inputSchema: { since_cursor: z.number().int().min(0).default(0), timeout_s: z.number().int().min(1).max(25).default(20) },
+      "server push is not possible over Streamable HTTP here, so poll this instead of list_events in a tight loop. " +
+      "Same since_cursor/since_scope_hash/cursor_pruned/cursor_scope_mismatch contract as list_events.",
+    inputSchema: {
+      since_cursor: z.number().int().min(0).default(0),
+      since_scope_hash: z.string().max(16).optional(),
+      timeout_s: z.number().int().min(1).max(25).default(20),
+    },
     annotations: ro,
-  }, async ({ since_cursor, timeout_s }) => {
+  }, async ({ since_cursor, since_scope_hash, timeout_s }) => {
     const v = await gate("wait_for_events", String(since_cursor));
     if (!isView(v)) return v;
-    const { cursor, events } = await stub.waitForEvents(since_cursor, timeout_s);
+    const page = await stub.waitForEvents(since_cursor, since_scope_hash ?? null, caller, timeout_s);
     return ok({
-      connection: v.connection, cursor,
-      events: events.map((e) => ({ cursor: e.cursor, task_id: e.remote_task_id || null, type: e.type, at: e.at, detail: e.detail })),
+      connection: v.connection, result: page.result, cursor: page.scanned_through_cursor,
+      scanned_through_cursor: page.scanned_through_cursor, latest_cursor: page.latest_cursor,
+      replay_floor_cursor: page.replay_floor_cursor, scope_hash: page.scope_hash,
+      events: page.events.map((e) => ({ cursor: e.cursor, event_id: e.event_id, task_id: e.remote_task_id || null,
+        type: e.type, source: e.source, subject: e.subject, at: e.at, detail: e.detail })),
     });
   });
 
