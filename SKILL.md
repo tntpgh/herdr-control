@@ -235,8 +235,10 @@ the task's recorded conductor pane directly:
 - a policy-refused prompt was denied, then the worker went idle;
 - a message was delivered to a worker's pane (`send-to-agent.sh`) and
   nothing happened afterward — it was never processed;
-- the worker's own last pane output is a bare `CONDUCTOR: ...` line, with
-  no deny, delivery or handoff to explain the idle task.
+- the worker's own last pane output is a bare `CONDUCTOR: ...` line that no
+  delivery has answered since THIS EXACT request first appeared — a fixed
+  claim epoch, not the task's `updated_at` (which slides forward on an
+  unrelated later approval).
 
 Idle past `HERDR_STALL_WATCHDOG_THRESHOLD_S` (default 600s) wakes the
 conductor once per (task, signal, occurrence) — `stall-watchdog.sh` claims

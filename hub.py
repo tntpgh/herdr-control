@@ -3626,6 +3626,64 @@ def _stall_boot_epoch() -> float:
     _STALL_BOOT_EPOCH_CACHE.append(epoch)
     return epoch
 
+_STALL_REQUEST_CLAIM_EVENT_PREFIX = "stall_request_claim_"
+
+
+def _stall_request_claim(task_id: str, fingerprint: str, now: float) -> float:
+    """The epoch THIS EXACT (task_id, fingerprint) conductor_prompt request
+    was first ever observed by the watchdog — review H1/M1 (r6): the old
+    gate compared a reply against the task's registry `updated_at`, which
+    moves on every later, unrelated permission prompt (so an answered
+    request re-fired the moment the worker's next approval landed) and can
+    itself sit well BEFORE the request ever appeared (so an earlier,
+    unrelated delivery read as having answered a request it preceded).
+
+    Persisted ONCE via the same idempotent INSERT-OR-IGNORE `_stall_boot_
+    epoch` uses, keyed on task+fingerprint, so it never moves again once
+    claimed — the SAME fingerprint across ticks (the request sits unchanged
+    while the worker goes on to other things) always reads back the SAME
+    epoch, regardless of what `updated_at` does meanwhile. Two hub
+    processes racing this agree on one epoch for the same reason
+    `_stall_boot_epoch` does: whichever INSERT wins, both read it back.
+    """
+    event_id = f"{_STALL_REQUEST_CLAIM_EVENT_PREFIX}{task_id}_{_sw_digest(fingerprint)}"
+    if not REGISTRY.exists():
+        return now
+    try:
+        conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+        try:
+            row = conn.execute("SELECT occurred_at FROM events WHERE event_id=?",
+                               (event_id,)).fetchone()
+        finally:
+            conn.close()
+        if row and row[0]:
+            epoch = _iso_epoch(row[0])
+            if epoch is not None:
+                return epoch
+    except sqlite3.Error:
+        pass
+    occurred = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    try:
+        conn = sqlite3.connect(str(REGISTRY), timeout=2)
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+                "VALUES (?, '', ?, 'stall_request_claim', ?, '{}')",
+                (event_id, task_id, occurred))
+            conn.commit()
+            row = conn.execute("SELECT occurred_at FROM events WHERE event_id=?",
+                               (event_id,)).fetchone()
+        finally:
+            conn.close()
+        if row and row[0]:
+            epoch = _iso_epoch(row[0])
+            if epoch is not None:
+                return epoch
+    except sqlite3.Error:
+        pass
+    return now
+
+
 _REASON_RE = re.compile(rb'"reason"\s*:\s*"([^"]*)"')
 
 
@@ -3814,7 +3872,7 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                               denied: dict | None = None, delivered: dict | None = None,
                               owner_acted: dict | None = None, replied: dict | None = None,
                               stat_fn=None, live_done_fn=None, pane_read_fn=None,
-                              pane_birth_fn=None,
+                              pane_birth_fn=None, claim_fn=None,
                               threshold_s: float | None = None,
                               boot_epoch: float | None = None) -> list[dict]:
     """Which (task, signal) pairs have sat idle/done, owing the conductor an
@@ -3823,7 +3881,14 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
     `denied`/`delivered`/`owner_acted`/`replied` are precomputed {task_id:
     {"epoch":…, "fingerprint":…}} (or, for `owner_acted`/`replied`,
     {task_id: epoch}) maps for facts `herdr_data()` cannot see on its own
-    — see `_stall_task_signals`.
+    — see `_stall_task_signals`. `replied` is the LATEST `message_delivered`
+    epoch per task, unbounded (review M2 r6: no longer windowed to 8x the
+    threshold — a genuinely old reply must keep silencing its request
+    forever, not just for 80 minutes). `claim_fn` (review H1/M1 r6) returns
+    the epoch THIS EXACT (task_id, fingerprint) request was first claimed
+    — see `_stall_request_claim` — so "answered" compares a reply against
+    the REQUEST's own fixed epoch, never the task's `updated_at` (which
+    moves on every later, unrelated permission prompt).
     `stat_fn`/`live_done_fn` are injectable (signal 2's artifact mtime+size,
     signal 1's live-bus read) so this stays a pure function callers can test
     with plain dicts, no filesystem or registry required — same testability
@@ -3882,11 +3947,19 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                     join inserts — still hashes to the same key. Review H1
                     (r5): "already answered" is no longer inferred from
                     pane shape (that dropped real unanswered requests —
-                    see `_last_conductor_prompt_line`); `replied[tid]`, the
-                    latest `message_delivered` event for this task from
-                    the registry, silences it only once that event is AT
-                    OR AFTER the task's own `updated_at` — a real reply,
-                    not a guess.
+                    see `_last_conductor_prompt_line`); it is a real
+                    `message_delivered` event, never a guess. Review H1/M1
+                    (r6): that reply is compared against THIS REQUEST'S OWN
+                    claim epoch (`claim_fn`, first-seen and held fixed —
+                    see `_stall_request_claim`), not the task's
+                    `updated_at` — r5 compared against `updated_at`
+                    instead, which (a) sits well before the request on a
+                    task spawned long ago, so an earlier, unrelated
+                    delivery read as having answered a request it
+                    preceded, and (b) slides forward on every later,
+                    unrelated permission prompt, so an already-answered
+                    request re-fired the moment the worker's next approval
+                    landed.
     """
     now = time.time() if now is None else now
     threshold = STALL_WATCHDOG_THRESHOLD_S if threshold_s is None else threshold_s
@@ -3905,6 +3978,8 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
         pane_read_fn = _pane_last_output
     if pane_birth_fn is None:
         pane_birth_fn = _live_pane_birth
+    if claim_fn is None:
+        claim_fn = _stall_request_claim
     IDLE_STATES = ("stalled", "ready_review")
     out: list[dict] = []
     for t in tasks:
@@ -3971,14 +4046,12 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                            "detail": "a message was delivered to this pane and never processed",
                            "artifact": ""})
 
-        # ---- signal 5: conductor_prompt (review M1) -------------------------
+        # ---- signal 5: conductor_prompt (review M1; H1/M1 r6) --------------
         if state in IDLE_STATES and t.get("pane_id"):
             since = _iso_epoch(t.get("updated_at"))
             owner_epoch = owner_acted.get(tid)
-            reply_epoch = replied.get(tid)
             if (since is not None and since >= boot and now - since >= threshold
-                    and (owner_epoch is None or owner_epoch < since)
-                    and (reply_epoch is None or reply_epoch < since)):
+                    and (owner_epoch is None or owner_epoch < since)):
                 live_birth = pane_birth_fn(t["pane_id"])
                 reg_birth = t.get("pane_birth") or ""
                 if live_birth and reg_birth and live_birth == reg_birth:
@@ -3989,9 +4062,20 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                         # where the continuation join inserts its space —
                         # mints the SAME fingerprint, not a second wake.
                         norm = re.sub(r"\s+", "", line)
-                        out.append({**base, "signal": "conductor_prompt",
-                                   "fingerprint": f"cprompt:{hashlib.sha256(norm.encode()).hexdigest()[:16]}",
-                                   "detail": line[:200], "artifact": ""})
+                        fingerprint = f"cprompt:{hashlib.sha256(norm.encode()).hexdigest()[:16]}"
+                        # Review H1/M1 (r6): "answered" is bound to THIS
+                        # REQUEST's own claim epoch, never `updated_at` —
+                        # which moves with every later, unrelated prompt
+                        # (M1) and can sit well before the request ever
+                        # appeared (H1). The pane read above is the first
+                        # place the fingerprint becomes known, so the claim
+                        # can only happen here, not earlier.
+                        claimed_at = claim_fn(tid, fingerprint, now)
+                        reply_epoch = replied.get(tid)
+                        if reply_epoch is None or reply_epoch < claimed_at:
+                            out.append({**base, "signal": "conductor_prompt",
+                                       "fingerprint": fingerprint,
+                                       "detail": line[:200], "artifact": ""})
     return out
 
 
@@ -4023,9 +4107,11 @@ def _stall_task_signals(now: float | None = None, threshold_s: float | None = No
     `message_delivered` event per task with no later WORKER event, the
     latest owner-side action epoch per task (PR #223 review H1/M-a's "newer
     than the conductor's last action"), and the latest `message_delivered`
-    event per task regardless of what happened after (review H1 r5's
-    `replied` — the one registry fact that proves a human/conductor
-    replied to a `conductor_prompt` signal, since pane SHAPE cannot).
+    event per task regardless of what happened after, UNBOUNDED — review H1
+    r5's `replied`, the one registry fact that proves a human/conductor
+    replied to a `conductor_prompt` signal, since pane SHAPE cannot; review
+    M2 (r6) dropped its former 8x-threshold window, which let a genuinely
+    old reply expire and the already-answered request re-fire.
 
     `denied` (review M2): a policy refusal is `approval_escalated`
     (`herdr-select.sh`'s `_refuse_non_human`, fired only when the policy
@@ -4115,11 +4201,15 @@ def _stall_task_signals(now: float | None = None, threshold_s: float | None = No
         # "no later worker activity" filter — a `conductor_prompt` signal
         # is answered the instant the conductor sends anything back,
         # whether or not the worker goes on to process it (that is
-        # `delivered`'s own, separate concern).
+        # `delivered`'s own, separate concern). Review M2 (r6): UNBOUNDED —
+        # no `cutoff` here. The signal it answers is compared against the
+        # REQUEST's own claim epoch (`stall_watchdog_candidates`'s
+        # `claim_fn`), which can be arbitrarily old; windowing this query
+        # to "recent" rows made a genuinely old, valid reply expire and the
+        # already-answered request re-fire (review M2).
         for tid, occurred_at in conn.execute(
                 "SELECT task_id, MAX(occurred_at) FROM events WHERE task_id != '' "
-                "AND type='message_delivered' AND occurred_at >= ? GROUP BY task_id",
-                (cutoff,)):
+                "AND type='message_delivered' GROUP BY task_id"):
             ep = _iso_epoch(occurred_at)
             if ep is not None:
                 replied[tid] = ep

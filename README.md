@@ -342,11 +342,14 @@ five signals, gated to `stalled`/`ready_review` only: once a task is
    the task's last recorded action;
 3. a policy denial, then the worker went idle;
 4. `message_delivered` (`send-to-agent.sh`) with nothing after it;
-5. the worker's own last pane output is a bare `CONDUCTOR: ...` line — no
-   deny, delivery or handoff to explain the idle task — matched across a
-   terminal wrap, a trailing status/recap block, or a bolded
-   `**CONDUCTOR:**` marker, and only once the pane's live birth still
-   matches what this task registered (a recycled pane id is never read).
+5. the worker's own last pane output is a bare `CONDUCTOR: ...` line that
+   no delivery has answered SINCE THIS EXACT REQUEST first appeared — its
+   own claim epoch, held fixed once recorded, never the task's
+   `updated_at` (which slides forward on every later, unrelated permission
+   prompt) — matched across a terminal wrap, a trailing status/recap
+   block, or a bolded `**CONDUCTOR:**` marker, and only once the pane's
+   live birth still matches what this task registered (a recycled pane id
+   is never read).
 
 Each candidate dispatches to `stall-watchdog.sh wake`, which owns the
 SAME one-claim-per-occurrence shape `push_wake`/`attn_track_claim` use

@@ -6,8 +6,8 @@
 #   stall-watchdog.sh's own dedupe / owner-resolution / escalation ladder /
 #   ack-stops-repeat, against a real scratch registry.
 # Section B (python, imported-module pattern from verify-projects-status.sh):
-#   hub.py's pure stall_watchdog_candidates() over all four signals, the
-#   supplemental _stall_denied_and_delivered() query against a real scratch
+#   hub.py's pure stall_watchdog_candidates() over all five signals, the
+#   supplemental _stall_task_signals() query against a real scratch
 #   registry, and _stall_watchdog_tick()'s own on/off switch — proof that
 #   disabling the rule (STALL_WATCHDOG_SCRIPT unset) leaves the SAME
 #   scenario silent, by in-memory monkeypatch, never git checkout/stash.
@@ -236,6 +236,38 @@ def base_task(**over):
 def cw(now_epoch, reason=None):   # stub live_done_fn: constant (epoch, reason)
     return lambda worktree: (now_epoch, reason)
 
+# review H1/M1 (r6): `claim_fn` defaults to `_stall_request_claim`, which
+# touches the REAL registry — every fixture below that only cares about
+# fingerprint/pane-shape behavior (not reply-suppression timing) must
+# override it so it never falls through to that default before `hub.
+# REGISTRY` is pointed at the scratch db further down.
+NO_CLAIM = lambda tid, fp, now: 0.0
+
+def _safe_candidates(label, *a, **kw):
+    """Review L1 (d): isolate a crash in ONE `stall_watchdog_candidates`
+    call (e.g. a `replied=`-shape mutation) to its OWN result key, so it
+    never takes the rest of Section B down with it -- same reasoning as
+    `_run_mutant` below, generalized to calls outside that loop."""
+    try:
+        return hub.stall_watchdog_candidates(*a, **kw)
+    except Exception as exc:
+        results[f"{label}_CRASHED"] = f"{type(exc).__name__}: {exc}"
+        return []
+
+
+def _safe_signals4(label, **kw):
+    """Review L1 (d): isolate a `_stall_task_signals` arity/shape change
+    to the ONE call site that unpacks it, instead of raising out of this
+    whole inline script -- round-2's M3 failure mode, reopened by r3's own
+    L1 (reverting the arity fix crashed with 0 keys surviving)."""
+    try:
+        denied_, delivered_, owner_acted_, replied_ = hub._stall_task_signals(**kw)
+        return denied_, delivered_, owner_acted_, replied_
+    except Exception as exc:
+        results[f"{label}_CRASHED"] = f"{type(exc).__name__}: {exc}"
+        return {}, {}, {}, {}
+
+
 # ---- signal 1: handoff (review N1/N2: live bus ONLY, IDLE_STATES ONLY) ------
 t_live = base_task(state="ready_review", stored_state="running", closure_reason=None, worktree="/wt-live")
 cands = hub.stall_watchdog_candidates(
@@ -417,7 +449,7 @@ t7 = base_task(state="stalled", stored_state="stalled", pane_id="p1", pane_birth
                updated_at="2026-01-01T00:00:00Z")
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 results["N3_conductor_prompt_fires_against_realistic_omp_chrome"] = any(
     c["signal"] == "conductor_prompt" for c in cands)
 # The naive "literal last row" check this replaces would see the composer's
@@ -427,13 +459,13 @@ results["N3_last_row_of_raw_chrome_is_not_the_conductor_line"] = (
 # Ordinary scrollback with no such line never fires it.
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME_NO_PROMPT, pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: CHROME_NO_PROMPT, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 results["M1_silent_without_a_conductor_line"] = cands == []
 # The owner already acted after the pane's last line -> silent.
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
     pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
-    owner_acted={"t1": NOW - 1})
+    owner_acted={"t1": NOW - 1}, claim_fn=NO_CLAIM)
 results["M1_silent_once_the_owner_already_acted"] = cands == []
 # A task state outside (stalled, ready_review) never reads the pane at all —
 # review N1/M-b's state-allowlist (`lost`/`cancelled`/`gone` used to be
@@ -442,20 +474,20 @@ t7_gone = base_task(state="gone", stored_state="gone", pane_id="p1", pane_birth=
                     updated_at="2026-01-01T00:00:00Z")
 cands = hub.stall_watchdog_candidates(
     [t7_gone], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 results["Mb_conductor_prompt_silent_outside_idle_states"] = cands == []
 # review M-b: the live pane's birth no longer matches what this task
 # registered (herdr recycled the pane id to an unrelated task) -> silent,
 # even with a real CONDUCTOR: line sitting there.
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "some-other-birth")
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "some-other-birth", claim_fn=NO_CLAIM)
 results["Mb_conductor_prompt_silent_on_a_recycled_pane"] = cands == []
 # Live birth unknown (LIVE disconnected, or herdr never answered) -> fails
 # closed, same reasoning.
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: None)
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: None, claim_fn=NO_CLAIM)
 results["Mb_conductor_prompt_silent_when_birth_cannot_be_confirmed"] = cands == []
 
 # ---- review H1 (r4): the hard-coded 20-row read window drops the exact
@@ -498,12 +530,12 @@ _h1_window_default = "\n".join(_h1_full[-_h1_default_lines:])
 _h1_window_20 = "\n".join(_h1_full[-20:])
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: _h1_window_default, pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: _h1_window_default, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 results["H1_46col_wrapped_request_plus_recap_fires_in_the_real_window"] = any(
     c["signal"] == "conductor_prompt" for c in cands)
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: _h1_window_20, pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: _h1_window_20, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 results["H1_the_old_20row_window_would_have_missed_it"] = not any(
     c["signal"] == "conductor_prompt" for c in cands)
 
@@ -544,7 +576,7 @@ CHROME_WRAPPED = ("an earlier line of agent output\n"
                   "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n")
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME_WRAPPED, pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: CHROME_WRAPPED, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 results["M1_fires_when_the_request_wraps_across_terminal_rows"] = any(
     c["signal"] == "conductor_prompt" for c in cands)
 # The continuation row, joined on, is part of what gets hashed/shown.
@@ -565,7 +597,7 @@ CHROME_RECAP_B = CHROME_RECAP_A.replace(
     "Recap: review done, tests queued, waiting on your call.")
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME_RECAP_A, pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: CHROME_RECAP_A, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 results["M1_fires_when_a_recap_block_follows_the_request"] = any(
     c["signal"] == "conductor_prompt" for c in cands)
 fp_recap_a = next((c["fingerprint"] for c in cands if c["signal"] == "conductor_prompt"), None)
@@ -573,7 +605,7 @@ fp_recap_a = next((c["fingerprint"] for c in cands if c["signal"] == "conductor_
 # request, same blank-line boundary) must NOT re-arm the claim.
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME_RECAP_B, pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: CHROME_RECAP_B, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 fp_recap_b = next((c["fingerprint"] for c in cands if c["signal"] == "conductor_prompt"), None)
 results["M1_a_rerendered_recap_is_not_a_new_fingerprint"] = fp_recap_a == fp_recap_b
 
@@ -610,10 +642,10 @@ results["M1_fixture_would_hash_differently_raw_at_the_two_widths"] = (
     != hub.hashlib.sha256(_l1_joined_70.encode()).hexdigest())
 cands_46 = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: _l1_chrome_at(46), pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: _l1_chrome_at(46), pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 cands_70 = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: _l1_chrome_at(70), pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: _l1_chrome_at(70), pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 fp_46 = next((c["fingerprint"] for c in cands_46 if c["signal"] == "conductor_prompt"), None)
 fp_70 = next((c["fingerprint"] for c in cands_70 if c["signal"] == "conductor_prompt"), None)
 results["L1_fingerprint_stable_across_a_resize_and_rewrap"] = (
@@ -626,7 +658,7 @@ CHROME_BOLD = ("an earlier line of agent output\n"
               "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n")
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME_BOLD, pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: CHROME_BOLD, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 results["M1_fires_on_a_bold_markdown_conductor_marker"] = any(
     c["signal"] == "conductor_prompt" for c in cands)
 
@@ -678,25 +710,72 @@ for _h1r5_key, _h1r5_paras in _H1R5_CASES:
     _h1r5_text = _h1r5_pane(_h1r5_paras)
     cands = hub.stall_watchdog_candidates(
         [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-        pane_read_fn=lambda pane, _t=_h1r5_text: _t, pane_birth_fn=lambda pane: "pb1")
+        pane_read_fn=lambda pane, _t=_h1r5_text: _t, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
     results[_h1r5_key] = any(c["signal"] == "conductor_prompt" for c in cands)
 
-# ---- review H1 (r5): the REAL answered check -- a `message_delivered`
-# event from the registry, never pane shape. AT OR AFTER the task's own
-# `updated_at` (the moment this CONDUCTOR: line went idle) silences it; a
-# STALE reply from before the request does not.
-_H1R5_SINCE = hub._iso_epoch(t7["updated_at"])
-cands = hub.stall_watchdog_candidates(
-    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+# ---- review H1/M1 (r6): "answered" is bound to the REQUEST's OWN claim
+# epoch -- the first time THIS EXACT fingerprint was ever observed, held
+# fixed via `claim_fn` -- never `updated_at`. r5's tests (removed) used
+# `updated_at` as the baseline and so could never catch either bug r3
+# found: (H1) `updated_at` can sit WELL BEFORE the request itself, so an
+# earlier, unrelated delivery read as having answered a request it
+# preceded; (M1) `updated_at` SLIDES FORWARD on every later, unrelated
+# permission prompt, so an already-answered request re-fired the moment
+# the worker's next approval landed.
+_H1R6_SINCE = hub._iso_epoch(t7["updated_at"])
+_H1R6_CLAIM = _H1R6_SINCE + 120   # the request's own first-claimed epoch --
+                                 # AFTER `updated_at` (a real request
+                                 # arrives after the last recorded state
+                                 # transition), fixed regardless of what
+                                 # `updated_at` does afterward.
+
+def _h1r6_claim_fn(claim_epoch):
+    return lambda tid, fp, now: claim_epoch
+
+# (a) (review L2): a delivery that landed BEFORE this exact request ever
+# appeared -- AFTER `updated_at` (so r5's `since`-based gate read it as an
+# answer) but BEFORE the real claim epoch -- must still wake.
+cands = _safe_candidates(
+    "H1r6_pre_request_fires", [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
     pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
-    replied={"t1": _H1R5_SINCE + 5})
-results["H1_r5_silent_once_a_real_reply_was_delivered_after_the_request"] = cands == []
-cands = hub.stall_watchdog_candidates(
-    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
-    replied={"t1": _H1R5_SINCE - 5000})
-results["H1_r5_a_stale_reply_from_before_the_request_still_fires"] = any(
+    claim_fn=_h1r6_claim_fn(_H1R6_CLAIM), replied={"t1": _H1R6_CLAIM - 60})
+results["H1_r6_a_delivery_before_the_request_itself_still_fires"] = any(
     c["signal"] == "conductor_prompt" for c in cands)
+
+# A real reply, AFTER the claim epoch, silences it.
+cands = _safe_candidates(
+    "H1r6_real_reply_silent", [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
+    claim_fn=_h1r6_claim_fn(_H1R6_CLAIM), replied={"t1": _H1R6_CLAIM + 5})
+results["H1_r6_silent_once_a_real_reply_landed_after_the_claim_epoch"] = cands == []
+
+# (b): the worker continues past an UNRELATED later permission prompt
+# after being answered -- same fingerprint, same (fixed) claim epoch --
+# must STAY silent even though the task's `updated_at` has since moved
+# far past the reply.
+t7_later = base_task(state="stalled", stored_state="stalled", pane_id="p1", pane_birth="pb1",
+                     updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_H1R6_CLAIM + 1000)))
+cands = _safe_candidates(
+    "M1r6_silent_past_prompt", [t7_later], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
+    claim_fn=_h1r6_claim_fn(_H1R6_CLAIM), replied={"t1": _H1R6_CLAIM + 5})
+results["M1_r6_silent_once_the_worker_went_on_past_a_later_prompt"] = cands == []
+
+# ---- mutants (review H1/M1 r6): reverting the claim to `updated_at` --
+# e5c3478's own gate -- must FAIL both cases above, proving these tests
+# exercise the fix rather than a tautology.
+cands = _safe_candidates(
+    "REVERT_H1r6_since_gate_a", [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
+    claim_fn=_h1r6_claim_fn(_H1R6_SINCE), replied={"t1": _H1R6_CLAIM - 60})
+results["REVERT_H1r6_since_based_gate_misses_a_pre_request_delivery"] = cands == []
+cands = _safe_candidates(
+    "REVERT_M1r6_since_gate_b", [t7_later], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
+    claim_fn=_h1r6_claim_fn(_H1R6_CLAIM + 1000), replied={"t1": _H1R6_CLAIM + 5})
+results["REVERT_M1r6_since_based_gate_refires_after_a_later_prompt"] = any(
+    c["signal"] == "conductor_prompt" for c in cands)
+
 
 # ---- mutation harness: each revert variant is installed, exercised and
 # restored in its own try/except/finally -- review M3: `next()` without a
@@ -730,7 +809,7 @@ def _run_mutant(mut_name, mut_fn, checks):
             try:
                 cands = hub.stall_watchdog_candidates(
                     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-                    pane_read_fn=lambda pane: pane_text, pane_birth_fn=lambda pane: "pb1")
+                    pane_read_fn=lambda pane: pane_text, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
                 fired = any(c["signal"] == "conductor_prompt" for c in cands)
                 results[result_key] = (fired == expect_fire)
             except Exception:
@@ -749,7 +828,7 @@ _run_mutant("REVERT_full_naive", _naive_last_conductor_prompt_line, [
 
 cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME_WRAPPED, pane_birth_fn=lambda pane: "pb1")
+    pane_read_fn=lambda pane: CHROME_WRAPPED, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 results["REVERT_M1_restored_fix_fires_again"] = any(
     c["signal"] == "conductor_prompt" for c in cands)
 
@@ -781,13 +860,58 @@ conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, 
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('ev1','drun','dtask','message_delivered','2026-01-01T00:00:00Z','{}')")
 conn.commit(); conn.close()
-denied, delivered, owner_acted, replied = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+denied, delivered, owner_acted, replied = _safe_signals4("sig_dtask", now=REG_NOW, threshold_s=REG_THRESH)
 results["M2_denied_query_finds_the_approval_escalated_row"] = denied.get("dtask", {}).get("fingerprint") == "esc1"
 results["delivered_query_finds_an_unprocessed_message"] = "dtask" in delivered
 # review H1 (r5): `replied` is populated from the SAME message_delivered
 # row `delivered` reads above, regardless of what happens after it --
 # unlike `delivered`, it is never cleared by later worker activity.
 results["H1_r5_replied_query_finds_the_message_delivered_row"] = "dtask" in replied
+
+# ---- review M2 (r6): `replied` must never expire -- a genuinely old
+# reply (well past the OLD 8x-threshold cutoff) still proves the request
+# was answered and must keep silencing it, forever, not just for 80
+# minutes.
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('dtask_oldreply','drun','stalled','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('ev_oldreply','drun','dtask_oldreply','message_delivered','2020-01-01T00:00:00Z','{}')")
+conn.commit(); conn.close()
+_, _, _, replied_old = _safe_signals4("sig_m2r6", now=REG_NOW, threshold_s=REG_THRESH)
+results["M2_r6_replied_query_is_unbounded_an_ancient_reply_still_counts"] = "dtask_oldreply" in replied_old
+
+# ---- mutant (review M2 r6): reverting to the WINDOWED replied query
+# (e5c3478's own shape) must MISS this same ancient reply -- the exact
+# M2 bug (an answered request re-fired once its reply aged past 8x the
+# threshold).
+def _m2r6_windowed_replied(conn_, now_, threshold_s_):
+    cutoff_ = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ - threshold_s_ * 8))
+    out_ = {}
+    for tid_, occurred_at_ in conn_.execute(
+            "SELECT task_id, MAX(occurred_at) FROM events WHERE task_id != '' "
+            "AND type='message_delivered' AND occurred_at >= ? GROUP BY task_id", (cutoff_,)):
+        ep_ = hub._iso_epoch(occurred_at_)
+        if ep_ is not None:
+            out_[tid_] = ep_
+    return out_
+ro = sqlite3.connect(f"file:{hub.REGISTRY}?mode=ro", uri=True)
+windowed_replied = _m2r6_windowed_replied(ro, REG_NOW, REG_THRESH)
+ro.close()
+results["REVERT_M2r6_windowed_replied_query_misses_the_ancient_reply"] = "dtask_oldreply" not in windowed_replied
+
+# ---- review L1 (d): prove isolation really works -- a `_stall_task_
+# signals` arity change crashes only ITS OWN call, never the rest of
+# Section B (round-2's M3 failure mode, reopened by r3's own L1).
+_real_signals = hub._stall_task_signals
+def _l1d_arity_mutant(*a, **kw):
+    return _real_signals(*a, **kw)[:3]   # 3-tuple instead of 4
+hub._stall_task_signals = _l1d_arity_mutant
+_safe_signals4("L1d_arity_mutant", now=REG_NOW, threshold_s=REG_THRESH)
+hub._stall_task_signals = _real_signals
+results["L1_d_arity_mutant_is_isolated_not_fatal"] = "L1d_arity_mutant_CRASHED" in results
+results["L1_d_script_continues_running_after_an_arity_mutant"] = True
+
 
 # review M-c(2): a WAY-older approval_escalated row, with no later worker
 # activity, falls outside the window and must not populate `denied` —
@@ -798,7 +922,7 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('esc_old','drun','dtask_old','approval_escalated','2020-01-01T00:00:00Z','{}')")
 conn.commit(); conn.close()
-denied_old, _, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+denied_old, _, _, _ = _safe_signals4("sig_mc2", now=REG_NOW, threshold_s=REG_THRESH)
 results["Mc2_a_window_bounded_scan_excludes_ancient_rows"] = "dtask_old" not in denied_old
 
 # review M2: a HUMAN pressing Approve on a deny-CLASSIFIED prompt (policy_verdict
@@ -809,7 +933,7 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO approvals (approval_id, task_id, authority, policy_verdict, choice_text, decided_at) "
              "VALUES ('appr_human_ok','dtask2','human','deny','Approve','2026-01-01T00:00:00Z')")
 conn.commit(); conn.close()
-denied2, _, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+denied2, _, _, _ = _safe_signals4("sig_m2human", now=REG_NOW, threshold_s=REG_THRESH)
 results["M2_human_approve_on_a_deny_classified_prompt_never_fires_denied"] = "dtask2" not in denied2
 
 # A human's OWN declining choice (independent of policy_verdict) is still the
@@ -820,7 +944,7 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO approvals (approval_id, task_id, authority, policy_verdict, choice_text, decided_at) "
              "VALUES ('appr_deny3','dtask3','human','allow','2. Deny','2026-01-01T00:00:00Z')")
 conn.commit(); conn.close()
-denied3, _, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+denied3, _, _, _ = _safe_signals4("sig_m2decline", now=REG_NOW, threshold_s=REG_THRESH)
 results["M2_a_humans_own_decline_still_fires_denied"] = denied3.get("dtask3", {}).get("fingerprint") == "appr_deny3"
 
 # review H4: herdr-deliver.sh's REAL ordering — send-to-agent.sh's
@@ -837,7 +961,7 @@ conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, 
              "('w1','drun','t_worker_acted','message_delivered','2026-01-01T01:00:00Z','{}'),"
              "('w2','drun','t_worker_acted','input_required','2026-01-01T01:00:05Z','{}')")
 conn.commit(); conn.close()
-_, delivered4, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+_, delivered4, _, _ = _safe_signals4("sig_h4", now=REG_NOW, threshold_s=REG_THRESH)
 results["H4_herdr_deliver_ordering_still_reads_as_unprocessed"] = "t_deliver" in delivered4
 results["H4_genuine_worker_activity_clears_unprocessed"] = "t_worker_acted" not in delivered4
 
@@ -848,7 +972,7 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('oa1','drun','t_owner','owner_acted','2026-01-01T02:00:00Z','{}')")
 conn.commit(); conn.close()
-_, _, owner_acted2, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+_, _, owner_acted2, _ = _safe_signals4("sig_owner", now=REG_NOW, threshold_s=REG_THRESH)
 results["owner_acted_populated_from_owner_acted_events"] = "t_owner" in owner_acted2
 
 # A later event from the SAME task (real worker activity) clears "unprocessed".
@@ -856,7 +980,7 @@ conn = sqlite3.connect(str(hub.REGISTRY))
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('ev2','drun','dtask','input_required','2026-01-01T00:05:00Z','{}')")
 conn.commit(); conn.close()
-_, delivered5, _, _ = hub._stall_task_signals(now=REG_NOW, threshold_s=REG_THRESH)
+_, delivered5, _, _ = _safe_signals4("sig_cleared", now=REG_NOW, threshold_s=REG_THRESH)
 results["delivered_cleared_once_the_worker_did_something"] = "dtask" not in delivered5
 
 # ---- review M-a: the boot floor persists across a restart --------------------
@@ -869,6 +993,25 @@ persisted = hub._stall_boot_epoch()
 results["Ma_boot_epoch_persists_across_a_restart"] = abs(persisted - hub._iso_epoch("2026-01-01T00:00:00Z")) < 1
 # A second call must not re-floor to "now" either (cached, not re-queried).
 results["Ma_boot_epoch_stays_cached_on_a_second_call"] = hub._stall_boot_epoch() == persisted
+
+# ---- review H1/M1 (r6): `_stall_request_claim` persists the FIRST-seen
+# epoch for a (task_id, fingerprint) pair, exactly once, against the REAL
+# registry -- `claim_fn`'s default in production (every test above stubs
+# it instead, since it must never touch Terrence's real registry).
+_claim_t1 = time.time() - 500
+claimed1 = hub._stall_request_claim("rtask", "cprompt:aaa", _claim_t1)
+results["H1r6_claim_persists_the_first_seen_epoch"] = abs(claimed1 - _claim_t1) < 2
+# A LATER call for the SAME (task, fingerprint), with a different `now`,
+# reads back the SAME epoch -- it never re-floors to the new `now`, the
+# exact property that keeps it immune to a later, unrelated prompt.
+claimed1_again = hub._stall_request_claim("rtask", "cprompt:aaa", time.time())
+results["H1r6_claim_is_idempotent_on_a_second_call"] = claimed1_again == claimed1
+# A DIFFERENT fingerprint for the SAME task gets its OWN, independent claim.
+_claim_t2 = time.time() - 100
+claimed2 = hub._stall_request_claim("rtask", "cprompt:bbb", _claim_t2)
+results["H1r6_claim_is_independent_per_fingerprint"] = (
+    abs(claimed2 - _claim_t2) < 2 and claimed2 != claimed1)
+
 
 # ---- review M-c(1): an escalated/unowned claim is resolved without an ack ---
 conn = sqlite3.connect(str(hub.REGISTRY))
