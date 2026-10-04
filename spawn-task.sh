@@ -12,7 +12,8 @@
 # the right job-class tier. This is the orchestrator's per-task hand:
 #
 #   spawn-task.sh ~/Code/myproject fix-parser implement           # claude flavor, sonnet, under omp
-#   spawn-task.sh ~/Code/myproject arch-review review codex       # codex flavor, deep model, under omp
+#   spawn-task.sh ~/Code/myproject pr-review review codex         # codex flavor, standard model high effort, under omp
+#   spawn-task.sh ~/Code/myproject arch-review deep-review codex  # codex flavor, deep model, under omp
 #   spawn-task.sh ~/Code/myproject fix-worker implement omp       # omp, sonnet
 #   spawn-task.sh ~/Code/myproject probe quick pwd                # literal cmd (no model)
 #
@@ -32,13 +33,19 @@
 #
 # job-class -> model (edit lib/agent-profiles.sh's model_for_agent; --model/
 # --effort override):
-#   plan|architect|review|design  -> claude opus   · codex $HERDR_CODEX_DEEP · omp opus:high
-#   implement|debug|code          -> claude sonnet · codex $HERDR_CODEX_STD  · omp sonnet:medium
-#   explore|quick|mechanical|docs -> claude haiku  · codex $HERDR_CODEX_FAST · omp haiku:low
+#   plan|architect|design|deep-review -> claude opus   · codex $HERDR_CODEX_DEEP · omp opus:high
+#   review                        -> claude sonnet:high · codex $HERDR_CODEX_STD's model at HIGH effort · omp sonnet:high
+#   implement|debug|code|docs     -> claude sonnet · codex $HERDR_CODEX_STD  · omp sonnet:medium
+#   explore|quick|mechanical      -> claude haiku  · codex $HERDR_CODEX_FAST · omp haiku:low
 # (Claude/omp tiers are model-name aliases omp fuzzy-matches; Codex model
 # names live in config.sh and are launched via omp's `openai-codex/<model>`
 # provider prefix. Known agents live in lib/agent-profiles.sh — add a new one
 # there, not in this file.)
+# Use `deep-review` instead of `review` when the diff touches auth, secrets,
+# money, external comms, deploy/CI/build, data deletion or migrations, or
+# concurrency/races (Terrence's decision 2026-10-04, form
+# 20261004T181727-8798, models=risk_based_default) — plan/architect/design
+# stay deep regardless; otherwise use `review`.
 #
 # herdr's native `worktree create` always makes a SEPARATE space; to get a sub-tab
 # we do `git worktree add` + `tab create --workspace <repo-ws>` ourselves. Each tab

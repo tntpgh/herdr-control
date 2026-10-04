@@ -84,9 +84,9 @@
 # Claude tiers use the standard aliases (opus/sonnet/haiku) and need no config.
 # Codex model names are yours — edit to match your Codex setup.
 # Format: "<model>:<reasoning-effort>".
-: "${HERDR_CODEX_DEEP:=gpt-5.6-sol:high}"     # plan / architect / review / design
-: "${HERDR_CODEX_STD:=gpt-5.5:medium}"        # implement / debug / code
-: "${HERDR_CODEX_FAST:=gpt-5.4-mini:low}"     # explore / quick / mechanical / docs
+: "${HERDR_CODEX_DEEP:=gpt-5.6-sol:high}"     # plan / architect / design / deep-review
+: "${HERDR_CODEX_STD:=gpt-5.5:medium}"        # implement / debug / code / review / docs
+: "${HERDR_CODEX_FAST:=gpt-5.4-mini:low}"     # explore / quick / mechanical
 
 # ---- shared state (smart-name.sh ownership/debounce, attention.sh stalls) ---
 # Where the tools remember what they've done. Removable at any time; the tools

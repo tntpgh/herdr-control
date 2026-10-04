@@ -151,6 +151,9 @@ check "explore gets no edit/eval/task, keeps write/ask/web_search, and (R3-1) it
 check "review keeps every tool (a reviewer may still edit or delegate)" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp opus:high '' review)" \
   "omp --model opus --thinking high --approval-mode write"
+check "deep-review keeps every tool too (same bucket as review/plan/design)" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp opus:high '' deep-review)" \
+  "omp --model opus --thinking high --approval-mode write"
 check "an unrecognised class fails OPEN to all tools (a missing tool breaks work, it never exposes anything)" \
   "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet '' no-such-class)" \
   "omp --model sonnet --approval-mode write"
@@ -187,7 +190,7 @@ check "implement (not write-restricted) is unaffected: still just the floor" \
   "omp --model sonnet --tools read,bash,edit,write,grep,glob,todo,eval,wait,ask --approval-mode write"
 
 printf '== model routing unchanged for every job class ==\n'
-for j in plan architect review design implement debug code explore quick mechanical docs weird; do
+for j in plan architect review deep-review design implement debug code explore quick mechanical docs weird; do
   for a in claude codex omp omc; do
     [ -n "$(model_for_agent "$a" "$j")" ] || bad "model_for_agent $a $j returned empty"
   done
@@ -201,7 +204,8 @@ check "claude implement -> sonnet"  "$(model_for_agent claude implement)" "sonne
 # ever since — a red suite nobody could read is worse than no suite.
 check "claude docs -> sonnet (judgment work, not fast)" \
                                     "$(model_for_agent claude docs)"      "sonnet"
-check "omp plan -> opus:high"       "$(model_for_agent omp plan)"         "opus:high"
+check "omp plan -> opus:high (unchanged — only review/deep-review moved tiers)" \
+                                    "$(model_for_agent omp plan)"         "opus:high"
 check "omp unknown job -> default"  "$(model_for_agent omp weird)"        "sonnet:medium"
 check "omc plan -> opus (rows were missing; launch built 'claude --model ')" \
                                     "$(model_for_agent omc plan)"         "opus"
@@ -209,6 +213,38 @@ check "omc implement -> sonnet"     "$(model_for_agent omc implement)"    "sonne
 check "omc docs -> sonnet"          "$(model_for_agent omc docs)"         "sonnet"
 check "omp docs -> sonnet:medium (the agent we actually run)" \
                                     "$(model_for_agent omp docs)"         "sonnet:medium"
+printf '== 2026-10-04 risk-based defaults (Terrence'"'"'s decision, form\n'
+printf '   20261004T181727-8798, models=risk_based_default): review runs the\n'
+printf '   standard model at HIGH effort; deep-review is the old flat-opus\n'
+printf '   mapping, reserved for auth/secrets/money/deploy/concurrency work ==\n'
+check "omp review -> sonnet:high (standard model, high effort — was opus:high on main)" \
+                                    "$(model_for_agent omp review)"      "sonnet:high"
+check "omp deep-review -> opus:high (new class; old flat review mapping)" \
+                                    "$(model_for_agent omp deep-review)" "opus:high"
+check "claude review -> sonnet:high (R1#1: every agent gets HIGH effort, not just omp)" \
+                                    "$(model_for_agent claude review)"   "sonnet:high"
+check "claude deep-review -> opus" "$(model_for_agent claude deep-review)" "opus"
+check "omc review -> sonnet:high (same fix applies to omc, which launches the real claude binary)" \
+                                    "$(model_for_agent omc review)"      "sonnet:high"
+check "omc deep-review -> opus"    "$(model_for_agent omc deep-review)" "opus"
+check "codex review -> \$HERDR_CODEX_STD's model at HIGH effort (R1#1: was \$HERDR_CODEX_STD's own medium effort)" \
+                                    "$(model_for_agent codex review)"      "${HERDR_CODEX_STD%%:*}:high"
+check "codex deep-review -> \$HERDR_CODEX_DEEP" \
+                                    "$(model_for_agent codex deep-review)" "$HERDR_CODEX_DEEP"
+printf '== R1#1 end-to-end: HIGH effort for review reaches the LAUNCHED command\n'
+printf '   line, not just model_for_agent'"'"'s own string (review finding #1) ==\n'
+check "claude review end-to-end: omp launch carries --thinking high" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent claude "$(model_for_agent claude review)" '' review)" \
+  "omp --model sonnet --thinking high --models sonnet,openai-codex/${HERDR_CODEX_STD%%:*} --approval-mode write"
+check "omc review end-to-end: claude launch carries --effort high" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omc "$(model_for_agent omc review)")" \
+  "claude --model sonnet --effort high --permission-mode acceptEdits"
+check "codex review end-to-end: omp launch carries --thinking high" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent codex "$(model_for_agent codex review)" '' review)" \
+  "omp --model openai-codex/${HERDR_CODEX_STD%%:*} --thinking high --models openai-codex/${HERDR_CODEX_STD%%:*},sonnet --approval-mode write"
+check "omp review end-to-end: --thinking high (unchanged — already correct pre-fix)" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp "$(model_for_agent omp review)" '' review)" \
+  "omp --model sonnet --thinking high --approval-mode write"
 
 # ============================================================================
 # Managed-launch regressions (2026-09-04): argv boundaries, bypass-flag
@@ -379,11 +415,16 @@ fi
 . "$here/lib/agent-profiles.sh"
 [ "$(secrets_default_for_job pr-review)" = withhold ] && ok "job-class match is substring (pr-review withheld)" || bad "pr-review fell through to grant"
 [ "$(secrets_default_for_job wat)" = withhold ] && ok "an unrecognised job class fails closed" || bad "unknown job class granted a credential"
+[ "$(secrets_default_for_job deep-review)" = withhold ] && ok "deep-review withholds secrets too ('review' substring still matches)" || bad "deep-review fell through to grant"
+[ "$(secrets_default_for_job deep-plan)" = withhold ] && ok "a deep-* class we did NOT add (deep-plan) still fails closed — KNOWN_JOB_CLASSES growing by one entry doesn't widen the match" || bad "deep-plan should fail closed but got granted"
 # Job-class defaults (lib/agent-profiles.sh `secrets_default_for_job`): the
 # safe choice made once per class instead of remembered at every spawn.
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 review omp 2>&1)
 printf '%s\n' "$out" | grep -q "secrets   : WITHHELD \[job class 'review'" \
   && ok "review class is withheld by default, and says why" || bad "review class got a credential: $out"
+out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 deep-review omp 2>&1)
+printf '%s\n' "$out" | grep -q "secrets   : WITHHELD \[job class 'deep-review'" \
+  && ok "deep-review class is withheld by default too" || bad "deep-review class got a credential: $out"
 out=$(env "${spawn_env[@]}" bash "$here/spawn-task.sh" --dry-run "$fleet/proj" t9 explore omp 2>&1)
 printf '%s\n' "$out" | grep -q 'secrets   : WITHHELD' \
   && ok "explore class is withheld by default" || bad "explore class got a credential: $out"
