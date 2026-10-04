@@ -106,8 +106,8 @@ def pane_for_thread(thread_ts):
 ALLOW = {u.strip() for u in os.environ.get("HERDR_BRIDGE_ALLOW_USERS", "").split(",") if u.strip()}
 CHANNEL = os.environ.get("HERDR_BRIDGE_CHANNEL", "").strip()
 # Checked FIRST in on_message and on_choice_button, before auth, routing or
-# say() -- a channel here (e.g. the zero-wake bell channel, publisher.py's
-# HERDR_ZERO_WAKE_CHANNEL) gets zero herdr calls and zero replies from this
+# say() -- a channel here (e.g. the zero-wake bell channel C0C6R1HLM0C;
+# its emitter is parked, unbuilt) gets zero herdr calls and zero replies from this
 # bridge, full stop. A malformed entry refuses to start rather than silently
 # not-ignoring a channel the operator meant to exclude.
 _IGNORE_CHANNEL_RE = re.compile(r"^[CGD][A-Z0-9]{8,}$")
