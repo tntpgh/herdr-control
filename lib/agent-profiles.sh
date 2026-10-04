@@ -148,7 +148,8 @@ model_for_agent() {
   case "$a:$j" in
     claude:deep-review)                                          printf 'opus\n' ;;
     claude:plan|claude:architect|claude:design)                  printf 'opus\n' ;;
-    claude:review|claude:implement|claude:debug|claude:code|claude:docs) printf 'sonnet\n' ;;
+    claude:review)                                               printf 'sonnet:high\n' ;;
+    claude:implement|claude:debug|claude:code|claude:docs)        printf 'sonnet\n' ;;
     claude:explore|claude:quick|claude:mechanical)               printf 'haiku\n' ;;
     claude:*)                                                   printf 'sonnet\n' ;;
     # omc launches the real claude binary (cli_for_agent below), so it uses
@@ -157,12 +158,14 @@ model_for_agent() {
     # `claude --model ` — a broken launch that looked routed but wasn't.
     omc:deep-review)                                             printf 'opus\n' ;;
     omc:plan|omc:architect|omc:design)                           printf 'opus\n' ;;
-    omc:review|omc:implement|omc:debug|omc:code|omc:docs)        printf 'sonnet\n' ;;
+    omc:review)                                                   printf 'sonnet:high\n' ;;
+    omc:implement|omc:debug|omc:code|omc:docs)                    printf 'sonnet\n' ;;
     omc:explore|omc:quick|omc:mechanical)                        printf 'haiku\n' ;;
     omc:*)                                                       printf 'sonnet\n' ;;
     codex:deep-review)                                            printf '%s\n' "$HERDR_CODEX_DEEP" ;;
     codex:plan|codex:architect|codex:design)                      printf '%s\n' "$HERDR_CODEX_DEEP" ;;
-    codex:review|codex:implement|codex:debug|codex:code|codex:docs) printf '%s\n' "$HERDR_CODEX_STD" ;;
+    codex:review)                                                  printf '%s:high\n' "${HERDR_CODEX_STD%%:*}" ;;
+    codex:implement|codex:debug|codex:code|codex:docs)             printf '%s\n' "$HERDR_CODEX_STD" ;;
     codex:explore|codex:quick|codex:mechanical)                   printf '%s\n' "$HERDR_CODEX_FAST" ;;
     codex:*)                                                      printf '%s\n' "$HERDR_CODEX_STD" ;;
     # omp's reasoning dial is --thinking (off/minimal/low/medium/high/xhigh/max).

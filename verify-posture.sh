@@ -221,13 +221,30 @@ check "omp review -> sonnet:high (standard model, high effort — was opus:high 
                                     "$(model_for_agent omp review)"      "sonnet:high"
 check "omp deep-review -> opus:high (new class; old flat review mapping)" \
                                     "$(model_for_agent omp deep-review)" "opus:high"
-check "claude review -> sonnet (joins the standard tier; was opus on main)" \
-                                    "$(model_for_agent claude review)"   "sonnet"
+check "claude review -> sonnet:high (R1#1: every agent gets HIGH effort, not just omp)" \
+                                    "$(model_for_agent claude review)"   "sonnet:high"
 check "claude deep-review -> opus" "$(model_for_agent claude deep-review)" "opus"
-check "codex review -> \$HERDR_CODEX_STD (was \$HERDR_CODEX_DEEP on main)" \
-                                    "$(model_for_agent codex review)"      "$HERDR_CODEX_STD"
+check "omc review -> sonnet:high (same fix applies to omc, which launches the real claude binary)" \
+                                    "$(model_for_agent omc review)"      "sonnet:high"
+check "omc deep-review -> opus"    "$(model_for_agent omc deep-review)" "opus"
+check "codex review -> \$HERDR_CODEX_STD's model at HIGH effort (R1#1: was \$HERDR_CODEX_STD's own medium effort)" \
+                                    "$(model_for_agent codex review)"      "${HERDR_CODEX_STD%%:*}:high"
 check "codex deep-review -> \$HERDR_CODEX_DEEP" \
                                     "$(model_for_agent codex deep-review)" "$HERDR_CODEX_DEEP"
+printf '== R1#1 end-to-end: HIGH effort for review reaches the LAUNCHED command\n'
+printf '   line, not just model_for_agent'"'"'s own string (review finding #1) ==\n'
+check "claude review end-to-end: omp launch carries --thinking high" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent claude "$(model_for_agent claude review)" '' review)" \
+  "omp --model sonnet --thinking high --models sonnet,openai-codex/${HERDR_CODEX_STD%%:*} --approval-mode write"
+check "omc review end-to-end: claude launch carries --effort high" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omc "$(model_for_agent omc review)")" \
+  "claude --model sonnet --effort high --permission-mode acceptEdits"
+check "codex review end-to-end: omp launch carries --thinking high" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent codex "$(model_for_agent codex review)" '' review)" \
+  "omp --model openai-codex/${HERDR_CODEX_STD%%:*} --thinking high --models openai-codex/${HERDR_CODEX_STD%%:*},sonnet --approval-mode write"
+check "omp review end-to-end: --thinking high (unchanged — already correct pre-fix)" \
+  "$(HERDR_POSTURE_FLOOR=write cli_for_agent omp "$(model_for_agent omp review)" '' review)" \
+  "omp --model sonnet --thinking high --approval-mode write"
 
 # ============================================================================
 # Managed-launch regressions (2026-09-04): argv boundaries, bypass-flag

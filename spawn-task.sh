@@ -34,9 +34,9 @@
 # job-class -> model (edit lib/agent-profiles.sh's model_for_agent; --model/
 # --effort override):
 #   plan|architect|design|deep-review -> claude opus   · codex $HERDR_CODEX_DEEP · omp opus:high
-#   review                        -> claude sonnet · codex $HERDR_CODEX_STD  · omp sonnet:high
-#   implement|debug|code          -> claude sonnet · codex $HERDR_CODEX_STD  · omp sonnet:medium
-#   explore|quick|mechanical|docs -> claude haiku  · codex $HERDR_CODEX_FAST · omp haiku:low
+#   review                        -> claude sonnet:high · codex $HERDR_CODEX_STD's model at HIGH effort · omp sonnet:high
+#   implement|debug|code|docs     -> claude sonnet · codex $HERDR_CODEX_STD  · omp sonnet:medium
+#   explore|quick|mechanical      -> claude haiku  · codex $HERDR_CODEX_FAST · omp haiku:low
 # (Claude/omp tiers are model-name aliases omp fuzzy-matches; Codex model
 # names live in config.sh and are launched via omp's `openai-codex/<model>`
 # provider prefix. Known agents live in lib/agent-profiles.sh — add a new one
