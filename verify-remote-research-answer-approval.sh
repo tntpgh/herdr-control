@@ -365,6 +365,11 @@ allow|echo x > tmp/scratch.txt
 allow|echo x > /tmp/f3-scratch-new
 allow|cat README.md
 allow|grep -rn foo . | head -5
+allow|git log --oneline -3
+allow|git diff HEAD -- src
+allow|find . -name '*.py' -type f
+allow|rg -n foo src | sort | head -20
+allow|mkdir -p tmp/work && echo x > tmp/work/notes.txt
 escalate|echo x > src/x.py
 escalate|echo x > .handoffs/OTHER.md
 escalate|echo x >> README.md
@@ -388,10 +393,18 @@ escalate|python3 -c 'open("src/p","w")'
 escalate|node -e 'require("fs").writeFileSync("src/n","x")'
 escalate|make
 escalate|echo x > ../outside
+escalate|tar -xf a.tar
+escalate|cc -o src/evil tmp/x.c
+escalate|timeout 5 cat README.md > src/a
+escalate|sed -n p README.md
+escalate|git -C src log
+escalate|git checkout -- README.md
+escalate|rg --pre ./tmp/x foo
+escalate|cp -l src/x tmp/hl
 EOF
-# find -exec / xargs / $VAR / script runs were already refused by
-# peer_decide before F3; they must stay refused.
-for c in 'find . -name a -exec cp {} src/b \;' 'echo src/z | xargs touch' 'echo x > "$OUT"' 'python3 tmp/probe.py'; do
+# These are refused by peer_decide before F3 runs (find -exec/-delete, xargs,
+# $VAR, unreviewable scripts, env -S credential rule); they must stay refused.
+for c in 'find . -name a -exec cp {} src/b \;' 'find . -name a -delete' 'echo src/z | xargs touch' 'echo x > "$OUT"' 'python3 tmp/probe.py' 'timeout 5 python3 tmp/p.py' "env -S \"python3 -c 'open(\\\"src/a\\\",\\\"w\\\")'\""; do
   out="$(enf bash "$(jq -nc --arg c "$c" '{command:$c}')")"; rc=$?
   [ "$rc" = 8 ] && ok "F3 still refused: $c" || not_ok "F3 expected refusal for [$c], got rc=$rc: $out"
 done
@@ -401,6 +414,37 @@ out="$(enf bash '{"command":"echo x > .handoffs/ANSWER.md"}')"; rc=$?
 [ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -q 'symlink' \
   && ok "F3: bash redirect into a symlinked ANSWER.md escalates" || not_ok "F3 symlinked ANSWER.md: rc=$rc: $out"
 rm -f "$wt/.handoffs/ANSWER.md"
+# Link planting through scratch or the deliverable (Zero review scope): every
+# allowed target is resolved on disk, never matched lexically.
+link_case() {                           # label command
+  local out rc
+  out="$(enf bash "$(jq -nc --arg c "$2" '{command:$c}')")"; rc=$?
+  [ "$rc" = 8 ] && printf '%s' "$out" | field reason | grep -qE 'symlink|hard link|restricts writes' \
+    && ok "F3 link: $1" || not_ok "F3 link [$1] expected escalation, got rc=$rc: $out"
+}
+printf 'tracked\n' > "$wt/src/victim"
+ln "$wt/src/victim" "$wt/.handoffs/ANSWER.md"
+link_case "ANSWER.md hard-linked to src/victim" 'echo x > .handoffs/ANSWER.md'
+rm -f "$wt/.handoffs/ANSWER.md"
+ln -s ../src/victim "$wt/tmp/sl"
+link_case "tmp/ file is a symlink into src/" 'echo x > tmp/sl'
+rm -f "$wt/tmp/sl"
+ln "$wt/src/victim" "$wt/tmp/hl"
+link_case "tmp/ file is a hard link to src/victim" 'echo x > tmp/hl'
+rm -f "$wt/tmp/hl"
+mv "$wt/tmp" "$wt/tmp.real"; ln -s src "$wt/tmp"
+link_case "tmp/ itself is a symlink to src/" 'echo x > tmp/new.txt'
+rm -f "$wt/tmp"; mv "$wt/tmp.real" "$wt/tmp"
+tlnk="$(mktemp -u /tmp/f3-hl.XXXXXX)"; ln "$wt/src/victim" "$tlnk"
+link_case "/tmp file is a hard link to src/victim" "echo x > $tlnk"
+rm -f "$tlnk"; ln -s "$wt/src/victim" "$tlnk"
+link_case "/tmp file is a symlink into the worktree" "echo x > $tlnk"
+rm -f "$tlnk"
+mv "$wt/.handoffs" "$wt/.handoffs.real"; ln -s src "$wt/.handoffs"
+link_case ".handoffs itself is a symlink to src/" 'echo x > .handoffs/ANSWER.md'
+rm -f "$wt/.handoffs"; mv "$wt/.handoffs.real" "$wt/.handoffs"
+[ "$(cat "$wt/src/victim")" = tracked ] && ok "F3 link: src/victim untouched (judging only, nothing ran)" || not_ok "src/victim changed"
+bash_case allow 'echo x > tmp/sub/new.txt'
 # A task WITHOUT handoffs_write is unchanged (in-worktree bash write allowed).
 register_task run1 task_impl worker1 cond1 "$CPANE" "$CBIRTH" "$PANE" "$BIRTH" /repo "$wt" impl:task_impl feat/y main "" '{}' hook >/dev/null
 set_task_state run1 task_impl running

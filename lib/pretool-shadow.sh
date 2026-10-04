@@ -302,24 +302,26 @@ _ps_plain_write_verdict() {
 # all auto-allowed anywhere inside the worktree for a research/explore task.
 # The outer hook (#184, workerWriteScopeBlock) only proves "inside the
 # worktree", never "is the deliverable". `_ps_bash_handoffs_verdict <cmd>
-# <cwd>` runs AFTER peer_decide said allow and can only tighten it:
-#   - every TARGET from the shared #184 parser (bash_write_targets — no
-#     second parser) must be exactly <wt>/.handoffs/<hw> (symlink-resolved,
-#     same check as the write tool) or scratch the outer hook already
-#     permits (<wt>/tmp/**, /tmp/**, /private/tmp/**);
-#   - COMPUTED/UNPARSED targets escalate (the parser's own contract);
-#   - any segment whose command word is an interpreter, shell, build/package
-#     runner, or awk escalates: the parser cannot see what a script or
-#     inline program writes (command-policy.sh's #184 ceiling), and a
-#     write-restricted task must not be able to route around that.
-# Ceiling: anything else that writes outside bash's own grammar (a binary
-# this list does not name) still relies on the outer hook's worktree
-# containment, exactly as before this rule.
-_PS_HW_RUNNERS='python python2 python3 pypy pypy3 node nodejs bun deno ruby perl php lua luajit osascript
-bash sh zsh dash ksh fish csh tcsh source . eval exec awk gawk mawk nawk make gmake npm npx pnpm yarn uv uvx pip pip3
-go cargo swift swiftc java tclsh expect'
+# <cwd> <hw>` runs AFTER peer_decide said allow and can only tighten it.
+# CLOSED WORLD (security review F3-1/2/4): the #184 parser is a denylist of
+# write-shaped verbs (command-policy.sh, "non-exhaustive"), so "no target
+# found" never meant "writes nothing" — `tar -xf a.tar`, `cc -o src/x`,
+# `env -S "python3 -c ..."` all named no target. For a task whose only
+# legitimate writes are its deliverable and scratch, every segment's command
+# word must instead be on _PS_HW_SAFE (reads, plus the few writers whose
+# every target the parser does extract), and then:
+#   - every TARGET must be exactly <wt>/.handoffs/<hw>, or untracked scratch
+#     under <wt>/tmp/ or /tmp/ — resolved ON DISK (realpath anchored on the
+#     trusted parent, no symlink or multiply-linked leaf), never lexically;
+#   - COMPUTED/UNPARSED, a parser failure, or a segment with no locatable
+#     command word (all launchers, e.g. `env -S ...`) escalates.
+# Anything else — interpreters, shells, compilers, archivers, package
+# runners, sed/awk, cp/mv/ln — escalates to the conductor. Reads stay allowed.
+_PS_HW_SAFE=' cat head tail wc ls grep egrep fgrep rg find echo printf tee cd pwd sort cut tr diff cmp
+ stat file basename dirname realpath readlink date true false test [ jq column nl comm fold expand
+ shasum sha256sum mkdir touch git '
 _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an allow
-  local cmd="$1" cwd="$2" hw="$3" wt wt_abs line kind val seg w real real_wt
+  local cmd="$1" cwd="$2" hw="$3" wt wt_abs line kind val seg root a targets
   wt="$(printf '%s' "$PS_TASK_JSON" | jq -r '.worktree // empty' 2>/dev/null)"
   if [ -z "$wt" ]; then
     PS_VERDICT=escalate PS_POLICY=handoffs-write PS_REASON="worker worktree unknown — cannot judge this task's bash write scope"; return
@@ -328,24 +330,41 @@ _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an
   [ -n "$cwd" ] || cwd="$wt_abs"
   while IFS= read -r seg; do
     [ -n "${seg//[[:space:]]/}" ] || continue
-    _cp_locate_command_word "$seg" || continue
-    w="${_cp_wcmd%%[0-9.]*}"; [ -n "$w" ] || w="$_cp_wcmd"
-    case " $(printf '%s' "$_PS_HW_RUNNERS" | tr '\n' ' ') " in
-      *" $_cp_wcmd "*|*" $w "*)
+    if ! _cp_locate_command_word "$seg"; then
+      PS_VERDICT=escalate PS_POLICY=handoffs-write
+      PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; a command segment has no command word this policy can identify — a conductor must review it"
+      return
+    fi
+    case "$_PS_HW_SAFE" in
+      *" $_cp_wcmd "*) ;;
+      *)
         PS_VERDICT=escalate PS_POLICY=handoffs-write
-        PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '$_cp_wcmd' runs code whose writes cannot be checked statically — a conductor must review it"
+        PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '$_cp_wcmd' is not on the read/scratch command list — a conductor must review it"
         return ;;
     esac
-    # A link AT the deliverable passes the realpath check while its target
-    # does not exist yet, then redirects every later write; a research task
-    # never needs to create one.
-    case "$_cp_wcmd" in
-      ln|link)
-        PS_VERDICT=escalate PS_POLICY=handoffs-write
-        PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; creating a link could redirect that file — a conductor must review it"
-        return ;;
-    esac
+    # find/git are reads only without their own writing/exec options.
+    for a in "${_CP_LOC[@]:1}"; do
+      case "$_cp_wcmd:$a" in
+        find:-exec*|find:-ok*|find:-delete|find:-fprint*|find:-fls|rg:--pre*|git:-o|git:--output*|git:-c|git:--exec-path*|git:-C)
+          PS_VERDICT=escalate PS_POLICY=handoffs-write
+          PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '$_cp_wcmd $a' can write or run code — a conductor must review it"
+          return ;;
+      esac
+    done
+    if [ "$_cp_wcmd" = git ]; then
+      case " ${_CP_LOC[1]:-} " in
+        " log "|" show "|" diff "|" status "|" grep "|" ls-files "|" rev-parse "|" blame "|" cat-file "|" ls-tree "|" describe "|" shortlog ") ;;
+        *)
+          PS_VERDICT=escalate PS_POLICY=handoffs-write
+          PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; 'git ${_CP_LOC[1]:-}' is not a read-only git verb — a conductor must review it"
+          return ;;
+      esac
+    fi
   done < <(_cp_walk_segments "$cmd")
+  # F3-5: capture the parser's output and status; a failure is never "no targets".
+  if ! targets="$(bash_write_targets "$cmd" "$cwd")"; then
+    PS_VERDICT=escalate PS_POLICY=handoffs-write PS_REASON="the bash write-target parser failed — a conductor must review it"; return
+  fi
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     kind="${line%%$'\t'*}" val="${line#*$'\t'}"
@@ -354,22 +373,58 @@ _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an
       PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; a write target cannot be read statically ($kind) — a conductor must review it"
       return
     fi
+    # Every allowed target is checked on disk, never lexically: its real
+    # (symlink-resolved) location must stay under the real root, and an
+    # existing leaf must be neither a symlink nor a multiply-linked file —
+    # `cp -s`/`cp -l`/an earlier plant into scratch must not turn a later
+    # redirect into a write somewhere else.
+    # mode: exact (the deliverable) | under (scratch). The anchor is the
+    # REAL path of a trusted directory plus a literal suffix, so a symlinked
+    # `.handoffs` or `tmp` (pointing into src/) can never become the root.
+    # /tmp itself is a system symlink to /private/tmp on macOS; trusted.
     case "$val" in
-      "$wt_abs/tmp/"*|/tmp/*|/private/tmp/*) continue ;;
-      "$wt_abs/.handoffs/$hw")
-        real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$val" 2>/dev/null)"
-        real_wt="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$wt" 2>/dev/null)"
-        if [ -z "$real" ] || [ -z "$real_wt" ] || [ "$real" != "$real_wt/.handoffs/$hw" ]; then
-          PS_VERDICT=escalate PS_POLICY=handoffs-write
-          PS_REASON="this task's one allowed .handoffs file is a symlink to somewhere else — remains human-only"
-          return
-        fi ;;
+      "$wt_abs/.handoffs/$hw") root="$wt|.handoffs/$hw|exact" ;;
+      "$wt_abs/tmp/"*) root="$wt|tmp|under" ;;
+      /tmp/*|/private/tmp/*) root="/tmp||under" ;;
       *)
         PS_VERDICT=escalate PS_POLICY=handoffs-write
         PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; this command writes ${val#"$wt_abs"/} — a conductor must review it"
         return ;;
     esac
-  done < <(bash_write_targets "$cmd" "$cwd")
+    if ! python3 - "$val" "$root" <<'PY' 2>/dev/null
+import os, stat, sys
+p = sys.argv[1]
+base, suffix, mode = sys.argv[2].split("|")
+anchor = os.path.realpath(base) + ("/" + suffix if suffix else "")
+rp = os.path.realpath(p)
+if mode == "exact":
+    if rp != anchor:
+        sys.exit(1)
+elif not rp.startswith(anchor + "/"):
+    sys.exit(1)
+try:
+    st = os.lstat(p)
+except FileNotFoundError:
+    sys.exit(0)
+if stat.S_ISLNK(st.st_mode) or (not stat.S_ISDIR(st.st_mode) and st.st_nlink != 1):
+    sys.exit(1)
+PY
+    then
+      PS_VERDICT=escalate PS_POLICY=handoffs-write
+      PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; ${val#"$wt_abs"/} is (or resolves through) a symlink or hard link — a conductor must review it"
+      return
+    fi
+    # Scratch is untracked by definition: a tracked file under tmp/ (some
+    # repos ship one) is a project file, not scratch.
+    case "$val" in
+      "$wt_abs/tmp/"*)
+        if git -C "$wt" ls-files --error-unmatch -- "${val#"$wt_abs"/}" >/dev/null 2>&1; then
+          PS_VERDICT=escalate PS_POLICY=handoffs-write
+          PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; ${val#"$wt_abs"/} is a tracked file, not scratch — a conductor must review it"
+          return
+        fi ;;
+    esac
+  done <<<"$targets"
 }
 
 pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8 not
