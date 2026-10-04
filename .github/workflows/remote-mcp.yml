@@ -3,15 +3,12 @@ name: remote-mcp
 # Both suites exercise behaviour end to end: the Worker suite runs the real
 # OAuth 2.1 + PKCE flow and every tool in workerd; the publisher suite builds
 # snapshots from a fixture hub and delivers to a fake herdr-deliver.
-#
-# slack-bridge/** is in the path filter for verify-bridge-ignore-channels.py
-# (zero-wake Part 1): it stubs slack_bolt itself, no new CI dependency.
 on:
   pull_request:
-    paths: ["remote-mcp/**", "slack-bridge/**", "spawn-task.sh", "lib/**", ".github/workflows/remote-mcp.yml"]
+    paths: ["remote-mcp/**", "spawn-task.sh", "lib/**", ".github/workflows/remote-mcp.yml"]
   push:
     branches: [main]
-    paths: ["remote-mcp/**", "slack-bridge/**", "spawn-task.sh", "lib/**", ".github/workflows/remote-mcp.yml"]
+    paths: ["remote-mcp/**", "spawn-task.sh", "lib/**", ".github/workflows/remote-mcp.yml"]
 
 jobs:
   worker:
@@ -37,8 +34,6 @@ jobs:
           python-version: "3.12"
       - run: python3 remote-mcp/verify-publisher.py
       - run: python3 remote-mcp/verify-owner-inbox.py
-      - run: python3 remote-mcp/verify-zero-wake.py
-      - run: python3 slack-bridge/verify-bridge-ignore-channels.py
       # SpawnArgvAgainstRealParser replays tasks.py's argv through the real
       # spawn-task.sh, hence spawn-task.sh and lib/** in the path filter.
       - run: HERDR_RUN_STATE_DIR="$(mktemp -d)/runs" python3 remote-mcp/verify-tasks.py

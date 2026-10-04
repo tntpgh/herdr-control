@@ -189,6 +189,45 @@ class Isolation(unittest.TestCase):
         self.assertTrue(b._argv_deliver.exists(), "an un-ignored DM must still deliver")
         self.assertEqual(len(say.calls), 1)
 
+class Authorization(unittest.TestCase):
+    """C1 (security review dce9f1f): on_message must still gate on
+    authorized() -- the ignore-channel check added for zero-wake must sit
+    BEFORE it, never REPLACE it. An unauthorized user's DM (no channel
+    restriction in play, HERDR_BRIDGE_CHANNEL unset per the design doc) must
+    produce zero deliveries and zero replies, exactly as it did before
+    HERDR_BRIDGE_IGNORE_CHANNELS existed. This fails against dce9f1f, where
+    on_message went ignore-check -> subtype/bot -> CHANNEL -> routing, with
+    no authorized() call at all."""
+    def test_unauthorized_user_dm_gets_zero_deliveries(self):
+        b = load_bridge(ignore_channels=IGNORED, channel="")
+        say = NoSay()
+        os.environ["FAKE_RC"] = "0"
+        b.on_message({"user": "UNOTALLOWED", "team": TEAM, "channel": "D0ADIRECTMSG", "text": "w1:p1 hi",
+                      "ts": "7.7"}, say, NoLogger(), {"team_id": TEAM})
+        self.assertFalse(b._argv_deliver.exists(), "an unauthorized user must never reach herdr-deliver")
+        self.assertEqual(say.calls, [])
+
+    def test_unauthorized_user_in_a_thread_under_an_alert_cannot_press_a_choice(self):
+        b = load_bridge(ignore_channels=IGNORED, channel="")
+        os.makedirs(b.STATE_DIR, exist_ok=True)
+        with open(b.REGISTRY, "a") as f:
+            f.write('{"ts": "1.1", "pane": "w1:p1", "prompt_id": "pid1"}\n')
+        say = NoSay()
+        b.on_message({"user": "UNOTALLOWED", "team": TEAM, "channel": "D0ADIRECTMSG", "text": "1",
+                      "ts": "8.8", "thread_ts": "1.1"}, say, NoLogger(), {"team_id": TEAM})
+        self.assertFalse(b._argv_select.exists(), "an unauthorized user must never reach herdr-select")
+        self.assertEqual(say.calls, [])
+
+    def test_unbound_team_fails_closed_even_for_an_allowlisted_id(self):
+        b = load_bridge(ignore_channels=IGNORED, channel="")
+        os.environ["HERDR_BRIDGE_TEAM"] = ""
+        b2 = load_bridge(ignore_channels=IGNORED, channel="")
+        say = NoSay()
+        b2.on_message({"user": ALLOWED_USER, "team": "T0SOMEOTHERTEAM", "channel": "D0ADIRECTMSG",
+                       "text": "w1:p1 hi", "ts": "9.9"}, say, NoLogger(), {"team_id": "T0SOMEOTHERTEAM"})
+        self.assertFalse(b2._argv_deliver.exists(), "an unbound team must refuse everything, not authorize on an unverifiable claim")
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -250,6 +250,12 @@ def on_message(event, say, logger, body):
     if event.get("channel") in IGNORE_CHANNELS:
         return
     if event.get("subtype") or event.get("bot_id"):
+        return  # edits/joins/bot echoes
+    # The workspace is checked BEFORE the id is trusted: same id, different team
+    # is a different human. Unattributable is refused, and logged at WARNING —
+    # a silent drop of a legitimate reply is indistinguishable from the bridge
+    # being down, and you would have no way to tell which.
+    if not authorized(event.get("user", ""), message_team(event, body), logger, "message"):
         return
     if CHANNEL and event.get("channel") != CHANNEL:
         return
@@ -365,5 +371,5 @@ def on_choice_button(ack, body, say, logger):
 
 if __name__ == "__main__":
     print(f"herdr bridge up — allowlist={sorted(ALLOW)} team={TEAM or 'ANY (unbound)'} "
-          f"channel={CHANNEL or 'any'} deliver={DELIVER}", flush=True)
+          f"channel={CHANNEL or 'any'} ignore={sorted(IGNORE_CHANNELS) or 'none'} deliver={DELIVER}", flush=True)
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
