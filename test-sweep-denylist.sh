@@ -81,6 +81,18 @@ check "find -delete"  'find . -name "*.tmp" -delete'  deny "$DENY_REVIEW"
 check "git rm (implement mode too)" "git $RM $F x"    deny "$DENY_IMPLEMENT"
 
 echo
+echo "== quoted, escaped and relative-path shapes (review r1 of #234) =="
+BS='\'
+check "bash -c double-quoted"  "bash -c \"$RM $RF /tmp/x\""  deny "$DENY_REVIEW"
+check "sh -c single-quoted"    "sh -c '$RM $F x'"            deny "$DENY_REVIEW"
+check "backslash-rm"           "$BS$RM $RF /tmp/x"           deny "$DENY_REVIEW"
+check "ANSI-C quoting"          "\$'$RM $RF /tmp/x'"         deny "$DENY_REVIEW"
+check "relative bin/ prefix"   "bin/$RM $F x"                deny "$DENY_REVIEW"
+check "./ prefix"               "./$RM $F x"                  deny "$DENY_REVIEW"
+check "quoted word, not command" "echo \"confirm it\""       allow "$DENY_REVIEW"
+check "docker --rm, quoted image" "docker run --rm \"img\"" allow "$DENY_REVIEW"
+
+echo
 echo "== words that merely CONTAIN rm stay ALLOWED (no false positives) =="
 check "npm run"           "npm run build"              allow "$DENY_REVIEW"
 check "perm"               "chmod 644 x # fix perm"    allow "$DENY_REVIEW"
