@@ -83,7 +83,7 @@ FAKE_DELIVER = fake_script("fake-deliver.sh", "FAKE_DELIVER_ARGV")
 FAKE_SELECT = fake_script("fake-select.sh", "FAKE_SELECT_ARGV")
 
 
-def load_bridge(ignore_channels: str = IGNORED, channel: str = ""):
+def load_bridge(ignore_channels: str = IGNORED, channel: str = "", team: str = TEAM):
     """Fresh module import with its own env, so successive tests (and the
     two revisions compared by tmp/'s old-vs-new proof) never share
     module-level state (ALLOW/CHANNEL/IGNORE_CHANNELS are computed at
@@ -93,7 +93,7 @@ def load_bridge(ignore_channels: str = IGNORED, channel: str = ""):
     argv_select.unlink(missing_ok=True)
     os.environ.update(
         SLACK_BOT_TOKEN="xoxb-fake", SLACK_APP_TOKEN="xapp-fake",
-        HERDR_BRIDGE_ALLOW_USERS=ALLOWED_USER, HERDR_BRIDGE_TEAM=TEAM,
+        HERDR_BRIDGE_ALLOW_USERS=ALLOWED_USER, HERDR_BRIDGE_TEAM=team,
         HERDR_BRIDGE_CHANNEL=channel, HERDR_BRIDGE_IGNORE_CHANNELS=ignore_channels,
         HERDR_DELIVER_BIN=str(FAKE_DELIVER), HERDR_SELECT_BIN=str(FAKE_SELECT),
         HERDR_BRIDGE_STATE=str(TMP / f"state-{len(list(TMP.glob('state-*')))}"),
@@ -219,13 +219,21 @@ class Authorization(unittest.TestCase):
         self.assertEqual(say.calls, [])
 
     def test_unbound_team_fails_closed_even_for_an_allowlisted_id(self):
-        b = load_bridge(ignore_channels=IGNORED, channel="")
-        os.environ["HERDR_BRIDGE_TEAM"] = ""
-        b2 = load_bridge(ignore_channels=IGNORED, channel="")
-        say = NoSay()
-        b2.on_message({"user": ALLOWED_USER, "team": "T0SOMEOTHERTEAM", "channel": "D0ADIRECTMSG",
-                       "text": "w1:p1 hi", "ts": "9.9"}, say, NoLogger(), {"team_id": "T0SOMEOTHERTEAM"})
-        self.assertFalse(b2._argv_deliver.exists(), "an unbound team must refuse everything, not authorize on an unverifiable claim")
+        # HERDR_BRIDGE_TEAM genuinely unset in the loaded module (R2-L1: the
+        # old version reset it inside load_bridge, so it only ever tested a
+        # wrong team). An allowlisted id claiming its own workspace must
+        # still be refused.
+        b = load_bridge(ignore_channels=IGNORED, channel="", team="")
+        self.assertEqual(b.TEAM, "", "the module under test must really be unbound")
+        b.on_message({"user": ALLOWED_USER, "team": TEAM, "channel": "D0ADIRECTMSG",
+                      "text": "w1:p1 hi", "ts": "9.9"}, NoSay(), NoLogger(), {"team_id": TEAM})
+        self.assertFalse(b._argv_deliver.exists(), "an unbound team must refuse everything, not authorize on an unverifiable claim")
+        # Control: the same message with the team bound IS delivered, so the
+        # refusal above is the team binding, not some other gate.
+        bound = load_bridge(ignore_channels=IGNORED, channel="", team=TEAM)
+        bound.on_message({"user": ALLOWED_USER, "team": TEAM, "channel": "D0ADIRECTMSG",
+                          "text": "w1:p1 hi", "ts": "9.9"}, NoSay(), NoLogger(), {"team_id": TEAM})
+        self.assertTrue(bound._argv_deliver.exists(), "control: a bound, matching team must deliver")
 
 
 

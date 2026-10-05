@@ -171,9 +171,16 @@ B="https://$HOST"
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 echo "PRM resource:          $(curl -s "$B/.well-known/oauth-protected-resource/mcp" | jq -r '.resource // "FAIL"')   (want $B/mcp)"
 echo "AS issuer / S256 / iss: $(curl -s "$B/.well-known/oauth-authorization-server" | jq -r '"\(.issuer) / \(.code_challenge_methods_supported|index("S256")!=null) / \(.authorization_response_iss_parameter_supported)"')"
-echo "AS scopes_supported:   $(curl -s "$B/.well-known/oauth-authorization-server" | jq -c '.scopes_supported')   (want [\"herdr:read\"] while messaging is off)"
-echo "/healthz:              $(curl -s "$B/healthz" | jq -c '{build_sha, messaging_enabled, scopes_offered}')"
-echo "                       (want build_sha $SHA, messaging_enabled false)"
+# The expectation comes from what this deploy actually shipped (wrangler.jsonc
+# MESSAGING_ENABLED), not a hard-coded "off" from before messaging went live.
+# Non-comment lines only, any spacing, any case; an absent key means the
+# Worker's own default (off). `|| true`: no match must not abort under set -e.
+WANT_MSG="$(grep -v '^[[:space:]]*//' "$WRANGLER_CFG" | grep -oiE '"MESSAGING_ENABLED"[[:space:]]*:[[:space:]]*"[a-z]+"' | tail -1 | cut -d'"' -f4 | tr 'A-Z' 'a-z' || true)"
+[ "$WANT_MSG" = true ] && WANT_MSG=true || WANT_MSG=false
+echo "AS scopes_supported:   $(curl -s "$B/.well-known/oauth-authorization-server" | jq -c '.scopes_supported')   (want [\"herdr:read\"] only when messaging is off; messaging_enabled=$WANT_MSG)"
+HZ="$(curl -s --max-time 15 "$B/healthz" || true)"   # a network failure is a MISMATCH, not an abort
+echo "/healthz:              $(printf '%s' "$HZ" | jq -c '{build_sha, messaging_enabled, scopes_offered}' 2>/dev/null || echo "<no JSON response>")"
+echo "                       (want build_sha $SHA, messaging_enabled $WANT_MSG): $(printf '%s' "$HZ" | jq -r --arg s "$SHA" --argjson m "$WANT_MSG" 'if .build_sha==$s and .messaging_enabled==$m then "OK" else "MISMATCH" end' 2>/dev/null | grep . || echo MISMATCH)"
 echo "live version:          $(npx wrangler deployments status 2>/dev/null | grep -E 'Version|Tag|Message' | tr -s ' ' | paste -sd ';' -)"
 echo "/mcp no token:         $(code -X POST "$B/mcp")   (want 401)"
 echo "/authorize no session: $(curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}' "$B/authorize" | cut -c1-80)   (want 302 -> $TEAM)"
