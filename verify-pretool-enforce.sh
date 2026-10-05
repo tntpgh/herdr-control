@@ -36,6 +36,7 @@ jq -nc --arg f "\$1" '{form_path:\$f, status:"open"}' > "$HERDR_STATE_ROOT/forms
 EOF
 chmod +x "$work/bin/"*
 export PATH="$work/bin:$PATH"
+export HERDR_EXTRA_PATH="$work/bin:${HERDR_EXTRA_PATH:-/opt/homebrew/bin:/usr/local/bin}"
 export HERDR_ACTION_SEND="$work/bin/send" HERDR_ACTION_NOTIFY="$work/bin/notify"
 export HERDR_ACTION_FORMSERVE="$work/bin/formserve" HERDR_ACTION_PYTHON=bash
 export HERDR_ACTION_NO_SURFACE=1       # surfacing is exercised explicitly below
@@ -143,6 +144,36 @@ printf '%s' "$out" | grep -q "DECLINED (conductor): use a narrower mode" && [ "$
   && ok "re-issue after decline: blocked with the reviewer's reason" || not_ok "decline: $out"
 [ "$(q "SELECT count(*) FROM action_requests WHERE command LIKE '%) $DEC';")" = 1 ] && ok "no new request after a decline" || not_ok "decline re-requested"
 grep -q "\[HERDR-ACTION\] $rid3 DECLINED" "$work/sent" && ok "worker told it was declined" || not_ok "decline not sent"
+
+printf '== supersede is non-granting, including code-by-reference requests ==\n'
+SUP='chmod -R u+rw tmp/superseded'
+srid="$(bashc "$SUP" | field request_id)"
+ssha="$(q "SELECT action_sha256 FROM action_requests WHERE request_id='$srid';")"
+HERDR_PANE_ID="$CPANE" act supersede "$srid" --authority conductor --action-sha256 "$ssha" --review-reason "worker moved on" >/dev/null; rc=$?
+[ "$rc" = 0 ] && [ "$(q "SELECT status FROM action_requests WHERE request_id='$srid';")" = superseded ] \
+  && ok "conductor explicitly cancels the pending bash request" || not_ok "bash supersede rc=$rc"
+for k in 1 2 3 4 5 6; do bashc "$SUP" "retry$k" > "$work/sup$k" & done; wait
+sid_new="$(cat "$work"/sup? | jq -r .request_id | sort -u)"
+[ -n "$sid_new" ] && [ "$sid_new" != "$srid" ] && [ "$(printf '%s\n' "$sid_new" | wc -l | tr -d ' ')" = 1 ] \
+  && [ "$(cat "$work"/sup? | jq -r .decision | sort -u)" = block ] \
+  && [ "$(q "SELECT status FROM action_requests WHERE request_id='$sid_new';")" = pending ] \
+  && ok "parallel identical reissues after supersede share one fresh pending request, none run" \
+  || not_ok "supersede parallel reissues: $sid_new"
+( . "$here/lib/action-request.sh"; action_grant_consume "$srid" ) \
+  && not_ok "superseded one-shot consumed" || ok "superseded one-shot cannot be consumed"
+printf '#!/bin/bash\nchmod -R u+rw tmp/sup-file\n' > "$wt/tmp/sup-file.sh"
+SUP_FILE="cd $wt && bash tmp/sup-file.sh"
+file_out="$(bashc "$SUP_FILE")"
+frid_sup="$(printf '%s' "$file_out" | field request_id)"
+[ -n "$frid_sup" ] && [ "$(q "SELECT grant_kind FROM action_requests WHERE request_id='$frid_sup';")" = file ] \
+  && ok "file cancellation setup escalates a resolved script as a file grant request" \
+  || not_ok "file cancellation setup did not create a file request: $file_out"
+fsha_sup="$(q "SELECT action_sha256 FROM action_requests WHERE request_id='$frid_sup';")"
+HERDR_PANE_ID="$CPANE" act supersede "$frid_sup" --authority conductor --action-sha256 "$fsha_sup" --review-reason "not needed" >/dev/null; rc=$?
+[ "$rc" = 0 ] && [ "$(q "SELECT count(*) FROM file_approvals;")" = 0 ] \
+  && [ "$(bashc "$SUP_FILE" | field decision)" = block ] \
+  && ok "superseding a file request records no persistent grant and reissue still blocks" \
+  || not_ok "file cancellation failed (rc=$rc, request=$frid_sup)"
 
 printf '== reserved: human only, through the hub form served for it ==\n'
 pin_form() {                             # request_id -> pinned formserve record id (tick serves, next tick pins)

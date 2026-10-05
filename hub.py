@@ -1245,7 +1245,9 @@ def portal_data() -> dict:
     if not cli.exists():
         return {"open": [], "open_count": 0, "error": f"{cli} not found"}
     try:
-        r = subprocess.run(["node", str(cli), "list", "--status", "open"], cwd=TOURGUIDE_DIR,
+        # launchd's PATH has no node (mise has no global node); tourguide's
+        # mise.toml pins it, so resolve through mise from that directory.
+        r = subprocess.run(["mise", "exec", "--", "node", str(cli), "list", "--status", "open"], cwd=TOURGUIDE_DIR,
                            capture_output=True, text=True, timeout=20)
         if r.returncode != 0:
             return {"open": [], "open_count": 0,
