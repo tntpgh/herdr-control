@@ -99,7 +99,7 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '8\n'; }
+_registry_schema_version() { printf '9\n'; }
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
@@ -268,6 +268,7 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   _migrate_schema_v6
   _migrate_schema_v7
   _migrate_schema_v8
+  _migrate_schema_v9
   _migrate_legacy_files
   return 0
 }
@@ -517,6 +518,31 @@ _migrate_schema_v8() {
   fi
 }
 
+# ---- schema v8 -> v9: add tasks.review_pr_repo / tasks.review_pr_number ----
+# (2026-10-05-worktree-archival-and-detached-close proposal). A detached-HEAD
+# reviewer worktree has no branch and no upstream, so close-done-workers.sh's
+# existing branch-based closability checks (around lines 171-208) have
+# nothing to evaluate. These two columns let the SPAWNING conductor name,
+# once and durably — same trust model as `manifest`: written by the
+# conductor via set_task_review_pr, never read from the worker-writable
+# identity.json — the GitHub PR a detached checkout exists to review, so
+# close-done-workers.sh's detached-close path can prove recoverability
+# against refs/pull/<N>/head instead of a branch that does not exist.
+# ALTER-guarded like v5/v7: additive, idempotent, safe to run again against
+# an already-migrated database.
+_migrate_schema_v9() {
+  local col
+  for col in \
+    "review_pr_repo   TEXT NOT NULL DEFAULT ''" \
+    "review_pr_number TEXT NOT NULL DEFAULT ''"; do
+    local name=${col%% *}
+    if [ -z "$(_sql "SELECT 1 FROM pragma_table_info('tasks') WHERE name='$name';" 2>/dev/null)" ]; then
+      _sql "ALTER TABLE tasks ADD COLUMN $col;" >/dev/null 2>&1
+    fi
+  done
+  _stamp_schema_version 9
+}
+
 # ---- one-time import of the pre-SQLite file layout --------------------------
 # A registry holding LIVE task state cannot simply be abandoned: dropping a
 # running worker's registration is not a clean slate, it silently disables
@@ -607,7 +633,7 @@ gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand
 # names whether it asked for one task or all of them.
 _task_json_select() {
   printf "%s" "SELECT json_object(
-    'schema', 7, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
+    'schema', 9, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
     'conductor_id', conductor_id, 'conductor_pane_id', conductor_pane_id,
     'conductor_pane_birth', conductor_pane_birth, 'pane_id', pane_id,
     'pane_birth', pane_birth, 'agent_session', agent_session, 'repo', repo,
@@ -615,6 +641,7 @@ _task_json_select() {
     'manifest', manifest, 'approval', approval,
     'remote_task_id', remote_task_id, 'deadline_at', deadline_at,
     'verified', (verified = 1), 'verify_detail', verify_detail,
+    'review_pr_repo', review_pr_repo, 'review_pr_number', review_pr_number,
     'label', label, 'state', state, 'created_at', created_at, 'updated_at', updated_at) FROM tasks"
 }
 
@@ -734,10 +761,18 @@ _legal_transition() {                   # from to -> 0 if allowed
 #
 # `handed_off_to:<x>` / `blocked_on:<x>` require a nonempty `<x>` — a bare
 # "handed_off_to:" names nobody.
-_valid_closure_reason() {               # reason -> 0 if one of the five
+#
+# `abandoned` / `superseded` (2026-10-05-worktree-archival-and-detached-close
+# proposal): the ONLY two reasons a detached-HEAD reviewer task whose PR
+# closed unmerged may use — close-done-workers.sh's detached path refuses
+# `shipped` there (nothing merged) and refuses every other reason too (a
+# dropped PR is not `no-follow-on`/`canceled` by default: the operator must
+# say explicitly which it was). Each still needs a checkable proof below,
+# same gate as `shipped`, just not a merged-PR claim.
+_valid_closure_reason() {               # reason -> 0 if one of the seven
   local reason="$1"
   case "$reason" in
-    shipped|canceled|no-follow-on) return 0 ;;
+    shipped|canceled|no-follow-on|abandoned|superseded) return 0 ;;
     handed_off_to:?*|blocked_on:?*) return 0 ;;
     *) return 1 ;;
   esac
@@ -920,21 +955,23 @@ set_task_state() {                      # run_id task_id state [reason] [proof]
     # call touches no row and appends no event.
     if [ "$state" = "completed" ]; then
       if ! _valid_closure_reason "$reason"; then
-        printf 'run-registry: refusing completed for %s/%s: closure reason missing/invalid (need shipped|handed_off_to:<x>|blocked_on:<x>|canceled|no-follow-on, got %s)\n' \
+        printf 'run-registry: refusing completed for %s/%s: closure reason missing/invalid (need shipped|handed_off_to:<x>|blocked_on:<x>|canceled|no-follow-on|abandoned|superseded, got %s)\n' \
           "$run_id" "$task_id" "${reason:-<empty>}" >&2
         return 1
       fi
-      if [ "$reason" = "shipped" ]; then
+      case "$reason" in
+        shipped|abandoned|superseded)
         local proof_wt=""
         case "$proof" in
           *PROOF.md*) proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null) ;;
         esac
         if ! _valid_proof_ref "$proof" "$proof_wt"; then
-          printf 'run-registry: refusing shipped completion for %s/%s: proof missing/invalid (need "<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)%s\n' \
-            "$run_id" "$task_id" "${_PROOF_REF_WHY:+: $_PROOF_REF_WHY}" >&2
+          printf 'run-registry: refusing %s completion for %s/%s: proof missing/invalid (need "<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)%s\n' \
+            "$reason" "$run_id" "$task_id" "${_PROOF_REF_WHY:+: $_PROOF_REF_WHY}" >&2
           return 1
         fi
-      fi
+        ;;
+      esac
     fi
 
     # The state change and its event land in ONE transaction, AND that
@@ -1041,6 +1078,33 @@ rebaseline_pane_birth() {
   append_event "$run_id" "$task_id" "pane_birth_rebaselined" \
     "$(jq -nc --arg old "$old_birth" --arg new "$new_birth" --arg reason "$reason" \
       '{old_pane_birth:$old, new_pane_birth:$new, reason:$reason}')" >/dev/null 2>&1
+}
+
+# set_task_review_pr <run_id> <task_id> <owner/repo> <pr_number>
+#
+# Names, once and durably, the GitHub PR a detached-HEAD reviewer worktree
+# exists to review (2026-10-05-worktree-archival-and-detached-close
+# proposal). Set by the SPAWNING conductor only — same trust model as
+# `manifest` (lib/task-manifest.sh): close-done-workers.sh's detached-close
+# path reads this back to know which refs/pull/<N>/head proves
+# recoverability, and a worker cannot widen or redirect that proof by
+# editing its own worktree. Write-once like set_task_remote_id/
+# set_task_agent_session: a review task is never re-pointed at a different
+# PR mid-flight, so a second call with a DIFFERENT value is refused rather
+# than silently overwriting what the detached-close check already trusted.
+# `owner/repo` must be exactly one `/`-separated pair of nonempty segments;
+# `pr_number` must be all digits — both validated here, not left to the
+# caller, since this is the one write path that can ever populate them.
+set_task_review_pr() {
+  local run_id="$1" task_id="$2" repo_slug="$3" pr_number="$4" changed
+  registry_init || return 1
+  case "$repo_slug" in */*/*|*/|/*|'') return 1 ;; */*) ;; *) return 1 ;; esac
+  case "$pr_number" in ''|*[!0-9]*) return 1 ;; esac
+  changed=$(_sql "UPDATE tasks SET review_pr_repo=$(_sq "$repo_slug"), review_pr_number=$(_sq "$pr_number")
+    WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id")
+      AND review_pr_repo='' AND review_pr_number='';
+    SELECT changes();" 2>/dev/null)
+  [ "$changed" = "1" ]
 }
 
 # set_task_remote_id <run_id> <task_id> <remote_task_id>
