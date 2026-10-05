@@ -1386,7 +1386,7 @@ class World:
 
     def read(self, pane, lines=60):
         v = self.panes.get(pane)
-        if not v or not v["alive"]:
+        if not v or not v["alive"] or v.get("unreadable"):    # R13e: birth-matched, every read empty
             return ""
         rows = (self._rows(pane) + [BOX_TOP, BOX_MID, BOX_BOT])[-lines:]
         return "\n".join(rows) + "\n"
@@ -1687,33 +1687,53 @@ def _():
 
 @scen("R9")
 def _():
-    fx = {n: HERE / "tests" / "fixtures" / f"omp-{n}.txt" for n in ("46-a", "46-b", "120-a", "120-b")}
+    # Live omp captures, taken read-only by the conductor from this PR's own
+    # fix worker (2026-10-05). herdr never resizes a background tab's PTY, so
+    # every capture is at the pane's native 153 columns, not the design's
+    # 46/120; narrow-width wrapping stays covered by R14/R17. Two request
+    # turns, each unanswered (with its `※` recap rendered) and then after a
+    # delivered one-paragraph answer, each in three herdr reads.
+    states = {"a": "a-unanswered", "b": "b-answered", "c": "c-turn2-unanswered", "d": "d-turn2-answered"}
+    reads = ("recent", "recent-unwrapped", "visible")
+    fx = {(s, v): HERE / "tests" / "fixtures" / f"omp-w153-{n}-{v}.txt" for s, n in states.items() for v in reads}
     missing = [str(p.relative_to(HERE)) for p in fx.values() if not p.exists()]
+    check("R9_live_fixtures_present", not missing)
     if missing:
-        print(f"  SKIP  R9: live fixtures not captured yet ({', '.join(missing)})", file=sys.stderr)
+        print(f"--- R9: missing live fixtures {missing}", file=sys.stderr)
         return
     cp = World("r9probe").hub._cp
-    text = {n: p.read_text() for n, p in fx.items()}
-    req = {n: cp.last_request(s) for n, s in text.items()}
-    one_f = all(req.values()) and len({r["fp"] for r in req.values()}) == 1
-    check("R9_live_fixtures_parse_to_one_request_F", one_f)
-    if not one_f:
-        return
-    for wd in ("46", "120"):
-        check(f"R9_P_after_a_one_paragraph_answer_exceeds_P_before_at_{wd}_cols",
-              req[f"{wd}-b"]["tail"] > req[f"{wd}-a"]["tail"])
-    for mode in ("i", "ii"):
-        w, t = std(f"r9{mode}")
-        w.run_to(BASE + 118); w.show(t, [("t", cp.agent_output_lines(text["46-a"]))], width=10 ** 6)
-        if mode == "i":
-            w.run_to(BASE + 221); w.reply(t)
-        w.run_to(BASE + 226); w.show(t, [("t", cp.agent_output_lines(text["46-b"]))], width=10 ** 6)
-        w.run_to(FS + 2400)
-        if mode == "i":
-            check("R9_i_answered_live_fixture_pair_mints_no_g2", w.silent(t) and w.gens(t) == {1}, w, t)
-        else:
-            check("R9_ii_unanswered_live_fixture_pair_is_one_occurrence_waking_at_first_seen_plus_600",
-                  w.gens(t) == {1} and w.woke(t, 1, fs=FS), w, t)
+    text = {k: p.read_text() for k, p in fx.items()}
+    req = {k: cp.last_request(s) for k, s in text.items()}
+    turns = (("1", "a", "b", "CONDUCTOR: R9 fixture turn 1 \u2014 please answer with one paragraph.",
+              "Spec read; turn 1 is a fixture-capture turn, so doing nothing else."),
+             ("2", "c", "d", "CONDUCTOR: R9 fixture turn 2 \u2014 please answer with one paragraph.",
+              "Answer received; ending turn 2 as the brief specifies."))
+    for turn, ua, an, line, above in turns:
+        f, c = cp.fingerprint(line), sha16(re.sub(r"\s+", "", above))
+        fc = all(req[(s, v)] and req[(s, v)]["fp"] == f and req[(s, v)]["ctx"] == c
+                 for s in (ua, an) for v in reads)
+        check(f"R9_turn{turn}_every_read_of_both_captures_resolves_to_the_same_F_and_readable_C", fc)
+        if not fc:
+            print(f"--- R9 turn {turn}: {[(s, v, req[(s, v)]) for s in (ua, an) for v in reads]}", file=sys.stderr)
+            continue
+        p = {s: {req[(s, v)]["tail"] for v in reads} for s in (ua, an)}
+        rises = p[ua] == {0} and len(p[an]) == 1 and min(p[an]) > 0      # the §1 rule-3 premise
+        check(f"R9_turn{turn}_P_is_0_with_the_recap_rendered_and_rises_after_a_one_paragraph_answer_at_153_cols", rises)
+        if not rises:
+            print(f"--- R9 turn {turn}: P = {p}", file=sys.stderr)
+        for mode in ("i", "ii"):
+            w, t = std(f"r9_{turn}{mode}")
+            w.run_to(BASE + 118); w.show(t, [("t", cp.agent_output_lines(text[(ua, "recent")]))], width=10 ** 6)
+            if mode == "i":
+                w.run_to(BASE + 221); w.reply(t)
+            w.run_to(BASE + 226); w.show(t, [("t", cp.agent_output_lines(text[(an, "recent")]))], width=10 ** 6)
+            w.run_to(FS + 2400)
+            if mode == "i":
+                check(f"R9_i_turn{turn}_answered_live_capture_pair_mints_no_g2",
+                      w.silent(t) and w.gens(t) == {1} and any(g == 1 for g, _ in w.floors(t)), w, t)
+            else:
+                check(f"R9_ii_turn{turn}_unanswered_live_capture_pair_is_one_occurrence_waking_at_first_seen_plus_600",
+                      w.gens(t) == {1} and w.woke(t, 1, fs=FS), w, t)
 
 @scen("R10")
 def _():
@@ -1806,6 +1826,23 @@ def _():
     check("R13d_the_retry_tick_seeds_only_the_unconfirmed_task_and_A_new_F_wakes_at_first_seen_plus_600",
           len(sa) == 1 and sa[0][1] == BASE and len(sb) == 1 and sb[0][1] == BASE + 15
           and w.woke(ta, 1, fs=BASE + 15) and w.silent(tb), w, ta)
+    # (e) one birth-matched pane reads empty on every tick: the seed gives up
+    # past 60s, visibly, so a task registered later is never seeded (r3 L2).
+    w = World("r13e")
+    ta = w.add_task("a")
+    w.show(ta, ask())
+    w.panes[w.tasks[ta]["pane"]]["unreadable"] = True
+    w.run_to(BASE + 60)
+    marker = lambda: w.q("SELECT payload FROM events WHERE event_id='stall_watchdog_epoch_cprompt_seeded'")
+    open_at_60 = not marker()
+    w.run_to(BASE + 75)
+    mk = marker()
+    gave_up = open_at_60 and bool(mk) and jload(mk[0][0]).get("complete") is False and bool(w.lasterr.get(BASE + 75))
+    w.run_to(BASE + 118)
+    tb = w.add_task("b"); w.show(tb, ask(ctx=CTX_C, req=REQ_B))
+    w.run_to(FS + THRESH + 60)
+    check("R13e_an_unreadable_pane_ends_the_seed_at_60s_visibly_and_a_task_registered_later_wakes_at_first_seen_plus_600",
+          gave_up and not w.rows(tb, "stall_request_seed") and w.woke(tb, 1, fs=FS), w, tb)
 
 @scen("R14")
 def _():
@@ -1898,6 +1935,21 @@ def _():
     check("R19_ii_last_approval_60m_before_the_ask_first_wake_is_first_seen_plus_600_not_15s",
           first == FS + THRESH and w.woke(t, 1), w, t)
 
+@scen("R19c")
+def _():
+    # since > first_seen on an UNANSWERED occurrence: approved work after the
+    # ask moves updated_at, and the clock is max(since, first_seen) (r1 H2).
+    w, t = std("r19c")
+    w.run_to(BASE + 118); w.show(t, ask())
+    w.run_to(BASE + 395); w.edge(t, "blocked")
+    w.run_to(BASE + 400); w.approval(t); w.edge(t, "running")
+    w.run_to(BASE + 400 + THRESH + 60)
+    since = epoch(w.q("SELECT updated_at FROM tasks WHERE task_id=?", (t,))[0][0])
+    first = min([a for _, a, _ in w.cp_events(t)] + [c[0] for c in w.cands_for(t)], default=None)
+    check("R19c_approved_work_after_the_ask_restarts_the_unanswered_clock_at_since_not_first_seen",
+          w.first_seen(t, 1) == FS and since == BASE + 400 and first is not None
+          and since + THRESH <= first < since + THRESH + TICK and w.woke(t, 1, fs=since), w, t)
+
 @scen("R20")
 def _():
     w, t = predeploy_answered("r20", cond_alive=False)
@@ -1936,6 +1988,22 @@ def _():
     since = epoch(w.q("SELECT updated_at FROM tasks WHERE task_id=?", (t,))[0][0])
     check("R20d_a_task_idle_since_before_the_223_boot_wakes_on_a_new_F_after_the_cprompt_deploy",
           since < BASE - 2000 and w.woke(t, 1), w, t)
+
+@scen("R20e")
+def _():
+    # §6 seeds in ANY non-terminal state: a task `running` at deploy, idling
+    # later with its pre-deploy-answered line still visible.
+    w = World("r20e", start=BASE - 4000)
+    t = w.add_task("a", state="running")
+    w.run_to(BASE - 3000); w.show(t, ask())
+    w.run_to(BASE - 2900); w.old_delivery(t)
+    w.run_to(BASE - 2890); w.show(t, ask(A1, A2))
+    w.run_to(BASE + 300)
+    w.tasks[t]["state"] = "stalled"              # derived idle; the registry row does not move
+    w.run_to(BASE + 300 + 2400)
+    seeds = [p for _, _, p, _ in w.rows(t, "stall_request_seed") if p.get("fp")]
+    check("R20e_a_task_running_at_deploy_is_seeded_and_idling_later_on_its_answered_line_is_silent",
+          len(seeds) == 1 and not w.claims(t) and w.silent(t), w, t)
 
 @scen("R21")
 def _():
@@ -2016,6 +2084,20 @@ def _():
     w.run_to(BASE + 855 + THRESH + 30)
     check("R23f_ack_then_output_then_a_same_F_C_reask_with_P_equal_pre_claims_g2_and_wakes",
           2 in w.gens(t) and w.woke(t, 2), w, t)
+
+@scen("R23g")
+def _():
+    # The debounce runs from the LATEST answering row (§3): ack at +800 retires
+    # g1, a captured reply lands at +821 (more than 20s after the ack, before
+    # any floor), and the +825 tick still shows P == pre. Ack at +800 with the
+    # reply at +900 would not test it: the +825 sighting floors post := pre.
+    w, t = typed_then_woken("r23g", below=())
+    w.run_to(BASE + 800); w.ack(t)
+    w.run_to(BASE + 821); w.reply(t)
+    w.run_to(BASE + 830); w.show(t, ask(A1))
+    w.run_to(BASE + 821 + 2400)
+    check("R23g_ack_then_a_captured_reply_debounces_from_the_reply_so_P_equal_pre_mints_no_g2",
+          w.woke(t, 1) and len(w.wakes(t)) == 1 and w.gens(t) == {1} and w.silent(t, after=BASE + 800), w, t)
 
 @scen("R24")
 def _():
@@ -2102,6 +2184,40 @@ def _():
     wk = [e for e in w.cp_events(t) if e[0] == "stall_wake"]
     check("R28_A_rewritten_after_B_was_captured_wakes_once_at_the_new_first_seen_plus_600",
           len(wk) == 1 and wk[0][2] == 2 and w.woke(t, 2, fs=BASE + 405), w, t)
+
+@scen("R28b")
+def _():
+    # R28, but the rewritten A (new C) is answered by capture BEFORE any tick
+    # sights it: the capture opens n+1, it does not answer A's superseded g1.
+    w, t = std("r28b")
+    w.run_to(BASE + 118); w.show(t, ask())
+    w.run_to(BASE + 200); w.show(t, ask(A1, A2))                                     # A typed-answered
+    w.run_to(BASE + 298); w.show(t, ask(A1, A2, CTX_C, REQ_B))
+    w.run_to(BASE + 361); w.reply(t)                                                 # captures B
+    w.run_to(BASE + 366); w.show(t, ask(A1, A2, CTX_C, REQ_B, A3))
+    w.run_to(BASE + 398); w.show(t, ask(A1, A2, CTX_C, REQ_B, A3, CTX_B, REQ_A))    # A rewritten, new C
+    w.run_to(BASE + 401); w.reply(t)                                                 # captures rewritten A
+    w.run_to(BASE + 403); w.show(t, ask(A1, A2, CTX_C, REQ_B, A3, CTX_B, REQ_A, A4))
+    w.run_to(BASE + 405 + 2400)
+    check("R28b_the_rewritten_A_answered_by_capture_is_silent_with_no_g2",
+          w.silent(t) and w.gens(t) == {1}, w, t)
+
+@scen("R28c")
+def _():
+    # R28 where B is only ever CAPTURED (never claimed): a capture supersedes
+    # like a claim, so rewritten A opens g2 instead of adopting g1's clock.
+    w, t = std("r28c")
+    w.run_to(BASE + 118); w.show(t, ask())
+    w.run_to(BASE + 200); w.show(t, ask(A1, A2))                                     # A typed-answered
+    w.run_to(BASE + 286); w.show(t, ask(A1, A2, CTX_C, REQ_B))
+    w.run_to(BASE + 291); w.reply(t)                                                 # captures B before the +300 tick
+    w.run_to(BASE + 293); w.show(t, ask(A1, A2, CTX_C, REQ_B, A3))
+    w.run_to(BASE + 398); w.show(t, ask(A1, A2, CTX_C, REQ_B, A3, CTX_A, REQ_A))    # A rewritten
+    w.run_to(BASE + 405 + 2400)
+    wk = [e for e in w.cp_events(t) if e[0] == "stall_wake"]
+    check("R28c_a_capture_alone_supersedes_so_rewritten_A_wakes_once_at_the_new_first_seen_plus_600",
+          sorted(g for g, _, _ in w.claims(t)) == [1, 2] and len(wk) == 1 and wk[0][2] == 2
+          and w.woke(t, 2, fs=BASE + 405), w, t)
 
 @scen("R29")
 def _():
