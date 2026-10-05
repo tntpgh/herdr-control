@@ -256,6 +256,7 @@ _read_panes() {
 _REG_OUT=""; _REG_ERR=""
 _reg_ro() {
   local sql="$1" errfile rc tries=0 max="${HERDR_REGISTRY_BUSY_RETRIES:-1}"
+  case "$max" in ''|*[!0-9]*) max=1 ;; esac
   _REG_OUT=""; _REG_ERR=""
   errfile=$(mktemp 2>/dev/null) || { _REG_ERR="could not create a scratch file for sqlite3's stderr"; return 1; }
   while :; do

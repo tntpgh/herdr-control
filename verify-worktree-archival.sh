@@ -1105,6 +1105,98 @@ row "$out" "$W" | grep -qi 'locked' \
   && ok "T3: sqlite3's real error (database is locked) is visible in the HOLD reason" || bad "T3: no visible cause: $(row "$out" "$W")"
 present "T3" "$W"
 
+printf '== T4: an archived symlink replaced by a regular file before the pre-remove recheck REFUSEs (MED) ==\n'
+GH_PRS="$GH_PRS
+probe/t4#74 t4-merged MERGED 7474747474747474747474747474747474747474"
+R="$T_TMP/t4"; mkrepo "$R" probe/t4
+printf 'lnk4\n' >> "$R/.gitignore"
+G -C "$R" add .gitignore && G -C "$R" commit -q -m "ignore lnk4"
+G -C "$R" push -q origin main
+OUT4="$T_TMP/t4-out"; mkdir -p "$OUT4"
+W="$WTROOT/t4-merged"; mkwt "$R" t4-merged "$W"
+ln -s "$OUT4" "$W/lnk4"
+# A dedicated git wrapper, scoped to this one call via PATH, swaps the
+# symlink for a regular file with new content exactly when `git bundle
+# create` runs — between archive_copy_and_manifest's first verify (which
+# still sees the intact symlink) and the pre-remove recheck's second one.
+T4_BIN="$T_TMP/t4bin"; mkdir -p "$T4_BIN"
+cat > "$T4_BIN/git" <<EOF
+#!/bin/bash
+case " \$* " in
+  *" bundle create "*) rm -f "$W/lnk4"; printf 'NEW UNARCHIVED WORK\n' > "$W/lnk4" ;;
+esac
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$T4_BIN/git"
+out=$(PATH="$T4_BIN:$PATH" AW --apply "$R")
+row "$out" "$W" | grep -q 'REFUSED.*no longer a symlink' \
+  && ok "T4: a symlink swapped for a file before the recheck REFUSEs the remove" || bad "T4 output: $out"
+present "T4" "$W"
+[ -f "$W/lnk4" ] && [ ! -L "$W/lnk4" ] && [ "$(cat "$W/lnk4")" = "NEW UNARCHIVED WORK" ] \
+  && ok "T4: the unarchived replacement content was never lost (worktree not removed)" || bad "T4: lnk4 wrong/missing"
+
+printf '== T5: a tracked dir replaced by a symlink never writes through it (LOW) ==\n'
+# Direct against lib/worktree-archive.sh (same approach as review r1's own
+# probe238.sh P7): archive-worktrees.sh's own archive_need_kb HOLDs this
+# exact fixture first ("could not size the archive copy/bundle" — `du`
+# cannot stat the vanished a/sub/b), which is correct fail-closed behavior
+# but means the top-level script never reaches archive_copy_and_manifest
+# here. The library function is what review r1 LOW actually fixed.
+T5_TMP="$T_TMP/t5"; mkdir -p "$T5_TMP"
+T5_WT="$T5_TMP/wt"; G init -q -b main "$T5_WT"
+mkdir -p "$T5_WT/a/sub"; printf 'x\n' > "$T5_WT/a/sub/b"
+G -C "$T5_WT" add a && G -C "$T5_WT" commit -q -m t
+OUT5="$T5_TMP/out"; mkdir -p "$OUT5"; printf 'keep\n' > "$OUT5/keep.txt"
+rm -r "$T5_WT/a"; ln -s "$OUT5" "$T5_WT/a"
+(
+  . "$here/lib/worktree-archive.sh"
+  d="$T5_TMP/arch"; mkdir -p "$d"
+  archive_copy_and_manifest "$T5_WT" "$d" "$(printf 'a\na/sub/b\n')"
+  printf 'T5: copy rc=%s why=%s\n' "$?" "$_ARCHIVE_WHY"
+) > "$T_TMP/t5.out" 2>&1
+grep -q 'why=path beneath a symlink: a/sub/b' "$T_TMP/t5.out" \
+  && ok "T5: a path beneath an already-archived symlink is refused before any mkdir" || bad "T5 output: $(cat "$T_TMP/t5.out")"
+[ "$(find "$OUT5" -mindepth 1 | wc -l | tr -d ' ')" = 1 ] && [ -f "$OUT5/keep.txt" ] \
+  && ok "T5: the symlink target directory is untouched (nothing written through it)" \
+  || bad "T5: target modified: $(find "$OUT5" 2>&1)"
+
+printf '== T6: HERDR_REGISTRY_BUSY_RETRIES=abc still HOLDs within bounded time, never hangs (LOW) ==\n'
+R="$T_TMP/t6"; mkrepo "$R" probe/t6; W="$WTROOT/t6-live"; mkwt "$R" t6-live "$W"
+T6_RUNS="$T_TMP/t6-runs"; mkdir -p "$T6_RUNS"
+HERDR_RUN_STATE_DIR="$T6_RUNS" bash -c '
+  . "$1/lib/run-registry.sh"
+  registry_init && register_task runT6 taskT6 w c cp cb pT6 bT6 "$2" "$3" t6-live
+' _ "$here" "$R" "$W" >/dev/null || bad "T6: could not seed the scratch registry"
+T6_DB="$T6_RUNS/registry.sqlite3"
+LOCKFIFO6="$T_TMP/t6.fifo"; mkfifo "$LOCKFIFO6"
+# Same real EXCLUSIVE-lock writer as T3. Unlike T3, this run's retries value
+# is invalid — `[ 0 -ge abc ]` errors (rc=2) rather than comparing, so the
+# unfixed cap never trips and _reg_ro spins until the writer releases; the
+# 10s `timeout` turns that hang into a visible FAIL instead of wedging the
+# whole suite when run against the pre-fix baseline.
+(
+  sqlite3 "$T6_DB" > "$T_TMP/t6-writer.out" 2>&1 <<SQL
+PRAGMA locking_mode=EXCLUSIVE;
+BEGIN IMMEDIATE;
+UPDATE tasks SET updated_at = updated_at;
+.shell cat "$LOCKFIFO6" >/dev/null
+COMMIT;
+SQL
+) &
+t6_writer=$!
+sleep 0.4
+out=$(timeout 10 env HERDR_RUN_STATE_DIR="$T6_RUNS" HERDR_REGISTRY_BUSY_MS=200 HERDR_REGISTRY_BUSY_RETRIES=abc \
+  bash "$here/archive-worktrees.sh" --apply "$R" 2>&1)
+rc=$?
+echo stop > "$LOCKFIFO6"
+wait "$t6_writer" 2>/dev/null
+[ "$rc" -ne 124 ] && ok "T6: a non-numeric retries value no longer spins forever (terminated, rc=$rc)" \
+  || bad "T6: still spinning past 10s with HERDR_REGISTRY_BUSY_RETRIES=abc (cap never trips)"
+row "$out" "$W" | grep -q HOLD && row "$out" "$W" | grep -qi 'liveness cannot be verified' \
+  && ok "T6: it still HOLDs (fail-closed), falling back to the default retry cap" || bad "T6 output: $out"
+present "T6" "$W"
+
+
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

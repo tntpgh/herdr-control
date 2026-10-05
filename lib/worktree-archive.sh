@@ -109,7 +109,7 @@ archive_enumerate_tracked_dirty() {     # <worktree> -> tracked files differing 
 # caller to inspect or discard — it is never reported as a valid manifest.
 # Call it directly, never as `$(archive_copy_and_manifest …)` (see header).
 archive_copy_and_manifest() {
-  local wt="$1" dest="$2" files="$3" rel src dst sha sz manifest
+  local wt="$1" dest="$2" files="$3" rel src dst sha sz manifest target anc
   _ARCHIVE_WHY=""; _ARCHIVE_MANIFEST=""
   manifest="$dest/MANIFEST.sha256"
   if ! mkdir -p "$dest/files" 2>/dev/null; then
@@ -124,6 +124,19 @@ archive_copy_and_manifest() {
     [ -n "$rel" ] || continue
     src="$wt/$rel"
     dst="$dest/files/$rel"
+    # Never write through an already-archived symlink (review r1 LOW): a
+    # tracked dir replaced by a symlink sorts before its own descendants
+    # ("a" before "a/sub/b"), so by the time a descendant's mkdir -p runs,
+    # $wt/a is itself a symlink and mkdir -p follows it into whatever it
+    # targets, creating real directories there. Refuse before any mkdir.
+    anc="$rel"
+    while case "$anc" in */*) true ;; *) false ;; esac; do
+      anc="${anc%/*}"
+      if [ -L "$wt/$anc" ]; then
+        _ARCHIVE_WHY="path beneath a symlink: $rel"
+        return 1
+      fi
+    done
     if ! mkdir -p "$(dirname "$dst")" 2>/dev/null; then
       _ARCHIVE_WHY="could not create directory for $rel"
       return 1
@@ -218,6 +231,12 @@ archive_verify_manifest() {
           _ARCHIVE_WHY="live source no longer matches its manifest target (changed since archiving): $rel"
           return 1
         fi
+      elif [ -e "$wt/$rel" ]; then
+        # Replaced by a regular file (or dir) between the copy and this
+        # recheck: same PATH, so the file-list comparison never catches
+        # it — only this type check does (review r1 MED).
+        _ARCHIVE_WHY="live source is no longer a symlink: $rel"
+        return 1
       fi
       continue
     fi
