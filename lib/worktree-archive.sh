@@ -132,7 +132,10 @@ archive_copy_and_manifest() {
     anc="$rel"
     while case "$anc" in */*) true ;; *) false ;; esac; do
       anc="${anc%/*}"
-      if [ -L "$wt/$anc" ]; then
+      # Check the archive side too: mkdir -p / cp follow $dest/files/$anc,
+      # so a live dir swapped back after its link was archived must not
+      # route the copy through that archived link (review r2).
+      if [ -L "$wt/$anc" ] || [ -L "$dest/files/$anc" ]; then
         _ARCHIVE_WHY="path beneath a symlink: $rel"
         return 1
       fi
