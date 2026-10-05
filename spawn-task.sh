@@ -60,6 +60,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/task-manifest.sh"
 . "$here/lib/op-env.sh"
 . "$here/lib/pane-guard.sh"
+. "$here/lib/worktree-archive.sh"
 
 # ---- args ------------------------------------------------------------------
 # op_mode inherits TIGHTEN-ONLY, the same shape as HERDR_POSTURE_FLOOR: a worker
@@ -495,7 +496,14 @@ if [ -z "$base" ] && ! git -C "$root" show-ref --verify --quiet "refs/heads/${br
   fi
 fi
 if git -C "$root" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt"; then
-  :  # already checked out here
+  # archive-worktrees.sh --apply `git worktree lock`s a worktree for its whole
+  # archive-to-remove window (review r2 H1 of PR #236): re-spawning into it
+  # would write .handoffs/ into a directory that is about to be removed.
+  if git -C "$root" worktree list --porcelain 2>/dev/null \
+      | awk -v w="$wt" '/^worktree /{cur=substr($0,10)} /^locked archive-worktrees\.sh /{ if (cur == w) f=1 } END{exit !f}'; then
+    echo "spawn-task: $wt is locked by an archive-worktrees.sh run (archiving, about to remove it) — not reusing it" >&2
+    exit 1
+  fi
 elif git -C "$root" show-ref --verify --quiet "refs/heads/${branch}"; then
   git -C "$root" worktree add "$wt" "$branch" >/dev/null 2>&1 || { echo "spawn-task: worktree add (existing branch) failed" >&2; exit 1; }
 else
@@ -516,6 +524,22 @@ if [ -z "$trunk" ]; then
   if [ -z "$trunk" ]; then
     trunk=$(git -C "$root" remote show origin 2>/dev/null | sed -n 's/^ *HEAD branch: //p')
   fi
+fi
+
+# ---- the archive fence (review r3 L1 of PR #236) ----------------------------
+# The archive-lock check above is check-then-act: archive-worktrees.sh can
+# fence and lock this worktree any time after it, and git cannot hold its
+# lock across `git worktree remove`. So, immediately before the first write
+# into the worktree, this spawn puts its intent file down and only THEN looks
+# for an archive fence (lib/worktree-archive.sh, "the spawn/archive fence").
+# The intent stays until this script exits, so an archive run that fences
+# after this check sees it and refuses its remove. A normal spawn never meets
+# a fence; the cost is one `git rev-parse` and two file operations.
+trap archive_fence_leave EXIT
+trap 'exit 130' INT TERM HUP
+if ! archive_fence_enter "$wt"; then
+  echo "spawn-task: $_ARCHIVE_WHY — not writing into it" >&2
+  exit 1
 fi
 
 # ---- coordination scaffold --------------------------------------------------
