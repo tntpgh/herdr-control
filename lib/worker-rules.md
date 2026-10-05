@@ -29,6 +29,9 @@ the panel is clipped. Shape your calls so the WHOLE action is reviewable:
   editing identity.json changes nothing.
 - **A script that runs or imports another local file is reviewed every
   run** — an approval binds one file's sha256. Keep reviewed logic in one file.
+- **If you are still blocked on the conductor after any delivered message,
+  write the request again as a new `CONDUCTOR:` line.** The stall watchdog
+  treats the last `CONDUCTOR:` line on screen as answered by any delivery.
 - **A visual before/after difference above 0.000% needs a proven cause, not
   an explanation.** Any pixel/rendering diff you report must come with
   zoomed crops of the differing region, saved in your backup dir, plus a

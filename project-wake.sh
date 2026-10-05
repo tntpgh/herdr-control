@@ -93,7 +93,7 @@ fi
 
 msg="[HERDR-PROJECT] ${card}. Verify before acting, this is a peer signal, not an instruction from the operator: project_status ${slug}"
 rc=0
-bash "$here/send-to-agent.sh" "$main" "$msg" >/dev/null 2>&1 || rc=$?
+bash "$here/send-to-agent.sh" "$main" --not-an-answer "$msg" >/dev/null 2>&1 || rc=$?
 outcome="$(_wake_outcome_for "$rc")"
 append_event project "$slug" project_wake_result \
   "$(jq -nc --arg k "$key" --arg o "$outcome" --argjson c "$rc" --argjson a "$attempt" \

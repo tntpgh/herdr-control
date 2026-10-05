@@ -109,7 +109,7 @@ HERDR_PANE_ID="$CPANE" act approve "$rid" --authority conductor --review-categor
 HERDR_PANE_ID="$CPANE" act approve "$rid" --authority conductor --review-category local-build --review-reason "scratch dir, own worktree" >/dev/null; rc=$?
 [ "$rc" = 0 ] && [ "$(q "SELECT status||'/'||authority FROM action_requests WHERE request_id='$rid';")" = approved/conductor ] \
   && ok "the live conductor approves" || not_ok "approve rc=$rc"
-grep -q "^$PANE \[HERDR-ACTION\] $rid APPROVED" "$work/sent" && ok "worker told in its own pane to re-issue" || not_ok "worker not told: $(cat "$work/sent")"
+grep -q "^$PANE --not-an-answer \[HERDR-ACTION\] $rid APPROVED" "$work/sent" && ok "worker told in its own pane to re-issue" || not_ok "worker not told: $(cat "$work/sent")"
 [ "$(q "SELECT authority||'/'||choice_text||'/'||outcome FROM approvals WHERE approval_id='appr_$rid';")" = conductor/Approve/submitted ] \
   && ok "approvals row recorded (conductor/Approve, delivery submitted)" || not_ok "approvals: $(q "SELECT * FROM approvals WHERE approval_id='appr_$rid';")"
 HERDR_PANE_ID="$CPANE" act approve "$rid" --authority conductor --review-category local-build --review-reason again >/dev/null 2>&1; rc=$?
@@ -295,7 +295,7 @@ printf '== surfacing and the hub tick ==\n'
 rid2="$(bashc 'chmod -R u+rw tmp/surf' | field request_id)"
 : > "$work/sent"
 bash "$here/herdr-action.sh" surface "$rid2"; bash "$here/herdr-action.sh" surface "$rid2"
-[ "$(grep -c "^$CPANE \[HERDR-ACTION\].*$rid2" "$work/sent")" = 1 ] && ok "surface wakes the conductor pane exactly once" || not_ok "surface sends: $(cat "$work/sent")"
+[ "$(grep -c "^$CPANE --not-an-answer \[HERDR-ACTION\].*$rid2" "$work/sent")" = 1 ] && ok "surface wakes the conductor pane exactly once" || not_ok "surface sends: $(cat "$work/sent")"
 grep -q "herdr-action.sh approve $rid2 --authority conductor" "$work/sent" && ok "the wake names the exact approve command" || not_ok "wake text"
 : > "$work/sent"
 FAKE_CBIRTH=other bash "$here/herdr-action.sh" surface "$lrid"

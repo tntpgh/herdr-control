@@ -869,7 +869,7 @@ kickoff_note="none (no --brief; send the first prompt yourself)"
 if [ -n "$brief_file" ] && [ "$managed" = 1 ]; then
   kickoff_msg="Your task brief is .handoffs/SPEC.md in this worktree — read it and execute it to Done. Your ids are in .handoffs/identity.json; when finished, append its completion_event to .handoffs/events.jsonl."
   if herdr pane wait-output "$pane" --regex 'Model scope|to change thinking effort' --timeout 60000 >/dev/null 2>&1 \
-     && bash "$here/send-to-agent.sh" "$pane" "$kickoff_msg" >/dev/null 2>&1; then
+     && bash "$here/send-to-agent.sh" "$pane" --not-an-answer "$kickoff_msg" >/dev/null 2>&1; then
     kickoff_note="SENT (points the worker at .handoffs/SPEC.md)"
   else
     kickoff_note="⚠ NOT DELIVERED — the worker is idle. Send it yourself: bash $here/send-to-agent.sh $pane \"$kickoff_msg\""

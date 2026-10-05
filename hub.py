@@ -69,6 +69,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from record_store import NotClaimable, claim_and_update  # noqa: E402
 import herdr_live  # noqa: E402
+import conductor_prompt as _cp  # noqa: E402
 from form_theme import force_dark  # noqa: E402
 
 DEFAULT_PORT = int(os.environ.get("HERDR_HUB_PORT", "8600"))
@@ -884,12 +885,14 @@ def herdr_data(event_limit: int = 100) -> dict:
         events = []
         for r in conn.execute(
                 # Review L4: stall-watchdog's own bookkeeping rows (first-seen
-                # claim, the boot floor, the durable answered marker) carry no
-                # human-meaningful content — filtered out of the feed a human
-                # or conductor actually reads; stall_wake/acked/escalate stay
-                # visible, those ARE real watchdog activity.
+                # claim, its floor/seed rows, the epoch markers, and the
+                # answered markers 7e1d9de wrote) carry no human-meaningful
+                # content — filtered out of the feed a human or conductor
+                # actually reads; stall_wake/acked/escalate stay visible,
+                # those ARE real watchdog activity.
                 "SELECT sequence, type, task_id, occurred_at, payload FROM events "
                 "WHERE type NOT IN ('stall_watchdog_epoch','stall_request_claim',"
+                "'stall_request_floor','stall_request_seed',"
                 "'stall_request_answered') ORDER BY sequence DESC LIMIT ?", (event_limit,)):
             e = dict(r)
             try:
@@ -3633,161 +3636,336 @@ def _stall_boot_epoch() -> float:
     _STALL_BOOT_EPOCH_CACHE.append(epoch)
     return epoch
 
-_STALL_REQUEST_CLAIM_EVENT_PREFIX = "stall_request_claim_"
+# ---- signal 5 request/answer state (DESIGN-228 FINAL) ----------------------
+# Identity and "answered" come from CONTENT, never from time: every rule is
+# one pure fold over durable `events` rows (`_stall_cprompt_fold`), rebuilt
+# on each tick, so a restart or a fresh module folds to the same state.
+# Nothing is memoized in-process except the two epoch markers, and only once
+# their read-back confirmed them (r2 L4). Rows (run_id '', deterministic
+# event_id, INSERT OR IGNORE plus read-back — `_stall_cprompt_put`):
+#   stall_request_claim_<task>_<d(F)>_g<n>       {fp,ctx,gen,tail}
+#   stall_request_floor_<task>_<d(F)>_g<n>_p<P>  {gen,tail}  one per new max P
+#   stall_request_seed_<task>_<d(F)> | _none     {fp,ctx,tail} | {}  (deploy)
+# plus `message_delivered.payload.req` = {fp,ctx,tail}, the capture
+# send-to-agent.sh takes before it types. 7e1d9de's `'{}'` claim rows and its
+# `stall_request_answered` rows carry no request and are ignored.
+#
+# Time is used in three places only: when an UNANSWERED request starts
+# waking (`stall_watchdog_candidates`), the 20s debounce below, and retire —
+# an occurrence whose key K is in `_sw_resolved_keys` (the keys the tick never
+# dispatches again) is answered, so the ladder and the fold cannot disagree
+# (r4 H1).
+#
+# The debounce: a sighting younger than one tick plus the herdr cache TTL
+# after the latest row that answered an occurrence may still show the pane
+# from before that answer rendered, so it writes neither a claim nor a floor
+# (r1 M3, r4 L1); it is re-evaluated next tick, never dropped.
+_STALL_CPROMPT_DEBOUNCE_S = ATTENTION_INTERVAL_S + CACHES["herdr"].ttl
+_STALL_CPROMPT_SEED_WINDOW_S = 60.0
+_STALL_CPROMPT_EPOCH_ID = "stall_watchdog_epoch_cprompt"
+_STALL_CPROMPT_SEEDED_ID = "stall_watchdog_epoch_cprompt_seeded"
+_STALL_CPROMPT_EPOCH_CACHE: list[float] = []   # only a CONFIRMED read-back
+_STALL_CPROMPT_SEEDED: list[bool] = []
+_STALL_CPROMPT_TYPES = ("stall_request_claim", "stall_request_floor",
+                        "stall_request_seed", "message_delivered")
 
 
-def _stall_request_claim(task_id: str, fingerprint: str, now: float) -> float | None:
-    """The epoch THIS EXACT (task_id, fingerprint) conductor_prompt request
-    was first ever observed by the watchdog — review H1/M1 (r6): the old
-    gate compared a reply against the task's registry `updated_at`, which
-    moves on every later, unrelated permission prompt (so an answered
-    request re-fired the moment the worker's next approval landed) and can
-    itself sit well BEFORE the request ever appeared (so an earlier,
-    unrelated delivery read as having answered a request it preceded).
+def _stall_cprompt_key(task_id: str, fp: str, gen: int) -> str:
+    """The claim_once key stall-watchdog.sh uses for occurrence (F, n): the
+    fingerprint it is handed is `F|g<n>`, one ladder per occurrence."""
+    return f"stall_{task_id}_conductor_prompt_{_sw_digest(f'{fp}|g{gen}')}"
 
-    Persisted ONCE via the same idempotent INSERT-OR-IGNORE `_stall_boot_
-    epoch` uses, keyed on task+fingerprint, so it never moves again once
-    claimed — the SAME fingerprint across ticks (the request sits unchanged
-    while the worker goes on to other things) always reads back the SAME
-    epoch, regardless of what `updated_at` does meanwhile. Two hub
-    processes racing this agree on one epoch for the same reason
-    `_stall_boot_epoch` does: whichever INSERT wins, both read it back.
 
-    Review H1 (r7): called on the FIRST TICK the request line is actually
-    visible in the pane — never gated on the idle-duration threshold, which
-    used to delay the claim until long after the request appeared, so a
-    reply landing in between read as predating it (review H1's own
-    regression: a quickly-answered request still woke).
+class _CpromptFold:
+    """One task's request/answer state (DESIGN-228 §1, §3), folded in
+    `sequence` order. An occurrence is (task, F, n) with `ctx`, `pre` (P before
+    the answer), `post` (largest P seen after it — a ratchet), `first_seen`,
+    `answered_at`, `basis` (`capture` dominates `retire`) and `last_answer`
+    (the latest row that answered, captured or retired it: the debounce)."""
 
-    Review L3: returns `None`, never a fabricated `now`, when the registry
-    cannot confirm the claim was actually persisted (missing registry, a
-    locked/read-only database). Falling open to `now` made every PAST reply
-    look like it predated a claim minted "just now", so an already-answered
-    request re-fired. The caller skips the candidate this tick and tries
-    again next tick, once the registry is reachable again.
-    """
-    event_id = f"{_STALL_REQUEST_CLAIM_EVENT_PREFIX}{task_id}_{_sw_digest(fingerprint)}"
-    if not REGISTRY.exists():
+    def __init__(self, task_id: str, resolved: dict[str, str]):
+        self.task_id, self.resolved = task_id, resolved
+        self.occ: dict[str, dict[int, dict]] = {}     # F -> {n: occurrence}
+        self.by_digest: dict[str, str] = {}           # d(F) -> F, for floor rows
+        self.marks: list[tuple[int, str]] = []        # (sequence, F): claims, captures, seeds
+        self._retires: list[tuple[float, dict]] = []  # (epoch, occurrence) not yet applied
+
+    def latest(self, fp: str) -> dict | None:
+        gens = self.occ.get(fp)
+        return gens[max(gens)] if gens else None
+
+    def superseded(self, o: dict) -> bool:
+        """r2 L1: a claim or capture for a DIFFERENT F sequenced after O's own
+        claim means a later sighting of O's F is a rewrite, not O."""
+        return any(seq > o["open_seq"] and fp != o["fp"] for seq, fp in self.marks)
+
+    @staticmethod
+    def same_line(o: dict, ctx: str, tail: int) -> bool:
+        """§1 rule 3, for an ANSWERED occurrence."""
+        if ctx != _cp.UNKNOWN_CTX and o["ctx"] != _cp.UNKNOWN_CTX and ctx != o["ctx"]:
+            return False
+        if o["post"] is not None:
+            return tail >= o["post"]
+        # A captured answer renders at least one paragraph below its own line;
+        # an ack adds nothing below it (r3 H1).
+        return tail > o["pre"] if o["basis"] == "capture" else tail >= o["pre"]
+
+    def _open(self, fp: str, gen: int, ctx: str, tail: int, at: float, seq: int,
+              answered: bool) -> dict:
+        o = {"fp": fp, "gen": gen, "ctx": ctx, "pre": tail, "post": None, "first_seen": at,
+             "answered_at": at if answered else None, "basis": "capture" if answered else None,
+             "last_answer": at if answered else None, "open_seq": seq}
+        self.occ.setdefault(fp, {})[gen] = o
+        self.by_digest[_sw_digest(fp)] = fp
+        resolved_at = self.resolved.get(_stall_cprompt_key(self.task_id, fp, gen))
+        if resolved_at is not None:
+            ep = _iso_epoch(resolved_at)
+            if ep is not None:
+                self._retires.append((ep, o))
+        return o
+
+    def flush(self, upto: float) -> None:
+        """Apply each retire whose resolving row is at or before `upto`. A
+        retire marks n answered if it is not already, `basis = retire`, and
+        never sets `post` (r3 H1)."""
+        keep = []
+        for at, o in self._retires:
+            if at > upto:
+                keep.append((at, o))
+                continue
+            if o["answered_at"] is None:
+                o["answered_at"], o["basis"] = at, "retire"
+            o["last_answer"] = at if o["last_answer"] is None else max(o["last_answer"], at)
+        self._retires = keep
+
+    def claim(self, fp: str, gen: int, ctx: str, tail: int, at: float, seq: int) -> None:
+        """Opens n unanswered. A claim for an existing n is a no-op: it never
+        clears answered (r1 L1a)."""
+        if gen not in self.occ.get(fp, {}):
+            self._open(fp, gen, ctx, tail, at, seq, answered=False)
+        self.marks.append((seq, fp))
+
+    def bind(self, fp: str, ctx: str, tail: int, at: float, seq: int, seed: bool = False) -> None:
+        """A captured reply or a deploy seed, resolved as in §1."""
+        o = self.latest(fp)
+        if o is None:
+            o = self._open(fp, 1, ctx, tail, at, seq, answered=True)
+        elif o["answered_at"] is None and not self.superseded(o):
+            o["answered_at"], o["basis"], o["last_answer"] = at, "capture", at
+        elif o["answered_at"] is not None and self.same_line(o, ctx, tail):
+            # The main post-wake path: send-to-agent.sh's owner_acted retires
+            # O just BEFORE its message_delivered{req} lands (r3 H1).
+            o["basis"] = "capture"
+            o["last_answer"] = at if o["last_answer"] is None else max(o["last_answer"], at)
+        else:
+            o = self._open(fp, o["gen"] + 1, ctx, tail, at, seq, answered=True)
+        if seed:
+            o["post"] = tail
+        self.marks.append((seq, fp))
+
+    def floor(self, digest: str, gen: int, tail: int) -> None:
+        fp = self.by_digest.get(digest)
+        o = self.occ.get(fp, {}).get(gen) if fp else None
+        if o is not None:
+            o["post"] = tail if o["post"] is None else max(o["post"], tail)
+
+
+def _stall_cprompt_fold(conn: sqlite3.Connection, task_id: str,
+                        resolved: dict[str, str]) -> _CpromptFold:
+    """Fold one task's rows (r1 L4: only this task, on `events_by_task`)."""
+    fold = _CpromptFold(task_id, resolved)
+    floor_prefix = f"stall_request_floor_{task_id}_"
+    for seq, eid, typ, occurred_at, payload in conn.execute(
+            "SELECT sequence, event_id, type, occurred_at, payload FROM events "
+            "WHERE task_id=? AND type IN (?,?,?,?) ORDER BY sequence",
+            (task_id, *_STALL_CPROMPT_TYPES)):
+        at = _iso_epoch(occurred_at)
+        if at is None:
+            continue
+        fold.flush(at)
+        if typ == "stall_request_floor":
+            m = (re.fullmatch(r"([0-9a-f]{16})_g(\d+)_p(\d+)", eid[len(floor_prefix):])
+                 if eid.startswith(floor_prefix) else None)
+            if m:
+                fold.floor(m.group(1), int(m.group(2)), int(m.group(3)))
+            continue
+        try:
+            p = json.loads(payload or "{}")
+        except json.JSONDecodeError:
+            continue
+        if typ == "message_delivered":
+            p = p.get("req") if isinstance(p, dict) else None
+        if not isinstance(p, dict):
+            continue
+        fp, ctx, tail = p.get("fp"), p.get("ctx"), p.get("tail")
+        if not (isinstance(fp, str) and isinstance(ctx, str) and isinstance(tail, int)):
+            continue        # 7e1d9de's '{}' rows, a `_none` seed, a delivery without req
+        if typ == "stall_request_claim":
+            gen = p.get("gen")
+            if isinstance(gen, int) and gen >= 1:
+                fold.claim(fp, gen, ctx, tail, at, seq)
+        else:
+            fold.bind(fp, ctx, tail, at, seq, seed=(typ == "stall_request_seed"))
+    fold.flush(float("inf"))
+    return fold
+
+
+def _stall_cprompt_put(conn: sqlite3.Connection, event_id: str, task_id: str, typ: str,
+                       at: float, payload: dict) -> float | None:
+    """INSERT OR IGNORE, then read the row back: its occurred_at epoch, or
+    None when the registry cannot confirm it exists."""
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+            "VALUES (?, '', ?, ?, ?, ?)",
+            (event_id, task_id, typ, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at)),
+             json.dumps(payload, separators=(",", ":"))))
+        conn.commit()
+    except sqlite3.Error:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+    try:
+        row = conn.execute("SELECT occurred_at FROM events WHERE event_id=?", (event_id,)).fetchone()
+    except sqlite3.Error:
         return None
-    try:
-        conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
-        try:
-            row = conn.execute("SELECT occurred_at FROM events WHERE event_id=?",
-                               (event_id,)).fetchone()
-        finally:
-            conn.close()
-        if row and row[0]:
-            epoch = _iso_epoch(row[0])
-            if epoch is not None:
-                return epoch
-    except sqlite3.Error:
-        pass
-    occurred = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-    try:
-        conn = sqlite3.connect(str(REGISTRY), timeout=2)
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
-                "VALUES (?, '', ?, 'stall_request_claim', ?, '{}')",
-                (event_id, task_id, occurred))
-            conn.commit()
-            row = conn.execute("SELECT occurred_at FROM events WHERE event_id=?",
-                               (event_id,)).fetchone()
-        finally:
-            conn.close()
-        if row and row[0]:
-            epoch = _iso_epoch(row[0])
-            if epoch is not None:
-                return epoch
-    except sqlite3.Error:
-        pass
+    return _iso_epoch(row[0]) if row and row[0] else None
+
+
+def _stall_cprompt_fail(why: str) -> None:
+    STALL_WATCHDOG_STATE["last_error"] = f"conductor_prompt: {why}"
     return None
 
 
-_STALL_REQUEST_ANSWERED_EVENT_PREFIX = "stall_request_answered_"
-
-
-def _stall_reply_matches(conn: sqlite3.Connection) -> dict[str, dict[str, float]]:
-    """{task_id: {claim_digest: reply_epoch}} — which `conductor_prompt`
-    claims (review H1/M1/M2/L2 r7) have a REAL reply bound to THIS EXACT
-    request, never to whichever request happens to be newest when the
-    reply's timestamp is read. Every genuine reply (`message_delivered` —
-    `send-to-agent.sh` writes it for EVERY successful send, peer, Slack/hub
-    or a direct conductor-pane reply alike, so this one query already
-    covers all three) answers the OLDEST still-open claim for its task, in
-    chronological order: a reply cannot answer a request that did not
-    exist yet when it was sent (review H1's own `claimed_at`), and once an
-    older request has first claim on a reply, a LATER, unrelated request
-    for the same task can never also claim it (review L2 — a reply "about
-    A" must never silence an unrelated, newer B that showed up after A's
-    reply was already sent).
-
-    Pure and stateless: claims and replies are both immutable, append-only
-    registry rows, so re-running this against the same rows always
-    reproduces the same pairing — an answered request stays answered
-    forever on its own, with no help from a durable marker. `_stall_
-    persist_answered` writes one anyway (review addendum: store it in the
-    existing claim-store idiom, no schema change) purely for the hub event
-    feed/observability, never as this function's own source of truth."""
-    claims_by_task: dict[str, list[tuple[str, float]]] = {}
-    for tid, event_id, occurred_at in conn.execute(
-            "SELECT task_id, event_id, occurred_at FROM events "
-            "WHERE type='stall_request_claim' ORDER BY sequence"):
-        ep = _iso_epoch(occurred_at)
-        if ep is None or len(event_id) < 16:
-            continue
-        claims_by_task.setdefault(tid, []).append((event_id[-16:], ep))
-    replies_by_task: dict[str, list[float]] = {}
-    for tid, occurred_at in conn.execute(
-            "SELECT task_id, occurred_at FROM events "
-            "WHERE type='message_delivered' AND task_id != '' ORDER BY sequence"):
-        ep = _iso_epoch(occurred_at)
-        if ep is not None:
-            replies_by_task.setdefault(tid, []).append(ep)
-    out: dict[str, dict[str, float]] = {}
-    for tid, claims in claims_by_task.items():
-        replies = replies_by_task.get(tid, [])
-        ri = 0
-        matched: dict[str, float] = {}
-        for digest, claimed_epoch in claims:
-            while ri < len(replies) and replies[ri] < claimed_epoch:
-                ri += 1   # predates even the oldest open claim: spent, unusable
-            if ri >= len(replies):
-                break     # no replies left; every later (newer) claim stays open
-            matched[digest] = replies[ri]
-            ri += 1
-        if matched:
-            out[tid] = matched
-    return out
-
-
-def _stall_persist_answered(matches: dict[str, dict[str, float]]) -> None:
-    """Best-effort durable record of each `_stall_reply_matches` pairing,
-    via the SAME idempotent INSERT-OR-IGNORE idiom `_stall_request_claim`
-    uses on the SAME `events` table/columns (no schema change) — review
-    addendum point 4. A write failure here costs nothing but the hub
-    event feed showing the pairing a tick late: `_stall_reply_matches`
-    recomputes the identical answer from the same immutable claim/reply
-    rows every tick regardless, so it is never this function's job to be
-    the source of truth."""
-    if not matches or not REGISTRY.exists():
-        return
+def _stall_cprompt_epoch(now: float) -> float | None:
+    """The signal-5 deploy epoch, minted once. Cached in-process ONLY after a
+    read-back confirmed it (r2 L4: `_stall_boot_epoch` caches `time.time()`
+    when both its read and its INSERT fail; this must not)."""
+    if _STALL_CPROMPT_EPOCH_CACHE:
+        return _STALL_CPROMPT_EPOCH_CACHE[0]
+    if not REGISTRY.exists():
+        return None
     try:
         conn = sqlite3.connect(str(REGISTRY), timeout=2)
         try:
-            for tid, digests in matches.items():
-                for digest, reply_epoch in digests.items():
-                    event_id = f"{_STALL_REQUEST_ANSWERED_EVENT_PREFIX}{tid}_{digest}"
-                    occurred = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reply_epoch))
-                    conn.execute(
-                        "INSERT OR IGNORE INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
-                        "VALUES (?, '', ?, 'stall_request_answered', ?, '{}')",
-                        (event_id, tid, occurred))
-            conn.commit()
+            epoch = _stall_cprompt_put(conn, _STALL_CPROMPT_EPOCH_ID, "", "stall_watchdog_epoch", now, {})
         finally:
             conn.close()
     except sqlite3.Error:
-        pass
+        return None
+    if epoch is not None:
+        _STALL_CPROMPT_EPOCH_CACHE.append(epoch)
+    return epoch
+
+
+def _stall_cprompt_seed(tasks: list[dict], now: float, epoch: float,
+                        pane_read_fn=None, pane_birth_fn=None) -> None:
+    """§6 deploy seed — seed, don't gate. Until the `_seeded` marker exists,
+    each tick reads the birth-matched pane of every non-terminal task not yet
+    confirmed (in any state) and writes its visible request as a seed row,
+    which the fold handles as a captured answer plus `post`. A task is
+    confirmed once a seed row of its own reads back (`_none` when its pane
+    showed no request), so a retry tick never seeds a request written AFTER
+    the deploy (r4 L4). The marker is written on the first tick that read
+    every birth-matched pane and read back every seed; past the window it is
+    written anyway, visibly, accepting one false wake per unseeded line."""
+    if _STALL_CPROMPT_SEEDED:
+        return
+    pane_read_fn = pane_read_fn or _pane_last_output
+    pane_birth_fn = pane_birth_fn or _live_pane_birth
+    try:
+        conn = sqlite3.connect(str(REGISTRY), timeout=2)
+    except sqlite3.Error as exc:
+        _stall_cprompt_fail(f"seed: {exc}")
+        return
+    try:
+        if conn.execute("SELECT 1 FROM events WHERE event_id=?", (_STALL_CPROMPT_SEEDED_ID,)).fetchone():
+            _STALL_CPROMPT_SEEDED.append(True)
+            return
+        if now - epoch > _STALL_CPROMPT_SEED_WINDOW_S:
+            if _stall_cprompt_put(conn, _STALL_CPROMPT_SEEDED_ID, "", "stall_watchdog_epoch", now,
+                                  {"complete": False}) is not None:
+                _STALL_CPROMPT_SEEDED.append(True)
+            _stall_cprompt_fail("deploy seed window passed with panes unseeded; each may false-wake once")
+            return
+        # The live subscription is what says which panes are birth-matched
+        # (`_live_pane_birth` is None for every pane while it is down);
+        # without it nothing can be called seeded, so wait for it.
+        complete = pane_birth_fn is not _live_pane_birth or pane_statuses() is not None
+        for t in tasks:
+            tid = t.get("task_id")
+            if not tid or t.get("state") in TERMINAL:
+                continue
+            if conn.execute("SELECT 1 FROM events WHERE type='stall_request_seed' AND task_id=? LIMIT 1",
+                            (tid,)).fetchone():
+                continue                                    # confirmed on an earlier tick
+            pane, reg_birth = t.get("pane_id") or "", t.get("pane_birth") or ""
+            live_birth = pane_birth_fn(pane) if pane else None
+            if not (live_birth and reg_birth and live_birth == reg_birth):
+                continue                                    # no pane of its own to show a line
+            text = pane_read_fn(pane)
+            if not text.strip():
+                complete = False                            # unread: retry next tick
+                continue
+            req = _cp.last_request(text)
+            if req:
+                eid = f"stall_request_seed_{tid}_{_sw_digest(req['fp'])}"
+                payload = {"fp": req["fp"], "ctx": req["ctx"], "tail": req["tail"]}
+            else:
+                eid, payload = f"stall_request_seed_{tid}_none", {}
+            if _stall_cprompt_put(conn, eid, tid, "stall_request_seed", now, payload) is None:
+                complete = False
+        if complete and _stall_cprompt_put(conn, _STALL_CPROMPT_SEEDED_ID, "", "stall_watchdog_epoch",
+                                           now, {"complete": True}) is not None:
+            _STALL_CPROMPT_SEEDED.append(True)
+    except sqlite3.Error as exc:
+        _stall_cprompt_fail(f"seed: {exc}")
+    finally:
+        conn.close()
+
+
+def _stall_cprompt_sight(task_id: str, req: dict, now: float,
+                         resolved: dict[str, str] | None) -> dict | None:
+    """§3's table for one idle sighting (F, C, P): resolve it to an
+    occurrence, write the claim or floor row the table calls for, and return
+    {"gen", "first_seen", "answered"}. None — the caller skips the candidate,
+    `last_error` set — when a needed row cannot be confirmed (r5 L3)."""
+    if resolved is None:
+        return _stall_cprompt_fail("resolved keys unreadable")
+    if not REGISTRY.exists():
+        return _stall_cprompt_fail("registry missing")
+    fp, ctx, tail = req["fp"], req["ctx"], req["tail"]
+    try:
+        conn = sqlite3.connect(str(REGISTRY), timeout=2)
+        try:
+            fold = _stall_cprompt_fold(conn, task_id, resolved)
+            o = fold.latest(fp)
+            if o is not None and o["answered_at"] is None and not fold.superseded(o):
+                # Unanswered: it IS O whatever C is — churn neither splits a
+                # pending request nor restarts its clock (r1 L1b).
+                return {"gen": o["gen"], "first_seen": o["first_seen"], "answered": False}
+            if o is not None and o["answered_at"] is not None:
+                if now - o["last_answer"] < _STALL_CPROMPT_DEBOUNCE_S:
+                    return {"gen": o["gen"], "first_seen": o["first_seen"], "answered": True}
+                if fold.same_line(o, ctx, tail):
+                    if o["post"] is None or tail > o["post"]:
+                        eid = f"stall_request_floor_{task_id}_{_sw_digest(fp)}_g{o['gen']}_p{tail}"
+                        if _stall_cprompt_put(conn, eid, task_id, "stall_request_floor", now,
+                                              {"gen": o["gen"], "tail": tail}) is None:
+                            return _stall_cprompt_fail(f"floor for {task_id} unconfirmed")
+                    return {"gen": o["gen"], "first_seen": o["first_seen"], "answered": True}
+            gen = 1 if o is None else o["gen"] + 1
+            first_seen = _stall_cprompt_put(
+                conn, f"stall_request_claim_{task_id}_{_sw_digest(fp)}_g{gen}", task_id,
+                "stall_request_claim", now, {"fp": fp, "ctx": ctx, "gen": gen, "tail": tail})
+            if first_seen is None:
+                return _stall_cprompt_fail(f"claim for {task_id} unconfirmed")
+            return {"gen": gen, "first_seen": first_seen, "answered": False}
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return _stall_cprompt_fail(f"{task_id}: {exc}")
 
 
 _REASON_RE = re.compile(rb'"reason"\s*:\s*"([^"]*)"')
@@ -3852,8 +4030,6 @@ def _live_done_info(worktree: str | None) -> tuple[float | None, str | None]:
             continue
     return best_epoch, best_reason
 
-_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
-
 
 def _pane_last_output(pane_id: str, lines: int = 60) -> str:
     """Review M1's pane-text source, called from hub.py since this signal
@@ -3866,11 +4042,10 @@ def _pane_last_output(pane_id: str, lines: int = 60) -> str:
     a 20-row tail. 60 keeps a live pane's wrapped-request-plus-recap shape
     inside the window with room to spare.
 
-    Review H1 (r7): gated only on the state/birth checks above, never on
-    the idle-duration threshold — called every tick a task is idle with a
-    live, birth-matched pane, so the claim's first-seen epoch
-    (`_stall_request_claim`) is genuinely the first sighting, not the
-    first sighting AFTER the threshold also happened to clear.
+    Gated only on the state/birth checks in `stall_watchdog_candidates`,
+    never on the idle-duration threshold: read every tick a task is idle
+    with a live, birth-matched pane, so a request's claim is minted at its
+    genuine first sighting.
 
     Review M2 (r5): `--source visible` — the shape attention.sh's own
     `_vishash` uses — caps at the pane's LIVE SCREEN HEIGHT, never at
@@ -3889,82 +4064,6 @@ def _pane_last_output(pane_id: str, lines: int = 60) -> str:
         return ""
 
 
-_CHROME_COMPOSER_TOP_RE = re.compile(r'^\s*\u256d')   # ╭
-
-
-def _agent_output_lines(text: str) -> list[str]:
-    """Everything ABOVE the omp composer's own top border — review N3: the
-    LAST rows of an idle omp pane are the composer's status bar and input
-    box (`lib/prompt-parse.sh:355-361`'s own `_composer_input_rows`, whose
-    "rows below the last `\u256d`" definition this takes the complement of),
-    never agent output. Requiring the literal last captured row to start
-    with `CONDUCTOR:`, as the first cut did, can never match a real omp
-    pane — the box is always what is actually last. No `\u256d` in the
-    window (a bare `\u276f` composer, or input tall enough to scroll its own
-    border out of view) leaves nothing distinguishable as output, the same
-    edge case `_composer_input_rows` documents; returns none rather than
-    guessing."""
-    raw = text.splitlines()
-    top = None
-    for i, line in enumerate(raw):
-        if _CHROME_COMPOSER_TOP_RE.match(_ANSI_RE.sub("", line)):
-            top = i
-    return raw[:top] if top is not None else []
-
-
-_MD_LEADING_RE = re.compile(r'^[\*_]+')   # **CONDUCTOR:** / __CONDUCTOR:__
-
-
-def _last_conductor_prompt_line(text: str | None) -> str | None:
-    """The most recent worker-authored `CONDUCTOR: ...` line in genuine
-    agent OUTPUT (never the composer chrome below it — see
-    `_agent_output_lines`) — incident 2's actual shape (SPEC.md:51): no
-    deny, no delivery, no handoff event, just a worker asking directly.
-
-    Review M1 (r3): the first cut required the literal LAST non-blank row
-    to BE the whole line, so it went silent the moment the request wrapped
-    across terminal columns (the wrap's continuation row, not
-    `CONDUCTOR:...`, sat last), the moment the worker's own status/recap
-    block followed it (the recap sat last instead), or the moment the
-    worker bolded the marker (`**CONDUCTOR:**`, which a bare
-    `.startswith()` missed). This scans every captured output row from
-    the bottom instead, stripping a leading markdown emphasis run
-    (`*`/`_`) before the prefix test, and joins the wrap's own
-    continuation rows — rows that immediately follow with no blank row
-    between them — onto the line it returns.
-
-    Review H1 (r5): r4 added a guard here that dropped the result as soon
-    as a SECOND, non-recap paragraph followed the request, trying to infer
-    "the conductor already answered" from pane SHAPE alone. It could not:
-    the round-1 live incident's own shape — a trailing paragraph, then
-    omp's `※` recap — went silent under it, and so did six other ordinary
-    UNANSWERED shapes a worker writes while still waiting (a plain
-    sentence, an indented command block, an evidence list, a `**Recap**:`
-    or `Status:` line — none of them an actual reply). Pane text cannot
-    tell "the worker kept narrating" from "the conductor replied and the
-    worker moved on"; only the registry can. `stall_watchdog_candidates`'s
-    own `replied` argument does that instead, comparing a real
-    `message_delivered` event's timestamp against THIS REQUEST's OWN claim
-    epoch (review H1/M1/M2/L2 r7 — never the task's `updated_at`, which
-    moves on every later, unrelated prompt) — so this function goes back
-    to always returning the request plus its wrap continuation, with no
-    shape-based answered guard."""
-    if not text:
-        return None
-    rows = [_ANSI_RE.sub("", ln).rstrip() for ln in _agent_output_lines(text)]
-    for i in range(len(rows) - 1, -1, -1):
-        row = _MD_LEADING_RE.sub("", rows[i].strip())
-        if not row or not row.startswith("CONDUCTOR:"):
-            continue
-        parts = [row]
-        j = i + 1
-        while j < len(rows) and rows[j].strip():
-            parts.append(rows[j].strip())
-            j += 1
-        return " ".join(parts)
-    return None
-
-
 def _live_pane_birth(pane_id: str) -> str | None:
     """Review M-b's liveness check: the pane's CURRENT `terminal_id` from
     the already-maintained live subscription (`pane_statuses()`), not a
@@ -3978,23 +4077,11 @@ def _live_pane_birth(pane_id: str) -> str | None:
     return rec.get("birth") if rec else None
 
 
-def _conductor_prompt_fingerprint(line: str) -> str:
-    """The stable fingerprint for a `CONDUCTOR: ...` request line — review
-    L1 (r4): hashed whitespace-free, so a resize/rewrap of the identical
-    request (which moves where the continuation join inserts its space)
-    mints the SAME fingerprint, never a second wake. Factored out of
-    `stall_watchdog_candidates` so every caller — production and tests
-    alike — computes it the SAME way, never a hand-derived copy of the
-    formula that could silently drift from it."""
-    norm = re.sub(r"\s+", "", line)
-    return f"cprompt:{hashlib.sha256(norm.encode()).hexdigest()[:16]}"
-
-
 def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                               denied: dict | None = None, delivered: dict | None = None,
-                              owner_acted: dict | None = None, replied: dict | None = None,
+                              owner_acted: dict | None = None,
                               stat_fn=None, live_done_fn=None, pane_read_fn=None,
-                              pane_birth_fn=None, claim_fn=None,
+                              pane_birth_fn=None, occurrence_fn=None,
                               threshold_s: float | None = None,
                               boot_epoch: float | None = None) -> list[dict]:
     """Which (task, signal) pairs have sat idle/done, owing the conductor an
@@ -4003,24 +4090,10 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
     `denied`/`delivered`/`owner_acted` are precomputed {task_id: {"epoch":
     …, "fingerprint":…}} (or, for `owner_acted`, {task_id: epoch}) maps for
     facts `herdr_data()` cannot see on its own — see `_stall_task_signals`.
-    `replied` is `{task_id: {claim_digest: epoch}}` (review H1/M1/M2/L2
-    r7, `_stall_reply_matches`): each real reply is bound to the OLDEST
-    still-open claim for its task, never to "whichever is newest" — so a
-    reply that answers an older request can never also silence an
-    unrelated, newer one (review L2) — unbounded (review M2 r6: no longer
-    windowed to 8x the threshold — a genuinely old reply must keep
-    silencing its request forever, not just for 80 minutes). `claim_fn`
-    (review H1/M1 r6, r7) mints or reads back the epoch THIS EXACT
-    (task_id, fingerprint) request was FIRST SEEN, called every tick a
-    task is idle with a live, birth-matched pane — never gated behind the
-    idle-duration threshold, which used to delay the claim until well
-    after the request appeared (review H1) — so "answered" compares a
-    reply against the REQUEST's own fixed, earliest-possible epoch, never
-    the task's `updated_at` (which moves on every later, unrelated
-    permission prompt). Returns `None` (review L3) when the registry
-    cannot confirm the claim persisted; the caller skips the candidate
-    rather than fabricate a `now` that reads every past reply as
-    premature.
+    `occurrence_fn(task_id, req, now)` resolves a visible signal-5 request to
+    its occurrence — {"gen", "first_seen", "answered"}, or None when the
+    registry could not confirm the row it needed (skip the candidate);
+    defaults to `_stall_cprompt_sight` against the registry.
     `stat_fn`/`live_done_fn` are injectable (signal 2's artifact mtime+size,
     signal 1's live-bus read) so this stays a pure function callers can test
     with plain dicts, no filesystem or registry required — same testability
@@ -4064,50 +4137,13 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
       conductor_prompt — review M1: incident 2 had 8 approvals, all
                     `allow` — no deny, no delivery, no handoff; it just sat
                     idle with its own last pane output asking the
-                    conductor directly (the `CONDUCTOR: ...` line this very
-                    codebase's own workers write — see
-                    `_last_conductor_prompt_line` for the wrap/bold
-                    handling). Review M-b: verifies the live pane's birth
-                    still matches the one this task registered before ever
-                    reading it — `state != completed` used to include
-                    `lost`/`cancelled`/`failed`/`gone`, any of which can
-                    mean herdr already recycled the pane id to an
-                    unrelated task. Review L1 (r4): the fingerprint hashes
-                    the line with ALL whitespace stripped, so a pane
-                    resize that re-wraps the same request at a different
-                    column — and so re-places the space the continuation
-                    join inserts — still hashes to the same key. Review H1
-                    (r5): "already answered" is no longer inferred from
-                    pane shape (that dropped real unanswered requests —
-                    see `_last_conductor_prompt_line`); it is a real
-    `message_delivered` event, never a guess. Review H1/M1
-    (r6, r7): that reply is compared against THIS REQUEST'S OWN
-    claim epoch (`claim_fn`, first-seen and held fixed — see
-    `_stall_request_claim`), not the task's `updated_at` — r5
-    compared against `updated_at` instead, which (a) sits well
-    before the request on a task spawned long ago, so an
-    earlier, unrelated delivery read as having answered a
-    request it preceded, and (b) slides forward on every
-    later, unrelated permission prompt, so an already-answered
-    request re-fired the moment the worker's next approval
-    landed. Review H1 (r7): r6 still minted the claim ONLY once
-    the since/threshold/owner_acted gate below had already
-    opened — the first GATED look, not the first time the
-    request was actually visible — so a reply landing in that
-    gap still read as predating the claim and woke anyway. The
-    claim is now minted on the very first tick the line is
-    visible, before any of that gate. Review M2 (r7): the
-    since/threshold gate no longer also requires `owner_acted <
-    since` — that compared the WRONG baseline (the task's own
-    moving `updated_at`) to decide "already answered", so a
-    brand-new re-ask (a new fingerprint, by definition never
-    answered) stayed silenced until some LATER, unrelated
-    approval happened to reopen it. "Answered" is `replied`'s
-    own job now, bound to this fingerprint's own claim (review
-    L2: and bound to the OLDEST open claim for the task, so a
-    reply "about" an earlier request can never silence a later,
-    unrelated one) — the gate below only decides WHEN an
-    unanswered request starts waking.
+                    conductor directly. The request is read by
+                    `lib/conductor_prompt.py` (one copy, shared with
+                    send-to-agent.sh's capture) only once the live pane's
+                    birth still matches the one this task registered
+                    (review M-b). Whether it is answered is the DESIGN-228
+                    fold's job (`_stall_cprompt_sight`); this only decides
+                    when an unanswered occurrence wakes, as `F|g<n>`.
     """
     now = time.time() if now is None else now
     threshold = STALL_WATCHDOG_THRESHOLD_S if threshold_s is None else threshold_s
@@ -4115,7 +4151,6 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
     denied = denied or {}
     delivered = delivered or {}
     owner_acted = owner_acted or {}
-    replied = replied or {}
     if stat_fn is None:
         def stat_fn(p):
             st = os.stat(p)
@@ -4126,8 +4161,16 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
         pane_read_fn = _pane_last_output
     if pane_birth_fn is None:
         pane_birth_fn = _live_pane_birth
-    if claim_fn is None:
-        claim_fn = _stall_request_claim
+    if occurrence_fn is None:
+        _occ: list = []
+
+        def occurrence_fn(tid_, req_, at_):
+            # Built on the first visible request only: a tick with no
+            # request on screen never touches the registry for signal 5.
+            if not _occ:
+                _occ.append(_stall_cprompt_occurrences(tasks, now, _stall_resolved(owner_acted),
+                                                       pane_read_fn, pane_birth_fn))
+            return _occ[0](tid_, req_, at_)
     IDLE_STATES = ("stalled", "ready_review")
     out: list[dict] = []
     for t in tasks:
@@ -4194,48 +4237,27 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                            "detail": "a message was delivered to this pane and never processed",
                            "artifact": ""})
 
-        # ---- signal 5: conductor_prompt (review H1/M1/M2/L2/L3 r7) ---------
+        # ---- signal 5: conductor_prompt (DESIGN-228) ------------------------
+        # Read on EVERY tick the task is idle with a live, birth-matched
+        # pane, never behind the threshold: the occurrence's first sighting
+        # is its own clock. The threshold below only decides WHEN an
+        # unanswered occurrence starts waking — from `max(since,
+        # first_seen)`, and with no `since >= boot` gate (r3 M1: `updated_at`
+        # never moves at idle, so `boot` silenced every task whose last edge
+        # predated #223; the deploy seed covers history instead).
         if state in IDLE_STATES and t.get("pane_id"):
             live_birth = pane_birth_fn(t["pane_id"])
             reg_birth = t.get("pane_birth") or ""
-            # Review H1 (r7): read on EVERY tick a task is idle with a live,
-            # birth-matched pane — never gated behind since/threshold/
-            # owner_acted below. That gate used to decide BOTH "has this
-            # sat long enough to escalate" AND "when was the claim first
-            # minted", so the claim could only ever be minted on the first
-            # GATED look, well after the request actually appeared — any
-            # reply landing in that gap read as predating the claim and
-            # woke anyway. The two concerns are now separate: the claim's
-            # first-seen epoch comes from here, unconditionally; the gate
-            # below only decides WHEN an unanswered request starts waking.
-            line = (_last_conductor_prompt_line(pane_read_fn(t["pane_id"]))
-                    if live_birth and reg_birth and live_birth == reg_birth else None)
-            if line:
-                fingerprint = _conductor_prompt_fingerprint(line)
-                claimed_at = claim_fn(tid, fingerprint, now)
-                # Review L3: a claim the registry never confirmed cannot be
-                # trusted as "just now" — skip this tick, try again next.
-                if claimed_at is not None:
-                    # Review L2: bound to THIS fingerprint's own claim,
-                    # never "whichever reply is latest for the task" — a
-                    # reply chronologically owed to an OLDER, already-
-                    # superseded request can never also silence this one.
-                    reply_epoch = replied.get(tid, {}).get(_sw_digest(fingerprint))
-                    # Review M2 (r7): no `owner_acted` check here — that
-                    # compared the wrong baseline (`since`) to decide
-                    # "already answered", so a brand-new re-ask (a new
-                    # fingerprint, by definition never answered) stayed
-                    # silenced until some later, unrelated approval
-                    # happened to reopen it. `reply_epoch` above is the
-                    # real answered check now; `since`/threshold below is
-                    # purely timing — how long this task has sat idle.
-                    since = _iso_epoch(t.get("updated_at"))
-                    if ((reply_epoch is None or reply_epoch < claimed_at)
-                            and since is not None and since >= boot
-                            and now - since >= threshold):
-                        out.append({**base, "signal": "conductor_prompt",
-                                   "fingerprint": fingerprint,
-                                   "detail": line[:200], "artifact": ""})
+            req = (_cp.last_request(pane_read_fn(t["pane_id"]))
+                   if live_birth and reg_birth and live_birth == reg_birth else None)
+            occ = occurrence_fn(tid, req, now) if req else None
+            if occ is not None and not occ["answered"]:
+                since = _iso_epoch(t.get("updated_at"))
+                start = occ["first_seen"] if since is None else max(since, occ["first_seen"])
+                if now - start >= threshold:
+                    out.append({**base, "signal": "conductor_prompt",
+                               "fingerprint": f"{req['fp']}|g{occ['gen']}",
+                               "detail": req["line"][:200], "artifact": ""})
     return out
 
 
@@ -4261,19 +4283,13 @@ _STALL_OWNER_ACTIVITY_TYPES = ("owner_acted", "brief_delivered", "reply_delivere
 _STALL_DENY_CHOICE_RE = re.compile(r"\b(deny|no|reject)\b", re.IGNORECASE)
 
 
-def _stall_task_signals(now: float | None = None, threshold_s: float | None = None) -> tuple[dict, dict, dict, dict]:
-    """The four supplemental facts `herdr_data()` does not carry, from one
+def _stall_task_signals(now: float | None = None, threshold_s: float | None = None) -> tuple[dict, dict, dict]:
+    """The three supplemental facts `herdr_data()` does not carry, from one
     registry connection: the latest DENIED approval per task, the latest
-    `message_delivered` event per task with no later WORKER event, the
+    `message_delivered` event per task with no later WORKER event, and the
     latest owner-side action epoch per task (PR #223 review H1/M-a's "newer
-    than the conductor's last action"), and — review H1 r5's `replied`,
-    the one registry fact that proves a human/conductor replied to a
-    `conductor_prompt` signal, since pane SHAPE cannot — which claim
-    digest of which task was actually answered and when (review H1/M1/M2/
-    L2 r7, `_stall_reply_matches`): each reply is bound to the OLDEST
-    still-open claim for its task, never "whichever is latest", unbounded
-    (review M2 r6 dropped the former 8x-threshold window, which let a
-    genuinely old reply expire and the already-answered request re-fire).
+    than the conductor's last action"). Whether a `conductor_prompt` request
+    was answered is the DESIGN-228 fold's (`_stall_cprompt_fold`), not here.
 
     `denied` (review M2): a policy refusal is `approval_escalated`
     (`herdr-select.sh`'s `_refuse_non_human`, fired only when the policy
@@ -4297,16 +4313,15 @@ def _stall_task_signals(now: float | None = None, threshold_s: float | None = No
     denied: dict = {}
     delivered: dict = {}
     owner_acted: dict = {}
-    replied: dict = {}
     now = time.time() if now is None else now
     threshold = STALL_WATCHDOG_THRESHOLD_S if threshold_s is None else threshold_s
     cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - threshold * 8))
     if not REGISTRY.exists():
-        return denied, delivered, owner_acted, replied
+        return denied, delivered, owner_acted
     try:
         conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
     except sqlite3.Error:
-        return denied, delivered, owner_acted, replied
+        return denied, delivered, owner_acted
     try:
         act_placeholders = ",".join("?" for _ in _STALL_WORKER_ACTIVITY_TYPES)
 
@@ -4359,26 +4374,9 @@ def _stall_task_signals(now: float | None = None, threshold_s: float | None = No
             ep = _iso_epoch(occurred_at)
             if ep is not None:
                 owner_acted[tid] = ep
-        # Review H1 (r5): a `conductor_prompt` signal is answered the
-        # instant the conductor sends anything back, whether or not the
-        # worker goes on to process it (that is `delivered`'s own,
-        # separate concern) — so, unlike `delivered`, no "no later worker
-        # activity" filter. Review M2 (r6): UNBOUNDED, no `cutoff` here —
-        # the comparison is against the REQUEST's own claim epoch, which
-        # can be arbitrarily old; windowing this query to "recent" rows
-        # made a genuinely old, valid reply expire and the already-
-        # answered request re-fire. Review H1/M1/M2/L2 (r7): bound to the
-        # SPECIFIC claim it answers, never "the task's latest reply" —
-        # see `_stall_reply_matches`.
-        replied = _stall_reply_matches(conn)
     finally:
         conn.close()
-    # Review addendum point 4: persist the pairing durably (best-effort,
-    # same claim-store idiom, no schema change) — purely for the hub
-    # event feed; `_stall_reply_matches` is already its own stable source
-    # of truth, recomputed from the same immutable rows every tick.
-    _stall_persist_answered(replied)
-    return denied, delivered, owner_acted, replied
+    return denied, delivered, owner_acted
 
 
 # Mirrors ATTENTION_STATE's shape (review M4: "failures are invisible... the
@@ -4397,7 +4395,7 @@ def _sw_digest(text: str) -> str:
     return hashlib.sha256((text or "").encode()).hexdigest()[:16]
 
 
-def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None) -> set[str]:
+def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None) -> dict[str, str]:
     """claim_once keys that are ALREADY woken AND acked (review M4): the
     daemon must not spawn a subprocess plus two herdr RPCs every tick,
     forever, for a fingerprint stall-watchdog.sh would itself immediately
@@ -4410,7 +4408,11 @@ def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None)
     guarantees it never fires again, but paid `_sw_owner_status`'s 2 herdr
     RPCs to discover that every tick anyway, forever. An owner-acted task
     is the same waste for H2's own reason. All three are filtered here the
-    same way the ack case always was."""
+    same way the ack case always was.
+
+    {key: occurred_at of the EARLIEST row that resolved it}: membership is
+    the dispatch filter; the time is when signal 5's fold retires that
+    occurrence (DESIGN-228 §3), so the ladder and the fold read one test."""
     owner_acted = owner_acted or {}
     claims: dict[str, tuple[str, str, str]] = {}
     for eid, tid, occurred_at, payload in conn.execute(
@@ -4428,26 +4430,63 @@ def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None)
         except json.JSONDecodeError:
             sig = "all"
         acks.setdefault(tid, []).append((sig, occurred_at))
-    resolved: set[str] = set()
+    own_placeholders = ",".join("?" for _ in _STALL_OWNER_ACTIVITY_TYPES)
+    resolved: dict[str, str] = {}
+
+    def _at(key: str, when: str) -> None:
+        if key not in resolved or when < resolved[key]:
+            resolved[key] = when
+
     for eid, (tid, sig, claimed_at) in claims.items():
         for ack_sig, acked_at in acks.get(tid, []):
             if ack_sig in (sig, "all") and acked_at > claimed_at:
-                resolved.add(eid)
-                break
-        if eid in resolved:
-            continue
+                _at(eid, acked_at)
         owner_epoch = owner_acted.get(tid)
         if owner_epoch is not None:
             claimed_epoch = _iso_epoch(claimed_at)
             if claimed_epoch is not None and owner_epoch >= claimed_epoch:
-                resolved.add(eid)
-    for (eid,) in conn.execute("SELECT event_id FROM events WHERE type='stall_escalate_claim'"):
+                row = conn.execute(
+                    f"SELECT MIN(occurred_at) FROM events WHERE task_id=? AND type IN ({own_placeholders}) "
+                    "AND occurred_at >= ?", (tid, *_STALL_OWNER_ACTIVITY_TYPES, claimed_at)).fetchone()
+                _at(eid, row[0] if row and row[0] else
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(owner_epoch)))
+    for eid, occurred_at in conn.execute(
+            "SELECT event_id, occurred_at FROM events WHERE type='stall_escalate_claim'"):
         if eid.endswith("_escalate"):
-            resolved.add(eid[: -len("_escalate")])
-    for (eid,) in conn.execute("SELECT event_id FROM events WHERE type='stall_wake_unowned'"):
+            _at(eid[: -len("_escalate")], occurred_at)
+    for eid, occurred_at in conn.execute(
+            "SELECT event_id, occurred_at FROM events WHERE type='stall_wake_unowned'"):
         if eid.endswith("_unowned"):
-            resolved.add(eid[: -len("_unowned")])
+            _at(eid[: -len("_unowned")], occurred_at)
     return resolved
+
+
+def _stall_resolved(owner_acted: dict | None) -> dict[str, str] | None:
+    """`_sw_resolved_keys` on its own read-only connection; None when the
+    registry cannot be read (signal 5 then skips rather than guessing)."""
+    if not REGISTRY.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
+        try:
+            return _sw_resolved_keys(conn, owner_acted=owner_acted)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def _stall_cprompt_occurrences(tasks: list[dict], now: float, resolved: dict[str, str] | None,
+                               pane_read_fn=None, pane_birth_fn=None):
+    """This tick's signal-5 `occurrence_fn`: confirm the cprompt epoch, run
+    the deploy seed while it is due, then resolve sightings against the
+    fold. An unconfirmed epoch skips signal 5 for the tick, visibly (r2 L4)."""
+    epoch = _stall_cprompt_epoch(now)
+    if epoch is None:
+        _stall_cprompt_fail("cprompt epoch unconfirmed; signal 5 skipped this tick")
+        return lambda _tid, _req, _now: None
+    _stall_cprompt_seed(tasks, now, epoch, pane_read_fn, pane_birth_fn)
+    return lambda tid, req, at: _stall_cprompt_sight(tid, req, at, resolved)
 
 
 def _stall_watchdog_tick() -> None:
@@ -4460,19 +4499,13 @@ def _stall_watchdog_tick() -> None:
     if not h or h.get("error"):
         return
     now = time.time()
-    denied, delivered, owner_acted, replied = _stall_task_signals(now=now)
-    candidates = stall_watchdog_candidates(h.get("tasks") or [], now=now, denied=denied,
-                                           delivered=delivered, owner_acted=owner_acted, replied=replied)
-    resolved: set[str] = set()
-    if REGISTRY.exists():
-        try:
-            conn = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=2)
-            try:
-                resolved = _sw_resolved_keys(conn, owner_acted=owner_acted)
-            finally:
-                conn.close()
-        except sqlite3.Error:
-            resolved = set()
+    tasks = h.get("tasks") or []
+    denied, delivered, owner_acted = _stall_task_signals(now=now)
+    resolved = _stall_resolved(owner_acted)
+    candidates = stall_watchdog_candidates(
+        tasks, now=now, denied=denied, delivered=delivered, owner_acted=owner_acted,
+        occurrence_fn=_stall_cprompt_occurrences(tasks, now, resolved))
+    resolved = resolved or {}
     dispatched = 0
     for c in candidates:
         key = f"stall_{c['task_id']}_{c['signal']}_{_sw_digest(c['fingerprint'])}"

@@ -168,7 +168,7 @@ _sw_wake_typed() {                      # task_id key -> 0 if an attempt already
 _sw_send_and_record() {                 # run_id task_id key signal conductor msg
   local run_id="$1" task_id="$2" key="$3" signal="$4" conductor="$5" msg="$6"
   local rc=0 out typed=0
-  out="$(bash "$SW_SEND" "$conductor" "$msg" 2>&1)" || rc=$?
+  out="$(bash "$SW_SEND" "$conductor" --not-an-answer "$msg" 2>&1)" || rc=$?
   if [ "$rc" = 4 ] || printf '%s' "$out" | grep -qi 'delivered'; then
     typed=1
   fi
