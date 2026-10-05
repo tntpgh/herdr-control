@@ -2,15 +2,18 @@
 # verify-worktree-archival.sh — real-negative test suite for close-done-
 # workers.sh's detached-HEAD close path and archive-worktrees.sh
 # (2026-10-05-worktree-archival-and-detached-close proposal; review r1 of
-# PR #236, whose probes P1-P8 are Section P below).
+# PR #236, whose probes P1-P8 are Section P below, and review r2, whose
+# probes are Section R).
 #
 # Real git throughout: a real bare "origin" repo, real `git worktree add`,
-# real `git ls-remote`/`rev-list`/`bundle`, real sha256 manifests. Only two
-# EXTERNAL services are stubbed, both exported bash functions the scripts
-# under test call as their own subprocess — `herdr` (never the real pane
-# daemon) and `gh` (never a real GitHub call) — same pattern as
-# verify-close-done-workers.sh. Every repo, worktree, registry, archive root
-# and code root lives under one mktemp dir; nothing here touches ~/Code.
+# real `git ls-remote`/`rev-list`/`bundle`, real sha256 manifests, real
+# lsof. Only two EXTERNAL services are stubbed, both exported bash functions
+# the scripts under test call as their own subprocess — `herdr` (never the
+# real pane daemon) and `gh` (never a real GitHub call) — same pattern as
+# verify-close-done-workers.sh. Section R adds a pass-through `shasum` on
+# PATH whose only job is to run a hook mid-archive. Every repo, worktree,
+# registry, archive root and code root lives under one mktemp dir; nothing
+# here touches ~/Code.
 #
 #   bash verify-worktree-archival.sh
 set -uo pipefail
@@ -41,10 +44,12 @@ mkdir -p "$WTROOT"
 CALLS=$(mktemp)
 export CALLS
 export PANES_JSON='{"result":{"panes":[{"pane_id":"pD","agent_status":"idle","terminal_id":"birthD-live","cwd":"/"}]}}'
+# PANES_FILE, when set, wins over PANES_JSON: a hook firing mid-run (Section
+# R) rewrites the file to "spawn" a pane between the check and the remove.
 herdr() {
   printf '%s\n' "$1 $2" >> "$CALLS"
   case "$1 $2" in
-    "pane list")  printf '%s\n' "$PANES_JSON" ;;
+    "pane list")  if [ -n "${PANES_FILE:-}" ]; then cat "$PANES_FILE"; else printf '%s\n' "$PANES_JSON"; fi ;;
     "pane close") : ;;
     *) printf '{}\n' ;;
   esac
@@ -616,6 +621,189 @@ chmod 755 "$RO"
 row "$out" "$W" | grep -q 'REFUSED.*archiving failed: could not create' \
   && ok "P8 (L1): REFUSED with the actual reason, not an empty one" || bad "P8 output: $out"
 present "P8" "$W"
+
+#######################################################################
+# Section R: review r2 probes as permanent real negatives. N4a, N6a, N6c,
+# N9, N9b, N11, N12, N15 and L5 each REMOVED a worktree that must be kept
+# on 64a0dc48; L1 and L3 mislabelled or always-LEFTOVER'd one.
+#######################################################################
+printf '\n== Section R: review r2 probes ==\n'
+R_TMP="$TMP/R"; mkdir -p "$R_TMP" "$TMP/bin"
+# A pass-through shasum: the archive copy hashes each file as it copies it,
+# so the first call is mid-archive. HOOK_FILE, when set and present, runs
+# ONCE there (it is renamed first) — the same mechanism review r2 used.
+REAL_SHASUM=$(command -v shasum)
+cat > "$TMP/bin/shasum" <<EOF
+#!/bin/bash
+if [ -n "\${HOOK_FILE:-}" ] && [ -f "\$HOOK_FILE" ]; then
+  mv -f "\$HOOK_FILE" "\$HOOK_FILE.fired" && bash "\$HOOK_FILE.fired"
+fi
+exec "$REAL_SHASUM" "\$@"
+EOF
+chmod +x "$TMP/bin/shasum"
+HOOKPATH="$TMP/bin:$PATH"
+M=abababababababababababababababababababab
+GH_PRS="$GH_PRS
+probe/n4#40 n4-merged MERGED $M
+probe/n6a#61 n6a-merged MERGED $M
+probe/n6c#63 n6c-merged MERGED $M
+probe/n9#91 n9-live MERGED $M
+probe/n11#111 n11-busy MERGED $M
+probe/n12#121 n12-fg MERGED $M
+probe/n15#151 n15-merged MERGED $M
+probe/l1#171 l1-a MERGED $M
+probe/l3#173 l3-locked MERGED $M"
+note() { mkdir -p "$1/tmp"; printf '%s\n' "${2:-notes}" > "$1/tmp/notes.md"; }
+_locked_by_us() {               # <wt>; stdin: worktree list --porcelain. Locked by archive-worktrees.sh?
+  awk -v w="$1" '/^worktree /{cur=substr($0,10)} /^locked archive-worktrees\.sh /{ if (cur == w) f=1 } END{exit !f}'
+}
+LOCKDIR="$HERDR_RUN_STATE_DIR/archive-worktrees.lock"
+
+printf '== N6a (H1): a re-spawn writes .handoffs/SPEC.md + a pane + a running task mid-archive ==\n'
+R="$R_TMP/n6a"; mkrepo "$R" probe/n6a; W="$WTROOT/n6a-merged"; mkwt "$R" n6a-merged "$W"; note "$W"
+PF="$R_TMP/n6a-panes.json"; printf '%s\n' "$PANES_JSON" > "$PF"
+cat > "$R_TMP/n6a-hook.sh" <<EOF
+git -C "$R" worktree list --porcelain > "$R_TMP/n6a-porcelain.txt"
+mkdir -p "$W/.handoffs"; echo 'SPEC written by a re-spawn mid-run' > "$W/.handoffs/SPEC.md"
+jq -nc --arg c "$W" '{result:{panes:[{pane_id:"spawned",cwd:\$c}]}}' > "$PF"
+. "$here/lib/run-registry.sh"
+register_task run6 task6 w c cp cb p6 b6 "$R" "$W" n6a >/dev/null && set_task_state run6 task6 running >/dev/null
+EOF
+out=$(PATH="$HOOKPATH" HOOK_FILE="$R_TMP/n6a-hook.sh" PANES_FILE="$PF" AW --apply "$R")
+[ -f "$R_TMP/n6a-hook.sh.fired" ] && ok "N6a: the mid-archive hook fired" || bad "N6a: hook never fired: $out"
+row "$out" "$W" | grep -q 'REFUSED.*changed while archiving' \
+  && ok "N6a: a pane/task/SPEC appearing mid-archive REFUSES the remove" || bad "N6a output: $out"
+present "N6a" "$W"
+[ -f "$W/.handoffs/SPEC.md" ] && ok "N6a: the re-spawn's SPEC.md survives" || bad "N6a: SPEC.md was destroyed"
+_locked_by_us "$W" < "$R_TMP/n6a-porcelain.txt" \
+  && ok "N6a: the worktree was git-worktree-locked while archiving" || bad "N6a: not locked mid-archive"
+git -C "$R" worktree list --porcelain | _locked_by_us "$W" \
+  && bad "N6a: still locked after the REFUSED" || ok "N6a: unlocked again after the REFUSED"
+[ -n "$(find "$HERDR_ARCHIVE_ROOT/n6a" -maxdepth 1 -type d -name 'n6a-merged-*.partial' 2>/dev/null)" ] \
+  && [ -z "$(find "$HERDR_ARCHIVE_ROOT/n6a" -maxdepth 1 -type d -name 'n6a-merged-*' ! -name '*.partial' 2>/dev/null)" ] \
+  && ok "N6a (L2): the refused archive is left as .partial, never a finished-looking one" \
+  || bad "N6a (L2): archive dirs: $(find "$HERDR_ARCHIVE_ROOT/n6a" -maxdepth 1 2>/dev/null | tr '\n' ' ')"
+
+printf '== N6c (H1): only an IGNORED file appears mid-archive (git remove would delete it) ==\n'
+R="$R_TMP/n6c"; mkrepo "$R" probe/n6c; W="$WTROOT/n6c-merged"; mkwt "$R" n6c-merged "$W"; note "$W"
+printf 'mkdir -p "%s/.handoffs"; echo late > "%s/.handoffs/SPEC.md"\n' "$W" "$W" > "$R_TMP/n6c-hook.sh"
+out=$(PATH="$HOOKPATH" HOOK_FILE="$R_TMP/n6c-hook.sh" AW --apply "$R")
+row "$out" "$W" | grep -q 'REFUSED.*files changed during archiving' \
+  && ok "N6c: a new ignored file mid-archive REFUSES the remove" || bad "N6c output: $out"
+present "N6c" "$W"
+[ -f "$W/.handoffs/SPEC.md" ] && ok "N6c: the late SPEC.md survives" || bad "N6c: the late SPEC.md was destroyed"
+
+printf '== N9 (H2): HERDR_RUN_STATE_DIR points at a missing / empty registry while a task runs ==\n'
+R="$R_TMP/n9"; mkrepo "$R" probe/n9; W="$WTROOT/n9-live"; mkwt "$R" n9-live "$W"; note "$W"
+register_task run9 task9 w c cp cb p9 b9 "$R" "$W" n9-live >/dev/null || bad "N9: register_task failed"
+set_task_state run9 task9 running >/dev/null || bad "N9: set_task_state failed"
+out=$(AW "$R")
+row "$out" "$W" | grep -q 'HOLD.*task task9' && ok "N9 control: the real registry HOLDs the live task" || bad "N9 control: $out"
+out=$(HERDR_RUN_STATE_DIR="$R_TMP/runs-typo" AW --apply "$R")
+row "$out" "$W" | grep -q HOLD && row "$out" "$W" | grep -qi 'does not exist' \
+  && ok "N9: a missing registry HOLDs (never 'nobody is working')" || bad "N9 output: $out"
+present "N9 (missing registry)" "$W"
+[ ! -e "$R_TMP/runs-typo" ] && ok "N9: the tool created no registry dir" || bad "N9: created $(ls "$R_TMP/runs-typo" 2>&1 | tr '\n' ' ')"
+mkdir -p "$R_TMP/runs-empty"
+HERDR_RUN_STATE_DIR="$R_TMP/runs-empty" bash -c '. "$1/lib/run-registry.sh" && registry_init' _ "$here" >/dev/null 2>&1 \
+  || bad "N9b: could not create the empty registry fixture"
+out=$(HERDR_RUN_STATE_DIR="$R_TMP/runs-empty" AW --apply "$R")
+row "$out" "$W" | grep -q HOLD && row "$out" "$W" | grep -qi 'never held a task' \
+  && ok "N9b: an existing but never-used registry HOLDs" || bad "N9b output: $out"
+present "N9b (empty registry)" "$W"
+
+printf '== N11 (H3): a non-herdr process has its cwd inside the worktree ==\n'
+R="$R_TMP/n11"; mkrepo "$R" probe/n11; W="$WTROOT/n11-busy"; mkwt "$R" n11-busy "$W"; note "$W"
+( cd "$W" && exec sleep 300 ) & spid=$!
+sleep 1
+out=$(AW --apply "$R")
+kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
+row "$out" "$W" | grep -q HOLD && row "$out" "$W" | grep -qi "process $spid has its cwd" \
+  && ok "N11: a plain process in the worktree HOLDs it" || bad "N11 output: $out"
+present "N11" "$W"
+
+printf '== N12 (M1): pane cwd is the worktree, foreground_cwd elsewhere ==\n'
+R="$R_TMP/n12"; mkrepo "$R" probe/n12; W="$WTROOT/n12-fg"; mkwt "$R" n12-fg "$W"; note "$W"
+pj=$(jq -nc --arg c "$W" '{result:{panes:[{pane_id:"f1",cwd:$c,foreground_cwd:"/tmp"}]}}')
+out=$(PANES_JSON="$pj" AW --apply "$R")
+row "$out" "$W" | grep -q HOLD && row "$out" "$W" | grep -qi 'live pane cwd' \
+  && ok "N12: a pane whose shell cwd is the worktree HOLDs it" || bad "N12 output: $out"
+present "N12" "$W"
+out=$(PANES_JSON='{"result":{"panes":[]}}' AW "$R")
+row "$out" "$W" | grep -qi 'HOLD.*returned no panes' \
+  && ok "N12 (H2): an empty pane list HOLDs (wrong herdr server)" || bad "N12 empty list: $out"
+
+printf '== N15 (M2): archive root inside the worktree being removed, or relative ==\n'
+R="$R_TMP/n15"; mkrepo "$R" probe/n15; W="$WTROOT/n15-merged"; mkwt "$R" n15-merged "$W"; note "$W" "only copy"
+out=$(HERDR_ARCHIVE_ROOT="$W/tmp/archive" AW --apply "$R")
+row "$out" "$W" | grep -q HOLD && row "$out" "$W" | grep -qi 'archive root .* is inside this worktree' \
+  && ok "N15: an archive root inside the worktree HOLDs" || bad "N15 output: $out"
+present "N15" "$W"
+[ ! -e "$W/tmp/archive" ] && ok "N15: nothing was archived into the worktree" || bad "N15: wrote $W/tmp/archive"
+ln -s "$W" "$R_TMP/n15-link"
+out=$(HERDR_ARCHIVE_ROOT="$R_TMP/n15-link/tmp/archive" AW --apply "$R")
+row "$out" "$W" | grep -qi 'HOLD.*is inside this worktree' \
+  && ok "N15: a symlinked spelling of that root HOLDs too" || bad "N15 symlinked root: $out"
+present "N15 (symlinked root)" "$W"
+out=$(HERDR_ARCHIVE_ROOT="rel/archive" AW --apply "$R"); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi 'not an absolute path' \
+  && ok "N15: a relative archive root refuses the run" || bad "N15 relative: rc=$rc $out"
+present "N15 (relative root)" "$W"
+
+printf '== N4a (M3): a second --apply while one holds the lock; two concurrent runs ==\n'
+R="$R_TMP/n4"; mkrepo "$R" probe/n4; W="$WTROOT/n4-merged"; mkwt "$R" n4-merged "$W"
+note "$W"; printf 'more\n' > "$W/tmp/more.md"
+n4_notes=$(shasum -a 256 "$W/tmp/notes.md" | cut -d' ' -f1); n4_more=$(shasum -a 256 "$W/tmp/more.md" | cut -d' ' -f1)
+mkdir "$LOCKDIR" && printf '%s\n' "$$" > "$LOCKDIR/pid"
+out=$(AW --apply "$R"); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "holds $LOCKDIR (pid $$)" \
+  && ok "N4a: --apply refuses while another run holds the lock" || bad "N4a held lock: rc=$rc $out"
+present "N4a (lock held)" "$W"
+[ -d "$LOCKDIR" ] && ok "N4a: the refused run left the other run's lock alone" || bad "N4a: the refused run removed a lock it did not own"
+rm -f "$LOCKDIR/pid"; rmdir "$LOCKDIR"
+AW --apply "$R" > "$R_TMP/n4-A.out" & pa=$!
+AW --apply "$R" > "$R_TMP/n4-B.out" & pb=$!
+wait "$pa" "$pb"
+[ ! -d "$W" ] && ok "N4a: two concurrent runs removed the worktree" \
+  || bad "N4a concurrent: A: $(cat "$R_TMP/n4-A.out") B: $(cat "$R_TMP/n4-B.out")"
+n4d=$(find "$HERDR_ARCHIVE_ROOT/n4" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+[ "$(printf '%s\n' "$n4d" | grep -c .)" -eq 1 ] && case "$n4d" in *.partial) false ;; esac \
+  && ok "N4a: exactly one finished archive dir" || bad "N4a: archive dirs: $n4d"
+[ "$(grep -vc '^EXCLUDED' "$n4d/MANIFEST.sha256" 2>/dev/null)" = 2 ] \
+  && _manifest_has "$n4d/MANIFEST.sha256" "$n4_notes" tmp/notes.md && _manifest_has "$n4d/MANIFEST.sha256" "$n4_more" tmp/more.md \
+  && [ -f "$n4d/DISPOSITION.txt" ] && [ -f "$n4d/branch.bundle" ] \
+  && ok "N4a: its manifest holds both entries (never truncated by the other run)" \
+  || bad "N4a: manifest: $(cat "$n4d/MANIFEST.sha256" 2>&1)"
+[ ! -e "$LOCKDIR" ] && ok "N4a: the lock is released after the runs" || bad "N4a: lock left behind at $LOCKDIR"
+
+printf '== L1: a registered worktree path swapped for a symlink to a sibling ==\n'
+R="$R_TMP/l1"; mkrepo "$R" probe/l1
+Wa="$WTROOT/l1-a"; Wb="$WTROOT/l1-b"; mkwt "$R" l1-a "$Wa"; mkwt "$R" l1-b "$Wb"
+note "$Wa" a-notes; note "$Wb" b-notes
+mv "$Wa" "$R_TMP/l1-a-moved"; ln -s "$Wb" "$Wa"
+out=$(AW --apply "$R")
+row "$out" "$Wa" | grep -q 'HOLD.*symlink' && ok "L1: a symlinked worktree path HOLDs" || bad "L1 output: $out"
+[ -z "$(find "$HERDR_ARCHIVE_ROOT/l1" -mindepth 1 -maxdepth 1 2>/dev/null)" ] \
+  && ok "L1: no archive was written (none under another worktree's label)" || bad "L1: archive written: $(find "$HERDR_ARCHIVE_ROOT/l1" -mindepth 1 -maxdepth 1)"
+[ -d "$Wb" ] && [ -f "$R_TMP/l1-a-moved/tmp/notes.md" ] && ok "L1: both real directories intact" || bad "L1: a real directory is gone"
+
+printf '== L3: a locked worktree previews as HOLD, not archive ==\n'
+R="$R_TMP/l3"; mkrepo "$R" probe/l3; W="$WTROOT/l3-locked"; mkwt "$R" l3-locked "$W"; note "$W"
+git -C "$R" worktree lock --reason "on a removable disk" "$W"
+out=$(AW "$R")
+row "$out" "$W" | grep -q 'HOLD.*locked' && ok "L3: a locked worktree HOLDs in preview" || bad "L3 output: $out"
+out=$(AW --apply "$R")
+[ -z "$(find "$HERDR_ARCHIVE_ROOT/l3" -mindepth 1 -maxdepth 1 2>/dev/null)" ] \
+  && ok "L3: --apply wrote no archive for it" || bad "L3: archive written: $out"
+present "L3" "$W"
+
+printf '== L5: a detached worktree holding a refs/worktree ref ==\n'
+R="$R_TMP/l5"; mkrepo "$R" probe/l5; W="$WTROOT/l5-det"; G -C "$R" worktree add -q --detach "$W" main
+G -C "$W" commit -q --allow-empty -m "detached local work"; X=$(git -C "$W" rev-parse HEAD)
+G -C "$W" update-ref refs/worktree/keep "$X"; G -C "$W" checkout -q --detach main
+out=$(AW --apply --worktree="$W" --disposition=abandoned "$R")
+row "$out" "$W" | grep -q 'HOLD.*worktree-private refs' && ok "L5: worktree-private refs HOLD" || bad "L5 output: $out"
+present "L5" "$W"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

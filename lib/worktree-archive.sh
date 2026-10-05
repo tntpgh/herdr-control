@@ -15,6 +15,8 @@
 #                                                               both still match the manifest
 #   archive_need_kb                  <worktree> <files>    -> KiB the copy + bundle may take
 #   archive_free_kb                  <path>                -> KiB free on the filesystem holding it
+#   archive_root_why                 <archive-root> <worktree> -> a HOLD reason when the archive
+#                                                               could not outlive the worktree
 #   archive_create_bundle            <worktree> <bundle-path>
 #   archive_verify_bundle            <worktree> <bundle-path>
 #
@@ -218,6 +220,46 @@ archive_free_kb() {
     d=$(dirname "$d")
   done
   df -Pk "$d" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4; f = 1 } END { exit !f }'
+}
+
+# archive_root_why <archive-root> <worktree> -> prints a HOLD reason, or
+# nothing. The verified archive must outlive the worktree it was taken from
+# (review r2 M2 of PR #236): a RELATIVE root resolves against whatever cwd
+# the caller happens to have, and a root at or beneath the worktree is
+# deleted by the very `git worktree remove` it was meant to survive — the
+# only copy goes with it. Compared raw AND resolved (the nearest existing
+# ancestor's realpath plus the not-yet-created rest), so a symlinked or
+# `..` spelling of the same place is caught too. Unresolvable = a reason.
+archive_root_why() {
+  local root="$1" wt="$2" wr d rest="" rr r w
+  case "$root" in
+    /*) ;;
+    *) printf 'archive root %s is not an absolute path\n' "$root"; return 0 ;;
+  esac
+  if ! wr=$(cd "$wt" 2>/dev/null && pwd -P); then
+    printf 'cannot resolve %s to check the archive root against it\n' "$wt"
+    return 0
+  fi
+  d="$root"
+  while [ ! -d "$d" ]; do
+    rest="/$(basename "$d")$rest"
+    d=$(dirname "$d")
+  done
+  if ! rr=$(cd "$d" 2>/dev/null && pwd -P); then
+    printf 'cannot resolve the archive root %s\n' "$root"
+    return 0
+  fi
+  rr="${rr%/}$rest"
+  for r in "$root" "$rr"; do
+    for w in "$wt" "$wr"; do
+      case "$r/" in
+        "$w"/*)
+          printf 'archive root %s is inside this worktree (%s) — the archive would be deleted with it\n' "$root" "$w"
+          return 0
+          ;;
+      esac
+    done
+  done
 }
 
 # A git bundle of HEAD — every commit reachable from the current tip,

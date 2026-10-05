@@ -2,7 +2,7 @@
 # archive-worktrees.sh — recoverably archive, then remove, linked git
 # worktrees whose work is done. DRY-RUN BY DEFAULT.
 # (2026-10-05-worktree-archival-and-detached-close proposal; fixed per
-# review r1 of PR #236.)
+# reviews r1 and r2 of PR #236.)
 #
 #   archive-worktrees.sh                                  # preview every repo under ~/Code
 #   archive-worktrees.sh ~/Code/herdr-control              # preview one repo
@@ -34,10 +34,17 @@
 #     registry row, so no liveness signal can see it) and ~/.local/share.
 #
 # ---- a worktree is removable only when ALL of ------------------------------------
-#   1. liveness is verifiable and clear: the run registry is readable and
-#      has no starting/running/blocked task at or beneath this path, and
-#      `herdr pane list` parses, every pane reports a cwd, and no pane's cwd
-#      (raw or realpath) is this path or anywhere beneath it.
+#   1. liveness is verifiable and clear — at preview time AND again
+#      immediately before `git worktree remove` (review r2 H1):
+#        - the run registry ALREADY EXISTS, has ever held a task, reads
+#          (read-only), and has no starting/running/blocked task at or
+#          beneath this path. A missing or empty registry is never "nobody is
+#          working", and this tool never creates one (r2 H2);
+#        - `herdr pane list` parses and lists at least one pane, every pane
+#          reports a cwd, and no pane's cwd OR foreground_cwd (raw or
+#          realpath) is this path or beneath it (r2 M1);
+#        - `lsof -d cwd` runs and sees this process, and NO process at all —
+#          herdr pane or not — has its cwd at or beneath this path (r2 H3).
 #   2. HEAD is reachable from a ref origin has RIGHT NOW (`git ls-remote
 #      origin`: branches, tags, refs/pull/N/head) — never a cached
 #      remote-tracking ref. RECOVERABILITY, never delivery.
@@ -54,14 +61,31 @@
 #      --include-dirty. Ignored artifacts (.handoffs/, tmp/) are archived.
 #   5. the archive root's filesystem has room for the copy plus a bundle of
 #      HEAD plus HERDR_ARCHIVE_MIN_FREE_KB (default 1 GiB) of headroom.
+#   6. git could actually remove it and the archive outlives it: the path is
+#      not a symlink and git resolves it to itself (r2 L1); it is not
+#      `git worktree lock`ed and has no submodule (r2 L3); it has no
+#      worktree-private refs/worktree or refs/bisect refs, which the HEAD
+#      bundle would not carry (r2 L5); and the archive root
+#      (HERDR_ARCHIVE_ROOT, absolute) is not at or beneath it (r2 M2).
 #
 # Then tracked changes, untracked files and ignored artifacts are copied to
-# ~/Code/.archive/worktrees/<repo>/<branch-or-ref>-<ts>/ with a sha256
+# ~/Code/.archive/worktrees/<repo>/<branch-or-ref>-<ts>-<pid>/ with a sha256
 # MANIFEST (lib/worktree-archive.sh) — regenerable dirs (node_modules,
 # .venv, build/dist caches) are not copied but listed in it as EXCLUDED —
 # a `git bundle` of HEAD is written alongside, BOTH are verified, and only
 # then does `git worktree remove` run (never `--force`; a leftover directory
 # after a clean remove is cleaned by hand with `trash`, never rm -rf).
+#
+# ---- --apply concurrency (review r2 H1/M3) ---------------------------------------
+#   * one --apply at a time: a mkdir lock, archive-worktrees.lock, beside the
+#     registry this run trusts ($HERDR_RUN_STATE_DIR). A second run exits.
+#   * each worktree is `git worktree lock`ed for its archive-to-remove
+#     window; spawn-task.sh refuses to re-spawn into one locked by this tool.
+#   * the archive is written to <dest>.partial/ (created with a plain mkdir,
+#     never -p) and renamed to <dest>/ only once verified, so an interrupted
+#     run leaves a dir that says it is unfinished.
+#   * right before the remove, liveness, HEAD, the file set and the manifest
+#     are all read AGAIN for that one worktree; any change REFUSES it.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib/run-registry.sh
@@ -115,6 +139,8 @@ code_root="${HERDR_CODE_ROOT:-$HOME/Code}"
 archive_root="${HERDR_ARCHIVE_ROOT:-$HOME/Code/.archive/worktrees}"
 min_free_kb="${HERDR_ARCHIVE_MIN_FREE_KB:-1048576}"
 case "$min_free_kb" in ''|*[!0-9]*) _die "HERDR_ARCHIVE_MIN_FREE_KB=$min_free_kb is not a whole number of KiB" ;; esac
+# r2 M2: a relative root resolves against the caller's cwd — wherever that is.
+case "$archive_root" in /*) ;; *) _die "HERDR_ARCHIVE_ROOT=$archive_root is not an absolute path" ;; esac
 
 # Repos to scan: explicit args, or every PRIMARY checkout directly under the
 # code root (`.git` a real directory — a linked worktree's `.git` is a FILE).
@@ -171,45 +197,85 @@ _origin_slug() {
   printf '%s\n' "$url"
 }
 
-# ---- H5: live pane cwds, raw AND canonical -------------------------------------------
-panes_why=""
-pane_cwds=""
-panes_json=$(herdr pane list 2>/dev/null)
-if ! printf '%s' "$panes_json" | jq -e '(.result.panes // .panes) | type == "array"' >/dev/null 2>&1; then
-  panes_why="herdr pane list is unavailable or unparseable; liveness cannot be verified"
-elif ! no_cwd=$(printf '%s' "$panes_json" | jq -r '[(.result.panes // .panes)[] | select(((.foreground_cwd // .cwd // "") | length) == 0) | .pane_id // "?"] | join(",")'); then
-  panes_why="herdr pane list could not be read; liveness cannot be verified"
-elif [ -n "$no_cwd" ]; then
-  panes_why="pane(s) $no_cwd report no cwd; liveness cannot be verified"
-elif ! raw_cwds=$(printf '%s' "$panes_json" | jq -r '(.result.panes // .panes)[] | (.foreground_cwd // .cwd)'); then
-  panes_why="herdr pane list could not be read; liveness cannot be verified"
-else
-  while IFS= read -r c; do
-    [ -n "$c" ] || continue
-    pane_cwds+="$c"$'\n'
-    cr=$(_realdir "$c") && [ "$cr" != "$c" ] && pane_cwds+="$cr"$'\n'
-  done <<<"$raw_cwds"
-fi
+# ---- liveness: three sources, each a function so the pre-remove re-check
+# (r2 H1) reads them AGAIN rather than trusting this run's first snapshot.
 
-# ---- H3: live registry rows, read ONCE, exit status checked ------------------------
-reg_why=""
-reg_paths=()                    # "task_id|path" for raw and canonical forms
-if ! registry_init >/dev/null 2>&1; then
-  reg_why="run registry unreadable (registry_init failed); liveness cannot be verified"
-elif ! reg_rows=$(_sql "SELECT task_id || '|' || worktree FROM tasks WHERE state IN ('starting','running','blocked') AND worktree IS NOT NULL AND worktree != '';" 2>/dev/null); then
-  reg_why="run registry query failed; liveness cannot be verified"
-else
-  while IFS='|' read -r tid twt; do
-    [ -n "$twt" ] || continue
-    reg_paths+=("$tid|$twt")
-    twt_real=$(_realdir "$twt") && [ "$twt_real" != "$twt" ] && reg_paths+=("$tid|$twt_real")
-  done <<<"$reg_rows"
-fi
+# H5 + r2 M1/H2: live pane cwds — BOTH cwd and foreground_cwd, raw AND
+# canonical. A pane with neither field, or a list with no panes at all (the
+# wrong herdr server/socket), makes liveness unverifiable.
+_read_panes() {
+  local json no_cwd raw c cr n
+  panes_why=""; pane_cwds=""
+  json=$(herdr pane list 2>/dev/null)
+  if ! printf '%s' "$json" | jq -e '(.result.panes // .panes) | type == "array"' >/dev/null 2>&1; then
+    panes_why="herdr pane list is unavailable or unparseable; liveness cannot be verified"
+  elif ! n=$(printf '%s' "$json" | jq -r '(.result.panes // .panes) | length') || [ "$n" = 0 ]; then
+    panes_why="herdr pane list returned no panes (wrong herdr server?); liveness cannot be verified"
+  elif ! no_cwd=$(printf '%s' "$json" | jq -r '[(.result.panes // .panes)[] | select(((.cwd // "") == "") and ((.foreground_cwd // "") == "")) | .pane_id // "?"] | join(",")'); then
+    panes_why="herdr pane list could not be read; liveness cannot be verified"
+  elif [ -n "$no_cwd" ]; then
+    panes_why="pane(s) $no_cwd report no cwd; liveness cannot be verified"
+  elif ! raw=$(printf '%s' "$json" | jq -r '(.result.panes // .panes)[] | (.cwd, .foreground_cwd) | select(. != null and . != "")'); then
+    panes_why="herdr pane list could not be read; liveness cannot be verified"
+  else
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      pane_cwds+="$c"$'\n'
+      cr=$(_realdir "$c") && [ "$cr" != "$c" ] && pane_cwds+="$cr"$'\n'
+    done <<<"$raw"
+  fi
+}
+
+# H3 + r2 H2: live registry rows, exit status checked. A registry that does
+# not already exist, or has never held a task, is a WRONG registry (typo'd or
+# unset HERDR_RUN_STATE_DIR), never an empty one — and it is opened
+# -readonly: registry_init would mkdir and CREATE it, which is exactly how a
+# typo'd dir used to read as "nobody is working".
+_reg_ro() {
+  sqlite3 -readonly -batch -noheader -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$(registry_db)" "$1"
+}
+_read_registry() {
+  local db n rows tid twt twt_real
+  reg_why=""; reg_paths=()        # "task_id|path" for raw and canonical forms
+  db=$(registry_db)
+  if [ ! -f "$db" ] || [ ! -s "$db" ]; then
+    reg_why="run registry $db does not exist (HERDR_RUN_STATE_DIR wrong or unset?) — a missing registry is not an empty one; liveness cannot be verified"
+  elif ! n=$(_reg_ro "SELECT count(*) FROM tasks;" 2>/dev/null); then
+    reg_why="run registry query failed; liveness cannot be verified"
+  elif [ "$n" = 0 ] || case "$n" in ''|*[!0-9]*) true ;; *) false ;; esac; then
+    reg_why="run registry $db has never held a task (not the live registry?); liveness cannot be verified"
+  elif ! rows=$(_reg_ro "SELECT task_id || '|' || worktree FROM tasks WHERE state IN ('starting','running','blocked') AND worktree IS NOT NULL AND worktree != '';" 2>/dev/null); then
+    reg_why="run registry query failed; liveness cannot be verified"
+  else
+    while IFS='|' read -r tid twt; do
+      [ -n "$twt" ] || continue
+      reg_paths+=("$tid|$twt")
+      twt_real=$(_realdir "$twt") && [ "$twt_real" != "$twt" ] && reg_paths+=("$tid|$twt_real")
+    done <<<"$rows"
+  fi
+}
+
+# r2 H3: every process's cwd, herdr pane or not — an omp session, editor,
+# dev server or shell in a plain terminal under ~/Code/.worktrees is as live
+# as a pane. lsof reports the kernel's (canonical) path. It must exit 0 AND
+# list this very process, or it cannot see what it is being asked about.
+_read_proc_cwds() {
+  local out
+  proc_why=""; proc_cwds=""
+  if ! out=$(lsof -w -d cwd -Fpn 2>/dev/null); then
+    proc_why="lsof -d cwd failed; process cwds cannot be verified"
+  elif ! printf '%s\n' "$out" | grep -qx "p$$"; then
+    proc_why="lsof -d cwd did not list this process; process cwds cannot be verified"
+  else
+    proc_cwds=$(printf '%s\n' "$out" | awk '/^p/ { p = substr($0, 2); next } /^n/ { print p "|" substr($0, 2) }')
+  fi
+}
 
 _live_why() {                   # <wt> <wt_real> -> prints a HOLD reason, or nothing
-  local c row
+  local c row pid
   if [ -n "$panes_why" ]; then printf '%s\n' "$panes_why"; return; fi
   if [ -n "$reg_why" ]; then printf '%s\n' "$reg_why"; return; fi
+  if [ -n "$proc_why" ]; then printf '%s\n' "$proc_why"; return; fi
   while IFS= read -r c; do
     if _within "$c" "$1" || _within "$c" "$2"; then
       printf 'a live pane cwd (%s) is inside this worktree\n' "$c"
@@ -222,6 +288,76 @@ _live_why() {                   # <wt> <wt_real> -> prints a HOLD reason, or not
       return
     fi
   done
+  while IFS='|' read -r pid c; do
+    if _within "$c" "$1" || _within "$c" "$2"; then
+      printf 'process %s has its cwd (%s) inside this worktree\n' "$pid" "$c"
+      return
+    fi
+  done <<<"$proc_cwds"
+}
+
+_read_registry
+
+# ---- r2 M3: one --apply at a time ----------------------------------------------------
+# A mkdir lock (no flock on macOS) beside the registry this run trusts — the
+# real registry dir in production, a scratch one under test. With no usable
+# registry every worktree HOLDs on reg_why and nothing is mutated, so no
+# lock is needed (and the missing dir is never created). A lock left by a
+# SIGKILLed run is never stolen: its pid is printed for the operator.
+# The EXIT trap also unlocks a worktree this run `git worktree lock`ed.
+run_lock=""; locked_wt=""; locked_repo=""
+_cleanup() {
+  [ -n "$locked_wt" ] && git -C "$locked_repo" worktree unlock "$locked_wt" >/dev/null 2>&1
+  if [ -n "$run_lock" ]; then
+    rm -f "$run_lock/pid"
+    rmdir "$run_lock" 2>/dev/null
+  fi
+  return 0
+}
+trap _cleanup EXIT
+trap 'exit 130' INT TERM HUP
+if [ "$apply" = 1 ] && [ -z "$reg_why" ]; then
+  lock="$(run_state_root)/archive-worktrees.lock"
+  mkdir "$lock" 2>/dev/null \
+    || _die "another archive-worktrees.sh --apply holds $lock (pid $(cat "$lock/pid" 2>/dev/null || echo '?')); if that pid is gone, \`trash\` the lock dir and re-run"
+  run_lock="$lock"
+  printf '%s\n' "$$" > "$lock/pid"
+fi
+
+_read_panes
+_read_proc_cwds
+_WT_LOCK_REASON="archive-worktrees.sh pid $$: archiving, about to remove"
+
+# r2 H1: <wt> <wt_real> <head> <files> <excluded> <manifest|""> -> prints a
+# reason, or nothing. Run immediately before `git worktree remove`, while
+# the worktree is `git worktree lock`ed: everything the decision rested on is
+# read AGAIN for this one worktree. Ignored files (.handoffs/SPEC.md from a
+# re-spawn) are deleted by a non-forced remove, so a new one must REFUSE.
+_recheck_why() {
+  local wt="$1" wt_real="$2" head="$3" files="$4" excluded="$5" manifest="$6" why now td ut ig nf first
+  _read_panes; _read_registry; _read_proc_cwds
+  why=$(_live_why "$wt" "$wt_real")
+  if [ -n "$why" ]; then printf '%s\n' "$why"; return; fi
+  now=$(git -C "$wt" rev-parse HEAD 2>/dev/null)
+  if [ "$now" != "$head" ]; then printf 'HEAD moved during archiving (%s -> %s)\n' "$head" "${now:-?}"; return; fi
+  if ! td=$(archive_enumerate_tracked_dirty "$wt") || ! ut=$(archive_enumerate_untracked "$wt") \
+    || ! ig=$(archive_enumerate_ignored "$wt") || ! archive_split_regenerable "$ig"; then
+    printf 'git could not re-list the worktree files\n'
+    return
+  fi
+  nf=$(printf '%s\n%s\n%s\n' "$td" "$ut" "$_ARCHIVE_KEEP" | grep . | sort -u)
+  if [ "$nf" != "$files" ]; then
+    first=$(comm -3 <(printf '%s\n' "$files") <(printf '%s\n' "$nf") | head -1 | tr -d '\t')
+    printf 'files changed during archiving (e.g. %s)\n' "${first:-?}"
+    return
+  fi
+  if [ "$(printf '%s\n' "$_ARCHIVE_EXCLUDED" | cut -f2)" != "$(printf '%s\n' "$excluded" | cut -f2)" ]; then
+    printf 'regenerable directories changed during archiving\n'
+    return
+  fi
+  if [ -n "$manifest" ] && ! archive_verify_manifest "$wt" "$manifest"; then
+    printf '%s\n' "$_ARCHIVE_WHY"
+  fi
 }
 
 _in_scope() {                   # <wt> <wt_real> <branch>
@@ -239,12 +375,14 @@ for repo in ${repo_args[@]+"${repo_args[@]}"}; do
     continue
   fi
   repo_base="$(basename "$repo")"
-  if ! wt_list=$(git -C "$repo" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}') \
+  if ! porcelain=$(git -C "$repo" worktree list --porcelain 2>/dev/null) \
+    || ! wt_list=$(printf '%s\n' "$porcelain" | awk '/^worktree /{print substr($0,10)}') \
     || [ -z "$wt_list" ]; then
     [ "$scoped" = 1 ] && _die "git worktree list failed for $repo"
     printf '  SKIP    %s — git worktree list failed\n' "$repo"
     continue
   fi
+  locked_list=$(printf '%s\n' "$porcelain" | awk '/^worktree /{cur=substr($0,10)} /^locked/{print cur}')
   primary="${wt_list%%$'\n'*}"
 
   # H4: a scope must name exactly one linked worktree before anything runs.
@@ -281,6 +419,38 @@ for repo in ${repo_args[@]+"${repo_args[@]}"}; do
     [ -n "$wt_real" ] || why="cannot resolve the real path"
     [ -n "$why" ] || why=$(_root_why "$wt" "$wt_real")
     [ -n "$why" ] || why=$(_live_why "$wt" "$wt_real")
+    [ -n "$why" ] || why=$(archive_root_why "$archive_root" "$wt")
+    # r2 L1: a registered path swapped for a symlink would be checked and
+    # archived as some OTHER directory under this worktree's label.
+    if [ -z "$why" ]; then
+      if [ -L "$wt" ]; then
+        why="the worktree path is a symlink — checks and archive would describe another directory"
+      elif ! tl=$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null) || [ "$(_realdir "$tl")" != "$wt_real" ]; then
+        why="git resolves this path to another checkout (${tl:-?}), not this worktree"
+      fi
+    fi
+    # r2 L3: git worktree remove can never remove these; previewing them as
+    # archivable only wrote a fresh archive and a LEFTOVER on every run.
+    if [ -z "$why" ] && printf '%s\n' "$locked_list" | grep -qxF -- "$wt"; then
+      why="locked (git worktree lock) — git worktree remove would refuse it; unlock it first"
+    fi
+    if [ -z "$why" ]; then
+      if ! idx=$(git -C "$wt" ls-files -s 2>/dev/null); then
+        why="git ls-files failed; submodules cannot be checked"
+      else
+        gl=$(printf '%s\n' "$idx" | awk '$1 == "160000" { sub(/^[^\t]*\t/, ""); print; exit }')
+        [ -n "$gl" ] && why="contains a submodule ($gl) — git worktree remove would refuse it"
+      fi
+    fi
+    # r2 L5: worktree-private refs are deleted with the worktree; the bundle
+    # holds HEAD only.
+    if [ -z "$why" ]; then
+      if ! wrefs=$(git -C "$wt" for-each-ref --format='%(refname)' refs/worktree refs/bisect 2>/dev/null); then
+        why="git for-each-ref failed; worktree-private refs cannot be checked"
+      elif [ -n "$wrefs" ]; then
+        why="has worktree-private refs the archive bundle would not carry (${wrefs%%$'\n'*})"
+      fi
+    fi
 
     if [ -z "$why" ]; then
       if [ -n "$origin_why" ]; then
@@ -393,38 +563,73 @@ for repo in ${repo_args[@]+"${repo_args[@]}"}; do
     nexcl=$(printf '%s\n' "$excluded" | grep -c .)
     ts=$(date -u +%Y%m%dT%H%M%SZ)
     slot="${branch:-detached-$(git -C "$wt" rev-parse --short HEAD 2>/dev/null)}"
-    dest="$archive_root/$repo_base/${slot//\//-}-$ts"
+    # r2 M3: the pid makes the name unique per run; it is still created with
+    # a plain mkdir (never -p) and refused if anything is already there.
+    dest="$archive_root/$repo_base/${slot//\//-}-$ts-$$"
 
     archivable=$((archivable+1))
     printf '  archive %-44s %-20s disposition=%s (%s file(s), %s regenerable dir(s) excluded, + bundle) -> %s\n' \
       "$wt" "${branch:-<detached>}" "$disposition" "$nfiles" "$nexcl" "$dest"
     [ "$apply" = 1 ] || continue
 
-    refuse=""
-    if [ -n "$files" ]; then
-      if ! archive_copy_and_manifest "$wt" "$dest" "$files"; then
+    # Archive into <dest>.partial/ (r2 L2: an interrupted run leaves a dir
+    # that says it is unfinished), with the worktree locked against a
+    # re-spawn for the whole archive-to-remove window (r2 H1).
+    refuse=""; part="$dest.partial"; manifest=""
+    head_sha=$(git -C "$wt" rev-parse HEAD 2>/dev/null)
+    [ -n "$head_sha" ] || refuse="could not resolve HEAD"
+    if [ -z "$refuse" ]; then
+      if git -C "$repo" worktree lock --reason "$_WT_LOCK_REASON" "$wt" >/dev/null 2>&1; then
+        locked_wt="$wt"; locked_repo="$repo"
+      else
+        refuse="git worktree lock failed — cannot fence off a re-spawn while archiving"
+      fi
+    fi
+    if [ -z "$refuse" ] && { [ -e "$dest" ] || ! mkdir -p "$archive_root/$repo_base" 2>/dev/null || ! mkdir "$part" 2>/dev/null; }; then
+      refuse="archiving failed: could not create $part (or $dest already exists)"
+    fi
+    if [ -z "$refuse" ] && [ -n "$files" ]; then
+      if ! archive_copy_and_manifest "$wt" "$part" "$files"; then
         refuse="archiving failed: $_ARCHIVE_WHY"
       elif ! archive_verify_manifest "$wt" "$_ARCHIVE_MANIFEST"; then
         refuse="archive verification failed: $_ARCHIVE_WHY"
+      else
+        manifest="$_ARCHIVE_MANIFEST"
       fi
-    elif ! mkdir -p "$dest" 2>/dev/null; then
-      refuse="archiving failed: could not create $dest"
     fi
-    if [ -z "$refuse" ] && ! archive_record_exclusions "$dest" "$excluded"; then
+    if [ -z "$refuse" ] && ! archive_record_exclusions "$part" "$excluded"; then
       refuse="archiving failed: $_ARCHIVE_WHY"
     fi
-    if [ -z "$refuse" ] && ! archive_create_bundle "$wt" "$dest/branch.bundle"; then
+    if [ -z "$refuse" ] && ! archive_create_bundle "$wt" "$part/branch.bundle"; then
       refuse="git bundle create failed"
     fi
-    if [ -z "$refuse" ] && ! archive_verify_bundle "$wt" "$dest/branch.bundle"; then
+    if [ -z "$refuse" ] && ! archive_verify_bundle "$wt" "$part/branch.bundle"; then
       refuse="git bundle verify failed"
     fi
     if [ -z "$refuse" ] && ! printf 'disposition=%s branch=%s ref_sha=%s archived_at=%s\n' \
-        "$disposition" "${branch:-<detached>}" "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" "$ts" > "$dest/DISPOSITION.txt" 2>/dev/null; then
-      refuse="could not write $dest/DISPOSITION.txt"
+        "$disposition" "${branch:-<detached>}" "$head_sha" "$ts" > "$part/DISPOSITION.txt" 2>/dev/null; then
+      refuse="could not write $part/DISPOSITION.txt"
+    fi
+    if [ -z "$refuse" ]; then
+      recheck=$(_recheck_why "$wt" "$wt_real" "$head_sha" "$files" "$excluded" "$manifest")
+      [ -n "$recheck" ] && refuse="changed while archiving: $recheck"
+    fi
+    if [ -z "$refuse" ] && { [ -e "$dest" ] || ! mv "$part" "$dest" 2>/dev/null; }; then
+      refuse="could not rename $part to $dest"
+    fi
+    # ceiling: the unlock -> remove gap is the one unfenced moment; a
+    # re-spawn landing in it loses only what it wrote in those milliseconds.
+    # Closing it needs git to remove a locked worktree without --force.
+    if [ -n "$locked_wt" ]; then
+      if ! git -C "$repo" worktree unlock "$wt" >/dev/null 2>&1; then
+        [ -n "$refuse" ] && refuse="$refuse; "
+        refuse="${refuse}git worktree unlock failed — it is still locked"
+      fi
+      locked_wt=""
     fi
     if [ -n "$refuse" ]; then
       held=$((held+1)); archivable=$((archivable-1))
+      [ -d "$part" ] && refuse="$refuse (unfinished archive left at $part)"
       printf '  REFUSED %-44s %-20s %s\n' "$wt" "${branch:-<detached>}" "$refuse"
       continue
     fi

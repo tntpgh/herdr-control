@@ -115,6 +115,22 @@ check "exactly one Proof contract heading, not duplicated" \
 grep -q 'SELF-REFERENTIAL-MARKER-BEFORE-RESPAWN' "$spec" 2>/dev/null \
   && ok "brief's own body content preserved" || bad "brief body lost: $(cat "$spec" 2>/dev/null)"
 
+printf '== re-spawn into a worktree archive-worktrees.sh has locked: refused, SPEC.md untouched ==\n'
+# archive-worktrees.sh --apply holds this lock across its archive-to-remove
+# window (review r2 H1 of PR #236); a re-spawn writing .handoffs/ there
+# would be deleted unarchived by the `git worktree remove` that follows.
+git -C "$probe_repo" worktree lock --reason "archive-worktrees.sh pid 1: archiving, about to remove" "$wt"
+spec_before=$(shasum -a 256 "$spec" | cut -d' ' -f1)
+if run_spawn no-brief-branch --brief "$brief_file2" >/tmp/spawn-out8-$$.log 2>&1; then
+  bad "re-spawn into an archive-locked worktree was ACCEPTED"
+elif grep -q 'locked by an archive-worktrees.sh run' /tmp/spawn-out8-$$.log; then
+  ok "re-spawn into an archive-locked worktree refused"
+else
+  bad "re-spawn refused for another reason: $(cat /tmp/spawn-out8-$$.log)"
+fi
+check "SPEC.md untouched by the refused re-spawn" "$(shasum -a 256 "$spec" | cut -d' ' -f1)" "$spec_before"
+git -C "$probe_repo" worktree unlock "$wt"
+
 printf '== identity.json tells the worker where SPEC/PROOF live and the closure vocabulary ==\n'
 idjson="$wt/.handoffs/identity.json"
 [ -f "$idjson" ] && ok "identity.json written" || bad "identity.json missing"

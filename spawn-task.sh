@@ -495,7 +495,14 @@ if [ -z "$base" ] && ! git -C "$root" show-ref --verify --quiet "refs/heads/${br
   fi
 fi
 if git -C "$root" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt"; then
-  :  # already checked out here
+  # archive-worktrees.sh --apply `git worktree lock`s a worktree for its whole
+  # archive-to-remove window (review r2 H1 of PR #236): re-spawning into it
+  # would write .handoffs/ into a directory that is about to be removed.
+  if git -C "$root" worktree list --porcelain 2>/dev/null \
+      | awk -v w="$wt" '/^worktree /{cur=substr($0,10)} /^locked archive-worktrees\.sh /{ if (cur == w) f=1 } END{exit !f}'; then
+    echo "spawn-task: $wt is locked by an archive-worktrees.sh run (archiving, about to remove it) — not reusing it" >&2
+    exit 1
+  fi
 elif git -C "$root" show-ref --verify --quiet "refs/heads/${branch}"; then
   git -C "$root" worktree add "$wt" "$branch" >/dev/null 2>&1 || { echo "spawn-task: worktree add (existing branch) failed" >&2; exit 1; }
 else

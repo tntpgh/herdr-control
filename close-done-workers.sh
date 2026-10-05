@@ -190,7 +190,8 @@ _DPR_REASON=""; _DPR_STATE=""; _DPR_HEAD_SHA=""; _DPR_REF_SHA=""; _DPR_ARCHIVE_M
 _detached_pr_check() {
   local wt="$1" run_id="$2" task_id="$3" repo_path="$4" repo_slug="$5" pr_num="$6" \
         want_reason="$7" apply="$8" \
-        head_sha ref_sha td ut dirty files info state url oid repo_base ts archive_dir required
+        head_sha ref_sha td ut dirty files info state url oid repo_base ts archive_dir required \
+        archive_root root_why
   _DPR_REASON=""; _DPR_STATE=""; _DPR_HEAD_SHA=""; _DPR_REF_SHA=""; _DPR_ARCHIVE_MANIFEST=""
 
   if [ -z "$repo_slug" ] || [ -z "$pr_num" ]; then
@@ -263,7 +264,20 @@ _detached_pr_check() {
     repo_base="$(basename "$repo_path")"
     [ -n "$repo_base" ] || repo_base="unknown-repo"
     ts=$(date -u +%Y%m%dT%H%M%SZ)
-    archive_dir="${HERDR_ARCHIVE_ROOT:-$HOME/Code/.archive/worktrees}/$repo_base/detached-pr-$pr_num-$ts"
+    archive_root="${HERDR_ARCHIVE_ROOT:-$HOME/Code/.archive/worktrees}"
+    root_why=$(archive_root_why "$archive_root" "$wt")
+    if [ -n "$root_why" ]; then
+      _DPR_REASON="$root_why"
+      return
+    fi
+    # Unique per run (pid) and created with a plain mkdir, never -p: two runs
+    # in the same second must never share, and truncate, one manifest
+    # (review r2 M3 of PR #236).
+    archive_dir="$archive_root/$repo_base/detached-pr-$pr_num-$ts-$$"
+    if ! mkdir -p "$archive_root/$repo_base" 2>/dev/null || ! mkdir "$archive_dir" 2>/dev/null; then
+      _DPR_REASON="archiving ignored artifacts failed: could not create $archive_dir (or it already exists)"
+      return
+    fi
     if ! archive_copy_and_manifest "$wt" "$archive_dir" "$files"; then
       _DPR_REASON="archiving ignored artifacts failed: $_ARCHIVE_WHY"
       return
