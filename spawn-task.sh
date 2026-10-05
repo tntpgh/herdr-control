@@ -60,6 +60,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib/task-manifest.sh"
 . "$here/lib/op-env.sh"
 . "$here/lib/pane-guard.sh"
+. "$here/lib/worktree-archive.sh"
 
 # ---- args ------------------------------------------------------------------
 # op_mode inherits TIGHTEN-ONLY, the same shape as HERDR_POSTURE_FLOOR: a worker
@@ -523,6 +524,22 @@ if [ -z "$trunk" ]; then
   if [ -z "$trunk" ]; then
     trunk=$(git -C "$root" remote show origin 2>/dev/null | sed -n 's/^ *HEAD branch: //p')
   fi
+fi
+
+# ---- the archive fence (review r3 L1 of PR #236) ----------------------------
+# The archive-lock check above is check-then-act: archive-worktrees.sh can
+# fence and lock this worktree any time after it, and git cannot hold its
+# lock across `git worktree remove`. So, immediately before the first write
+# into the worktree, this spawn puts its intent file down and only THEN looks
+# for an archive fence (lib/worktree-archive.sh, "the spawn/archive fence").
+# The intent stays until this script exits, so an archive run that fences
+# after this check sees it and refuses its remove. A normal spawn never meets
+# a fence; the cost is one `git rev-parse` and two file operations.
+trap archive_fence_leave EXIT
+trap 'exit 130' INT TERM HUP
+if ! archive_fence_enter "$wt"; then
+  echo "spawn-task: $_ARCHIVE_WHY — not writing into it" >&2
+  exit 1
 fi
 
 # ---- coordination scaffold --------------------------------------------------

@@ -2,8 +2,8 @@
 # verify-worktree-archival.sh — real-negative test suite for close-done-
 # workers.sh's detached-HEAD close path and archive-worktrees.sh
 # (2026-10-05-worktree-archival-and-detached-close proposal; review r1 of
-# PR #236, whose probes P1-P8 are Section P below, and review r2, whose
-# probes are Section R).
+# PR #236, whose probes P1-P8 are Section P below, review r2, whose probes
+# are Section R, and review r3, whose probes S3 and S5 are Section S).
 #
 # Real git throughout: a real bare "origin" repo, real `git worktree add`,
 # real `git ls-remote`/`rev-list`/`bundle`, real sha256 manifests, real
@@ -11,9 +11,10 @@
 # the scripts under test call as their own subprocess — `herdr` (never the
 # real pane daemon) and `gh` (never a real GitHub call) — same pattern as
 # verify-close-done-workers.sh. Section R adds a pass-through `shasum` on
-# PATH whose only job is to run a hook mid-archive. Every repo, worktree,
-# registry, archive root and code root lives under one mktemp dir; nothing
-# here touches ~/Code.
+# PATH whose only job is to run a hook mid-archive; Section S adds more such
+# hooks and runs the REAL spawn-task.sh (herdr stubbed) against the archiver.
+# Every repo, worktree, registry, archive root and code root lives under one
+# mktemp dir; nothing here touches ~/Code.
 #
 #   bash verify-worktree-archival.sh
 set -uo pipefail
@@ -804,6 +805,191 @@ G -C "$W" update-ref refs/worktree/keep "$X"; G -C "$W" checkout -q --detach mai
 out=$(AW --apply --worktree="$W" --disposition=abandoned "$R")
 row "$out" "$W" | grep -q 'HOLD.*worktree-private refs' && ok "L5: worktree-private refs HOLD" || bad "L5 output: $out"
 present "L5" "$W"
+
+#######################################################################
+# Section S: review r3 probes S3 and S5 as permanent real negatives. On
+# 67c7efe a re-spawn whose archive-lock check passed before the archive
+# started, and whose SPEC.md write landed after the pre-remove re-check or
+# in the unlock -> remove gap, lost that SPEC.md unarchived (S3); and a
+# process holding a file open inside a worktree, its cwd elsewhere, did not
+# hold it (S5).
+#######################################################################
+printf '\n== Section S: review r3 probes ==\n'
+S_TMP="$TMP/S"; mkdir -p "$S_TMP"
+REAL_GIT=$(command -v git); REAL_MV=$(command -v mv); REAL_DATE=$(command -v date); REAL_MKTEMP=$(command -v mktemp)
+GH_PRS="$GH_PRS
+probe/s3m#301 s3m-merged MERGED $M
+probe/s3g#302 s3g-merged MERGED $M
+probe/s3i#303 s3i-merged MERGED $M
+probe/s5#501 s5-fd MERGED $M"
+
+# More pass-through hooks for archive-worktrees.sh, each armed by its own
+# variable and fired ONCE, like shasum's: HOOK_DATE at the archive's
+# timestamp (every preview check passed; nothing fenced or locked yet),
+# HOOK_MV at `mv <dest>.partial <dest>` (after the pre-remove re-check) and
+# HOOK_RM at `git worktree remove` (after the unlock).
+_hook_wrapper() {               # <name> <real binary> <HOOK var> <case pattern on " $* ">
+  cat > "$TMP/bin/$1" <<EOF
+#!/bin/bash
+case " \$* " in
+  $4) if [ -n "\${$3:-}" ] && [ -f "\$$3" ]; then "$REAL_MV" -f "\$$3" "\$$3.fired" && bash "\$$3.fired"; fi ;;
+esac
+exec "$2" "\$@"
+EOF
+  chmod +x "$TMP/bin/$1"
+}
+_hook_wrapper date "$REAL_DATE" HOOK_DATE '*" -u +%Y%m%dT%H%M%SZ "*'
+_hook_wrapper mv "$REAL_MV" HOOK_MV '*".partial "*'
+_hook_wrapper git "$REAL_GIT" HOOK_RM '*" worktree remove "*'
+
+# The real spawn-task.sh, run from its own bin dir (HERDR_EXTRA_PATH, which
+# config.sh puts first on PATH): verify-spawn-spec-proof.sh's herdr stub,
+# plus two pass-through gates that PAUSE it until released —
+#   GATE1 at its trunk lookup: after its archive-lock check, before anything
+#         it writes into the worktree (and before the r3 fence check);
+#   GATE2 at the mktemp for SPEC.md: after the r3 fence check, before the write.
+# A gate is a path: the spawn touches <gate>.at on arrival, waits for <gate>.go.
+SPAWN_BIN="$S_TMP/spawnbin"; mkdir -p "$SPAWN_BIN"
+cat > "$SPAWN_BIN/herdr" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+	"tab create") printf '{"result":{"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"p1","terminal_id":"term1"}}}\n' ;;
+	"pane run")   : ;;
+	"pane list")  printf '{"result":{"panes":[]}}\n' ;;
+	*)            printf '{"result":{"workspace":{"workspace_id":"w1"},"workspaces":[],"panes":[],"tabs":[]}}\n' ;;
+esac
+STUB
+chmod +x "$SPAWN_BIN/herdr"
+_gate_wrapper() {               # <name> <real binary> <GATE var> <case pattern on " $* ">
+  cat > "$SPAWN_BIN/$1" <<EOF
+#!/bin/bash
+case " \$* " in
+  $4) if [ -n "\${$3:-}" ] && mkdir "\$$3.taken" 2>/dev/null; then
+        : > "\$$3.at"; n=0
+        while [ ! -e "\$$3.go" ] && [ \$n -lt 1200 ]; do sleep 0.1; n=\$((n+1)); done
+      fi ;;
+esac
+exec "$2" "\$@"
+EOF
+  chmod +x "$SPAWN_BIN/$1"
+}
+_gate_wrapper git "$REAL_GIT" GATE1 '*" symbolic-ref -q --short refs/remotes/origin/HEAD "*'
+_gate_wrapper mktemp "$REAL_MKTEMP" GATE2 '*"/.SPEC."*'
+
+_await() {                      # <file>...: wait (<= 120 s) until any of them exists
+  local n=0 f
+  while [ "$n" -lt 1200 ]; do
+    for f in "$@"; do [ -e "$f" ] && return 0; done
+    sleep 0.1; n=$((n+1))
+  done
+  return 1
+}
+_release_hook() {               # <hook file> <gate>.go <wait-for>...: open the gate, block until any <wait-for> exists
+  local h="$1" g="$2" w; shift 2
+  { printf 'touch "%s"\n' "$g"
+    printf 'n=0; while [ $n -lt 1200 ]'
+    for w in "$@"; do printf ' && [ ! -e "%s" ]' "$w"; done
+    printf '; do sleep 0.1; n=$((n+1)); done\n'
+  } > "$h"
+}
+_spawn() {                      # <repo> <branch> <brief> [VAR=value...]: real spawn-task.sh, own scratch registry
+  local repo="$1" br="$2" brief="$3"; shift 3
+  ( unset -f herdr gh
+    env "$@" HERDR_EXTRA_PATH="$SPAWN_BIN" PATH="$SPAWN_BIN:$PATH" HERDR_WT_DIR="$WTROOT" \
+      HERDR_RUN_STATE_DIR="$(mktemp -d)" bash "$here/spawn-task.sh" "$repo" "$br" quick /bin/true --brief "$brief" )
+}
+_s3_setup() {                   # <name>: spawn-task.sh made the worktree, its PR is MERGED -> sets R, W
+  R="$S_TMP/$1"; mkrepo "$R" "probe/$1"
+  printf '# ORIGINAL-%s brief\n' "$1" > "$S_TMP/$1-brief0.md"
+  printf '# LATE-%s brief\n' "$1" > "$S_TMP/$1-late.md"
+  _spawn "$R" "$1-merged" "$S_TMP/$1-brief0.md" > "$S_TMP/$1-spawn0.out" 2>&1 \
+    || bad "$1: the first spawn failed: $(tail -3 "$S_TMP/$1-spawn0.out" | tr '\n' ' ')"
+  W="$WTROOT/$1/$1-merged"
+  G -C "$W" commit -q --allow-empty -m "$1 work"; G -C "$W" push -q origin "$1-merged"; G -C "$R" fetch -q origin
+}
+_respawn_bg() {                 # <name> [VAR=value...]: re-spawn with the LATE brief in the background; rc -> <name>.rc
+  local n="$1"; shift
+  ( _spawn "$R" "$n-merged" "$S_TMP/$n-late.md" "$@" > "$S_TMP/$n.out" 2>&1; printf '%s\n' "$?" > "$S_TMP/$n.rc" ) &
+  spawn_pid=$!
+}
+_no_lost_write() {              # <name>: the re-spawn refused itself, or its SPEC.md still exists somewhere
+  local n="$1" rc
+  rc=$(cat "$S_TMP/$n.rc" 2>/dev/null || echo '?')
+  if [ "$rc" = 0 ]; then
+    if grep -qs "LATE-$n" "$W/.handoffs/SPEC.md" || grep -rqs "LATE-$n" "$HERDR_ARCHIVE_ROOT/$n"; then
+      ok "$n: the re-spawn succeeded and its SPEC.md survives"
+    else
+      bad "$n: the re-spawn reported success but its SPEC.md is gone, deleted unarchived ($(row "$AWOUT" "$W"))"
+    fi
+  elif grep -q 'being archived' "$S_TMP/$n.out"; then
+    ok "$n: the re-spawn refused itself at the archive fence, writing nothing"
+  else
+    bad "$n: the re-spawn failed for another reason (rc=$rc): $(tail -3 "$S_TMP/$n.out" | tr '\n' ' ')"
+  fi
+}
+_archived_and_removed() {       # <name>: the archive still completed, holding the SPEC.md it verified
+  [ ! -d "$W" ] && find "$HERDR_ARCHIVE_ROOT/$1" -path '*/files/.handoffs/SPEC.md' -exec grep -l "ORIGINAL-$1" {} + 2>/dev/null | grep -q . \
+    && ok "$1: the archive still completes, with the SPEC.md it verified" || bad "$1: $(row "$AWOUT" "$W")"
+}
+_no_intent_left() {             # <name>: no spawn intent or archive fence outlives its process
+  local left
+  left=$(find "$R/.git/worktrees" -name 'herdr-*' 2>/dev/null)
+  [ -z "$left" ] && ok "$1: no spawn intent or archive fence left behind" || bad "$1: left behind: $left"
+}
+
+printf '== S3 (L1): a re-spawn checked the lock before the archive began; its write lands after the re-check ==\n'
+_s3_setup s3m
+_respawn_bg s3m GATE1="$S_TMP/s3m-g1"
+_await "$S_TMP/s3m-g1.at" "$S_TMP/s3m.rc" || bad "s3m: the re-spawn never reached its pause"
+_release_hook "$S_TMP/s3m-hook.sh" "$S_TMP/s3m-g1.go" "$S_TMP/s3m.rc"
+AWOUT=$(PATH="$HOOKPATH" HOOK_MV="$S_TMP/s3m-hook.sh" AW --apply "$R")
+touch "$S_TMP/s3m-g1.go"; wait "$spawn_pid"
+[ -f "$S_TMP/s3m-hook.sh.fired" ] && ok "s3m: the re-spawn was released after the re-check" || bad "s3m: hook never fired: $AWOUT"
+_no_lost_write s3m
+_archived_and_removed s3m
+_no_intent_left s3m
+
+printf '== S3 (L1): the same re-spawn released in the unlock -> remove gap ==\n'
+_s3_setup s3g
+_respawn_bg s3g GATE1="$S_TMP/s3g-g1"
+_await "$S_TMP/s3g-g1.at" "$S_TMP/s3g.rc" || bad "s3g: the re-spawn never reached its pause"
+_release_hook "$S_TMP/s3g-hook.sh" "$S_TMP/s3g-g1.go" "$S_TMP/s3g.rc"
+AWOUT=$(PATH="$HOOKPATH" HOOK_RM="$S_TMP/s3g-hook.sh" AW --apply "$R")
+touch "$S_TMP/s3g-g1.go"; wait "$spawn_pid"
+[ -f "$S_TMP/s3g-hook.sh.fired" ] && ok "s3g: the re-spawn was released between unlock and remove" || bad "s3g: hook never fired: $AWOUT"
+_no_lost_write s3g
+_archived_and_removed s3g
+_no_intent_left s3g
+
+printf '== S3 (L1): a re-spawn already past its fence check before the archive fenced, writing after the re-check ==\n'
+# HOOK_MV only fires when the re-check lets the run reach its rename (67c7efe,
+# which has no fence): it releases the paused write there, before the remove.
+_s3_setup s3i
+_respawn_bg s3i GATE1="$S_TMP/s3i-g1" GATE2="$S_TMP/s3i-g2"
+_await "$S_TMP/s3i-g1.at" "$S_TMP/s3i.rc" || bad "s3i: the re-spawn never reached its first pause"
+_release_hook "$S_TMP/s3i-date.sh" "$S_TMP/s3i-g1.go" "$S_TMP/s3i-g2.at" "$S_TMP/s3i.rc"
+_release_hook "$S_TMP/s3i-mv.sh" "$S_TMP/s3i-g2.go" "$S_TMP/s3i.rc"
+AWOUT=$(PATH="$HOOKPATH" HOOK_DATE="$S_TMP/s3i-date.sh" HOOK_MV="$S_TMP/s3i-mv.sh" AW --apply "$R")
+touch "$S_TMP/s3i-g1.go" "$S_TMP/s3i-g2.go"; wait "$spawn_pid"
+[ -f "$S_TMP/s3i-date.sh.fired" ] && [ -f "$S_TMP/s3i-g2.at" ] \
+  && ok "s3i: the re-spawn passed its own check before the archive fenced" || bad "s3i: choreography: $AWOUT"
+_no_lost_write s3i
+row "$AWOUT" "$W" | grep -q 'REFUSED.*changed while archiving: spawn-task pid' \
+  && ok "s3i: the re-check sees the spawn's intent and REFUSES the remove" || bad "s3i output: $AWOUT"
+present "s3i" "$W"
+_no_intent_left s3i
+
+printf '== S5 (L2): a process holds a file open inside the worktree, its cwd elsewhere ==\n'
+R="$S_TMP/s5"; mkrepo "$R" probe/s5; W="$WTROOT/s5-fd"; mkwt "$R" s5-fd "$W"; note "$W"
+( cd "$CWD_REPO" && exec 3<"$W/tmp/notes.md" && exec sleep 300 ) & fpid=$!
+sleep 1
+out=$(AW --apply "$R")
+kill "$fpid" 2>/dev/null; wait "$fpid" 2>/dev/null
+row "$out" "$W" | grep -q HOLD && row "$out" "$W" | grep -qF "process $fpid has $W/tmp/notes.md open" \
+  && ok "S5: a file held open inside the worktree HOLDs it" || bad "S5 output: $out"
+present "S5" "$W"
+out=$(AW --apply "$R")
+[ ! -d "$W" ] && ok "S5 control: once the file is closed the same worktree is archived and removed" || bad "S5 control: $out"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

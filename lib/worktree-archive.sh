@@ -19,6 +19,11 @@
 #                                                               could not outlive the worktree
 #   archive_create_bundle            <worktree> <bundle-path>
 #   archive_verify_bundle            <worktree> <bundle-path>
+#   archive_fence_take               <worktree>            -> archive-worktrees.sh fences it off
+#                                                               from spawn-task.sh, sets _ARCHIVE_FENCE
+#   archive_fence_why                <worktree> [own-fence] -> a HOLD reason while another
+#                                                               archive run or a spawn-task holds it
+#   archive_fence_enter / _leave     <worktree>            -> spawn-task.sh's side of the fence
 #
 # Results that a caller needs alongside a failure reason travel in globals
 # (_ARCHIVE_MANIFEST, _ARCHIVE_WHY, _ARCHIVE_KEEP, _ARCHIVE_EXCLUDED), never
@@ -45,6 +50,7 @@
 set -uo pipefail
 
 _ARCHIVE_WHY=""; _ARCHIVE_MANIFEST=""; _ARCHIVE_KEEP=""; _ARCHIVE_EXCLUDED=""
+_ARCHIVE_FENCE=""; _ARCHIVE_SPAWN_INTENT=""
 
 # Ignored directories that are build output or dependency caches: re-created
 # by an install/build, routinely 7k-28k files each (review r1 M2, measured on
@@ -277,4 +283,112 @@ archive_create_bundle() {               # <worktree> <bundle-path>
 # and silently checked prerequisites against an unrelated repo otherwise.
 archive_verify_bundle() {               # <worktree> <bundle-path>
   git -C "$1" bundle verify "$2" >/dev/null 2>&1
+}
+
+# ---- the spawn/archive fence (review r3 L1 of PR #236) ------------------------
+# `git worktree lock` cannot span `git worktree remove` (git refuses a locked
+# worktree without --force --force), and spawn-task.sh read that lock once,
+# long before it wrote .handoffs/ — so a re-spawn could pass its check, then
+# write a SPEC.md that the remove deleted unarchived. Two kinds of file in
+# the worktree's git admin dir (<common-dir>/worktrees/<id>) close that. They
+# are outside the worktree, so they never enter a file listing or an archive,
+# and `git worktree remove`/`prune` delete them with the admin dir:
+#   herdr-archive-fence        archive-worktrees.sh's: created exclusively
+#                              BEFORE it locks the worktree, kept until AFTER
+#                              the remove.
+#   herdr-spawn-intent.<pid>   spawn-task.sh's: created BEFORE it looks for
+#                              the fence, deleted when spawn-task.sh exits.
+# Each side puts its own file down and only THEN looks for the other's:
+#   * a spawn that looked before the fence existed still has its intent down
+#     at the archiver's pre-remove re-check (which runs after it fenced), and
+#     that re-check REFUSES the remove;
+#   * a spawn that looks while the fence exists refuses itself;
+#   * a spawn that looks once the remove has run finds its own intent gone
+#     with the admin dir (or cannot write it), and refuses itself.
+# No timing assumption, no settle period. A fence or intent left behind by a
+# SIGKILL is never stolen: both sides keep refusing and print its path.
+
+_archive_admin_dir() {                  # <worktree> -> its git admin dir; nonzero unless a linked worktree
+  local gd
+  gd=$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null) || return 1
+  case "$gd" in */worktrees/?*) ;; *) return 1 ;; esac
+  [ -f "$gd/commondir" ] || return 1
+  printf '%s\n' "$gd"
+}
+
+# archive_fence_take <worktree> -> 0 with _ARCHIVE_FENCE set to the fence this
+# process now holds, or 1 with _ARCHIVE_WHY. `ln` of a fully written temp
+# file is the exclusive create: it fails when the fence already exists, so two
+# runs can never both hold it and a reader never sees a half-written one.
+# Call directly, never as `$(…)`.
+archive_fence_take() {
+  local gd f tmp
+  _ARCHIVE_FENCE=""
+  if ! gd=$(_archive_admin_dir "$1"); then
+    _ARCHIVE_WHY="cannot locate the worktree's git admin dir to fence it off from a re-spawn"
+    return 1
+  fi
+  f="$gd/herdr-archive-fence"; tmp="$f.take.$$"
+  if ! printf 'archive-worktrees.sh pid %s\n' "$$" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    _ARCHIVE_WHY="could not write the spawn fence in $gd"
+    return 1
+  fi
+  if ! ln "$tmp" "$f" 2>/dev/null; then
+    rm -f "$tmp"
+    _ARCHIVE_WHY="the spawn fence $f is already held ($(cat "$f" 2>/dev/null || echo '?'))"
+    return 1
+  fi
+  rm -f "$tmp"
+  _ARCHIVE_FENCE="$f"
+}
+
+# archive_fence_why <worktree> [own-fence] -> prints a HOLD/REFUSE reason, or
+# nothing: a fence that is not <own-fence> (another archive run, or one a
+# SIGKILL left), or any spawn-task intent at all.
+archive_fence_why() {
+  local gd s
+  if ! gd=$(_archive_admin_dir "$1"); then
+    printf 'cannot locate its git admin dir, so a re-spawn into it cannot be ruled out\n'
+    return
+  fi
+  if [ -e "$gd/herdr-archive-fence" ] && [ "$gd/herdr-archive-fence" != "${2:-}" ]; then
+    printf 'fenced by another archive run (%s) — if that pid is gone, `git worktree unlock` it and trash %s\n' \
+      "$(cat "$gd/herdr-archive-fence" 2>/dev/null || echo '?')" "$gd/herdr-archive-fence"
+    return
+  fi
+  for s in "$gd"/herdr-spawn-intent.*; do
+    [ -e "$s" ] || continue
+    printf 'spawn-task pid %s is writing into this worktree (%s — if that pid is gone, trash it)\n' "${s##*.}" "$s"
+    return
+  done
+}
+
+# archive_fence_enter <worktree> -> spawn-task.sh's side, run immediately
+# before its first write into the worktree. 0: the intent file is down
+# (_ARCHIVE_SPAWN_INTENT) and no archive run holds the worktree — write away;
+# archive_fence_leave must run at exit. 1: refuse, reason in _ARCHIVE_WHY.
+archive_fence_enter() {
+  local gd
+  _ARCHIVE_SPAWN_INTENT=""
+  if ! gd=$(_archive_admin_dir "$1") || ! : > "$gd/herdr-spawn-intent.$$" 2>/dev/null; then
+    _ARCHIVE_WHY="$1 is not a linked git worktree whose admin dir takes a spawn intent (removed while spawning?)"
+    return 1
+  fi
+  _ARCHIVE_SPAWN_INTENT="$gd/herdr-spawn-intent.$$"
+  if [ -e "$gd/herdr-archive-fence" ]; then
+    _ARCHIVE_WHY="$1 is being archived ($(cat "$gd/herdr-archive-fence" 2>/dev/null || echo '?'); if that pid is gone, \`git worktree unlock\` it and trash $gd/herdr-archive-fence)"
+    archive_fence_leave
+    return 1
+  fi
+  if [ ! -e "$_ARCHIVE_SPAWN_INTENT" ]; then
+    _ARCHIVE_SPAWN_INTENT=""
+    _ARCHIVE_WHY="$1 is being archived (removed while spawning)"
+    return 1
+  fi
+}
+
+archive_fence_leave() {
+  [ -z "$_ARCHIVE_SPAWN_INTENT" ] || rm -f "$_ARCHIVE_SPAWN_INTENT"
+  _ARCHIVE_SPAWN_INTENT=""
 }

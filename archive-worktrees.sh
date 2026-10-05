@@ -43,8 +43,11 @@
 #        - `herdr pane list` parses and lists at least one pane, every pane
 #          reports a cwd, and no pane's cwd OR foreground_cwd (raw or
 #          realpath) is this path or beneath it (r2 M1);
-#        - `lsof -d cwd` runs and sees this process, and NO process at all —
-#          herdr pane or not — has its cwd at or beneath this path (r2 H3).
+#        - `lsof` runs and sees this process, and NO process at all — herdr
+#          pane or not — has its cwd OR any open file at or beneath this
+#          path (r2 H3, r3 L2);
+#        - no other archive run fences it and no spawn-task.sh is writing
+#          into it (r3 L1; lib/worktree-archive.sh, "the spawn/archive fence").
 #   2. HEAD is reachable from a ref origin has RIGHT NOW (`git ls-remote
 #      origin`: branches, tags, refs/pull/N/head) — never a cached
 #      remote-tracking ref. RECOVERABILITY, never delivery.
@@ -79,13 +82,16 @@
 # ---- --apply concurrency (review r2 H1/M3) ---------------------------------------
 #   * one --apply at a time: a mkdir lock, archive-worktrees.lock, beside the
 #     registry this run trusts ($HERDR_RUN_STATE_DIR). A second run exits.
-#   * each worktree is `git worktree lock`ed for its archive-to-remove
-#     window; spawn-task.sh refuses to re-spawn into one locked by this tool.
+#   * each worktree is fenced off from spawn-task.sh (lib/worktree-archive.sh
+#     archive_fence_take) from BEFORE its `git worktree lock` until AFTER its
+#     `git worktree remove`, and `git worktree lock`ed for the archive window;
+#     spawn-task.sh refuses a worktree that is either (r2 H1, r3 L1).
 #   * the archive is written to <dest>.partial/ (created with a plain mkdir,
 #     never -p) and renamed to <dest>/ only once verified, so an interrupted
 #     run leaves a dir that says it is unfinished.
-#   * right before the remove, liveness, HEAD, the file set and the manifest
-#     are all read AGAIN for that one worktree; any change REFUSES it.
+#   * right before the remove, spawn intents, liveness, HEAD, the file set
+#     and the manifest are all read AGAIN for that one worktree; any change
+#     REFUSES it.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib/run-registry.sh
@@ -255,24 +261,39 @@ _read_registry() {
   fi
 }
 
-# r2 H3: every process's cwd, herdr pane or not — an omp session, editor,
-# dev server or shell in a plain terminal under ~/Code/.worktrees is as live
-# as a pane. lsof reports the kernel's (canonical) path. It must exit 0 AND
-# list this very process, or it cannot see what it is being asked about.
-_read_proc_cwds() {
-  local out
-  proc_why=""; proc_cwds=""
-  if ! out=$(lsof -w -d cwd -Fpn 2>/dev/null); then
-    proc_why="lsof -d cwd failed; process cwds cannot be verified"
-  elif ! printf '%s\n' "$out" | grep -qx "p$$"; then
-    proc_why="lsof -d cwd did not list this process; process cwds cannot be verified"
-  else
-    proc_cwds=$(printf '%s\n' "$out" | awk '/^p/ { p = substr($0, 2); next } /^n/ { print p "|" substr($0, 2) }')
-  fi
+# r2 H3 + r3 L2: every process's cwd AND every file it holds open, herdr
+# pane or not — an omp session, editor, dev server, log writer or `tail -f`
+# under ~/Code/.worktrees is as live as a pane, wherever its own cwd is.
+# lsof reports the kernel's (canonical) path. It must exit 0 AND list this
+# very process, or it cannot see what it is being asked about. Only rows at
+# or beneath an allowed root are kept: a worktree anywhere else HOLDs before
+# liveness is consulted, and the full listing is tens of thousands of rows.
+# One pipe, no `grep -q` on the listing: an early-exiting reader SIGPIPEs a
+# writer of that size, which pipefail reports as "lsof failed". -n -P: the
+# full listing includes sockets, and resolving them would hang on DNS.
+_read_procs() {
+  local rc
+  proc_why=""
+  proc_files=$(lsof -w -n -P -Fpfn 2>/dev/null \
+    | AW_SELF="$$" AW_ROOTS="$(printf '%s\n' ${allowed_roots[@]+"${allowed_roots[@]}"})" awk '
+        BEGIN { nr = split(ENVIRON["AW_ROOTS"], r, "\n") }
+        /^p/ { p = substr($0, 2); if (p == ENVIRON["AW_SELF"]) self = 1; next }
+        /^f/ { f = substr($0, 2); next }
+        /^n\// {
+          n = substr($0, 2)
+          for (i = 1; i <= nr; i++) if (r[i] != "" && (n == r[i] || index(n, r[i] "/") == 1)) { print p "\t" f "\t" n; break }
+        }
+        END { if (!self) exit 3 }')
+  rc=$?
+  case "$rc" in
+    0) ;;
+    3) proc_why="lsof did not list this process; open files cannot be verified"; proc_files="" ;;
+    *) proc_why="lsof failed; open files cannot be verified"; proc_files="" ;;
+  esac
 }
 
 _live_why() {                   # <wt> <wt_real> -> prints a HOLD reason, or nothing
-  local c row pid
+  local c row pid fd hit
   if [ -n "$panes_why" ]; then printf '%s\n' "$panes_why"; return; fi
   if [ -n "$reg_why" ]; then printf '%s\n' "$reg_why"; return; fi
   if [ -n "$proc_why" ]; then printf '%s\n' "$proc_why"; return; fi
@@ -288,12 +309,18 @@ _live_why() {                   # <wt> <wt_real> -> prints a HOLD reason, or not
       return
     fi
   done
-  while IFS='|' read -r pid c; do
-    if _within "$c" "$1" || _within "$c" "$2"; then
+  hit=$(printf '%s\n' "$proc_files" | AW_WT="$1" AW_WTR="$2" awk '
+    function within(p, b) { return b != "" && (p == b || index(p, b "/") == 1) }
+    !hit { n = $0; sub(/^[^\t]*\t[^\t]*\t/, "", n)
+           if (within(n, ENVIRON["AW_WT"]) || within(n, ENVIRON["AW_WTR"])) { print; hit = 1 } }')
+  if [ -n "$hit" ]; then
+    IFS=$'\t' read -r pid fd c <<<"$hit"
+    if [ "$fd" = cwd ]; then
       printf 'process %s has its cwd (%s) inside this worktree\n' "$pid" "$c"
-      return
+    else
+      printf 'process %s has %s open inside this worktree (fd %s)\n' "$pid" "$c" "$fd"
     fi
-  done <<<"$proc_cwds"
+  fi
 }
 
 _read_registry
@@ -304,10 +331,16 @@ _read_registry
 # registry every worktree HOLDs on reg_why and nothing is mutated, so no
 # lock is needed (and the missing dir is never created). A lock left by a
 # SIGKILLed run is never stolen: its pid is printed for the operator.
-# The EXIT trap also unlocks a worktree this run `git worktree lock`ed.
-run_lock=""; locked_wt=""; locked_repo=""
+# The EXIT trap also unlocks a worktree this run `git worktree lock`ed, and
+# only then drops the spawn fence it holds (r3 L1) — never the other order.
+run_lock=""; locked_wt=""; locked_repo=""; fenced=""
+_release_fence() {
+  [ -z "$fenced" ] || rm -f "$fenced"
+  fenced=""
+}
 _cleanup() {
   [ -n "$locked_wt" ] && git -C "$locked_repo" worktree unlock "$locked_wt" >/dev/null 2>&1
+  _release_fence
   if [ -n "$run_lock" ]; then
     rm -f "$run_lock/pid"
     rmdir "$run_lock" 2>/dev/null
@@ -325,7 +358,7 @@ if [ "$apply" = 1 ] && [ -z "$reg_why" ]; then
 fi
 
 _read_panes
-_read_proc_cwds
+_read_procs
 _WT_LOCK_REASON="archive-worktrees.sh pid $$: archiving, about to remove"
 
 # r2 H1: <wt> <wt_real> <head> <files> <excluded> <manifest|""> -> prints a
@@ -333,9 +366,15 @@ _WT_LOCK_REASON="archive-worktrees.sh pid $$: archiving, about to remove"
 # the worktree is `git worktree lock`ed: everything the decision rested on is
 # read AGAIN for this one worktree. Ignored files (.handoffs/SPEC.md from a
 # re-spawn) are deleted by a non-forced remove, so a new one must REFUSE.
+# r3 L1: this runs AFTER this run fenced the worktree (archive_fence_take).
+# A spawn-task that passed its own fence check before that still has its
+# intent file down here, whenever it writes — or, if it already finished,
+# its writes (identity.json at least) show up below as changed files.
 _recheck_why() {
   local wt="$1" wt_real="$2" head="$3" files="$4" excluded="$5" manifest="$6" why now td ut ig nf first
-  _read_panes; _read_registry; _read_proc_cwds
+  why=$(archive_fence_why "$wt" "$fenced")
+  if [ -n "$why" ]; then printf '%s\n' "$why"; return; fi
+  _read_panes; _read_registry; _read_procs
   why=$(_live_why "$wt" "$wt_real")
   if [ -n "$why" ]; then printf '%s\n' "$why"; return; fi
   now=$(git -C "$wt" rev-parse HEAD 2>/dev/null)
@@ -434,6 +473,8 @@ for repo in ${repo_args[@]+"${repo_args[@]}"}; do
     if [ -z "$why" ] && printf '%s\n' "$locked_list" | grep -qxF -- "$wt"; then
       why="locked (git worktree lock) — git worktree remove would refuse it; unlock it first"
     fi
+    # r3 L1: another archive run's fence, or a spawn-task mid-write.
+    [ -n "$why" ] || why=$(archive_fence_why "$wt")
     if [ -z "$why" ]; then
       if ! idx=$(git -C "$wt" ls-files -s 2>/dev/null); then
         why="git ls-files failed; submodules cannot be checked"
@@ -573,11 +614,15 @@ for repo in ${repo_args[@]+"${repo_args[@]}"}; do
     [ "$apply" = 1 ] || continue
 
     # Archive into <dest>.partial/ (r2 L2: an interrupted run leaves a dir
-    # that says it is unfinished), with the worktree locked against a
-    # re-spawn for the whole archive-to-remove window (r2 H1).
+    # that says it is unfinished), with the worktree fenced off from
+    # spawn-task.sh from here until AFTER the remove (r3 L1) and locked
+    # against git for the archive window (r2 H1).
     refuse=""; part="$dest.partial"; manifest=""
     head_sha=$(git -C "$wt" rev-parse HEAD 2>/dev/null)
     [ -n "$head_sha" ] || refuse="could not resolve HEAD"
+    if [ -z "$refuse" ]; then
+      if archive_fence_take "$wt"; then fenced="$_ARCHIVE_FENCE"; else refuse="$_ARCHIVE_WHY"; fi
+    fi
     if [ -z "$refuse" ]; then
       if git -C "$repo" worktree lock --reason "$_WT_LOCK_REASON" "$wt" >/dev/null 2>&1; then
         locked_wt="$wt"; locked_repo="$repo"
@@ -617,9 +662,8 @@ for repo in ${repo_args[@]+"${repo_args[@]}"}; do
     if [ -z "$refuse" ] && { [ -e "$dest" ] || ! mv "$part" "$dest" 2>/dev/null; }; then
       refuse="could not rename $part to $dest"
     fi
-    # ceiling: the unlock -> remove gap is the one unfenced moment; a
-    # re-spawn landing in it loses only what it wrote in those milliseconds.
-    # Closing it needs git to remove a locked worktree without --force.
+    # git refuses to remove a locked worktree (short of --force --force), so
+    # the lock comes off here; the spawn fence stays on across the remove.
     if [ -n "$locked_wt" ]; then
       if ! git -C "$repo" worktree unlock "$wt" >/dev/null 2>&1; then
         [ -n "$refuse" ] && refuse="$refuse; "
@@ -628,6 +672,7 @@ for repo in ${repo_args[@]+"${repo_args[@]}"}; do
       locked_wt=""
     fi
     if [ -n "$refuse" ]; then
+      _release_fence
       held=$((held+1)); archivable=$((archivable-1))
       [ -d "$part" ] && refuse="$refuse (unfinished archive left at $part)"
       printf '  REFUSED %-44s %-20s %s\n' "$wt" "${branch:-<detached>}" "$refuse"
@@ -641,6 +686,7 @@ for repo in ${repo_args[@]+"${repo_args[@]}"}; do
       printf '  LEFTOVER %-43s %-20s archived to %s; git worktree remove failed (%s) — clean up by hand with `trash`, never rm -rf\n' \
         "$wt" "${branch:-<detached>}" "$dest" "$remove_err"
     fi
+    _release_fence
   done <<<"$wt_list"
 done
 
