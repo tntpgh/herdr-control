@@ -8,6 +8,15 @@
 # becomes a row here instead of a menu:
 #
 #   pending --(conductor|human decides, herdr-action.sh)--> approved | declined
+#                                                        \-> superseded (request-supersede, 2026-10-04:
+#                                                            "I moved on, cancel this" -- NOT a decline.
+#                                                            The identical call re-issued after a supersede
+#                                                            escalates again as a brand-new pending request;
+#                                                            after a decline it stays blocked on the old
+#                                                            decline reason forever. Same decline-capable
+#                                                            authority, bound to request_id AND
+#                                                            action_sha256 so the decider confirms they
+#                                                            reviewed the exact action, never just an id.)
 #   approved (grant_kind once) --(the identical call re-issued)--> consumed
 #   approved (grant_kind file) -> a file_approvals row (code by reference); the
 #                                 same bytes then re-run through peer_decide
@@ -74,8 +83,12 @@ action_grant_consume() {                # request_id -> 0 consumed by this call
 action_request_create() {               # run task tool action_sha command verdict reason route grant_kind code_path code_sha
   local run="$1" task="$2" tool="$3" sha="$4" cmd="$5" verdict="$6" reason="$7" route="$8" kind="$9"
   local cpath="${10:-}" csha="${11:-}" gen id
-  gen="$(_sql "SELECT count(*) FROM action_requests WHERE task_id=$(_sq "$task") AND action_sha256=$(_sq "$sha")
-      AND status IN ('consumed','approved');" 2>/dev/null)"
+  # Every prior generation for (task, action) counts, not merely
+  # consumed/approved -- a superseded (or any future terminal, non-pending)
+  # status must still force a fresh id, or INSERT OR IGNORE silently
+  # no-ops on the old row's id and the caller is handed back the SAME
+  # (still-superseded) row instead of a genuinely new pending one.
+  gen="$(_sql "SELECT count(*) FROM action_requests WHERE task_id=$(_sq "$task") AND action_sha256=$(_sq "$sha");" 2>/dev/null)"
   id="ar_$(printf '%s' "$task" | shasum -a 256 | cut -c1-8)_$(printf '%s' "$sha" | cut -c1-16)_$(( ${gen:-0} + 1 ))"
   if _sql "INSERT OR IGNORE INTO action_requests (request_id, run_id, task_id, tool, action_sha256, command,
         verdict, reason, route, grant_kind, code_path, code_sha256, status, created_at)

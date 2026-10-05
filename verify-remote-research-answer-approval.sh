@@ -589,6 +589,96 @@ FAKE_SEND_RC=5 bash "$here/herdr-action.sh" tick
   || not_ok "F6b: expected exactly 1 send attempt, got: $(cat "$work/sent" 2>/dev/null)"
 unregister_owner first-owner >/dev/null 2>&1 || true
 unregister_owner second-owner >/dev/null 2>&1 || true
+# Sections B/C/F/G/H each replaced $work/bin/herdr with their OWN fake pane
+# list (owner panes only, no PANE/CPANE) -- restore the original PANE/CPANE
+# stub so _ha_conductor_ok can resolve task_ans's live conductor again.
+cat > "$work/bin/herdr" <<'EOF'
+#!/bin/bash
+[ "$1 $2" = "pane list" ] || exit 0
+printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"}]}}\n' \
+  "$PANE" "${FAKE_BIRTH:-$BIRTH}" "$CPANE" "${FAKE_CBIRTH:-$CBIRTH}"
+EOF
+chmod +x "$work/bin/herdr"
+
+printf '== I: explicit supersession of an abandoned action request (request-supersede, 2026-10-04) ==\n'
+# A hook-mode research worker escalated, then moved on and finished its own
+# ANSWER.md without the escalated call. Supersede is the human/conductor's
+# way to say "cancel this, the worker doesn't need it" -- distinct from
+# decline ("no, don't run this"): a later identical call must escalate
+# again as a FRESH request, never stay blocked on the old reason forever.
+act() { bash "$here/herdr-action.sh" "$@"; }
+
+rm -f "$work/sent"
+out="$(enf write '{"path":".handoffs/SUPI1.md","content":"x"}')"
+rid_i1="$(printf '%s' "$out" | field request_id)"
+[ -n "$rid_i1" ] && ok "setup: a pending conductor-route request exists for supersede tests" \
+  || not_ok "setup failed: $out"
+asha1="$(_sql "SELECT action_sha256 FROM action_requests WHERE request_id=$(_sq "$rid_i1");")"
+
+HERDR_PANE_ID="$CPANE" act supersede "unknown_$rid_i1" --authority conductor --action-sha256 "$asha1" --review-reason x >/dev/null 2>&1; rc=$?
+[ "$rc" = 3 ] && ok "supersede: an unknown request id is refused" || not_ok "unknown id rc=$rc"
+
+HERDR_PANE_ID="$CPANE" act supersede "$rid_i1" --authority conductor --review-reason x >/dev/null 2>&1; rc=$?
+[ "$rc" = 8 ] && ok "supersede: a missing --action-sha256 is refused" || not_ok "missing sha rc=$rc"
+
+HERDR_PANE_ID="$CPANE" act supersede "$rid_i1" --authority conductor --action-sha256 deadbeef --review-reason x >/dev/null 2>&1; rc=$?
+[ "$rc" = 8 ] && [ "$(_sql "SELECT status FROM action_requests WHERE request_id=$(_sq "$rid_i1");")" = pending ] \
+  && ok "supersede: a wrong action_sha256 is refused, request stays pending" || not_ok "wrong sha rc=$rc"
+
+HERDR_PANE_ID="$PANE" act supersede "$rid_i1" --authority conductor --action-sha256 "$asha1" --review-reason x >/dev/null 2>&1; rc=$?
+[ "$rc" = 8 ] && ok "supersede: the WORKER's own pane (not the registered conductor) is refused" || not_ok "wrong pane rc=$rc"
+
+HERDR_PANE_ID="$CPANE" act supersede "$rid_i1" --authority bogus --action-sha256 "$asha1" --review-reason x >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && ok "supersede: an unknown authority is refused" || not_ok "unknown authority rc=$rc"
+
+HERDR_PANE_ID="$CPANE" act supersede "$rid_i1" --authority conductor --action-sha256 "$asha1" \
+  --review-reason "the worker already finished ANSWER.md without this; moved on" >/dev/null; rc=$?
+[ "$rc" = 0 ] && [ "$(_sql "SELECT status||'/'||authority FROM action_requests WHERE request_id=$(_sq "$rid_i1");")" = superseded/conductor ] \
+  && ok "supersede: a live conductor with the matching action_sha256 supersedes (status=superseded, authority=conductor)" \
+  || not_ok "conductor supersede rc=$rc: $(_sql "SELECT status FROM action_requests WHERE request_id=$(_sq "$rid_i1");")"
+[ -n "$(_sql "SELECT decided_at FROM action_requests WHERE request_id=$(_sq "$rid_i1");")" ] \
+  && ok "supersede: decided_at/decision_reason recorded (who, authority, reason, timestamp)" || not_ok "no decided_at"
+[ "$(_sql "SELECT count(*) FROM events WHERE type='action_decided' AND json_extract(payload,'\$.request_id')=$(_sq "$rid_i1") AND json_extract(payload,'\$.decision')='superseded';")" = 1 ] \
+  && ok "supersede: an action_decided event with decision=superseded was recorded" || not_ok "no action_decided(superseded) event"
+grep -q "\[HERDR-ACTION\] $rid_i1 SUPERSEDED" "$work/sent" \
+  && ok "supersede: the worker's pane was told SUPERSEDED, not DECLINED" || not_ok "worker not told superseded: $(cat "$work/sent" 2>/dev/null)"
+[ "$(_sql "SELECT count(*) FROM action_requests WHERE request_id=$(_sq "$rid_i1") AND status='pending';")" = 0 ] \
+  && ok "supersede: the superseded row no longer matches status='pending' (clears publisher.py's has_pending_request / tasks.py's close gate)" \
+  || not_ok "superseded row still counted pending"
+
+out2="$(enf write '{"path":".handoffs/SUPI1.md","content":"x"}')"; rc=$?
+rid_i1b="$(printf '%s' "$out2" | field request_id)"
+[ "$rc" = 8 ] && [ -n "$rid_i1b" ] && [ "$rid_i1b" != "$rid_i1" ] && [ "$(printf '%s' "$out2" | field decision)" = block ] \
+  && ok "supersede: re-issuing the identical call escalates as a FRESH pending request ($rid_i1b != $rid_i1) -- never consumed, unlike approve/decline" \
+  || not_ok "re-issue after supersede: rc=$rc out=$out2"
+[ "$(_sql "SELECT status FROM action_requests WHERE request_id=$(_sq "$rid_i1b");")" = pending ] \
+  && ok "supersede: the new escalation is genuinely pending (still blocks the orchestrator close gate)" || not_ok "new request not pending"
+
+for _n in 1 2 3; do bash "$here/herdr-action.sh" tick >/dev/null 2>&1; done
+[ "$(_sql "SELECT status FROM action_requests WHERE request_id=$(_sq "$rid_i1b");")" = pending ] \
+  && ok "never automatic: three tick passes over a running task's own pending request never supersede, decline, approve or expire it" \
+  || not_ok "tick auto-decided the request on its own"
+
+rm -f "$work/sent"
+out3="$(enf write '{"path":".handoffs/SUPI2.md","content":"x"}')"
+rid_i2="$(printf '%s' "$out3" | field request_id)"
+_sql "UPDATE action_requests SET route='human' WHERE request_id=$(_sq "$rid_i2");" >/dev/null
+bash "$here/herdr-action.sh" tick >/dev/null 2>&1; bash "$here/herdr-action.sh" tick >/dev/null 2>&1
+fid_i2="$(_sql "SELECT form_record FROM action_requests WHERE request_id=$(_sq "$rid_i2");")"
+fpath_i2="$(_sql "SELECT form_path FROM action_requests WHERE request_id=$(_sq "$rid_i2");")"
+[ -n "$fid_i2" ] && [ -n "$fpath_i2" ] && ok "setup: a human-route form was served and pinned for $rid_i2" || not_ok "no pinned human form: fid=$fid_i2 fp=$fpath_i2"
+grep -q 'value=supersede' "$fpath_i2" 2>/dev/null \
+  && ok "the served form offers an explicit supersede choice (cancel this request -- worker already moved on), not just approve/decline" \
+  || not_ok "form has no supersede option: $(cat "$fpath_i2" 2>/dev/null)"
+jq -c --arg id "$rid_i2" '.status="answered" | .answers={request_id:$id, decision:"supersede", reason:"worker finished without it"}' \
+  "$HERDR_STATE_ROOT/forms/$fid_i2.json" > "$HERDR_STATE_ROOT/forms/$fid_i2.json.t" && mv "$HERDR_STATE_ROOT/forms/$fid_i2.json.t" "$HERDR_STATE_ROOT/forms/$fid_i2.json"
+bash "$here/herdr-action.sh" tick >/dev/null 2>&1
+[ "$(_sql "SELECT status||'/'||authority||'/'||decision_reason FROM action_requests WHERE request_id=$(_sq "$rid_i2");")" = "superseded/human/worker finished without it" ] \
+  && ok "a human choosing 'cancel' on the form is applied as status=superseded, authority=human, by the tick -- a human is never pushed into approving" \
+  || not_ok "human supersede via form: $(_sql "SELECT status||'/'||authority||'/'||decision_reason FROM action_requests WHERE request_id=$(_sq "$rid_i2");")"
+grep -q "\[HERDR-ACTION\] $rid_i2 SUPERSEDED (human)" "$work/sent" \
+  && ok "the worker was told it was superseded by the human's decision, not approved" || not_ok "worker not told (human supersede): $(cat "$work/sent" 2>/dev/null)"
+
 
 
 printf '\n%s\n' "-----"

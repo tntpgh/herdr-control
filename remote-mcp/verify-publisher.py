@@ -425,6 +425,18 @@ class HookApprovalBlocker(unittest.TestCase):
         _, asks, _, _ = pub.registry_rows(["task_hook"])
         self.assertNotIn("task_hook", asks)
 
+    def test_superseded_requests_are_never_surfaced_as_a_current_blocker(self):
+        # request-supersede (2026-10-04): a superseded request (herdr-action.sh
+        # supersede -- "the worker moved on, cancel this", distinct from a
+        # decline) must clear registry_rows' has_pending_request gate the
+        # exact same way an approved/declined one already does, so
+        # tasks.py's _orchestrator_close_research can proceed.
+        con = sqlite3.connect(self.reg)
+        con.execute("UPDATE action_requests SET status='superseded' WHERE request_id='ar_1'")
+        con.commit(); con.close()
+        _, asks, _, _ = pub.registry_rows(["task_hook"])
+        self.assertNotIn("task_hook", asks)
+
     def test_an_input_required_ask_always_wins_over_an_action_request(self):
         con = sqlite3.connect(self.reg)
         con.execute("INSERT INTO events VALUES (2,'task_hook','input_required',?,?)",
