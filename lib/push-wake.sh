@@ -389,7 +389,7 @@ push_wake() {
   fi
 
   local rc=0
-  bash "$_pw_dir/send-to-agent.sh" "$cpane" "$wake" >/dev/null 2>&1 || rc=$?
+  bash "$_pw_dir/send-to-agent.sh" "$cpane" --not-an-answer "$wake" >/dev/null 2>&1 || rc=$?
   local outcome; outcome="$(_wake_outcome_for "$rc")"
 
   if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then

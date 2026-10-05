@@ -28,8 +28,8 @@
 # consumed, for any reason; something changing means it was, for any reason
 # (a real submit, or the paste placeholder finally clearing).
 #
-# Usage:  send-to-agent.sh <pane_id> [--force] [--wait-clear SECONDS] <text>
-#         send-to-agent.sh <pane_id> [--force] [--wait-clear SECONDS] --submit-only
+# Usage:  send-to-agent.sh <pane_id> [--force] [--wait-clear SECONDS] [--not-an-answer] <text>
+#         send-to-agent.sh <pane_id> [--force] [--wait-clear SECONDS] [--not-an-answer] --submit-only
 #   pane_id       e.g. w2:p1 (from `herdr pane list` / pane-map.sh)
 #   --force       send even if the pane looks like it is on a permission prompt,
 #                 or if a human appears to be typing into it right now
@@ -38,6 +38,10 @@
 #   --submit-only press/retry Enter on text ALREADY in the composer (e.g. an
 #                 operator typed directly into the pane over herdr and the
 #                 Enter did not land) — types nothing, requires no text arg.
+#   --not-an-answer  an automated notice ([HERDR-DENIED], wakes, kickoffs):
+#                 records the delivery WITHOUT the worker's visible
+#                 `CONDUCTOR:` request, so the stall watchdog never reads it
+#                 as that request's answer (DESIGN-228 §2).
 #   text          the prompt to inject (literal; quote it) — omitted with
 #                 --submit-only
 #
@@ -70,15 +74,17 @@ export HERDR_SANCTIONED_ANSWER=1
 _here=$(cd "$(dirname "$0")" && pwd)
 . "$_here/lib/prompt-parse.sh"
 
-pane="${1:?usage: send-to-agent.sh <pane_id> [--force] [--wait-clear SECONDS] [--submit-only] <text>}"; shift
+pane="${1:?usage: send-to-agent.sh <pane_id> [--force] [--wait-clear SECONDS] [--submit-only] [--not-an-answer] <text>}"; shift
 force=0
 submit_only=0
+not_an_answer=0
 wait_clear=0
 while :; do
   case "${1:-}" in
     --force)       force=1; shift ;;
     --wait-clear)  wait_clear="${2:?seconds required after --wait-clear}"; shift 2 ;;
     --submit-only) submit_only=1; shift ;;
+    --not-an-answer) not_an_answer=1; shift ;;
     *) break ;;
   esac
 done
@@ -243,6 +249,16 @@ fi
 # was actually answering, not whatever the composer shows after we typed
 # into it.
 _pre_pid="$(prompt_id "$pane" 2>/dev/null)"
+# DESIGN-228 §2: the `CONDUCTOR:` request this delivery answers, as {fp,ctx,
+# tail} from the one extractor hub.py's signal 5 uses, on the identical pane
+# read. Taken here, before typing AND before the final permission check
+# below, which no pane read may follow. An automated notice passes
+# --not-an-answer and captures nothing: it is not an answer.
+_req=""
+if [ "$not_an_answer" -eq 0 ]; then
+  _req="$(herdr pane read "$pane" --source recent --lines 60 2>/dev/null \
+    | python3 "$_here/lib/conductor_prompt.py" 2>/dev/null)" || _req=""
+fi
 
 # The typing guard above spends up to ~1s reading the pane AFTER the permission
 # check, and a menu raised in that window would receive the typed text — a `y`
@@ -373,9 +389,13 @@ for _ in 1 2 3 4 5 6; do
           # conductor: incident 3's owner was the worker's parent conductor,
           # but "delivered, nothing told anyone it sat unread" is not
           # specific to who sent it.
+          # DESIGN-228 §2: `req` is the conductor request this delivery
+          # answers, captured before typing; absent under --not-an-answer
+          # (automated notices) or when no request was on screen.
           if [ -n "$_owner_tid" ]; then
             append_event "$_owner_run" "$_owner_tid" "message_delivered" \
-              "$(jq -nc --arg p "$pane" --arg f "${HERDR_PANE_ID:-}" '{pane:$p, from:$f}')" >/dev/null 2>&1
+              "$(jq -nc --arg p "$pane" --arg f "${HERDR_PANE_ID:-}" --arg r "$_req" \
+                 '{pane:$p, from:$f} + (if $r == "" then {} else {req:($r | fromjson)} end)')" >/dev/null 2>&1
           fi
         ) 2>/dev/null
       fi

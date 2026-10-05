@@ -123,7 +123,7 @@ _ha_notify_worker() {                   # row decision -> records action_notifie
       approved:*)    msg="[HERDR-ACTION] $id APPROVED ($(_ha_field "$row" authority)): re-issue the identical call now — same tool, same command and arguments, byte for byte. It runs once." ;;
       *)             msg="[HERDR-ACTION] $id DECLINED ($(_ha_field "$row" authority)): $(_ha_field "$row" decision_reason). Do not retry it or work around it; change approach, or finish and hand off." ;;
     esac
-    bash "$HA_SEND" "$pane" "$msg" >/dev/null 2>&1; rc=$?
+    bash "$HA_SEND" "$pane" --not-an-answer "$msg" >/dev/null 2>&1; rc=$?
     case "$rc" in 0) outcome=submitted ;; 5) outcome=refused ;; 4) outcome=unsubmitted ;; *) outcome="error_$rc" ;; esac
   fi
   append_event "$run" "$task" action_notified \
@@ -283,7 +283,7 @@ cmd_surface() {                         # id -> wake the conductor once
   elif [ -z "$cbirth" ] || [ "$cbirth" != "$(pane_birth_now "$cpane")" ]; then
     outcome=conductor_unreachable
   else
-    bash "$HA_SEND" "$cpane" "$msg" >/dev/null 2>&1; rc=$?
+    bash "$HA_SEND" "$cpane" --not-an-answer "$msg" >/dev/null 2>&1; rc=$?
     case "$rc" in 0) outcome=submitted ;; 5) outcome=refused ;; 4) outcome=unsubmitted ;; *) outcome="error_$rc" ;; esac
   fi
   _sql "UPDATE action_requests SET surfaced_at=$(_sq "$(_now_iso)") WHERE request_id=$(_sq "$id");" >/dev/null 2>&1

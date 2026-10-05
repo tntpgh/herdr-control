@@ -429,7 +429,7 @@ if [ "$delivered" -eq 1 ]; then
         sleep 5
         _tail="$(herdr pane read "$PANE" --source visible --lines 8 2>/dev/null || true)"
         printf '%s\n' "$_tail" | grep '^[[:space:]]*╰' | grep -qF "$_base" || break
-        bash "$HERE/send-to-agent.sh" "$PANE" --submit-only || true
+        bash "$HERE/send-to-agent.sh" "$PANE" --not-an-answer --submit-only || true
     done
     if printf '%s\n' "${_tail:-}" | grep '^[[:space:]]*╰' | grep -qF "$_base"; then
         delivered=0 drc=8  # stranded in composer despite submit retries

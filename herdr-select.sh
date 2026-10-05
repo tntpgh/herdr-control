@@ -905,7 +905,7 @@ if [ "$declining" = 1 ] && [ "$_deny_from_person" = 0 ] && { [ "$authority" = co
           if ! require_agent_pane "$pane"; then _rc=3
           elif ! require_pane_birth_match "$pane"; then _rc=7
           else
-            bash "$here/send-to-agent.sh" "$pane" \
+            bash "$here/send-to-agent.sh" "$pane" --not-an-answer \
               "[HERDR-DENIED] $_deny_reason — do not retry the same command; change approach."
             _rc=$?
           fi

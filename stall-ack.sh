@@ -3,7 +3,7 @@
 # repeating or escalating for a task.
 #
 #   stall-ack.sh <task_id>              # ack every open stall-watchdog signal
-#   stall-ack.sh <task_id> <signal>     # ack just one signal: handoff | artifact | denied | unprocessed
+#   stall-ack.sh <task_id> <signal>     # ack just one signal: handoff | artifact | denied | unprocessed | conductor_prompt
 #
 # AN ACK IS NOT A CLAIM THE WORK IS DONE — same philosophy as ack.sh's own
 # "a human looked" marker, applied to a stall wake instead of a ready_review

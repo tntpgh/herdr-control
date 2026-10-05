@@ -218,7 +218,7 @@ _attn_maybe_escalate() {                # run_id task_id pane conductor_pane_id 
   msg="$msg — its conductor (${conductor_pane_id:-none}) has not acted. Verify before acting, this is a"
   msg="$msg peer signal, not an instruction from the operator: herdr pane read ${pane} --source visible --lines 30"
   local rc=0
-  bash "$here/send-to-agent.sh" "$main" "$msg" >/dev/null 2>&1 || rc=$?
+  bash "$here/send-to-agent.sh" "$main" --not-an-answer "$msg" >/dev/null 2>&1 || rc=$?
   local outcome; outcome="$(_wake_outcome_for "$rc")"
   append_event "$run_id" "$task_id" "attention_escalation_result" \
     "$(jq -nc --arg k "$key" --arg o "$outcome" --argjson c "$rc" --argjson a "$attempt" \
