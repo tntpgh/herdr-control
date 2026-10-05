@@ -131,7 +131,7 @@ as-built differences):
    today; `route=human` goes to the existing alert path (`lib/alert-gate.sh` →
    Slack / formserve decisions portal); the hub lists open requests (no
    `action_decided` yet).
-3. **Deciding.** One script, `herdr-action.sh <request_id> approve|decline
+3. **Deciding.** One script, `herdr-action.sh approve|decline|supersede <request_id>
    --authority conductor|human --review-category … --review-reason …`, applying
    today's `herdr-select.sh` authority rules unchanged: conductor authority needs
    the owning registered pane and cannot approve `reserved`; human authority is
@@ -139,10 +139,14 @@ as-built differences):
    `(task, tool, input_sha256)` — or, for code by reference, the existing
    `file_approval_record(task, realpath, sha256)` — plus an `action_decided` event
    (also recorded in `approvals`, `authority` as today). Decline writes
-   `action_decided` with the reason.
+   `action_decided` with the reason. Supersede cancels one exact request without
+   granting execution; it requires decline-capable authority, the request's
+   `action_sha256`, and a nonblank reason. A later identical call creates a fresh
+   pending request, unlike decline's persistent refusal.
 4. **Worker learns.** `send-to-agent.sh` types `[HERDR-ACTION] <id> approved —
-   re-issue the identical call` or `… declined: <reason>` into the worker pane
-   (typed delivery with submit verification; the worker is idle, no menu). The
+   re-issue the identical call`, `… declined: <reason>`, or `… SUPERSEDED:
+   <reason>` into the worker pane (typed delivery with submit verification;
+   the worker is idle, no menu). Only an approval grants execution. The
    re-issued call's hook finds the unused grant for that exact `input_sha256`,
    consumes it, and allows. A different byte changes the hash, so a grant cannot
    be stretched to another command — the property the scrape path lacked.
@@ -352,21 +356,36 @@ Nothing here runs for a task spawned without the flag.
   `(task, action_sha256)` — an approved one-shot grant is consumed (check-and-set
   UPDATE; exactly one of N parallel identical calls runs) and the call runs; a
   pending request blocks as "still waiting"; a declined one blocks with the
-  reviewer's reason and is not re-requested; otherwise a new request is created
+  reviewer's reason and is not re-requested; a superseded one cannot be consumed
+  and re-escalates as a fresh pending request. Otherwise a new request is created
   (deterministic id, so parallel identical calls make one row) and the conductor
   is woken immediately. `action_sha256` covers the execution-relevant input only
   (bash: command, cwd, service env/name; other tools: the whole input minus the
   model's free-text `i`), so a rephrased intent still matches and one changed byte
   does not.
-- **Deciding** (`herdr-action.sh approve|decline <id>`): conductor authority as in
-  `herdr-select.sh` (caller pane = registered conductor pane with a live matching
-  generation, active task, operational category + reason; approve only
-  conductor-route requests; decline anything). Human authority only through an
-  **answered hub form for exactly that request** (`--form <id>`). Approve records
-  a one-shot grant, or for a code-by-reference script a `file_approvals` row bound
-  to the reviewed sha256; both write an `approvals` row and `action_decided`, and
-  the worker is told in its pane (`send-to-agent.sh`, after a pane-generation
-  check).
+- **Deciding** (`herdr-action.sh approve|decline|supersede <id>`): conductor
+  authority as in `herdr-select.sh` (caller pane = registered conductor pane
+  with a live matching generation, active task; approval needs an operational
+  category + reason and a conductor-route request). Decline and supersede may
+  cancel human-route/reserved requests too, because neither runs the action.
+  Supersede requires `--action-sha256 <request's action_sha256>` and a nonblank
+  reason. Human authority requires an **answered, pinned hub form for exactly
+  that request** (`--form <id>`); cancellation also validates the answer's
+  `action_sha256` and reason. Approve records a one-shot grant, or for a
+  code-by-reference script a `file_approvals` row bound to its reviewed sha256.
+  Supersede records no grant of either kind. Decisions write an `approvals` row
+  and `action_decided` (request id, action SHA, authority, reviewer, reason;
+  event timestamp), and notify the worker after a pane-generation check.
+- **Abandoned research action**: the existing form under `runs/action-forms/`
+  offers “Cancel this request (worker moved on)” alongside approve and decline,
+  with no default choice. Cancellation records `superseded`, not approved.
+  Request age, an idle/done pane, a passing `ANSWER.md`, and form expiry never
+  decide the request. `publisher.py` already selects only `status='pending'`;
+  superseded and declined rows therefore clear `has_pending_request` on the
+  next snapshot. Another pending request still blocks. The research
+  orchestrator's answer validation and F1/F2 live-pane/closure gates remain
+  unchanged. Terminal registry task withdrawal below is distinct from a
+  worker pane merely reporting done.
 - **Withdrawal** (`herdr-action.sh tick`, 2026-09-29): a pending request whose
   task is terminal (`completed|failed|cancelled|lost`) becomes `withdrawn`
   (authority `system`, event `action_withdrawn`) and its form record, if still

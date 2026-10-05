@@ -425,6 +425,23 @@ class HookApprovalBlocker(unittest.TestCase):
         _, asks, _, _ = pub.registry_rows(["task_hook"])
         self.assertNotIn("task_hook", asks)
 
+    def test_terminal_decisions_clear_the_blocker_but_another_pending_request_still_blocks(self):
+        for status in ("superseded", "declined"):
+            with self.subTest(status=status):
+                con = sqlite3.connect(self.reg)
+                con.execute("DELETE FROM action_requests WHERE request_id='ar_2'")
+                con.execute("UPDATE action_requests SET status=? WHERE request_id='ar_1'", (status,))
+                con.commit(); con.close()
+                _, asks, _, _ = pub.registry_rows(["task_hook"])
+                self.assertNotIn("task_hook", asks)
+                con = sqlite3.connect(self.reg)
+                con.execute("INSERT INTO action_requests VALUES ('ar_2','task_hook','bash','another action','pending',?)",
+                            (Z(NOW),))
+                con.commit(); con.close()
+                _, asks, _, _ = pub.registry_rows(["task_hook"])
+                self.assertEqual(asks["task_hook"]["tool"], "bash")
+                self.assertEqual(asks["task_hook"]["kind"], "permission")
+
     def test_an_input_required_ask_always_wins_over_an_action_request(self):
         con = sqlite3.connect(self.reg)
         con.execute("INSERT INTO events VALUES (2,'task_hook','input_required',?,?)",

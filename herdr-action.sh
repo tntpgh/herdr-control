@@ -11,7 +11,9 @@
 #   herdr-action.sh approve <request_id> --authority conductor \
 #       --review-category <local-read|local-build|branch-work|owned-cleanup> --review-reason <why>
 #   herdr-action.sh decline <request_id> --authority conductor --review-reason <why>
-#   herdr-action.sh approve|decline <request_id> --authority human --form <form_id>
+#   herdr-action.sh supersede <request_id> --authority conductor \
+#       --action-sha256 <sha> --review-reason <why>
+#   herdr-action.sh approve|decline|supersede <request_id> --authority human --form <form_id>
 #   herdr-action.sh surface <request_id>   wake the owning conductor (idempotent)
 #   herdr-action.sh tick                   the hub's pass (hub.py, every 60s)
 #
@@ -22,10 +24,26 @@
 #              operational --review-category and a --review-reason are required.
 #              A conductor may approve only conductor-route requests (escalate
 #              verdicts, lessons); a reserved (human-only) request refuses. It
-#              may decline anything — declining runs nothing.
+#              may decline anything, or supersede anything (same rule as
+#              decline: never gated by route/verdict) — neither runs the call.
 #   human      only through an ANSWERED hub decision form for this exact
 #              request (--form <id>, ~/.local/state/herdr/forms/<id>.json). The
 #              hub's tick applies answered forms itself.
+#
+# supersede (request-supersede, 2026-10-04): a terminal decision for ONE
+# exact request, distinct from decline — "the worker already moved on, this
+# is no longer wanted" rather than "no, don't run this". Requires
+# --action-sha256 matching the request's own action_sha256 (conductor CLI
+# path; human cancellation must carry the same SHA in its pinned form) —
+# a wrong/missing sha, wrong pane, wrong authority or unknown id all refuse.
+# Never automatic: no age, idle-worker, or passing-ANSWER.md signal ever
+# supersedes a request on its own — only an explicit conductor/human
+# decision through this command. A superseded request is NOT consumable: the
+# identical call re-issued escalates again as a brand-new pending request
+# (unlike a decline, which blocks forever on the old reason) — see
+# lib/action-request.sh's state-machine comment. Superseded (like declined)
+# stops counting as `status='pending'`, so publisher.py's has_pending_request
+# and tasks.py's `_orchestrator_close_research` gate clear on the next tick.
 #
 # Approve writes a one-shot grant bound to (task, tool, action_sha256), or —
 # for a script judged by reference (grant_kind=file) — a file_approvals row for
@@ -99,12 +117,14 @@ _ha_conductor_ok() {                    # task-json -> 0 if the caller is its li
 }
 
 # An answered hub form for exactly this request. Prints the answer JSON.
-_ha_form_answer() {                     # form_id request_id -> answers json
+_ha_form_answer() {                     # form_id request_id action_sha256 -> answers json
   local f="$HA_FORMS_DIR/$1.json"
   case "$1" in ''|*/*|*..*) return 1 ;; esac
   [ -r "$f" ] || return 1
-  jq -e --arg id "$2" '.status=="answered" and (.answers.request_id==$id)
-      and ((.answers.decision=="approve") or (.answers.decision=="decline"))' "$f" >/dev/null 2>&1 || return 1
+  jq -e --arg id "$2" --arg sha "$3" '.status=="answered" and (.answers.request_id==$id)
+      and ((.answers.decision=="approve") or (.answers.decision=="decline")
+        or (.answers.decision=="supersede" and .answers.action_sha256==$sha
+          and (.answers.reason | type=="string" and test("\\S"))))' "$f" >/dev/null 2>&1 || return 1
   jq -c '.answers' "$f"
 }
 
@@ -121,6 +141,7 @@ _ha_notify_worker() {                   # row decision -> records action_notifie
     case "$decision:$(_ha_field "$row" grant_kind)" in
       approved:file) msg="[HERDR-ACTION] $id APPROVED ($(_ha_field "$row" authority)): $(_ha_field "$row" code_path) at sha256 $short is approved for this task — re-run it unchanged. Any edit to that file needs a new review." ;;
       approved:*)    msg="[HERDR-ACTION] $id APPROVED ($(_ha_field "$row" authority)): re-issue the identical call now — same tool, same command and arguments, byte for byte. It runs once." ;;
+      superseded:*)  msg="[HERDR-ACTION] $id SUPERSEDED ($(_ha_field "$row" authority)): $(_ha_field "$row" decision_reason). This request is cancelled, not approved — do not run it or work around it. If the action is still needed, issue the call again; it will escalate as a brand-new request." ;;
       *)             msg="[HERDR-ACTION] $id DECLINED ($(_ha_field "$row" authority)): $(_ha_field "$row" decision_reason). Do not retry it or work around it; change approach, or finish and hand off." ;;
     esac
     bash "$HA_SEND" "$pane" --not-an-answer "$msg" >/dev/null 2>&1; rc=$?
@@ -134,7 +155,7 @@ _ha_notify_worker() {                   # row decision -> records action_notifie
 }
 
 # The one decide path (conductor CLI, human CLI, hub tick).
-_ha_decide() {                          # id approved|declined authority decided_by category reason
+_ha_decide() {                          # id approved|declined|superseded authority decided_by category reason
   local id="$1" status="$2" auth="$3" who="$4" cat="$5" why="$6" row kind run task
   row="$(action_request_get "$id")"
   [ -n "$row" ] || die "no request $id" 3
@@ -149,11 +170,11 @@ _ha_decide() {                          # id approved|declined authority decided
   fi
   row="$(action_request_get "$id")"
   append_event "$run" "$task" action_decided \
-    "$(jq -nc --arg id "$id" --arg s "$status" --arg a "$auth" --arg w "$who" --arg c "$cat" --arg r "$why" \
-       '{request_id:$id, decision:$s, authority:$a, reviewer:$w, review_category:$c, reason:$r}')" \
+    "$(jq -nc --arg id "$id" --arg sha "$(_ha_field "$row" action_sha256)" --arg s "$status" --arg a "$auth" --arg w "$who" --arg c "$cat" --arg r "$why" \
+       '{request_id:$id, action_sha256:$sha, decision:$s, authority:$a, reviewer:$w, review_category:$c, reason:$r}')" \
     "actdec_${id}" >/dev/null 2>&1 || true
   local tj pane choice=1 label=Approve
-  [ "$status" = declined ] && { choice=2; label=Deny; }
+  case "$status" in declined) choice=2; label=Deny ;; superseded) choice=3; label=Supersede ;; esac
   tj="$(read_task "$run" "$task")"; pane="$(_ha_field "$tj" pane_id)"
   approval_decided "appr_${id}" "$pane" "$id" "$choice" "$label" "$who" "$auth" \
     "$(_ha_field "$row" verdict)" "$(_ha_field "$row" command)" "$run" "$task" >/dev/null 2>&1 || true
@@ -163,8 +184,8 @@ _ha_decide() {                          # id approved|declined authority decided
   approval_confirmed "appr_${id}" "$HA_NOTIFIED" "worker told via send-to-agent" >/dev/null 2>&1 || true
 }
 
-cmd_decide() {                          # approve|decline id [flags]
-  local verb="$1" id="${2:-}" authority="" cat="" why="" form="" row tj route verdict
+cmd_decide() {                          # approve|decline|supersede id [flags]
+  local verb="$1" id="${2:-}" authority="" cat="" why="" form="" asha="" row tj route verdict
   shift 2 2>/dev/null || die "usage: herdr-action.sh $verb <request_id> --authority conductor|human …"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -172,6 +193,7 @@ cmd_decide() {                          # approve|decline id [flags]
       --review-category) cat="${2:-}"; shift 2 ;;
       --review-reason) why="${2:-}"; shift 2 ;;
       --form) form="${2:-}"; shift 2 ;;
+      --action-sha256) asha="${2:-}"; shift 2 ;;
       *) die "unknown argument $1" ;;
     esac
   done
@@ -179,7 +201,15 @@ cmd_decide() {                          # approve|decline id [flags]
   row="$(action_request_get "$id")"; [ -n "$row" ] || die "no request $id" 3
   tj="$(read_task "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)")"
   route="$(_ha_field "$row" route)"; verdict="$(_ha_field "$row" verdict)"
-  local status=approved; [ "$verb" = decline ] && status=declined
+  local status=approved
+  case "$verb" in decline) status=declined ;; supersede) status=superseded ;; esac
+  if [ "$verb" = supersede ] && { [ "$authority" != human ] || [ -n "$asha" ]; }; then
+    # Bound to request_id AND action_sha256 (SPEC.md requirement 1): the
+    # decider must name the exact action they reviewed, not merely an id —
+    # a wrong or missing sha refuses, same as a wrong pane or authority.
+    [ -n "$asha" ] && [ "$asha" = "$(_ha_field "$row" action_sha256)" ] \
+      || die "supersede requires --action-sha256 matching request $id's action_sha256 (wrong or missing sha refused)" 8
+  fi
   case "$authority" in
     conductor)
       _ha_task_active "$tj" || die "the task is not active — nothing to decide" 8
@@ -199,7 +229,7 @@ cmd_decide() {                          # approve|decline id [flags]
       # request's form counts — a record written later by anything else does not.
       pinned="$(_ha_field "$row" form_record)"
       [ -n "$pinned" ] && [ "$form" = "$pinned" ] || die "human authority needs --form <id> naming the hub decision form served for $id (${pinned:-none served yet})" 8
-      ans="$(_ha_form_answer "$form" "$id")" || die "human authority needs --form <id>: an ANSWERED hub decision form for exactly $id" 8
+      ans="$(_ha_form_answer "$form" "$id" "$(_ha_field "$row" action_sha256)")" || die "human authority needs --form <id>: an ANSWERED hub decision form for exactly $id (cancellation also requires its action SHA and a reason)" 8
       [ "$(_ha_field "$ans" decision)" = "$verb" ] || die "form $form answered '$(_ha_field "$ans" decision)', not '$verb'" 8
       _ha_decide "$id" "$status" human "hub form $form" "" "$(_ha_field "$ans" reason)" ;;
     *) die "--authority conductor|human is required" ;;
@@ -272,7 +302,7 @@ cmd_surface() {                         # id -> wake the conductor once
   cpane="$(_ha_field "$tj" conductor_pane_id)"; cbirth="$(_ha_field "$tj" conductor_pane_birth)"
   label="$(_ha_field "$tj" label)"
   disp="$(pretool_redact "$(_ha_field "$row" command)" | tr '\n' ' ' | cut -c1-300)"
-  msg="[HERDR-ACTION] ${label:-$(_ha_field "$row" task_id)} ($(_ha_field "$tj" pane_id)) asks to run: ${disp} — $(_ha_field "$row" reason | cut -c1-200). Request $id. Review the complete action (herdr-action.sh show $id), then: $here/herdr-action.sh approve $id --authority conductor --review-category <local-read|local-build|branch-work|owned-cleanup> --review-reason '<why>'  OR  $here/herdr-action.sh decline $id --authority conductor --review-reason '<why>'"
+  msg="[HERDR-ACTION] ${label:-$(_ha_field "$row" task_id)} ($(_ha_field "$tj" pane_id)) asks to run: ${disp} — $(_ha_field "$row" reason | cut -c1-200). Request $id. Review the complete action (herdr-action.sh show $id), then: $here/herdr-action.sh approve $id --authority conductor --review-category <local-read|local-build|branch-work|owned-cleanup> --review-reason '<why>'  OR  $here/herdr-action.sh decline $id --authority conductor --review-reason '<why>'  OR cancel this request (worker moved on): $here/herdr-action.sh supersede $id --authority conductor --action-sha256 $(_ha_field "$row" action_sha256) --review-reason '<why>'"
   if [ -z "$cpane" ]; then
     owner_msg="[HERDR-ACTION] ${label:-$(_ha_field "$row" task_id)} ($(_ha_field "$tj" pane_id)) has no conductor configured and asks to run: ${disp} — $(_ha_field "$row" reason | cut -c1-200). Request $id. Decide at http://127.0.0.1:8600/decisions."
     if owner_label="$(_ha_route_to_owner "$id" "$row" "$tj" "$owner_msg")"; then
@@ -317,19 +347,22 @@ textarea{width:100%;min-height:70px;padding:10px 12px;border-radius:5px;border:1
 button{font:600 14px system-ui;padding:10px 20px;border-radius:5px;cursor:pointer;border:1px solid var(--accent);background:var(--accent);color:var(--ground)}
 </style></head><body><main>
 <h1>A worker needs your OK for one action</h1>
-<p class=sub>Worker $(_ha_esc "$(_ha_field "$tj" label)") ($(_ha_esc "$(_ha_field "$tj" pane_id)")) was stopped before running this. It only runs if you approve it here, and then only once, exactly as shown. If this page expires, the request stays open — expiry is not a no.</p>
+<p class=sub>Worker $(_ha_esc "$(_ha_field "$tj" label)") ($(_ha_esc "$(_ha_field "$tj" pane_id)")) was stopped before running this. It only runs if you approve it here, and then only once, exactly as shown. If this page expires, the request stays open — expiry is not a no. If the worker has already moved on and finished without this, choose Cancel instead of leaving it pending.</p>
 <form id=f>
 <fieldset><legend>What it wants to run</legend><pre>$(_ha_esc "$(_ha_field "$row" command)")</pre></fieldset>
 <fieldset><legend>Why it was stopped</legend><p style="margin:0">$(_ha_esc "$(_ha_field "$row" reason)")</p></fieldset>
 <fieldset><legend>Your decision</legend>
 <label class=opt><input type=radio name=decision value=approve required><span><b>Approve — run it once</b></span></label>
 <label class=opt><input type=radio name=decision value=decline><span><b>Decline — do not run it</b></span></label>
-<p style="margin:14px 0 6px">Reason (sent to the worker):</p><textarea name=reason></textarea></fieldset>
+<label class=opt><input type=radio name=decision value=supersede><span><b>Cancel this request (worker moved on)</b> — not approval; a later identical call needs a new decision.</span></label>
+<p style="margin:14px 0 6px">Reason (sent to the worker; required for cancellation):</p><textarea name=reason></textarea></fieldset>
 <p class=sub>Request $(_ha_esc "$id")</p>
 </form></main>
 <div class=bar><button type=submit form=f>Send decision</button></div>
-<script>document.getElementById("f").addEventListener("submit",function(e){e.preventDefault();var fd=new FormData(e.target);
-window.submitAnswers({request_id:"$(_ha_esc "$id")",decision:fd.get("decision"),reason:(fd.get("reason")||"").trim()})});</script>
+<script>var f=document.getElementById("f");f.addEventListener("change",function(){f.elements.reason.required=f.elements.decision.value==="supersede"});
+f.addEventListener("submit",function(e){e.preventDefault();var fd=new FormData(e.target),reason=(fd.get("reason")||"").trim();
+if(fd.get("decision")==="supersede"&&!reason){f.elements.reason.focus();return}
+window.submitAnswers({request_id:"$(_ha_esc "$id")",action_sha256:"$(_ha_esc "$(_ha_field "$row" action_sha256)")",decision:fd.get("decision"),reason:reason})});</script>
 </body></html>
 HTML
   ( "$HA_PYTHON" "$HA_FORMSERVE" "$f" --timeout 86400 --no-open </dev/null >/dev/null 2>&1 & disown ) 2>/dev/null
@@ -380,10 +413,11 @@ EOF
     st="$(jq -r '.status // empty' "$HA_FORMS_DIR/$fid.json" 2>/dev/null)"
     case "${st:-}" in
       answered)
-        if ans="$(_ha_form_answer "$fid" "$id")"; then
+        if ans="$(_ha_form_answer "$fid" "$id" "$(_ha_field "$row" action_sha256)")"; then
           case "$(_ha_field "$ans" decision)" in
             approve) ( _ha_decide "$id" approved human "hub form $fid" "" "$(_ha_field "$ans" reason)" ) >/dev/null 2>&1 ;;
             decline) ( _ha_decide "$id" declined human "hub form $fid" "" "$(_ha_field "$ans" reason)" ) >/dev/null 2>&1 ;;
+            supersede) ( _ha_decide "$id" superseded human "hub form $fid" "" "$(_ha_field "$ans" reason)" ) >/dev/null 2>&1 ;;
           esac
         fi
         return 0 ;;
@@ -518,7 +552,7 @@ cmd_list() {
 }
 
 case "${1:-}" in
-  approve|decline) cmd_decide "$@" ;;
+  approve|decline|supersede) cmd_decide "$@" ;;
   surface) [ -n "${2:-}" ] || die "usage: herdr-action.sh surface <request_id>"; cmd_surface "$2" ;;
   tick) cmd_tick ;;
   list) cmd_list "${2:-}" ;;
