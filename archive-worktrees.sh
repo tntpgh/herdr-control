@@ -237,8 +237,43 @@ _read_panes() {
 # unset HERDR_RUN_STATE_DIR), never an empty one — and it is opened
 # -readonly: registry_init would mkdir and CREATE it, which is exactly how a
 # typo'd dir used to read as "nobody is working".
+# _reg_ro retries ONCE (HERDR_REGISTRY_BUSY_RETRIES, bounded) when sqlite3
+# itself reports the database as locked/busy despite `.timeout` — a real
+# batch run saw "run registry query failed" on 14/200 reads under a busy
+# registry even with .timeout 5000, and `.timeout`'s own internal wait does
+# not cover every case (e.g. another connection's locking_mode=EXCLUSIVE).
+# Still fail-closed: a query that keeps failing returns 1, and _REG_ERR
+# carries sqlite3's actual stderr text into the HOLD reason instead of the
+# generic message alone — "it failed" without "here is what sqlite3 said"
+# was unactionable. Any OTHER sqlite3 error (schema, syntax, a corrupt db)
+# is never retried — only locked/busy is transient.
+#
+# Results travel in globals (_REG_OUT, _REG_ERR), never through `$(…)`: a
+# command substitution runs _reg_ro in a subshell and throws away anything
+# it sets, the same trap lib/worktree-archive.sh's header documents for
+# _ARCHIVE_WHY. Call it directly — `if ! _reg_ro "SELECT …"; then …` — and
+# read _REG_OUT/_REG_ERR from the caller's own shell afterward.
+_REG_OUT=""; _REG_ERR=""
 _reg_ro() {
-  sqlite3 -readonly -batch -noheader -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$(registry_db)" "$1"
+  local sql="$1" errfile rc tries=0 max="${HERDR_REGISTRY_BUSY_RETRIES:-1}"
+  _REG_OUT=""; _REG_ERR=""
+  errfile=$(mktemp 2>/dev/null) || { _REG_ERR="could not create a scratch file for sqlite3's stderr"; return 1; }
+  while :; do
+    _REG_OUT=$(sqlite3 -readonly -batch -noheader -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$(registry_db)" "$sql" 2>"$errfile")
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$errfile"
+      return 0
+    fi
+    _REG_ERR=$(cat "$errfile" 2>/dev/null)
+    if [ "$tries" -ge "$max" ] || ! printf '%s' "$_REG_ERR" | grep -qi 'locked\|busy'; then
+      rm -f "$errfile"
+      return "$rc"
+    fi
+    rm -f "$errfile"
+    tries=$((tries + 1))
+    sleep 0.2
+  done
 }
 _read_registry() {
   local db n rows tid twt twt_real
@@ -246,19 +281,27 @@ _read_registry() {
   db=$(registry_db)
   if [ ! -f "$db" ] || [ ! -s "$db" ]; then
     reg_why="run registry $db does not exist (HERDR_RUN_STATE_DIR wrong or unset?) — a missing registry is not an empty one; liveness cannot be verified"
-  elif ! n=$(_reg_ro "SELECT count(*) FROM tasks;" 2>/dev/null); then
-    reg_why="run registry query failed; liveness cannot be verified"
-  elif [ "$n" = 0 ] || case "$n" in ''|*[!0-9]*) true ;; *) false ;; esac; then
-    reg_why="run registry $db has never held a task (not the live registry?); liveness cannot be verified"
-  elif ! rows=$(_reg_ro "SELECT task_id || '|' || worktree FROM tasks WHERE state IN ('starting','running','blocked') AND worktree IS NOT NULL AND worktree != '';" 2>/dev/null); then
-    reg_why="run registry query failed; liveness cannot be verified"
-  else
-    while IFS='|' read -r tid twt; do
-      [ -n "$twt" ] || continue
-      reg_paths+=("$tid|$twt")
-      twt_real=$(_realdir "$twt") && [ "$twt_real" != "$twt" ] && reg_paths+=("$tid|$twt_real")
-    done <<<"$rows"
+    return
   fi
+  if ! _reg_ro "SELECT count(*) FROM tasks;"; then
+    reg_why="run registry query failed${_REG_ERR:+: $_REG_ERR}; liveness cannot be verified"
+    return
+  fi
+  n="$_REG_OUT"
+  if [ "$n" = 0 ] || case "$n" in ''|*[!0-9]*) true ;; *) false ;; esac; then
+    reg_why="run registry $db has never held a task (not the live registry?); liveness cannot be verified"
+    return
+  fi
+  if ! _reg_ro "SELECT task_id || '|' || worktree FROM tasks WHERE state IN ('starting','running','blocked') AND worktree IS NOT NULL AND worktree != '';"; then
+    reg_why="run registry query failed${_REG_ERR:+: $_REG_ERR}; liveness cannot be verified"
+    return
+  fi
+  rows="$_REG_OUT"
+  while IFS='|' read -r tid twt; do
+    [ -n "$twt" ] || continue
+    reg_paths+=("$tid|$twt")
+    twt_real=$(_realdir "$twt") && [ "$twt_real" != "$twt" ] && reg_paths+=("$tid|$twt_real")
+  done <<<"$rows"
 }
 
 # r2 H3 + r3 L2: every process's cwd AND every file it holds open, herdr
