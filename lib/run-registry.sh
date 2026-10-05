@@ -767,8 +767,12 @@ _legal_transition() {                   # from to -> 0 if allowed
 # closed unmerged may use — close-done-workers.sh's detached path refuses
 # `shipped` there (nothing merged) and refuses every other reason too (a
 # dropped PR is not `no-follow-on`/`canceled` by default: the operator must
-# say explicitly which it was). Each still needs a checkable proof below,
-# same gate as `shipped`, just not a merged-PR claim.
+# say explicitly which it was). The reverse holds too: close-done-workers.sh
+# HOLDs any row that is NOT a detached reviewer when asked to close it
+# abandoned/superseded — this function only checks the vocabulary, so a
+# direct set_task_state caller is trusted to use them for that case alone.
+# Each still needs a checkable proof below, same gate as `shipped`, just not
+# a merged-PR claim.
 _valid_closure_reason() {               # reason -> 0 if one of the seven
   local reason="$1"
   case "$reason" in
@@ -778,13 +782,18 @@ _valid_closure_reason() {               # reason -> 0 if one of the seven
   esac
 }
 
-# _gh_pr_lookup <owner/repo> (--number <n> | --head <branch>) -> prints
-# "STATE|URL|MERGE_OID" (MERGE_OID empty unless merged). Nonzero when gh is
-# missing or the call fails — callers must treat that as "unknown", never as
-# "fine". The ONE place that asks GitHub whether a PR merged and at what sha:
-# conductor-exit.sh finds a worktree's PR by branch, _valid_proof_ref checks a
-# cited PR by number; both read the same three fields the same way. By branch,
-# a MERGED PR sorts first (a branch can carry an older CLOSED one too).
+# _gh_pr_lookup <owner/repo> (--number <n> | --head <branch> | --head-all <branch>)
+# -> prints "STATE|URL|MERGE_OID" (MERGE_OID empty unless merged). Nonzero
+# when gh is missing or the call fails — callers must treat that as
+# "unknown", never as "fine". The ONE place that asks GitHub whether a PR
+# merged and at what sha: conductor-exit.sh finds a worktree's PR by branch,
+# _valid_proof_ref checks a cited PR by number; both read the same three
+# fields the same way. By branch (--head), a MERGED PR sorts first (a branch
+# can carry an older CLOSED one too) — right for "did it ship", wrong for "is
+# anything still open". --head-all prints EVERY PR on the branch, one line
+# each (empty output with rc 0 = genuinely no PR), for a caller that must
+# see an OPEN one regardless of what else the branch carries
+# (archive-worktrees.sh, review r1 H2 of PR #236).
 _gh_pr_lookup() {
   local slug="$1" how="$2" sel="$3" fmt='"\(.state)|\(.url)|\(.mergeCommit.oid // "")"'
   command -v gh >/dev/null 2>&1 || return 127
@@ -792,6 +801,8 @@ _gh_pr_lookup() {
     --number) gh pr view "$sel" -R "$slug" --json url,state,mergeCommit -q "$fmt" 2>/dev/null ;;
     --head)   gh pr list -R "$slug" --head "$sel" --state all --json url,state,mergeCommit \
                 -q "sort_by(.state != \"MERGED\") | .[0] // empty | $fmt" 2>/dev/null ;;
+    --head-all) gh pr list -R "$slug" --head "$sel" --state all --limit 1000 --json url,state,mergeCommit \
+                -q ".[] | $fmt" 2>/dev/null ;;
     *) return 2 ;;
   esac
 }
@@ -929,8 +940,8 @@ _valid_proof_ref() {
   return 1
 }
 
-set_task_state() {                      # run_id task_id state [reason] [proof]
-  local run_id="$1" task_id="$2" state="$3" reason="${4:-}" proof="${5:-}"
+set_task_state() {                      # run_id task_id state [reason] [proof] [detail-json-object]
+  local run_id="$1" task_id="$2" state="$3" reason="${4:-}" proof="${5:-}" detail="${6:-}"
   registry_init || return 1
   local attempt=0
   while [ "$attempt" -lt 3 ]; do
@@ -973,6 +984,15 @@ set_task_state() {                      # run_id task_id state [reason] [proof]
         ;;
       esac
     fi
+    # `detail` (optional): a JSON object recorded verbatim under .detail in
+    # this transition's state_changed payload — e.g. close-done-workers.sh's
+    # detached-close tuple (pr/head/ref/state/archive), which otherwise
+    # existed only in its stdout. Anything that is not a JSON object is
+    # refused before the transaction, so a malformed detail never half-writes.
+    if [ -n "$detail" ] && ! printf '%s' "$detail" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      printf 'run-registry: refusing %s for %s/%s: detail is not a JSON object\n' "$state" "$run_id" "$task_id" >&2
+      return 1
+    fi
 
     # The state change and its event land in ONE transaction, AND that
     # transaction is compare-and-swap on the "$cur" we just read (WHERE
@@ -1003,6 +1023,9 @@ set_task_state() {                      # run_id task_id state [reason] [proof]
       fi
     else
       payload="$(jq -nc --arg s "$state" --arg f "$cur" '{state:$s, from:$f}')"
+    fi
+    if [ -n "$detail" ]; then
+      payload="$(printf '%s' "$payload" | jq -c --argjson d "$detail" '. + {detail: $d}')" || return 1
     fi
     changed=$(_sql "BEGIN IMMEDIATE;
       UPDATE tasks SET state=$(_sq "$state"), updated_at=$(_sq "$at")

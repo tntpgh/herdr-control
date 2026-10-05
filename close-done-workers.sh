@@ -170,17 +170,19 @@ pane_live_birth() {
 # empty when there was nothing to archive) — the caller prints all of these
 # regardless of outcome, which is this function's "log the tuple" contract.
 #
-# Order matches the proposal exactly: (1) a PR must be named at all, (2)
-# refs/pull/<N>/head on origin must equal HEAD exactly — RECOVERABILITY,
-# not delivery, (3) no tracked/untracked changes, (4) every ignored
-# artifact archived+verified (skipped when there are none to archive).
-# Only once ALL FOUR hold does this even ask GitHub what happened to the
-# PR — and even then, closable is not the same as "will close": under
-# --apply, the requested reason must match what GitHub actually reports
-# (MERGED only accepts shipped; CLOSED-unmerged only accepts
-# abandoned/superseded; OPEN or any other state never closes) or this
-# still HOLDs, refusing to let a default/batch reason quietly misdescribe
-# what happened to the PR. A plain dry run (apply=0) never mutates the
+# Order: (1) a PR must be named at all, (2) refs/pull/<N>/head on origin
+# must equal HEAD exactly — RECOVERABILITY, not delivery, (3) no tracked
+# changes and no untracked files (git plumbing, not `git status`, which
+# honors status.showUntrackedFiles=no), (4) GitHub's PR state — asked
+# BEFORE anything is archived, so an OPEN PR or a reason mismatch never
+# leaves a fresh archive dir behind (review r1 L4 of PR #236): OPEN or any
+# other state never closes, and under --apply the requested reason must
+# match it (MERGED only accepts shipped; CLOSED-unmerged only accepts
+# abandoned/superseded) or this still HOLDs, refusing to let a
+# default/batch reason quietly misdescribe what happened to the PR,
+# (5) every ignored artifact archived+verified (skipped when there are none;
+# regenerable dirs like node_modules are left in place and listed in the
+# manifest as EXCLUDED). A plain dry run (apply=0) never mutates the
 # filesystem — archiving included — and never requires the requested
 # reason to match: it previews pure eligibility; the printed state names
 # which reason --apply will require.
@@ -188,7 +190,7 @@ _DPR_REASON=""; _DPR_STATE=""; _DPR_HEAD_SHA=""; _DPR_REF_SHA=""; _DPR_ARCHIVE_M
 _detached_pr_check() {
   local wt="$1" run_id="$2" task_id="$3" repo_path="$4" repo_slug="$5" pr_num="$6" \
         want_reason="$7" apply="$8" \
-        head_sha ref_sha dirty files info state url oid repo_base ts archive_dir manifest required
+        head_sha ref_sha td ut dirty files info state url oid repo_base ts archive_dir required
   _DPR_REASON=""; _DPR_STATE=""; _DPR_HEAD_SHA=""; _DPR_REF_SHA=""; _DPR_ARCHIVE_MANIFEST=""
 
   if [ -z "$repo_slug" ] || [ -z "$pr_num" ]; then
@@ -213,35 +215,17 @@ _detached_pr_check() {
     return
   fi
 
-  dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-  if [ "${dirty:-0}" != 0 ]; then
+  if ! td=$(archive_enumerate_tracked_dirty "$wt") || ! ut=$(archive_enumerate_untracked "$wt"); then
+    _DPR_REASON="git could not list tracked changes/untracked files"
+    return
+  fi
+  dirty=$(printf '%s\n%s\n' "$td" "$ut" | grep -c .)
+  if [ "$dirty" != 0 ]; then
     _DPR_REASON="$dirty uncommitted/untracked file(s)"
     return
   fi
 
-  files=$(archive_enumerate_ignored "$wt")
-  if [ -n "$files" ]; then
-    if [ "$apply" != 1 ]; then
-      _DPR_REASON="$(printf '%s\n' "$files" | wc -l | tr -d ' ') ignored artifact(s) not yet archived (rerun with --apply to archive and close)"
-      return
-    fi
-    repo_base="$(basename "$repo_path")"
-    [ -n "$repo_base" ] || repo_base="unknown-repo"
-    ts=$(date -u +%Y%m%dT%H%M%SZ)
-    archive_dir="${HERDR_ARCHIVE_ROOT:-$HOME/Code/.archive/worktrees}/$repo_base/detached-pr-$pr_num-$ts"
-    if ! manifest=$(archive_copy_and_manifest "$wt" "$archive_dir" "$files"); then
-      _DPR_REASON="archiving ignored artifacts failed: $_ARCHIVE_WHY"
-      return
-    fi
-    if ! archive_verify_manifest "$wt" "$manifest"; then
-      _DPR_REASON="archive verification failed: $_ARCHIVE_WHY"
-      return
-    fi
-    _DPR_ARCHIVE_MANIFEST="$manifest"
-  fi
-
-  info=$(_gh_pr_lookup "$repo_slug" --number "$pr_num")
-  if [ -z "$info" ]; then
+  if ! info=$(_gh_pr_lookup "$repo_slug" --number "$pr_num") || [ -z "$info" ]; then
     _DPR_REASON="could not determine PR state for $repo_slug#$pr_num (gh unavailable or failed)"
     return
   fi
@@ -256,20 +240,50 @@ _detached_pr_check() {
       return
       ;;
   esac
+  if [ "$apply" = 1 ]; then
+    case "$required|$want_reason" in
+      shipped\|shipped|"abandoned or superseded|abandoned"|"abandoned or superseded|superseded") ;;
+      *)
+        _DPR_REASON="$repo_slug#$pr_num is $state — needs --reason=$required, not ${want_reason:-<empty>}"
+        return
+        ;;
+    esac
+  fi
 
-  [ "$apply" = 1 ] || return   # dry run: eligible to preview, nothing more to check
-
-  case "$required" in
-    shipped) [ "$want_reason" = shipped ] && return ;;
-    *) case "$want_reason" in abandoned|superseded) return ;; esac ;;
-  esac
-  _DPR_REASON="$repo_slug#$pr_num is $state — needs --reason=$required, not ${want_reason:-<empty>}"
+  if ! files=$(archive_enumerate_ignored "$wt") || ! archive_split_regenerable "$files"; then
+    _DPR_REASON="could not list ignored artifacts"
+    return
+  fi
+  files="$_ARCHIVE_KEEP"
+  if [ -n "$files" ]; then
+    if [ "$apply" != 1 ]; then
+      _DPR_REASON="$(printf '%s\n' "$files" | wc -l | tr -d ' ') ignored artifact(s) not yet archived (rerun with --apply to archive and close)"
+      return
+    fi
+    repo_base="$(basename "$repo_path")"
+    [ -n "$repo_base" ] || repo_base="unknown-repo"
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    archive_dir="${HERDR_ARCHIVE_ROOT:-$HOME/Code/.archive/worktrees}/$repo_base/detached-pr-$pr_num-$ts"
+    if ! archive_copy_and_manifest "$wt" "$archive_dir" "$files"; then
+      _DPR_REASON="archiving ignored artifacts failed: $_ARCHIVE_WHY"
+      return
+    fi
+    if ! archive_verify_manifest "$wt" "$_ARCHIVE_MANIFEST"; then
+      _DPR_REASON="archive verification failed: $_ARCHIVE_WHY"
+      return
+    fi
+    if ! archive_record_exclusions "$archive_dir" "$_ARCHIVE_EXCLUDED"; then
+      _DPR_REASON="$_ARCHIVE_WHY"
+      return
+    fi
+    _DPR_ARCHIVE_MANIFEST="$_ARCHIVE_MANIFEST"
+  fi
 }
 
 closable=0; held=0; refused=0
 while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_pr_repo review_pr_number; do
   [ -n "$pane" ] || continue
-  dpr_tuple=""
+  dpr_tuple=""; dpr_detail=""
   if [ "$panes_ok" != 1 ]; then
     reason="herdr pane list is unavailable or unparseable; status cannot be verified"
   else
@@ -285,6 +299,18 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
         reason="pane_id recycled to a different session (pane_birth mismatch)"
       fi
     fi
+  fi
+  # abandoned/superseded describe ONE thing: a detached reviewer whose PR
+  # closed unmerged, checked against GitHub in _detached_pr_check. On any
+  # other row nothing would check them, so they HOLD (review r1 L3).
+  if [ -z "$reason" ]; then
+    case "$closure_reason" in
+      abandoned|superseded)
+        if [ ! -d "$wt" ] || git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1; then
+          reason="--reason=$closure_reason is only for a detached-HEAD reviewer whose PR closed unmerged; this row is not one"
+        fi
+        ;;
+    esac
   fi
   if [ -z "$reason" ] && [ -d "$wt" ]; then
     if git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1; then
@@ -331,6 +357,9 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
         "$closure_reason" "$apply"
       reason="$_DPR_REASON"
       dpr_tuple="pr=${review_pr_repo:-?}#${review_pr_number:-?} head=${_DPR_HEAD_SHA:-?} ref=${_DPR_REF_SHA:-?} state=${_DPR_STATE:-?} archive=${_DPR_ARCHIVE_MANIFEST:-none}"
+      dpr_detail=$(jq -nc --arg pr "${review_pr_repo}#${review_pr_number}" --arg head "$_DPR_HEAD_SHA" \
+        --arg ref "$_DPR_REF_SHA" --arg state "$_DPR_STATE" --arg archive "$_DPR_ARCHIVE_MANIFEST" \
+        '{detached_close: {pr: $pr, head: $head, ref: $ref, state: $state, archive: $archive}}')
     fi
   fi
 
@@ -349,7 +378,7 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
   # run, the task stays `running` forever against a pane that no longer
   # exists — which is precisely the stale state that made the attention view
   # report seven phantom items all day.
-  if ! set_task_state "$run_id" "$task_id" "completed" "$closure_reason" "$closure_proof" >/dev/null 2>&1; then
+  if ! set_task_state "$run_id" "$task_id" "completed" "$closure_reason" "$closure_proof" "$dpr_detail" >/dev/null 2>&1; then
     # NEVER silently fall back to `cancelled` here — that used to convert
     # ANY refusal (a proof that doesn't actually match THIS task, a race,
     # an illegal transition) into a fabricated successful outcome: pane
