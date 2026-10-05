@@ -9,7 +9,7 @@ import { emailAllowed } from "./access";
 import { connection, DEFAULT_LIMITS, OWNER_LABEL, OWNER_LIMITS, rateLimited, resolveTarget, sanitizeMessage, sanitizeObjective, sanitizeOwnerMessage } from "./policy";
 import type { Connection, MessageLimits } from "./policy";
 import type { CommandAck, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem, OwnerAck, OwnerOutboxItem, OwnerReplySync, ResultDoc, Sender, Snapshot, TaskCaps, TaskRow } from "./types";
-import { SCOPE_OWNER_MESSAGE, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START, SNAPSHOT_SCHEMA } from "./types";
+import { SCOPE_OWNER_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START, SNAPSHOT_SCHEMA } from "./types";
 
 const str = z.string().max(4000);
 const ExtState = z.enum(["enabled", "disabled", "missing", "unknown"]);
@@ -244,6 +244,31 @@ export interface EventPage {
   result: "ok" | "cursor_pruned" | "cursor_scope_mismatch";
 }
 
+export interface ConsumerPosition {
+  result: "ok" | "event_consumers_disabled" | "insufficient_scope" | "invalid_arguments"
+    | "consumer_not_found" | "cursor_scope_mismatch" | "cursor_pruned"
+    | "committed_cursor_mismatch" | "lease_epoch_mismatch" | "cursor_backwards" | "cursor_past_latest";
+  consumer_id?: string;
+  committed_cursor?: number;
+  lease_epoch?: number;
+  authorization_scope_hash?: string;
+  scope_hash?: string;
+  updated_at?: string;
+  last_error?: string | null;
+  failure_count?: number;
+  latest_cursor?: number;
+  replay_floor_cursor?: number;
+}
+
+type ConsumerRow = {
+  committed_cursor: number;
+  lease_epoch: number;
+  authorization_scope_hash: string;
+  updated_at: number;
+  last_error: string | null;
+  failure_count: number;
+};
+
 // A started remote task's own (actor, client_id), the way pendingSenders()
 // reports it for messages -- but tagged with the SCOPE the sender needed to
 // queue it, so grantGate (index.ts) can check the right scope per mode
@@ -428,6 +453,16 @@ export class HerdrState extends DurableObject<Env> {
         WHERE remote_task_id<>''`);
     }
     this.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS task_events_event_id ON task_events(event_id) WHERE event_id IS NOT NULL`);
+    // Same tenant boundary as owner_private events: exact sender actor/client.
+    // A hash is a scope-change detector, never an authorization lookup key.
+    // srv is the existing Worker producer namespace; no publisher API is added.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS event_consumers (
+      producer TEXT NOT NULL DEFAULT 'srv', sender_actor TEXT NOT NULL, sender_client TEXT NOT NULL,
+      consumer_id TEXT NOT NULL, committed_cursor INTEGER NOT NULL DEFAULT 0 CHECK(committed_cursor >= 0),
+      lease_epoch INTEGER NOT NULL DEFAULT 1 CHECK(lease_epoch >= 1),
+      authorization_scope_hash TEXT NOT NULL, updated_at INTEGER NOT NULL,
+      last_error TEXT, failure_count INTEGER NOT NULL DEFAULT 0 CHECK(failure_count >= 0),
+      PRIMARY KEY(producer, sender_actor, sender_client, consumer_id))`);
     // send_owner_message's own queue, independent of `messages` (different
     // rate limit, different target shape -- a named owning session, never a
     // task's agent -- different ack vocabulary: delivered/blocked/replied,
@@ -956,6 +991,82 @@ export class HerdrState extends DurableObject<Env> {
     this.sql.exec(`INSERT OR REPLACE INTO kv (k, v) VALUES ('replay_floor_cursor', ?)`, String(candidateMax));
   }
 
+  // MAX(retained cursor) falls after pruning. SQLite's AUTOINCREMENT sequence
+  // survives deletion, so the stream watermark never moves backwards.
+  private latestEventCursor(): number {
+    return this.sql.exec<{ seq: number }>(`SELECT seq FROM sqlite_sequence WHERE name='task_events'`).toArray()[0]?.seq ?? 0;
+  }
+
+  // Hash before the synchronous critical section: no await separates reading
+  // the row/floor/watermark from the conditional UPDATE. Scope ordering and
+  // duplicate scope strings are immaterial; identity and grant changes are not.
+  private async consumerScopeHash(caller: Caller, scopes: string[]): Promise<string> {
+    const input = JSON.stringify(["srv", caller.email, caller.client_id, [...new Set(scopes)].sort()]);
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  private consumerPosition(nowMs: number, caller: Caller, consumerId: string, hash: string,
+      commit: { expected: number; cursor: number; epoch: number } | null): ConsumerPosition {
+    return this.ctx.storage.transactionSync(() => {
+      let row = this.sql.exec<ConsumerRow>(`SELECT committed_cursor, lease_epoch, authorization_scope_hash,
+        updated_at, last_error, failure_count FROM event_consumers
+        WHERE producer='srv' AND sender_actor=? AND sender_client=? AND consumer_id=?`,
+        caller.email, caller.client_id, consumerId).toArray()[0];
+      if (!row && commit) return { result: "consumer_not_found" };
+      if (!row) {
+        this.sql.exec(`INSERT INTO event_consumers
+          (sender_actor, sender_client, consumer_id, authorization_scope_hash, updated_at) VALUES (?,?,?,?,?)`,
+          caller.email, caller.client_id, consumerId, hash, nowMs);
+        row = { committed_cursor: 0, lease_epoch: 1, authorization_scope_hash: hash,
+          updated_at: nowMs, last_error: null, failure_count: 0 };
+      }
+      const out: ConsumerPosition = {
+        result: "ok", consumer_id: consumerId, committed_cursor: row.committed_cursor, lease_epoch: row.lease_epoch,
+        authorization_scope_hash: row.authorization_scope_hash, scope_hash: scopeHash(caller),
+        updated_at: iso(row.updated_at), last_error: row.last_error, failure_count: row.failure_count,
+        latest_cursor: this.latestEventCursor(), replay_floor_cursor: this.replayFloorCursor(),
+      };
+      if (row.authorization_scope_hash !== hash) return { ...out, result: "cursor_scope_mismatch" };
+      // Unlike ad-hoc list_events(since_cursor=0), a durable unread consumer
+      // cannot treat zero as "everything retained" and silently miss a gap.
+      if (row.committed_cursor < out.replay_floor_cursor!) return { ...out, result: "cursor_pruned" };
+      if (!commit) return out;
+      if (row.lease_epoch !== commit.epoch) return { ...out, result: "lease_epoch_mismatch" };
+      if (row.committed_cursor !== commit.expected) return { ...out, result: "committed_cursor_mismatch" };
+      if (commit.cursor < row.committed_cursor) return { ...out, result: "cursor_backwards" };
+      if (commit.cursor > out.latest_cursor!) return { ...out, result: "cursor_past_latest" };
+      if (commit.cursor === row.committed_cursor) return out;
+      const changed = this.sql.exec(`UPDATE event_consumers SET committed_cursor=?, updated_at=?
+        WHERE producer='srv' AND sender_actor=? AND sender_client=? AND consumer_id=?
+          AND committed_cursor=? AND lease_epoch=? AND authorization_scope_hash=?`,
+        commit.cursor, nowMs, caller.email, caller.client_id, consumerId, commit.expected, commit.epoch, hash).rowsWritten;
+      if (changed !== 1) throw new Error("consumer conditional update lost inside transaction");
+      return { ...out, committed_cursor: commit.cursor, updated_at: iso(nowMs) };
+    });
+  }
+
+  async getConsumerPosition(nowMs: number, caller: Caller, scopes: string[], consumerId: string): Promise<ConsumerPosition> {
+    if (this.env.EVENT_CONSUMERS_ENABLED !== "true") return { result: "event_consumers_disabled" };
+    if (!scopes.includes(SCOPE_READ)) return { result: "insufficient_scope" };
+    if (!consumerId || consumerId.length > 200) return { result: "invalid_arguments" };
+    const hash = await this.consumerScopeHash(caller, scopes);
+    return this.consumerPosition(nowMs, caller, consumerId, hash, null);
+  }
+
+  async commitConsumerPosition(nowMs: number, caller: Caller, scopes: string[], consumerId: string,
+      expectedCommittedCursor: number, newCursor: number, leaseEpoch: number): Promise<ConsumerPosition> {
+    if (this.env.EVENT_CONSUMERS_ENABLED !== "true") return { result: "event_consumers_disabled" };
+    if (!scopes.includes(SCOPE_READ)) return { result: "insufficient_scope" };
+    if (!consumerId || consumerId.length > 200
+        || ![expectedCommittedCursor, newCursor, leaseEpoch].every((n) => Number.isSafeInteger(n) && n >= 0)) {
+      return { result: "invalid_arguments" };
+    }
+    const hash = await this.consumerScopeHash(caller, scopes);
+    return this.consumerPosition(nowMs, caller, consumerId, hash,
+      { expected: expectedCommittedCursor, cursor: newCursor, epoch: leaseEpoch });
+  }
+
   // The global feed, scope-bound (plan section 5 + section 7): sinceCursor
   // is rejected as cursor_pruned below the durable replay floor (never
   // trusted bare -- a stale cursor under a false "still complete" read
@@ -972,7 +1083,7 @@ export class HerdrState extends DurableObject<Env> {
   // with scanned_through_cursor").
   listEvents(sinceCursor: number, sinceScopeHash: string | null, caller: Caller, limit: number): EventPage {
     const hash = scopeHash(caller);
-    const latest = this.sql.exec<{ c: number | null }>(`SELECT MAX(cursor) AS c FROM task_events`).one().c ?? 0;
+    const latest = this.latestEventCursor();
     const floor = this.replayFloorCursor();
     if (sinceScopeHash && sinceScopeHash !== hash) {
       return { events: [], scanned_through_cursor: sinceCursor, latest_cursor: latest, replay_floor_cursor: floor,
