@@ -885,6 +885,51 @@ class Sweep(unittest.TestCase):
         actions = tsk.sweep({"task_pend": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
         self.assertEqual(actions, [])
 
+    def test_research_cancellation_clears_only_the_pending_gate(self):
+        import publisher
+
+        self._row("task_cancel", "rtask_cancel")
+        self._event("task_cancel", "hard_stop_scheduled", json.dumps({"pid": 1}))
+        (self.wt / ".handoffs/ANSWER.md").write_text("Answer: https://example.com/evidence")
+        reg = TMP / "cancel-requests.sqlite3"
+        if reg.exists():
+            reg.unlink()
+        con = sqlite3.connect(reg)
+        con.execute("CREATE TABLE tasks (task_id TEXT, pane_birth TEXT)")
+        con.execute("INSERT INTO tasks VALUES ('task_cancel','birth')")
+        con.execute("CREATE TABLE events (sequence INTEGER, task_id TEXT, type TEXT, occurred_at TEXT, payload TEXT)")
+        con.execute("CREATE TABLE action_requests (task_id TEXT, request_id TEXT, tool TEXT, reason TEXT, created_at TEXT, status TEXT)")
+        con.execute("INSERT INTO action_requests VALUES ('task_cancel','ar_cancel','bash','review','2000-01-01T00:00:00Z','pending')")
+        con.commit()
+        original_registry = publisher.REGISTRY
+        publisher.REGISTRY = reg
+        try:
+            for status in ("pending", "superseded", "declined"):
+                with self.subTest(status=status):
+                    con.execute("UPDATE action_requests SET status=?", (status,))
+                    con.commit()
+                    _, asks, _, _ = publisher.registry_rows(["task_cancel"])
+                    t = {"task_id": "task_cancel", "run_id": "run_x", "state": "running",
+                         "worktree": str(self.wt), "agent_live": True, "pane_status": "done",
+                         "has_pending_request": bool(asks.get("task_cancel", {}).get("kind"))}
+                    actions = tsk.sweep({"task_cancel": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
+                    closes = [a for a in actions if a["action"] == "orchestrator_close"]
+                    self.assertEqual(bool(closes), status != "pending")
+                    self.assertEqual(con.execute("SELECT status FROM action_requests").fetchone()[0], status,
+                                     "sweep must not decide the request itself")
+                    if closes:
+                        self.assertTrue(closes[0]["ok"])
+                        for overrides in ({"agent_live": False}, {"pane_status": "working"}):
+                            self.assertIsNone(tsk._orchestrator_close_research({**t, **overrides}, self.wt))
+                        FAKE_CLOSE_OUT.write_text("REFUSED: pane birth changed\n")
+                        try:
+                            self.assertFalse(tsk._orchestrator_close_research(t, self.wt)["ok"])
+                        finally:
+                            FAKE_CLOSE_OUT.write_text("closed 1, held back 0, refused 0\n")
+        finally:
+            con.close()
+            publisher.REGISTRY = original_registry
+
     def test_orchestrator_close_requires_the_summary_to_say_it_actually_closed_something(self):
         # F10 (security review round 2, 2026-10-04): rc=0 with no
         # HOLD/REFUSED substring is also what "closed 0" looks like -- an

@@ -7,16 +7,11 @@
 # every call on the exact input; an escalate/reserved verdict is BLOCKED and
 # becomes a row here instead of a menu:
 #
-#   pending --(conductor|human decides, herdr-action.sh)--> approved | declined
-#                                                        \-> superseded (request-supersede, 2026-10-04:
-#                                                            "I moved on, cancel this" -- NOT a decline.
-#                                                            The identical call re-issued after a supersede
-#                                                            escalates again as a brand-new pending request;
-#                                                            after a decline it stays blocked on the old
-#                                                            decline reason forever. Same decline-capable
-#                                                            authority, bound to request_id AND
-#                                                            action_sha256 so the decider confirms they
-#                                                            reviewed the exact action, never just an id.)
+#   pending --(conductor|human decides)--> approved | declined | superseded
+#   superseded: explicit cancellation, never a grant. A later identical call
+#               escalates as a fresh pending request; decline instead retains
+#               its refusal. Requires decline-capable authority, request id,
+#               action_sha256 and a reason through herdr-action.sh.
 #   approved (grant_kind once) --(the identical call re-issued)--> consumed
 #   approved (grant_kind file) -> a file_approvals row (code by reference); the
 #                                 same bytes then re-run through peer_decide
@@ -83,12 +78,10 @@ action_grant_consume() {                # request_id -> 0 consumed by this call
 action_request_create() {               # run task tool action_sha command verdict reason route grant_kind code_path code_sha
   local run="$1" task="$2" tool="$3" sha="$4" cmd="$5" verdict="$6" reason="$7" route="$8" kind="$9"
   local cpath="${10:-}" csha="${11:-}" gen id
-  # Every prior generation for (task, action) counts, not merely
-  # consumed/approved -- a superseded (or any future terminal, non-pending)
-  # status must still force a fresh id, or INSERT OR IGNORE silently
-  # no-ops on the old row's id and the caller is handed back the SAME
-  # (still-superseded) row instead of a genuinely new pending one.
-  gen="$(_sql "SELECT count(*) FROM action_requests WHERE task_id=$(_sq "$task") AND action_sha256=$(_sq "$sha");" 2>/dev/null)"
+  # Terminal generations, including superseded, force a fresh id. Do not
+  # count pending rows: concurrent callers that arrive after the first
+  # INSERT must still map to that same pending generation.
+  gen="$(_sql "SELECT count(*) FROM action_requests WHERE task_id=$(_sq "$task") AND action_sha256=$(_sq "$sha") AND status!='pending';" 2>/dev/null)"
   id="ar_$(printf '%s' "$task" | shasum -a 256 | cut -c1-8)_$(printf '%s' "$sha" | cut -c1-16)_$(( ${gen:-0} + 1 ))"
   if _sql "INSERT OR IGNORE INTO action_requests (request_id, run_id, task_id, tool, action_sha256, command,
         verdict, reason, route, grant_kind, code_path, code_sha256, status, created_at)
@@ -145,8 +138,8 @@ action_request_resolve() {              # run task tool action_sha command verdi
   return 0
 }
 
-# Check-and-set pending -> approved|declined. 0 only for the caller that won.
-action_request_decide() {               # request_id approved|declined authority decided_by category reason [form_path]
+# Check-and-set pending -> approved|declined|superseded. 0 only for the caller that won.
+action_request_decide() {               # request_id approved|declined|superseded authority decided_by category reason
   local n
   n="$(_sql "UPDATE action_requests SET status=$(_sq "$2"), decided_at=$(_sq "$(_now_iso)"),
       authority=$(_sq "$3"), decided_by=$(_sq "$4"), review_category=$(_sq "$5"), decision_reason=$(_sq "$6")
