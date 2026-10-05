@@ -362,7 +362,7 @@ class SchemaTolerance(unittest.TestCase):
         pub.REGISTRY = self.real_registry
 
     def test_registry_rows_tolerates_a_pre_v7_registry(self):
-        births, asks, remotes, sessions = pub.registry_rows(["task_v6"])
+        births, asks, remotes, sessions, pending = pub.registry_rows(["task_v6"])
         self.assertEqual(births, {"task_v6": "term_v6"})
         self.assertEqual(remotes, {})
         self.assertEqual(sessions, {})
@@ -402,12 +402,12 @@ class HookApprovalBlocker(unittest.TestCase):
         pub.REGISTRY = self.real_registry
 
     def test_registry_rows_surfaces_a_pending_hook_request_as_an_ask(self):
-        _, asks, _, _ = pub.registry_rows(["task_hook"])
+        _, asks, _, _, _ = pub.registry_rows(["task_hook"])
         self.assertEqual(asks["task_hook"]["kind"], "permission")
         self.assertEqual(asks["task_hook"]["tool"], "write")
 
     def test_unconfigured_conductor_summary_tells_zero_why(self):
-        _, asks, _, _ = pub.registry_rows(["task_hook"])
+        _, asks, _, _, _ = pub.registry_rows(["task_hook"])
         self.assertEqual(asks["task_hook"]["summary"], "awaiting_owner_approval: no conductor configured")
 
     def test_a_configured_conductor_keeps_the_policy_reason(self):
@@ -415,14 +415,14 @@ class HookApprovalBlocker(unittest.TestCase):
         con.execute("UPDATE events SET payload=? WHERE sequence=1",
                     (json.dumps({"request_id": "ar_1", "outcome": "submitted"}),))
         con.commit(); con.close()
-        _, asks, _, _ = pub.registry_rows(["task_hook"])
+        _, asks, _, _, _ = pub.registry_rows(["task_hook"])
         self.assertIn("restricts its write tool", asks["task_hook"]["summary"])
 
     def test_decided_requests_are_never_surfaced_as_a_current_blocker(self):
         con = sqlite3.connect(self.reg)
         con.execute("UPDATE action_requests SET status='approved' WHERE request_id='ar_1'")
         con.commit(); con.close()
-        _, asks, _, _ = pub.registry_rows(["task_hook"])
+        _, asks, _, _, _ = pub.registry_rows(["task_hook"])
         self.assertNotIn("task_hook", asks)
 
     def test_terminal_decisions_clear_the_blocker_but_another_pending_request_still_blocks(self):
@@ -432,24 +432,51 @@ class HookApprovalBlocker(unittest.TestCase):
                 con.execute("DELETE FROM action_requests WHERE request_id='ar_2'")
                 con.execute("UPDATE action_requests SET status=? WHERE request_id='ar_1'", (status,))
                 con.commit(); con.close()
-                _, asks, _, _ = pub.registry_rows(["task_hook"])
+                _, asks, _, _, _ = pub.registry_rows(["task_hook"])
                 self.assertNotIn("task_hook", asks)
                 con = sqlite3.connect(self.reg)
                 con.execute("INSERT INTO action_requests VALUES ('ar_2','task_hook','bash','another action','pending',?)",
                             (Z(NOW),))
                 con.commit(); con.close()
-                _, asks, _, _ = pub.registry_rows(["task_hook"])
+                _, asks, _, _, _ = pub.registry_rows(["task_hook"])
                 self.assertEqual(asks["task_hook"]["tool"], "bash")
                 self.assertEqual(asks["task_hook"]["kind"], "permission")
 
-    def test_an_input_required_ask_always_wins_over_an_action_request(self):
+    def test_historical_menu_ask_cannot_mask_pending_request_or_allow_closure(self):
         con = sqlite3.connect(self.reg)
         con.execute("INSERT INTO events VALUES (2,'task_hook','input_required',?,?)",
-                    (Z(NOW), json.dumps({"tool": "bash", "message": "menu-mode ask"})))
-        con.commit(); con.close()
-        _, asks, _, _ = pub.registry_rows(["task_hook"])
-        self.assertEqual(asks["task_hook"]["tool"], "bash")
-        self.assertNotIn("kind", asks["task_hook"])
+                    ("2000-01-01T00:00:00Z", json.dumps({"tool": "bash", "message": "old menu ask"})))
+        con.commit()
+        wt = WT_ROOT / "kb/feat-masked-request"
+        (wt / ".handoffs").mkdir(parents=True, exist_ok=True)
+        (wt / ".handoffs/ANSWER.md").write_text("Answer: https://example.com/evidence")
+        task = dict(task_id="task_hook", run_id="r9", label="research:masked", repo="/x/kb",
+                    state="running", pane_id="w8:p8", worktree=str(wt), branch="feat/masked",
+                    project="kb", created_at=Z(NOW), updated_at=Z(NOW))
+        real_hub_get = pub.hub_get
+        pub.hub_get = lambda path: (
+            {"tasks": [task]} if path == "/herdr?json=1" else
+            {"panes": [{"pane_id": "w8:p8", "birth": "term_hook", "agent": "omp", "agent_status": "idle"}]}
+            if path == "/api/panes" else {})
+        try:
+            for status in ("pending", "superseded", "declined"):
+                with self.subTest(status=status):
+                    con.execute("UPDATE action_requests SET status=?", (status,))
+                    con.commit()
+                    snap, local = pub.build(NOW)
+                    t = local["tasks"]["task_hook"]
+                    self.assertTrue(t["agent_live"])
+                    self.assertEqual(t["pane_status"], "idle")
+                    self.assertEqual(t["has_pending_request"], status == "pending")
+                    blockers = [b for b in snap["blockers"] if b["task_id"] == "task_hook"]
+                    if status == "pending":
+                        self.assertEqual([b["kind"] for b in blockers], ["permission"])
+                        self.assertIsNone(pub.rtasks._orchestrator_close_research(t, wt))
+                    else:
+                        self.assertEqual(blockers, [])
+        finally:
+            pub.hub_get = real_hub_get
+            con.close()
 
     def test_build_surfaces_a_running_hook_task_stuck_on_a_pending_request_as_a_blocker(self):
         wt = WT_ROOT / "kb/feat-hook"
@@ -565,7 +592,7 @@ class TranscriptSync(unittest.TestCase):
         return path
 
     def test_registry_rows_reads_the_agent_session_column(self):
-        births, asks, remotes, sessions = pub.registry_rows(["task_ts"])
+        births, asks, remotes, sessions, pending = pub.registry_rows(["task_ts"])
         self.assertEqual(sessions, {"task_ts": str(self.session_path)})
 
     def test_latest_reply_is_the_last_assistant_text_skipping_thinking_and_tool_call(self):

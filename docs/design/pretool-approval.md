@@ -370,22 +370,26 @@ Nothing here runs for a task spawned without the flag.
   cancel human-route/reserved requests too, because neither runs the action.
   Supersede requires `--action-sha256 <request's action_sha256>` and a nonblank
   reason. Human authority requires an **answered, pinned hub form for exactly
-  that request** (`--form <id>`); cancellation also validates the answer's
-  `action_sha256` and reason. Approve records a one-shot grant, or for a
-  code-by-reference script a `file_approvals` row bound to its reviewed sha256.
+  that request** (`--form <id>`) with the matching `action_sha256` for approve,
+  decline, and supersede; cancellation additionally requires a nonblank reason.
+  Approve records a one-shot grant, or for a code-by-reference script a
+  `file_approvals` row bound to its reviewed sha256.
   Supersede records no grant of either kind. Decisions write an `approvals` row
   and `action_decided` (request id, action SHA, authority, reviewer, reason;
   event timestamp), and notify the worker after a pane-generation check.
+  A conductor decision also retires the pinned open human form under the same
+  record lock as withdrawal; already-answered or expired forms are preserved.
 - **Abandoned research action**: the existing form under `runs/action-forms/`
   offers “Cancel this request (worker moved on)” alongside approve and decline,
   with no default choice. Cancellation records `superseded`, not approved.
   Request age, an idle/done pane, a passing `ANSWER.md`, and form expiry never
   decide the request. `publisher.py` already selects only `status='pending'`;
   superseded and declined rows therefore clear `has_pending_request` on the
-  next snapshot. Another pending request still blocks. The research
-  orchestrator's answer validation and F1/F2 live-pane/closure gates remain
-  unchanged. Terminal registry task withdrawal below is distinct from a
-  worker pane merely reporting done.
+  next snapshot. Another pending request still blocks, even when the task has
+  historical `input_required` events: pending membership is computed separately
+  from the displayed ask. The research orchestrator's answer validation and
+  F1/F2 live-pane/closure gates remain unchanged. Terminal task withdrawal below
+  is distinct from a worker pane merely reporting done.
 - **Withdrawal** (`herdr-action.sh tick`, 2026-09-29): a pending request whose
   task is terminal (`completed|failed|cancelled|lost`) becomes `withdrawn`
   (authority `system`, event `action_withdrawn`) and its form record, if still
