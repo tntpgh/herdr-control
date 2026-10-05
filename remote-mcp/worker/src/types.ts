@@ -35,6 +35,9 @@ export interface Env {
   // was on. The Mac has its own switch, HERDR_MCP_OWNER_INBOX, set only by
   // install.sh --remote-mcp-owner-inbox.
   OWNER_INBOX_ENABLED: string;
+  // Build-only: durable event checkpoints. Only literal "true" registers
+  // the tools; the Durable Object checks the switch again on every call.
+  EVENT_CONSUMERS_ENABLED?: string;
   INGEST_KEY: string; // secret: HMAC key shared with publisher.py
   BUILD_SHA: string; // commit deployed; "unstamped" when not deployed by provision.sh
 }

@@ -9,10 +9,9 @@ const { publicKey, privateKey } = await generateKeyPair("RS256", { extractable: 
 const pub = { ...(await exportJWK(publicKey)), kid: "test-kid", alg: "RS256", use: "sig" };
 const priv = { ...(await exportJWK(privateKey)), kid: "test-kid", alg: "RS256" };
 
-// The same Worker four times: as deployed first (messaging and tasks off,
-// read-only), with messaging on, with tasks on, and with owner-inbox on.
-// vars are fixed per isolate, so each mode is a project.
-const worker = (messaging: "true" | "false", tasks: "true" | "false" = "false", ownerInbox: "true" | "false" = "false") =>
+// Bindings are fixed per isolate, so each feature mode is a project.
+const worker = (messaging: "true" | "false", tasks: "true" | "false" = "false",
+    ownerInbox: "true" | "false" = "false", consumers: "true" | "false" = "false") =>
   cloudflareTest({
     wrangler: { configPath: "./wrangler.jsonc" },
     miniflare: {
@@ -22,6 +21,7 @@ const worker = (messaging: "true" | "false", tasks: "true" | "false" = "false", 
         MESSAGING_ENABLED: messaging,
         TASKS_ENABLED: tasks,
         OWNER_INBOX_ENABLED: ownerInbox,
+        EVENT_CONSUMERS_ENABLED: consumers,
         TEST_ACCESS_PRIVATE_JWK: JSON.stringify(priv),
       },
       outboundService: (request: Request) => {
@@ -42,6 +42,7 @@ export default defineConfig({
       { plugins: [worker("false")], test: { name: "read-only", include: ["test/readonly.test.ts"] } },
       { plugins: [worker("true", "false", "true")], test: { name: "owner-inbox", include: ["test/owner-inbox.test.ts"] } },
       { plugins: [worker("true", "false", "true")], test: { name: "events", include: ["test/events.test.ts"] } },
+      { plugins: [worker("true", "false", "true", "true")], test: { name: "consumers", include: ["test/consumers.test.ts"] } },
     ],
   },
 });

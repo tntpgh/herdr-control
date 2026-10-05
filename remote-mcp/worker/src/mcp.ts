@@ -367,6 +367,47 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
     });
   });
 
+  if (env.EVENT_CONSUMERS_ENABLED === "true" && canRead) {
+    server.registerTool("get_consumer_position", {
+      title: "Get a durable event consumer position",
+      description: "Get or initialize your named consumer at cursor 0. Bound to the original caller/client and " +
+        "authorization scopes. Never acknowledges events or advances an existing position. Returns cursor_pruned " +
+        "rather than skipping a retention gap; cursor_scope_mismatch rather than rebinding changed scopes. " +
+        "Use scope_hash with list_events/wait_for_events. At-least-once processing; not exactly-once.",
+      inputSchema: { consumer_id: z.string().min(1).max(200) },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    }, async ({ consumer_id }) => {
+      const v = await gate("get_consumer_position", consumer_id);
+      if (!isView(v)) return v;
+      const position = await stub.getConsumerPosition(now(), caller, scopes, consumer_id);
+      const data = { connection: v.connection, ...position };
+      return position.result === "ok" ? ok(data) : fail(position.result, `Refused: ${position.result}.`, data);
+    });
+
+    server.registerTool("commit_consumer_position", {
+      title: "Commit a fully handled event prefix",
+      description: "Explicitly acknowledge a serial, fully handled prefix for your named consumer. Conditional on " +
+        "expected_committed_cursor and lease_epoch returned by get_consumer_position. A stale commit, changed " +
+        "authorization scope, backwards cursor, cursor beyond latest_cursor, or pruned checkpoint changes nothing. " +
+        "Reading never acknowledges. This records your processing assertion, not business-process success; " +
+        "duplicate delivery after a crash is possible. No lease acquisition/takeover or exactly-once effects.",
+      inputSchema: {
+        consumer_id: z.string().min(1).max(200),
+        expected_committed_cursor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+        new_cursor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+        lease_epoch: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    }, async ({ consumer_id, expected_committed_cursor, new_cursor, lease_epoch }) => {
+      const v = await gate("commit_consumer_position", consumer_id);
+      if (!isView(v)) return v;
+      const position = await stub.commitConsumerPosition(now(), caller, scopes, consumer_id,
+        expected_committed_cursor, new_cursor, lease_epoch);
+      const data = { connection: v.connection, ...position };
+      return position.result === "ok" ? ok(data) : fail(position.result, `Refused: ${position.result}.`, data);
+    });
+  }
+
   if (scopes.includes(SCOPE_MESSAGE)) {
     server.registerTool("send_message", {
       title: "Send a message to a task's agent",

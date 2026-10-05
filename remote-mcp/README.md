@@ -185,6 +185,8 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
 | `resume_task` | task.cancel | `task_id`, `text?` | re-enters the same worktree/branch as a brand new `task_id` (only a terminal task can be resumed), linked via `parent_task_id` |
 | `list_events` | read | `since_cursor` (0), `since_scope_hash?`, `limit` 1–500 (100) | `result` ok\|cursor_pruned\|cursor_scope_mismatch, `scanned_through_cursor`, `latest_cursor`, `replay_floor_cursor`, `scope_hash`, and `events`: `task_started`, `state_changed`, `approval_needed`, `capability_probe`, `answer_ready`, `finished`, `verified`, `failed`, `cancelled`, `timed_out`, `disconnected`/`reconnected`, and (visible only to the original sender/client, by identity match — not gated on currently holding `herdr:message.owner`) `owner.reply_ready` — never the reply text itself. See "Watching for an owner reply" below. |
 | `wait_for_events` | read | `since_cursor` (0), `since_scope_hash?`, `timeout_s` 1–25 (20) | holds the call open until a new event lands or `timeout_s` elapses (true server push is not possible over Streamable HTTP; poll this instead of `list_events` in a tight loop). Same `result`/cursor contract as `list_events`. |
+| `get_consumer_position` | read (listed only when `EVENT_CONSUMERS_ENABLED=true`) | `consumer_id` (1–200 chars) | creates an unread checkpoint if absent; otherwise returns the durable position, epoch, scope hashes, diagnostics, watermark/floor, and typed result |
+| `commit_consumer_position` | read (listed only when `EVENT_CONSUMERS_ENABLED=true`) | `consumer_id`, `expected_committed_cursor`, `new_cursor`, `lease_epoch` (nonnegative safe integers) | conditional ACK of a fully handled prefix; stale cursor/epoch, scope change, retention gap, backwards or past-latest commits are refused without changing the row |
 | `send_owner_message` | message.owner (listed only when enabled) | `owner_label`, `body` (≤4000 chars), `client_msg_id` | `exchange_id`, `state` `queued` |
 | `get_owner_message_status` | read or message.owner | `exchange_id` | status + detail (only your own messages) |
 | `get_owner_reply` | read or message.owner | `exchange_id` | the owner's reply (body, `session`, `responded_at`) once one exists (only your own messages) |
@@ -226,6 +228,59 @@ platform's own retry/resume) should follow this sequence exactly:
    it does not survive the watcher task ending or an executor crash (that
    is Phase 3/4 territory -- named consumer checkpoints and Slack/other
    adapters -- not this MVP).
+
+### Durable named consumer positions (built, disabled)
+
+`EVENT_CONSUMERS_ENABLED` defaults to `"false"` in the Worker. Only the literal
+`"true"` exposes these two tools to `herdr:read` callers; the Durable Object
+checks the flag and scope again. Build/review authorization is **not**
+activation authorization. No deploy or activation is part of this change.
+
+Storage lives beside `task_events`, in the existing SQLite Durable Object:
+`event_consumers` is created idempotently without rebuilding existing tables.
+Its key is `(producer='srv', sender_actor, sender_client, consumer_id)`, reusing
+the event stream's tenant/original-sender boundary. Caller identity comes from
+the verified OAuth grant, never tool arguments. The same consumer name under
+another email or OAuth client denotes a separate checkpoint, not access to
+someone else's row. Owner-private events remain sender/client-only.
+
+1. Call `get_consumer_position(consumer_id)` after each restart. First use
+   stores cursor `0`, epoch `1`, and a SHA-256 `authorization_scope_hash`
+   over the producer, exact sender identity, and canonical granted-scope set.
+   Scope order and display names do not matter. Changed scopes return
+   `cursor_scope_mismatch`; the stored scope is never silently rebound.
+2. Resume `list_events`/`wait_for_events` using the returned
+   `committed_cursor` and `scope_hash` (the existing event-reader scope token;
+   distinct from `authorization_scope_hash`). Reading any page or position
+   never advances the checkpoint. Page using `scanned_through_cursor`,
+   including pages with only another sender's hidden events.
+3. Handle authorized events serially. Commit only a fully handled prefix:
+   `commit_consumer_position(consumer_id, expected_committed_cursor,
+   new_cursor, lease_epoch)`. The server records the caller's assertion; it
+   cannot prove downstream processing succeeded or detect a failed event
+   that the caller omitted.
+4. The conditional update is transactional with its scope, pruning floor,
+   epoch and watermark checks. One racing writer wins; the stale one returns
+   `committed_cursor_mismatch`. An epoch mismatch returns
+   `lease_epoch_mismatch`. Backwards/past-watermark commits return
+   `cursor_backwards`/`cursor_past_latest`. An equal cursor is a no-op after
+   all fences pass; refusal never alters timestamps or diagnostics.
+
+`latest_cursor` is the durable AUTOINCREMENT watermark, not `MAX` of retained
+rows: it survives pruning even when the event table becomes empty.
+Any checkpoint below `replay_floor_cursor`, **including zero**, returns
+`cursor_pruned` on get and commit. Stop and reconcile; these tools deliberately
+do not reset/rebind checkpoints or acknowledge across a known gap. A fresh
+consumer after pruning also reports the gap rather than starting silently at
+the floor. Explicit gap recovery is not provided by these two operations.
+
+This is **at-least-once**, not exactly-once. A crash before ACK replays the
+prefix; a crash after a downstream effect but before ACK may repeat the effect.
+Use destination idempotency keys where supported. Epoch `1` is initialized and
+fenced, but this build adds no lease acquisition, expiration, or takeover API;
+it does not claim exclusive processing ownership. `last_error` (nullable) and
+`failure_count` are stored diagnostics, not an automated retry/dead-letter
+policy. No alarms, transports, wake emitters, or outbox are added.
 
 ### Message rules (server-side, then re-checked on the Mac)
 
