@@ -247,11 +247,18 @@ def _safe_candidates(label, *a, **kw):
     """Review L1 (d): isolate a crash in ONE `stall_watchdog_candidates`
     call (e.g. a `replied=`-shape mutation) to its OWN result key, so it
     never takes the rest of Section B down with it -- same reasoning as
-    `_run_mutant` below, generalized to calls outside that loop."""
+    `_run_mutant` below, generalized to calls outside that loop.
+
+    Review L1 (r7): records the crash as the BOOLEAN `False`, never a
+    message string -- a non-empty string is truthy, so the bash runner's
+    own `sum(1 for v in r.values() if v)` counted every crash as `ok`.
+    The diagnostic still prints, to stderr, where it helps debugging
+    without being read as a passing result."""
     try:
         return hub.stall_watchdog_candidates(*a, **kw)
     except Exception as exc:
-        results[f"{label}_CRASHED"] = f"{type(exc).__name__}: {exc}"
+        results[f"{label}_CRASHED"] = False
+        print(f"{label}_CRASHED: {type(exc).__name__}: {exc}", file=sys.stderr)
         return []
 
 
@@ -259,13 +266,29 @@ def _safe_signals4(label, **kw):
     """Review L1 (d): isolate a `_stall_task_signals` arity/shape change
     to the ONE call site that unpacks it, instead of raising out of this
     whole inline script -- round-2's M3 failure mode, reopened by r3's own
-    L1 (reverting the arity fix crashed with 0 keys surviving)."""
+    L1 (reverting the arity fix crashed with 0 keys surviving).
+
+    Review L1 (r7): records `False`, not a truthy string -- see
+    `_safe_candidates`."""
     try:
         denied_, delivered_, owner_acted_, replied_ = hub._stall_task_signals(**kw)
         return denied_, delivered_, owner_acted_, replied_
     except Exception as exc:
-        results[f"{label}_CRASHED"] = f"{type(exc).__name__}: {exc}"
+        results[f"{label}_CRASHED"] = False
+        print(f"{label}_CRASHED: {type(exc).__name__}: {exc}", file=sys.stderr)
         return {}, {}, {}, {}
+
+
+def _safe_tick(label):
+    """Review L1: `_stall_watchdog_tick()` itself was called unwrapped --
+    a shape change anywhere in its own call graph (`_stall_task_signals`,
+    `stall_watchdog_candidates`, `_sw_resolved_keys`) would crash the rest
+    of Section B along with it. Same isolation as `_safe_candidates`."""
+    try:
+        hub._stall_watchdog_tick()
+    except Exception as exc:
+        results[f"{label}_CRASHED"] = False
+        print(f"{label}_CRASHED: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 # ---- signal 1: handoff (review N1/N2: live bus ONLY, IDLE_STATES ONLY) ------
@@ -461,12 +484,6 @@ cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
     pane_read_fn=lambda pane: CHROME_NO_PROMPT, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
 results["M1_silent_without_a_conductor_line"] = cands == []
-# The owner already acted after the pane's last line -> silent.
-cands = hub.stall_watchdog_candidates(
-    [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
-    owner_acted={"t1": NOW - 1}, claim_fn=NO_CLAIM)
-results["M1_silent_once_the_owner_already_acted"] = cands == []
 # A task state outside (stalled, ready_review) never reads the pane at all —
 # review N1/M-b's state-allowlist (`lost`/`cancelled`/`gone` used to be
 # included via `state != "completed"`).
@@ -713,68 +730,13 @@ for _h1r5_key, _h1r5_paras in _H1R5_CASES:
         pane_read_fn=lambda pane, _t=_h1r5_text: _t, pane_birth_fn=lambda pane: "pb1", claim_fn=NO_CLAIM)
     results[_h1r5_key] = any(c["signal"] == "conductor_prompt" for c in cands)
 
-# ---- review H1/M1 (r6): "answered" is bound to the REQUEST's OWN claim
-# epoch -- the first time THIS EXACT fingerprint was ever observed, held
-# fixed via `claim_fn` -- never `updated_at`. r5's tests (removed) used
-# `updated_at` as the baseline and so could never catch either bug r3
-# found: (H1) `updated_at` can sit WELL BEFORE the request itself, so an
-# earlier, unrelated delivery read as having answered a request it
-# preceded; (M1) `updated_at` SLIDES FORWARD on every later, unrelated
-# permission prompt, so an already-answered request re-fired the moment
-# the worker's next approval landed.
-_H1R6_SINCE = hub._iso_epoch(t7["updated_at"])
-_H1R6_CLAIM = _H1R6_SINCE + 120   # the request's own first-claimed epoch --
-                                 # AFTER `updated_at` (a real request
-                                 # arrives after the last recorded state
-                                 # transition), fixed regardless of what
-                                 # `updated_at` does afterward.
-
-def _h1r6_claim_fn(claim_epoch):
-    return lambda tid, fp, now: claim_epoch
-
-# (a) (review L2): a delivery that landed BEFORE this exact request ever
-# appeared -- AFTER `updated_at` (so r5's `since`-based gate read it as an
-# answer) but BEFORE the real claim epoch -- must still wake.
-cands = _safe_candidates(
-    "H1r6_pre_request_fires", [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
-    claim_fn=_h1r6_claim_fn(_H1R6_CLAIM), replied={"t1": _H1R6_CLAIM - 60})
-results["H1_r6_a_delivery_before_the_request_itself_still_fires"] = any(
-    c["signal"] == "conductor_prompt" for c in cands)
-
-# A real reply, AFTER the claim epoch, silences it.
-cands = _safe_candidates(
-    "H1r6_real_reply_silent", [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
-    claim_fn=_h1r6_claim_fn(_H1R6_CLAIM), replied={"t1": _H1R6_CLAIM + 5})
-results["H1_r6_silent_once_a_real_reply_landed_after_the_claim_epoch"] = cands == []
-
-# (b): the worker continues past an UNRELATED later permission prompt
-# after being answered -- same fingerprint, same (fixed) claim epoch --
-# must STAY silent even though the task's `updated_at` has since moved
-# far past the reply.
-t7_later = base_task(state="stalled", stored_state="stalled", pane_id="p1", pane_birth="pb1",
-                     updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_H1R6_CLAIM + 1000)))
-cands = _safe_candidates(
-    "M1r6_silent_past_prompt", [t7_later], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
-    claim_fn=_h1r6_claim_fn(_H1R6_CLAIM), replied={"t1": _H1R6_CLAIM + 5})
-results["M1_r6_silent_once_the_worker_went_on_past_a_later_prompt"] = cands == []
-
-# ---- mutants (review H1/M1 r6): reverting the claim to `updated_at` --
-# e5c3478's own gate -- must FAIL both cases above, proving these tests
-# exercise the fix rather than a tautology.
-cands = _safe_candidates(
-    "REVERT_H1r6_since_gate_a", [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
-    claim_fn=_h1r6_claim_fn(_H1R6_SINCE), replied={"t1": _H1R6_CLAIM - 60})
-results["REVERT_H1r6_since_based_gate_misses_a_pre_request_delivery"] = cands == []
-cands = _safe_candidates(
-    "REVERT_M1r6_since_gate_b", [t7_later], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
-    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1",
-    claim_fn=_h1r6_claim_fn(_H1R6_CLAIM + 1000), replied={"t1": _H1R6_CLAIM + 5})
-results["REVERT_M1r6_since_based_gate_refires_after_a_later_prompt"] = any(
-    c["signal"] == "conductor_prompt" for c in cands)
+# ---- review H1/M1/M2/L2/L3 (r7): a REAL multi-tick timing/reply-binding
+# proof against a real scratch registry, with the real default `claim_fn`
+# -- never a `claim_fn` stub that hands back a fixed epoch (review M1's
+# own finding: that shape can never let the GATE decide when the claim
+# happens, which is exactly how H1 got through r6). See the
+# "review H1/M1/M2/L2/L3 (r7)" section further down, once `hub.REGISTRY`
+# is pointed at the real scratch database.
 
 
 # ---- mutation harness: each revert variant is installed, exercised and
@@ -857,6 +819,10 @@ conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at)
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('esc1','drun','dtask','approval_escalated','2026-01-01T00:00:00Z',"
              "'{\"verdict\":\"deny\",\"reason\":\"reserved\"}')")
+conn.execute(
+    f"INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+    f"VALUES ('stall_request_claim_dtask_{hub._sw_digest('cprompt:dtask-probe')}',"
+    "'drun','dtask','stall_request_claim','2026-01-01T00:00:00Z','{}')")
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('ev1','drun','dtask','message_delivered','2026-01-01T00:00:00Z','{}')")
 conn.commit(); conn.close()
@@ -875,6 +841,10 @@ results["H1_r5_replied_query_finds_the_message_delivered_row"] = "dtask" in repl
 conn = sqlite3.connect(str(hub.REGISTRY))
 conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
              "VALUES ('dtask_oldreply','drun','stalled','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+conn.execute(
+    f"INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+    f"VALUES ('stall_request_claim_dtask_oldreply_{hub._sw_digest('cprompt:oldreply-probe')}',"
+    "'drun','dtask_oldreply','stall_request_claim','2020-01-01T00:00:00Z','{}')")
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
              "VALUES ('ev_oldreply','drun','dtask_oldreply','message_delivered','2020-01-01T00:00:00Z','{}')")
 conn.commit(); conn.close()
@@ -906,10 +876,25 @@ results["REVERT_M2r6_windowed_replied_query_misses_the_ancient_reply"] = "dtask_
 _real_signals = hub._stall_task_signals
 def _l1d_arity_mutant(*a, **kw):
     return _real_signals(*a, **kw)[:3]   # 3-tuple instead of 4
+def _safe_signals4_isolated(label, local_results, **kw):
+    """Same crash isolation as `_safe_signals4`, but records into a LOCAL
+    dict, not the shared `results` -- this call's crash is the MUTANT
+    ITSELF (deliberately induced, to prove isolation works), never an
+    unexpected regression, so it must never count against the suite's own
+    pass/fail tally the way a real crash would (that is exactly what the
+    shared `_safe_signals4` is for)."""
+    try:
+        denied_, delivered_, owner_acted_, replied_ = hub._stall_task_signals(**kw)
+        return denied_, delivered_, owner_acted_, replied_
+    except Exception as exc:
+        local_results[f"{label}_CRASHED"] = True
+        print(f"{label}_CRASHED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return {}, {}, {}, {}
 hub._stall_task_signals = _l1d_arity_mutant
-_safe_signals4("L1d_arity_mutant", now=REG_NOW, threshold_s=REG_THRESH)
+_l1d_local: dict = {}
+_safe_signals4_isolated("L1d_arity_mutant", _l1d_local, now=REG_NOW, threshold_s=REG_THRESH)
 hub._stall_task_signals = _real_signals
-results["L1_d_arity_mutant_is_isolated_not_fatal"] = "L1d_arity_mutant_CRASHED" in results
+results["L1_d_arity_mutant_is_isolated_not_fatal"] = "L1d_arity_mutant_CRASHED" in _l1d_local
 results["L1_d_script_continues_running_after_an_arity_mutant"] = True
 
 
@@ -1012,6 +997,252 @@ claimed2 = hub._stall_request_claim("rtask", "cprompt:bbb", _claim_t2)
 results["H1r6_claim_is_independent_per_fingerprint"] = (
     abs(claimed2 - _claim_t2) < 2 and claimed2 != claimed1)
 
+# ---- review H1/M1/M2/L2/L3 (r7): real claim/reply timing ---------------------
+# Everything below runs against the REAL scratch `hub.REGISTRY` (pointed
+# there at line ~838) with the REAL default `claim_fn`/`_stall_task_
+# signals` -- never a stub that hands back a fixed epoch. Review M1's own
+# finding: a `claim_fn` stub can never let the GATE decide when the claim
+# happens, which is exactly the shape that let H1 through r6.
+
+# == H1: the claim is minted on the first tick the request is VISIBLE, ==
+# == never the first tick the idle-duration threshold has also cleared. ==
+NOW_H1 = hub._iso_epoch("2026-02-01T00:00:00Z")
+THRESH_H1 = 600.0
+BOOT_H1 = NOW_H1 - 100_000.0
+T0 = NOW_H1 - 200.0   # idle 200s ago -- NOT yet past the 600s threshold
+h1_task = base_task(task_id="h1_task", pane_id="h1_pane", pane_birth="h1_birth",
+                    updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0)))
+
+# Tick 1: the request line is already visible; the OLD gate would never
+# even look (threshold not yet elapsed) -- so it must stay silent...
+denied1, delivered1, owner1, replied1 = hub._stall_task_signals(now=T0, threshold_s=THRESH_H1)
+cands1 = hub.stall_watchdog_candidates(
+    [h1_task], now=T0, threshold_s=THRESH_H1, boot_epoch=BOOT_H1,
+    denied=denied1, delivered=delivered1, owner_acted=owner1, replied=replied1,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "h1_birth")
+results["H1_r7_not_yet_past_threshold_stays_silent_on_tick_one"] = cands1 == []
+# ...but the claim must ALREADY be minted, at (approximately) T0 -- the
+# first SIGHT, never the first GATED look.
+_h1_line = hub._last_conductor_prompt_line(CHROME)
+fp_h1 = hub._conductor_prompt_fingerprint(_h1_line)
+ro = sqlite3.connect(f"file:{hub.REGISTRY}?mode=ro", uri=True)
+claim_row = ro.execute(
+    "SELECT occurred_at FROM events WHERE event_id=?",
+    (f"stall_request_claim_h1_task_{hub._sw_digest(fp_h1)}",)).fetchone()
+ro.close()
+results["H1_r7_claim_minted_on_first_sight_despite_threshold_not_elapsed"] = (
+    claim_row is not None and abs(hub._iso_epoch(claim_row[0]) - T0) < 2)
+
+# A real reply lands shortly after -- well before the threshold elapses.
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('h1_reply','drun','h1_task','message_delivered',?,'{}')",
+             (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 + 50)),))
+conn.commit(); conn.close()
+
+# Tick 2: NOW past threshold -- the OLD code's first (and only) gated
+# look. The already-answered request must stay silent.
+NOW2 = T0 + 700.0
+denied2, delivered2, owner2, replied2 = hub._stall_task_signals(now=NOW2, threshold_s=THRESH_H1)
+cands2 = hub.stall_watchdog_candidates(
+    [h1_task], now=NOW2, threshold_s=THRESH_H1, boot_epoch=BOOT_H1,
+    denied=denied2, delivered=delivered2, owner_acted=owner2, replied=replied2,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "h1_birth")
+results["H1_r7_a_reply_that_predates_the_old_gated_look_still_counts_as_answered"] = not any(
+    c["signal"] == "conductor_prompt" for c in cands2)
+
+# Revert mutant -- head 5e76419's OWN gate structure (claim minted ONLY
+# once since/threshold/owner_acted has already opened), run against the
+# SAME real `_stall_request_claim` and the SAME reply timing, on a
+# separate task so its own claim store never collides with h1_task's.
+def _old_structure_signal5(tasks_, now_, replied_flat_, threshold_s_, boot_epoch_,
+                           pane_read_fn_, pane_birth_fn_, claim_fn_):
+    out_ = []
+    for t_ in tasks_:
+        tid_ = t_.get("task_id")
+        if t_.get("state") in ("stalled", "ready_review") and t_.get("pane_id"):
+            since_ = hub._iso_epoch(t_.get("updated_at"))
+            if since_ is not None and since_ >= boot_epoch_ and now_ - since_ >= threshold_s_:
+                live_birth_ = pane_birth_fn_(t_["pane_id"])
+                reg_birth_ = t_.get("pane_birth") or ""
+                if live_birth_ and reg_birth_ and live_birth_ == reg_birth_:
+                    line_ = hub._last_conductor_prompt_line(pane_read_fn_(t_["pane_id"]))
+                    if line_:
+                        fp_ = hub._conductor_prompt_fingerprint(line_)
+                        claimed_at_ = claim_fn_(tid_, fp_, now_)
+                        reply_epoch_ = replied_flat_.get(tid_)
+                        if reply_epoch_ is None or reply_epoch_ < claimed_at_:
+                            out_.append({"task_id": tid_, "signal": "conductor_prompt", "fingerprint": fp_})
+    return out_
+
+h1_old_task = base_task(task_id="h1_task_old", pane_id="h1_pane", pane_birth="h1_birth",
+                        updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0)))
+_old_structure_signal5([h1_old_task], T0, {}, THRESH_H1, BOOT_H1,
+                       pane_read_fn_=lambda pane: CHROME, pane_birth_fn_=lambda pane: "h1_birth",
+                       claim_fn_=hub._stall_request_claim)   # tick 1: gate closed, no claim minted
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('h1_old_reply','drun','h1_task_old','message_delivered',?,'{}')",
+             (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 + 50)),))
+conn.commit(); conn.close()
+old_replied_flat = {"h1_task_old": T0 + 50}   # the one fact e5c3478's own flat `replied` carried
+old_cands2 = _old_structure_signal5([h1_old_task], NOW2, old_replied_flat, THRESH_H1, BOOT_H1,
+                                    pane_read_fn_=lambda pane: CHROME, pane_birth_fn_=lambda pane: "h1_birth",
+                                    claim_fn_=hub._stall_request_claim)
+results["REVERT_H1r7_old_gate_structure_wakes_on_an_already_answered_request"] = any(
+    c["signal"] == "conductor_prompt" for c in old_cands2)
+
+# == M2: a re-ask with NEW text wakes via conductor_prompt (new ==
+# == fingerprint, new first-seen epoch) even through a LATER, unrelated ==
+# == owner_acted/approval -- never gated behind it. ==
+NOW_M2 = hub._iso_epoch("2026-02-02T00:00:00Z")
+THRESH_M2 = 600.0
+BOOT_M2 = NOW_M2 - 100_000.0
+T0_M2 = NOW_M2 - 700.0   # already well past threshold from tick one
+m2_task = base_task(task_id="m2_task", pane_id="m2_pane", pane_birth="m2_birth",
+                    updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0_M2)))
+
+denied_a, delivered_a, owner_a, replied_a = hub._stall_task_signals(now=NOW_M2, threshold_s=THRESH_M2)
+cands_a = hub.stall_watchdog_candidates(
+    [m2_task], now=NOW_M2, threshold_s=THRESH_M2, boot_epoch=BOOT_M2,
+    denied=denied_a, delivered=delivered_a, owner_acted=owner_a, replied=replied_a,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "m2_birth")
+results["M2_r7_request_A_wakes_first"] = any(c["signal"] == "conductor_prompt" for c in cands_a)
+
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('m2_reply_a','drun','m2_task','message_delivered',?,'{}')",
+             (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW_M2 + 30)),))
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('m2_approval','drun','m2_task','approval_reviewed',?,'{}')",
+             (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW_M2 + 400)),))
+conn.commit(); conn.close()
+
+NOW_M2B = NOW_M2 + 500.0
+denied_b, delivered_b, owner_b, replied_b = hub._stall_task_signals(now=NOW_M2B, threshold_s=THRESH_M2)
+cands_b = hub.stall_watchdog_candidates(
+    [m2_task], now=NOW_M2B, threshold_s=THRESH_M2, boot_epoch=BOOT_M2,
+    denied=denied_b, delivered=delivered_b, owner_acted=owner_b, replied=replied_b,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "m2_birth")
+results["M2_r7_A_stays_silenced_through_the_unrelated_later_approval"] = not any(
+    c["signal"] == "conductor_prompt" for c in cands_b)
+
+CHROME_B = ("an earlier line of agent output\n"
+           "CONDUCTOR: a totally different question now, please advise\n"
+           "\u256d\u2500\u2500 omp \u00b7 sonnet \u00b7 ctx 42% \u2500\u2500\u256e\n"
+           "\u2502 >                                          \u2502\n"
+           "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n")
+NOW_M2C = NOW_M2 + 900.0
+denied_c, delivered_c, owner_c, replied_c = hub._stall_task_signals(now=NOW_M2C, threshold_s=THRESH_M2)
+results["M2_r7_owner_acted_is_populated_and_recent"] = (
+    owner_c.get("m2_task") is not None and owner_c["m2_task"] > T0_M2)
+cands_c = hub.stall_watchdog_candidates(
+    [m2_task], now=NOW_M2C, threshold_s=THRESH_M2, boot_epoch=BOOT_M2,
+    denied=denied_c, delivered=delivered_c, owner_acted=owner_c, replied=replied_c,
+    pane_read_fn=lambda pane: CHROME_B, pane_birth_fn=lambda pane: "m2_birth")
+results["M2_r7_a_brand_new_reask_wakes_despite_a_recent_unrelated_owner_acted"] = any(
+    c["signal"] == "conductor_prompt" for c in cands_c)
+
+# Revert mutant: head 5e76419's OWN `owner_acted < since` guard, run on
+# the SAME real owner_acted/since/claim/replied data -- must silence B.
+def _old_owner_gate_signal5(tasks_, now_, owner_acted_flat_, threshold_s_, boot_epoch_,
+                            pane_read_fn_, pane_birth_fn_, claim_fn_, replied_nested_):
+    out_ = []
+    for t_ in tasks_:
+        tid_ = t_.get("task_id")
+        if t_.get("state") in ("stalled", "ready_review") and t_.get("pane_id"):
+            since_ = hub._iso_epoch(t_.get("updated_at"))
+            owner_epoch_ = owner_acted_flat_.get(tid_)
+            if (since_ is not None and since_ >= boot_epoch_ and now_ - since_ >= threshold_s_
+                    and (owner_epoch_ is None or owner_epoch_ < since_)):
+                live_birth_ = pane_birth_fn_(t_["pane_id"])
+                reg_birth_ = t_.get("pane_birth") or ""
+                if live_birth_ and reg_birth_ and live_birth_ == reg_birth_:
+                    line_ = hub._last_conductor_prompt_line(pane_read_fn_(t_["pane_id"]))
+                    if line_:
+                        fp_ = hub._conductor_prompt_fingerprint(line_)
+                        claimed_at_ = claim_fn_(tid_, fp_, now_)
+                        reply_epoch_ = replied_nested_.get(tid_, {}).get(hub._sw_digest(fp_))
+                        if reply_epoch_ is None or reply_epoch_ < claimed_at_:
+                            out_.append({"task_id": tid_, "signal": "conductor_prompt", "fingerprint": fp_})
+    return out_
+
+old_cands_c = _old_owner_gate_signal5(
+    [m2_task], NOW_M2C, owner_c, THRESH_M2, BOOT_M2,
+    pane_read_fn_=lambda pane: CHROME_B, pane_birth_fn_=lambda pane: "m2_birth",
+    claim_fn_=hub._stall_request_claim, replied_nested_=replied_c)
+results["REVERT_M2r7_old_owner_acted_gate_silences_the_new_reask"] = old_cands_c == []
+
+# == L2: a reply binds to the OLDEST still-open claim for its task -- a ==
+# == reply owed to an older request must never silence an unrelated, ==
+# == newer one. ==
+digest_a = hub._sw_digest("cprompt:l2-A")
+digest_b = hub._sw_digest("cprompt:l2-B")
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) VALUES "
+             f"('stall_request_claim_l2_task_{digest_a}','drun','l2_task','stall_request_claim',"
+             "'2026-03-01T00:00:00Z','{}'),"
+             f"('stall_request_claim_l2_task_{digest_b}','drun','l2_task','stall_request_claim',"
+             "'2026-03-01T00:11:00Z','{}')")
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('l2_reply','drun','l2_task','message_delivered','2026-03-01T00:12:00Z','{}')")
+conn.commit(); conn.close()
+ro = sqlite3.connect(f"file:{hub.REGISTRY}?mode=ro", uri=True)
+l2_matches = hub._stall_reply_matches(ro)
+ro.close()
+results["L2_r7_the_older_claim_is_answered"] = digest_a in l2_matches.get("l2_task", {})
+results["L2_r7_the_newer_unrelated_claim_is_not_silenced_by_a_reply_owed_to_the_older_one"] = (
+    digest_b not in l2_matches.get("l2_task", {}))
+
+# Revert mutant: the OLD per-task "latest reply" shape (e5c3478/r6's own
+# flat `replied[task_id] = epoch`) carries no per-fingerprint identity, so
+# the SAME reply would ALSO read as answering B, the real L2 bug.
+old_flat_reply_epoch = hub._iso_epoch("2026-03-01T00:12:00Z")
+claim_b_epoch = hub._iso_epoch("2026-03-01T00:11:00Z")
+results["REVERT_L2r7_old_flat_per_task_reply_would_have_silenced_B_too"] = (
+    old_flat_reply_epoch >= claim_b_epoch)
+
+# == L3: a claim the registry never confirmed is never trusted as "just ==
+# == now" -- the candidate is skipped, not fabricated as answered. ==
+real_registry_l3 = hub.REGISTRY
+hub.REGISTRY = __import__("pathlib").Path(os.environ["WORK"]) / "does-not-exist" / "registry.sqlite3"
+l3_claim = hub._stall_request_claim("l3_task", "cprompt:l3", time.time())
+results["L3_r7_claim_returns_None_when_the_registry_is_unreachable"] = l3_claim is None
+hub.REGISTRY = real_registry_l3
+
+l3_task = base_task(task_id="l3_task2", pane_id="l3_pane", pane_birth="l3_birth",
+                    updated_at="2026-04-01T00:00:00Z")
+NOW_L3 = hub._iso_epoch("2026-04-01T00:20:00Z")
+THRESH_L3 = 600.0
+BOOT_L3 = NOW_L3 - 100_000.0
+
+def _failing_claim(tid_, fp_, now_):
+    return None   # review L3: what a write failure must return now
+
+cands_l3 = hub.stall_watchdog_candidates(
+    [l3_task], now=NOW_L3, threshold_s=THRESH_L3, boot_epoch=BOOT_L3,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "l3_birth",
+    claim_fn=_failing_claim)
+results["L3_r7_candidate_is_skipped_when_the_claim_cannot_be_confirmed"] = cands_l3 == []
+
+# Revert mutant: the OLD "fail open to now" fallback wakes anyway, even
+# with a real reply dated shortly BEFORE `now` sitting right there.
+l3_line = hub._last_conductor_prompt_line(CHROME)
+l3_fp = hub._conductor_prompt_fingerprint(l3_line)
+l3_digest = hub._sw_digest(l3_fp)
+
+def _old_failing_claim_falls_open(tid_, fp_, now_):
+    return now_   # e5c3478/r6's own fallback
+
+cands_l3_old = hub.stall_watchdog_candidates(
+    [l3_task], now=NOW_L3, threshold_s=THRESH_L3, boot_epoch=BOOT_L3,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "l3_birth",
+    replied={"l3_task2": {l3_digest: NOW_L3 - 300}},
+    claim_fn=_old_failing_claim_falls_open)
+results["REVERT_L3r7_falling_open_to_now_wakes_an_already_answered_request"] = any(
+    c["signal"] == "conductor_prompt" for c in cands_l3_old)
+
+
 
 # ---- review M-c(1): an escalated/unowned claim is resolved without an ack ---
 conn = sqlite3.connect(str(hub.REGISTRY))
@@ -1064,12 +1295,12 @@ hub.CACHES["herdr"] = FakeCache(fake_herdr)
 # script path at nothing and confirm the exact same scenario stays silent.
 real_script = hub.STALL_WATCHDOG_SCRIPT
 hub.STALL_WATCHDOG_SCRIPT = __import__("pathlib").Path("/does/not/exist")
-hub._stall_watchdog_tick()
+_safe_tick("tick_rule_removed")
 results["rule_removed_stays_silent_on_a_real_candidate"] = calls == []
 
 # restored — the same scenario now fires.
 hub.STALL_WATCHDOG_SCRIPT = real_script
-hub._stall_watchdog_tick()
+_safe_tick("tick_rule_restored")
 results["rule_restored_fires_on_the_same_candidate"] = (
     len(calls) == 1 and calls[0][2] == "wake" and calls[0][3] == "tick1" and calls[0][4] == "denied")
 
@@ -1084,7 +1315,7 @@ conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, 
              (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600)),))
 conn.commit(); conn.close()
 calls.clear()
-hub._stall_watchdog_tick()
+_safe_tick("tick_m4_dedupe")
 results["M4_already_claimed_and_acked_key_is_never_redispatched"] = calls == []
 
 hub.subprocess.run = real_run
