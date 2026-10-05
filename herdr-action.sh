@@ -122,8 +122,9 @@ _ha_form_answer() {                     # form_id request_id action_sha256 -> an
   case "$1" in ''|*/*|*..*) return 1 ;; esac
   [ -r "$f" ] || return 1
   jq -e --arg id "$2" --arg sha "$3" '.status=="answered" and (.answers.request_id==$id)
+      and (.answers.action_sha256==$sha)
       and ((.answers.decision=="approve") or (.answers.decision=="decline")
-        or (.answers.decision=="supersede" and .answers.action_sha256==$sha
+        or (.answers.decision=="supersede"
           and (.answers.reason | type=="string" and test("\\S"))))' "$f" >/dev/null 2>&1 || return 1
   jq -c '.answers' "$f"
 }
@@ -156,7 +157,7 @@ _ha_notify_worker() {                   # row decision -> records action_notifie
 
 # The one decide path (conductor CLI, human CLI, hub tick).
 _ha_decide() {                          # id approved|declined|superseded authority decided_by category reason
-  local id="$1" status="$2" auth="$3" who="$4" cat="$5" why="$6" row kind run task
+  local id="$1" status="$2" auth="$3" who="$4" cat="$5" why="$6" row kind run task fid
   row="$(action_request_get "$id")"
   [ -n "$row" ] || die "no request $id" 3
   kind="$(_ha_field "$row" grant_kind)"; run="$(_ha_field "$row" run_id)"; task="$(_ha_field "$row" task_id)"
@@ -169,6 +170,13 @@ _ha_decide() {                          # id approved|declined|superseded author
     fi
   fi
   row="$(action_request_get "$id")"
+  fid="$(_ha_field "$row" form_record)"
+  if [ "$who" != "hub form $fid" ]; then
+    case "$fid" in
+      ''|*/*|*..*) ;;
+      *) _ha_retire_form "$HA_FORMS_DIR/$fid.json" "request $id $status by $auth" >/dev/null ;;
+    esac
+  fi
   append_event "$run" "$task" action_decided \
     "$(jq -nc --arg id "$id" --arg sha "$(_ha_field "$row" action_sha256)" --arg s "$status" --arg a "$auth" --arg w "$who" --arg c "$cat" --arg r "$why" \
        '{request_id:$id, action_sha256:$sha, decision:$s, authority:$a, reviewer:$w, review_category:$c, reason:$r}')" \
@@ -229,7 +237,7 @@ cmd_decide() {                          # approve|decline|supersede id [flags]
       # request's form counts — a record written later by anything else does not.
       pinned="$(_ha_field "$row" form_record)"
       [ -n "$pinned" ] && [ "$form" = "$pinned" ] || die "human authority needs --form <id> naming the hub decision form served for $id (${pinned:-none served yet})" 8
-      ans="$(_ha_form_answer "$form" "$id" "$(_ha_field "$row" action_sha256)")" || die "human authority needs --form <id>: an ANSWERED hub decision form for exactly $id (cancellation also requires its action SHA and a reason)" 8
+      ans="$(_ha_form_answer "$form" "$id" "$(_ha_field "$row" action_sha256)")" || die "human authority needs --form <id>: an ANSWERED hub decision form for exactly $id with its action SHA (cancellation also requires a reason)" 8
       [ "$(_ha_field "$ans" decision)" = "$verb" ] || die "form $form answered '$(_ha_field "$ans" decision)', not '$verb'" 8
       _ha_decide "$id" "$status" human "hub form $form" "" "$(_ha_field "$ans" reason)" ;;
     *) die "--authority conductor|human is required" ;;

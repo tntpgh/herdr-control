@@ -152,6 +152,14 @@ ssha="$(q "SELECT action_sha256 FROM action_requests WHERE request_id='$srid';")
 HERDR_PANE_ID="$CPANE" act supersede "$srid" --authority conductor --action-sha256 "$ssha" --review-reason "worker moved on" >/dev/null; rc=$?
 [ "$rc" = 0 ] && [ "$(q "SELECT status FROM action_requests WHERE request_id='$srid';")" = superseded ] \
   && ok "conductor explicitly cancels the pending bash request" || not_ok "bash supersede rc=$rc"
+for verb in approve decline; do
+  HERDR_PANE_ID="$CPANE" act "$verb" "$srid" --authority conductor \
+    --review-category local-build --review-reason "late decision" >/dev/null 2>"$work/late-$verb.err"; rc=$?
+  [ "$rc" = 4 ] && grep -Fq "is not pending (status superseded)" "$work/late-$verb.err" \
+    && [ "$(q "SELECT status FROM action_requests WHERE request_id='$srid';")" = superseded ] \
+    && ok "superseded-terminal: later $verb refused (rc=4), status stays superseded" \
+    || not_ok "superseded-terminal: $verb rc=$rc: $(cat "$work/late-$verb.err")"
+done
 for k in 1 2 3 4 5 6; do bashc "$SUP" "retry$k" > "$work/sup$k" & done; wait
 sid_new="$(cat "$work"/sup? | jq -r .request_id | sort -u)"
 [ -n "$sid_new" ] && [ "$sid_new" != "$srid" ] && [ "$(printf '%s\n' "$sid_new" | wc -l | tr -d ' ')" = 1 ] \
@@ -159,8 +167,6 @@ sid_new="$(cat "$work"/sup? | jq -r .request_id | sort -u)"
   && [ "$(q "SELECT status FROM action_requests WHERE request_id='$sid_new';")" = pending ] \
   && ok "parallel identical reissues after supersede share one fresh pending request, none run" \
   || not_ok "supersede parallel reissues: $sid_new"
-( . "$here/lib/action-request.sh"; action_grant_consume "$srid" ) \
-  && not_ok "superseded one-shot consumed" || ok "superseded one-shot cannot be consumed"
 printf '#!/bin/bash\nchmod -R u+rw tmp/sup-file\n' > "$wt/tmp/sup-file.sh"
 SUP_FILE="cd $wt && bash tmp/sup-file.sh"
 file_out="$(bashc "$SUP_FILE")"
@@ -181,10 +187,42 @@ pin_form() {                             # request_id -> pinned formserve record
   bash "$here/herdr-action.sh" tick; bash "$here/herdr-action.sh" tick
   q "SELECT form_record FROM action_requests WHERE request_id='$1';"
 }
-answer_form() {                          # record-id request-id decision
-  local f="$HERDR_STATE_ROOT/forms/$1.json"
-  jq -c --arg id "$2" --arg d "$3" '.status="answered" | .answers={request_id:$id, decision:$d, reason:"ok"}' "$f" > "$f.t" && mv "$f.t" "$f"
+answer_form() {                          # record-id request-id decision [action-sha]
+  local f="$HERDR_STATE_ROOT/forms/$1.json" sha="${4-$(q "SELECT action_sha256 FROM action_requests WHERE request_id='$2';")}"
+  jq -c --arg id "$2" --arg d "$3" --arg sha "$sha" '.status="answered" | .answers={request_id:$id, action_sha256:$sha, decision:$d, reason:"ok"}' "$f" > "$f.t" && mv "$f.t" "$f"
 }
+
+printf '== conductor decisions retire pinned human forms ==\n'
+for verb in approve decline supersede; do
+  retire_rid="$(bashc "chmod -R u+rw tmp/retire-$verb" | field request_id)"
+  retire_fid="$(pin_form "$retire_rid")"
+  q "UPDATE action_requests SET route='conductor' WHERE request_id='$retire_rid';"
+  retire_sha="$(q "SELECT action_sha256 FROM action_requests WHERE request_id='$retire_rid';")"
+  HERDR_PANE_ID="$CPANE" act "$verb" "$retire_rid" --authority conductor \
+    --action-sha256 "$retire_sha" --review-category local-build --review-reason "reviewed, worker moved on" >/dev/null; rc=$?
+  [ "$rc" = 0 ] && [ "$(jq -r .status "$HERDR_STATE_ROOT/forms/$retire_fid.json")" = withdrawn ] \
+    && ok "form-retirement: conductor $verb retires the pinned open human form" \
+    || not_ok "form-retirement: $verb rc=$rc, form=$(jq -r .status "$HERDR_STATE_ROOT/forms/$retire_fid.json")"
+done
+
+printf '== every human form decision binds the exact action SHA ==\n'
+for verb in approve decline; do
+  for invalid in wrong missing; do
+    bound_rid="$(bashc "chmod -R u+rw tmp/bind-$verb-$invalid" | field request_id)"
+    bound_fid="$(pin_form "$bound_rid")"
+    answer_form "$bound_fid" "$bound_rid" "$verb" deadbeef
+    bound_rec="$HERDR_STATE_ROOT/forms/$bound_fid.json"
+    if [ "$invalid" = missing ]; then
+      jq -c 'del(.answers.action_sha256)' "$bound_rec" > "$bound_rec.t" && mv "$bound_rec.t" "$bound_rec"
+    fi
+    act "$verb" "$bound_rid" --authority human --form "$bound_fid" >/dev/null 2>"$work/bound.err"; rc=$?
+    act tick >/dev/null
+    [ "$rc" = 8 ] && grep -Fq "an ANSWERED hub decision form" "$work/bound.err" \
+      && [ "$(q "SELECT status FROM action_requests WHERE request_id='$bound_rid';")" = pending ] \
+      && ok "form-binding: $verb with $invalid action SHA refused by CLI and tick, stays pending" \
+      || not_ok "form-binding: $verb/$invalid rc=$rc, status=$(q "SELECT status FROM action_requests WHERE request_id='$bound_rid';"): $(cat "$work/bound.err")"
+  done
+done
 RES='gh pr merge 7 --squash'
 out="$(bashc "$RES")"; hrid="$(printf '%s' "$out" | field request_id)"
 printf '%s' "$out" | grep -q "human-only: requested as $hrid" && ok "reserved -> human request $hrid" || not_ok "reserved: $out"
@@ -350,7 +388,7 @@ fp2="$(q "SELECT form_path FROM action_requests WHERE request_id='$srid';")"
 [ "$(q "SELECT count(*) FROM events WHERE type='action_form_expired';")" -ge 1 ] && ok "action_form_expired recorded" || not_ok "no expiry event"
 [ "$(grep -c "$srid" "$work/notified")" = 1 ] && ok "no second Slack post for a re-served form" || not_ok "slack re-posted"
 rec2="$HERDR_STATE_ROOT/forms/$(q "SELECT form_record FROM action_requests WHERE request_id='$srid';").json"
-jq -c --arg id "$srid" '.status="answered" | .answers={request_id:$id, decision:"approve", reason:"fine"}' "$rec2" > "$rec2.t" && mv "$rec2.t" "$rec2"
+answer_form "$(basename "$rec2" .json)" "$srid" approve
 bash "$here/herdr-action.sh" tick
 [ "$(q "SELECT status||'/'||authority FROM action_requests WHERE request_id='$srid';")" = approved/human ] \
   && ok "tick applies an answered hub form (approved, authority human)" || not_ok "tick apply: $(q "SELECT status, authority FROM action_requests WHERE request_id='$srid';")"
@@ -378,7 +416,7 @@ wrec() { printf '%s/forms/%s.json' "$HERDR_STATE_ROOT" "$(q "SELECT form_record 
 w1="$(wrec "${wd[0]}")"; w2="$(wrec "${wd[1]}")"
 [ "$(jq -r .status "$w1")" = open ] && [ "$(jq -r .status "$w2")" = open ] && ok "setup: two open, pinned forms" || not_ok "setup: forms not open ($w1, $w2)"
 # wd2's form is answered 'approve' — then its task ends before the tick applies it.
-jq -c --arg id "${wd[1]}" '.status="answered" | .answers={request_id:$id, decision:"approve", reason:"ok"}' "$w2" > "$w2.t" && mv "$w2.t" "$w2"
+answer_form "$(basename "$w2" .json)" "${wd[1]}" approve
 q "UPDATE action_requests SET task_id='taskw' WHERE request_id IN ('${wd[0]}','${wd[1]}');"
 q "UPDATE action_requests SET task_id='ghost' WHERE request_id='${wd[2]}';"
 bash "$here/herdr-action.sh" tick; bash "$here/herdr-action.sh" tick
