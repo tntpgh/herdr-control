@@ -31,7 +31,11 @@ the panel is clipped. Shape your calls so the WHOLE action is reviewable:
   run** — an approval binds one file's sha256. Keep reviewed logic in one file.
 - **If you are still blocked on the conductor after any delivered message,
   write the request again as a new `CONDUCTOR:` line.** The stall watchdog
-  treats the last `CONDUCTOR:` line on screen as answered by any delivery.
+  treats the last `CONDUCTOR:` line on screen as answered by any delivered
+  message from your conductor or a person — not by an automated notice (a
+  `[HERDR-DENIED]` denial, a wake, or a kickoff), which
+  `send-to-agent.sh --not-an-answer` delivers without recording it as that
+  line's answer.
 - **A visual before/after difference above 0.000% needs a proven cause, not
   an explanation.** Any pixel/rendering diff you report must come with
   zoomed crops of the differing region, saved in your backup dir, plus a

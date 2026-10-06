@@ -3805,7 +3805,17 @@ class _CpromptFold:
 
 def _stall_cprompt_fold(conn: sqlite3.Connection, task_id: str,
                         resolved: dict[str, str]) -> _CpromptFold:
-    """Fold one task's rows (r1 L4: only this task, on `events_by_task`)."""
+    """Fold one task's rows (r1 L4: only this task, on `events_by_task`).
+
+    r1 L3 (deliberately left, not fixed): no time window on the query
+    below. A windowed fold risks silently dropping a genuinely old answer
+    that is still correct (DESIGN-228 §1's P can legitimately be set days
+    before a later idle sighting of the SAME occurrence), trading a
+    bounded-but-wrong fold for an unbounded-but-right one. Rows are per
+    TASK (bounded by how many times that one task's conductor line
+    changed, not by registry history), and the per-tick cost the review
+    actually measured growing without bound was `_sw_resolved_keys`'s
+    cross-task query, fixed separately (r1 L5)."""
     fold = _CpromptFold(task_id, resolved)
     floor_prefix = f"stall_request_floor_{task_id}_"
     for seq, eid, typ, occurred_at, payload in conn.execute(
@@ -4428,6 +4438,12 @@ def _sw_digest(text: str) -> str:
     return hashlib.sha256((text or "").encode()).hexdigest()[:16]
 
 
+_SW_RESOLVED_CACHE: dict[str, str] = {}   # r1 L5: once an eid resolves, its
+# occurred_at is immutable (the docstring below), so it is cached across
+# ticks — an owner-acted task's `stall_wake` rows, which only ever grow,
+# cost one `MIN(occurred_at)` query EACH, once, not every 15s tick forever.
+
+
 def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None) -> dict[str, str]:
     """claim_once keys that are ALREADY woken AND acked (review M4): the
     daemon must not spawn a subprocess plus two herdr RPCs every tick,
@@ -4471,6 +4487,9 @@ def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None)
             resolved[key] = when
 
     for eid, (tid, sig, claimed_at) in claims.items():
+        if eid in _SW_RESOLVED_CACHE:
+            _at(eid, _SW_RESOLVED_CACHE[eid])
+            continue
         for ack_sig, acked_at in acks.get(tid, []):
             if ack_sig in (sig, "all") and acked_at > claimed_at:
                 _at(eid, acked_at)
@@ -4491,6 +4510,7 @@ def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None)
             "SELECT event_id, occurred_at FROM events WHERE type='stall_wake_unowned'"):
         if eid.endswith("_unowned"):
             _at(eid[: -len("_unowned")], occurred_at)
+    _SW_RESOLVED_CACHE.update(resolved)
     return resolved
 
 

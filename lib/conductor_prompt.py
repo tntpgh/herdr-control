@@ -14,7 +14,9 @@ A request is (F, C, P):
        nothing is above, or when it holds tool-gutter rows (omp truncates
        those at the pane width, so they are width-dependent).
   P    paragraphs BELOW the block: blank-row separated, a `╭…╰` box counts
-       one, each `※`-led paragraph counts 0. Characters are never counted.
+       one, each `※`-led paragraph counts 0, and so does a lone omp spinner
+       row (`Working…` etc — furniture, not an answer). Characters are
+       never counted.
 
 CLI: pane text on stdin -> `{"fp":…,"ctx":…,"tail":…}` on stdout, or nothing
 when no request is visible.
@@ -33,6 +35,13 @@ _RECAP = "\u203b"                                   # ※
 _BOX_TOP, _BOX_BOTTOM = "\u256d", "\u2570"          # ╭ ╰
 _GUTTER_LEADS = ("\u2502", "\u251c", "\u2514", "\u256d", "\u2570")   # │ ├ └ ╭ ╰
 UNKNOWN_CTX = "?"
+_SPINNER_WORDS = ("Working", "Thinking", "Running", "Compacting")  # the same
+# keywords lib/attention.sh greps for on a live pane; here they mark a dead
+# one-row paragraph, not a live state.
+_PUA = r"[\uE000-\uF8FF\U000F0000-\U000FFFFD\U00100000-\U0010FFFD]"  # private
+# use: icon fonts only, an agent's own words never start with one, so
+# requiring it keeps a genuine one-word reply like "Working…" OUT of this.
+_SPINNER_RE = re.compile(r"^%s+\s*(?:%s)\u2026$" % (_PUA, "|".join(_SPINNER_WORDS)))
 
 
 def agent_output_lines(text: str) -> list[str]:
@@ -55,12 +64,16 @@ def fingerprint(line: str) -> str:
 
 
 def _paragraphs(rows: list[str]) -> list[tuple[int, int, str]]:
-    """[(first, last, kind)] over `rows`; kind is `text`, `box` or `recap`.
+    """[(first, last, kind)] over `rows`; kind is `text`, `box`, `recap` or
+    `spinner`.
 
     A `╭…╰` box is one unit whatever it holds. A `※`-led paragraph runs from
     its first row to the next blank row. A `※` or `╭` row also ends the text
     paragraph above it, the same rule the request's own continuation join
-    uses for `※`."""
+    uses for `※`. A single-row paragraph that is nothing but an omp spinner
+    glyph plus one of its status words (`Working…`, `Thinking…`, `Running…`,
+    `Compacting…` — lib/attention.sh's own list) is `spinner`: furniture that
+    can disappear on the very next render."""
     out: list[tuple[int, int, str]] = []
     i, n = 0, len(rows)
     while i < n:
@@ -79,6 +92,14 @@ def _paragraphs(rows: list[str]) -> list[tuple[int, int, str]]:
         j = i + 1
         while j < n and rows[j].strip() and not rows[j].strip().startswith((_RECAP, _BOX_TOP)):
             j += 1
+        if kind == "text" and j - 1 == i and _SPINNER_RE.fullmatch(s):
+            # A lone omp spinner row ("Working…" etc) can still be on screen
+            # the instant herdr samples an otherwise-idle task, and vanishes
+            # on the next render. Counting it would let P drop between two
+            # sightings of the SAME answered occurrence, and only a decrease
+            # in P can mint a false re-ask (hub.py
+            # `_CpromptFold.same_line`) — so it counts 0, like `※` (r2 L2).
+            kind = "spinner"
         out.append((i, j - 1, kind))
         i = j
     return out
@@ -87,7 +108,7 @@ def _paragraphs(rows: list[str]) -> list[tuple[int, int, str]]:
 def _context(rows: list[str]) -> str:
     """C over the rows above the block (see the module docstring)."""
     for first, last, kind in reversed(_paragraphs(rows)):
-        if kind == "recap":
+        if kind in ("recap", "spinner"):
             continue
         if first == 0:
             return UNKNOWN_CTX                      # may be clipped by the window
@@ -101,7 +122,7 @@ def _context(rows: list[str]) -> str:
 
 def _tail(rows: list[str]) -> int:
     """P over the rows below the block (see the module docstring)."""
-    return sum(1 for _, _, kind in _paragraphs(rows) if kind != "recap")
+    return sum(1 for _, _, kind in _paragraphs(rows) if kind not in ("recap", "spinner"))
 
 
 def last_request(text: str | None) -> dict | None:
