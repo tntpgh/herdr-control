@@ -373,6 +373,8 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
       description: "Get or initialize your named consumer at cursor 0. Bound to the original caller/client and " +
         "authorization scopes. Never acknowledges events or advances an existing position. Returns cursor_pruned " +
         "rather than skipping a retention gap; cursor_scope_mismatch rather than rebinding changed scopes. " +
+        "On either, capture latest_cursor and current_authorization_scope_hash, reconcile scoped state, then " +
+        "explicitly rebase_consumer_position. At most 32 named consumers per caller/client. " +
         "Use scope_hash with list_events/wait_for_events. At-least-once processing; not exactly-once.",
       inputSchema: { consumer_id: z.string().min(1).max(200) },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -387,7 +389,8 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
     server.registerTool("commit_consumer_position", {
       title: "Commit a fully handled event prefix",
       description: "Explicitly acknowledge a serial, fully handled prefix for your named consumer. Conditional on " +
-        "expected_committed_cursor and lease_epoch returned by get_consumer_position. A stale commit, changed " +
+        "expected_committed_cursor and lease_epoch returned by get_consumer_position. lease_epoch is a checkpoint " +
+        "generation advanced by explicit rebase, not a lease or exclusive ownership claim. A stale generation, changed " +
         "authorization scope, backwards cursor, cursor beyond latest_cursor, or pruned checkpoint changes nothing. " +
         "Reading never acknowledges. This records your processing assertion, not business-process success; " +
         "duplicate delivery after a crash is possible. No lease acquisition/takeover or exactly-once effects.",
@@ -403,6 +406,33 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
       if (!isView(v)) return v;
       const position = await stub.commitConsumerPosition(now(), caller, scopes, consumer_id,
         expected_committed_cursor, new_cursor, lease_epoch);
+      const data = { connection: v.connection, ...position };
+      return position.result === "ok" ? ok(data) : fail(position.result, `Refused: ${position.result}.`, data);
+    });
+
+    server.registerTool("rebase_consumer_position", {
+      title: "Rebase a reconciled event consumer",
+      description: "Explicitly assert scoped state reconciliation and acknowledge a replay gap or rebind changed scopes. " +
+        "FIRST capture R=latest_cursor and current_authorization_scope_hash from get_consumer_position, THEN reconcile " +
+        "current scoped state without replaying historical notification effects, THEN submit resume_cursor=R and reconciled=true. " +
+        "Events created during reconciliation remain after R for replay. Conditional on expected_committed_cursor, lease_epoch, " +
+        "and the captured current authorization scope; rejects R below the current pruning floor or above the watermark. " +
+        "Success audits the rebase and increments the checkpoint generation (lease_epoch). The server records your assertion, " +
+        "not proof of downstream reconciliation. Reading never rebases. No exclusive processing lease or exactly-once effects.",
+      inputSchema: {
+        consumer_id: z.string().min(1).max(200),
+        expected_committed_cursor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+        resume_cursor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+        lease_epoch: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+        current_authorization_scope_hash: z.string().regex(/^[0-9a-f]{64}$/),
+        reconciled: z.literal(true),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    }, async ({ consumer_id, expected_committed_cursor, resume_cursor, lease_epoch, current_authorization_scope_hash, reconciled }) => {
+      const v = await gate("rebase_consumer_position", consumer_id);
+      if (!isView(v)) return v;
+      const position = await stub.rebaseConsumerPosition(now(), caller, scopes, consumer_id,
+        expected_committed_cursor, resume_cursor, lease_epoch, current_authorization_scope_hash, reconciled);
       const data = { connection: v.connection, ...position };
       return position.result === "ok" ? ok(data) : fail(position.result, `Refused: ${position.result}.`, data);
     });

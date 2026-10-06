@@ -247,11 +247,13 @@ export interface EventPage {
 export interface ConsumerPosition {
   result: "ok" | "event_consumers_disabled" | "insufficient_scope" | "invalid_arguments"
     | "consumer_not_found" | "cursor_scope_mismatch" | "cursor_pruned"
-    | "committed_cursor_mismatch" | "lease_epoch_mismatch" | "cursor_backwards" | "cursor_past_latest";
+    | "committed_cursor_mismatch" | "lease_epoch_mismatch" | "cursor_backwards" | "cursor_past_latest"
+    | "consumer_limit_reached";
   consumer_id?: string;
   committed_cursor?: number;
   lease_epoch?: number;
   authorization_scope_hash?: string;
+  current_authorization_scope_hash?: string;
   scope_hash?: string;
   updated_at?: string;
   last_error?: string | null;
@@ -1007,7 +1009,7 @@ export class HerdrState extends DurableObject<Env> {
   }
 
   private consumerPosition(nowMs: number, caller: Caller, consumerId: string, hash: string,
-      commit: { expected: number; cursor: number; epoch: number } | null): ConsumerPosition {
+      commit: { expected: number; cursor: number; epoch: number; rebaseScope?: string } | null): ConsumerPosition {
     return this.ctx.storage.transactionSync(() => {
       let row = this.sql.exec<ConsumerRow>(`SELECT committed_cursor, lease_epoch, authorization_scope_hash,
         updated_at, last_error, failure_count FROM event_consumers
@@ -1015,6 +1017,9 @@ export class HerdrState extends DurableObject<Env> {
         caller.email, caller.client_id, consumerId).toArray()[0];
       if (!row && commit) return { result: "consumer_not_found" };
       if (!row) {
+        const count = this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM event_consumers
+          WHERE producer='srv' AND sender_actor=? AND sender_client=?`, caller.email, caller.client_id).one().n;
+        if (count >= 32) return { result: "consumer_limit_reached" };
         this.sql.exec(`INSERT INTO event_consumers
           (sender_actor, sender_client, consumer_id, authorization_scope_hash, updated_at) VALUES (?,?,?,?,?)`,
           caller.email, caller.client_id, consumerId, hash, nowMs);
@@ -1024,25 +1029,40 @@ export class HerdrState extends DurableObject<Env> {
       const out: ConsumerPosition = {
         result: "ok", consumer_id: consumerId, committed_cursor: row.committed_cursor, lease_epoch: row.lease_epoch,
         authorization_scope_hash: row.authorization_scope_hash, scope_hash: scopeHash(caller),
+        current_authorization_scope_hash: hash,
         updated_at: iso(row.updated_at), last_error: row.last_error, failure_count: row.failure_count,
         latest_cursor: this.latestEventCursor(), replay_floor_cursor: this.replayFloorCursor(),
       };
-      if (row.authorization_scope_hash !== hash) return { ...out, result: "cursor_scope_mismatch" };
+      const rebase = commit?.rebaseScope !== undefined;
+      if (rebase && commit!.rebaseScope !== hash) return { ...out, result: "cursor_scope_mismatch" };
+      if (!rebase && row.authorization_scope_hash !== hash) return { ...out, result: "cursor_scope_mismatch" };
       // Unlike ad-hoc list_events(since_cursor=0), a durable unread consumer
       // cannot treat zero as "everything retained" and silently miss a gap.
-      if (row.committed_cursor < out.replay_floor_cursor!) return { ...out, result: "cursor_pruned" };
+      if (!rebase && row.committed_cursor < out.replay_floor_cursor!) return { ...out, result: "cursor_pruned" };
       if (!commit) return out;
       if (row.lease_epoch !== commit.epoch) return { ...out, result: "lease_epoch_mismatch" };
       if (row.committed_cursor !== commit.expected) return { ...out, result: "committed_cursor_mismatch" };
       if (commit.cursor < row.committed_cursor) return { ...out, result: "cursor_backwards" };
       if (commit.cursor > out.latest_cursor!) return { ...out, result: "cursor_past_latest" };
-      if (commit.cursor === row.committed_cursor) return out;
-      const changed = this.sql.exec(`UPDATE event_consumers SET committed_cursor=?, updated_at=?
+      if (rebase && commit.cursor < out.replay_floor_cursor!) return { ...out, result: "cursor_pruned" };
+      if (!rebase && commit.cursor === row.committed_cursor) return out;
+      // Rebase is an explicit reconciliation assertion, not an ordinary ACK.
+      // Fence workers holding the pre-reconciliation generation even if R=0.
+      const epoch = row.lease_epoch + (rebase ? 1 : 0);
+      const changed = this.sql.exec(`UPDATE event_consumers
+        SET committed_cursor=?, updated_at=?, authorization_scope_hash=?, lease_epoch=?
         WHERE producer='srv' AND sender_actor=? AND sender_client=? AND consumer_id=?
           AND committed_cursor=? AND lease_epoch=? AND authorization_scope_hash=?`,
-        commit.cursor, nowMs, caller.email, caller.client_id, consumerId, commit.expected, commit.epoch, hash).rowsWritten;
+        commit.cursor, nowMs, hash, epoch, caller.email, caller.client_id, consumerId,
+        commit.expected, commit.epoch, row.authorization_scope_hash).rowsWritten;
       if (changed !== 1) throw new Error("consumer conditional update lost inside transaction");
-      return { ...out, committed_cursor: commit.cursor, updated_at: iso(nowMs) };
+      if (rebase) this.audit(nowMs, { actor: caller.email, client_id: caller.client_id,
+        tool: "rebase_consumer_position", target: consumerId, decision: "reconciled",
+        reason: row.authorization_scope_hash !== hash ? "scope_rebound" : "checkpoint_rebased", message_id: "",
+        detail: JSON.stringify({ from: row.committed_cursor, to: commit.cursor, epoch,
+          previous_scope: row.authorization_scope_hash, current_scope: hash }) });
+      return { ...out, result: "ok", committed_cursor: commit.cursor, updated_at: iso(nowMs),
+        authorization_scope_hash: hash, lease_epoch: epoch };
     });
   }
 
@@ -1065,6 +1085,21 @@ export class HerdrState extends DurableObject<Env> {
     const hash = await this.consumerScopeHash(caller, scopes);
     return this.consumerPosition(nowMs, caller, consumerId, hash,
       { expected: expectedCommittedCursor, cursor: newCursor, epoch: leaseEpoch });
+  }
+
+  async rebaseConsumerPosition(nowMs: number, caller: Caller, scopes: string[], consumerId: string,
+      expectedCommittedCursor: number, resumeCursor: number, leaseEpoch: number,
+      currentAuthorizationScopeHash: string, reconciled: boolean): Promise<ConsumerPosition> {
+    if (this.env.EVENT_CONSUMERS_ENABLED !== "true") return { result: "event_consumers_disabled" };
+    if (!scopes.includes(SCOPE_READ)) return { result: "insufficient_scope" };
+    if (!consumerId || consumerId.length > 200 || reconciled !== true
+        || !/^[0-9a-f]{64}$/.test(currentAuthorizationScopeHash)
+        || ![expectedCommittedCursor, resumeCursor, leaseEpoch].every((n) => Number.isSafeInteger(n) && n >= 0)) {
+      return { result: "invalid_arguments" };
+    }
+    const hash = await this.consumerScopeHash(caller, scopes);
+    return this.consumerPosition(nowMs, caller, consumerId, hash,
+      { expected: expectedCommittedCursor, cursor: resumeCursor, epoch: leaseEpoch, rebaseScope: currentAuthorizationScopeHash });
   }
 
   // The global feed, scope-bound (plan section 5 + section 7): sinceCursor
