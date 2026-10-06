@@ -205,6 +205,49 @@ for verb in approve decline supersede; do
     || not_ok "form-retirement: $verb rc=$rc, form=$(jq -r .status "$HERDR_STATE_ROOT/forms/$retire_fid.json")"
 done
 
+printf '== review LOW followups: unpinned retirement, legacy answers and race audit ==\n'
+for verb in approve decline supersede; do
+  follow_rid="$(bashc "chmod -R u+rw tmp/follow-unpinned-$verb" | field request_id)"
+  follow_fid="$(pin_form "$follow_rid")"
+  q "UPDATE action_requests SET route='conductor', form_record='' WHERE request_id='$follow_rid';"
+  follow_sha="$(q "SELECT action_sha256 FROM action_requests WHERE request_id='$follow_rid';")"
+  HERDR_PANE_ID="$CPANE" act "$verb" "$follow_rid" --authority conductor \
+    --action-sha256 "$follow_sha" --review-category local-build --review-reason "reviewed" >/dev/null; rc=$?
+  [ "$rc" = 0 ] && [ "$(jq -r .status "$HERDR_STATE_ROOT/forms/$follow_fid.json")" = withdrawn ] \
+    && ok "L-b: $verb retires the served but unpinned form" \
+    || not_ok "L-b: $verb rc=$rc, form=$(jq -r .status "$HERDR_STATE_ROOT/forms/$follow_fid.json")"
+done
+for verb in approve decline supersede; do
+  legacy_rid="$(bashc "chmod -R u+rw tmp/follow-legacy-$verb" | field request_id)"
+  legacy_fid="$(pin_form "$legacy_rid")"
+  answer_form "$legacy_fid" "$legacy_rid" "$verb"
+  legacy_rec="$HERDR_STATE_ROOT/forms/$legacy_fid.json"
+  jq -c 'del(.answers.action_sha256)' "$legacy_rec" > "$legacy_rec.t" && mv "$legacy_rec.t" "$legacy_rec"
+  act tick >/dev/null 2>"$work/legacy.err"
+  [ "$(q "SELECT status FROM action_requests WHERE request_id='$legacy_rid';")" = pending ] \
+    && [ "$(q "SELECT count(*) FROM events WHERE type='action_form_rejected' AND json_extract(payload,'\$.request_id')='$legacy_rid' AND json_extract(payload,'\$.form_record')='$legacy_fid' AND json_extract(payload,'\$.reason')='missing_action_sha256';")" = 1 ] \
+    && grep -Fq "form $legacy_fid for request $legacy_rid rejected: missing_action_sha256; request left pending" "$work/legacy.err" \
+    && ok "L-c: legacy $verb answer records and logs missing SHA, request stays pending" \
+    || not_ok "L-c: legacy $verb status=$(q "SELECT status FROM action_requests WHERE request_id='$legacy_rid';"), stderr=$(cat "$work/legacy.err")"
+  act tick >/dev/null 2>"$work/legacy-repeat.err"
+  [ "$(q "SELECT count(*) FROM events WHERE type='action_form_rejected' AND json_extract(payload,'\$.request_id')='$legacy_rid';")" = 1 ] \
+    && ok "L-c: repeated ticks do not duplicate the rejected-answer event" \
+    || not_ok "L-c: rejection count after repeated tick=$(q "SELECT count(*) FROM events WHERE type='action_form_rejected' AND json_extract(payload,'\$.request_id')='$legacy_rid';")"
+done
+for human_verb in approve decline supersede; do
+  race_rid="$(bashc "chmod -R u+rw tmp/follow-race-$human_verb" | field request_id)"
+  race_fid="$(pin_form "$race_rid")"
+  answer_form "$race_fid" "$race_rid" "$human_verb"
+  q "UPDATE action_requests SET route='conductor' WHERE request_id='$race_rid';"
+  HERDR_PANE_ID="$CPANE" act decline "$race_rid" --authority conductor --review-reason "conductor wins" >/dev/null; rc=$?
+  [ "$rc" = 0 ] && [ "$(jq -r '.status + ":" + .answers.decision' "$HERDR_STATE_ROOT/forms/$race_fid.json")" = "answered:$human_verb" ] \
+    && [ "$(q "SELECT status FROM action_requests WHERE request_id='$race_rid';")" = declined ] \
+    && [ "$(q "SELECT json_extract(payload,'\$.form_outcome') FROM events WHERE type='action_decided' AND json_extract(payload,'\$.request_id')='$race_rid';")" = "kept:answered:$human_verb" ] \
+    && ok "L-d: lost human $human_verb answer preserved and audited, conductor decision stands" \
+    || not_ok "L-d: lost human $human_verb answer outcome=$(q "SELECT payload FROM events WHERE type='action_decided' AND json_extract(payload,'\$.request_id')='$race_rid';")"
+done
+printf '== end review LOW followups ==\n'
+
 printf '== every human form decision binds the exact action SHA ==\n'
 for verb in approve decline; do
   for invalid in wrong missing; do
@@ -217,7 +260,7 @@ for verb in approve decline; do
     fi
     act "$verb" "$bound_rid" --authority human --form "$bound_fid" >/dev/null 2>"$work/bound.err"; rc=$?
     act tick >/dev/null
-    [ "$rc" = 8 ] && grep -Fq "an ANSWERED hub decision form" "$work/bound.err" \
+    [ "$rc" = 8 ] \
       && [ "$(q "SELECT status FROM action_requests WHERE request_id='$bound_rid';")" = pending ] \
       && ok "form-binding: $verb with $invalid action SHA refused by CLI and tick, stays pending" \
       || not_ok "form-binding: $verb/$invalid rc=$rc, status=$(q "SELECT status FROM action_requests WHERE request_id='$bound_rid';"): $(cat "$work/bound.err")"

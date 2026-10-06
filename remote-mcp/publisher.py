@@ -260,9 +260,9 @@ def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict],
                 p = {}
             asks[tid] = {"at": at, "tool": p.get("tool"), "summary": p.get("message") or p.get("command")}
         # Pending requests are closure blockers regardless of input_required
-        # history. Keep the menu ask for presentation, but never let it mask
-        # pending membership. Only the newest pending request supplies the
-        # fallback ask; older registries may lack action_requests entirely.
+        # history. The newest pending request also supplies the current ask,
+        # overriding historical menu metadata. Older registries may lack
+        # action_requests entirely.
         try:
             for tid, rid, tool, reason, at in con.execute(
                 f"""SELECT task_id, request_id, tool, reason, created_at FROM action_requests ar
@@ -272,8 +272,6 @@ def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict],
                 task_ids,
             ):
                 pending.add(tid)
-                if tid in asks:
-                    continue
                 outcome = con.execute(
                     """SELECT json_extract(payload,'$.outcome') FROM events
                        WHERE task_id=? AND type='action_surfaced' AND json_extract(payload,'$.request_id')=?
@@ -484,7 +482,7 @@ def build(now: datetime) -> tuple[dict, dict]:
         live_blocked = t["pane_id"] in blocked_panes if t["pane_id"] else False
         ask = asks.get(t["task_id"])
         # Historical menu asks alone are not blockers, but a pending action
-        # request always is, even when the displayed ask comes from a menu.
+        # request always is and supplies the displayed ask.
         if not (live_blocked or t["state"] in ("blocked", "stalled") or t["task_id"] in pending):
             continue
         blockers.append({
