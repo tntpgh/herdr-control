@@ -109,7 +109,7 @@ archive_enumerate_tracked_dirty() {     # <worktree> -> tracked files differing 
 # caller to inspect or discard — it is never reported as a valid manifest.
 # Call it directly, never as `$(archive_copy_and_manifest …)` (see header).
 archive_copy_and_manifest() {
-  local wt="$1" dest="$2" files="$3" rel src dst sha sz manifest
+  local wt="$1" dest="$2" files="$3" rel src dst sha sz manifest target anc
   _ARCHIVE_WHY=""; _ARCHIVE_MANIFEST=""
   manifest="$dest/MANIFEST.sha256"
   if ! mkdir -p "$dest/files" 2>/dev/null; then
@@ -123,13 +123,51 @@ archive_copy_and_manifest() {
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     src="$wt/$rel"
-    if [ ! -f "$src" ]; then
-      _ARCHIVE_WHY="source file vanished before archiving: $rel"
-      return 1
-    fi
     dst="$dest/files/$rel"
+    # Never write through an already-archived symlink (review r1 LOW): a
+    # tracked dir replaced by a symlink sorts before its own descendants
+    # ("a" before "a/sub/b"), so by the time a descendant's mkdir -p runs,
+    # $wt/a is itself a symlink and mkdir -p follows it into whatever it
+    # targets, creating real directories there. Refuse before any mkdir.
+    anc="$rel"
+    while case "$anc" in */*) true ;; *) false ;; esac; do
+      anc="${anc%/*}"
+      # Check the archive side too: mkdir -p / cp follow $dest/files/$anc,
+      # so a live dir swapped back after its link was archived must not
+      # route the copy through that archived link (review r2).
+      if [ -L "$wt/$anc" ] || [ -L "$dest/files/$anc" ]; then
+        _ARCHIVE_WHY="path beneath a symlink: $rel"
+        return 1
+      fi
+    done
     if ! mkdir -p "$(dirname "$dst")" 2>/dev/null; then
       _ARCHIVE_WHY="could not create directory for $rel"
+      return 1
+    fi
+    # A symlink (to anything — a directory, a file, something outside this
+    # worktree entirely, e.g. ingest/node_modules -> the primary checkout's
+    # own node_modules) is archived AS A SYMLINK: its target is recorded in
+    # the manifest and reproduced here as a symlink, never dereferenced and
+    # never copied. `-f` below follows a symlink to judge its TARGET, so a
+    # symlink to a directory reads as "not a regular file" and was
+    # misreported as vanished (real-fleet --apply, batch-1.log, 2026-10-05).
+    # `-L` is checked first and independently of whether the target exists —
+    # a broken symlink is still archived as one, never treated as missing.
+    if [ -L "$src" ]; then
+      target=$(readlink "$src" 2>/dev/null)
+      if [ -z "$target" ]; then
+        _ARCHIVE_WHY="could not read symlink target: $rel"
+        return 1
+      fi
+      if ! ln -s "$target" "$dst" 2>/dev/null; then
+        _ARCHIVE_WHY="could not record symlink for $rel"
+        return 1
+      fi
+      printf 'SYMLINK\t%s\t%s\n' "$target" "$rel" >> "$manifest"
+      continue
+    fi
+    if [ ! -f "$src" ]; then
+      _ARCHIVE_WHY="source file vanished before archiving: $rel"
       return 1
     fi
     if ! cp -p "$src" "$dst" 2>/dev/null; then
@@ -182,6 +220,29 @@ archive_verify_manifest() {
     [ -n "$sha" ] && [ -n "$rel" ] || continue
     [ "$sha" = EXCLUDED ] && continue
     entries=$((entries + 1))
+    if [ "$sha" = SYMLINK ]; then
+      # sz holds the recorded TARGET TEXT here, never a hash — comparing it
+      # via `readlink` keeps this check from ever dereferencing the link.
+      csha=$(readlink "$dest/files/$rel" 2>/dev/null)
+      if [ "$csha" != "$sz" ]; then
+        _ARCHIVE_WHY="archived symlink does not match its manifest target: $rel"
+        return 1
+      fi
+      if [ -L "$wt/$rel" ]; then
+        ssha=$(readlink "$wt/$rel" 2>/dev/null)
+        if [ "$ssha" != "$sz" ]; then
+          _ARCHIVE_WHY="live source no longer matches its manifest target (changed since archiving): $rel"
+          return 1
+        fi
+      elif [ -e "$wt/$rel" ]; then
+        # Replaced by a regular file (or dir) between the copy and this
+        # recheck: same PATH, so the file-list comparison never catches
+        # it — only this type check does (review r1 MED).
+        _ARCHIVE_WHY="live source is no longer a symlink: $rel"
+        return 1
+      fi
+      continue
+    fi
     csha=$(shasum -a 256 "$dest/files/$rel" 2>/dev/null | cut -d' ' -f1)
     if [ "$csha" != "$sha" ]; then
       _ARCHIVE_WHY="archived copy does not match its manifest sha256: $rel"

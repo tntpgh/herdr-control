@@ -991,6 +991,213 @@ present "S5" "$W"
 out=$(AW --apply "$R")
 [ ! -d "$W" ] && ok "S5 control: once the file is closed the same worktree is archived and removed" || bad "S5 control: $out"
 
+#######################################################################
+# Section T: fix/archival-symlinks. A real-fleet --apply batch (form 8810,
+# /tmp/archival/batch-1.log) refused 10 tourguide worktrees with "archiving
+# failed: source file vanished before archiving: ingest/node_modules" (also
+# farm-review/node_modules, node_modules) — each path was a SYMLINK into the
+# primary checkout (ingest/node_modules -> ~/Code/tourguide/ingest/
+# node_modules). `[ -f ]` follows a symlink to judge its TARGET, so a
+# symlink to a directory read as "not a regular file" and was misreported
+# as vanished. Second: the same batch's "run registry query failed;
+# liveness cannot be verified" hit 14/200 reads intermittently under a busy
+# registry even with `.timeout 5000`.
+#######################################################################
+printf '\n== Section T: symlinked regenerable dirs + a locked registry ==\n'
+T_TMP="$TMP/T"; mkdir -p "$T_TMP"
+
+printf '== T1: a symlinked node_modules into a scratch primary archives AS A SYMLINK; the target is untouched ==\n'
+GH_PRS="$GH_PRS
+probe/t1#71 t1-merged MERGED 7171717171717171717171717171717171717171"
+R="$T_TMP/t1"; mkrepo "$R" probe/t1
+# mkrepo's shared .gitignore uses 'node_modules/' (trailing slash), which
+# gitignore semantics match ONLY a directory — a symlink never qualifies,
+# so ingest/node_modules would read as untracked, not ignored. Real
+# tourguide's .gitignore has the bare form too, which matches a symlink.
+printf 'node_modules\n' >> "$R/.gitignore"
+G -C "$R" add .gitignore && G -C "$R" commit -q -m "ignore node_modules symlinks too"
+G -C "$R" push -q origin main
+PRIMARY="$T_TMP/t1-primary-checkout"; mkdir -p "$PRIMARY/node_modules/pkg"
+printf 'module.exports = 1\n' > "$PRIMARY/node_modules/pkg/index.js"
+primary_before_sha=$(shasum -a 256 "$PRIMARY/node_modules/pkg/index.js" | cut -d' ' -f1)
+W="$WTROOT/t1-merged"; mkwt "$R" t1-merged "$W"
+mkdir -p "$W/ingest"
+ln -s "$PRIMARY/node_modules" "$W/ingest/node_modules"
+out=$(AW "$R")
+row "$out" "$W" | grep -q '^  archive' \
+  && ok "T1: a worktree with a symlinked node_modules previews archivable (never 'vanished')" || bad "T1 dry-run: $out"
+out=$(AW --apply "$R")
+[ ! -d "$W" ] && ok "T1: the worktree was archived and removed" || bad "T1 apply: $out"
+dest_t1=$(find "$HERDR_ARCHIVE_ROOT/t1" -maxdepth 1 -type d -name 't1-merged-*' 2>/dev/null | head -1)
+m="$dest_t1/MANIFEST.sha256"
+[ -n "$dest_t1" ] && [ -f "$m" ] \
+  && awk -F'\t' '$1=="SYMLINK" && $3=="ingest/node_modules" {f=1} END{exit !f}' "$m" \
+  && ok "T1: the manifest records ingest/node_modules as a SYMLINK, never a vanished/copied file" \
+  || bad "T1: manifest wrong/missing: $(cat "$m" 2>&1)"
+recorded_target=$(awk -F'\t' '$1=="SYMLINK" && $3=="ingest/node_modules" {print $2}' "$m")
+[ "$recorded_target" = "$PRIMARY/node_modules" ] \
+  && ok "T1: the recorded target is the real primary checkout's node_modules path" || bad "T1: recorded target wrong: $recorded_target"
+[ -L "$dest_t1/files/ingest/node_modules" ] \
+  && [ "$(readlink "$dest_t1/files/ingest/node_modules")" = "$PRIMARY/node_modules" ] \
+  && ok "T1: the archived copy is itself a symlink to the same target, never a copy of its content" \
+  || bad "T1: archived entry is not a matching symlink"
+primary_after_sha=$(shasum -a 256 "$PRIMARY/node_modules/pkg/index.js" 2>/dev/null | cut -d' ' -f1)
+[ "$primary_after_sha" = "$primary_before_sha" ] \
+  && ok "T1: the symlink target (primary checkout's node_modules) is byte-identical afterward" \
+  || bad "T1: the primary checkout's node_modules was modified"
+[ -d "$PRIMARY/node_modules" ] && ok "T1: the primary checkout's node_modules dir still exists (never removed)" \
+  || bad "T1: the primary checkout's node_modules is gone"
+
+printf '== T2: a symlink pointing outside every allowed root is recorded, never followed ==\n'
+GH_PRS="$GH_PRS
+probe/t2#72 t2-merged MERGED 7272727272727272727272727272727272727272"
+R="$T_TMP/t2"; mkrepo "$R" probe/t2
+printf 'outside-link\n' >> "$R/.gitignore"
+G -C "$R" add .gitignore && G -C "$R" commit -q -m "ignore the outside-link symlink"
+G -C "$R" push -q origin main
+OUTSIDE="$T_TMP/t2-outside"; mkdir -p "$OUTSIDE"
+printf 'do not touch\n' > "$OUTSIDE/secret.txt"
+outside_before_sha=$(shasum -a 256 "$OUTSIDE/secret.txt" | cut -d' ' -f1)
+W="$WTROOT/t2-merged"; mkwt "$R" t2-merged "$W"
+ln -s "$OUTSIDE" "$W/outside-link"
+out=$(AW --apply "$R")
+[ ! -d "$W" ] && ok "T2: a worktree with a symlink to an arbitrary outside path archives and removes" || bad "T2 apply: $out"
+dest_t2=$(find "$HERDR_ARCHIVE_ROOT/t2" -maxdepth 1 -type d -name 't2-merged-*' 2>/dev/null | head -1)
+m2="$dest_t2/MANIFEST.sha256"
+[ -n "$dest_t2" ] && [ -f "$m2" ] \
+  && awk -F'\t' -v t="$OUTSIDE" '$1=="SYMLINK" && $2==t && $3=="outside-link" {f=1} END{exit !f}' "$m2" \
+  && ok "T2: the manifest records the out-of-root symlink and its exact target" || bad "T2: manifest wrong/missing: $(cat "$m2" 2>&1)"
+[ "$(find "$OUTSIDE" -mindepth 1 | wc -l | tr -d ' ')" = 1 ] \
+  && [ "$(shasum -a 256 "$OUTSIDE/secret.txt" | cut -d' ' -f1)" = "$outside_before_sha" ] \
+  && ok "T2: the outside directory was never traversed or modified (never followed)" \
+  || bad "T2: the outside directory was touched"
+
+printf '== T3: a registry locked past the retries still HOLDs, with the real sqlite3 error visible ==\n'
+R="$T_TMP/t3"; mkrepo "$R" probe/t3; W="$WTROOT/t3-live"; mkwt "$R" t3-live "$W"
+T3_RUNS="$T_TMP/t3-runs"; mkdir -p "$T3_RUNS"
+HERDR_RUN_STATE_DIR="$T3_RUNS" bash -c '
+  . "$1/lib/run-registry.sh"
+  registry_init && register_task runT3 taskT3 w c cp cb pT3 bT3 "$2" "$3" t3-live
+' _ "$here" "$R" "$W" >/dev/null || bad "T3: could not seed the scratch registry"
+T3_DB="$T3_RUNS/registry.sqlite3"
+LOCKFIFO="$T_TMP/t3.fifo"; mkfifo "$LOCKFIFO"
+# A scratch writer takes an OS-level EXCLUSIVE lock (locking_mode=EXCLUSIVE)
+# and holds it open via the FIFO — a real SQLITE_BUSY-producing lock, not a
+# simulated error string — until the archiver's retries have had their
+# chance and this test releases it.
+(
+  sqlite3 "$T3_DB" > "$T_TMP/t3-writer.out" 2>&1 <<SQL
+PRAGMA locking_mode=EXCLUSIVE;
+BEGIN IMMEDIATE;
+UPDATE tasks SET updated_at = updated_at;
+.shell cat "$LOCKFIFO" >/dev/null
+COMMIT;
+SQL
+) &
+t3_writer=$!
+sleep 0.4
+out=$(HERDR_RUN_STATE_DIR="$T3_RUNS" HERDR_REGISTRY_BUSY_MS=200 HERDR_REGISTRY_BUSY_RETRIES=1 AW --apply "$R")
+echo stop > "$LOCKFIFO"
+wait "$t3_writer" 2>/dev/null
+row "$out" "$W" | grep -q HOLD && row "$out" "$W" | grep -qi 'liveness cannot be verified' \
+  && ok "T3: a locked registry still HOLDs (fail-closed)" || bad "T3 output: $out"
+row "$out" "$W" | grep -qi 'locked' \
+  && ok "T3: sqlite3's real error (database is locked) is visible in the HOLD reason" || bad "T3: no visible cause: $(row "$out" "$W")"
+present "T3" "$W"
+
+printf '== T4: an archived symlink replaced by a regular file before the pre-remove recheck REFUSEs (MED) ==\n'
+GH_PRS="$GH_PRS
+probe/t4#74 t4-merged MERGED 7474747474747474747474747474747474747474"
+R="$T_TMP/t4"; mkrepo "$R" probe/t4
+printf 'lnk4\n' >> "$R/.gitignore"
+G -C "$R" add .gitignore && G -C "$R" commit -q -m "ignore lnk4"
+G -C "$R" push -q origin main
+OUT4="$T_TMP/t4-out"; mkdir -p "$OUT4"
+W="$WTROOT/t4-merged"; mkwt "$R" t4-merged "$W"
+ln -s "$OUT4" "$W/lnk4"
+# A dedicated git wrapper, scoped to this one call via PATH, swaps the
+# symlink for a regular file with new content exactly when `git bundle
+# create` runs — between archive_copy_and_manifest's first verify (which
+# still sees the intact symlink) and the pre-remove recheck's second one.
+T4_BIN="$T_TMP/t4bin"; mkdir -p "$T4_BIN"
+cat > "$T4_BIN/git" <<EOF
+#!/bin/bash
+case " \$* " in
+  *" bundle create "*) rm -f "$W/lnk4"; printf 'NEW UNARCHIVED WORK\n' > "$W/lnk4" ;;
+esac
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$T4_BIN/git"
+out=$(PATH="$T4_BIN:$PATH" AW --apply "$R")
+row "$out" "$W" | grep -q 'REFUSED.*no longer a symlink' \
+  && ok "T4: a symlink swapped for a file before the recheck REFUSEs the remove" || bad "T4 output: $out"
+present "T4" "$W"
+[ -f "$W/lnk4" ] && [ ! -L "$W/lnk4" ] && [ "$(cat "$W/lnk4")" = "NEW UNARCHIVED WORK" ] \
+  && ok "T4: the unarchived replacement content was never lost (worktree not removed)" || bad "T4: lnk4 wrong/missing"
+
+printf '== T5: a tracked dir replaced by a symlink never writes through it (LOW) ==\n'
+# Direct against lib/worktree-archive.sh (same approach as review r1's own
+# probe238.sh P7): archive-worktrees.sh's own archive_need_kb HOLDs this
+# exact fixture first ("could not size the archive copy/bundle" — `du`
+# cannot stat the vanished a/sub/b), which is correct fail-closed behavior
+# but means the top-level script never reaches archive_copy_and_manifest
+# here. The library function is what review r1 LOW actually fixed.
+T5_TMP="$T_TMP/t5"; mkdir -p "$T5_TMP"
+T5_WT="$T5_TMP/wt"; G init -q -b main "$T5_WT"
+mkdir -p "$T5_WT/a/sub"; printf 'x\n' > "$T5_WT/a/sub/b"
+G -C "$T5_WT" add a && G -C "$T5_WT" commit -q -m t
+OUT5="$T5_TMP/out"; mkdir -p "$OUT5"; printf 'keep\n' > "$OUT5/keep.txt"
+rm -r "$T5_WT/a"; ln -s "$OUT5" "$T5_WT/a"
+(
+  . "$here/lib/worktree-archive.sh"
+  d="$T5_TMP/arch"; mkdir -p "$d"
+  archive_copy_and_manifest "$T5_WT" "$d" "$(printf 'a\na/sub/b\n')"
+  printf 'T5: copy rc=%s why=%s\n' "$?" "$_ARCHIVE_WHY"
+) > "$T_TMP/t5.out" 2>&1
+grep -q 'why=path beneath a symlink: a/sub/b' "$T_TMP/t5.out" \
+  && ok "T5: a path beneath an already-archived symlink is refused before any mkdir" || bad "T5 output: $(cat "$T_TMP/t5.out")"
+[ "$(find "$OUT5" -mindepth 1 | wc -l | tr -d ' ')" = 1 ] && [ -f "$OUT5/keep.txt" ] \
+  && ok "T5: the symlink target directory is untouched (nothing written through it)" \
+  || bad "T5: target modified: $(find "$OUT5" 2>&1)"
+
+printf '== T6: HERDR_REGISTRY_BUSY_RETRIES=abc still HOLDs within bounded time, never hangs (LOW) ==\n'
+R="$T_TMP/t6"; mkrepo "$R" probe/t6; W="$WTROOT/t6-live"; mkwt "$R" t6-live "$W"
+T6_RUNS="$T_TMP/t6-runs"; mkdir -p "$T6_RUNS"
+HERDR_RUN_STATE_DIR="$T6_RUNS" bash -c '
+  . "$1/lib/run-registry.sh"
+  registry_init && register_task runT6 taskT6 w c cp cb pT6 bT6 "$2" "$3" t6-live
+' _ "$here" "$R" "$W" >/dev/null || bad "T6: could not seed the scratch registry"
+T6_DB="$T6_RUNS/registry.sqlite3"
+LOCKFIFO6="$T_TMP/t6.fifo"; mkfifo "$LOCKFIFO6"
+# Same real EXCLUSIVE-lock writer as T3. Unlike T3, this run's retries value
+# is invalid — `[ 0 -ge abc ]` errors (rc=2) rather than comparing, so the
+# unfixed cap never trips and _reg_ro spins until the writer releases; the
+# 10s `timeout` turns that hang into a visible FAIL instead of wedging the
+# whole suite when run against the pre-fix baseline.
+(
+  sqlite3 "$T6_DB" > "$T_TMP/t6-writer.out" 2>&1 <<SQL
+PRAGMA locking_mode=EXCLUSIVE;
+BEGIN IMMEDIATE;
+UPDATE tasks SET updated_at = updated_at;
+.shell cat "$LOCKFIFO6" >/dev/null
+COMMIT;
+SQL
+) &
+t6_writer=$!
+sleep 0.4
+out=$(timeout 10 env HERDR_RUN_STATE_DIR="$T6_RUNS" HERDR_REGISTRY_BUSY_MS=200 HERDR_REGISTRY_BUSY_RETRIES=abc \
+  bash "$here/archive-worktrees.sh" --apply "$R" 2>&1)
+rc=$?
+echo stop > "$LOCKFIFO6"
+wait "$t6_writer" 2>/dev/null
+[ "$rc" -ne 124 ] && ok "T6: a non-numeric retries value no longer spins forever (terminated, rc=$rc)" \
+  || bad "T6: still spinning past 10s with HERDR_REGISTRY_BUSY_RETRIES=abc (cap never trips)"
+row "$out" "$W" | grep -q HOLD && row "$out" "$W" | grep -qi 'liveness cannot be verified' \
+  && ok "T6: it still HOLDs (fail-closed), falling back to the default retry cap" || bad "T6 output: $out"
+present "T6" "$W"
+
+
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi
