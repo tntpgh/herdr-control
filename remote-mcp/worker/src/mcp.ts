@@ -222,9 +222,12 @@ export function buildServer(env: Env, caller: Caller, scopes: string[]): McpServ
 
   server.registerTool("get_owner_message_status", {
     title: "Get owner-message status",
-    description: "Delivery status of a message you sent to a named owning session: queued | delivered | " +
+    description: "Delivery status of a message you sent to a named owning session: queued | delivering | delivered | " +
       "blocked:<owner_not_registered|owner_pane_gone|owner_identity_changed|owner_at_approval_prompt|" +
-      "deliver_failed:<rc>|sender_revoked|owner_inbox_disabled> | replied. Requires herdr:message.owner.",
+      "deliver_failed:<rc>|sender_revoked|owner_inbox_disabled> | replied. queued with detail deliver_failed:4 means " +
+      "the notice was typed but submission is unconfirmed: it is not retyped and accepts an authorized matching reply " +
+      "only before the 15-minute delivery expiry (sync time, not reply-file write time). replied may have delivered_at:null " +
+      "when the owner answered before notice submission was confirmed. Requires herdr:message.owner.",
     inputSchema: { exchange_id: z.string().min(1).max(100) },
     annotations: ro,
   }, async ({ exchange_id }) => {

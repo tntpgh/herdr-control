@@ -291,12 +291,9 @@ const MAX_ATTEMPTS = 40;
 // and leaving a single cancel_stuck event instead of an unbounded flood --
 // same shape, same cap, as registry-bridge.sh's own CANCEL_STUCK_THRESHOLD.
 const CANCEL_RETRY_CAP = 5;
-// Approval prompts retry on later ticks as before. Busy composers use the
-// same ack shape and attempt counter, with a bounded exponential delay.
+// Pre-send approval prompts retry on later ticks. Already-typed notices
+// wait for a reply/expiry instead: re-leasing would type them twice.
 const APPROVAL_RETRY_CAP = 10;
-const OWNER_BUSY_RETRY_CAP = 10;
-const OWNER_BUSY_BACKOFF_MS = 15_000;
-const OWNER_BUSY_BACKOFF_MAX_MS = 60_000;
 const AUDIT_KEEP_MS = 180 * 86_400_000;
 // Every tool call by one client (allowed or refused) counts. A ChatGPT session
 // makes a handful of calls per turn; these only bite a loop or a leaked token.
@@ -719,12 +716,12 @@ export class HerdrState extends DurableObject<Env> {
     };
   }
 
-  // Every sender with an owner message that could still be leased: the same
-  // pre-lease grant re-check as pendingSenders, on herdr:message.owner.
+  // Re-check grants for pending delivery AND confirmed deliveries awaiting
+  // a reply. The reply path must not extend access after grant revocation.
   pendingOwnerSenders(nowMs: number): Sender[] {
     return this.sql.exec<{ actor: string; client_id: string }>(
       `SELECT DISTINCT sender_actor AS actor, sender_client AS client_id FROM owner_messages
-       WHERE status IN ('queued','delivering') AND expires_at > ?`, nowMs).toArray();
+       WHERE status='delivered' OR (status IN ('queued','delivering') AND expires_at > ?)`, nowMs).toArray();
   }
 
   // Caps in force this tick: the Mac's own pushed config when we have one
@@ -1343,12 +1340,11 @@ export class HerdrState extends DurableObject<Env> {
       }
     }
 
-    // Owner acks retain the delivered/blocked contract. Only approval prompts
-    // and an unchanged busy composer (rc 4) are transient; all other reasons
-    // finalize on their first report.
+    // Owner acks retain the delivered/blocked contract. Approval prompts
+    // retry; already-typed, unconfirmed notices wait for a reply until expiry.
     for (const a of body.owner_acks ?? []) {
-      const m = this.sql.exec<{ status: string; owner_label: string; attempts: number }>(
-        `SELECT status, owner_label, attempts FROM owner_messages WHERE exchange_id=?`, a.exchange_id).toArray()[0];
+      const m = this.sql.exec<{ status: string; owner_label: string; attempts: number; expires_at: number }>(
+        `SELECT status, owner_label, attempts, expires_at FROM owner_messages WHERE exchange_id=?`, a.exchange_id).toArray()[0];
       if (!m || m.status !== "delivering") continue;
       if (a.outcome === "delivered") {
         this.sql.exec(`UPDATE owner_messages SET status='delivered', delivered_at=?, detail='', updated_at=?, lease_until=0 WHERE exchange_id=?`,
@@ -1357,19 +1353,13 @@ export class HerdrState extends DurableObject<Env> {
         continue;
       }
       const reason = a.reason ?? "unknown";
-      const busy = reason === "deliver_failed:4";
-      // A reply in this sync takes precedence over retry exhaustion. Keep
-      // it transient until the reply loop commits (or retries a hold/error),
-      // rather than ever resurrecting an already-terminal rc 4 exchange.
-      const busyReplyPending = busy && (body.owner_replies ?? []).some(
-        (r) => r.exchange_id === a.exchange_id && r.owner_label === m.owner_label);
-      if ((reason === "owner_at_approval_prompt" && m.attempts < APPROVAL_RETRY_CAP)
-          || (busy && (m.attempts < OWNER_BUSY_RETRY_CAP || busyReplyPending))) {
-        const retryAt = busy
-          ? nowMs + Math.min(OWNER_BUSY_BACKOFF_MS * 2 ** (m.attempts - 1), OWNER_BUSY_BACKOFF_MAX_MS) : 0;
+      if (reason === "deliver_failed:4"
+          || (reason === "owner_at_approval_prompt" && m.attempts < APPROVAL_RETRY_CAP)) {
         this.sql.exec(`UPDATE owner_messages SET status='queued', detail=?, updated_at=?, lease_until=? WHERE exchange_id=?`,
-          reason, nowMs, retryAt, a.exchange_id);
-        this.audit(nowMs, { ...sys, target: m.owner_label, decision: "retry", reason, message_id: a.exchange_id, detail: `attempt ${m.attempts}` });
+          reason, nowMs, reason === "deliver_failed:4" ? m.expires_at : 0, a.exchange_id);
+        this.audit(nowMs, { ...sys, target: m.owner_label,
+          decision: reason === "deliver_failed:4" ? "notice_unconfirmed" : "retry",
+          reason, message_id: a.exchange_id, detail: `attempt ${m.attempts}` });
         continue;
       }
       this.sql.exec(`UPDATE owner_messages SET status=?, detail=?, updated_at=?, lease_until=0 WHERE exchange_id=?`,
@@ -1380,10 +1370,9 @@ export class HerdrState extends DurableObject<Env> {
     // A reply the owner wrote on the Mac. "header must match the exchange"
     // (SPEC item 4): the reported owner_label must equal THIS exchange's own
     // target (the Mac's directory-scoped knowledge, re-validated here).
-    // A busy-pane retry already wrote the body file, even though its notice
-    // did not submit. Accept a matching reply during that retry without
-    // claiming notice delivery. A final rc 4 ack in THIS sync cannot hide
-    // the reply either. Other blocked/queued states keep their old refusal.
+    // rc 4 and pre-send rc 5 both follow a successful body-file write.
+    // Accept matching replies while those exchanges are non-terminal,
+    // without claiming notice delivery or requiring another notice lease.
     const ownerReplyResults: { exchange_id: string; owner_label: string; outcome: string }[] = [];
     for (const r of body.owner_replies ?? []) {
       // #225 review round 3 N1: a reply file under the WRONG label
@@ -1392,8 +1381,8 @@ export class HerdrState extends DurableObject<Env> {
       // echo back the REQUESTED owner_label on every result so the Mac
       // can key by (owner_label, exchange_id), not exchange_id alone.
       const m = this.sql.exec<{ owner_label: string; status: string; detail: string; reply_body: string | null;
-        sender_actor: string; sender_client: string }>(
-        `SELECT owner_label, status, detail, reply_body, sender_actor, sender_client FROM owner_messages WHERE exchange_id=?`,
+        sender_actor: string; sender_client: string; expires_at: number }>(
+        `SELECT owner_label, status, detail, reply_body, sender_actor, sender_client, expires_at FROM owner_messages WHERE exchange_id=?`,
         r.exchange_id).toArray()[0];
       if (!m || m.owner_label !== r.owner_label) {
         ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome: "ignored:missing" });
@@ -1413,15 +1402,23 @@ export class HerdrState extends DurableObject<Env> {
         ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome });
         continue;
       }
-      const busyReply = m.detail === "deliver_failed:4"
+      const earlyReply = (m.detail === "deliver_failed:4" || m.detail === "owner_at_approval_prompt")
         && (m.status === "queued" || m.status === "delivering");
-      // The queued-message policy sweep runs below, after replies. Do not
-      // let this new retry acceptance path beat a revoked sender/off switch.
-      const busyReplyAllowed = busyReply && this.env.OWNER_INBOX_ENABLED === "true"
-        && emailAllowed(this.env, m.sender_actor) && !ownerGate.hold
-        && !ownerGate.revoked.some((s) => s.actor === m.sender_actor && s.client_id === m.sender_client);
-      if (m.status !== "delivered" && !busyReplyAllowed) {
+      // Undelivered exchanges use sync-time expiry, not the file's claimed
+      // responded_at. Confirmed deliveries retain post-delivery reply behavior.
+      if (m.status !== "delivered" && !(earlyReply && m.expires_at > nowMs)) {
         ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome: `ignored:${m.status}` });
+        continue;
+      }
+      // Even a confirmed notice is not permission to accept after revocation.
+      const refusal = this.env.OWNER_INBOX_ENABLED !== "true" ? "owner_inbox_disabled"
+        : !emailAllowed(this.env, m.sender_actor)
+          || ownerGate.revoked.some((s) => s.actor === m.sender_actor && s.client_id === m.sender_client)
+          ? "sender_revoked" : null;
+      if (refusal || ownerGate.hold) {
+        const outcome = refusal ? `ignored:blocked:${refusal}`
+          : m.status === "delivered" ? "retry:grant_lookup_hold" : `ignored:${m.status}`;
+        ownerReplyResults.push({ exchange_id: r.exchange_id, owner_label: r.owner_label, outcome });
         continue;
       }
       const respondedMs = Date.parse(r.responded_at);
@@ -1611,14 +1608,14 @@ export class HerdrState extends DurableObject<Env> {
       this.audit(nowMs, { ...sys, target: c.remote_task_id, decision: status, reason: why, message_id: "", detail: c.detail });
     }
 
-    // Never delivered within the TTL, or the Mac never got a single
-    // non-approval-prompt attempt to land within MAX_ATTEMPTS: finalize as
-    // deliver_failed, the same shape as the SPEC's other blocked reasons.
+    // An unconfirmed notice is never leased again and ends with its rc 4
+    // reason at expiry. Other undelivered exchanges retain their old caps.
     for (const m of this.sql.exec<{ exchange_id: string; owner_label: string; detail: string; attempts: number }>(
       `SELECT exchange_id, owner_label, detail, attempts FROM owner_messages
-       WHERE status IN ('queued','delivering') AND (expires_at <= ? OR (attempts >= ? AND lease_until < ?))`,
+       WHERE status IN ('queued','delivering') AND (expires_at <= ?
+         OR (detail <> 'deliver_failed:4' AND attempts >= ? AND lease_until < ?))`,
       nowMs, MAX_ATTEMPTS, nowMs).toArray()) {
-      const rc = m.attempts >= MAX_ATTEMPTS ? "max_attempts" : "timeout";
+      const rc = m.detail === "deliver_failed:4" ? "4" : m.attempts >= MAX_ATTEMPTS ? "max_attempts" : "timeout";
       const why = `deliver_failed:${rc}`;
       const note = rc === "max_attempts" ? `gave up after ${m.attempts} attempts` : "not delivered within 15 minutes";
       this.sql.exec(`UPDATE owner_messages SET status=?, detail=?, updated_at=? WHERE exchange_id=?`,
@@ -1737,7 +1734,7 @@ export class HerdrState extends DurableObject<Env> {
       body: string; sender_actor: string; sender_client_name: string; attempts: number }>(
       `SELECT exchange_id, owner_label, client_msg_id, body, sender_actor, sender_client_name, attempts FROM owner_messages
        WHERE ((status='queued' AND lease_until <= ?) OR (status='delivering' AND lease_until < ?))
-         AND expires_at > ? ORDER BY created_at LIMIT 20`,
+         AND detail <> 'deliver_failed:4' AND expires_at > ? ORDER BY created_at LIMIT 20`,
       nowMs, nowMs, nowMs).toArray() : [];
     for (const m of dueOwners) {
       this.sql.exec(`UPDATE owner_messages SET status='delivering', attempts=attempts+1, lease_until=?, updated_at=? WHERE exchange_id=?`,

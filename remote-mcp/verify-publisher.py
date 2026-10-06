@@ -351,7 +351,9 @@ class OwnerDeliveryTicks(unittest.TestCase):
         self.item = {"exchange_id": "oex_tick1", "owner_label": "conductor",
                      "sender": "sender2026", "body": "remote payload"}
         snap, local = pub.build(NOW)
-        local["owners"] = {"conductor": {"pane_id": "w1:p1", "pane_birth": "term_cond", "agent_session": "session"}}
+        self.local = local
+        local["owners"] = {"conductor": {"pane_id": "w1:p1", "pane_birth": "term_cond", "agent_session": "session",
+                                       "workspace": "ops", "registered_at": "registration-one", "updated_at": "registration-one"}}
         self.calls = []
 
         def post(key, body):
@@ -360,7 +362,8 @@ class OwnerDeliveryTicks(unittest.TestCase):
                     "audit": [], "audit_cursor": 0}
 
         for target, value in (("OUT", root / "out"), ("INBOX_ROOT", root / "inbox"),
-                              ("OWNER_INBOX_ON_MAC", True), ("post_sync", post)):
+                              ("OWNER_INBOX_ON_MAC", True), ("post_sync", post),
+                              ("registry_owners", lambda: local["owners"])):
             p = patch.object(pub, target, value)
             p.start()
             self.addCleanup(p.stop)
@@ -373,22 +376,53 @@ class OwnerDeliveryTicks(unittest.TestCase):
         self.addCleanup(p.stop)
         self.argv = root / "argv"
 
-    def test_busy_then_success_then_lost_ack_never_creates_another_message(self):
+    def test_unconfirmed_duplicate_lease_never_types_notice_twice(self):
         self.assertEqual(pub.main([]), 0)
+        body = pub.INBOX_ROOT / "conductor/messages/oex_tick1.md"
+        first_body = body.read_bytes()
+        self.argv.unlink()
+        os.environ["FAKE_RC"] = "0"
+        self.assertEqual(pub.main([]), 0)  # replayed lease after an unconfirmed notice
+        self.assertFalse(self.argv.exists(), "rc4 already typed the notice")
         self.assertEqual(self.calls[-1]["owner_acks"],
                          [{"exchange_id": "oex_tick1", "outcome": "blocked", "reason": "deliver_failed:4"}])
         self.assertNotIn("oex_tick1", pub.load_state().get("owner_delivered", {}))
-        body = pub.INBOX_ROOT / "conductor/messages/oex_tick1.md"
-        first_body, first_argv = body.read_bytes(), self.argv.read_bytes()
-        os.environ["FAKE_RC"] = "0"
-        self.assertEqual(pub.main([]), 0)
-        self.assertEqual(self.calls[-1]["owner_acks"], [{"exchange_id": "oex_tick1", "outcome": "delivered"}])
         self.assertEqual(body.read_bytes(), first_body)
-        self.assertEqual(self.argv.read_bytes(), first_argv)
-        self.argv.unlink()
-        self.assertEqual(pub.main([]), 0)  # Worker re-leases after a lost ack
-        self.assertFalse(self.argv.exists())
         self.assertEqual(list(body.parent.glob("*.md")), [body])
+
+    def test_unconfirmed_restart_preserves_no_retype_and_reply_delivery(self):
+        self.assertEqual(pub.main([]), 0)
+        self.argv.unlink()
+        # A new module has no process-local delivery state. Only state.json
+        # and the inbox survive, just as when launchd starts the next tick.
+        spec = importlib.util.spec_from_file_location("publisher_restart", HERE / "publisher.py")
+        restarted = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(restarted)
+        with patch.object(restarted, "OUT", pub.OUT), patch.object(restarted, "INBOX_ROOT", pub.INBOX_ROOT), \
+                patch.object(restarted, "OWNER_INBOX_ON_MAC", True), \
+                patch.object(restarted, "build", pub.build), \
+                patch.object(restarted, "registry_owners", pub.registry_owners), \
+                patch.object(restarted, "post_sync", pub.post_sync):
+            self.assertEqual(restarted.main([]), 0)
+            self.assertFalse(self.argv.exists(), "restart must replay rc4 without typing")
+            replies = pub.INBOX_ROOT / "conductor/replies"
+            replies.mkdir()
+            reply = replies / "oex_tick1.md"
+            reply.write_text("answer after restart")
+            settled = NOW.timestamp() - pub.REPLY_MIN_AGE_S - 5
+            os.utime(reply, (settled, settled))
+
+            def accepted(key, body):
+                self.calls.append(body)
+                return {"audit": [], "audit_cursor": 0, "owner_reply_results": [
+                    {"exchange_id": r["exchange_id"], "owner_label": r["owner_label"], "outcome": "accepted"}
+                    for r in body["owner_replies"]]}
+
+            with patch.object(restarted, "post_sync", accepted):
+                self.assertEqual(restarted.main([]), 0)
+            self.assertEqual(self.calls[-1]["owner_replies"][0]["body"], "answer after restart")
+            self.assertEqual((replies / "sent" / reply.name).read_text(), "answer after restart")
+            self.assertFalse(self.argv.exists())
 
     def test_busy_reply_is_scanned_even_when_another_notice_lease_arrives(self):
         self.assertEqual(pub.main([]), 0)
@@ -396,11 +430,13 @@ class OwnerDeliveryTicks(unittest.TestCase):
         replies.mkdir()
         reply = replies / "oex_tick1.md"
         reply.write_text("answer from owner")
-        os.utime(reply, (1_700_000_000, 1_700_000_000))
+        settled = NOW.timestamp() - pub.REPLY_MIN_AGE_S - 5
+        os.utime(reply, (settled, settled))
         self.argv.unlink()
         self.assertEqual(pub.main([]), 0)
         self.assertEqual(self.calls[-2]["owner_replies"][0]["body"], "answer from owner")
-        self.assertEqual(self.calls[-1]["owner_acks"], [])
+        self.assertEqual(self.calls[-1]["owner_acks"],
+                         [{"exchange_id": "oex_tick1", "outcome": "blocked", "reason": "deliver_failed:4"}])
         self.assertFalse(self.argv.exists())
         self.assertTrue(reply.exists())  # no acceptance outcome: keep for the next sync
 
@@ -410,6 +446,46 @@ class OwnerDeliveryTicks(unittest.TestCase):
         self.assertEqual(self.calls[-1]["owner_acks"],
                          [{"exchange_id": "oex_tick1", "outcome": "blocked", "reason": "owner_at_approval_prompt"}])
         self.assertNotIn("oex_tick1", pub.load_state().get("owner_delivered", {}))
+
+    def test_reply_identity_changes_fail_closed(self):
+        for change in ("registration", "re-enrolled", "session", "birth", "revoked", "pane", "hub-down", "missing-record"):
+            with self.subTest(change=change):
+                self.assertEqual(pub.main([]), 0)
+                replies = pub.INBOX_ROOT / "conductor/replies"
+                replies.mkdir(exist_ok=True)
+                reply = replies / "oex_tick1.md"
+                reply.write_text("must stay local")
+                settled = NOW.timestamp() - pub.REPLY_MIN_AGE_S - 5
+                os.utime(reply, (settled, settled))
+                original = self.local["owners"]
+                changed = {label: dict(row) for label, row in original.items()}
+                if change == "revoked":
+                    changed.clear()
+                elif change in ("registration", "re-enrolled", "session", "birth"):
+                    field = {"registration": "updated_at", "re-enrolled": "registered_at",
+                             "session": "agent_session", "birth": "pane_birth"}[change]
+                    changed["conductor"][field] = "new-identity"
+                st = pub.load_state()
+                if change == "missing-record":
+                    st.pop("owner_message_identity", None)
+                    pub.save_state(st)
+                with patch.object(pub, "registry_owners", return_value=changed):
+                    if change == "hub-down":
+                        with patch.object(pub, "hub_get", side_effect=OSError("hub down")):
+                            self.assertEqual(pub.main([]), 0)
+                    elif change == "pane":
+                        with patch.object(pub, "hub_get", return_value={"panes": [{**PANES[0], "birth": "recycled"}]}):
+                            self.assertEqual(pub.main([]), 0)
+                    else:
+                        self.assertEqual(pub.main([]), 0)
+                self.assertEqual(self.calls[-2]["owner_replies"], [])
+                self.assertTrue(reply.exists())
+                self.assertFalse((replies / "sent" / reply.name).exists())
+                reply.unlink()
+                # Restore only the scratch identity record for the next case.
+                st = pub.load_state()
+                st["owner_message_identity"] = {"conductor/oex_tick1": original["conductor"]}
+                pub.save_state(st)
 
 class SchemaTolerance(unittest.TestCase):
     """registry_rows() opens the registry read-only via sqlite3.connect()

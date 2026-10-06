@@ -291,7 +291,7 @@ def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict],
 
 
 def registry_owners() -> dict[str, dict]:
-    """label -> {pane_id, pane_birth, agent_session, workspace}, read
+    """label -> pane/session identity, workspace and registration timestamps, read
     straight from the `owners` table (register-owner.sh / lib/run-registry.sh
     schema v8) -- the same read-only sqlite3 pattern registry_rows() uses.
     register-owner.sh/unregister-owner.sh are the only writers; publisher.py
@@ -309,9 +309,10 @@ def registry_owners() -> dict[str, dict]:
         if not has_table:
             return owners
         con.row_factory = sqlite3.Row
-        for row in con.execute("SELECT label, pane_id, pane_birth, agent_session, workspace FROM owners"):
+        for row in con.execute("SELECT label, pane_id, pane_birth, agent_session, workspace, registered_at, updated_at FROM owners"):
             owners[row["label"]] = {"pane_id": row["pane_id"] or "", "pane_birth": row["pane_birth"] or "",
-                                     "agent_session": row["agent_session"] or "", "workspace": row["workspace"] or ""}
+                                     "agent_session": row["agent_session"] or "", "workspace": row["workspace"] or "",
+                                     "registered_at": row["registered_at"] or "", "updated_at": row["updated_at"] or ""}
     finally:
         con.close()
     return owners
@@ -1193,10 +1194,10 @@ def deliver(item: dict, local: dict) -> dict:
 
 def deliver_owner(item: dict, local: dict) -> dict | None:
     """F1 re-check, then write the body to a file (never typed) and type
-    only the fixed notice pointing at it. Exit 5 keeps its approval-prompt
-    retry; exit 4 reports deliver_failed:4, which the Worker now retries
-    with bounded backoff. Neither means delivered. All other non-zero
-    exits remain terminal.
+    only the fixed notice pointing at it. Pre-send exit 5 keeps its
+    approval-prompt retry. Exit 4 (or exit 5 after typing) reports
+    deliver_failed:4: notice submission is unconfirmed, never retyped.
+    Neither means delivered. All other non-zero exits remain terminal.
 
     M1 (REVIEW-219): the F1 check against `local["panes"]` is the TICK-START
     hub snapshot, not "right before delivery" as README claims -- everything
@@ -1209,6 +1210,12 @@ def deliver_owner(item: dict, local: dict) -> dict | None:
     attempt (main()'s own `continue` for that case)."""
     exchange_id = item["exchange_id"]
     label = item["owner_label"]
+    # A reply proves the owner found the body. Check before refreshing pane
+    # identity: the pane may exit/change while a reply is still settling.
+    # Acceptance belongs to scan_owner_replies/the Worker, not delivery.
+    for kind in ("replies", "replies/sent"):
+        if _resolve_inbox_leaf(label, kind, exchange_id) is not None:
+            return None
     try:
         fresh_panes = {p["pane_id"]: p for p in (hub_get("/api/panes").get("panes") or []) if p.get("agent")}
     except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -1223,12 +1230,6 @@ def deliver_owner(item: dict, local: dict) -> dict | None:
     sender = clean(str(item.get("sender") or ""))
     if not write_inbox_message(label, exchange_id, sender, str(item.get("body") or "")):
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "deliver_failed:write"}
-    # A reply proves the owner found the body without this notice. Leave
-    # acceptance to scan_owner_replies/the Worker, never infer delivery or
-    # re-type while a reply is settling, awaiting sync, or already accepted.
-    for kind in ("replies", "replies/sent"):
-        if _resolve_inbox_leaf(label, kind, exchange_id) is not None:
-            return None
     # M7 (REVIEW-219): exchange_id's own fixed format (oex_<compact-iso>Z_<hex>)
     # guarantees a digit at a predictable offset -- made deterministic, not
     # just theoretical, by this feature. herdr-deliver.sh's own check-then-type
@@ -1255,6 +1256,9 @@ def deliver_owner(item: dict, local: dict) -> dict | None:
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "deliver_failed:timeout"}
     if proc.returncode == 0:
         return {"exchange_id": exchange_id, "outcome": "delivered"}
+    if proc.returncode == 5 and "delivered but NOT submitted" in proc.stderr:
+        # Same post-type uncertainty as rc 4, not a pre-send refusal.
+        return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "deliver_failed:4"}
     if proc.returncode == 5:
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "owner_at_approval_prompt"}
     return {"exchange_id": exchange_id, "outcome": "blocked", "reason": f"deliver_failed:{proc.returncode}"}
@@ -1520,9 +1524,30 @@ def main(argv: list[str]) -> int:
     # a file still sitting in replies/ (not yet moved to replies/sent/) IS
     # "unsent"; scan_owner_replies enforces the per-tick cap itself.
     owner_replies_raw = scan_owner_replies() if OWNER_INBOX_ON_MAC else []
-    owners_now = local.get("owners", {})
+    owners_now = registry_owners()
+    # A reply belongs to the registration that received the body, not a
+    # new owner of the same label. Missing legacy identity records fail
+    # closed: preserve the reply locally, never guess its original owner.
+    identities = st.get("owner_message_identity", {})
+    if owner_replies_raw:
+        try:
+            reply_panes = {p["pane_id"]: p for p in (hub_get("/api/panes").get("panes") or []) if p.get("agent")}
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            log(f"owner replies: could not refresh pane identity ({exc}); left local")
+            owner_replies_raw = []
+        else:
+            verified = []
+            for r in owner_replies_raw:
+                label, eid = r["owner_label"], r["exchange_id"]
+                original = identities.get(f"{label}/{eid}")
+                if (original and original == owners_now.get(label)
+                        and owner_pane_status(label, owners_now, reply_panes) == "ok"):
+                    verified.append(r)
+                else:
+                    log(f"owner reply {label}/{eid}: registration/pane identity unverifiable or changed; left local")
+            owner_replies_raw = verified
     owner_replies = [{**{k: v for k, v in r.items() if k != "_key"},
-                       "session": _owner_session_token(r["owner_label"], owners_now.get(r["owner_label"], {}))}
+                       "session": _owner_session_token(r["owner_label"], owners_now[r["owner_label"]])}
                       for r in owner_replies_raw]
     # #225 review M2: trims both lists in lockstep so owner_replies_raw
     # (used below to route this tick's ACTUAL posted replies) never
@@ -1602,6 +1627,8 @@ def main(argv: list[str]) -> int:
         if pruned_messages:
             st["owner_message_delivered"] = {k: v for k, v in st.get("owner_message_delivered", {}).items()
                                               if k not in pruned_messages}
+            st["owner_message_identity"] = {k: v for k, v in identities.items()
+                                            if k.split("/", 1)[1] not in pruned_messages}
         if pruned_sent:
             st["owner_replies_accepted"] = {k: v for k, v in st.get("owner_replies_accepted", {}).items()
                                              if k not in pruned_sent}
@@ -1642,12 +1669,19 @@ def main(argv: list[str]) -> int:
     # left unacked rather than forced into owner_at_approval_prompt, which
     # has its own specific bounded-retry meaning (SPEC item 3).
     owner_delivered = {k: v for k, v in st.get("owner_delivered", {}).items() if now.timestamp() - v < 86_400}
+    # Cache unconfirmed typing separately from delivered: a lost rc 4 ack
+    # must be replayed without typing again or claiming delivery. One day
+    # covers the Worker's 15-minute exchange TTL, like owner_delivered.
+    owner_unconfirmed = {k: v for k, v in st.get("owner_unconfirmed", {}).items()
+                         if now.timestamp() - v < 86_400}
     new_owner_acks = []
     owner_leased_at = time.monotonic()
     for item in owner_outbox:
         eid = item["exchange_id"]
         if eid in owner_delivered:
             a = {"exchange_id": eid, "outcome": "delivered"}
+        elif eid in owner_unconfirmed:
+            a = {"exchange_id": eid, "outcome": "blocked", "reason": "deliver_failed:4"}
         elif not OWNER_INBOX_ON_MAC:
             a = {"exchange_id": eid, "outcome": "blocked", "reason": "owner_inbox_disabled"}
         elif time.monotonic() - owner_leased_at > LEASE_LOCAL_S:
@@ -1665,9 +1699,15 @@ def main(argv: list[str]) -> int:
                 # never-time-filtered map, trimmed only when prune_inbox
                 # deletes the matching messages/ file.
                 st.setdefault("owner_message_delivered", {})[eid] = now.timestamp()
+            elif a.get("reason") == "deliver_failed:4":
+                owner_unconfirmed[eid] = now.timestamp()
+            if a["outcome"] == "delivered" or a.get("reason") in ("deliver_failed:4", "owner_at_approval_prompt"):
+                st.setdefault("owner_message_identity", {}).setdefault(
+                    f"{item['owner_label']}/{eid}", local["owners"][item["owner_label"]])
         log(f"owner message {eid}: {a['outcome']} ({a.get('reason', '')})")
         new_owner_acks.append(a)
         st["owner_delivered"], st["pending_owner_acks"] = owner_delivered, new_owner_acks
+        st["owner_unconfirmed"] = owner_unconfirmed
         save_state(st)
 
     new_command_acks = []
