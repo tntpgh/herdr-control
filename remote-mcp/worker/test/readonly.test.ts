@@ -100,3 +100,26 @@ it("never hands out a message queued before messaging was switched off", async (
   const m = await runInDurableObject(fleet, (o: HerdrState) => o.messageStatus(id, "tnt@teamthurber.com"));
   expect([m?.status, m?.detail]).toEqual(["refused", "cancelled before delivery: messaging_disabled"]);
 });
+
+it("consumer tools are absent and Durable Object calls refuse when the feature is off", async () => {
+  const { access_token } = await oauthToken(["herdr:read"]);
+  const response = await SELF.fetch(`${BASE}/mcp`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${access_token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+  });
+  const body = await response.json() as { result: { tools: { name: string }[] } };
+  const names = body.result.tools.map((tool) => tool.name);
+  expect(names).not.toContain("get_consumer_position");
+  expect(names).not.toContain("commit_consumer_position");
+  expect((await callTool(access_token, "get_consumer_position", { consumer_id: "zero" })).isError).toBe(true);
+  const fleet = e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet"));
+  const caller = { email: "tnt@teamthurber.com", client_id: "c", client_name: "Zero" };
+  expect((await fleet.getConsumerPosition(Date.now(), caller, ["herdr:read"], "zero")).result)
+    .toBe("event_consumers_disabled");
+  expect((await fleet.commitConsumerPosition(Date.now(), caller, ["herdr:read"], "zero", 0, 0, 1)).result)
+    .toBe("event_consumers_disabled");
+  const rows = await runInDurableObject(fleet, (_o: HerdrState, state) =>
+    state.storage.sql.exec(`SELECT * FROM event_consumers`).toArray());
+  expect(rows).toEqual([]);
+});

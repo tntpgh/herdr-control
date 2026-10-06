@@ -908,10 +908,10 @@ class Sweep(unittest.TestCase):
                 with self.subTest(status=status):
                     con.execute("UPDATE action_requests SET status=?", (status,))
                     con.commit()
-                    _, asks, _, _ = publisher.registry_rows(["task_cancel"])
+                    _, asks, _, _, pending = publisher.registry_rows(["task_cancel"])
                     t = {"task_id": "task_cancel", "run_id": "run_x", "state": "running",
                          "worktree": str(self.wt), "agent_live": True, "pane_status": "done",
-                         "has_pending_request": bool(asks.get("task_cancel", {}).get("kind"))}
+                         "has_pending_request": "task_cancel" in pending}
                     actions = tsk.sweep({"task_cancel": t}, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
                     closes = [a for a in actions if a["action"] == "orchestrator_close"]
                     self.assertEqual(bool(closes), status != "pending")

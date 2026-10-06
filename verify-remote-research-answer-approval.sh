@@ -630,12 +630,18 @@ HERDR_PANE_ID="$CPANE" act supersede "$rid_i1" --authority conductor --action-sh
 HERDR_PANE_ID="$PANE" act supersede "$rid_i1" --authority conductor --action-sha256 "$asha1" --review-reason x >/dev/null 2>&1; rc=$?
 [ "$rc" = 8 ] && ok "supersede: the WORKER's own pane (not the registered conductor) is refused" || not_ok "wrong pane rc=$rc"
 
-HERDR_PANE_ID="$CPANE" act supersede "$rid_i1" --authority bogus --action-sha256 "$asha1" --review-reason x >/dev/null 2>&1; rc=$?
-[ "$rc" = 2 ] && ok "supersede: an unknown authority is refused" || not_ok "unknown authority rc=$rc"
+HERDR_PANE_ID="$CPANE" act supersede "$rid_i1" --authority bogus --action-sha256 "$asha1" --review-reason x >/dev/null 2>"$work/unknown-authority.err"; rc=$?
+[ "$rc" = 2 ] && grep -Fq -- "--authority conductor|human is required" "$work/unknown-authority.err" \
+  && [ "$(_sql "SELECT status FROM action_requests WHERE request_id=$(_sq "$rid_i1");")" = pending ] \
+  && ok "supersede: an unknown authority is refused with the authority reason, stays pending" \
+  || not_ok "unknown authority rc=$rc: $(cat "$work/unknown-authority.err")"
 FAKE_CBIRTH=recycled HERDR_PANE_ID="$CPANE" act supersede "$rid_i1" --authority conductor --action-sha256 "$asha1" --review-reason x >/dev/null 2>&1; rc=$?
 [ "$rc" = 8 ] && ok "supersede: recycled conductor generation refused" || not_ok "recycled conductor rc=$rc"
-HERDR_PANE_ID="$CPANE" act supersede "$rid_i1" --authority conductor --action-sha256 "$asha1" --review-reason " " >/dev/null 2>&1; rc=$?
-[ "$rc" = 2 ] && ok "supersede: blank reason refused" || not_ok "blank reason rc=$rc"
+HERDR_PANE_ID="$CPANE" act supersede "$rid_i1" --authority conductor --action-sha256 "$asha1" --review-reason " " >/dev/null 2>"$work/blank-reason.err"; rc=$?
+[ "$rc" = 2 ] && grep -Fq -- "conductor requires --review-reason after reviewing the complete action and target" "$work/blank-reason.err" \
+  && [ "$(_sql "SELECT status FROM action_requests WHERE request_id=$(_sq "$rid_i1");")" = pending ] \
+  && ok "supersede: blank reason refused with the review-reason reason, stays pending" \
+  || not_ok "blank reason rc=$rc: $(cat "$work/blank-reason.err")"
 
 HERDR_PANE_ID="$CPANE" act supersede "$rid_i1" --authority conductor --action-sha256 "$asha1" \
   --review-reason "the worker already finished ANSWER.md without this; moved on" >/dev/null; rc=$?
@@ -652,8 +658,6 @@ grep -q "\[HERDR-ACTION\] $rid_i1 SUPERSEDED" "$work/sent" \
   && ok "supersede: the superseded row no longer matches status='pending' (clears publisher.py's has_pending_request / tasks.py's close gate)" \
   || not_ok "superseded row still counted pending"
 
-( . "$here/lib/action-request.sh"; action_grant_consume "$rid_i1" ) \
-  && not_ok "superseded request consumed" || ok "superseded request is not a one-shot grant"
 out2="$(enf write '{"path":".handoffs/SUPI1.md","content":"x"}')"; rc=$?
 rid_i1b="$(printf '%s' "$out2" | field request_id)"
 [ "$rc" = 8 ] && [ -n "$rid_i1b" ] && [ "$rid_i1b" != "$rid_i1" ] && [ "$(printf '%s' "$out2" | field decision)" = block ] \

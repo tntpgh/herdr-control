@@ -210,20 +210,22 @@ def hub_get(path: str):
         return json.load(r)
 
 
-def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict], dict[str, dict], dict[str, str]]:
+def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict], dict[str, dict], dict[str, str], set[str]]:
     """pane_birth per task, each task's newest input_required payload,
     (sparse -- only tasks herdr-mcp's tasks.py actually started remotely)
     its remote_task_id/verified/verify_detail for tasks[]'s SyncSchema
     extension, and (same sparseness) its agent_session -- the omp session
-    id changed_results() resolves into the "omp:transcript" source. The
-    Worker's own mapLocalState reads the remote_task_id/verified columns,
+    id changed_results() resolves into the "omp:transcript" source, plus
+    tasks with pending action requests, independent of historical menu asks.
+    The Worker's own mapLocalState reads the remote_task_id/verified columns,
     not a second computation here."""
     births: dict[str, str] = {}
     asks: dict[str, dict] = {}
     remotes: dict[str, dict] = {}
     sessions: dict[str, str] = {}
+    pending: set[str] = set()
     if not task_ids or not REGISTRY.exists():
-        return births, asks, remotes, sessions
+        return births, asks, remotes, sessions, pending
     con = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=5)
     try:
         has_v7 = rtasks.has_v7_task_columns(con)
@@ -257,16 +259,10 @@ def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict],
             except ValueError:
                 p = {}
             asks[tid] = {"at": at, "tool": p.get("tool"), "summary": p.get("message") or p.get("command")}
-        # remote-research-answer-approval (2026-10-02): a `--approval hook`
-        # task (research/explore) never paints an omp menu and so never
-        # writes an input_required event -- its escalations are
-        # action_requests rows (lib/action-request.sh) instead. Without this,
-        # Zero's list_blockers/get_task never saw a hook task stuck on a
-        # pending action, however long it waited. Only the newest PENDING
-        # request per task (a decided/withdrawn one is not a current
-        # blocker); never overrides an input_required ask, since the two
-        # sources are mutually exclusive per task (menu vs hook approval).
-        # Best-effort: a registry older than schema v6 has no such table.
+        # Pending requests are closure blockers regardless of input_required
+        # history. Keep the menu ask for presentation, but never let it mask
+        # pending membership. Only the newest pending request supplies the
+        # fallback ask; older registries may lack action_requests entirely.
         try:
             for tid, rid, tool, reason, at in con.execute(
                 f"""SELECT task_id, request_id, tool, reason, created_at FROM action_requests ar
@@ -275,6 +271,7 @@ def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict],
                                         WHERE task_id = ar.task_id AND status='pending')""",
                 task_ids,
             ):
+                pending.add(tid)
                 if tid in asks:
                     continue
                 outcome = con.execute(
@@ -292,7 +289,7 @@ def registry_rows(task_ids: list[str]) -> tuple[dict[str, str], dict[str, dict],
             pass
     finally:
         con.close()
-    return births, asks, remotes, sessions
+    return births, asks, remotes, sessions, pending
 
 
 def registry_owners() -> dict[str, dict]:
@@ -405,7 +402,7 @@ def build(now: datetime) -> tuple[dict, dict]:
             continue
         if t.get("state") not in TERMINAL or updated >= cutoff:
             raw_tasks.append(t)
-    births, asks, remotes, sessions = registry_rows([t["task_id"] for t in raw_tasks])
+    births, asks, remotes, sessions, pending = registry_rows([t["task_id"] for t in raw_tasks])
 
     tasks, worktrees, active_task_by_pane, extra_by_task = [], {}, {}, {}
     for t in raw_tasks:
@@ -441,19 +438,12 @@ def build(now: datetime) -> tuple[dict, dict]:
         if agent_live:
             active_task_by_pane.setdefault(pane, t["task_id"])
         remote = remotes.get(t["task_id"]) or {}
-        # F2 (security review round 2, 2026-10-04): LOCAL-only signals for
-        # the orchestrator's own close gate (tasks.py's
-        # _orchestrator_close_research), never sent to the Worker -- merged
-        # into by_id below, not into the public tasks.append dict. Mirrors
-        # the exact `ask and ask.get("kind")` gate the blockers loop below
-        # already uses for "this task has a pending action_request", so a
-        # hook-mode research worker waiting on one (which shows as neither
-        # live_blocked nor registry state blocked/stalled -- see that
-        # loop's own comment) is never treated as idle here either.
-        ask = asks.get(t["task_id"])
+        # Local-only closure signals, never sent to the Worker. Pending
+        # membership comes from action_requests, not ask presentation:
+        # input_required history does not mean a request was decided.
         extra_by_task[t["task_id"]] = {
             "pane_status": (live.get("agent_status") if live else None) if agent_live else None,
-            "has_pending_request": bool(ask and ask.get("kind")),
+            "has_pending_request": t["task_id"] in pending,
         }
         tasks.append({
             "task_id": t["task_id"], "run_id": t.get("run_id") or "", "label": t.get("label") or "",
@@ -493,25 +483,13 @@ def build(now: datetime) -> tuple[dict, dict]:
     for t in tasks:
         live_blocked = t["pane_id"] in blocked_panes if t["pane_id"] else False
         ask = asks.get(t["task_id"])
-        # A hook-approval task's pending action_request (see registry_rows)
-        # never shows up as live_blocked (no omp menu ever paints) or as
-        # registry state blocked/stalled -- the ask's own presence is the
-        # only signal it is stuck, so it must gate this loop too. But the
-        # OLD input_required source (menu mode) has no "resolved" event at
-        # all -- registry_rows grabs the newest input_required EVER, so an
-        # old, long-since-answered ask stayed in `asks` forever (F7,
-        # security review PR #220: a running AND a completed task with a
-        # stale menu ask both showed up as permanent blockers). Only the
-        # NEW, action_requests-sourced ask carries "kind" (set to
-        # "permission" at registry_rows, filtered to status='pending'
-        # there) -- gate on that, not on `ask`'s mere presence, so a stale
-        # menu ask never re-enters the set this clause used to exclude it
-        # from.
-        if not (live_blocked or t["state"] in ("blocked", "stalled") or (ask and ask.get("kind"))):
+        # Historical menu asks alone are not blockers, but a pending action
+        # request always is, even when the displayed ask comes from a menu.
+        if not (live_blocked or t["state"] in ("blocked", "stalled") or t["task_id"] in pending):
             continue
         blockers.append({
             "task_id": t["task_id"], "label": t["label"], "pane_id": t["pane_id"], "agent_id": t["agent_id"],
-            "kind": "permission" if live_blocked else ((ask or {}).get("kind") or t["state"]),
+            "kind": "permission" if live_blocked or t["task_id"] in pending else ((ask or {}).get("kind") or t["state"]),
             "tool": ask.get("tool") if ask else None,
             "summary": redact(str(ask["summary"]))[:240] if ask and ask.get("summary") else None,
             "since": iso(ask["at"]) if ask else t["updated_at"],
