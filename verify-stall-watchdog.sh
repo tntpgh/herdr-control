@@ -1109,6 +1109,8 @@ A4 = P("Cleaned up the temporary build directory.")
 X1 = P("Staged the release notes draft under docs/release/v1.4.2.md for review.")
 X2 = P("Left the old tag in place until the new one is confirmed.")
 STALE = P("Thinking...")
+SPINNER = P("\U000F12B7 Working\u2026")   # r2 L2: a lone omp spinner row —
+# the furniture conductor_prompt.py's `spinner` kind excludes from P.
 JOB = P("Background job 7 finished: lint passed with 0 warnings.")
 NARR = P("Noted the lint result; still waiting on the release script.")
 STILL = P("Still blocked: that reply was about the release script, not the index question.")
@@ -2170,6 +2172,22 @@ def _():
     w.run_to(FS + 2400)
     check("R26b_a_stale_sighting_inside_the_debounce_never_raises_the_floor",
           max((p for g, p in w.floors(t) if g == 1), default=None) == 2 and w.gens(t) == {1} and w.silent(t), w, t)
+
+@scen("R26c")
+def _():
+    w, t = std("r26c")
+    w.run_to(BASE + 118); w.show(t, ask())
+    w.run_to(BASE + 221); w.reply(t)
+    # Both reads below are OUTSIDE the 20s debounce from the reply, so each
+    # can write/ratchet the floor. r2 L2: if the spinner row counted toward
+    # P, the first read ratchets the floor to pre+2; the spinner then
+    # vanishes (the second read is pre+1, a DROP), `same_line` fails, and a
+    # false g2 is claimed. Excluding it (the fix) keeps both reads at pre+1.
+    w.run_to(BASE + 251); w.show(t, ask(A1, SPINNER))                   # +30s: pre+2 if spinner counts
+    w.run_to(BASE + 311); w.show(t, ask(A1))                            # +90s: spinner gone, pre+1
+    w.run_to(FS + 2400)
+    check("R26c_a_vanished_spinner_row_never_drops_the_floor_or_mints_g2",
+          w.silent(t) and w.gens(t) == {1}, w, t)
 
 @scen("R28")
 def _():
