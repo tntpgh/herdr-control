@@ -6,6 +6,8 @@
 #   close-done-workers.sh --apply --reason=no-follow-on
 #   close-done-workers.sh --apply --reason=shipped --task=task_abc \
 #     --proof="https://github.com/org/repo/pull/1 abc1234"
+#   close-done-workers.sh --apply --reason=superseded --task=task_old \
+#     --superseded-by=task_new --proof=".handoffs/PROOF.md#check"
 #
 # `--reason=shipped` needs `--pane=<id>` or `--task=<id>`: one proof cannot
 # honestly cover every closable task in a batch, so shipped scopes to
@@ -53,7 +55,7 @@ source "$HERE/lib/pane-guard.sh"
 # shellcheck source=lib/worktree-archive.sh
 source "$HERE/lib/worktree-archive.sh"
 
-apply=0; include_lost=0; closure_reason=""; closure_proof=""; pane_filter=""; task_filter=""; task_given=0
+apply=0; include_lost=0; closure_reason=""; closure_proof=""; pane_filter=""; task_filter=""; task_given=0; superseded_by=""
 for a in "$@"; do
   case "$a" in
     --apply) apply=1 ;;
@@ -63,10 +65,16 @@ for a in "$@"; do
     # states why these panes are closing, uniformly for the whole batch.
     # Mixed reasons across one run: filter panes and run it more than once.
     --reason=*) closure_reason="${a#--reason=}" ;;
+    # Rule 1 of the `superseded` close path (brief 2026-10-06): names the
+    # NEWER review-class task that supersedes this older one, both reviewing
+    # the same repo#PR. Required whenever --reason=superseded is given, in
+    # dry-run too -- a dry run with no --superseded-by previews nothing new
+    # and the plain "PR is OPEN" hold stands unchanged (item 6).
+    --superseded-by=*) superseded_by="${a#--superseded-by=}" ;;
     --proof=*) closure_proof="${a#--proof=}" ;;
     --pane=*) pane_filter="${a#--pane=}" ;;
     --task=*) task_filter="${a#--task=}"; task_given=1 ;;
-    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'close-done-workers: unknown flag %s\n' "$a" >&2; exit 1 ;;
   esac
 done
@@ -131,10 +139,30 @@ if [ "$apply" = 1 ] && case "$closure_reason" in shipped|abandoned|superseded) t
     exit 1
   fi
   proof_wt=$(_sql "SELECT worktree FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)
-  _valid_proof_ref "$closure_proof" "$proof_wt" || {
-    printf 'close-done-workers: --reason=%s requires --proof="<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the selected task'"'"'s worktree%s\n' "$closure_reason" "${_PROOF_REF_WHY:+ ($_PROOF_REF_WHY)}" >&2
-    exit 1
-  }
+  # `superseded`'s proof requirement depends on which of its two paths
+  # this one scoped row actually takes. With no --superseded-by at all,
+  # ONLY the older, CLOSED-unmerged `superseded` disposition is even
+  # reachable (_superseded_check never runs) — pre-check exactly like
+  # abandoned, so a missing/invalid proof refuses before any archiving,
+  # never after (review PR #249 r2 N3: skipping this unconditionally left
+  # a CLOSED+superseded run with no proof archiving first, then refused
+  # by set_task_state — fails closed but leaves an orphan archive dir).
+  # With --superseded-by given, which path applies is not yet known here
+  # (that needs a per-row GitHub lookup the main scan below does): the
+  # OPEN-PR bypass's own rules 1-4 (newer review, clean tree, provable
+  # ancestry, verified archive) already ARE the proof and need no
+  # separate --proof (review PR #249: "superseded must never require a
+  # merged-PR proof — the PR is OPEN by definition, so the proof is the
+  # archive and the newer task"); set_task_state re-checks that evidence
+  # itself and falls back to requiring a real proof for anything else,
+  # including this same CLOSED-unmerged disposition when --superseded-by
+  # happened to be given alongside it.
+  if [ "$closure_reason" != superseded ] || [ -z "$superseded_by" ]; then
+    _valid_proof_ref "$closure_proof" "$proof_wt" || {
+      printf 'close-done-workers: --reason=%s requires --proof="<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the selected task'"'"'s worktree%s\n' "$closure_reason" "${_PROOF_REF_WHY:+ ($_PROOF_REF_WHY)}" >&2
+      exit 1
+    }
+  fi
 fi
 
 panes_json=$(herdr pane list 2>/dev/null)
@@ -163,36 +191,75 @@ pane_live_birth() {
 }
 
 # _detached_pr_check <worktree> <run_id> <task_id> <repo_path> <repo_slug> \
-#                     <pr_number> <requested-reason> <apply:0|1>
+#                     <pr_number> <requested-reason> <apply:0|1> [superseded_by_task_id]
 #
 # Sets _DPR_REASON (HOLD text; empty means closable), _DPR_STATE (the PR's
 # gh state), _DPR_HEAD_SHA, _DPR_REF_SHA, _DPR_ARCHIVE_MANIFEST (path, or
-# empty when there was nothing to archive) — the caller prints all of these
-# regardless of outcome, which is this function's "log the tuple" contract.
+# empty when there was nothing to archive), _DPR_VIA ("superseded" when the
+# closure went through _superseded_check, empty otherwise) — the caller
+# prints all of these regardless of outcome, which is this function's "log
+# the tuple" contract.
 #
 # Order: (1) a PR must be named at all, (2) refs/pull/<N>/head on origin
 # must equal HEAD exactly — RECOVERABILITY, not delivery, (3) no tracked
 # changes and no untracked files (git plumbing, not `git status`, which
 # honors status.showUntrackedFiles=no), (4) GitHub's PR state — asked
 # BEFORE anything is archived, so an OPEN PR or a reason mismatch never
-# leaves a fresh archive dir behind (review r1 L4 of PR #236): OPEN or any
-# other state never closes, and under --apply the requested reason must
-# match it (MERGED only accepts shipped; CLOSED-unmerged only accepts
-# abandoned/superseded) or this still HOLDs, refusing to let a
-# default/batch reason quietly misdescribe what happened to the PR,
-# (5) every ignored artifact archived+verified (skipped when there are none;
-# regenerable dirs like node_modules are left in place and listed in the
-# manifest as EXCLUDED). A plain dry run (apply=0) never mutates the
-# filesystem — archiving included — and never requires the requested
-# reason to match: it previews pure eligibility; the printed state names
-# which reason --apply will require.
-_DPR_REASON=""; _DPR_STATE=""; _DPR_HEAD_SHA=""; _DPR_REF_SHA=""; _DPR_ARCHIVE_MANIFEST=""
+# leaves a fresh archive dir behind (review r1 L4 of PR #236): CLOSED never
+# closes without a matching reason, MERGED needs shipped; an OPEN PR is a
+# hold UNLESS --reason=superseded names a newer reviewing task via
+# [superseded_by_task_id], in which case _superseded_check (brief
+# 2026-10-06, "superseded close reason") runs its own stricter rule set
+# past the usual "PR is OPEN" fallthrough, (5) every ignored artifact
+# archived+verified (skipped when there are none; regenerable dirs like
+# node_modules are left in place and listed in the manifest as EXCLUDED).
+# A plain dry run (apply=0) never mutates the filesystem — archiving
+# included — and never requires the requested reason to match: it previews
+# pure eligibility; the printed state names which reason --apply will
+# require.
+_DPR_REASON=""; _DPR_STATE=""; _DPR_HEAD_SHA=""; _DPR_REF_SHA=""; _DPR_ARCHIVE_MANIFEST=""; _DPR_VIA=""
+# _archive_repo_base_why <archive_root> <repo_base_dir> <wt> -> prints a
+# refusal reason, or nothing. archive_root_why only ever resolved
+# $archive_root itself; $archive_root/$repo_base is `mkdir -p`'d separately
+# and was never checked again before this (review r3 F0/4b of PR #249): a
+# worker that had pre-planted $repo_base as a symlink into its own
+# worktree (or anywhere else) got its archive written through that link,
+# past every later check that trusts the archive directory's contents.
+# Refuses outright if $repo_base is itself a symlink, reuses
+# archive_root_why to catch a resolved target inside the worktree, and
+# separately requires the resolved path stay nested under the resolved
+# archive root.
+_archive_repo_base_why() {
+  local archive_root="$1" repo_base_dir="$2" wt="$3" why rr rb
+  if [ -L "$repo_base_dir" ]; then
+    printf '%s is a symlink, refusing to archive through it\n' "$repo_base_dir"
+    return 0
+  fi
+  why=$(archive_root_why "$repo_base_dir" "$wt")
+  if [ -n "$why" ]; then
+    printf '%s\n' "$why"
+    return 0
+  fi
+  if ! rr=$(cd "$archive_root" 2>/dev/null && pwd -P); then
+    printf 'cannot resolve the archive root %s\n' "$archive_root"
+    return 0
+  fi
+  if ! rb=$(cd "$repo_base_dir" 2>/dev/null && pwd -P); then
+    printf 'cannot resolve %s\n' "$repo_base_dir"
+    return 0
+  fi
+  case "$rb/" in
+    "$rr"/*) ;;
+    *) printf '%s resolves to %s, outside the archive root %s\n' "$repo_base_dir" "$rb" "$rr"; return 0 ;;
+  esac
+}
+
 _detached_pr_check() {
   local wt="$1" run_id="$2" task_id="$3" repo_path="$4" repo_slug="$5" pr_num="$6" \
-        want_reason="$7" apply="$8" \
+        want_reason="$7" apply="$8" superseded_by="${9:-}" \
         head_sha ref_sha td ut dirty files info state url oid repo_base ts archive_dir required \
         archive_root root_why
-  _DPR_REASON=""; _DPR_STATE=""; _DPR_HEAD_SHA=""; _DPR_REF_SHA=""; _DPR_ARCHIVE_MANIFEST=""
+  _DPR_REASON=""; _DPR_STATE=""; _DPR_HEAD_SHA=""; _DPR_REF_SHA=""; _DPR_ARCHIVE_MANIFEST=""; _DPR_VIA=""
 
   if [ -z "$repo_slug" ] || [ -z "$pr_num" ]; then
     _DPR_REASON="detached HEAD with no PR recorded (conductor must call set_task_review_pr before this can close)"
@@ -205,6 +272,34 @@ _detached_pr_check() {
     _DPR_REASON="could not resolve detached HEAD"
     return
   fi
+
+  # The `superseded` close path bypasses the strict ref/dirty gates below —
+  # which exist for "is this HEAD exactly the delivered commit" (merged) or
+  # "is this worktree pristine" recoverability, neither of which fits a
+  # still-OPEN PR a NEWER review has moved past. _superseded_check (brief
+  # 2026-10-06) does its own, looser rules instead: ancestor-of-the-CURRENT-
+  # PR-head (not equality), and dirty/untracked scoped to tmp/.handoffs. A
+  # CLOSED-unmerged PR keeps its OWN, older `superseded`/`abandoned`
+  # disposition below completely unchanged, whether or not --superseded-by
+  # happens to be set (review PR #249 M4: this used to HOLD outright on any
+  # non-OPEN state instead of falling through, silently breaking that older
+  # contract whenever the caller passed --superseded-by at all).
+  if [ "$want_reason" = superseded ] && [ -n "$superseded_by" ]; then
+    if ! info=$(_gh_pr_lookup "$repo_slug" --number "$pr_num") || [ -z "$info" ]; then
+      _DPR_REASON="could not determine PR state for $repo_slug#$pr_num (gh unavailable or failed)"
+      return
+    fi
+    IFS='|' read -r state url oid <<<"$info"
+    _DPR_STATE="$state"
+    if [ "$state" = OPEN ]; then
+      _superseded_check "$wt" "$run_id" "$task_id" "$repo_path" "$repo_slug" "$pr_num" \
+        "$head_sha" "$superseded_by" "$apply"
+      return
+    fi
+    # Not OPEN: fall through to the generic flow below, which already has
+    # $state and skips its own lookup.
+  fi
+
   ref_sha=$(git -C "$wt" ls-remote origin "refs/pull/$pr_num/head" 2>/dev/null | cut -f1)
   _DPR_REF_SHA="$ref_sha"
   if [ -z "$ref_sha" ]; then
@@ -226,12 +321,14 @@ _detached_pr_check() {
     return
   fi
 
-  if ! info=$(_gh_pr_lookup "$repo_slug" --number "$pr_num") || [ -z "$info" ]; then
-    _DPR_REASON="could not determine PR state for $repo_slug#$pr_num (gh unavailable or failed)"
-    return
+  if [ -z "$state" ]; then
+    if ! info=$(_gh_pr_lookup "$repo_slug" --number "$pr_num") || [ -z "$info" ]; then
+      _DPR_REASON="could not determine PR state for $repo_slug#$pr_num (gh unavailable or failed)"
+      return
+    fi
+    IFS='|' read -r state url oid <<<"$info"
+    _DPR_STATE="$state"
   fi
-  IFS='|' read -r state url oid <<<"$info"
-  _DPR_STATE="$state"
 
   case "$state" in
     MERGED) required=shipped ;;
@@ -274,7 +371,16 @@ _detached_pr_check() {
     # in the same second must never share, and truncate, one manifest
     # (review r2 M3 of PR #236).
     archive_dir="$archive_root/$repo_base/detached-pr-$pr_num-$ts-$$"
-    if ! mkdir -p "$archive_root/$repo_base" 2>/dev/null || ! mkdir "$archive_dir" 2>/dev/null; then
+    if ! mkdir -p "$archive_root/$repo_base" 2>/dev/null; then
+      _DPR_REASON="archiving ignored artifacts failed: could not create $archive_root/$repo_base"
+      return
+    fi
+    root_why=$(_archive_repo_base_why "$archive_root" "$archive_root/$repo_base" "$wt")
+    if [ -n "$root_why" ]; then
+      _DPR_REASON="$root_why"
+      return
+    fi
+    if ! mkdir "$archive_dir" 2>/dev/null; then
       _DPR_REASON="archiving ignored artifacts failed: could not create $archive_dir (or it already exists)"
       return
     fi
@@ -294,10 +400,234 @@ _detached_pr_check() {
   fi
 }
 
+# _superseded_check <worktree> <run_id> <task_id> <repo_path> <repo_slug> \
+#                    <pr_num> <old_head_sha> <superseded_by_task_id> <apply:0|1>
+#
+# The `superseded` close path (brief 2026-10-06): a review task whose PR is
+# still OPEN holds forever under the plain _detached_pr_check rules above,
+# even once a NEWER review of the exact same PR has made it redundant —
+# live examples w6G:pB/pC/pH/pM/pK in tntpgh-dev. This closes that one row
+# ONLY when every rule below holds; any failure sets _DPR_REASON (a HOLD,
+# never a close) and changes nothing on disk.
+#
+# Rule 1: both tasks review-class (label "review:..." or "deep-review:...",
+#   spawn-task.sh's two review job classes; every live example this closes
+#   is deep-review), reviewing the same
+#   repo#PR (compared via review_pr_repo/review_pr_number, the fields
+#   set_task_review_pr already stamps for a detached reviewer), and the
+#   named task was registered strictly after this one.
+# Rule 2: zero dirty TRACKED files anywhere, and zero untracked files
+#   outside tmp/ and .handoffs/ — those two dirs are what rule 4 archives;
+#   anything else uncommitted/untracked is real work this must not discard.
+# Rule 3: old HEAD is an ancestor of the PR's CURRENT refs/pull/<N>/head,
+#   fetched fresh (never trusted from a stale local ref) — recoverable via
+#   the newer review's own checkout, not merely "was reachable once". This
+#   ancestry check against a ref fetched straight from origin proves HEAD's
+#   own history is reachable from a remote object. A separate check reads
+#   the worktree's own HEAD reflog (review PR #249 M2): any commit left
+#   behind there by a stray local commit before re-detaching, not itself
+#   reachable from the fetched PR head or any remote, is real work the
+#   worktree-removal `git worktree remove` would otherwise destroy
+#   unrecoverably (that reflog lives only in the worktree's own private
+#   `logs/HEAD`, which no archive bundles today).
+# Rule 4: every ignored file in the worktree is archived — not merely the
+#   ones under tmp/ and .handoffs/ (review PR #249 M1: an ignored file
+#   anywhere else, e.g. .private/, was silently dropped) — split via the
+#   same archive_split_regenerable the generic detached path uses, unioned
+#   with the untracked files rule 2 already proved confined to
+#   tmp/.handoffs/. Each enumerator's own failure HOLDs rather than reading
+#   as "nothing to archive" (review PR #249 M3). Archived via the same
+#   copy-then-verify primitives _detached_pr_check uses, and the archive
+#   dir always gets a HEAD.txt naming the old head — proof of what exactly
+#   got superseded, independent of whether there was anything else to
+#   copy. Dry run (apply=0) never archives (never mutates the filesystem):
+#   it HOLDs when there is something that would need archiving, closable
+#   when there is nothing to archive and rules 1-3 already passed.
+# Rule 5: the caller (main loop below) records reason=superseded, this
+#   task's id, superseded_by, the old head, the fetched PR head, and the
+#   archive path in the state_changed event's detail payload — never
+#   `shipped`, and never reusing _detached_pr_check's own detached-pr-*
+#   archive naming (this uses superseded-*, a distinct lineage).
+_superseded_check() {
+  local wt="$1" run_id="$2" task_id="$3" repo_path="$4" repo_slug="$5" pr_num="$6" \
+        head_sha="$7" superseded_by="$8" apply="$9" \
+        old_json old_label old_created new_json new_label new_repo new_pr new_created \
+        td td_n ut outside pr_head reflog c cnt ign files repo_base ts archive_root root_why archive_dir
+  _DPR_REASON=""
+
+  old_json=$(read_task "$run_id" "$task_id" 2>/dev/null)
+  old_label=$(printf '%s' "$old_json" | jq -r '.label // ""' 2>/dev/null)
+  old_created=$(printf '%s' "$old_json" | jq -r '.created_at // ""' 2>/dev/null)
+  case "$old_label" in
+    review:*|deep-review:*) ;;
+    *) _DPR_REASON="this task (label=${old_label:-?}) is not review-class"; return ;;
+  esac
+
+  new_json=$(_sql "$(_task_json_select) WHERE task_id=$(_sq "$superseded_by") LIMIT 1;" 2>/dev/null)
+  if [ -z "$new_json" ]; then
+    _DPR_REASON="--superseded-by=$superseded_by does not match any registered task"
+    return
+  fi
+  new_label=$(printf '%s' "$new_json" | jq -r '.label // ""' 2>/dev/null)
+  new_repo=$(printf '%s' "$new_json" | jq -r '.review_pr_repo // ""' 2>/dev/null)
+  new_pr=$(printf '%s' "$new_json" | jq -r '.review_pr_number // ""' 2>/dev/null)
+  new_created=$(printf '%s' "$new_json" | jq -r '.created_at // ""' 2>/dev/null)
+  case "$new_label" in
+    review:*|deep-review:*) ;;
+    *) _DPR_REASON="--superseded-by=$superseded_by (label=${new_label:-?}) is not review-class"; return ;;
+  esac
+  if [ "$new_repo" != "$repo_slug" ] || [ "$new_pr" != "$pr_num" ]; then
+    _DPR_REASON="--superseded-by=$superseded_by reviews ${new_repo:-?}#${new_pr:-?}, not $repo_slug#$pr_num"
+    return
+  fi
+  if [ -z "$new_created" ] || [ -z "$old_created" ] || ! [[ "$new_created" > "$old_created" ]]; then
+    _DPR_REASON="--superseded-by=$superseded_by was not created after this task (new=${new_created:-?} old=${old_created:-?})"
+    return
+  fi
+
+  if ! td=$(archive_enumerate_tracked_dirty "$wt") || ! ut=$(archive_enumerate_untracked "$wt"); then
+    _DPR_REASON="git could not list tracked changes/untracked files"
+    return
+  fi
+  td_n=$(printf '%s\n' "$td" | grep -c .)
+  if [ "${td_n:-0}" != 0 ]; then
+    _DPR_REASON="$td_n uncommitted tracked file(s)"
+    return
+  fi
+  outside=$(printf '%s\n' "$ut" | grep -v '^$' | grep -vE '^(tmp/|\.handoffs/)')
+  if [ -n "$outside" ]; then
+    _DPR_REASON="$(printf '%s\n' "$outside" | grep -c .) untracked file(s) outside tmp/ and .handoffs/"
+    return
+  fi
+
+  if ! git -C "$wt" fetch -q origin "refs/pull/$pr_num/head" 2>/dev/null; then
+    _DPR_REASON="could not fetch refs/pull/$pr_num/head on origin"
+    return
+  fi
+  pr_head=$(git -C "$wt" rev-parse FETCH_HEAD 2>/dev/null)
+  _DPR_REF_SHA="$pr_head"
+  if [ -z "$pr_head" ]; then
+    _DPR_REASON="could not resolve refs/pull/$pr_num/head after fetch"
+    return
+  fi
+  if ! git -C "$wt" merge-base --is-ancestor "$head_sha" "$pr_head" 2>/dev/null; then
+    _DPR_REASON="HEAD ($head_sha) is not an ancestor of refs/pull/$pr_num/head ($pr_head) — not safely superseded"
+    return
+  fi
+  # Rule 3 also covers the HEAD reflog: a commit this worktree once checked
+  # out and left behind (e.g. a stray local commit before re-detaching at
+  # the PR head) lives ONLY in <common>/worktrees/<id>/logs/HEAD, which
+  # `git worktree remove` deletes outright — `merge-base --is-ancestor`
+  # above only proves the CURRENT HEAD's own history, never the reflog
+  # (review PR #249 M2). Any reflog entry that is neither an ancestor of
+  # the fetched PR head nor already on some other remote means real,
+  # unrecoverable work; fail closed on an unreadable reflog too.
+  if ! reflog=$(git -C "$wt" log -g --format=%H HEAD 2>/dev/null); then
+    _DPR_REASON="could not read the HEAD reflog"
+    return
+  fi
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    cnt=$(git -C "$wt" rev-list --count "$c" --not "$pr_head" --remotes 2>/dev/null)
+    case "$cnt" in
+      0) ;;
+      *)
+        _DPR_REASON="the HEAD reflog holds a commit ($c) not reachable from refs/pull/$pr_num/head or any remote — not safely superseded"
+        return
+        ;;
+    esac
+  done <<<"$reflog"
+  # Rules 1-3 all hold: this row IS going through the superseded path,
+  # regardless of what rule 4 (archiving) decides below — a dry run that
+  # finds nothing to archive is closable via superseded exactly as much as
+  # an --apply that archives something, and the caller's "(superseded)"
+  # marker must show for both, not only once archiving has actually run.
+  _DPR_VIA="superseded"
+  # No separate "exists on no remote" rev-list check: `fetch`d straight from
+  # origin, `pr_head` IS a remote object, and merge-base --is-ancestor above
+  # already proved HEAD's entire history is reachable from it — rule 3's
+  # "no commits that no remote contains" is satisfied BY that ancestry, not
+  # by a second check. A `--not --remotes` rev-list check was tried here and
+  # false-positived: `git fetch origin refs/pull/N/head` only updates
+  # FETCH_HEAD, never a refs/remotes/origin/* ref, so `--remotes` never sees
+  # commits that exist ONLY via a PR ref nobody has fetched into a tracking
+  # branch — exactly this function's own normal case.
+
+  # Rule 4 covers every ignored file in the worktree, not only ones under
+  # tmp/ or .handoffs/ — a client-data file under .private/ or a stray
+  # ignored file elsewhere is exactly the "real, unrecoverable work" rule 2
+  # already refuses to discard when it is merely untracked; being ignored
+  # must never be a loophole past that (review PR #249 M1). Split it the
+  # same way the generic detached path does: a regenerable dir (e.g.
+  # node_modules) is excluded-and-recorded, never copied; everything else
+  # is archived. The untracked half ($ut) is already proven confined to
+  # tmp/.handoffs/ by rule 2 above, so it is unioned in as-is. Each
+  # enumerator's own failure HOLDs instead of silently reading as "nothing
+  # to archive" (review PR #249 M3).
+  if ! ign=$(archive_enumerate_ignored "$wt") || ! archive_split_regenerable "$ign"; then
+    _DPR_REASON="could not list ignored artifacts"
+    return
+  fi
+  files=$(printf '%s\n%s\n' "$_ARCHIVE_KEEP" "$ut" | grep -v '^$' | sort -u)
+
+  if [ "$apply" != 1 ]; then
+    if [ -n "$files" ]; then
+      _DPR_REASON="$(printf '%s\n' "$files" | grep -c .) artifact(s) not yet archived (rerun with --apply to archive and close)"
+    fi
+    return
+  fi
+
+  repo_base="$(basename "$repo_path")"
+  [ -n "$repo_base" ] || repo_base="unknown-repo"
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  archive_root="${HERDR_ARCHIVE_ROOT:-$HOME/Code/.archive/worktrees}"
+  root_why=$(archive_root_why "$archive_root" "$wt")
+  if [ -n "$root_why" ]; then
+    _DPR_REASON="$root_why"
+    return
+  fi
+  # superseded-* names this archive lineage distinctly from
+  # _detached_pr_check's own detached-pr-*; unique per run (pid), never -p,
+  # for the same reason given there.
+  archive_dir="$archive_root/$repo_base/superseded-$pr_num-$ts-$$"
+  if ! mkdir -p "$archive_root/$repo_base" 2>/dev/null; then
+    _DPR_REASON="archiving failed: could not create $archive_root/$repo_base"
+    return
+  fi
+  root_why=$(_archive_repo_base_why "$archive_root" "$archive_root/$repo_base" "$wt")
+  if [ -n "$root_why" ]; then
+    _DPR_REASON="$root_why"
+    return
+  fi
+  if ! mkdir "$archive_dir" 2>/dev/null; then
+    _DPR_REASON="archiving failed: could not create $archive_dir (or it already exists)"
+    return
+  fi
+  if [ -n "$files" ]; then
+    if ! archive_copy_and_manifest "$wt" "$archive_dir" "$files"; then
+      _DPR_REASON="archiving failed: $_ARCHIVE_WHY"
+      return
+    fi
+    if ! archive_verify_manifest "$wt" "$_ARCHIVE_MANIFEST"; then
+      _DPR_REASON="archive verification failed: $_ARCHIVE_WHY"
+      return
+    fi
+  fi
+  if ! archive_record_exclusions "$archive_dir" "$_ARCHIVE_EXCLUDED"; then
+    _DPR_REASON="$_ARCHIVE_WHY"
+    return
+  fi
+  if ! printf '%s\n' "$head_sha" > "$archive_dir/HEAD.txt" 2>/dev/null; then
+    _DPR_REASON="could not write HEAD.txt to $archive_dir"
+    return
+  fi
+  _DPR_ARCHIVE_MANIFEST="$archive_dir"
+}
+
 closable=0; held=0; refused=0
 while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_pr_repo review_pr_number; do
   [ -n "$pane" ] || continue
-  dpr_tuple=""; dpr_detail=""
+  dpr_tuple=""; dpr_detail=""; _DPR_VIA=""
   if [ "$panes_ok" != 1 ]; then
     reason="herdr pane list is unavailable or unparseable; status cannot be verified"
   else
@@ -368,12 +698,22 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
       # Detached HEAD: no branch, no upstream, nothing the checks above can
       # evaluate. Closable only via the stricter PR-recoverability path.
       _detached_pr_check "$wt" "$run_id" "$task_id" "$repo" "$review_pr_repo" "$review_pr_number" \
-        "$closure_reason" "$apply"
+        "$closure_reason" "$apply" "$superseded_by"
       reason="$_DPR_REASON"
-      dpr_tuple="pr=${review_pr_repo:-?}#${review_pr_number:-?} head=${_DPR_HEAD_SHA:-?} ref=${_DPR_REF_SHA:-?} state=${_DPR_STATE:-?} archive=${_DPR_ARCHIVE_MANIFEST:-none}"
-      dpr_detail=$(jq -nc --arg pr "${review_pr_repo}#${review_pr_number}" --arg head "$_DPR_HEAD_SHA" \
-        --arg ref "$_DPR_REF_SHA" --arg state "$_DPR_STATE" --arg archive "$_DPR_ARCHIVE_MANIFEST" \
-        '{detached_close: {pr: $pr, head: $head, ref: $ref, state: $state, archive: $archive}}')
+      dpr_tuple="pr=${review_pr_repo:-?}#${review_pr_number:-?} head=${_DPR_HEAD_SHA:-?} ref=${_DPR_REF_SHA:-?} state=${_DPR_STATE:-?} archive=${_DPR_ARCHIVE_MANIFEST:-none}${_DPR_VIA:+ via=$_DPR_VIA}"
+      if [ "$_DPR_VIA" = superseded ]; then
+        # Rule 5: record old/new task ids and superseded_by alongside the
+        # usual pr/head/ref/archive tuple — never a `shipped` detail shape.
+        dpr_detail=$(jq -nc --arg pr "${review_pr_repo}#${review_pr_number}" --arg head "$_DPR_HEAD_SHA" \
+          --arg ref "$_DPR_REF_SHA" --arg state "$_DPR_STATE" --arg archive "$_DPR_ARCHIVE_MANIFEST" \
+          --arg old_task "$task_id" --arg superseded_by "$superseded_by" \
+          '{superseded_close: {pr: $pr, old_head: $head, pr_head: $ref, state: $state, archive: $archive,
+            old_task: $old_task, superseded_by: $superseded_by}}')
+      else
+        dpr_detail=$(jq -nc --arg pr "${review_pr_repo}#${review_pr_number}" --arg head "$_DPR_HEAD_SHA" \
+          --arg ref "$_DPR_REF_SHA" --arg state "$_DPR_STATE" --arg archive "$_DPR_ARCHIVE_MANIFEST" \
+          '{detached_close: {pr: $pr, head: $head, ref: $ref, state: $state, archive: $archive}}')
+      fi
     fi
   fi
 
@@ -384,7 +724,7 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
     continue
   fi
   closable=$((closable+1))
-  printf '  close  %-8s %-46s (%s)\n' "$pane" "$label" "$st"
+  printf '  close  %-8s %-46s (%s)%s\n' "$pane" "$label" "$st" "${_DPR_VIA:+ (superseded)}"
   [ -n "$dpr_tuple" ] && printf '         %-8s %-46s %s\n' '' '' "$dpr_tuple"
   [ "$apply" = 1 ] || continue
 

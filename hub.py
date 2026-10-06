@@ -3269,10 +3269,13 @@ def spec_checklist(worktree: str | None) -> tuple[list[dict], str | None]:
 
 # A closure reason that means the project's story is DONE, not merely that
 # its latest worker exited. Set only by a real `set_task_state … completed
-# <reason>` call, which already required a valid proof reference
-# (lib/run-registry.sh's closure-reason gate, item 1) — a stronger signal
-# than an unticked SPEC.md checkbox, which a worker is never required to
-# maintain. `handed_off_to:<x>` is matched by prefix (the `<x>` varies).
+# <reason>` call, which required either a valid proof reference
+# (lib/run-registry.sh's closure-reason gate, item 1) or, for
+# `reason=superseded`, registry-verified evidence that a newer review task
+# made this PR's review redundant (`_valid_superseded_detail`, PR #249) —
+# a stronger signal than an unticked SPEC.md checkbox, which a worker is
+# never required to maintain. `handed_off_to:<x>` is matched by prefix
+# (the `<x>` varies).
 _CLOSED_REASONS = frozenset(("shipped", "canceled", "no-follow-on"))
 
 
@@ -3515,8 +3518,11 @@ def projects_data() -> dict:
         # read as "no live worker" and page Main anyway.
         task_states = [t.get("stored_state") or t.get("state") for t in ptasks]
         # The LATEST task's closure — set only by a real `set_task_state …
-        # completed <reason>` call, which already required a valid proof
-        # reference (lib/run-registry.sh's closure-reason gate, item 1). A
+        # completed <reason>` call, which required either a valid proof
+        # reference (lib/run-registry.sh's closure-reason gate, item 1) or,
+        # for `reason=superseded`, registry-verified evidence that a newer
+        # review task made this PR's review redundant
+        # (`_valid_superseded_detail`, PR #249). A
         # project whose most recent task closed shipped/canceled/no-follow-on
         # or was handed off has a definitive, human-reviewed outcome; SPEC.md
         # checkboxes are not re-derived against it because workers are not

@@ -1196,6 +1196,536 @@ row "$out" "$W" | grep -q HOLD && row "$out" "$W" | grep -qi 'liveness cannot be
   && ok "T6: it still HOLDs (fail-closed), falling back to the default retry cap" || bad "T6 output: $out"
 present "T6" "$W"
 
+#######################################################################
+# Section U: close-done-workers.sh --reason=superseded (brief 2026-10-06,
+# "superseded close reason" — form 20261006T121930-8789, "build"). A review
+# task's PR is still OPEN but a NEWER review of the exact same PR made it
+# redundant (live examples w6G:pB/pC/pH/pM/pK in tntpgh-dev); every rule
+# below is a hold, never a shim, and dry-run never mutates anything.
+#######################################################################
+printf '\n== Section U: close-done-workers.sh --reason=superseded ==\n'
+
+U_TMP="$TMP/U"; mkdir -p "$U_TMP"
+U_ORIGIN="$U_TMP/origin.git"
+git init -q --bare "$U_ORIGIN"
+U_WORK="$U_TMP/work"
+git init -q -b main "$U_WORK"
+G -C "$U_WORK" commit -q --allow-empty -m init
+printf 'tmp/\n.handoffs/\n' > "$U_WORK/.gitignore"
+git -C "$U_WORK" add .gitignore
+G -C "$U_WORK" commit -q -m gitignore
+git -C "$U_WORK" remote add origin "$U_ORIGIN"
+git -C "$U_WORK" push -q origin main
+U_WT_ROOT="$U_TMP/worktrees"; mkdir -p "$U_WT_ROOT"
+
+# _u_case <old-label> <new-label> -> fresh org/repo#<N> PR (own GH_PRS line,
+# own refs/pull/<N>/head), an OLD review task detached at the PR head
+# (created_at backdated to 2020, so any default-timestamped NEW task sorts
+# after it) and a NEW task reviewing the same PR. Sets U_PR, U_PR_SHA,
+# U_WT, U_RUN/U_TASK (old), U_NEWRUN/U_NEWTASK (new).
+_u_n=0
+_u_case() {
+  _u_n=$((_u_n + 1))
+  local n br seed
+  n=$((9000 + _u_n))
+  br="pr-u$n"
+  seed="$U_TMP/seed-$n"
+  GH_PRS="$GH_PRS
+org/repo#$n $br OPEN -"
+  G -C "$U_WORK" worktree add -q -b "$br" "$seed" main
+  G -C "$seed" commit -q --allow-empty -m "$br work"
+  G -C "$seed" push -q origin "$br:refs/pull/$n/head"
+  U_PR="$n"
+  U_PR_SHA=$(git -C "$seed" rev-parse HEAD)
+  git -C "$U_WORK" worktree remove --force "$seed" >/dev/null 2>&1
+
+  U_WT="$U_WT_ROOT/wt-$n"
+  git -C "$U_WORK" worktree add -q --detach "$U_WT" "$U_PR_SHA"
+  U_RUN="runU$n"; U_TASK="taskU$n"
+  register_task "$U_RUN" "$U_TASK" w c cp cb pD birthD-live "$U_WORK" "$U_WT" "${1:-review:old-$n}" \
+    || bad "U setup: register $U_TASK"
+  set_task_state "$U_RUN" "$U_TASK" running || bad "U setup: $U_TASK -> running"
+  set_task_review_pr "$U_RUN" "$U_TASK" org/repo "$n" || bad "U setup: set_task_review_pr $U_TASK"
+  sqlite3 "$(registry_db)" "UPDATE tasks SET created_at='2020-01-01T00:00:00Z' WHERE task_id='$U_TASK';"
+
+  U_NEWRUN="runU${n}n"; U_NEWTASK="taskU${n}n"
+  register_task "$U_NEWRUN" "$U_NEWTASK" w c cp cb "pDn$n" "birthDn$n" "$U_WORK" "/does/not/exist" "${2:-review:new-$n}" \
+    || bad "U setup: register $U_NEWTASK"
+  set_task_state "$U_NEWRUN" "$U_NEWTASK" running || bad "U setup: $U_NEWTASK -> running"
+  set_task_review_pr "$U_NEWRUN" "$U_NEWTASK" org/repo "$n" || bad "U setup: set_task_review_pr $U_NEWTASK"
+}
+
+printf -- '-- rule 1: both review-class, same repo#PR, newer created after older --\n'
+
+_u_case "implement:old-r1a" "review:new-r1a"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'not review-class' \
+  && ok "U rule1a: old task not review-class HOLDs" || bad "U rule1a output: $out"
+
+_u_case "review:old-r1b" "implement:new-r1b"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'not review-class' \
+  && ok "U rule1b: --superseded-by task not review-class HOLDs" || bad "U rule1b output: $out"
+
+_u_case "review:old-r1c-a" "review:new-r1c-a"; r1c_old="$U_TASK"
+_u_case "review:old-r1c-b" "review:new-r1c-b"; r1c_cross_new="$U_NEWTASK"
+out=$(bash "$here/close-done-workers.sh" --task="$r1c_old" --reason=superseded --superseded-by="$r1c_cross_new" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'reviews .*, not' \
+  && ok "U rule1c: --superseded-by reviewing a DIFFERENT PR HOLDs" || bad "U rule1c output: $out"
+
+_u_case "review:old-r1d" "review:new-r1d"
+sqlite3 "$(registry_db)" "UPDATE tasks SET created_at='2019-01-01T00:00:00Z' WHERE task_id='$U_NEWTASK';"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'was not created after' \
+  && ok "U rule1d: --superseded-by NOT created after this task HOLDs" || bad "U rule1d output: $out"
+
+printf -- '-- rule 2: zero dirty tracked files, zero untracked files outside tmp/.handoffs --\n'
+
+_u_case "review:old-r2a" "review:new-r2a"
+printf 'tmp/\n.handoffs/\nextra\n' > "$U_WT/.gitignore"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'uncommitted tracked file' \
+  && ok "U rule2a: a dirty TRACKED file HOLDs" || bad "U rule2a output: $out"
+
+_u_case "review:old-r2b" "review:new-r2b"
+printf 'x\n' > "$U_WT/stray.txt"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'untracked file(s) outside tmp/ and .handoffs/' \
+  && ok "U rule2b: an untracked file outside tmp/.handoffs HOLDs" || bad "U rule2b output: $out"
+
+printf -- '-- rule 3: old HEAD must be an ancestor of the CURRENT refs/pull/<N>/head --\n'
+
+_u_case "review:old-r3" "review:new-r3"
+# force refs/pull/<N>/head back to main's tip -- an ANCESTOR of old's HEAD,
+# never the other way, so old's HEAD is no longer an ancestor of the ref.
+G -C "$U_WORK" push -q --force origin "main:refs/pull/$U_PR/head"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'is not an ancestor of' \
+  && ok "U rule3: HEAD no longer an ancestor of refs/pull/<N>/head HOLDs" || bad "U rule3 output: $out"
+
+printf -- '-- rule 4: the archive dir must outlive the worktree; dry run never archives --\n'
+
+_u_case "review:old-r4" "review:new-r4"
+mkdir -p "$U_WT/.handoffs"
+printf 'verified: ran the check, output attached\n' > "$U_WT/.handoffs/PROOF.md"
+out=$(HERDR_ARCHIVE_ROOT="$U_WT/.archive-under-wt" bash "$here/close-done-workers.sh" --apply --reason=superseded \
+  --task="$U_TASK" --superseded-by="$U_NEWTASK" --proof=".handoffs/PROOF.md#check" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'inside this worktree' \
+  && ok "U rule4: an archive root beneath the worktree HOLDs" || bad "U rule4 output: $out"
+check "U rule4: task untouched by the refused archive root" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+printf -- '-- dry run: nothing to archive and rules 1-3 pass -> closable, never mutates the filesystem --\n'
+
+_u_case "review:old-dry" "review:new-dry"
+: > "$CALLS"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q '^  close' && printf '%s' "$out" | grep -q '(superseded)' \
+  && ok "U dry-run: closable with the (superseded) marker, no --apply needed" || bad "U dry-run output: $out"
+check "U dry-run: task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+[ -d "$HERDR_ARCHIVE_ROOT" ] && find "$HERDR_ARCHIVE_ROOT" -maxdepth 2 -type d -name 'superseded-*' 2>/dev/null | grep -q . \
+  && bad "U dry-run: an archive dir was created despite no --apply" \
+  || ok "U dry-run: no superseded-* archive dir exists yet"
+grep -q '^pane close$' "$CALLS" && bad "U dry-run: a pane was closed on a dry run" \
+  || ok "U dry-run: no pane close for the dry run"
+
+printf -- '-- positive: every rule holds -> --apply archives tmp/.handoffs, writes HEAD.txt, closes, records reason=superseded --\n'
+
+_u_case "review:old-pos" "review:new-pos"
+mkdir -p "$U_WT/tmp" "$U_WT/.handoffs"
+printf 'pos notes\n' > "$U_WT/tmp/notes.md"
+exp_pos_sha=$(shasum -a 256 "$U_WT/tmp/notes.md" | cut -d' ' -f1)
+printf 'verified: ran the check, output attached\n' > "$U_WT/.handoffs/PROOF.md"
+: > "$CALLS"
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" --superseded-by="$U_NEWTASK" \
+  --proof=".handoffs/PROOF.md#check" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U positive: --apply exits 0" || bad "U positive exit $rc: $out"
+check "U positive: old task completed" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "completed"
+_uev() { sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.$1') FROM events WHERE task_id='$U_TASK' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';"; }
+check "U positive: reason recorded is superseded, never shipped" "$(_uev reason)" "superseded"
+check "U positive: detail records the old task id" "$(_uev detail.superseded_close.old_task)" "$U_TASK"
+check "U positive: detail records superseded_by" "$(_uev detail.superseded_close.superseded_by)" "$U_NEWTASK"
+check "U positive: detail records the old head" "$(_uev detail.superseded_close.old_head)" "$U_PR_SHA"
+grep -q '^pane close$' "$CALLS" && ok "U positive: pane close was called" || bad "U positive: no pane close: $(cat "$CALLS")"
+u_archive_dir=$(find "$HERDR_ARCHIVE_ROOT" -maxdepth 2 -type d -name "superseded-$U_PR-*" 2>/dev/null | head -1)
+[ -n "$u_archive_dir" ] && [ -f "$u_archive_dir/HEAD.txt" ] \
+  && ok "U positive: archive dir exists with HEAD.txt" || bad "U positive: no archive dir/HEAD.txt: $out"
+[ "$(cat "$u_archive_dir/HEAD.txt" 2>/dev/null)" = "$U_PR_SHA" ] \
+  && ok "U positive: HEAD.txt names the exact old head sha" || bad "U positive: HEAD.txt wrong: $(cat "$u_archive_dir/HEAD.txt" 2>&1)"
+_manifest_has "$u_archive_dir/MANIFEST.sha256" "$exp_pos_sha" "tmp/notes.md" \
+  && ok "U positive: tmp/notes.md archived with a matching sha256 in the manifest" \
+  || bad "U positive: manifest missing/mismatched: $(cat "$u_archive_dir/MANIFEST.sha256" 2>&1)"
+
+check "U positive: detail records pr_head" "$(_uev detail.superseded_close.pr_head)" "$U_PR_SHA"
+
+printf -- '-- H1: deep-review:* is accepted on both sides (every live example is deep-review) --\n'
+
+_u_case "deep-review:old-h1" "deep-review:new-h1"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q '^  close' && printf '%s' "$out" | grep -q '(superseded)' \
+  && ok "U H1: deep-review:* labels on both sides are accepted (closable)" || bad "U H1 output: $out"
+
+printf -- '-- mutant M3: same PR NUMBER in a DIFFERENT repo HOLDs, never "reviews the same PR" --\n'
+
+_u_case "review:old-repocmp" "review:new-repocmp"
+sqlite3 "$(registry_db)" "UPDATE tasks SET review_pr_repo='org/other-repo' WHERE task_id='$U_NEWTASK';"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'reviews org/other-repo#.*, not org/repo#' \
+  && ok "U rule1 (mutant M3): same PR# in a DIFFERENT repo HOLDs" || bad "U rule1 (mutant M3) output: $out"
+
+printf -- '-- M1: an ignored file OUTSIDE tmp/.handoffs (.private/) is archived, never silently dropped --\n'
+
+echo '.private/' >> "$(git -C "$U_WORK" rev-parse --path-format=absolute --git-common-dir)/info/exclude"
+_u_case "review:old-m1" "review:new-m1"
+mkdir -p "$U_WT/.private" "$U_WT/.handoffs"
+printf 'ignored note outside tmp/.handoffs\n' > "$U_WT/.private/notes.txt"
+exp_private_sha=$(shasum -a 256 "$U_WT/.private/notes.txt" | cut -d' ' -f1)
+printf 'verified: ran the check, output attached\n' > "$U_WT/.handoffs/PROOF.md"
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" --superseded-by="$U_NEWTASK" \
+  --proof=".handoffs/PROOF.md#check" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U M1: --apply closes despite an ignored file outside tmp/.handoffs" || bad "U M1 exit $rc: $out"
+check "U M1: task completed" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "completed"
+m1_archive_dir=$(find "$HERDR_ARCHIVE_ROOT" -maxdepth 2 -type d -name "superseded-$U_PR-*" 2>/dev/null | head -1)
+_manifest_has "$m1_archive_dir/MANIFEST.sha256" "$exp_private_sha" ".private/notes.txt" \
+  && ok "U M1: .private/notes.txt is archived with a matching sha256, never dropped" \
+  || bad "U M1: manifest missing .private/notes.txt: $(cat "$m1_archive_dir/MANIFEST.sha256" 2>&1)"
+
+printf -- '-- M3: rule-4 enumeration failing HOLDs, never reads as "nothing to archive" --\n'
+
+_u_case "review:old-m3" "review:new-m3"
+mkdir -p "$U_WT/.handoffs"
+printf 'verified: ran the check, output attached\n' > "$U_WT/.handoffs/PROOF.md"
+M3_BIN="$U_TMP/m3bin"; mkdir -p "$M3_BIN"
+REAL_GIT=$(command -v git)
+cat > "$M3_BIN/git" <<EOF
+#!/bin/bash
+if [ "\$1" = "-C" ] && [ "\$3" = "ls-files" ]; then
+  case "\$*" in
+    *--ignored*) exit 128 ;;
+  esac
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$M3_BIN/git"
+out=$(PATH="$M3_BIN:$PATH" bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" \
+  --superseded-by="$U_NEWTASK" --proof=".handoffs/PROOF.md#check" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'could not list ignored artifacts' \
+  && ok "U M3: a failing ignored-file enumeration HOLDs, never reads as nothing to archive" || bad "U M3 output: $out"
+check "U M3: task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+printf -- '-- M2: a reflog-only commit (left behind by re-detaching) HOLDs --\n'
+
+_u_case "review:old-m2" "review:new-m2"
+G -C "$U_WT" commit -q --allow-empty -m "stray local commit, later abandoned"
+git -C "$U_WT" checkout -q --detach "$U_PR_SHA"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'reflog holds a commit' \
+  && ok "U M2: a reflog-only commit left by re-detaching HOLDs" || bad "U M2 output: $out"
+
+printf -- '-- M4: a CLOSED-unmerged PR keeps closing via --reason=superseded, with or without --superseded-by (regression) --\n'
+
+_u_m4_mk() {                    # CLOSED-PR fixture -> U_M4_WT/U_M4_RUN/U_M4_TASK/U_M4_SHA/U_M4_N
+  _u_n=$((_u_n + 1))
+  local n br seed
+  n=$((9000 + _u_n)); br="pr-u$n"; seed="$U_TMP/seed-$n"
+  GH_PRS="$GH_PRS
+org/repo#$n $br CLOSED -"
+  G -C "$U_WORK" worktree add -q -b "$br" "$seed" main
+  G -C "$seed" commit -q --allow-empty -m "$br work"
+  G -C "$seed" push -q origin "$br:refs/pull/$n/head"
+  U_M4_N="$n"
+  U_M4_SHA=$(git -C "$seed" rev-parse HEAD)
+  git -C "$U_WORK" worktree remove --force "$seed" >/dev/null 2>&1
+  U_M4_WT="$U_WT_ROOT/wt-$n"
+  git -C "$U_WORK" worktree add -q --detach "$U_M4_WT" "$U_M4_SHA"
+  mkdir -p "$U_M4_WT/.handoffs"
+  printf 'verified: ran the check, output attached\n' > "$U_M4_WT/.handoffs/PROOF.md"
+  U_M4_RUN="runU$n"; U_M4_TASK="taskU$n"
+  register_task "$U_M4_RUN" "$U_M4_TASK" w c cp cb pD birthD-live "$U_WORK" "$U_M4_WT" "review:old-$n" \
+    || bad "U M4 setup: register $U_M4_TASK"
+  set_task_state "$U_M4_RUN" "$U_M4_TASK" running || bad "U M4 setup: $U_M4_TASK -> running"
+  set_task_review_pr "$U_M4_RUN" "$U_M4_TASK" org/repo "$n" || bad "U M4 setup: set_task_review_pr $U_M4_TASK"
+}
+
+_u_m4_mk
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_M4_TASK" \
+  --proof=".handoffs/PROOF.md#check" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U M4: CLOSED + superseded with NO --superseded-by still closes (regression)" \
+  || bad "U M4 (no flag) exit $rc: $out"
+check "U M4: task completed (no flag)" "$(read_task "$U_M4_RUN" "$U_M4_TASK" | jq -r .state)" "completed"
+_uev4a() { sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.$1') FROM events WHERE task_id='$U_M4_TASK' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';"; }
+[ "$(_uev4a detail.detached_close.state)" = CLOSED ] \
+  && ok "U M4: closed via the GENERIC path (detached_close), not the bypass (no flag)" \
+  || bad "U M4: wrong detail shape (no flag): $(_uev4a detail.detached_close.state)"
+
+_u_m4_mk
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_M4_TASK" \
+  --superseded-by=does-not-exist-task --proof=".handoffs/PROOF.md#check" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U M4 (mutant M17/M19): CLOSED + superseded WITH --superseded-by still closes via the generic path" \
+  || bad "U M4 (with flag) exit $rc: $out"
+check "U M4: task completed (with flag)" "$(read_task "$U_M4_RUN" "$U_M4_TASK" | jq -r .state)" "completed"
+_uev4b() { sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.$1') FROM events WHERE task_id='$U_M4_TASK' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';"; }
+[ "$(_uev4b detail.detached_close.state)" = CLOSED ] \
+  && ok "U M4 (mutant M17/M19): the OPEN-only gate kept --superseded-by from re-routing a CLOSED PR" \
+  || bad "U M4: wrong detail shape (with flag): $(_uev4b detail.detached_close.state)"
+
+printf -- '-- M12: the live source changing mid-archive fails manifest verification, never closes --\n'
+
+_u_case "review:old-m12" "review:new-m12"
+mkdir -p "$U_WT/tmp"
+printf 'original content\n' > "$U_WT/tmp/notes.md"
+cat > "$U_TMP/m12-hook.sh" <<EOF
+printf 'mutated after the copy-time hash\n' > "$U_WT/tmp/notes.md"
+EOF
+out=$(PATH="$HOOKPATH" HOOK_FILE="$U_TMP/m12-hook.sh" bash "$here/close-done-workers.sh" --apply --reason=superseded \
+  --task="$U_TASK" --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'verification failed' \
+  && ok "U M12: the source changing mid-archive fails verification, never closes" || bad "U M12 output: $out"
+check "U M12: task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+printf -- '-- mutant M18: --superseded-by is ignored unless --reason=superseded (opt-in gate) --\n'
+
+_u_case "review:old-m18" "review:new-m18"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=no-follow-on --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'not yet closable' \
+  && ok "U mutant M18: --superseded-by with --reason=no-follow-on never engages the bypass" || bad "U mutant M18 output: $out"
+
+printf -- '-- N1 (mutant P1): set_task_state refuses a forged, empty or missing superseded_close detail --\n'
+
+_u_case "review:old-n1" "review:new-n1"
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" \
+  "$(jq -nc --arg t "$U_TASK" '{superseded_close:{old_task:$t, superseded_by:"does-not-exist", old_head:"deadbeef", archive:"/no/such/dir", pr:"org/repo#1"}}')" 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "U N1 (mutant P1): a forged superseded_close (fake superseded_by/archive) is REFUSED" \
+  || bad "U N1 forged: rc=$rc $out"
+check "U N1: task untouched (forged)" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" '{"superseded_close":{}}' 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "U N1 (mutant P1): an empty superseded_close is REFUSED" || bad "U N1 empty: rc=$rc $out"
+check "U N1: task untouched (empty)" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "" 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "U N1 (mutant P1): a missing detail (no superseded_close at all) is REFUSED" || bad "U N1 missing: rc=$rc $out"
+check "U N1: task untouched (missing)" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+printf -- '-- N1 (mutant P2): the OPEN-PR bypass completes with NO --proof at all --\n'
+
+_u_case "review:old-noproof" "review:new-noproof"
+mkdir -p "$U_WT/tmp"
+printf 'no proof needed, the bypass evidence is\n' > "$U_WT/tmp/notes.md"
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" --superseded-by="$U_NEWTASK" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U N1 (mutant P2): --apply closes with NO --proof at all" || bad "U N1 (mutant P2) exit $rc: $out"
+check "U N1 (mutant P2): task completed" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "completed"
+_uevnp() { sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.$1') FROM events WHERE task_id='$U_TASK' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';"; }
+[ -z "$(_uevnp proof)" ] && ok "U N2: no unchecked proof lands in the audit row when none was given" \
+  || bad "U N2: proof field present with nothing given: $(_uevnp proof)"
+
+printf -- '-- mutant M1b: a regenerable ignored dir is recorded EXCLUDED, never silently dropped --\n'
+
+echo 'node_modules' >> "$(git -C "$U_WORK" rev-parse --path-format=absolute --git-common-dir)/info/exclude"
+_u_case "review:old-m1b" "review:new-m1b"
+mkdir -p "$U_WT/node_modules/pkg" "$U_WT/tmp"
+printf 'module.exports = 1\n' > "$U_WT/node_modules/pkg/index.js"
+printf 'keep me\n' > "$U_WT/tmp/notes.md"
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" --superseded-by="$U_NEWTASK" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U mutant M1b: --apply closes with a regenerable ignored dir present" || bad "U mutant M1b exit $rc: $out"
+m1b_archive_dir=$(find "$HERDR_ARCHIVE_ROOT" -maxdepth 2 -type d -name "superseded-$U_PR-*" 2>/dev/null | head -1)
+grep -q '^EXCLUDED' "$m1b_archive_dir/MANIFEST.sha256" 2>/dev/null \
+  && ok "U mutant M1b: node_modules is recorded EXCLUDED in the manifest" \
+  || bad "U mutant M1b: no EXCLUDED line: $(cat "$m1b_archive_dir/MANIFEST.sha256" 2>&1)"
+
+printf -- '-- T1: each _valid_superseded_detail check is pinned in isolation (V1-V10 + a valid-detail positive) --\n'
+
+# Builds a detail that is REAL in every field except what each case below
+# mutates: a genuine archive dir (with HEAD.txt) under HERDR_ARCHIVE_ROOT,
+# naming the actual old/new task ids, the actual old head, and the actual
+# repo#PR -- never the real close-done-workers.sh bypass itself (which
+# would close the task, leaving nothing to mutate against), so each V-case
+# below differs from a passing call by exactly the one field it names.
+# Sets U_VALID_ARCHIVE (the archive dir it created) and U_VALID_DETAIL (its
+# JSON) directly as globals -- never call this as $(...): the assignments
+# would be thrown away in the subshell, same trap as archive_copy_and_manifest.
+_u_valid_detail() {
+  local repo_base ts dir
+  repo_base="$(basename "$U_WORK")"
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  dir="$HERDR_ARCHIVE_ROOT/$repo_base/superseded-$U_PR-$ts-$$-manual"
+  mkdir -p "$dir"
+  printf '%s\n' "$U_PR_SHA" > "$dir/HEAD.txt"
+  U_VALID_ARCHIVE="$dir"
+  U_VALID_DETAIL=$(jq -nc --arg t "$U_TASK" --arg s "$U_NEWTASK" --arg h "$U_PR_SHA" --arg a "$dir" --arg pr "org/repo#$U_PR" \
+    '{superseded_close:{old_task:$t, superseded_by:$s, old_head:$h, archive:$a, pr:$pr}}')
+}
+
+_u_case "review:old-vpos" "review:new-vpos"
+_u_valid_detail
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$U_VALID_DETAIL" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "U T1 positive: a valid hand-built detail with no proof completes" || bad "U T1 positive: rc=$rc $out"
+check "U T1 positive: task completed" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "completed"
+
+_u_case "review:old-v1" "review:new-v1"
+_u_valid_detail
+d=$(printf '%s' "$U_VALID_DETAIL" | jq -c '.superseded_close.old_task = "wrong-task-id"')
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$d" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (V1): old_task mismatch alone is REFUSED" || bad "U T1 (V1): rc=$rc $out"
+check "U T1 (V1): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v2" "review:new-v2"
+sqlite3 "$(registry_db)" "UPDATE tasks SET label='implement:old-v2' WHERE task_id='$U_TASK';"
+_u_valid_detail
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$U_VALID_DETAIL" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (V2): old task not review-class alone is REFUSED" || bad "U T1 (V2): rc=$rc $out"
+check "U T1 (V2): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v3" "review:new-v3"
+_u_valid_detail
+d=$(printf '%s' "$U_VALID_DETAIL" | jq -c '.superseded_close.pr = "org/repo#1"')
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$d" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (V3): pr mismatch alone is REFUSED" || bad "U T1 (V3): rc=$rc $out"
+check "U T1 (V3): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v4" "review:new-v4"
+_u_valid_detail
+d=$(printf '%s' "$U_VALID_DETAIL" | jq -c '.superseded_close.superseded_by = ""')
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$d" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (V4): empty superseded_by alone is REFUSED" || bad "U T1 (V4): rc=$rc $out"
+check "U T1 (V4): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v5" "review:new-v5"
+_u_valid_detail
+d=$(printf '%s' "$U_VALID_DETAIL" | jq -c '.superseded_close.superseded_by = "does-not-exist-task"')
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$d" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (V5): unregistered superseded_by alone is REFUSED" || bad "U T1 (V5): rc=$rc $out"
+check "U T1 (V5): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v6" "review:new-v6"
+sqlite3 "$(registry_db)" "UPDATE tasks SET label='implement:new-v6' WHERE task_id='$U_NEWTASK';"
+_u_valid_detail
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$U_VALID_DETAIL" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (V6): superseded_by not review-class alone is REFUSED" || bad "U T1 (V6): rc=$rc $out"
+check "U T1 (V6): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v7" "review:new-v7"
+sqlite3 "$(registry_db)" "UPDATE tasks SET review_pr_number=review_pr_number+1 WHERE task_id='$U_NEWTASK';"
+_u_valid_detail
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$U_VALID_DETAIL" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (V7): superseded_by reviewing a different PR alone is REFUSED" || bad "U T1 (V7): rc=$rc $out"
+check "U T1 (V7): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v8" "review:new-v8"
+sqlite3 "$(registry_db)" "UPDATE tasks SET created_at='2019-01-01T00:00:00Z' WHERE task_id='$U_NEWTASK';"
+_u_valid_detail
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$U_VALID_DETAIL" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (V8): superseded_by not created after this task alone is REFUSED" || bad "U T1 (V8): rc=$rc $out"
+check "U T1 (V8): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v9" "review:new-v9"
+_u_valid_detail
+d=$(printf '%s' "$U_VALID_DETAIL" | jq -c '.superseded_close.archive = "/no/such/archive/dir"')
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$d" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (V9): nonexistent archive dir alone is REFUSED" || bad "U T1 (V9): rc=$rc $out"
+check "U T1 (V9): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v10" "review:new-v10"
+_u_valid_detail
+printf 'wrong-sha\n' > "$U_VALID_ARCHIVE/HEAD.txt"
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$U_VALID_DETAIL" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (V10): HEAD.txt not matching old_head alone is REFUSED" || bad "U T1 (V10): rc=$rc $out"
+check "U T1 (V10): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+printf -- '-- T1 (4a): archive location, naming, worktree-HEAD and manifest checks are each pinned in isolation --\n'
+
+_u_case "review:old-v16" "review:new-v16"
+_u_valid_detail
+outside_dir="$U_TMP/outside-archive-root-$U_PR"
+mkdir -p "$outside_dir"
+printf '%s\n' "$U_PR_SHA" > "$outside_dir/HEAD.txt"
+d=$(printf '%s' "$U_VALID_DETAIL" | jq -c --arg a "$outside_dir" '.superseded_close.archive = $a')
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$d" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (4a-location): an archive outside HERDR_ARCHIVE_ROOT alone is REFUSED" || bad "U T1 (4a-location): rc=$rc $out"
+check "U T1 (4a-location): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v17" "review:new-v17"
+_u_valid_detail
+badname_dir="$HERDR_ARCHIVE_ROOT/$(basename "$U_WORK")/not-a-superseded-name-$U_PR"
+mkdir -p "$badname_dir"
+printf '%s\n' "$U_PR_SHA" > "$badname_dir/HEAD.txt"
+d=$(printf '%s' "$U_VALID_DETAIL" | jq -c --arg a "$badname_dir" '.superseded_close.archive = $a')
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$d" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (4a-naming): an archive not named superseded-<PR>-* alone is REFUSED" || bad "U T1 (4a-naming): rc=$rc $out"
+check "U T1 (4a-naming): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v18" "review:new-v18"
+_u_valid_detail
+G -C "$U_WT" commit -q --allow-empty -m "worktree moved after the archive was taken"
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$U_VALID_DETAIL" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (4a-worktree-head): old_head not matching the task worktree's real HEAD alone is REFUSED" || bad "U T1 (4a-worktree-head): rc=$rc $out"
+check "U T1 (4a-worktree-head): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+_u_case "review:old-v19" "review:new-v19"
+_u_valid_detail
+mkdir -p "$U_VALID_ARCHIVE/files/tmp"
+printf 'real content\n' > "$U_VALID_ARCHIVE/files/tmp/notes.md"
+printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\t12\ttmp/notes.md\n' > "$U_VALID_ARCHIVE/MANIFEST.sha256"
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$U_VALID_DETAIL" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (4a-manifest): a MANIFEST.sha256 entry that doesn't verify alone is REFUSED" || bad "U T1 (4a-manifest): rc=$rc $out"
+check "U T1 (4a-manifest): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+printf -- '-- 4b: a symlinked archive repo_base dir is refused before anything is written through it --\n'
+
+_u_case "review:old-4b" "review:new-4b"
+u4b_root="$U_TMP/archive-root-4b"
+mkdir -p "$u4b_root"
+repo_base_4b="$(basename "$U_WORK")"
+elsewhere_4b="$U_TMP/symlink-target-4b"
+mkdir -p "$elsewhere_4b"
+ln -s "$elsewhere_4b" "$u4b_root/$repo_base_4b"
+mkdir -p "$U_WT/tmp"
+printf 'should never reach the symlinked target\n' > "$U_WT/tmp/notes.md"
+out=$(HERDR_ARCHIVE_ROOT="$u4b_root" bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" --superseded-by="$U_NEWTASK" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'symlink' \
+  && ok "U (4b): a symlinked archive repo_base dir HOLDs" || bad "U (4b) exit $rc: $out"
+check "U (4b): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+[ -z "$(find "$elsewhere_4b" -mindepth 1 2>/dev/null)" ] && ok "U (4b): nothing was written through the symlink" \
+  || bad "U (4b): files appeared at the symlink target: $(find "$elsewhere_4b" -mindepth 1)"
+
+
+printf -- '-- T2 (mutant V14): a proof GIVEN alongside a valid bypass still never lands in the audit row --\n'
+
+_u_case "review:old-v14" "review:new-v14"
+mkdir -p "$U_WT/tmp"
+printf 'proof given but unused\n' > "$U_WT/tmp/notes.md"
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" --superseded-by="$U_NEWTASK" \
+  --proof="https://github.com/org/repo/pull/1 deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U T2 (mutant V14): --apply closes even with an unchecked --proof given" || bad "U T2 (mutant V14) exit $rc: $out"
+_uevv14() { sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.$1') FROM events WHERE task_id='$U_TASK' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';"; }
+[ -z "$(_uevv14 proof)" ] && ok "U T2 (mutant V14): the given proof never lands in the audit row" \
+  || bad "U T2 (mutant V14): proof field present: $(_uevv14 proof)"
+
+printf -- '-- T3 (mutant V15): CLOSED + superseded with NO --superseded-by and NO proof refuses BEFORE archiving --\n'
+
+_u_m4_mk
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_M4_TASK" 2>&1)
+rc=$?
+[ "$rc" -eq 1 ] && ok "U T3 (mutant V15): exits 1 at the top level, never reaches the main scan" || bad "U T3 (mutant V15) exit $rc: $out"
+check "U T3 (mutant V15): task untouched" "$(read_task "$U_M4_RUN" "$U_M4_TASK" | jq -r .state)" "running"
+[ -z "$(find "$HERDR_ARCHIVE_ROOT" -maxdepth 2 -type d -name "detached-pr-$U_M4_N-*" 2>/dev/null)" ] \
+  && ok "U T3 (mutant V15): no orphan archive dir was created" \
+  || bad "U T3 (mutant V15): an archive dir was created despite the refusal"
+
+
+
+
+
 
 
 printf '\n%s\n' "-----"

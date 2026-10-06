@@ -940,6 +940,127 @@ _valid_proof_ref() {
   return 1
 }
 
+# _valid_superseded_detail <run_id> <task_id> <detail-json> -> 0 iff a
+# `superseded_close` detail object is actually backed by the evidence
+# close-done-workers.sh's own `_superseded_check` rules 1-4 produce,
+# re-checked here from the registry's own trust boundary (the DB and the
+# filesystem), never taken on the caller's word (review PR #249 r2 N1: a
+# bare `jq -e 'has("superseded_close")'` waived the proof requirement for
+# ANY caller handing `set_task_state` a detail shaped like that key, with
+# nothing tying it to this task, a real newer task, or an archive that
+# exists — "never user-suppliable" was a claim in a commit message, not an
+# enforced property). Sets _PROOF_REF_WHY. Every failure falls back to the
+# ordinary proof requirement in the caller, never to a silent close.
+_valid_superseded_detail() {
+  local run_id="$1" task_id="$2" detail="$3" \
+        pr old_task sup_by old_head archive label review_pr_repo review_pr_number \
+        new_json new_label new_repo new_pr new_created old_created \
+        archive_root archive_rr archive_r task_wt real_head
+  _PROOF_REF_WHY=""
+  pr=$(printf '%s' "$detail" | jq -r '.superseded_close.pr // ""' 2>/dev/null)
+  old_task=$(printf '%s' "$detail" | jq -r '.superseded_close.old_task // ""' 2>/dev/null)
+  sup_by=$(printf '%s' "$detail" | jq -r '.superseded_close.superseded_by // ""' 2>/dev/null)
+  old_head=$(printf '%s' "$detail" | jq -r '.superseded_close.old_head // ""' 2>/dev/null)
+  archive=$(printf '%s' "$detail" | jq -r '.superseded_close.archive // ""' 2>/dev/null)
+  if [ "$old_task" != "$task_id" ]; then
+    _PROOF_REF_WHY="detail.superseded_close.old_task ($old_task) does not match this task"
+    return 1
+  fi
+  label=$(_sql "SELECT label FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  review_pr_repo=$(_sql "SELECT review_pr_repo FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  review_pr_number=$(_sql "SELECT review_pr_number FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  case "$label" in
+    review:*|deep-review:*) ;;
+    *) _PROOF_REF_WHY="this task (label=${label:-?}) is not review-class"; return 1 ;;
+  esac
+  if [ -z "$review_pr_repo" ] || [ "$pr" != "${review_pr_repo}#${review_pr_number}" ]; then
+    _PROOF_REF_WHY="detail.superseded_close.pr ($pr) does not match this task's recorded PR (${review_pr_repo:-?}#${review_pr_number:-?})"
+    return 1
+  fi
+  if [ -z "$sup_by" ]; then
+    _PROOF_REF_WHY="detail.superseded_close.superseded_by is empty"
+    return 1
+  fi
+  new_json=$(_sql "$(_task_json_select) WHERE task_id=$(_sq "$sup_by") LIMIT 1;" 2>/dev/null)
+  if [ -z "$new_json" ]; then
+    _PROOF_REF_WHY="superseded_by=$sup_by does not match any registered task"
+    return 1
+  fi
+  new_label=$(printf '%s' "$new_json" | jq -r '.label // ""' 2>/dev/null)
+  new_repo=$(printf '%s' "$new_json" | jq -r '.review_pr_repo // ""' 2>/dev/null)
+  new_pr=$(printf '%s' "$new_json" | jq -r '.review_pr_number // ""' 2>/dev/null)
+  new_created=$(printf '%s' "$new_json" | jq -r '.created_at // ""' 2>/dev/null)
+  old_created=$(_sql "SELECT created_at FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  case "$new_label" in
+    review:*|deep-review:*) ;;
+    *) _PROOF_REF_WHY="superseded_by=$sup_by (label=${new_label:-?}) is not review-class"; return 1 ;;
+  esac
+  if [ "${new_repo}#${new_pr}" != "$pr" ]; then
+    _PROOF_REF_WHY="superseded_by=$sup_by reviews ${new_repo:-?}#${new_pr:-?}, not $pr"
+    return 1
+  fi
+  if [ -z "$new_created" ] || [ -z "$old_created" ] || ! [[ "$new_created" > "$old_created" ]]; then
+    _PROOF_REF_WHY="superseded_by=$sup_by was not created after this task"
+    return 1
+  fi
+  if [ -z "$archive" ] || [ ! -d "$archive" ]; then
+    _PROOF_REF_WHY="detail.superseded_close.archive ($archive) does not exist"
+    return 1
+  fi
+  # review PR #249 r3 F0/4a: existence alone let a forged detail name any
+  # writable directory. Pin it to the one place and naming convention
+  # close-done-workers.sh itself ever creates a superseded archive under.
+  archive_root="${HERDR_ARCHIVE_ROOT:-$HOME/Code/.archive/worktrees}"
+  if ! archive_rr=$(cd "$archive_root" 2>/dev/null && pwd -P); then
+    _PROOF_REF_WHY="cannot resolve the archive root $archive_root"
+    return 1
+  fi
+  if ! archive_r=$(cd "$archive" 2>/dev/null && pwd -P); then
+    _PROOF_REF_WHY="cannot resolve detail.superseded_close.archive ($archive)"
+    return 1
+  fi
+  case "$archive_r/" in
+    "$archive_rr"/*) ;;
+    *) _PROOF_REF_WHY="detail.superseded_close.archive ($archive) resolves outside the archive root $archive_root"; return 1 ;;
+  esac
+  case "$(basename "$archive_r")" in
+    superseded-"$review_pr_number"-*) ;;
+    *) _PROOF_REF_WHY="detail.superseded_close.archive ($archive) is not named superseded-$review_pr_number-*"; return 1 ;;
+  esac
+  if [ ! -f "$archive/HEAD.txt" ] || [ "$(cat "$archive/HEAD.txt" 2>/dev/null)" != "$old_head" ]; then
+    _PROOF_REF_WHY="$archive/HEAD.txt does not match detail.superseded_close.old_head ($old_head)"
+    return 1
+  fi
+  # review PR #249 r3 F0/4a: old_head was never compared with anything but
+  # the archived HEAD.txt a forger also controls. When the task's own
+  # worktree still exists, demand it actually be at old_head.
+  task_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  if [ -n "$task_wt" ] && [ -d "$task_wt" ]; then
+    real_head=$(git -C "$task_wt" rev-parse HEAD 2>/dev/null)
+    if [ -z "$real_head" ] || [ "$real_head" != "$old_head" ]; then
+      _PROOF_REF_WHY="detail.superseded_close.old_head ($old_head) does not match the task worktree's real HEAD (${real_head:-unresolvable})"
+      return 1
+    fi
+    # review PR #249 r3 F0/4a: when a manifest was produced, its hashes
+    # must actually verify — a forged archive's files, not just its
+    # HEAD.txt, are now checked against the worktree they claim to be from.
+    if [ -f "$archive/MANIFEST.sha256" ]; then
+      if ! command -v archive_verify_manifest >/dev/null 2>&1; then
+        # shellcheck source=lib/worktree-archive.sh
+        . "$(dirname "${BASH_SOURCE[0]}")/worktree-archive.sh" 2>/dev/null
+      fi
+      if command -v archive_verify_manifest >/dev/null 2>&1; then
+        if ! archive_verify_manifest "$task_wt" "$archive/MANIFEST.sha256"; then
+          _PROOF_REF_WHY="archive manifest verification failed: ${_ARCHIVE_WHY:-unknown}"
+          return 1
+        fi
+      fi
+    fi
+  fi
+
+  return 0
+}
+
 set_task_state() {                      # run_id task_id state [reason] [proof] [detail-json-object]
   local run_id="$1" task_id="$2" state="$3" reason="${4:-}" proof="${5:-}" detail="${6:-}"
   registry_init || return 1
@@ -964,6 +1085,7 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
     # transitions TO completed a second time). "Missing -> nonzero exit,
     # nothing written" — checked before the transaction below, so a refused
     # call touches no row and appends no event.
+    local waived_proof=0
     if [ "$state" = "completed" ]; then
       if ! _valid_closure_reason "$reason"; then
         printf 'run-registry: refusing completed for %s/%s: closure reason missing/invalid (need shipped|handed_off_to:<x>|blocked_on:<x>|canceled|no-follow-on|abandoned|superseded, got %s)\n' \
@@ -971,17 +1093,45 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
         return 1
       fi
       case "$reason" in
-        shipped|abandoned|superseded)
-        local proof_wt=""
-        case "$proof" in
-          *PROOF.md*) proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null) ;;
-        esac
-        if ! _valid_proof_ref "$proof" "$proof_wt"; then
-          printf 'run-registry: refusing %s completion for %s/%s: proof missing/invalid (need "<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)%s\n' \
-            "$reason" "$run_id" "$task_id" "${_PROOF_REF_WHY:+: $_PROOF_REF_WHY}" >&2
-          return 1
-        fi
-        ;;
+        shipped|abandoned)
+          local proof_wt=""
+          case "$proof" in
+            *PROOF.md*) proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null) ;;
+          esac
+          if ! _valid_proof_ref "$proof" "$proof_wt"; then
+            printf 'run-registry: refusing %s completion for %s/%s: proof missing/invalid (need "<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)%s\n' \
+              "$reason" "$run_id" "$task_id" "${_PROOF_REF_WHY:+: $_PROOF_REF_WHY}" >&2
+            return 1
+          fi
+          ;;
+        superseded)
+          # The OPEN-PR bypass needs no separate --proof ONLY when the
+          # detail it was handed is itself backed by real evidence this
+          # function re-checks against the DB and the filesystem —
+          # `_valid_superseded_detail`, never a bare key-presence check
+          # (review PR #249 r2 N1: "never user-suppliable" was a claim in
+          # a commit message, not an enforced property — any direct
+          # set_task_state call could complete ANY task as `superseded`
+          # with a forged or empty `superseded_close` object and no proof
+          # at all). Anything that fails that re-check — including the
+          # older, CLOSED-unmerged `superseded` disposition, whose detail
+          # is the generic `detached_close` shape `abandoned` uses — falls
+          # back to the real proof requirement, exactly like `abandoned`.
+          if printf '%s' "$detail" | jq -e 'has("superseded_close")' >/dev/null 2>&1 \
+            && _valid_superseded_detail "$run_id" "$task_id" "$detail"; then
+            waived_proof=1
+          else
+            local proof_wt=""
+            case "$proof" in
+              *PROOF.md*) proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null) ;;
+            esac
+            if ! _valid_proof_ref "$proof" "$proof_wt"; then
+              printf 'run-registry: refusing %s completion for %s/%s: proof missing/invalid (need "<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)%s\n' \
+                "$reason" "$run_id" "$task_id" "${_PROOF_REF_WHY:+: $_PROOF_REF_WHY}" >&2
+              return 1
+            fi
+          fi
+          ;;
       esac
     fi
     # `detail` (optional): a JSON object recorded verbatim under .detail in
@@ -1014,7 +1164,14 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
     # `completed` carries them; every other transition's payload shape is
     # unchanged, so an existing reader keyed on {state,from} still works.
     if [ "$state" = "completed" ]; then
-      if [ -n "$proof" ]; then
+      # A waived `superseded` proof (review PR #249 r2 N2) is never
+      # recorded verbatim: it was never checked against anything, and an
+      # unvalidated "<claimed merged PR URL> <sha>" sitting in the audit
+      # row next to reason=superseded reads as evidence it is not.
+      if [ "$waived_proof" = 1 ]; then
+        payload="$(jq -nc --arg s "$state" --arg f "$cur" --arg reason "$reason" \
+          '{state:$s, from:$f, reason:$reason}')"
+      elif [ -n "$proof" ]; then
         payload="$(jq -nc --arg s "$state" --arg f "$cur" --arg reason "$reason" --arg proof "$proof" \
           '{state:$s, from:$f, reason:$reason, proof:$proof}')"
       else
