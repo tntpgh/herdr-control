@@ -375,10 +375,12 @@ Nothing here runs for a task spawned without the flag.
   Approve records a one-shot grant, or for a code-by-reference script a
   `file_approvals` row bound to its reviewed sha256.
   Supersede records no grant of either kind. Decisions write an `approvals` row
-  and `action_decided` (request id, action SHA, authority, reviewer, reason;
-  event timestamp), and notify the worker after a pane-generation check.
-  A conductor decision also retires the pinned open human form under the same
-  record lock as withdrawal; already-answered or expired forms are preserved.
+  and `action_decided` (request id, action SHA, authority, reviewer, reason,
+  form record and `form_outcome`; event timestamp), and notify the worker after
+  a pane-generation check. A conductor decision also retires the open human
+  form under the same record lock as withdrawal, resolving it by `form_path`
+  if not yet pinned; already-answered or expired forms are preserved. A human
+  answer losing the request-decision race is audited as `kept:answered:<decision>`.
 - **Abandoned research action**: the existing form under `runs/action-forms/`
   offers “Cancel this request (worker moved on)” alongside approve and decline,
   with no default choice. Cancellation records `superseded`, not approved.
@@ -386,9 +388,11 @@ Nothing here runs for a task spawned without the flag.
   decide the request. `publisher.py` already selects only `status='pending'`;
   superseded and declined rows therefore clear `has_pending_request` on the
   next snapshot. Another pending request still blocks, even when the task has
-  historical `input_required` events: pending membership is computed separately
-  from the displayed ask. The research orchestrator's answer validation and
-  F1/F2 live-pane/closure gates remain unchanged. Terminal task withdrawal below
+  historical `input_required` events: the newest pending request supplies the
+  blocker's tool, summary and since, overriding the historical menu ask. Pending
+  membership is computed separately from presentation. The research
+  orchestrator's answer validation and F1/F2 live-pane/closure gates remain
+  unchanged. Terminal task withdrawal below
   is distinct from a worker pane merely reporting done.
 - **Withdrawal** (`herdr-action.sh tick`, 2026-09-29): a pending request whose
   task is terminal (`completed|failed|cancelled|lost`) becomes `withdrawn`
@@ -405,9 +409,14 @@ Nothing here runs for a task spawned without the flag.
   15 s, one read-only query when nothing is pending) posts one Slack alert at
   class `human-action` (`lib/slack-level.sh`: an error class, posted at the
   default level) and serves a formserve decision; an answered form is applied as
-  human authority; an expired form is recorded as `action_form_expired` and
-  re-served — never a decline. `lib/reconcile.sh` reports `action_requested` to
-  the owning conductor at session start.
+  human authority. An answered legacy form without `action_sha256` is rejected:
+  `action_form_rejected` records its request, form record and
+  `reason: missing_action_sha256` once per form, and the CLI/tick emits a clear
+  stderr line. The request stays pending; an explicit conductor decision is
+  needed, not an automatic re-serve or grant from an unbound answer. An expired
+  form is recorded as `action_form_expired` and re-served — never a decline.
+  `lib/reconcile.sh` reports `action_requested` to the owning conductor at
+  session start.
 - **Review round 1 (2026-09-27, two independent reviewers) and what changed**:
   - *Self-approval*: a worker's allowed bash could UPDATE `action_requests`,
     forge a form record, or edit the gate files (`lib/pretool-shadow.sh`,

@@ -471,6 +471,9 @@ class HookApprovalBlocker(unittest.TestCase):
                     blockers = [b for b in snap["blockers"] if b["task_id"] == "task_hook"]
                     if status == "pending":
                         self.assertEqual([b["kind"] for b in blockers], ["permission"])
+                        self.assertEqual(blockers[0]["tool"], "write")
+                        self.assertEqual(blockers[0]["summary"], "awaiting_owner_approval: no conductor configured")
+                        self.assertEqual(blockers[0]["since"], Z(NOW))
                         self.assertIsNone(pub.rtasks._orchestrator_close_research(t, wt))
                     else:
                         self.assertEqual(blockers, [])

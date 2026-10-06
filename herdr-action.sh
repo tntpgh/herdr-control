@@ -118,9 +118,21 @@ _ha_conductor_ok() {                    # task-json -> 0 if the caller is its li
 
 # An answered hub form for exactly this request. Prints the answer JSON.
 _ha_form_answer() {                     # form_id request_id action_sha256 -> answers json
-  local f="$HA_FORMS_DIR/$1.json"
+  local f="$HA_FORMS_DIR/$1.json" row
   case "$1" in ''|*/*|*..*) return 1 ;; esac
   [ -r "$f" ] || return 1
+  # Legacy forms predate action_sha256. Never apply an unbound answer:
+  # audit the rejected form and keep the request pending for an explicit
+  # conductor decision. The event id deduplicates subsequent hub ticks.
+  if jq -e --arg id "$2" '.status=="answered" and .answers.request_id==$id
+      and .answers.action_sha256==null' "$f" >/dev/null 2>&1; then
+    row="$(action_request_get "$2")"
+    append_event "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_form_rejected \
+      "$(jq -nc --arg id "$2" --arg fid "$1" '{request_id:$id, form_record:$fid, reason:"missing_action_sha256"}')" \
+      "actformrej_${2}_${1}" >/dev/null || true
+    printf 'herdr-action: form %s for request %s rejected: missing_action_sha256; request left pending\n' "$1" "$2" >&2
+    return 1
+  fi
   jq -e --arg id "$2" --arg sha "$3" '.status=="answered" and (.answers.request_id==$id)
       and (.answers.action_sha256==$sha)
       and ((.answers.decision=="approve") or (.answers.decision=="decline")
@@ -157,7 +169,7 @@ _ha_notify_worker() {                   # row decision -> records action_notifie
 
 # The one decide path (conductor CLI, human CLI, hub tick).
 _ha_decide() {                          # id approved|declined|superseded authority decided_by category reason
-  local id="$1" status="$2" auth="$3" who="$4" cat="$5" why="$6" row kind run task fid
+  local id="$1" status="$2" auth="$3" who="$4" cat="$5" why="$6" row kind run task fid fp _st outcome=human-answer
   row="$(action_request_get "$id")"
   [ -n "$row" ] || die "no request $id" 3
   kind="$(_ha_field "$row" grant_kind)"; run="$(_ha_field "$row" run_id)"; task="$(_ha_field "$row" task_id)"
@@ -171,15 +183,21 @@ _ha_decide() {                          # id approved|declined|superseded author
   fi
   row="$(action_request_get "$id")"
   fid="$(_ha_field "$row" form_record)"
+  fp="$(_ha_field "$row" form_path)"
+  if [ -z "$fid" ] && [ -n "$fp" ]; then
+    read -r _st fid <<EOF
+$(_ha_form_status "$fp")
+EOF
+  fi
   if [ "$who" != "hub form $fid" ]; then
     case "$fid" in
-      ''|*/*|*..*) ;;
-      *) _ha_retire_form "$HA_FORMS_DIR/$fid.json" "request $id $status by $auth" >/dev/null ;;
+      ''|*/*|*..*) if [ -n "$fp" ]; then outcome=unpinned; else outcome=no-form; fi ;;
+      *) outcome="$(_ha_retire_form "$HA_FORMS_DIR/$fid.json" "request $id $status by $auth")" ;;
     esac
   fi
   append_event "$run" "$task" action_decided \
-    "$(jq -nc --arg id "$id" --arg sha "$(_ha_field "$row" action_sha256)" --arg s "$status" --arg a "$auth" --arg w "$who" --arg c "$cat" --arg r "$why" \
-       '{request_id:$id, action_sha256:$sha, decision:$s, authority:$a, reviewer:$w, review_category:$c, reason:$r}')" \
+    "$(jq -nc --arg id "$id" --arg sha "$(_ha_field "$row" action_sha256)" --arg s "$status" --arg a "$auth" --arg w "$who" --arg c "$cat" --arg r "$why" --arg f "$fid" --arg o "$outcome" \
+       '{request_id:$id, action_sha256:$sha, decision:$s, authority:$a, reviewer:$w, review_category:$c, reason:$r, form_record:$f, form_outcome:$o}')" \
     "actdec_${id}" >/dev/null 2>&1 || true
   local tj pane choice=1 label=Approve
   case "$status" in declined) choice=2; label=Deny ;; superseded) choice=3; label=Supersede ;; esac
@@ -548,7 +566,7 @@ cmd_tick() {
         *) [ "$age" -ge "$HA_STALE_S" ] || continue ;;
       esac
     fi
-    ( _ha_human_route "$id" "$row" "$tj" ) >/dev/null 2>&1
+    ( _ha_human_route "$id" "$row" "$tj" ) >/dev/null
   done < <(action_requests_pending)
 }
 
