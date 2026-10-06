@@ -343,6 +343,69 @@ describe("owner.reply_ready: envelope and acceptance", () => {
   });
 });
 
+describe("event detail integrity", () => {
+  const reader = caller("tnt@teamthurber.com", "c");
+
+  it("preserves detail at the size boundary and distinguishes oversized duplicate payloads", async () => {
+    await runInDurableObject(fleet(), (o: HerdrState, state) => {
+      const data = { reason: "x".repeat(2000 - JSON.stringify({ reason: "" }).length) };
+      internal(o).recordTaskEvent(Date.now(), "rt_boundary", "failed", data);
+      expect(o.taskEventLog("rt_boundary", 1)[0]?.detail).toEqual(data);
+      const stored = state.storage.sql.exec<{ detail: string }>(
+        `SELECT detail FROM task_events WHERE remote_task_id='rt_boundary'`).one().detail;
+      expect(stored.length).toBe(2000);
+
+      const insert = (reason: string) => internal(o).insertEvent(Date.now(), {
+        eventId: "hev:test:oversized", remoteTaskId: "rt_large", type: "failed", source: "worker_internal",
+        subjectKind: "remote_task", subjectId: "rt_large", visibility: "public",
+        senderActor: "", senderClient: "", correlationId: "rt_large", data: { reason },
+      });
+      const first = insert("x".repeat(4000));
+      expect(first.outcome).toBe("accepted");
+      expect(insert("x".repeat(4000))).toEqual({ outcome: "duplicate_same_payload", cursor: first.cursor });
+      expect(insert("x".repeat(3999) + "y")).toEqual({ outcome: "rejected:duplicate_payload_mismatch", cursor: null });
+      const detail = state.storage.sql.exec<{ detail: string }>(
+        `SELECT detail FROM task_events WHERE event_id='hev:test:oversized'`).one().detail;
+      expect(detail.length).toBeLessThanOrEqual(2000);
+      expect(JSON.parse(detail)).toEqual({ detail_error: "oversized", original_chars: 4013,
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    });
+  });
+
+  it.each(['{"reason":"' + "x".repeat(1990), "null", "[]", "42", ""])(
+    "a malformed stored detail cannot poison pagination, waits, or task progress (%s)",
+    async (badDetail) => {
+      const afterBad = await runInDurableObject(fleet(), (o: HerdrState, state) => {
+        internal(o).recordTaskEvent(Date.now(), "rt_bad", "task_started", { repo: "test" });
+        internal(o).recordTaskEvent(Date.now(), "rt_bad", "failed", { reason: "old" });
+        state.storage.sql.exec(`UPDATE task_events SET detail=? WHERE type='failed'`, badDetail);
+        internal(o).recordTaskEvent(Date.now(), "rt_bad", "finished", { state: "done" });
+        const page = o.listEvents(0, null, reader, 2);
+        expect(page.result).toBe("ok");
+        expect(page.events.map((ev) => [ev.type, ev.detail])).toEqual([
+          ["task_started", { repo: "test" }], ["failed", { detail_error: "invalid_json" }],
+        ]);
+        expect(o.taskEventLog("rt_bad", 3).map((ev) => [ev.type, ev.detail])).toEqual([
+          ["finished", { state: "done" }], ["failed", { detail_error: "invalid_json" }],
+          ["task_started", { repo: "test" }],
+        ]);
+        const next = o.listEvents(page.scanned_through_cursor, page.scope_hash, reader, 2);
+        expect(next.events.map((ev) => [ev.type, ev.detail])).toEqual([["finished", { state: "done" }]]);
+        expect(next.scanned_through_cursor).toBe(next.latest_cursor);
+        return page.scanned_through_cursor;
+      });
+      const { access_token } = await oauthToken(["herdr:read"]);
+      const listed = await callTool<EventPage>(access_token, "list_events", { since_cursor: 0 });
+      expect(listed.isError).toBe(false);
+      expect(listed.data.events.find((ev) => ev.type === "failed")?.detail).toEqual({ detail_error: "invalid_json" });
+      const waited = await callTool<EventPage>(access_token, "wait_for_events", { since_cursor: 0, timeout_s: 1 });
+      expect(waited.isError).toBe(false);
+      expect(waited.data.events.find((ev) => ev.type === "failed")?.detail).toEqual({ detail_error: "invalid_json" });
+      expect(waited.data.scanned_through_cursor).toBeGreaterThan(afterBad);
+    },
+  );
+});
+
 describe("list_events/wait_for_events: pruning, scope and pagination", () => {
   const reader = caller("tnt@teamthurber.com", "c");
 

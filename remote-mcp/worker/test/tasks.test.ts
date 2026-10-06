@@ -140,6 +140,33 @@ describe("start_task: refusals", () => {
 });
 
 describe("start_task: happy path through to get_task_answer", () => {
+  it.each(["x".repeat(4000), '"\\\n'.repeat(1333) + "x"])(
+    "a 4000-character command ack does not break list_events",
+    async (detail) => {
+      await signedSync(taskConfigBody());
+      const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
+      const started = await callTool<StartTaskResult>(access_token, "start_task",
+        { repo: "knowledge-base", mode: "research", objective: "find X" });
+      const leased = await syncJson(await signedSync(taskConfigBody()));
+      const cmd = leased.commands.find((c) => c.remote_task_id === started.data.task_id && c.op === "start");
+      if (!cmd) throw new Error("start command was not leased");
+      const ack = await signedSync(syncBody({ lease: false,
+        command_acks: [{ command_id: cmd.command_id, outcome: "failed", detail }] }));
+      expect(ack.status).toBe(200);
+
+      const page = await callTool<{ result: string; events: { type: string; detail: object }[] }>(
+        access_token, "list_events", { since_cursor: 0 });
+      expect(page.isError).toBe(false);
+      expect(page.data.result).toBe("ok");
+      expect(page.data.events.find((ev) => ev.type === "failed")?.detail).toMatchObject({
+        detail_error: "oversized", original_chars: JSON.stringify({ reason: detail }).length,
+      });
+      const answer = await callTool<AnswerResult>(access_token, "get_task_answer", { task_id: started.data.task_id });
+      expect(answer.isError).toBe(false);
+      expect(answer.data.state).toBe("failed");
+    },
+  );
+
   it("queues a start command, the Mac's ack moves it to running, and the local task's `verified` surfaces", async () => {
     await signedSync(taskConfigBody());
     const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
