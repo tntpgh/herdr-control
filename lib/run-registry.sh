@@ -954,7 +954,8 @@ _valid_proof_ref() {
 _valid_superseded_detail() {
   local run_id="$1" task_id="$2" detail="$3" \
         pr old_task sup_by old_head archive label review_pr_repo review_pr_number \
-        new_json new_label new_repo new_pr new_created old_created
+        new_json new_label new_repo new_pr new_created old_created \
+        archive_root archive_rr archive_r task_wt real_head
   _PROOF_REF_WHY=""
   pr=$(printf '%s' "$detail" | jq -r '.superseded_close.pr // ""' 2>/dev/null)
   old_task=$(printf '%s' "$detail" | jq -r '.superseded_close.old_task // ""' 2>/dev/null)
@@ -1006,10 +1007,57 @@ _valid_superseded_detail() {
     _PROOF_REF_WHY="detail.superseded_close.archive ($archive) does not exist"
     return 1
   fi
+  # review PR #249 r3 F0/4a: existence alone let a forged detail name any
+  # writable directory. Pin it to the one place and naming convention
+  # close-done-workers.sh itself ever creates a superseded archive under.
+  archive_root="${HERDR_ARCHIVE_ROOT:-$HOME/Code/.archive/worktrees}"
+  if ! archive_rr=$(cd "$archive_root" 2>/dev/null && pwd -P); then
+    _PROOF_REF_WHY="cannot resolve the archive root $archive_root"
+    return 1
+  fi
+  if ! archive_r=$(cd "$archive" 2>/dev/null && pwd -P); then
+    _PROOF_REF_WHY="cannot resolve detail.superseded_close.archive ($archive)"
+    return 1
+  fi
+  case "$archive_r/" in
+    "$archive_rr"/*) ;;
+    *) _PROOF_REF_WHY="detail.superseded_close.archive ($archive) resolves outside the archive root $archive_root"; return 1 ;;
+  esac
+  case "$(basename "$archive_r")" in
+    superseded-"$review_pr_number"-*) ;;
+    *) _PROOF_REF_WHY="detail.superseded_close.archive ($archive) is not named superseded-$review_pr_number-*"; return 1 ;;
+  esac
   if [ ! -f "$archive/HEAD.txt" ] || [ "$(cat "$archive/HEAD.txt" 2>/dev/null)" != "$old_head" ]; then
     _PROOF_REF_WHY="$archive/HEAD.txt does not match detail.superseded_close.old_head ($old_head)"
     return 1
   fi
+  # review PR #249 r3 F0/4a: old_head was never compared with anything but
+  # the archived HEAD.txt a forger also controls. When the task's own
+  # worktree still exists, demand it actually be at old_head.
+  task_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  if [ -n "$task_wt" ] && [ -d "$task_wt" ]; then
+    real_head=$(git -C "$task_wt" rev-parse HEAD 2>/dev/null)
+    if [ -z "$real_head" ] || [ "$real_head" != "$old_head" ]; then
+      _PROOF_REF_WHY="detail.superseded_close.old_head ($old_head) does not match the task worktree's real HEAD (${real_head:-unresolvable})"
+      return 1
+    fi
+    # review PR #249 r3 F0/4a: when a manifest was produced, its hashes
+    # must actually verify — a forged archive's files, not just its
+    # HEAD.txt, are now checked against the worktree they claim to be from.
+    if [ -f "$archive/MANIFEST.sha256" ]; then
+      if ! command -v archive_verify_manifest >/dev/null 2>&1; then
+        # shellcheck source=lib/worktree-archive.sh
+        . "$(dirname "${BASH_SOURCE[0]}")/worktree-archive.sh" 2>/dev/null
+      fi
+      if command -v archive_verify_manifest >/dev/null 2>&1; then
+        if ! archive_verify_manifest "$task_wt" "$archive/MANIFEST.sha256"; then
+          _PROOF_REF_WHY="archive manifest verification failed: ${_ARCHIVE_WHY:-unknown}"
+          return 1
+        fi
+      fi
+    fi
+  fi
+
   return 0
 }
 

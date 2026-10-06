@@ -218,6 +218,42 @@ pane_live_birth() {
 # pure eligibility; the printed state names which reason --apply will
 # require.
 _DPR_REASON=""; _DPR_STATE=""; _DPR_HEAD_SHA=""; _DPR_REF_SHA=""; _DPR_ARCHIVE_MANIFEST=""; _DPR_VIA=""
+# _archive_repo_base_why <archive_root> <repo_base_dir> <wt> -> prints a
+# refusal reason, or nothing. archive_root_why only ever resolved
+# $archive_root itself; $archive_root/$repo_base is `mkdir -p`'d separately
+# and was never checked again before this (review r3 F0/4b of PR #249): a
+# worker that had pre-planted $repo_base as a symlink into its own
+# worktree (or anywhere else) got its archive written through that link,
+# past every later check that trusts the archive directory's contents.
+# Refuses outright if $repo_base is itself a symlink, reuses
+# archive_root_why to catch a resolved target inside the worktree, and
+# separately requires the resolved path stay nested under the resolved
+# archive root.
+_archive_repo_base_why() {
+  local archive_root="$1" repo_base_dir="$2" wt="$3" why rr rb
+  if [ -L "$repo_base_dir" ]; then
+    printf '%s is a symlink, refusing to archive through it\n' "$repo_base_dir"
+    return 0
+  fi
+  why=$(archive_root_why "$repo_base_dir" "$wt")
+  if [ -n "$why" ]; then
+    printf '%s\n' "$why"
+    return 0
+  fi
+  if ! rr=$(cd "$archive_root" 2>/dev/null && pwd -P); then
+    printf 'cannot resolve the archive root %s\n' "$archive_root"
+    return 0
+  fi
+  if ! rb=$(cd "$repo_base_dir" 2>/dev/null && pwd -P); then
+    printf 'cannot resolve %s\n' "$repo_base_dir"
+    return 0
+  fi
+  case "$rb/" in
+    "$rr"/*) ;;
+    *) printf '%s resolves to %s, outside the archive root %s\n' "$repo_base_dir" "$rb" "$rr"; return 0 ;;
+  esac
+}
+
 _detached_pr_check() {
   local wt="$1" run_id="$2" task_id="$3" repo_path="$4" repo_slug="$5" pr_num="$6" \
         want_reason="$7" apply="$8" superseded_by="${9:-}" \
@@ -335,7 +371,16 @@ _detached_pr_check() {
     # in the same second must never share, and truncate, one manifest
     # (review r2 M3 of PR #236).
     archive_dir="$archive_root/$repo_base/detached-pr-$pr_num-$ts-$$"
-    if ! mkdir -p "$archive_root/$repo_base" 2>/dev/null || ! mkdir "$archive_dir" 2>/dev/null; then
+    if ! mkdir -p "$archive_root/$repo_base" 2>/dev/null; then
+      _DPR_REASON="archiving ignored artifacts failed: could not create $archive_root/$repo_base"
+      return
+    fi
+    root_why=$(_archive_repo_base_why "$archive_root" "$archive_root/$repo_base" "$wt")
+    if [ -n "$root_why" ]; then
+      _DPR_REASON="$root_why"
+      return
+    fi
+    if ! mkdir "$archive_dir" 2>/dev/null; then
       _DPR_REASON="archiving ignored artifacts failed: could not create $archive_dir (or it already exists)"
       return
     fi
@@ -545,7 +590,16 @@ _superseded_check() {
   # _detached_pr_check's own detached-pr-*; unique per run (pid), never -p,
   # for the same reason given there.
   archive_dir="$archive_root/$repo_base/superseded-$pr_num-$ts-$$"
-  if ! mkdir -p "$archive_root/$repo_base" 2>/dev/null || ! mkdir "$archive_dir" 2>/dev/null; then
+  if ! mkdir -p "$archive_root/$repo_base" 2>/dev/null; then
+    _DPR_REASON="archiving failed: could not create $archive_root/$repo_base"
+    return
+  fi
+  root_why=$(_archive_repo_base_why "$archive_root" "$archive_root/$repo_base" "$wt")
+  if [ -n "$root_why" ]; then
+    _DPR_REASON="$root_why"
+    return
+  fi
+  if ! mkdir "$archive_dir" 2>/dev/null; then
     _DPR_REASON="archiving failed: could not create $archive_dir (or it already exists)"
     return
   fi
