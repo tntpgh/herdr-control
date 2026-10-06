@@ -1356,6 +1356,144 @@ _manifest_has "$u_archive_dir/MANIFEST.sha256" "$exp_pos_sha" "tmp/notes.md" \
   && ok "U positive: tmp/notes.md archived with a matching sha256 in the manifest" \
   || bad "U positive: manifest missing/mismatched: $(cat "$u_archive_dir/MANIFEST.sha256" 2>&1)"
 
+check "U positive: detail records pr_head" "$(_uev detail.superseded_close.pr_head)" "$U_PR_SHA"
+
+printf -- '-- H1: deep-review:* is accepted on both sides (every live example is deep-review) --\n'
+
+_u_case "deep-review:old-h1" "deep-review:new-h1"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q '^  close' && printf '%s' "$out" | grep -q '(superseded)' \
+  && ok "U H1: deep-review:* labels on both sides are accepted (closable)" || bad "U H1 output: $out"
+
+printf -- '-- mutant M3: same PR NUMBER in a DIFFERENT repo HOLDs, never "reviews the same PR" --\n'
+
+_u_case "review:old-repocmp" "review:new-repocmp"
+sqlite3 "$(registry_db)" "UPDATE tasks SET review_pr_repo='org/other-repo' WHERE task_id='$U_NEWTASK';"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'reviews org/other-repo#.*, not org/repo#' \
+  && ok "U rule1 (mutant M3): same PR# in a DIFFERENT repo HOLDs" || bad "U rule1 (mutant M3) output: $out"
+
+printf -- '-- M1: an ignored file OUTSIDE tmp/.handoffs (.private/) is archived, never silently dropped --\n'
+
+echo '.private/' >> "$(git -C "$U_WORK" rev-parse --git-common-dir)/info/exclude"
+_u_case "review:old-m1" "review:new-m1"
+mkdir -p "$U_WT/.private" "$U_WT/.handoffs"
+printf 'ignored note outside tmp/.handoffs\n' > "$U_WT/.private/notes.txt"
+exp_private_sha=$(shasum -a 256 "$U_WT/.private/notes.txt" | cut -d' ' -f1)
+printf 'verified: ran the check, output attached\n' > "$U_WT/.handoffs/PROOF.md"
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" --superseded-by="$U_NEWTASK" \
+  --proof=".handoffs/PROOF.md#check" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U M1: --apply closes despite an ignored file outside tmp/.handoffs" || bad "U M1 exit $rc: $out"
+check "U M1: task completed" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "completed"
+m1_archive_dir=$(find "$HERDR_ARCHIVE_ROOT" -maxdepth 2 -type d -name "superseded-$U_PR-*" 2>/dev/null | head -1)
+_manifest_has "$m1_archive_dir/MANIFEST.sha256" "$exp_private_sha" ".private/notes.txt" \
+  && ok "U M1: .private/notes.txt is archived with a matching sha256, never dropped" \
+  || bad "U M1: manifest missing .private/notes.txt: $(cat "$m1_archive_dir/MANIFEST.sha256" 2>&1)"
+
+printf -- '-- M3: rule-4 enumeration failing HOLDs, never reads as "nothing to archive" --\n'
+
+_u_case "review:old-m3" "review:new-m3"
+mkdir -p "$U_WT/.handoffs"
+printf 'verified: ran the check, output attached\n' > "$U_WT/.handoffs/PROOF.md"
+M3_BIN="$U_TMP/m3bin"; mkdir -p "$M3_BIN"
+REAL_GIT=$(command -v git)
+cat > "$M3_BIN/git" <<EOF
+#!/bin/bash
+if [ "\$1" = "-C" ] && [ "\$3" = "ls-files" ]; then
+  case "\$*" in
+    *--ignored*) exit 128 ;;
+  esac
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$M3_BIN/git"
+out=$(PATH="$M3_BIN:$PATH" bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" \
+  --superseded-by="$U_NEWTASK" --proof=".handoffs/PROOF.md#check" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'could not list ignored artifacts' \
+  && ok "U M3: a failing ignored-file enumeration HOLDs, never reads as nothing to archive" || bad "U M3 output: $out"
+check "U M3: task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+printf -- '-- M2: a reflog-only commit (left behind by re-detaching) HOLDs --\n'
+
+_u_case "review:old-m2" "review:new-m2"
+G -C "$U_WT" commit -q --allow-empty -m "stray local commit, later abandoned"
+git -C "$U_WT" checkout -q --detach "$U_PR_SHA"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=superseded --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'reflog holds a commit' \
+  && ok "U M2: a reflog-only commit left by re-detaching HOLDs" || bad "U M2 output: $out"
+
+printf -- '-- M4: a CLOSED-unmerged PR keeps closing via --reason=superseded, with or without --superseded-by (regression) --\n'
+
+_u_m4_mk() {                    # CLOSED-PR fixture -> U_M4_WT/U_M4_RUN/U_M4_TASK/U_M4_SHA/U_M4_N
+  _u_n=$((_u_n + 1))
+  local n br seed
+  n=$((9000 + _u_n)); br="pr-u$n"; seed="$U_TMP/seed-$n"
+  GH_PRS="$GH_PRS
+org/repo#$n $br CLOSED -"
+  G -C "$U_WORK" worktree add -q -b "$br" "$seed" main
+  G -C "$seed" commit -q --allow-empty -m "$br work"
+  G -C "$seed" push -q origin "$br:refs/pull/$n/head"
+  U_M4_N="$n"
+  U_M4_SHA=$(git -C "$seed" rev-parse HEAD)
+  git -C "$U_WORK" worktree remove --force "$seed" >/dev/null 2>&1
+  U_M4_WT="$U_WT_ROOT/wt-$n"
+  git -C "$U_WORK" worktree add -q --detach "$U_M4_WT" "$U_M4_SHA"
+  mkdir -p "$U_M4_WT/.handoffs"
+  printf 'verified: ran the check, output attached\n' > "$U_M4_WT/.handoffs/PROOF.md"
+  U_M4_RUN="runU$n"; U_M4_TASK="taskU$n"
+  register_task "$U_M4_RUN" "$U_M4_TASK" w c cp cb pD birthD-live "$U_WORK" "$U_M4_WT" "review:old-$n" \
+    || bad "U M4 setup: register $U_M4_TASK"
+  set_task_state "$U_M4_RUN" "$U_M4_TASK" running || bad "U M4 setup: $U_M4_TASK -> running"
+  set_task_review_pr "$U_M4_RUN" "$U_M4_TASK" org/repo "$n" || bad "U M4 setup: set_task_review_pr $U_M4_TASK"
+}
+
+_u_m4_mk
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_M4_TASK" \
+  --proof=".handoffs/PROOF.md#check" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U M4: CLOSED + superseded with NO --superseded-by still closes (regression)" \
+  || bad "U M4 (no flag) exit $rc: $out"
+check "U M4: task completed (no flag)" "$(read_task "$U_M4_RUN" "$U_M4_TASK" | jq -r .state)" "completed"
+_uev4a() { sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.$1') FROM events WHERE task_id='$U_M4_TASK' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';"; }
+[ "$(_uev4a detail.detached_close.state)" = CLOSED ] \
+  && ok "U M4: closed via the GENERIC path (detached_close), not the bypass (no flag)" \
+  || bad "U M4: wrong detail shape (no flag): $(_uev4a detail.detached_close.state)"
+
+_u_m4_mk
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_M4_TASK" \
+  --superseded-by=does-not-exist-task --proof=".handoffs/PROOF.md#check" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U M4 (mutant M17/M19): CLOSED + superseded WITH --superseded-by still closes via the generic path" \
+  || bad "U M4 (with flag) exit $rc: $out"
+check "U M4: task completed (with flag)" "$(read_task "$U_M4_RUN" "$U_M4_TASK" | jq -r .state)" "completed"
+_uev4b() { sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.$1') FROM events WHERE task_id='$U_M4_TASK' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';"; }
+[ "$(_uev4b detail.detached_close.state)" = CLOSED ] \
+  && ok "U M4 (mutant M17/M19): the OPEN-only gate kept --superseded-by from re-routing a CLOSED PR" \
+  || bad "U M4: wrong detail shape (with flag): $(_uev4b detail.detached_close.state)"
+
+printf -- '-- M12: the live source changing mid-archive fails manifest verification, never closes --\n'
+
+_u_case "review:old-m12" "review:new-m12"
+mkdir -p "$U_WT/tmp"
+printf 'original content\n' > "$U_WT/tmp/notes.md"
+cat > "$U_TMP/m12-hook.sh" <<EOF
+printf 'mutated after the copy-time hash\n' > "$U_WT/tmp/notes.md"
+EOF
+out=$(PATH="$HOOKPATH" HOOK_FILE="$U_TMP/m12-hook.sh" bash "$here/close-done-workers.sh" --apply --reason=superseded \
+  --task="$U_TASK" --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'verification failed' \
+  && ok "U M12: the source changing mid-archive fails verification, never closes" || bad "U M12 output: $out"
+check "U M12: task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+printf -- '-- mutant M18: --superseded-by is ignored unless --reason=superseded (opt-in gate) --\n'
+
+_u_case "review:old-m18" "review:new-m18"
+out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=no-follow-on --superseded-by="$U_NEWTASK" 2>&1)
+printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'not yet closable' \
+  && ok "U mutant M18: --superseded-by with --reason=no-follow-on never engages the bypass" || bad "U mutant M18 output: $out"
+
+
 
 
 
