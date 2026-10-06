@@ -1866,6 +1866,38 @@ HERDR_SELECT_RECORD_WAIT_S=1 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" sel 1 --autho
   && ok "the controller's row is not the hook's record: waited the window, then refused" \
   || bad "rc=$rc keys=$(keys_pressed) trace: $(cat "$WAIT_TRACE")"
 
+printf '== fix/select-hook-none: the hook-record wait also runs for --authority conductor ==\n'
+# Before this fix, wait_for_input_required_row (lib/scoped-policy.sh) ran
+# for authority=peer only. The #191 tool-identity check a few lines below
+# it in herdr-select.sh judges peer AND conductor alike, so a conductor
+# pressing `--authority conductor` the instant a push_wake lands (SKILL.md's
+# documented flow) hit the identical "row not written yet" race peer was
+# fixed for — and had no wait to close it. SPEC.md 2026-10-05: spawn-task.sh
+# implement workers (tabs w5W:t7, w6H:t2, w6J:t2) refused with "approval
+# panel claims tool bash but the hook recorded '<none>' for this prompt"
+# on trivial commands because the attention-controller's tool-less row won
+# push_wake's claim first and the conductor answered before the hook's own
+# later corroborated write replaced it.
+set_task_state runR taskR running >/dev/null 2>&1
+CRACE_MSG="npm run build"
+HERDR_TEST_SKIP_AUTOSEED=1 set_menu "$CRACE_MSG"; reset_keys
+: > "$WAIT_TRACE"
+seed_after_poll2 runR taskR "$CRACE_MSG" &
+bg_pid=$!
+( export HERDR_PANE_ID=w9:p9
+  HERDR_SELECT_RECORD_WAIT_S=5 HERDR_SELECT_WAIT_TRACE="$WAIT_TRACE" \
+  sel 1 --authority conductor --review-category local-build \
+    --review-reason "Reviewed complete command; trivial build step." \
+    --expect-prompt-id "$(prompt_id "$PANE")" ); rc=$?
+wait "$bg_pid" 2>/dev/null
+[ "$rc" -eq 0 ] && ok "conductor waited for the delayed registry row instead of judging the raw panel" \
+  || bad "conductor race not resolved: rc=$rc; stderr: $(cat "$WORK/err.txt")"
+[ "$(tail -1 "$WAIT_TRACE")" = "found" ] && ok "conductor trace ends in found" \
+  || bad "conductor trace did not end in found: $(cat "$WAIT_TRACE")"
+cpoll_count=$(grep -c '^poll ' "$WAIT_TRACE")
+[ "$cpoll_count" -ge 2 ] && ok "at least one conductor poll found nothing before the row landed ($cpoll_count polls)" \
+  || bad "only $cpoll_count poll(s) — the row must have already existed at call time: $(cat "$WAIT_TRACE")"
+
 printf '== change 2: a peer refusal records the TASKs own_run/own_task and the prompt_id ==\n'
 REFUSE_TEXT="gh pr merge 99 --squash"
 set_menu "$REFUSE_TEXT"; reset_keys
