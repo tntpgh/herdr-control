@@ -1049,11 +1049,13 @@ _valid_superseded_detail() {
         # shellcheck source=lib/worktree-archive.sh
         . "$(dirname "${BASH_SOURCE[0]}")/worktree-archive.sh" 2>/dev/null
       fi
-      if command -v archive_verify_manifest >/dev/null 2>&1; then
-        if ! archive_verify_manifest "$task_wt" "$archive/MANIFEST.sha256"; then
-          _PROOF_REF_WHY="archive manifest verification failed: ${_ARCHIVE_WHY:-unknown}"
-          return 1
-        fi
+      if ! command -v archive_verify_manifest >/dev/null 2>&1; then
+        _PROOF_REF_WHY="cannot load archive_verify_manifest"
+        return 1
+      fi
+      if ! archive_verify_manifest "$task_wt" "$archive/MANIFEST.sha256"; then
+        _PROOF_REF_WHY="archive manifest verification failed: ${_ARCHIVE_WHY:-unknown}"
+        return 1
       fi
     fi
   fi

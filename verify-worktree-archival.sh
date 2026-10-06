@@ -1591,6 +1591,22 @@ out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$d" 2>&1); rc=$
 [ "$rc" -ne 0 ] && ok "U T1 (V3): pr mismatch alone is REFUSED" || bad "U T1 (V3): rc=$rc $out"
 check "U T1 (V3): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
 
+_u_case "review:old-l1v3" "review:new-l1v3"
+sqlite3 "$(registry_db)" "UPDATE tasks SET review_pr_number=review_pr_number+1 WHERE task_id='$U_NEWTASK';"
+_u_valid_detail
+# L1 (mutant V3): the old-V3 test above is caught by the superseded_by-PR
+# check (V7) instead, because its pr field still names THIS task's real PR
+# while superseded_by's own recorded PR differs. Here detail.pr is changed
+# to match superseded_by's (bumped) PR, so that check passes too -- only
+# the standalone "pr == this task's own recorded PR" check (line ~976) can
+# still catch it.
+l1v3_new_pr=$(sqlite3 "$(registry_db)" "SELECT review_pr_number FROM tasks WHERE task_id='$U_NEWTASK';")
+d=$(printf '%s' "$U_VALID_DETAIL" | jq -c --arg pr "org/repo#$l1v3_new_pr" '.superseded_close.pr = $pr')
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$d" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (L1/V3): detail.pr matching superseded_by's PR but not this task's own is REFUSED" \
+  || bad "U T1 (L1/V3): rc=$rc $out"
+check "U T1 (L1/V3): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
 _u_case "review:old-v4" "review:new-v4"
 _u_valid_detail
 d=$(printf '%s' "$U_VALID_DETAIL" | jq -c '.superseded_close.superseded_by = ""')
@@ -1652,6 +1668,21 @@ out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$d" 2>&1); rc=$
 [ "$rc" -ne 0 ] && ok "U T1 (4a-location): an archive outside HERDR_ARCHIVE_ROOT alone is REFUSED" || bad "U T1 (4a-location): rc=$rc $out"
 check "U T1 (4a-location): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
 
+_u_case "review:old-l2w1" "review:new-l2w1"
+_u_valid_detail
+# L2 (mutant W1): the 4a-location test above is also misnamed (it fails
+# the naming check first), so it cannot pin the standalone containment
+# check in isolation. Here the dir is correctly named superseded-<N>-*
+# but still sits outside HERDR_ARCHIVE_ROOT.
+outside_named_dir="$U_TMP/outside-root-l2w1/superseded-$U_PR-x"
+mkdir -p "$outside_named_dir"
+printf '%s\n' "$U_PR_SHA" > "$outside_named_dir/HEAD.txt"
+d=$(printf '%s' "$U_VALID_DETAIL" | jq -c --arg a "$outside_named_dir" '.superseded_close.archive = $a')
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$d" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (L2/W1): a correctly-named archive OUTSIDE the archive root alone is REFUSED" \
+  || bad "U T1 (L2/W1): rc=$rc $out"
+check "U T1 (L2/W1): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
 _u_case "review:old-v17" "review:new-v17"
 _u_valid_detail
 badname_dir="$HERDR_ARCHIVE_ROOT/$(basename "$U_WORK")/not-a-superseded-name-$U_PR"
@@ -1678,6 +1709,36 @@ out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "$U_VALID_DETAIL
 [ "$rc" -ne 0 ] && ok "U T1 (4a-manifest): a MANIFEST.sha256 entry that doesn't verify alone is REFUSED" || bad "U T1 (4a-manifest): rc=$rc $out"
 check "U T1 (4a-manifest): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
 
+printf -- '-- L3 (fail closed): the manifest check REFUSES when archive_verify_manifest cannot be loaded --\n'
+
+_u_case "review:old-l3" "review:new-l3"
+_u_valid_detail
+mkdir -p "$U_VALID_ARCHIVE/files/tmp"
+printf 'real content\n' > "$U_VALID_ARCHIVE/files/tmp/notes.md"
+printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\t12\ttmp/notes.md\n' > "$U_VALID_ARCHIVE/MANIFEST.sha256"
+L3_TMP="$U_TMP/l3"; mkdir -p "$L3_TMP/lib" "$L3_TMP/runs"
+# A copy of run-registry.sh with no sibling worktree-archive.sh next to it,
+# so the dynamic `. "$(dirname "${BASH_SOURCE[0]}")/worktree-archive.sh"`
+# source attempt inside _valid_superseded_detail fails and
+# archive_verify_manifest never becomes defined -- review PR #249 r4's F0j
+# shape, isolated from the real lib/ (which is never touched).
+cp "$here/lib/run-registry.sh" "$L3_TMP/lib/run-registry.sh"
+sqlite3 "$(registry_db)" ".backup '$L3_TMP/runs/registry.sqlite3'"
+out=$(HERDR_RUN_STATE_DIR="$L3_TMP/runs" bash -c \
+  '. "$1/lib/run-registry.sh" && set_task_state "$2" "$3" completed superseded "" "$4"' \
+  _ "$L3_TMP" "$U_RUN" "$U_TASK" "$U_VALID_DETAIL" 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "U T1 (L3): a MANIFEST.sha256 present but archive_verify_manifest unloadable is REFUSED" \
+  || bad "U T1 (L3): rc=$rc $out"
+# Note: the specific "cannot load archive_verify_manifest" reason set inside
+# _valid_superseded_detail is NOT what reaches the caller here -- a failed
+# superseded-detail check always falls through to the generic
+# _valid_proof_ref("") check, which resets _PROOF_REF_WHY to empty before
+# refusing for lack of a --proof. rc alone is what distinguishes the fix
+# (refused) from the L3 mutant (silently accepted, rc=0), same as every
+# other V*/W* check in this section.
+check "U T1 (L3): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
 printf -- '-- 4b: a symlinked archive repo_base dir is refused before anything is written through it --\n'
 
 _u_case "review:old-4b" "review:new-4b"
@@ -1696,6 +1757,30 @@ rc=$?
 check "U (4b): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
 [ -z "$(find "$elsewhere_4b" -mindepth 1 2>/dev/null)" ] && ok "U (4b): nothing was written through the symlink" \
   || bad "U (4b): files appeared at the symlink target: $(find "$elsewhere_4b" -mindepth 1)"
+
+printf -- '-- L4 (mutant B5): the symlinked repo_base check also holds via the GENERIC detached-close path --\n'
+
+_u_m4_mk
+b5_root="$U_TMP/archive-root-l4b5"
+mkdir -p "$b5_root"
+repo_base_b5="$(basename "$U_WORK")"
+elsewhere_b5="$U_TMP/symlink-target-l4b5"
+mkdir -p "$elsewhere_b5"
+ln -s "$elsewhere_b5" "$b5_root/$repo_base_b5"
+# B4 (above) only pins the superseded_check call site. --reason=superseded
+# with NO --superseded-by on a CLOSED PR instead closes via the GENERIC
+# detached-close path (_detached_pr_check, confirmed by M4's
+# detail.detached_close.state assertion), which has its own, separate
+# _archive_repo_base_why call site.
+out=$(HERDR_ARCHIVE_ROOT="$b5_root" bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_M4_TASK" \
+  --proof=".handoffs/PROOF.md#check" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'symlink' \
+  && ok "U T1 (L4/B5): a symlinked archive repo_base dir HOLDs via the generic detached-close path" \
+  || bad "U T1 (L4/B5) exit $rc: $out"
+check "U T1 (L4/B5): task untouched" "$(read_task "$U_M4_RUN" "$U_M4_TASK" | jq -r .state)" "running"
+[ -z "$(find "$elsewhere_b5" -mindepth 1 2>/dev/null)" ] && ok "U T1 (L4/B5): nothing was written through the symlink" \
+  || bad "U T1 (L4/B5): files appeared at the symlink target: $(find "$elsewhere_b5" -mindepth 1)"
 
 
 printf -- '-- T2 (mutant V14): a proof GIVEN alongside a valid bypass still never lands in the audit row --\n'
