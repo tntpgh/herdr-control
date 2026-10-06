@@ -371,11 +371,31 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
   # fix/peer-waits-for-record change 1: give the hook's own write a brief
   # head start before judging a raw scrape it was about to correct — see
   # lib/scoped-policy.sh wait_for_input_required_row for the exact race.
-  # Peer-only (a human reviewing their own screen needs no registry text at
-  # all) and skipped on a Deny (which never needed corroboration — see the
-  # panel_scrape fallback below).
-  [ "$authority" = peer ] && [ "$declining" = 0 ] && \
-    wait_for_input_required_row "$own_run" "$own_task" "$current_prompt_id"
+  # fix/select-hook-none (2026-10-05, SPEC.md): this used to be peer-only,
+  # but the #191 tool-identity check seven lines below runs for peer AND
+  # conductor, and conductor automation (a conductor agent pressing
+  # `herdr-select.sh --authority conductor` the moment a push_wake lands —
+  # SKILL.md's documented conductor-approval flow) can press just as fast
+  # as peer automation can. Measured on spawn-task.sh implement workers
+  # (tabs w5W:t7, w6H:t2, w6J:t2, 2026-10-05): the attention-controller
+  # routinely wins push_wake's per-prompt claim ahead of the hook
+  # (agent-hooks/omp-notify.sh), writes a tool-less/command-less
+  # input_required row AND delivers the wake off it, so a conductor
+  # answering that wake before the hook's own later corroborated write
+  # replaces the row saw registry_tool/registry_cmd empty and refused —
+  # "the hook recorded '<none>'" — even though a real record was still
+  # landing. No policy changed: this only waits for information that is
+  # already coming before judging it, exactly as it already did for peer.
+  # A human reviewing their own screen needs no registry text at all
+  # (authority=human is excluded by the guard above), and a Deny never
+  # needed corroboration — see the panel_scrape fallback below — so the
+  # wait still runs for peer/conductor Approve-path lookups only.
+  case "$authority" in
+    peer|conductor)
+      [ "$declining" = 0 ] && \
+        wait_for_input_required_row "$own_run" "$own_task" "$current_prompt_id"
+      ;;
+  esac
   registry_cmd="$(task_input_required_command "$own_run" "$own_task" "$current_prompt_id" 2>/dev/null)"
   # lib/scoped-policy.sh approval_command_text: the recorded command when the
   # panel (whitespace-collapsed) contains it, else the panel; exit 2 = the two

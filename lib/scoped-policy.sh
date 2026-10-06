@@ -236,8 +236,12 @@ _sp_clamp_wait_seconds() {
 # fix/peer-waits-for-record change 1: an input_required row exists the
 # INSTANT the hook (agent-hooks/omp-notify.sh -> lib/push-wake.sh push_wake)
 # writes it, but herdr-select.sh can be called before that write lands — a
-# peer answering as fast as the alert path fires, or the omp hook itself
-# racing tool_approval_requested. Live registry, 2026-09-26: event 37805
+# peer OR conductor answering as fast as the alert path fires, or the omp
+# hook itself racing tool_approval_requested. fix/select-hook-none widened
+# the caller from peer-only to peer+conductor (herdr-select.sh): conductor
+# automation races the identical write, and used to see the same empty
+# lookup with no wait to close it.
+# Live registry, 2026-09-26: event 37805
 # input_required and 37806 wake_held landed the SAME second — a
 # herdr-select.sh lookup racing between the two found nothing, judged the
 # SCRAPED panel instead of the untruncated registry command, and a
