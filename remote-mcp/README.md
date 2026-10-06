@@ -480,8 +480,18 @@ outbox are added.
    showing a permission prompt refuses it: `blocked:owner_at_approval_prompt`,
    retried up to `APPROVAL_RETRY_CAP` (10) sync ticks before it gives up and
    stays blocked (not retried forever, unlike a message's 15-minute
-   envelope-level expiry). Any other non-zero `herdr-deliver.sh` exit, or a
-   timeout, is a terminal `blocked:deliver_failed:<rc|timeout>`.
+   envelope-level expiry). Exit 4 (`UNSUBMITTED`, unchanged/busy composer)
+   means the notice was **already typed**, but submission is unconfirmed.
+   It stays `queued` with `detail: "deliver_failed:4"` and is **never leased
+   or typed again**; at the 15-minute delivery expiry it becomes terminal
+   `blocked:deliver_failed:4`. Exit 5 after typing (`delivered but NOT
+   submitted`) follows this same unconfirmed path, not the pre-send rc5
+   retry. The publisher persists the unconfirmed outcome in local
+   `state.json`: a lost ack or publisher restart replays rc4 without typing
+   or claiming delivery. A reply file in `replies/` or `replies/sent/`
+   suppresses notice delivery before refreshing pane identity, including
+   while the file is still settling. Other non-zero exits/timeouts remain
+   terminal.
 9. A reply is a file the owner (human or agent) writes themselves:
    `~/.local/state/herdr/inbox/<label>/replies/<exchange_id>.md` — never
    typed by anything, never auto-generated. The publisher scans for new
@@ -498,6 +508,35 @@ outbox are added.
    same Mac user wrote this file to this path, not that the registered
    owner pane itself typed it — any other same-uid process on the Mac
    could write a reply file too (REVIEW-219 R2-3).
+   A matching reply is also accepted while a body-written exchange is
+   queued/delivering with `detail: "deliver_failed:4"` or
+   `"owner_at_approval_prompt"`; this includes an in-flight legacy retry
+   that changes rc4 to rc5. Notice submission is not required once the
+   owner has read the body and answered, so `replied` may legitimately have
+   `delivered_at: null`. These shapes are documented by
+   `get_owner_message_status` for remote callers.
+
+   **Expiry is based on Worker sync time**, not the reply file's mtime or
+   claimed `responded_at`: an undelivered exchange accepts a reply only
+   when `now < expires_at` (15 minutes after the exchange was queued).
+   A reply written before expiry but synced at/after expiry is **not
+   accepted**, and an already-terminal exchange is never revived. Once a
+   notice was confirmed `delivered`, this delivery TTL no longer applies
+   to its reply, preserving the existing delivered-reply behavior.
+
+   **Identity and authorization still fail closed.** The publisher records
+   the original owner registration (pane id/birth, session and registration
+   timestamps) locally with the body-written outcome. Before posting a reply
+   it re-reads the registration and live pane identity. An unregistered,
+   re-registered or replaced owner/pane, missing original identity record
+   (including legacy exchanges), or failed identity refresh leaves the reply
+   local and unaccepted; it is not deleted or silently attributed to the
+   new owner. The new identity record stays on the Mac; replies retain the
+   existing opaque session token, not the registration fields. The Worker checks the
+   sender allowlist, live unexpired grant with `herdr:message.owner`, and
+   inbox switch for reply acceptance as well as delivery. A grant-lookup
+   hold remains transient; revoked/expired grants, removed scope, disabled
+   inboxes and mismatched labels do not gain reply access.
 
 ### Audit and limits
 
@@ -677,7 +716,12 @@ triggers `lib/run-registry.sh`'s schema migration) plus `python3
 remote-mcp/verify-owner-inbox.py` (registry read, the F1 pane-identity
 re-check, symlink-refused inbox writes and reply scans, and
 `herdr-deliver.sh`'s exit-code mapping, including exit 5 →
-`owner_at_approval_prompt`) plus `python3
+`owner_at_approval_prompt`, post-type rc5 handling, unsettled-reply deferral
+and reply-file suppression). Publisher regressions cover rc4 notice dedup
+across restarts and fail-closed owner identity checks. The Worker suite
+covers unconfirmed-notice expiry, within-TTL late replies, mixed rc4/rc5
+reply acceptance, expired/revoked grants, scope removal, disabled inboxes
+and grant-lookup holds. Plus `python3
 remote-mcp/verify-tasks.py` (allowlist/caps refusals, objective sanitization,
 start/cancel/resume command processing, verify-research/verify-implement,
 deadline force-cancel — against fake `spawn-task.sh`/`close-done-workers.sh`/
