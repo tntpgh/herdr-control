@@ -39,8 +39,8 @@
     // Same two-switch shape as messaging/tasks -- the Mac's own switch is
     // HERDR_MCP_OWNER_INBOX (install.sh --remote-mcp-owner-inbox).
     "OWNER_INBOX_ENABLED": "true",
-    // Consumer positions are approved for build/review, not activation.
-    "EVENT_CONSUMERS_ENABLED": "false",
+    // Consumer positions activated on hub form 20261006T003752-8784 (activate=yes).
+    "EVENT_CONSUMERS_ENABLED": "true",
     // The commit this deploy was built from. provision.sh overrides it with
     // `--var BUILD_SHA:<sha>` from a clean, pushed tree; /healthz reports it.
     "BUILD_SHA": "unstamped"
