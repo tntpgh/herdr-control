@@ -112,12 +112,15 @@ it("consumer tools are absent and Durable Object calls refuse when the feature i
   const names = body.result.tools.map((tool) => tool.name);
   expect(names).not.toContain("get_consumer_position");
   expect(names).not.toContain("commit_consumer_position");
+  expect(names).not.toContain("rebase_consumer_position");
   expect((await callTool(access_token, "get_consumer_position", { consumer_id: "zero" })).isError).toBe(true);
   const fleet = e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet"));
   const caller = { email: "tnt@teamthurber.com", client_id: "c", client_name: "Zero" };
   expect((await fleet.getConsumerPosition(Date.now(), caller, ["herdr:read"], "zero")).result)
     .toBe("event_consumers_disabled");
   expect((await fleet.commitConsumerPosition(Date.now(), caller, ["herdr:read"], "zero", 0, 0, 1)).result)
+    .toBe("event_consumers_disabled");
+  expect((await fleet.rebaseConsumerPosition(Date.now(), caller, ["herdr:read"], "zero", 0, 0, 1, "0".repeat(64), true)).result)
     .toBe("event_consumers_disabled");
   const rows = await runInDurableObject(fleet, (_o: HerdrState, state) =>
     state.storage.sql.exec(`SELECT * FROM event_consumers`).toArray());

@@ -232,7 +232,7 @@ platform's own retry/resume) should follow this sequence exactly:
 ### Durable named consumer positions (built, disabled)
 
 `EVENT_CONSUMERS_ENABLED` defaults to `"false"` in the Worker. Only the literal
-`"true"` exposes these two tools to `herdr:read` callers; the Durable Object
+`"true"` exposes these three tools to `herdr:read` callers; the Durable Object
 checks the flag and scope again. Build/review authorization is **not**
 activation authorization. No deploy or activation is part of this change.
 
@@ -243,6 +243,9 @@ the event stream's tenant/original-sender boundary. Caller identity comes from
 the verified OAuth grant, never tool arguments. The same consumer name under
 another email or OAuth client denotes a separate checkpoint, not access to
 someone else's row. Owner-private events remain sender/client-only.
+Each caller/client may create at most 32 named consumers; further new names
+return `consumer_limit_reached` without inserting a row. Existing positions
+remain usable at the cap, and another caller/client has its own allowance.
 
 1. Call `get_consumer_position(consumer_id)` after each restart. First use
    stores cursor `0`, epoch `1`, and a SHA-256 `authorization_scope_hash`
@@ -260,7 +263,7 @@ someone else's row. Owner-private events remain sender/client-only.
    cannot prove downstream processing succeeded or detect a failed event
    that the caller omitted.
 4. The conditional update is transactional with its scope, pruning floor,
-   epoch and watermark checks. One racing writer wins; the stale one returns
+   generation and watermark checks. One racing writer wins; the stale one returns
    `committed_cursor_mismatch`. An epoch mismatch returns
    `lease_epoch_mismatch`. Backwards/past-watermark commits return
    `cursor_backwards`/`cursor_past_latest`. An equal cursor is a no-op after
@@ -269,18 +272,54 @@ someone else's row. Owner-private events remain sender/client-only.
 `latest_cursor` is the durable AUTOINCREMENT watermark, not `MAX` of retained
 rows: it survives pruning even when the event table becomes empty.
 Any checkpoint below `replay_floor_cursor`, **including zero**, returns
-`cursor_pruned` on get and commit. Stop and reconcile; these tools deliberately
-do not reset/rebind checkpoints or acknowledge across a known gap. A fresh
-consumer after pruning also reports the gap rather than starting silently at
-the floor. Explicit gap recovery is not provided by these two operations.
+`cursor_pruned` on get and ordinary commit. A fresh consumer after pruning also
+reports the gap rather than starting silently at the floor. Scope changes
+(including feature-flag changes to offered scopes) still fail closed with
+`cursor_scope_mismatch`; recover through the same explicit reconciliation:
+
+1. Capture **R = `latest_cursor`** and `current_authorization_scope_hash`
+   from `get_consumer_position`, together with the expected committed cursor
+   and epoch. On mismatch, `authorization_scope_hash` identifies the stored
+   binding; `current_authorization_scope_hash` identifies the current grant.
+2. Reconcile state visible under that current authorization scope using the
+   best available scoped reads. Do **not** replay historical notification
+   effects. Capture R **before** those reads so concurrent events remain
+   after R for replay.
+3. Call `rebase_consumer_position(consumer_id, expected_committed_cursor,
+   resume_cursor=R, lease_epoch, current_authorization_scope_hash,
+   reconciled=true)`. This explicitly asserts reconciliation, sets the
+   committed cursor to R and rebinds the stored scope to the current grant.
+   The server cannot prove reconciliation occurred, or that the caller
+   supplied a previously captured watermark rather than an arbitrary
+   in-range cursor; this is an assertion API like ordinary commit.
+4. Resume after R using the returned `scope_hash` and new epoch. Rebase
+   increments `lease_epoch` even if the cursor stays unchanged, fencing
+   pre-reconciliation workers. It checks the expected cursor, epoch, current
+   scope, current floor and watermark in the same transaction as the update
+   and audit insert. If R was itself pruned during reconciliation, recapture
+   and reconcile again; refusal changes no checkpoint and emits no
+   reconciliation audit (the MCP admission/refusal audit still applies).
+
+Successful rebases create an existing `audit` row with decision `reconciled`,
+reason `checkpoint_rebased` or `scope_rebound`, and old/new cursors, scope
+hashes and the new generation. They never emit historical lifecycle events.
+The audit follows the existing audit-retention/export path.
+
+Tail pruning may leave the latest retained row below the durable watermark.
+A from-zero catch-up can therefore reach a conservative `cursor_pruned` on
+its next page. Reconcile at the returned watermark and resume from R; the
+empty or post-R page then converges without moving the watermark backwards.
 
 This is **at-least-once**, not exactly-once. A crash before ACK replays the
 prefix; a crash after a downstream effect but before ACK may repeat the effect.
-Use destination idempotency keys where supported. Epoch `1` is initialized and
-fenced, but this build adds no lease acquisition, expiration, or takeover API;
-it does not claim exclusive processing ownership. `last_error` (nullable) and
-`failure_count` are stored diagnostics, not an automated retry/dead-letter
-policy. No alarms, transports, wake emitters, or outbox are added.
+Use destination idempotency keys where supported. Despite its compatibility
+name, `lease_epoch` is a checkpoint/reconciliation generation, **not a lease**:
+there is no acquisition, expiration, takeover, or exclusive ownership.
+Ordinary concurrent readers share a generation; expected-cursor CAS protects
+their commits, and explicit rebase advances the generation.
+`last_error` (nullable) and `failure_count` are stored diagnostics, not an
+automated retry/dead-letter policy. No alarms, transports, wake emitters, or
+outbox are added.
 
 ### Message rules (server-side, then re-checked on the Mac)
 

@@ -50,11 +50,13 @@ describe("durable consumer positions", () => {
     expect(await row()).toEqual(before);
   });
 
-  it("rejects a stale epoch without changing checkpoint or diagnostics", async () => {
-    await seedEvents();
+  it("[rebase] rejects a real pre-reconciliation epoch even when the cursor is unchanged", async () => {
     const start = await fleet.getConsumerPosition(Date.now(), caller, scopes, "zero");
+    const rebased = await fleet.rebaseConsumerPosition(Date.now(), caller, scopes, "zero", 0, 0,
+      start.lease_epoch!, start.current_authorization_scope_hash!, true);
+    expect(rebased).toMatchObject({ result: "ok", committed_cursor: 0, lease_epoch: start.lease_epoch! + 1 });
     const before = await row();
-    expect((await fleet.commitConsumerPosition(Date.now(), caller, scopes, "zero", 0, 1, start.lease_epoch! - 1)).result)
+    expect((await fleet.commitConsumerPosition(Date.now(), caller, scopes, "zero", 0, 0, start.lease_epoch!)).result)
       .toBe("lease_epoch_mismatch");
     expect(await row()).toEqual(before);
   });
@@ -183,5 +185,147 @@ describe("durable consumer positions", () => {
     const body = await response.json() as { result: { tools: { name: string }[] } };
     expect(body.result.tools.map((tool) => tool.name)).not.toContain("commit_consumer_position");
     expect(body.result.tools.map((tool) => tool.name)).not.toContain("get_consumer_position");
+    expect(body.result.tools.map((tool) => tool.name)).not.toContain("rebase_consumer_position");
+  });
+
+  it("[rebase] recovers new and lagging readers from a real tail prune without losing concurrent events", async () => {
+    await seedEvents();
+    const lagging = await fleet.getConsumerPosition(Date.now(), caller, scopes, "lagging");
+    await fleet.commitConsumerPosition(Date.now(), caller, scopes, "lagging", 0, 1, lagging.lease_epoch!);
+    await runInDurableObject(fleet, (_o: HerdrState, state) => {
+      state.storage.sql.exec(`UPDATE task_events SET subject_kind='owner_exchange', at=? WHERE cursor=3`,
+        Date.now() - 31 * 86_400_000);
+    });
+    expect((await signedSync(syncBody())).status).toBe(200); // real non-prefix prune
+    const retained = await fleet.listEvents(0, null, caller, 100);
+    expect(retained).toMatchObject({ result: "ok", scanned_through_cursor: 2, latest_cursor: 3, replay_floor_cursor: 3 });
+    expect((await fleet.listEvents(retained.scanned_through_cursor, retained.scope_hash, caller, 100)).result)
+      .toBe("cursor_pruned"); // conservative false-positive catch-up gap
+    for (const id of ["lagging", "new-after-prune"]) {
+      const gap = await fleet.getConsumerPosition(Date.now(), caller, scopes, id);
+      expect(gap).toMatchObject({ result: "cursor_pruned", latest_cursor: id === "lagging" ? 3 : 4, replay_floor_cursor: 3 });
+      // Capture R before reconciliation. A new event then arrives while reconciling.
+      await runInDurableObject(fleet, (_o: HerdrState, state) => {
+        state.storage.sql.exec(`INSERT INTO task_events (remote_task_id,type,at) VALUES ('','state_changed',?)`, Date.now());
+      });
+      const rebased = await fleet.rebaseConsumerPosition(Date.now(), caller, scopes, id, gap.committed_cursor!,
+        gap.latest_cursor!, gap.lease_epoch!, gap.current_authorization_scope_hash!, true);
+      expect(rebased).toMatchObject({ result: "ok", committed_cursor: gap.latest_cursor! });
+      const page = await fleet.listEvents(rebased.committed_cursor!, rebased.scope_hash!, caller, 100);
+      expect(page.result).toBe("ok");
+      expect(page.events.map((event) => event.cursor)).toEqual([gap.latest_cursor! + 1]);
+      expect(page.scanned_through_cursor).toBe(page.latest_cursor);
+      expect((await fleet.getConsumerPosition(Date.now(), caller, scopes, id)).committed_cursor).toBe(gap.latest_cursor);
+    }
+    const audit = await runInDurableObject(fleet, (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ target: string; decision: string; detail: string }>(
+        `SELECT target, decision, detail FROM audit WHERE tool='rebase_consumer_position'`).toArray());
+    expect(audit.map((entry) => [entry.target, entry.decision, JSON.parse(entry.detail).to]))
+      .toEqual([["lagging", "reconciled", 3], ["new-after-prune", "reconciled", 4]]);
+  });
+
+  it("[rebase] rebinds changed grants explicitly but refuses scope changes during reconciliation", async () => {
+    await seedEvents();
+    const start = await fleet.getConsumerPosition(Date.now(), caller, scopes, "zero");
+    const changedScopes = [...scopes, "herdr:message.owner"];
+    const mismatch = await fleet.getConsumerPosition(Date.now(), caller, changedScopes, "zero");
+    expect(mismatch.result).toBe("cursor_scope_mismatch");
+    const before = await row();
+    expect((await fleet.rebaseConsumerPosition(Date.now(), caller, scopes, "zero", 0, 3,
+      start.lease_epoch!, mismatch.current_authorization_scope_hash!, true)).result).toBe("cursor_scope_mismatch");
+    expect(await row()).toEqual(before);
+    const rebound = await fleet.rebaseConsumerPosition(Date.now(), caller, changedScopes, "zero", 0,
+      mismatch.latest_cursor!, mismatch.lease_epoch!, mismatch.current_authorization_scope_hash!, true);
+    expect(rebound).toMatchObject({ result: "ok", committed_cursor: 3,
+      authorization_scope_hash: mismatch.current_authorization_scope_hash });
+    expect((await fleet.getConsumerPosition(Date.now(), caller, changedScopes, "zero")).result).toBe("ok");
+    expect((await fleet.getConsumerPosition(Date.now(), caller, scopes, "zero")).result).toBe("cursor_scope_mismatch");
+  });
+
+  it("[rebase] conditional reconciliations race and a stale replay cannot mutate the winning checkpoint", async () => {
+    await seedEvents();
+    const start = await fleet.getConsumerPosition(Date.now(), caller, scopes, "zero");
+    const results = await Promise.all([1, 3].map((cursor) => fleet.rebaseConsumerPosition(Date.now(), caller, scopes,
+      "zero", 0, cursor, start.lease_epoch!, start.current_authorization_scope_hash!, true)));
+    expect(results.map((result) => result.result).sort()).toEqual(["lease_epoch_mismatch", "ok"]);
+    const before = await row();
+    expect((await fleet.rebaseConsumerPosition(Date.now(), caller, scopes, "zero", 0, 3,
+      start.lease_epoch!, start.current_authorization_scope_hash!, true)).result).toBe("lease_epoch_mismatch");
+    expect(await row()).toEqual(before);
+  });
+
+  it("[rebase] refuses missing, foreign, unconsented, stale, backwards and past-watermark rebases without writes", async () => {
+    await seedEvents();
+    const start = await fleet.getConsumerPosition(Date.now(), caller, scopes, "zero");
+    await fleet.commitConsumerPosition(Date.now(), caller, scopes, "zero", 0, 1, start.lease_epoch!);
+    const before = await row();
+    const hash = start.current_authorization_scope_hash!;
+    for (const [expected, cursor, consent, result] of [
+      [0, 3, true, "committed_cursor_mismatch"], [1, 0, true, "cursor_backwards"],
+      [1, 4, true, "cursor_past_latest"], [1, 3, false, "invalid_arguments"],
+      [1, -1, true, "invalid_arguments"], [1, 1.5, true, "invalid_arguments"],
+    ] as const) {
+      expect((await fleet.rebaseConsumerPosition(Date.now(), caller, scopes, "zero",
+        expected, cursor, start.lease_epoch!, hash, consent)).result).toBe(result);
+      expect(await row()).toEqual(before);
+    }
+    expect((await fleet.rebaseConsumerPosition(Date.now(), caller, [], "zero", 1, 3, start.lease_epoch!, hash, true)).result)
+      .toBe("insufficient_scope");
+    for (const other of [{ ...caller, email: "other@teamthurber.com" }, { ...caller, client_id: "other-client" }]) {
+      expect((await fleet.rebaseConsumerPosition(Date.now(), other, scopes, "zero", 1, 3,
+        start.lease_epoch!, hash, true)).result).toBe("consumer_not_found");
+    }
+    expect((await fleet.rebaseConsumerPosition(Date.now(), caller, scopes, "missing", 1, 3,
+      start.lease_epoch!, hash, true)).result).toBe("consumer_not_found");
+    expect(await row()).toEqual(before);
+  });
+
+  it("[rebase] refuses a captured boundary that was itself pruned during reconciliation", async () => {
+    await seedEvents();
+    const start = await fleet.getConsumerPosition(Date.now(), caller, scopes, "zero");
+    await runInDurableObject(fleet, (_o: HerdrState, state) => {
+      state.storage.sql.exec(`INSERT INTO task_events (remote_task_id,type,at,subject_kind)
+        VALUES ('','owner.reply_ready',?,'owner_exchange')`, Date.now() - 31 * 86_400_000);
+    });
+    await signedSync(syncBody());
+    const before = await row();
+    expect((await fleet.rebaseConsumerPosition(Date.now(), caller, scopes, "zero", 0, start.latest_cursor!,
+      start.lease_epoch!, start.current_authorization_scope_hash!, true)).result).toBe("cursor_pruned");
+    expect(await row()).toEqual(before);
+  });
+
+  it("[rebase] caps creation at 32 consumers per caller/client without stranding existing or other callers", async () => {
+    await Promise.all(Array.from({ length: 32 }, (_, i) => fleet.getConsumerPosition(Date.now(), caller, scopes, `c${i}`)));
+    const before = await row();
+    expect((await fleet.getConsumerPosition(Date.now(), caller, scopes, "overflow")).result).toBe("consumer_limit_reached");
+    expect(await row()).toEqual(before);
+    expect((await fleet.getConsumerPosition(Date.now(), caller, scopes, "c0")).result).toBe("ok");
+    const existing = await fleet.getConsumerPosition(Date.now(), caller, scopes, "c0");
+    expect((await fleet.rebaseConsumerPosition(Date.now(), caller, scopes, "c0", 0, 0,
+      existing.lease_epoch!, existing.current_authorization_scope_hash!, true)).result).toBe("ok");
+    for (const other of [{ ...caller, client_id: "other-client" }, { ...caller, email: "other@teamthurber.com" }]) {
+      expect((await fleet.getConsumerPosition(Date.now(), other, scopes, "c0")).result).toBe("ok");
+    }
+  });
+
+  it("[rebase] MCP recovers a fresh pruned consumer and returns a usable checkpoint across restart", async () => {
+    await seedEvents();
+    await runInDurableObject(fleet, (_o: HerdrState, state) => {
+      state.storage.sql.exec(`UPDATE task_events SET subject_kind='owner_exchange', at=?`, Date.now() - 31 * 86_400_000);
+    });
+    await signedSync(syncBody());
+    const { access_token } = await oauthToken(scopes);
+    const gap = await callTool<ConsumerPosition>(access_token, "get_consumer_position", { consumer_id: "zero" });
+    expect(gap.isError).toBe(true);
+    expect(gap.data).toMatchObject({ result: "cursor_pruned", committed_cursor: 0, latest_cursor: 3 });
+    const recovered = await callTool<ConsumerPosition>(access_token, "rebase_consumer_position", {
+      consumer_id: "zero", expected_committed_cursor: 0, resume_cursor: gap.data.latest_cursor,
+      lease_epoch: gap.data.lease_epoch, current_authorization_scope_hash: gap.data.current_authorization_scope_hash,
+      reconciled: true,
+    });
+    expect(recovered.isError).toBe(false);
+    expect(recovered.data).toMatchObject({ result: "ok", committed_cursor: 3, lease_epoch: 2 });
+    expect((await callTool<ConsumerPosition>(access_token, "get_consumer_position", { consumer_id: "zero" })).data)
+      .toMatchObject({ result: "ok", committed_cursor: 3, lease_epoch: 2 });
   });
 });
