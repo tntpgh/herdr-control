@@ -480,8 +480,13 @@ outbox are added.
    showing a permission prompt refuses it: `blocked:owner_at_approval_prompt`,
    retried up to `APPROVAL_RETRY_CAP` (10) sync ticks before it gives up and
    stays blocked (not retried forever, unlike a message's 15-minute
-   envelope-level expiry). Any other non-zero `herdr-deliver.sh` exit, or a
-   timeout, is a terminal `blocked:deliver_failed:<rc|timeout>`.
+   envelope-level expiry). Exit 4 (`UNSUBMITTED`, unchanged/busy composer)
+   reports `deliver_failed:4` but stays queued for retry: ten total lease
+   attempts, with 15s, 30s, then 60s capped backoff, before terminal
+   `blocked:deliver_failed:4`. The existing 15-minute expiry still applies.
+   A retry preserves the same exchange/body file and the identical fixed
+   notice; a reply file already in `replies/` or `replies/sent/` suppresses
+   retyping. Other non-zero exits and timeouts remain terminal.
 9. A reply is a file the owner (human or agent) writes themselves:
    `~/.local/state/herdr/inbox/<label>/replies/<exchange_id>.md` — never
    typed by anything, never auto-generated. The publisher scans for new
@@ -498,6 +503,12 @@ outbox are added.
    same Mac user wrote this file to this path, not that the registered
    owner pane itself typed it — any other same-uid process on the Mac
    could write a reply file too (REVIEW-219 R2-3).
+   A matching reply is also accepted while an rc 4 notice is queued or
+   delivering for retry; notice submission is not required once the owner
+   has read the body file and answered. A reply in the same sync as the
+   final busy ack takes precedence over exhaustion, and stays transient
+   during a grant-lookup hold. Revocation, the owner-inbox off switch,
+   mismatched labels, and already-terminal exchanges are not bypassed.
 
 ### Audit and limits
 
@@ -677,7 +688,9 @@ triggers `lib/run-registry.sh`'s schema migration) plus `python3
 remote-mcp/verify-owner-inbox.py` (registry read, the F1 pane-identity
 re-check, symlink-refused inbox writes and reply scans, and
 `herdr-deliver.sh`'s exit-code mapping, including exit 5 →
-`owner_at_approval_prompt`) plus `python3
+`owner_at_approval_prompt`, rc 4 notice/body idempotence and reply-file
+suppression). The Worker owner-inbox suite covers bounded busy retries,
+reply precedence, revocation and final-ack grant-lookup holds. Plus `python3
 remote-mcp/verify-tasks.py` (allowlist/caps refusals, objective sanitization,
 start/cancel/resume command processing, verify-research/verify-implement,
 deadline force-cancel — against fake `spawn-task.sh`/`close-done-workers.sh`/

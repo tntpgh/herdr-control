@@ -15,6 +15,7 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -340,6 +341,75 @@ class Delivery(unittest.TestCase):
             pub.post_sync, pub.deliver, pub.MESSAGING_ON_MAC = real_post, real_deliver, False
         self.assertEqual(typed, ["msg_1"])
         self.assertEqual(pub.load_state()["pending_acks"][0]["detail"], "already delivered (ack was lost)")
+
+
+class OwnerDeliveryTicks(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory(prefix="herdr-owner-ticks-")
+        self.addCleanup(self.scratch.cleanup)
+        root = Path(self.scratch.name)
+        self.item = {"exchange_id": "oex_tick1", "owner_label": "conductor",
+                     "sender": "sender2026", "body": "remote payload"}
+        snap, local = pub.build(NOW)
+        local["owners"] = {"conductor": {"pane_id": "w1:p1", "pane_birth": "term_cond", "agent_session": "session"}}
+        self.calls = []
+
+        def post(key, body):
+            self.calls.append(body)
+            return {"owner_outbox": [self.item] if body["lease"] else [],
+                    "audit": [], "audit_cursor": 0}
+
+        for target, value in (("OUT", root / "out"), ("INBOX_ROOT", root / "inbox"),
+                              ("OWNER_INBOX_ON_MAC", True), ("post_sync", post)):
+            p = patch.object(pub, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch.object(pub, "build", return_value=(snap, local))
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.dict(os.environ, {"HERDR_MCP_INGEST_KEY": "k" * 48,
+                                  "FAKE_ARGV": str(root / "argv"), "FAKE_RC": "4"})
+        p.start()
+        self.addCleanup(p.stop)
+        self.argv = root / "argv"
+
+    def test_busy_then_success_then_lost_ack_never_creates_another_message(self):
+        self.assertEqual(pub.main([]), 0)
+        self.assertEqual(self.calls[-1]["owner_acks"],
+                         [{"exchange_id": "oex_tick1", "outcome": "blocked", "reason": "deliver_failed:4"}])
+        self.assertNotIn("oex_tick1", pub.load_state().get("owner_delivered", {}))
+        body = pub.INBOX_ROOT / "conductor/messages/oex_tick1.md"
+        first_body, first_argv = body.read_bytes(), self.argv.read_bytes()
+        os.environ["FAKE_RC"] = "0"
+        self.assertEqual(pub.main([]), 0)
+        self.assertEqual(self.calls[-1]["owner_acks"], [{"exchange_id": "oex_tick1", "outcome": "delivered"}])
+        self.assertEqual(body.read_bytes(), first_body)
+        self.assertEqual(self.argv.read_bytes(), first_argv)
+        self.argv.unlink()
+        self.assertEqual(pub.main([]), 0)  # Worker re-leases after a lost ack
+        self.assertFalse(self.argv.exists())
+        self.assertEqual(list(body.parent.glob("*.md")), [body])
+
+    def test_busy_reply_is_scanned_even_when_another_notice_lease_arrives(self):
+        self.assertEqual(pub.main([]), 0)
+        replies = pub.INBOX_ROOT / "conductor/replies"
+        replies.mkdir()
+        reply = replies / "oex_tick1.md"
+        reply.write_text("answer from owner")
+        os.utime(reply, (1_700_000_000, 1_700_000_000))
+        self.argv.unlink()
+        self.assertEqual(pub.main([]), 0)
+        self.assertEqual(self.calls[-2]["owner_replies"][0]["body"], "answer from owner")
+        self.assertEqual(self.calls[-1]["owner_acks"], [])
+        self.assertFalse(self.argv.exists())
+        self.assertTrue(reply.exists())  # no acceptance outcome: keep for the next sync
+
+    def test_approval_prompt_ack_stays_unchanged(self):
+        os.environ["FAKE_RC"] = "5"
+        self.assertEqual(pub.main([]), 0)
+        self.assertEqual(self.calls[-1]["owner_acks"],
+                         [{"exchange_id": "oex_tick1", "outcome": "blocked", "reason": "owner_at_approval_prompt"}])
+        self.assertNotIn("oex_tick1", pub.load_state().get("owner_delivered", {}))
 
 class SchemaTolerance(unittest.TestCase):
     """registry_rows() opens the registry read-only via sqlite3.connect()

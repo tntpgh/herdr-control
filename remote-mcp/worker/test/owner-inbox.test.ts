@@ -189,6 +189,115 @@ describe("blocked states reported by the publisher's own ack", () => {
   });
 });
 
+describe("busy-pane owner notice retries", () => {
+  const actor = "tnt@teamthurber.com";
+  const gate = { revoked: [], hold: false };
+  async function tick(now: number, over: Parameters<typeof syncBody>[0] = {},
+      revoked: { actor: string; client_id: string }[] = [], hold = false) {
+    const out = await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(now, crypto.randomUUID(), JSON.stringify(syncBody({ snapshot: ownerSnapshot(), ...over })),
+        gate, gate, { revoked, hold }));
+    if (!out.ok) throw new Error(out.reason);
+    return out.response;
+  }
+  const status = (id: string) =>
+    runInDurableObject(fleet(), (o: HerdrState) => o.ownerMessageStatus(id, actor));
+  const busy = (id: string) => ({ exchange_id: id, outcome: "blocked" as const, reason: "deliver_failed:4" });
+  const reply = (id: string) => ({ exchange_id: id, owner_label: "conductor", body: "owner answer",
+    responded_at: new Date().toISOString(), artifact_revision: "r1", session: "opaque-session" });
+  async function queued() {
+    return runInDurableObject(fleet(), (_o: HerdrState, state) => queueRawOwner(state.storage));
+  }
+
+  it("backs off without marking delivered, then delivers on the next eligible tick", async () => {
+    const id = await queued();
+    const now = Date.now();
+    expect((await tick(now)).owner_outbox.map((m) => m.exchange_id)).toEqual([id]);
+    const ack = await tick(now + 1, { owner_acks: [busy(id)] });
+    expect(ack.owner_outbox).toEqual([]);
+    expect((await status(id))?.status).toBe("queued");
+    expect(ack.audit.filter((a) => a.message_id === id).map((a) => a.decision)).toEqual(["retry"]);
+    expect((await tick(now + 15_000)).owner_outbox).toEqual([]);
+    expect((await tick(now + 15_001)).owner_outbox.map((m) => [m.exchange_id, m.attempts])).toEqual([[id, 2]]);
+    await tick(now + 15_002, { lease: false, owner_acks: [{ exchange_id: id, outcome: "delivered" }] });
+    expect((await status(id))?.status).toBe("delivered");
+    expect((await tick(now + 100_000)).owner_outbox).toEqual([]);
+  });
+
+  it("caps exponential backoff at 60s and terminates the tenth busy attempt as deliver_failed:4", async () => {
+    const id = await queued();
+    let now = Date.now();
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      expect((await tick(now)).owner_outbox.map((m) => [m.exchange_id, m.attempts])).toEqual([[id, attempt]]);
+      await tick(now + 1, { lease: false, owner_acks: [busy(id)] });
+      expect((await status(id))?.status).toBe(attempt < 10 ? "queued" : "blocked:deliver_failed:4");
+      if (attempt < 10) {
+        const delay = Math.min(15_000 * 2 ** (attempt - 1), 60_000);
+        expect((await tick(now + delay)).owner_outbox).toEqual([]);
+        now += delay + 1;
+      }
+    }
+    expect((await tick(now + 120_000)).owner_outbox).toEqual([]);
+    const late = await tick(now + 120_001, { owner_acks: [busy(id)], owner_replies: [reply(id)] });
+    expect(late.owner_reply_results)
+      .toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "ignored:blocked:deliver_failed:4" }]);
+    expect((await status(id))?.status).toBe("blocked:deliver_failed:4");
+  });
+
+  for (const phase of ["queued", "delivering", "last-ack"] as const) {
+    it(`accepts a reply during ${phase} retry without another notice lease`, async () => {
+      const id = await queued();
+      const now = Date.now();
+      await tick(now);
+      await tick(now + 1, { lease: false, owner_acks: [busy(id)] });
+      if (phase !== "queued") await tick(now + 15_001);
+      if (phase === "last-ack") {
+        await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+          state.storage.sql.exec("UPDATE owner_messages SET attempts=10 WHERE exchange_id=?", id).toArray());
+      }
+      const out = await tick(now + 15_002, {
+        owner_replies: [reply(id)], ...(phase === "last-ack" ? { owner_acks: [busy(id)] } : {}),
+      });
+      expect(out.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "accepted" }]);
+      expect(out.owner_outbox).toEqual([]);
+      expect((await status(id))?.status).toBe("replied");
+      expect(await runInDurableObject(fleet(), (o: HerdrState) => o.ownerReply(id, actor)))
+        .toMatchObject({ body: "owner answer" });
+      expect((await tick(now + 15_003, { owner_replies: [reply(id)] })).owner_reply_results)
+        .toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "duplicate" }]);
+    });
+  }
+
+  it("keeps a reply transient when grant lookup holds the final busy ack, then accepts it", async () => {
+    const id = await queued();
+    const now = Date.now();
+    await tick(now);
+    await tick(now + 1, { lease: false, owner_acks: [busy(id)] });
+    await tick(now + 15_001);
+    await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec("UPDATE owner_messages SET attempts=10 WHERE exchange_id=?", id).toArray());
+    const held = await tick(now + 15_002, { owner_acks: [busy(id)], owner_replies: [reply(id)] }, [], true);
+    expect(held.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "ignored:queued" }]);
+    expect((await status(id))?.status).toBe("queued");
+    const recovered = await tick(now + 15_003, { owner_replies: [reply(id)] });
+    expect(recovered.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "conductor", outcome: "accepted" }]);
+    expect(recovered.owner_outbox).toEqual([]);
+  });
+
+  it("does not let a busy-retry reply bypass sender revocation or a mismatched owner", async () => {
+    const id = await queued();
+    const now = Date.now();
+    await tick(now);
+    await tick(now + 1, { lease: false, owner_acks: [busy(id)] });
+    const mismatch = await tick(now + 2, { lease: false, owner_replies: [{ ...reply(id), owner_label: "other" }] });
+    expect(mismatch.owner_reply_results).toEqual([{ exchange_id: id, owner_label: "other", outcome: "ignored:missing" }]);
+    const revoked = await tick(now + 3, { owner_replies: [reply(id)] }, [{ actor, client_id: "c" }]);
+    expect(revoked.owner_reply_results[0]?.outcome).not.toBe("accepted");
+    expect((await status(id))?.status).toBe("blocked:sender_revoked");
+    expect(await runInDurableObject(fleet(), (o: HerdrState) => o.ownerReply(id, actor))).toBeNull();
+  });
+});
+
 describe("get_owner_reply", () => {
   async function deliveredExchange(access_token: string) {
     const sent = await callTool<{ exchange_id: string }>(access_token, "send_owner_message",

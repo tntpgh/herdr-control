@@ -1193,10 +1193,10 @@ def deliver(item: dict, local: dict) -> dict:
 
 def deliver_owner(item: dict, local: dict) -> dict | None:
     """F1 re-check, then write the body to a file (never typed) and type
-    only the fixed notice pointing at it. herdr-deliver.sh's own exit 5
-    (permission prompt) maps straight to owner_at_approval_prompt -- SPEC's
-    bounded-retry reason -- not the generic 'retry' messages use; every
-    other non-zero exit is a terminal deliver_failed:<rc>.
+    only the fixed notice pointing at it. Exit 5 keeps its approval-prompt
+    retry; exit 4 reports deliver_failed:4, which the Worker now retries
+    with bounded backoff. Neither means delivered. All other non-zero
+    exits remain terminal.
 
     M1 (REVIEW-219): the F1 check against `local["panes"]` is the TICK-START
     hub snapshot, not "right before delivery" as README claims -- everything
@@ -1223,6 +1223,12 @@ def deliver_owner(item: dict, local: dict) -> dict | None:
     sender = clean(str(item.get("sender") or ""))
     if not write_inbox_message(label, exchange_id, sender, str(item.get("body") or "")):
         return {"exchange_id": exchange_id, "outcome": "blocked", "reason": "deliver_failed:write"}
+    # A reply proves the owner found the body without this notice. Leave
+    # acceptance to scan_owner_replies/the Worker, never infer delivery or
+    # re-type while a reply is settling, awaiting sync, or already accepted.
+    for kind in ("replies", "replies/sent"):
+        if _resolve_inbox_leaf(label, kind, exchange_id) is not None:
+            return None
     # M7 (REVIEW-219): exchange_id's own fixed format (oex_<compact-iso>Z_<hex>)
     # guarantees a digit at a predictable offset -- made deterministic, not
     # just theoretical, by this feature. herdr-deliver.sh's own check-then-type
@@ -1649,7 +1655,7 @@ def main(argv: list[str]) -> int:
         else:
             a = deliver_owner(item, local)
             if a is None:
-                continue  # M1: couldn't refresh identity this tick (hub hiccup); retried next tick
+                continue  # identity refresh failed, or a reply already exists; no notice/ack this tick
             if a["outcome"] == "delivered":
                 owner_delivered[eid] = now.timestamp()
                 # #225 item 3: owner_delivered above is a 24h cache for
