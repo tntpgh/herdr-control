@@ -971,17 +971,41 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
         return 1
       fi
       case "$reason" in
-        shipped|abandoned|superseded)
-        local proof_wt=""
-        case "$proof" in
-          *PROOF.md*) proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null) ;;
-        esac
-        if ! _valid_proof_ref "$proof" "$proof_wt"; then
-          printf 'run-registry: refusing %s completion for %s/%s: proof missing/invalid (need "<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)%s\n' \
-            "$reason" "$run_id" "$task_id" "${_PROOF_REF_WHY:+: $_PROOF_REF_WHY}" >&2
-          return 1
-        fi
-        ;;
+        shipped|abandoned)
+          local proof_wt=""
+          case "$proof" in
+            *PROOF.md*) proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null) ;;
+          esac
+          if ! _valid_proof_ref "$proof" "$proof_wt"; then
+            printf 'run-registry: refusing %s completion for %s/%s: proof missing/invalid (need "<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)%s\n' \
+              "$reason" "$run_id" "$task_id" "${_PROOF_REF_WHY:+: $_PROOF_REF_WHY}" >&2
+            return 1
+          fi
+          ;;
+        superseded)
+          # The OPEN-PR bypass's own detail (archive path, old_task,
+          # superseded_by — set ONLY by _superseded_check's own rules 1-4,
+          # never user-suppliable) IS the proof (review PR #249 of
+          # herdr-control: "superseded must never require a merged-PR
+          # proof — the PR is OPEN by definition, so the proof is the
+          # archive and the newer task"). A `superseded_close` detail
+          # object needs no separate --proof. The older, CLOSED-unmerged
+          # `superseded` disposition (close-done-workers.sh's generic
+          # detached-close path, same `detached_close` detail shape
+          # `abandoned` uses) is NOT that bypass and keeps needing a real
+          # one, exactly like `abandoned` above.
+          if ! printf '%s' "$detail" | jq -e 'has("superseded_close")' >/dev/null 2>&1; then
+            local proof_wt=""
+            case "$proof" in
+              *PROOF.md*) proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null) ;;
+            esac
+            if ! _valid_proof_ref "$proof" "$proof_wt"; then
+              printf 'run-registry: refusing %s completion for %s/%s: proof missing/invalid (need "<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the task'"'"'s worktree)%s\n' \
+                "$reason" "$run_id" "$task_id" "${_PROOF_REF_WHY:+: $_PROOF_REF_WHY}" >&2
+              return 1
+            fi
+          fi
+          ;;
       esac
     fi
     # `detail` (optional): a JSON object recorded verbatim under .detail in

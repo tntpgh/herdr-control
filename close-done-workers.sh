@@ -139,10 +139,24 @@ if [ "$apply" = 1 ] && case "$closure_reason" in shipped|abandoned|superseded) t
     exit 1
   fi
   proof_wt=$(_sql "SELECT worktree FROM tasks WHERE state IN ($states)$states_filter ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null)
-  _valid_proof_ref "$closure_proof" "$proof_wt" || {
-    printf 'close-done-workers: --reason=%s requires --proof="<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the selected task'"'"'s worktree%s\n' "$closure_reason" "${_PROOF_REF_WHY:+ ($_PROOF_REF_WHY)}" >&2
-    exit 1
-  }
+  # `superseded`'s proof requirement depends on which of its two paths
+  # this one scoped row actually takes, not yet known here (that needs a
+  # GitHub lookup the main scan below does per-row): the OPEN-PR bypass's
+  # own rules 1-4 (newer review, clean tree, provable ancestry, verified
+  # archive) already ARE the proof and need no separate --proof at all
+  # (review PR #249: "superseded must never require a merged-PR proof —
+  # the PR is OPEN by definition, so the proof is the archive and the
+  # newer task"); the older, CLOSED-unmerged `superseded` disposition
+  # still needs a real one, exactly like `abandoned`. set_task_state
+  # enforces this correctly per-row, from the detail shape each path
+  # actually produced — pre-checking format here would wrongly refuse
+  # the bypass before it is even known which path applies.
+  if [ "$closure_reason" != superseded ]; then
+    _valid_proof_ref "$closure_proof" "$proof_wt" || {
+      printf 'close-done-workers: --reason=%s requires --proof="<merged PR URL> <merge sha>" or a non-empty PROOF.md section in the selected task'"'"'s worktree%s\n' "$closure_reason" "${_PROOF_REF_WHY:+ ($_PROOF_REF_WHY)}" >&2
+      exit 1
+    }
+  fi
 fi
 
 panes_json=$(herdr pane list 2>/dev/null)

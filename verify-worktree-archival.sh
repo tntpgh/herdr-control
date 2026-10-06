@@ -1375,7 +1375,7 @@ printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'reviews org/
 
 printf -- '-- M1: an ignored file OUTSIDE tmp/.handoffs (.private/) is archived, never silently dropped --\n'
 
-echo '.private/' >> "$(git -C "$U_WORK" rev-parse --git-common-dir)/info/exclude"
+echo '.private/' >> "$(git -C "$U_WORK" rev-parse --path-format=absolute --git-common-dir)/info/exclude"
 _u_case "review:old-m1" "review:new-m1"
 mkdir -p "$U_WT/.private" "$U_WT/.handoffs"
 printf 'ignored note outside tmp/.handoffs\n' > "$U_WT/.private/notes.txt"
