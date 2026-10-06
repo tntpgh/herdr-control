@@ -1691,7 +1691,8 @@ mkdir -p "$U_WT/tmp"
 printf 'should never reach the symlinked target\n' > "$U_WT/tmp/notes.md"
 out=$(HERDR_ARCHIVE_ROOT="$u4b_root" bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" --superseded-by="$U_NEWTASK" 2>&1)
 rc=$?
-[ "$rc" -ne 0 ] && ok "U (4b): a symlinked archive repo_base dir is REFUSED" || bad "U (4b) exit $rc: $out"
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'symlink' \
+  && ok "U (4b): a symlinked archive repo_base dir HOLDs" || bad "U (4b) exit $rc: $out"
 check "U (4b): task untouched" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
 [ -z "$(find "$elsewhere_4b" -mindepth 1 2>/dev/null)" ] && ok "U (4b): nothing was written through the symlink" \
   || bad "U (4b): files appeared at the symlink target: $(find "$elsewhere_4b" -mindepth 1)"
