@@ -940,6 +940,79 @@ _valid_proof_ref() {
   return 1
 }
 
+# _valid_superseded_detail <run_id> <task_id> <detail-json> -> 0 iff a
+# `superseded_close` detail object is actually backed by the evidence
+# close-done-workers.sh's own `_superseded_check` rules 1-4 produce,
+# re-checked here from the registry's own trust boundary (the DB and the
+# filesystem), never taken on the caller's word (review PR #249 r2 N1: a
+# bare `jq -e 'has("superseded_close")'` waived the proof requirement for
+# ANY caller handing `set_task_state` a detail shaped like that key, with
+# nothing tying it to this task, a real newer task, or an archive that
+# exists — "never user-suppliable" was a claim in a commit message, not an
+# enforced property). Sets _PROOF_REF_WHY. Every failure falls back to the
+# ordinary proof requirement in the caller, never to a silent close.
+_valid_superseded_detail() {
+  local run_id="$1" task_id="$2" detail="$3" \
+        pr old_task sup_by old_head archive label review_pr_repo review_pr_number \
+        new_json new_label new_repo new_pr new_created old_created
+  _PROOF_REF_WHY=""
+  pr=$(printf '%s' "$detail" | jq -r '.superseded_close.pr // ""' 2>/dev/null)
+  old_task=$(printf '%s' "$detail" | jq -r '.superseded_close.old_task // ""' 2>/dev/null)
+  sup_by=$(printf '%s' "$detail" | jq -r '.superseded_close.superseded_by // ""' 2>/dev/null)
+  old_head=$(printf '%s' "$detail" | jq -r '.superseded_close.old_head // ""' 2>/dev/null)
+  archive=$(printf '%s' "$detail" | jq -r '.superseded_close.archive // ""' 2>/dev/null)
+  if [ "$old_task" != "$task_id" ]; then
+    _PROOF_REF_WHY="detail.superseded_close.old_task ($old_task) does not match this task"
+    return 1
+  fi
+  label=$(_sql "SELECT label FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  review_pr_repo=$(_sql "SELECT review_pr_repo FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  review_pr_number=$(_sql "SELECT review_pr_number FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  case "$label" in
+    review:*|deep-review:*) ;;
+    *) _PROOF_REF_WHY="this task (label=${label:-?}) is not review-class"; return 1 ;;
+  esac
+  if [ -z "$review_pr_repo" ] || [ "$pr" != "${review_pr_repo}#${review_pr_number}" ]; then
+    _PROOF_REF_WHY="detail.superseded_close.pr ($pr) does not match this task's recorded PR (${review_pr_repo:-?}#${review_pr_number:-?})"
+    return 1
+  fi
+  if [ -z "$sup_by" ]; then
+    _PROOF_REF_WHY="detail.superseded_close.superseded_by is empty"
+    return 1
+  fi
+  new_json=$(_sql "$(_task_json_select) WHERE task_id=$(_sq "$sup_by") LIMIT 1;" 2>/dev/null)
+  if [ -z "$new_json" ]; then
+    _PROOF_REF_WHY="superseded_by=$sup_by does not match any registered task"
+    return 1
+  fi
+  new_label=$(printf '%s' "$new_json" | jq -r '.label // ""' 2>/dev/null)
+  new_repo=$(printf '%s' "$new_json" | jq -r '.review_pr_repo // ""' 2>/dev/null)
+  new_pr=$(printf '%s' "$new_json" | jq -r '.review_pr_number // ""' 2>/dev/null)
+  new_created=$(printf '%s' "$new_json" | jq -r '.created_at // ""' 2>/dev/null)
+  old_created=$(_sql "SELECT created_at FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null)
+  case "$new_label" in
+    review:*|deep-review:*) ;;
+    *) _PROOF_REF_WHY="superseded_by=$sup_by (label=${new_label:-?}) is not review-class"; return 1 ;;
+  esac
+  if [ "${new_repo}#${new_pr}" != "$pr" ]; then
+    _PROOF_REF_WHY="superseded_by=$sup_by reviews ${new_repo:-?}#${new_pr:-?}, not $pr"
+    return 1
+  fi
+  if [ -z "$new_created" ] || [ -z "$old_created" ] || ! [[ "$new_created" > "$old_created" ]]; then
+    _PROOF_REF_WHY="superseded_by=$sup_by was not created after this task"
+    return 1
+  fi
+  if [ -z "$archive" ] || [ ! -d "$archive" ]; then
+    _PROOF_REF_WHY="detail.superseded_close.archive ($archive) does not exist"
+    return 1
+  fi
+  if [ ! -f "$archive/HEAD.txt" ] || [ "$(cat "$archive/HEAD.txt" 2>/dev/null)" != "$old_head" ]; then
+    _PROOF_REF_WHY="$archive/HEAD.txt does not match detail.superseded_close.old_head ($old_head)"
+    return 1
+  fi
+  return 0
+}
+
 set_task_state() {                      # run_id task_id state [reason] [proof] [detail-json-object]
   local run_id="$1" task_id="$2" state="$3" reason="${4:-}" proof="${5:-}" detail="${6:-}"
   registry_init || return 1
@@ -964,6 +1037,7 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
     # transitions TO completed a second time). "Missing -> nonzero exit,
     # nothing written" — checked before the transaction below, so a refused
     # call touches no row and appends no event.
+    local waived_proof=0
     if [ "$state" = "completed" ]; then
       if ! _valid_closure_reason "$reason"; then
         printf 'run-registry: refusing completed for %s/%s: closure reason missing/invalid (need shipped|handed_off_to:<x>|blocked_on:<x>|canceled|no-follow-on|abandoned|superseded, got %s)\n' \
@@ -983,18 +1057,22 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
           fi
           ;;
         superseded)
-          # The OPEN-PR bypass's own detail (archive path, old_task,
-          # superseded_by — set ONLY by _superseded_check's own rules 1-4,
-          # never user-suppliable) IS the proof (review PR #249 of
-          # herdr-control: "superseded must never require a merged-PR
-          # proof — the PR is OPEN by definition, so the proof is the
-          # archive and the newer task"). A `superseded_close` detail
-          # object needs no separate --proof. The older, CLOSED-unmerged
-          # `superseded` disposition (close-done-workers.sh's generic
-          # detached-close path, same `detached_close` detail shape
-          # `abandoned` uses) is NOT that bypass and keeps needing a real
-          # one, exactly like `abandoned` above.
-          if ! printf '%s' "$detail" | jq -e 'has("superseded_close")' >/dev/null 2>&1; then
+          # The OPEN-PR bypass needs no separate --proof ONLY when the
+          # detail it was handed is itself backed by real evidence this
+          # function re-checks against the DB and the filesystem —
+          # `_valid_superseded_detail`, never a bare key-presence check
+          # (review PR #249 r2 N1: "never user-suppliable" was a claim in
+          # a commit message, not an enforced property — any direct
+          # set_task_state call could complete ANY task as `superseded`
+          # with a forged or empty `superseded_close` object and no proof
+          # at all). Anything that fails that re-check — including the
+          # older, CLOSED-unmerged `superseded` disposition, whose detail
+          # is the generic `detached_close` shape `abandoned` uses — falls
+          # back to the real proof requirement, exactly like `abandoned`.
+          if printf '%s' "$detail" | jq -e 'has("superseded_close")' >/dev/null 2>&1 \
+            && _valid_superseded_detail "$run_id" "$task_id" "$detail"; then
+            waived_proof=1
+          else
             local proof_wt=""
             case "$proof" in
               *PROOF.md*) proof_wt=$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id");" 2>/dev/null) ;;
@@ -1038,7 +1116,14 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
     # `completed` carries them; every other transition's payload shape is
     # unchanged, so an existing reader keyed on {state,from} still works.
     if [ "$state" = "completed" ]; then
-      if [ -n "$proof" ]; then
+      # A waived `superseded` proof (review PR #249 r2 N2) is never
+      # recorded verbatim: it was never checked against anything, and an
+      # unvalidated "<claimed merged PR URL> <sha>" sitting in the audit
+      # row next to reason=superseded reads as evidence it is not.
+      if [ "$waived_proof" = 1 ]; then
+        payload="$(jq -nc --arg s "$state" --arg f "$cur" --arg reason "$reason" \
+          '{state:$s, from:$f, reason:$reason}')"
+      elif [ -n "$proof" ]; then
         payload="$(jq -nc --arg s "$state" --arg f "$cur" --arg reason "$reason" --arg proof "$proof" \
           '{state:$s, from:$f, reason:$reason, proof:$proof}')"
       else

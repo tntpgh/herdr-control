@@ -1493,6 +1493,55 @@ out=$(bash "$here/close-done-workers.sh" --task="$U_TASK" --reason=no-follow-on 
 printf '%s' "$out" | grep -q HOLD && printf '%s' "$out" | grep -qi 'not yet closable' \
   && ok "U mutant M18: --superseded-by with --reason=no-follow-on never engages the bypass" || bad "U mutant M18 output: $out"
 
+printf -- '-- N1 (mutant P1): set_task_state refuses a forged, empty or missing superseded_close detail --\n'
+
+_u_case "review:old-n1" "review:new-n1"
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" \
+  "$(jq -nc --arg t "$U_TASK" '{superseded_close:{old_task:$t, superseded_by:"does-not-exist", old_head:"deadbeef", archive:"/no/such/dir", pr:"org/repo#1"}}')" 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "U N1 (mutant P1): a forged superseded_close (fake superseded_by/archive) is REFUSED" \
+  || bad "U N1 forged: rc=$rc $out"
+check "U N1: task untouched (forged)" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" '{"superseded_close":{}}' 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "U N1 (mutant P1): an empty superseded_close is REFUSED" || bad "U N1 empty: rc=$rc $out"
+check "U N1: task untouched (empty)" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+out=$(set_task_state "$U_RUN" "$U_TASK" completed superseded "" "" 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && ok "U N1 (mutant P1): a missing detail (no superseded_close at all) is REFUSED" || bad "U N1 missing: rc=$rc $out"
+check "U N1: task untouched (missing)" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "running"
+
+printf -- '-- N1 (mutant P2): the OPEN-PR bypass completes with NO --proof at all --\n'
+
+_u_case "review:old-noproof" "review:new-noproof"
+mkdir -p "$U_WT/tmp"
+printf 'no proof needed, the bypass evidence is\n' > "$U_WT/tmp/notes.md"
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" --superseded-by="$U_NEWTASK" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U N1 (mutant P2): --apply closes with NO --proof at all" || bad "U N1 (mutant P2) exit $rc: $out"
+check "U N1 (mutant P2): task completed" "$(read_task "$U_RUN" "$U_TASK" | jq -r .state)" "completed"
+_uevnp() { sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.$1') FROM events WHERE task_id='$U_TASK' AND type='state_changed' AND json_extract(payload,'\$.state')='completed';"; }
+[ -z "$(_uevnp proof)" ] && ok "U N2: no unchecked proof lands in the audit row when none was given" \
+  || bad "U N2: proof field present with nothing given: $(_uevnp proof)"
+
+printf -- '-- mutant M1b: a regenerable ignored dir is recorded EXCLUDED, never silently dropped --\n'
+
+echo 'node_modules' >> "$(git -C "$U_WORK" rev-parse --path-format=absolute --git-common-dir)/info/exclude"
+_u_case "review:old-m1b" "review:new-m1b"
+mkdir -p "$U_WT/node_modules/pkg" "$U_WT/tmp"
+printf 'module.exports = 1\n' > "$U_WT/node_modules/pkg/index.js"
+printf 'keep me\n' > "$U_WT/tmp/notes.md"
+out=$(bash "$here/close-done-workers.sh" --apply --reason=superseded --task="$U_TASK" --superseded-by="$U_NEWTASK" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "U mutant M1b: --apply closes with a regenerable ignored dir present" || bad "U mutant M1b exit $rc: $out"
+m1b_archive_dir=$(find "$HERDR_ARCHIVE_ROOT" -maxdepth 2 -type d -name "superseded-$U_PR-*" 2>/dev/null | head -1)
+grep -q '^EXCLUDED' "$m1b_archive_dir/MANIFEST.sha256" 2>/dev/null \
+  && ok "U mutant M1b: node_modules is recorded EXCLUDED in the manifest" \
+  || bad "U mutant M1b: no EXCLUDED line: $(cat "$m1b_archive_dir/MANIFEST.sha256" 2>&1)"
+
+
 
 
 
