@@ -4,6 +4,7 @@
 // send-message/start-task policy checks and their enqueue happen atomically
 // against the same snapshot.
 import { DurableObject } from "cloudflare:workers";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { emailAllowed } from "./access";
 import { connection, DEFAULT_LIMITS, OWNER_LABEL, OWNER_LIMITS, rateLimited, resolveTarget, sanitizeMessage, sanitizeObjective, sanitizeOwnerMessage } from "./policy";
@@ -209,6 +210,10 @@ export type ResumeTaskOutcome =
   | { ok: true; remote_task_id: string; parent_remote_task_id: string; state: "queued" }
   | { ok: false; reason: string };
 
+export type EventDetailPlaceholder =
+  | { detail_error: "oversized"; original_chars: number; sha256: string }
+  | { detail_error: "invalid_json" };
+
 export interface TaskEventRow {
   cursor: number;
   remote_task_id: string;
@@ -301,6 +306,29 @@ const CALLS_PER_MINUTE = 60;
 const CALLS_PER_DAY = 2000;
 
 const iso = (ms: number) => new Date(ms).toISOString();
+
+const EVENT_DETAIL_MAX_CHARS = 2000;
+
+function serializeEventDetail(data: Record<string, unknown>): string {
+  const json = JSON.stringify(data);
+  if (json.length <= EVENT_DETAIL_MAX_CHARS) return json;
+  // Keep the row bounded and parseable. The digest distinguishes oversized
+  // payloads under the immutable event-id check without storing their text.
+  const marker: EventDetailPlaceholder = { detail_error: "oversized", original_chars: json.length,
+    sha256: createHash("sha256").update(json).digest("hex") };
+  return JSON.stringify(marker);
+}
+
+function parseEventDetail(json: string): object {
+  try {
+    const data: unknown = JSON.parse(json);
+    if (data !== null && typeof data === "object" && !Array.isArray(data)) return data;
+  } catch {
+    // Historical serialized-text truncation left invalid JSON in task_events.
+  }
+  const marker: EventDetailPlaceholder = { detail_error: "invalid_json" };
+  return marker;
+}
 
 // A caller-bound opaque token for list_events/wait_for_events' cursor
 // contract (plan section 5, "a cursor is bound to a stable authorization/
@@ -747,7 +775,7 @@ export class HerdrState extends DurableObject<Env> {
       subjectKind: string; subjectId: string; visibility: "public" | "owner_private"; senderActor: string;
       senderClient: string; correlationId: string; data: Record<string, unknown> }):
       { outcome: "accepted" | "duplicate_same_payload" | "rejected:duplicate_payload_mismatch"; cursor: number | null } {
-    const dataJson = JSON.stringify(e.data).slice(0, 2000);
+    const dataJson = serializeEventDetail(e.data);
     if (e.eventId) {
       const existing = this.sql.exec<{ cursor: number; type: string; subject_kind: string; subject_id: string; detail: string }>(
         `SELECT cursor, type, subject_kind, subject_id, detail FROM task_events WHERE event_id=?`, e.eventId).toArray()[0];
@@ -973,7 +1001,7 @@ export class HerdrState extends DurableObject<Env> {
        FROM task_events WHERE remote_task_id=? ORDER BY cursor DESC LIMIT ?`,
       remoteTaskId, limit,
     ).toArray().map((r) => ({ cursor: r.cursor, remote_task_id: r.remote_task_id, type: r.type, at: iso(r.at),
-      detail: JSON.parse(r.detail || "{}") as object, event_id: r.event_id, schema_version: r.schema_version,
+      detail: parseEventDetail(r.detail), event_id: r.event_id, schema_version: r.schema_version,
       source: r.source, subject: r.subject_kind ? { kind: r.subject_kind, id: r.subject_id } : null }));
   }
 
@@ -1138,7 +1166,7 @@ export class HerdrState extends DurableObject<Env> {
       || (r.sender_actor === caller.email && r.sender_client === caller.client_id));
     return {
       events: visible.map((r) => ({ cursor: r.cursor, remote_task_id: r.remote_task_id, type: r.type, at: iso(r.at),
-        detail: JSON.parse(r.detail || "{}") as object, event_id: r.event_id, schema_version: r.schema_version,
+        detail: parseEventDetail(r.detail), event_id: r.event_id, schema_version: r.schema_version,
         source: r.source, subject: r.subject_kind ? { kind: r.subject_kind, id: r.subject_id } : null })),
       scanned_through_cursor: rows.length ? rows[rows.length - 1]!.cursor : sinceCursor,
       latest_cursor: latest, replay_floor_cursor: floor, scope_hash: hash, result: "ok",

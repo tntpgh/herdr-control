@@ -194,6 +194,16 @@ state. `degraded` = the Mac is syncing but the hub lost its live herdr feed.
 
 `tools/list` on the live server is the authoritative JSON Schema.
 
+Event `detail` is stored as valid JSON with a 2000-character serialized limit.
+Oversized payloads are replaced by
+`{ "detail_error": "oversized", "original_chars": N, "sha256": "..." }`;
+the digest covers the full serialized payload so different oversized payloads
+remain distinguishable by the immutable event-id check. The omitted text is
+not recoverable from this marker. A malformed historical detail is returned as
+`{ "detail_error": "invalid_json" }` rather than failing the page.
+`list_events`, `wait_for_events`, and `get_task_answer` progress retain the
+row's envelope and cursor; visibility checks and pagination are unchanged.
+
 ### Watching for an owner reply (the watcher recipe)
 
 `send_owner_message` queues a note to a registered owning session; the
