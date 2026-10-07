@@ -324,6 +324,20 @@ _PS_HW_SAFE=' cat head tail wc ls grep egrep fgrep rg find echo printf tee pwd s
  shasum sha256sum mkdir touch git '
 _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an allow
   local cmd="$1" cwd="$2" hw="$3" wt wt_abs line kind val seg root a targets
+  # Round 7 (herdr-control#254 PR comment): the SAME shared text-anywhere
+  # gate classify_command's peer_decide path now runs FIRST
+  # (`_cp_exec_name_or_opaque_present`, lib/command-policy.sh) — called
+  # directly here too, not only inherited through peer_decide, so this
+  # tighten-only check cannot itself be the reason a handoffs-restricted
+  # task's own narrower per-segment walk below (which only recognizes
+  # `git`/`git-*` as the command word, not an arbitrary launcher chain or
+  # heredoc/here-string hiding it) misses the same shapes round 6's
+  # review found.
+  if _cp_exec_name_or_opaque_present "$cmd"; then
+    PS_VERDICT=escalate PS_POLICY=handoffs-write
+    PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; the command text carries an exec-capable variable NAME, git config KEY, unquoted brace-expansion word, or \$'…' ANSI-C word — a conductor must review it"
+    return
+  fi
   wt="$(printf '%s' "$PS_TASK_JSON" | jq -r '.worktree // empty' 2>/dev/null)"
   if [ -z "$wt" ]; then
     PS_VERDICT=escalate PS_POLICY=handoffs-write PS_REASON="worker worktree unknown — cannot judge this task's bash write scope"; return

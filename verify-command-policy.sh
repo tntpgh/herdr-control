@@ -2648,6 +2648,161 @@ else
 fi
 rm -f "$_r6_eval_marker"
 
+echo
+echo "== round 7 (herdr-control#254 PR comment): stop parsing — match" \
+     "exec-capable NAMES anywhere in the text =="
+
+# Baseline: plain read-only git and the false-positive controls stay allow.
+check "r7 baseline: git log" "git log" allow
+check "r7 baseline: git status" "git status" allow
+check "r7 baseline: git log --oneline" "git log --oneline" allow
+check "r7 baseline: bash -c ls" "bash -c ls" allow
+check "r7 baseline: ls -la" "ls -la" allow
+check "r7 baseline: printf eval (data, not a name)" "printf \"%s\\n\" \"eval\"" allow
+check "r7 baseline: git log --format=eval" "git log --format=eval" allow
+
+# D1 — bash -c flag spellings the old extractor's exact \`-c\` token match missed.
+check "r7 D1: su -c" "su root -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: perl -e system" "perl -e \"system q(GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r)\"" escalate
+check "r7 D1: osascript do shell script" "osascript -e 'do shell script \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"'" escalate
+check "r7 D1: bash -o posix -c" "bash -o posix -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: bash -O extglob -c" "bash -O extglob -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: bash +e -c" "bash +e -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: bash -c -e" "bash -c -e \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: bash -c --" "bash -c -- \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: find decoy then bash -c" "find . -exec sh -c true \\; -exec bash -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\" \\;" escalate
+check "r7 D1: xargs -0 bash -c (body from stdin)" "printf \"%s\" \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\" | xargs -0 bash -c" escalate
+check "r7 D1: tcsh -c setenv" "tcsh -c \"setenv GIT_SSH_COMMAND /tmp/x; git ls-remote ssh://h/r\"" escalate
+check "r7 D1: csh -c setenv" "csh -c \"setenv GIT_SSH_COMMAND /tmp/x; git ls-remote ssh://h/r\"" escalate
+check "r7 D1: fish -c" "fish -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: renamed bash copy" "cp /bin/bash tmp/q; tmp/q -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: BASH_ENV prefix on bash -c" "BASH_ENV=tmp/evil.sh bash -c \"git status\"" escalate
+
+# D2 — stdin / here-string / heredoc shells (no \`-c\` at all).
+check "r7 D2: bash <<< BODY" "bash <<< \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D2: bash /dev/stdin <<< BODY" "bash /dev/stdin <<< \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D2: bash <(printf BODY)" "bash <(printf \"%s\" \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\")" escalate
+check "r7 D2: . <(printf BODY)" ". <(printf \"%s\" \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\")" escalate
+check "r7 D2: printf BODY | /bin/sh" "printf \"%s\\n\" \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\" | /bin/sh" escalate
+check "r7 D2: printf BODY | command bash" "printf \"%s\\n\" \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\" | command bash" escalate
+check "r7 D2: parallel ::: BODY" "parallel ::: \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+
+# D3 — command-word spellings no parser resolves to a literal name.
+check "r7 D3: ANSI-C git word" "\$'\\x67it' -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D3: ANSI-C eval word" "\$'\\x65val' \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D3: ANSI-C bash word -c" "\$'\\x62ash' -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D3: brace {git,}" "{git,} -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D3: brace one-word argv" "{git,-c,core.sshCommand=/tmp/x,ls-remote,ssh://h/r}" escalate
+check "r7 D3: brace {eval,}" "{eval,} \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D3: glob /usr/bin/gi[t]" "/usr/bin/gi[t] -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D3: glob /usr/bin/gi?" "/usr/bin/gi? -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+
+# D4 — command/process substitution bodies at depth 0.
+check "r7 D4: \$(git -c ...)" "echo \"\$(git -c core.sshCommand=/tmp/x ls-remote ssh://h/r)\"" escalate
+check "r7 D4: backtick git -c" "echo \`git -c core.sshCommand=/tmp/x ls-remote ssh://h/r\`" escalate
+check "r7 D4: \$(GIT_SSH_COMMAND= git)" "x=\$(GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r)" escalate
+check "r7 D4: \$(bash -c ...)" "echo \"\$(bash -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\")\"" escalate
+
+# D5 — wrappers not on the \`-c\`-body launcher list.
+check "r7 D5: find -exec git -c" "find . -maxdepth 0 -exec git -c core.sshCommand=/tmp/x ls-remote ssh://h/r \\;" escalate
+check "r7 D5: script -q /dev/null git -c" "script -q /dev/null git -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D5: arch -arm64 git -c" "arch -arm64 git -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D5: xcrun git -c" "xcrun git -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D5: watch git -c" "watch git -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D5: flock git -c" "flock /tmp/l git -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+
+# D6 — env-var / shell-state vectors not on the old prefix list (the subset
+# that carries one of this round's NAMEs — HOME/XDG_CONFIG_HOME/PATH and
+# \`hash -p\` carry no name at all and stay a documented residual gap below).
+check "r7 D6: LESSOPEN same-segment prefix" "LESSOPEN=\"|-tmp/x %s\" git log" escalate
+check "r7 D6: DYLD_INSERT_LIBRARIES prefix" "DYLD_INSERT_LIBRARIES=tmp/x.dylib git log" escalate
+check "r7 D6: set -a; read GIT_SSH_COMMAND" "set -a; read -r GIT_SSH_COMMAND <<< /tmp/x; git ls-remote ssh://h/r" escalate
+check "r7 D6: set -a; printf -v GIT_SSH_COMMAND" "set -a; printf -v GIT_SSH_COMMAND %s /tmp/x; git ls-remote ssh://h/r" escalate
+check "r7 D6: set -a; for GIT_SSH_COMMAND in" "set -a; for GIT_SSH_COMMAND in /tmp/x; do git ls-remote ssh://h/r; done" escalate
+check "r7 D6: set -a; : \${GIT_SSH_COMMAND:=}" "set -a; : \"\${GIT_SSH_COMMAND:=/tmp/x}\"; git ls-remote ssh://h/r" escalate
+check "r7 D6: set -k trailing assignment" "set -k; git ls-remote ssh://h/r GIT_SSH_COMMAND=/tmp/x" escalate
+check "r7 D6: f() ( local -x ) subshell body" "f() ( local -x GIT_SSH_COMMAND=/tmp/x; git ls-remote ssh://h/r ); f" escalate
+check "r7 D6: f() if ... local -x" "f() if true; then local -x GIT_SSH_COMMAND=/tmp/x; git ls-remote ssh://h/r; fi; f" escalate
+check "r7 D6: shopt -qs + BASH_ALIASES" "shopt -qs expand_aliases
+BASH_ALIASES[g]=\"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"
+g" escalate
+check "r7 D6: set -o posix + BASH_ALIASES" "set -o posix
+BASH_ALIASES[g]=\"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"
+g" escalate
+check "r7 D6: trap string EXIT" "trap \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\" EXIT" escalate
+check "r7 D6: PS4 \$() + set -x" "PS4='\$(GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r)'; set -x; true" escalate
+check "r7 D6: arith a[\$()] in variable" "x='a[\$(GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r)]'; (( x ))" escalate
+
+# D6 residual gaps — documented ceiling, not this round's scope: HOME,
+# XDG_CONFIG_HOME, and PATH are ordinary, extremely common identifiers; a
+# name match on them would escalate nearly everything. \`hash -p\` carries
+# no textual hazard at all — closing either needs parsing, which is the
+# thing this round stopped doing.
+check "r7 D6 ceiling: HOME= prefix stays open" "HOME=tmp/h git ls-remote ssh://h/r" allow
+check "r7 D6 ceiling: PATH= prefix stays open" "PATH=tmp/bin:/usr/bin:/bin git ls-remote ssh://h/r" allow
+check "r7 D6 ceiling: hash -p evil git stays open" "hash -p /tmp/x git; git status" allow
+
+# D7 — git verbs/options that run code, the subset carrying a listed config key.
+check "r7 D7: git config core.sshCommand" "git config core.sshCommand /tmp/x" escalate
+check "r7 D7: git config --global core.pager" "git config --global core.pager \"sh -c /tmp/x\"" escalate
+check "r7 D7: git config --local core.fsmonitor" "git config --local core.fsmonitor /tmp/x" escalate
+check "r7 D7: git clone -c core.hooksPath" "git clone -c core.hooksPath=/tmp/h src dst" escalate
+check "r7 D7: git clone --config core.fsmonitor" "git clone --config core.fsmonitor=/tmp/x src dst" escalate
+check "r7 D7: git for-each-repo -c core.sshCommand" "git for-each-repo --config=x.repos -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+
+# D7 residual gaps — documented ceiling: these git-native options carry no
+# NAME from this round's list; closing them needs the exec-opts allowlist
+# extended (round 6's structural mechanism), not a name match. Out of scope.
+check "r7 D7 ceiling: git clone --template stays open" "git clone --template=/tmp/tpl src dst" allow
+check "r7 D7 ceiling: git difftool -x stays open" "git difftool -y -x /tmp/x HEAD~1" allow
+check "r7 D7 ceiling: git rebase -x stays open" "git rebase -x /tmp/x HEAD~1" allow
+check "r7 D7 ceiling: git submodule foreach stays open" "git submodule foreach /tmp/x" allow
+check "r7 D7 ceiling: git bisect run stays open" "git bisect run /tmp/x" allow
+
+# item 2 — opaque words are a general hole, not git-specific: trunk already
+# ALLOWS brace expansion on a non-git command (\`{curl,-X,POST,url}\`), and
+# an ANSI-C word can spell any command name from escapes.
+check "r7 item2: brace on a non-git command" "{curl,-X,POST,url}" escalate
+check "r7 item2: ANSI-C word on a non-git command" "\$'\\x63url' -X POST url" escalate
+check "r7 item2 false-positive fix: a quoted brace is not opaque" "echo \"{a,b}\"" allow
+
+# Real negative: bash -o posix -c is a round-6 D1 shape the old \`-c\`
+# extractor's exact-token match missed (it requires the cluster to be
+# exactly \`-c\`/\`-lc\`/…, not a separate \`-o posix\` flag before it) —
+# actually running it proves the payload executes, and the identical text
+# now escalates.
+_r7_marker="$(mktemp -u /tmp/herdr-git-exec-r7-marker.XXXXXX)"
+_r7_ssh="$(mktemp -u /tmp/herdr-git-exec-r7-ssh.XXXXXX)"
+printf '#!/bin/sh\ntouch %s\nexit 1\n' "$_r7_marker" > "$_r7_ssh"
+chmod +x "$_r7_ssh"
+rm -f "$_r7_marker"
+_r7_body="GIT_SSH_COMMAND=$_r7_ssh git ls-remote ssh://herdr-control-r7-nonexistent-host/r.git"
+_r7_text="bash -o posix -c \"$_r7_body\""
+eval "$_r7_text" >/dev/null 2>&1
+total=$((total + 1))
+if [ -f "$_r7_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: bash -o posix -c GIT_SSH_COMMAND payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: bash -o posix -c GIT_SSH_COMMAND payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "$_r7_text")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -f "$_r7_marker" "$_r7_ssh"
+
+# Acceptance checklist, item 1: classify in-process before asking.
+check "r7 acceptance: ls -la allows" "ls -la" allow
+check "r7 acceptance: git status allows" "git status" allow
+check "r7 acceptance: git log --oneline allows" "git log --oneline" allow
+check "r7 acceptance: bash -c ls allows" "bash -c ls" allow
+
+
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

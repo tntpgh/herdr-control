@@ -2833,6 +2833,117 @@ EOF
   return 1
 }
 
+# Round 7 (herdr-control#254 PR comment): round 6 closed every shape the
+# review found by PARSING — recognizing bash -c/xargs/find -exec/heredocs/
+# a renamed bash copy as more shell text to recurse into. The round-6
+# REVIEW immediately found ~30 more shapes that defeat parsing itself: su
+# -c, perl -e system, osascript do shell script, bash -o posix -c / -O
+# extglob -c / +e -c / -c -e / -c -- (flag spellings the -c extractor
+# above does not recognize as "-c"), tcsh/csh/fish -c (not on the
+# bash/sh/zsh/dash/ksh/mksh list), a RENAMED bash copy (the detector keys
+# on the basename "bash", not behavior), BASH_ENV=… bash -c (the body
+# itself is harmless — the hazard loads from a file this scanner cannot
+# read), bash <<< / bash <(…) / . <(…) / | /bin/sh / a heredoc piped into
+# bash (none of these are "-c BODY" at all), parallel ::: (no -c either),
+# and $'\x67it' / {git,} / {eval,} (the command word itself is built from
+# a shape no parser here resolves to a literal name). Parsing can always
+# be defeated by one more shape; round 7 stops trying. Trunk's OWN curl
+# rule proves the alternative already works: `bash -c "curl -X POST …"`
+# escalates on every one of those same evasions, not because any of them
+# is parsed, but because the text "curl" and "-X POST" are matched
+# WHEREVER they sit. The git bypasses above all share one structural
+# feature curl's payload doesn't: the dangerous part is a variable or git
+# config NAME sitting next to ordinary "read-only" git text
+# (GIT_SSH_COMMAND=… git ls-remote …) — text-anywhere matching on the
+# NAME closes every shape above in one gate, independent of whatever
+# launcher/quoting/renaming hides the git invocation itself.
+#
+# `_cp_exec_name_or_opaque_present <raw>` -> 0 (true) when RAW's TEXT
+# contains, ANYWHERE — quoted or not, inside a heredoc, inside a -c
+# string, inside an alias/BASH_ALIASES value, as a `read`/`printf -v`/
+# `for … in`/`: ${NAME:=}`/`local -x` assignment target, whatever —
+# any of:
+#   1. an exec-capable variable NAME (case-SENSITIVE: these are real
+#      shell identifiers, and env assignment is already the one shape
+#      this file treats as dangerous wherever it is textually visible,
+#      same as `GIT_*=`/`PAGER=` do inside `_cp_git_seg_exec_unsafe`);
+#   2. a git config KEY that can run a program through git itself
+#      (case-INSENSITIVE: git config keys are case-folded, `CORE.PAGER`
+#      and `core.pager` name the same setting);
+#   3. an unquoted brace-expansion word containing a comma (`{a,b}`) —
+#      a general hole, not git-specific: trunk already ALLOWS
+#      `{curl,-X,POST,url}`, which a shell expands to `curl -X POST
+#      url` before anything runs;
+#   4. a `$'…'` ANSI-C-quoted word — the only shell quoting form that
+#      can spell an identifier (`$'\x67it'` -> `git`) from escapes a
+#      naive scan never resolves; the opening `$'` is itself unquoted
+#      text (it IS the quote marker), so no quote-tracking is needed to
+#      see it.
+# Called FIRST in classify_command, right after `_cp_best_v`/`_cp_best_r`
+# reset and before any other rule — including `_cp_shared_gate`'s own
+# parsing — considers anything: the whole point is that this gate does
+# not need parsing to have already identified a `git` word, a `-c` body,
+# or any other structure; it only needs the name or shape to be present
+# in the text at all.
+#
+# ceiling (item 4, SPEC): a name match cannot tell "the real variable"
+# from a word that only LOOKS like it without parsing, and parsing is
+# exactly what this round gave up on. `grep GIT_PAGER file`,
+# `echo "price is PAGER-controlled"`, and similar now escalate too —
+# accepted false positives, not bugs. Likewise `HOME=`/`XDG_CONFIG_HOME=`/
+# `PATH=` prefixes and `hash -p evil git` carry no NAME at all (PATH/HOME
+# are ordinary, extremely common identifiers a name-match would make
+# nearly everything escalate on, and `hash -p` has no textual hazard to
+# match at all) — real residual gaps, out of this round's scope, not
+# silently claimed closed here. Likewise a handful of git subcommand
+# options with no associated NAME in this list (`clone --template`,
+# `difftool -x/--extcmd`, `rebase -x`, `submodule foreach`, `bisect run`,
+# `filter-branch --tree-filter`, `send-email --sendmail-cmd`) stay open —
+# round 6's existing `_cp_git_exec_opts`/`_cp_git_unsafe_tokens` allowlist
+# (kept below, defense in depth per SPEC item 3) does not cover them
+# either; closing those needs the option allowlist extended, not a name
+# match, and is out of this round's scope.
+_CP_EXEC_VAR_NAME_RE='GIT_SSH_COMMAND|GIT_SSH|GIT_PAGER|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_EXTERNAL_DIFF|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND|GIT_EXEC_PATH|GIT_CONFIG[A-Za-z0-9_]*|GIT_DIR|GIT_WORK_TREE|GIT_TEMPLATE_DIR|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH_ENV|ENV|PROMPT_COMMAND|LD_PRELOAD|DYLD_[A-Za-z0-9_]*'
+_CP_EXEC_CFGKEY_RE='core\.pager|core\.sshcommand|core\.editor|core\.fsmonitor|core\.hookspath|core\.gitproxy|diff\.external|\.textconv|credential\.helper|sequence\.editor|alias\.|include\.path|includeif|uploadpack\.|receivepack\.|filter\.|remote\.[^[:space:]]*\.uploadpack'
+
+# `_cp_unquoted_text <raw>` -> prints RAW with every quoted span (single,
+# double, and the ANSI-C/`$"…"` dollar-quoted forms) dropped entirely —
+# used only to find an unquoted brace-expansion word, where "quoted" has
+# to mean something (a shell never brace-expands inside quotes). Every
+# OTHER check in this function is deliberately quote-blind.
+_cp_unquoted_text() {                   # raw -> raw with quoted spans removed
+  printf '%s' "$1" | awk '
+    BEGIN { SQ = sprintf("%c", 39); DQ = "\"" }
+    {
+      line = $0; n = length(line); st = 0; out = ""
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (st == 0) {
+          if (c == "\\") { i++; continue }
+          if (c == "$" && substr(line, i + 1, 1) == SQ) { st = 1; i++; continue }
+          if (c == "$" && substr(line, i + 1, 1) == DQ) { st = 2; i++; continue }
+          if (c == SQ) { st = 1; continue }
+          if (c == DQ) { st = 2; continue }
+          out = out c; continue
+        }
+        if (st == 1) { if (c == SQ) st = 0; continue }
+        if (c == "\\") { i++; continue }
+        if (c == DQ) st = 0
+      }
+      print out
+    }'
+}
+
+_cp_exec_name_or_opaque_present() {     # raw -> 0 if an exec-capable name/config-key/opaque word is present anywhere
+  local LC_ALL=C LANG=C
+  local raw="$1"
+  grep -qE "(^|[^A-Za-z0-9_])(${_CP_EXEC_VAR_NAME_RE})([^A-Za-z0-9_]|\$)" <<<"$raw" && return 0
+  grep -qiE "$_CP_EXEC_CFGKEY_RE" <<<"$raw" && return 0
+  grep -qE '\{[^{}]*,[^{}]*\}' <<<"$(_cp_unquoted_text "$raw")" && return 0
+  grep -qF "\$'" <<<"$raw" && return 0
+  return 1
+}
+
 # ---- the floor rule table (ported from qm's command-policy.ts) ------------
 # Applies in EVERY posture — there is no "trusted mode" that skips these.
 # Deny rules are checked ahead of require_approval ones so a command that
@@ -4458,6 +4569,15 @@ classify_command() {                    # <panel/command text> [worktree] [manif
 
   _cp_best_v=0
   _cp_best_r=""
+
+  # escalate — round 7 (herdr-control#254 PR comment): text-anywhere
+  # exec-capable name/config-key/opaque-word gate. Runs FIRST, on the raw
+  # text, before any other rule in this function (including
+  # `_cp_shared_gate`'s own parsing) gets a chance to have already missed
+  # the shape carrying it. See `_cp_exec_name_or_opaque_present`'s own
+  # header, just above `_cp_git_exec_opt_invoked`, for the full rationale.
+  _cp_exec_name_or_opaque_present "$raw" &&
+    _cp_consider 1 "command text carries an exec-capable variable NAME, git config KEY, unquoted brace-expansion word, or \$'…' ANSI-C word — it can run arbitrary code wherever it sits, quoted or not"
 
   # deny — mkfs formats a block device with no confirmation of its own;
   # nothing downstream of "yes, run this" makes that reversible, so it is
