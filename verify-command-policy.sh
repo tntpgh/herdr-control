@@ -2178,6 +2178,155 @@ check_wt "a backslash-newline line continuation between \$ and ' is still read a
 check "bash write-scope rule is a no-op with no worktree context" \
   "cat f >> /outside" allow
 
+echo
+echo "== Round 3 (herdr-control#254 review): quoted/escaped env values, launcher" \
+     "chains ahead of the env prefix, xargs/parallel fan-out, unknown" \
+     "subcommands, and the dashed git-<verb> libexec form =="
+# F1 (root bug): the old preprocessing stripped quote/backslash CHARACTERS
+# without tracking which spaces they were protecting, so a quoted or
+# escaped VALUE containing a space split the assignment token away from
+# its value — `GIT_PAGER=sh git log` escalated but `GIT_PAGER="touch
+# pwned" git log` and `GIT_PAGER=touch\ pwned git log` did not. Fixed by
+# running the same quote/escape-aware `_cp_protect_text` every other
+# walk-based rule in this file uses, instead of a blanket strip.
+check "F1: GIT_PAGER quoted value with an inner space" \
+  'GIT_PAGER="touch /tmp/herdr-r3-marker" git log' escalate
+check "F1: GIT_PAGER backslash-escaped space" \
+  'GIT_PAGER=touch\ /tmp/herdr-r3-marker git log' escalate
+check "F1: GIT_EDITOR quoted value with an inner space" \
+  'GIT_EDITOR="touch /tmp/herdr-r3-marker" git log' escalate
+check "F1: GIT_SSH_COMMAND quoted value with an inner space" \
+  'GIT_SSH_COMMAND="touch /tmp/herdr-r3-marker" git fetch origin main' escalate
+check "F1: GIT_CONFIG_COUNT quoted value" \
+  'GIT_CONFIG_COUNT="1 extra" git log' escalate
+
+# F2: a launcher (`command`, `nice`, `time`, `stdbuf -i0`, `setsid`) or
+# another plain `FOO=bar` assignment between the dangerous env prefix and
+# the git word must not reset the "a dangerous env var was assigned"
+# signal — `_cp_locate_command_word`'s own `_CP_LOC_SKIPPED` is read back
+# instead of a second, possibly-disagreeing token walk.
+check "F2: command launcher between the env prefix and git" \
+  'GIT_PAGER=sh command git log' escalate
+check "F2: nice launcher between the env prefix and git" \
+  'GIT_PAGER=sh nice git log' escalate
+check "F2: time launcher between the env prefix and git" \
+  'GIT_PAGER=sh time git log' escalate
+check "F2: stdbuf -i0 launcher between the env prefix and git" \
+  'GIT_PAGER=sh stdbuf -i0 git log' escalate
+check "F2: setsid launcher between the env prefix and git" \
+  'GIT_PAGER=sh setsid git log' escalate
+check "F2: a second plain assignment between the env prefix and git" \
+  'GIT_PAGER=sh FOO=bar git log' escalate
+
+# F3: a fan-out runner (`xargs`/`parallel`) wrapping git — the real
+# subcommand comes from piped input this policy cannot see at all, so it
+# escalates regardless of what static argv happens to be present.
+check "F3: bare xargs git" "xargs git log" escalate
+check "F3: xargs -n1 git (attached value opt)" "xargs -n1 git log" escalate
+check "F3: parallel git" "parallel git log" escalate
+
+# F4: an unknown subcommand could be a repo-configured alias
+# (`git config alias.x '!sh -c …'` — git only consults the alias table
+# when the name does not match a real one), so it must not auto-allow; a
+# verb that IS a real git subcommand, read or write, is unaffected.
+check "F4: unknown subcommand (possible alias)" "git x" escalate
+check "F4: another unknown subcommand" "git frobnicate" escalate
+check "F4: known write verb stays allow (branch listing)" "git branch -a" allow
+check "F4: known read verb stays allow (merge-base)" "git merge-base HEAD main" allow
+check "F4: known verb stays allow (remote listing)" "git remote -v" allow
+
+# F5: git's dashed libexec binary name (`git-<verb>`, found via $PATH with
+# no literal "git <verb>" text at all — same shape `_cp_git_push_invoked`
+# already recognizes for the force-push rule) must get the identical
+# exec-opt scrutiny the spaced spelling gets, not be invisible to this
+# gate entirely.
+check "F5: dashed form with a dangerous env prefix" \
+  'GIT_PAGER=sh git-log' escalate
+check "F5: dashed form carrying an exec-bearing option" \
+  'git-log --output=/tmp/herdr-r3-marker' escalate
+check "F5: dashed form, plain read, stays allow (consistent with 'git log')" \
+  "git-log" allow
+
+# Negative: every read-only git shape this gate already allows must stay
+# allow — the new known-verb check must not over-match plain reads.
+check "F4/F1/F2 negative: plain git log stays allow" "git log" allow
+check "F4/F1/F2 negative: plain git fetch stays allow" "git fetch origin main" allow
+check "F4/F1/F2 negative: plain git status stays allow" "git status" allow
+
+# Real negative: run the LITERAL payload through real git in a scratch repo
+# and confirm the marker DOES land (the quoted/escaped-space bypass is a
+# genuine exploit, not a false positive), while classify_command for that
+# exact text already says escalate.
+_r3_marker="$(mktemp -u /tmp/herdr-git-exec-r3-marker.XXXXXX)"
+_r3_scratch="$(mktemp -d)"
+( cd "$_r3_scratch" && git init -q && git -c user.email=x@x -c user.name=x commit -q --allow-empty -m x )
+rm -f "$_r3_marker"
+_r3_cmd="(cd $_r3_scratch && GIT_PAGER=\"touch $_r3_marker\" git log >/dev/null 2>&1)"
+bash -c "$_r3_cmd"
+total=$((total + 1))
+if [ -f "$_r3_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: quoted GIT_PAGER payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: quoted GIT_PAGER payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "GIT_PAGER=\"touch $_r3_marker\" git log")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -rf "$_r3_scratch"
+rm -f "$_r3_marker"
+
+echo
+echo "== classifier/shadow parity: one shared function, same verdict for every" \
+     "git row (Round 3) =="
+# lib/pretool-shadow.sh's `_ps_bash_handoffs_verdict` calls the exact same
+# `_cp_git_unsafe_tokens` this file's exec-opt rule uses (Round 2's parity
+# helper, redefined here since it unset itself after that section), fed
+# the tokens its own `_cp_locate_command_word` locator already produces —
+# so the quoting fix (F1), the launcher-chain fix (F2), and the
+# unknown-subcommand fix (F4) all land in both places from the ONE shared
+# function. The dashed-form (F5) and fan-out (F3) fixes are
+# classify_command-only: the shadow's OWN outer `_PS_HW_SAFE` allowlist
+# (lib/pretool-shadow.sh) already excludes `git-<verb>`/`xargs`/`parallel`
+# by name before `_cp_git_unsafe_tokens` is ever reached in that context,
+# so there is nothing to parity-check there.
+_cp_shadow_git_verdict() {              # cmd -> hit | safe | not-git
+  local cmd="$1"
+  local -a _r3_toks
+  set -f; read -r -a _r3_toks <<<"$cmd"; set +f
+  if ! _cp_locate_command_word "$cmd" || [ "$_cp_wcmd" != git ]; then
+    printf 'not-git\n'; return
+  fi
+  if [ "${_r3_toks[0]:-}" != git ]; then
+    printf 'hit\n'; return
+  fi
+  if _cp_git_unsafe_tokens "${_CP_LOC[@]:1}"; then printf 'hit\n'; else printf 'safe\n'; fi
+}
+_r3_parity_rows=(
+  'git log' 'git fetch origin main' 'git status' 'git x' 'git frobnicate'
+  'git branch -a' 'git merge-base HEAD main' 'git remote -v'
+  'GIT_PAGER=sh git log' 'GIT_PAGER=sh command git log'
+  'GIT_PAGER=sh nice git log' 'GIT_PAGER=sh FOO=bar git log'
+)
+for _r3_row in "${_r3_parity_rows[@]}"; do
+  total=$((total + 1))
+  _r3_cv="$(classify_command "$_r3_row")"
+  _r3_sv="$(_cp_shadow_git_verdict "$_r3_row")"
+  case "$_r3_cv:$_r3_sv" in
+    escalate:hit|allow:safe)
+      printf 'PASS  %-52s classifier=%-9s shadow=%s\n' "parity: $_r3_row" "$_r3_cv" "$_r3_sv" ;;
+    *)
+      printf 'FAIL  %-52s classifier=%-9s shadow=%s (must agree)\n' "parity: $_r3_row" "$_r3_cv" "$_r3_sv"
+      failed=$((failed + 1)) ;;
+  esac
+done
+unset -f _cp_shadow_git_verdict
+
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

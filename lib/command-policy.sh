@@ -1889,8 +1889,17 @@ EOF
 # but redirections/assignments/launchers (e.g. `> /dev/null` alone, or the
 # tail end of a segment the splitter cut mid-redirection).
 _CP_LOC=()
+_CP_LOC_SKIPPED=()
 _cp_locate_command_word() {             # segment
   _CP_LOC=()
+  _CP_LOC_SKIPPED=()
+  # `_CP_LOC_SKIPPED` collects every `NAME=val`-shaped token shifted away
+  # below (both the top-level assignment case and the ones a launcher's own
+  # value-parsing loop skips) — not read by most callers, but it is the ONE
+  # place that walk happens, so a caller that needs to know whether a
+  # specific env var was assigned ANYWHERE ahead of the resolved command
+  # word (`_cp_git_seg_exec_unsafe` below, for `GIT_*=`/`PAGER=`/`EDITOR=`/
+  # `VISUAL=` through any launcher chain) reads it instead of re-walking.
   case "$-" in *f*) _cp_wglob=off ;; *) _cp_wglob=on ;; esac
   set -f
   # shellcheck disable=SC2086
@@ -1918,7 +1927,7 @@ _cp_locate_command_word() {             # segment
         esac
         ;;
       [A-Za-z_]*=*)
-        shift; _cp_wate=1 ;;
+        _CP_LOC_SKIPPED+=("$1"); shift; _cp_wate=1 ;;
     esac
 
     if [ "$_cp_wate" = 0 ]; then
@@ -1973,7 +1982,7 @@ _cp_locate_command_word() {             # segment
                   case "$1" in *[!0-9]*) break ;; esac
                 fi
                 shift ;;
-              [A-Za-z_]*=*) shift ;;
+              [A-Za-z_]*=*) _CP_LOC_SKIPPED+=("$1"); shift ;;
               *) break ;;
             esac
           done
@@ -2583,6 +2592,19 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
 # adding a new exec-bearing long option whose prefix is not already in
 # `_cp_git_exec_opts` below needs a line added here.
 _cp_git_exec_opts="open-files-in-pager ext-diff textconv output exec upload-pack receive-pack"
+
+# Round 3 (herdr-control#254 review): an UNKNOWN subcommand (`git x`) could
+# be a repo-configured alias (`git config alias.x '!sh -c …'`) — git only
+# consults the alias table when the name does not match a real subcommand,
+# so any token here that IS a real one can never be an alias, and anything
+# that is NOT one must be treated as arbitrary code. This is every porcelain
+# and plumbing subcommand `git help -a` lists (git 2.54), minus the
+# documentation-only topic pages (attributes/hooks/ignore/mailmap/modules/
+# repository-layout/revisions/format-*/protocol-*/cli) and GUI launchers
+# that cannot run as a repo alias target anyway. ceiling: a future git
+# release adding a subcommand not in this list needs a line added here —
+# same ceiling `_cp_git_exec_opts` above already carries.
+_cp_git_known_verbs=" add am annotate apply archive archimport backfill bisect blame branch bugreport bundle cat-file check-attr check-ignore check-mailmap check-ref-format checkout checkout-index cherry cherry-pick clean clone column commit commit-graph commit-tree config count-objects credential credential-cache credential-store cvsexportcommit cvsimport cvsserver daemon describe diagnose diff diff-files diff-index diff-pairs diff-tree difftool fast-export fast-import fetch fetch-pack filter-branch fmt-merge-msg for-each-ref for-each-repo fsck gc get-tar-commit-id grep hash-object help history hook http-backend http-fetch http-push imap-send index-pack init instaweb interpret-trailers log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-one-file merge-tree mergetool mktag mktree multi-pack-index mv name-rev notes p4 pack-objects pack-redundant pack-refs patch-id prune prune-packed pull push quiltimport range-diff read-tree rebase receive-pack reflog remote repack replace replay repo request-pull rerere reset restore rev-list rev-parse revert rm scalar send-email send-pack sh-i18n sh-setup shell show show-branch show-index show-ref shortlog sparse-checkout stash status stripspace submodule svn switch symbolic-ref tag unpack-file unpack-objects update-index update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack verify-tag version whatchanged worktree write-tree "
 _cp_git_unsafe_tokens() {               # token... (everything after the git word) -> 0 if unsafe
   local verb="" tok name opt
   for tok in "$@"; do
@@ -2606,49 +2628,92 @@ _cp_git_unsafe_tokens() {               # token... (everything after the git wor
         ;;
     esac
   done
+  if [ -n "$verb" ]; then
+    case "$_cp_git_known_verbs" in *" $verb "*) ;; *) return 0 ;; esac
+  fi
   return 1
 }
 
+# `_cp_git_dashed_verb <wcmd>` -> prints the subcommand name when WCMD is
+# the dashed git-core libexec binary form (`git-push`, `git-http-push`,
+# `git-send-pack`, …) `_cp_git_push_invoked`'s own awk already recognizes
+# for the force-push rule (H3, independent review of #157: these resolve
+# via $PATH with no literal "git push" text at all) — same shape, one
+# place, so this gate cannot disagree with that one about what counts as
+# git. Returns 1 for a bare `git` or anything else.
+_cp_git_dashed_verb() {                 # wcmd
+  case "$1" in
+    git-?*) printf '%s' "${1#git-}"; return 0 ;;
+  esac
+  return 1
+}
+
+# `_cp_git_seg_exec_unsafe <protected-segment>` -> 0 (true) when this ONE
+# already-protected-and-carved segment is unsafe:
+#   * a `GIT_*=`/`PAGER=`/`EDITOR=`/`VISUAL=` assignment anywhere ahead of
+#     the resolved command word — through any chain of launchers
+#     (`command`, `nice`, `time`, `stdbuf -i0`, `setsid`, another
+#     `FOO=bar` assignment, …) `_cp_locate_command_word` already walks past
+#     for every caller; read back from its `_CP_LOC_SKIPPED` rather than
+#     re-splitting the segment a second, possibly-inconsistent way;
+#   * `git`/`git-<verb>` itself failing `_cp_git_unsafe_tokens`'s shape;
+#   * a fan-out runner (`xargs`/`parallel`) wrapping git — its real
+#     subcommand comes from piped input this policy cannot see at all, so
+#     it is unsafe regardless of what static argv is present.
+_cp_git_seg_exec_unsafe() {             # protected-segment
+  local seg="$1" tok
+  _cp_locate_command_word "$seg" || return 1
+  for tok in "${_CP_LOC_SKIPPED[@]}"; do
+    case "$tok" in GIT_*=*|PAGER=*|EDITOR=*|VISUAL=*) return 0 ;; esac
+  done
+  case "$_cp_wcmd" in
+    git)
+      _cp_git_unsafe_tokens "${_CP_LOC[@]:1}" && return 0
+      return 1 ;;
+    git-*)
+      local v
+      if v="$(_cp_git_dashed_verb "$_cp_wcmd")"; then
+        _cp_git_unsafe_tokens "$v" "${_CP_LOC[@]:1}" && return 0
+      fi
+      return 1 ;;
+    xargs|parallel)
+      local wrapped
+      wrapped="$(_cp_coderef_wrapped_command "$_cp_wcmd" "${_CP_LOC[@]:1}")" || return 1
+      case "${wrapped##*/}" in git|git-*) return 0 ;; esac
+      return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
 # `_cp_git_exec_opt_invoked <raw>` -> 0 (true) when RAW invokes git in any
-# shape `_cp_git_unsafe_tokens` disqualifies, OR with a `GIT_*`/`PAGER`/
-# `EDITOR`/`VISUAL` env-assignment immediately ahead of the git word (that
-# token is consumed here, before the subcommand tokens are ever handed to
-# `_cp_git_unsafe_tokens`). Same preprocessing as `_cp_git_push_invoked`
-# (unflattened, quote-stripped, segmented on shell operators including
-# `<`/`>` so a quoted option value containing its own redirect cannot hide
-# the option in a later segment) so this reads the same shape the
-# push-force rule already trusts.
+# shape `_cp_git_seg_exec_unsafe` disqualifies. Preprocessing joins a
+# backslash-newline continuation (real shell behaviour) and then runs
+# `_cp_protect_text` — the SAME quote/escape-aware pass `scannable_command`
+# and every walk-based rule in this file use — instead of a blanket
+# `s/['"\\\\]//g` strip: the old strip removed quote/backslash characters
+# WITHOUT tracking which spaces they were protecting, so
+# `GIT_PAGER="touch pwned" git log` and `GIT_PAGER=touch\ pwned git log`
+# both collapsed to a 4-token line (`GIT_PAGER=touch`, `pwned`, `git`,
+# `log`) that split the dangerous assignment's VALUE off into its own,
+# unrecognized token (round 3 review, the root bug). `_cp_protect_text`
+# turns a quoted/escaped space into a control byte instead, so the
+# assignment survives as ONE token the way a real shell would pass it.
+# Segmented on shell operators including `<`/`>` (same as
+# `_cp_git_push_invoked`) so a quoted option value containing its own
+# redirect cannot hide the option in a later segment.
 _cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git fails the read-only shape
   local LC_ALL=C LANG=C
-  local raw="$1" pre segmented seg
+  local raw="$1" pre protected seg
   pre="$(_cp_strip_heredocs "$raw")"
-  pre="$(_cp_decode_ansi_c "$pre")"
   pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
-  pre="$(printf '%s' "$pre" | sed "s/['\"\\\\]//g")"
-  pre="$(printf '%s' "$pre" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
-  segmented="$(printf '%s' "$pre" | sed -E 's/[;&|()`<>]/\n/g')"
+  protected="$(_cp_protect_text "$pre")"
+  protected="$(printf '%s' "$protected" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
   while IFS= read -r seg; do
     [ -n "${seg//[[:space:]]/}" ] || continue
-    local -a tok
-    set -f; read -r -a tok <<<"$seg"; set +f
-    local i=0 n="${#tok[@]}" pending_env=0 t
-    while [ "$i" -lt "$n" ]; do
-      t="${tok[$i]}"
-      if [ -z "$t" ]; then i=$((i + 1)); continue; fi
-      case "$t" in
-        GIT_*=*|PAGER=*|EDITOR=*|VISUAL=*) pending_env=1; i=$((i + 1)); continue ;;
-      esac
-      case "$t" in
-        git|*/git)
-          if [ "$pending_env" = 1 ]; then return 0; fi
-          _cp_git_unsafe_tokens "${tok[@]:$((i + 1))}" && return 0
-          break
-          ;;
-      esac
-      pending_env=0
-      i=$((i + 1))
-    done
-  done <<<"$segmented"
+    _cp_git_seg_exec_unsafe "$seg" && return 0
+  done <<EOF
+$(printf '%s' "$protected" | sed -E 's/[;&|()`<>]/\n/g')
+EOF
   return 1
 }
 
