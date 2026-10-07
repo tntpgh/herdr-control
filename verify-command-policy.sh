@@ -2544,6 +2544,110 @@ for _r3_row in "${_r3_parity_rows[@]}"; do
 done
 unset -f _cp_shadow_git_verdict
 
+echo
+echo "== round 6 (herdr-control#254 PR comment): -c BODY recursion for the" \
+     "git/env/indirection gate, command-word expansion, and the" \
+     "eval/function/alias command-position false positives =="
+
+# Observed (round-5 review): classify_command's OWN quote-aware splitters
+# (_cp_git_exec_opt_invoked, the eval/function/alias indirection rule) treat
+# a `-c`/eval program string as one opaque blob instead of recursing into
+# it as fresh shell text — the download/run-file rules only LOOK like they
+# recurse, because scannable_command's global quote-strip flattens a `-c`
+# string into $norm for free. Rule C (_cp_shared_gate) fixes the structural
+# gap; rule D (_cp_gate_indirection_in_segment) fixes the false positives
+# the old whole-string regex had from matching DATA, not command position.
+
+check "rule C: bash -c hides a GIT_SSH_COMMAND + git ls-remote pair" \
+  'bash -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"' escalate
+check "rule C: sh -c, same payload" \
+  'sh -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"' escalate
+check "rule C: xargs wrapping sh -c" \
+  'echo h | xargs -I{} sh -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"' escalate
+check "rule C: find -exec wrapping sh -c, {} + terminator" \
+  'find . -exec sh -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r" {} +' escalate
+check "rule C: a -c body built from a variable is dynamic, not literal (bash)" \
+  'body="GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"; bash -c "$body"' escalate
+check "rule C: a -c body built from a variable is dynamic, not literal (sh)" \
+  'body="GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"; sh -c "$body"' escalate
+check "rule C: a static -c body with no git/env hazard still allows" \
+  "bash -c 'ls -la'" allow
+check "rule C negative: bash -c ls, acceptance-criteria shape" \
+  "bash -c ls" allow
+
+check "rule D: constructed eval via variable concatenation" \
+  'e=e; cmd=${e}val; "$cmd" "GIT_PAGER=x git log"' escalate
+check "rule D: constructed command name from two variables (shopt-shaped)" \
+  'x=sh; y=opt; $x$y -s expand_aliases' escalate
+check "rule D negative: a bare command substitution as data, not command word" \
+  'echo $(date +%s)' allow
+
+check "rule D false-positive fix: eval sitting in printf DATA, not command position" \
+  'printf "%s\n" "eval"' allow
+check "rule D false-positive fix: a function-def shape sitting in printf DATA" \
+  'printf "%s\n" "name() {"' allow
+check "rule D false-positive fix: eval as a git --format value, not a word" \
+  'git log --format=eval' allow
+check "rule D false-positive fix: a function-def shape as a git --format value" \
+  'git log --format="name() {"' allow
+
+# Acceptance checklist, item 1: classify in-process before asking.
+check "acceptance: ls -la allows" "ls -la" allow
+check "acceptance: git status allows" "git status" allow
+check "acceptance: bash -c ls allows" "bash -c ls" allow
+check "acceptance: eval ls escalates" "eval ls" escalate
+
+# Real negatives: both LIVE items from the PR comment actually run the
+# hidden payload, and classify_command escalates the identical text.
+_r6_marker="$(mktemp -u /tmp/herdr-git-exec-r6-marker.XXXXXX)"
+_r6_ssh="$(mktemp -u /tmp/herdr-git-exec-r6-ssh.XXXXXX)"
+printf '#!/bin/sh\ntouch %s\nexit 1\n' "$_r6_marker" > "$_r6_ssh"
+chmod +x "$_r6_ssh"
+
+# item 1 (LIVE): bash -c hiding a GIT_SSH_COMMAND + git ls-remote pair.
+rm -f "$_r6_marker"
+_r6_body="GIT_SSH_COMMAND=$_r6_ssh git ls-remote ssh://herdr-control-r6-nonexistent-host/r.git"
+_r6_text="bash -c \"$_r6_body\""
+eval "$_r6_text" >/dev/null 2>&1
+total=$((total + 1))
+if [ -f "$_r6_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: bash -c GIT_SSH_COMMAND payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: bash -c GIT_SSH_COMMAND payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "$_r6_text")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -f "$_r6_marker" "$_r6_ssh"
+
+# item 2 (LIVE): constructed eval via variable concatenation.
+_r6_eval_marker="$(mktemp -u /tmp/herdr-git-exec-r6-eval-marker.XXXXXX)"
+rm -f "$_r6_eval_marker"
+_r6_eval_text="e=e; cmd=\${e}val; \"\$cmd\" \"touch $_r6_eval_marker\""
+bash -c "$_r6_eval_text" >/dev/null 2>&1
+total=$((total + 1))
+if [ -f "$_r6_eval_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: constructed-eval payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: constructed-eval payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "$_r6_eval_text")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -f "$_r6_eval_marker"
+
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

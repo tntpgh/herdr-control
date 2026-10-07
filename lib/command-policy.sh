@@ -4202,6 +4202,208 @@ _cp_mask_script_data() {
     }'
 }
 
+# ---- shared git/env/indirection gate, with -c BODY recursion --------------
+# Round 6 (herdr-control#254 PR comment, Round-5 review): main measured that
+# the classifier already "recurses" into `bash -c BODY` for the download/
+# run-file rules, purely as a side effect of `scannable_command` stripping
+# quotes and flattening substitutions before those rules ever run — `bash -c
+# "curl -X POST …"` escalates, `bash -c ls` allows, with no real extraction
+# involved. `_cp_git_exec_opt_invoked` and the eval/function/alias
+# indirection rule below are NOT like that: both do their OWN quote-aware
+# splitting on the RAW text, and that splitting is exactly right for a
+# TOP-LEVEL command (the quotes around `-c`'s argument really do mark one
+# opaque string there) and exactly WRONG one level down (inside that string,
+# the quotes are gone — they were the OUTER shell's syntax, not the nested
+# shell's — so its spaces are real word separators again). Live-measured:
+# `bash -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"` classified
+# allow, because `_cp_git_exec_opt_invoked`'s own `_cp_protect_text` pass
+# saw one giant quoted blob and never split it into an env-assignment
+# segment and a `git` segment.
+#
+# The fix is structural, not a special case for one shape: `_cp_shared_gate`
+# runs the SAME three checks (git exec-option gate, eval/function/alias/
+# expand_aliases indirection, and "is the command word itself built from an
+# expansion") against the raw text, THEN finds every `bash|sh|zsh|dash|ksh|
+# mksh -c BODY` in it — wherever it sits, so a `xargs`/`find -exec`/`env`/
+# `nice`/… wrapper in front needs no special handling, it is just more
+# words before the shell name in the same segment — and recurses the WHOLE
+# function into each BODY. One code path classifies depth 0 and depth N
+# identically.
+#
+# A BODY that still contains `$` or the flattened-substitution marker
+# `@SUB@` after unprotecting is not a literal string this scanner can
+# reason about (`body=…; bash -c "$body"`): it escalates on sight rather
+# than being walked, per spec — "cannot be known statically" is itself the
+# finding, not a reason to guess. Capped at depth 6, matching every other
+# recursion bound in this file (`_cp_coderef_walk`, `bash_write_targets`).
+#
+# `_cp_gate_function_def_present` fixes a separate false-positive the old
+# regex-based rule had: matching a `name() {` shape ANYWHERE in `$norm`
+# caught the shape sitting in DATA too — `printf "%s\n" "name() {"`, `git
+# log --format="name() {"` both escalated, live-confirmed false positives
+# (round 6 review). It runs on `_cp_protect_text`'s OUTPUT DIRECTLY —
+# never on `_cp_walk_prep`'s segments, which split on bare `(`/`)` as
+# subshell operators and would cut `f()` itself in half (round 6 REGRESSION:
+# the first version of this fix used segments and stopped seeing `f() {
+# ...}; f` at all) — anchored so the shape only counts at a real STATEMENT
+# boundary: start of text, or immediately after an unescaped `;`/`&`/`|`/
+# `(` (skipping real whitespace only). `_cp_protect_text` already turned
+# every operator INSIDE a quote into a control byte and dropped the quote
+# characters, so `"name() {"` can never present as a real `;`/`&`/`|`/`(`
+# followed by whitespace then the shape — its surrounding text (`printf`,
+# `--format=`) is ordinary, non-boundary characters, and the space BETWEEN
+# `()` and `{` inside that same quoted string is itself a control byte
+# (not `[[:space:]]`), so the shape fails to match even if a boundary were
+# found. Real embedded newlines are folded to `;` first (an equivalent
+# statement separator) so one regex handles both — `grep` would otherwise
+# need per-line anchoring that a newline-spanning quoted string can defeat.
+# The `function` keyword form is a second, independent check: `function` as
+# a BARE WORD at the same kind of boundary, same reasoning, no trailing-
+# brace requirement (matches this file's round-5 behavior: `function f {
+# ls; }; f` escalates with no further parsing of what follows).
+_cp_gate_function_def_present() {       # raw -> 0 if `name() {`/`function NAME` sits at a statement boundary
+  local text
+  text="$(_cp_protect_text "$1" | tr '\n' ';')"
+  printf '%s' "$text" |
+    grep -qE '(^|[;&|(])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\([[:space:]]*\)[[:space:]]*\{' &&
+    return 0
+  printf '%s' "$text" |
+    grep -qE '(^|[;&|(])[[:space:]]*function\b' &&
+    return 0
+  return 1
+}
+
+# `_cp_gate_eval_alias_shopt <segment>` — eval/alias/`shopt -s
+# expand_aliases` checked at COMMAND POSITION (via `_cp_locate_command_word`,
+# which already skips `NAME=val` assignments and launchers), not a
+# whole-string regex — the same false-positive class
+# `_cp_gate_function_def_present` fixes above: `printf "%s\n" "eval"` has
+# `eval` sitting in printf's DATA, never resolved as the segment's actual
+# command word, so it no longer matches. Takes a `_cp_walk_prep`-split
+# segment (safe here: unlike the function-def shape, `eval`/`alias`/`shopt`
+# never have a bare `(` glued to them, so the paren-splitting that broke
+# the function-def check above does not apply to this one).
+_cp_gate_eval_alias_shopt() {           # protected segment -> 0 if eval/alias/expand_aliases is the command word
+  _cp_locate_command_word "$1" || return 1
+  case "$_cp_wcmd" in
+    eval|alias) return 0 ;;
+    shopt)
+      case " ${_CP_LOC[*]:1} " in
+        *' -s '*|*' --set '*)
+          case " ${_CP_LOC[*]:1} " in *' expand_aliases '*) return 0 ;; esac ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
+# Item 3 (round 6 spec): "any word in command position that contains an
+# expansion ($x, ${…}, "$cmd", $(…), backticks) escalates" — a command word
+# this scanner cannot resolve to a literal name is exactly as opaque as
+# `eval`/an alias, it just has no keyword to grep for (`e=e; cmd=${e}val;
+# "$cmd" "…"`, live-measured allow before this). `_cp_protect_text` already
+# collapsed any `$(...)`/backtick to the literal token `@SUB@`, so checking
+# the resolved word for a leading `$` or an embedded `@sub@` (case-folded by
+# `_cp_locate_command_word`) catches both shapes with no new parsing.
+_cp_gate_command_word_is_expansion() {  # protected segment -> 0 if the command word is an unresolved expansion
+  _cp_locate_command_word "$1" || return 1
+  case "$_cp_wcmd" in
+    '$'*|*'@sub@'*) return 0 ;;
+  esac
+  return 1
+}
+
+# Finds `bash|sh|zsh|dash|ksh|mksh -c BODY` anywhere in one protected
+# segment (so any wrapper word in front — `xargs`, `find -exec`, `env`,
+# `nice`, …) and prints one of:
+#   `DYNAMIC`                 — the body is not a static literal
+#   `STATIC<US>text`          — the body, unprotected back to real text
+# Returns 1 with nothing printed when the segment names no such shell. The
+# `-c` flag is matched as a cluster (`-c`, `-lc`, `-ic`, …), mirroring the
+# existing `-[A-Za-z]*c`/`-[A-Za-z]*c[A-Za-z]*` cluster match this file
+# already uses for the same flag elsewhere (`_cp_coderef_others_unsafe`).
+_cp_gate_interp_c_body() {              # protected segment -> DYNAMIC | STATIC<US>text (rc 1: no shell -c here)
+  local seg="$1" oldopts i n tok base k flagtok body
+  case "$-" in *f*) oldopts=set ;; *) oldopts=unset ;; esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $seg
+  [ "$oldopts" = unset ] && set +f
+  local -a toks=("$@")
+  n="${#toks[@]}"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    tok="${toks[$i]}"
+    base="$(printf '%s' "${tok##*/}" | tr 'A-Z' 'a-z')"
+    case "$base" in
+      bash|sh|zsh|dash|ksh|mksh)
+        k=$((i + 1))
+        while [ "$k" -lt "$n" ]; do
+          flagtok="${toks[$k]}"
+          case "$flagtok" in
+            -c|-[A-Za-z]*c|-[A-Za-z]*c[A-Za-z]*)
+              if [ "$((k + 1))" -lt "$n" ]; then
+                body="$(_cp_coderef_unprotect "${toks[$((k + 1))]}")"
+                case "$body" in
+                  *'$'*|*'@SUB@'*) printf 'DYNAMIC\n' ;;
+                  *) printf 'STATIC\x1f%s\n' "$body" ;;
+                esac
+                return 0
+              fi
+              return 1 ;;
+            -*) k=$((k + 1)); continue ;;
+            *) break ;;
+          esac
+        done
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# `_cp_shared_gate <raw> [depth]` — the entry point classify_command calls
+# once at depth 0. Runs the git exec-option gate and the two indirection
+# checks above against every segment of TEXT, then recurses into every
+# `-c` BODY it finds, so a nested shell gets exactly the same scrutiny as
+# the outer one. Updates the running `_cp_best_v`/`_cp_best_r` accumulator
+# via `_cp_consider` directly — callers read the verdict off that, same as
+# every other rule in this file.
+_cp_shared_gate() {                     # raw [depth]
+  local raw="$1" depth="${2:-0}" seg bodyline bodytxt
+  if [ "$depth" -gt 6 ]; then
+    _cp_consider 1 "nested -c/shell body is too deep for the policy gate to follow safely"
+    return 0
+  fi
+
+  _cp_git_exec_opt_invoked "$raw" &&
+    _cp_consider 1 "git invocation carries a global option/env-prefix ahead of the subcommand, or an exec-bearing option/abbreviation, that can run arbitrary code"
+
+  _cp_gate_function_def_present "$raw" &&
+    _cp_consider 1 "command defines a function or alias, or enables alias expansion — the real command is hidden from every other rule"
+
+  while IFS= read -r seg; do
+    [ -n "${seg//[[:space:]]/}" ] || continue
+
+    _cp_gate_eval_alias_shopt "$seg" &&
+      _cp_consider 1 "command invokes eval, defines a function or alias, or enables alias expansion — the real command is hidden from every other rule"
+
+    _cp_gate_command_word_is_expansion "$seg" &&
+      _cp_consider 1 "a command word is built from a variable or command expansion and cannot be resolved statically"
+
+    bodyline="$(_cp_gate_interp_c_body "$seg")" || continue
+    case "$bodyline" in
+      DYNAMIC)
+        _cp_consider 1 "a -c program string is built from an expansion and cannot be resolved statically" ;;
+      STATIC$'\x1f'*)
+        bodytxt="${bodyline#STATIC$'\x1f'}"
+        _cp_shared_gate "$bodytxt" "$((depth + 1))" ;;
+    esac
+  done <<EOF
+$(_cp_walk_prep "$raw")
+EOF
+}
+
 classify_command() {                    # <panel/command text> [worktree] [manifest]
   if [ "$#" -lt 1 ]; then
     printf 'command-policy: classify_command requires a <command> argument\n' >&2
@@ -4355,58 +4557,22 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   { _cp_git_push_invoked "$raw" && ! _cp_push_is_safe "$norm"; } &&
     _cp_consider 1 "git push target is not on the safe branch allowlist"
 
-  # escalate — a git invocation whose shape fails the narrow ALLOWLIST
-  # `_cp_git_unsafe_tokens`/`_cp_git_exec_opt_invoked` require for a
-  # command to be exec-safe regardless of verb: a global option (or
-  # env-assignment) ahead of the subcommand (-c/-C/--git-dir/--work-tree/
-  # --exec-path/--namespace/--super-prefix/--config-env/-p/--paginate/
-  # GIT_*=/PAGER=/EDITOR=/VISUAL=, or any other leading `-` token — each
-  # changes what repo/config git reads from or runs), grep's
-  # -O/--open-files-in-pager in any abbreviation, any `-o*` short form of
-  # `--output` (writes the command's output to an arbitrary path — `git
-  # diff -o<path>`/`git show -o<path>`/`git log -o<path>`), or any `--`
-  # option that is an abbreviation-prefix of a known exec-bearing long
-  # option (--open-files-in-pager/--ext-diff/--textconv/--output/--exec/
-  # --upload-pack/--receive-pack). This only fires on that exec-capable
-  # option/config/env surface — every OTHER git shape this file already
-  # allows (`git status`, `git log`, `git diff`, `git grep -e …`, `git
-  # commit -m …`, …) is untouched.
-  _cp_git_exec_opt_invoked "$raw" &&
-    _cp_consider 1 "git invocation carries a global option/env-prefix ahead of the subcommand, or an exec-bearing option/abbreviation, that can run arbitrary code"
-
-  # escalate — round 5a (herdr-control#254 PR comment): eval, a function
-  # definition, alias, or `shopt -s expand_aliases`, ANYWHERE in the
-  # command, hides the real command from every verb-based rule in this
-  # file — `eval "GIT_PAGER=x git log"`, `eval "GIT_PAGER=x; git log"`,
-  # `f() { local -x GIT_PAGER=x; git log; }; f`, `set -a; f() { local
-  # GIT_PAGER=x; git log; }; f`, and `shopt -s expand_aliases; alias
-  # ggg='GIT_PAGER=x git log'; ggg` all classified allow (live-measured on
-  # this branch). The hole is general, not only a git one: `eval "ls"`,
-  # `f() { ls; }; f`, and `alias x=ls` classified allow too. Do not try to
-  # parse what eval/the function body/the alias actually runs — escalate
-  # is the reviewable outcome, and an agent rarely needs any of these four
-  # forms. `$norm` already has quotes stripped and `$(...)`/backtick
-  # substitutions flattened, so a quoted eval payload or a substitution
-  # smuggling one of these words is still seen. The `eval` match excludes
-  # a `-`-prefixed hit so node/perl/ruby's own `--eval`/`-eval` inline-code
-  # FLAG — already handled by the narrower, pre-existing interpreter-
-  # inline-code rules below — does not get caught by this broader one too
-  # (round 5f's `node --eval 'x' /tmp/p.json` stays allow, pinned above).
-  # The function-def match requires a trailing `{` (the real bash shape,
-  # `name() {`/`name () {`) — round 5 review, live-confirmed FALSE
-  # POSITIVE: a bare `name()` with no brace also matches any no-arg method
-  # call in a quoted interpreter payload (`sys.stdin.read()` inside
-  # `python3 -c "..."`), which is never a bash function definition and
-  # must stay allow (verify-command-policy.sh:213 "curl piped to inline
-  # python"). Requiring the brace keeps every real round-5 escalate row
-  # (all of which are `f() { ... }` or `f () { ... }`) while dropping the
-  # false hit.
-  { _cp_match '(^|[^A-Za-z0-9_-])eval([^A-Za-z0-9_]|$)' "$norm" ||
-    _cp_match '\balias\b' "$norm" ||
-    _cp_match '\bfunction[[:space:]]+[A-Za-z_][A-Za-z0-9_]*\b' "$norm" ||
-    _cp_match '[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(\)[[:space:]]*\{' "$norm" ||
-    { _cp_match '\bshopt\b' "$norm" && _cp_match '\bexpand_aliases\b' "$norm"; }; } &&
-    _cp_consider 1 "command invokes eval, defines a function or alias, or enables alias expansion — the real command is hidden from every other rule"
+  # escalate — round 6 (herdr-control#254 PR comment): the git exec-option
+  # gate (`_cp_git_exec_opt_invoked`), the eval/function/alias/
+  # expand_aliases indirection check, and "is the command word itself an
+  # unresolved expansion" all now run through `_cp_shared_gate`, which
+  # additionally recurses into every `bash|sh|zsh|dash|ksh|mksh -c BODY` it
+  # finds (under any wrapper — `xargs`, `find -exec`, `env`, `nice`, …) and
+  # runs the SAME three checks on that body, unprotected back to real text.
+  # `bash -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"` classified
+  # allow before this: `_cp_git_exec_opt_invoked` ran on the raw text and
+  # saw the whole quoted `-c` argument as one opaque blob, never splitting
+  # it into an env-assignment segment and a `git` segment the way it does
+  # for the same text typed unquoted at the top level. See the function's
+  # own header, just above `classify_command`, for the rest of this round's
+  # findings (constructed eval/alias names, the `printf "%s\n" "eval"`/
+  # `git log --format=eval` false positives the old whole-string regex had).
+  _cp_shared_gate "$raw" 0
 
   # escalate — DROP/TRUNCATE TABLE, case-insensitive (SQL keywords are
   # conventionally upper- or lower-case interchangeably).
