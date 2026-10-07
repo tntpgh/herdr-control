@@ -150,17 +150,45 @@
 # send here gets (refuses only on a POSITIVE mismatch).
 #
 # Set by `designate-main.sh` from the Main session, NOT here: Main's pane id
-# changes every session, so a static value was always empty or stale. An
-# explicit environment value still wins. The file is re-read every tick
-# (attention-tick.sh sources this file each pass). Empty = no Main; the
-# escalation is recorded as skipped and the form is still served on schedule.
-if [ -z "${HERDR_MAIN_PANE_ID:-}" ]; then
-  _herdr_main_role="${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}/roles/main"
-  if [ -s "$_herdr_main_role" ]; then
-    read -r HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH < "$_herdr_main_role" || true
-  fi
-  unset _herdr_main_role
+# changes every session, so a static value was always empty or stale. Read
+# from the registry's `roles` table (label "main" — designate-main.sh writes
+# it via register_role_cas, lib/run-registry.sh) every time this file is
+# sourced; attention-tick.sh re-sources config.sh each tick, so a new
+# designation takes effect on the next pass with no hub restart. Empty = no
+# Main; the escalation is recorded as skipped and the form is still served
+# on schedule.
+#
+# The REGISTRY ROW WINS whenever one exists — security review PR #252, F6:
+# "explicit environment value always wins" let any process (not just a real
+# caller) set its OWN HERDR_MAIN_PANE_ID and have config.sh agree it is
+# authorized Main, which is fatal once an authorization decision (P1's
+# conductor-handover.sh) is ever made by sourcing this file. The env value
+# is used ONLY as a fallback when there is no row at all (no registry file,
+# no `roles` table yet, or no "main" label registered) — this is what every
+# existing test suite that sets HERDR_MAIN_PANE_ID against an isolated
+# scratch registry (with no such row) still relies on; nothing that
+# genuinely designates Main runs in a scratch registry's path.
+#
+# A direct sqlite3 query, not `source lib/run-registry.sh`: that file sets
+# `set -uo pipefail` at its own top level, which would then apply to every
+# one of config.sh's many sourcers (several of which run today without -u),
+# a behavior change this file has no business making as a side effect of a
+# read. 2026-10-07, moved off roles/main (a plain file) to the registry's
+# `owners` table, then (security review PR #252, F1) off `owners` again
+# into its own `roles` table — Main's row must not be reachable by the
+# shared, already-shipped owner-inbox tools (register-owner.sh /
+# unregister-owner.sh), which have no designation gate at all.
+_herdr_main_db="${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}/registry.sqlite3"
+_herdr_main_row=""
+if [ -f "$_herdr_main_db" ]; then
+  _herdr_main_row="$(sqlite3 -batch -noheader -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$_herdr_main_db" \
+    "SELECT pane_id || '|' || pane_birth FROM roles WHERE label='main';" 2>/dev/null)"
 fi
+if [ -n "$_herdr_main_row" ]; then
+  HERDR_MAIN_PANE_ID="${_herdr_main_row%%|*}"
+  HERDR_MAIN_PANE_BIRTH="${_herdr_main_row#*|}"
+fi
+unset _herdr_main_db _herdr_main_row
 : "${HERDR_MAIN_PANE_ID:=}"
 : "${HERDR_MAIN_PANE_BIRTH:=}"
 # Delivery-only rollback: 1 makes agent-hooks/omp-notify.sh and

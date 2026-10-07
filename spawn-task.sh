@@ -406,11 +406,14 @@ if [ -z "$conductor_pane_id" ] && [ -n "${HERDR_MCP_CONDUCTOR_PANE:-}" ] \
   # task pane: a worker is never a conductor, and every
   # "approve ... --authority conductor" prompt this fallback enables would
   # otherwise be typed straight into that worker's session.
-  fallback_occupant_state="$(task_for_pane "$HERDR_MCP_CONDUCTOR_PANE" 2>/dev/null | jq -r '.state // empty' 2>/dev/null)"
+  # Delegates to lib/pane-guard.sh's pane_is_conductor_eligible (P3,
+  # .handoffs/SPEC.md feat/main-designation-lock), the single copy of this
+  # same judgment designate-main.sh and conductor-handover.sh (P1) also use --
+  # pane_is_agent was already checked by the `if` above, so a failure here
+  # can only be the worker-state reason.
   fallback_reject_reason=""
-  case "$fallback_occupant_state" in
-    running|starting|blocked) fallback_reject_reason="pane is a registered worker's own active task pane" ;;
-  esac
+  pane_is_conductor_eligible "$HERDR_MCP_CONDUCTOR_PANE" 2>/dev/null \
+    || fallback_reject_reason="pane is a registered worker's own active task pane"
   # R3 (security review round 2): F8's check only proves "not a currently
   # registered worker" -- a recycled id hosting any OTHER unregistered
   # session (a reviewer pane, another conductor) still passed. When the
