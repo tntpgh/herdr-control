@@ -365,9 +365,20 @@ _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an
         return ;;
     esac
     # find/git are reads only without their own writing/exec options.
+    # git:-O*/git:--open-files-in-pager* (the pager-hook VALUE runs through
+    # a shell) and git:-c*/git:--config-env* (sets arbitrary per-invocation
+    # config — core.pager, core.editor, alias.*, diff.external,
+    # core.sshCommand, core.fsmonitor, core.hooksPath, credential.helper,
+    # gpg.program, core.askpass, filter.*, merge.*.driver and more all run a
+    # command from that value) are listed explicitly: the old
+    # `git:-[!-]*[oCc]*` glob matched a LOWERCASE o/C/c anywhere in a short
+    # option cluster, so it missed the uppercase `-O` and the long
+    # `--open-files-in-pager`/`--config-env` spellings entirely (shared
+    # list with lib/command-policy.sh's `_cp_git_exec_opt_invoked` — one
+    # list, not two diverging copies).
     for a in "${_CP_LOC[@]:1}"; do
       case "$_cp_wcmd:$a" in
-        find:-exec*|find:-ok*|find:-delete|find:-fprint*|find:-fls|rg:--pre*|git:-[!-]*[oCc]*|git:--output*|git:--exec-path*|git:--ext-diff|git:--textconv)
+        find:-exec*|find:-ok*|find:-delete|find:-fprint*|find:-fls|rg:--pre*|git:-[!-]*[oCc]*|git:-O*|git:--open-files-in-pager*|git:-c|git:-c*|git:--config-env*|git:--output*|git:--exec-path*|git:--ext-diff|git:--textconv)
           PS_VERDICT=escalate PS_POLICY=handoffs-write
           PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '$_cp_wcmd $a' can write or run code — a conductor must review it"
           return ;;
@@ -483,8 +494,16 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
           PS_VERDICT=escalate PS_REASON="the call sets service environment variables, which the command policy does not judge"
         fi
         # F3: a write-restricted (handoffs_write) task's bash is narrowed
-        # the same way its write tool is; this can only tighten an allow.
-        if [ "$PS_VERDICT" = allow ] && [ -n "$hw" ]; then
+        # the same way its write tool is; this can only tighten an allow —
+        # or, when the top-level command-policy verdict already escalated
+        # (e.g. the git -O/-c/--config-env/env-prefix exec-option rule,
+        # which applies to every task, not just a handoffs_write one), swap
+        # in the more specific "restricts writes to .handoffs/$hw only"
+        # reason instead of the generic one. _ps_bash_handoffs_verdict never
+        # sets `allow` itself (see its own header), so running it on an
+        # already-escalated verdict can only leave that escalation in place
+        # or escalate further — never loosen it.
+        if [ -n "$hw" ] && { [ "$PS_VERDICT" = allow ] || [ "$PS_VERDICT" = escalate ]; }; then
           # omp runs bash in input.cwd (relative to the session cwd) or the session cwd.
           op="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
           cmd="$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null)"

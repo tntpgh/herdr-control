@@ -1583,6 +1583,72 @@ check_reserved "H3/xiv: absolute git-send-pack binary path" \
   '/Library/Developer/CommandLineTools/usr/libexec/git-core/git-send-pack origin main'
 check "H1: force via glued redirect" 'git -P> status push -f origin main' escalate
 
+echo
+echo
+echo "== git -O/-c/--config-env exec options escalate (herdr-control git-pager-exec) =="
+# Defect measured on trunk 879d4a8: git runs an `-O`/`--open-files-in-pager`
+# value, and any `-c key=value`/`--config-env` value whose key is
+# exec-capable (core.pager, core.editor, alias.*, diff.external,
+# core.sshCommand, core.fsmonitor, core.hooksPath, credential.helper,
+# gpg.program, core.askpass, filter.*, merge.*.driver, …), through a shell —
+# none of that needed a push or a write, so it sailed through classified
+# `allow`. Mirrors the three measured bypasses exactly.
+check "git grep --open-files-in-pager=cmd (long form, redirect in value)" \
+  'git grep --open-files-in-pager="printf X > /tmp/m" -e foo -- README.md' escalate
+check "git grep -O attached pager cmd" \
+  'git grep -O"touch /tmp/m" -e foo' escalate
+check "git -c core.pager=sh log" \
+  'git -c core.pager=sh log' escalate
+check "git -c alias override" \
+  'git -c alias.x=!sh log' escalate
+check "git --config-env=core.pager=VAR log" \
+  'git --config-env=core.pager=VAR log' escalate
+check "GIT_PAGER= env prefix before git log" \
+  'GIT_PAGER=sh git log' escalate
+check "GIT_SSH_COMMAND= env prefix before git fetch" \
+  'GIT_SSH_COMMAND=sh git fetch' escalate
+check "PAGER= env prefix before git diff" \
+  'PAGER=sh git diff' escalate
+
+# Negative: every read-only git shape this gate already allows must stay
+# allow — the new rule must not over-match plain reads.
+check "git grep -e stays allow"  "git grep -e foo -- README.md"  allow
+check "git log stays allow"      "git log"                       allow
+check "git diff stays allow"     "git diff"                      allow
+check "git status stays allow"   "git status"                    allow
+
+# Real negative (not just the classifier's opinion): run the LITERAL payload
+# through real git in a scratch repo and confirm the marker DOES land (the
+# text is a genuine exploit, not a false positive we're padding the suite
+# with), while classify_command for that exact text already says escalate —
+# so herdr-select.sh/pretool-shadow never hand it to a peer-approved worker
+# unsupervised.
+_gpe_marker="$(mktemp -u /tmp/herdr-git-pager-exec-marker.XXXXXX)"
+_gpe_scratch="$(mktemp -d)"
+( cd "$_gpe_scratch" && git init -q && git -c user.email=x@x -c user.name=x commit -q --allow-empty -m x
+  rm -f "$_gpe_marker"
+  env -u GIT_PAGER -u PAGER script -q /dev/null git -c core.pager="touch $_gpe_marker" log >/dev/null 2>&1
+)
+total=$((total + 1))
+if [ -f "$_gpe_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: -c core.pager payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: -c core.pager payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+rm -f "$_gpe_marker"
+total=$((total + 1))
+got="$(classify_command "git -c core.pager=\"touch $_gpe_marker\" log")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -rf "$_gpe_scratch"
+rm -f "$_gpe_marker"
+
+
 
 
 echo

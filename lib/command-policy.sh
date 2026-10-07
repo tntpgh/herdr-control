@@ -2536,6 +2536,70 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
   esac
 }
 
+# `_cp_git_exec_opt_invoked <raw>` -> 0 (true) when RAW invokes git with an
+# option that runs a value through a shell: `-O`/`--open-files-in-pager`
+# (git grep/log/diff "open in pager" — the raw option VALUE is the pager
+# command, no git-config step or quoting trick needed: `git grep
+# --open-files-in-pager="printf X > /tmp/m" -e foo`, `git grep -O"touch
+# /tmp/m"`), any `-c`/`--config-env` on git (sets per-invocation config —
+# core.pager, pager.*, core.editor, sequence.editor, alias.*, diff.external,
+# diff.*.textconv, diff.*.command, core.sshCommand, core.fsmonitor,
+# core.hooksPath, credential.helper, gpg.program, gpg.*.program,
+# core.askpass, filter.*, merge.*.driver, uploadpack.packObjectsHook,
+# protocol.* among the exec-capable keys — `git -c core.pager=sh log`),
+# or a `GIT_PAGER=`/`PAGER=`/`GIT_EDITOR=`/`GIT_EXTERNAL_DIFF=`/
+# `GIT_SSH_COMMAND=`/`GIT_CONFIG_*=` env-prefix ahead of the git word in the
+# same segment. Simplest acceptable per the issue's own review: escalate the
+# WHOLE `-c`/`--config-env` surface rather than keep an exec-capable-key
+# allowlist in sync with git's — one shared list, not two diverging copies
+# (lib/pretool-shadow.sh's `git:-c*` entry mirrors this).
+#
+# Same preprocessing as _cp_git_push_invoked (unflattened, quote-stripped,
+# segmented on shell operators including `<`/`>` so a quoted `-O` value
+# containing its own redirect cannot hide the option in a later segment) so
+# this reads the same shape the push-force rule already trusts.
+_cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git runs an exec-capable option
+  local LC_ALL=C LANG=C
+  local raw="$1" pre segmented out
+  pre="$(_cp_strip_heredocs "$raw")"
+  pre="$(_cp_decode_ansi_c "$pre")"
+  pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
+  pre="$(printf '%s' "$pre" | sed "s/['\"\\\\]//g")"
+  pre="$(printf '%s' "$pre" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
+  segmented="$(printf '%s' "$pre" | sed -E 's/[;&|()`<>]/\n/g')"
+  out="$(printf '%s\n' "$segmented" | awk '
+    function is_git(s,    n) { n = length(s); return (s == "git" || (n > 4 && substr(s, n - 3) == "/git")) }
+    function is_env_prefix(s) { return (s ~ /^(GIT_PAGER|PAGER|GIT_EDITOR|GIT_EXTERNAL_DIFF|GIT_SSH_COMMAND|GIT_CONFIG_[A-Za-z0-9_]*)=/) }
+    {
+      n = split($0, tok, /[ \t]+/)
+      i = 1; pending_env = 0
+      while (i <= n) {
+        t = tok[i]
+        if (t == "") { i++; continue }
+        if (is_env_prefix(t)) { pending_env = 1; i++; continue }
+        if (is_git(t)) {
+          if (pending_env) hit = 1
+          pending_env = 0
+          i++
+          while (i <= n) {
+            t2 = tok[i]
+            if (t2 == "") { i++; continue }
+            if (t2 ~ /^-O/ || t2 ~ /^--open-files-in-pager(=|$)/ ||
+                t2 == "-c" || t2 ~ /^--config-env(=|$)/) hit = 1
+            i++
+          }
+          continue
+        }
+        pending_env = 0
+        i++
+      }
+    }
+    END { if (hit) print "hit"; else print "safe" }
+  ')"
+  [ "$out" = hit ] && return 0
+  return 1
+}
+
 # ---- the floor rule table (ported from qm's command-policy.ts) ------------
 # Applies in EVERY posture — there is no "trusted mode" that skips these.
 # Deny rules are checked ahead of require_approval ones so a command that
@@ -4041,6 +4105,17 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   { _cp_git_push_invoked "$raw" &&
     _cp_match '(^|[[:space:]])(-[A-Za-z]*f[A-Za-z]*|--force(-with-lease)?)([[:space:]]|$)' "$norm"; } &&
     _cp_consider 1 "git push --force/-f rewrites remote history"
+
+  # escalate — git -O/--open-files-in-pager, -c/--config-env, or a
+  # GIT_PAGER/GIT_EDITOR/GIT_EXTERNAL_DIFF/GIT_SSH_COMMAND/GIT_CONFIG_* env
+  # prefix runs an arbitrary command through a shell — see
+  # _cp_git_exec_opt_invoked above for the full key list and why the whole
+  # -c/--config-env surface escalates rather than an allowlist of keys.
+  # Every OTHER git shape this file already allows (`git status`, `git
+  # log`, `git diff`, `git grep -e …`, …) is untouched; this only fires on
+  # the exec-capable option/config/env surface itself.
+  _cp_git_exec_opt_invoked "$raw" &&
+    _cp_consider 1 "git -O/--open-files-in-pager, -c/--config-env, or a GIT_PAGER/GIT_EDITOR/GIT_SSH_COMMAND/GIT_CONFIG_* env prefix runs an arbitrary command through a shell"
 
   # escalate — DROP/TRUNCATE TABLE, case-insensitive (SQL keywords are
   # conventionally upper- or lower-case interchangeably).
