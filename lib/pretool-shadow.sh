@@ -19,9 +19,13 @@
 # scripts/shadow-compare.sh can measure it against what the menu path actually
 # did.
 #
-# Usage: pretool-shadow.sh [--record] [--enforce]   (payload JSON on stdin)
+# Usage: pretool-shadow.sh [--record] [--enforce [--owner]]   (payload JSON on stdin)
 #   --enforce: hook-approval tasks only (see pretool_enforce below); prints
 #   {decision, reason, request_id, verdict} for the hook instead of the row.
+#   --owner (with --enforce): a registered long-lived owner/conductor session
+#   instead of a spawned task (design §13, pretool_owner_enforce below);
+#   identity is HERDR_OWNER_APPROVAL (label), HERDR_PANE_ID and
+#   HERDR_OWNER_SESSION_ID, all passed by the hook.
 #   payload: {tool, call_id, input, cwd, guard_block, t0_ms}
 #     guard_block: the reason string of a block the hook's existing guards
 #                  (pretool-registration, #159 write scope) returned, or null.
@@ -58,6 +62,7 @@ _ps_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_ps_dir/scoped-policy.sh"
 . "$_ps_dir/pane-guard.sh"
 . "$_ps_dir/action-request.sh"
+. "$_ps_dir/owner-identity.sh"
 
 # Hook-approval reservations join the ONE policy through its own operator-rule
 # channel (lib/hook-approval-rules.tsv: tighten-only; a match is human-only).
@@ -118,10 +123,14 @@ _ps_now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time*1000' 2>/dev/null; 
 
 # ---- identity: fail closed ---------------------------------------------------
 # Sets PS_TASK_JSON on success; on failure sets PS_VERDICT=block PS_POLICY=identity.
+# PS_OWNER_MODE=1 (--owner) judges a registered owner session instead of a
+# spawned task; neither branch can fall through to the other.
+_ps_id_fail() { PS_VERDICT=block PS_POLICY=identity PS_REASON="identity: $1"; return 1; }
+
 _ps_identity() {
+  if [ "${PS_OWNER_MODE:-0}" = 1 ]; then _ps_owner_identity; return; fi
   PS_TASK_JSON=""
   local st reg_pane reg_birth live
-  _ps_id_fail() { PS_VERDICT=block PS_POLICY=identity PS_REASON="identity: $1"; return 1; }
   [ -n "${HERDR_TASK_ID:-}" ] || _ps_id_fail "HERDR_TASK_ID is not set" || return 1
   [ -n "${HERDR_RUN_ID:-}" ] || _ps_id_fail "HERDR_TASK_ID is set but HERDR_RUN_ID is not" || return 1
   [ -n "${HERDR_PANE_ID:-}" ] || _ps_id_fail "HERDR_PANE_ID is not set" || return 1
@@ -154,6 +163,49 @@ _ps_identity() {
   live="$(pane_birth_now "$HERDR_PANE_ID" 2>/dev/null)"
   [ -n "$live" ] || _ps_id_fail "pane generation unverifiable (herdr pane list has no $HERDR_PANE_ID)" || return 1
   [ "$live" = "$reg_birth" ] || _ps_id_fail "pane $HERDR_PANE_ID was recycled (registered $reg_birth, live $live)" || return 1
+  return 0
+}
+
+# The owner branch (design §13). Every proof comes from the hook's load-time
+# pane id, the hook's ctx session id, the owner record and herdr's live pane
+# list — never from env the session can set later, a payload field, or pane
+# text. The record is read on EVERY call (no cache), so a revocation takes
+# effect on the owner's next tool call. On success PS_TASK_JSON is '{}': an
+# owner has no worktree, manifest or ownership grant, so peer_decide judges
+# its commands on their text alone (the unregistered-pane case it already has).
+_ps_owner_identity() {
+  PS_TASK_JSON=""
+  local label="${HERDR_OWNER_APPROVAL:-}" sid="${HERDR_OWNER_SESSION_ID:-}" pane="${HERDR_PANE_ID:-}"
+  local db row fields st r_pane r_birth r_sid live
+  [ -n "$label" ] || _ps_id_fail "owner mode with no owner label (HERDR_OWNER_APPROVAL)" || return 1
+  owner_label_valid "$label" || _ps_id_fail "owner label '$label' is malformed" || return 1
+  [ -z "${HERDR_TASK_ID:-}${HERDR_RUN_ID:-}" ] \
+    || _ps_id_fail "this session carries both a worker task (HERDR_TASK_ID/HERDR_RUN_ID) and an owner label; one session is never both" || return 1
+  [ -n "$pane" ] || _ps_id_fail "HERDR_PANE_ID is not set" || return 1
+  [ -n "$sid" ] || _ps_id_fail "the omp session id is unavailable to the hook" || return 1
+  db="$(owner_identity_db)"
+  [ -f "$db" ] || _ps_id_fail "no owner identity record exists ($db is absent); this session is $sid in pane $pane" || return 1
+  row="$(owner_identity_read "$label" 2>/dev/null)" \
+    || _ps_id_fail "the owner identity record is unreadable ($db)" || return 1
+  [ -n "$row" ] || _ps_id_fail "unknown owner '$label': no registration for that label; this session is $sid in pane $pane" || return 1
+  fields="$(printf '%s' "$row" | jq -er '[.state, .pane_id, .pane_birth, .session_id] | map(tostring) | join("\u001f")' 2>/dev/null)" \
+    || _ps_id_fail "the owner identity record for '$label' is corrupt" || return 1
+  IFS=$'\x1f' read -r st r_pane r_birth r_sid <<<"$fields"
+  case "$st" in
+    active) ;;
+    revoked)
+      _ps_id_fail "owner '$label' was revoked at $(printf '%s' "$row" | jq -r '.revoked_at') ($(printf '%s' "$row" | jq -r '.revoke_reason'))"
+      return 1 ;;
+    *) _ps_id_fail "the owner identity record for '$label' has unknown state '${st}'"; return 1 ;;
+  esac
+  [ "$r_pane" = "$pane" ] || _ps_id_fail "pane $pane is not owner '$label''s registered pane ${r_pane:-<none>}" || return 1
+  [ -n "$r_birth" ] || _ps_id_fail "owner record '$label' has no pane_birth" || return 1
+  live="$(pane_birth_now "$pane" 2>/dev/null)"
+  [ -n "$live" ] || _ps_id_fail "pane generation unverifiable (herdr pane list has no $pane)" || return 1
+  [ "$live" = "$r_birth" ] || _ps_id_fail "pane $pane was recycled (registered $r_birth, live $live)" || return 1
+  [ "$r_sid" = "$sid" ] \
+    || _ps_id_fail "session $sid is not owner '$label''s registered session (a new or resumed session in that pane is a different identity)" || return 1
+  PS_TASK_JSON='{}'
   return 0
 }
 
@@ -301,7 +353,7 @@ _ps_plain_write_verdict() {
 # handoffs_write — so `echo x > src/a.py`, `tee`, `cp`, `sed -i`, `ln -s`
 # all auto-allowed anywhere inside the worktree for a research/explore task.
 # The outer hook (#184, workerWriteScopeBlock) only proves "inside the
-# worktree", never "is the deliverable". `_ps_bash_handoffs_verdict <cmd>
+# worktree", never "is the deliverable". `_ps_bash_closed_world_verdict <cmd>
 # <cwd> <hw>` runs AFTER peer_decide said allow and can only tighten it.
 # CLOSED WORLD (security review F3-1/2/4): the #184 parser is a denylist of
 # write-shaped verbs (command-policy.sh, "non-exhaustive"), so "no target
@@ -319,31 +371,41 @@ _ps_plain_write_verdict() {
 # runners, sed/awk, cp/mv/ln — escalates to the conductor. Reads stay allowed.
 # No `cd`: omp's bash is a persistent shell, so a `cd` in one call would move
 # every later call away from the cwd this check resolves targets against.
+#
+# OWNER (design §13): the same closed world with NO write scope at all — an
+# owner session's bash may only read. Called with an empty <hw>; every TARGET
+# escalates. This is what makes peer_decide's `allow` mean "read-only" for an
+# owner, which has neither a worktree nor the #184 write-target containment.
 _PS_HW_SAFE=' cat head tail wc ls grep egrep fgrep rg find echo printf tee pwd sort cut tr diff cmp
  stat file basename dirname realpath readlink date true false test [ jq column nl comm fold expand
  shasum sha256sum mkdir touch git '
-_ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an allow
-  local cmd="$1" cwd="$2" hw="$3" wt wt_abs line kind val seg root a targets
-  wt="$(printf '%s' "$PS_TASK_JSON" | jq -r '.worktree // empty' 2>/dev/null)"
-  if [ -z "$wt" ]; then
-    PS_VERDICT=escalate PS_POLICY=handoffs-write PS_REASON="worker worktree unknown — cannot judge this task's bash write scope"; return
+_ps_bash_closed_world_verdict() {       # command cwd hw ; hw empty = owner ; only ever tightens an allow
+  local cmd="$1" cwd="$2" hw="$3" wt="" wt_abs="" line kind val seg root a targets pol scope
+  if [ -n "$hw" ]; then
+    pol=handoffs-write scope="this task's manifest restricts writes to .handoffs/$hw only"
+    wt="$(printf '%s' "$PS_TASK_JSON" | jq -r '.worktree // empty' 2>/dev/null)"
+    if [ -z "$wt" ]; then
+      PS_VERDICT=escalate PS_POLICY=handoffs-write PS_REASON="worker worktree unknown — cannot judge this task's bash write scope"; return
+    fi
+    wt_abs="$(_cp_lexical_abspath "$wt")"
+    [ -n "$cwd" ] || cwd="$wt_abs"
+  else
+    pol=owner-scope scope="an owner session runs only read-only commands"
   fi
-  wt_abs="$(_cp_lexical_abspath "$wt")"
-  [ -n "$cwd" ] || cwd="$wt_abs"
   # R2-1: a command substitution's body is collapsed to @SUB@ before either
   # the segment walk or the target parser sees it, so `cat "$(echo x >
   # src/a)"` would read as a bare `cat`. Nothing a research task needs.
   case "$(_cp_protect_text "$cmd")" in
     *@SUB@*)
-      PS_VERDICT=escalate PS_POLICY=handoffs-write
-      PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; a command substitution runs code this policy cannot see — a conductor must review it"
+      PS_VERDICT=escalate PS_POLICY=$pol
+      PS_REASON="$scope; a command substitution runs code this policy cannot see — a conductor must review it"
       return ;;
   esac
   while IFS= read -r seg; do
     [ -n "${seg//[[:space:]]/}" ] || continue
     if ! _cp_locate_command_word "$seg"; then
-      PS_VERDICT=escalate PS_POLICY=handoffs-write
-      PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; a command segment has no command word this policy can identify — a conductor must review it"
+      PS_VERDICT=escalate PS_POLICY=$pol
+      PS_REASON="$scope; a command segment has no command word this policy can identify — a conductor must review it"
       return
     fi
     # R2-3: the command word must be the segment's FIRST word. A launcher
@@ -353,23 +415,23 @@ _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an
     local -a _hw_toks
     set -f; read -r -a _hw_toks <<<"$seg"; set +f
     if [ "${_hw_toks[0]:-}" != "${_CP_LOC[0]:-}" ]; then
-      PS_VERDICT=escalate PS_POLICY=handoffs-write
-      PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '${_hw_toks[0]:-}' wraps or prefixes '$_cp_wcmd' — a conductor must review it"
+      PS_VERDICT=escalate PS_POLICY=$pol
+      PS_REASON="$scope; '${_hw_toks[0]:-}' wraps or prefixes '$_cp_wcmd' — a conductor must review it"
       return
     fi
     case "$_PS_HW_SAFE" in
       *" $_cp_wcmd "*) ;;
       *)
-        PS_VERDICT=escalate PS_POLICY=handoffs-write
-        PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '$_cp_wcmd' is not on the read/scratch command list — a conductor must review it"
+        PS_VERDICT=escalate PS_POLICY=$pol
+        PS_REASON="$scope; '$_cp_wcmd' is not on the read/scratch command list — a conductor must review it"
         return ;;
     esac
     # find/git are reads only without their own writing/exec options.
     for a in "${_CP_LOC[@]:1}"; do
       case "$_cp_wcmd:$a" in
         find:-exec*|find:-ok*|find:-delete|find:-fprint*|find:-fls|rg:--pre*|git:-[!-]*[oCc]*|git:--output*|git:--exec-path*|git:--ext-diff|git:--textconv)
-          PS_VERDICT=escalate PS_POLICY=handoffs-write
-          PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '$_cp_wcmd $a' can write or run code — a conductor must review it"
+          PS_VERDICT=escalate PS_POLICY=$pol
+          PS_REASON="$scope; '$_cp_wcmd $a' can write or run code — a conductor must review it"
           return ;;
       esac
     done
@@ -377,22 +439,26 @@ _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an
       case " ${_CP_LOC[1]:-} " in
         " log "|" show "|" diff "|" status "|" grep "|" ls-files "|" rev-parse "|" blame "|" cat-file "|" ls-tree "|" describe "|" shortlog ") ;;
         *)
-          PS_VERDICT=escalate PS_POLICY=handoffs-write
-          PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; 'git ${_CP_LOC[1]:-}' is not a read-only git verb — a conductor must review it"
+          PS_VERDICT=escalate PS_POLICY=$pol
+          PS_REASON="$scope; 'git ${_CP_LOC[1]:-}' is not a read-only git verb — a conductor must review it"
           return ;;
       esac
     fi
   done < <(_cp_walk_segments "$cmd")
   # F3-5: capture the parser's output and status; a failure is never "no targets".
   if ! targets="$(bash_write_targets "$cmd" "$cwd")"; then
-    PS_VERDICT=escalate PS_POLICY=handoffs-write PS_REASON="the bash write-target parser failed — a conductor must review it"; return
+    PS_VERDICT=escalate PS_POLICY=$pol PS_REASON="the bash write-target parser failed — a conductor must review it"; return
   fi
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     kind="${line%%$'\t'*}" val="${line#*$'\t'}"
     if [ "$kind" != TARGET ]; then
-      PS_VERDICT=escalate PS_POLICY=handoffs-write
-      PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; a write target cannot be read statically ($kind) — a conductor must review it"
+      PS_VERDICT=escalate PS_POLICY=$pol
+      PS_REASON="$scope; a write target cannot be read statically ($kind) — a conductor must review it"
+      return
+    fi
+    if [ -z "$hw" ]; then
+      PS_VERDICT=escalate PS_POLICY=$pol PS_REASON="$scope; this command writes $val"
       return
     fi
     # Every allowed target is checked on disk, never lexically: its real
@@ -409,8 +475,8 @@ _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an
       "$wt_abs/tmp/"*) root="$wt|tmp|under" ;;
       /tmp/*|/private/tmp/*) root="/tmp||under" ;;
       *)
-        PS_VERDICT=escalate PS_POLICY=handoffs-write
-        PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; this command writes ${val#"$wt_abs"/} — a conductor must review it"
+        PS_VERDICT=escalate PS_POLICY=$pol
+        PS_REASON="$scope; this command writes ${val#"$wt_abs"/} — a conductor must review it"
         return ;;
     esac
     if ! python3 - "$val" "$root" <<'PY' 2>/dev/null
@@ -432,8 +498,8 @@ if stat.S_ISLNK(st.st_mode) or (not stat.S_ISDIR(st.st_mode) and st.st_nlink != 
     sys.exit(1)
 PY
     then
-      PS_VERDICT=escalate PS_POLICY=handoffs-write
-      PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; ${val#"$wt_abs"/} is (or resolves through) a symlink or hard link — a conductor must review it"
+      PS_VERDICT=escalate PS_POLICY=$pol
+      PS_REASON="$scope; ${val#"$wt_abs"/} is (or resolves through) a symlink or hard link — a conductor must review it"
       return
     fi
     # Scratch is untracked by definition: a tracked file under tmp/ (some
@@ -441,8 +507,8 @@ PY
     case "$val" in
       "$wt_abs/tmp/"*)
         if git -C "$wt" ls-files --error-unmatch -- "${val#"$wt_abs"/}" >/dev/null 2>&1; then
-          PS_VERDICT=escalate PS_POLICY=handoffs-write
-          PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; ${val#"$wt_abs"/} is a tracked file, not scratch — a conductor must review it"
+          PS_VERDICT=escalate PS_POLICY=$pol
+          PS_REASON="$scope; ${val#"$wt_abs"/} is a tracked file, not scratch — a conductor must review it"
           return
         fi ;;
     esac
@@ -489,7 +555,7 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
           op="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
           cmd="$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null)"
           case "$op" in /*) ;; '') op="$cmd" ;; *) op="${cmd:+$cmd/}$op" ;; esac
-          _ps_bash_handoffs_verdict "$PS_CMD" "$op" "$hw"
+          _ps_bash_closed_world_verdict "$PS_CMD" "$op" "$hw"
         fi
       fi ;;
     eval|python|js|javascript|repl|notebook_eval)
@@ -625,6 +691,27 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
     *)
       PS_VERDICT=escalate PS_REASON="unknown tool '$tool': a conductor must review it" ;;
   esac
+  # Owner tighten (design §13), both can only turn an allow into escalate:
+  # - containment-159's allow leans on the #159 write-scope guard, which
+  #   confines spawned workers to their worktree and does not run for an
+  #   owner session — an owner has no registered write scope;
+  # - a command peer_decide allowed (bash, a job's stdin, hub start) is held
+  #   to the read-only closed world: classify_command alone allows interpreter
+  #   and redirect writes anywhere (`python3 -c "open(p,'w')…"`, `echo > p`,
+  #   `cp`), which for a worker the #184 write-target guard contains and for
+  #   an owner nothing would.
+  if [ "${PS_OWNER_MODE:-0}" = 1 ] && [ "$PS_VERDICT" = allow ]; then
+    case "$PS_POLICY" in
+      containment-159)
+        PS_VERDICT=escalate PS_POLICY=owner-scope
+        PS_REASON="file mutation: the #159 write-scope guard contains spawned workers only, and an owner session has no registered write scope" ;;
+      command-policy)
+        op="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
+        cmd="$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null)"
+        case "$op" in /*) ;; '') op="$cmd" ;; *) op="${cmd:+$cmd/}$op" ;; esac
+        _ps_bash_closed_world_verdict "$PS_CMD" "$op" "" ;;
+    esac
+  fi
   [ "$PS_VERDICT" = allow ] && return 0
   return 8
 }
@@ -648,7 +735,7 @@ pretool_payload_json() {                # payload-json elapsed-ms -> event/stdou
     '{schema:1, mode:$mode, tool:$tool, call_id:$call, verdict:$v, policy:$pol, reason:$r,
       authority:$auth, command:$cmd, command_sha256:$csha, input_sha256:$isha, cwd:$cwd, pane:$pane,
       code_path:$cp, code_sha256:$cs, elapsed_ms:(($el|tonumber?) // null)}
-     + (if $mode == "enforce" then {decision:$dec, request_id:$rid} else {} end)'
+     + (if $mode == "enforce" or $mode == "owner" then {decision:$dec, request_id:$rid} else {} end)'
 }
 
 # ---- enforce mode (hook-approval tasks only) ----------------------------------
@@ -682,12 +769,52 @@ _ps_request_command() {                 # input-json session-cwd -> text the rev
   fi
 }
 
+# The ONE fail-closed answer to an unproven identity, for both branches.
+_ps_identity_refusal() {                # who subject tell
+  printf 'herdr %s: refused — %s. The pre-tool check cannot prove this session is %s, so nothing runs. Stop and tell %s.' \
+    "$1" "$PS_REASON" "$2" "$3"
+}
+
+# ---- owner enforce (design §13) -----------------------------------------------
+# Only called by the omp hook for a session launched with
+# HERDR_OWNER_APPROVAL=<label> (the opt-in; nothing sets it today). Same
+# verdict as a worker, from the same table and peer_decide, but an owner has
+# no conductor above it and no grant path, so only `allow` runs:
+#   identity unproven -> refused, nothing runs (the worker branch's wording)
+#   allow             -> run it (omp's own approval layer still applies)
+#   escalate/reserved -> blocked: Terrence's call; no request, no grant
+#   deny/block        -> blocked, nobody can approve it
+# Never touches the control-plane registry (no action_requests row, no
+# registry_init). Sets PS_DECISION (allow|block), PS_WORKER_REASON.
+pretool_owner_enforce() {
+  PS_DECISION=block PS_WORKER_REASON="" PS_REQUEST_ID=""
+  if [ "$PS_POLICY" = identity ] || [ -z "$PS_TASK_JSON" ]; then
+    PS_WORKER_REASON="$(_ps_identity_refusal owner-approval "the live registered owner '${HERDR_OWNER_APPROVAL:-}'" "Terrence")"
+    return 8
+  fi
+  if [ -z "$_PS_RULES" ]; then
+    PS_VERDICT=block PS_POLICY=identity PS_REASON="lib/hook-approval-rules.tsv is missing"
+    PS_WORKER_REASON="herdr owner-approval: refused — the hook-approval policy rules are missing, so nothing runs. Tell Terrence."
+    return 8
+  fi
+  case "$PS_VERDICT" in
+    allow) PS_DECISION=allow; return 0 ;;
+    escalate|reserved)
+      PS_WORKER_REASON="herdr owner-approval: not run — ${PS_REASON}. An owner session has no conductor above it, so this is Terrence's call: stop and ask him. Do not retry it or work around it through another tool (eval, write, edit, a script)." ;;
+    deny)
+      PS_WORKER_REASON="herdr owner-approval: refused — ${PS_REASON}. Nobody can approve this. Do not retry it or work around it; change approach or end your turn." ;;
+    *)
+      PS_WORKER_REASON="herdr owner-approval: refused — ${PS_REASON}. Do not retry it or work around it." ;;
+  esac
+  return 8
+}
+
 pretool_enforce() {                     # payload-json (after pretool_decide) -> 0 allow, 8 block
   local payload="$1" input cwd sha route kind cmd approval here_root
   PS_DECISION=block PS_WORKER_REASON="" PS_REQUEST_ID=""
   approval="$(printf '%s' "$PS_TASK_JSON" | jq -r '.approval // empty' 2>/dev/null)"
   if [ "$PS_POLICY" = identity ] || [ -z "$PS_TASK_JSON" ]; then
-    PS_WORKER_REASON="herdr hook-approval: refused — $PS_REASON. The pre-tool check cannot prove this session is a live registered hook-approval worker, so nothing runs. Stop and tell your conductor."
+    PS_WORKER_REASON="$(_ps_identity_refusal hook-approval "a live registered hook-approval worker" "your conductor")"
     return 8
   fi
   if [ "$approval" != hook ]; then
@@ -780,13 +907,17 @@ pretool_enforce() {                     # payload-json (after pretool_decide) ->
 
 pretool_shadow_main() {
   local record=0 enforce=0 payload rc t0 now elapsed="" out eid call a
+  PS_OWNER_MODE=0
   for a in "$@"; do
-    case "$a" in --record) record=1 ;; --enforce) enforce=1 ;; esac
+    case "$a" in --record) record=1 ;; --enforce) enforce=1 ;; --owner) PS_OWNER_MODE=1 enforce=1 ;; esac
   done
   payload="$(cat)"
   printf '%s' "$payload" | jq -e 'type=="object"' >/dev/null 2>&1 || payload='{}'
   pretool_decide "$payload"; rc=$?
-  if [ "$enforce" = 1 ]; then
+  if [ "$PS_OWNER_MODE" = 1 ]; then
+    PS_MODE=owner
+    pretool_owner_enforce; rc=$?
+  elif [ "$enforce" = 1 ]; then
     PS_MODE=enforce
     pretool_enforce "$payload"; rc=$?
   fi
@@ -802,7 +933,12 @@ pretool_shadow_main() {
   else
     printf '%s\n' "$out"
   fi
-  if [ "$record" = 1 ] && [ "${PS_REGISTRY_OK:-1}" = 1 ] && [ -n "${HERDR_TASK_ID:-}" ]; then
+  if [ "$record" = 1 ] && [ "$PS_OWNER_MODE" = 1 ]; then
+    # The owner audit trail lives with the owner records (never the shadow
+    # store's worker rows); dropped when no owner store exists yet.
+    owner_identity_audit "${HERDR_OWNER_APPROVAL:-}" verdict \
+      "$(printf '%s' "$out" | jq -c --arg s "${HERDR_OWNER_SESSION_ID:-}" '. + {session_id:$s}' 2>/dev/null)"
+  elif [ "$record" = 1 ] && [ "${PS_REGISTRY_OK:-1}" = 1 ] && [ -n "${HERDR_TASK_ID:-}" ]; then
     call="$(printf '%s' "$payload" | jq -r '.call_id // empty' 2>/dev/null)"
     eid="$(gen_id ptv)"
     [ -n "$call" ] && eid="ptv_${HERDR_TASK_ID}_$(_ps_sha "$call" | cut -c1-16)"

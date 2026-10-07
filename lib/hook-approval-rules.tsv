@@ -5,8 +5,10 @@
 # conductor_reserved_reason turns any match into human-only, so these can only
 # tighten. Why: a hook worker's bash runs with no menu, so writing the registry,
 # a decision form or the approval machinery directly would approve its own
-# request. Loaded by lib/pretool-shadow.sh (shadow and enforce).
-escalate	(\.local/state/herdr|herdr/runs|registry\.sqlite3|pretool-shadow\.sqlite3|action-forms|herdr/forms)	hook approval: the herdr control-plane state (registry, decisions, forms) is human-only
-escalate	(herdr-action\.sh|action-request\.sh|pretool-shadow\.sh|pretool-registration\.sh|hook-approval-rules|omp-worker-overlay|omp-herdr-control|formserve\.py)	hook approval: the approval machinery itself is human-only
-escalate	(\.omp/agent/(extensions|config)|\bHERDR_RUN_STATE_DIR\b|\bHERDR_STATE_ROOT\b|\bHERDR_APPROVAL\b)	hook approval: omp extensions/config and herdr state locations are human-only
-escalate	\bsqlite3?\b.*\b(action_requests|file_approvals|approvals|pretool_verdicts|tasks|events)\b	hook approval: approval records are human-only
+# request. The same rules protect the owner identity store (design §13): an
+# owner session must never register, re-bind or revoke itself. Loaded by
+# lib/pretool-shadow.sh (shadow, enforce and --owner).
+escalate	(\.local/state/herdr|herdr/runs|registry\.sqlite3|pretool-shadow\.sqlite3|owner-identities\.sqlite3|action-forms|herdr/forms)	hook approval: the herdr control-plane state (registry, decisions, forms, owner identities) is human-only
+escalate	(herdr-action\.sh|action-request\.sh|pretool-shadow\.sh|pretool-registration\.sh|hook-approval-rules|omp-worker-overlay|omp-herdr-control|formserve\.py|owner-approval\.sh|owner-identity\.sh)	hook approval: the approval machinery itself is human-only
+escalate	(\.omp/agent/(extensions|config)|\bHERDR_RUN_STATE_DIR\b|\bHERDR_STATE_ROOT\b|\bHERDR_APPROVAL\b|\bHERDR_OWNER_APPROVAL\b|\bHERDR_OWNER_SESSION_ID\b)	hook approval: omp extensions/config and herdr state locations are human-only
+escalate	\bsqlite3?\b.*\b(action_requests|file_approvals|approvals|pretool_verdicts|tasks|events|owner_identities|owner_events)\b	hook approval: approval records are human-only
