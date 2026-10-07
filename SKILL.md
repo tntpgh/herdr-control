@@ -278,6 +278,22 @@ clean tree, nothing unpushed), so it never closes more than that would. The
 omp hook's `session_stop` handler reminds a conductor once, at its first stop,
 whenever `--summary` reports closable workers. It never blocks.
 
+**Conductor handover.** A blocked, stalled or dead conductor pane otherwise
+leaves its workers answerable by nobody but a human — every
+conductor-authority check compares the live caller against the row
+`register_task` wrote once at spawn. `conductor-handover.sh` moves that row
+by compare-and-swap instead:
+
+```bash
+./conductor-handover.sh --task <id>   --to <pane> --reason "<text>" [--dry-run]
+./conductor-handover.sh --from <pane> --to <pane> --reason "<text>" [--dry-run]
+```
+
+Callable by the task's current live conductor (its own tasks only) or the
+designated Main (any task); the target must be a live, non-worker pane. A
+pending prompt is re-delivered to the new conductor; both conductors get a
+one-line notice. See `docs/approval-policy.md` §11.
+
 ---
 
 ## omp workers push too

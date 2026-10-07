@@ -239,6 +239,36 @@ rather than a path (`learn`, `manage_skill`, `retain`). The hook loads at omp
 session start, and omp has no extension file-watcher. A running worker keeps
 the hook it started with until its next session start.
 
+## 11. Conductor authority can be handed over, but only by a compare-and-swap
+
+`conductor_pane_id`/`conductor_pane_birth`/`conductor_id` used to be written
+once, at `register_task`, and nothing could change them — so a blocked,
+stalled or dead conductor pane left its workers answerable by nobody but a
+human, since every conductor-authority check (`herdr-select.sh`'s
+reviewed-conductor gate above, `lib/push-wake.sh`'s conductor-pane-birth
+revalidation) compares the live caller against exactly that row.
+`conductor-handover.sh` + `lib/run-registry.sh` `set_task_conductor` close
+that gap with the narrowest primitive that does: ONE compare-and-swap per
+task, gated on the caller's claimed `from_pane`/`from_birth` still being the
+row's live conductor — a stale or raced caller changes nothing, and two
+concurrent handovers of the same task leave exactly one winner.
+
+**Who may call it:** the task's current live registered conductor (giving
+its own tasks away only — the same live-pane-and-birth comparison rule 3
+above requires), or the designated Main (any task). Refused: a worker pane,
+and anyone else. **The target** must be a live, non-worker agent pane —
+`validate_conductor_target_pane` (`lib/pane-guard.sh`), the same check
+`spawn-task.sh`'s `HERDR_MCP_CONDUCTOR_PANE` fallback uses, not a second
+copy that could drift from it.
+
+**A handover never changes classification, posture, or the reserved list.**
+It moves WHO the conductor-authority checks above compare the caller
+against; it does not relax what a conductor, once recognized, may do. A
+pending `input_required` prompt is re-delivered to the new conductor through
+the existing push-wake path (no new sender), and both the old and new
+conductor get a one-line best-effort notice — a failed notice never rolls
+back the swap that already committed.
+
 ---
 
 Cross-reference: `docs/control-plane-design.md` has the design history and

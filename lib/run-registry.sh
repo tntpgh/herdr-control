@@ -706,6 +706,66 @@ register_task() {
   return 1
 }
 
+# set_task_conductor <run_id> <task_id> <from_pane> <from_birth> <to_pane>
+#                     <to_birth> <to_conductor_id> <by> [reason]
+#
+# Compare-and-swap handover of a task's conductor authority (SPEC.md
+# feat/conductor-handover). Until this existed, conductor_pane_id/
+# conductor_pane_birth/conductor_id were written ONCE at register_task and
+# nothing could change them, so a blocked/stalled/dead conductor pane left
+# its workers answerable by nobody but a human (every conductor-authority
+# check -- herdr-select.sh's reviewed-conductor gate, lib/push-wake.sh's
+# conductor-pane-birth revalidation -- compares the live caller against
+# exactly this row). Measured 2026-10-07: task_20261007T021346Z_91873_9846
+# deadlocked behind a blocked conductor pane with no way out but a human.
+#
+# ONE transaction: the UPDATE is gated on the CALLER'S claimed <from_pane>/
+# <from_birth> still being the row's live conductor_pane_id/
+# conductor_pane_birth, and state still being active -- exactly
+# set_task_state's CAS shape, same race it closes (two callers racing a
+# handover of the same task; a caller acting on a conductor that already
+# moved on). 0 rows changed = stale/raced, nonzero exit, no event -- the
+# caller re-reads reality instead of retrying blind. A `conductor_handover`
+# event is appended only when exactly 1 row changed, gated the same way
+# set_task_state gates `state_changed` (`WHERE (SELECT changes())>0`).
+#
+# Authority (who may call this), target validation (must be a live,
+# non-worker pane) and the re-wake/notify steps are conductor-handover.sh's
+# job, not this function's -- this is the one compare-and-swap write, reused
+# by anything that needs it, the same split register_task/set_task_state
+# already draw between "record a fact" and "decide whether to."
+set_task_conductor() {
+  local run_id="$1" task_id="$2" from_pane="$3" from_birth="$4" to_pane="$5" \
+        to_birth="$6" to_conductor_id="$7" by="$8" reason="${9:-}"
+  registry_init || return 1
+  [ -n "$run_id" ] && [ -n "$task_id" ] && [ -n "$to_pane" ] && [ -n "$to_conductor_id" ] || {
+    printf 'run-registry: set_task_conductor requires run_id, task_id, to_pane, to_conductor_id\n' >&2
+    return 1
+  }
+  local at eid payload changed
+  at="$(_now_iso)"
+  eid="$(gen_id ev)"
+  payload="$(jq -nc --arg f "$from_pane" --arg fb "$from_birth" --arg t "$to_pane" \
+    --arg tb "$to_birth" --arg by "$by" --arg reason "$reason" \
+    '{from:$f, from_birth:$fb, to:$t, to_birth:$tb, by:$by, reason:$reason}')"
+  changed=$(_sql "BEGIN IMMEDIATE;
+    UPDATE tasks SET conductor_pane_id=$(_sq "$to_pane"), conductor_pane_birth=$(_sq "$to_birth"),
+        conductor_id=$(_sq "$to_conductor_id"), updated_at=$(_sq "$at")
+      WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id")
+        AND conductor_pane_id=$(_sq "$from_pane") AND conductor_pane_birth=$(_sq "$from_birth")
+        AND state IN ('starting','running','blocked');
+    INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload)
+      SELECT $(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), 'conductor_handover', $(_sq "$at"),
+        $(_sq "$payload")
+      WHERE (SELECT changes()) > 0;
+    COMMIT;
+    SELECT changes();" 2>/dev/null)
+  [ "$changed" = "1" ] && return 0
+  printf 'run-registry: set_task_conductor CAS miss for %s/%s (from %s/%s no longer matches the live conductor, or the task is not active)\n' \
+    "$run_id" "$task_id" "$from_pane" "$from_birth" >&2
+  return 1
+}
+
 # ---- code by reference: file approvals bound to a sha256 ---------------------
 # See the file_approvals table comment in registry_init and lib/scoped-policy.sh.
 file_approval_record() {                # <task_id> <abs-path> <sha256> <approved_by>

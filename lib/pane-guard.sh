@@ -87,6 +87,41 @@ pane_birth_now() {                      # pane_id -> live terminal_id, empty if 
     '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null
 }
 
+# validate_conductor_target_pane <pane> [expected_birth]
+#
+# The occupant/birth half of F8 (security review PR #220), extracted so
+# spawn-task.sh's HERDR_MCP_CONDUCTOR_PANE fallback and
+# conductor-handover.sh's --to both check the same thing instead of two
+# copies that drift. Caller must already have confirmed `pane_is_agent` --
+# this only adds what that alone cannot prove:
+#
+#   F8: pane_is_agent proves only that SOME agent process is running there
+#   NOW -- a herdr-recycled pane id can belong to an unrelated WORKER (any
+#   agent process satisfies it). Refuse a pane that is CURRENTLY a
+#   registered worker's own active task pane: a worker is never a
+#   conductor.
+#   R3 (round 2): "not currently a worker" alone still lets a recycled id
+#   hosting some OTHER unregistered session through. When the caller pins
+#   an expected birth, also refuse a live mismatch.
+#
+# Prints a refusal reason to stdout; empty output = the pane is a valid
+# conductor target. Requires lib/run-registry.sh (task_for_pane) already
+# sourced.
+validate_conductor_target_pane() {
+  local pane="$1" expected_birth="${2:-}" occupant_state live_birth
+  occupant_state="$(task_for_pane "$pane" 2>/dev/null | jq -r '.state // empty' 2>/dev/null)"
+  case "$occupant_state" in
+    running|starting|blocked)
+      printf "pane is a registered worker's own active task pane"
+      return 0 ;;
+  esac
+  if [ -n "$expected_birth" ]; then
+    live_birth="$(pane_birth_now "$pane" 2>/dev/null)"
+    [ "$live_birth" = "$expected_birth" ] || \
+      printf 'pane birth %s does not match the expected birth' "${live_birth:-<gone>}"
+  fi
+}
+
 # Refuse to act if a REGISTERED task's pane has been recycled since spawn —
 # the TOCTOU gap the consensus review (docs/control-plane-design.md,
 # correction 5) called the most dangerous unhit failure: "a delayed answer
