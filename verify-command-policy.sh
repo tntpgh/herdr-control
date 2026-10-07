@@ -2733,31 +2733,42 @@ check "r7 D6: trap string EXIT" "trap \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh
 check "r7 D6: PS4 \$() + set -x" "PS4='\$(GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r)'; set -x; true" escalate
 check "r7 D6: arith a[\$()] in variable" "x='a[\$(GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r)]'; (( x ))" escalate
 
-# D6 residual gaps — documented ceiling, not this round's scope: HOME,
-# XDG_CONFIG_HOME, and PATH are ordinary, extremely common identifiers; a
-# name match on them would escalate nearly everything. \`hash -p\` carries
-# no textual hazard at all — closing either needs parsing, which is the
-# thing this round stopped doing.
-check "r7 D6 ceiling: HOME= prefix stays open" "HOME=tmp/h git ls-remote ssh://h/r" allow
-check "r7 D6 ceiling: PATH= prefix stays open" "PATH=tmp/bin:/usr/bin:/bin git ls-remote ssh://h/r" allow
-check "r7 D6 ceiling: hash -p evil git stays open" "hash -p /tmp/x git; git status" allow
+# Round 8 (herdr-control#254 PR comment, round-7 item A ceiling closed):
+# HOME=/XDG_CONFIG_HOME=/PATH= assigned ahead of a git invocation, and
+# `hash -p` remapping the git command word, now escalate (ASSIGNMENT-
+# shaped match for the first three, command-position indirection for
+# `hash -p` — neither is the text-anywhere name gate, so an ordinary
+# read of any of these stays allowed, proven by the allow rows below).
+check "r8 item A: HOME= prefix ahead of git" "HOME=tmp/h git ls-remote ssh://h/r" escalate
+check "r8 item A: export HOME=; git ..." "export HOME=tmp/h; git ls-remote ssh://h/r" escalate
+check "r8 item A: XDG_CONFIG_HOME= prefix ahead of git" "XDG_CONFIG_HOME=tmp/x git log" escalate
+check "r8 item A: PATH= prefix shadowing ssh" "PATH=tmp/bin:/usr/bin:/bin git ls-remote ssh://h/r" escalate
+check "r8 item A: hash -p remaps git" "hash -p /tmp/x git; git status" escalate
 
-# D7 — git verbs/options that run code, the subset carrying a listed config key.
-check "r7 D7: git config core.sshCommand" "git config core.sshCommand /tmp/x" escalate
-check "r7 D7: git config --global core.pager" "git config --global core.pager \"sh -c /tmp/x\"" escalate
-check "r7 D7: git config --local core.fsmonitor" "git config --local core.fsmonitor /tmp/x" escalate
-check "r7 D7: git clone -c core.hooksPath" "git clone -c core.hooksPath=/tmp/h src dst" escalate
-check "r7 D7: git clone --config core.fsmonitor" "git clone --config core.fsmonitor=/tmp/x src dst" escalate
-check "r7 D7: git for-each-repo -c core.sshCommand" "git for-each-repo --config=x.repos -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+# Round 8 item B (round-7 item B ceiling closed): the option/subcommand
+# allowlist (`_cp_git_exec_opts`/`_cp_git_unsafe_tokens`) extended to
+# cover every exec-capable git shape round 7 left open.
+check "r8 item B: git clone --template" "git clone --template=/tmp/tpl src dst" escalate
+check "r8 item B: git init --template" "git init --template=/tmp/tpl dir" escalate
+check "r8 item B: git difftool -x" "git difftool -y -x /tmp/x HEAD~1" escalate
+check "r8 item B: git difftool --extcmd" "git difftool --extcmd=/tmp/x HEAD~1" escalate
+check "r8 item B: git rebase -x" "git rebase -x /tmp/x HEAD~1" escalate
+check "r8 item B: git rebase --exec" "git rebase --exec=/tmp/x HEAD~1" escalate
+check "r8 item B: git submodule foreach" "git submodule foreach /tmp/x" escalate
+check "r8 item B: git bisect run" "git bisect run /tmp/x" escalate
+check "r8 item B: git filter-branch --tree-filter" "git filter-branch --tree-filter /tmp/x HEAD" escalate
+check "r8 item B: git filter-branch --index-filter" "git filter-branch --index-filter /tmp/x HEAD" escalate
+check "r8 item B: git send-email --sendmail-cmd" "git send-email --sendmail-cmd=/tmp/x --to=a@b m.patch" escalate
+check "r8 item B: git send-email --smtp-server=/path" "git send-email --smtp-server=/tmp/x --to=a@b m.patch" escalate
+check "r8 item B: git mergetool always escalates" "git mergetool" escalate
 
-# D7 residual gaps — documented ceiling: these git-native options carry no
-# NAME from this round's list; closing them needs the exec-opts allowlist
-# extended (round 6's structural mechanism), not a name match. Out of scope.
-check "r7 D7 ceiling: git clone --template stays open" "git clone --template=/tmp/tpl src dst" allow
-check "r7 D7 ceiling: git difftool -x stays open" "git difftool -y -x /tmp/x HEAD~1" allow
-check "r7 D7 ceiling: git rebase -x stays open" "git rebase -x /tmp/x HEAD~1" allow
-check "r7 D7 ceiling: git submodule foreach stays open" "git submodule foreach /tmp/x" allow
-check "r7 D7 ceiling: git bisect run stays open" "git bisect run /tmp/x" allow
+# Round 8 negatives: the reads/plain verbs that must stay allowed — the
+# whole point of items A/B being assignment-/option-shaped instead of a
+# bare text-anywhere match.
+check "r8 negative: echo \$HOME is a read, not an assignment" "echo \$HOME" allow
+check "r8 negative: \"\$HOME/Code\" is a read" "ls \"\$HOME/Code\"" allow
+check "r8 negative: plain git rebase main" "git rebase main" allow
+check "r8 negative: plain git submodule update --init" "git submodule update --init" allow
 
 # item 2 — opaque words are a general hole, not git-specific: trunk already
 # ALLOWS brace expansion on a non-git command (\`{curl,-X,POST,url}\`), and
@@ -2801,6 +2812,7 @@ check "r7 acceptance: ls -la allows" "ls -la" allow
 check "r7 acceptance: git status allows" "git status" allow
 check "r7 acceptance: git log --oneline allows" "git log --oneline" allow
 check "r7 acceptance: bash -c ls allows" "bash -c ls" allow
+check "r8 acceptance: ls \$HOME allows" "ls \$HOME" allow
 
 
 echo "-----------------------------------------------------------------"

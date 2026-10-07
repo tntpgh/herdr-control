@@ -2591,7 +2591,13 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
 # in sync with git's real per-subcommand grammar). A future git release
 # adding a new exec-bearing long option whose prefix is not already in
 # `_cp_git_exec_opts` below needs a line added here.
-_cp_git_exec_opts="open-files-in-pager ext-diff textconv output exec upload-pack receive-pack"
+# Round 8 (herdr-control#254 PR comment, round-7 item B ceiling): `template`
+# (clone/init copy hooks out of the template dir), `extcmd` (difftool's
+# long form of `-x`), `sendmail-cmd`/`smtp-server` (send-email pipes mail
+# into either as a program when the value looks like a path — accepted
+# false positive on an ordinary hostname value, same tradeoff as every
+# other entry in this table) join the same abbreviation-prefix allowlist.
+_cp_git_exec_opts="open-files-in-pager ext-diff textconv output exec upload-pack receive-pack template extcmd sendmail-cmd smtp-server"
 
 # Round 3 (herdr-control#254 review): an UNKNOWN subcommand (`git x`) could
 # be a repo-configured alias (`git config alias.x '!sh -c …'`) — git only
@@ -2606,13 +2612,25 @@ _cp_git_exec_opts="open-files-in-pager ext-diff textconv output exec upload-pack
 # same ceiling `_cp_git_exec_opts` above already carries.
 _cp_git_known_verbs=" add am annotate apply archive archimport backfill bisect blame branch bugreport bundle cat-file check-attr check-ignore check-mailmap check-ref-format checkout checkout-index cherry cherry-pick clean clone column commit commit-graph commit-tree config count-objects credential credential-cache credential-store cvsexportcommit cvsimport cvsserver daemon describe diagnose diff diff-files diff-index diff-pairs diff-tree difftool fast-export fast-import fetch fetch-pack filter-branch fmt-merge-msg for-each-ref for-each-repo fsck gc get-tar-commit-id grep hash-object help history hook http-backend http-fetch http-push imap-send index-pack init instaweb interpret-trailers log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-one-file merge-tree mergetool mktag mktree multi-pack-index mv name-rev notes p4 pack-objects pack-redundant pack-refs patch-id prune prune-packed pull push quiltimport range-diff read-tree rebase receive-pack reflog remote repack replace replay repo request-pull rerere reset restore rev-list rev-parse revert rm scalar send-email send-pack sh-i18n sh-setup shell show show-branch show-index show-ref shortlog sparse-checkout stash status stripspace submodule svn switch symbolic-ref tag unpack-file unpack-objects update-index update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack verify-tag version whatchanged worktree write-tree "
 _cp_git_unsafe_tokens() {               # token... (everything after the git word) -> 0 if unsafe
-  local verb="" tok name opt has_u=0 has_remote=0
+  local verb="" tok name opt has_u=0 has_remote=0 has_x=0 sub1=""
   for tok in "$@"; do
     if [ -z "$verb" ]; then
       case "$tok" in
         -*) return 0 ;;
-        *) verb="$tok"; continue ;;
+        *) verb="$tok"
+           # Round 8 (SPEC item B): `git mergetool` always launches an
+           # external merge tool — there is no read-only shape at all, so
+           # no option/argument needs inspecting.
+           [ "$verb" = mergetool ] && return 0
+           continue ;;
       esac
+    fi
+    # Round 8 (SPEC item B): `submodule foreach <command>`/`bisect run
+    # <command>` run an arbitrary command as a POSITIONAL argument (the
+    # sub-verb name itself), not an option — capture the first non-flag
+    # token once so the verb-scoped check after the loop can read it.
+    if [ -z "$sub1" ]; then
+      case "$tok" in -*) : ;; *) sub1="$tok" ;; esac
     fi
     # Round 4 (herdr-control#254 F2): git bundles short options, so
     # `-nO/bin/true`/`-iO…`/`-wO…` are `-n -O …`/`-i -O …`/`-w -O …` — the
@@ -2632,6 +2650,10 @@ _cp_git_unsafe_tokens() {               # token... (everything after the git wor
     # verbs where `-u` is exec-capable.
     case "$tok" in -u*|-[!-]*u*) has_u=1 ;; esac
     case "$tok" in --remote|--remote=*) has_remote=1 ;; esac
+    # Round 8 (SPEC item B): `-x` is the short form of `--exec` for
+    # `rebase` and of `--extcmd` for `difftool` — same bundled/glued
+    # cluster shape as `-u` above (`-x/tmp/x`, `-qx/tmp/x`).
+    case "$tok" in -x*|-[!-]*x*) has_x=1 ;; esac
     case "$tok" in
       -o*) return 0 ;;
       --*)
@@ -2640,6 +2662,15 @@ _cp_git_unsafe_tokens() {               # token... (everything after the git wor
         for opt in $_cp_git_exec_opts; do
           case "$opt" in "$name"*) return 0 ;; esac
         done
+        # Round 8 (SPEC item B): filter-branch's whole `--*-filter` family
+        # (tree/index/env/parent/msg/commit/tag-name/subdirectory) runs
+        # arbitrary shell for every rewritten commit; matched by SUFFIX,
+        # scoped to this one verb, since the family keeps growing and a
+        # prefix-of-one-known-name check (the loop just above) cannot
+        # match a family by its ending.
+        if [ "$verb" = filter-branch ]; then
+          case "$name" in *-filter) return 0 ;; esac
+        fi
         ;;
     esac
   done
@@ -2659,6 +2690,18 @@ _cp_git_unsafe_tokens() {               # token... (everything after the git wor
       archive) [ "$has_remote" = 1 ] && return 0 ;;
     esac
   fi
+  # Round 8 (SPEC item B): `-x` scoped to the two verbs where it is
+  # exec-capable — harmless elsewhere (no other git porcelain command this
+  # table already allows through uses a bare `-x`).
+  if [ "$has_x" = 1 ]; then
+    case "$verb" in
+      rebase|difftool) return 0 ;;
+    esac
+  fi
+  case "$verb" in
+    submodule) [ "$sub1" = foreach ] && return 0 ;;
+    bisect) [ "$sub1" = run ] && return 0 ;;
+  esac
   return 1
 }
 
@@ -2889,22 +2932,47 @@ EOF
 # ceiling (item 4, SPEC): a name match cannot tell "the real variable"
 # from a word that only LOOKS like it without parsing, and parsing is
 # exactly what this round gave up on. `grep GIT_PAGER file`,
-# `echo "price is PAGER-controlled"`, and similar now escalate too —
-# accepted false positives, not bugs. Likewise `HOME=`/`XDG_CONFIG_HOME=`/
-# `PATH=` prefixes and `hash -p evil git` carry no NAME at all (PATH/HOME
-# are ordinary, extremely common identifiers a name-match would make
-# nearly everything escalate on, and `hash -p` has no textual hazard to
-# match at all) — real residual gaps, out of this round's scope, not
-# silently claimed closed here. Likewise a handful of git subcommand
-# options with no associated NAME in this list (`clone --template`,
-# `difftool -x/--extcmd`, `rebase -x`, `submodule foreach`, `bisect run`,
-# `filter-branch --tree-filter`, `send-email --sendmail-cmd`) stay open —
-# round 6's existing `_cp_git_exec_opts`/`_cp_git_unsafe_tokens` allowlist
-# (kept below, defense in depth per SPEC item 3) does not cover them
-# either; closing those needs the option allowlist extended, not a name
-# match, and is out of this round's scope.
+# `echo "price is PAGER-controlled"`, and similar still escalate too —
+# accepted false positives, not bugs.
+#
+# Round 8 (herdr-control#254 PR comment, round-7 item A/B ceiling) closed
+# the two gaps left open above:
+#   * `HOME=`/`XDG_CONFIG_HOME=`/`PATH=` redirect where git finds its
+#     config or the programs it shells out to, but are also ordinary,
+#     extremely common identifiers in everyday reads (`$HOME/...`,
+#     `"$PATH"`) — too common for THIS text-anywhere gate. Closed instead
+#     by `_cp_exec_assign_present` below, an ASSIGNMENT-shaped match
+#     (`NAME=` at a word start) that a read never satisfies. `hash -p`
+#     closed in `_cp_gate_eval_alias_shopt` (command-position indirection,
+#     same family as `eval`/`alias`).
+#   * `clone --template`, `difftool -x/--extcmd`, `rebase -x`, `submodule
+#     foreach`, `bisect run`, `filter-branch --*-filter`, `send-email
+#     --sendmail-cmd/--smtp-server`, and `mergetool` (always) closed by
+#     extending `_cp_git_exec_opts`/`_cp_git_unsafe_tokens` above (the
+#     option allowlist these needed, not a name match).
 _CP_EXEC_VAR_NAME_RE='GIT_SSH_COMMAND|GIT_SSH|GIT_PAGER|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_EXTERNAL_DIFF|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND|GIT_EXEC_PATH|GIT_CONFIG[A-Za-z0-9_]*|GIT_DIR|GIT_WORK_TREE|GIT_TEMPLATE_DIR|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH_ENV|ENV|PROMPT_COMMAND|LD_PRELOAD|DYLD_[A-Za-z0-9_]*'
 _CP_EXEC_CFGKEY_RE='core\.pager|core\.sshcommand|core\.editor|core\.fsmonitor|core\.hookspath|core\.gitproxy|diff\.external|\.textconv|credential\.helper|sequence\.editor|alias\.|include\.path|includeif|uploadpack\.|receivepack\.|filter\.|remote\.[^[:space:]]*\.uploadpack'
+
+# Round 8 (herdr-control#254 PR comment, round-7 item A): `HOME`,
+# `XDG_CONFIG_HOME` and `PATH`, ASSIGNED ahead of a git invocation,
+# redirect where git reads its config (`$HOME/.gitconfig`,
+# `$XDG_CONFIG_HOME/git/config`) or resolves the programs it shells out
+# to (a `$PATH` that shadows `ssh`/`less`/`git` itself with a fake one,
+# live-confirmed `PATH=tmp/bin:... git ls-remote ...`). Matched ONLY as
+# an assignment — `NAME=` glued to a word start, so `MYPATH=`/`THOME=`
+# never match and a plain read (`$HOME/...`, `"$PATH"`, `echo $HOME`)
+# never does either, unlike `_CP_EXEC_VAR_NAME_RE` above, which these
+# three are deliberately NOT on (that gate is word-boundary, not
+# assignment-shaped, and HOME/PATH are too common a word to put there —
+# see this file's own round-7 note). `export`/`declare -x`/`env` prefixes
+# need no special-casing: the character immediately before the NAME is
+# already a space/operator in all three shapes, which the same
+# word-start boundary already requires.
+_CP_EXEC_ASSIGN_NAME_RE='HOME|XDG_CONFIG_HOME|PATH'
+_cp_exec_assign_present() {             # raw -> 0 if HOME=/XDG_CONFIG_HOME=/PATH= is assigned anywhere
+  local LC_ALL=C LANG=C
+  grep -qE "(^|[^A-Za-z0-9_])(${_CP_EXEC_ASSIGN_NAME_RE})=" <<<"$1"
+}
 
 # `_cp_unquoted_text <raw>` -> prints RAW with every quoted span (single,
 # double, and the ANSI-C/`$"…"` dollar-quoted forms) dropped entirely —
@@ -4398,6 +4466,16 @@ _cp_gate_eval_alias_shopt() {           # protected segment -> 0 if eval/alias/e
   _cp_locate_command_word "$1" || return 1
   case "$_cp_wcmd" in
     eval|alias) return 0 ;;
+    # Round 8 (herdr-control#254 PR comment, round-7 item A): `hash -p
+    # pathname name` hashes a command NAME to an arbitrary pathname
+    # independent of $PATH — every later `git` (or whatever NAME is)
+    # resolves to that pathname instead, with no textual hazard a NAME
+    # match could ever see. Same family as `eval`/`alias`: the real
+    # command is hidden from every other rule, checked here at command
+    # position so `printf '%s\n' "hash -p"` in DATA still doesn't match.
+    hash)
+      case " ${_CP_LOC[*]:1} " in *' -p '*) return 0 ;; esac
+      ;;
     shopt)
       case " ${_CP_LOC[*]:1} " in
         *' -s '*|*' --set '*)
@@ -4578,6 +4656,15 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   # header, just above `_cp_git_exec_opt_invoked`, for the full rationale.
   _cp_exec_name_or_opaque_present "$raw" &&
     _cp_consider 1 "command text carries an exec-capable variable NAME, git config KEY, unquoted brace-expansion word, or \$'…' ANSI-C word — it can run arbitrary code wherever it sits, quoted or not"
+
+  # escalate — round 8 (herdr-control#254 PR comment, round-7 item A
+  # ceiling): HOME=/XDG_CONFIG_HOME=/PATH= assigned anywhere ahead of a
+  # git invocation redirects where git finds its config or the programs
+  # it shells out to. See `_cp_exec_assign_present`'s own header, just
+  # above `_cp_unquoted_text`, for why this is assignment-shaped and not
+  # folded into the text-anywhere gate just above.
+  _cp_exec_assign_present "$raw" &&
+    _cp_consider 1 "command text assigns HOME/XDG_CONFIG_HOME/PATH ahead of a command — it can redirect where git finds its config or the programs it shells out to"
 
   # deny — mkfs formats a block device with no confirmation of its own;
   # nothing downstream of "yes, run this" makes that reversible, so it is
