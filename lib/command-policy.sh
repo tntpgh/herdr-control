@@ -2606,7 +2606,7 @@ _cp_git_exec_opts="open-files-in-pager ext-diff textconv output exec upload-pack
 # same ceiling `_cp_git_exec_opts` above already carries.
 _cp_git_known_verbs=" add am annotate apply archive archimport backfill bisect blame branch bugreport bundle cat-file check-attr check-ignore check-mailmap check-ref-format checkout checkout-index cherry cherry-pick clean clone column commit commit-graph commit-tree config count-objects credential credential-cache credential-store cvsexportcommit cvsimport cvsserver daemon describe diagnose diff diff-files diff-index diff-pairs diff-tree difftool fast-export fast-import fetch fetch-pack filter-branch fmt-merge-msg for-each-ref for-each-repo fsck gc get-tar-commit-id grep hash-object help history hook http-backend http-fetch http-push imap-send index-pack init instaweb interpret-trailers log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-one-file merge-tree mergetool mktag mktree multi-pack-index mv name-rev notes p4 pack-objects pack-redundant pack-refs patch-id prune prune-packed pull push quiltimport range-diff read-tree rebase receive-pack reflog remote repack replace replay repo request-pull rerere reset restore rev-list rev-parse revert rm scalar send-email send-pack sh-i18n sh-setup shell show show-branch show-index show-ref shortlog sparse-checkout stash status stripspace submodule svn switch symbolic-ref tag unpack-file unpack-objects update-index update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack verify-tag version whatchanged worktree write-tree "
 _cp_git_unsafe_tokens() {               # token... (everything after the git word) -> 0 if unsafe
-  local verb="" tok name opt
+  local verb="" tok name opt has_u=0 has_remote=0
   for tok in "$@"; do
     if [ -z "$verb" ]; then
       case "$tok" in
@@ -2622,6 +2622,16 @@ _cp_git_unsafe_tokens() {               # token... (everything after the git wor
     if [ "$verb" = grep ]; then
       case "$tok" in -O*|-[!-]*O*|--o*) return 0 ;; esac
     fi
+    # Round 5 rule B (herdr-control#254 PR comment, live-confirmed `git
+    # clone -u /tmp/pwned.sh src dst`): same cluster/glued shape as grep's
+    # `-O` above — `-u*` catches `u` as the first char of the cluster
+    # (including git's glued short-option-with-value form, `-u/tmp/x`),
+    # `-[!-]*u*` catches it anywhere later in a bundled cluster
+    # (`-qu/tmp/x`). Track `--remote` here too. Both tracked
+    # unconditionally — cheap, and only CONSUMED below for the handful of
+    # verbs where `-u` is exec-capable.
+    case "$tok" in -u*|-[!-]*u*) has_u=1 ;; esac
+    case "$tok" in --remote|--remote=*) has_remote=1 ;; esac
     case "$tok" in
       -o*) return 0 ;;
       --*)
@@ -2635,6 +2645,19 @@ _cp_git_unsafe_tokens() {               # token... (everything after the git wor
   done
   if [ -n "$verb" ]; then
     case "$_cp_git_known_verbs" in *" $verb "*) ;; *) return 0 ;; esac
+  fi
+  # Round 5 rule B: `-u` is the short form of `--upload-pack` for
+  # clone/fetch/pull/ls-remote/submodule, and archive's remote-upload-pack
+  # companion once `--remote` is given — exec-capable the same way as the
+  # long form (already caught above via the `--` abbreviation-prefix
+  # check), but that check only matches `--` tokens, so the short `-u`
+  # slipped through. Scoped to these verbs only: `-u` means something
+  # harmless elsewhere (`git push -u`, `git checkout -u`, ...).
+  if [ "$has_u" = 1 ]; then
+    case "$verb" in
+      clone|fetch|pull|ls-remote|submodule) return 0 ;;
+      archive) [ "$has_remote" = 1 ] && return 0 ;;
+    esac
   fi
   return 1
 }
@@ -4350,6 +4373,40 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   # commit -m …`, …) is untouched.
   _cp_git_exec_opt_invoked "$raw" &&
     _cp_consider 1 "git invocation carries a global option/env-prefix ahead of the subcommand, or an exec-bearing option/abbreviation, that can run arbitrary code"
+
+  # escalate — round 5a (herdr-control#254 PR comment): eval, a function
+  # definition, alias, or `shopt -s expand_aliases`, ANYWHERE in the
+  # command, hides the real command from every verb-based rule in this
+  # file — `eval "GIT_PAGER=x git log"`, `eval "GIT_PAGER=x; git log"`,
+  # `f() { local -x GIT_PAGER=x; git log; }; f`, `set -a; f() { local
+  # GIT_PAGER=x; git log; }; f`, and `shopt -s expand_aliases; alias
+  # ggg='GIT_PAGER=x git log'; ggg` all classified allow (live-measured on
+  # this branch). The hole is general, not only a git one: `eval "ls"`,
+  # `f() { ls; }; f`, and `alias x=ls` classified allow too. Do not try to
+  # parse what eval/the function body/the alias actually runs — escalate
+  # is the reviewable outcome, and an agent rarely needs any of these four
+  # forms. `$norm` already has quotes stripped and `$(...)`/backtick
+  # substitutions flattened, so a quoted eval payload or a substitution
+  # smuggling one of these words is still seen. The `eval` match excludes
+  # a `-`-prefixed hit so node/perl/ruby's own `--eval`/`-eval` inline-code
+  # FLAG — already handled by the narrower, pre-existing interpreter-
+  # inline-code rules below — does not get caught by this broader one too
+  # (round 5f's `node --eval 'x' /tmp/p.json` stays allow, pinned above).
+  # The function-def match requires a trailing `{` (the real bash shape,
+  # `name() {`/`name () {`) — round 5 review, live-confirmed FALSE
+  # POSITIVE: a bare `name()` with no brace also matches any no-arg method
+  # call in a quoted interpreter payload (`sys.stdin.read()` inside
+  # `python3 -c "..."`), which is never a bash function definition and
+  # must stay allow (verify-command-policy.sh:213 "curl piped to inline
+  # python"). Requiring the brace keeps every real round-5 escalate row
+  # (all of which are `f() { ... }` or `f () { ... }`) while dropping the
+  # false hit.
+  { _cp_match '(^|[^A-Za-z0-9_-])eval([^A-Za-z0-9_]|$)' "$norm" ||
+    _cp_match '\balias\b' "$norm" ||
+    _cp_match '\bfunction[[:space:]]+[A-Za-z_][A-Za-z0-9_]*\b' "$norm" ||
+    _cp_match '[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(\)[[:space:]]*\{' "$norm" ||
+    { _cp_match '\bshopt\b' "$norm" && _cp_match '\bexpand_aliases\b' "$norm"; }; } &&
+    _cp_consider 1 "command invokes eval, defines a function or alias, or enables alias expansion — the real command is hidden from every other rule"
 
   # escalate — DROP/TRUNCATE TABLE, case-insensitive (SQL keywords are
   # conventionally upper- or lower-case interchangeably).

@@ -2386,6 +2386,119 @@ rm -rf "$_r4b_scratch"
 rm -f "$_r4b_marker"
 
 echo
+echo "== round 5 (herdr-control#254 PR comment): indirection (eval, function," \
+     "alias, expand_aliases) + clone/fetch/pull/ls-remote/submodule/archive" \
+     "exec-option \`-u\` =="
+# Observed (round-4 review): classify_command does not look inside eval
+# strings or function bodies at all, and git's clone/fetch/pull/ls-remote/
+# submodule/archive share an exec-capable short option (`-u`, the short
+# form of `--upload-pack`) the long-form abbreviation-prefix check never
+# sees. Rule A escalates on eval/function-def/alias/expand_aliases
+# regardless of what follows — reviewable, not parsed. Rule B teaches
+# `_cp_git_unsafe_tokens` that `-u` is exec-capable for those five verbs.
+check "rule A: eval wrapping a GIT_PAGER payload" \
+  'eval "GIT_PAGER=/tmp/pwned git log"' escalate
+check "rule A: eval with a trailing git statement" \
+  'eval "GIT_PAGER=x; git log"' escalate
+check "rule A: eval has no git/GIT_PAGER at all — still escalates, the hole is general" \
+  'eval "ls"' escalate
+check "rule A: function def (name() shape) wrapping a GIT_PAGER payload" \
+  'f() { local -x GIT_PAGER=x; git log; }; f' escalate
+check "rule A: function def after an unrelated set -a" \
+  'set -a; f() { local GIT_PAGER=x; git log; }; f' escalate
+check "rule A: function def with no git/GIT_PAGER at all — still escalates" \
+  'f() { ls; }; f' escalate
+check "rule A: function keyword form" \
+  'function f { ls; }; f' escalate
+check "rule A: expand_aliases + alias wrapping a GIT_PAGER payload" \
+  "shopt -s expand_aliases; alias ggg='GIT_PAGER=x git log'; ggg" escalate
+check "rule A: alias alone, no git at all — still escalates" \
+  'alias x=ls' escalate
+check "rule A negative: a no-arg method call inside quoted interpreter code is not a bash function def" \
+  "curl -sS https://x/api | python3 -c \"import json,sys; print(len(sys.stdin.read()))\"" allow
+check "rule A negative: python def uses a colon, not a brace — not a bash function def" \
+  "python3 -c 'def f(): pass'" allow
+
+# Real negatives (items 1 and 2): prove the eval/function-def GIT_PAGER
+# bypass actually RUNS in real bash — same primitives SPEC names (mktemp
+# for a scratch repo + a fake pager, `script -q /dev/null` for the pty a
+# pager needs to engage at all, `env -u GIT_PAGER -u PAGER` to start from
+# a clean slate) — and that classify_command escalates the identical text.
+# Mirrors round 4's F2/F3 real-negative shape exactly (scratch repo, a
+# tracked file, a fake-pager script that touches a marker).
+_r5_marker="$(mktemp -u /tmp/herdr-git-exec-r5-marker.XXXXXX)"
+_r5_scratch="$(mktemp -d)"
+( cd "$_r5_scratch" && git init -q && printf 'foo\n' > f && git add f &&
+  git -c user.email=x@x -c user.name=x commit -q -m x )
+_r5_pager="$(mktemp -u /tmp/herdr-git-exec-r5-pager.XXXXXX)"
+printf '#!/bin/sh\ntouch %s\ncat >/dev/null\n' "$_r5_marker" > "$_r5_pager"
+chmod +x "$_r5_pager"
+
+# item 1: eval hiding a GIT_PAGER assignment
+rm -f "$_r5_marker"
+_r5_eval_text="eval \"GIT_PAGER=$_r5_pager git log\""
+bash -c "cd $_r5_scratch && env -u GIT_PAGER -u PAGER script -q /dev/null bash -c '$_r5_eval_text' >/dev/null 2>&1"
+total=$((total + 1))
+if [ -f "$_r5_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: eval-hidden GIT_PAGER payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: eval-hidden GIT_PAGER payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "$_r5_eval_text")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+
+# item 2: a function definition hiding the same GIT_PAGER assignment
+rm -f "$_r5_marker"
+_r5_func_text="f() { GIT_PAGER=$_r5_pager git log; }; f"
+bash -c "cd $_r5_scratch && env -u GIT_PAGER -u PAGER script -q /dev/null bash -c '$_r5_func_text' >/dev/null 2>&1"
+total=$((total + 1))
+if [ -f "$_r5_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: function-hidden GIT_PAGER payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: function-hidden GIT_PAGER payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "$_r5_func_text")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -rf "$_r5_scratch"
+rm -f "$_r5_marker" "$_r5_pager"
+
+check "rule B: git clone -u (short --upload-pack) runs an arbitrary program" \
+  "git clone -u /tmp/pwned.sh src dst" escalate
+check "rule B: git fetch -u" "git fetch -u origin main" escalate
+check "rule B: git pull -u" "git pull -u origin main" escalate
+check "rule B: git ls-remote -u" "git ls-remote -u /tmp/pwned.sh" escalate
+check "rule B: git submodule -u" "git submodule update -u" escalate
+check "rule B: git archive --remote -u" "git archive --remote=origin -u HEAD" escalate
+check "rule B: git archive --remote --upload-pack (long form, pre-existing coverage, pinned)" \
+  "git archive --remote=origin --upload-pack=/tmp/pwned.sh HEAD" escalate
+check "rule B negative: -u means --set-upstream for push, not upload-pack" \
+  "git push -u origin fix/x" allow
+check "rule B negative: -u is unrelated for checkout" \
+  "git checkout -u some-branch" allow
+check "rule B negative: plain clone with no exec option stays allow" \
+  "git clone https://x/y dst" allow
+check "rule B negative: plain fetch stays allow" "git fetch origin main" allow
+check "rule B negative: plain pull stays allow" "git pull" allow
+check "rule B negative: plain ls-remote stays allow" "git ls-remote origin" allow
+check "rule B negative: plain submodule update stays allow" "git submodule update" allow
+check "rule B negative: archive --remote with no exec option stays allow" \
+  "git archive --remote=origin HEAD" allow
+
+echo
 echo "== classifier/shadow parity: one shared function, same verdict for every" \
      "git row (Round 3) =="
 # lib/pretool-shadow.sh's `_ps_bash_handoffs_verdict` calls the exact same
