@@ -145,15 +145,26 @@ _main_row() {
                     "$(printf '%s' "$j" | jq -r '.pane_birth // empty')"
 }
 
-# Is a given (pane, birth) pair LIVE right now? F5: fails closed (1, "treat
-# as not live") on a herdr read failure — a transient herdr hiccup must
-# never read as "Main is gone."
-_is_live() {       # pane birth -> 0 live, 1 not live or indeterminate
-  local pane="$1" birth="$2" live
+# Is a given (pane, birth) pair LIVE right now?
+#   rc 0 -- confirmed live.
+#   rc 1 -- confirmed NOT live (herdr answered; the pane is gone or recycled).
+#   rc 2 -- INDETERMINATE: the herdr read itself failed. R2-F12 (security
+#           review PR #252 round 2): the old two-state version folded this
+#           into "not live," which let a transient herdr hiccup during
+#           cmd_self/cmd_clear's liveness check be read as "Main is gone,"
+#           silently permitting a different pane to take over or clear a
+#           STILL-LIVE Main. Every call site below must refuse outright on
+#           rc 2 -- never treat "couldn't tell" as either live or dead.
+_is_live() {       # pane birth -> 0 live / 1 confirmed gone / 2 indeterminate
+  local pane="$1" birth="$2" live rc
   [ -n "$pane" ] || return 1
-  live="$(pane_birth_now "$pane")" || return 1
+  live="$(pane_birth_now "$pane")"; rc=$?
+  [ "$rc" = 0 ] || return 2
   [ -n "$live" ] || return 1
-  [ -z "$birth" ] || [ "$live" = "$birth" ]
+  if [ -z "$birth" ] || [ "$live" = "$birth" ]; then
+    return 0
+  fi
+  return 1
 }
 
 # Refuses a pane that is a worker — pane_is_conductor_eligible
@@ -190,7 +201,10 @@ cmd_clear() {
     echo "(no Main designated; nothing to clear)"
     return 0
   fi
-  if _is_live "$pane" "$birth" && [ "$caller" != "$pane" ]; then
+  local live_rc=0
+  _is_live "$pane" "$birth" || live_rc=$?
+  [ "$live_rc" != 2 ] || die 3 "could not verify whether Main ($pane) is live (herdr read failed); refusing rather than guessing"
+  if [ "$live_rc" = 0 ] && [ "$caller" != "$pane" ]; then
     record_refused "$pane" "$caller" "a live Main ($pane) exists and the caller isn't it"
     die 4 "refusing to clear: Main is $pane (birth $birth); only it may clear itself"
   fi
@@ -206,7 +220,10 @@ cmd_handoff() {          # target_pane
   local target="$1" caller pane birth
   caller="$(_caller_pane)" || die 3 "could not verify caller identity from process ancestry (herdr unreachable, or this process traces to no live pane)"
   read -r pane birth <<<"$(_main_row)" || die 1 "could not read the registry"
-  _is_live "$pane" "$birth" || die 4 "refusing: no live Main to hand off from"
+  local live_rc=0
+  _is_live "$pane" "$birth" || live_rc=$?
+  [ "$live_rc" != 2 ] || die 3 "could not verify whether $pane is live (herdr read failed); refusing rather than guessing"
+  [ "$live_rc" = 0 ] || die 4 "refusing: no live Main to hand off from"
   if [ "$caller" != "$pane" ]; then
     record_refused "$pane" "$caller" "only the current live Main ($pane) may --handoff-to"
     die 4 "refusing: only the current live Main ($pane) may hand off"
@@ -257,7 +274,10 @@ cmd_self() {
   fi
   local pane birth
   read -r pane birth <<<"$(_main_row)" || die 1 "could not read the registry"
-  if _is_live "$pane" "$birth" && [ "$pane" != "$caller" ]; then
+  local live_rc=0
+  _is_live "$pane" "$birth" || live_rc=$?
+  [ "$live_rc" != 2 ] || die 3 "could not verify whether Main ($pane) is live (herdr read failed); refusing rather than guessing"
+  if [ "$live_rc" = 0 ] && [ "$pane" != "$caller" ]; then
     record_refused "$pane" "$caller" "a live Main ($pane) already exists and the caller isn't it"
     die 4 "refusing: Main is already $pane (birth $birth); use --handoff-to from that pane, or --force"
   fi

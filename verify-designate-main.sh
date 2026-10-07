@@ -33,6 +33,12 @@ bad()  { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
 
 export HERDR_RUN_STATE_DIR="$(mktemp -d)/runs"
+# A plain shell variable can't count "pane list" calls across invocations:
+# `herdr` runs inside the subshell each `$(herdr ...)` call substitution
+# forks, so an in-memory increment is discarded the instant that subshell
+# exits -- every call would see the count reset to 0. A file survives the
+# fork.
+export LIST_CALL_FILE="$(mktemp)"
 
 # ---- the fake herdr: panes are plain labels (no ':' — stays a valid var
 # name), looked up via env indirection. PID_<pane> is the pid herdr reports
@@ -56,7 +62,10 @@ reset_pids
 herdr() {
   case "$1 $2" in
     "pane list")
+      n=$(( $(cat "$LIST_CALL_FILE" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$n" > "$LIST_CALL_FILE"
       [ -z "${FAIL_LIST:-}" ] || return 1
+      [ -z "${FAIL_LIST_FROM:-}" ] || [ "$n" -lt "$FAIL_LIST_FROM" ] || return 1
       local first=1 p b
       printf '{"result":{"panes":['
       for p in M1 M2 SH W1 H1 F1 R1 A B; do
@@ -281,12 +290,25 @@ check "config.sh still resolves Main to M1" "$(cfg)" "M1|gen_m1"
 q "DELETE FROM owners WHERE label='main';" >/dev/null 2>&1
 q "DELETE FROM roles WHERE label='main';" >/dev/null 2>&1
 
-printf '== F5: a failed herdr pane-list read during the liveness check must NOT read as "Main is gone" ==\n'
+printf '== R2-F12: an indeterminate liveness read (herdr failed) must refuse, never be treated as live OR dead ==\n'
+# FAIL_LIST_FROM=2 lets the FIRST "pane list" call succeed (ancestry
+# resolution, which cmd_self/cmd_clear need to even identify the caller)
+# and fails every call from the SECOND onward -- exactly the one
+# _is_live/pane_birth_now makes. A global FAIL_LIST=1 (the old version of
+# this test) also breaks ancestry resolution itself, so it proved the WRONG
+# code path refused (caller identity, not liveness) and would have passed
+# even with R2-F12's bug still present.
 caller_is M1; dm >/dev/null 2>&1
 caller_is M2
-FAIL_LIST=1 dm >/dev/null 2>&1; rc=$?
-check "exit 3 (or a fail-closed refusal, never 0): a herdr read failure never lets a different pane take over a live Main" "$rc" "3"
+: > "$LIST_CALL_FILE"
+FAIL_LIST_FROM=2 dm >/dev/null 2>&1; rc=$?
+check "cmd_self exit 3 (never 0): an indeterminate liveness read never lets a different pane take over" "$rc" "3"
 check "Main is still M1 — the failed read did not let M2 in" "$(role_row)" "M1 gen_m1"
+caller_is M1
+: > "$LIST_CALL_FILE"
+FAIL_LIST_FROM=2 dm --clear >/dev/null 2>&1; rc=$?
+check "cmd_clear exit 3 (never 0): an indeterminate liveness read never lets even the recorded pane itself clear it" "$rc" "3"
+check "Main is still M1 — the failed read did not let the clear through" "$(role_row)" "M1 gen_m1"
 q "DELETE FROM roles WHERE label='main';" >/dev/null
 
 printf '== F5: an unreadable registry during the worker-eligibility check must refuse, not silently pass ==\n'
