@@ -2663,7 +2663,7 @@ _cp_git_dashed_verb() {                 # wcmd
 _cp_git_seg_exec_unsafe() {             # protected-segment
   local seg="$1" tok
   _cp_locate_command_word "$seg" || return 1
-  for tok in "${_CP_LOC_SKIPPED[@]}"; do
+  for tok in ${_CP_LOC_SKIPPED[@]+"${_CP_LOC_SKIPPED[@]}"}; do
     case "$tok" in GIT_*=*|PAGER=*|EDITOR=*|VISUAL=*) return 0 ;; esac
   done
   case "$_cp_wcmd" in
