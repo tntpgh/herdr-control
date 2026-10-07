@@ -2261,7 +2261,7 @@ _r3_marker="$(mktemp -u /tmp/herdr-git-exec-r3-marker.XXXXXX)"
 _r3_scratch="$(mktemp -d)"
 ( cd "$_r3_scratch" && git init -q && git -c user.email=x@x -c user.name=x commit -q --allow-empty -m x )
 rm -f "$_r3_marker"
-_r3_cmd="(cd $_r3_scratch && GIT_PAGER=\"touch $_r3_marker\" git log >/dev/null 2>&1)"
+_r3_cmd="(cd $_r3_scratch && GIT_PAGER=\"touch $_r3_marker\" script -q /dev/null git log >/dev/null 2>&1)"
 bash -c "$_r3_cmd"
 total=$((total + 1))
 if [ -f "$_r3_marker" ]; then
