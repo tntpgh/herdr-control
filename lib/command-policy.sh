@@ -20,7 +20,11 @@
 #                                        "UNPARSED\t<reason>" line per write
 #                                        target a bash command names
 #                                        (redirect/tee/cp/mv/install/ln/
-#                                        dd of=/sed|perl -i/touch/truncate);
+#                                        dd of=/sed|perl -i/touch/truncate),
+#                                        plus (round 10, ln only)
+#                                        "LNSRC\t<abs path>" per SOURCE
+#                                        argument — read-side, not itself
+#                                        a write target;
 #                                        caller MUST treat COMPUTED and
 #                                        UNPARSED as "outside scope" — #184,
 #                                        shared with
@@ -1889,8 +1893,17 @@ EOF
 # but redirections/assignments/launchers (e.g. `> /dev/null` alone, or the
 # tail end of a segment the splitter cut mid-redirection).
 _CP_LOC=()
+_CP_LOC_SKIPPED=()
 _cp_locate_command_word() {             # segment
   _CP_LOC=()
+  _CP_LOC_SKIPPED=()
+  # `_CP_LOC_SKIPPED` collects every `NAME=val`-shaped token shifted away
+  # below (both the top-level assignment case and the ones a launcher's own
+  # value-parsing loop skips) — not read by most callers, but it is the ONE
+  # place that walk happens, so a caller that needs to know whether a
+  # specific env var was assigned ANYWHERE ahead of the resolved command
+  # word (`_cp_git_seg_exec_unsafe` below, for `GIT_*=`/`PAGER=`/`EDITOR=`/
+  # `VISUAL=` through any launcher chain) reads it instead of re-walking.
   case "$-" in *f*) _cp_wglob=off ;; *) _cp_wglob=on ;; esac
   set -f
   # shellcheck disable=SC2086
@@ -1918,7 +1931,7 @@ _cp_locate_command_word() {             # segment
         esac
         ;;
       [A-Za-z_]*=*)
-        shift; _cp_wate=1 ;;
+        _CP_LOC_SKIPPED+=("$1"); shift; _cp_wate=1 ;;
     esac
 
     if [ "$_cp_wate" = 0 ]; then
@@ -1973,7 +1986,7 @@ _cp_locate_command_word() {             # segment
                   case "$1" in *[!0-9]*) break ;; esac
                 fi
                 shift ;;
-              [A-Za-z_]*=*) shift ;;
+              [A-Za-z_]*=*) _CP_LOC_SKIPPED+=("$1"); shift ;;
               *) break ;;
             esac
           done
@@ -2534,6 +2547,584 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
     ambiguous) _cp_match '\bpush\b' "$pre" ;;
     *) return 1 ;;
   esac
+}
+
+# `_cp_git_unsafe_tokens <token...>` -> 0 (true) when the git invocation
+# whose git WORD these tokens follow fails the narrow allowlisted shape a
+# git command may auto-allow in. Takes everything AFTER the literal `git`
+# word — the would-be subcommand plus every option that follows it — the
+# SAME tokens lib/pretool-shadow.sh already extracts into `_CP_LOC[@]:1`,
+# so both files call this one function instead of keeping two glob lists
+# that can drift. Round 2 finding: the old `git:-[!-]*[oCc]*` glob (and
+# this file's old denylist of `-O*`/`--open-files-in-pager*`/`-c`/
+# `--config-env*`) caught a lowercase o/C/c inside a short-option cluster
+# but missed `-C`, `--git-dir`, `--work-tree`, `GIT_DIR=`/`GIT_WORK_TREE=`
+# env prefixes, the attached-short-option form `-ccore.pager=...`, and
+# grep's `--open-files-in-pag=...` abbreviation — every one of those
+# classified `allow` and ran.
+#
+# ALLOWLIST, not denylist: a git invocation is safe to auto-allow ONLY if
+# ALL of —
+#   1. the very first token here IS the subcommand itself — no `-c`, `-C`,
+#      `--git-dir`, `--work-tree`, `--exec-path`, `--namespace`,
+#      `--super-prefix`, `--config-env`, `-p`/`--paginate`, or any other
+#      token starting with `-`, ahead of it (attached short form included:
+#      `-ccore.pager=x`). ANY token before the subcommand changes what
+#      repo/config git reads from or runs, so it disqualifies the whole
+#      invocation — this is checked here; the caller checks the matching
+#      `GIT_*`/`PAGER`/`EDITOR`/`VISUAL` env-assignment-ahead-of-`git` case,
+#      since that token never reaches this function at all.
+#   2. for `git grep`: no option token starting with `-O` or `--o` — every
+#      spelling and abbreviation of `--open-files-in-pager` starts one of
+#      those two ways.
+#   3. no option token starting with `-o` (lowercase, any verb) — the
+#      short form of `--output` (`git diff -o<path>`/`git show -o<path>`/
+#      `git log -o<path>`): it writes the command's output to an
+#      arbitrary path, same as the long form, and the old glob-based
+#      denylist caught it only by accident (a lowercase `o` anywhere in a
+#      short-option cluster) — losing it when that glob was deleted was a
+#      real regression (live review finding), not a style change.
+#   4. for every verb: no `--` option token that is an abbreviation-prefix
+#      of a known exec-bearing long option. git accepts ANY unambiguous
+#      prefix of a long option (`--open-f` means `--open-files-in-pager`),
+#      so the check is "is this token's name a prefix of the exec-bearing
+#      spelling", not an exact-match denylist.
+# ceiling: #4 is a denylist of known exec-bearing long options layered on
+# an allowlist SHAPE (no leading option, no env prefix) — not a full
+# per-verb allowlist of every known-safe long option (infeasible to keep
+# in sync with git's real per-subcommand grammar). A future git release
+# adding a new exec-bearing long option whose prefix is not already in
+# `_cp_git_exec_opts` below needs a line added here.
+# Round 8 (herdr-control#254 PR comment, round-7 item B ceiling): `template`
+# (clone/init copy hooks out of the template dir), `extcmd` (difftool's
+# long form of `-x`), `sendmail-cmd`/`smtp-server` (send-email pipes mail
+# into either as a program when the value looks like a path — accepted
+# false positive on an ordinary hostname value, same tradeoff as every
+# other entry in this table) join the same abbreviation-prefix allowlist.
+_cp_git_exec_opts="open-files-in-pager ext-diff textconv output exec upload-pack receive-pack template extcmd sendmail-cmd smtp-server"
+
+# Round 3 (herdr-control#254 review): an UNKNOWN subcommand (`git x`) could
+# be a repo-configured alias (`git config alias.x '!sh -c …'`) — git only
+# consults the alias table when the name does not match a real subcommand,
+# so any token here that IS a real one can never be an alias, and anything
+# that is NOT one must be treated as arbitrary code. This is every porcelain
+# and plumbing subcommand `git help -a` lists (git 2.54), minus the
+# documentation-only topic pages (attributes/hooks/ignore/mailmap/modules/
+# repository-layout/revisions/format-*/protocol-*/cli) and GUI launchers
+# that cannot run as a repo alias target anyway. ceiling: a future git
+# release adding a subcommand not in this list needs a line added here —
+# same ceiling `_cp_git_exec_opts` above already carries.
+_cp_git_known_verbs=" add am annotate apply archive archimport backfill bisect blame branch bugreport bundle cat-file check-attr check-ignore check-mailmap check-ref-format checkout checkout-index cherry cherry-pick clean clone column commit commit-graph commit-tree config count-objects credential credential-cache credential-store cvsexportcommit cvsimport cvsserver daemon describe diagnose diff diff-files diff-index diff-pairs diff-tree difftool fast-export fast-import fetch fetch-pack filter-branch fmt-merge-msg for-each-ref for-each-repo fsck gc get-tar-commit-id grep hash-object help history hook http-backend http-fetch http-push imap-send index-pack init instaweb interpret-trailers log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-one-file merge-tree mergetool mktag mktree multi-pack-index mv name-rev notes p4 pack-objects pack-redundant pack-refs patch-id prune prune-packed pull push quiltimport range-diff read-tree rebase receive-pack reflog remote repack replace replay repo request-pull rerere reset restore rev-list rev-parse revert rm scalar send-email send-pack sh-i18n sh-setup shell show show-branch show-index show-ref shortlog sparse-checkout stash status stripspace submodule svn switch symbolic-ref tag unpack-file unpack-objects update-index update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack verify-tag version whatchanged worktree write-tree "
+
+# `_cp_git_config_unsafe <tok...>` (everything after the `config` word)
+# -> 0 (true) when this is NOT a pure read, 1 when it is. Round 9 (SPEC
+# item B.1, herdr-control#254 round-8 review): the old behaviour let
+# `config` fall through the verb loop below untouched — any `git config`
+# invocation stayed allow, because nothing on the exec-opt/abbreviation
+# table means anything to a config KEY/VALUE pair. The fix is not another
+# dangerous-key enumeration (`_CP_EXEC_CFGKEY_RE`, round 4, already lists
+# the ones that run a program through git itself) — SPEC: "whatever the
+# key" — a key this file has never heard of (a future `core.something`,
+# a custom `alias.*`) is just as capable of being read back by a LATER
+# command in the same chain. So this is a SHAPE check instead: the only
+# arguments that cannot change anything are the documented pure-read
+# flags (`--get`, `--get-all`, `--get-regexp`, `--list`/`-l`,
+# `--show-origin`, `--show-scope`) plus at most ONE positional (a bare
+# key, `git config user.email`). Any other flag (`--add`, `--unset`,
+# `--replace-all`, `--edit`/`-e`, `--remove-section`, `--rename-section`,
+# ...) or a second positional (the key WITH a value, `git config KEY
+# VALUE`) is a write — fails closed to unsafe rather than naming every
+# write flag git has ever added.
+_cp_git_config_unsafe() {               # tok... -> 0 if this is a write (not a pure read)
+  local tok n_pos=0
+  for tok in "$@"; do
+    case "$tok" in
+      --get|--get-all|--get-regexp|--list|-l|--show-origin|--show-scope) ;;
+      -*) return 0 ;;
+      *) n_pos=$((n_pos + 1)) ;;
+    esac
+  done
+  [ "$n_pos" -le 1 ] && return 1
+  return 0
+}
+
+# ceiling (SPEC item C, round 9): `git commit -S`/`-s`/`--gpg-sign` and
+# `git tag -s`/`-u <key>` run `gpg.program` (or `gpg.ssh.program` for SSH
+# signing) to produce the signature — the same launcher B.1/B.2 above now
+# block an agent command from SETTING. Left allowed here on purpose: with
+# writing git config closed (B above), signing can only run a gpg.program
+# an agent command did NOT set in this session. Upgrade path, if that
+# stops being true (a repo's checked-in/pre-existing config already
+# points `gpg.program` somewhere untrusted, so signing runs it on first
+# use): escalate `-S`/`-s`/`-u`/`--gpg-sign`/`--sign` on `commit`/`tag`/
+# `merge` whenever the repo's OWN config (not this command) is untrusted —
+# this file has no way to read that config today, so the check cannot be
+# added without first giving it one.
+
+_cp_git_unsafe_tokens() {               # token... (everything after the git word) -> 0 if unsafe
+  local verb="" tok name opt has_u=0 has_remote=0 has_x=0 sub1=""
+  for tok in "$@"; do
+    if [ -z "$verb" ]; then
+      case "$tok" in
+        -*) return 0 ;;
+        *) verb="$tok"
+           # Round 8 (SPEC item B): `git mergetool` always launches an
+           # external merge tool — there is no read-only shape at all, so
+           # no option/argument needs inspecting.
+           [ "$verb" = mergetool ] && return 0
+           # Round 9 (SPEC item B.1): `git config` has its own read/write
+           # shape, unrelated to the exec-opt/abbreviation allowlist below
+           # (a config VALUE is freeform text, not an option this table
+           # knows about). Handle it here, once, and skip the rest of this
+           # loop for its own arguments: `_cp_git_config_unsafe` decides
+           # safe/unsafe by itself; whatever it returns IS the verdict for
+           # this whole statement.
+           if [ "$verb" = config ]; then
+             _cp_git_config_unsafe "${@:2}" && return 0
+             return 1
+           fi
+           continue ;;
+      esac
+    fi
+    # Round 8 (SPEC item B): `submodule foreach <command>`/`bisect run
+    # <command>` run an arbitrary command as a POSITIONAL argument (the
+    # sub-verb name itself), not an option — capture the first non-flag
+    # token once so the verb-scoped check after the loop can read it.
+    if [ -z "$sub1" ]; then
+      case "$tok" in -*) : ;; *) sub1="$tok" ;; esac
+    fi
+    # Round 4 (herdr-control#254 F2): git bundles short options, so
+    # `-nO/bin/true`/`-iO…`/`-wO…` are `-n -O …`/`-i -O …`/`-w -O …` — the
+    # old `-O*` only caught O as the FIRST char of the cluster. Any
+    # single-dash cluster containing O anywhere is now caught too; `--o*`
+    # (long-option abbreviations of `--open-files-in-pager`) is unchanged.
+    if [ "$verb" = grep ]; then
+      case "$tok" in -O*|-[!-]*O*|--o*) return 0 ;; esac
+    fi
+    # Round 5 rule B (herdr-control#254 PR comment, live-confirmed `git
+    # clone -u /tmp/pwned.sh src dst`): same cluster/glued shape as grep's
+    # `-O` above — `-u*` catches `u` as the first char of the cluster
+    # (including git's glued short-option-with-value form, `-u/tmp/x`),
+    # `-[!-]*u*` catches it anywhere later in a bundled cluster
+    # (`-qu/tmp/x`). Track `--remote` here too. Both tracked
+    # unconditionally — cheap, and only CONSUMED below for the handful of
+    # verbs where `-u` is exec-capable.
+    case "$tok" in -u*|-[!-]*u*) has_u=1 ;; esac
+    case "$tok" in --remote|--remote=*) has_remote=1 ;; esac
+    # Round 8 (SPEC item B): `-x` is the short form of `--exec` for
+    # `rebase` and of `--extcmd` for `difftool` — same bundled/glued
+    # cluster shape as `-u` above (`-x/tmp/x`, `-qx/tmp/x`).
+    case "$tok" in -x*|-[!-]*x*) has_x=1 ;; esac
+    case "$tok" in
+      -o*) return 0 ;;
+      --*)
+        name="${tok#--}"; name="${name%%=*}"
+        [ -n "$name" ] || continue
+        for opt in $_cp_git_exec_opts; do
+          case "$opt" in "$name"*) return 0 ;; esac
+        done
+        # Round 8 (SPEC item B): filter-branch's whole `--*-filter` family
+        # (tree/index/env/parent/msg/commit/tag-name/subdirectory) runs
+        # arbitrary shell for every rewritten commit; matched by SUFFIX,
+        # scoped to this one verb, since the family keeps growing and a
+        # prefix-of-one-known-name check (the loop just above) cannot
+        # match a family by its ending.
+        if [ "$verb" = filter-branch ]; then
+          case "$name" in *-filter) return 0 ;; esac
+        fi
+        ;;
+    esac
+  done
+  if [ -n "$verb" ]; then
+    case "$_cp_git_known_verbs" in *" $verb "*) ;; *) return 0 ;; esac
+  fi
+  # Round 5 rule B: `-u` is the short form of `--upload-pack` for
+  # clone/fetch/pull/ls-remote/submodule, and archive's remote-upload-pack
+  # companion once `--remote` is given — exec-capable the same way as the
+  # long form (already caught above via the `--` abbreviation-prefix
+  # check), but that check only matches `--` tokens, so the short `-u`
+  # slipped through. Scoped to these verbs only: `-u` means something
+  # harmless elsewhere (`git push -u`, `git checkout -u`, ...).
+  if [ "$has_u" = 1 ]; then
+    case "$verb" in
+      clone|fetch|pull|ls-remote|submodule) return 0 ;;
+      archive) [ "$has_remote" = 1 ] && return 0 ;;
+    esac
+  fi
+  # Round 8 (SPEC item B): `-x` scoped to the two verbs where it is
+  # exec-capable — harmless elsewhere (no other git porcelain command this
+  # table already allows through uses a bare `-x`).
+  if [ "$has_x" = 1 ]; then
+    case "$verb" in
+      rebase|difftool) return 0 ;;
+    esac
+  fi
+  case "$verb" in
+    submodule) [ "$sub1" = foreach ] && return 0 ;;
+    bisect) [ "$sub1" = run ] && return 0 ;;
+  esac
+  return 1
+}
+
+# `_cp_git_dashed_verb <wcmd>` -> prints the subcommand name when WCMD is
+# the dashed git-core libexec binary form (`git-push`, `git-http-push`,
+# `git-send-pack`, …) `_cp_git_push_invoked`'s own awk already recognizes
+# for the force-push rule (H3, independent review of #157: these resolve
+# via $PATH with no literal "git push" text at all) — same shape, one
+# place, so this gate cannot disagree with that one about what counts as
+# git. Returns 1 for a bare `git` or anything else.
+_cp_git_dashed_verb() {                 # wcmd
+  case "$1" in
+    git-?*) printf '%s' "${1#git-}"; return 0 ;;
+  esac
+  return 1
+}
+
+# `_cp_git_seg_exec_unsafe <protected-segment>` -> 0 (true) when this ONE
+# already-protected-and-carved segment is unsafe:
+#   * a `GIT_*=`/`PAGER=`/`EDITOR=`/`VISUAL=` assignment anywhere ahead of
+#     the resolved command word — through any chain of launchers
+#     (`command`, `nice`, `time`, `stdbuf -i0`, `setsid`, another
+#     `FOO=bar` assignment, …) `_cp_locate_command_word` already walks past
+#     for every caller; read back from its `_CP_LOC_SKIPPED` rather than
+#     re-splitting the segment a second, possibly-inconsistent way;
+#   * `git`/`git-<verb>` itself failing `_cp_git_unsafe_tokens`'s shape;
+#   * a fan-out runner (`xargs`/`parallel`) wrapping git — its real
+#     subcommand comes from piped input this policy cannot see at all, so
+#     it is unsafe regardless of what static argv is present.
+_cp_git_seg_exec_unsafe() {             # protected-segment
+  local seg="$1" tok
+  _cp_locate_command_word "$seg" || return 1
+  for tok in ${_CP_LOC_SKIPPED[@]+"${_CP_LOC_SKIPPED[@]}"}; do
+    case "$tok" in GIT_*=*|PAGER=*|EDITOR=*|VISUAL=*) return 0 ;; esac
+  done
+  case "$_cp_wcmd" in
+    git)
+      _cp_git_unsafe_tokens "${_CP_LOC[@]:1}" && return 0
+      return 1 ;;
+    git-*)
+      local v
+      if v="$(_cp_git_dashed_verb "$_cp_wcmd")"; then
+        _cp_git_unsafe_tokens "$v" "${_CP_LOC[@]:1}" && return 0
+      fi
+      return 1 ;;
+    xargs|parallel)
+      local wrapped
+      wrapped="$(_cp_coderef_wrapped_command "$_cp_wcmd" "${_CP_LOC[@]:1}")" || return 1
+      case "${wrapped##*/}" in git|git-*) return 0 ;; esac
+      return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Round 4 (herdr-control#254, rule A — "stop enumerating; make the rules
+# structural"): the variables that can run arbitrary code THROUGH git
+# itself once set in the environment — a pager/editor/filter/credential-
+# helper launcher, or (GIT_CONFIG_COUNT/KEY_n/VALUE_n) a fabricated repo
+# config entry for one of those same launchers. `LESSOPEN`/`LESSCLOSE`
+# (git's default pager is `less`, which runs them), `BASH_ENV`/`ENV`
+# (sourced by non-interactive bash/sh before the first command),
+# `PROMPT_COMMAND` (run before every prompt a pager/pty might print), and
+# `LD_*`/`DYLD_*` (dynamic-linker preload) are exec-capable the same way.
+_CP_EXEC_VAR_RE='^(GIT_[A-Za-z0-9_]*|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH_ENV|ENV|PROMPT_COMMAND|LD_[A-Za-z0-9_]*|DYLD_[A-Za-z0-9_]*)$'
+
+# `_cp_exec_var_stmt_kind <protected-statement>` -> prints one of
+# "execvar"/"source"/"git"/"" describing what this ONE statement (already
+# split on `;&|()<>` and backtick, same as every other per-segment check
+# in this file) is, for the whole-command scan below. Reuses
+# `_cp_locate_command_word` rather than re-walking tokens a second way:
+#   * a statement that resolves to NO command word at all (every token
+#     consumed as an `NAME=value` prefix, or walked past as a launcher's
+#     own `NAME=value` option value — `_cp_locate_command_word` already
+#     collects both into `_CP_LOC_SKIPPED`) is a bare assignment statement
+#     with nothing following it to apply to in THIS statement — exactly
+#     the `export GIT_PAGER=x` (no command) / bare `GIT_PAGER=x` (own
+#     statement) / `env GIT_PAGER=x` (no command) shapes;
+#   * a statement whose resolved command word IS `export`/`declare`/
+#     `typeset`/`readonly` has every non-flag argument checked the same
+#     way — these are never on `_cp_locate_command_word`'s launcher list,
+#     so they surface as the command word itself, with their arguments in
+#     `_CP_LOC`;
+#   * `source`/`.` is reported separately (not "execvar") since it only
+#     matters ordered strictly BEFORE a git statement — the caller tracks
+#     that ordering itself;
+#   * `git`/`git-*` is reported so the caller knows this statement needs
+#     the exec-var/source check to matter at all.
+_cp_exec_var_stmt_kind() {              # protected-segment -> prints execvar|source|git|""
+  local LC_ALL=C LANG=C
+  local seg="$1" tok name
+  if ! _cp_locate_command_word "$seg"; then
+    for tok in ${_CP_LOC_SKIPPED[@]+"${_CP_LOC_SKIPPED[@]}"}; do
+      name="${tok%%=*}"
+      if [[ "$name" =~ $_CP_EXEC_VAR_RE ]]; then printf 'execvar'; return 0; fi
+    done
+    printf ''; return 1
+  fi
+  case "$_cp_wcmd" in
+    export|declare|typeset|readonly)
+      for tok in ${_CP_LOC[@]+"${_CP_LOC[@]}"}; do
+        case "$tok" in -*) continue ;; esac
+        name="${tok%%=*}"
+        if [[ "$name" =~ $_CP_EXEC_VAR_RE ]]; then printf 'execvar'; return 0; fi
+      done
+      printf ''; return 1 ;;
+    source|.)
+      printf 'source'; return 0 ;;
+    git|git-*)
+      printf 'git'; return 0 ;;
+    *) printf ''; return 1 ;;
+  esac
+}
+
+# `_cp_git_exec_opt_invoked <raw>` -> 0 (true) when RAW invokes git in any
+# shape `_cp_git_seg_exec_unsafe` disqualifies. Preprocessing joins a
+# backslash-newline continuation (real shell behaviour) and then runs
+# `_cp_protect_text` — the SAME quote/escape-aware pass `scannable_command`
+# and every walk-based rule in this file use — instead of a blanket
+# `s/['"\\\\]//g` strip: the old strip removed quote/backslash characters
+# WITHOUT tracking which spaces they were protecting, so
+# `GIT_PAGER="touch pwned" git log` and `GIT_PAGER=touch\ pwned git log`
+# both collapsed to a 4-token line (`GIT_PAGER=touch`, `pwned`, `git`,
+# `log`) that split the dangerous assignment's VALUE off into its own,
+# unrecognized token (round 3 review, the root bug). `_cp_protect_text`
+# turns a quoted/escaped space into a control byte instead, so the
+# assignment survives as ONE token the way a real shell would pass it.
+# Segmented on shell operators including `<`/`>` (same as
+# `_cp_git_push_invoked`) so a quoted option value containing its own
+# redirect cannot hide the option in a later segment.
+#
+# Round 4 (herdr-control#254, rule A): a FIRST pass over every statement,
+# order-independent for the exec-var/git pairing (the var escalates the
+# whole command "regardless of what follows" — SPEC's words; a worker
+# cannot be trusted to have left a LATER statement's assignment inert)
+# but order-SENSITIVE for `source`/`.` ("before git" — SPEC's words: a
+# sourced file loaded AFTER the git invocation already ran cannot have
+# affected it). `export GIT_PAGER=/bin/true; git log` (`;` or a real
+# newline — `read -r` on the here-string already splits on either), the
+# GIT_SSH_COMMAND and GIT_CONFIG_COUNT/KEY_0/VALUE_0 shapes from the same
+# probe, and `. ./evil.sh; git log` are a SEPARATE EARLIER statement, so
+# none of them ever reached `_cp_git_seg_exec_unsafe`'s same-segment
+# `_CP_LOC_SKIPPED` walk at all — this pass closes that gap structurally
+# instead of enumerating each shape.
+_cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git fails the read-only shape
+  local LC_ALL=C LANG=C
+  local raw="$1" pre protected seg
+  pre="$(_cp_strip_heredocs "$raw")"
+  pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
+  protected="$(_cp_protect_text "$pre")"
+  protected="$(printf '%s' "$protected" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
+
+  local _cp_geo_execvar=0 _cp_geo_git=0 _cp_geo_source=0 _cp_geo_kind
+  while IFS= read -r seg; do
+    [ -n "${seg//[[:space:]]/}" ] || continue
+    _cp_geo_kind="$(_cp_exec_var_stmt_kind "$seg")"
+    case "$_cp_geo_kind" in
+      execvar) _cp_geo_execvar=1 ;;
+      source) _cp_geo_source=1 ;;
+      git) _cp_geo_git=1; [ "$_cp_geo_source" = 1 ] && _cp_geo_execvar=1 ;;
+    esac
+  done <<EOF
+$(printf '%s' "$protected" | sed -E 's/[;&|()`<>]/\n/g')
+EOF
+  [ "$_cp_geo_execvar" = 1 ] && [ "$_cp_geo_git" = 1 ] && return 0
+
+  while IFS= read -r seg; do
+    [ -n "${seg//[[:space:]]/}" ] || continue
+    _cp_git_seg_exec_unsafe "$seg" && return 0
+  done <<EOF
+$(printf '%s' "$protected" | sed -E 's/[;&|()`<>]/\n/g')
+EOF
+  return 1
+}
+
+# Round 7 (herdr-control#254 PR comment): round 6 closed every shape the
+# review found by PARSING — recognizing bash -c/xargs/find -exec/heredocs/
+# a renamed bash copy as more shell text to recurse into. The round-6
+# REVIEW immediately found ~30 more shapes that defeat parsing itself: su
+# -c, perl -e system, osascript do shell script, bash -o posix -c / -O
+# extglob -c / +e -c / -c -e / -c -- (flag spellings the -c extractor
+# above does not recognize as "-c"), tcsh/csh/fish -c (not on the
+# bash/sh/zsh/dash/ksh/mksh list), a RENAMED bash copy (the detector keys
+# on the basename "bash", not behavior), BASH_ENV=… bash -c (the body
+# itself is harmless — the hazard loads from a file this scanner cannot
+# read), bash <<< / bash <(…) / . <(…) / | /bin/sh / a heredoc piped into
+# bash (none of these are "-c BODY" at all), parallel ::: (no -c either),
+# and $'\x67it' / {git,} / {eval,} (the command word itself is built from
+# a shape no parser here resolves to a literal name). Parsing can always
+# be defeated by one more shape; round 7 stops trying. Trunk's OWN curl
+# rule proves the alternative already works: `bash -c "curl -X POST …"`
+# escalates on every one of those same evasions, not because any of them
+# is parsed, but because the text "curl" and "-X POST" are matched
+# WHEREVER they sit. The git bypasses above all share one structural
+# feature curl's payload doesn't: the dangerous part is a variable or git
+# config NAME sitting next to ordinary "read-only" git text
+# (GIT_SSH_COMMAND=… git ls-remote …) — text-anywhere matching on the
+# NAME closes every shape above in one gate, independent of whatever
+# launcher/quoting/renaming hides the git invocation itself.
+#
+# `_cp_exec_name_or_opaque_present <raw>` -> 0 (true) when RAW's TEXT
+# contains, ANYWHERE — quoted or not, inside a heredoc, inside a -c
+# string, inside an alias/BASH_ALIASES value, as a `read`/`printf -v`/
+# `for … in`/`: ${NAME:=}`/`local -x` assignment target, whatever —
+# any of:
+#   1. an exec-capable variable NAME (case-SENSITIVE: these are real
+#      shell identifiers, and env assignment is already the one shape
+#      this file treats as dangerous wherever it is textually visible,
+#      same as `GIT_*=`/`PAGER=` do inside `_cp_git_seg_exec_unsafe`);
+#   2. a git config KEY that can run a program through git itself
+#      (case-INSENSITIVE: git config keys are case-folded, `CORE.PAGER`
+#      and `core.pager` name the same setting);
+#   3. an unquoted brace-expansion word containing a comma (`{a,b}`) —
+#      a general hole, not git-specific: trunk already ALLOWS
+#      `{curl,-X,POST,url}`, which a shell expands to `curl -X POST
+#      url` before anything runs;
+#   4. a `$'…'` ANSI-C-quoted word — the only shell quoting form that
+#      can spell an identifier (`$'\x67it'` -> `git`) from escapes a
+#      naive scan never resolves; the opening `$'` is itself unquoted
+#      text (it IS the quote marker), so no quote-tracking is needed to
+#      see it.
+# Called FIRST in classify_command, right after `_cp_best_v`/`_cp_best_r`
+# reset and before any other rule — including `_cp_shared_gate`'s own
+# parsing — considers anything: the whole point is that this gate does
+# not need parsing to have already identified a `git` word, a `-c` body,
+# or any other structure; it only needs the name or shape to be present
+# in the text at all.
+#
+# ceiling (item 4, SPEC): a name match cannot tell "the real variable"
+# from a word that only LOOKS like it without parsing, and parsing is
+# exactly what this round gave up on. `grep GIT_PAGER file`,
+# `echo "price is PAGER-controlled"`, and similar still escalate too —
+# accepted false positives, not bugs.
+#
+# Round 8 (herdr-control#254 PR comment, round-7 item A/B ceiling) closed
+# the two gaps left open above:
+#   * `HOME=`/`XDG_CONFIG_HOME=`/`PATH=` redirect where git finds its
+#     config or the programs it shells out to, but are also ordinary,
+#     extremely common identifiers in everyday reads (`$HOME/...`,
+#     `"$PATH"`) — too common for THIS text-anywhere gate. Closed instead
+#     by `_cp_exec_assign_present` below, an ASSIGNMENT-shaped match
+#     (`NAME=` at a word start) that a read never satisfies. `hash -p`
+#     closed in `_cp_gate_eval_alias_shopt` (command-position indirection,
+#     same family as `eval`/`alias`).
+#   * `clone --template`, `difftool -x/--extcmd`, `rebase -x`, `submodule
+#     foreach`, `bisect run`, `filter-branch --*-filter`, `send-email
+#     --sendmail-cmd/--smtp-server`, and `mergetool` (always) closed by
+#     extending `_cp_git_exec_opts`/`_cp_git_unsafe_tokens` above (the
+#     option allowlist these needed, not a name match).
+#
+# ceiling (round 10, herdr-control#254 round-9 review, probe #182): this
+# text-anywhere match on `alias\.` cannot tell a WRITE (`git config
+# alias.x '!sh'`) from a pure READ of the same key (`git config
+# --get-all alias.x`) — `_cp_git_config_unsafe` above already allows the
+# read shape, but this gate runs first and considers "alias." present in
+# the text regardless. Accepted false positive, not a bug; do not weaken
+# the name match to fix it (that would reopen the write shape).
+_CP_EXEC_VAR_NAME_RE='GIT_SSH_COMMAND|GIT_SSH|GIT_PAGER|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_EXTERNAL_DIFF|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND|GIT_EXEC_PATH|GIT_CONFIG[A-Za-z0-9_]*|GIT_DIR|GIT_WORK_TREE|GIT_TEMPLATE_DIR|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH_ENV|ENV|PROMPT_COMMAND|LD_PRELOAD|DYLD_[A-Za-z0-9_]*'
+_CP_EXEC_CFGKEY_RE='core\.pager|core\.sshcommand|core\.editor|core\.fsmonitor|core\.hookspath|core\.gitproxy|diff\.external|\.textconv|credential\.helper|sequence\.editor|alias\.|include\.path|includeif|uploadpack\.|receivepack\.|filter\.|remote\.[^[:space:]]*\.uploadpack'
+
+# Round 8 (herdr-control#254 PR comment, round-7 item A): `HOME`,
+# `XDG_CONFIG_HOME` and `PATH`, ASSIGNED ahead of a git invocation,
+# redirect where git reads its config (`$HOME/.gitconfig`,
+# `$XDG_CONFIG_HOME/git/config`) or resolves the programs it shells out
+# to (a `$PATH` that shadows `ssh`/`less`/`git` itself with a fake one,
+# live-confirmed `PATH=tmp/bin:... git ls-remote ...`). Matched ONLY as
+# an assignment — `NAME=` glued to a word start, so `MYPATH=`/`THOME=`
+# never match and a plain read (`$HOME/...`, `"$PATH"`, `echo $HOME`)
+# never does either, unlike `_CP_EXEC_VAR_NAME_RE` above, which these
+# three are deliberately NOT on (that gate is word-boundary, not
+# assignment-shaped, and HOME/PATH are too common a word to put there —
+# see this file's own round-7 note). `export`/`declare -x`/`env` prefixes
+# need no special-casing: the character immediately before the NAME is
+# already a space/operator in all three shapes, which the same
+# word-start boundary already requires.
+_CP_EXEC_ASSIGN_NAME_RE='HOME|XDG_CONFIG_HOME|PATH'
+_cp_exec_assign_present() {             # raw -> 0 if HOME=/XDG_CONFIG_HOME=/PATH= is assigned anywhere
+  local LC_ALL=C LANG=C
+  grep -qE "(^|[^A-Za-z0-9_])(${_CP_EXEC_ASSIGN_NAME_RE})=" <<<"$1"
+}
+
+# Round 9 (herdr-control#254 PR comment, round-8 review item A): a
+# runtime-BUILT variable NAME handed to an assignment builtin —
+# `printf -v n "%s%s%s" "$g" "$s" "$t"; export "$n=/tmp/x"`, `n="$(printf
+# ...)"; export "$n=/tmp/x"`, `for n in ${!prefix@}; do export "$n=/tmp/x";
+# done` — never matches `_CP_EXEC_VAR_NAME_RE` above (that gate matches a
+# LITERAL name like GIT_PAGER wherever it sits; here the name is not text
+# at all until the shell expands it). Same text-anywhere philosophy as
+# round 7's `_cp_exec_name_or_opaque_present`: this does not try to
+# resolve what the expansion evaluates to (round 7 gave up on parsing
+# defeating itself) — it escalates on the SHAPE, an assignment builtin
+# whose name argument starts with an expansion, regardless of what the
+# expansion resolves to. `export FOO=bar` (a literal name) is unaffected:
+# nothing between the builtin and `=` is `$`/backtick.
+_CP_DYNAMIC_NAME_BUILTIN_RE='export|declare|typeset|local|readonly|read'
+_cp_dynamic_assign_name_present() {     # raw -> 0 if an assignment builtin's NAME arg is an expansion
+  local LC_ALL=C LANG=C
+  _cp_match "(^|[^A-Za-z0-9_])(${_CP_DYNAMIC_NAME_BUILTIN_RE})[[:space:]]+(-[A-Za-z]+[[:space:]]+)*[\"']?(\\\$|\`)" "$1" && return 0
+  _cp_match "(^|[^A-Za-z0-9_])printf[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-v[[:space:]]+(-[A-Za-z]+[[:space:]]+)*[\"']?(\\\$|\`)" "$1" && return 0
+  return 1
+}
+
+# Round 10 (herdr-control#254 PR comment, round-9 review item 1, probe
+# #171): `declare -n`/`local -n`/`typeset -n` (any `-n` nameref flag,
+# alone or clustered with other short flags — `-gn`, `-rn`, …) binds a
+# SECOND name indirectly: `n="$(...)"; declare -n ref="$n"; export ref;
+# ref=/tmp/x` writes through `ref` to whatever variable `$n` evaluated
+# to, without that real target ever appearing as a literal assignment
+# builtin NAME — the exact gap `_cp_dynamic_assign_name_present` above
+# does not cover (its expansion check is on the NAME argument itself,
+# not on a nameref's indirection target). ceiling: this does not try to
+# tell "the nameref target contains an expansion" from "the nameref
+# target is a plain literal" — parsing that apart reopens the same
+# "parsing defeats itself" trap round 7 gave up on (see
+# `_cp_exec_name_or_opaque_present`'s header) — so ANY `-n` nameref
+# escalates unconditionally, including a harmless literal one.
+# `setvar(){ local -n ref="$1"; ref="$2"; }` (probe #175) still
+# escalates too, but not wrongly: it is a FUNCTION DEFINITION, which
+# escalates by design regardless of this rule (round 5,
+# `_cp_gate_function_def_present`) — the round-9 review's own triage
+# confirmed that escalation is correct, not a defect to route around.
+_CP_NAMEREF_RE='(^|[^A-Za-z0-9_])(declare|local|typeset)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*n[A-Za-z]*([[:space:]=]|$)'
+_cp_nameref_present() {                 # raw -> 0 if a declare/local/typeset -n nameref flag is present
+  local LC_ALL=C LANG=C
+  _cp_match "$_CP_NAMEREF_RE" "$1"
+}
+
+# `_cp_unquoted_text <raw>` -> prints RAW with every quoted span (single,
+# double, and the ANSI-C/`$"…"` dollar-quoted forms) dropped entirely —
+# used only to find an unquoted brace-expansion word, where "quoted" has
+# to mean something (a shell never brace-expands inside quotes). Every
+# OTHER check in this function is deliberately quote-blind.
+_cp_unquoted_text() {                   # raw -> raw with quoted spans removed
+  printf '%s' "$1" | awk '
+    BEGIN { SQ = sprintf("%c", 39); DQ = "\"" }
+    {
+      line = $0; n = length(line); st = 0; out = ""
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (st == 0) {
+          if (c == "\\") { i++; continue }
+          if (c == "$" && substr(line, i + 1, 1) == SQ) { st = 1; i++; continue }
+          if (c == "$" && substr(line, i + 1, 1) == DQ) { st = 2; i++; continue }
+          if (c == SQ) { st = 1; continue }
+          if (c == DQ) { st = 2; continue }
+          out = out c; continue
+        }
+        if (st == 1) { if (c == SQ) st = 0; continue }
+        if (c == "\\") { i++; continue }
+        if (c == DQ) st = 0
+      }
+      print out
+    }'
+}
+
+_cp_exec_name_or_opaque_present() {     # raw -> 0 if an exec-capable name/config-key/opaque word is present anywhere
+  local LC_ALL=C LANG=C
+  local raw="$1"
+  grep -qE "(^|[^A-Za-z0-9_])(${_CP_EXEC_VAR_NAME_RE})([^A-Za-z0-9_]|\$)" <<<"$raw" && return 0
+  grep -qiE "$_CP_EXEC_CFGKEY_RE" <<<"$raw" && return 0
+  grep -qE '\{[^{}]*,[^{}]*\}' <<<"$(_cp_unquoted_text "$raw")" && return 0
+  grep -qF "\$'" <<<"$raw" && return 0
+  return 1
 }
 
 # ---- the floor rule table (ported from qm's command-policy.ts) ------------
@@ -3295,6 +3886,26 @@ _cp_bwt_verb_targets() {
       _cp_bwt_scan_optvals "S" "t" "suffix" "target-directory" "$@"
       if [ "$_CP_BWT_TGT_HIT" != 1 ] && [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ]; then
         _cp_bwt_classify_target "${_CP_BWT_NONOPT[$((${#_CP_BWT_NONOPT[@]} - 1))]}"
+      fi
+      # Round 10 (herdr-control#254 PR comment, round-9 review item 2,
+      # probes #176-178): `ln`'s SOURCE argument (every non-option arg
+      # other than the implicit last-is-dest one, or every one of them
+      # when an explicit `-t DIR`/`--target-directory` makes them all
+      # sources) can itself be `.git/config`/`.gitconfig` — a hardlink or
+      # symlink that then gets written through at the OTHER path writes
+      # the real git config file by a route `_cp_git_dir_write_present`
+      # (which only looks at the write TARGET) never sees. `cp`/`mv`
+      # reading or moving `.git/config` is a different, out-of-scope
+      # shape (no second path keeps writing through it afterward), so
+      # this is `ln`-only.
+      if [ "$cmd" = ln ]; then
+        local _cp_lnsrc_i=0 _cp_lnsrc_n="${#_CP_BWT_NONOPT[@]}" _cp_lnsrc_last=$((${#_CP_BWT_NONOPT[@]} - 1))
+        while [ "$_cp_lnsrc_i" -lt "$_cp_lnsrc_n" ]; do
+          if [ "$_CP_BWT_TGT_HIT" = 1 ] || [ "$_cp_lnsrc_i" -lt "$_cp_lnsrc_last" ]; then
+            printf 'LNSRC\t%s\n' "${_CP_BWT_NONOPT[$_cp_lnsrc_i]}"
+          fi
+          _cp_lnsrc_i=$((_cp_lnsrc_i + 1))
+        done
       fi ;;
     install)
       # herdr-control#192 round 4, G1/G2/G3: routed through the shared
@@ -3636,12 +4247,18 @@ _cp_bwt_unterminated_quote() {
 # path>" (cwd-joined, cd-adjusted, lexically `.`/`..`-collapsed — NOT
 # symlink-resolved; that is the hook's job, see _cp_lexical_abspath's own
 # header), "COMPUTED\t<raw text>" (a target this cannot read statically —
-# substitution, unquoted $VAR, glob, ~otheruser), or "UNPARSED\t<reason>"
-# (an unterminated quote — see _cp_bwt_unterminated_quote) line per write
-# target this command names. Every caller MUST treat COMPUTED and UNPARSED
-# identically to "outside scope" — a command that cannot be read is not
-# proof it writes nowhere. Genuinely empty output means this command names
-# no write target at all (`git status`). Runs _cp_strip_heredocs FIRST
+# substitution, unquoted $VAR, glob, ~otheruser), "UNPARSED\t<reason>"
+# (an unterminated quote — see _cp_bwt_unterminated_quote), or (round 10,
+# `ln` only) "LNSRC\t<abs-ish path>" for every SOURCE argument — same
+# resolution as TARGET, but NOT a write target itself; only
+# `_cp_ln_git_source_present` below reads this kind, and callers that
+# only ever matched `TARGET` (`_cp_git_dir_write_present`,
+# `_cp_bash_write_scope_violation`) silently and correctly ignore it —
+# line per write target this command names. Every caller MUST treat
+# COMPUTED and UNPARSED identically to "outside scope" — a command that
+# cannot be read is not proof it writes nowhere. Genuinely empty output
+# means this command names no write target at all (`git status`). Runs
+# _cp_strip_heredocs FIRST
 # (same function scannable_command uses): an inert heredoc body (`cat > f
 # <<EOF` — cat never executes it) is DATA, not a write target, and would
 # otherwise misread `cp`/`tee`/etc mentioned only in usage text inside the
@@ -3691,14 +4308,14 @@ bash_write_targets() {
       [ -n "$line" ] || continue
       kind="${line%%$'\t'*}"
       val="${line#*$'\t'}"
-      if [ "$kind" = TARGET ]; then
-        case "$val" in
-          /*) printf 'TARGET\t%s\n' "$(_cp_lexical_abspath "$val")" ;;
-          *) printf 'TARGET\t%s\n' "$(_cp_lexical_abspath "$eff/$val")" ;;
-        esac
-      else
-        printf '%s\n' "$line"
-      fi
+      case "$kind" in
+        TARGET|LNSRC)
+          case "$val" in
+            /*) printf '%s\t%s\n' "$kind" "$(_cp_lexical_abspath "$val")" ;;
+            *) printf '%s\t%s\n' "$kind" "$(_cp_lexical_abspath "$eff/$val")" ;;
+          esac ;;
+        *) printf '%s\n' "$line" ;;
+      esac
     done <<EOF2
 $(_cp_bwt_segment "$body" "$eff")
 EOF2
@@ -3732,6 +4349,14 @@ _cp_bash_write_scope_violation() {
       printf '%s' "$val"
       return 0
     fi
+    # Round 10: `bash_write_targets` now also emits `LNSRC` lines (an
+    # `ln` SOURCE argument, not a write target — see that rule's own
+    # header near `_cp_ln_git_source_present`) through this SAME stream.
+    # Those are a read-side path, not a write-scope boundary — an `ln -s
+    # /usr/local/bin/foo bin/foo` symlinking FROM outside the worktree is
+    # ordinary and must stay allowed; only a real `TARGET` line is this
+    # function's concern.
+    [ "$kind" = TARGET ] || continue
     _cp_path_within_worktree "$val" "$wt" && continue
     case "$val" in /tmp|/tmp/*) continue ;; esac
     if [ -n "${TMPDIR:-}" ]; then
@@ -3742,6 +4367,71 @@ _cp_bash_write_scope_violation() {
   done <<EOF
 $(bash_write_targets "$raw" "$wt")
 EOF
+}
+
+# `_cp_git_dir_write_present <raw>` -> 0 (true) when RAW names a write
+# target landing under a `.git/` directory, or at `.gitconfig` — Round 9
+# (SPEC item B.2, herdr-control#254 round-8 review): `cat cfg >
+# .git/config` and `cp cfg .git/config` write the SAME file `git config`
+# writes through git itself (B.1 above), by a completely different route
+# this file's git-specific checks never look at. Reuses `bash_write_targets`
+# (the #184 write-scope scanner) rather than a second redirect/cp/tee/
+# install/dd/sed-i parser: that function already walks every operator-
+# split segment and recognizes all of those verbs' write targets — see its
+# own header. Called with `cwd="."` (no worktree boundary to resolve
+# against; this gate fires on the TARGET PATH itself, same everywhere) so
+# a relative `.git/config` lexically resolves to `/.git/config` — matched
+# by suffix, not full path, since the real repo root is unknown here. A
+# COMPUTED or UNPARSED line (a target this scanner cannot read statically)
+# is not a hit for THIS gate — other rules in this file already fail
+# closed on those shapes generally; this one only needs to recognize a
+# STATICALLY VISIBLE `.git/` target.
+_cp_git_dir_write_present() {           # raw -> 0 if a write target lands under .git/ or at .gitconfig
+  local raw="$1" line kind val
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    kind="${line%%$'\t'*}"
+    val="${line#*$'\t'}"
+    [ "$kind" = TARGET ] || continue
+    case "$val" in
+      */.git/*|*/.gitconfig) return 0 ;;
+    esac
+  done <<EOF
+$(bash_write_targets "$raw" ".")
+EOF
+  return 1
+}
+
+# `_cp_ln_git_source_present <raw>` -> 0 (true) when RAW's `ln`/`ln -s`
+# names a SOURCE argument under a `.git/` directory, or at `.gitconfig` —
+# Round 10 (herdr-control#254 PR comment, round-9 review item 2, probes
+# #176-178): `.git/config`'s own write target is already closed by
+# `_cp_git_dir_write_present` above, but a hardlink or symlink planted
+# FROM `.git/config` TO an outside path (`ln .git/config /tmp/cfgcopy`,
+# `ln -s .git/config /tmp/cfgcopy`) lets a later, completely ordinary-
+# looking write to the OUTSIDE path (`echo pager=/tmp/x >> /tmp/cfgcopy`)
+# land in the real git config — the write target that command names is
+# `/tmp/cfgcopy`, nowhere near `.git/`, so no TARGET-based rule ever
+# sees it. Reuses `bash_write_targets`'s own `LNSRC` lines (same
+# resolution as `TARGET`: cwd-joined, cd-adjusted, lexically collapsed)
+# rather than a second argv/option parser — see that function's header
+# for the kind contract. `cwd="."` for the same reason
+# `_cp_git_dir_write_present` uses it: no worktree boundary to resolve
+# against, this gate fires on the SOURCE PATH itself.
+_cp_ln_git_source_present() {           # raw -> 0 if an ln SOURCE argument is under .git/ or at .gitconfig
+  local raw="$1" line kind val
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    kind="${line%%$'\t'*}"
+    val="${line#*$'\t'}"
+    [ "$kind" = LNSRC ] || continue
+    case "$val" in
+      */.git/*|*/.gitconfig) return 0 ;;
+    esac
+  done <<EOF
+$(bash_write_targets "$raw" ".")
+EOF
+  return 1
 }
 
 # _cp_write_menu_verdict <raw panel text> <worktree> -> "allow" or
@@ -3905,6 +4595,218 @@ _cp_mask_script_data() {
     }'
 }
 
+# ---- shared git/env/indirection gate, with -c BODY recursion --------------
+# Round 6 (herdr-control#254 PR comment, Round-5 review): main measured that
+# the classifier already "recurses" into `bash -c BODY` for the download/
+# run-file rules, purely as a side effect of `scannable_command` stripping
+# quotes and flattening substitutions before those rules ever run — `bash -c
+# "curl -X POST …"` escalates, `bash -c ls` allows, with no real extraction
+# involved. `_cp_git_exec_opt_invoked` and the eval/function/alias
+# indirection rule below are NOT like that: both do their OWN quote-aware
+# splitting on the RAW text, and that splitting is exactly right for a
+# TOP-LEVEL command (the quotes around `-c`'s argument really do mark one
+# opaque string there) and exactly WRONG one level down (inside that string,
+# the quotes are gone — they were the OUTER shell's syntax, not the nested
+# shell's — so its spaces are real word separators again). Live-measured:
+# `bash -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"` classified
+# allow, because `_cp_git_exec_opt_invoked`'s own `_cp_protect_text` pass
+# saw one giant quoted blob and never split it into an env-assignment
+# segment and a `git` segment.
+#
+# The fix is structural, not a special case for one shape: `_cp_shared_gate`
+# runs the SAME three checks (git exec-option gate, eval/function/alias/
+# expand_aliases indirection, and "is the command word itself built from an
+# expansion") against the raw text, THEN finds every `bash|sh|zsh|dash|ksh|
+# mksh -c BODY` in it — wherever it sits, so a `xargs`/`find -exec`/`env`/
+# `nice`/… wrapper in front needs no special handling, it is just more
+# words before the shell name in the same segment — and recurses the WHOLE
+# function into each BODY. One code path classifies depth 0 and depth N
+# identically.
+#
+# A BODY that still contains `$` or the flattened-substitution marker
+# `@SUB@` after unprotecting is not a literal string this scanner can
+# reason about (`body=…; bash -c "$body"`): it escalates on sight rather
+# than being walked, per spec — "cannot be known statically" is itself the
+# finding, not a reason to guess. Capped at depth 6, matching every other
+# recursion bound in this file (`_cp_coderef_walk`, `bash_write_targets`).
+#
+# `_cp_gate_function_def_present` fixes a separate false-positive the old
+# regex-based rule had: matching a `name() {` shape ANYWHERE in `$norm`
+# caught the shape sitting in DATA too — `printf "%s\n" "name() {"`, `git
+# log --format="name() {"` both escalated, live-confirmed false positives
+# (round 6 review). It runs on `_cp_protect_text`'s OUTPUT DIRECTLY —
+# never on `_cp_walk_prep`'s segments, which split on bare `(`/`)` as
+# subshell operators and would cut `f()` itself in half (round 6 REGRESSION:
+# the first version of this fix used segments and stopped seeing `f() {
+# ...}; f` at all) — anchored so the shape only counts at a real STATEMENT
+# boundary: start of text, or immediately after an unescaped `;`/`&`/`|`/
+# `(` (skipping real whitespace only). `_cp_protect_text` already turned
+# every operator INSIDE a quote into a control byte and dropped the quote
+# characters, so `"name() {"` can never present as a real `;`/`&`/`|`/`(`
+# followed by whitespace then the shape — its surrounding text (`printf`,
+# `--format=`) is ordinary, non-boundary characters, and the space BETWEEN
+# `()` and `{` inside that same quoted string is itself a control byte
+# (not `[[:space:]]`), so the shape fails to match even if a boundary were
+# found. Real embedded newlines are folded to `;` first (an equivalent
+# statement separator) so one regex handles both — `grep` would otherwise
+# need per-line anchoring that a newline-spanning quoted string can defeat.
+# The `function` keyword form is a second, independent check: `function` as
+# a BARE WORD at the same kind of boundary, same reasoning, no trailing-
+# brace requirement (matches this file's round-5 behavior: `function f {
+# ls; }; f` escalates with no further parsing of what follows).
+_cp_gate_function_def_present() {       # raw -> 0 if `name() {`/`function NAME` sits at a statement boundary
+  local text
+  text="$(_cp_protect_text "$1" | tr '\n' ';')"
+  printf '%s' "$text" |
+    grep -qE '(^|[;&|(])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\([[:space:]]*\)[[:space:]]*\{' &&
+    return 0
+  printf '%s' "$text" |
+    grep -qE '(^|[;&|(])[[:space:]]*function\b' &&
+    return 0
+  return 1
+}
+
+# `_cp_gate_eval_alias_shopt <segment>` — eval/alias/`shopt -s
+# expand_aliases` checked at COMMAND POSITION (via `_cp_locate_command_word`,
+# which already skips `NAME=val` assignments and launchers), not a
+# whole-string regex — the same false-positive class
+# `_cp_gate_function_def_present` fixes above: `printf "%s\n" "eval"` has
+# `eval` sitting in printf's DATA, never resolved as the segment's actual
+# command word, so it no longer matches. Takes a `_cp_walk_prep`-split
+# segment (safe here: unlike the function-def shape, `eval`/`alias`/`shopt`
+# never have a bare `(` glued to them, so the paren-splitting that broke
+# the function-def check above does not apply to this one).
+_cp_gate_eval_alias_shopt() {           # protected segment -> 0 if eval/alias/expand_aliases is the command word
+  _cp_locate_command_word "$1" || return 1
+  case "$_cp_wcmd" in
+    eval|alias) return 0 ;;
+    # Round 8 (herdr-control#254 PR comment, round-7 item A): `hash -p
+    # pathname name` hashes a command NAME to an arbitrary pathname
+    # independent of $PATH — every later `git` (or whatever NAME is)
+    # resolves to that pathname instead, with no textual hazard a NAME
+    # match could ever see. Same family as `eval`/`alias`: the real
+    # command is hidden from every other rule, checked here at command
+    # position so `printf '%s\n' "hash -p"` in DATA still doesn't match.
+    hash)
+      case " ${_CP_LOC[*]:1} " in *' -p '*) return 0 ;; esac
+      ;;
+    shopt)
+      case " ${_CP_LOC[*]:1} " in
+        *' -s '*|*' --set '*)
+          case " ${_CP_LOC[*]:1} " in *' expand_aliases '*) return 0 ;; esac ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
+# Item 3 (round 6 spec): "any word in command position that contains an
+# expansion ($x, ${…}, "$cmd", $(…), backticks) escalates" — a command word
+# this scanner cannot resolve to a literal name is exactly as opaque as
+# `eval`/an alias, it just has no keyword to grep for (`e=e; cmd=${e}val;
+# "$cmd" "…"`, live-measured allow before this). `_cp_protect_text` already
+# collapsed any `$(...)`/backtick to the literal token `@SUB@`, so checking
+# the resolved word for a leading `$` or an embedded `@sub@` (case-folded by
+# `_cp_locate_command_word`) catches both shapes with no new parsing.
+_cp_gate_command_word_is_expansion() {  # protected segment -> 0 if the command word is an unresolved expansion
+  _cp_locate_command_word "$1" || return 1
+  case "$_cp_wcmd" in
+    '$'*|*'@sub@'*) return 0 ;;
+  esac
+  return 1
+}
+
+# Finds `bash|sh|zsh|dash|ksh|mksh -c BODY` anywhere in one protected
+# segment (so any wrapper word in front — `xargs`, `find -exec`, `env`,
+# `nice`, …) and prints one of:
+#   `DYNAMIC`                 — the body is not a static literal
+#   `STATIC<US>text`          — the body, unprotected back to real text
+# Returns 1 with nothing printed when the segment names no such shell. The
+# `-c` flag is matched as a cluster (`-c`, `-lc`, `-ic`, …), mirroring the
+# existing `-[A-Za-z]*c`/`-[A-Za-z]*c[A-Za-z]*` cluster match this file
+# already uses for the same flag elsewhere (`_cp_coderef_others_unsafe`).
+_cp_gate_interp_c_body() {              # protected segment -> DYNAMIC | STATIC<US>text (rc 1: no shell -c here)
+  local seg="$1" oldopts i n tok base k flagtok body
+  case "$-" in *f*) oldopts=set ;; *) oldopts=unset ;; esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $seg
+  [ "$oldopts" = unset ] && set +f
+  local -a toks=("$@")
+  n="${#toks[@]}"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    tok="${toks[$i]}"
+    base="$(printf '%s' "${tok##*/}" | tr 'A-Z' 'a-z')"
+    case "$base" in
+      bash|sh|zsh|dash|ksh|mksh)
+        k=$((i + 1))
+        while [ "$k" -lt "$n" ]; do
+          flagtok="${toks[$k]}"
+          case "$flagtok" in
+            -c|-[A-Za-z]*c|-[A-Za-z]*c[A-Za-z]*)
+              if [ "$((k + 1))" -lt "$n" ]; then
+                body="$(_cp_coderef_unprotect "${toks[$((k + 1))]}")"
+                case "$body" in
+                  *'$'*|*'@SUB@'*) printf 'DYNAMIC\n' ;;
+                  *) printf 'STATIC\x1f%s\n' "$body" ;;
+                esac
+                return 0
+              fi
+              return 1 ;;
+            -*) k=$((k + 1)); continue ;;
+            *) break ;;
+          esac
+        done
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# `_cp_shared_gate <raw> [depth]` — the entry point classify_command calls
+# once at depth 0. Runs the git exec-option gate and the two indirection
+# checks above against every segment of TEXT, then recurses into every
+# `-c` BODY it finds, so a nested shell gets exactly the same scrutiny as
+# the outer one. Updates the running `_cp_best_v`/`_cp_best_r` accumulator
+# via `_cp_consider` directly — callers read the verdict off that, same as
+# every other rule in this file.
+_cp_shared_gate() {                     # raw [depth]
+  local raw="$1" depth="${2:-0}" seg bodyline bodytxt
+  if [ "$depth" -gt 6 ]; then
+    _cp_consider 1 "nested -c/shell body is too deep for the policy gate to follow safely"
+    return 0
+  fi
+
+  _cp_git_exec_opt_invoked "$raw" &&
+    _cp_consider 1 "git invocation carries a global option/env-prefix ahead of the subcommand, or an exec-bearing option/abbreviation, that can run arbitrary code"
+
+  _cp_gate_function_def_present "$raw" &&
+    _cp_consider 1 "command defines a function or alias, or enables alias expansion — the real command is hidden from every other rule"
+
+  while IFS= read -r seg; do
+    [ -n "${seg//[[:space:]]/}" ] || continue
+
+    _cp_gate_eval_alias_shopt "$seg" &&
+      _cp_consider 1 "command invokes eval, defines a function or alias, or enables alias expansion — the real command is hidden from every other rule"
+
+    _cp_gate_command_word_is_expansion "$seg" &&
+      _cp_consider 1 "a command word is built from a variable or command expansion and cannot be resolved statically"
+
+    bodyline="$(_cp_gate_interp_c_body "$seg")" || continue
+    case "$bodyline" in
+      DYNAMIC)
+        _cp_consider 1 "a -c program string is built from an expansion and cannot be resolved statically" ;;
+      STATIC$'\x1f'*)
+        bodytxt="${bodyline#STATIC$'\x1f'}"
+        _cp_shared_gate "$bodytxt" "$((depth + 1))" ;;
+    esac
+  done <<EOF
+$(_cp_walk_prep "$raw")
+EOF
+}
+
 classify_command() {                    # <panel/command text> [worktree] [manifest]
   if [ "$#" -lt 1 ]; then
     printf 'command-policy: classify_command requires a <command> argument\n' >&2
@@ -3959,6 +4861,58 @@ classify_command() {                    # <panel/command text> [worktree] [manif
 
   _cp_best_v=0
   _cp_best_r=""
+
+  # escalate — round 7 (herdr-control#254 PR comment): text-anywhere
+  # exec-capable name/config-key/opaque-word gate. Runs FIRST, on the raw
+  # text, before any other rule in this function (including
+  # `_cp_shared_gate`'s own parsing) gets a chance to have already missed
+  # the shape carrying it. See `_cp_exec_name_or_opaque_present`'s own
+  # header, just above `_cp_git_exec_opt_invoked`, for the full rationale.
+  _cp_exec_name_or_opaque_present "$raw" &&
+    _cp_consider 1 "command text carries an exec-capable variable NAME, git config KEY, unquoted brace-expansion word, or \$'…' ANSI-C word — it can run arbitrary code wherever it sits, quoted or not"
+
+  # escalate — round 8 (herdr-control#254 PR comment, round-7 item A
+  # ceiling): HOME=/XDG_CONFIG_HOME=/PATH= assigned anywhere ahead of a
+  # git invocation redirects where git finds its config or the programs
+  # it shells out to. See `_cp_exec_assign_present`'s own header, just
+  # above `_cp_unquoted_text`, for why this is assignment-shaped and not
+  # folded into the text-anywhere gate just above.
+  _cp_exec_assign_present "$raw" &&
+    _cp_consider 1 "command text assigns HOME/XDG_CONFIG_HOME/PATH ahead of a command — it can redirect where git finds its config or the programs it shells out to"
+
+  # escalate — round 9 (herdr-control#254 PR comment, round-8 review item
+  # A): an assignment builtin (`export`/`declare`/`typeset`/`local`/
+  # `readonly`/`read`/`printf -v`) handed a NAME argument built at run
+  # time (`export "$n=/tmp/x"`) rather than a literal. See
+  # `_cp_dynamic_assign_name_present`'s own header, just above
+  # `_cp_unquoted_text`, for the shapes this closes and why it is
+  # text-anywhere like the gate above rather than another name enumeration.
+  _cp_dynamic_assign_name_present "$raw" &&
+    _cp_consider 1 "an assignment builtin (export/declare/typeset/local/readonly/read/printf -v) is given a NAME argument built from an expansion at run time — it can set any exec-capable variable without ever spelling its name as text"
+
+  # escalate — round 10 (herdr-control#254 PR comment, round-9 review
+  # item 1): a `declare`/`local`/`typeset` `-n` nameref flag. See
+  # `_cp_nameref_present`'s own header, just above `_cp_unquoted_text`.
+  _cp_nameref_present "$raw" &&
+    _cp_consider 1 "declare/local/typeset -n creates a nameref — it can write through an indirectly-bound variable whose real target never appears as a literal assignment name"
+
+  # escalate — round 9 (herdr-control#254 PR comment, round-8 review item
+  # B.2): a write target landing under `.git/` (most commonly
+  # `.git/config`, `.git/hooks/*`) or at `.gitconfig` sets git's own
+  # runtime config or an executable hook by a route that never goes
+  # through `git config` or any git subcommand at all. See
+  # `_cp_git_dir_write_present`'s own header, just above
+  # `_cp_write_menu_verdict`, for why this reuses `bash_write_targets`
+  # rather than a second redirect/cp/tee parser.
+  _cp_git_dir_write_present "$raw" &&
+    _cp_consider 1 "command writes to a path under .git/ or at .gitconfig — this can set git's runtime config or install an executable hook outside git config itself"
+
+  # escalate — round 10 (herdr-control#254 PR comment, round-9 review
+  # item 2): an `ln`/`ln -s` SOURCE argument under `.git/` or at
+  # `.gitconfig`. See `_cp_ln_git_source_present`'s own header, just
+  # above `_cp_write_menu_verdict`.
+  _cp_ln_git_source_present "$raw" &&
+    _cp_consider 1 "ln names a source path under .git/ or at .gitconfig — a hardlink or symlink planted here lets a later ordinary-looking write elsewhere land in git's own runtime config"
 
   # deny — mkfs formats a block device with no confirmation of its own;
   # nothing downstream of "yes, run this" makes that reversible, so it is
@@ -4041,6 +4995,39 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   { _cp_git_push_invoked "$raw" &&
     _cp_match '(^|[[:space:]])(-[A-Za-z]*f[A-Za-z]*|--force(-with-lease)?)([[:space:]]|$)' "$norm"; } &&
     _cp_consider 1 "git push --force/-f rewrites remote history"
+
+  # escalate — round 4 (herdr-control#254 observed F1): the --force rule
+  # just above is the ONLY general git-push check classify_command itself
+  # ever ran — conductor_reserved_reason's own, separate `_cp_push_is_safe`
+  # allowlist (type/slug branches only) was never consulted here, so
+  # `git-push origin main` (and plain `git push origin main`, with no
+  # --force at all) classified `allow` by THIS function even though
+  # herdr-select.sh's conductor/peer paths separately call
+  # conductor_reserved_reason too and would have refused it there — a
+  # caller that trusts classify_command's own verdict alone had no such
+  # second layer. Shares the same `_cp_push_is_safe`/
+  # `_cp_git_push_invoked` conductor_reserved_reason uses, so the two
+  # cannot drift: a push is allow-class here ONLY when the target is the
+  # exact `git push [-u|--set-upstream] origin type/slug` shape.
+  { _cp_git_push_invoked "$raw" && ! _cp_push_is_safe "$norm"; } &&
+    _cp_consider 1 "git push target is not on the safe branch allowlist"
+
+  # escalate — round 6 (herdr-control#254 PR comment): the git exec-option
+  # gate (`_cp_git_exec_opt_invoked`), the eval/function/alias/
+  # expand_aliases indirection check, and "is the command word itself an
+  # unresolved expansion" all now run through `_cp_shared_gate`, which
+  # additionally recurses into every `bash|sh|zsh|dash|ksh|mksh -c BODY` it
+  # finds (under any wrapper — `xargs`, `find -exec`, `env`, `nice`, …) and
+  # runs the SAME three checks on that body, unprotected back to real text.
+  # `bash -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"` classified
+  # allow before this: `_cp_git_exec_opt_invoked` ran on the raw text and
+  # saw the whole quoted `-c` argument as one opaque blob, never splitting
+  # it into an env-assignment segment and a `git` segment the way it does
+  # for the same text typed unquoted at the top level. See the function's
+  # own header, just above `classify_command`, for the rest of this round's
+  # findings (constructed eval/alias names, the `printf "%s\n" "eval"`/
+  # `git log --format=eval` false positives the old whole-string regex had).
+  _cp_shared_gate "$raw" 0
 
   # escalate — DROP/TRUNCATE TABLE, case-insensitive (SQL keywords are
   # conventionally upper- or lower-case interchangeably).

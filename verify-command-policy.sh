@@ -191,7 +191,12 @@ echo "== git fetch downloads refs, not code to run =="
 # FIRST step of every review escalated to a human (wN:pA, 2026-09-18).
 check "git fetch a branch"            "git fetch origin geo/ai-surface-gaps"   allow
 check "git fetch then log"            "git fetch origin main && git log --oneline -1 FETCH_HEAD" allow
-check "git fetch with -C"             "git -C /tmp/wt fetch origin main"       allow
+# Round 2 (git-exec-allowlist): -C is a global option ahead of the
+# subcommand, same as any other leading `-` token — it now escalates like
+# every other pre-verb global option (-c/--git-dir/--work-tree/…), not a
+# regression of the fetch narrowing above, which only ever covered the
+# bare `git fetch <ref>` shape.
+check "git fetch with -C"             "git -C /tmp/wt fetch origin main"       escalate
 check "git fetch --all --prune"       "git fetch --all --prune"                allow
 # The narrowing is only the git form: a bare downloader still escalates, and
 # so does a git fetch whose output is piped into a shell.
@@ -1583,6 +1588,228 @@ check_reserved "H3/xiv: absolute git-send-pack binary path" \
   '/Library/Developer/CommandLineTools/usr/libexec/git-core/git-send-pack origin main'
 check "H1: force via glued redirect" 'git -P> status push -f origin main' escalate
 
+echo
+echo
+echo "== git -O/-c/--config-env exec options escalate (herdr-control git-pager-exec) =="
+# Defect measured on trunk 879d4a8: git runs an `-O`/`--open-files-in-pager`
+# value, and any `-c key=value`/`--config-env` value whose key is
+# exec-capable (core.pager, core.editor, alias.*, diff.external,
+# core.sshCommand, core.fsmonitor, core.hooksPath, credential.helper,
+# gpg.program, core.askpass, filter.*, merge.*.driver, …), through a shell —
+# none of that needed a push or a write, so it sailed through classified
+# `allow`. Mirrors the three measured bypasses exactly.
+check "git grep --open-files-in-pager=cmd (long form, redirect in value)" \
+  'git grep --open-files-in-pager="printf X > /tmp/m" -e foo -- README.md' escalate
+check "git grep -O attached pager cmd" \
+  'git grep -O"touch /tmp/m" -e foo' escalate
+check "git -c core.pager=sh log" \
+  'git -c core.pager=sh log' escalate
+check "git -c alias override" \
+  'git -c alias.x=!sh log' escalate
+check "git --config-env=core.pager=VAR log" \
+  'git --config-env=core.pager=VAR log' escalate
+check "GIT_PAGER= env prefix before git log" \
+  'GIT_PAGER=sh git log' escalate
+check "GIT_SSH_COMMAND= env prefix before git fetch" \
+  'GIT_SSH_COMMAND=sh git fetch' escalate
+check "PAGER= env prefix before git diff" \
+  'PAGER=sh git diff' escalate
+
+# Negative: every read-only git shape this gate already allows must stay
+# allow — the new rule must not over-match plain reads.
+check "git grep -e stays allow"  "git grep -e foo -- README.md"  allow
+check "git log stays allow"      "git log"                       allow
+check "git diff stays allow"     "git diff"                      allow
+check "git status stays allow"   "git status"                    allow
+
+# Real negative (not just the classifier's opinion): run the LITERAL payload
+# through real git in a scratch repo and confirm the marker DOES land (the
+# text is a genuine exploit, not a false positive we're padding the suite
+# with), while classify_command for that exact text already says escalate —
+# so herdr-select.sh/pretool-shadow never hand it to a peer-approved worker
+# unsupervised.
+_gpe_marker="$(mktemp -u /tmp/herdr-git-pager-exec-marker.XXXXXX)"
+_gpe_scratch="$(mktemp -d)"
+( cd "$_gpe_scratch" && git init -q && git -c user.email=x@x -c user.name=x commit -q --allow-empty -m x
+  rm -f "$_gpe_marker"
+  env -u GIT_PAGER -u PAGER script -q /dev/null git -c core.pager="touch $_gpe_marker" log >/dev/null 2>&1
+)
+total=$((total + 1))
+if [ -f "$_gpe_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: -c core.pager payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: -c core.pager payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+rm -f "$_gpe_marker"
+total=$((total + 1))
+got="$(classify_command "git -c core.pager=\"touch $_gpe_marker\" log")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -rf "$_gpe_scratch"
+rm -f "$_gpe_marker"
+
+echo
+echo "== Round 2 (git-exec-allowlist, PR #254 review): ANY global option or" \
+     "env-prefix ahead of the verb escalates, not just the specific flags" \
+     "the old denylist happened to name =="
+# Review findings, observed live by running the probes against real git:
+# classify_command returned `allow`, and the payload RAN, for all four.
+check "F1: --git-dir/--work-tree point at an attacker repo (its own core.pager runs)" \
+  'git --git-dir=/tmp/evil/.git --work-tree=/tmp/evil log' escalate
+check "F2: GIT_DIR= env points at an attacker repo" \
+  'GIT_DIR=/tmp/evil/.git git log' escalate
+check "F3: git grep --open-files-in-pag= (git accepts unambiguous abbreviations of long options)" \
+  'git grep --open-files-in-pag="touch /tmp/m" -e foo' escalate
+check "F4: attached -c, no space before the key" \
+  'git -ccore.pager=touch log' escalate
+
+# Acceptance checklist's own probe list.
+check "-C <dir> log — global option ahead of the verb" \
+  'git -C /tmp log' escalate
+check "--namespace x log — global option ahead of the verb" \
+  'git --namespace x log' escalate
+check "-p log — -p/--paginate is a global option" \
+  'git -p log' escalate
+check "GIT_WORK_TREE= env prefix before git log" \
+  'GIT_WORK_TREE=x git log' escalate
+check "EDITOR= env prefix before git log" \
+  'EDITOR=x git log' escalate
+check "--open-f=x — abbreviation of --open-files-in-pager on a non-grep verb" \
+  'git log --open-f=x' escalate
+check "-Ox on grep — attached -O value" \
+  'git grep -Ox -e foo' escalate
+check "-osrc/x on diff — attached -o (--output's short form) writes a file" \
+  'git diff -osrc/git-glued-output' escalate
+check "-osrc/x on show — attached -o (--output's short form) writes a file" \
+  'git show -osrc/x HEAD' escalate
+check "-o with a separate value on log — --output's short form" \
+  'git log -o src/x' escalate
+
+# Plain reads stay allow.
+check "git status stays allow (Round 2)"  "git status"            allow
+check "git log stays allow (Round 2)"     "git log"                allow
+check "git diff stays allow (Round 2)"    "git diff"               allow
+check "git show stays allow (Round 2)"    "git show"               allow
+check "git grep -e foo stays allow (Round 2)" "git grep -e foo"    allow
+check "git ls-files stays allow (Round 2)" "git ls-files"          allow
+check "git blame stays allow (Round 2)"   "git blame"              allow
+check "git rev-parse stays allow (Round 2)" "git rev-parse"        allow
+
+# Real negatives: run the LITERAL payload through real git and confirm the
+# marker lands (the threat is real), while classify_command for that exact
+# text already says escalate — same pattern as the existing -c core.pager
+# real negative above.
+_r2_real_negative() {   # label cmd
+  local label="$1" cmd="$2" got
+  total=$((total + 1))
+  if [ -f "$_r2_marker" ]; then
+    printf 'PASS  %-52s => %-9s\n' "real negative: $label payload runs" "ran"
+  else
+    printf 'FAIL  %-52s => %-9s\n' "real negative: $label payload runs" "did-not-run"
+    failed=$((failed + 1))
+  fi
+  total=$((total + 1))
+  got="$(classify_command "$cmd")"
+  if [ "$got" = escalate ]; then
+    printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates $label" "$got"
+  else
+    printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates $label" "$got"
+    failed=$((failed + 1))
+  fi
+}
+
+# F1/F2: an alt repo whose OWN local core.pager runs, reached via
+# --git-dir/--work-tree or GIT_DIR=.
+_r2_marker="$(mktemp -u /tmp/herdr-git-exec-allowlist-marker.XXXXXX)"
+_r2_evil="$(mktemp -d)"
+( cd "$_r2_evil" && git init -q && git -c user.email=x@x -c user.name=x commit -q --allow-empty -m x
+  git -c user.email=x@x -c user.name=x config core.pager "touch $_r2_marker" )
+rm -f "$_r2_marker"
+_r2_cmd="git --git-dir=$_r2_evil/.git --work-tree=$_r2_evil log"
+( env -u GIT_PAGER -u PAGER script -q /dev/null bash -c "$_r2_cmd" >/dev/null 2>&1 )
+_r2_real_negative "F1: --git-dir/--work-tree alt-repo pager" "$_r2_cmd"
+rm -f "$_r2_marker"
+_r2_cmd="GIT_DIR=$_r2_evil/.git git log"
+( env -u GIT_PAGER -u PAGER script -q /dev/null bash -c "$_r2_cmd" >/dev/null 2>&1 )
+_r2_real_negative "F2: GIT_DIR= alt-repo pager" "$_r2_cmd"
+rm -rf "$_r2_evil"
+
+# F3: the grep abbreviation, in a fresh repo of its own.
+_r2_scratch="$(mktemp -d)"
+( cd "$_r2_scratch" && git init -q && printf 'foo\n' > f && git add f &&
+  git -c user.email=x@x -c user.name=x commit -q -m x )
+rm -f "$_r2_marker"
+_r2_cmd="(cd $_r2_scratch && env -u GIT_PAGER -u PAGER script -q /dev/null git grep --open-files-in-pag=\"touch $_r2_marker\" -e foo >/dev/null 2>&1)"
+bash -c "$_r2_cmd"
+_r2_real_negative "F3: git grep --open-files-in-pag= abbreviation" "git grep --open-files-in-pag=\"touch $_r2_marker\" -e foo"
+
+# F4 (attached -c, `-ccore.pager=...`) has no EXEC real-negative here: on
+# this machine's git, the attached short form does not apply core.pager
+# the way the spaced `-c core.pager=...` form does (confirmed live — the
+# marker never lands even though the classifier is right to treat the
+# shape as unsafe, since `-c`-attached is parsed identically to `-c`
+# wherever git DOES honor it). The classifier-escalates assertion for this
+# exact text is already covered above ("F4: attached -c, no space before
+# the key").
+rm -rf "$_r2_scratch"
+rm -f "$_r2_marker"
+unset -f _r2_real_negative
+
+echo
+echo "== classifier/shadow parity: one shared function, same verdict for every git row (Round 2) =="
+# lib/pretool-shadow.sh's `_ps_bash_handoffs_verdict` now calls the exact
+# same `_cp_git_unsafe_tokens` this file's exec-opt rule uses, fed the
+# tokens its own `_cp_locate_command_word` locator already produces (the
+# SAME locator the menu/shadow write-scope check relies on) — reproduced
+# here without the full handoffs-write scaffolding, plus the generic
+# first-word launcher/env-prefix check pretool-shadow applies ahead of it
+# (R2-3 above), so this is the real combined behaviour, not a stand-in.
+_cp_shadow_git_verdict() {              # cmd -> hit | safe | not-git
+  local cmd="$1"
+  local -a _r2_toks
+  set -f; read -r -a _r2_toks <<<"$cmd"; set +f
+  if ! _cp_locate_command_word "$cmd" || [ "$_cp_wcmd" != git ]; then
+    printf 'not-git\n'; return
+  fi
+  if [ "${_r2_toks[0]:-}" != git ]; then
+    printf 'hit\n'; return
+  fi
+  if _cp_git_unsafe_tokens "${_CP_LOC[@]:1}"; then printf 'hit\n'; else printf 'safe\n'; fi
+}
+_r2_parity_rows=(
+  'git status' 'git log' 'git diff' 'git show' 'git grep -e foo'
+  'git ls-files' 'git blame' 'git rev-parse'
+  'git --git-dir=/tmp/evil/.git --work-tree=/tmp/evil log'
+  'git grep --open-files-in-pag=touchM -e foo'
+  'git -ccore.pager=touch log'
+  'git -C /tmp log' 'git --namespace x log' 'git -p log'
+  'GIT_WORK_TREE=x git log' 'EDITOR=x git log'
+  'git log --open-f=x' 'git grep -Ox -e foo'
+  'git -c core.pager=touch log' 'git --config-env=core.pager=X log'
+  'git --exec-path=/tmp log' 'git diff --text log' 'git log --output=/tmp/x'
+  'git diff -osrc/git-glued-output' 'git show -osrc/x HEAD'
+)
+for _r2_row in "${_r2_parity_rows[@]}"; do
+  total=$((total + 1))
+  _r2_cv="$(classify_command "$_r2_row")"
+  _r2_sv="$(_cp_shadow_git_verdict "$_r2_row")"
+  case "$_r2_cv:$_r2_sv" in
+    escalate:hit|allow:safe)
+      printf 'PASS  %-52s classifier=%-9s shadow=%s\n' "parity: $_r2_row" "$_r2_cv" "$_r2_sv" ;;
+    *)
+      printf 'FAIL  %-52s classifier=%-9s shadow=%s (must agree)\n' "parity: $_r2_row" "$_r2_cv" "$_r2_sv"
+      failed=$((failed + 1)) ;;
+  esac
+done
+unset -f _cp_shadow_git_verdict
+
+
+
 
 
 echo
@@ -1951,6 +2178,716 @@ check_wt "a backslash-newline line continuation between \$ and ' is still read a
 check "bash write-scope rule is a no-op with no worktree context" \
   "cat f >> /outside" allow
 
+echo
+echo "== Round 3 (herdr-control#254 review): quoted/escaped env values, launcher" \
+     "chains ahead of the env prefix, xargs/parallel fan-out, unknown" \
+     "subcommands, and the dashed git-<verb> libexec form =="
+# F1 (root bug): the old preprocessing stripped quote/backslash CHARACTERS
+# without tracking which spaces they were protecting, so a quoted or
+# escaped VALUE containing a space split the assignment token away from
+# its value — `GIT_PAGER=sh git log` escalated but `GIT_PAGER="touch
+# pwned" git log` and `GIT_PAGER=touch\ pwned git log` did not. Fixed by
+# running the same quote/escape-aware `_cp_protect_text` every other
+# walk-based rule in this file uses, instead of a blanket strip.
+check "F1: GIT_PAGER quoted value with an inner space" \
+  'GIT_PAGER="touch /tmp/herdr-r3-marker" git log' escalate
+check "F1: GIT_PAGER backslash-escaped space" \
+  'GIT_PAGER=touch\ /tmp/herdr-r3-marker git log' escalate
+check "F1: GIT_EDITOR quoted value with an inner space" \
+  'GIT_EDITOR="touch /tmp/herdr-r3-marker" git log' escalate
+check "F1: GIT_SSH_COMMAND quoted value with an inner space" \
+  'GIT_SSH_COMMAND="touch /tmp/herdr-r3-marker" git fetch origin main' escalate
+check "F1: GIT_CONFIG_COUNT quoted value" \
+  'GIT_CONFIG_COUNT="1 extra" git log' escalate
+
+# F2: a launcher (`command`, `nice`, `time`, `stdbuf -i0`, `setsid`) or
+# another plain `FOO=bar` assignment between the dangerous env prefix and
+# the git word must not reset the "a dangerous env var was assigned"
+# signal — `_cp_locate_command_word`'s own `_CP_LOC_SKIPPED` is read back
+# instead of a second, possibly-disagreeing token walk.
+check "F2: command launcher between the env prefix and git" \
+  'GIT_PAGER=sh command git log' escalate
+check "F2: nice launcher between the env prefix and git" \
+  'GIT_PAGER=sh nice git log' escalate
+check "F2: time launcher between the env prefix and git" \
+  'GIT_PAGER=sh time git log' escalate
+check "F2: stdbuf -i0 launcher between the env prefix and git" \
+  'GIT_PAGER=sh stdbuf -i0 git log' escalate
+check "F2: setsid launcher between the env prefix and git" \
+  'GIT_PAGER=sh setsid git log' escalate
+check "F2: a second plain assignment between the env prefix and git" \
+  'GIT_PAGER=sh FOO=bar git log' escalate
+
+# F3: a fan-out runner (`xargs`/`parallel`) wrapping git — the real
+# subcommand comes from piped input this policy cannot see at all, so it
+# escalates regardless of what static argv happens to be present.
+check "F3: bare xargs git" "xargs git log" escalate
+check "F3: xargs -n1 git (attached value opt)" "xargs -n1 git log" escalate
+check "F3: parallel git" "parallel git log" escalate
+
+# F4: an unknown subcommand could be a repo-configured alias
+# (`git config alias.x '!sh -c …'` — git only consults the alias table
+# when the name does not match a real one), so it must not auto-allow; a
+# verb that IS a real git subcommand, read or write, is unaffected.
+check "F4: unknown subcommand (possible alias)" "git x" escalate
+check "F4: another unknown subcommand" "git frobnicate" escalate
+check "F4: known write verb stays allow (branch listing)" "git branch -a" allow
+check "F4: known read verb stays allow (merge-base)" "git merge-base HEAD main" allow
+check "F4: known verb stays allow (remote listing)" "git remote -v" allow
+
+# F5: git's dashed libexec binary name (`git-<verb>`, found via $PATH with
+# no literal "git <verb>" text at all — same shape `_cp_git_push_invoked`
+# already recognizes for the force-push rule) must get the identical
+# exec-opt scrutiny the spaced spelling gets, not be invisible to this
+# gate entirely.
+check "F5: dashed form with a dangerous env prefix" \
+  'GIT_PAGER=sh git-log' escalate
+check "F5: dashed form carrying an exec-bearing option" \
+  'git-log --output=/tmp/herdr-r3-marker' escalate
+check "F5: dashed form, plain read, stays allow (consistent with 'git log')" \
+  "git-log" allow
+
+# Negative: every read-only git shape this gate already allows must stay
+# allow — the new known-verb check must not over-match plain reads.
+check "F4/F1/F2 negative: plain git log stays allow" "git log" allow
+check "F4/F1/F2 negative: plain git fetch stays allow" "git fetch origin main" allow
+check "F4/F1/F2 negative: plain git status stays allow" "git status" allow
+
+# Real negative: run the LITERAL payload through real git in a scratch repo
+# and confirm the marker DOES land (the quoted/escaped-space bypass is a
+# genuine exploit, not a false positive), while classify_command for that
+# exact text already says escalate.
+_r3_marker="$(mktemp -u /tmp/herdr-git-exec-r3-marker.XXXXXX)"
+_r3_scratch="$(mktemp -d)"
+( cd "$_r3_scratch" && git init -q && git -c user.email=x@x -c user.name=x commit -q --allow-empty -m x )
+rm -f "$_r3_marker"
+_r3_cmd="(cd $_r3_scratch && GIT_PAGER=\"touch $_r3_marker\" script -q /dev/null git log >/dev/null 2>&1)"
+bash -c "$_r3_cmd"
+total=$((total + 1))
+if [ -f "$_r3_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: quoted GIT_PAGER payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: quoted GIT_PAGER payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "GIT_PAGER=\"touch $_r3_marker\" git log")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -rf "$_r3_scratch"
+rm -f "$_r3_marker"
+
+echo
+echo "== round 4 (herdr-control#254): close the three live probe bypasses =="
+# F1: classify_command's ONLY general git-push check was the --force rule
+# above — a plain `git push origin main` (no --force at all) classified
+# `allow` by classify_command even though conductor_reserved_reason
+# separately reserves it; round 3's H3 fix only taught
+# `_cp_git_push_invoked` to recognize the dashed binary form, it never
+# taught classify_command to CONSULT that recognition for anything but
+# --force. Confirmed live via a mktemp-sandbox probe comment on PR #254.
+check "F1: bare dashed push to main, no --force"   "git-push origin main"    escalate
+check "F1: plain git push to main, no --force"     "git push origin main"    escalate
+check "F1: dashed push, even to a safe branch, escalates (no space => never matches the safe shape, same as conductor_reserved_reason's existing behaviour)" \
+  "git-push origin fix/x" escalate
+check "F1: plain push to a safe branch stays allow"  "git push origin fix/x" allow
+
+# F2: git bundles short options, so `-O` need not be the first flag char
+# in its cluster — `-nO<cmd>` is `-n -O<cmd>`.
+check "F2: git grep -nO bundled short opts" "git grep -nO/bin/true -e foo" escalate
+check "F2: git grep -iO bundled short opts" "git grep -iO/bin/true -e foo" escalate
+check "F2: git grep -wO bundled short opts" "git grep -wO/bin/true -e foo" escalate
+check "F2 negative: git grep -n without O stays allow" \
+  "git grep -n foo -- README.md" allow
+
+# F3 (rule A): the exec-capable var lives in an EARLIER STATEMENT, not a
+# same-segment prefix `_CP_LOC_SKIPPED` can see.
+check "F3: export GIT_PAGER, separate statement (;)" \
+  'export GIT_PAGER=/bin/true; git log' escalate
+check "F3: export GIT_PAGER, separate statement (newline)" \
+  "$(printf 'export GIT_PAGER=/bin/true\ngit log')" escalate
+check "F3: export GIT_SSH_COMMAND, separate statement" \
+  'export GIT_SSH_COMMAND=/bin/true; git fetch origin main' escalate
+check "F3: GIT_CONFIG_COUNT/KEY_0/VALUE_0 fsmonitor, separate statement" \
+  'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=/bin/true; git status' escalate
+check "F3: bare GIT_PAGER assignment as its own statement (no export)" \
+  'GIT_PAGER=/bin/true; git log' escalate
+check "F3: source a file before git" \
+  '. /tmp/herdr-r4-evil.sh; git log' escalate
+check "F3 negative: unrelated export before git stays allow" \
+  'export FOO=bar; git log' allow
+check "F3 negative: plain git log stays allow" "git log" allow
+check "F3 negative: plain git status stays allow" "git status" allow
+
+# Real negative (F2): run the LITERAL bundled-short-opt payload through
+# real git in a scratch repo and confirm the marker DOES land. git grep
+# -O only opens a file (running the pager command at all) when (a) stdout
+# is a TTY — `script -q /dev/null` provides one — AND (b) there is at
+# least one matching line to open, so the scratch repo needs a tracked
+# file whose content the `-e` pattern actually matches. Mirrors the
+# already-proven F3 (`--open-files-in-pag=`) real negative below exactly
+# — same scratch-repo shape, same bare `-e foo` with no `--` pathspec —
+# with only the one variable this round actually tests added: the `-n`
+# bundled onto the SAME short-option cluster as `-O`.
+_r4_marker="$(mktemp -u /tmp/herdr-git-exec-r4-marker.XXXXXX)"
+_r4_scratch="$(mktemp -d)"
+( cd "$_r4_scratch" && git init -q && printf 'foo\n' > f && git add f &&
+  git -c user.email=x@x -c user.name=x commit -q -m x )
+rm -f "$_r4_marker"
+_r4_cmd="(cd $_r4_scratch && env -u GIT_PAGER -u PAGER script -q /dev/null git grep -nO\"touch $_r4_marker\" -e foo >/dev/null 2>&1)"
+bash -c "$_r4_cmd"
+total=$((total + 1))
+if [ -f "$_r4_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: bundled grep -nO payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: bundled grep -nO payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "git grep -nO\"touch $_r4_marker\" -e foo")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -rf "$_r4_scratch"
+rm -f "$_r4_marker"
+
+# Real negative (F3): run the LITERAL earlier-statement export through real
+# git in a scratch repo (a TTY is not needed here — GIT_CONFIG_* reaches
+# core.fsmonitor without ever opening a pager) and confirm the marker lands.
+_r4b_marker="$(mktemp -u /tmp/herdr-git-exec-r4b-marker.XXXXXX)"
+_r4b_scratch="$(mktemp -d)"
+( cd "$_r4b_scratch" && git init -q && git -c user.email=x@x -c user.name=x commit -q --allow-empty -m x )
+rm -f "$_r4b_marker"
+_r4b_cmd="(cd $_r4b_scratch && export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=\"touch $_r4b_marker\"; git status >/dev/null 2>&1)"
+bash -c "$_r4b_cmd"
+total=$((total + 1))
+if [ -f "$_r4b_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: earlier-statement GIT_CONFIG_* payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: earlier-statement GIT_CONFIG_* payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=\"touch $_r4b_marker\"; git status")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -rf "$_r4b_scratch"
+rm -f "$_r4b_marker"
+
+echo
+echo "== round 5 (herdr-control#254 PR comment): indirection (eval, function," \
+     "alias, expand_aliases) + clone/fetch/pull/ls-remote/submodule/archive" \
+     "exec-option \`-u\` =="
+# Observed (round-4 review): classify_command does not look inside eval
+# strings or function bodies at all, and git's clone/fetch/pull/ls-remote/
+# submodule/archive share an exec-capable short option (`-u`, the short
+# form of `--upload-pack`) the long-form abbreviation-prefix check never
+# sees. Rule A escalates on eval/function-def/alias/expand_aliases
+# regardless of what follows — reviewable, not parsed. Rule B teaches
+# `_cp_git_unsafe_tokens` that `-u` is exec-capable for those five verbs.
+check "rule A: eval wrapping a GIT_PAGER payload" \
+  'eval "GIT_PAGER=/tmp/pwned git log"' escalate
+check "rule A: eval with a trailing git statement" \
+  'eval "GIT_PAGER=x; git log"' escalate
+check "rule A: eval has no git/GIT_PAGER at all — still escalates, the hole is general" \
+  'eval "ls"' escalate
+check "rule A: function def (name() shape) wrapping a GIT_PAGER payload" \
+  'f() { local -x GIT_PAGER=x; git log; }; f' escalate
+check "rule A: function def after an unrelated set -a" \
+  'set -a; f() { local GIT_PAGER=x; git log; }; f' escalate
+check "rule A: function def with no git/GIT_PAGER at all — still escalates" \
+  'f() { ls; }; f' escalate
+check "rule A: function keyword form" \
+  'function f { ls; }; f' escalate
+check "rule A: expand_aliases + alias wrapping a GIT_PAGER payload" \
+  "shopt -s expand_aliases; alias ggg='GIT_PAGER=x git log'; ggg" escalate
+check "rule A: alias alone, no git at all — still escalates" \
+  'alias x=ls' escalate
+check "rule A negative: a no-arg method call inside quoted interpreter code is not a bash function def" \
+  "curl -sS https://x/api | python3 -c \"import json,sys; print(len(sys.stdin.read()))\"" allow
+check "rule A negative: python def uses a colon, not a brace — not a bash function def" \
+  "python3 -c 'def f(): pass'" allow
+
+# Real negatives (items 1 and 2): prove the eval/function-def GIT_PAGER
+# bypass actually RUNS in real bash — same primitives SPEC names (mktemp
+# for a scratch repo + a fake pager, `script -q /dev/null` for the pty a
+# pager needs to engage at all, `env -u GIT_PAGER -u PAGER` to start from
+# a clean slate) — and that classify_command escalates the identical text.
+# Mirrors round 4's F2/F3 real-negative shape exactly (scratch repo, a
+# tracked file, a fake-pager script that touches a marker).
+_r5_marker="$(mktemp -u /tmp/herdr-git-exec-r5-marker.XXXXXX)"
+_r5_scratch="$(mktemp -d)"
+( cd "$_r5_scratch" && git init -q && printf 'foo\n' > f && git add f &&
+  git -c user.email=x@x -c user.name=x commit -q -m x )
+_r5_pager="$(mktemp -u /tmp/herdr-git-exec-r5-pager.XXXXXX)"
+printf '#!/bin/sh\ntouch %s\ncat >/dev/null\n' "$_r5_marker" > "$_r5_pager"
+chmod +x "$_r5_pager"
+
+# item 1: eval hiding a GIT_PAGER assignment
+rm -f "$_r5_marker"
+_r5_eval_text="eval \"GIT_PAGER=$_r5_pager git log\""
+bash -c "cd $_r5_scratch && env -u GIT_PAGER -u PAGER script -q /dev/null bash -c '$_r5_eval_text' >/dev/null 2>&1"
+total=$((total + 1))
+if [ -f "$_r5_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: eval-hidden GIT_PAGER payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: eval-hidden GIT_PAGER payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "$_r5_eval_text")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+
+# item 2: a function definition hiding the same GIT_PAGER assignment
+rm -f "$_r5_marker"
+_r5_func_text="f() { GIT_PAGER=$_r5_pager git log; }; f"
+bash -c "cd $_r5_scratch && env -u GIT_PAGER -u PAGER script -q /dev/null bash -c '$_r5_func_text' >/dev/null 2>&1"
+total=$((total + 1))
+if [ -f "$_r5_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: function-hidden GIT_PAGER payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: function-hidden GIT_PAGER payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "$_r5_func_text")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -rf "$_r5_scratch"
+rm -f "$_r5_marker" "$_r5_pager"
+
+check "rule B: git clone -u (short --upload-pack) runs an arbitrary program" \
+  "git clone -u /tmp/pwned.sh src dst" escalate
+check "rule B: git fetch -u" "git fetch -u origin main" escalate
+check "rule B: git pull -u" "git pull -u origin main" escalate
+check "rule B: git ls-remote -u" "git ls-remote -u /tmp/pwned.sh" escalate
+check "rule B: git submodule -u" "git submodule update -u" escalate
+check "rule B: git archive --remote -u" "git archive --remote=origin -u HEAD" escalate
+check "rule B: git archive --remote --upload-pack (long form, pre-existing coverage, pinned)" \
+  "git archive --remote=origin --upload-pack=/tmp/pwned.sh HEAD" escalate
+check "rule B negative: -u means --set-upstream for push, not upload-pack" \
+  "git push -u origin fix/x" allow
+check "rule B negative: -u is unrelated for checkout" \
+  "git checkout -u some-branch" allow
+check "rule B negative: plain clone with no exec option stays allow" \
+  "git clone https://x/y dst" allow
+check "rule B negative: plain fetch stays allow" "git fetch origin main" allow
+check "rule B negative: plain pull stays allow" "git pull" allow
+check "rule B negative: plain ls-remote stays allow" "git ls-remote origin" allow
+check "rule B negative: plain submodule update stays allow" "git submodule update" allow
+check "rule B negative: archive --remote with no exec option stays allow" \
+  "git archive --remote=origin HEAD" allow
+
+echo
+echo "== classifier/shadow parity: one shared function, same verdict for every" \
+     "git row (Round 3) =="
+# lib/pretool-shadow.sh's `_ps_bash_handoffs_verdict` calls the exact same
+# `_cp_git_unsafe_tokens` this file's exec-opt rule uses (Round 2's parity
+# helper, redefined here since it unset itself after that section), fed
+# the tokens its own `_cp_locate_command_word` locator already produces —
+# so the quoting fix (F1), the launcher-chain fix (F2), and the
+# unknown-subcommand fix (F4) all land in both places from the ONE shared
+# function. The dashed-form (F5) and fan-out (F3) fixes are
+# classify_command-only: the shadow's OWN outer `_PS_HW_SAFE` allowlist
+# (lib/pretool-shadow.sh) already excludes `git-<verb>`/`xargs`/`parallel`
+# by name before `_cp_git_unsafe_tokens` is ever reached in that context,
+# so there is nothing to parity-check there.
+_cp_shadow_git_verdict() {              # cmd -> hit | safe | not-git
+  local cmd="$1"
+  local -a _r3_toks
+  set -f; read -r -a _r3_toks <<<"$cmd"; set +f
+  if ! _cp_locate_command_word "$cmd" || [ "$_cp_wcmd" != git ]; then
+    printf 'not-git\n'; return
+  fi
+  if [ "${_r3_toks[0]:-}" != git ]; then
+    printf 'hit\n'; return
+  fi
+  if _cp_git_unsafe_tokens "${_CP_LOC[@]:1}"; then printf 'hit\n'; else printf 'safe\n'; fi
+}
+_r3_parity_rows=(
+  'git log' 'git fetch origin main' 'git status' 'git x' 'git frobnicate'
+  'git branch -a' 'git merge-base HEAD main' 'git remote -v'
+  'GIT_PAGER=sh git log' 'GIT_PAGER=sh command git log'
+  'GIT_PAGER=sh nice git log' 'GIT_PAGER=sh FOO=bar git log'
+)
+for _r3_row in "${_r3_parity_rows[@]}"; do
+  total=$((total + 1))
+  _r3_cv="$(classify_command "$_r3_row")"
+  _r3_sv="$(_cp_shadow_git_verdict "$_r3_row")"
+  case "$_r3_cv:$_r3_sv" in
+    escalate:hit|allow:safe)
+      printf 'PASS  %-52s classifier=%-9s shadow=%s\n' "parity: $_r3_row" "$_r3_cv" "$_r3_sv" ;;
+    *)
+      printf 'FAIL  %-52s classifier=%-9s shadow=%s (must agree)\n' "parity: $_r3_row" "$_r3_cv" "$_r3_sv"
+      failed=$((failed + 1)) ;;
+  esac
+done
+unset -f _cp_shadow_git_verdict
+
+echo
+echo "== round 6 (herdr-control#254 PR comment): -c BODY recursion for the" \
+     "git/env/indirection gate, command-word expansion, and the" \
+     "eval/function/alias command-position false positives =="
+
+# Observed (round-5 review): classify_command's OWN quote-aware splitters
+# (_cp_git_exec_opt_invoked, the eval/function/alias indirection rule) treat
+# a `-c`/eval program string as one opaque blob instead of recursing into
+# it as fresh shell text — the download/run-file rules only LOOK like they
+# recurse, because scannable_command's global quote-strip flattens a `-c`
+# string into $norm for free. Rule C (_cp_shared_gate) fixes the structural
+# gap; rule D (_cp_gate_indirection_in_segment) fixes the false positives
+# the old whole-string regex had from matching DATA, not command position.
+
+check "rule C: bash -c hides a GIT_SSH_COMMAND + git ls-remote pair" \
+  'bash -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"' escalate
+check "rule C: sh -c, same payload" \
+  'sh -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"' escalate
+check "rule C: xargs wrapping sh -c" \
+  'echo h | xargs -I{} sh -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"' escalate
+check "rule C: find -exec wrapping sh -c, {} + terminator" \
+  'find . -exec sh -c "GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r" {} +' escalate
+check "rule C: a -c body built from a variable is dynamic, not literal (bash)" \
+  'body="GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"; bash -c "$body"' escalate
+check "rule C: a -c body built from a variable is dynamic, not literal (sh)" \
+  'body="GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r"; sh -c "$body"' escalate
+check "rule C: a static -c body with no git/env hazard still allows" \
+  "bash -c 'ls -la'" allow
+check "rule C negative: bash -c ls, acceptance-criteria shape" \
+  "bash -c ls" allow
+
+check "rule D: constructed eval via variable concatenation" \
+  'e=e; cmd=${e}val; "$cmd" "GIT_PAGER=x git log"' escalate
+check "rule D: constructed command name from two variables (shopt-shaped)" \
+  'x=sh; y=opt; $x$y -s expand_aliases' escalate
+check "rule D negative: a bare command substitution as data, not command word" \
+  'echo $(date +%s)' allow
+
+check "rule D false-positive fix: eval sitting in printf DATA, not command position" \
+  'printf "%s\n" "eval"' allow
+check "rule D false-positive fix: a function-def shape sitting in printf DATA" \
+  'printf "%s\n" "name() {"' allow
+check "rule D false-positive fix: eval as a git --format value, not a word" \
+  'git log --format=eval' allow
+check "rule D false-positive fix: a function-def shape as a git --format value" \
+  'git log --format="name() {"' allow
+
+# Acceptance checklist, item 1: classify in-process before asking.
+check "acceptance: ls -la allows" "ls -la" allow
+check "acceptance: git status allows" "git status" allow
+check "acceptance: bash -c ls allows" "bash -c ls" allow
+check "acceptance: eval ls escalates" "eval ls" escalate
+
+# Real negatives: both LIVE items from the PR comment actually run the
+# hidden payload, and classify_command escalates the identical text.
+_r6_marker="$(mktemp -u /tmp/herdr-git-exec-r6-marker.XXXXXX)"
+_r6_ssh="$(mktemp -u /tmp/herdr-git-exec-r6-ssh.XXXXXX)"
+printf '#!/bin/sh\ntouch %s\nexit 1\n' "$_r6_marker" > "$_r6_ssh"
+chmod +x "$_r6_ssh"
+
+# item 1 (LIVE): bash -c hiding a GIT_SSH_COMMAND + git ls-remote pair.
+rm -f "$_r6_marker"
+_r6_body="GIT_SSH_COMMAND=$_r6_ssh git ls-remote ssh://herdr-control-r6-nonexistent-host/r.git"
+_r6_text="bash -c \"$_r6_body\""
+eval "$_r6_text" >/dev/null 2>&1
+total=$((total + 1))
+if [ -f "$_r6_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: bash -c GIT_SSH_COMMAND payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: bash -c GIT_SSH_COMMAND payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "$_r6_text")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -f "$_r6_marker" "$_r6_ssh"
+
+# item 2 (LIVE): constructed eval via variable concatenation.
+_r6_eval_marker="$(mktemp -u /tmp/herdr-git-exec-r6-eval-marker.XXXXXX)"
+rm -f "$_r6_eval_marker"
+_r6_eval_text="e=e; cmd=\${e}val; \"\$cmd\" \"touch $_r6_eval_marker\""
+bash -c "$_r6_eval_text" >/dev/null 2>&1
+total=$((total + 1))
+if [ -f "$_r6_eval_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: constructed-eval payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: constructed-eval payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "$_r6_eval_text")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -f "$_r6_eval_marker"
+
+echo
+echo "== round 7 (herdr-control#254 PR comment): stop parsing — match" \
+     "exec-capable NAMES anywhere in the text =="
+
+# Baseline: plain read-only git and the false-positive controls stay allow.
+check "r7 baseline: git log" "git log" allow
+check "r7 baseline: git status" "git status" allow
+check "r7 baseline: git log --oneline" "git log --oneline" allow
+check "r7 baseline: bash -c ls" "bash -c ls" allow
+check "r7 baseline: ls -la" "ls -la" allow
+check "r7 baseline: printf eval (data, not a name)" "printf \"%s\\n\" \"eval\"" allow
+check "r7 baseline: git log --format=eval" "git log --format=eval" allow
+
+# D1 — bash -c flag spellings the old extractor's exact \`-c\` token match missed.
+check "r7 D1: su -c" "su root -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: perl -e system" "perl -e \"system q(GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r)\"" escalate
+check "r7 D1: osascript do shell script" "osascript -e 'do shell script \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"'" escalate
+check "r7 D1: bash -o posix -c" "bash -o posix -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: bash -O extglob -c" "bash -O extglob -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: bash +e -c" "bash +e -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: bash -c -e" "bash -c -e \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: bash -c --" "bash -c -- \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: find decoy then bash -c" "find . -exec sh -c true \\; -exec bash -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\" \\;" escalate
+check "r7 D1: xargs -0 bash -c (body from stdin)" "printf \"%s\" \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\" | xargs -0 bash -c" escalate
+check "r7 D1: tcsh -c setenv" "tcsh -c \"setenv GIT_SSH_COMMAND /tmp/x; git ls-remote ssh://h/r\"" escalate
+check "r7 D1: csh -c setenv" "csh -c \"setenv GIT_SSH_COMMAND /tmp/x; git ls-remote ssh://h/r\"" escalate
+check "r7 D1: fish -c" "fish -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: renamed bash copy" "cp /bin/bash tmp/q; tmp/q -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D1: BASH_ENV prefix on bash -c" "BASH_ENV=tmp/evil.sh bash -c \"git status\"" escalate
+
+# D2 — stdin / here-string / heredoc shells (no \`-c\` at all).
+check "r7 D2: bash <<< BODY" "bash <<< \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D2: bash /dev/stdin <<< BODY" "bash /dev/stdin <<< \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D2: bash <(printf BODY)" "bash <(printf \"%s\" \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\")" escalate
+check "r7 D2: . <(printf BODY)" ". <(printf \"%s\" \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\")" escalate
+check "r7 D2: printf BODY | /bin/sh" "printf \"%s\\n\" \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\" | /bin/sh" escalate
+check "r7 D2: printf BODY | command bash" "printf \"%s\\n\" \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\" | command bash" escalate
+check "r7 D2: parallel ::: BODY" "parallel ::: \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+
+# D3 — command-word spellings no parser resolves to a literal name.
+check "r7 D3: ANSI-C git word" "\$'\\x67it' -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D3: ANSI-C eval word" "\$'\\x65val' \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D3: ANSI-C bash word -c" "\$'\\x62ash' -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D3: brace {git,}" "{git,} -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D3: brace one-word argv" "{git,-c,core.sshCommand=/tmp/x,ls-remote,ssh://h/r}" escalate
+check "r7 D3: brace {eval,}" "{eval,} \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"" escalate
+check "r7 D3: glob /usr/bin/gi[t]" "/usr/bin/gi[t] -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D3: glob /usr/bin/gi?" "/usr/bin/gi? -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+
+# D4 — command/process substitution bodies at depth 0.
+check "r7 D4: \$(git -c ...)" "echo \"\$(git -c core.sshCommand=/tmp/x ls-remote ssh://h/r)\"" escalate
+check "r7 D4: backtick git -c" "echo \`git -c core.sshCommand=/tmp/x ls-remote ssh://h/r\`" escalate
+check "r7 D4: \$(GIT_SSH_COMMAND= git)" "x=\$(GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r)" escalate
+check "r7 D4: \$(bash -c ...)" "echo \"\$(bash -c \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\")\"" escalate
+
+# D5 — wrappers not on the \`-c\`-body launcher list.
+check "r7 D5: find -exec git -c" "find . -maxdepth 0 -exec git -c core.sshCommand=/tmp/x ls-remote ssh://h/r \\;" escalate
+check "r7 D5: script -q /dev/null git -c" "script -q /dev/null git -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D5: arch -arm64 git -c" "arch -arm64 git -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D5: xcrun git -c" "xcrun git -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D5: watch git -c" "watch git -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+check "r7 D5: flock git -c" "flock /tmp/l git -c core.sshCommand=/tmp/x ls-remote ssh://h/r" escalate
+
+# D6 — env-var / shell-state vectors not on the old prefix list (the subset
+# that carries one of this round's NAMEs — HOME/XDG_CONFIG_HOME/PATH and
+# \`hash -p\` carry no name at all and stay a documented residual gap below).
+check "r7 D6: LESSOPEN same-segment prefix" "LESSOPEN=\"|-tmp/x %s\" git log" escalate
+check "r7 D6: DYLD_INSERT_LIBRARIES prefix" "DYLD_INSERT_LIBRARIES=tmp/x.dylib git log" escalate
+check "r7 D6: set -a; read GIT_SSH_COMMAND" "set -a; read -r GIT_SSH_COMMAND <<< /tmp/x; git ls-remote ssh://h/r" escalate
+check "r7 D6: set -a; printf -v GIT_SSH_COMMAND" "set -a; printf -v GIT_SSH_COMMAND %s /tmp/x; git ls-remote ssh://h/r" escalate
+check "r7 D6: set -a; for GIT_SSH_COMMAND in" "set -a; for GIT_SSH_COMMAND in /tmp/x; do git ls-remote ssh://h/r; done" escalate
+check "r7 D6: set -a; : \${GIT_SSH_COMMAND:=}" "set -a; : \"\${GIT_SSH_COMMAND:=/tmp/x}\"; git ls-remote ssh://h/r" escalate
+check "r7 D6: set -k trailing assignment" "set -k; git ls-remote ssh://h/r GIT_SSH_COMMAND=/tmp/x" escalate
+check "r7 D6: f() ( local -x ) subshell body" "f() ( local -x GIT_SSH_COMMAND=/tmp/x; git ls-remote ssh://h/r ); f" escalate
+check "r7 D6: f() if ... local -x" "f() if true; then local -x GIT_SSH_COMMAND=/tmp/x; git ls-remote ssh://h/r; fi; f" escalate
+check "r7 D6: shopt -qs + BASH_ALIASES" "shopt -qs expand_aliases
+BASH_ALIASES[g]=\"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"
+g" escalate
+check "r7 D6: set -o posix + BASH_ALIASES" "set -o posix
+BASH_ALIASES[g]=\"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\"
+g" escalate
+check "r7 D6: trap string EXIT" "trap \"GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r\" EXIT" escalate
+check "r7 D6: PS4 \$() + set -x" "PS4='\$(GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r)'; set -x; true" escalate
+check "r7 D6: arith a[\$()] in variable" "x='a[\$(GIT_SSH_COMMAND=/tmp/x git ls-remote ssh://h/r)]'; (( x ))" escalate
+
+# Round 8 (herdr-control#254 PR comment, round-7 item A ceiling closed):
+# HOME=/XDG_CONFIG_HOME=/PATH= assigned ahead of a git invocation, and
+# `hash -p` remapping the git command word, now escalate (ASSIGNMENT-
+# shaped match for the first three, command-position indirection for
+# `hash -p` — neither is the text-anywhere name gate, so an ordinary
+# read of any of these stays allowed, proven by the allow rows below).
+check "r8 item A: HOME= prefix ahead of git" "HOME=tmp/h git ls-remote ssh://h/r" escalate
+check "r8 item A: export HOME=; git ..." "export HOME=tmp/h; git ls-remote ssh://h/r" escalate
+check "r8 item A: XDG_CONFIG_HOME= prefix ahead of git" "XDG_CONFIG_HOME=tmp/x git log" escalate
+check "r8 item A: PATH= prefix shadowing ssh" "PATH=tmp/bin:/usr/bin:/bin git ls-remote ssh://h/r" escalate
+check "r8 item A: hash -p remaps git" "hash -p /tmp/x git; git status" escalate
+
+# Round 8 item B (round-7 item B ceiling closed): the option/subcommand
+# allowlist (`_cp_git_exec_opts`/`_cp_git_unsafe_tokens`) extended to
+# cover every exec-capable git shape round 7 left open.
+check "r8 item B: git clone --template" "git clone --template=/tmp/tpl src dst" escalate
+check "r8 item B: git init --template" "git init --template=/tmp/tpl dir" escalate
+check "r8 item B: git difftool -x" "git difftool -y -x /tmp/x HEAD~1" escalate
+check "r8 item B: git difftool --extcmd" "git difftool --extcmd=/tmp/x HEAD~1" escalate
+check "r8 item B: git rebase -x" "git rebase -x /tmp/x HEAD~1" escalate
+check "r8 item B: git rebase --exec" "git rebase --exec=/tmp/x HEAD~1" escalate
+check "r8 item B: git submodule foreach" "git submodule foreach /tmp/x" escalate
+check "r8 item B: git bisect run" "git bisect run /tmp/x" escalate
+check "r8 item B: git filter-branch --tree-filter" "git filter-branch --tree-filter /tmp/x HEAD" escalate
+check "r8 item B: git filter-branch --index-filter" "git filter-branch --index-filter /tmp/x HEAD" escalate
+check "r8 item B: git send-email --sendmail-cmd" "git send-email --sendmail-cmd=/tmp/x --to=a@b m.patch" escalate
+check "r8 item B: git send-email --smtp-server=/path" "git send-email --smtp-server=/tmp/x --to=a@b m.patch" escalate
+check "r8 item B: git mergetool always escalates" "git mergetool" escalate
+
+# Round 8 negatives: the reads/plain verbs that must stay allowed — the
+# whole point of items A/B being assignment-/option-shaped instead of a
+# bare text-anywhere match.
+check "r8 negative: echo \$HOME is a read, not an assignment" "echo \$HOME" allow
+check "r8 negative: \"\$HOME/Code\" is a read" "ls \"\$HOME/Code\"" allow
+check "r8 negative: plain git rebase main" "git rebase main" allow
+check "r8 negative: plain git submodule update --init" "git submodule update --init" allow
+
+# item 2 — opaque words are a general hole, not git-specific: trunk already
+# ALLOWS brace expansion on a non-git command (\`{curl,-X,POST,url}\`), and
+# an ANSI-C word can spell any command name from escapes.
+check "r7 item2: brace on a non-git command" "{curl,-X,POST,url}" escalate
+check "r7 item2: ANSI-C word on a non-git command" "\$'\\x63url' -X POST url" escalate
+check "r7 item2 false-positive fix: a quoted brace is not opaque" "echo \"{a,b}\"" allow
+
+# Real negative: bash -o posix -c is a round-6 D1 shape the old \`-c\`
+# extractor's exact-token match missed (it requires the cluster to be
+# exactly \`-c\`/\`-lc\`/…, not a separate \`-o posix\` flag before it) —
+# actually running it proves the payload executes, and the identical text
+# now escalates.
+_r7_marker="$(mktemp -u /tmp/herdr-git-exec-r7-marker.XXXXXX)"
+_r7_ssh="$(mktemp -u /tmp/herdr-git-exec-r7-ssh.XXXXXX)"
+printf '#!/bin/sh\ntouch %s\nexit 1\n' "$_r7_marker" > "$_r7_ssh"
+chmod +x "$_r7_ssh"
+rm -f "$_r7_marker"
+_r7_body="GIT_SSH_COMMAND=$_r7_ssh git ls-remote ssh://herdr-control-r7-nonexistent-host/r.git"
+_r7_text="bash -o posix -c \"$_r7_body\""
+eval "$_r7_text" >/dev/null 2>&1
+total=$((total + 1))
+if [ -f "$_r7_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: bash -o posix -c GIT_SSH_COMMAND payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: bash -o posix -c GIT_SSH_COMMAND payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "$_r7_text")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -f "$_r7_marker" "$_r7_ssh"
+
+# Acceptance checklist, item 1: classify in-process before asking.
+check "r7 acceptance: ls -la allows" "ls -la" allow
+check "r7 acceptance: git status allows" "git status" allow
+check "r7 acceptance: git log --oneline allows" "git log --oneline" allow
+check "r7 acceptance: bash -c ls allows" "bash -c ls" allow
+check "r8 acceptance: ls \$HOME allows" "ls \$HOME" allow
+
+echo
+echo "== round 9 (herdr-control#254 PR comment, round-8 review): three class"
+echo "   rules closing the 19 round-8 probe failures =="
+
+# Class A (SPEC item A): a runtime-BUILT variable NAME handed to an
+# assignment builtin. All 6 round-8 probe failures for this class.
+check "r9 A1: runtime split env name (printf -v concat, then export \"\$n=...\")" \
+  'g="GIT_"; s="PA"; t="GER"; printf -v n "%s%s%s" "$g" "$s" "$t"; export "$n=/tmp/x"; git log' escalate
+check "r9 A2: hex printf env name" \
+  'n="$(printf "\x47\x49\x54\x5f\x50\x41\x47\x45\x52")"; export "$n=/tmp/x"; git log' escalate
+check "r9 A3: base64 env name" \
+  'n="$(printf R0lUX1BBR0VS | base64 -D)"; export "$n=/tmp/x"; git log' escalate
+check "r9 A4: reverse env name" \
+  'n="$(printf REGAP_TIG | rev)"; export "$n=/tmp/x"; git log' escalate
+check "r9 A5: tr env name" \
+  'n="$(printf GIT_XAGER | tr X P)"; export "$n=/tmp/x"; git log' escalate
+check "r9 A6: indirect prefix expansion (\${!prefix@})" \
+  'prefix=GIT_; for n in ${!prefix@}; do export "$n=/tmp/x"; done; git log' escalate
+
+# Class A negatives: a literal name is unaffected.
+check "r9 A negative: export with a literal name" "export FOO=bar" allow
+check "r9 A negative: export PATH_SUFFIX=x (not a real PATH write)" "export PATH_SUFFIX=x" allow
+
+# Class B (SPEC item B): writing git config by any route.
+# B.1: `git config` itself — any shape beyond a pure read.
+check "r9 B1: config key read from a file, two positionals" \
+  'git config "$(cat tmp/keyfile)" /tmp/x; git log' escalate
+check "r9 B4: git config gpg.program" "git config gpg.program /tmp/x" escalate
+check "r9 B5: git config gpg.ssh.program" "git config gpg.ssh.program /tmp/x" escalate
+check "r9 B6: git config core.askPass" "git config core.askPass /tmp/x" escalate
+check "r9 B7: git config mergetool cmd" "git config mergetool.foo.cmd /tmp/x" escalate
+check "r9 B8: git config difftool cmd" "git config difftool.foo.cmd /tmp/x" escalate
+check "r9 B9: git config merge driver" "git config merge.foo.driver /tmp/x" escalate
+check "r9 B10: git config sendemail cmd" "git config sendemail.sendmailCmd /tmp/x" escalate
+check "r9 B11: git config submodule update" 'git config submodule.foo.update !/tmp/x' escalate
+# B.2: writing the file directly, bypassing `git config` entirely.
+check "r9 B2: cat redirect into .git/config" \
+  'cat tmp/cfg > .git/config; git log' escalate
+check "r9 B3: cp into .git/config" \
+  'cp tmp/cfg-ssh .git/config; git log' escalate
+
+# Class B negatives: every pure-read shape the review's own allow list named.
+check "r9 B negative: git config --get user.name" "git config --get user.name" allow
+check "r9 B negative: git config -l" "git config -l" allow
+check "r9 B negative: git config user.email (bare key, a read)" "git config user.email" allow
+
+# Class C (SPEC item C): commit -S / tag -s stay allowed — B above already
+# closes the route that would let an agent command set gpg.program; the
+# ceiling comment (lib/command-policy.sh, just above _cp_git_unsafe_tokens)
+# names the residual risk (a repo's PRE-EXISTING config) and the upgrade path.
+check "r9 C1: git commit -S stays allow (ceiling noted, not closed this round)" "git commit -S" allow
+check "r9 C2: git tag -s stays allow (ceiling noted, not closed this round)" "git tag -s v1" allow
+
+echo
+echo "== round 10 (herdr-control#254 PR comment, round-9 review): two" \
+     "classes closing the 4 real round-9 probe failures =="
+
+# Item 1 (SPEC): declare/local/typeset -n nameref, any target, escalates
+# unconditionally (ceiling noted in lib/command-policy.sh above
+# _cp_nameref_present). Probe #171's exact shape.
+check "r10 nameref: declare -n ref=\"\$n\" (runtime-built target)" \
+  'n="$(printf "\x47\x49\x54\x5f\x50\x41\x47\x45\x52")"; declare -n ref="$n"; export ref; ref=/tmp/x; git log' escalate
+check "r10 nameref negative: declare -a arr=(1 2) (no -n flag)" "declare -a arr=(1 2)" allow
+
+# Item 2 (SPEC): ln/ln -s SOURCE under .git/ or at .gitconfig. Probes
+# #176-178.
+check "r10 ln B1: hardlink .git/config out, then write the hardlink" \
+  'ln ".git/config" "/tmp/herdr-r10-hardlink-target"; printf "[core]\nsshCommand = /tmp/x\n" > "/tmp/herdr-r10-hardlink-target"; git log' escalate
+check "r10 ln B2: symlink .git/config out, then write through the symlink" \
+  'ln -s ".git/config" "/tmp/herdr-r10-symlink-target"; printf "[core]\nsshCommand = /tmp/x\n" > "/tmp/herdr-r10-symlink-target"; git log' escalate
+check "r10 ln B3: relative hardlink, no quotes, common agent shape" \
+  'ln .git/config /tmp/cfgcopy; echo "[core]" > /tmp/cfgcopy; echo "pager = /tmp/x" >> /tmp/cfgcopy; git log' escalate
+check "r10 ln negative: ln -s ../shared lib/shared (source outside .git/)" \
+  "ln -s ../shared lib/shared" allow
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

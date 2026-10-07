@@ -324,6 +324,20 @@ _PS_HW_SAFE=' cat head tail wc ls grep egrep fgrep rg find echo printf tee pwd s
  shasum sha256sum mkdir touch git '
 _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an allow
   local cmd="$1" cwd="$2" hw="$3" wt wt_abs line kind val seg root a targets
+  # Round 7 (herdr-control#254 PR comment): the SAME shared text-anywhere
+  # gate classify_command's peer_decide path now runs FIRST
+  # (`_cp_exec_name_or_opaque_present`, lib/command-policy.sh) — called
+  # directly here too, not only inherited through peer_decide, so this
+  # tighten-only check cannot itself be the reason a handoffs-restricted
+  # task's own narrower per-segment walk below (which only recognizes
+  # `git`/`git-*` as the command word, not an arbitrary launcher chain or
+  # heredoc/here-string hiding it) misses the same shapes round 6's
+  # review found.
+  if _cp_exec_name_or_opaque_present "$cmd"; then
+    PS_VERDICT=escalate PS_POLICY=handoffs-write
+    PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; the command text carries an exec-capable variable NAME, git config KEY, unquoted brace-expansion word, or \$'…' ANSI-C word — a conductor must review it"
+    return
+  fi
   wt="$(printf '%s' "$PS_TASK_JSON" | jq -r '.worktree // empty' 2>/dev/null)"
   if [ -z "$wt" ]; then
     PS_VERDICT=escalate PS_POLICY=handoffs-write PS_REASON="worker worktree unknown — cannot judge this task's bash write scope"; return
@@ -365,15 +379,30 @@ _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an
         return ;;
     esac
     # find/git are reads only without their own writing/exec options.
+    # git calls the SAME shared allowlist function
+    # lib/command-policy.sh's top-level exec-opt escalation rule uses
+    # (`_cp_git_unsafe_tokens`) instead of keeping its own duplicate glob
+    # list here: the old `git:-[!-]*[oCc]*`/`git:-O*`/
+    # `git:--open-files-in-pager*`/`git:-c*`/`git:--config-env*` globs
+    # matched a lowercase o/C/c anywhere in a short-option cluster but
+    # missed `-C`, `--git-dir`, `--work-tree`, the attached short form
+    # `-ccore.pager=...`, and grep's `--open-files-in-pag=...`
+    # abbreviation — one shared function so classifier and shadow cannot
+    # disagree again.
     for a in "${_CP_LOC[@]:1}"; do
       case "$_cp_wcmd:$a" in
-        find:-exec*|find:-ok*|find:-delete|find:-fprint*|find:-fls|rg:--pre*|git:-[!-]*[oCc]*|git:--output*|git:--exec-path*|git:--ext-diff|git:--textconv)
+        find:-exec*|find:-ok*|find:-delete|find:-fprint*|find:-fls|rg:--pre*)
           PS_VERDICT=escalate PS_POLICY=handoffs-write
           PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '$_cp_wcmd $a' can write or run code — a conductor must review it"
           return ;;
       esac
     done
     if [ "$_cp_wcmd" = git ]; then
+      if _cp_git_unsafe_tokens "${_CP_LOC[@]:1}"; then
+        PS_VERDICT=escalate PS_POLICY=handoffs-write
+        PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; 'git ${_CP_LOC[*]:1}' can write or run code — a conductor must review it"
+        return
+      fi
       case " ${_CP_LOC[1]:-} " in
         " log "|" show "|" diff "|" status "|" grep "|" ls-files "|" rev-parse "|" blame "|" cat-file "|" ls-tree "|" describe "|" shortlog ") ;;
         *)
@@ -483,8 +512,16 @@ pretool_decide() {                      # payload-json -> sets PS_* ; 0 allow, 8
           PS_VERDICT=escalate PS_REASON="the call sets service environment variables, which the command policy does not judge"
         fi
         # F3: a write-restricted (handoffs_write) task's bash is narrowed
-        # the same way its write tool is; this can only tighten an allow.
-        if [ "$PS_VERDICT" = allow ] && [ -n "$hw" ]; then
+        # the same way its write tool is; this can only tighten an allow —
+        # or, when the top-level command-policy verdict already escalated
+        # (e.g. the git -O/-c/--config-env/env-prefix exec-option rule,
+        # which applies to every task, not just a handoffs_write one), swap
+        # in the more specific "restricts writes to .handoffs/$hw only"
+        # reason instead of the generic one. _ps_bash_handoffs_verdict never
+        # sets `allow` itself (see its own header), so running it on an
+        # already-escalated verdict can only leave that escalation in place
+        # or escalate further — never loosen it.
+        if [ -n "$hw" ] && { [ "$PS_VERDICT" = allow ] || [ "$PS_VERDICT" = escalate ]; }; then
           # omp runs bash in input.cwd (relative to the session cwd) or the session cwd.
           op="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
           cmd="$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null)"
