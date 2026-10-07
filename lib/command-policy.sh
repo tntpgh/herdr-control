@@ -2614,8 +2614,13 @@ _cp_git_unsafe_tokens() {               # token... (everything after the git wor
         *) verb="$tok"; continue ;;
       esac
     fi
+    # Round 4 (herdr-control#254 F2): git bundles short options, so
+    # `-nO/bin/true`/`-iO…`/`-wO…` are `-n -O …`/`-i -O …`/`-w -O …` — the
+    # old `-O*` only caught O as the FIRST char of the cluster. Any
+    # single-dash cluster containing O anywhere is now caught too; `--o*`
+    # (long-option abbreviations of `--open-files-in-pager`) is unchanged.
     if [ "$verb" = grep ]; then
-      case "$tok" in -O*|--o*) return 0 ;; esac
+      case "$tok" in -O*|-[!-]*O*|--o*) return 0 ;; esac
     fi
     case "$tok" in
       -o*) return 0 ;;
@@ -2685,6 +2690,65 @@ _cp_git_seg_exec_unsafe() {             # protected-segment
   esac
 }
 
+# Round 4 (herdr-control#254, rule A — "stop enumerating; make the rules
+# structural"): the variables that can run arbitrary code THROUGH git
+# itself once set in the environment — a pager/editor/filter/credential-
+# helper launcher, or (GIT_CONFIG_COUNT/KEY_n/VALUE_n) a fabricated repo
+# config entry for one of those same launchers. `LESSOPEN`/`LESSCLOSE`
+# (git's default pager is `less`, which runs them), `BASH_ENV`/`ENV`
+# (sourced by non-interactive bash/sh before the first command),
+# `PROMPT_COMMAND` (run before every prompt a pager/pty might print), and
+# `LD_*`/`DYLD_*` (dynamic-linker preload) are exec-capable the same way.
+_CP_EXEC_VAR_RE='^(GIT_[A-Za-z0-9_]*|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH_ENV|ENV|PROMPT_COMMAND|LD_[A-Za-z0-9_]*|DYLD_[A-Za-z0-9_]*)$'
+
+# `_cp_exec_var_stmt_kind <protected-statement>` -> prints one of
+# "execvar"/"source"/"git"/"" describing what this ONE statement (already
+# split on `;&|()<>` and backtick, same as every other per-segment check
+# in this file) is, for the whole-command scan below. Reuses
+# `_cp_locate_command_word` rather than re-walking tokens a second way:
+#   * a statement that resolves to NO command word at all (every token
+#     consumed as an `NAME=value` prefix, or walked past as a launcher's
+#     own `NAME=value` option value — `_cp_locate_command_word` already
+#     collects both into `_CP_LOC_SKIPPED`) is a bare assignment statement
+#     with nothing following it to apply to in THIS statement — exactly
+#     the `export GIT_PAGER=x` (no command) / bare `GIT_PAGER=x` (own
+#     statement) / `env GIT_PAGER=x` (no command) shapes;
+#   * a statement whose resolved command word IS `export`/`declare`/
+#     `typeset`/`readonly` has every non-flag argument checked the same
+#     way — these are never on `_cp_locate_command_word`'s launcher list,
+#     so they surface as the command word itself, with their arguments in
+#     `_CP_LOC`;
+#   * `source`/`.` is reported separately (not "execvar") since it only
+#     matters ordered strictly BEFORE a git statement — the caller tracks
+#     that ordering itself;
+#   * `git`/`git-*` is reported so the caller knows this statement needs
+#     the exec-var/source check to matter at all.
+_cp_exec_var_stmt_kind() {              # protected-segment -> prints execvar|source|git|""
+  local LC_ALL=C LANG=C
+  local seg="$1" tok name
+  if ! _cp_locate_command_word "$seg"; then
+    for tok in ${_CP_LOC_SKIPPED[@]+"${_CP_LOC_SKIPPED[@]}"}; do
+      name="${tok%%=*}"
+      if [[ "$name" =~ $_CP_EXEC_VAR_RE ]]; then printf 'execvar'; return 0; fi
+    done
+    printf ''; return 1
+  fi
+  case "$_cp_wcmd" in
+    export|declare|typeset|readonly)
+      for tok in ${_CP_LOC[@]+"${_CP_LOC[@]}"}; do
+        case "$tok" in -*) continue ;; esac
+        name="${tok%%=*}"
+        if [[ "$name" =~ $_CP_EXEC_VAR_RE ]]; then printf 'execvar'; return 0; fi
+      done
+      printf ''; return 1 ;;
+    source|.)
+      printf 'source'; return 0 ;;
+    git|git-*)
+      printf 'git'; return 0 ;;
+    *) printf ''; return 1 ;;
+  esac
+}
+
 # `_cp_git_exec_opt_invoked <raw>` -> 0 (true) when RAW invokes git in any
 # shape `_cp_git_seg_exec_unsafe` disqualifies. Preprocessing joins a
 # backslash-newline continuation (real shell behaviour) and then runs
@@ -2701,6 +2765,20 @@ _cp_git_seg_exec_unsafe() {             # protected-segment
 # Segmented on shell operators including `<`/`>` (same as
 # `_cp_git_push_invoked`) so a quoted option value containing its own
 # redirect cannot hide the option in a later segment.
+#
+# Round 4 (herdr-control#254, rule A): a FIRST pass over every statement,
+# order-independent for the exec-var/git pairing (the var escalates the
+# whole command "regardless of what follows" — SPEC's words; a worker
+# cannot be trusted to have left a LATER statement's assignment inert)
+# but order-SENSITIVE for `source`/`.` ("before git" — SPEC's words: a
+# sourced file loaded AFTER the git invocation already ran cannot have
+# affected it). `export GIT_PAGER=/bin/true; git log` (`;` or a real
+# newline — `read -r` on the here-string already splits on either), the
+# GIT_SSH_COMMAND and GIT_CONFIG_COUNT/KEY_0/VALUE_0 shapes from the same
+# probe, and `. ./evil.sh; git log` are a SEPARATE EARLIER statement, so
+# none of them ever reached `_cp_git_seg_exec_unsafe`'s same-segment
+# `_CP_LOC_SKIPPED` walk at all — this pass closes that gap structurally
+# instead of enumerating each shape.
 _cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git fails the read-only shape
   local LC_ALL=C LANG=C
   local raw="$1" pre protected seg
@@ -2708,6 +2786,21 @@ _cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git fails the read-
   pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
   protected="$(_cp_protect_text "$pre")"
   protected="$(printf '%s' "$protected" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
+
+  local _cp_geo_execvar=0 _cp_geo_git=0 _cp_geo_source=0 _cp_geo_kind
+  while IFS= read -r seg; do
+    [ -n "${seg//[[:space:]]/}" ] || continue
+    _cp_geo_kind="$(_cp_exec_var_stmt_kind "$seg")"
+    case "$_cp_geo_kind" in
+      execvar) _cp_geo_execvar=1 ;;
+      source) _cp_geo_source=1 ;;
+      git) _cp_geo_git=1; [ "$_cp_geo_source" = 1 ] && _cp_geo_execvar=1 ;;
+    esac
+  done <<EOF
+$(printf '%s' "$protected" | sed -E 's/[;&|()`<>]/\n/g')
+EOF
+  [ "$_cp_geo_execvar" = 1 ] && [ "$_cp_geo_git" = 1 ] && return 0
+
   while IFS= read -r seg; do
     [ -n "${seg//[[:space:]]/}" ] || continue
     _cp_git_seg_exec_unsafe "$seg" && return 0
@@ -4222,6 +4315,22 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   { _cp_git_push_invoked "$raw" &&
     _cp_match '(^|[[:space:]])(-[A-Za-z]*f[A-Za-z]*|--force(-with-lease)?)([[:space:]]|$)' "$norm"; } &&
     _cp_consider 1 "git push --force/-f rewrites remote history"
+
+  # escalate — round 4 (herdr-control#254 observed F1): the --force rule
+  # just above is the ONLY general git-push check classify_command itself
+  # ever ran — conductor_reserved_reason's own, separate `_cp_push_is_safe`
+  # allowlist (type/slug branches only) was never consulted here, so
+  # `git-push origin main` (and plain `git push origin main`, with no
+  # --force at all) classified `allow` by THIS function even though
+  # herdr-select.sh's conductor/peer paths separately call
+  # conductor_reserved_reason too and would have refused it there — a
+  # caller that trusts classify_command's own verdict alone had no such
+  # second layer. Shares the same `_cp_push_is_safe`/
+  # `_cp_git_push_invoked` conductor_reserved_reason uses, so the two
+  # cannot drift: a push is allow-class here ONLY when the target is the
+  # exact `git push [-u|--set-upstream] origin type/slug` shape.
+  { _cp_git_push_invoked "$raw" && ! _cp_push_is_safe "$norm"; } &&
+    _cp_consider 1 "git push target is not on the safe branch allowlist"
 
   # escalate — a git invocation whose shape fails the narrow ALLOWLIST
   # `_cp_git_unsafe_tokens`/`_cp_git_exec_opt_invoked` require for a

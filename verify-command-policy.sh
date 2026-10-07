@@ -2282,6 +2282,110 @@ rm -rf "$_r3_scratch"
 rm -f "$_r3_marker"
 
 echo
+echo "== round 4 (herdr-control#254): close the three live probe bypasses =="
+# F1: classify_command's ONLY general git-push check was the --force rule
+# above — a plain `git push origin main` (no --force at all) classified
+# `allow` by classify_command even though conductor_reserved_reason
+# separately reserves it; round 3's H3 fix only taught
+# `_cp_git_push_invoked` to recognize the dashed binary form, it never
+# taught classify_command to CONSULT that recognition for anything but
+# --force. Confirmed live via a mktemp-sandbox probe comment on PR #254.
+check "F1: bare dashed push to main, no --force"   "git-push origin main"    escalate
+check "F1: plain git push to main, no --force"     "git push origin main"    escalate
+check "F1: dashed push, even to a safe branch, escalates (no space => never matches the safe shape, same as conductor_reserved_reason's existing behaviour)" \
+  "git-push origin fix/x" escalate
+check "F1: plain push to a safe branch stays allow"  "git push origin fix/x" allow
+
+# F2: git bundles short options, so `-O` need not be the first flag char
+# in its cluster — `-nO<cmd>` is `-n -O<cmd>`.
+check "F2: git grep -nO bundled short opts" "git grep -nO/bin/true -e foo" escalate
+check "F2: git grep -iO bundled short opts" "git grep -iO/bin/true -e foo" escalate
+check "F2: git grep -wO bundled short opts" "git grep -wO/bin/true -e foo" escalate
+check "F2 negative: git grep -n without O stays allow" \
+  "git grep -n foo -- README.md" allow
+
+# F3 (rule A): the exec-capable var lives in an EARLIER STATEMENT, not a
+# same-segment prefix `_CP_LOC_SKIPPED` can see.
+check "F3: export GIT_PAGER, separate statement (;)" \
+  'export GIT_PAGER=/bin/true; git log' escalate
+check "F3: export GIT_PAGER, separate statement (newline)" \
+  "$(printf 'export GIT_PAGER=/bin/true\ngit log')" escalate
+check "F3: export GIT_SSH_COMMAND, separate statement" \
+  'export GIT_SSH_COMMAND=/bin/true; git fetch origin main' escalate
+check "F3: GIT_CONFIG_COUNT/KEY_0/VALUE_0 fsmonitor, separate statement" \
+  'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=/bin/true; git status' escalate
+check "F3: bare GIT_PAGER assignment as its own statement (no export)" \
+  'GIT_PAGER=/bin/true; git log' escalate
+check "F3: source a file before git" \
+  '. /tmp/herdr-r4-evil.sh; git log' escalate
+check "F3 negative: unrelated export before git stays allow" \
+  'export FOO=bar; git log' allow
+check "F3 negative: plain git log stays allow" "git log" allow
+check "F3 negative: plain git status stays allow" "git status" allow
+
+# Real negative (F2): run the LITERAL bundled-short-opt payload through
+# real git in a scratch repo and confirm the marker DOES land. git grep
+# -O only opens a file (running the pager command at all) when (a) stdout
+# is a TTY — `script -q /dev/null` provides one — AND (b) there is at
+# least one matching line to open, so the scratch repo needs a tracked
+# file whose content the `-e` pattern actually matches. Mirrors the
+# already-proven F3 (`--open-files-in-pag=`) real negative below exactly
+# — same scratch-repo shape, same bare `-e foo` with no `--` pathspec —
+# with only the one variable this round actually tests added: the `-n`
+# bundled onto the SAME short-option cluster as `-O`.
+_r4_marker="$(mktemp -u /tmp/herdr-git-exec-r4-marker.XXXXXX)"
+_r4_scratch="$(mktemp -d)"
+( cd "$_r4_scratch" && git init -q && printf 'foo\n' > f && git add f &&
+  git -c user.email=x@x -c user.name=x commit -q -m x )
+rm -f "$_r4_marker"
+_r4_cmd="(cd $_r4_scratch && env -u GIT_PAGER -u PAGER script -q /dev/null git grep -nO\"touch $_r4_marker\" -e foo >/dev/null 2>&1)"
+bash -c "$_r4_cmd"
+total=$((total + 1))
+if [ -f "$_r4_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: bundled grep -nO payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: bundled grep -nO payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "git grep -nO\"touch $_r4_marker\" -e foo")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -rf "$_r4_scratch"
+rm -f "$_r4_marker"
+
+# Real negative (F3): run the LITERAL earlier-statement export through real
+# git in a scratch repo (a TTY is not needed here — GIT_CONFIG_* reaches
+# core.fsmonitor without ever opening a pager) and confirm the marker lands.
+_r4b_marker="$(mktemp -u /tmp/herdr-git-exec-r4b-marker.XXXXXX)"
+_r4b_scratch="$(mktemp -d)"
+( cd "$_r4b_scratch" && git init -q && git -c user.email=x@x -c user.name=x commit -q --allow-empty -m x )
+rm -f "$_r4b_marker"
+_r4b_cmd="(cd $_r4b_scratch && export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=\"touch $_r4b_marker\"; git status >/dev/null 2>&1)"
+bash -c "$_r4b_cmd"
+total=$((total + 1))
+if [ -f "$_r4b_marker" ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: earlier-statement GIT_CONFIG_* payload actually runs" "ran"
+else
+  printf 'FAIL  %-52s => %-9s\n' "real negative: earlier-statement GIT_CONFIG_* payload actually runs" "did-not-run"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+got="$(classify_command "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=\"touch $_r4b_marker\"; git status")"
+if [ "$got" = escalate ]; then
+  printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates the same text" "$got"
+else
+  printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates the same text" "$got"
+  failed=$((failed + 1))
+fi
+rm -rf "$_r4b_scratch"
+rm -f "$_r4b_marker"
+
+echo
 echo "== classifier/shadow parity: one shared function, same verdict for every" \
      "git row (Round 3) =="
 # lib/pretool-shadow.sh's `_ps_bash_handoffs_verdict` calls the exact same
