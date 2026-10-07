@@ -82,8 +82,11 @@ require_agent_pane() {
 # is running in this pane RIGHT NOW; it says nothing about whether that is
 # still the same process an earlier decision (a registered task, a captured
 # prompt_id) was made about.
-pane_birth_now() {                      # pane_id -> live terminal_id, empty if pane gone
-  herdr pane list 2>/dev/null | jq -r --arg p "$1" \
+pane_birth_now() {                      # pane_id -> live terminal_id, empty if pane gone, rc 1 if herdr itself failed
+  local out
+  out="$(herdr pane list 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s' "$out" | jq -r --arg p "$1" \
     '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null
 }
 
@@ -132,12 +135,88 @@ require_pane_birth_match() {            # pane_id -> 0 ok-to-proceed, 1 refuse
 # conductor-handover.sh (P1) share the identical judgment instead of growing
 # a second copy that drifts. Requires lib/run-registry.sh already sourced
 # (uses task_for_pane), same convention as require_pane_birth_match above.
+#
+# F5 (security review PR #252): task_for_pane's own exit status, not just
+# its (possibly empty) stdout, is checked below -- a failed registry read
+# must refuse (not a worker -> eligible is the WRONG default for "we
+# couldn't tell"), same fail-closed direction as pane_birth_now above.
 pane_is_conductor_eligible() {          # pane_id -> 0 eligible, 1 refuse
-  local pane="$1" state
+  local pane="$1" task state
   pane_is_agent "$pane" 2>/dev/null || return 1
-  state="$(task_for_pane "$pane" 2>/dev/null | jq -r '.state // empty' 2>/dev/null)"
+  task="$(task_for_pane "$pane" 2>/dev/null)" || return 1
+  state="$(printf '%s' "$task" | jq -r '.state // empty' 2>/dev/null)"
   case "$state" in
     running|starting|blocked) return 1 ;;
   esac
   return 0
+}
+
+# ---- caller identity from process ancestry (not self-asserted env) ---------
+# $HERDR_PANE_ID/$HERDR_TASK_ID come from the CALLING process's own
+# environment -- a worker can export whatever it likes before running a
+# script that trusts them (F2, security review PR #252: designate-main.sh,
+# P3, .handoffs/SPEC.md feat/main-designation-lock). This resolves/validates
+# identity from something the caller cannot set: the OS process tree herdr
+# itself reports back about each pane's CURRENT foreground job.
+#
+# Architecture note (measured empirically on this host, both for a plain
+# `herdr pane send-text`-typed command and for an agent's own bash-tool
+# dispatch): neither path makes the agent binary (omp/claude/codex) a
+# process ancestor of the command it runs -- herdr's daemon forks the shell
+# itself for BOTH, so "walk ancestry for an agent's binary NAME" (as first
+# proposed for designate-main.sh --force, F3) cannot distinguish a human
+# typing in a pane from an agent dispatching through its tool. What IS a
+# real, unspoofable signal: whether this process's ancestry traces to ANY
+# herdr-tracked pane at all. Every agent (worker or Main) by definition runs
+# inside one; a genuinely external human shell (direct ssh, a terminal
+# outside herdr's purview) never will. caller_pane_from_ancestry's rc=2
+# captures exactly that "outside herdr's reach entirely" case, consumed by
+# designate-main.sh's --force gate; rc=0 (a pane was found) is the identity
+# used everywhere else a caller's own pane must be known for certain.
+#
+# Bounded (HERDR_ANCESTOR_WALK_MAX hops, default 32) so a cycle or a very
+# deep tree cannot hang a caller; each hop costs one `ps` call.
+_pg_process_ancestors() {   # -> $PPID, its parent, ... one pid per line
+  local pid="$PPID" hops=0 max="${HERDR_ANCESTOR_WALK_MAX:-32}"
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && [ "$hops" -lt "$max" ]; do
+    printf '%s\n' "$pid"
+    hops=$((hops + 1))
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+  done
+}
+
+# Which live pane is this process actually running inside, as herdr itself
+# sees it: the first ancestor pid (closest first) that herdr reports as a
+# CURRENT foreground process of some pane.
+#   rc 0  -- found; the pane_id is printed on stdout.
+#   rc 1  -- the check itself could not complete (herdr/ps read failure, or
+#            the ancestor walk produced nothing) -- fails closed, NEVER
+#            treated the same as a clean no-match.
+#   rc 2  -- the walk ran cleanly end to end and traced to NO herdr pane --
+#            the only rc designate-main.sh's --force may treat as "outside
+#            herdr's reach" (see note above).
+caller_pane_from_ancestry() {
+  local panes pane_ids p map ancestors pid found
+  panes="$(herdr pane list 2>/dev/null)" || return 1
+  [ -n "$panes" ] || return 1
+  pane_ids="$(printf '%s' "$panes" | jq -r '(.result.panes // .panes)[]?.pane_id' 2>/dev/null)"
+  [ -n "$pane_ids" ] || return 1
+  map=""
+  for p in $pane_ids; do
+    local info
+    info="$(herdr pane process-info --pane "$p" 2>/dev/null)" || return 1
+    map="$map
+$(printf '%s' "$info" | jq -r --arg pane "$p" \
+      '.result.process_info.foreground_processes[]? | (.pid|tostring) + " " + $pane' 2>/dev/null)"
+  done
+  ancestors="$(_pg_process_ancestors)"
+  [ -n "$ancestors" ] || return 1
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    found="$(printf '%s' "$map" | awk -v want="$pid" '$1==want {print $2; exit}')"
+    if [ -n "$found" ]; then printf '%s\n' "$found"; return 0; fi
+  done <<EOF
+$ancestors
+EOF
+  return 2
 }

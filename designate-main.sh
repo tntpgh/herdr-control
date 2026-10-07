@@ -14,29 +14,45 @@
 #                                             # hand the role to another live,
 #                                             # non-worker agent pane
 #   designate-main.sh --force --reason "<text>" <pane>   # Zero/Terrence
-#                                             # override from a plain human
-#                                             # shell (never from inside an
-#                                             # agent) — forces <pane>
+#                                             # override from a shell outside
+#                                             # herdr's reach entirely (never
+#                                             # from inside any herdr pane,
+#                                             # agent or not) — forces <pane>
 #   designate-main.sh --show                 # print the current designation
-#   designate-main.sh --clear                # remove it (only the live Main,
-#                                             # or --force, may do this)
+#   designate-main.sh --clear                # remove it — only the live
+#                                             # Main may clear a LIVE row; a
+#                                             # DEAD row may be cleared by any
+#                                             # eligible non-worker agent pane
 #
-# Storage: a row in the registry's `owners` table (lib/run-registry.sh),
-# label "main" — register_owner/read_owner/unregister_owner, plus
-# register_owner_cas for the compare-and-swap writes below. NOT a file:
-# earlier this lived at roles/main, moved here 2026-10-07 so the role can
-# carry the same liveness-aware, race-safe write path every other registry
-# row already has, instead of a second bespoke format. config.sh reads the
-# SAME table (a direct sqlite3 query, not by sourcing this file) whenever
-# HERDR_MAIN_PANE_ID is not set explicitly, and attention-tick.sh re-sources
-# config.sh every tick, so a new designation takes effect on the next pass
-# with no hub restart — unchanged from the file-based design.
+# Storage: a row in the registry's OWN `roles` table (lib/run-registry.sh),
+# label "main" — read_role, plus register_role_cas/unregister_role_cas for
+# every write below. NOT the shared `owners` table: security review PR #252
+# (F1) found register-owner.sh/unregister-owner.sh — generic, already-shipped
+# tools with no designation gate — could overwrite or delete a "main" row
+# there with no liveness or worker check, and that same table is read
+# generically by remote-mcp's publisher.py and herdr-action.sh's owner-alert
+# routing. A dedicated table makes the collision impossible by construction
+# instead of filtering it at every read site. config.sh reads the SAME table
+# (a direct sqlite3 query, not by sourcing this file) whenever
+# HERDR_MAIN_PANE_ID has no registry row to defer to, and attention-tick.sh
+# re-sources config.sh every tick, so a new designation takes effect on the
+# next pass with no hub restart.
 #
 # The pane's birth fingerprint (herdr terminal_id) is stored with it.
 # attention-tick.sh refuses to send on a POSITIVE birth mismatch, so a
 # designation left behind by a Main that exited cannot deliver into whatever
 # process later reuses that pane id. It records attention_escalation_refused
 # instead. This is the minimal slice of plan item 4 (role addresses).
+#
+# ---- caller identity: process ancestry, never self-asserted env -----------
+# Every subcommand resolves ITS CALLER from caller_pane_from_ancestry
+# (lib/pane-guard.sh): the first ancestor pid of this process that herdr
+# itself reports as a pane's CURRENT foreground process. $HERDR_PANE_ID and
+# $HERDR_TASK_ID are the CALLER's own environment — a worker can set either
+# to whatever it likes (security review PR #252, F2) — and are never trusted
+# for identity or the worker check here; pane_is_conductor_eligible looks up
+# the resolved pane in the registry directly, which a caller cannot spoof by
+# exporting a variable.
 #
 # ---- who may change the designation ----------------------------------------
 # Allowed:
@@ -49,21 +65,44 @@
 #       agent pane that is not a worker.
 # Refused:
 #   - a live Main exists and the caller isn't it (and isn't doing (c));
-#   - the caller is a worker — HERDR_TASK_ID is set, or its pane is a
-#     registered task's own currently active pane (pane_is_conductor_eligible,
-#     lib/pane-guard.sh — the same judgment spawn-task.sh's own conductor
-#     fallback and conductor-handover.sh (P1) use, F8/R3, security review PR #220).
+#   - the caller is a worker (pane_is_conductor_eligible, lib/pane-guard.sh
+#     — the same judgment spawn-task.sh's own conductor fallback and
+#     conductor-handover.sh (P1) use, F8/R3, security review PR #220);
+#   - the caller's identity could not be resolved from process ancestry at
+#     all (herdr unreachable, or this process traces to no live pane).
 # Every change writes a `main_designated` event {from,to,birth,by,reason};
 # every refusal writes `main_designation_refused` {from,attempted_by,reason}.
 # --show is always read-only and never gated.
 #
+# ---- --force -----------------------------------------------------------------
+# Measured empirically (security review PR #252, F3): neither a human typing
+# directly into a herdr pane NOR an agent's own bash-tool dispatch makes the
+# agent binary (omp/claude/codex) a process ancestor of the command it runs
+# — herdr's daemon forks the shell itself for both, so walking ancestry for
+# an agent's NAME cannot tell them apart, and `-t 0`/HERDR_TASK_ID (the
+# original gate) is satisfiable by any agent via `script -q /dev/null ...`.
+# What IS unspoofable: whether this process's ancestry traces to ANY
+# herdr-tracked pane at all. Every agent (worker or Main) by definition runs
+# inside one; a genuinely external human shell (direct ssh, a terminal
+# outside herdr's purview) never will. --force requires
+# caller_pane_from_ancestry to return rc=2 — the walk ran cleanly and found
+# NO herdr pane anywhere in this process's ancestry — not merely "stdin is a
+# tty" or "no env var is set."
+#
 # ---- concurrency -------------------------------------------------------------
-# Two panes racing to self-designate when no Main exists (or over a Main they
-# both independently decided is dead) must leave exactly one winner, not a
-# last-write-wins clobber. register_owner_cas makes the read-permission-check
-# and the write happen as one atomic SQL statement guarded by the row's
-# pre-image, so a losing racer's write simply fails (changes()=0) instead of
-# silently overwriting whoever won.
+# Two panes racing to self-designate when no Main exists (or over a Main
+# they both independently decided is dead) must leave exactly one winner,
+# not a last-write-wins clobber. register_role_cas makes the
+# read-permission-check and the write happen as one atomic SQL statement
+# guarded by the row's pre-image, so a losing racer's write simply fails
+# (changes()=0) instead of silently overwriting whoever won.
+#
+# F4 (security review PR #252): that pre-image is read EXACTLY ONCE per
+# command below and reused unchanged as the CAS expected_pane/expected_birth
+# — no command re-reads the row between its permission check and its write.
+# A second, later read let a Main that appeared IN BETWEEN get silently
+# overwritten by a racer who had already passed its permission check against
+# the first read.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib/run-registry.sh
@@ -73,7 +112,7 @@ source "$HERE/lib/pane-guard.sh"
 
 MAIN_LABEL=main
 
-usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
 
 die() { local code="$1"; shift; echo "designate-main: $*" >&2; exit "$code"; }
 
@@ -88,43 +127,45 @@ record_refused() {      # from attempted_by reason
     >/dev/null 2>&1 || true
 }
 
-# Current designation row, split into pane/birth (empty/empty if absent).
+# Resolve the CALLER's pane from process ancestry (F2) — never from
+# self-asserted HERDR_PANE_ID. Dies the caller never sees a fallback value:
+# an unresolved caller refuses, full stop.
+_caller_pane() {
+  caller_pane_from_ancestry
+}
+
+# Current "main" row, split pane/birth (empty/empty if absent). Read this
+# EXACTLY ONCE per command (F4) — every caller below reuses the same
+# pane/birth pair as both the permission-check input and the CAS pre-image.
 _main_row() {
   local j
-  j="$(read_owner "$MAIN_LABEL")"
+  j="$(read_role "$MAIN_LABEL")" || return 1
   if [ -z "$j" ] || [ "$j" = "null" ]; then printf ' \n'; return 0; fi
   printf '%s %s\n' "$(printf '%s' "$j" | jq -r '.pane_id // empty')" \
                     "$(printf '%s' "$j" | jq -r '.pane_birth // empty')"
 }
 
-# Is the recorded owners row for "main" a LIVE Main right now? Prints
-# "<pane> <birth>" and returns 0 if so; prints nothing and returns 1 if the
-# row is absent, the pane is gone, or its birth no longer matches (Main is
-# gone, same POSITIVE-mismatch-only rule attention-tick.sh's escalation uses).
-_live_main() {
-  local pane birth live
-  read -r pane birth <<<"$(_main_row)"
+# Is a given (pane, birth) pair LIVE right now? F5: fails closed (1, "treat
+# as not live") on a herdr read failure — a transient herdr hiccup must
+# never read as "Main is gone."
+_is_live() {       # pane birth -> 0 live, 1 not live or indeterminate
+  local pane="$1" birth="$2" live
   [ -n "$pane" ] || return 1
-  live="$(pane_birth_now "$pane" 2>/dev/null)"
+  live="$(pane_birth_now "$pane")" || return 1
   [ -n "$live" ] || return 1
-  [ -z "$birth" ] || [ "$live" = "$birth" ] || return 1
-  printf '%s %s\n' "$pane" "$live"
+  [ -z "$birth" ] || [ "$live" = "$birth" ]
 }
 
-# Refuses a pane that is a worker: HERDR_TASK_ID set in THIS process's own
-# environment, or the TARGET pane is a registered task's own active pane
-# (pane_is_conductor_eligible, lib/pane-guard.sh). Sets $WORKER_REASON.
+# Refuses a pane that is a worker — pane_is_conductor_eligible
+# (lib/pane-guard.sh) looks the pane up in the registry directly, and itself
+# fails closed on a registry read failure (F5). Sets $WORKER_REASON.
 _refuse_if_worker() {   # pane -> 0 eligible, 1 refuse
   local pane="$1"
-  if [ -n "${HERDR_TASK_ID:-}" ]; then
-    WORKER_REASON="caller has HERDR_TASK_ID set (is a worker)"
-    return 1
-  fi
-  if ! pane_is_conductor_eligible "$pane" 2>/dev/null; then
+  if ! pane_is_conductor_eligible "$pane"; then
     if ! pane_is_agent "$pane" 2>/dev/null; then
       WORKER_REASON="$pane is not running an agent"
     else
-      WORKER_REASON="$pane is a registered worker's own active task pane"
+      WORKER_REASON="$pane is a registered worker's own active task pane, or its eligibility could not be verified"
     fi
     return 1
   fi
@@ -133,64 +174,74 @@ _refuse_if_worker() {   # pane -> 0 eligible, 1 refuse
 
 show() {
   local pane birth
-  read -r pane birth <<<"$(_main_row)"
+  read -r pane birth <<<"$(_main_row)" || die 1 "could not read the registry"
   if [ -z "$pane" ]; then echo "(no Main designated)"; else printf '%s %s\n' "$pane" "$birth"; fi
 }
 
 cmd_clear() {
-  local live_pane live_birth caller="${HERDR_PANE_ID:-}"
-  if read -r live_pane live_birth <<<"$(_live_main)" && [ -n "$live_pane" ]; then
-    if [ -n "$caller" ] && [ "$caller" = "$live_pane" ]; then
-      :  # the live Main may clear itself
-    else
-      record_refused "$live_pane" "${caller:-<no pane>}" "a live Main ($live_pane) exists and the caller isn't it"
-      die 4 "refusing to clear: Main is $live_pane (birth $live_birth); only it may clear itself"
-    fi
+  local caller pane birth
+  caller="$(_caller_pane)" || die 3 "could not verify caller identity from process ancestry (herdr unreachable, or this process traces to no live pane)"
+  if ! _refuse_if_worker "$caller"; then
+    record_refused "$(_main_row | awk '{print $1}')" "$caller" "$WORKER_REASON"
+    die 3 "refusing to clear: $WORKER_REASON"
   fi
-  unregister_owner "$MAIN_LABEL"
-  record_designated "$live_pane" "" "" "${caller:-<no pane>}" "clear"
-  echo "Main designation cleared"
+  read -r pane birth <<<"$(_main_row)" || die 1 "could not read the registry"
+  if [ -z "$pane" ]; then
+    echo "(no Main designated; nothing to clear)"
+    return 0
+  fi
+  if _is_live "$pane" "$birth" && [ "$caller" != "$pane" ]; then
+    record_refused "$pane" "$caller" "a live Main ($pane) exists and the caller isn't it"
+    die 4 "refusing to clear: Main is $pane (birth $birth); only it may clear itself"
+  fi
+  if unregister_role_cas "$MAIN_LABEL" "$pane" "$birth"; then
+    record_designated "$pane" "" "" "$caller" "clear"
+    echo "Main designation cleared"
+  else
+    die 1 "clear lost a race (the designation changed underneath it); retry"
+  fi
 }
 
 cmd_handoff() {          # target_pane
-  local target="$1" caller="${HERDR_PANE_ID:-}" live_pane live_birth
-  [ -n "$caller" ] || die 2 "no pane (set HERDR_PANE_ID)"
-  read -r live_pane live_birth <<<"$(_live_main)"
-  [ -n "$live_pane" ] || die 4 "refusing: no live Main to hand off from"
-  [ "$caller" = "$live_pane" ] || { record_refused "$live_pane" "$caller" "only the current live Main ($live_pane) may --handoff-to"; die 4 "refusing: only the current live Main ($live_pane) may hand off"; }
+  local target="$1" caller pane birth
+  caller="$(_caller_pane)" || die 3 "could not verify caller identity from process ancestry (herdr unreachable, or this process traces to no live pane)"
+  read -r pane birth <<<"$(_main_row)" || die 1 "could not read the registry"
+  _is_live "$pane" "$birth" || die 4 "refusing: no live Main to hand off from"
+  if [ "$caller" != "$pane" ]; then
+    record_refused "$pane" "$caller" "only the current live Main ($pane) may --handoff-to"
+    die 4 "refusing: only the current live Main ($pane) may hand off"
+  fi
   if ! _refuse_if_worker "$target"; then
-    record_refused "$live_pane" "$caller" "handoff target $WORKER_REASON"
+    record_refused "$pane" "$caller" "handoff target $WORKER_REASON"
     die 3 "refusing handoff to $target: $WORKER_REASON"
   fi
-  local target_birth; target_birth="$(pane_birth_now "$target" 2>/dev/null)"
-  [ -n "$target_birth" ] || die 3 "could not read $target's birth fingerprint"
-  if register_owner_cas "$MAIN_LABEL" "$target" "$target_birth" "" "" "$live_pane" "$live_birth"; then
-    record_designated "$live_pane" "$target" "$target_birth" "$caller" "handoff"
-    echo "Main handed off: $live_pane -> $target (birth $target_birth)"
+  local target_birth
+  target_birth="$(pane_birth_now "$target")" || die 3 "could not read $target's birth fingerprint (herdr unreachable)"
+  [ -n "$target_birth" ] || die 3 "could not read $target's birth fingerprint (pane not found)"
+  if register_role_cas "$MAIN_LABEL" "$target" "$target_birth" "" "" "$pane" "$birth"; then
+    record_designated "$pane" "$target" "$target_birth" "$caller" "handoff"
+    echo "Main handed off: $pane -> $target (birth $target_birth)"
   else
     die 1 "handoff lost a race (the designation changed underneath it); retry"
   fi
 }
 
 cmd_force() {             # target_pane reason
-  local target="$1" reason="$2" caller="${HERDR_PANE_ID:-}"
-  [ -n "$caller" ] || die 2 "no pane (set HERDR_PANE_ID)"
-  # Must be invoked directly by a human, never by/through an agent process:
-  # owner-approval.sh's agent-ancestor check isn't on main yet, so this is
-  # the documented fallback (.handoffs/SPEC.md item 4).
-  if [ -n "${HERDR_TASK_ID:-}" ] || [ ! -t 0 ]; then
-    die 3 "refusing --force: not an interactive human invocation (HERDR_TASK_ID set, or stdin is not a tty)"
-  fi
+  local target="$1" reason="$2" rc=0
+  caller_pane_from_ancestry >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || die 3 "refusing --force: this process traces to a herdr-managed pane (or that could not be verified); --force is only for a shell outside herdr's reach entirely"
   if ! _refuse_if_worker "$target"; then
-    record_refused "$(_main_row | awk '{print $1}')" "human-force" "force target $WORKER_REASON"
+    local pane; pane="$(_main_row | awk '{print $1}')"
+    record_refused "$pane" "human-force" "force target $WORKER_REASON"
     die 3 "refusing --force: $WORKER_REASON"
   fi
-  local target_birth; target_birth="$(pane_birth_now "$target" 2>/dev/null)"
-  [ -n "$target_birth" ] || die 3 "could not read $target's birth fingerprint"
-  local observed_pane observed_birth
-  read -r observed_pane observed_birth <<<"$(_main_row)"
-  if register_owner_cas "$MAIN_LABEL" "$target" "$target_birth" "" "" "$observed_pane" "$observed_birth"; then
-    record_designated "$observed_pane" "$target" "$target_birth" "human-force" "$reason"
+  local target_birth
+  target_birth="$(pane_birth_now "$target")" || die 3 "could not read $target's birth fingerprint (herdr unreachable)"
+  [ -n "$target_birth" ] || die 3 "could not read $target's birth fingerprint (pane not found)"
+  local pane birth
+  read -r pane birth <<<"$(_main_row)" || die 1 "could not read the registry"
+  if register_role_cas "$MAIN_LABEL" "$target" "$target_birth" "" "" "$pane" "$birth"; then
+    record_designated "$pane" "$target" "$target_birth" "human-force" "$reason"
     echo "Main = $target (birth $target_birth) [forced by human: $reason]"
   else
     die 1 "force-designation lost a race (the designation changed underneath it); retry"
@@ -198,24 +249,23 @@ cmd_force() {             # target_pane reason
 }
 
 cmd_self() {
-  local caller="${HERDR_PANE_ID:-}"
-  [ -n "$caller" ] || die 2 "no pane (set HERDR_PANE_ID or pass one)"
+  local caller
+  caller="$(_caller_pane)" || die 3 "could not verify caller identity from process ancestry (herdr unreachable, or this process traces to no live pane)"
   if ! _refuse_if_worker "$caller"; then
     record_refused "$(_main_row | awk '{print $1}')" "$caller" "$WORKER_REASON"
     die 3 "refusing: $WORKER_REASON"
   fi
-  local live_pane live_birth
-  read -r live_pane live_birth <<<"$(_live_main)"
-  if [ -n "$live_pane" ] && [ "$live_pane" != "$caller" ]; then
-    record_refused "$live_pane" "$caller" "a live Main ($live_pane) already exists and the caller isn't it"
-    die 4 "refusing: Main is already $live_pane (birth $live_birth); use --handoff-to from that pane, or --force"
+  local pane birth
+  read -r pane birth <<<"$(_main_row)" || die 1 "could not read the registry"
+  if _is_live "$pane" "$birth" && [ "$pane" != "$caller" ]; then
+    record_refused "$pane" "$caller" "a live Main ($pane) already exists and the caller isn't it"
+    die 4 "refusing: Main is already $pane (birth $birth); use --handoff-to from that pane, or --force"
   fi
-  local caller_birth; caller_birth="$(pane_birth_now "$caller" 2>/dev/null)"
-  [ -n "$caller_birth" ] || die 3 "could not read $caller's birth fingerprint"
-  local observed_pane observed_birth
-  read -r observed_pane observed_birth <<<"$(_main_row)"
-  if register_owner_cas "$MAIN_LABEL" "$caller" "$caller_birth" "" "" "$observed_pane" "$observed_birth"; then
-    record_designated "$observed_pane" "$caller" "$caller_birth" "$caller" "$([ -n "$live_pane" ] && echo self-redesignate || echo main-absent-or-dead)"
+  local caller_birth
+  caller_birth="$(pane_birth_now "$caller")" || die 3 "could not read $caller's birth fingerprint (herdr unreachable)"
+  [ -n "$caller_birth" ] || die 3 "could not read $caller's birth fingerprint (pane not found)"
+  if register_role_cas "$MAIN_LABEL" "$caller" "$caller_birth" "" "" "$pane" "$birth"; then
+    record_designated "$pane" "$caller" "$caller_birth" "$caller" "$([ -n "$pane" ] && echo self-redesignate || echo main-absent-or-dead)"
     echo "Main = $caller (birth $caller_birth)"
   else
     die 1 "designation changed concurrently (lost the race); retry"
@@ -242,7 +292,9 @@ if [ "$force" = 1 ]; then
   [ -n "$target" ] || die 2 "--force requires a target pane: designate-main.sh --force --reason \"<text>\" <pane>"
   cmd_force "$target" "$reason"
 elif [ -n "$handoff_to" ]; then
+  [ -z "$target" ] || die 2 "unexpected extra argument: $target"
   cmd_handoff "$handoff_to"
 else
+  [ -z "$target" ] || die 2 "designate-main.sh takes no positional pane argument except with --force; did you mean --handoff-to $target or --force --reason \"<text>\" $target?"
   cmd_self
 fi
