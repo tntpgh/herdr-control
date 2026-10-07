@@ -1603,6 +1603,42 @@ register_owner() {                      # label pane_id pane_birth agent_session
   return 1
 }
 
+# Atomic compare-and-swap write of an owners row, for a caller that must NOT
+# clobber a row someone else changed between its own read and its own write
+# (designate-main.sh, P3: two panes racing to become Main when none exists
+# must leave exactly one winner, and a pane re-designating over what it just
+# proved is a DEAD Main must not silently overwrite a real Main that
+# reasserted itself in that same window). expected_pane="" means "the row
+# must still be ABSENT" (a plain INSERT guarded by NOT EXISTS); otherwise the
+# existing row's pane_id AND pane_birth must still equal expected_pane/
+# expected_birth (a plain UPDATE guarded by WHERE). Either way this is ONE
+# statement per branch, so SQLite's own per-statement atomicity is the whole
+# guarantee -- no read-then-write gap for a second process to land in.
+# Returns 0 only when this call's write actually landed (changes()=1); 1 on
+# a lost race (another process changed the row first) or a write failure --
+# the caller cannot tell those apart from the return code alone and should
+# re-read read_owner() to decide what happened.
+register_owner_cas() {                  # label pane_id pane_birth agent_session workspace expected_pane expected_birth
+  local label="$1" pane_id="$2" pane_birth="$3" agent_session="$4" workspace="$5" \
+        expected_pane="$6" expected_birth="${7:-}"
+  registry_init || return 1
+  local at changes
+  at="$(_now_iso)"
+  if [ -z "$expected_pane" ]; then
+    changes="$(_sql "INSERT INTO owners (label, pane_id, pane_birth, agent_session, workspace, registered_at, updated_at)
+        SELECT $(_sq "$label"), $(_sq "$pane_id"), $(_sq "$pane_birth"), $(_sq "$agent_session"),
+               $(_sq "$workspace"), $(_sq "$at"), $(_sq "$at")
+        WHERE NOT EXISTS (SELECT 1 FROM owners WHERE label=$(_sq "$label"));
+      SELECT changes();" 2>/dev/null)"
+  else
+    changes="$(_sql "UPDATE owners SET pane_id=$(_sq "$pane_id"), pane_birth=$(_sq "$pane_birth"),
+          agent_session=$(_sq "$agent_session"), workspace=$(_sq "$workspace"), updated_at=$(_sq "$at")
+        WHERE label=$(_sq "$label") AND pane_id=$(_sq "$expected_pane") AND pane_birth=$(_sq "$expected_birth");
+      SELECT changes();" 2>/dev/null)"
+  fi
+  [ "$changes" = "1" ]
+}
+
 unregister_owner() {                    # label
   registry_init || return 1
   _sql "DELETE FROM owners WHERE label=$(_sq "$1");" >/dev/null 2>&1

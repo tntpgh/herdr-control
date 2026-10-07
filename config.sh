@@ -151,15 +151,31 @@
 #
 # Set by `designate-main.sh` from the Main session, NOT here: Main's pane id
 # changes every session, so a static value was always empty or stale. An
-# explicit environment value still wins. The file is re-read every tick
-# (attention-tick.sh sources this file each pass). Empty = no Main; the
-# escalation is recorded as skipped and the form is still served on schedule.
+# explicit environment value still wins. Read from the registry's `owners`
+# table (label "main" — designate-main.sh writes it via register_owner_cas,
+# lib/run-registry.sh) every time this file is sourced; attention-tick.sh
+# re-sources config.sh each tick, so a new designation takes effect on the
+# next pass with no hub restart. Empty = no Main; the escalation is recorded
+# as skipped and the form is still served on schedule.
+#
+# A direct sqlite3 query, not `source lib/run-registry.sh`: that file sets
+# `set -uo pipefail` at its own top level, which would then apply to every
+# one of config.sh's many sourcers (several of which run today without -u),
+# a behavior change this file has no business making as a side effect of a
+# read. 2026-10-07, moved off roles/main (a plain file) to this table so
+# designate-main.sh's CAS write path (P3, .handoffs/SPEC.md
+# feat/main-designation-lock) has one authoritative store, not two.
 if [ -z "${HERDR_MAIN_PANE_ID:-}" ]; then
-  _herdr_main_role="${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}/roles/main"
-  if [ -s "$_herdr_main_role" ]; then
-    read -r HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH < "$_herdr_main_role" || true
+  _herdr_main_db="${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}/registry.sqlite3"
+  if [ -f "$_herdr_main_db" ]; then
+    _herdr_main_row="$(sqlite3 -batch -noheader -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$_herdr_main_db" \
+      "SELECT pane_id || '|' || pane_birth FROM owners WHERE label='main';" 2>/dev/null)"
+    if [ -n "$_herdr_main_row" ]; then
+      HERDR_MAIN_PANE_ID="${_herdr_main_row%%|*}"
+      HERDR_MAIN_PANE_BIRTH="${_herdr_main_row#*|}"
+    fi
   fi
-  unset _herdr_main_role
+  unset _herdr_main_db _herdr_main_row
 fi
 : "${HERDR_MAIN_PANE_ID:=}"
 : "${HERDR_MAIN_PANE_BIRTH:=}"

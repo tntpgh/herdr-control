@@ -121,3 +121,23 @@ require_pane_birth_match() {            # pane_id -> 0 ok-to-proceed, 1 refuse
   fi
   return 0
 }
+
+# Is this pane allowed to BE or RECEIVE conductor authority (Main,
+# spawn-task.sh's HERDR_MCP_CONDUCTOR_PANE fallback) -- a live agent pane
+# that is not some OTHER task's currently active worker pane. Extracted from
+# spawn-task.sh's own F8 check (security review PR #220: pane_is_agent alone
+# only proves SOME agent is running there now -- a herdr-recycled pane id can
+# belong to an unrelated WORKER, and a worker is never a conductor) so
+# designate-main.sh (P3, .handoffs/SPEC.md feat/main-designation-lock) and
+# conductor-handover.sh (P1) share the identical judgment instead of growing
+# a second copy that drifts. Requires lib/run-registry.sh already sourced
+# (uses task_for_pane), same convention as require_pane_birth_match above.
+pane_is_conductor_eligible() {          # pane_id -> 0 eligible, 1 refuse
+  local pane="$1" state
+  pane_is_agent "$pane" 2>/dev/null || return 1
+  state="$(task_for_pane "$pane" 2>/dev/null | jq -r '.state // empty' 2>/dev/null)"
+  case "$state" in
+    running|starting|blocked) return 1 ;;
+  esac
+  return 0
+}
