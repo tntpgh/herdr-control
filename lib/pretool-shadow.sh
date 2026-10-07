@@ -365,26 +365,30 @@ _ps_bash_handoffs_verdict() {           # command cwd hw ; only ever tightens an
         return ;;
     esac
     # find/git are reads only without their own writing/exec options.
-    # git:-O*/git:--open-files-in-pager* (the pager-hook VALUE runs through
-    # a shell) and git:-c*/git:--config-env* (sets arbitrary per-invocation
-    # config — core.pager, core.editor, alias.*, diff.external,
-    # core.sshCommand, core.fsmonitor, core.hooksPath, credential.helper,
-    # gpg.program, core.askpass, filter.*, merge.*.driver and more all run a
-    # command from that value) are listed explicitly: the old
-    # `git:-[!-]*[oCc]*` glob matched a LOWERCASE o/C/c anywhere in a short
-    # option cluster, so it missed the uppercase `-O` and the long
-    # `--open-files-in-pager`/`--config-env` spellings entirely (shared
-    # list with lib/command-policy.sh's `_cp_git_exec_opt_invoked` — one
-    # list, not two diverging copies).
+    # git calls the SAME shared allowlist function
+    # lib/command-policy.sh's top-level exec-opt escalation rule uses
+    # (`_cp_git_unsafe_tokens`) instead of keeping its own duplicate glob
+    # list here: the old `git:-[!-]*[oCc]*`/`git:-O*`/
+    # `git:--open-files-in-pager*`/`git:-c*`/`git:--config-env*` globs
+    # matched a lowercase o/C/c anywhere in a short-option cluster but
+    # missed `-C`, `--git-dir`, `--work-tree`, the attached short form
+    # `-ccore.pager=...`, and grep's `--open-files-in-pag=...`
+    # abbreviation — one shared function so classifier and shadow cannot
+    # disagree again.
     for a in "${_CP_LOC[@]:1}"; do
       case "$_cp_wcmd:$a" in
-        find:-exec*|find:-ok*|find:-delete|find:-fprint*|find:-fls|rg:--pre*|git:-[!-]*[oCc]*|git:-O*|git:--open-files-in-pager*|git:-c|git:-c*|git:--config-env*|git:--output*|git:--exec-path*|git:--ext-diff|git:--textconv)
+        find:-exec*|find:-ok*|find:-delete|find:-fprint*|find:-fls|rg:--pre*)
           PS_VERDICT=escalate PS_POLICY=handoffs-write
           PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; '$_cp_wcmd $a' can write or run code — a conductor must review it"
           return ;;
       esac
     done
     if [ "$_cp_wcmd" = git ]; then
+      if _cp_git_unsafe_tokens "${_CP_LOC[@]:1}"; then
+        PS_VERDICT=escalate PS_POLICY=handoffs-write
+        PS_REASON="this task's manifest restricts writes to .handoffs/$hw only; 'git ${_CP_LOC[*]:1}' can write or run code — a conductor must review it"
+        return
+      fi
       case " ${_CP_LOC[1]:-} " in
         " log "|" show "|" diff "|" status "|" grep "|" ls-files "|" rev-parse "|" blame "|" cat-file "|" ls-tree "|" describe "|" shortlog ") ;;
         *)

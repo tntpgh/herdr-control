@@ -2536,67 +2536,119 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
   esac
 }
 
-# `_cp_git_exec_opt_invoked <raw>` -> 0 (true) when RAW invokes git with an
-# option that runs a value through a shell: `-O`/`--open-files-in-pager`
-# (git grep/log/diff "open in pager" — the raw option VALUE is the pager
-# command, no git-config step or quoting trick needed: `git grep
-# --open-files-in-pager="printf X > /tmp/m" -e foo`, `git grep -O"touch
-# /tmp/m"`), any `-c`/`--config-env` on git (sets per-invocation config —
-# core.pager, pager.*, core.editor, sequence.editor, alias.*, diff.external,
-# diff.*.textconv, diff.*.command, core.sshCommand, core.fsmonitor,
-# core.hooksPath, credential.helper, gpg.program, gpg.*.program,
-# core.askpass, filter.*, merge.*.driver, uploadpack.packObjectsHook,
-# protocol.* among the exec-capable keys — `git -c core.pager=sh log`),
-# or a `GIT_PAGER=`/`PAGER=`/`GIT_EDITOR=`/`GIT_EXTERNAL_DIFF=`/
-# `GIT_SSH_COMMAND=`/`GIT_CONFIG_*=` env-prefix ahead of the git word in the
-# same segment. Simplest acceptable per the issue's own review: escalate the
-# WHOLE `-c`/`--config-env` surface rather than keep an exec-capable-key
-# allowlist in sync with git's — one shared list, not two diverging copies
-# (lib/pretool-shadow.sh's `git:-c*` entry mirrors this).
+# `_cp_git_unsafe_tokens <token...>` -> 0 (true) when the git invocation
+# whose git WORD these tokens follow fails the narrow allowlisted shape a
+# git command may auto-allow in. Takes everything AFTER the literal `git`
+# word — the would-be subcommand plus every option that follows it — the
+# SAME tokens lib/pretool-shadow.sh already extracts into `_CP_LOC[@]:1`,
+# so both files call this one function instead of keeping two glob lists
+# that can drift. Round 2 finding: the old `git:-[!-]*[oCc]*` glob (and
+# this file's old denylist of `-O*`/`--open-files-in-pager*`/`-c`/
+# `--config-env*`) caught a lowercase o/C/c inside a short-option cluster
+# but missed `-C`, `--git-dir`, `--work-tree`, `GIT_DIR=`/`GIT_WORK_TREE=`
+# env prefixes, the attached-short-option form `-ccore.pager=...`, and
+# grep's `--open-files-in-pag=...` abbreviation — every one of those
+# classified `allow` and ran.
 #
-# Same preprocessing as _cp_git_push_invoked (unflattened, quote-stripped,
-# segmented on shell operators including `<`/`>` so a quoted `-O` value
-# containing its own redirect cannot hide the option in a later segment) so
-# this reads the same shape the push-force rule already trusts.
-_cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git runs an exec-capable option
+# ALLOWLIST, not denylist: a git invocation is safe to auto-allow ONLY if
+# ALL of —
+#   1. the very first token here IS the subcommand itself — no `-c`, `-C`,
+#      `--git-dir`, `--work-tree`, `--exec-path`, `--namespace`,
+#      `--super-prefix`, `--config-env`, `-p`/`--paginate`, or any other
+#      token starting with `-`, ahead of it (attached short form included:
+#      `-ccore.pager=x`). ANY token before the subcommand changes what
+#      repo/config git reads from or runs, so it disqualifies the whole
+#      invocation — this is checked here; the caller checks the matching
+#      `GIT_*`/`PAGER`/`EDITOR`/`VISUAL` env-assignment-ahead-of-`git` case,
+#      since that token never reaches this function at all.
+#   2. for `git grep`: no option token starting with `-O` or `--o` — every
+#      spelling and abbreviation of `--open-files-in-pager` starts one of
+#      those two ways.
+#   3. no option token starting with `-o` (lowercase, any verb) — the
+#      short form of `--output` (`git diff -o<path>`/`git show -o<path>`/
+#      `git log -o<path>`): it writes the command's output to an
+#      arbitrary path, same as the long form, and the old glob-based
+#      denylist caught it only by accident (a lowercase `o` anywhere in a
+#      short-option cluster) — losing it when that glob was deleted was a
+#      real regression (live review finding), not a style change.
+#   4. for every verb: no `--` option token that is an abbreviation-prefix
+#      of a known exec-bearing long option. git accepts ANY unambiguous
+#      prefix of a long option (`--open-f` means `--open-files-in-pager`),
+#      so the check is "is this token's name a prefix of the exec-bearing
+#      spelling", not an exact-match denylist.
+# ceiling: #4 is a denylist of known exec-bearing long options layered on
+# an allowlist SHAPE (no leading option, no env prefix) — not a full
+# per-verb allowlist of every known-safe long option (infeasible to keep
+# in sync with git's real per-subcommand grammar). A future git release
+# adding a new exec-bearing long option whose prefix is not already in
+# `_cp_git_exec_opts` below needs a line added here.
+_cp_git_exec_opts="open-files-in-pager ext-diff textconv output exec upload-pack receive-pack"
+_cp_git_unsafe_tokens() {               # token... (everything after the git word) -> 0 if unsafe
+  local verb="" tok name opt
+  for tok in "$@"; do
+    if [ -z "$verb" ]; then
+      case "$tok" in
+        -*) return 0 ;;
+        *) verb="$tok"; continue ;;
+      esac
+    fi
+    if [ "$verb" = grep ]; then
+      case "$tok" in -O*|--o*) return 0 ;; esac
+    fi
+    case "$tok" in
+      -o*) return 0 ;;
+      --*)
+        name="${tok#--}"; name="${name%%=*}"
+        [ -n "$name" ] || continue
+        for opt in $_cp_git_exec_opts; do
+          case "$opt" in "$name"*) return 0 ;; esac
+        done
+        ;;
+    esac
+  done
+  return 1
+}
+
+# `_cp_git_exec_opt_invoked <raw>` -> 0 (true) when RAW invokes git in any
+# shape `_cp_git_unsafe_tokens` disqualifies, OR with a `GIT_*`/`PAGER`/
+# `EDITOR`/`VISUAL` env-assignment immediately ahead of the git word (that
+# token is consumed here, before the subcommand tokens are ever handed to
+# `_cp_git_unsafe_tokens`). Same preprocessing as `_cp_git_push_invoked`
+# (unflattened, quote-stripped, segmented on shell operators including
+# `<`/`>` so a quoted option value containing its own redirect cannot hide
+# the option in a later segment) so this reads the same shape the
+# push-force rule already trusts.
+_cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git fails the read-only shape
   local LC_ALL=C LANG=C
-  local raw="$1" pre segmented out
+  local raw="$1" pre segmented seg
   pre="$(_cp_strip_heredocs "$raw")"
   pre="$(_cp_decode_ansi_c "$pre")"
   pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
   pre="$(printf '%s' "$pre" | sed "s/['\"\\\\]//g")"
   pre="$(printf '%s' "$pre" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
   segmented="$(printf '%s' "$pre" | sed -E 's/[;&|()`<>]/\n/g')"
-  out="$(printf '%s\n' "$segmented" | awk '
-    function is_git(s,    n) { n = length(s); return (s == "git" || (n > 4 && substr(s, n - 3) == "/git")) }
-    function is_env_prefix(s) { return (s ~ /^(GIT_PAGER|PAGER|GIT_EDITOR|GIT_EXTERNAL_DIFF|GIT_SSH_COMMAND|GIT_CONFIG_[A-Za-z0-9_]*)=/) }
-    {
-      n = split($0, tok, /[ \t]+/)
-      i = 1; pending_env = 0
-      while (i <= n) {
-        t = tok[i]
-        if (t == "") { i++; continue }
-        if (is_env_prefix(t)) { pending_env = 1; i++; continue }
-        if (is_git(t)) {
-          if (pending_env) hit = 1
-          pending_env = 0
-          i++
-          while (i <= n) {
-            t2 = tok[i]
-            if (t2 == "") { i++; continue }
-            if (t2 ~ /^-O/ || t2 ~ /^--open-files-in-pager(=|$)/ ||
-                t2 == "-c" || t2 ~ /^--config-env(=|$)/) hit = 1
-            i++
-          }
-          continue
-        }
-        pending_env = 0
-        i++
-      }
-    }
-    END { if (hit) print "hit"; else print "safe" }
-  ')"
-  [ "$out" = hit ] && return 0
+  while IFS= read -r seg; do
+    [ -n "${seg//[[:space:]]/}" ] || continue
+    local -a tok
+    set -f; read -r -a tok <<<"$seg"; set +f
+    local i=0 n="${#tok[@]}" pending_env=0 t
+    while [ "$i" -lt "$n" ]; do
+      t="${tok[$i]}"
+      if [ -z "$t" ]; then i=$((i + 1)); continue; fi
+      case "$t" in
+        GIT_*=*|PAGER=*|EDITOR=*|VISUAL=*) pending_env=1; i=$((i + 1)); continue ;;
+      esac
+      case "$t" in
+        git|*/git)
+          if [ "$pending_env" = 1 ]; then return 0; fi
+          _cp_git_unsafe_tokens "${tok[@]:$((i + 1))}" && return 0
+          break
+          ;;
+      esac
+      pending_env=0
+      i=$((i + 1))
+    done
+  done <<<"$segmented"
   return 1
 }
 
@@ -4106,16 +4158,24 @@ classify_command() {                    # <panel/command text> [worktree] [manif
     _cp_match '(^|[[:space:]])(-[A-Za-z]*f[A-Za-z]*|--force(-with-lease)?)([[:space:]]|$)' "$norm"; } &&
     _cp_consider 1 "git push --force/-f rewrites remote history"
 
-  # escalate — git -O/--open-files-in-pager, -c/--config-env, or a
-  # GIT_PAGER/GIT_EDITOR/GIT_EXTERNAL_DIFF/GIT_SSH_COMMAND/GIT_CONFIG_* env
-  # prefix runs an arbitrary command through a shell — see
-  # _cp_git_exec_opt_invoked above for the full key list and why the whole
-  # -c/--config-env surface escalates rather than an allowlist of keys.
-  # Every OTHER git shape this file already allows (`git status`, `git
-  # log`, `git diff`, `git grep -e …`, …) is untouched; this only fires on
-  # the exec-capable option/config/env surface itself.
+  # escalate — a git invocation whose shape fails the narrow ALLOWLIST
+  # `_cp_git_unsafe_tokens`/`_cp_git_exec_opt_invoked` require for a
+  # command to be exec-safe regardless of verb: a global option (or
+  # env-assignment) ahead of the subcommand (-c/-C/--git-dir/--work-tree/
+  # --exec-path/--namespace/--super-prefix/--config-env/-p/--paginate/
+  # GIT_*=/PAGER=/EDITOR=/VISUAL=, or any other leading `-` token — each
+  # changes what repo/config git reads from or runs), grep's
+  # -O/--open-files-in-pager in any abbreviation, any `-o*` short form of
+  # `--output` (writes the command's output to an arbitrary path — `git
+  # diff -o<path>`/`git show -o<path>`/`git log -o<path>`), or any `--`
+  # option that is an abbreviation-prefix of a known exec-bearing long
+  # option (--open-files-in-pager/--ext-diff/--textconv/--output/--exec/
+  # --upload-pack/--receive-pack). This only fires on that exec-capable
+  # option/config/env surface — every OTHER git shape this file already
+  # allows (`git status`, `git log`, `git diff`, `git grep -e …`, `git
+  # commit -m …`, …) is untouched.
   _cp_git_exec_opt_invoked "$raw" &&
-    _cp_consider 1 "git -O/--open-files-in-pager, -c/--config-env, or a GIT_PAGER/GIT_EDITOR/GIT_SSH_COMMAND/GIT_CONFIG_* env prefix runs an arbitrary command through a shell"
+    _cp_consider 1 "git invocation carries a global option/env-prefix ahead of the subcommand, or an exec-bearing option/abbreviation, that can run arbitrary code"
 
   # escalate — DROP/TRUNCATE TABLE, case-insensitive (SQL keywords are
   # conventionally upper- or lower-case interchangeably).

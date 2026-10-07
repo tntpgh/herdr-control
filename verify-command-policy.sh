@@ -191,7 +191,12 @@ echo "== git fetch downloads refs, not code to run =="
 # FIRST step of every review escalated to a human (wN:pA, 2026-09-18).
 check "git fetch a branch"            "git fetch origin geo/ai-surface-gaps"   allow
 check "git fetch then log"            "git fetch origin main && git log --oneline -1 FETCH_HEAD" allow
-check "git fetch with -C"             "git -C /tmp/wt fetch origin main"       allow
+# Round 2 (git-exec-allowlist): -C is a global option ahead of the
+# subcommand, same as any other leading `-` token — it now escalates like
+# every other pre-verb global option (-c/--git-dir/--work-tree/…), not a
+# regression of the fetch narrowing above, which only ever covered the
+# bare `git fetch <ref>` shape.
+check "git fetch with -C"             "git -C /tmp/wt fetch origin main"       escalate
 check "git fetch --all --prune"       "git fetch --all --prune"                allow
 # The narrowing is only the git form: a bare downloader still escalates, and
 # so does a git fetch whose output is piped into a shell.
@@ -1647,6 +1652,162 @@ else
 fi
 rm -rf "$_gpe_scratch"
 rm -f "$_gpe_marker"
+
+echo
+echo "== Round 2 (git-exec-allowlist, PR #254 review): ANY global option or" \
+     "env-prefix ahead of the verb escalates, not just the specific flags" \
+     "the old denylist happened to name =="
+# Review findings, observed live by running the probes against real git:
+# classify_command returned `allow`, and the payload RAN, for all four.
+check "F1: --git-dir/--work-tree point at an attacker repo (its own core.pager runs)" \
+  'git --git-dir=/tmp/evil/.git --work-tree=/tmp/evil log' escalate
+check "F2: GIT_DIR= env points at an attacker repo" \
+  'GIT_DIR=/tmp/evil/.git git log' escalate
+check "F3: git grep --open-files-in-pag= (git accepts unambiguous abbreviations of long options)" \
+  'git grep --open-files-in-pag="touch /tmp/m" -e foo' escalate
+check "F4: attached -c, no space before the key" \
+  'git -ccore.pager=touch log' escalate
+
+# Acceptance checklist's own probe list.
+check "-C <dir> log — global option ahead of the verb" \
+  'git -C /tmp log' escalate
+check "--namespace x log — global option ahead of the verb" \
+  'git --namespace x log' escalate
+check "-p log — -p/--paginate is a global option" \
+  'git -p log' escalate
+check "GIT_WORK_TREE= env prefix before git log" \
+  'GIT_WORK_TREE=x git log' escalate
+check "EDITOR= env prefix before git log" \
+  'EDITOR=x git log' escalate
+check "--open-f=x — abbreviation of --open-files-in-pager on a non-grep verb" \
+  'git log --open-f=x' escalate
+check "-Ox on grep — attached -O value" \
+  'git grep -Ox -e foo' escalate
+check "-osrc/x on diff — attached -o (--output's short form) writes a file" \
+  'git diff -osrc/git-glued-output' escalate
+check "-osrc/x on show — attached -o (--output's short form) writes a file" \
+  'git show -osrc/x HEAD' escalate
+check "-o with a separate value on log — --output's short form" \
+  'git log -o src/x' escalate
+
+# Plain reads stay allow.
+check "git status stays allow (Round 2)"  "git status"            allow
+check "git log stays allow (Round 2)"     "git log"                allow
+check "git diff stays allow (Round 2)"    "git diff"               allow
+check "git show stays allow (Round 2)"    "git show"               allow
+check "git grep -e foo stays allow (Round 2)" "git grep -e foo"    allow
+check "git ls-files stays allow (Round 2)" "git ls-files"          allow
+check "git blame stays allow (Round 2)"   "git blame"              allow
+check "git rev-parse stays allow (Round 2)" "git rev-parse"        allow
+
+# Real negatives: run the LITERAL payload through real git and confirm the
+# marker lands (the threat is real), while classify_command for that exact
+# text already says escalate — same pattern as the existing -c core.pager
+# real negative above.
+_r2_real_negative() {   # label cmd
+  local label="$1" cmd="$2" got
+  total=$((total + 1))
+  if [ -f "$_r2_marker" ]; then
+    printf 'PASS  %-52s => %-9s\n' "real negative: $label payload runs" "ran"
+  else
+    printf 'FAIL  %-52s => %-9s\n' "real negative: $label payload runs" "did-not-run"
+    failed=$((failed + 1))
+  fi
+  total=$((total + 1))
+  got="$(classify_command "$cmd")"
+  if [ "$got" = escalate ]; then
+    printf 'PASS  %-52s => %-9s\n' "real negative: classifier escalates $label" "$got"
+  else
+    printf 'FAIL  %-52s => %-9s (want escalate)\n' "real negative: classifier escalates $label" "$got"
+    failed=$((failed + 1))
+  fi
+}
+
+# F1/F2: an alt repo whose OWN local core.pager runs, reached via
+# --git-dir/--work-tree or GIT_DIR=.
+_r2_marker="$(mktemp -u /tmp/herdr-git-exec-allowlist-marker.XXXXXX)"
+_r2_evil="$(mktemp -d)"
+( cd "$_r2_evil" && git init -q && git -c user.email=x@x -c user.name=x commit -q --allow-empty -m x
+  git -c user.email=x@x -c user.name=x config core.pager "touch $_r2_marker" )
+rm -f "$_r2_marker"
+_r2_cmd="git --git-dir=$_r2_evil/.git --work-tree=$_r2_evil log"
+( env -u GIT_PAGER -u PAGER script -q /dev/null bash -c "$_r2_cmd" >/dev/null 2>&1 )
+_r2_real_negative "F1: --git-dir/--work-tree alt-repo pager" "$_r2_cmd"
+rm -f "$_r2_marker"
+_r2_cmd="GIT_DIR=$_r2_evil/.git git log"
+( env -u GIT_PAGER -u PAGER script -q /dev/null bash -c "$_r2_cmd" >/dev/null 2>&1 )
+_r2_real_negative "F2: GIT_DIR= alt-repo pager" "$_r2_cmd"
+rm -rf "$_r2_evil"
+
+# F3: the grep abbreviation, in a fresh repo of its own.
+_r2_scratch="$(mktemp -d)"
+( cd "$_r2_scratch" && git init -q && printf 'foo\n' > f && git add f &&
+  git -c user.email=x@x -c user.name=x commit -q -m x )
+rm -f "$_r2_marker"
+_r2_cmd="(cd $_r2_scratch && env -u GIT_PAGER -u PAGER script -q /dev/null git grep --open-files-in-pag=\"touch $_r2_marker\" -e foo >/dev/null 2>&1)"
+bash -c "$_r2_cmd"
+_r2_real_negative "F3: git grep --open-files-in-pag= abbreviation" "git grep --open-files-in-pag=\"touch $_r2_marker\" -e foo"
+
+# F4 (attached -c, `-ccore.pager=...`) has no EXEC real-negative here: on
+# this machine's git, the attached short form does not apply core.pager
+# the way the spaced `-c core.pager=...` form does (confirmed live — the
+# marker never lands even though the classifier is right to treat the
+# shape as unsafe, since `-c`-attached is parsed identically to `-c`
+# wherever git DOES honor it). The classifier-escalates assertion for this
+# exact text is already covered above ("F4: attached -c, no space before
+# the key").
+rm -rf "$_r2_scratch"
+rm -f "$_r2_marker"
+unset -f _r2_real_negative
+
+echo
+echo "== classifier/shadow parity: one shared function, same verdict for every git row (Round 2) =="
+# lib/pretool-shadow.sh's `_ps_bash_handoffs_verdict` now calls the exact
+# same `_cp_git_unsafe_tokens` this file's exec-opt rule uses, fed the
+# tokens its own `_cp_locate_command_word` locator already produces (the
+# SAME locator the menu/shadow write-scope check relies on) — reproduced
+# here without the full handoffs-write scaffolding, plus the generic
+# first-word launcher/env-prefix check pretool-shadow applies ahead of it
+# (R2-3 above), so this is the real combined behaviour, not a stand-in.
+_cp_shadow_git_verdict() {              # cmd -> hit | safe | not-git
+  local cmd="$1"
+  local -a _r2_toks
+  set -f; read -r -a _r2_toks <<<"$cmd"; set +f
+  if ! _cp_locate_command_word "$cmd" || [ "$_cp_wcmd" != git ]; then
+    printf 'not-git\n'; return
+  fi
+  if [ "${_r2_toks[0]:-}" != git ]; then
+    printf 'hit\n'; return
+  fi
+  if _cp_git_unsafe_tokens "${_CP_LOC[@]:1}"; then printf 'hit\n'; else printf 'safe\n'; fi
+}
+_r2_parity_rows=(
+  'git status' 'git log' 'git diff' 'git show' 'git grep -e foo'
+  'git ls-files' 'git blame' 'git rev-parse'
+  'git --git-dir=/tmp/evil/.git --work-tree=/tmp/evil log'
+  'git grep --open-files-in-pag=touchM -e foo'
+  'git -ccore.pager=touch log'
+  'git -C /tmp log' 'git --namespace x log' 'git -p log'
+  'GIT_WORK_TREE=x git log' 'EDITOR=x git log'
+  'git log --open-f=x' 'git grep -Ox -e foo'
+  'git -c core.pager=touch log' 'git --config-env=core.pager=X log'
+  'git --exec-path=/tmp log' 'git diff --text log' 'git log --output=/tmp/x'
+  'git diff -osrc/git-glued-output' 'git show -osrc/x HEAD'
+)
+for _r2_row in "${_r2_parity_rows[@]}"; do
+  total=$((total + 1))
+  _r2_cv="$(classify_command "$_r2_row")"
+  _r2_sv="$(_cp_shadow_git_verdict "$_r2_row")"
+  case "$_r2_cv:$_r2_sv" in
+    escalate:hit|allow:safe)
+      printf 'PASS  %-52s classifier=%-9s shadow=%s\n' "parity: $_r2_row" "$_r2_cv" "$_r2_sv" ;;
+    *)
+      printf 'FAIL  %-52s classifier=%-9s shadow=%s (must agree)\n' "parity: $_r2_row" "$_r2_cv" "$_r2_sv"
+      failed=$((failed + 1)) ;;
+  esac
+done
+unset -f _cp_shadow_git_verdict
+
 
 
 
