@@ -2814,6 +2814,58 @@ check "r7 acceptance: git log --oneline allows" "git log --oneline" allow
 check "r7 acceptance: bash -c ls allows" "bash -c ls" allow
 check "r8 acceptance: ls \$HOME allows" "ls \$HOME" allow
 
+echo
+echo "== round 9 (herdr-control#254 PR comment, round-8 review): three class"
+echo "   rules closing the 19 round-8 probe failures =="
+
+# Class A (SPEC item A): a runtime-BUILT variable NAME handed to an
+# assignment builtin. All 6 round-8 probe failures for this class.
+check "r9 A1: runtime split env name (printf -v concat, then export \"\$n=...\")" \
+  'g="GIT_"; s="PA"; t="GER"; printf -v n "%s%s%s" "$g" "$s" "$t"; export "$n=/tmp/x"; git log' escalate
+check "r9 A2: hex printf env name" \
+  'n="$(printf "\x47\x49\x54\x5f\x50\x41\x47\x45\x52")"; export "$n=/tmp/x"; git log' escalate
+check "r9 A3: base64 env name" \
+  'n="$(printf R0lUX1BBR0VS | base64 -D)"; export "$n=/tmp/x"; git log' escalate
+check "r9 A4: reverse env name" \
+  'n="$(printf REGAP_TIG | rev)"; export "$n=/tmp/x"; git log' escalate
+check "r9 A5: tr env name" \
+  'n="$(printf GIT_XAGER | tr X P)"; export "$n=/tmp/x"; git log' escalate
+check "r9 A6: indirect prefix expansion (\${!prefix@})" \
+  'prefix=GIT_; for n in ${!prefix@}; do export "$n=/tmp/x"; done; git log' escalate
+
+# Class A negatives: a literal name is unaffected.
+check "r9 A negative: export with a literal name" "export FOO=bar" allow
+check "r9 A negative: export PATH_SUFFIX=x (not a real PATH write)" "export PATH_SUFFIX=x" allow
+
+# Class B (SPEC item B): writing git config by any route.
+# B.1: `git config` itself — any shape beyond a pure read.
+check "r9 B1: config key read from a file, two positionals" \
+  'git config "$(cat tmp/keyfile)" /tmp/x; git log' escalate
+check "r9 B4: git config gpg.program" "git config gpg.program /tmp/x" escalate
+check "r9 B5: git config gpg.ssh.program" "git config gpg.ssh.program /tmp/x" escalate
+check "r9 B6: git config core.askPass" "git config core.askPass /tmp/x" escalate
+check "r9 B7: git config mergetool cmd" "git config mergetool.foo.cmd /tmp/x" escalate
+check "r9 B8: git config difftool cmd" "git config difftool.foo.cmd /tmp/x" escalate
+check "r9 B9: git config merge driver" "git config merge.foo.driver /tmp/x" escalate
+check "r9 B10: git config sendemail cmd" "git config sendemail.sendmailCmd /tmp/x" escalate
+check "r9 B11: git config submodule update" 'git config submodule.foo.update !/tmp/x' escalate
+# B.2: writing the file directly, bypassing `git config` entirely.
+check "r9 B2: cat redirect into .git/config" \
+  'cat tmp/cfg > .git/config; git log' escalate
+check "r9 B3: cp into .git/config" \
+  'cp tmp/cfg-ssh .git/config; git log' escalate
+
+# Class B negatives: every pure-read shape the review's own allow list named.
+check "r9 B negative: git config --get user.name" "git config --get user.name" allow
+check "r9 B negative: git config -l" "git config -l" allow
+check "r9 B negative: git config user.email (bare key, a read)" "git config user.email" allow
+
+# Class C (SPEC item C): commit -S / tag -s stay allowed — B above already
+# closes the route that would let an agent command set gpg.program; the
+# ceiling comment (lib/command-policy.sh, just above _cp_git_unsafe_tokens)
+# names the residual risk (a repo's PRE-EXISTING config) and the upgrade path.
+check "r9 C1: git commit -S stays allow (ceiling noted, not closed this round)" "git commit -S" allow
+check "r9 C2: git tag -s stays allow (ceiling noted, not closed this round)" "git tag -s v1" allow
 
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then

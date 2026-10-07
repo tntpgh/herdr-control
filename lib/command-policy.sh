@@ -2611,6 +2611,52 @@ _cp_git_exec_opts="open-files-in-pager ext-diff textconv output exec upload-pack
 # release adding a subcommand not in this list needs a line added here —
 # same ceiling `_cp_git_exec_opts` above already carries.
 _cp_git_known_verbs=" add am annotate apply archive archimport backfill bisect blame branch bugreport bundle cat-file check-attr check-ignore check-mailmap check-ref-format checkout checkout-index cherry cherry-pick clean clone column commit commit-graph commit-tree config count-objects credential credential-cache credential-store cvsexportcommit cvsimport cvsserver daemon describe diagnose diff diff-files diff-index diff-pairs diff-tree difftool fast-export fast-import fetch fetch-pack filter-branch fmt-merge-msg for-each-ref for-each-repo fsck gc get-tar-commit-id grep hash-object help history hook http-backend http-fetch http-push imap-send index-pack init instaweb interpret-trailers log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-one-file merge-tree mergetool mktag mktree multi-pack-index mv name-rev notes p4 pack-objects pack-redundant pack-refs patch-id prune prune-packed pull push quiltimport range-diff read-tree rebase receive-pack reflog remote repack replace replay repo request-pull rerere reset restore rev-list rev-parse revert rm scalar send-email send-pack sh-i18n sh-setup shell show show-branch show-index show-ref shortlog sparse-checkout stash status stripspace submodule svn switch symbolic-ref tag unpack-file unpack-objects update-index update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack verify-tag version whatchanged worktree write-tree "
+
+# `_cp_git_config_unsafe <tok...>` (everything after the `config` word)
+# -> 0 (true) when this is NOT a pure read, 1 when it is. Round 9 (SPEC
+# item B.1, herdr-control#254 round-8 review): the old behaviour let
+# `config` fall through the verb loop below untouched — any `git config`
+# invocation stayed allow, because nothing on the exec-opt/abbreviation
+# table means anything to a config KEY/VALUE pair. The fix is not another
+# dangerous-key enumeration (`_CP_EXEC_CFGKEY_RE`, round 4, already lists
+# the ones that run a program through git itself) — SPEC: "whatever the
+# key" — a key this file has never heard of (a future `core.something`,
+# a custom `alias.*`) is just as capable of being read back by a LATER
+# command in the same chain. So this is a SHAPE check instead: the only
+# arguments that cannot change anything are the documented pure-read
+# flags (`--get`, `--get-all`, `--get-regexp`, `--list`/`-l`,
+# `--show-origin`, `--show-scope`) plus at most ONE positional (a bare
+# key, `git config user.email`). Any other flag (`--add`, `--unset`,
+# `--replace-all`, `--edit`/`-e`, `--remove-section`, `--rename-section`,
+# ...) or a second positional (the key WITH a value, `git config KEY
+# VALUE`) is a write — fails closed to unsafe rather than naming every
+# write flag git has ever added.
+_cp_git_config_unsafe() {               # tok... -> 0 if this is a write (not a pure read)
+  local tok n_pos=0
+  for tok in "$@"; do
+    case "$tok" in
+      --get|--get-all|--get-regexp|--list|-l|--show-origin|--show-scope) ;;
+      -*) return 0 ;;
+      *) n_pos=$((n_pos + 1)) ;;
+    esac
+  done
+  [ "$n_pos" -le 1 ] && return 1
+  return 0
+}
+
+# ceiling (SPEC item C, round 9): `git commit -S`/`-s`/`--gpg-sign` and
+# `git tag -s`/`-u <key>` run `gpg.program` (or `gpg.ssh.program` for SSH
+# signing) to produce the signature — the same launcher B.1/B.2 above now
+# block an agent command from SETTING. Left allowed here on purpose: with
+# writing git config closed (B above), signing can only run a gpg.program
+# an agent command did NOT set in this session. Upgrade path, if that
+# stops being true (a repo's checked-in/pre-existing config already
+# points `gpg.program` somewhere untrusted, so signing runs it on first
+# use): escalate `-S`/`-s`/`-u`/`--gpg-sign`/`--sign` on `commit`/`tag`/
+# `merge` whenever the repo's OWN config (not this command) is untrusted —
+# this file has no way to read that config today, so the check cannot be
+# added without first giving it one.
+
 _cp_git_unsafe_tokens() {               # token... (everything after the git word) -> 0 if unsafe
   local verb="" tok name opt has_u=0 has_remote=0 has_x=0 sub1=""
   for tok in "$@"; do
@@ -2622,6 +2668,17 @@ _cp_git_unsafe_tokens() {               # token... (everything after the git wor
            # external merge tool — there is no read-only shape at all, so
            # no option/argument needs inspecting.
            [ "$verb" = mergetool ] && return 0
+           # Round 9 (SPEC item B.1): `git config` has its own read/write
+           # shape, unrelated to the exec-opt/abbreviation allowlist below
+           # (a config VALUE is freeform text, not an option this table
+           # knows about). Handle it here, once, and skip the rest of this
+           # loop for its own arguments: `_cp_git_config_unsafe` decides
+           # safe/unsafe by itself; whatever it returns IS the verdict for
+           # this whole statement.
+           if [ "$verb" = config ]; then
+             _cp_git_config_unsafe "${@:2}" && return 0
+             return 1
+           fi
            continue ;;
       esac
     fi
@@ -2972,6 +3029,27 @@ _CP_EXEC_ASSIGN_NAME_RE='HOME|XDG_CONFIG_HOME|PATH'
 _cp_exec_assign_present() {             # raw -> 0 if HOME=/XDG_CONFIG_HOME=/PATH= is assigned anywhere
   local LC_ALL=C LANG=C
   grep -qE "(^|[^A-Za-z0-9_])(${_CP_EXEC_ASSIGN_NAME_RE})=" <<<"$1"
+}
+
+# Round 9 (herdr-control#254 PR comment, round-8 review item A): a
+# runtime-BUILT variable NAME handed to an assignment builtin —
+# `printf -v n "%s%s%s" "$g" "$s" "$t"; export "$n=/tmp/x"`, `n="$(printf
+# ...)"; export "$n=/tmp/x"`, `for n in ${!prefix@}; do export "$n=/tmp/x";
+# done` — never matches `_CP_EXEC_VAR_NAME_RE` above (that gate matches a
+# LITERAL name like GIT_PAGER wherever it sits; here the name is not text
+# at all until the shell expands it). Same text-anywhere philosophy as
+# round 7's `_cp_exec_name_or_opaque_present`: this does not try to
+# resolve what the expansion evaluates to (round 7 gave up on parsing
+# defeating itself) — it escalates on the SHAPE, an assignment builtin
+# whose name argument starts with an expansion, regardless of what the
+# expansion resolves to. `export FOO=bar` (a literal name) is unaffected:
+# nothing between the builtin and `=` is `$`/backtick.
+_CP_DYNAMIC_NAME_BUILTIN_RE='export|declare|typeset|local|readonly|read'
+_cp_dynamic_assign_name_present() {     # raw -> 0 if an assignment builtin's NAME arg is an expansion
+  local LC_ALL=C LANG=C
+  _cp_match "(^|[^A-Za-z0-9_])(${_CP_DYNAMIC_NAME_BUILTIN_RE})[[:space:]]+(-[A-Za-z]+[[:space:]]+)*[\"']?(\\\$|\`)" "$1" && return 0
+  _cp_match "(^|[^A-Za-z0-9_])printf[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-v[[:space:]]+(-[A-Za-z]+[[:space:]]+)*[\"']?(\\\$|\`)" "$1" && return 0
+  return 1
 }
 
 # `_cp_unquoted_text <raw>` -> prints RAW with every quoted span (single,
@@ -4220,6 +4298,39 @@ $(bash_write_targets "$raw" "$wt")
 EOF
 }
 
+# `_cp_git_dir_write_present <raw>` -> 0 (true) when RAW names a write
+# target landing under a `.git/` directory, or at `.gitconfig` — Round 9
+# (SPEC item B.2, herdr-control#254 round-8 review): `cat cfg >
+# .git/config` and `cp cfg .git/config` write the SAME file `git config`
+# writes through git itself (B.1 above), by a completely different route
+# this file's git-specific checks never look at. Reuses `bash_write_targets`
+# (the #184 write-scope scanner) rather than a second redirect/cp/tee/
+# install/dd/sed-i parser: that function already walks every operator-
+# split segment and recognizes all of those verbs' write targets — see its
+# own header. Called with `cwd="."` (no worktree boundary to resolve
+# against; this gate fires on the TARGET PATH itself, same everywhere) so
+# a relative `.git/config` lexically resolves to `/.git/config` — matched
+# by suffix, not full path, since the real repo root is unknown here. A
+# COMPUTED or UNPARSED line (a target this scanner cannot read statically)
+# is not a hit for THIS gate — other rules in this file already fail
+# closed on those shapes generally; this one only needs to recognize a
+# STATICALLY VISIBLE `.git/` target.
+_cp_git_dir_write_present() {           # raw -> 0 if a write target lands under .git/ or at .gitconfig
+  local raw="$1" line kind val
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    kind="${line%%$'\t'*}"
+    val="${line#*$'\t'}"
+    [ "$kind" = TARGET ] || continue
+    case "$val" in
+      */.git/*|*/.gitconfig) return 0 ;;
+    esac
+  done <<EOF
+$(bash_write_targets "$raw" ".")
+EOF
+  return 1
+}
+
 # _cp_write_menu_verdict <raw panel text> <worktree> -> "allow" or
 # "escalate:<reason>" on stdout, or nothing (caller falls back to the
 # existing "unknown tool" escalate) when the shape cannot be judged safely.
@@ -4665,6 +4776,27 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   # folded into the text-anywhere gate just above.
   _cp_exec_assign_present "$raw" &&
     _cp_consider 1 "command text assigns HOME/XDG_CONFIG_HOME/PATH ahead of a command — it can redirect where git finds its config or the programs it shells out to"
+
+  # escalate — round 9 (herdr-control#254 PR comment, round-8 review item
+  # A): an assignment builtin (`export`/`declare`/`typeset`/`local`/
+  # `readonly`/`read`/`printf -v`) handed a NAME argument built at run
+  # time (`export "$n=/tmp/x"`) rather than a literal. See
+  # `_cp_dynamic_assign_name_present`'s own header, just above
+  # `_cp_unquoted_text`, for the shapes this closes and why it is
+  # text-anywhere like the gate above rather than another name enumeration.
+  _cp_dynamic_assign_name_present "$raw" &&
+    _cp_consider 1 "an assignment builtin (export/declare/typeset/local/readonly/read/printf -v) is given a NAME argument built from an expansion at run time — it can set any exec-capable variable without ever spelling its name as text"
+
+  # escalate — round 9 (herdr-control#254 PR comment, round-8 review item
+  # B.2): a write target landing under `.git/` (most commonly
+  # `.git/config`, `.git/hooks/*`) or at `.gitconfig` sets git's own
+  # runtime config or an executable hook by a route that never goes
+  # through `git config` or any git subcommand at all. See
+  # `_cp_git_dir_write_present`'s own header, just above
+  # `_cp_write_menu_verdict`, for why this reuses `bash_write_targets`
+  # rather than a second redirect/cp/tee parser.
+  _cp_git_dir_write_present "$raw" &&
+    _cp_consider 1 "command writes to a path under .git/ or at .gitconfig — this can set git's runtime config or install an executable hook outside git config itself"
 
   # deny — mkfs formats a block device with no confirmation of its own;
   # nothing downstream of "yes, run this" makes that reversible, so it is
