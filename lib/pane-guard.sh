@@ -82,12 +82,13 @@ require_agent_pane() {
 # is running in this pane RIGHT NOW; it says nothing about whether that is
 # still the same process an earlier decision (a registered task, a captured
 # prompt_id) was made about.
-pane_birth_now() {                      # pane_id -> live terminal_id, empty if pane gone, rc 1 if herdr itself failed
+pane_birth_now() {                      # pane_id -> live terminal_id, empty if pane gone, rc 1 if herdr itself failed (or answered with no panes array -- L2, security review PR #252 round 3)
   local out
   out="$(herdr pane list 2>/dev/null)" || return 1
   [ -n "$out" ] || return 1
   printf '%s' "$out" | jq -r --arg p "$1" \
-    '(.result.panes // .panes)[]? | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null
+    '(.result.panes // .panes) | if type=="array" then .[] else error("no panes") end
+     | select(.pane_id==$p) | .terminal_id // empty' 2>/dev/null
 }
 
 # Refuse to act if a REGISTERED task's pane has been recycled since spawn —

@@ -66,6 +66,10 @@ herdr() {
       printf '%s' "$n" > "$LIST_CALL_FILE"
       [ -z "${FAIL_LIST:-}" ] || return 1
       [ -z "${FAIL_LIST_FROM:-}" ] || [ "$n" -lt "$FAIL_LIST_FROM" ] || return 1
+      if [ -n "${EMPTY_LIST_FROM:-}" ] && [ "$n" -ge "$EMPTY_LIST_FROM" ]; then
+        printf '{"result":{}}\n'
+        return 0
+      fi
       local first=1 p b
       printf '{"result":{"panes":['
       for p in M1 M2 SH W1 H1 F1 R1 A B; do
@@ -309,6 +313,25 @@ caller_is M1
 FAIL_LIST_FROM=2 dm --clear >/dev/null 2>&1; rc=$?
 check "cmd_clear exit 3 (never 0): an indeterminate liveness read never lets even the recorded pane itself clear it" "$rc" "3"
 check "Main is still M1 — the failed read did not let the clear through" "$(role_row)" "M1 gen_m1"
+q "DELETE FROM roles WHERE label='main';" >/dev/null
+
+printf '== L2: a well-formed (rc 0) herdr reply with NO panes array must also be indeterminate ==\n'
+# {"result":{}} -- herdr answered, exit 0, but there is no panes array at
+# all. The old jq filter ((.result.panes // .panes)[]?) treated that the
+# SAME as "queried the array, pane absent": empty output, rc 0 -- "Main
+# confirmed gone" -- letting a malformed-but-200-OK reply do exactly what
+# R2-F12 closed for an outright herdr failure.
+caller_is M1; dm >/dev/null 2>&1
+caller_is M2
+: > "$LIST_CALL_FILE"
+EMPTY_LIST_FROM=2 dm >/dev/null 2>&1; rc=$?
+check "cmd_self exit 3: a panes-array-less reply never reads as Main gone" "$rc" "3"
+check "Main is still M1" "$(role_row)" "M1 gen_m1"
+caller_is M1
+: > "$LIST_CALL_FILE"
+EMPTY_LIST_FROM=2 dm --clear >/dev/null 2>&1; rc=$?
+check "cmd_clear exit 3: a panes-array-less reply never reads as Main gone" "$rc" "3"
+check "Main is still M1" "$(role_row)" "M1 gen_m1"
 q "DELETE FROM roles WHERE label='main';" >/dev/null
 
 printf '== F5: an unreadable registry during the worker-eligibility check must refuse, not silently pass ==\n'
