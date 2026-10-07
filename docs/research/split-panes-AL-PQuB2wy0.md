@@ -112,8 +112,8 @@ herdr-control:
 - **Socket access for methods with no CLI verb:** `herdr-rpc.py:1-16` (today: `tab.move`).
   `lib/herdr_live.py:142` has a second one-shot `request()`, and it subscribes to `pane.moved`
   (`:81`).
-- **Main:** `designate-main.sh` records pane_id + birth in `roles/main`, and `config.sh` loads it.
-  Main is its own tab.
+- **Main:** `designate-main.sh` records pane_id + birth in the registry's `owners`
+  table (label `main`), and `config.sh` loads it. Main is its own tab.
 - **Watching:** `herdr pane read --source visible` (`lib/prompt-parse.sh:343,451,456`, attention/notify
   paths). `herdr_live.py:7-10` records why scraping more panes more often is costly: p95 went from
   9 ms to 136 ms.

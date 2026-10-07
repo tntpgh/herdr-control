@@ -423,7 +423,11 @@ escalate|git log --output=src/x
 escalate|git diff --ext-diff
 escalate|nice tee tmp/out
 escalate|GIT_EXTERNAL_DIFF=./tmp/x git diff
-escalate|LC_ALL=C grep foo README.md
+escalate|git grep -O./tmp/x -e foo
+escalate|git grep --open-files-in-pager=./tmp/x -e foo
+escalate|git -c core.pager=cat log
+escalate|git --config-env=core.pager=cat log
+escalate|GIT_PAGER=cat git log
 EOF
 # These are refused by peer_decide before F3 runs (find -exec/-delete, xargs,
 # $VAR, unreviewable scripts, the env credential rule); they must stay refused.
