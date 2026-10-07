@@ -20,7 +20,11 @@
 #                                        "UNPARSED\t<reason>" line per write
 #                                        target a bash command names
 #                                        (redirect/tee/cp/mv/install/ln/
-#                                        dd of=/sed|perl -i/touch/truncate);
+#                                        dd of=/sed|perl -i/touch/truncate),
+#                                        plus (round 10, ln only)
+#                                        "LNSRC\t<abs path>" per SOURCE
+#                                        argument — read-side, not itself
+#                                        a write target;
 #                                        caller MUST treat COMPUTED and
 #                                        UNPARSED as "outside scope" — #184,
 #                                        shared with
@@ -3007,6 +3011,14 @@ EOF
 #     --sendmail-cmd/--smtp-server`, and `mergetool` (always) closed by
 #     extending `_cp_git_exec_opts`/`_cp_git_unsafe_tokens` above (the
 #     option allowlist these needed, not a name match).
+#
+# ceiling (round 10, herdr-control#254 round-9 review, probe #182): this
+# text-anywhere match on `alias\.` cannot tell a WRITE (`git config
+# alias.x '!sh'`) from a pure READ of the same key (`git config
+# --get-all alias.x`) — `_cp_git_config_unsafe` above already allows the
+# read shape, but this gate runs first and considers "alias." present in
+# the text regardless. Accepted false positive, not a bug; do not weaken
+# the name match to fix it (that would reopen the write shape).
 _CP_EXEC_VAR_NAME_RE='GIT_SSH_COMMAND|GIT_SSH|GIT_PAGER|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_EXTERNAL_DIFF|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND|GIT_EXEC_PATH|GIT_CONFIG[A-Za-z0-9_]*|GIT_DIR|GIT_WORK_TREE|GIT_TEMPLATE_DIR|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH_ENV|ENV|PROMPT_COMMAND|LD_PRELOAD|DYLD_[A-Za-z0-9_]*'
 _CP_EXEC_CFGKEY_RE='core\.pager|core\.sshcommand|core\.editor|core\.fsmonitor|core\.hookspath|core\.gitproxy|diff\.external|\.textconv|credential\.helper|sequence\.editor|alias\.|include\.path|includeif|uploadpack\.|receivepack\.|filter\.|remote\.[^[:space:]]*\.uploadpack'
 
@@ -3050,6 +3062,31 @@ _cp_dynamic_assign_name_present() {     # raw -> 0 if an assignment builtin's NA
   _cp_match "(^|[^A-Za-z0-9_])(${_CP_DYNAMIC_NAME_BUILTIN_RE})[[:space:]]+(-[A-Za-z]+[[:space:]]+)*[\"']?(\\\$|\`)" "$1" && return 0
   _cp_match "(^|[^A-Za-z0-9_])printf[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-v[[:space:]]+(-[A-Za-z]+[[:space:]]+)*[\"']?(\\\$|\`)" "$1" && return 0
   return 1
+}
+
+# Round 10 (herdr-control#254 PR comment, round-9 review item 1, probe
+# #171): `declare -n`/`local -n`/`typeset -n` (any `-n` nameref flag,
+# alone or clustered with other short flags — `-gn`, `-rn`, …) binds a
+# SECOND name indirectly: `n="$(...)"; declare -n ref="$n"; export ref;
+# ref=/tmp/x` writes through `ref` to whatever variable `$n` evaluated
+# to, without that real target ever appearing as a literal assignment
+# builtin NAME — the exact gap `_cp_dynamic_assign_name_present` above
+# does not cover (its expansion check is on the NAME argument itself,
+# not on a nameref's indirection target). ceiling: this does not try to
+# tell "the nameref target contains an expansion" from "the nameref
+# target is a plain literal" — parsing that apart reopens the same
+# "parsing defeats itself" trap round 7 gave up on (see
+# `_cp_exec_name_or_opaque_present`'s header) — so ANY `-n` nameref
+# escalates unconditionally, including a harmless literal one.
+# `setvar(){ local -n ref="$1"; ref="$2"; }` (probe #175) still
+# escalates too, but not wrongly: it is a FUNCTION DEFINITION, which
+# escalates by design regardless of this rule (round 5,
+# `_cp_gate_function_def_present`) — the round-9 review's own triage
+# confirmed that escalation is correct, not a defect to route around.
+_CP_NAMEREF_RE='(^|[^A-Za-z0-9_])(declare|local|typeset)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*n[A-Za-z]*([[:space:]=]|$)'
+_cp_nameref_present() {                 # raw -> 0 if a declare/local/typeset -n nameref flag is present
+  local LC_ALL=C LANG=C
+  _cp_match "$_CP_NAMEREF_RE" "$1"
 }
 
 # `_cp_unquoted_text <raw>` -> prints RAW with every quoted span (single,
@@ -3849,6 +3886,26 @@ _cp_bwt_verb_targets() {
       _cp_bwt_scan_optvals "S" "t" "suffix" "target-directory" "$@"
       if [ "$_CP_BWT_TGT_HIT" != 1 ] && [ "${#_CP_BWT_NONOPT[@]}" -ge 2 ]; then
         _cp_bwt_classify_target "${_CP_BWT_NONOPT[$((${#_CP_BWT_NONOPT[@]} - 1))]}"
+      fi
+      # Round 10 (herdr-control#254 PR comment, round-9 review item 2,
+      # probes #176-178): `ln`'s SOURCE argument (every non-option arg
+      # other than the implicit last-is-dest one, or every one of them
+      # when an explicit `-t DIR`/`--target-directory` makes them all
+      # sources) can itself be `.git/config`/`.gitconfig` — a hardlink or
+      # symlink that then gets written through at the OTHER path writes
+      # the real git config file by a route `_cp_git_dir_write_present`
+      # (which only looks at the write TARGET) never sees. `cp`/`mv`
+      # reading or moving `.git/config` is a different, out-of-scope
+      # shape (no second path keeps writing through it afterward), so
+      # this is `ln`-only.
+      if [ "$cmd" = ln ]; then
+        local _cp_lnsrc_i=0 _cp_lnsrc_n="${#_CP_BWT_NONOPT[@]}" _cp_lnsrc_last=$((${#_CP_BWT_NONOPT[@]} - 1))
+        while [ "$_cp_lnsrc_i" -lt "$_cp_lnsrc_n" ]; do
+          if [ "$_CP_BWT_TGT_HIT" = 1 ] || [ "$_cp_lnsrc_i" -lt "$_cp_lnsrc_last" ]; then
+            printf 'LNSRC\t%s\n' "${_CP_BWT_NONOPT[$_cp_lnsrc_i]}"
+          fi
+          _cp_lnsrc_i=$((_cp_lnsrc_i + 1))
+        done
       fi ;;
     install)
       # herdr-control#192 round 4, G1/G2/G3: routed through the shared
@@ -4190,12 +4247,18 @@ _cp_bwt_unterminated_quote() {
 # path>" (cwd-joined, cd-adjusted, lexically `.`/`..`-collapsed — NOT
 # symlink-resolved; that is the hook's job, see _cp_lexical_abspath's own
 # header), "COMPUTED\t<raw text>" (a target this cannot read statically —
-# substitution, unquoted $VAR, glob, ~otheruser), or "UNPARSED\t<reason>"
-# (an unterminated quote — see _cp_bwt_unterminated_quote) line per write
-# target this command names. Every caller MUST treat COMPUTED and UNPARSED
-# identically to "outside scope" — a command that cannot be read is not
-# proof it writes nowhere. Genuinely empty output means this command names
-# no write target at all (`git status`). Runs _cp_strip_heredocs FIRST
+# substitution, unquoted $VAR, glob, ~otheruser), "UNPARSED\t<reason>"
+# (an unterminated quote — see _cp_bwt_unterminated_quote), or (round 10,
+# `ln` only) "LNSRC\t<abs-ish path>" for every SOURCE argument — same
+# resolution as TARGET, but NOT a write target itself; only
+# `_cp_ln_git_source_present` below reads this kind, and callers that
+# only ever matched `TARGET` (`_cp_git_dir_write_present`,
+# `_cp_bash_write_scope_violation`) silently and correctly ignore it —
+# line per write target this command names. Every caller MUST treat
+# COMPUTED and UNPARSED identically to "outside scope" — a command that
+# cannot be read is not proof it writes nowhere. Genuinely empty output
+# means this command names no write target at all (`git status`). Runs
+# _cp_strip_heredocs FIRST
 # (same function scannable_command uses): an inert heredoc body (`cat > f
 # <<EOF` — cat never executes it) is DATA, not a write target, and would
 # otherwise misread `cp`/`tee`/etc mentioned only in usage text inside the
@@ -4245,14 +4308,14 @@ bash_write_targets() {
       [ -n "$line" ] || continue
       kind="${line%%$'\t'*}"
       val="${line#*$'\t'}"
-      if [ "$kind" = TARGET ]; then
-        case "$val" in
-          /*) printf 'TARGET\t%s\n' "$(_cp_lexical_abspath "$val")" ;;
-          *) printf 'TARGET\t%s\n' "$(_cp_lexical_abspath "$eff/$val")" ;;
-        esac
-      else
-        printf '%s\n' "$line"
-      fi
+      case "$kind" in
+        TARGET|LNSRC)
+          case "$val" in
+            /*) printf '%s\t%s\n' "$kind" "$(_cp_lexical_abspath "$val")" ;;
+            *) printf '%s\t%s\n' "$kind" "$(_cp_lexical_abspath "$eff/$val")" ;;
+          esac ;;
+        *) printf '%s\n' "$line" ;;
+      esac
     done <<EOF2
 $(_cp_bwt_segment "$body" "$eff")
 EOF2
@@ -4286,6 +4349,14 @@ _cp_bash_write_scope_violation() {
       printf '%s' "$val"
       return 0
     fi
+    # Round 10: `bash_write_targets` now also emits `LNSRC` lines (an
+    # `ln` SOURCE argument, not a write target — see that rule's own
+    # header near `_cp_ln_git_source_present`) through this SAME stream.
+    # Those are a read-side path, not a write-scope boundary — an `ln -s
+    # /usr/local/bin/foo bin/foo` symlinking FROM outside the worktree is
+    # ordinary and must stay allowed; only a real `TARGET` line is this
+    # function's concern.
+    [ "$kind" = TARGET ] || continue
     _cp_path_within_worktree "$val" "$wt" && continue
     case "$val" in /tmp|/tmp/*) continue ;; esac
     if [ -n "${TMPDIR:-}" ]; then
@@ -4322,6 +4393,38 @@ _cp_git_dir_write_present() {           # raw -> 0 if a write target lands under
     kind="${line%%$'\t'*}"
     val="${line#*$'\t'}"
     [ "$kind" = TARGET ] || continue
+    case "$val" in
+      */.git/*|*/.gitconfig) return 0 ;;
+    esac
+  done <<EOF
+$(bash_write_targets "$raw" ".")
+EOF
+  return 1
+}
+
+# `_cp_ln_git_source_present <raw>` -> 0 (true) when RAW's `ln`/`ln -s`
+# names a SOURCE argument under a `.git/` directory, or at `.gitconfig` —
+# Round 10 (herdr-control#254 PR comment, round-9 review item 2, probes
+# #176-178): `.git/config`'s own write target is already closed by
+# `_cp_git_dir_write_present` above, but a hardlink or symlink planted
+# FROM `.git/config` TO an outside path (`ln .git/config /tmp/cfgcopy`,
+# `ln -s .git/config /tmp/cfgcopy`) lets a later, completely ordinary-
+# looking write to the OUTSIDE path (`echo pager=/tmp/x >> /tmp/cfgcopy`)
+# land in the real git config — the write target that command names is
+# `/tmp/cfgcopy`, nowhere near `.git/`, so no TARGET-based rule ever
+# sees it. Reuses `bash_write_targets`'s own `LNSRC` lines (same
+# resolution as `TARGET`: cwd-joined, cd-adjusted, lexically collapsed)
+# rather than a second argv/option parser — see that function's header
+# for the kind contract. `cwd="."` for the same reason
+# `_cp_git_dir_write_present` uses it: no worktree boundary to resolve
+# against, this gate fires on the SOURCE PATH itself.
+_cp_ln_git_source_present() {           # raw -> 0 if an ln SOURCE argument is under .git/ or at .gitconfig
+  local raw="$1" line kind val
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    kind="${line%%$'\t'*}"
+    val="${line#*$'\t'}"
+    [ "$kind" = LNSRC ] || continue
     case "$val" in
       */.git/*|*/.gitconfig) return 0 ;;
     esac
@@ -4787,6 +4890,12 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   _cp_dynamic_assign_name_present "$raw" &&
     _cp_consider 1 "an assignment builtin (export/declare/typeset/local/readonly/read/printf -v) is given a NAME argument built from an expansion at run time — it can set any exec-capable variable without ever spelling its name as text"
 
+  # escalate — round 10 (herdr-control#254 PR comment, round-9 review
+  # item 1): a `declare`/`local`/`typeset` `-n` nameref flag. See
+  # `_cp_nameref_present`'s own header, just above `_cp_unquoted_text`.
+  _cp_nameref_present "$raw" &&
+    _cp_consider 1 "declare/local/typeset -n creates a nameref — it can write through an indirectly-bound variable whose real target never appears as a literal assignment name"
+
   # escalate — round 9 (herdr-control#254 PR comment, round-8 review item
   # B.2): a write target landing under `.git/` (most commonly
   # `.git/config`, `.git/hooks/*`) or at `.gitconfig` sets git's own
@@ -4797,6 +4906,13 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   # rather than a second redirect/cp/tee parser.
   _cp_git_dir_write_present "$raw" &&
     _cp_consider 1 "command writes to a path under .git/ or at .gitconfig — this can set git's runtime config or install an executable hook outside git config itself"
+
+  # escalate — round 10 (herdr-control#254 PR comment, round-9 review
+  # item 2): an `ln`/`ln -s` SOURCE argument under `.git/` or at
+  # `.gitconfig`. See `_cp_ln_git_source_present`'s own header, just
+  # above `_cp_write_menu_verdict`.
+  _cp_ln_git_source_present "$raw" &&
+    _cp_consider 1 "ln names a source path under .git/ or at .gitconfig — a hardlink or symlink planted here lets a later ordinary-looking write elsewhere land in git's own runtime config"
 
   # deny — mkfs formats a block device with no confirmation of its own;
   # nothing downstream of "yes, run this" makes that reversible, so it is

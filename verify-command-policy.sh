@@ -2867,6 +2867,27 @@ check "r9 B negative: git config user.email (bare key, a read)" "git config user
 check "r9 C1: git commit -S stays allow (ceiling noted, not closed this round)" "git commit -S" allow
 check "r9 C2: git tag -s stays allow (ceiling noted, not closed this round)" "git tag -s v1" allow
 
+echo
+echo "== round 10 (herdr-control#254 PR comment, round-9 review): two" \
+     "classes closing the 4 real round-9 probe failures =="
+
+# Item 1 (SPEC): declare/local/typeset -n nameref, any target, escalates
+# unconditionally (ceiling noted in lib/command-policy.sh above
+# _cp_nameref_present). Probe #171's exact shape.
+check "r10 nameref: declare -n ref=\"\$n\" (runtime-built target)" \
+  'n="$(printf "\x47\x49\x54\x5f\x50\x41\x47\x45\x52")"; declare -n ref="$n"; export ref; ref=/tmp/x; git log' escalate
+check "r10 nameref negative: declare -a arr=(1 2) (no -n flag)" "declare -a arr=(1 2)" allow
+
+# Item 2 (SPEC): ln/ln -s SOURCE under .git/ or at .gitconfig. Probes
+# #176-178.
+check "r10 ln B1: hardlink .git/config out, then write the hardlink" \
+  'ln ".git/config" "/tmp/herdr-r10-hardlink-target"; printf "[core]\nsshCommand = /tmp/x\n" > "/tmp/herdr-r10-hardlink-target"; git log' escalate
+check "r10 ln B2: symlink .git/config out, then write through the symlink" \
+  'ln -s ".git/config" "/tmp/herdr-r10-symlink-target"; printf "[core]\nsshCommand = /tmp/x\n" > "/tmp/herdr-r10-symlink-target"; git log' escalate
+check "r10 ln B3: relative hardlink, no quotes, common agent shape" \
+  'ln .git/config /tmp/cfgcopy; echo "[core]" > /tmp/cfgcopy; echo "pager = /tmp/x" >> /tmp/cfgcopy; git log' escalate
+check "r10 ln negative: ln -s ../shared lib/shared (source outside .git/)" \
+  "ln -s ../shared lib/shared" allow
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
