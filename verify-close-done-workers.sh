@@ -23,7 +23,7 @@ export CALLS
 herdr() {
   printf '%s\n' "$1 $2" >> "$CALLS"
   case "$1 $2" in
-    "pane list")  printf '{"result":{"panes":[{"pane_id":"pX","agent_status":"idle","terminal_id":"birthX"},{"pane_id":"pY","agent_status":"idle","terminal_id":"birthY"},{"pane_id":"pZ","agent_status":"idle","terminal_id":"birthZ"},{"pane_id":"pR","agent_status":"idle","terminal_id":"birthR-live"}]}}\n' ;;
+    "pane list")  printf '{"result":{"panes":[{"pane_id":"pX","agent_status":"idle","terminal_id":"birthX"},{"pane_id":"pY","agent_status":"idle","terminal_id":"birthY"},{"pane_id":"pZ","agent_status":"idle","terminal_id":"birthZ"},{"pane_id":"pR","agent_status":"idle","terminal_id":"birthR-live"},{"pane_id":"pC","agent_status":"idle","terminal_id":"cbirthC"},{"pane_id":"pS1","agent_status":"idle","terminal_id":"birthS1"},{"pane_id":"pS2","agent_status":"idle","terminal_id":"birthS2"}]}}\n' ;;
     "pane close") : ;;
     *) printf '{}\n' ;;
   esac
@@ -48,6 +48,17 @@ gh() {
 export -f gh
 
 export HERDR_RUN_STATE_DIR="$(mktemp -d)/runs"
+
+# herdr-action.sh env overrides for the supersede-on-close tests below: a
+# throwaway forms dir (never $HOME/.local/state/herdr) and a no-op send
+# stub, so HERDR_PANE_ID=pC's conductor-authority supersede calls never
+# touch a real pane or the real Slack bridge.
+export HERDR_STATE_ROOT="$(mktemp -d)"
+mkdir -p "$HERDR_STATE_ROOT/forms"
+HA_SEND_STUB="$(mktemp -d)/send"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$HA_SEND_STUB"
+chmod +x "$HA_SEND_STUB"
+export HERDR_ACTION_SEND="$HA_SEND_STUB"
 
 . "$here/lib/run-registry.sh"
 # A registered, running task whose worktree does not exist on disk: the
@@ -376,6 +387,62 @@ check "taskNoList untouched" "$(read_task runNL taskNoList | jq -r .state)" "run
 eval "$old_herdr_fn"
 export -f herdr
 
+printf '== --apply supersedes a closed task'"'"'s pending action requests, leaves approved alone, and retires the pinned hub form ==\n'
+register_task runSup taskSup w c pC cbirthC pS1 birthS1 /repo/sup /does/not/exist "sup-task" \
+  || bad "register taskSup failed"
+set_task_state runSup taskSup running || bad "taskSup -> running failed (setup)"
+db="$(registry_db)"
+sqlite3 "$db" "INSERT INTO action_requests
+    (request_id, run_id, task_id, tool, action_sha256, command, verdict, reason, route, grant_kind, status, created_at)
+  VALUES
+    ('req_sup_p1','runSup','taskSup','bash','sha_p1','echo p1','escalate','probe','conductor','once','pending',$(date -u +%s)),
+    ('req_sup_p2','runSup','taskSup','bash','sha_p2','echo p2','escalate','probe','conductor','once','pending',$(date -u +%s)),
+    ('req_sup_a1','runSup','taskSup','bash','sha_a1','echo a1','escalate','probe','conductor','once','approved',$(date -u +%s));"
+mkdir -p "$HERDR_STATE_ROOT/forms"
+printf '{"status":"open","form_path":"dummy-sup1"}' > "$HERDR_STATE_ROOT/forms/form_sup1.json"
+sqlite3 "$db" "UPDATE action_requests SET form_record='form_sup1' WHERE request_id='req_sup_p1';"
+
+: > "$CALLS"
+out=$(bash "$here/close-done-workers.sh" --task=taskSup 2>&1)
+printf '%s' "$out" | grep -q 'would supersede 2 pending request(s)' \
+  && ok "dry run lists would-supersede count for a task with 2 pending requests" || bad "dry run count missing: $out"
+check "dry run: req_sup_p1 still pending" "$(sqlite3 "$db" "SELECT status FROM action_requests WHERE request_id='req_sup_p1';")" "pending"
+check "dry run: req_sup_p2 still pending" "$(sqlite3 "$db" "SELECT status FROM action_requests WHERE request_id='req_sup_p2';")" "pending"
+check "dry run: req_sup_a1 still approved" "$(sqlite3 "$db" "SELECT status FROM action_requests WHERE request_id='req_sup_a1';")" "approved"
+check "dry run: taskSup still running" "$(read_task runSup taskSup | jq -r .state)" "running"
+check "dry run: pinned form still open" "$(jq -r .status "$HERDR_STATE_ROOT/forms/form_sup1.json")" "open"
+
+HERDR_PANE_ID=pC bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --task=taskSup \
+  >/tmp/cdw-sup-apply-$$.log 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ok "apply with pending requests exits 0" || bad "apply exit $rc: $(cat /tmp/cdw-sup-apply-$$.log)"
+check "req_sup_p1 superseded" "$(sqlite3 "$db" "SELECT status FROM action_requests WHERE request_id='req_sup_p1';")" "superseded"
+check "req_sup_p2 superseded" "$(sqlite3 "$db" "SELECT status FROM action_requests WHERE request_id='req_sup_p2';")" "superseded"
+check "req_sup_a1 (already approved) untouched by the supersede sweep" \
+  "$(sqlite3 "$db" "SELECT status FROM action_requests WHERE request_id='req_sup_a1';")" "approved"
+check "taskSup closed" "$(read_task runSup taskSup | jq -r .state)" "completed"
+check "the pinned hub form was retired exactly as a manual supersede does" \
+  "$(jq -r .status "$HERDR_STATE_ROOT/forms/form_sup1.json")" "withdrawn"
+grep -q 'supersede-failed' /tmp/cdw-sup-apply-$$.log && bad "unexpected supersede-failed: $(cat /tmp/cdw-sup-apply-$$.log)" \
+  || ok "no supersede-failed reported for a live conductor"
+
+printf '== a held-back task'"'"'s pending action requests are left untouched ==\n'
+held_wt=$(mktemp -d)/wt-held
+git init -q -b main "$held_wt"
+git -C "$held_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+mkdir -p "$held_wt/.handoffs"; printf '*\n' > "$held_wt/.handoffs/.gitignore"
+printf 'dirty\n' > "$held_wt/dirty.txt"        # uncommitted -> held, never closable
+register_task runHeld taskHeld w c pC cbirthC pS2 birthS2 /repo/held "$held_wt" "held-task" \
+  || bad "register taskHeld failed"
+set_task_state runHeld taskHeld running || bad "taskHeld -> running failed (setup)"
+sqlite3 "$db" "INSERT INTO action_requests
+    (request_id, run_id, task_id, tool, action_sha256, command, verdict, reason, route, grant_kind, status, created_at)
+  VALUES ('req_held_p1','runHeld','taskHeld','bash','sha_held_p1','echo held','escalate','probe','conductor','once','pending',$(date -u +%s));"
+out=$(HERDR_PANE_ID=pC bash "$here/close-done-workers.sh" --apply --reason=no-follow-on --task=taskHeld 2>&1)
+printf '%s' "$out" | grep -q 'HOLD' && ok "dirty worktree is held, not closed" || bad "held task was not held: $out"
+check "req_held_p1 still pending -- a held task's requests are never touched" \
+  "$(sqlite3 "$db" "SELECT status FROM action_requests WHERE request_id='req_held_p1';")" "pending"
+check "taskHeld untouched" "$(read_task runHeld taskHeld | jq -r .state)" "running"
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

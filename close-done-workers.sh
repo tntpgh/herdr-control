@@ -726,7 +726,39 @@ while IFS='|' read -r run_id task_id pane pane_birth wt label trunk repo review_
   closable=$((closable+1))
   printf '  close  %-8s %-46s (%s)%s\n' "$pane" "$label" "$st" "${_DPR_VIA:+ (superseded)}"
   [ -n "$dpr_tuple" ] && printf '         %-8s %-46s %s\n' '' '' "$dpr_tuple"
+  # This task may still have pending action requests (lib/action-request.sh)
+  # sitting on a hub form nobody will ever act on once this pane is gone —
+  # 98 stale forms measured 2026-10-08. List what would be superseded in
+  # BOTH modes (dry run previews it too); the actual decide call happens
+  # only under --apply, and only below, BEFORE the registry completes the
+  # task -- herdr-action.sh's conductor authority refuses on anything but
+  # an active task (_ha_task_active), so superseding after completion
+  # would refuse every single one.
+  pending_reqs=$(_sql "SELECT request_id || '|' || action_sha256 FROM action_requests
+      WHERE task_id=$(_sq "$task_id") AND status='pending' ORDER BY created_at;" 2>/dev/null)
+  pending_n=0
+  [ -n "$pending_reqs" ] && pending_n=$(printf '%s\n' "$pending_reqs" | grep -c .)
+  if [ "$pending_n" -gt 0 ]; then
+    printf '         %-8s %-46s would supersede %d pending request(s)\n' '' '' "$pending_n"
+  fi
   [ "$apply" = 1 ] || continue
+
+  if [ "$pending_n" -gt 0 ]; then
+    while IFS='|' read -r preq_id preq_sha; do
+      [ -n "$preq_id" ] || continue
+      # The real decide path (herdr-action.sh supersede), never a hand-
+      # rolled `UPDATE action_requests` -- that is the ONLY call that also
+      # retires the row's pinned hub form exactly as a manual supersede
+      # does. Never approves, never runs the call (supersede grants
+      # nothing). A failure here (task raced to inactive, pane recycled,
+      # registry hiccup) must never stop the pane closing below -- report
+      # it and leave the row pending for the hub's own tick to deal with.
+      if ! "$HERE/herdr-action.sh" supersede "$preq_id" --authority conductor \
+          --action-sha256 "$preq_sha" --review-reason "worker closed: $closure_reason" >/dev/null 2>&1; then
+        printf '  supersede-failed %s\n' "$preq_id"
+      fi
+    done <<<"$pending_reqs"
+  fi
 
   # Settle the registry FIRST. If the pane close succeeds and this did not
   # run, the task stays `running` forever against a pane that no longer

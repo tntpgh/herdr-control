@@ -141,6 +141,20 @@ check "proof_file points at PROOF.md" "$(jq -r .proof_file "$idjson" 2>/dev/null
 printf '%s' "$(jq -r .how_to_complete "$idjson" 2>/dev/null)" | grep -qi 'closure reason' \
   && ok "how_to_complete explains the closure-reason requirement" || bad "how_to_complete silent on closure reasons"
 
+printf '== tmp/ is self-gitignored exactly like .handoffs/: a fresh spawn leaves it invisible to git status ==\n'
+tmp_gitignore="$wt/tmp/.gitignore"
+[ -f "$tmp_gitignore" ] && ok "tmp/.gitignore written" || bad "tmp/.gitignore missing at $tmp_gitignore"
+[ "$(cat "$tmp_gitignore" 2>/dev/null)" = "*" ] && ok "tmp/.gitignore ignores everything, itself included" || bad "tmp/.gitignore wrong content: $(cat "$tmp_gitignore" 2>/dev/null)"
+printf 'scratch probe output\n' > "$wt/tmp/probe.out"
+dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+[ "$dirty" = 0 ] && ok "tmp/ scratch file invisible to git status" || bad "tmp/ not self-ignored: $(git -C "$wt" status --porcelain 2>/dev/null)"
+
+printf '== re-spawn on the same branch keeps existing tmp/ files ==\n'
+run_spawn no-brief-branch >/tmp/spawn-out-tmp-$$.log 2>&1 || bad "re-spawn (tmp/ check) failed: $(cat /tmp/spawn-out-tmp-$$.log)"
+[ -f "$wt/tmp/probe.out" ] && ok "re-spawn keeps an existing tmp/ file" || bad "re-spawn deleted tmp/probe.out"
+grep -q 'scratch probe output' "$wt/tmp/probe.out" 2>/dev/null \
+  && ok "re-spawn leaves tmp/probe.out bytes untouched" || bad "tmp/probe.out contents changed by re-spawn"
+
 printf '== --dry-run --brief FILE: spec line shows the brief path exactly once (regression) ==\n'
 dryrun_brief=$(mktemp)
 printf '# dry run brief\n' > "$dryrun_brief"

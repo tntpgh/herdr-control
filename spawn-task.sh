@@ -569,6 +569,21 @@ mkdir -p "$(dirname "$events_file")"
 # coordination log into the branch it was sent to write.
 printf '*\n' > "$(dirname "$events_file")/.gitignore"
 
+# tmp/ gets the same self-ignore treatment, for the same reason but a
+# different failure mode: a worker's own probe/scratch scripts under
+# tmp/ (the worker-rules.md convention for anything reviewed by
+# reference) are untracked, so `git status --porcelain` reports the
+# worktree dirty forever and close-done-workers.sh's "clean tree" check
+# holds the pane back — measured 2026-10-08, 20 finished worktrees held
+# back for nothing but leftover tmp/ scratch. Unlike .handoffs/.gitignore
+# above (always `*`, safe to rewrite every spawn), this is created ONLY
+# if missing: a respawn into an existing worktree must never touch a
+# directory that may already hold a worker's files, even with identical
+# content — the unconditional-write lesson two paragraphs below applies
+# here too.
+wt_tmp_dir="$wt/tmp"
+[ -e "$wt_tmp_dir/.gitignore" ] || { mkdir -p "$wt_tmp_dir" && printf '*\n' > "$wt_tmp_dir/.gitignore"; }
+
 # ---- SPEC.md / PROOF.md: written FIRST, before any herdr/registry side
 # effect (tab, pane, task registration, claim) — a write failure here exits
 # clean with nothing else created yet.
