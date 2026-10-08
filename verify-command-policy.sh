@@ -1961,8 +1961,8 @@ check_wt "bash find -exec touch outside is unwrapped and escalates (#192 bypass 
   "$WT_184" 'find . -maxdepth 0 -exec touch /outside/marker \;' escalate
 check_wt "bash piped to xargs touch outside is unwrapped and escalates (#192 bypass C)" \
   "$WT_184" 'echo /outside/marker | xargs touch' escalate
-check_wt "bash find -exec touch fully inside the worktree allows (unwrap, not blanket fail-closed)" \
-  "$WT_184" 'find . -exec touch .handoffs/x \;' allow
+check_wt "bash find -exec touch (round 3, #261 r3): touch is not on the inner read-only allowlist, escalates even fully inside the worktree now" \
+  "$WT_184" 'find . -exec touch .handoffs/x \;' escalate
 check_wt "bash plain find with no -exec writes nothing, allows (the dominant real-world find shape)" \
   "$WT_184" "find . -name '*.log'" allow
 
@@ -3264,6 +3264,43 @@ check "#261 r3: xcrun -f with no -r stays a non-executing lookup, allows" \
   "xcrun -f clang" allow
 check "#261 r3: xcrun --show-sdk-path alone stays a non-executing lookup, allows" \
   "xcrun --show-sdk-path" allow
+
+# #261 r3 live-run finding (4): the measured OB rows below are DELIBERATE
+# over-blocks per the brief, not bugs — agents never need script/arch/
+# xcrun at all, and find -exec's allowlist is ten read-only tools, full
+# stop. Pinned here explicitly so a future round doesn't mistake a
+# regression test for a live bug and "fix" it back open.
+check "#261 r3 (deliberate OB): script running a genuinely safe read now escalates" \
+  "script -q /dev/null cat README.md" escalate
+check "#261 r3 (deliberate OB): arch running a genuinely safe read now escalates" \
+  "arch -arm64 cat README.md" escalate
+check "#261 r3 (deliberate OB): xcrun running a genuinely safe read now escalates" \
+  "xcrun cat README.md" escalate
+check "#261 r3 (deliberate OB): find -exec git (not on the allowlist) escalates" \
+  "find . -exec git log \\;" escalate
+check "#261 r3 (deliberate OB): find -exec shellcheck (not on the allowlist) escalates" \
+  "find . -name '*.sh' -exec shellcheck {} +" escalate
+check "#261 r3 (deliberate OB): xcrun simctl (a real tool invocation, not an info-only lookup) escalates" \
+  "xcrun simctl list devices" escalate
+
+# #261 r3 live-run finding (1): four more launchers Main's live probes
+# found still allowing a wrapped unsafe git call straight through,
+# because they are neither on the generic transparent-launcher skip
+# list (sudo/env/nice/.../caffeinate/unbuffer/sandbox-exec — those
+# already resolve PAST themselves to the real command word) nor on the
+# per-tool extractor dispatch (find/script/arch/xcrun/chroot/flock) —
+# `_cp_wcmd` stopped AT the launcher name and no case arm matched it, so
+# the default `return 1` (not unsafe) let it through untouched.
+check "#261 r3 N1-launcher: taskpolicy wrapping git -C escalates" \
+  "taskpolicy -c utility git -C /tmp/evilrepo status" escalate
+check "#261 r3 N1-launcher: direnv exec wrapping git -C escalates" \
+  "direnv exec . git -C /tmp/evilrepo status" escalate
+check "#261 r3 N1-launcher: mise exec wrapping git -C escalates" \
+  "mise exec -- git -C /tmp/evilrepo status" escalate
+check "#261 r3 N1-launcher: launchctl asuser wrapping git -C escalates" \
+  "launchctl asuser 501 git -C /tmp/evilrepo status" escalate
+check "#261 r3 N1-launcher: a bare launcher with nothing trailing is not a wrapped command, allows" \
+  "direnv" allow
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

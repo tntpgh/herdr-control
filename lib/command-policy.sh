@@ -3127,6 +3127,17 @@ _cp_git_seg_exec_unsafe() {             # protected-segment [depth]
       return 1 ;;
     script)
       return 0 ;;
+    # #261 r3 live-run finding (1): these four have no safe-to-parse
+    # value-opt grammar worth building (taskpolicy's -c/-p, direnv's
+    # exec/allow/other subcommands, mise's exec/run/other subcommands,
+    # launchctl's asuser/submit/bootstrap/other subcommands) and agents
+    # never need any of them — any trailing word at all after the
+    # wrapper name escalates, same unconditional rule as `script`. A
+    # bare invocation with nothing trailing (nothing can run) still
+    # falls through to the default `return 1` below.
+    taskpolicy|direnv|mise|launchctl)
+      [ "${#_CP_LOC[@]}" -gt 1 ] && return 0
+      return 1 ;;
     arch)
       _cp_wrap_arch_has_cmd "${_CP_LOC[@]:1}" && return 0
       return 1 ;;
@@ -3562,7 +3573,11 @@ _cp_exec_name_or_opaque_present() {     # raw -> 0 if an exec-capable name/confi
 
 # `_cp_find_word_injection_present <raw>` -> 0 (true) when RAW names
 # `find` as a literal word ANYWHERE and also carries an UNQUOTED `$` or
-# backtick-substitution opener anywhere (round 3, SPEC #261 r3, N3): by
+# backtick-substitution opener AFTER that word (round 3, SPEC #261 r3,
+# N3, narrowed per Main's live run: `TS=$(date +%s) find . -newer
+# /tmp/ref.json` false-escalated because the FIRST version of this check
+# scanned the whole raw line — the `$(date +%s)` sits in a leading
+# assignment, never in find's own argv, and trunk already allows it). By
 # the time text reaches `_cp_find_exec_unsafe`'s token array,
 # `_cp_protect_text` has already stripped every quote character, so a
 # quoted `"$ROOT"` and a bare `$ROOT` are textually IDENTICAL — the
@@ -3573,16 +3588,21 @@ _cp_exec_name_or_opaque_present() {     # raw -> 0 if an exec-capable name/confi
 # scan never sees — live-measured in round 2's N3). Reading the
 # distinction off RAW text before protection, via `_cp_unquoted_text`
 # (already in this file, same job it does for the brace-expansion gate
-# above), is the only point it still exists. Text-anywhere rather than
-# scoped to one statement — same accepted-false-positive trade this
-# file already makes for `PAGER`/`BASH_ENV` above — so `echo "$x"; find .
-# -name y` also escalates; cheap and rare compared to actually parsing
-# statement boundaries a second, possibly-inconsistent way.
-_cp_find_word_injection_present() {     # raw -> 0 if find + an unquoted expansion both appear
+# above), is the only point it still exists; cutting RAW at the first
+# literal `find` before unquoting scopes the `$`/backtick search to
+# find's own invocation and everything after it, not whatever sits
+# ahead of it on the same line. Still text-anywise PAST that cut point
+# rather than scoped to one statement — same accepted-false-positive
+# trade this file already makes for `PAGER`/`BASH_ENV` above — so
+# `find . -name y; echo "$x"` also escalates; cheap and rare compared to
+# actually parsing statement boundaries a second, possibly-inconsistent
+# way.
+_cp_find_word_injection_present() {     # raw -> 0 if find + a later unquoted expansion both appear
   local LC_ALL=C LANG=C
-  local raw="$1"
+  local raw="$1" rest
   grep -qE '(^|[^A-Za-z0-9_])find([^A-Za-z0-9_]|$)' <<<"$raw" || return 1
-  grep -qE '\$|`' <<<"$(_cp_unquoted_text "$raw")"
+  rest="${raw#*find}"
+  grep -qE '\$|`' <<<"$(_cp_unquoted_text "$rest")"
 }
 
 # ---- the floor rule table (ported from qm's command-policy.ts) ------------
