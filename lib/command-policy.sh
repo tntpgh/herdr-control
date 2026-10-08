@@ -5911,7 +5911,10 @@ conductor_reserved_reason() {
   #
   # _cp_registry_read_allowed carves back out exactly: `sqlite3 [-readonly]
   # [-json|-line|-separator X] <path> "<ONE statement>"`, statement a bare
-  # SELECT/PRAGMA (no `=`) or `.schema`/`.tables`, no stdin/no other flag
+  # SELECT/PRAGMA matching a finite allowlist (round 3: a fixed read-only
+  # PRAGMA-name list, a fixed pure-function list for SELECT — see
+  # _cp_registry_pragma_safe/_cp_registry_select_safe below) or `.schema`/
+  # `.tables`, no stdin/no other flag
   # (so `-init`, `-cmd`, `-csv`, ... all fail closed), and no `;`/`$(`/
   # unresolved `$VAR` inside the quoted SQL or the path. F4 (over-
   # reservation of ordinary reads): a `>` used as a SQL COMPARISON is
@@ -5940,13 +5943,32 @@ _CP_REGISTRY_TRIGGER_RE="$_CP_REGISTRY_PATH_RE"'|\bsqlite3\b|(^|[;&|(]|[[:space:
 
 # `_cp_registry_read_allowed <raw>` -> 0 only for the single allowlisted
 # registry read: `sqlite3 [-readonly] [-json|-line|-separator X] <path>
-# "<statement>"`, statement exactly one bare SELECT/PRAGMA (no `=` — a
-# setter) or `.schema`/`.tables`. A harmless stderr-to-null (`2>/dev/null`)
-# or fd-dup (`N>&M`) redirect is blanked first so it cannot itself trip the
-# operator check (F4); every other unquoted operator (real stdin/output
-# redirect, `;`, `&&`, a pipe) still makes _cp_simple_words refuse, which
-# this function then also refuses. No other sqlite3 flag is allowlisted —
-# `-init`, `-cmd`, `-csv`, `-batch`, ... all fall through to "not allowed".
+# "<statement>"`, statement exactly one bare SELECT/PRAGMA or `.schema`/
+# `.tables`. A harmless stderr-to-null (`2>/dev/null`) or fd-dup (`N>&M`)
+# redirect is blanked first so it cannot itself trip the operator check
+# (F4); every other unquoted operator (real stdin/output redirect, `;`,
+# `&&`, a pipe) still makes _cp_simple_words refuse, which this function
+# then also refuses. No other sqlite3 flag is allowlisted -- `-init`,
+# `-cmd`, `-csv`, `-batch`, ... all fall through to "not allowed".
+#
+# Round 3 (PR #258 round-2 review, two HIGH): a bare "no `=`" check on the
+# SQL text let two write-capable shapes through. PRAGMA accepts its
+# argument in parens as well as after `=` (SQLite's own PRAGMA grammar),
+# so `PRAGMA user_version(42)`/`PRAGMA journal_mode(WAL)` were unreserved
+# writes (F1); and the sqlite3 CLI's `writefile()`/`load_extension()` are
+# application-defined SQL FUNCTIONS, callable from inside an otherwise-
+# bare SELECT, that write/load arbitrary files (F2). Both are closed by
+# replacing the "no `=`" check with two finite allowlists instead of a
+# denylist: _cp_registry_pragma_safe accepts only PRAGMA names proven
+# read-only in SQLite's own docs, each with EITHER no argument or one
+# bareword-identifier argument in parens (never `=`, never a quoted/
+# numeric/expression argument -- so `user_version(42)` does not match the
+# identifier-argument shape and falls through to escalate); _cp_registry_
+# select_safe strips quoted string literals (so a function name sitting
+# inside a literal, e.g. 'writefile(' in a string, is just text) and then
+# requires every remaining `identifier(` to name a function from a fixed
+# pure/read-only list -- anything else (writefile, load_extension, an
+# unknown function, a window function) is NOT in the list and fails closed.
 _cp_registry_read_allowed() {           # raw
   local tidy
   tidy="$(printf '%s' "$1" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
@@ -5977,11 +5999,79 @@ _cp_registry_read_allowed() {           # raw
   if printf '%s' "$sql" | grep -qiE '^\.schema([[:space:]]|$)|^\.tables[[:space:]]*$'; then
     return 0
   fi
-  if printf '%s' "$sql" | grep -qiE '^(select|pragma)[[:space:]]'; then
-    case "$sql" in *=*) return 1 ;; esac   # a PRAGMA setter, not a read
-    return 0
+  if printf '%s' "$sql" | grep -qiE '^pragma([[:space:]]|$)'; then
+    _cp_registry_pragma_safe "$sql" && return 0
+    return 1
+  fi
+  if printf '%s' "$sql" | grep -qiE '^select([[:space:]]|$)'; then
+    _cp_registry_select_safe "$sql" && return 0
+    return 1
   fi
   return 1
+}
+
+# The fixed, read-only PRAGMA names (SPEC round 3 item 1): schema/
+# connection-state introspection pragmas, each taking no argument or one
+# identifier naming what to report on -- never a value that changes
+# anything. Anything not on this list (writable_schema, synchronous,
+# foreign_keys, case_sensitive_like, ...) escalates.
+_CP_REGISTRY_READONLY_PRAGMAS=' table_info table_xinfo index_list index_info foreign_key_list user_version schema_version journal_mode page_count freelist_count integrity_check quick_check database_list compile_options '
+
+# `_cp_registry_pragma_safe <sql>` -> 0 only for `PRAGMA <name>` or
+# `PRAGMA <name>(<identifier>)`, <name> on the list above and <identifier>
+# a bare word (no quotes, no digits-only literal, no expression) -- so
+# `PRAGMA user_version(42)` (a numeric SETTER, F1) does not match the
+# identifier-argument shape and falls through to escalate, while `PRAGMA
+# user_version` (the bare read) and `PRAGMA table_info(tasks)` (a table
+# name) both match and are allowed. Any `=` anywhere is refused outright.
+_cp_registry_pragma_safe() {            # sql
+  local sql="$1" rest name=""
+  case "$sql" in *=*) return 1 ;; esac
+  rest="$(printf '%s' "$sql" | sed -E 's/^[Pp][Rr][Aa][Gg][Mm][Aa][[:space:]]*//; s/[[:space:]]+$//')"
+  case "$rest" in
+    [A-Za-z_]*)
+      if [[ "$rest" =~ ^([A-Za-z_][A-Za-z0-9_]*)$ ]] ||
+         [[ "$rest" =~ ^([A-Za-z_][A-Za-z0-9_]*)\([A-Za-z_][A-Za-z0-9_]*\)$ ]]; then
+        name="$(printf '%s' "${BASH_REMATCH[1]}" | tr 'A-Z' 'a-z')"
+      fi
+      ;;
+  esac
+  [ -n "$name" ] || return 1
+  case "$_CP_REGISTRY_READONLY_PRAGMAS" in
+    *" $name "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The fixed, pure/read-only SQL function names (SPEC round 3 item 2):
+# scalar and aggregate functions from SQLite's own core and JSON1
+# function lists that only compute a value from their arguments -- never
+# touch the filesystem, an extension, or connection state. `writefile`,
+# `readfile`, `load_extension`, and every other name NOT on this list
+# fail closed.
+_CP_REGISTRY_PURE_FUNCS=' count min max sum total avg abs round length lower upper trim ltrim rtrim substr substring instr replace coalesce ifnull nullif iif typeof printf format date time datetime julianday strftime unixepoch group_concat string_agg json json_extract json_array json_object json_group_array json_group_object json_each json_tree json_type json_valid cast like glob hex quote char unicode '
+
+# `_cp_registry_select_safe <sql>` -> 0 only when every `identifier(` in
+# the statement names a function on the list above. Quoted string
+# literals (single- or double-quoted, `''`/`""` the doubled-quote escape)
+# are stripped first, so a function name that is just TEXT inside a
+# literal (`SELECT 'writefile(oops)'`) never trips the check -- while
+# `SELECT writefile('/path','x')`, where `writefile(` sits outside any
+# quote, still fails closed because `writefile` is not on the list.
+_cp_registry_select_safe() {            # sql
+  local sql="$1" stripped call ident
+  stripped="$(printf '%s' "$sql" | sed -E "s/'([^']|'')*'/''/g" | sed -E 's/"([^"]|"")*"/""/g')"
+  while IFS= read -r call; do
+    [ -n "$call" ] || continue
+    ident="$(printf '%s' "${call%(}" | tr 'A-Z' 'a-z')"
+    case "$_CP_REGISTRY_PURE_FUNCS" in
+      *" $ident "*) ;;
+      *) return 1 ;;
+    esac
+  done <<EOF
+$(printf '%s' "$stripped" | grep -ioE '[A-Za-z_][A-Za-z0-9_]*\(')
+EOF
+  return 0
 }
 
 # The governance files. A name counts only as a whole path component: the

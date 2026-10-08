@@ -3009,6 +3009,54 @@ check_unreserved "sqlite3 SELECT using > as a SQL comparison, not a redirect" \
 check_unreserved "sqlite3 SELECT with a harmless stderr-to-null redirect" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1' 2>/dev/null"
 
+# Round 3 (PR #258 round-2 review, two HIGH): the bare "no `=`" check let
+# a PRAGMA setter spelled with parens, and an allowlisted-SELECT that
+# calls a side-effecting SQLite CLI function, both through. Fixed with a
+# finite PRAGMA-name allowlist and a finite pure-function allowlist
+# (lib/command-policy.sh: _cp_registry_pragma_safe, _cp_registry_select_
+# safe). Rows below are tmp/probes.sh's "new allowlist attacks" section,
+# adapted from the round-2 review (.handoffs/REVIEW.md, F1/F2) plus the
+# full round-1 set it re-ran, with the expected verdict the fixed
+# implementation now produces.
+check_reserved "F1: PRAGMA setter with parens (user_version, not an identifier arg)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA user_version(42)'"
+check_unreserved "PRAGMA journal_mode with an identifier arg (on the fixed read-only-pragma list)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA journal_mode(WAL)'"
+check_reserved "PRAGMA name not on the fixed read-only list, even bare" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA writable_schema'"
+check_reserved "CTE followed by INSERT (does not start with select/pragma)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'WITH x AS (SELECT 1) INSERT INTO tasks(task_id) SELECT x FROM x'"
+check_reserved "ATTACH after SELECT (semicolon makes it a second statement)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1; ATTACH \"/tmp/x\" AS x'"
+check_reserved "semicolon inside a SELECT string literal (conservative over-reservation, not a bypass)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT \";\"'"
+check_reserved "F2: SELECT writefile() to an arbitrary file" \
+  "sqlite3 /tmp/other.sqlite3 'SELECT writefile(\"/tmp/forged\",\"x\")'"
+check_reserved "F2: SELECT writefile() targeting the registry path as its argument" \
+  "sqlite3 /tmp/other.sqlite3 'SELECT writefile(\"/Users/thurbs/.local/state/herdr/runs/registry.sqlite3\",\"x\")'"
+check_reserved "SELECT load_extension() (not on the pure-function list)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT load_extension(\"/tmp/x.dylib\")'"
+check_reserved "sqlite3 -cmd .output before .schema (-cmd is not an allowlisted flag)" \
+  "sqlite3 -cmd '.output /tmp/forged' ~/.local/state/herdr/runs/registry.sqlite3 '.schema'"
+check_reserved "here-string UPDATE (stdin redirect, not the allowlist shape)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 <<< \"UPDATE tasks SET status=1\""
+check_reserved "command-substitution path (computed path fails closed)" \
+  'sqlite3 "$(printf %s ~/.local/state/herdr/runs/registry.sqlite3)" "UPDATE tasks SET status=1"'
+check_reserved "quoted command-name split (\"sql\"\"ite3\" glues back to sqlite3)" \
+  '"sql""ite3" ~/.local/state/herdr/runs/registry.sqlite3 "UPDATE tasks SET status=1"'
+check_unreserved "quoted SQL keyword split (\"SEL\"\"ECT 1\" glues back to a harmless SELECT)" \
+  'sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 "SEL""ECT 1"'
+
+# SELECTs using pure/read-only functions stay unreserved (SPEC item 3):
+# the allowlist is for FUNCTION NAMES, not a ban on function calls.
+check_unreserved "SELECT using count()/max() (pure aggregate functions)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT count(*), max(task_id) FROM tasks'"
+check_unreserved "SELECT using json_extract()/coalesce() (pure JSON/scalar functions)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \"SELECT json_extract(meta,'x'), coalesce(status,'none') FROM tasks\""
+check_unreserved "SELECT using strftime() (pure date function)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \"SELECT strftime('%Y-%m-%d', created_at) FROM tasks\""
+check_unreserved "a function name inside a SELECT string literal is just text" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \"SELECT 'writefile(oops)'\""
 
 # Real negative: the threat named in the SPEC is real -- an UPDATE through
 # sqlite3 really does rewrite conductor_pane_id on a throwaway registry (own
