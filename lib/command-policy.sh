@@ -3003,6 +3003,49 @@ _cp_wrap_xcrun_verb() {                 # args... -> 0 unsafe, 1 safe
   return 0
 }
 
+# `_cp_wrap_taskpolicy_has_cmd <taskpolicy's own args...>` -> 0 (unsafe)
+# the moment a word follows taskpolicy's own recognized flags (`man
+# taskpolicy`: two synopsis forms — `[-d policy] [-g policy] [-c clamp]
+# [-b] [-t thruput_tier] [-l latency_tier] [-a] [-s] [-S shims]
+# [-m limit] [-j pri] [-P pcontrol] program [arg1 [...]]`, or
+# `[-b|-B] [-t thruput_tier] [-l latency_tier] [-p pid]` to modify an
+# already-running process — neither form's own flags ever take a value
+# shaped like a program name). Same shape as `_cp_wrap_arch_has_cmd`:
+# ANY trailing word always escalates, no attempt to judge what it is. 1
+# (safe, trunk's verdict) when taskpolicy carries nothing but its own
+# flags — `taskpolicy -c utility` alone sets a clamp and runs nothing.
+# An option this table does not list fails closed (0) rather than guess
+# whether it takes a value.
+_cp_wrap_taskpolicy_has_cmd() {         # args...
+  local -a a=("$@")
+  local i=0 n="${#a[@]}"
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -d|-g|-c|-t|-l|-m|-j|-P|-p|-S) i=$((i + 2)); continue ;;
+      -b|-B|-a|-s) i=$((i + 1)); continue ;;
+      -*) return 0 ;;
+    esac
+    return 0
+  done
+  return 1
+}
+
+# `_cp_wrap_open_has_launcher_flag <open's own args...>` -> 0 (unsafe)
+# when `-a`/`--args` appears anywhere in open's argv (`open --help`:
+# `--args` passes all remaining arguments to the launched application's
+# `main()`; `-a <application>` picks which bundle to launch, same
+# "handing attacker-controlled argv/target to another program" risk
+# class as `script`). 1 (safe, trunk's verdict) for a bare
+# `open <file-or-url>` with neither flag — it can only ever open its own
+# argument, never pass argv through.
+_cp_wrap_open_has_launcher_flag() {     # args...
+  local a
+  for a in "$@"; do
+    case "$a" in -a|--args) return 0 ;; esac
+  done
+  return 1
+}
+
 # `_cp_wrap_chroot_verb <chroot's own args...>` -> the command's full argv
 # for `chroot [-G group[,group...]] [-g group] [-u user] newroot [command
 # [arg...]]` (`man chroot`). The first non-option word is always
@@ -3127,15 +3170,42 @@ _cp_git_seg_exec_unsafe() {             # protected-segment [depth]
       return 1 ;;
     script)
       return 0 ;;
-    # #261 r3 live-run finding (1): these four have no safe-to-parse
-    # value-opt grammar worth building (taskpolicy's -c/-p, direnv's
-    # exec/allow/other subcommands, mise's exec/run/other subcommands,
-    # launchctl's asuser/submit/bootstrap/other subcommands) and agents
-    # never need any of them — any trailing word at all after the
-    # wrapper name escalates, same unconditional rule as `script`. A
-    # bare invocation with nothing trailing (nothing can run) still
-    # falls through to the default `return 1` below.
-    taskpolicy|direnv|mise|launchctl)
+    # #261 r3 live-run finding (1): direnv/mise have no safe-to-parse
+    # value-opt grammar worth building (direnv's exec/allow/other
+    # subcommands, mise's exec/run/other subcommands) and agents never
+    # need either — any trailing word at all after the wrapper name
+    # escalates, same unconditional rule as `script`. A bare invocation
+    # with nothing trailing (nothing can run) still falls through to the
+    # default `return 1` below.
+    direnv|mise)
+      [ "${#_CP_LOC[@]}" -gt 1 ] && return 0
+      return 1 ;;
+    # #261 r4: unlike direnv/mise, taskpolicy's OWN flag grammar is
+    # small, fixed, and fully documented (`man taskpolicy`) — every flag
+    # either takes exactly one value or is boolean, so a trailing PROGRAM
+    # (the only thing worth escalating for) is unambiguous once those
+    # flags are walked off, same pattern `_cp_wrap_arch_has_cmd` already
+    # uses. `taskpolicy -c utility` alone (round-3 live-run over-block,
+    # main-probes FAIL) carries no trailing program and matches origin/
+    # main's own verdict (main has no taskpolicy rule at all) — allow.
+    # `taskpolicy -c utility git -C … status` still escalates unchanged.
+    taskpolicy)
+      _cp_wrap_taskpolicy_has_cmd "${_CP_LOC[@]:1}" && return 0
+      return 1 ;;
+    # #261 r4: launchctl's subcommand grammar is too broad to parse
+    # safely in general (`submit`/`bootstrap` can run or register
+    # arbitrary programs), so every subcommand but the single literal,
+    # argument-less `list` keeps the round-3 "any trailing word
+    # escalates" rule. Bare `launchctl list` (round-3 live-run
+    # over-block, main-probes FAIL) is a pure read — it cannot run
+    # anything — and matches origin/main's own verdict (main's only
+    # launchctl rule is the unrelated getenv/export env-dump check, which
+    # doesn't match `list` either). `launchctl list com.apple.Finder` and
+    # every other subcommand/trailing-arg shape still escalate unchanged.
+    launchctl)
+      if [ "${#_CP_LOC[@]}" -eq 2 ] && [ "${_CP_LOC[1]}" = list ]; then
+        return 1
+      fi
       [ "${#_CP_LOC[@]}" -gt 1 ] && return 0
       return 1 ;;
     arch)
@@ -3143,6 +3213,16 @@ _cp_git_seg_exec_unsafe() {             # protected-segment [depth]
       return 1 ;;
     xcrun)
       _cp_wrap_xcrun_verb "${_CP_LOC[@]:1}" && return 0
+      return 1 ;;
+    # #261 r4: `open -a <application>`/`open … --args …` are a stock
+    # macOS launcher capable of passing attacker-controlled argv to
+    # another application's `main()` (`open --help`: "--args All
+    # remaining arguments are passed in argv to the application's main()
+    # function") — join the always-escalate launcher class, same as
+    # `script`. Bare `open <file-or-url>` (no `-a`/`--args` anywhere)
+    # keeps trunk's verdict — it cannot pass argv to anything.
+    open)
+      _cp_wrap_open_has_launcher_flag "${_CP_LOC[@]:1}" && return 0
       return 1 ;;
     chroot)
       local rc
@@ -3572,24 +3652,39 @@ _cp_exec_name_or_opaque_present() {     # raw -> 0 if an exec-capable name/confi
 }
 
 # `_cp_find_word_injection_present <raw>` -> 0 (true) when RAW names
-# `find` as a literal word ANYWHERE and also carries an UNQUOTED `$` or
-# backtick-substitution opener AFTER that word (round 3, SPEC #261 r3,
-# N3, narrowed per Main's live run: `TS=$(date +%s) find . -newer
+# `find` as a literal word ANYWHERE and also carries an UNQUOTED `$`,
+# backtick-substitution opener, or glob character (`*`/`?`/`[`) AFTER
+# that word (round 3, SPEC #261 r3, N3, narrowed per Main's live run: `TS=$(date +%s) find . -newer
 # /tmp/ref.json` false-escalated because the FIRST version of this check
 # scanned the whole raw line — the `$(date +%s)` sits in a leading
-# assignment, never in find's own argv, and trunk already allows it). By
+# assignment, never in find's own argv, and trunk already allows it).
+# Round 4 (SPEC #261 r4, ATK-glob6, round-3 review's reopened N3): the
+# `$`/backtick half of this check never covered a BARE unquoted glob
+# character sitting in find's own path/expression argv, outside any
+# already-recognized `-exec` clause — `_cp_find_exec_unsafe`'s own glob
+# check only fires on a token that already starts with `-`, so a token
+# that is purely `*` (no leading dash) never matched either check.
+# Live-measured: `find . * -maxdepth 0` lets the shell's own (unquoted)
+# glob expansion splice a planted `-exec`-named file into find's argv at
+# runtime, and real BSD find accepts `-exec` there as a genuine primitive
+# — the same "unreadable word can expand into something the static
+# scanner never saw" principle N1 already established for the command
+# word, just not carried over to find's own argv. By
 # the time text reaches `_cp_find_exec_unsafe`'s token array,
 # `_cp_protect_text` has already stripped every quote character, so a
-# quoted `"$ROOT"` and a bare `$ROOT` are textually IDENTICAL — the
+# quoted `"$ROOT"`/`'*.md'` and a bare `$ROOT`/`*.md` are textually
+# IDENTICAL — the
 # array has no way left to tell apart `find "$ROOT" -type f` (OB, one
-# token regardless of value) from `find $ROOT -type f` or
-# `X='-exec git -C /evil status ;'; find . $X` (an unquoted expansion
-# that word-splits at runtime into brand-new find primaries this static
-# scan never sees — live-measured in round 2's N3). Reading the
+# token regardless of value) or `find . -name '*.md'` (OB, quoted glob
+# stays literal) from `find $ROOT -type f`,
+# `X='-exec git -C /evil status ;'; find . $X`, or `find . * -maxdepth 0`
+# (unquoted expansions/globs that word-split or glob-expand at runtime
+# into brand-new find primaries this static scan never sees — live-
+# measured in round 2's N3 and round 4's ATK-glob6). Reading the
 # distinction off RAW text before protection, via `_cp_unquoted_text`
 # (already in this file, same job it does for the brace-expansion gate
 # above), is the only point it still exists; cutting RAW at the first
-# literal `find` before unquoting scopes the `$`/backtick search to
+# literal `find` before unquoting scopes the `$`/backtick/glob search to
 # find's own invocation and everything after it, not whatever sits
 # ahead of it on the same line. Still text-anywise PAST that cut point
 # rather than scoped to one statement — same accepted-false-positive
@@ -3597,12 +3692,12 @@ _cp_exec_name_or_opaque_present() {     # raw -> 0 if an exec-capable name/confi
 # `find . -name y; echo "$x"` also escalates; cheap and rare compared to
 # actually parsing statement boundaries a second, possibly-inconsistent
 # way.
-_cp_find_word_injection_present() {     # raw -> 0 if find + a later unquoted expansion both appear
+_cp_find_word_injection_present() {     # raw -> 0 if find + a later unquoted expansion/glob both appear
   local LC_ALL=C LANG=C
   local raw="$1" rest
   grep -qE '(^|[^A-Za-z0-9_])find([^A-Za-z0-9_]|$)' <<<"$raw" || return 1
   rest="${raw#*find}"
-  grep -qE '\$|`' <<<"$(_cp_unquoted_text "$rest")"
+  grep -qE '\$|`|\*|\?|\[' <<<"$(_cp_unquoted_text "$rest")"
 }
 
 # ---- the floor rule table (ported from qm's command-policy.ts) ------------

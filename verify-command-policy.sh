@@ -3301,6 +3301,80 @@ check "#261 r3 N1-launcher: launchctl asuser wrapping git -C escalates" \
   "launchctl asuser 501 git -C /tmp/evilrepo status" escalate
 check "#261 r3 N1-launcher: a bare launcher with nothing trailing is not a wrapped command, allows" \
   "direnv" allow
+
+# ---------------------------------------------------------------------------
+# #261 round 4 (review of round 3: CHANGES — ATK-glob6 HIGH reopened N3 in
+# a narrower form, open joins the launcher class, two bare-wrapper
+# over-blocks judged against origin/main's own verdict). Every row below
+# is a FAIL in round 3's main-probes.out (43 pass, 9 fail), pinned here
+# with its round-4 decided verdict — fixed where the brief calls for a
+# fix, left exactly as measured where the brief says leave it.
+
+# ATK-glob6 (HIGH, fixed): a bare, non-flag-shaped, unquoted glob
+# character in find's own path/expression argv — outside any already-
+# recognized -exec clause — used to be invisible to both the clause-level
+# glob check (only fires on a token starting with '-') and the word-
+# injection check (only looked for '$'/backtick). Real BSD find accepts
+# a shell-glob-expanded '-exec' there as a genuine primitive.
+check "#261 r4 ATK-glob6: a bare unquoted glob in find's own argv escalates" \
+  "find . * -maxdepth 0" escalate
+check "#261 r4 ATK-glob6: an unquoted glob after find's OWN flag/value pair still escalates" \
+  "find . -newer /tmp/ref * -maxdepth 0" escalate
+check "#261 r4 ATK-glob6-OB: a QUOTED glob pattern keeps today's verdict, allows" \
+  "find . -name '*.md'" allow
+
+# ATK-tilde-safe (decided: stays escalated, on purpose — brief item 4):
+# a path-qualified -exec clause command word is judged by its own
+# literal spelling, not its resolved target; tightening this to resolve
+# `~/../../usr/bin/wc` down to the bare allowlisted name is out of scope
+# for this round.
+check "#261 r4 ATK-tilde-safe: find -exec through a path-qualified ~/../.. wc stays escalated (deliberate, brief item 4)" \
+  "find . -exec ~/../../usr/bin/wc -l {} \\;" escalate
+
+# open (MEDIUM, fixed): open -a/--args is a stock macOS launcher capable
+# of passing attacker-controlled argv to another application's main().
+check "#261 r4 open: open -a <application> joins the always-escalate launcher class" \
+  "open -a /Applications/Terminal.app" escalate
+check "#261 r4 open: open --args passes argv through, escalates" \
+  "open -a /Applications/Foo.app --args --evil-flag" escalate
+check "#261 r4 open (OB): a bare open <file-or-url> with neither flag keeps trunk's verdict, allows" \
+  "open ./report.pdf" allow
+
+# Over-block rows judged against origin/main's own verdict (brief item
+# 4): main has no taskpolicy rule at all, and main's only launchctl rule
+# matches getenv/export, never list — so both bare forms below allow on
+# main today. Wrapping an actual command through either still escalates
+# unchanged (N1-launcher checks above).
+check "#261 r4 (OB fixed): bare 'taskpolicy -c utility' with no program carries nothing to run, allows (matches origin/main)" \
+  "taskpolicy -c utility" allow
+check "#261 r4 (OB fixed): bare 'launchctl list' is a pure read, allows (matches origin/main)" \
+  "launchctl list" allow
+check "#261 r4 (OB fixed, regression): taskpolicy wrapping an actual program still escalates" \
+  "taskpolicy -c utility git log" escalate
+check "#261 r4 (OB fixed, regression): launchctl list with a trailing service-target still escalates" \
+  "launchctl list com.apple.Finder" escalate
+
+# Remaining main-probes FAIL rows: measured over-blocks the brief does
+# NOT ask to fix this round (script/arch/xcrun running ANY command, and
+# find's own read-only-tool-collateral arg charset, are deliberate
+# design per the round-3 header) — pinned here so a future round doesn't
+# mistake either for a regression and "fix" it back open.
+check "#261 r4 (OB, deliberate, unchanged): bare 'script -q /dev/null' still escalates (script always escalates)" \
+  "script -q /dev/null" escalate
+check "#261 r4 (OB, deliberate, unchanged): arch running a safe read still escalates" \
+  "arch -arm64 git log" escalate
+check "#261 r4 (OB, deliberate, unchanged): xcrun running a real tool still escalates" \
+  "xcrun simctl list devices" escalate
+check "#261 r4 (OB, deliberate, unchanged): find -exec grep whose own argument is an unquoted expansion fails the clause arg charset closed" \
+  "find \"\$ROOT\" -type f \\( -name pre-commit -o -name pre-merge-commit \\) -exec grep -lF \"\$DEPLOYED\" {} +" escalate
+
+# ATK-fifo (MEDIUM, documented, not coded): the 10-tool find -exec
+# allowlist includes cat/head/tail/wc/shasum, all of which block
+# indefinitely reading a FIFO with no writer. Out of scope for this
+# classifier — it judges static command TEXT and cannot see the
+# filesystem at the time the command actually runs, so it cannot tell a
+# real file from an attacker-planted FIFO at the path a -exec clause
+# names. No test: there is no text-level distinction to assert.
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
