@@ -498,12 +498,18 @@ if [ -z "$base" ] && ! git -C "$root" show-ref --verify --quiet "refs/heads/${br
     echo "spawn-task: could not resolve origin's default branch — basing on local HEAD (pass --base to be explicit)" >&2
   fi
 fi
-if git -C "$root" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt"; then
+# Read the list once into a variable. Never pipe `git worktree list` into
+# `grep -q`: under `set -o pipefail`, grep exits on its first match, git takes
+# SIGPIPE (rc 141) once the list is longer than the pipe can absorb, and the
+# pipeline reads as "no such worktree" -- spawn-task then tried
+# `worktree add` over an existing worktree and died (measured 2026-10-08 with a
+# 22 KB list).
+wt_list="$(git -C "$root" worktree list --porcelain 2>/dev/null)"
+if grep -qxF "worktree $wt" <<<"$wt_list"; then
   # archive-worktrees.sh --apply `git worktree lock`s a worktree for its whole
   # archive-to-remove window (review r2 H1 of PR #236): re-spawning into it
   # would write .handoffs/ into a directory that is about to be removed.
-  if git -C "$root" worktree list --porcelain 2>/dev/null \
-      | awk -v w="$wt" '/^worktree /{cur=substr($0,10)} /^locked archive-worktrees\.sh /{ if (cur == w) f=1 } END{exit !f}'; then
+  if awk -v w="$wt" '/^worktree /{cur=substr($0,10)} /^locked archive-worktrees\.sh /{ if (cur == w) f=1 } END{exit !f}' <<<"$wt_list"; then
     echo "spawn-task: $wt is locked by an archive-worktrees.sh run (archiving, about to remove it) — not reusing it" >&2
     exit 1
   fi
