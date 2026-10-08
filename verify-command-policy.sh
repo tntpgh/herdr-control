@@ -2988,75 +2988,112 @@ check_reserved "source lib/claims.sh and call a writer directly" \
 check_reserved "source lib/run-registry.sh and call a writer directly" \
   'bash -c ". ./lib/run-registry.sh; register_owner forged pane birth session /tmp"'
 
-check_unreserved "sqlite3 SELECT against the registry" \
+# Round 4 (PR #258 round-3 review, .handoffs/REVIEW.md: F1 critical, F2
+# high) deleted the finite PRAGMA-name and pure-function allowlists and
+# trusts `sqlite3 -readonly -safe` to refuse writes at the ENGINE instead
+# of parsing SQL text. None of the probes below carry the required pair,
+# so every one -- including the three shapes round 3's allowlists used
+# to let through -- is now reserved; the round-4 flag tests that follow
+# re-run the harmless ones WITH `-readonly -safe` to prove they still work.
+check_reserved "sqlite3 SELECT against the registry, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
-check_unreserved "sqlite3 .schema read against the registry" \
+check_reserved "sqlite3 .schema read against the registry, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 '.schema tasks'"
-check_unreserved "sqlite3 .tables read against the registry" \
+check_reserved "sqlite3 .tables read against the registry, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 '.tables'"
-check_unreserved "sqlite3 bare PRAGMA read against the registry" \
+check_reserved "sqlite3 bare PRAGMA read against the registry, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA table_info(tasks)'"
-check_unreserved "sqlite3 -readonly SELECT against the registry" \
+check_reserved "sqlite3 -readonly SELECT against the registry, missing -safe" \
   "sqlite3 -readonly ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
-check_unreserved "sqlite3 -json SELECT against the registry" \
+check_reserved "sqlite3 -json SELECT against the registry, no -readonly -safe" \
   "sqlite3 -json ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
-
-# F4 (review): ordinary reads the old regex over-reserved -- a `>` used as
-# a SQL comparison (inside quotes, never a real operator) and a harmless
-# stderr-to-null redirect must both stay in the allowlist.
-check_unreserved "sqlite3 SELECT using > as a SQL comparison, not a redirect" \
+check_reserved "sqlite3 SELECT using > as a SQL comparison, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT x > 1 FROM tasks'"
-check_unreserved "sqlite3 SELECT with a harmless stderr-to-null redirect" \
+check_reserved "sqlite3 SELECT with a harmless stderr-to-null redirect, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1' 2>/dev/null"
-
-# Round 3 (PR #258 round-2 review, two HIGH): the bare "no `=`" check let
-# a PRAGMA setter spelled with parens, and an allowlisted-SELECT that
-# calls a side-effecting SQLite CLI function, both through. Fixed with a
-# finite PRAGMA-name allowlist and a finite pure-function allowlist
-# (lib/command-policy.sh: _cp_registry_pragma_safe, _cp_registry_select_
-# safe). Rows below are tmp/probes.sh's "new allowlist attacks" section,
-# adapted from the round-2 review (.handoffs/REVIEW.md, F1/F2) plus the
-# full round-1 set it re-ran, with the expected verdict the fixed
-# implementation now produces.
-check_reserved "F1: PRAGMA setter with parens (user_version, not an identifier arg)" \
+check_reserved "PRAGMA setter with parens, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA user_version(42)'"
-check_unreserved "PRAGMA journal_mode with an identifier arg (on the fixed read-only-pragma list)" \
+check_reserved "PRAGMA journal_mode with an identifier arg, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA journal_mode(WAL)'"
-check_reserved "PRAGMA name not on the fixed read-only list, even bare" \
+check_reserved "PRAGMA name never read-only, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA writable_schema'"
-check_reserved "CTE followed by INSERT (does not start with select/pragma)" \
+check_reserved "CTE followed by INSERT, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'WITH x AS (SELECT 1) INSERT INTO tasks(task_id) SELECT x FROM x'"
-check_reserved "ATTACH after SELECT (semicolon makes it a second statement)" \
+check_reserved "ATTACH after SELECT, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1; ATTACH \"/tmp/x\" AS x'"
-check_reserved "semicolon inside a SELECT string literal (conservative over-reservation, not a bypass)" \
+check_reserved "semicolon inside a SELECT string literal, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT \";\"'"
-check_reserved "F2: SELECT writefile() to an arbitrary file" \
+check_reserved "SELECT writefile() to an arbitrary file, no -readonly -safe" \
   "sqlite3 /tmp/other.sqlite3 'SELECT writefile(\"/tmp/forged\",\"x\")'"
-check_reserved "F2: SELECT writefile() targeting the registry path as its argument" \
+check_reserved "SELECT writefile() targeting the registry path, no -readonly -safe" \
   "sqlite3 /tmp/other.sqlite3 'SELECT writefile(\"/Users/thurbs/.local/state/herdr/runs/registry.sqlite3\",\"x\")'"
-check_reserved "SELECT load_extension() (not on the pure-function list)" \
+check_reserved "SELECT load_extension(), no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT load_extension(\"/tmp/x.dylib\")'"
-check_reserved "sqlite3 -cmd .output before .schema (-cmd is not an allowlisted flag)" \
+check_reserved "sqlite3 -cmd .output before .schema (-cmd is never allowed)" \
   "sqlite3 -cmd '.output /tmp/forged' ~/.local/state/herdr/runs/registry.sqlite3 '.schema'"
-check_reserved "here-string UPDATE (stdin redirect, not the allowlist shape)" \
+check_reserved "here-string UPDATE, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 <<< \"UPDATE tasks SET status=1\""
-check_reserved "command-substitution path (computed path fails closed)" \
+check_reserved "command-substitution path, no -readonly -safe" \
   'sqlite3 "$(printf %s ~/.local/state/herdr/runs/registry.sqlite3)" "UPDATE tasks SET status=1"'
-check_reserved "quoted command-name split (\"sql\"\"ite3\" glues back to sqlite3)" \
+check_reserved "quoted command-name split, no -readonly -safe" \
   '"sql""ite3" ~/.local/state/herdr/runs/registry.sqlite3 "UPDATE tasks SET status=1"'
-check_unreserved "quoted SQL keyword split (\"SEL\"\"ECT 1\" glues back to a harmless SELECT)" \
+check_reserved "quoted SQL keyword split, no -readonly -safe" \
   'sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 "SEL""ECT 1"'
-
-# SELECTs using pure/read-only functions stay unreserved (SPEC item 3):
-# the allowlist is for FUNCTION NAMES, not a ban on function calls.
-check_unreserved "SELECT using count()/max() (pure aggregate functions)" \
+check_reserved "SELECT using pure aggregate functions, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT count(*), max(task_id) FROM tasks'"
-check_unreserved "SELECT using json_extract()/coalesce() (pure JSON/scalar functions)" \
+check_reserved "SELECT using pure JSON/scalar functions, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \"SELECT json_extract(meta,'x'), coalesce(status,'none') FROM tasks\""
-check_unreserved "SELECT using strftime() (pure date function)" \
+check_reserved "SELECT using strftime(), no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \"SELECT strftime('%Y-%m-%d', created_at) FROM tasks\""
-check_unreserved "a function name inside a SELECT string literal is just text" \
+check_reserved "function name inside a string literal, no -readonly -safe" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \"SELECT 'writefile(oops)'\""
+
+echo
+echo "== round 4 (PR #258 round-3 review): engine-guaranteed -readonly -safe,"
+echo "   no more SQL text parsing =="
+
+check_unreserved "sqlite3 -readonly -safe SELECT against the registry" \
+  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_unreserved "sqlite3 -safe -readonly (reverse order) SELECT" \
+  "sqlite3 -safe -readonly ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_unreserved "sqlite3 --readonly --safe (long flags) SELECT" \
+  "sqlite3 --readonly --safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_unreserved "sqlite3 -readonly -safe -json SELECT" \
+  "sqlite3 -readonly -safe -json ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_unreserved "sqlite3 -readonly -safe PRAGMA journal_mode(WAL) (engine refuses the write at runtime)" \
+  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA journal_mode(WAL)'"
+check_unreserved "sqlite3 -readonly -safe SELECT piped out to jq" \
+  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks' | jq ."
+check_reserved "sqlite3 -readonly without -safe" \
+  "sqlite3 -readonly ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_reserved "sqlite3 -safe without -readonly" \
+  "sqlite3 -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_reserved "sqlite3 -readonly -safe but -cmd also present" \
+  "sqlite3 -readonly -safe -cmd '.timeout 2000' ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_reserved "sqlite3 -readonly -safe but -init also present" \
+  "sqlite3 -readonly -safe -init tmp/x.sql ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_reserved "sqlite3 -readonly -safe but -bail also present" \
+  "sqlite3 -readonly -safe -bail ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_reserved "sqlite3 -readonly -safe but -echo also present" \
+  "sqlite3 -readonly -safe -echo ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_reserved "sqlite3 -readonly -safe but -batch also present" \
+  "sqlite3 -readonly -safe -batch ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_reserved "sqlite3 -readonly -safe stdin redirect" \
+  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 < tmp/update.sql"
+check_reserved "sqlite3 -readonly -safe here-string" \
+  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 <<< 'SELECT 1'"
+check_reserved "sqlite3 -readonly -safe but SQL is a dot-command (.schema)" \
+  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 '.schema tasks'"
+check_reserved "sqlite3 -readonly -safe but SQL is a dot-command (.tables)" \
+  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 '.tables'"
+check_reserved "sqlite3 -readonly -safe but two SQL arguments" \
+  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1' 'SELECT 2'"
+check_reserved "sqlite3 piped INTO from another command, -readonly -safe present" \
+  "echo 'SELECT 1' | sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "sqlite3 -readonly -safe SELECT piped out into a second sqlite3 write" \
+  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1' | sqlite3 /tmp/other.sqlite3 'UPDATE t SET x=1'"
+check_reserved "sqlite3 -readonly -safe SELECT piped out to tee onto the registry" \
+  "sqlite3 -readonly -safe /tmp/other.sqlite3 'SELECT 1' | tee ~/.local/state/herdr/runs/registry.sqlite3"
 
 # Real negative: the threat named in the SPEC is real -- an UPDATE through
 # sqlite3 really does rewrite conductor_pane_id on a throwaway registry (own

@@ -5909,19 +5909,6 @@ conductor_reserved_reason() {
   # existing verdict (SPEC item 3) — this is not a by-name exemption, it
   # structurally never matches.
   #
-  # _cp_registry_read_allowed carves back out exactly: `sqlite3 [-readonly]
-  # [-json|-line|-separator X] <path> "<ONE statement>"`, statement a bare
-  # SELECT/PRAGMA matching a finite allowlist (round 3: a fixed read-only
-  # PRAGMA-name list, a fixed pure-function list for SELECT — see
-  # _cp_registry_pragma_safe/_cp_registry_select_safe below) or `.schema`/
-  # `.tables`, no stdin/no other flag
-  # (so `-init`, `-cmd`, `-csv`, ... all fail closed), and no `;`/`$(`/
-  # unresolved `$VAR` inside the quoted SQL or the path. F4 (over-
-  # reservation of ordinary reads): a `>` used as a SQL COMPARISON is
-  # already a control byte by the time _cp_simple_words sees it (quoted,
-  # so _cp_protect_text protected it, not a real operator), and a harmless
-  # `2>/dev/null`/`N>&M` redirect is blanked before the operator check —
-  # only a real write-capable redirect still trips `_cp_simple_words`.
   elif _cp_imatch "$_CP_REGISTRY_TRIGGER_RE" "$action_norm" && ! _cp_registry_read_allowed "$1"; then
     printf 'registry writes remain human-only\n'
   fi
@@ -5941,136 +5928,114 @@ _CP_REGISTRY_PATH_RE='\bHERDR_RUN_STATE_DIR\b|(^|[^A-Za-z0-9_-])registry\.sqlite
 # writer entry point.
 _CP_REGISTRY_TRIGGER_RE="$_CP_REGISTRY_PATH_RE"'|\bsqlite3\b|(^|[;&|(]|[[:space:]])(\.|source)[[:space:]]+[^;&|]*\blib/[A-Za-z0-9_.-]*\.sh\b|\bclaims\.sh\b|\bset_task_conductor\b'
 
-# `_cp_registry_read_allowed <raw>` -> 0 only for the single allowlisted
-# registry read: `sqlite3 [-readonly] [-json|-line|-separator X] <path>
-# "<statement>"`, statement exactly one bare SELECT/PRAGMA or `.schema`/
-# `.tables`. A harmless stderr-to-null (`2>/dev/null`) or fd-dup (`N>&M`)
-# redirect is blanked first so it cannot itself trip the operator check
-# (F4); every other unquoted operator (real stdin/output redirect, `;`,
-# `&&`, a pipe) still makes _cp_simple_words refuse, which this function
-# then also refuses. No other sqlite3 flag is allowlisted -- `-init`,
-# `-cmd`, `-csv`, `-batch`, ... all fall through to "not allowed".
+# _cp_registry_read_allowed carves back out exactly: `sqlite3 -readonly
+# -safe [output-format flags] <path> "<ONE statement>"`, trusting SQLite's
+# OWN engine guarantee instead of parsing SQL text.
 #
-# Round 3 (PR #258 round-2 review, two HIGH): a bare "no `=`" check on the
-# SQL text let two write-capable shapes through. PRAGMA accepts its
-# argument in parens as well as after `=` (SQLite's own PRAGMA grammar),
-# so `PRAGMA user_version(42)`/`PRAGMA journal_mode(WAL)` were unreserved
-# writes (F1); and the sqlite3 CLI's `writefile()`/`load_extension()` are
-# application-defined SQL FUNCTIONS, callable from inside an otherwise-
-# bare SELECT, that write/load arbitrary files (F2). Both are closed by
-# replacing the "no `=`" check with two finite allowlists instead of a
-# denylist: _cp_registry_pragma_safe accepts only PRAGMA names proven
-# read-only in SQLite's own docs, each with EITHER no argument or one
-# bareword-identifier argument in parens (never `=`, never a quoted/
-# numeric/expression argument -- so `user_version(42)` does not match the
-# identifier-argument shape and falls through to escalate); _cp_registry_
-# select_safe strips quoted string literals (so a function name sitting
-# inside a literal, e.g. 'writefile(' in a string, is just text) and then
-# requires every remaining `identifier(` to name a function from a fixed
-# pure/read-only list -- anything else (writefile, load_extension, an
-# unknown function, a window function) is NOT in the list and fails closed.
+# Round 4 (PR #258 round-3 review, .handoffs/REVIEW.md: F1 critical, F2
+# high): three straight rounds of text-parsing allowlists (round 1 an
+# enumerated-verb denylist, round 2 a bare "no `=`" check, round 3 a
+# finite PRAGMA-name list plus a finite pure-function list) each closed
+# one bypass and opened another — `PRAGMA journal_mode(WAL)` was a write
+# masquerading as the identifier-argument shape the round-3 fix allowed
+# (F1), and quoting a function name (`"PR""AGMA"`-style splits elsewhere
+# in this file) threatened the same fate for the pure-function list
+# (F2). SQL is not a language this classifier can safely parse with
+# shell string matching; Main proved on the live registry (sqlite3
+# 3.54.0) that `sqlite3 -readonly -safe` refuses writefile(), ATTACH and
+# load_extension at the ENGINE, independent of the SQL text — a PRAGMA
+# setter fails with "attempt to write a readonly database", a SELECT
+# works. Round 4 deletes both allowlists and trusts that guarantee
+# instead: the classifier verifies only the INVOCATION shape (both
+# flags present, no other flag that could defeat `-safe` before it
+# takes effect, exactly one SQL argument, no dot-command), never the
+# SQL content.
+#
+# Shape, every point required:
+# 1. Command word exactly `sqlite3`.
+# 2. `-readonly`/`--readonly` AND `-safe`/`--safe` both present, any
+#    order, before the path.
+# 3. Every other option is output-format-only: `-json -line -csv
+#    -header -noheader -separator X -list -box -table -markdown`.
+#    `-cmd`/`-init` run BEFORE safe mode applies, so they are refused
+#    regardless of the two required flags; `-bail -echo -batch` refused
+#    too — none change whether a write can occur, but none is needed
+#    for a read either, so none is allowlisted.
+# 4. Exactly one SQL argument (no stdin, no here-string, no redirect
+#    except a harmless stderr-to-null/fd-dup — blanked below before the
+#    operator check — and no pipe INTO sqlite3: `_cp_simple_words`
+#    refuses every other unquoted operator). A pipe OUT of it, e.g.
+#    into `jq`, is fine: `_cp_coderef_split` on the tidied text lets a
+#    trailing `@PIPE@`-tagged segment through, re-checked only against
+#    `_CP_REGISTRY_TRIGGER_RE` so it cannot itself be a second sqlite3
+#    call or a write onto the registry path (`| tee registry.sqlite3`).
+# 5. The SQL argument does not start with `.` — no dot-command at all
+#    (not even `.schema`/`.tables`, which round 1-3 allowlisted by
+#    name): `-safe` blocks the dangerous ones, but SPEC says keep it
+#    simple rather than re-deriving which dot-commands are harmless.
+#
+# A computed path (command substitution, an unresolved `$VAR`, a glob)
+# is still refused outright (not something a static classifier can
+# verify the content of).
 _cp_registry_read_allowed() {           # raw
   local tidy
   tidy="$(printf '%s' "$1" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
-  _cp_simple_words "$tidy" "" || return 1
+  case "$tidy" in *$'\n'*) return 1 ;; esac
+  local seg bare n=0
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    n=$((n + 1))
+    bare="$seg"
+    case "$seg" in @PIPE@*) bare="${seg#@PIPE@}" ;; esac
+    if [ "$n" -eq 1 ]; then
+      case "$seg" in @PIPE@*) return 1 ;; esac   # piped INTO the first segment -- reserved
+      _cp_registry_sqlite_invocation_safe "$bare" || return 1
+    else
+      case "$seg" in @PIPE@*) ;; *) return 1 ;; esac   # anything but a pipe-OUT continuation reserves
+      # A trailing pipe-out consumer (jq, etc.) is fine, but it must not
+      # itself touch sqlite3/the registry again -- `sqlite3 ... | tee
+      # registry.sqlite3` or `sqlite3 ... | sqlite3 ...` would otherwise
+      # smuggle a second, unvalidated write through the one pipe this
+      # rule allows.
+      _cp_imatch "$_CP_REGISTRY_TRIGGER_RE" "$bare" && return 1
+    fi
+  done <<EOF
+$(_cp_coderef_split "$tidy")
+EOF
+  [ "$n" -gt 0 ]
+}
+
+# `_cp_registry_sqlite_invocation_safe <segment>` -> 0 only for the exact
+# invocation shape item 1-5 above describes, on one already-split segment
+# (a leading `@PIPE@` tag, if any, is stripped first).
+_cp_registry_sqlite_invocation_safe() {   # seg
+  local seg="$1"
+  case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
+  _cp_simple_words "$seg" "" || return 1
   local -a w=("${_CP_W[@]}")
   [ "${#w[@]}" -ge 3 ] || return 1
   [ "$(_cp_bwt_unprotect "${w[0]}")" = sqlite3 ] || return 1
-  local i=1 tok
+  local i=1 tok has_readonly=0 has_safe=0
   while [ "$i" -lt "${#w[@]}" ]; do
     tok="$(_cp_bwt_unprotect "${w[$i]}")"
     case "$tok" in
-      -readonly|-json|-line) i=$((i + 1)) ;;
+      -readonly|--readonly) has_readonly=1; i=$((i + 1)) ;;
+      -safe|--safe) has_safe=1; i=$((i + 1)) ;;
+      -json|-line|-csv|-header|-noheader|-list|-box|-table|-markdown) i=$((i + 1)) ;;
       -separator) i=$((i + 2)) ;;
       -*) return 1 ;;
       *) break ;;
     esac
   done
+  [ "$has_readonly" -eq 1 ] && [ "$has_safe" -eq 1 ] || return 1
   # Exactly <path> <statement> remain -- no stdin source, no trailing junk.
   [ "$((i + 2))" -eq "${#w[@]}" ] || return 1
   local path sql
   path="$(_cp_bwt_unprotect "${w[$i]}")"
   sql="$(_cp_bwt_unprotect "${w[$((i + 1))]}")"
-  # A computed path/statement (command substitution, an unresolved $VAR, a
-  # glob) is not something this static classifier can verify the content
-  # of -- fail closed rather than guess what it would expand to.
   case "$path" in *'@SUB@'*|*'$'*|*'*'*|*'?'*|*'['*) return 1 ;; esac
-  case "$sql" in *';'*|*'@SUB@'*|*'$'*) return 1 ;; esac
-  if printf '%s' "$sql" | grep -qiE '^\.schema([[:space:]]|$)|^\.tables[[:space:]]*$'; then
-    return 0
-  fi
-  if printf '%s' "$sql" | grep -qiE '^pragma([[:space:]]|$)'; then
-    _cp_registry_pragma_safe "$sql" && return 0
-    return 1
-  fi
-  if printf '%s' "$sql" | grep -qiE '^select([[:space:]]|$)'; then
-    _cp_registry_select_safe "$sql" && return 0
-    return 1
-  fi
-  return 1
-}
-
-# The fixed, read-only PRAGMA names (SPEC round 3 item 1): schema/
-# connection-state introspection pragmas, each taking no argument or one
-# identifier naming what to report on -- never a value that changes
-# anything. Anything not on this list (writable_schema, synchronous,
-# foreign_keys, case_sensitive_like, ...) escalates.
-_CP_REGISTRY_READONLY_PRAGMAS=' table_info table_xinfo index_list index_info foreign_key_list user_version schema_version journal_mode page_count freelist_count integrity_check quick_check database_list compile_options '
-
-# `_cp_registry_pragma_safe <sql>` -> 0 only for `PRAGMA <name>` or
-# `PRAGMA <name>(<identifier>)`, <name> on the list above and <identifier>
-# a bare word (no quotes, no digits-only literal, no expression) -- so
-# `PRAGMA user_version(42)` (a numeric SETTER, F1) does not match the
-# identifier-argument shape and falls through to escalate, while `PRAGMA
-# user_version` (the bare read) and `PRAGMA table_info(tasks)` (a table
-# name) both match and are allowed. Any `=` anywhere is refused outright.
-_cp_registry_pragma_safe() {            # sql
-  local sql="$1" rest name=""
-  case "$sql" in *=*) return 1 ;; esac
-  rest="$(printf '%s' "$sql" | sed -E 's/^[Pp][Rr][Aa][Gg][Mm][Aa][[:space:]]*//; s/[[:space:]]+$//')"
-  case "$rest" in
-    [A-Za-z_]*)
-      if [[ "$rest" =~ ^([A-Za-z_][A-Za-z0-9_]*)$ ]] ||
-         [[ "$rest" =~ ^([A-Za-z_][A-Za-z0-9_]*)\([A-Za-z_][A-Za-z0-9_]*\)$ ]]; then
-        name="$(printf '%s' "${BASH_REMATCH[1]}" | tr 'A-Z' 'a-z')"
-      fi
-      ;;
-  esac
-  [ -n "$name" ] || return 1
-  case "$_CP_REGISTRY_READONLY_PRAGMAS" in
-    *" $name "*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# The fixed, pure/read-only SQL function names (SPEC round 3 item 2):
-# scalar and aggregate functions from SQLite's own core and JSON1
-# function lists that only compute a value from their arguments -- never
-# touch the filesystem, an extension, or connection state. `writefile`,
-# `readfile`, `load_extension`, and every other name NOT on this list
-# fail closed.
-_CP_REGISTRY_PURE_FUNCS=' count min max sum total avg abs round length lower upper trim ltrim rtrim substr substring instr replace coalesce ifnull nullif iif typeof printf format date time datetime julianday strftime unixepoch group_concat string_agg json json_extract json_array json_object json_group_array json_group_object json_each json_tree json_type json_valid cast like glob hex quote char unicode '
-
-# `_cp_registry_select_safe <sql>` -> 0 only when every `identifier(` in
-# the statement names a function on the list above. Quoted string
-# literals (single- or double-quoted, `''`/`""` the doubled-quote escape)
-# are stripped first, so a function name that is just TEXT inside a
-# literal (`SELECT 'writefile(oops)'`) never trips the check -- while
-# `SELECT writefile('/path','x')`, where `writefile(` sits outside any
-# quote, still fails closed because `writefile` is not on the list.
-_cp_registry_select_safe() {            # sql
-  local sql="$1" stripped call ident
-  stripped="$(printf '%s' "$sql" | sed -E "s/'([^']|'')*'/''/g" | sed -E 's/"([^"]|"")*"/""/g')"
-  while IFS= read -r call; do
-    [ -n "$call" ] || continue
-    ident="$(printf '%s' "${call%(}" | tr 'A-Z' 'a-z')"
-    case "$_CP_REGISTRY_PURE_FUNCS" in
-      *" $ident "*) ;;
-      *) return 1 ;;
-    esac
-  done <<EOF
-$(printf '%s' "$stripped" | grep -ioE '[A-Za-z_][A-Za-z0-9_]*\(')
-EOF
+  case "$sql" in *'@SUB@'*|*'$'*) return 1 ;; esac
+  case "$sql" in .*) return 1 ;; esac
   return 0
 }
 
