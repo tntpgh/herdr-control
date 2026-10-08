@@ -3470,6 +3470,67 @@ check "#261 r5b (regression): mixed/partial quoting on a non-find command word s
 check "#261 r5 INNER-write: file -C -m inside a -exec clause escalates" \
   "find . -exec file -C -m /tmp/magic {} \\;" escalate
 
+# #261 r6 round 2 (Main's live run of round 5 + round-6 probes, SPEC's own
+# "add every r5 probe row" requirement): pin every probe row from
+# review/pr-261-r5/tmp/main-probes.out as a permanent suite case — both the
+# ones that were FAILing (R5-NL newline-segment-separator, R5-QWRAP
+# recursive quoted-launcher unwrap, MEDIUM launcher-dispatch-parity) and
+# the ones already PASSing, so a future change can't silently regress any
+# of them. Exact duplicates of already-pinned rows above (the `open -b`
+# bundle-id case) are skipped rather than re-asserted.
+check "#261 r6 QL-command: a quoted 'command' launcher ahead of find escalates" \
+  "'command' find . * -maxdepth 0" escalate
+check "#261 r6 QL-exec: a quoted 'exec' launcher ahead of find escalates" \
+  "'exec' find . * -maxdepth 0" escalate
+check "#261 r6 QL-nice: a quoted 'nice' launcher ahead of find escalates" \
+  "'nice' -n 5 find . * -maxdepth 0" escalate
+check "#261 r6 QL-env (regression): a quoted 'env' launcher ahead of find escalates" \
+  "'env' find . * -maxdepth 0" escalate
+check "#261 r6 QL-sudo: a quoted 'sudo' launcher ahead of find escalates" \
+  "'sudo' find . * -maxdepth 0" escalate
+check "#261 r6 QL-time: a quoted 'time' launcher ahead of find escalates" \
+  "'time' find . * -maxdepth 0" escalate
+check "#261 r6 QL-nohup: a quoted 'nohup' launcher ahead of find escalates" \
+  "'nohup' find . * -maxdepth 0" escalate
+check "#261 r6 QL-plain (regression): a bare unquoted find still escalates" \
+  "find . * -maxdepth 0" escalate
+check "#261 r6 NL-prefix: a real newline segment separator ahead of find escalates" \
+  $'echo harmless\nfind . * -maxdepth 0' escalate
+check "#261 r6 NL-suffix (regression): a real newline segment separator after find still escalates" \
+  $'find . * -maxdepth 0\necho harmless' escalate
+check "#261 r6 NL-dollar: a real newline ahead of find's \$-expansion N3 shape escalates" \
+  $'echo harmless\nfind . $X' escalate
+check "#261 r6 NL-semicolon: a semicolon-then-newline ahead of find still escalates" \
+  $'echo harmless;\nfind . * -maxdepth 0' escalate
+check "#261 r6 TERM-empty-quote (regression): an empty-single-quote -exec terminator still escalates" \
+  "find . -exec echo {} ''\\; * -maxdepth 0" escalate
+check "#261 r6 TERM-double-empty (regression): an empty-double-quote -exec terminator still escalates" \
+  "find . -exec echo {} \"\"\\; * -maxdepth 0" escalate
+check "#261 r6 TERM-empty-before (regression): a quote-then-semicolon -exec terminator still escalates" \
+  "find . -exec echo {} \\'\\; * -maxdepth 0" escalate
+check "#261 r6 XARGS-find: xargs launching find escalates (launcher-dispatch-parity)" \
+  "xargs find . * -maxdepth 0" escalate
+check "#261 r6 LOCKF-find: lockf launching find escalates (launcher-dispatch-parity)" \
+  "lockf /tmp/lock find . * -maxdepth 0" escalate
+check "#261 r6 SSHAGENT-find: ssh-agent launching find escalates (launcher-dispatch-parity)" \
+  "ssh-agent find . * -maxdepth 0" escalate
+check "#261 r6 DTRACE-find: dtrace -c launching find escalates (launcher-dispatch-parity)" \
+  "dtrace -c 'find . * -maxdepth 0'" escalate
+check "#261 r6 LLDB-find: lldb -- launching find escalates (launcher-dispatch-parity)" \
+  "lldb -- find . * -maxdepth 0" escalate
+check "#261 r6 TASKPOLICY-find (regression): taskpolicy -c launching find still escalates" \
+  "taskpolicy -c utility find . * -maxdepth 0" escalate
+check "#261 r6 OPEN-env (regression): open --env app-selection still escalates" \
+  "open --env NODE_OPTIONS=--require=/tmp/x.js /tmp/x.command" escalate
+check "#261 r6 OPEN-read (regression): a bare open with a path argument stays allow" \
+  "open /tmp/x.command" allow
+check "#261 r6 R5-SUBST: find hidden inside an unrelated command's \$(...) argument escalates" \
+  'printf "%s\n" "$(find . * -maxdepth 0)"' escalate
+check "#261 r6 R5-SUBST: find hidden inside a backtick substitution escalates" \
+  'printf "%s\n" "`find . * -maxdepth 0`"' escalate
+check "#261 r6 R5-QWRAP: a chain of individually-quoted launchers still unwraps to find" \
+  "'nice' -n 5 'sudo' find . * -maxdepth 0" escalate
+
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
