@@ -451,6 +451,35 @@ function prefetchRegisteredWorktree(): void {
 }
 prefetchRegisteredWorktree();
 
+// mutationTargets()'s own bash-write-targets.sh spawnSync (lib/command-policy.sh,
+// #184's write-scope parser, ~5,926 lines) is the other synchronous subprocess
+// every registered worker's bash/shell call pays, and it is NOT cacheable the
+// way the registry reads above are — its result depends on the exact command
+// text. Measured directly (tmp/ scripts, round 2 of this task): the FIRST such
+// spawnSync a session issues costs roughly 2x a later one (e.g. ~70ms vs
+// ~35-40ms for the same command, repeatable across clean runs) — a real OS/
+// CPU-scheduling cost paid by the first process this bash interpreter forks
+// after the module's own idle startup gap, not something tied to command
+// content or verdict. A single warm spawnSync of the SAME script (trivial
+// "true" command, so it exercises the identical source-and-run path without
+// being a provable write target) during that idle gap measurably halves the
+// first real call's cost in repeated clean-environment testing (~52ms down to
+// ~44ms median for the `bash_reserved` probe). Detached/fire-and-forget like
+// the prefetch above: its own result is never read, it only warms whatever
+// OS/runtime state the next real spawnSync benefits from.
+function prefetchBashWriteTargetsWarm(): void {
+  if (!WORKER_TASK_ID) return;
+  try {
+    if (!safeExists(BASH_WRITE_TARGETS_SH)) return;
+    const child = spawn("bash", [BASH_WRITE_TARGETS_SH, "true", "."], { stdio: ["ignore", "ignore", "ignore"] });
+    child.on("error", () => {});
+    child.unref();
+  } catch {
+    // best effort
+  }
+}
+prefetchBashWriteTargetsWarm();
+
 // The kernel's view of an absolute path: walk it component by component,
 // splicing in each symlink's target (dangling or not) before applying the next
 // `..`. An absent component is taken as-is, because a write creates it as a
