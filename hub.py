@@ -4149,6 +4149,12 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
     as `project_needs_wake`. `boot_epoch` (PR #223 review H1/M-a) floors every
     signal's own evidence epoch so a deploy (or a restart mid-incident)
     never wakes on history; defaults to the persisted `_stall_boot_epoch()`.
+    Each task's own `created_at` (SPEC.md item 1/2) floors it a second way:
+    `spawn-task.sh` re-uses a branch's worktree for round N+1, so round N's
+    live-bus `_done` line or PROOF.md/REVIEW.md mtime is still sitting
+    there — `boot` alone never catches this since the hub did not restart
+    between rounds. Evidence timestamped before the task it is being
+    judged against was even registered belongs to an earlier task.
 
     Five signals, each its own `fingerprint` (what the claim_once key in
     stall-watchdog.sh re-arms on when it changes). IDLE_STATES (`stalled`,
@@ -4227,6 +4233,14 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
         if not tid:
             continue
         state = t.get("state")
+        # Floors every signal's own evidence epoch, alongside `boot`
+        # (SPEC.md item 1/2): `spawn-task.sh` re-uses a branch's worktree
+        # for round N+1, so round N's `_done` line / PROOF.md mtime is
+        # still sitting there when round N+1 registers — `boot` alone
+        # never catches this (the hub did not restart between rounds).
+        # Evidence older than the task's OWN registration belongs to an
+        # earlier task.
+        task_start = _iso_epoch(t.get("created_at"))
         base = {"task_id": tid, "run_id": t.get("run_id") or "",
                 "label": t.get("label") or tid, "pane_id": t.get("pane_id") or "",
                 "conductor_pane_id": t.get("conductor_pane_id") or "",
@@ -4240,7 +4254,8 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
         else:
             since = None
             fingerprint = None
-        if since is not None and since >= boot and now - since >= threshold:
+        if since is not None and since >= boot and (task_start is None or since >= task_start) \
+                and now - since >= threshold:
             out.append({**base, "signal": "handoff", "fingerprint": fingerprint,
                        "detail": "closed handed_off_to:... ; the conductor was never told",
                        "artifact": ""})
@@ -4256,7 +4271,7 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                     continue
                 if not size or mtime is None:
                     continue                                   # empty file: nothing was WRITTEN
-                if mtime < boot:
+                if mtime < boot or (task_start is not None and mtime < task_start):
                     continue
                 if owner_epoch is not None and owner_epoch >= mtime:
                     continue                                   # the conductor already acted since
@@ -4276,12 +4291,14 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
         # ---- signal 3/4: denied, unprocessed --------------------------------
         if state == "stalled":
             d = denied.get(tid)
-            if d and d["epoch"] >= boot and now - d["epoch"] >= threshold:
+            if d and d["epoch"] >= boot and (task_start is None or d["epoch"] >= task_start) \
+                    and now - d["epoch"] >= threshold:
                 out.append({**base, "signal": "denied", "fingerprint": d["fingerprint"],
                            "detail": "a policy-refused prompt was denied, then the worker went idle",
                            "artifact": ""})
             m = delivered.get(tid)
-            if m and m["epoch"] >= boot and now - m["epoch"] >= threshold:
+            if m and m["epoch"] >= boot and (task_start is None or m["epoch"] >= task_start) \
+                    and now - m["epoch"] >= threshold:
                 out.append({**base, "signal": "unprocessed", "fingerprint": m["fingerprint"],
                            "detail": "a message was delivered to this pane and never processed",
                            "artifact": ""})
@@ -4328,7 +4345,16 @@ _STALL_WORKER_ACTIVITY_TYPES = ("input_required", "completion_recorded")
 # already existed before this feature — reused as both "the conductor
 # already acted on this artifact" (H1) and "treat it the same as an ack"
 # (H2, enforced in stall-watchdog.sh's own event query, not here).
-_STALL_OWNER_ACTIVITY_TYPES = ("owner_acted", "brief_delivered", "reply_delivered", "approval_reviewed")
+# `action_decided` (SPEC.md item 4): herdr-action.sh's approve/decline/
+# supersede request-based path — DISTINCT from herdr-select.sh's inline
+# PostToolUse approval, which already writes `approval_reviewed` above —
+# writes only this event (payload.decision in approved/declined/
+# superseded), never `approval_reviewed`/`owner_acted`. Main's normal way
+# of handling a worker's pending request is exactly `herdr-action.sh
+# supersede` followed by running the suite itself, which previously left
+# no owner-activity trace at all and kept escalating.
+_STALL_OWNER_ACTIVITY_TYPES = ("owner_acted", "brief_delivered", "reply_delivered", "approval_reviewed",
+                               "action_decided")
 _STALL_DENY_CHOICE_RE = re.compile(r"\b(deny|no|reject)\b", re.IGNORECASE)
 
 

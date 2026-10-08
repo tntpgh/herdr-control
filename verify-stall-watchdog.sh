@@ -174,6 +174,19 @@ HERDR_STALL_WATCHDOG_ESCALATE_S=0 bash "$here/stall-watchdog.sh" wake taskD arti
 [ "$(_lc "$NOTIFIED")" = "0" ] && ok "H2: owner_acted after the wake counts as handled — no escalation without stall-ack" \
   || bad "H2 REGRESSION: escalated despite owner_acted — $(cat "$NOTIFIED")"
 
+echo "== A8b (SPEC.md item 4): a conductor supersede (herdr-action.sh, action_decided) counts as handled too =="
+register_task runD2 taskD2 workerD2 condD2 "$COND" "$CONDB" paneD2 paneD2birth repo/d2 "$WORK/wtD2" labelD2 >/dev/null
+: > "$SENT"; : > "$NOTIFIED"
+bash "$here/stall-watchdog.sh" wake taskD2 artifact "tmp/REVIEW.md:7" "ready" "tmp/REVIEW.md"
+sleep 1.2
+_sql_runD "INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload)
+  VALUES ('ev_supersedeD2','runD2','taskD2','action_decided','$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+  '{\"decision\":\"superseded\"}');"
+: > "$SENT"; : > "$NOTIFIED"
+HERDR_STALL_WATCHDOG_ESCALATE_S=0 bash "$here/stall-watchdog.sh" wake taskD2 artifact "tmp/REVIEW.md:7" "ready" "tmp/REVIEW.md"
+[ "$(_lc "$NOTIFIED")" = "0" ] && ok "item4: action_decided (supersede) after the wake counts as handled — no escalation without stall-ack" \
+  || bad "item4 REGRESSION: escalated despite a conductor supersede — $(cat "$NOTIFIED")"
+
 echo "== A9 (review H3): an ack survives the conductor pane later going away — no re-escalation =="
 register_task runE taskE workerE condE "$COND" "$CONDB" paneE paneEbirth repo/e "$WORK/wtE" labelE >/dev/null
 : > "$SENT"; : > "$NOTIFIED"
@@ -381,6 +394,25 @@ cands = hub.stall_watchdog_candidates(
     live_done_fn=cw(BOOT - 10, "handed_off_to:conductor"))
 results["H1_boot_epoch_floor_silences_pre_existing_evidence"] = cands == []
 
+# ---- SPEC.md item 1: a re-used worktree's round-N `_done` line must not
+# fire for round N+1's task. created_at floors evidence the same way boot
+# does -- a task registered AT T with live-bus evidence from BEFORE T
+# (round N's own close) is silent; the identical shape with evidence AFTER
+# T (this round's own close) still fires.
+t_reused_before = base_task(state="ready_review", stored_state="running", worktree="/wt-live",
+                            created_at="2026-01-01T19:00:00Z")   # T
+cands = hub.stall_watchdog_candidates(
+    [t_reused_before], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(hub._iso_epoch("2026-01-01T18:59:59Z"), "handed_off_to:conductor"))  # T-1
+results["item1_handoff_silent_on_a_prior_rounds_done_line_predating_this_task"] = cands == []
+t_reused_after = base_task(state="ready_review", stored_state="running", worktree="/wt-live",
+                           created_at="2026-01-01T19:00:00Z")   # T
+cands = hub.stall_watchdog_candidates(
+    [t_reused_after], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(hub._iso_epoch("2026-01-01T19:00:01Z"), "handed_off_to:conductor"))  # T+1
+results["item1_handoff_still_fires_on_this_rounds_own_done_line"] = any(
+    c["signal"] == "handoff" for c in cands)
+
 # ---- signal 2: artifact (injectable stat_fn — no real filesystem needed) ----
 # stat_fn now returns (size, mtime): review H1's empty-file / owner-action gates.
 mtimes = {"/wt/tmp/commit-msg.txt": (400, NOW - THRESH - 1)}
@@ -461,6 +493,25 @@ t3d = base_task(state="ready_review", stored_state="running", worktree="/wtd")
 cands = hub.stall_watchdog_candidates([t3d], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
                                       stat_fn=lambda p: mtimes_debounce.get(p, (0, None)))
 results["M2_r4_newer_not_yet_stale_artifact_suppresses_the_older_ones_wake"] = cands == []
+
+# ---- SPEC.md item 2: round N+1's task must not qualify on round N's own
+# PROOF.md left behind in the re-used worktree. A task registered at T with
+# an artifact mtime from BEFORE T is silent; the identical shape with an
+# mtime AFTER T still fires -- same created_at floor as item 1, this time
+# on signal 2.
+mtimes_item2_before = {"/wti/.handoffs/PROOF.md": (10, hub._iso_epoch("2026-01-01T18:59:59Z"))}  # T-1
+t_item2_before = base_task(state="ready_review", stored_state="running", worktree="/wti",
+                           created_at="2026-01-01T19:00:00Z")   # T
+cands = hub.stall_watchdog_candidates([t_item2_before], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+                                      stat_fn=lambda p: mtimes_item2_before.get(p, (0, None)))
+results["item2_artifact_silent_on_a_prior_rounds_file_predating_this_task"] = cands == []
+mtimes_item2_after = {"/wti/.handoffs/PROOF.md": (10, hub._iso_epoch("2026-01-01T19:00:01Z"))}  # T+1
+t_item2_after = base_task(state="ready_review", stored_state="running", worktree="/wti",
+                          created_at="2026-01-01T19:00:00Z")   # T
+cands = hub.stall_watchdog_candidates([t_item2_after], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+                                      stat_fn=lambda p: mtimes_item2_after.get(p, (0, None)))
+results["item2_artifact_still_fires_on_this_rounds_own_file"] = any(
+    c["signal"] == "artifact" for c in cands)
 
 # ---- signal 3: denied --------------------------------------------------------
 t5 = base_task(state="stalled")
@@ -910,6 +961,20 @@ conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, 
 conn.commit(); conn.close()
 _, _, owner_acted2 = _safe_signals3("sig_owner", now=REG_NOW, threshold_s=REG_THRESH)
 results["owner_acted_populated_from_owner_acted_events"] = "t_owner" in owner_acted2
+
+# SPEC.md item 4: herdr-action.sh's approve/decline/supersede path writes
+# `action_decided`, not `owner_acted`/`approval_reviewed` -- Main's normal
+# way of handling a pending request (supersede it, run the suite itself)
+# must also count as owner activity.
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('t_supersede','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('ad1','drun','t_supersede','action_decided','2026-01-01T02:00:00Z',"
+             "'{\"decision\":\"superseded\"}')")
+conn.commit(); conn.close()
+_, _, owner_acted3 = _safe_signals3("sig_supersede", now=REG_NOW, threshold_s=REG_THRESH)
+results["item4_owner_acted_populated_from_a_herdr_action_supersede"] = "t_supersede" in owner_acted3
 
 # A later event from the SAME task (real worker activity) clears "unprocessed".
 conn = sqlite3.connect(str(hub.REGISTRY))
