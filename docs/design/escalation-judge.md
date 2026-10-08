@@ -492,6 +492,17 @@ All must hold; `scripts/judge-shadow.py --score --gate` checks (b)–(d):
   from a deny-default trace on this host. If a tool needs a path not on it,
   the fix is a reviewed change to that table (and so to `profile_sha256`),
   never a broader rule.
+- **Short or split secrets reach the model (round-4 review M4).** `pretool_redact`
+  plus `blunt_redact` miss secrets that are short, single-class, or broken up
+  by symbols or quotes; those reach `omp -p` byte for byte. No replay
+  (`judge-shadow.py` without `--dry-run`) runs until this is fixed and
+  re-probed. The live hook's own redactor gap is issue #265.
+- **Over-redaction floors legitimate rows (M5).** The `/` trigger in
+  `blunt_redact` redacts every 20+ char path and sha, and the
+  `[redacted-token]` marker then floors the row to `unsure`. The unsure-rate
+  numbers are not meaningful until the trigger is narrowed.
+- **Doc drift (M6).** Before go-live, reconcile this document with the code
+  as the round-4 review lists.
 
 JUDGE_LOOSER = the judge approved where the actual decision was not an approval
 (declined, superseded) or where the request was routed to a human.
