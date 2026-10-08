@@ -4096,18 +4096,29 @@ check_reserved "R3-5: a command substitution inside a redirect target still rese
 #     (`git p >/dev/null\ush origin main` runs `git p origin main` —
 #     the backslash just quotes the literal "u", there is no "ush" left
 #     to read as "push"; `git pu >/dev/null''sh origin main` runs
-#     `git pu origin main` the same way via quote-splicing). Neither one
-#     ever reaches `_cp_git_push_invoked`'s awk scanner with the literal
-#     text "push" attached to "git" at all, so main does not reserve
-#     them either — traced in .handoffs/PROOF.md#round-4-redirect-strip.
-#     Round 4's allowlist is stricter than main here, not looser: the
-#     embedded (non-trailing) redirect byte makes both ESCALATE through
-#     the exec-option gate regardless of what the mutated verb turns out
-#     to mean, so there is nothing to under-block.
+#     `git pu origin main` the same way via quote-splicing). Under real
+#     bash semantics neither is actually a push — traced in
+#     .handoffs/PROOF.md#round-4-redirect-strip — so `_cp_git_push_invoked`'s
+#     primary exact-token scanner correctly calls both "safe". Round 6b
+#     (Main's live r5-probe run, Part C mode=postverb): reservation is
+#     the STRONGER human-only guarantee behind `conductor_reserved_reason`
+#     (plain `escalate` can still be peer-auto-answered as operational),
+#     so both now ALSO reserve via a second, narrower pass that fires
+#     whenever the token right after `git` is a non-empty proper prefix
+#     of `push` (`p`, `pu`) and the statement carries a redirect byte —
+#     failing closed on the ambiguity a human skimming the text (not
+#     tracing real redirect-target grammar) would read as "still says
+#     push". The embedded (non-trailing) redirect byte ALSO makes both
+#     ESCALATE through the exec-option gate independently of reservation,
+#     so there is nothing to under-block either way.
 check "Part C REGRESS: backslash-glued redirect inside the verb word escalates (stricter than main, not looser)" \
   'git p >/dev/null\ush origin main' escalate
 check "Part C REGRESS: quote-spliced redirect inside the verb word escalates (stricter than main, not looser)" \
   "git pu >/dev/null''sh origin main" escalate
+check_reserved "round 6b: backslash-glued redirect inside the verb word still reserves (postverb REGRESS)" \
+  'git p >/dev/null\ush origin main'
+check_reserved "round 6b: quote-spliced redirect inside the verb word still reserves (postverb REGRESS)" \
+  "git pu >/dev/null''sh origin main"
 # --- round 5 (PR#257 round-4 review, R4-1..R4-4): the push-scanner
 #     fallback round 4 added replaced main's whole-text scan with a bare
 #     `\bpush\b` substring search for the ENTIRE command whenever any
@@ -4147,6 +4158,35 @@ check "R4-4: detached > /dev/null allows like the glued spelling" \
   'git status > /dev/null' allow
 check "R4-4: trailing </dev/null allows" \
   'git log --oneline -5 </dev/null' allow
+# --- round 6 (PR#257 round-5 review, R5-1/R5-2): a leading dup-fd
+#     redirect (`10>&2`, `{fd}>&2`, `10<&0`) is a shape the locator's
+#     own patterns don't cover either, and the R4-2 backstop's own
+#     "is this chunk git" test was case-SENSITIVE, so `GIT`/`Git`/
+#     `/usr/bin/GIT` (all real git on macOS's case-insensitive default
+#     filesystem) slipped past both and the chunk was waved through
+#     unchanged — looser than main, which escalates every one of these.
+#     `_cp_git_seg_strip_trailing_redirects`'s new leading-redirect
+#     check (any `_cp_is_redirect_word` first word escalates
+#     unconditionally) and `_cp_git_push_seg_has_git`'s new case-folded
+#     basename match close both holes.
+check "R5-1: multi-digit dup-fd redirect ahead of uppercase GIT" \
+  '10>&2 GIT -C /tmp/r status' escalate
+check "R5-1: named-fd dup redirect ahead of uppercase GIT" \
+  '{fd}>&2 GIT -C /tmp/r status' escalate
+check "R5-1: multi-digit input-dup redirect ahead of title-case Git" \
+  '10<&0 Git -C /tmp/r status' escalate
+check "R5-1: multi-digit dup-fd redirect ahead of /usr/bin/GIT" \
+  '10>&2 /usr/bin/GIT -C /tmp/r status' escalate
+check "R5-1: multi-digit dup-fd redirect ahead of git-core/git-ls-remote" \
+  '10>&2 /Library/Developer/CommandLineTools/usr/libexec/git-core/git-ls-remote --upload-pack=/tmp/x /tmp/r' escalate
+check "R5-1: multi-digit dup-fd redirect ahead of git-core/git-diff" \
+  '10>&2 /Library/Developer/CommandLineTools/usr/libexec/git-core/git-diff --ext-diff HEAD' escalate
+check "R5-1: multi-digit dup-fd redirect ahead of xargs .../git-core/git-log" \
+  '10>&2 xargs /Library/Developer/CommandLineTools/usr/libexec/git-core/git-log' escalate
+check "R5-1: same shape inside a bash -c body still escalates via recursion" \
+  "bash -c '10>&2 GIT -C /tmp/r status'" escalate
+check "R5-2: single-digit named-null dup-fd redirect ahead of uppercase GIT" \
+  '10>/dev/null GIT -C /tmp/r status' escalate
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

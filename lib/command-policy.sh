@@ -2691,6 +2691,52 @@ _cp_flatten_substitutions() {
 # identical to the walk's output and runs in one O(n) pass. That fast
 # path covers the overwhelming majority of real commands; the char walk
 # below only runs for the minority that actually contains a redirect.
+
+# `_cp_is_redirect_word <word>` -> 0 when WORD, taken as a single
+# whitespace-delimited shell token from already-`_cp_protect_text`-
+# protected text (so every remaining `<`/`>` byte is a REAL, unquoted
+# shell operator — a quoted one was already turned into a control byte),
+# STARTS WITH a genuine redirect operator: an optional fd prefix (one or
+# more digits, or a `{name}` fd-variable) immediately followed by one of
+# `<<<` `<<` `<>` `<&` `<` `>>` `>|` `>&` `&>>` `&>` `>`. A word matching
+# this is, by shell grammar, unambiguously a redirect token — never an
+# ordinary argument — whatever target is glued on after the operator
+# (`10>&2`, `{fd}>&2`, `>|/dev/null`, …).
+#
+# Round 6 (PR#257 round-5 review, R5-1/R5-2): this is the ONE place
+# this shape is recognised, used by `_cp_git_seg_strip_trailing_redirects`'s
+# leading-redirect escalate check below — the exact gap that let
+# `10>&2 GIT …` read differently from `10>&2 git …` in round 5
+# (`_cp_git_push_seg_has_git`'s separate case-insensitivity fix, same
+# round, closes the other half: see that function's own header).
+_cp_is_redirect_word() {                # word -> 0 if WORD starts with a redirect operator
+  printf '%s' "$1" | grep -qE '^([0-9]+|\{[A-Za-z_][A-Za-z_0-9]*\})?(<<<|<<|<>|<&|<|>>|>\||>&|&>>|&>|>)'
+}
+
+# `_cp_is_git_or_launcher_word <word>` -> 0 when WORD's basename,
+# case-folded, is `git`/`git-*` or one of the launchers/interpreters
+# `_cp_locate_command_word` already walks past looking for the real
+# command word (`sudo doas su env nice ionice nohup time timeout
+# gtimeout stdbuf setsid command builtin exec caffeinate`), a shell
+# `_cp_shared_gate` recurses into for its own `-c BODY` (`bash sh zsh
+# dash ksh mksh csh tcsh fish`, `busybox`), or `xargs`/`parallel` (the
+# two non-shell forwarders this file has always treated as capable of
+# running an arbitrary trailing argv — see `_cp_walk_run`'s own header).
+# Used ONLY by the narrower leading-redirect check in
+# `_cp_git_seg_strip_trailing_redirects`: a word that is none of these is
+# an ordinary argument/target, not a sign that a git invocation (direct
+# or wrapped) might be hiding behind the redirect this function already
+# confirmed comes before it.
+_cp_is_git_or_launcher_word() {         # word -> 0 if WORD's basename is git-like or a launcher/interpreter
+  local wl
+  wl="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
+  case "$wl" in
+    git|git-*|sudo|doas|su|env|nice|ionice|nohup|time|timeout|gtimeout|stdbuf|setsid|command|builtin|exec|caffeinate|bash|sh|zsh|dash|ksh|mksh|csh|tcsh|fish|busybox|xargs|parallel)
+      return 0 ;;
+  esac
+  return 1
+}
+
 _cp_git_redirect_split() {                      # text -> raw statements, one per line, <>& dup-forms kept intact
   local LC_ALL=C LANG=C
   local text="$1"
@@ -2779,6 +2825,43 @@ _cp_git_redirect_split() {                      # text -> raw statements, one pe
 _cp_git_seg_strip_trailing_redirects() {        # chunk -> cleaned chunk, or (return 1) escalate
   local LC_ALL=C LANG=C
   local chunk="$1"
+  # Round 6 (PR#257 round-5 review, R5-1/R5-2; narrowed per Main's live
+  # round-6 run against `verify-command-policy.sh`): a leading redirect
+  # escalates ONLY when, after skipping every CONTIGUOUS redirect-shaped
+  # word from the front (`_cp_is_redirect_word`), the next real word is
+  # git-like or a launcher/interpreter that could itself be hiding a git
+  # invocation further in (`_cp_is_git_or_launcher_word`) — never on the
+  # mere presence of a redirect-shaped word alone. An earlier,
+  # unconditional version of this rule over-blocked three real shapes:
+  # a process-substitution artifact (`diff <(git show HEAD:f) …` — the
+  # existing blind `(`/`)` split in `_cp_git_redirect_split` already cuts
+  # `<(` into its own "<" line, so a LONE leftover "<" word with NOTHING
+  # after it is not a real redirect-before-a-command at all, just a
+  # split artifact — the `-lt _cp_gsr_n` check below requires a real word
+  # to remain), a bare `> /dev/null 2>&1` with no command in it, and
+  # `> /dev/null bash scripts/ci.sh` (the detached target `/dev/null` is
+  # NOT itself redirect-shaped, so the skip loop stops there — `bash`
+  # one word further is never examined, same as real bash grammar, where
+  # the operator consumes exactly one target word). This loses no
+  # required R5-1/R5-2 coverage: every one of those rows also carries a
+  # literal git-like word somewhere in the chunk, which the backstop just
+  # below (`_cp_git_push_seg_has_git`, now case-folded) independently
+  # catches regardless of this narrower rule.
+  local -a _cp_gsr_words
+  local _cp_gsr_noglob=0
+  case "$-" in *f*) _cp_gsr_noglob=1 ;; esac
+  set -f
+  # shellcheck disable=SC2206
+  _cp_gsr_words=($chunk)
+  [ "$_cp_gsr_noglob" = 1 ] || set +f
+  local _cp_gsr_i=0 _cp_gsr_n="${#_cp_gsr_words[@]}"
+  while [ "$_cp_gsr_i" -lt "$_cp_gsr_n" ] && _cp_is_redirect_word "${_cp_gsr_words[$_cp_gsr_i]}"; do
+    _cp_gsr_i=$((_cp_gsr_i + 1))
+  done
+  if [ "$_cp_gsr_i" -gt 0 ] && [ "$_cp_gsr_i" -lt "$_cp_gsr_n" ] &&
+     _cp_is_git_or_launcher_word "${_cp_gsr_words[$_cp_gsr_i]}"; then
+    return 1
+  fi
   if _cp_locate_command_word "$chunk"; then
     case "$_cp_wcmd" in
       git|git-*)
@@ -2869,12 +2952,11 @@ EOF
 
 # `_cp_git_push_seg_has_git <chunk>` -> 0 when CHUNK contains, as a
 # whitespace-delimited word ANYWHERE (not only as the resolved FIRST
-# command word), the literal `git`, a path ending `/git`, or one of
-# git's push-equivalent libexec binaries (`git-push`, `git-http-push`,
-# `git-send-pack`, or a path ending in one of those). Mirrors
-# `is_git`/`is_git_push_bin` inside `_cp_git_push_invoked`'s own awk
-# script exactly so the two definitions of "this is git" cannot drift
-# apart again.
+# command word), something whose BASENAME case-folds to `git` or
+# `git-*` — the exact same "is this git" test `_cp_git_seg_exec_unsafe`
+# applies to the resolved command word (`_cp_locate_command_word`
+# already lowercases `${word##*/}` at line ~2001), so the backstop
+# cannot disagree with the locator about what counts as git.
 #
 # Round 5: `_cp_git_push_invoked` no longer calls this directly (R4-1/
 # R4-3 — see that function's own header for why it reverted to running
@@ -2885,9 +2967,21 @@ EOF
 # `_cp_locate_command_word` failed to resolve as git (because a leading
 # redirect shape its patterns don't cover ate the `git` token) can
 # still be a real git invocation.
+#
+# Round 6 (PR#257 round-5 review, R5-1/R5-2): round 5's version matched
+# the literal lowercase strings `git`/`*/git`/the three push-equivalent
+# binary names ONLY — case-SENSITIVE. macOS's default filesystem is
+# case-insensitive, so `GIT`, `Git`, and `/usr/bin/GIT` all really run
+# git but none of them matched, and the backstop silently waved the
+# chunk through unchanged instead of running the pop-and-check that
+# would have caught the leftover redirect byte. Folding each word's
+# basename to lowercase and matching `git`/`git-*` (the SAME shape
+# `_cp_git_seg_exec_unsafe` already applies post-resolution) also
+# subsumes the three named push binaries — `git-push`/`git-http-push`/
+# `git-send-pack` already match `git-*`.
 _cp_git_push_seg_has_git() {
   local LC_ALL=C LANG=C
-  local chunk="$1" w
+  local chunk="$1" w wl
   local -a words
   local _cp_gph_noglob=0
   case "$-" in *f*) _cp_gph_noglob=1 ;; esac
@@ -2896,9 +2990,9 @@ _cp_git_push_seg_has_git() {
   words=($chunk)
   [ "$_cp_gph_noglob" = 1 ] || set +f
   for w in ${words[@]+"${words[@]}"}; do
-    case "$w" in
-      git|*/git|git-push|*/git-push|git-http-push|*/git-http-push|git-send-pack|*/git-send-pack)
-        return 0 ;;
+    wl="$(printf '%s' "${w##*/}" | tr 'A-Z' 'a-z')"
+    case "$wl" in
+      git|git-*) return 0 ;;
     esac
   done
   return 1
@@ -3027,11 +3121,84 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
       if (reserve) print "push"; else if (missing || nonliteral) print "ambiguous"; else print "safe"
     }
   ')"
+  # Round 6b (Main's live r5-probe run, Part C mode=postverb, REGRESS=2):
+  # the awk above blind-splits on `<`/`>` too, same as the rest of this
+  # function always has (per round 5's invariant above) — but that means
+  # a redirect SITTING IN THE VERB SLOT splits `push` away from itself
+  # before the awk ever sees it: `git pu >/dev/null''sh origin main`
+  # (quote-splice) and `git p >/dev/null\ush origin main` (backslash-
+  # glue) both resolve their subcmd token to `pu`/`p` — genuinely a
+  # DIFFERENT git verb under correct shell-redirect-target semantics (the
+  # `sh`/`ush` suffix is consumed by the redirect's own target word, not
+  # left over as part of the verb) — so main's `\bpush\b` fallback and
+  # this scanner's own exact-token match both correctly see no real push
+  # here, by that semantics. `conductor_reserved_reason` is the STRONGER
+  # human-only guarantee (plain `escalate` can still be peer-auto-
+  # answered for an operational prompt); failing to reserve a text a
+  # human who isn't tracing real quote/redirect-target grammar would
+  # read as "obviously still says push" risks exactly that peer auto-
+  # answer. Fail closed the same way the rest of this function already
+  # commits to (deny by default): a SECOND, independent pass over `pre`
+  # split ONLY on `;&|()`` backtick — keeping `<`/`>` intact this time —
+  # reserves whenever the token right after `git` (skipping the SAME
+  # global dash-options the main scan does) is a non-empty, non-full
+  # PROPER PREFIX of the literal word `push` (`p`, `pu`, `pus`) AND that
+  # same statement carries a `<`/`>` byte. Scoped to `push` only (not
+  # `http-push`/`send-pack`, whose own first letters `h`/`s` collide with
+  # common short aliases like `git s` for `status`) and to the verb SLOT
+  # specifically (the exact first non-flag token after `git`, same as the
+  # main scan's own `subcmd`) — never a substring scan of the whole
+  # statement, which is exactly the shape R4-3 already proved false-
+  # positives on (`git diff lib/push-wake.sh >/tmp/d.patch`: subcmd is
+  # unambiguously `diff`, not a prefix of `push`, so this pass leaves it
+  # alone). Real git has no abbreviated subcommands, so a literal `p`/
+  # `pu`/`pus` subcmd is never a genuine OTHER verb — at worst a
+  # user-defined alias, which is exactly the ambiguous case reservation
+  # (not a hard block) exists for.
+  local segmented2 out2
+  segmented2="$(printf '%s' "$pre" | sed -E 's/[;&|()`]/\n/g')"
+  out2="$(printf '%s\n' "$segmented2" | awk '
+    function is_consuming(s) { return (s ~ /^(-C|-c|--git-dir|--work-tree|--namespace|--config-env|--exec-path|--super-prefix|--attr-source)$/) }
+    function is_git(s,    n) { n = length(s); return (s == "git" || (n > 4 && substr(s, n - 3) == "/git")) }
+    function is_push_prefix(s) { return (s != "" && s != "push" && index("push", s) == 1) }
+    {
+      if ($0 !~ /[<>]/) next
+      n = split($0, tok, /[ \t]+/)
+      i = 1
+      while (i <= n) {
+        t = tok[i]
+        if (t == "") { i++; continue }
+        if (is_git(t)) {
+          i++
+          while (i <= n) {
+            t2 = tok[i]
+            if (t2 == "") { i++; continue }
+            if (substr(t2, 1, 1) == "-") {
+              eq = index(t2, "=")
+              name = (eq > 0) ? substr(t2, 1, eq - 1) : t2
+              i++
+              if (eq == 0 && is_consuming(name)) {
+                while (i <= n && tok[i] == "") i++
+                if (i <= n) i++
+              }
+              continue
+            }
+            if (is_push_prefix(t2)) reserve = 1
+            i++
+            break
+          }
+          continue
+        }
+        i++
+      }
+    }
+    END { if (reserve) print "push"; else print "safe" }
+  ')"
   case "$out" in
     push) return 0 ;;
-    ambiguous) _cp_match '\bpush\b' "$pre" ;;
-    *) return 1 ;;
+    ambiguous) _cp_match '\bpush\b' "$pre" && return 0 ;;
   esac
+  [ "$out2" = push ]
 }
 
 # `_cp_git_unsafe_tokens <token...>` -> 0 (true) when the git invocation
@@ -3866,9 +4033,13 @@ _cp_exec_var_stmt_kind() {              # protected-segment -> prints execvar|so
 # unrecognized token (round 3 review, the root bug). `_cp_protect_text`
 # turns a quoted/escaped space into a control byte instead, so the
 # assignment survives as ONE token the way a real shell would pass it.
-# Segmented on shell operators including `<`/`>` (same as
-# `_cp_git_push_invoked`) so a quoted option value containing its own
-# redirect cannot hide the option in a later segment.
+# Segmented via `_cp_git_redirect_segments` — real statement separators
+# split as always, but `<`/`>` only ever split as part of the git/push
+# allowlisted-trailing-redirect handling there (NOT a blind split, and
+# NOT the same as `_cp_git_push_invoked`, which runs its own
+# unconditional whole-text scan and never touches redirects specially —
+# see that function's own header) — so a quoted option value containing
+# its own redirect cannot hide the option in a later segment.
 #
 # Round 4 (herdr-control#254, rule A): a FIRST pass over every statement,
 # order-independent for the exec-var/git pairing (the var escalates the
