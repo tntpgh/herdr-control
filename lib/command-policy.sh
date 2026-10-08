@@ -2778,12 +2778,15 @@ _cp_git_redirect_split() {                      # text -> raw statements, one pe
 # `_cp_git_seg_strip_trailing_redirects <chunk>` -> prints CHUNK
 # unchanged when its resolved command (`_cp_locate_command_word`) is
 # anything other than `git`/`git-*` AND the chunk carries no `<`/`>`
-# byte at all — a non-git chunk with no redirect byte is inert to
-# every consumer below (none of them look for a command word besides
-# git/git-*/the export family/source/xargs/parallel), so nothing here
-# needs to touch it, matching main. Used by `_cp_git_exec_opt_invoked`,
-# whose own per-segment gates already key off this same FIRST-command-
-# word resolution.
+# byte at all is inert to THIS function's own job (popping trailing
+# redirects) — it is NOT necessarily inert to every downstream consumer:
+# `_cp_git_seg_exec_unsafe`'s dispatch now matches the full #261 launcher
+# list (`find`/`script`/`arch`/`xcrun`/`direnv`/`mise`/`lockf`/
+# `ssh-agent`/`dtrace`/`leaks`/`lldb`/`taskpolicy`/`launchctl`/`open`/
+# `chroot`/`flock`/`parallel`/`watch`), not just git/git-*/the export
+# family/source/xargs. Round 6 (`_cp_git_exec_opt_invoked`) compensates
+# by ALSO running both loops over main's blind split, independent of
+# this function's scope.
 #
 # For a git/git-* chunk: word-splits it (safe — `_cp_locate_command_word`
 # already required this to tokenize on whitespace to find the command
@@ -3970,11 +3973,15 @@ _CP_EXEC_VAR_RE='^(GIT_[A-Za-z0-9_]*|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH
 
 # `_cp_exec_var_stmt_kind <protected-statement>` -> prints one of
 # "execvar"/"source"/"git"/"" describing what this ONE statement (already
-# split on `;&|()` and backtick, same as every other per-segment check
-# in this file — `<`/`>` are NOT blind split points here; each
-# statement already had its own allowlisted trailing redirect popped by
-# `_cp_git_seg_strip_trailing_redirects`, or escalated before reaching
-# this far, so a leftover `<`/`>` byte cannot appear in SEG) is, for
+# split on `;&|()` and backtick for the redirect-aware view (each
+# statement there already had its own allowlisted trailing redirect
+# popped by `_cp_git_seg_strip_trailing_redirects`, or escalated before
+# reaching this far, so no leftover `<`/`>` byte survives in SEG from
+# that view). Round 6 (`_cp_git_exec_opt_invoked`) ALSO calls this on
+# statements from main's blind split, where `<`/`>` ARE split points
+# too — SEG from that view carries no `<`/`>` byte either, but can be a
+# bare fragment (e.g. `2`, empty) with no command word, which the
+# no-command-word branch below already handles) is, for
 # the whole-command scan below. Reuses
 # `_cp_locate_command_word` rather than re-walking tokens a second way:
 #   * a statement that resolves to NO command word at all (every token
@@ -4054,6 +4061,38 @@ _cp_exec_var_stmt_kind() {              # protected-segment -> prints execvar|so
 # none of them ever reached `_cp_git_seg_exec_unsafe`'s same-segment
 # `_CP_LOC_SKIPPED` walk at all — this pass closes that gap structurally
 # instead of enumerating each shape.
+# `_cp_git_exec_opt_scan_segments <newline-separated-segments>` -> 0
+# (true) when ANY segment is unsafe by either of the two checks
+# `_cp_git_exec_opt_invoked` has always run over one segmentation: the
+# exec-var/source pairing above, or `_cp_git_seg_exec_unsafe` itself.
+# Factored out of `_cp_git_exec_opt_invoked` so round 6 (R6-1) can run
+# the identical logic over two different segmentations — the
+# redirect-aware split and main's blind split — without two copies of
+# the loop to keep in sync.
+_cp_git_exec_opt_scan_segments() {      # segments -> 0 (true) if any segment unsafe
+  local segmented="$1" seg
+  local _cp_geo_execvar=0 _cp_geo_git=0 _cp_geo_source=0 _cp_geo_kind
+  while IFS= read -r seg; do
+    [ -n "${seg//[[:space:]]/}" ] || continue
+    _cp_geo_kind="$(_cp_exec_var_stmt_kind "$seg")"
+    case "$_cp_geo_kind" in
+      execvar) _cp_geo_execvar=1 ;;
+      source) _cp_geo_source=1 ;;
+      git) _cp_geo_git=1; [ "$_cp_geo_source" = 1 ] && _cp_geo_execvar=1 ;;
+    esac
+  done <<EOF
+$segmented
+EOF
+  [ "$_cp_geo_execvar" = 1 ] && [ "$_cp_geo_git" = 1 ] && return 0
+  while IFS= read -r seg; do
+    [ -n "${seg//[[:space:]]/}" ] || continue
+    _cp_git_seg_exec_unsafe "$seg" && return 0
+  done <<EOF
+$segmented
+EOF
+  return 1
+}
+
 _cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git fails the read-only shape
   local LC_ALL=C LANG=C
   local raw="$1" pre protected seg
@@ -4075,26 +4114,33 @@ _cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git fails the read-
   if ! segmented="$(_cp_git_redirect_segments "$protected")"; then
     return 0
   fi
+  _cp_git_exec_opt_scan_segments "$segmented" && return 0
 
-  local _cp_geo_execvar=0 _cp_geo_git=0 _cp_geo_source=0 _cp_geo_kind
-  while IFS= read -r seg; do
-    [ -n "${seg//[[:space:]]/}" ] || continue
-    _cp_geo_kind="$(_cp_exec_var_stmt_kind "$seg")"
-    case "$_cp_geo_kind" in
-      execvar) _cp_geo_execvar=1 ;;
-      source) _cp_geo_source=1 ;;
-      git) _cp_geo_git=1; [ "$_cp_geo_source" = 1 ] && _cp_geo_execvar=1 ;;
-    esac
-  done <<EOF
-$segmented
-EOF
-  [ "$_cp_geo_execvar" = 1 ] && [ "$_cp_geo_git" = 1 ] && return 0
-  while IFS= read -r seg; do
-    [ -n "${seg//[[:space:]]/}" ] || continue
-    _cp_git_seg_exec_unsafe "$seg" && return 0
-  done <<EOF
-$segmented
-EOF
+  # Round 6 (PR#266 review, required change #1): ADDITIONALLY run the
+  # identical scan over main's blind split — the same `[;&|()`<>]`
+  # statement-separator set this function split on before #257 taught it
+  # to treat `<`/`>` as part of a segment instead of a split point.
+  # #261's dispatch has grown a long, still-growing list of launcher
+  # words (`script`/`arch`/`xcrun`/`find`/`direnv`/…) that the
+  # redirect-aware split's leading-redirect skip
+  # (`_cp_is_git_or_launcher_word`) must name explicitly before it can
+  # resolve the command word behind a leading dup-fd redirect like
+  # `10>&2 script …` — a list that is one future launcher short, always.
+  # The blind split needs no such list: `10>&2 script …` becomes `10`,
+  # ``, `2 script …`, and the lone fd `2` is skipped by the locator the
+  # same way main already does it. Scanning BOTH views and returning 0
+  # if either hits makes this gate >= main for every dispatch entry,
+  # present and future, with no second list to keep in sync (R6-1). It
+  # also closes R6-2: `git>/dev/null -C … status` leaves a lone `git`
+  # chunk in the blind view (empty verb after the git word), which
+  # `_cp_git_unsafe_tokens`'s existing `[ -n "$verb" ] || return 0` rule
+  # already treats as unsafe.
+  # Accepted cost: this restores main's own escalation of
+  # `git config <key> 2>/dev/null` (PR#257 round 5 Part C `trail`, an
+  # unintended loosening #257 introduced) — "only add escalation".
+  local blind_segmented
+  blind_segmented="$(printf '%s' "$protected" | sed -E 's/[;&|()`<>]/\n/g')"
+  _cp_git_exec_opt_scan_segments "$blind_segmented" && return 0
   return 1
 }
 
