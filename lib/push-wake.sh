@@ -11,7 +11,9 @@
 # places for it to rot.
 #
 # What it does, in order, refusing rather than guessing at every step:
-#   1. nothing to do unless a conductor pane was stamped at spawn
+#   1. nothing to do unless a conductor pane is known — the task's CURRENT
+#      registry row (conductor_pane_id, kept live by conductor-handover.sh)
+#      when one exists, else the pane stamped into the env at spawn
 #   2. the conductor pane must still be running an agent (pane_is_agent) —
 #      send-to-agent.sh does not enforce that itself, so without this a stray
 #      HERDR_CONDUCTOR_PANE_ID types into a bare shell, where the text EXECUTES
@@ -145,6 +147,20 @@ push_wake() {
   if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
     own_task="$(read_task "$HERDR_RUN_ID" "$HERDR_TASK_ID" 2>/dev/null)"
     own_state=$(printf '%s' "$own_task" | jq -r '.state // empty' 2>/dev/null)
+    # F1 (security review PR #253): conductor-handover.sh updates
+    # conductor_pane_id/conductor_pane_birth on this row when authority
+    # moves — a worker's own HERDR_CONDUCTOR_PANE_ID env var is stamped
+    # once at spawn and never changes, so a LATER prompt kept paging the
+    # OLD conductor pane after a handover and got refused as "recycled"
+    # once that pane stopped matching the (also stale) env birth. Prefer
+    # the row's CURRENT conductor_pane_id when one exists; env is the
+    # fallback only for an older registration or a worker not spawned via
+    # spawn-task.sh.
+    if [ -n "$own_task" ]; then
+      local row_cpane
+      row_cpane=$(printf '%s' "$own_task" | jq -r '.conductor_pane_id // empty' 2>/dev/null)
+      [ -n "$row_cpane" ] && cpane="$row_cpane"
+    fi
     case "$own_state" in
       completed|failed|cancelled|lost)
         append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "stale_worker_hook_refused" \
