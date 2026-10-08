@@ -174,19 +174,6 @@ HERDR_STALL_WATCHDOG_ESCALATE_S=0 bash "$here/stall-watchdog.sh" wake taskD arti
 [ "$(_lc "$NOTIFIED")" = "0" ] && ok "H2: owner_acted after the wake counts as handled — no escalation without stall-ack" \
   || bad "H2 REGRESSION: escalated despite owner_acted — $(cat "$NOTIFIED")"
 
-echo "== A8b (SPEC.md item 4): a conductor supersede (herdr-action.sh, action_decided) counts as handled too =="
-register_task runD2 taskD2 workerD2 condD2 "$COND" "$CONDB" paneD2 paneD2birth repo/d2 "$WORK/wtD2" labelD2 >/dev/null
-: > "$SENT"; : > "$NOTIFIED"
-bash "$here/stall-watchdog.sh" wake taskD2 artifact "tmp/REVIEW.md:7" "ready" "tmp/REVIEW.md"
-sleep 1.2
-_sql_runD "INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload)
-  VALUES ('ev_supersedeD2','runD2','taskD2','action_decided','$(date -u +%Y-%m-%dT%H:%M:%SZ)',
-  '{\"decision\":\"superseded\"}');"
-: > "$SENT"; : > "$NOTIFIED"
-HERDR_STALL_WATCHDOG_ESCALATE_S=0 bash "$here/stall-watchdog.sh" wake taskD2 artifact "tmp/REVIEW.md:7" "ready" "tmp/REVIEW.md"
-[ "$(_lc "$NOTIFIED")" = "0" ] && ok "item4: action_decided (supersede) after the wake counts as handled — no escalation without stall-ack" \
-  || bad "item4 REGRESSION: escalated despite a conductor supersede — $(cat "$NOTIFIED")"
-
 echo "== A9 (review H3): an ack survives the conductor pane later going away — no re-escalation =="
 register_task runE taskE workerE condE "$COND" "$CONDB" paneE paneEbirth repo/e "$WORK/wtE" labelE >/dev/null
 : > "$SENT"; : > "$NOTIFIED"
@@ -986,10 +973,10 @@ conn.commit(); conn.close()
 _, _, owner_acted2 = _safe_signals3("sig_owner", now=REG_NOW, threshold_s=REG_THRESH)
 results["owner_acted_populated_from_owner_acted_events"] = "t_owner" in owner_acted2
 
-# SPEC.md item 4: herdr-action.sh's approve/decline/supersede path writes
-# `action_decided`, not `owner_acted`/`approval_reviewed` -- Main's normal
-# way of handling a pending request (supersede it, run the suite itself)
-# must also count as owner activity.
+# round-3 R3: `action_decided` was removed from owner-activity entirely --
+# a conductor's `herdr-action.sh supersede` must NOT ack a wake, exactly
+# as on origin/main (the round-1 item-4 addition and the round-2 Q2
+# textual-match carve-out are both reverted).
 conn = sqlite3.connect(str(hub.REGISTRY))
 conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
              "VALUES ('t_supersede','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
@@ -998,41 +985,7 @@ conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, 
              "'{\"decision\":\"superseded\"}')")
 conn.commit(); conn.close()
 _, _, owner_acted3 = _safe_signals3("sig_supersede", now=REG_NOW, threshold_s=REG_THRESH)
-results["item4_owner_acted_populated_from_a_herdr_action_supersede"] = "t_supersede" in owner_acted3
-
-# review r6 Q2: a supersede only counts as owner activity for the
-# conductor_prompt wake it NAMES -- a conductor_prompt fingerprint has no
-# request_id of its own, so the match is textual against the wake's own
-# request line (`detail`). A supersede of request B must not silence a wake
-# about request A; approve/decline (item4/A8b above) stay unconditional.
-conn = sqlite3.connect(str(hub.REGISTRY))
-conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
-             "VALUES ('t_q2','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
-fp_a = "cprompt:aaaaaaaaaaaaaaaa|g1"
-key_a = f"stall_t_q2_conductor_prompt_{hub._sw_digest(fp_a)}"
-conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
-             "VALUES (?,'drun','t_q2','stall_wake','2026-01-01T01:00:00Z',?)",
-             (key_a, json.dumps({"signal": "conductor_prompt", "fingerprint": fp_a,
-                                 "detail": "CONDUCTOR: approve request ar_A or tell me why not"})))
-conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
-             "VALUES ('ad_q2b','drun','t_q2','action_decided','2026-01-01T01:30:00Z',"
-             "'{\"decision\":\"superseded\",\"request_id\":\"ar_B\",\"action_sha256\":\"shaB\"}')")
-conn.commit(); conn.close()
-hub._SW_RESOLVED_CACHE.clear()
-ro = sqlite3.connect(f"file:{hub.REGISTRY}?mode=ro", uri=True)
-resolved_q2a = hub._sw_resolved_keys(ro, owner_acted={"t_q2": hub._iso_epoch("2026-01-01T01:30:00Z")})
-ro.close()
-results["Q2_supersede_of_request_B_does_not_silence_a_wake_about_request_A"] = key_a not in resolved_q2a
-conn = sqlite3.connect(str(hub.REGISTRY))
-conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
-             "VALUES ('ad_q2a','drun','t_q2','action_decided','2026-01-01T02:00:00Z',"
-             "'{\"decision\":\"superseded\",\"request_id\":\"ar_A\",\"action_sha256\":\"shaA\"}')")
-conn.commit(); conn.close()
-hub._SW_RESOLVED_CACHE.clear()
-ro = sqlite3.connect(f"file:{hub.REGISTRY}?mode=ro", uri=True)
-resolved_q2b = hub._sw_resolved_keys(ro, owner_acted={"t_q2": hub._iso_epoch("2026-01-01T02:00:00Z")})
-ro.close()
-results["Q2_supersede_naming_request_A_does_resolve_its_own_wake"] = key_a in resolved_q2b
+results["R3_supersede_after_a_wake_does_not_ack_it_matches_main"] = "t_supersede" not in owner_acted3
 
 # A later event from the SAME task (real worker activity) clears "unprocessed".
 conn = sqlite3.connect(str(hub.REGISTRY))

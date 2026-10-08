@@ -4366,16 +4366,7 @@ _STALL_WORKER_ACTIVITY_TYPES = ("input_required", "completion_recorded")
 # already existed before this feature — reused as both "the conductor
 # already acted on this artifact" (H1) and "treat it the same as an ack"
 # (H2, enforced in stall-watchdog.sh's own event query, not here).
-# `action_decided` (SPEC.md item 4): herdr-action.sh's approve/decline/
-# supersede request-based path — DISTINCT from herdr-select.sh's inline
-# PostToolUse approval, which already writes `approval_reviewed` above —
-# writes only this event (payload.decision in approved/declined/
-# superseded), never `approval_reviewed`/`owner_acted`. Main's normal way
-# of handling a worker's pending request is exactly `herdr-action.sh
-# supersede` followed by running the suite itself, which previously left
-# no owner-activity trace at all and kept escalating.
-_STALL_OWNER_ACTIVITY_TYPES = ("owner_acted", "brief_delivered", "reply_delivered", "approval_reviewed",
-                               "action_decided")
+_STALL_OWNER_ACTIVITY_TYPES = ("owner_acted", "brief_delivered", "reply_delivered", "approval_reviewed")
 _STALL_DENY_CHOICE_RE = re.compile(r"\b(deny|no|reject)\b", re.IGNORECASE)
 
 
@@ -4497,38 +4488,6 @@ _SW_RESOLVED_CACHE: dict[str, str] = {}   # r1 L5: once an eid resolves, its
 # cost one `MIN(occurred_at)` query EACH, once, not every 15s tick forever.
 
 
-def _sw_owner_resolves_cprompt(conn: sqlite3.Connection, tid: str, detail: str,
-                               claimed_at: str, own_placeholders: str) -> str | None:
-    """Review r6 Q2: a `conductor_prompt` wake is resolved by the first
-    owner-activity row after its claim UNLESS that row is an
-    `action_decided` supersede naming a DIFFERENT request — a
-    conductor_prompt fingerprint has no `request_id` of its own, so the
-    match is textual: the superseded decision's `request_id` or
-    `action_sha256` must appear in the wake's own request text (`detail`,
-    `req["line"][:200]`). Approve/decline keep today's unconditional
-    behavior (the `approval_reviewed` precedent, DESIGN-228 R29c) — only
-    a mismatched SUPERSEDE is skipped, falling through to the next row (an
-    unrelated supersede followed by a real ack still resolves it).
-    Returns None when every owner-activity row since the claim is a
-    mismatched supersede, leaving the key open."""
-    for typ, payload, occurred_at in conn.execute(
-            f"SELECT type, payload, occurred_at FROM events WHERE task_id=? "
-            f"AND type IN ({own_placeholders}) AND occurred_at >= ? ORDER BY occurred_at",
-            (tid, *_STALL_OWNER_ACTIVITY_TYPES, claimed_at)):
-        if typ != "action_decided":
-            return occurred_at
-        try:
-            p = json.loads(payload or "{}")
-        except json.JSONDecodeError:
-            p = {}
-        if p.get("decision") != "superseded":
-            return occurred_at
-        rid, sha = str(p.get("request_id") or ""), str(p.get("action_sha256") or "")
-        if (rid and rid in detail) or (sha and sha in detail):
-            return occurred_at
-    return None
-
-
 def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None) -> dict[str, str]:
     """claim_once keys that are ALREADY woken AND acked (review M4): the
     daemon must not spawn a subprocess plus two herdr RPCs every tick,
@@ -4548,14 +4507,14 @@ def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None)
     the dispatch filter; the time is when signal 5's fold retires that
     occurrence (DESIGN-228 §3), so the ladder and the fold read one test."""
     owner_acted = owner_acted or {}
-    claims: dict[str, tuple[str, str, str, str]] = {}
+    claims: dict[str, tuple[str, str, str]] = {}
     for eid, tid, occurred_at, payload in conn.execute(
             "SELECT event_id, task_id, occurred_at, payload FROM events WHERE type='stall_wake'"):
         try:
-            p = json.loads(payload or "{}")
+            sig = json.loads(payload or "{}").get("signal", "")
         except json.JSONDecodeError:
-            p = {}
-        claims[eid] = (tid, p.get("signal", "") or "", occurred_at, p.get("detail", "") or "")
+            sig = ""
+        claims[eid] = (tid, sig, occurred_at)
     acks: dict[str, list[tuple[str, str]]] = {}
     for tid, payload, occurred_at in conn.execute(
             "SELECT task_id, payload, occurred_at FROM events WHERE type='stall_acked'"):
@@ -4571,7 +4530,7 @@ def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None)
         if key not in resolved or when < resolved[key]:
             resolved[key] = when
 
-    for eid, (tid, sig, claimed_at, detail) in claims.items():
+    for eid, (tid, sig, claimed_at) in claims.items():
         if eid in _SW_RESOLVED_CACHE:
             _at(eid, _SW_RESOLVED_CACHE[eid])
             continue
@@ -4582,16 +4541,11 @@ def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None)
         if owner_epoch is not None:
             claimed_epoch = _iso_epoch(claimed_at)
             if claimed_epoch is not None and owner_epoch >= claimed_epoch:
-                if sig == "conductor_prompt":
-                    resolved_at = _sw_owner_resolves_cprompt(conn, tid, detail, claimed_at, own_placeholders)
-                    if resolved_at is not None:
-                        _at(eid, resolved_at)
-                else:
-                    row = conn.execute(
-                        f"SELECT MIN(occurred_at) FROM events WHERE task_id=? AND type IN ({own_placeholders}) "
-                        "AND occurred_at >= ?", (tid, *_STALL_OWNER_ACTIVITY_TYPES, claimed_at)).fetchone()
-                    _at(eid, row[0] if row and row[0] else
-                        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(owner_epoch)))
+                row = conn.execute(
+                    f"SELECT MIN(occurred_at) FROM events WHERE task_id=? AND type IN ({own_placeholders}) "
+                    "AND occurred_at >= ?", (tid, *_STALL_OWNER_ACTIVITY_TYPES, claimed_at)).fetchone()
+                _at(eid, row[0] if row and row[0] else
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(owner_epoch)))
     for eid, occurred_at in conn.execute(
             "SELECT event_id, occurred_at FROM events WHERE type='stall_escalate_claim'"):
         if eid.endswith("_escalate"):

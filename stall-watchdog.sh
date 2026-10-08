@@ -117,18 +117,13 @@ _sw_acked_since() {                     # task_id signal since_iso -> 0 if acked
 # Owner-side ACTIVITY (review H2): most real handling is never routed
 # through stall-ack.sh at all — a conductor just messages the worker
 # (owner_acted/brief_delivered/reply_delivered) or reviews an approval
-# (approval_reviewed) or decides a herdr-action.sh request
-# (action_decided — SPEC.md item 4: `herdr-action.sh supersede` is
-# Main's normal way of cancelling a worker's pending request before
-# running the suite itself, and wrote NO owner-activity event at all
-# until this type was added here). ANY of those after the wake's own
-# claim counts the same as an explicit ack; otherwise every wake the
-# conductor handles the NORMAL way still escalates to Slack 2x the
-# threshold later regardless.
+# (approval_reviewed). ANY of those after the wake's own claim counts the
+# same as an explicit ack; otherwise every wake the conductor handles the
+# NORMAL way still escalates to Slack 2x the threshold later regardless.
 _sw_owner_acted_since() {               # task_id since_iso -> 0 if owner activity happened after
   local n
   n="$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq "$1")
-        AND type IN ('owner_acted','brief_delivered','reply_delivered','approval_reviewed','action_decided')
+        AND type IN ('owner_acted','brief_delivered','reply_delivered','approval_reviewed')
         AND occurred_at > $(_sq "$2");" 2>/dev/null)"
   [ "${n:-0}" -gt 0 ]
 }
