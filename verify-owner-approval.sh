@@ -318,12 +318,12 @@ for c in "git grep --open-files-in-pager='$pg' $gf" \
   fi
 done
 [ ! -e "$mk" ] && ok "the pager marker was never created" || not_ok "a pager command executed: $mk exists"
-# The regex-anchor case is double-quoted on purpose: #254's shared gate
-# (`_cp_exec_name_or_opaque_present`) flags the text `$'` anywhere, so
-# `-e 'owner$'` escalates there (a safe-direction false positive, owned by
-# #254). This case pins the closed world's own rule: a bare `$` is no expansion.
+# Round 11 (#255) escalates ANY `$` in a git argument, by class: a literal
+# regex anchor such as `-e "owner$"` is a safe-direction false positive, kept
+# on purpose so the rule never has to judge which `$` expands. Pinned here.
+out="$(ownb "git grep -n -e \"owner\$\" -- docs/design/pretool-approval.md")"; rc=$?
+expect_block "owner git with a \$ in an argument: refused (round 11 class rule)" "$out" "$rc" "git invocation"
 for c in "git grep -n -e owner -- docs/design/pretool-approval.md" \
-         "git grep -n -e \"owner\$\" -- docs/design/pretool-approval.md" \
          "git log --oneline -1 -- '*.md'" \
          "git log -1 --extended-regexp --grep=x" \
          "git diff --no-ext-diff --stat HEAD" \
