@@ -2488,10 +2488,32 @@ _cp_flatten_substitutions() {
 # itself, so `git -P diff 2>&1` split into `git -P diff 2>` (an
 # unmatched, now-disqualifying `>`) and a bare `1` — a real background
 # `&`/`&&` still splits exactly as before (only an `&` immediately
-# followed by `>` is ever kept joined).
+# followed by `>` is ever kept joined). Round 5 (R4-2/R4-5): `>|` (the
+# noclobber-override operator) is kept joined the same way `>&` already
+# was — round 4 left it as a bare split point, so `>|/dev/null git …`
+# was cut at the `|`, leaving `/dev/null git …` with no `git` token
+# left in its own segment at all (one of the R4-2 leading-redirect
+# holes; `_cp_git_seg_strip_trailing_redirects`'s own backstop closes
+# the rest). `<|` is not a real shell operator, so `<` only ever joins
+# with a following `&`.
+#
+# Round 5 (R4-6, cost): the char-walk below is O(n) in characters, but
+# bash's `out+=` string growth is itself O(n) per append, making the
+# whole loop O(n²) — measurable on a large pasted command. None of this
+# machinery is needed when TEXT has no `<`/`>` byte at all: with no `>`
+# anywhere, `&` can never be glued to one, so a plain `sed` split on the
+# same separator set (`;`/`&`/`|`/`(`/`)`/backtick) is byte-for-byte
+# identical to the walk's output and runs in one O(n) pass. That fast
+# path covers the overwhelming majority of real commands; the char walk
+# below only runs for the minority that actually contains a redirect.
 _cp_git_redirect_split() {                      # text -> raw statements, one per line, <>& dup-forms kept intact
   local LC_ALL=C LANG=C
-  local text="$1" out="" n i c c1
+  local text="$1"
+  case "$text" in
+    *'<'*|*'>'*) ;;
+    *) printf '%s' "$text" | sed -E 's/[;&|()`]/\n/g'; return 0 ;;
+  esac
+  local out="" n i c c1
   n=${#text}
   i=0
   while [ "$i" -lt "$n" ]; do
@@ -2509,7 +2531,7 @@ _cp_git_redirect_split() {                      # text -> raw statements, one pe
         ;;
       '>'|'<')
         c1="${text:$((i + 1)):1}"
-        if [ "$c1" = '&' ]; then
+        if [ "$c1" = '&' ] || { [ "$c" = '>' ] && [ "$c1" = '|' ]; }; then
           out+="$c$c1"; i=$((i + 2))
         else
           out+="$c"; i=$((i + 1))
@@ -2524,46 +2546,91 @@ _cp_git_redirect_split() {                      # text -> raw statements, one pe
 
 # `_cp_git_seg_strip_trailing_redirects <chunk>` -> prints CHUNK
 # unchanged when its resolved command (`_cp_locate_command_word`) is
-# anything other than `git`/`git-*` — a non-git chunk's own `<`/`>`
-# bytes are inert to every consumer below (none of them look for a
-# command word besides git/git-*/the export family/source/xargs/
-# parallel), so nothing here needs to touch it, matching main. Used by
-# `_cp_git_exec_opt_invoked`, whose own per-segment gates already key
-# off this same FIRST-command-word resolution.
+# anything other than `git`/`git-*` AND the chunk carries no `<`/`>`
+# byte at all — a non-git chunk with no redirect byte is inert to
+# every consumer below (none of them look for a command word besides
+# git/git-*/the export family/source/xargs/parallel), so nothing here
+# needs to touch it, matching main. Used by `_cp_git_exec_opt_invoked`,
+# whose own per-segment gates already key off this same FIRST-command-
+# word resolution.
 #
 # For a git/git-* chunk: word-splits it (safe — `_cp_locate_command_word`
 # already required this to tokenize on whitespace to find the command
 # word) and pops trailing words off the end for as long as each exactly
 # equals one of the fixed allowed redirects: `>/dev/null`, `2>/dev/null`,
-# `&>/dev/null`, `2>&1`, `1>&2`, `>&2`. Only a whole, separate,
-# whitespace-delimited trailing word matches — `-P>` (glued), a leading
-# `>/dev/null git …`, a mid-segment `git >/dev/null status`, `<(`/`>(`,
-# a here-string/here-doc marker, or a target containing `$`/a backtick
-# all keep at least one `<`/`>` byte somewhere other than the exact
-# trailing position, which the reassembled text still carries. If any
-# `<`/`>` byte remains after popping every matching trailing word, this
-# is the SPEC's ESCALATED case: prints nothing and returns 1. The caller
+# `&>/dev/null`, `2>&1`, `1>&2`, `>&2`, `</dev/null`, or a detached
+# `2> /dev/null`/`> /dev/null` pair (see
+# `_cp_git_seg_pop_allowed_trailing_redirects`'s own header). Only a
+# whole, separate, whitespace-delimited trailing word (or that one
+# detached pair) matches — `-P>` (glued), a leading `>/dev/null git …`,
+# a mid-segment `git >/dev/null status`, `<(`/`>(`, a here-string/
+# here-doc marker, or a target containing `$`/a backtick all keep at
+# least one `<`/`>` byte somewhere other than the exact trailing
+# position, which the reassembled text still carries. If any `<`/`>`
+# byte remains after popping every matching trailing word, this is the
+# SPEC's ESCALATED case: prints nothing and returns 1. The caller
 # treats that as "do not try to parse this further" — never as "safe".
+#
+# Round 5 (R4-2 backstop): the locator's OWN redirect patterns only
+# recognise a single-digit fd and a handful of exact operator shapes —
+# a multi-digit fd (`10>/dev/null`), a named fd (`{fd}>/dev/null`), a
+# detached `>&`/`<&` (`>& /dev/null`), or `>|` (cut apart by the
+# splitter at the `|` before round 5, now kept joined — see
+# `_cp_git_redirect_split`) can make the locator read the redirect's
+# own TARGET word, or nothing at all, as the resolved command word —
+# hiding a real leading `git` from every later gate (round-4 review
+# finding R4-2). Fixing every such shape in the shared locator would
+# touch every OTHER `_CP_LOC` consumer in this file; this is the
+# narrower backstop the review proposed instead: if the chunk still
+# contains `git`/a push-equivalent binary ANYWHERE as a whitespace word
+# (`_cp_git_push_seg_has_git`, the same looser test the push scanner
+# used to use), run the SAME pop check a resolved git chunk gets,
+# whether or not the locator resolved git as the first word. An
+# intentionally allowlisted TRAILING redirect still pops cleanly from
+# the true end of the chunk; a redirect sitting where the locator
+# tripped is, by construction, not that exact trailing shape, so it is
+# left behind and the pop check's own leftover `<`/`>` test escalates —
+# never silently waved through as "not git".
 _cp_git_seg_strip_trailing_redirects() {        # chunk -> cleaned chunk, or (return 1) escalate
   local LC_ALL=C LANG=C
   local chunk="$1"
-  if ! _cp_locate_command_word "$chunk"; then
-    printf '%s' "$chunk"
-    return 0
+  if _cp_locate_command_word "$chunk"; then
+    case "$_cp_wcmd" in
+      git|git-*)
+        _cp_git_seg_pop_allowed_trailing_redirects "$chunk"
+        return $?
+        ;;
+    esac
   fi
-  case "$_cp_wcmd" in
-    git|git-*) ;;
-    *) printf '%s' "$chunk"; return 0 ;;
+  case "$chunk" in
+    *'<'*|*'>'*)
+      if _cp_git_push_seg_has_git "$chunk"; then
+        _cp_git_seg_pop_allowed_trailing_redirects "$chunk"
+        return $?
+      fi
+      ;;
   esac
-  _cp_git_seg_pop_allowed_trailing_redirects "$chunk"
+  printf '%s' "$chunk"
+  return 0
 }
 
-# Shared by both trailing-redirect strippers above/below: word-splits
-# CHUNK and pops trailing words off the end for as long as each exactly
-# equals one of the fixed allowed redirects, then checks whatever is
-# left for a disqualifying `<`/`>` byte. Factored out once the two
-# callers needed IDENTICAL popping logic gated on two DIFFERENT "is this
-# a git chunk" tests — see each caller's own header for why they differ.
+# Word-splits CHUNK and pops trailing words off the end for as long as
+# each exactly equals one of the fixed allowed redirects, then checks
+# whatever is left for a disqualifying `<`/`>` byte. Used by
+# `_cp_git_seg_strip_trailing_redirects` above, both for a chunk
+# `_cp_locate_command_word` resolved to git/git-* directly and for its
+# own R4-2 backstop (a chunk the locator missed but that still
+# contains a `git`/push-equivalent word somewhere).
+#
+# Round 5 (R4-4 over-block): main judges `git status 2> /dev/null` and
+# `git status > /dev/null` (a bare operator and its target typed as TWO
+# separate words, the common way agents write this) on the git argv
+# alone, same as the glued `2>/dev/null`/`>/dev/null` spelling — before
+# popping a single trailing word, check whether the LAST TWO words are
+# exactly that detached pair and pop both together. `</dev/null` joins
+# the single-word allowlist outright (a plain stdin-from-null, no
+# reason to treat it any differently than the output redirects already
+# there).
 _cp_git_seg_pop_allowed_trailing_redirects() {  # chunk -> cleaned chunk, or (return 1) escalate
   local LC_ALL=C LANG=C
   local chunk="$1"
@@ -2576,8 +2643,13 @@ _cp_git_seg_pop_allowed_trailing_redirects() {  # chunk -> cleaned chunk, or (re
   [ "$_cp_gsr_noglob" = 1 ] || set +f
   local i=${#words[@]}
   while [ "$i" -gt 0 ]; do
+    if [ "$i" -ge 2 ] && [ "${words[$((i-1))]}" = '/dev/null' ]; then
+      case "${words[$((i-2))]}" in
+        '>'|'2>') i=$((i-2)); continue ;;
+      esac
+    fi
     case "${words[$((i-1))]}" in
-      '>/dev/null'|'2>/dev/null'|'&>/dev/null'|'2>&1'|'1>&2'|'>&2') i=$((i-1)) ;;
+      '>/dev/null'|'2>/dev/null'|'&>/dev/null'|'2>&1'|'1>&2'|'>&2'|'</dev/null') i=$((i-1)) ;;
       *) break ;;
     esac
   done
@@ -2612,16 +2684,22 @@ EOF
 
 # `_cp_git_push_seg_has_git <chunk>` -> 0 when CHUNK contains, as a
 # whitespace-delimited word ANYWHERE (not only as the resolved FIRST
-# command word — unlike `_cp_git_seg_strip_trailing_redirects` above,
-# the awk scanner inside `_cp_git_push_invoked` finds `git` wherever it
-# sits in the token stream, which is the one thing that lets
-# `bash -c 'git log'` get caught by the SAME push-reservation text scan
-# as a top-level `git log` — round 3 review item H1's `bash -c` variant
-# relies on exactly this), the literal `git`, a path ending `/git`, or
-# one of git's push-equivalent libexec binaries (`git-push`,
-# `git-http-push`, `git-send-pack`, or a path ending in one of those).
-# Mirrors `is_git`/`is_git_push_bin` inside that same awk script exactly
-# so the two definitions of "this is git" cannot drift apart again.
+# command word), the literal `git`, a path ending `/git`, or one of
+# git's push-equivalent libexec binaries (`git-push`, `git-http-push`,
+# `git-send-pack`, or a path ending in one of those). Mirrors
+# `is_git`/`is_git_push_bin` inside `_cp_git_push_invoked`'s own awk
+# script exactly so the two definitions of "this is git" cannot drift
+# apart again.
+#
+# Round 5: `_cp_git_push_invoked` no longer calls this directly (R4-1/
+# R4-3 — see that function's own header for why it reverted to running
+# main's scanner unconditionally on the ORIGINAL text instead). The
+# remaining caller is `_cp_git_seg_strip_trailing_redirects`'s R4-2
+# backstop, which needs this exact looser "is git anywhere in this
+# chunk" test for the same reason the push scanner used to: a chunk
+# `_cp_locate_command_word` failed to resolve as git (because a leading
+# redirect shape its patterns don't cover ate the `git` token) can
+# still be a real git invocation.
 _cp_git_push_seg_has_git() {
   local LC_ALL=C LANG=C
   local chunk="$1" w
@@ -2639,34 +2717,6 @@ _cp_git_push_seg_has_git() {
     esac
   done
   return 1
-}
-
-# `_cp_git_push_redirect_segments <text>` -> the push-scanner's own
-# counterpart to `_cp_git_redirect_segments` above, gated on
-# `_cp_git_push_seg_has_git` instead of `_cp_locate_command_word`'s
-# first-word resolution — see that function's header for why
-# `_cp_git_push_invoked` needs a looser "is this chunk git" test than
-# `_cp_git_exec_opt_invoked` does.
-_cp_git_push_redirect_segments() {              # text -> cleaned statements, one per line, or (return 1) escalate
-  local LC_ALL=C LANG=C
-  local text="$1" chunk cleaned
-  while IFS= read -r chunk; do
-    if [ -z "$chunk" ]; then
-      printf '\n'
-      continue
-    fi
-    if _cp_git_push_seg_has_git "$chunk"; then
-      if ! cleaned="$(_cp_git_seg_pop_allowed_trailing_redirects "$chunk")"; then
-        return 1
-      fi
-      printf '%s\n' "$cleaned"
-    else
-      printf '%s\n' "$chunk"
-    fi
-  done <<EOF
-$(_cp_git_redirect_split "$text")
-EOF
-  return 0
 }
 
 # `_cp_git_push_invoked <raw>` -> 0 (true) when RAW invokes a real git push
@@ -2688,30 +2738,35 @@ EOF
 # (see below), so `git $(echo push)…` naturally splits into a `git $` segment
 # — subcommand slot MISSING — and its own `echo push` segment, both handled
 # by the ordinary rules with no separate flattened pass needed.
+#
+# Round 5 (round-4 review R4-1/R4-3): round 4 tried to keep a redirect-
+# carrying git/push chunk adjacent to its own argv here too, the same
+# way the exec-option gate does, falling back to a bare `\bpush\b` text
+# search whenever that stripping couldn't resolve cleanly. Two bugs
+# came from that: (1) the fallback REPLACED the whole-text awk scan
+# below for the ENTIRE command, not just the one redirect-carrying
+# chunk, so a `send-pack`/`git-send-pack`/libexec-path invocation
+# anywhere else on the same line stopped reserving the instant any
+# OTHER chunk had a redirect the stripper couldn't parse (R4-1); (2)
+# the bare regex matches the substring "push" with no word-structure
+# awareness at all, so `git diff lib/push-wake.sh >/tmp/d.patch`
+# reserved on the repo's own `push-wake.sh` filename (R4-3) — exactly
+# the false reservation this function's own awk scanner (which checks
+# exact TOKEN equality, never substring) was written to remove. The
+# invariant going forward: this scanner runs on the ORIGINAL, unmodified
+# text, split the same blind way main always has — a leading/glued/mid-
+# segment redirect can only ever ADD escalation (handled by
+# `_cp_git_exec_opt_invoked`'s own structural redirect handling, a
+# SEPARATE gate from this one), never subtract a check this one runs.
 _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invoked
   local LC_ALL=C LANG=C
-  local raw="$1" pre segmented out wide=1
+  local raw="$1" pre segmented out
   pre="$(_cp_strip_heredocs "$raw")"
   pre="$(_cp_decode_ansi_c "$pre")"
   pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
   pre="$(printf '%s' "$pre" | sed "s/['\"\\\\]//g")"
   pre="$(printf '%s' "$pre" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
-  # Round 4 (PR#257 round-3 review, R3-1..R3-5): a redirect anywhere in
-  # a chunk that contains `git`/a push-equivalent binary ANYWHERE (not
-  # only as the resolved first command word — see
-  # `_cp_git_push_seg_has_git`'s own header for why this scanner needs
-  # that looser test, unlike `_cp_git_exec_opt_invoked`) no longer gets
-  # stripped out of the text. A chunk with only an allowlisted TRAILING
-  # redirect comes back cleaned, intact and adjacent to its own argv;
-  # any other shape escalates (`_cp_git_push_redirect_segments` returns
-  # 1), and this function falls back to its own pre-existing "cannot
-  # parse with confidence" path — a whole-text search for the literal
-  # word `push` — exactly what the `ambiguous` branch below already does
-  # for every other unparseable shape, never a false "safe".
-  if ! segmented="$(_cp_git_push_redirect_segments "$pre")"; then
-    _cp_match '\bpush\b' "$pre"
-    return $?
-  fi
+  segmented="$(printf '%s' "$pre" | sed -E 's/[;&|()`<>]/\n/g')"
   out="$(printf '%s\n' "$segmented" | awk '
     # H2 (independent review of #157): grep does NOT belong on this list.
     # git grep -O<cmd> -e . (--open-files-in-pager) runs <cmd> through the
@@ -3110,8 +3165,12 @@ _CP_EXEC_VAR_RE='^(GIT_[A-Za-z0-9_]*|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH
 
 # `_cp_exec_var_stmt_kind <protected-statement>` -> prints one of
 # "execvar"/"source"/"git"/"" describing what this ONE statement (already
-# split on `;&|()<>` and backtick, same as every other per-segment check
-# in this file) is, for the whole-command scan below. Reuses
+# split on `;&|()` and backtick, same as every other per-segment check
+# in this file — `<`/`>` are NOT blind split points here; each
+# statement already had its own allowlisted trailing redirect popped by
+# `_cp_git_seg_strip_trailing_redirects`, or escalated before reaching
+# this far, so a leftover `<`/`>` byte cannot appear in SEG) is, for
+# the whole-command scan below. Reuses
 # `_cp_locate_command_word` rather than re-walking tokens a second way:
 #   * a statement that resolves to NO command word at all (every token
 #     consumed as an `NAME=value` prefix, or walked past as a launcher's

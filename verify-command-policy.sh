@@ -3233,6 +3233,45 @@ check "Part C REGRESS: backslash-glued redirect inside the verb word escalates (
   'git p >/dev/null\ush origin main' escalate
 check "Part C REGRESS: quote-spliced redirect inside the verb word escalates (stricter than main, not looser)" \
   "git pu >/dev/null''sh origin main" escalate
+# --- round 5 (PR#257 round-4 review, R4-1..R4-4): the push-scanner
+#     fallback round 4 added replaced main's whole-text scan with a bare
+#     `\bpush\b` substring search for the ENTIRE command whenever any
+#     redirect-carrying chunk couldn't be cleanly stripped — losing
+#     send-pack reservation elsewhere on the line (R4-1) and over-
+#     reserving on an unrelated "push" substring like a filename (R4-3).
+#     `_cp_git_push_invoked` now runs main's exact unconditional scan on
+#     the original text; see its own header.
+check_reserved "R4-1: send-pack with its own trailing redirect still reserves" \
+  'git send-pack origin main 2>/tmp/e'
+check_reserved "R4-1: an earlier redirect-carrying statement no longer loses a later send-pack" \
+  'git status 2>/tmp/e; git send-pack origin main'
+check_unreserved "R4-3: a push-named file in a trailing-redirected diff is not a push" \
+  'git diff lib/push-wake.sh >/tmp/d.patch'
+# --- round 5 (R4-2): a leading redirect shape the locator's own
+#     patterns don't cover (multi-digit fd, named fd, detached `>&`,
+#     `>|`) used to make the redirect's TARGET word — or nothing at all
+#     — read as the resolved command word, hiding git from the exec
+#     gate entirely. `_cp_git_seg_strip_trailing_redirects`'s backstop
+#     (if `git` still appears anywhere in the chunk as a word, run the
+#     same pop check regardless of what the locator resolved) closes
+#     this without touching the shared locator.
+check "R4-2: multi-digit leading fd hides git from the locator" \
+  '10>/dev/null git -C /tmp/r status' escalate
+check "R4-2: named leading fd hides git from the locator" \
+  '{fd}>/dev/null git -C /tmp/r status' escalate
+check "R4-2: detached >& hides git from the locator" \
+  '>& /dev/null git -C /tmp/r status' escalate
+check "R4-2: >| (noclobber override) no longer splits git away from its argv" \
+  '>|/dev/null git -C /tmp/r status' escalate
+# --- round 5 (R4-4): a detached operator-and-target pair, typed with a
+#     space, is the same redirect as the glued spelling — main judges
+#     both on the git argv alone.
+check "R4-4: detached 2> /dev/null allows like the glued spelling" \
+  'git status 2> /dev/null' allow
+check "R4-4: detached > /dev/null allows like the glued spelling" \
+  'git status > /dev/null' allow
+check "R4-4: trailing </dev/null allows" \
+  'git log --oneline -5 </dev/null' allow
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
