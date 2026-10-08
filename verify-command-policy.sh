@@ -3375,6 +3375,101 @@ check "#261 r4 (OB, deliberate, unchanged): find -exec grep whose own argument i
 # filesystem at the time the command actually runs, so it cannot tell a
 # real file from an attacker-planted FIFO at the path a -exec clause
 # names. No test: there is no text-level distinction to assert.
+
+# #261 r5: _cp_find_word_injection_present rewritten to locate each
+# segment's command word via _cp_locate_command_word (the same machinery
+# the git rules use), fed a quote-PRESERVING protect pass
+# (_cp_protect_text_qa) instead of raw-text `grep -q find`. Any command
+# word carrying a surviving quote/backslash character escalates — a
+# real command word never needs quoting — which closes every desync
+# spelling in one check instead of enumerating shapes.
+check "#261 r5 ATK4-desync: a quoted find basename escalates" \
+  "\"find\" . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync: an empty-quote-spliced find basename escalates" \
+  "fi''nd . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync: a backslash-spliced find basename escalates" \
+  "f\\ind . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync: a double-quote-spliced find basename escalates" \
+  "fin\"\"d . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync: a quoted-text decoy ahead of a real find no longer desyncs the cut" \
+  "cd \"/tmp/findings\" && find . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync: the word 'find' inside an unrelated quoted grep pattern no longer desyncs the cut" \
+  "grep -l 'find' README.md; find . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync-N3: a quoted find basename with the \$-half of N3 escalates" \
+  "\"find\" . \$X" escalate
+check "#261 r5 ATK4-desync-N3: a quoted-text decoy ahead of the \$-half of N3 no longer desyncs the cut" \
+  "cd \"/tmp/findings\" && find . \$X -type f" escalate
+check "#261 r5 ATK4-desync (regression): a quoted command word on a non-find command also escalates (never needs quoting)" \
+  "\"git\" push" escalate
+
+# ATK4-braceseq: bash brace-expands a one-element SEQUENCE (`{a..z}`),
+# not just the comma form, to a plain letter run with no comma anywhere
+# — closed in the command-word gate (_cp_gate_command_word_is_expansion)
+# and in find's own argv scan (_cp_find_word_injection_present) and in
+# the whole-text opaque-word gate (_cp_exec_name_or_opaque_present).
+check "#261 r5 ATK4-braceseq: a brace-sequence -exec primary in find's own argv escalates" \
+  "find . -exe{c..c} git -C /tmp/evilrepo status \\;" escalate
+check "#261 r5 ATK4-braceseq: a brace-sequence find command word escalates" \
+  "{f..f}ind . -exec git -C /tmp/evilrepo status \\;" escalate
+check "#261 r5 ATK4-braceseq: a brace-sequence git command word escalates" \
+  "{g..g}it -C /tmp/evilrepo status" escalate
+check "#261 r5 ATK4-braceseq: a quoted-text decoy ahead of a brace-sequence find still escalates" \
+  "cd \"/tmp/findings\" && find . -exe{c..c} git -C /tmp/evilrepo status \\;" escalate
+
+# ATK4-newline: a real embedded newline inside a quoted multi-line find
+# argument used to reset AWK's quote-tracking state at the next record,
+# hiding whatever unquoted glob/expansion followed on that next line.
+check "#261 r5 ATK4-newline: an unquoted glob after a quoted multi-line argument escalates" \
+  $'find . \'a\nb\' * -maxdepth 0' escalate
+check "#261 r5 ATK4-newline: an unquoted expansion after a quoted multi-line argument escalates" \
+  $'find . \'a\nb\' $X' escalate
+
+# LNCH4-open: real `open` uses getopt, so the app-selecting flag is not
+# just the exact token `-a` — it clusters (`-na`) and takes an attached
+# value (`-aTerminal`); `-b <bundle-id>` selects an app the same way.
+check "#261 r5 LNCH4-open: a clustered -na flag escalates" \
+  "open -na Terminal /tmp/x.command" escalate
+check "#261 r5 LNCH4-open: an attached -aTerminal flag escalates" \
+  "open -aTerminal /tmp/x.command" escalate
+check "#261 r5 LNCH4-open: a clustered -gja flag escalates" \
+  "open -gja Terminal /tmp/x.command" escalate
+check "#261 r5 LNCH4-open: -b <bundle-id> app selection escalates" \
+  "open -b com.apple.Terminal /tmp/x.command" escalate
+check "#261 r5 LNCH4-open (regression): a bare open with no a/b flag stays allow" \
+  "open -n /tmp/x.command" allow
+
+# INNER-libxo: `wc`/`ls` (and other BSD tools) load an
+# `--libxo=encoder=<name>` plugin by NAME — a clause argument shaped
+# like a long option is not automatically read-only collateral the way
+# a short flag or bare path/pattern is.
+check "#261 r5 INNER-libxo: wc --libxo=encoder=<path> inside a -exec clause escalates" \
+  "find . -exec wc --libxo=encoder=../../../../tmp/evil {} \\;" escalate
+check "#261 r5 INNER-libxo: ls --libxo=encoder=<path> inside a -exec clause escalates" \
+  "find . -exec ls --libxo=encoder=../../../../tmp/evil {} \\;" escalate
+check "#261 r5 INNER-libxo (regression): wc's closed-list long options still allow" \
+  "find . -exec wc --lines {} \\;" allow
+
+# round 5b (Main's live run of round 5): a command word that is ONE
+# fully-quoted plain word is equivalent to unquoted — an argv-quoting
+# caller (every word individually shell-quoted) is ordinary, not an
+# obfuscation. Only MIXED/PARTIAL quoting stays opaque.
+check "#261 r5b: every-argv-word shell-quoted (hub launch shape), single quotes, stays allow" \
+  "'python3' '-m' 'http.server' '8123'" allow
+check "#261 r5b: every-argv-word shell-quoted, double quotes, stays allow" \
+  "\"python3\" -m http.server" allow
+check "#261 r5b: a cleanly single-quoted find basename still applies the find rule, escalates" \
+  "'find' . * -maxdepth 0" escalate
+check "#261 r5b: a cleanly double-quoted find basename still applies the find rule, escalates" \
+  "\"find\" . * -maxdepth 0" escalate
+check "#261 r5b (regression): mixed/partial quoting on a non-find command word still escalates" \
+  "fi''nd push" escalate
+
+# INNER-write: `file -C -m <path>` compiles a `.mgc` magic database into
+# the CURRENT directory — a write, not a read; `file` dropped from the
+# find -exec allowlist entirely.
+check "#261 r5 INNER-write: file -C -m inside a -exec clause escalates" \
+  "find . -exec file -C -m /tmp/magic {} \\;" escalate
+
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
