@@ -409,6 +409,48 @@ function readRegisteredWorktree(): { worktree: string } | { error: string } {
   return { worktree: real };
 }
 
+// Prefetched once at module load (session start), same reasoning and shape
+// as prefetchRegistryApproval() below: a registered worker's FIRST bash/
+// write/edit call must not pay this spawnSync's cost synchronously on top
+// of mutationTargets' own bash-write-targets.sh spawn — together they blew
+// verify-pretool-shadow.sh's <50ms bash/eval handler budget (measured:
+// bash_reserved 53-74ms, the registry spawnSync alone costing tens of ms
+// over an unwarmed sqlite3 connection). A tool call that arrives before
+// this answers falls back to the synchronous read in readRegisteredWorktree().
+function prefetchRegisteredWorktree(): void {
+  if (registeredWorktreeReal || !WORKER_TASK_ID || !WORKER_RUN_ID) return;
+  try {
+    if (!safeExists(RUN_REGISTRY_SH)) return;
+    const env: Record<string, string | undefined> = { ...process.env, HOME: LOAD_HOME };
+    if (LOAD_RUN_STATE_DIR) env.HERDR_RUN_STATE_DIR = LOAD_RUN_STATE_DIR;
+    else delete env.HERDR_RUN_STATE_DIR;
+    const child = spawn(
+      "bash",
+      ["-c", '. "$1" && read_task "$2" "$3"', "herdr-write-scope", RUN_REGISTRY_SH, WORKER_RUN_ID, WORKER_TASK_ID],
+      { stdio: ["ignore", "pipe", "pipe"], env },
+    );
+    let out = "";
+    child.on("error", () => {});
+    child.stdout?.on("data", (d) => { out += String(d); });
+    child.on("close", (code) => {
+      if (registeredWorktreeReal || code !== 0) return;
+      try {
+        const row: unknown = JSON.parse(out.trim());
+        const wt = row && typeof row === "object" ? (row as Record<string, unknown>).worktree : undefined;
+        if (typeof wt !== "string" || !path.isAbsolute(wt)) return;
+        const real = resolveFollowingLinks(wt);
+        if (real && safeExists(real)) registeredWorktreeReal = real;
+      } catch {
+        // best effort; the synchronous read in readRegisteredWorktree() is the fallback
+      }
+    });
+    child.unref();
+  } catch {
+    // best effort; the synchronous read is the fallback
+  }
+}
+prefetchRegisteredWorktree();
+
 // The kernel's view of an absolute path: walk it component by component,
 // splicing in each symlink's target (dangling or not) before applying the next
 // `..`. An absent component is taken as-is, because a write creates it as a
