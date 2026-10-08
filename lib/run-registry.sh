@@ -99,7 +99,7 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '9\n'; }
+_registry_schema_version() { printf '10\n'; }
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
@@ -269,6 +269,7 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   _migrate_schema_v7
   _migrate_schema_v8
   _migrate_schema_v9
+  _migrate_schema_v10
   _migrate_legacy_files
   return 0
 }
@@ -541,6 +542,36 @@ _migrate_schema_v9() {
     fi
   done
   _stamp_schema_version 9
+}
+
+# ---- schema v9 -> v10: a dedicated `roles` table for Main -------------------
+# (P3, .handoffs/SPEC.md feat/main-designation-lock, security review PR #252
+# finding F1.) Main's designation used to live in a row of the SHARED
+# `owners` table (label "main"), which put it behind register-owner.sh /
+# unregister-owner.sh -- generic, already-shipped tools with no designation
+# gate at all -- and made it visible to every generic reader of that table
+# (remote-mcp's publisher.py snapshot, herdr-action.sh's owner-alert
+# routing), neither of which this change may edit. A SEPARATE table makes
+# that collision structurally impossible instead of filtering it at every
+# read site: `owners` is untouched, register-owner.sh/unregister-owner.sh
+# cannot reach `roles`, and nothing that scans `owners` ever sees "main".
+# Same shape as `owners` (mirrors v8) so register_role_cas/unregister_role_cas
+# below reuse the identical CAS pattern. Idempotent/no-backup: additive new
+# table, nothing pre-existing to lose.
+_migrate_schema_v10() {
+  if _sql "CREATE TABLE IF NOT EXISTS roles (
+      label          TEXT PRIMARY KEY,
+      pane_id        TEXT NOT NULL,
+      pane_birth     TEXT NOT NULL DEFAULT '',
+      agent_session  TEXT NOT NULL DEFAULT '',
+      workspace      TEXT NOT NULL DEFAULT '',
+      registered_at  TEXT NOT NULL,
+      updated_at     TEXT NOT NULL
+    );" >/dev/null 2>&1; then
+    _stamp_schema_version 10
+  else
+    printf 'run-registry: v10 migration (roles table) failed; schema_version NOT advanced\n' >&2
+  fi
 }
 
 # ---- one-time import of the pre-SQLite file layout --------------------------
@@ -1645,6 +1676,13 @@ prune_completed_tasks() {               # max_age_days
 # liveness ever leave the Mac (remote-mcp/publisher.py's snapshot.owners).
 register_owner() {                      # label pane_id pane_birth agent_session [workspace]
   local label="$1" pane_id="$2" pane_birth="$3" agent_session="$4" workspace="${5:-}"
+  # "main" is Main's own `roles` table now (F1, security review PR #252) --
+  # reserved here too, defense in depth: even if a future caller skips
+  # register-owner.sh's own check, the shared write primitive still refuses.
+  if [ "$label" = "main" ]; then
+    printf 'run-registry: label "main" is reserved for Main (designate-main.sh, the roles table) -- refusing\n' >&2
+    return 1
+  fi
   registry_init || return 1
   local at; at="$(_now_iso)"
   # Re-registering the same label (Mac restart, a moved tab) must UPDATE, not
@@ -1662,6 +1700,67 @@ register_owner() {                      # label pane_id pane_birth agent_session
   printf 'run-registry: failed to register owner %s (database unwritable)\n' "$label" >&2
   return 1
 }
+
+# ---- role registry: Main (P3, .handoffs/SPEC.md feat/main-designation-lock) -
+# A SEPARATE table from `owners` above, not a shared label ("main") in it --
+# security review PR #252, F1: register-owner.sh/unregister-owner.sh are
+# shipped, ungated tools that would otherwise let anyone overwrite or delete
+# Main with no liveness or worker check, and the owners table is read
+# generically by remote-mcp's publisher.py and herdr-action.sh's owner-alert
+# routing, neither of which designate-main.sh's security fix may touch. A
+# distinct table makes the collision impossible by construction: nothing
+# that reads `owners` can see a role, and register_owner/unregister_owner
+# cannot write one.
+#
+# Every write here is a CAS (there is no plain register_role/unregister_role
+# -- a role's write path must never be a last-write-wins clobber). Same
+# single-statement pattern as the owners CAS used to be: expected_pane=""
+# means "the row must still be ABSENT" (INSERT guarded by NOT EXISTS);
+# otherwise the existing row's pane_id AND pane_birth must still equal
+# expected_pane/expected_birth (UPDATE/DELETE guarded by WHERE). SQLite's
+# own per-statement atomicity is the whole guarantee -- no read-then-write
+# gap. Returns 0 only when changes()=1.
+register_role_cas() {                  # label pane_id pane_birth agent_session workspace expected_pane expected_birth
+  local label="$1" pane_id="$2" pane_birth="$3" agent_session="$4" workspace="$5" \
+        expected_pane="$6" expected_birth="${7:-}"
+  registry_init || return 1
+  local at changes
+  at="$(_now_iso)"
+  if [ -z "$expected_pane" ]; then
+    changes="$(_sql "INSERT INTO roles (label, pane_id, pane_birth, agent_session, workspace, registered_at, updated_at)
+        SELECT $(_sq "$label"), $(_sq "$pane_id"), $(_sq "$pane_birth"), $(_sq "$agent_session"),
+               $(_sq "$workspace"), $(_sq "$at"), $(_sq "$at")
+        WHERE NOT EXISTS (SELECT 1 FROM roles WHERE label=$(_sq "$label"));
+      SELECT changes();" 2>/dev/null)"
+  else
+    changes="$(_sql "UPDATE roles SET pane_id=$(_sq "$pane_id"), pane_birth=$(_sq "$pane_birth"),
+          agent_session=$(_sq "$agent_session"), workspace=$(_sq "$workspace"), updated_at=$(_sq "$at")
+        WHERE label=$(_sq "$label") AND pane_id=$(_sq "$expected_pane") AND pane_birth=$(_sq "$expected_birth");
+      SELECT changes();" 2>/dev/null)"
+  fi
+  [ "$changes" = "1" ]
+}
+
+# Guarded delete (F9: clear must be a CAS too, not an unconditional DELETE --
+# a Main that re-designated between a caller's liveness check and its clear
+# must not have its NEW row deleted). 0 only if a row matching BOTH
+# expected_pane and expected_birth was actually removed.
+unregister_role_cas() {                # label expected_pane expected_birth
+  registry_init || return 1
+  local changes
+  changes="$(_sql "DELETE FROM roles WHERE label=$(_sq "$1") AND pane_id=$(_sq "$2") AND pane_birth=$(_sq "${3:-}");
+      SELECT changes();" 2>/dev/null)"
+  [ "$changes" = "1" ]
+}
+
+read_role() {                          # label -> json (empty if absent)
+  registry_init || return 1
+  _sql "SELECT json_object('label', label, 'pane_id', pane_id, 'pane_birth', pane_birth,
+          'agent_session', agent_session, 'workspace', workspace,
+          'registered_at', registered_at, 'updated_at', updated_at)
+        FROM roles WHERE label=$(_sq "$1");" 2>/dev/null
+}
+
 
 unregister_owner() {                    # label
   registry_init || return 1

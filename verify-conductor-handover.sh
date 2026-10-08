@@ -3,14 +3,21 @@
 #   - lib/run-registry.sh set_task_conductor is a real compare-and-swap:
 #     a stale/raced caller changes nothing, exactly one of two concurrent
 #     handovers of the same task wins, a terminal task refuses;
-#   - lib/pane-guard.sh validate_conductor_target_pane (shared with
-#     spawn-task.sh's HERDR_MCP_CONDUCTOR_PANE fallback) refuses a
-#     registered worker's own pane and a live-birth mismatch;
-#   - conductor-handover.sh's authority rule (current live conductor gives
-#     its own tasks away; Main gives any task away; everyone else, and
-#     every worker, is refused), its target rule (--to must be live and
-#     non-worker), its re-wake of a pending prompt through the existing
-#     push-wake path, and its best-effort [handover] notify to both sides;
+#   - lib/pane-guard.sh pane_is_conductor_eligible (#252/P3, shared with
+#     spawn-task.sh's HERDR_MCP_CONDUCTOR_PANE fallback and
+#     designate-main.sh) refuses a registered worker's own pane, a
+#     non-agent pane, and fails closed on a herdr read failure;
+#   - conductor-handover.sh resolves its caller from REAL process ancestry
+#     (caller_pane_from_ancestry), never a self-asserted
+#     HERDR_PANE_ID/HERDR_TASK_ID — a worker spoofing HERDR_PANE_ID=<Main>
+#     is still refused as a worker, and a herdr ancestry-read failure
+#     refuses rather than guessing;
+#   - its authority rule (current live conductor gives its own tasks away;
+#     Main — read from the roles table, not an env var — gives any task
+#     away; everyone else, and every worker, is refused), its target rule
+#     (--to must be live and conductor-eligible), its re-wake of a pending
+#     prompt through the existing push-wake path, and its best-effort
+#     [handover] notify to both sides;
 #   - after a successful handover, herdr-select.sh's own conductor check
 #     (the `owner_pane`/`owner_birth` comparison at herdr-select.sh:282-293)
 #     passes for the NEW conductor pane and fails for the OLD one.
@@ -34,6 +41,16 @@ export SENT="$WORK/sent.log"
 # session leaks into what's being tested as a fixture below.
 unset HERDR_PANE_ID HERDR_TASK_ID HERDR_RUN_ID HERDR_CONDUCTOR_PANE_ID \
       HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH HERDR_CONDUCTOR_ID HERDR_TASK_LABEL 2>/dev/null || true
+
+# conductor-handover.sh and designate-main.sh (#252/P3) resolve the caller
+# from REAL process ancestry (caller_pane_from_ancestry), not an env var —
+# so simulating "this call comes from pane X" means the herdr stub's "pane
+# process-info" response for X must report a pid that is a genuine ancestor
+# of the `ch`/`dm` subshell. TEST_PID (this script's own real PID, captured
+# once here, before any subshell) always is one; CALLER_PANE picks which
+# fixture pane the stub attributes it to for the next call.
+TEST_PID=$$
+export TEST_PID
 
 . "$here/lib/run-registry.sh"
 . "$here/lib/pane-guard.sh"
@@ -62,13 +79,23 @@ herdr() {
   local sub="$1 $2" pane screen wake target
   case "$sub" in
     "pane process-info")
+      [ -z "${FAIL_PANE_LIST:-}" ] || return 1
       pane="$4"
       if [ "$pane" = "$SH" ]; then
         printf '{"result":{"process_info":{"foreground_processes":[]}}}\n'
+      elif [ -n "${CALLER_PANE:-}" ] && [ "$pane" = "$CALLER_PANE" ]; then
+        # Attributes TEST_PID (a real ancestor of this call) to the fixture
+        # pane the current test wants to act as the caller.
+        printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"name":"omp","cmdline":"omp --model sonnet"}]}}}\n' "$TEST_PID"
       else
         printf '{"result":{"process_info":{"foreground_processes":[{"name":"omp","cmdline":"omp --model sonnet"}]}}}\n'
       fi ;;
     "pane list")
+      # FAIL_PANE_LIST simulates a herdr read failure for the
+      # "could not verify caller identity" / "herdr read failure" negative
+      # rows — caller_pane_from_ancestry and pane_is_conductor_eligible must
+      # both refuse outright on this, never fall back to "not found".
+      [ -z "${FAIL_PANE_LIST:-}" ] || return 1
       printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"},{"pane_id":"%s","terminal_id":"%s"}]}}\n' \
         "$W1" "$W1B" "$W2" "$W2B" "$C1" "$C1B" "$C2" "$C2B" "$OTHER" "$OTHERB" "$MAIN" "$MAINB" ;;
     "pane read")
@@ -92,7 +119,7 @@ export -f herdr
 
 # roles/main, via the REAL designate-main.sh (same approved pattern
 # verify-designate-main.sh uses), not a direct file write.
-HERDR_PANE_ID="$MAIN" bash "$here/designate-main.sh" >/dev/null \
+CALLER_PANE="$MAIN" bash "$here/designate-main.sh" >/dev/null \
   || { echo "setup: designate-main.sh could not designate $MAIN as Main" >&2; exit 1; }
 
 ch() { bash "$here/conductor-handover.sh" "$@"; }
@@ -111,14 +138,14 @@ for t in taskA taskB taskC taskD taskE taskF; do
 done
 check "taskA starts owned by C1" "$(read_task run1 taskA | jq -r .conductor_pane_id)" "$C1"
 
-printf '== validate_conductor_target_pane: the shared F8/R3 check, standalone ==\n'
-check "a plain unregistered live pane passes" "$(validate_conductor_target_pane "$C2")" ""
-check "a registered worker's own active pane is refused" \
-  "$(validate_conductor_target_pane "$W1")" "pane is a registered worker's own active task pane"
-check "a pinned expected birth that matches passes" \
-  "$(validate_conductor_target_pane "$C2" "$C2B")" ""
-check "target recycled: a pinned expected birth that does NOT match the live one is refused" \
-  "$(validate_conductor_target_pane "$C2" "some-other-birth")" "pane birth $C2B does not match the expected birth"
+printf '== pane_is_conductor_eligible (#252/P3): the shared conductor-eligibility check, standalone ==\n'
+_eligible() { pane_is_conductor_eligible "$1" 2>/dev/null && echo eligible || echo refused; }
+check "a plain unregistered live pane is eligible" "$(_eligible "$C2")" "eligible"
+check "a registered worker's own active pane is refused" "$(_eligible "$W1")" "refused"
+check "a non-agent pane is refused" "$(_eligible "$SH")" "refused"
+FAIL_PANE_LIST=1
+check "a herdr read failure is refused, not treated as eligible" "$(_eligible "$C2")" "refused"
+unset FAIL_PANE_LIST
 
 printf '== lib/run-registry.sh set_task_conductor: the raw CAS ==\n'
 set_task_conductor run1 taskC "$C1" "$C1B" "$C2" "$C2B" "conductor_$C2" "conductor_$C1" "unit test" \
@@ -160,7 +187,7 @@ else
 fi
 
 printf '== CLI: current live conductor hands its own task to a live non-worker pane ==\n'
-out="$(HERDR_PANE_ID="$C1" ch --task taskA --to "$C2" --reason "stalled conductor, 2026-10-07")"; rc=$?
+out="$(CALLER_PANE="$C1" ch --task taskA --to "$C2" --reason "stalled conductor, 2026-10-07")"; rc=$?
 check "exit 0" "$rc" "0"
 check "taskA's conductor is now C2" "$(read_task run1 taskA | jq -r .conductor_pane_id)" "$C2"
 check "taskA's conductor_pane_birth is now C2's live birth" "$(read_task run1 taskA | jq -r .conductor_pane_birth)" "$C2B"
@@ -184,13 +211,13 @@ check "the NEW conductor (C2) can now answer taskA's worker pane" "$(select_cond
 check "the OLD conductor (C1) can no longer answer it" "$(select_conductor_ok "$C1" "$C1B")" "refused"
 
 printf '== CLI: the old conductor can no longer hand over a task it already gave away ==\n'
-out2="$(HERDR_PANE_ID="$C1" ch --task taskA --to "$MAIN" --reason "double handover" 2>&1)"; rc2=$?
+out2="$(CALLER_PANE="$C1" ch --task taskA --to "$MAIN" --reason "double handover" 2>&1)"; rc2=$?
 [ "$rc2" -ne 0 ] && ok "exit nonzero: ex-conductor refused" || bad "ex-conductor's second handover was accepted (rc=$rc2)"
 check "taskA's conductor is still C2" "$(read_task run1 taskA | jq -r .conductor_pane_id)" "$C2"
 
 printf '== CLI: Main hands over ANY task, not just its own; both sides get a tagged notify ==\n'
 : > "$SENT"
-out3="$(HERDR_PANE_ID="$MAIN" ch --task taskB --to "$C2" --reason "main reassign")"; rc3=$?
+out3="$(CALLER_PANE="$MAIN" ch --task taskB --to "$C2" --reason "main reassign")"; rc3=$?
 check "exit 0" "$rc3" "0"
 check "taskB's conductor is now C2" "$(read_task run1 taskB | jq -r .conductor_pane_id)" "$C2"
 check "old conductor (C1) got exactly one notify, no wake (taskB wasn't blocked)" \
@@ -205,33 +232,39 @@ grep -q '\[handover\]' "$WORK/wake_$(_fsafe "$C2").txt" \
   || bad "new conductor's message missing [handover] tag: $(cat "$WORK/wake_$(_fsafe "$C2").txt" 2>/dev/null)"
 
 printf '== CLI: a non-conductor, non-Main caller is refused ==\n'
-out4="$(HERDR_PANE_ID="$OTHER" ch --task taskD --to "$C2" --reason "squatting" 2>&1)"; rc4=$?
+out4="$(CALLER_PANE="$OTHER" ch --task taskD --to "$C2" --reason "squatting" 2>&1)"; rc4=$?
 [ "$rc4" -ne 0 ] && ok "exit nonzero" || bad "a random live pane's handover was accepted"
 check "taskD's conductor is unchanged" "$(read_task run1 taskD | jq -r .conductor_pane_id)" "$C1"
 
-printf '== CLI: a worker caller (HERDR_TASK_ID set) is refused ==\n'
-out5="$(HERDR_PANE_ID="$W1" HERDR_TASK_ID=taskA ch --task taskD --to "$C2" --reason "self-serve" 2>&1)"; rc5=$?
+printf "== CLI: a worker caller (its real ancestry traces to its own active pane) is refused ==\n"
+out5="$(CALLER_PANE="$W1" ch --task taskD --to "$C2" --reason "self-serve" 2>&1)"; rc5=$?
 check "exit 4" "$rc5" "4"
 check "taskD's conductor is unchanged" "$(read_task run1 taskD | jq -r .conductor_pane_id)" "$C1"
 
-printf "== CLI: a pane that IS a registered worker's own active pane is refused as CALLER too, even without HERDR_TASK_ID ==\n"
-out6="$(HERDR_PANE_ID="$W1" ch --task taskD --to "$C2" --reason "worker pane, no env" 2>&1)"; rc6=$?
+printf "== CLI: a worker spoofing HERDR_PANE_ID=<Main> is still refused — identity comes from ancestry, not env ==\n"
+out6="$(CALLER_PANE="$W1" HERDR_PANE_ID="$MAIN" ch --task taskD --to "$C2" --reason "spoofed env" 2>&1)"; rc6=$?
 check "exit 4" "$rc6" "4"
+check "taskD's conductor is unchanged" "$(read_task run1 taskD | jq -r .conductor_pane_id)" "$C1"
+
+printf "== CLI: a herdr ancestry-read failure refuses the caller, never guesses ==\n"
+out6b="$(FAIL_PANE_LIST=1 CALLER_PANE="$C1" ch --task taskD --to "$C2" --reason "herdr down" 2>&1)"; rc6b=$?
+check "exit 3" "$rc6b" "3"
+check "taskD's conductor is unchanged" "$(read_task run1 taskD | jq -r .conductor_pane_id)" "$C1"
 
 printf "== CLI: the target must not be a registered worker's own active pane ==\n"
-out7="$(HERDR_PANE_ID="$C1" ch --task taskD --to "$W2" --reason "bad target" 2>&1)"; rc7=$?
+out7="$(CALLER_PANE="$C1" ch --task taskD --to "$W2" --reason "bad target" 2>&1)"; rc7=$?
 [ "$rc7" -ne 0 ] && ok "exit nonzero: worker-pane target refused" || bad "a worker pane was accepted as a handover target"
 check "taskD's conductor is unchanged" "$(read_task run1 taskD | jq -r .conductor_pane_id)" "$C1"
 
 printf '== CLI: a dead target pane is refused ==\n'
-out8="$(HERDR_PANE_ID="$C1" ch --task taskD --to "nope:p9" --reason "dead target" 2>&1)"; rc8=$?
+out8="$(CALLER_PANE="$C1" ch --task taskD --to "nope:p9" --reason "dead target" 2>&1)"; rc8=$?
 [ "$rc8" -ne 0 ] && ok "exit nonzero: dead target refused" || bad "a dead pane was accepted as a handover target"
 check "taskD's conductor is unchanged" "$(read_task run1 taskD | jq -r .conductor_pane_id)" "$C1"
 
 printf '== CLI: --dry-run changes nothing ==\n'
 dry_events_before="$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events WHERE task_id='taskE' AND type='conductor_handover';")"
 : > "$SENT"
-out9="$(HERDR_PANE_ID="$C1" ch --task taskE --to "$C2" --reason "dry run" --dry-run)"; rc9=$?
+out9="$(CALLER_PANE="$C1" ch --task taskE --to "$C2" --reason "dry run" --dry-run)"; rc9=$?
 check "exit 0" "$rc9" "0"
 printf '%s\n' "$out9" | grep -q 'DRY RUN' || bad "dry-run output did not say DRY RUN: $out9"
 check "taskE's conductor is unchanged" "$(read_task run1 taskE | jq -r .conductor_pane_id)" "$C1"
@@ -245,7 +278,7 @@ set_task_state run1 taskF blocked >/dev/null 2>&1 || bad "taskF running->blocked
 append_event run1 taskF input_required \
   "$(jq -nc '{message:"needs review", prompt_id:"promptF1", command:"git push", tool:"bash"}')" >/dev/null
 : > "$SENT"
-outF="$(HERDR_PANE_ID="$C1" ch --task taskF --to "$C2" --reason "blocked conductor")"; rcF=$?
+outF="$(CALLER_PANE="$C1" ch --task taskF --to "$C2" --reason "blocked conductor")"; rcF=$?
 check "exit 0" "$rcF" "0"
 check "taskF's conductor is now C2" "$(read_task run1 taskF | jq -r .conductor_pane_id)" "$C2"
 check "the new conductor (C2) got the re-delivered wake PLUS the notify (2 sends)" \
@@ -262,9 +295,9 @@ check "wake_result recorded submitted (delivered through send-to-agent.sh, not a
 printf '== help text and bad usage ==\n'
 ch --help >/dev/null; check "exit 0" "$?" "0"
 ch --to "$C2" --reason x >/dev/null 2>&1; check "neither --task nor --from: exit 2" "$?" "2"
-HERDR_PANE_ID="$C1" ch --task taskD --from "$C1" --to "$C2" --reason x >/dev/null 2>&1
+CALLER_PANE="$C1" ch --task taskD --from "$C1" --to "$C2" --reason x >/dev/null 2>&1
 check "both --task and --from: exit 2" "$?" "2"
-HERDR_PANE_ID="$C1" ch --task taskD --to "$C2" >/dev/null 2>&1
+CALLER_PANE="$C1" ch --task taskD --to "$C2" >/dev/null 2>&1
 check "no --reason: exit 2" "$?" "2"
 
 echo "-----"; echo "passed=$pass failed=$fail"

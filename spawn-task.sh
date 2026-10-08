@@ -398,18 +398,32 @@ conductor_pane_id="${HERDR_PANE_ID:-}"
 # a conductor that can never answer.
 if [ -z "$conductor_pane_id" ] && [ -n "${HERDR_MCP_CONDUCTOR_PANE:-}" ] \
    && pane_is_agent "$HERDR_MCP_CONDUCTOR_PANE" 2>/dev/null; then
-  # F8/R3 (security review PR #220, round 2): pane_is_agent alone proves only
-  # that SOME agent process is running there now -- a herdr-recycled pane id
-  # can belong to an unrelated WORKER, and a static plist value has no way to
-  # notice the pane changed hands. validate_conductor_target_pane
-  # (lib/pane-guard.sh, shared with conductor-handover.sh's --to check)
-  # refuses a pane that is CURRENTLY a registered worker's own active task
-  # pane -- every "approve ... --authority conductor" prompt this fallback
-  # enables would otherwise be typed straight into that worker's session --
-  # and, when the publisher pins the pane's EXPECTED birth
-  # (HERDR_MCP_CONDUCTOR_BIRTH, optional, a plist value stamped once), any
-  # live-birth mismatch too.
-  fallback_reject_reason="$(validate_conductor_target_pane "$HERDR_MCP_CONDUCTOR_PANE" "${HERDR_MCP_CONDUCTOR_BIRTH:-}")"
+  # F8 (security review PR #220): pane_is_agent proves only that SOME agent
+  # process is running there now -- a herdr-recycled pane id can belong to
+  # an unrelated WORKER (any agent process satisfies it), and a static
+  # plist value has no way to notice the pane changed hands. Refuse the
+  # fallback when the pane is CURRENTLY a registered worker's own active
+  # task pane: a worker is never a conductor, and every
+  # "approve ... --authority conductor" prompt this fallback enables would
+  # otherwise be typed straight into that worker's session.
+  # Delegates to lib/pane-guard.sh's pane_is_conductor_eligible (P3,
+  # .handoffs/SPEC.md feat/main-designation-lock), the single copy of this
+  # same judgment designate-main.sh and conductor-handover.sh (P1) also use --
+  # pane_is_agent was already checked by the `if` above, so a failure here
+  # can only be the worker-state reason.
+  fallback_reject_reason=""
+  pane_is_conductor_eligible "$HERDR_MCP_CONDUCTOR_PANE" 2>/dev/null \
+    || fallback_reject_reason="pane is a registered worker's own active task pane"
+  # R3 (security review round 2): F8's check only proves "not a currently
+  # registered worker" -- a recycled id hosting any OTHER unregistered
+  # session (a reviewer pane, another conductor) still passed. When the
+  # publisher's config pins the pane's EXPECTED birth (HERDR_MCP_CONDUCTOR_
+  # BIRTH, optional -- a plist value stamped once, same as the pane id
+  # itself), refuse on any mismatch too.
+  if [ -z "$fallback_reject_reason" ] && [ -n "${HERDR_MCP_CONDUCTOR_BIRTH:-}" ]; then
+    live_birth="$(pane_birth_now "$HERDR_MCP_CONDUCTOR_PANE" 2>/dev/null)"
+    [ "$live_birth" = "$HERDR_MCP_CONDUCTOR_BIRTH" ] || fallback_reject_reason="pane birth ${live_birth:-<gone>} does not match the pinned HERDR_MCP_CONDUCTOR_BIRTH"
+  fi
   if [ -n "$fallback_reject_reason" ]; then
     # R3: a rejected fallback used to leave no trace at all.
     append_event "$run_id" "$task_id" conductor_fallback_rejected \

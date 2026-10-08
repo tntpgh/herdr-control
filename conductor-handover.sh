@@ -15,18 +15,32 @@
 # current conductor_pane_id is that pane. --dry-run prints what would
 # happen and writes nothing.
 #
-# Allowed callers (HERDR_PANE_ID + its live pane birth):
+# ---- caller identity: process ancestry, never self-asserted env -----------
+# The caller is resolved from caller_pane_from_ancestry (lib/pane-guard.sh),
+# the first ancestor pid of this process that herdr itself reports as a
+# pane's CURRENT foreground process — NOT from $HERDR_PANE_ID/$HERDR_TASK_ID
+# (security review PR #252, F2: those are the caller's own environment; a
+# worker can export whatever it likes, including the pane id of Main, before
+# running this script). pane_is_conductor_eligible looks the resolved pane
+# up in the registry directly, which a caller cannot spoof by exporting a
+# variable.
+#
+# Allowed callers:
 #   (a) the task's current live registered conductor — may give away only
 #       its OWN tasks (a --from pane other than the caller's own is refused
 #       unless the caller is Main);
-#   (b) the designated Main (designate-main.sh's roles/main file, read via
-#       config.sh) — may hand over any task.
-# Refused: a worker pane (HERDR_TASK_ID set, or the caller pane IS a
-# registered worker's own active task pane) and anything else.
+#   (b) the designated Main (the roles table's "main" row, read via
+#       lib/run-registry.sh's read_role — never an env var) — may hand over
+#       any task.
+# Refused: a worker pane (pane_is_conductor_eligible, lib/pane-guard.sh — the
+# same judgment spawn-task.sh's conductor fallback and designate-main.sh
+# (P3) use; fails closed on a registry read failure, F5) and anything whose
+# identity process ancestry could not resolve at all.
 #
-# The target (--to) must be a live, non-worker agent pane
-# (validate_conductor_target_pane, lib/pane-guard.sh — the same check
-# spawn-task.sh's HERDR_MCP_CONDUCTOR_PANE fallback uses, not a second copy).
+# The target (--to) must be live and conductor-eligible by the same
+# pane_is_conductor_eligible check — not a worker's own active pane, and not
+# a pane herdr can't currently read (fails closed, never "eligible" for
+# "couldn't tell").
 #
 # Each task's handover is ONE compare-and-swap (lib/run-registry.sh
 # set_task_conductor): a stale or raced caller changes that task's row not
@@ -40,8 +54,6 @@
 # notify is logged and never rolls back the swap already committed.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-# shellcheck source=config.sh
-. "$HERE/config.sh" 2>/dev/null || true
 # shellcheck source=lib/run-registry.sh
 . "$HERE/lib/run-registry.sh"
 # shellcheck source=lib/pane-guard.sh
@@ -50,6 +62,25 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib/prompt-parse.sh"
 # shellcheck source=lib/push-wake.sh
 . "$HERE/lib/push-wake.sh"
+
+# Is a given (pane, birth) pair LIVE right now? Same tri-state contract as
+# designate-main.sh's _is_live (not shared code — each file's copy is one
+# call to pane_birth_now, not worth extracting): rc 0 confirmed live, rc 1
+# confirmed not live (herdr answered; pane gone or recycled), rc 2
+# INDETERMINATE — the herdr read itself failed. Every call site below must
+# refuse outright on rc 2, never fold "couldn't tell" into either live or
+# dead.
+_is_live() {       # pane birth -> 0 live / 1 confirmed gone / 2 indeterminate
+  local pane="$1" birth="$2" live rc
+  [ -n "$pane" ] || return 1
+  live="$(pane_birth_now "$pane")"; rc=$?
+  [ "$rc" = 0 ] || return 2
+  [ -n "$live" ] || return 1
+  if [ -z "$birth" ] || [ "$live" = "$birth" ]; then
+    return 0
+  fi
+  return 1
+}
 
 task_id="" from_pane="" to_pane="" reason="" dry_run=0
 while [ $# -gt 0 ]; do
@@ -63,7 +94,7 @@ while [ $# -gt 0 ]; do
     --reason) reason="$2"; shift 2 ;;
     --reason=*) reason="${1#--reason=}"; shift ;;
     --dry-run) dry_run=1; shift ;;
-    -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,54p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "conductor-handover: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -75,45 +106,61 @@ fi
 [ -n "$to_pane" ] || { echo "conductor-handover: --to <pane> is required" >&2; exit 2; }
 [ -n "${reason//[[:space:]]/}" ] || { echo "conductor-handover: --reason \"<text>\" is required" >&2; exit 2; }
 
-caller_pane="${HERDR_PANE_ID:-}"
-[ -n "$caller_pane" ] || { echo "conductor-handover: no caller pane (HERDR_PANE_ID unset)" >&2; exit 2; }
+# ---- caller identity: process ancestry, never self-asserted env -----------
+_anc_rc=0
+caller_pane="$(caller_pane_from_ancestry)" || _anc_rc=$?
+if [ "$_anc_rc" != 0 ] || [ -z "$caller_pane" ]; then
+  echo "conductor-handover: refusing — could not verify caller identity from process ancestry (herdr unreachable, or this process traces to no live pane)" >&2
+  exit 3
+fi
 caller_birth="$(pane_birth_now "$caller_pane" 2>/dev/null)"
 [ -n "$caller_birth" ] || { echo "conductor-handover: caller pane $caller_pane is not live" >&2; exit 3; }
 
 # ---- refuse worker callers -------------------------------------------------
 # A worker may only ever give its OWN task away through a human/conductor
 # decision, never self-serve a handover of its own or anyone else's task.
-if [ -n "${HERDR_TASK_ID:-}" ]; then
-  echo "conductor-handover: refusing — caller is a worker (HERDR_TASK_ID set)" >&2
-  exit 4
-fi
-_caller_occ="$(validate_conductor_target_pane "$caller_pane" 2>/dev/null)"
-if [ -n "$_caller_occ" ]; then
-  echo "conductor-handover: refusing — caller pane $caller_pane: $_caller_occ" >&2
+# pane_is_conductor_eligible looks the ancestry-resolved pane up in the
+# registry directly (fails closed on a read failure, F5) — not
+# $HERDR_TASK_ID, which a worker can simply not export.
+if ! pane_is_conductor_eligible "$caller_pane" 2>/dev/null; then
+  echo "conductor-handover: refusing — caller pane $caller_pane is a registered worker's own active task pane, or its eligibility could not be verified" >&2
   exit 4
 fi
 
 # ---- is the caller Main? ---------------------------------------------------
+# roles table's "main" row (lib/run-registry.sh read_role), never an env
+# var — a worker could export HERDR_MAIN_PANE_ID=<Main's pane> to claim
+# Main's authority over env, but cannot make caller_pane_from_ancestry
+# resolve to anything but its own pane.
 is_main=0
-if [ -n "${HERDR_MAIN_PANE_ID:-}" ] && [ "$HERDR_MAIN_PANE_ID" = "$caller_pane" ] \
-   && [ -n "${HERDR_MAIN_PANE_BIRTH:-}" ] && [ "$HERDR_MAIN_PANE_BIRTH" = "$caller_birth" ]; then
-  is_main=1
+_main_row_j="$(read_role main 2>/dev/null)"
+if [ -n "$_main_row_j" ] && [ "$_main_row_j" != null ]; then
+  _main_pane="$(printf '%s' "$_main_row_j" | jq -r '.pane_id // empty')"
+  _main_birth="$(printf '%s' "$_main_row_j" | jq -r '.pane_birth // empty')"
+  _main_live_rc=0
+  _is_live "$_main_pane" "$_main_birth" || _main_live_rc=$?
+  if [ "$_main_live_rc" = 0 ] && [ "$_main_pane" = "$caller_pane" ]; then
+    is_main=1
+  fi
 fi
 
 # ---- target validation ------------------------------------------------------
-if ! pane_is_agent "$to_pane" 2>/dev/null; then
-  echo "conductor-handover: refusing — target pane $to_pane is not running an agent" >&2
+# pane_is_conductor_eligible covers both pane_is_agent and the worker-pane
+# refusal, and fails closed on a registry read failure the same as above.
+if ! pane_is_conductor_eligible "$to_pane" 2>/dev/null; then
+  echo "conductor-handover: refusing — target pane $to_pane is not an agent, is a registered worker's own active task pane, or its eligibility could not be verified" >&2
   exit 5
 fi
-_target_reason="$(validate_conductor_target_pane "$to_pane" 2>/dev/null)"
-if [ -n "$_target_reason" ]; then
-  echo "conductor-handover: refusing — target pane $to_pane: $_target_reason" >&2
-  exit 5
-fi
+_to_live_rc=0
+_is_live "$to_pane" "" || _to_live_rc=$?
+case "$_to_live_rc" in
+  0) : ;;
+  2) echo "conductor-handover: refusing — could not read target pane $to_pane's birth fingerprint (herdr read failed)" >&2; exit 5 ;;
+  *) echo "conductor-handover: refusing — target pane $to_pane is gone" >&2; exit 5 ;;
+esac
 to_birth="$(pane_birth_now "$to_pane" 2>/dev/null)"
-[ -n "$to_birth" ] || { echo "conductor-handover: refusing — target pane $to_pane is gone" >&2; exit 5; }
 to_conductor_id="conductor_${to_pane}"
-by="${HERDR_CONDUCTOR_ID:-conductor_${caller_pane}}"
+by="conductor_${caller_pane}"
 
 # ---- resolve the task set --------------------------------------------------
 # One row per task: task_id|run_id|current-conductor-pane|current-conductor-birth|label|worker-pane|state

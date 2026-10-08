@@ -253,13 +253,19 @@ task, gated on the caller's claimed `from_pane`/`from_birth` still being the
 row's live conductor — a stale or raced caller changes nothing, and two
 concurrent handovers of the same task leave exactly one winner.
 
-**Who may call it:** the task's current live registered conductor (giving
-its own tasks away only — the same live-pane-and-birth comparison rule 3
-above requires), or the designated Main (any task). Refused: a worker pane,
-and anyone else. **The target** must be a live, non-worker agent pane —
-`validate_conductor_target_pane` (`lib/pane-guard.sh`), the same check
-`spawn-task.sh`'s `HERDR_MCP_CONDUCTOR_PANE` fallback uses, not a second
-copy that could drift from it.
+**Who may call it:** caller identity comes from `caller_pane_from_ancestry`
+(`lib/pane-guard.sh`, security review PR #252, P3) — the first ancestor pid
+of the process that herdr itself reports as a pane's current foreground
+process — never a self-asserted `HERDR_PANE_ID`/`HERDR_TASK_ID`, which a
+worker can export as anything it likes. Allowed: the task's current live
+registered conductor (giving its own tasks away only — the same live-pane-
+and-birth comparison rule 3 above requires), or the designated Main (the
+roles table's `main` row, read via `read_role`, never an env var — any
+task). Refused: a worker pane, and anyone else. **The target** must pass
+`pane_is_conductor_eligible` (`lib/pane-guard.sh`) — a live, non-worker
+agent pane, failing closed on a registry read failure — the same check
+`spawn-task.sh`'s `HERDR_MCP_CONDUCTOR_PANE` fallback and
+`designate-main.sh` use, not a second copy that could drift from them.
 
 **A handover never changes classification, posture, or the reserved list.**
 It moves WHO the conductor-authority checks above compare the caller
