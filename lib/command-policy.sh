@@ -1937,7 +1937,7 @@ _cp_locate_command_word() {             # segment
     if [ "$_cp_wate" = 0 ]; then
       _cp_wl="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
       case "$_cp_wl" in
-        sudo|doas|su|env|nice|ionice|nohup|time|timeout|gtimeout|stdbuf|setsid|command|builtin|exec|caffeinate)
+        sudo|doas|su|env|nice|ionice|nohup|time|timeout|gtimeout|stdbuf|setsid|command|builtin|exec|caffeinate|unbuffer|sandbox-exec)
           case "$_cp_wl" in
             sudo)    _cp_wv='ugphCDRT'; _cp_wvl='user|group|host|prompt|chdir|close-from|role|type|other-user' ;;
             su)      _cp_wv='csl';      _cp_wvl='command|shell|user' ;;
@@ -1947,6 +1947,12 @@ _cp_locate_command_word() {             # segment
             ionice)  _cp_wv='cnpt';     _cp_wvl='class|classdata|pid' ;;
             stdbuf)  _cp_wv='ioe';      _cp_wvl='input|output|error' ;;
             exec)    _cp_wv='a';        _cp_wvl='' ;;
+            # wrapper-unwrap (SPEC #257 r2 PART A 186-193): `sandbox-exec
+            # -f/-n/-p/-D` each take ONE separate value (`man
+            # sandbox-exec`); `unbuffer`'s only flag (`-p`) is boolean, so
+            # it needs no entry here — it already falls through to the
+            # value-less default below.
+            sandbox-exec) _cp_wv='nfpD'; _cp_wvl='' ;;
             *)       _cp_wv=;           _cp_wvl= ;;
           esac
           shift
@@ -2798,6 +2804,204 @@ _cp_git_dashed_verb() {                 # wcmd
   return 1
 }
 
+# SPEC #257 r2 (PART A rows 186-193): `_cp_git_seg_exec_unsafe` already
+# unwraps every GENERIC launcher through `_cp_locate_command_word` (sudo,
+# env, nice, timeout, caffeinate, unbuffer, sandbox-exec, …: skip the
+# launcher's own value-opts, the very next word IS the real command) plus
+# `xargs`/`parallel`/`watch` (their own small value-opt set, via
+# `_cp_coderef_wrapped_command`). `find -exec/-execdir/-ok/-okdir`,
+# `script`, `arch`, `xcrun` and `chroot` all escaped BOTH of those:
+# `find`'s wrapped command sits after a mid-argv clause marker, not in
+# launcher position at all; `script`/`chroot` always consume a mandatory
+# FILE/newroot positional before the real command, so the generic "skip
+# flags, next word is it" rule would misread that positional as the
+# command; `arch` takes its value options in a non-GNU single-dash
+# multi-letter form (`-arch arm64`) the generic matcher's single-char
+# short-opt table cannot express. Five narrow, hand-written extractors
+# below — one per actual argv shape (`man <tool>`), not a blanket
+# heuristic — each fills `_CP_WRAP_TAIL` (array: the wrapped command word
+# and everything after it, UNCHANGED — not just the word) with rc 0, rc 1
+# when the tool genuinely invokes nothing (a bare `find … -name …` with
+# no `-exec` clause; `xcrun` used in an info-only mode; `arch`/`script`/
+# `chroot` with only their own flags/positional and no trailing command),
+# or rc 2 when a command-invoking shape IS present but unreadable with
+# confidence (an `-exec` clause whose command word is `{}` or empty; an
+# option this extractor does not recognize sitting ahead of the command)
+# — callers MUST treat rc 2 as unsafe (fail closed, never "not git"), same
+# as the xargs/parallel "piped input invisible" fail-closed case just
+# below. `_CP_WRAP_TAIL` (not just its first word) is handed straight to
+# `_cp_git_unsafe_tokens`, same as a direct `git …`/`xargs git …`
+# invocation, so `find … -exec git log \;` still allows (`log` is
+# read-only) while `find … -exec git -C /x status \;` still escalates
+# (`-C` ahead of the subcommand) — the wrapper itself never changes how
+# strict the inner git call's OWN shape is judged.
+_CP_WRAP_TAIL=()
+
+# `_cp_protect_text` turns a backslash-escaped OR quoted `;` (`\;` / `';'`
+# — how `find -exec … \;` is actually written, since a bare `;` would
+# otherwise end the shell statement before it reaches find at all) into
+# the control byte `\002`, never the literal ASCII character — every
+# caller downstream of it, including `_cp_wrap_find_exec_verb` below,
+# receives that byte, not `;`. A real UNESCAPED `;` can never appear
+# inside the args this function sees in the first place: it would already
+# have split the segment in two before `_cp_git_seg_exec_unsafe` ever ran.
+_CP_PROT_SEMI="$(printf '\002')"
+
+# `_cp_wrap_find_exec_verb <find's own args...>` -> the first
+# `-exec`/`-execdir`/`-ok`/`-okdir` clause's full argv. Mirrors
+# `_cp_bwt_dispatch_wrapped`'s find case (herdr-control#192) in shape, as
+# a separate copy: that function's return convention (`KIND<TAB>target`
+# lines, for the rm/curl write-target scan) is unrelated to this one.
+_cp_wrap_find_exec_verb() {             # args...
+  _CP_WRAP_TAIL=()
+  local -a a=("$@") wrapped
+  local i=0 n="${#a[@]}"
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -exec|-execdir|-ok|-okdir)
+        i=$((i + 1))
+        [ "$i" -lt "$n" ] || return 2
+        case "${a[$i]}" in ';'|"$_CP_PROT_SEMI"|'+'|'{}'|*'{}'*) return 2 ;; esac
+        wrapped=("${a[$i]}")
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ] && [ "${a[$i]}" != ';' ] && \
+              [ "${a[$i]}" != "$_CP_PROT_SEMI" ] && [ "${a[$i]}" != '+' ]; do
+          wrapped+=("${a[$i]}"); i=$((i + 1))
+        done
+        _CP_WRAP_TAIL=("${wrapped[@]}")
+        return 0 ;;
+    esac
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# `_cp_wrap_script_verb <script's own args...>` -> the command's full argv
+# for BSD `script [-aeFkqr] [-t time] [file [command ...]]` (`man
+# script`). script's FIRST non-option word is ALWAYS the transcript file,
+# never the command — there is no spelling that takes a bare command with
+# no file — so this skips exactly one non-option word before looking for
+# the real command. rc 1 when nothing follows the file (an
+# interactive-shell invocation, not a wrapper). rc 2 on any option this
+# table does not list (includes `-p`/`-T`/`-d`'s playback mode, which
+# does not take a command at all — ambiguous enough to fail closed rather
+# than guess).
+_cp_wrap_script_verb() {                # args...
+  _CP_WRAP_TAIL=()
+  local -a a=("$@")
+  local i=0 n="${#a[@]}" seen_file=0
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -t) i=$((i + 2)); continue ;;
+      -a|-e|-F|-k|-q|-r) i=$((i + 1)); continue ;;
+      -*) return 2 ;;
+    esac
+    if [ "$seen_file" = 0 ]; then seen_file=1; i=$((i + 1)); continue; fi
+    _CP_WRAP_TAIL=("${a[@]:i}")
+    return 0
+  done
+  return 1
+}
+
+# `_cp_wrap_arch_verb <arch's own args...>` -> the command's full argv for
+# `arch [-32] [-64] [[-arch_name | -arch arch_name]...] [-c] [-d envname]
+# [-e envname=value] [-h] prog [args...]` (`man arch`). rc 1 when no
+# `prog` follows (arch alone, or only its own flags). rc 2 on any `-`
+# token this table does not list.
+_cp_wrap_arch_verb() {                  # args...
+  _CP_WRAP_TAIL=()
+  local -a a=("$@")
+  local i=0 n="${#a[@]}"
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -arch|-d|-e) i=$((i + 2)); continue ;;
+      -32|-64|-c|-h|-i386|-x86_64|-x86_64h|-arm64|-arm64e) i=$((i + 1)); continue ;;
+      -*) return 2 ;;
+    esac
+    _CP_WRAP_TAIL=("${a[@]:i}")
+    return 0
+  done
+  return 1
+}
+
+# `_cp_wrap_xcrun_verb <xcrun's own args...>` -> the tool's full argv for
+# `xcrun [--sdk <SDK>] [--toolchain <name>] [-v|--verbose] [-n|--no-cache]
+# [-k|--kill-cache] [-l|--log] [-r|--run] <tool name> ...` (`man xcrun`).
+# `-f`/`--find` and every `--show-*` flag are INFO-ONLY shapes — xcrun
+# resolves/prints and never execs a tool at all in that mode, regardless
+# of what else is on the line — so those return rc 1 (not a wrapper) the
+# moment they appear. rc 2 on any other `-`-led token this table does not
+# list.
+_cp_wrap_xcrun_verb() {                 # args...
+  _CP_WRAP_TAIL=()
+  local -a a=("$@")
+  local i=0 n="${#a[@]}"
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -f|--find|--show-sdk-path|--show-sdk-version|--show-sdk-build-version| \
+      --show-sdk-platform-path|--show-sdk-platform-version|--show-toolchain-path)
+        return 1 ;;
+      --sdk|--toolchain) i=$((i + 2)); continue ;;
+      --sdk=*|--toolchain=*) i=$((i + 1)); continue ;;
+      -v|--verbose|-n|--no-cache|-k|--kill-cache|-l|--log|-r|--run) i=$((i + 1)); continue ;;
+      -*) return 2 ;;
+    esac
+    _CP_WRAP_TAIL=("${a[@]:i}")
+    return 0
+  done
+  return 1
+}
+
+# `_cp_wrap_chroot_verb <chroot's own args...>` -> the command's full argv
+# for `chroot [-G group[,group...]] [-g group] [-u user] newroot [command
+# [arg...]]` (`man chroot`). Same "mandatory positional before the real
+# command" shape as `script` above: the first non-option word is always
+# `newroot`, never the command. rc 1 when no command follows newroot
+# (chroot execs the login shell instead — not a wrapper here).
+_cp_wrap_chroot_verb() {                # args...
+  _CP_WRAP_TAIL=()
+  local -a a=("$@")
+  local i=0 n="${#a[@]}" seen_root=0
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -G|-g|-u) i=$((i + 2)); continue ;;
+      -*) return 2 ;;
+    esac
+    if [ "$seen_root" = 0 ]; then seen_root=1; i=$((i + 1)); continue; fi
+    _CP_WRAP_TAIL=("${a[@]:i}")
+    return 0
+  done
+  return 1
+}
+
+# `_cp_wrap_flock_verb <flock's own args...>` -> the command's full argv
+# for `flock [-sxon] [-w timeout] file|directory command [args...]` (`man
+# flock`, util-linux). Same "mandatory positional before the real
+# command" shape as `script`/`chroot` above: the first non-option word is
+# always the lock file/directory, never the command. rc 1 when no command
+# follows it (locking an already-open fd by number — not a wrapper). rc 2
+# on `-c`/`--command`, which runs its STRING argument through a shell —
+# the same unreadable-without-evaluation shape SPEC names for `sh -c` —
+# or on any other option this table does not list.
+_cp_wrap_flock_verb() {                 # args...
+  _CP_WRAP_TAIL=()
+  local -a a=("$@")
+  local i=0 n="${#a[@]}" seen_target=0
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -w|--timeout|-E|--conflict-exit-code) i=$((i + 2)); continue ;;
+      -s|--shared|-x|--exclusive|-n|--nonblock|-o|--close|-F|--no-fork|--verbose)
+        i=$((i + 1)); continue ;;
+      -c|--command) return 2 ;;
+      -*) return 2 ;;
+    esac
+    if [ "$seen_target" = 0 ]; then seen_target=1; i=$((i + 1)); continue; fi
+    _CP_WRAP_TAIL=("${a[@]:i}")
+    return 0
+  done
+  return 1
+}
+
 # `_cp_git_seg_exec_unsafe <protected-segment>` -> 0 (true) when this ONE
 # already-protected-and-carved segment is unsafe:
 #   * a `GIT_*=`/`PAGER=`/`EDITOR=`/`VISUAL=` assignment anywhere ahead of
@@ -2807,9 +3011,17 @@ _cp_git_dashed_verb() {                 # wcmd
 #     for every caller; read back from its `_CP_LOC_SKIPPED` rather than
 #     re-splitting the segment a second, possibly-inconsistent way;
 #   * `git`/`git-<verb>` itself failing `_cp_git_unsafe_tokens`'s shape;
-#   * a fan-out runner (`xargs`/`parallel`) wrapping git — its real
-#     subcommand comes from piped input this policy cannot see at all, so
-#     it is unsafe regardless of what static argv is present.
+#   * a fan-out runner (`xargs`/`parallel`/`watch`) wrapping git — its real
+#     subcommand comes from piped input (`xargs`/`parallel`) or is simply
+#     re-read every cycle (`watch`) in a way this policy cannot see ahead
+#     of time, so it is unsafe regardless of what static argv is present;
+#   * `find -exec/-execdir/-ok/-okdir`, `script`, `arch`, `xcrun`,
+#     `chroot` or `flock` wrapping git (SPEC #257 r2, PART A rows 186-193,
+#     and the pre-existing r7 D5 rows for `find`/`script`/`arch`/`xcrun`/
+#     `watch`/`flock`) — each unwrapped by its own `_cp_wrap_*_verb`
+#     extractor just above, which fails CLOSED (treated as unsafe here)
+#     rather than silently "not git" whenever that extractor cannot read
+#     the wrapped command word with confidence.
 _cp_git_seg_exec_unsafe() {             # protected-segment
   local seg="$1" tok
   _cp_locate_command_word "$seg" || return 1
@@ -2826,10 +3038,35 @@ _cp_git_seg_exec_unsafe() {             # protected-segment
         _cp_git_unsafe_tokens "$v" "${_CP_LOC[@]:1}" && return 0
       fi
       return 1 ;;
-    xargs|parallel)
+    xargs|parallel|watch)
       local wrapped
       wrapped="$(_cp_coderef_wrapped_command "$_cp_wcmd" "${_CP_LOC[@]:1}")" || return 1
       case "${wrapped##*/}" in git|git-*) return 0 ;; esac
+      return 1 ;;
+    find|script|arch|xcrun|chroot|flock)
+      local rc wv
+      case "$_cp_wcmd" in
+        find)   _cp_wrap_find_exec_verb "${_CP_LOC[@]:1}"; rc=$? ;;
+        script) _cp_wrap_script_verb    "${_CP_LOC[@]:1}"; rc=$? ;;
+        arch)   _cp_wrap_arch_verb      "${_CP_LOC[@]:1}"; rc=$? ;;
+        xcrun)  _cp_wrap_xcrun_verb     "${_CP_LOC[@]:1}"; rc=$? ;;
+        chroot) _cp_wrap_chroot_verb    "${_CP_LOC[@]:1}"; rc=$? ;;
+        flock)  _cp_wrap_flock_verb     "${_CP_LOC[@]:1}"; rc=$? ;;
+      esac
+      [ "$rc" = 1 ] && return 1
+      [ "$rc" = 2 ] && return 0
+      wv="$(printf '%s' "${_CP_WRAP_TAIL[0]##*/}" | tr 'A-Z' 'a-z')"
+      case "$wv" in
+        git)
+          _cp_git_unsafe_tokens "${_CP_WRAP_TAIL[@]:1}" && return 0
+          return 1 ;;
+        git-*)
+          local gv
+          if gv="$(_cp_git_dashed_verb "$wv")"; then
+            _cp_git_unsafe_tokens "$gv" "${_CP_WRAP_TAIL[@]:1}" && return 0
+          fi
+          return 1 ;;
+      esac
       return 1 ;;
     *) return 1 ;;
   esac
