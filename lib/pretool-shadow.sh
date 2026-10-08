@@ -459,6 +459,15 @@ _ps_bash_closed_world_verdict() {       # command cwd hw ; hw empty = owner ; on
           PS_VERDICT=escalate PS_POLICY=$pol
           PS_REASON="$scope; '$_cp_wcmd $a' can write or run code — a conductor must review it"
           return ;;
+        # PR #251 review: an expansion (`$X`, `${X}`, `$(…)`, `$'\055O'`, a
+        # backtick) is resolved by the shell AFTER this check, so the option
+        # checks above and the shared git gate below never see its final
+        # words (`git grep $X` with X=-O<cmd> runs <cmd>). A bare `$` (a
+        # regex anchor, `-e 'x$'`) is not an expansion and stays allowed.
+        find:*\$[A-Za-z_0-9{\(\'@*#?!-]*|rg:*\$[A-Za-z_0-9{\(\'@*#?!-]*|git:*\$[A-Za-z_0-9{\(\'@*#?!-]*|find:*\`*|rg:*\`*|git:*\`*)
+          PS_VERDICT=escalate PS_POLICY=$pol
+          PS_REASON="$scope; '$_cp_wcmd' argument '$a' is expanded by the shell after this check — a conductor must review it"
+          return ;;
       esac
     done
     if [ "$_cp_wcmd" = git ]; then

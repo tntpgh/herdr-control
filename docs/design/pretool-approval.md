@@ -583,7 +583,17 @@ task JSON (the unregistered-pane case `peer_decide` already has,
   `_ps_bash_handoffs_verdict`) with an empty `hw` means "no write scope" —
   every segment's command word on `_PS_HW_SAFE`, read-only git verbs only, no
   command substitution, and any write target escalates. Worker reasons are
-  byte-identical.
+  byte-identical. Exec-capable git options (`git grep -O`/
+  `--open-files-in-pager`, clustered or abbreviated, `--ext-diff`,
+  `--textconv`, `--output`, …; the PR #251 review's HIGH finding) are refused
+  by #254's shared gate — `_cp_git_unsafe_tokens` and
+  `_cp_exec_name_or_opaque_present` (lib/command-policy.sh), which
+  `peer_decide` runs for every session and the closed world calls again —
+  so owner mode carries no git option list of its own. One rule stays in the
+  closed world, because no shared gate sees it: a find/rg/git argument
+  holding an expansion (`$X`, `${X}`, `$'…'`, a backtick) escalates, since
+  the shell resolves it after the check (`git grep $X`, X=`-O<cmd>`). A bare
+  `$` regex anchor is not an expansion.
 
 Answers: `allow` runs (omp's own approval layer still applies after it);
 `escalate`/`reserved` are blocked as Terrence's call ("stop and ask him"),
@@ -606,7 +616,7 @@ write/edit tools are owner-scope; eval is blocked. Residual (§12, unchanged):
 a same-uid process that double-forks away from its agent and fakes a
 terminal can still write the store. Isolation (#172) is what closes it.
 
-**Proof** (`verify-owner-approval.sh`, 101 checks): missing store, unknown and
+**Proof** (`verify-owner-approval.sh`, 124 checks): missing store, unknown and
 malformed labels, recycled/vanished/wrong pane, session mismatch and missing
 session, worker+owner env, revoke mid-session (and the revoked session stays
 out after the label is re-bound), garbage/table-less/mode-000 store and a row

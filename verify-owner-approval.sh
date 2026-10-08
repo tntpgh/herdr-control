@@ -280,6 +280,58 @@ for c in "git status --short" "git log --oneline -3" "cat /etc/hosts" "grep -n x
   out="$(ownb "$c")"; rc=$?
   expect_allow "owner read-only bash still runs: $c" "$out" "$rc"
 done
+# PR #251 security review (HIGH): `git grep --open-files-in-pager=<cmd>` runs
+# <cmd> through the shell. Control first: run the reviewer's command directly
+# and prove it really executes here, so the marker check below can fail.
+mk="$work/pager-marker"
+pg="printf PAGER_EXECUTED > $mk"
+(cd "$here" && git grep --open-files-in-pager="$pg" -e '^#' -- docs/design/pretool-approval.md >/dev/null 2>&1)
+[ -e "$mk" ] && ok "control: git grep --open-files-in-pager really executes its value" || not_ok "control: the pager never ran, so the marker check proves nothing"
+rm -f "$mk"
+# $PAGERX must survive word splitting to be a real attack: one word, a script.
+printf '#!/bin/sh\nprintf PAGER_EXECUTED > %s\n' "$mk" > "$work/pager.sh"; chmod +x "$work/pager.sh"
+gf="-e '^#' -- docs/design/pretool-approval.md"
+for c in "git grep --open-files-in-pager='$pg' $gf" \
+         "git grep -O '$pg' $gf" \
+         "git grep -O'$pg' $gf" \
+         "git grep -iO'$pg' $gf" \
+         "git grep --open='$pg' $gf" \
+         "git grep --op'en-files-in-pager'='$pg' $gf" \
+         "git grep \"-O\"'$pg' $gf" \
+         "git grep -\\O'$pg' $gf" \
+         "git grep \$PAGERX $gf" \
+         "git grep {-O'$pg',-n} $gf" \
+         "git diff --ext HEAD" \
+         "git log -p -1 --textc" \
+         "git log -1 --ou=$mk" \
+         "find . -maxdepth 1 -e\"xec\" sh -c '$pg' ;"; do
+  out="$(ownb "$c")"; rc=$?
+  # As if auto-approved: anything the judge allows actually runs.
+  [ "$rc" = 0 ] && (cd "$here" && PAGERX="-O$work/pager.sh" bash -c "$c" >/dev/null 2>&1)
+  # The refusal may come from the shared git gate (#254, inside peer_decide)
+  # or from the owner closed world; either way it must not be an allow.
+  if [ "$rc" = 8 ] && [ "$(printf '%s' "$out" | field decision)" = block ] \
+     && [ "$(printf '%s' "$out" | field verdict)" != allow ]; then
+    ok "owner pager/exec option refused: ${c:0:70}"
+  else
+    not_ok "owner pager/exec option not refused: $c -> $out"
+  fi
+done
+[ ! -e "$mk" ] && ok "the pager marker was never created" || not_ok "a pager command executed: $mk exists"
+# The regex-anchor case is double-quoted on purpose: #254's shared gate
+# (`_cp_exec_name_or_opaque_present`) flags the text `$'` anywhere, so
+# `-e 'owner$'` escalates there (a safe-direction false positive, owned by
+# #254). This case pins the closed world's own rule: a bare `$` is no expansion.
+for c in "git grep -n -e owner -- docs/design/pretool-approval.md" \
+         "git grep -n -e \"owner\$\" -- docs/design/pretool-approval.md" \
+         "git log --oneline -1 -- '*.md'" \
+         "git log -1 --extended-regexp --grep=x" \
+         "git diff --no-ext-diff --stat HEAD" \
+         "git show --stat HEAD@{0}" \
+         "find . -maxdepth 1 -name '*.md'"; do
+  out="$(ownb "$c")"; rc=$?
+  expect_allow "owner read-only git/find still runs: $c" "$out" "$rc"
+done
 out="$(own eval "$(jq -nc --arg p "$cursor" '{language:"py", code:("open(\"" + $p + "\",\"w\").write(\"{}\")")}')")"; rc=$?
 expect_block "eval write to the same file: refused" "$out" "$rc" "eval runs arbitrary code"
 [ ! -e "$cursor" ] && ok "nothing was written (the judge never executes the call)" || not_ok "cursor file created"
