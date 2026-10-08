@@ -4033,25 +4033,36 @@ def _is_handoff_reason(reason: str | None) -> bool:
     return bool(reason) and reason.strip().lower().startswith("handed_off_to:")
 
 
-def _live_done_info(worktree: str | None) -> tuple[float | None, str | None]:
-    """(epoch, reason) of the newest readable `_done` line in the worker's
-    OWN handoff bus — PR #223 review H5's fix for incident 1's exact shape:
-    while the pane stays alive, `lib/reconcile.sh` only ingests a
-    worktree's `_done` once the pane is GONE, so the registry row can sit
-    `running`/derive `ready_review` all night with no closure_reason at
-    all, which is precisely what left incident 1 undetected. Same bus
-    files, same byte-level never-decode discipline, and the same
-    last-line-only mtime fallback as `_evidence_at` — reused rather than
-    re-derived so the two readers can never disagree about which file.
+def _live_done_info(worktree: str | None) -> tuple[float | None, str | None, bool, float | None]:
+    """(epoch, reason, done_is_last, mtime) of the newest readable `_done`
+    line in the worker's OWN handoff bus — PR #223 review H5's fix for
+    incident 1's exact shape: while the pane stays alive, `lib/reconcile.sh`
+    only ingests a worktree's `_done` once the pane is GONE, so the registry
+    row can sit `running`/derive `ready_review` all night with no
+    closure_reason at all, which is precisely what left incident 1
+    undetected. Same bus files, same byte-level never-decode discipline,
+    and the same last-line-only mtime fallback as `_evidence_at` — reused
+    rather than re-derived so the two readers can never disagree about
+    which file.
+
+    Review r6 M1: `epoch` is the worker-WRITTEN `ts`, which can be wrong
+    (local time stamped with a `Z` suffix on an EDT host is 4h+ early) —
+    `done_is_last`/`mtime` let the caller also check the APPEND time, which
+    the worker never controls, for the one place that matters (the
+    task_start floor): a genuinely-this-round handoff must not be dropped
+    just because its own `ts` lies about when it landed.
     """
     if not worktree:
-        return None, None
+        return None, None, False, None
     best_epoch: float | None = None
     best_reason: str | None = None
+    best_is_last = False
+    best_mtime: float | None = None
     for rel in _bus_relpaths():
         p = Path(worktree) / rel
         try:
-            if not p.stat().st_size:
+            st = p.stat()
+            if not st.st_size:
                 continue
             last_ts: bytes | None = None
             last_reason: str | None = None
@@ -4072,12 +4083,13 @@ def _live_done_info(worktree: str | None) -> tuple[float | None, str | None]:
                 continue
             epoch = _iso_epoch(last_ts.decode("ascii", "replace")) if last_ts else None
             if epoch is None and done_is_last:
-                epoch = p.stat().st_mtime
+                epoch = st.st_mtime
             if epoch is not None and (best_epoch is None or epoch > best_epoch):
                 best_epoch, best_reason = epoch, last_reason
+                best_is_last, best_mtime = done_is_last, st.st_mtime
         except OSError:
             continue
-    return best_epoch, best_reason
+    return best_epoch, best_reason, best_is_last, best_mtime
 
 
 def _pane_last_output(pane_id: str, lines: int = 60) -> str:
@@ -4149,6 +4161,12 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
     as `project_needs_wake`. `boot_epoch` (PR #223 review H1/M-a) floors every
     signal's own evidence epoch so a deploy (or a restart mid-incident)
     never wakes on history; defaults to the persisted `_stall_boot_epoch()`.
+    Each task's own `created_at` (SPEC.md item 1/2) floors it a second way:
+    `spawn-task.sh` re-uses a branch's worktree for round N+1, so round N's
+    live-bus `_done` line or PROOF.md/REVIEW.md mtime is still sitting
+    there — `boot` alone never catches this since the hub did not restart
+    between rounds. Evidence timestamped before the task it is being
+    judged against was even registered belongs to an earlier task.
 
     Five signals, each its own `fingerprint` (what the claim_once key in
     stall-watchdog.sh re-arms on when it changes). IDLE_STATES (`stalled`,
@@ -4227,6 +4245,14 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
         if not tid:
             continue
         state = t.get("state")
+        # Floors every signal's own evidence epoch, alongside `boot`
+        # (SPEC.md item 1/2): `spawn-task.sh` re-uses a branch's worktree
+        # for round N+1, so round N's `_done` line / PROOF.md mtime is
+        # still sitting there when round N+1 registers — `boot` alone
+        # never catches this (the hub did not restart between rounds).
+        # Evidence older than the task's OWN registration belongs to an
+        # earlier task.
+        task_start = _iso_epoch(t.get("created_at"))
         base = {"task_id": tid, "run_id": t.get("run_id") or "",
                 "label": t.get("label") or tid, "pane_id": t.get("pane_id") or "",
                 "conductor_pane_id": t.get("conductor_pane_id") or "",
@@ -4234,13 +4260,23 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
 
         # ---- signal 1: handoff --------------------------------------------
         if state in IDLE_STATES and t.get("worktree"):
-            live_epoch, live_reason = live_done_fn(t["worktree"])
+            live_epoch, live_reason, live_is_last, live_mtime = live_done_fn(t["worktree"])
             since = live_epoch if _is_handoff_reason(live_reason) else None
             fingerprint = f"live:{live_epoch}"
         else:
             since = None
             fingerprint = None
-        if since is not None and since >= boot and now - since >= threshold:
+            live_is_last, live_mtime = False, None
+        # Review r6 M1: the floor accepts EITHER the worker-written `ts` or
+        # the file's own append mtime (only when the `_done` line is the
+        # file's last line — mtime then dates the append, not some later
+        # unrelated write). A skewed `ts` 4h early must not drop a handoff
+        # that landed well after this task's own registration; an untouched
+        # bus from a prior round still fails both checks, so the re-spawn
+        # fix (SPEC.md item 1) stays intact.
+        past_floor = task_start is None or (since is not None and since >= task_start) \
+            or (live_is_last and live_mtime is not None and live_mtime >= task_start)
+        if since is not None and since >= boot and past_floor and now - since >= threshold:
             out.append({**base, "signal": "handoff", "fingerprint": fingerprint,
                        "detail": "closed handed_off_to:... ; the conductor was never told",
                        "artifact": ""})
@@ -4256,7 +4292,7 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                     continue
                 if not size or mtime is None:
                     continue                                   # empty file: nothing was WRITTEN
-                if mtime < boot:
+                if mtime < boot or (task_start is not None and mtime < task_start):
                     continue
                 if owner_epoch is not None and owner_epoch >= mtime:
                     continue                                   # the conductor already acted since
@@ -4276,12 +4312,14 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
         # ---- signal 3/4: denied, unprocessed --------------------------------
         if state == "stalled":
             d = denied.get(tid)
-            if d and d["epoch"] >= boot and now - d["epoch"] >= threshold:
+            if d and d["epoch"] >= boot and (task_start is None or d["epoch"] >= task_start) \
+                    and now - d["epoch"] >= threshold:
                 out.append({**base, "signal": "denied", "fingerprint": d["fingerprint"],
                            "detail": "a policy-refused prompt was denied, then the worker went idle",
                            "artifact": ""})
             m = delivered.get(tid)
-            if m and m["epoch"] >= boot and now - m["epoch"] >= threshold:
+            if m and m["epoch"] >= boot and (task_start is None or m["epoch"] >= task_start) \
+                    and now - m["epoch"] >= threshold:
                 out.append({**base, "signal": "unprocessed", "fingerprint": m["fingerprint"],
                            "detail": "a message was delivered to this pane and never processed",
                            "artifact": ""})

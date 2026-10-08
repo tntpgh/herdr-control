@@ -263,8 +263,8 @@ def base_task(**over):
     t.update(over)
     return t
 
-def cw(now_epoch, reason=None):   # stub live_done_fn: constant (epoch, reason)
-    return lambda worktree: (now_epoch, reason)
+def cw(now_epoch, reason=None, is_last=True, mtime=None):   # stub live_done_fn:
+    return lambda worktree: (now_epoch, reason, is_last, mtime)  # constant (epoch, reason, is_last, mtime)
 
 # DESIGN-228: `occurrence_fn` defaults to the registry fold
 # (`_stall_cprompt_sight`) — every fixture below that only cares about
@@ -381,6 +381,49 @@ cands = hub.stall_watchdog_candidates(
     live_done_fn=cw(BOOT - 10, "handed_off_to:conductor"))
 results["H1_boot_epoch_floor_silences_pre_existing_evidence"] = cands == []
 
+# ---- SPEC.md item 1: a re-used worktree's round-N `_done` line must not
+# fire for round N+1's task. created_at floors evidence the same way boot
+# does -- a task registered AT T with live-bus evidence from BEFORE T
+# (round N's own close) is silent; the identical shape with evidence AFTER
+# T (this round's own close) still fires.
+t_reused_before = base_task(state="ready_review", stored_state="running", worktree="/wt-live",
+                            created_at="2026-01-01T19:00:00Z")   # T
+cands = hub.stall_watchdog_candidates(
+    [t_reused_before], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(hub._iso_epoch("2026-01-01T18:59:59Z"), "handed_off_to:conductor"))  # T-1
+results["item1_handoff_silent_on_a_prior_rounds_done_line_predating_this_task"] = cands == []
+t_reused_after = base_task(state="ready_review", stored_state="running", worktree="/wt-live",
+                           created_at="2026-01-01T19:00:00Z")   # T
+cands = hub.stall_watchdog_candidates(
+    [t_reused_after], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(hub._iso_epoch("2026-01-01T19:00:01Z"), "handed_off_to:conductor"))  # T+1
+results["item1_handoff_still_fires_on_this_rounds_own_done_line"] = any(
+    c["signal"] == "handoff" for c in cands)
+
+# ---- review r6 M1: clock skew -- the worker's own `ts` stamped 4h early
+# must not drop a handoff that genuinely landed after this round's own
+# registration. `_live_done_info` now also reports done_is_last/mtime; the
+# task_start floor accepts the APPEND time (mtime, only when the `_done`
+# line is the file's own last line) as an alternative to the worker-written
+# `ts` -- a real -4h/mtime-pr-223-r3-shaped skew on this machine.
+T_SKEW = hub._iso_epoch("2026-01-01T19:00:00Z")           # task registered at T
+t_skew = base_task(state="ready_review", stored_state="running", worktree="/wt-live",
+                   created_at="2026-01-01T19:00:00Z")
+cands = hub.stall_watchdog_candidates(
+    [t_skew], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(T_SKEW + 1800 - 4 * 3600, "handed_off_to:conductor",
+                   is_last=True, mtime=T_SKEW + 1800))     # ts=T-3h30m, appended at T+30m
+results["M1_skewed_ts_still_fires_when_the_append_mtime_is_after_task_start"] = any(
+    c["signal"] == "handoff" for c in cands)
+# Same skewed ts, but the `_done` line is NOT the file's last line (some
+# later non-done write set the mtime) -- the mtime cannot be trusted to
+# date the append, so it must not be used to clear the floor.
+cands = hub.stall_watchdog_candidates(
+    [t_skew], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(T_SKEW + 1800 - 4 * 3600, "handed_off_to:conductor",
+                   is_last=False, mtime=T_SKEW + 1800))
+results["M1_mtime_ignored_when_the_done_line_is_not_the_files_last_line"] = cands == []
+
 # ---- signal 2: artifact (injectable stat_fn — no real filesystem needed) ----
 # stat_fn now returns (size, mtime): review H1's empty-file / owner-action gates.
 mtimes = {"/wt/tmp/commit-msg.txt": (400, NOW - THRESH - 1)}
@@ -461,6 +504,25 @@ t3d = base_task(state="ready_review", stored_state="running", worktree="/wtd")
 cands = hub.stall_watchdog_candidates([t3d], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
                                       stat_fn=lambda p: mtimes_debounce.get(p, (0, None)))
 results["M2_r4_newer_not_yet_stale_artifact_suppresses_the_older_ones_wake"] = cands == []
+
+# ---- SPEC.md item 2: round N+1's task must not qualify on round N's own
+# PROOF.md left behind in the re-used worktree. A task registered at T with
+# an artifact mtime from BEFORE T is silent; the identical shape with an
+# mtime AFTER T still fires -- same created_at floor as item 1, this time
+# on signal 2.
+mtimes_item2_before = {"/wti/.handoffs/PROOF.md": (10, hub._iso_epoch("2026-01-01T18:59:59Z"))}  # T-1
+t_item2_before = base_task(state="ready_review", stored_state="running", worktree="/wti",
+                           created_at="2026-01-01T19:00:00Z")   # T
+cands = hub.stall_watchdog_candidates([t_item2_before], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+                                      stat_fn=lambda p: mtimes_item2_before.get(p, (0, None)))
+results["item2_artifact_silent_on_a_prior_rounds_file_predating_this_task"] = cands == []
+mtimes_item2_after = {"/wti/.handoffs/PROOF.md": (10, hub._iso_epoch("2026-01-01T19:00:01Z"))}  # T+1
+t_item2_after = base_task(state="ready_review", stored_state="running", worktree="/wti",
+                          created_at="2026-01-01T19:00:00Z")   # T
+cands = hub.stall_watchdog_candidates([t_item2_after], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+                                      stat_fn=lambda p: mtimes_item2_after.get(p, (0, None)))
+results["item2_artifact_still_fires_on_this_rounds_own_file"] = any(
+    c["signal"] == "artifact" for c in cands)
 
 # ---- signal 3: denied --------------------------------------------------------
 t5 = base_task(state="stalled")
@@ -910,6 +972,20 @@ conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, 
 conn.commit(); conn.close()
 _, _, owner_acted2 = _safe_signals3("sig_owner", now=REG_NOW, threshold_s=REG_THRESH)
 results["owner_acted_populated_from_owner_acted_events"] = "t_owner" in owner_acted2
+
+# round-3 R3: `action_decided` was removed from owner-activity entirely --
+# a conductor's `herdr-action.sh supersede` must NOT ack a wake, exactly
+# as on origin/main (the round-1 item-4 addition and the round-2 Q2
+# textual-match carve-out are both reverted).
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('t_supersede','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('ad1','drun','t_supersede','action_decided','2026-01-01T02:00:00Z',"
+             "'{\"decision\":\"superseded\"}')")
+conn.commit(); conn.close()
+_, _, owner_acted3 = _safe_signals3("sig_supersede", now=REG_NOW, threshold_s=REG_THRESH)
+results["R3_supersede_after_a_wake_does_not_ack_it_matches_main"] = "t_supersede" not in owner_acted3
 
 # A later event from the SAME task (real worker activity) clears "unprocessed".
 conn = sqlite3.connect(str(hub.REGISTRY))
