@@ -3050,50 +3050,114 @@ check_reserved "function name inside a string literal, no -readonly -safe" \
 
 echo
 echo "== round 4 (PR #258 round-3 review): engine-guaranteed -readonly -safe,"
-echo "   no more SQL text parsing =="
+echo "   no more SQL text parsing; round 5 (PR #258 round-4 review) pins the"
+echo "   command word to /usr/bin/sqlite3 -- see the round-5 section below =="
 
 check_unreserved "sqlite3 -readonly -safe SELECT against the registry" \
-  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_unreserved "sqlite3 -safe -readonly (reverse order) SELECT" \
-  "sqlite3 -safe -readonly ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+  "/usr/bin/sqlite3 -safe -readonly ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_unreserved "sqlite3 --readonly --safe (long flags) SELECT" \
-  "sqlite3 --readonly --safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+  "/usr/bin/sqlite3 --readonly --safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_unreserved "sqlite3 -readonly -safe -json SELECT" \
-  "sqlite3 -readonly -safe -json ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+  "/usr/bin/sqlite3 -readonly -safe -json ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_unreserved "sqlite3 -readonly -safe PRAGMA journal_mode(WAL) (engine refuses the write at runtime)" \
-  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA journal_mode(WAL)'"
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA journal_mode(WAL)'"
 check_unreserved "sqlite3 -readonly -safe SELECT piped out to jq" \
-  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks' | jq ."
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks' | jq ."
 check_reserved "sqlite3 -readonly without -safe" \
-  "sqlite3 -readonly ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+  "/usr/bin/sqlite3 -readonly ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_reserved "sqlite3 -safe without -readonly" \
-  "sqlite3 -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+  "/usr/bin/sqlite3 -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_reserved "sqlite3 -readonly -safe but -cmd also present" \
-  "sqlite3 -readonly -safe -cmd '.timeout 2000' ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+  "/usr/bin/sqlite3 -readonly -safe -cmd '.timeout 2000' ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_reserved "sqlite3 -readonly -safe but -init also present" \
-  "sqlite3 -readonly -safe -init tmp/x.sql ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+  "/usr/bin/sqlite3 -readonly -safe -init tmp/x.sql ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_reserved "sqlite3 -readonly -safe but -bail also present" \
-  "sqlite3 -readonly -safe -bail ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+  "/usr/bin/sqlite3 -readonly -safe -bail ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_reserved "sqlite3 -readonly -safe but -echo also present" \
-  "sqlite3 -readonly -safe -echo ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+  "/usr/bin/sqlite3 -readonly -safe -echo ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_reserved "sqlite3 -readonly -safe but -batch also present" \
-  "sqlite3 -readonly -safe -batch ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+  "/usr/bin/sqlite3 -readonly -safe -batch ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_reserved "sqlite3 -readonly -safe stdin redirect" \
-  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 < tmp/update.sql"
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 < tmp/update.sql"
 check_reserved "sqlite3 -readonly -safe here-string" \
-  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 <<< 'SELECT 1'"
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 <<< 'SELECT 1'"
 check_reserved "sqlite3 -readonly -safe but SQL is a dot-command (.schema)" \
-  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 '.schema tasks'"
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 '.schema tasks'"
 check_reserved "sqlite3 -readonly -safe but SQL is a dot-command (.tables)" \
-  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 '.tables'"
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 '.tables'"
 check_reserved "sqlite3 -readonly -safe but two SQL arguments" \
-  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1' 'SELECT 2'"
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1' 'SELECT 2'"
 check_reserved "sqlite3 piped INTO from another command, -readonly -safe present" \
-  "echo 'SELECT 1' | sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3"
+  "echo 'SELECT 1' | /usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3"
 check_reserved "sqlite3 -readonly -safe SELECT piped out into a second sqlite3 write" \
-  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1' | sqlite3 /tmp/other.sqlite3 'UPDATE t SET x=1'"
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1' | /usr/bin/sqlite3 /tmp/other.sqlite3 'UPDATE t SET x=1'"
 check_reserved "sqlite3 -readonly -safe SELECT piped out to tee onto the registry" \
-  "sqlite3 -readonly -safe /tmp/other.sqlite3 'SELECT 1' | tee ~/.local/state/herdr/runs/registry.sqlite3"
+  "/usr/bin/sqlite3 -readonly -safe /tmp/other.sqlite3 'SELECT 1' | tee ~/.local/state/herdr/runs/registry.sqlite3"
+
+echo
+echo "== round 5 (PR #258 round-4 review, .handoffs/REVIEW.md: F1 high, F2 high):"
+echo "   /usr/bin/sqlite3 pinned, -separator/-newline dropped, backtick/dollar"
+echo "   banned in options and path, -column added =="
+
+# F2: the shell resolves a bare/relative/wrapped command word, not this
+# classifier -- a PATH shim, function, or alias named sqlite3 would get the
+# apparently-safe argv and could ignore -readonly -safe entirely.
+check_reserved "bare sqlite3 command word, full safe shape (F2 bypass closed)" \
+  "sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_reserved "relative ./sqlite3 command word, full safe shape" \
+  "./sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_reserved "command wrapper around sqlite3, full safe shape" \
+  "command sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_reserved "env wrapper around sqlite3, full safe shape" \
+  "env sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_reserved "exec wrapper around sqlite3, full safe shape" \
+  "exec sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_unreserved "absolute /usr/bin/sqlite3 command word, full safe shape" \
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+
+# F1: -separator took a value this classifier never validated, so an
+# unresolved $VAR separator value let the shell supply extra argv words
+# (e.g. -init /tmp/evil.sql) the classifier never saw. Round 5 drops every
+# value-taking option instead of trying to validate each one.
+check_reserved "readonly consumed as a -separator value (F1 bypass closed)" \
+  "/usr/bin/sqlite3 -separator -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1'"
+check_reserved "safe consumed as a -separator value (F1 bypass closed)" \
+  "/usr/bin/sqlite3 -separator -safe -readonly ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1'"
+check_reserved "-separator with a literal value, full safe shape (dropped option)" \
+  "/usr/bin/sqlite3 -readonly -safe -separator , ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1'"
+check_reserved "-newline, full safe shape (dropped option)" \
+  "/usr/bin/sqlite3 -readonly -safe -newline ';' ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1'"
+check_unreserved "-column output flag, full safe shape (added to the allowlist)" \
+  "/usr/bin/sqlite3 -readonly -safe -column ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+
+# Other flag/shape attacks from the round-4 review's own probe file, re-run
+# against the pinned command word.
+check_reserved "flags after the database path (invalid shape)" \
+  "/usr/bin/sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 -readonly -safe 'SELECT 1'"
+check_reserved "--readonly=0 (never a disable form; also unmatched flag text)" \
+  "/usr/bin/sqlite3 --readonly=0 -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1'"
+check_reserved "abbreviated -read (not -readonly)" \
+  "/usr/bin/sqlite3 -read -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1'"
+check_unreserved "repeated idempotent -readonly/--safe, full safe shape" \
+  "/usr/bin/sqlite3 -readonly -readonly -safe --safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1'"
+check_reserved "two ; -separated statements, only the first carries -readonly -safe" \
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1'; /usr/bin/sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'UPDATE tasks SET status=1'"
+
+# Item 3: no $, backtick, $(...) or ANSI-C $'...' anywhere in options or the
+# database path; the SQL argument is refused outright too -- this classifier
+# cannot tell a shell-expanding $VAR from a literal one post-unprotect.
+check_reserved "backtick in the database path" \
+  '/usr/bin/sqlite3 -readonly -safe "`echo /tmp`/registry.sqlite3" "SELECT 1"'
+check_reserved "unresolved \$VAR in the database path" \
+  '/usr/bin/sqlite3 -readonly -safe "$DB" "SELECT 1"'
+check_reserved "backtick inside the SQL argument, full safe shape" \
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 'SELECT \`writefile\`(1,1)'"
+check_reserved "ANSI-C \$'...' SQL argument smuggling a dot-command, full safe shape" \
+  "/usr/bin/sqlite3 -readonly -safe ~/.local/state/herdr/runs/registry.sqlite3 \$'SELECT 1\\n.shell touch /tmp/round5-shell'"
+check_reserved "URI query string in the database path (? is a glob char here too)" \
+  "/usr/bin/sqlite3 -readonly -safe 'file:/tmp/round5.sqlite3?mode=rw' 'SELECT 1'"
 
 # Real negative: the threat named in the SPEC is real -- an UPDATE through
 # sqlite3 really does rewrite conductor_pane_id on a throwaway registry (own
