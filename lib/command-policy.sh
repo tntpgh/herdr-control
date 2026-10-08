@@ -5739,7 +5739,40 @@ conductor_reserved_reason() {
   elif { _cp_git_push_invoked "$(_cp_mask_script_data "$raw")" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm" ||
        { _cp_imatch "$_CP_POLICY_FILE_RE" "$action_norm" && ! _cp_policy_mention_harmless "$raw"; }; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
+  # Registry-write-reserved (herdr-control#253 round-2 review probe 5c): a
+  # hook-mode worker that can UPDATE its own task row (e.g. set its own pane
+  # as conductor_pane_id) can approve its own prompts next. Only herdr-
+  # control scripts may write the registry, and those run as the conductor
+  # or human — so ANY direct write, by any route, is reserved the same way
+  # editing run-registry.sh itself already is (_CP_POLICY_FILE_RE above):
+  # name the target, exempt a provably harmless read.
+  elif _cp_imatch "$_CP_REGISTRY_PATH_RE" "$action_norm" && ! _cp_registry_mention_harmless "$raw"; then
+    printf 'registry writes remain human-only\n'
   fi
+}
+
+# The registry/state directory: its filename (any parent — a mktemp scratch
+# dir in a test counts exactly like the real one), the HERDR_RUN_STATE_DIR
+# override BY NAME (so a command that assigns or reads it is still caught),
+# and the whole state directory it defaults into. Boundary-anchored on the
+# filename only, same style as _CP_POLICY_FILE_RE.
+_CP_REGISTRY_PATH_RE='\bHERDR_RUN_STATE_DIR\b|(^|[^A-Za-z0-9_-])registry\.sqlite3\b|\.local/state/herdr\b'
+
+# Write markers for the registry/state-dir mention above: SQL verbs that
+# mutate a sqlite3 database, the `.import`/`.restore` dot-commands, a SETTER
+# pragma (one with `=`; a bare pragma is a read), python's execute(...)/
+# executescript(...) call shapes, and any shell-level write (redirect, tee,
+# cp/mv/rm/dd/truncate/ln). Matched anywhere in the text, not word-by-word:
+# the SQL is almost always one quoted argument or heredoc body a shell-word
+# segmenter cannot parse, same reasoning as _cp_cred_shaped_and_not_placeholder.
+_CP_REGISTRY_WRITE_RE='\b(update|insert|delete|replace|drop|alter|create|attach)\b|\.import\b|\.restore\b|\bexecute(script)?[[:space:]]*\(|\bpragma\b[^;]*=|>|\btee\b|\bcp\b|\bmv\b|\brm\b|\bdd\b|\btruncate\b|\bln\b'
+
+# `_cp_registry_mention_harmless <raw>` -> 0 when the registry/state-dir
+# mention cannot have written anything: no write marker anywhere in the
+# text. `SELECT`, `.schema`, and a bare `pragma` (no `=`) stay unreserved —
+# the ordinary worker flow of inspecting its own task row.
+_cp_registry_mention_harmless() {       # raw
+  ! _cp_imatch "$_CP_REGISTRY_WRITE_RE" "$1"
 }
 
 # The governance files. A name counts only as a whole path component: the

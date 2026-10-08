@@ -2888,6 +2888,79 @@ check "r10 ln B3: relative hardlink, no quotes, common agent shape" \
   'ln .git/config /tmp/cfgcopy; echo "[core]" > /tmp/cfgcopy; echo "pager = /tmp/x" >> /tmp/cfgcopy; git log' escalate
 check "r10 ln negative: ln -s ../shared lib/shared (source outside .git/)" \
   "ln -s ../shared lib/shared" allow
+
+echo
+echo "== registry-write-reserved (herdr-control#253 round-2 review probe 5c):"
+echo "   a worker must never write the run registry directly =="
+
+check_reserved "sqlite3 UPDATE the registry (literal default path)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \"UPDATE tasks SET conductor_pane_id='w9:p9' WHERE task_id='t1'\""
+check_reserved "sqlite3 UPDATE the registry (HERDR_RUN_STATE_DIR override)" \
+  'sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "UPDATE tasks SET conductor_pane_id='"'"'w9:p9'"'"'"'
+check_reserved "python sqlite3 .execute(UPDATE ...)" \
+  "python3 -c \"import sqlite3; sqlite3.connect('/tmp/x/runs/registry.sqlite3').execute('UPDATE tasks SET conductor_pane_id=1')\""
+check_reserved "python sqlite3 .executescript(INSERT ...)" \
+  "python3 -c \"import sqlite3; sqlite3.connect('/tmp/x/runs/registry.sqlite3').executescript('INSERT INTO tasks VALUES (1)')\""
+check_reserved "cp a forged db over the registry" \
+  "cp /tmp/forged-registry.sqlite3 ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "mv a forged db over the registry" \
+  "mv /tmp/forged-registry.sqlite3 ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "redirect into the registry file" \
+  "printf junk > ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "tee into the registry file" \
+  "echo junk | tee ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "dd over the registry file" \
+  "dd if=/dev/zero of=~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "truncate the registry file" \
+  "truncate -s 0 ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "sqlite3 .restore onto the registry" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 '.restore /tmp/forged.sqlite3'"
+check_reserved "sqlite3 PRAGMA setter against the registry" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA writable_schema=1'"
+check_reserved "remove the whole state directory" \
+  "rm -rf ~/.local/state/herdr/"
+check_reserved "cp a tree onto the state directory" \
+  "cp -r /tmp/forged-state ~/.local/state/herdr/"
+
+check_unreserved "sqlite3 SELECT against the registry" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_unreserved "sqlite3 .schema read against the registry" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 '.schema tasks'"
+check_unreserved "sqlite3 bare PRAGMA read against the registry" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA table_info(tasks)'"
+check_unreserved "cat the registry file (a read, no write marker)" \
+  "cat ~/.local/state/herdr/runs/registry.sqlite3"
+
+# Real negative: the threat named in the SPEC is real -- an UPDATE through
+# sqlite3 really does rewrite conductor_pane_id on a throwaway registry (own
+# mktemp HERDR_RUN_STATE_DIR, never the live one) -- and conductor_reserved_
+# reason reserves the IDENTICAL text that just proved it.
+_rwr_state="$(mktemp -d)"
+(
+  export HERDR_RUN_STATE_DIR="$_rwr_state"
+  . "$here/lib/run-registry.sh"
+  register_task run-rwr task-rwr worker-rwr orig-conductor CPANE1 CPB1 PANE1 PB1 /repo /wt "impl:rwr" >/dev/null 2>&1
+)
+_rwr_before="$(sqlite3 "$_rwr_state/registry.sqlite3" "SELECT conductor_pane_id FROM tasks WHERE task_id='task-rwr';" 2>/dev/null)"
+_rwr_cmd="sqlite3 \"$_rwr_state/registry.sqlite3\" \"UPDATE tasks SET conductor_pane_id='hijacked:pane' WHERE task_id='task-rwr'\""
+eval "$_rwr_cmd" >/dev/null 2>&1
+_rwr_after="$(sqlite3 "$_rwr_state/registry.sqlite3" "SELECT conductor_pane_id FROM tasks WHERE task_id='task-rwr';" 2>/dev/null)"
+total=$((total + 1))
+if [ "$_rwr_before" = "CPANE1" ] && [ "$_rwr_after" = "hijacked:pane" ]; then
+  printf 'PASS  %-52s => real UPDATE changed the row (%s -> %s)\n' "real negative: UPDATE really hijacks conductor_pane_id" "$_rwr_before" "$_rwr_after"
+else
+  printf 'FAIL  %-52s => before=%s after=%s (threat not reproduced)\n' "real negative: UPDATE really hijacks conductor_pane_id" "$_rwr_before" "$_rwr_after"
+  failed=$((failed + 1))
+fi
+total=$((total + 1))
+_rwr_got="$(conductor_reserved_reason "$_rwr_cmd")"
+if [ -n "$_rwr_got" ]; then
+  printf 'PASS  %-52s => reserved\n' "real negative: classifier reserves the identical UPDATE text"
+else
+  printf 'FAIL  %-52s => NOT reserved (an automated authority would press Approve)\n' "real negative: classifier reserves the identical UPDATE text"
+  failed=$((failed + 1))
+fi
+rm -rf "$_rwr_state"
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
