@@ -2643,6 +2643,89 @@ _cp_flatten_substitutions() {
   printf '%s' "$text"
 }
 
+# `_cp_strip_redirect_tokens <text>` -> TEXT with every redirection
+# operator, together with its target (attached or the following detached
+# word), removed — the segment stays ONE contiguous run of text instead
+# of being split at `<`/`>` the way `;`/`&`/`|`/`(`/`)`/backtick still
+# are. Round 3 (PR#257 round-2 review R2-1): hard-splitting on `<`/`>`
+# cut a git invocation away from its own argv whenever a redirect sat
+# before/between/after it (`>/dev/null git …`, `git -P> status push`,
+# `git grep >/dev/null -Oid -e x`) — the git word or its global options
+# ended up alone in one segment with nothing recognizable in it, which
+# every consumer below reads as "no git here" instead of "redirect
+# here, git is still the command". Meant to run on `_cp_protect_text`'s
+# output: a redirect CHARACTER that only appears inside a quoted string
+# was already turned into a control byte by that pass and never reaches
+# here as a real `<`/`>` — see `_cp_protect_text`'s own header. The
+# caller still does its own tokenize/split AFTER this (on `;&|()` and
+# backtick only, never `<>` again).
+#
+# Recognizes, fd digits optional ahead of the operator: `>`, `>>`,
+# `>|`, `<`, `<>`, `<<<`, `&>`, `&>>`, `N>&M`/`N<&M` (dup forms,
+# self-contained — no following word consumed, the dup target is
+# already part of the operator). Matches the operator wherever it
+# sits in a token: glued to a preceding option (`-P>`), glued to its
+# own target (`>/dev/null`, `2>&1`), or standing alone with the target
+# as the NEXT word (detached — consumed too, unless the operator was a
+# self-contained dup form). Only the operator (+ its glued/detached
+# target) is dropped; text in the SAME token BEFORE the operator is
+# kept as its own word — this is what lets `-P>` surface `-P` rather
+# than losing the whole token.
+_cp_strip_redirect_tokens() {            # protected text -> text with every redirect operator+target removed
+  local LC_ALL=C LANG=C
+  local text="$1" word rest kept=() skip_next=0 i n c op_start
+  local _cp_srt_noglob=0
+  case "$-" in *f*) _cp_srt_noglob=1 ;; esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $text
+  [ "$_cp_srt_noglob" = 1 ] || set +f
+  for word in "$@"; do
+    if [ "$skip_next" = 1 ]; then
+      skip_next=0
+      continue
+    fi
+    case "$word" in
+      *'<'*|*'>'*) ;;
+      *) kept+=("$word"); continue ;;
+    esac
+    n=${#word}
+    op_start=-1
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      c="${word:$i:1}"
+      if [ "$c" = '<' ] || [ "$c" = '>' ]; then
+        op_start=$i
+        while [ "$op_start" -gt 0 ]; do
+          case "${word:$((op_start-1)):1}" in
+            [0-9]) op_start=$((op_start-1)) ;;
+            *) break ;;
+          esac
+        done
+        if [ "$c" = '>' ] && [ "$op_start" -gt 0 ] && [ "${word:$((op_start-1)):1}" = '&' ]; then
+          op_start=$((op_start-1))
+        fi
+        break
+      fi
+      i=$((i+1))
+    done
+    if [ "$op_start" -lt 0 ]; then
+      kept+=("$word")
+      continue
+    fi
+    [ "$op_start" -gt 0 ] && kept+=("${word:0:$op_start}")
+    rest="${word:$op_start}"
+    case "$rest" in
+      [0-9]'>&'[0-9]*|'>&'[0-9]*|[0-9]'<&'[0-9]*|'<&'[0-9]*) ;;
+      [0-9]'>>'|'>>'|[0-9]'<>'|'<>'|[0-9]'>'|'>'|[0-9]'<'|'<'|'&>>'|'&>')
+        skip_next=1 ;;
+      *) ;;
+    esac
+  done
+  [ "${#kept[@]}" -gt 0 ] && printf '%s ' "${kept[@]}"
+  return 0
+}
+
 # `_cp_git_push_invoked <raw>` -> 0 (true) when RAW invokes a real git push
 # anywhere (any segment of a chain, any nesting) — shared by
 # conductor_reserved_reason, classify_command's force-push escalate, and
@@ -2670,16 +2753,21 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
   pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
   pre="$(printf '%s' "$pre" | sed "s/['\"\\\\]//g")"
   pre="$(printf '%s' "$pre" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
-  # H1 (independent review of #157): a `<`/`>` redirect glued directly onto
-  # a git global-option token (`git -P> status push origin main`) made the
-  # redirect's TARGET word read as the subcommand, while bash actually runs
-  # `git -P push …` with stdout redirected to a file named `status`. `<`/`>`
-  # are shell operators, never legal inside a git argument, so they get the
-  # same segment-delimiter treatment as `;`/`&`/`|` — the option token and
-  # anything after the redirect end up in different segments, and a git
-  # invocation left with nothing before its own segment boundary falls into
-  # the existing "subcommand slot missing" deny-by-default path.
-  segmented="$(printf '%s' "$pre" | sed -E 's/[;&|()`<>]/\n/g')"
+  # H1 (independent review of #157; round 3 of PR#257 round-2 review R2-1
+  # broadened this from a segment-delimiter trick to a real strip): a
+  # `<`/`>` redirect glued directly onto a git global-option token
+  # (`git -P> status push origin main`) made the redirect's TARGET word
+  # read as the subcommand, while bash actually runs `git -P push …`
+  # with stdout redirected to a file named `status`. Splitting on `<`/`>`
+  # like `;`/`&`/`|` fixed THAT shape but broke every other one — a
+  # redirect before git (`>/dev/null git …`), between its global options,
+  # or after the verb cut git away from its own argv into a segment with
+  # nothing recognizable in it. `_cp_strip_redirect_tokens` removes the
+  # operator and its target (attached or the following detached word)
+  # instead, so the segment stays one contiguous run of text with git
+  # and its argv still adjacent, no matter where the redirect sat.
+  pre="$(_cp_strip_redirect_tokens "$pre")"
+  segmented="$(printf '%s' "$pre" | sed -E 's/[;&|()`]/\n/g')"
   out="$(printf '%s\n' "$segmented" | awk '
     # H2 (independent review of #157): grep does NOT belong on this list.
     # git grep -O<cmd> -e . (--open-files-in-pager) runs <cmd> through the
@@ -3614,6 +3702,13 @@ _cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git fails the read-
   pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
   protected="$(_cp_protect_text "$pre")"
   protected="$(printf '%s' "$protected" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
+  # Round 3 (PR#257 round-2 review R2-1): split on `<`/`>` like `;`/`&`/
+  # `|` used to cut git away from its own argv whenever a redirect sat
+  # before/between/after it. `_cp_strip_redirect_tokens` removes the
+  # operator and its target instead, so both loops below split only on
+  # real statement separators and a redirect anywhere never hides git
+  # or its options from either pass. See that function's own header.
+  protected="$(_cp_strip_redirect_tokens "$protected")"
 
   local _cp_geo_execvar=0 _cp_geo_git=0 _cp_geo_source=0 _cp_geo_kind
   while IFS= read -r seg; do
@@ -3625,15 +3720,14 @@ _cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git fails the read-
       git) _cp_geo_git=1; [ "$_cp_geo_source" = 1 ] && _cp_geo_execvar=1 ;;
     esac
   done <<EOF
-$(printf '%s' "$protected" | sed -E 's/[;&|()`<>]/\n/g')
+$(printf '%s' "$protected" | sed -E 's/[;&|()`]/\n/g')
 EOF
   [ "$_cp_geo_execvar" = 1 ] && [ "$_cp_geo_git" = 1 ] && return 0
-
   while IFS= read -r seg; do
     [ -n "${seg//[[:space:]]/}" ] || continue
     _cp_git_seg_exec_unsafe "$seg" && return 0
   done <<EOF
-$(printf '%s' "$protected" | sed -E 's/[;&|()`<>]/\n/g')
+$(printf '%s' "$protected" | sed -E 's/[;&|()`]/\n/g')
 EOF
   return 1
 }
@@ -3839,6 +3933,7 @@ _cp_assign_dequote() {                  # word -> word with ', ", \ removed
 _cp_assign_odd_opt_present() {          # raw -> 0 if export/declare/typeset/local/readonly carries a quoted/escaped option word or a quote-spliced builtin name (minus the safe-flag/safe-name exception)
   local LC_ALL=C LANG=C
   local raw="$1" seg first dq wl word flag name
+  raw="$(_cp_strip_redirect_tokens "$raw")"
   while IFS= read -r seg; do
     seg="${seg#"${seg%%[![:space:]]*}"}"
     [ -n "$seg" ] || continue
@@ -3878,7 +3973,7 @@ _cp_assign_odd_opt_present() {          # raw -> 0 if export/declare/typeset/loc
       esac
     done
   done <<EOF
-$(printf '%s' "$raw" | sed -E 's/[;&|()`<>]/\n/g')
+$(printf '%s' "$raw" | sed -E 's/[;&|()`]/\n/g')
 EOF
   return 1
 }

@@ -3928,6 +3928,161 @@ check "r13 F4 escalate: --no-pager -- leaves no verb" \
   'git --no-pager -- status' escalate
 check "r13 F4 escalate: \$ token right after the skip" \
   'git --no-pager $x status' escalate
+
+echo
+echo "== round 14 (PR#257 round 3, SPEC.md 'remove redirections before ANY" \
+     "git rule'): a redirect leading git, between its global options, or" \
+     "right after the verb must not hide the invocation from any of the" \
+     "checks above =="
+# --- global option hidden by a redirect, every position, -P/--no-pager too
+check "r14 pre: -C hidden by a leading redirect" \
+  '>/dev/null git -C /tmp log' escalate
+check "r14 pre -P: -C hidden by a leading redirect" \
+  '>/dev/null git -P -C /tmp log' escalate
+check "r14 pre --no-pager: -C hidden by a leading redirect" \
+  '>/dev/null git --no-pager -C /tmp log' escalate
+check "r14 between: redirect right after git hides -C" \
+  'git >/dev/null -C /tmp/evilrepo status' escalate
+check "r14 between -P: redirect right after -P hides -C" \
+  'git -P >/dev/null -C /tmp/evilrepo status' escalate
+check "r14 between --no-pager: redirect after --no-pager hides -c" \
+  'git --no-pager 2>&1 -c protocol.ext.allow=always ls-remote ext::id' escalate
+check "r14 pre: --namespace hidden by a leading redirect" \
+  '>/dev/null git --namespace x log' escalate
+check "r14 pre: -p (paginate) hidden by a leading redirect" \
+  '>/dev/null git -p log' escalate
+check "r14 pre: --git-dir/--work-tree hidden by a leading redirect" \
+  '>/dev/null git --git-dir=/tmp/evil/.git --work-tree=/tmp/evil log' escalate
+check "r14 pre doubled: -P then a second redirect still hides -c ext::" \
+  '>/dev/null git -P >/dev/null -c protocol.ext.allow=always ls-remote ext::id' escalate
+check "r14 pre doubled: bare redirect then a second redirect hides -C" \
+  '>/dev/null git >/dev/null -C /tmp/r status' escalate
+check "r14 pre doubled: leading redirect then --no-pager's own redirect" \
+  '>/dev/null git --no-pager 2>&1 -c x log' escalate
+# --- git grep -O / --open-files-in-pager family, pre and postverb
+check "r14 pre: grep -O attached pager cmd" \
+  '>/dev/null git grep -O"touch /tmp/m" -e foo' escalate
+check "r14 postverb: grep -O attached pager cmd" \
+  'git grep >/dev/null -O"touch /tmp/m" -e foo' escalate
+check "r14 pre: grep --open-files-in-pager long form" \
+  '>/dev/null git grep --open-files-in-pager="printf X > /tmp/m" -e foo -- README.md' escalate
+check "r14 postverb: grep --open-files-in-pager long form" \
+  'git grep >/dev/null --open-files-in-pager="printf X > /tmp/m" -e foo -- README.md' escalate
+check "r14 pre: grep --open-files-in-pag abbreviation" \
+  '>/dev/null git grep --open-files-in-pag="touch /tmp/m" -e foo' escalate
+check "r14 postverb: --open-f=x abbreviation on a non-grep verb" \
+  'git log >/dev/null --open-f=x' escalate
+check "r14 pre: grep -nO bundled short opts" \
+  '>/dev/null git grep -nO/bin/true -e foo' escalate
+check "r14 postverb: grep -iO bundled short opts" \
+  'git grep >/dev/null -iO/bin/true -e foo' escalate
+check "r14 pre: grep -Ox attached value" \
+  '>/dev/null git grep -Ox -e foo' escalate
+check "r14 postverb: grep -Ox attached value" \
+  'git grep >/dev/null -Ox -e foo' escalate
+check "r14 postverb: grep option from a shell variable" \
+  'opt="-nO/tmp/x"; git grep >/dev/null "$opt" -e foo -- README.md' escalate
+check "r14 pre: grep option from command substitution" \
+  '>/dev/null git grep "$(printf "%s" "-nO/tmp/x")" -e foo -- README.md' escalate
+check "r14 postverb: grep long option from a shell variable" \
+  'opt="--open-files-in-pager=/tmp/x"; git grep >/dev/null "$opt" -e foo -- README.md' escalate
+# --- -o/--output (diff/show/log), pre and postverb
+check "r14 pre: diff -osrc/x attached output" \
+  '>/dev/null git diff -osrc/git-glued-output' escalate
+check "r14 postverb: show -osrc/x attached output" \
+  'git show >/dev/null -osrc/x HEAD' escalate
+check "r14 postverb: log -o src/x separate value" \
+  'git log >/dev/null -o src/x' escalate
+# --- rule B: -u/--upload-pack runs an arbitrary program, pre and postverb
+check "r14 pre: clone -u runs an arbitrary program" \
+  '>/dev/null git clone -u /tmp/pwned.sh src dst' escalate
+check "r14 postverb: clone -u runs an arbitrary program" \
+  'git clone >/dev/null -u /tmp/pwned.sh src dst' escalate
+check "r14 pre: fetch -u" '>/dev/null git fetch -u origin main' escalate
+check "r14 postverb: ls-remote -u" \
+  'git ls-remote >/dev/null -u /tmp/pwned.sh' escalate
+check "r14 pre: archive --remote --upload-pack long form" \
+  '>/dev/null git archive --remote=origin --upload-pack=/tmp/pwned.sh HEAD' escalate
+# --- r8 item B family (template/difftool/rebase/submodule/bisect/
+#     filter-branch/send-email/mergetool), pre and postverb
+check "r14 pre: clone --template" \
+  '>/dev/null git clone --template=/tmp/tpl src dst' escalate
+check "r14 postverb: rebase -x" \
+  'git rebase >/dev/null -x /tmp/x HEAD~1' escalate
+check "r14 pre: rebase --exec" \
+  '>/dev/null git rebase --exec=/tmp/x HEAD~1' escalate
+check "r14 postverb: submodule foreach" \
+  'git submodule >/dev/null foreach /tmp/x' escalate
+check "r14 pre: bisect run" '>/dev/null git bisect run /tmp/x' escalate
+check "r14 postverb: filter-branch --tree-filter" \
+  'git filter-branch >/dev/null --tree-filter /tmp/x HEAD' escalate
+check "r14 pre: send-email --sendmail-cmd" \
+  '>/dev/null git send-email --sendmail-cmd=/tmp/x --to=a@b m.patch' escalate
+check "r14 pre: mergetool always escalates" '>/dev/null git mergetool' escalate
+check "r14 pre: difftool -x" \
+  '>/dev/null git difftool -y -x /tmp/x HEAD~1' escalate
+# --- r9: git config exec-capable keys, pre and postverb
+check "r14 pre: config key read from a file, two positionals" \
+  '>/dev/null git config "$(cat tmp/keyfile)" /tmp/x; git log' escalate
+check "r14 postverb: config key read from a file, two positionals" \
+  'git config >/dev/null "$(cat tmp/keyfile)" /tmp/x; git log >/dev/null' escalate
+check "r14 pre: config gpg.program" \
+  '>/dev/null git config gpg.program /tmp/x' escalate
+check "r14 postverb: config core.askPass" \
+  'git config >/dev/null core.askPass /tmp/x' escalate
+check "r14 pre: config mergetool cmd" \
+  '>/dev/null git config mergetool.foo.cmd /tmp/x' escalate
+check "r14 postverb: config submodule update" \
+  'git config >/dev/null submodule.foo.update !/tmp/x' escalate
+# --- F4: unknown subcommand, pre
+check "r14 pre: unknown subcommand (possible alias)" '>/dev/null git x' escalate
+check "r14 pre: another unknown subcommand" '>/dev/null git frobnicate' escalate
+# --- r12/r13: --no-pager skip combined with a leading redirect
+check "r14 pre: --no-pager -C /tmp log" \
+  '>/dev/null git --no-pager -C /tmp log' escalate
+check "r14 pre: --no-pager grep -O x" \
+  '>/dev/null git --no-pager grep -O x' escalate
+check "r14 pre: --no-pager --paginate log" \
+  '>/dev/null git --no-pager --paginate log' escalate
+check "r14 pre: config value carries a bare \$" \
+  '>/dev/null git config $a' escalate
+check "r14 postverb: config value carries a bare \$" \
+  'git config >/dev/null $a' escalate
+check "r14 pre: config write after the --no-pager skip" \
+  '>/dev/null git --no-pager config user.email x' escalate
+check "r14 pre: -Pc is not the exact -P token" '>/dev/null git -Pc status' escalate
+check "r14 pre: -P= is not the exact -P token" '>/dev/null git -P= status' escalate
+check "r14 pre: --no-pager= is not the exact token" \
+  '>/dev/null git --no-pager= status' escalate
+check "r14 pre: --no-pag abbreviation not recognized" \
+  '>/dev/null git --no-pag status' escalate
+check "r14 pre: -pP bundled cluster" '>/dev/null git -pP status' escalate
+check "r14 pre: --no-pager -- leaves no verb" \
+  '>/dev/null git --no-pager -- status' escalate
+check "r14 pre: \$ token right after the skip" \
+  '>/dev/null git --no-pager $x status' escalate
+# --- allow spot-checks: an ordinary redirect on an ordinary command must
+#     still allow — the strip removes the redirect, not the command
+check "r14 allow: git status with stdout redirected" \
+  'git status >/dev/null' allow
+check "r14 allow: a non-git command with stderr-to-stdout" \
+  'ls -la 2>&1' allow
+# --- two Part C REGRESS shapes NOT covered here: "backslash inside
+#     subcommand [postverb]" and "split-quoted subcommand [postverb]"
+#     (`git p >/dev/null\ush origin main`, `git pu >/dev/null''sh origin
+#     main`). Traced in .handoffs/PROOF.md#round-4-redirect-strip: the
+#     Part C mutator's own regex only matches up through "p"/"pu", so it
+#     inserts the redirect INSIDE the word meant to read as "push",
+#     between the first letters and the backslash/quote-spliced rest. By
+#     real bash redirect grammar the target word swallows everything
+#     after the operator up to the next real whitespace — there is no
+#     "ush" left over as a separate token, and the mutated command
+#     genuinely no longer invokes `git push`; the real verb is `p`/`pu`.
+#     Adding these as escalate/reserved rows would require a NEW
+#     detection rule unrelated to redirect-stripping (and untested here:
+#     every attempt to execute this file was refused by the sandbox as
+#     human-only). Not added pending Main's call on whether that is in
+#     scope for this PR.
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
