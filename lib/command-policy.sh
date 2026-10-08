@@ -2661,9 +2661,27 @@ _cp_git_config_unsafe() {               # tok... -> 0 if this is a write (not a 
 # this file has no way to read that config today, so the check cannot be
 # added without first giving it one.
 
+# Round 11 (herdr-control#254 round-10 review, probes #194-196): a git
+# argument built from an expansion — `opt="-nO/tmp/x"; git grep "$opt" -e
+# foo -- README.md`, `git grep "$(printf ...)" -e foo -- README.md` — never
+# matches any spelling-specific check above or below (those all match
+# literal option TEXT; `"$opt"` and `"$(...)"` are not that text, they
+# become it only once the shell expands them, after this policy has
+# already judged the command). Rather than try to resolve what an
+# expansion evaluates to (the same "parsing defeats itself" trap round 7
+# gave up on — see `_cp_exec_name_or_opaque_present`'s header), escalate
+# on the SHAPE: ANY token in a git invocation (verb or option/value) that
+# still carries a literal `$` (a plain `$var`/`${var}` reference survives
+# `_cp_protect_text` unchanged — only `$(...)`/backtick command
+# substitution gets replaced, with the marker `@SUB@`) is unsafe, whatever
+# it would expand to. This is broad on purpose (SPEC: "add broad rules, do
+# not enumerate spellings") — `git commit -m '$5 off'` (a literal,
+# single-quoted, never-expanding `$`) escalates too; accepted
+# over-blocking, not a bug.
 _cp_git_unsafe_tokens() {               # token... (everything after the git word) -> 0 if unsafe
   local verb="" tok name opt has_u=0 has_remote=0 has_x=0 sub1=""
   for tok in "$@"; do
+    case "$tok" in *'$'*|*'@SUB@'*) return 0 ;; esac
     if [ -z "$verb" ]; then
       case "$tok" in
         -*) return 0 ;;
@@ -3072,21 +3090,114 @@ _cp_dynamic_assign_name_present() {     # raw -> 0 if an assignment builtin's NA
 # to, without that real target ever appearing as a literal assignment
 # builtin NAME — the exact gap `_cp_dynamic_assign_name_present` above
 # does not cover (its expansion check is on the NAME argument itself,
-# not on a nameref's indirection target). ceiling: this does not try to
-# tell "the nameref target contains an expansion" from "the nameref
-# target is a plain literal" — parsing that apart reopens the same
-# "parsing defeats itself" trap round 7 gave up on (see
-# `_cp_exec_name_or_opaque_present`'s header) — so ANY `-n` nameref
-# escalates unconditionally, including a harmless literal one.
+# not on a nameref's indirection target).
 # `setvar(){ local -n ref="$1"; ref="$2"; }` (probe #175) still
 # escalates too, but not wrongly: it is a FUNCTION DEFINITION, which
 # escalates by design regardless of this rule (round 5,
 # `_cp_gate_function_def_present`) — the round-9 review's own triage
 # confirmed that escalation is correct, not a defect to route around.
+# Round 11 (herdr-control#254 round-10 review, probe #174 over-blocking
+# item): round 10's ceiling above ("ANY `-n` nameref escalates
+# unconditionally, including a harmless literal one") is relaxed, not
+# removed — `declare -n ref=count` (the flag's `NAME=VALUE` is a plain
+# literal: no `$`, no backtick, no quote character in VALUE) now allows.
+# `_CP_NAMEREF_SAFE_RE` requires the EXACT same nameref-flag shape
+# `_CP_NAMEREF_RE` matches, immediately followed by `NAME=` and a VALUE
+# built only from `[A-Za-z0-9_./-]` — any expansion, quoting, or a
+# nameref with no inline value at all (`declare -n ref; ref=$n`) fails
+# this and stays escalating, same as before. ceiling: both regexes are
+# text-anywhere, not position-anchored to the SAME occurrence — a command
+# with two separate nameref statements, one literal and one dynamic,
+# would read as "safe present somewhere" and wrongly allow the dynamic
+# one too. Accepted, same tradeoff this file makes everywhere else
+# (`_cp_exec_name_or_opaque_present`'s own header); not demonstrated by
+# any round-10/11 probe.
 _CP_NAMEREF_RE='(^|[^A-Za-z0-9_])(declare|local|typeset)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*n[A-Za-z]*([[:space:]=]|$)'
-_cp_nameref_present() {                 # raw -> 0 if a declare/local/typeset -n nameref flag is present
+_CP_NAMEREF_SAFE_RE='(^|[^A-Za-z0-9_])(declare|local|typeset)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*n[A-Za-z]*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./-]*([[:space:];&|)]|$)'
+_cp_nameref_present() {                 # raw -> 0 if a declare/local/typeset -n nameref flag targets anything but a static literal
   local LC_ALL=C LANG=C
-  _cp_match "$_CP_NAMEREF_RE" "$1"
+  _cp_match "$_CP_NAMEREF_RE" "$1" || return 1
+  _cp_match "$_CP_NAMEREF_SAFE_RE" "$1" && return 1
+  return 0
+}
+
+# Round 11 (herdr-control#254 round-10 review item 3, probes #183-187):
+# every gate above that looks for a `declare`/`local`/`typeset`/`export`/
+# `readonly` option flag (`_cp_nameref_present`, `_CP_ENVDUMP_OTHER_RE`,
+# `conductor_reserved_reason`'s own `declare -x`/`-p` check, …) requires
+# the literal `-` to sit right at a word boundary — `declare "-n"
+# ref="$n"`, `declare '-n' ref=...`, `declare \-n ref=...` all dequote to
+# the exact same real flag bash actually parses, but the quote/backslash
+# character sitting where the regex expects `-` defeats every one of
+# them. `de''clare "-n" ref=...` goes one step further: bash splices the
+# two empty-quoted halves into the single word `declare` at parse time,
+# so even the BUILTIN NAME itself never appears as contiguous text.
+# `_cp_protect_text` (what every segment-tokenized gate in this file
+# reads) actually REMOVES quote/backslash characters the same way real
+# quote-removal does — meaning by the time a token reaches
+# `_cp_locate_command_word`, a quoted `"-n"` and a bare `-n` are already
+# indistinguishable, too late to catch this. So, like
+# `_cp_dynamic_assign_name_present`/`_cp_nameref_present` above, this
+# works on RAW text, split only on `;`/`&`/`|`/`(`/`)`/backtick/`<`/`>`
+# (the same statement-boundary set `_cp_git_exec_opt_invoked` splits on)
+# — never on whitespace inside a real quoted string, so this can still
+# tell a quote/backslash marking an OPTION from quoting used elsewhere in
+# the same statement.
+# SPEC over-blocking exception: `declare "-x" harmless=/tmp/x` — a quoted
+# option that dequotes to a flag with no `n` in it (not a nameref, the
+# one flag this file treats as dangerous regardless of spelling) AND
+# whose paired NAME is not already exec-capable (`_CP_EXEC_VAR_RE`, or
+# `HOME`/`XDG_CONFIG_HOME`/`PATH`) stays allowed — reuses the SAME
+# exec-capable-name regex `_cp_exec_var_stmt_kind` does, rather than a
+# second list that could drift from it.
+_cp_assign_dequote() {                  # word -> word with ', ", \ removed
+  printf '%s' "$1" | tr -d "\"'\\\\"
+}
+_cp_assign_odd_opt_present() {          # raw -> 0 if export/declare/typeset/local/readonly carries a quoted/escaped option word or a quote-spliced builtin name (minus the safe-flag/safe-name exception)
+  local LC_ALL=C LANG=C
+  local raw="$1" seg first dq wl word flag name
+  while IFS= read -r seg; do
+    seg="${seg#"${seg%%[![:space:]]*}"}"
+    [ -n "$seg" ] || continue
+    local _cp_aoo_noglob=0
+    case $- in *f*) _cp_aoo_noglob=1 ;; esac
+    set -f
+    # shellcheck disable=SC2086
+    set -- $seg
+    [ "$_cp_aoo_noglob" = 1 ] || set +f
+    [ "$#" -gt 0 ] || continue
+    first="$1"
+    dq="$(_cp_assign_dequote "$first")"
+    case "$dq" in
+      export|declare|typeset|local|readonly) ;;
+      *) continue ;;
+    esac
+    [ "$dq" = "$first" ] || return 0
+    wl="$dq"
+    shift
+    while [ "$#" -gt 0 ]; do
+      word="$1"
+      case "$word" in
+        -*) shift; continue ;;
+        \"-*|\'-*|\\-*)
+          flag="$(_cp_assign_dequote "$word")"
+          case "$flag" in
+            -*)
+              shift
+              name="${1%%=*}"
+              case "$flag" in *n*) return 0 ;; esac
+              if [[ "$name" =~ $_CP_EXEC_VAR_RE ]]; then return 0; fi
+              case "$name" in HOME|XDG_CONFIG_HOME|PATH) return 0 ;; esac
+              shift; continue ;;
+          esac
+          shift; continue ;;
+        *) break ;;
+      esac
+    done
+  done <<EOF
+$(printf '%s' "$raw" | sed -E 's/[;&|()`<>]/\n/g')
+EOF
+  return 1
 }
 
 # `_cp_unquoted_text <raw>` -> prints RAW with every quoted span (single,
@@ -4403,31 +4514,50 @@ EOF
 }
 
 # `_cp_ln_git_source_present <raw>` -> 0 (true) when RAW's `ln`/`ln -s`
-# names a SOURCE argument under a `.git/` directory, or at `.gitconfig` —
-# Round 10 (herdr-control#254 PR comment, round-9 review item 2, probes
-# #176-178): `.git/config`'s own write target is already closed by
+# names a SOURCE argument that mentions `.git` anywhere (case-insensitive,
+# any position — a bare `.git` directory, `.GIT/config`, `$repo/.git`), or
+# whose source argument carries an expansion at all — Round 10
+# (herdr-control#254 PR comment, round-9 review item 2, probes #176-178):
+# `.git/config`'s own write target is already closed by
 # `_cp_git_dir_write_present` above, but a hardlink or symlink planted
 # FROM `.git/config` TO an outside path (`ln .git/config /tmp/cfgcopy`,
 # `ln -s .git/config /tmp/cfgcopy`) lets a later, completely ordinary-
 # looking write to the OUTSIDE path (`echo pager=/tmp/x >> /tmp/cfgcopy`)
 # land in the real git config — the write target that command names is
 # `/tmp/cfgcopy`, nowhere near `.git/`, so no TARGET-based rule ever
-# sees it. Reuses `bash_write_targets`'s own `LNSRC` lines (same
-# resolution as `TARGET`: cwd-joined, cd-adjusted, lexically collapsed)
-# rather than a second argv/option parser — see that function's header
-# for the kind contract. `cwd="."` for the same reason
-# `_cp_git_dir_write_present` uses it: no worktree boundary to resolve
-# against, this gate fires on the SOURCE PATH itself.
-_cp_ln_git_source_present() {           # raw -> 0 if an ln SOURCE argument is under .git/ or at .gitconfig
+# sees it. Round 11 (herdr-control#254 round-10 review, probes #188,
+# #189, #191, #192): the old exact `*/.git/*|*/.gitconfig` match missed a
+# bare `.git` DIRECTORY itself as the whole source argument (no trailing
+# `/something`), a case-variant spelling (`.GIT/config` — the filesystem
+# is case-insensitive on this box, same `.git` either way), and a
+# dynamically-prefixed one (`repo=...; ln -s "$repo/.git" ...` —
+# `bash_write_targets` never evaluates `$repo`, so the resolved val keeps
+# the literal text, and a plain substring match still finds `.git` in it
+# regardless). Fixed with a broad, case-insensitive, any-position
+# substring match instead of an exact suffix — SPEC: "add broad rules, do
+# not enumerate spellings"; `foo.gitignore` as an ln source also
+# escalates now, an accepted over-block, not a bug. SPEC also calls for
+# escalating ANY `ln` SOURCE argument carrying an expansion at all, `.git`
+# or not — same `$`/`@SUB@` shape rule 1 uses for git arguments (see
+# `_cp_git_unsafe_tokens`'s own header), reused here rather than
+# re-deriving it: an `ln` source built at runtime can point anywhere,
+# `.git` included, in a way no static text match will ever enumerate.
+# Reuses `bash_write_targets`'s own `LNSRC` lines (same resolution as
+# `TARGET`: cwd-joined, cd-adjusted, lexically collapsed) rather than a
+# second argv/option parser — see that function's header for the kind
+# contract. `cwd="."` for the same reason `_cp_git_dir_write_present`
+# uses it: no worktree boundary to resolve against, this gate fires on
+# the SOURCE PATH itself.
+_cp_ln_git_source_present() {           # raw -> 0 if an ln SOURCE argument mentions .git (any case/position) or carries an expansion
+  local LC_ALL=C LANG=C
   local raw="$1" line kind val
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     kind="${line%%$'\t'*}"
     val="${line#*$'\t'}"
     [ "$kind" = LNSRC ] || continue
-    case "$val" in
-      */.git/*|*/.gitconfig) return 0 ;;
-    esac
+    _cp_imatch '\.git' "$val" && return 0
+    case "$val" in *'$'*|*'@SUB@'*) return 0 ;; esac
   done <<EOF
 $(bash_write_targets "$raw" ".")
 EOF
@@ -4895,6 +5025,14 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   # `_cp_nameref_present`'s own header, just above `_cp_unquoted_text`.
   _cp_nameref_present "$raw" &&
     _cp_consider 1 "declare/local/typeset -n creates a nameref — it can write through an indirectly-bound variable whose real target never appears as a literal assignment name"
+
+  # escalate — round 11 (herdr-control#254 round-10 review item 3): an
+  # assignment builtin (export/declare/typeset/local/readonly) with a
+  # quoted/escaped option word, or a quote-spliced builtin name. See
+  # `_cp_assign_odd_opt_present`'s own header, just above
+  # `_cp_unquoted_text`.
+  _cp_assign_odd_opt_present "$raw" &&
+    _cp_consider 1 "export/declare/typeset/local/readonly carries a quoted or backslash-escaped option word, or the builtin name itself is quote-spliced — this defeats every flag-spelling check in this file the same way bash itself still parses the real flag"
 
   # escalate — round 9 (herdr-control#254 PR comment, round-8 review item
   # B.2): a write target landing under `.git/` (most commonly
