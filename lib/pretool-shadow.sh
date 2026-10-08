@@ -62,13 +62,25 @@ _ps_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_ps_dir/scoped-policy.sh"
 . "$_ps_dir/pane-guard.sh"
 . "$_ps_dir/action-request.sh"
-. "$_ps_dir/owner-identity.sh"
+# owner-identity.sh is sourced lazily, on first use inside _ps_owner_identity
+# (--owner is the opt-in minority path; sourcing it unconditionally here cost
+# every plain worker's shadow-record call a file read for functions it never
+# calls — perf fix for verify-pretool-shadow.sh's bash/eval timing budget).
 
 # Hook-approval reservations join the ONE policy through its own operator-rule
 # channel (lib/hook-approval-rules.tsv: tighten-only; a match is human-only).
 # Without them a hook worker's bash could write the registry or a decision form
 # and approve its own request, so enforce mode refuses when they are missing.
-_PS_RULES="$(grep -v '^#' "$_ps_dir/hook-approval-rules.tsv" 2>/dev/null)"
+# Pure-bash filter (no `grep` fork): this runs on EVERY invocation of this
+# file, including the detached shadow-record spawn for every single worker
+# tool call, so one fewer subprocess here is one fewer per call.
+_PS_RULES=""
+while IFS= read -r _ps_rule_line || [ -n "$_ps_rule_line" ]; do
+  case "$_ps_rule_line" in '#'*) continue ;; esac
+  _PS_RULES="${_PS_RULES:+$_PS_RULES
+}$_ps_rule_line"
+done < "$_ps_dir/hook-approval-rules.tsv" 2>/dev/null
+unset _ps_rule_line
 if [ -n "$_PS_RULES" ]; then
   HERDR_POLICY_EXTRA_RULES="${HERDR_POLICY_EXTRA_RULES:+$HERDR_POLICY_EXTRA_RULES
 }$_PS_RULES"
@@ -174,6 +186,7 @@ _ps_identity() {
 # owner has no worktree, manifest or ownership grant, so peer_decide judges
 # its commands on their text alone (the unregistered-pane case it already has).
 _ps_owner_identity() {
+  command -v owner_identity_db >/dev/null 2>&1 || . "$_ps_dir/owner-identity.sh"
   PS_TASK_JSON=""
   local label="${HERDR_OWNER_APPROVAL:-}" sid="${HERDR_OWNER_SESSION_ID:-}" pane="${HERDR_PANE_ID:-}"
   local db row fields st r_pane r_birth r_sid live
