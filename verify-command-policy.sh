@@ -2888,6 +2888,73 @@ check "r10 ln B3: relative hardlink, no quotes, common agent shape" \
   'ln .git/config /tmp/cfgcopy; echo "[core]" > /tmp/cfgcopy; echo "pager = /tmp/x" >> /tmp/cfgcopy; git log' escalate
 check "r10 ln negative: ln -s ../shared lib/shared (source outside .git/)" \
   "ln -s ../shared lib/shared" allow
+
+echo
+echo "== round 11 (herdr-control#254 round-10 review, 182/197 pass comment):" \
+     "closing the 15 round-10 probe failures =="
+
+# Rule 1 (SPEC): expansion in git's arguments. Probes #194-196.
+check "r11 rule1: git grep option from a variable" \
+  'opt="-nO/tmp/x"; git grep "$opt" -e foo -- README.md' escalate
+check "r11 rule1: git grep option from command substitution" \
+  'git grep "$(printf "%s" "-nO/tmp/x")" -e foo -- README.md' escalate
+check "r11 rule1: git grep long option from a variable" \
+  'opt="--open-files-in-pager=/tmp/x"; git grep "$opt" -e foo -- README.md' escalate
+
+# Rule 2 (SPEC): ln and .git — case-insensitive, any position, bare
+# directory, dynamic prefix, plus any ln argument carrying an expansion.
+# Probes #188, #189, #191, #192.
+check "r11 rule2: ln source is the bare .git directory itself (absolute)" \
+  'ln -s "/tmp/herdr-r11-repo/.git" "/tmp/herdr-r11-gitdir-link" 2>/dev/null; printf "[core]\nsshCommand = /tmp/x\n" > "/tmp/herdr-r11-gitdir-link/config"; git log' escalate
+check "r11 rule2: ln source is the bare .git directory, relative" \
+  'ln -s .git /tmp/herdr-r11-gitdir-link2 2>/dev/null; printf "[core]\npager = /tmp/x\n" > /tmp/herdr-r11-gitdir-link2/config; git log' escalate
+check "r11 rule2: ln source is a dynamically-prefixed .git directory" \
+  'repo="/tmp/herdr-r11-repo"; ln -s "$repo/.git" "/tmp/herdr-r11-dynamic-link" 2>/dev/null; printf "[core]\npager = /tmp/x\n" > "/tmp/herdr-r11-dynamic-link/config"; git log' escalate
+check "r11 rule2: ln source is a case-variant .GIT/config" \
+  'ln "/tmp/herdr-r11-repo/.GIT/config" "/tmp/herdr-r11-case-link" 2>/dev/null; printf "[core]\nsshCommand = /tmp/x\n" > "/tmp/herdr-r11-case-link"; git log' escalate
+
+# Rule 3 (SPEC): assignment builtins with odd options. Probes #183-187
+# (escalate) and #174 (allow, over-blocking fix).
+check "r11 rule3: quoted declare -n option" \
+  'n="$(printf "\x47\x49\x54\x5f\x50\x41\x47\x45\x52")"; declare "-n" ref="$n"; export ref; ref=/tmp/x; git log' escalate
+check "r11 rule3: single-quoted declare -n option" \
+  "n=\"\$(printf \"\x47\x49\x54\x5f\x50\x41\x47\x45\x52\")\"; declare '-n' ref=\"\$n\"; export ref; ref=/tmp/x; git log" escalate
+check "r11 rule3: escaped declare -n option" \
+  'n="$(printf "\x47\x49\x54\x5f\x50\x41\x47\x45\x52")"; declare \-n ref="$n"; export ref; ref=/tmp/x; git log' escalate
+check "r11 rule3: quote-spliced declare command" \
+  'n="$(printf "\x47\x49\x54\x5f\x50\x41\x47\x45\x52")"; de'"''"'clare "-n" ref="$n"; export ref; ref=/tmp/x; git log' escalate
+check "r11 rule3 negative: quoted declare -x still escalates (pre-existing secrets rule, not r11)" \
+  'declare "-x" harmless=/tmp/x; printf "%s\n" "$harmless"' escalate
+# `_CP_ENVDUMP_OTHER_RE` (lib/command-policy.sh, "env dumps that never
+# spell env/printenv") matches ANY `declare -x`/`typeset -x`/`-p`
+# regardless of quoting or of an assignment following it — a pre-existing,
+# unrelated rule this file's own `_cp_env_dump_invoked`/secrets gate
+# fires on before r11's exception logic is ever reached. Proving the r11
+# Rule 3 exception itself needs a flag that isn't also an env-dump
+# trigger: `-r` (readonly) is safe (no `n`, no `x`/`p`) and `harmless` is
+# not exec-capable.
+check "r11 rule3 negative: quoted declare -r, safe flag/name, stays allow" \
+  'declare "-r" harmless=/tmp/x; printf "%s\n" "$harmless"' allow
+
+# Over-blocking fixes (SPEC): #174 relaxed, #175/#182 left escalating on
+# purpose (accepted ceilings, not bugs).
+check "r11 over-block: declare -n ref=count (static literal target)" \
+  'declare -n ref=count; count=0; ref=5; printf "%s\n" "$count"' allow
+check "r11 ceiling: local -n generic setvar helper still escalates (function def)" \
+  'setvar(){ local -n ref="$1"; ref="$2"; }; setvar out hello; printf "%s\n" "$out"' escalate
+check "r11 ceiling: git config --get-all alias.x still escalates (accepted false positive)" \
+  "git config --get-all alias.x" escalate
+
+# Acceptance (SPEC): plain read-only git, and the three commands this
+# worker must self-classify before asking.
+check "r11 acceptance: ls -la" "ls -la" allow
+check "r11 acceptance: git status" "git status" allow
+check "r11 acceptance: ln -s ../shared lib/shared" "ln -s ../shared lib/shared" allow
+check "r11 baseline: git status --short" "git status --short" allow
+check "r11 baseline: git log --oneline" "git log --oneline -1" allow
+check "r11 baseline: git diff" "git diff HEAD -- README.md" allow
+check "r11 baseline: git show" "git show --format=oneline --no-patch HEAD" allow
+check "r11 baseline: git grep -e" "git grep -e foo -- README.md" allow
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
