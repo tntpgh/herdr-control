@@ -30,6 +30,9 @@
 // this extension never adopts Firstmate's approval-bypass posture. A session
 // that is not a registered worker (Main, a conductor, Terrence's own) never
 // reaches the write-scope guard at all.
+// The one exception is opt-in and off: a session launched with
+// HERDR_OWNER_APPROVAL=<label> is judged call by call against a human-made
+// owner record (enforceOwnerApproval; docs/design/pretool-approval.md §13).
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, type Stats, writeFileSync } from "node:fs";
@@ -936,11 +939,17 @@ function readOnlyChildBlock(event: unknown, ctx?: unknown): Block | undefined {
 function onToolCall(event: unknown, ctx?: unknown): Block | undefined {
   cacheBashInput(event);
   const result = readOnlyChildBlock(event, ctx) ?? pretoolRegistrationBlock(event) ?? workerWriteScopeBlock(event, ctx);
+  // Owner mode (design §13) is opted into only by the launch-time label; a
+  // session without it never reaches this branch.
+  if (LOAD_OWNER_LABEL) return result ?? enforceOwnerApproval(event, ctx);
   if (result || !hookApprovalEnforced()) {
     recordShadowVerdict(event, ctx, result);
     return result;
   }
-  return enforceHookApproval(event, ctx);
+  return runEnforcingCheck(event, ctx, ["--enforce", "--record"], shadowEnv(), (why) => ({
+    block: true,
+    reason: `herdr hook-approval: refused — ${why}. Nothing ran; tell your conductor. Do not retry it through another tool.`,
+  }));
 }
 
 // SHADOW MODE (docs/design/pretool-approval.md): for a registered worker only,
@@ -1101,19 +1110,24 @@ function hookApprovalEnforced(): boolean {
   }
 }
 
-function enforceHookApproval(event: unknown, ctx: unknown): Block | undefined {
-  const refuse = (why: string): Block => ({
-    block: true,
-    reason: `herdr hook-approval: refused — ${why}. Nothing ran; tell your conductor. Do not retry it through another tool.`,
-  });
+// Runs lib/pretool-shadow.sh synchronously on the exact input and turns its
+// one-line answer into the hook's. Any failure — a missing lib, a timeout,
+// garbage output, an exception — BLOCKS: fail closed.
+function runEnforcingCheck(
+  event: unknown,
+  ctx: unknown,
+  args: string[],
+  env: Record<string, string | undefined>,
+  refuse: (why: string) => Block,
+): Block | undefined {
   try {
     if (!safeExists(PRETOOL_SHADOW_SH)) return refuse("the pre-tool check (lib/pretool-shadow.sh) is missing");
-    const r = spawnSync("bash", [PRETOOL_SHADOW_SH, "--enforce", "--record"], {
+    const r = spawnSync("bash", [PRETOOL_SHADOW_SH, ...args], {
       input: shadowPayload(event, ctx, undefined),
       encoding: "utf8",
       timeout: 20_000,
       stdio: ["pipe", "pipe", "pipe"],
-      env: shadowEnv(),
+      env,
     });
     if (r.error) return refuse(`the pre-tool check failed (${r.error.message})`);
     const line = (r.stdout ?? "").trim().split("\n").pop() ?? "";
@@ -1129,6 +1143,42 @@ function enforceHookApproval(event: unknown, ctx: unknown): Block | undefined {
   } catch (error) {
     return refuse(`the pre-tool check threw (${error instanceof Error ? error.message : String(error)})`);
   }
+}
+
+// ---- owner/conductor hook approval (docs/design/pretool-approval.md §13) ----
+// OPT-IN and off: only a session launched with HERDR_OWNER_APPROVAL=<label>
+// is judged here, and nothing in this repo sets that variable. The label is
+// read ONCE, at module load, so the session cannot shed it later; it only
+// TIGHTENS — it turns the check on, and the check then allows a call only when
+// the owner record (owner-approval.sh, human-only) binds this label to this
+// pane, this pane's live generation, and THIS omp session id, read from
+// ctx.sessionManager (never from env or the payload). Every tool call — eval,
+// write and edit included — goes through lib/pretool-shadow.sh --owner; an
+// unproven identity refuses every call; omp's own approval layer still runs
+// after an allow. A session carrying both a worker task and an owner label is
+// refused by the lib. Subagents run as their own sessions, so their calls do
+// not match the owner's session and are refused.
+const LOAD_OWNER_LABEL = process.env.HERDR_OWNER_APPROVAL?.trim() ?? "";
+
+function sessionIdOf(ctx: unknown): string {
+  try {
+    const sm = ctx && typeof ctx === "object" ? (ctx as Record<string, unknown>).sessionManager : undefined;
+    const get = sm && typeof sm === "object" ? (sm as Record<string, unknown>).getSessionId : undefined;
+    const id = typeof get === "function" ? (get as (this: unknown) => unknown).call(sm) : undefined;
+    return typeof id === "string" ? id.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function enforceOwnerApproval(event: unknown, ctx: unknown): Block | undefined {
+  const env = shadowEnv();
+  env.HERDR_OWNER_APPROVAL = LOAD_OWNER_LABEL;
+  env.HERDR_OWNER_SESSION_ID = sessionIdOf(ctx);
+  return runEnforcingCheck(event, ctx, ["--enforce", "--owner", "--record"], env, (why) => ({
+    block: true,
+    reason: `herdr owner-approval: refused — ${why}. Nothing ran; tell Terrence. Do not retry it through another tool.`,
+  }));
 }
 
 function onApprovalRequested(event: unknown): undefined {

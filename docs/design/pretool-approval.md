@@ -505,3 +505,152 @@ default and for any task that reads untrusted input (starting point:
 might work, but we'd have to be mindful of how our system works. Like the idea
 of getting better at our security with this." The 5-day shadow gate (§10 q1)
 still applies to any canary.
+
+## 13. Long-lived owner/conductor identity (built OFF, 2026-10-07)
+
+Status: **inert.** Code, store, CLI and tests exist; nothing sets the opt-in,
+nothing calls the registration path, no default changed. Activation needs a
+reviewed owner decision (below).
+
+**Why.** §5/§11 cover only spawned tasks: identity is the registry row
+`spawn-task.sh` stamped. An ordinary long-lived pane (Main, a conductor) has
+no row, so nothing judges its exact input. Incident
+`.handoffs/incidents/2026-10-07-mnemopi-cursor-bypass.md` (pane w72:p3): a
+`bash` call was denied twice, then `eval` wrote
+`~/.omp/agent/notepad-mnemopi-sync-cursors.json` — §3's `eval` row, from a
+pane §3 does not cover.
+
+**Identity: three facts, all required.** A row in
+`$(run_state_root)/owner-identities.sqlite3` (`lib/owner-identity.sh`) binds an
+owner label to:
+- `pane_id` — the herdr pane;
+- `pane_birth` — that pane's herdr `terminal_id` at registration, the same
+  generation `_ps_identity` (`lib/pretool-shadow.sh:130`) and
+  `_ha_conductor_ok` (`herdr-action.sh:112`) compare against
+  `pane_birth_now` (`lib/pane-guard.sh:85`). A later process in a recycled
+  pane id has a different birth;
+- `session_id` — the running omp session's own id, read by the hook from
+  `ctx.sessionManager.getSessionId()` (`omp://extensions.md`), never from env
+  or the payload. `/new`, `/resume` or a relaunch is a different identity.
+
+The existing `owners` table (`register-owner.sh`, `lib/run-registry.sh:1586`)
+is NOT reused: it is a remote-MCP routing registry that any caller may
+(re)write with `INSERT OR REPLACE` and that carries no session binding. A
+separate file also means no registry migration: the store does not exist
+until a human registers the first owner, and the enforcing check only reads it.
+
+Rows are never deleted. Revoke flips `state` to `revoked`; re-registering a
+label adds a new row; the check reads the label's newest row. Partial unique
+indexes allow at most one ACTIVE row per label, per pane and per session, so
+racing registrations of one pane land exactly once.
+
+**Opt-in and env only tightens.** The hook (`agent-hooks/omp-herdr-control.ts`
+`LOAD_OWNER_LABEL`, `onToolCall` at :939) engages owner mode only when the
+session was launched with `HERDR_OWNER_APPROVAL=<label>`, read once at module
+load. Like `HERDR_APPROVAL=hook` (§11), the label turns the check on and can
+never admit a call: admission needs the record. A session without the label
+takes exactly origin/main's path (proved below). A session with both a worker
+task and an owner label is refused. The record cannot engage owner mode by
+itself: a session the human launched without the label is that human's
+choice of posture, and the label is what makes the session unable to shed it.
+
+**Gate, then the existing classifier.** `lib/pretool-shadow.sh --enforce
+--owner` runs `pretool_decide` unchanged except for its first step:
+`_ps_identity` dispatches to `_ps_owner_identity` (:176). Every failure sets
+`PS_POLICY=identity` through the same `_ps_id_fail` (:128), and
+`pretool_owner_enforce` (:789) answers with the same sentence the worker
+branch uses (`_ps_identity_refusal`, :773): *"…cannot prove this session is
+the live registered owner '<label>', so nothing runs. Stop and tell
+Terrence."* Refused, never allowed: no store, unreadable/corrupt store,
+unknown label, malformed label, revoked (checked every call, no cache — a
+revoke lands on the next call), wrong pane, recycled or vanished pane, session
+mismatch, missing session id, worker+owner env. The refusal names the
+session id and pane so the human can register it; it never shows the
+registered session id.
+
+After identity, the verdict is the §3 table and `peer_decide` with an empty
+task JSON (the unregistered-pane case `peer_decide` already has,
+`lib/scoped-policy.sh:529-533`). Two tightenings, owner-only, at the end of
+`pretool_decide` (:694); both can only turn `allow` into `escalate`:
+- `containment-159` allows (edit/write/notepad/local://) lean on the #159
+  guard, which runs for spawned workers only → escalate (`owner-scope`).
+- a command `peer_decide` allowed (bash, a job's stdin, `hub start`) must pass
+  the read-only closed world. `classify_command` with no worktree allows
+  `python3 -c "open(p,'w')…"`, `node -e writeFileSync`, `echo > p` and `cp`;
+  for a worker the #184 write-target guard contains those, for an owner
+  nothing would. The closed world is the existing F3 one, generalized rather than
+  copied: `_ps_bash_closed_world_verdict` (:382, formerly
+  `_ps_bash_handoffs_verdict`) with an empty `hw` means "no write scope" —
+  every segment's command word on `_PS_HW_SAFE`, read-only git verbs only, no
+  command substitution, and any write target escalates. Worker reasons are
+  byte-identical. Exec-capable git options (`git grep -O`/
+  `--open-files-in-pager`, clustered or abbreviated, `--ext-diff`,
+  `--textconv`, `--output`, …; the PR #251 review's HIGH finding) are refused
+  by #254's shared gate — `_cp_git_unsafe_tokens` and
+  `_cp_exec_name_or_opaque_present` (lib/command-policy.sh), which
+  `peer_decide` runs for every session and the closed world calls again —
+  so owner mode carries no git option list of its own. One rule stays in the
+  closed world, because no shared gate sees it: a find/rg/git argument
+  holding an expansion (`$X`, `${X}`, `$'…'`, a backtick) escalates, since
+  the shell resolves it after the check (`git grep $X`, X=`-O<cmd>`). A bare
+  `$` regex anchor is not an expansion.
+
+Answers: `allow` runs (omp's own approval layer still applies after it);
+`escalate`/`reserved` are blocked as Terrence's call ("stop and ask him"),
+with no action request and no registry write; `deny`/`block` (eval, python,
+browser, debug, paid APIs) are blocked. Verdicts are audited in the owner
+store's `owner_events` (with the session id), never in the shadow store's
+worker rows.
+
+**Registration is human-only.** `owner-approval.sh register <label> <pane>
+<session>` / `revoke <label> --reason <why>` refuse (exit 9, audited as
+`register_refused`/`revoke_refused`) unless: no `HERDR_TASK_ID`/`HERDR_RUN_ID`/
+`HERDR_OWNER_APPROVAL`; the caller's pane is not the target and is not running
+an agent (`pane_is_agent`); stdin is a terminal; no ancestor process is a
+known agent (`lib/agent-profiles.sh` names, so an agent's bash with a pty is
+still refused); and the label is typed back. Inside an enforced session the
+policy refuses first: `lib/hook-approval-rules.tsv` adds the store, its
+tables, `owner-approval.sh`, `owner-identity.sh` and
+`HERDR_OWNER_APPROVAL`/`HERDR_OWNER_SESSION_ID` to the human-only list; the
+write/edit tools are owner-scope; eval is blocked. Residual (§12, unchanged):
+a same-uid process that double-forks away from its agent and fakes a
+terminal can still write the store. Isolation (#172) is what closes it.
+
+**Proof** (`verify-owner-approval.sh`, 124 checks): missing store, unknown and
+malformed labels, recycled/vanished/wrong pane, session mismatch and missing
+session, worker+owner env, revoke mid-session (and the revoked session stays
+out after the label is re-bound), garbage/table-less/mode-000 store and a row
+with no birth, a spoofed "approved" pane screen plus approval-shaped payload
+fields and env (herdr is only ever asked `pane list`), seven owner-mode
+self-registration/elevation commands plus write/edit/eval on the store, every
+CLI guard, 14 bash write/exec shapes including the incident's interpreter
+write, 30 parallel checks from two sessions on one pane (15/15 and 0/15), 12
+racing registrations (exactly one lands), revoke racing 16 checks, and the
+hook: ctx session id required (env never substitutes, a throwing session
+manager refuses), `--auto-approve` with no store refuses everything, missing
+lib refuses, and a session without the label returns origin/main's answers
+exactly (non-worker and menu worker).
+
+**Deliberately not built (decisions for activation):**
+1. *Answering owner escalations.* Today they are blocked for Terrence to run
+   himself. A grant path would reuse `action_requests` with the human route,
+   keyed to the owner label instead of a task row; that touches the hub tick
+   and `herdr-action.sh`, so it waits for the decision.
+2. *An owner write scope.* None today: every file mutation and every
+   non-read bash escalates. A per-owner allowlist of writable roots is the
+   obvious extension.
+3. *Subagents.* A child session has its own id, so its calls are refused.
+   Binding children to the parent session is possible but widens the identity.
+4. *Launch posture.* With the label and omp's menu, owner mode only removes
+   calls. With `--auto-approve`, the hook is the only check. Which one is a
+   posture decision.
+
+**Activation step (NOT taken by this change).**
+1. Terrence decides the four items above (hub form, `rule://conductor-decisions`).
+2. Launch the owner's omp with `HERDR_OWNER_APPROVAL=<label>` (posture per
+   item 4). Every call is refused until step 3, and the refusal shows
+   `this session is <id> in pane <pane>`.
+3. From a plain terminal (not an agent pane):
+   `owner-approval.sh register <label> <pane> <session>`, then type the label.
+4. Rollback: `owner-approval.sh revoke <label> --reason <why>` (the session
+   is then refused, never unenforced), then relaunch without the label.
