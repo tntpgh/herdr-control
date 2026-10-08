@@ -3067,6 +3067,138 @@ check "r11 baseline: git log --oneline" "git log --oneline -1" allow
 check "r11 baseline: git diff" "git diff HEAD -- README.md" allow
 check "r11 baseline: git show" "git show --format=oneline --no-patch HEAD" allow
 check "r11 baseline: git grep -e" "git grep -e foo -- README.md" allow
+
+# ---------------------------------------------------------------------------
+# PR #261 round 2 (review CHANGES, worktree review/pr-261 .handoffs/REVIEW.md):
+# every probe row the review flagged WEAKER/FAIL becomes a test here, with
+# the verdict the review wants (`tmp/main-probes.out` section A/C in that
+# worktree has the raw probe matrix this was measured against).
+
+# H1 — find only examined its FIRST -exec/-execdir/-ok/-okdir clause; a
+# safe clause ahead of an unsafe one hid the unsafe one completely. Fixed
+# by walking every clause (lib/command-policy.sh's `find)` case now loops
+# `_cp_wrap_find_exec_verb` instead of calling it once).
+check "r2 H1: safe first clause no longer hides an unsafe second clause (-C)" \
+  "find . -maxdepth 0 -exec true \\; -exec git -C /tmp/evilrepo status \\;" escalate
+check "r2 H1: safe first clause no longer hides an unsafe second clause (ext::)" \
+  "find . -maxdepth 0 -exec true \\; -exec git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "r2 H1: a git-reading first clause no longer hides an unsafe second git clause" \
+  "find . -maxdepth 0 -exec git log \\; -exec git -C /tmp/evilrepo status \\;" escalate
+check "r2 H1: all-safe clauses still allow (no over-blocking from the new loop)" \
+  "find . -maxdepth 0 -exec git log \\; -exec git log -1 \\;" allow
+
+# H2 — a generic launcher or second wrapper in front of git inside a wrap
+# tail was never re-unwrapped; `_cp_wrap_tail_unsafe` now re-enters
+# `_cp_git_seg_exec_unsafe` on anything that isn't git itself, so a nested
+# launcher/wrapper gets the full judgment again (depth-capped).
+check "r2 H2: find -exec wraps nice wraps git -C" \
+  "find . -maxdepth 0 -exec nice git -C /tmp/evilrepo status \\;" escalate
+check "r2 H2: nice find -exec wraps script wraps git -C (the exact SPEC shape)" \
+  "nice find . -maxdepth 0 -exec script -q /dev/null git -C /tmp/evilrepo status \\;" escalate
+check "r2 H2: script wraps nice wraps git -C" \
+  "script -q /dev/null nice git -C /tmp/evilrepo status" escalate
+check "r2 H2: script wraps arch wraps git -C" \
+  "script -q /dev/null arch -arm64 git -C /tmp/evilrepo status" escalate
+check "r2 H2: arch wraps nice wraps git -C" \
+  "arch -arm64 nice git -C /tmp/evilrepo status" escalate
+check "r2 H2: arch wraps script wraps git -C" \
+  "arch -arm64 script -q /dev/null git -C /tmp/evilrepo status" escalate
+check "r2 H2: xcrun wraps nice wraps git -C" \
+  "xcrun nice git -C /tmp/evilrepo status" escalate
+check "r2 H2: xcrun wraps arch wraps git -C" \
+  "xcrun arch -arm64 git -C /tmp/evilrepo status" escalate
+check "r2 H2: nested-safe still allows (no over-blocking from the new recursion)" \
+  "script -q /dev/null nice git log" allow
+
+# H3 — xcrun's -f/--find and -r/--run are a MODE, not independently final;
+# the LAST one on the line wins. The old extractor returned the moment it
+# saw -f/--find, so a later -r/--run silently never ran.
+check "r2 H3: xcrun -f -r — -r wins, the git call underneath still judged" \
+  "xcrun -f -r git -C /tmp/evilrepo status" escalate
+check "r2 H3: xcrun --find --run — long spelling, -run wins" \
+  "xcrun --find --run git -C /tmp/evilrepo status" escalate
+check "r2 H3: xcrun -l -f -r — unrelated flag between find/run doesn't confuse mode tracking" \
+  "xcrun -l -f -r git -C /tmp/evilrepo status" escalate
+check "r2 H3: xcrun -f -r with a safe git call stays allow (not blanket escalate)" \
+  "xcrun -f -r git log" allow
+
+# H4 — an unreadable wrapped command word ($VAR) fell through to "not
+# git" instead of failing closed, the same way {}/empty already did.
+check "r2 H4: find -exec \$VAR fails closed" \
+  "find . -maxdepth 0 -exec \$G -C /tmp/evilrepo status \\;" escalate
+check "r2 H4: script \$VAR fails closed" \
+  "script -q /dev/null \$G -C /tmp/evilrepo status" escalate
+check "r2 H4: arch \"\$VAR\" (quoted) fails closed" \
+  "arch -arm64 \"\$G\" -C /tmp/evilrepo status" escalate
+check "r2 H4: xcrun \$VAR fails closed" \
+  "xcrun \$G -C /tmp/evilrepo status" escalate
+
+# M1 — find's clause loop used to stop a clause at ANY bare `+`; real find
+# ends a clause at `+` only when `+` directly follows a literal `{}` word.
+check "r2 M1: a bare + mid-clause is an ordinary argument, not a terminator" \
+  "find . -maxdepth 0 -exec git grep -e foo + -O/tmp/evil.sh \\;" escalate
+check "r2 M1: {} + is still recognized as the real terminator (no regression)" \
+  "find . -exec grep -lF needle {} +" allow
+
+# M2 — script/chroot with NO trailing command run \$SHELL/the login shell;
+# an ahead-of-it SHELL= assignment is unsafe even though no command word
+# is present to judge.
+check "r2 M2: SHELL= ahead of a command-less script escalates" \
+  "SHELL=/tmp/evil.sh script -q /dev/null" escalate
+check "r2 M2: a command-less script with no SHELL= override stays allow" \
+  "script -q /dev/null" allow
+
+# L1 — real xcrun also accepts single-dash long spellings (-sdk,
+# -toolchain, -find, -run, -log); the old table only had the double-dash
+# forms and over-blocked these with a misleading git-option reason.
+check "r2 L1: xcrun -find (single-dash) is read-only, allows" \
+  "xcrun -find clang" allow
+check "r2 L1: xcrun -sdk ... --show-sdk-path (single-dash sdk) allows" \
+  "xcrun -sdk macosx --show-sdk-path" allow
+
+# ---------------------------------------------------------------------------
+# round 3 (Main's live run of round 2: verify-command-policy 1417/1419, 2
+# FAIL on r2 H1; review-probes 42/45, 3 FAIL on xcrun toolchain redirects).
+
+# r2 H1's two cases were a real bug, not a wrong trace: `_CP_LOC` is a
+# GLOBAL array `_cp_locate_command_word` overwrites on every call, and
+# `find)`'s clause loop re-read `"${_CP_LOC[@]:1}"` on each iteration —
+# but the SAME loop calls `_cp_wrap_tail_unsafe`, which recurses back into
+# `_cp_locate_command_word` for a non-git tail and clobbered `_CP_LOC`
+# before the loop's next read. A first SAFE clause (whose tail recurses)
+# silently fed the SECOND clause's scan an empty argv. Fixed by
+# snapshotting find's own args into a local array once, before the loop.
+check "r3 H1 regression: safe-tail-then-unsafe-clause no longer clobbers the scan (-C)" \
+  "find . -maxdepth 0 -exec true \\; -exec git -C /tmp/evilrepo status \\;" escalate
+check "r3 H1 regression: safe-tail-then-unsafe-clause no longer clobbers the scan (ext::)" \
+  "find . -maxdepth 0 -exec true \\; -exec git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "r3 H1 regression: a NESTED-but-safe first clause (recurses) doesn't clobber the second either" \
+  "find . -maxdepth 0 -exec nice git log \\; -exec git -C /tmp/evilrepo status \\;" escalate
+
+# SPEC brief item 3: xcrun toolchain/SDK redirects escalate — the
+# `--sdk`/`-sdk` PATH-value form, `--toolchain`/`-toolchain` with any
+# value, and the `DEVELOPER_DIR=`/`SDKROOT=`/`TOOLCHAINS=` env-prefix form
+# of the same redirect.
+check "r3 item3: DEVELOPER_DIR= env prefix redirects xcrun's toolchain" \
+  "DEVELOPER_DIR=/tmp/evil xcrun git log" escalate
+check "r3 item3: SDKROOT= env prefix redirects xcrun's SDK" \
+  "SDKROOT=/tmp/evil xcrun git log" escalate
+check "r3 item3: TOOLCHAINS= env prefix redirects xcrun's toolchain" \
+  "TOOLCHAINS=com.evil.toolchain xcrun git log" escalate
+check "r3 item3: --sdk with a path value redirects the SDK" \
+  "xcrun --sdk /tmp/evil git log" escalate
+check "r3 item3: -sdk (single-dash) with a path value redirects the SDK" \
+  "xcrun -sdk /tmp/evil git log" escalate
+check "r3 item3: --toolchain always redirects, even with a plain-looking name" \
+  "xcrun --toolchain /tmp/evil git log" escalate
+check "r3 item3: -toolchain (single-dash) always redirects" \
+  "xcrun -toolchain com.evil.toolchain git log" escalate
+check "r3 item3: --toolchain=VALUE (glued) always redirects" \
+  "xcrun --toolchain=/tmp/evil git log" escalate
+check "r3 item3 negative: --sdk with a plain SDK name is not a redirect, stays allow" \
+  "xcrun --sdk macosx git log" allow
+check "r3 item3 negative: -sdk (single-dash) with a plain name stays allow (no regression on L1)" \
+  "xcrun -sdk macosx --show-sdk-path" allow
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

@@ -2847,45 +2847,76 @@ _CP_WRAP_TAIL=()
 # have split the segment in two before `_cp_git_seg_exec_unsafe` ever ran.
 _CP_PROT_SEMI="$(printf '\002')"
 
-# `_cp_wrap_find_exec_verb <find's own args...>` -> the first
-# `-exec`/`-execdir`/`-ok`/`-okdir` clause's full argv. Mirrors
-# `_cp_bwt_dispatch_wrapped`'s find case (herdr-control#192) in shape, as
-# a separate copy: that function's return convention (`KIND<TAB>target`
-# lines, for the rm/curl write-target scan) is unrelated to this one.
-_cp_wrap_find_exec_verb() {             # args...
+# `_cp_wrap_find_exec_verb <start-index> <find's own args...>` -> the ONE
+# `-exec`/`-execdir`/`-ok`/`-okdir` clause starting at or after
+# START-INDEX, in `_CP_WRAP_TAIL`. Mirrors `_cp_bwt_dispatch_wrapped`'s
+# find case (herdr-control#192) in shape, as a separate copy: that
+# function's return convention (`KIND<TAB>target` lines, for the rm/curl
+# write-target scan) is unrelated to this one.
+#
+# round 2 (review of PR #261, H1): real find runs EVERY `-exec` clause on
+# its command line, not just the first — a safe clause ahead of an unsafe
+# one used to hide it completely. `_CP_WRAP_FIND_NEXT` is set to the index
+# to resume scanning from, so a caller walks every clause in a loop
+# instead of returning after the first.
+#
+# round 2 (H4): a clause's command word containing `$`/`@SUB@` (an
+# unexpanded variable or collapsed substitution) is unreadable, same as
+# `{}`/empty — rc 2, fail closed, not "not git".
+#
+# round 2 (M1): real find ends a clause at `+` only when `+` directly
+# follows a literal `{}` word; a `+` anywhere else (e.g. `-exec git grep
+# -e foo + -O/tmp/evil.sh \;`) is an ordinary argument passed through to
+# the command, not a terminator.
+_cp_wrap_find_exec_verb() {             # start-index args...
   _CP_WRAP_TAIL=()
+  local start="$1"; shift
   local -a a=("$@") wrapped
-  local i=0 n="${#a[@]}"
+  local i="$start" n="${#a[@]}"
   while [ "$i" -lt "$n" ]; do
     case "${a[$i]}" in
       -exec|-execdir|-ok|-okdir)
         i=$((i + 1))
-        [ "$i" -lt "$n" ] || return 2
-        case "${a[$i]}" in ';'|"$_CP_PROT_SEMI"|'+'|'{}'|*'{}'*) return 2 ;; esac
+        if [ "$i" -ge "$n" ]; then _CP_WRAP_FIND_NEXT="$n"; return 2; fi
+        case "${a[$i]}" in
+          ';'|"$_CP_PROT_SEMI"|'+'|'{}'|*'{}'*|*'$'*|*'@SUB@'*)
+            _CP_WRAP_FIND_NEXT="$n"; return 2 ;;
+        esac
         wrapped=("${a[$i]}")
         i=$((i + 1))
-        while [ "$i" -lt "$n" ] && [ "${a[$i]}" != ';' ] && \
-              [ "${a[$i]}" != "$_CP_PROT_SEMI" ] && [ "${a[$i]}" != '+' ]; do
-          wrapped+=("${a[$i]}"); i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case "${a[$i]}" in
+            ';'|"$_CP_PROT_SEMI")
+              i=$((i + 1)); break ;;
+            '+')
+              case "${wrapped[${#wrapped[@]}-1]}" in
+                '{}') i=$((i + 1)); break ;;
+                *) wrapped+=("${a[$i]}"); i=$((i + 1)) ;;
+              esac ;;
+            *) wrapped+=("${a[$i]}"); i=$((i + 1)) ;;
+          esac
         done
         _CP_WRAP_TAIL=("${wrapped[@]}")
+        _CP_WRAP_FIND_NEXT="$i"
         return 0 ;;
     esac
     i=$((i + 1))
   done
+  _CP_WRAP_FIND_NEXT="$n"
   return 1
 }
+_CP_WRAP_FIND_NEXT=0
 
 # `_cp_wrap_script_verb <script's own args...>` -> the command's full argv
 # for BSD `script [-aeFkqr] [-t time] [file [command ...]]` (`man
 # script`). script's FIRST non-option word is ALWAYS the transcript file,
 # never the command — there is no spelling that takes a bare command with
 # no file — so this skips exactly one non-option word before looking for
-# the real command. rc 1 when nothing follows the file (an
-# interactive-shell invocation, not a wrapper). rc 2 on any option this
-# table does not list (includes `-p`/`-T`/`-d`'s playback mode, which
-# does not take a command at all — ambiguous enough to fail closed rather
-# than guess).
+# the real command. rc 1 when nothing follows the file (a command-less
+# invocation — M2 below decides whether that is actually safe). rc 2 on
+# any option this table does not list (includes `-p`/`-T`/`-d`'s playback
+# mode, which does not take a command at all — ambiguous enough to fail
+# closed rather than guess).
 _cp_wrap_script_verb() {                # args...
   _CP_WRAP_TAIL=()
   local -a a=("$@")
@@ -2926,30 +2957,63 @@ _cp_wrap_arch_verb() {                  # args...
 
 # `_cp_wrap_xcrun_verb <xcrun's own args...>` -> the tool's full argv for
 # `xcrun [--sdk <SDK>] [--toolchain <name>] [-v|--verbose] [-n|--no-cache]
-# [-k|--kill-cache] [-l|--log] [-r|--run] <tool name> ...` (`man xcrun`).
-# `-f`/`--find` and every `--show-*` flag are INFO-ONLY shapes — xcrun
-# resolves/prints and never execs a tool at all in that mode, regardless
-# of what else is on the line — so those return rc 1 (not a wrapper) the
-# moment they appear. rc 2 on any other `-`-led token this table does not
-# list.
+# [-k|--kill-cache] [-l|--log] [-f|--find] [-r|--run] <tool name> ...`
+# (`man xcrun`). `--show-*` flags are truly info-only in every case —
+# real xcrun REJECTS a trailing tool argument after one with "unexpected
+# trailing argument" rather than running it — so those always return rc 1.
+#
+# round 2 (H3): `-f`/`--find`/`-find` and `-r`/`--run`/`-run` are NOT
+# independently final the way `--show-*` is: real xcrun tracks find-vs-run
+# as a MODE, and the LAST such flag on the line wins (`xcrun -f -r git
+# …` really execs git). This tracks `mode` across the whole scan instead
+# of returning the moment `-f`/`--find` is seen.
+#
+# round 2 (L1): real xcrun also accepts the single-dash long spellings
+# `-sdk`, `-toolchain`, `-find`, `-run`, `-log` — the old extractor fell
+# through those to the `-*) return 2` catch-all and over-blocked them.
+#
+# round 3 (SPEC brief item 3): `--toolchain`/`-toolchain` ALWAYS
+# redirects xcrun's whole toolchain, so any value escalates (rc 2) rather
+# than being consumed. `--sdk`/`-sdk` only escalates when its value is a
+# PATH (contains `/`) — a plain SDK name (`macosx`, `iphoneos`, …) is the
+# ordinary, safe spelling and still just gets consumed. The
+# `DEVELOPER_DIR=`/`SDKROOT=`/`TOOLCHAINS=` env-prefix form of the same
+# redirect is not this extractor's job to see — it is a NAME=value token
+# ahead of the command word, already collected in `_CP_LOC_SKIPPED` by
+# `_cp_locate_command_word`, and checked by the `xcrun)` dispatch arm
+# below.
 _cp_wrap_xcrun_verb() {                 # args...
   _CP_WRAP_TAIL=()
   local -a a=("$@")
-  local i=0 n="${#a[@]}"
+  local i=0 n="${#a[@]}" mode=run showonly=0
   while [ "$i" -lt "$n" ]; do
     case "${a[$i]}" in
-      -f|--find|--show-sdk-path|--show-sdk-version|--show-sdk-build-version| \
+      --show-sdk-path|--show-sdk-version|--show-sdk-build-version| \
       --show-sdk-platform-path|--show-sdk-platform-version|--show-toolchain-path)
-        return 1 ;;
-      --sdk|--toolchain) i=$((i + 2)); continue ;;
-      --sdk=*|--toolchain=*) i=$((i + 1)); continue ;;
-      -v|--verbose|-n|--no-cache|-k|--kill-cache|-l|--log|-r|--run) i=$((i + 1)); continue ;;
+        showonly=1; i=$((i + 1)); continue ;;
+      -f|--find|-find)
+        mode=find; i=$((i + 1)); continue ;;
+      -r|--run|-run)
+        mode=run; i=$((i + 1)); continue ;;
+      --toolchain|-toolchain|--toolchain=*)
+        return 2 ;;
+      --sdk|-sdk)
+        case "${a[$((i + 1))]-}" in */*) return 2 ;; esac
+        i=$((i + 2)); continue ;;
+      --sdk=*)
+        case "${a[$i]#*=}" in */*) return 2 ;; esac
+        i=$((i + 1)); continue ;;
+      -v|--verbose|-n|--no-cache|-k|--kill-cache|-l|--log|-log)
+        i=$((i + 1)); continue ;;
       -*) return 2 ;;
     esac
-    _CP_WRAP_TAIL=("${a[@]:i}")
-    return 0
+    break
   done
-  return 1
+  [ "$showonly" = 1 ] && return 1
+  [ "$i" -lt "$n" ] || return 1
+  [ "$mode" = find ] && return 1
+  _CP_WRAP_TAIL=("${a[@]:i}")
+  return 0
 }
 
 # `_cp_wrap_chroot_verb <chroot's own args...>` -> the command's full argv
@@ -2957,7 +3021,8 @@ _cp_wrap_xcrun_verb() {                 # args...
 # [arg...]]` (`man chroot`). Same "mandatory positional before the real
 # command" shape as `script` above: the first non-option word is always
 # `newroot`, never the command. rc 1 when no command follows newroot
-# (chroot execs the login shell instead — not a wrapper here).
+# (a command-less invocation — M2 below decides whether that is actually
+# safe).
 _cp_wrap_chroot_verb() {                # args...
   _CP_WRAP_TAIL=()
   local -a a=("$@")
@@ -3002,8 +3067,50 @@ _cp_wrap_flock_verb() {                 # args...
   return 1
 }
 
-# `_cp_git_seg_exec_unsafe <protected-segment>` -> 0 (true) when this ONE
-# already-protected-and-carved segment is unsafe:
+# `_cp_wrap_tail_unsafe <depth>` -> 0 (unsafe) when `_CP_WRAP_TAIL`
+# (already populated by one of the `_cp_wrap_*_verb` extractors above, or
+# by one `find` clause) invokes something unsafe.
+#
+# round 2 (H4): an unreadable command word (`$VAR`, `@SUB@`, or empty)
+# fails closed, same as `find`'s own clause check.
+#
+# round 2 (H2): `git`/`git-<verb>` is judged the same way a direct
+# invocation is — unchanged from round 1. Anything ELSE is a potential
+# nested launcher or SECOND wrapper (`nice`, `command`, another
+# `find`/`script`/`arch`/`xcrun`/`chroot`/`flock`, …) that round 1 never
+# looked at again: it only read `_CP_WRAP_TAIL[0]`'s basename, so `find …
+# -exec nice git … \;` or `xcrun arch … git …` hid git completely. This
+# re-runs the FULL segment judgment (`_cp_git_seg_exec_unsafe`, same
+# function this helper is called from) on the joined tail — the array
+# elements are already individual protected tokens with no embedded
+# unprotected whitespace (same invariant `_cp_locate_command_word`'s own
+# `set -- $1` word-split relies on), so re-joining with plain spaces
+# reproduces the original segment shape exactly. Capped at
+# `_CP_WRAP_MAX_DEPTH` so a pathological wrapper chain cannot recurse
+# unbounded; hitting the cap fails closed (unsafe), matching every other
+# depth-capped walk in this file.
+_CP_WRAP_MAX_DEPTH=8
+_cp_wrap_tail_unsafe() {                # depth
+  local depth="$1" w0="${_CP_WRAP_TAIL[0]-}" wv
+  case "$w0" in ''|*'$'*|*'@SUB@'*) return 0 ;; esac
+  wv="$(printf '%s' "${w0##*/}" | tr 'A-Z' 'a-z')"
+  case "$wv" in
+    git)
+      _cp_git_unsafe_tokens "${_CP_WRAP_TAIL[@]:1}" && return 0
+      return 1 ;;
+    git-*)
+      local gv
+      if gv="$(_cp_git_dashed_verb "$wv")"; then
+        _cp_git_unsafe_tokens "$gv" "${_CP_WRAP_TAIL[@]:1}" && return 0
+      fi
+      return 1 ;;
+  esac
+  [ "$depth" -ge "$_CP_WRAP_MAX_DEPTH" ] && return 0
+  _cp_git_seg_exec_unsafe "${_CP_WRAP_TAIL[*]}" "$((depth + 1))"
+}
+
+# `_cp_git_seg_exec_unsafe <protected-segment> [depth]` -> 0 (true) when
+# this ONE already-protected-and-carved segment is unsafe:
 #   * a `GIT_*=`/`PAGER=`/`EDITOR=`/`VISUAL=` assignment anywhere ahead of
 #     the resolved command word — through any chain of launchers
 #     (`command`, `nice`, `time`, `stdbuf -i0`, `setsid`, another
@@ -3016,14 +3123,19 @@ _cp_wrap_flock_verb() {                 # args...
 #     re-read every cycle (`watch`) in a way this policy cannot see ahead
 #     of time, so it is unsafe regardless of what static argv is present;
 #   * `find -exec/-execdir/-ok/-okdir`, `script`, `arch`, `xcrun`,
-#     `chroot` or `flock` wrapping git (SPEC #257 r2, PART A rows 186-193,
-#     and the pre-existing r7 D5 rows for `find`/`script`/`arch`/`xcrun`/
-#     `watch`/`flock`) — each unwrapped by its own `_cp_wrap_*_verb`
+#     `chroot` or `flock` wrapping git, DIRECTLY or through a nested
+#     launcher/wrapper (SPEC #257 r2, PART A rows 186-193; review round 2
+#     H1/H2/H3/H4/M1/M2) — each unwrapped by its own `_cp_wrap_*_verb`
 #     extractor just above, which fails CLOSED (treated as unsafe here)
 #     rather than silently "not git" whenever that extractor cannot read
-#     the wrapped command word with confidence.
-_cp_git_seg_exec_unsafe() {             # protected-segment
-  local seg="$1" tok
+#     the wrapped command word with confidence. `find` walks EVERY `-exec`
+#     clause (H1), not just the first; every wrapped tail is judged
+#     through `_cp_wrap_tail_unsafe`, which re-enters THIS function for
+#     anything that is not git itself (H2); `script`/`chroot` with no
+#     trailing command run `$SHELL`/the login shell, so a `SHELL=`
+#     assignment ahead of a command-less one of those is unsafe too (M2).
+_cp_git_seg_exec_unsafe() {             # protected-segment [depth]
+  local seg="$1" depth="${2:-0}" tok
   _cp_locate_command_word "$seg" || return 1
   for tok in ${_CP_LOC_SKIPPED[@]+"${_CP_LOC_SKIPPED[@]}"}; do
     case "$tok" in GIT_*=*|PAGER=*|EDITOR=*|VISUAL=*) return 0 ;; esac
@@ -3043,30 +3155,68 @@ _cp_git_seg_exec_unsafe() {             # protected-segment
       wrapped="$(_cp_coderef_wrapped_command "$_cp_wcmd" "${_CP_LOC[@]:1}")" || return 1
       case "${wrapped##*/}" in git|git-*) return 0 ;; esac
       return 1 ;;
-    find|script|arch|xcrun|chroot|flock)
-      local rc wv
+    find)
+      # round 3 bugfix: `_CP_LOC` is a GLOBAL array `_cp_locate_command_word`
+      # overwrites on every call. `_cp_wrap_tail_unsafe` below recurses back
+      # into THIS function for a non-git tail, which calls
+      # `_cp_locate_command_word` again and clobbers `_CP_LOC` — so re-reading
+      # `"${_CP_LOC[@]:1}"` on the loop's NEXT iteration silently fed find's
+      # OWN extractor an empty/wrong argv, making every clause after the
+      # first one invisible again (the exact H1 bug this loop exists to
+      # fix). Snapshot find's own args into a local array once, before the
+      # loop can run anything that recurses.
+      local idx=0 rc
+      local -a find_args=("${_CP_LOC[@]:1}")
+      while :; do
+        _cp_wrap_find_exec_verb "$idx" "${find_args[@]}"; rc=$?
+        idx="$_CP_WRAP_FIND_NEXT"
+        case "$rc" in
+          1) return 1 ;;
+          2) return 0 ;;
+        esac
+        _cp_wrap_tail_unsafe "$depth" && return 0
+      done ;;
+    script|chroot)
+      local rc
+      if [ "$_cp_wcmd" = script ]; then
+        _cp_wrap_script_verb "${_CP_LOC[@]:1}"; rc=$?
+      else
+        _cp_wrap_chroot_verb "${_CP_LOC[@]:1}"; rc=$?
+      fi
+      if [ "$rc" = 1 ]; then
+        for tok in ${_CP_LOC_SKIPPED[@]+"${_CP_LOC_SKIPPED[@]}"}; do
+          case "$tok" in SHELL=*) return 0 ;; esac
+        done
+        return 1
+      fi
+      [ "$rc" = 2 ] && return 0
+      _cp_wrap_tail_unsafe "$depth" && return 0
+      return 1 ;;
+    xcrun)
+      # round 3 (SPEC brief item 3): `DEVELOPER_DIR=`/`SDKROOT=`/
+      # `TOOLCHAINS=` ahead of xcrun redirects its whole toolchain/SDK the
+      # same way `--sdk`/`--toolchain` with a path value does (the
+      # extractor's own job, handled inside it) — these are env-prefix
+      # assignments instead, already collected in `_CP_LOC_SKIPPED` by
+      # `_cp_locate_command_word`, so checked here rather than re-walking.
+      local rc
+      for tok in ${_CP_LOC_SKIPPED[@]+"${_CP_LOC_SKIPPED[@]}"}; do
+        case "$tok" in DEVELOPER_DIR=*|SDKROOT=*|TOOLCHAINS=*) return 0 ;; esac
+      done
+      _cp_wrap_xcrun_verb "${_CP_LOC[@]:1}"; rc=$?
+      [ "$rc" = 1 ] && return 1
+      [ "$rc" = 2 ] && return 0
+      _cp_wrap_tail_unsafe "$depth" && return 0
+      return 1 ;;
+    arch|flock)
+      local rc
       case "$_cp_wcmd" in
-        find)   _cp_wrap_find_exec_verb "${_CP_LOC[@]:1}"; rc=$? ;;
-        script) _cp_wrap_script_verb    "${_CP_LOC[@]:1}"; rc=$? ;;
-        arch)   _cp_wrap_arch_verb      "${_CP_LOC[@]:1}"; rc=$? ;;
-        xcrun)  _cp_wrap_xcrun_verb     "${_CP_LOC[@]:1}"; rc=$? ;;
-        chroot) _cp_wrap_chroot_verb    "${_CP_LOC[@]:1}"; rc=$? ;;
-        flock)  _cp_wrap_flock_verb     "${_CP_LOC[@]:1}"; rc=$? ;;
+        arch)  _cp_wrap_arch_verb  "${_CP_LOC[@]:1}"; rc=$? ;;
+        flock) _cp_wrap_flock_verb "${_CP_LOC[@]:1}"; rc=$? ;;
       esac
       [ "$rc" = 1 ] && return 1
       [ "$rc" = 2 ] && return 0
-      wv="$(printf '%s' "${_CP_WRAP_TAIL[0]##*/}" | tr 'A-Z' 'a-z')"
-      case "$wv" in
-        git)
-          _cp_git_unsafe_tokens "${_CP_WRAP_TAIL[@]:1}" && return 0
-          return 1 ;;
-        git-*)
-          local gv
-          if gv="$(_cp_git_dashed_verb "$wv")"; then
-            _cp_git_unsafe_tokens "$gv" "${_CP_WRAP_TAIL[@]:1}" && return 0
-          fi
-          return 1 ;;
-      esac
+      _cp_wrap_tail_unsafe "$depth" && return 0
       return 1 ;;
     *) return 1 ;;
   esac
