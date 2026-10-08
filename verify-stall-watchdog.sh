@@ -276,8 +276,8 @@ def base_task(**over):
     t.update(over)
     return t
 
-def cw(now_epoch, reason=None):   # stub live_done_fn: constant (epoch, reason)
-    return lambda worktree: (now_epoch, reason)
+def cw(now_epoch, reason=None, is_last=True, mtime=None):   # stub live_done_fn:
+    return lambda worktree: (now_epoch, reason, is_last, mtime)  # constant (epoch, reason, is_last, mtime)
 
 # DESIGN-228: `occurrence_fn` defaults to the registry fold
 # (`_stall_cprompt_sight`) — every fixture below that only cares about
@@ -412,6 +412,30 @@ cands = hub.stall_watchdog_candidates(
     live_done_fn=cw(hub._iso_epoch("2026-01-01T19:00:01Z"), "handed_off_to:conductor"))  # T+1
 results["item1_handoff_still_fires_on_this_rounds_own_done_line"] = any(
     c["signal"] == "handoff" for c in cands)
+
+# ---- review r6 M1: clock skew -- the worker's own `ts` stamped 4h early
+# must not drop a handoff that genuinely landed after this round's own
+# registration. `_live_done_info` now also reports done_is_last/mtime; the
+# task_start floor accepts the APPEND time (mtime, only when the `_done`
+# line is the file's own last line) as an alternative to the worker-written
+# `ts` -- a real -4h/mtime-pr-223-r3-shaped skew on this machine.
+T_SKEW = hub._iso_epoch("2026-01-01T19:00:00Z")           # task registered at T
+t_skew = base_task(state="ready_review", stored_state="running", worktree="/wt-live",
+                   created_at="2026-01-01T19:00:00Z")
+cands = hub.stall_watchdog_candidates(
+    [t_skew], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(T_SKEW + 1800 - 4 * 3600, "handed_off_to:conductor",
+                   is_last=True, mtime=T_SKEW + 1800))     # ts=T-3h30m, appended at T+30m
+results["M1_skewed_ts_still_fires_when_the_append_mtime_is_after_task_start"] = any(
+    c["signal"] == "handoff" for c in cands)
+# Same skewed ts, but the `_done` line is NOT the file's last line (some
+# later non-done write set the mtime) -- the mtime cannot be trusted to
+# date the append, so it must not be used to clear the floor.
+cands = hub.stall_watchdog_candidates(
+    [t_skew], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    live_done_fn=cw(T_SKEW + 1800 - 4 * 3600, "handed_off_to:conductor",
+                   is_last=False, mtime=T_SKEW + 1800))
+results["M1_mtime_ignored_when_the_done_line_is_not_the_files_last_line"] = cands == []
 
 # ---- signal 2: artifact (injectable stat_fn — no real filesystem needed) ----
 # stat_fn now returns (size, mtime): review H1's empty-file / owner-action gates.
@@ -975,6 +999,40 @@ conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, 
 conn.commit(); conn.close()
 _, _, owner_acted3 = _safe_signals3("sig_supersede", now=REG_NOW, threshold_s=REG_THRESH)
 results["item4_owner_acted_populated_from_a_herdr_action_supersede"] = "t_supersede" in owner_acted3
+
+# review r6 Q2: a supersede only counts as owner activity for the
+# conductor_prompt wake it NAMES -- a conductor_prompt fingerprint has no
+# request_id of its own, so the match is textual against the wake's own
+# request line (`detail`). A supersede of request B must not silence a wake
+# about request A; approve/decline (item4/A8b above) stay unconditional.
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('t_q2','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+fp_a = "cprompt:aaaaaaaaaaaaaaaa|g1"
+key_a = f"stall_t_q2_conductor_prompt_{hub._sw_digest(fp_a)}"
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES (?,'drun','t_q2','stall_wake','2026-01-01T01:00:00Z',?)",
+             (key_a, json.dumps({"signal": "conductor_prompt", "fingerprint": fp_a,
+                                 "detail": "CONDUCTOR: approve request ar_A or tell me why not"})))
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('ad_q2b','drun','t_q2','action_decided','2026-01-01T01:30:00Z',"
+             "'{\"decision\":\"superseded\",\"request_id\":\"ar_B\",\"action_sha256\":\"shaB\"}')")
+conn.commit(); conn.close()
+hub._SW_RESOLVED_CACHE.clear()
+ro = sqlite3.connect(f"file:{hub.REGISTRY}?mode=ro", uri=True)
+resolved_q2a = hub._sw_resolved_keys(ro, owner_acted={"t_q2": hub._iso_epoch("2026-01-01T01:30:00Z")})
+ro.close()
+results["Q2_supersede_of_request_B_does_not_silence_a_wake_about_request_A"] = key_a not in resolved_q2a
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('ad_q2a','drun','t_q2','action_decided','2026-01-01T02:00:00Z',"
+             "'{\"decision\":\"superseded\",\"request_id\":\"ar_A\",\"action_sha256\":\"shaA\"}')")
+conn.commit(); conn.close()
+hub._SW_RESOLVED_CACHE.clear()
+ro = sqlite3.connect(f"file:{hub.REGISTRY}?mode=ro", uri=True)
+resolved_q2b = hub._sw_resolved_keys(ro, owner_acted={"t_q2": hub._iso_epoch("2026-01-01T02:00:00Z")})
+ro.close()
+results["Q2_supersede_naming_request_A_does_resolve_its_own_wake"] = key_a in resolved_q2b
 
 # A later event from the SAME task (real worker activity) clears "unprocessed".
 conn = sqlite3.connect(str(hub.REGISTRY))

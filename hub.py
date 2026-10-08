@@ -4033,25 +4033,36 @@ def _is_handoff_reason(reason: str | None) -> bool:
     return bool(reason) and reason.strip().lower().startswith("handed_off_to:")
 
 
-def _live_done_info(worktree: str | None) -> tuple[float | None, str | None]:
-    """(epoch, reason) of the newest readable `_done` line in the worker's
-    OWN handoff bus — PR #223 review H5's fix for incident 1's exact shape:
-    while the pane stays alive, `lib/reconcile.sh` only ingests a
-    worktree's `_done` once the pane is GONE, so the registry row can sit
-    `running`/derive `ready_review` all night with no closure_reason at
-    all, which is precisely what left incident 1 undetected. Same bus
-    files, same byte-level never-decode discipline, and the same
-    last-line-only mtime fallback as `_evidence_at` — reused rather than
-    re-derived so the two readers can never disagree about which file.
+def _live_done_info(worktree: str | None) -> tuple[float | None, str | None, bool, float | None]:
+    """(epoch, reason, done_is_last, mtime) of the newest readable `_done`
+    line in the worker's OWN handoff bus — PR #223 review H5's fix for
+    incident 1's exact shape: while the pane stays alive, `lib/reconcile.sh`
+    only ingests a worktree's `_done` once the pane is GONE, so the registry
+    row can sit `running`/derive `ready_review` all night with no
+    closure_reason at all, which is precisely what left incident 1
+    undetected. Same bus files, same byte-level never-decode discipline,
+    and the same last-line-only mtime fallback as `_evidence_at` — reused
+    rather than re-derived so the two readers can never disagree about
+    which file.
+
+    Review r6 M1: `epoch` is the worker-WRITTEN `ts`, which can be wrong
+    (local time stamped with a `Z` suffix on an EDT host is 4h+ early) —
+    `done_is_last`/`mtime` let the caller also check the APPEND time, which
+    the worker never controls, for the one place that matters (the
+    task_start floor): a genuinely-this-round handoff must not be dropped
+    just because its own `ts` lies about when it landed.
     """
     if not worktree:
-        return None, None
+        return None, None, False, None
     best_epoch: float | None = None
     best_reason: str | None = None
+    best_is_last = False
+    best_mtime: float | None = None
     for rel in _bus_relpaths():
         p = Path(worktree) / rel
         try:
-            if not p.stat().st_size:
+            st = p.stat()
+            if not st.st_size:
                 continue
             last_ts: bytes | None = None
             last_reason: str | None = None
@@ -4072,12 +4083,13 @@ def _live_done_info(worktree: str | None) -> tuple[float | None, str | None]:
                 continue
             epoch = _iso_epoch(last_ts.decode("ascii", "replace")) if last_ts else None
             if epoch is None and done_is_last:
-                epoch = p.stat().st_mtime
+                epoch = st.st_mtime
             if epoch is not None and (best_epoch is None or epoch > best_epoch):
                 best_epoch, best_reason = epoch, last_reason
+                best_is_last, best_mtime = done_is_last, st.st_mtime
         except OSError:
             continue
-    return best_epoch, best_reason
+    return best_epoch, best_reason, best_is_last, best_mtime
 
 
 def _pane_last_output(pane_id: str, lines: int = 60) -> str:
@@ -4248,14 +4260,23 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
 
         # ---- signal 1: handoff --------------------------------------------
         if state in IDLE_STATES and t.get("worktree"):
-            live_epoch, live_reason = live_done_fn(t["worktree"])
+            live_epoch, live_reason, live_is_last, live_mtime = live_done_fn(t["worktree"])
             since = live_epoch if _is_handoff_reason(live_reason) else None
             fingerprint = f"live:{live_epoch}"
         else:
             since = None
             fingerprint = None
-        if since is not None and since >= boot and (task_start is None or since >= task_start) \
-                and now - since >= threshold:
+            live_is_last, live_mtime = False, None
+        # Review r6 M1: the floor accepts EITHER the worker-written `ts` or
+        # the file's own append mtime (only when the `_done` line is the
+        # file's last line — mtime then dates the append, not some later
+        # unrelated write). A skewed `ts` 4h early must not drop a handoff
+        # that landed well after this task's own registration; an untouched
+        # bus from a prior round still fails both checks, so the re-spawn
+        # fix (SPEC.md item 1) stays intact.
+        past_floor = task_start is None or (since is not None and since >= task_start) \
+            or (live_is_last and live_mtime is not None and live_mtime >= task_start)
+        if since is not None and since >= boot and past_floor and now - since >= threshold:
             out.append({**base, "signal": "handoff", "fingerprint": fingerprint,
                        "detail": "closed handed_off_to:... ; the conductor was never told",
                        "artifact": ""})
@@ -4476,6 +4497,38 @@ _SW_RESOLVED_CACHE: dict[str, str] = {}   # r1 L5: once an eid resolves, its
 # cost one `MIN(occurred_at)` query EACH, once, not every 15s tick forever.
 
 
+def _sw_owner_resolves_cprompt(conn: sqlite3.Connection, tid: str, detail: str,
+                               claimed_at: str, own_placeholders: str) -> str | None:
+    """Review r6 Q2: a `conductor_prompt` wake is resolved by the first
+    owner-activity row after its claim UNLESS that row is an
+    `action_decided` supersede naming a DIFFERENT request — a
+    conductor_prompt fingerprint has no `request_id` of its own, so the
+    match is textual: the superseded decision's `request_id` or
+    `action_sha256` must appear in the wake's own request text (`detail`,
+    `req["line"][:200]`). Approve/decline keep today's unconditional
+    behavior (the `approval_reviewed` precedent, DESIGN-228 R29c) — only
+    a mismatched SUPERSEDE is skipped, falling through to the next row (an
+    unrelated supersede followed by a real ack still resolves it).
+    Returns None when every owner-activity row since the claim is a
+    mismatched supersede, leaving the key open."""
+    for typ, payload, occurred_at in conn.execute(
+            f"SELECT type, payload, occurred_at FROM events WHERE task_id=? "
+            f"AND type IN ({own_placeholders}) AND occurred_at >= ? ORDER BY occurred_at",
+            (tid, *_STALL_OWNER_ACTIVITY_TYPES, claimed_at)):
+        if typ != "action_decided":
+            return occurred_at
+        try:
+            p = json.loads(payload or "{}")
+        except json.JSONDecodeError:
+            p = {}
+        if p.get("decision") != "superseded":
+            return occurred_at
+        rid, sha = str(p.get("request_id") or ""), str(p.get("action_sha256") or "")
+        if (rid and rid in detail) or (sha and sha in detail):
+            return occurred_at
+    return None
+
+
 def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None) -> dict[str, str]:
     """claim_once keys that are ALREADY woken AND acked (review M4): the
     daemon must not spawn a subprocess plus two herdr RPCs every tick,
@@ -4495,14 +4548,14 @@ def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None)
     the dispatch filter; the time is when signal 5's fold retires that
     occurrence (DESIGN-228 §3), so the ladder and the fold read one test."""
     owner_acted = owner_acted or {}
-    claims: dict[str, tuple[str, str, str]] = {}
+    claims: dict[str, tuple[str, str, str, str]] = {}
     for eid, tid, occurred_at, payload in conn.execute(
             "SELECT event_id, task_id, occurred_at, payload FROM events WHERE type='stall_wake'"):
         try:
-            sig = json.loads(payload or "{}").get("signal", "")
+            p = json.loads(payload or "{}")
         except json.JSONDecodeError:
-            sig = ""
-        claims[eid] = (tid, sig, occurred_at)
+            p = {}
+        claims[eid] = (tid, p.get("signal", "") or "", occurred_at, p.get("detail", "") or "")
     acks: dict[str, list[tuple[str, str]]] = {}
     for tid, payload, occurred_at in conn.execute(
             "SELECT task_id, payload, occurred_at FROM events WHERE type='stall_acked'"):
@@ -4518,7 +4571,7 @@ def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None)
         if key not in resolved or when < resolved[key]:
             resolved[key] = when
 
-    for eid, (tid, sig, claimed_at) in claims.items():
+    for eid, (tid, sig, claimed_at, detail) in claims.items():
         if eid in _SW_RESOLVED_CACHE:
             _at(eid, _SW_RESOLVED_CACHE[eid])
             continue
@@ -4529,11 +4582,16 @@ def _sw_resolved_keys(conn: sqlite3.Connection, owner_acted: dict | None = None)
         if owner_epoch is not None:
             claimed_epoch = _iso_epoch(claimed_at)
             if claimed_epoch is not None and owner_epoch >= claimed_epoch:
-                row = conn.execute(
-                    f"SELECT MIN(occurred_at) FROM events WHERE task_id=? AND type IN ({own_placeholders}) "
-                    "AND occurred_at >= ?", (tid, *_STALL_OWNER_ACTIVITY_TYPES, claimed_at)).fetchone()
-                _at(eid, row[0] if row and row[0] else
-                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(owner_epoch)))
+                if sig == "conductor_prompt":
+                    resolved_at = _sw_owner_resolves_cprompt(conn, tid, detail, claimed_at, own_placeholders)
+                    if resolved_at is not None:
+                        _at(eid, resolved_at)
+                else:
+                    row = conn.execute(
+                        f"SELECT MIN(occurred_at) FROM events WHERE task_id=? AND type IN ({own_placeholders}) "
+                        "AND occurred_at >= ?", (tid, *_STALL_OWNER_ACTIVITY_TYPES, claimed_at)).fetchone()
+                    _at(eid, row[0] if row and row[0] else
+                        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(owner_epoch)))
     for eid, occurred_at in conn.execute(
             "SELECT event_id, occurred_at FROM events WHERE type='stall_escalate_claim'"):
         if eid.endswith("_escalate"):
