@@ -364,6 +364,130 @@ _cp_walk_prep() {                       # raw
     sed -E 's/<\(/<@LP@/g; s/>\(/>@LP@/g; s/(\&\&|\|\||[;|&()])/\n/g; s/@LP@/(/g'
 }
 
+# `_cp_protect_text_qa <raw>` — a QUOTE-PRESERVING sibling of
+# `_cp_protect_text` above, built for SPEC #261 r5 (ATK4-desync):
+# `_cp_locate_command_word` + `_cp_bwt_unprotect` are the SAME machinery
+# the git rules use to find a segment's real command word; running them
+# against ordinary `_cp_protect_text` output can never answer "was this
+# word quoted or backslash-escaped in the original text", because that
+# function's whole job is to DROP every quote/backslash character so an
+# escaped operator and a quoted one are indistinguishable downstream —
+# exactly the information round 5's generic "a command word never needs
+# quoting" gate needs to see. This variant keeps every quote character
+# and every backslash literally in the output (still folding an
+# operator/space INTO a quoted span to the same control bytes, and a
+# command substitution to `@SUB@`, so segment-splitting still agrees
+# with the real one), so a quoted/escaped command word reaches
+# `_cp_locate_command_word` carrying `'`/`"`/`\` characters a caller can
+# test for directly — closing `"find"`, `fi''nd`, `f\ind`, `fin""d` and
+# every other quote/backslash spelling in ONE check instead of
+# enumerating shapes.
+#
+# Because quote characters are never dropped, an EMPTY quoted pair
+# (`''`, `""`) already emits two real characters and can never vanish
+# the way it could for `_cp_protect_text` — none of that function's
+# empty-word-sentinel/chain-deferral machinery (rounds 5-7, #192) is
+# needed here; it existed solely to compensate for dropping the quote
+# marks that this variant keeps.
+#
+# Deliberately does NOT do the final `tr '\017' '\n'` restoration
+# `_cp_protect_text` ends with. A real embedded newline inside a quoted
+# multi-line value is flattened to `\017` before this runs (same as
+# `_cp_protect_text`, so AWK's own per-record `st` reset can never catch
+# a quote mid-string — ATK4-newline). Restoring it to a literal `\n`
+# before a caller line-splits the output (`while IFS= read -r seg`,
+# exactly how every consumer of this file's segmented text works) would
+# silently re-introduce the SAME bug one level up: the read loop would
+# treat that restored newline as a fresh segment boundary and cut a
+# legitimately-quoted multi-line argument in half. Leaving it as `\017`
+# means only a REAL (always-unquoted-by-definition) newline the
+# upstream caller already turned into a segment line is ever read as
+# one — a `\017` sitting inside one word never matches IFS whitespace,
+# so `_cp_locate_command_word`'s `set -- $1` keeps it as part of that
+# one token, same as every other control byte this file already uses.
+_cp_protect_text_qa() {                 # raw
+  printf '%s' "$1" | tr '\n' '\017' | awk '
+    function prot(c) {
+      if (c == " ")  return sprintf("%c", 1)
+      if (c == ";")  return sprintf("%c", 2)
+      if (c == "&")  return sprintf("%c", 3)
+      if (c == "|")  return sprintf("%c", 4)
+      if (c == "(")  return sprintf("%c", 5)
+      if (c == ")")  return sprintf("%c", 6)
+      if (c == "<")  return sprintf("%c", 7)
+      if (c == ">")  return sprintf("%c", 14)
+      # SPEC #261 r6 (R5-NL): a REAL newline is flattened to \017
+      # before this awk ever runs (same reason as every other control
+      # byte here -- AWK per-record "st" reset would otherwise close a
+      # quote early at the physical line break). Protecting it to a
+      # DIFFERENT byte (\020) ONLY when it falls through this quoted-
+      # content path keeps a genuinely quoted multi-line value newline
+      # from ever reading as the plain \017 that _cp_segments_qa now
+      # splits segments on -- a newline OUTSIDE any quote never reaches
+      # prot() at all (the state-0 catch-all two lines below emits it
+      # unprotected), so only the unquoted one keeps the bare \017
+      # spelling a real statement separator needs.
+      if (c == "\017") return sprintf("%c", 16)
+      return c
+    }
+    function skipsub(line, start, n,    d, j, ch) {
+      d = 1; j = start
+      while (j <= n && d > 0) {
+        ch = substr(line, j, 1)
+        if (ch == "(") d++
+        else if (ch == ")") d--
+        j++
+      }
+      return j
+    }
+    {
+      SQ = sprintf("%c", 39); DQ = "\""; BT = sprintf("%c", 96)
+      line = $0; n = length(line); st = 0; i = 1; out = ""
+      while (i <= n) {
+        c = substr(line, i, 1)
+        if (st == 0) {
+          if (c == "\\")      { out = out "\\" prot(substr(line, i+1, 1)); i += 2; continue }
+          if (c == "$" && (substr(line, i+1, 1) == SQ || substr(line, i+1, 1) == DQ)) {
+                                out = out c substr(line, i+1, 1)
+                                st = (substr(line, i+1, 1) == SQ) ? 1 : 2
+                                i += 2; continue }
+          if (c == SQ)        { out = out c; st = 1; i++; continue }
+          if (c == DQ)        { out = out c; st = 2; i++; continue }
+          if (c == BT)        { j = i+1; while (j <= n && substr(line, j, 1) != BT) j++
+                                out = out "@SUB@"; i = j+1; continue }
+          if (c == "$" && substr(line, i+1, 1) == "(") {
+                                i = skipsub(line, i+2, n); out = out "@SUB@"; continue }
+          out = out c; i++; continue
+        }
+        q = (st == 1) ? SQ : DQ
+        if (c == q) { out = out c; st = 0; i++; continue }
+        if (st == 2 && c == "\\") { out = out "\\" prot(substr(line, i+1, 1)); i += 2; continue }
+        if (st == 2 && c == "$" && substr(line, i+1, 1) == "(") {
+                                i = skipsub(line, i+2, n); out = out "@SUB@"; continue }
+        out = out prot(c); i++; continue
+      }
+      print out
+    }'
+}
+
+_cp_segments_qa() {                     # raw -> same split as _cp_walk_prep, quote/backslash-preserving
+  # SPEC #261 r6 (R5-NL, review HIGH): `_cp_protect_text_qa` deliberately
+  # leaves a genuinely UNQUOTED `\017` (a real newline) unprotected — see
+  # its own header and `prot()`'s `\017` case just above — so converting
+  # it back to a literal `\n` HERE, before the operator split, makes a
+  # bare newline a segment separator exactly like `;`/`&`/`|`, closing
+  # the bypass where `echo harmless<NL>find . * -maxdepth 0` reached
+  # `_cp_locate_command_word` as one glued token `echo\017find` whose
+  # command word was never `find`. A newline that WAS inside a quote
+  # already became the distinct `\020` byte in `prot()` and is untouched
+  # by this `tr`, so a legitimately multi-line quoted value still reads
+  # as one token on one line.
+  _cp_protect_text_qa "$1" |
+    tr '\017' '\n' |
+    sed -E 's/<\(/<@LP@/g; s/>\(/>@LP@/g; s/(\&\&|\|\||[;|&()])/\n/g; s/@LP@/(/g'
+}
+
+
 # ---- ownership grant fast path (thurber-os docs/project-contract-plan.md
 # #3b) -------------------------------------------------------------------
 # `_cp_grant_action <raw> <worktree> <branch> <trunk>` -> prints a one-line
@@ -1875,6 +1999,42 @@ $(_cp_procsub_bodies "$1")
 EOF
 }
 
+# `_CP_QA_CLEAN_WORD_RE` / `_cp_cmdword_dequote <word>` — a clean fully
+# single/double-quoted PLAIN word ('x'/"x", content only
+# `[A-Za-z0-9._/+-]`, no embedded quote/backslash/`$`) is exactly
+# equivalent to typing it bare (SPEC #261 r5, round 5's own exception for
+# `'python3' '-m' 'http.server' '8123'`-style per-argument quoting).
+# `_cp_cmdword_dequote` prints that unquoted spelling for a clean word,
+# or WORD unchanged for anything else (a bare word, or a genuinely
+# mixed/partially quoted one — `_cp_locate_command_word`'s own pattern
+# matching below already fails to match those against a bare launcher
+# name, same severity as today). `_cp_protect_text` (every OTHER
+# caller's input) already DROPS quote characters before this file ever
+# sees them, so this is a no-op everywhere except `_cp_protect_text_qa`'s
+# quote-PRESERVING output — SPEC #261 r6, R5-QWRAP: a quoted launcher
+# name (`'nice' -n 5 find . * -maxdepth 0`) used to stop
+# `_cp_locate_command_word`'s launcher recognition cold, because the
+# case match below compares against the LITERAL token including its
+# quote marks. Dequoting at every point that token is matched against a
+# bare name — not just once at the end — lets the SAME loop iteration
+# that already walks past a bare `nice`/`sudo`/`exec`/… walk past its
+# cleanly-quoted spelling too, and loop again for a SECOND quoted
+# wrapper ('nice' 'sudo' find …), with no separate recursion needed.
+_CP_QA_CLEAN_WORD_RE='^[A-Za-z0-9._/+-]+$'
+_cp_cmdword_dequote() {                 # word
+  local w="$1" inner=""
+  case "$w" in
+    \'*\') inner="${w#\'}"; inner="${inner%\'}" ;;
+    \"*\") inner="${w#\"}"; inner="${inner%\"}" ;;
+  esac
+  if [ -n "$inner" ] && [[ "$inner" =~ $_CP_QA_CLEAN_WORD_RE ]]; then
+    printf '%s' "$inner"
+  else
+    printf '%s' "$w"
+  fi
+}
+
+
 # ---- _cp_locate_command_word ------------------------------------------------
 # `_cp_locate_command_word <segment>` finds where the real command word is in
 # ONE segment: it skips (in any order, any number of times) every
@@ -1894,9 +2054,11 @@ EOF
 # tail end of a segment the splitter cut mid-redirection).
 _CP_LOC=()
 _CP_LOC_SKIPPED=()
+_CP_LOC_CAPPED=0
 _cp_locate_command_word() {             # segment
   _CP_LOC=()
   _CP_LOC_SKIPPED=()
+  _CP_LOC_CAPPED=0
   # `_CP_LOC_SKIPPED` collects every `NAME=val`-shaped token shifted away
   # below (both the top-level assignment case and the ones a launcher's own
   # value-parsing loop skips) — not read by most callers, but it is the ONE
@@ -1910,7 +2072,24 @@ _cp_locate_command_word() {             # segment
   set -- $1
   [ "$_cp_wglob" = on ] && set +f
 
+  local _cp_loc_iter=0
   while [ "$#" -gt 0 ]; do
+    _cp_loc_iter=$((_cp_loc_iter + 1))
+    if [ "$_cp_loc_iter" -gt 64 ]; then
+      # SPEC #261 r6 round 2 (Main's live run): a pathological launcher/
+      # assignment chain (thousands of tokens this loop would otherwise
+      # walk one at a time) is a DoS surface, not just a correctness
+      # one. 64 is generous for anything a real command needs (even a
+      # few chained launchers is unusual) and cheap to check every
+      # iteration. `_CP_LOC_CAPPED=1` is opt-in: every EXISTING caller
+      # that does not check it keeps today's exact behavior (the loop
+      # just stops early, same as hitting a non-launcher word);
+      # `_cp_find_word_injection_present`/`_cp_git_seg_exec_unsafe`
+      # check it and fail closed (escalate) instead of trusting
+      # whatever partial `_CP_LOC` this left behind.
+      _CP_LOC_CAPPED=1
+      break
+    fi
     _cp_wate=0
     case "$1" in
       function)
@@ -1935,9 +2114,9 @@ _cp_locate_command_word() {             # segment
     esac
 
     if [ "$_cp_wate" = 0 ]; then
-      _cp_wl="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
+      _cp_wl="$(_cp_cmdword_dequote "$1")"; _cp_wl="$(printf '%s' "${_cp_wl##*/}" | tr 'A-Z' 'a-z')"
       case "$_cp_wl" in
-        sudo|doas|su|env|nice|ionice|nohup|time|timeout|gtimeout|stdbuf|setsid|command|builtin|exec|caffeinate)
+        sudo|doas|su|env|nice|ionice|nohup|time|timeout|gtimeout|stdbuf|setsid|command|builtin|exec|caffeinate|unbuffer|sandbox-exec)
           case "$_cp_wl" in
             sudo)    _cp_wv='ugphCDRT'; _cp_wvl='user|group|host|prompt|chdir|close-from|role|type|other-user' ;;
             su)      _cp_wv='csl';      _cp_wvl='command|shell|user' ;;
@@ -1947,6 +2126,12 @@ _cp_locate_command_word() {             # segment
             ionice)  _cp_wv='cnpt';     _cp_wvl='class|classdata|pid' ;;
             stdbuf)  _cp_wv='ioe';      _cp_wvl='input|output|error' ;;
             exec)    _cp_wv='a';        _cp_wvl='' ;;
+            # wrapper-unwrap (SPEC #257 r2 PART A 186-193): `sandbox-exec
+            # -f/-n/-p/-D` each take ONE separate value (`man
+            # sandbox-exec`); `unbuffer`'s only flag (`-p`) is boolean, so
+            # it needs no entry here — it already falls through to the
+            # value-less default below.
+            sandbox-exec) _cp_wv='nfpD'; _cp_wvl='' ;;
             *)       _cp_wv=;           _cp_wvl= ;;
           esac
           shift
@@ -1998,7 +2183,7 @@ _cp_locate_command_word() {             # segment
   done
   [ "$#" -gt 0 ] || return 1
 
-  _cp_wcmd="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
+  _cp_wcmd="$(_cp_cmdword_dequote "$1")"; _cp_wcmd="$(printf '%s' "${_cp_wcmd##*/}" | tr 'A-Z' 'a-z')"
 
   while [ "$_cp_wcmd" = busybox ] && [ "$#" -gt 1 ]; do
     shift
@@ -2006,7 +2191,7 @@ _cp_locate_command_word() {             # segment
       '>'|'>>'|'<'|'<>'|[0-9]'>'|[0-9]'>>'|[0-9]'<'|'&>'|'&>>') shift; [ "$#" -gt 1 ] && shift ;;
       '>'*|'<'*|[0-9]'>'*|[0-9]'<'*|'&>'*) shift ;;
     esac
-    _cp_wcmd="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z')"
+    _cp_wcmd="$(_cp_cmdword_dequote "$1")"; _cp_wcmd="$(printf '%s' "${_cp_wcmd##*/}" | tr 'A-Z' 'a-z')"
   done
 
   _CP_LOC=("$@")
@@ -2798,8 +2983,362 @@ _cp_git_dashed_verb() {                 # wcmd
   return 1
 }
 
-# `_cp_git_seg_exec_unsafe <protected-segment>` -> 0 (true) when this ONE
-# already-protected-and-carved segment is unsafe:
+# SPEC #257 r2 (PART A rows 186-193): `_cp_git_seg_exec_unsafe` already
+# unwraps every GENERIC launcher through `_cp_locate_command_word` (sudo,
+# env, nice, timeout, caffeinate, unbuffer, sandbox-exec, …: skip the
+# launcher's own value-opts, the very next word IS the real command) plus
+# `xargs`/`parallel`/`watch` (their own small value-opt set, via
+# `_cp_coderef_wrapped_command`). `chroot` and `flock` both take a
+# mandatory positional before the real command — `_cp_wrap_chroot_verb`/
+# `_cp_wrap_flock_verb` below extract it and the wrapped tail is judged
+# through `_cp_wrap_tail_unsafe`, same recursive shape as before.
+#
+# round 3 (SPEC #261 r3, review of #261 r2): `find -exec/-execdir/-ok/
+# -okdir`, `script`, `arch` and `xcrun` do NOT get that treatment anymore.
+# Two rounds tried to parse each one's own sub-grammar precisely enough to
+# recurse the wrapped command through the same git judgment a bare
+# invocation gets, and each reopened (round 1: H1/H2/H3/H4/M1/M2; round 2,
+# on top of round-1's own fixes: N1 glob command words, N2 clause
+# terminators read too loosely, N3 unreadable words outside the command
+# slot, N4 env set outside the wrapper's own segment, N5 a primary's own
+# ARGUMENT spelled `-exec` read as a new clause). This repo's rule once a
+# classifier keeps reopening on a sub-language: stop parsing it.
+#   * `script` ALWAYS escalates, command or not — it runs an interactive
+#     `$SHELL` session even with no trailing command, and agents never
+#     need it at all.
+#   * `arch` escalates the moment any word follows its own recognized
+#     flags (`_cp_wrap_arch_has_cmd` below) — bare `arch`/`arch -arm64`
+#     with nothing further is informational only (prints the machine's
+#     architecture, same as `uname -m`) and keeps trunk's verdict.
+#   * `xcrun` escalates the moment it would actually RUN a tool
+#     (`_cp_wrap_xcrun_verb` below returns unsafe for anything but the
+#     narrow read-only lookup shapes trunk already allowed: `--show-*`,
+#     and `-f`/`--find`/`-find` used WITHOUT a later `-r`/`--run`/`-run` —
+#     the LAST find/run flag on the line wins, same as round 2's H3).
+#   * `find -exec/-execdir/-ok/-okdir` is judged by a narrow allowlist
+#     instead (`_cp_find_exec_unsafe` below): a clause is safe ONLY when
+#     its command word is LITERALLY one of ten read-only tools and every
+#     other word in it is `{}`, the exact terminator (`\;`/`';'`/`+`), or
+#     text made only of `[A-Za-z0-9._/=-]` — anything else (another
+#     command, a glob/expansion, a word merely starting with `;`/`+`, an
+#     `-exec`-type flag spelling misread from a different primary's own
+#     argument) fails the WHOLE clause closed. `find` with no `-exec`-type
+#     primary at all is unaffected — trunk's existing verdict for find's
+#     own primaries stands.
+#   * `SHELL`/`DEVELOPER_DIR`/`TOOLCHAINS`/`SDKROOT` set anywhere ahead of
+#     a command (not just inside one of these wrappers' own segment — round
+#     2's N4: `/usr/bin/git` is Apple's xcode-select shim, so a bare
+#     `DEVELOPER_DIR=x git log` runs attacker code with no wrapper
+#     involved at all) are now exec-capable names in
+#     `_CP_EXEC_VAR_NAME_RE`/`_CP_EXEC_VAR_RE` below, the SAME text-
+#     anywhere/assignment-ordering gates `PAGER`/`BASH_ENV` already go
+#     through — no per-wrapper duplicate of that check needed here.
+_CP_WRAP_TAIL=()
+
+# `_cp_protect_text` turns a backslash-escaped OR quoted `;` (`\;` / `';'`
+# — how `find -exec … \;` is actually written, since a bare `;` would
+# otherwise end the shell statement before it reaches find at all) into
+# the control byte `\002`, never the literal ASCII character — every
+# caller downstream of it, including `_cp_find_exec_unsafe` below,
+# receives that byte, not `;`. A real UNESCAPED `;` can never appear
+# inside the args this function sees in the first place: it would already
+# have split the segment in two before `_cp_git_seg_exec_unsafe` ever ran.
+_CP_PROT_SEMI="$(printf '\002')"
+
+# `_cp_find_exec_unsafe <find's own args...>` -> 0 (unsafe) the moment ANY
+# `-exec`/`-execdir`/`-ok`/`-okdir` clause fails the strict read-only
+# allowlist below, OR a word sitting OUTSIDE an exec clause (find's own
+# primary/argument area) is flag-shaped (`-*`) and glob-unreadable — round
+# 2's N5/N3: `find . -name -exec -exec git … \;`'s first `-exec` is really
+# `-name`'s own pattern ARGUMENT, and a literal `-exe?`/`-exe[c]` can
+# glob-expand to the real flag at runtime if a file by that name exists.
+# 1 (safe) once every token has been scanned without ever hitting either
+# (find with no exec-type primary — trunk's verdict stands — or every
+# clause it does carry matched). A clause matches only when its command
+# word is EXACTLY one of the ten literal names (not merely alnum-shaped —
+# that is what stops a glob like `g*`/`[g]it` from passing as the command)
+# and every later word up to the terminator is `{}` or text made only of
+# `[A-Za-z0-9._/=-]` (SPEC #261 r3's own list, verbatim — no `$`, no `_`:
+# a clause argument this narrow is read-only-tool collateral, not a
+# closed hole, same tradeoff as the ten-tool allowlist itself) — a word
+# like `';x'` or `'++'` matches neither the exact terminator nor that
+# charset, so it fails the clause closed exactly like round 2's N2
+# wanted, with no separate "starts with" special case needed. No attempt
+# to resolve what a clause "means" beyond that literal shape — see the
+# round-3 header above.
+# SPEC #261 r5 (INNER-write): `file -C -m <path>` compiles a `.mgc`
+# magic-database file into the CURRENT directory — a write, not a read,
+# the exact thing this allowlist exists to exclude. `file`'s other flags
+# (`-b`, `-i`, …) are harmless, but this list has no per-flag grammar,
+# only a per-tool one, so `file` drops off the allowlist entirely rather
+# than special-casing `-C`/`-m`.
+_CP_FIND_EXEC_ALLOW_RE='^(wc|cat|head|tail|ls|stat|grep|md5|shasum)$'
+_CP_FIND_EXEC_ARG_RE='^[A-Za-z0-9._/=-]+$'
+# SPEC #261 r5 (INNER-libxo): `wc`/`ls` (and other BSD tools) load an
+# `--libxo=encoder=<name>` plugin by NAME — live-measured
+# `wc --libxo=encoder=../../../../tmp/evil` attempting to initialize that
+# encoder — so a clause argument shaped like a long option is not
+# automatically read-only collateral the way a short flag or a bare
+# path/pattern is. No clause argument may start with `--` unless it is
+# one of this short closed list (`grep`'s own harmless long forms); any
+# other `--something` fails the clause closed.
+_CP_FIND_EXEC_LONGOPT_ALLOW_RE='^--(count|lines|bytes|files-with-matches|fixed-strings)$'
+_cp_find_exec_unsafe() {                # args...
+  local -a a=("$@")
+  local i=0 n="${#a[@]}"
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -exec|-execdir|-ok|-okdir)
+        i=$((i + 1))
+        [ "$i" -lt "$n" ] || return 0
+        [[ "${a[$i]}" =~ $_CP_FIND_EXEC_ALLOW_RE ]] || return 0
+        i=$((i + 1))
+        while :; do
+          [ "$i" -lt "$n" ] || return 0
+          case "${a[$i]}" in
+            "$_CP_PROT_SEMI"|';'|'+')
+              i=$((i + 1)); break ;;
+            '{}')
+              i=$((i + 1)) ;;
+            *)
+              case "${a[$i]}" in
+                --*) [[ "${a[$i]}" =~ $_CP_FIND_EXEC_LONGOPT_ALLOW_RE ]] || return 0 ;;
+                *)   [[ "${a[$i]}" =~ $_CP_FIND_EXEC_ARG_RE ]] || return 0 ;;
+              esac
+              i=$((i + 1)) ;;
+          esac
+        done
+        ;;
+      -*'*'*|-*'?'*|-*'['*)
+        return 0 ;;
+      *) i=$((i + 1)) ;;
+    esac
+  done
+  return 1
+}
+
+# `_cp_wrap_arch_has_cmd <arch's own args...>` -> 0 (unsafe) the moment a
+# word follows `arch`'s own recognized flags (`man arch`: `[-32] [-64]
+# [[-arch_name | -arch arch_name]...] [-c] [-d envname] [-e envname=value]
+# [-h] prog [args...]`) — ANY trailing `prog` always escalates (round-3
+# header above), so unlike round 1/2 this never inspects what that word
+# actually is. 1 (safe, trunk's verdict) when arch carries nothing but its
+# own flags — a truly bare `arch`/`arch -arm64` just prints the machine's
+# architecture and runs nothing. An option this table does not list is
+# ambiguous enough to fail closed (0) rather than guess whether it takes a
+# value.
+_cp_wrap_arch_has_cmd() {               # args...
+  local -a a=("$@")
+  local i=0 n="${#a[@]}"
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -arch|-d|-e) i=$((i + 2)); continue ;;
+      -32|-64|-c|-h|-i386|-x86_64|-x86_64h|-arm64|-arm64e) i=$((i + 1)); continue ;;
+      -*) return 0 ;;
+    esac
+    return 0
+  done
+  return 1
+}
+
+# `_cp_wrap_xcrun_verb <xcrun's own args...>` -> 0 (unsafe) for any shape
+# that would actually RUN a tool — `xcrun [--sdk <SDK>] [--toolchain
+# <name>] [-v|--verbose] [-n|--no-cache] [-k|--kill-cache] [-l|--log]
+# [-f|--find] [-r|--run] <tool name> ...` (`man xcrun`) — with NO
+# exception for what that tool is (round-3 header above). 1 (safe, trunk's
+# verdict) ONLY for the genuinely read-only, nothing-executes shapes:
+# `--show-*` (always info-only; real xcrun REJECTS a trailing tool
+# argument after one with "unexpected trailing argument" rather than
+# running it) and `-f`/`--find`/`-find` used WITHOUT a later `-r`/`--run`/
+# `-run` — real xcrun tracks find-vs-run as a MODE and the LAST such flag
+# wins (round 2 H3), so `xcrun -f -r git …` really execs git (0) while
+# `xcrun -f git` only prints its path (1). `-sdk`/`--sdk` with a PATH
+# value, a `~` value, or `-toolchain`/`--toolchain` at all always
+# redirects xcrun's whole toolchain/SDK — unsafe regardless of what tool
+# name (if any) follows.
+#
+# round 3 (N3): a word encountered WHILE STILL SCANNING xcrun's own flags
+# (before the loop reaches the tool-name position) that carries `$`/
+# `@SUB@` is unreadable with the SAME consequence an unreadable `-sdk`
+# value already has — it could resolve to `-r`/`--run` at runtime and
+# flip a `-f`-only (never-executes) invocation into one that actually
+# runs the tool (`xcrun -f $R git …`, live-measured: real xcrun ran git
+# once $R expanded to `-r`). Checked ahead of the generic `-*)` catch-all
+# so it also covers a `$`/`@SUB@` value handed to `-sdk`/`--sdk=`, which
+# cannot be proven to lack a `/` the way a literal value can.
+_cp_wrap_xcrun_verb() {                 # args... -> 0 unsafe, 1 safe
+  local -a a=("$@")
+  local i=0 n="${#a[@]}" mode=run showonly=0
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      --show-sdk-path|--show-sdk-version|--show-sdk-build-version| \
+      --show-sdk-platform-path|--show-sdk-platform-version|--show-toolchain-path)
+        showonly=1; i=$((i + 1)); continue ;;
+      -f|--find|-find)
+        mode=find; i=$((i + 1)); continue ;;
+      -r|--run|-run)
+        mode=run; i=$((i + 1)); continue ;;
+      --toolchain|-toolchain|--toolchain=*)
+        return 0 ;;
+      --sdk|-sdk)
+        case "${a[$((i + 1))]-}" in */*|*'$'*|*'@SUB@'*|'~'*) return 0 ;; esac
+        i=$((i + 2)); continue ;;
+      --sdk=*)
+        case "${a[$i]#*=}" in */*|*'$'*|*'@SUB@'*|'~'*) return 0 ;; esac
+        i=$((i + 1)); continue ;;
+      -v|--verbose|-n|--no-cache|-k|--kill-cache|-l|--log|-log)
+        i=$((i + 1)); continue ;;
+      *'$'*|*'@SUB@'*)
+        return 0 ;;
+      -*) return 0 ;;
+    esac
+    break
+  done
+  [ "$showonly" = 1 ] && return 1
+  [ "$i" -lt "$n" ] || return 1
+  [ "$mode" = find ] && return 1
+  return 0
+}
+
+# `_cp_wrap_taskpolicy_has_cmd <taskpolicy's own args...>` -> 0 (unsafe)
+# the moment a word follows taskpolicy's own recognized flags (`man
+# taskpolicy`: two synopsis forms — `[-d policy] [-g policy] [-c clamp]
+# [-b] [-t thruput_tier] [-l latency_tier] [-a] [-s] [-S shims]
+# [-m limit] [-j pri] [-P pcontrol] program [arg1 [...]]`, or
+# `[-b|-B] [-t thruput_tier] [-l latency_tier] [-p pid]` to modify an
+# already-running process — neither form's own flags ever take a value
+# shaped like a program name). Same shape as `_cp_wrap_arch_has_cmd`:
+# ANY trailing word always escalates, no attempt to judge what it is. 1
+# (safe, trunk's verdict) when taskpolicy carries nothing but its own
+# flags — `taskpolicy -c utility` alone sets a clamp and runs nothing.
+# An option this table does not list fails closed (0) rather than guess
+# whether it takes a value.
+_cp_wrap_taskpolicy_has_cmd() {         # args...
+  local -a a=("$@")
+  local i=0 n="${#a[@]}"
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -d|-g|-c|-t|-l|-m|-j|-P|-p|-S) i=$((i + 2)); continue ;;
+      -b|-B|-a|-s) i=$((i + 1)); continue ;;
+      -*) return 0 ;;
+    esac
+    return 0
+  done
+  return 1
+}
+
+# `_cp_wrap_open_has_launcher_flag <open's own args...>` -> 0 (unsafe)
+# when `-a`/`--args` appears anywhere in open's argv (`open --help`:
+# `--args` passes all remaining arguments to the launched application's
+# `main()`; `-a <application>` picks which bundle to launch, same
+# "handing attacker-controlled argv/target to another program" risk
+# class as `script`). 1 (safe, trunk's verdict) for a bare
+# `open <file-or-url>` with neither flag — it can only ever open its own
+# argument, never pass argv through.
+#
+# round 5 (SPEC #261 r5, LNCH4-open, review MEDIUM): real `open` uses
+# getopt, so the app-selecting flag is not just the exact token `-a` —
+# it clusters with other booleans (`-na`, `-ga`) and takes an ATTACHED
+# value with no space (`-aTerminal`), live-measured against real `open`
+# in the review. `-b <bundle-id>` selects an application the same way
+# `-a <name>` does and was not covered at all. Any short cluster
+# (single `-`, no `--`, letters only — a real `open` flag or value
+# never needs anything else) containing `a` or `b` now escalates,
+# matching the review's fix; `--` long options are unaffected (a
+# literal `-` as the SECOND character, e.g. `--background`, never
+# matches the `[A-Za-z]` class that pattern requires there).
+_cp_wrap_open_has_launcher_flag() {     # args...
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --args) return 0 ;;
+      -[A-Za-z]*) case "$a" in *[ab]*) return 0 ;; esac ;;
+    esac
+  done
+  return 1
+}
+
+# `_cp_wrap_chroot_verb <chroot's own args...>` -> the command's full argv
+# for `chroot [-G group[,group...]] [-g group] [-u user] newroot [command
+# [arg...]]` (`man chroot`). The first non-option word is always
+# `newroot`, never the command. rc 1 when no command follows newroot (a
+# command-less invocation — runs the default shell, same risk class as
+# script with no command, but chroot is unchanged scope for this round).
+_cp_wrap_chroot_verb() {                # args...
+  _CP_WRAP_TAIL=()
+  local -a a=("$@")
+  local i=0 n="${#a[@]}" seen_root=0
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -G|-g|-u) i=$((i + 2)); continue ;;
+      -*) return 2 ;;
+    esac
+    if [ "$seen_root" = 0 ]; then seen_root=1; i=$((i + 1)); continue; fi
+    _CP_WRAP_TAIL=("${a[@]:i}")
+    return 0
+  done
+  return 1
+}
+
+# `_cp_wrap_flock_verb <flock's own args...>` -> the command's full argv
+# for `flock [-sxon] [-w timeout] file|directory command [args...]` (`man
+# flock`, util-linux). The first non-option word is always the lock
+# file/directory, never the command. rc 1 when no command follows it
+# (locking an already-open fd by number — not a wrapper). rc 2 on
+# `-c`/`--command`, which runs its STRING argument through a shell, or on
+# any other option this table does not list.
+_cp_wrap_flock_verb() {                 # args...
+  _CP_WRAP_TAIL=()
+  local -a a=("$@")
+  local i=0 n="${#a[@]}" seen_target=0
+  while [ "$i" -lt "$n" ]; do
+    case "${a[$i]}" in
+      -w|--timeout|-E|--conflict-exit-code) i=$((i + 2)); continue ;;
+      -s|--shared|-x|--exclusive|-n|--nonblock|-o|--close|-F|--no-fork|--verbose)
+        i=$((i + 1)); continue ;;
+      -c|--command) return 2 ;;
+      -*) return 2 ;;
+    esac
+    if [ "$seen_target" = 0 ]; then seen_target=1; i=$((i + 1)); continue; fi
+    _CP_WRAP_TAIL=("${a[@]:i}")
+    return 0
+  done
+  return 1
+}
+
+# `_cp_wrap_tail_unsafe <depth>` -> 0 (unsafe) when `_CP_WRAP_TAIL`
+# (already populated by `_cp_wrap_chroot_verb`/`_cp_wrap_flock_verb`)
+# invokes something unsafe. An unreadable OR glob-shaped command word
+# (`$VAR`, `@SUB@`, or a bare `*`/`?`/`[` — round 2 N1, same pattern
+# `_cp_bwt_dispatch_wrapped` already treats as unreadable) fails closed.
+# `git`/`git-<verb>` is judged the same way a direct invocation is.
+# Anything else re-runs the FULL segment judgment
+# (`_cp_git_seg_exec_unsafe`, same function this helper is called from) on
+# the joined tail, so a nested launcher/wrapper inside chroot/flock still
+# gets caught. Capped at `_CP_WRAP_MAX_DEPTH` so a pathological wrapper
+# chain cannot recurse unbounded; hitting the cap fails closed.
+_CP_WRAP_MAX_DEPTH=8
+_cp_wrap_tail_unsafe() {                # depth
+  local depth="$1" w0="${_CP_WRAP_TAIL[0]-}" wv
+  case "$w0" in ''|*'$'*|*'@SUB@'*|*'*'*|*'?'*|*'['*) return 0 ;; esac
+  wv="$(printf '%s' "${w0##*/}" | tr 'A-Z' 'a-z')"
+  case "$wv" in
+    git)
+      _cp_git_unsafe_tokens "${_CP_WRAP_TAIL[@]:1}" && return 0
+      return 1 ;;
+    git-*)
+      local gv
+      if gv="$(_cp_git_dashed_verb "$wv")"; then
+        _cp_git_unsafe_tokens "$gv" "${_CP_WRAP_TAIL[@]:1}" && return 0
+      fi
+      return 1 ;;
+  esac
+  [ "$depth" -ge "$_CP_WRAP_MAX_DEPTH" ] && return 0
+  _cp_git_seg_exec_unsafe "${_CP_WRAP_TAIL[*]}" "$((depth + 1))"
+}
+
+# `_cp_git_seg_exec_unsafe <protected-segment> [depth]` -> 0 (true) when
+# this ONE already-protected-and-carved segment is unsafe:
 #   * a `GIT_*=`/`PAGER=`/`EDITOR=`/`VISUAL=` assignment anywhere ahead of
 #     the resolved command word — through any chain of launchers
 #     (`command`, `nice`, `time`, `stdbuf -i0`, `setsid`, another
@@ -2807,12 +3346,20 @@ _cp_git_dashed_verb() {                 # wcmd
 #     for every caller; read back from its `_CP_LOC_SKIPPED` rather than
 #     re-splitting the segment a second, possibly-inconsistent way;
 #   * `git`/`git-<verb>` itself failing `_cp_git_unsafe_tokens`'s shape;
-#   * a fan-out runner (`xargs`/`parallel`) wrapping git — its real
-#     subcommand comes from piped input this policy cannot see at all, so
-#     it is unsafe regardless of what static argv is present.
-_cp_git_seg_exec_unsafe() {             # protected-segment
-  local seg="$1" tok
+#   * a fan-out runner (`xargs`/`parallel`/`watch`) wrapping git — its real
+#     subcommand comes from piped input (`xargs`/`parallel`) or is simply
+#     re-read every cycle (`watch`) in a way this policy cannot see ahead
+#     of time, so it is unsafe regardless of what static argv is present;
+#   * `find -exec/-execdir/-ok/-okdir` carrying a clause that fails
+#     `_cp_find_exec_unsafe`'s allowlist;
+#   * `script` at all, or `arch`/`xcrun` running an actual command — round
+#     3 header above;
+#   * `chroot`/`flock` wrapping git, DIRECTLY or through a nested
+#     launcher/wrapper — same shape as before this round, unchanged.
+_cp_git_seg_exec_unsafe() {             # protected-segment [depth]
+  local seg="$1" depth="${2:-0}" tok
   _cp_locate_command_word "$seg" || return 1
+  [ "$_CP_LOC_CAPPED" = 1 ] && return 0
   for tok in ${_CP_LOC_SKIPPED[@]+"${_CP_LOC_SKIPPED[@]}"}; do
     case "$tok" in GIT_*=*|PAGER=*|EDITOR=*|VISUAL=*) return 0 ;; esac
   done
@@ -2826,10 +3373,95 @@ _cp_git_seg_exec_unsafe() {             # protected-segment
         _cp_git_unsafe_tokens "$v" "${_CP_LOC[@]:1}" && return 0
       fi
       return 1 ;;
-    xargs|parallel)
+    # SPEC #261 r6 (item 4): the SAME fan-out-is-unsafe-regardless
+    # reasoning above applies to a wrapped `find` just as much as a
+    # wrapped `git` — `xargs find . * -maxdepth 0` appends whatever
+    # STDIN hands it to find's own argv, in a way this policy cannot see
+    # ahead of time either.
+    xargs|parallel|watch)
       local wrapped
       wrapped="$(_cp_coderef_wrapped_command "$_cp_wcmd" "${_CP_LOC[@]:1}")" || return 1
-      case "${wrapped##*/}" in git|git-*) return 0 ;; esac
+      case "${wrapped##*/}" in git|git-*|find) return 0 ;; esac
+      return 1 ;;
+    find)
+      _cp_find_exec_unsafe "${_CP_LOC[@]:1}" && return 0
+      return 1 ;;
+    script)
+      return 0 ;;
+    # #261 r3 live-run finding (1): direnv/mise have no safe-to-parse
+    # value-opt grammar worth building (direnv's exec/allow/other
+    # subcommands, mise's exec/run/other subcommands) and agents never
+    # need either — any trailing word at all after the wrapper name
+    # escalates, same unconditional rule as `script`. A bare invocation
+    # with nothing trailing (nothing can run) still falls through to the
+    # default `return 1` below.
+    # SPEC #261 r6 (item 4, review MEDIUM "argv launchers omitted from
+    # the dispatch"): `lockf`/`ssh-agent` (a mandatory positional, or an
+    # env-setting exec, ahead of the real command) and `dtrace -c`/
+    # `lldb --` (their own value-opt grammars run arbitrary command
+    # strings or debugger script, not worth building a safe-to-parse
+    # table for) join direnv/mise's existing "any trailing word
+    # escalates" rule rather than a second one-off list.
+    direnv|mise|lockf|ssh-agent|dtrace|leaks|lldb)
+      [ "${#_CP_LOC[@]}" -gt 1 ] && return 0
+      return 1 ;;
+    # #261 r4: unlike direnv/mise, taskpolicy's OWN flag grammar is
+    # small, fixed, and fully documented (`man taskpolicy`) — every flag
+    # either takes exactly one value or is boolean, so a trailing PROGRAM
+    # (the only thing worth escalating for) is unambiguous once those
+    # flags are walked off, same pattern `_cp_wrap_arch_has_cmd` already
+    # uses. `taskpolicy -c utility` alone (round-3 live-run over-block,
+    # main-probes FAIL) carries no trailing program and matches origin/
+    # main's own verdict (main has no taskpolicy rule at all) — allow.
+    # `taskpolicy -c utility git -C … status` still escalates unchanged.
+    taskpolicy)
+      _cp_wrap_taskpolicy_has_cmd "${_CP_LOC[@]:1}" && return 0
+      return 1 ;;
+    # #261 r4: launchctl's subcommand grammar is too broad to parse
+    # safely in general (`submit`/`bootstrap` can run or register
+    # arbitrary programs), so every subcommand but the single literal,
+    # argument-less `list` keeps the round-3 "any trailing word
+    # escalates" rule. Bare `launchctl list` (round-3 live-run
+    # over-block, main-probes FAIL) is a pure read — it cannot run
+    # anything — and matches origin/main's own verdict (main's only
+    # launchctl rule is the unrelated getenv/export env-dump check, which
+    # doesn't match `list` either). `launchctl list com.apple.Finder` and
+    # every other subcommand/trailing-arg shape still escalate unchanged.
+    launchctl)
+      if [ "${#_CP_LOC[@]}" -eq 2 ] && [ "${_CP_LOC[1]}" = list ]; then
+        return 1
+      fi
+      [ "${#_CP_LOC[@]}" -gt 1 ] && return 0
+      return 1 ;;
+    arch)
+      _cp_wrap_arch_has_cmd "${_CP_LOC[@]:1}" && return 0
+      return 1 ;;
+    xcrun)
+      _cp_wrap_xcrun_verb "${_CP_LOC[@]:1}" && return 0
+      return 1 ;;
+    # #261 r4: `open -a <application>`/`open … --args …` are a stock
+    # macOS launcher capable of passing attacker-controlled argv to
+    # another application's `main()` (`open --help`: "--args All
+    # remaining arguments are passed in argv to the application's main()
+    # function") — join the always-escalate launcher class, same as
+    # `script`. Bare `open <file-or-url>` (no `-a`/`--args` anywhere)
+    # keeps trunk's verdict — it cannot pass argv to anything.
+    open)
+      _cp_wrap_open_has_launcher_flag "${_CP_LOC[@]:1}" && return 0
+      return 1 ;;
+    chroot)
+      local rc
+      _cp_wrap_chroot_verb "${_CP_LOC[@]:1}"; rc=$?
+      [ "$rc" = 1 ] && return 1
+      [ "$rc" = 2 ] && return 0
+      _cp_wrap_tail_unsafe "$depth" && return 0
+      return 1 ;;
+    flock)
+      local rc
+      _cp_wrap_flock_verb "${_CP_LOC[@]:1}"; rc=$?
+      [ "$rc" = 1 ] && return 1
+      [ "$rc" = 2 ] && return 0
+      _cp_wrap_tail_unsafe "$depth" && return 0
       return 1 ;;
     *) return 1 ;;
   esac
@@ -2844,7 +3476,13 @@ _cp_git_seg_exec_unsafe() {             # protected-segment
 # (sourced by non-interactive bash/sh before the first command),
 # `PROMPT_COMMAND` (run before every prompt a pager/pty might print), and
 # `LD_*`/`DYLD_*` (dynamic-linker preload) are exec-capable the same way.
-_CP_EXEC_VAR_RE='^(GIT_[A-Za-z0-9_]*|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH_ENV|ENV|PROMPT_COMMAND|LD_[A-Za-z0-9_]*|DYLD_[A-Za-z0-9_]*)$'
+# round 3 (SPEC #261 r3, N4): `SHELL` (what `script`/`chroot` with no
+# trailing command execs) and `DEVELOPER_DIR`/`TOOLCHAINS`/`SDKROOT`
+# (`/usr/bin/git` is Apple's xcode-select shim — these redirect which
+# toolchain/SDK it and every other Xcode tool resolves to, no `xcrun`
+# involved) are exec-capable the same way, wherever they are set ahead of
+# a command — not just inside a wrapper's own segment.
+_CP_EXEC_VAR_RE='^(GIT_[A-Za-z0-9_]*|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH_ENV|ENV|PROMPT_COMMAND|LD_[A-Za-z0-9_]*|DYLD_[A-Za-z0-9_]*|SHELL|DEVELOPER_DIR|TOOLCHAINS|SDKROOT)$'
 
 # `_cp_exec_var_stmt_kind <protected-statement>` -> prints one of
 # "execvar"/"source"/"git"/"" describing what this ONE statement (already
@@ -3037,7 +3675,7 @@ EOF
 # read shape, but this gate runs first and considers "alias." present in
 # the text regardless. Accepted false positive, not a bug; do not weaken
 # the name match to fix it (that would reopen the write shape).
-_CP_EXEC_VAR_NAME_RE='GIT_SSH_COMMAND|GIT_SSH|GIT_PAGER|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_EXTERNAL_DIFF|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND|GIT_EXEC_PATH|GIT_CONFIG[A-Za-z0-9_]*|GIT_DIR|GIT_WORK_TREE|GIT_TEMPLATE_DIR|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH_ENV|ENV|PROMPT_COMMAND|LD_PRELOAD|DYLD_[A-Za-z0-9_]*'
+_CP_EXEC_VAR_NAME_RE='GIT_SSH_COMMAND|GIT_SSH|GIT_PAGER|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_EXTERNAL_DIFF|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND|GIT_EXEC_PATH|GIT_CONFIG[A-Za-z0-9_]*|GIT_DIR|GIT_WORK_TREE|GIT_TEMPLATE_DIR|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|BASH_ENV|ENV|PROMPT_COMMAND|LD_PRELOAD|DYLD_[A-Za-z0-9_]*|SHELL|DEVELOPER_DIR|TOOLCHAINS|SDKROOT'
 _CP_EXEC_CFGKEY_RE='core\.pager|core\.sshcommand|core\.editor|core\.fsmonitor|core\.hookspath|core\.gitproxy|diff\.external|\.textconv|credential\.helper|sequence\.editor|alias\.|include\.path|includeif|uploadpack\.|receivepack\.|filter\.|remote\.[^[:space:]]*\.uploadpack'
 
 # Round 8 (herdr-control#254 PR comment, round-7 item A): `HOME`,
@@ -3205,8 +3843,19 @@ EOF
 # used only to find an unquoted brace-expansion word, where "quoted" has
 # to mean something (a shell never brace-expands inside quotes). Every
 # OTHER check in this function is deliberately quote-blind.
+#
+# SPEC #261 r5 (ATK4-newline, review item shared with the find-injection
+# gate): AWK's default per-line records reset `st` to 0 at the top of
+# EVERY line, so a real embedded newline inside a quoted multi-line
+# value closed the quote early and read the far side's closing quote as
+# OPENING a fresh one — silently hiding whatever unquoted text followed
+# it on that next line. Same fix `_cp_protect_text` already uses:
+# flatten every real `\n` to the otherwise-unused `\017` byte BEFORE awk
+# ever sees the text, so the whole input is exactly one record and `st`
+# is never reset mid-string; restore real newlines afterward so a
+# caller that inspects the returned TEXT still sees one.
 _cp_unquoted_text() {                   # raw -> raw with quoted spans removed
-  printf '%s' "$1" | awk '
+  printf '%s' "$1" | tr '\n' '\017' | awk '
     BEGIN { SQ = sprintf("%c", 39); DQ = "\"" }
     {
       line = $0; n = length(line); st = 0; out = ""
@@ -3225,7 +3874,7 @@ _cp_unquoted_text() {                   # raw -> raw with quoted spans removed
         if (c == DQ) st = 0
       }
       print out
-    }'
+    }' | tr '\017' '\n'
 }
 
 _cp_exec_name_or_opaque_present() {     # raw -> 0 if an exec-capable name/config-key/opaque word is present anywhere
@@ -3233,8 +3882,233 @@ _cp_exec_name_or_opaque_present() {     # raw -> 0 if an exec-capable name/confi
   local raw="$1"
   grep -qE "(^|[^A-Za-z0-9_])(${_CP_EXEC_VAR_NAME_RE})([^A-Za-z0-9_]|\$)" <<<"$raw" && return 0
   grep -qiE "$_CP_EXEC_CFGKEY_RE" <<<"$raw" && return 0
-  grep -qE '\{[^{}]*,[^{}]*\}' <<<"$(_cp_unquoted_text "$raw")" && return 0
+  # SPEC #261 r5 (ATK4-braceseq): bash brace-expands a SEQUENCE
+  # (`{a..z}`/`{0..9}`), not just the comma form — a one-element
+  # sequence is a plain letter (`{g..g}it` -> `git`), so the comma-only
+  # regex this used to be missed it. `\.\.` added as a second
+  # alternative, same unquoted-text scope as before.
+  grep -qE '\{[^{}]*(,|\.\.)[^{}]*\}' <<<"$(_cp_unquoted_text "$raw")" && return 0
   grep -qF "\$'" <<<"$raw" && return 0
+  return 1
+}
+
+# `_cp_find_word_injection_present <raw>` -> 0 (true) when, after
+# genuinely locating each segment's command word (round 5, SPEC #261 r5,
+# replacing rounds 3-4's raw-text `grep -q ... find ...` cut):
+#   (a) the resolved command word carries a quote or backslash character
+#       in a shape OTHER than one fully-quoted plain word ('x'/"x",
+#       content only `[A-Za-z0-9._/+-]`) — a clean single-quoted word is
+#       unquoted and treated exactly as if it had been typed bare (round
+#       5b, Main's live run: a caller that shell-quotes every argv word
+#       individually, `'python3' '-m' 'http.server' '8123'`, is
+#       ordinary); MIXED or PARTIAL quoting (`fi''nd`, `f\ind`,
+#       `fin""d`, anything a single pair of matching quotes around the
+#       WHOLE word doesn't explain) stays opaque, for ANY command, not
+#       just find — see the next header just below `_cp_protect_text_qa`'s
+#       own, for why that alone closes the whole ATK4-desync class; or
+#   (b) the resolved (bare-or-cleanly-quoted) command word's basename is
+#       literally `find`, and a word sitting OUTSIDE any `-exec`/
+#       `-execdir`/`-ok`/`-okdir` clause in THIS segment's own argv
+#       carries an unquoted `$`, `@SUB@` (backtick or `$(...)`), `*`,
+#       `?`, `[`, or brace (`{a,b}`/`{a..z}`) — any of which can expand
+#       at shell-glob or runtime into a brand-new primary (including a
+#       planted `-exec`) that `_cp_find_exec_unsafe`'s static token walk
+#       never sees (round 2's N3, round 4's ATK-glob6, round 5's
+#       ATK4-braceseq). Clause-internal words are left to
+#       `_cp_find_exec_unsafe`'s own allowlist (called separately, via
+#       `_cp_git_seg_exec_unsafe`'s `find)` case, against the ordinary
+#       fully-protected text) — this only widens what counts as find's
+#       own primary/path area.
+#
+# ATK4-desync (round 4 review HIGH): the OLD version cut RAW at the
+# first substring "find", wherever it sat — `cd "/tmp/findings" &&
+# find …`, `grep -l 'find' x; find …`, `"find" .`, `fi''nd .`, `f\ind .`
+# all either desynced the cut into the middle of an unrelated quote or
+# never matched the trigger grep at all (a quote/backslash-spliced
+# spelling has no contiguous word "find" to find). Locating the command
+# word per SEGMENT via `_cp_locate_command_word` — the same walk the
+# git rules use, fed `_cp_protect_text_qa`'s quote-PRESERVING output
+# instead of the ordinary quote-DROPPING one — removes the cut
+# entirely: there is no substring search left to desync, and a quoted
+# or backslash-spliced spelling fails the exact `find` comparison and
+# instead gets caught by (a) above, since bash never needs to quote a
+# real command word.
+#
+# ATK4-newline (round 4 review HIGH, shared root cause with the global
+# brace gate above): a real embedded newline inside a quoted multi-line
+# find argument used to close the quote early once execution reached a
+# second awk record. `_cp_protect_text_qa` flattens real newlines to
+# `\017` before its own awk ever runs (same fix `_cp_protect_text`
+# already had) and deliberately does NOT restore them — see its own
+# header — so this function's `while IFS= read -r seg` segment split
+# can never see that `\017` as a fresh line either.
+#
+# `_cp_find_argv_unsafe <find's own quote-preserving args...>` -> 0
+# (unsafe) the moment a word OUTSIDE an -exec/-execdir/-ok/-okdir clause
+# carries an unquoted expansion/glob/brace. Factored out of the per-
+# segment walk below so SPEC #261 r6's substitution-body recursion
+# (R5-SUBST, just below) can run the EXACT SAME find-safety check
+# against a `$(find …)`/`` `find …` `` body instead of a looser,
+# second-guessed one.
+_cp_find_argv_unsafe() {                # find's own quote-preserving args...
+  local -a fargs=("$@")
+  local fi=0 fn="${#fargs[@]}" term unq
+  while [ "$fi" -lt "$fn" ]; do
+    case "${fargs[$fi]}" in
+      -exec|-execdir|-ok|-okdir)
+        fi=$((fi + 1))
+        while [ "$fi" -lt "$fn" ]; do
+          term="${fargs[$fi]}"
+          term="${term#\\}"; term="${term#\'}"; term="${term%\'}"
+          term="${term#\"}"; term="${term%\"}"
+          fi=$((fi + 1))
+          case "$term" in "$_CP_PROT_SEMI"|'+') break ;; esac
+        done
+        ;;
+      *)
+        unq="$(_cp_unquoted_text "${fargs[$fi]}")"
+        case "$unq" in
+          *'$'*|*'@SUB@'*|*'*'*|*'?'*|*'['*) return 0 ;;
+        esac
+        [[ "$unq" =~ \{[^{}]*(,|\.\.)[^{}]*\} ]] && return 0
+        fi=$((fi + 1)) ;;
+    esac
+  done
+  return 1
+}
+
+# `_cp_sub_text_risk_present <raw>` -> 0 if the word `find` appears
+# anywhere inside an UNQUOTED command-substitution span (`$(...)` or
+# `` `...` ``, at ANY nesting depth) in RAW — ONE linear-time scan, no
+# recursion, no per-level external-process re-invocation.
+#
+# SPEC #261 r6 round 2 (Main's live run, verify-command-policy.sh): the
+# FIRST version of this check (`_cp_sub_bodies`) extracted each nesting
+# level's body as its own string and recursed — a bash function call,
+# each spawning a fresh `printf|tr|awk` pipeline, per level. A 200-deep
+# `$(...)` nesting probe hung past the suite's 5s timeout: not
+# algorithmically exponential, but 200+ external-process spawns for one
+# classification is a real DoS surface on text an attacker fully
+# controls. This version tracks substitution DEPTH with one integer
+# counter inside a SINGLE awk pass over the whole raw text (same
+# character-at-a-time state machine `_cp_protect_text_qa` already uses
+# for quotes, extended with a depth counter instead of a jump-over
+# `skipsub`), so 200 levels of nesting is 200 more characters to walk
+# in the SAME pass, not 200 more process spawns.
+#
+# Deliberately coarser than the extraction version it replaces: it does
+# NOT re-run `_cp_find_argv_unsafe` against each substitution's own
+# argv (a quoted-safe `$(find . -name '*.txt')` now also escalates, not
+# just the unquoted-glob shape) — matching SPEC's literal R5-SUBST text
+# ("do not try to inspect it") rather than the narrower, inspection-
+# based version this replaces. Still deliberately FIND-ONLY, not git:
+# `_cp_git_unsafe_tokens` already scans git's own argv for `$`/`@SUB@`
+# when git is a segment's OWN resolved command, and a substitution
+# naming git as its own command (`$(git rev-parse --show-toplevel)`) is
+# a pinned-allow idiom (`verify-command-policy.sh` CPW-05/P3-F2) a
+# blanket find-or-git version would break for no static-safety gain.
+_cp_sub_text_risk_present() {           # raw
+  local LC_ALL=C LANG=C
+  local raw="$1" hit
+  hit="$(printf '%s' "$raw" | tr '\n' '\017' | awk '
+    function isword(line, pos,    a, b) {
+      a = substr(line, pos - 1, 1)
+      b = substr(line, pos + 4, 1)
+      if (a ~ /[A-Za-z0-9_]/) return 0
+      if (b ~ /[A-Za-z0-9_]/) return 0
+      return 1
+    }
+    {
+      SQ = sprintf("%c", 39); DQ = "\""; BT = sprintf("%c", 96)
+      line = $0; n = length(line); st = 0; sd = 0; i = 1; found = 0
+      while (i <= n) {
+        c = substr(line, i, 1)
+        if (st == 1) {
+          if (c == SQ) { st = 0; i++; continue }
+          i++; continue
+        }
+        if (st == 3) {
+          if (c == BT) { sd--; st = stk[sd]; i++; continue }
+          if (c == "\\") { i += 2; continue }
+          if (sd > 0 && substr(line, i, 4) == "find" && isword(line, i)) { found = 1 }
+          i++; continue
+        }
+        if (st == 2 && c == DQ) { st = 0; i++; continue }
+        if (st == 2 && c == "\\") { i += 2; continue }
+        if (st == 0 && c == "\\") { i += 2; continue }
+        if (st == 0 && c == "$" && (substr(line, i+1, 1) == SQ || substr(line, i+1, 1) == DQ)) {
+          st = (substr(line, i+1, 1) == SQ) ? 1 : 2; i += 2; continue
+        }
+        if (st == 0 && c == SQ) { st = 1; i++; continue }
+        if (st == 0 && c == DQ) { st = 2; i++; continue }
+        # A new substitution level ALWAYS starts fresh (unquoted)
+        # parsing for its own content, regardless of the ENCLOSING
+        # quote state it was entered from (`"$(find …)"` is valid —
+        # the inner command is its own quoting context) — push the
+        # enclosing state so the matching close restores it, rather
+        # than staying stuck in whatever state we entered from.
+        if (c == BT) { stk[sd] = st; sd++; st = 3; i++; continue }
+        if (c == "$" && substr(line, i+1, 1) == "(") { stk[sd] = st; sd++; st = 0; i += 2; continue }
+        if (sd > 0 && st == 0 && c == ")") { sd--; st = stk[sd]; i++; continue }
+        if (sd > 0 && substr(line, i, 4) == "find" && isword(line, i)) { found = 1 }
+        i++; continue
+      }
+      print found
+    }')"
+  [ "$hit" = 1 ] && return 0
+  return 1
+}
+_cp_find_word_injection_present() {     # raw -> 0 if a segment's resolved command word is mixed/partially quoted, or is find (bare or cleanly-quoted) with an unsafe unquoted word in its own argv, or a command-substitution body resolves to an unsafe find invocation
+  local LC_ALL=C LANG=C
+  local raw="$1" seg unq tok inner cmdbase
+  while IFS= read -r seg; do
+    [ -n "${seg//[[:space:]]/}" ] || continue
+    _cp_locate_command_word "$seg" || continue
+    tok="${_CP_LOC[0]}"
+    # (a) — a command word that is ONE fully-quoted PLAIN word ('x'/"x",
+    # content only [A-Za-z0-9._/+-], no embedded quote/backslash/`$`) is
+    # exactly equivalent to typing it unquoted (round 5, Main's live run:
+    # a caller that shell-quotes every argv word individually —
+    # `'python3' '-m' 'http.server' '8123'` — is ordinary, not an
+    # obfuscation) — unquote it and resolve the basename the same way
+    # `_cp_locate_command_word` does for a bare word, so every later rule
+    # (including the find-argv scan below) sees it exactly as it would
+    # see the unquoted spelling. Anything else carrying a quote or
+    # backslash character is MIXED or PARTIAL quoting/escaping
+    # (`fi''nd`, `f\ind`, `fin""d`, a quoted launcher glued to more text)
+    # — a real command word never needs that, so it stays opaque by
+    # construction, same severity as an unresolved expansion.
+    inner=""
+    case "$tok" in
+      \'*\') inner="${tok#\'}"; inner="${inner%\'}" ;;
+      \"*\") inner="${tok#\"}"; inner="${inner%\"}" ;;
+    esac
+    if [ -n "$inner" ] && [[ "$inner" =~ $_CP_QA_CLEAN_WORD_RE ]]; then
+      cmdbase="$(printf '%s' "${inner##*/}" | tr 'A-Z' 'a-z')"
+    else
+      case "$tok" in
+        *\'*|*'"'*|*'\'*) return 0 ;;
+      esac
+      cmdbase="$_cp_wcmd"
+    fi
+    [ "$cmdbase" = find ] || continue
+    # (b) — walk find's own argv (quote-aware tokens), skipping the
+    # CONTENTS of every -exec/-execdir/-ok/-okdir clause (that allowlist
+    # is _cp_find_exec_unsafe's job, run separately against ordinary
+    # protected text) and checking every other word for an unquoted
+    # expansion/glob/brace.
+    _cp_find_argv_unsafe "${_CP_LOC[@]:1}" && return 0
+  done <<EOF
+$(_cp_segments_qa "$raw")
+EOF
+  # (c) — R5-SUBST (SPEC #261 r6, review HIGH): a command substitution's
+  # own text is never executed AS this segment's command word —
+  # `printf '%s\n' "$(find . * -maxdepth 0)"` hands printf a VALUE, so
+  # the segment loop above never sees `find` here at all. ONE linear
+  # scan (`_cp_sub_text_risk_present`, round 2 of this fix — see its own
+  # header for why the first, recursive version hung) — not a new,
+  # per-body inspection pass.
+  _cp_sub_text_risk_present "$raw" && return 0
   return 1
 }
 
@@ -4836,12 +5710,29 @@ _cp_gate_eval_alias_shopt() {           # protected segment -> 0 if eval/alias/e
 # `eval`/an alias, it just has no keyword to grep for (`e=e; cmd=${e}val;
 # "$cmd" "…"`, live-measured allow before this). `_cp_protect_text` already
 # collapsed any `$(...)`/backtick to the literal token `@SUB@`, so checking
-# the resolved word for a leading `$` or an embedded `@sub@` (case-folded by
 # `_cp_locate_command_word`) catches both shapes with no new parsing.
-_cp_gate_command_word_is_expansion() {  # protected segment -> 0 if the command word is an unresolved expansion
+#
+# round 3 (SPEC #261 r3, N1 — already on trunk, not just the wrapper
+# shapes this PR touches): a command word carrying an unquoted
+# `*`/`?`/`[` is exactly as unreadable as an expansion — `[g]it`, `gi?`,
+# `g*` and `/usr/bin/gi[t]` all resolve to the real `git` binary with no
+# `$`/backtick anywhere, bare or through any wrapper/path prefix. Same
+# glob-is-unreadable pattern `_cp_bwt_dispatch_wrapped` already uses for
+# the write-target scanner, applied here too so both the bare and every
+# wrapped shape close in one edit.
+#
+# round 5 (SPEC #261 r5, ATK4-braceseq): a command word carrying a
+# brace (`{g..g}it`, `{f..f}ind`) is unreadable the same way — bash
+# brace-expands a one-element SEQUENCE (`{g..g}`) to a plain letter run
+# with no comma anywhere, so it reaches this case bare, with neither a
+# `$`/`@SUB@` nor a glob character to catch it otherwise. The comma form
+# (`{git,}`) is already caught by the whole-text gate just above
+# (`_cp_exec_name_or_opaque_present`); this closes the command-WORD
+# position specifically, sequence or comma, bare or wrapped.
+_cp_gate_command_word_is_expansion() {  # protected segment -> 0 if the command word is an unresolved expansion or glob
   _cp_locate_command_word "$1" || return 1
   case "$_cp_wcmd" in
-    '$'*|*'@sub@'*) return 0 ;;
+    '$'*|*'@sub@'*|*'*'*|*'?'*|*'['*|*'{'*) return 0 ;;
   esac
   return 1
 }
@@ -5009,6 +5900,14 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   # folded into the text-anywhere gate just above.
   _cp_exec_assign_present "$raw" &&
     _cp_consider 1 "command text assigns HOME/XDG_CONFIG_HOME/PATH ahead of a command — it can redirect where git finds its config or the programs it shells out to"
+
+  # escalate — round 3 (SPEC #261 r3, N3): an unquoted expansion sitting
+  # anywhere in find's own argv can inject a brand-new `-exec` primary at
+  # runtime that `_cp_find_exec_unsafe`'s token walk never sees. See
+  # `_cp_find_word_injection_present`'s own header, just below
+  # `_cp_exec_name_or_opaque_present`, for why this has to run on raw text.
+  _cp_find_word_injection_present "$raw" &&
+    _cp_consider 1 "command text names find and also carries an unquoted \$ or backtick expansion — it can inject a new -exec clause find's own argv parsing never sees"
 
   # escalate — round 9 (herdr-control#254 PR comment, round-8 review item
   # A): an assignment builtin (`export`/`declare`/`typeset`/`local`/

