@@ -177,10 +177,12 @@ if command -v bun >/dev/null 2>&1; then
   hook_js='const mod = await import(process.env.HOOK); const h = {}; mod.default({on: (e, f) => { h[e] = f; }});
     await new Promise((res) => setTimeout(res, 700)); // omp: session start precedes the first tool call
     const cases = JSON.parse(process.env.CASES); const out = [];
-    for (const c of cases) { const samples = []; let r;
-      for (let i = 0; i < 3; i++) { const t = performance.now(); try { r = h.tool_call(c.ev, {cwd: process.env.WT}); } catch (err) { r = "THREW"; } samples.push(performance.now() - t); }
+    for (const c of cases) { const samples = []; const rs = [];
+      for (let i = 0; i < 3; i++) { const t = performance.now(); let v;
+        try { const r = h.tool_call(c.ev, {cwd: process.env.WT}); v = r?.block ? "BLOCK" : "ALLOW"; } catch (err) { v = "THREW"; }
+        samples.push(performance.now() - t); rs.push(v); }
       samples.sort((a, b) => a - b);
-      out.push({id: c.id, r: r === "THREW" ? "THREW" : (r?.block ? "BLOCK" : "ALLOW"), ms: samples[1]}); }
+      out.push({id: c.id, r: rs[0], rs, ms: samples[1]}); }
     console.log(JSON.stringify(out));
     await new Promise((res) => setTimeout(res, 1000)); // let detached children read stdin before this short-lived host exits'
   cases="$(jq -nc --arg wt "$wt" '[
@@ -200,21 +202,30 @@ if command -v bun >/dev/null 2>&1; then
   [ -n "$mine" ] && [ "$(printf '%s' "$mine" | jq -c '[.[]|{id,r}]')" = "$(printf '%s' "$base" | jq -c '[.[]|{id,r}]')" ] \
     && ok "worker: every return value identical to origin/main ($(printf '%s' "$mine" | jq -c '[.[]|.r]'))" \
     || not_ok "worker return values differ: mine=$mine base=$base"
-  printf '%s' "$mine" | jq -e 'all(.[]; .r != "THREW")' >/dev/null && ok "no handler threw (null/junk events included)" || not_ok "a handler threw: $mine"
+  printf '%s' "$mine" | jq -e 'all(.[]; (.rs | unique | length) == 1 and (.rs[0] != "THREW"))' >/dev/null \
+    && ok "no handler threw and all 3 median-of-3 samples agree" \
+    || not_ok "a sample threw or verdicts disagreed across the 3 calls: $mine"
   # Relative budget: compare each bash/eval case's median-of-3 ms to bash_allow's,
-  # not an absolute wall-clock number (that flakes under parallel-suite load —
-  # measured load-stable at delta +14 on this branch, +9 at pre-fix 243e775,
-  # both well under +15). #251's own regression measures about +9ms with the
-  # median of 3 (down from the +21ms single-sample figure it shipped with) —
-  # this check detects a real regression over 15ms on the reserved path
-  # (proven with an injected +30ms delay, PROOF.md round3-negative: delta 38,
-  # not_ok), but a regression smaller than that can median its way under the
-  # budget. Absolute 150ms ceiling still catches a pathological hang.
+  # not an absolute wall-clock number (that flakes under parallel-suite load).
+  # This catches cost that depends on the command text (e.g. the write-target
+  # parser on a longer command) but not cost every bash call pays regardless
+  # of its text (#251's own regression was that kind, measuring about +9ms).
   allow_ms="$(printf '%s' "$mine" | jq '[.[]|select(.id=="bash_allow")|.ms][0]')"
-  deltas="$(printf '%s' "$mine" | jq --argjson allow "$allow_ms" -c '[.[]|select(.id|test("^(bash|eval)"))|{id,ms:(.ms|floor),delta:((.ms-$allow)|floor)}]')"
+  deltas="$(printf '%s' "$mine" | jq --argjson allow "$allow_ms" -c '[.[]|select(.id|test("^(bash|eval)"))|{id,ms,delta:(.ms-$allow)}]')"
   printf '%s' "$deltas" | jq -e 'all(.[]; .delta <= 15 and .ms <= 150)' >/dev/null \
-    && ok "handler cost within budget: bash_allow=${allow_ms}ms deltas=$deltas" \
-    || not_ok "handler too slow: bash_allow=${allow_ms}ms deltas=$deltas"
+    && ok "handler cost within relative budget: bash_allow=${allow_ms}ms deltas=$deltas" \
+    || not_ok "handler too slow (relative): bash_allow=${allow_ms}ms deltas=$deltas"
+  # Absolute budget: compare each bash/eval case's median-of-3 ms directly to
+  # origin/main's median for the same case, which the suite already runs
+  # above as $base. This catches cost that every bash call pays, on this run
+  # and on every run after merge. On this PR origin/main is the slow pre-fix
+  # tree, so it passes trivially here.
+  abs="$(jq -n --argjson mine "$mine" --argjson base "$base" -c '
+    [$mine[] | select(.id|test("^(bash|eval)")) as $m | ($base[] | select(.id == $m.id) | .ms) as $b |
+     {id: $m.id, mine_ms: $m.ms, base_ms: $b, over: ($m.ms - $b)}]')"
+  printf '%s' "$abs" | jq -e 'all(.[]; .over <= 15)' >/dev/null \
+    && ok "handler cost within absolute budget vs origin/main (<=15ms over): $abs" \
+    || not_ok "handler slower than origin/main by more than 15ms: $abs"
   for _ in $(seq 1 200); do
     [ "$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE type='pretool_verdict' AND json_extract(payload,'\$.call_id') LIKE 'h%';")" -ge 5 ] && break; sleep 0.2
   done
