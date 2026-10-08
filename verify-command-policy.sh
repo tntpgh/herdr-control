@@ -3186,28 +3186,53 @@ check "r14 pre: --no-pager -- leaves no verb" \
   '>/dev/null git --no-pager -- status' escalate
 check "r14 pre: \$ token right after the skip" \
   '>/dev/null git --no-pager $x status' escalate
-# --- allow spot-checks: an ordinary redirect on an ordinary command must
-#     still allow — the strip removes the redirect, not the command
+# --- allow spot-checks: an ordinary TRAILING redirect on an ordinary
+#     command must still allow — the allowlist drops only the fixed
+#     trailing redirect word, never the command (SPEC round 4).
 check "r14 allow: git status with stdout redirected" \
   'git status >/dev/null' allow
 check "r14 allow: a non-git command with stderr-to-stdout" \
   'ls -la 2>&1' allow
-# --- two Part C REGRESS shapes NOT covered here: "backslash inside
-#     subcommand [postverb]" and "split-quoted subcommand [postverb]"
-#     (`git p >/dev/null\ush origin main`, `git pu >/dev/null''sh origin
-#     main`). Traced in .handoffs/PROOF.md#round-4-redirect-strip: the
-#     Part C mutator's own regex only matches up through "p"/"pu", so it
-#     inserts the redirect INSIDE the word meant to read as "push",
-#     between the first letters and the backslash/quote-spliced rest. By
-#     real bash redirect grammar the target word swallows everything
-#     after the operator up to the next real whitespace — there is no
-#     "ush" left over as a separate token, and the mutated command
-#     genuinely no longer invokes `git push`; the real verb is `p`/`pu`.
-#     Adding these as escalate/reserved rows would require a NEW
-#     detection rule unrelated to redirect-stripping (and untested here:
-#     every attempt to execute this file was refused by the sandbox as
-#     human-only). Not added pending Main's call on whether that is in
-#     scope for this PR.
+check "r14 allow: git log with a multi-word trailing redirect" \
+  'git log --oneline -5 2>/dev/null' allow
+check "r14 allow: git -P diff with stderr-to-stdout" \
+  'git -P diff 2>&1' allow
+# --- round 4 (PR#257 round-3 review, R3-1..R3-5): the shapes that broke
+#     round 3's text-rewriting strip are now closed structurally — a
+#     redirect is never dropped from the middle of anything, so none of
+#     these can smuggle a separator, a newline, or a process-substitution
+#     body past this file. See `_cp_git_seg_strip_trailing_redirects`'s
+#     own header for why.
+check_reserved "R3-1 (push path): a redirect glued to a statement separator still reserves a later push" \
+  'git status >/dev/null;git push origin main'
+check "R3-1: same shape still escalates through the exec-option gate" \
+  'git status >/dev/null;git -C /tmp/evilrepo status' escalate
+check "R3-2: a real newline before git is a separate, later statement" \
+  "$(printf 'echo ok\ngit -C /tmp/r status')" escalate
+check "R3-3: process substitution keeps the inner git invocation visible" \
+  'cat <(git -C /tmp/evilrepo status)' escalate
+check_reserved "R3-3: process substitution keeps an inner git push reserved" \
+  'git status <(git push origin main)'
+check_reserved "R3-4: a quoted redirect operand in -C's value no longer eats the push verb" \
+  "git -C '<' push origin main"
+check_reserved "R3-5: a command substitution inside a redirect target still reserves the push" \
+  'git status >$(git push origin main)'
+# --- two Part C REGRESS shapes real bash reads as a DIFFERENT verb
+#     (`git p >/dev/null\ush origin main` runs `git p origin main` —
+#     the backslash just quotes the literal "u", there is no "ush" left
+#     to read as "push"; `git pu >/dev/null''sh origin main` runs
+#     `git pu origin main` the same way via quote-splicing). Neither one
+#     ever reaches `_cp_git_push_invoked`'s awk scanner with the literal
+#     text "push" attached to "git" at all, so main does not reserve
+#     them either — traced in .handoffs/PROOF.md#round-4-redirect-strip.
+#     Round 4's allowlist is stricter than main here, not looser: the
+#     embedded (non-trailing) redirect byte makes both ESCALATE through
+#     the exec-option gate regardless of what the mutated verb turns out
+#     to mean, so there is nothing to under-block.
+check "Part C REGRESS: backslash-glued redirect inside the verb word escalates (stricter than main, not looser)" \
+  'git p >/dev/null\ush origin main' escalate
+check "Part C REGRESS: quote-spliced redirect inside the verb word escalates (stricter than main, not looser)" \
+  "git pu >/dev/null''sh origin main" escalate
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
