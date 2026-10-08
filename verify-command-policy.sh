@@ -2308,16 +2308,20 @@ check "F8: time wraps an exec-capable ls-remote" \
 check "F8: watch wraps git, fan-out arm, fails closed regardless of argv" \
   "watch git log" escalate
 
-# F9: the fix must not make a SAFE git call under a new wrapper stricter
-# than the bare call — `git log` is read-only and stays allow everywhere.
-check "F9: find -exec wraps a safe read, stays allow" \
-  "find . -maxdepth 0 -exec git log \\;" allow
-check "F9: script wraps a safe read, stays allow" \
-  "script -q /dev/null git log" allow
-check "F9: arch wraps a safe read, stays allow" \
-  "arch -arm64 git log" allow
-check "F9: xcrun wraps a safe read, stays allow" \
-  "xcrun git log" allow
+# F9 (round 3, SPEC #261 r3): the fix no longer tries to prove a wrapped
+# command SAFE — `find -exec`/`script`/`arch`/`xcrun` carrying any actual
+# command (git included) now escalate unconditionally; see the round-3
+# block at the end of this file for the full rationale. Only `chroot`
+# (out of this round's scope) and `xcrun`'s genuinely non-executing
+# lookup modes still judge the wrapped command on its own merits.
+check "F9 (round 3): find -exec now ALWAYS escalates, even a safe read" \
+  "find . -maxdepth 0 -exec git log \\;" escalate
+check "F9 (round 3): script now ALWAYS escalates, even a safe read" \
+  "script -q /dev/null git log" escalate
+check "F9 (round 3): arch now ALWAYS escalates, even a safe read" \
+  "arch -arm64 git log" escalate
+check "F9 (round 3): xcrun now ALWAYS escalates, even a safe read" \
+  "xcrun git log" escalate
 check "F9: chroot wraps a safe read, stays allow" \
   "chroot /tmp git log" allow
 check "F9: xcrun --find mode never invokes the tool, stays allow" \
@@ -3084,8 +3088,8 @@ check "r2 H1: safe first clause no longer hides an unsafe second clause (ext::)"
   "find . -maxdepth 0 -exec true \\; -exec git -c protocol.ext.allow=always ls-remote ext::id \\;" escalate
 check "r2 H1: a git-reading first clause no longer hides an unsafe second git clause" \
   "find . -maxdepth 0 -exec git log \\; -exec git -C /tmp/evilrepo status \\;" escalate
-check "r2 H1: all-safe clauses still allow (no over-blocking from the new loop)" \
-  "find . -maxdepth 0 -exec git log \\; -exec git log -1 \\;" allow
+check "r2 H1 (round 3): all-safe clauses now escalate too — find -exec no longer parses git's safety" \
+  "find . -maxdepth 0 -exec git log \\; -exec git log -1 \\;" escalate
 
 # H2 — a generic launcher or second wrapper in front of git inside a wrap
 # tail was never re-unwrapped; `_cp_wrap_tail_unsafe` now re-enters
@@ -3107,8 +3111,8 @@ check "r2 H2: xcrun wraps nice wraps git -C" \
   "xcrun nice git -C /tmp/evilrepo status" escalate
 check "r2 H2: xcrun wraps arch wraps git -C" \
   "xcrun arch -arm64 git -C /tmp/evilrepo status" escalate
-check "r2 H2: nested-safe still allows (no over-blocking from the new recursion)" \
-  "script -q /dev/null nice git log" allow
+check "r2 H2 (round 3): script now ALWAYS escalates, even nested-safe" \
+  "script -q /dev/null nice git log" escalate
 
 # H3 — xcrun's -f/--find and -r/--run are a MODE, not independently final;
 # the LAST one on the line wins. The old extractor returned the moment it
@@ -3119,8 +3123,8 @@ check "r2 H3: xcrun --find --run — long spelling, -run wins" \
   "xcrun --find --run git -C /tmp/evilrepo status" escalate
 check "r2 H3: xcrun -l -f -r — unrelated flag between find/run doesn't confuse mode tracking" \
   "xcrun -l -f -r git -C /tmp/evilrepo status" escalate
-check "r2 H3: xcrun -f -r with a safe git call stays allow (not blanket escalate)" \
-  "xcrun -f -r git log" allow
+check "r2 H3 (round 3): xcrun -f -r now ALWAYS escalates once -r wins, even a safe read" \
+  "xcrun -f -r git log" escalate
 
 # H4 — an unreadable wrapped command word ($VAR) fell through to "not
 # git" instead of failing closed, the same way {}/empty already did.
@@ -3145,8 +3149,8 @@ check "r2 M1: {} + is still recognized as the real terminator (no regression)" \
 # is present to judge.
 check "r2 M2: SHELL= ahead of a command-less script escalates" \
   "SHELL=/tmp/evil.sh script -q /dev/null" escalate
-check "r2 M2: a command-less script with no SHELL= override stays allow" \
-  "script -q /dev/null" allow
+check "r2 M2 (round 3): a command-less script now ALWAYS escalates too" \
+  "script -q /dev/null" escalate
 
 # L1 — real xcrun also accepts single-dash long spellings (-sdk,
 # -toolchain, -find, -run, -log); the old table only had the double-dash
@@ -3195,10 +3199,71 @@ check "r3 item3: -toolchain (single-dash) always redirects" \
   "xcrun -toolchain com.evil.toolchain git log" escalate
 check "r3 item3: --toolchain=VALUE (glued) always redirects" \
   "xcrun --toolchain=/tmp/evil git log" escalate
-check "r3 item3 negative: --sdk with a plain SDK name is not a redirect, stays allow" \
-  "xcrun --sdk macosx git log" allow
+check "r3 item3 negative (round 3): --sdk with a plain SDK name no longer saves it — any trailing command through xcrun now escalates" \
+  "xcrun --sdk macosx git log" escalate
 check "r3 item3 negative: -sdk (single-dash) with a plain name stays allow (no regression on L1)" \
   "xcrun -sdk macosx --show-sdk-path" allow
+
+# ---------------------------------------------------------------------------
+# #261 round 3 (review of round 2: 5 HIGH findings, N1-N5 — a classifier
+# that keeps reopening on find/script/arch/xcrun's own sub-grammar stops
+# parsing it). `_cp_find_exec_unsafe`/`_cp_wrap_arch_has_cmd`/
+# `_cp_wrap_xcrun_verb` in lib/command-policy.sh replace every extractor
+# the F6-F11/H1-H4/M1-M2/L1 sections above exercised; those sections stay
+# (updated in place above for the rows whose verdict genuinely changed)
+# because the shapes they name are still real probes, just judged by the
+# new narrower rule now.
+
+# SPEC's own three required rows.
+check "#261 r3: find with no -exec primary allows, as trunk" \
+  "find . -name \"*.md\"" allow
+check "#261 r3: find -exec wc (allowlisted tool) allows" \
+  "find . -type f -exec wc -l {} +" allow
+check "#261 r3: find -exec rm (not on the allowlist) escalates" \
+  "find . -exec rm {} \\;" escalate
+
+# N1: a glob command word is unreadable the same way an expansion is —
+# bare, and through every wrapper.
+check "#261 r3 N1: bare glob command word escalates" \
+  "[g]it -C /tmp/evilrepo status" escalate
+check "#261 r3 N1: find -exec with a glob command word escalates" \
+  "find . -exec g* -C /tmp/evilrepo status \\;" escalate
+check "#261 r3 N1: path-qualified glob command word escalates" \
+  "/usr/bin/gi[t] -C /tmp/evilrepo status" escalate
+
+# N2/N5: a find clause only ends on the EXACT terminator, and only a
+# literal `-exec`/`-execdir`/`-ok`/`-okdir` token starts one — never a
+# prefix spelling or a different primary's own argument value.
+check "#261 r3 N2: a word merely starting with ';' does not end a clause early" \
+  "find . -exec true ';x' -exec rm -rf /tmp/x \\;" escalate
+check "#261 r3 N5: -exec spelled as -name's own pattern argument still fails closed" \
+  "find . -name -exec -o -exec rm -rf /tmp/x \\;" escalate
+
+# N3: an unquoted expansion in find's own argv can inject a brand-new
+# -exec clause at runtime that the token walk never sees.
+check "#261 r3 N3: an unquoted variable standing in for find's own args escalates" \
+  "find . \$X" escalate
+check "#261 r3 N3: a quoted expansion as find's search root stays allow (OB)" \
+  "find \"\$ROOT\" -type f" allow
+
+# N4: SHELL/DEVELOPER_DIR/TOOLCHAINS/SDKROOT are exec-capable names
+# wherever they sit, not just inside the wrapper's own segment — a bare
+# DEVELOPER_DIR= ahead of git is exactly as dangerous (git is Apple's
+# xcode-select shim) as one ahead of xcrun.
+check "#261 r3 N4: DEVELOPER_DIR= ahead of a BARE git call escalates (no xcrun involved)" \
+  "DEVELOPER_DIR=/tmp/evil git log" escalate
+check "#261 r3 N4: arch -e DEVELOPER_DIR= still escalates" \
+  "arch -e DEVELOPER_DIR=/tmp/evil xcrun git log" escalate
+
+# script/arch/xcrun carrying any command always escalate now — agents
+# never need these tools; only xcrun's genuinely non-executing lookups
+# (no trailing command) keep trunk's verdict.
+check "#261 r3: script with no command at all still escalates" \
+  "script -q /dev/null" escalate
+check "#261 r3: xcrun -f with no -r stays a non-executing lookup, allows" \
+  "xcrun -f clang" allow
+check "#261 r3: xcrun --show-sdk-path alone stays a non-executing lookup, allows" \
+  "xcrun --show-sdk-path" allow
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
