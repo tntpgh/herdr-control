@@ -5877,7 +5877,209 @@ conductor_reserved_reason() {
   elif { _cp_git_push_invoked "$(_cp_mask_script_data "$raw")" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm" ||
        { _cp_imatch "$_CP_POLICY_FILE_RE" "$action_norm" && ! _cp_policy_mention_harmless "$raw"; }; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
+  # Registry-write-reserved (herdr-control#253 round-2 review probe 5c,
+  # hardened round 2 / PR #258 by the SPEC at .handoffs/SPEC.md and its
+  # review at review/registry-write/.handoffs/REVIEW.md): a hook-mode
+  # worker that can write its own task row (e.g. set its own pane as
+  # conductor_pane_id) can approve its own prompts next. Only herdr-
+  # control's own entry scripts, run as the conductor or human, may write
+  # the registry. Round 1 enumerated write VERBS (UPDATE/INSERT/.../`>`/
+  # cp/mv/...) and the review proved that converges on nothing: stdin SQL
+  # and dot-commands (`<`, `.read`, `.backup`, `.shell`, `.system`), non-
+  # enumerated filesystem writers (rsync, install, ditto, sed -i, node/
+  # perl file APIs), and ad-hoc-sourced lib/*.sh writer functions were all
+  # unreserved by the old regex (F1-F3). Round 2 replaces the denylist
+  # with a class rule: reserve ANY segment that can reach the registry AT
+  # ALL, and carve back out one narrow, provably-safe read shape instead
+  # of trying to enumerate every dangerous one.
+  #
+  # _CP_REGISTRY_TRIGGER_RE fires on: the sqlite3 binary/module/library by
+  # name anywhere (`\bsqlite3\b` — a word boundary sits right before
+  # "sqlite3" even inside "better-sqlite3", so the CLI, Python's `sqlite3`
+  # module, and better-sqlite3 are all one pattern); the state dir/db by
+  # any spelling (_CP_REGISTRY_PATH_RE); and ad-hoc sourcing of ANY herdr-
+  # control lib/*.sh file (`. lib/...sh`, `source lib/...sh`, bare
+  # `claims.sh`) or a named writer entry point (`set_task_conductor`) —
+  # once a lib is sourced outside a reviewed entry script, assume a
+  # writer gets called next rather than trying to enumerate which one.
+  # herdr-control's own entry scripts (herdr-action.sh, spawn-task.sh,
+  # close-done-workers.sh, ...) source their libs INSIDE the script FILE,
+  # never in the invoked command TEXT this classifier ever sees, so a
+  # normal invocation of one is untouched by this rule and keeps its
+  # existing verdict (SPEC item 3) — this is not a by-name exemption, it
+  # structurally never matches.
+  #
+  elif _cp_imatch "$_CP_REGISTRY_TRIGGER_RE" "$action_norm" && ! _cp_registry_read_allowed "$1"; then
+    printf 'registry writes remain human-only\n'
   fi
+}
+
+# The registry/state directory: its filename (any parent — a mktemp scratch
+# dir in a test counts exactly like the real one), the HERDR_RUN_STATE_DIR
+# override BY NAME (so a command that assigns or reads it is still caught),
+# and the whole state directory it defaults into. Boundary-anchored on the
+# filename only, same style as _CP_POLICY_FILE_RE.
+_CP_REGISTRY_PATH_RE='\bHERDR_RUN_STATE_DIR\b|(^|[^A-Za-z0-9_-])registry\.sqlite3\b|\.local/state/herdr\b'
+
+# See the registry-write-reserved comment above conductor_reserved_reason's
+# registry branch for the design. Three independent OR'd triggers: the
+# state dir/db (_CP_REGISTRY_PATH_RE), the sqlite3 binary/module/library by
+# name, and ad-hoc sourcing of a herdr-control lib/*.sh file or a named
+# writer entry point.
+_CP_REGISTRY_TRIGGER_RE="$_CP_REGISTRY_PATH_RE"'|\bsqlite3\b|(^|[;&|(]|[[:space:]])(\.|source)[[:space:]]+[^;&|]*\blib/[A-Za-z0-9_.-]*\.sh\b|\bclaims\.sh\b|\bset_task_conductor\b'
+
+# _cp_registry_read_allowed carves back out exactly: `sqlite3 -readonly
+# -safe [output-format flags] <path> "<ONE statement>"`, trusting SQLite's
+# OWN engine guarantee instead of parsing SQL text.
+#
+# Round 4 (PR #258 round-3 review, .handoffs/REVIEW.md: F1 critical, F2
+# high): three straight rounds of text-parsing allowlists (round 1 an
+# enumerated-verb denylist, round 2 a bare "no `=`" check, round 3 a
+# finite PRAGMA-name list plus a finite pure-function list) each closed
+# one bypass and opened another — `PRAGMA journal_mode(WAL)` was a write
+# masquerading as the identifier-argument shape the round-3 fix allowed
+# (F1), and quoting a function name (`"PR""AGMA"`-style splits elsewhere
+# in this file) threatened the same fate for the pure-function list
+# (F2). SQL is not a language this classifier can safely parse with
+# shell string matching; Main proved on the live registry (sqlite3
+# 3.54.0) that `sqlite3 -readonly -safe` refuses writefile(), ATTACH and
+# load_extension at the ENGINE, independent of the SQL text — a PRAGMA
+# setter fails with "attempt to write a readonly database", a SELECT
+# works. Round 4 deletes both allowlists and trusts that guarantee
+# instead: the classifier verifies only the INVOCATION shape (both
+# flags present, no other flag that could defeat `-safe` before it
+# takes effect, exactly one SQL argument, no dot-command), never the
+# SQL content.
+#
+# Shape, every point required:
+# 1. Command word exactly the literal `/usr/bin/sqlite3` — not bare
+#    `sqlite3`, `./sqlite3`, `command sqlite3`, `env sqlite3`, or any
+#    other spelling. Round 4 trusted the shell to resolve the bare word
+#    to the real binary; round 5 (PR #258 round-4 review F2) does not —
+#    a PATH shim, function, or alias named `sqlite3` would receive the
+#    apparently-safe argv and could ignore `-readonly -safe` entirely.
+#    Pinning the absolute path is the only spelling this classifier can
+#    verify resolves to the trusted binary.
+# 2. `-readonly`/`--readonly` AND `-safe`/`--safe` both present, any
+#    order, before the path.
+# 3. Every other option is value-less and output-format-only: `-json
+#    -line -csv -header -noheader -list -box -table -markdown -column`
+#    (and their `--` forms). `-separator`/`-newline` are DROPPED (round
+#    5, PR #258 round-4 review F1): they take a value, and an unexpanded
+#    `$VAR` separator value lets the shell smuggle an extra argv word
+#    (e.g. `-init /tmp/evil.sql`) past this classifier, which only
+#    checked the database path and SQL argument for expansion, never a
+#    value-taking option. Dropping every value-taking option closes the
+#    whole class at once instead of validating each one.
+#    `-cmd`/`-init` run BEFORE safe mode applies, so they are refused
+#    regardless of the two required flags; `-bail -echo -batch` refused
+#    too — none change whether a write can occur, but none is needed
+#    for a read either, so none is allowlisted.
+# 4. Exactly one SQL argument (no stdin, no here-string, no redirect
+#    except a harmless stderr-to-null/fd-dup — blanked below before the
+#    operator check — and no pipe INTO sqlite3: `_cp_simple_words`
+#    refuses every other unquoted operator). A pipe OUT of it, e.g.
+#    into `jq`, is fine: `_cp_coderef_split` on the tidied text lets a
+#    trailing `@PIPE@`-tagged segment through, re-checked only against
+#    `_CP_REGISTRY_TRIGGER_RE` so it cannot itself be a second sqlite3
+#    call or a write onto the registry path (`| tee registry.sqlite3`).
+# 5. The SQL argument does not start with `.` — no dot-command at all
+#    (not even `.schema`/`.tables`, which round 1-3 allowlisted by
+#    name): `-safe` blocks the dangerous ones, but SPEC says keep it
+#    simple rather than re-deriving which dot-commands are harmless.
+# 6. No `$`, backtick, `$(` or ANSI-C `$'` anywhere in the options or
+#    the database path (round 5: `$` alone already covers `$(` and
+#    `$'`, both of which contain it; backtick is checked separately).
+#    The SQL argument is likewise refused outright if it contains any
+#    of these — this classifier cannot tell a shell-expanding `$VAR`
+#    from a single-quoted literal `$VAR` after unprotecting, so it
+#    refuses every occurrence rather than risk letting an expanding one
+#    through; a literal `$`/backtick the worker actually needs stays
+#    inside the single-quoted SQL text, which this rule still blocks —
+#    accepted ceiling, not a bug.
+# A computed path (command substitution, an unresolved `$VAR`, a glob)
+# is still refused outright (not something a static classifier can
+# verify the content of).
+_cp_registry_read_allowed() {           # raw
+  # `$'...'` ANSI-C and `$"..."` locale-translation quoting both get their
+  # `$'`/`$"`/closing-quote delimiters swallowed by `_cp_protect_text`
+  # without ever being emitted (they become ordinary single/double-quote
+  # state, same as `'...'`/`"..."`), so checking the POST-protected text
+  # (any segment `_cp_coderef_split` hands back) can never see them -- a
+  # live round-5 review failure confirmed a `$'SELECT 1\n.shell …'` SQL
+  # argument reached `_cp_registry_sqlite_invocation_safe` as plain
+  # "SELECT 1\n.shell …" with no `$` left in it at all. Checked here, on
+  # the untouched RAW text, before any protection ever runs: the SQL
+  # argument may carry a `$` only inside a plain `'...'` single-quoted
+  # span (SPEC item 3); `$'…'`, `$"…"`, or any other dollar/backtick
+  # anywhere in the command reserves the whole thing outright rather than
+  # trying to prove which span it sits in.
+  case "$1" in *'$"'*) return 1 ;; esac
+  _cp_coderef_has_ansi_c_quote "$1" && return 1
+  local tidy
+  tidy="$(printf '%s' "$1" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
+  case "$tidy" in *$'\n'*) return 1 ;; esac
+  local seg bare n=0
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    n=$((n + 1))
+    bare="$seg"
+    case "$seg" in @PIPE@*) bare="${seg#@PIPE@}" ;; esac
+    if [ "$n" -eq 1 ]; then
+      case "$seg" in @PIPE@*) return 1 ;; esac   # piped INTO the first segment -- reserved
+      _cp_registry_sqlite_invocation_safe "$bare" || return 1
+    else
+      case "$seg" in @PIPE@*) ;; *) return 1 ;; esac   # anything but a pipe-OUT continuation reserves
+      # A trailing pipe-out consumer (jq, etc.) is fine, but it must not
+      # itself touch sqlite3/the registry again -- `sqlite3 ... | tee
+      # registry.sqlite3` or `sqlite3 ... | sqlite3 ...` would otherwise
+      # smuggle a second, unvalidated write through the one pipe this
+      # rule allows.
+      _cp_imatch "$_CP_REGISTRY_TRIGGER_RE" "$bare" && return 1
+    fi
+  done <<EOF
+$(_cp_coderef_split "$tidy")
+EOF
+  [ "$n" -gt 0 ]
+}
+
+# `_cp_registry_sqlite_invocation_safe <segment>` -> 0 only for the exact
+# invocation shape item 1-6 above describes, on one already-split segment
+# (a leading `@PIPE@` tag, if any, is stripped first). `$'...'`/`$"..."`
+# quoting is already refused by the caller (`_cp_registry_read_allowed`)
+# on the untouched RAW text, before `_cp_protect_text` ever runs — doing
+# it here instead would be too late: protection swallows those quote
+# delimiters without emitting them, so the segment this function receives
+# can no longer contain the `$'`/`$"` marker to check for.
+_cp_registry_sqlite_invocation_safe() {   # seg
+  local seg="$1"
+  case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
+  _cp_simple_words "$seg" "" || return 1
+  local -a w=("${_CP_W[@]}")
+  [ "${#w[@]}" -ge 3 ] || return 1
+  [ "$(_cp_bwt_unprotect "${w[0]}")" = /usr/bin/sqlite3 ] || return 1
+  local i=1 tok has_readonly=0 has_safe=0
+  while [ "$i" -lt "${#w[@]}" ]; do
+    tok="$(_cp_bwt_unprotect "${w[$i]}")"
+    case "$tok" in
+      -readonly|--readonly) has_readonly=1; i=$((i + 1)) ;;
+      -safe|--safe) has_safe=1; i=$((i + 1)) ;;
+      -json|--json|-line|--line|-csv|--csv|-header|--header|-noheader|--noheader|-list|--list|-box|--box|-table|--table|-markdown|--markdown|-column|--column)
+        i=$((i + 1)) ;;
+      -*) return 1 ;;
+      *) break ;;
+    esac
+  done
+  [ "$has_readonly" -eq 1 ] && [ "$has_safe" -eq 1 ] || return 1
+  # Exactly <path> <statement> remain -- no stdin source, no trailing junk.
+  [ "$((i + 2))" -eq "${#w[@]}" ] || return 1
+  local path sql
+  path="$(_cp_bwt_unprotect "${w[$i]}")"
+  sql="$(_cp_bwt_unprotect "${w[$((i + 1))]}")"
+  case "$path" in *'@SUB@'*|*'$'*|*'`'*|*'*'*|*'?'*|*'['*) return 1 ;; esac
+  case "$sql" in *'@SUB@'*|*'$'*|*'`'*) return 1 ;; esac
+  case "$sql" in .*) return 1 ;; esac
+  return 0
 }
 
 # The governance files. A name counts only as a whole path component: the
