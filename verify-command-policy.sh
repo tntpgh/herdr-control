@@ -3831,6 +3831,28 @@ check "#261 r6 R5-SUBST: find hidden inside a backtick substitution escalates" \
 check "#261 r6 R5-QWRAP: a chain of individually-quoted launchers still unwraps to find" \
   "'nice' -n 5 'sudo' find . * -maxdepth 0" escalate
 
+echo
+echo "== round 12 (herdr-control#254 follow-up, hub form" \
+     "20261008T004244-8734 \"merge_plus_nopager\"): --no-pager/-P are the" \
+     "ONLY global options allowed ahead of a read-only verb =="
+check "r12 allow: --no-pager diff" "git --no-pager diff" allow
+check "r12 allow: --no-pager log --oneline -5" \
+  "git --no-pager log --oneline -5" allow
+check "r12 allow: -P show HEAD" "git -P show HEAD" allow
+check "r12 allow: --no-pager diff --no-ext-diff a b -- f" \
+  "git --no-pager diff --no-ext-diff a b -- f" allow
+check "r12 escalate: --no-pager -c core.pager=x log" \
+  "git --no-pager -c core.pager=x log" escalate
+check "r12 escalate: -c core.pager=x --no-pager log" \
+  "git -c core.pager=x --no-pager log" escalate
+check "r12 escalate: --no-pager -C /tmp log" \
+  "git --no-pager -C /tmp log" escalate
+check "r12 escalate: --no-pager grep -O x" \
+  "git --no-pager grep -O x" escalate
+check "r12 escalate: GIT_PAGER= env prefix before --no-pager" \
+  "GIT_PAGER=x git --no-pager log" escalate
+check "r12 escalate: --no-pager --paginate log" \
+  "git --no-pager --paginate log" escalate
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
