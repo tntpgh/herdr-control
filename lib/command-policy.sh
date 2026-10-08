@@ -2195,6 +2195,34 @@ _cp_locate_command_word() {             # segment
   done
 
   _CP_LOC=("$@")
+  # Round 2 follow-up (herdr-control#254/PR#257 round-2 F1-F4 review,
+  # Main's main-probes.out Part C): the `--no-pager`/`-P` skip used to
+  # live ONLY inside `_cp_git_unsafe_tokens`'s own loop, so every OTHER
+  # consumer of these same tokens — the clone-destination write-target
+  # scanner (`_cp_bwt_verb_targets`'s `git)` case, which reads
+  # `"${1:-}"` positionally for `clone`) and lib/pretool-shadow.sh's own
+  # call of `_cp_git_unsafe_tokens` — still read `-P`/`--no-pager` AS
+  # the verb slot, so `git -P clone https://… /outside/dest` and
+  # `git --no-pager clone --depth 1 https://… /outside/dest` never
+  # matched `clone)` at all and the destination went unclassified.
+  # Stripped ONCE here, right where every consumer's tokens originate,
+  # so `git -P <verb> …`/`git --no-pager <verb> …` read identically to
+  # `git <verb> …` everywhere — no per-site skip to keep in sync, and
+  # nothing left to miss. `_CP_LOC[0]` (the `git` word itself) is kept;
+  # only repeated exact `-P`/`--no-pager` tokens right after it are
+  # dropped. `git-<verb>` dashed-binary form never reaches here (its
+  # `_cp_wcmd` is `git-push` etc, not `git`) — it has no global-option
+  # slot to begin with.
+  if [ "$_cp_wcmd" = git ] && [ "${#_CP_LOC[@]}" -gt 1 ]; then
+    local _cp_git_skip=1
+    while [ "$_cp_git_skip" -lt "${#_CP_LOC[@]}" ]; do
+      case "${_CP_LOC[$_cp_git_skip]}" in
+        --no-pager|-P) _cp_git_skip=$((_cp_git_skip + 1)) ;;
+        *) break ;;
+      esac
+    done
+    [ "$_cp_git_skip" -gt 1 ] && _CP_LOC=("${_CP_LOC[0]}" "${_CP_LOC[@]:$_cp_git_skip}")
+  fi
   return 0
 }
 
@@ -2750,12 +2778,22 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
 #
 # ALLOWLIST, not denylist: a git invocation is safe to auto-allow ONLY if
 # ALL of —
-#   1. the very first token here IS the subcommand itself, OR one or more
+#   1. the very first token here IS the subcommand itself — one or more
 #      repetitions of `--no-pager`/`-P` (any order with each other) ahead
-#      of it — round 12 (herdr-control#254 follow-up, hub form
-#      20261008T004244-8734): both ONLY disable the pager, a strictly
-#      safer exec surface, so they are the one exception to "any token
-#      before the subcommand disqualifies". No `-c`, `-C`, `--git-dir`,
+#      of it are never seen here at all: round 12 (herdr-control#254
+#      follow-up, hub form 20261008T004244-8734) allowed them (both ONLY
+#      disable the pager, a strictly safer exec surface, the one
+#      exception to "any token before the subcommand disqualifies"), and
+#      round 2's F1/F4 follow-up (PR#257 round 2, Main's main-probes.out
+#      Part C) moved the stripping out of this function entirely, into
+#      `_cp_locate_command_word` where `_CP_LOC` is built — every
+#      consumer of these tokens (this function, the clone-destination
+#      write-target scanner, lib/pretool-shadow.sh) now sees the SAME
+#      pre-stripped `git <verb> …` shape, instead of each needing its own
+#      copy of the skip (the clone-dest scanner's old positional
+#      `"${1:-}" = clone` check never had one, so `git -P clone …`/
+#      `git --no-pager clone …` slipped its destination past it
+#      entirely). No `-c`, `-C`, `--git-dir`,
 #      `--work-tree`, `--exec-path`, `--namespace`, `--super-prefix`,
 #      `--config-env`, `-p`/`--paginate`, or any other token starting with
 #      `-`, ahead of the subcommand (attached short form included:
@@ -2829,6 +2867,7 @@ _cp_git_config_unsafe() {               # tok... -> 0 if this is a write (not a 
   local tok n_pos=0
   for tok in "$@"; do
     case "$tok" in
+      *'$'*|*'@SUB@'*) return 0 ;;
       --get|--get-all|--get-regexp|--list|-l|--show-origin|--show-scope) ;;
       -*) return 0 ;;
       *) n_pos=$((n_pos + 1)) ;;
@@ -2869,12 +2908,12 @@ _cp_git_config_unsafe() {               # tok... -> 0 if this is a write (not a 
 # single-quoted, never-expanding `$`) escalates too; accepted
 # over-blocking, not a bug.
 _cp_git_unsafe_tokens() {               # token... (everything after the git word) -> 0 if unsafe
-  local verb="" tok name opt has_u=0 has_remote=0 has_x=0 sub1=""
+  local verb="" tok name opt has_u=0 has_remote=0 has_x=0 sub1="" idx=0 verb_idx=0
   for tok in "$@"; do
+    idx=$((idx + 1))
     case "$tok" in *'$'*|*'@SUB@'*) return 0 ;; esac
     if [ -z "$verb" ]; then
       case "$tok" in
-        --no-pager|-P) continue ;;
         -*) return 0 ;;
         *) verb="$tok"
            # Round 8 (SPEC item B): `git mergetool` always launches an
@@ -2889,7 +2928,8 @@ _cp_git_unsafe_tokens() {               # token... (everything after the git wor
            # safe/unsafe by itself; whatever it returns IS the verdict for
            # this whole statement.
            if [ "$verb" = config ]; then
-             _cp_git_config_unsafe "${@:2}" && return 0
+             verb_idx=$idx
+             _cp_git_config_unsafe "${@:$((verb_idx + 1))}" && return 0
              return 1
            fi
            continue ;;
@@ -2944,9 +2984,8 @@ _cp_git_unsafe_tokens() {               # token... (everything after the git wor
         ;;
     esac
   done
-  if [ -n "$verb" ]; then
-    case "$_cp_git_known_verbs" in *" $verb "*) ;; *) return 0 ;; esac
-  fi
+  [ -n "$verb" ] || return 0
+  case "$_cp_git_known_verbs" in *" $verb "*) ;; *) return 0 ;; esac
   # Round 5 rule B: `-u` is the short form of `--upload-pack` for
   # clone/fetch/pull/ls-remote/submodule, and archive's remote-upload-pack
   # companion once `--remote` is given — exec-capable the same way as the
@@ -6688,7 +6727,23 @@ EOF
 # other than `-u`/`--set-upstream` (`--force`, `--delete`/`-d`,
 # `--mirror`, `--all`, `--tags`, …), a `-C`, and any `cd … &&` prefix all
 # fail to match the shape below at all and fall straight through to "not
-# safe" — that catch-all is structural, not enumerated.
+# safe" — that catch-all is structural, not enumerated. One narrow
+# exception (round 2 follow-up, herdr-control#254/PR#257 round-2 review,
+# Main's main-probes.out Part C): repeated `--no-pager`/`-P` ahead of
+# `push` are matched and skipped like they are everywhere else in this
+# file (they only disable the pager) — this regex used to require `git`
+# and `push` adjacent, so `git -P push origin main` (a push to the
+# PROTECTED default branch) fell through to "not safe" the same as a
+# genuinely unsafe push, by accident rather than by design; the regex
+# itself never ran the branch-allowlist check at all in that shape, so
+# the "reserved" verdict it produced depended entirely on a SEPARATE
+# caller correctly treating "not safe" as "stays reserved" — any caller
+# that instead special-cased "didn't even look like a push" differently
+# from "looked like an unsafe push" could read the two outcomes apart.
+# Matching `-P`/`--no-pager` explicitly here closes that gap structurally
+# instead of relying on it never mattering: a `-P`-prefixed push now
+# reads IDENTICALLY to the unprefixed one, safe or not, same as every
+# other git rule in this file after the same round's `_CP_LOC` fix.
 _CP_PUSH_BRANCH_ALLOW_RE='^(feat|fix|chore|ci|docs|refactor|test|perf|build|wip|plan|review|spike)/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$'
 
 _cp_push_branch_is_safe() {             # name -> 0 (true) if this literal branch name is a safe push target
@@ -6705,8 +6760,8 @@ _cp_push_branch_is_safe() {             # name -> 0 (true) if this literal branc
 
 _cp_push_is_safe() {                    # norm -> 0 (true) only for git push [-u|--set-upstream] origin <plain-branch-name>
   local norm="$1"
-  [[ "$norm" =~ ^[[:space:]]*git[[:space:]]+push[[:space:]]+((-u|--set-upstream)[[:space:]]+)?origin[[:space:]]+([^[:space:]:]+)[[:space:]]*$ ]] || return 1
-  _cp_push_branch_is_safe "${BASH_REMATCH[3]}"
+  [[ "$norm" =~ ^[[:space:]]*git[[:space:]]+(--no-pager[[:space:]]+|-P[[:space:]]+)*push[[:space:]]+((-u|--set-upstream)[[:space:]]+)?origin[[:space:]]+([^[:space:]:]+)[[:space:]]*$ ]] || return 1
+  _cp_push_branch_is_safe "${BASH_REMATCH[4]}"
 }
 
 # Human-reserved actions under the reviewed-operational conductor grant.

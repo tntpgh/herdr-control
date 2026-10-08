@@ -113,6 +113,19 @@ else
 fi
 _dirty_rm="$(printf 'rm -rf /tmp/x \377')"
 check_not_allow "recursive rm with a trailing 0xFF byte" "$_dirty_rm"
+# Round 2 follow-up (herdr-control#254/PR#257 round-2 review, Main's
+# main-probes.out Part C mutation pass): the SAME two rows above, with a
+# `-P`/`--no-pager` wrapper — `_cp_push_is_safe`'s adjacency-only regex
+# and the blanket `\brm\b` floor rule must both still fire once git's
+# own global-option skip is centralized, not just for the unwrapped text.
+_dirty_p="$(printf 'git -P %s origin %s \377trailing' push ma"in")"
+check_reserved "default-branch push with a trailing 0xFF byte [-P]" "$_dirty_p"
+_dirty_nopager="$(printf 'git --no-pager %s origin %s \377trailing' push ma"in")"
+check_reserved "default-branch push with a trailing 0xFF byte [--no-pager]" "$_dirty_nopager"
+_dirty_rm_p="$(printf 'git -P rm -rf /tmp/x \377')"
+check_not_allow "recursive rm with a trailing 0xFF byte [-P]" "$_dirty_rm_p"
+_dirty_rm_nopager="$(printf 'git --no-pager rm -rf /tmp/x \377')"
+check_not_allow "recursive rm with a trailing 0xFF byte [--no-pager]" "$_dirty_rm_nopager"
 
 echo "== detonation F3: reserved actions spelled around the old regexes =="
 check_reserved "git -C <dir> push (breaks push adjacency)"   "git -C /Users/thurbs/Code/other push"
@@ -2080,6 +2093,33 @@ check_wt "scp -- protects a real dash-prefixed dest from being read as a flag (#
   "$WT_184" "scp -- src.txt /outside/-dashdest-scp" escalate
 check_wt "git clone --depth=1 (glued long form) still finds the real dest, unchanged" \
   "$WT_184" "git clone --depth=1 file:///tmp/r.git /outside/clone-depth-eq" escalate
+# Round 2 follow-up (herdr-control#254/PR#257 round-2 review, Main's
+# main-probes.out Part C mutation pass): `-P`/`--no-pager` ahead of
+# `clone` used to read as the subcommand itself in
+# `_cp_bwt_verb_targets`'s positional `"${1:-}" = clone` check, so the
+# real destination argument went unclassified — closed by stripping the
+# skip once in `_cp_locate_command_word`, the shared source of these
+# tokens, instead of only inside `_cp_git_unsafe_tokens`.
+check_wt "git clone explicit dest outside (#192 round 2 bypass E) [-P]" \
+  "$WT_184" "git -P clone https://example.com/r.git /outside/r" escalate
+check_wt "git clone explicit dest outside (#192 round 2 bypass E) [--no-pager]" \
+  "$WT_184" "git --no-pager clone https://example.com/r.git /outside/r" escalate
+check_wt "git clone --depth 1 (value-taking flag before URL) still finds the real dest (#192 round 3 F1) [-P]" \
+  "$WT_184" "git -P clone --depth 1 https://example.com/r.git /outside/r" escalate
+check_wt "git clone --depth 1 (value-taking flag before URL) still finds the real dest (#192 round 3 F1) [--no-pager]" \
+  "$WT_184" "git --no-pager clone --depth 1 https://example.com/r.git /outside/r" escalate
+check_wt "git clone -b BRANCH (value-taking flag before URL) still finds the real dest (#192 round 3 F1) [-P]" \
+  "$WT_184" "git -P clone -b main https://example.com/r.git /outside/r" escalate
+check_wt "git clone -b BRANCH (value-taking flag before URL) still finds the real dest (#192 round 3 F1) [--no-pager]" \
+  "$WT_184" "git --no-pager clone -b main https://example.com/r.git /outside/r" escalate
+check_wt "git clone --separate-git-dir names a write destination of its own (#192 round 3 F1) [-P]" \
+  "$WT_184" "git -P clone --separate-git-dir /outside/gitdir https://example.com/r.git" escalate
+check_wt "git clone --separate-git-dir names a write destination of its own (#192 round 3 F1) [--no-pager]" \
+  "$WT_184" "git --no-pager clone --separate-git-dir /outside/gitdir https://example.com/r.git" escalate
+check_wt "git clone --depth=1 (glued long form) still finds the real dest, unchanged [-P]" \
+  "$WT_184" "git -P clone --depth=1 file:///tmp/r.git /outside/clone-depth-eq" escalate
+check_wt "git clone --depth=1 (glued long form) still finds the real dest, unchanged [--no-pager]" \
+  "$WT_184" "git --no-pager clone --depth=1 file:///tmp/r.git /outside/clone-depth-eq" escalate
 check_wt "rsync -aTDIR (glued temp-dir short opt) still finds the real dest (#192 round 4 G4)" \
   "$WT_184" "rsync -aT/outside file.txt file2.txt" escalate
 check_wt "curl -oFILE (glued short output flag) still finds the real dest (#192 round 4 G5)" \
@@ -3853,6 +3893,41 @@ check "r12 escalate: GIT_PAGER= env prefix before --no-pager" \
   "GIT_PAGER=x git --no-pager log" escalate
 check "r12 escalate: --no-pager --paginate log" \
   "git --no-pager --paginate log" escalate
+
+echo
+echo "== round 13 (herdr-control#254/PR#257 round-2 review, F1/F2/F3/F4):" \
+     "fail closed with no verb, config tokens after the verb (not" \
+     "position 2), \$/@SUB@ inside git config =="
+check "r13 F1 escalate: -P redirect hides -c ext::" \
+  'git -P >/dev/null -c protocol.ext.allow=always ls-remote ext::id' escalate
+check "r13 F1 escalate: bare redirect hides -C" \
+  'git >/dev/null -C /tmp/r status' escalate
+check "r13 F1 escalate: --no-pager redirect hides -c" \
+  'git --no-pager 2>&1 -c x log' escalate
+check "r13 F3 allow: -P config --get is still a pure read" \
+  'git -P config --get user.email' allow
+check "r13 F2 escalate: config value carries a bare \$" \
+  'git config $a' escalate
+check "r13 F4 allow: config after the --no-pager skip" \
+  'git --no-pager config --get user.email' allow
+check "r13 F4 escalate: config write after the --no-pager skip" \
+  'git --no-pager config user.email x' escalate
+check "r13 F4 escalate: -Pc is not the exact -P token" \
+  'git -Pc status' escalate
+check "r13 F4 escalate: -P= is not the exact -P token" \
+  'git -P= status' escalate
+check "r13 F4 escalate: --no-pager= is not the exact token" \
+  'git --no-pager= status' escalate
+check "r13 F4 escalate: --no-pag abbreviation not recognized" \
+  'git --no-pag status' escalate
+check "r13 F4 escalate: -pP bundled cluster" \
+  'git -pP status' escalate
+check "r13 F4 allow: quoted \"-P\" still matches the skip" \
+  'git "-P" status' allow
+check "r13 F4 escalate: --no-pager -- leaves no verb" \
+  'git --no-pager -- status' escalate
+check "r13 F4 escalate: \$ token right after the skip" \
+  'git --no-pager $x status' escalate
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
