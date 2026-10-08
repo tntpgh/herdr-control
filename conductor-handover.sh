@@ -151,14 +151,23 @@ if ! pane_is_conductor_eligible "$to_pane" 2>/dev/null; then
   echo "conductor-handover: refusing — target pane $to_pane is not an agent, is a registered worker's own active task pane, or its eligibility could not be verified" >&2
   exit 5
 fi
-_to_live_rc=0
-_is_live "$to_pane" "" || _to_live_rc=$?
-case "$_to_live_rc" in
-  0) : ;;
-  2) echo "conductor-handover: refusing — could not read target pane $to_pane's birth fingerprint (herdr read failed)" >&2; exit 5 ;;
-  *) echo "conductor-handover: refusing — target pane $to_pane is gone" >&2; exit 5 ;;
-esac
-to_birth="$(pane_birth_now "$to_pane" 2>/dev/null)"
+# F2 (security review PR #253): the birth used for the CAS and the
+# liveness check must be the SAME read — a second, later pane_birth_now
+# call here (between the liveness check and the CAS) had no rc/empty
+# check of its own, so a transient herdr hiccup on THAT read (distinct
+# from the one that just confirmed liveness) could hand over with an
+# EMPTY conductor_pane_birth. One read; its own rc and emptiness decide
+# live/gone/indeterminate, and the same value becomes to_birth.
+_to_birth_read="$(pane_birth_now "$to_pane")"; _to_live_rc=$?
+if [ "$_to_live_rc" != 0 ]; then
+  echo "conductor-handover: refusing — could not read target pane $to_pane's birth fingerprint (herdr read failed)" >&2
+  exit 5
+fi
+if [ -z "$_to_birth_read" ]; then
+  echo "conductor-handover: refusing — target pane $to_pane is gone" >&2
+  exit 5
+fi
+to_birth="$_to_birth_read"
 to_conductor_id="conductor_${to_pane}"
 by="conductor_${caller_pane}"
 

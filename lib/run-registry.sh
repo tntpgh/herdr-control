@@ -769,8 +769,8 @@ set_task_conductor() {
   local run_id="$1" task_id="$2" from_pane="$3" from_birth="$4" to_pane="$5" \
         to_birth="$6" to_conductor_id="$7" by="$8" reason="${9:-}"
   registry_init || return 1
-  [ -n "$run_id" ] && [ -n "$task_id" ] && [ -n "$to_pane" ] && [ -n "$to_conductor_id" ] || {
-    printf 'run-registry: set_task_conductor requires run_id, task_id, to_pane, to_conductor_id\n' >&2
+  [ -n "$run_id" ] && [ -n "$task_id" ] && [ -n "$to_pane" ] && [ -n "$to_birth" ] && [ -n "$to_conductor_id" ] || {
+    printf 'run-registry: set_task_conductor requires run_id, task_id, to_pane, to_birth, to_conductor_id\n' >&2
     return 1
   }
   local at eid payload changed

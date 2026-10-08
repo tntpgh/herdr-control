@@ -292,6 +292,31 @@ check "wake_result recorded submitted (delivered through send-to-agent.sh, not a
   "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.outcome') FROM events WHERE task_id='taskF' AND type='wake_result' ORDER BY sequence DESC LIMIT 1;")" \
   "submitted"
 
+printf "== F1 (security review PR #253): a LATER prompt wakes the NEW conductor even with a stale env HERDR_CONDUCTOR_PANE_ID ==\n"
+# A worker's HERDR_CONDUCTOR_PANE_ID is stamped once at spawn and never
+# updated — after the handover above, taskF's own hook calls still carry
+# the OLD conductor pane (C1) in that env var. push_wake must now read
+# conductor_pane_id off the CURRENT registry row (C2, set by the handover)
+# instead of trusting it, or every later prompt refuses as
+# "conductor_pane_recycled" once C1's birth stops matching C2's.
+# HERDR_ALERT_FORCE=1 isolates the cpane-resolution bug from alert-gate's
+# separate hold/allow-class classification, which is not what this proves.
+: > "$SENT"
+(
+  export HERDR_RUN_ID=run1 HERDR_TASK_ID=taskF HERDR_PANE_ID=w6:p1 \
+         HERDR_CONDUCTOR_PANE_ID="$C1" HERDR_TASK_LABEL=impl:taskF HERDR_ALERT_FORCE=1
+  push_wake "second prompt after handover" "" "" "bash"
+)
+rcW=$?
+check "exit 0 (delivered)" "$rcW" "0"
+check "woken the NEW conductor (C2), not the stale env pane (C1)" \
+  "$(grep -c "^send-text $C2\$" "$SENT")" "1"
+check "nothing sent to the stale env pane (C1)" "$(grep -c "^send-text $C1\$" "$SENT")" "0"
+check "wake_attempted recorded against the NEW conductor pane, not the stale env one" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.conductor_pane') FROM events WHERE task_id='taskF' AND type='wake_attempted' ORDER BY sequence DESC LIMIT 1;")" \
+  "$C2"
+
+
 printf '== help text and bad usage ==\n'
 ch --help >/dev/null; check "exit 0" "$?" "0"
 ch --to "$C2" --reason x >/dev/null 2>&1; check "neither --task nor --from: exit 2" "$?" "2"
