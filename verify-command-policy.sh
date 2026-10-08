@@ -2890,7 +2890,8 @@ check "r10 ln negative: ln -s ../shared lib/shared (source outside .git/)" \
   "ln -s ../shared lib/shared" allow
 
 echo
-echo "== registry-write-reserved (herdr-control#253 round-2 review probe 5c):"
+echo "== registry-write-reserved (herdr-control#253 round-2 review probe 5c,"
+echo "   hardened round 2 / PR #258 to a class rule + narrow read allowlist):"
 echo "   a worker must never write the run registry directly =="
 
 check_reserved "sqlite3 UPDATE the registry (literal default path)" \
@@ -2922,14 +2923,92 @@ check_reserved "remove the whole state directory" \
 check_reserved "cp a tree onto the state directory" \
   "cp -r /tmp/forged-state ~/.local/state/herdr/"
 
+# F1 (review): stdin SQL and dot-command write routes the old verb-list
+# regex never recognized.
+check_reserved "sqlite3 stdin SQL (<)" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 < tmp/update.sql"
+check_reserved "sqlite3 .read dot-command" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \".read tmp/update.sql\""
+check_reserved "sqlite3 -init loads a script" \
+  "sqlite3 -init tmp/update.sql ~/.local/state/herdr/runs/registry.sqlite3 .schema"
+check_reserved "sqlite3 .backup dot-command" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \".backup ~/.local/state/herdr/runs/registry.sqlite3\""
+check_reserved "sqlite3 .save dot-command" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \".save ~/.local/state/herdr/runs/registry.sqlite3\""
+check_reserved "sqlite3 .shell dot-command" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \".shell cp forged ~/.local/state/herdr/runs/registry.sqlite3\""
+check_reserved "sqlite3 .system dot-command" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 \".system install forged ~/.local/state/herdr/runs/registry.sqlite3\""
+
+# F2 (review): filesystem writers the old verb list never enumerated.
+check_reserved "rsync onto the registry" \
+  "rsync forged ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "install onto the registry" \
+  "install forged ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "ditto onto the registry" \
+  "ditto forged ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "sed -i onto the registry" \
+  "sed -i s/old/new/ ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "chmod the registry" \
+  "chmod 600 ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "touch the registry" \
+  "touch ~/.local/state/herdr/runs/registry.sqlite3"
+check_reserved "node fs.copyFileSync onto the registry (no sqlite3 mention)" \
+  'node -e "require(\"fs\").copyFileSync(\"/tmp/forged\", process.env.HOME+\"/.local/state/herdr/runs/registry.sqlite3\")"'
+check_reserved "perl File::Copy onto the registry (no sqlite3 mention)" \
+  'perl -MFile::Copy -e "copy(\"/tmp/forged\", $ENV{HOME}.\"/.local/state/herdr/runs/registry.sqlite3\")"'
+check_reserved "copy the registry out (read-shaped cp, still not the allowlist)" \
+  "cp ~/.local/state/herdr/runs/registry.sqlite3 /tmp/registry-copy.sqlite3"
+check_reserved "cat the registry file (not the sqlite3-only read allowlist)" \
+  "cat ~/.local/state/herdr/runs/registry.sqlite3"
+
+# Path obfuscation the regex still has to see through (quote-stripped by
+# scannable_command, or just non-exact filenames that still name the dir).
+check_reserved "relative path after cd (multi-segment, not the allowlist)" \
+  "cd ~/.local/state/herdr/runs && sqlite3 ./registry.sqlite3 \"UPDATE tasks SET status='x'\""
+check_reserved "path built in a shell variable (multi-segment)" \
+  'db="$HOME/.local/state/herdr/runs/registry.sqlite3"; sqlite3 "$db" "UPDATE tasks SET status=\"x\""'
+check_reserved "split/concatenated filename literal" \
+  'sqlite3 "$HOME/.local/state/herdr/runs/registry"".sqlite3" "UPDATE tasks SET status=\"x\""'
+check_reserved "glob filename naming the state dir" \
+  'sqlite3 ~/.local/state/herdr/runs/registry.sqlite? "UPDATE tasks SET status=\"x\""'
+check_reserved "symlink the registry out, then write the symlink" \
+  'ln -s ~/.local/state/herdr/runs/registry.sqlite3 /tmp/db; sqlite3 /tmp/db "UPDATE tasks SET status=\"x\""'
+check_reserved "python sqlite3, path assembled at runtime" \
+  'python3 -c "import sqlite3; p=__import__(\"os\").path.expanduser(\"~/.local/state/herdr/runs/registry.sqlite3\"); getattr(sqlite3.connect(p), \"executemany\")(\"UPDATE tasks SET status=?\", [(\"x\",)])"'
+check_reserved "python sqlite3, SQL string concatenated at runtime" \
+  'python3 -c "import sqlite3; p=\"$HOME/.local/state/herdr/runs/registry.sqlite3\"; sqlite3.connect(p).execute(\"UPD\"+\"ATE tasks SET status=1\")"'
+check_reserved "HERDR_RUN_STATE_DIR exported then used (multi-segment)" \
+  'HERDR_RUN_STATE_DIR=/tmp/scratch; sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "UPDATE tasks SET status=1"'
+
+# F3 (review): ad-hoc sourcing of a herdr-control lib writer, without the
+# registry path or any SQL verb ever appearing in the command text.
+check_reserved "source lib/claims.sh and call a writer directly" \
+  'bash -c ". ./lib/claims.sh; register_owner forged pane birth session /tmp"'
+check_reserved "source lib/run-registry.sh and call a writer directly" \
+  'bash -c ". ./lib/run-registry.sh; register_owner forged pane birth session /tmp"'
+
 check_unreserved "sqlite3 SELECT against the registry" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
 check_unreserved "sqlite3 .schema read against the registry" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 '.schema tasks'"
+check_unreserved "sqlite3 .tables read against the registry" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 '.tables'"
 check_unreserved "sqlite3 bare PRAGMA read against the registry" \
   "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'PRAGMA table_info(tasks)'"
-check_unreserved "cat the registry file (a read, no write marker)" \
-  "cat ~/.local/state/herdr/runs/registry.sqlite3"
+check_unreserved "sqlite3 -readonly SELECT against the registry" \
+  "sqlite3 -readonly ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+check_unreserved "sqlite3 -json SELECT against the registry" \
+  "sqlite3 -json ~/.local/state/herdr/runs/registry.sqlite3 'SELECT * FROM tasks'"
+
+# F4 (review): ordinary reads the old regex over-reserved -- a `>` used as
+# a SQL comparison (inside quotes, never a real operator) and a harmless
+# stderr-to-null redirect must both stay in the allowlist.
+check_unreserved "sqlite3 SELECT using > as a SQL comparison, not a redirect" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT x > 1 FROM tasks'"
+check_unreserved "sqlite3 SELECT with a harmless stderr-to-null redirect" \
+  "sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 'SELECT 1' 2>/dev/null"
+
 
 # Real negative: the threat named in the SPEC is real -- an UPDATE through
 # sqlite3 really does rewrite conductor_pane_id on a throwaway registry (own

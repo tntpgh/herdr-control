@@ -5877,14 +5877,49 @@ conductor_reserved_reason() {
   elif { _cp_git_push_invoked "$(_cp_mask_script_data "$raw")" && ! _cp_push_is_safe "$action_norm"; } || _cp_imatch '\bgh\b.*\bpr\b.*\bmerge\b|\bgh\b.*\bpr\b.*\breview\b.*--approve|\bgh\b.*\balias[[:space:]]+set\b|--auto-approve|--dangerously-skip-permissions|--approval-mode[=[:space:]]+yolo|(^|[[:space:]])-a[[:space:]]+yolo\b|--yolo\b|--full-auto\b|--permission-mode[=[:space:]]+bypass' "$action_norm" ||
        { _cp_imatch "$_CP_POLICY_FILE_RE" "$action_norm" && ! _cp_policy_mention_harmless "$raw"; }; then
     printf 'merge, governance, push, or control weakening remains human-only\n'
-  # Registry-write-reserved (herdr-control#253 round-2 review probe 5c): a
-  # hook-mode worker that can UPDATE its own task row (e.g. set its own pane
-  # as conductor_pane_id) can approve its own prompts next. Only herdr-
-  # control scripts may write the registry, and those run as the conductor
-  # or human — so ANY direct write, by any route, is reserved the same way
-  # editing run-registry.sh itself already is (_CP_POLICY_FILE_RE above):
-  # name the target, exempt a provably harmless read.
-  elif _cp_imatch "$_CP_REGISTRY_PATH_RE" "$action_norm" && ! _cp_registry_mention_harmless "$raw"; then
+  # Registry-write-reserved (herdr-control#253 round-2 review probe 5c,
+  # hardened round 2 / PR #258 by the SPEC at .handoffs/SPEC.md and its
+  # review at review/registry-write/.handoffs/REVIEW.md): a hook-mode
+  # worker that can write its own task row (e.g. set its own pane as
+  # conductor_pane_id) can approve its own prompts next. Only herdr-
+  # control's own entry scripts, run as the conductor or human, may write
+  # the registry. Round 1 enumerated write VERBS (UPDATE/INSERT/.../`>`/
+  # cp/mv/...) and the review proved that converges on nothing: stdin SQL
+  # and dot-commands (`<`, `.read`, `.backup`, `.shell`, `.system`), non-
+  # enumerated filesystem writers (rsync, install, ditto, sed -i, node/
+  # perl file APIs), and ad-hoc-sourced lib/*.sh writer functions were all
+  # unreserved by the old regex (F1-F3). Round 2 replaces the denylist
+  # with a class rule: reserve ANY segment that can reach the registry AT
+  # ALL, and carve back out one narrow, provably-safe read shape instead
+  # of trying to enumerate every dangerous one.
+  #
+  # _CP_REGISTRY_TRIGGER_RE fires on: the sqlite3 binary/module/library by
+  # name anywhere (`\bsqlite3\b` — a word boundary sits right before
+  # "sqlite3" even inside "better-sqlite3", so the CLI, Python's `sqlite3`
+  # module, and better-sqlite3 are all one pattern); the state dir/db by
+  # any spelling (_CP_REGISTRY_PATH_RE); and ad-hoc sourcing of ANY herdr-
+  # control lib/*.sh file (`. lib/...sh`, `source lib/...sh`, bare
+  # `claims.sh`) or a named writer entry point (`set_task_conductor`) —
+  # once a lib is sourced outside a reviewed entry script, assume a
+  # writer gets called next rather than trying to enumerate which one.
+  # herdr-control's own entry scripts (herdr-action.sh, spawn-task.sh,
+  # close-done-workers.sh, ...) source their libs INSIDE the script FILE,
+  # never in the invoked command TEXT this classifier ever sees, so a
+  # normal invocation of one is untouched by this rule and keeps its
+  # existing verdict (SPEC item 3) — this is not a by-name exemption, it
+  # structurally never matches.
+  #
+  # _cp_registry_read_allowed carves back out exactly: `sqlite3 [-readonly]
+  # [-json|-line|-separator X] <path> "<ONE statement>"`, statement a bare
+  # SELECT/PRAGMA (no `=`) or `.schema`/`.tables`, no stdin/no other flag
+  # (so `-init`, `-cmd`, `-csv`, ... all fail closed), and no `;`/`$(`/
+  # unresolved `$VAR` inside the quoted SQL or the path. F4 (over-
+  # reservation of ordinary reads): a `>` used as a SQL COMPARISON is
+  # already a control byte by the time _cp_simple_words sees it (quoted,
+  # so _cp_protect_text protected it, not a real operator), and a harmless
+  # `2>/dev/null`/`N>&M` redirect is blanked before the operator check —
+  # only a real write-capable redirect still trips `_cp_simple_words`.
+  elif _cp_imatch "$_CP_REGISTRY_TRIGGER_RE" "$action_norm" && ! _cp_registry_read_allowed "$1"; then
     printf 'registry writes remain human-only\n'
   fi
 }
@@ -5896,21 +5931,57 @@ conductor_reserved_reason() {
 # filename only, same style as _CP_POLICY_FILE_RE.
 _CP_REGISTRY_PATH_RE='\bHERDR_RUN_STATE_DIR\b|(^|[^A-Za-z0-9_-])registry\.sqlite3\b|\.local/state/herdr\b'
 
-# Write markers for the registry/state-dir mention above: SQL verbs that
-# mutate a sqlite3 database, the `.import`/`.restore` dot-commands, a SETTER
-# pragma (one with `=`; a bare pragma is a read), python's execute(...)/
-# executescript(...) call shapes, and any shell-level write (redirect, tee,
-# cp/mv/rm/dd/truncate/ln). Matched anywhere in the text, not word-by-word:
-# the SQL is almost always one quoted argument or heredoc body a shell-word
-# segmenter cannot parse, same reasoning as _cp_cred_shaped_and_not_placeholder.
-_CP_REGISTRY_WRITE_RE='\b(update|insert|delete|replace|drop|alter|create|attach)\b|\.import\b|\.restore\b|\bexecute(script)?[[:space:]]*\(|\bpragma\b[^;]*=|>|\btee\b|\bcp\b|\bmv\b|\brm\b|\bdd\b|\btruncate\b|\bln\b'
+# See the registry-write-reserved comment above conductor_reserved_reason's
+# registry branch for the design. Three independent OR'd triggers: the
+# state dir/db (_CP_REGISTRY_PATH_RE), the sqlite3 binary/module/library by
+# name, and ad-hoc sourcing of a herdr-control lib/*.sh file or a named
+# writer entry point.
+_CP_REGISTRY_TRIGGER_RE="$_CP_REGISTRY_PATH_RE"'|\bsqlite3\b|(^|[;&|(]|[[:space:]])(\.|source)[[:space:]]+[^;&|]*\blib/[A-Za-z0-9_.-]*\.sh\b|\bclaims\.sh\b|\bset_task_conductor\b'
 
-# `_cp_registry_mention_harmless <raw>` -> 0 when the registry/state-dir
-# mention cannot have written anything: no write marker anywhere in the
-# text. `SELECT`, `.schema`, and a bare `pragma` (no `=`) stay unreserved —
-# the ordinary worker flow of inspecting its own task row.
-_cp_registry_mention_harmless() {       # raw
-  ! _cp_imatch "$_CP_REGISTRY_WRITE_RE" "$1"
+# `_cp_registry_read_allowed <raw>` -> 0 only for the single allowlisted
+# registry read: `sqlite3 [-readonly] [-json|-line|-separator X] <path>
+# "<statement>"`, statement exactly one bare SELECT/PRAGMA (no `=` — a
+# setter) or `.schema`/`.tables`. A harmless stderr-to-null (`2>/dev/null`)
+# or fd-dup (`N>&M`) redirect is blanked first so it cannot itself trip the
+# operator check (F4); every other unquoted operator (real stdin/output
+# redirect, `;`, `&&`, a pipe) still makes _cp_simple_words refuse, which
+# this function then also refuses. No other sqlite3 flag is allowlisted —
+# `-init`, `-cmd`, `-csv`, `-batch`, ... all fall through to "not allowed".
+_cp_registry_read_allowed() {           # raw
+  local tidy
+  tidy="$(printf '%s' "$1" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
+  _cp_simple_words "$tidy" "" || return 1
+  local -a w=("${_CP_W[@]}")
+  [ "${#w[@]}" -ge 3 ] || return 1
+  [ "$(_cp_bwt_unprotect "${w[0]}")" = sqlite3 ] || return 1
+  local i=1 tok
+  while [ "$i" -lt "${#w[@]}" ]; do
+    tok="$(_cp_bwt_unprotect "${w[$i]}")"
+    case "$tok" in
+      -readonly|-json|-line) i=$((i + 1)) ;;
+      -separator) i=$((i + 2)) ;;
+      -*) return 1 ;;
+      *) break ;;
+    esac
+  done
+  # Exactly <path> <statement> remain -- no stdin source, no trailing junk.
+  [ "$((i + 2))" -eq "${#w[@]}" ] || return 1
+  local path sql
+  path="$(_cp_bwt_unprotect "${w[$i]}")"
+  sql="$(_cp_bwt_unprotect "${w[$((i + 1))]}")"
+  # A computed path/statement (command substitution, an unresolved $VAR, a
+  # glob) is not something this static classifier can verify the content
+  # of -- fail closed rather than guess what it would expand to.
+  case "$path" in *'@SUB@'*|*'$'*|*'*'*|*'?'*|*'['*) return 1 ;; esac
+  case "$sql" in *';'*|*'@SUB@'*|*'$'*) return 1 ;; esac
+  if printf '%s' "$sql" | grep -qiE '^\.schema([[:space:]]|$)|^\.tables[[:space:]]*$'; then
+    return 0
+  fi
+  if printf '%s' "$sql" | grep -qiE '^(select|pragma)[[:space:]]'; then
+    case "$sql" in *=*) return 1 ;; esac   # a PRAGMA setter, not a read
+    return 0
+  fi
+  return 1
 }
 
 # The governance files. A name counts only as a whole path component: the
