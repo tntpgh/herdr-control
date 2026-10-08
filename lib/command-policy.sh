@@ -2565,15 +2565,20 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
 #
 # ALLOWLIST, not denylist: a git invocation is safe to auto-allow ONLY if
 # ALL of —
-#   1. the very first token here IS the subcommand itself — no `-c`, `-C`,
-#      `--git-dir`, `--work-tree`, `--exec-path`, `--namespace`,
-#      `--super-prefix`, `--config-env`, `-p`/`--paginate`, or any other
-#      token starting with `-`, ahead of it (attached short form included:
-#      `-ccore.pager=x`). ANY token before the subcommand changes what
-#      repo/config git reads from or runs, so it disqualifies the whole
-#      invocation — this is checked here; the caller checks the matching
-#      `GIT_*`/`PAGER`/`EDITOR`/`VISUAL` env-assignment-ahead-of-`git` case,
-#      since that token never reaches this function at all.
+#   1. the very first token here IS the subcommand itself, OR one or more
+#      repetitions of `--no-pager`/`-P` (any order with each other) ahead
+#      of it — round 12 (herdr-control#254 follow-up, hub form
+#      20261008T004244-8734): both ONLY disable the pager, a strictly
+#      safer exec surface, so they are the one exception to "any token
+#      before the subcommand disqualifies". No `-c`, `-C`, `--git-dir`,
+#      `--work-tree`, `--exec-path`, `--namespace`, `--super-prefix`,
+#      `--config-env`, `-p`/`--paginate`, or any other token starting with
+#      `-`, ahead of the subcommand (attached short form included:
+#      `-ccore.pager=x`). ANY OTHER token before the subcommand changes
+#      what repo/config git reads from or runs, so it disqualifies the
+#      whole invocation — this is checked here; the caller checks the
+#      matching `GIT_*`/`PAGER`/`EDITOR`/`VISUAL` env-assignment-ahead-of-
+#      `git` case, since that token never reaches this function at all.
 #   2. for `git grep`: no option token starting with `-O` or `--o` — every
 #      spelling and abbreviation of `--open-files-in-pager` starts one of
 #      those two ways.
@@ -2684,6 +2689,7 @@ _cp_git_unsafe_tokens() {               # token... (everything after the git wor
     case "$tok" in *'$'*|*'@SUB@'*) return 0 ;; esac
     if [ -z "$verb" ]; then
       case "$tok" in
+        --no-pager|-P) continue ;;
         -*) return 0 ;;
         *) verb="$tok"
            # Round 8 (SPEC item B): `git mergetool` always launches an
