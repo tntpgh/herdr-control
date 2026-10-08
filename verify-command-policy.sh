@@ -1963,8 +1963,8 @@ check_wt "bash piped to xargs touch outside is unwrapped and escalates (#192 byp
   "$WT_184" 'echo /outside/marker | xargs touch' escalate
 check_wt "bash find -exec touch (round 3, #261 r3): touch is not on the inner read-only allowlist, escalates even fully inside the worktree now" \
   "$WT_184" 'find . -exec touch .handoffs/x \;' escalate
-check_wt "bash plain find with no -exec writes nothing, allows (the dominant real-world find shape)" \
-  "$WT_184" "find . -name '*.log'" allow
+check_wt "bash plain find with a quoted glob: blunt rule OB — find + a quote anywhere now escalates" \
+  "$WT_184" "find . -name '*.log'" escalate
 
 # herdr-control#192 round 2 — three MORE parser gaps found on re-review.
 check_wt "bash -c wraps a real bash string, unwrapped and escalates (#192 round 2 bypass D)" \
@@ -2326,8 +2326,8 @@ check "F9: chroot wraps a safe read, stays allow" \
   "chroot /tmp git log" allow
 check "F9: xcrun --find mode never invokes the tool, stays allow" \
   "xcrun --find git" allow
-check "F9: bare find with no -exec clause still allows (dominant real shape)" \
-  "find . -name '*.md'" allow
+check "F9: blunt rule OB — bare find with a quoted glob now escalates (quote anywhere + find)" \
+  "find . -name '*.md'" escalate
 
 # F10: fail-closed shapes SPEC item 3 calls out by name — an unresolvable
 # wrapped command must escalate, never silently read as "not git".
@@ -2704,8 +2704,8 @@ check "rule D false-positive fix: a function-def shape sitting in printf DATA" \
   'printf "%s\n" "name() {"' allow
 check "rule D false-positive fix: eval as a git --format value, not a word" \
   'git log --format=eval' allow
-check "rule D false-positive fix: a function-def shape as a git --format value" \
-  'git log --format="name() {"' allow
+check "rule D false-positive fix / blunt rule OB: a quote in a git --format value now escalates (git + quote anywhere)" \
+  'git log --format="name() {"' escalate
 
 # Acceptance checklist, item 1: classify in-process before asking.
 check "acceptance: ls -la allows" "ls -la" allow
@@ -3515,8 +3515,8 @@ check "r3 item3 negative: -sdk (single-dash) with a plain name stays allow (no r
 # new narrower rule now.
 
 # SPEC's own three required rows.
-check "#261 r3: find with no -exec primary allows, as trunk" \
-  "find . -name \"*.md\"" allow
+check "#261 r3 / blunt rule OB: find with no -exec primary but a quoted glob now escalates" \
+  "find . -name \"*.md\"" escalate
 check "#261 r3: find -exec wc (allowlisted tool) allows" \
   "find . -type f -exec wc -l {} +" allow
 check "#261 r3: find -exec rm (not on the allowlist) escalates" \
@@ -3620,8 +3620,8 @@ check "#261 r4 ATK-glob6: a bare unquoted glob in find's own argv escalates" \
   "find . * -maxdepth 0" escalate
 check "#261 r4 ATK-glob6: an unquoted glob after find's OWN flag/value pair still escalates" \
   "find . -newer /tmp/ref * -maxdepth 0" escalate
-check "#261 r4 ATK-glob6-OB: a QUOTED glob pattern keeps today's verdict, allows" \
-  "find . -name '*.md'" allow
+check "#261 r4 ATK-glob6-OB / blunt rule OB round 2: a QUOTED glob pattern now escalates (the quote itself triggers)" \
+  "find . -name '*.md'" escalate
 
 # ATK-tilde-safe (decided: stays escalated, on purpose — brief item 4):
 # a path-qualified -exec clause command word is judged by its own
@@ -3746,8 +3746,8 @@ check "#261 r5 INNER-libxo: wc --libxo=encoder=<path> inside a -exec clause esca
   "find . -exec wc --libxo=encoder=../../../../tmp/evil {} \\;" escalate
 check "#261 r5 INNER-libxo: ls --libxo=encoder=<path> inside a -exec clause escalates" \
   "find . -exec ls --libxo=encoder=../../../../tmp/evil {} \\;" escalate
-check "#261 r5 INNER-libxo (regression): wc's closed-list long options still allow" \
-  "find . -exec wc --lines {} \\;" allow
+check "#261 r5 INNER-libxo (regression) / blunt rule OB: wc's closed-list long options, but find's own -exec \\; backslash now escalates" \
+  "find . -exec wc --lines {} \\;" escalate
 
 # round 5b (Main's live run of round 5): a command word that is ONE
 # fully-quoted plain word is equivalent to unquoted — an argv-quoting
@@ -3833,7 +3833,7 @@ check "#261 r6 R5-QWRAP: a chain of individually-quoted launchers still unwraps 
 
 # ---------------------------------------------------------------------------
 # findgit-blunt (follow-up to #261 round 6, SPEC "Blunt fail-closed rule:
-# find/git together with substitution, redirect or quote escalates"):
+# find/git together with substitution, redirect or quote escalates").
 # `_cp_findgit_blunt_present` is ONE deliberately blunt raw-text scan — a
 # find/git token anywhere combined with `$(`, a backtick, `<(`/`>(`, a
 # redirect ahead of a segment's first word, or a quoted `$` expansion in
@@ -3845,14 +3845,28 @@ check "#261 r6 R5-QWRAP: a chain of individually-quoted launchers still unwraps 
 # them and are OUT OF SCOPE for this one blunt rule by design — they keep
 # origin/main's own verdict, pinned here as deliberate non-coverage rather
 # than silently left untested.
+#
+# PR #264 round 2 (review/pr-264/.handoffs/REVIEW.md F1-F4): the five
+# named trigger FORMS above were still anchored to a segment START or an
+# exact `"$` pair, so a redirect anywhere but the front of a
+# `_cp_segments` split, an `&>`/`{v}<` spelling, a quoted `$` split across
+# a flag prefix, or a `gfind`/`fd`/`*`/bracket-range spelling all slipped
+# past. `_cp_findgit_blunt_present` is now rewritten as ONE normalise-
+# then-scan pass with no position or exact-spelling anchor at all: a
+# find/git mention (a substring match anywhere, or a glob character in
+# command position) combined with `$`/backtick/`<`/`>`/a quote/a backslash
+# ANYWHERE in the raw text. Accepted fallout: an ordinary quoted find
+# argument or a find `-exec … \;` clause (the backslash in `\;` is itself
+# a trigger) now escalates too — every row below marked "blunt rule OB"
+# is exactly that, re-pinned from a prior round's allow.
 
 check "findgit-blunt ordinary: git status stays allowed" \
   "git status" allow
 check "findgit-blunt ordinary: git diff HEAD~1 stays allowed" \
   "git diff HEAD~1" allow
-check "findgit-blunt ordinary: a quoted find ARGUMENT not touching the word stays allowed" \
-  "find . -name '*.sh' -print" allow
-check "findgit-blunt ordinary: a TRAILING redirect (not leading) stays allowed" \
+check "findgit-blunt ordinary / blunt rule OB: a quoted find ARGUMENT now escalates (quote anywhere + find)" \
+  "find . -name '*.sh' -print" escalate
+check "findgit-blunt ordinary: a TRAILING redirect (not leading) on a plain git read verb stays allowed (step 4 exception)" \
   "git log --oneline -5 2>/dev/null" allow
 
 check "findgit-blunt SUB-sq: find single-quoted inside \$(...) escalates" \
@@ -3925,7 +3939,11 @@ check "findgit-blunt N1-herestr: a here-string ahead of a single-char-elided git
 # fd's own `-x`/`-X`/`--exec`/`--exec-batch` check, close L-dtruss/
 # L-sc_usage/L-screen/L-gfind/L-fd-x/KW-coproc/G-coproc. `find . -fprint`/
 # `-fls` close via the existing find-delete escalation, widened to cover
-# find's other write primitives.
+# find's other write primitives. PR #264 round 2: `_cp_find_wrapped_
+# quote_present` is removed — a quote ANYWHERE in the text is now a
+# trigger for the one blunt rule, a strict superset of "a quote in a
+# segment that wraps find/gfind/fd", so QO-* below still escalate with no
+# dedicated function.
 check "findgit-blunt KW-coproc: a bare coproc wrapping find escalates" \
   'coproc C { find . * -maxdepth 0; }' escalate
 check "findgit-blunt QO-nice: a quoted-option nice wrapping find escalates" \
@@ -3936,8 +3954,8 @@ check "findgit-blunt QO-time: a quoted-option time wrapping find escalates" \
   "time \"-p\" find . * -maxdepth 0" escalate
 check "findgit-blunt QO-nohup: a quoted-option nohup wrapping find escalates" \
   "nohup '--' find . * -maxdepth 0" escalate
-check "findgit-blunt QO-regression: a bare quoted find ARGUMENT (no wrapper) still allows" \
-  "find . -name '*.sh' -print" allow
+check "findgit-blunt QO-regression / blunt rule OB: a bare quoted find ARGUMENT (no wrapper) now escalates" \
+  "find . -name '*.sh' -print" escalate
 check "findgit-blunt I-libxo-env: LIBXO_OPTIONS ahead of find escalates" \
   'LIBXO_OPTIONS=encoder=../../../../tmp/x find . -exec wc {} \;' escalate
 check "findgit-blunt I-libxo-top: LIBXO_OPTIONS ahead of ls (no find/git token at all) escalates" \
@@ -3964,6 +3982,88 @@ check "findgit-blunt L-fd-regression: a bare fd search with no -x/-X/--exec stil
   'fd pattern' allow
 check "findgit-blunt G-coproc: a bare coproc wrapping git escalates" \
   'coproc C { git -C /tmp/evilrepo status; }' escalate
+
+# ---------------------------------------------------------------------------
+# PR #264 round 2 (review/pr-264/.handoffs/REVIEW.md F1-F4): the rewritten
+# `_cp_findgit_blunt_present` drops every position/spelling anchor the
+# round-6 version still had. These pin the review's own named examples.
+
+# F1 HIGH: a redirect anywhere ahead of find/git, not just at the front of
+# a `_cp_segments` split — `|`, `(`, `!`, an assignment or `if`/`then` never
+# split there, so the old front-anchored check missed all of these.
+check "PR264 F1: a pipe ahead of a redirect-wrapped git desyncs the old front-anchor, escalates" \
+  'true | </dev/null git -C /tmp/evilrepo status' escalate
+check "PR264 F1: a subshell ahead of a redirect-wrapped find desyncs the old front-anchor, escalates" \
+  'true; ( </dev/null find . -maxdepth 0 -exec echo INJECTED {} \; )' escalate
+check "PR264 F1: a bang ahead of a redirect-wrapped find desyncs the old front-anchor, escalates" \
+  '! </dev/null find . -maxdepth 0 -exec echo INJECTED {} \;' escalate
+check "PR264 F1: a leading env assignment ahead of a redirect-wrapped find desyncs the old front-anchor, escalates" \
+  'X=1 </dev/null find . -maxdepth 0 -exec echo INJECTED {} \;' escalate
+check "PR264 F1: an if/then ahead of a redirect-wrapped find desyncs the old front-anchor, escalates" \
+  'if true; then </dev/null find . -maxdepth 0 -exec echo INJECTED {} \;; fi' escalate
+
+# F2 HIGH: redirect spellings the old front-anchor regex never listed —
+# `&>`, `&>>`, `{name}<` — now irrelevant since the trigger is just "a `<`
+# or `>` anywhere", not a specific operator spelling.
+check "PR264 F2: &> ahead of find escalates (spelling the old anchor regex never listed)" \
+  '&>/dev/null find . -maxdepth 0 -exec echo INJECTED {} \;' escalate
+check "PR264 F2: &>> ahead of find escalates" \
+  '&>>/dev/null find . -maxdepth 0 -exec echo INJECTED {} \;' escalate
+check "PR264 F2: a named file descriptor redirect ({v}<) ahead of git escalates" \
+  '{v}</dev/null git -C /tmp/evilrepo status' escalate
+
+# F3 HIGH: a quote touching a `$` expansion in find's own argv, split
+# across a flag prefix — the old trigger was the literal two characters
+# `"$`, which neither of these contain.
+check "PR264 F3: a quoted \${VAR:-default} expansion prefixed onto a flag escalates" \
+  'find /dev/null -maxdepth 0 "-${U:-exec}" echo INJECTED {} \;' escalate
+check "PR264 F3: a quoted \${VAR:-default} expansion spliced mid-flag escalates" \
+  'find /dev/null -maxdepth 0 "-e${U:-xec}" echo INJECTED {} \;' escalate
+
+# F4 HIGH: gfind/fd (missing from the old token alternation) and a glob
+# character standing in for the verb (missing from the old bracket-
+# stripped substring test), including behind a front redirect — the case
+# the old "already closed by an earlier rule" comment got wrong, because
+# that earlier rule is the same locator a front redirect desyncs.
+check "PR264 F4: gfind behind a front redirect escalates (gfind contains the 'find' substring)" \
+  '</dev/null gfind /dev/null -maxdepth 0 -exec echo INJECTED {} \;' escalate
+check "PR264 F4: fd behind a front redirect escalates" \
+  '</dev/null fd . /dev -x echo INJECTED' escalate
+check "PR264 F4: a star-disguised find verb behind a front redirect escalates (glob in command position)" \
+  '>& /dev/null /usr/bin/f*nd . -maxdepth 0 -exec echo INJECTED {} \;' escalate
+check "PR264 F4: a star-disguised git verb behind a front redirect escalates" \
+  '>& /dev/null /usr/bin/g*t -C /tmp/evilrepo status' escalate
+check "PR264 F4: a bracket-range git verb behind a leading here-string escalates" \
+  '<<< x /usr/bin/g[h-j]t -C /tmp/evilrepo status' escalate
+check "PR264 F4: a bracket-wrapped find verb after a plain segment boundary escalates (no redirect needed)" \
+  'echo $(true); fi[n]d /dev/null -maxdepth 0 -exec echo INJECTED {} \;' escalate
+check "PR264 F4: a bracket-range git verb after a plain segment boundary escalates" \
+  'echo $(true); [f-h]it -C /tmp/evilrepo status' escalate
+
+# Controls the PR claims to close (probes.sh ctl-*), distinct text from
+# the round-6 rows above.
+check "PR264 ctl-subst: find behind an unrelated \$(...) substitution, same segment, escalates" \
+  'echo $(true); find . -maxdepth 0 -exec echo INJECTED {} \;' escalate
+check "PR264 ctl-bt: git behind an unrelated backtick substitution, same segment, escalates" \
+  'echo `true`; git -C /tmp/evilrepo status' escalate
+check "PR264 ctl-procsub: find behind an unrelated <(...) process substitution, same segment, escalates" \
+  'cat <(true); find . * -maxdepth 0' escalate
+
+# blunt rule OB, round 2 (Main's live run, r6 probes): the remaining r6
+# accepted-safe rows from `review/pr-261-r6/tmp/r6probes.sh` (NOT edited —
+# it is a read-only review artifact; these are the same commands pinned
+# here instead) now carry a quote or a backslash alongside the find
+# mention, so the blunt rule's step-3 trigger fires on them too.
+# C-safe-find is already re-pinned above (the duplicate "findgit-blunt
+# ordinary"/"QO-regression" rows, same literal command).
+check "r6 C-safe-exec / blunt rule OB: a quoted glob in a find -exec clause now escalates" \
+  "find . -name '*.ts' -exec grep -l foo {} +" escalate
+check "r6 T-bs / blunt rule OB: find -exec's own \\; terminator backslash now escalates" \
+  'find . -exec cat {} \;' escalate
+check "r6 T-sq / blunt rule OB: a single-quoted ';' terminator now escalates" \
+  "find . -exec cat {} ';'" escalate
+check "r6 T-dq / blunt rule OB: a double-quoted \";\" terminator now escalates" \
+  'find . -exec cat {} ";"' escalate
 
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then

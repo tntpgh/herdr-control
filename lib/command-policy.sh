@@ -4111,101 +4111,154 @@ _cp_sub_text_risk_present() {           # raw
 }
 
 # `_cp_findgit_blunt_present <raw>` -> 0 (true) when a find/git token
-# appears anywhere in the text AND the text also carries a command
-# substitution, process substitution, a redirect operator ahead of a
-# segment's first word, or a quote touching the find/git word / a quoted
-# `$` expansion in find's own arguments. Follow-up to #261 round 6
-# (SPEC "Blunt fail-closed rule: find/git together with substitution,
-# redirect or quote escalates"): the round-6 review found the locator
-# (`_cp_locate_command_word`) and the substitution-spelling scan
-# (`_cp_sub_text_risk_present`) both desync on a leading redirect
-# (`</dev/null find …`, `<<< x git …`, `2>/dev/null find … -exec …`) or on
-# a quoted `$` expansion inside find's own argv (`find . "${U:--exec}" …`)
-# — neither closes by teaching the real parser one more shape; both close
-# by never trusting the parse in the first place when these five raw-text
-# markers show up next to find/git at all. Deliberately blunt per SPEC:
-# ONE linear scan, no recursion into substitutions, no new parser;
-# escalating an ordinary command that happens to combine these shapes is
-# an accepted over-block, not a bug. ESCALATION-ONLY: classify_command
-# folds this in via `_cp_consider`'s running max, so it can only raise a
-# verdict, never lower one already escalate/deny from another rule.
+# appears anywhere in the text AND the ORIGINAL text also carries one of
+# the trigger characters below, ANYWHERE — not at a segment start, not
+# next to the find/git word. SPEC round 2 (PR #264): the position- and
+# spelling-sensitive round-6 version (five named trigger FORMS, each
+# anchored to a segment start or an exact two-character `"$`) desynced on
+# a redirect that was not at the very front of a `_cp_segments` split
+# (`true; </dev/null find …`, backslash disables the split entirely), on
+# `&>`/`{v}<` spellings the front-anchor regex never listed, on a quoted
+# `$`-expansion split across a prefix (`"-${U:-exec}"`), and on
+# `gfind`/`fd`/`*`/bracket-range spellings the token alternation never
+# named — see review/pr-264/.handoffs/REVIEW.md F1-F4. This version drops
+# every one of those anchors: ONE normalised copy, ONE substring/glob
+# mention test, ONE "does a trigger char occur anywhere" test. Over-
+# matching (an ordinary `find . -name '*.sh'` now escalates on its own
+# quote) is accepted per SPEC rather than chased closed with a sixth
+# anchor.
 #
-# Step 1 (token): quote characters, backslashes and brackets are
-# stripped first so 'find', "find", \find, fi''nd, `\find` and [g]it all
-# read as the bare word; case folds via `grep -qi`. The single run-time
-# probe that elides exactly one letter with a bare `?` (`gi?`, `/usr/bin/
-# fin?`) is matched by explicit per-letter alternatives rather than a
-# general glob engine — every OTHER globbed/braced spelling in this
-# file's own test suite (`{f,}ind`, `~+/find`, full-word brackets) is
-# already closed by an earlier rule before this one ever has to.
+# Step 1 (normalise): quote characters and backslashes are deleted, then
+# the copy is lowercased. Nothing else — no bracket-stripping (round 6
+# stripped `[`/`]` too, which is exactly what let a bracket-range glob
+# spelling hide from the substring test as a false "already closed by an
+# earlier rule"; now it is caught by the glob check below instead).
 #
-# Step 2 (trigger): `$(`, a backtick, `<(`/`>(`, or a literal `"$` (a
-# double-quoted `$`-expansion, e.g. `"$X"`/`"${U:--exec}"`) are plain
-# substring checks on the UNSTRIPPED text — stripping quotes here would
-# hide the very thing being detected. The redirect form reuses the
-# shared `_cp_segments` splitter and checks each segment's own leading
-# text (not the whole string) for an operator before any real word, so a
-# command's OWN trailing `2>/dev/null` (ordinary, must stay allowed per
-# SPEC) never matches — only a redirect at the FRONT of a segment does.
+# Step 2 (mention): true if EITHER (a) the normalised copy contains
+# `find`, `git` or `fd` anywhere (plain substring — this alone covers
+# every ordinary and case/quote/backslash-obfuscated spelling, including
+# `gfind`/`git-status`, regardless of where it sits), or (b) a glob
+# character (`*`, `?`, `[`) sits in "command position" — the word a
+# segment boundary (`;`/`&`/`|`/`(`/`)`) or a redirect's own target hands
+# control to next. Command position is tracked with a single forward scan
+# (the awk pass below, O(n), one process for the whole call — not one
+# fork per segment, which is what made the round-6 version's per-segment
+# loop slow on a 100 KB command): any run of `;&|()<>` flips the next
+# real word into "command position" UNLESS that run contained `<`/`>`, in
+# which case the next word is a redirect TARGET (skipped), and the word
+# AFTER that target is offered command position again — so N leading
+# redirects ahead of a glob-disguised verb (`>& /dev/null [g]it …`,
+# `<<< x /usr/bin/gi? …`) still resolve to the real verb without ever
+# trying to parse which launcher or redirect it was.
+#
+# Step 3 (trigger): a mention is escalated the instant the RAW text (not
+# the normalised copy — stripping first would hide the very thing being
+# detected) contains `$`, a backtick, `<`, `>`, a quote character, or a
+# backslash ANYWHERE. No position check, no two-character `"$` pairing.
+#
+# Step 4 (exception): a trailing `2>/dev/null` or `>/dev/null 2>&1`, as
+# the LAST token(s) of the text, does not itself count as the trigger —
+# `git log --oneline 2>/dev/null` stays allowed. Any OTHER trigger
+# character anywhere outside that trailing suffix still escalates.
 _cp_findgit_blunt_present() {           # raw
   local LC_ALL=C LANG=C
-  local raw="$1" stripped seg split
+  local raw="$1" stripped mention rest trailing=1
+
   stripped="$raw"
   stripped="${stripped//\'/}"
   stripped="${stripped//\"/}"
-  stripped="${stripped//\`/}"
   stripped="${stripped//\\/}"
-  stripped="${stripped//\[/}"
-  stripped="${stripped//\]/}"
-  printf '%s' "$stripped" |
-    grep -qiE '(^|[^a-z0-9])(find|git|git-[a-z-]+|g\?t|\?it|gi\?|\?ind|f\?nd|fi\?d|fin\?)([^a-z0-9]|$)' ||
-    return 1
+  stripped="$(printf '%s' "$stripped" | tr '[:upper:]' '[:lower:]')"
+  # Flatten real embedded newlines (a heredoc body, an ANSI-C $'...\n...'
+  # string) to a control byte BEFORE awk, same technique `_cp_protect_text`
+  # already uses above: awk's default per-LINE record processing would
+  # otherwise run the whole `{ }` block (and its own `hit`/print) once
+  # PER PHYSICAL LINE instead of once for the whole command, so a
+  # command whose find/git mention sits on one line and its trigger
+  # character on another — or even both on the SAME line, with inert
+  # blank lines before/after — printed MULTIPLE "MENTION\nNOMENTION" rows
+  # instead of one, and `[ "$mention" = MENTION ]` then compared that
+  # whole multi-line string against the literal word "MENTION" and always
+  # lost (round 5 regression, Main's live run: RD-heredoc's `<<
+  # EOF find … \nbody\nEOF` stayed allow because its 3-line text produced
+  # 3 printed verdicts, never the single bare "MENTION" the caller checks
+  # for).
+  local flat
+  flat="$(printf '%s' "$stripped" | tr '\n' '\017')"
+
+  mention="$(printf '%s' "$flat" | awk '
+    {
+      text = $0
+      n = length(text)
+      expect_cmd = 1
+      in_target = 0
+      word = ""
+      opbuf = ""
+      hit = (index(text, "find") > 0) || (index(text, "git") > 0) || (index(text, "fd") > 0)
+      for (i = 1; i <= n; i++) {
+        c = substr(text, i, 1)
+        if (c == ";" || c == "&" || c == "|" || c == "(" || c == ")" || c == "<" || c == ">") {
+          if (word != "") {
+            if (!in_target && expect_cmd) {
+              if (word ~ /[*?\[]/) hit = 1
+              expect_cmd = 0
+            }
+            word = ""
+          }
+          opbuf = opbuf c
+        } else if (c == " " || c == "\t" || c == "\017") {
+          if (opbuf != "") {
+            if (opbuf ~ /[<>]/) { in_target = 1; expect_cmd = 1 } else { in_target = 0; expect_cmd = 1 }
+            opbuf = ""
+          } else if (word != "") {
+            if (!in_target && expect_cmd) {
+              if (word ~ /[*?\[]/) hit = 1
+              expect_cmd = 0
+            } else if (in_target) {
+              in_target = 0
+            }
+            word = ""
+          }
+        } else {
+          if (opbuf != "") {
+            if (opbuf ~ /[<>]/) { in_target = 1; expect_cmd = 1 } else { in_target = 0; expect_cmd = 1 }
+            opbuf = ""
+          }
+          word = word c
+        }
+      }
+      if (opbuf != "") {
+        if (opbuf ~ /[<>]/) { in_target = 1; expect_cmd = 1 } else { in_target = 0; expect_cmd = 1 }
+      }
+      if (word != "" && !in_target && expect_cmd) {
+        if (word ~ /[*?\[]/) hit = 1
+      }
+      print (hit ? "MENTION" : "NOMENTION")
+    }
+  ')"
+  [ "$mention" = MENTION ] || return 1
 
   case "$raw" in
-    *'$('*|*'`'*|*'<('*|*'>('*|*'"$'*) return 0 ;;
+    *'$'*|*'`'*|*'<'*|*'>'*|*"'"*|*'"'*|*'\'*) : ;;
+    *) return 1 ;;
   esac
 
-  split=1
-  _cp_quoting_is_simple "$raw" || split=0
-  while IFS= read -r seg; do
-    printf '%s' "$seg" |
-      grep -qE '^[[:space:]]*[0-9]*(<<<|<<-|<<|<&|>&|>\||<|>)' && return 0
-  done <<EOF
-$(_cp_segments "$raw" "$split")
-EOF
+  rest=""
+  case "$raw" in
+    *' 2>/dev/null') rest="${raw% 2>/dev/null}" ;;
+    *'2>/dev/null') rest="${raw%2>/dev/null}" ;;
+    *' >/dev/null 2>&1') rest="${raw% >/dev/null 2>&1}" ;;
+    *'>/dev/null 2>&1') rest="${raw%>/dev/null 2>&1}" ;;
+    *) trailing=0 ;;
+  esac
+  if [ "$trailing" = 1 ]; then
+    case "$rest" in
+      *'$'*|*'`'*|*'<'*|*'>'*|*"'"*|*'"'*|*'\'*) ;;
+      *) return 1 ;;
+    esac
+  fi
 
-  return 1
-}
-
-# `_cp_find_wrapped_quote_present <raw>` -> 0 (true) when a segment's OWN
-# first word is something OTHER than find/gfind/fd, that segment also
-# carries a find/gfind/fd word later, and the segment has a quote
-# character anywhere. Follow-up to #261 round 6 (Main's live run,
-# QO-nice/QO-command/QO-time/QO-nohup): a launcher's OWN flag value
-# quoted (`nice '-n' 5 find …`, `command '-p' find …`, `time "-p" find
-# …`, `nohup '--' find …`) is a different shape than the launcher NAME
-# itself being quoted (`'nice' find …`, already closed) — this does not
-# try to prove which launcher flag the quote sits on or whether it
-# changes the launcher's own parse; any quote anywhere in a segment that
-# wraps find/gfind/fd behind some other first word is blunt grounds to
-# escalate. A bare `find . -name '*.sh' -print` (find itself is the
-# segment's first word) is explicitly excluded, so an ordinary quoted
-# find ARGUMENT keeps allowing.
-_cp_find_wrapped_quote_present() {      # raw
-  local LC_ALL=C LANG=C
-  local raw="$1" seg split first
-  split=1
-  _cp_quoting_is_simple "$raw" || split=0
-  while IFS= read -r seg; do
-    [ -n "${seg//[[:space:]]/}" ] || continue
-    read -r first _ <<<"$seg"
-    case "$first" in find|gfind|fd) continue ;; esac
-    printf '%s' "$seg" | grep -qE '(^|[^a-z0-9])(find|gfind|fd)([^a-z0-9]|$)' || continue
-    printf '%s' "$seg" | grep -qE "['\"\`]" && return 0
-  done <<EOF
-$(_cp_segments "$raw" "$split")
-EOF
-  return 1
+  return 0
 }
 
 # `_cp_coproc_present <raw>` -> 0 (true) when any segment's first word is
@@ -6093,28 +6146,21 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   _cp_find_word_injection_present "$raw" &&
     _cp_consider 1 "command text names find and also carries an unquoted \$ or backtick expansion — it can inject a new -exec clause find's own argv parsing never sees"
 
-  # escalate — follow-up to #261 round 6 (SPEC "Blunt fail-closed rule:
-  # find/git together with substitution, redirect or quote escalates"):
-  # a find/git token anywhere combined with a substitution, process
-  # substitution, a leading-segment redirect, or a quoted $ expansion.
-  # See `_cp_findgit_blunt_present`'s own header, just above
-  # `_cp_find_word_injection_present`, for the five trigger forms and why
-  # this is a raw-text scan rather than a locator/parser fix.
+  # escalate — SPEC round 2 (PR #264): a find/git token anywhere in the
+  # text combined with `$`, a backtick, `<`, `>`, a quote character or a
+  # backslash ANYWHERE in the raw text — no position/spelling anchor.
+  # This one rule now also covers what the round-6 version split into a
+  # separate quote-wrapped-launcher check (`_cp_find_wrapped_quote_
+  # present`, removed: any quote anywhere already escalates here, a
+  # strict superset). See `_cp_findgit_blunt_present`'s own header, just
+  # above `_cp_find_word_injection_present`.
   _cp_findgit_blunt_present "$raw" &&
     _cp_consider 1 "find/git combined with substitution, redirect or quoting: a conductor must review it"
-
-  # escalate — follow-up to #261 round 6 (Main's live run, QO-nice/
-  # QO-command/QO-time/QO-nohup): a quote character anywhere in a segment
-  # that wraps find/gfind/fd behind some other first word. See
-  # `_cp_find_wrapped_quote_present`'s own header, just below
-  # `_cp_findgit_blunt_present`.
-  _cp_find_wrapped_quote_present "$raw" &&
-    _cp_consider 1 "a quote character sits in a segment that wraps find/gfind/fd behind another launcher word: a conductor must review it"
 
   # escalate — round 2 of this follow-up (Main's live run, KW-coproc/
   # G-coproc): any segment whose first word is `coproc`, unconditionally.
   # See `_cp_coproc_present`'s own header, just below
-  # `_cp_find_wrapped_quote_present`.
+  # `_cp_findgit_blunt_present`.
   _cp_coproc_present "$raw" &&
     _cp_consider 1 "coproc starts a background process this policy cannot see ahead of time: a conductor must review it"
 

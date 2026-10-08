@@ -355,6 +355,16 @@ done < "$work/r1.out"
 printf '== E: F3 — handoffs_write also narrows bash, not just the write tool ==\n'
 # Before the fix every escalate row below auto-allowed: peer_decide never saw
 # handoffs_write, and the outer #184 hook only proves "inside the worktree".
+# blunt rule OB (herdr-control#264 round 2): `find . -name '*.py' -type f`
+# used to be a plain allowed read; `_cp_findgit_blunt_present` now
+# escalates it on the quote character alone (find + a quote anywhere).
+# That is a DIFFERENT escalation than this narrowing's own
+# "restricts writes to .handoffs/ANSWER.md only" — it is
+# `classify_command` itself refusing the command before the write-scope
+# narrowing ever gets a say, same rc=8 block + action request shape but
+# the blunt rule's own reason text. Pulled out of the generic
+# allow/escalate table below (which asserts the narrowing's fixed reason)
+# into its own check, right after the table.
 rm -f "$wt/.handoffs/ANSWER.md"; mkdir -p "$wt/tmp"
 bash_case() {                           # want(allow|escalate) command
   local want="$1" c="$2" out rc d
@@ -378,7 +388,6 @@ allow|cat README.md
 allow|grep -rn foo . | head -5
 allow|git log --oneline -3
 allow|git diff HEAD -- src
-allow|find . -name '*.py' -type f
 allow|rg -n foo src | sort | head -20
 allow|mkdir -p tmp/work && echo x > tmp/work/notes.txt
 escalate|echo x > src/x.py
@@ -429,6 +438,17 @@ escalate|git -c core.pager=cat log
 escalate|git --config-env=core.pager=cat log
 escalate|GIT_PAGER=cat git log
 EOF
+# blunt rule OB (herdr-control#264 round 2): pulled out of the table
+# above because its escalation reason is `_cp_findgit_blunt_present`'s
+# own text, not the write-narrowing's "restricts writes to
+# .handoffs/ANSWER.md only" every other escalate row in that table gets —
+# `classify_command` itself refuses this one before the narrowing ever
+# runs, same rc=8 block + action request shape, different reason.
+out="$(enf bash "$(jq -nc --arg c "find . -name '*.py' -type f" '{command:$c}')")"; rc=$?
+[ "$rc" = 8 ] && [ -n "$(printf '%s' "$out" | field request_id)" ] && printf '%s' "$out" | field reason | grep -q 'find/git combined with substitution, redirect or quoting' \
+  && ok "F3 escalate (blunt rule OB): find . -name '*.py' -type f" \
+  || not_ok "F3 expected blunt-rule escalation for [find . -name '*.py' -type f], got rc=$rc: $out"
+
 # These are refused by peer_decide before F3 runs (find -exec/-delete, xargs,
 # $VAR, unreviewable scripts, the env credential rule); they must stay refused.
 for c in 'find . -name a -exec cp {} src/b \;' 'find . -name a -delete' 'echo src/z | xargs touch' 'echo x > "$OUT"' 'python3 tmp/probe.py' 'timeout 5 python3 tmp/p.py' "env -S \"python3 -c 'open(\\\"src/a\\\",\\\"w\\\")'\"" 'env --chdir=src tee tmp/out' 'env -C src touch tmp/out'; do
