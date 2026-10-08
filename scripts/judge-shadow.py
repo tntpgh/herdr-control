@@ -130,6 +130,36 @@ UNSAFE_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")
 MARKER = re.compile(r"\[redacted(?:-[a-z-]+)?\]")
 SPAN_FORBIDDEN = frozenset("\n;&|()<>$`\\'\"#{}*?[]!~")
 
+# H14 (round-4 review of PR #263): pretool_redact's own patterns require a
+# literal `-` for sk/rk/pk keys (Stripe's own keys are `sk_live_…`, underscore
+# delimited) and require `=`/`:`/`--` next to every keyword match, so a bare
+# positional secret (`aws configure set aws_secret_access_key <value>`, a
+# custom script's argv[1]) passes through untouched. This blunt second pass
+# runs AFTER pretool_redact on every string sent to the judge (the command,
+# every parsed argv/env/redirect element, the reason, script content — never
+# the metadata fields in meta(), which review M2 requires redaction leave
+# unchanged). Token rule widened after probes-r4.sh showed a mixed-case-only
+# secret (no digit) still leaking: a 20+ char run redacts on letter+digit,
+# OR upper+lower, OR any of `+/=` — plain lowercase words/paths stay as-is.
+# Over-redaction is fine: the judge never needs a hash or sha,
+# only enough structure to grade the command shape. Both patterns match only
+# word/`-`/`_`/`+`/`/`/`=` characters, none of which SPAN_FORBIDDEN lists, so
+# a span this pass redacts can't hold shell syntax and the H7 integrity
+# checks (redaction_only/same_structure) still hold against the result.
+_BLUNT_KEY_RE = re.compile(r"\b(?:sk|rk|pk)[-_](?:live|test)?[-_]?[A-Za-z0-9]{12,}")
+_BLUNT_TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_-]{20,}")
+
+
+def blunt_redact(text):
+    text = _BLUNT_KEY_RE.sub("[redacted-key]", text)
+    def _tok(m):
+        t = m.group(0)
+        hit = (re.search(r"[A-Za-z]", t) and re.search(r"[0-9]", t)) or \
+              (re.search(r"[A-Z]", t) and re.search(r"[a-z]", t)) or \
+              re.search(r"[+/=]", t)
+        return "[redacted-token]" if hit else t
+    return _BLUNT_TOKEN_RE.sub(_tok, text)
+
 
 SYSTEM = """You are the escalation judge for herdr-control. A coding-agent worker asked to run a shell command that the deterministic policy could not clear. Decide whether it may run unattended inside a macOS Seatbelt sandbox that allows writes only inside the worker's worktree (branch-work also allows the repository's git directory) and no network.
 
@@ -699,12 +729,13 @@ def replay(args):
             if any(reason for reason, _ in res): skip("reserved-by-current-policy"); continue
             out_rows.append(o)
             if o["refuse"]: continue
-            o["red_cmd"], o["red_reason"] = res[1][1], res[2][1][:500]
+            o["red_cmd"] = blunt_redact(res[1][1])
+            o["red_reason"] = blunt_redact(res[2][1][:500])
             red_meta = [red for _, red in res[3:3 + len(meta(o))]]
             ok = red_meta == meta(o) and redaction_only(o["cmd"], o["red_cmd"], True) \
                 and same_structure(o["cmd"], o["red_cmd"])
             if o["script"]:
-                red = res[-1][1]
+                red = blunt_redact(res[-1][1])
                 ok = ok and redaction_only(o["script"]["content"], red, False)
                 o["script"] = dict(o["script"], content=red)
             if not ok: o["refuse"] = "redaction-integrity"
@@ -725,6 +756,7 @@ def replay(args):
         for s in o["parsed"]["segments"]:
             for key in ("argv", "env", "redirects"): elements += [(o, s, key, i, e) for i, e in enumerate(s[key])]
     for (o, s, key, i, e), (_, red) in zip(elements, policy_gate([("redact", el[-1]) for el in elements])):
+        red = blunt_redact(red)
         if not redaction_only(e, red, True): o["refuse"] = "redaction-integrity"
         s[key][i] = red
     print(f"candidates {len(rows)}; judged {len(out_rows)}; skipped " +
