@@ -166,6 +166,7 @@ stripe_pk="pk_""test_""P9q8R7s6T5u4V3w2"
 bare_digit="A1bcDef2Ghi3Jkl4Mno5Pqr6"
 bare_mixed="wJalrXUtnFEMIFAKEKEYFAKEKEYbPxRfiCYFAKEKEY"
 aws_slash="wJalrXUtnFEMI/""K7MDENG/""bPxRfiCYEXAMPLEKEY"
+aws_slash_nodigit="$(printf '%s/%s' AbCdEfGhIjKlMnOpQrSt UvWxYzAbCdEfGhIjKlM)"
 slack_hook="$(printf 'https://%s/%s/%s/%s' 'hooks.slack.com' services T00000000 'B00000000/A1bcDef2Ghi3Jkl4Mno5Pqr6')"
 discord_hook="$(printf 'https://%s/%s/%s/%s' discord.com api webhooks '1234567890/A1bcDef2Ghi3Jkl4Mno5Pqr6')"
 telegram_hook="$(printf 'https://%s/%s%s/%s' api.telegram.org bot '123456789:A1bcDef2Ghi3Jkl4Mno5Pqr6' sendMessage)"
@@ -174,12 +175,12 @@ bash_payload "./upload.sh $stripe_sk $stripe_rk $stripe_pk" secshape1 | shadow -
 bash_payload "./upload.sh $bare_digit" secshape2 | shadow --record >/dev/null
 bash_payload "./upload.sh $bare_mixed" secshape3 | shadow --record >/dev/null
 bash_payload "printf %s $safe_lower" secshape4 | shadow --record >/dev/null
-bash_payload "./upload.sh $aws_slash" secshape5 | shadow --record >/dev/null
+bash_payload "./upload.sh $aws_slash $aws_slash_nodigit" secshape5 | shadow --record >/dev/null
 bash_payload "curl -sS $slack_hook" secshape6 | shadow --record >/dev/null
 bash_payload "curl -sS $discord_hook" secshape7 | shadow --record >/dev/null
 bash_payload "curl -sS $telegram_hook" secshape8 | shadow --record >/dev/null
 shape_leaks=0
-for shape in "$stripe_sk" "$stripe_rk" "$stripe_pk" "$bare_digit" "$bare_mixed" "$aws_slash" "$slack_hook" "$discord_hook" "$telegram_hook"; do
+for shape in "$stripe_sk" "$stripe_rk" "$stripe_pk" "$bare_digit" "$bare_mixed" "$aws_slash" "$aws_slash_nodigit" "$slack_hook" "$discord_hook" "$telegram_hook"; do
   [ "$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE instr(payload,'$shape') > 0;")" = 0 ] \
     || shape_leaks=$((shape_leaks + 1))
 done

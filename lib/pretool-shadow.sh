@@ -118,7 +118,7 @@ _pretool_redact() {                     # text [byte-cap] -> redacted
     s#(api\.telegram\.org/bot)[^/\s"\x27]+#$1[redacted-token]#gi;
     s{(?<![A-Za-z0-9/+])([A-Za-z0-9/+]{40})(?![A-Za-z0-9/+])}{
       my $t = $1;
-      ($t =~ /[A-Z]/ && $t =~ /[a-z]/ && $t =~ /[0-9]/)
+      ($t =~ /[A-Z]/ && $t =~ /[a-z]/ && ($t =~ /[0-9]/ || $t =~ m{[\/+]}))
         ? "[redacted-token]" : $t
     }ge;
     s{(?<![A-Za-z0-9+_/-])((?![A-Za-z0-9+_-]*=)[A-Za-z0-9][A-Za-z0-9+_-]{19,})(?![A-Za-z0-9+_/-])(?!(?:\.[A-Za-z0-9]{1,8}){1,3}(?:\z|[^A-Za-z0-9_.-]))}{
