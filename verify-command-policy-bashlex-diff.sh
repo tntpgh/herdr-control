@@ -199,6 +199,13 @@ check "268-dashed-git-remote-ext"   'git-remote add x ext::sh' escalate
 check "268-env-assignment-ext"      'env X=1 git remote add x ext::sh' escalate
 check "268-nice-option-ext"         'nice -n 5 git remote add x ext::sh' escalate
 check "268-env-bare-dash-ext"        'env - git remote add x ext::sh' escalate
+check "268-caffeinate-timeout-ext"  'caffeinate -t 10 git remote add x ext::sh' escalate
+check "268-caffeinate-wait-ext"      'caffeinate -w 123 /usr/bin/git remote add origin ext::sh' escalate
+check "268-env-cluster-ext"          'env -iu HOME /usr/bin/git remote add origin ext::sh' escalate
+check "268-sudo-cluster-ext"         'sudo -Eu root /usr/bin/git remote add origin ext::sh' escalate
+check "268-exec-cluster-ext"         'exec -la login /usr/bin/git remote add origin ext::sh' escalate
+check "268-env-altpath-ext"          'env -P /usr/bin git -c protocol.ext.allow=always clone ext::sh /tmp/x' escalate
+check "268-env-cluster-split"        "env -iS 'git log'" escalate
 # Expansion/glob splices can resolve to ext:: only at shell runtime. Dynamic
 # argv expansions fail closed; quote-only splices are static and bashlex
 # normalizes them; shell patterns around `::` are treated as possible ext.

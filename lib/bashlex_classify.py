@@ -74,8 +74,8 @@ import sys
 TIMEOUT_SECONDS = 2
 _PLAIN_RE = re.compile(r'^[A-Za-z0-9._/+-]+$')
 _ASSIGN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
-_FINDGIT_RE = re.compile(r'^(find|fd|git|git-.+)$', re.IGNORECASE)
-_GIT_ONLY_RE = re.compile(r'^(git|git-.+)$', re.IGNORECASE)
+_FINDGIT_RE = re.compile(r'^(find|fd|git|git-.*)$', re.IGNORECASE)
+_GIT_ONLY_RE = re.compile(r'^(git|git-.*)$', re.IGNORECASE)
 _SOURCE_RE = re.compile(r'^(source|\.)$')
 _MAX_LAUNCHER_CHAIN = 16
 _LAUNCHER_SHORT_VALUE_OPTS = {
@@ -83,11 +83,12 @@ _LAUNCHER_SHORT_VALUE_OPTS = {
     "su": frozenset("csl"),
     "timeout": frozenset("sk"),
     "gtimeout": frozenset("sk"),
-    "env": frozenset("uSC"),
+    "env": frozenset("uSCP"),
     "nice": frozenset("n"),
     "ionice": frozenset("cnpt"),
     "stdbuf": frozenset("ioe"),
     "exec": frozenset("a"),
+    "caffeinate": frozenset("tw"),
     "sandbox-exec": frozenset("nfpD"),
 }
 _LAUNCHER_LONG_VALUE_OPTS = {
@@ -300,10 +301,11 @@ def _launcher_names():
 def _after_launcher(words, idx, basename):
     """Return the next command-word index after one launcher prelude.
 
-    Option arity mirrors `_cp_locate_command_word` in command-policy.sh.
-    Unknown options retain that function's conservative skip-one behavior.
-    A dynamic prelude or env split-string is not statically resolvable and
-    therefore escalates instead of guessing.
+    Option arity follows each launcher's getopt grammar. Short-option
+    clusters are scanned until their first value option; its value is the
+    rest of that token or the next word. Unknown options retain the
+    conservative skip-one behavior. A dynamic prelude or env split-string is
+    not statically resolvable and therefore escalates instead of guessing.
     """
     short_values = _LAUNCHER_SHORT_VALUE_OPTS.get(basename, ())
     long_values = _LAUNCHER_LONG_VALUE_OPTS.get(basename, ())
@@ -320,8 +322,7 @@ def _after_launcher(words, idx, basename):
             idx += 1
             continue
         if basename == "env" and (
-            token == "-S"
-            or token.startswith("-S")
+            (token.startswith("-") and not token.startswith("--") and "S" in token[1:])
             or token == "--split-string"
             or token.startswith("--split-string=")
         ):
@@ -336,18 +337,30 @@ def _after_launcher(words, idx, basename):
                     return None
                 idx += 1
             continue
-        # Match command-policy.sh's `-*` launcher-option branch exactly.
-        # A lone `-` is executable prelude syntax (`env - cmd` is the
-        # legacy empty-environment spelling), not the wrapped command.
+        # A lone `-` is executable prelude syntax (`env - cmd` is the legacy
+        # empty-environment spelling), not the wrapped command. Clusters such
+        # as `env -iu NAME cmd` and `sudo -Eu root cmd` consume a separate
+        # value only when their value option is the cluster's last character.
         if token.startswith("-"):
             idx += 1
-            if len(token) == 2 and token[1] in short_values:
-                if idx >= len(words):
-                    _escalate("launcher option %s is missing its value" % token)
-                    return None
-                idx += 1
+            flags = token[1:]
+            for pos, flag in enumerate(flags):
+                if flag not in short_values:
+                    continue
+                if pos + 1 == len(flags):
+                    if idx >= len(words):
+                        _escalate("launcher option -%s is missing its value" % flag)
+                        return None
+                    idx += 1
+                break
             continue
-        if basename in ("timeout", "gtimeout") and _TIMEOUT_DURATION_RE.match(token):
+        # Mirror command-policy.sh's positional-number branch: timeout accepts
+        # units/decimals; every other launcher consumes an all-digit token.
+        # The latter is what resolves `caffeinate -t 10 git …`.
+        if (
+            basename in ("timeout", "gtimeout")
+            and _TIMEOUT_DURATION_RE.match(token)
+        ) or (basename not in ("timeout", "gtimeout") and token.isdigit()):
             idx += 1
             continue
         return idx
@@ -496,37 +509,42 @@ def main():
     launcher_names = _launcher_names()
 
     old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    # One deadline covers parsing and the generic walk.
     signal.alarm(TIMEOUT_SECONDS)
     try:
-        import bashlex  # imported here so an import failure is also "parse error"
         try:
-            trees = bashlex.parse(rewritten)
+            import bashlex  # imported here so an import failure is also "parse error"
+            try:
+                trees = bashlex.parse(rewritten)
+            except _Timeout:
+                raise
+            except Exception as exc:  # noqa: BLE001 — bashlex raises several types
+                # (ParsingError on a genuine syntax error OR anything this
+                # grammar never implemented at all, e.g. `case`/extglob;
+                # NotImplementedError for some of the latter directly) — ALL of
+                # them mean "this file could not prove the command safe",
+                # which is exactly the fail-closed case SPEC step 2 asks for.
+                print("ESCALATE parse error: %s: %s" % (type(exc).__name__, exc))
+                return 0
         except _Timeout:
-            raise
-        except Exception as exc:  # noqa: BLE001 — bashlex raises several types
-            # (ParsingError on a genuine syntax error OR anything this
-            # grammar never implemented at all, e.g. `case`/extglob;
-            # NotImplementedError for some of the latter directly) — ALL of
-            # them mean "this file could not prove the command safe",
-            # which is exactly the fail-closed case SPEC step 2 asks for.
-            print("ESCALATE parse error: %s: %s" % (type(exc).__name__, exc))
+            print("ESCALATE parser timed out after %ss" % TIMEOUT_SECONDS)
             return 0
-    except _Timeout:
-        print("ESCALATE parser timed out after %ss" % TIMEOUT_SECONDS)
-        return 0
+
+        try:
+            for tree in trees:
+                _walk(tree, launcher_names)
+        except _Timeout:
+            print("ESCALATE AST walk timed out after %ss" % TIMEOUT_SECONDS)
+            return 0
+        except RecursionError:
+            print("ESCALATE AST too deeply nested to walk safely")
+            return 0
+        except Exception as exc:  # noqa: BLE001 — a walker bug must fail closed too
+            print("ESCALATE walker error: %s: %s" % (type(exc).__name__, exc))
+            return 0
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
-
-    try:
-        for tree in trees:
-            _walk(tree, launcher_names)
-    except RecursionError:
-        print("ESCALATE AST too deeply nested to walk safely")
-        return 0
-    except Exception as exc:  # noqa: BLE001 — a walker bug must fail closed too
-        print("ESCALATE walker error: %s: %s" % (type(exc).__name__, exc))
-        return 0
 
     # #268 gap 1: a resolved git/git-* command and a literal `source`/`.`
     # command ANYWHERE in the same classified input — either order, in
