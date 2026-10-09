@@ -336,7 +336,10 @@ def _after_launcher(words, idx, basename):
                     return None
                 idx += 1
             continue
-        if token.startswith("-") and token != "-":
+        # Match command-policy.sh's `-*` launcher-option branch exactly.
+        # A lone `-` is executable prelude syntax (`env - cmd` is the
+        # legacy empty-environment spelling), not the wrapped command.
+        if token.startswith("-"):
             idx += 1
             if len(token) == 2 and token[1] in short_values:
                 if idx >= len(words):

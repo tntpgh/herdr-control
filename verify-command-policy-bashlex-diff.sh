@@ -198,6 +198,7 @@ check "268-wrapper-git-remote-ext"  'nice git remote add x ext::sh' escalate
 check "268-dashed-git-remote-ext"   'git-remote add x ext::sh' escalate
 check "268-env-assignment-ext"      'env X=1 git remote add x ext::sh' escalate
 check "268-nice-option-ext"         'nice -n 5 git remote add x ext::sh' escalate
+check "268-env-bare-dash-ext"        'env - git remote add x ext::sh' escalate
 # Expansion/glob splices can resolve to ext:: only at shell runtime. Dynamic
 # argv expansions fail closed; quote-only splices are static and bashlex
 # normalizes them; shell patterns around `::` are treated as possible ext.
