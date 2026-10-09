@@ -35,6 +35,26 @@ so the four classes collapse to two checks instead of four spelling rules:
      judgement itself, so there is no second find/git rule to keep in
      sync with the first).
 
+herdr-control#268 added two more checks over the SAME single walk,
+neither needing a second shell-text parser:
+  3. If the whole command graph (any order, any list/pipeline/
+     substitution/nested body) contains BOTH a resolved git/git-*
+     command and a literal `source`/`.` command: ESCALATE. A sourced
+     file can set exec-capable state (GIT_PAGER, a credential helper,
+     ...) for a git invocation that runs EITHER before or after it in
+     the same input — the pre-#268 shell-text pass
+     (`_cp_git_exec_opt_scan_segments`) only caught source-before-git.
+  4. If a resolved git/git-* command's own argv contains a literal,
+     case-sensitive `ext::` substring, a dynamic expansion, or a shell
+     pattern around `::`: ESCALATE, independent of subcommand (remote
+     add/set-url, clone, fetch with protocol.ext.allow=always, ...). Git's
+     `ext::<command>` transport runs a command wherever git allows that
+     transport, not just on `ls-remote --upload-pack=`, which is all the
+     existing shell-text rules (`_cp_git_unsafe_tokens`) knew about.
+     Static non-ext `::` text remains readable. Over-blocking another
+     dynamic git argument or a literal commit message containing `ext::`
+     is accepted.
+
 Output grammar (one line per verdict; the caller reads ALL of them):
   `ESCALATE <reason>`   — fail closed (parse error/timeout/unreadable word)
   `CHECK <quoted argv>` — hand this resolved segment to the existing
@@ -52,15 +72,55 @@ import signal
 import sys
 
 TIMEOUT_SECONDS = 2
+MAX_INPUT_CHARS = 4096
 _PLAIN_RE = re.compile(r'^[A-Za-z0-9._/+-]+$')
 _ASSIGN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
-_FINDGIT_RE = re.compile(r'^(find|fd|git|git-.+)$', re.IGNORECASE)
+_FINDGIT_RE = re.compile(r'^(find|fd|git|git-.*)$', re.IGNORECASE)
+_GIT_ONLY_RE = re.compile(r'^(git|git-.*)$', re.IGNORECASE)
+_SOURCE_RE = re.compile(r'^(source|\.)$')
 _MAX_LAUNCHER_CHAIN = 16
+_LAUNCHER_SHORT_VALUE_OPTS = {
+    "sudo": frozenset("ugphCDRTrtca"),
+    "doas": frozenset("Cu"),
+    "su": frozenset("csl"),
+    "timeout": frozenset("sk"),
+    "gtimeout": frozenset("sk"),
+    "env": frozenset("uSCPa"),
+    "nice": frozenset("n"),
+    "ionice": frozenset("cnpPu"),
+    "stdbuf": frozenset("ioe"),
+    "time": frozenset("fo"),
+    "exec": frozenset("a"),
+    "caffeinate": frozenset("tw"),
+    "sandbox-exec": frozenset("nfpD"),
+}
+_LAUNCHER_LONG_VALUE_OPTS = {
+    "sudo": frozenset(
+        (
+            "user", "group", "host", "prompt", "chdir", "close-from",
+            "role", "type", "other-user", "chroot", "auth-type",
+            "login-class",
+        )
+    ),
+    "su": frozenset(("command", "shell", "user")),
+    "timeout": frozenset(("signal", "kill-after")),
+    "gtimeout": frozenset(("signal", "kill-after")),
+    "env": frozenset(("unset", "chdir", "split-string", "argv0")),
+    "nice": frozenset(("adjustment",)),
+    "ionice": frozenset(("class", "classdata", "pid", "pgid", "uid")),
+    "stdbuf": frozenset(("input", "output", "error")),
+    "time": frozenset(("format", "output")),
+}
+_TIMEOUT_DURATION_RE = re.compile(
+    r"^(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[smhd]?$"
+)
 _WORD_BOUNDARY_CHARS = set(' \t\n;&|()<>')
 _NAME_EQ_PAREN_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)=\(')
 
 _escalated = []
 _checks = []
+_git_seen = []
+_source_seen = []
 _PLACEHOLDER_SPANS = []
 
 
@@ -248,6 +308,98 @@ def _launcher_names():
     return set(n for n in raw.split() if n)
 
 
+def _launcher_tail_sensitive(words, idx):
+    """Whether an ambiguous option precedes a possible policy target."""
+    for node in words[idx:]:
+        if not _is_plain_literal(node):
+            return True
+        basename = os.path.basename(node.word).lower()
+        if _FINDGIT_RE.match(basename) or _SOURCE_RE.match(basename):
+            return True
+    return False
+
+def _after_launcher(words, idx, basename):
+    """Return the next command-word index after one launcher prelude.
+
+    Known value options follow each launcher's getopt grammar. Short-option
+    clusters are scanned until their first value option; its value is the
+    rest of that token or the next word. An unknown or abbreviated option
+    before a possible find/git/source target fails closed instead of guessing
+    its arity. Dynamic preludes and env split-string fail closed too.
+    """
+    short_values = _LAUNCHER_SHORT_VALUE_OPTS.get(basename, ())
+    long_values = _LAUNCHER_LONG_VALUE_OPTS.get(basename, ())
+    while idx < len(words):
+        node = words[idx]
+        if node.parts or _overlaps_placeholder(node.pos):
+            _escalate("launcher prelude contains an expansion: %r" % (node.word,))
+            return None
+        token = node.word
+        if _ASSIGN_RE.match(token):
+            idx += 1
+            continue
+        if token == "--":
+            idx += 1
+            return idx if idx < len(words) else None
+        if basename == "env" and (
+            (token.startswith("-") and not token.startswith("--") and "S" in token[1:])
+            or token == "--split-string"
+            or token.startswith("--split-string=")
+        ):
+            _escalate("env split-string command cannot be resolved statically")
+            return None
+        if token.startswith("--"):
+            name, has_equals, _value = token[2:].partition("=")
+            idx += 1
+            if not has_equals and name in long_values:
+                if idx >= len(words):
+                    _escalate("launcher option --%s is missing its value" % name)
+                    return None
+                idx += 1
+            elif name not in long_values and _launcher_tail_sensitive(words, idx):
+                _escalate("launcher long-option arity is ambiguous before a policy target: --%s" % name)
+                return None
+            continue
+        # A lone `-` is executable prelude syntax (`env - cmd` is the legacy
+        # empty-environment spelling), not the wrapped command. Clusters such
+        # as `env -iu NAME cmd` and `sudo -Eu root cmd` consume a separate
+        # value only when their value option is the cluster's last character.
+        if token.startswith("-"):
+            idx += 1
+            flags = token[1:]
+            unknown = False
+            for pos, flag in enumerate(flags):
+                if flag not in short_values:
+                    unknown = True
+                    continue
+                if pos + 1 == len(flags):
+                    if idx >= len(words):
+                        _escalate("launcher option -%s is missing its value" % flag)
+                        return None
+                    idx += 1
+                break
+            if unknown and _launcher_tail_sensitive(words, idx):
+                _escalate("launcher short-option arity is ambiguous before a policy target: %s" % token)
+                return None
+            continue
+        # Mirror command-policy.sh's positional-number branch: timeout accepts
+        # units/decimals; every other launcher consumes an all-digit token.
+        # The latter is what resolves `caffeinate -t 10 git …`.
+        if (
+            basename in ("timeout", "gtimeout")
+            and _TIMEOUT_DURATION_RE.match(token)
+        ) or (basename not in ("timeout", "gtimeout") and token.isdigit()):
+            idx += 1
+            continue
+        if basename in ("timeout", "gtimeout") and _launcher_tail_sensitive(words, idx + 1):
+            _escalate("timeout duration is ambiguous before a policy target: %s" % token)
+            return None
+        return idx
+    return None
+
+
+
+
 
 def _handle_command(node, launcher_names):
     # `node.parts` holds every assignment/redirect/word in SOURCE order.
@@ -285,19 +437,58 @@ def _handle_command(node, launcher_names):
             )
             return
         basename = os.path.basename(w.word).lower()
-        if basename in launcher_names and idx + 1 < len(words):
+        if basename == "su":
+            _escalate("su launcher command cannot be resolved statically")
+            return
+        if basename in launcher_names:
+            if idx + 1 >= len(words):
+                return
             if chain >= _MAX_LAUNCHER_CHAIN:
                 _escalate("launcher chain longer than %d words" % _MAX_LAUNCHER_CHAIN)
                 return
-            idx += 1
+            idx = _after_launcher(words, idx + 1, basename)
+            if idx is None:
+                return
             chain += 1
             continue
         break
-
     resolved = words[idx]
     basename = os.path.basename(resolved.word).lower()
+    # #268 gap 1: `source ./evil.sh` (or the `.` builtin form) paired
+    # anywhere in the same classified input with a resolved git/git-*
+    # command — either order, in any list/pipeline/substitution/nested
+    # body — must escalate (main()'s post-walk check below does the actual
+    # pairing once the full tree is known). `source`/`.` alone is not a
+    # find/git/fd command, so record the sighting and stop: no CHECK line
+    # for it, same as any other non-find/git command.
+    if _SOURCE_RE.match(basename):
+        _source_seen.append(True)
+        return
     if not _FINDGIT_RE.match(basename):
         return
+    if _GIT_ONLY_RE.match(basename):
+        _git_seen.append(True)
+        # #268 gap 2: every `ext::` transport in this command's resolved
+        # git argv is unsafe (remote add/set-url, clone, fetch with
+        # protocol.ext.allow=always, ...) regardless of subcommand.
+        #
+        # bashlex resolves static quote splices (`ex""t::`) into one literal
+        # word. Dynamic expansions remain in `parts`; fail those closed here
+        # (the downstream shell gate already does the same). Globs/braces do
+        # not consistently get parts, so a non-literal spelling around `::`
+        # also fails closed. Static non-ext uses of `::` remain readable.
+        for t in words[idx + 1 :]:
+            if t.parts or _overlaps_placeholder(t.pos):
+                _escalate("git argv word contains an expansion: %r" % (t.word,))
+                continue
+            if "ext::" in t.word:
+                _escalate("git argv contains an ext:: transport: %r" % (t.word,))
+                continue
+            if "::" in t.word and any(c in t.word for c in "*?[{"):
+                _escalate(
+                    "git argv shell pattern could resolve to an ext:: transport: %r"
+                    % (t.word,)
+                )
 
     # Reconstruct this simple command's resolved argv from `resolved`
     # onward, PLUS any leading GIT_*/PAGER/EDITOR/VISUAL assignment this
@@ -335,7 +526,10 @@ def _walk(node, launcher_names):
 
 
 def main():
-    raw = sys.stdin.read()
+    raw = sys.stdin.read(MAX_INPUT_CHARS + 1)
+    if len(raw) > MAX_INPUT_CHARS:
+        print("ESCALATE input exceeds %d-character parser ceiling" % MAX_INPUT_CHARS)
+        return 0
     # A heredoc whose closing delimiter is the LAST line of input with no
     # trailing newline (e.g. `printf 'node <<EOF\n...\nEOF'`, no final
     # `\n`) is valid, complete bash — but Main's round-3 run found bashlex's
@@ -352,37 +546,50 @@ def main():
     launcher_names = _launcher_names()
 
     old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    # One deadline covers parsing and the generic walk.
     signal.alarm(TIMEOUT_SECONDS)
     try:
-        import bashlex  # imported here so an import failure is also "parse error"
         try:
-            trees = bashlex.parse(rewritten)
+            import bashlex  # imported here so an import failure is also "parse error"
+            try:
+                trees = bashlex.parse(rewritten)
+            except _Timeout:
+                raise
+            except Exception as exc:  # noqa: BLE001 — bashlex raises several types
+                # (ParsingError on a genuine syntax error OR anything this
+                # grammar never implemented at all, e.g. `case`/extglob;
+                # NotImplementedError for some of the latter directly) — ALL of
+                # them mean "this file could not prove the command safe",
+                # which is exactly the fail-closed case SPEC step 2 asks for.
+                print("ESCALATE parse error: %s: %s" % (type(exc).__name__, exc))
+                return 0
         except _Timeout:
-            raise
-        except Exception as exc:  # noqa: BLE001 — bashlex raises several types
-            # (ParsingError on a genuine syntax error OR anything this
-            # grammar never implemented at all, e.g. `case`/extglob;
-            # NotImplementedError for some of the latter directly) — ALL of
-            # them mean "this file could not prove the command safe",
-            # which is exactly the fail-closed case SPEC step 2 asks for.
-            print("ESCALATE parse error: %s: %s" % (type(exc).__name__, exc))
+            print("ESCALATE parser timed out after %ss" % TIMEOUT_SECONDS)
             return 0
-    except _Timeout:
-        print("ESCALATE parser timed out after %ss" % TIMEOUT_SECONDS)
-        return 0
+
+        try:
+            for tree in trees:
+                _walk(tree, launcher_names)
+        except _Timeout:
+            print("ESCALATE AST walk timed out after %ss" % TIMEOUT_SECONDS)
+            return 0
+        except RecursionError:
+            print("ESCALATE AST too deeply nested to walk safely")
+            return 0
+        except Exception as exc:  # noqa: BLE001 — a walker bug must fail closed too
+            print("ESCALATE walker error: %s: %s" % (type(exc).__name__, exc))
+            return 0
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
 
-    try:
-        for tree in trees:
-            _walk(tree, launcher_names)
-    except RecursionError:
-        print("ESCALATE AST too deeply nested to walk safely")
-        return 0
-    except Exception as exc:  # noqa: BLE001 — a walker bug must fail closed too
-        print("ESCALATE walker error: %s: %s" % (type(exc).__name__, exc))
-        return 0
+    # #268 gap 1: a resolved git/git-* command and a literal `source`/`.`
+    # command ANYWHERE in the same classified input — either order, in
+    # any list/pipeline/substitution/nested body — escalate together.
+    # Checked once the whole tree is known (not inside _handle_command)
+    # so order never matters.
+    if _git_seen and _source_seen:
+        _escalate("git and source/. both present in the same command graph")
 
     if _escalated:
         for reason in _escalated:
