@@ -72,6 +72,7 @@ import signal
 import sys
 
 TIMEOUT_SECONDS = 2
+MAX_INPUT_CHARS = 4096
 _PLAIN_RE = re.compile(r'^[A-Za-z0-9._/+-]+$')
 _ASSIGN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 _FINDGIT_RE = re.compile(r'^(find|fd|git|git-.*)$', re.IGNORECASE)
@@ -79,32 +80,40 @@ _GIT_ONLY_RE = re.compile(r'^(git|git-.*)$', re.IGNORECASE)
 _SOURCE_RE = re.compile(r'^(source|\.)$')
 _MAX_LAUNCHER_CHAIN = 16
 _LAUNCHER_SHORT_VALUE_OPTS = {
-    "sudo": frozenset("ugphCDRT"),
+    "sudo": frozenset("ugphCDRTrtca"),
     "doas": frozenset("Cu"),
     "su": frozenset("csl"),
     "timeout": frozenset("sk"),
     "gtimeout": frozenset("sk"),
-    "env": frozenset("uSCP"),
+    "env": frozenset("uSCPa"),
     "nice": frozenset("n"),
-    "ionice": frozenset("cnpt"),
+    "ionice": frozenset("cnpPu"),
     "stdbuf": frozenset("ioe"),
+    "time": frozenset("fo"),
     "exec": frozenset("a"),
     "caffeinate": frozenset("tw"),
     "sandbox-exec": frozenset("nfpD"),
 }
 _LAUNCHER_LONG_VALUE_OPTS = {
     "sudo": frozenset(
-        ("user", "group", "host", "prompt", "chdir", "close-from", "role", "type", "other-user")
+        (
+            "user", "group", "host", "prompt", "chdir", "close-from",
+            "role", "type", "other-user", "chroot", "auth-type",
+            "login-class",
+        )
     ),
     "su": frozenset(("command", "shell", "user")),
     "timeout": frozenset(("signal", "kill-after")),
     "gtimeout": frozenset(("signal", "kill-after")),
-    "env": frozenset(("unset", "chdir", "split-string")),
+    "env": frozenset(("unset", "chdir", "split-string", "argv0")),
     "nice": frozenset(("adjustment",)),
-    "ionice": frozenset(("class", "classdata", "pid")),
+    "ionice": frozenset(("class", "classdata", "pid", "pgid", "uid")),
     "stdbuf": frozenset(("input", "output", "error")),
+    "time": frozenset(("format", "output")),
 }
-_TIMEOUT_DURATION_RE = re.compile(r"^[0-9][0-9.smhd]*$")
+_TIMEOUT_DURATION_RE = re.compile(
+    r"^(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[smhd]?$"
+)
 _WORD_BOUNDARY_CHARS = set(' \t\n;&|()<>')
 _NAME_EQ_PAREN_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)=\(')
 
@@ -299,14 +308,24 @@ def _launcher_names():
     return set(n for n in raw.split() if n)
 
 
+def _launcher_tail_sensitive(words, idx):
+    """Whether an ambiguous option precedes a possible policy target."""
+    for node in words[idx:]:
+        if not _is_plain_literal(node):
+            return True
+        basename = os.path.basename(node.word).lower()
+        if _FINDGIT_RE.match(basename) or _SOURCE_RE.match(basename):
+            return True
+    return False
+
 def _after_launcher(words, idx, basename):
     """Return the next command-word index after one launcher prelude.
 
-    Option arity follows each launcher's getopt grammar. Short-option
+    Known value options follow each launcher's getopt grammar. Short-option
     clusters are scanned until their first value option; its value is the
-    rest of that token or the next word. Unknown options retain the
-    conservative skip-one behavior. A dynamic prelude or env split-string is
-    not statically resolvable and therefore escalates instead of guessing.
+    rest of that token or the next word. An unknown or abbreviated option
+    before a possible find/git/source target fails closed instead of guessing
+    its arity. Dynamic preludes and env split-string fail closed too.
     """
     short_values = _LAUNCHER_SHORT_VALUE_OPTS.get(basename, ())
     long_values = _LAUNCHER_LONG_VALUE_OPTS.get(basename, ())
@@ -321,7 +340,7 @@ def _after_launcher(words, idx, basename):
             continue
         if token == "--":
             idx += 1
-            continue
+            return idx if idx < len(words) else None
         if basename == "env" and (
             (token.startswith("-") and not token.startswith("--") and "S" in token[1:])
             or token == "--split-string"
@@ -337,6 +356,9 @@ def _after_launcher(words, idx, basename):
                     _escalate("launcher option --%s is missing its value" % name)
                     return None
                 idx += 1
+            elif name not in long_values and _launcher_tail_sensitive(words, idx):
+                _escalate("launcher long-option arity is ambiguous before a policy target: --%s" % name)
+                return None
             continue
         # A lone `-` is executable prelude syntax (`env - cmd` is the legacy
         # empty-environment spelling), not the wrapped command. Clusters such
@@ -345,8 +367,10 @@ def _after_launcher(words, idx, basename):
         if token.startswith("-"):
             idx += 1
             flags = token[1:]
+            unknown = False
             for pos, flag in enumerate(flags):
                 if flag not in short_values:
+                    unknown = True
                     continue
                 if pos + 1 == len(flags):
                     if idx >= len(words):
@@ -354,6 +378,9 @@ def _after_launcher(words, idx, basename):
                         return None
                     idx += 1
                 break
+            if unknown and _launcher_tail_sensitive(words, idx):
+                _escalate("launcher short-option arity is ambiguous before a policy target: %s" % token)
+                return None
             continue
         # Mirror command-policy.sh's positional-number branch: timeout accepts
         # units/decimals; every other launcher consumes an all-digit token.
@@ -364,6 +391,9 @@ def _after_launcher(words, idx, basename):
         ) or (basename not in ("timeout", "gtimeout") and token.isdigit()):
             idx += 1
             continue
+        if basename in ("timeout", "gtimeout") and _launcher_tail_sensitive(words, idx + 1):
+            _escalate("timeout duration is ambiguous before a policy target: %s" % token)
+            return None
         return idx
     return None
 
@@ -496,7 +526,10 @@ def _walk(node, launcher_names):
 
 
 def main():
-    raw = sys.stdin.read()
+    raw = sys.stdin.read(MAX_INPUT_CHARS + 1)
+    if len(raw) > MAX_INPUT_CHARS:
+        print("ESCALATE input exceeds %d-character parser ceiling" % MAX_INPUT_CHARS)
+        return 0
     # A heredoc whose closing delimiter is the LAST line of input with no
     # trailing newline (e.g. `printf 'node <<EOF\n...\nEOF'`, no final
     # `\n`) is valid, complete bash — but Main's round-3 run found bashlex's

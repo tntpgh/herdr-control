@@ -228,6 +228,15 @@ helper_escalates "268-helper-exec-cluster" 'exec -la login git remote add x ext:
 helper_escalates "268-helper-doas-user"    'doas -u root git remote add x ext::sh'
 helper_escalates "268-helper-doas-attached" 'doas -uroot git remote add x ext::sh'
 helper_escalates "268-helper-su-command"   "su root -c 'git remote add x ext::sh'"
+helper_escalates "268-helper-ionice-ignore" 'ionice -t git remote add x ext::sh'
+helper_escalates "268-helper-env-argv0"     'env -a spoof git remote add x ext::sh'
+helper_escalates "268-helper-env-argv0-long" 'env --argv0 spoof git remote add x ext::sh'
+helper_escalates "268-helper-time-output"  'time -o /tmp/time.log git remote add x ext::sh'
+helper_escalates "268-helper-sudo-role"    'sudo -r staff_r git remote add x ext::sh'
+helper_escalates "268-helper-timeout-abbrev" 'timeout --sig KILL git remote add x ext::sh'
+helper_escalates "268-helper-sudo-login-class" 'sudo -c default git remote add x ext::sh'
+helper_escalates "268-helper-sudo-auth-type" 'sudo --auth-type bsdauth git remote add x ext::sh'
+helper_escalates "268-helper-timeout-scientific" 'gtimeout 1e3 git remote add x ext::sh'
 # Expansion/glob splices can resolve to ext:: only at shell runtime. Dynamic
 # argv expansions fail closed; quote-only splices are static and bashlex
 # normalizes them; shell patterns around `::` are treated as possible ext.
