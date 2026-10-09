@@ -159,6 +159,28 @@ sha="$(printf '%s' "curl -H 'Authorization: Bearer $tok' https://api.github.com/
 [ "$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE type='pretool_verdict' AND json_extract(payload,'\$.command_sha256')='$sha';")" = 1 ] \
   && ok "the exact command is still joinable by sha256" || not_ok "command sha not recorded"
 
+printf '== underscore Stripe keys and bare positional secrets are redacted ==\n'
+stripe_sk="sk_""live_""A1b2C3d4E5f6G7h8"
+stripe_rk="rk_""live_""H8g7F6e5D4c3B2a1"
+stripe_pk="pk_""test_""P9q8R7s6T5u4V3w2"
+bare_digit="A1bcDef2Ghi3Jkl4Mno5Pqr6"
+bare_mixed="wJalrXUtnFEMIFAKEKEYFAKEKEYbPxRfiCYFAKEKEY"
+safe_lower="thisisaverylonglowercaseword"
+bash_payload "./upload.sh $stripe_sk $stripe_rk $stripe_pk" secshape1 | shadow --record >/dev/null
+bash_payload "./upload.sh $bare_digit" secshape2 | shadow --record >/dev/null
+bash_payload "./upload.sh $bare_mixed" secshape3 | shadow --record >/dev/null
+bash_payload "printf %s $safe_lower" secshape4 | shadow --record >/dev/null
+shape_leaks=0
+for shape in "$stripe_sk" "$stripe_rk" "$stripe_pk" "$bare_digit" "$bare_mixed"; do
+  [ "$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE instr(payload,'$shape') > 0;")" = 0 ] \
+    || shape_leaks=$((shape_leaks + 1))
+done
+shape_rows="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE json_extract(payload,'\$.call_id') LIKE 'secshape%';")"
+safe_rows="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE json_extract(payload,'\$.call_id')='secshape4' AND instr(payload,'$safe_lower') > 0;")"
+[ "$shape_leaks" = 0 ] && [ "$shape_rows" = 4 ] && [ "$safe_rows" = 1 ] \
+  && ok "Stripe/bare secret shapes redacted; lowercase control preserved" \
+  || not_ok "shape redaction leaks=$shape_leaks rows=$shape_rows lowercase_controls=$safe_rows"
+
 printf '== the control-plane registry is never written ==\n'
 before_ev="$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")"
 before_ch="$(shasum "$(registry_db)" | cut -c1-40)"

@@ -92,11 +92,17 @@ PS_CMD_CAP=2000
 # The shapes smart-name.sh strips from pane scrapes, plus credential-carrying
 # flags (curl -u user:pass, mysql -p<pw>, sshpass -p, --password/--token=…),
 # Authorization headers, NAME=value where NAME says key/token/secret/password
-# (any case), private-key blocks and URL userinfo. perl for case-insensitive
-# matching (BSD sed has no /I).
+# (any case), private-key blocks and URL userinfo. The final two substitutions
+# are deliberately blunt storage-boundary controls: Stripe accepts `_` as its
+# separator, and a positional secret has no flag/name for the earlier patterns
+# to key on. A 20+ character non-path token is redacted when it mixes
+# letters+digits or upper+lower; `+`/`=` also identify encoded values. Long
+# lowercase prose and filesystem paths survive.
+# perl provides case-insensitive matching and the conditional token replacement
+# (BSD sed has neither /I nor a replacement callback).
 pretool_redact() {                      # text -> redacted, capped text
   printf '%s' "$1" | LC_ALL=C perl -0777 -pe '
-    s/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}/[redacted-key]/g;
+    s/\b(?:sk|rk|pk)[-_](?:live|test)?[-_]?[A-Za-z0-9]{12,}/[redacted-key]/g;
     s/\b(?:gh[posru]|xox[baprs]|github_pat)[-_][A-Za-z0-9_]{16,}/[redacted-token]/g;
     s/\bAKIA[0-9A-Z]{12,}/[redacted-aws]/g;
     s/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/[redacted-jwt]/g;
@@ -109,6 +115,13 @@ pretool_redact() {                      # text -> redacted, capped text
     s/(\bsshpass\s+-p\s*)\S+/$1\[redacted]/gi;
     s/(--[A-Za-z0-9-]*(?:password|passwd|passphrase|token|secret|api-?key|auth)[A-Za-z0-9-]*(?:=|\s+))\S+/$1\[redacted]/gi;
     s/(\b[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|token|password|passwd|passphrase|secret|credential|auth)[A-Za-z0-9_]*\s*[=:]\s*)[^\s]+/$1\[redacted]/gi;
+    s{[A-Za-z0-9+/=_-]{20,}}{
+      my $t = $&;
+      (($t !~ m{/} &&
+        (($t =~ /[A-Za-z]/ && $t =~ /[0-9]/) ||
+         ($t =~ /[A-Z]/ && $t =~ /[a-z]/))) ||
+       $t =~ m{[+=]}) ? "[redacted-token]" : $t
+    }ge;
   ' 2>/dev/null | head -c "$PS_CMD_CAP"
 }
 
@@ -809,25 +822,27 @@ pretool_payload_json() {                # payload-json elapsed-ms -> event/stdou
 #                       action request is (found or) created and it is blocked
 #   deny/block       -> blocked, nobody can approve it
 # Sets PS_DECISION (allow|block), PS_WORKER_REASON, PS_REQUEST_ID.
-_ps_request_command() {                 # input-json session-cwd -> text the reviewer sees
-  local where env
+_ps_request_command() {                 # input-json session-cwd -> redacted reviewer text
+  local where env shown
   if [ -n "$PS_CMD" ]; then
-    # Everything the grant binds is shown: the directory it runs in and any
-    # service env, not just the command text.
+    # The action hash still binds every exact byte. The registry stores only
+    # this display copy: action_requests/events are durable, so a literal
+    # credential must not be the price of asking a reviewer for approval.
     case "$(printf '%s' "$PS_TOOL" | tr '[:upper:]' '[:lower:]')" in
       bash|shell) where="(in $(printf '%s' "$1" | jq -r --arg c "$2" '.cwd // $c' 2>/dev/null)) " ;;
       *) where="(stdin of $(printf '%s' "$1" | jq -r '.path // "?"' 2>/dev/null)) " ;;
     esac
     env="$(printf '%s' "$1" | jq -r '(.env // {}) | to_entries | map(.key + "=" + (.value|tostring)) | join(" ")' 2>/dev/null)"
     case "$PS_REASON" in
-      credential*|*"credential-value"*) printf '%s[credential withheld] %s' "$where" "$(pretool_redact "$PS_CMD")" ;;
-      *) printf '%s%s' "$where" "$PS_CMD" ;;
+      credential*|*"credential-value"*) shown="${where}[credential withheld] ${PS_CMD}" ;;
+      *) shown="${where}${PS_CMD}" ;;
     esac
-    [ -n "$env" ] && printf '\n[env] %s' "$env"
-    return 0
+    [ -n "$env" ] && shown="${shown}
+[env] ${env}"
   else
-    printf '%s %s' "$PS_TOOL" "$(printf '%s' "$1" | jq -cS 'if type=="object" then del(.i) else . end' 2>/dev/null | head -c 20000)"
+    shown="$PS_TOOL $(printf '%s' "$1" | jq -cS 'if type=="object" then del(.i) else . end' 2>/dev/null | head -c 20000)"
   fi
+  pretool_redact "$shown"
 }
 
 # The ONE fail-closed answer to an unproven identity, for both branches.

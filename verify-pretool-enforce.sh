@@ -703,6 +703,22 @@ grep -q '^workspace create' "$work/herdr-control.log" 2>/dev/null \
   && ok "HEAD dry runs never ask herdr to create or focus a workspace" \
   || not_ok "a HEAD dry run touched workspaces: $(grep -E '^workspace' "$work/herdr-head.log" 2>/dev/null | tr '\n' ';')"
 
+printf '== durable action-request display redacts Stripe and bare secrets ==\n'
+request_stripe="sk_""live_""A1b2C3d4E5f6G7h8"
+request_bare="wJalrXUtnFEMIFAKEKEYFAKEKEYbPxRfiCYFAKEKEY"
+out="$(bashc "$ESC # $request_stripe $request_bare")"; rc=$?
+request_rid="$(printf '%s' "$out" | field request_id)"
+request_leaks="$(q "SELECT
+  (SELECT count(*) FROM action_requests WHERE request_id='$request_rid' AND
+     (instr(command,'$request_stripe')>0 OR instr(command,'$request_bare')>0)) +
+  (SELECT count(*) FROM events WHERE type='action_requested' AND
+     (instr(payload,'$request_stripe')>0 OR instr(payload,'$request_bare')>0));")"
+request_markers="$(q "SELECT count(*) FROM action_requests WHERE request_id='$request_rid'
+  AND instr(command,'[redacted-key]')>0 AND instr(command,'[redacted-token]')>0;")"
+[ "$rc" = 8 ] && [ -n "$request_rid" ] && [ "$request_leaks" = 0 ] && [ "$request_markers" = 1 ] \
+  && ok "action_requests row/event retain exact hash but no Stripe or bare secret" \
+  || not_ok "action-request redaction rc=$rc rid=$request_rid leaks=$request_leaks markers=$request_markers"
+
 printf '== shadow-compare.sh --gate (decision q1) ==\n'
 g="$work/gate"; mkdir -p "$g"
 ( export HERDR_RUN_STATE_DIR="$g"; . "$here/lib/run-registry.sh"; registry_init >/dev/null
