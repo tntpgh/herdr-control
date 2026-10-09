@@ -1913,7 +1913,17 @@ except Exception:
   else
     res="$(conductor_reserved_reason "$content")"
   fi
-  if [ -n "$res" ]; then printf 'reserved: %s\n' "$res"; return 0; fi
+  if [ -n "$res" ]; then
+    case "$res" in
+      *"(herdr-control#267)"*)
+        # A typed over-ceiling command stays human-only, but a script file is
+        # already bound to path+sha256 and can be reviewed as a file. Return a
+        # non-reserved reason without running another scanner over its content.
+        printf 'script content requires file review: %s\n' "$res"
+        return 0 ;;
+      *) printf 'reserved: %s\n' "$res"; return 0 ;;
+    esac
+  fi
   case "$kind" in
     shell)
       if _cp_shell_nested "$content"; then
@@ -6695,25 +6705,47 @@ $(_cp_walk_prep "$raw")
 EOF
 }
 
+# #267 input-complexity ceiling. Sets _CP_INPUT_CEILING_REASON and returns 0
+# when the ORIGINAL text must stop before any scanner. The byte cap bounds
+# memory/input size; the separator cap bounds the real slow shape (`true;`
+# repeated hundreds of times) while leaving long single commands alone.
+_CP_INPUT_CEILING_REASON=""
+_cp_input_ceiling_hit() {               # original text -> 0 when hard-stop
+  local raw="$1" raw_len i=0 controls=0 ch
+  local _cp_saved_lc_all="${LC_ALL-}" _cp_had_lc_all="${LC_ALL+x}" LC_ALL
+  _CP_INPUT_CEILING_REASON=""
+  LC_ALL=C
+  raw_len=${#raw}
+  if [ "$raw_len" -gt 4096 ]; then
+    _CP_INPUT_CEILING_REASON="classified text is ${raw_len} bytes, over the 4096-byte safety ceiling (herdr-control#267) — split the command or run a script file by reference"
+  elif [ "$raw_len" -gt 1024 ]; then
+    while [ "$i" -lt "$raw_len" ]; do
+      ch="${raw:$i:1}"
+      case "$ch" in ';'|'&'|'|'|$'\n') controls=$((controls + 1)) ;; esac
+      if [ "$controls" -gt 128 ]; then
+        _CP_INPUT_CEILING_REASON="classified text contains more than 128 shell separators (herdr-control#267) — split the command or run a script file by reference"
+        break
+      fi
+      i=$((i + 1))
+    done
+  fi
+  if [ "$_cp_had_lc_all" = x ]; then LC_ALL="$_cp_saved_lc_all"; else unset LC_ALL; fi
+  [ -n "$_CP_INPUT_CEILING_REASON" ]
+}
+
 classify_command() {                    # <panel/command text> [worktree] [manifest]
   if [ "$#" -lt 1 ]; then
     printf 'command-policy: classify_command requires a <command> argument\n' >&2
     return 2
   fi
   local raw="$1" wt="${2:-}" cp_manifest="${3:-}" norm
-  # herdr-control#267: cap the ORIGINAL text before the first scan. A 10 KiB
-  # panel took 167 s through the old rule set. Recorded requests are p50 196 /
-  # p95 557 / p99 1159 / max 1619 bytes, so 4096 is >2.5x the observed max.
-  # Bash length is locale-sensitive: temporarily shadow LC_ALL with C for the
-  # count, then restore the caller's exact set/unset state before any rule runs.
-  # No external process is added to the normal hot path.
-  local raw_len _cp_saved_lc_all="${LC_ALL-}" _cp_had_lc_all="${LC_ALL+x}" LC_ALL
-  LC_ALL=C
-  raw_len=${#raw}
-  if [ "$_cp_had_lc_all" = x ]; then LC_ALL="$_cp_saved_lc_all"; else unset LC_ALL; fi
-  if [ "$raw_len" -gt 4096 ]; then
-    printf 'command text is %d bytes, over the 4096-byte early size ceiling (herdr-control#267) — escalating before any scan\n' "$raw_len" > "$(_cp_reason_file)"
-    printf 'escalate\n'
+  # A hard deny preserves every built-in deny floor: an over-cap `mkfs` or
+  # root deletion must never become conductor-approvable merely because its
+  # padding reached this earlier branch. Code-by-reference maps a non-allow
+  # content verdict to file review, so larger scripts retain that safe path.
+  if _cp_input_ceiling_hit "$raw"; then
+    printf '%s\n' "$_CP_INPUT_CEILING_REASON" > "$(_cp_reason_file)"
+    printf 'deny\n'
     return 0
   fi
   # #190 (pre-existing on main; folded into #187/PR-189's security-review
@@ -7657,6 +7689,10 @@ _cp_push_is_safe() {                    # norm -> 0 (true) only for git push [-u
 # else on this list applies to python content unchanged.
 conductor_reserved_reason() {
   local raw="$1" mode="${2:-shell}" norm action_norm fleet_norm
+  if _cp_input_ceiling_hit "$raw"; then
+    printf '%s\n' "$_CP_INPUT_CEILING_REASON"
+    return
+  fi
   norm="$(scannable_command "$raw")"
   action_norm="$(scannable_command "$(_cp_mask_script_data "$raw")")"
   fleet_norm="$(printf '%s' "$norm" | sed -E 's/\$\{IFS[^}]*\}/ /g; s/\$IFS\b/ /g; s/\$\{[A-Za-z_][A-Za-z0-9_]*[^}]*\}//g; s/\$[A-Za-z_][A-Za-z0-9_]*\b//g')"

@@ -2077,8 +2077,8 @@ _f4cmd="echo x > /outside/deep.txt"
 for _f4i in 1 2 3 4 5 6 7 8 9 10; do
   _f4cmd="bash -c $(printf '%q' "$_f4cmd")"
 done
-check_wt "bash -c nested past the depth cap fails closed, not silently allowed (#192 round 3 F4)" \
-  "$WT_184" "$_f4cmd" escalate
+check_wt "bash -c nested past the depth cap fails closed at the input ceiling (#192/#267)" \
+  "$WT_184" "$_f4cmd" deny
 
 # herdr-control#192 round 4 — generalized value-flag recognizer (glued
 # short flags, cluster-tail short flags, `--` end-of-options) routed
@@ -4557,39 +4557,67 @@ check "R6-2: redirect glued onto the uppercase GIT word with a target path" \
   'GIT>/tmp/o -C /tmp/r status' escalate
 
 echo
-echo "== herdr-control#267: early 4096-byte escalation ceiling =="
-# Fixtures are built with printf/arithmetic, not literal padding, so the
-# byte counts stay exact across edits to this file. Prefix is an ordinary
-# allow-shaped command (confirmed plain-allow elsewhere in this file, e.g.
-# "PR264r3 ctl-plain-git") so case 1 proves the ceiling does not touch
-# classification for anything AT or under the limit.
+echo "== herdr-control#267: early input-complexity safety ceiling =="
+# 4096 bytes with one shell segment still reaches ordinary classification.
 _267_prefix='git status # '
 _267_pad=$((4096 - ${#_267_prefix}))
 _267_at_cap="${_267_prefix}$(printf '%*s' "$_267_pad" '' | tr ' ' x)"
 _267_over_cap="${_267_at_cap}x"
+_267_over_reason="classified text is 4097 bytes, over the 4096-byte safety ceiling (herdr-control#267) — split the command or run a script file by reference"
 check "267-1: exactly 4096 bytes reaches normal classification" \
   "$_267_at_cap" allow
-check_reason "267-2: 4097 bytes escalates with the exact ceiling reason" \
-  "$_267_over_cap" escalate \
-  "command text is 4097 bytes, over the 4096-byte early size ceiling (herdr-control#267) — escalating before any scan"
-# A 2-byte UTF-8 character (é, U+00E9) repeated 2100 times: 2100 CHARACTERS
-# (comfortably under the 4097 char-count a locale-aware ${#raw} would have
-# compared against) but 4200 BYTES — over the ceiling. Proves the count is
-# byte-based, not character-based, independent of the host's locale.
+check_reason "267-2: 4097 bytes hard-denies with the exact ceiling reason" \
+  "$_267_over_cap" deny "$_267_over_reason"
+# A deny-shaped over-cap input must remain deny, never become an approvable
+# escalate merely because the ceiling runs before the normal deny rules.
+_267_deny_prefix='mkfs.ext4 /dev/disk2 # '
+_267_deny_pad=$((4097 - ${#_267_deny_prefix}))
+_267_deny="${_267_deny_prefix}$(printf '%*s' "$_267_deny_pad" '' | tr ' ' x)"
+check_reason "267-3: over-cap destructive input preserves the deny floor" \
+  "$_267_deny" deny "$_267_over_reason"
+# UTF-8 byte boundary: 2100 characters, 4200 bytes. Force a multibyte
+# locale so deleting the function's temporary `LC_ALL=C` makes this red.
 _267_mb_count=2100
 _267_mb_bytes=$((_267_mb_count * 2))
 _267_mb_input="$(printf '\xc3\xa9%.0s' $(seq 1 "$_267_mb_count"))"
-check_reason "267-3: multibyte input under 4097 chars but over 4096 bytes escalates" \
-  "$_267_mb_input" escalate \
-  "command text is ${_267_mb_bytes} bytes, over the 4096-byte early size ceiling (herdr-control#267) — escalating before any scan"
-# 100 KiB: proves the ceiling fires long before any parsing rule would see
-# pathological input (a 10 KiB panel measured 167s through the full rule
-# set on main). Timing itself lives in tmp/probes.sh, not here — absolute
-# wall-clock assertions are flaky in a shared/loaded CI host and do not
-# belong in the permanent verdict suite.
+_267_utf8_locale="$(locale -a 2>/dev/null | grep -iE '^(en_US\.UTF-?8|C\.UTF-8)$' | head -1 || true)"
+if [ -z "$_267_utf8_locale" ]; then
+  printf 'FAIL  %-52s => no UTF-8 locale installed\n' "267-4: multibyte input is measured in bytes"
+  total=$((total + 1)); failed=$((failed + 1))
+else
+  LC_ALL="$_267_utf8_locale" check_reason "267-4: multibyte input is measured in bytes" \
+    "$_267_mb_input" deny \
+    "classified text is ${_267_mb_bytes} bytes, over the 4096-byte safety ceiling (herdr-control#267) — split the command or run a script file by reference"
+fi
+# Bound the slow statement-dense shape below the byte ceiling too.
+_267_dense="$(printf 'true;%.0s' $(seq 1 205))"
+check_reason "267-5: 205 statements stop at the 128-separator ceiling" \
+  "$_267_dense" deny \
+  "classified text contains more than 128 shell separators (herdr-control#267) — split the command or run a script file by reference"
 _267_huge="$(printf 'x%.0s' $(seq 1 102400))"
-check_not_allow "267-4: 100 KiB input escalates (timing itself: tmp/probes.sh)" \
-  "$_267_huge"
+check_reason "267-6: 100 KiB input hard-denies before scanning" \
+  "$_267_huge" deny \
+  "classified text is 102400 bytes, over the 4096-byte safety ceiling (herdr-control#267) — split the command or run a script file by reference"
+check_reserved "267-7: over-cap text is human-reserved on menu surfaces" "$_267_over_cap"
+_267_file="$(mktemp "${TMPDIR:-/tmp}/herdr-267-content.XXXXXX")"
+{
+  printf '#'
+  printf 'x%.0s' $(seq 1 4200)
+  printf '\necho ok\n'
+} > "$_267_file"
+_267_file_reason="$(_cp_code_content_reason shell "$_267_file")"
+rm -f "$_267_file"
+total=$((total + 1))
+case "$_267_file_reason" in
+  reserved:*)
+    printf 'FAIL  %-52s => human-reserved (%s)\n' "267-8: long script remains conductor file-reviewable" "$_267_file_reason"
+    failed=$((failed + 1)) ;;
+  *"(herdr-control#267)"*)
+    printf 'PASS  %-52s => file-review\n' "267-8: long script remains conductor file-reviewable" ;;
+  *)
+    printf 'FAIL  %-52s => wrong reason (%s)\n' "267-8: long script remains conductor file-reviewable" "$_267_file_reason"
+    failed=$((failed + 1)) ;;
+esac
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

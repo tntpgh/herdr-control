@@ -488,6 +488,14 @@ peer_decide() {                         # cmd task-json
     PD_REASON="unreadable prompt — nothing to classify"; return 1
   fi
 
+  # Stop before manifest/grant/reservation scans. The same ceiling at
+  # classify_command alone is too late: `_cp_scope_ceiling` and
+  # conductor_reserved_reason both scan the full text first.
+  if _cp_input_ceiling_hit "$cmd"; then
+    PD_VERDICT=deny PD_REASON="$_CP_INPUT_CEILING_REASON"
+    return 1
+  fi
+
   # The manifest's declared ceiling binds even the ownership grant: a task
   # spawned `git: commit-only` does not get its push pressed by a peer.
   ceil="$(_cp_scope_ceiling "$cmd" "$manifest")"

