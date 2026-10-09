@@ -4589,9 +4589,9 @@ else
     "$_267_mb_input" deny \
     "classified text is ${_267_mb_bytes} bytes, over the 4096-byte safety ceiling (herdr-control#267) — split the command or run a script file by reference"
 fi
-# Bound the slow statement-dense shape below the byte ceiling too.
-_267_dense="$(printf 'true;%.0s' $(seq 1 205))"
-check_reason "267-5: 205 statements stop at the 128-separator ceiling" \
+# Bound the slow statement-dense shape even when it is far below the byte cap.
+_267_dense="$(printf 'a;%.0s' $(seq 1 129))"
+check_reason "267-5: 129 separators stop below the byte ceiling" \
   "$_267_dense" deny \
   "classified text contains more than 128 shell separators (herdr-control#267) — split the command or run a script file by reference"
 _267_huge="$(printf 'x%.0s' $(seq 1 102400))"

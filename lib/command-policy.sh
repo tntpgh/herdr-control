@@ -6718,7 +6718,7 @@ _cp_input_ceiling_hit() {               # original text -> 0 when hard-stop
   raw_len=${#raw}
   if [ "$raw_len" -gt 4096 ]; then
     _CP_INPUT_CEILING_REASON="classified text is ${raw_len} bytes, over the 4096-byte safety ceiling (herdr-control#267) — split the command or run a script file by reference"
-  elif [ "$raw_len" -gt 1024 ]; then
+  else
     while [ "$i" -lt "$raw_len" ]; do
       ch="${raw:$i:1}"
       case "$ch" in ';'|'&'|'|'|$'\n') controls=$((controls + 1)) ;; esac
