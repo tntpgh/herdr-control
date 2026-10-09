@@ -168,6 +168,21 @@ check "268-source-then-git-redir"   'source ./evil.sh 2>/dev/null; git log 2>/de
 check "268-dot-then-git"            '. ./evil.sh; git log' escalate
 check "268-source-in-cmdsub"        'echo "$(source ./evil.sh)"; git log' escalate
 check "268-source-in-func-body"     'f() { source ./evil.sh; }; f; git log' escalate
+check "268-source-in-subshell"      '( source ./evil.sh ); git log' escalate
+check "268-git-in-if"               'if true; then git log; fi; source ./evil.sh' escalate
+check "268-source-in-pipeline"      'source ./evil.sh | cat; git log' escalate
+check "268-both-in-procsubs"        'diff <(source ./evil.sh) <(git log)' escalate
+check "268-launcher-source-pair"    'nice source ./evil.sh; git log' escalate
+check "268-launcher-chain-source"   'nice env source ./evil.sh; git log' escalate
+check "268-env-assignment-git"      'env X=1 git log; source ./evil.sh' escalate
+check "268-env-assignment-source"   'env X=1 source ./evil.sh; git log' escalate
+check "268-nested-env-assignment"   'nice env X=1 git log; source ./evil.sh' escalate
+check "268-env-double-dash"         'env -- X=1 git log; source ./evil.sh' escalate
+check "268-nice-option-git"         'nice -n 5 git log; source ./evil.sh' escalate
+check "268-timeout-duration-git"    'timeout 2 git log; source ./evil.sh' escalate
+check "268-sudo-option-git"         'sudo -u nobody git log; source ./evil.sh' escalate
+check "268-env-option-git"          'env -u FOO git log; source ./evil.sh' escalate
+check "268-env-split-string"        "env -S 'git log'" escalate
 
 # Controls: source-only behavior is whatever main already says (NOT
 # asserted escalate here — only the pairing with git is new); plain git
@@ -181,6 +196,23 @@ check "268-clone-ext"               'git clone ext::sh /tmp/x' escalate
 check "268-fetch-protocol-ext"      'git -c protocol.ext.allow=always fetch ext::sh' escalate
 check "268-wrapper-git-remote-ext"  'nice git remote add x ext::sh' escalate
 check "268-dashed-git-remote-ext"   'git-remote add x ext::sh' escalate
+check "268-env-assignment-ext"      'env X=1 git remote add x ext::sh' escalate
+check "268-nice-option-ext"         'nice -n 5 git remote add x ext::sh' escalate
+# Expansion/glob splices can resolve to ext:: only at shell runtime. Dynamic
+# argv expansions fail closed; quote-only splices are static and bashlex
+# normalizes them; shell patterns around `::` are treated as possible ext.
+check "268-ext-quote-splice"        'git clone ex""t::sh /tmp/x' escalate
+check "268-ext-dollar9-splice"      'git clone ex$9t::sh /tmp/x' escalate
+check "268-ext-brace9-splice"       'git clone ex${9}t::sh /tmp/x' escalate
+check "268-ext-backtick-splice"     'git clone ex``t::sh /tmp/x' escalate
+check "268-ext-brace-expand"        'git remote add x ex{,}t::sh' escalate
+check "268-ext-star-glob"           'git clone ex*t::sh /tmp/x' escalate
+check "268-ext-question-glob"       'git clone e?t::sh /tmp/x' escalate
+check "268-ext-bracket-glob"        'git clone e[x]t::sh /tmp/x' escalate
+check "268-ext-whole-expansion"     'git clone "$REMOTE" /tmp/x' escalate
+
+# Control: static non-ext `::` text remains readable.
+check "268-static-double-colon"     'git log --format=%H::%s' allow
 
 # Red regression: both dashed `git-ls-remote>/dev/null --upload-pack=...`
 # forms (#264) stay escalated under this diff too.

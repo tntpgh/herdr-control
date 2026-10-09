@@ -44,14 +44,16 @@ neither needing a second shell-text parser:
      ...) for a git invocation that runs EITHER before or after it in
      the same input — the pre-#268 shell-text pass
      (`_cp_git_exec_opt_scan_segments`) only caught source-before-git.
-  4. If a resolved git/git-* command's own argv contains the literal,
-     case-sensitive substring `ext::` in ANY word: ESCALATE,
-     independent of subcommand (remote add/set-url, clone, fetch with
-     protocol.ext.allow=always, ...) — git's `ext::<command>` transport
-     runs a command wherever git allows that transport, not just on
-     `ls-remote --upload-pack=`, which is all the existing shell-text
-     rules (`_cp_git_unsafe_tokens`) knew about. Over-blocking a commit
-     message that happens to contain `ext::` is accepted.
+  4. If a resolved git/git-* command's own argv contains a literal,
+     case-sensitive `ext::` substring, a dynamic expansion, or a shell
+     pattern around `::`: ESCALATE, independent of subcommand (remote
+     add/set-url, clone, fetch with protocol.ext.allow=always, ...). Git's
+     `ext::<command>` transport runs a command wherever git allows that
+     transport, not just on `ls-remote --upload-pack=`, which is all the
+     existing shell-text rules (`_cp_git_unsafe_tokens`) knew about.
+     Static non-ext `::` text remains readable. Over-blocking another
+     dynamic git argument or a literal commit message containing `ext::`
+     is accepted.
 
 Output grammar (one line per verdict; the caller reads ALL of them):
   `ESCALATE <reason>`   — fail closed (parse error/timeout/unreadable word)
@@ -76,6 +78,31 @@ _FINDGIT_RE = re.compile(r'^(find|fd|git|git-.+)$', re.IGNORECASE)
 _GIT_ONLY_RE = re.compile(r'^(git|git-.+)$', re.IGNORECASE)
 _SOURCE_RE = re.compile(r'^(source|\.)$')
 _MAX_LAUNCHER_CHAIN = 16
+_LAUNCHER_SHORT_VALUE_OPTS = {
+    "sudo": frozenset("ugphCDRT"),
+    "su": frozenset("csl"),
+    "timeout": frozenset("sk"),
+    "gtimeout": frozenset("sk"),
+    "env": frozenset("uSC"),
+    "nice": frozenset("n"),
+    "ionice": frozenset("cnpt"),
+    "stdbuf": frozenset("ioe"),
+    "exec": frozenset("a"),
+    "sandbox-exec": frozenset("nfpD"),
+}
+_LAUNCHER_LONG_VALUE_OPTS = {
+    "sudo": frozenset(
+        ("user", "group", "host", "prompt", "chdir", "close-from", "role", "type", "other-user")
+    ),
+    "su": frozenset(("command", "shell", "user")),
+    "timeout": frozenset(("signal", "kill-after")),
+    "gtimeout": frozenset(("signal", "kill-after")),
+    "env": frozenset(("unset", "chdir", "split-string")),
+    "nice": frozenset(("adjustment",)),
+    "ionice": frozenset(("class", "classdata", "pid")),
+    "stdbuf": frozenset(("input", "output", "error")),
+}
+_TIMEOUT_DURATION_RE = re.compile(r"^[0-9][0-9.smhd]*$")
 _WORD_BOUNDARY_CHARS = set(' \t\n;&|()<>')
 _NAME_EQ_PAREN_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)=\(')
 
@@ -270,6 +297,62 @@ def _launcher_names():
     return set(n for n in raw.split() if n)
 
 
+def _after_launcher(words, idx, basename):
+    """Return the next command-word index after one launcher prelude.
+
+    Option arity mirrors `_cp_locate_command_word` in command-policy.sh.
+    Unknown options retain that function's conservative skip-one behavior.
+    A dynamic prelude or env split-string is not statically resolvable and
+    therefore escalates instead of guessing.
+    """
+    short_values = _LAUNCHER_SHORT_VALUE_OPTS.get(basename, ())
+    long_values = _LAUNCHER_LONG_VALUE_OPTS.get(basename, ())
+    while idx < len(words):
+        node = words[idx]
+        if node.parts or _overlaps_placeholder(node.pos):
+            _escalate("launcher prelude contains an expansion: %r" % (node.word,))
+            return None
+        token = node.word
+        if _ASSIGN_RE.match(token):
+            idx += 1
+            continue
+        if token == "--":
+            idx += 1
+            continue
+        if basename == "env" and (
+            token == "-S"
+            or token.startswith("-S")
+            or token == "--split-string"
+            or token.startswith("--split-string=")
+        ):
+            _escalate("env split-string command cannot be resolved statically")
+            return None
+        if token.startswith("--"):
+            name, has_equals, _value = token[2:].partition("=")
+            idx += 1
+            if not has_equals and name in long_values:
+                if idx >= len(words):
+                    _escalate("launcher option --%s is missing its value" % name)
+                    return None
+                idx += 1
+            continue
+        if token.startswith("-") and token != "-":
+            idx += 1
+            if len(token) == 2 and token[1] in short_values:
+                if idx >= len(words):
+                    _escalate("launcher option %s is missing its value" % token)
+                    return None
+                idx += 1
+            continue
+        if basename in ("timeout", "gtimeout") and _TIMEOUT_DURATION_RE.match(token):
+            idx += 1
+            continue
+        return idx
+    return None
+
+
+
+
 
 def _handle_command(node, launcher_names):
     # `node.parts` holds every assignment/redirect/word in SOURCE order.
@@ -307,11 +390,15 @@ def _handle_command(node, launcher_names):
             )
             return
         basename = os.path.basename(w.word).lower()
-        if basename in launcher_names and idx + 1 < len(words):
+        if basename in launcher_names:
+            if idx + 1 >= len(words):
+                return
             if chain >= _MAX_LAUNCHER_CHAIN:
                 _escalate("launcher chain longer than %d words" % _MAX_LAUNCHER_CHAIN)
                 return
-            idx += 1
+            idx = _after_launcher(words, idx + 1, basename)
+            if idx is None:
+                return
             chain += 1
             continue
         break
@@ -333,16 +420,25 @@ def _handle_command(node, launcher_names):
         _git_seen.append(True)
         # #268 gap 2: every `ext::` transport in this command's resolved
         # git argv is unsafe (remote add/set-url, clone, fetch with
-        # protocol.ext.allow=always, ...) regardless of subcommand —
-        # scanned on the raw word text, same as the rest of this file's
-        # spelling-agnostic checks, so a quoted or expansion-built
-        # argument still trips it. Over-blocking a commit message that
-        # happens to contain `ext::` is accepted (SPEC): no subcommand
-        # grammar here.
-        for t in words[idx:]:
+        # protocol.ext.allow=always, ...) regardless of subcommand.
+        #
+        # bashlex resolves static quote splices (`ex""t::`) into one literal
+        # word. Dynamic expansions remain in `parts`; fail those closed here
+        # (the downstream shell gate already does the same). Globs/braces do
+        # not consistently get parts, so a non-literal spelling around `::`
+        # also fails closed. Static non-ext uses of `::` remain readable.
+        for t in words[idx + 1 :]:
+            if t.parts or _overlaps_placeholder(t.pos):
+                _escalate("git argv word contains an expansion: %r" % (t.word,))
+                continue
             if "ext::" in t.word:
                 _escalate("git argv contains an ext:: transport: %r" % (t.word,))
-                break
+                continue
+            if "::" in t.word and any(c in t.word for c in "*?[{"):
+                _escalate(
+                    "git argv shell pattern could resolve to an ext:: transport: %r"
+                    % (t.word,)
+                )
 
     # Reconstruct this simple command's resolved argv from `resolved`
     # onward, PLUS any leading GIT_*/PAGER/EDITOR/VISUAL assignment this
