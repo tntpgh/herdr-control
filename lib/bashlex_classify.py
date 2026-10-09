@@ -80,6 +80,7 @@ _SOURCE_RE = re.compile(r'^(source|\.)$')
 _MAX_LAUNCHER_CHAIN = 16
 _LAUNCHER_SHORT_VALUE_OPTS = {
     "sudo": frozenset("ugphCDRT"),
+    "doas": frozenset("Cu"),
     "su": frozenset("csl"),
     "timeout": frozenset("sk"),
     "gtimeout": frozenset("sk"),
@@ -406,6 +407,9 @@ def _handle_command(node, launcher_names):
             )
             return
         basename = os.path.basename(w.word).lower()
+        if basename == "su":
+            _escalate("su launcher command cannot be resolved statically")
+            return
         if basename in launcher_names:
             if idx + 1 >= len(words):
                 return

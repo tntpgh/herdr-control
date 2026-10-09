@@ -159,6 +159,19 @@ check() {               # label cmd want
   fi
 }
 
+# Direct helper assertions keep broader shell rules from masking a launcher
+# resolver regression. These inputs must be rejected by the AST helper itself.
+helper_escalates() {      # label cmd
+  local label="$1" cmd="$2" got
+  got="$(printf '%s' "$cmd" |
+    CP_LAUNCHER_NAMES="$_CP_LAUNCHER_NAMES" "$here/.venv-bashlex/bin/python3" \
+      "$here/lib/bashlex_classify.py" 2>/dev/null)"
+  case "$got" in
+    ESCALATE*) ok "$label: helper escalates" ;;
+    *) bad "$label: helper returned '$got' for '$cmd'" ;;
+  esac
+}
+
 
 # Red: a resolved git/git-* command paired ANYWHERE (either order,
 # redirects, list/pipeline/substitution/nested body) with a literal
@@ -206,6 +219,15 @@ check "268-sudo-cluster-ext"         'sudo -Eu root /usr/bin/git remote add orig
 check "268-exec-cluster-ext"         'exec -la login /usr/bin/git remote add origin ext::sh' escalate
 check "268-env-altpath-ext"          'env -P /usr/bin git -c protocol.ext.allow=always clone ext::sh /tmp/x' escalate
 check "268-env-cluster-split"        "env -iS 'git log'" escalate
+helper_escalates "268-helper-caffeinate-t" 'caffeinate -t 10 git remote add x ext::sh'
+helper_escalates "268-helper-caffeinate-w" 'caffeinate -w 123 git remote add x ext::sh'
+helper_escalates "268-helper-env-cluster"  'env -iu HOME git remote add x ext::sh'
+helper_escalates "268-helper-env-altpath"  'env -P /usr/bin git remote add x ext::sh'
+helper_escalates "268-helper-sudo-cluster" 'sudo -Eu root git remote add x ext::sh'
+helper_escalates "268-helper-exec-cluster" 'exec -la login git remote add x ext::sh'
+helper_escalates "268-helper-doas-user"    'doas -u root git remote add x ext::sh'
+helper_escalates "268-helper-doas-attached" 'doas -uroot git remote add x ext::sh'
+helper_escalates "268-helper-su-command"   "su root -c 'git remote add x ext::sh'"
 # Expansion/glob splices can resolve to ext:: only at shell runtime. Dynamic
 # argv expansions fail closed; quote-only splices are static and bashlex
 # normalizes them; shell patterns around `::` are treated as possible ext.
