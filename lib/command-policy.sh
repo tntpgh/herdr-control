@@ -2052,6 +2052,14 @@ _cp_cmdword_dequote() {                 # word
 # 1 — leaving both stale from a prior call — when the segment holds nothing
 # but redirections/assignments/launchers (e.g. `> /dev/null` alone, or the
 # tail end of a segment the splitter cut mid-redirection).
+# Single source of truth for the generic launcher/wrapper names `_cp_locate_
+# command_word` skips (with their own value-option grammar) below. SPEC
+# #264 round 3's bashlex gate (`_cp_bashlex_findgit_present`, near the find/
+# git rules in `classify_command`) reads this SAME variable — exported to
+# its python helper as `CP_LAUNCHER_NAMES` — so there is exactly one place
+# that names a launcher, never a second list that could drift from this one.
+_CP_LAUNCHER_NAMES="sudo doas su env nice ionice nohup time timeout gtimeout stdbuf setsid command builtin exec caffeinate unbuffer sandbox-exec"
+
 _CP_LOC=()
 _CP_LOC_SKIPPED=()
 _CP_LOC_CAPPED=0
@@ -2115,8 +2123,8 @@ _cp_locate_command_word() {             # segment
 
     if [ "$_cp_wate" = 0 ]; then
       _cp_wl="$(_cp_cmdword_dequote "$1")"; _cp_wl="$(printf '%s' "${_cp_wl##*/}" | tr 'A-Z' 'a-z')"
-      case "$_cp_wl" in
-        sudo|doas|su|env|nice|ionice|nohup|time|timeout|gtimeout|stdbuf|setsid|command|builtin|exec|caffeinate|unbuffer|sandbox-exec)
+      case " $_CP_LAUNCHER_NAMES " in
+        *" $_cp_wl "*)
           case "$_cp_wl" in
             sudo)    _cp_wv='ugphCDRT'; _cp_wvl='user|group|host|prompt|chdir|close-from|role|type|other-user' ;;
             su)      _cp_wv='csl';      _cp_wvl='command|shell|user' ;;
@@ -4288,6 +4296,84 @@ $(_cp_segments "$raw" "$split")
 EOF
   return 1
 }
+
+# `_cp_bashlex_findgit_present <raw>` -> 0 (true, escalate) when SPEC
+# #264 round 3's parser-based gate (`lib/bashlex_classify.py`, run under
+# the interpreter `install.sh`/`restart.sh` provision at
+# `$here/.venv-bashlex/bin/python3` — NEVER `uv run`, which would need
+# network at hook time) finds a resolved find/git/fd invocation the
+# existing rules above cannot see because of HOW it is spelled (a
+# backslash-newline inside the verb, an extglob pattern, an empty-
+# expansion splice — `~/.herdr/worktrees/herdr-control/review/pr-264-r2/
+# .handoffs/REVIEW.md` M1-M4), OR any command word a real parser could not
+# resolve statically at all. Added ON TOP of every existing rule in this
+# file, including `_cp_findgit_blunt_present` just above: this never
+# REPLACES the blunt scan, it only closes gaps a position- and spelling-
+# based text scan structurally cannot close.
+#
+# The helper's own stdout grammar (`lib/bashlex_classify.py`'s header):
+# one `ESCALATE <reason>` line fails this closed outright; one or more
+# `CHECK <quoted argv>` lines are each handed to `_cp_git_seg_exec_unsafe`
+# (the SAME dispatch `_cp_git_exec_opt_invoked` above already reuses for
+# every OTHER git/find shape in this file, so there is no second find/git
+# rule for the two to disagree about) — protected the same way every
+# other segment this file classifies is, via `_cp_protect_text`, before
+# that call. A bare `ALLOW` line, a missing/non-executable interpreter, a
+# non-zero exit, empty output, or any OTHER line this grammar does not
+# define all fail closed the same way `_cp_wrap_tail_unsafe` hitting its
+# depth cap does — a parser that cannot prove a command safe is not
+# evidence that it IS safe.
+_CP_BASHLEX_PY=""
+_CP_BASHLEX_PY_CHECKED=0
+_cp_bashlex_log_once() {                # message
+  local dir="${HOME:-/tmp}/.herdr"
+  mkdir -p "$dir" 2>/dev/null
+  printf '%s command-policy bashlex: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" "$1" \
+    >>"$dir/command-policy-bashlex.log" 2>/dev/null
+}
+_cp_bashlex_resolve_helper() {
+  [ -n "$_CP_BASHLEX_PY" ] && return 0
+  [ "$_CP_BASHLEX_PY_CHECKED" = 1 ] && return 1
+  _CP_BASHLEX_PY_CHECKED=1
+  local src="${BASH_SOURCE[0]}" here py script
+  here="$(cd "$(dirname "$src")/.." && pwd 2>/dev/null)" || return 1
+  py="$here/.venv-bashlex/bin/python3"
+  script="$here/lib/bashlex_classify.py"
+  [ -x "$py" ] && [ -f "$script" ] || {
+    _cp_bashlex_log_once "helper interpreter/script missing ($py / $script) — failing closed on every find/git-shaped command until install.sh/restart.sh provisions it"
+    return 1
+  }
+  _CP_BASHLEX_PY="$py"
+  _CP_BASHLEX_SCRIPT="$script"
+  return 0
+}
+_cp_bashlex_findgit_present() {         # raw
+  local raw="$1" out rc line seg protseg
+  if ! _cp_bashlex_resolve_helper; then
+    return 0
+  fi
+  out="$(CP_LAUNCHER_NAMES="$_CP_LAUNCHER_NAMES" "$_CP_BASHLEX_PY" "$_CP_BASHLEX_SCRIPT" <<<"$raw" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    _cp_bashlex_log_once "helper exited rc=$rc with no usable output — failing closed"
+    return 0
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      'ESCALATE '*) return 0 ;;
+      'CHECK '*)
+        seg="${line#CHECK }"
+        protseg="$(_cp_protect_text "$seg")"
+        _cp_git_seg_exec_unsafe "$protseg" && return 0
+        ;;
+      ALLOW) : ;;
+      *)
+        _cp_bashlex_log_once "helper emitted an unrecognized line — failing closed: $line"
+        return 0 ;;
+    esac
+  done <<<"$out"
+  return 1
+}
 _cp_find_word_injection_present() {     # raw -> 0 if a segment's resolved command word is mixed/partially quoted, or is find (bare or cleanly-quoted) with an unsafe unquoted word in its own argv, or a command-substitution body resolves to an unsafe find invocation
   local LC_ALL=C LANG=C
   local raw="$1" seg unq tok inner cmdbase
@@ -6163,6 +6249,16 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   # `_cp_findgit_blunt_present`.
   _cp_coproc_present "$raw" &&
     _cp_consider 1 "coproc starts a background process this policy cannot see ahead of time: a conductor must review it"
+
+  # escalate — SPEC #264 round 3: a real parser (bashlex) resolves a
+  # find/git/fd invocation's spelling the way bash itself does — a
+  # backslash-newline inside the verb, an extglob pattern, a quote
+  # splice, an empty-expansion splice — none of which any position- or
+  # spelling-based text scan above can see. See
+  # `_cp_bashlex_findgit_present`'s own header, just below
+  # `_cp_coproc_present`.
+  _cp_bashlex_findgit_present "$raw" &&
+    _cp_consider 1 "a parser-resolved find/git/fd invocation, or a command word a parser could not resolve statically, needs a conductor's review"
 
   # escalate — round 9 (herdr-control#254 PR comment, round-8 review item
   # A): an assignment builtin (`export`/`declare`/`typeset`/`local`/

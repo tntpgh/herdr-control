@@ -1034,8 +1034,8 @@ check "xargs env still escalates"                       "xargs env"             
 check "sudo env still escalates"                          "sudo env"                               escalate
 check "Worker bindings object, JS object literal"           'const env = { KB_API_KEY: "kb-secret" };' allow
 check "Worker bindings object, member access"                 "env.KB_API_KEY"                        allow
-check "Worker bindings object, function argument"               "worker.fetch(req, env)"                allow
-check "Worker bindings object, declare then assign"               "let env; env = {}"                     allow
+check "Worker bindings object, function argument (parser OB: not valid bash)" "worker.fetch(req, env)"                escalate
+check "Worker bindings object, declare then assign (parser OB: env launcher)"               "let env; env = {}"                     escalate
 # The identically-shaped non-credential control the conductor named: same
 # object-literal syntax, no "env" anywhere, must have stayed allow all along.
 check "const cfg (control, never mentioned env)"                     'const cfg = { KB_API_KEY: "kb-secret" };' allow
@@ -1074,7 +1074,7 @@ check_reserved   "inside a process substitution" "diff <(printenv) /dev/null"
 # function call, not a subshell — `(` immediately preceded by an
 # identifier character.
 check_unreserved "bare function call, not a subshell" "fn(env)"
-check "bare function call, not a subshell (verdict)"  "fn(env)" allow
+check "bare function call, not a subshell (verdict, parser OB: not valid bash)"  "fn(env)" escalate
 
 echo
 echo "== env-dump mutation check: prove the shared detector is load-bearing =="
@@ -1195,7 +1195,7 @@ check "nested substitution inside a subshell"                    '($(true), env)
 check_reserved "nested substitution inside a subshell"          '($(true), env)'
 # Real call argument lists still have to stay allowed.
 check_unreserved "obj.m(env), method call"                        "obj.m(env)"
-check "obj.m(env), method call (verdict)"                        "obj.m(env)" allow
+check "obj.m(env), method call (verdict, parser OB: not valid bash)"                        "obj.m(env)" escalate
 
 echo
 echo "== round 5, section C: env dumps that never spell env/printenv =="
@@ -4064,6 +4064,89 @@ check "r6 T-sq / blunt rule OB: a single-quoted ';' terminator now escalates" \
   "find . -exec cat {} ';'" escalate
 check "r6 T-dq / blunt rule OB: a double-quoted \";\" terminator now escalates" \
   'find . -exec cat {} ";"' escalate
+
+# ---------------------------------------------------------------------------
+# PR #264 round 3 (review/pr-264-r2/.handoffs/REVIEW.md M1-M4): a parser
+# (`lib/bashlex_classify.py`, `_cp_bashlex_findgit_present`) resolves each
+# of these spellings to a real find/git/fd command word the way bash's OWN
+# lexer does, which no position- or spelling-anchored text scan above ever
+# could. Commands mirrored from review/pr-264-r2/tmp/probes.sh's `b M*-…`
+# rows; each carries a genuinely unsafe shape once resolved (`git -C …` —
+# a global option ahead of the subcommand — or `find … -exec …`) so the
+# EXISTING find/git-specific rules (`_cp_git_seg_exec_unsafe`), not a new
+# escalate-on-sight rule, are what actually fires once the spelling is
+# resolved.
+check "PR264r3 M1-cont-git: a backslash-newline inside the verb resolves to git -C, escalates" \
+  $'<<< x gi\\\nt -C /tmp/evilrepo status' escalate
+check "PR264r3 M1-cont-find: a backslash-newline inside the verb resolves to find -exec, escalates" \
+  $'<<< x fi\\\nnd . -maxdepth 0 -exec echo INJECTED {} \\;' escalate
+check "PR264r3 M2-launch-git: a glob verb behind an assignment resolves to git -C, escalates" \
+  '<<< x X=1 /usr/bin/[g]it -C /tmp/evilrepo status' escalate
+check "PR264r3 M2-launch-find: a glob verb behind nice resolves to find -exec, escalates" \
+  '<<< x nice /usr/bin/f[i]nd . -maxdepth 0 -exec echo INJECTED {} \;' escalate
+check "PR264r3 M3-extglob: an extglob verb fails to parse at all, fails closed" \
+  $'shopt -s extglob\n/usr/bin/@(g)it -C /tmp/evilrepo status </dev/null' escalate
+check "PR264r3 xg-git-q: a quoted extglob verb also fails to parse, fails closed" \
+  "shopt -s extglob"$'\n'"/usr/bin/+(g)it -C \"/tmp/evilrepo\" status" escalate
+check "PR264r3 xg-find-hs: an extglob find verb behind a here-string fails to parse, fails closed" \
+  "shopt -s extglob"$'\n''<<< x /usr/bin/@(f)ind . -maxdepth 0 -exec echo INJECTED {} \;' escalate
+check "PR264r3 M4-dollar9-git: an empty \$9 splice resolves to git -C, escalates" \
+  'gi$9t -C /tmp/evilrepo status' escalate
+check "PR264r3 M4-at-git: an empty \$@ splice resolves to git -C, escalates" \
+  'gi$@t -C /tmp/evilrepo status' escalate
+check "PR264r3 M4-dollar9-find: an empty \$9 splice resolves to find -exec, escalates" \
+  'fi$9nd . -maxdepth 0 -exec echo INJECTED {} \;' escalate
+check "PR264r3 M4-dollar9-fd: an empty \$9 splice resolves to fd -x, escalates" \
+  'f$9d -1 -d 1 . /dev -x echo INJECTED' escalate
+check "PR264r3 M4-bt-hs: an empty backtick splice behind a here-string resolves to git -C, escalates" \
+  '<<< x g``it -C /tmp/evilrepo status' escalate
+check "PR264r3 M4-sub-hs: an empty \$() splice behind a here-string resolves to git -C, escalates" \
+  '<<< x gi$()t -C /tmp/evilrepo status' escalate
+check "PR264r3 M4-brace9-hs: a \${9} splice behind a here-string resolves to git -C, escalates" \
+  '<<< x gi${9}t -C /tmp/evilrepo status' escalate
+check "PR264r3 M4-brace9: a bare \${9} splice resolves to git -C, escalates" \
+  'gi${9}t -C /tmp/evilrepo status' escalate
+
+# Controls: a `case` statement is unsupported by the parser (same "cannot
+# prove safe" fail-closed path as a genuine syntax error) — any command
+# using one now escalates on this rule alone, an accepted over-block.
+check "PR264r3 ctl-case: a case statement cannot be parsed, fails closed" \
+  'case "$1" in a) git status;; esac' escalate
+
+# Controls: the SAME shapes, spelled plainly or with a harmless subcommand,
+# must still allow — this rule only closes the spelling gap, it does not
+# make every git/find invocation through a launcher or line continuation
+# escalate regardless of what it does.
+check "PR264r3 ctl-plain-git: an ordinary git status stays allow" \
+  'git status' allow
+check "PR264r3 ctl-plain-find: an ordinary find with no -exec/-delete stays allow" \
+  'find . -type f -exec wc -l {} +' allow
+check "PR264r3 ctl-cont-safe: a line-continuation-spelled git with a harmless subcommand (accepted OB: round-2 blunt rule still fires on the literal backslash, independent of this round's resolved-argv verdict)" \
+  $'gi\\\nt status' escalate
+check "PR264r3 ctl-launch-safe: find behind nice with no -exec/-delete stays allow" \
+  'nice find . -maxdepth 0' allow
+
+# Main's round-9 ask: a QUOTED heredoc delimiter (`<<'EOF'`, `<<"EOF"`,
+# `<<\EOF`) is unparseable by bashlex at all; this file now rewrites it to
+# its unquoted, quote-removed form before parsing — CONSERVATIVE, since
+# bashlex treats a heredoc body as an opaque string regardless of quoting
+# either way (confirmed: `HeredocNode.value` is never walked for nested
+# substitutions), so the rewrite can only ever match the unquoted form's
+# verdict, never diverge from it, and can never see FEWER commands than
+# the unquoted spelling would.
+heredoc_quoted_harmless="$(printf "cat <<'EOF'\nhello world\nEOF")"
+check "PR264r3 heredoc-unquote: quoted delimiter with harmless body stays allow" \
+  "$heredoc_quoted_harmless" allow
+heredoc_quoted_obf="$(printf "cat <<'EOF'\n\$(gi\$9t log)\nEOF")"
+heredoc_unquoted_obf="$(printf "cat <<EOF\n\$(gi\$9t log)\nEOF")"
+check "PR264r3 heredoc-consistency A: quoted-delimiter heredoc, obfuscated-git body (command word in the body is built from an expansion -- escalate)" \
+  "$heredoc_quoted_obf" escalate
+check "PR264r3 heredoc-consistency B: same body, unquoted delimiter, SAME verdict as A" \
+  "$heredoc_unquoted_obf" escalate
+heredoc_mismatch="$(printf "cat <<'EOF'\nbody\nNOTEOF")"
+check "PR264r3 heredoc-mismatch: a quoted delimiter that never actually closes before end-of-input fails closed" \
+  "$heredoc_mismatch" escalate
+
 
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then

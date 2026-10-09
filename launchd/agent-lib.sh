@@ -401,6 +401,46 @@ plugin_pin() {
     || { echo "plugin: install reported success but the record says '$state'" >&2; return 2; }
 }
 
+# provision_bashlex_venv <app_dir> — (re)build `<app_dir>/.venv-bashlex`,
+# SPEC #264 round 3's parser-based find/git gate
+# (`lib/command-policy.sh`'s `_cp_bashlex_findgit_present`, helper
+# `lib/bashlex_classify.py`). Shared by install.sh (the developer checkout)
+# and deploy_app below (the deployed worktree) so there is one place that
+# knows the pin — `lib/bashlex-requirements.txt`, `bashlex==<version>
+# --hash=sha256:<hash>`, installed with `--require-hashes` so a compromised
+# or re-released index entry cannot swap in different bytes under the same
+# version number. `deploy_app`'s own `git clean -qfdx` wipes this directory
+# on every redeploy (it is gitignored, so `-x` treats it as trash) — this
+# function is idempotent and cheap to re-run (a `bashlex` import check
+# short-circuits both the venv-create and the pip-install step once already
+# provisioned), so calling it again right after `clean -qfdx` is the fix,
+# not a workaround. Never touches the network beyond that one `uv pip
+# install` — the hook itself (`_cp_bashlex_resolve_helper`) calls the venv's
+# interpreter directly, never `uv run`. Prints its own status; never exits
+# nonzero — a failed provision means the find/git gate fails CLOSED (every
+# shaped command escalates, logged once) rather than taking install.sh or a
+# deploy down.
+provision_bashlex_venv() {
+  local app_dir="$1" venv reqs
+  venv="$app_dir/.venv-bashlex"
+  reqs="$app_dir/lib/bashlex-requirements.txt"
+  if [ ! -f "$reqs" ]; then
+    echo "  bashlex: no $reqs in this revision — skipping (pre-#264 checkout?)"
+    return 0
+  fi
+  if [ ! -x "$venv/bin/python3" ]; then
+    uv venv --python python3 "$venv" >/dev/null 2>&1
+  fi
+  if ! "$venv/bin/python3" -c 'import bashlex' >/dev/null 2>&1; then
+    uv pip install --python "$venv/bin/python3" -r "$reqs" --require-hashes >/dev/null 2>&1
+  fi
+  if "$venv/bin/python3" -c 'import bashlex' >/dev/null 2>&1; then
+    echo "  bashlex venv ok: $venv"
+  else
+    echo "  bashlex venv FAILED to provision at $venv — the find/git parser gate will fail closed (escalate) until this is fixed" >&2
+  fi
+}
+
 # deploy_app [<revision>] — point the deployed worktree at a committed revision
 # (default: origin/main). Never touches the developer checkout's HEAD.
 deploy_app() {
@@ -469,6 +509,7 @@ deploy_app() {
     return 1
   fi
   find "$HERDR_APP_DIR" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
+  command -v uv >/dev/null 2>&1 && provision_bashlex_venv "$HERDR_APP_DIR"
   echo "  deployed $(app_rev) $(git -C "$HERDR_APP_DIR" log -1 --format=%s | cut -c1-56)${fetched}"
 }
 

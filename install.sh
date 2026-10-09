@@ -93,9 +93,32 @@ done
 
 # ---- dependencies ----------------------------------------------------------
 missing=""
-for c in jq python3 herdr curl; do command -v "$c" >/dev/null 2>&1 || missing="$missing $c"; done
+for c in jq python3 herdr curl uv; do command -v "$c" >/dev/null 2>&1 || missing="$missing $c"; done
 [ -n "$missing" ] && { echo "missing required commands:$missing" >&2; exit 1; }
-echo "deps ok: jq python3 herdr curl"
+echo "deps ok: jq python3 herdr curl uv"
+
+# ---- bashlex venv (SPEC #264 round 3's parser-based find/git gate) ---------
+# `lib/command-policy.sh`'s `_cp_bashlex_findgit_present` calls
+# `.venv-bashlex/bin/python3` DIRECTLY at hook time — never `uv run`, which
+# resolves its environment from the network on every invocation. Pinned to
+# an exact version + hash (`lib/bashlex-requirements.txt`, `uv pip install
+# --require-hashes`): bashlex's licence is GPLv3 — internal use only,
+# nothing in this repo links or redistributes it. `provision_bashlex_venv`
+# (launchd/agent-lib.sh, shared with `deploy_app` for the deployed
+# worktree) never exits nonzero: missing or broken fails the GATE closed,
+# not this install — `_cp_bashlex_resolve_helper` escalates every find/
+# git-shaped command until the venv exists and imports cleanly, logged
+# once to ~/.herdr/command-policy-bashlex.log.
+if [ "$APPLY" = 1 ]; then
+  provision_bashlex_venv "$here"
+else
+  if [ -x "$here/.venv-bashlex/bin/python3" ] && "$here/.venv-bashlex/bin/python3" -c 'import bashlex' >/dev/null 2>&1; then
+    echo "bashlex venv ok: $here/.venv-bashlex (dry run, unchanged)"
+  else
+    echo "bashlex venv would be created at $here/.venv-bashlex (dry run; re-run with --apply)"
+  fi
+fi
+
 
 SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 [ -f "$SETTINGS" ] || { echo "no Claude settings at $SETTINGS — is Claude Code installed?" >&2; exit 1; }
