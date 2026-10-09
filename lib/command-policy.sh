@@ -4340,7 +4340,7 @@ _cp_bashlex_resolve_helper() {
   py="$here/.venv-bashlex/bin/python3"
   script="$here/lib/bashlex_classify.py"
   [ -x "$py" ] && [ -f "$script" ] || {
-    _cp_bashlex_log_once "helper interpreter/script missing ($py / $script) — failing closed on every find/git-shaped command until install.sh/restart.sh provisions it"
+    _cp_bashlex_log_once "helper interpreter/script missing ($py / $script) — EVERY command escalates until install.sh --apply (or restart.sh --deploy with uv on PATH) provisions it"
     return 1
   }
   _CP_BASHLEX_PY="$py"

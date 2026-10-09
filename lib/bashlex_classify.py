@@ -285,7 +285,10 @@ def _handle_command(node, launcher_names):
             )
             return
         basename = os.path.basename(w.word).lower()
-        if basename in launcher_names and chain < _MAX_LAUNCHER_CHAIN and idx + 1 < len(words):
+        if basename in launcher_names and idx + 1 < len(words):
+            if chain >= _MAX_LAUNCHER_CHAIN:
+                _escalate("launcher chain longer than %d words" % _MAX_LAUNCHER_CHAIN)
+                return
             idx += 1
             chain += 1
             continue
