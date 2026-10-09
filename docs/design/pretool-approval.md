@@ -117,11 +117,13 @@ as-built differences):
 1. **Worker side.** The hook returns `{block: true, reason}` for `escalate` /
    `reserved`. Before returning it appends, with `claim_once`, an
    **`action_requested`** event keyed `actreq_<task>_<sha256(tool,input)[:16]>`:
-   `{request_id, tool, command (redacted, ≤2000 chars), command_sha256,
-   input_sha256, cwd, verdict, reason, route: conductor|human, code_path,
-   code_sha256, pane, pane_birth}`. The exact-input hashes and one-shot grant
-   bind the bytes that execute; durable registry rows never need the secret
-   itself. The deterministic id makes a retried identical call the same request
+   `{request_id, tool, command (fully redacted, not truncated), command_sha256,
+   input_sha256, cwd, verdict, reason (redacted), route: conductor|human,
+   code_path, code_sha256, pane, pane_birth}`. Review display remains complete;
+   only the separate shadow audit copy is capped. The exact-input hashes and
+   one-shot grant bind the bytes that execute; durable registry rows never need
+   the secret itself. The deterministic id makes a retried identical call the
+   same request
    (the denied-3×-then-redirect loop, backlog viii). The reason tells the worker:
    *"not run — <reason>. Requested as <id> for your conductor (or: human-only).
    Do not retry it or work around it; continue other work or end your turn; the
@@ -218,16 +220,22 @@ Stronger:
 Built now (this PR):
 - `lib/pretool-shadow.sh`: the verdict, identity checks, redaction; `--record`
   stores a `pretool_verdict` row `{schema, mode:"shadow", tool, call_id, verdict,
-  policy, reason, authority, command (redacted, ≤2000 chars; prefixed as
-  withheld when the policy says it carries a credential), command_sha256,
+  policy, reason, authority, command (redacted, ≤2000 valid UTF-8 bytes; a
+  trailing split code point is dropped; prefixed as withheld when policy says
+  it carries a credential), command_sha256,
   input_sha256, cwd, pane, code_path, code_sha256, elapsed_ms}` keyed
   `ptv_<task>_<sha(call_id)>`. Raw tool input and file contents are never
-  stored. The same redactor protects action-request display text and covers
-  known token shapes, underscore-delimited Stripe keys, high-entropy bare
-  positional tokens, Authorization headers, `curl -u user:pass`, `mysql -p…`,
-  `sshpass -p`, `--password/--token/--api-key` values,
-  `*KEY/TOKEN/SECRET/PASSWORD*=` in any case, URL userinfo and private-key
-  blocks.
+  stored. The same uncapped redactor protects action-request command/reason
+  display and covers known token shapes, underscore-delimited Stripe keys,
+  40-character slash-bearing AWS secret-key shapes, Slack/Discord/Telegram
+  webhook paths, high-entropy bare positional tokens, Authorization headers,
+  `curl -u user:pass`, `mysql -p…`, `sshpass -p`,
+  `--password/--token/--api-key` values, `*KEY/TOKEN/SECRET/PASSWORD*=` in any
+  case, URL userinfo and private-key
+  blocks. Generic shape matching deliberately preserves option/assignment
+  names and common audit ids (commit hashes, UUIDs, herdr ids, and file names).
+  Its ceiling: unknown values under 20 characters, all digits, all one case, or
+  shorter punctuation-delimited pieces need a provider-specific pattern.
 - **Storage: a separate file**, `pretool-shadow.sqlite3`, beside the registry
   (table `pretool_verdicts`). The shadow reads the control-plane registry
   read-only and never runs `registry_init`, so a burst of parallel tool calls

@@ -159,27 +159,61 @@ sha="$(printf '%s' "curl -H 'Authorization: Bearer $tok' https://api.github.com/
 [ "$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE type='pretool_verdict' AND json_extract(payload,'\$.command_sha256')='$sha';")" = 1 ] \
   && ok "the exact command is still joinable by sha256" || not_ok "command sha not recorded"
 
-printf '== underscore Stripe keys and bare positional secrets are redacted ==\n'
+printf '== underscore Stripe keys, slash-bearing AWS secrets, and bare values are redacted ==\n'
 stripe_sk="sk_""live_""A1b2C3d4E5f6G7h8"
 stripe_rk="rk_""live_""H8g7F6e5D4c3B2a1"
 stripe_pk="pk_""test_""P9q8R7s6T5u4V3w2"
 bare_digit="A1bcDef2Ghi3Jkl4Mno5Pqr6"
 bare_mixed="wJalrXUtnFEMIFAKEKEYFAKEKEYbPxRfiCYFAKEKEY"
+aws_slash="wJalrXUtnFEMI/""K7MDENG/""bPxRfiCYEXAMPLEKEY"
+slack_hook="$(printf 'https://%s/%s/%s/%s' 'hooks.slack.com' services T00000000 'B00000000/A1bcDef2Ghi3Jkl4Mno5Pqr6')"
+discord_hook="$(printf 'https://%s/%s/%s/%s' discord.com api webhooks '1234567890/A1bcDef2Ghi3Jkl4Mno5Pqr6')"
+telegram_hook="$(printf 'https://%s/%s%s/%s' api.telegram.org bot '123456789:A1bcDef2Ghi3Jkl4Mno5Pqr6' sendMessage)"
 safe_lower="thisisaverylonglowercaseword"
 bash_payload "./upload.sh $stripe_sk $stripe_rk $stripe_pk" secshape1 | shadow --record >/dev/null
 bash_payload "./upload.sh $bare_digit" secshape2 | shadow --record >/dev/null
 bash_payload "./upload.sh $bare_mixed" secshape3 | shadow --record >/dev/null
 bash_payload "printf %s $safe_lower" secshape4 | shadow --record >/dev/null
+bash_payload "./upload.sh $aws_slash" secshape5 | shadow --record >/dev/null
+bash_payload "curl -sS $slack_hook" secshape6 | shadow --record >/dev/null
+bash_payload "curl -sS $discord_hook" secshape7 | shadow --record >/dev/null
+bash_payload "curl -sS $telegram_hook" secshape8 | shadow --record >/dev/null
 shape_leaks=0
-for shape in "$stripe_sk" "$stripe_rk" "$stripe_pk" "$bare_digit" "$bare_mixed"; do
+for shape in "$stripe_sk" "$stripe_rk" "$stripe_pk" "$bare_digit" "$bare_mixed" "$aws_slash" "$slack_hook" "$discord_hook" "$telegram_hook"; do
   [ "$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE instr(payload,'$shape') > 0;")" = 0 ] \
     || shape_leaks=$((shape_leaks + 1))
 done
 shape_rows="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE json_extract(payload,'\$.call_id') LIKE 'secshape%';")"
 safe_rows="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE json_extract(payload,'\$.call_id')='secshape4' AND instr(payload,'$safe_lower') > 0;")"
-[ "$shape_leaks" = 0 ] && [ "$shape_rows" = 4 ] && [ "$safe_rows" = 1 ] \
-  && ok "Stripe/bare secret shapes redacted; lowercase control preserved" \
+[ "$shape_leaks" = 0 ] && [ "$shape_rows" = 8 ] && [ "$safe_rows" = 1 ] \
+  && ok "Stripe/AWS/bare/webhook secret shapes redacted; lowercase control preserved" \
   || not_ok "shape redaction leaks=$shape_leaks rows=$shape_rows lowercase_controls=$safe_rows"
+
+structure_secret="N7bcDef8Ghi9Jkl0Mno1Pqr2"
+structure_cmd="printf %s --pluginMode2MixedCaseName=$structure_secret LONG2_MixedConfigName=$structure_secret"
+bash_payload "$structure_cmd" secstructure | shadow --record >/dev/null
+structure_rows="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts
+  WHERE json_extract(payload,'\$.call_id')='secstructure'
+    AND instr(payload,'$structure_secret')=0
+    AND instr(payload,'--pluginMode2MixedCaseName=[redacted-token]')>0
+    AND instr(payload,'LONG2_MixedConfigName=[redacted-token]')>0;")"
+[ "$structure_rows" = 1 ] && ok "generic redaction preserves option and assignment names" \
+  || not_ok "generic redaction erased review structure"
+audit_ids="task_20261009T154116Z_11479_30916 0123456789abcdef0123456789abcdef01234567 550e8400-e29b-41d4-a716-446655440000 verify-command-policy-r34.sh"
+bash_payload "printf %s '$audit_ids'" secaudit | shadow --record >/dev/null
+audit_rows="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts
+  WHERE json_extract(payload,'\$.call_id')='secaudit' AND instr(payload,'$audit_ids')>0;")"
+[ "$audit_rows" = 1 ] && ok "common task, commit, UUID, and filename audit identifiers survive redaction" \
+  || not_ok "redactor erased a common audit or filename identifier"
+
+utf8_cmd="$(printf 'a%.0s' $(seq 1 1999))é"
+bash_payload "$utf8_cmd" secutf8 | shadow --record >/dev/null
+utf8_rows="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts
+  WHERE json_extract(payload,'\$.call_id')='secutf8'
+    AND json_valid(payload)=1
+    AND length(CAST(json_extract(payload,'\$.command') AS BLOB))=1999;")"
+[ "$utf8_rows" = 1 ] && ok "2000-byte shadow cap drops a split UTF-8 code point" \
+  || not_ok "shadow cap stored invalid or mis-sized UTF-8"
 
 printf '== the control-plane registry is never written ==\n'
 before_ev="$(sqlite3 "$(registry_db)" "SELECT count(*) FROM events;")"

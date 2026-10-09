@@ -703,21 +703,60 @@ grep -q '^workspace create' "$work/herdr-control.log" 2>/dev/null \
   && ok "HEAD dry runs never ask herdr to create or focus a workspace" \
   || not_ok "a HEAD dry run touched workspaces: $(grep -E '^workspace' "$work/herdr-head.log" 2>/dev/null | tr '\n' ';')"
 
-printf '== durable action-request display redacts Stripe and bare secrets ==\n'
+printf '== durable action requests redact full display and quoted reasons without truncation ==\n'
 request_stripe="sk_""live_""A1b2C3d4E5f6G7h8"
 request_bare="wJalrXUtnFEMIFAKEKEYFAKEKEYbPxRfiCYFAKEKEY"
-out="$(bashc "$ESC # $request_stripe $request_bare")"; rc=$?
+request_aws="wJalrXUtnFEMI/""K7MDENG/""bPxRfiCYEXAMPLEKEY"
+request_padding="$(printf 'p%.0s' $(seq 1 2100))"
+request_command="$ESC # $request_padding $request_stripe $request_bare --pluginMode2MixedCaseName=$request_bare LONG2_MixedConfigName=$request_bare"
+request_input="$(jq -nc --arg c "$request_command" --arg i run --arg e "$request_aws" \
+  '{command:$c,i:$i,env:{BASH_ENV:$e}}')"
+out="$(enf bash "$request_input")"; rc=$?
 request_rid="$(printf '%s' "$out" | field request_id)"
 request_leaks="$(q "SELECT
   (SELECT count(*) FROM action_requests WHERE request_id='$request_rid' AND
-     (instr(command,'$request_stripe')>0 OR instr(command,'$request_bare')>0)) +
+     (instr(command,'$request_stripe')>0 OR instr(command,'$request_bare')>0 OR instr(command,'$request_aws')>0 OR instr(reason,'$request_stripe')>0 OR instr(reason,'$request_bare')>0 OR instr(reason,'$request_aws')>0)) +
   (SELECT count(*) FROM events WHERE type='action_requested' AND
-     (instr(payload,'$request_stripe')>0 OR instr(payload,'$request_bare')>0));")"
-request_markers="$(q "SELECT count(*) FROM action_requests WHERE request_id='$request_rid'
-  AND instr(command,'[redacted-key]')>0 AND instr(command,'[redacted-token]')>0;")"
-[ "$rc" = 8 ] && [ -n "$request_rid" ] && [ "$request_leaks" = 0 ] && [ "$request_markers" = 1 ] \
-  && ok "action_requests row/event retain exact hash but no Stripe or bare secret" \
-  || not_ok "action-request redaction rc=$rc rid=$request_rid leaks=$request_leaks markers=$request_markers"
+     (instr(payload,'$request_stripe')>0 OR instr(payload,'$request_bare')>0 OR instr(payload,'$request_aws')>0));")"
+request_shape="$(q "SELECT count(*) FROM action_requests WHERE request_id='$request_rid'
+  AND length(command)>2000
+  AND instr(command,'[redacted-key]')>0 AND instr(command,'[redacted-token]')>0
+  AND instr(command,'--pluginMode2MixedCaseName=[redacted-token]')>0
+  AND instr(command,'LONG2_MixedConfigName=[redacted-token]')>0
+  AND instr(command,'[env] BASH_ENV=[redacted-token]')>0;")"
+[ "$rc" = 8 ] && [ -n "$request_rid" ] && [ "$request_leaks" = 0 ] && [ "$request_shape" = 1 ] \
+  && ok "action request keeps complete review structure while redacting command, env, and event" \
+  || not_ok "action-request redaction rc=$rc rid=$request_rid leaks=$request_leaks shape=$request_shape"
+
+reason_secret="R7bcDef8Ghi9Jkl0Mno1Pqr2"
+reg task_reason hook
+q "UPDATE tasks SET manifest='{\"handoffs_write\":\"REVIEW.md\"}' WHERE task_id='task_reason';" >/dev/null
+HERDR_TASK_ID=task_reason
+reason_out="$(bashc "DEPLOY_REF=$reason_secret cat README.md")"; reason_rc=$?
+HERDR_TASK_ID=task1
+reason_rid="$(printf '%s' "$reason_out" | field request_id)"
+reason_leaks="$(q "SELECT
+  (SELECT count(*) FROM action_requests WHERE request_id='$reason_rid' AND instr(reason,'$reason_secret')>0) +
+  (SELECT count(*) FROM events WHERE type='action_requested' AND json_extract(payload,'\$.request_id')='$reason_rid' AND instr(payload,'$reason_secret')>0);")"
+reason_markers="$(q "SELECT count(*) FROM action_requests WHERE request_id='$reason_rid' AND instr(reason,'DEPLOY_REF=[redacted-token]')>0;")"
+[ "$reason_rc" = 8 ] && [ -n "$reason_rid" ] && [ "$reason_leaks" = 0 ] && [ "$reason_markers" = 1 ] \
+  && ok "policy reasons that quote argv are redacted before durable storage" \
+  || not_ok "reason redaction rc=$reason_rc rid=$reason_rid leaks=$reason_leaks markers=$reason_markers"
+
+json_password="lowercase-hyphenated-passphrase"
+json_tail="sk_""live_""Z9y8X7w6V5u4T3s2"
+json_padding="$(printf 'p%.0s' $(seq 1 20050))"
+json_input="$(jq -nc --arg b "$json_padding $json_tail" --arg p "$json_password" \
+  '{blob:$b,password:$p}')"
+json_out="$(enf mystery_tool "$json_input")"; json_rc=$?
+json_rid="$(printf '%s' "$json_out" | field request_id)"
+json_leaks="$(q "SELECT count(*) FROM action_requests WHERE request_id='$json_rid'
+  AND (instr(command,'$json_password')>0 OR instr(command,'$json_tail')>0);")"
+json_shape="$(q "SELECT count(*) FROM action_requests WHERE request_id='$json_rid'
+  AND length(command)>20000 AND instr(command,'[redacted]')>0 AND instr(command,'[redacted-key]')>0;")"
+[ "$json_rc" = 8 ] && [ -n "$json_rid" ] && [ "$json_leaks" = 0 ] && [ "$json_shape" = 1 ] \
+  && ok "non-shell JSON is redacted before display and remains complete past 20 KB" \
+  || not_ok "non-shell redaction rc=$json_rc rid=$json_rid leaks=$json_leaks shape=$json_shape"
 
 printf '== shadow-compare.sh --gate (decision q1) ==\n'
 g="$work/gate"; mkdir -p "$g"
