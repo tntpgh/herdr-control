@@ -89,27 +89,83 @@ fi
 
 PS_CMD_CAP=2000
 
-# The shapes smart-name.sh strips from pane scrapes, plus credential-carrying
-# flags (curl -u user:pass, mysql -p<pw>, sshpass -p, --password/--token=…),
-# Authorization headers, NAME=value where NAME says key/token/secret/password
-# (any case), private-key blocks and URL userinfo. perl for case-insensitive
-# matching (BSD sed has no /I).
-pretool_redact() {                      # text -> redacted, capped text
-  printf '%s' "$1" | LC_ALL=C perl -0777 -pe '
-    s/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}/[redacted-key]/g;
+# Storage-boundary redactor. Specific credential formats run first. Shell
+# credential-value matches consume one quoted atom or stop before command
+# metacharacters, so redaction cannot hide review-relevant command structure.
+# The generic pass replaces only a value-like token, never a leading
+# option/assignment NAME, and preserves common audit identifiers
+# (sha/UUID/herdr ids).
+#
+# ceiling: an unknown secret under 20 characters, all digits, all one case, or
+# split into sub-20-character pieces by punctuation is not detectable by shape
+# alone. Add a provider-specific pattern when one of those formats matters.
+_pretool_redact() {                     # text [byte-cap] -> redacted
+  local cap="${2:-0}"
+  printf '%s' "$1" | PS_REDACT_CAP="$cap" LC_ALL=C perl -0777 -pe '
+    my $shell_atom = qr/(?:\x27[^\x27]*\x27|"[^"\$\x60]*"|(?:\\.|[^\s;&|<>()\$\x60\x27"])+)/;
+    s/\b(?:sk|rk|pk)[-_](?:live|test)?[-_]?[A-Za-z0-9]{12,}/[redacted-key]/g;
     s/\b(?:gh[posru]|xox[baprs]|github_pat)[-_][A-Za-z0-9_]{16,}/[redacted-token]/g;
     s/\bAKIA[0-9A-Z]{12,}/[redacted-aws]/g;
     s/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/[redacted-jwt]/g;
     s/-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)/[redacted-private-key]/gs;
-    s/(authorization\s*:\s*)[^\x27"\n]+/$1\[redacted]/gi;
     s/\b(bearer|basic|token)(\s+)[A-Za-z0-9._~+\/=-]{8,}/$1$2\[redacted]/gi;
-    s#(://)[^/@\s]+:[^/@\s]+@#$1\[redacted]@#g;
-    s/((?:^|\s)(?:-u|--user|--proxy-user)(?:\s+|=)?)[\x27"]?[^\s:\x27"]*:[^\s\x27"]+[\x27"]?/$1\[redacted]/g;
-    s/(\b(?:mysql|mysqldump|mariadb|mysqladmin)\b[^|;&\n]*?\s-p)(?!\s)[^\s]+/$1\[redacted]/gi;
-    s/(\bsshpass\s+-p\s*)\S+/$1\[redacted]/gi;
-    s/(--[A-Za-z0-9-]*(?:password|passwd|passphrase|token|secret|api-?key|auth)[A-Za-z0-9-]*(?:=|\s+))\S+/$1\[redacted]/gi;
-    s/(\b[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|token|password|passwd|passphrase|secret|credential|auth)[A-Za-z0-9_]*\s*[=:]\s*)[^\s]+/$1\[redacted]/gi;
-  ' 2>/dev/null | head -c "$PS_CMD_CAP"
+    s/(\x27[^\x27\n]*?authorization\s*:\s*)[^\x27\n]+(\x27)/$1\[redacted]$2/gi;
+    s/("[^"\$\x60\n]*?authorization\s*:\s*)[^"\$\x60\n]+(")/$1\[redacted]$2/gi;
+    s/(authorization\s*:\s*)$shell_atom/$1\[redacted]/gi;
+    s#(\x27[^\x27\n]*?://)[^/@\x27\n]+:[^/@\x27\n]+@#$1\[redacted]@#g;
+    s#("[^"\$\x60\n]*?://)[^/@"\$\x60\n]+:[^/@"\$\x60\n]+@#$1\[redacted]@#g;
+    s#(://)[^/@\s;&|<>()\$\x60\x27"]+:[^/@\s;&|<>()\$\x60\x27"]+@#$1\[redacted]@#g;
+    s/((?:^|\s)(?:-u|--user|--proxy-user)(?:\s+|=)?)$shell_atom/$1\[redacted]/g;
+    s/(\b(?:mysql|mysqldump|mariadb|mysqladmin)\b[^|;&\n]*?\s-p)(?!\s)$shell_atom/$1\[redacted]/gi;
+    s/(\bsshpass\s+-p\s*)$shell_atom/$1\[redacted]/gi;
+    s/(--[A-Za-z0-9-]*(?:password|passwd|passphrase|token|secret|api-?key|auth)[A-Za-z0-9-]*(?:=|\s+))$shell_atom/$1\[redacted]/gi;
+    s/(["\x27]?[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|token|password|passwd|passphrase|secret|credential|auth)[A-Za-z0-9_.-]*["\x27]?\s*:\s*["\x27])([^"\x27]*)(["\x27])/$1\[redacted]$3/gi;
+    s/(\b[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|token|password|passwd|passphrase|secret|credential|auth)[A-Za-z0-9_]*\s*[=:]\s*)$shell_atom/$1\[redacted]/gi;
+    s#((?:hooks\.slack\.com/services/)[^/\s;&|<>()\$\x60]+/[^/\s;&|<>()\$\x60]+/)[^/?\s;&|<>()\$\x60"\x27]+#$1[redacted-token]#gi;
+    s#((?:discord(?:app)?\.com/api/webhooks/)[^/\s;&|<>()\$\x60]+/)[^/?\s;&|<>()\$\x60"\x27]+#$1[redacted-token]#gi;
+    s#(api\.telegram\.org/bot)[^/\s;&|<>()\$\x60"\x27]+#$1[redacted-token]#gi;
+    s{(?<![A-Za-z0-9/+])([A-Za-z0-9/+]{40})(?![A-Za-z0-9/+])}{
+      my $t = $1;
+      ($t =~ /[A-Z]/ && $t =~ /[a-z]/ && ($t =~ /[0-9]/ || $t =~ m{[\/+]}))
+        ? "[redacted-token]" : $t
+    }ge;
+    s{(?<![A-Za-z0-9+_/-])((?![A-Za-z0-9+_-]*=)[A-Za-z0-9][A-Za-z0-9+_-]{19,})(?![A-Za-z0-9+_/-])(?!(?:\.[A-Za-z0-9]{1,8}){1,3}(?:\z|[^A-Za-z0-9_.-]))}{
+      my $t = $1;
+      my $audit = $t =~ /\A(?:task|run|ar|req|appr)_[A-Za-z0-9_-]+\z/
+               || $t =~ /\A[0-9a-f]{32,64}\z/
+               || $t =~ /\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/i;
+      my $secretish = ($t =~ /[A-Za-z]/ && $t =~ /[0-9]/)
+                   || ($t =~ /[A-Z]/ && $t =~ /[a-z]/)
+                   || $t =~ /\+/;
+      (!$audit && $secretish) ? "[redacted-token]" : $t
+    }ge;
+    my $cap = 0 + ($ENV{PS_REDACT_CAP} // 0);
+    if ($cap > 0 && length($_) > $cap) {
+      $_ = substr($_, 0, $cap);
+      my $i = length($_) - 1;
+      $i-- while $i >= 0 && ((ord(substr($_, $i, 1)) & 0xC0) == 0x80);
+      if ($i < 0) {
+        $_ = "";
+      } else {
+        my $b = ord(substr($_, $i, 1));
+        my $need = $b < 0x80 ? 1
+                 : ($b & 0xE0) == 0xC0 ? 2
+                 : ($b & 0xF0) == 0xE0 ? 3
+                 : ($b & 0xF8) == 0xF0 ? 4 : 0;
+        my $have = length($_) - $i;
+        if (!$need || $have < $need) { substr($_, $i) = "" }
+        elsif ($have > $need) { substr($_, $i + $need) = "" }
+      }
+    }
+  ' 2>/dev/null
+}
+
+_pretool_redact_full() {                # text -> redacted, never truncated
+  _pretool_redact "$1" 0
+}
+
+pretool_redact() {                      # text -> redacted, valid UTF-8 byte cap
+  _pretool_redact "$1" "$PS_CMD_CAP"
 }
 
 # Shadow verdict store: its own file, never the control-plane registry.
@@ -809,25 +865,27 @@ pretool_payload_json() {                # payload-json elapsed-ms -> event/stdou
 #                       action request is (found or) created and it is blocked
 #   deny/block       -> blocked, nobody can approve it
 # Sets PS_DECISION (allow|block), PS_WORKER_REASON, PS_REQUEST_ID.
-_ps_request_command() {                 # input-json session-cwd -> text the reviewer sees
-  local where env
+_ps_request_command() {                 # input-json session-cwd -> redacted reviewer text
+  local where env shown
   if [ -n "$PS_CMD" ]; then
-    # Everything the grant binds is shown: the directory it runs in and any
-    # service env, not just the command text.
+    # The action hash still binds every exact byte. The registry stores only
+    # this display copy: action_requests/events are durable, so a literal
+    # credential must not be the price of asking a reviewer for approval.
     case "$(printf '%s' "$PS_TOOL" | tr '[:upper:]' '[:lower:]')" in
       bash|shell) where="(in $(printf '%s' "$1" | jq -r --arg c "$2" '.cwd // $c' 2>/dev/null)) " ;;
       *) where="(stdin of $(printf '%s' "$1" | jq -r '.path // "?"' 2>/dev/null)) " ;;
     esac
     env="$(printf '%s' "$1" | jq -r '(.env // {}) | to_entries | map(.key + "=" + (.value|tostring)) | join(" ")' 2>/dev/null)"
     case "$PS_REASON" in
-      credential*|*"credential-value"*) printf '%s[credential withheld] %s' "$where" "$(pretool_redact "$PS_CMD")" ;;
-      *) printf '%s%s' "$where" "$PS_CMD" ;;
+      credential*|*"credential-value"*) shown="${where}[credential withheld] ${PS_CMD}" ;;
+      *) shown="${where}${PS_CMD}" ;;
     esac
-    [ -n "$env" ] && printf '\n[env] %s' "$env"
-    return 0
+    [ -n "$env" ] && shown="${shown}
+[env] ${env}"
   else
-    printf '%s %s' "$PS_TOOL" "$(printf '%s' "$1" | jq -cS 'if type=="object" then del(.i) else . end' 2>/dev/null | head -c 20000)"
+    shown="$PS_TOOL $(printf '%s' "$1" | jq -cS 'if type=="object" then del(.i) else . end' 2>/dev/null)"
   fi
+  _pretool_redact_full "$shown"
 }
 
 # The ONE fail-closed answer to an unproven identity, for both branches.
@@ -933,8 +991,10 @@ pretool_enforce() {                     # payload-json (after pretool_decide) ->
   route=conductor; [ "$PS_VERDICT" = reserved ] && route=human
   kind=once; [ -n "$PS_CODE_PATH" ] && [ "$PS_VERDICT" = escalate ] && kind=file
   cmd="$(_ps_request_command "$input" "$cwd")"
+  local request_reason
+  request_reason="$(_pretool_redact_full "$PS_REASON")"
   if ! action_request_resolve "$HERDR_RUN_ID" "$HERDR_TASK_ID" "$PS_TOOL" "$sha" "$cmd" "$PS_VERDICT" \
-       "$PS_REASON" "$route" "$kind" "$PS_CODE_PATH" "$PS_CODE_SHA"; then
+       "$request_reason" "$route" "$kind" "$PS_CODE_PATH" "$PS_CODE_SHA"; then
     PS_WORKER_REASON="herdr: not run — ${PS_REASON}. The request could not be recorded (registry write failed), so nothing runs. Tell your conductor."
     return 8
   fi
