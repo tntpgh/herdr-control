@@ -142,6 +142,52 @@ run_corpus_row wrap-xargs-find 'echo . | xargs find -maxdepth 0 -exec echo INJEC
 run_corpus_row ctl-plain-git  'git status'
 run_corpus_row ctl-plain-find 'find . -maxdepth 0'
 
+# ---- #268: exact-verdict assertions ---------------------------------------
+# `run_corpus_row` above only fails when the EXISTING find/git rules
+# already call the resolved argv unsafe — useless for a NEW escalation
+# rule (git+source pairing, ext:: transport) this diff's existing rules
+# never judged before. `check` asserts classify_command's verdict
+# directly, same semantics as verify-command-policy.sh's own helper, kept
+# here instead so this branch does not contend with #267's edits there.
+check() {               # label cmd want
+  local label="$1" cmd="$2" want="$3" got
+  got="$(classify_command "$cmd")"
+  if [ "$got" = "$want" ]; then
+    ok "$label: $got"
+  else
+    bad "$label: $got (want $want) for '$cmd'"
+  fi
+}
+
+
+# Red: a resolved git/git-* command paired ANYWHERE (either order,
+# redirects, list/pipeline/substitution/nested body) with a literal
+# `source`/`.` command.
+check "268-git-then-source-redir"   'git log 2>/dev/null; source ./evil.sh 2>/dev/null' escalate
+check "268-source-then-git-redir"   'source ./evil.sh 2>/dev/null; git log 2>/dev/null' escalate
+check "268-dot-then-git"            '. ./evil.sh; git log' escalate
+check "268-source-in-cmdsub"        'echo "$(source ./evil.sh)"; git log' escalate
+check "268-source-in-func-body"     'f() { source ./evil.sh; }; f; git log' escalate
+
+# Controls: source-only behavior is whatever main already says (NOT
+# asserted escalate here — only the pairing with git is new); plain git
+# stays allow.
+check "268-git-only-allow"          'git log' allow
+
+# Red: every `ext::` transport in a resolved git argv, any subcommand.
+check "268-remote-add-ext"          'git remote add x ext::sh' escalate
+check "268-set-url-ext"             'git remote set-url origin ext::sh' escalate
+check "268-clone-ext"               'git clone ext::sh /tmp/x' escalate
+check "268-fetch-protocol-ext"      'git -c protocol.ext.allow=always fetch ext::sh' escalate
+check "268-wrapper-git-remote-ext"  'nice git remote add x ext::sh' escalate
+check "268-dashed-git-remote-ext"   'git-remote add x ext::sh' escalate
+
+# Red regression: both dashed `git-ls-remote>/dev/null --upload-pack=...`
+# forms (#264) stay escalated under this diff too.
+check "268-dashed-upload-pack"      'git-ls-remote>/dev/null --upload-pack=/tmp/x' escalate
+check "268-dashed-upload-pack-u"    'git-ls-remote>/dev/null -u/tmp/x' escalate
+
+
 echo "-----------------------------------------------------------------"
 printf 'bashlex-diff: %d/%d passed, %d skipped\n' "$pass" "$((pass+fail))" "$skipped"
 [ "$fail" -eq 0 ]

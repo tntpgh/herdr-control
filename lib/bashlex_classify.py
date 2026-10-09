@@ -35,6 +35,24 @@ so the four classes collapse to two checks instead of four spelling rules:
      judgement itself, so there is no second find/git rule to keep in
      sync with the first).
 
+herdr-control#268 added two more checks over the SAME single walk,
+neither needing a second shell-text parser:
+  3. If the whole command graph (any order, any list/pipeline/
+     substitution/nested body) contains BOTH a resolved git/git-*
+     command and a literal `source`/`.` command: ESCALATE. A sourced
+     file can set exec-capable state (GIT_PAGER, a credential helper,
+     ...) for a git invocation that runs EITHER before or after it in
+     the same input — the pre-#268 shell-text pass
+     (`_cp_git_exec_opt_scan_segments`) only caught source-before-git.
+  4. If a resolved git/git-* command's own argv contains the literal,
+     case-sensitive substring `ext::` in ANY word: ESCALATE,
+     independent of subcommand (remote add/set-url, clone, fetch with
+     protocol.ext.allow=always, ...) — git's `ext::<command>` transport
+     runs a command wherever git allows that transport, not just on
+     `ls-remote --upload-pack=`, which is all the existing shell-text
+     rules (`_cp_git_unsafe_tokens`) knew about. Over-blocking a commit
+     message that happens to contain `ext::` is accepted.
+
 Output grammar (one line per verdict; the caller reads ALL of them):
   `ESCALATE <reason>`   — fail closed (parse error/timeout/unreadable word)
   `CHECK <quoted argv>` — hand this resolved segment to the existing
@@ -55,12 +73,16 @@ TIMEOUT_SECONDS = 2
 _PLAIN_RE = re.compile(r'^[A-Za-z0-9._/+-]+$')
 _ASSIGN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 _FINDGIT_RE = re.compile(r'^(find|fd|git|git-.+)$', re.IGNORECASE)
+_GIT_ONLY_RE = re.compile(r'^(git|git-.+)$', re.IGNORECASE)
+_SOURCE_RE = re.compile(r'^(source|\.)$')
 _MAX_LAUNCHER_CHAIN = 16
 _WORD_BOUNDARY_CHARS = set(' \t\n;&|()<>')
 _NAME_EQ_PAREN_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)=\(')
 
 _escalated = []
 _checks = []
+_git_seen = []
+_source_seen = []
 _PLACEHOLDER_SPANS = []
 
 
@@ -293,11 +315,34 @@ def _handle_command(node, launcher_names):
             chain += 1
             continue
         break
-
     resolved = words[idx]
     basename = os.path.basename(resolved.word).lower()
+    # #268 gap 1: `source ./evil.sh` (or the `.` builtin form) paired
+    # anywhere in the same classified input with a resolved git/git-*
+    # command — either order, in any list/pipeline/substitution/nested
+    # body — must escalate (main()'s post-walk check below does the actual
+    # pairing once the full tree is known). `source`/`.` alone is not a
+    # find/git/fd command, so record the sighting and stop: no CHECK line
+    # for it, same as any other non-find/git command.
+    if _SOURCE_RE.match(basename):
+        _source_seen.append(True)
+        return
     if not _FINDGIT_RE.match(basename):
         return
+    if _GIT_ONLY_RE.match(basename):
+        _git_seen.append(True)
+        # #268 gap 2: every `ext::` transport in this command's resolved
+        # git argv is unsafe (remote add/set-url, clone, fetch with
+        # protocol.ext.allow=always, ...) regardless of subcommand —
+        # scanned on the raw word text, same as the rest of this file's
+        # spelling-agnostic checks, so a quoted or expansion-built
+        # argument still trips it. Over-blocking a commit message that
+        # happens to contain `ext::` is accepted (SPEC): no subcommand
+        # grammar here.
+        for t in words[idx:]:
+            if "ext::" in t.word:
+                _escalate("git argv contains an ext:: transport: %r" % (t.word,))
+                break
 
     # Reconstruct this simple command's resolved argv from `resolved`
     # onward, PLUS any leading GIT_*/PAGER/EDITOR/VISUAL assignment this
@@ -383,6 +428,14 @@ def main():
     except Exception as exc:  # noqa: BLE001 — a walker bug must fail closed too
         print("ESCALATE walker error: %s: %s" % (type(exc).__name__, exc))
         return 0
+
+    # #268 gap 1: a resolved git/git-* command and a literal `source`/`.`
+    # command ANYWHERE in the same classified input — either order, in
+    # any list/pipeline/substitution/nested body — escalate together.
+    # Checked once the whole tree is known (not inside _handle_command)
+    # so order never matters.
+    if _git_seen and _source_seen:
+        _escalate("git and source/. both present in the same command graph")
 
     if _escalated:
         for reason in _escalated:
