@@ -96,6 +96,25 @@ check_unreserved() {
   fi
 }
 
+# check_reason <label> <command> <expected-verdict> <expected-reason> —
+# herdr-control#267: exact-verdict AND exact-reason-text assertion, for
+# cases where the verdict alone (escalate) isn't enough proof — a mutant
+# that escalates for the WRONG reason (or an unrelated existing rule that
+# happens to also escalate the fixture) would pass a plain `check` row
+# without ever exercising the size ceiling at all.
+check_reason() {
+  local label="$1" cmd="$2" want="$3" want_reason="$4" got reason
+  total=$((total + 1))
+  got="$(classify_command "$cmd")"
+  reason="$(classify_reason)"
+  if [ "$got" = "$want" ] && [ "$reason" = "$want_reason" ]; then
+    printf 'PASS  %-52s => %-9s\n' "$label" "$got"
+  else
+    printf 'FAIL  %-52s => %-9s reason=[%s] (want %s reason=[%s])\n' "$label" "$got" "$reason" "$want" "$want_reason"
+    failed=$((failed + 1))
+  fi
+}
+
 echo "== detonation F2: one invalid byte must not blank the scanner =="
 # BSD sed aborts on the first non-UTF-8 byte in a UTF-8 locale, so every
 # transform in scannable_command returned "" and the floor table judged an
@@ -4536,6 +4555,41 @@ check "R6-2: redirect glued onto the lowercase git word" \
   'git>/dev/null -C /tmp/r status' escalate
 check "R6-2: redirect glued onto the uppercase GIT word with a target path" \
   'GIT>/tmp/o -C /tmp/r status' escalate
+
+echo
+echo "== herdr-control#267: early 4096-byte escalation ceiling =="
+# Fixtures are built with printf/arithmetic, not literal padding, so the
+# byte counts stay exact across edits to this file. Prefix is an ordinary
+# allow-shaped command (confirmed plain-allow elsewhere in this file, e.g.
+# "PR264r3 ctl-plain-git") so case 1 proves the ceiling does not touch
+# classification for anything AT or under the limit.
+_267_prefix='git status # '
+_267_pad=$((4096 - ${#_267_prefix}))
+_267_at_cap="${_267_prefix}$(printf '%*s' "$_267_pad" '' | tr ' ' x)"
+_267_over_cap="${_267_at_cap}x"
+check "267-1: exactly 4096 bytes reaches normal classification" \
+  "$_267_at_cap" allow
+check_reason "267-2: 4097 bytes escalates with the exact ceiling reason" \
+  "$_267_over_cap" escalate \
+  "command text is 4097 bytes, over the 4096-byte early size ceiling (herdr-control#267) — escalating before any scan"
+# A 2-byte UTF-8 character (é, U+00E9) repeated 2100 times: 2100 CHARACTERS
+# (comfortably under the 4097 char-count a locale-aware ${#raw} would have
+# compared against) but 4200 BYTES — over the ceiling. Proves the count is
+# byte-based, not character-based, independent of the host's locale.
+_267_mb_count=2100
+_267_mb_bytes=$((_267_mb_count * 2))
+_267_mb_input="$(printf '\xc3\xa9%.0s' $(seq 1 "$_267_mb_count"))"
+check_reason "267-3: multibyte input under 4097 chars but over 4096 bytes escalates" \
+  "$_267_mb_input" escalate \
+  "command text is ${_267_mb_bytes} bytes, over the 4096-byte early size ceiling (herdr-control#267) — escalating before any scan"
+# 100 KiB: proves the ceiling fires long before any parsing rule would see
+# pathological input (a 10 KiB panel measured 167s through the full rule
+# set on main). Timing itself lives in tmp/probes.sh, not here — absolute
+# wall-clock assertions are flaky in a shared/loaded CI host and do not
+# belong in the permanent verdict suite.
+_267_huge="$(printf 'x%.0s' $(seq 1 102400))"
+check_not_allow "267-4: 100 KiB input escalates (timing itself: tmp/probes.sh)" \
+  "$_267_huge"
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

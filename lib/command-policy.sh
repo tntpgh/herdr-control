@@ -6701,6 +6701,21 @@ classify_command() {                    # <panel/command text> [worktree] [manif
     return 2
   fi
   local raw="$1" wt="${2:-}" cp_manifest="${3:-}" norm
+  # herdr-control#267: cap the ORIGINAL text before the first scan. A 10 KiB
+  # panel took 167 s through the old rule set. Recorded requests are p50 196 /
+  # p95 557 / p99 1159 / max 1619 bytes, so 4096 is >2.5x the observed max.
+  # Bash length is locale-sensitive: temporarily shadow LC_ALL with C for the
+  # count, then restore the caller's exact set/unset state before any rule runs.
+  # No external process is added to the normal hot path.
+  local raw_len _cp_saved_lc_all="${LC_ALL-}" _cp_had_lc_all="${LC_ALL+x}" LC_ALL
+  LC_ALL=C
+  raw_len=${#raw}
+  if [ "$_cp_had_lc_all" = x ]; then LC_ALL="$_cp_saved_lc_all"; else unset LC_ALL; fi
+  if [ "$raw_len" -gt 4096 ]; then
+    printf 'command text is %d bytes, over the 4096-byte early size ceiling (herdr-control#267) — escalating before any scan\n' "$raw_len" > "$(_cp_reason_file)"
+    printf 'escalate\n'
+    return 0
+  fi
   # #190 (pre-existing on main; folded into #187/PR-189's security-review
   # fix round): a classified text carrying more than one literal
   # "Allow tool:" occurrence cannot be trusted AT ALL, regardless of tool.
