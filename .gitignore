@@ -5,6 +5,7 @@ build/
 .local-state/engineering-ledger/
 __pycache__/
 *.pyc
+.venv-bashlex/
 
 # --- secrets hygiene (added 2026-07-30) ---
 # Ignore every env file by default; re-allow the templates that are meant to be tracked.

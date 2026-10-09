@@ -2052,6 +2052,14 @@ _cp_cmdword_dequote() {                 # word
 # 1 — leaving both stale from a prior call — when the segment holds nothing
 # but redirections/assignments/launchers (e.g. `> /dev/null` alone, or the
 # tail end of a segment the splitter cut mid-redirection).
+# Single source of truth for the generic launcher/wrapper names `_cp_locate_
+# command_word` skips (with their own value-option grammar) below. SPEC
+# #264 round 3's bashlex gate (`_cp_bashlex_findgit_present`, near the find/
+# git rules in `classify_command`) reads this SAME variable — exported to
+# its python helper as `CP_LAUNCHER_NAMES` — so there is exactly one place
+# that names a launcher, never a second list that could drift from this one.
+_CP_LAUNCHER_NAMES="sudo doas su env nice ionice nohup time timeout gtimeout stdbuf setsid command builtin exec caffeinate unbuffer sandbox-exec"
+
 _CP_LOC=()
 _CP_LOC_SKIPPED=()
 _CP_LOC_CAPPED=0
@@ -2115,8 +2123,8 @@ _cp_locate_command_word() {             # segment
 
     if [ "$_cp_wate" = 0 ]; then
       _cp_wl="$(_cp_cmdword_dequote "$1")"; _cp_wl="$(printf '%s' "${_cp_wl##*/}" | tr 'A-Z' 'a-z')"
-      case "$_cp_wl" in
-        sudo|doas|su|env|nice|ionice|nohup|time|timeout|gtimeout|stdbuf|setsid|command|builtin|exec|caffeinate|unbuffer|sandbox-exec)
+      case " $_CP_LAUNCHER_NAMES " in
+        *" $_cp_wl "*)
           case "$_cp_wl" in
             sudo)    _cp_wv='ugphCDRT'; _cp_wvl='user|group|host|prompt|chdir|close-from|role|type|other-user' ;;
             su)      _cp_wv='csl';      _cp_wvl='command|shell|user' ;;
@@ -3882,15 +3890,48 @@ _cp_git_seg_exec_unsafe() {             # protected-segment [depth]
     # escalates, same unconditional rule as `script`. A bare invocation
     # with nothing trailing (nothing can run) still falls through to the
     # default `return 1` below.
-    # SPEC #261 r6 (item 4, review MEDIUM "argv launchers omitted from
-    # the dispatch"): `lockf`/`ssh-agent` (a mandatory positional, or an
-    # env-setting exec, ahead of the real command) and `dtrace -c`/
+    # Follow-up to #261 round 6 (Main's live run): `dtruss`/`sc_usage`
+    # (stock macOS tracing launchers — both run their trailing argv as a
+    # child process the same way `dtrace -c`/`lldb --` already do above)
+    # and `screen -dm` (starts its trailing argv as a background process
+    # the caller never has to wait on, same unverifiable-ahead-of-time
+    # shape as `watch`) join the same "any trailing word escalates"
+    # rule. `gfind` (GNU findutils' own binary name on macOS, e.g. via
+    # Homebrew coreutils) is find itself under a different basename —
+    # rather than re-deriving the find-exec allowlist walk for a second
+    # binary name, it is treated as a member of THIS list too: any
+    # trailing word (the search root, every real invocation has one)
+    # escalates, same accepted-over-block bluntness as the rest of this
+    # file. SPEC #261 r6 (item 4, review MEDIUM "argv launchers omitted
+    # from the dispatch"): `lockf`/`ssh-agent` (a mandatory positional,
+    # or an env-setting exec, ahead of the real command) and `dtrace -c`/
     # `lldb --` (their own value-opt grammars run arbitrary command
     # strings or debugger script, not worth building a safe-to-parse
     # table for) join direnv/mise's existing "any trailing word
     # escalates" rule rather than a second one-off list.
-    direnv|mise|lockf|ssh-agent|dtrace|leaks|lldb)
+    direnv|mise|lockf|ssh-agent|dtrace|leaks|lldb|dtruss|sc_usage|screen|gfind)
       [ "${#_CP_LOC[@]}" -gt 1 ] && return 0
+      return 1 ;;
+    # (coproc: round 2 live-run finding — `_cp_locate_command_word`
+    # (line ~2099) treats `coproc` as a shell KEYWORD to skip past, the
+    # same way it skips `if`/`while`/`{`, so `_cp_wcmd` here is never
+    # literally `coproc` — it resolves to whatever word follows (the
+    # bash-assigned coprocess NAME, e.g. `C` in `coproc C { … }`), which
+    # matches no case arm and falls through to `return 1`. Detected
+    # instead as a raw-text, locator-independent check —
+    # `_cp_coproc_present`, wired directly into `classify_command` next
+    # to `_cp_findgit_blunt_present` — rather than here.)
+    # Follow-up to #261 round 6, L-fd-x: `fd` (a find-replacement) runs
+    # its OWN trailing argv as a child process once `-x`/`-X`/`--exec`/
+    # `--exec-batch` is present — the same shape find's `-exec` is,
+    # narrowly matched (not "any trailing word") because a bare `fd
+    # pattern` search is the overwhelming ordinary case and carries no
+    # exec capability at all.
+    fd)
+      local _cp_fd_a
+      for _cp_fd_a in "${_CP_LOC[@]:1}"; do
+        case "$_cp_fd_a" in -x|-X|--exec|--exec-batch) return 0 ;; esac
+      done
       return 1 ;;
     # #261 r4: unlike direnv/mise, taskpolicy's OWN flag grammar is
     # small, fixed, and fully documented (`man taskpolicy`) — every flag
@@ -4250,6 +4291,24 @@ _cp_exec_assign_present() {             # raw -> 0 if HOME=/XDG_CONFIG_HOME=/PAT
   grep -qE "(^|[^A-Za-z0-9_])(${_CP_EXEC_ASSIGN_NAME_RE})=" <<<"$1"
 }
 
+# Follow-up to #261 round 6 (Main's live run, items I-libxo-env/I-libxo-top/
+# I-perl5opt): LIBXO_OPTIONS (read by every BSD tool linked against libxo —
+# `wc`, `ls`, `df`, …; `--libxo=encoder=<path>` is already closed as an
+# inline FLAG by `_cp_find_exec_inner_tool_opt_unsafe`, but the SAME
+# `encoder=<path>` value reaches the tool just as well via the environment,
+# ahead of ANY command, not only one running inside a find -exec clause) and
+# PERL5OPT/PERL5LIB (read by every `perl` invocation — `-M<module>`/a
+# library search path ahead of ANY command that might shell out to perl)
+# are exec-capable the same way HOME/XDG_CONFIG_HOME/PATH are just above,
+# just for a different target program than git. Same text-anywhere,
+# assignment-shaped, one-grep shape; a separate list (not folded into
+# `_CP_EXEC_ASSIGN_NAME_RE`) only because the reason string differs.
+_CP_INJECTION_ENV_NAME_RE='LIBXO_OPTIONS|PERL5OPT|PERL5LIB'
+_cp_injection_env_assign_present() {    # raw -> 0 if LIBXO_OPTIONS=/PERL5OPT=/PERL5LIB= is assigned anywhere
+  local LC_ALL=C LANG=C
+  grep -qE "(^|[^A-Za-z0-9_])(${_CP_INJECTION_ENV_NAME_RE})=" <<<"$1"
+}
+
 # Round 9 (herdr-control#254 PR comment, round-8 review item A): a
 # runtime-BUILT variable NAME handed to an assignment builtin —
 # `printf -v n "%s%s%s" "$g" "$s" "$t"; export "$n=/tmp/x"`, `n="$(printf
@@ -4607,6 +4666,263 @@ _cp_sub_text_risk_present() {           # raw
       print found
     }')"
   [ "$hit" = 1 ] && return 0
+  return 1
+}
+
+# `_cp_findgit_blunt_present <raw>` -> 0 (true) when a find/git token
+# appears anywhere in the text AND the ORIGINAL text also carries one of
+# the trigger characters below, ANYWHERE — not at a segment start, not
+# next to the find/git word. SPEC round 2 (PR #264): the position- and
+# spelling-sensitive round-6 version (five named trigger FORMS, each
+# anchored to a segment start or an exact two-character `"$`) desynced on
+# a redirect that was not at the very front of a `_cp_segments` split
+# (`true; </dev/null find …`, backslash disables the split entirely), on
+# `&>`/`{v}<` spellings the front-anchor regex never listed, on a quoted
+# `$`-expansion split across a prefix (`"-${U:-exec}"`), and on
+# `gfind`/`fd`/`*`/bracket-range spellings the token alternation never
+# named — see review/pr-264/.handoffs/REVIEW.md F1-F4. This version drops
+# every one of those anchors: ONE normalised copy, ONE substring/glob
+# mention test, ONE "does a trigger char occur anywhere" test. Over-
+# matching (an ordinary `find . -name '*.sh'` now escalates on its own
+# quote) is accepted per SPEC rather than chased closed with a sixth
+# anchor.
+#
+# Step 1 (normalise): quote characters and backslashes are deleted, then
+# the copy is lowercased. Nothing else — no bracket-stripping (round 6
+# stripped `[`/`]` too, which is exactly what let a bracket-range glob
+# spelling hide from the substring test as a false "already closed by an
+# earlier rule"; now it is caught by the glob check below instead).
+#
+# Step 2 (mention): true if EITHER (a) the normalised copy contains
+# `find`, `git` or `fd` anywhere (plain substring — this alone covers
+# every ordinary and case/quote/backslash-obfuscated spelling, including
+# `gfind`/`git-status`, regardless of where it sits), or (b) a glob
+# character (`*`, `?`, `[`) sits in "command position" — the word a
+# segment boundary (`;`/`&`/`|`/`(`/`)`) or a redirect's own target hands
+# control to next. Command position is tracked with a single forward scan
+# (the awk pass below, O(n), one process for the whole call — not one
+# fork per segment, which is what made the round-6 version's per-segment
+# loop slow on a 100 KB command): any run of `;&|()<>` flips the next
+# real word into "command position" UNLESS that run contained `<`/`>`, in
+# which case the next word is a redirect TARGET (skipped), and the word
+# AFTER that target is offered command position again — so N leading
+# redirects ahead of a glob-disguised verb (`>& /dev/null [g]it …`,
+# `<<< x /usr/bin/gi? …`) still resolve to the real verb without ever
+# trying to parse which launcher or redirect it was.
+#
+# Step 3 (trigger): a mention is escalated the instant the RAW text (not
+# the normalised copy — stripping first would hide the very thing being
+# detected) contains `$`, a backtick, `<`, `>`, a quote character, or a
+# backslash ANYWHERE. No position check, no two-character `"$` pairing.
+#
+# Step 4 (exception): a trailing `2>/dev/null` or `>/dev/null 2>&1`, as
+# the LAST token(s) of the text, does not itself count as the trigger —
+# `git log --oneline 2>/dev/null` stays allowed. Any OTHER trigger
+# character anywhere outside that trailing suffix still escalates.
+_cp_findgit_blunt_present() {           # raw
+  local LC_ALL=C LANG=C
+  local raw="$1" stripped mention rest trailing=1
+
+  stripped="$raw"
+  stripped="${stripped//\'/}"
+  stripped="${stripped//\"/}"
+  stripped="${stripped//\\/}"
+  stripped="$(printf '%s' "$stripped" | tr '[:upper:]' '[:lower:]')"
+  # Flatten real embedded newlines (a heredoc body, an ANSI-C $'...\n...'
+  # string) to a control byte BEFORE awk, same technique `_cp_protect_text`
+  # already uses above: awk's default per-LINE record processing would
+  # otherwise run the whole `{ }` block (and its own `hit`/print) once
+  # PER PHYSICAL LINE instead of once for the whole command, so a
+  # command whose find/git mention sits on one line and its trigger
+  # character on another — or even both on the SAME line, with inert
+  # blank lines before/after — printed MULTIPLE "MENTION\nNOMENTION" rows
+  # instead of one, and `[ "$mention" = MENTION ]` then compared that
+  # whole multi-line string against the literal word "MENTION" and always
+  # lost (round 5 regression, Main's live run: RD-heredoc's `<<
+  # EOF find … \nbody\nEOF` stayed allow because its 3-line text produced
+  # 3 printed verdicts, never the single bare "MENTION" the caller checks
+  # for).
+  local flat
+  flat="$(printf '%s' "$stripped" | tr '\n' '\017')"
+
+  mention="$(printf '%s' "$flat" | awk '
+    {
+      text = $0
+      n = length(text)
+      expect_cmd = 1
+      in_target = 0
+      word = ""
+      opbuf = ""
+      hit = (index(text, "find") > 0) || (index(text, "git") > 0) || (index(text, "fd") > 0)
+      for (i = 1; i <= n; i++) {
+        c = substr(text, i, 1)
+        if (c == ";" || c == "&" || c == "|" || c == "(" || c == ")" || c == "<" || c == ">") {
+          if (word != "") {
+            if (!in_target && expect_cmd) {
+              if (word ~ /[*?\[]/) hit = 1
+              expect_cmd = 0
+            }
+            word = ""
+          }
+          opbuf = opbuf c
+        } else if (c == " " || c == "\t" || c == "\017") {
+          if (opbuf != "") {
+            if (opbuf ~ /[<>]/) { in_target = 1; expect_cmd = 1 } else { in_target = 0; expect_cmd = 1 }
+            opbuf = ""
+          } else if (word != "") {
+            if (!in_target && expect_cmd) {
+              if (word ~ /[*?\[]/) hit = 1
+              expect_cmd = 0
+            } else if (in_target) {
+              in_target = 0
+            }
+            word = ""
+          }
+        } else {
+          if (opbuf != "") {
+            if (opbuf ~ /[<>]/) { in_target = 1; expect_cmd = 1 } else { in_target = 0; expect_cmd = 1 }
+            opbuf = ""
+          }
+          word = word c
+        }
+      }
+      if (opbuf != "") {
+        if (opbuf ~ /[<>]/) { in_target = 1; expect_cmd = 1 } else { in_target = 0; expect_cmd = 1 }
+      }
+      if (word != "" && !in_target && expect_cmd) {
+        if (word ~ /[*?\[]/) hit = 1
+      }
+      print (hit ? "MENTION" : "NOMENTION")
+    }
+  ')"
+  [ "$mention" = MENTION ] || return 1
+
+  case "$raw" in
+    *'$'*|*'`'*|*'<'*|*'>'*|*"'"*|*'"'*|*'\'*) : ;;
+    *) return 1 ;;
+  esac
+
+  rest=""
+  case "$raw" in
+    *' 2>/dev/null') rest="${raw% 2>/dev/null}" ;;
+    *'2>/dev/null') rest="${raw%2>/dev/null}" ;;
+    *' >/dev/null 2>&1') rest="${raw% >/dev/null 2>&1}" ;;
+    *'>/dev/null 2>&1') rest="${raw%>/dev/null 2>&1}" ;;
+    *) trailing=0 ;;
+  esac
+  if [ "$trailing" = 1 ]; then
+    case "$rest" in
+      *'$'*|*'`'*|*'<'*|*'>'*|*"'"*|*'"'*|*'\'*) ;;
+      *) return 1 ;;
+    esac
+  fi
+
+  return 0
+}
+
+# `_cp_coproc_present <raw>` -> 0 (true) when any segment's first word is
+# literally `coproc`. Round 2 of this follow-up (Main's live run): KW-coproc
+# and G-coproc still allowed after `coproc` was added to the launcher
+# dispatch's "any trailing word escalates" case arm (`_cp_git_seg_exec_
+# unsafe`), because that arm is keyed on `_cp_wcmd`, and
+# `_cp_locate_command_word` treats `coproc` as a shell KEYWORD to skip
+# PAST — same as `if`/`while`/`{` — so `_cp_wcmd` for `coproc C { find …
+# }` resolves to `C` (the bash-assigned coprocess NAME), which matches no
+# case arm. Teaching the locator coproc's own grammar (NAME is optional;
+# the body is a compound command, not a simple one) is a parser, which
+# SPEC rules out. Blunt instead, per Main: a locator-independent raw-text
+# check of each segment's own first word — unconditional, regardless of
+# what the compound form holds or whether find/git appears in it at all.
+_cp_coproc_present() {                  # raw
+  local LC_ALL=C LANG=C
+  local raw="$1" seg split first
+  split=1
+  _cp_quoting_is_simple "$raw" || split=0
+  while IFS= read -r seg; do
+    [ -n "${seg//[[:space:]]/}" ] || continue
+    read -r first _ <<<"$seg"
+    [ "$first" = coproc ] && return 0
+  done <<EOF
+$(_cp_segments "$raw" "$split")
+EOF
+  return 1
+}
+
+# `_cp_bashlex_findgit_present <raw>` -> 0 (true, escalate) when SPEC
+# #264 round 3's parser-based gate (`lib/bashlex_classify.py`, run under
+# the interpreter `install.sh`/`restart.sh` provision at
+# `$here/.venv-bashlex/bin/python3` — NEVER `uv run`, which would need
+# network at hook time) finds a resolved find/git/fd invocation the
+# existing rules above cannot see because of HOW it is spelled (a
+# backslash-newline inside the verb, an extglob pattern, an empty-
+# expansion splice — `~/.herdr/worktrees/herdr-control/review/pr-264-r2/
+# .handoffs/REVIEW.md` M1-M4), OR any command word a real parser could not
+# resolve statically at all. Added ON TOP of every existing rule in this
+# file, including `_cp_findgit_blunt_present` just above: this never
+# REPLACES the blunt scan, it only closes gaps a position- and spelling-
+# based text scan structurally cannot close.
+#
+# The helper's own stdout grammar (`lib/bashlex_classify.py`'s header):
+# one `ESCALATE <reason>` line fails this closed outright; one or more
+# `CHECK <quoted argv>` lines are each handed to `_cp_git_seg_exec_unsafe`
+# (the SAME dispatch `_cp_git_exec_opt_invoked` above already reuses for
+# every OTHER git/find shape in this file, so there is no second find/git
+# rule for the two to disagree about) — protected the same way every
+# other segment this file classifies is, via `_cp_protect_text`, before
+# that call. A bare `ALLOW` line, a missing/non-executable interpreter, a
+# non-zero exit, empty output, or any OTHER line this grammar does not
+# define all fail closed the same way `_cp_wrap_tail_unsafe` hitting its
+# depth cap does — a parser that cannot prove a command safe is not
+# evidence that it IS safe.
+_CP_BASHLEX_PY=""
+_CP_BASHLEX_PY_CHECKED=0
+_cp_bashlex_log_once() {                # message
+  local dir="${HOME:-/tmp}/.herdr"
+  mkdir -p "$dir" 2>/dev/null
+  printf '%s command-policy bashlex: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" "$1" \
+    >>"$dir/command-policy-bashlex.log" 2>/dev/null
+}
+_cp_bashlex_resolve_helper() {
+  [ -n "$_CP_BASHLEX_PY" ] && return 0
+  [ "$_CP_BASHLEX_PY_CHECKED" = 1 ] && return 1
+  _CP_BASHLEX_PY_CHECKED=1
+  local src="${BASH_SOURCE[0]}" here py script
+  here="$(cd "$(dirname "$src")/.." && pwd 2>/dev/null)" || return 1
+  py="$here/.venv-bashlex/bin/python3"
+  script="$here/lib/bashlex_classify.py"
+  [ -x "$py" ] && [ -f "$script" ] || {
+    _cp_bashlex_log_once "helper interpreter/script missing ($py / $script) — EVERY command escalates until install.sh --apply (or restart.sh --deploy with uv on PATH) provisions it"
+    return 1
+  }
+  _CP_BASHLEX_PY="$py"
+  _CP_BASHLEX_SCRIPT="$script"
+  return 0
+}
+_cp_bashlex_findgit_present() {         # raw
+  local raw="$1" out rc line seg protseg
+  if ! _cp_bashlex_resolve_helper; then
+    return 0
+  fi
+  out="$(CP_LAUNCHER_NAMES="$_CP_LAUNCHER_NAMES" "$_CP_BASHLEX_PY" "$_CP_BASHLEX_SCRIPT" <<<"$raw" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    _cp_bashlex_log_once "helper exited rc=$rc with no usable output — failing closed"
+    return 0
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      'ESCALATE '*) return 0 ;;
+      'CHECK '*)
+        seg="${line#CHECK }"
+        protseg="$(_cp_protect_text "$seg")"
+        _cp_git_seg_exec_unsafe "$protseg" && return 0
+        ;;
+      ALLOW) : ;;
+      *)
+        _cp_bashlex_log_once "helper emitted an unrecognized line — failing closed: $line"
+        return 0 ;;
+    esac
+  done <<<"$out"
   return 1
 }
 _cp_find_word_injection_present() {     # raw -> 0 if a segment's resolved command word is mixed/partially quoted, or is find (bare or cleanly-quoted) with an unsafe unquoted word in its own argv, or a command-substitution body resolves to an unsafe find invocation
@@ -6452,6 +6768,13 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   _cp_exec_assign_present "$raw" &&
     _cp_consider 1 "command text assigns HOME/XDG_CONFIG_HOME/PATH ahead of a command — it can redirect where git finds its config or the programs it shells out to"
 
+  # escalate — follow-up to #261 round 6 (Main's live run, I-libxo-env/
+  # I-libxo-top/I-perl5opt): LIBXO_OPTIONS/PERL5OPT/PERL5LIB assigned
+  # anywhere ahead of any command. See `_cp_injection_env_assign_present`'s
+  # own header, just above `_cp_dynamic_assign_name_present`.
+  _cp_injection_env_assign_present "$raw" &&
+    _cp_consider 1 "command text assigns LIBXO_OPTIONS/PERL5OPT/PERL5LIB ahead of a command — it can inject libxo encoder output or a perl -M module into whatever that command (or anything it shells out to) runs"
+
   # escalate — round 3 (SPEC #261 r3, N3): an unquoted expansion sitting
   # anywhere in find's own argv can inject a brand-new `-exec` primary at
   # runtime that `_cp_find_exec_unsafe`'s token walk never sees. See
@@ -6459,6 +6782,34 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   # `_cp_exec_name_or_opaque_present`, for why this has to run on raw text.
   _cp_find_word_injection_present "$raw" &&
     _cp_consider 1 "command text names find and also carries an unquoted \$ or backtick expansion — it can inject a new -exec clause find's own argv parsing never sees"
+
+  # escalate — SPEC round 2 (PR #264): a find/git token anywhere in the
+  # text combined with `$`, a backtick, `<`, `>`, a quote character or a
+  # backslash ANYWHERE in the raw text — no position/spelling anchor.
+  # This one rule now also covers what the round-6 version split into a
+  # separate quote-wrapped-launcher check (`_cp_find_wrapped_quote_
+  # present`, removed: any quote anywhere already escalates here, a
+  # strict superset). See `_cp_findgit_blunt_present`'s own header, just
+  # above `_cp_find_word_injection_present`.
+  _cp_findgit_blunt_present "$raw" &&
+    _cp_consider 1 "find/git combined with substitution, redirect or quoting: a conductor must review it"
+
+  # escalate — round 2 of this follow-up (Main's live run, KW-coproc/
+  # G-coproc): any segment whose first word is `coproc`, unconditionally.
+  # See `_cp_coproc_present`'s own header, just below
+  # `_cp_findgit_blunt_present`.
+  _cp_coproc_present "$raw" &&
+    _cp_consider 1 "coproc starts a background process this policy cannot see ahead of time: a conductor must review it"
+
+  # escalate — SPEC #264 round 3: a real parser (bashlex) resolves a
+  # find/git/fd invocation's spelling the way bash itself does — a
+  # backslash-newline inside the verb, an extglob pattern, a quote
+  # splice, an empty-expansion splice — none of which any position- or
+  # spelling-based text scan above can see. See
+  # `_cp_bashlex_findgit_present`'s own header, just below
+  # `_cp_coproc_present`.
+  _cp_bashlex_findgit_present "$raw" &&
+    _cp_consider 1 "a parser-resolved find/git/fd invocation, or a command word a parser could not resolve statically, needs a conductor's review"
 
   # escalate — round 9 (herdr-control#254 PR comment, round-8 review item
   # A): an assignment builtin (`export`/`declare`/`typeset`/`local`/
@@ -6572,9 +6923,16 @@ classify_command() {                    # <panel/command text> [worktree] [manif
     _cp_consider 1 "recursive chmod can strip protection from an entire tree"
 
   # escalate — find piping into rm/-delete walks and deletes a whole tree,
-  # same blast radius as recursive rm but a different verb.
-  { _cp_match '\bfind\b' "$norm" && _cp_match '(-delete\b|-exec[[:space:]]+rm\b)' "$norm"; } &&
-    _cp_consider 1 "find -delete / -exec rm walks and deletes a whole tree"
+  # same blast radius as recursive rm but a different verb. Follow-up to
+  # #261 round 6 (Main's live run, W-fprint/W-fls): -fprint/-fprint0/
+  # -fprintf/-fls are find's own WRITE primitives (they open and write the
+  # named output file themselves, same write capability as a shell
+  # redirect, just spelled as a find flag instead) — same unconditional
+  # text-anywhere treatment as -delete/-exec rm, not narrowed to this
+  # file's other find-argv machinery.
+  { _cp_match '\bfind\b' "$norm" &&
+    _cp_match '(-delete\b|-fprint0?\b|-fprintf\b|-fls\b|-exec[[:space:]]+rm\b)' "$norm"; } &&
+    _cp_consider 1 "find -delete/-fprint/-fprintf/-fls/-exec rm walks and deletes or writes an output file across a whole tree"
 
   # escalate — git push --force/-f rewrites remote history other people may
   # already have pulled; the target branch needs a human's eyes, not an
