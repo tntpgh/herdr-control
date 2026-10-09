@@ -231,11 +231,13 @@ Built now (this PR):
   webhook paths, high-entropy bare positional tokens, Authorization headers,
   `curl -u user:pass`, `mysql -p…`, `sshpass -p`,
   `--password/--token/--api-key` values, `*KEY/TOKEN/SECRET/PASSWORD*=` in any
-  case, URL userinfo and private-key
-  blocks. Generic shape matching deliberately preserves option/assignment
-  names and common audit ids (commit hashes, UUIDs, herdr ids, and file names).
-  Its ceiling: unknown values under 20 characters, all digits, all one case, or
-  shorter punctuation-delimited pieces need a provider-specific pattern.
+  case, URL userinfo and private-key blocks. Shell values consume one quoted
+  atom or stop before command metacharacters, so redaction cannot hide a
+  following command. Generic shape matching deliberately preserves
+  option/assignment names and common audit ids (commit hashes, UUIDs, herdr
+  ids, and file names). Its ceiling: unknown values under 20 characters, all
+  digits, all one case, or shorter punctuation-delimited pieces need a
+  provider-specific pattern.
 - **Storage: a separate file**, `pretool-shadow.sqlite3`, beside the registry
   (table `pretool_verdicts`). The shadow reads the control-plane registry
   read-only and never runs `registry_init`, so a burst of parallel tool calls

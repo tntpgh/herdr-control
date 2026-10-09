@@ -89,9 +89,12 @@ fi
 
 PS_CMD_CAP=2000
 
-# Storage-boundary redactor. Specific credential formats run first. The generic
-# pass only replaces a value-like token, never a leading option/assignment NAME,
-# and preserves common audit identifiers (sha/UUID/herdr ids).
+# Storage-boundary redactor. Specific credential formats run first. Shell
+# credential-value matches consume one quoted atom or stop before command
+# metacharacters, so redaction cannot hide review-relevant command structure.
+# The generic pass replaces only a value-like token, never a leading
+# option/assignment NAME, and preserves common audit identifiers
+# (sha/UUID/herdr ids).
 #
 # ceiling: an unknown secret under 20 characters, all digits, all one case, or
 # split into sub-20-character pieces by punctuation is not detectable by shape
@@ -99,23 +102,28 @@ PS_CMD_CAP=2000
 _pretool_redact() {                     # text [byte-cap] -> redacted
   local cap="${2:-0}"
   printf '%s' "$1" | PS_REDACT_CAP="$cap" LC_ALL=C perl -0777 -pe '
+    my $shell_atom = qr/(?:\x27[^\x27]*\x27|"[^"\$\x60]*"|(?:\\.|[^\s;&|<>()\$\x60\x27"])+)/;
     s/\b(?:sk|rk|pk)[-_](?:live|test)?[-_]?[A-Za-z0-9]{12,}/[redacted-key]/g;
     s/\b(?:gh[posru]|xox[baprs]|github_pat)[-_][A-Za-z0-9_]{16,}/[redacted-token]/g;
     s/\bAKIA[0-9A-Z]{12,}/[redacted-aws]/g;
     s/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/[redacted-jwt]/g;
     s/-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)/[redacted-private-key]/gs;
-    s/(authorization\s*:\s*)[^\x27"\n]+/$1\[redacted]/gi;
     s/\b(bearer|basic|token)(\s+)[A-Za-z0-9._~+\/=-]{8,}/$1$2\[redacted]/gi;
-    s#(://)[^/@\s]+:[^/@\s]+@#$1\[redacted]@#g;
-    s/((?:^|\s)(?:-u|--user|--proxy-user)(?:\s+|=)?)[\x27"]?[^\s:\x27"]*:[^\s\x27"]+[\x27"]?/$1\[redacted]/g;
-    s/(\b(?:mysql|mysqldump|mariadb|mysqladmin)\b[^|;&\n]*?\s-p)(?!\s)[^\s]+/$1\[redacted]/gi;
-    s/(\bsshpass\s+-p\s*)\S+/$1\[redacted]/gi;
-    s/(--[A-Za-z0-9-]*(?:password|passwd|passphrase|token|secret|api-?key|auth)[A-Za-z0-9-]*(?:=|\s+))\S+/$1\[redacted]/gi;
+    s/(\x27[^\x27\n]*?authorization\s*:\s*)[^\x27\n]+(\x27)/$1\[redacted]$2/gi;
+    s/("[^"\$\x60\n]*?authorization\s*:\s*)[^"\$\x60\n]+(")/$1\[redacted]$2/gi;
+    s/(authorization\s*:\s*)$shell_atom/$1\[redacted]/gi;
+    s#(\x27[^\x27\n]*?://)[^/@\x27\n]+:[^/@\x27\n]+@#$1\[redacted]@#g;
+    s#("[^"\$\x60\n]*?://)[^/@"\$\x60\n]+:[^/@"\$\x60\n]+@#$1\[redacted]@#g;
+    s#(://)[^/@\s;&|<>()\$\x60\x27"]+:[^/@\s;&|<>()\$\x60\x27"]+@#$1\[redacted]@#g;
+    s/((?:^|\s)(?:-u|--user|--proxy-user)(?:\s+|=)?)$shell_atom/$1\[redacted]/g;
+    s/(\b(?:mysql|mysqldump|mariadb|mysqladmin)\b[^|;&\n]*?\s-p)(?!\s)$shell_atom/$1\[redacted]/gi;
+    s/(\bsshpass\s+-p\s*)$shell_atom/$1\[redacted]/gi;
+    s/(--[A-Za-z0-9-]*(?:password|passwd|passphrase|token|secret|api-?key|auth)[A-Za-z0-9-]*(?:=|\s+))$shell_atom/$1\[redacted]/gi;
     s/(["\x27]?[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|token|password|passwd|passphrase|secret|credential|auth)[A-Za-z0-9_.-]*["\x27]?\s*:\s*["\x27])([^"\x27]*)(["\x27])/$1\[redacted]$3/gi;
-    s/(\b[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|token|password|passwd|passphrase|secret|credential|auth)[A-Za-z0-9_]*\s*[=:]\s*)[^\s]+/$1\[redacted]/gi;
-    s#((?:hooks\.slack\.com/services/)[^/\s]+/[^/\s]+/)[^/?\s"\x27]+#$1[redacted-token]#gi;
-    s#((?:discord(?:app)?\.com/api/webhooks/)[^/\s]+/)[^/?\s"\x27]+#$1[redacted-token]#gi;
-    s#(api\.telegram\.org/bot)[^/\s"\x27]+#$1[redacted-token]#gi;
+    s/(\b[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|token|password|passwd|passphrase|secret|credential|auth)[A-Za-z0-9_]*\s*[=:]\s*)$shell_atom/$1\[redacted]/gi;
+    s#((?:hooks\.slack\.com/services/)[^/\s;&|<>()\$\x60]+/[^/\s;&|<>()\$\x60]+/)[^/?\s;&|<>()\$\x60"\x27]+#$1[redacted-token]#gi;
+    s#((?:discord(?:app)?\.com/api/webhooks/)[^/\s;&|<>()\$\x60]+/)[^/?\s;&|<>()\$\x60"\x27]+#$1[redacted-token]#gi;
+    s#(api\.telegram\.org/bot)[^/\s;&|<>()\$\x60"\x27]+#$1[redacted-token]#gi;
     s{(?<![A-Za-z0-9/+])([A-Za-z0-9/+]{40})(?![A-Za-z0-9/+])}{
       my $t = $1;
       ($t =~ /[A-Z]/ && $t =~ /[a-z]/ && ($t =~ /[0-9]/ || $t =~ m{[\/+]}))

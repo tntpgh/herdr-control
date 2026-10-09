@@ -200,6 +200,20 @@ structure_rows="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts
     AND instr(payload,'LONG2_MixedConfigName=[redacted-token]')>0;")"
 [ "$structure_rows" = 1 ] && ok "generic redaction preserves option and assignment names" \
   || not_ok "generic redaction erased review structure"
+shell_structure="TOKEN=$structure_secret;touch /tmp/redaction-probe --api-key='$structure_secret;literal';touch /tmp/quoted-redaction-probe DYNAMIC_TOKEN=$structure_secret\$(id);touch /tmp/dynamic-redaction-probe"
+shell_redacted="$(bash -c '. "$1/lib/pretool-shadow.sh"; _pretool_redact_full "$2"' _ "$here" "$shell_structure")"
+[ "$shell_redacted" = 'TOKEN=[redacted];touch /tmp/redaction-probe --api-key=[redacted];touch /tmp/quoted-redaction-probe DYNAMIC_TOKEN=[redacted]$(id);touch /tmp/dynamic-redaction-probe' ] \
+  && ok "redaction preserves quotes, substitutions, and following-command structure" \
+  || not_ok "redaction erased shell structure: $shell_redacted"
+provider_structure_cmd="curl -H \"Authorization: Bearer $structure_secret;literal\" \"https://user:$structure_secret;literal@127.0.0.1/x\";touch /tmp/provider-redaction-probe"
+bash_payload "$provider_structure_cmd" secproviderstructure | shadow --record >/dev/null
+provider_structure_rows="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts
+  WHERE json_extract(payload,'\$.call_id')='secproviderstructure'
+    AND instr(json_extract(payload,'\$.command'),'$structure_secret')=0
+    AND instr(json_extract(payload,'\$.command'),char(34)||'Authorization: [redacted]'||char(34))>0
+    AND instr(json_extract(payload,'\$.command'),char(34)||'https://[redacted]@127.0.0.1/x'||char(34)||';touch /tmp/provider-redaction-probe')>0;")"
+[ "$provider_structure_rows" = 1 ] && ok "header and URL redaction preserve quoted data and following commands" \
+  || not_ok "provider redaction leaked or erased command structure"
 audit_ids="task_20261009T154116Z_11479_30916 0123456789abcdef0123456789abcdef01234567 550e8400-e29b-41d4-a716-446655440000 verify-command-policy-r34.sh"
 bash_payload "printf %s '$audit_ids'" secaudit | shadow --record >/dev/null
 audit_rows="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts

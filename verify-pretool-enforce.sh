@@ -708,7 +708,7 @@ request_stripe="sk_""live_""A1b2C3d4E5f6G7h8"
 request_bare="wJalrXUtnFEMIFAKEKEYFAKEKEYbPxRfiCYFAKEKEY"
 request_aws="wJalrXUtnFEMI/""K7MDENG/""bPxRfiCYEXAMPLEKEY"
 request_padding="$(printf 'p%.0s' $(seq 1 2100))"
-request_command="$ESC # $request_padding $request_stripe $request_bare --pluginMode2MixedCaseName=$request_bare LONG2_MixedConfigName=$request_bare"
+request_command="$ESC # $request_padding $request_stripe $request_bare --pluginMode2MixedCaseName=$request_bare LONG2_MixedConfigName=$request_bare TOKEN=$request_bare;touch /tmp/request-structure"
 request_input="$(jq -nc --arg c "$request_command" --arg i run --arg e "$request_aws" \
   '{command:$c,i:$i,env:{BASH_ENV:$e}}')"
 out="$(enf bash "$request_input")"; rc=$?
@@ -723,6 +723,7 @@ request_shape="$(q "SELECT count(*) FROM action_requests WHERE request_id='$requ
   AND instr(command,'[redacted-key]')>0 AND instr(command,'[redacted-token]')>0
   AND instr(command,'--pluginMode2MixedCaseName=[redacted-token]')>0
   AND instr(command,'LONG2_MixedConfigName=[redacted-token]')>0
+  AND instr(command,'TOKEN=[redacted];touch /tmp/request-structure')>0
   AND instr(command,'[env] BASH_ENV=[redacted-token]')>0;")"
 [ "$rc" = 8 ] && [ -n "$request_rid" ] && [ "$request_leaks" = 0 ] && [ "$request_shape" = 1 ] \
   && ok "action request keeps complete review structure while redacting command, env, and event" \
