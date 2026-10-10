@@ -547,6 +547,37 @@ test("late held and accepted target evidence from failed/timed-out/cancelled row
   }
 });
 
+test("cancelled snapshot preserves timeout provenance after late binding of an unbound launch", () => {
+  for (const receiptKind of ["bound", "launched"]) {
+    const f = fixture(); const config = { ...CONFIG, caps: { ...CONFIG.caps, max_minutes: 1 } };
+    sync(f, config); const started = start(f); assert.equal(started.ok, true);
+    const command = sync(f, config)[0]; const original = commandRow(f, command);
+    const acks = receiverAcks(command);
+    if (receiptKind === "bound") sync(f, config, NOW, false, [acks.accepted_receipt]);
+    sync(f, config, NOW + 60_001, false);
+    assert.equal(task(f, started.remote_task_id).state, "timed_out");
+    assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM task_events WHERE type='timed_out'").one().n, 1);
+    assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM task_events WHERE type='timeout_detected'").one().n, 0);
+    const stopped = body(config, false, [acks[receiptKind]]);
+    stopped.snapshot.tasks = [{ task_id: acks.bound.local_task_id, run_id: acks.bound.local_run_id,
+      label: "fixture", project: "fixture-repo", repo: "fixture-repo", branch: acks.bound.branch,
+      state: "cancelled", stored_state: "cancelled", state_source: "live",
+      created_at: new Date(NOW).toISOString(), updated_at: new Date(NOW + 60_002).toISOString(),
+      completed_at: new Date(NOW + 60_002).toISOString(), closure_reason: "cancelled", closure_proof: null,
+      pane_id: null, agent_id: null, agent_live: false, has_result: false, remote_task_id: started.remote_task_id }];
+    const resolved = f.state.sync(NOW + 60_002, crypto.randomUUID(), JSON.stringify(stopped), GATE, GATE, GATE);
+    assert.equal(resolved.ok, true); assert.equal(task(f, started.remote_task_id).state, "timed_out");
+    assert.equal(task(f, started.remote_task_id).local_task_id, acks.bound.local_task_id);
+    const after = commandRow(f, command);
+    assert.equal(after.authorization, original.authorization); assert.equal(after.expires_at, original.expires_at);
+    assert.equal(after.attempts, original.attempts); assert.equal(after.outcome, receiptKind === "bound" ? "held" : "accepted");
+    assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM commands WHERE op IN ('start','resume')").one().n, 1);
+    assert.equal(cancelCount(f), 1);
+    assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM task_events WHERE type='state_changed' AND json_extract(detail,'$.state')='running'").one().n, 0);
+    f.db.close();
+  }
+});
+
 test("lost stop ACK expires into bounded retry while original launch receipt stays fixed", () => {
   const { f, command, acks, taskId } = pendingFixture();
   sync(f, CONFIG, NOW, false, [acks.accepted_receipt]);

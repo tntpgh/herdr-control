@@ -1890,7 +1890,7 @@ export class HerdrState extends DurableObject<Env> {
         // reports once the Mac confirms it stopped.
         const finalState = mapped === "cancelled" && rt.state === "cancelling"
           && this.sql.exec<{ n: number }>(
-            `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='timeout_detected'`, rt.remote_task_id).one().n > 0
+            `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type IN ('timeout_detected','timed_out')`, rt.remote_task_id).one().n > 0
           ? "timed_out" : mapped;
         this.sql.exec(`UPDATE remote_tasks SET state=?, updated_at=? WHERE remote_task_id=?`, finalState, nowMs, rt.remote_task_id);
         this.recordTaskEvent(nowMs, rt.remote_task_id, finalState === "waiting_approval" ? "approval_needed" : "state_changed", { state: finalState });
