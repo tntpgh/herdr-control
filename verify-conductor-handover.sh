@@ -88,7 +88,7 @@ herdr() {
         # pane the current test wants to act as the caller.
         printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"name":"omp","cmdline":"omp --model sonnet"}]}}}\n' "$TEST_PID"
       else
-        printf '{"result":{"process_info":{"foreground_processes":[{"name":"omp","cmdline":"omp --model sonnet"}]}}}\n'
+        printf '{"result":{"process_info":{"foreground_processes":[{"pid":2147483000,"name":"omp","cmdline":"omp --model sonnet"}]}}}\n'
       fi ;;
     "pane list")
       # FAIL_PANE_LIST simulates a herdr read failure for the

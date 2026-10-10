@@ -52,7 +52,7 @@ export BIRTH_M1=gen_m1 BIRTH_M2=gen_m2 BIRTH_SH=gen_sh BIRTH_W1=gen_w1 \
 export AGENT_M1=1 AGENT_M2=1 AGENT_SH=0 AGENT_W1=1 AGENT_H1=1 AGENT_F1=1 AGENT_R1=1 AGENT_A=1 AGENT_B=1
 reset_pids() {
   local p
-  for p in M1 M2 SH W1 H1 F1 R1 A B; do eval "export PID_$p=0"; done
+  for p in M1 M2 SH W1 H1 F1 R1 A B; do eval "export PID_$p=2147483000"; done
 }
 # Exactly this pane's foreground job is a REAL ancestor of the calling
 # process -- the only pane caller_pane_from_ancestry will resolve to.

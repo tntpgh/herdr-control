@@ -202,18 +202,33 @@ _pg_process_ancestors() {   # -> $PPID, its parent, ... one pid per line
 #            the only rc designate-main.sh's --force may treat as "outside
 #            herdr's reach" (see note above).
 caller_pane_from_ancestry() {
-  local panes pane_ids p map ancestors pid found
+  local panes pane_ids p info rows map ancestors pid found
   panes="$(herdr pane list 2>/dev/null)" || return 1
   [ -n "$panes" ] || return 1
-  pane_ids="$(printf '%s' "$panes" | jq -r '(.result.panes // .panes)[]?.pane_id' 2>/dev/null)"
+  pane_ids="$(printf '%s' "$panes" | jq -sr '
+    if length != 1 then error("expected one pane inventory") else .[0] end
+    | (.result.panes // .panes)
+    | if type == "array" and all(.[];
+        type == "object" and (.pane_id | type == "string")
+        and (.pane_id | test("^[^[:space:]]+$")))
+      then .[].pane_id else error("invalid pane inventory") end' 2>/dev/null)" || return 1
   [ -n "$pane_ids" ] || return 1
   map=""
   for p in $pane_ids; do
-    local info
     info="$(herdr pane process-info --pane "$p" 2>/dev/null)" || return 1
+    # A missing/malformed response is unknown identity, not a clean no-match.
+    # Validate the whole array before emitting any row and preserve jq failure;
+    # rc=2 is a security-sensitive proof consumed by designate-main --force.
+    rows="$(printf '%s' "$info" | jq -sr --arg pane "$p" '
+      if length != 1 then error("expected one process response") else .[0] end
+      | .result.process_info.foreground_processes
+      | if type == "array" and all(.[];
+          type == "object" and (.pid | type == "number")
+          and (.pid > 0 and .pid == (.pid | floor)))
+        then .[] | (.pid | tostring) + " " + $pane
+        else error("invalid foreground process inventory") end' 2>/dev/null)" || return 1
     map="$map
-$(printf '%s' "$info" | jq -r --arg pane "$p" \
-      '.result.process_info.foreground_processes[]? | (.pid|tostring) + " " + $pane' 2>/dev/null)"
+$rows"
   done
   ancestors="$(_pg_process_ancestors)" || return 1
   [ -n "$ancestors" ] || return 1
