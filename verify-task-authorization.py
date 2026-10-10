@@ -53,6 +53,15 @@ class RegistryAuthorization(unittest.TestCase):
                 self.assertIn(reason, p.stderr)
         return p
 
+    def call_raw(self, op, *args):
+        """Same subprocess invocation as call(), with no stderr assertion --
+        for confirm-ack's own benign non-exceptional dict results
+        (unknown/conflict), which exit 1 but print JSON to stdout, never
+        'authorization hold: ' to stderr (that marker is reserved for an
+        actual Refused exception)."""
+        return subprocess.run([sys.executable, str(HELPER), str(self.db), op, *args],
+                              text=True, capture_output=True)
+
     def query(self, sql, args=()):
         with sqlite3.connect(self.db) as db:
             return db.execute(sql, args).fetchall()
@@ -144,13 +153,13 @@ class RegistryAuthorization(unittest.TestCase):
         self.execute("DROP TABLE task_authorizations")
         self.execute("UPDATE schema_meta SET value='10' WHERE key='schema_version'")
         self.sh("registry_init")
-        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("11",)])
+        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("12",)])
         self.assertEqual(self.query("SELECT type,payload FROM events ORDER BY sequence"), history)
         self.call("check", canonical(task), ok=False, reason="missing verified task source")
         self.assertEqual(self.query("SELECT COUNT(*) FROM task_authorizations"), [(0,)])
         self.assertNotIn("manifest_approved", [r[0] for r in history])
         self.assertNotIn("approved_by", canonical(history))
-        backups = list(self.db.parent.glob("registry.sqlite3.*.v11.bak"))
+        backups = list(self.db.parent.glob("registry.sqlite3.*.v12.bak"))
         self.assertEqual(len(backups), 1)
         with sqlite3.connect(backups[0]) as old:
             self.assertEqual(old.execute("PRAGMA integrity_check").fetchone(), ("ok",))
@@ -188,27 +197,27 @@ class RegistryAuthorization(unittest.TestCase):
         self.assertIn("ready=0", p.stdout)
         self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("10",)])
         self.assertEqual(self.query("SELECT name FROM sqlite_master WHERE name='task_authorizations'"), [])
-        self.assertEqual(list(self.db.parent.glob("registry.sqlite3.*.v11.bak")), [])
+        self.assertEqual(list(self.db.parent.glob("registry.sqlite3.*.v12.bak")), [])
         self.sh("registry_init")  # No stale lock or partial migration remains.
 
     def test_migration_schema_failure_keeps_verified_backup_and_rolls_back(self):
         self.execute("DROP TABLE task_authorizations")
         self.execute("UPDATE schema_meta SET value='10' WHERE key='schema_version'")
-        self.execute("CREATE TRIGGER reject_fixture_stamp BEFORE UPDATE ON schema_meta WHEN NEW.value='11' BEGIN SELECT RAISE(ABORT,'fixture stamp failure'); END")
+        self.execute("CREATE TRIGGER reject_fixture_stamp BEFORE UPDATE ON schema_meta WHEN NEW.value='12' BEGIN SELECT RAISE(ABORT,'fixture stamp failure'); END")
         p = self.sh('registry_init; rc=$?; printf "ready=%s\\n" "$_HERDR_REGISTRY_READY"; exit "$rc"', ok=False)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("fixture stamp failure", p.stderr)
         self.assertIn("ready=0", p.stdout)
         self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("10",)])
         self.assertEqual(self.query("SELECT name FROM sqlite_master WHERE name='task_authorizations'"), [])
-        backups = list(self.db.parent.glob("registry.sqlite3.*.v11.bak"))
+        backups = list(self.db.parent.glob("registry.sqlite3.*.v12.bak"))
         self.assertEqual(len(backups), 1)
         with sqlite3.connect(backups[0]) as saved:
             self.assertEqual(saved.execute("PRAGMA integrity_check").fetchone(), ("ok",))
             self.assertEqual(saved.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone(), ("10",))
         self.execute("DROP TRIGGER reject_fixture_stamp")
         self.sh("registry_init")
-        self.assertEqual(len(list(self.db.parent.glob("registry.sqlite3.*.v11.bak"))), 2)
+        self.assertEqual(len(list(self.db.parent.glob("registry.sqlite3.*.v12.bak"))), 2)
 
     def test_remote_source_is_not_main_approval(self):
         cmd, claims, task = self.launch()
@@ -288,7 +297,7 @@ class RegistryAuthorization(unittest.TestCase):
         self.assertTrue(all(rc == 0 for rc, _, _ in outcomes), outcomes)
         self.assertEqual(self.query("PRAGMA integrity_check"), [("ok",)])
         self.assertEqual(self.query("SELECT count(*) FROM task_authorizations"), [(0,)])
-        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("11",)])
+        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("12",)])
 
     def test_parallel_shell_initializers_share_cold_registry(self):
         for attempt in range(10):
@@ -304,9 +313,9 @@ class RegistryAuthorization(unittest.TestCase):
             with self.subTest(attempt=attempt):
                 self.execute("DROP TABLE task_authorizations")
                 self.execute("UPDATE schema_meta SET value='10' WHERE key='schema_version'")
-                before = set(self.db.parent.glob("registry.sqlite3.*.v11.bak"))
+                before = set(self.db.parent.glob("registry.sqlite3.*.v12.bak"))
                 self.parallel_initializers()
-                added = set(self.db.parent.glob("registry.sqlite3.*.v11.bak")) - before
+                added = set(self.db.parent.glob("registry.sqlite3.*.v12.bak")) - before
                 self.assertEqual(len(added), 1)
                 with sqlite3.connect(added.pop()) as saved:
                     self.assertEqual(saved.execute("PRAGMA integrity_check").fetchone(), ("ok",))
@@ -475,6 +484,126 @@ class RegistryAuthorization(unittest.TestCase):
         self.execute("DELETE FROM task_worktree_reservations")
         self.call("launch", cmd["command_id"], task["task_id"], task["run_id"], "launch_claimed", ok=False,
                   reason="does not own this exact worktree mutation")
+
+    # ── slice 3: receipt-to-ack recovery (dot-herdr-recovery-slices.md §3) ──
+    def _revision(self, command_id):
+        row = self.query("SELECT revision,acked_revision FROM task_authorizations WHERE command_id=?", (command_id,))
+        return row[0] if row else (None, None)
+
+    def test_revision_is_an_exact_monotonic_stage_counter(self):
+        """accepted=1, bound=2, launch_claimed=3, launched=4 -- set by the
+        SAME transaction that advances status, never derived at read time."""
+        cmd, claims, row = self.accept()
+        self.assertEqual(self._revision(cmd["command_id"]), (1, 0))
+        task = self.task()
+        self.call("register", canonical(task), cmd["command_id"])
+        self.assertEqual(self._revision(cmd["command_id"]), (2, 0))
+        self.call("launch", cmd["command_id"], task["task_id"], task["run_id"], "launch_claimed")
+        self.assertEqual(self._revision(cmd["command_id"]), (3, 0))
+        self.call("launch", cmd["command_id"], task["task_id"], task["run_id"], "launched")
+        self.assertEqual(self._revision(cmd["command_id"]), (4, 0))
+
+    def test_pending_acks_enumerates_the_unconfirmed_receipt(self):
+        cmd, claims, row = self.accept()
+        pending = json.loads(self.call("pending-acks").stdout)
+        self.assertIn(cmd["command_id"], [p["command_id"] for p in pending])
+        mine = next(p for p in pending if p["command_id"] == cmd["command_id"])
+        self.assertEqual((mine["revision"], mine["acked_revision"]), (1, 0))
+
+    def test_confirm_ack_recorded_then_idempotent_already_recorded(self):
+        cmd, claims, row = self.accept()
+        first = json.loads(self.call("confirm-ack", cmd["command_id"], "1").stdout)
+        self.assertEqual(first["result"], "recorded")
+        self.assertEqual(self._revision(cmd["command_id"]), (1, 1))
+        retry = json.loads(self.call("confirm-ack", cmd["command_id"], "1").stdout)
+        self.assertEqual(retry["result"], "already_recorded")
+        self.assertEqual(self._revision(cmd["command_id"]), (1, 1))
+
+    def test_confirm_ack_unknown_command_id(self):
+        result = json.loads(self.call_raw("confirm-ack", "cmd_never_existed", "1").stdout)
+        self.assertEqual(result["result"], "unknown")
+
+    def test_confirm_ack_invalid_revision_is_refused(self):
+        cmd, claims, row = self.accept()
+        self.call("confirm-ack", cmd["command_id"], "0", ok=False, reason="invalid acknowledgement revision")
+        self.call("confirm-ack", cmd["command_id"], "not-a-number", ok=False, reason="invalid acknowledgement revision")
+
+    def test_pending_acks_excludes_a_fully_confirmed_receipt(self):
+        cmd, claims, row = self.accept()
+        self.call("confirm-ack", cmd["command_id"], "1")
+        pending = json.loads(self.call("pending-acks").stdout)
+        self.assertNotIn(cmd["command_id"], [p["command_id"] for p in pending])
+
+    def test_pending_acks_enumeration_is_bounded(self):
+        for i in range(1, 6):
+            self.accept(str(i))
+        limited = json.loads(self.call("pending-acks", "2").stdout)
+        self.assertEqual(len(limited), 2)
+        self.call("pending-acks", "0", ok=False, reason="invalid pending-ack enumeration limit")
+
+    def test_crash_after_launch_still_enumerates_the_unconfirmed_launch(self):
+        """Proves the specific gap this slice exists to close: 'the protected
+        receipt can reach launched before the publisher saves
+        pending_command_acks'. No save_state()/local cache exists in this
+        fixture at all -- pending_acks() must recover the unconfirmed ack
+        from the registry alone, with no dependence on any side cache."""
+        cmd, claims, task = self.launch()  # commits straight through to 'launched', revision=4
+        self.assertEqual(self._revision(cmd["command_id"]), (4, 0))
+        pending = json.loads(self.call("pending-acks").stdout)
+        mine = next(p for p in pending if p["command_id"] == cmd["command_id"])
+        self.assertEqual(mine["status"], "launched")
+        self.assertEqual(mine["revision"], 4)
+
+    def test_an_older_held_response_cannot_confirm_a_newer_launched_revision(self):
+        """A publisher that sent an ack at revision=3 (launch_claimed), then
+        crashed and restarted before the registry advanced to revision=4
+        (launched), must never have that STALE revision=3 confirmation
+        silently accepted once the live receipt has moved on -- it must
+        come back 'conflict', naming the CURRENT revision, not 'recorded'."""
+        cmd, claims, task = self.bind()
+        self.call("launch", cmd["command_id"], task["task_id"], task["run_id"], "launch_claimed")
+        self.assertEqual(self._revision(cmd["command_id"]), (3, 0))
+        self.call("launch", cmd["command_id"], task["task_id"], task["run_id"], "launched")
+        self.assertEqual(self._revision(cmd["command_id"]), (4, 0))
+        stale = json.loads(self.call_raw("confirm-ack", cmd["command_id"], "3").stdout)
+        self.assertEqual(stale["result"], "conflict")
+        self.assertEqual(stale["current_revision"], 4)
+        self.assertEqual(self._revision(cmd["command_id"]), (4, 0))  # unchanged: no confirmation recorded
+        current = json.loads(self.call("confirm-ack", cmd["command_id"], "4").stdout)
+        self.assertEqual(current["result"], "recorded")
+        self.assertEqual(self._revision(cmd["command_id"]), (4, 4))
+
+    def test_crash_after_each_receipt_phase_leaves_an_exactly_matching_pending_ack(self):
+        """One scratch registry per phase (accepted/bound/launch_claimed/
+        launched), simulating a crash immediately after that phase commits
+        and before any ack is ever sent -- pending_acks() must name EXACTLY
+        that phase's own revision, never a stale or guessed one, and
+        confirm-ack at that exact revision must be the only one that
+        succeeds."""
+        phases = [
+            ("accepted", lambda suffix: self.accept(suffix)[0]["command_id"], 1),
+            ("bound", lambda suffix: self.bind(suffix)[0]["command_id"], 2),
+            ("launch_claimed", self._to_launch_claimed, 3),
+            ("launched", lambda suffix: self.launch(suffix)[0]["command_id"], 4),
+        ]
+        for idx, (phase, make, expected_revision) in enumerate(phases, start=1):
+            with self.subTest(phase=phase):
+                suffix = str(100 + idx)
+                cid = make(suffix)
+                self.assertEqual(self._revision(cid)[0], expected_revision)
+                pending = json.loads(self.call("pending-acks", "1000").stdout)
+                mine = next(p for p in pending if p["command_id"] == cid)
+                self.assertEqual(mine["revision"], expected_revision)
+                for wrong in (r for r in (1, 2, 3, 4) if r != expected_revision):
+                    bad = json.loads(self.call_raw("confirm-ack", cid, str(wrong)).stdout)
+                    self.assertEqual(bad["result"], "conflict", (phase, wrong))
+                ok = json.loads(self.call("confirm-ack", cid, str(expected_revision)).stdout)
+                self.assertEqual(ok["result"], "recorded")
+
+    def _to_launch_claimed(self, suffix):
+        cmd, claims, task = self.bind(suffix)
+        self.call("launch", cmd["command_id"], task["task_id"], task["run_id"], "launch_claimed")
+        return cmd["command_id"]
 
 
 if __name__ == "__main__":

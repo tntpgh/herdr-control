@@ -68,6 +68,9 @@ const SyncSchema = z.object({
     command_id: str, outcome: z.enum(["accepted", "refused", "failed", "held"]), detail: str,
     local_task_id: str.optional(), local_run_id: str.optional(), branch: str.optional(),
     pane_id: str.optional(), agent_id: str.optional(), capability_probe: z.record(z.string(), z.boolean()).optional(),
+    // Receipt-to-ack recovery (§3): present only when this ack came from the
+    // registry's durable revision/acked_revision CAS, never minted here.
+    revision: z.number().int().positive().optional(),
   })).max(200).optional(),
   owner_acks: z.array(z.object({
     exchange_id: str, outcome: z.enum(["delivered", "blocked"]), reason: str.optional(),
@@ -117,6 +120,13 @@ export interface SyncResponse {
   // exchange_id alone would let a reply misfiled under the wrong label
   // directory be matched against a DIFFERENT exchange's real result.
   owner_reply_results: { exchange_id: string; owner_label: string; outcome: string }[];
+  // Receipt-to-ack recovery (dot-herdr-recovery-slices.md §3): bounded
+  // confirmation that THIS sync durably processed a command_ack carrying a
+  // `revision` -- echoed back exactly (command_id, revision), never
+  // reinterpreted. Absent/older publishers that never send a revision get
+  // nothing here and keep resending their local cache every tick, same as
+  // before this field existed -- this is purely additive.
+  command_ack_results?: { command_id: string; revision: number }[];
 }
 
 export type SyncOutcome = { ok: true; response: SyncResponse } | { ok: false; status: number; reason: string };
@@ -1396,6 +1406,14 @@ export class HerdrState extends DurableObject<Env> {
         if (stuck === 0) this.recordTaskEvent(nowMs, remoteTaskId, "cancel_stuck", { attempts: retries, reason });
       }
     };
+    // Receipt-to-ack recovery (§3): a found command row means this ack was
+    // durably read and acted on THIS sync, regardless of which branch below
+    // then did with it (held/accepted/stale/duplicate all still count as
+    // "received") -- so the Mac can stop resending that exact revision.
+    // Never recorded for a command this Worker has no row for at all: there
+    // is nothing here to confirm against.
+    const commandAckResults: { command_id: string; revision: number }[] = [];
+
 
     // start_task/cancel_task/resume_task's own acks: the Mac tells us what a
     // leased command actually did or that its outcome is still held. Local
@@ -1407,6 +1425,7 @@ export class HerdrState extends DurableObject<Env> {
         authorization: string | null; attempts: number; expires_at: number }>(
         `SELECT status, op, remote_task_id, outcome, authorization, attempts, expires_at FROM commands WHERE command_id=?`, a.command_id).toArray()[0];
       if (!c) continue;
+      if (incoming.revision !== undefined) commandAckResults.push({ command_id: incoming.command_id, revision: incoming.revision });
       const launch = c.op === "start" || c.op === "resume";
       // A retired authenticated command can still report an execution that
       // was already in flight. Recover its stop target only; never revive
@@ -1414,7 +1433,6 @@ export class HerdrState extends DurableObject<Env> {
       const late = launch && c.authorization !== null && c.attempts > 0 && c.status === "done"
         && c.outcome !== "accepted" && c.outcome !== "late_accepted" && (a.outcome === "accepted" || a.outcome === "held");
       if (c.status !== "delivering" && !late) continue;
-      if (a.outcome === "held" && !launch) continue;
       if (launch && (a.outcome === "held" || a.outcome === "accepted")) {
         const cur = this.sql.exec<{ state: string; local_task_id: string; local_run_id: string;
           branch: string; pane_id: string; agent_id: string }>(
@@ -2028,6 +2046,7 @@ export class HerdrState extends DurableObject<Env> {
         })),
         audit, audit_cursor: cursor,
         owner_reply_results: ownerReplyResults,
+        command_ack_results: commandAckResults,
       },
     };
   }

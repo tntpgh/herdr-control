@@ -643,12 +643,12 @@ try:
         current = row[0] if row else ""
         if not current.isdecimal():
             raise ValueError("invalid pre-migration schema version")
-        if int(current) < 11 and existed == "1":
+        if int(current) < 12 and existed == "1":
             # The locked connection must not back itself up while it has an
             # open write transaction. A separate read-only connection takes a
             # consistent online snapshot; the writer lock prevents any other
             # migrator from advancing its version until verification completes.
-            fd, backup = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".v11.bak",
+            fd, backup = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".v12.bak",
                                           dir=os.path.dirname(os.path.abspath(path)))
             os.close(fd)
             with storage.connect(path, readonly=True) as source, sqlite3.connect(backup) as target:
@@ -659,7 +659,7 @@ try:
             if integrity != "ok" or version != current:
                 raise ValueError("pre-migration backup failed integrity/version verification")
             verified = True
-            print(f"run-registry: backed up {path} -> {backup} before migration v11 (integrity+version verified)", file=sys.stderr)
+            print(f"run-registry: backed up {path} -> {backup} before migration v12 (integrity+version verified)", file=sys.stderr)
         # schema() uses this connection's existing transaction and commits only
         # after both DDL and the monotonic stamp succeed. Closing on error rolls
         # everything back and releases the writer lock without a stale lockfile.
@@ -670,7 +670,7 @@ except Exception as exc:
             os.unlink(backup)
         except OSError:
             pass
-    print(f"run-registry: v11 migration aborted: {exc}", file=sys.stderr)
+    print(f"run-registry: v12 migration aborted: {exc}", file=sys.stderr)
     sys.exit(1)
 PY
 }
@@ -833,6 +833,22 @@ accept_local_task_authorization() {
 }
 read_task_authorization() {
   _task_authorization_adapter read "$1"
+}
+# Slice 3 (receipt-to-ack recovery, dot-herdr-recovery-slices.md §3):
+# enumeration/confirmation are read of the SAME protected registry row the
+# accept/register/launch adapters above already write -- no new storage,
+# no admission, no spawn. publisher.py calls these INDEPENDENTLY of its own
+# local JSON ack cache, so a crash between a registry commit and
+# `save_state()` cannot silently drop an unconfirmed acknowledgement.
+pending_task_authorization_acks() {
+  if [ -n "${1:-}" ]; then
+    _task_authorization_adapter pending-acks "$1"
+  else
+    _task_authorization_adapter pending-acks
+  fi
+}
+confirm_task_authorization_ack() {
+  _task_authorization_adapter confirm-ack "$1" "$2"
 }
 reserve_task_worktree() {
   registry_init || return 1

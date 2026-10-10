@@ -296,6 +296,13 @@ export interface CommandAck {
   // Reported once, from start_task's own spawn: did this task's manifest
   // actually reach what it needs (e.g. {kb: true}) -- real, not assumed.
   capability_probe?: Record<string, boolean>;
+  // Receipt-to-ack recovery (dot-herdr-recovery-slices.md §3): present only
+  // when the Mac sourced this ack from the registry's durable
+  // revision/acked_revision CAS (either the live path or pending_acks()
+  // recovery), never invented by the Worker. Echoed back verbatim in
+  // SyncResponse.command_ack_results so the Mac can CAS-confirm the EXACT
+  // revision it sent, never a guessed or stale one.
+  revision?: number;
 }
 
 // Who queued a message: the grant's user (email) and the OAuth client.

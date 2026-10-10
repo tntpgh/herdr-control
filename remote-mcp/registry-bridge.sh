@@ -104,6 +104,12 @@ case "$cmd" in
   read-authorization)
     read_task_authorization "$1" || exit 1
     ;;
+  pending-authorization-acks)
+    pending_task_authorization_acks "$@" || exit 1
+    ;;
+  confirm-authorization-ack)
+    confirm_task_authorization_ack "$1" "$2" || exit 1
+    ;;
   reserve-worktree)
     command_json="$1" repo="$2" worktree="$3" branch="$4"
     stopped='{}'

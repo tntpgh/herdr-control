@@ -658,8 +658,12 @@ def _receipt_ack(cmd: dict, row: dict | None, root: Path, branch: str) -> dict:
     if not _receipt_matches(row, cmd):
         return {"command_id": cid, "outcome": "refused", "detail": "authorization receipt source binding mismatch"}
     status = row.get("status")
+    # Only ever a real positive int over the wire -- never `null`: an older
+    # registry row (or a test fixture with no revision column at all) must
+    # look identical to an older publisher that never sends this field.
+    revision = {"revision": row["revision"]} if isinstance(row.get("revision"), int) and row["revision"] > 0 else {}
     if status == "accepted" and not any(row.get(k) for k in ("task_id", "run_id", "worktree", "branch", "pane_id", "pane_birth")):
-        return {"command_id": cid, "outcome": "held",
+        return {"command_id": cid, "outcome": "held", **revision,
                 "detail": "outcome_unknown: source accepted, launch not yet bound; no launch retry"}
     wt = WT_ROOT / root.name / branch
     if (status not in ("bound", "launch_claimed", "launched")
@@ -668,7 +672,7 @@ def _receipt_ack(cmd: dict, row: dict | None, root: Path, branch: str) -> dict:
             or not isinstance(row.get("deadline_at"), str)
             or _parse_iso(row.get("deadline_at", "")) is None):
         return {"command_id": cid, "outcome": "refused", "detail": "authorization receipt task binding mismatch"}
-    return {"command_id": cid, "outcome": "accepted" if status == "launched" else "held",
+    return {"command_id": cid, "outcome": "accepted" if status == "launched" else "held", **revision,
             "detail": "already launched (protected receipt)" if status == "launched" else
                       "outcome_unknown: protected task binding exists, launch unconfirmed; no launch retry",
             "local_task_id": row["task_id"], "local_run_id": row["run_id"], "branch": branch,
@@ -684,6 +688,67 @@ def _read_authorization(command_id: str) -> dict | None:
         return row if isinstance(row, dict) else None
     except (ValueError, OSError, subprocess.SubprocessError):
         return None
+
+
+# ── receipt-to-ack recovery (dot-herdr-recovery-slices.md §3) ────────────────
+# "The protected receipt can reach `launched` before the publisher saves
+# `pending_command_acks`" -- a crash in that exact gap loses the LOCAL json
+# cache entry for an ack that the registry already durably decided. These
+# two functions give publisher.py a way to recover that stayed independent
+# of both the Worker's lease (no `cmd` is required or consulted) and the
+# local JSON cache: the registry row's own `revision`/`acked_revision`
+# counter IS the retained evidence, enumerated and CAS-confirmed through
+# lib/task-authorization.py (via registry-bridge.sh) the same way every
+# other protected-receipt mutation in this file already is. No admission,
+# reservation, brief, spawn or capability-probe call happens here.
+def _ack_from_registry_row(row: dict) -> dict:
+    cid = row.get("command_id", "")
+    status = row.get("status")
+    revision = {"revision": row["revision"]} if isinstance(row.get("revision"), int) and row["revision"] > 0 else {}
+    if status == "accepted" and not any(row.get(k) for k in ("task_id", "run_id", "worktree", "branch", "pane_id", "pane_birth")):
+        return {"command_id": cid, "outcome": "held", **revision,
+                "detail": "outcome_unknown: source accepted, launch not yet bound; no launch retry"}
+    if (status not in ("bound", "launch_claimed", "launched")
+            or not all(isinstance(row.get(k), str) and row[k] for k in ("task_id", "run_id", "pane_id", "pane_birth"))):
+        return {"command_id": cid, "outcome": "held", **revision,
+                "detail": "outcome_unknown: protected task binding unconfirmed; no launch retry"}
+    return {"command_id": cid, "outcome": "accepted" if status == "launched" else "held", **revision,
+            "detail": "already launched (protected receipt)" if status == "launched" else
+                      "outcome_unknown: protected task binding exists, launch unconfirmed; no launch retry",
+            "local_task_id": row["task_id"], "local_run_id": row["run_id"], "branch": row.get("branch", ""),
+            "pane_id": row["pane_id"], "agent_id": row["pane_birth"]}
+
+
+def pending_receipt_acks(limit: int = 200) -> list[dict]:
+    """Enumerate protected receipts whose durable `revision` has not yet
+    been confirmed, bounded to `limit`, independently of any Worker lease
+    or local JSON cache -- a fresh publisher process calls this BEFORE its
+    own sync round so a crash-lost local ack is rebuilt from the registry
+    itself rather than left unsent forever."""
+    result = _bridge("pending-authorization-acks", str(limit))
+    if result.returncode != 0:
+        return []
+    try:
+        rows = json.loads(result.stdout)
+    except ValueError:
+        return []
+    if not isinstance(rows, list):
+        return []
+    return [_ack_from_registry_row(row) for row in rows if isinstance(row, dict) and row.get("command_id")]
+
+
+def confirm_receipt_ack(command_id: str, revision: int) -> dict:
+    """CAS-confirm the EXACT revision a Worker sync result correlated back
+    to this command -- never confirms a stale revision: the registry
+    adapter refuses unless the row's CURRENT revision still equals this
+    one, so an older held response cannot confirm a newer launched
+    revision. Returns {"result": "recorded"|"already_recorded"|"conflict"|
+    "unknown"} (distinguished, never silently treated the same)."""
+    try:
+        result = _bridge("confirm-authorization-ack", command_id, str(revision))
+        return json.loads(result.stdout)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return {"command_id": command_id, "result": "unknown"}
 
 
 def _cleanup_uncertain_spawn(wt: Path, cmd: dict, branch: str, since: str, ack: dict) -> None:

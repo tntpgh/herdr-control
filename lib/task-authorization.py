@@ -81,6 +81,16 @@ def connect(path, readonly=False):
 
 def schema(db):
     # Additive v10 migration: no legacy task receives an authorization row.
+    # Additive v12 (slice 3, receipt-to-ack recovery): `revision` is a
+    # durable, exact monotonic stage counter (accepted=1, bound=2,
+    # launch_claimed=3, launched=4) set by the SAME transaction that
+    # advances `status`; `acked_revision`/`acked_at` record the last
+    # revision a Worker sync round explicitly, correlatedly confirmed.
+    # Deliberately NOT derived from `status` at read time: a durable
+    # integer the publisher can enumerate ("revision > acked_revision")
+    # and CAS-confirm by exact value is immune to a lost local JSON ack
+    # cache (publisher.py's `pending_command_acks`) -- the registry row
+    # itself is the retained task evidence an unconfirmed revision needs.
     with db:
         db.execute("""CREATE TABLE IF NOT EXISTS task_authorizations (
             command_id TEXT PRIMARY KEY,
@@ -96,6 +106,9 @@ def schema(db):
             expires_at INTEGER NOT NULL,
             deadline_at TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL CHECK(status IN ('accepted','bound','launch_claimed','launched')),
+            revision INTEGER NOT NULL DEFAULT 0,
+            acked_revision INTEGER NOT NULL DEFAULT 0,
+            acked_at TEXT NOT NULL DEFAULT '',
             task_id TEXT UNIQUE,
             run_id TEXT NOT NULL DEFAULT '',
             worker_id TEXT NOT NULL DEFAULT '',
@@ -112,9 +125,24 @@ def schema(db):
             launch_claimed_at TEXT NOT NULL DEFAULT '',
             launched_at TEXT NOT NULL DEFAULT ''
         )""")
-        db.execute("""INSERT INTO schema_meta(key,value) VALUES ('schema_version','11')
-            ON CONFLICT(key) DO UPDATE SET value='11'
-            WHERE CAST(schema_meta.value AS INTEGER)<11""")
+        cols = {r[1] for r in db.execute("PRAGMA table_info(task_authorizations)").fetchall()}
+        for col in ("revision", "acked_revision"):
+            if col not in cols:
+                db.execute(f"ALTER TABLE task_authorizations ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+        if "acked_at" not in cols:
+            db.execute("ALTER TABLE task_authorizations ADD COLUMN acked_at TEXT NOT NULL DEFAULT ''")
+        if "revision" not in cols:
+            # A pre-v12 database has rows whose status already advanced
+            # past 'accepted' with no revision recorded -- backfill the
+            # exact stage number so pending_acks() does not wrongly treat
+            # every historical row as newly unconfirmed.
+            db.execute("""UPDATE task_authorizations SET revision = CASE status
+                WHEN 'accepted' THEN 1 WHEN 'bound' THEN 2
+                WHEN 'launch_claimed' THEN 3 WHEN 'launched' THEN 4 ELSE 0 END
+                WHERE revision = 0""")
+        db.execute("""INSERT INTO schema_meta(key,value) VALUES ('schema_version','12')
+            ON CONFLICT(key) DO UPDATE SET value='12'
+            WHERE CAST(schema_meta.value AS INTEGER)<12""")
 
 
 def read(db, command_id):
@@ -225,8 +253,8 @@ def _insert(db, claims, raw_claims, expected, deadline=""):
         return public(previous)
     db.execute("""INSERT INTO task_authorizations
         (command_id,remote_task_id,source,claims,source_sha256,payload_sha256,
-         effective_scope,source_repo,expected_manifest,issued_at,expires_at,deadline_at,status,accepted_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'accepted',?)""",
+         effective_scope,source_repo,expected_manifest,issued_at,expires_at,deadline_at,status,revision,accepted_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'accepted',1,?)""",
         (claims["command_id"], claims.get("remote_task_id") or None, claims["source"], raw_claims,
          digest(raw_claims), claims["payload_sha256"], canonical(claims["effective_scope"]),
          claims["repo"], expected, claims["issued_at"], claims["expires_at"], deadline, now_iso()))
@@ -349,7 +377,7 @@ def register(db, raw_task, command_id=""):
     if receipt:
         fields = BIND_FIELDS + ("manifest_sha256", "bound_at")
         values = tuple(task[f] for f in BIND_FIELDS) + (digest(manifest(task.get("manifest", ""))), now_iso())
-        db.execute("UPDATE task_authorizations SET status='bound'," + ",".join(f + "=?" for f in fields) + " WHERE command_id=?",
+        db.execute("UPDATE task_authorizations SET status='bound',revision=2," + ",".join(f + "=?" for f in fields) + " WHERE command_id=?",
                    values + (command_id,))
         event(db, task["run_id"], task["task_id"], "task_authorization_bound",
               {"command_id": command_id, "source": receipt["source"], "source_sha256": receipt["source_sha256"],
@@ -399,7 +427,9 @@ def launch(db, command_id, task_id, run_id, status):
         valid_window(parse(row["claims"]))
         if row["deadline_at"] and row["deadline_at"] <= now_iso():
             raise Refused("task deadline expired before launch")
-    db.execute("UPDATE task_authorizations SET status=?," + status + "_at=? WHERE command_id=?", (status, now_iso(), command_id))
+    revision = 3 if status == "launch_claimed" else 4
+    db.execute("UPDATE task_authorizations SET status=?,revision=?," + status + "_at=? WHERE command_id=?",
+               (status, revision, now_iso(), command_id))
     event(db, run_id, task_id, "task_authorization_" + status,
           {"command_id": command_id, "source_sha256": row["source_sha256"]})
     db.commit()
@@ -414,6 +444,49 @@ def check(db, raw_task):
     if row["status"] not in ("launch_claimed", "launched"):
         raise Refused("task launch has no protected claim")
     _binding(db, row, task)
+
+
+def pending_acks(db, limit=200):
+    """Enumerate receipts whose durable `revision` has advanced past the
+    last confirmed `acked_revision` -- independent of the Worker's own
+    lease and of publisher.py's local JSON `pending_command_acks` cache,
+    which a crash between a registry commit and `save_state()` can lose.
+    The registry row itself (not a side cache) is the retained evidence."""
+    if not isinstance(limit, int) or not 0 < limit <= 1000:
+        raise Refused("invalid pending-ack enumeration limit")
+    rows = db.execute(
+        "SELECT * FROM task_authorizations WHERE revision > acked_revision "
+        "ORDER BY revision ASC, command_id ASC LIMIT ?", (limit,)).fetchall()
+    return [public(row) for row in rows]
+
+
+def confirm_ack(db, command_id, revision):
+    """CAS-confirm the EXACT revision a sync round reported sending. An
+    older held response can never confirm a newer launched revision: the
+    match is on the row's CURRENT `revision`, not merely `>=`, so a stale
+    ack for revision 2 (bound) cannot silently confirm revision 4
+    (launched) once the receipt has moved on."""
+    try:
+        revision = int(revision)
+    except (TypeError, ValueError):
+        raise Refused("invalid acknowledgement revision")
+    if revision < 1:
+        raise Refused("invalid acknowledgement revision")
+    db.execute("BEGIN IMMEDIATE")
+    row = read(db, command_id)
+    if row is None:
+        db.rollback()
+        return {"command_id": command_id, "result": "unknown"}
+    if row["revision"] != revision:
+        db.rollback()
+        return {"command_id": command_id, "result": "conflict", "current_revision": row["revision"]}
+    if row["acked_revision"] >= revision:
+        db.rollback()
+        return {"command_id": command_id, "result": "already_recorded", "acked_revision": row["acked_revision"]}
+    db.execute("UPDATE task_authorizations SET acked_revision=?,acked_at=? WHERE command_id=? AND revision=?",
+               (revision, now_iso(), command_id, revision))
+    db.commit()
+    return {"command_id": command_id, "result": "recorded", "acked_revision": revision}
 
 
 def _action_task(db, request):
@@ -515,7 +588,7 @@ def action_decide(db, request_id, status, authority, decided_by, category, reaso
 
 def main():
     path, op, *args = sys.argv[1:]
-    with connect(path, readonly=op in ("read", "check")) as db:
+    with connect(path, readonly=op in ("read", "check", "pending-acks")) as db:
         if op == "schema":
             schema(db)
         elif op == "accept":
@@ -533,6 +606,13 @@ def main():
             launch(db, *args)
         elif op == "check":
             check(db, *args)
+        elif op == "pending-acks":
+            print(canonical(pending_acks(db, int(args[0])) if args else pending_acks(db)))
+        elif op == "confirm-ack":
+            result = confirm_ack(db, *args)
+            print(canonical(result))
+            if result["result"] not in ("recorded", "already_recorded"):
+                sys.exit(1)
         elif op in ("action-consume", "action-decide"):
             result = (action_consume if op == "action-consume" else action_decide)(db, *args)
             print(canonical(result))
