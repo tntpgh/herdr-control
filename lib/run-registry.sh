@@ -39,7 +39,7 @@
 # Sourced by spawn-task.sh (register), agent-hooks/claude-notify.sh and
 # agent-hooks/omp-notify.sh (read + log), lib/reconcile.sh (sweep),
 # lib/pane-guard.sh (task_for_pane), herdr-select.sh (approval lifecycle).
-# Requires: sqlite3, jq.
+# Requires: sqlite3, jq, python3.
 set -uo pipefail
 
 # ---- location ---------------------------------------------------------------
@@ -99,13 +99,19 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '10\n'; }
+_registry_schema_version() { printf '11\n'; }
+
+_TASK_AUTHORIZATION_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/task-authorization.py"
+_task_authorization_adapter() {
+  python3 "$_TASK_AUTHORIZATION_HELPER" "$(registry_db)" "$@"
+}
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
-  local root db
+  local root db existed=0
   root="$(run_state_root)"
   db="$(registry_db)"
+  [ ! -e "$db" ] || existed=1
   mkdir -p "$root" || {
     printf 'run-registry: cannot create registry root %s\n' "$root" >&2
     return 1
@@ -172,12 +178,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- every reader treats empty as use-the-repo-basename rather than a
   -- distinct project of its own.
   project               TEXT NOT NULL DEFAULT '',
-  -- The task's capability manifest (lib/task-manifest.sh), canonical JSON,
-  -- approved ONCE at spawn by the spawning conductor. '' = no manifest: the
-  -- per-task scope layer in lib/scoped-policy.sh then adds nothing and every
-  -- decision is exactly the pre-manifest one. Stored HERE, not read from the
-  -- worker-writable .handoffs/identity.json, so a worker cannot widen its own
-  -- scope by editing a file in its worktree.
+  -- The recorded capability manifest (lib/task-manifest.sh), canonical JSON.
+  -- Its existence alone proves no approval. Automated authority additionally
+  -- requires the separate protected source receipt and exact task binding.
+  -- Stored HERE, not in worker-writable .handoffs/identity.json.
   manifest             TEXT NOT NULL DEFAULT '',
   label                TEXT NOT NULL DEFAULT '',
   state                TEXT NOT NULL,
@@ -255,7 +259,7 @@ CREATE TABLE IF NOT EXISTS file_approvals (
 );
 
 INSERT OR IGNORE INTO schema_meta(key, value)
-  VALUES ('schema_version', '$(_registry_schema_version)');
+  VALUES ('schema_version', '10');
 " >/dev/null 2>&1; then
     printf 'run-registry: failed to initialize %s\n' "$db" >&2
     return 1
@@ -270,6 +274,10 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   _migrate_schema_v8
   _migrate_schema_v9
   _migrate_schema_v10
+  if ! _migrate_schema_v11 "$existed"; then
+    _HERDR_REGISTRY_READY=0
+    return 1
+  fi
   _migrate_legacy_files
   return 0
 }
@@ -574,6 +582,18 @@ _migrate_schema_v10() {
   fi
 }
 
+# Add a separate receipt table; existing manifests remain unverified. Schema
+# creation and the version stamp share a transaction in the storage adapter.
+_migrate_schema_v11() {
+  local current
+  current="$(_sql "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)" || return 1
+  case "$current" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$current" -lt 11 ] && [ "${1:-1}" = 1 ]; then
+    _backup_registry_before_migration v11 "$current" || return 1
+  fi
+  _task_authorization_adapter schema
+}
+
 # ---- one-time import of the pre-SQLite file layout --------------------------
 # A registry holding LIVE task state cannot simply be abandoned: dropping a
 # running worker's registration is not a clean slate, it silently disables
@@ -664,12 +684,15 @@ gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand
 # names whether it asked for one task or all of them.
 _task_json_select() {
   printf "%s" "SELECT json_object(
-    'schema', 9, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
+    'schema', 11, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
     'conductor_id', conductor_id, 'conductor_pane_id', conductor_pane_id,
     'conductor_pane_birth', conductor_pane_birth, 'pane_id', pane_id,
     'pane_birth', pane_birth, 'agent_session', agent_session, 'repo', repo,
     'worktree', worktree, 'branch', branch, 'trunk', trunk, 'project', project,
     'manifest', manifest, 'approval', approval,
+    'authorization_command_id', COALESCE((SELECT a.command_id FROM task_authorizations a WHERE a.task_id=tasks.task_id), ''),
+    'authorization_source', COALESCE((SELECT a.source FROM task_authorizations a WHERE a.task_id=tasks.task_id), ''),
+    'authorization_status', COALESCE((SELECT a.status FROM task_authorizations a WHERE a.task_id=tasks.task_id), ''),
     'remote_task_id', remote_task_id, 'deadline_at', deadline_at,
     'verified', (verified = 1), 'verify_detail', verify_detail,
     'review_pr_repo', review_pr_repo, 'review_pr_number', review_pr_number,
@@ -687,14 +710,13 @@ _task_json_select() {
 # existing caller that passes 11 args keeps registering exactly as before.
 # project (14th, OPTIONAL) is the project-contract-plan.md #2 label; empty
 # means "no explicit project — every reader falls back to the repo basename".
-# manifest (15th, OPTIONAL) is the canonical capability-manifest JSON from
-# lib/task-manifest.sh; recorded with a `manifest_approved` event naming the
-# spawning conductor and the manifest's sha256 — the one approval decision.
+# manifest (15th, OPTIONAL) is the capability-manifest JSON. Source authority
+# comes from an accepted protected receipt (17th), never the assigned conductor.
 register_task() {
   local run_id="$1" task_id="$2" worker_id="$3" conductor_id="$4" \
         conductor_pane_id="$5" conductor_pane_birth="$6" pane_id="$7" pane_birth="$8" \
         repo="$9" worktree="${10}" label="${11}" branch="${12:-}" trunk="${13:-}" \
-        project="${14:-}" manifest="${15:-}" approval="${16:-menu}"
+        project="${14:-}" manifest="${15:-}" approval="${16:-menu}" authorization_command_id="${17:-}"
   case "$approval" in
     menu|hook) ;;
     *) printf 'run-registry: invalid approval posture %s (menu|hook)\n' "$approval" >&2; return 1 ;;
@@ -705,35 +727,45 @@ register_task() {
     esac
   fi
   registry_init || return 1
-  local at; at="$(_now_iso)"
+  local task_json
+  task_json="$(jq -nc --arg run_id "$run_id" --arg task_id "$task_id" --arg worker_id "$worker_id" \
+    --arg conductor_id "$conductor_id" --arg conductor_pane_id "$conductor_pane_id" \
+    --arg conductor_pane_birth "$conductor_pane_birth" --arg pane_id "$pane_id" --arg pane_birth "$pane_birth" \
+    --arg repo "$repo" --arg worktree "$worktree" --arg branch "$branch" --arg trunk "$trunk" \
+    --arg project "$project" --arg manifest "$manifest" --arg approval "$approval" --arg label "$label" \
+    '$ARGS.named')" || return 1
+  # INSERT plus source binding plus audit events is one transaction. Legacy
+  # registrations still succeed, but cannot fabricate a manifest approval.
+  _task_authorization_adapter register "$task_json" "$authorization_command_id"
+}
 
-  # Plain INSERT, not INSERT OR REPLACE: a task_id collision must be a visible
-  # failure, not a silent overwrite of a live worker's registration. See the
-  # tasks table comment in registry_init.
-  if _sql "INSERT INTO tasks
-      (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth,
-       pane_id, pane_birth, repo, worktree, branch, trunk, project, manifest, approval, label, state, created_at, updated_at)
-      VALUES ($(_sq "$task_id"), $(_sq "$run_id"), $(_sq "$worker_id"), $(_sq "$conductor_id"),
-        $(_sq "$conductor_pane_id"), $(_sq "$conductor_pane_birth"), $(_sq "$pane_id"),
-        $(_sq "$pane_birth"), $(_sq "$repo"), $(_sq "$worktree"), $(_sq "$branch"), $(_sq "$trunk"),
-        $(_sq "$project"), $(_sq "$manifest"), $(_sq "$approval"), $(_sq "$label"), 'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
-    append_event "$run_id" "$task_id" "registered" \
-      "$(jq -nc --arg p "$pane_id" --arg l "$label" '{pane_id:$p, label:$l}')" >/dev/null 2>&1
-    if [ "$approval" = hook ]; then
-      append_event "$run_id" "$task_id" "approval_posture" \
-        "$(jq -nc --arg c "$conductor_id" --arg cp "$conductor_pane_id" \
-           '{approval:"hook", approved_by:$c, conductor_pane:$cp}')" >/dev/null 2>&1
-    fi
-    if [ -n "$manifest" ]; then
-      append_event "$run_id" "$task_id" "manifest_approved" \
-        "$(jq -nc --arg c "$conductor_id" --arg cp "$conductor_pane_id" \
-           --arg sha "$(printf '%s' "$manifest" | shasum -a 256 | cut -d' ' -f1)" \
-           --argjson m "$manifest" \
-           '{approved_by:$c, conductor_pane:$cp, manifest_sha256:$sha, manifest:$m}')" >/dev/null 2>&1
-    fi
+# These are protected storage adapters. The publisher verifies the signed
+# source before accept; spawn verifies local ancestry/birth before accept-local.
+# Do not expose either as an inbox operation or an unauthenticated endpoint.
+accept_task_authorization() {
+  registry_init || return 1
+  _task_authorization_adapter accept "$1" "$2" "${3:-}"
+}
+accept_local_task_authorization() {
+  registry_init || return 1
+  _task_authorization_adapter accept-local "$1" "$2" "$3" "$4" "${5:-}"
+}
+read_task_authorization() {
+  _task_authorization_adapter read "$1"
+}
+mark_authorization_launch() {
+  _task_authorization_adapter launch "$1" "$2" "$3" "$4"
+}
+task_authorization_check() {
+  TASK_AUTHORIZATION_REASON=""
+  local why
+  if why="$(_task_authorization_adapter check "$1" 2>&1)"; then
     return 0
   fi
-  printf 'run-registry: failed to register task %s (duplicate task_id, or database unwritable)\n' "$task_id" >&2
+  case "$why" in
+    'authorization hold: '*) TASK_AUTHORIZATION_REASON="$why" ;;
+    *) TASK_AUTHORIZATION_REASON="authorization hold: protected source unavailable" ;;
+  esac
   return 1
 }
 

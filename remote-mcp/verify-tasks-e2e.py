@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Real-registry e2e for tasks.py's command pipeline.
 
-register_task() (lib/run-registry.sh), registry-bridge.sh's set-remote-id /
-set-deadline / set-verified / cancel, and close-done-workers.sh all run for
+Publisher signature admission, register_task() (lib/run-registry.sh), the
+protected authorization receipt transitions, registry cancellation and closure run
 REAL here, against a scratch HERDR_RUN_STATE_DIR -- proving tasks.py's SQL
-assumptions match what lib/run-registry.sh's own v7 schema and migration
+assumptions match what lib/run-registry.sh's current schema and migration
 actually produce, which verify-tasks.py's hand-rolled fixture schema
 (deliberately minimal, for speed) cannot catch. Uses the REAL
 remote-mcp/task-allowlist.json, unmodified.
 
-The only thing faked is spawn-task.sh's actual pane/tab/agent launch
+External services, capability probes and Herdr panes are faked from the outset.
+spawn-task.sh's actual pane/tab/agent launch is also faked
 (verify-tasks-e2e-fake-spawn.sh calls register_task() for real and writes a
 real identity.json, then stops short of starting a real tab) -- a real
 wrangler-dev + real publisher tick + real spawn-task.sh against a real repo
@@ -17,7 +18,14 @@ is SPEC.md Acceptance item 2, explicitly deferred to the conductor's own
 live e2e (see .handoffs/PROOF.md).
 
     python3 remote-mcp/verify-tasks-e2e.py
+    python3 remote-mcp/verify-tasks-e2e.py --registry-only
+
+The second form explicitly excludes independent timer/process-identity checks;
+use it when sandbox policy denies ps. It does not claim those checks passed.
 """
+import atexit
+import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -28,6 +36,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 TMP = Path(tempfile.mkdtemp(prefix="herdr-tasks-e2e-"))
@@ -35,6 +44,8 @@ TMP = Path(tempfile.mkdtemp(prefix="herdr-tasks-e2e-"))
 # Must be set before `import tasks`: its module-level constants read these
 # once, at import time, exactly like the real publisher process does.
 os.environ["HERDR_RUN_STATE_DIR"] = str(TMP / "runs")
+os.environ["HERDR_STATE_DIR"] = str(TMP / "state")
+os.environ["HERDR_ARCHIVE_ROOT"] = str(TMP / "archives")
 os.environ["HERDR_WT_DIR"] = str(TMP / "worktrees")
 os.environ["HERDR_CODE_DIR"] = str(TMP / "code")
 os.environ["HERDR_MCP_TASKS"] = "1"
@@ -48,6 +59,78 @@ tsk.SPAWN_TASK = str(HERE / "verify-tasks-e2e-fake-spawn.sh")
 # (HERE/registry-bridge.sh, REPO/close-done-workers.sh) -- the whole point
 # of this script versus verify-tasks.py's faked stand-ins for those two.
 
+# Fake all external surfaces BEFORE even the first start/close/cancel.
+# Fixture shell commands and git repositories are confined to TMP.
+fake_herdr_dir = TMP / "fake-herdr-bin"
+fake_herdr_dir.mkdir()
+fake_herdr_log = TMP / "fake-herdr-calls.log"
+fake_herdr = fake_herdr_dir / "herdr"
+fake_herdr.write_text("#!/bin/sh\nprintf '%s\\n' '{\"result\":{\"panes\":[]}}'\n")
+fake_herdr.chmod(0o755)
+for name in ("gh", "curl", "omp", "claude", "codex"):
+    blocked = fake_herdr_dir / name
+    blocked.write_text("#!/bin/sh\necho 'external service forbidden in isolated fixture' >&2\nexit 97\n")
+    blocked.chmod(0o755)
+os.environ["PATH"] = f"{fake_herdr_dir}:{os.environ['PATH']}"
+tsk._capability_probe = lambda repo, granted: {"secrets_granted": granted}
+
+from authorization import canonical_json, payload_sha256
+import publisher
+DUMMY_KEY = "isolated-e2e-fixture-key-only-32-characters"
+SIGNED_COMMANDS = {}
+
+
+def signed_command(cmd):
+    """Build a stable fixture envelope; the real receiver still verifies it."""
+    cmd = json.loads(json.dumps(cmd))
+    if cmd["op"] in ("start", "resume"):
+        fingerprint = canonical_json(cmd)
+        if fingerprint not in SIGNED_COMMANDS:
+            mode = cmd["payload"].get("mode", "research")
+            config = tsk.load_allowlist()["modes"][mode]
+            issued = int(time.time() * 1000)
+            claims = canonical_json({"version": 1, "source": "oauth_task_delegation",
+                "command_id": cmd["command_id"], "op": cmd["op"], "remote_task_id": cmd["remote_task_id"],
+                "requester_actor": "e2e@example.com", "requester_client": "e2e-fixture",
+                "scope": "herdr:task.start" if mode == "research" else "herdr:task.implement",
+                "repo": cmd["payload"]["repo"], "mode": mode,
+                "effective_scope": {k: config[k] for k in tsk.MODE_FIELDS},
+                "payload_sha256": payload_sha256(cmd["payload"]), "issued_at": issued, "expires_at": issued + 900000})
+            SIGNED_COMMANDS[fingerprint] = {"claims": claims,
+                "signature": hmac.new(DUMMY_KEY.encode(), b"herdr-task-authorization-v1\n" + claims.encode(), hashlib.sha256).hexdigest()}
+        cmd["authorization"] = SIGNED_COMMANDS[fingerprint]
+    return cmd
+
+
+def process_command(cmd):
+    """Actual publisher admission, real receipt bridge, no live transport."""
+    return publisher.process_leased_command(signed_command(cmd), DUMMY_KEY, {}, time.time())
+
+REGISTRY_ONLY = "--registry-only" in sys.argv
+OWNED_TIMERS = {}
+_REAL_POPEN = tsk._popen_detached
+
+
+def fixture_popen(argv):
+    if REGISTRY_ONLY:
+        raise OSError("independent timer verification excluded by --registry-only")
+    proc = _REAL_POPEN(argv)
+    OWNED_TIMERS[proc.pid] = proc
+    return proc
+
+
+def cleanup_owned_timers():
+    for proc in OWNED_TIMERS.values():
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=5)
+
+
+tsk._popen_detached = fixture_popen
+atexit.register(cleanup_owned_timers)
 failures: list[str] = []
 
 
@@ -87,7 +170,7 @@ case "$1 $2" in
 esac
 exit 0
 """)
-    out = tsk.process_command({
+    out = process_command({
         "command_id": cmd_id, "op": "cancel", "remote_task_id": remote_task_id,
         "payload": {"local_task_id": local_task_id, "reason": "test_cleanup"},
     })
@@ -96,21 +179,49 @@ exit 0
           out.get("outcome") == "accepted", json.dumps(out))
 
 
-print("== start_task: real register_task() + real registry-bridge.sh set-remote-id/set-deadline ==")
-out = tsk.process_command({
+print("== start_task: real signature admission + registry source binding and deadline ==")
+start_request = {
     "command_id": "cmd_1", "op": "start", "remote_task_id": "rtask_20261002T000001Z_e2e00001",
     "payload": {"repo": "knowledge-base", "mode": "research",
                 "objective": "find the most recent tl;dv meeting in the KB and summarise it"},
-})
+}
+out = process_command(start_request)
 check("start accepted", out.get("outcome") == "accepted", json.dumps(out))
 task_id, run_id = out.get("local_task_id", ""), out.get("local_run_id", "")
 row = registry_row(task_id) if task_id else None
-check("registry row exists for real (schema v7, register_task())", row is not None)
+check("registry row exists for real (current schema, register_task())", row is not None)
 if row:
-    check("remote_task_id round-tripped through real registry-bridge.sh set-remote-id",
+    check("remote_task_id bound atomically through protected receipt registration",
           row.get("remote_task_id") == "rtask_20261002T000001Z_e2e00001", row.get("remote_task_id"))
-    check("deadline_at set by real registry-bridge.sh set-deadline", bool(row.get("deadline_at")))
+    check("deadline_at set before launch through protected receipt", bool(row.get("deadline_at")))
     check("state is 'starting' immediately after register_task()", row.get("state") == "starting")
+
+print("== protected authorization: receipt, ack loss, and source substitution ==")
+if row:
+    receipt_result = tsk._bridge("read-authorization", "cmd_1")
+    receipt = json.loads(receipt_result.stdout)
+    check("receipt reached launched through real registry transitions", receipt.get("status") == "launched")
+    check("receipt binds source identity separately from conductor",
+          receipt["claims"]["requester_actor"] == "e2e@example.com" and row["conductor_id"] == "conductor_e2e")
+    check("receipt copied deadline before execution", row["deadline_at"] == receipt["deadline_at"])
+    con = sqlite3.connect(tsk.REGISTRY)
+    before_count = con.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    con.close()
+    identity = Path(row["worktree"]) / ".handoffs/identity.json"
+    saved_identity = identity.read_bytes()
+    identity.write_text('{"run_id":"forged-run","task_id":"forged-task"}')
+    with patch.object(tsk, "_spawn", side_effect=AssertionError("replayed launch")):
+        replay = process_command(start_request)
+    identity.write_bytes(saved_identity)
+    check("lost ack replay resolves only protected task binding", replay.get("local_task_id") == task_id and replay.get("outcome") == "accepted", replay)
+    con = sqlite3.connect(tsk.REGISTRY)
+    after_count = con.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    con.close()
+    check("lost ack creates no duplicate task and never extends deadline", before_count == after_count and registry_row(task_id)["deadline_at"] == row["deadline_at"])
+    changed = {**start_request, "payload": {**start_request["payload"], "objective": "different objective"}}
+    with patch.object(tsk, "_spawn", side_effect=AssertionError("changed source launch")):
+        substituted = process_command(changed)
+    check("same command id with another signed payload refuses before launch", substituted.get("outcome") == "refused" and "persisted" in substituted.get("detail", ""), substituted)
 
 print("== sweep(): real close-done-workers.sh auto-closes a finished research task ==")
 wt = Path(row["worktree"]) if row and row.get("worktree") else None
@@ -120,24 +231,25 @@ if wt:
         "Found it: https://kb.teamthurber.com/entity/e2e-123 -- summary here.\n")
     (wt / ".handoffs/events.jsonl").write_text(
         json.dumps({"event": "e2e_done", "status": "completed", "reason": "no-follow-on"}) + "\n")
-    t = {"task_id": task_id, "run_id": run_id, "state": "running", "worktree": str(wt)}
+    t = {"task_id": task_id, "run_id": run_id, "state": "running", "worktree": str(wt),
+         "agent_live": True, "pane_status": "idle", "has_pending_request": False}
     actions = tsk.sweep({task_id: t}, datetime.now(timezone.utc))
     check("sweep() produced exactly one action", len(actions) == 1, str(actions))
     if actions:
-        check("action is auto_close", actions[0]["action"] == "auto_close", str(actions[0]))
+        check("action is orchestrator_close", actions[0]["action"] == "orchestrator_close", str(actions[0]))
         check("real close-done-workers.sh --apply succeeded", actions[0]["ok"], actions[0]["detail"])
     row = registry_row(task_id)
     check("registry state is 'completed' after the real close-done-workers.sh ran",
           bool(row) and row.get("state") == "completed", row)
 
 print("== a second task: real registry-bridge.sh cancel ==")
-out2 = tsk.process_command({
+out2 = process_command({
     "command_id": "cmd_2", "op": "start", "remote_task_id": "rtask_20261002T000002Z_e2e00002",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "y"},
 })
 check("second start accepted", out2.get("outcome") == "accepted", json.dumps(out2))
 task_id2 = out2.get("local_task_id", "")
-cout = tsk.process_command({
+cout = process_command({
     "command_id": "cmd_3", "op": "cancel", "remote_task_id": "rtask_20261002T000002Z_e2e00002",
     "payload": {"local_task_id": task_id2, "reason": "canceled"},
 })
@@ -148,7 +260,7 @@ check("registry state is 'cancelled' after the real registry-bridge.sh cancel ra
 
 print("== N5: real registry-bridge.sh cancel skips the pane close when `herdr pane list` itself fails ==")
 fake_herdr_dir = TMP / "fake-herdr-bin"
-fake_herdr_dir.mkdir()
+fake_herdr_dir.mkdir(exist_ok=True)
 fake_herdr_log = TMP / "fake-herdr-calls.log"
 fake_herdr = fake_herdr_dir / "herdr"
 fake_herdr.write_text(f"""#!/usr/bin/env bash
@@ -160,13 +272,13 @@ exit 0
 """)
 fake_herdr.chmod(0o755)
 os.environ["PATH"] = f"{fake_herdr_dir}:{os.environ['PATH']}"
-out3 = tsk.process_command({
+out3 = process_command({
     "command_id": "cmd_4", "op": "start", "remote_task_id": "rtask_20261002T000003Z_e2e00003",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "z"},
 })
 check("third start accepted", out3.get("outcome") == "accepted", json.dumps(out3))
 task_id3 = out3.get("local_task_id", "")
-cout3 = tsk.process_command({
+cout3 = process_command({
     "command_id": "cmd_5", "op": "cancel", "remote_task_id": "rtask_20261002T000003Z_e2e00003",
     "payload": {"local_task_id": task_id3, "reason": "canceled"},
 })
@@ -185,7 +297,7 @@ restore_working_herdr_and_free_slot(fake_herdr, fake_herdr_log, "cmd_n5_cleanup"
 
 print("== R3-3: real registry-bridge.sh cancel refuses when the row's own remote_task_id does not match ==")
 import subprocess  # noqa: E402 (test-only, added for this direct bridge call)
-out4 = tsk.process_command({
+out4 = process_command({
     "command_id": "cmd_6", "op": "start", "remote_task_id": "rtask_20261002T000004Z_e2e00004",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "w"},
 })
@@ -223,13 +335,13 @@ case "$1 $2" in
 esac
 exit 0
 """)
-out5 = tsk.process_command({
+out5 = process_command({
     "command_id": "cmd_7", "op": "start", "remote_task_id": "rtask_20261002T000005Z_e2e00005",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "v"},
 })
 check("fifth start accepted", out5.get("outcome") == "accepted", json.dumps(out5))
 task_id5 = out5.get("local_task_id", "")
-cout5 = tsk.process_command({
+cout5 = process_command({
     "command_id": "cmd_8", "op": "cancel", "remote_task_id": "rtask_20261002T000005Z_e2e00005",
     "payload": {"local_task_id": task_id5, "reason": "canceled"},
 })
@@ -256,13 +368,13 @@ case "$1 $2" in
 esac
 exit 0
 """)
-out6 = tsk.process_command({
+out6 = process_command({
     "command_id": "cmd_9", "op": "start", "remote_task_id": "rtask_20261002T000007Z_e2e00007",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "w"},
 })
 check("sixth start accepted", out6.get("outcome") == "accepted", json.dumps(out6))
 task_id6 = out6.get("local_task_id", "")
-cout6 = tsk.process_command({
+cout6 = process_command({
     "command_id": "cmd_10", "op": "cancel", "remote_task_id": "rtask_20261002T000007Z_e2e00007",
     "payload": {"local_task_id": task_id6, "reason": "canceled"},
 })
@@ -286,13 +398,13 @@ case "$1 $2" in
 esac
 exit 0
 """)
-out7 = tsk.process_command({
+out7 = process_command({
     "command_id": "cmd_11", "op": "start", "remote_task_id": "rtask_20261002T000008Z_e2e00008",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "u"},
 })
 check("seventh start accepted", out7.get("outcome") == "accepted", json.dumps(out7))
 task_id7 = out7.get("local_task_id", "")
-cout7 = tsk.process_command({
+cout7 = process_command({
     "command_id": "cmd_12", "op": "cancel", "remote_task_id": "rtask_20261002T000008Z_e2e00008",
     "payload": {"local_task_id": task_id7, "reason": "canceled"},
 })
@@ -309,13 +421,13 @@ restore_working_herdr_and_free_slot(fake_herdr, fake_herdr4_log, "cmd_z1b_cleanu
                                      "rtask_20261002T000008Z_e2e00008", task_id7)
 
 print("== F2: real registry-bridge.sh cancel on an already-terminal row refuses BEFORE touching any pane ==")
-out_f2 = tsk.process_command({
+out_f2 = process_command({
     "command_id": "cmd_f2", "op": "start", "remote_task_id": "rtask_20261002T000011Z_0000f2f2",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "f2"},
 })
 check("F2 start accepted", out_f2.get("outcome") == "accepted", json.dumps(out_f2))
 task_id_f2, run_id_f2 = out_f2.get("local_task_id", ""), out_f2.get("local_run_id", "")
-cout_f2_first = tsk.process_command({
+cout_f2_first = process_command({
     "command_id": "cmd_f2_cancel1", "op": "cancel", "remote_task_id": "rtask_20261002T000011Z_0000f2f2",
     "payload": {"local_task_id": task_id_f2, "reason": "canceled"},
 })
@@ -356,7 +468,7 @@ set_task_agent_session {run_id} {task_id} {session}
 
 
 fake_herdr_f1a_log = TMP / "fake-herdr-f1a-calls.log"
-out_f1a = tsk.process_command({
+out_f1a = process_command({
     "command_id": "cmd_f1a", "op": "start", "remote_task_id": "rtask_20261002T000012Z_0000f1a1",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "f1a"},
 })
@@ -375,7 +487,7 @@ case "$1 $2" in
 esac
 exit 0
 """)
-cout_f1a = tsk.process_command({
+cout_f1a = process_command({
     "command_id": "cmd_f1a_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000012Z_0000f1a1",
     "payload": {"local_task_id": task_id_f1a, "reason": "canceled"},
 })
@@ -388,7 +500,7 @@ restore_working_herdr_and_free_slot(fake_herdr, fake_herdr_f1a_log, "cmd_f1a_cle
                                      "rtask_20261002T000012Z_0000f1a1", task_id_f1a)
 
 fake_herdr_f1b_log = TMP / "fake-herdr-f1b-calls.log"
-out_f1b = tsk.process_command({
+out_f1b = process_command({
     "command_id": "cmd_f1b", "op": "start", "remote_task_id": "rtask_20261002T000013Z_0000f1b1",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "f1b"},
 })
@@ -406,7 +518,7 @@ case "$1 $2" in
 esac
 exit 0
 """)
-cout_f1b = tsk.process_command({
+cout_f1b = process_command({
     "command_id": "cmd_f1b_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000013Z_0000f1b1",
     "payload": {"local_task_id": task_id_f1b, "reason": "canceled"},
 })
@@ -418,7 +530,7 @@ row_f1b = registry_row(task_id_f1b)
 check("F1b: registry state is 'cancelled'", bool(row_f1b) and row_f1b.get("state") == "cancelled", row_f1b)
 
 fake_herdr_f1c_log = TMP / "fake-herdr-f1c-calls.log"
-out_f1c = tsk.process_command({
+out_f1c = process_command({
     "command_id": "cmd_f1c", "op": "start", "remote_task_id": "rtask_20261002T000014Z_0000f1c1",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "f1c"},
 })
@@ -434,7 +546,7 @@ case "$1 $2" in
 esac
 exit 0
 """)
-cout_f1c = tsk.process_command({
+cout_f1c = process_command({
     "command_id": "cmd_f1c_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000014Z_0000f1c1",
     "payload": {"local_task_id": task_id_f1c, "reason": "canceled"},
 })
@@ -448,7 +560,7 @@ restore_working_herdr_and_free_slot(fake_herdr, fake_herdr_f1c_log, "cmd_f1c_cle
 
 print("== Fz: real registry-bridge.sh cancel treats a wrong-shaped-but-valid-JSON `herdr pane list` as UNPARSEABLE, never 'gone' ==")
 fake_herdr_fza_log = TMP / "fake-herdr-fza-calls.log"
-out_fza = tsk.process_command({
+out_fza = process_command({
     "command_id": "cmd_fza", "op": "start", "remote_task_id": "rtask_20261002T000015Z_0000fda1",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "fza"},
 })
@@ -462,7 +574,7 @@ case "$1 $2" in
 esac
 exit 0
 """)
-cout_fza = tsk.process_command({
+cout_fza = process_command({
     "command_id": "cmd_fza_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000015Z_0000fda1",
     "payload": {"local_task_id": task_id_fza, "reason": "canceled"},
 })
@@ -474,7 +586,7 @@ restore_working_herdr_and_free_slot(fake_herdr, fake_herdr_fza_log, "cmd_fza_cle
                                      "rtask_20261002T000015Z_0000fda1", task_id_fza)
 
 fake_herdr_fzb_log = TMP / "fake-herdr-fzb-calls.log"
-out_fzb = tsk.process_command({
+out_fzb = process_command({
     "command_id": "cmd_fzb", "op": "start", "remote_task_id": "rtask_20261002T000016Z_0000fdb1",
     "payload": {"repo": "knowledge-base", "mode": "research", "objective": "fzb"},
 })
@@ -489,7 +601,7 @@ case "$1 $2" in
 esac
 exit 0
 """)
-cout_fzb = tsk.process_command({
+cout_fzb = process_command({
     "command_id": "cmd_fzb_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000016Z_0000fdb1",
     "payload": {"local_task_id": task_id_fzb, "reason": "canceled"},
 })
@@ -522,7 +634,7 @@ register_task {run_id_r41} {task_id_r41} worker1 cond1 cpane1 cbirth1 pane_r41 b
 reg_script.chmod(0o755)
 
 
-def _spawn_registers_then_times_out(root, branch, mcfg, brief):
+def _spawn_registers_then_times_out(root, branch, mcfg, brief, authorization_command_id):
     # Simulates spawn-task.sh: register the task for real (remote_task_id
     # stays empty, exactly as it is until a LATER set-remote-id call), then
     # hang/crash before ever returning or writing identity.json.
@@ -535,7 +647,7 @@ def _spawn_registers_then_times_out(root, branch, mcfg, brief):
 old_spawn_fn = tsk._spawn
 tsk._spawn = _spawn_registers_then_times_out
 try:
-    out_r41 = tsk.process_command({
+    out_r41 = process_command({
         "command_id": "cmd_r41", "op": "start", "remote_task_id": remote_id_r41,
         "payload": {"repo": "knowledge-base", "mode": "research", "objective": "r41"},
     })
@@ -572,112 +684,160 @@ row_after = registry_row(task_id_r41b)
 check("state is 'cancelled' after cancelling the unstamped row",
       bool(row_after) and row_after.get("state") == "cancelled", row_after)
 
-print("== Z5: every accepted start schedules a real, independently-firing hard-stop timer, "
-      "killed on a real cancel but NOT while the task is still running (F9) ==")
-out_z5a = tsk.process_command({
-    "command_id": "cmd_z5a", "op": "start", "remote_task_id": "rtask_20261002T000009Z_00005a01",
-    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "z5a"},
-})
-check("Z5a start accepted", out_z5a.get("outcome") == "accepted", json.dumps(out_z5a))
-task_id_z5a, run_id_z5a = out_z5a.get("local_task_id", ""), out_z5a.get("local_run_id", "")
+
+print("== actual overlapping consumers: duplicate receipt held, different tasks isolated ==")
+from concurrent.futures import ThreadPoolExecutor
+import threading
+
+race_request = {"command_id": "cmd_race_duplicate", "op": "start", "remote_task_id": "rtask_20261002T000020Z_00110011",
+                "payload": {"repo": "knowledge-base", "mode": "research", "objective": "duplicate race"}}
+race_wire = signed_command(race_request)
+entered, release = threading.Event(), threading.Event()
+real_spawn = tsk._spawn
+spawn_calls = []
 
 
-def _hard_stop_pid(task_id: str) -> int | None:
-    con = sqlite3.connect(tsk.REGISTRY)
-    con.row_factory = sqlite3.Row
-    row = con.execute("SELECT payload FROM events WHERE task_id=? AND type='hard_stop_scheduled' "
-                       "ORDER BY sequence DESC LIMIT 1", (task_id,)).fetchone()
-    con.close()
-    if not row:
-        return None
-    try:
-        pid = json.loads(row["payload"]).get("pid")
-    except ValueError:
-        return None
-    return pid if isinstance(pid, int) and pid > 0 else None
+def paused_spawn(*args):
+    spawn_calls.append(args[-1])
+    entered.set()
+    if not release.wait(10):
+        raise RuntimeError("concurrent fixture stalled")
+    return real_spawn(*args)
 
 
-def _reap_or_confirm_dead(pid: int, timeout_s: float = 2.0) -> bool:
-    """Kill a hard-stop timer's process group and confirm it is actually
-    gone before anything calls it a leak. Fix for a conductor-reported
-    flake: `os.kill(pid, 0)` alone returns success for an unreaped
-    ZOMBIE (signalled but never waited on) -- this script is the real
-    parent of every timer it schedules (tasks.py's real, unfaked Popen
-    runs in-process here), so a plain killpg without a reap leaves
-    exactly that zombie, which then looks indistinguishable from "still
-    running" to anything checking with signal 0 alone. Reaps via
-    waitpid when this process is still the pid's parent; falls back to
-    polling `ps`'s own STAT column (Z or no row at all means dead) for a
-    pid this process is no longer the parent of (e.g. already reaped by
-    tasks.py's own _kill_hard_stop_timer through a real _cancel() call
-    earlier in this same run)."""
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except OSError:
-        pass
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
+with patch.object(tsk, "_spawn", side_effect=paused_spawn), ThreadPoolExecutor(max_workers=2) as pool:
+    first = pool.submit(publisher.process_leased_command, race_wire, DUMMY_KEY, {}, time.time())
+    ready = entered.wait(10)
+    if ready:
+        second = pool.submit(publisher.process_leased_command, race_wire, DUMMY_KEY, {}, time.time()).result(timeout=15)
+    else:
+        second = {"outcome": "failed", "detail": "first consumer did not enter spawn"}
+    release.set()
+    first = first.result(timeout=20)
+check("overlapping duplicate consumer sees exact ambiguous-receipt refusal",
+      ready and second.get("outcome") == "refused" and "outcome_unknown" in second.get("detail", ""), second)
+check("only one overlapping consumer executes the launch", first.get("outcome") == "accepted" and spawn_calls == ["cmd_race_duplicate"], first)
+if first.get("local_task_id"):
+    process_command({"command_id":"cmd_race_cancel","op":"cancel","remote_task_id":race_request["remote_task_id"],
+                     "payload":{"local_task_id":first["local_task_id"]}})
+barrier = threading.Barrier(2)
+
+
+def concurrent_job(index):
+    request = {"command_id": f"cmd_concurrent_{index}", "op": "start",
+               "remote_task_id": f"rtask_20261002T000021Z_0011001{index}",
+               "payload": {"repo": "knowledge-base", "mode": "research", "objective": f"job {index}"}}
+    wire = signed_command(request)
+    barrier.wait(timeout=10)
+    return request, publisher.process_leased_command(wire, DUMMY_KEY, {}, time.time())
+
+
+with ThreadPoolExecutor(max_workers=2) as pool:
+    jobs = list(pool.map(concurrent_job, [2, 3]))
+check("two different jobs launch concurrently with distinct local tasks",
+      all(outcome.get("outcome") == "accepted" for _, outcome in jobs)
+      and len({outcome.get("local_task_id") for _, outcome in jobs}) == 2, jobs)
+for request, outcome in jobs:
+    if outcome.get("local_task_id"):
+        bound = registry_row(outcome["local_task_id"])
+        check("concurrent task retains its own remote binding " + request["command_id"], bound["remote_task_id"] == request["remote_task_id"])
+        process_command({"command_id":request["command_id"]+"_cancel","op":"cancel","remote_task_id":request["remote_task_id"],
+                         "payload":{"local_task_id":outcome["local_task_id"]}})
+
+if REGISTRY_ONLY:
+    print("SKIP: independent timer/process-identity checks (--registry-only); no timer verification claimed")
+else:
+    print("== Z5: every accepted start schedules a real, independently-firing hard-stop timer, "
+          "killed on a real cancel but NOT while the task is still running (F9) ==")
+    out_z5a = process_command({
+        "command_id": "cmd_z5a", "op": "start", "remote_task_id": "rtask_20261002T000009Z_00005a01",
+        "payload": {"repo": "knowledge-base", "mode": "research", "objective": "z5a"},
+    })
+    check("Z5a start accepted", out_z5a.get("outcome") == "accepted", json.dumps(out_z5a))
+    task_id_z5a, run_id_z5a = out_z5a.get("local_task_id", ""), out_z5a.get("local_run_id", "")
+
+
+    def _hard_stop_pid(task_id: str) -> int | None:
+        con = sqlite3.connect(tsk.REGISTRY)
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT payload FROM events WHERE task_id=? AND type='hard_stop_scheduled' "
+                           "ORDER BY sequence DESC LIMIT 1", (task_id,)).fetchone()
+        con.close()
+        if not row:
+            return None
         try:
-            reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
-            if reaped_pid == pid:
-                return True
-        except ChildProcessError:
-            out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
-            if out.stdout.strip() in ("", ) or out.stdout.strip().startswith("Z"):
-                return True
-        time.sleep(0.05)
-    return False
+            pid = json.loads(row["payload"]).get("pid")
+        except ValueError:
+            return None
+        return pid if isinstance(pid, int) and pid > 0 else None
 
 
-pid_z5a = _hard_stop_pid(task_id_z5a)
-check("a real numeric hard-stop pid was recorded for Z5a's start", pid_z5a is not None, pid_z5a)
-alive_before_cancel = False
-if pid_z5a is not None:
-    try:
-        os.kill(pid_z5a, 0)
-        alive_before_cancel = True
-    except ProcessLookupError:
-        pass
-check("Z5a's hard-stop pid is a REAL, live detached process before cancel (not a placeholder)",
-      alive_before_cancel, pid_z5a)
+    def _reap_or_confirm_dead(pid: int, timeout_s: float = 2.0) -> bool:
+        """Only reap processes this fixture itself created; no ps access needed."""
+        proc = OWNED_TIMERS.get(pid)
+        if proc is None:
+            return False
+        if proc.poll() is None:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        try:
+            proc.wait(timeout=timeout_s)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
 
-cout_z5a = tsk.process_command({
-    "command_id": "cmd_z5a_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000009Z_00005a01",
-    "payload": {"local_task_id": task_id_z5a, "reason": "canceled"},
-})
-check("Z5a cancel (through tasks.py's own process_command, the real production path) accepted",
-      cout_z5a.get("outcome") == "accepted", json.dumps(cout_z5a))
-still_alive_after_cancel = True
-if pid_z5a is not None:
-    try:
-        os.kill(pid_z5a, 0)
-    except ProcessLookupError:
-        still_alive_after_cancel = False
-check("F9: Z5a's hard-stop pid was killed by the cancel it went through -- no 60+-minute leaked sleep",
-      not still_alive_after_cancel, pid_z5a)
 
-print("== Z5b: a hard-stop timer is NOT killed while its task is still running (F9 only fires on a terminal transition) ==")
-out_z5b = tsk.process_command({
-    "command_id": "cmd_z5b", "op": "start", "remote_task_id": "rtask_20261002T000010Z_00005b01",
-    "payload": {"repo": "knowledge-base", "mode": "research", "objective": "z5b"},
-})
-check("Z5b start accepted", out_z5b.get("outcome") == "accepted", json.dumps(out_z5b))
-task_id_z5b = out_z5b.get("local_task_id", "")
-pid_z5b = _hard_stop_pid(task_id_z5b)
-check("a real numeric hard-stop pid was recorded for Z5b's start", pid_z5b is not None, pid_z5b)
-# No cancel, no auto_close, no sweep() here -- Z5b's task stays 'running'.
-# Its timer must still be alive; F9 only kills on a terminal transition.
-still_alive_z5b = False
-if pid_z5b is not None:
-    try:
-        os.kill(pid_z5b, 0)
-        still_alive_z5b = True
-    except ProcessLookupError:
-        pass
-check("Z5b's hard-stop pid is still alive -- nothing killed it while the task is still running",
-      still_alive_z5b, pid_z5b)
-if pid_z5b is not None and still_alive_z5b:
-    _reap_or_confirm_dead(pid_z5b)  # it would otherwise sleep ~62 real minutes
+    pid_z5a = _hard_stop_pid(task_id_z5a)
+    check("a real numeric hard-stop pid was recorded for Z5a's start", pid_z5a is not None, pid_z5a)
+    alive_before_cancel = False
+    if pid_z5a is not None:
+        try:
+            os.kill(pid_z5a, 0)
+            alive_before_cancel = True
+        except ProcessLookupError:
+            pass
+    check("Z5a's hard-stop pid is a REAL, live detached process before cancel (not a placeholder)",
+          alive_before_cancel, pid_z5a)
+
+    cout_z5a = process_command({
+        "command_id": "cmd_z5a_cancel", "op": "cancel", "remote_task_id": "rtask_20261002T000009Z_00005a01",
+        "payload": {"local_task_id": task_id_z5a, "reason": "canceled"},
+    })
+    check("Z5a cancel (through tasks.py's own process_command, the real production path) accepted",
+          cout_z5a.get("outcome") == "accepted", json.dumps(cout_z5a))
+    still_alive_after_cancel = True
+    if pid_z5a is not None:
+        try:
+            os.kill(pid_z5a, 0)
+        except ProcessLookupError:
+            still_alive_after_cancel = False
+    check("F9: Z5a's hard-stop pid was killed by the cancel it went through -- no 60+-minute leaked sleep",
+          not still_alive_after_cancel, pid_z5a)
+
+    print("== Z5b: a hard-stop timer is NOT killed while its task is still running (F9 only fires on a terminal transition) ==")
+    out_z5b = process_command({
+        "command_id": "cmd_z5b", "op": "start", "remote_task_id": "rtask_20261002T000010Z_00005b01",
+        "payload": {"repo": "knowledge-base", "mode": "research", "objective": "z5b"},
+    })
+    check("Z5b start accepted", out_z5b.get("outcome") == "accepted", json.dumps(out_z5b))
+    task_id_z5b = out_z5b.get("local_task_id", "")
+    pid_z5b = _hard_stop_pid(task_id_z5b)
+    check("a real numeric hard-stop pid was recorded for Z5b's start", pid_z5b is not None, pid_z5b)
+    # No cancel, no auto_close, no sweep() here -- Z5b's task stays 'running'.
+    # Its timer must still be alive; F9 only kills on a terminal transition.
+    still_alive_z5b = False
+    if pid_z5b is not None:
+        try:
+            os.kill(pid_z5b, 0)
+            still_alive_z5b = True
+        except ProcessLookupError:
+            pass
+    check("Z5b's hard-stop pid is still alive -- nothing killed it while the task is still running",
+          still_alive_z5b, pid_z5b)
+    if pid_z5b is not None and still_alive_z5b:
+        _reap_or_confirm_dead(pid_z5b)  # it would otherwise sleep ~62 real minutes
 
 # Conductor's own nit (round-2 review): every per-section cleanup above
 # handles its OWN out-of-band shortcut; this is the blanket safety net
@@ -688,19 +848,11 @@ if pid_z5b is not None and still_alive_z5b:
 # as a false leak either (the fix for the flake: a plain `os.kill(pid,
 # 0)` right after killpg sees a just-killed-but-unreaped zombie as
 # "still alive").
-con_cleanup = sqlite3.connect(tsk.REGISTRY)
-con_cleanup.row_factory = sqlite3.Row
-leftover_pids = [
-    json.loads(r["payload"]).get("pid")
-    for r in con_cleanup.execute("SELECT payload FROM events WHERE type='hard_stop_scheduled'").fetchall()
-]
-con_cleanup.close()
-leaked = [pid for pid in leftover_pids if pid is not None and not _reap_or_confirm_dead(pid)]
-check("teardown: no hard-stop timer scheduled anywhere in this run was left alive",
-      leaked == [], leaked)
+cleanup_owned_timers()
+check("teardown: every timer created by this fixture is reaped", all(p.poll() is not None for p in OWNED_TIMERS.values()))
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 if failures:
     print(f"FAILED: {len(failures)} check(s): {failures}")
     sys.exit(1)
-print("PASS: all real-registry e2e checks green")
+print("PASS: real-registry lifecycle checks green" + ("; independent timer checks explicitly excluded" if REGISTRY_ONLY else ""))

@@ -54,6 +54,18 @@ _sp_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_sp_dir/command-policy.sh"
 . "$_sp_dir/run-registry.sh"
 
+# Ownership grants may clear a policy escalation, but a missing/broken parser
+# is not a reviewable command shape. Exercise the installed helper itself (not
+# just its path) before any such grant; no caller-provided readiness flag counts.
+_sp_shell_policy_ready() {
+  local probe
+  SP_DEPENDENCY_REASON="policy dependency unavailable: bash parser self-check failed; approval held"
+  _cp_bashlex_resolve_helper || return 1
+  probe="$(CP_LAUNCHER_NAMES="$_CP_LAUNCHER_NAMES" "$_CP_BASHLEX_PY" "$_CP_BASHLEX_SCRIPT" <<<'true' 2>/dev/null)" || return 1
+  [ "$probe" = ALLOW ] || return 1
+  SP_DEPENDENCY_REASON=""
+}
+
 _sp_collapse_ws() { printf '%s' "$1" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'; }
 
 # _sp_command_region <panel> -> the text after the omp "Command:"/"run:"
@@ -496,6 +508,18 @@ peer_decide() {                         # cmd task-json
     return 1
   fi
 
+  # A registered task's capabilities are usable only with verified provenance
+  # in the protected registry. This precedes BOTH the simple-command grant
+  # and the compound-command fallback, and covers existing file approvals.
+  if [ -n "$task_id$wt$manifest" ] && ! task_authorization_check "$task"; then
+    PD_VERDICT=reserved PD_REASON="${TASK_AUTHORIZATION_REASON:-task authorization unavailable; human-only hold}"
+    return 1
+  fi
+  if ! _sp_shell_policy_ready; then
+    PD_VERDICT=reserved PD_REASON="$SP_DEPENDENCY_REASON"
+    return 1
+  fi
+
   # The manifest's declared ceiling binds even the ownership grant: a task
   # spawned `git: commit-only` does not get its push pressed by a peer.
   ceil="$(_cp_scope_ceiling "$cmd" "$manifest")"
@@ -550,6 +574,10 @@ peer_decide() {                         # cmd task-json
   [ -n "$task_id" ] && state="$(file_approval_state "$task_id" "$PD_CODE_PATH" "$PD_CODE_SHA")"
   case "$state" in
     approved)
+      if ! task_authorization_check "$task"; then
+        PD_VERDICT=reserved PD_REASON="${TASK_AUTHORIZATION_REASON:-authorization hold: provenance unavailable; human-only}"
+        return 1
+      fi
       # A hash binds ONE file's bytes. A script that runs or imports other
       # local files would carry those files' later edits through a stale
       # approval, so it never re-runs on one — every run is a review.

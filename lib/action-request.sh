@@ -21,7 +21,9 @@
 # different request. Consumption is a check-and-set UPDATE, so one approval
 # runs the call exactly once even under parallel identical calls.
 #
-# Requires lib/run-registry.sh to be sourced.
+# Requires lib/run-registry.sh; consuming shell grants also requires the
+# installed parser readiness gate from lib/scoped-policy.sh (normally loaded
+# by lib/pretool-shadow.sh). Missing dependencies always refuse consumption.
 # Not a containment boundary (docs/approval-policy.md rule 7): a same-user
 # process can write the registry.
 [ -n "${_HERDR_ACTION_REQUEST_SH:-}" ] && return 0
@@ -66,7 +68,13 @@ _ar_latest() {                          # task action_sha -> json row of the new
 # Atomically turn an approved one-shot grant into `consumed`. 0 only for the
 # ONE caller whose UPDATE changed the row.
 action_grant_consume() {                # request_id -> 0 consumed by this call
-  local n
+  local n row task
+  row="$(_ar_row "$1")" || return 1
+  task="$(read_task "$(printf '%s' "$row" | jq -r '.run_id // empty')" "$(printf '%s' "$row" | jq -r '.task_id // empty')")" || return 1
+  task_authorization_check "$task" || return 1
+  case "$(printf '%s' "$row" | jq -r '.tool // empty')" in
+    bash|shell) _sp_shell_policy_ready || return 1 ;;
+  esac
   n="$(_sql "UPDATE action_requests SET status='consumed', consumed_at=$(_sq "$(_now_iso)")
       WHERE request_id=$(_sq "$1") AND status='approved' AND grant_kind='once'; SELECT changes();" 2>/dev/null)"
   [ "${n:-0}" = 1 ]
@@ -100,12 +108,36 @@ action_request_create() {               # run task tool action_sha command verdi
 }
 
 # The whole hook-time lookup for a not-allowed call. Sets AR_DECISION
-# (allow|block), AR_REQUEST_ID, AR_STATE (consumed|pending|declined|new) and
+# (allow|block), AR_REQUEST_ID, AR_STATE
+# (consumed|pending|declined|new|authorization_hold|dependency_hold) and
 # AR_WHO/AR_WHY for a declined request.
 action_request_resolve() {              # run task tool action_sha command verdict reason route grant_kind code_path code_sha
-  local run="$1" task="$2" sha="$4" row st id
+  local run="$1" task="$2" sha="$4" row st id tj
   AR_DECISION=block AR_REQUEST_ID="" AR_STATE="" AR_WHO="" AR_WHY=""
   row="$(_ar_latest "$task" "$sha")"
+  # Retain an explicit refusal even when provenance later becomes unreadable.
+  # An authorization hold never consumes a pre-existing grant or generates a
+  # new request (including after an acknowledgement was lost).
+  if [ -n "$row" ] && [ "$(printf '%s' "$row" | jq -r '.status')" = declined ]; then
+    AR_REQUEST_ID="$(printf '%s' "$row" | jq -r '.request_id')" AR_STATE=declined
+    AR_WHO="$(printf '%s' "$row" | jq -r '.authority')"
+    AR_WHY="$(printf '%s' "$row" | jq -r '.decision_reason')"
+    return 0
+  fi
+  tj="$(read_task "$run" "$task")"
+  if ! task_authorization_check "$tj"; then
+    AR_STATE=authorization_hold AR_WHY="${TASK_AUTHORIZATION_REASON:-task authorization unavailable; human-only hold}"
+    [ -z "$row" ] || AR_REQUEST_ID="$(printf '%s' "$row" | jq -r '.request_id')"
+    return 0
+  fi
+  case "$3" in
+    bash|shell)
+      if ! _sp_shell_policy_ready; then
+        AR_STATE=dependency_hold AR_WHY="$SP_DEPENDENCY_REASON"
+        [ -z "$row" ] || AR_REQUEST_ID="$(printf '%s' "$row" | jq -r '.request_id')"
+        return 0
+      fi ;;
+  esac
   if [ -n "$row" ]; then
     st="$(printf '%s' "$row" | jq -r '.status')"; id="$(printf '%s' "$row" | jq -r '.request_id')"
     case "$st" in
@@ -140,7 +172,12 @@ action_request_resolve() {              # run task tool action_sha command verdi
 
 # Check-and-set pending -> approved|declined|superseded. 0 only for the caller that won.
 action_request_decide() {               # request_id approved|declined|superseded authority decided_by category reason
-  local n
+  local n row task
+  if [ "$2" = approved ]; then
+    row="$(_ar_row "$1")" || return 1
+    task="$(read_task "$(printf '%s' "$row" | jq -r '.run_id // empty')" "$(printf '%s' "$row" | jq -r '.task_id // empty')")" || return 1
+    task_authorization_check "$task" || return 1
+  fi
   n="$(_sql "UPDATE action_requests SET status=$(_sq "$2"), decided_at=$(_sq "$(_now_iso)"),
       authority=$(_sq "$3"), decided_by=$(_sq "$4"), review_category=$(_sq "$5"), decision_reason=$(_sq "$6")
       WHERE request_id=$(_sq "$1") AND status='pending'; SELECT changes();" 2>/dev/null)"

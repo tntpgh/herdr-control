@@ -41,6 +41,7 @@ from pathlib import Path
 
 from sanitize import clean, read_single_link_regular
 import tasks as rtasks
+from authorization import AuthorizationError, canonical_json, verify_command
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -1484,6 +1485,30 @@ def _trim_owner_replies_to_budget(rows: list[dict], raw: list[dict], budget: int
     return rows, raw
 
 
+def process_leased_command(cmd: dict, key: str, processed: dict, now_s: float) -> dict:
+    """Admission precedes all start/resume execution and cache lookup.
+
+    The JSON cache is delivery bookkeeping, not authorization. Start/resume
+    retries reconcile against the protected registry receipt instead.
+    """
+    cid = cmd.get("command_id", "")
+    if cmd.get("op") in ("start", "resume"):
+        try:
+            authorization = verify_command(cmd, key, rtasks.load_allowlist())
+        except (AuthorizationError, ValueError, OSError, TypeError) as exc:
+            return {"command_id": cid, "outcome": "refused", "detail": f"task authorization refused: {exc}"[:300]}
+        return rtasks.process_command(cmd, authorization=authorization)
+    fingerprint = hashlib.sha256(canonical_json(cmd).encode("utf-8")).hexdigest()
+    prior = processed.get(cid)
+    if prior:
+        if prior.get("command_sha256") != fingerprint:
+            return {"command_id": cid, "outcome": "refused", "detail": "command replay binding missing or changed"}
+        return prior["ack"]
+    ack = rtasks.process_command(cmd)
+    processed[cid] = {"at": now_s, "command_sha256": fingerprint, "ack": ack}
+    return ack
+
+
 def main(argv: list[str]) -> int:
     os.umask(0o077)  # state.json / audit.jsonl carry emails and client ids
     if "--print-key-fingerprint" in argv:  # identity, never the value (provision.sh compares it to 1Password)
@@ -1714,13 +1739,10 @@ def main(argv: list[str]) -> int:
     cmd_leased_at = time.monotonic()
     for cmd in commands:
         cid = cmd["command_id"]
-        if cid in processed:
-            ack = processed[cid]["ack"]
-        elif time.monotonic() - cmd_leased_at > COMMAND_LEASE_LOCAL_S:
+        if time.monotonic() - cmd_leased_at > COMMAND_LEASE_LOCAL_S:
             continue  # not even attempted this tick; the Worker's own lease expires and re-queues it
         else:
-            ack = rtasks.process_command(cmd)
-            processed[cid] = {"at": now.timestamp(), "ack": ack}
+            ack = process_leased_command(cmd, key, processed, now.timestamp())
         log(f"command {cid} ({cmd.get('op')}): {ack['outcome']} ({ack.get('detail', '')})")
         new_command_acks.append(ack)
         st["processed_commands"], st["pending_command_acks"] = processed, new_command_acks

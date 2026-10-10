@@ -61,6 +61,9 @@ export interface TaskCaps {
 }
 export interface TaskConfig {
   mac_enabled: boolean; // this sync's HERDR_MCP_TASKS switch state on the Mac
+  // Start/resume require a receiver that verifies and durably binds the
+  // command receipt before launch. Missing/other versions fail closed.
+  authorization_protocol?: number;
   repos: string[];
   modes: { research: TaskModeConfig; implement: TaskModeConfig };
   caps: TaskCaps;
@@ -257,6 +260,13 @@ export interface OwnerReplySync {
 // outcome back as a CommandAck on its next sync -- never a separate route,
 // so the Mac never listens and the push model stays one-directional).
 export type CommandOp = "start" | "cancel" | "resume";
+export interface CommandAuthorization {
+  // Recursively key-sorted, compact UTF-8 JSON, signed exactly as sent.
+  // This proves the existing OAuth task delegation, never a human's
+  // exact-command approval or a decision by the assigned supervisor.
+  claims: string;
+  signature: string;
+}
 export interface CommandItem {
   command_id: string;
   op: CommandOp;
@@ -270,6 +280,7 @@ export interface CommandItem {
   // bisection -- swapping this one field's type is what flips it). The Mac
   // only ever reads this JSON-decoded, never indexes it generically here.
   payload: object;
+  authorization?: CommandAuthorization;
 }
 export interface CommandAck {
   command_id: string;

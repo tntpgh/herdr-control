@@ -21,24 +21,38 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 . "$HERE/lib/run-registry.sh"
 
 root="$1" branch="$2"
+authorization_command_id=""
+prev=""
+for arg in "$@"; do
+  [ "$prev" != --authorization-command-id ] || authorization_command_id="$arg"
+  prev="$arg"
+done
+[ -n "$authorization_command_id" ] || { echo 'fixture requires signed authorization' >&2; exit 1; }
+receipt="$(read_task_authorization "$authorization_command_id")"
+manifest="$(printf '%s' "$receipt" | jq -er '.expected_manifest')"
 repo_name=$(basename "$root")
 wt="${HERDR_WT_DIR:?HERDR_WT_DIR must be set to a scratch dir}/$repo_name/$branch"
 mkdir -p "$(dirname "$wt")"
 
 trunk=main
-git init -q -b "$trunk" "$wt"
-mkdir -p "$wt/.handoffs"
-printf '*\n' > "$wt/.handoffs/.gitignore"
-git -C "$wt" -c user.email=e2e@test -c user.name=e2e add -f .handoffs/.gitignore
-git -C "$wt" -c user.email=e2e@test -c user.name=e2e commit -q -m init
-git -C "$wt" switch -q -c "$branch"
+if [ ! -d "$wt/.git" ]; then
+  git init -q -b "$trunk" "$wt"
+  mkdir -p "$wt/.handoffs"
+  printf '*\n' > "$wt/.handoffs/.gitignore"
+  git -C "$wt" -c user.email=e2e@test -c user.name=e2e add -f .handoffs/.gitignore
+  git -C "$wt" -c user.email=e2e@test -c user.name=e2e commit -q -m init
+  git -C "$wt" switch -q -c "$branch"
+fi
 
 run_id="run_e2e_$(date -u +%Y%m%dT%H%M%SZ)_$$"
 task_id="task_e2e_$(date -u +%Y%m%dT%H%M%SZ)_$$_${RANDOM}"
 
 register_task "$run_id" "$task_id" worker_e2e conductor_e2e "" "" \
   pane_e2e_fake birth_e2e_fake "$root" "$wt" e2e-label "$branch" "$trunk" \
-  "$repo_name" "" menu
+  "$repo_name" "$manifest" menu "$authorization_command_id"
+mark_authorization_launch "$authorization_command_id" "$task_id" "$run_id" launch_claimed
+# This is a fixture launch acknowledgement. No agent process is run.
+mark_authorization_launch "$authorization_command_id" "$task_id" "$run_id" launched
 
 jq -n --arg run "$run_id" --arg task "$task_id" --arg event "e2e_done" \
   --arg events "$wt/.handoffs/events.jsonl" --arg worktree "$wt" \

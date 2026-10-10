@@ -178,12 +178,17 @@ pane_is_conductor_eligible() {          # pane_id -> 0 eligible, 1 refuse
 # Bounded (HERDR_ANCESTOR_WALK_MAX hops, default 32) so a cycle or a very
 # deep tree cannot hang a caller; each hop costs one `ps` call.
 _pg_process_ancestors() {   # -> $PPID, its parent, ... one pid per line
-  local pid="$PPID" hops=0 max="${HERDR_ANCESTOR_WALK_MAX:-32}"
+  local pid="$PPID" parent hops=0 max="${HERDR_ANCESTOR_WALK_MAX:-32}"
   while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && [ "$hops" -lt "$max" ]; do
     printf '%s\n' "$pid"
     hops=$((hops + 1))
-    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    parent="$(ps -o ppid= -p "$pid" 2>/dev/null)" || return 1
+    pid="$(printf '%s' "$parent" | tr -d '[:space:]')"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   done
+  # A truncated walk is an unavailable identity, never evidence the caller
+  # is an external human. Partial stdout must not be used after failure.
+  [ "$pid" = 0 ] || [ "$pid" = 1 ]
 }
 
 # Which live pane is this process actually running inside, as herdr itself
@@ -210,7 +215,7 @@ caller_pane_from_ancestry() {
 $(printf '%s' "$info" | jq -r --arg pane "$p" \
       '.result.process_info.foreground_processes[]? | (.pid|tostring) + " " + $pane' 2>/dev/null)"
   done
-  ancestors="$(_pg_process_ancestors)"
+  ancestors="$(_pg_process_ancestors)" || return 1
   [ -n "$ancestors" ] || return 1
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue

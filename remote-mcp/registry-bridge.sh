@@ -98,6 +98,12 @@ _cancel_attempt_failed() {
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
+  accept-authorization)
+    accept_task_authorization "$1" "$2" "${3:-}" || exit 1
+    ;;
+  read-authorization)
+    read_task_authorization "$1" || exit 1
+    ;;
   read)
     read_task "$1" "$2"
     ;;

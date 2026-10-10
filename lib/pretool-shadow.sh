@@ -211,6 +211,7 @@ _ps_identity() {
     PS_REGISTRY_OK=0; _ps_id_fail "registry unreadable ($(registry_db))"; return 1
   fi
   if ! _sql "SELECT approval FROM tasks LIMIT 0;" >/dev/null 2>&1 \
+     || ! _sql "SELECT 1 FROM task_authorizations LIMIT 0;" >/dev/null 2>&1 \
      || ! _sql "SELECT 1 FROM action_requests LIMIT 0;" >/dev/null 2>&1; then
     registry_init >/dev/null 2>&1 || { PS_REGISTRY_OK=0; _ps_id_fail "registry not migrated and migration failed"; return 1; }
   fi
@@ -947,6 +948,20 @@ pretool_enforce() {                     # payload-json (after pretool_decide) ->
     PS_WORKER_REASON="herdr hook-approval: refused — the hook-approval policy rules are missing, so nothing runs. Tell your conductor."
     return 8
   fi
+  # Task provenance is a precondition, including for allow-class tools and
+  # already-approved file/one-shot grants. A conductor cannot override this
+  # hold. Do not create recurring requests or send wakes for the same defect.
+  if ! task_authorization_check "$PS_TASK_JSON"; then
+    PS_VERDICT=block PS_POLICY=task-authorization
+    PS_REASON="${TASK_AUTHORIZATION_REASON:-task authorization unavailable; human-only hold}"
+    PS_WORKER_REASON="herdr: not run — $PS_REASON. Authorization remains held; no new approval request was created. Do not retry or work around it."
+    return 8
+  fi
+  if [ -n "$PS_CMD" ] && ! _sp_shell_policy_ready; then
+    PS_VERDICT=block PS_POLICY=policy-dependency PS_REASON="$SP_DEPENDENCY_REASON"
+    PS_WORKER_REASON="herdr: not run — $PS_REASON. No new approval request was created. Do not retry or work around it."
+    return 8
+  fi
   case "$PS_VERDICT" in
     allow) PS_DECISION=allow; return 0 ;;
     escalate|reserved) ;;
@@ -1000,6 +1015,10 @@ pretool_enforce() {                     # payload-json (after pretool_decide) ->
   fi
   PS_REQUEST_ID="$AR_REQUEST_ID"
   case "$AR_STATE" in
+    authorization_hold|dependency_hold)
+      PS_VERDICT=block PS_POLICY=task-authorization
+      PS_WORKER_REASON="herdr: not run — $AR_WHY. Authorization remains held; no new approval request was created. Do not retry or work around it."
+      return 8 ;;
     consumed)
       PS_DECISION=allow
       PS_REASON="approved request $AR_REQUEST_ID consumed (one-shot grant for these exact bytes)"

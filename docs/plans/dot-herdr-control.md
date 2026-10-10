@@ -1,6 +1,6 @@
 # Dot → Herdr: preserve task authority without turning messages into approvals
 
-Status: plan for independent review; no implementation or activation authorized by this document.
+Status: bounded inactive M1 implementation authorized after independent review of `212033cdc389283d8edd40c68af96b5229e424d8`. This document does not authorize activation or a live approval.
 Date: 2026-10-10 UTC. Baseline: `4f071ad0454bb5fcb1d835872bd6705064207c3f` (deployed PR272).
 Branch: `fix/dot-control-authorization`. Worktree: `/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control`.
 
@@ -217,9 +217,21 @@ Rollback before activation: retain the worktree/commits, remove no user data, an
 
 ## 10. Open review decisions and completion boundaries
 
-* Parent reports Astra ultra architecture review completed; provide this exact committed plan for its pending acceptance. Do not label architectural advice as exact-plan or exact-code approval.
+* Parent reports Astra ultra architecture review completed and independent exact-plan GO at `212033cdc389283d8edd40c68af96b5229e424d8` for inactive M1. Exact-code approval remains a separate gate.
 * Independent reviewer should challenge M2's exact lifecycle and migration before implementation, especially file-grant lifetime, actor authentication and the consume/side-effect crash gap.
 * Decide whether M1 alone meets the real canary without broader grammar recognition. Prefer the existing reviewed conductor route; a generic compound shell parser is outside the first fix.
 * Canary activation scope remains unapproved. Current remote allowlist excludes `herdr-control`; do not alter it or use `knowledge-base` as a proxy. Ask the parent for an explicitly permitted isolated canary route when the reviewed candidate is ready.
 * Legacy unknown grants need direct trusted recovery authorization. Main's current explicit refusal is authoritative for this workflow; the engineering patch must not silently bless the two current tasks or replay their blocked commands.
 * This plan is not an approval for current real worker commands, a persistent security grant, a deploy or a completed implementation. Release acceptance remains open until exact-head review and actual permitted canary evidence exist.
+
+## 11. Follow-on: unreadable menus and truthful progress
+
+Parent supplied a further observation during M1: Main had been idle since 00:52:13 UTC with its inbox answered, while both workers had been blocked about ten minutes on routine closure/read-only commands. Automation refused wrapped or unreadable menus. Main's completed code reviews did not authorize further work: recap had 1 high/5 medium/2 low findings, finance 3 high/5 medium/3 low. These are reported observations; this engineering task did not inspect or answer the live menus.
+
+Independent source diagnosis found four gaps. The OMP hook already receives `toolCallId`, but `notifyForPrompt` drops it. `omp-notify.sh` exits without recording an approval if its five screen checks fail. `attention-tick.sh` treats an unreadable prompt like an answered one, and the hub watchdog's denied-prompt rule considers `stalled` while a worker can remain `blocked`. A pure fixture aged 940 seconds returned no watchdog signal for `blocked`, but `denied` for `stalled`. The sweep also interpreted every selector exit 8 as clipping and recommended shorter commands. M1 removes that misleading advice and preserves the refusal; it does not reissue a held command.
+
+The separately reviewed follow-on should preserve `(session, toolCallId, task, pane birth, tool, input hash)` as a durable observation even when the screen cannot be read. An observation is never an approval. Inventory, attention and selection should share explicit states: `pending_parseable`, `pending_unreadable`, `read_failed`, `correlation_mismatch`, `authorization_held`, `resolved`, and `unknown`. Unknown must not mean idle. Preserve exact current selector checks and retain the complete input for corroboration; do not guess highlighted options or relax parsing. Existing hook-mode exact requests may be used only for tasks already authorized and configured for that path.
+
+Track unresolved occurrences across blocked/stalled states, restart and handover. Deduplicate notification by occurrence and conductor generation. Acknowledgement means receipt; resolution requires the matching completion, decline or withdrawal. An answered inbox, unrelated owner reply, review, delivered wake or idle Main is not evidence that the pending action resolved. Mark work runnable only after source authority, current policy and the exact action validate.
+
+Acceptance for this follow-on: wrapped commands/footer/status rows, clipped headers/bodies, Unicode widths, unreadable highlights, forged panel text, unknown options, missing/delayed hook events, concurrent identical commands with distinct call IDs, recycled panes, changed commands, restart/ack loss and handover all retain one correct occurrence. Every unknown/mismatch path sends zero keys; repeated observations create no duplicate owner requests; unresolved work cannot be reported as “no prompts”, idle or completed. No new remote approval endpoint, worker posture switch or legacy grant repair is authorized by this diagnosis.

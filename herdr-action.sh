@@ -18,7 +18,7 @@
 #   herdr-action.sh tick                   the hub's pass (hub.py, every 60s)
 #
 # Authority — today's herdr-select.sh rules, unchanged:
-#   conductor  the caller's HERDR_PANE_ID must be the task's registered
+#   conductor  the caller's process ancestry must resolve to the task's registered
 #              conductor pane AND its live generation (terminal_id) must equal
 #              the registered conductor_pane_birth; the task must be active; an
 #              operational --review-category and a --review-reason are required.
@@ -110,10 +110,22 @@ _ha_task_terminal() {                   # task-json -> 0 if terminal
 }
 
 _ha_conductor_ok() {                    # task-json -> 0 if the caller is its live conductor
-  local owner birth
+  local owner birth caller
   owner="$(_ha_field "$1" conductor_pane_id)"; birth="$(_ha_field "$1" conductor_pane_birth)"
-  [ -n "$owner" ] && [ "$owner" = "${HERDR_PANE_ID:-}" ] && [ -n "$birth" ] \
+  caller="$(caller_pane_from_ancestry)" || return 1
+  [ -n "$owner" ] && [ "$owner" = "$caller" ] && [ -n "$birth" ] \
     && [ "$birth" = "$(pane_birth_now "$owner")" ]
+}
+
+# Keep pre-existing pending rows visible for inspection, but never re-surface
+# them as approval questions while the source authority is unverified. Record
+# one durable hold per request; a restart/tick/ack loss does not send again.
+_ha_authorization_ok() {                # request-row task-json
+  task_authorization_check "$2" && return 0
+  append_event "$(_ha_field "$1" run_id)" "$(_ha_field "$1" task_id)" action_authorization_held \
+    "$(jq -nc --arg id "$(_ha_field "$1" request_id)" --arg r "${TASK_AUTHORIZATION_REASON:-authorization hold: provenance unavailable; human-only}" \
+       '{request_id:$id,reason:$r}')" "actauthhold_$(_ha_field "$1" request_id)" >/dev/null 2>&1 || true
+  return 1
 }
 
 # An answered hub form for exactly this request. Prints the answer JSON.
@@ -173,6 +185,16 @@ _ha_decide() {                          # id approved|declined|superseded author
   row="$(action_request_get "$id")"
   [ -n "$row" ] || die "no request $id" 3
   kind="$(_ha_field "$row" grant_kind)"; run="$(_ha_field "$row" run_id)"; task="$(_ha_field "$row" task_id)"
+  if [ "$auth" = conductor ]; then
+    local current_task
+    current_task="$(read_task "$run" "$task")"
+    _ha_task_active "$current_task" && _ha_conductor_ok "$current_task" &&
+      [ "$who" = "$(_ha_field "$current_task" conductor_pane_id)" ] \
+      || die "conductor assignment changed during review; no decision or notification written" 8
+  fi
+  if [ "$status" = approved ] && ! task_authorization_check "$(read_task "$run" "$task")"; then
+    die "${TASK_AUTHORIZATION_REASON:-task authorization unavailable; human-only hold}; no decision or notification written" 8
+  fi
   action_request_decide "$id" "$status" "$auth" "$who" "$cat" "$why" \
     || die "request $id is not pending (status $(_ha_field "$row" status)) — nothing changed" 4
   if [ "$status" = approved ] && [ "$kind" = file ]; then
@@ -242,13 +264,17 @@ cmd_decide() {                          # approve|decline|supersede id [flags]
       _ha_conductor_ok "$tj" || die "caller is not this task's live registered conductor" 8
       [ -n "${why//[[:space:]]/}" ] || die "conductor requires --review-reason after reviewing the complete action and target"
       if [ "$status" = approved ]; then
+        task_authorization_check "$tj" || die "${TASK_AUTHORIZATION_REASON:-task authorization unavailable; human-only hold}" 8
+        case "$(_ha_field "$row" tool)" in
+          bash|shell) _sp_shell_policy_ready || die "$SP_DEPENDENCY_REASON" 8 ;;
+        esac
         case "$cat" in local-read|local-build|branch-work|owned-cleanup) ;;
           *) die "conductor approval requires an operational --review-category" ;; esac
         if [ "$route" != conductor ] || [ "$verdict" = reserved ] || [ "$verdict" = deny ]; then
           die "request $id is human-only ($verdict): a conductor may decline it but not approve it" 8
         fi
       fi
-      _ha_decide "$id" "$status" conductor "${HERDR_PANE_ID:-}" "$cat" "$why" ;;
+      _ha_decide "$id" "$status" conductor "$(_ha_field "$tj" conductor_pane_id)" "$cat" "$why" ;;
     human)
       local ans pinned
       # Only the formserve record the hub tick pinned when it served THIS
@@ -322,9 +348,10 @@ cmd_surface() {                         # id -> wake the conductor once
   row="$(action_request_get "$id")"; [ -n "$row" ] || return 3
   [ "$(_ha_field "$row" status)" = pending ] || return 0
   [ "$(_ha_field "$row" route)" = conductor ] || return 0
+  tj="$(read_task "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)")"
+  _ha_authorization_ok "$row" "$tj" || return 8
   claim_once "actsurf_${id}" "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)" action_surface_claimed \
     "$(jq -nc --arg id "$id" '{request_id:$id}')" || return 0
-  tj="$(read_task "$(_ha_field "$row" run_id)" "$(_ha_field "$row" task_id)")"
   cpane="$(_ha_field "$tj" conductor_pane_id)"; cbirth="$(_ha_field "$tj" conductor_pane_birth)"
   label="$(_ha_field "$tj" label)"
   disp="$(pretool_redact "$(_ha_field "$row" command)" | tr '\n' ' ' | cut -c1-300)"
@@ -547,6 +574,7 @@ cmd_tick() {
       _ha_task_terminal "$tj" && _ha_withdraw "$id" "$row" "$tj"
       continue
     fi
+    _ha_authorization_ok "$row" "$tj" || continue
     age=$(( now - $(_ha_epoch "$(_ha_field "$row" created_at)") ))
     if [ "$(_ha_field "$row" route)" = conductor ]; then
       cmd_surface "$id" >/dev/null 2>&1 || true

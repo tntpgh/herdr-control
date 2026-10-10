@@ -13,6 +13,8 @@ script's own sqlite fixture never shares a path with the real one.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -20,10 +22,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import patch
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -164,6 +165,7 @@ tsk._popen_detached = _record_hard_stop
 
 
 def _reset_registry(rows: list[tuple] = ()):
+    RECEIPTS.clear()
     con = sqlite3.connect(REGISTRY)
     con.execute("DELETE FROM tasks")
     con.executemany(
@@ -176,6 +178,76 @@ def _reset_registry(rows: list[tuple] = ()):
 def _start_cmd(repo="knowledge-base", mode="research", objective="find X") -> dict:
     return {"command_id": "cmd_1", "op": "start", "remote_task_id": "rtask_20261002T000000Z_deadbeef",
             "payload": {"repo": repo, "mode": mode, "objective": objective}}
+
+
+# Signed fixture requests exercise real receiver admission with a dummy key.
+# Only the protected registry/spawn effects are faked. No real service calls.
+from authorization import AuthorizationError, canonical_json, payload_sha256, verify_command
+FIXTURE_KEY = "fixture-key-for-receiver-tests-only-32"
+RECEIPTS = {}
+_REAL_BRIDGE = tsk._bridge
+_REAL_SPAWN = tsk._spawn
+_REAL_PROBE = tsk._capability_probe
+
+
+def _signed(cmd):
+    cmd = json.loads(json.dumps(cmd))
+    mode = cmd["payload"].get("mode", "implement")
+    cfg = json.loads(ALLOWLIST.read_text())["modes"].get(mode, {})
+    issued = int(time.time() * 1000)
+    claims = canonical_json({"version": 1, "source": "oauth_task_delegation",
+        "command_id": cmd["command_id"], "op": cmd["op"], "remote_task_id": cmd["remote_task_id"],
+        "requester_actor": "fixture@example.com", "requester_client": "fixture-client",
+        "scope": "herdr:task.start" if mode == "research" else "herdr:task.implement",
+        "repo": cmd["payload"]["repo"], "mode": mode, "effective_scope": cfg,
+        "payload_sha256": payload_sha256(cmd["payload"]), "issued_at": issued, "expires_at": issued + 600000})
+    signature = hmac.new(FIXTURE_KEY.encode(), b"herdr-task-authorization-v1\n" + claims.encode(), hashlib.sha256).hexdigest()
+    cmd["authorization"] = {"claims": claims, "signature": signature}
+    return cmd
+
+
+def _process(cmd):
+    if cmd["op"] not in ("start", "resume"):
+        return tsk.process_command(cmd)
+    cmd = _signed(cmd)
+    try:
+        verified = verify_command(cmd, FIXTURE_KEY, json.loads(ALLOWLIST.read_text()))
+    except AuthorizationError as exc:
+        return {"command_id": cmd["command_id"], "outcome": "refused", "detail": str(exc)}
+    return tsk.process_command(cmd, authorization=verified)
+
+
+def _fixture_bridge(*args):
+    if args[0] not in ("accept-authorization", "read-authorization"):
+        return _REAL_BRIDGE(*args)
+    with FAKE_BRIDGE_LOG.open("a") as log:
+        log.write(" ".join(args) + "\n")
+    if FAKE_BRIDGE_RC.read_text().strip() != "0":
+        return subprocess.CompletedProcess(args, 1, "", "fixture refusal")
+    if args[0] == "accept-authorization":
+        cmd, claims = json.loads(args[1]), json.loads(args[2])
+        cid = cmd["command_id"]
+        new = cid not in RECEIPTS
+        if new:
+            RECEIPTS[cid] = {"command_id": cid, "remote_task_id": cmd["remote_task_id"],
+                "payload_sha256": claims["payload_sha256"], "status": "accepted", "deadline_at": args[3]}
+        row = {**RECEIPTS[cid], "newly_accepted": new}
+    else:
+        row = RECEIPTS.get(args[1], {})
+    return subprocess.CompletedProcess(args, 0, json.dumps(row), "")
+
+
+def _fixture_spawn(root, branch, mcfg, brief, authorization_command_id=""):
+    proc = _REAL_SPAWN(root, branch, mcfg, brief, authorization_command_id)
+    if proc.returncode == 0 and authorization_command_id in RECEIPTS:
+        RECEIPTS[authorization_command_id].update(status="launched", run_id="run_fake1", task_id="task_fake1",
+            worktree=str(WT_ROOT / root.name / branch), branch=branch, pane_id="pane_1", pane_birth="birth_1")
+    return proc
+
+
+tsk._bridge = _fixture_bridge
+tsk._spawn = _fixture_spawn
+tsk._capability_probe = lambda repo, secrets: {"secrets_granted": secrets}
 
 
 class Capabilities(unittest.TestCase):
@@ -211,7 +283,7 @@ class SpawnArgvAgainstRealParser(unittest.TestCase):
         tsk.subprocess.run = lambda argv, **kw: captured.append(list(argv)) or subprocess.CompletedProcess(argv, 0, "", "")
         try:
             for secrets in ("grant", "withhold"):
-                tsk._spawn(repo, "remote/argv-check", {"job_class": "research", "secrets": secrets}, brief)
+                tsk._spawn(repo, "remote/argv-check", {"job_class": "research", "secrets": secrets}, brief, "cmd_argv")
         finally:
             tsk.subprocess.run = real_run
         self.assertEqual(len(captured), 2)
@@ -271,7 +343,7 @@ class RemoteSpawnConductorRouting(unittest.TestCase):
         con.commit()
         con.close()
         tsk._spawn(CODE_ROOT / "knowledge-base", "remote/main-route",
-                   {"job_class": "implement", "secrets": "default"}, self._brief())
+                   {"job_class": "implement", "secrets": "default"}, self._brief(), "cmd_routing")
         self.assertEqual(FAKE_SPAWN_ENV_CAPTURE.read_text().strip(), "1|w72:p1|term_main")
 
     def test_explicit_conductor_keeps_precedence_over_main(self):
@@ -282,7 +354,7 @@ class RemoteSpawnConductorRouting(unittest.TestCase):
         os.environ["HERDR_MCP_CONDUCTOR_PANE"] = "w9:p9"
         os.environ["HERDR_MCP_CONDUCTOR_BIRTH"] = "term_explicit"
         tsk._spawn(CODE_ROOT / "knowledge-base", "remote/explicit-route",
-                   {"job_class": "implement", "secrets": "default"}, self._brief())
+                   {"job_class": "implement", "secrets": "default"}, self._brief(), "cmd_routing")
         self.assertEqual(FAKE_SPAWN_ENV_CAPTURE.read_text().strip(), "1|w9:p9|term_explicit")
 
     def test_incomplete_main_identity_is_not_forwarded(self):
@@ -291,60 +363,37 @@ class RemoteSpawnConductorRouting(unittest.TestCase):
         con.commit()
         con.close()
         tsk._spawn(CODE_ROOT / "knowledge-base", "remote/no-route",
-                   {"job_class": "implement", "secrets": "default"}, self._brief())
+                   {"job_class": "implement", "secrets": "default"}, self._brief(), "cmd_routing")
         self.assertEqual(FAKE_SPAWN_ENV_CAPTURE.read_text().strip(), "1||")
+
+    def test_publisher_signing_key_is_not_forwarded_to_spawn(self):
+        with patch.dict(os.environ, {"HERDR_MCP_INGEST_KEY": "dummy-fixture-key-do-not-forward"}):
+            env = tsk._remote_spawn_env()
+        self.assertNotIn("HERDR_MCP_INGEST_KEY", env)
 
 
 class CapabilityProbe(unittest.TestCase):
-    """_capability_probe()'s kb_http_reachable: a 2xx-only HTTP reachability
-    check, named honestly -- never kb_reachable (which read as "the agent
-    can actually use it"), and no kb_auth_ok: this process runs on the Mac
-    BEFORE a worker is spawned and never holds the KB credential itself."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.status = 200
-
-        class Health(BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802
-                self.send_response(CapabilityProbe.status)
-                self.end_headers()
-
-            def log_message(self, *a):
-                pass
-
-        cls.server = HTTPServer(("127.0.0.1", 0), Health)
-        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
-        cls.real_url = tsk.KB_HEALTH_URL
-        tsk.KB_HEALTH_URL = f"http://127.0.0.1:{cls.server.server_port}/health"
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-        tsk.KB_HEALTH_URL = cls.real_url
-
+    """Exercise HTTP response semantics without a listener or external request."""
     def test_a_2xx_response_is_reachable(self):
-        CapabilityProbe.status = 200
-        probe = tsk._capability_probe("knowledge-base", False)
+        class Response:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+        with patch.object(tsk.urllib.request, "urlopen", return_value=Response()):
+            probe = _REAL_PROBE("knowledge-base", False)
         self.assertIs(probe["kb_http_reachable"], True)
         self.assertNotIn("kb_reachable", probe)
 
     def test_a_401_response_is_not_reachable_and_the_field_is_renamed(self):
-        # The 401-counts-as-reachable claim this fix's SPEC started from was
-        # itself wrong: urllib raises HTTPError (a URLError subclass) on a
-        # non-2xx status, so the OLD probe already returned False here too.
-        # Pinned anyway: the field must still be kb_http_reachable, never
-        # kb_reachable, and kb_auth_ok must not exist (no probe makes an
-        # authenticated call at this privilege level).
-        CapabilityProbe.status = 401
-        probe = tsk._capability_probe("knowledge-base", False)
+        error = tsk.urllib.error.HTTPError("https://fixture.invalid", 401, "unauthorized", {}, None)
+        with patch.object(tsk.urllib.request, "urlopen", side_effect=error):
+            probe = _REAL_PROBE("knowledge-base", False)
         self.assertIs(probe["kb_http_reachable"], False)
         self.assertNotIn("kb_reachable", probe)
         self.assertNotIn("kb_auth_ok", probe)
 
     def test_a_non_kb_repo_gets_no_probe_at_all(self):
-        probe = tsk._capability_probe("some-other-repo", True)
-        self.assertEqual(probe, {"secrets_granted": True})
+        self.assertEqual(_REAL_PROBE("some-other-repo", True), {"secrets_granted": True})
 
 
 class StartRefusals(unittest.TestCase):
@@ -356,25 +405,25 @@ class StartRefusals(unittest.TestCase):
     def test_tasks_off_on_mac(self):
         tsk.TASKS_ON_MAC = False
         try:
-            out = tsk.process_command(_start_cmd())
+            out = _process(_start_cmd())
         finally:
             tsk.TASKS_ON_MAC = True
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("HERDR_MCP_TASKS", out["detail"])
 
     def test_repo_not_allowlisted(self):
-        out = tsk.process_command(_start_cmd(repo="not-a-repo"))
+        out = _process(_start_cmd(repo="not-a-repo"))
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("not allow-listed", out["detail"])
 
     def test_unknown_mode(self):
-        out = tsk.process_command(_start_cmd(mode="bogus"))
+        out = _process(_start_cmd(mode="bogus"))
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("unknown mode", out["detail"])
 
     def test_repo_has_no_local_checkout(self):
         shutil.rmtree(CODE_ROOT / "knowledge-base/.git")
-        out = tsk.process_command(_start_cmd())
+        out = _process(_start_cmd())
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("no local checkout", out["detail"])
         (CODE_ROOT / "knowledge-base/.git").mkdir()
@@ -391,7 +440,7 @@ class StartRefusals(unittest.TestCase):
         except sqlite3.OperationalError:
             pass
         con.commit(); con.close()
-        out = tsk.process_command(_start_cmd())
+        out = _process(_start_cmd())
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("too_many_concurrent", out["detail"])
 
@@ -401,7 +450,7 @@ class StartRefusals(unittest.TestCase):
         # a refusal instead of a path surprise.
         cmd = _start_cmd()
         cmd["remote_task_id"] = "not-the-right-shape"
-        out = tsk.process_command(cmd)
+        out = _process(cmd)
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("unexpected shape", out["detail"])
 
@@ -422,7 +471,7 @@ class StartAccepted(unittest.TestCase):
         shutil.rmtree(WT_ROOT, ignore_errors=True)
 
     def test_happy_path_accepted(self):
-        out = tsk.process_command(_start_cmd(objective="find [X] and tell @owner about it"))
+        out = _process(_start_cmd(objective="find [X] and tell @owner about it"))
         self.assertEqual(out["outcome"], "accepted")
         self.assertEqual(out["local_task_id"], "task_fake1")
         self.assertEqual(out["local_run_id"], "run_fake1")
@@ -431,10 +480,10 @@ class StartAccepted(unittest.TestCase):
         self.assertEqual(out["agent_id"], "birth_1")
         self.assertIn("secrets_granted", out["capability_probe"])
         self.assertTrue(out["capability_probe"]["secrets_granted"])  # research mode grants
-        self.assertIn("set-deadline", FAKE_BRIDGE_LOG.read_text())
+        self.assertIn("accept-authorization", FAKE_BRIDGE_LOG.read_text())
 
     def test_objective_sanitized_before_reaching_the_brief(self):
-        tsk.process_command(_start_cmd(objective="do [X] and notify @owner now"))
+        _process(_start_cmd(objective="do [X] and notify @owner now"))
         text = CAPTURE.read_text()
         fence = text.split("```text untrusted-objective\n", 1)[1].split("\n```", 1)[0]
         self.assertNotIn("[", fence)
@@ -444,50 +493,106 @@ class StartAccepted(unittest.TestCase):
 
     def test_spawn_failure_is_a_failed_ack_not_an_exception(self):
         FAKE_SPAWN_OUT.write_text("1")
-        out = tsk.process_command(_start_cmd())
+        out = _process(_start_cmd())
         self.assertEqual(out["outcome"], "failed")
         self.assertIn("exit 1", out["detail"])
 
-    def test_set_remote_id_failure_cancels_the_orphaned_pane(self):
-        # N1: a post-spawn failure after spawn-task.sh has already registered
-        # a pane must not leave that agent alive with nothing stopping it.
-        fake = TMP / "fake-bridge-fail-remote-id.sh"
-        fake.write_text(f"""#!/usr/bin/env bash
-printf '%s\\n' "$*" >> {FAKE_BRIDGE_LOG}
-case "$1" in
-  set-remote-id) exit 1 ;;
-esac
-exit 0
-""")
-        fake.chmod(0o755)
-        old = tsk.REGISTRY_BRIDGE
-        tsk.REGISTRY_BRIDGE = str(fake)
-        try:
-            out = tsk.process_command(_start_cmd())
-        finally:
-            tsk.REGISTRY_BRIDGE = old
-        self.assertEqual(out["outcome"], "failed")
-        self.assertIn("cancel run_fake1 task_fake1", FAKE_BRIDGE_LOG.read_text())
+    def test_protected_binding_failure_never_adopts_worker_identity(self):
+        old = tsk._bridge
+        def broken(*args):
+            if args[0] == "read-authorization":
+                return subprocess.CompletedProcess(args, 1, "", "unavailable")
+            return old(*args)
+        with patch.object(tsk, "_bridge", side_effect=broken):
+            out = _process(_start_cmd())
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("outcome_unknown", out["detail"])
+        self.assertNotIn("set-remote-id", FAKE_BRIDGE_LOG.read_text())
 
-    def test_set_deadline_failure_cancels_the_orphaned_pane(self):
-        fake = TMP / "fake-bridge-fail-deadline.sh"
-        fake.write_text(f"""#!/usr/bin/env bash
-printf '%s\\n' "$*" >> {FAKE_BRIDGE_LOG}
-case "$1" in
-  set-remote-id) cat {FAKE_BRIDGE_ROW} ;;
-  set-deadline) exit 1 ;;
-esac
-exit 0
-""")
-        fake.chmod(0o755)
-        old = tsk.REGISTRY_BRIDGE
-        tsk.REGISTRY_BRIDGE = str(fake)
-        try:
+    def test_receipt_persistence_failure_stops_before_spawn(self):
+        FAKE_BRIDGE_RC.write_text("1")
+        with patch.object(tsk, "_spawn") as spawn:
+            out = _process(_start_cmd())
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("could not be persisted", out["detail"])
+        spawn.assert_not_called()
+
+
+class ReceiptAdmission(unittest.TestCase):
+    """Receiver recovery assertions; real atomic receipt races are tested by the registry suite."""
+    setUp = StartAccepted.setUp
+    def test_missing_verified_source_stops_before_bridge_or_spawn(self):
+        with patch.object(tsk, "_bridge") as bridge, patch.object(tsk, "_spawn") as spawn:
             out = tsk.process_command(_start_cmd())
-        finally:
-            tsk.REGISTRY_BRIDGE = old
-        self.assertEqual(out["outcome"], "failed")
-        self.assertIn("cancel run_fake1 task_fake1", FAKE_BRIDGE_LOG.read_text())
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("missing verified", out["detail"])
+        bridge.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_changed_payload_after_verification_stops_before_bridge(self):
+        cmd = _signed(_start_cmd())
+        verified = verify_command(cmd, FIXTURE_KEY, json.loads(ALLOWLIST.read_text()))
+        cmd["payload"]["objective"] = "changed command"
+        with patch.object(tsk, "_bridge") as bridge:
+            out = tsk.process_command(cmd, authorization=verified)
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("binding mismatch", out["detail"])
+        bridge.assert_not_called()
+
+    def test_worker_identity_file_is_never_an_adoption_source(self):
+        wt = WT_ROOT / "knowledge-base/remote/deadbeef/.handoffs"
+        wt.mkdir(parents=True)
+        (wt / "identity.json").write_text('{"task_id":"task_forged","run_id":"run_forged"}')
+        with patch.object(tsk, "_read_identity", side_effect=AssertionError("untrusted identity read")):
+            out = _process(_start_cmd())
+        self.assertEqual(out["outcome"], "accepted")
+        self.assertEqual(out["local_task_id"], "task_fake1")
+
+    def test_ack_loss_reuses_protected_launched_binding_without_execution(self):
+        first = _process(_start_cmd())
+        original_deadline = RECEIPTS["cmd_1"]["deadline_at"]
+        with patch.object(tsk, "_spawn") as spawn, patch.object(tsk, "_schedule_hard_stop") as timer:
+            second = _process(_start_cmd())
+        self.assertEqual(first["local_task_id"], second["local_task_id"])
+        self.assertEqual(second["outcome"], "accepted")
+        self.assertEqual(RECEIPTS["cmd_1"]["deadline_at"], original_deadline)
+        spawn.assert_not_called()
+        timer.assert_not_called()
+
+    def test_crash_windows_are_durable_holds_without_execution(self):
+        cmd = _start_cmd()
+        for state in ("accepted", "bound", "launch_claimed"):
+            RECEIPTS["cmd_1"] = {"command_id": "cmd_1", "remote_task_id": cmd["remote_task_id"],
+                "payload_sha256": payload_sha256(cmd["payload"]), "status": state}
+            with self.subTest(state=state), patch.object(tsk, "_spawn") as spawn:
+                first, second = _process(cmd), _process(cmd)
+                self.assertEqual(first["outcome"], "refused")
+                self.assertIn("outcome_unknown", first["detail"])
+                self.assertEqual(first, second)
+                spawn.assert_not_called()
+
+    def test_receipt_for_another_task_or_payload_is_not_reused(self):
+        _process(_start_cmd())
+        for field, changed in (("remote_task_id", "rtask_20261002T000000Z_aaaaaaaa"),
+                               ("payload_sha256", "0" * 64), ("worktree", "/wrong"),
+                               ("branch", "remote/aaaaaaaa"), ("deadline_at", "")):
+            saved = RECEIPTS["cmd_1"][field]
+            RECEIPTS["cmd_1"][field] = changed
+            with self.subTest(field=field), patch.object(tsk, "_spawn") as spawn:
+                out = _process(_start_cmd())
+                self.assertEqual(out["outcome"], "refused")
+                spawn.assert_not_called()
+            RECEIPTS["cmd_1"][field] = saved
+
+    def test_repeated_different_command_cannot_adopt_existing_receipt(self):
+        _process(_start_cmd())
+        changed = _start_cmd(objective="different work, same command id")
+        with patch.object(tsk, "_spawn") as spawn:
+            out = _process(changed)
+        self.assertEqual(out["outcome"], "refused")
+        self.assertIn("binding mismatch", out["detail"])
+        spawn.assert_not_called()
+
 
 
 class CancelCommand(unittest.TestCase):
@@ -502,12 +607,12 @@ class CancelCommand(unittest.TestCase):
         return {"command_id": "cmd_c1", "op": "cancel", "remote_task_id": "rtask_1", "payload": p}
 
     def test_never_spawned_is_accepted_as_a_no_op(self):
-        out = tsk.process_command(self._cmd(local_task_id=""))
+        out = _process(self._cmd(local_task_id=""))
         self.assertEqual(out["outcome"], "accepted")
         self.assertIn("never spawned", out["detail"])
 
     def test_happy_path_cancels(self):
-        out = tsk.process_command(self._cmd())
+        out = _process(self._cmd())
         self.assertEqual(out["outcome"], "accepted")
         log = FAKE_BRIDGE_LOG.read_text()
         self.assertIn("read-by-remote rtask_1", log)
@@ -515,7 +620,7 @@ class CancelCommand(unittest.TestCase):
 
     def test_bridge_refusal_surfaces_as_failed(self):
         FAKE_BRIDGE_RC.write_text("1")
-        out = tsk.process_command(self._cmd())
+        out = _process(self._cmd())
         self.assertEqual(out["outcome"], "failed")
 
 
@@ -535,6 +640,9 @@ class ResumeCommand(unittest.TestCase):
         shutil.rmtree(WT_ROOT, ignore_errors=True)
         self.wt = WT_ROOT / "knowledge-base" / "remote/abc12345"
         self.wt.mkdir(parents=True)
+        FAKE_BRIDGE_ROW.write_text(json.dumps({"run_id": "run_old1", "task_id": "task_old1",
+            "pane_id": "pane_1", "pane_birth": "birth_1", "branch": "remote/abc12345",
+            "worktree": str(self.wt), "state": "completed", "manifest": '{"git":"push-own-branch"}'}))
 
     def _cmd(self, branch="remote/abc12345", repo="knowledge-base", text=""):
         return {"command_id": "cmd_r1", "op": "resume", "remote_task_id": "rtask_20261002T000000Z_deadbeef",
@@ -545,28 +653,28 @@ class ResumeCommand(unittest.TestCase):
         # H1: the fallback bug -- a missing/unreadable parent row must never
         # silently default to implement (git push + credentials granted).
         FAKE_BRIDGE_RC.write_text("1")
-        out = tsk.process_command(self._cmd())
+        out = _process(self._cmd())
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("registry row is gone", out["detail"])
 
     def test_refuses_repo_not_allowlisted(self):
         # M3: _resume must recheck the allowlist, same as _start -- removing
         # a repo from task-allowlist.json must stop resumes into it too.
-        out = tsk.process_command(self._cmd(repo="not-a-repo"))
+        out = _process(self._cmd(repo="not-a-repo"))
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("not allow-listed", out["detail"])
 
     def test_refuses_malformed_branch(self):
         # M3/I4: the branch must be the Worker-minted shape, not
         # attacker-controlled free text reaching a worktree path.
-        out = tsk.process_command(self._cmd(branch="main"))
+        out = _process(self._cmd(branch="main"))
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("not a remote task branch", out["detail"])
 
     def test_refuses_remote_task_id_bad_shape(self):
         cmd = self._cmd()
         cmd["remote_task_id"] = "not-the-right-shape"
-        out = tsk.process_command(cmd)
+        out = _process(cmd)
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("unexpected shape", out["detail"])
 
@@ -579,15 +687,15 @@ class ResumeCommand(unittest.TestCase):
         # 'running', which would otherwise also saturate max_concurrent).
         con.execute("UPDATE tasks SET state='finished'")
         con.commit(); con.close()
-        out = tsk.process_command(self._cmd())
+        out = _process(self._cmd())
         self.assertEqual(out["outcome"], "refused")
         self.assertIn("too_many_today", out["detail"])
 
     def test_happy_path_resumes(self):
-        out = tsk.process_command(self._cmd(text="one more thing"))
+        out = _process(self._cmd(text="one more thing"))
         self.assertEqual(out["outcome"], "accepted")
         self.assertEqual(out["local_task_id"], "task_fake1")
-        self.assertIn("set-deadline", FAKE_BRIDGE_LOG.read_text())
+        self.assertIn("accept-authorization", FAKE_BRIDGE_LOG.read_text())
 
     def test_resume_renames_a_stale_answer_aside_before_respawning(self):
         # F3 (security review round 2, 2026-10-04): _resume respawns into
@@ -598,7 +706,7 @@ class ResumeCommand(unittest.TestCase):
         # (or the follow-up note) ever got a turn.
         (self.wt / ".handoffs").mkdir(parents=True, exist_ok=True)
         (self.wt / ".handoffs/ANSWER.md").write_text("STALE: from the previous run, must never be read as current.")
-        out = tsk.process_command(self._cmd(text="one more thing"))
+        out = _process(self._cmd(text="one more thing"))
         self.assertEqual(out["outcome"], "accepted")
         self.assertFalse((self.wt / ".handoffs/ANSWER.md").exists(),
                           "a stale ANSWER.md must not still be at the path _verify_research reads")
@@ -614,7 +722,7 @@ class ResumeCommand(unittest.TestCase):
         # that both creates a remote_task_id row and runs sweep() over it,
         # so it must mark itself, never rely on job_class alone (a LOCAL
         # research/explore spawn shares that job_class and is never swept).
-        tsk.process_command(self._cmd(text="one more thing"))
+        _process(self._cmd(text="one more thing"))
         self.assertEqual(FAKE_SPAWN_ENV_CAPTURE.read_text().strip(), "1||")
 
     def test_resume_crash_before_identity_is_written_looks_up_find_spawned_and_cancels_the_returned_row(self):
@@ -631,7 +739,7 @@ class ResumeCommand(unittest.TestCase):
         old_spawn = tsk.SPAWN_TASK
         tsk.SPAWN_TASK = str(TMP / "does-not-exist-r33.sh")
         try:
-            out = tsk.process_command(self._cmd())
+            out = _process(self._cmd())
         finally:
             tsk.SPAWN_TASK = old_spawn
         self.assertEqual(out["outcome"], "failed")
@@ -651,7 +759,7 @@ class ResumeCommand(unittest.TestCase):
         old_spawn = tsk.SPAWN_TASK
         tsk.SPAWN_TASK = str(TMP / "does-not-exist-r33b.sh")
         try:
-            out = tsk.process_command(self._cmd())
+            out = _process(self._cmd())
         finally:
             tsk.SPAWN_TASK = old_spawn
         self.assertEqual(out["outcome"], "failed")
@@ -679,9 +787,9 @@ class Robustness(unittest.TestCase):
         # M7: a slow/crashed composer boot must never crash the whole
         # publisher tick -- it must come back as a failed ack instead.
         tsk.SPAWN_TASK = str(TMP / "does-not-exist.sh")
-        out = tsk.process_command(_start_cmd())
+        out = _process(_start_cmd())
         self.assertEqual(out["outcome"], "failed")
-        self.assertIn("crashed", out["detail"])
+        self.assertIn("outcome_unknown", out["detail"])
 
 
 class VerifyRules(unittest.TestCase):
@@ -1216,11 +1324,11 @@ class HardStop(unittest.TestCase):
         HARD_STOP_CALLS.clear()
 
     def test_an_accepted_start_schedules_exactly_one_hard_stop_at_max_minutes_plus_grace(self):
-        out = tsk.process_command(_start_cmd())
+        out = _process(_start_cmd())
         self.assertEqual(out["outcome"], "accepted")
         self.assertEqual(len(HARD_STOP_CALLS), 1)
         script = HARD_STOP_CALLS[0][2]  # ["/bin/bash", "-c", script]
-        self.assertIn(f"sleep {60 * 60 + tsk.HARD_STOP_GRACE_S};", script)
+        self.assertRegex(script, r"sleep 36(?:8[0-9]|90);")
         self.assertIn("cancel run_fake1 task_fake1 timed_out rtask_20261002T000000Z_deadbeef", script)
         self.assertIn("hard_stop_scheduled", FAKE_BRIDGE_LOG.read_text())
 
@@ -1230,7 +1338,7 @@ class HardStop(unittest.TestCase):
         old = tsk._popen_detached
         tsk._popen_detached = _boom
         try:
-            out = tsk.process_command(_start_cmd())
+            out = _process(_start_cmd())
         finally:
             tsk._popen_detached = old
         self.assertEqual(out["outcome"], "accepted")

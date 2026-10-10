@@ -4,12 +4,12 @@
 // send-message/start-task policy checks and their enqueue happen atomically
 // against the same snapshot.
 import { DurableObject } from "cloudflare:workers";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { z } from "zod";
 import { emailAllowed } from "./access";
 import { connection, DEFAULT_LIMITS, OWNER_LABEL, OWNER_LIMITS, rateLimited, resolveTarget, sanitizeMessage, sanitizeObjective, sanitizeOwnerMessage } from "./policy";
 import type { Connection, MessageLimits } from "./policy";
-import type { CommandAck, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem, OwnerAck, OwnerOutboxItem, OwnerReplySync, ResultDoc, Sender, Snapshot, TaskCaps, TaskRow } from "./types";
+import type { CommandAck, CommandAuthorization, CommandItem, CommandOp, DeliveryGate, Env, OutboxItem, OwnerAck, OwnerOutboxItem, OwnerReplySync, ResultDoc, Sender, Snapshot, TaskCaps, TaskModeConfig, TaskRow } from "./types";
 import { SCOPE_OWNER_MESSAGE, SCOPE_READ, SCOPE_TASK_CANCEL, SCOPE_TASK_IMPLEMENT, SCOPE_TASK_START, SNAPSHOT_SCHEMA } from "./types";
 
 const str = z.string().max(4000);
@@ -39,6 +39,7 @@ const SyncSchema = z.object({
     })).max(500),
     task_config: z.object({
       mac_enabled: z.boolean(),
+      authorization_protocol: z.number().int().optional(),
       repos: z.array(str).max(200),
       modes: z.object({
         research: z.object({ job_class: str, secrets: z.enum(["grant", "default"]), git: z.enum(["none", "commit-only", "push-own-branch"]), writes: z.array(str).max(50), net_read: z.array(str).max(50) }),
@@ -307,6 +308,38 @@ const CALLS_PER_DAY = 2000;
 
 const iso = (ms: number) => new Date(ms).toISOString();
 
+// Cross-language receipt contract: only JSON values supplied by our typed
+// command builders enter this function. Arrays retain their order. Object
+// keys sort recursively, strings use JSON escaping, and UTF-8 is used by
+// both the digest and HMAC. The receiver checks canonical bytes as well.
+function authorizationJSON(value: unknown): string {
+  if (value === null || typeof value === "string" || typeof value === "boolean"
+      || (typeof value === "number" && Number.isFinite(value))) return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(authorizationJSON).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${authorizationJSON(record[key])}`).join(",")}}`;
+  }
+  throw new Error("invalid task authorization JSON");
+}
+
+// Keep signing outside the DurableObject method surface: it is reachable
+// only from the admission paths after their existing caller/scope checks.
+function commandAuthorization(key: string, nowMs: number, caller: Caller, commandId: string,
+    op: "start" | "resume", remoteTaskId: string, repo: string, mode: "research" | "implement",
+    effectiveScope: TaskModeConfig, payload: object): CommandAuthorization {
+  const claims = authorizationJSON({
+    version: 1, source: "oauth_task_delegation", command_id: commandId, op, remote_task_id: remoteTaskId,
+    requester_actor: caller.email, requester_client: caller.client_id,
+    scope: mode === "research" ? SCOPE_TASK_START : SCOPE_TASK_IMPLEMENT,
+    repo, mode, effective_scope: effectiveScope,
+    payload_sha256: createHash("sha256").update(authorizationJSON(payload), "utf8").digest("hex"),
+    issued_at: nowMs, expires_at: nowMs + MESSAGE_TTL_MS,
+  });
+  return { claims, signature: createHmac("sha256", key)
+    .update(`herdr-task-authorization-v1\n${claims}`, "utf8").digest("hex") };
+}
+
 const EVENT_DETAIL_MAX_CHARS = 2000;
 
 function serializeEventDetail(data: Record<string, unknown>): string {
@@ -446,6 +479,13 @@ export class HerdrState extends DurableObject<Env> {
       status TEXT NOT NULL DEFAULT 'queued', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
       expires_at INTEGER NOT NULL DEFAULT 0, lease_until INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
       outcome TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '')`);
+    // Deliberately nullable on migration: a queued legacy task's requester
+    // metadata is not evidence that a receipt was accepted at creation.
+    // Never backfill or mint authority during leasing/handover.
+    const commandColumns = this.sql.exec<{ name: string }>(`PRAGMA table_info(commands)`).toArray();
+    if (!commandColumns.some((column) => column.name === "authorization")) {
+      this.sql.exec(`ALTER TABLE commands ADD COLUMN authorization TEXT`);
+    }
     this.sql.exec(`CREATE INDEX IF NOT EXISTS commands_by_status ON commands(status, created_at)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS commands_by_remote_task ON commands(remote_task_id, op, status)`);
     // list_events/wait_for_events' own monotonic feed, one remote task's
@@ -815,6 +855,8 @@ export class HerdrState extends DurableObject<Env> {
     const { snapshot, connection: conn } = this.view(nowMs);
     const cfg = snapshot?.task_config ?? null;
     if (!cfg || !cfg.mac_enabled) return refuse("tasks_disabled_on_mac");
+    if (cfg.authorization_protocol !== 1) return refuse("authorization_protocol_required");
+    if (!this.env.INGEST_KEY || this.env.INGEST_KEY.length < 32) return refuse("authorization_not_configured");
     if (conn.state === "disconnected" || conn.state === "never_connected") return refuse(`not_connected (${conn.state})`);
     if (!cfg.repos.includes(repo)) return refuse(`repo_not_allowed (${repo})`);
     const text = sanitizeObjective(rawObjective);
@@ -828,14 +870,19 @@ export class HerdrState extends DurableObject<Env> {
     if (today >= caps.max_per_day) return refuse(`too_many_today (max ${caps.max_per_day})`);
 
     const id = `rtask_${iso(nowMs).replace(/[-:.]/g, "").slice(0, 15)}Z_${crypto.randomUUID().slice(0, 8)}`;
-    this.sql.exec(`INSERT INTO remote_tasks (remote_task_id, requester_email, requester_client, requester_client_name,
+    const commandId = `cmd_${crypto.randomUUID().slice(0, 12)}`;
+    const payload = { repo, mode, objective: text.text };
+    const authorization = commandAuthorization(this.env.INGEST_KEY, nowMs, caller, commandId, "start", id, repo, mode, cfg.modes[mode], payload);
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(`INSERT INTO remote_tasks (remote_task_id, requester_email, requester_client, requester_client_name,
         mode, repo, objective, created_at, updated_at, state) VALUES (?,?,?,?,?,?,?,?,?,'queued')`,
-      id, caller.email, caller.client_id, caller.client_name.slice(0, 80), mode, repo, text.text, nowMs, nowMs);
-    this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
-      `cmd_${crypto.randomUUID().slice(0, 12)}`, "start", id, JSON.stringify({ repo, mode, objective: text.text }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
-    this.recordTaskEvent(nowMs, id, "task_started", { repo, mode, requester: caller.email });
-    this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "start_task", target: `${mode}:${repo}`,
-      decision: "queued", reason: "", message_id: "", detail: `remote_task_id=${id}` });
+        id, caller.email, caller.client_id, caller.client_name.slice(0, 80), mode, repo, text.text, nowMs, nowMs);
+      this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at, authorization) VALUES (?,?,?,?,?,?,?,?)`,
+        commandId, "start", id, JSON.stringify(payload), nowMs, nowMs, nowMs + MESSAGE_TTL_MS, JSON.stringify(authorization));
+      this.recordTaskEvent(nowMs, id, "task_started", { repo, mode, requester: caller.email });
+      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "start_task", target: `${mode}:${repo}`,
+        decision: "queued", reason: "", message_id: "", detail: `remote_task_id=${id}` });
+    });
     return { ok: true, remote_task_id: id, state: "queued" };
   }
 
@@ -912,6 +959,8 @@ export class HerdrState extends DurableObject<Env> {
     const { snapshot, connection: conn } = this.view(nowMs);
     const cfg = snapshot?.task_config ?? null;
     if (!cfg || !cfg.mac_enabled) return refuse("tasks_disabled_on_mac");
+    if (cfg.authorization_protocol !== 1) return refuse("authorization_protocol_required");
+    if (!this.env.INGEST_KEY || this.env.INGEST_KEY.length < 32) return refuse("authorization_not_configured");
     if (conn.state === "disconnected" || conn.state === "never_connected") return refuse(`not_connected (${conn.state})`);
     if (!cfg.repos.includes(row.repo)) return refuse(`repo_not_allowed (${row.repo})`);
     const caps = cfg.caps;
@@ -928,16 +977,25 @@ export class HerdrState extends DurableObject<Env> {
       text = cleaned.text;
     }
     const newId = `rtask_${iso(nowMs).replace(/[-:.]/g, "").slice(0, 15)}Z_${crypto.randomUUID().slice(0, 8)}`;
-    this.sql.exec(`INSERT INTO remote_tasks (remote_task_id, requester_email, requester_client, requester_client_name,
+    // neededScope was checked above; retain the explicit mode narrowing so
+    // an unknown stored mode can never select implement as a fallback.
+    if (row.mode !== "research" && row.mode !== "implement") return refuse(`bad_mode (${row.mode})`);
+    const commandId = `cmd_${crypto.randomUUID().slice(0, 12)}`;
+    const payload = { local_task_id: row.local_task_id, local_run_id: row.local_run_id, branch: row.branch,
+      repo: row.repo, mode: row.mode, text };
+    const authorization = commandAuthorization(this.env.INGEST_KEY, nowMs, caller, commandId, "resume", newId,
+      row.repo, row.mode, cfg.modes[row.mode], payload);
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(`INSERT INTO remote_tasks (remote_task_id, requester_email, requester_client, requester_client_name,
         mode, repo, objective, created_at, updated_at, state, parent_remote_task_id)
         VALUES (?,?,?,?,?,?,?,?,?,'queued',?)`,
-      newId, caller.email, caller.client_id, caller.client_name.slice(0, 80), row.mode, row.repo, row.objective, nowMs, nowMs, remoteTaskId);
-    this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
-      `cmd_${crypto.randomUUID().slice(0, 12)}`, "resume", newId,
-      JSON.stringify({ local_task_id: row.local_task_id, local_run_id: row.local_run_id, branch: row.branch, repo: row.repo, mode: row.mode, text }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
-    this.recordTaskEvent(nowMs, newId, "task_started", { resumed_from: remoteTaskId, requester: caller.email });
-    this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "resume_task", target: remoteTaskId,
-      decision: "queued", reason: "", message_id: "", detail: `remote_task_id=${newId}` });
+        newId, caller.email, caller.client_id, caller.client_name.slice(0, 80), row.mode, row.repo, row.objective, nowMs, nowMs, remoteTaskId);
+      this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at, authorization) VALUES (?,?,?,?,?,?,?,?)`,
+        commandId, "resume", newId, JSON.stringify(payload), nowMs, nowMs, nowMs + MESSAGE_TTL_MS, JSON.stringify(authorization));
+      this.recordTaskEvent(nowMs, newId, "task_started", { resumed_from: remoteTaskId, requester: caller.email });
+      this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "resume_task", target: remoteTaskId,
+        decision: "queued", reason: "", message_id: "", detail: `remote_task_id=${newId}` });
+    });
     return { ok: true, remote_task_id: newId, parent_remote_task_id: remoteTaskId, state: "queued" };
   }
 
@@ -1749,10 +1807,12 @@ export class HerdrState extends DurableObject<Env> {
     }
 
     const dueCommands = body.lease && !cmdGate.hold ? this.sql.exec<{ command_id: string; op: CommandOp; remote_task_id: string;
-      payload: string; attempts: number }>(
-      `SELECT command_id, op, remote_task_id, payload, attempts FROM commands
-       WHERE (status='queued' OR (status='delivering' AND lease_until < ?)) AND expires_at > ? ORDER BY created_at LIMIT 20`,
-      nowMs, nowMs).toArray() : [];
+      payload: string; attempts: number; authorization: string | null }>(
+      `SELECT command_id, op, remote_task_id, payload, attempts, authorization FROM commands
+       WHERE (status='queued' OR (status='delivering' AND lease_until < ?)) AND expires_at > ?
+         AND (op='cancel' OR (op IN ('start','resume') AND authorization IS NOT NULL AND ?=1))
+       ORDER BY created_at LIMIT 20`,
+      nowMs, nowMs, body.snapshot.task_config?.authorization_protocol === 1 ? 1 : 0).toArray() : [];
     for (const c of dueCommands) {
       this.sql.exec(`UPDATE commands SET status='delivering', attempts=attempts+1, lease_until=?, updated_at=? WHERE command_id=?`,
         nowMs + LEASE_MS, nowMs, c.command_id);
@@ -1805,7 +1865,12 @@ export class HerdrState extends DurableObject<Env> {
       ok: true,
       response: {
         outbox: due.map((m) => ({ ...m, attempts: m.attempts + 1 })),
-        commands: dueCommands.map((c) => ({ ...c, payload: JSON.parse(c.payload) as object, attempts: c.attempts + 1 })),
+        commands: dueCommands.map((c) => ({
+          command_id: c.command_id, op: c.op, remote_task_id: c.remote_task_id,
+          payload: JSON.parse(c.payload) as object, attempts: c.attempts + 1,
+          ...(c.op !== "cancel" && c.authorization
+            ? { authorization: JSON.parse(c.authorization) as CommandAuthorization } : {}),
+        })),
         owner_outbox: dueOwners.map((m) => ({
           exchange_id: m.exchange_id, owner_label: m.owner_label, client_msg_id: m.client_msg_id, body: m.body,
           sender: m.sender_actor, client_name: m.sender_client_name, attempts: m.attempts + 1,
