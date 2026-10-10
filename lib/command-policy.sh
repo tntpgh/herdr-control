@@ -267,6 +267,14 @@ _cp_data_run_ext='(html?|json|xml|csv|tsv|txt|md|log|ya?ml|png|jpe?g|gif|svg|pdf
 # for F1/round-6 above correctly looks at what precedes the `$`, not what
 # precedes the quote character after it.
 _cp_protect_text() {                    # raw
+  # Byte-oriented, like every other control-byte-injecting scanner in this
+  # file (_cp_find_word_injection_present and a dozen others below it) --
+  # missing here let awk validate the injected sprintf("%c", N) control
+  # bytes as UTF-8 under whatever locale the caller's shell happened to
+  # have (observed: LANG=C.UTF-8), failing "illegal byte sequence" and
+  # making _cp_bashlex_findgit_present's caller treat EVERY command as
+  # unresolvable -> escalate, regardless of content.
+  local LC_ALL=C LANG=C
   printf '%s' "$1" | tr '\n' '\017' | awk '
     function prot(c) {
       if (c == " ")  return sprintf("%c", 1)
@@ -406,6 +414,8 @@ _cp_walk_prep() {                       # raw
 # so `_cp_locate_command_word`'s `set -- $1` keeps it as part of that
 # one token, same as every other control byte this file already uses.
 _cp_protect_text_qa() {                 # raw
+  # Same byte-oriented fix as _cp_protect_text above, same reason.
+  local LC_ALL=C LANG=C
   printf '%s' "$1" | tr '\n' '\017' | awk '
     function prot(c) {
       if (c == " ")  return sprintf("%c", 1)

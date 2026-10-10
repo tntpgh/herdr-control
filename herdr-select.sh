@@ -330,6 +330,38 @@ own_worktree=$(printf '%s' "$own_task_json" | jq -r '.worktree // empty' 2>/dev/
 own_branch=$(printf '%s' "$own_task_json" | jq -r '.branch // empty' 2>/dev/null)
 own_trunk=$(printf '%s' "$own_task_json" | jq -r '.trunk // empty' 2>/dev/null)
 
+# Occurrence corroboration (docs/plans/dot-herdr-recovery-slices.md §2):
+# when the hook path (agent-hooks/omp-herdr-control.ts + omp-notify.sh,
+# writing through lib/prompt-occurrence.py) has recorded an occurrence for
+# THIS EXACT on-screen prompt (screen_prompt_id == current_prompt_id, the
+# same fingerprint --expect-prompt-id checks above), trust it the same way
+# every other fold consumer does: refuse an APPROVING press (a decline is
+# exempt, same as every other gate in this script) whenever that
+# occurrence's identity could not be proven (identity_verified false — an
+# unproven pane_birth/native_session, M1) or its last recorded screen read
+# was not cleanly parseable (display != pending_parseable — a stuck or
+# mismatched panel). A pane with NO matching occurrence recorded at all
+# (Claude, Codex, or an omp pane whose hook never fired for this prompt) is
+# unaffected: there is nothing here to corroborate against, so behavior is
+# exactly as before this check existed — legacy callers retain legacy
+# behavior.
+
+if [ "$declining" = 0 ] && [ -n "$current_prompt_id" ] && [ -n "$own_run" ] && [ -n "$own_task" ] \
+   && [ -f "$here/lib/prompt-occurrence.py" ]; then
+  occ_summary="$(python3 "$here/lib/prompt-occurrence.py" fold --db "$(registry_db)" --run "$own_run" --task "$own_task" 2>/dev/null \
+    | jq -r --arg p "$pane" --arg pid "$current_prompt_id" \
+        '([.[] | select(.pane_id == $p and .screen_prompt_id == $pid)] | sort_by(.last_seq) | last) as $m
+         | if $m == null then "" else ($m.display + "\t" + ($m.identity_verified|tostring)) end' 2>/dev/null)"
+  if [ -n "$occ_summary" ]; then
+    occ_display="${occ_summary%%$'\t'*}"
+    occ_identity="${occ_summary#*$'\t'}"
+    if [ "$occ_identity" != true ] || [ "$occ_display" != pending_parseable ]; then
+      echo "herdr-select: the recorded occurrence for this exact prompt is identity_verified=$occ_identity display=$occ_display — refusing to press an approving key." >&2
+      exit 8
+    fi
+  fi
+fi
+
 # Responsibility may move while the reviewer correlates a prompt. Resolve it
 # again immediately before recording/sending, and reject a changed task/pane
 # mapping or a conductor whose original assignment is no longer current.
