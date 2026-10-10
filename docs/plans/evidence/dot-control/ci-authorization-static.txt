@@ -1,0 +1,44 @@
+LOCAL macOS static validation; Ubuntu/Node24 CI was not run.
+
++ bash -n .github/scripts/verify-task-authorization.sh
+exit=0
+
++ bash -n verify-run-registry.sh
+exit=0
+
++ ruby -ryaml -e 'doc = YAML.load_file(".github/workflows/remote-mcp.yml")
+trigger = doc["on"] || doc[true]
+paths = trigger.fetch("pull_request").fetch("paths")
+abort "trigger filters differ" unless paths == trigger.fetch("push").fetch("paths")
+abort "job set changed" unless doc.fetch("jobs").keys.sort == %w[authorization publisher worker]
+worker = doc.fetch("jobs").fetch("worker").fetch("steps")
+runs = worker.map { |step| step["run"] }.compact
+abort "offline order" unless runs == ["npm ci", "npx tsc --noEmit", "node test/authorization-offline.cjs", "npx vitest run"]
+gate = doc.fetch("jobs").fetch("authorization")
+abort "gate runner" unless gate["runs-on"] == "ubuntu-latest"
+abort "gate not run" unless gate["steps"].last["run"] == "bash .github/scripts/verify-task-authorization.sh"
+suites = File.readlines(".github/scripts/verify-task-authorization.sh").grep(/^run /).map(&:split)
+abort "suite count" unless suites.length == 8
+suites.each do |suite|
+  path = suite[2]
+  abort "missing verifier: #{path}" unless File.file?(path)
+  abort "missing path filter: #{path}" unless paths.any? { |pattern| File.fnmatch(pattern, path) }
+end
+abort "timer exclusion" unless suites.last == %w[run python3 remote-mcp/verify-tasks-e2e.py --registry-only]
+puts "PASS YAML parse, trigger parity, jobs, offline ordering, 8 verifier paths and explicit timer exclusion"
+'
+PASS YAML parse, trigger parity, jobs, offline ordering, 8 verifier paths and explicit timer exclusion
+exit=0
+
++ git diff --check -- .github/workflows/remote-mcp.yml .github/scripts/verify-task-authorization.sh verify-run-registry.sh
+exit=0
+
++ ruby -ryaml -e 'doc = YAML.load_file(".github/workflows/remote-mcp.yml")
+trigger = doc["on"] || doc[true]
+paths = trigger.fetch("pull_request").fetch("paths")
+abort "trigger filters differ" unless paths == trigger.fetch("push").fetch("paths")
+%w[conductor-handover.sh sweep-approvals.sh].each { |path| abort "missing source #{path}" unless paths.include?(path) }
+puts "PASS final YAML parse, trigger parity and conductor handover/sweep source paths"
+'
+PASS final YAML parse, trigger parity and conductor handover/sweep source paths
+exit=0

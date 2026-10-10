@@ -834,6 +834,16 @@ accept_local_task_authorization() {
 read_task_authorization() {
   _task_authorization_adapter read "$1"
 }
+reserve_task_worktree() {
+  registry_init || return 1
+  python3 "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" reserve "$@"
+}
+claim_task_worktree_mutation() {
+  python3 "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" claim-mutation "$@"
+}
+check_worktree_unreserved() {
+  python3 "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" check-unreserved "$@"
+}
 mark_authorization_launch() {
   _task_authorization_adapter launch "$1" "$2" "$3" "$4"
 }

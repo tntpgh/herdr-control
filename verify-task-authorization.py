@@ -81,7 +81,17 @@ class RegistryAuthorization(unittest.TestCase):
     def accept(self, suffix="1", mode="implement"):
         cmd, claims = self.source(suffix, mode)
         row = json.loads(self.call("accept", canonical(cmd), canonical(claims)).stdout)
+        self.reserve(cmd, self.task(suffix, mode))
         return cmd, claims, row
+
+    def reserve(self, cmd, task, claim=True):
+        helper = ROOT / "lib/task-reservation.py"
+        for op, args in (("reserve", (canonical(cmd), task["repo"], task["worktree"], task["branch"])),
+                         ("claim-mutation", (cmd["command_id"], task["repo"], task["worktree"], task["branch"]))):
+            if op == "claim-mutation" and not claim:
+                continue
+            proc = subprocess.run([sys.executable, str(helper), str(self.db), op, *args], text=True, capture_output=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def task(self, suffix="1", mode="implement"):
         manifest = {"git": "push-own-branch" if mode == "implement" else "none", "net_write": "none",
@@ -92,7 +102,7 @@ class RegistryAuthorization(unittest.TestCase):
                 "conductor_id": "Main", "conductor_pane_id": "w72:p1", "conductor_pane_birth": "main-birth",
                 "pane_id": "w2:p" + suffix, "pane_birth": "worker-birth-" + suffix,
                 "repo": str(self.base / "sample"), "worktree": str(self.base / ("wt-" + suffix)),
-                "branch": "worker/" + suffix, "trunk": "main", "project": "sample", "label": "synthetic",
+                "branch": "remote/" + f"{int(suffix):08x}", "trunk": "main", "project": "sample", "label": "synthetic",
                 "manifest": canonical(manifest), "approval": "menu"}
 
     def bind(self, suffix="1", mode="implement"):
@@ -307,6 +317,9 @@ class RegistryAuthorization(unittest.TestCase):
     def test_concurrent_binding_and_launch_each_have_one_winner(self):
         cmd, _, _ = self.accept()
         tasks = [self.task(str(i)) for i in range(1, 9)]
+        target = self.task()
+        for task in tasks:
+            task.update({key: target[key] for key in ("repo", "worktree", "branch")})
         outcomes = self.concurrent([("register", canonical(task), cmd["command_id"]) for task in tasks])
         self.assertEqual(sum(rc == 0 for rc, _, _ in outcomes), 1, outcomes)
         for rc, _, err in outcomes:
@@ -328,6 +341,8 @@ class RegistryAuthorization(unittest.TestCase):
         outcomes = self.concurrent([("accept", canonical(c), canonical(s)) for c, s in sources])
         self.assertTrue(all(rc == 0 for rc, _, _ in outcomes), outcomes)
         tasks = [self.task(str(i)) for i in range(1, 9)]
+        for task, (cmd, _) in zip(tasks, sources):
+            self.reserve(cmd, task)
         outcomes = self.concurrent([("register", canonical(t), c["command_id"]) for t, (c, _) in zip(tasks, sources)])
         self.assertTrue(all(rc == 0 for rc, _, _ in outcomes), outcomes)
         self.call("launch", sources[0][0]["command_id"], tasks[1]["task_id"], tasks[1]["run_id"],
@@ -440,9 +455,26 @@ class RegistryAuthorization(unittest.TestCase):
         deadline = "2099-01-01T00:00:00Z"
         self.call("accept", canonical(cmd), canonical(claims), deadline)
         self.call("accept", canonical(cmd), canonical(claims), "2099-02-01T00:00:00Z")
+        self.reserve(cmd, self.task())
         self.call("register", canonical(self.task()), cmd["command_id"])
         self.assertEqual(self.query("SELECT deadline_at FROM tasks"), [(deadline,)])
         self.assertEqual(self.query("SELECT deadline_at FROM task_authorizations"), [(deadline,)])
+
+    def test_remote_registration_requires_claimed_reservation(self):
+        cmd, claims = self.source()
+        self.call("accept", canonical(cmd), canonical(claims))
+        task = self.task()
+        self.call("register", canonical(task), cmd["command_id"], ok=False, reason="protected reservation unavailable")
+        self.reserve(cmd, task, claim=False)
+        self.call("register", canonical(task), cmd["command_id"], ok=False, reason="does not own this exact worktree mutation")
+        helper = ROOT / "lib/task-reservation.py"
+        proc = subprocess.run([sys.executable, str(helper), str(self.db), "claim-mutation", cmd["command_id"],
+                               task["repo"], task["worktree"], task["branch"]], text=True, capture_output=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.call("register", canonical(task), cmd["command_id"])
+        self.execute("DELETE FROM task_worktree_reservations")
+        self.call("launch", cmd["command_id"], task["task_id"], task["run_id"], "launch_claimed", ok=False,
+                  reason="does not own this exact worktree mutation")
 
 
 if __name__ == "__main__":

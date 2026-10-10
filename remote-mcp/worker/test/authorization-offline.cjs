@@ -188,6 +188,131 @@ test("equal manifests and objectives remain bound to separate task and command i
   assert.notEqual(commands[0].authorization.signature, commands[1].authorization.signature); f.db.close();
 });
 
+test("distinct resume requests cannot reserve one parent worktree twice", () => {
+  const f = fixture(); sync(f); const parent = start(f); sync(f); finish(f, parent.remote_task_id);
+  const first = f.state.resumeTask(NOW, CALLER, SCOPES, parent.remote_task_id, "first continuation");
+  const second = f.state.resumeTask(NOW, CALLER, SCOPES, parent.remote_task_id, "different continuation");
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, false, `second distinct resume was admitted: ${JSON.stringify(second)}`);
+  assert.match(second.reason, /^worktree_reserved /);
+  assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM commands WHERE op='resume'").one().n, 1);
+  f.db.close();
+});
+
+test("resume parent reservation survives uncertain delivery, expiry, revocation, restart and command pruning", () => {
+  for (const disposition of ["expiry", "revoked", "missing_ack"]) {
+    const f = fixture(); sync(f); const parent = start(f); sync(f); finish(f, parent.remote_task_id);
+    const child = f.state.resumeTask(NOW, CALLER, SCOPES, parent.remote_task_id, "continue");
+    assert.equal(child.ok, true);
+    const command = sync(f)[0]; const original = commandRow(f, command);
+    const acks = receiverAcks(command);
+    if (disposition !== "missing_ack") sync(f, CONFIG, NOW, false, [acks.accepted_receipt]);
+    const later = NOW + 900_001;
+    sync(f, CONFIG, later, false, [], disposition === "revoked"
+      ? { revoked: [{ actor: CALLER.email, client_id: CALLER.client_id }], hold: false } : GATE);
+    const restored = fixture(f.db); sync(restored, CONFIG, later, false);
+    const retry = restored.state.resumeTask(later, CALLER, SCOPES, parent.remote_task_id, "different continuation");
+    assert.equal(retry.ok, false); assert.match(retry.reason, /^worktree_reserved /);
+    assert.equal(commandRow(f, command).authorization, original.authorization);
+    assert.equal(commandRow(f, command).expires_at, original.expires_at);
+    f.sql.exec("DELETE FROM commands WHERE remote_task_id=?", child.remote_task_id);
+    const afterPrune = restored.state.resumeTask(later, CALLER, SCOPES, parent.remote_task_id, "retry after retention");
+    assert.equal(afterPrune.ok, false); assert.match(afterPrune.reason, /^worktree_reserved /);
+    assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM remote_tasks WHERE parent_remote_task_id=?", parent.remote_task_id).one().n, 1);
+    f.db.close();
+  }
+});
+
+test("terminal held child cannot become another resume parent even after a stop acknowledgement", () => {
+  const f = fixture(); sync(f); const parent = start(f); sync(f); finish(f, parent.remote_task_id);
+  const child = f.state.resumeTask(NOW, CALLER, SCOPES, parent.remote_task_id, "continue");
+  assert.equal(child.ok, true);
+  const command = sync(f)[0]; const acks = receiverAcks(command);
+  sync(f, CONFIG, NOW, false, [acks.bound]);
+  assert.equal(f.state.cancelTask(NOW, CALLER, SCOPES, child.remote_task_id).ok, true);
+  const stop = sync(f)[0]; assert.equal(stop.op, "cancel");
+  sync(f, CONFIG, NOW, false, [{ command_id: stop.command_id, outcome: "accepted", detail: "registered target stopped" }]);
+  assert.equal(task(f, child.remote_task_id).state, "cancelled");
+  assert.deepEqual(f.state.resumeTask(NOW, CALLER, SCOPES, child.remote_task_id, "unsafe continuation"),
+    { ok: false, reason: "resume_launch_unresolved" });
+  assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM commands WHERE op='resume'").one().n, 1);
+  f.db.close();
+});
+
+test("completed resume continues only from latest child with a distinct command and receipt", () => {
+  const f = fixture(); sync(f); const parent = start(f); sync(f); finish(f, parent.remote_task_id);
+  const first = f.state.resumeTask(NOW, CALLER, SCOPES, parent.remote_task_id, "first"); assert.equal(first.ok, true);
+  const firstCommand = sync(f)[0]; const acks = receiverAcks(firstCommand);
+  sync(f, CONFIG, NOW, false, [acks.launched]);
+  assert.equal(f.state.cancelTask(NOW, CALLER, SCOPES, first.remote_task_id).ok, true);
+  const stop = sync(f)[0];
+  sync(f, CONFIG, NOW, false, [{ command_id: stop.command_id, outcome: "accepted", detail: "launched target stopped" }]);
+  const oldParent = f.state.resumeTask(NOW, CALLER, SCOPES, parent.remote_task_id, "old ancestor");
+  assert.equal(oldParent.ok, false); assert.match(oldParent.reason, /^worktree_reserved /);
+  const second = f.state.resumeTask(NOW, CALLER, SCOPES, first.remote_task_id, "next"); assert.equal(second.ok, true);
+  const secondCommand = sync(f)[0];
+  assert.notEqual(secondCommand.command_id, firstCommand.command_id);
+  assert.notEqual(secondCommand.remote_task_id, firstCommand.remote_task_id);
+  assert.notEqual(secondCommand.authorization.signature, firstCommand.authorization.signature);
+  assert.equal(task(f, second.remote_task_id).parent_remote_task_id, first.remote_task_id);
+  f.db.close();
+});
+
+test("terminal labels and pruned source commands cannot release unresolved launch authority", () => {
+  for (const outcome of ["held", "late_held", "held_expired", "refused", "failed", "expired", "pruned"]) {
+    const f = fixture(); sync(f); const parent = start(f); sync(f); finish(f, parent.remote_task_id);
+    if (outcome === "pruned") f.sql.exec("DELETE FROM commands WHERE remote_task_id=?", parent.remote_task_id);
+    else f.sql.exec("UPDATE commands SET status='done',outcome=? WHERE remote_task_id=?", outcome, parent.remote_task_id);
+    assert.deepEqual(f.state.resumeTask(NOW, CALLER, SCOPES, parent.remote_task_id, "uncertain continuation"),
+      { ok: false, reason: "resume_launch_unresolved" });
+    assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM remote_tasks WHERE parent_remote_task_id<>''").one().n, 0);
+    f.db.close();
+  }
+});
+
+test("retention keeps the child reservation while its parent remains addressable", () => {
+  const f = fixture(); sync(f); const parent = start(f); sync(f); finish(f, parent.remote_task_id);
+  const child = f.state.resumeTask(NOW, CALLER, SCOPES, parent.remote_task_id, "continue"); assert.equal(child.ok, true);
+  sync(f); const later = NOW + 31 * 86_400_000;
+  f.sql.exec("UPDATE remote_tasks SET state='failed' WHERE remote_task_id=?", child.remote_task_id);
+  f.sql.exec("UPDATE commands SET status='done',outcome='expired' WHERE remote_task_id=?", child.remote_task_id);
+  f.sql.exec("UPDATE remote_tasks SET updated_at=? WHERE remote_task_id=?", later, parent.remote_task_id);
+  f.sql.exec("UPDATE commands SET updated_at=? WHERE remote_task_id=?", later, parent.remote_task_id);
+  sync(f, CONFIG, later, false);
+  assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM commands WHERE remote_task_id=?", child.remote_task_id).one().n, 0);
+  assert.equal(task(f, child.remote_task_id).parent_remote_task_id, parent.remote_task_id);
+  const rejected = f.state.resumeTask(later, CALLER, SCOPES, parent.remote_task_id, "retained ancestor");
+  assert.equal(rejected.ok, false); assert.match(rejected.reason, /^worktree_reserved /);
+  f.db.close();
+});
+
+test("resume reservation rolls back with command persistence failure and independent parents remain concurrent", () => {
+  const f = fixture(); sync(f); const first = start(f); sync(f); finish(f, first.remote_task_id);
+  const second = start(f); sync(f); finish(f, second.remote_task_id);
+  f.sql.exec("UPDATE remote_tasks SET local_task_id='task_other',local_run_id='run_other',branch='remote/other' WHERE remote_task_id=?", second.remote_task_id);
+  f.sql.exec("CREATE TRIGGER reject_resume BEFORE INSERT ON commands WHEN NEW.op='resume' BEGIN SELECT RAISE(ABORT,'fixture resume persistence failure'); END");
+  assert.throws(() => f.state.resumeTask(NOW, CALLER, SCOPES, first.remote_task_id, "first"), /resume persistence failure/);
+  assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM remote_tasks WHERE parent_remote_task_id<>''").one().n, 0);
+  f.sql.exec("DROP TRIGGER reject_resume");
+  assert.equal(f.state.resumeTask(NOW, CALLER, SCOPES, first.remote_task_id, "first").ok, true);
+  assert.equal(f.state.resumeTask(NOW, CALLER, SCOPES, second.remote_task_id, "second").ok, true);
+  const commands = sync(f); assert.equal(commands.length, 2);
+  assert.notEqual(commands[0].payload.branch, commands[1].payload.branch);
+  f.db.close();
+});
+
+test("legacy duplicate children migrate without a crash and block additional lineage forks", () => {
+  const f = fixture(); sync(f); const parent = start(f); sync(f); finish(f, parent.remote_task_id);
+  const first = f.state.resumeTask(NOW, CALLER, SCOPES, parent.remote_task_id, "first"); assert.equal(first.ok, true);
+  f.sql.exec(`INSERT INTO remote_tasks(remote_task_id,requester_email,requester_client,mode,repo,objective,created_at,updated_at,state,parent_remote_task_id)
+    VALUES ('legacy_duplicate',?,?,'research','fixture-repo','legacy',?,?,'failed',?)`, CALLER.email, CALLER.client_id, NOW, NOW, parent.remote_task_id);
+  const restored = fixture(f.db);
+  const rejected = restored.state.resumeTask(NOW, CALLER, SCOPES, parent.remote_task_id, "third");
+  assert.equal(rejected.ok, false); assert.match(rejected.reason, /^worktree_reserved /);
+  assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM remote_tasks WHERE parent_remote_task_id=?", parent.remote_task_id).one().n, 2);
+  f.db.close();
+});
+
 test("source substitution and changed payload invalidate the authenticated binding", () => {
   const f = fixture(); sync(f); assert.equal(start(f).ok, true);
   const command = sync(f)[0]; const claims = checkReceipt(command);

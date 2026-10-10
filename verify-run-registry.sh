@@ -258,7 +258,15 @@ _valid_proof_ref ".handoffs/PROOF.md#x" "" \
 _valid_proof_ref "https://example.com/pr/1 abc1234" \
   && ok "non-GitHub URL proof unchanged (shape check only)" || bad "non-PR URL refused while gh fails"
 GH_FAIL=0
-if ( unset -f gh; PATH=/usr/bin:/bin; _valid_proof_ref "$pr153 f1579a6" ); then
+# Stub discovery itself: CI may have a real gh in /usr/bin, so trimming PATH
+# neither proves absence nor guarantees this fixture stays off the network.
+if (
+  command() {
+    if [ "${1:-}" = -v ] && [ "${2:-}" = gh ]; then return 1; fi
+    builtin command "$@"
+  }
+  _valid_proof_ref "$pr153 f1579a6"
+); then
   bad "gh NOT INSTALLED let a shipped PR proof through"
 else
   ok "gh absent from PATH -> PR proof not accepted"

@@ -104,6 +104,33 @@ case "$cmd" in
   read-authorization)
     read_task_authorization "$1" || exit 1
     ;;
+  reserve-worktree)
+    command_json="$1" repo="$2" worktree="$3" branch="$4"
+    stopped='{}'
+    if [ "$(printf '%s' "$command_json" | jq -r '.op')" = resume ]; then
+      parent_run="$(printf '%s' "$command_json" | jq -r '.payload.local_run_id')"
+      parent_task="$(printf '%s' "$command_json" | jq -r '.payload.local_task_id')"
+      parent="$(read_task "$parent_run" "$parent_task")" || exit 1
+      pane="$(printf '%s' "$parent" | jq -r '.pane_id // empty')"
+      birth="$(printf '%s' "$parent" | jq -r '.pane_birth // empty')"
+      session="$(printf '%s' "$parent" | jq -r '.agent_session // empty')"
+      [ -n "$pane" ] && [ -n "$birth" ] || { echo 'reservation hold: original pane identity unavailable' >&2; exit 1; }
+      pane_list_json="$(herdr pane list 2>/dev/null)" || { echo 'reservation hold: pane observation unavailable' >&2; exit 1; }
+      lookup="$(_pane_list_lookup "$pane_list_json" "$pane")" || { echo 'reservation hold: invalid pane observation' >&2; exit 1; }
+      if [ "$lookup" != ABSENT ]; then
+        live_birth="$(printf '%s' "$lookup" | cut -f2)"
+        live_session="$(printf '%s' "$lookup" | cut -f3)"
+        # A changed terminal_id can be a Herdr restart. Only a different
+        # known agent session corroborates replacement; idle is not stopped.
+        if [ -z "$live_birth" ] || [ "$live_birth" = "$birth" ] || [ -z "$session" ] \
+           || [ -z "$live_session" ] || [ "$live_session" = "$session" ]; then
+          echo 'reservation hold: original pane is present or stop is unproven' >&2; exit 1
+        fi
+      fi
+      stopped="$(printf '%s' "$parent" | jq -c '{task_id,run_id,pane_id,pane_birth,agent_session:(.agent_session // ""),stopped:true}')"
+    fi
+    reserve_task_worktree "$command_json" "$repo" "$worktree" "$branch" "$stopped" || exit 1
+    ;;
   read)
     read_task "$1" "$2"
     ;;

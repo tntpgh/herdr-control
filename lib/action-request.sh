@@ -65,19 +65,51 @@ _ar_latest() {                          # task action_sha -> json row of the new
   [ -n "$id" ] && _ar_row "$id"
 }
 
-# Atomically turn an approved one-shot grant into `consumed`. 0 only for the
-# ONE caller whose UPDATE changed the row.
-action_grant_consume() {                # request_id -> 0 consumed by this call
-  local n row task
+# Run the protected mutation adapter. Source validation and the action CAS
+# share its SQLite write transaction; shell preflight reads are advisory only.
+_ar_authorized_mutation() {
+  local result rc
+  AR_MUTATION_REASON="" AR_MUTATION_HOLD=0
+  result="$(_task_authorization_adapter "$@" 2>&1)"; rc=$?
+  if [ "$rc" = 0 ] && [ "$(printf '%s' "$result" | jq -r '.changed // false' 2>/dev/null)" = true ]; then
+    return 0
+  fi
+  AR_MUTATION_REASON="$(printf '%s' "$result" | jq -r '.reason // empty' 2>/dev/null)"
+  if [ "$(printf '%s' "$result" | jq -r '.hold // false' 2>/dev/null)" = true ]; then
+    AR_MUTATION_HOLD=1
+  elif [ -z "$AR_MUTATION_REASON" ]; then
+    # A missing/broken storage adapter is never an invitation to issue a fresh
+    # approval prompt. Preserve the existing row under a stable source hold.
+    AR_MUTATION_HOLD=1
+    case "$result" in
+      'authorization hold: '*) AR_MUTATION_REASON="$result" ;;
+      *) AR_MUTATION_REASON='authorization hold: protected mutation unavailable' ;;
+    esac
+  fi
+  return 1
+}
+
+# Atomically validate the current task source and consume one approved grant.
+# Callers resolving an actual tool call supply its exact binding. Direct
+# callers retain the historical id-only API, with a snapshot checked by CAS.
+action_grant_consume() {                # id [run task tool action_sha route]
+  local row task run tid tool sha route
+  AR_MUTATION_REASON="" AR_MUTATION_HOLD=0
   row="$(_ar_row "$1")" || return 1
+  [ -n "$row" ] || return 1
+  run="${2:-$(printf '%s' "$row" | jq -r '.run_id')}"
+  tid="${3:-$(printf '%s' "$row" | jq -r '.task_id')}"
+  tool="${4:-$(printf '%s' "$row" | jq -r '.tool')}"
+  sha="${5:-$(printf '%s' "$row" | jq -r '.action_sha256')}"
+  route="${6:-$(printf '%s' "$row" | jq -r '.route')}"
   task="$(read_task "$(printf '%s' "$row" | jq -r '.run_id // empty')" "$(printf '%s' "$row" | jq -r '.task_id // empty')")" || return 1
-  task_authorization_check "$task" || return 1
-  case "$(printf '%s' "$row" | jq -r '.tool // empty')" in
+  if ! task_authorization_check "$task"; then
+    AR_MUTATION_HOLD=1 AR_MUTATION_REASON="$TASK_AUTHORIZATION_REASON"; return 1
+  fi
+  case "$tool" in
     bash|shell) _sp_shell_policy_ready || return 1 ;;
   esac
-  n="$(_sql "UPDATE action_requests SET status='consumed', consumed_at=$(_sq "$(_now_iso)")
-      WHERE request_id=$(_sq "$1") AND status='approved' AND grant_kind='once'; SELECT changes();" 2>/dev/null)"
-  [ "${n:-0}" = 1 ]
+  _ar_authorized_mutation action-consume "$1" "$run" "$tid" "$tool" "$sha" "$route"
 }
 
 # Create (or find) the pending request for one call. Deterministic id: the
@@ -151,10 +183,15 @@ action_request_resolve() {              # run task tool action_sha command verdi
           human) okauth=1 ;;
           conductor) [ "$rroute" = conductor ] && [ "$8" = conductor ] && okauth=1 ;;
         esac
-        if [ "$okauth" = 1 ] && [ "$(printf '%s' "$row" | jq -r '.grant_kind')" = once ] && action_grant_consume "$id"; then
+        AR_MUTATION_HOLD=0 AR_MUTATION_REASON=""
+        if [ "$okauth" = 1 ] && [ "$(printf '%s' "$row" | jq -r '.grant_kind')" = once ] && action_grant_consume "$id" "$run" "$task" "$3" "$sha" "$8"; then
           AR_DECISION=allow AR_REQUEST_ID="$id" AR_STATE=consumed
           append_event "$run" "$task" action_consumed "$(jq -nc --arg id "$id" '{request_id:$id}')" \
             "actcons_${id}" >/dev/null 2>&1 || true
+          return 0
+        fi
+        if [ "$AR_MUTATION_HOLD" = 1 ]; then
+          AR_STATE=authorization_hold AR_REQUEST_ID="$id" AR_WHY="$AR_MUTATION_REASON"
           return 0
         fi ;;
       pending) AR_REQUEST_ID="$id" AR_STATE=pending; return 0 ;;
@@ -171,17 +208,20 @@ action_request_resolve() {              # run task tool action_sha command verdi
 }
 
 # Check-and-set pending -> approved|declined|superseded. 0 only for the caller that won.
-action_request_decide() {               # request_id approved|declined|superseded authority decided_by category reason
-  local n row task
+action_request_decide() {               # id status authority decided_by category reason [reviewed_request_json reviewer_birth]
+  local row task reviewed birth="${8:-}"
+  AR_MUTATION_REASON="" AR_MUTATION_HOLD=0
+  row="$(_ar_row "$1")" || return 1
+  [ -n "$row" ] || return 1
+  reviewed="${7:-$row}"
   if [ "$2" = approved ]; then
-    row="$(_ar_row "$1")" || return 1
     task="$(read_task "$(printf '%s' "$row" | jq -r '.run_id // empty')" "$(printf '%s' "$row" | jq -r '.task_id // empty')")" || return 1
-    task_authorization_check "$task" || return 1
+    if ! task_authorization_check "$task"; then
+      AR_MUTATION_HOLD=1 AR_MUTATION_REASON="$TASK_AUTHORIZATION_REASON"; return 1
+    fi
+    [ "$3" != conductor ] || [ -n "$birth" ] || birth="$(printf '%s' "$task" | jq -r '.conductor_pane_birth // empty')"
   fi
-  n="$(_sql "UPDATE action_requests SET status=$(_sq "$2"), decided_at=$(_sq "$(_now_iso)"),
-      authority=$(_sq "$3"), decided_by=$(_sq "$4"), review_category=$(_sq "$5"), decision_reason=$(_sq "$6")
-      WHERE request_id=$(_sq "$1") AND status='pending'; SELECT changes();" 2>/dev/null)"
-  [ "${n:-0}" = 1 ]
+  _ar_authorized_mutation action-decide "$1" "$2" "$3" "$4" "$5" "$6" "$reviewed" "$birth"
 }
 
 # Check-and-set pending -> withdrawn: the task ended (completed/failed/

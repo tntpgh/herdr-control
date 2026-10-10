@@ -180,28 +180,25 @@ _ha_notify_worker() {                   # row decision -> records action_notifie
 }
 
 # The one decide path (conductor CLI, human CLI, hub tick).
-_ha_decide() {                          # id approved|declined|superseded authority decided_by category reason
-  local id="$1" status="$2" auth="$3" who="$4" cat="$5" why="$6" row kind run task fid fp _st outcome=human-answer
-  row="$(action_request_get "$id")"
+_ha_decide() {                          # id status authority decided_by category reason [reviewed_request_json]
+  local id="$1" status="$2" auth="$3" who="$4" cat="$5" why="$6" row run task fid fp _st reviewer_birth="" outcome=human-answer
+  row="${7:-$(action_request_get "$id")}"
   [ -n "$row" ] || die "no request $id" 3
-  kind="$(_ha_field "$row" grant_kind)"; run="$(_ha_field "$row" run_id)"; task="$(_ha_field "$row" task_id)"
+  run="$(_ha_field "$row" run_id)"; task="$(_ha_field "$row" task_id)"
   if [ "$auth" = conductor ]; then
     local current_task
     current_task="$(read_task "$run" "$task")"
     _ha_task_active "$current_task" && _ha_conductor_ok "$current_task" &&
       [ "$who" = "$(_ha_field "$current_task" conductor_pane_id)" ] \
       || die "conductor assignment changed during review; no decision or notification written" 8
+    reviewer_birth="$(_ha_field "$current_task" conductor_pane_birth)"
   fi
   if [ "$status" = approved ] && ! task_authorization_check "$(read_task "$run" "$task")"; then
     die "${TASK_AUTHORIZATION_REASON:-task authorization unavailable; human-only hold}; no decision or notification written" 8
   fi
-  action_request_decide "$id" "$status" "$auth" "$who" "$cat" "$why" \
-    || die "request $id is not pending (status $(_ha_field "$row" status)) — nothing changed" 4
-  if [ "$status" = approved ] && [ "$kind" = file ]; then
-    if ! file_approval_record "$task" "$(_ha_field "$row" code_path)" "$(_ha_field "$row" code_sha256)" "$auth:$who"; then
-      _sql "UPDATE action_requests SET status='pending', decided_at=NULL, authority='', decided_by='' WHERE request_id=$(_sq "$id");" >/dev/null 2>&1
-      die "could not record the file approval — request left pending" 1
-    fi
+  if ! action_request_decide "$id" "$status" "$auth" "$who" "$cat" "$why" "$row" "$reviewer_birth"; then
+    [ "${AR_MUTATION_HOLD:-0}" != 1 ] || die "$AR_MUTATION_REASON; no decision or notification written" 8
+    die "request $id is not pending (status $(_ha_field "$(action_request_get "$id")" status)) — nothing changed" 4
   fi
   row="$(action_request_get "$id")"
   fid="$(_ha_field "$row" form_record)"
@@ -274,7 +271,7 @@ cmd_decide() {                          # approve|decline|supersede id [flags]
           die "request $id is human-only ($verdict): a conductor may decline it but not approve it" 8
         fi
       fi
-      _ha_decide "$id" "$status" conductor "$(_ha_field "$tj" conductor_pane_id)" "$cat" "$why" ;;
+      _ha_decide "$id" "$status" conductor "$(_ha_field "$tj" conductor_pane_id)" "$cat" "$why" "$row" ;;
     human)
       local ans pinned
       # Only the formserve record the hub tick pinned when it served THIS
@@ -283,7 +280,7 @@ cmd_decide() {                          # approve|decline|supersede id [flags]
       [ -n "$pinned" ] && [ "$form" = "$pinned" ] || die "human authority needs --form <id> naming the hub decision form served for $id (${pinned:-none served yet})" 8
       ans="$(_ha_form_answer "$form" "$id" "$(_ha_field "$row" action_sha256)")" || die "human authority needs --form <id>: an ANSWERED hub decision form for exactly $id with its action SHA (cancellation also requires a reason)" 8
       [ "$(_ha_field "$ans" decision)" = "$verb" ] || die "form $form answered '$(_ha_field "$ans" decision)', not '$verb'" 8
-      _ha_decide "$id" "$status" human "hub form $form" "" "$(_ha_field "$ans" reason)" ;;
+      _ha_decide "$id" "$status" human "hub form $form" "" "$(_ha_field "$ans" reason)" "$row" ;;
     *) die "--authority conductor|human is required" ;;
   esac
 }
@@ -468,9 +465,9 @@ EOF
       answered)
         if ans="$(_ha_form_answer "$fid" "$id" "$(_ha_field "$row" action_sha256)")"; then
           case "$(_ha_field "$ans" decision)" in
-            approve) ( _ha_decide "$id" approved human "hub form $fid" "" "$(_ha_field "$ans" reason)" ) >/dev/null 2>&1 ;;
-            decline) ( _ha_decide "$id" declined human "hub form $fid" "" "$(_ha_field "$ans" reason)" ) >/dev/null 2>&1 ;;
-            supersede) ( _ha_decide "$id" superseded human "hub form $fid" "" "$(_ha_field "$ans" reason)" ) >/dev/null 2>&1 ;;
+            approve) ( _ha_decide "$id" approved human "hub form $fid" "" "$(_ha_field "$ans" reason)" "$row" ) >/dev/null 2>&1 ;;
+            decline) ( _ha_decide "$id" declined human "hub form $fid" "" "$(_ha_field "$ans" reason)" "$row" ) >/dev/null 2>&1 ;;
+            supersede) ( _ha_decide "$id" superseded human "hub form $fid" "" "$(_ha_field "$ans" reason)" "$row" ) >/dev/null 2>&1 ;;
           esac
         fi
         return 0 ;;

@@ -4,6 +4,14 @@ PASS downgrade withholds queued and overdue commands without changing receipt or
 PASS restart/ack loss redelivers original receipt and expires instead of renewing
 PASS nullable migration preserves legacy commands without minting source authority
 PASS equal manifests and objectives remain bound to separate task and command identities
+PASS distinct resume requests cannot reserve one parent worktree twice
+PASS resume parent reservation survives uncertain delivery, expiry, revocation, restart and command pruning
+PASS terminal held child cannot become another resume parent even after a stop acknowledgement
+PASS completed resume continues only from latest child with a distinct command and receipt
+PASS terminal labels and pruned source commands cannot release unresolved launch authority
+PASS retention keeps the child reservation while its parent remains addressable
+PASS resume reservation rolls back with command persistence failure and independent parents remain concurrent
+PASS legacy duplicate children migrate without a crash and block additional lineage forks
 PASS source substitution and changed payload invalidate the authenticated binding
 PASS receipt write failure atomically rolls back task, command and event creation
 PASS event/audit failure also rolls back a stored receipt and task
@@ -24,6 +32,6 @@ PASS review regression: retired unbound launch retains failed-stop retry and req
 PASS late held and accepted target evidence from failed/timed-out/cancelled rows opens stop tracking only
 PASS lost stop ACK expires into bounded retry while original launch receipt stays fixed
 PASS failed or lost stops exhaust five retries into one durable recovery item without false completion
-26 passed; 0 failed; Cloudflare/OAuth integration not exercised
-(node:41045) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+34 passed; 0 failed; Cloudflare/OAuth integration not exercised
+(node:20982) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)

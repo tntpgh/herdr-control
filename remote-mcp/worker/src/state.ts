@@ -471,6 +471,7 @@ export class HerdrState extends DurableObject<Env> {
       capability_probe TEXT NOT NULL DEFAULT '{}')`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS remote_tasks_by_local ON remote_tasks(local_task_id) WHERE local_task_id<>''`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS remote_tasks_by_state ON remote_tasks(state, created_at)`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS remote_tasks_by_parent ON remote_tasks(parent_remote_task_id) WHERE parent_remote_task_id<>''`);
     // Worker -> Mac directives, leased exactly like the message outbox
     // (status queued -> delivering -> done; lease_until/attempts/expires_at
     // the same shape, same 15-minute TTL -- a Mac that never acks one gives
@@ -954,6 +955,17 @@ export class HerdrState extends DurableObject<Env> {
     if (row.requester_email !== caller.email || row.requester_client !== caller.client_id) return refuse("not_your_task");
     if (!REMOTE_TERMINAL[row.state]) return refuse(`not_terminal (${row.state})`);
     if (!row.local_task_id) return refuse("never_started");
+    // A terminal remote label alone does not resolve an in-flight local
+    // launch. In particular, a held receipt can have a registered task and
+    // a cancel acknowledgement before its original launch is resolved.
+    // Never use that uncertain task as a new parent sharing its worktree.
+    // Missing retained proof (including old/pruned commands) also fails
+    // closed; command retention cannot turn uncertainty into permission.
+    const source = this.sql.exec<{ status: string; outcome: string }>(
+      `SELECT status, outcome FROM commands WHERE remote_task_id=? AND op IN ('start','resume')`, remoteTaskId).toArray()[0];
+    if (!source || source.status !== "done" || !["accepted", "late_accepted"].includes(source.outcome)) {
+      return refuse("resume_launch_unresolved");
+    }
     const neededScope = row.mode === "research" ? SCOPE_TASK_START : row.mode === "implement" ? SCOPE_TASK_IMPLEMENT : null;
     if (!neededScope) return refuse(`bad_mode (${row.mode})`);
     if (!scopes.includes(neededScope)) return refuse(`missing_scope ${neededScope}`);
@@ -986,7 +998,16 @@ export class HerdrState extends DurableObject<Env> {
       repo: row.repo, mode: row.mode, text };
     const authorization = commandAuthorization(this.env.INGEST_KEY, nowMs, caller, commandId, "resume", newId,
       row.repo, row.mode, cfg.modes[row.mode], payload);
-    this.ctx.storage.transactionSync(() => {
+    return this.ctx.storage.transactionSync((): ResumeTaskOutcome => {
+      // Parent identity is a durable reservation for one continuation,
+      // independent of command expiry, delivery outcome and retention. A
+      // completed child can itself be resumed; its ancestor cannot fork
+      // another worker into the same branch/worktree. Keep the test and
+      // insert in one SQLite transaction, including command/audit writes.
+      const existing = this.sql.exec<{ remote_task_id: string }>(
+        `SELECT remote_task_id FROM remote_tasks WHERE parent_remote_task_id=? ORDER BY created_at, remote_task_id LIMIT 1`,
+        remoteTaskId).toArray()[0];
+      if (existing) return refuse(`worktree_reserved (resume child ${existing.remote_task_id})`);
       this.sql.exec(`INSERT INTO remote_tasks (remote_task_id, requester_email, requester_client, requester_client_name,
         mode, repo, objective, created_at, updated_at, state, parent_remote_task_id)
         VALUES (?,?,?,?,?,?,?,?,?,'queued',?)`,
@@ -996,8 +1017,8 @@ export class HerdrState extends DurableObject<Env> {
       this.recordTaskEvent(nowMs, newId, "task_started", { resumed_from: remoteTaskId, requester: caller.email });
       this.audit(nowMs, { actor: caller.email, client_id: caller.client_id, tool: "resume_task", target: remoteTaskId,
         decision: "queued", reason: "", message_id: "", detail: `remote_task_id=${newId}` });
+      return { ok: true, remote_task_id: newId, parent_remote_task_id: remoteTaskId, state: "queued" };
     });
-    return { ok: true, remote_task_id: newId, parent_remote_task_id: remoteTaskId, state: "queued" };
   }
 
   // follow_up resolves to this, then reuses sendMessage verbatim (same
@@ -1976,7 +1997,11 @@ export class HerdrState extends DurableObject<Env> {
       pruneCutoff).one().c;
     this.raiseReplayFloor(pruneMax);
     this.sql.exec(`DELETE FROM task_events WHERE ${prunable}`, pruneCutoff);
-    this.sql.exec(`DELETE FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out') AND updated_at < ?`,
+    // A child is its parent's one-continuation reservation. Retain it as
+    // long as that parent still exists, even after terminal task/command
+    // retention; deleting it must not make an old ancestor resumable again.
+    this.sql.exec(`DELETE FROM remote_tasks WHERE state IN ('finished','verified','failed','cancelled','lost','timed_out') AND updated_at < ?
+      AND NOT EXISTS (SELECT 1 FROM remote_tasks parent WHERE parent.remote_task_id=remote_tasks.parent_remote_task_id)`,
       nowMs - 30 * 86_400_000);
 
     this.sql.exec(`DELETE FROM owner_messages WHERE (status='delivered' OR status='replied' OR status LIKE 'blocked:%') AND updated_at < ?`,

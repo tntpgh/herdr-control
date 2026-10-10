@@ -292,6 +292,19 @@ def _check_source(row):
     return claims
 
 
+def _reservation(db, receipt, task):
+    if receipt["source"] != "oauth_task_delegation":
+        return
+    # Reuse the protected reservation validator on this caller's transaction;
+    # a separate process/connection here would reopen a check-to-use race.
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location("task_reservation_storage", Path(__file__).with_name("task-reservation.py"))
+    reservation = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reservation)
+    reservation.validate_reservation(db, receipt, task)
+
+
 def register(db, raw_task, command_id=""):
     task = parse(raw_task)
     if task.get("approval") not in ("menu", "hook"):
@@ -316,6 +329,7 @@ def register(db, raw_task, command_id=""):
                         if receipt["source"] == "oauth_task_delegation" else task["repo"] == receipt["source_repo"])
         if not matches_repo or manifest(task.get("manifest", "")) != receipt["expected_manifest"]:
             raise Refused("task repository/manifest differs from source authorization")
+        _reservation(db, receipt, task)
         task["remote_task_id"] = receipt["remote_task_id"] or ""
         task["deadline_at"] = receipt["deadline_at"]
     task.update(state="starting", created_at=now_iso(), updated_at=now_iso())
@@ -379,7 +393,8 @@ def launch(db, command_id, task_id, run_id, status):
     row = read(db, command_id)
     if row is None or row["task_id"] != task_id or row["run_id"] != run_id or row["status"] != before:
         raise Refused("launch claim already consumed or task binding mismatch")
-    _binding(db, row)
+    task = _binding(db, row)
+    _reservation(db, row, task)
     if status == "launch_claimed":
         valid_window(parse(row["claims"]))
         if row["deadline_at"] and row["deadline_at"] <= now_iso():
@@ -399,6 +414,103 @@ def check(db, raw_task):
     if row["status"] not in ("launch_claimed", "launched"):
         raise Refused("task launch has no protected claim")
     _binding(db, row, task)
+
+
+def _action_task(db, request):
+    """Validate current protected source on the caller's locked connection."""
+    receipt = db.execute("SELECT * FROM task_authorizations WHERE task_id=?", (request["task_id"],)).fetchone()
+    if receipt is None:
+        raise Refused("missing verified task source")
+    if receipt["status"] not in ("launch_claimed", "launched"):
+        raise Refused("task launch has no protected claim")
+    task = _binding(db, receipt)
+    if request["run_id"] != task["run_id"]:
+        raise Refused("action request run/task binding mismatch")
+    return task
+
+
+def _action_result(changed, reason="", hold=False):
+    return {"changed": changed, "reason": reason, "hold": hold}
+
+
+def action_consume(db, request_id, expected_run, expected_task, expected_tool, expected_sha, current_route):
+    """Linearize receipt validation and approved-once consumption together."""
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT * FROM action_requests WHERE request_id=?", (request_id,)).fetchone()
+        if row is None:
+            raise Refused("action request is absent")
+        expected = {"run_id": expected_run, "task_id": expected_task, "tool": expected_tool, "action_sha256": expected_sha}
+        if any(not value or row[field] != value for field, value in expected.items()):
+            raise Refused("action request snapshot binding mismatch")
+        _action_task(db, row)
+        if row["status"] != "approved" or row["grant_kind"] != "once":
+            db.rollback()
+            return _action_result(False, "request has no approved one-shot grant")
+        if current_route not in ("conductor", "human") or row["route"] not in ("conductor", "human"):
+            raise Refused("unsupported action authority route")
+        if row["authority"] != "human" and not (
+                row["authority"] == "conductor" and row["route"] == current_route == "conductor"
+                and row["verdict"] not in ("reserved", "deny")):
+            raise Refused("action decision authority does not satisfy current route")
+        changed = db.execute("""UPDATE action_requests SET status='consumed',consumed_at=?
+            WHERE request_id=? AND status='approved' AND grant_kind='once'""", (now_iso(), request_id)).rowcount
+        if changed != 1:
+            db.rollback()
+            return _action_result(False, "request changed before consumption")
+        db.commit()
+        return _action_result(True)
+    except (Refused, ValueError, TypeError, KeyError, sqlite3.Error, OSError) as exc:
+        db.rollback()
+        return _action_result(False, "authorization hold: " + str(exc), True)
+
+
+def action_decide(db, request_id, status, authority, decided_by, category, reason, expected_request, expected_conductor_birth):
+    """Record an action decision against the same transaction's live source."""
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        if status not in ("approved", "declined", "superseded") or authority not in ("conductor", "human"):
+            raise Refused("unsupported action decision or authority")
+        row = db.execute("SELECT * FROM action_requests WHERE request_id=?", (request_id,)).fetchone()
+        snapshot = parse(expected_request)
+        fields = ("request_id", "run_id", "task_id", "tool", "action_sha256", "command", "verdict",
+                  "route", "grant_kind", "code_path", "code_sha256")
+        if (row is None or not snapshot.get("action_sha256")
+                or any(field not in snapshot or snapshot[field] != row[field] for field in fields)):
+            raise Refused("action request snapshot binding mismatch")
+        if row["status"] != "pending":
+            db.rollback()
+            return _action_result(False, "request is no longer pending")
+        if status == "approved":
+            task = _action_task(db, row)
+            if authority == "conductor":
+                if row["route"] != "conductor" or row["verdict"] in ("reserved", "deny"):
+                    raise Refused("action requires a human decision")
+                if (not decided_by or not expected_conductor_birth
+                        or decided_by != task["conductor_pane_id"]
+                        or expected_conductor_birth != task["conductor_pane_birth"]):
+                    raise Refused("conductor pane/birth changed during review")
+            if row["grant_kind"] not in ("once", "file"):
+                raise Refused("unsupported action grant kind")
+            if row["grant_kind"] == "file":
+                if not row["code_path"] or not row["code_sha256"]:
+                    raise Refused("file grant has no bound path/content hash")
+                # The file grant is part of this same permission mutation. A
+                # second shell connection after approval would reopen the race.
+                db.execute("""INSERT OR IGNORE INTO file_approvals(task_id,path,sha256,approved_by,approved_at)
+                    VALUES (?,?,?,?,?)""", (row["task_id"], row["code_path"], row["code_sha256"],
+                                            authority + ":" + decided_by, now_iso()))
+        changed = db.execute("""UPDATE action_requests SET status=?,decided_at=?,authority=?,decided_by=?,
+            review_category=?,decision_reason=? WHERE request_id=? AND status='pending'""",
+            (status, now_iso(), authority, decided_by, category, reason, request_id)).rowcount
+        if changed != 1:
+            db.rollback()
+            return _action_result(False, "request changed before decision")
+        db.commit()
+        return _action_result(True)
+    except (Refused, ValueError, TypeError, KeyError, sqlite3.Error, OSError) as exc:
+        db.rollback()
+        return _action_result(False, "authorization hold: " + str(exc), True)
 
 
 def main():
@@ -421,6 +533,11 @@ def main():
             launch(db, *args)
         elif op == "check":
             check(db, *args)
+        elif op in ("action-consume", "action-decide"):
+            result = (action_consume if op == "action-consume" else action_decide)(db, *args)
+            print(canonical(result))
+            if not result["changed"]:
+                sys.exit(1)
         else:
             raise Refused("unknown registry adapter operation")
 

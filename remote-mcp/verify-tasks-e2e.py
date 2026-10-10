@@ -627,6 +627,7 @@ set -euo pipefail
 . "{HERE.parent}/lib/run-registry.sh"
 receipt="$(read_task_authorization "$1")"
 manifest="$(printf '%s' "$receipt" | jq -er '.expected_manifest')"
+claim_task_worktree_mutation "$1" "$2" {wt_r41} {branch_r41} >/dev/null
 register_task {run_id_r41} {task_id_r41} worker1 cond1 cpane1 cbirth1 pane_r41 birth_r41 \\
   "$2" {wt_r41} remote:r41 {branch_r41} main "" "$manifest" menu "$1"
 mark_authorization_launch "$1" {task_id_r41} {run_id_r41} launch_claimed
@@ -742,6 +743,136 @@ for request, outcome in jobs:
         check("concurrent task retains its own remote binding " + request["command_id"], bound["remote_task_id"] == request["remote_task_id"])
         process_command({"command_id":request["command_id"]+"_cancel","op":"cancel","remote_task_id":request["remote_task_id"],
                          "payload":{"local_task_id":outcome["local_task_id"]}})
+
+print("== distinct resumes: exclusive worktree mutation and trusted stopped-parent observation ==")
+
+
+def distinct_resume_reservation_regression():
+    parent_request = {"command_id": "cmd_resume_race_parent", "op": "start",
+                      "remote_task_id": "rtask_20261002T000030Z_00110030",
+                      "payload": {"repo": "knowledge-base", "mode": "implement", "objective": "resume reservation parent"}}
+    parent_ack = process_command(parent_request)
+    check("resume-race setup: authenticated parent launch recorded", parent_ack.get("outcome") == "accepted", parent_ack)
+    if parent_ack.get("outcome") != "accepted":
+        return
+    parent_cancel = process_command({"command_id": "cmd_resume_race_parent_cancel", "op": "cancel",
+                                    "remote_task_id": parent_request["remote_task_id"],
+                                    "payload": {"local_task_id": parent_ack["local_task_id"], "reason": "fixture_resume_parent"}})
+    parent = registry_row(parent_ack["local_task_id"])
+    check("resume-race setup: parent cancelled only after fake pane is observed absent",
+          parent_cancel.get("outcome") == "accepted" and parent and parent["state"] == "cancelled", parent_cancel)
+    if parent_cancel.get("outcome") != "accepted" or not parent or parent["state"] != "cancelled":
+        return
+    handoffs = Path(parent["worktree"]) / ".handoffs"
+    sentinels = {"ANSWER.md": b"fresh answer owned by the first resume\n",
+                 "ANSWER.prev.md": b"older preserved answer\n",
+                 "SPEC.md": b"winning resume specification\n"}
+    for name, content in sentinels.items():
+        (handoffs / name).write_bytes(content)
+
+    def resume_wire(index):
+        return signed_command({"command_id": "cmd_resume_race_" + str(index), "op": "resume",
+            "remote_task_id": f"rtask_20261002T000031Z_001100{index:02x}",
+            "payload": {"repo": "knowledge-base", "mode": "implement", "branch": parent["branch"],
+                        "local_run_id": parent["run_id"], "local_task_id": parent["task_id"],
+                        "text": "resume consumer " + str(index)}})
+
+    # The real bridge must observe absence, not infer it from malformed data,
+    # idle state, or a matching terminal identity. Only this fixture's stub is
+    # replaced; the PATH already excludes every live service from this suite.
+    original_herdr = fake_herdr.read_text()
+    try:
+        observations = [(50, {"result": {}}, "invalid pane observation"),
+                        (51, {"result": {"panes": [{"pane_id": parent["pane_id"],
+                              "terminal_id": parent["pane_birth"], "agent_session": {"value": "fixture-session"}}]}},
+                         "original pane is present or stop is unproven")]
+        for index, observation, expected_reason in observations:
+            fake_herdr.write_text("#!/bin/sh\ncat <<'HERDR_RESUME_FIXTURE_JSON'\n" +
+                                  json.dumps(observation) + "\nHERDR_RESUME_FIXTURE_JSON\n")
+            with patch.object(tsk, "_spawn", side_effect=AssertionError("stopped-parent refusal must precede spawn")) as guarded_spawn:
+                refused = publisher.process_leased_command(resume_wire(index), DUMMY_KEY, {}, time.time())
+            check("resume guard refuses the exact stopped-parent observation: " + expected_reason,
+                  refused.get("outcome") == "refused" and expected_reason in refused.get("detail", "")
+                  and guarded_spawn.call_count == 0, refused)
+            check("stopped-parent refusal preserves ANSWER, previous answer and SPEC",
+                  all((handoffs / name).read_bytes() == content for name, content in sentinels.items()))
+    finally:
+        fake_herdr.write_text(original_herdr)
+
+    wires = [resume_wire(index) for index in (52, 53)]
+    old_read_barrier = threading.Barrier(2)
+    spawn_entered, spawn_release = threading.Event(), threading.Event()
+    spawn_lock = threading.Lock()
+    resume_spawns = []
+    original_spawn, original_bridge = tsk._spawn, tsk._bridge
+
+    def simultaneous_parent_read(*args):
+        result = original_bridge(*args)
+        if args == ("read", parent["run_id"], parent["task_id"]):
+            old_read_barrier.wait(timeout=10)
+        return result
+
+    def paused_resume_spawn(*args):
+        with spawn_lock:
+            resume_spawns.append(args[-1])
+            first_consumer = len(resume_spawns) == 1
+        if not first_consumer:
+            return subprocess.CompletedProcess(args, 96, "", "unexpected second resume reached spawn")
+        # Reservation is committed by now; keep the actual one-shot mutation
+        # claim and rename paused while the other signed request is rejected.
+        spawn_entered.set()
+        if not spawn_release.wait(25):
+            raise RuntimeError("distinct-resume fixture stalled")
+        return original_spawn(*args)
+
+    with patch.object(tsk, "_bridge", side_effect=simultaneous_parent_read), \
+         patch.object(tsk, "_spawn", side_effect=paused_resume_spawn), ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {wire["command_id"]: pool.submit(publisher.process_leased_command, wire, DUMMY_KEY, {}, time.time())
+                   for wire in wires}
+        try:
+            ready = spawn_entered.wait(15)
+            check("distinct resumes overlap after reading the same terminal parent", ready)
+            if ready:
+                winner_id = resume_spawns[0]
+                loser_id = next(cid for cid in futures if cid != winner_id)
+                loser = futures[loser_id].result(timeout=15)
+                check("losing distinct resume refuses the existing successor reservation",
+                      loser.get("outcome") == "refused"
+                      and "parent already has a successor" in loser.get("detail", ""), loser)
+                check("losing resume cannot rename ANSWER or overwrite previous answer/SPEC",
+                      all((handoffs / name).read_bytes() == content for name, content in sentinels.items()))
+                loser_receipt = json.loads(original_bridge("read-authorization", loser_id).stdout)
+                check("losing resume has no bound task or mutation permission",
+                      loser_receipt.get("status") == "accepted" and not loser_receipt.get("task_id"), loser_receipt)
+            else:
+                winner_id = ""
+        finally:
+            spawn_release.set()
+        outcomes = {cid: future.result(timeout=25) for cid, future in futures.items()}
+    accepted = [(cid, outcome) for cid, outcome in outcomes.items() if outcome.get("outcome") == "accepted"]
+    check("two distinct signed resumes execute exactly one fixture launch",
+          len(accepted) == 1 and resume_spawns == [accepted[0][0]] and accepted[0][0] == winner_id, outcomes)
+    check("winning mutation retires the fresh answer once and preserves SPEC",
+          not (handoffs / "ANSWER.md").exists()
+          and (handoffs / "ANSWER.prev.md").read_bytes() == sentinels["ANSWER.md"]
+          and (handoffs / "SPEC.md").read_bytes() == sentinels["SPEC.md"])
+    with sqlite3.connect(tsk.REGISTRY) as db:
+        owners = db.execute("SELECT command_id,mutation_claimed FROM task_worktree_reservations WHERE worktree=?",
+                            (str(Path(parent["worktree"]).resolve()),)).fetchall()
+        edges = db.execute("SELECT command_id FROM task_resume_edges WHERE parent_task_id=?", (parent["task_id"],)).fetchall()
+        launched_children = db.execute("SELECT command_id FROM task_authorizations WHERE command_id IN (?,?) AND status='launched'",
+                                       tuple(wire["command_id"] for wire in wires)).fetchall()
+    check("registry retains exactly the winning owner, mutation claim and permanent parent edge",
+          owners == [(winner_id, 1)] and edges == [(winner_id,)] and launched_children == [(winner_id,)],
+          {"owners": owners, "edges": edges, "launched_children": launched_children})
+    for cid, outcome in accepted:
+        wire = next(wire for wire in wires if wire["command_id"] == cid)
+        cleanup = process_command({"command_id": cid + "_cancel", "op": "cancel", "remote_task_id": wire["remote_task_id"],
+                                   "payload": {"local_task_id": outcome["local_task_id"], "reason": "fixture_cleanup"}})
+        check("resume-race cleanup cancels the one fixture child", cleanup.get("outcome") == "accepted", cleanup)
+
+
+distinct_resume_reservation_regression()
 
 if REGISTRY_ONLY:
     print("SKIP: independent timer/process-identity checks (--registry-only); no timer verification claimed")

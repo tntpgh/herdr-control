@@ -483,6 +483,35 @@ if [ "$dry" = 1 ]; then
   exit 0
 fi
 
+# Source authority is separate from the pane assigned to supervise the task.
+# In particular, the publisher's Main fallback is never proof Main approved
+# the manifest. The remote adapter must have persisted a verified receipt;
+# local launches must prove the actual caller's live conductor ancestry.
+if [ -n "$authorization_command_id" ]; then
+  authorization_row="$(read_task_authorization "$authorization_command_id")" || exit 1
+  printf '%s' "$authorization_row" | jq -e --arg repo "$(basename "$root")" --arg job "$job" \
+    '.status == "accepted" and .source == "oauth_task_delegation" and .repo == $repo and .effective_scope.job_class == $job' >/dev/null || {
+    echo "spawn-task: authorization hold: source, repo or job binding mismatch" >&2; exit 1;
+  }
+  # Match the existing allowlist's credential policy; inherited withholding
+  # can only tighten it. This receipt adds no credential grant of its own.
+  source_secrets="$(printf '%s' "$authorization_row" | jq -r '.effective_scope.secrets')"
+  source_posture_ok=0
+  case "$source_secrets:$secrets_req" in
+    grant:grant|default:|default:withhold) source_posture_ok=1 ;;
+  esac
+  if [ "$managed" != 1 ] || [ "$source_posture_ok" != 1 ]; then
+    echo "spawn-task: authorization hold: remote launch credential/agent posture mismatch" >&2; exit 1
+  fi
+  # This durable once-only claim precedes git worktree changes and every
+  # .handoffs write. Expiry/crash never releases an uncertain reservation.
+  claim_task_worktree_mutation "$authorization_command_id" "$root" "$wt" "$branch" >/dev/null || exit 1
+else
+  # Preserve an already reserved remote worktree even for a local/unmanaged
+  # invocation. This read-only guard does not serialize two brand-new intents.
+  check_worktree_unreserved "$root" "$wt" "$branch" >/dev/null || exit 1
+fi
+
 # ---- worktree: create or reuse ---------------------------------------------
 # A NEW branch is cut from origin's default branch, never from the local
 # checkout's HEAD: the local checkout is routinely a dirty, stale lane (2026-09-05:
@@ -551,6 +580,10 @@ trap 'exit 130' INT TERM HUP
 if ! archive_fence_enter "$wt"; then
   echo "spawn-task: $_ARCHIVE_WHY — not writing into it" >&2
   exit 1
+fi
+if [ -n "${authorization_row:-}" ] && [ "$(printf '%s' "$authorization_row" | jq -r '.claims.op')" = resume ] \
+   && [ -f "$wt/.handoffs/ANSWER.md" ]; then
+  mv "$wt/.handoffs/ANSWER.md" "$wt/.handoffs/ANSWER.prev.md" || exit 1
 fi
 
 # ---- coordination scaffold --------------------------------------------------
@@ -732,27 +765,8 @@ case "$job" in
     ;;
 esac
 
-# Source authority is separate from the pane assigned to supervise the task.
-# In particular, the publisher's Main fallback is never proof Main approved
-# the manifest. The remote adapter must have persisted a verified receipt;
-# local launches must prove the actual caller's live conductor ancestry.
-if [ -n "$authorization_command_id" ]; then
-  authorization_row="$(read_task_authorization "$authorization_command_id")" || exit 1
-  printf '%s' "$authorization_row" | jq -e --arg repo "$(basename "$root")" --arg job "$job" \
-    '.status == "accepted" and .source == "oauth_task_delegation" and .repo == $repo and .effective_scope.job_class == $job' >/dev/null || {
-    echo "spawn-task: authorization hold: source, repo or job binding mismatch" >&2; exit 1;
-  }
-  # Match the existing allowlist's credential policy; inherited withholding
-  # can only tighten it. This receipt adds no credential grant of its own.
-  source_secrets="$(printf '%s' "$authorization_row" | jq -r '.effective_scope.secrets')"
-  source_posture_ok=0
-  case "$source_secrets:$secrets_req" in
-    grant:grant|default:|default:withhold) source_posture_ok=1 ;;
-  esac
-  if [ "$managed" != 1 ] || [ "$source_posture_ok" != 1 ]; then
-    echo "spawn-task: authorization hold: remote launch credential/agent posture mismatch" >&2; exit 1
-  fi
-elif [ "$managed" = 1 ]; then
+# Local caller authority is established once the final manifest is known.
+if [ -z "$authorization_command_id" ] && [ "$managed" = 1 ]; then
   source_pane="$(caller_pane_from_ancestry)" || {
     echo "spawn-task: authorization hold: local caller ancestry unavailable or outside Herdr" >&2; exit 1;
   }

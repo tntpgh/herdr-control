@@ -757,6 +757,24 @@ def _launch_authorized(cmd: dict, authorization: VerifiedAuthorization, root: Pa
     return ack
 
 
+def _reserve_worktree(cmd: dict, root: Path, branch: str) -> dict | None:
+    wt = WT_ROOT / root.name / branch
+    result = _bridge("reserve-worktree", canonical_json(cmd), str(root), str(wt), branch)
+    if result.returncode != 0:
+        return {"command_id": cmd["command_id"], "outcome": "refused",
+                "detail": "worktree reservation refused: " + result.stderr.strip()[:220]}
+    try:
+        row = json.loads(result.stdout)
+    except ValueError:
+        row = {}
+    if (row.get("command_id") != cmd["command_id"] or row.get("repo") != str(root.resolve())
+            or row.get("worktree") != str(wt.resolve()) or row.get("branch") != branch
+            or row.get("newly_reserved") is not True):
+        return {"command_id": cmd["command_id"], "outcome": "held",
+                "detail": "worktree reservation outcome unknown or already consumed; no mutation retry"}
+    return None
+
+
 def _start(cmd: dict, authorization: VerifiedAuthorization) -> dict:
     cid, remote_id, p = cmd["command_id"], cmd["remote_task_id"], cmd["payload"]
     repo, mode, objective = p["repo"], p["mode"], p.get("objective", "")
@@ -773,6 +791,9 @@ def _start(cmd: dict, authorization: VerifiedAuthorization) -> dict:
         return {"command_id": cid, "outcome": "refused", "detail": f"too_many_concurrent on the Mac (max {caps['max_concurrent']})"}
     if _count_remote("created_at > ?", (_iso_in(-86400),)) >= caps["max_per_day"]:
         return {"command_id": cid, "outcome": "refused", "detail": f"too_many_today on the Mac (max {caps['max_per_day']}/day)"}
+    reserved = _reserve_worktree(cmd, root, branch)
+    if reserved is not None:
+        return reserved
     return _launch_authorized(cmd, authorization, root, branch, mode, authorization.parsed["effective_scope"], objective)
 
 
@@ -830,11 +851,11 @@ def _resume(cmd: dict, authorization: VerifiedAuthorization) -> dict:
         return refuse(f"too_many_concurrent on the Mac (max {caps['max_concurrent']})")
     if _count_remote("created_at > ?", (_iso_in(-86400),)) >= caps["max_per_day"]:
         return refuse(f"too_many_today on the Mac (max {caps['max_per_day']}/day)")
-    # Invalidate prior answer only AFTER authenticated admission and protected
-    # binding checks; rejected/replayed resumes cannot mutate the worktree.
-    stale_answer = wt / ".handoffs/ANSWER.md"
-    if stale_answer.is_file():
-        stale_answer.replace(wt / ".handoffs/ANSWER.prev.md")
+    reserved = _reserve_worktree(cmd, root, branch)
+    if reserved is not None:
+        return reserved
+    # spawn-task claims this reservation once before ANY worktree write,
+    # including retiring the prior answer. A second command cannot alter it.
     return _launch_authorized(cmd, authorization, root, branch, mode, mcfg,
                               "(resumed -- see the follow-up note below, if any)", follow_up)
 

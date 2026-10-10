@@ -719,6 +719,29 @@ describe("cancel_task / resume_task", () => {
     expect(resumeCmd!.authorization).not.toEqual(startCmd.authorization);
   });
 
+  it("atomically admits one of two distinct concurrent resumes for the same terminal parent", async () => {
+    const config = { ...TASK_CONFIG, caps: { ...CAPS, max_concurrent: 2 } };
+    await signedSync(taskConfigBody(config));
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const command = (await syncJson(await signedSync(taskConfigBody(config)))).commands[0]!;
+    await signedSync({ ...taskConfigBody(config), lease: false, command_acks: [{ command_id: command.command_id,
+      outcome: "accepted", detail: "spawned", local_task_id: "task_resume_race", local_run_id: "run_resume_race",
+      branch: "remote/resume-race" }] });
+    await signedSync(syncBody({ snapshot: snapshot({ task_config: config,
+      tasks: [taskRow("task_resume_race", started.data.task_id)] }) }));
+    const results = await Promise.all([
+      callTool(tok, "resume_task", { task_id: started.data.task_id, text: "first continuation" }),
+      callTool(tok, "resume_task", { task_id: started.data.task_id, text: "different continuation" }),
+    ]);
+    expect(results.filter((result) => !result.isError)).toHaveLength(1);
+    expect(results.filter((result) => result.isError)).toHaveLength(1);
+    expect(results.find((result) => result.isError)!.data.error).toBe("worktree_reserved");
+    const commands = (await syncJson(await signedSync(taskConfigBody(config)))).commands;
+    expect(commands.filter((item) => item.op === "resume")).toHaveLength(1);
+    expect(commands[0]!.payload).toMatchObject({ local_task_id: "task_resume_race", branch: "remote/resume-race" });
+  });
+
   it("refuses resume after a publisher downgrade before creating the child task", async () => {
     await signedSync(taskConfigBody());
     const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);

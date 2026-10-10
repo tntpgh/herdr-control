@@ -127,7 +127,7 @@ peer_decide 'git add result.txt && git status && git commit -m fixture' "$truste
   && ok 'compound command cannot use the simple-command ownership recognizer' || fail "compound ownership expanded: $rc/$PD_VERDICT/$PD_AUTHORITY"
 
 printf '== authority machinery cannot be executed or overwritten by a worker ==\n'
-for control in lib/task-authorization.py remote-mcp/registry-bridge.sh remote-mcp/authorization.py tests/fixtures/task-authorization.sh; do
+for control in lib/task-authorization.py lib/task-reservation.py remote-mcp/registry-bridge.sh remote-mcp/authorization.py tests/fixtures/task-authorization.sh; do
   interpreter=python3; case "$control" in *.sh) interpreter=bash ;; esac
   for command in "$interpreter $here/$control" "printf x > $here/$control"; do
     peer_decide "$command" "$trusted"; rc=$?
@@ -180,6 +180,74 @@ done
   && ok 'four concurrent consumers: exactly one consumes, three refuse' || fail "concurrent consume winners=$winners losers=$losers"
 action_grant_consume "$once"; rc=$?
 [ "$rc" = 1 ] && ok 'replay of a consumed grant refuses' || fail 'consumed grant replay allowed'
+
+printf '== invalidation after genuine preflight cannot win the action CAS ==\n'
+# The adapter wrapper executes the real read-only check, then commits a
+# conflicting scratch-registry write before returning that old valid result.
+# This deterministically hit the former check/UPDATE gap; no verifier result
+# is fabricated and production has no test-only pause or permission bypass.
+source_sha="$(q "SELECT source_sha256 FROM task_authorizations WHERE task_id='trusted';")"
+for operation in consume approve; do
+  for invalidation in cancellation source; do
+    race_sha="$(_ps_sha "interleave-$operation-$invalidation")"
+    race_id="$(action_request_create gates trusted bash "$race_sha" 'chmod u+x result.txt' escalate fixture conductor once '' '')"
+    if [ "$operation" = consume ]; then
+      action_request_decide "$race_id" approved conductor w9:p9 local-build fixture || { fail "race setup: $AR_MUTATION_REASON"; exit 1; }
+    fi
+    case "$invalidation" in
+      cancellation) race_sql="UPDATE tasks SET state='cancelled' WHERE task_id='trusted';" ;;
+      source) race_sql="UPDATE task_authorizations SET source_sha256='invalidated' WHERE task_id='trusted';" ;;
+    esac
+    race_mark="$work/$race_sha-preflight"; execute_mark="$work/$race_sha-executed"
+    race_checks="$work/$race_sha-checks"; race_after=1
+    # resolve checks once before looking up a grant; the second genuine check
+    # is action_grant_consume's own preflight, immediately before its mutation.
+    [ "$operation" != consume ] || race_after=2
+    (
+      _task_authorization_adapter() {
+        local op="$1" result checks
+        python3 "$_TASK_AUTHORIZATION_HELPER" "$(registry_db)" "$@"; result=$?
+        if [ "$op" = check ] && [ "$result" = 0 ] && [ ! -e "$race_mark" ]; then
+          checks="$(cat "$race_checks" 2>/dev/null || printf '0')"
+          checks=$((checks + 1)); printf '%s\n' "$checks" > "$race_checks"
+          if [ "$checks" = "$race_after" ]; then
+            _sql "$race_sql" >/dev/null || return 1
+            printf 'committed\n' > "$race_mark"
+          fi
+        fi
+        return "$result"
+      }
+      if [ "$operation" = consume ]; then
+        action_request_resolve gates trusted bash "$race_sha" 'chmod u+x result.txt' escalate fixture conductor once '' ''
+        [ "$AR_DECISION" != allow ] || printf 'executed\n' > "$execute_mark"
+        [ "$AR_STATE" = authorization_hold ] && [ "$AR_REQUEST_ID" = "$race_id" ] && hold_reason "$AR_WHY"
+      else
+        action_request_decide "$race_id" approved conductor w9:p9 local-build fixture; result=$?
+        [ "$result" != 0 ] || printf 'approved\n' > "$execute_mark"
+        [ "$result" = 1 ] && [ "$AR_MUTATION_HOLD" = 1 ] && hold_reason "$AR_MUTATION_REASON"
+      fi
+    ); race_rc=$?
+    expected=pending; [ "$operation" != consume ] || expected=approved
+    [ "$race_rc" = 0 ] && [ -s "$race_mark" ] && [ ! -e "$execute_mark" ] &&
+      [ "$(action_request_get "$race_id" | jq -r .status)" = "$expected" ] &&
+      [ "$(q "SELECT count(*) FROM action_requests WHERE action_sha256=$(_sq "$race_sha");")" = 1 ] \
+      && ok "$operation after $invalidation: committed invalidation, zero mutation/execution/replacement" \
+      || fail "$operation/$invalidation interleaving rc=$race_rc status=$(action_request_get "$race_id" | jq -r .status)"
+    q "UPDATE tasks SET state='running' WHERE task_id='trusted'; UPDATE task_authorizations SET source_sha256=$(_sq "$source_sha") WHERE task_id='trusted';" >/dev/null
+  done
+done
+
+printf '== authorized compound command reaches the fixture menu transport ==\n'
+compound='git add result.txt && git status && git commit -m fixture'
+printf 'Allow tool: bash\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' "$compound" > "$SCREEN"
+compound_prompt="$(prompt_id w2:p2)"
+append_event gates trusted input_required "$(jq -nc --arg cmd "$compound" --arg pid "$compound_prompt" '{tool:"bash",command:$cmd,prompt_id:$pid}')" >/dev/null
+HERDR_PANE_ID=forged-label bash "$here/herdr-select.sh" w2:p2 1 --authority conductor --expect-prompt-id "$compound_prompt" --review-category branch-work --review-reason 'fixture compound inside approved task scope' > "$work/compound-menu" 2>&1; rc=$?
+[ "$rc" = 0 ] && [ "$(wc -l < "$KEYS" | tr -d ' ')" = 1 ] && grep -qx 'pane send-keys w2:p2 Enter' "$KEYS" &&
+  [ "$(q "SELECT count(*) FROM approvals WHERE task_id='trusted' AND prompt_id=$(_sq "$compound_prompt") AND authority='conductor' AND outcome='pressed';")" = 1 ] \
+  && ok 'authorized compound: exact prompt, current conductor ancestry, one delivered Enter and auditable acknowledgement' \
+  || fail "authorized compound delivery rc=$rc: $(cat "$work/compound-menu")"
+: > "$KEYS"
 
 printf '== approved grants revalidate original source ==\n'
 printf '#!/bin/bash\nchmod u+x result.txt\n' > "$WT/probe.sh"

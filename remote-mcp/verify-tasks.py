@@ -12,6 +12,7 @@ script's own sqlite fixture never shares a path with the real one.
 """
 from __future__ import annotations
 
+from contextlib import closing
 import importlib.util
 import hashlib
 import hmac
@@ -167,6 +168,7 @@ tsk._popen_detached = _record_hard_stop
 
 def _reset_registry(rows: list[tuple] = ()):
     RECEIPTS.clear()
+    RESERVATIONS.clear()
     SIGNED_FIXTURES.clear()
     con = sqlite3.connect(REGISTRY)
     con.execute("DELETE FROM tasks")
@@ -187,6 +189,7 @@ def _start_cmd(repo="knowledge-base", mode="research", objective="find X") -> di
 from authorization import AuthorizationError, canonical_json, payload_sha256, verify_command
 FIXTURE_KEY = "fixture-key-for-receiver-tests-only-32"
 RECEIPTS = {}
+RESERVATIONS = {}
 SIGNED_FIXTURES = {}
 _REAL_BRIDGE = tsk._bridge
 _REAL_SPAWN = tsk._spawn
@@ -226,13 +229,23 @@ def _process(cmd):
 
 
 def _fixture_bridge(*args):
-    if args[0] not in ("accept-authorization", "read-authorization"):
+    if args[0] not in ("accept-authorization", "read-authorization", "reserve-worktree"):
         return _REAL_BRIDGE(*args)
     with FAKE_BRIDGE_LOG.open("a") as log:
         log.write(" ".join(args) + "\n")
     if FAKE_BRIDGE_RC.read_text().strip() != "0":
         return subprocess.CompletedProcess(args, 1, "", "fixture refusal")
-    if args[0] == "accept-authorization":
+    if args[0] == "reserve-worktree":
+        cmd = json.loads(args[1])
+        root, wt, branch = args[2:]
+        key = (str(Path(root).resolve()), branch)
+        previous = RESERVATIONS.get(key)
+        if previous and previous != cmd["command_id"]:
+            return subprocess.CompletedProcess(args, 1, "", "worktree already reserved")
+        RESERVATIONS[key] = cmd["command_id"]
+        row = {"command_id": cmd["command_id"], "repo": str(Path(root).resolve()),
+               "worktree": str(Path(wt).resolve()), "branch": branch, "newly_reserved": previous is None}
+    elif args[0] == "accept-authorization":
         cmd, claims = json.loads(args[1]), json.loads(args[2])
         cid = cmd["command_id"]
         new = cid not in RECEIPTS
@@ -247,6 +260,11 @@ def _fixture_bridge(*args):
 
 
 def _fixture_spawn(root, branch, mcfg, brief, authorization_command_id=""):
+    source = RECEIPTS.get(authorization_command_id, {})
+    if source.get("claims", {}).get("op") == "resume":
+        answer = WT_ROOT / root.name / branch / ".handoffs/ANSWER.md"
+        if answer.is_file():
+            answer.replace(answer.with_name("ANSWER.prev.md"))
     proc = _REAL_SPAWN(root, branch, mcfg, brief, authorization_command_id)
     if proc.returncode == 0 and authorization_command_id in RECEIPTS:
         RECEIPTS[authorization_command_id].update(status="launched", run_id="run_fake1", task_id="task_fake1",
@@ -317,6 +335,55 @@ class SpawnArgvAgainstRealParser(unittest.TestCase):
             tokens = launch.split()
             for flag in (a for a in argv[1:] if a.startswith("--")):
                 self.assertNotIn(flag, tokens, f"{flag} leaked onto the omp command line: {launch}")
+
+
+class SpawnReservationBeforeWrites(unittest.TestCase):
+    def test_real_spawn_refuses_missing_or_consumed_reservation_before_writes(self):
+        base = TMP / "spawn-reservation"
+        repo, wt_root, state, binaries = (base / name for name in ("knowledge-base", "worktrees", "state", "bin"))
+        for directory in (repo, state, binaries):
+            directory.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        calls = base / "external-calls"
+        for name in ("herdr", "omp", "claude", "codex", "curl", "gh"):
+            binary = binaries / name
+            binary.write_text('#!/bin/sh\nprintf "%s\\n" "$0 $*" >> "' + str(calls) + '"\nexit 1\n')
+            binary.chmod(0o755)
+        helper_spec = importlib.util.spec_from_file_location("spawn_reservation_fixture", HERE.parent / "lib/task-reservation.py")
+        helper = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper)
+        adapter = helper.auth()
+        cmd = _signed(_start_cmd(mode="implement"))
+        branch = "remote/" + cmd["remote_task_id"].rsplit("_", 1)[-1]
+        wt = wt_root / repo.name / branch
+        handoffs = wt / ".handoffs"
+        handoffs.mkdir(parents=True)
+        for name in ("SPEC.md", "ANSWER.md", "ANSWER.prev.md"):
+            (handoffs / name).write_text("sentinel " + name)
+        brief = base / "brief.md"
+        brief.write_text("unapplied fixture brief")
+        with closing(adapter.connect(str(state / "registry.sqlite3"))) as db:
+            db.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY,value TEXT)")
+            db.execute("CREATE TABLE tasks(task_id TEXT,repo TEXT,worktree TEXT,branch TEXT,state TEXT)")
+            db.commit()
+            adapter.schema(db)
+            adapter.accept(db, canonical_json(cmd), cmd["authorization"]["claims"])
+        env = {**os.environ, "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
+               "HERDR_RUN_STATE_DIR": str(state), "HERDR_STATE_DIR": str(base / "local-state"),
+               "HERDR_WT_DIR": str(wt_root), "HERDR_PANE_ID": "", "HERDR_MCP_CONDUCTOR_PANE": ""}
+        argv = ["bash", str(HERE.parent / "spawn-task.sh"), str(repo), branch, "implement", "claude",
+                "--no-secrets", "--brief", str(brief), "--authorization-command-id", cmd["command_id"]]
+        for consumed in (False, True):
+            if consumed:
+                with closing(adapter.connect(str(state / "registry.sqlite3"))) as db:
+                    helper.reserve(db, canonical_json(cmd), str(repo), str(wt), branch)
+                    helper.claim_mutation(db, cmd["command_id"], str(repo), str(wt), branch)
+            result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("worktree reservation", result.stderr)
+            for name in ("SPEC.md", "ANSWER.md", "ANSWER.prev.md"):
+                self.assertEqual((handoffs / name).read_text(), "sentinel " + name)
+        self.assertFalse(calls.exists(), "real spawn must refuse before any external surface call")
 
 
 class RemoteSpawnConductorRouting(unittest.TestCase):

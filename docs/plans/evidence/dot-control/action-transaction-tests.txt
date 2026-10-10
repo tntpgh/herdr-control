@@ -1,0 +1,19 @@
+test_action_snapshot_and_route_checked_in_transaction (__main__.ActionTransactionTests.test_action_snapshot_and_route_checked_in_transaction) ... ok
+test_approval_binds_reviewed_request_fields (__main__.ActionTransactionTests.test_approval_binds_reviewed_request_fields) ... ok
+test_approval_rechecks_current_conductor_birth (__main__.ActionTransactionTests.test_approval_rechecks_current_conductor_birth) ... ok
+test_approved_task_action_survives_supervisor_handover (__main__.ActionTransactionTests.test_approved_task_action_survives_supervisor_handover) ... ok
+test_cli_returns_structured_refusal (__main__.ActionTransactionTests.test_cli_returns_structured_refusal) ... ok
+test_competing_consumers_change_and_execute_once (__main__.ActionTransactionTests.test_competing_consumers_change_and_execute_once) ... ok
+test_decline_and_supersede_remain_available_without_source (__main__.ActionTransactionTests.test_decline_and_supersede_remain_available_without_source) ... ok
+test_file_grant_and_decision_commit_together (__main__.ActionTransactionTests.test_file_grant_and_decision_commit_together) ... ok
+test_invalidator_cannot_commit_between_validation_and_approve (__main__.ActionTransactionTests.test_invalidator_cannot_commit_between_validation_and_approve) ... ok
+test_invalidator_cannot_commit_between_validation_and_consume (__main__.ActionTransactionTests.test_invalidator_cannot_commit_between_validation_and_consume) ... ok
+test_receipt_deleted_before_approve_acquires_lock (__main__.ActionTransactionTests.test_receipt_deleted_before_approve_acquires_lock) ... ok
+test_receipt_deleted_before_consume_acquires_lock (__main__.ActionTransactionTests.test_receipt_deleted_before_consume_acquires_lock) ... ok
+test_task_ends_before_approve_acquires_lock (__main__.ActionTransactionTests.test_task_ends_before_approve_acquires_lock) ... ok
+test_task_ends_before_consume_acquires_lock (__main__.ActionTransactionTests.test_task_ends_before_consume_acquires_lock) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 4.864s
+
+OK

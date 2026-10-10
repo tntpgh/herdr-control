@@ -64,12 +64,12 @@
   ok    F2: no `herdr pane list` or `pane close` call was ever made for the completed row either
 == F1: real registry-bridge.sh cancel corroborates a terminal_id mismatch via agent_session (herdr restart case) ==
   ok    F1a start accepted
-  ok    setup: agent_session stamped for task_e2e_20261010T011536Z_54135_21595
+  ok    setup: agent_session stamped for task_e2e_20261010T013535Z_97550_6627
   ok    F1a: pane close WAS attempted (same agent_session corroborated 'still ours' despite the terminal_id mismatch)
   ok    F1a: cancel fails here only because this fixture's `pane close` itself fails (proves the match, not the close)
   ok    cleanup (cmd_f1a_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
   ok    F1b start accepted
-  ok    setup: agent_session stamped for task_e2e_20261010T011539Z_61805_17696
+  ok    setup: agent_session stamped for task_e2e_20261010T013538Z_1761_6343
   ok    F1b: cancel SUCCEEDS when a disagreeing agent_session confirms a different occupant (nothing of ours to close)
   ok    F1b: `herdr pane close` was NEVER attempted (not our pane)
   ok    F1b: registry state is 'cancelled'
@@ -101,6 +101,21 @@
   ok    two different jobs launch concurrently with distinct local tasks
   ok    concurrent task retains its own remote binding cmd_concurrent_2
   ok    concurrent task retains its own remote binding cmd_concurrent_3
+== distinct resumes: exclusive worktree mutation and trusted stopped-parent observation ==
+  ok    resume-race setup: authenticated parent launch recorded
+  ok    resume-race setup: parent cancelled only after fake pane is observed absent
+  ok    resume guard refuses the exact stopped-parent observation: invalid pane observation
+  ok    stopped-parent refusal preserves ANSWER, previous answer and SPEC
+  ok    resume guard refuses the exact stopped-parent observation: original pane is present or stop is unproven
+  ok    stopped-parent refusal preserves ANSWER, previous answer and SPEC
+  ok    distinct resumes overlap after reading the same terminal parent
+  ok    losing distinct resume refuses the existing successor reservation
+  ok    losing resume cannot rename ANSWER or overwrite previous answer/SPEC
+  ok    losing resume has no bound task or mutation permission
+  ok    two distinct signed resumes execute exactly one fixture launch
+  ok    winning mutation retires the fresh answer once and preserves SPEC
+  ok    registry retains exactly the winning owner, mutation claim and permanent parent edge
+  ok    resume-race cleanup cancels the one fixture child
 SKIP: independent timer/process-identity checks (--registry-only); no timer verification claimed
   ok    teardown: every timer created by this fixture is reaped
 

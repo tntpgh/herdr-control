@@ -2,7 +2,7 @@
   ok    unverified source held: git add result.txt
   ok    unverified source held: git commit -m fixture
   ok    unverified source held: git add result.txt && git status && git commit -m fixture
-  ok    unverified source held: cd "/private/tmp/herdr-auth-gates.SxvK7b/wt" && git add result.txt && git status && git commit -m fixture
+  ok    unverified source held: cd "/private/tmp/herdr-auth-gates.o0aWa6/wt" && git add result.txt && git status && git commit -m fixture
   ok    caller JSON cannot forge verification
 == stable hook hold: no repeated requests or grant consumption ==
   ok    hook attempt 1 held without a request
@@ -25,6 +25,9 @@
   ok    authority machinery is human-reserved: python3 /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/task-authorization.py
   ok    authority machinery is human-reserved: printf x > /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/task-authorization.py
   ok    ordinary source inspection stays allowed: lib/task-authorization.py
+  ok    authority machinery is human-reserved: python3 /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/task-reservation.py
+  ok    authority machinery is human-reserved: printf x > /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/task-reservation.py
+  ok    ordinary source inspection stays allowed: lib/task-reservation.py
   ok    authority machinery is human-reserved: bash /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/remote-mcp/registry-bridge.sh
   ok    authority machinery is human-reserved: printf x > /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/remote-mcp/registry-bridge.sh
   ok    ordinary source inspection stays allowed: remote-mcp/registry-bridge.sh
@@ -43,6 +46,13 @@
   ok    positive decision emits exactly one fixture notification
   ok    four concurrent consumers: exactly one consumes, three refuse
   ok    replay of a consumed grant refuses
+== invalidation after genuine preflight cannot win the action CAS ==
+  ok    consume after cancellation: committed invalidation, zero mutation/execution/replacement
+  ok    consume after source: committed invalidation, zero mutation/execution/replacement
+  ok    approve after cancellation: committed invalidation, zero mutation/execution/replacement
+  ok    approve after source: committed invalidation, zero mutation/execution/replacement
+== authorized compound command reaches the fixture menu transport ==
+  ok    authorized compound: exact prompt, current conductor ancestry, one delivered Enter and auditable acknowledgement
 == approved grants revalidate original source ==
   ok    verified file approval permits its unchanged reviewed bytes
   ok    old file approval cannot clear newly unverified provenance
@@ -55,4 +65,4 @@
   ok    unreadable ancestry fails closed; no env fallback
   ok    held scenarios: exactly zero consumes, keypresses and notifications
 
-48 passed / 0 failed; live canary runs=0 (not measured)
+56 passed / 0 failed; live canary runs=0 (not measured)

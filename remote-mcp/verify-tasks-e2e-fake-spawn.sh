@@ -32,6 +32,10 @@ receipt="$(read_task_authorization "$authorization_command_id")"
 manifest="$(printf '%s' "$receipt" | jq -er '.expected_manifest')"
 repo_name=$(basename "$root")
 wt="${HERDR_WT_DIR:?HERDR_WT_DIR must be set to a scratch dir}/$repo_name/$branch"
+claim_task_worktree_mutation "$authorization_command_id" "$root" "$wt" "$branch" >/dev/null
+if [ "$(printf '%s' "$receipt" | jq -r '.claims.op')" = resume ] && [ -f "$wt/.handoffs/ANSWER.md" ]; then
+  mv "$wt/.handoffs/ANSWER.md" "$wt/.handoffs/ANSWER.prev.md"
+fi
 mkdir -p "$(dirname "$wt")"
 
 trunk=main
