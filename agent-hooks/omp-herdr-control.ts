@@ -1252,13 +1252,99 @@ function enforceOwnerApproval(event: unknown, ctx: unknown): Block | undefined {
   }));
 }
 
-function onApprovalRequested(event: unknown): undefined {
+// ---- occurrence correlation (docs/plans/dot-herdr-recovery-slices.md §2) ---
+// Carries (run, task, pane, pane_birth, native_session, toolCallId) through
+// the approval lifecycle into lib/prompt-occurrence.py, the one deterministic
+// fold every consumer (attention-tick.sh, herdr-select.sh, hub.py) reads.
+// native_session is THIS session's omp id (sessionIdOf, same mechanism
+// enforceOwnerApproval already trusts above) — never from env or payload,
+// and stable for the life of this hook module instance, so a late event from
+// an old session's residual process cannot resolve a new session's
+// occurrence: the key simply would not match.
+const PROMPT_OCCURRENCE_PY = path.join(ROOT, "lib", "prompt-occurrence.py");
+const promptOccurrenceAvailable = safeExists(PROMPT_OCCURRENCE_PY);
+
+let registeredPaneBirthCache: string | undefined;
+function registeredPaneBirth(): string {
+  if (registeredPaneBirthCache !== undefined) return registeredPaneBirthCache;
+  if (!WORKER_RUN_ID || !WORKER_TASK_ID || !safeExists(REGISTRY_DB)) {
+    registeredPaneBirthCache = "";
+    return registeredPaneBirthCache;
+  }
+  try {
+    const sql = `SELECT pane_birth FROM tasks WHERE run_id=${sqlQuote(WORKER_RUN_ID)} AND task_id=${sqlQuote(WORKER_TASK_ID)};`;
+    const r = spawnSync("sqlite3", ["-batch", "-noheader", "-cmd", ".timeout 3000", REGISTRY_DB, sql],
+      { encoding: "utf8", timeout: 4_000, stdio: ["ignore", "pipe", "pipe"] });
+    registeredPaneBirthCache = r.status === 0 ? (r.stdout ?? "").trim() : "";
+  } catch {
+    registeredPaneBirthCache = "";
+  }
+  return registeredPaneBirthCache;
+}
+
+function occurrenceIdentityArgs(callId: string, nativeSession: string): string[] {
+  return [
+    "--db", REGISTRY_DB, "--run", WORKER_RUN_ID, "--task", WORKER_TASK_ID, "--pane", WORKER_PANE_ID,
+    "--birth", registeredPaneBirth(), "--session", nativeSession, "--call-id", callId,
+  ];
+}
+
+// Synchronous, deliberately: the occurrence must be PERSISTED before the
+// notify/screen-probe path below ever runs, or a crash between notify and
+// recording loses the only evidence the prompt existed. This is a monitoring
+// path (same contract as the rest of this file): any failure here is
+// swallowed, never thrown, and never blocks the tool it observes.
+function recordOccurrence(args: string[]): void {
+  if (!promptOccurrenceAvailable || !WORKER_RUN_ID || !WORKER_TASK_ID || !WORKER_PANE_ID) return;
+  try {
+    spawnSync("python3", [PROMPT_OCCURRENCE_PY, ...args],
+      { encoding: "utf8", timeout: 4_000, stdio: ["ignore", "pipe", "pipe"] });
+  } catch {
+    // best effort — see header.
+  }
+}
+
+// Bounded (same eviction shape as inputByCallId/pendingScratch): which
+// in-flight calls this SESSION itself put through the approval menu, and
+// whether a decision was recorded for them yet. This is a fast-path only —
+// it decides completed-vs-withdrawn without a second durable read, but the
+// durable fold (prompt-occurrence.py) independently refuses to trust a
+// completion that was never actually approved, so a lost/evicted entry here
+// degrades to "no occurrence recorded for this call", never a false
+// completion.
+const occurrenceByCallId = new Map<string, { nativeSession: string; decided: boolean }>();
+function trackOccurrence(callId: string, nativeSession: string, decided: boolean): void {
+  occurrenceByCallId.set(callId, { nativeSession, decided });
+  while (occurrenceByCallId.size > INPUT_CACHE_MAX) {
+    const oldest = occurrenceByCallId.keys().next().value;
+    if (oldest === undefined) break;
+    occurrenceByCallId.delete(oldest);
+  }
+}
+
+
+function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     const toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
     const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
     const input = e.input ?? e.args ?? (callId !== undefined ? inputByCallId.get(callId) : undefined);
-    if (callId !== undefined) inputByCallId.delete(callId);
+    // Cache kept, never deleted here: omp can fire tool_approval_requested
+    // more than once for ONE still-open prompt (the existing compound-menu
+    // fixture pins exactly that repeat-firing shape), and deleting on the
+    // first firing silently dropped the SECOND firing's cached input before
+    // this fix (docs/plans/dot-herdr-recovery-slices.md §2, prerequisite
+    // notes on agent-hooks/omp-herdr-control.ts:925).
+    if (callId !== undefined) {
+      const nativeSession = sessionIdOf(ctx);
+      trackOccurrence(callId, nativeSession, false);
+      recordOccurrence([
+        "seen", ...occurrenceIdentityArgs(callId, nativeSession),
+        "--tool", toolName,
+        ...(input !== undefined ? ["--input-json", JSON.stringify(input)] : []),
+        "--source", "tool_approval_requested",
+      ]);
+    }
     // `reason` is the approval's own words when omp supplies one; the argument
     // summary is the fallback, and still the more useful line for bash.
     const detail = describeToolCall(toolName, input)
@@ -1305,8 +1391,25 @@ function retract(): void {
   if (resolveAvailable) spawnDetached([RESOLVE_SH]);
 }
 
-function onApprovalResolved(): undefined {
+function onApprovalResolved(event?: unknown, ctx?: unknown): undefined {
   try {
+    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
+    if (callId !== undefined) {
+      const approved = e.approved === true;
+      const nativeSession = sessionIdOf(ctx);
+      trackOccurrence(callId, nativeSession, true);
+      // Approval is never completion (plan §2): this moves the occurrence to
+      // approved_awaiting_completion, or — for a real Deny — resolves it
+      // directly as declined. `false` also covers "no interactive UI" and an
+      // abort, so `reason` carries omp's own words rather than this always
+      // being read as a human denial.
+      recordOccurrence([
+        "authorized", ...occurrenceIdentityArgs(callId, nativeSession),
+        "--decided-by", approved ? "human" : "human_or_abort",
+        "--choice", approved ? "approve" : "deny",
+      ]);
+    }
     retract();
   } catch {
     // see onApprovalRequested().
@@ -1314,13 +1417,28 @@ function onApprovalResolved(): undefined {
   return undefined;
 }
 
-function onExecutionEnd(event: unknown): undefined {
+function onExecutionEnd(event: unknown, ctx?: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     // Only `ask` was ever alerted from tool_execution_start, so only `ask`
     // needs the matching retraction; any other tool ending is not a prompt
     // being answered and must not cost a sweep.
     if (e.toolName === "ask") retract();
+    const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
+    const occ = callId !== undefined ? occurrenceByCallId.get(callId) : undefined;
+    if (callId !== undefined && occ) {
+      occurrenceByCallId.delete(callId);
+      const isError = e.isError === true;
+      if (occ.decided) {
+        recordOccurrence(["completed", ...occurrenceIdentityArgs(callId, occ.nativeSession),
+          ...(isError ? ["--is-error"] : [])]);
+      } else {
+        // Aborted/skipped before a decision ever reached this store — a
+        // withdrawal, never a silent success (plan §2).
+        recordOccurrence(["withdrawn", ...occurrenceIdentityArgs(callId, occ.nativeSession),
+          "--reason", "execution_end_without_decision"]);
+      }
+    }
   } catch {
     // see onApprovalRequested().
   }
