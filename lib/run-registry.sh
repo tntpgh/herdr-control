@@ -106,9 +106,43 @@ _task_authorization_adapter() {
   python3 "$_TASK_AUTHORIZATION_HELPER" "$(registry_db)" "$@"
 }
 
+_registry_enable_wal() {
+  # SQLite's journal-mode transition may return SQLITE_BUSY immediately even
+  # with busy_timeout installed. Retry that idempotent transition alone, using
+  # typed lock errors and the same bounded wait budget as ordinary SQL calls.
+  python3 - "$1" "${HERDR_REGISTRY_BUSY_MS:-5000}" <<'PY'
+import sqlite3
+import sys
+import time
+
+try:
+    path, budget_ms = sys.argv[1:]
+    budget = int(budget_ms) / 1000
+    if budget < 0:
+        raise ValueError("negative registry lock wait budget")
+    deadline = time.monotonic() + budget
+    with sqlite3.connect(path, timeout=0) as db:
+        while True:
+            try:
+                mode = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                if mode != "wal":
+                    raise ValueError("registry did not enter WAL mode")
+                break
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", 0) & 255
+                remaining = deadline - time.monotonic()
+                if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or remaining <= 0:
+                    raise
+                time.sleep(min(0.01, remaining))
+except (sqlite3.Error, OSError, ValueError) as exc:
+    print(f"run-registry: WAL initialization failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
-  local root db existed=0
+  local root db existed=0 init_error
   root="$(run_state_root)"
   db="$(registry_db)"
   [ ! -e "$db" ] || existed=1
@@ -121,14 +155,11 @@ registry_init() {
   # as the Slack bridge's state dir (see herdr-notify.sh's reg_dir comment).
   chmod 700 "$root" 2>/dev/null || true
 
-  # journal_mode is persisted in the database header, so it is set here rather
-  # than in _sql — WAL is what lets the reconcile sweep read while a hook
-  # writes, instead of the two serializing on a whole-file lock.
-  # Install the connection's wait policy before journal_mode too: concurrent
-  # first readers can otherwise fail immediately at that first PRAGMA, before
-  # the later busy_timeout statement ever runs.
-  if ! sqlite3 -batch -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$db" "
-PRAGMA journal_mode=WAL;
+  # Set persistent journal mode before ordinary DDL, with a bounded transition
+  # retry for simultaneous first readers. The schema statements retain the
+  # normal connection busy timeout and fail closed on any error.
+  _registry_enable_wal "$db" || return 1
+  if ! init_error="$(sqlite3 -batch -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$db" "
 PRAGMA busy_timeout=${HERDR_REGISTRY_BUSY_MS:-5000};
 
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -263,8 +294,8 @@ CREATE TABLE IF NOT EXISTS file_approvals (
 
 INSERT OR IGNORE INTO schema_meta(key, value)
   VALUES ('schema_version', '10');
-" >/dev/null 2>&1; then
-    printf 'run-registry: failed to initialize %s\n' "$db" >&2
+" 2>&1 >/dev/null)"; then
+    printf 'run-registry: failed to initialize %s: %s\n' "$db" "$init_error" >&2
     return 1
   fi
 
@@ -588,13 +619,60 @@ _migrate_schema_v10() {
 # Add a separate receipt table; existing manifests remain unverified. Schema
 # creation and the version stamp share a transaction in the storage adapter.
 _migrate_schema_v11() {
-  local current
-  current="$(_sql "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)" || return 1
-  case "$current" in ''|*[!0-9]*) return 1 ;; esac
-  if [ "$current" -lt 11 ] && [ "${1:-1}" = 1 ]; then
-    _backup_registry_before_migration v11 "$current" || return 1
-  fi
-  _task_authorization_adapter schema
+  # Serialize the version recheck, verified backup, DDL and stamp with the
+  # registry's existing SQLite writer lock. Separate shell connections left a
+  # window where eight first readers backed up into the same second-resolution
+  # filename, or compared a newly migrated backup against a stale version.
+  python3 - "$(registry_db)" "$_TASK_AUTHORIZATION_HELPER" "${1:-1}" <<'PY'
+import importlib.util
+import os
+import sqlite3
+import sys
+import tempfile
+
+path, helper, existed = sys.argv[1:]
+backup = None
+verified = False
+try:
+    spec = importlib.util.spec_from_file_location("task_authorization_storage", helper)
+    storage = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(storage)
+    with storage.connect(path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+        current = row[0] if row else ""
+        if not current.isdecimal():
+            raise ValueError("invalid pre-migration schema version")
+        if int(current) < 11 and existed == "1":
+            # The locked connection must not back itself up while it has an
+            # open write transaction. A separate read-only connection takes a
+            # consistent online snapshot; the writer lock prevents any other
+            # migrator from advancing its version until verification completes.
+            fd, backup = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".v11.bak",
+                                          dir=os.path.dirname(os.path.abspath(path)))
+            os.close(fd)
+            with storage.connect(path, readonly=True) as source, sqlite3.connect(backup) as target:
+                source.backup(target)
+            with storage.connect(backup, readonly=True) as saved:
+                integrity = saved.execute("PRAGMA integrity_check").fetchone()[0]
+                version = saved.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
+            if integrity != "ok" or version != current:
+                raise ValueError("pre-migration backup failed integrity/version verification")
+            verified = True
+            print(f"run-registry: backed up {path} -> {backup} before migration v11 (integrity+version verified)", file=sys.stderr)
+        # schema() uses this connection's existing transaction and commits only
+        # after both DDL and the monotonic stamp succeed. Closing on error rolls
+        # everything back and releases the writer lock without a stale lockfile.
+        storage.schema(db)
+except Exception as exc:
+    if backup and not verified:
+        try:
+            os.unlink(backup)
+        except OSError:
+            pass
+    print(f"run-registry: v11 migration aborted: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 # ---- one-time import of the pre-SQLite file layout --------------------------

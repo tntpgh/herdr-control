@@ -65,10 +65,10 @@
   ok    redaction preserves quotes, substitutions, and following-command structure
   ok    header and URL redaction preserve quoted data and following commands
   ok    common task, commit, UUID, and filename audit identifiers survive redaction
-awk: illegal byte sequence aaaaaaa√
+awk: illegal byte sequence aaaaaaa\xc3
  input record number 1, file 
  source line number 14
-awk: illegal byte sequence aaaaaaa√
+awk: illegal byte sequence aaaaaaa\xc3
  input record number 1, file 
  source line number 14
   ok    2000-byte shadow cap drops a split UTF-8 code point

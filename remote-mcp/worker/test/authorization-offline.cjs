@@ -316,13 +316,13 @@ test("revocation covers held in-flight source and queues a stop for its known lo
   assert.equal(cancelCount(f), 1); f.db.close();
 });
 
-test("revoked unbound hold accepts later mapping only to cancel, never to revive terminal task", () => {
+test("revoked unbound hold reopens only stop tracking when later mapping arrives", () => {
   const { f, command, acks, taskId } = pendingFixture();
   sync(f, CONFIG, NOW, false, [acks.accepted_receipt]);
   const revoked = { revoked: [{ actor: CALLER.email, client_id: CALLER.client_id }], hold: false };
   sync(f, CONFIG, NOW, false, [], revoked); assert.equal(task(f, taskId).state, "cancelled");
   const cancellations = sync(f, CONFIG, NOW, true, [acks.launched, acks.bound], revoked);
-  assert.equal(task(f, taskId).state, "cancelled"); assert.equal(task(f, taskId).local_task_id, acks.launched.local_task_id);
+  assert.equal(task(f, taskId).state, "cancelling"); assert.equal(task(f, taskId).local_task_id, acks.launched.local_task_id);
   assert.equal(commandRow(f, command).outcome, "late_accepted");
   assert.equal(cancellations.length, 1); assert.equal(cancellations[0].op, "cancel");
   assert.equal(cancelCount(f), 1); f.db.close();
@@ -378,6 +378,98 @@ test("unknown and never-leased ack IDs cannot create a mapping or revive executi
   sync(f, CONFIG, NOW, false, [acks.launched, acks.bound]);
   assert.equal(task(f, taskId).local_task_id, ""); assert.equal(commandRow(f, command).status, "queued");
   assert.equal(cancelCount(f), 0); f.db.close();
+});
+
+test("review regression: retired unbound launch retains failed-stop retry and requires conclusive stop", () => {
+  const { f, command, acks, taskId } = pendingFixture();
+  const receipt = commandRow(f, command);
+  sync(f, CONFIG, NOW, false, [acks.accepted_receipt]);
+  const revoked = { revoked: [{ actor: CALLER.email, client_id: CALLER.client_id }], hold: false };
+  sync(f, CONFIG, NOW, false, [], revoked); assert.equal(task(f, taskId).state, "cancelled");
+  const stop = sync(f, CONFIG, NOW, true, [acks.launched], revoked)[0];
+  assert.equal(task(f, taskId).state, "cancelling"); assert.equal(stop.op, "cancel");
+  const retry = sync(f, CONFIG, NOW + 1, true, [{ command_id: stop.command_id, outcome: "failed", detail: "fixture transient stop failure" }], revoked)[0];
+  assert.equal(retry.op, "cancel"); assert.notEqual(retry.command_id, stop.command_id);
+  assert.equal(retry.payload.local_task_id, acks.launched.local_task_id);
+  assert.equal(task(f, taskId).state, "cancelling");
+  assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM task_events WHERE type='cancellation_reopened'").one().n, 1);
+  assert.equal(commandRow(f, command).authorization, receipt.authorization);
+  assert.equal(commandRow(f, command).expires_at, receipt.expires_at);
+  sync(f, CONFIG, NOW + 2, false, [{ command_id: retry.command_id, outcome: "accepted", detail: "fixture stopped" }], revoked);
+  assert.equal(task(f, taskId).state, "cancelled");
+  assert.equal(commandRow(f, command).outcome, "late_accepted"); f.db.close();
+});
+
+test("late held and accepted target evidence from failed/timed-out/cancelled rows opens stop tracking only", () => {
+  for (const previous of ["failed", "timed_out", "cancelled"]) {
+    for (const receiptKind of ["bound", "launched"]) {
+      const { f, command, acks, taskId } = pendingFixture();
+      const original = commandRow(f, command);
+      f.sql.exec("UPDATE commands SET status='done',outcome='expired' WHERE command_id=?", command.command_id);
+      f.sql.exec("UPDATE remote_tasks SET state=? WHERE remote_task_id=?", previous, taskId);
+      if (previous === "timed_out") f.sql.exec("INSERT INTO task_events(remote_task_id,type,at,detail) VALUES (?,'timed_out',?,'{}')", taskId, NOW);
+      const stop = sync(f, CONFIG, NOW, true, [acks[receiptKind]])[0];
+      assert.equal(stop.op, "cancel"); assert.equal(task(f, taskId).state, "cancelling");
+      assert.equal(commandRow(f, command).expires_at, original.expires_at);
+      assert.equal(commandRow(f, command).authorization, original.authorization);
+      const recovery = f.sql.exec("SELECT detail FROM task_events WHERE type='cancellation_reopened'").one();
+      assert.equal(JSON.parse(recovery.detail).previous_state, previous);
+      sync(f, CONFIG, NOW + 1, false, [{ command_id: stop.command_id, outcome: "accepted", detail: "fixture stopped" }]);
+      assert.equal(task(f, taskId).state, previous === "timed_out" ? "timed_out" : "cancelled");
+      assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM commands WHERE op='cancel' AND status IN ('queued','delivering')").one().n, 0);
+      f.db.close();
+    }
+  }
+});
+
+test("lost stop ACK expires into bounded retry while original launch receipt stays fixed", () => {
+  const { f, command, acks, taskId } = pendingFixture();
+  sync(f, CONFIG, NOW, false, [acks.accepted_receipt]);
+  const revoked = { revoked: [{ actor: CALLER.email, client_id: CALLER.client_id }], hold: false };
+  sync(f, CONFIG, NOW, false, [], revoked);
+  const first = sync(f, CONFIG, NOW, true, [acks.launched], revoked)[0];
+  const original = commandRow(f, command);
+  const afterExpiry = sync(f, CONFIG, NOW + 900_001, true, [], revoked);
+  assert.equal(afterExpiry.length, 1); assert.equal(afterExpiry[0].op, "cancel");
+  assert.notEqual(afterExpiry[0].command_id, first.command_id);
+  assert.equal(task(f, taskId).state, "cancelling");
+  // A result from the retired stop cannot certify the timing of a newer
+  // stop; its current retry remains pending until its own result arrives.
+  sync(f, CONFIG, NOW + 900_002, false, [{ command_id: first.command_id, outcome: "accepted", detail: "old stop response" }], revoked);
+  assert.equal(task(f, taskId).state, "cancelling");
+  assert.equal(commandRow(f, command).expires_at, original.expires_at);
+  assert.equal(commandRow(f, command).authorization, original.authorization);
+  sync(f, CONFIG, NOW + 900_003, false, [{ command_id: afterExpiry[0].command_id, outcome: "accepted", detail: "current stop confirmed" }], revoked);
+  assert.equal(task(f, taskId).state, "cancelled"); f.db.close();
+});
+
+test("failed or lost stops exhaust five retries into one durable recovery item without false completion", () => {
+  for (const failure of ["failed", "lost"]) {
+    const { f, command, acks, taskId } = pendingFixture();
+    sync(f, CONFIG, NOW, false, [acks.accepted_receipt]);
+    const revoked = { revoked: [{ actor: CALLER.email, client_id: CALLER.client_id }], hold: false };
+    sync(f, CONFIG, NOW, false, [], revoked);
+    let stop = sync(f, CONFIG, NOW, true, [acks.launched], revoked)[0];
+    const original = commandRow(f, command);
+    let now = NOW;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      now += failure === "lost" ? 900_001 : 1;
+      const next = sync(f, CONFIG, now, true, failure === "lost" ? []
+        : [{ command_id: stop.command_id, outcome: "failed", detail: "fixture transport failed" }], revoked);
+      assert.equal(task(f, taskId).state, "cancelling");
+      if (attempt < 5) { assert.equal(next.length, 1); stop = next[0]; assert.equal(stop.op, "cancel"); }
+      else assert.deepEqual(next, []);
+    }
+    assert.equal(cancelCount(f), 6);
+    assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM task_events WHERE type='cancel_retry_queued'").one().n, 5);
+    assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM task_events WHERE type='cancel_stuck'").one().n, 1);
+    assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM commands WHERE op='cancel' AND status IN ('queued','delivering')").one().n, 0);
+    for (let repeat = 0; repeat < 10; repeat++) assert.deepEqual(sync(f, CONFIG, now + repeat + 1, true, [acks.launched, acks.bound], revoked), []);
+    assert.equal(task(f, taskId).state, "cancelling"); assert.equal(cancelCount(f), 6);
+    assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM task_events WHERE type='cancel_stuck'").one().n, 1);
+    assert.equal(commandRow(f, command).expires_at, original.expires_at);
+    assert.equal(commandRow(f, command).authorization, original.authorization); f.db.close();
+  }
 });
 
 let failed = 0;

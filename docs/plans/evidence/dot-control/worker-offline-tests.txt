@@ -15,11 +15,15 @@ PASS actual Python accepted→held ack order cannot downgrade or erase accepted 
 PASS actual Python held binding remains cancellable and later accepted ack cannot revive it
 PASS cancel before an unbound held ack learns its target once bound evidence arrives
 PASS revocation covers held in-flight source and queues a stop for its known local mapping
-PASS revoked unbound hold accepts later mapping only to cancel, never to revive terminal task
+PASS revoked unbound hold reopens only stop tracking when later mapping arrives
 PASS bound hold expiry queues cancellation without extending receipt or losing target
 PASS unbound hold expiry creates one durable uncertainty item; late binding is cancel-only
 PASS changed mapping and partial accepted acks stay held; valid Python result can still resolve
 PASS unknown and never-leased ack IDs cannot create a mapping or revive execution
-22 passed; 0 failed; Cloudflare/OAuth integration not exercised
-(node:26903) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+PASS review regression: retired unbound launch retains failed-stop retry and requires conclusive stop
+PASS late held and accepted target evidence from failed/timed-out/cancelled rows opens stop tracking only
+PASS lost stop ACK expires into bounded retry while original launch receipt stays fixed
+PASS failed or lost stops exhaust five retries into one durable recovery item without false completion
+26 passed; 0 failed; Cloudflare/OAuth integration not exercised
+(node:41045) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)

@@ -174,9 +174,10 @@ export interface View {
 }
 
 // The remote task lifecycle states a client is ever shown (SPEC). Anything
-// in this set never leaves it (mirrors lib/run-registry.sh's own terminal
-// set, one layer up): queued/starting/running/waiting_approval/blocked are
-// the only states a command or a local-state remap may still move out of.
+// in this set never resumes work (mirrors the local registry's terminal
+// set). The sole recovery exception is authenticated late target evidence:
+// it may reopen `cancelling` until stop is confirmed, never `running` or
+// new launch authority.
 const REMOTE_TERMINAL: Record<string, true> = {
   finished: true, verified: true, failed: true, cancelled: true, lost: true, timed_out: true,
 };
@@ -1332,17 +1333,47 @@ export class HerdrState extends DurableObject<Env> {
     }
 
     // Several recovery paths may learn the same local target in one tick.
-    // Preserve one outstanding stop request, without inventing a launch or
-    // renewing its source receipt. A completed cancel is not proof that a
-    // later accepted launch was already stopped, so that later fact may
-    // require another cancel.
+    // A newly known possible/live target reopens only STOP tracking, even
+    // if the earlier unmapped row was terminal. It never restores running
+    // or renews launch authority. Keep one outstanding stop request until
+    // its result is conclusive or bounded retries require durable recovery.
     const ensureCancel = (remoteTaskId: string, localTaskId: string, reason: string): void => {
+      const current = this.sql.exec<{ state: string }>(`SELECT state FROM remote_tasks WHERE remote_task_id=?`, remoteTaskId).toArray()[0];
+      if (!current) return;
+      if (current.state !== "cancelling") {
+        this.sql.exec(`UPDATE remote_tasks SET state='cancelling', updated_at=? WHERE remote_task_id=?`, nowMs, remoteTaskId);
+        if (REMOTE_TERMINAL[current.state]) {
+          this.recordTaskEvent(nowMs, remoteTaskId, "cancellation_reopened", { previous_state: current.state, reason });
+        }
+      }
       const pending = this.sql.exec<{ payload: string }>(
         `SELECT payload FROM commands WHERE remote_task_id=? AND op='cancel' AND status IN ('queued','delivering')`, remoteTaskId).toArray();
       if (pending.some((command) => JSON.parse(command.payload).local_task_id === localTaskId)) return;
       this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
         `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", remoteTaskId,
         JSON.stringify({ local_task_id: localTaskId, reason }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
+    };
+    // Failed and lost cancel acknowledgements share the existing retry
+    // ceiling. Expiry must not leave a known target with no pending stop
+    // and no durable recovery item. Retired cancel acks stay retired; a
+    // currently leased retry or terminal local evidence must confirm stop.
+    const retryCancel = (remoteTaskId: string, reason: string): void => {
+      const current = this.sql.exec<{ state: string; local_task_id: string }>(
+        `SELECT state, local_task_id FROM remote_tasks WHERE remote_task_id=?`, remoteTaskId).toArray()[0];
+      if (!current || current.state !== "cancelling" || !current.local_task_id) return;
+      const pending = this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM commands
+        WHERE remote_task_id=? AND op='cancel' AND status IN ('queued','delivering')`, remoteTaskId).one().n;
+      if (pending > 0) return;
+      const retries = this.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='cancel_retry_queued'`, remoteTaskId).one().n;
+      if (retries < CANCEL_RETRY_CAP) {
+        ensureCancel(remoteTaskId, current.local_task_id, reason);
+        this.recordTaskEvent(nowMs, remoteTaskId, "cancel_retry_queued", { attempt: retries + 1, reason });
+      } else {
+        const stuck = this.sql.exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='cancel_stuck'`, remoteTaskId).one().n;
+        if (stuck === 0) this.recordTaskEvent(nowMs, remoteTaskId, "cancel_stuck", { attempts: retries, reason });
+      }
     };
 
     // start_task/cancel_task/resume_task's own acks: the Mac tells us what a
@@ -1480,37 +1511,12 @@ export class HerdrState extends DurableObject<Env> {
         // distinct timed_out value (the remap loop never runs again once
         // the row is already terminal). Same lookup the remap loop uses.
         const finalState = this.sql.exec<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='timeout_detected'`,
+          `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type IN ('timeout_detected','timed_out')`,
           c.remote_task_id).one().n > 0 ? "timed_out" : "cancelled";
         this.sql.exec(`UPDATE remote_tasks SET state=?, updated_at=? WHERE remote_task_id=?`, finalState, nowMs, c.remote_task_id);
         this.recordTaskEvent(nowMs, c.remote_task_id, finalState, {});
       } else if (c.op === "cancel" && a.outcome !== "accepted") {
-        // ZR1 (ZERO-REVIEW-213-01 item 1): a FAILED cancel ack used to hit
-        // no branch at all here -- the command was still marked 'done'
-        // above (line 746), but the explicit cancel attempt it reported
-        // failing was then silently dropped: remote_tasks.state stayed
-        // 'cancelling' forever, with nothing ever retrying it. Re-queue a
-        // fresh cancel for the same local_task_id (same shape as the Z4
-        // revoke-while-running loop's own INSERT below), capped at
-        // CANCEL_RETRY_CAP like registry-bridge.sh's own cancel retries,
-        // so a cancel that can never land becomes one visible
-        // cancel_stuck event instead of an unbounded flood.
-        const curRow = this.sql.exec<{ state: string; local_task_id: string }>(
-          `SELECT state, local_task_id FROM remote_tasks WHERE remote_task_id=?`, c.remote_task_id).toArray()[0];
-        if (curRow && !REMOTE_TERMINAL[curRow.state] && curRow.local_task_id) {
-          const retries = this.sql.exec<{ n: number }>(
-            `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='cancel_retry_queued'`, c.remote_task_id).one().n;
-          if (retries < CANCEL_RETRY_CAP) {
-            this.sql.exec(`INSERT INTO commands (command_id, op, remote_task_id, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
-              `cmd_${crypto.randomUUID().slice(0, 12)}`, "cancel", c.remote_task_id,
-              JSON.stringify({ local_task_id: curRow.local_task_id }), nowMs, nowMs, nowMs + MESSAGE_TTL_MS);
-            this.recordTaskEvent(nowMs, c.remote_task_id, "cancel_retry_queued", { attempt: retries + 1, reason: a.detail });
-          } else {
-            const stuck = this.sql.exec<{ n: number }>(
-              `SELECT COUNT(*) AS n FROM task_events WHERE remote_task_id=? AND type='cancel_stuck'`, c.remote_task_id).one().n;
-            if (stuck === 0) this.recordTaskEvent(nowMs, c.remote_task_id, "cancel_stuck", { attempts: retries });
-          }
-        }
+        retryCancel(c.remote_task_id, a.detail);
       }
     }
 
@@ -1800,7 +1806,7 @@ export class HerdrState extends DurableObject<Env> {
           this.sql.exec(`UPDATE remote_tasks SET state=?, updated_at=? WHERE remote_task_id=?`, final, nowMs, c.remote_task_id);
           this.recordTaskEvent(nowMs, c.remote_task_id, final, { reason: why });
         }
-      }
+      } else if (c.op === "cancel") retryCancel(c.remote_task_id, why);
       this.audit(nowMs, { ...sys, target: c.remote_task_id, decision: status, reason: why, message_id: "", detail: c.detail });
     }
 

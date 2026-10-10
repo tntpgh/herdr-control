@@ -42,3 +42,17 @@ The receiver now returns a nonterminal `held` acknowledgement for an exact unfin
 Cancel cache fingerprints now bind only command ID, operation, remote task ID and payload. Attempts may change; payload may not. Missing resume mode also refuses consistently. A separately observed concurrent cold-registry initialization race was repaired with a connection timeout installed before the first WAL PRAGMA, with an eight-process regression (21 registry tests).
 
 Existing regression suites use explicit accepted/bound/launched test receipts, not replacement production validators. Environment-limited and deployed-baseline failures remain separately reported in the evidence file.
+
+## Second candidate: fb35974ff368ae3eed847b6a75139c08a4405971
+
+Two new independent lanes both reproduced a remaining HIGH and returned a blocking finding: a revoked, previously unbound held launch can later report a local mapping, but the stop request was queued while its remote state remained terminal `cancelled`. A transient cancellation failure then skips the retry path (`state.ts:1500`) because that path excludes terminal states. The stop target is recorded but no outstanding stop or stuck event remains.
+
+Observed with the actual Python acknowledgement producer and production Worker methods: `state=cancelled`, `local_task_id=task_fixture`, start `done/late_accepted`, cancel `done/failed`, no `cancel_retry_queued` or `cancel_stuck`, next sync `commands=[]`.
+
+Required repair: a late-discovered possibly running target must retain unresolved cancellation state independently from the retired launch authority. Failed or lost stop delivery needs bounded retries or one durable unresolved-stop record; it must never revive launch permission. Author repair and further independent review are pending.
+
+The same two lanes independently reproduced a MEDIUM migration race: the registry suite returned 20 passed / 1 failed, and a standalone cold-initialization rerun failed. Multiple v11 migrators shared a second-resolution backup destination and checked version outside a migration-wide writer lock; one read `integrity=<none>, version=10, expected=10`. A unique verified backup plus serialized version recheck/migration is required.
+
+Architecture WATCH for later activation: after crash-before-ack persistence, a restart beyond source expiry/revocation cannot regenerate the acknowledgement from a durable outbox. The repaired handler can contain late acknowledgements that arrive; it does not guarantee producing every lost one. Keep receipt-outbox/reconciliation and its permitted crash canary as an explicit M3/preactivation gate.
+
+Repair design for the second review: `ensureCancel` reopens only stop tracking to `cancelling` when a late mapping reveals a possible live target. Failed and expired/lost cancellations share the existing retry ceiling and produce one `cancel_stuck` record on exhaustion. Source receipts, launch expiry and authority remain retired. Migration now rechecks version under one SQLite writer lock, creates a unique verified online backup, and commits schema plus version together. Stress testing also exposed a separate transient lock at initial WAL setup; bounded typed busy handling passed the final stress tests before the next exact-head candidate: eight simultaneous initializers × ten cold starts and × ten populated v10 migrations. Full registry authorization 23/23 and existing registry 134/134 passed. Worker offline 26/26 and reviewer reproducer 27/27 passed; TypeScript passed. These repairs await fresh exact-head approval.

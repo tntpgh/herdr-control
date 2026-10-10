@@ -150,11 +150,55 @@ class RegistryAuthorization(unittest.TestCase):
     def test_migration_backup_failure_stops_before_schema_and_stamp(self):
         self.execute("DROP TABLE task_authorizations")
         self.execute("UPDATE schema_meta SET value='10' WHERE key='schema_version'")
-        p = self.sh('_backup_registry_before_migration() { return 1; }; registry_init; rc=$?; printf "ready=%s\\n" "$_HERDR_REGISTRY_READY"; exit "$rc"', ok=False)
+        # Inject only in this test subprocess, at the actual SQLite backup
+        # boundary. Production has no failure-injection flag or alternate path.
+        patch_dir = self.base / "backup-failure"
+        patch_dir.mkdir()
+        (patch_dir / "sitecustomize.py").write_text(
+            "import sqlite3\n"
+            "class BackupFailure(sqlite3.Connection):\n"
+            "    def backup(self, *args, **kwargs):\n"
+            "        raise sqlite3.OperationalError('fixture backup failure')\n"
+            "original_connect = sqlite3.connect\n"
+            "def connect(*args, **kwargs):\n"
+            "    kwargs.setdefault('factory', BackupFailure)\n"
+            "    return original_connect(*args, **kwargs)\n"
+            "sqlite3.connect = connect\n")
+        old_path = self.env.get("PYTHONPATH")
+        self.env["PYTHONPATH"] = str(patch_dir)
+        try:
+            p = self.sh('registry_init; rc=$?; printf "ready=%s\\n" "$_HERDR_REGISTRY_READY"; exit "$rc"', ok=False)
+        finally:
+            if old_path is None:
+                del self.env["PYTHONPATH"]
+            else:
+                self.env["PYTHONPATH"] = old_path
         self.assertNotEqual(p.returncode, 0)
+        self.assertIn("fixture backup failure", p.stderr)
         self.assertIn("ready=0", p.stdout)
         self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("10",)])
         self.assertEqual(self.query("SELECT name FROM sqlite_master WHERE name='task_authorizations'"), [])
+        self.assertEqual(list(self.db.parent.glob("registry.sqlite3.*.v11.bak")), [])
+        self.sh("registry_init")  # No stale lock or partial migration remains.
+
+    def test_migration_schema_failure_keeps_verified_backup_and_rolls_back(self):
+        self.execute("DROP TABLE task_authorizations")
+        self.execute("UPDATE schema_meta SET value='10' WHERE key='schema_version'")
+        self.execute("CREATE TRIGGER reject_fixture_stamp BEFORE UPDATE ON schema_meta WHEN NEW.value='11' BEGIN SELECT RAISE(ABORT,'fixture stamp failure'); END")
+        p = self.sh('registry_init; rc=$?; printf "ready=%s\\n" "$_HERDR_REGISTRY_READY"; exit "$rc"', ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("fixture stamp failure", p.stderr)
+        self.assertIn("ready=0", p.stdout)
+        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("10",)])
+        self.assertEqual(self.query("SELECT name FROM sqlite_master WHERE name='task_authorizations'"), [])
+        backups = list(self.db.parent.glob("registry.sqlite3.*.v11.bak"))
+        self.assertEqual(len(backups), 1)
+        with sqlite3.connect(backups[0]) as saved:
+            self.assertEqual(saved.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+            self.assertEqual(saved.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone(), ("10",))
+        self.execute("DROP TRIGGER reject_fixture_stamp")
+        self.sh("registry_init")
+        self.assertEqual(len(list(self.db.parent.glob("registry.sqlite3.*.v11.bak"))), 2)
 
     def test_remote_source_is_not_main_approval(self):
         cmd, claims, task = self.launch()
@@ -217,21 +261,48 @@ class RegistryAuthorization(unittest.TestCase):
         self.assertEqual(sum(json.loads(out)["newly_accepted"] for _, out, _ in outcomes), 1)
         self.assertEqual(self.query("SELECT COUNT(*) FROM task_authorizations"), [(1,)])
 
-    def test_parallel_shell_initializers_share_cold_registry(self):
-        self.env["HERDR_RUN_STATE_DIR"] = str(self.base / "cold-state")
-        self.db = self.base / "cold-state/registry.sqlite3"
+    def parallel_initializers(self):
+        # Start eight real shells, each blocked on its own input pipe, then
+        # release every pipe from a barrier. No sleeps or sequential init loop.
+        code = 'source "$1/lib/run-registry.sh"; IFS= read -r start; registry_init'
+        processes = [subprocess.Popen(["bash", "-c", code, "fixture", str(ROOT)], env=self.env,
+                                      text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE) for _ in range(8)]
         barrier = threading.Barrier(8)
-
-        def initialize(_):
-            barrier.wait()
-            return self.sh("registry_init", ok=False)
-
+        def release(p):
+            barrier.wait(timeout=10)
+            out, err = p.communicate("start\n", timeout=30)
+            return p.returncode, out, err
         with ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(initialize, range(8)))
-        self.assertTrue(all(p.returncode == 0 for p in results),
-                        [(p.returncode, p.stderr) for p in results])
+            outcomes = list(pool.map(release, processes))
+        self.assertTrue(all(rc == 0 for rc, _, _ in outcomes), outcomes)
         self.assertEqual(self.query("PRAGMA integrity_check"), [("ok",)])
         self.assertEqual(self.query("SELECT count(*) FROM task_authorizations"), [(0,)])
+        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("11",)])
+
+    def test_parallel_shell_initializers_share_cold_registry(self):
+        for attempt in range(10):
+            with self.subTest(attempt=attempt):
+                self.env["HERDR_RUN_STATE_DIR"] = str(self.base / f"cold-state-{attempt}")
+                self.db = self.base / f"cold-state-{attempt}/registry.sqlite3"
+                self.parallel_initializers()
+
+    def test_parallel_v10_migration_creates_one_verified_backup(self):
+        self.call("register", canonical(self.task()))
+        history = self.query("SELECT type,payload FROM events ORDER BY sequence")
+        for attempt in range(10):
+            with self.subTest(attempt=attempt):
+                self.execute("DROP TABLE task_authorizations")
+                self.execute("UPDATE schema_meta SET value='10' WHERE key='schema_version'")
+                before = set(self.db.parent.glob("registry.sqlite3.*.v11.bak"))
+                self.parallel_initializers()
+                added = set(self.db.parent.glob("registry.sqlite3.*.v11.bak")) - before
+                self.assertEqual(len(added), 1)
+                with sqlite3.connect(added.pop()) as saved:
+                    self.assertEqual(saved.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+                    self.assertEqual(saved.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone(), ("10",))
+                    self.assertEqual(saved.execute("SELECT COUNT(*) FROM tasks").fetchone(), (1,))
+                self.assertEqual(self.query("SELECT type,payload FROM events ORDER BY sequence"), history)
 
     def test_concurrent_binding_and_launch_each_have_one_winner(self):
         cmd, _, _ = self.accept()
