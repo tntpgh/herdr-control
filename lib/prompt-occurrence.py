@@ -414,11 +414,24 @@ def fold_task(db_path: str, run_id: str, task_id: str, readonly: bool = True) ->
                 else:
                     rec["lifecycle"] = LIFECYCLE_BY_RESOLUTION[typ]
 
+    # M1 (Main review, dc6a55d): identity_verified was computed but nothing
+    # enforced it — "safe only if every consumer refuses keys when
+    # identity_verified is false; that is not yet enforced." Enforced here,
+    # once, for every consumer of this fold (occurrence_state, hub.py,
+    # any future reader) rather than trusting each one to re-check the flag
+    # itself: an occurrence with an unproven pane_birth/native_session must
+    # never read as authorized or completed, whichever event recorded it.
     for rec in occ.values():
         if rec["mismatch"] and not rec["lifecycle"].startswith("resolved"):
             # A proven identity collision is never a safe thing to answer:
             # unknown display, no authorization inferred from either side.
             rec["display"] = "correlation_mismatch"
+        if not rec.get("identity_verified") and rec["lifecycle"] in (
+            "approved_awaiting_completion", "resolved:completed",
+        ):
+            rec["lifecycle"] = "unknown"
+            rec["authorization"] = "none"
+            rec["unresolved_reason"] = "identity_unverified"
     return occ
 
 

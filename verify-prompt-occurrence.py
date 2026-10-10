@@ -265,6 +265,26 @@ class Lifecycle(unittest.TestCase):
         rec = po.occurrence_state(db, **IDENT)
         self.assertEqual(rec["lifecycle"], "resolved:withdrawn")
 
+    def test_unverified_identity_never_authorizes_or_completes(self):
+        """M1 (Main review, dc6a55d): identity_verified was computed but
+        nothing enforced it. An occurrence recorded with a blank pane_birth
+        or native_session must never read as approved_awaiting_completion
+        or resolved:completed -- the fold itself refuses, so no consumer
+        can forget to check the flag."""
+        unverified = dict(IDENT, pane_birth="", native_session="")
+        db = _fresh_db()
+        po.record_seen(db, **unverified, tool="bash", tool_input={"command": "x"}, source="s")
+        po.record_authorized(db, **unverified, decided_by="conductor", choice="approve")
+        rec = po.occurrence_state(db, **unverified)
+        self.assertFalse(rec["identity_verified"])
+        self.assertEqual(rec["lifecycle"], "unknown")
+        self.assertEqual(rec["authorization"], "none")
+        self.assertEqual(rec["unresolved_reason"], "identity_unverified")
+        # ... and the same holds once a (claimed) completion follows.
+        po.record_completed(db, **unverified, is_error=False)
+        rec2 = po.occurrence_state(db, **unverified)
+        self.assertNotEqual(rec2["lifecycle"], "resolved:completed")
+
     def test_out_of_order_completion_then_late_authorized_is_sticky(self):
         """Out-of-order completion: tool_execution_end can race ahead of a
         delayed tool_approval_resolved. Once resolved, a later authorized

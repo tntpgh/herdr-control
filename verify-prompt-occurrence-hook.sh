@@ -64,15 +64,19 @@ occ_count="$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type='prompt_occ_s
   || bad "expected exactly 1 seen row, got $occ_count"
 
 # -- a full approve -> complete cycle resolves completed --------------------
+# ctx carries a real session id (sessionIdOf reads ctx.sessionManager.
+# getSessionId()): identity_verified requires both pane_birth (from the
+# seeded registry row) and native_session to be non-empty (M1, Main review).
 sqlite3 "$DB" "DELETE FROM events;"
 run_bun '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
+const ctx = { sessionManager: { getSessionId: () => "sess-2" } };
 handlers["tool_call"]({ toolName: "bash", toolCallId: "call-2", input: { command: "git status" } });
-handlers["tool_approval_requested"]({ toolName: "bash", toolCallId: "call-2" });
-handlers["tool_approval_resolved"]({ toolName: "bash", toolCallId: "call-2", approved: true });
-handlers["tool_execution_end"]({ toolName: "bash", toolCallId: "call-2", result: {}, isError: false });
+handlers["tool_approval_requested"]({ toolName: "bash", toolCallId: "call-2" }, ctx);
+handlers["tool_approval_resolved"]({ toolName: "bash", toolCallId: "call-2", approved: true }, ctx);
+handlers["tool_execution_end"]({ toolName: "bash", toolCallId: "call-2", result: {}, isError: false }, ctx);
 await new Promise(r => setTimeout(r, 200));
 ' >/dev/null
 
