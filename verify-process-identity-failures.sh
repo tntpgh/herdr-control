@@ -8,7 +8,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/herdr-identity.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 export HERDR_RUN_STATE_DIR="$work/runs" XDG_RUNTIME_DIR="$work/runtime"
 export INFO_PAYLOAD PANES_PAYLOAD INFO_FAILURE=0 LIST_FAILURE=0 SECOND_INFO=''
-export RAW_PANES=0 RAW_INFO=0
+export RAW_PANES=0 RAW_INFO=0 INFO_FILE=''
 passed=0 failed=0
 expect_identity() {
   local label="$1" expected="$2" wanted="${3:-}" result rc
@@ -31,6 +31,7 @@ herdr() {
     'pane process-info')
       [ "$INFO_FAILURE" != 1 ] || return 1
       if [ "${4:-}" = fixture:p2 ]; then printf '%s' "$SECOND_INFO"
+      elif [ -n "$INFO_FILE" ]; then cat "$INFO_FILE"
       elif [ "$RAW_INFO" = 1 ]; then printf '%b' "$INFO_PAYLOAD"; else printf '%s' "$INFO_PAYLOAD"; fi
       [ "$INFO_FAILURE" = 0 ] ;;
     *) return 99 ;;
@@ -53,6 +54,15 @@ ps() { printf '1\n'; }
 export -f ps
 
 expect_identity 'complete matching process inventory' 0 fixture:p1
+# Stream a large fixture from disk, avoiding exported-payload/ARG_MAX effects.
+# The first row matches, but the lookup must still drain its pipe under pipefail.
+python3 -I -S -c 'import json,sys
+rows=[{"pid":int(sys.argv[1])}]+[{"pid":n} for n in range(1000000,1020000)]
+with open(sys.argv[2],"w") as f: json.dump({"result":{"process_info":{"foreground_processes":rows}}},f)
+' "$PPID" "$work/large-processes.json"
+INFO_FILE="$work/large-processes.json"
+expect_identity 'large complete matching inventory does not fail from SIGPIPE' 0 fixture:p1
+INFO_FILE=''
 awk() { return 1; }
 expect_unknown 'process map lookup unavailable'
 unset -f awk

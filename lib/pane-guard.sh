@@ -271,7 +271,9 @@ $rows"
   [ -n "$ancestors" ] || return 1
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
-    found="$(printf '%s' "$map" | awk -v want="$pid" '$1==want {print $2; exit}')" || return 1
+    # Consume the complete map so pipefail cannot turn an early matching exit
+    # into an upstream SIGPIPE on a large, otherwise valid inventory.
+    found="$(printf '%s' "$map" | awk -v want="$pid" '$1==want && !seen {print $2; seen=1}')" || return 1
     if [ -n "$found" ]; then printf '%s\n' "$found"; return 0; fi
   done <<EOF
 $ancestors
