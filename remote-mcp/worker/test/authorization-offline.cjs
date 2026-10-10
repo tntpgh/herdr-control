@@ -10,6 +10,7 @@ const path = require("node:path");
 const Module = require("node:module");
 const { DatabaseSync } = require("node:sqlite");
 const { createHash, createHmac } = require("node:crypto");
+const { spawnSync } = require("node:child_process");
 const ts = require("typescript");
 
 const originalLoad = Module._load;
@@ -63,8 +64,8 @@ function body(config = CONFIG, lease = true, command_acks = []) {
     agents: [], tasks: [], blockers: [], task_config: config },
   results: [], acks: [], command_acks, audit_cursor: 0, lease };
 }
-function sync(f, config = CONFIG, now = NOW, lease = true, acks = []) {
-  const result = f.state.sync(now, crypto.randomUUID(), JSON.stringify(body(config, lease, acks)), GATE, GATE, GATE);
+function sync(f, config = CONFIG, now = NOW, lease = true, acks = [], commandGate = GATE) {
+  const result = f.state.sync(now, crypto.randomUUID(), JSON.stringify(body(config, lease, acks)), GATE, commandGate, GATE);
   assert.equal(result.ok, true, result.reason);
   return result.response.commands;
 }
@@ -91,6 +92,23 @@ function checkReceipt(command) {
   assert.equal(parsed.assigned_supervisor, undefined);
   return parsed;
 }
+function receiverAcks(command) {
+  const produced = spawnSync(process.env.HERDR_TEST_PYTHON || "python3",
+    [path.resolve(__dirname, "../../receipt-ack-fixture.py")], { input: JSON.stringify(command), encoding: "utf8" });
+  assert.equal(produced.status, 0, `actual Python receipt-ack producer failed: ${produced.error || produced.stderr}`);
+  const acks = JSON.parse(produced.stdout);
+  for (const kind of ["accepted_receipt", "bound", "launch_claimed"]) assert.equal(acks[kind].outcome, "held");
+  assert.equal(acks.launched.outcome, "accepted");
+  return acks;
+}
+function pendingFixture() {
+  const f = fixture(); sync(f); const started = start(f); assert.equal(started.ok, true);
+  const command = sync(f)[0];
+  return { f, command, acks: receiverAcks(command), taskId: started.remote_task_id };
+}
+function task(f, taskId) { return f.sql.exec("SELECT * FROM remote_tasks WHERE remote_task_id=?", taskId).one(); }
+function commandRow(f, command) { return f.sql.exec("SELECT * FROM commands WHERE command_id=?", command.command_id).one(); }
+function cancelCount(f) { return f.sql.exec("SELECT COUNT(*) AS n FROM commands WHERE op='cancel'").one().n; }
 
 const tests = [];
 const test = (name, run) => tests.push({ name, run });
@@ -232,6 +250,134 @@ test("missing signing key fails before task or command creation", () => {
   assert.deepEqual(start(f), { ok: false, reason: "authorization_not_configured" });
   assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM remote_tasks").one().n, 0);
   assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM commands").one().n, 0); f.db.close();
+});
+
+test("actual Python held→bound→claimed→accepted acks retain receipt/expiry and converge without duplicate audit", () => {
+  const { f, command, acks, taskId } = pendingFixture();
+  const original = commandRow(f, command);
+  sync(f, CONFIG, NOW, false, [acks.accepted_receipt]);
+  assert.equal(task(f, taskId).local_task_id, "");
+  for (let replay = 0; replay < 10; replay++) sync(f, CONFIG, NOW, false, [acks.bound, acks.launch_claimed]);
+  const held = commandRow(f, command);
+  assert.equal(held.status, "delivering"); assert.equal(held.outcome, "held");
+  for (const field of ["payload", "authorization", "expires_at", "lease_until", "attempts"]) assert.equal(held[field], original[field]);
+  assert.equal(task(f, taskId).state, "starting");
+  assert.equal(task(f, taskId).local_task_id, acks.bound.local_task_id);
+  assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM audit WHERE decision='held'").one().n, 1);
+  assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM task_events WHERE type='command_held'").one().n, 1);
+  sync(f, CONFIG, NOW, false, [acks.launched, acks.bound]);
+  assert.equal(commandRow(f, command).status, "done"); assert.equal(commandRow(f, command).outcome, "accepted");
+  assert.equal(task(f, taskId).state, "running"); assert.equal(cancelCount(f), 0); f.db.close();
+});
+
+test("actual Python accepted→held ack order cannot downgrade or erase accepted launch mapping", () => {
+  const { f, command, acks, taskId } = pendingFixture();
+  sync(f, CONFIG, NOW, false, [acks.launched]); const acceptedTask = task(f, taskId); const acceptedCommand = commandRow(f, command);
+  for (let replay = 0; replay < 10; replay++) sync(f, CONFIG, NOW, false, [acks.accepted_receipt, acks.bound, acks.launch_claimed]);
+  assert.deepEqual(task(f, taskId), acceptedTask); assert.deepEqual(commandRow(f, command), acceptedCommand);
+  assert.equal(acceptedTask.local_task_id, acks.launched.local_task_id);
+  assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM audit WHERE decision='held'").one().n, 0);
+  assert.equal(cancelCount(f), 0); f.db.close();
+});
+
+test("actual Python held binding remains cancellable and later accepted ack cannot revive it", () => {
+  const { f, command, acks, taskId } = pendingFixture();
+  sync(f, CONFIG, NOW, false, [acks.bound]);
+  assert.deepEqual(f.state.cancelTask(NOW, CALLER, SCOPES, taskId), { ok: true, state: "cancelling" });
+  const cancellations = sync(f, CONFIG, NOW, true, [acks.launch_claimed, acks.launched]);
+  assert.equal(task(f, taskId).state, "cancelling");
+  assert.equal(task(f, taskId).local_task_id, acks.bound.local_task_id);
+  assert.equal(cancellations.length, 1); assert.equal(cancellations[0].op, "cancel");
+  assert.equal(cancellations[0].payload.local_task_id, acks.bound.local_task_id); assert.equal(cancelCount(f), 1);
+  sync(f, CONFIG, NOW, false, [{ command_id: cancellations[0].command_id, outcome: "accepted", detail: "fixture stopped" }, acks.bound]);
+  assert.equal(task(f, taskId).state, "cancelled"); assert.equal(commandRow(f, command).outcome, "accepted"); f.db.close();
+});
+
+test("cancel before an unbound held ack learns its target once bound evidence arrives", () => {
+  const { f, acks, taskId } = pendingFixture();
+  sync(f, CONFIG, NOW, false, [acks.accepted_receipt]);
+  assert.equal(f.state.cancelTask(NOW, CALLER, SCOPES, taskId).state, "cancelling"); assert.equal(cancelCount(f), 0);
+  sync(f, CONFIG, NOW, false, [acks.bound, acks.bound, acks.launched]);
+  assert.equal(task(f, taskId).state, "cancelling"); assert.equal(cancelCount(f), 1);
+  assert.equal(task(f, taskId).local_task_id, acks.bound.local_task_id); f.db.close();
+});
+
+test("revocation covers held in-flight source and queues a stop for its known local mapping", () => {
+  const { f, command, acks, taskId } = pendingFixture();
+  sync(f, CONFIG, NOW, false, [acks.bound]);
+  assert.deepEqual(f.state.pendingCommandSenders(NOW), [{ actor: CALLER.email, client_id: CALLER.client_id, scope: "herdr:task.start" }]);
+  const revoked = { revoked: [{ actor: CALLER.email, client_id: CALLER.client_id }], hold: false };
+  const cancellations = sync(f, CONFIG, NOW, true, [], revoked);
+  assert.equal(task(f, taskId).state, "cancelling"); assert.equal(cancellations.length, 1);
+  assert.equal(cancellations[0].payload.local_task_id, acks.bound.local_task_id);
+  assert.equal(commandRow(f, command).outcome, "refused");
+  sync(f, CONFIG, NOW, false, [acks.launched, acks.bound], revoked);
+  assert.equal(task(f, taskId).state, "cancelling"); assert.equal(commandRow(f, command).outcome, "late_accepted");
+  assert.equal(cancelCount(f), 1); f.db.close();
+});
+
+test("revoked unbound hold accepts later mapping only to cancel, never to revive terminal task", () => {
+  const { f, command, acks, taskId } = pendingFixture();
+  sync(f, CONFIG, NOW, false, [acks.accepted_receipt]);
+  const revoked = { revoked: [{ actor: CALLER.email, client_id: CALLER.client_id }], hold: false };
+  sync(f, CONFIG, NOW, false, [], revoked); assert.equal(task(f, taskId).state, "cancelled");
+  const cancellations = sync(f, CONFIG, NOW, true, [acks.launched, acks.bound], revoked);
+  assert.equal(task(f, taskId).state, "cancelled"); assert.equal(task(f, taskId).local_task_id, acks.launched.local_task_id);
+  assert.equal(commandRow(f, command).outcome, "late_accepted");
+  assert.equal(cancellations.length, 1); assert.equal(cancellations[0].op, "cancel");
+  assert.equal(cancelCount(f), 1); f.db.close();
+});
+
+test("bound hold expiry queues cancellation without extending receipt or losing target", () => {
+  const { f, command, acks, taskId } = pendingFixture();
+  sync(f, CONFIG, NOW, false, [acks.launch_claimed]);
+  const before = commandRow(f, command); const expiredAt = NOW + 900_001;
+  const cancellations = sync(f, CONFIG, expiredAt);
+  assert.equal(cancellations.length, 1); assert.equal(cancellations[0].op, "cancel");
+  assert.equal(cancellations[0].payload.local_task_id, acks.launch_claimed.local_task_id);
+  assert.equal(task(f, taskId).state, "cancelling");
+  assert.equal(commandRow(f, command).expires_at, before.expires_at);
+  assert.equal(commandRow(f, command).authorization, before.authorization);
+  sync(f, CONFIG, expiredAt + 1, false, [acks.launched, acks.bound]);
+  assert.equal(task(f, taskId).state, "cancelling"); assert.equal(cancelCount(f), 1);
+  assert.equal(commandRow(f, command).outcome, "late_accepted"); f.db.close();
+});
+
+test("unbound hold expiry creates one durable uncertainty item; late binding is cancel-only", () => {
+  const { f, command, acks, taskId } = pendingFixture();
+  sync(f, CONFIG, NOW, false, [acks.accepted_receipt]);
+  assert.deepEqual(sync(f, CONFIG, NOW + 900_001), []);
+  assert.equal(commandRow(f, command).outcome, "held_expired"); assert.equal(task(f, taskId).state, "blocked");
+  for (let replay = 0; replay < 10; replay++) assert.deepEqual(sync(f, CONFIG, NOW + 3_600_001 + replay), []);
+  assert.equal(task(f, taskId).state, "blocked");
+  assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM task_events WHERE type='launch_outcome_unknown'").one().n, 1);
+  const cancellations = sync(f, CONFIG, NOW + 3_600_011, true, [acks.bound, acks.bound]);
+  assert.equal(task(f, taskId).state, "cancelling"); assert.equal(cancellations.length, 1);
+  assert.equal(cancellations[0].payload.local_task_id, acks.bound.local_task_id);
+  sync(f, CONFIG, NOW + 3_600_012, false, [acks.launched, acks.accepted_receipt]);
+  assert.equal(task(f, taskId).state, "cancelling"); assert.equal(cancelCount(f), 1); f.db.close();
+});
+
+test("changed mapping and partial accepted acks stay held; valid Python result can still resolve", () => {
+  const { f, command, acks, taskId } = pendingFixture();
+  sync(f, CONFIG, NOW, false, [acks.bound]);
+  sync(f, CONFIG, NOW, false, [{ ...acks.launched, local_task_id: "task_other" }]);
+  assert.equal(task(f, taskId).local_task_id, acks.bound.local_task_id);
+  assert.equal(commandRow(f, command).status, "delivering"); assert.equal(task(f, taskId).state, "starting");
+  const { local_run_id, ...partial } = acks.launched;
+  sync(f, CONFIG, NOW, false, [partial]); assert.equal(commandRow(f, command).status, "delivering");
+  sync(f, CONFIG, NOW, false, [acks.launched]); assert.equal(task(f, taskId).state, "running");
+  assert.equal(cancelCount(f), 0); f.db.close();
+});
+
+test("unknown and never-leased ack IDs cannot create a mapping or revive execution", () => {
+  const { f, command, acks, taskId } = pendingFixture();
+  sync(f, CONFIG, NOW, false, [{ ...acks.launched, command_id: "cmd_never_issued" }]);
+  assert.equal(task(f, taskId).local_task_id, ""); assert.equal(commandRow(f, command).status, "delivering");
+  f.sql.exec("UPDATE commands SET status='queued',attempts=0 WHERE command_id=?", command.command_id);
+  sync(f, CONFIG, NOW, false, [acks.launched, acks.bound]);
+  assert.equal(task(f, taskId).local_task_id, ""); assert.equal(commandRow(f, command).status, "queued");
+  assert.equal(cancelCount(f), 0); f.db.close();
 });
 
 let failed = 0;

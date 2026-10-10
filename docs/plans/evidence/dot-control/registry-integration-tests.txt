@@ -1,0 +1,107 @@
+== start_task: real signature admission + registry source binding and deadline ==
+  ok    start accepted
+  ok    registry row exists for real (current schema, register_task())
+  ok    remote_task_id bound atomically through protected receipt registration
+  ok    deadline_at set before launch through protected receipt
+  ok    state is 'starting' immediately after register_task()
+== protected authorization: receipt, ack loss, and source substitution ==
+  ok    receipt reached launched through real registry transitions
+  ok    receipt binds source identity separately from conductor
+  ok    receipt copied deadline before execution
+  ok    lost ack replay resolves only protected task binding
+  ok    lost ack creates no duplicate task and never extends deadline
+  ok    same command id with another signed payload refuses before launch
+== sweep(): real close-done-workers.sh auto-closes a finished research task ==
+  ok    registry row carries a real worktree directory
+  ok    sweep() produced exactly one action
+  ok    action is orchestrator_close
+  ok    real close-done-workers.sh --apply succeeded
+  ok    registry state is 'completed' after the real close-done-workers.sh ran
+== a second task: real registry-bridge.sh cancel ==
+  ok    second start accepted
+  ok    cancel accepted
+  ok    registry state is 'cancelled' after the real registry-bridge.sh cancel ran
+== N5: real registry-bridge.sh cancel skips the pane close when `herdr pane list` itself fails ==
+  ok    third start accepted
+  ok    cancel FAILS (not accepted) when herdr pane list itself fails -- Z1: the row must never be marked cancelled on an unconfirmed pane
+  ok    registry state is NOT 'cancelled' (stays non-terminal for the next retry)
+  ok    `herdr pane list` was attempted
+  ok    `herdr pane close` was NEVER attempted once `pane list` failed (N5, no fail-open)
+  ok    cleanup (cmd_n5_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== R3-3: real registry-bridge.sh cancel refuses when the row's own remote_task_id does not match ==
+  ok    fourth start accepted
+  ok    registry-bridge.sh cancel exits nonzero on a remote_task_id mismatch
+  ok    registry state is untouched by the refused cancel (still starting/running, not cancelled)
+  ok    registry-bridge.sh cancel succeeds when the expected remote_task_id matches the row's own
+  ok    registry state is 'cancelled' once the remote_task_id actually matches
+== R3-6: real registry-bridge.sh cancel skips the pane close when `herdr pane list` returns non-JSON with rc 0 ==
+  ok    fifth start accepted
+  ok    cancel FAILS (not accepted) when `herdr pane list` returns rc=0 but non-JSON -- Z1: an unparseable list must never fail open
+  ok    registry state is NOT 'cancelled' when the pane list could not be parsed
+  ok    `herdr pane list` was attempted
+  ok    `herdr pane close` was NEVER attempted when jq could not parse a rc=0 list (R3-6, no fail-open)
+  ok    cleanup (cmd_r36_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== Z1: real registry-bridge.sh cancel fails (stays non-terminal) when `herdr pane close` itself fails ==
+  ok    sixth start accepted
+  ok    cancel fails when herdr pane close itself fails
+  ok    registry state is NOT 'cancelled' when the close failed (nothing of ours was actually confirmed gone)
+  ok    `herdr pane close` WAS attempted (the live pane matched the registered birth)
+  ok    cleanup (cmd_z1a_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== Z1: real registry-bridge.sh cancel refuses to mark cancelled when the pane is STILL alive after close (no fail-open on a survivor) ==
+  ok    seventh start accepted
+  ok    cancel fails when the pane is STILL reported alive after close (fake herdr's close is a no-op on the fixture pane)
+  ok    registry state is NOT 'cancelled' when the post-close list still shows the SAME pane alive
+  ok    `herdr pane close` WAS attempted before the row was ever refused
+  ok    `herdr pane list` was called TWICE (once before the close, once after, to prove the pane survived it)
+  ok    cleanup (cmd_z1b_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== F2: real registry-bridge.sh cancel on an already-terminal row refuses BEFORE touching any pane ==
+  ok    F2 start accepted
+  ok    F2 first cancel (real pane, real herdr fake) accepted
+  ok    R2-2: a SECOND cancel on an ALREADY-CANCELLED row is idempotent (exits 0, not an error)
+  ok    F2: no `herdr pane list` or `pane close` call was ever made for the already-terminal row (refused before touching any pane)
+  ok    F2: a cancel on a COMPLETED row (not idempotently-cancellable) still refuses and exits nonzero
+  ok    F2: the refusal message says 'already terminal'
+  ok    F2: no `herdr pane list` or `pane close` call was ever made for the completed row either
+== F1: real registry-bridge.sh cancel corroborates a terminal_id mismatch via agent_session (herdr restart case) ==
+  ok    F1a start accepted
+  ok    setup: agent_session stamped for task_e2e_20261010T011536Z_54135_21595
+  ok    F1a: pane close WAS attempted (same agent_session corroborated 'still ours' despite the terminal_id mismatch)
+  ok    F1a: cancel fails here only because this fixture's `pane close` itself fails (proves the match, not the close)
+  ok    cleanup (cmd_f1a_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+  ok    F1b start accepted
+  ok    setup: agent_session stamped for task_e2e_20261010T011539Z_61805_17696
+  ok    F1b: cancel SUCCEEDS when a disagreeing agent_session confirms a different occupant (nothing of ours to close)
+  ok    F1b: `herdr pane close` was NEVER attempted (not our pane)
+  ok    F1b: registry state is 'cancelled'
+  ok    F1c start accepted
+  ok    F1c: cancel FAILS when our own side has no agent_session to corroborate with (fail closed, never guess)
+  ok    F1c: registry state is NOT 'cancelled' (stays non-terminal for the next retry)
+  ok    cleanup (cmd_f1c_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== Fz: real registry-bridge.sh cancel treats a wrong-shaped-but-valid-JSON `herdr pane list` as UNPARSEABLE, never 'gone' ==
+  ok    Fz-a start accepted
+  ok    Fz-a: cancel FAILS on a valid-JSON error envelope (never mistaken for an empty/gone list)
+  ok    Fz-a: `herdr pane close` was NEVER attempted on an unparseable shape
+  ok    cleanup (cmd_fza_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+  ok    Fz-b start accepted
+  ok    Fz-b: cancel FAILS when the matched pane entry is missing terminal_id (found-but-unreadable is never 'absent')
+  ok    Fz-b: `herdr pane close` was NEVER attempted (never confirmed as our own live pane, never confirmed gone either)
+  ok    cleanup (cmd_fzb_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== R4-1: timeout after protected registration preserves mapping and cancels the orphan ==
+  ok    start returns held (spawn timed out)
+  ok    held timeout retains the exact protected task mapping
+  ok    the protected registered row IS cancelled after the timeout
+== R4-1: real registry-bridge.sh cancel accepts an UNSTAMPED row (set-remote-id failure window) ==
+  ok    setup: register_task for the never-stamped row succeeded
+  ok    the freshly-registered row's remote_task_id is genuinely still empty
+  ok    registry-bridge.sh cancel succeeds against an unstamped row (no false refusal)
+  ok    state is 'cancelled' after cancelling the unstamped row
+== actual overlapping consumers: duplicate receipt held, different tasks isolated ==
+  ok    overlapping duplicate consumer sees exact nonterminal ambiguous-receipt hold
+  ok    only one overlapping consumer executes the launch
+  ok    two different jobs launch concurrently with distinct local tasks
+  ok    concurrent task retains its own remote binding cmd_concurrent_2
+  ok    concurrent task retains its own remote binding cmd_concurrent_3
+SKIP: independent timer/process-identity checks (--registry-only); no timer verification claimed
+  ok    teardown: every timer created by this fixture is reaped
+
+PASS: real-registry lifecycle checks green; independent timer checks explicitly excluded

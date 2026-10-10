@@ -7961,7 +7961,7 @@ _cp_registry_sqlite_invocation_safe() {   # seg
 # character before it is not a word char or `-` (so `verify-alert-gate.sh`
 # and `my-herdr-select.sh.bak` are not these files; `lib/alert-gate.sh`,
 # `./herdr-select.sh`, `>herdr-select.sh` are).
-_CP_POLICY_FILE_RE='(^|[^A-Za-z0-9_-])(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|task-authorization\.py|registry-bridge\.sh|authorization\.py|alert-gate\.sh|prompt-parse\.sh|command-policy\.sh)([^A-Za-z0-9_]|$)'
+_CP_POLICY_FILE_RE='(^|[^A-Za-z0-9_-])(gate-registry|approval-policy|herdr-select\.sh|scoped-policy\.sh|task-manifest\.sh|run-registry\.sh|task-authorization\.(py|sh)|registry-bridge\.sh|authorization\.py|alert-gate\.sh|prompt-parse\.sh|command-policy\.sh)([^A-Za-z0-9_]|$)'
 
 # `_cp_policy_mention_harmless <raw>` -> 0 when naming a policy file cannot
 # change it: every segment's command word is a read-only verb, with no

@@ -81,9 +81,8 @@ def _check(data: dict, cmd: dict, allowlist: dict, now_ms: int) -> None:
     mode = data["mode"]
     if mode not in ("research", "implement") or mode not in allowlist.get("modes", {}):
         raise AuthorizationError("unknown mode in authorization")
-    # Resume's original wire shape omitted mode. The signed claim supplies it;
-    # if a newer sender includes a payload mode, it must agree exactly.
-    if (data["op"] == "start" or "mode" in payload) and mode != payload.get("mode"):
+    # Protocol 1 always binds the explicit wire mode for start and resume.
+    if mode != payload.get("mode"):
         raise AuthorizationError("authorization mode binding mismatch")
     required_scope = "herdr:task.start" if mode == "research" else "herdr:task.implement"
     if data["scope"] != required_scope:

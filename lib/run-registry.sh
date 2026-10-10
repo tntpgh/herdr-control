@@ -124,7 +124,10 @@ registry_init() {
   # journal_mode is persisted in the database header, so it is set here rather
   # than in _sql — WAL is what lets the reconcile sweep read while a hook
   # writes, instead of the two serializing on a whole-file lock.
-  if ! sqlite3 -batch "$db" "
+  # Install the connection's wait policy before journal_mode too: concurrent
+  # first readers can otherwise fail immediately at that first PRAGMA, before
+  # the later busy_timeout statement ever runs.
+  if ! sqlite3 -batch -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$db" "
 PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=${HERDR_REGISTRY_BUSY_MS:-5000};
 

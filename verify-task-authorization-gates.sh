@@ -126,6 +126,18 @@ peer_decide 'git add result.txt && git status && git commit -m fixture' "$truste
 [ "$PD_AUTHORITY" != grant ] && [ -z "$(_cp_grant_action 'git add result.txt && git status && git commit -m fixture' "$WT" feat/gates main)" ] \
   && ok 'compound command cannot use the simple-command ownership recognizer' || fail "compound ownership expanded: $rc/$PD_VERDICT/$PD_AUTHORITY"
 
+printf '== authority machinery cannot be executed or overwritten by a worker ==\n'
+for control in lib/task-authorization.py remote-mcp/registry-bridge.sh remote-mcp/authorization.py tests/fixtures/task-authorization.sh; do
+  interpreter=python3; case "$control" in *.sh) interpreter=bash ;; esac
+  for command in "$interpreter $here/$control" "printf x > $here/$control"; do
+    peer_decide "$command" "$trusted"; rc=$?
+    [ "$rc" = 1 ] && [ "$PD_VERDICT" = reserved ] && [ -n "$(conductor_reserved_reason "$command")" ] \
+      && ok "authority machinery is human-reserved: $command" || fail "authority file escaped: $rc/$PD_VERDICT/$PD_REASON"
+  done
+  peer_decide "cat $here/$control" "$trusted"; rc=$?
+  [ "$rc" = 0 ] && [ "$PD_VERDICT" = allow ] && ok "ordinary source inspection stays allowed: $control" || fail "source read held: $rc/$PD_VERDICT/$PD_REASON"
+done
+
 printf '== parser dependency failure is a hold, including existing grants ==\n'
 (
   _cp_bashlex_resolve_helper() { return 1; }

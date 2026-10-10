@@ -1,0 +1,25 @@
+PASS start signs source identity, scope and unicode payload; golden cross-language vector
+PASS missing/old/unknown publisher protocol rejects admission with zero tasks/commands
+PASS downgrade withholds queued and overdue commands without changing receipt or lease attempts
+PASS restart/ack loss redelivers original receipt and expires instead of renewing
+PASS nullable migration preserves legacy commands without minting source authority
+PASS equal manifests and objectives remain bound to separate task and command identities
+PASS source substitution and changed payload invalidate the authenticated binding
+PASS receipt write failure atomically rolls back task, command and event creation
+PASS event/audit failure also rolls back a stored receipt and task
+PASS resume requires publisher protocol and binds original mapping to a new child receipt
+PASS cancel remains deliverable after publisher downgrade and carries no approval receipt
+PASS missing signing key fails before task or command creation
+PASS actual Python held→bound→claimed→accepted acks retain receipt/expiry and converge without duplicate audit
+PASS actual Python accepted→held ack order cannot downgrade or erase accepted launch mapping
+PASS actual Python held binding remains cancellable and later accepted ack cannot revive it
+PASS cancel before an unbound held ack learns its target once bound evidence arrives
+PASS revocation covers held in-flight source and queues a stop for its known local mapping
+PASS revoked unbound hold accepts later mapping only to cancel, never to revive terminal task
+PASS bound hold expiry queues cancellation without extending receipt or losing target
+PASS unbound hold expiry creates one durable uncertainty item; late binding is cancel-only
+PASS changed mapping and partial accepted acks stay held; valid Python result can still resolve
+PASS unknown and never-leased ack IDs cannot create a mapping or revive execution
+22 passed; 0 failed; Cloudflare/OAuth integration not exercised
+(node:26903) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)

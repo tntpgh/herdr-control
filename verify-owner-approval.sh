@@ -13,6 +13,7 @@ trap 'rm -rf "$work"' EXIT
 # This suite is usually run from inside an agent pane: never inherit its identity.
 unset HERDR_TASK_ID HERDR_RUN_ID HERDR_OWNER_APPROVAL HERDR_OWNER_SESSION_ID HERDR_APPROVAL
 export HERDR_RUN_STATE_DIR="$work/runs" HERDR_STATE_ROOT="$work/state" HERDR_CALL_LOG="$work/herdr-calls"
+export XDG_RUNTIME_DIR="$work/runtime"; mkdir -p "$XDG_RUNTIME_DIR"
 export OPANE='w5:p3' OBIRTH='term-owner-1'
 SID='sess-A' LABEL='main-owner'
 mkdir -p "$work/bin" "$work/agentbin" "$HERDR_RUN_STATE_DIR" "$work/home/.omp/agent"
@@ -37,7 +38,7 @@ export PATH="$work/bin:$PATH"
 
 . "$here/lib/owner-identity.sh"
 db="$(owner_identity_db)"
-good=0 bad=0
+good=0 bad=0 skipped=0
 ok() { good=$((good + 1)); printf '  ok    %s\n' "$1"; }
 not_ok() { bad=$((bad + 1)); printf '  FAIL  %s\n' "$1"; }
 field() { jq -r ".$1"; }
@@ -192,6 +193,7 @@ o="$(env -u HERDR_PANE_ID bash "$here/owner-approval.sh" register "$LABEL" "$OPA
 o="$(HERDR_PANE_ID=w6:p6 cli revoke "$LABEL" --reason x)"; rc=$?
 [ "$rc" = 9 ] && ok "CLI: revoke from an agent pane refused (exit 9)" || not_ok "CLI revoke: rc=$rc $o"
 # A terminal (pty) does not make an agent's descendant human.
+if ps -o ppid= -p "$$" >/dev/null 2>&1; then
 env -u HERDR_PANE_ID python3 - "$work/agentbin/omp" "$here/owner-approval.sh" "$OPANE" > "$work/pty.out" 2>&1 <<'PY'
 import os, pty, sys
 omp, cli, pane = sys.argv[1:4]
@@ -205,6 +207,10 @@ anc="$(bash -c '. "$1"; _oa_agent_ancestor "$2"' _ "$here/owner-approval.sh" "$c
 [ "${anc%% *}" = "$fake" ] && ok "_oa_agent_ancestor names the nearest agent ancestor (pid $fake)" || not_ok "ancestor: '$anc' want $fake"
 bash -c '. "$1"; _oa_agent_ancestor 1' _ "$here/owner-approval.sh" >/dev/null && not_ok "launchd reported as an agent" || ok "_oa_agent_ancestor: no agent above pid 1"
 kill "$fake" 2>/dev/null; wait "$fake" 2>/dev/null
+else
+  skipped=$((skipped + 3))
+  printf '  SKIP  3 real-process ancestry/PTY cases: sandbox denies ps; no owner registration attempted\n'
+fi
 [ "$(q 'SELECT count(*) FROM owner_identities;')" = "$rows_before" ] && ok "no refused CLI call wrote an identity row" || not_ok "CLI refusals changed rows"
 [ "$(q "SELECT count(*) FROM owner_events WHERE kind IN ('register_refused','revoke_refused');")" -ge 6 ] \
   && ok "every refused CLI attempt is audited" || not_ok "refusal audit: $(q "SELECT kind, payload FROM owner_events WHERE kind LIKE '%refused';")"
@@ -385,7 +391,8 @@ if command -v bun >/dev/null 2>&1; then
   [ "$(printf '%s' "$r" | rs | jq -c unique)" = '["BLOCK"]' ] && ok "owner label with the pre-tool lib missing: every call refused" || not_ok "nolib: $r"
   # Inert: a session WITHOUT the label is byte-for-byte origin/main's.
   base="$work/base"
-  if git -C "$here" worktree add -q --detach "$base" origin/main 2>/dev/null; then
+  mkdir -p "$base"
+  if git -C "$here" archive origin/main | tar -x -C "$base"; then
     for who in nonworker menuworker; do
       extra=(); [ "$who" = menuworker ] && extra=(HERDR_TASK_ID=task_m HERDR_RUN_ID=run_m)
       mine="$(env ${extra[@]+"${extra[@]}"} bash -c 'HOOK="$1/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$1" HERDR_PANE_ID="$OPANE" CASES="$2" CTX_MODE=sid CTX_SID=x bun -e "$3"' _ "$here" "$cases" "$hook_js" 2>/dev/null)"
@@ -393,7 +400,6 @@ if command -v bun >/dev/null 2>&1; then
       [ -n "$mine" ] && [ "$mine" = "$theirs" ] && ok "no owner label ($who): every hook answer identical to origin/main ($(printf '%s' "$mine" | rs))" \
         || not_ok "$who differs: $mine vs $theirs"
     done
-    git -C "$here" worktree remove --force "$base" 2>/dev/null
   else
     not_ok "could not check out origin/main for the inertness comparison"
   fi
@@ -405,5 +411,5 @@ printf '== not wired: nothing calls the registration path or sets the label ==\n
 callers="$(cd "$here" && git grep --untracked -l -e 'owner-approval\.sh' -e 'HERDR_OWNER_APPROVAL=' -- ':!docs' ':!tmp' ':!verify-owner-approval.sh' ':!owner-approval.sh' ':!lib/hook-approval-rules.tsv' ':!lib/owner-identity.sh' ':!lib/pretool-shadow.sh' ':!agent-hooks/omp-herdr-control.ts' 2>/dev/null)"
 [ -z "$callers" ] && ok "no script, config or spawn path references the owner CLI or sets the label" || not_ok "unexpected callers: $callers"
 
-printf '\n%d passed, %d failed\n' "$good" "$bad"
+printf '\n%d passed, %d failed, %d skipped (environment)\n' "$good" "$bad" "$skipped"
 [ "$bad" = 0 ]

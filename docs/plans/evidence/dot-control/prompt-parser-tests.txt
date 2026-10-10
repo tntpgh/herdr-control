@@ -1,0 +1,83 @@
+== a complete panel WITH its header parses (the pre-existing path) ==
+  ok   two options parsed
+  ok   highlighted row reported as 1
+  ok   question keeps the header
+
+== a panel whose header scrolled AWAY still parses (the fix) ==
+  ok   headerless menu is answerable
+  ok   highlight still located
+  ok   question is marked truncated
+  ok   truncated parse hashes differently
+
+== near-misses MUST fail closed ==
+  ok   footer + Deny but no Approve refused
+  ok   footer + Approve but no Deny refused
+  ok   no navigation footer refused
+  ok   prose containing Approve refused
+  ok   two highlighted rows refused
+  ok   a dismissed menu with newer output below it is not actionable
+
+== prompt_any_visible: both shapes from one read, same scope as before ==
+  ok   menu panel seen
+  ok   headerless menu seen
+  ok   numbered prompt seen with no footer
+  ok   numbered list outside the bottom 20 rows ignored
+  ok   prose refused
+
+== a NUMBERED list is only offered while it is still the live prompt ==
+  ok   a live list with a navigation footer below it is offered
+  ok   the task line reads as prose (it is a sentence); position exempts it
+  ok   output recognised: I have applied the change and moved on to 
+  ok   output recognised:  Done. Press Enter to send your next messa
+  ok   output recognised:  I have applied it. You can use the arrow 
+  ok   status recognised:   ↑/↓ navigate · enter select · esc cancel
+  ok   status recognised: ⏵⏵ auto-accept edits on
+  ok   status recognised: branch: main
+  ok   status recognised:   249 insertions(+), 18 deletions(-)
+  ok   status recognised: ╭── ⠙ 34m ▎ Opus 5 ▎ ~/Code/x ▎ main ▎ 20.
+  ok   a live list above Claude Code's mode line is offered
+  ok   and above omp's task line, which is prose by any word count
+  ok   offered below:   ↑/↓ navigate · enter select · esc cancel
+  ok   offered below:   ? for shortcuts
+  ok   offered below:   Context left until auto-compact: 23%
+  ok   offered below:   ⏵⏵ auto-accept edits on (shift+tab to cycl
+  ok   offered below:   esc to interrupt
+  ok   offered below:   Use the arrow keys to move, Enter to choos
+  ok   offered below:   Press Enter to confirm your selection, or 
+  ok   offered below:   Press up and down to move between the opti
+  ok   offered below:   Type a number and press return to answer t
+  ok   offered below:   Choose one of the options above with the a
+  ok   offered below:   (Use arrow keys or type a number, then pre
+  ok   a wrapped option does not truncate the list
+  ok   and its continuation is joined onto it
+  ok   and above an OMC branch line
+  ok   a list the agent has already moved past is NOT offered
+  ok   menu-first ordering consumes a panel, so a queue above it is never offered
+  ok   with two lists on screen, only the newest is offered
+
+== a pane line truncated mid multibyte character must not crash the parser ==
+  ok   truncated multibyte line does not abort the parser (rc=0)
+  ok   options either side of the torn character still parse
+  ok   an intact em-dash still renders as a real character
+
+== prompt_command_torn: detects invalid UTF-8 in the RAW capture (PR #147 hold) ==
+  ok   a torn byte in the raw capture is detected
+  ok   a clean capture is not flagged torn
+  ok   menu-shape (omp) torn byte in a classified panel row is detected
+  ok   menu-shape (omp) clean capture is not flagged torn
+  ok   a torn byte outside the classified panel rows is not flagged (F3 scope)
+  ok   an unreadable capture counts as torn, not clean (F2)
+
+== omp 18.3.5 key-hint footers (symbolPreset glyphs, 2026-09-27) ==
+  ok   nerd-preset footer parses, Approve highlighted
+  ok   nerd-preset footer wrapped across two rows still parses
+  ok   capitalised key words parse
+  ok   fails closed: │ navigate select cancel │
+  ok   fails closed: | Up/Down navigate  Enter select  Esc cancel |
+  ok   fails closed: │ ↑/↓ navigate  enter select  esc cancel now │
+  ok   fails closed: │ x navigate  y select  z cancel │
+
+== #191/F7 (herdr-control PR #189 round-2 security review, R8/XQ1): an embedded 'Allow tool:' row in a legit bash body never overwrites the real header ==
+  ok   question keeps the real header, never relabelled to embedded body text (XQ1)
+
+pass=64 fail=0

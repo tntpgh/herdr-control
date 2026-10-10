@@ -13,6 +13,7 @@
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 WORK="$(mktemp -d)"
+export XDG_RUNTIME_DIR="$WORK/runtime"; mkdir -p "$XDG_RUNTIME_DIR"
 trap 'rm -rf "$WORK"' EXIT
 . "$here/lib/task-manifest.sh"
 . "$here/lib/command-policy.sh"
@@ -525,6 +526,7 @@ printf '== trunk-identical suite: one conductor review per worktree state (F5) =
 # (peer allow); a change-set = one conductor review per state.
 command -v peer_decide >/dev/null 2>&1 || . "$here/lib/scoped-policy.sh"
 command -v file_approval_record >/dev/null 2>&1 || . "$here/lib/run-registry.sh"
+. "$here/tests/fixtures/task-authorization.sh"
 export HERDR_RUN_STATE_DIR="$WORK/f5-state"; mkdir -p "$HERDR_RUN_STATE_DIR"
 F5O="$WORK/f5-origin.git"; F5W="$WORK/f5-wt"
 git init -q --bare -b main "$F5O"
@@ -538,7 +540,8 @@ git -C "$F5W" add -A && git -C "$F5W" -c user.email=t@t -c user.name=t commit -q
 git -C "$F5W" push -q origin HEAD:main 2>/dev/null
 git -C "$F5W" fetch -q origin
 git -C "$F5W" checkout -q -b fix/f5
-F5TASK="$(jq -nc --arg wt "$F5W" '{worktree:$wt,branch:"fix/f5",trunk:"main",manifest:"",task_id:"taskF5"}')"
+fixture_register_task runF5 taskF5 workerF5 conductorF5 w9:p9 cond-birth w1:p1 worker-birth "$F5W" "$F5W" fixture fix/f5 main >/dev/null || exit 1
+F5TASK="$(read_task runF5 taskF5)"
 f5_decide() { peer_decide "$1" "$F5TASK"; }
 f5_trunkish() { case "$PD_REASON" in *trunk*) return 0 ;; esac; return 1; }
 

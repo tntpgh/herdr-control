@@ -56,7 +56,6 @@ def command(mode: str = "implement", op: str = "start") -> dict:
     cmd = {"command_id": "cmd_fixture_1", "op": op,
            "remote_task_id": "rtask_20261010T000000Z_0123abcd", "payload": payload}
     if op == "resume":
-        payload.pop("mode")
         payload.pop("objective")
         payload.update(local_task_id="task_original", local_run_id="run_original",
                        branch="remote/0123abcd", text="Continue the same approved scope.")
@@ -122,6 +121,14 @@ class AuthorizationVerification(unittest.TestCase):
                 changed = copy.deepcopy(cmd)
                 changed["payload"][field] += "_substituted"
                 self.refused(changed)
+
+    def test_resume_requires_explicit_signed_payload_mode(self):
+        cmd = command(op="resume")
+        del cmd["payload"]["mode"]
+        claims = json.loads(cmd["authorization"]["claims"])
+        claims["payload_sha256"] = payload_sha256(cmd["payload"])
+        cmd["authorization"] = sign_raw(reference_json(claims))
+        self.refused(cmd)
 
     def test_resume_explicit_mode_must_match(self):
         cmd = command(op="resume")
@@ -550,6 +557,18 @@ class PublisherAdmission(unittest.TestCase):
         self.processor.reset_mock()
         changed = copy.deepcopy(cancel)
         changed["payload"]["local_task_id"] = "another_task"
+        self.assert_refused_before_task_handoff(changed, reason="command replay binding missing or changed")
+
+    def test_cancel_retry_attempt_changes_reuse_ack_without_second_effect(self):
+        cancel = {"command_id": "cmd_cancel_retry", "op": "cancel", "attempts": 1,
+                  "remote_task_id": self.cmd["remote_task_id"], "payload": {"local_task_id": "task_fixture", "reason": "done"}}
+        self.ack["command_id"] = cancel["command_id"]
+        self.assertEqual(self.process(cancel), self.ack)
+        retry = {**cancel, "attempts": 2}
+        self.assertEqual(self.process(retry), self.ack)
+        self.processor.assert_called_once_with(cancel)
+        changed = {**retry, "payload": {**retry["payload"], "reason": "changed reason"}}
+        self.processor.reset_mock()
         self.assert_refused_before_task_handoff(changed, reason="command replay binding missing or changed")
 
     def test_legacy_cancel_cache_without_fingerprint_refuses(self):

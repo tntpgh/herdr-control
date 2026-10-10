@@ -210,6 +210,68 @@ describe("task command authorization receipts", () => {
     }));
     expect(counts).toEqual({ tasks: 0, commands: 0, events: 0 });
   });
+
+  it.each(["held-first", "accepted-first"])("keeps an accepted launch when duplicate acknowledgements arrive %s", async (order) => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const command = (await syncJson(await signedSync(taskConfigBody()))).commands[0]!;
+    const held = { command_id: command.command_id, outcome: "held" as const, detail: "outcome_unknown: launch_claimed",
+      local_task_id: "task_held", local_run_id: "run_held", branch: "remote/held", pane_id: "pane_held", agent_id: "birth_held" };
+    const accepted = { ...held, outcome: "accepted" as const, detail: "spawned" };
+    const ordered = order === "held-first" ? [held, accepted] : [accepted, held];
+    await signedSync({ ...taskConfigBody(), lease: false, command_acks: ordered });
+    for (let retry = 0; retry < 3; retry++) await signedSync({ ...taskConfigBody(), lease: false, command_acks: [held] });
+    const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(started.data.task_id));
+    expect(row).toMatchObject({ state: "running", local_task_id: held.local_task_id, local_run_id: held.local_run_id, branch: held.branch });
+    const recorded = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ status: string; outcome: string }>(`SELECT status,outcome FROM commands WHERE command_id=?`, command.command_id).one());
+    expect(recorded).toEqual({ status: "done", outcome: "accepted" });
+    const auditCount = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM audit WHERE decision='held'`).one().n);
+    expect(auditCount).toBe(order === "held-first" ? 1 : 0);
+  });
+
+  it("retains held binding for cancellation and never revives it when accepted arrives later", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const command = (await syncJson(await signedSync(taskConfigBody()))).commands[0]!;
+    const held = { command_id: command.command_id, outcome: "held" as const, detail: "outcome_unknown: launch_claimed",
+      local_task_id: "task_held_cancel", local_run_id: "run_held_cancel", branch: "remote/held-cancel" };
+    await signedSync({ ...taskConfigBody(), lease: false, command_acks: [held] });
+    expect((await callTool<CancelTaskResult>(access_token, "cancel_task", { task_id: started.data.task_id })).data.state).toBe("cancelling");
+    const after = await syncJson(await signedSync({ ...taskConfigBody(), command_acks: [{ ...held, outcome: "accepted", detail: "spawned" }] }));
+    expect(after.commands).toHaveLength(1);
+    expect(after.commands[0]).toMatchObject({ op: "cancel", payload: { local_task_id: held.local_task_id } });
+    const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(started.data.task_id));
+    expect(row).toMatchObject({ state: "cancelling", local_task_id: held.local_task_id });
+  });
+
+  it("expires an unbound hold into one durable uncertainty item and contains late accepted mapping", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const command = (await syncJson(await signedSync(taskConfigBody()))).commands[0]!;
+    await signedSync({ ...taskConfigBody(), lease: false, command_acks: [{ command_id: command.command_id, outcome: "held", detail: "outcome_unknown: accepted receipt" }] });
+    const future = Date.now() + 16 * 60_000;
+    const body = JSON.stringify(taskConfigBody());
+    const expired = await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
+    expect(expired.ok).toBe(true);
+    const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(started.data.task_id));
+    expect(row?.state).toBe("blocked");
+    const lateBody = JSON.stringify({ ...taskConfigBody(), command_acks: [{ command_id: command.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_held_expiry", local_run_id: "run_held_expiry", branch: "remote/held-expiry" }] });
+    const late = await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future + 1, crypto.randomUUID(), lateBody, { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
+    expect(late.ok).toBe(true);
+    if (!late.ok) throw new Error(late.reason);
+    expect(late.response.commands).toHaveLength(1);
+    expect(late.response.commands[0]).toMatchObject({ op: "cancel", payload: { local_task_id: "task_held_expiry" } });
+    const final = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(started.data.task_id));
+    expect(final).toMatchObject({ state: "cancelling", local_task_id: "task_held_expiry" });
+  });
 });
 
 describe("list_capabilities", () => {

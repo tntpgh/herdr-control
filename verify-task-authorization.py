@@ -202,12 +202,36 @@ class RegistryAuthorization(unittest.TestCase):
         second_claims["remote_task_id"] = cmd["remote_task_id"]
         self.call("accept", canonical(second_cmd), canonical(second_claims), ok=False, reason="UNIQUE constraint")
 
+    def test_resume_requires_payload_mode_in_protocol_one(self):
+        cmd, claims = self.source()
+        cmd["op"] = claims["op"] = "resume"
+        del cmd["payload"]["mode"]
+        claims["payload_sha256"] = hashlib.sha256(canonical(cmd["payload"]).encode()).hexdigest()
+        self.call("accept", canonical(cmd), canonical(claims), ok=False, reason="payload mode mismatch")
+        self.assertEqual(self.query("SELECT COUNT(*) FROM task_authorizations"), [(0,)])
+
     def test_concurrent_accept_has_one_new_receipt(self):
         cmd, claims = self.source()
         outcomes = self.concurrent([("accept", canonical(cmd), canonical(claims))] * 8)
         self.assertTrue(all(rc == 0 for rc, _, _ in outcomes), outcomes)
         self.assertEqual(sum(json.loads(out)["newly_accepted"] for _, out, _ in outcomes), 1)
         self.assertEqual(self.query("SELECT COUNT(*) FROM task_authorizations"), [(1,)])
+
+    def test_parallel_shell_initializers_share_cold_registry(self):
+        self.env["HERDR_RUN_STATE_DIR"] = str(self.base / "cold-state")
+        self.db = self.base / "cold-state/registry.sqlite3"
+        barrier = threading.Barrier(8)
+
+        def initialize(_):
+            barrier.wait()
+            return self.sh("registry_init", ok=False)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(initialize, range(8)))
+        self.assertTrue(all(p.returncode == 0 for p in results),
+                        [(p.returncode, p.stderr) for p in results])
+        self.assertEqual(self.query("PRAGMA integrity_check"), [("ok",)])
+        self.assertEqual(self.query("SELECT count(*) FROM task_authorizations"), [(0,)])
 
     def test_concurrent_binding_and_launch_each_have_one_winner(self):
         cmd, _, _ = self.accept()

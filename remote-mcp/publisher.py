@@ -101,9 +101,9 @@ REPLY_MIN_AGE_S = 30
 LEASE_LOCAL_S = 60
 # Same idea for the Worker's `commands` outbox (start/cancel/resume): a
 # command not even ATTEMPTED within this many seconds of the lease is simply
-# left unacked -- there is no "retry" outcome in CommandAck, only
-# accepted/refused/failed, so omission (letting the Worker's own lease_until
-# expire and re-queue it) is how a command retries, the same end state a
+# left unacked. "held" preserves an uncertain result; it does not ask for
+# a fresh effect. Omitting the ack lets the Worker's lease_until expire and
+# re-queue the command, the same end state a
 # message's explicit "retry" outcome reaches.
 COMMAND_LEASE_LOCAL_S = 60
 # The Mac's own switch, independent of the Worker's MESSAGING_ENABLED: unless
@@ -1498,7 +1498,10 @@ def process_leased_command(cmd: dict, key: str, processed: dict, now_s: float) -
         except (AuthorizationError, ValueError, OSError, TypeError) as exc:
             return {"command_id": cid, "outcome": "refused", "detail": f"task authorization refused: {exc}"[:300]}
         return rtasks.process_command(cmd, authorization=authorization)
-    fingerprint = hashlib.sha256(canonical_json(cmd).encode("utf-8")).hexdigest()
+    # Lease attempts and other transport metadata change on a legitimate
+    # redelivery. Bind the effect-bearing command fields only.
+    immutable = {field: cmd.get(field) for field in ("command_id", "op", "remote_task_id", "payload")}
+    fingerprint = hashlib.sha256(canonical_json(immutable).encode("utf-8")).hexdigest()
     prior = processed.get(cid)
     if prior:
         if prior.get("command_sha256") != fingerprint:

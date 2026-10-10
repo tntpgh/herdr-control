@@ -1,0 +1,33 @@
+== the survey ==
+  ok    a prompting pane is listed
+  ok    and a pane that is not asking is not listed
+  ok    with the classifier's verdict for the command behind it
+  ok    and the default survey answers NOTHING
+== answering, only through herdr-select ==
+  ok    answers via herdr-select, with an option number and a prompt id
+  ok    and never sends a key itself
+  ok    narrow_affirmative picks a plain Approve
+  ok    and refuses an affirmative that also changes future prompts
+  ok    including the remember-for-the-session wording
+  ok    and prefers the narrow one when both are offered
+  ok    and finds nothing to press when there is no affirmative at all
+  ok    an answer with no prompt id is held, never sent unbound
+== what it refuses to answer ==
+  ok    a command the classifier declines is held for a human
+  ok    and herdr-select is not even called for it
+  ok    a panel whose options cannot be parsed is reported
+  ok    and held, never answered — it is the most dangerous one
+== herdr-select refusals are results, not errors ==
+  ok    a clipped approval preserves the selector refusal
+  ok    does not advise rewording or reissuing the held action
+  ok    authorization hold keeps its reason despite shared exit 8
+  ok    unknown provenance is never reported as clipping or retried
+  ok    any other refusal is surfaced with its exit code
+== the survey is machine-readable too ==
+  ok    --json emits one object per prompting pane, with verdict and parseability
+== nothing asking ==
+  ok    says so plainly when no pane is prompting
+
+-----
+passed=23 failed=0
+PASS

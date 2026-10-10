@@ -284,7 +284,9 @@ export interface CommandItem {
 }
 export interface CommandAck {
   command_id: string;
-  outcome: "accepted" | "refused" | "failed";
+  // held is an unfinished/uncertain start or resume, never an approval or
+  // successful launch. It must not retire the command or discard mapping.
+  outcome: "accepted" | "refused" | "failed" | "held";
   detail: string;
   local_task_id?: string;
   local_run_id?: string;

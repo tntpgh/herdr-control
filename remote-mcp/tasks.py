@@ -425,11 +425,12 @@ def process_command(cmd: dict, *, authorization: VerifiedAuthorization | None = 
     except (AuthorizationError, ValueError, KeyError, TypeError) as exc:
         return {"command_id": cid, "outcome": "refused", "detail": f"authorization/payload refused: {exc}"[:300]}
     except (subprocess.TimeoutExpired, OSError, sqlite3.Error) as exc:
-        # M7: a slow tab/composer boot must never crash the publisher's
-        # whole tick -- that would also drop this command from `processed`,
-        # so the Worker re-leases it every 90s for up to its 15-minute TTL
-        # while this ack (which would have told it to stop) never lands.
-        return {"command_id": cid, "outcome": "failed", "detail": f"{op} crashed or did not finish in time: {exc}"[:300]}
+        # Preserve uncertainty without crashing the whole publisher tick.
+        # A start/resume hold is nonterminal; its durable receipt blocks a
+        # fresh launch while later acknowledgements can reconcile the result.
+        outcome = "held" if op in ("start", "resume") else "failed"
+        detail = f"outcome_unknown: {op} did not finish; no launch retry: {exc}" if outcome == "held" else f"{op} did not finish: {exc}"
+        return {"command_id": cid, "outcome": outcome, "detail": detail[:300]}
 
 
 def _spawn(root: Path, branch: str, mcfg: dict, brief: Path, authorization_command_id: str = "") -> subprocess.CompletedProcess:
@@ -636,41 +637,81 @@ def _kill_hard_stop_timer(run_id: str, task_id: str) -> None:
 
 
 def _receipt_matches(row: dict, cmd: dict) -> bool:
-    """A receipt is protected registry data, never a worker-owned identity file."""
+    """Match the protected immutable source, never a worker identity file."""
     from authorization import payload_sha256
+    try:
+        claims = json.loads(cmd["authorization"]["claims"])
+    except (KeyError, TypeError, ValueError):
+        return False
     return (isinstance(row, dict) and row.get("command_id") == cmd["command_id"]
             and row.get("remote_task_id") == cmd["remote_task_id"]
-            and row.get("payload_sha256") == payload_sha256(cmd["payload"]))
+            and row.get("payload_sha256") == payload_sha256(cmd["payload"])
+            and row.get("source_repo") == cmd["payload"]["repo"]
+            and row.get("claims") == claims)
 
 
-def _receipt_ack(cmd: dict, row: dict, root: Path, branch: str) -> dict:
+def _receipt_ack(cmd: dict, row: dict | None, root: Path, branch: str) -> dict:
+    cid = cmd["command_id"]
+    if row is None or row == {}:
+        return {"command_id": cid, "outcome": "held",
+                "detail": "outcome_unknown: protected receipt unavailable; no launch retry"}
+    if not _receipt_matches(row, cmd):
+        return {"command_id": cid, "outcome": "refused", "detail": "authorization receipt source binding mismatch"}
+    status = row.get("status")
+    if status == "accepted" and not any(row.get(k) for k in ("task_id", "run_id", "worktree", "branch", "pane_id", "pane_birth")):
+        return {"command_id": cid, "outcome": "held",
+                "detail": "outcome_unknown: source accepted, launch not yet bound; no launch retry"}
     wt = WT_ROOT / root.name / branch
-    if (not _receipt_matches(row, cmd) or row.get("status") != "launched"
-            or not row.get("task_id") or not row.get("run_id")
-            or row.get("worktree") != str(wt) or row.get("branch") != branch
+    if (status not in ("bound", "launch_claimed", "launched")
+            or not all(isinstance(row.get(k), str) and row[k] for k in ("task_id", "run_id", "pane_id", "pane_birth"))
+            or row.get("repo") != str(root) or row.get("worktree") != str(wt) or row.get("branch") != branch
+            or not isinstance(row.get("deadline_at"), str)
             or _parse_iso(row.get("deadline_at", "")) is None):
-        return {"command_id": cmd["command_id"], "outcome": "refused",
-                "detail": "outcome_unknown: receipt is missing, unlaunched or has a conflicting task binding; held without retry"}
-    return {"command_id": cmd["command_id"], "outcome": "accepted",
-            "detail": "already launched (protected receipt)",
+        return {"command_id": cid, "outcome": "refused", "detail": "authorization receipt task binding mismatch"}
+    return {"command_id": cid, "outcome": "accepted" if status == "launched" else "held",
+            "detail": "already launched (protected receipt)" if status == "launched" else
+                      "outcome_unknown: protected task binding exists, launch unconfirmed; no launch retry",
             "local_task_id": row["task_id"], "local_run_id": row["run_id"], "branch": branch,
-            "pane_id": row.get("pane_id", ""), "agent_id": row.get("pane_birth", "")}
+            "pane_id": row["pane_id"], "agent_id": row["pane_birth"]}
+
+
+def _read_authorization(command_id: str) -> dict | None:
+    try:
+        result = _bridge("read-authorization", command_id)
+        if result.returncode != 0:
+            return None
+        row = json.loads(result.stdout)
+        return row if isinstance(row, dict) else None
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None
+
+
+def _cleanup_uncertain_spawn(wt: Path, cmd: dict, branch: str, since: str, ack: dict) -> None:
+    try:
+        _cancel_after_spawn_failure(wt, ack.get("local_run_id", ""), ack.get("local_task_id", ""),
+                                    cmd["remote_task_id"], branch, since)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        # A failed cleanup remains a held unknown outcome. No fresh launch is
+        # permitted; later cancellation/deadline reconciliation retains the map.
+        pass
 
 
 def _accept_receipt(cmd: dict, authorization: VerifiedAuthorization, root: Path, branch: str) -> dict | None:
     deadline = _iso_in(load_allowlist()["caps"]["max_minutes"] * 60)
     result = _bridge("accept-authorization", canonical_json(cmd), authorization.claims, deadline)
     if result.returncode != 0:
-        return {"command_id": cmd["command_id"], "outcome": "refused",
-                "detail": "authorization receipt could not be persisted; no worker launched"}
+        # The write may have completed despite a lost response, or a second
+        # consumer may already be launching. Reconcile before a definitive ack.
+        return _receipt_ack(cmd, _read_authorization(cmd["command_id"]), root, branch)
     try:
         row = json.loads(result.stdout)
     except ValueError:
-        row = {}
+        return _receipt_ack(cmd, _read_authorization(cmd["command_id"]), root, branch)
     if not _receipt_matches(row, cmd):
         return {"command_id": cmd["command_id"], "outcome": "refused",
                 "detail": "authorization receipt binding mismatch; no worker launched"}
-    if row.get("newly_accepted") is True and row.get("status") == "accepted":
+    if (row.get("newly_accepted") is True and row.get("status") == "accepted"
+            and not any(row.get(k) for k in ("task_id", "run_id", "worktree", "branch", "pane_id", "pane_birth"))):
         return None
     # A crash after acceptance, registration or launch claim is ambiguous.
     # Only a fully recorded launch can be acknowledged; never execute again.
@@ -685,23 +726,20 @@ def _launch_authorized(cmd: dict, authorization: VerifiedAuthorization, root: Pa
     authorization.matches(cmd, load_allowlist())
     brief = _write_brief(mode, mcfg, objective, remote_id, follow_up)
     spawn_since = _now_iso()
+    failure = ""
     try:
         proc = _spawn(root, branch, mcfg, brief, cid)
+        if proc.returncode != 0:
+            failure = f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:120]}"
     except (subprocess.TimeoutExpired, OSError) as exc:
-        _cancel_after_spawn_failure(wt, expected_remote_id=remote_id, branch=branch, since=spawn_since)
-        return {"command_id": cid, "outcome": "failed",
-                "detail": f"outcome_unknown: spawn did not finish; held without retry: {exc}"[:300]}
-    if proc.returncode != 0:
-        return {"command_id": cid, "outcome": "failed",
-                "detail": f"spawn-task.sh exit {proc.returncode}; receipt held without retry: {proc.stderr.strip()[:160]}"}
-    protected = _bridge("read-authorization", cid)
-    try:
-        row = json.loads(protected.stdout) if protected.returncode == 0 else {}
-    except ValueError:
-        row = {}
+        failure = f"spawn did not finish: {exc}"[:180]
+    row = _read_authorization(cid)
     ack = _receipt_ack(cmd, row, root, branch)
-    if ack["outcome"] != "accepted":
-        _cancel_after_spawn_failure(wt, expected_remote_id=remote_id, branch=branch, since=spawn_since)
+    if failure or ack["outcome"] != "accepted":
+        if failure and ack["outcome"] != "refused":
+            ack["outcome"] = "held"
+            ack["detail"] = f"outcome_unknown: {failure}; no launch retry"
+        _cleanup_uncertain_spawn(wt, cmd, branch, spawn_since, ack)
         return ack
     run_id, local_task_id = row["run_id"], row["task_id"]
     # Registration binds remote_task_id AND the original deadline before

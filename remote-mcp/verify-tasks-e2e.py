@@ -221,7 +221,7 @@ if row:
     changed = {**start_request, "payload": {**start_request["payload"], "objective": "different objective"}}
     with patch.object(tsk, "_spawn", side_effect=AssertionError("changed source launch")):
         substituted = process_command(changed)
-    check("same command id with another signed payload refuses before launch", substituted.get("outcome") == "refused" and "persisted" in substituted.get("detail", ""), substituted)
+    check("same command id with another signed payload refuses before launch", substituted.get("outcome") == "refused" and "binding mismatch" in substituted.get("detail", ""), substituted)
 
 print("== sweep(): real close-done-workers.sh auto-closes a finished research task ==")
 wt = Path(row["worktree"]) if row and row.get("worktree") else None
@@ -613,12 +613,9 @@ check("Fz-b: `herdr pane close` was NEVER attempted (never confirmed as our own 
 restore_working_herdr_and_free_slot(fake_herdr, fake_herdr_fzb_log, "cmd_fzb_cleanup",
                                      "rtask_20261002T000016Z_0000fdb1", task_id_fzb)
 
-print("== R4-1: a spawn timeout BEFORE remote_task_id is ever stamped still gets the orphan cancelled (real registry-bridge.sh, real registry) ==")
-# Mirrors spawn-task.sh's own real sequence: register_task() runs long
-# before the caller ever calls set-remote-id -- a crash/timeout in that
-# window must not bring back the pre-R3-3 orphan (M7/N1). _start derives
-# worktree/branch from remote_task_id by a fixed formula, so both are
-# precomputed here to match exactly what _start will itself compute.
+print("== R4-1: timeout after protected registration preserves mapping and cancels the orphan ==")
+# Register the protected task binding before a simulated timeout. The held
+# acknowledgement must retain that mapping without assuming launch succeeded.
 remote_id_r41 = "rtask_20261002T000006Z_0000a41f"
 run_id_r41, task_id_r41 = "run_r41", "task_r41"
 branch_r41 = f"remote/{remote_id_r41.rsplit('_', 1)[-1]}"
@@ -628,17 +625,18 @@ reg_script = TMP / "register-r41.sh"
 reg_script.write_text(f"""#!/usr/bin/env bash
 set -euo pipefail
 . "{HERE.parent}/lib/run-registry.sh"
+receipt="$(read_task_authorization "$1")"
+manifest="$(printf '%s' "$receipt" | jq -er '.expected_manifest')"
 register_task {run_id_r41} {task_id_r41} worker1 cond1 cpane1 cbirth1 pane_r41 birth_r41 \\
-  knowledge-base {wt_r41} remote:r41 {branch_r41} main "" "" menu
+  "$2" {wt_r41} remote:r41 {branch_r41} main "" "$manifest" menu "$1"
+mark_authorization_launch "$1" {task_id_r41} {run_id_r41} launch_claimed
 """)
 reg_script.chmod(0o755)
 
 
 def _spawn_registers_then_times_out(root, branch, mcfg, brief, authorization_command_id):
-    # Simulates spawn-task.sh: register the task for real (remote_task_id
-    # stays empty, exactly as it is until a LATER set-remote-id call), then
-    # hang/crash before ever returning or writing identity.json.
-    reg_out = subprocess.run(["bash", str(reg_script)], capture_output=True, text=True)
+    # No worker/identity-file effect; only real protected registry operations.
+    reg_out = subprocess.run(["bash", str(reg_script), authorization_command_id, str(root)], capture_output=True, text=True)
     if reg_out.returncode != 0:
         raise RuntimeError(f"test setup: register_task failed: {reg_out.stderr}")
     raise subprocess.TimeoutExpired(cmd="spawn-task.sh", timeout=75)
@@ -653,9 +651,10 @@ try:
     })
 finally:
     tsk._spawn = old_spawn_fn
-check("start returns failed (spawn timed out)", out_r41.get("outcome") == "failed", json.dumps(out_r41))
+check("start returns held (spawn timed out)", out_r41.get("outcome") == "held", json.dumps(out_r41))
 row_r41 = registry_row(task_id_r41)
-check("the orphaned row (registered before the timeout, remote_task_id never stamped) IS cancelled",
+check("held timeout retains the exact protected task mapping", out_r41.get("local_task_id") == task_id_r41 and out_r41.get("local_run_id") == run_id_r41, out_r41)
+check("the protected registered row IS cancelled after the timeout",
       bool(row_r41) and row_r41.get("state") == "cancelled", row_r41)
 
 print("== R4-1: real registry-bridge.sh cancel accepts an UNSTAMPED row (set-remote-id failure window) ==")
@@ -714,8 +713,8 @@ with patch.object(tsk, "_spawn", side_effect=paused_spawn), ThreadPoolExecutor(m
         second = {"outcome": "failed", "detail": "first consumer did not enter spawn"}
     release.set()
     first = first.result(timeout=20)
-check("overlapping duplicate consumer sees exact ambiguous-receipt refusal",
-      ready and second.get("outcome") == "refused" and "outcome_unknown" in second.get("detail", ""), second)
+check("overlapping duplicate consumer sees exact nonterminal ambiguous-receipt hold",
+      ready and second.get("outcome") == "held" and "outcome_unknown" in second.get("detail", ""), second)
 check("only one overlapping consumer executes the launch", first.get("outcome") == "accepted" and spawn_calls == ["cmd_race_duplicate"], first)
 if first.get("local_task_id"):
     process_command({"command_id":"cmd_race_cancel","op":"cancel","remote_task_id":race_request["remote_task_id"],

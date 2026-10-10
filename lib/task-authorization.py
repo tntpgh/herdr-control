@@ -197,7 +197,7 @@ def accept(db, raw_command, raw_claims, deadline=""):
         raise Refused("changed command payload")
     if payload.get("repo") != claims["repo"] or claims["mode"] not in ("research", "implement"):
         raise Refused("repository/mode binding mismatch")
-    if (claims["op"] == "start" or "mode" in payload) and payload.get("mode") != claims["mode"]:
+    if payload.get("mode") != claims["mode"]:
         raise Refused("payload mode mismatch")
     if claims["scope"] != ("herdr:task.start" if claims["mode"] == "research" else "herdr:task.implement"):
         raise Refused("entitlement/mode mismatch")

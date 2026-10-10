@@ -19,6 +19,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export HERDR_RUN_STATE_DIR="$WORK/runs"
 export HERDR_BRIDGE_STATE="$WORK/bridge"
+export XDG_RUNTIME_DIR="$WORK/runtime"; mkdir -p "$XDG_RUNTIME_DIR"
 export SCREEN="$WORK/screen.txt"
 export KEYS="$WORK/keys.log"
 : > "$KEYS"
@@ -50,7 +51,9 @@ export PANE BIRTH
 _std_herdr_stub() {
   case "$1 $2" in
     "pane process-info")
-      printf '{"result":{"process_info":{"foreground_processes":[{"name":"claude","cmdline":"claude --model sonnet"}]}}}\n' ;;
+      local pid=999999
+      [ "${4:-}" != "${HERDR_FIXTURE_CALLER_PANE:-}" ] || pid="$PPID"
+      printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"name":"claude","cmdline":"claude --model sonnet"}]}}}\n' "$pid" ;;
     "pane list")
       printf '{"result":{"panes":[{"pane_id":"%s","terminal_id":"%s","cwd":"/tmp"},{"pane_id":"w9:p9","terminal_id":"cond-birth","cwd":"/tmp"}]}}\n' "$PANE" "$BIRTH" ;;
     "pane read")
@@ -80,6 +83,8 @@ _std_herdr_stub() {
 herdr() { _std_herdr_stub "$@"; }
 export -f _std_herdr_stub
 export -f herdr
+ps() { printf '1\n'; }
+export -f ps
 
 pass=0 fail=0
 ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
@@ -101,9 +106,10 @@ reset_keys()   { : > "$KEYS"; }
 keys_pressed() { wc -l < "$KEYS" | tr -d ' '; }
 
 . "$here/lib/run-registry.sh"
-register_task run1 task1 w1 c1 "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt "impl:test" >/dev/null 2>&1
+. "$here/tests/fixtures/task-authorization.sh"
+fixture_register_task run1 task1 w1 c1 "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt "impl:test" >/dev/null 2>&1 || exit 1
 
-sel() { ( bash "$here/herdr-select.sh" "$PANE" "$@" >"$WORK/out.txt" 2>"$WORK/err.txt" ); }
+sel() { ( HERDR_FIXTURE_CALLER_PANE="${HERDR_PANE_ID:-}" bash "$here/herdr-select.sh" "$PANE" "$@" >"$WORK/out.txt" 2>"$WORK/err.txt" ); }
 
 q_appr() {
   sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
@@ -662,7 +668,7 @@ printf '== #3b: ownership grant — strict tokenizer, own repo/branch only ==\n'
 # which is what item 2's resolution swaps in before item 3's tokenizer ever
 # runs. seed_input_required mirrors that write directly against the DB.
 GBRANCH="feat/grant-test"; GTRUNK="main"
-register_task runG taskG wG cG "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/grant "impl:grant" "$GBRANCH" "$GTRUNK" >/dev/null 2>&1
+fixture_register_task runG taskG wG cG "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/grant "impl:grant" "$GBRANCH" "$GTRUNK" >/dev/null 2>&1 || exit 1
 set_task_state runG taskG running >/dev/null 2>&1
 seed_input_required() {                 # <run> <task> <command> [tool=bash]
   append_event "$1" "$2" input_required \
@@ -833,7 +839,7 @@ sel 1 --authority peer; rc=$?
 # matching registry command for the wrapped-display proof above. Post-#148, a
 # registry-corroborated command is allowed to replace a torn scrape; this block
 # is specifically proving the no-corroboration case.
-register_task runT taskT wT cT "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/torn "impl:torn-menu" >/dev/null 2>&1
+fixture_register_task runT taskT wT cT "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/torn "impl:torn-menu" >/dev/null 2>&1 || exit 1
 set_task_state runT taskT running >/dev/null 2>&1
 
 printf '== PR #147 hold, independent review: scrape-only menu-shape (omp) torn capture escalates ==\n'
@@ -1607,10 +1613,10 @@ printf '== task-scoped approval: capability manifest, approved once at spawn ==\
 SWT="$WORK/wt-scope"; mkdir -p "$SWT/tmp/geo" "$SWT/.handoffs"
 SBRANCH="feat/scope-test"
 SMANIFEST='{"git":"commit-only","net_read":["teamthurber.com"],"net_write":"none","writes":["GEO-AUDIT-REPORT-*.md","tmp/**"]}'
-register_task runS taskS wS cS "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo "$SWT" "impl:scope" "$SBRANCH" main "$SMANIFEST" >/dev/null 2>&1
+fixture_register_task runS taskS wS cS "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo "$SWT" "impl:scope" "$SBRANCH" main "$SMANIFEST" >/dev/null 2>&1 || exit 1
 set_task_state runS taskS running >/dev/null 2>&1
-[ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM events WHERE task_id='taskS' AND type='manifest_approved';")" = 1 ] \
-  && ok "manifest approval recorded once, at registration" || bad "no manifest_approved event"
+[ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM events WHERE task_id='taskS' AND type='task_authorization_bound';")" = 1 ] \
+  && ok "verified task authorization bound once, at registration" || bad "no task_authorization_bound event"
 peer_on() {                              # <command> -> rc of a peer select on a menu showing it
   set_menu "$1"; reset_keys; seed_input_required runS taskS "$1"; sel 1 --authority peer
 }
@@ -1729,7 +1735,7 @@ set_task_state runS taskS completed no-follow-on >/dev/null 2>&1
 printf '== fix/peer-waits-for-record ==\n'
 
 RBRANCH="fix/race-wait"; RTRUNK="main"
-register_task runR taskR wR cR "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/record-wait "impl:race" "$RBRANCH" "$RTRUNK" >/dev/null 2>&1
+fixture_register_task runR taskR wR cR "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/record-wait "impl:race" "$RBRANCH" "$RTRUNK" >/dev/null 2>&1 || exit 1
 set_task_state runR taskR running >/dev/null 2>&1
 WAIT_TRACE="$WORK/wait-trace.log"
 
@@ -2052,7 +2058,7 @@ printf '== the blocked period closes BEFORE the answering keystroke ==\n'
 # queued second tool call's panel the instant the first is answered, so a close
 # written after the keypress let that next panel be read under the old period
 # and re-keyed under the new one: one prompt, two ids, two wakes.
-register_task runK taskK wK cK "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/close "impl:close" >/dev/null 2>&1
+fixture_register_task runK taskK wK cK "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/close "impl:close" >/dev/null 2>&1 || exit 1
 set_task_state runK taskK blocked >/dev/null 2>&1
 set_menu "git status --short --branch"; reset_keys; : > "$SCREEN.state-at-enter"
 STATE_AT_ENTER=taskK HERDR_SELECT_RECORD_WAIT_S=0 sel 1 --authority peer; rc=$?
@@ -2068,7 +2074,7 @@ printf '== the screen is re-read AFTER the close, right before the keystroke ==\
 # panel with Approve highlighted, an Enter sent on the strength of the read
 # BEFORE the close would approve a prompt nobody reviewed. Model it: once the
 # task is running (the close landed), the pane shows a different command.
-register_task runQ taskQ wQ cQ "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/queued "impl:queued" >/dev/null 2>&1
+fixture_register_task runQ taskQ wQ cQ "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/queued "impl:queued" >/dev/null 2>&1 || exit 1
 set_task_state runQ taskQ blocked >/dev/null 2>&1
 set_menu "gh pr merge 7 --squash"; cp "$SCREEN" "$WORK/queued-screen.txt"
 set_menu "git status --short"; reset_keys
@@ -2096,7 +2102,7 @@ printf '== F7c: a peer/conductor Deny tells the worker WHY, once the menu has cl
 # by waiting for nothing, so each is followed by a conductor Deny control on a
 # fresh prompt: once the control's row lands, the send log must hold exactly
 # the control's line and the negative prompt must have no row.
-register_task runD taskD wD cD "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/deny "impl:deny" >/dev/null 2>&1
+fixture_register_task runD taskD wD cD "w9:p9" "cond-birth" "$PANE" "$BIRTH" /repo /wt/deny "impl:deny" >/dev/null 2>&1 || exit 1
 set_task_state runD taskD running >/dev/null 2>&1
 CLEAN_SCREEN="$WORK/clean-screen.txt"
 printf 'worker idle at its composer\n' > "$CLEAN_SCREEN"

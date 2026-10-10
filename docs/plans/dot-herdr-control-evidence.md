@@ -1,7 +1,7 @@
 # Evidence for the dot → Herdr plan
 
 Baseline: `4f071ad0454bb5fcb1d835872bd6705064207c3f`. Date: 2026-10-10 UTC.
-This is planning evidence, not implementation verification or canary acceptance.
+This records planning and inactive implementation verification. It is not live canary acceptance.
 
 ## Repository and isolation
 
@@ -38,9 +38,9 @@ Parent reports an independent Astra ultra architecture review completed, with ex
 
 Latest parent observation: Main refuses the recap commit/push because its original manifest approval was `conductor_unknown` with no pane identity. The refusal is preserved. This task did not inspect the live approval prompt or issue an approval. The two defects are grammar recognition and missing verified original provenance; neither is a lost database manifest.
 
-Subsequent parent reviewer finding is also incorporated: assigning Main as supervisor can be logged as apparent manifest approval even without a Main decision; simple ownership fast paths do not check original approval provenance. The proposed first slice now includes separation of requester/source/supervisor, pre-execution task-bound provenance and identical unknown-provenance holds on simple/compound commands. Merely adding handover guidance is insufficient. No exact-plan acceptance has yet been received.
+Subsequent parent reviewer finding is also incorporated: assigning Main as supervisor can be logged as apparent manifest approval even without a Main decision; simple ownership fast paths do not check original approval provenance. The proposed first slice now includes separation of requester/source/supervisor, pre-execution task-bound provenance and identical unknown-provenance holds on simple/compound commands. Merely adding handover guidance is insufficient. That planning-stage gate was subsequently satisfied at `212033c`, as recorded below.
 
-Supplemental independent exact-plan review of `290c1f5` returned ITERATE with two HIGH findings: the provenance hold must also cover reviewed menu conductor, hook decision and approved one-shot consumption; minimum mixed-version admission cannot be deferred while issuing provenance-bearing legacy commands. Both corrections are now explicit in the plan. This review did not run tests or authorize implementation/activation; parent exact-plan acceptance remains pending.
+Supplemental independent exact-plan review of `290c1f5` returned ITERATE with two HIGH findings: the provenance hold must also cover reviewed menu conductor, hook decision and approved one-shot consumption; minimum mixed-version admission cannot be deferred while issuing provenance-bearing legacy commands. Both corrections are now explicit in the plan. This review did not run tests or authorize implementation/activation; the parent subsequently supplied exact-plan GO at `212033c`.
 
 ## Follow-up baseline diagnosis (same unchanged production source)
 
@@ -58,7 +58,7 @@ compound peer_rc=1 verdict=escalate authority=peer
 quoted_cd peer_rc=1 verdict=escalate authority=peer
 ```
 
-Both escalation reasons are `find/git combined with substitution, redirect or quoting: a conductor must review it`. Exact output: [reproduction-dependencies-restored.txt](evidence/dot-control/reproduction-dependencies-restored.txt). These command strings were classified only, never executed. This proves the grammar difference while preserving the unknown-provenance problem; it does not approve splitting a held real command. No production code changes yet.
+Both escalation reasons are `find/git combined with substitution, redirect or quoting: a conductor must review it`. Exact output: [reproduction-dependencies-restored.txt](evidence/dot-control/reproduction-dependencies-restored.txt). These command strings were classified only, never executed. This proves the grammar difference while preserving the unknown-provenance problem; it does not approve splitting a held real command. No production code had changed at that baseline point.
 
 ## Interruption accounting
 
@@ -66,6 +66,52 @@ No live canary ran. Workflow owner-relay count: **not measured**. Historical own
 
 Worktree creation and local git metadata writes use the execution environment's auto-review mechanism because the common git directory is outside this task's writable root. No human response was required in this thread. No owner approval, message to KB/Main, canary launch, merge, deploy, persistent access change or live grant was issued. A progress/clarification message to the source task through the local task API failed with `thread not found`; it did not deliver. Final task output is the supported parent handoff.
 
-## Pending
+## Reviewed scope and inactive candidate
 
-Exact-plan review; an approved implementation slice; a permitted fixture environment; exact-head adversarial code review; and an explicitly permitted live canary route. No implementation has started.
+The parent supplied independent exact-plan **GO** at `212033cdc389283d8edd40c68af96b5229e424d8` for bounded inactive M1. Initial implementation candidate `71eafafdd765e53f275c2534f3ca21d28001dab3`, on `fix/dot-control-authorization`, received **REQUEST CHANGES / BLOCK** from two fresh independent review lanes. They found one HIGH (a concurrent duplicate's refusal could discard a later successful launch acknowledgement and lose remote cancellation) and one MEDIUM (cancel retry hashing included mutable lease attempts). Both were repaired before another exact-head review: unresolved matching receipts produce nonterminal `held` acknowledgements, while cancel retry hashes omit lease-attempt counters. No activation occurred.
+
+M1 preserves server-derived task delegation in the existing command queue with a canonical HMAC receipt, validates it against the local allowlist, and binds it atomically to the actual task identity before launch. Local launches require verified process ancestry and a live eligible conductor. The assigned supervisor is never recorded as the source approver. Legacy tasks remain unverified; policy/parser/identity failures hold across ownership, menu, hook, decision and consumption paths. Receipt retries cannot launch twice; ambiguous launch intent is retained as `outcome_unknown`. Registration, launch intent and launch acknowledgement are separate durable facts.
+
+The parent-reported unreadable-menu stall is recorded in plan section 11. Independent diagnosis found a dropped tool-call identifier and monitoring that can conflate unreadable with answered. Existing menu parser tests passed 64/64 and window tests 16/16; this does not reconstruct the live incident. M1 removes the sweep's incorrect exit-8-to-clipping inference and shorter-command advice. Structured menu observations and watchdog state repair remain a separately reviewed follow-on.
+
+## Implementation verification
+
+All records below use synthetic identities, scratch state and fixture transports. The source authentication tests use fixture keys, never live signing credentials. Shell execution/overwrite tests reserve the new control helper filenames; native file tools retain the existing worktree-containment policy. These are not OS containment guarantees. No model/service/API call or live Herdr worker was used.
+
+| Command / evidence | Observed result | Boundary |
+|---|---|---|
+| `python3 verify-task-authorization.py` | 21 passed | Real SQLite and concurrent processes: receipt acceptance, duplicate binding/launch winners, concurrent independent jobs, handover, corruption, rollback and legacy migration |
+| `bash verify-task-authorization-gates.sh` | 48 passed | Real policy/registry with explicit fixture panes/ancestry; no live approval |
+| `python3 remote-mcp/verify-authorization.py` | 64 passed | HMAC/protocol/time/payload/scope checks; production Worker golden vector interoperability |
+| `python3 remote-mcp/verify-tasks.py` | 76 passed | Lifecycle and failure/recovery behavior; local fixture transport |
+| `python3 remote-mcp/verify-publisher.py` | 47 passed | Publisher formatting, bookkeeping and isolated response handling |
+| `python3 remote-mcp/verify-tasks-e2e.py --registry-only` | 89 passing assertions | Real receipt verification/registry, fake worker launch; timers explicitly excluded |
+| `node test/authorization-offline.cjs` in `remote-mcp/worker` | 22 passed | Real production state methods and SQLite; substitutes DurableObject base/storage, no Cloudflare/OAuth ingress |
+| Worker TypeScript `tsc --noEmit` | Exit 0 | Static check using existing installed dependencies |
+| `bash verify-scoped-approval.sh` | 260 passed | Existing policy cases use explicit protected-receipt fixtures |
+| `bash verify-pretool-shadow.sh` | 70 passed | Existing policy shadow behavior with verified fixtures |
+| `bash verify-pretool-enforce.sh` | 185 passed | Real hook interface; fixture transports/identity only |
+| `bash verify-owner-approval.sh` | 118 passed, 3 failed, 3 skipped | Three quote/parser failures reproduced against deployed baseline; skips require host process/PTY access |
+| `bash verify-run-registry.sh` | 134 passed | Existing schema expectation updated to 11; no legacy grant backfill |
+| `bash verify-sweep-approvals.sh` | 23 passed | No selector refusal is misreported as clipping or permission to retry |
+| `bash verify-process-identity-failures.sh` | 3 passed | Unavailable, malformed and truncated ancestry return unknown, including a matching partial ancestor |
+
+Raw results are in [evidence/dot-control](evidence/dot-control). Node uses the existing `/Users/thurbs/.local/share/mise/installs/node/22.23.2/bin/node`; the default shim could not resolve its configured version. No runtime was installed and no global setting changed. The parser and Worker dependencies are existing read-only worktree symlinks, excluded from git.
+
+The standard Worker Vitest attempt executed **zero tests**: localhost binding and Wrangler log-path permissions failed before execution. The full timer integration attempt reached sandbox-denied `ps`; the registry-only run explicitly excludes timer verification and cannot establish it. Baseline handover CLI tests also remain host-limited by real process ancestry. No rejected test or action was retried with a false Herdr identity or a weaker production guard. In-process HTTP response fixtures replaced listener-only unit harnesses; the result is explicitly not socket integration.
+
+The pre-commit repository hook initially rejected synthetic `example.test` email addresses. Fixtures were corrected to its supported reserved `example.com` domain and the signed golden vector regenerated. Hooks and policy configuration were not changed or disabled. The corrected commit passed the hook without a human prompt.
+
+## Measured interruptions and side effects
+
+Engineering job: **0 owner input requests, 0 owner relays, 0 human approval prompts, 0 live canary runs, 0 sends to KB/Main**. These counts describe this engineering job, not end-to-end Herdr task acceptance.
+
+In the new consumer fixture, three sequential and four concurrent enforcing-hook calls for an unverified task produced **0 action requests**. Two surface/tick retries produced **1 durable hold event and 0 notification/form sends**. Four concurrent consumers of one verified grant produced **1 consumption and 3 refusals**; a subsequent replay refused. Held scenarios produced **0 consumes, 0 keypresses and 0 notifications**. One separately identified positive approval emitted one fixture notification.
+
+Real-registry integration observed exactly one fake launch for overlapping duplicate consumers; the loser reported nonterminal `held` with `outcome_unknown`. Actual Python-produced acknowledgements were passed through production Worker state methods in both arrival orders. Held replay generated one audit/event; mapped holds stayed cancellable; expired unmapped holds kept a durable unresolved record. Late acknowledgements retained targets only for cancellation, never restored launch authority. Two distinct concurrent jobs retained different receipt/task bindings. A lost acknowledgement reused the protected record without another launch or deadline extension. Eight real processes simultaneously initializing one cold registry also passed after a reproduced race was fixed by installing the SQLite busy timeout before the first WAL PRAGMA. These are fixture measurements, not a live job or a proof that every crash window automatically recovers.
+
+## Remaining acceptance gates
+
+Exact-head independent review is pending. The real canary (inspection → edit → tests → local commit → review, zero owner relays) has **not** run. No production source receipt was backfilled, no legacy refusal was cleared, and no merge, push, deploy, persistent access expansion, approval activation or security-setting change occurred. Later activation/canary authorization must be resolved by the parent through a permitted route; current remote allowlisting excludes `herdr-control`.
+
+M2 action-grant expiry/generation/HEAD-index binding and full immutable work ceilings, plus the menu/watchdog follow-on, remain outside M1. This candidate must not be described as satisfying full release acceptance.

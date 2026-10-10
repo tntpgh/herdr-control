@@ -1,0 +1,26 @@
+test_accept_retry_conflict_remote_uniqueness (__main__.RegistryAuthorization.test_accept_retry_conflict_remote_uniqueness) ... ok
+test_binding_and_events_roll_back_together (__main__.RegistryAuthorization.test_binding_and_events_roll_back_together) ... ok
+test_concurrent_accept_has_one_new_receipt (__main__.RegistryAuthorization.test_concurrent_accept_has_one_new_receipt) ... ok
+test_concurrent_binding_and_launch_each_have_one_winner (__main__.RegistryAuthorization.test_concurrent_binding_and_launch_each_have_one_winner) ... ok
+test_crash_windows_never_claim_a_second_launch (__main__.RegistryAuthorization.test_crash_windows_never_claim_a_second_launch) ... ok
+test_deadline_bound_before_launch_and_retry_does_not_extend_it (__main__.RegistryAuthorization.test_deadline_bound_before_launch_and_retry_does_not_extend_it) ... ok
+test_delivery_expiry_does_not_expire_running_task (__main__.RegistryAuthorization.test_delivery_expiry_does_not_expire_running_task) ... ok
+test_distinct_concurrent_jobs_cannot_exchange_receipts (__main__.RegistryAuthorization.test_distinct_concurrent_jobs_cannot_exchange_receipts) ... ok
+test_expired_source_cannot_bind_or_launch (__main__.RegistryAuthorization.test_expired_source_cannot_bind_or_launch) ... ok
+test_handover_preserves_source_with_real_competing_processes (__main__.RegistryAuthorization.test_handover_preserves_source_with_real_competing_processes) ... ok
+test_local_source_concurrent_retry_and_changed_actor (__main__.RegistryAuthorization.test_local_source_concurrent_retry_and_changed_actor) ... ok
+test_migration_backup_failure_stops_before_schema_and_stamp (__main__.RegistryAuthorization.test_migration_backup_failure_stops_before_schema_and_stamp) ... ok
+test_migration_preserves_legacy_hold_and_history (__main__.RegistryAuthorization.test_migration_preserves_legacy_hold_and_history) ... ok
+test_parallel_shell_initializers_share_cold_registry (__main__.RegistryAuthorization.test_parallel_shell_initializers_share_cold_registry) ... ok
+test_remote_source_is_not_main_approval (__main__.RegistryAuthorization.test_remote_source_is_not_main_approval) ... ok
+test_research_manifest_is_exact_and_restrictions_required (__main__.RegistryAuthorization.test_research_manifest_is_exact_and_restrictions_required) ... ok
+test_resume_requires_payload_mode_in_protocol_one (__main__.RegistryAuthorization.test_resume_requires_payload_mode_in_protocol_one) ... ok
+test_retry_ack_checks_binding_and_permits_terminal_history_only (__main__.RegistryAuthorization.test_retry_ack_checks_binding_and_permits_terminal_history_only) ... ok
+test_schema_source_expiry_entitlement_and_changed_command_refused (__main__.RegistryAuthorization.test_schema_source_expiry_entitlement_and_changed_command_refused) ... ok
+test_source_integrity_and_absence_fail_closed (__main__.RegistryAuthorization.test_source_integrity_and_absence_fail_closed) ... ok
+test_task_binding_wrong_pane_manifest_and_mutable_json_refused (__main__.RegistryAuthorization.test_task_binding_wrong_pane_manifest_and_mutable_json_refused) ... ok
+
+----------------------------------------------------------------------
+Ran 21 tests in 9.474s
+
+OK
