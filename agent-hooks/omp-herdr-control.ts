@@ -922,10 +922,24 @@ function workerWriteScopeBlock(event: unknown, ctx: unknown): Block | undefined 
 // only bounded pre-work: cache bash/shell input for the later approval event and
 // run the fail-closed registration guard for delegation-shaped tools. Ordinary
 // tool calls return undefined and cost zero herdr RPCs here.
-function notifyForPrompt(toolName: string, message: string, command?: string): void {
+function notifyForPrompt(
+  toolName: string,
+  message: string,
+  command?: string,
+  callId?: string,
+  nativeSession?: string,
+): void {
   if (!notifyAvailable) return;
   const payload: Record<string, unknown> = { tool: toolName, message, cwd: process.cwd() };
   if (command) payload.command = command;
+  // Carried only so omp-notify.sh can persist a prompt_occ_screen observation
+  // against the SAME occurrence onApprovalRequested already recorded `seen`
+  // for (docs/plans/dot-herdr-recovery-slices.md §2: "persist request before
+  // probing; failed parsing updates display status instead of discarding the
+  // observation") — never a second identity source, since both come from
+  // the one onApprovalRequested call below.
+  if (callId) payload.call_id = callId;
+  if (nativeSession) payload.native_session = nativeSession;
   spawnDetached([NOTIFY_SH], JSON.stringify(payload));
 }
 
@@ -1335,8 +1349,9 @@ function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
     // first firing silently dropped the SECOND firing's cached input before
     // this fix (docs/plans/dot-herdr-recovery-slices.md §2, prerequisite
     // notes on agent-hooks/omp-herdr-control.ts:925).
+    let nativeSession: string | undefined;
     if (callId !== undefined) {
-      const nativeSession = sessionIdOf(ctx);
+      nativeSession = sessionIdOf(ctx);
       trackOccurrence(callId, nativeSession, false);
       recordOccurrence([
         "seen", ...occurrenceIdentityArgs(callId, nativeSession),
@@ -1353,6 +1368,8 @@ function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
       toolName,
       detail ? `${toolName}: ${detail}` : `omp needs your permission to use ${toolName}`,
       rawBashCommand(toolName, input),
+      callId,
+      nativeSession,
     );
   } catch {
     // MUST NOT throw — see the fail-closed contract at the top of this file.
