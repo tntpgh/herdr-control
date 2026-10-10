@@ -1,6 +1,6 @@
 # Dot → Herdr: preserve task authority without turning messages into approvals
 
-Status: bounded inactive M1 implementation authorized after independent review of `212033cdc389283d8edd40c68af96b5229e424d8`. This document does not authorize activation or a live approval.
+Status: bounded inactive M1 implemented at `37a3dff28d4402eb5b509e7f59c72c43f0c6cbf6` after independent plan GO at `212033cdc389283d8edd40c68af96b5229e424d8`. Final security and architecture reviews are CLEAR for this bounded inactive code; full release/canary acceptance remains open. This document does not authorize activation or a live approval.
 Date: 2026-10-10 UTC. Baseline: `4f071ad0454bb5fcb1d835872bd6705064207c3f` (deployed PR272).
 Branch: `fix/dot-control-authorization`. Worktree: `/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control`.
 
@@ -154,7 +154,7 @@ Implementation begins only after M0 review. M1 does not require a new persistent
 
 Bound the first implementation to M1: preserve/authenticate existing delegation, correct attribution, hold unverified origins consistently, present authoritative handover context, and prove those paths with fixtures. Defer compound grammar, full action epochs/expiry/context digests and new acknowledgement machinery to separate reviewed slices. M1 alone must not claim the full acceptance matrix or completed live zero-relay repair. Registration already precedes `herdr pane run` (`spawn-task.sh:799`, `:911`); a receipt-backed menu launch must fail closed on registration failure, matching the existing hook launch safeguard.
 
-No new API calls to paid model providers. Parent reports an independent Astra ultra architecture pass completed and supplied its findings; this engineering job did not invoke another model CLI. Exact-plan acceptance is still pending. `omp --help` confirms `--thinking max`, but that is not proof of the intended subscription route and no local ultrathink pass is claimed. Do not silently switch to a billed API or bypass HERDR_ENV.
+No new API calls to paid model providers. Parent reports an independent Astra ultra architecture pass completed and supplied its findings; this engineering job did not invoke another model CLI. The parent subsequently supplied exact-plan GO at `212033cdc389283d8edd40c68af96b5229e424d8` for bounded inactive M1. `omp --help` confirms `--thinking max`, but that is not proof of the intended subscription route and no local ultrathink pass is claimed. Do not silently switch to a billed API or bypass HERDR_ENV.
 
 ## 8. Test plan and exact acceptance criteria
 
@@ -217,7 +217,7 @@ Rollback before activation: retain the worktree/commits, remove no user data, an
 
 ## 10. Open review decisions and completion boundaries
 
-* Parent reports Astra ultra architecture review completed and independent exact-plan GO at `212033cdc389283d8edd40c68af96b5229e424d8` for inactive M1. Exact-code approval remains a separate gate.
+* Parent reports Astra ultra architecture review completed and independent exact-plan GO at `212033cdc389283d8edd40c68af96b5229e424d8` for inactive M1. Exact code `37a3dff28d4402eb5b509e7f59c72c43f0c6cbf6` subsequently received security and architecture CLEAR for bounded inactive M1; activation remains a separate gate.
 * Independent reviewer should challenge M2's exact lifecycle and migration before implementation, especially file-grant lifetime, actor authentication and the consume/side-effect crash gap.
 * Decide whether M1 alone meets the real canary without broader grammar recognition. Prefer the existing reviewed conductor route; a generic compound shell parser is outside the first fix.
 * Canary activation scope remains unapproved. Current remote allowlist excludes `herdr-control`; do not alter it or use `knowledge-base` as a proxy. Ask the parent for an explicitly permitted isolated canary route when the reviewed candidate is ready.
