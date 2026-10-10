@@ -62,10 +62,22 @@ for payload in 'not-json' '{}' '' 'null' '[]' '{"result":{}}' \
   '{"result":{"process_info":{"foreground_processes":[{"pid":"123"}]}}}' \
   '{"result":{"process_info":{"foreground_processes":[{"pid":0}]}}}' \
   '{"result":{"process_info":{"foreground_processes":[{"pid":-1}]}}}' \
-  '{"result":{"process_info":{"foreground_processes":[{"pid":1.5}]}}}'; do
+  '{"result":{"process_info":{"foreground_processes":[{"pid":1.5}]}}}' \
+  '{"result":{"process_info":{"foreground_processes":[{"pid":2147483648}]}}}' \
+  '{"result":{"process_info":{"foreground_processes":[{"pid":1e10000}]}}}' \
+  '{"result":{"process_info":{"foreground_processes":[{"pid":1e-10000}]}}}' \
+  '{"result":{"process_info":{"foreground_processes":[{"pid":Infinity}]}}}' \
+  '{"result":{"process_info":{"foreground_processes":[{"pid":NaN}]}}}' \
+  '{"result":{"process_info":{"foreground_processes":[{"pid":true}]}}}' \
+  '{"result":{"process_info":{"foreground_processes":[{"pid":1.0}]}}}' \
+  '{"result":{"process_info":{"foreground_processes":[],"foreground_processes":[]}}}'; do
   INFO_PAYLOAD="$payload"
   expect_unknown "incomplete or invalid process response: ${payload:-<empty>}"
 done
+INFO_PAYLOAD="$(printf '{"result":{"process_info":{"foreground_processes":[{"pid":+%s}]}}}' "$PPID")"
+expect_unknown 'non-JSON plus-prefixed PID cannot identify caller'
+INFO_PAYLOAD="$(printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s.000000000000001}]}}}' "$PPID")"
+expect_unknown 'fractional PID must not round to matching caller'
 INFO_PAYLOAD="$matching $matching"
 expect_unknown 'multiple JSON process responses'
 INFO_PAYLOAD="$(printf '%s' "$matching" | jq '.result.process_info.foreground_processes += [{}]')"
@@ -99,18 +111,20 @@ done
 RAW_PANES=1
 for payload in '{"panes":[{"pane_id":"fixture:p\0001"}]}' \
   '\000{"panes":[{"pane_id":"fixture:p1"}]}' \
-  '{"panes":[{"pane_id":"fixture:p1"}]}\000'; do
+  '{"panes":[{"pane_id":"fixture:p1"}]}\000' \
+  '{"panes":[{"pane_id":"fixture:p1","label":"\377"}]}'; do
   PANES_PAYLOAD="$payload" INFO_PAYLOAD="$matching"
-  expect_unknown 'raw NUL pane transport cannot normalize to matching caller'
+  expect_unknown 'malformed raw pane transport cannot normalize to matching caller'
   INFO_PAYLOAD='{"result":{"process_info":{"foreground_processes":[]}}}'
-  expect_unknown 'raw NUL pane transport cannot prove outside caller'
+  expect_unknown 'malformed raw pane transport cannot prove outside caller'
 done
 RAW_PANES=0 PANES_PAYLOAD="$valid_panes" RAW_INFO=1
 for payload in '{"result":{"process_info":{"foreground_pro\000cesses":[]}}}' \
   '{"result":{"process_info":{"foreground_processes":[]}}}\000' \
-  '\000{"result":{"process_info":{"foreground_processes":[]}}}'; do
+  '\000{"result":{"process_info":{"foreground_processes":[]}}}' \
+  '{"result":{"process_info":{"foreground_processes":[],"label":"\377"}}}'; do
   INFO_PAYLOAD="$payload"
-  expect_unknown 'raw NUL process transport cannot prove outside caller'
+  expect_unknown 'malformed raw process transport cannot prove outside caller'
 done
 INFO_PAYLOAD="${matching/foreground_processes/foreground_pro\\000cesses}"
 expect_unknown 'raw NUL process transport cannot normalize to matching caller'
@@ -141,20 +155,24 @@ for payload in 'not-json' '{}'; do
     failed=$((failed+1))
   fi
 done
-for transport in pane process; do
+for transport in pane process pane_utf8 process_utf8; do
   RAW_PANES=0 RAW_INFO=0 PANES_PAYLOAD="$valid_panes"
   INFO_PAYLOAD='{"result":{"process_info":{"foreground_processes":[]}}}'
   if [ "$transport" = pane ]; then
     RAW_PANES=1 PANES_PAYLOAD='{"panes":[{"pane_id":"fixture:p\0001"}]}'
-  else
+  elif [ "$transport" = process ]; then
     RAW_INFO=1 INFO_PAYLOAD='{"result":{"process_info":{"foreground_pro\000cesses":[]}}}'
+  elif [ "$transport" = pane_utf8 ]; then
+    RAW_PANES=1 PANES_PAYLOAD='{"panes":[{"pane_id":"fixture:p1","label":"\377"}]}'
+  else
+    RAW_INFO=1 INFO_PAYLOAD='{"result":{"process_info":{"foreground_processes":[],"label":"\377"}}}'
   fi
   out="$(bash "$here/designate-main.sh" --force fixture:p1 --reason fixture 2>&1)"; rc=$?
   if [ "$rc" = 3 ] && printf '%s' "$out" | grep -q -- '--force is only for a shell outside herdr'; then
-    printf 'PASS force consumer refuses raw NUL %s transport at caller gate\n' "$transport"
+    printf 'PASS force consumer refuses malformed raw %s transport at caller gate\n' "$transport"
     passed=$((passed+1))
   else
-    printf 'FAIL raw NUL force consumer: expected caller refusal, got rc=%s %s\n' "$rc" "$out" >&2
+    printf 'FAIL malformed raw force consumer: expected caller refusal, got rc=%s %s\n' "$rc" "$out" >&2
     failed=$((failed+1))
   fi
 done
