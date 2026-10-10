@@ -56,6 +56,8 @@ con.execute("""CREATE TABLE tasks (task_id TEXT PRIMARY KEY, run_id TEXT, remote
 # other). FAKE_BRIDGE's append-event case below is this fixture's only
 # writer, mirroring what registry-bridge.sh's real append_event does.
 con.execute("CREATE TABLE events (run_id TEXT, task_id TEXT, type TEXT, payload TEXT)")
+con.execute("""CREATE TABLE roles (label TEXT PRIMARY KEY, pane_id TEXT NOT NULL,
+             pane_birth TEXT NOT NULL, agent_session TEXT, workspace TEXT)""")
 con.commit()
 con.close()
 
@@ -69,7 +71,7 @@ def _fake(name: str, body: str) -> Path:
 
 CAPTURE = TMP / "captured-brief.md"
 FAKE_SPAWN_OUT = TMP / "fake-spawn-outcome"  # "0 ok" or "1" to force a failure
-FAKE_SPAWN_ENV_CAPTURE = TMP / "fake-spawn-env-capture"  # F7: records HERDR_MCP_REMOTE_SPAWN per call
+FAKE_SPAWN_ENV_CAPTURE = TMP / "fake-spawn-env-capture"  # remote-spawn plus conductor identity
 FAKE_SPAWN = _fake("fake-spawn-task.sh", f"""
 root="$1"; branch="$2"
 brief=""
@@ -78,7 +80,7 @@ for a in "$@"; do
   prev="$a"
 done
 [ -n "$brief" ] && cp "$brief" {CAPTURE}
-printf '%s\\n' "${{HERDR_MCP_REMOTE_SPAWN:-}}" > {FAKE_SPAWN_ENV_CAPTURE}
+printf '%s|%s|%s\\n' "${{HERDR_MCP_REMOTE_SPAWN:-}}" "${{HERDR_MCP_CONDUCTOR_PANE:-}}" "${{HERDR_MCP_CONDUCTOR_BIRTH:-}}" > {FAKE_SPAWN_ENV_CAPTURE}
 rc=$(cat {FAKE_SPAWN_OUT} 2>/dev/null || echo 0)
 [ "$rc" = 0 ] || exit "$rc"
 wt="{WT_ROOT}/$(basename "$root")/$branch"
@@ -234,6 +236,63 @@ class SpawnArgvAgainstRealParser(unittest.TestCase):
             tokens = launch.split()
             for flag in (a for a in argv[1:] if a.startswith("--")):
                 self.assertNotIn(flag, tokens, f"{flag} leaked onto the omp command line: {launch}")
+
+
+class RemoteSpawnConductorRouting(unittest.TestCase):
+    def setUp(self):
+        con = sqlite3.connect(REGISTRY)
+        con.execute("DELETE FROM roles")
+        con.commit()
+        con.close()
+        self.saved = {
+            key: os.environ.pop(key, None)
+            for key in ("HERDR_MCP_CONDUCTOR_PANE", "HERDR_MCP_CONDUCTOR_BIRTH")
+        }
+
+    def tearDown(self):
+        con = sqlite3.connect(REGISTRY)
+        con.execute("DELETE FROM roles")
+        con.commit()
+        con.close()
+        for key in ("HERDR_MCP_CONDUCTOR_PANE", "HERDR_MCP_CONDUCTOR_BIRTH"):
+            os.environ.pop(key, None)
+        for key, value in self.saved.items():
+            if value is not None:
+                os.environ[key] = value
+
+    def _brief(self) -> Path:
+        brief = TMP / "routing-brief.md"
+        brief.write_text("objective\n")
+        return brief
+
+    def test_missing_explicit_conductor_uses_main_pane_and_birth(self):
+        con = sqlite3.connect(REGISTRY)
+        con.execute("INSERT INTO roles(label,pane_id,pane_birth) VALUES ('main','w72:p1','term_main')")
+        con.commit()
+        con.close()
+        tsk._spawn(CODE_ROOT / "knowledge-base", "remote/main-route",
+                   {"job_class": "implement", "secrets": "default"}, self._brief())
+        self.assertEqual(FAKE_SPAWN_ENV_CAPTURE.read_text().strip(), "1|w72:p1|term_main")
+
+    def test_explicit_conductor_keeps_precedence_over_main(self):
+        con = sqlite3.connect(REGISTRY)
+        con.execute("INSERT INTO roles(label,pane_id,pane_birth) VALUES ('main','w72:p1','term_main')")
+        con.commit()
+        con.close()
+        os.environ["HERDR_MCP_CONDUCTOR_PANE"] = "w9:p9"
+        os.environ["HERDR_MCP_CONDUCTOR_BIRTH"] = "term_explicit"
+        tsk._spawn(CODE_ROOT / "knowledge-base", "remote/explicit-route",
+                   {"job_class": "implement", "secrets": "default"}, self._brief())
+        self.assertEqual(FAKE_SPAWN_ENV_CAPTURE.read_text().strip(), "1|w9:p9|term_explicit")
+
+    def test_incomplete_main_identity_is_not_forwarded(self):
+        con = sqlite3.connect(REGISTRY)
+        con.execute("INSERT INTO roles(label,pane_id,pane_birth) VALUES ('main','w72:p1','')")
+        con.commit()
+        con.close()
+        tsk._spawn(CODE_ROOT / "knowledge-base", "remote/no-route",
+                   {"job_class": "implement", "secrets": "default"}, self._brief())
+        self.assertEqual(FAKE_SPAWN_ENV_CAPTURE.read_text().strip(), "1||")
 
 
 class CapabilityProbe(unittest.TestCase):
@@ -556,7 +615,7 @@ class ResumeCommand(unittest.TestCase):
         # so it must mark itself, never rely on job_class alone (a LOCAL
         # research/explore spawn shares that job_class and is never swept).
         tsk.process_command(self._cmd(text="one more thing"))
-        self.assertEqual(FAKE_SPAWN_ENV_CAPTURE.read_text().strip(), "1")
+        self.assertEqual(FAKE_SPAWN_ENV_CAPTURE.read_text().strip(), "1||")
 
     def test_resume_crash_before_identity_is_written_looks_up_find_spawned_and_cancels_the_returned_row(self):
         # R3-3/R4-1: a spawn timeout/crash before identity.json is ever

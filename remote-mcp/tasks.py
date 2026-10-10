@@ -268,6 +268,47 @@ def _find_repo_root(repo: str) -> Path | None:
     return root if (root / ".git").exists() else None
 
 
+def _main_role_conductor() -> tuple[str, str] | None:
+    """Return Main's durable pane identity for spawn-task to revalidate."""
+    if not REGISTRY.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{REGISTRY}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        if not con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='roles'"
+        ).fetchone():
+            return None
+        row = con.execute(
+            "SELECT pane_id, pane_birth FROM roles WHERE label='main'"
+        ).fetchone()
+    except sqlite3.Error:
+        # Routing enrichment must not turn a readable-but-old/damaged role
+        # registry into a remote-spawn outage. The unchanged safe fallback is
+        # conductor_unknown; spawn-task still registers and reports it.
+        return None
+    finally:
+        con.close()
+    # A bare pane id is recyclable. Only forward the complete identity;
+    # spawn-task.sh remains responsible for live/birth/worker validation.
+    if not row or not row[0] or not row[1]:
+        return None
+    return str(row[0]), str(row[1])
+
+
+def _remote_spawn_env() -> dict[str, str]:
+    """Build remote spawn env, preserving an explicit conductor's priority."""
+    env = {**os.environ, "HERDR_MCP_REMOTE_SPAWN": "1"}
+    if env.get("HERDR_MCP_CONDUCTOR_PANE"):
+        return env
+    candidate = _main_role_conductor()
+    if candidate:
+        env["HERDR_MCP_CONDUCTOR_PANE"], env["HERDR_MCP_CONDUCTOR_BIRTH"] = candidate
+    return env
+
+
 # ── capability probe (SPEC item 2: "a real probe ... in its events") ───────────
 def _capability_probe(repo: str, secrets_granted: bool) -> dict:
     probe = {"secrets_granted": secrets_granted}
@@ -411,7 +452,7 @@ def _spawn(root: Path, branch: str, mcfg: dict, brief: Path) -> subprocess.Compl
     # remote_task_id and nothing ever calls sweep() over it. Mark this
     # spawn as remote-orchestrated; spawn-task.sh gates orchestrator_closes
     # on exactly this env var, never on job_class alone.
-    env = {**os.environ, "HERDR_MCP_REMOTE_SPAWN": "1"}
+    env = _remote_spawn_env()
     try:
         # Comfortably inside the Worker's 90s command lease (publisher.py's
         # COMMAND_LEASE_LOCAL_S budgets 60s to even START this call): spawning
