@@ -40,6 +40,26 @@ Latest parent observation: Main refuses the recap commit/push because its origin
 
 Subsequent parent reviewer finding is also incorporated: assigning Main as supervisor can be logged as apparent manifest approval even without a Main decision; simple ownership fast paths do not check original approval provenance. The proposed first slice now includes separation of requester/source/supervisor, pre-execution task-bound provenance and identical unknown-provenance holds on simple/compound commands. Merely adding handover guidance is insufficient. No exact-plan acceptance has yet been received.
 
+Supplemental independent exact-plan review of `290c1f5` returned ITERATE with two HIGH findings: the provenance hold must also cover reviewed menu conductor, hook decision and approved one-shot consumption; minimum mixed-version admission cannot be deferred while issuing provenance-bearing legacy commands. Both corrections are now explicit in the plan. This review did not run tests or authorize implementation/activation; parent exact-plan acceptance remains pending.
+
+## Follow-up baseline diagnosis (same unchanged production source)
+
+`ps -o ppid= -p $$` returned exit 127 with `zsh:1: operation not permitted: ps`. `lib/pane-guard.sh:185` requires that process-ancestry read. The handover CLI's 25 failures follow its identity-check exit 3 and the resulting unchanged fixture state; raw registry CAS cases passed. No fallback identity or fake `ps` was introduced.
+
+The remote task error is the fixture's `HTTPServer(("127.0.0.1", 0), Health)` bind at `remote-mcp/verify-tasks.py:317`; no live service is involved. It was not retried outside the sandbox or silently skipped.
+
+The isolated worktree lacked its ignored `.venv-bashlex` interpreter, while the existing shared checkout already has it installed. A worktree-local symlink now reuses that dependency read-only. With `XDG_RUNTIME_DIR` pointed to a task-local test directory (no HOME/HERDR_ENV change), the same diagnostic returned cleanly:
+
+```text
+add peer_rc=0 verdict=allow authority=grant
+status peer_rc=0 verdict=allow authority=peer
+commit peer_rc=0 verdict=allow authority=grant
+compound peer_rc=1 verdict=escalate authority=peer
+quoted_cd peer_rc=1 verdict=escalate authority=peer
+```
+
+Both escalation reasons are `find/git combined with substitution, redirect or quoting: a conductor must review it`. Exact output: [reproduction-dependencies-restored.txt](evidence/dot-control/reproduction-dependencies-restored.txt). These command strings were classified only, never executed. This proves the grammar difference while preserving the unknown-provenance problem; it does not approve splitting a held real command. No production code changes yet.
+
 ## Interruption accounting
 
 No live canary ran. Workflow owner-relay count: **not measured**. Historical owner interruption count: **unknown**. No zero-relay success claim is made.
