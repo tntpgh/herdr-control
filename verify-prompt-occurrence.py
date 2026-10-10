@@ -227,6 +227,19 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(rec["lifecycle"], "approved_awaiting_completion")
         self.assertNotEqual(rec["lifecycle"], "resolved")
 
+    def test_unrecognized_choice_never_folds_as_approved(self):
+        """H1 residual (Main review, dc6a55d): record_authorized's `choice`
+        must be an explicit allowlist, not 'everything that is not a deny'.
+        A blank choice, or a value nobody recognizes, must leave the
+        occurrence exactly where it was -- never approved by default."""
+        for choice in ("", "   ", "maybe", "later", "unknown-value"):
+            db = _fresh_db()
+            po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
+            po.record_authorized(db, **IDENT, decided_by="conductor", choice=choice)
+            rec = po.occurrence_state(db, **IDENT)
+            self.assertEqual(rec["lifecycle"], "requested", f"choice={choice!r} must not authorize")
+            self.assertNotEqual(rec["authorization"], "approved", f"choice={choice!r} must not authorize")
+
     def test_matching_completion_resolves(self):
         db = _fresh_db()
         po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")

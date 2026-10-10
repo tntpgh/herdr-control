@@ -89,6 +89,12 @@ LIFECYCLE_BY_RESOLUTION = {
 # (H1, 2026-10-10): "record_authorized stores `choice` but fold sets
 # authorization=approved for EVERY prompt_occ_authorized."
 DENY_CHOICES = {"deny", "denied", "decline", "declined", "reject", "rejected", "no"}
+# H1 residual (Main review, dc6a55d): an explicit allowlist, not "everything
+# that is not a deny" — a blank choice, an unrecognized value, or a typo'd
+# future caller must never silently fold as approved. Anything outside both
+# sets leaves the occurrence's lifecycle untouched (still `requested`),
+# exactly as if the authorized event had not landed at all.
+APPROVE_CHOICES = {"approve", "approved", "yes", "allow", "allowed", "accept", "accepted"}
 
 
 def occurrence_key(run_id: str, task_id: str, pane_id: str, pane_birth: str,
@@ -380,9 +386,13 @@ def fold_task(db_path: str, run_id: str, task_id: str, readonly: bool = True) ->
                     # directly, whichever path recorded it — it must never
                     # read as approval.
                     rec["lifecycle"] = "resolved:declined"
-                else:
+                elif choice in APPROVE_CHOICES:
                     rec["authorization"] = "approved"
                     rec["lifecycle"] = "approved_awaiting_completion"
+                # else: an unrecognized or blank choice (H1 residual, Main
+                # review dc6a55d) decides nothing — the occurrence stays
+                # exactly where it was (normally `requested`), never folded
+                # as approved by default.
         elif typ in RESOLVED_TYPES:
             # Sticky: the FIRST resolution wins; a duplicate/out-of-order
             # resolution event for an already-resolved key is audit only.
