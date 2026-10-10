@@ -80,6 +80,14 @@ for payload in 'not-json' '{}' '{"panes":{}}' '{"panes":[{}]}' \
 done
 PANES_PAYLOAD="$valid_panes $valid_panes"
 expect_unknown 'multiple JSON pane inventories'
+for payload in '{"panes":[{"pane_id":"fixture:p1\n"}]}' \
+  '{"panes":[{"pane_id":"fixture:p\u00001"}]}' \
+  '{"panes":[{"pane_id":"*"}]}'; do
+  PANES_PAYLOAD="$payload" INFO_PAYLOAD="$matching"
+  expect_unknown "malformed identifier cannot normalize to matching caller: $payload"
+  INFO_PAYLOAD='{"result":{"process_info":{"foreground_processes":[]}}}'
+  expect_unknown "malformed identifier cannot prove outside caller: $payload"
+done
 PANES_PAYLOAD="$valid_panes" LIST_FAILURE=1
 expect_unknown 'pane inventory unavailable'
 LIST_FAILURE=0

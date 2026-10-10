@@ -210,7 +210,7 @@ caller_pane_from_ancestry() {
     | (.result.panes // .panes)
     | if type == "array" and all(.[];
         type == "object" and (.pane_id | type == "string")
-        and (.pane_id | test("^[^[:space:]]+$")))
+        and (.pane_id | test("\\A[A-Za-z0-9:_-]+\\z")))
       then .[].pane_id else error("invalid pane inventory") end' 2>/dev/null)" || return 1
   [ -n "$pane_ids" ] || return 1
   map=""
