@@ -1,0 +1,20 @@
+add ownership_rc=0 grant=git add in /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control (own worktree, local-only)
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 4892: /Users/thurbs/.herdr/command-policy-bashlex.log: Operation not permitted
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.61166.reason: Operation not permitted
+add peer_rc=0 verdict=allow authority=grant reason=ownership grant: git add in /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control (own worktree, local-only)
+status ownership_rc=1 grant=none
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 4892: /Users/thurbs/.herdr/command-policy-bashlex.log: Operation not permitted
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.61166.reason: Operation not permitted
+status peer_rc=1 verdict=escalate authority=peer reason=
+commit ownership_rc=0 grant=git commit in /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control (own worktree, local-only)
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 4892: /Users/thurbs/.herdr/command-policy-bashlex.log: Operation not permitted
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.61166.reason: Operation not permitted
+commit peer_rc=0 verdict=allow authority=grant reason=ownership grant: git commit in /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control (own worktree, local-only)
+compound ownership_rc=1 grant=none
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 4892: /Users/thurbs/.herdr/command-policy-bashlex.log: Operation not permitted
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.61166.reason: Operation not permitted
+compound peer_rc=1 verdict=escalate authority=peer reason=
+quoted_cd ownership_rc=1 grant=none
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 4892: /Users/thurbs/.herdr/command-policy-bashlex.log: Operation not permitted
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.61166.reason: Operation not permitted
+quoted_cd peer_rc=1 verdict=escalate authority=peer reason=
