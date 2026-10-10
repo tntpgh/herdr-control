@@ -8,6 +8,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/herdr-identity.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 export HERDR_RUN_STATE_DIR="$work/runs" XDG_RUNTIME_DIR="$work/runtime"
 export INFO_PAYLOAD PANES_PAYLOAD INFO_FAILURE=0 LIST_FAILURE=0 SECOND_INFO=''
+export RAW_PANES=0 RAW_INFO=0
 passed=0 failed=0
 expect_identity() {
   local label="$1" expected="$2" wanted="${3:-}" result rc
@@ -23,10 +24,15 @@ expect_identity() {
 expect_unknown() { expect_identity "$1" 1; }
 herdr() {
   case "$1 $2" in
-    'pane list') [ "$LIST_FAILURE" = 0 ] || return 1; printf '%s' "$PANES_PAYLOAD" ;;
+    'pane list')
+      [ "$LIST_FAILURE" != 1 ] || return 1
+      if [ "$RAW_PANES" = 1 ]; then printf '%b' "$PANES_PAYLOAD"; else printf '%s' "$PANES_PAYLOAD"; fi
+      [ "$LIST_FAILURE" = 0 ] ;;
     'pane process-info')
-      [ "$INFO_FAILURE" = 0 ] || return 1
-      if [ "${4:-}" = fixture:p2 ]; then printf '%s' "$SECOND_INFO"; else printf '%s' "$INFO_PAYLOAD"; fi ;;
+      [ "$INFO_FAILURE" != 1 ] || return 1
+      if [ "${4:-}" = fixture:p2 ]; then printf '%s' "$SECOND_INFO"
+      elif [ "$RAW_INFO" = 1 ]; then printf '%b' "$INFO_PAYLOAD"; else printf '%s' "$INFO_PAYLOAD"; fi
+      [ "$INFO_FAILURE" = 0 ] ;;
     *) return 99 ;;
   esac
 }
@@ -88,6 +94,30 @@ for payload in '{"panes":[{"pane_id":"fixture:p1\n"}]}' \
   INFO_PAYLOAD='{"result":{"process_info":{"foreground_processes":[]}}}'
   expect_unknown "malformed identifier cannot prove outside caller: $payload"
 done
+# Emit raw NUL bytes from the transport fixture itself: shell variables and
+# escaped JSON strings cannot reproduce Bash's lossy pre-validation capture.
+RAW_PANES=1
+for payload in '{"panes":[{"pane_id":"fixture:p\0001"}]}' \
+  '\000{"panes":[{"pane_id":"fixture:p1"}]}' \
+  '{"panes":[{"pane_id":"fixture:p1"}]}\000'; do
+  PANES_PAYLOAD="$payload" INFO_PAYLOAD="$matching"
+  expect_unknown 'raw NUL pane transport cannot normalize to matching caller'
+  INFO_PAYLOAD='{"result":{"process_info":{"foreground_processes":[]}}}'
+  expect_unknown 'raw NUL pane transport cannot prove outside caller'
+done
+RAW_PANES=0 PANES_PAYLOAD="$valid_panes" RAW_INFO=1
+for payload in '{"result":{"process_info":{"foreground_pro\000cesses":[]}}}' \
+  '{"result":{"process_info":{"foreground_processes":[]}}}\000' \
+  '\000{"result":{"process_info":{"foreground_processes":[]}}}'; do
+  INFO_PAYLOAD="$payload"
+  expect_unknown 'raw NUL process transport cannot prove outside caller'
+done
+INFO_PAYLOAD="${matching/foreground_processes/foreground_pro\\000cesses}"
+expect_unknown 'raw NUL process transport cannot normalize to matching caller'
+RAW_INFO=0 INFO_PAYLOAD="$matching" INFO_FAILURE=2
+expect_unknown 'valid process JSON followed by producer failure'
+INFO_FAILURE=0 LIST_FAILURE=2
+expect_unknown 'valid pane JSON followed by producer failure'
 PANES_PAYLOAD="$valid_panes" LIST_FAILURE=1
 expect_unknown 'pane inventory unavailable'
 LIST_FAILURE=0
@@ -108,6 +138,23 @@ for payload in 'not-json' '{}'; do
     passed=$((passed+1))
   else
     printf 'FAIL force consumer: expected caller refusal, got rc=%s %s\n' "$rc" "$out" >&2
+    failed=$((failed+1))
+  fi
+done
+for transport in pane process; do
+  RAW_PANES=0 RAW_INFO=0 PANES_PAYLOAD="$valid_panes"
+  INFO_PAYLOAD='{"result":{"process_info":{"foreground_processes":[]}}}'
+  if [ "$transport" = pane ]; then
+    RAW_PANES=1 PANES_PAYLOAD='{"panes":[{"pane_id":"fixture:p\0001"}]}'
+  else
+    RAW_INFO=1 INFO_PAYLOAD='{"result":{"process_info":{"foreground_pro\000cesses":[]}}}'
+  fi
+  out="$(bash "$here/designate-main.sh" --force fixture:p1 --reason fixture 2>&1)"; rc=$?
+  if [ "$rc" = 3 ] && printf '%s' "$out" | grep -q -- '--force is only for a shell outside herdr'; then
+    printf 'PASS force consumer refuses raw NUL %s transport at caller gate\n' "$transport"
+    passed=$((passed+1))
+  else
+    printf 'FAIL raw NUL force consumer: expected caller refusal, got rc=%s %s\n' "$rc" "$out" >&2
     failed=$((failed+1))
   fi
 done

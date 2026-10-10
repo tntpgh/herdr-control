@@ -202,11 +202,12 @@ _pg_process_ancestors() {   # -> $PPID, its parent, ... one pid per line
 #            the only rc designate-main.sh's --force may treat as "outside
 #            herdr's reach" (see note above).
 caller_pane_from_ancestry() {
-  local panes pane_ids p info rows map ancestors pid found
-  panes="$(herdr pane list 2>/dev/null)" || return 1
-  [ -n "$panes" ] || return 1
-  pane_ids="$(printf '%s' "$panes" | jq -sr '
-    if length != 1 then error("expected one pane inventory") else .[0] end
+  local pane_ids p rows map ancestors pid found
+  # Parse raw transport bytes before Bash can discard NULs. Raw slurp plus
+  # fromjson validates one complete document, including trailing raw bytes.
+  # Scoped pipefail preserves a producer error even after valid JSON output.
+  pane_ids="$(set -o pipefail; herdr pane list 2>/dev/null | jq -Rsr '
+    fromjson
     | (.result.panes // .panes)
     | if type == "array" and all(.[];
         type == "object" and (.pane_id | type == "string")
@@ -215,12 +216,11 @@ caller_pane_from_ancestry() {
   [ -n "$pane_ids" ] || return 1
   map=""
   for p in $pane_ids; do
-    info="$(herdr pane process-info --pane "$p" 2>/dev/null)" || return 1
     # A missing/malformed response is unknown identity, not a clean no-match.
     # Validate the whole array before emitting any row and preserve jq failure;
     # rc=2 is a security-sensitive proof consumed by designate-main --force.
-    rows="$(printf '%s' "$info" | jq -sr --arg pane "$p" '
-      if length != 1 then error("expected one process response") else .[0] end
+    rows="$(set -o pipefail; herdr pane process-info --pane "$p" 2>/dev/null | jq -Rsr --arg pane "$p" '
+      fromjson
       | .result.process_info.foreground_processes
       | if type == "array" and all(.[];
           type == "object" and (.pid | type == "number")
