@@ -195,7 +195,9 @@ _pg_process_ancestors() {   # -> $PPID, its parent, ... one pid per line
 # point coercion. jq accepts non-JSON numbers and replaces invalid UTF-8; those
 # tolerances cannot establish the security-sensitive outside-caller result.
 _pg_identity_rows() {
-  python3 -c '
+  # Ignore repository/PYTHONPATH imports and site startup hooks: worker CWD
+  # contents must not replace the standard-library identity parser.
+  python3 -I -S -c '
 import json, re, sys
 from decimal import Decimal
 
@@ -269,7 +271,7 @@ $rows"
   [ -n "$ancestors" ] || return 1
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
-    found="$(printf '%s' "$map" | awk -v want="$pid" '$1==want {print $2; exit}')"
+    found="$(printf '%s' "$map" | awk -v want="$pid" '$1==want {print $2; exit}')" || return 1
     if [ -n "$found" ]; then printf '%s\n' "$found"; return 0; fi
   done <<EOF
 $ancestors

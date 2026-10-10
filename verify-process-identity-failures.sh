@@ -53,6 +53,31 @@ ps() { printf '1\n'; }
 export -f ps
 
 expect_identity 'complete matching process inventory' 0 fixture:p1
+awk() { return 1; }
+expect_unknown 'process map lookup unavailable'
+unset -f awk
+
+# Worker-controlled CWD/PYTHONPATH must not supply parser modules or startup
+# hooks. This fake decoder would convert missing process data into rc=2.
+mkdir -p "$work/import-shadow"
+cat > "$work/import-shadow/json.py" <<'PY'
+def loads(raw, **kwargs):
+    if 'pane_id' in raw:
+        return {'panes': [{'pane_id': 'fixture:p1'}]}
+    return {'result': {'process_info': {'foreground_processes': []}}}
+PY
+saved_dir="$PWD"
+cd "$work/import-shadow"
+expect_identity 'repository json module cannot replace stdlib for matching caller' 0 fixture:p1
+INFO_PAYLOAD='{}'
+expect_unknown 'repository json module cannot forge complete no-match'
+cd "$saved_dir"
+saved_pythonpath="${PYTHONPATH-}" pythonpath_was_set="${PYTHONPATH+x}"
+export PYTHONPATH="$work/import-shadow"
+expect_unknown 'PYTHONPATH json module cannot forge complete no-match'
+INFO_PAYLOAD="$matching"
+expect_identity 'PYTHONPATH does not break valid matching identity' 0 fixture:p1
+if [ "$pythonpath_was_set" = x ]; then export PYTHONPATH="$saved_pythonpath"; else unset PYTHONPATH; fi
 for payload in 'not-json' '{}' '' 'null' '[]' '{"result":{}}' \
   '{"result":{"process_info":{}}}' \
   '{"result":{"process_info":{"foreground_processes":null}}}' \
