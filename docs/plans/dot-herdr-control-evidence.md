@@ -1,5 +1,7 @@
 # Evidence for the dot → Herdr plan
 
+Follow-up priority and exact identity candidate: [identity evidence](dot-herdr-identity-evidence.md) and [bounded recovery scopes](dot-herdr-recovery-slices.md). These supersede older broad prerequisite wording: full M2/global nonremote admission are conditional follow-ons; the immediate path is identity repair, menu/watchdog recovery, minimal durable receipt-to-ack recovery and an explicitly permitted isolated canary. The M1 history below remains an immutable account of its earlier reviews.
+
 Baseline: `4f071ad0454bb5fcb1d835872bd6705064207c3f`. Date: 2026-10-10 UTC.
 This records planning and inactive implementation verification. It is not live canary acceptance.
 

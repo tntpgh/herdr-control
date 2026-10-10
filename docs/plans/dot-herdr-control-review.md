@@ -1,5 +1,7 @@
 # Independent review record: dot → Herdr M1
 
+Follow-up priority and exact identity candidate: [identity evidence](dot-herdr-identity-evidence.md) and [bounded recovery scopes](dot-herdr-recovery-slices.md). These supersede older broad prerequisite wording: full M2/global nonremote admission are conditional follow-ons; the immediate path is identity repair, menu/watchdog recovery, minimal durable receipt-to-ack recovery and an explicitly permitted isolated canary. The M1 history below remains an immutable account of its earlier reviews.
+
 Latest result: **security CLEAR + architecture CLEAR** for bounded inactive M1 at `37a3dff28d4402eb5b509e7f59c72c43f0c6cbf6`; zero unresolved high-confidence HIGH/CRITICAL findings. Full activation/release acceptance remains open. Earlier rejected candidates are retained below.
 
 Plan approval: parent-supplied independent GO at `212033cdc389283d8edd40c68af96b5229e424d8`, bounded inactive M1 only. Architecture advice previously came from the parent's Astra ultra review. This record does not approve deployment, a live action or full release acceptance.

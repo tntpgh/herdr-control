@@ -1,5 +1,7 @@
 # Dot → Herdr: preserve task authority without turning messages into approvals
 
+Follow-up priority and exact identity candidate: [identity evidence](dot-herdr-identity-evidence.md) and [bounded recovery scopes](dot-herdr-recovery-slices.md). These supersede older broad prerequisite wording: full M2/global nonremote admission are conditional follow-ons; the immediate path is identity repair, menu/watchdog recovery, minimal durable receipt-to-ack recovery and an explicitly permitted isolated canary. The M1 history below remains an immutable account of its earlier reviews.
+
 Status: bounded inactive M1 implemented at `37a3dff28d4402eb5b509e7f59c72c43f0c6cbf6` after independent plan GO at `212033cdc389283d8edd40c68af96b5229e424d8`. Final security and architecture reviews are CLEAR for this bounded inactive code; full release/canary acceptance remains open. This document does not authorize activation or a live approval.
 Date: 2026-10-10 UTC. Baseline: `4f071ad0454bb5fcb1d835872bd6705064207c3f` (deployed PR272).
 Branch: `fix/dot-control-authorization`. Worktree: `/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control`.
