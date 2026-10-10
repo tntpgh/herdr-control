@@ -38,6 +38,8 @@ Parent reports an independent Astra ultra architecture review completed, with ex
 
 Latest parent observation: Main refuses the recap commit/push because its original manifest approval was `conductor_unknown` with no pane identity. The refusal is preserved. This task did not inspect the live approval prompt or issue an approval. The two defects are grammar recognition and missing verified original provenance; neither is a lost database manifest.
 
+Subsequent parent reviewer finding is also incorporated: assigning Main as supervisor can be logged as apparent manifest approval even without a Main decision; simple ownership fast paths do not check original approval provenance. The proposed first slice now includes separation of requester/source/supervisor, pre-execution task-bound provenance and identical unknown-provenance holds on simple/compound commands. Merely adding handover guidance is insufficient. No exact-plan acceptance has yet been received.
+
 ## Interruption accounting
 
 No live canary ran. Workflow owner-relay count: **not measured**. Historical owner interruption count: **unknown**. No zero-relay success claim is made.
