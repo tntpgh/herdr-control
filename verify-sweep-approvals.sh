@@ -45,6 +45,7 @@ cat > "$WORK/bin/select" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "SELECT $*" >> "$WORK/calls"
 [ -n "${SELECT_CLIPPED:-}" ] && { echo "herdr-select: approval arguments are clipped" >&2; exit 8; }
+[ -n "${SELECT_AUTH_HOLD:-}" ] && { echo "herdr-select: authorization hold: source unavailable" >&2; exit 8; }
 [ -n "${SELECT_REFUSE:-}" ] && { echo "herdr-select: the prompt in that pane no longer matches" >&2; exit 6; }
 exit 0
 STUB
@@ -213,12 +214,23 @@ reset; OUT="$(cd "$here" && WORK="$WORK" HERDR_EXTRA_PATH="$WORK/bin" PATH="$WOR
   HERDR_BIN="$WORK/bin/herdr" HERDR_SELECT="$WORK/bin/select" SELECT_CLIPPED=1 \
   FAKE_PROMPTING="$WORK/prompting.txt" FAKE_SHELL="$WORK/shell.txt" bash "$SWEEP" --answer 2>&1)"
 case "$OUT" in
-  *"NEEDS THE WORKER"*"clipped"*) ok "a clipped approval says the WORKER has to re-issue it smaller" ;;
+  *"HELD: herdr-select refused:"*"clipped"*) ok "a clipped approval preserves the selector refusal" ;;
   *) bad "clipped" "$OUT" ;;
 esac
 case "$OUT" in
-  *send-to-agent.sh*) ok "and names the tool for telling it so" ;;
-  *) bad "clipped" "no actionable next step: $OUT" ;;
+  *send-to-agent.sh*|*shorter*) bad "clipped" "suggested reissuing a held action: $OUT" ;;
+  *) ok "does not advise rewording or reissuing the held action" ;;
+esac
+reset; OUT="$(cd "$here" && WORK="$WORK" HERDR_EXTRA_PATH="$WORK/bin" PATH="$WORK/bin:$PATH" \
+  HERDR_BIN="$WORK/bin/herdr" HERDR_SELECT="$WORK/bin/select" SELECT_AUTH_HOLD=1 \
+  FAKE_PROMPTING="$WORK/prompting.txt" FAKE_SHELL="$WORK/shell.txt" bash "$SWEEP" --answer 2>&1)"
+case "$OUT" in
+  *"HELD: herdr-select refused:"*"authorization hold: source unavailable"*) ok "authorization hold keeps its reason despite shared exit 8" ;;
+  *) bad "authorization hold" "$OUT" ;;
+esac
+case "$OUT" in
+  *clipped*|*shorter*|*SENT-KEYS*) bad "authorization hold" "misdiagnosed refusal: $OUT" ;;
+  *) ok "unknown provenance is never reported as clipping or retried" ;;
 esac
 reset; OUT="$(cd "$here" && WORK="$WORK" HERDR_EXTRA_PATH="$WORK/bin" PATH="$WORK/bin:$PATH" \
   HERDR_BIN="$WORK/bin/herdr" HERDR_SELECT="$WORK/bin/select" SELECT_REFUSE=1 \

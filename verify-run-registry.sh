@@ -258,7 +258,15 @@ _valid_proof_ref ".handoffs/PROOF.md#x" "" \
 _valid_proof_ref "https://example.com/pr/1 abc1234" \
   && ok "non-GitHub URL proof unchanged (shape check only)" || bad "non-PR URL refused while gh fails"
 GH_FAIL=0
-if ( unset -f gh; PATH=/usr/bin:/bin; _valid_proof_ref "$pr153 f1579a6" ); then
+# Stub discovery itself: CI may have a real gh in /usr/bin, so trimming PATH
+# neither proves absence nor guarantees this fixture stays off the network.
+if (
+  command() {
+    if [ "${1:-}" = -v ] && [ "${2:-}" = gh ]; then return 1; fi
+    builtin command "$@"
+  }
+  _valid_proof_ref "$pr153 f1579a6"
+); then
   bad "gh NOT INSTALLED let a shipped PR proof through"
 else
   ok "gh absent from PATH -> PR proof not accepted"
@@ -335,8 +343,8 @@ check "branch column exists (#3b ownership grant)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='branch';")" "1"
 check "trunk column exists (#3b ownership grant)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='trunk';")" "1"
-check "schema_version is 8 (v8 adds the owners table for the remote owner inbox)" \
-  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "8"
+check "schema_version is 11 (source authorization receipts remain separate from legacy task rows)" \
+  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "11"
 check "project column exists (project-contract-plan.md #2)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='project';")" "1"
 check "manifest column exists (task-scoped approval)" \

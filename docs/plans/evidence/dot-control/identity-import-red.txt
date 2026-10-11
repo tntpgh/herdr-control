@@ -1,0 +1,77 @@
+PASS ps unavailable with matching partial ancestry: rc=1, expected caller result
+PASS malformed parent pid: rc=1, expected caller result
+PASS cycle or truncated ancestor chain: rc=1, expected caller result
+PASS complete matching process inventory: rc=0, expected caller result
+PASS incomplete or invalid process response: not-json: rc=1, expected caller result
+PASS incomplete or invalid process response: {}: rc=1, expected caller result
+PASS incomplete or invalid process response: <empty>: rc=1, expected caller result
+PASS incomplete or invalid process response: null: rc=1, expected caller result
+PASS incomplete or invalid process response: []: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":null}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":{}}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":null}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":"123"}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":0}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":-1}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":1.5}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":2147483648}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":1e10000}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":1e-10000}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":Infinity}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":NaN}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":true}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":1.0}]}}}: rc=1, expected caller result
+PASS incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[],"foreground_processes":[]}}}: rc=1, expected caller result
+PASS non-JSON plus-prefixed PID cannot identify caller: rc=1, expected caller result
+PASS fractional PID must not round to matching caller: rc=1, expected caller result
+PASS multiple JSON process responses: rc=1, expected caller result
+PASS matching row cannot hide later incomplete process row: rc=1, expected caller result
+PASS process-info unavailable: rc=1, expected caller result
+PASS matching pane cannot hide another unavailable pane inventory: rc=1, expected caller result
+PASS incomplete or invalid pane inventory: not-json: rc=1, expected caller result
+PASS incomplete or invalid pane inventory: {}: rc=1, expected caller result
+PASS incomplete or invalid pane inventory: {"panes":{}}: rc=1, expected caller result
+PASS incomplete or invalid pane inventory: {"panes":[{}]}: rc=1, expected caller result
+PASS incomplete or invalid pane inventory: {"panes":[{"pane_id":""}]}: rc=1, expected caller result
+PASS incomplete or invalid pane inventory: {"panes":[{"pane_id":"fixture p1"}]}: rc=1, expected caller result
+PASS incomplete or invalid pane inventory: {"panes":[{"pane_id":"fixture:p1"},{}]}: rc=1, expected caller result
+PASS multiple JSON pane inventories: rc=1, expected caller result
+PASS malformed identifier cannot normalize to matching caller: {"panes":[{"pane_id":"fixture:p1\n"}]}: rc=1, expected caller result
+PASS malformed identifier cannot prove outside caller: {"panes":[{"pane_id":"fixture:p1\n"}]}: rc=1, expected caller result
+PASS malformed identifier cannot normalize to matching caller: {"panes":[{"pane_id":"fixture:p\u00001"}]}: rc=1, expected caller result
+PASS malformed identifier cannot prove outside caller: {"panes":[{"pane_id":"fixture:p\u00001"}]}: rc=1, expected caller result
+PASS malformed identifier cannot normalize to matching caller: {"panes":[{"pane_id":"*"}]}: rc=1, expected caller result
+PASS malformed identifier cannot prove outside caller: {"panes":[{"pane_id":"*"}]}: rc=1, expected caller result
+PASS malformed raw pane transport cannot normalize to matching caller: rc=1, expected caller result
+PASS malformed raw pane transport cannot prove outside caller: rc=1, expected caller result
+PASS malformed raw pane transport cannot normalize to matching caller: rc=1, expected caller result
+PASS malformed raw pane transport cannot prove outside caller: rc=1, expected caller result
+PASS malformed raw pane transport cannot normalize to matching caller: rc=1, expected caller result
+PASS malformed raw pane transport cannot prove outside caller: rc=1, expected caller result
+PASS malformed raw pane transport cannot normalize to matching caller: rc=1, expected caller result
+PASS malformed raw pane transport cannot prove outside caller: rc=1, expected caller result
+PASS malformed raw process transport cannot prove outside caller: rc=1, expected caller result
+PASS malformed raw process transport cannot prove outside caller: rc=1, expected caller result
+PASS malformed raw process transport cannot prove outside caller: rc=1, expected caller result
+PASS malformed raw process transport cannot prove outside caller: rc=1, expected caller result
+PASS raw NUL process transport cannot normalize to matching caller: rc=1, expected caller result
+PASS valid process JSON followed by producer failure: rc=1, expected caller result
+PASS valid pane JSON followed by producer failure: rc=1, expected caller result
+PASS pane inventory unavailable: rc=1, expected caller result
+PASS complete inventory and ancestry prove legitimate outside-Herdr caller: rc=2, expected caller result
+PASS explicit empty foreground array is a complete no-match: rc=2, expected caller result
+PASS force consumer refuses unavailable identity before target validation
+PASS force consumer refuses unavailable identity before target validation
+PASS force consumer refuses malformed raw pane transport at caller gate
+PASS force consumer refuses malformed raw process transport at caller gate
+PASS force consumer refuses malformed raw pane_utf8 transport at caller gate
+PASS force consumer refuses malformed raw process_utf8 transport at caller gate
+passed=71 failed=5; live designations=0
+FAIL process map lookup unavailable: expected rc=1 result=; got rc=2 result=
+FAIL repository json module cannot replace stdlib for matching caller: expected rc=0 result=fixture:p1; got rc=2 result=
+FAIL repository json module cannot forge complete no-match: expected rc=1 result=; got rc=2 result=
+FAIL PYTHONPATH json module cannot forge complete no-match: expected rc=1 result=; got rc=2 result=
+FAIL PYTHONPATH does not break valid matching identity: expected rc=0 result=fixture:p1; got rc=2 result=

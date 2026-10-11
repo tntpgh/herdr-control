@@ -3,7 +3,7 @@
 Called from publisher.py each tick:
   * capabilities_snapshot() -> pushed as snapshot.task_config (list_capabilities'
     source of truth, and the Worker's own pre-validation cache).
-  * process_commands(commands) -> turns the Worker's leased `start`/`cancel`/
+  * process_command(command, authorization=verified) -> turns a leased `start`/`cancel`/
     `resume` commands into spawn-task.sh / registry-bridge.sh / close-done-
     workers.sh calls, and returns the command_acks to report back.
   * sweep(tasks_by_id, now) -> three backstops that do not wait for a client
@@ -44,6 +44,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sanitize import clean, read_single_link_regular
+from authorization import AuthorizationError, VerifiedAuthorization, canonical_json
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -151,7 +152,8 @@ def capabilities_snapshot() -> dict:
     and what the Worker pre-validates a start_task call against."""
     a = load_allowlist()
     modes = {m: {k: cfg[k] for k in MODE_FIELDS} for m, cfg in a["modes"].items()}
-    return {"mac_enabled": TASKS_ON_MAC, "repos": a["repos"], "modes": modes, "caps": a["caps"]}
+    return {"authorization_protocol": 1, "mac_enabled": TASKS_ON_MAC,
+            "repos": a["repos"], "modes": modes, "caps": a["caps"]}
 
 
 # ── registry: read-only (writes go through registry-bridge.sh) ─────────────────
@@ -301,6 +303,9 @@ def _main_role_conductor() -> tuple[str, str] | None:
 def _remote_spawn_env() -> dict[str, str]:
     """Build remote spawn env, preserving an explicit conductor's priority."""
     env = {**os.environ, "HERDR_MCP_REMOTE_SPAWN": "1"}
+    # Publisher authentication is never a worker capability. The worker gets
+    # only its protected receipt identifier, not the transport signing key.
+    env.pop("HERDR_MCP_INGEST_KEY", None)
     if env.get("HERDR_MCP_CONDUCTOR_PANE"):
         return env
     candidate = _main_role_conductor()
@@ -401,29 +406,34 @@ def _write_brief(mode: str, mcfg: dict, objective: str, remote_task_id: str, fol
 
 
 # ── command processors ──────────────────────────────────────────────────────────
-def process_commands(commands: list[dict]) -> list[dict]:
-    return [process_command(c) for c in commands]
-
-
-def process_command(cmd: dict) -> dict:
+def process_command(cmd: dict, *, authorization: VerifiedAuthorization | None = None) -> dict:
     cid, op = cmd.get("command_id", ""), cmd.get("op")
     try:
+        if op in ("start", "resume"):
+            if not TASKS_ON_MAC:
+                return {"command_id": cid, "outcome": "refused", "detail": "task lifecycle is turned off on the Mac (HERDR_MCP_TASKS)"}
+            if not isinstance(authorization, VerifiedAuthorization):
+                raise AuthorizationError("missing verified task authorization")
+            authorization.matches(cmd, load_allowlist())
         if op == "start":
-            return _start(cmd)
+            return _start(cmd, authorization)
         if op == "cancel":
             return _cancel(cmd)
         if op == "resume":
-            return _resume(cmd)
+            return _resume(cmd, authorization)
         return {"command_id": cid, "outcome": "failed", "detail": f"unknown op {op!r}"}
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        # M7: a slow tab/composer boot must never crash the publisher's
-        # whole tick -- that would also drop this command from `processed`,
-        # so the Worker re-leases it every 90s for up to its 15-minute TTL
-        # while this ack (which would have told it to stop) never lands.
-        return {"command_id": cid, "outcome": "failed", "detail": f"{op} crashed or did not finish in time: {exc}"[:300]}
+    except (AuthorizationError, ValueError, KeyError, TypeError) as exc:
+        return {"command_id": cid, "outcome": "refused", "detail": f"authorization/payload refused: {exc}"[:300]}
+    except (subprocess.TimeoutExpired, OSError, sqlite3.Error) as exc:
+        # Preserve uncertainty without crashing the whole publisher tick.
+        # A start/resume hold is nonterminal; its durable receipt blocks a
+        # fresh launch while later acknowledgements can reconcile the result.
+        outcome = "held" if op in ("start", "resume") else "failed"
+        detail = f"outcome_unknown: {op} did not finish; no launch retry: {exc}" if outcome == "held" else f"{op} did not finish: {exc}"
+        return {"command_id": cid, "outcome": outcome, "detail": detail[:300]}
 
 
-def _spawn(root: Path, branch: str, mcfg: dict, brief: Path) -> subprocess.CompletedProcess:
+def _spawn(root: Path, branch: str, mcfg: dict, brief: Path, authorization_command_id: str = "") -> subprocess.CompletedProcess:
     # remote-research-answer-approval (2026-10-02): research/explore -- never
     # `implement` -- get --approval hook, never menu. A menu panel in a
     # narrow herdr pane truncated the write tool's Path:/Content: fields
@@ -444,6 +454,9 @@ def _spawn(root: Path, branch: str, mcfg: dict, brief: Path) -> subprocess.Compl
     approval = "hook" if mcfg["job_class"] in ("research", "explore") else "menu"
     args = [SPAWN_TASK, str(root), branch, mcfg["job_class"], "claude", "--no-focus",
             "--approval", approval, "--brief", str(brief)]
+    if not authorization_command_id:
+        raise AuthorizationError("spawn requires a protected authorization receipt")
+    args += ["--authorization-command-id", authorization_command_id]
     if mcfg["secrets"] == "grant":
         args.append("--secrets")
     # F7 (security review round 2, 2026-10-04): orchestrator_closes must
@@ -623,101 +636,230 @@ def _kill_hard_stop_timer(run_id: str, task_id: str) -> None:
             time.sleep(0.05)
 
 
-def _start(cmd: dict) -> dict:
+def _receipt_matches(row: dict, cmd: dict) -> bool:
+    """Match the protected immutable source, never a worker identity file."""
+    from authorization import payload_sha256
+    try:
+        claims = json.loads(cmd["authorization"]["claims"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (isinstance(row, dict) and row.get("command_id") == cmd["command_id"]
+            and row.get("remote_task_id") == cmd["remote_task_id"]
+            and row.get("payload_sha256") == payload_sha256(cmd["payload"])
+            and row.get("source_repo") == cmd["payload"]["repo"]
+            and row.get("claims") == claims)
+
+
+def _receipt_ack(cmd: dict, row: dict | None, root: Path, branch: str) -> dict:
+    cid = cmd["command_id"]
+    if row is None or row == {}:
+        return {"command_id": cid, "outcome": "held",
+                "detail": "outcome_unknown: protected receipt unavailable; no launch retry"}
+    if not _receipt_matches(row, cmd):
+        return {"command_id": cid, "outcome": "refused", "detail": "authorization receipt source binding mismatch"}
+    status = row.get("status")
+    # Only ever a real positive int over the wire -- never `null`: an older
+    # registry row (or a test fixture with no revision column at all) must
+    # look identical to an older publisher that never sends this field.
+    revision = {"revision": row["revision"]} if isinstance(row.get("revision"), int) and row["revision"] > 0 else {}
+    if status == "accepted" and not any(row.get(k) for k in ("task_id", "run_id", "worktree", "branch", "pane_id", "pane_birth")):
+        return {"command_id": cid, "outcome": "held", **revision,
+                "detail": "outcome_unknown: source accepted, launch not yet bound; no launch retry"}
+    wt = WT_ROOT / root.name / branch
+    if (status not in ("bound", "launch_claimed", "launched")
+            or not all(isinstance(row.get(k), str) and row[k] for k in ("task_id", "run_id", "pane_id", "pane_birth"))
+            or row.get("repo") != str(root) or row.get("worktree") != str(wt) or row.get("branch") != branch
+            or not isinstance(row.get("deadline_at"), str)
+            or _parse_iso(row.get("deadline_at", "")) is None):
+        return {"command_id": cid, "outcome": "refused", "detail": "authorization receipt task binding mismatch"}
+    return {"command_id": cid, "outcome": "accepted" if status == "launched" else "held", **revision,
+            "detail": "already launched (protected receipt)" if status == "launched" else
+                      "outcome_unknown: protected task binding exists, launch unconfirmed; no launch retry",
+            "local_task_id": row["task_id"], "local_run_id": row["run_id"], "branch": branch,
+            "pane_id": row["pane_id"], "agent_id": row["pane_birth"]}
+
+
+def _read_authorization(command_id: str) -> dict | None:
+    try:
+        result = _bridge("read-authorization", command_id)
+        if result.returncode != 0:
+            return None
+        row = json.loads(result.stdout)
+        return row if isinstance(row, dict) else None
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None
+
+
+# ── receipt-to-ack recovery (dot-herdr-recovery-slices.md §3) ────────────────
+# "The protected receipt can reach `launched` before the publisher saves
+# `pending_command_acks`" -- a crash in that exact gap loses the LOCAL json
+# cache entry for an ack that the registry already durably decided. These
+# two functions give publisher.py a way to recover that stayed independent
+# of both the Worker's lease (no `cmd` is required or consulted) and the
+# local JSON cache: the registry row's own `revision`/`acked_revision`
+# counter IS the retained evidence, enumerated and CAS-confirmed through
+# lib/task-authorization.py (via registry-bridge.sh) the same way every
+# other protected-receipt mutation in this file already is. No admission,
+# reservation, brief, spawn or capability-probe call happens here.
+def _ack_from_registry_row(row: dict) -> dict:
+    cid = row.get("command_id", "")
+    status = row.get("status")
+    revision = {"revision": row["revision"]} if isinstance(row.get("revision"), int) and row["revision"] > 0 else {}
+    if status == "accepted" and not any(row.get(k) for k in ("task_id", "run_id", "worktree", "branch", "pane_id", "pane_birth")):
+        return {"command_id": cid, "outcome": "held", **revision,
+                "detail": "outcome_unknown: source accepted, launch not yet bound; no launch retry"}
+    if (status not in ("bound", "launch_claimed", "launched")
+            or not all(isinstance(row.get(k), str) and row[k] for k in ("task_id", "run_id", "pane_id", "pane_birth"))):
+        return {"command_id": cid, "outcome": "held", **revision,
+                "detail": "outcome_unknown: protected task binding unconfirmed; no launch retry"}
+    return {"command_id": cid, "outcome": "accepted" if status == "launched" else "held", **revision,
+            "detail": "already launched (protected receipt)" if status == "launched" else
+                      "outcome_unknown: protected task binding exists, launch unconfirmed; no launch retry",
+            "local_task_id": row["task_id"], "local_run_id": row["run_id"], "branch": row.get("branch", ""),
+            "pane_id": row["pane_id"], "agent_id": row["pane_birth"]}
+
+
+def pending_receipt_acks(limit: int = 200) -> list[dict]:
+    """Enumerate protected receipts whose durable `revision` has not yet
+    been confirmed, bounded to `limit`, independently of any Worker lease
+    or local JSON cache -- a fresh publisher process calls this BEFORE its
+    own sync round so a crash-lost local ack is rebuilt from the registry
+    itself rather than left unsent forever."""
+    result = _bridge("pending-authorization-acks", str(limit))
+    if result.returncode != 0:
+        return []
+    try:
+        rows = json.loads(result.stdout)
+    except ValueError:
+        return []
+    if not isinstance(rows, list):
+        return []
+    return [_ack_from_registry_row(row) for row in rows if isinstance(row, dict) and row.get("command_id")]
+
+
+def confirm_receipt_ack(command_id: str, revision: int) -> dict:
+    """CAS-confirm the EXACT revision a Worker sync result correlated back
+    to this command -- never confirms a stale revision: the registry
+    adapter refuses unless the row's CURRENT revision still equals this
+    one, so an older held response cannot confirm a newer launched
+    revision. Returns {"result": "recorded"|"already_recorded"|"conflict"|
+    "unknown"} (distinguished, never silently treated the same)."""
+    try:
+        result = _bridge("confirm-authorization-ack", command_id, str(revision))
+        return json.loads(result.stdout)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return {"command_id": command_id, "result": "unknown"}
+
+
+def _cleanup_uncertain_spawn(wt: Path, cmd: dict, branch: str, since: str, ack: dict) -> None:
+    try:
+        _cancel_after_spawn_failure(wt, ack.get("local_run_id", ""), ack.get("local_task_id", ""),
+                                    cmd["remote_task_id"], branch, since)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        # A failed cleanup remains a held unknown outcome. No fresh launch is
+        # permitted; later cancellation/deadline reconciliation retains the map.
+        pass
+
+
+def _accept_receipt(cmd: dict, authorization: VerifiedAuthorization, root: Path, branch: str) -> dict | None:
+    deadline = _iso_in(load_allowlist()["caps"]["max_minutes"] * 60)
+    result = _bridge("accept-authorization", canonical_json(cmd), authorization.claims, deadline)
+    if result.returncode != 0:
+        # The write may have completed despite a lost response, or a second
+        # consumer may already be launching. Reconcile before a definitive ack.
+        return _receipt_ack(cmd, _read_authorization(cmd["command_id"]), root, branch)
+    try:
+        row = json.loads(result.stdout)
+    except ValueError:
+        return _receipt_ack(cmd, _read_authorization(cmd["command_id"]), root, branch)
+    if not _receipt_matches(row, cmd):
+        return {"command_id": cmd["command_id"], "outcome": "refused",
+                "detail": "authorization receipt binding mismatch; no worker launched"}
+    if (row.get("newly_accepted") is True and row.get("status") == "accepted"
+            and not any(row.get(k) for k in ("task_id", "run_id", "worktree", "branch", "pane_id", "pane_birth"))):
+        return None
+    # A crash after acceptance, registration or launch claim is ambiguous.
+    # Only a fully recorded launch can be acknowledged; never execute again.
+    return _receipt_ack(cmd, row, root, branch)
+
+
+def _launch_authorized(cmd: dict, authorization: VerifiedAuthorization, root: Path, branch: str, mode: str, mcfg: dict,
+                       objective: str, follow_up: str = "") -> dict:
+    cid, remote_id = cmd["command_id"], cmd["remote_task_id"]
+    caps = load_allowlist()["caps"]
+    wt = WT_ROOT / root.name / branch
+    authorization.matches(cmd, load_allowlist())
+    brief = _write_brief(mode, mcfg, objective, remote_id, follow_up)
+    spawn_since = _now_iso()
+    failure = ""
+    try:
+        proc = _spawn(root, branch, mcfg, brief, cid)
+        if proc.returncode != 0:
+            failure = f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:120]}"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        failure = f"spawn did not finish: {exc}"[:180]
+    row = _read_authorization(cid)
+    ack = _receipt_ack(cmd, row, root, branch)
+    if failure or ack["outcome"] != "accepted":
+        if failure and ack["outcome"] != "refused":
+            ack["outcome"] = "held"
+            ack["detail"] = f"outcome_unknown: {failure}; no launch retry"
+        _cleanup_uncertain_spawn(wt, cmd, branch, spawn_since, ack)
+        return ack
+    run_id, local_task_id = row["run_id"], row["task_id"]
+    # Registration binds remote_task_id AND the original deadline before
+    # execution. Retries must never extend the task's accepted lifetime.
+    if _event_count(local_task_id, "hard_stop_scheduled") == 0:
+        remaining = max(0, int(_parse_iso(row["deadline_at"]) - time.time()))
+        pid = _schedule_hard_stop(run_id, local_task_id, remote_id, remaining + HARD_STOP_GRACE_S)
+        event = "hard_stop_scheduled" if pid is not None else "hard_stop_unscheduled"
+        payload = {"max_minutes": caps["max_minutes"]}
+        if pid is not None:
+            payload.update(pid=pid, grace_s=HARD_STOP_GRACE_S)
+        _bridge("append-event", run_id, local_task_id, event, json.dumps(payload))
+    ack["detail"] = "resumed" if cmd["op"] == "resume" else "spawned"
+    ack["capability_probe"] = _capability_probe(cmd["payload"]["repo"], mcfg["secrets"] == "grant")
+    return ack
+
+
+def _reserve_worktree(cmd: dict, root: Path, branch: str) -> dict | None:
+    wt = WT_ROOT / root.name / branch
+    result = _bridge("reserve-worktree", canonical_json(cmd), str(root), str(wt), branch)
+    if result.returncode != 0:
+        return {"command_id": cmd["command_id"], "outcome": "refused",
+                "detail": "worktree reservation refused: " + result.stderr.strip()[:220]}
+    try:
+        row = json.loads(result.stdout)
+    except ValueError:
+        row = {}
+    if (row.get("command_id") != cmd["command_id"] or row.get("repo") != str(root.resolve())
+            or row.get("worktree") != str(wt.resolve()) or row.get("branch") != branch
+            or row.get("newly_reserved") is not True):
+        return {"command_id": cmd["command_id"], "outcome": "held",
+                "detail": "worktree reservation outcome unknown or already consumed; no mutation retry"}
+    return None
+
+
+def _start(cmd: dict, authorization: VerifiedAuthorization) -> dict:
     cid, remote_id, p = cmd["command_id"], cmd["remote_task_id"], cmd["payload"]
-    repo, mode, objective = p.get("repo", ""), p.get("mode", ""), p.get("objective", "")
-
-    def refuse(detail: str) -> dict:
-        return {"command_id": cid, "outcome": "refused", "detail": detail}
-
-    if not TASKS_ON_MAC:
-        return refuse("task lifecycle is turned off on the Mac (HERDR_MCP_TASKS)")
-    if not REMOTE_TASK_ID_RE.fullmatch(remote_id):
-        return refuse(f"remote_task_id {remote_id!r} has an unexpected shape")
-    a = load_allowlist()
-    if repo not in a["repos"]:
-        return refuse(f"repo {repo!r} is not allow-listed")
-    mcfg = a["modes"].get(mode)
-    if not mcfg:
-        return refuse(f"unknown mode {mode!r}")
+    repo, mode, objective = p["repo"], p["mode"], p.get("objective", "")
     root = _find_repo_root(repo)
     if root is None:
-        return refuse(f"repo {repo!r} has no local checkout under {CODE_ROOT}")
+        return {"command_id": cid, "outcome": "refused", "detail": f"repo {repo!r} has no local checkout under {CODE_ROOT}"}
+    branch = f"remote/{remote_id.rsplit('_', 1)[-1]}"
+    prior = _accept_receipt(cmd, authorization, root, branch)
+    if prior is not None:
+        return prior
+    a = load_allowlist()
     caps = a["caps"]
     if _count_remote("state IN ('starting','running','blocked')") >= caps["max_concurrent"]:
-        return refuse(f"too_many_concurrent on the Mac (max {caps['max_concurrent']})")
+        return {"command_id": cid, "outcome": "refused", "detail": f"too_many_concurrent on the Mac (max {caps['max_concurrent']})"}
     if _count_remote("created_at > ?", (_iso_in(-86400),)) >= caps["max_per_day"]:
-        return refuse(f"too_many_today on the Mac (max {caps['max_per_day']}/day)")
-
-    branch = f"remote/{remote_id.rsplit('_', 1)[-1]}"
-    wt = WT_ROOT / root.name / branch
-    identity = _read_identity(wt)
-    if identity:
-        # M7: the Worker re-leases a start it never got an ack for every 90s
-        # for up to a 15-minute TTL. A previous attempt for this exact
-        # remote_task_id may already have registered a worktree/pane (slow
-        # composer boot, not a real failure) -- adopt it instead of spawning
-        # a second tab, which would escape the Mac's own concurrency cap.
-        run_id, local_task_id = identity["run_id"], identity["task_id"]
-    else:
-        brief = _write_brief(mode, mcfg, objective, remote_id)
-        spawn_since = _now_iso()
-        try:
-            proc = _spawn(root, branch, mcfg, brief)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            _cancel_after_spawn_failure(wt, expected_remote_id=remote_id, branch=branch, since=spawn_since)
-            return {"command_id": cid, "outcome": "failed",
-                    "detail": f"spawn-task.sh crashed or did not finish in time: {exc}"[:300]}
-        if proc.returncode != 0:
-            return {"command_id": cid, "outcome": "failed",
-                    "detail": f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:200]}"}
-        identity = _read_identity(wt)
-        if not identity:
-            _cancel_after_spawn_failure(wt, expected_remote_id=remote_id, branch=branch, since=spawn_since)
-            return {"command_id": cid, "outcome": "failed", "detail": "spawned, but identity.json was unreadable"}
-        run_id, local_task_id = identity["run_id"], identity["task_id"]
-    stamped = _bridge("set-remote-id", run_id, local_task_id, remote_id)
-    if stamped.returncode != 0:
-        _cancel_after_spawn_failure(wt, run_id, local_task_id, remote_id)
-        return {"command_id": cid, "outcome": "failed",
-                "detail": "spawned, but could not stamp remote_task_id onto the registry row",
-                "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
-    row = json.loads(stamped.stdout) if stamped.stdout.strip() else {}
-    deadlined = _bridge("set-deadline", run_id, local_task_id, _iso_in(caps["max_minutes"] * 60))
-    if deadlined.returncode != 0:
-        _cancel_after_spawn_failure(wt, run_id, local_task_id, remote_id)
-        return {"command_id": cid, "outcome": "failed",
-                "detail": "spawned, but could not set the deadline that is the only backstop on a runaway task",
-                "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
-    # REVIEW-213 F9: identity found via the M7-adopt branch above means
-    # this may be a re-lease retry of a start command already accepted --
-    # up to ~10 of those can arrive for one slow boot. Schedule at most
-    # once per task: a second timer for the same task_id/run_id is a pure
-    # duplicate (both would fire the identical cancel), never a second
-    # independent backstop.
-    if _event_count(local_task_id, "hard_stop_scheduled") == 0:
-        hard_stop_pid = _schedule_hard_stop(run_id, local_task_id, remote_id,
-                                             caps["max_minutes"] * 60 + HARD_STOP_GRACE_S)
-        if hard_stop_pid is not None:
-            _bridge("append-event", run_id, local_task_id, "hard_stop_scheduled",
-                    json.dumps({"pid": hard_stop_pid, "max_minutes": caps["max_minutes"], "grace_s": HARD_STOP_GRACE_S}))
-        else:
-            # ZR4 (ZERO-REVIEW-213-01 item 4): a scheduling failure must
-            # never be silent -- this task now has NO independent
-            # deadline backstop until sweep()'s own retry (same tick
-            # cadence, same backoff/cap as F6) lands one. Never fails the
-            # start itself: the publisher's own sweep deadline check is
-            # still the primary enforcement path, and refusing an
-            # otherwise-good spawn over a transient Popen failure (e.g.
-            # a process-table EAGAIN) would be a worse outcome than a
-            # loud, retried gap.
-            _bridge("append-event", run_id, local_task_id, "hard_stop_unscheduled",
-                    json.dumps({"max_minutes": caps["max_minutes"]}))
-    probe = _capability_probe(repo, mcfg["secrets"] == "grant")
-    return {"command_id": cid, "outcome": "accepted", "detail": "spawned",
-            "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch,
-            "pane_id": row.get("pane_id", ""), "agent_id": row.get("pane_birth", ""),
-            "capability_probe": probe}
+        return {"command_id": cid, "outcome": "refused", "detail": f"too_many_today on the Mac (max {caps['max_per_day']}/day)"}
+    reserved = _reserve_worktree(cmd, root, branch)
+    if reserved is not None:
+        return reserved
+    return _launch_authorized(cmd, authorization, root, branch, mode, authorization.parsed["effective_scope"], objective)
 
 
 def _cancel(cmd: dict) -> dict:
@@ -738,24 +880,16 @@ def _cancel(cmd: dict) -> dict:
     return {"command_id": cid, "outcome": "accepted", "detail": f"cancelled ({reason})"}
 
 
-def _resume(cmd: dict) -> dict:
-    cid, remote_id, p = cmd["command_id"], cmd["remote_task_id"], cmd["payload"]
-    old_run_id, old_local_id = p.get("local_run_id", ""), p.get("local_task_id", "")
-    branch, repo, follow_up = p.get("branch", ""), p.get("repo", ""), p.get("text", "") or ""
+def _resume(cmd: dict, authorization: VerifiedAuthorization) -> dict:
+    cid, p = cmd["command_id"], cmd["payload"]
+    branch, repo, follow_up = p.get("branch", ""), p["repo"], p.get("text", "") or ""
+    mode = authorization.parsed["mode"]
+    a = load_allowlist()
+    mcfg, caps = authorization.parsed["effective_scope"], a["caps"]
 
     def refuse(detail: str) -> dict:
         return {"command_id": cid, "outcome": "refused", "detail": detail}
 
-    if not TASKS_ON_MAC:
-        return refuse("task lifecycle is turned off on the Mac (HERDR_MCP_TASKS)")
-    if not REMOTE_TASK_ID_RE.fullmatch(remote_id):
-        return refuse(f"remote_task_id {remote_id!r} has an unexpected shape")
-    a = load_allowlist()
-    # M3: resume trusts the Worker's own payload.repo/branch to rebuild the
-    # worktree path -- re-check both the same way _start does, since the
-    # allowlist comment calls this copy "actually enforced".
-    if repo not in a["repos"]:
-        return refuse(f"repo {repo!r} is not allow-listed")
     if not re.fullmatch(r"remote/[0-9a-f]{8}", branch):
         return refuse(f"branch {branch!r} is not a remote task branch")
     root = _find_repo_root(repo)
@@ -764,92 +898,31 @@ def _resume(cmd: dict) -> dict:
     wt = WT_ROOT / root.name / branch
     if not wt.is_dir():
         return refuse(f"worktree {wt} no longer exists; nothing to resume into")
-    # F3 (security review round 2, 2026-10-04): resume respawns into the
-    # SAME worktree, and spawn-task.sh deliberately keeps .handoffs/, so a
-    # previous run's ANSWER.md is still sitting there. The first sweep after
-    # this resume would otherwise pass `_verify_research` on that STALE
-    # answer and close the resumed task before the new worker (or the
-    # follow-up note above) ever gets a turn -- there is no boot-time
-    # window where that could be safe. Move it aside now, synchronously,
-    # before the new session starts: no TOCTOU window, no registry/schema
-    # change, and `_verify_research` correctly reports "missing" until the
-    # new run writes its own.
-    stale_answer = wt / ".handoffs/ANSWER.md"
-    if stale_answer.is_file():
-        stale_answer.replace(wt / ".handoffs/ANSWER.prev.md")
-    old_row = _bridge("read", old_run_id, old_local_id)
-    if old_row.returncode != 0 or not old_row.stdout.strip():
-        # H1: the parent row is gone -- pruned past HERDR_TASK_RETENTION_DAYS
-        # (14d) while the Worker still remembers the remote task for 30d, or
-        # it never existed. Never default to implement here: that silently
-        # escalates git from none to push-own-branch, with credentials
-        # granted by default, for a client that only ever consented to
-        # research. No row, no resume.
-        return refuse("original task's registry row is gone; cannot tell what mode it ran in")
-    mode = "implement"
-    try:
-        if json.loads(json.loads(old_row.stdout).get("manifest") or "{}").get("git") == "none":
-            mode = "research"
-    except ValueError:
-        pass
-    mcfg = a["modes"].get(mode, a["modes"]["implement"])
-    caps = a["caps"]
+    old = _bridge("read", p.get("local_run_id", ""), p.get("local_task_id", ""))
+    if old.returncode != 0 or not old.stdout.strip():
+        return refuse("original task's registry row is gone; cannot validate resume binding")
+    old_row = json.loads(old.stdout)
+    if (old_row.get("run_id") != p.get("local_run_id") or old_row.get("task_id") != p.get("local_task_id")
+            or old_row.get("branch") != branch or old_row.get("worktree") != str(wt)
+            or old_row.get("state") not in TERMINAL):
+        return refuse("original task binding or terminal state does not permit resume")
+    old_manifest = json.loads(old_row.get("manifest") or "{}")
+    if old_manifest.get("git") != mcfg["git"]:
+        return refuse("original task mode differs from authenticated resume mode")
+    prior = _accept_receipt(cmd, authorization, root, branch)
+    if prior is not None:
+        return prior
     if _count_remote("state IN ('starting','running','blocked')") >= caps["max_concurrent"]:
         return refuse(f"too_many_concurrent on the Mac (max {caps['max_concurrent']})")
     if _count_remote("created_at > ?", (_iso_in(-86400),)) >= caps["max_per_day"]:
-        # M1: a repeated cancel+resume (or resuming the same terminal parent
-        # while under max_concurrent) must not be a free pass around the
-        # daily cap start_task already enforces.
         return refuse(f"too_many_today on the Mac (max {caps['max_per_day']}/day)")
-
-    brief = _write_brief(mode, mcfg, "(resumed -- see the follow-up note below, if any)", remote_id, follow_up)
-    spawn_since = _now_iso()
-    try:
-        proc = _spawn(root, branch, mcfg, brief)
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        _cancel_after_spawn_failure(wt, expected_remote_id=remote_id, branch=branch, since=spawn_since)
-        return {"command_id": cid, "outcome": "failed",
-                "detail": f"spawn-task.sh crashed or did not finish in time: {exc}"[:300]}
-    if proc.returncode != 0:
-        return {"command_id": cid, "outcome": "failed",
-                "detail": f"spawn-task.sh exit {proc.returncode}: {proc.stderr.strip()[:200]}"}
-    identity = _read_identity(wt)
-    if not identity:
-        _cancel_after_spawn_failure(wt, expected_remote_id=remote_id, branch=branch, since=spawn_since)
-        return {"command_id": cid, "outcome": "failed", "detail": "resumed, but identity.json was unreadable"}
-    run_id, local_task_id = identity["run_id"], identity["task_id"]
-    stamped = _bridge("set-remote-id", run_id, local_task_id, remote_id)
-    if stamped.returncode != 0:
-        _cancel_after_spawn_failure(wt, run_id, local_task_id, remote_id)
-        return {"command_id": cid, "outcome": "failed",
-                "detail": "resumed, but could not stamp remote_task_id onto the registry row",
-                "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
-    row = json.loads(stamped.stdout) if stamped.stdout.strip() else {}
-    deadlined = _bridge("set-deadline", run_id, local_task_id, _iso_in(caps["max_minutes"] * 60))
-    if deadlined.returncode != 0:
-        _cancel_after_spawn_failure(wt, run_id, local_task_id, remote_id)
-        return {"command_id": cid, "outcome": "failed",
-                "detail": "resumed, but could not set the deadline that is the only backstop on a runaway task",
-                "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch}
-    # REVIEW-213 F9/ZR4: _resume always spawns a fresh task_id (unlike
-    # _start's M7-adopt branch), so the dedup check is a no-op today --
-    # kept for symmetry with _start so this stays correct if resume ever
-    # grows its own re-lease-adopt path. The loud-failure-on-schedule-
-    # failure half is not a no-op: see _start's identical comment.
-    if _event_count(local_task_id, "hard_stop_scheduled") == 0:
-        hard_stop_pid = _schedule_hard_stop(run_id, local_task_id, remote_id,
-                                             caps["max_minutes"] * 60 + HARD_STOP_GRACE_S)
-        if hard_stop_pid is not None:
-            _bridge("append-event", run_id, local_task_id, "hard_stop_scheduled",
-                    json.dumps({"pid": hard_stop_pid, "max_minutes": caps["max_minutes"], "grace_s": HARD_STOP_GRACE_S}))
-        else:
-            _bridge("append-event", run_id, local_task_id, "hard_stop_unscheduled",
-                    json.dumps({"max_minutes": caps["max_minutes"]}))
-    probe = _capability_probe(repo, mcfg["secrets"] == "grant")
-    return {"command_id": cid, "outcome": "accepted", "detail": "resumed",
-            "local_task_id": local_task_id, "local_run_id": run_id, "branch": branch,
-            "pane_id": row.get("pane_id", ""), "agent_id": row.get("pane_birth", ""),
-            "capability_probe": probe}
+    reserved = _reserve_worktree(cmd, root, branch)
+    if reserved is not None:
+        return reserved
+    # spawn-task claims this reservation once before ANY worktree write,
+    # including retiring the prior answer. A second command cannot alter it.
+    return _launch_authorized(cmd, authorization, root, branch, mode, mcfg,
+                              "(resumed -- see the follow-up note below, if any)", follow_up)
 
 
 # ── sweep: auto-close, verify, deadline backstop ────────────────────────────────

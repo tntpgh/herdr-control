@@ -10,6 +10,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 export HERDR_RUN_STATE_DIR="$work/runs" HERDR_STATE_ROOT="$work/state"
+export XDG_RUNTIME_DIR="$work/runtime"; mkdir -p "$XDG_RUNTIME_DIR"
 export PANE='w1:p1' BIRTH='gen-1' CPANE='w9:p9' CBIRTH='cgen-1'
 export HERDR_PANE_ID="$PANE" HERDR_RUN_ID='run1' HERDR_TASK_ID='task1'
 wt="$work/worktree"; mkdir -p "$wt/tmp" "$HERDR_STATE_ROOT/forms" "$work/bin"
@@ -35,6 +36,18 @@ id="\$(date -u +%Y%m%dT%H%M%S)-\$RANDOM\$RANDOM"
 jq -nc --arg f "\$1" '{form_path:\$f, status:"open"}' > "$HERDR_STATE_ROOT/forms/\$id.json"
 EOF
 chmod +x "$work/bin/"*
+# Existing action-path fixtures explicitly model the calling pane. Production
+# still reads process ancestry; no authorization verifier is replaced here.
+herdr() {
+  if [ "$1 $2" = 'pane process-info' ]; then
+    local pid=999999
+    [ "${4:-}" != "${HERDR_FIXTURE_CALLER_PANE:-}" ] || pid="$PPID"
+    printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"name":"omp","cmdline":"omp"}]}}}\n' "$pid"
+  else "$HERDR_FIXTURE_HERDR" "$@"; fi
+}
+ps() { printf '1\n'; }
+export HERDR_FIXTURE_HERDR="$work/bin/herdr"
+export -f herdr ps
 export PATH="$work/bin:$PATH"
 export HERDR_EXTRA_PATH="$work/bin:${HERDR_EXTRA_PATH:-/opt/homebrew/bin:/usr/local/bin}"
 export HERDR_ACTION_SEND="$work/bin/send" HERDR_ACTION_NOTIFY="$work/bin/notify"
@@ -42,8 +55,9 @@ export HERDR_ACTION_FORMSERVE="$work/bin/formserve" HERDR_ACTION_PYTHON=bash
 export HERDR_ACTION_NO_SURFACE=1       # surfacing is exercised explicitly below
 
 . "$here/lib/run-registry.sh"
+. "$here/tests/fixtures/task-authorization.sh"
 reg() {                                  # task approval
-  register_task run1 "$1" worker1 cond1 "$CPANE" "$CBIRTH" "$PANE" "$BIRTH" /repo "$wt" "impl:$1" feat/x main "" "" "$2" >/dev/null
+  fixture_register_task run1 "$1" worker1 cond1 "$CPANE" "$CBIRTH" "$PANE" "$BIRTH" /repo "$wt" "impl:$1" feat/x main "" "${3:-}" "$2" >/dev/null || return 1
   set_task_state run1 "$1" running
 }
 reg task1 hook
@@ -57,7 +71,7 @@ enf() {                                  # tool input-json [cwd] -> {decision,re
     | bash "$here/lib/pretool-shadow.sh" --enforce --record
 }
 bashc() { enf bash "$(jq -nc --arg c "$1" --arg i "${2:-run it}" '{command:$c, i:$i}')"; }
-act() { bash "$here/herdr-action.sh" "$@"; }
+act() { HERDR_FIXTURE_CALLER_PANE="${HERDR_PANE_ID:-}" bash "$here/herdr-action.sh" "$@"; }
 
 printf '== registry: the posture is on the row, fixed at registration ==\n'
 [ "$(read_task run1 task1 | field approval)" = hook ] && ok "row carries approval=hook" || not_ok "row approval: $(read_task run1 task1)"
@@ -446,7 +460,7 @@ t1=$(perl -MTime::HiRes=time -e 'printf "%d", time*1000')
 [ $((t1 - t0)) -lt 300 ] && ok "tick with no registry/pending work is cheap ($((t1 - t0))ms)" || not_ok "idle tick took $((t1 - t0))ms"
 
 printf '== withdrawal: a request whose task ended before a decision ==\n'
-register_task run1 taskw worker1 cond1 "$CPANE" "$CBIRTH" 'w1:p7' gen-7 /repo "$wt" impl:taskw feat/w main "" "" hook >/dev/null
+fixture_register_task run1 taskw worker1 cond1 "$CPANE" "$CBIRTH" 'w1:p7' gen-7 /repo "$wt" impl:taskw feat/w main "" "" hook >/dev/null
 set_task_state run1 taskw running; set_task_state run1 taskw completed no-follow-on
 [ "$(read_task run1 taskw | field state)" = completed ] && ok "setup: taskw is completed" || not_ok "setup: taskw state $(read_task run1 taskw | field state)"
 wd=()
@@ -541,11 +555,11 @@ if command -v bun >/dev/null 2>&1; then
   envhook="$(HERDR_TASK_ID=nope HERDR_APPROVAL=hook run_hook "$here")"
   [ "$(printf '%s' "$envhook" | jq -c '[.[]|.r]|unique')" = '["BLOCK"]' ] && ok "HERDR_APPROVAL=hook with no registry row: every call blocked" || not_ok "env-hook no-row: $envhook"
   menu_mine="$(HERDR_TASK_ID=task_m run_hook "$here")"
-  base_dir="$work/base"; git -C "$here" worktree add -q --detach "$base_dir" origin/main 2>/dev/null
+  base_dir="$work/base"; mkdir -p "$base_dir"
+  git -C "$here" archive origin/main | tar -x -C "$base_dir" || exit 1
   menu_base="$(HERDR_TASK_ID=task_m run_hook "$base_dir")"
   nw_mine="$(env -u HERDR_TASK_ID -u HERDR_RUN_ID CASES="$cases" WT="$wt" bash -c 'HOOK="$1/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$1" bun -e "$2"' _ "$here" "$hook_js" 2>/dev/null)"
   nw_base="$(env -u HERDR_TASK_ID -u HERDR_RUN_ID CASES="$cases" WT="$wt" bash -c 'HOOK="$1/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$1" bun -e "$2"' _ "$base_dir" "$hook_js" 2>/dev/null)"
-  git -C "$here" worktree remove --force "$base_dir" 2>/dev/null
   [ -n "$menu_mine" ] && [ "$(printf '%s' "$menu_mine" | jq -c '[.[]|{id,r}]')" = "$(printf '%s' "$menu_base" | jq -c '[.[]|{id,r}]')" ] \
     && ok "menu worker: every return value identical to origin/main ($(printf '%s' "$menu_mine" | jq -c '[.[]|.r]'))" || not_ok "menu differs: $menu_mine vs $menu_base"
   [ -n "$nw_mine" ] && [ "$nw_mine" = "$nw_base" ] && ok "non-worker session: identical to origin/main" || not_ok "non-worker differs: $nw_mine vs $nw_base"
@@ -568,11 +582,12 @@ printf '%s\n' "$*" >> "${HERDR_STUB_LOG:-/dev/null}"
 exit 1
 EOF
 chmod +x "$stubbin/herdr"
-stub_env=(HERDR_EXTRA_PATH="$stubbin:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin")
+stub_env=(HERDR_EXTRA_PATH="$stubbin:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin" HERDR_FIXTURE_HERDR="$stubbin/herdr")
 dry() { local d="$1" lg="$work/herdr-head.log"; shift; [ "$d" = "$here" ] || lg="$work/herdr-base.log"
   env -u HERDR_TASK_ID -u HERDR_RUN_ID HERDR_PANE_ID="$CPANE" "${stub_env[@]}" HERDR_STUB_LOG="$lg" \
     bash "$d/spawn-task.sh" --dry-run --no-secrets "$repo" "$@" 2>&1 | norm | sed "s#$d/#<checkout>/#g"; }
-base_dir="$work/base2"; git -C "$here" worktree add -q --detach "$base_dir" origin/main 2>/dev/null
+base_dir="$work/base2"; mkdir -p "$base_dir"
+git -C "$here" archive origin/main | tar -x -C "$base_dir" || exit 1
 # The job-class tool set (lib/agent-profiles.sh tools_for_job, pinned by
 # verify-posture.sh) changes the launch line on purpose; what THIS check
 # guards is that --approval adds nothing. Strip `--tools <list>` from both
@@ -581,7 +596,6 @@ a="$(dry "$here" fix/x implement omp | sed -E 's/ --tools [^ ]+//')"; b="$(dry "
 [ -n "$a" ] && [ "$a" = "$b" ] && ok "default spawn --dry-run is byte-identical to origin/main" || { not_ok "default dry-run differs"; diff <(printf '%s\n' "$b") <(printf '%s\n' "$a") | head; }
 a="$(dry "$here" fix/x implement claude --approval menu | sed -E 's/ --tools [^ ]+//')"; b="$(dry "$base_dir" fix/x implement claude | sed -E 's/ --tools [^ ]+//')"
 [ "$a" = "$b" ] && ok "explicit --approval menu is byte-identical to origin/main's default" || not_ok "--approval menu differs"
-git -C "$here" worktree remove --force "$base_dir" 2>/dev/null
 export HERDR_OMP_EXTENSION="$here/agent-hooks/omp-herdr-control.ts"
 h="$(dry "$here" fix/x implement omp --approval hook)"
 launch="$(printf '%s\n' "$h" | grep '^  launch')"
@@ -730,8 +744,7 @@ request_shape="$(q "SELECT count(*) FROM action_requests WHERE request_id='$requ
   || not_ok "action-request redaction rc=$rc rid=$request_rid leaks=$request_leaks shape=$request_shape"
 
 reason_secret="R7bcDef8Ghi9Jkl0Mno1Pqr2"
-reg task_reason hook
-q "UPDATE tasks SET manifest='{\"handoffs_write\":\"REVIEW.md\"}' WHERE task_id='task_reason';" >/dev/null
+reg task_reason hook '{"handoffs_write":"REVIEW.md"}'
 HERDR_TASK_ID=task_reason
 reason_out="$(bashc "DEPLOY_REF=$reason_secret cat README.md")"; reason_rc=$?
 HERDR_TASK_ID=task1

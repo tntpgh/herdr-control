@@ -1,0 +1,537 @@
+== SAFE command, peer authority -> allowed, key pressed ==
+  FAIL  exit 8 (expected 0); stderr: awk: illegal byte sequence  \xe2\x9d
+ input record number 7, file 
+ source line number 14
+awk: illegal byte sequence  \xe2\x9d
+ input record number 7, file 
+ source line number 14
+awk: illegal byte sequence  \xe2\x9d
+ input record number 7, file 
+ source line number 14
+herdr-select: REFUSED (escalate) — a human must answer this one.
+herdr-select: a parser-resolved find/git/fd invocation, or a command word a parser could not resolve statically, needs a conductor's review
+herdr-select: option 1 (Yes) in w1:p1 was NOT pressed.
+  FAIL  keys pressed=0
+  FAIL  pressed ''
+  FAIL  verdict=
+  FAIL  authority=
+  FAIL  decided_at empty
+  FAIL  attempted_at empty
+  FAIL  confirmed_at empty
+  FAIL  outcome=
+== DESTRUCTIVE command, peer authority -> REFUSED, no key pressed ==
+  ok    exit 8 (policy refusal)
+  ok    NO KEY PRESSED — the property that matters
+  ok    refusal explained on stderr
+  ok    approval_escalated event recorded
+  ok    approval_escalated records the refused command (shadow-compare joins on it)
+== CREDENTIAL-shaped command, peer authority -> REFUSED, no key pressed ==
+  ok    exit 8 (policy refusal)
+  ok    NO KEY PRESSED on a credential-exfil prompt
+  ok    approval_escalated event recorded
+== PR #147 hold: a scrape-only allow-class TORN raw capture must escalate, not auto-approve ==
+  FAIL  clean capture unexpectedly refused: exit 8; stderr: awk: illegal byte sequence  \xe2\x9d
+ input record number 7, file 
+ source line number 14
+awk: illegal byte sequence  \xe2\x9d
+ input record number 7, file 
+ source line number 14
+awk: illegal byte sequence  \xe2\x9d
+ input record number 7, file 
+ source line number 14
+herdr-select: REFUSED (escalate) — a human must answer this one.
+herdr-select: a parser-resolved find/git/fd invocation, or a command word a parser could not resolve statically, needs a conductor's review
+herdr-select: option 1 (Yes) in w1:p1 was NOT pressed.
+  ok    torn capture: REFUSED even though the classifier would allow the visible text
+  ok    NO KEY PRESSED on a torn capture
+  ok    approval_escalated event recorded for the torn capture
+  ok    a torn capture that was already deny-class stays refused
+  ok    NO KEY PRESSED on a torn deny-class command
+== RESERVED form (main merge), classifier ALLOW, peer authority -> REFUSED, no key pressed ==
+  ok    exit 8 for 'gh pr merge 5 --squash'
+  ok    NO KEY PRESSED for 'gh pr merge 5 --squash'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'git push origin main'
+  ok    NO KEY PRESSED for 'git push origin main'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'op read op://secrets/x/credential'
+  ok    NO KEY PRESSED for 'op read op://secrets/x/credential'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'wrangler deploy'
+  ok    NO KEY PRESSED for 'wrangler deploy'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'gh -R o/r pr merge 5'
+  ok    NO KEY PRESSED for 'gh -R o/r pr merge 5'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'gh api -X PUT repos/o/r/pulls/5/merge -f sha=abc'
+  ok    NO KEY PRESSED for 'gh api -X PUT repos/o/r/pulls/5/merge -f sha=abc'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'gh pr review 5 --approve'
+  ok    NO KEY PRESSED for 'gh pr review 5 --approve'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'git push --all'
+  ok    NO KEY PRESSED for 'git push --all'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'git push'
+  ok    NO KEY PRESSED for 'git push'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'gh alias set m pr-merge'
+  ok    NO KEY PRESSED for 'gh alias set m pr-merge'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'codex --yolo'
+  ok    NO KEY PRESSED for 'codex --yolo'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'codex -a yolo'
+  ok    NO KEY PRESSED for 'codex -a yolo'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'claude --permission-mode bypassPermissions'
+  ok    NO KEY PRESSED for 'claude --permission-mode bypassPermissions'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'cat ~/.config/gh/hosts.yml'
+  ok    NO KEY PRESSED for 'cat ~/.config/gh/hosts.yml'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'export'
+  ok    NO KEY PRESSED for 'export'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'declare -p'
+  ok    NO KEY PRESSED for 'declare -p'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    exit 8 for 'vim lib/command-policy.sh'
+  ok    NO KEY PRESSED for 'vim lib/command-policy.sh'
+  ok    reservation named on stderr
+  ok    approval_escalated recorded
+  ok    escalation event carries verdict=reserved (F1)
+== positive controls: the worker flow the lab depends on is STILL allowed ==
+  FAIL  'gh pr create --base main --fill' now refused: rc=8; herdr-select: REFUSED (escalate) — a human must answer this one.
+  FAIL  'gh issue edit 5 --add-label ready-for-review' now refused: rc=8; herdr-select: REFUSED (escalate) — a human must answer this one.
+  FAIL  'set -euo pipefail' now refused: rc=8; herdr-select: REFUSED (escalate) — a human must answer this one.
+  FAIL  'export UV_CACHE_DIR=/tmp/uv' now refused: rc=8; herdr-select: REFUSED (escalate) — a human must answer this one.
+  ok    'bash scripts/ci.sh' (unbound relative script) escalates, nothing pressed
+== the SAME reserved prompt, HUMAN authority -> allowed (a human is the authority) ==
+  ok    exit 0 for the human
+  ok    key pressed for the human
+== the SAME destructive prompt, HUMAN authority -> allowed, verdict still recorded ==
+  ok    exit 0 (a human is the authority)
+  ok    key pressed for the human
+  ok    escalate verdict RECORDED even though allowed
+== NO flag at all: a non-interactive caller defaults to PEER (fail closed) ==
+  ok    exit 8 with no flag — defaults to peer
+  ok    no key pressed
+== NO flag, stdin IS a terminal (an agent bash with pty:true) -> still PEER ==
+  ok    a terminal-attached caller with no flag is refused (peer), not human
+  ok    no key pressed for the tty caller
+== a SAFE command still passes on the peer default ==
+  FAIL  exit 8 (expected 0)
+  FAIL  authority=human
+== an ANSWERED prompt clears the task back to running (the hub-nag bug) ==
+  ok    precondition: task is blocked
+  FAIL  rc=8 keys=0
+  FAIL  task state=blocked (expected running)
+== a REFUSED prompt leaves the task blocked (nothing was answered) ==
+  ok    refused, no key
+  ok    still blocked — a human is genuinely needed
+== prompt_id fingerprints the PANEL, not omp queued messages ==
+  ok    two different panels, two different ids
+  ok    the same panel is stable across reads
+== F3: the id still separates panels when the panel parses INCOMPLETE ==
+  ok    incomplete panel: two commands, two ids
+== the id is STABLE while the highlight moves (or navigation would abort) ==
+  ok    moving the highlight does not change the id
+== F4: a stale row under the same pane id is NOT cleared (birth must match) ==
+  ok    recycled pane refused before any key (exit 7)
+  ok    state untouched on a recycled pane
+== F6: a typed-answer DECLINE does not report running ==
+  ok    typed-answer decline stays blocked
+== the Slack alert describes the PANEL, not omp queued messages ==
+  ok    menu-first yields the panel's own first option
+== a DECLINE is answerable from any authority, on BOTH prompt shapes ==
+  ok    menu Deny still allowed for peer
+  ok    numbered 'No' allowed for peer
+  ok    numbered 'No, and tell...' allowed for peer
+  ok    the APPROVE option on the same prompt is still refused
+== a Slack BUTTON is demonstrably human; a threaded REPLY is not ==
+  ok    via=slack-button -> human, destructive approval allowed
+  ok    via=slack-button recorded as human
+  ok    via=slack-button verdict still recorded for attribution
+  ok    via=slack-reply REFUSED a destructive prompt (peer)
+  ok    no key pressed on the reply route
+  ok    via=slack-reply cannot merge from a phone
+== a Slack reply still answers ordinary work (else the route is useless) ==
+  FAIL  rc=8 keys=0
+  FAIL  authority=human
+== an unrecognised via is NOT human ==
+  ok    unknown via falls through to peer
+== an explicit --authority human still overrides the default ==
+  ok    explicit human wins
+== a bad HERDR_SELECT_AUTHORITY value is rejected, not silently coerced ==
+  ok    exit 2 on a bad authority value
+  ok    no key pressed
+== HERDR_SELECT_AUTHORITY env also gates ==
+  ok    env var refuses a force-push
+  ok    no key pressed
+== a dangerous command far up the pane / past column 200 is STILL classified ==
+  ok    still refused despite distance and line length
+  ok    no key pressed
+== an unreadable pane refuses rather than classifying blind ==
+  ok    refused an unreadable pane (exit 6)
+  ok    no key pressed
+== a recycled pane refuses, ahead of any policy question ==
+  ok    exit 7 (pane recycled)
+  ok    no key pressed
+== operator rules tighten the gate (HERDR_POLICY_EXTRA_RULES) ==
+  FAIL  exit 8 (expected 0)
+  ok    operator rule escalates it
+  ok    no key pressed under the operator rule
+== reviewed conductor: owned task, exact prompt, attributed exception ==
+  ok    complete pending panel is not contaminated by prior transcript examples
+== wrapped/multi-line command rows reach the classifier intact ==
+  ok    continuation row '-rf …' still escalates
+== a backslash-newline continuation is one logical command (F2) ==
+  ok    'gh pr \<nl>merge 5' refused, no key
+  ok    punctuation-only row (fork bomb) still denies
+  ok    wrapped '-X DELETE' stays human-reserved
+  ok    separate menu rows without registry text fail closed instead of being joined into echo
+  ok    unreadable row-count scrape fails closed on separate command rows
+  ok    embedded 'Allow tool:' row cannot restart the panel and hide the real command
+  ok    non-UTF-8 bytes do not abort the parser
+  ok    registered conductor can approve reviewed task-owned cleanup
+  ok    review is recorded as conductor, never laundered as human
+== incomplete or self-issued conductor review refuses without input ==
+  ok    missing review/prompt binding refused
+  ok    worker cannot use its own identity to approve itself
+== reserved actions and site restrictions cannot use conductor exception ==
+  ok    human boundary held: cat ~/.aws/credentials
+  ok    human boundary held: wrangler deploy
+  ok    human boundary held: gh pr merge 12
+  ok    human boundary held: git push origin main
+  ok    human boundary held: mkfs /dev/disk9
+  ok    equal-severity site rule cannot hide behind built-in escalation reason
+== clipped approvals refuse, but a known Deny remains safe ==
+  ok    clipped command cannot be reviewed by assertion
+  ok    peer can deny an unsafe request without approving it
+  ok    completed task no longer grants conductor authority
+== #3b: ownership grant — strict tokenizer, own repo/branch only ==
+  ok    grant allows: git push origin feat/grant-test
+  ok    authority recorded as grant
+  ok    grant allows: gh pr create --head feat/grant-test
+  ok    authority recorded as grant
+  ok    grant allows: gh pr create --head feat/grant-test --base main
+  ok    authority recorded as grant
+  ok    grant allows: git add -A
+  ok    authority recorded as grant
+  ok    grant allows: git commit -m note
+  ok    authority recorded as grant
+  ok    grant allows: cd /wt/grant && git push origin feat/grant-test
+  ok    authority recorded as grant
+  ok    grant allows: git push -u origin feat/grant-test
+  ok    authority recorded as grant
+  ok    grant allows: git push --set-upstream origin feat/grant-test
+  ok    authority recorded as grant
+  ok    grant allows: cd /wt/grant && git push -u origin feat/grant-test
+  ok    authority recorded as grant
+  ok    grant allows: cd /wt/grant && git push --set-upstream origin feat/grant-test
+  ok    authority recorded as grant
+  ok    grant allows: git add lib/command-policy.sh herdr-select.sh
+  ok    authority recorded as grant
+  ok    grant allows: cd /wt/grant && git add verify-alert-gate.sh lib/scoped-policy.sh
+  ok    authority recorded as grant
+  ok    commit message mentioning herdr-select.sh no longer reserved under the grant
+== reserved-git-subcommand fix: a worktree PATH containing "push" is not a git push ==
+  ok    worktree path containing 'push' no longer reserved
+== #3b: exact non-grant variants of the SAME verbs still refused ==
+  ok    still refused: git add .env lib/command-policy.sh
+  ok    still refused: git add -f .env
+  ok    still refused: git add ~/.ssh/id_rsa
+  ok    still refused: git push origin main
+  ok    still refused: git push -f origin feat/grant-test
+  ok    still refused: git push origin HEAD:main
+  ok    still refused: git push origin feat/grant-test && git push origin main
+  ok    still refused: gh pr merge feat/grant-test
+  ok    still refused: git push -u origin main
+  ok    still refused: git push --force -u origin feat/grant-test
+  ok    still refused: git push -u --force-with-lease origin feat/grant-test
+  ok    still refused: git push -u origin +feat/grant-test
+  ok    still refused: git push -u upstream feat/grant-test
+  ok    still refused: cd /somewhere/else && git push -u origin feat/grant-test
+  ok    still refused: git push -u -u origin feat/grant-test
+== #3b item 2: a wrapped display reflows into a false escalation; the registry text (confirmed on screen) fixes it ==
+  ok    wrapped allow-class command classified via the untruncated registry text
+== HIGH (PR #158 review, live event 38070): a recorded command that is a SUBSTRING of the panel must not corroborate ==
+  ok    'ls' inside '...pulls...' does not corroborate; refused, no key pressed
+  ok    no approvals row recorded choice Approve
+== HIGH: a recorded command that is a PREFIX of a compound panel command must not corroborate ==
+  ok    recorded 'git status' does not equal the full compound command; refused, no key pressed
+  ok    no approvals row recorded choice Approve
+== HIGH: a recorded command does not corroborate an injected compound panel it is merely a substring of ==
+  ok    'ls' does not corroborate an injected curl|sh panel; refused, no key pressed
+  ok    no approvals row recorded choice Approve
+== positive: a word-boundary-wrapped long allow-class command whose registry row equals the joined command still corroborates ==
+  ok    word-boundary-wrapped allow-class command corroborates and is approved
+== MEDIUM (PR #162 review): omp Reason: row before Command: must not fail closed on a correct recorded command ==
+  ok    byte-identical recorded command corroborates past an omp Reason: row
+== MEDIUM: the same Reason: row does not block a reviewed conductor owned-cleanup rm -rf ==
+  ok    conductor owned-cleanup rm -rf corroborates past an omp Reason: row
+== MEDIUM: a Reason: row does not weaken anchoring — a mismatched recorded command still refuses ==
+  ok    'ls' still does not corroborate a Reason:-prefixed merge panel; refused, no key pressed
+== MEDIUM (round 2 review): the Reason strip is literal-text-only — a run:-row embedding a fake Command: token must not corroborate ==
+  ok    a fake 'Command:' token inside a run: row does not corroborate; refused, no key pressed
+== PR #147 hold, independent review: scrape-only menu-shape (omp) torn capture escalates ==
+  ok    menu-shape clean capture: allowed (baseline)
+  ok    menu-shape torn capture: REFUSED
+  ok    no key pressed on menu-shape torn capture
+  ok    approval_escalated recorded for menu-shape torn capture
+== PR #147 hold, independent review: reviewed conductor authority also refuses a torn capture (F1) ==
+  ok    conductor authority refused a torn capture
+  ok    no key pressed (conductor, torn)
+== PR #147 hold, independent review: an unreadable second read counts as torn, never clean (F2) ==
+  ok    an unreadable second read is treated as torn, not clean
+  ok    no key pressed (F2)
+== PR #147 hold, independent review: the registry-text exemption still holds when the on-screen SCRAPE was torn ==
+  ok    a torn on-screen scrape is exempt once the registry text (never scraped) confirms and replaces it
+== PR #147 hold, independent review: a torn deny-class capture records deny, not a relabelled escalate (F5) ==
+  ok    torn deny-class capture refused
+  ok    no key pressed (torn deny-class)
+  ok    the recorded verdict is deny, not a relabelled escalate
+== #3b item 2: a recorded command absent from the actual screen refuses ==
+  ok    recorded command disagreeing with the panel refuses
+== deny skips corroboration: a Deny on a disagreeing recorded command still presses Deny ==
+  ok    peer Deny presses through a disagreeing recorded command
+  ok    approvals row records the whole panel scrape on a Deny-mismatch, not the mismatched registry text or empty
+  ok    conductor Deny presses through the same disagreeing recorded command
+  ok    conductor Deny with a wrong --expect-prompt-id still refuses (rc 6, no key)
+  ok    peer Approve on the same disagreeing command is still refused
+  ok    conductor Approve on the same disagreeing command is still refused
+== positive: a MID-TOKEN wrap whose rows join (no separator) into the exact registry command corroborates through push_wake itself, not just herdr-select.sh -- Approve is pressed (fix/approve-wrapped-commands, F1) ==
+  ok    push_wake's OWN write-time gate corroborated the wrap via the wrap-join candidate (F1: not blanked)
+  ok    mid-token wrap corroborates via the wrap-join candidate; Approve pressed
+  ok    approvals row records the untruncated registry command, not the space-joined scrape
+== negative: same wrapped rows, registry command is a genuinely different (still allow-class) path -- still refused, no key (fix/approve-wrapped-commands, F5) ==
+  ok    a genuinely differing allow-class registry command does not corroborate; refused, no key pressed
+  ok    refused specifically for the mismatch reason on stderr
+  ok    no approvals row recorded choice Approve
+  ok    approval_escalated event recorded
+  ok    approval_escalated records the ON-SCREEN (space-joined) command, not the mismatched registry text or empty (PR #181 F1)
+  ok    conductor Deny still works on the same hidden-statement wrap
+== negative: menu rows carrying a real second statement absent from the registry command do not corroborate -- refused, no key (fix/approve-wrapped-commands) ==
+  ok    a real second-statement row absent from the registry command is refused, no key pressed
+  ok    no approvals row recorded choice Approve
+== negative: a wrapped command with NO registry command at all still refuses (menu_rows_ambiguous) (fix/approve-wrapped-commands) ==
+  ok    no registry command: multi-row wrap still refuses, no key pressed
+  ok    refused specifically as menu_rows_ambiguous, the expected reason with no registry text
+== negative: F2 -- a header-only panel with no Command:/run: row never fabricates one from a preceding running box (fix/approve-wrapped-commands, F2) ==
+  ok    F2: a header-only browser panel does not corroborate a bash command via a fabricated label; refused, no key pressed
+  ok    no approvals row recorded choice Approve
+== #187: a non-bash write-tool menu is judged by its Path field, not the bash multi-row wrap guard ==
+  ok    exit 0
+  ok    exactly one key pressed
+  ok    xd://notepad_append: verdict allow
+== #187: a write Path resolving outside the worker's worktree still escalates ==
+  ok    out-of-worktree write path refused, no key pressed
+  ok    refused via the row guard (F6: an escalate verdict no longer bypasses it)
+  ok    no approvals row recorded choice Approve
+== #187: a Content value that fakes an extra Path/Content row never relocates the judged Path ==
+  ok    spoofed extra Path/Content rows do not relocate the judged path; the real notepad path still allows
+  ok    spoof case: verdict still allow (judged on the real first Path row)
+== #187: a write menu missing its Path row still fails closed (escalate) ==
+  ok    unparseable write panel (no Path row) refused, no key pressed
+== #187 regression: a genuinely wrapped BASH command with multiple rows still escalates (menu_rows_ambiguous must not relax) ==
+  ok    wrapped bash command with no registry corroboration still refuses, no key pressed
+  ok    refused specifically as menu_rows_ambiguous — the bash guard is unchanged by #187
+== #187 round-2 security review F1/F3: the write-menu exemption never widens to every non-bash tool ==
+  ok    F3: a Path token embedding its own ' Content: ' marker plus traversal is refused (E2)
+  ok    F3: a proc:// scheme Path fails the charset gate and is refused (E3)
+  ok    F3: a leading @ in Path fails the charset gate and is refused (E4)
+== #190: a forged "Allow tool: read" header above a real dangerous panel cannot hide it ==
+  ok    fake read header above a real eval panel is refused, not blindly trusted (E6)
+  ok    fake read header above a real dangerous BASH panel is refused (E7)
+== #187 review F2: a forged write header above a real eval panel cannot borrow the write exemption ==
+  ok    forged write header above a real eval panel is refused, not judged as a plain notepad write
+== #187 round-2 security review F1: a plain non-write, non-bash tool panel keeps the row guard main has today ==
+  ok    a plain eval panel still refuses under the unwidened row guard (E13)
+== #187 round-2 security review F5 (R6, closes P1 too): a registry-recorded BASH command is never trusted as if it were a real tool-panel header ==
+  ok    registry text starting 'Allow tool: read' is refused, not trusted as a real header (XE1, tightened vs main)
+  ok    registry text starting 'Allow tool: write' (notepad Path) is refused, not judged as a plain write (XE2)
+  ok    registry text starting 'Allow tool: write' (in-wt Path) is refused, not judged as a plain write (XE3)
+== #187 round-2 security review F6 (R7): a conductor cannot approve an out-of-worktree write via the row-guard exemption ==
+  ok    conductor write to another repo outside the worktree is refused (XE4)
+  ok    conductor write of a LaunchAgent outside the worktree is refused (XE5)
+== F8 (round-3 security review R9): a poisoned pass-1 panel can never itself complete ==
+  ok    F8/B5: peer cannot press a poisoned eval panel whose real header scrolled past a fake comment-row header
+  ok    F8/B5: conductor cannot press it either
+  ok    B1: a flat headerless eval panel whose only 'Allow tool:' row is a Python string literal is refused
+  ok    B3: a flat headerless eval panel with a JS template-literal 'Allow tool:' row is refused
+== F9 (round-4 security review R10): a footer closing a poisoned panel ends the parse, pass 2 never runs ==
+  ok    P2: still visible to the human-paging backstop even though herdr-select.sh cannot press it
+  ok    P2: a poisoned eval panel closed by its own footer is refused, not handed to pass 2
+  ok    P3C: a poisoned eval panel with a blank tail and no comment-row escape is refused
+== negative: N1/F3 -- a short non-final row inside a REAL bordered box never glues (round-2 security review, N5/N1) ==
+  ok    N1/F3: a no-separator glue does not exist for a short row inside a real bordered box; refused, no key pressed
+  ok    no approvals row recorded choice Approve
+== negative: N2 -- a left-gutter-only capture (no right border) never glues, even when one row looks relatively long (round-2 security review, N5/N2) ==
+  ok    N2: a gutter-only capture never glues; refused, no key pressed
+  ok    no approvals row recorded choice Approve
+== negative: N4/F4 -- a wrap-join match that would let a lost space smuggle a different program past the classifier still refuses (fix/approve-wrapped-commands, F3/F4 defence in depth) ==
+  ok    F4: wrap-join matches but the space-join reading classifies deny; refused, no key pressed
+  ok    no approvals row recorded choice Approve
+== negative: N3/N6 -- both-must-allow now also requires the space-join reading not be human-reserved, not just classify allow (round-2 security review, N3/N6) ==
+  ok    N3/N6: wrap-join matches but the space-join reading is human-reserved (credential-value access); refused, no key pressed
+  ok    no approvals row recorded choice Approve
+== negative: N4b/N7 -- a captured row containing a literal 0x1E is rejected outright, never split into a corroboration candidate (round-2 security review, N4/N7) ==
+  ok    N4/N7: a row containing 0x1E is rejected outright; refused, no key pressed
+  ok    no approvals row recorded choice Approve
+== task-scoped approval: capability manifest, approved once at spawn ==
+  ok    manifest approval recorded once, at registration
+  ok    in-scope GET into writes clears (authority=scope)
+  ok    outside the manifest still escalates: curl -sS -o tmp/geo/x.raw https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -o tmp/geo/x.raw https://evil.example/
+  ok    outside the manifest still escalates: curl -q -sS -o /tmp/x.raw https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -o tmp/../x.raw https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -o tmp/.git/x.raw https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -o tmp/geo/hardlink.raw https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -O https://teamthurber.com/x.sh
+  ok    outside the manifest still escalates: curl -q -sSL -o tmp/geo/x.raw https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -o tmp/geo/x.raw https://user@teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -o $OUT https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -o tmp/geo/x.raw -H {X-A:1,-Ktmp/geo/rc} https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -o tmp/geo/* https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -H @tmp/geo/headers.txt -o tmp/geo/x.raw https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -w %output{/tmp/w.txt}x -o tmp/geo/x.raw https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -H Host:evil.example -o tmp/geo/x.raw https://teamthurber.com/
+  ok    outside the manifest still escalates: curl -q -sS -o tmp/geo/x.raw "https://teamthurber.com/?q=`cat /tmp/secret`"
+  ok    outside the manifest still escalates: curl -q -sS -o tmp/geo/x.raw https://teamthurber.com/
+  ok    manifest cannot clear: curl -q -sS -X POST -o tmp/geo/x.raw https://teamthurber.com/api
+  ok    manifest cannot clear: curl -q -sS -d a=1 -o tmp/geo/x.raw https://teamthurber.com/
+  ok    manifest cannot clear: curl -q -sS -o tmp/geo/x.raw https://teamthurber.com/ --data-binary @tmp/geo/x
+  ok    manifest cannot clear: git push origin main
+  ok    manifest cannot clear: git push origin feat/scope-test
+  ok    manifest cannot clear: git push -u origin feat/scope-test
+  ok    manifest cannot clear: gh pr create --head feat/scope-test
+  ok    manifest cannot clear: cat ~/.ssh/id_rsa
+  ok    manifest cannot clear: git commit -F ~/.ssh/id_ed25519 -m note
+  ok    manifest cannot clear: git add .env.local
+  ok    a worker-edited identity.json widens nothing (policy reads the registry)
+  ok    in-scope GET remains quiet after negatives
+  ok    absolute code outside the worktree escalates
+  ok    clean python file clears on its content
+  ok    network-using file escalates for peer
+  ok    conductor approves the reviewed file
+  ok    approval bound to the file's sha256
+  ok    same content re-runs without a new review
+  ok    file changed after approval escalates again
+  ok    conductor cannot approve a file whose CONTENT is human-reserved
+  ok    a script that cannot be read for review escalates
+== fix/coderef-compound: reserved-content script inside a compound command refuses for peer, zero keys ==
+  ok    refused, no key: cd /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.aghgImrVzI/wt-scope && bash tmp/reserved.sh | tail -3
+  ok    refused, no key: cd /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.aghgImrVzI/wt-scope && bash tmp/reserved.sh && echo done
+  ok    refused, no key: cd /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.aghgImrVzI/wt-scope && echo $(bash tmp/reserved.sh)
+== fix/coderef-compound: conductor path binds the sha for a compound command with one clean script ==
+  ok    conductor approves a compound command wrapping one clean script
+  ok    approval bound to greet.sh's sha256, not the raw command line
+== fix/coderef-compound: conductor path refuses a compound command with two distinct scripts (rc 8) ==
+  ok    conductor refuses two distinct script files in one command
+== fix/peer-waits-for-record ==
+== change 1: registry command missing at call time is worth a short wait ==
+  ok    waited for the delayed registry row instead of judging the raw panel
+  ok    authority recorded grant (registry text used, not the panel's 'push' word)
+  ok    trace ends in found
+  ok    at least one poll found nothing before the row landed (3 polls)
+== HIGH (PR #158 review): a SHORT recorded command must not corroborate as a substring of unrelated panel text ==
+  ok    'ls' inside '...pulls...' does not corroborate; Approve refused, no key pressed
+  ok    the 'ls' row was found by the wait (the refusal is the corroboration check, not a timeout)
+== HIGH: a recorded command that is a PREFIX of the panel text must not corroborate either ==
+  ok    recorded 'git status' does not equal the full compound command; refused, no key pressed
+== change 1: a command-less registry row (command:"") never waits ==
+  FAIL  rc=8
+  ok    trace is exactly one poll followed by found — no timeout, no extra polling
+== change 1: no registry row ever appears -> bounded wait, then refused (herdr-control #191 tightening) ==
+  ok    refused: no hook-recorded tool identity ever landed for this prompt (#191)
+  ok    refusal names the missing hook record
+  ok    waited out the whole 1s window (5 polls) and then timed out
+== 2026-09-29: an attention-controller row alone does not end the wait ==
+  ok    the controller's row is not the hook's record: waited the window, then refused
+== fix/select-hook-none: the hook-record wait also runs for --authority conductor ==
+  ok    conductor waited for the delayed registry row instead of judging the raw panel
+  ok    conductor trace ends in found
+  ok    at least one conductor poll found nothing before the row landed (3 polls)
+== change 2: a peer refusal records the TASKs own_run/own_task and the prompt_id ==
+  ok    refused as expected
+  ok    approval_escalated carries run_id=runR task_id=taskR prompt_id=563b23249085f754d9b63c251beae22da122975890a8773d2e7d29814a941f10, not the empty HERDR_RUN_ID/HERDR_TASK_ID
+== change 3 + MEDIUM-1: a wake HELD before the refusal is released at refusal time, once, with its Slack alert ==
+  ok    the reserved push to main is still refused
+  ok    wake_hold_released recorded
+  ok    wake_hold_released names the prompt, pane, and 'peer refused: reserved'
+  ok    a forced wake_attempted fired for the released hold
+  ok    the forced attempt correlates to the SAME wake_key the held wake used
+  ok    claimed the SAME idempotency key grace_realert's own 90s re-check would use
+  ok    MEDIUM-1: the held Slack alert was sent exactly once on release
+  ok    the Slack call is class held (errors-only level suppresses it like the held timer's own) and names the pane
+== MEDIUM-2: a wrap-corroboration-mismatch refusal ALSO releases a held wake (not just peer_decide) ==
+  ok    mid-token wrap: refused, no key pressed
+  ok    mid-token wrap: refused specifically for the mismatch reason on stderr
+  ok    mid-token wrap: approval_escalated carries run_id/task_id/prompt_id (not empty)
+  ok    mid-token wrap: approval_escalated records the ON-SCREEN command, not the mismatched registry text or empty (PR #181 F1)
+  ok    mid-token wrap: held wake released
+  ok    mid-token wrap: forced wake_attempted fired
+== MEDIUM-2: torn-capture and ambiguous-menu-rows refusals also record run_id/task_id/prompt_id ==
+  ok    torn capture: still refused
+  ok    torn capture: approval_escalated carries run_id/task_id/prompt_id
+  ok    ambiguous menu rows: still refused
+  ok    ambiguous menu rows: approval_escalated carries run_id/task_id/prompt_id
+== the blocked period closes BEFORE the answering keystroke ==
+  ok    peer Approve pressed
+  ok    the task was already running when Enter landed (period closed first)
+== the screen is re-read AFTER the close, right before the keystroke ==
+  ok    a panel that changed during the close is refused, no key pressed
+  ok    the refused press put the task back to blocked
+== F7c: a peer/conductor Deny tells the worker WHY, once the menu has cleared ==
+== F7c 1: conductor Deny with --review-reason -> one [HERDR-DENIED] line after the menu clears ==
+  ok    conductor Deny pressed (rc 0)
+  ok    deny_reason_delivered recorded for prompt 02d2bfc215c8a902833b73a7001e16c785c254d5a3f52c43efb3e691e9ccafa3
+  ok    exactly one deny_reason_delivered row
+  ok    row: outcome=delivered exit_code=0 pane=w1:p1
+  ok    exactly one send-text line to the worker
+  ok    the line was typed only after the menu had cleared
+  ok    the line carries [HERDR-DENIED] and the review reason
+== F7c 2: conductor Approve with a reason -> no line, no row ==
+  ok    conductor Approve pressed (rc 0)
+  ok    control Deny after the Approve delivered its row
+  ok    only the control's line was sent — nothing for the Approve
+  ok    no deny_reason_delivered row for the Approve
+== F7c 3: human Deny -> no line ==
+  ok    human Deny pressed (rc 0)
+  ok    control Deny after the human Deny delivered its row
+  ok    only the control's line was sent — nothing for the human Deny
+  ok    no deny_reason_delivered row for the human Deny
+== F7c 4: the menu never clears -> no line, outcome menu_never_cleared ==
+  ok    conductor Deny pressed (rc 0)
+  ok    deny_reason_delivered recorded after the bounded wait
+  ok    row: outcome=menu_never_cleared, no exit code
+  ok    no send-text into a pane still showing the menu
+  ok    no key beyond the Deny itself
+== F7c 5: peer Deny of a deny-class command, no --review-reason -> the policy reason ==
+  ok    peer Deny pressed (rc 0)
+  ok    classified deny with a policy reason
+  ok    deny_reason_delivered recorded for the peer Deny
+  ok    row: outcome=delivered
+  ok    one line, after the menu cleared
+  ok    the line carries the policy reason
+
+-----
+passed=387 failed=22
+FAIL

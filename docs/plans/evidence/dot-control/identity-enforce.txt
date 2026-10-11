@@ -1,0 +1,351 @@
+== registry: the posture is on the row, fixed at registration ==
+  ok    row carries approval=hook
+  ok    approval_posture event recorded once
+  ok    default row is approval=menu
+  ok    a menu registration writes no posture event (unchanged)
+  ok    invalid approval posture refused by register_task
+== enforce: allow / deny / block paths ==
+  ok    allow verdict runs (rc 0)
+  ok    deny: blocked, no request, says nobody can approve
+  ok    eval: blocked, no request
+  ok    secret_present: reserved -> human request
+  ok    only the reserved call made a request so far
+== escalate -> request -> conductor approve -> one-shot grant ==
+  ok    escalate: blocked, request ar_943be81e_fa64d2e58237cabd_1, told it went to the conductor
+  ok    request row: conductor / once / pending
+  ok    the reviewer sees the exact command and where it runs
+  ok    action_requested event recorded
+  ok    identical re-issue (different intent text) -> same pending request
+  ok    no duplicate request row
+  ok    approve from a pane that is not the task's conductor: refused
+  ok    approve from a recycled conductor pane: refused
+  ok    approve without an operational review category: refused
+  ok    approve without a review reason: refused
+  ok    still pending after 4 refused approvals
+  ok    the live conductor approves
+  ok    worker told in its own pane to re-issue
+  ok    approvals row recorded (conductor/Approve, delivery submitted)
+  ok    a second decision on the same request is refused (check-and-set)
+  ok    different bytes (trailing space) do not match the grant
+  ok    the identical call now runs (grant consumed)
+  ok    request is consumed
+  ok    one-shot: the next identical call needs a NEW request (ar_943be81e_fa64d2e58237cabd_2)
+== parallel: identical calls make one request; one grant runs once ==
+  ok    6 parallel identical calls -> 1 request row
+  ok    6 parallel re-issues after one approval -> exactly 1 runs
+== decline ==
+  ok    re-issue after decline: blocked with the reviewer's reason
+  ok    no new request after a decline
+  ok    worker told it was declined
+== supersede is non-granting, including code-by-reference requests ==
+  ok    conductor explicitly cancels the pending bash request
+  ok    superseded-terminal: later approve refused (rc=4), status stays superseded
+  ok    superseded-terminal: later decline refused (rc=4), status stays superseded
+  ok    parallel identical reissues after supersede share one fresh pending request, none run
+  ok    file cancellation setup escalates a resolved script as a file grant request
+  ok    superseding a file request records no persistent grant and reissue still blocks
+== reserved: human only, through the hub form served for it ==
+== conductor decisions retire pinned human forms ==
+  ok    form-retirement: conductor approve retires the pinned open human form
+  ok    form-retirement: conductor decline retires the pinned open human form
+  ok    form-retirement: conductor supersede retires the pinned open human form
+== review LOW followups: unpinned retirement, legacy answers and race audit ==
+  ok    L-b: approve retires the served but unpinned form
+  ok    L-b: decline retires the served but unpinned form
+  ok    L-b: supersede retires the served but unpinned form
+  ok    L-c: legacy approve answer records and logs missing SHA, request stays pending
+  ok    L-c: repeated ticks do not duplicate the rejected-answer event
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+  ok    L-c: legacy decline answer records and logs missing SHA, request stays pending
+  ok    L-c: repeated ticks do not duplicate the rejected-answer event
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+  ok    L-c: legacy supersede answer records and logs missing SHA, request stays pending
+  ok    L-c: repeated ticks do not duplicate the rejected-answer event
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+  ok    L-d: lost human approve answer preserved and audited, conductor decision stands
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+  ok    L-d: lost human decline answer preserved and audited, conductor decision stands
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+  ok    L-d: lost human supersede answer preserved and audited, conductor decision stands
+== end review LOW followups ==
+== every human form decision binds the exact action SHA ==
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+  ok    form-binding: approve with wrong action SHA refused by CLI and tick, stays pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+  ok    form-binding: approve with missing action SHA refused by CLI and tick, stays pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+  ok    form-binding: decline with wrong action SHA refused by CLI and tick, stays pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+  ok    form-binding: decline with missing action SHA refused by CLI and tick, stays pending
+  ok    reserved -> human request ar_943be81e_7b1f54fdb691fb73_1
+  ok    conductor cannot approve a human-only request
+  ok    bare --authority human (no form): refused
+  ok    an answered record that is not the form served for it: refused
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+  ok    the tick served a form and pinned its record (20261010T020806-223928798)
+  ok    the pinned form while still OPEN is not an approval
+  ok    the pinned form answered for ANOTHER request: refused
+  ok    a form that says decline cannot approve
+  ok    the pinned form answered approve for exactly this request approves (authority human)
+  ok    the reserved call runs once after the human's yes
+== a decision that did not come from the right authority is never consumed ==
+  ok    status=approved with no authority: not consumed
+  ok    a conductor decision on a human-only request: not consumed
+== the worker cannot approve itself through bash (hook-approval rules) ==
+  ok    reserved: sqlite3 /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.t1WBG76Lw
+  ok    reserved: sqlite3 ~/.local/state/herdr/runs/registry.sqlite3 .dump
+  ok    reserved: jq -n '{status:1}' > ~/.local/state/herdr/forms/F9.json
+  ok    reserved: printf x >> /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-contro
+  ok    reserved: sed -i '' s/a/b/ /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-c
+  ok    reserved: bash /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/herdr
+  ok    reserved: cp tmp/x.ts ~/.omp/agent/extensions/y.ts
+  ok    reserved: python3 -c "import sqlite3; sqlite3.connect('r').execute('update appro
+  ok    ordinary git still runs
+== code by reference: approval binds to the file sha, re-runs, re-escalates on edit ==
+  ok    escalating script content -> file-kind request
+  ok    file_approvals row written for (task, path, sha)
+  ok    the same bytes re-run without review (twice)
+  ok    an edited file escalates again
+== grants bind the script bytes a command runs ==
+  ok    a script run alongside another segment: refused, no request
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+  ok    script rewritten after the human's approval: the grant does not match, nothing consumed
+  ok    …the reviewed bytes still run once
+  ok    unresolvable script: refused with guidance, no request to approve
+  ok    a relative script with an explicit tool cwd resolves and is requestable
+== the reviewer sees what the grant binds (cwd, env) ==
+  ok    a bash call with a service env escalates
+  ok    request text shows the cwd and the env
+== every tool that can run a program is judged ==
+  ok    hub start bash -c <reserved> is reserved
+  ok    hub start of an allow-class program runs
+  ok    hub wait runs
+  ok    hub send (in-process peer message) runs and files no request
+  ok    unknown hub op escalates
+  ok    text written to a job's stdin is judged as a command
+  ok    mixed-case scheme Xd://secret_present is still judged
+  ok    mixed-case scheme xD://browser is still judged
+  ok    mixed-case scheme XD://memory_edit is still judged
+  ok    unknown device via Xd:// escalates
+  ok    write to an unknown URL scheme escalates
+  ok    read FILE:// of a credential path is reserved
+  ok    SSH:// read blocked
+  ok    glob over a credential directory is reserved
+  ok    a grep PATTERN is not judged as a path
+== learn goes to the conductor (q4) ==
+  ok    learn: blocked, conductor request
+== identity fails closed in enforce mode ==
+  ok    launched for hook, row says menu: refused
+  ok    no registry row: refused
+  ok    recycled worker pane: refused
+  ok    unreadable registry: refused
+== surfacing and the hub tick ==
+  ok    surface wakes the conductor pane exactly once
+  ok    the wake names the exact approve command
+  ok    a recycled conductor pane is not typed into (outcome conductor_unreachable)
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+  ok    tick served a hub decision form for the human request
+  ok    one Slack alert (class human-action) across two ticks
+  ok    the Slack text does not carry the command
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+  ok    expired form: request still pending, a fresh form is served (expiry is not a decline)
+  ok    action_form_expired recorded
+  ok    no second Slack post for a re-served form
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+  ok    tick applies an answered hub form (approved, authority human)
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+  ok    a conductor request left pending past the stale window goes to the human route
+  ok    tick with no registry/pending work is cheap (9ms)
+== withdrawal: a request whose task ended before a decision ==
+  ok    setup: taskw is completed
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+  ok    setup: two open, pinned forms
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+  ok    terminal task: pending request withdrawn (authority system)
+  ok    its open form record is withdrawn (hub drops it from /decisions)
+  ok    an approve answered after the task ended grants nothing
+  ok    the answered record is not overwritten
+  ok    a request whose task row is missing stays pending (never guessed at)
+  ok    one action_withdrawn event per request across two ticks
+  ok    the event records the form outcome, including an approve that arrived too late
+== the omp hook: enforcing only for approval=hook rows ==
+  ok    hook row: allow runs; escalate/reserved/eval/junk blocked; read runs
+  ok    escalate block reason names the request
+  ok    after approval the hook lets the identical call run
+  ok    …exactly once
+  ok    hook row with the pre-tool lib missing: fails closed (BLOCK)
+  ok    a yolo-POSTURE menu worker ('--approval-mode', 'yolo') is unchanged — not treated as hook mode
+  ok    a yolo-POSTURE menu worker ('--approval-mode=yolo') is unchanged — not treated as hook mode
+  ok    a registered worker launched --auto-approve is judged even when its row says menu (refused)
+  ok    …and with the registry unreadable, every call is refused
+  ok    row-only enforcement is stable across 3 fresh sessions
+  ok    row-only enforcement holds with '#', '?', '%' in the state path
+  ok    row-only enforcement holds on a WAL registry with no -wal/-shm files
+herdr-action: form 20261010T020712-3183620918 for request ar_943be81e_1dbffe203263e2e2_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020717-1689830708 for request ar_943be81e_70eaa2bab1f0389b_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020723-2807811767 for request ar_943be81e_d5de74d7d1397db4_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020748-294929882 for request ar_943be81e_930a1c616a89a839_1 rejected: missing_action_sha256; request left pending
+herdr-action: form 20261010T020800-96451348 for request ar_943be81e_b54f83e8d2382103_1 rejected: missing_action_sha256; request left pending
+  ok    the hub tick is not skipped on a WAL registry with no -wal/-shm files
+  ok    HERDR_APPROVAL=hook with no registry row: every call blocked
+  ok    menu worker: every return value identical to origin/main (["ALLOW","ALLOW","ALLOW","ALLOW","ALLOW","ALLOW"])
+  ok    non-worker session: identical to origin/main
+== spawn-task.sh --approval ==
+  ok    default spawn --dry-run is byte-identical to origin/main
+  ok    explicit --approval menu is byte-identical to origin/main's default
+  ok    hook: launch is --auto-approve + worker overlay, no --approval-mode
+  ok    hook: dry-run states the approval posture
+  ok    refused: --approval yolo
+  ok    refused: --approval hook --posture strict
+  ok    refused: --approval hook with omc
+  ok    refused: --approval hook with a literal command
+  ok    refused: the extension omp would load does not exist (content check, R5 sha256 not path identity)
+  ok    refused: an installed hook without the enforcement protocol
+  ok    R5/F6: byte-identical hook content AND lib/ tree at a DIFFERENT path is accepted (sha256, not path identity)
+  ok    R5: one differing byte (marker still present) still refuses
+  ok    F6: an untouched .ts next to a GUTTED lib/pretool-shadow.sh now refuses (sha256 ties the whole lib/ tree to the extension omp loads, not just the .ts file)
+  ok    F6: an ADDED file anywhere under lib/ also refuses (whole-tree hash, no file list to fall out of sync)
+  ok    F6 r2: a stray __pycache__/*.pyc present on only one side does not affect the verdict (build noise, never source)
+  ok    F6 r2: a changed .sh still refuses even with .pyc noise sitting alongside it
+  ok    N1: a scratch copy of this working tree (the shape a deploy produces) with pyc noise on top is accepted
+  ok    N1: the SAME scratch copy with a real .sh change still refuses
+  ok    F9: research/explore hook-mode launch runs at write; strict is stamped for grandchildren
+  ok    F9 control: research/explore menu-mode is unaffected (launch and stamp both strict, byte-identical wording to before this fix)
+  ok    F9 control: a non-research/explore job class is unaffected (launch and stamp both write, byte-identical wording to before this fix)
+  ok    refused spawns created no worktree
+  ok    control: the stub log records a workspace create when one is attempted
+  ok    HEAD dry runs never ask herdr to create or focus a workspace
+== durable action requests redact full display and quoted reasons without truncation ==
+  ok    action request keeps complete review structure while redacting command, env, and event
+  ok    policy reasons that quote argv are redacted before durable storage
+  ok    non-shell JSON is redacted before display and remains complete past 20 KB
+== shadow-compare.sh --gate (decision q1) ==
+  ok    gate FAILs on one unexplained SHADOW_LOOSER even at 0.1% disagreement
+  ok    gate PASSes: 6 days, 1000 rows / 5 tasks, 0.1%, every looser row explained
+  ok    gate FAILs while a command-less escalation is in the window (its refusal cannot be compared)
+  ok    gate FAILs above 2% disagreement (3.1%)
+  ok    gate FAILs with no shadow data
+== shadow-compare joins: bound to the command/tool, never pane + time alone ==
+  ok    a command-less (legacy) escalation on the pane is not pinned on an unrelated bash call
+  ok    an escalation recording the same command still joins (refused vs allow = looser)
+  ok    a read call does not take a bash panel's approval on the same pane
+  ok    omp's 'Allow tool: bash ; Command:' panel matches its command
+  ok    an omp-flagged panel ('Reason: Critical pattern detected') still matches its command
+
+passed=185 failed=0

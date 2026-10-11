@@ -1,0 +1,46 @@
+LOCAL macOS Node22 validation; Ubuntu/Node24 CI was not run.
+CWD=/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/remote-mcp/worker
+PYTHONDONTWRITEBYTECODE=1
+
++ /Users/thurbs/.local/share/mise/installs/node/22.23.2/bin/node node_modules/typescript/bin/tsc --noEmit
+exit=0; elapsed=0.888s
+
++ /Users/thurbs/.local/share/mise/installs/node/22.23.2/bin/node test/authorization-offline.cjs
+PASS start signs source identity, scope and unicode payload; golden cross-language vector
+PASS missing/old/unknown publisher protocol rejects admission with zero tasks/commands
+PASS downgrade withholds queued and overdue commands without changing receipt or lease attempts
+PASS restart/ack loss redelivers original receipt and expires instead of renewing
+PASS nullable migration preserves legacy commands without minting source authority
+PASS equal manifests and objectives remain bound to separate task and command identities
+PASS distinct resume requests cannot reserve one parent worktree twice
+PASS resume parent reservation survives uncertain delivery, expiry, revocation, restart and command pruning
+PASS terminal held child cannot become another resume parent even after a stop acknowledgement
+PASS completed resume continues only from latest child with a distinct command and receipt
+PASS terminal labels and pruned source commands cannot release unresolved launch authority
+PASS retention keeps the child reservation while its parent remains addressable
+PASS resume reservation rolls back with command persistence failure and independent parents remain concurrent
+PASS legacy duplicate children migrate without a crash and block additional lineage forks
+PASS source substitution and changed payload invalidate the authenticated binding
+PASS receipt write failure atomically rolls back task, command and event creation
+PASS event/audit failure also rolls back a stored receipt and task
+PASS resume requires publisher protocol and binds original mapping to a new child receipt
+PASS cancel remains deliverable after publisher downgrade and carries no approval receipt
+PASS missing signing key fails before task or command creation
+PASS actual Python held→bound→claimed→accepted acks retain receipt/expiry and converge without duplicate audit
+PASS actual Python accepted→held ack order cannot downgrade or erase accepted launch mapping
+PASS actual Python held binding remains cancellable and later accepted ack cannot revive it
+PASS cancel before an unbound held ack learns its target once bound evidence arrives
+PASS revocation covers held in-flight source and queues a stop for its known local mapping
+PASS revoked unbound hold reopens only stop tracking when later mapping arrives
+PASS bound hold expiry queues cancellation without extending receipt or losing target
+PASS unbound hold expiry creates one durable uncertainty item; late binding is cancel-only
+PASS changed mapping and partial accepted acks stay held; valid Python result can still resolve
+PASS unknown and never-leased ack IDs cannot create a mapping or revive execution
+PASS review regression: retired unbound launch retains failed-stop retry and requires conclusive stop
+PASS late held and accepted target evidence from failed/timed-out/cancelled rows opens stop tracking only
+PASS lost stop ACK expires into bounded retry while original launch receipt stays fixed
+PASS failed or lost stops exhaust five retries into one durable recovery item without false completion
+34 passed; 0 failed; Cloudflare/OAuth integration not exercised
+(node:33567) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+exit=0; elapsed=1.674s

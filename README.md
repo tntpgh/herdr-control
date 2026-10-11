@@ -335,7 +335,13 @@ two supplemental queries (`approvals` for a denial never followed up,
 `events` for a `message_delivered` with no later activity), and asks a pure
 function — `stall_watchdog_candidates()`, unit-tested with injected
 clocks/`stat_fn`, no filesystem or registry needed — which rows match one of
-five signals, gated to `stalled`/`ready_review` only: once a task is
+five signals, gated to `stalled`/`ready_review` only for signals 1/2
+(handoff/artifact, worktree-completion heuristics); signals 3/4/5
+(denied/unprocessed/conductor_prompt) also include `blocked` — the state
+the occurrence model (herdr-select.sh/push-wake.sh) now sets while a
+prompt sits unresolved — and signal 5 suppresses 3/4 for the same task
+the same tick once it already fires, so the occurrence-precise mechanism
+never double-fires alongside the older heuristics. Once a task is
 `completed`, closing it IS the action owed, and nothing fires again for it:
 
 1. the worker's OWN worktree bus says `handed_off_to:<anything>` while

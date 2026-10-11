@@ -9,6 +9,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 export HERDR_RUN_STATE_DIR="$work/runs"
+export XDG_RUNTIME_DIR="$work/runtime"; mkdir -p "$XDG_RUNTIME_DIR"
 export PANE='w1:p1' BIRTH='generation-1'
 export HERDR_PANE_ID="$PANE" HERDR_RUN_ID='run1' HERDR_TASK_ID='task1'
 wt="$work/worktree"; mkdir -p "$wt/tmp"
@@ -24,8 +25,9 @@ chmod +x "$work/bin/herdr"
 export PATH="$work/bin:$PATH"
 
 . "$here/lib/scoped-policy.sh"
+. "$here/tests/fixtures/task-authorization.sh"
 SHADOW="$HERDR_RUN_STATE_DIR/pretool-shadow.sqlite3"
-register_task run1 task1 worker1 conductor1 w9:p9 cond-birth "$PANE" "$BIRTH" /repo "$wt" 'impl:shadow' feat/shadow main >/dev/null
+fixture_register_task run1 task1 worker1 conductor1 w9:p9 cond-birth "$PANE" "$BIRTH" /repo "$wt" 'impl:shadow' feat/shadow main >/dev/null || exit 1
 set_task_state run1 task1 running
 TASK_JSON="$(read_task run1 task1)"
 
@@ -121,7 +123,7 @@ FAKE_BIRTH=generation-2 idf 'recycled pane (birth differs)'
 FAKE_NO_PANE=1 idf 'pane generation unverifiable'
 printf 'x' > "$work/notadir"
 HERDR_RUN_STATE_DIR="$work/notadir/runs" idf 'registry unreadable'
-register_task run1 task2 worker2 conductor1 w9:p9 cond-birth "$PANE" "$BIRTH" /repo "$wt" 'impl:done' feat/d main >/dev/null
+fixture_register_task run1 task2 worker2 conductor1 w9:p9 cond-birth "$PANE" "$BIRTH" /repo "$wt" 'impl:done' feat/d main >/dev/null || exit 1
 set_task_state run1 task2 running; set_task_state run1 task2 cancelled
 HERDR_TASK_ID=task2 idf 'terminal task state'
 bash_payload ls | HERDR_RUN_STATE_DIR="$work/notadir/runs" shadow --record >/dev/null; rc=$?
@@ -265,11 +267,11 @@ if command -v bun >/dev/null 2>&1; then
     {id:"null_event", ev:null},
     {id:"junk_event", ev:{toolName:42, input:"x"}}]')"
   # Baseline: origin/main's return values for the same events (shadow absent).
-  base_dir="$work/base"; git -C "$here" worktree add -q --detach "$base_dir" origin/main 2>/dev/null
+  base_dir="$work/base"; mkdir -p "$base_dir"
+  git -C "$here" archive origin/main | tar -x -C "$base_dir" || exit 1
   run_hook() { HOOK="$1/agent-hooks/omp-herdr-control.ts" HERDR_CONTROL_DIR="$1" CASES="$cases" WT="$wt" bun -e "$hook_js" 2>"$work/bun.err"; }
   before="$(sqlite3 "$SHADOW" "SELECT count(*) FROM pretool_verdicts WHERE type='pretool_verdict';")"
   mine="$(run_hook "$here")"; base="$(run_hook "$base_dir")"
-  git -C "$here" worktree remove --force "$base_dir" 2>/dev/null
   [ -n "$mine" ] && [ "$(printf '%s' "$mine" | jq -c '[.[]|{id,r}]')" = "$(printf '%s' "$base" | jq -c '[.[]|{id,r}]')" ] \
     && ok "worker: every return value identical to origin/main ($(printf '%s' "$mine" | jq -c '[.[]|.r]'))" \
     || not_ok "worker return values differ: mine=$mine base=$base"

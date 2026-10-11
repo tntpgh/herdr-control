@@ -61,6 +61,9 @@ export interface TaskCaps {
 }
 export interface TaskConfig {
   mac_enabled: boolean; // this sync's HERDR_MCP_TASKS switch state on the Mac
+  // Start/resume require a receiver that verifies and durably binds the
+  // command receipt before launch. Missing/other versions fail closed.
+  authorization_protocol?: number;
   repos: string[];
   modes: { research: TaskModeConfig; implement: TaskModeConfig };
   caps: TaskCaps;
@@ -257,6 +260,13 @@ export interface OwnerReplySync {
 // outcome back as a CommandAck on its next sync -- never a separate route,
 // so the Mac never listens and the push model stays one-directional).
 export type CommandOp = "start" | "cancel" | "resume";
+export interface CommandAuthorization {
+  // Recursively key-sorted, compact UTF-8 JSON, signed exactly as sent.
+  // This proves the existing OAuth task delegation, never a human's
+  // exact-command approval or a decision by the assigned supervisor.
+  claims: string;
+  signature: string;
+}
 export interface CommandItem {
   command_id: string;
   op: CommandOp;
@@ -270,10 +280,13 @@ export interface CommandItem {
   // bisection -- swapping this one field's type is what flips it). The Mac
   // only ever reads this JSON-decoded, never indexes it generically here.
   payload: object;
+  authorization?: CommandAuthorization;
 }
 export interface CommandAck {
   command_id: string;
-  outcome: "accepted" | "refused" | "failed";
+  // held is an unfinished/uncertain start or resume, never an approval or
+  // successful launch. It must not retire the command or discard mapping.
+  outcome: "accepted" | "refused" | "failed" | "held";
   detail: string;
   local_task_id?: string;
   local_run_id?: string;
@@ -283,6 +296,13 @@ export interface CommandAck {
   // Reported once, from start_task's own spawn: did this task's manifest
   // actually reach what it needs (e.g. {kb: true}) -- real, not assumed.
   capability_probe?: Record<string, boolean>;
+  // Receipt-to-ack recovery (dot-herdr-recovery-slices.md §3): present only
+  // when the Mac sourced this ack from the registry's durable
+  // revision/acked_revision CAS (either the live path or pending_acks()
+  // recovery), never invented by the Worker. Echoed back verbatim in
+  // SyncResponse.command_ack_results so the Mac can CAS-confirm the EXACT
+  // revision it sent, never a guessed or stale one.
+  revision?: number;
 }
 
 // Who queued a message: the grant's user (email) and the OAuth client.

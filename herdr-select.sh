@@ -286,9 +286,16 @@ if [ "$authority" = conductor ]; then
     starting|running|blocked) ;;
     *) echo "herdr-select: conductor may only answer an active registered task." >&2; exit 8 ;;
   esac
-  if [ -z "$owner_pane" ] || [ "$owner_pane" != "${HERDR_PANE_ID:-}" ] ||
+  caller_pane="$(caller_pane_from_ancestry)" || {
+    echo "herdr-select: caller identity is unproven; conductor authority refused." >&2; exit 8;
+  }
+  if [ -z "$owner_pane" ] || [ "$owner_pane" != "$caller_pane" ] ||
      [ -z "$owner_birth" ] || [ "$owner_birth" != "$(pane_birth_now "$owner_pane")" ]; then
     echo "herdr-select: caller is not this task's live registered conductor." >&2
+    exit 8
+  fi
+  if [ "$declining" = 0 ] && ! task_authorization_check "$reviewed_task"; then
+    echo "herdr-select: ${TASK_AUTHORIZATION_REASON:-task authorization unavailable; human-only hold}; no key pressed." >&2
     exit 8
   fi
 fi
@@ -322,6 +329,69 @@ own_task=$(printf '%s' "$own_task_json" | jq -r '.task_id // empty' 2>/dev/null)
 own_worktree=$(printf '%s' "$own_task_json" | jq -r '.worktree // empty' 2>/dev/null)
 own_branch=$(printf '%s' "$own_task_json" | jq -r '.branch // empty' 2>/dev/null)
 own_trunk=$(printf '%s' "$own_task_json" | jq -r '.trunk // empty' 2>/dev/null)
+
+# Occurrence corroboration (docs/plans/dot-herdr-recovery-slices.md §2):
+# when the hook path (agent-hooks/omp-herdr-control.ts + omp-notify.sh,
+# writing through lib/prompt-occurrence.py) has recorded an occurrence for
+# THIS EXACT on-screen prompt (screen_prompt_id == current_prompt_id, the
+# same fingerprint --expect-prompt-id checks above), trust it the same way
+# every other fold consumer does: refuse an APPROVING press (a decline is
+# exempt, same as every other gate in this script) whenever that
+# occurrence's identity could not be proven (identity_verified false — an
+# unproven pane_birth/native_session, M1) or its last recorded screen read
+# was not cleanly parseable (display != pending_parseable — a stuck or
+# mismatched panel). A pane with NO matching occurrence recorded at all
+# (Claude, Codex, or an omp pane whose hook never fired for this prompt) is
+# unaffected: there is nothing here to corroborate against, so behavior is
+# exactly as before this check existed — legacy callers retain legacy
+# behavior.
+
+if [ "$declining" = 0 ] && [ -n "$current_prompt_id" ] && [ -n "$own_run" ] && [ -n "$own_task" ] \
+   && [ -f "$here/lib/prompt-occurrence.py" ]; then
+  occ_summary="$(python3 "$here/lib/prompt-occurrence.py" fold --db "$(registry_db)" --run "$own_run" --task "$own_task" 2>/dev/null \
+    | jq -r --arg p "$pane" --arg pid "$current_prompt_id" \
+        '([.[] | select(.pane_id == $p and .screen_prompt_id == $pid)] | sort_by(.last_seq) | last) as $m
+         | if $m == null then "" else ($m.display + "\t" + ($m.identity_verified|tostring)) end' 2>/dev/null)"
+  if [ -n "$occ_summary" ]; then
+    occ_display="${occ_summary%%$'\t'*}"
+    occ_identity="${occ_summary#*$'\t'}"
+    if [ "$occ_identity" != true ] || [ "$occ_display" != pending_parseable ]; then
+      echo "herdr-select: the recorded occurrence for this exact prompt is identity_verified=$occ_identity display=$occ_display — refusing to press an approving key." >&2
+      exit 8
+    fi
+  fi
+fi
+
+# Responsibility may move while the reviewer correlates a prompt. Resolve it
+# again immediately before recording/sending, and reject a changed task/pane
+# mapping or a conductor whose original assignment is no longer current.
+_require_current_authority() {
+  [ "$authority" = human ] && return 0
+  local fresh live_caller current_owner current_birth
+  fresh="$(task_for_pane "$pane" 2>/dev/null)" || return 1
+  if [ -n "$own_task" ]; then
+    [ "$(printf '%s' "$fresh" | jq -r '.task_id // empty')" = "$own_task" ] &&
+      [ "$(printf '%s' "$fresh" | jq -r '.run_id // empty')" = "$own_run" ] || return 1
+    if [ "$declining" = 0 ]; then
+      task_authorization_check "$fresh" || return 1
+    fi
+  fi
+  [ "$authority" = conductor ] || return 0
+  live_caller="$(caller_pane_from_ancestry)" || return 1
+  current_owner="$(printf '%s' "$fresh" | jq -r '.conductor_pane_id // empty')"
+  current_birth="$(printf '%s' "$fresh" | jq -r '.conductor_pane_birth // empty')"
+  [ -n "$live_caller" ] && [ "$live_caller" = "$caller_pane" ] &&
+    [ "$current_owner" = "$live_caller" ] && [ -n "$current_birth" ] &&
+    [ "$current_birth" = "$owner_birth" ] && [ "$current_birth" = "$(pane_birth_now "$live_caller")" ]
+}
+
+# A provenance failure is a stable task hold, not a new conductor question.
+# No key, request or wake is emitted on retries. An explicit Deny remains safe.
+if [ "$authority" != human ] && [ "$declining" = 0 ] && [ -n "$own_task" ] &&
+   ! task_authorization_check "$own_task_json"; then
+  echo "herdr-select: ${TASK_AUTHORIZATION_REASON:-authorization hold: provenance unavailable; human-only}; no key pressed." >&2
+  exit 8
+fi
 
 # _refuse_non_human <verdict> <reason>
 #
@@ -586,6 +656,16 @@ if [ "$authority" != human ] && [ "$declining" = 0 ] && [ "$mechanism" = menu ];
 fi
 
 if [ "$authority" = conductor ] && [ "$declining" = 0 ]; then
+  # Recheck the current registry context after prompt correlation and before
+  # recording any review. Missing parser infrastructure is never reviewable.
+  if ! task_authorization_check "$own_task_json"; then
+    echo "herdr-select: ${TASK_AUTHORIZATION_REASON:-task authorization unavailable; human-only hold}; no key pressed." >&2
+    exit 8
+  fi
+  if ! _sp_shell_policy_ready; then
+    echo "herdr-select: $SP_DEPENDENCY_REASON; no key pressed." >&2
+    exit 8
+  fi
   # A torn capture is refused even for the reviewed conductor — independent
   # review of PR #147 (torn-gate-conductor-bypass): the conductor's own gate
   # below only refuses `deny`/empty/reserved text, evaluated on the CLEANED
@@ -661,6 +741,9 @@ fi
 # through to send-keys regardless, silently breaking the "recorded before
 # sent" invariant the header above promises whenever mkdir/jq/the append
 # itself failed (a full disk, a missing directory permission).
+_require_current_authority || {
+  echo "herdr-select: task authorization or conductor assignment changed during review; no key pressed." >&2; exit 8;
+}
 log_dir="${HERDR_BRIDGE_STATE:-$HOME/.config/herdr-bridge}"
 mkdir -p "$log_dir" || { echo "herdr-select: cannot create $log_dir — refusing to answer without an audit trail." >&2; exit 2; }
 # selections.jsonl is the authorization audit trail — command text, verdict,
@@ -677,7 +760,7 @@ jq -nc --arg pane "$pane" --arg choice "$choice" --arg label "$label" --arg mech
        --arg prompt_id "$current_prompt_id" \
        --arg authority "$authority" --arg verdict "$policy_verdict" --arg reason "$policy_reason" \
        --arg review_reason "$review_reason" --arg review_category "$review_category" \
-       --arg reviewer "${HERDR_PANE_ID:-}" \
+       --arg reviewer "${caller_pane:-${HERDR_PANE_ID:-}}" \
   '{at:$at,pane:$pane,choice:($choice|tonumber),label:$label,mechanism:$mechanism,via:$via,prompt_id:$prompt_id,authority:$authority,policy_verdict:$verdict,policy_reason:$reason,review_reason:$review_reason,review_category:$review_category,reviewer:$reviewer}' \
   >> "$log_dir/selections.jsonl" || {
   echo "herdr-select: failed to write $log_dir/selections.jsonl — refusing to answer without an audit trail." >&2
@@ -704,7 +787,7 @@ approval_decided "$approval_id" "$pane" "$current_prompt_id" "$choice" "$label" 
 if [ "$authority" = conductor ]; then
   append_event "$_run" "$_task" approval_reviewed \
     "$(jq -nc --arg id "$approval_id" --arg reason "$review_reason" \
-       --arg category "$review_category" --arg reviewer "${HERDR_PANE_ID:-}" \
+       --arg category "$review_category" --arg reviewer "${caller_pane:-${HERDR_PANE_ID:-}}" \
        '{approval_id:$id,reason:$reason,category:$category,reviewer:$reviewer}')" >/dev/null 2>&1 || {
     echo "herdr-select: cannot persist conductor review — refusing." >&2; exit 2;
   }
@@ -717,7 +800,7 @@ fi
 if [ "$declining" = 0 ] && [ -n "$_task" ] && { [ "$authority" = conductor ] || [ "$authority" = human ]; }; then
   [ "$authority" = human ] && code_ref_inspect "$cmd_text" "$own_worktree" >/dev/null 2>&1
   if [ -n "${PD_CODE_PATH:-}" ] && [ -n "${PD_CODE_SHA:-}" ]; then
-    file_approval_record "$_task" "$PD_CODE_PATH" "$PD_CODE_SHA" "$authority:${HERDR_PANE_ID:-cli}" >/dev/null 2>&1 &&
+    file_approval_record "$_task" "$PD_CODE_PATH" "$PD_CODE_SHA" "$authority:${caller_pane:-${HERDR_PANE_ID:-cli}}" >/dev/null 2>&1 &&
       append_event "$_run" "$_task" file_approved \
         "$(jq -nc --arg id "$approval_id" --arg p "$PD_CODE_PATH" --arg s "$PD_CODE_SHA" --arg a "$authority" \
            '{approval_id:$id,path:$p,sha256:$s,authority:$a}')" >/dev/null 2>&1 || true
@@ -797,7 +880,7 @@ _reopen_blocked_period() {
 # only if a prompt is still on screen: a mismatch usually means someone else
 # answered, and a pane with nothing pending is running, not blocked.
 _require_unchanged_after_close() {
-  require_agent_pane "$pane" && require_pane_birth_match "$pane" &&
+  _require_current_authority && require_agent_pane "$pane" && require_pane_birth_match "$pane" &&
     { [ "$mechanism" = numbered ] || [ "$(prompt_menu_selected "$pane")" = "$choice" ]; } &&
     [ "$(prompt_content_digest "$pane")" = "$current_content" ] && return 0
   prompt_any_visible "$pane" >/dev/null 2>&1 && _reopen_blocked_period
@@ -805,7 +888,7 @@ _require_unchanged_after_close() {
   return 1
 }
 _require_current_decision() {
-  require_agent_pane "$pane" && require_pane_birth_match "$pane" || return 1
+  _require_current_authority && require_agent_pane "$pane" && require_pane_birth_match "$pane" || return 1
   [ "$(prompt_id "$pane")" = "$current_prompt_id" ] || {
     echo "herdr-select: prompt changed after review — refusing stale input." >&2
     return 1

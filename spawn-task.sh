@@ -70,9 +70,11 @@ here=$(cd "$(dirname "$0")" && pwd)
 secrets_req=""
 [ "${HERDR_SECRETS_WITHHELD:-}" = 1 ] && secrets_req=withhold
 approval_req=menu
+authorization_command_id=""
 base=""; dry=0; model_override=""; effort_override=""; posture_req=""; foc=--no-focus; brief_file=""; project_label=""; route_provider=""; tools_req=""; positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
+    --authorization-command-id) authorization_command_id="${2:?spawn-task: authorization command id required}"; shift 2 ;;
     --base) base="$2"; shift 2 ;;
     --model) model_override="$2"; shift 2 ;;
     --effort) effort_override="$2"; shift 2 ;;
@@ -481,6 +483,35 @@ if [ "$dry" = 1 ]; then
   exit 0
 fi
 
+# Source authority is separate from the pane assigned to supervise the task.
+# In particular, the publisher's Main fallback is never proof Main approved
+# the manifest. The remote adapter must have persisted a verified receipt;
+# local launches must prove the actual caller's live conductor ancestry.
+if [ -n "$authorization_command_id" ]; then
+  authorization_row="$(read_task_authorization "$authorization_command_id")" || exit 1
+  printf '%s' "$authorization_row" | jq -e --arg repo "$(basename "$root")" --arg job "$job" \
+    '.status == "accepted" and .source == "oauth_task_delegation" and .repo == $repo and .effective_scope.job_class == $job' >/dev/null || {
+    echo "spawn-task: authorization hold: source, repo or job binding mismatch" >&2; exit 1;
+  }
+  # Match the existing allowlist's credential policy; inherited withholding
+  # can only tighten it. This receipt adds no credential grant of its own.
+  source_secrets="$(printf '%s' "$authorization_row" | jq -r '.effective_scope.secrets')"
+  source_posture_ok=0
+  case "$source_secrets:$secrets_req" in
+    grant:grant|default:|default:withhold) source_posture_ok=1 ;;
+  esac
+  if [ "$managed" != 1 ] || [ "$source_posture_ok" != 1 ]; then
+    echo "spawn-task: authorization hold: remote launch credential/agent posture mismatch" >&2; exit 1
+  fi
+  # This durable once-only claim precedes git worktree changes and every
+  # .handoffs write. Expiry/crash never releases an uncertain reservation.
+  claim_task_worktree_mutation "$authorization_command_id" "$root" "$wt" "$branch" >/dev/null || exit 1
+else
+  # Preserve an already reserved remote worktree even for a local/unmanaged
+  # invocation. This read-only guard does not serialize two brand-new intents.
+  check_worktree_unreserved "$root" "$wt" "$branch" >/dev/null || exit 1
+fi
+
 # ---- worktree: create or reuse ---------------------------------------------
 # A NEW branch is cut from origin's default branch, never from the local
 # checkout's HEAD: the local checkout is routinely a dirty, stale lane (2026-09-05:
@@ -549,6 +580,10 @@ trap 'exit 130' INT TERM HUP
 if ! archive_fence_enter "$wt"; then
   echo "spawn-task: $_ARCHIVE_WHY — not writing into it" >&2
   exit 1
+fi
+if [ -n "${authorization_row:-}" ] && [ "$(printf '%s' "$authorization_row" | jq -r '.claims.op')" = resume ] \
+   && [ -f "$wt/.handoffs/ANSWER.md" ]; then
+  mv "$wt/.handoffs/ANSWER.md" "$wt/.handoffs/ANSWER.prev.md" || exit 1
 fi
 
 # ---- coordination scaffold --------------------------------------------------
@@ -730,6 +765,20 @@ case "$job" in
     ;;
 esac
 
+# Local caller authority is established once the final manifest is known.
+if [ -z "$authorization_command_id" ] && [ "$managed" = 1 ]; then
+  source_pane="$(caller_pane_from_ancestry)" || {
+    echo "spawn-task: authorization hold: local caller ancestry unavailable or outside Herdr" >&2; exit 1;
+  }
+  pane_is_conductor_eligible "$source_pane" || {
+    echo "spawn-task: authorization hold: local caller is not an eligible conductor" >&2; exit 1;
+  }
+  source_birth="$(pane_birth_now "$source_pane")" || exit 1
+  [ -n "$source_birth" ] || { echo "spawn-task: authorization hold: caller birth unavailable" >&2; exit 1; }
+  authorization_command_id="$(gen_id local_auth)"
+  accept_local_task_authorization "$authorization_command_id" "$source_pane" "$source_birth" "$root" "$manifest_json" >/dev/null || exit 1
+fi
+
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
 # Whether THIS call creates the workspace decides the root-tab cleanup below.
 ws_existed=0
@@ -786,7 +835,7 @@ jq -n \
     events_file:$events, worktree:$worktree, branch:$branch, repo:$repo,
     project:$project, spec_file:$spec, proof_file:$proof_file,
     capability_manifest:(if $manifest == "" then null else ($manifest|fromjson) end),
-    capability_manifest_note:"Approved once at spawn by the conductor (registry event manifest_approved). Inside it, approvals clear without a per-call review; outside it they escalate exactly as before. This copy is informational — editing it changes nothing the approver reads.",
+    capability_manifest_note:"Scope and source authority are checked in the protected registry. The assigned conductor is a supervisor, not proof of approval. This copy is informational; editing it changes nothing the approver reads.",
     how_to_complete:$how_to_complete,
     closure_reasons:$closure_reasons,
     example:$example}' \
@@ -797,13 +846,9 @@ jq -n \
   }
 
 if ! register_task "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$conductor_pane_birth" \
-  "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk" "$project_label" "$manifest_json" "$approval_req"; then
-  # A menu worker has always launched anyway (its approvals still gate it); a
-  # hook worker runs with --auto-approve, so it is never launched unregistered.
-  if [ "$approval_req" = hook ]; then
-    echo "spawn-task: registration failed — a hook-approval worker is never launched without its registry row" >&2
-    exit 1
-  fi
+  "$pane" "$pane_birth" "$root" "$wt" "$label" "$branch" "$trunk" "$project_label" "$manifest_json" "$approval_req" "$authorization_command_id"; then
+  echo "spawn-task: registration or source binding failed; worker was not launched" >&2
+  exit 1
 fi
 
 # ---- claim the worktree on the worker's behalf ------------------------------
@@ -908,7 +953,31 @@ stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q
 # token, went looking for .env.local (gitignored, so absent from every linked
 # worktree), and produced four credential-shaped approval prompts.
 stamped_cli="$(op_env_prelude "$op_mode") $stamped_cli; $cli"
+# Persist intent BEFORE the external effect. If the process dies in this gap,
+# a retry holds outcome_unknown rather than executing the worker twice.
+if [ -n "$authorization_command_id" ]; then
+  launch_birth="$(pane_birth_now "$pane")" || exit 1
+  if [ -z "$pane_birth" ] || [ "$launch_birth" != "$pane_birth" ]; then
+    echo "spawn-task: authorization hold: worker pane disappeared or changed birth" >&2; exit 1
+  fi
+  if [ -n "${source_pane:-}" ]; then
+    launch_source="$(caller_pane_from_ancestry)" || exit 1
+    launch_source_birth="$(pane_birth_now "$source_pane")" || exit 1
+    if [ "$launch_source" != "$source_pane" ] || [ "$launch_source_birth" != "$source_birth" ] || \
+       ! pane_is_conductor_eligible "$source_pane"; then
+      echo "spawn-task: authorization hold: local source identity changed before launch" >&2; exit 1
+    fi
+  fi
+  mark_authorization_launch "$authorization_command_id" "$task_id" "$run_id" launch_claimed || {
+    echo "spawn-task: authorization hold: could not claim launch" >&2; exit 1;
+  }
+fi
 herdr pane run "$pane" "$stamped_cli" >/dev/null 2>&1 || { echo "spawn-task: launch failed: $cli" >&2; exit 1; }
+if [ -n "$authorization_command_id" ]; then
+  mark_authorization_launch "$authorization_command_id" "$task_id" "$run_id" launched || {
+    echo "spawn-task: authorization hold: launch acknowledgement lost; outcome_unknown, do not relaunch" >&2; exit 1;
+  }
+fi
 herdr pane report-agent "$pane" --source "$HERDR_SOURCE" --agent "$label" --state working >/dev/null 2>&1 || true
 
 # Best-effort agent_session capture — herdr reports this natively for

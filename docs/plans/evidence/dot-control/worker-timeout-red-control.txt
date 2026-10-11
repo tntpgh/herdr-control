@@ -1,0 +1,48 @@
+{
+  "revision": "4f071ad0454bb5fcb1d835872bd6705064207c3f",
+  "before": "timed_out",
+  "after": "timed_out",
+  "events": [
+    {
+      "type": "task_started",
+      "detail": "{\"repo\":\"fixture-repo\",\"mode\":\"research\",\"requester\":\"fixture@example.com\"}"
+    },
+    {
+      "type": "timed_out",
+      "detail": "{\"max_minutes\":1}"
+    },
+    {
+      "type": "late_ack_ignored",
+      "detail": "{\"outcome\":\"accepted\",\"already\":\"timed_out\"}"
+    }
+  ]
+}
+{
+  "revision": "34d705ed6bd8d1b14649b01873c0c07f30d3b693",
+  "before": "timed_out",
+  "after": "cancelled",
+  "events": [
+    {
+      "type": "task_started",
+      "detail": "{\"repo\":\"fixture-repo\",\"mode\":\"research\",\"requester\":\"fixture@example.com\"}"
+    },
+    {
+      "type": "timed_out",
+      "detail": "{\"max_minutes\":1}"
+    },
+    {
+      "type": "late_ack_ignored",
+      "detail": "{\"outcome\":\"accepted\",\"already\":\"timed_out\"}"
+    },
+    {
+      "type": "cancellation_reopened",
+      "detail": "{\"previous_state\":\"timed_out\",\"reason\":\"launch acknowledged after task became terminal\"}"
+    },
+    {
+      "type": "state_changed",
+      "detail": "{\"state\":\"cancelled\"}"
+    }
+  ]
+}
+(node:31764) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)

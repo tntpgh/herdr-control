@@ -1,0 +1,48 @@
+2026-10-10T01:11:51Z herdr-mcp-publisher: message msg_1: delivered (submitted)
+2026-10-10T01:11:51Z herdr-mcp-publisher: ack sync failed, will retry next tick: network dropped the ack
+2026-10-10T01:11:51Z herdr-mcp-publisher: message msg_1: delivered (already delivered (ack was lost))
+2026-10-10T01:11:51Z herdr-mcp-publisher: ack sync failed, will retry next tick: network dropped the ack
+.....2026-10-10T01:11:52Z herdr-mcp-publisher: message msg_gate_0: refused (messaging is turned off on the Mac)
+2026-10-10T01:11:52Z herdr-mcp-publisher: message msg_gate_1: retry (lease ran out before delivery; re-checked next tick)
+............2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (owner_at_approval_prompt)
+.2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+.2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner reply conductor/oex_tick1: registration/pane identity unverifiable or changed; left local
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner reply conductor/oex_tick1: registration/pane identity unverifiable or changed; left local
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner reply conductor/oex_tick1: registration/pane identity unverifiable or changed; left local
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner reply conductor/oex_tick1: registration/pane identity unverifiable or changed; left local
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner reply conductor/oex_tick1: registration/pane identity unverifiable or changed; left local
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner reply conductor/oex_tick1: registration/pane identity unverifiable or changed; left local
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner replies: could not refresh pane identity (hub down); left local
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner reply conductor/oex_tick1: registration/pane identity unverifiable or changed; left local
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+.2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+.2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: owner message oex_tick1: blocked (deliver_failed:4)
+2026-10-10T01:11:52Z herdr-mcp-publisher: synced 2 tasks, 3 agents, 0 results
+...........2026-10-10T01:11:52Z herdr-mcp-publisher: chrome-relay status unavailable, browser omitted this tick: JSONDecodeError('Expecting value: line 1 column 1 (char 0)')
+2026-10-10T01:11:52Z herdr-mcp-publisher: chrome-relay status unavailable, browser omitted this tick: ValueError('unexpected shape: {"checked_at": "T", "real_chrome_running": true, "relay": "connected", "extensions": {"chatgpt": "enabled"}, "stray_omp_chromes": 0, "healthy": true}')
+2026-10-10T01:11:52Z herdr-mcp-publisher: chrome-relay status unavailable, browser omitted this tick: ValueError('unexpected shape: {"checked_at": "T", "real_chrome_running": true, "relay": "connected", "extensions": {"omp_relay": "enabled", "1password": "enabled", "chatgpt": "blocked"}, "stray_omp_chromes": 0, "healthy": true}')
+2026-10-10T01:11:52Z herdr-mcp-publisher: chrome-relay status unavailable, browser omitted this tick: ValueError('unexpected shape: {"checked_at": "T", "real_chrome_running": true, "relay": "connected to /Users/x", "extensions": {"omp_relay": "enabled", "1password": "enabled", "chatgpt": "enabled"}, "stray_omp_chromes": 0, "health')
+2026-10-10T01:11:52Z herdr-mcp-publisher: chrome-relay status unavailable, browser omitted this tick: ValueError('unexpected shape: {"checked_at": "T", "real_chrome_running": true, "relay": "connected", "extensions": {"omp_relay": "enabled", "1password": "enabled", "chatgpt": "enabled"}, "stray_omp_chromes": "2", "healthy": true}')
+...............
+----------------------------------------------------------------------
+Ran 47 tests in 0.797s
+
+OK

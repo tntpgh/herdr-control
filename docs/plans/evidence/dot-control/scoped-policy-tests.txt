@@ -1,0 +1,306 @@
+== manifest: valid block parses to canonical JSON ==
+  ok    canonical JSON, sorted, defaults filled
+  ok    git defaults to today's grant (push-own-branch)
+  ok    no block -> no manifest (behaviour unchanged)
+== manifest: invalid blocks refuse the spawn (exit 2) ==
+  ok    refused: net_write granted
+  ok    refused: unknown key (typo)
+  ok    refused: wildcard host
+  ok    refused: IP host
+  ok    refused: host with port
+  ok    refused: absolute glob
+  ok    refused: home glob
+  ok    refused: dotdot glob
+  ok    refused: .git target
+  ok    refused: .handoffs target
+  ok    refused: .env target
+  ok    refused: bad git value
+  ok    refused: unbracketed list
+  ok    refused: two manifest blocks
+== python content: data processing is clean, risky capabilities are not ==
+  ok    re.compile / model.eval() / json / pathlib are not risk
+  ok    flagged: import subprocess; subprocess.run(["ls"])
+  ok    flagged: import os; os.system("ls")
+  ok    flagged: import urllib.request
+  ok    flagged: import requests
+  ok    flagged: import socket
+  ok    flagged: import shutil; shutil.rmtree("x")
+  ok    flagged: import os; os.remove("x")
+  ok    flagged: from pathlib import Path; Path("x").unlink()
+  ok    flagged: import os; os.chmod("x", 0o777)
+  ok    flagged: exec(open("x").read())
+  ok    flagged: eval("1+1")
+  ok    flagged: __import__("os")
+  ok    flagged: open(os.path.expanduser("~/.zshrc"))
+== file content: judge what executes, not prose — and not less than executes ==
+  ok    shebang, module docstring and comments are not judged as commands
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    a shell shebang is not an env dump
+  ok    code on the docstring's line is still judged
+  ok    a utf-7 coding cookie is not reviewable
+  ok    a reserved path in a STRING is still reserved (strings are code)
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    risky shell content escalates
+  ok    python reading the process environment is human-reserved
+  ok    a python f-string with '$'+x is not a shell env dump (measured: schema_listing.py)
+== code by reference judges ONE file, so running/importing another escalates ==
+  ok    python importing a sibling module escalates
+  ok    a stdlib import is not a local import
+  ok    shell content that runs another file escalates: . tmp/inner.sh
+  ok    shell content that runs another file escalates: source tmp/inner.sh
+  ok    shell content that runs another file escalates: bash tmp/inner.sh
+  ok    shell content that runs another file escalates: python3 tmp/wrapper.py
+  ok    shell content that runs another file escalates: ./tmp/run-me
+  ok    shell content that runs another file escalates: wc -l x | xargs echo
+  ok    python tripwire: from os import system
+  ok    python tripwire: import os; f = getattr(os, "sys" + "tem")
+  ok    python tripwire: import runpy; runpy.run_path("x.py")
+  ok    python tripwire: import pwd
+  ok    python tripwire: import sys; sys.path.insert(0, "/tmp")
+== git ceiling: none refuses every history/worktree write, reads pass ==
+  ok    git: none refuses: git commit -m x
+  ok    git: none refuses: git merge feat/x
+  ok    git: none refuses: git reset --hard HEAD~1
+  ok    git: none refuses: git stash
+  ok    git: none refuses: git tag v1
+  ok    git: none refuses: git checkout -b x
+  ok    git: none refuses: git branch -D x
+  ok    git: none refuses: git rebase main
+  ok    git: none allows read: git status --short
+  ok    git: none allows read: git log --oneline -5
+  ok    git: none allows read: git diff HEAD
+  ok    git: none allows read: git show HEAD
+== python: NFKC-folded identifiers are judged as the interpreter reads them ==
+  ok    fullwidth 'subprocess' is caught after NFKC
+== commit-message strip keeps every other argument ==
+  ok    the -F path survives the strip
+  ok    only the -m value is removed
+== composed canonical rules carry the worker approval rules ==
+  ok    operator rules + herdr-control worker rules both present
+== code by reference: every script-executing segment of a compound command ==
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/evil.sh | tail -3
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/evil.sh 2>&1 | tail -3
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/evil.sh > /tmp/out.txt
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/evil.sh 2>/dev/null
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/evil.sh < /dev/null
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/evil.sh && echo ok
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/evil.sh; echo ok
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/evil.sh || true
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && true && bash tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && (bash tmp/evil.sh)
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && { bash tmp/evil.sh; }
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && echo $(bash tmp/evil.sh)
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && echo `bash tmp/evil.sh`
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash -c "bash tmp/evil.sh"
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && sh -c 'bash tmp/evil.sh'
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && eval "bash tmp/evil.sh"
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && source tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && . tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && ./tmp/evil.sh
+  ok    judged or refused (rc=0): /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt/tmp/evil.sh
+  ok    judged or refused (rc=0): /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt/tmp/evil.sh | tail -1
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && echo tmp/evil.sh | xargs bash
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && find tmp -name evil.sh -exec bash {} \;
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && find tmp -name evil.sh -exec {} \;
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && env FOO=1 bash tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && nohup bash tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && time bash tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && timeout 5 bash tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && exec bash tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && command bash tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && nice -n 5 bash tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash < tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && cat tmp/evil.sh | bash
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash -x tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash -- tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/evil.sh &
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && python3 tmp/evil.py | tail -1
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && python3 tmp/evil.py > /tmp/o.txt
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash <(cat tmp/evil.sh)
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && watch -n1 bash tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/clean.sh && bash tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && cd tmp && bash evil.sh
+  ok    judged or refused (rc=3): bash tmp/evil.sh | tail -3
+  ok    judged or refused (rc=0): bash /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt/tmp/evil.sh | tail -3
+  ok    a clean script inside a pipe resolves to that one file
+  ok    a compound command running no script is not code by reference
+  ok    python3 -m stays out of scope (unchanged)
+== code by reference: worker-written exec trampolines ==
+  ok    exec trampoline tramp1.sh is not clean: nested: script runs another program or file — review what it runs
+  ok    exec trampoline tramp2.sh is not clean: nested: script runs another program or file — review what it runs
+  ok    exec trampoline tramp3.sh is not clean: nested: script runs another program or file — review what it runs
+  ok    trampoline judged or refused (rc=3): bash /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/harness.sh "$(pwd)" _cp_walk_prep 'cd /tmp/x && bash tmp/evil.sh 2>&1 | tail -3'
+  ok    trampoline judged or refused (rc=3): bash /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/harness.sh "$(pwd)" ls
+  ok    trampoline judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/tramp3.sh "$(pwd)" ls
+  ok    trampoline judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/tramp1.sh "$(printf gh)" pr view 1
+  ok    trampoline judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash tmp/tramp2.sh `echo ls` -la
+== PR #160 review round 1: findings 1-11 must never allow, only judge (0) or refuse (3) ==
+  ok    judged or refused (rc=0): multi-line: true then bash on its own line
+  ok    judged or refused (rc=0): trailing newline only
+  ok    judged or refused (rc=3): heredoc feeding bash
+  ok    judged or refused (rc=3): absolute path, no cd prefix: true then bash on its own line
+  ok    judged or refused (rc=3): absolute path, trailing newline only, no cd prefix
+  ok    judged or refused (rc=3): absolute path word alone on the second line, no cd prefix
+  ok    a genuine multi-line capture running no script anywhere stays rc 1
+  ok    a numbered-panel scrape with no real script stays rc 1 (its own chrome does not misparse)
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && eval eval eval eval eval eval eval bash tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && echo $(echo $(echo $(echo $(echo $(echo $(echo $(bash tmp/evil.sh)))))))
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && $SHELL tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && "$BASH" tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && $0 tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && $(which bash) tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && `which bash` tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && ba$()sh tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && x=bash; $x tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash -c "$(cat tmp/evil.sh)"
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && sh -c "$(<tmp/evil.sh)"
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && eval "$(cat tmp/evil.sh)"
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && cat tmp/evil.sh |& bash
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && cat tmp/evil.sh |& bash -s
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && < tmp/evil.sh bash
+  ok    judged or refused (rc=3): <tmp/evil.sh sh
+  ok    judged or refused (rc=3): 0<tmp/evil.sh bash
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && < tmp/evil.py python3
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && bash &>/dev/null < tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && python3 &>/dev/null < tmp/evil.py
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && echo tmp/evil.sh | xargs -n 1 bash
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && echo tmp/evil.sh | xargs -I {} sh {}
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && echo tmp/evil.sh | xargs -P 2 bash
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && echo tmp/evil.sh | xargs -L 1 bash
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && watch -n 1 bash tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && parallel -j 2 bash ::: tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && eval cd tmp && bash run.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && $(echo cd) tmp && bash run.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && echo $'\'' ; bash tmp/evil.sh
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && echo $'it\'s' $(bash tmp/evil.sh)
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && ./tmp/outlink.sh
+  ok    an absolute /tmp path outside the worktree escalates (finding 11)
+== finding 9: python flags other than -uBev still resolve the file slot ==
+  ok    python3 -I resolves the file slot
+  ok    python3 -O resolves the file slot
+  ok    python3 -S resolves the file slot
+  ok    python3 -W ignore resolves past its value
+  ok    python3 -X utf8 resolves past its value
+== finding 10: launcher option values and shell keywords no longer hide the script ==
+  ok    resolves past the launcher: timeout 5s bash tmp/evil.sh
+  ok    resolves past the launcher: timeout 1.5m bash tmp/evil.sh
+  ok    resolves past the launcher: exec -a foo bash tmp/evil.sh
+  ok    resolves past the launcher: coproc bash tmp/evil.sh
+  ok    resolves past the launcher: function f { bash tmp/evil.sh; }; f
+== finding 13: python3 -m <local.module> resolves to its worktree file ==
+  ok    python3 -m tmp.evil resolves tmp/evil.py
+  ok    python3 -m tmp.evil resolves past a trailing pipe
+  ok    python3 -m json.tool (no matching worktree file) stays out of scope
+== finding 14: the same file judged as two different kinds counts as two scripts ==
+  ok    python3 tmp/rm.py resolves alone
+  ok    the same path judged shell AND python counts as two scripts, escalates
+== finding 15: clustered -c and value-taking shell options no longer over-escalate ==
+  ok    no over-escalation: bash -lc 'npm test'
+  ok    no over-escalation: bash -ec 'npm test'
+  ok    no over-escalation: sh -ec 'git status'
+  ok    no over-escalation: zsh -lc 'git status'
+  ok    no over-escalation: bash -o pipefail -c 'npm test | tail'
+  ok    no over-escalation: bash -euo pipefail -c 'npm test'
+  ok    bash -n never executes, stays out of scope
+  ok    bash -n tmp/evil.sh is not reserved either — it never executes
+== finding 16: find -okdir escalates like -exec/-execdir/-ok ==
+  ok    find -okdir escalates
+== finding 17: interpreter-loading env vars are treated as a second, unreviewed script ==
+  ok    env-poisoned invocation escalates: BASH_ENV=tmp/evil.sh bash tmp/clean.sh
+  ok    env-poisoned invocation escalates: BASH_ENV=tmp/evil.sh bash -c true
+  ok    env-poisoned invocation escalates: PYTHONPATH=tmp python3 tmp/clean.py
+  ok    env-poisoned invocation escalates: export BASH_ENV=tmp/evil.sh; bash tmp/clean.sh
+== finding 18: csh/tcsh/fish, pypy, and uv run/uvx/pipx run are covered ==
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && csh tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && tcsh tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && fish tmp/evil.sh
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && pypy3 tmp/evil.py
+  ok    judged or refused (rc=0): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && uv run python tmp/evil.py
+  ok    judged or refused (rc=3): cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && uv run tmp/evil.py
+== finding 12: rewriting the script another segment runs escalates (rename/copy laundering) ==
+  ok    laundering escalates: cp tmp/evil.sh tmp/laundered.sh && bash tmp/laundered.sh
+  ok    laundering escalates: cat tmp/evil.sh > tmp/laundered.sh; bash tmp/laundered.sh
+  ok    laundering escalates: ln -sf evil.sh tmp/laundered.sh && bash tmp/laundered.sh
+  ok    a script named only in its own invocation still resolves and binds its sha
+== code by reference, review round 2 (#160) ==
+  ok    python -c local import escalates: python3 -c 'import pkgr.evil'
+  ok    python -c local import escalates: python3 -c 'from pkgr import evil'
+  ok    python -c local import escalates: cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && python3 -c 'import pkgr.evil'
+  ok    python -c with only stdlib imports is not code by reference
+  ok    a self-rewriting script run twice escalates
+  ok    the same script twice escalates (fails closed)
+  ok    a writer between two runs still escalates
+  ok    a run that redirects onto the script still escalates
+== code by reference: order gate and unbound python -c (F8b, #160 round 3 H-b/H-c) ==
+  ok    order-unsafe is not a plain binding (rc=0): cp tmp/evil.sh tmp/clean.s?; bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): cat tmp/evil.sh > tmp/clea?.sh; bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): cp tmp/evil.sh tmp/clean.s[h]; bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): tee tmp/clean.s{h,x} < tmp/evil.sh; bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): d=tmp/clea; cp tmp/evil.sh ${d}n.sh; bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): python3 -c 'open("tmp/clea"+"n.sh","w").write("x")'; bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): cp tmp/evil.sh tmp/*an.sh; bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): bash tmp/clean.sh >> tmp/clea?.sh
+  ok    order-unsafe is not a plain binding (rc=0): bash tmp/clean.sh | tee tmp/clean.s?
+  ok    order-unsafe is not a plain binding (rc=0): git pull && bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): git diff --output=tmp/x && bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): git -c diff.external=x diff && bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): git stash && bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): GIT_EXTERNAL_DIFF=x git diff; bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): GIT_PAGER=x git log; bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): git remote add x 'ext::sh -c true' && git remote update x && bash tmp/clean.sh
+  ok    order-unsafe is not a plain binding (rc=0): git branch --edit-description && bash tmp/clean.sh
+  ok    read-only company keeps a plain binding: bash tmp/clean.sh
+  ok    read-only company keeps a plain binding: bash tmp/clean.sh 2>&1 | tail -3
+  ok    read-only company keeps a plain binding: bash tmp/clean.sh && echo done
+  ok    read-only company keeps a plain binding: bash tmp/clean.sh > /tmp/out.txt
+  ok    read-only company keeps a plain binding: bash tmp/clean.sh | grep hello | wc -l
+  ok    read-only company keeps a plain binding: bash tmp/clean.sh && git status
+  ok    read-only company keeps a plain binding: git log --oneline -3 && bash tmp/clean.sh
+  ok    read-only company keeps a plain binding: git remote -v && bash tmp/clean.sh
+  ok    unbound-cwd python -c import escalates: cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && cd tmp && python3 -c 'import evil'
+  ok    unbound-cwd python -c import escalates: cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt/tmp && python3 -c 'import evil'
+  ok    unbound-cwd python -c import escalates: cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && (cd tmp; python3 -c 'import evil')
+  ok    unbound-cwd python -c import escalates: cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && pushd tmp && python3 -c 'import evil'
+  ok    unbound-cwd python -c import escalates: python3 -c 'import evil'
+  ok    unbound-cwd python -c import escalates: python3 -c 'from . import evil'
+  ok    stdlib-only python -c stays out of scope: python3 -c 'import json; print(1)'
+  ok    stdlib-only python -c stays out of scope: cd /private/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.EFO9uuURg4/crwt && cd tmp && python3 -c 'import json'
+== trunk-identical suite: one conductor review per worktree state (F5) ==
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (A) unmodified suite, no worktree changes: still one conductor review (trunk path, not reserved)
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (A-g) after approval, the piped form replays for the clean state
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (s) a trunk-identical script that is not a test entry point never takes the trunk path
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (a) a change-set makes it escalate on the trunk path, not reserved
+  ok    (a) the approval sha binds more than the file bytes
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (b) approved suite + same worktree state re-runs for a peer
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (g) the piped form binds the same way
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (c) a lib edit changes the state: escalates again
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (d) an untracked file changes the state: escalates again
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (b2) back to the approved state: replays again
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (j) an edit hidden by assume-unchanged still changes the state (raw bytes): escalates
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (b3) approved state replays before the filter attack
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (k) textconv/clean-filter cannot hide a lib edit from the change-set
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (h) a changed .gitignore disqualifies the trunk path
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (i) the order gate beats the trunk path
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (e) a worker-modified suite leaves the trunk path (escalate)
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (f) origin/main moved locally to the worker's commit: no trunk path
+/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/command-policy.sh: line 7459: /Users/thurbs/.cache/herdr-control/command-policy.17973.reason: Operation not permitted
+  ok    (f2) the worker's own branch on the remote is not trunk
+-----
+passed=260 failed=0
+PASS

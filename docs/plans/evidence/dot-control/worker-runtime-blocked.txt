@@ -1,0 +1,51 @@
+Command: /Users/thurbs/.local/share/mise/installs/node/22.23.2/bin/node node_modules/vitest/vitest.mjs run --project tasks --configLoader runner
+Working directory: /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/remote-mcp/worker
+Exit: 1
+Captured tool output (terminal color escapes omitted; no rerun):
+
+ RUN  v4.1.11 /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/remote-mcp/worker
+
+ERROR Failed to write to log file Error: EPERM: operation not permitted, open '/Users/thurbs/Library/Preferences/.wrangler/logs/wrangler-2026-10-10_00-52-44_340.log'
+
+      at open (node:internal/fs/promises:639:25)
+      at writeFile (node:internal/fs/promises:1222:14)
+      at /Users/thurbs/Code/herdr-control/remote-mcp/worker/node_modules/wrangler/wrangler-dist/cli.js:65055:7
+      at Mutex.runWith (/Users/thurbs/Code/herdr-control/remote-mcp/worker/node_modules/miniflare/dist/src/index.js:70205:16)
+      at appendToDebugLogFile (/Users/thurbs/Code/herdr-control/remote-mcp/worker/node_modules/wrangler/wrangler-dist/cli.js:65052:3) {
+    errno: -1,
+    code: 'EPERM',
+    syscall: 'open',
+    path: '/Users/thurbs/Library/Preferences/.wrangler/logs/wrangler-2026-10-10_00-52-44_340.log'
+  }
+
+ERROR Would have written:
+  --- 2026-10-10T00:52:44.502Z debug
+  🪵  Writing logs to "/Users/thurbs/Library/Preferences/.wrangler/logs/wrangler-2026-10-10_00-52-44_340.log"
+  ---
+
+⎯⎯⎯⎯⎯⎯ Unhandled Errors ⎯⎯⎯⎯⎯⎯
+
+Vitest caught 1 unhandled error during the test run.
+This might cause false positive tests. Resolve unhandled errors to make sure your tests are not affected.
+
+⎯⎯⎯⎯⎯⎯ Unhandled Error ⎯⎯⎯⎯⎯⎯⎯
+Error: [vitest-pool]: Failed to start cloudflare-pool worker for test files /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/remote-mcp/worker/test/tasks.test.ts.
+ ❯ ../../../../../../../Code/herdr-control/remote-mcp/worker/node_modules/vitest/dist/chunks/cli-api.CnMVyzaz.js:3532:94
+ ❯ processTicksAndRejections node:internal/process/task_queues:103:5
+ ❯ Pool.schedule ../../../../../../../Code/herdr-control/remote-mcp/worker/node_modules/vitest/dist/chunks/cli-api.CnMVyzaz.js:3532:5
+
+Caused by: Error: listen EPERM: operation not permitted 127.0.0.1
+ ❯ Server.setupListenHandle [as _listen2] node:net:1919:21
+ ❯ listenInCluster node:net:1998:12
+ ❯ node:net:2207:7
+ ❯ processTicksAndRejections node:internal/process/task_queues:89:21
+
+Serialized Error: { code: 'EPERM', errno: -1, syscall: 'listen', address: '127.0.0.1' }
+
+ Test Files  no tests
+      Tests  no tests
+     Errors  1 error
+   Start at  20:52:44
+   Duration  140ms (transform 0ms, setup 0ms, import 0ms, tests 0ms, environment 0ms)
+
+🪵  Logs were written to "/Users/thurbs/Library/Preferences/.wrangler/logs/wrangler-2026-10-10_00-52-44_340.log"

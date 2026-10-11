@@ -1333,3 +1333,68 @@ prompt_command_text() {
       | sed -E 's/[[:space:]]+$//'
   )"
 }
+
+# ---- occurrence display adapter (docs/plans/dot-herdr-recovery-slices.md §2) -
+#
+# prompt_any_visible/_prompt_menu's own return codes collapse two different
+# facts onto one "nothing to show" signal: `_menu_window`'s status is the
+# LAST stage of its own pipe (`_sanitize_utf8`), never `herdr pane read`'s —
+# so a real transport failure (pane gone, herdr down) and a genuinely empty,
+# successfully-read window both produce an empty string and both read as
+# "no prompt". `attention-tick.sh:337`'s `[ "$visible" = "true" ] || continue`
+# is exactly that collapse: an unreadable prompt is treated like an answered
+# one, so a stuck pane whose screen cannot be read escalates to nobody.
+#
+# This reads the RAW `herdr pane read` exit status once (not through a pipe)
+# and ONLY THEN runs the existing, unchanged menu/numbered parse over the
+# bytes it got — same `_menu_gate`, `_prompt_menu_parse`, `_OPT_LINE` as
+# prompt_any_visible, so a fixture that used to parse still parses exactly
+# the same way. It adds a state prompt_any_visible has no way to express,
+# it does not change what counts as a parseable prompt.
+#
+# prompt_occurrence_display <pane> -> one of:
+#   read_failed        — `herdr pane read` itself failed (nonzero exit): pane
+#                         gone, herdr socket down, or any other transport
+#                         fault. Distinct from "read fine, nothing painted".
+#   no_prompt           — the read succeeded and nothing on screen even
+#                         LOOKS like a prompt: no menu-gate footer words,
+#                         no numbered-option tail. An idle/working pane or
+#                         one whose prompt was answered a moment ago reads
+#                         this, never pending_unreadable (M5, Main review:
+#                         conflating the two recreates #59's false
+#                         "needs input" in the opposite direction). CALLER
+#                         CONTRACT: only meaningful for an occurrence the
+#                         fold still shows open — this function alone
+#                         cannot know whether a pane was ever blocked.
+#   pending_unreadable  — something menu-shaped IS on screen (the gate's
+#                         footer words matched) but the strict two-pass
+#                         parser could not resolve a complete panel — a
+#                         real "stuck, can't read it" case (wrapped/clipped
+#                         shapes, see the KNOWN SHAPES note above).
+#   pending_parseable   — a prompt (menu or numbered shape) is currently
+#                         parseable on this exact snapshot.
+prompt_occurrence_display() {           # <pane>
+  local pane="$1" raw rc win tail_match
+  raw="$(_pane_read_raw "$pane" --format ansi)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'read_failed\n'
+    return 0
+  fi
+  win="$(printf '%s' "$raw" | _sanitize_utf8)"
+  if _menu_gate "$win"; then
+    if printf '%s\n' "$win" | _prompt_menu_parse visible; then
+      printf 'pending_parseable\n'
+    else
+      printf 'pending_unreadable\n'
+    fi
+    return 0
+  fi
+  tail_match="$(printf '%s\n' "$win" | tail -n 20 \
+    | sed -nE -e $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' -e "s/$_OPT_LINE/\1/p")"
+  if [ -n "$tail_match" ]; then
+    printf 'pending_parseable\n'
+  else
+    printf 'no_prompt\n'
+  fi
+}

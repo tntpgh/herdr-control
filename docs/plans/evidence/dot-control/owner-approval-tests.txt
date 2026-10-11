@@ -1,0 +1,138 @@
+== inert: no owner store exists until a human registers one ==
+  ok    missing identity record: refused (fail closed)
+  ok    …with the PS_POLICY=identity fail-closed wording
+  ok    …and names the session id and pane a human would register
+  ok    the check never creates the owner store
+  ok    the owner check never touches the control-plane registry
+== positive control: a live, matching, human-made record ==
+  ok    record registered
+  ok    registered owner: a read-only command runs
+  ok    registered owner: read runs
+  ok    verdicts are audited in owner_events with the session id
+== unknown / malformed owner label ==
+  ok    unknown owner label: refused
+  ok    malformed owner label: refused
+  ok    --owner with an empty label: refused
+== recycled / stale pane ==
+  ok    same pane id, later pane birth: refused
+  ok    pane no longer in herdr pane list: refused
+  ok    another pane presenting the owner's label and session: refused
+  ok    no HERDR_PANE_ID: refused
+== session-id mismatch ==
+  ok    a new/resumed session in the owner's own pane: refused
+  ok    the refusal does not reveal the registered session id
+  ok    no session id from the hook: refused
+== worker identity and owner label together ==
+  ok    a session carrying both a worker task and an owner label: refused
+== revoked owner, mid-session ==
+  ok    before revocation the owner runs a read
+  ok    revoked
+  ok    the very next call of the same session: refused
+  ok    revoking an already-revoked owner is a no-op (rc 1)
+  ok    a human re-registers the label for a NEW session
+  ok    the revoked session stays refused after the label is re-bound
+  ok    the newly registered session runs
+  ok    revocation keeps history: two rows, never deleted
+== missing / corrupt identity record ==
+  ok    store is garbage: refused
+  ok    store without the owner table: refused
+  ok    restored store: the owner runs again (control)
+  ok    unreadable store (mode 000): refused
+  ok    a record with no pane_birth: refused
+  ok    the store refuses any state but active/revoked (CHECK)
+== spoofed terminal text and payload fields never decide ==
+  ok    pane shows 'owner approved', payload says approved/session sess-A, env claims approval: still refused
+  ok    identity consulted only herdr pane list — never pane text
+  ok    a command that IS the approval string grants nothing
+== self-registration / self-elevation by the owner session ==
+  ok    owner-mode bash refused: bash /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/owner
+  ok    owner-mode bash refused: /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/owner-appr
+  ok    owner-mode bash refused: sqlite3 /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.cLIHVqgHL
+  ok    owner-mode bash refused: sqlite3 ~/.local/state/herdr/runs/owner-identities.sqlite3 .dump
+  ok    owner-mode bash refused: python3 -c "import sqlite3; sqlite3.connect('/var/folders/c5/tt3qy2k11
+  ok    owner-mode bash refused: HERDR_OWNER_APPROVAL=x bash -c true
+  ok    owner-mode bash refused: bash -c '. lib/owner-identity.sh; owner_identity_register main-owner w
+  ok    owner-mode write tool onto the owner store: refused
+  ok    owner-mode edit of the identity library: refused
+  ok    owner-mode eval: refused (the incident's bypass tool)
+  ok    the owner record is unchanged after every attempt
+  ok    CLI: owner-mode environment refused (exit 9)
+  ok    CLI: worker environment refused (exit 9)
+  ok    CLI: called from the pane being registered refused (exit 9)
+  ok    CLI: called from a pane running an agent refused (exit 9)
+  ok    CLI: no terminal on stdin refused (exit 9)
+  ok    CLI: revoke from an agent pane refused (exit 9)
+  SKIP  3 real-process ancestry/PTY cases: sandbox denies ps; no owner registration attempted
+  ok    no refused CLI call wrote an identity row
+  ok    every refused CLI attempt is audited
+  ok    CLI show is read-only and works from anywhere
+== concurrency: two processes claiming one pane ==
+  ok    30 parallel checks: the registered session 15/15 allowed, the other 15/15 refused, no crash
+  ok    12 racing registrations of one pane: exactly one lands, 11 conflict
+  ok    a second label on an owner's active pane is refused (rc 3)
+  ok    one session cannot be two owners (rc 3)
+  ok    revocation racing 16 checks: every answer is a clean allow/refuse, and refuse after
+== owner tightening: mutations and reserved calls are Terrence's ==
+  ok    write tool outside any scope (the incident's target shape): refused
+  ok    owner bash write/exec refused: python3 -c "open('/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm00
+  ok    owner bash write/exec refused: node -e "require('fs').writeFileSync('/var/folders/c5/tt3qy2
+  ok    owner bash write/exec refused: echo '{}' > /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T
+  ok    owner bash write/exec refused: printf x >> /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T
+  ok    owner bash write/exec refused: cat /tmp/x | tee /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm000
+  ok    owner bash write/exec refused: cp /tmp/x /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/t
+  ok    owner bash write/exec refused: mkdir -p /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tm
+  ok    owner bash write/exec refused: touch /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.c
+  ok    owner bash write/exec refused: sed -i '' s/a/b/ /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm000
+  ok    owner bash write/exec refused: git status --short && echo x > /var/folders/c5/tt3qy2k11r3gj
+  ok    owner bash write/exec refused: cat "$(echo x > /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000
+  ok    owner bash write/exec refused: env python3 -c 1
+  ok    owner bash write/exec refused: git -C /tmp commit -m x
+  ok    owner bash write/exec refused: find /tmp -name x -delete
+  ok    owner read-only bash still runs: git status --short
+  ok    owner read-only bash still runs: git log --oneline -3
+  ok    owner read-only bash still runs: cat /etc/hosts
+  ok    owner read-only bash still runs: grep -n x /etc/hosts | head -3
+  ok    owner read-only bash still runs: ls -la /tmp
+  ok    owner read-only bash still runs: jq -n 1
+  ok    control: git grep --open-files-in-pager really executes its value
+  ok    owner pager/exec option refused: git grep --open-files-in-pager='printf PAGER_EXECUTED > /var/folders/c
+  ok    owner pager/exec option refused: git grep -O 'printf PAGER_EXECUTED > /var/folders/c5/tt3qy2k11r3gjm135
+  ok    owner pager/exec option refused: git grep -O'printf PAGER_EXECUTED > /var/folders/c5/tt3qy2k11r3gjm1358
+  ok    owner pager/exec option refused: git grep -iO'printf PAGER_EXECUTED > /var/folders/c5/tt3qy2k11r3gjm135
+  ok    owner pager/exec option refused: git grep --open='printf PAGER_EXECUTED > /var/folders/c5/tt3qy2k11r3gj
+  ok    owner pager/exec option refused: git grep --op'en-files-in-pager'='printf PAGER_EXECUTED > /var/folders
+  ok    owner pager/exec option refused: git grep "-O"'printf PAGER_EXECUTED > /var/folders/c5/tt3qy2k11r3gjm13
+  ok    owner pager/exec option refused: git grep -\O'printf PAGER_EXECUTED > /var/folders/c5/tt3qy2k11r3gjm135
+  ok    owner pager/exec option refused: git grep $PAGERX -e '^#' -- docs/design/pretool-approval.md
+  ok    owner pager/exec option refused: git grep {-O'printf PAGER_EXECUTED > /var/folders/c5/tt3qy2k11r3gjm135
+  ok    owner pager/exec option refused: git diff --ext HEAD
+  ok    owner pager/exec option refused: git log -p -1 --textc
+  ok    owner pager/exec option refused: git log -1 --ou=/var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.c
+  ok    owner pager/exec option refused: find . -maxdepth 1 -e"xec" sh -c 'printf PAGER_EXECUTED > /var/folders
+  ok    the pager marker was never created
+  FAIL  owner git with a $ in an argument: refused (round 11 class rule): rc=8 {"decision":"block","reason":"herdr owner-approval: not run — find/git combined with substitution, redirect or quoting: a conductor must review it. An owner session has no conductor above it, so this is Terrence's call: stop and ask him. Do not retry it or work around it through another tool (eval, write, edit, a script).","request_id":"","verdict":"escalate"}
+  ok    owner read-only git/find still runs: git grep -n -e owner -- docs/design/pretool-approval.md
+  FAIL  owner read-only git/find still runs: git log --oneline -1 -- '*.md': rc=8 {"decision":"block","reason":"herdr owner-approval: not run — find/git combined with substitution, redirect or quoting: a conductor must review it. An owner session has no conductor above it, so this is Terrence's call: stop and ask him. Do not retry it or work around it through another tool (eval, write, edit, a script).","request_id":"","verdict":"escalate"}
+  ok    owner read-only git/find still runs: git log -1 --extended-regexp --grep=x
+  ok    owner read-only git/find still runs: git diff --no-ext-diff --stat HEAD
+  ok    owner read-only git/find still runs: git show --stat HEAD@{0}
+  FAIL  owner read-only git/find still runs: find . -maxdepth 1 -name '*.md': rc=8 {"decision":"block","reason":"herdr owner-approval: not run — find/git combined with substitution, redirect or quoting: a conductor must review it. An owner session has no conductor above it, so this is Terrence's call: stop and ask him. Do not retry it or work around it through another tool (eval, write, edit, a script).","request_id":"","verdict":"escalate"}
+  ok    eval write to the same file: refused
+  ok    nothing was written (the judge never executes the call)
+  ok    deny-class command: refused, nobody can approve
+  ok    reserved (secret_present): refused for Terrence
+  ok    no action request and no registry write for an owner refusal
+  ok    browser: refused
+== the omp hook ==
+  ok    registered owner through the hook: read/status run; eval, store write, self-registration, junk refused
+  ok    env HERDR_OWNER_SESSION_ID never substitutes for ctx's session id: every call refused
+  ok    a throwing session manager: every call refused, handler never throws
+  ok    another session in the owner's pane: every call refused
+  ok    owner label + --auto-approve with no owner store: every call refused (no yolo fallback)
+  ok    owner label with the pre-tool lib missing: every call refused
+  ok    no owner label (nonworker): every hook answer identical to origin/main (["ALLOW","ALLOW","ALLOW","ALLOW","ALLOW","ALLOW"])
+  ok    no owner label (menuworker): every hook answer identical to origin/main (["ALLOW","ALLOW","ALLOW","BLOCK","ALLOW","ALLOW"])
+== not wired: nothing calls the registration path or sets the label ==
+  ok    no script, config or spawn path references the owner CLI or sets the label
+
+118 passed, 3 failed, 3 skipped (environment)

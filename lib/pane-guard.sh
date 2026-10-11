@@ -178,12 +178,68 @@ pane_is_conductor_eligible() {          # pane_id -> 0 eligible, 1 refuse
 # Bounded (HERDR_ANCESTOR_WALK_MAX hops, default 32) so a cycle or a very
 # deep tree cannot hang a caller; each hop costs one `ps` call.
 _pg_process_ancestors() {   # -> $PPID, its parent, ... one pid per line
-  local pid="$PPID" hops=0 max="${HERDR_ANCESTOR_WALK_MAX:-32}"
+  local pid="$PPID" parent hops=0 max="${HERDR_ANCESTOR_WALK_MAX:-32}"
   while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && [ "$hops" -lt "$max" ]; do
     printf '%s\n' "$pid"
     hops=$((hops + 1))
-    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    parent="$(ps -o ppid= -p "$pid" 2>/dev/null)" || return 1
+    pid="$(printf '%s' "$parent" | tr -d '[:space:]')"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   done
+  # A truncated walk is an unavailable identity, never evidence the caller
+  # is an external human. Partial stdout must not be used after failure.
+  [ "$pid" = 0 ] || [ "$pid" = 1 ]
+}
+
+# Decode before shell capture, with exact integer types rather than floating
+# point coercion. jq accepts non-JSON numbers and replaces invalid UTF-8; those
+# tolerances cannot establish the security-sensitive outside-caller result.
+_pg_identity_rows() {
+  # Ignore repository/PYTHONPATH imports and site startup hooks: worker CWD
+  # contents must not replace the standard-library identity parser.
+  python3 -I -S -c '
+import json, re, sys
+from decimal import Decimal
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+def invalid_constant(value):
+    raise ValueError("non-JSON numeric constant")
+
+try:
+    body = json.loads(sys.stdin.buffer.read().decode("utf-8"),
+                      parse_float=Decimal, parse_constant=invalid_constant,
+                      object_pairs_hook=unique_object)
+    if type(body) is not dict:
+        raise ValueError("invalid response")
+    if sys.argv[1] == "panes":
+        panes = body.get("result", {}).get("panes")
+        if panes is None:
+            panes = body.get("panes")
+        if type(panes) is not list or not all(
+            type(row) is dict and type(row.get("pane_id")) is str
+            and re.fullmatch(r"[A-Za-z0-9:_-]+", row["pane_id"])
+            for row in panes):
+            raise ValueError("invalid pane inventory")
+        rows = [row["pane_id"] for row in panes]
+    else:
+        processes = body["result"]["process_info"]["foreground_processes"]
+        if type(processes) is not list or not all(
+            type(row) is dict and type(row.get("pid")) is int
+            and 0 < row["pid"] <= 2147483647 for row in processes):
+            raise ValueError("invalid process inventory")
+        rows = [str(row["pid"]) + " " + sys.argv[2] for row in processes]
+    for row in rows:
+        print(row)
+except (ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
+    sys.exit(1)
+' "$@"
 }
 
 # Which live pane is this process actually running inside, as herdr itself
@@ -197,24 +253,27 @@ _pg_process_ancestors() {   # -> $PPID, its parent, ... one pid per line
 #            the only rc designate-main.sh's --force may treat as "outside
 #            herdr's reach" (see note above).
 caller_pane_from_ancestry() {
-  local panes pane_ids p map ancestors pid found
-  panes="$(herdr pane list 2>/dev/null)" || return 1
-  [ -n "$panes" ] || return 1
-  pane_ids="$(printf '%s' "$panes" | jq -r '(.result.panes // .panes)[]?.pane_id' 2>/dev/null)"
+  local pane_ids p rows map ancestors pid found
+  # Parse raw transport bytes before Bash can discard NULs.
+  # Scoped pipefail preserves a producer error even after valid JSON output.
+  pane_ids="$(set -o pipefail; herdr pane list 2>/dev/null | _pg_identity_rows panes 2>/dev/null)" || return 1
   [ -n "$pane_ids" ] || return 1
   map=""
   for p in $pane_ids; do
-    local info
-    info="$(herdr pane process-info --pane "$p" 2>/dev/null)" || return 1
+    # A missing/malformed response is unknown identity, not a clean no-match.
+    # Validate the whole array before emitting any row and preserve failures;
+    # rc=2 is a security-sensitive proof consumed by designate-main --force.
+    rows="$(set -o pipefail; herdr pane process-info --pane "$p" 2>/dev/null | _pg_identity_rows processes "$p" 2>/dev/null)" || return 1
     map="$map
-$(printf '%s' "$info" | jq -r --arg pane "$p" \
-      '.result.process_info.foreground_processes[]? | (.pid|tostring) + " " + $pane' 2>/dev/null)"
+$rows"
   done
-  ancestors="$(_pg_process_ancestors)"
+  ancestors="$(_pg_process_ancestors)" || return 1
   [ -n "$ancestors" ] || return 1
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
-    found="$(printf '%s' "$map" | awk -v want="$pid" '$1==want {print $2; exit}')"
+    # Consume the complete map so pipefail cannot turn an early matching exit
+    # into an upstream SIGPIPE on a large, otherwise valid inventory.
+    found="$(printf '%s' "$map" | awk -v want="$pid" '$1==want && !seen {print $2; seen=1}')" || return 1
     if [ -n "$found" ]; then printf '%s\n' "$found"; return 0; fi
   done <<EOF
 $ancestors

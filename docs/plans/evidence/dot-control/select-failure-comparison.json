@@ -1,0 +1,37 @@
+{
+  "baseline_commit": "4f071ad0454bb5fcb1d835872bd6705064207c3f",
+  "candidate_log": "/tmp/herdr-regression-select-final.log",
+  "baseline_log": "/tmp/herdr-regression-select-baseline.log",
+  "candidate_summary": [
+    "passed=387 failed=22"
+  ],
+  "baseline_summary": [
+    "passed=387 failed=22"
+  ],
+  "identical_ordered_failure_lines": true,
+  "failure_count": 22,
+  "failure_lines": [
+    "  FAIL  exit 8 (expected 0); stderr: awk: illegal byte sequence  \ufffd",
+    "  FAIL  keys pressed=0",
+    "  FAIL  pressed ''",
+    "  FAIL  verdict=",
+    "  FAIL  authority=",
+    "  FAIL  decided_at empty",
+    "  FAIL  attempted_at empty",
+    "  FAIL  confirmed_at empty",
+    "  FAIL  outcome=",
+    "  FAIL  clean capture unexpectedly refused: exit 8; stderr: awk: illegal byte sequence  \ufffd",
+    "  FAIL  'gh pr create --base main --fill' now refused: rc=8; herdr-select: REFUSED (escalate) \u2014 a human must answer this one.",
+    "  FAIL  'gh issue edit 5 --add-label ready-for-review' now refused: rc=8; herdr-select: REFUSED (escalate) \u2014 a human must answer this one.",
+    "  FAIL  'set -euo pipefail' now refused: rc=8; herdr-select: REFUSED (escalate) \u2014 a human must answer this one.",
+    "  FAIL  'export UV_CACHE_DIR=/tmp/uv' now refused: rc=8; herdr-select: REFUSED (escalate) \u2014 a human must answer this one.",
+    "  FAIL  exit 8 (expected 0)",
+    "  FAIL  authority=human",
+    "  FAIL  rc=8 keys=0",
+    "  FAIL  task state=blocked (expected running)",
+    "  FAIL  rc=8 keys=0",
+    "  FAIL  authority=human",
+    "  FAIL  exit 8 (expected 0)",
+    "  FAIL  rc=8"
+  ]
+}

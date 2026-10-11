@@ -155,12 +155,10 @@ for p in $(panes); do
   out="$(bash "$SELECT" "$p" "$choice" --expect-prompt-id "$pid" 2>&1)"; rc=$?
   case "$rc" in
     0) printf '  -> answered %s via herdr-select\n' "$choice"; answered=$((answered + 1)) ;;
-    8) # The clipping refusal is a RESULT, not an error: the request does not fit
-       # the approval box, so nobody — human or peer — can see all of what they
-       # would be approving. The worker has to re-issue it smaller.
-       printf '  -> NEEDS THE WORKER: approval text is clipped, so no one can see all of it\n'
-       printf '     tell it to re-issue in shorter commands (send-to-agent.sh %s "...")\n' "$p"
-       clipped=$((clipped + 1)) ;;
+    8) # Exit 8 also covers identity, provenance and policy refusals. It is
+       # not evidence of clipping and never permission to reword a held action.
+       printf '  -> HELD: herdr-select refused: %s\n' "$(printf '%s' "$out" | head -1)"
+       held=$((held + 1)) ;;
     *) printf '  -> herdr-select refused (exit %s): %s\n' "$rc" "$(printf '%s' "$out" | head -1)"
        held=$((held + 1)) ;;
   esac

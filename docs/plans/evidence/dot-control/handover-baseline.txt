@@ -1,0 +1,88 @@
+== fixture: six active tasks under C1, one worker pane each ==
+  ok    taskA starts owned by C1
+== pane_is_conductor_eligible (#252/P3): the shared conductor-eligibility check, standalone ==
+  ok    a plain unregistered live pane is eligible
+  ok    a registered worker's own active pane is refused
+  ok    a non-agent pane is refused
+  ok    a herdr read failure is refused, not treated as eligible
+== lib/run-registry.sh set_task_conductor: the raw CAS ==
+  ok    taskC's conductor is now C2
+  ok    conductor_handover event recorded
+  ok    event payload names from/to
+== stale from (CAS miss): refused, no event, row untouched ==
+  ok    stale from-pane refused
+  ok    taskC's conductor is still C2
+  ok    no second conductor_handover event for the stale attempt
+== two concurrent handovers of the same task: exactly one wins ==
+run-registry: set_task_conductor CAS miss for run1/taskRace (from c1:p1/c1b no longer matches the live conductor, or the task is not active)
+  ok    exactly one of the two same-from CAS attempts won
+  ok    taskRace landed on the winner, C2
+== terminal task: refused ==
+  ok    terminal task refused the CAS (state not IN starting/running/blocked)
+== CLI: current live conductor hands its own task to a live non-worker pane ==
+conductor-handover: refusing — could not verify caller identity from process ancestry (herdr unreachable, or this process traces to no live pane)
+  FAIL  exit 0 (expected '0', got '3')
+  FAIL  taskA's conductor is now C2 (expected 'c2:p1', got 'c1:p1')
+  FAIL  taskA's conductor_pane_birth is now C2's live birth (expected 'c2b', got 'c1b')
+== herdr-select.sh conductor check, replicated: passes for C2, fails for C1 ==
+  FAIL  the NEW conductor (C2) can now answer taskA's worker pane (expected 'ok', got 'refused')
+  FAIL  the OLD conductor (C1) can no longer answer it (expected 'refused', got 'ok')
+== CLI: the old conductor can no longer hand over a task it already gave away ==
+  ok    exit nonzero: ex-conductor refused
+  FAIL  taskA's conductor is still C2 (expected 'c2:p1', got 'c1:p1')
+== CLI: Main hands over ANY task, not just its own; both sides get a tagged notify ==
+conductor-handover: refusing — could not verify caller identity from process ancestry (herdr unreachable, or this process traces to no live pane)
+  FAIL  exit 0 (expected '0', got '3')
+  FAIL  taskB's conductor is now C2 (expected 'c2:p1', got 'c1:p1')
+  FAIL  old conductor (C1) got exactly one notify, no wake (taskB wasn't blocked) (expected '1', got '0')
+  FAIL  new conductor (C2) got exactly one notify, no wake (taskB wasn't blocked) (expected '1', got '0')
+grep: /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.OjpTQY38Vh/wake_c1_p1.txt: No such file or directory
+  FAIL  old conductor's message missing [handover] tag: 
+grep: /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T/tmp.OjpTQY38Vh/wake_c2_p1.txt: No such file or directory
+  FAIL  new conductor's message missing [handover] tag: 
+== CLI: a non-conductor, non-Main caller is refused ==
+  ok    exit nonzero
+  ok    taskD's conductor is unchanged
+== CLI: a worker caller (its real ancestry traces to its own active pane) is refused ==
+  FAIL  exit 4 (expected '4', got '3')
+  ok    taskD's conductor is unchanged
+== CLI: a worker spoofing HERDR_PANE_ID=<Main> is still refused — identity comes from ancestry, not env ==
+  FAIL  exit 4 (expected '4', got '3')
+  ok    taskD's conductor is unchanged
+== CLI: a herdr ancestry-read failure refuses the caller, never guesses ==
+  ok    exit 3
+  ok    taskD's conductor is unchanged
+== CLI: the target must not be a registered worker's own active pane ==
+  ok    exit nonzero: worker-pane target refused
+  ok    taskD's conductor is unchanged
+== CLI: a dead target pane is refused ==
+  ok    exit nonzero: dead target refused
+  ok    taskD's conductor is unchanged
+== CLI: --dry-run changes nothing ==
+conductor-handover: refusing — could not verify caller identity from process ancestry (herdr unreachable, or this process traces to no live pane)
+  FAIL  exit 0 (expected '0', got '3')
+  FAIL  dry-run output did not say DRY RUN: 
+  ok    taskE's conductor is unchanged
+  ok    no conductor_handover event written
+  ok    dry-run sent no notify at all
+== re-wake: a blocked task's pending prompt is re-delivered to the new conductor ==
+conductor-handover: refusing — could not verify caller identity from process ancestry (herdr unreachable, or this process traces to no live pane)
+  FAIL  exit 0 (expected '0', got '3')
+  FAIL  taskF's conductor is now C2 (expected 'c2:p1', got 'c1:p1')
+  FAIL  the new conductor (C2) got the re-delivered wake PLUS the notify (2 sends) (expected '2', got '0')
+  FAIL  the old conductor (C1) got only the notify, no wake (expected '1', got '0')
+  FAIL  wake_attempted recorded against the new conductor pane (expected 'c2:p1', got '')
+  FAIL  wake_result recorded submitted (delivered through send-to-agent.sh, not a new sender) (expected 'submitted', got '')
+== F1 (security review PR #253): a LATER prompt wakes the NEW conductor even with a stale env HERDR_CONDUCTOR_PANE_ID ==
+  ok    exit 0 (delivered)
+  FAIL  woken the NEW conductor (C2), not the stale env pane (C1) (expected '1', got '0')
+  FAIL  nothing sent to the stale env pane (C1) (expected '0', got '1')
+  FAIL  wake_attempted recorded against the NEW conductor pane, not the stale env one (expected 'c2:p1', got 'c1:p1')
+== help text and bad usage ==
+  ok    exit 0
+  ok    neither --task nor --from: exit 2
+  ok    both --task and --from: exit 2
+  ok    no --reason: exit 2
+-----
+passed=33 failed=25
+FAIL

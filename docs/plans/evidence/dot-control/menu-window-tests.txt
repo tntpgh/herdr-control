@@ -1,0 +1,28 @@
+== a panel that fits is answerable (regression floor)
+  ok   short panel parses
+  ok   short panel highlight found
+== a panel taller than the old fixed window, but still ON SCREEN
+  ok   tall panel parses (was: unanswerable forever)
+  ok   tall panel highlight found
+== a very tall panel still parses
+  ok   very tall pane reports very tall window
+== a panel whose HEADER is off-viewport is answered by the footer-anchored pass
+  ok   a header off-viewport is still answerable (footer-anchored)
+  ok   the truncated parse marks itself as truncated
+== the window is NOT derived from the pane record
+  ok   a parse makes no extra pane-list RPC
+== fail-closed behaviour is PRESERVED for a genuinely broken panel
+  ok   unknown option shape still refuses
+== the OTHER three fixed-60 reads on the same path (review BLOCKERs)
+  ok   prompt_command_text sees the command in a tall panel
+  ok   prompt_id distinguishes two commands in a tall panel
+  ok   human_must_answer escalates a tall panel instead of reading the steering queue
+== a tool whose approval panel renders no body row still fingerprints distinctly
+  ok   the pending calls own code reaches the fingerprint text
+  ok   two different browser calls no longer collide on one prompt_id
+== the fallback never fires when the panel already has its own content
+  ok   a real command panel ignores the running box above it
+== two truly identical browser panels with no running box still collide honestly
+  ok   a genuinely undistinguishable pair still reports one honest id
+
+verify-menu-window.sh: 16 passed, 0 failed

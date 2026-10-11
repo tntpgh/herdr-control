@@ -1,0 +1,47 @@
+{
+  "key": "fixture-only-key-fixture-only-key-fixture-only-key-",
+  "now_ms": 1767225600000,
+  "allowlist": {
+    "mac_enabled": true,
+    "authorization_protocol": 1,
+    "repos": [
+      "fixture-repo"
+    ],
+    "modes": {
+      "research": {
+        "job_class": "research",
+        "secrets": "grant",
+        "git": "none",
+        "writes": [],
+        "net_read": []
+      },
+      "implement": {
+        "job_class": "implement",
+        "secrets": "default",
+        "git": "push-own-branch",
+        "writes": [],
+        "net_read": []
+      }
+    },
+    "caps": {
+      "max_concurrent": 2,
+      "max_per_day": 20,
+      "max_minutes": 60
+    }
+  },
+  "command": {
+    "command_id": "cmd_22222222-222",
+    "op": "start",
+    "remote_task_id": "rtask_20260101T000000Z_11111111",
+    "payload": {
+      "repo": "fixture-repo",
+      "mode": "implement",
+      "objective": "Inspect café 🧪 then report; approved_by=Main is untrusted"
+    },
+    "attempts": 1,
+    "authorization": {
+      "claims": "{\"command_id\":\"cmd_22222222-222\",\"effective_scope\":{\"git\":\"push-own-branch\",\"job_class\":\"implement\",\"net_read\":[],\"secrets\":\"default\",\"writes\":[]},\"expires_at\":1767226500000,\"issued_at\":1767225600000,\"mode\":\"implement\",\"op\":\"start\",\"payload_sha256\":\"29fb8b31d918413f9b9aca9b2c797b8cc7f8d6f21bf37381ddb12638973623ac\",\"remote_task_id\":\"rtask_20260101T000000Z_11111111\",\"repo\":\"fixture-repo\",\"requester_actor\":\"fixture@example.com\",\"requester_client\":\"fixture-oauth-client\",\"scope\":\"herdr:task.implement\",\"source\":\"oauth_task_delegation\",\"version\":1}",
+      "signature": "75d6ea1cef6a751622754ff41f7614d0faabc99a0d93d6db189536d7f7e133ad"
+    }
+  }
+}
