@@ -1077,7 +1077,14 @@ with socketserver.TCPServer(("127.0.0.1", 0), H) as srv:
     threading.Timer(30, lambda: os._exit(0)).start()   # never outlive the suite
     srv.serve_forever()
 EOS
-  stub_summary() {                      # summary json -> the injected one-liner
+  # fix/omp-hook-nonblocking (2026-10-10): onBeforeAgentStart no longer
+  # spawnSyncs the hub curl on the turn that needs it — it kicks a
+  # background refresh and reads whatever hubSummaryCache last completed
+  # with. A single call in a FRESH process therefore always reads the cold
+  # cache ("none"); priming it needs a first call to start the fetch, a
+  # wait for the stub server's response to land, then a SECOND call that
+  # actually sees it.
+  stub_summary() {                      # summary json -> the injected one-liner, once warm
     : > "$SHIM3/port"
     python3 "$SHIM3/stub-hub.py" "$1" > "$SHIM3/port" &
     stub_pid=$!
@@ -1094,7 +1101,9 @@ EOS
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
-const bas = handlers["before_agent_start"]({});
+handlers["before_agent_start"]({});              // cold: only starts the background fetch
+await new Promise(r => setTimeout(r, 600));       // let the curl to the stub hub land
+const bas = handlers["before_agent_start"]({});   // warm: first turn that SEES the cache
 console.log("LINE:" + (bas && bas.message ? bas.message.content : "none"));
 ' 2>&1 | grep '^LINE:'
     kill "$stub_pid" 2>/dev/null || true
@@ -1126,7 +1135,7 @@ console.log("LINE:" + (bas && bas.message ? bas.message.content : "none"));
     *) bad "clamped line lost its content: $line" ;;
   esac
 
-  printf '== TS shim: the SAME unresolved count does not re-announce every turn ==\n'
+  printf '== TS shim: cold cache never blocks, warm cache announces, repeat stays quiet ==\n'
   # Terrence, 2026-09-22: "less noise, more of the right kind" — measured
   # against this exact banner repeating the identical count on every turn of
   # a multi-hour session. before_agent_start in THIS harness fires more often
@@ -1136,6 +1145,12 @@ console.log("LINE:" + (bas && bas.message ? bas.message.content : "none"));
   # function — that is unit-tested separately in agent-hooks) so the actual
   # read-compare-write round trip through the filesystem is what is proven
   # here, not just the decision logic in isolation.
+  #
+  # fix/omp-hook-nonblocking (2026-10-10) added a fourth thing to prove here:
+  # the FIRST before_agent_start call in a process must read "none" (the
+  # cache is cold, nothing fetched yet) rather than blocking on the curl —
+  # that is the whole point of the fix. The SECOND call, once the background
+  # fetch has had time to land, is the one that actually announces.
   SHIM4="$WORK/shim4"; mkdir -p "$SHIM4/agent-hooks"
   for s in omp-notify.sh omp-reconcile.sh; do printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM4/agent-hooks/$s"; done
   printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM4/herdr-resolve.sh"
@@ -1152,17 +1167,61 @@ console.log("LINE:" + (bas && bas.message ? bas.message.content : "none"));
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
+const cold = handlers["before_agent_start"]({});
+console.log("COLD:" + (cold && cold.message ? cold.message.content : "none"));
+await new Promise(r => setTimeout(r, 600));
 const first = handlers["before_agent_start"]({});
 console.log("FIRST:" + (first && first.message ? first.message.content : "none"));
 const second = handlers["before_agent_start"]({});
 console.log("SECOND:" + (second && second.message ? second.message.content : "none"));
 ' 2>&1)"
   kill "$shim4_pid" 2>/dev/null || true; wait "$shim4_pid" 2>/dev/null || true
+  printf '%s' "$shim4_out" | grep -q '^COLD:none$' \
+    && ok "a cold cache never blocks the turn on a curl — reads none, not a hang" || bad "cold turn: $shim4_out"
   printf '%s' "$shim4_out" | grep -q '^FIRST:hub: 3 task' \
-    && ok "the first turn announces" || bad "first turn: $shim4_out"
+    && ok "the first turn to see the warm cache announces" || bad "first warm turn: $shim4_out"
   printf '%s' "$shim4_out" | grep -q '^SECOND:none$' \
     && ok "the second turn, same unresolved count, stays quiet" \
     || bad "second turn repeated the announcement: $shim4_out"
+
+  printf '== TS shim: onBeforeAgentStart never blocks on a slow/hung reconcile ==\n'
+  # The regression this pins (fix/omp-hook-nonblocking, 2026-10-10): before
+  # this fix, onBeforeAgentStart spawnSync'd omp-reconcile.sh session with a
+  # 15s timeout — hung or merely slow, the whole omp UI event loop sat frozen
+  # for up to 15s on every turn (SPEC evidence: the 2026-10-10 watchdog log
+  # showed 384 ui.loop-blocked entries that day, 83 of them landing at
+  # exactly 15.0-15.6s). A stub that sleeps 10s before replying is
+  # comfortably inside that old 15s timeout, so a still-synchronous handler
+  # would take >=10s on this call alone; the fix must return in well under
+  # 200ms regardless of how slow or hung the reconcile sweep is. (Ack
+  # correctness for this same async path is already proven by the SHIM2
+  # case above with a fast stub — this test's only new claim is the latency
+  # bound, so it does not also wait out the 10s sleep.)
+  SHIM5="$WORK/shim5"; mkdir -p "$SHIM5/agent-hooks"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM5/agent-hooks/omp-notify.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM5/herdr-resolve.sh"
+  cat > "$SHIM5/agent-hooks/omp-reconcile.sh" <<'EOS'
+#!/usr/bin/env bash
+sleep 10
+exit 0
+EOS
+  chmod +x "$SHIM5/agent-hooks/"*.sh "$SHIM5/herdr-resolve.sh"
+  shim5_out="$(HERDR_CONTROL_DIR="$SHIM5" HERDR_RUN_STATE_DIR="$SHIM5/state" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
+const t0 = performance.now();
+handlers["before_agent_start"]({});
+console.log("ELAPSED_MS:" + (performance.now() - t0).toFixed(1));
+' 2>&1)"
+  elapsed="$(printf '%s' "$shim5_out" | grep '^ELAPSED_MS:' | cut -d: -f2)"
+  case "$elapsed" in
+    ''|*[!0-9.]*) bad "could not read handler latency: $shim5_out" ;;
+    *)
+      awk -v e="$elapsed" 'BEGIN { exit (e < 200) ? 0 : 1 }' \
+        && ok "onBeforeAgentStart returns in ${elapsed}ms even with a 10s-sleeping reconcile stub (<200ms)" \
+        || bad "onBeforeAgentStart blocked ${elapsed}ms on a slow reconcile — regressed to synchronous" ;;
+  esac
 
   printf '== shouldAnnounce(): the pure decision, every edge case ==\n'
   # SHIM4 above proves the real filesystem round trip once; these exercise
