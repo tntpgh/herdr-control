@@ -135,6 +135,39 @@ function spawnDetached(args: string[], stdinInput?: string, env?: Record<string,
   }
 }
 
+// ---- async process capture --------------------------------------------------
+// Shared by every background refresh below (hub summary, project card,
+// reconcile): run `cmd`, collect stdout up to a bound, call `cb(ok, stdout)`
+// EXACTLY once — `ok` is the same bar the old spawnSync call sites used
+// (`r.error || r.status !== 0 || !r.stdout` -> false). Never throws, never
+// blocks: this is what let onBeforeAgentStart stop doing spawnSync at all
+// (2026-10-10 fix/omp-hook-nonblocking — see onBeforeAgentStart's header).
+function captureOutput(
+  cmd: string,
+  args: string[],
+  opts: { cwd?: string },
+  cb: (ok: boolean, stdout: string) => void,
+): void {
+  let out = "";
+  let done = false;
+  const finish = (ok: boolean) => {
+    if (done) return;
+    done = true;
+    cb(ok, out);
+  };
+  try {
+    const child = spawn(cmd, args, { cwd: opts.cwd, stdio: ["ignore", "pipe", "ignore"] });
+    child.on("error", () => finish(false));
+    child.stdout?.on("error", () => {});
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (out.length < 65_536) out += chunk.toString("utf8"); // bounded, see spawnDetached header
+    });
+    child.on("close", (code) => finish(code === 0 && out.length > 0));
+  } catch {
+    finish(false);
+  }
+}
+
 // ---- Notification: tool_approval_requested / ask --------------------------
 // omp's docs (docs/extensions.md, docs/hooks.md) both show the SAME shape for
 // this event — `event.toolName: string` and `event.input: Record<string,
@@ -1389,30 +1422,47 @@ function ensureHub(): void {
   }
 }
 
-// {attention, open_decisions} from the hub, or undefined when it is not up
-// yet (first start on a machine without the launchd agent) — bounded so a
-// slow hub costs the session start at most 2s.
-//
-// `attention` is the UNION (panes + repos owing a handoff); `handoff_debt` is
-// the repo half of it, published separately so this banner can name each with
-// its own noun instead of calling a repo a task. A hub too old to publish the
-// field reads as 0 and the line is exactly what it was before.
-function hubSummary(): { attention: number; handoff_debt: number; open_decisions: number } | undefined {
-  try {
-    const r = spawnSync("curl", ["-s", "--max-time", "2", `${HUB_URL}api/summary`], { encoding: "utf8" });
-    if (r.error || r.status !== 0 || !r.stdout) return undefined;
-    const j: unknown = JSON.parse(r.stdout);
-    if (!j || typeof j !== "object" || !("attention" in j) || !("open_decisions" in j)) return undefined;
-    const attention = Number(j.attention);
-    const open_decisions = Number(j.open_decisions);
-    const raw_debt = "handoff_debt" in j ? Number(j.handoff_debt) : 0;
-    const handoff_debt = Number.isFinite(raw_debt) && raw_debt > 0 ? raw_debt : 0;
-    return Number.isFinite(attention) && Number.isFinite(open_decisions)
-      ? { attention, handoff_debt, open_decisions }
-      : undefined;
-  } catch {
-    return undefined;
-  }
+interface HubSummary {
+  attention: number;
+  handoff_debt: number;
+  open_decisions: number;
+}
+
+// hubSummary() used to spawnSync a curl (bounded 2s) on EVERY turn — one of
+// the three synchronous waits onBeforeAgentStart made on omp's event loop
+// (2026-10-10 watchdog: ~/.omp/logs/omp.2026-10-10.25513.log, 384
+// ui.loop-blocked entries that day). Converted to cache-and-background-
+// refresh: onBeforeAgentStart never waits on this. It calls
+// refreshHubSummaryAsync() (fire-and-forget, in-flight-guarded) and reads
+// whatever hubSummaryCache already holds — the last summary that actually
+// finished fetching, possibly from an earlier turn, possibly undefined if
+// none ever has (cold cache reads exactly like a hub that is down).
+// `attention` is the UNION (panes + repos owing a handoff); `handoff_debt`
+// is the repo half, published separately so the banner can name each with
+// its own noun. A hub too old to publish the field reads as 0, same as before.
+let hubSummaryCache: HubSummary | undefined;
+let hubRefreshInFlight = false;
+
+function refreshHubSummaryAsync(): void {
+  if (hubRefreshInFlight) return;
+  hubRefreshInFlight = true;
+  captureOutput("curl", ["-s", "--max-time", "2", `${HUB_URL}api/summary`], {}, (ok, out) => {
+    hubRefreshInFlight = false;
+    if (!ok) return;
+    try {
+      const j: unknown = JSON.parse(out);
+      if (!j || typeof j !== "object" || !("attention" in j) || !("open_decisions" in j)) return;
+      const attention = Number(j.attention);
+      const open_decisions = Number(j.open_decisions);
+      const raw_debt = "handoff_debt" in j ? Number(j.handoff_debt) : 0;
+      const handoff_debt = Number.isFinite(raw_debt) && raw_debt > 0 ? raw_debt : 0;
+      if (Number.isFinite(attention) && Number.isFinite(open_decisions)) {
+        hubSummaryCache = { attention, handoff_debt, open_decisions };
+      }
+    } catch {
+      // malformed JSON: leave the previous cache in place, never crash
+    }
+  });
 }
 
 // ---- project ambient card (project-contract-plan.md §2, surface 2) ---------
@@ -1461,35 +1511,70 @@ function isProjectRowFor(
   return "repo" in p && typeof p.repo === "string" && p.repo.endsWith(`/${fallbackRepoName}`);
 }
 
-function gitCommonDirRepoRoot(cwd: string): string | null {
-  const r = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, encoding: "utf8" });
-  if (r.error || r.status !== 0 || !r.stdout) return null;
-  const commonDir = r.stdout.trim();
-  return commonDir ? path.dirname(commonDir) : null;
+// `refreshProjectSummaryAsync` fetches /api/projects and the git common-dir
+// in parallel (both small, bounded reads: curl --max-time 2, a local `git
+// rev-parse`) and hands the result to this pure builder — same shape
+// projectSummary() used to compute synchronously. Split out so the async
+// join below has somewhere to put the result without duplicating the
+// row-matching logic.
+function buildProjectCard(j: unknown, cwd: string, repoRoot: string | null, fallbackRepoName: string): ProjectCard | undefined {
+  if (!j || typeof j !== "object" || !("projects" in j) || !Array.isArray(j.projects)) return undefined;
+  const row = j.projects.find((p: unknown) => isProjectRowFor(p, cwd, repoRoot, fallbackRepoName));
+  if (!row) return undefined;
+  return {
+    project: typeof row.project === "string" ? row.project : fallbackRepoName,
+    next_step: typeof row.next_step === "string" ? row.next_step : null,
+    needs_wake: row.needs_wake === true,
+    workers: Array.isArray(row.tasks) ? row.tasks.length : 0,
+    open_prs: Array.isArray(row.prs) ? row.prs.length : 0,
+    open_decisions: Array.isArray(row.open_decisions) ? row.open_decisions.length : 0,
+  };
 }
 
-function projectSummary(cwd: string): ProjectCard | undefined {
-  try {
-    const fallbackRepoName = cwd.split(path.sep).filter(Boolean).pop();
-    if (!fallbackRepoName) return undefined;
-    const r = spawnSync("curl", ["-s", "--max-time", "2", `${HUB_URL}api/projects`], { encoding: "utf8" });
-    if (r.error || r.status !== 0 || !r.stdout) return undefined;
-    const j: unknown = JSON.parse(r.stdout);
-    if (!j || typeof j !== "object" || !("projects" in j) || !Array.isArray(j.projects)) return undefined;
-    const repoRoot = gitCommonDirRepoRoot(cwd);
-    const row = j.projects.find((p: unknown) => isProjectRowFor(p, cwd, repoRoot, fallbackRepoName));
-    if (!row) return undefined;
-    return {
-      project: typeof row.project === "string" ? row.project : fallbackRepoName,
-      next_step: typeof row.next_step === "string" ? row.next_step : null,
-      needs_wake: row.needs_wake === true,
-      workers: Array.isArray(row.tasks) ? row.tasks.length : 0,
-      open_prs: Array.isArray(row.prs) ? row.prs.length : 0,
-      open_decisions: Array.isArray(row.open_decisions) ? row.open_decisions.length : 0,
-    };
-  } catch {
-    return undefined;
-  }
+// Same cache-and-background-refresh conversion as hubSummary above, for the
+// SAME reason (projectSummary used to spawnSync a `git rev-parse` AND a
+// curl, sequentially, on every turn — SPEC evidence L1465/L1475). cwd-keyed
+// because the cwd a refresh was fetched for might not be the cwd of the
+// turn reading the cache (rare — cwd basically never changes mid-session —
+// but a stale cache for the WRONG project must never be shown as the
+// current one): onBeforeAgentStart only uses projectCardCache when
+// projectCardCacheCwd still equals the live cwd.
+let projectCardCache: ProjectCard | undefined;
+let projectCardCacheCwd: string | undefined;
+let projectRefreshInFlight = false;
+
+function refreshProjectSummaryAsync(cwd: string): void {
+  if (projectRefreshInFlight) return;
+  const fallbackRepoName = cwd.split(path.sep).filter(Boolean).pop();
+  if (!fallbackRepoName) return;
+  projectRefreshInFlight = true;
+  let projResult: { ok: boolean; out: string } | undefined;
+  let gitResult: { ok: boolean; out: string } | undefined;
+  const maybeFinish = () => {
+    if (!projResult || !gitResult) return;
+    projectRefreshInFlight = false;
+    if (!projResult.ok) return;
+    try {
+      const j: unknown = JSON.parse(projResult.out);
+      const commonDir = gitResult.ok ? gitResult.out.trim() : "";
+      const repoRoot = commonDir ? path.dirname(commonDir) : null;
+      const card = buildProjectCard(j, cwd, repoRoot, fallbackRepoName);
+      if (card) {
+        projectCardCache = card;
+        projectCardCacheCwd = cwd;
+      }
+    } catch {
+      // malformed JSON: leave the previous cache in place, never crash
+    }
+  };
+  captureOutput("curl", ["-s", "--max-time", "2", `${HUB_URL}api/projects`], {}, (ok, out) => {
+    projResult = { ok, out };
+    maybeFinish();
+  });
+  captureOutput("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd }, (ok, out) => {
+    gitResult = { ok, out };
+    maybeFinish();
+  });
 }
 
 interface ProjectAnnounceCursor {
@@ -1602,12 +1687,27 @@ function writeAnnounceCursor(c: AnnounceCursor): void {
 }
 
 // ---- SessionStart: before_agent_start --------------------------------------
-// Runs SYNCHRONOUSLY (an async hook's output is not guaranteed to land before
-// the first prompt is assembled), bounded by `timeout` so a hung or missing
-// omp-reconcile.sh degrades to "nothing injected". The ack fires just before
-// returning: for this event the runner keeps the first returned message, so
-// a constructed return IS the accepted delivery. A timeout or parse failure
-// exits earlier and leaves the envelope unacked for redelivery.
+// This handler still returns SYNCHRONOUSLY — the runner is not guaranteed
+// to wait on an async handler's eventual resolution before the prompt is
+// assembled — but it no longer does any synchronous I/O of its own at all.
+// 2026-10-10: the watchdog (~/.omp/logs/omp.2026-10-10.25513.log) showed 384
+// ui.loop-blocked entries that day on this handler's three synchronous
+// waits — reconcile's spawnSync (bounded 15s; 83 events landed at exactly
+// 15.0-15.6s, the registry sweep over hundreds of registered tasks
+// routinely exceeding the timeout) stacked with two `curl --max-time 2`
+// calls (hub + project summaries). None of the three results were worth
+// blocking a turn for: reconcile's own `report` text was NEVER injected
+// into the prompt (see "the report lives on a web page", below — its only
+// job here is the registry sweep's side effects and its ack), and the hub/
+// project summaries are a one-line "something needs you" banner, not
+// something that has to be millisecond-fresh. So every one of the three is
+// now fire-and-forget (runReconcileAsync / refreshHubSummaryAsync /
+// refreshProjectSummaryAsync — each in-flight-guarded so a turn can't pile
+// a second sweep on one still running), and this handler reads whatever
+// each one LAST finished with. A cold cache (nothing has completed yet)
+// reads exactly like a hub that is down: no line, not a block. The ack
+// still fires exactly when ackRequired is true, same as before — it is
+// just no longer on this turn's critical path (see runReconcileAsync).
 
 // Pure decision, isolated from the filesystem and the clock so it is
 // unit-testable without a real cursor file or a real hub: given the current
@@ -1633,20 +1733,12 @@ function onBeforeAgentStart():
   | undefined {
   try {
     ensureHub();
-    if (reconcileAvailable) {
-      const result = spawnSync("bash", [RECONCILE_SH, "session"], {
-        encoding: "utf8",
-        timeout: 15_000,
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      if (!result.error) {
-        const env = parseEnvelope(result.stdout ?? "");
-        if (env?.ackRequired) spawnDetached([RECONCILE_SH, "ack"], env.raw);
-      }
-    }
-    const s = hubSummary();
+    if (reconcileAvailable) runReconcileAsync("session");
+    refreshHubSummaryAsync();
     const cwd = process.cwd();
-    const project = projectSummary(cwd);
+    refreshProjectSummaryAsync(cwd);
+    const s = hubSummaryCache;
+    const project = projectCardCache && projectCardCacheCwd === cwd ? projectCardCache : undefined;
     // Worth a line only when there is something outstanding — a healthy
     // project (no next step, no wake) says nothing, same as the fleet card
     // when nothing needs a human.
@@ -1714,42 +1806,72 @@ function onBeforeAgentStart():
   }
 }
 
-// ---- PostToolUse: tool_result -----------------------------------------------
-// Same two jobs Claude's PostToolUse wiring does: throttled mid-session
-// reconciliation and alert retraction (answering a prompt in the terminal
-// must not leave a stale Slack alert sitting there looking live).
+// ---- reconcile, shared by both the session and interval callers -------------
+// omp-reconcile.sh session used to run via spawnSync with a 15s timeout —
+// the single largest synchronous wait onBeforeAgentStart made (see its
+// header above). Its stdout (the `report`) was never injected into the
+// prompt anyway — the only thing either caller needed from this call was
+// the ack side effect — so running it fully async costs the banner
+// nothing. One function for both modes (session: before_agent_start,
+// interval: tool_result) so the sweep, envelope parse and
+// ack-on-ackRequired stay in exactly one place, matching lib/reconcile.sh's
+// own one-copy-for-both-hooks rationale.
 //
-// The interval pass is spawned fire-and-forget for the AGENT (the handler
-// returns immediately; a slow sweep costs the turn nothing) but its stdout
-// is COLLECTED so the envelope can be acked: the registry cursor advances
-// and the page picks the history up. Nothing is injected into context —
-// mid-session, the conductor learns about worker state from push-wakes
-// ([HERDR-PEER-SIGNAL], omp-notify.sh) and from the status page, not from a
-// 20-line report typed into the next turn. The child is deliberately NOT
-// detached/unref'd: a piped-stdout child needs its parent reading.
-function runIntervalReconcile(): void {
+// A per-mode in-flight guard replaces what the old spawnSync accidentally
+// provided by blocking the whole process: before_agent_start fires every
+// turn in this harness, not once per session (see its header), so without
+// a guard a slow sweep could pile a second one on top of itself. The 15s
+// kill-timer is kept as a resource backstop only — NOT load-bearing for
+// context injection, which never depended on this call completing in time
+// — so a hung omp-reconcile.sh becomes a killed orphan instead of an
+// indefinitely growing one.
+//
+// The child is deliberately NOT detached/unref'd: a piped-stdout child
+// needs its parent reading, same as before.
+let reconcileSessionInFlight = false;
+let reconcileIntervalInFlight = false;
+
+function runReconcileAsync(mode: "session" | "interval"): void {
+  const setInFlight = (v: boolean) => {
+    if (mode === "session") reconcileSessionInFlight = v;
+    else reconcileIntervalInFlight = v;
+  };
+  if (mode === "session" ? reconcileSessionInFlight : reconcileIntervalInFlight) return;
+  setInFlight(true);
   try {
-    const child = spawn("bash", [RECONCILE_SH, "interval"], {
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    child.on("error", () => {});
+    const child = spawn("bash", [RECONCILE_SH, mode], { stdio: ["ignore", "pipe", "ignore"] });
     let out = "";
+    let settled = false;
+    const killTimer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // already gone
+      }
+    }, 15_000);
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      setInFlight(false);
+      try {
+        const env = parseEnvelope(out);
+        if (env?.ackRequired) spawnDetached([RECONCILE_SH, "ack"], env.raw);
+      } catch {
+        // no ack -> the envelope replays next pass; still never injected.
+      }
+    };
+    child.on("error", finish);
     child.stdout?.on("error", () => {});
     child.stdout?.on("data", (chunk: Buffer) => {
       // Bounded: an envelope is small; a runaway child must not buffer
       // unbounded output inside the agent process.
       if (out.length < 262_144) out += chunk.toString("utf8");
     });
-    child.on("close", () => {
-      try {
-        const env = parseEnvelope(out);
-        if (env?.ackRequired) spawnDetached([RECONCILE_SH, "ack"], env.raw);
-      } catch {
-        // no ack -> the envelope replays next interval; still never injected.
-      }
-    });
+    child.on("close", finish);
   } catch {
     // spawn() throwing synchronously — same contract as spawnDetached.
+    setInFlight(false);
   }
 }
 
@@ -1777,7 +1899,7 @@ function onToolResult(event?: unknown): undefined {
     // Reconciliation. Retraction moved to the approval/ask events above:
     // sweeping here fired it on every tool call in every session, and while
     // any worker sat blocked the queue was non-empty, so it always did work.
-    if (reconcileAvailable) runIntervalReconcile();
+    if (reconcileAvailable) runReconcileAsync("interval");
   } catch {
     // omp swallows tool_result handler errors (unlike tool_call), but this
     // stays defensive for consistency — see the header contract.
