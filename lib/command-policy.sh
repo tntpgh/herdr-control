@@ -566,7 +566,13 @@ _cp_simple_words() {                    # raw wt
   fi
   [ -n "$rest" ] || return 1
 
-  local protected; protected="$(_cp_protect_text "$rest")"
+  local protected rc; protected="$(_cp_protect_text "$rest")"; rc=$?
+  # Fail closed: a broken/missing awk must not fall through this fast path
+  # as "no unquoted operator found" — force the slow path, which has its
+  # own escalation on the same failure.
+  if [ "$rc" -ne 0 ] || [ -z "$protected" ]; then
+    return 1
+  fi
   _cp_has_unquoted_operator "$protected" && return 1
 
   local oldopts; case "$-" in *f*) oldopts=set ;; *) oldopts=unset ;; esac
@@ -886,7 +892,7 @@ _cp_scope_action() {                    # raw wt manifest
 # only a single read-only git command (`status`, `log`, `diff`, `show`,
 # `ls-files`, `rev-parse`, `blame`, `grep`) and refuses every other git shape.
 _cp_scope_ceiling() {                   # raw manifest
-  local norm git protected
+  local norm git protected rc
   [ -n "$2" ] || return 0
   git="$(printf '%s' "$2" | jq -r '.git // "push-own-branch"' 2>/dev/null)"
   norm="$(scannable_command "$1")"
@@ -897,8 +903,8 @@ _cp_scope_ceiling() {                   # raw manifest
       fi ;;
   esac
   if [ "$git" = none ] && _cp_match '\bgit\b' "$norm"; then
-    protected="$(_cp_protect_text "$norm")"
-    if _cp_has_unquoted_operator "$protected"; then
+    protected="$(_cp_protect_text "$norm")"; rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$protected" ] || _cp_has_unquoted_operator "$protected"; then
       printf 'outside the task manifest (git: none) — compound git actions are not in scope\n'
       return 0
     fi
@@ -3070,7 +3076,7 @@ _cp_git_push_seg_has_git() {
 # SEPARATE gate from this one), never subtract a check this one runs.
 _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invoked
   local LC_ALL=C LANG=C
-  local raw="$1" pre segmented out
+  local raw="$1" pre segmented out rc
   pre="$(_cp_strip_heredocs "$raw")"
   pre="$(_cp_decode_ansi_c "$pre")"
   pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
@@ -3152,6 +3158,15 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
       if (reserve) print "push"; else if (missing || nonliteral) print "ambiguous"; else print "safe"
     }
   ')"
+  rc=$?
+  # Fail closed: an awk exit != 0 or empty output for nonempty input means
+  # this scanner could not resolve push/safe/ambiguous at all — treat the
+  # same as "push" rather than silently falling through to "safe" below
+  # (herdr-control security review Q2: a broken/missing awk must never
+  # let `git push --force` read as harmless).
+  if [ "$rc" -ne 0 ] || { [ -n "$pre" ] && [ -z "$out" ]; }; then
+    return 0
+  fi
   # Round 6b (Main's live r5-probe run, Part C mode=postverb, REGRESS=2):
   # the awk above blind-splits on `<`/`>` too, same as the rest of this
   # function always has (per round 5's invariant above) — but that means
@@ -3186,7 +3201,7 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
   # `pu`/`pus` subcmd is never a genuine OTHER verb — at worst a
   # user-defined alias, which is exactly the ambiguous case reservation
   # (not a hard block) exists for.
-  local segmented2 out2
+  local segmented2 out2 rc2
   segmented2="$(printf '%s' "$pre" | sed -E 's/[;&|()`]/\n/g')"
   out2="$(printf '%s\n' "$segmented2" | awk '
     function is_consuming(s) { return (s ~ /^(-C|-c|--git-dir|--work-tree|--namespace|--config-env|--exec-path|--super-prefix|--attr-source)$/) }
@@ -3225,6 +3240,10 @@ _cp_git_push_invoked() {                # raw -> 0 (true) if a git push is invok
     }
     END { if (reserve) print "push"; else print "safe" }
   ')"
+  rc2=$?
+  if [ "$rc2" -ne 0 ] || { [ -n "$pre" ] && [ -z "$out2" ]; }; then
+    return 0
+  fi
   case "$out" in
     push) return 0 ;;
     ambiguous) _cp_match '\bpush\b' "$pre" && return 0 ;;
@@ -4156,10 +4175,13 @@ EOF
 
 _cp_git_exec_opt_invoked() {            # raw -> 0 (true) if git fails the read-only shape
   local LC_ALL=C LANG=C
-  local raw="$1" pre protected seg
+  local raw="$1" pre protected seg rc
   pre="$(_cp_strip_heredocs "$raw")"
   pre="$(printf '%s' "$pre" | sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}')"
-  protected="$(_cp_protect_text "$pre")"
+  protected="$(_cp_protect_text "$pre")"; rc=$?
+  if [ "$rc" -ne 0 ] || { [ -n "$pre" ] && [ -z "$protected" ]; }; then
+    return 0
+  fi
   protected="$(printf '%s' "$protected" | sed -E 's/\$\{IFS[^}]*\}|\$IFS/ /g')"
   # Round 4 (PR#257 round-3 review, R3-1..R3-5): `_cp_git_redirect_segments`
   # splits on real statement separators only (never on `<`/`>`) and cleans
@@ -4919,7 +4941,7 @@ _cp_bashlex_resolve_helper() {
   return 0
 }
 _cp_bashlex_findgit_present() {         # raw
-  local raw="$1" out rc line seg protseg
+  local raw="$1" out rc line seg protseg prc
   if ! _cp_bashlex_resolve_helper; then
     return 0
   fi
@@ -4934,7 +4956,10 @@ _cp_bashlex_findgit_present() {         # raw
       'ESCALATE '*) return 0 ;;
       'CHECK '*)
         seg="${line#CHECK }"
-        protseg="$(_cp_protect_text "$seg")"
+        protseg="$(_cp_protect_text "$seg")"; prc=$?
+        if [ "$prc" -ne 0 ] || { [ -n "$seg" ] && [ -z "$protseg" ]; }; then
+          return 0
+        fi
         _cp_git_seg_exec_unsafe "$protseg" && return 0
         ;;
       ALLOW) : ;;
@@ -6546,8 +6571,12 @@ _cp_mask_script_data() {
 # brace requirement (matches this file's round-5 behavior: `function f {
 # ls; }; f` escalates with no further parsing of what follows).
 _cp_gate_function_def_present() {       # raw -> 0 if `name() {`/`function NAME` sits at a statement boundary
-  local text
-  text="$(_cp_protect_text "$1" | tr '\n' ';')"
+  local text raw="$1" rc protected
+  protected="$(_cp_protect_text "$raw")"; rc=$?
+  if [ "$rc" -ne 0 ] || { [ -n "$raw" ] && [ -z "$protected" ]; }; then
+    return 0
+  fi
+  text="$(printf '%s' "$protected" | tr '\n' ';')"
   printf '%s' "$text" |
     grep -qE '(^|[;&|(])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\([[:space:]]*\)[[:space:]]*\{' &&
     return 0
