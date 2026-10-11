@@ -555,6 +555,7 @@ _migrate_schema_v8() {
     _stamp_schema_version 8
   else
     printf 'run-registry: v8 migration (owners table) failed; schema_version NOT advanced\n' >&2
+    return 1
   fi
 }
 
@@ -610,6 +611,7 @@ _migrate_schema_v10() {
     _stamp_schema_version 10
   else
     printf 'run-registry: v10 migration (roles table) failed; schema_version NOT advanced\n' >&2
+    return 1
   fi
 }
 
