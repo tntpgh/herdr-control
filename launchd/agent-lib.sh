@@ -441,6 +441,32 @@ provision_bashlex_venv() {
   fi
 }
 
+# resolve_hub_python — an explicit, versioned, absolute python3 interpreter
+# for the hub plist and its compile gate. NEVER `/usr/bin/env python3`: that
+# resolves through PATH at launchd LOAD TIME with none of the shell's
+# environment, and when Homebrew's generic `python3` symlink is missing (it
+# is, on this machine) it silently lands on the CLT's /usr/bin/python3 3.9.6
+# while an interactive shell's `python3` is 3.14 — two different
+# interpreters answering to the same command. Observed live: the installed
+# plist used `/usr/bin/env python3`, `env python3 -V` on this machine prints
+# 3.9.6, and the running hub log shows 3.14 (whatever `python3` happened to
+# resolve to at the moment someone last reloaded it by hand).
+# FAILS CLOSED: empty stdout + nonzero exit when no versioned interpreter is
+# found. The caller must treat that as fatal, never fall back to `python3`
+# or `/usr/bin/env python3` — a silent fallback is exactly the bug this
+# removes.
+resolve_hub_python() {
+  local dir found
+  for dir in /opt/homebrew/bin /usr/local/bin; do
+    found="$(ls "$dir" 2>/dev/null | grep -E '^python3\.[0-9]+$' | sort -t. -k3 -n | tail -1)"
+    if [ -n "$found" ] && [ -x "$dir/$found" ]; then
+      printf '%s/%s\n' "$dir" "$found"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # deploy_app [<revision>] — point the deployed worktree at a committed revision
 # (default: origin/main). Never touches the developer checkout's HEAD.
 deploy_app() {
@@ -498,7 +524,7 @@ deploy_app() {
   # load, so a revision whose lib/*.py does not parse passed a hub.py-only
   # gate and crash-looped the service on the next reload. Most changes here
   # touch lib/.
-  if ! python3 -m compileall -q "$HERDR_APP_DIR/hub.py" "$HERDR_APP_DIR/lib" >/dev/null 2>&1; then
+  if ! "${HERDR_DEPLOY_PYTHON:-python3}" -m compileall -q "$HERDR_APP_DIR/hub.py" "$HERDR_APP_DIR/lib" >/dev/null 2>&1; then
     if [ -n "${prev:-}" ] && git -C "$HERDR_APP_DIR" checkout -q --detach --force "$prev"; then
       echo "deploy: $rev does not compile — rolled back to $prev" >&2
     else
@@ -513,11 +539,16 @@ deploy_app() {
   echo "  deployed $(app_rev) $(git -C "$HERDR_APP_DIR" log -1 --format=%s | cut -c1-56)${fetched}"
 }
 
-# render_hub_plist <template> <out> — one implementation, so the suite can
-# assert the RENDERED file instead of grepping install.sh for a sed expression.
+# render_hub_plist <template> <out> <python-interpreter> — one implementation,
+# so the suite can assert the RENDERED file instead of grepping install.sh
+# for a sed expression. <python-interpreter> is REQUIRED: a blank value would
+# render `exec  /path/hub.py` (interpreter-less, launchd fails to exec it) —
+# the caller must have already failed closed via resolve_hub_python.
 render_hub_plist() {
-  local tpl="$1" out="$2"
+  local tpl="$1" out="$2" py="$3"
+  [ -n "$py" ] || { echo "render_hub_plist: no interpreter given — refusing to render" >&2; return 1; }
   sed -e "s|__HUB_PY__|$HERDR_APP_DIR/hub.py|" \
+      -e "s|__HUB_PYTHON__|$py|" \
       -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.hub.log|g" \
     "$tpl" > "$out"
 }

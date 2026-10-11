@@ -435,18 +435,39 @@ if [ "$HUB" = 1 ]; then
     # A run intended to fix the control plane would have fixed none of it and
     # said nothing about the two services it skipped, which is the shape of
     # the 2026-09-13 auth-plane outage.
-    if deploy_app "${HUB_REV:-origin/main}"; then
-      render_hub_plist "$here/com.herdr-control.hub.plist.template" "$PLIST"
-      reload_agent com.herdr-control.hub "$PLIST" \
-        && echo "  hub -> http://127.0.0.1:8600/"
+    #
+    # Same fail-soft shape for the interpreter pin: no versioned python3
+    # found is as fatal as a deploy that does not compile, but it must not
+    # abort auth/bridge/remote-mcp rendering below.
+    if HUB_PY_BIN="$(resolve_hub_python)"; then
+      HERDR_DEPLOY_PYTHON="$HUB_PY_BIN"
+      if deploy_app "${HUB_REV:-origin/main}"; then
+        render_hub_plist "$here/com.herdr-control.hub.plist.template" "$PLIST" "$HUB_PY_BIN"
+        reload_agent com.herdr-control.hub "$PLIST" \
+          && echo "  hub -> http://127.0.0.1:8600/ (python: $HUB_PY_BIN)"
+      else
+        INSTALL_RC=2
+        echo "  ! hub NOT installed: deploy failed (above). The plist and the" >&2
+        echo "    running hub are untouched; continuing with the other agents." >&2
+      fi
+      unset HERDR_DEPLOY_PYTHON
     else
       INSTALL_RC=2
-      echo "  ! hub NOT installed: deploy failed (above). The plist and the" >&2
-      echo "    running hub are untouched; continuing with the other agents." >&2
+      echo "  ! hub NOT installed: no pinned python3 interpreter found." >&2
+      echo "    Looked for a versioned, absolute interpreter under" >&2
+      echo "    /opt/homebrew/bin or /usr/local/bin (e.g. python3.14)." >&2
+      echo "    Refusing to fall back to the ambiguous /usr/bin/env python3." >&2
+      echo "    Install one (brew install python@3.14) and re-run." >&2
+      echo "    The plist and the running hub are untouched." >&2
     fi
   else
-    echo "  + would deploy $here -> $HERDR_APP_DIR (detached at ${HUB_REV:-origin/main})"
-    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/hub.py on :8600)"
+    if HUB_PY_BIN="$(resolve_hub_python)"; then
+      echo "  + would deploy $here -> $HERDR_APP_DIR (detached at ${HUB_REV:-origin/main})"
+      echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/hub.py on :8600, python: $HUB_PY_BIN)"
+    else
+      echo "  ! would FAIL: no pinned python3 interpreter found under /opt/homebrew/bin" >&2
+      echo "    or /usr/local/bin (e.g. python3.14) — --apply would refuse to install." >&2
+    fi
   fi
 fi
 
