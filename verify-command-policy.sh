@@ -4753,6 +4753,80 @@ for _stubname in exit2 empty partial; do
   check_broken_awk_bashlex_check "bashlex CHECK-segment dispatch fails closed ($_stubdesc)" "$_stubdir"
 done
 
+echo "== command-policy awk-fail-closed round 2 (security review of 4e9c86f, HIGH/MEDIUM) =="
+# Round 1 missed three _cp_protect_text*/_cp_protect_text_qa wrappers that
+# are also awk pipelines on the allow path: _cp_walk_prep (feeds
+# _cp_shared_gate's depth-0 segment loop, the entry point classify_command
+# calls first), _cp_coderef_split (feeds the code-by-reference walkers),
+# and _cp_segments_qa (feeds _cp_find_word_injection_present).
+# check_broken_awk_sentinel <label> <stubdir> <fn> <arg...> — FN itself (not
+# a caller several layers up) must return nonzero AND print exactly the
+# @CP_PROTECT_FAILED@ sentinel. A collaborator review of the first draft of
+# this section (ChatGPT via herdr-mcp, 2026-10-11) correctly flagged that
+# testing _cp_walk_prep only through _cp_shared_gate is NOT discriminating:
+# _cp_shared_gate's own _cp_git_exec_opt_invoked call (round 1, already
+# fixed) unconditionally fails closed under a broken awk for ANY input,
+# before the per-segment loop this section targets ever runs — so those
+# check_broken_awk_considers rows below pass on the unfixed base too, for
+# the wrong reason. This checks the actual flagged site (_cp_walk_prep
+# itself) directly, with nothing upstream that could mask it.
+check_broken_awk_sentinel() {
+  local label="$1" stubdir="$2" out rc; shift 2
+  total=$((total + 1))
+  out="$(PATH="$stubdir:$_real_path" "$@")"; rc=$?
+  if [ "$rc" -ne 0 ] && [ "$out" = '@CP_PROTECT_FAILED@' ]; then
+    printf 'PASS  %-52s => sentinel, rc=%s\n' "$label" "$rc"
+  else
+    printf 'FAIL  %-52s => rc=%s out=[%s] (not the fail-closed sentinel)\n' "$label" "$rc" "$out"
+    failed=$((failed + 1))
+  fi
+}
+
+check_broken_awk_considers() {
+  local label="$1" stubdir="$2" cmd="$3"
+  total=$((total + 1))
+  _cp_best_v=0; _cp_best_r=""
+  PATH="$stubdir:$_real_path" _cp_shared_gate "$cmd"
+  if [ "$_cp_best_v" -gt 0 ]; then
+    printf 'PASS  %-52s => considered (v=%s)\n' "$label" "$_cp_best_v"
+  else
+    printf 'FAIL  %-52s => NOT considered under a broken awk\n' "$label"
+    failed=$((failed + 1))
+  fi
+}
+# check_broken_awk_considers <label> <stubdir> <cmd> — calls _cp_shared_gate
+# directly and asserts it raised the running _cp_best_v/_cp_best_r
+# accumulator (the same one classify_command reads), bypassing the
+# .venv-bashlex-absent masking classify_command itself would hit. Kept as
+# end-to-end regression coverage for _cp_shared_gate as a whole; NOT proof
+# of _cp_walk_prep specifically (see check_broken_awk_sentinel above for
+# that) — these two rows pass on base 4e9c86f too, via the already-fixed
+# _cp_git_exec_opt_invoked call ahead of the loop.
+
+_eval_hide_cmd='eval "rm -rf /tmp/x"'
+_expansion_word_cmd='$(echo rm) -rf /tmp/x'
+_bash_env_cmd='BASH_ENV=/tmp/evil.sh bash /tmp/clean.sh'
+_find_injection_cmd='find . * -maxdepth 0'
+
+for _stubname in exit2 empty partial; do
+  case "$_stubname" in
+    exit2)   _stubdir="$_awk_exit2_dir";   _stubdesc="awk exits 2" ;;
+    empty)   _stubdir="$_awk_empty_dir";   _stubdesc="awk prints nothing" ;;
+    partial) _stubdir="$_awk_partial_dir"; _stubdesc="awk prints a partial line then exits 2" ;;
+  esac
+  # Known site: _cp_walk_prep (~L370) itself, isolated from every other
+  # gate — the clean discriminator.
+  check_broken_awk_sentinel "_cp_walk_prep fails closed, not silently empty ($_stubdesc)" "$_stubdir" _cp_walk_prep "$_eval_hide_cmd"
+  # Known site: _cp_walk_prep (~L370) -> _cp_shared_gate's per-segment
+  # eval/alias-hiding and command-word-is-expansion detectors (end-to-end
+  # coverage only — see check_broken_awk_considers's own header).
+  check_broken_awk_considers "_cp_shared_gate still flags eval hiding a command ($_stubdesc)" "$_stubdir" "$_eval_hide_cmd"
+  check_broken_awk_considers "_cp_shared_gate still flags a \$(...) command word ($_stubdesc)" "$_stubdir" "$_expansion_word_cmd"
+  # Known site: _cp_coderef_split (~L1112) -> _cp_coderef_env_poisoned.
+  check_broken_awk_true "_cp_coderef_env_poisoned still flags BASH_ENV poisoning ($_stubdesc)" "$_stubdir" _cp_coderef_env_poisoned "$_bash_env_cmd"
+  # Known site: _cp_segments_qa (~L494) -> _cp_find_word_injection_present.
+  check_broken_awk_true "_cp_find_word_injection_present still flags find argv injection ($_stubdesc)" "$_stubdir" _cp_find_word_injection_present "$_find_injection_cmd"
+done
 
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then

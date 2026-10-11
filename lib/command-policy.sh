@@ -368,7 +368,18 @@ _cp_protect_text() {                    # raw
 }
 
 _cp_walk_prep() {                       # raw
-  _cp_protect_text "$1" |
+  local protected rc
+  protected="$(_cp_protect_text "$1")"; rc=$?
+  # Fail closed (herdr-control security review of 4e9c86f, HIGH): this
+  # feeds _cp_shared_gate's depth-0 segment loop — the eval/alias and
+  # dynamic-command-word detectors, plus the -c body recursion — and
+  # _cp_walk_segments. A broken awk used to make this whole function
+  # (and every detector downstream of it) silently produce nothing.
+  if [ "$rc" -ne 0 ] || { [ -n "$1" ] && [ -z "$protected" ]; }; then
+    printf '%s\n' '@CP_PROTECT_FAILED@'
+    return 1
+  fi
+  printf '%s\n' "$protected" |
     sed -E 's/<\(/<@LP@/g; s/>\(/>@LP@/g; s/(\&\&|\|\||[;|&()])/\n/g; s/@LP@/(/g'
 }
 
@@ -492,7 +503,17 @@ _cp_segments_qa() {                     # raw -> same split as _cp_walk_prep, qu
   # already became the distinct `\020` byte in `prot()` and is untouched
   # by this `tr`, so a legitimately multi-line quoted value still reads
   # as one token on one line.
-  _cp_protect_text_qa "$1" |
+  local protected rc
+  protected="$(_cp_protect_text_qa "$1")"; rc=$?
+  # Fail closed (herdr-control security review of 4e9c86f, MEDIUM): the
+  # only caller, _cp_find_word_injection_present, used to lose its
+  # mixed/partially-quoted-command-word and find-argv-injection checks
+  # outright when this came back empty.
+  if [ "$rc" -ne 0 ] || { [ -n "$1" ] && [ -z "$protected" ]; }; then
+    printf '%s\n' '@CP_PROTECT_FAILED@'
+    return 1
+  fi
+  printf '%s\n' "$protected" |
     tr '\017' '\n' |
     sed -E 's/<\(/<@LP@/g; s/>\(/>@LP@/g; s/(\&\&|\|\||[;|&()])/\n/g; s/@LP@/(/g'
 }
@@ -1089,7 +1110,20 @@ _cp_quoted_subst_bodies_once() {
 # apart from a genuinely bare invocation nothing feeds (spec: `x | bash` is
 # UNRESOLVABLE, a lone `bash` is not code by reference at all).
 _cp_coderef_split() {                   # raw
-  _cp_protect_text "$1" | sed -E '
+  local protected rc
+  protected="$(_cp_protect_text "$1")"; rc=$?
+  # Fail closed (herdr-control security review of 4e9c86f, MEDIUM): this
+  # feeds the code-by-reference walkers (_cp_coderef_env_poisoned,
+  # _cp_coderef_walk, _cp_coderef_count_segments_mentioning,
+  # _cp_coderef_others_unsafe, the sqlite-registry and policy-mention
+  # read-only checks) that decide whether a script gets reviewed by
+  # content or replayed by file-hash — a broken awk used to make every
+  # one of those silently see zero segments.
+  if [ "$rc" -ne 0 ] || { [ -n "$1" ] && [ -z "$protected" ]; }; then
+    printf '%s\n' '@CP_PROTECT_FAILED@'
+    return 1
+  fi
+  printf '%s\n' "$protected" | sed -E '
     s/<\(/<@LP@/g
     s/>\(/>@LP@/g
     s/\&(>>?)/@AMP@\1/g
@@ -1182,6 +1216,7 @@ _cp_coderef_wrapped_command() {         # cmd args...
 _cp_coderef_env_poisoned() {            # text
   local segments seg
   segments="$(_cp_coderef_split "$1")"
+  case "$segments" in '@CP_PROTECT_FAILED@') return 0 ;; esac
   while IFS= read -r seg; do
     [ -n "$seg" ] || continue
     case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
@@ -1506,6 +1541,7 @@ _cp_coderef_walk() {                    # text wt cwd_bound depth
   case "$text" in "cd ${wt} && "*) leading_cd_pfx=1 ;; esac
 
   local segments; segments="$(_cp_coderef_split "$text")"
+  case "$segments" in '@CP_PROTECT_FAILED@') _cp_cr_unresolvable=1; return 0 ;; esac
 
   local later_cd=0 segidx=0 _seg
   while IFS= read -r _seg; do
@@ -1556,8 +1592,18 @@ EOF
 # script's OWN invocation (`bash tmp/evil.sh tmp/evil.sh`) still counts
 # once, not twice.
 _cp_coderef_count_segments_mentioning() {   # text basename depth
-  local text="$1" base="$2" depth="${3:-0}" count=0 seg body sub
+  local text="$1" base="$2" depth="${3:-0}" count=0 seg body sub segments
   [ "$depth" -le 6 ] || { printf 0; return 0; }
+  segments="$(_cp_coderef_split "$text")"
+  if [ "$segments" = '@CP_PROTECT_FAILED@' ]; then
+    # Fail closed (herdr-control security review of 4e9c86f, MEDIUM): a
+    # broken awk means this function cannot count real mentions, so
+    # report enough (>1) to make the one caller that reads this,
+    # _cp_coderef_file_named_elsewhere, escalate rather than silently
+    # read "named nowhere else".
+    printf '%s' "$((count + 2))"
+    return 0
+  fi
   while IFS= read -r seg; do
     [ -n "$seg" ] || continue
     case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
@@ -1565,7 +1611,7 @@ _cp_coderef_count_segments_mentioning() {   # text basename depth
       count=$((count + 1))
     fi
   done <<EOF
-$(_cp_coderef_split "$text")
+$segments
 EOF
   while IFS= read -r body; do
     [ -n "$body" ] || continue
@@ -1607,9 +1653,11 @@ _cp_coderef_file_named_elsewhere() {    # raw real
 # every run, never replayed (see code_ref_inspect).
 _CP_CODEREF_SAFE_VERBS=' cd pushd popd true false : echo printf cat head tail grep egrep fgrep rg wc cut tr ls pwd date sleep test [ jq column nl basename dirname less more '
 _cp_coderef_others_unsafe() {           # raw [depth] -> 0 unsafe; sets _cp_cr_runners
-  local raw="$1" depth="${2:-0}" seg body tgt
+  local raw="$1" depth="${2:-0}" seg body tgt segments
   [ "$depth" = 0 ] && _cp_cr_runners=0
   [ "$depth" -le 6 ] || return 0
+  segments="$(_cp_coderef_split "$raw")"
+  case "$segments" in '@CP_PROTECT_FAILED@') return 0 ;; esac
   while IFS= read -r seg; do
     [ -n "$seg" ] || continue
     case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
@@ -1659,7 +1707,7 @@ EOF
         case "$_CP_CODEREF_SAFE_VERBS" in *" $_cp_wcmd "*) ;; *) return 0 ;; esac ;;
     esac
   done <<EOF
-$(_cp_coderef_split "$raw")
+$segments
 EOF
   while IFS= read -r body; do
     [ -n "$body" ] || continue
@@ -4972,7 +5020,9 @@ _cp_bashlex_findgit_present() {         # raw
 }
 _cp_find_word_injection_present() {     # raw -> 0 if a segment's resolved command word is mixed/partially quoted, or is find (bare or cleanly-quoted) with an unsafe unquoted word in its own argv, or a command-substitution body resolves to an unsafe find invocation
   local LC_ALL=C LANG=C
-  local raw="$1" seg unq tok inner cmdbase
+  local raw="$1" seg unq tok inner cmdbase segments
+  segments="$(_cp_segments_qa "$raw")"
+  case "$segments" in '@CP_PROTECT_FAILED@') return 0 ;; esac
   while IFS= read -r seg; do
     [ -n "${seg//[[:space:]]/}" ] || continue
     _cp_locate_command_word "$seg" || continue
@@ -5011,7 +5061,7 @@ _cp_find_word_injection_present() {     # raw -> 0 if a segment's resolved comma
     # expansion/glob/brace.
     _cp_find_argv_unsafe "${_CP_LOC[@]:1}" && return 0
   done <<EOF
-$(_cp_segments_qa "$raw")
+$segments
 EOF
   # (c) — R5-SUBST (SPEC #261 r6, review HIGH): a command substitution's
   # own text is never executed AS this segment's command word —
@@ -6201,6 +6251,11 @@ bash_write_targets() {
   fi
   while IFS= read -r body; do
     [ -n "$body" ] || continue
+    case "$body" in
+      '@CP_PROTECT_FAILED@')
+        printf 'COMPUTED\t%s\n' "command text could not be safely segmented (awk failed) for the write-scope scanner"
+        continue ;;
+    esac
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       kind="${line%%$'\t'*}"
@@ -6724,6 +6779,11 @@ _cp_shared_gate() {                     # raw [depth]
 
   while IFS= read -r seg; do
     [ -n "${seg//[[:space:]]/}" ] || continue
+    case "$seg" in
+      '@CP_PROTECT_FAILED@')
+        _cp_consider 1 "command text could not be safely segmented (awk failed) — the eval/alias and dynamic-command-word checks cannot run"
+        continue ;;
+    esac
 
     _cp_gate_eval_alias_shopt "$seg" &&
       _cp_consider 1 "command invokes eval, defines a function or alias, or enables alias expansion — the real command is hidden from every other rule"
@@ -7164,6 +7224,11 @@ classify_command() {                    # <panel/command text> [worktree] [manif
   # was allow. Over-splitting keeps the invariant pointing the safe way.
   while IFS= read -r _cp_xseg; do
     [ -n "$_cp_xseg" ] || continue
+    case "$_cp_xseg" in
+      '@CP_PROTECT_FAILED@')
+        _cp_consider 1 "command text could not be safely segmented (awk failed) for the downloader/run check"
+        break ;;
+    esac
     _cp_walk_run "$_cp_xseg" "$raw" && break
   done <<XSEGS
 $(_cp_walk_segments "$raw")
@@ -7933,7 +7998,9 @@ _cp_registry_read_allowed() {           # raw
   local tidy
   tidy="$(printf '%s' "$1" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
   case "$tidy" in *$'\n'*) return 1 ;; esac
-  local seg bare n=0
+  local seg bare n=0 segments
+  segments="$(_cp_coderef_split "$tidy")"
+  case "$segments" in '@CP_PROTECT_FAILED@') return 1 ;; esac
   while IFS= read -r seg; do
     [ -n "$seg" ] || continue
     n=$((n + 1))
@@ -7952,7 +8019,7 @@ _cp_registry_read_allowed() {           # raw
       _cp_imatch "$_CP_REGISTRY_TRIGGER_RE" "$bare" && return 1
     fi
   done <<EOF
-$(_cp_coderef_split "$tidy")
+$segments
 EOF
   [ "$n" -gt 0 ]
 }
@@ -8010,7 +8077,7 @@ _CP_POLICY_FILE_RE='(^|[^A-Za-z0-9_-])(gate-registry|approval-policy|herdr-selec
 # every other reserved shape are judged exactly as before.
 _CP_READONLY_VERBS=' cd cat wc head tail grep egrep fgrep rg diff cmp ls stat file shasum sha256sum md5 nl '
 _cp_policy_mention_harmless() {         # raw
-  local raw="$1" seg n=0
+  local raw="$1" seg n=0 segments
   local tidy
   # stderr-to-stdout and discard-to-/dev/null write nothing; any other `>` does.
   tidy="$(printf '%s' "$raw" | sed -E 's#[0-9]*>&[0-9]([[:space:]]|$)# #g; s#[0-9]*>[[:space:]]*/dev/null([[:space:]]|$)# #g')"
@@ -8024,6 +8091,8 @@ _cp_policy_mention_harmless() {         # raw
         return 0 ;;
     esac
   fi
+  segments="$(_cp_coderef_split "$tidy")"
+  case "$segments" in '@CP_PROTECT_FAILED@') return 1 ;; esac
   while IFS= read -r seg; do
     [ -n "$seg" ] || continue
     case "$seg" in @PIPE@*) seg="${seg#@PIPE@}" ;; esac
@@ -8036,7 +8105,7 @@ _cp_policy_mention_harmless() {         # raw
     [ "${_CP_LOC[0]:-}" = "$(printf '%s' "$seg" | awk '{print $1}')" ] || return 1
     case "$_CP_READONLY_VERBS" in *" $_cp_wcmd "*) ;; *) return 1 ;; esac
   done <<EOF
-$(_cp_coderef_split "$tidy")
+$segments
 EOF
   [ "$n" -gt 0 ]
 }
