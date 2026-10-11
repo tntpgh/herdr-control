@@ -299,20 +299,17 @@ INSERT OR IGNORE INTO schema_meta(key, value)
     return 1
   fi
 
+  _migrate_schema_v3 || return 1
+  _migrate_schema_v4 || return 1
+  _migrate_schema_v5 || return 1
+  _migrate_schema_v6 || return 1
+  _migrate_schema_v7 || return 1
+  _migrate_schema_v8 || return 1
+  _migrate_schema_v9 || return 1
+  _migrate_schema_v10 || return 1
+  _migrate_schema_v11 "$existed" || return 1
+  _migrate_legacy_files || return 1
   _HERDR_REGISTRY_READY=1
-  _migrate_schema_v3
-  _migrate_schema_v4
-  _migrate_schema_v5
-  _migrate_schema_v6
-  _migrate_schema_v7
-  _migrate_schema_v8
-  _migrate_schema_v9
-  _migrate_schema_v10
-  if ! _migrate_schema_v11 "$existed"; then
-    _HERDR_REGISTRY_READY=0
-    return 1
-  fi
-  _migrate_legacy_files
   return 0
 }
 
@@ -558,6 +555,7 @@ _migrate_schema_v8() {
     _stamp_schema_version 8
   else
     printf 'run-registry: v8 migration (owners table) failed; schema_version NOT advanced\n' >&2
+    return 1
   fi
 }
 
@@ -613,6 +611,7 @@ _migrate_schema_v10() {
     _stamp_schema_version 10
   else
     printf 'run-registry: v10 migration (roles table) failed; schema_version NOT advanced\n' >&2
+    return 1
   fi
 }
 

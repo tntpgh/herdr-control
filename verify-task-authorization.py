@@ -27,7 +27,21 @@ class RegistryAuthorization(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="herdr-authorization-")
         self.base = Path(self.temp.name)
-        self.env = {**os.environ, "HERDR_RUN_STATE_DIR": str(self.base / "state")}
+        # lib/run-registry.sh's own internal migration/WAL-retry code shells
+        # out to a bare `python3`, resolved through PATH -- NOT through
+        # sys.executable -- so launching this suite under python3.14 alone
+        # does not change what THAT internal `python3` resolves to. This
+        # machine's /opt/homebrew/bin has no generic `python3` symlink (only
+        # `python3.14`), so bare `python3` falls through to /usr/bin/python3
+        # (3.9.6) regardless of which interpreter runs this file. Shim ONLY
+        # this test's own PATH -- never any real system file -- so
+        # registry_init's internal calls run under the SAME interpreter as
+        # this suite, matching SPEC's "run with /opt/homebrew/bin/python3.14".
+        shim_dir = self.base / "pythonshim"
+        shim_dir.mkdir()
+        (shim_dir / "python3").symlink_to(sys.executable)
+        self.env = {**os.environ, "PATH": f"{shim_dir}:{os.environ.get('PATH', '')}",
+                    "HERDR_RUN_STATE_DIR": str(self.base / "state")}
         self.db = self.base / "state/registry.sqlite3"
         self.sh("registry_init")
 
@@ -218,6 +232,41 @@ class RegistryAuthorization(unittest.TestCase):
         self.execute("DROP TRIGGER reject_fixture_stamp")
         self.sh("registry_init")
         self.assertEqual(len(list(self.db.parent.glob("registry.sqlite3.*.v12.bak"))), 2)
+
+    def test_v8_backup_failure_before_ready_fails_closed(self):
+        # Force a pre-v8 registry (the `owners` table does not exist yet) so
+        # _migrate_schema_v8 takes its backup-then-create path, then make
+        # that one `.backup` dot-command fail (a PATH-shimmed `sqlite3` that
+        # passes every other call through to the real binary unchanged). On
+        # 7d2d57e, _HERDR_REGISTRY_READY=1 was set BEFORE the v3-v10 chain
+        # ran, and each migration call was a bare statement with no `||
+        # return 1` -- this exact backup failure was silently discarded and
+        # the registry was marked ready anyway. The fix chains every
+        # migration with `|| return 1` and sets READY only at the very end.
+        self.execute("DROP TABLE IF EXISTS owners")
+        self.execute("UPDATE schema_meta SET value='7' WHERE key='schema_version'")
+        shim_dir = self.base / "backup-failure-shim"
+        shim_dir.mkdir()
+        shim = shim_dir / "sqlite3"
+        shim.write_text(
+            "#!/bin/sh\n"
+            'case "$*" in *.backup*) echo "fixture backup failure" >&2; exit 1;; esac\n'
+            'exec /usr/bin/sqlite3 "$@"\n')
+        shim.chmod(0o755)
+        old_path = self.env.get("PATH", "")
+        self.env["PATH"] = f"{shim_dir}:{old_path}"
+        try:
+            p = self.sh('registry_init; rc=$?; printf "ready=%s\\n" "$_HERDR_REGISTRY_READY"; exit "$rc"', ok=False)
+        finally:
+            self.env["PATH"] = old_path
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("could not back up", p.stderr)
+        self.assertIn("migration aborted", p.stderr)
+        self.assertIn("ready=0", p.stdout)
+        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("7",)])
+        self.assertEqual(self.query("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='owners'"), [(0,)])
+        self.sh("registry_init")  # No stale lock or partial migration remains.
+        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE key='schema_version'"), [("12",)])
 
     def test_remote_source_is_not_main_approval(self):
         cmd, claims, task = self.launch()

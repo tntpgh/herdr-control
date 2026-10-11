@@ -111,6 +111,62 @@ else
   bad "a holder's claim id is readable from the CLI" "got empty"
 fi
 
+printf '\n== claims_init never regresses the shared schema_version ==\n'
+# claims_init() always calls registry_init() first (full migration chain to
+# v12), then stamps its OWN table's schema_version -- an unconditional
+# INSERT OR REPLACE there would silently knock the registry's shared
+# schema_meta.schema_version back down to claims' own v4 on every claim.sh
+# call, which would then make the NEXT registry_init() see "current < 12"
+# and re-run the v12 migration (and its backup) on every single claim.
+ver=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)
+if [ -n "$ver" ] && [ "$ver" -ge 12 ] 2>/dev/null; then
+  ok "schema_version is still >=12 after claims_init ran (got $ver)"
+else
+  bad "schema_version is still >=12 after claims_init ran" "got [$ver]"
+fi
+
+printf '\n== v8 migration CREATE TABLE failure fails closed (REVIEW-219 F1) ==\n'
+# _migrate_schema_v8/_migrate_schema_v10's CREATE TABLE guard used to have an
+# else branch whose only statement was `printf` -- that exits 0, so the
+# function returned success even though the table was never created and the
+# version was never advanced. registry_init()'s `_migrate_schema_v8 ||
+# return 1` guard was a no-op against that exact failure. Reproduce ONLY
+# that one CREATE TABLE failing: a PATH-shimmed `sqlite3` that fails just
+# the "CREATE TABLE IF NOT EXISTS owners" call and passes every other call
+# through to the real binary unchanged (chmod-ing the whole db file instead
+# also fails registry_init's own earlier bootstrap DDL block, which would
+# make this row pass even on the unfixed code for the wrong reason).
+V8ROOT="$TMPROOT/state-v8fail"
+HERDR_RUN_STATE_DIR="$V8ROOT" bash -c "source '$HERE/lib/run-registry.sh'; registry_init" >/dev/null 2>&1
+v8db="$V8ROOT/registry.sqlite3"
+sqlite3 "$v8db" "DROP TABLE IF EXISTS owners; UPDATE schema_meta SET value='7' WHERE key='schema_version';"
+V8SHIM="$TMPROOT/v8-create-failure-shim"
+mkdir -p "$V8SHIM"
+cat > "$V8SHIM/sqlite3" <<'SHIM'
+#!/bin/sh
+case "$*" in *"CREATE TABLE IF NOT EXISTS owners"*) echo "fixture owners CREATE failure" >&2; exit 1;; esac
+exec /usr/bin/sqlite3 "$@"
+SHIM
+chmod +x "$V8SHIM/sqlite3"
+out=$(HERDR_RUN_STATE_DIR="$V8ROOT" PATH="$V8SHIM:$PATH" bash -c "source '$HERE/lib/run-registry.sh'; registry_init; rc=\$?; printf 'ready=%s\n' \"\$_HERDR_REGISTRY_READY\"; exit \$rc" 2>&1)
+rc=$?
+[ "$rc" != 0 ] && ok "v8 CREATE TABLE failure makes registry_init fail (rc=$rc)" \
+               || bad "v8 CREATE TABLE failure makes registry_init fail" "rc=0"
+case "$out" in *"ready=0"*) ok "READY stays unset when v8 fails" ;; *) bad "READY stays unset when v8 fails" "$out" ;; esac
+ver=$(sqlite3 "$v8db" "SELECT value FROM schema_meta WHERE key='schema_version';")
+check "schema_version NOT advanced past 7" "$ver" "7"
+owners=$(sqlite3 "$v8db" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='owners';")
+check "owners table NOT created" "$owners" "0"
+HERDR_RUN_STATE_DIR="$V8ROOT" bash -c "source '$HERE/lib/run-registry.sh'; registry_init" >/dev/null 2>&1
+owners=$(sqlite3 "$v8db" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='owners';")
+# Not a full-v12 recovery check: a subsequent registry_init on an EXISTING
+# (existed=1) registry also exercises _migrate_schema_v11's own pre-existing,
+# parked, NOT-shipped WAL-header/ro-reopen bug (.handoffs/py39-parked.diff)
+# under this machine's bare `python3` (3.9.6) -- unrelated to F1. Just prove
+# the v8 table itself is created once the shim is gone.
+check "a subsequent registry_init creates the owners table" "$owners" "1"
+
 printf '\n== summary ==\n'
 printf '  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ] || exit 1
