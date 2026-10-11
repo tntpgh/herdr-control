@@ -111,6 +111,21 @@ else
   bad "a holder's claim id is readable from the CLI" "got empty"
 fi
 
+printf '\n== claims_init never regresses the shared schema_version ==\n'
+# claims_init() always calls registry_init() first (full migration chain to
+# v12), then stamps its OWN table's schema_version -- an unconditional
+# INSERT OR REPLACE there would silently knock the registry's shared
+# schema_meta.schema_version back down to claims' own v4 on every claim.sh
+# call, which would then make the NEXT registry_init() see "current < 12"
+# and re-run the v12 migration (and its backup) on every single claim.
+ver=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)
+if [ -n "$ver" ] && [ "$ver" -ge 12 ] 2>/dev/null; then
+  ok "schema_version is still >=12 after claims_init ran (got $ver)"
+else
+  bad "schema_version is still >=12 after claims_init ran" "got [$ver]"
+fi
+
 printf '\n== summary ==\n'
 printf '  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ] || exit 1
