@@ -111,11 +111,13 @@ _TASK_AUTHORIZATION_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/task-a
 # 3.9.6 in every shell, under which the v12 migration aborts with "unable to
 # open database file" (Main's rehearsal,
 # thurber-os/.handoffs/registry-rehearsal-20261011.log); the SAME pinned
-# 3.14 interpreter the hub uses reaches schema 12 cleanly. FAILS CLOSED:
-# empty/non-executable resolution, or a resolved interpreter below 3.11
-# (the registry's own floor — stricter than the hub's "any versioned
-# interpreter," because this is the version the migration was proven
-# against), both refuse with a clear stderr message and a nonzero return.
+# 3.14 interpreter the hub uses reaches schema 12 cleanly. The >=3.11 floor
+# the migration needs is enforced INSIDE resolve-hub-python.sh itself
+# (round 6 review: a second floor check here, duplicating the one the
+# shared resolver now also carries, is exactly the kind of two-definitions
+# drift the resolver's own header warns about) — this wrapper only adds
+# caching, not a second version check. FAILS CLOSED: empty/non-executable
+# resolution refuses with a clear stderr message and a nonzero return.
 # Resolved at most once per process and cached in _REGISTRY_PYTHON.
 _REGISTRY_PYTHON_RESOLVER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/launchd/resolve-hub-python.sh"
 _REGISTRY_PYTHON=""
@@ -127,11 +129,7 @@ _registry_python() {
   local py
   py="$(bash "$_REGISTRY_PYTHON_RESOLVER" 2>/dev/null)" || py=""
   if [ -z "$py" ] || [ ! -x "$py" ]; then
-    printf 'run-registry: no pinned python3 interpreter found (resolve-hub-python.sh) — refusing to run registry code under an unpinned /usr/bin/env python3\n' >&2
-    return 1
-  fi
-  if ! "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
-    printf 'run-registry: pinned interpreter %s is older than 3.11 — refusing (the registry migration needs 3.11+)\n' "$py" >&2
+    printf 'run-registry: no pinned python3.11+ interpreter found (resolve-hub-python.sh) — refusing to run registry code under an unpinned /usr/bin/env python3\n' >&2
     return 1
   fi
   _REGISTRY_PYTHON="$py"

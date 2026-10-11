@@ -12,6 +12,19 @@
 # did, in review) drift apart the moment one was edited and the other
 # wasn't.
 #
+# Enforces >=3.11 as part of THIS ONE scan (round 6 review: the registry
+# wrapper had its own extra floor check the hub/remote-mcp/TS paths lacked —
+# two definitions of "pinned enough" drifting the same way "pinned at all"
+# once did). Checks the REAL version by running the candidate
+# (`sys.version_info`), not the filename: a round 6 follow-up review caught
+# that a filename-only check trusts `python3.14` even when that path is a
+# symlink (or a stale/rebuilt binary) actually reporting 3.9 — the filename
+# is what a directory listing claims, never what's proven. Every candidate
+# in a directory is tried highest-named first; a directory whose highest
+# NAMED candidate turns out to be a real sub-3.11 interpreter still tries
+# the next-highest-named one in the SAME directory before moving on, since
+# the name is no longer trusted to order real versions correctly either.
+#
 # Prints the resolved absolute interpreter path on stdout and exits 0, or
 # prints nothing on stdout (diagnostic on stderr) and exits 1. NEVER prints
 # `python3` or `/usr/bin/env python3` — those resolve through PATH with no
@@ -32,17 +45,25 @@ for dir in "${search_dirs[@]}"; do
   # `python3.N` has exactly TWO dot-fields (`python3`, `N`) — `-k3` addresses
   # a field that does not exist, so `sort -n` had no numeric key for ANY
   # candidate and silently fell through to `ls`'s alphabetical order:
-  # `python3.9` sorted after `python3.14` lexically, so `tail -1` picked
-  # the LOWER version whenever two were present (review finding on
-  # f41370f/c7c9bd4 — this machine has only one installed minor, so round
-  # 1/2's own proofs never had two candidates to catch it with). `-k2,2n`
-  # is the version field, explicitly bounded so a future three-dot name
-  # cannot widen the key by accident.
-  found="$(ls "$dir" 2>/dev/null | grep -E '^python3\.[0-9]+$' | sort -t. -k2,2n | tail -1)"
-  if [ -n "$found" ] && [ -x "$dir/$found" ]; then
-    printf '%s/%s\n' "$dir" "$found"
-    exit 0
-  fi
+  # `python3.9` sorted after `python3.14` lexically, so picking the LAST
+  # entry chose the LOWER version whenever two were present (review finding
+  # on f41370f/c7c9bd4 — this machine has only one installed minor, so
+  # round 1/2's own proofs never had two candidates to catch it with).
+  # `-k2,2nr` is the version field, numeric descending, explicitly bounded
+  # so a future three-dot name cannot widen the key by accident.
+  while IFS= read -r found; do
+    [ -n "$found" ] || continue
+    candidate="$dir/$found"
+    [ -x "$candidate" ] || continue
+    if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      exit 0
+    fi
+    # Named python3.N >= 11 but the REAL interpreter reports otherwise (a
+    # lying symlink, or vice versa a conservatively-named real 3.11+): try
+    # the next-highest-named candidate in this SAME directory before moving
+    # on to the next search dir.
+  done < <(ls "$dir" 2>/dev/null | grep -E '^python3\.[0-9]+$' | sort -t. -k2,2nr)
 done
-echo "resolve-hub-python: no versioned python3 found under ${search_dirs[*]}" >&2
+echo "resolve-hub-python: no python3.11+ interpreter found under ${search_dirs[*]}" >&2
 exit 1

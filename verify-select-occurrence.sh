@@ -105,6 +105,39 @@ sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "exit 0 (no occurrence to corroborate against)" || bad "exit $rc (expected 0); stderr: $(cat "$WORK/err.txt")"
 [ "$(keys_pressed)" = "1" ] && ok "key pressed" || bad "keys pressed=$(keys_pressed)"
 
+printf '== round 6 (MEDIUM): resolver unavailable end-to-end -> still HELD (never approved), via registry_init'"'"'s own fail-closed gate ==\n'
+# A BLANKET resolver failure also empties own_run/own_task (task_for_pane
+# calls registry_init, which itself now refuses when _registry_python
+# fails — round 5), so this scenario is caught by #191's EARLIER
+# tool-identity gate (herdr-select.sh:589) before ever reaching the
+# occurrence block this round touches: a different message, same safe
+# outcome. That is why the test immediately below this one, not this one,
+# is what actually discriminates round 6's fix — this one only confirms
+# the end-to-end outcome stayed HELD after the fix, not regressed to
+# approve by some other interaction.
+set_menu "git status"; reset_keys
+seed_input_required "git status"
+EMPTY_PY_DIR="$WORK/no-python-here"; mkdir -p "$EMPTY_PY_DIR"
+HERDR_HUB_PYTHON_DIRS="$EMPTY_PY_DIR" sel 1 --authority peer; rc=$?
+[ "$rc" -eq 8 ] && ok "exit 8 (still held end-to-end on a blanket resolver failure)" || bad "exit $rc (expected 8); stderr: $(cat "$WORK/err.txt")"
+[ "$(keys_pressed)" = "0" ] && ok "NO KEY PRESSED" || bad "keys pressed=$(keys_pressed) on a resolver failure!"
+
+printf '== round 6 (MEDIUM) discriminator: the occurrence block ITSELF holds on a resolver/query failure, not just via a downstream coincidence ==\n'
+# own_run/own_task empties under a blanket failure (above), which means a
+# black-box run of the full script cannot isolate herdr-select.sh:356-384's
+# OWN behavior from #191's unrelated tool-identity gate catching the same
+# blanket case first. This checks the actual code shape instead: at
+# 42f7ea44 the block was `occ_summary=""; if occ_py=... ; then ...; fi` —
+# a resolver failure left occ_summary empty and fell through to approve,
+# indistinguishable from "no occurrence recorded". At head it is
+# `if ! occ_py=...; then ... exit 8; fi` — an explicit, immediate HOLD
+# before occ_summary is ever touched. Fails at 42f7ea44 (grep finds
+# nothing), passes at head.
+grep -q 'if ! occ_py="\$(_registry_python 2>/dev/null)"; then' "$here/herdr-select.sh" \
+  && grep -A2 'if ! occ_py="\$(_registry_python 2>/dev/null)"; then' "$here/herdr-select.sh" | grep -q 'exit 8' \
+  && ok "occurrence block exits 8 immediately on a resolver failure, before the empty-occ_summary fallthrough" \
+  || bad "occurrence block no longer holds on a resolver failure at its own source location"
+
 printf '== matching occurrence, identity_verified=true, display=pending_parseable -> still allowed ==\n'
 set_menu "git status"; reset_keys
 seed_input_required "git status"

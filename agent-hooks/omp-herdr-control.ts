@@ -1399,15 +1399,34 @@ function occurrenceIdentityArgs(callId: string, nativeSession: string): string[]
 // Synchronous, deliberately: the occurrence must be PERSISTED before the
 // notify/screen-probe path below ever runs, or a crash between notify and
 // recording loses the only evidence the prompt existed. This is a monitoring
-// path (same contract as the rest of this file): any failure here is
-// swallowed, never thrown, and never blocks the tool it observes.
+// path (same contract as the rest of this file): any failure here never
+// throws and never blocks the tool it observes — but round 6 review (HIGH):
+// it must still be VISIBLE, not silently vanish. A swallowed failure under
+// an unpinned interpreter (the CLT's /usr/bin/python3 3.9.6 lacks syntax
+// this helper's annotations use) meant durable occurrence events quietly
+// stopped being written, with nothing anywhere to show it. Reuses the SAME
+// async-cached interpreter ensureHub() already resolves below
+// (hubPythonCache / refreshHubPythonAsync) — never a second resolver, never
+// a sync child_process added to the agent-start path (#273): this function
+// is not reachable from onBeforeAgentStart, so keeping ITS OWN call
+// synchronous is unchanged from before this fix, only the interpreter
+// source and the visibility of a failure are new.
 function recordOccurrence(args: string[]): void {
   if (!promptOccurrenceAvailable || !WORKER_RUN_ID || !WORKER_TASK_ID || !WORKER_PANE_ID) return;
+  refreshHubPythonAsync();
+  const py = hubPythonCache;
+  if (!py) {
+    console.error("herdr: recordOccurrence: no pinned python3 interpreter cached yet (resolve-hub-python.sh) — occurrence NOT recorded");
+    return;
+  }
   try {
-    spawnSync("python3", [PROMPT_OCCURRENCE_PY, ...args],
+    const r = spawnSync(py, [PROMPT_OCCURRENCE_PY, ...args],
       { encoding: "utf8", timeout: 4_000, stdio: ["ignore", "pipe", "pipe"] });
-  } catch {
-    // best effort — see header.
+    if (r.error || r.status !== 0) {
+      console.error(`herdr: recordOccurrence: prompt-occurrence.py failed (status=${r.status ?? "spawn-error"}) — occurrence NOT recorded: ${(r.stderr ?? "").toString().slice(0, 300)}`);
+    }
+  } catch (e: unknown) {
+    console.error(`herdr: recordOccurrence: spawnSync threw — occurrence NOT recorded: ${e}`);
   }
 }
 
