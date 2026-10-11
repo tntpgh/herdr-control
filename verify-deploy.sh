@@ -20,6 +20,16 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/launchd/agent-lib.sh"
 
+# The real pinned interpreter, resolved once via the actual production
+# resolver (launchd/resolve-hub-python.sh through resolve_hub_python) —
+# every compile/import check below uses THIS, not bare `python3`, so the
+# suite exercises the same interpreter the deployed plist would exec.
+DEPLOY_PY="$(resolve_hub_python)" || {
+  echo "verify-deploy.sh: no pinned python3 interpreter found (resolve_hub_python)" >&2
+  echo "  — install one under /opt/homebrew/bin or /usr/local/bin (e.g. python3.14)" >&2
+  exit 1
+}
+
 pass=0 fail=0
 ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
@@ -103,7 +113,7 @@ OUT="$(deploy_app "$BROKEN" 2>&1)"; RC=$?
 [ "$(app_rev)" = "$(git -C "$SRC" rev-parse --short "$GOOD")" ] \
     && ok "the previous revision is still what is deployed" \
     || bad "left the app at $(app_rev) after a failed deploy"
-python3 -m py_compile "$HERDR_APP_DIR/hub.py" 2>/dev/null \
+"$DEPLOY_PY" -m py_compile "$HERDR_APP_DIR/hub.py" 2>/dev/null \
     && ok "so the deployed hub.py still compiles" \
     || bad "the deployed hub.py does not compile after a rolled-back deploy"
 
@@ -115,7 +125,7 @@ OUT="$(deploy_app "$BROKEN_LIB" 2>&1)"; RC=$?
                 || bad "a revision with an unparseable lib/ deployed with rc=0"
 [ "$(app_rev_sha)" = "$(git -C "$SRC" rev-parse --short "$GOOD2")" ] \
     && ok "and the previous revision is still deployed" || bad "left the app at $(app_rev_sha)"
-if python3 -c "import sys; sys.path.insert(0, '$HERDR_APP_DIR/lib'); import herdr_live" 2>/dev/null; then
+if "$DEPLOY_PY" -c "import sys; sys.path.insert(0, '$HERDR_APP_DIR/lib'); import herdr_live" 2>/dev/null; then
     ok "the deployed tree still imports"
 else
     bad "the deployed tree does not import after a rolled-back deploy"
@@ -184,7 +194,7 @@ printf '== the rendered plist points at the deployed app, not a checkout ==\n'
 # expression: a source grep passes for a line that is unreachable, shadowed by
 # a later render, or resolving an empty variable.
 OUT_PLIST="$WORK/hub.plist"
-render_hub_plist "$here/com.herdr-control.hub.plist.template" "$OUT_PLIST"
+render_hub_plist "$here/com.herdr-control.hub.plist.template" "$OUT_PLIST" "$DEPLOY_PY"
 # plutil's JSON escapes every `/` as `\/`, so compare with the escapes removed
 # rather than against the raw path.
 ARGS="$(plutil -extract ProgramArguments json -o - "$OUT_PLIST" 2>/dev/null | tr -d '\\\\')"
@@ -197,6 +207,115 @@ printf '%s' "$ARGS" | grep -qF "$here/hub.py" \
 printf '%s' "$ARGS" | grep -qE '"/hub\.py"' \
     && bad "HERDR_APP_DIR was empty when rendering — the plist points at /hub.py" \
     || ok "and is not a bare /hub.py from an empty app dir"
+printf '%s' "$ARGS" | grep -qF "$DEPLOY_PY" \
+    && ok "the rendered ProgramArguments names the pinned interpreter ($DEPLOY_PY)" \
+    || bad "rendered plist does not name the pinned interpreter: $ARGS"
+printf '%s' "$ARGS" | grep -qE 'env.{0,2}python3' \
+    && bad "the rendered plist still execs the ambiguous /usr/bin/env python3 form" \
+    || ok "and does not exec the ambiguous /usr/bin/env python3 form"
+render_hub_plist "$here/com.herdr-control.hub.plist.template" "$WORK/hub-noarg.plist" "" \
+    >/dev/null 2>&1 \
+    && bad "render_hub_plist with a blank interpreter should have been refused" \
+    || ok "render_hub_plist refuses a blank interpreter argument (regression: f41370f made the arg optional-looking but required)"
+[ -e "$WORK/hub-noarg.plist" ] \
+    && bad "render_hub_plist wrote a file despite refusing the blank interpreter" \
+    || ok "and writes nothing when it refuses"
+
+printf '== round 2: resolve_hub_python itself fails closed (the REAL function, not a copy) ==\n'
+# HERDR_HUB_PYTHON_DIRS exists ONLY so a test can drive the real resolver's
+# empty-result branch against scratch directories — production code never
+# sets it (launchd/resolve-hub-python.sh).
+EMPTY1="$WORK/py-empty1"; EMPTY2="$WORK/py-empty2"; mkdir -p "$EMPTY1" "$EMPTY2"
+if OUT="$(HERDR_HUB_PYTHON_DIRS="$EMPTY1:$EMPTY2" resolve_hub_python 2>/dev/null)"; then
+    bad "resolve_hub_python found an interpreter in empty scratch dirs: $OUT"
+else
+    [ -z "$OUT" ] \
+        && ok "resolve_hub_python (the real function) fails closed against empty dirs, stdout empty" \
+        || bad "resolve_hub_python failed but printed to stdout anyway: $OUT"
+fi
+: > "$EMPTY1/python3.x-config"   # present, but not a `python3.<digits>` name
+if OUT="$(HERDR_HUB_PYTHON_DIRS="$EMPTY1" resolve_hub_python 2>&1)"; then
+    bad "resolve_hub_python matched a non-interpreter entry: $OUT"
+else
+    ok "resolve_hub_python ignores entries that do not match python3.<digits> and still fails closed"
+fi
+if REAL_PY="$(resolve_hub_python)"; then
+    [ "$REAL_PY" = "$DEPLOY_PY" ] \
+        && ok "resolve_hub_python (no override) is stable: same path this suite resolved at start" \
+        || bad "resolve_hub_python is not stable across calls: '$REAL_PY' vs '$DEPLOY_PY'"
+else
+    bad "resolve_hub_python found nothing on the real machine, but DEPLOY_PY succeeded at suite start"
+fi
+
+printf '== round 2: deploy_app fails closed and rolls back with no pinned interpreter ==\n'
+deploy_app "$GOOD2" >/dev/null 2>&1
+BEFORE_NO_PY="$(app_rev_sha)"
+OUT="$(HERDR_DEPLOY_PYTHON="$WORK/no-such-interpreter" deploy_app "$GOOD" 2>&1)"; RC=$?
+[ "$RC" -ne 0 ] \
+    && ok "deploy_app refuses when HERDR_DEPLOY_PYTHON names a nonexistent interpreter" \
+    || bad "deploy_app accepted a nonexistent interpreter path: $OUT"
+[ "$(app_rev_sha)" = "$BEFORE_NO_PY" ] \
+    && ok "...and the previously deployed revision is still what is deployed" \
+    || bad "a missing-interpreter deploy still moved the app to $(app_rev_sha)"
+case "$OUT" in
+    *"interpreter"*"cannot verify"*"compiles"*) ok "...and says WHY, not just 'does not compile'" ;;
+    *) bad "missing-interpreter failure message does not explain why: $OUT" ;;
+esac
+deploy_app "$GOOD2" >/dev/null 2>&1
+
+printf '== round 2: stage_plist — atomic lint, timestamped backup, replace ==\n'
+STAGE_PLIST="$WORK/stage/com.herdr-control.hub.plist"
+mkdir -p "$(dirname "$STAGE_PLIST")"
+
+printf 'not a plist' > "$WORK/bad.plist"
+if stage_plist "$WORK/bad.plist" "$STAGE_PLIST" >/dev/null 2>&1; then
+    bad "stage_plist accepted a render that fails plutil -lint"
+else
+    ok "stage_plist refuses a render that fails plutil -lint"
+fi
+[ -e "$STAGE_PLIST" ] \
+    && bad "stage_plist created the live plist from a failed lint" \
+    || ok "...and the live path still does not exist"
+[ -e "$WORK/bad.plist" ] \
+    && bad "stage_plist left the failed temp file behind" \
+    || ok "...and cleans up the failed temp file"
+
+render_hub_plist "$here/com.herdr-control.hub.plist.template" "$WORK/good1.plist" "$DEPLOY_PY"
+stage_plist "$WORK/good1.plist" "$STAGE_PLIST" >/dev/null \
+    && ok "stage_plist creates the live plist on first install" \
+    || bad "stage_plist failed on a clean lint-passing render"
+[ -e "$WORK/good1.plist" ] \
+    && bad "stage_plist left the source temp file behind after a successful move" \
+    || ok "...and moves (not copies) the temp file into place"
+FIRST_CONTENT="$(cat "$STAGE_PLIST")"
+
+# A second good render over an EXISTING live plist must back it up verbatim
+# BEFORE the atomic replace — that backup is the actual manual-rollback
+# artifact, not a re-render of an old template (which would silently
+# restore whatever interpreter bug the old template had).
+render_hub_plist "$here/com.herdr-control.hub.plist.template" "$WORK/good2.plist" "/opt/homebrew/bin/python3.99"
+stage_plist "$WORK/good2.plist" "$STAGE_PLIST" >/dev/null \
+    && ok "stage_plist replaces an existing live plist" \
+    || bad "stage_plist failed replacing an existing plist"
+BACKUP="$(ls "$WORK/stage/"*.bak-* 2>/dev/null | head -1)"
+if [ -n "$BACKUP" ]; then
+    ok "stage_plist left a timestamped backup: $(basename "$BACKUP")"
+    [ "$(cat "$BACKUP")" = "$FIRST_CONTENT" ] \
+        && ok "...and the backup is byte-for-byte the PREVIOUS plist, not the new one" \
+        || bad "the backup does not match the plist it replaced"
+else
+    bad "stage_plist replaced an existing plist with no backup — the previous plist is gone"
+fi
+grep -q 'python3.99' "$STAGE_PLIST" \
+    && ok "...and the live plist now holds the NEW render" \
+    || bad "the live plist was not actually replaced: $(cat "$STAGE_PLIST")"
+
+BEFORE_BAD="$(cat "$STAGE_PLIST")"
+printf 'not a plist either' > "$WORK/bad2.plist"
+stage_plist "$WORK/bad2.plist" "$STAGE_PLIST" >/dev/null 2>&1
+[ "$(cat "$STAGE_PLIST")" = "$BEFORE_BAD" ] \
+    && ok "a failed lint on a REPLACE leaves the current live plist untouched" \
+    || bad "a failed lint on a replace corrupted the live plist"
 
 printf '== the SERVED rev must equal the DEPLOYED rev ==\n'
 # "the port answers 200" and "the revision I deployed is answering" are

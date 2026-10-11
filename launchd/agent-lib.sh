@@ -441,30 +441,19 @@ provision_bashlex_venv() {
   fi
 }
 
-# resolve_hub_python — an explicit, versioned, absolute python3 interpreter
-# for the hub plist and its compile gate. NEVER `/usr/bin/env python3`: that
-# resolves through PATH at launchd LOAD TIME with none of the shell's
-# environment, and when Homebrew's generic `python3` symlink is missing (it
-# is, on this machine) it silently lands on the CLT's /usr/bin/python3 3.9.6
-# while an interactive shell's `python3` is 3.14 — two different
-# interpreters answering to the same command. Observed live: the installed
-# plist used `/usr/bin/env python3`, `env python3 -V` on this machine prints
-# 3.9.6, and the running hub log shows 3.14 (whatever `python3` happened to
-# resolve to at the moment someone last reloaded it by hand).
+# resolve_hub_python — the bash-side call into the ONE canonical interpreter
+# resolver, launchd/resolve-hub-python.sh (full rationale there: NEVER
+# `/usr/bin/env python3`, which resolves through PATH at launchd load time
+# with none of the shell's environment and silently lands on the CLT's
+# /usr/bin/python3 3.9.6 on a machine where Homebrew's generic `python3`
+# symlink is missing, while an interactive shell's `python3` is 3.14).
+# A thin wrapper, not a second implementation: the omp extension's
+# ensureHub() calls the SAME script directly (spawnSync) before it spawns
+# hub.py, so bash and TypeScript can never pin two different interpreters.
 # FAILS CLOSED: empty stdout + nonzero exit when no versioned interpreter is
-# found. The caller must treat that as fatal, never fall back to `python3`
-# or `/usr/bin/env python3` — a silent fallback is exactly the bug this
-# removes.
+# found. The caller must treat that as fatal, never fall back to `python3`.
 resolve_hub_python() {
-  local dir found
-  for dir in /opt/homebrew/bin /usr/local/bin; do
-    found="$(ls "$dir" 2>/dev/null | grep -E '^python3\.[0-9]+$' | sort -t. -k3 -n | tail -1)"
-    if [ -n "$found" ] && [ -x "$dir/$found" ]; then
-      printf '%s/%s\n' "$dir" "$found"
-      return 0
-    fi
-  done
-  return 1
+  "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/resolve-hub-python.sh"
 }
 
 # deploy_app [<revision>] — point the deployed worktree at a committed revision
@@ -524,7 +513,26 @@ deploy_app() {
   # load, so a revision whose lib/*.py does not parse passed a hub.py-only
   # gate and crash-looped the service on the next reload. Most changes here
   # touch lib/.
-  if ! "${HERDR_DEPLOY_PYTHON:-python3}" -m compileall -q "$HERDR_APP_DIR/hub.py" "$HERDR_APP_DIR/lib" >/dev/null 2>&1; then
+  local deploy_py="${HERDR_DEPLOY_PYTHON:-}"
+  # No caller-supplied interpreter (restart.sh and verify-deploy.sh never
+  # set one) falls through to the SAME canonical resolver install.sh uses,
+  # not bare `python3` — a caller that forgets to pin still gets the pinned
+  # interpreter instead of silently reintroducing the ambiguous-runtime bug.
+  [ -n "$deploy_py" ] || deploy_py="$(resolve_hub_python 2>/dev/null)" || true
+  # A caller-supplied path that does not exist (e.g. HERDR_DEPLOY_PYTHON
+  # pointed at the wrong place) is a DIFFERENT failure than "the code does
+  # not compile" and must say so distinctly — "does not compile" for a
+  # missing interpreter blamed the wrong thing (round 2 review).
+  local py_problem=""
+  if [ -z "$deploy_py" ]; then
+    py_problem="no pinned python3 interpreter found (resolve_hub_python)"
+  elif [ ! -x "$deploy_py" ]; then
+    py_problem="pinned interpreter '$deploy_py' is not an executable file"
+  fi
+  if [ -n "$py_problem" ] || ! "$deploy_py" -m compileall -q "$HERDR_APP_DIR/hub.py" "$HERDR_APP_DIR/lib" >/dev/null 2>&1; then
+    if [ -n "$py_problem" ]; then
+      echo "deploy: $py_problem — cannot verify $rev compiles" >&2
+    fi
     if [ -n "${prev:-}" ] && git -C "$HERDR_APP_DIR" checkout -q --detach --force "$prev"; then
       echo "deploy: $rev does not compile — rolled back to $prev" >&2
     else
@@ -551,6 +559,40 @@ render_hub_plist() {
       -e "s|__HUB_PYTHON__|$py|" \
       -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.hub.log|g" \
     "$tpl" > "$out"
+}
+
+# stage_plist <rendered-tmp> <live-path> — the only safe way to put a
+# rendered plist where launchd (or the next reload_agent) will find it.
+# `render_hub_plist` must be called with a TEMP `out` path, never the live
+# one directly: a prior version of install.sh rendered straight onto
+# `$PLIST`, so a render that then failed `plutil -lint` had already
+# overwritten the one working plist on disk with no backup — "the previous
+# plist is untouched" was asserted in a commit message and was false
+# (review finding, f41370f round 2). This function:
+#   1. lints the TEMP file — on failure, deletes it and returns 1 WITHOUT
+#      touching `<live-path>` at all;
+#   2. if a live plist already exists, copies it to a timestamped backup
+#      (`<live-path>.bak-<UTC timestamp>`) — the thing to restore for a
+#      manual rollback, NOT a re-render of an old template (which would
+#      silently restore whatever ambiguous-runtime bug the old template had);
+#   3. atomically `mv`s the linted temp file over the live path.
+stage_plist() {
+  local tmp="$1" live="$2" backup
+  if ! plutil -lint "$tmp" >/dev/null 2>&1; then
+    echo "  ! rendered plist failed plutil -lint ($tmp) — $live left untouched" >&2
+    rm -f "$tmp"
+    return 1
+  fi
+  if [ -e "$live" ]; then
+    backup="$live.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+    if ! cp -p "$live" "$backup"; then
+      echo "  ! could not back up $live before replacing it — refusing to stage" >&2
+      rm -f "$tmp"
+      return 1
+    fi
+    echo "  backed up previous plist -> $backup"
+  fi
+  mv -f "$tmp" "$live"
 }
 
 HERDR_SERVICES=(

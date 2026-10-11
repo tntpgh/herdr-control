@@ -55,6 +55,7 @@ const BASH_WRITE_TARGETS_SH = path.join(ROOT, "lib", "bash-write-targets.sh");
 const RESOLVE_SH = path.join(ROOT, "herdr-resolve.sh");
 const CONDUCTOR_EXIT_SH = path.join(ROOT, "conductor-exit.sh");
 const HUB_PY = path.join(ROOT, "hub.py");
+const RESOLVE_HUB_PYTHON_SH = path.join(ROOT, "launchd", "resolve-hub-python.sh");
 const HUB_PORT = Number(process.env.HERDR_HUB_PORT) || 8600;
 const HUB_URL = `http://127.0.0.1:${HUB_PORT}/`;
 
@@ -1375,10 +1376,35 @@ function parseEnvelope(stdout: string): ReconcileEnvelope | undefined {
 // human: tasks needing attention or an open decision form. The envelope is
 // acked exactly as before, so the conductor's cursor advances and the page —
 // not the next prompt — carries the history.
+// resolveHubPython — calls the SAME canonical resolver launchd/agent-lib.sh's
+// resolve_hub_python() wraps (launchd/resolve-hub-python.sh), so this
+// extension and install.sh/restart.sh can never pin two different
+// interpreters. Synchronous and cheap (an `ls`+`grep`+`sort` over two
+// directories), run at most once per omp session start, so the 2s budget
+// `hubSummary` already spends below is the dominant cost here, not this.
+function resolveHubPython(): string | undefined {
+  try {
+    const r = spawnSync("bash", [RESOLVE_HUB_PYTHON_SH], { encoding: "utf8", timeout: 2_000 });
+    const py = r.status === 0 ? r.stdout?.trim() : undefined;
+    return py ? py : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function ensureHub(): void {
   if (!hubAvailable) return;
+  // FAIL CLOSED, never fall back to bare `python3`: that resolves through
+  // this process's PATH with no guarantee of which interpreter answers —
+  // the exact ambiguous-runtime bug (CLT /usr/bin/python3 3.9.6 vs. an
+  // interactive shell's Homebrew 3.14) this resolver exists to remove. No
+  // pinned interpreter found means the omp extension simply does not start
+  // a hub here; the launchd agent (if installed) or a human running
+  // `install.sh --hub --apply` remain the paths that do.
+  const py = resolveHubPython();
+  if (!py) return;
   try {
-    const child = spawn("python3", [HUB_PY, "--port", String(HUB_PORT)], {
+    const child = spawn(py, [HUB_PY, "--port", String(HUB_PORT)], {
       detached: true,
       stdio: ["ignore", "ignore", "ignore"],
     });

@@ -442,9 +442,21 @@ if [ "$HUB" = 1 ]; then
     if HUB_PY_BIN="$(resolve_hub_python)"; then
       HERDR_DEPLOY_PYTHON="$HUB_PY_BIN"
       if deploy_app "${HUB_REV:-origin/main}"; then
-        render_hub_plist "$here/com.herdr-control.hub.plist.template" "$PLIST" "$HUB_PY_BIN"
-        reload_agent com.herdr-control.hub "$PLIST" \
-          && echo "  hub -> http://127.0.0.1:8600/ (python: $HUB_PY_BIN)"
+        # Render to a TEMP path and let stage_plist lint + back up + swap —
+        # NEVER render straight onto $PLIST. A render that then failed lint
+        # used to overwrite the one working plist on disk with no backup
+        # (round 2 review finding on f41370f): "the previous plist is
+        # untouched" was claimed and was false.
+        TMP_PLIST="$PLIST.rendering.$$"
+        render_hub_plist "$here/com.herdr-control.hub.plist.template" "$TMP_PLIST" "$HUB_PY_BIN"
+        if stage_plist "$TMP_PLIST" "$PLIST"; then
+          reload_agent com.herdr-control.hub "$PLIST" \
+            && echo "  hub -> http://127.0.0.1:8600/ (python: $HUB_PY_BIN)"
+        else
+          INSTALL_RC=2
+          echo "  ! hub NOT installed: plist staging failed (above)." >&2
+          echo "    The previous plist (if any) and the running hub are untouched." >&2
+        fi
       else
         INSTALL_RC=2
         echo "  ! hub NOT installed: deploy failed (above). The plist and the" >&2
