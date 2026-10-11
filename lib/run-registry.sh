@@ -102,15 +102,53 @@ _HERDR_REGISTRY_READY=0
 _registry_schema_version() { printf '11\n'; }
 
 _TASK_AUTHORIZATION_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/task-authorization.py"
+
+# _registry_python — the ONE place lib/run-registry.sh decides which python3
+# interpreter touches the registry. Extends launchd/resolve-hub-python.sh
+# (the same resolver the hub plist and its compile gate pin) rather than
+# re-deriving a second scan: a machine where Homebrew's generic `python3`
+# symlink is missing resolves bare `python3` to the CLT's /usr/bin/python3
+# 3.9.6 in every shell, under which the v12 migration aborts with "unable to
+# open database file" (Main's rehearsal,
+# thurber-os/.handoffs/registry-rehearsal-20261011.log); the SAME pinned
+# 3.14 interpreter the hub uses reaches schema 12 cleanly. FAILS CLOSED:
+# empty/non-executable resolution, or a resolved interpreter below 3.11
+# (the registry's own floor — stricter than the hub's "any versioned
+# interpreter," because this is the version the migration was proven
+# against), both refuse with a clear stderr message and a nonzero return.
+# Resolved at most once per process and cached in _REGISTRY_PYTHON.
+_REGISTRY_PYTHON_RESOLVER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/launchd/resolve-hub-python.sh"
+_REGISTRY_PYTHON=""
+_registry_python() {
+  if [ -n "$_REGISTRY_PYTHON" ]; then
+    printf '%s\n' "$_REGISTRY_PYTHON"
+    return 0
+  fi
+  local py
+  py="$(bash "$_REGISTRY_PYTHON_RESOLVER" 2>/dev/null)" || py=""
+  if [ -z "$py" ] || [ ! -x "$py" ]; then
+    printf 'run-registry: no pinned python3 interpreter found (resolve-hub-python.sh) — refusing to run registry code under an unpinned /usr/bin/env python3\n' >&2
+    return 1
+  fi
+  if ! "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    printf 'run-registry: pinned interpreter %s is older than 3.11 — refusing (the registry migration needs 3.11+)\n' "$py" >&2
+    return 1
+  fi
+  _REGISTRY_PYTHON="$py"
+  printf '%s\n' "$py"
+}
+
 _task_authorization_adapter() {
-  python3 "$_TASK_AUTHORIZATION_HELPER" "$(registry_db)" "$@"
+  local py; py="$(_registry_python)" || return 1
+  "$py" "$_TASK_AUTHORIZATION_HELPER" "$(registry_db)" "$@"
 }
 
 _registry_enable_wal() {
   # SQLite's journal-mode transition may return SQLITE_BUSY immediately even
   # with busy_timeout installed. Retry that idempotent transition alone, using
   # typed lock errors and the same bounded wait budget as ordinary SQL calls.
-  python3 - "$1" "${HERDR_REGISTRY_BUSY_MS:-5000}" <<'PY'
+  local py; py="$(_registry_python)" || return 1
+  "$py" - "$1" "${HERDR_REGISTRY_BUSY_MS:-5000}" <<'PY'
 import sqlite3
 import sys
 import time
@@ -142,6 +180,12 @@ PY
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
+  # Resolve (and cache) the pinned registry interpreter FIRST: every path
+  # below this point depends on it (_registry_enable_wal immediately below,
+  # the v11/v12 migration further down), so failing here gives the clearest
+  # possible message instead of surfacing from inside the first helper that
+  # happens to need it.
+  _registry_python >/dev/null || return 1
   local root db existed=0 init_error
   root="$(run_state_root)"
   db="$(registry_db)"
@@ -622,7 +666,8 @@ _migrate_schema_v11() {
   # registry's existing SQLite writer lock. Separate shell connections left a
   # window where eight first readers backed up into the same second-resolution
   # filename, or compared a newly migrated backup against a stale version.
-  python3 - "$(registry_db)" "$_TASK_AUTHORIZATION_HELPER" "${1:-1}" <<'PY'
+  local py; py="$(_registry_python)" || return 1
+  "$py" - "$(registry_db)" "$_TASK_AUTHORIZATION_HELPER" "${1:-1}" <<'PY'
 import importlib.util
 import os
 import sqlite3
@@ -851,13 +896,16 @@ confirm_task_authorization_ack() {
 }
 reserve_task_worktree() {
   registry_init || return 1
-  python3 "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" reserve "$@"
+  local py; py="$(_registry_python)" || return 1
+  "$py" "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" reserve "$@"
 }
 claim_task_worktree_mutation() {
-  python3 "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" claim-mutation "$@"
+  local py; py="$(_registry_python)" || return 1
+  "$py" "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" claim-mutation "$@"
 }
 check_worktree_unreserved() {
-  python3 "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" check-unreserved "$@"
+  local py; py="$(_registry_python)" || return 1
+  "$py" "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" check-unreserved "$@"
 }
 mark_authorization_launch() {
   _task_authorization_adapter launch "$1" "$2" "$3" "$4"

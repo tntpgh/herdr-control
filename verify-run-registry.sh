@@ -343,8 +343,8 @@ check "branch column exists (#3b ownership grant)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='branch';")" "1"
 check "trunk column exists (#3b ownership grant)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='trunk';")" "1"
-check "schema_version is 11 (source authorization receipts remain separate from legacy task rows)" \
-  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "11"
+check "schema_version is 12 (receipt-to-ack recovery: task_authorizations gets a durable revision stage counter)" \
+  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "12"
 check "project column exists (project-contract-plan.md #2)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='project';")" "1"
 check "manifest column exists (task-scoped approval)" \
@@ -509,6 +509,38 @@ printf '{"oldrun/oldtask":{"state":"running","updated_at":"2026-07-01T00:00:00Z"
   printf '  ok    legacy tasks, events and checkpoints imported once, non-destructively\n'
 ) || bad "legacy import"
 [ -d "$(dirname "$legacy_root")" ] && rm -rf "$(dirname "$legacy_root")"
+printf '\n== round 5 (fix/hub-runtime-pin): registry_init reaches schema 12 under a PATH where bare python3 is 3.9.6 ==\n'
+# Main's rehearsal (thurber-os/.handoffs/registry-rehearsal-20261011.log):
+# under the CLT's /usr/bin/python3 3.9.6 the v12 migration aborts with
+# "unable to open database file", rc=1; under a pinned 3.14 it reaches
+# schema 12 cleanly. Every registry call site now resolves an explicit,
+# versioned, absolute interpreter (launchd/resolve-hub-python.sh) instead of
+# trusting PATH's `python3` — proved here by making PATH unable to find
+# anything BUT the CLT's 3.9.6 and confirming the migration still succeeds.
+hostile_root="$(mktemp -d)/runs"
+(
+  export HERDR_RUN_STATE_DIR="$hostile_root"
+  _HERDR_REGISTRY_READY=0
+  registry_init >/dev/null 2>&1
+) || { printf '  FAIL  could not seed a fresh registry to build the v10 fixture\n'; }
+hostile_db="$hostile_root/registry.sqlite3"
+sqlite3 "$hostile_db" "DROP TABLE IF EXISTS task_authorizations; UPDATE schema_meta SET value='10' WHERE key='schema_version';" 2>/dev/null
+fixture_ver="$(sqlite3 -noheader "$hostile_db" "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)"
+if [ "$fixture_ver" = 10 ]; then
+  hostile_out="$(
+    env -i PATH="/usr/bin:/bin" HOME="$HOME" HERDR_RUN_STATE_DIR="$hostile_root" \
+      bash -c '. "'"$here"'/lib/run-registry.sh"; registry_init; printf "RC=%s\n" "$?"' 2>&1
+  )"
+  hostile_rc="$(printf '%s' "$hostile_out" | grep -o 'RC=[0-9]*' | tail -1 | cut -d= -f2)"
+  hostile_final_ver="$(sqlite3 -noheader "$hostile_db" "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)"
+  [ "$hostile_rc" = 0 ] && [ "$hostile_final_ver" = 12 ] \
+    && ok "registry_init reaches schema 12 with PATH restricted to /usr/bin:/bin (bare python3 there is 3.9.6)" \
+    || bad "registry_init under a hostile PATH: rc=$hostile_rc schema_version=$hostile_final_ver ($hostile_out)"
+else
+  bad "could not build a clean v10 fixture (schema_version=$fixture_ver) — test setup itself failed"
+fi
+rm -rf "$(dirname "$hostile_root")"
+
 
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"

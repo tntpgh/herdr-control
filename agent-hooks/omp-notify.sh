@@ -114,7 +114,7 @@ if [ -n "$call_id" ] && [ -n "$native_session" ] && [ -n "${HERDR_RUN_ID:-}" ] \
   _occ_display="$(prompt_occurrence_display "$pane" 2>/dev/null || printf 'read_failed')"
   _occ_screen_id=""
   [ "$_occ_display" = pending_parseable ] && _occ_screen_id="$(prompt_id "$pane" 2>/dev/null || printf '')"
-  python3 "$here/lib/prompt-occurrence.py" screen \
+  _occ_py="$(_registry_python 2>/dev/null)" && "$_occ_py" "$here/lib/prompt-occurrence.py" screen \
     --db "$(registry_db)" --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" --pane "$pane" \
     --birth "$_occ_pane_birth" --session "$native_session" --call-id "$call_id" \
     --display "$_occ_display" ${_occ_screen_id:+--prompt-id "$_occ_screen_id"} \

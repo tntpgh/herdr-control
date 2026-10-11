@@ -348,10 +348,13 @@ own_trunk=$(printf '%s' "$own_task_json" | jq -r '.trunk // empty' 2>/dev/null)
 
 if [ "$declining" = 0 ] && [ -n "$current_prompt_id" ] && [ -n "$own_run" ] && [ -n "$own_task" ] \
    && [ -f "$here/lib/prompt-occurrence.py" ]; then
-  occ_summary="$(python3 "$here/lib/prompt-occurrence.py" fold --db "$(registry_db)" --run "$own_run" --task "$own_task" 2>/dev/null \
+  occ_summary=""
+  if occ_py="$(_registry_python 2>/dev/null)"; then
+    occ_summary="$("$occ_py" "$here/lib/prompt-occurrence.py" fold --db "$(registry_db)" --run "$own_run" --task "$own_task" 2>/dev/null \
     | jq -r --arg p "$pane" --arg pid "$current_prompt_id" \
         '([.[] | select(.pane_id == $p and .screen_prompt_id == $pid)] | sort_by(.last_seq) | last) as $m
          | if $m == null then "" else ($m.display + "\t" + ($m.identity_verified|tostring)) end' 2>/dev/null)"
+  fi
   if [ -n "$occ_summary" ]; then
     occ_display="${occ_summary%%$'\t'*}"
     occ_identity="${occ_summary#*$'\t'}"

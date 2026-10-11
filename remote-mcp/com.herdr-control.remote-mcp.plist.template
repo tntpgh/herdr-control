@@ -11,11 +11,18 @@
 		     one credential, HERDR_MCP_INGEST_KEY, from
 		     ~/.config/op/launchd-secrets.env with the same literal parser as the
 		     hub, and never runs `op`, so no service-account file is sourced.
-		     Render (install.sh --remote-mcp): __REMOTE_MCP_PY__ -> the DEPLOYED
-		     app worktree's remote-mcp/publisher.py, __LOG_PATH__ ->
+		     Render (install.sh --remote-mcp): __REMOTE_MCP_PYTHON__ -> an
+		     explicit, versioned, absolute python3 (launchd/resolve-hub-python.sh,
+		     the SAME resolver the hub plist pins — publisher.py opens the
+		     registry sqlite directly and imports tasks.py, so it needs the same
+		     pin, NEVER `/usr/bin/env python3`: that resolves through PATH at
+		     launchd load time with none of the shell's environment, and on a
+		     machine where Homebrew's generic `python3` symlink is missing it
+		     silently lands on the CLT's /usr/bin/python3 3.9.6 while an
+		     interactive shell's `python3` is 3.14), __REMOTE_MCP_PY__ -> the
+		     DEPLOYED app worktree's remote-mcp/publisher.py, __LOG_PATH__ ->
 		     ~/Library/Logs/com.herdr-control.remote-mcp.log. -->
-		<string>/usr/bin/env</string>
-		<string>python3</string>
+		<string>__REMOTE_MCP_PYTHON__</string>
 		<string>__REMOTE_MCP_PY__</string>
 	</array>
 	<key>EnvironmentVariables</key>

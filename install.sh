@@ -551,8 +551,17 @@ if [ "$REMOTE_MCP" = 1 ]; then
   cond_note="conductor pane: $([ -n "$REMOTE_MCP_CONDUCTOR_PANE" ] && echo "$REMOTE_MCP_CONDUCTOR_PANE" || echo "none (falls back to owner-inbox/human-notify per-escalation)")"
   if [ "$APPLY" = 1 ]; then
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-    if deploy_app "${HUB_REV:-origin/main}"; then
-      sed -e "s|__REMOTE_MCP_PY__|$HERDR_APP_DIR/remote-mcp/publisher.py|" \
+    if ! REMOTE_MCP_PY_BIN="$(resolve_hub_python)"; then
+      INSTALL_RC=2
+      echo "  ! remote-mcp publisher NOT installed: no pinned python3 interpreter found." >&2
+      echo "    Looked for a versioned, absolute interpreter under" >&2
+      echo "    /opt/homebrew/bin or /usr/local/bin (e.g. python3.14)." >&2
+      echo "    Refusing to fall back to the ambiguous /usr/bin/env python3 — the" >&2
+      echo "    publisher opens the registry sqlite directly." >&2
+      echo "    Install one (brew install python@3.14) and re-run." >&2
+    elif deploy_app "${HUB_REV:-origin/main}"; then
+      sed -e "s|__REMOTE_MCP_PYTHON__|$(_sed_rhs "$REMOTE_MCP_PY_BIN")|" \
+          -e "s|__REMOTE_MCP_PY__|$HERDR_APP_DIR/remote-mcp/publisher.py|" \
           -e "s|__REMOTE_MCP_MESSAGING__|$REMOTE_MCP_MESSAGING|" \
           -e "s|__REMOTE_MCP_TASKS__|$REMOTE_MCP_TASKS|" \
           -e "s|__REMOTE_MCP_OWNER_INBOX__|$REMOTE_MCP_OWNER_INBOX|" \
@@ -561,7 +570,7 @@ if [ "$REMOTE_MCP" = 1 ]; then
           -e "s|__LOG_PATH__|$HOME/Library/Logs/com.herdr-control.remote-mcp.log|g" \
         "$here/remote-mcp/com.herdr-control.remote-mcp.plist.template" > "$PLIST"
       if rmcp_exit="$(load_interval_agent com.herdr-control.remote-mcp "$PLIST")"; then
-        echo "  remote-mcp publisher loaded (every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off), Mac owner-inbox switch $([ "$REMOTE_MCP_OWNER_INBOX" = 1 ] && echo ON || echo off), $cond_note); first tick last exit code: $rmcp_exit"
+        echo "  remote-mcp publisher loaded (every 15 s, pinned interpreter $REMOTE_MCP_PY_BIN, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off), Mac owner-inbox switch $([ "$REMOTE_MCP_OWNER_INBOX" = 1 ] && echo ON || echo off), $cond_note); first tick last exit code: $rmcp_exit"
       else
         INSTALL_RC=2; echo "  ! remote-mcp publisher: first tick exit ${rmcp_exit:-?}; check ~/Library/Logs/com.herdr-control.remote-mcp.log" >&2
       fi
@@ -570,7 +579,7 @@ if [ "$REMOTE_MCP" = 1 ]; then
       echo "  ! remote-mcp publisher NOT installed: deploy failed (above)." >&2
     fi
   else
-    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/remote-mcp/publisher.py every 15 s, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off), Mac owner-inbox switch $([ "$REMOTE_MCP_OWNER_INBOX" = 1 ] && echo ON || echo off), $cond_note)"
+    echo "  + would install launchd plist -> $PLIST ($HERDR_APP_DIR/remote-mcp/publisher.py every 15 s, pinned interpreter, Mac messaging switch $([ "$REMOTE_MCP_MESSAGING" = 1 ] && echo ON || echo off), Mac tasks switch $([ "$REMOTE_MCP_TASKS" = 1 ] && echo ON || echo off), Mac owner-inbox switch $([ "$REMOTE_MCP_OWNER_INBOX" = 1 ] && echo ON || echo off), $cond_note)"
   fi
 fi
 
