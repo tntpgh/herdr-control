@@ -1372,6 +1372,19 @@ console.log("LATE:" + fs.readFileSync("'"$RUNLOG"'", "utf8").trim().replace(/\n/
     && ok "interval reconcile runs normally once the guard frees up (not permanently stuck)" \
     || bad "interval reconcile never ran even after the session sweep finished: $late_line"
 
+  printf '== static: nothing reachable from onBeforeAgentStart() calls a *Sync child_process fn ==\n'
+  # Round 4 (2026-10-11): fix/hub-runtime-pin's resolveHubPython() called
+  # spawnSync from ensureHub(), itself called from onBeforeAgentStart — exactly
+  # the event-loop block PR #273 (above) eliminated, just one hop further down
+  # the call graph than a single-function grep would catch. This runs the
+  # actual call-graph-closure checker (not a copy of its logic) against the
+  # real source file, so a future regression anywhere in the reachable set —
+  # not just in onBeforeAgentStart's own body — fails this suite.
+  syncgraph_out="$(bun "$here/agent-hooks/check-no-sync-on-agent-start.mjs" 2>&1)"
+  printf '%s\n' "$syncgraph_out" | grep -q '^PASS:' \
+    && ok "$syncgraph_out" \
+    || bad "$syncgraph_out"
+
   printf '== shouldAnnounce(): the pure decision, every edge case ==\n'
   # SHIM4 above proves the real filesystem round trip once; these exercise
   # the exported decision function directly against constructed cursors, so

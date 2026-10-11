@@ -1468,32 +1468,40 @@ function parseEnvelope(stdout: string): ReconcileEnvelope | undefined {
 // human: tasks needing attention or an open decision form. The envelope is
 // acked exactly as before, so the conductor's cursor advances and the page —
 // not the next prompt — carries the history.
-// resolveHubPython — calls the SAME canonical resolver launchd/agent-lib.sh's
-// resolve_hub_python() wraps (launchd/resolve-hub-python.sh), so this
-// extension and install.sh/restart.sh can never pin two different
-// interpreters. Synchronous and cheap (an `ls`+`grep`+`sort` over two
-// directories), run at most once per omp session start, so the 2s budget
-// `hubSummary` already spends below is the dominant cost here, not this.
-function resolveHubPython(): string | undefined {
-  try {
-    const r = spawnSync("bash", [RESOLVE_HUB_PYTHON_SH], { encoding: "utf8", timeout: 2_000 });
-    const py = r.status === 0 ? r.stdout?.trim() : undefined;
-    return py ? py : undefined;
-  } catch {
-    return undefined;
-  }
+// ensureHub() used to call resolveHubPython() -> a synchronous
+// `spawnSync("bash", [RESOLVE_HUB_PYTHON_SH], ...)` inside
+// onBeforeAgentStart — exactly the pattern PR #273 eliminated everywhere
+// else in this handler (2026-10-10 watchdog: 384 ui.loop-blocked
+// entries/day; onBeforeAgentStart fires every turn, not once per session).
+// Same cache-and-background-refresh shape as hubSummaryCache below:
+// onBeforeAgentStart never waits on this. A cold cache this turn means
+// ensureHub() simply does not attempt to start a hub THIS turn — harmless,
+// since hub.py is normally already up via the launchd agent and this path
+// only matters on a machine where it is not, where a LATER turn's cache
+// hit (or the launchd agent, or `install.sh --hub --apply`) covers it. A
+// cold cache is never treated as "start one unpinned": it is read as "do
+// not start a hub this turn," never as permission to spawn bare `python3`.
+let hubPythonCache: string | undefined;
+let hubPythonRefreshInFlight = false;
+
+function refreshHubPythonAsync(): void {
+  if (hubPythonRefreshInFlight) return;
+  hubPythonRefreshInFlight = true;
+  captureOutput("bash", [RESOLVE_HUB_PYTHON_SH], { timeoutMs: 2_000 }, (ok, out) => {
+    hubPythonRefreshInFlight = false;
+    const py = ok ? out.trim() : "";
+    if (py) hubPythonCache = py;
+  });
 }
 
 function ensureHub(): void {
   if (!hubAvailable) return;
+  refreshHubPythonAsync();
   // FAIL CLOSED, never fall back to bare `python3`: that resolves through
   // this process's PATH with no guarantee of which interpreter answers —
   // the exact ambiguous-runtime bug (CLT /usr/bin/python3 3.9.6 vs. an
-  // interactive shell's Homebrew 3.14) this resolver exists to remove. No
-  // pinned interpreter found means the omp extension simply does not start
-  // a hub here; the launchd agent (if installed) or a human running
-  // `install.sh --hub --apply` remain the paths that do.
-  const py = resolveHubPython();
+  // interactive shell's Homebrew 3.14) this resolver exists to remove.
+  const py = hubPythonCache;
   if (!py) return;
   try {
     const child = spawn(py, [HUB_PY, "--port", String(HUB_PORT)], {
