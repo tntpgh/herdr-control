@@ -29,7 +29,16 @@ set -uo pipefail
 
 IFS=':' read -r -a search_dirs <<< "${HERDR_HUB_PYTHON_DIRS:-/opt/homebrew/bin:/usr/local/bin}"
 for dir in "${search_dirs[@]}"; do
-  found="$(ls "$dir" 2>/dev/null | grep -E '^python3\.[0-9]+$' | sort -t. -k3 -n | tail -1)"
+  # `python3.N` has exactly TWO dot-fields (`python3`, `N`) — `-k3` addresses
+  # a field that does not exist, so `sort -n` had no numeric key for ANY
+  # candidate and silently fell through to `ls`'s alphabetical order:
+  # `python3.9` sorted after `python3.14` lexically, so `tail -1` picked
+  # the LOWER version whenever two were present (review finding on
+  # f41370f/c7c9bd4 — this machine has only one installed minor, so round
+  # 1/2's own proofs never had two candidates to catch it with). `-k2,2n`
+  # is the version field, explicitly bounded so a future three-dot name
+  # cannot widen the key by accident.
+  found="$(ls "$dir" 2>/dev/null | grep -E '^python3\.[0-9]+$' | sort -t. -k2,2n | tail -1)"
   if [ -n "$found" ] && [ -x "$dir/$found" ]; then
     printf '%s/%s\n' "$dir" "$found"
     exit 0

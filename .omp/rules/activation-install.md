@@ -125,3 +125,32 @@ only if something resolves to them:
    breaking every hook and the omp extension the next time cleanup runs.
    Adoption always targets a durable checkout (`~/Code/herdr-control` on
    `main`, or an explicit APM deploy path), never a worktree.
+
+## Hub interpreter pin: what happens when Homebrew upgrades python3
+
+`install.sh --apply --hub` bakes an ABSOLUTE, versioned interpreter path
+(e.g. `/opt/homebrew/bin/python3.14`, `launchd/resolve-hub-python.sh`) into
+the rendered plist's `exec` line at INSTALL TIME — deliberately, to kill the
+`/usr/bin/env python3` ambiguity (ROUND 2 note above). The tradeoff: that
+path is only as durable as the Homebrew keg it names.
+
+**Symptom:** the hub crash-loops after a routine `brew upgrade python@3.14`
+(or any upgrade that removes an old minor's symlink, e.g. a `3.14` → `3.15`
+cleanup). `KeepAlive=true` in the plist respawns it immediately, so this
+looks like a tight restart loop, not a clean "service down."
+
+**Where it shows up:** `~/Library/Logs/com.herdr-control.hub.log`
+(`StandardOutPath`/`StandardErrorPath` in the plist both point here) gets an
+`exec`-failure line (`No such file or directory`) every time launchd
+respawns it — the failure IS logged, but nothing pages for it; an operator
+has to go looking.
+
+**Fix:** re-run `install.sh --apply --hub`. `resolve_hub_python` re-scans
+`/opt/homebrew/bin` and `/usr/local/bin` at that moment, so it picks up
+whichever minor Homebrew left behind, and the resulting plist is staged
+through `stage_plist` (temp render → `plutil -lint` → timestamped backup of
+the broken one → atomic replace) the same as any other install. There is no
+proactive alert for this today — `verify-deploy.sh`'s "the plist installed
+on THIS machine" section will catch a plist pointing at a `hub.py` that does
+not exist, but not yet an interpreter path that does not exist; that is a
+gap, not a guarantee.

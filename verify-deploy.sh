@@ -247,6 +247,26 @@ else
     bad "resolve_hub_python found nothing on the real machine, but DEPLOY_PY succeeded at suite start"
 fi
 
+printf '== round 3: resolve_hub_python picks the HIGHEST version, numerically ==\n'
+# The bug this catches: `sort -t. -k3 -n` addressed a dot-field that does
+# not exist for `python3.N` (only 2 fields — `python3`, `N`), so the numeric
+# key was empty for every candidate and sort silently fell through to `ls`'s
+# alphabetical order: `python3.9` sorts after `python3.14` lexically, so
+# `tail -1` picked the LOWER version whenever a 3.1x and a 3.9-or-below both
+# existed. Needs at least one two-digit AND one one-digit minor to expose —
+# this machine normally has only one installed minor, which is exactly why
+# round 1/2's own proofs never caught it (review finding on c7c9bd4).
+MULTIV="$WORK/py-multiv"; mkdir -p "$MULTIV"
+for v in python3.6 python3.9 python3.10 python3.14; do
+    cp /usr/bin/true "$MULTIV/$v"
+    chmod +x "$MULTIV/$v"
+done
+PICKED="$(HERDR_HUB_PYTHON_DIRS="$MULTIV" resolve_hub_python 2>&1)"
+case "$PICKED" in
+    */python3.14) ok "resolve_hub_python picks python3.14 over .6/.9/.10 (numeric order, not lexical)" ;;
+    *) bad "resolve_hub_python picked '$PICKED' instead of python3.14 — lexical-sort regression" ;;
+esac
+
 printf '== round 2: deploy_app fails closed and rolls back with no pinned interpreter ==\n'
 deploy_app "$GOOD2" >/dev/null 2>&1
 BEFORE_NO_PY="$(app_rev_sha)"
