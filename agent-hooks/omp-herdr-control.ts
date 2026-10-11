@@ -135,34 +135,93 @@ function spawnDetached(args: string[], stdinInput?: string, env?: Record<string,
   }
 }
 
+// ---- kill a spawned child's entire process group ---------------------------
+// `detached: true` on spawn() makes the child the leader of a new POSIX
+// process group (Node calls setpgid before exec), so `-pid` here addresses
+// every process in that group — not just the one PID passed to spawn().
+// Added 2026-10-10 (PR #273 round 2 security review, finding 2): a plain
+// `child.kill()` only ever reaches the direct child; any subprocess THAT
+// child is itself synchronously blocked on (a `herdr pane list`, `jq`, or
+// sqlite3 call inside lib/reconcile.sh's own sweep) was never signalled and
+// survived as an orphan — reproduced live: a `sleep 9999` left running
+// under a killed bash wrapper, its inherited stdout pipe keeping the
+// wrapper's own 'close' event from ever firing. SIGTERM first; SIGKILL
+// after a short grace period if the group is still alive (the review's
+// "hard-kill fallback" direction). Both signals route to the GROUP. A
+// group that is already gone makes process.kill() throw ESRCH — swallowed
+// like every other best-effort signal in this file.
+//
+// Exported (like shouldAnnounce below) purely so verify-omp-hooks.sh can
+// exercise this exact mechanism directly against a forked-sleep stub,
+// without waiting out runReconcileAsync's full production kill-timer.
+export function killGroup(pid: number): void {
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    // group already gone
+  }
+  const killer = setTimeout(() => {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // group already gone
+    }
+  }, 2_000);
+  killer.unref();
+}
+
 // ---- async process capture --------------------------------------------------
-// Shared by every background refresh below (hub summary, project card,
-// reconcile): run `cmd`, collect stdout up to a bound, call `cb(ok, stdout)`
-// EXACTLY once — `ok` is the same bar the old spawnSync call sites used
-// (`r.error || r.status !== 0 || !r.stdout` -> false). Never throws, never
-// blocks: this is what let onBeforeAgentStart stop doing spawnSync at all
+// Shared by every background refresh below (hub summary, project card):
+// run `cmd`, collect stdout up to a bound, call `cb(ok, stdout)` EXACTLY
+// once — `ok` is the same bar the old spawnSync call sites used (`r.error
+// || r.status !== 0 || !r.stdout` -> false). Never throws, never blocks:
+// this is what let onBeforeAgentStart stop doing spawnSync at all
 // (2026-10-10 fix/omp-hook-nonblocking — see onBeforeAgentStart's header).
+//
+// `timeoutMs` is REQUIRED, not optional (2026-10-10, PR #273 round 2
+// security review, finding 1): the first version of this helper trusted
+// every caller's own command to self-bound — true for the `curl --max-time
+// 2` call sites, false for `git rev-parse` (no bound at all). A hung `git`
+// (lock contention, a flaky/networked worktree, a corrupted .git) left
+// `projectRefreshInFlight` stuck at `true` forever, silently and
+// permanently freezing the project card with zero signal — reproduced
+// live with a fake `git` that slept. Making the parameter mandatory means
+// a future caller cannot repeat that mistake by omission. On timeout,
+// `killGroup` reaps the whole process group (see above) and the call
+// resolves `ok:false`, same as any other failure. Triggered off `exit`,
+// not `close`: see killGroup's header for why `close` is the wrong signal
+// to wait on when an orphaned grandchild can hold the pipe open.
 function captureOutput(
   cmd: string,
   args: string[],
-  opts: { cwd?: string },
+  opts: { cwd?: string; timeoutMs: number },
   cb: (ok: boolean, stdout: string) => void,
 ): void {
   let out = "";
   let done = false;
+  let timer: NodeJS.Timeout | undefined;
   const finish = (ok: boolean) => {
     if (done) return;
     done = true;
+    clearTimeout(timer);
     cb(ok, out);
   };
   try {
-    const child = spawn(cmd, args, { cwd: opts.cwd, stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn(cmd, args, { cwd: opts.cwd, stdio: ["ignore", "pipe", "ignore"], detached: true });
     child.on("error", () => finish(false));
     child.stdout?.on("error", () => {});
     child.stdout?.on("data", (chunk: Buffer) => {
       if (out.length < 65_536) out += chunk.toString("utf8"); // bounded, see spawnDetached header
     });
-    child.on("close", (code) => finish(code === 0 && out.length > 0));
+    child.on("exit", (code) => finish(code === 0 && out.length > 0));
+    if (child.pid) {
+      const pid = child.pid;
+      timer = setTimeout(() => {
+        killGroup(pid);
+        finish(false);
+      }, opts.timeoutMs);
+      timer.unref();
+    }
   } catch {
     finish(false);
   }
@@ -1446,7 +1505,7 @@ let hubRefreshInFlight = false;
 function refreshHubSummaryAsync(): void {
   if (hubRefreshInFlight) return;
   hubRefreshInFlight = true;
-  captureOutput("curl", ["-s", "--max-time", "2", `${HUB_URL}api/summary`], {}, (ok, out) => {
+  captureOutput("curl", ["-s", "--max-time", "2", `${HUB_URL}api/summary`], { timeoutMs: 5_000 }, (ok, out) => {
     hubRefreshInFlight = false;
     if (!ok) return;
     try {
@@ -1538,7 +1597,12 @@ function buildProjectCard(j: unknown, cwd: string, repoRoot: string | null, fall
 // turn reading the cache (rare — cwd basically never changes mid-session —
 // but a stale cache for the WRONG project must never be shown as the
 // current one): onBeforeAgentStart only uses projectCardCache when
-// projectCardCacheCwd still equals the live cwd.
+// projectCardCacheCwd still equals the live cwd. The `git` call below is
+// bounded (`timeoutMs: 2_000`, see captureOutput's header) since 2026-10-10
+// — PR #273 round 2 security review, finding 1: the first version left it
+// unbounded, and a hung `git` (lock contention, a flaky/networked
+// worktree, a corrupted .git) left `projectRefreshInFlight` stuck `true`
+// forever, silently and permanently freezing this card.
 let projectCardCache: ProjectCard | undefined;
 let projectCardCacheCwd: string | undefined;
 let projectRefreshInFlight = false;
@@ -1567,11 +1631,11 @@ function refreshProjectSummaryAsync(cwd: string): void {
       // malformed JSON: leave the previous cache in place, never crash
     }
   };
-  captureOutput("curl", ["-s", "--max-time", "2", `${HUB_URL}api/projects`], {}, (ok, out) => {
+  captureOutput("curl", ["-s", "--max-time", "2", `${HUB_URL}api/projects`], { timeoutMs: 5_000 }, (ok, out) => {
     projResult = { ok, out };
     maybeFinish();
   });
-  captureOutput("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd }, (ok, out) => {
+  captureOutput("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, timeoutMs: 2_000 }, (ok, out) => {
     gitResult = { ok, out };
     maybeFinish();
   });
@@ -1817,43 +1881,55 @@ function onBeforeAgentStart():
 // ack-on-ackRequired stay in exactly one place, matching lib/reconcile.sh's
 // own one-copy-for-both-hooks rationale.
 //
-// A per-mode in-flight guard replaces what the old spawnSync accidentally
-// provided by blocking the whole process: before_agent_start fires every
-// turn in this harness, not once per session (see its header), so without
-// a guard a slow sweep could pile a second one on top of itself. The 15s
-// kill-timer is kept as a resource backstop only — NOT load-bearing for
-// context injection, which never depended on this call completing in time
-// — so a hung omp-reconcile.sh becomes a killed orphan instead of an
-// indefinitely growing one.
+// ONE shared in-flight guard across BOTH modes (2026-10-10, PR #273 round 2
+// security review, finding 3): the old spawnSync provided mutual exclusion
+// between session and interval reconcile for free by blocking the WHOLE
+// event loop — interval mode (triggered from tool_result, which cannot run
+// until the loop is unblocked) literally could not start while a session
+// sweep was in flight. The first async version of this file used TWO
+// separate per-mode guards and lost that: session and interval could run
+// as two concurrent omp-reconcile.sh processes, and lib/reconcile.sh's own
+// mutex (reconcile_lock_dir) is acquired ONLY by interval mode — session
+// mode never takes it, so the two could race to ack_reconcile, and the
+// loser's task_states (last-writer-wins, not merged — see
+// lib/run-registry.sh ack_reconcile) could clobber the winner's diffing
+// baseline. A single shared boolean restores "only one sweep of either
+// kind at a time" without needing a cross-process lock, since both callers
+// live in this same process.
 //
-// The child is deliberately NOT detached/unref'd: a piped-stdout child
-// needs its parent reading, same as before.
-let reconcileSessionInFlight = false;
-let reconcileIntervalInFlight = false;
+// Killed by PROCESS GROUP, not by PID (2026-10-10, finding 2): a plain
+// `child.kill()` only signals the `bash` wrapper itself — not any
+// subprocess that wrapper is synchronously blocked ON (a `herdr pane
+// list`, `jq`, or sqlite3 call inside lib/reconcile.sh's own sweep —
+// exactly the kind of call PROOF.md's #r1 says scales with registry size).
+// That subprocess inherits the wrapper's piped stdout, so it also keeps
+// the pipe open after the wrapper dies — which is why `finish` is wired to
+// `exit` (the direct child terminating) and NOT `close` (every stdio
+// stream reaching EOF): `close` can be held open indefinitely by exactly
+// the orphan `killGroup` exists to reap. `detached: true` makes the child
+// its own process-group leader on POSIX, so `killGroup`'s
+// `process.kill(-pid, ...)` reaches the whole group — SIGTERM first,
+// SIGKILL after a 2s grace period if anything in the group is still
+// alive. The kill-timer itself is a resource backstop only — NOT
+// load-bearing for context injection, which never depended on this call
+// completing in time. `HERDR_RECONCILE_KILL_MS` overrides the 15s default
+// for tests only; production never sets it.
+const RECONCILE_KILL_MS = Number(process.env.HERDR_RECONCILE_KILL_MS) || 15_000;
+let reconcileInFlight = false;
 
 function runReconcileAsync(mode: "session" | "interval"): void {
-  const setInFlight = (v: boolean) => {
-    if (mode === "session") reconcileSessionInFlight = v;
-    else reconcileIntervalInFlight = v;
-  };
-  if (mode === "session" ? reconcileSessionInFlight : reconcileIntervalInFlight) return;
-  setInFlight(true);
+  if (reconcileInFlight) return;
+  reconcileInFlight = true;
   try {
-    const child = spawn("bash", [RECONCILE_SH, mode], { stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn("bash", [RECONCILE_SH, mode], { stdio: ["ignore", "pipe", "ignore"], detached: true });
     let out = "";
     let settled = false;
-    const killTimer = setTimeout(() => {
-      try {
-        child.kill();
-      } catch {
-        // already gone
-      }
-    }, 15_000);
+    let killTimer: NodeJS.Timeout | undefined;
     const finish = () => {
       if (settled) return;
       settled = true;
       clearTimeout(killTimer);
-      setInFlight(false);
+      reconcileInFlight = false;
       try {
         const env = parseEnvelope(out);
         if (env?.ackRequired) spawnDetached([RECONCILE_SH, "ack"], env.raw);
@@ -1868,10 +1944,18 @@ function runReconcileAsync(mode: "session" | "interval"): void {
       // unbounded output inside the agent process.
       if (out.length < 262_144) out += chunk.toString("utf8");
     });
-    child.on("close", finish);
+    child.on("exit", finish);
+    if (child.pid) {
+      const pid = child.pid;
+      killTimer = setTimeout(() => {
+        killGroup(pid);
+        finish();
+      }, RECONCILE_KILL_MS);
+      killTimer.unref();
+    }
   } catch {
     // spawn() throwing synchronously — same contract as spawnDetached.
-    setInFlight(false);
+    reconcileInFlight = false;
   }
 }
 

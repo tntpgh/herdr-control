@@ -936,6 +936,13 @@ console.log("APPROVAL_RETURN:" + (ar === undefined ? "undefined" : JSON.stringif
 const bas = handlers["before_agent_start"]({});
 console.log("INJECTED:" + (bas && bas.message ? bas.message.content : "none"));
 handlers["tool_execution_start"]({ toolName: "read", args: { path: "/x" } });   // must stay silent
+// Finding 3 (PR #273 round 2): session and interval reconcile now share ONE
+// in-flight guard, so firing tool_result in the SAME tick as
+// before_agent_start would be correctly suppressed (that is the fix, not a
+// bug) — this test is about composition (every handler wires to its
+// script), not concurrency, so give the session stub time to finish and
+// free the guard before interval fires.
+await new Promise(r => setTimeout(r, 150));
 handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
 handlers["tool_approval_resolved"]({ approved: true });
 handlers["agent_end"]({});
@@ -1006,6 +1013,10 @@ const sent = [];
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, sendMessage: (m) => { sent.push(m); } });
 const bas = handlers["before_agent_start"]({});
 console.log("SESSION_INJECT:" + (bas && bas.message ? bas.message.content : "none"));
+// Finding 3 (PR #273 round 2): see the identical comment above the first
+// SHIM test — the shared in-flight guard means interval must wait for the
+// session stub to finish and free up before it can run at all.
+await new Promise(r => setTimeout(r, 150));
 handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
 await new Promise(r => setTimeout(r, 800));
 console.log("SENT:" + sent.length + ":" + (sent[0] ? sent[0].content : ""));
@@ -1222,6 +1233,144 @@ console.log("ELAPSED_MS:" + (performance.now() - t0).toFixed(1));
         && ok "onBeforeAgentStart returns in ${elapsed}ms even with a 10s-sleeping reconcile stub (<200ms)" \
         || bad "onBeforeAgentStart blocked ${elapsed}ms on a slow reconcile — regressed to synchronous" ;;
   esac
+
+  printf '== TS shim: finding 1 — a hung git does not permanently wedge the project card ==\n'
+  # The regression this pins (PR #273 round 2 security review, finding 1):
+  # captureOutput's git call had no timeout of its own. A hung git (lock
+  # contention, a flaky/networked worktree, a corrupted .git) left
+  # projectRefreshInFlight stuck true forever, so the project card froze —
+  # or stayed cold forever on a fresh process — with zero signal. The fix
+  # bounds that call (timeoutMs: 2_000, see refreshProjectSummaryAsync's
+  # header) and reaps it via killGroup, so a SECOND before_agent_start
+  # call, issued after that bound plus killGroup's own SIGKILL grace, must
+  # see the project card recover instead of staying wedged.
+  SHIM6="$WORK/shim6"; mkdir -p "$SHIM6/agent-hooks" "$WORK/fakegit"
+  for s in omp-notify.sh omp-reconcile.sh; do printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM6/agent-hooks/$s"; done
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM6/herdr-resolve.sh"
+  chmod +x "$SHIM6/agent-hooks/"*.sh "$SHIM6/herdr-resolve.sh"
+  # A fake `git` that hangs well past captureOutput's 2s bound, modelling
+  # lock contention / a flaky networked worktree / a corrupted .git.
+  printf '#!/usr/bin/env bash\nsleep 120\n' > "$WORK/fakegit/git"
+  chmod +x "$WORK/fakegit/git"
+  cp "$SHIM3/stub-hub.py" "$SHIM6/stub-hub.py"
+  : > "$SHIM6/port"
+  proj_json="$(jq -nc --arg repo "$here" \
+    '{projects:[{project:"demo",repo:$repo,next_step:"ship it",needs_wake:false,tasks:[],prs:[],open_decisions:[]}]}')"
+  python3 "$SHIM6/stub-hub.py" "$proj_json" > "$SHIM6/port" &
+  shim6_pid=$!
+  port6="" tries6=0
+  while [ -z "$port6" ] && [ "$tries6" -lt 50 ]; do
+    sleep 0.1; port6="$(cat "$SHIM6/port" 2>/dev/null)"; tries6=$((tries6 + 1))
+  done
+  # PATH-prepended fake git: refreshProjectSummaryAsync shells out to `git`
+  # by name, so this is the same substitution a real PATH mishap or a
+  # deliberately slow wrapper would produce — no code change needed to
+  # reach the call.
+  shim6_out="$(PATH="$WORK/fakegit:$PATH" HERDR_CONTROL_DIR="$SHIM6" HERDR_HUB_PORT="$port6" HERDR_RUN_STATE_DIR="$SHIM6/state" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
+const first = handlers["before_agent_start"]({});
+console.log("FIRST:" + (first && first.message ? first.message.content : "none"));
+await new Promise(r => setTimeout(r, 5000));   // past git'"'"'s 2s captureOutput bound + killGroup'"'"'s 2s SIGKILL grace + buffer
+const second = handlers["before_agent_start"]({});
+console.log("SECOND:" + (second && second.message ? second.message.content : "none"));
+' 2>&1)"
+  kill "$shim6_pid" 2>/dev/null || true; wait "$shim6_pid" 2>/dev/null || true
+  printf '%s' "$shim6_out" | grep -q '^FIRST:none$' \
+    && ok "the first (cold) turn never blocks on the hung git" || bad "first turn: $shim6_out"
+  printf '%s' "$shim6_out" | grep -q 'project demo: next — ship it' \
+    && ok "a hung git still lets the project card recover within the bound (finding 1 fixed)" \
+    || bad "finding 1 regression: project card never recovered from a hung git: $shim6_out"
+
+  printf '== killGroup(): finding 2 — the whole process group is reaped, not just the wrapper ==\n'
+  # The regression this pins (PR #273 round 2 security review, finding 2):
+  # a plain child.kill() only signals the direct child; a subprocess that
+  # child is itself synchronously blocked on inherits the same stdio and
+  # survives as an orphan. Reproduced here directly against killGroup
+  # (exported for exactly this), without waiting out
+  # runReconcileAsync's full 15s production kill-timer: a wrapper script
+  # backgrounds a `sleep 9999`, records its PID, then blocks in `wait` —
+  # the same shape a wrapper synchronously blocked on a slow `herdr pane
+  # list`/jq/sqlite3 call takes. killGroup must kill BOTH.
+  cat > "$WORK/gk-wrapper.sh" <<EOS
+#!/usr/bin/env bash
+sleep 9999 &
+printf '%s' "\$!" > "$WORK/gk-grandchild.pid"
+wait
+EOS
+  chmod +x "$WORK/gk-wrapper.sh"
+  : > "$WORK/gk-grandchild.pid"
+  gk_out="$(bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const { spawn } = await import("node:child_process");
+const wrapper = spawn("bash", ["'"$WORK"'/gk-wrapper.sh"], { stdio: ["ignore", "ignore", "ignore"], detached: true });
+const wpid = wrapper.pid;
+await new Promise(r => setTimeout(r, 400));    // let bash fork the grandchild and write its pid
+mod.killGroup(wpid);
+await new Promise(r => setTimeout(r, 2500));   // past killGroup'"'"'s own SIGTERM-then-SIGKILL 2s grace
+console.log("WRAPPER_PID:" + wpid);
+' 2>&1)"
+  wpid="$(printf '%s' "$gk_out" | grep '^WRAPPER_PID:' | cut -d: -f2)"
+  gcpid="$(cat "$WORK/gk-grandchild.pid" 2>/dev/null)"
+  if [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null; then
+    bad "finding 2 regression: the wrapper itself (pid $wpid) survived killGroup: $gk_out"
+  else
+    ok "the wrapper is reaped by killGroup"
+  fi
+  if [ -n "$gcpid" ] && kill -0 "$gcpid" 2>/dev/null; then
+    bad "finding 2 regression: the wrapper's grandchild (pid $gcpid) survived as an orphan — exactly the leak the security review found: $gk_out"
+  else
+    ok "finding 2 fixed: the grandchild a hung wrapper was blocked on is also reaped, not just the wrapper"
+  fi
+  kill -9 "$wpid" "$gcpid" 2>/dev/null || true   # belt and braces if the assertion above ever needs to run again
+
+  printf '== TS shim: finding 3 — session and interval reconcile cannot overlap ==\n'
+  # The regression this pins (PR #273 round 2 security review, finding 3):
+  # making session-mode reconcile async removed the serialization the old
+  # blocking spawnSync provided for free (interval mode, triggered from
+  # tool_result, literally could not start while the event loop was
+  # blocked on a session sweep). TWO separate per-mode in-flight guards
+  # (the first async version of this file) did not restore that — session
+  # and interval could race as two concurrent omp-reconcile.sh processes.
+  # A SHARED guard must make an interval call that lands WHILE a session
+  # sweep is still running a no-op, not a second concurrent sweep — and
+  # must free up again once that sweep finishes, not stay stuck forever.
+  SHIM7="$WORK/shim7"; mkdir -p "$SHIM7/agent-hooks"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM7/agent-hooks/omp-notify.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM7/herdr-resolve.sh"
+  RUNLOG="$WORK/shim7-runs.log"; : > "$RUNLOG"
+  cat > "$SHIM7/agent-hooks/omp-reconcile.sh" <<EOS
+#!/usr/bin/env bash
+printf 'RUN mode=%s\n' "\$1" >> "$RUNLOG"
+if [ "\$1" = session ]; then sleep 1; fi
+exit 0
+EOS
+  chmod +x "$SHIM7/agent-hooks/"*.sh "$SHIM7/herdr-resolve.sh"
+  shim7_out="$(HERDR_CONTROL_DIR="$SHIM7" HERDR_RUN_STATE_DIR="$SHIM7/state" bun -e '
+const fs = await import("node:fs");
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
+handlers["before_agent_start"]({});                                           // kicks off session mode (1s sweep in the stub)
+handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });    // interval, racing session — must be suppressed
+await new Promise(r => setTimeout(r, 300));
+console.log("EARLY:" + fs.readFileSync("'"$RUNLOG"'", "utf8").trim().replace(/\n/g, "|"));
+await new Promise(r => setTimeout(r, 1000));                                   // let session'"'"'s 1s sweep finish, guard frees up
+handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });    // interval again — must run now
+await new Promise(r => setTimeout(r, 300));
+console.log("LATE:" + fs.readFileSync("'"$RUNLOG"'", "utf8").trim().replace(/\n/g, "|"));
+' 2>&1)"
+  early_line="$(printf '%s' "$shim7_out" | grep '^EARLY:')"
+  late_line="$(printf '%s' "$shim7_out" | grep '^LATE:')"
+  printf '%s' "$early_line" | grep -q 'mode=interval' \
+    && bad "finding 3 regression: interval reconcile ran WHILE session reconcile was still in flight: $early_line" \
+    || ok "interval reconcile is suppressed while session reconcile is in flight (shared guard holds)"
+  printf '%s' "$early_line" | grep -q 'mode=session' \
+    && ok "session reconcile itself did start" || bad "session reconcile never ran: $early_line"
+  printf '%s' "$late_line" | grep -q 'mode=interval' \
+    && ok "interval reconcile runs normally once the guard frees up (not permanently stuck)" \
+    || bad "interval reconcile never ran even after the session sweep finished: $late_line"
 
   printf '== shouldAnnounce(): the pure decision, every edge case ==\n'
   # SHIM4 above proves the real filesystem round trip once; these exercise
