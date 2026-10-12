@@ -34,10 +34,14 @@
 # interactive shell's `python3` is 3.14.
 #
 # HERDR_HUB_PYTHON_DIRS overrides the search path (colon-separated,
-# default /opt/homebrew/bin:/usr/local/bin) — ONLY so a test can exercise
-# this REAL script's fail-closed branch against empty scratch directories
-# without touching the real /opt/homebrew or /usr/local on the dev machine.
-# Production code never sets it.
+# default /opt/homebrew/bin:/usr/local/bin) — so a test can exercise this
+# REAL script's fail-closed branch against empty scratch directories
+# without touching the real /opt/homebrew or /usr/local on the dev
+# machine, and so .github/workflows/remote-mcp.yml can point this same
+# unmodified scan at actions/setup-python's install dir (neither
+# /opt/homebrew nor /usr/local on an Ubuntu runner) instead of growing a
+# second search path just for CI. Production (launchd-installed) code
+# never sets it.
 set -uo pipefail
 
 IFS=':' read -r -a search_dirs <<< "${HERDR_HUB_PYTHON_DIRS:-/opt/homebrew/bin:/usr/local/bin}"

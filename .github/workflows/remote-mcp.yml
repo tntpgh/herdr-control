@@ -67,6 +67,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Point resolve-hub-python.sh at actions/setup-python's interpreter
+        run: echo "HERDR_HUB_PYTHON_DIRS=$(dirname "$(command -v python3)")" >> "$GITHUB_ENV"
       - run: npm ci
       - run: npx tsc --noEmit
       - name: Production Worker authorization (offline storage adapter)
@@ -81,6 +83,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Point resolve-hub-python.sh at actions/setup-python's interpreter
+        run: echo "HERDR_HUB_PYTHON_DIRS=$(dirname "$(command -v python3)")" >> "$GITHUB_ENV"
       - name: Install isolated fixture dependencies
         run: |
           sudo apt-get update
@@ -100,6 +104,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Point resolve-hub-python.sh at actions/setup-python's interpreter
+        run: echo "HERDR_HUB_PYTHON_DIRS=$(dirname "$(command -v python3)")" >> "$GITHUB_ENV"
       - run: python3 remote-mcp/verify-publisher.py
       - run: python3 remote-mcp/verify-owner-inbox.py
       # SpawnArgvAgainstRealParser replays tasks.py's argv through the real
