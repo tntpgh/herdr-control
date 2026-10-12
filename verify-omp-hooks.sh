@@ -897,7 +897,7 @@ printf '== the TS extension shim actually drives these scripts (needs bun) ==\n'
 if ! command -v bun >/dev/null 2>&1; then
   printf '  skip  bun not on PATH — cannot exercise the omp extension module\n'
 else
-  SHIM="$WORK/shim"; mkdir -p "$SHIM/agent-hooks"
+  SHIM="$WORK/shim"; mkdir -p "$SHIM/agent-hooks" "$SHIM/lib" "$SHIM/launchd" "$SHIM/state"
   cat > "$SHIM/agent-hooks/omp-notify.sh" <<'EOS'
 #!/usr/bin/env bash
 # Its OWN file: the other stubs append concurrently, and an interleaved write
@@ -916,7 +916,39 @@ printf 'RESOLVE\n' >> "$REC"
 EOS
   chmod +x "$SHIM/agent-hooks/"*.sh "$SHIM/herdr-resolve.sh"
   export REC="$SHIM/rec.log"; : > "$REC"
-  shim_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" bun -e '
+  # Round 9 review (Main): HERDR_CONTROL_DIR="$SHIM" moves ROOT itself to this
+  # shim tree, so promptOccurrenceAvailable/RESOLVE_HUB_PYTHON_SH resolved
+  # against files this shim never created — recordOccurrence's own
+  # "missing helper" branch (a REAL, intentional fail-closed path, not a
+  # bug) always resolved persisted=false here, which correctly suppressed
+  # the notification the assertions below still expect. Fix: give this
+  # shim a REAL working prompt-occurrence path instead of weakening the
+  # gate — symlink the genuine resolver and prompt-occurrence.py in (both
+  # are self-contained: no further relative-path dependencies) and
+  # register a real task row in this shim's OWN isolated registry so
+  # identity resolves too.
+  ln -sf "$here/lib/prompt-occurrence.py" "$SHIM/lib/prompt-occurrence.py"
+  ln -sf "$here/launchd/resolve-hub-python.sh" "$SHIM/launchd/resolve-hub-python.sh"
+  # Setting WORKER_TASK_ID (below) also activates workerWriteScopeBlock for
+  # every bash tool_call, registered-worker-gated and previously dormant
+  # here since HERDR_TASK_ID was never set — symlink its real parser chain
+  # too (bash-write-targets.sh -> command-policy.sh, no further relative
+  # deps) so "git push --force" (no file write targets) is judged for real
+  # and allowed through, instead of failing closed as "parser unavailable".
+  ln -sf "$here/lib/bash-write-targets.sh" "$SHIM/lib/bash-write-targets.sh"
+  ln -sf "$here/lib/command-policy.sh" "$SHIM/lib/command-policy.sh"
+  # A genuinely separate `bash -c`, not just a subshell: registry_init's own
+  # _HERDR_REGISTRY_READY cache is a plain shell variable, already set to 1
+  # by this script's OWN top-level `register_task run1 task1 ...` call
+  # against $WORK/runs — a subshell inherits that same already-ready value
+  # and would skip creating the schema (including the `events` table
+  # prompt-occurrence.py writes into) for this shim's DIFFERENT state dir
+  # entirely. A fresh process has no inherited cache to skip past.
+  HERDR_RUN_STATE_DIR="$SHIM/state" bash -c \
+    '. "$0/lib/run-registry.sh"; register_task shimrun shimtask w1 cond1 "$1" "$2" "$3" "$4" /repo /wt "impl:omp-notify-shim"' \
+    "$here" "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" >/dev/null 2>&1
+  shim_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
 const handlers = {};
 mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
@@ -941,8 +973,11 @@ handlers["tool_execution_start"]({ toolName: "read", args: { path: "/x" } });   
 // before_agent_start would be correctly suppressed (that is the fix, not a
 // bug) — this test is about composition (every handler wires to its
 // script), not concurrency, so give the session stub time to finish and
-// free the guard before interval fires.
-await new Promise(r => setTimeout(r, 150));
+// free the guard before interval fires. Round 9: this shim now runs a REAL
+// resolve-hub-python.sh + prompt-occurrence.py chain (cold bash+python3
+// spawn) inside the detached persist-before-notify task, so
+// 150ms was cut it close — 800ms gives that real subprocess chain room.
+await new Promise(r => setTimeout(r, 800));
 handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
 handlers["tool_approval_resolved"]({ approved: true });
 handlers["agent_end"]({});

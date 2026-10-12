@@ -1477,7 +1477,7 @@ function occurrenceIdentityArgs(callId: string, nativeSession: string): string[]
 // this path has nothing to hide.
 const MAX_PENDING_OCCURRENCES = 50;
 const OCCURRENCE_SPAWN_TIMEOUT_MS = 4_000;
-interface PendingOccurrence { args: string[]; resolve: () => void; }
+interface PendingOccurrence { args: string[]; resolve: (persisted: boolean) => void; }
 const pendingOccurrenceQueue: PendingOccurrence[] = [];
 let pendingOccurrenceDropped = 0;
 // Round 7 follow-up (Main review): spawn/exit/timeout failures were only
@@ -1486,6 +1486,27 @@ let pendingOccurrenceDropped = 0;
 // spawn increments this exactly once even when more than one of its
 // handlers fires for the same outcome.
 let pendingOccurrenceFailed = 0;
+
+// prompt-occurrence.py (lib/prompt-occurrence.py:main) ALWAYS exits 0 and
+// prints exactly one JSON object, by design ("a monitoring CLI must never
+// crash its caller") — exit code alone can never tell a durable write from
+// an internal failure. Its one success shape, for every subcommand
+// (record_seen / record_screen / record_authorized / _resolve), is
+// `{"occ_key": <str>, "written": <str>, ...}` with no `error` key; every
+// failure path (malformed --input-json, an unhandled exception) instead
+// prints `{"error": <str>}` with no `occ_key`. Round 9 review (BLOCK): the
+// TS side never read stdout at all, so an exit-0 JSON error looked
+// identical to a real persist. This is the one place that tells them apart.
+function parsePersistedResponse(stdout: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(stdout.trim());
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const r = parsed as Record<string, unknown>;
+    return typeof r.occ_key === "string" && r.occ_key.length > 0 && !("error" in r);
+  } catch {
+    return false;
+  }
+}
 
 // Genuinely async: spawn + event listeners, never spawnSync. Bounded
 // lifetime: a hung prompt-occurrence.py (e.g. a stuck sqlite lock) must
@@ -1498,21 +1519,28 @@ let pendingOccurrenceFailed = 0;
 // PR #273 round 2's killGroup() already exists to close for captureOutput.
 // A single `settled` guard (round 8, finding 5) is checked first in every
 // handler so a failure that fires more than one of timeout/error/close is
-// still counted and resolved exactly once. Always resolves (never
-// rejects) so a dropped/failed/killed occurrence cannot produce an
+// still counted and resolved exactly once. Always resolves `persisted`
+// (never rejects) so a dropped/failed/killed occurrence cannot produce an
 // unhandled rejection; every failure is logged AND counted before resolve.
-function runOccurrenceAsync(py: string, args: string[]): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
+// Round 9 review (BLOCK): resolving `void` on EVERY outcome — including a
+// genuine timeout/EACCES/nonzero exit — made the caller's "did this
+// persist?" indistinguishable from "did this finish?". `persisted` is now
+// explicit: true only for a clean exit whose stdout is a real success
+// response (parsePersistedResponse above); every other outcome resolves
+// false and still logs the truthful reason.
+function runOccurrenceAsync(py: string, args: string[]): Promise<boolean> {
+  const { promise, resolve } = Promise.withResolvers<boolean>();
   let settled = false;
   let child;
   try {
-    child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: ["ignore", "ignore", "pipe"], detached: true });
+    child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: ["ignore", "pipe", "pipe"], detached: true });
   } catch (e: unknown) {
     pendingOccurrenceFailed++;
     console.error(`herdr: recordOccurrence: spawn threw (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${e}`);
-    resolve();
+    resolve(false);
     return promise;
   }
+  let stdout = "";
   let stderr = "";
   const liveChild = child;
   const timer = setTimeout(() => {
@@ -1521,8 +1549,9 @@ function runOccurrenceAsync(py: string, args: string[]): Promise<void> {
     pendingOccurrenceFailed++;
     console.error(`herdr: recordOccurrence: prompt-occurrence.py timed out after ${OCCURRENCE_SPAWN_TIMEOUT_MS}ms (total failed this session: ${pendingOccurrenceFailed}) — killing its process group, occurrence NOT recorded`);
     if (liveChild.pid) killGroup(liveChild.pid);
-    resolve();
+    resolve(false);
   }, OCCURRENCE_SPAWN_TIMEOUT_MS);
+  child.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
   child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
   child.on("error", (e: Error) => {
     if (settled) return;
@@ -1530,7 +1559,7 @@ function runOccurrenceAsync(py: string, args: string[]): Promise<void> {
     clearTimeout(timer);
     pendingOccurrenceFailed++;
     console.error(`herdr: recordOccurrence: spawn error (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${e}`);
-    resolve();
+    resolve(false);
   });
   child.on("close", (code: number | null) => {
     if (settled) return;
@@ -1539,8 +1568,16 @@ function runOccurrenceAsync(py: string, args: string[]): Promise<void> {
     if (code !== 0) {
       pendingOccurrenceFailed++;
       console.error(`herdr: recordOccurrence: prompt-occurrence.py failed (status=${code}, total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${stderr.slice(0, 300)}`);
+      resolve(false);
+      return;
     }
-    resolve();
+    if (!parsePersistedResponse(stdout)) {
+      pendingOccurrenceFailed++;
+      console.error(`herdr: recordOccurrence: prompt-occurrence.py exited 0 but its response was not a success (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${stdout.slice(0, 300)}`);
+      resolve(false);
+      return;
+    }
+    resolve(true);
   });
   return promise;
 }
@@ -1564,25 +1601,25 @@ async function drainOccurrenceQueue(): Promise<void> {
       if (!py) return;
       const item = pendingOccurrenceQueue.shift();
       if (!item) return;
-      await runOccurrenceAsync(py, item.args);
-      item.resolve();
+      const persisted = await runOccurrenceAsync(py, item.args);
+      item.resolve(persisted);
     }
   } finally {
     occurrenceDrainInFlight = false;
   }
 }
 
-export function recordOccurrence(args: string[]): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
+export function recordOccurrence(args: string[]): Promise<boolean> {
+  const { promise, resolve } = Promise.withResolvers<boolean>();
   if (!promptOccurrenceAvailable || !WORKER_RUN_ID || !WORKER_TASK_ID || !WORKER_PANE_ID) {
-    resolve();
+    resolve(false);
     return promise;
   }
   if (pendingOccurrenceQueue.length >= MAX_PENDING_OCCURRENCES) {
     const dropped = pendingOccurrenceQueue.shift();
     pendingOccurrenceDropped++;
     console.error(`herdr: recordOccurrence: pending-queue cap (${MAX_PENDING_OCCURRENCES}) reached — oldest queued occurrence dropped (total dropped this session: ${pendingOccurrenceDropped})`);
-    dropped?.resolve(); // it will never persist now; its waiter must not hang on it
+    dropped?.resolve(false); // it will never persist now; its waiter must not hang on it
   }
   pendingOccurrenceQueue.push({ args, resolve });
   if (hubPythonCache) void drainOccurrenceQueue();
@@ -1632,8 +1669,7 @@ function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
     // notifyForPrompt on the very next line, so the notification could
     // race ahead of (or outrun, on a crash) whatever async resolve+write
     // recordOccurrence still had in flight — fixed by awaiting its
-    // Promise<void> (resolves only once the write has genuinely been
-    // attempted) before notifying. Round 8 Main review follow-up: an
+    // Promise<boolean> before notifying. Round 8 Main review follow-up: an
     // `async function` handler returns a Promise, which omp's own
     // "never blocks the agent" event-handler contract requires this NOT
     // to do (verify-omp-hooks.sh:958) — this synchronous handler now
@@ -1641,15 +1677,31 @@ function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
     // persist-before-notify sequence in a DETACHED, self-contained task
     // with its own try/catch, exactly like every other fire-and-forget
     // path in this file (never awaited by the caller, never throws out).
+    //
+    // Round 9 review (BLOCK): awaiting the promise was only "attempt
+    // before notify" — every failure path (timeout, spawn error/EACCES,
+    // nonzero exit, queue eviction, prompt-occurrence.py exiting 0 with a
+    // JSON error) used to resolve just like a real success, so the
+    // notification fired unconditionally anyway. recordOccurrence now
+    // resolves an explicit `persisted` boolean (true only for a verified
+    // durable write) and this is the one gate: no identity (callId
+    // undefined, nothing was ever attempted) and an attempted-but-failed
+    // write both read as `persisted !== true` here and suppress the
+    // notification — the failure itself was already logged with its
+    // truthful reason and counted inside recordOccurrence/runOccurrenceAsync.
     void (async () => {
       try {
-        if (callId !== undefined) {
-          await recordOccurrence([
-            "seen", ...occurrenceIdentityArgs(callId, nativeSession),
-            "--tool", toolName,
-            ...(input !== undefined ? ["--input-json", JSON.stringify(input)] : []),
-            "--source", "tool_approval_requested",
-          ]);
+        const persisted = callId !== undefined
+          ? await recordOccurrence([
+              "seen", ...occurrenceIdentityArgs(callId, nativeSession),
+              "--tool", toolName,
+              ...(input !== undefined ? ["--input-json", JSON.stringify(input)] : []),
+              "--source", "tool_approval_requested",
+            ])
+          : false;
+        if (!persisted) {
+          console.error(`herdr: recordOccurrence: occurrence was not durably persisted — suppressing the approval notification for ${toolName} (call ${callId ?? "unknown"})`);
+          return;
         }
         notifyForPrompt(
           toolName,
