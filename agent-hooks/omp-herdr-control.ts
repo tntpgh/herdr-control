@@ -1441,125 +1441,153 @@ function occurrenceIdentityArgs(callId: string, nativeSession: string): string[]
 // first occurrence of a session, before any prior resolution) used to be
 // dropped outright — refreshHubPythonAsync() only starts the resolve, it
 // does not finish it, so reading hubPythonCache one line later was always
-// empty on that first call. Fixed: a cold-cache call is QUEUED (bounded,
-// oldest dropped and counted if the queue is ever saturated — logged, never
-// silent) and FLUSHED in order by refreshHubPythonAsync's own callback the
-// instant a resolution succeeds. The flush itself uses the ASYNC `spawn`,
-// not `spawnSync` (round 7 follow-up: an earlier version of this fix routed
-// the flush through an anonymous waiter closure specifically so the static
-// checker's identifier-based call graph could not resolve it back to a
-// named function — that hid a real spawnSync call from the guard instead of
-// making it genuinely non-blocking, the same class of problem as the round
-// 6 glob-evasion correction. This version has nothing to hide: the flush
-// path contains no *Sync call anywhere in its reachable closure, so
-// refreshHubPythonAsync can call flushPendingOccurrences by name and
-// check-no-sync-on-agent-start.mjs sees the whole truth). The WARM path
-// (cache already populated) stays genuinely synchronous — spawnSync, same
-// as before — because recordOccurrence's own caller ordering guarantee
-// only needs to hold when a resolved interpreter is already in hand, and
-// recordOccurrence is not reachable from onBeforeAgentStart either way.
+// empty on that first call. Round 8 review (5 findings against the round 7
+// fix, all addressed by collapsing to ONE ordered async path instead of a
+// separate warm-sync / cold-queue split):
+//  1. persist-before-notify: recordOccurrence now returns a Promise that
+//     resolves only once this occurrence has actually been attempted
+//     (written or definitively failed+logged), so onApprovalRequested can
+//     await it before calling notifyForPrompt — a notification can no
+//     longer outrun the write it describes.
+//  2. group-kill: runOccurrenceAsync spawns `detached: true` and kills via
+//     killGroup() (same PR #273 round 2 mechanism captureOutput uses) so a
+//     grandchild the interpreter itself blocked on cannot survive a kill
+//     and keep stdio open forever.
+//  4. one ordered path: the WARM short-circuit (recordOccurrence calling a
+//     synchronous spawnSync directly whenever hubPythonCache happened to
+//     already be set) is gone. Every occurrence, warm or cold, is pushed
+//     onto the SAME FIFO queue; a single drainOccurrenceQueue() — guarded
+//     against re-entry — is the only thing that ever calls
+//     runOccurrenceAsync, so persistence order is always arrival order,
+//     never whichever call happened to race hubPythonCache's assignment.
+//  5. count-once: runOccurrenceAsync now checks one shared `settled` guard
+//     at the top of every handler (timeout / error / close) so a failure
+//     that fires more than one of those (Node can emit both 'error' and
+//     'close' for the same spawn failure) is logged and counted exactly
+//     once, not twice.
+// flushPendingOccurrences's own name is gone with the split it drained;
+// drainOccurrenceQueue is its replacement, called directly, by name, from
+// refreshHubPythonAsync's callback and from recordOccurrence itself —
+// reachable from ensureHub()/onBeforeAgentStart, which is exactly why
+// nothing in its closure may contain a *Sync call (it does not:
+// runOccurrenceAsync only ever uses `spawn`, never `spawnSync`). An
+// earlier version of the round 7 fix instead hid a real spawnSync call
+// from the static checker behind an anonymous waiter closure — rejected
+// as the same class of problem as the round 6 glob-evasion correction;
+// this path has nothing to hide.
 const MAX_PENDING_OCCURRENCES = 50;
 const OCCURRENCE_SPAWN_TIMEOUT_MS = 4_000;
-const pendingOccurrenceArgs: string[][] = [];
+interface PendingOccurrence { args: string[]; resolve: () => void; }
+const pendingOccurrenceQueue: PendingOccurrence[] = [];
 let pendingOccurrenceDropped = 0;
 // Round 7 follow-up (Main review): spawn/exit/timeout failures were only
-// logged, never counted — this is the queued-flush twin of
-// pendingOccurrenceDropped, incremented by BOTH the warm sync path
-// (runOccurrence) and the queued async path (runOccurrenceAsync) and
-// included in every one of their failure log lines, so "how many
-// occurrences has this session actually lost" is answerable from the log
-// alone, not just "that it happened once."
+// logged, never counted. Round 8: a single shared `settled` guard inside
+// runOccurrenceAsync (not just the old `timedOut` flag) makes sure each
+// spawn increments this exactly once even when more than one of its
+// handlers fires for the same outcome.
 let pendingOccurrenceFailed = 0;
-
-function runOccurrence(py: string, args: string[]): void {
-  try {
-    const r = spawnSync(py, [PROMPT_OCCURRENCE_PY, ...args],
-      { encoding: "utf8", timeout: OCCURRENCE_SPAWN_TIMEOUT_MS, stdio: ["ignore", "pipe", "pipe"] });
-    if (r.error || r.status !== 0) {
-      pendingOccurrenceFailed++;
-      console.error(`herdr: recordOccurrence: prompt-occurrence.py failed (status=${r.status ?? "spawn-error"}, total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${(r.stderr ?? "").toString().slice(0, 300)}`);
-    }
-  } catch (e: unknown) {
-    pendingOccurrenceFailed++;
-    console.error(`herdr: recordOccurrence: spawnSync threw (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${e}`);
-  }
-}
 
 // Genuinely async: spawn + event listeners, never spawnSync. Bounded
 // lifetime: a hung prompt-occurrence.py (e.g. a stuck sqlite lock) must
-// never stall the flush queue forever — a manual timer (not spawn's own
+// never stall the queue forever — a manual timer (not spawn's own
 // `timeout` option, so the log line can say TIMEOUT distinctly from a
 // normal non-zero exit) kills the child after OCCURRENCE_SPAWN_TIMEOUT_MS.
-// Always resolves (never rejects) so a dropped/failed/killed queued
-// occurrence cannot produce an unhandled rejection; every failure is
-// logged AND counted first.
+// Spawned detached and killed via killGroup() (round 8, finding 2): a
+// plain child.kill() only ever reaches prompt-occurrence.py's own PID, not
+// any grandchild IT is synchronously blocked on — exactly the orphan class
+// PR #273 round 2's killGroup() already exists to close for captureOutput.
+// A single `settled` guard (round 8, finding 5) is checked first in every
+// handler so a failure that fires more than one of timeout/error/close is
+// still counted and resolved exactly once. Always resolves (never
+// rejects) so a dropped/failed/killed occurrence cannot produce an
+// unhandled rejection; every failure is logged AND counted before resolve.
 function runOccurrenceAsync(py: string, args: string[]): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
+  let settled = false;
   let child;
   try {
-    child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: ["ignore", "ignore", "pipe"] });
+    child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: ["ignore", "ignore", "pipe"], detached: true });
   } catch (e: unknown) {
     pendingOccurrenceFailed++;
-    console.error(`herdr: recordOccurrence: spawn threw (queued flush, total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${e}`);
+    console.error(`herdr: recordOccurrence: spawn threw (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${e}`);
     resolve();
     return promise;
   }
   let stderr = "";
-  let timedOut = false;
   const liveChild = child;
   const timer = setTimeout(() => {
-    timedOut = true;
+    if (settled) return;
+    settled = true;
     pendingOccurrenceFailed++;
-    console.error(`herdr: recordOccurrence: prompt-occurrence.py timed out after ${OCCURRENCE_SPAWN_TIMEOUT_MS}ms (queued flush, total failed this session: ${pendingOccurrenceFailed}) — killing it, occurrence NOT recorded`);
-    liveChild.kill("SIGKILL");
+    console.error(`herdr: recordOccurrence: prompt-occurrence.py timed out after ${OCCURRENCE_SPAWN_TIMEOUT_MS}ms (total failed this session: ${pendingOccurrenceFailed}) — killing its process group, occurrence NOT recorded`);
+    if (liveChild.pid) killGroup(liveChild.pid);
+    resolve();
   }, OCCURRENCE_SPAWN_TIMEOUT_MS);
   child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
   child.on("error", (e: Error) => {
+    if (settled) return;
+    settled = true;
     clearTimeout(timer);
-    if (!timedOut) {
-      pendingOccurrenceFailed++;
-      console.error(`herdr: recordOccurrence: spawn error (queued flush, total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${e}`);
-    }
+    pendingOccurrenceFailed++;
+    console.error(`herdr: recordOccurrence: spawn error (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${e}`);
     resolve();
   });
   child.on("close", (code: number | null) => {
+    if (settled) return;
+    settled = true;
     clearTimeout(timer);
-    if (!timedOut && code !== 0) {
+    if (code !== 0) {
       pendingOccurrenceFailed++;
-      console.error(`herdr: recordOccurrence: prompt-occurrence.py failed (queued flush, status=${code}, total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${stderr.slice(0, 300)}`);
+      console.error(`herdr: recordOccurrence: prompt-occurrence.py failed (status=${code}, total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${stderr.slice(0, 300)}`);
     }
     resolve();
   });
   return promise;
 }
 
-// Drains the cold-cache queue in FIFO order, awaiting each async spawn
-// before starting the next. Called directly, by name, from
-// refreshHubPythonAsync's own callback — reachable from ensureHub() /
-// onBeforeAgentStart, which is exactly why it must never contain a *Sync
-// call anywhere in its closure (it does not: runOccurrenceAsync only ever
-// uses `spawn`).
-async function flushPendingOccurrences(py: string): Promise<void> {
-  while (pendingOccurrenceArgs.length) {
-    const args = pendingOccurrenceArgs.shift();
-    if (args) await runOccurrenceAsync(py, args);
+// The ONE path every occurrence goes through, warm or cold (round 8,
+// finding 4): a warm recordOccurrence call used to spawnSync directly,
+// which could complete and persist before an earlier COLD-queued call's
+// async flush got there — an arrival-order violation. Guarded against
+// re-entry (occurrenceDrainInFlight) so at most one drain loop runs; it
+// stops (without consuming the head of the queue) the moment
+// hubPythonCache is empty, leaving every remaining item — and every
+// caller still awaiting its resolve() — queued for the next successful
+// refreshHubPythonAsync to retrigger this same function.
+let occurrenceDrainInFlight = false;
+async function drainOccurrenceQueue(): Promise<void> {
+  if (occurrenceDrainInFlight) return;
+  occurrenceDrainInFlight = true;
+  try {
+    while (pendingOccurrenceQueue.length) {
+      const py = hubPythonCache;
+      if (!py) return;
+      const item = pendingOccurrenceQueue.shift();
+      if (!item) return;
+      await runOccurrenceAsync(py, item.args);
+      item.resolve();
+    }
+  } finally {
+    occurrenceDrainInFlight = false;
   }
 }
 
-export function recordOccurrence(args: string[]): void {
-  if (!promptOccurrenceAvailable || !WORKER_RUN_ID || !WORKER_TASK_ID || !WORKER_PANE_ID) return;
-  const py = hubPythonCache;
-  if (py) {
-    runOccurrence(py, args);
-    return;
+export function recordOccurrence(args: string[]): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  if (!promptOccurrenceAvailable || !WORKER_RUN_ID || !WORKER_TASK_ID || !WORKER_PANE_ID) {
+    resolve();
+    return promise;
   }
-  if (pendingOccurrenceArgs.length >= MAX_PENDING_OCCURRENCES) {
-    pendingOccurrenceArgs.shift();
+  if (pendingOccurrenceQueue.length >= MAX_PENDING_OCCURRENCES) {
+    const dropped = pendingOccurrenceQueue.shift();
     pendingOccurrenceDropped++;
     console.error(`herdr: recordOccurrence: pending-queue cap (${MAX_PENDING_OCCURRENCES}) reached — oldest queued occurrence dropped (total dropped this session: ${pendingOccurrenceDropped})`);
+    dropped?.resolve(); // it will never persist now; its waiter must not hang on it
   }
-  pendingOccurrenceArgs.push(args);
-  refreshHubPythonAsync();
+  pendingOccurrenceQueue.push({ args, resolve });
+  if (hubPythonCache) void drainOccurrenceQueue();
+  else refreshHubPythonAsync();
+  return promise;
 }
 
 // Bounded (same eviction shape as inputByCallId/pendingScratch): which
@@ -1594,27 +1622,46 @@ function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
     // this fix (docs/plans/dot-herdr-recovery-slices.md §2, prerequisite
     // notes on agent-hooks/omp-herdr-control.ts:925).
     let nativeSession: string | undefined;
-    if (callId !== undefined) {
-      nativeSession = sessionIdOf(ctx);
-      trackOccurrence(callId, nativeSession, false);
-      recordOccurrence([
-        "seen", ...occurrenceIdentityArgs(callId, nativeSession),
-        "--tool", toolName,
-        ...(input !== undefined ? ["--input-json", JSON.stringify(input)] : []),
-        "--source", "tool_approval_requested",
-      ]);
-    }
+    if (callId !== undefined) nativeSession = sessionIdOf(ctx);
+    if (callId !== undefined) trackOccurrence(callId, nativeSession, false);
     // `reason` is the approval's own words when omp supplies one; the argument
     // summary is the fallback, and still the more useful line for bash.
     const detail = describeToolCall(toolName, input)
       ?? (typeof e.reason === "string" && e.reason ? truncate(e.reason) : undefined);
-    notifyForPrompt(
-      toolName,
-      detail ? `${toolName}: ${detail}` : `omp needs your permission to use ${toolName}`,
-      rawBashCommand(toolName, input),
-      callId,
-      nativeSession,
-    );
+    // Round 8 review (finding 1): this used to call recordOccurrence then
+    // notifyForPrompt on the very next line, so the notification could
+    // race ahead of (or outrun, on a crash) whatever async resolve+write
+    // recordOccurrence still had in flight — fixed by awaiting its
+    // Promise<void> (resolves only once the write has genuinely been
+    // attempted) before notifying. Round 8 Main review follow-up: an
+    // `async function` handler returns a Promise, which omp's own
+    // "never blocks the agent" event-handler contract requires this NOT
+    // to do (verify-omp-hooks.sh:958) — this synchronous handler now
+    // returns undefined immediately, same as before, and runs the
+    // persist-before-notify sequence in a DETACHED, self-contained task
+    // with its own try/catch, exactly like every other fire-and-forget
+    // path in this file (never awaited by the caller, never throws out).
+    void (async () => {
+      try {
+        if (callId !== undefined) {
+          await recordOccurrence([
+            "seen", ...occurrenceIdentityArgs(callId, nativeSession),
+            "--tool", toolName,
+            ...(input !== undefined ? ["--input-json", JSON.stringify(input)] : []),
+            "--source", "tool_approval_requested",
+          ]);
+        }
+        notifyForPrompt(
+          toolName,
+          detail ? `${toolName}: ${detail}` : `omp needs your permission to use ${toolName}`,
+          rawBashCommand(toolName, input),
+          callId,
+          nativeSession,
+        );
+      } catch {
+        // MUST NOT throw — see the fail-closed contract at the top of this file.
+      }
+    })();
   } catch {
     // MUST NOT throw — see the fail-closed contract at the top of this file.
   }
@@ -1778,9 +1825,9 @@ function refreshHubPythonAsync(): void {
     const py = ok ? out.trim() : "";
     if (py) {
       hubPythonCache = py;
-      if (pendingOccurrenceArgs.length) flushPendingOccurrences(py);
-    } else if (pendingOccurrenceArgs.length) {
-      console.error(`herdr: recordOccurrence: resolver failed to find a pinned interpreter — ${pendingOccurrenceArgs.length} queued occurrence(s) still pending, will retry on the next recordOccurrence/ensureHub call`);
+      if (pendingOccurrenceQueue.length) void drainOccurrenceQueue();
+    } else if (pendingOccurrenceQueue.length) {
+      console.error(`herdr: recordOccurrence: resolver failed to find a pinned interpreter — ${pendingOccurrenceQueue.length} queued occurrence(s) still pending, will retry on the next recordOccurrence/ensureHub call`);
     }
   });
 }
