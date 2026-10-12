@@ -119,9 +119,11 @@ note() {
 # stayed `blocked` for another 16 seconds, and only a by-hand call proved the
 # code path worked. `reg=` now says which.
 follow_registry() {
-  local want="$1" task run_id task_id reg_birth err
+  local want="$1" task="${2:-}" generation="${3:-}" expected="${4:-}" run_id task_id reg_birth err
   command -v task_for_pane >/dev/null 2>&1 || { printf 'reg=no-registry'; return 0; }
-  task=$(task_for_pane "$pane" 2>/dev/null) || { printf 'reg=lookup-failed'; return 0; }
+  if [ -z "$task" ]; then
+    task=$(task_for_pane "$pane" 2>/dev/null) || { printf 'reg=lookup-failed'; return 0; }
+  fi
   [ -n "$task" ] || { printf 'reg=no-task'; return 0; }
   run_id=$(printf '%s' "$task" | jq -r '.run_id // empty' 2>/dev/null)
   task_id=$(printf '%s' "$task" | jq -r '.task_id // empty' 2>/dev/null)
@@ -145,7 +147,12 @@ follow_registry() {
       "$(printf '%s' "$reg_birth" | cut -c1-12)" "$(printf '%s' "$birth" | cut -c1-12)"
     return 0
   fi
-  if err=$(set_task_state "$run_id" "$task_id" "$want" 2>&1 >/dev/null); then
+  if [ -n "$generation" ]; then
+    err=$(set_task_state_if_generation "$run_id" "$task_id" "$want" "$expected" "$generation" 2>&1 >/dev/null)
+  else
+    err=$(set_task_state "$run_id" "$task_id" "$want" 2>&1 >/dev/null)
+  fi
+  if [ $? -eq 0 ]; then
     printf 'reg=%s' "$want"
   else
     printf 'reg=refused(%s)' "$(printf '%s' "$err" | tr -d '"' | tr '\n' ' ' | cut -c1-90)"
@@ -167,16 +174,26 @@ pane_has_pending_alert() {
 # healthy, and the record asserted the prompt had cleared. A monitor must never
 # confuse "it is fine" with "I could not look".
 pane_probe() {
-  local url="${HERDR_HUB_URL:-http://127.0.0.1:${HERDR_HUB_PORT:-8600}/}" body
+  local url="${HERDR_HUB_URL:-http://127.0.0.1:${HERDR_HUB_PORT:-8600}/}" body rec live_birth live_status
   body=$("$CURL" -s --max-time 3 "${url}api/panes" 2>/dev/null) || { printf 'unknown'; return 0; }
   printf '%s' "$body" | jq -e '.connected == true and (.panes | type) == "array"' >/dev/null 2>&1 \
     || { printf 'unknown'; return 0; }
-  if printf '%s' "$body" | jq -e --arg p "$pane" \
-       'any(.panes[]?; .pane_id == $p and .agent_status == "blocked")' >/dev/null 2>&1; then
-    printf 'blocked'
-  else
-    printf 'cleared'
+  # Absence is not a clear. It can mean pane removal/recycling or an
+  # incomplete snapshot; lost/reconcile owns that lifecycle. Likewise, a
+  # recycled pane id is not evidence about the registered pane occurrence.
+  rec=$(printf '%s' "$body" | jq -c --arg p "$pane" 'first(.panes[]? | select(.pane_id == $p)) // empty' 2>/dev/null)
+  [ -n "$rec" ] || { printf 'unknown'; return 0; }
+  live_birth=$(printf '%s' "$rec" | jq -r '.birth // .terminal_id // empty' 2>/dev/null)
+  if [ -n "$birth" ] && [ -n "$live_birth" ] && [ "$birth" != "$live_birth" ]; then
+    printf 'unknown'
+    return 0
   fi
+  live_status=$(printf '%s' "$rec" | jq -r '.agent_status // "unknown"' 2>/dev/null)
+  case "$live_status" in
+    blocked) printf 'blocked' ;;
+    working|idle|done) printf 'cleared' ;;
+    *) printf 'unknown' ;;
+  esac
 }
 
 case "$status" in
@@ -291,7 +308,31 @@ case "$status" in
       exit 0
     fi
     [ "$previous" = "blocked" ] || { note "noop"; exit 0; }
-    reg=$(follow_registry running)
+    # The edge argument can be older than the hub's current pane state. Bind
+    # this clear to the exact registry occurrence observed before asking the
+    # hub. If a newer block lands between the probe and the write, the event
+    # generation CAS below refuses it (including blocked->running->blocked
+    # ABA); if the hub is unavailable, fail closed and preserve the alert.
+    edge_task=$(task_for_pane "$pane" 2>/dev/null || true)
+    edge_run=$(printf '%s' "$edge_task" | jq -r '.run_id // empty' 2>/dev/null)
+    edge_id=$(printf '%s' "$edge_task" | jq -r '.task_id // empty' 2>/dev/null)
+    edge_state=""
+    edge_generation=""
+    if [ -n "$edge_run" ] && [ -n "$edge_id" ]; then
+      edge_snapshot=$(task_state_snapshot "$edge_run" "$edge_id" 2>/dev/null || true)
+      edge_state=$(printf '%s' "$edge_snapshot" | jq -r '.state // empty' 2>/dev/null)
+      edge_generation=$(printf '%s' "$edge_snapshot" | jq -r '.generation // empty' 2>/dev/null)
+    fi
+    case "$(pane_probe)" in
+      blocked) note "ignored stale unblocked edge: hub still blocked"; exit 0 ;;
+      unknown) note "ignored unverified unblocked edge: hub unavailable"; exit 0 ;;
+    esac
+    if [ "$edge_state" != blocked ] || [ -z "$edge_generation" ]; then
+      note "ignored unbound unblocked edge: no blocked registry occurrence"
+      exit 0
+    fi
+    reg=$(follow_registry running "$edge_task" "$edge_generation" blocked)
+    case "$reg" in reg=running) ;; *) note "ignored raced unblocked edge: $reg"; exit 0 ;; esac
     # The prompt is answered, so any Slack alert for it is now a lie. This is
     # the same retraction the omp hook fires on tool_approval_resolved; for a
     # pane with no hook it is the only one.
