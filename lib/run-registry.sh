@@ -1482,6 +1482,68 @@ set_task_state() {                      # run_id task_id state [reason] [proof] 
   return 1
 }
 
+# Return the durable generation of a task's lifecycle state.  `state` alone is
+# not a sufficient compare-and-swap token: a task can move blocked -> running
+# -> blocked while a delayed edge handler is in flight (the classic ABA
+# problem).  State-change event sequence is monotonic even when timestamps
+# share the same second, so callers can bind a decision to one exact blocked
+# occurrence.
+task_state_generation() {               # run_id task_id -> latest state_changed sequence
+  registry_init || return 1
+  _sql "SELECT COALESCE(MAX(sequence),0) FROM events
+          WHERE run_id=$(_sq "$1") AND task_id=$(_sq "$2") AND type='state_changed';" 2>/dev/null
+}
+
+task_state_snapshot() {                 # run_id task_id -> {state,generation}
+  registry_init || return 1
+  _sql "SELECT json_object(
+          'state', state,
+          'generation', (SELECT COALESCE(MAX(sequence),0) FROM events
+                           WHERE run_id=tasks.run_id AND task_id=tasks.task_id
+                             AND type='state_changed'))
+        FROM tasks WHERE run_id=$(_sq "$1") AND task_id=$(_sq "$2") LIMIT 1;" 2>/dev/null
+}
+
+# A single-shot, occurrence-bound lifecycle transition.  Unlike
+# set_task_state(), this deliberately does not retry: if any state transition
+# landed after the caller's snapshot, its decision is stale and must be
+# recomputed from the newer world rather than applied to it.
+set_task_state_if_generation() {        # run_id task_id state expected_state expected_generation
+  local run_id="$1" task_id="$2" state="$3" expected="$4" generation="$5"
+  registry_init || return 1
+  case "$generation" in ''|*[!0-9]*)
+    printf 'run-registry: invalid state generation for %s/%s\n' "$run_id" "$task_id" >&2
+    return 1 ;;
+  esac
+  if ! _legal_transition "$expected" "$state" || [ "$expected" = "$state" ]; then
+    printf 'run-registry: refusing occurrence-bound transition %s -> %s for %s/%s\n' \
+      "$expected" "$state" "$run_id" "$task_id" >&2
+    return 1
+  fi
+
+  local at eid payload changed
+  at="$(_now_iso)"
+  eid="$(gen_id ev)"
+  payload="$(jq -nc --arg s "$state" --arg f "$expected" '{state:$s, from:$f}')" || return 1
+  changed=$(_sql "BEGIN IMMEDIATE;
+    UPDATE tasks SET state=$(_sq "$state"), updated_at=$(_sq "$at")
+      WHERE task_id=$(_sq "$task_id") AND run_id=$(_sq "$run_id")
+        AND state=$(_sq "$expected")
+        AND (SELECT COALESCE(MAX(sequence),0) FROM events
+               WHERE run_id=$(_sq "$run_id") AND task_id=$(_sq "$task_id")
+                 AND type='state_changed')=$generation;
+    INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload)
+      SELECT $(_sq "$eid"), $(_sq "$run_id"), $(_sq "$task_id"), 'state_changed',
+             $(_sq "$at"), $(_sq "$payload")
+        WHERE (SELECT changes()) > 0;
+    COMMIT;
+    SELECT changes();" 2>/dev/null)
+  [ "$changed" = "1" ] && return 0
+  printf 'run-registry: state occurrence changed before %s -> %s for %s/%s\n' \
+    "$expected" "$state" "$run_id" "$task_id" >&2
+  return 1
+}
+
 # set_task_agent_session <run_id> <task_id> <agent_session>
 #
 # Best-effort metadata capture, deliberately NOT a lifecycle transition (no

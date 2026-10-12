@@ -566,6 +566,8 @@ cat > "$tmp/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 echo "curl $*" >> "$STUB_LOG"
 [ -n "${STUB_DOWN:-}" ] && exit 7
+[ -n "${STUB_MISSING:-}" ] && { echo '{"connected":true,"panes":[{"pane_id":"w1:p9","agent_status":"idle"}]}'; exit 0; }
+[ -n "${STUB_WRONG_BIRTH:-}" ] && { echo '{"connected":true,"panes":[{"pane_id":"w1:p1","agent_status":"idle","birth":"other-birth"}]}'; exit 0; }
 # STUB_CLEAR_FROM_CALL=N: blocked for the first N-1 probes, cleared after —
 # a block that outlives the backstop grace but clears before escalation.
 if [ -n "${STUB_CLEAR_FROM_CALL:-}" ]; then
@@ -753,9 +755,10 @@ grep -q "^peer-answer --interval 1 --max-rounds 3 --agent omp w1:p1" "$tmp/log" 
   && ok "opting in answers three short rounds, for that pane only" \
   || no "peer-answer opt-in" "$(cat "$tmp/log")"
 
-line=$(run_edge working blocked)
-case "$(did "$line")" in "unblocked: registry running + retract reg="*) true ;; *) false ;; esac && grep -q "^resolve" "$tmp/log" \
-  && ok "unblocking follows the registry and retracts the alert" || no "unblock" "$line"
+line=$(run_edge working blocked STUB_CLEARED=1)
+[ "$(did "$line")" = "ignored unbound unblocked edge: no blocked registry occurrence" ] \
+  && ! grep -q "^resolve" "$tmp/log" \
+  && ok "an unbound clear cannot retract an alert" || no "unbound clear" "$line $(cat "$tmp/log")"
 
 line=$(run_edge working idle)
 [ "$(did "$line")" = "noop" ] && [ ! -s "$tmp/log" ] \
@@ -769,6 +772,8 @@ echo "== registry follow (real sqlite registry, isolated root) =="
 # run-registry against a throwaway root.
 regroot="$tmp/runs"
 mkdir -p "$regroot"
+stale_regroot="$tmp/runs-stale"
+mkdir -p "$stale_regroot"
 env HERDR_RUN_STATE_DIR="$regroot" bash -c '
   . "'"$HERE"'/config.sh"; . "'"$HERE"'/lib/run-registry.sh"
   register_task run_v task_v worker_v conductor_v c:p1 birth1 w1:p1 birth2 /repo /wt lane >/dev/null
@@ -779,6 +784,81 @@ after=$(sqlite3 "$regroot/registry.sqlite3" "select state from tasks where task_
 [ "$before" = "blocked" ] && [ "$after" = "running" ] && [ "$(did "$line")" = "registry-heal (first observation) reg=running" ] \
   && ok "a stale blocked row is healed, and the audit line says reg=running" \
   || no "registry follow" "before=$before after=$after did=$(did "$line")"
+
+# A delayed working edge from prompt N must not close prompt N+1's blocked
+# period. The hub's current pane view is newer than the edge argument; if it
+# still says blocked, preserve both the registry state and occurrence salt.
+env HERDR_RUN_STATE_DIR="$stale_regroot" bash -c '
+  . "'"$HERE"'/config.sh"; . "'"$HERE"'/lib/run-registry.sh"
+  register_task run_stale task_stale worker_stale conductor_stale c:p1 birth1 w1:p1 birth2 /repo /wt lane >/dev/null
+  set_task_state run_stale task_stale blocked >/dev/null' 2>/dev/null
+before_period=$(HERDR_RUN_STATE_DIR="$stale_regroot" bash -c '. "'"$HERE"'/lib/prompt-parse.sh"; prompt_period w1:p1')
+line=$(run_edge working blocked HERDR_RUN_STATE_DIR="$stale_regroot")
+after=$(sqlite3 "$stale_regroot/registry.sqlite3" "select state from tasks where task_id='task_stale';" 2>/dev/null)
+after_period=$(HERDR_RUN_STATE_DIR="$stale_regroot" bash -c '. "'"$HERE"'/lib/prompt-parse.sh"; prompt_period w1:p1')
+[ "$after" = "blocked" ] && [ "$before_period" = "$after_period" ] && ! grep -q '^resolve' "$tmp/log" \
+  && ok "a delayed working edge cannot close a newer blocked occurrence" \
+  || no "delayed edge occurrence guard" "after=$after period=$before_period->$after_period did=$(did "$line") log=$(cat "$tmp/log")"
+
+# An unreachable hub is not evidence that the prompt cleared. Preserve the
+# same occurrence and alert, exactly as for an explicitly blocked current view.
+line=$(run_edge working blocked HERDR_RUN_STATE_DIR="$stale_regroot" STUB_DOWN=1)
+after=$(sqlite3 "$stale_regroot/registry.sqlite3" "select state from tasks where task_id='task_stale';" 2>/dev/null)
+after_period=$(HERDR_RUN_STATE_DIR="$stale_regroot" bash -c '. "'"$HERE"'/lib/prompt-parse.sh"; prompt_period w1:p1')
+[ "$after" = "blocked" ] && [ "$before_period" = "$after_period" ] && ! grep -q '^resolve' "$tmp/log" \
+  && ok "an unavailable hub cannot clear a blocked occurrence" \
+  || no "unavailable hub clear guard" "after=$after period=$before_period->$after_period did=$(did "$line")"
+
+# A valid connected snapshot that omits this pane is still not proof of a
+# clear. Pane removal/recycling belongs to lost/reconcile, not this edge.
+line=$(run_edge working blocked HERDR_RUN_STATE_DIR="$stale_regroot" STUB_MISSING=1)
+after=$(sqlite3 "$stale_regroot/registry.sqlite3" "select state from tasks where task_id='task_stale';" 2>/dev/null)
+after_period=$(HERDR_RUN_STATE_DIR="$stale_regroot" bash -c '. "'"$HERE"'/lib/prompt-parse.sh"; prompt_period w1:p1')
+[ "$after" = "blocked" ] && [ "$before_period" = "$after_period" ] && ! grep -q '^resolve' "$tmp/log" \
+  && ok "a current pane list missing the target cannot clear its occurrence" \
+  || no "missing target clear guard" "after=$after period=$before_period->$after_period did=$(did "$line")"
+
+: > "$tmp/log"
+env STUB_LOG="$tmp/log" STUB_PENDING="$tmp/bridge/pending.jsonl" STUB_WRONG_BIRTH=1 \
+    HERDR_RUN_STATE_DIR="$stale_regroot" HERDR_STATE_DIR="$tmp/state" HERDR_BRIDGE_STATE="$tmp/bridge" \
+    HERDR_EDGE_ALERT_GRACE_S=0 HERDR_EDGE_CURL="$tmp/bin/curl" \
+    HERDR_EDGE_NOTIFY="$tmp/bin/notify" HERDR_EDGE_RESOLVE="$tmp/bin/resolve" \
+    HERDR_EDGE_PEER_ANSWER_SH="$tmp/bin/peer-answer" \
+    bash "$HERE/agent-edge.sh" w1:p1 working blocked omp /repo birth2 >/dev/null 2>&1
+after=$(sqlite3 "$stale_regroot/registry.sqlite3" "select state from tasks where task_id='task_stale';" 2>/dev/null)
+[ "$after" = "blocked" ] && ! grep -q '^resolve' "$tmp/log" \
+  && ok "a recycled target birth cannot clear the registered occurrence" \
+  || no "probe birth guard" "after=$after log=$(cat "$tmp/log")"
+
+# A current cleared view still performs the intended transition and retracts.
+line=$(run_edge working blocked HERDR_RUN_STATE_DIR="$stale_regroot" STUB_CLEARED=1)
+after=$(sqlite3 "$stale_regroot/registry.sqlite3" "select state from tasks where task_id='task_stale';" 2>/dev/null)
+[ "$after" = "running" ] && grep -q '^resolve' "$tmp/log" \
+  && [ "$(did "$line")" = "unblocked: registry running + retract reg=running" ] \
+  && ok "a verified current clear advances the registry and retracts" \
+  || no "verified clear" "after=$after did=$(did "$line") log=$(cat "$tmp/log")"
+
+# Reproduce the TOCTOU/ABA shape directly against the actual registry writer:
+# after the snapshot, another actor clears and then creates a newer block. The
+# row is `blocked` again, but the old occurrence token must not match it.
+aba_regroot="$tmp/runs-aba"
+mkdir -p "$aba_regroot"
+if env HERDR_RUN_STATE_DIR="$aba_regroot" bash -c '
+  . "'"$HERE"'/config.sh"; . "'"$HERE"'/lib/run-registry.sh"
+  register_task run_aba task_aba worker conductor c:p1 birth1 w1:p1 birth2 /repo /wt lane >/dev/null
+  set_task_state run_aba task_aba blocked >/dev/null
+  old=$(task_state_generation run_aba task_aba)
+  set_task_state run_aba task_aba running >/dev/null
+  set_task_state run_aba task_aba blocked >/dev/null
+  before=$(_sql "select count(*) from events where run_id='"'"'run_aba'"'"' and task_id='"'"'task_aba'"'"' and type='"'"'state_changed'"'"';")
+  ! set_task_state_if_generation run_aba task_aba running blocked "$old" >/dev/null 2>&1 || exit 1
+  after=$(_sql "select count(*) from events where run_id='"'"'run_aba'"'"' and task_id='"'"'task_aba'"'"' and type='"'"'state_changed'"'"';")
+  state=$(_sql "select state from tasks where run_id='"'"'run_aba'"'"' and task_id='"'"'task_aba'"'"';")
+  [ "$state" = blocked ] && [ "$before" = "$after" ]' 2>/dev/null; then
+  ok "the occurrence CAS rejects a blocked-running-blocked ABA race"
+else
+  no "occurrence CAS ABA guard"
+fi
 
 # And a terminal row is never resurrected: the registry's own legality rule.
 env HERDR_RUN_STATE_DIR="$regroot" bash -c '
