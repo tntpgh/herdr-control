@@ -529,6 +529,7 @@ fixture_ver="$(sqlite3 -noheader "$hostile_db" "SELECT value FROM schema_meta WH
 if [ "$fixture_ver" = 10 ]; then
   hostile_out="$(
     env -i PATH="/usr/bin:/bin" HOME="$HOME" HERDR_RUN_STATE_DIR="$hostile_root" \
+      ${HERDR_HUB_PYTHON_DIRS:+HERDR_HUB_PYTHON_DIRS="$HERDR_HUB_PYTHON_DIRS"} \
       bash -c '. "'"$here"'/lib/run-registry.sh"; registry_init; printf "RC=%s\n" "$?"' 2>&1
   )"
   hostile_rc="$(printf '%s' "$hostile_out" | grep -o 'RC=[0-9]*' | tail -1 | cut -d= -f2)"
