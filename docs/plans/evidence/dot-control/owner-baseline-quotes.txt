@@ -1,0 +1,9 @@
+command=git grep -n -e "owner$" -- docs/design/pretool-approval.md
+verdict=escalate
+reason=find/git combined with substitution, redirect or quoting: a conductor must review it
+command=git log --oneline -1 -- '*.md'
+verdict=escalate
+reason=find/git combined with substitution, redirect or quoting: a conductor must review it
+command=find . -maxdepth 1 -name '*.md'
+verdict=escalate
+reason=find/git combined with substitution, redirect or quoting: a conductor must review it

@@ -4618,6 +4618,216 @@ case "$_267_file_reason" in
     printf 'FAIL  %-52s => wrong reason (%s)\n' "267-8: long script remains conductor file-reviewable" "$_267_file_reason"
     failed=$((failed + 1)) ;;
 esac
+
+echo "== command-policy awk-fail-closed (security review Q2, HIGH) =="
+# When awk is unavailable or fails, every caller of _cp_protect_text (and
+# the other allow-path awk pipeline in _cp_git_push_invoked) used to treat
+# a nonzero exit or empty/garbage output as "nothing dangerous found" and
+# fall through to allow — a broken or missing awk on PATH silently disabled
+# the quoting/push-detection machinery for EVERY command. Three broken-awk
+# shapes: exits nonzero with no output, exits 0 printing nothing, and exits
+# nonzero AFTER printing a partial line (the real shape _cp_protect_text's
+# own header describes: a BSD/non-UTF-8-locale awk that aborts "illegal
+# byte sequence" partway through a multi-line scan).
+_awk_exit2_dir="$here/.handoffs/awk-stub-exit2"
+_awk_empty_dir="$here/.handoffs/awk-stub-empty"
+_awk_partial_dir="$here/.handoffs/awk-stub-partial"
+mkdir -p "$_awk_exit2_dir" "$_awk_empty_dir" "$_awk_partial_dir"
+printf '#!/bin/sh\nexit 2\n' > "$_awk_exit2_dir/awk"
+printf '#!/bin/sh\nexit 0\n' > "$_awk_empty_dir/awk"
+printf '#!/bin/sh\nprintf "git\\n"\nexit 2\n' > "$_awk_partial_dir/awk"
+chmod +x "$_awk_exit2_dir/awk" "$_awk_empty_dir/awk" "$_awk_partial_dir/awk"
+_real_path="$PATH"
+
+# check_broken_awk_reserved <label> <stubdir> <cmd> — conductor_reserved_reason
+# (the path herdr-select.sh's peer auto-answer actually consults; it does NOT
+# go through classify_command's parser-based find/git gate) must still name
+# CMD with the stub awk first on PATH.
+check_broken_awk_reserved() {
+  local label="$1" stubdir="$2" cmd="$3" got
+  total=$((total + 1))
+  got="$(PATH="$stubdir:$_real_path" conductor_reserved_reason "$cmd")"
+  if [ -n "$got" ]; then
+    printf 'PASS  %-52s => reserved\n' "$label"
+  else
+    printf 'FAIL  %-52s => NOT reserved under a broken awk (an automated authority would press Approve)\n' "$label"
+    failed=$((failed + 1))
+  fi
+}
+
+# check_broken_awk_verdict <label> <stubdir> <cmd> — classify_command must
+# not return allow with the stub awk first on PATH. NOTE: this worktree has
+# no .venv-bashlex (AGENTS.md: "not provisioned in spawned worktrees"), so
+# _cp_bashlex_findgit_present's own, separate fail-closed path (missing
+# helper) already forces escalate for every command here regardless of
+# this fix — these rows stay green once a provisioned environment (CI,
+# `install.sh --apply`) makes that gate resolve real commands again. The
+# direct per-function rows below are what actually discriminates base vs.
+# head in THIS worktree.
+check_broken_awk_verdict() {
+  local label="$1" stubdir="$2" cmd="$3" got reason
+  total=$((total + 1))
+  got="$(PATH="$stubdir:$_real_path" classify_command "$cmd")"
+  reason="$(classify_reason)"
+  if [ "$got" != "allow" ]; then
+    printf 'PASS  %-52s => %-9s\n' "$label" "$got"
+  else
+    printf 'FAIL  %-52s => allow under a broken awk (reason=%s)\n' "$label" "$reason"
+    failed=$((failed + 1))
+  fi
+}
+
+# check_broken_awk_true <label> <stubdir> <fn> <arg...> — FN must return
+# true (0) with the stub awk first on PATH.
+check_broken_awk_true() {
+  local label="$1" stubdir="$2"; shift 2
+  total=$((total + 1))
+  if PATH="$stubdir:$_real_path" "$@"; then
+    printf 'PASS  %-52s => fail-closed (true)\n' "$label"
+  else
+    printf 'FAIL  %-52s => returned false/safe under a broken awk\n' "$label"
+    failed=$((failed + 1))
+  fi
+}
+
+# check_broken_awk_nonempty <label> <stubdir> <fn> <arg...> — FN's stdout
+# must be nonempty (a restriction/reason) with the stub awk first on PATH.
+check_broken_awk_nonempty() {
+  local label="$1" stubdir="$2" got; shift 2
+  total=$((total + 1))
+  got="$(PATH="$stubdir:$_real_path" "$@")"
+  if [ -n "$got" ]; then
+    printf 'PASS  %-52s => restricted\n' "$label"
+  else
+    printf 'FAIL  %-52s => silently unrestricted under a broken awk\n' "$label"
+    failed=$((failed + 1))
+  fi
+}
+
+_push_force_cmd="git push --force origin main"
+_rm_rf_cmd="rm -rf /"
+_git_status_cmd="git status"
+_compound_git_cmd="git status; rm -rf /tmp/x"
+_hidden_fn_cmd='name() { rm -rf /tmp/x; }; name'
+_manifest_git_none='{"git":"none"}'
+
+# bashlex CHECK-segment dispatch (~L4950): bypass _cp_bashlex_resolve_helper
+# (its OWN, separate fail-closed path when .venv-bashlex is missing would
+# otherwise mask this call) by pointing the helper vars straight at a fake
+# interpreter that emits one CHECK line, so the protect_text call inside the
+# CHECK branch is what's actually under test.
+_bashlex_stub_dir="$here/.handoffs/bashlex-stub"
+mkdir -p "$_bashlex_stub_dir"
+printf '#!/bin/sh\nprintf "CHECK git push --force origin main\\n"\n' > "$_bashlex_stub_dir/fake.sh"
+chmod +x "$_bashlex_stub_dir/fake.sh"
+check_broken_awk_bashlex_check() {
+  local label="$1" stubdir="$2"
+  _CP_BASHLEX_PY="/bin/sh"
+  _CP_BASHLEX_SCRIPT="$_bashlex_stub_dir/fake.sh"
+  _CP_BASHLEX_PY_CHECKED=1
+  check_broken_awk_true "$label" "$stubdir" _cp_bashlex_findgit_present "irrelevant raw text"
+  _CP_BASHLEX_PY=""
+  _CP_BASHLEX_PY_CHECKED=0
+}
+
+for _stubname in exit2 empty partial; do
+  case "$_stubname" in
+    exit2)   _stubdir="$_awk_exit2_dir";   _stubdesc="awk exits 2" ;;
+    empty)   _stubdir="$_awk_empty_dir";   _stubdesc="awk prints nothing" ;;
+    partial) _stubdir="$_awk_partial_dir"; _stubdesc="awk prints a partial line then exits 2" ;;
+  esac
+  # Known site: _cp_git_push_invoked (herdr-control#272 security review Q2).
+  check_broken_awk_true     "_cp_git_push_invoked sees force-push ($_stubdesc)" "$_stubdir" _cp_git_push_invoked "$_push_force_cmd"
+  check_broken_awk_reserved "git push --force stays reserved ($_stubdesc)" "$_stubdir" "$_push_force_cmd"
+  check_broken_awk_verdict  "git push --force escalates/denies, never allow ($_stubdesc)" "$_stubdir" "$_push_force_cmd"
+  check_broken_awk_verdict  "rm -rf / escalates/denies, never allow ($_stubdesc)" "$_stubdir" "$_rm_rf_cmd"
+  check_broken_awk_verdict  "plain git status escalates/denies, never allow ($_stubdesc)" "$_stubdir" "$_git_status_cmd"
+  # Known site: _cp_git_exec_opt_invoked (~L4176/L4181).
+  check_broken_awk_true     "_cp_git_exec_opt_invoked fails closed on plain git status ($_stubdesc)" "$_stubdir" _cp_git_exec_opt_invoked "$_git_status_cmd"
+  # Known site: _cp_scope_ceiling (~L894/L906) — git:none ceiling must still
+  # block a compound statement when the operator scan itself is broken.
+  check_broken_awk_nonempty "_cp_scope_ceiling blocks compound git under git:none ($_stubdesc)" "$_stubdir" _cp_scope_ceiling "$_compound_git_cmd" "$_manifest_git_none"
+  # Known site: _cp_gate_function_def_present (~L6573/L6575).
+  check_broken_awk_true     "_cp_gate_function_def_present still sees a hidden function def ($_stubdesc)" "$_stubdir" _cp_gate_function_def_present "$_hidden_fn_cmd"
+  # Known site: bashlex CHECK-segment dispatch (~L4950/L4959).
+  check_broken_awk_bashlex_check "bashlex CHECK-segment dispatch fails closed ($_stubdesc)" "$_stubdir"
+done
+
+echo "== command-policy awk-fail-closed round 2 (security review of 4e9c86f, HIGH/MEDIUM) =="
+# Round 1 missed three _cp_protect_text*/_cp_protect_text_qa wrappers that
+# are also awk pipelines on the allow path: _cp_walk_prep (feeds
+# _cp_shared_gate's depth-0 segment loop, the entry point classify_command
+# calls first), _cp_coderef_split (feeds the code-by-reference walkers),
+# and _cp_segments_qa (feeds _cp_find_word_injection_present).
+# check_broken_awk_sentinel <label> <stubdir> <fn> <arg...> — FN itself (not
+# a caller several layers up) must return nonzero AND print exactly the
+# @CP_PROTECT_FAILED@ sentinel. A collaborator review of the first draft of
+# this section (ChatGPT via herdr-mcp, 2026-10-11) correctly flagged that
+# testing _cp_walk_prep only through _cp_shared_gate is NOT discriminating:
+# _cp_shared_gate's own _cp_git_exec_opt_invoked call (round 1, already
+# fixed) unconditionally fails closed under a broken awk for ANY input,
+# before the per-segment loop this section targets ever runs — so those
+# check_broken_awk_considers rows below pass on the unfixed base too, for
+# the wrong reason. This checks the actual flagged site (_cp_walk_prep
+# itself) directly, with nothing upstream that could mask it.
+check_broken_awk_sentinel() {
+  local label="$1" stubdir="$2" out rc; shift 2
+  total=$((total + 1))
+  out="$(PATH="$stubdir:$_real_path" "$@")"; rc=$?
+  if [ "$rc" -ne 0 ] && [ "$out" = '@CP_PROTECT_FAILED@' ]; then
+    printf 'PASS  %-52s => sentinel, rc=%s\n' "$label" "$rc"
+  else
+    printf 'FAIL  %-52s => rc=%s out=[%s] (not the fail-closed sentinel)\n' "$label" "$rc" "$out"
+    failed=$((failed + 1))
+  fi
+}
+
+check_broken_awk_considers() {
+  local label="$1" stubdir="$2" cmd="$3"
+  total=$((total + 1))
+  _cp_best_v=0; _cp_best_r=""
+  PATH="$stubdir:$_real_path" _cp_shared_gate "$cmd"
+  if [ "$_cp_best_v" -gt 0 ]; then
+    printf 'PASS  %-52s => considered (v=%s)\n' "$label" "$_cp_best_v"
+  else
+    printf 'FAIL  %-52s => NOT considered under a broken awk\n' "$label"
+    failed=$((failed + 1))
+  fi
+}
+# check_broken_awk_considers <label> <stubdir> <cmd> — calls _cp_shared_gate
+# directly and asserts it raised the running _cp_best_v/_cp_best_r
+# accumulator (the same one classify_command reads), bypassing the
+# .venv-bashlex-absent masking classify_command itself would hit. Kept as
+# end-to-end regression coverage for _cp_shared_gate as a whole; NOT proof
+# of _cp_walk_prep specifically (see check_broken_awk_sentinel above for
+# that) — these two rows pass on base 4e9c86f too, via the already-fixed
+# _cp_git_exec_opt_invoked call ahead of the loop.
+
+_eval_hide_cmd='eval "rm -rf /tmp/x"'
+_expansion_word_cmd='$(echo rm) -rf /tmp/x'
+_bash_env_cmd='BASH_ENV=/tmp/evil.sh bash /tmp/clean.sh'
+_find_injection_cmd='find . * -maxdepth 0'
+
+for _stubname in exit2 empty partial; do
+  case "$_stubname" in
+    exit2)   _stubdir="$_awk_exit2_dir";   _stubdesc="awk exits 2" ;;
+    empty)   _stubdir="$_awk_empty_dir";   _stubdesc="awk prints nothing" ;;
+    partial) _stubdir="$_awk_partial_dir"; _stubdesc="awk prints a partial line then exits 2" ;;
+  esac
+  # Known site: _cp_walk_prep (~L370) itself, isolated from every other
+  # gate — the clean discriminator.
+  check_broken_awk_sentinel "_cp_walk_prep fails closed, not silently empty ($_stubdesc)" "$_stubdir" _cp_walk_prep "$_eval_hide_cmd"
+  # Known site: _cp_walk_prep (~L370) -> _cp_shared_gate's per-segment
+  # eval/alias-hiding and command-word-is-expansion detectors (end-to-end
+  # coverage only — see check_broken_awk_considers's own header).
+  check_broken_awk_considers "_cp_shared_gate still flags eval hiding a command ($_stubdesc)" "$_stubdir" "$_eval_hide_cmd"
+  check_broken_awk_considers "_cp_shared_gate still flags a \$(...) command word ($_stubdesc)" "$_stubdir" "$_expansion_word_cmd"
+  # Known site: _cp_coderef_split (~L1112) -> _cp_coderef_env_poisoned.
+  check_broken_awk_true "_cp_coderef_env_poisoned still flags BASH_ENV poisoning ($_stubdesc)" "$_stubdir" _cp_coderef_env_poisoned "$_bash_env_cmd"
+  # Known site: _cp_segments_qa (~L494) -> _cp_find_word_injection_present.
+  check_broken_awk_true "_cp_find_word_injection_present still flags find argv injection ($_stubdesc)" "$_stubdir" _cp_find_word_injection_present "$_find_injection_cmd"
+done
+
 echo "-----------------------------------------------------------------"
 if [ "$failed" -eq 0 ]; then
   printf 'PASS: %d/%d command-policy cases passed\n' "$total" "$total"

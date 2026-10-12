@@ -62,6 +62,10 @@ herdr() {
       fi ;;
     "pane read")
       pane="$3"
+      # STUB_FAIL_READ=<pane_id>: simulate a transport failure (herdr down,
+      # pane gone) for exactly that pane — distinct from an empty screen,
+      # which is a successful read of nothing.
+      [ "${STUB_FAIL_READ:-}" = "$pane" ] && return 7
       case "$pane" in
         "$W1") cat "$S1" 2>/dev/null ;;
         "$W2") cat "$S2" 2>/dev/null ;;
@@ -552,5 +556,55 @@ reads_after_probe=$(grep -c "^pane read $W1" "$HERDR_CALLS" 2>/dev/null || true)
 [ "${reads_after_probe:-0}" = "0" ] \
   && ok "building the key from attention_probe's own command_text costs zero additional reads (probe alone cost $reads_probe_only)" \
   || bad "attention_dedupe_key re-read the pane after attention_probe already captured command_text: $reads_after_probe"
+
+printf '== occurrence: a gate-matched but unparseable menu is tracked and escalated, never treated as answered ==\n'
+# docs/plans/dot-herdr-recovery-slices.md §2 / attention-tick.sh:337: before
+# this fix, a pane carrying something menu-shaped the strict parser could
+# not resolve collapsed into the SAME "nothing visible" signal as an
+# answered prompt, so attention_tick silently stopped watching it forever.
+# Same gate-matched-but-no-Approve/Deny-rows shape
+# verify-prompt-occurrence-display.sh's own pending_unreadable fixture uses.
+register_task run19 task19 w19 cond19 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt19 "impl:unreadable" >/dev/null 2>&1
+set_task_state run19 task19 running >/dev/null 2>&1
+printf ' Allow tool: bash\n   run: some long command\n\n up/down navigate  enter select  esc cancel\n' > "$S1"
+: > "$SENT"
+NB="$(date +%s)"
+probe_unreadable="$(attention_probe "$W1")"
+[ "$(printf '%s' "$probe_unreadable" | jq -r '.visible')" = true ] \
+  && ok "a gate-matched but unparseable panel reads visible:true, not false" \
+  || bad "expected visible:true for an unparseable panel, got: $probe_unreadable"
+[ "$(printf '%s' "$probe_unreadable" | jq -r '.display')" = pending_unreadable ] \
+  && ok "attention_probe surfaces display:pending_unreadable" \
+  || bad "expected display:pending_unreadable, got: $probe_unreadable"
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW="$NB" attention_tick
+[ "$(_q "SELECT count(*) FROM events WHERE task_id='task19' AND type='attention_tracking';")" = "1" ] \
+  && ok "the unreadable prompt is tracked — the clock starts instead of being silently dropped" \
+  || bad "no attention_tracking row for an unreadable prompt"
+printf '%s\n' "$W1" | HERDR_ATTENTION_NOW=$((NB + 605)) attention_tick
+[ "$(_q "SELECT count(*) FROM events WHERE task_id='task19' AND type='attention_escalated';")" = "1" ] \
+  && ok "and it escalates at T+10min exactly like a readable stuck prompt — never treated as answered" \
+  || bad "an unreadable prompt was never escalated (the bug this fix closes)"
+clean_screen > "$S1"
+
+printf '== occurrence: a transport failure (herdr itself unreadable) is tracked too, never answered ==\n'
+# A DIFFERENT pane (W2) than the pending_unreadable case above: that case
+# also produces an empty command_text, and attention_dedupe_key's key has
+# no task_id in it (pane + birth + cmd-hash + blocked-period) — reusing W1
+# here with the same still-current period would collide with task19's own
+# claim and silently attribute nothing to task20 (claim_once is a global
+# event_id, not task-scoped).
+register_task run20 task20 w20 cond20 "$CND" "$CNDB" "$W2" "$W2B" /repo /wt20 "impl:read-failed" >/dev/null 2>&1
+set_task_state run20 task20 running >/dev/null 2>&1
+clean_screen > "$S2"
+: > "$SENT"
+probe_failed="$(STUB_FAIL_READ="$W2" attention_probe "$W2")"
+[ "$(printf '%s' "$probe_failed" | jq -r '.display')" = read_failed ] \
+  && ok "a transport failure reads display:read_failed, distinct from an empty successful read" \
+  || bad "expected display:read_failed, got: $probe_failed"
+NB2="$(date +%s)"
+printf '%s\n' "$W2" | STUB_FAIL_READ="$W2" HERDR_ATTENTION_NOW="$NB2" attention_tick
+[ "$(_q "SELECT count(*) FROM events WHERE task_id='task20' AND type='attention_tracking';")" = "1" ] \
+  && ok "a pane the transport cannot read is tracked instead of silently skipped" \
+  || bad "no attention_tracking row when the transport itself failed"
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

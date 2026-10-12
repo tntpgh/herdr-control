@@ -1,0 +1,39 @@
+PASS ps unavailable with matching partial ancestry: rc=1, expected caller result
+PASS malformed parent pid: rc=1, expected caller result
+PASS cycle or truncated ancestor chain: rc=1, expected caller result
+PASS complete matching process inventory: rc=0, expected caller result
+FAIL incomplete or invalid process response: not-json: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: {}: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: <empty>: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: null: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: []: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: {"result":{}}: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: {"result":{"process_info":{}}}: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":null}}}: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":{}}}}: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{}]}}}: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":null}]}}}: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":"123"}]}}}: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":0}]}}}: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":-1}]}}}: expected rc=1 result=; got rc=2 result=
+FAIL incomplete or invalid process response: {"result":{"process_info":{"foreground_processes":[{"pid":1.5}]}}}: expected rc=1 result=; got rc=2 result=
+FAIL multiple JSON process responses: expected rc=1 result=; got rc=0 result=fixture:p1
+FAIL matching row cannot hide later incomplete process row: expected rc=1 result=; got rc=0 result=fixture:p1
+PASS process-info unavailable: rc=1, expected caller result
+FAIL matching pane cannot hide another unavailable pane inventory: expected rc=1 result=; got rc=0 result=fixture:p1
+PASS incomplete or invalid pane inventory: not-json: rc=1, expected caller result
+PASS incomplete or invalid pane inventory: {}: rc=1, expected caller result
+PASS incomplete or invalid pane inventory: {"panes":{}}: rc=1, expected caller result
+FAIL incomplete or invalid pane inventory: {"panes":[{}]}: expected rc=1 result=; got rc=0 result=null
+PASS incomplete or invalid pane inventory: {"panes":[{"pane_id":""}]}: rc=1, expected caller result
+FAIL incomplete or invalid pane inventory: {"panes":[{"pane_id":"fixture p1"}]}: expected rc=1 result=; got rc=0 result=fixture
+FAIL incomplete or invalid pane inventory: {"panes":[{"pane_id":"fixture:p1"},{}]}: expected rc=1 result=; got rc=0 result=fixture:p1
+FAIL multiple JSON pane inventories: expected rc=1 result=; got rc=0 result=fixture:p1
+PASS pane inventory unavailable: rc=1, expected caller result
+PASS complete inventory and ancestry prove legitimate outside-Herdr caller: rc=2, expected caller result
+PASS explicit empty foreground array is a complete no-match: rc=2, expected caller result
+FAIL force consumer: expected caller refusal, got rc=3 designate-main: refusing --force: fixture:p1 is not running an agent
+FAIL force consumer: expected caller refusal, got rc=3 designate-main: refusing --force: fixture:p1 is not running an agent
+passed=12 failed=24; live designations=0
+
+exit=1

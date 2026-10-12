@@ -1,14 +1,57 @@
 name: remote-mcp
 # The herdr-mcp Worker (OAuth + MCP + Durable Object) and its Mac publisher.
-# Both suites exercise behaviour end to end: the Worker suite runs the real
+# The Worker suite runs the real
 # OAuth 2.1 + PKCE flow and every tool in workerd; the publisher suite builds
-# snapshots from a fixture hub and delivers to a fake herdr-deliver.
+# snapshots from a fixture hub and delivers to a fake herdr-deliver. The
+# authorization job exercises only isolated receipt/registry/consumer fixtures.
 on:
   pull_request:
-    paths: ["remote-mcp/**", "spawn-task.sh", "lib/**", ".github/workflows/remote-mcp.yml"]
+    paths:
+      - "remote-mcp/**"
+      - "lib/**"
+      - "agent-hooks/**"
+      - "tests/fixtures/**"
+      - "spawn-task.sh"
+      - "close-done-workers.sh"
+      - "herdr-action.sh"
+      - "herdr-select.sh"
+      - "conductor-handover.sh"
+      - "sweep-approvals.sh"
+      - "peer-answer.sh"
+      - "send-to-agent.sh"
+      - "guard-raw-prompt-answer.sh"
+      - "verify-task-authorization.py"
+      - "verify-task-authorization-gates.sh"
+      - "verify-action-transaction.py"
+      - "verify-task-reservation.py"
+      - "verify-run-registry.sh"
+      - "verify-process-identity-failures.sh"
+      - ".github/scripts/**"
+      - ".github/workflows/remote-mcp.yml"
   push:
     branches: [main]
-    paths: ["remote-mcp/**", "spawn-task.sh", "lib/**", ".github/workflows/remote-mcp.yml"]
+    paths:
+      - "remote-mcp/**"
+      - "lib/**"
+      - "agent-hooks/**"
+      - "tests/fixtures/**"
+      - "spawn-task.sh"
+      - "close-done-workers.sh"
+      - "herdr-action.sh"
+      - "herdr-select.sh"
+      - "conductor-handover.sh"
+      - "sweep-approvals.sh"
+      - "peer-answer.sh"
+      - "send-to-agent.sh"
+      - "guard-raw-prompt-answer.sh"
+      - "verify-task-authorization.py"
+      - "verify-task-authorization-gates.sh"
+      - "verify-action-transaction.py"
+      - "verify-task-reservation.py"
+      - "verify-run-registry.sh"
+      - "verify-process-identity-failures.sh"
+      - ".github/scripts/**"
+      - ".github/workflows/remote-mcp.yml"
 
 jobs:
   worker:
@@ -21,9 +64,38 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Point resolve-hub-python.sh at actions/setup-python's interpreter
+        run: echo "HERDR_HUB_PYTHON_DIRS=$(dirname "$(command -v python3)")" >> "$GITHUB_ENV"
       - run: npm ci
       - run: npx tsc --noEmit
+      - name: Production Worker authorization (offline storage adapter)
+        run: node test/authorization-offline.cjs
       - run: npx vitest run
+
+  authorization:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Point resolve-hub-python.sh at actions/setup-python's interpreter
+        run: echo "HERDR_HUB_PYTHON_DIRS=$(dirname "$(command -v python3)")" >> "$GITHUB_ENV"
+      - name: Install isolated fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes sqlite3 jq
+          python3 -m venv .venv-bashlex
+          .venv-bashlex/bin/python3 -m pip install bashlex==0.18
+      # This deliberately selects fixture suites, not all root verify-*.sh.
+      # The real-registry e2e excludes independent timer/process checks and
+      # does not claim live pane, owner-relay or deployment acceptance.
+      - name: Receipt, registry, approval and negative ancestry fixtures
+        run: bash .github/scripts/verify-task-authorization.sh
 
   publisher:
     runs-on: ubuntu-latest
@@ -32,6 +104,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Point resolve-hub-python.sh at actions/setup-python's interpreter
+        run: echo "HERDR_HUB_PYTHON_DIRS=$(dirname "$(command -v python3)")" >> "$GITHUB_ENV"
       - run: python3 remote-mcp/verify-publisher.py
       - run: python3 remote-mcp/verify-owner-inbox.py
       # SpawnArgvAgainstRealParser replays tasks.py's argv through the real

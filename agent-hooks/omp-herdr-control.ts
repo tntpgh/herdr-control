@@ -55,6 +55,7 @@ const BASH_WRITE_TARGETS_SH = path.join(ROOT, "lib", "bash-write-targets.sh");
 const RESOLVE_SH = path.join(ROOT, "herdr-resolve.sh");
 const CONDUCTOR_EXIT_SH = path.join(ROOT, "conductor-exit.sh");
 const HUB_PY = path.join(ROOT, "hub.py");
+const RESOLVE_HUB_PYTHON_SH = path.join(ROOT, "launchd", "resolve-hub-python.sh");
 const HUB_PORT = Number(process.env.HERDR_HUB_PORT) || 8600;
 const HUB_URL = `http://127.0.0.1:${HUB_PORT}/`;
 
@@ -509,6 +510,23 @@ function readRegisteredWorktree(): { worktree: string } | { error: string } {
 // bash_reserved 53-74ms, the registry spawnSync alone costing tens of ms
 // over an unwarmed sqlite3 connection). A tool call that arrives before
 // this answers falls back to the synchronous read in readRegisteredWorktree().
+//
+// Round 7 follow-up (Main review): this spawned NO timeout at all — a
+// hung `read_task` (e.g. a wedged python3 interpreter it calls through
+// _registry_python/resolve-hub-python.sh) left the child alive forever,
+// and because its stdout is PIPED (captured into `out`) rather than
+// ignored, the dangling pipe to a still-running grandchild kept the
+// WHOLE node/bun process from exiting even though `child.unref()` alone
+// was already in place — reproduced live with a fake slow interpreter
+// (observed process tree: bun -> bash read_task -> sleep). Fixed with the
+// exact same bounded-timeout + process-GROUP kill shape captureOutput
+// above already uses for this precise class of bug (PR #273 round 2
+// security review, finding 2): `detached: true` so `killGroup` can reach
+// a grandchild the direct child is itself synchronously blocked on, not
+// just the immediate bash wrapper. Logged and counted, never silent.
+const PREFETCH_SPAWN_TIMEOUT_MS = 4_000;
+let prefetchRegisteredWorktreeTimedOut = 0;
+
 function prefetchRegisteredWorktree(): void {
   if (registeredWorktreeReal || !WORKER_TASK_ID || !WORKER_RUN_ID) return;
   try {
@@ -519,12 +537,20 @@ function prefetchRegisteredWorktree(): void {
     const child = spawn(
       "bash",
       ["-c", '. "$1" && read_task "$2" "$3"', "herdr-write-scope", RUN_REGISTRY_SH, WORKER_RUN_ID, WORKER_TASK_ID],
-      { stdio: ["ignore", "pipe", "pipe"], env },
+      { stdio: ["ignore", "pipe", "pipe"], env, detached: true },
     );
     let out = "";
-    child.on("error", () => {});
+    let done = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+    };
+    child.on("error", finish);
     child.stdout?.on("data", (d) => { out += String(d); });
     child.on("close", (code) => {
+      finish();
       if (registeredWorktreeReal || code !== 0) return;
       try {
         const row: unknown = JSON.parse(out.trim());
@@ -536,6 +562,16 @@ function prefetchRegisteredWorktree(): void {
         // best effort; the synchronous read in readRegisteredWorktree() is the fallback
       }
     });
+    if (child.pid) {
+      const pid = child.pid;
+      timer = setTimeout(() => {
+        prefetchRegisteredWorktreeTimedOut++;
+        console.error(`herdr: prefetchRegisteredWorktree: bash/read_task did not finish within ${PREFETCH_SPAWN_TIMEOUT_MS}ms — killing its process group (total prefetch timeouts this session: ${prefetchRegisteredWorktreeTimedOut})`);
+        killGroup(pid);
+        finish();
+      }, PREFETCH_SPAWN_TIMEOUT_MS);
+      timer.unref();
+    }
     child.unref();
   } catch {
     // best effort; the synchronous read is the fallback
@@ -1014,10 +1050,24 @@ function workerWriteScopeBlock(event: unknown, ctx: unknown): Block | undefined 
 // only bounded pre-work: cache bash/shell input for the later approval event and
 // run the fail-closed registration guard for delegation-shaped tools. Ordinary
 // tool calls return undefined and cost zero herdr RPCs here.
-function notifyForPrompt(toolName: string, message: string, command?: string): void {
+function notifyForPrompt(
+  toolName: string,
+  message: string,
+  command?: string,
+  callId?: string,
+  nativeSession?: string,
+): void {
   if (!notifyAvailable) return;
   const payload: Record<string, unknown> = { tool: toolName, message, cwd: process.cwd() };
   if (command) payload.command = command;
+  // Carried only so omp-notify.sh can persist a prompt_occ_screen observation
+  // against the SAME occurrence onApprovalRequested already recorded `seen`
+  // for (docs/plans/dot-herdr-recovery-slices.md §2: "persist request before
+  // probing; failed parsing updates display status instead of discarding the
+  // observation") — never a second identity source, since both come from
+  // the one onApprovalRequested call below.
+  if (callId) payload.call_id = callId;
+  if (nativeSession) payload.native_session = nativeSession;
   spawnDetached([NOTIFY_SH], JSON.stringify(payload));
 }
 
@@ -1344,22 +1394,345 @@ function enforceOwnerApproval(event: unknown, ctx: unknown): Block | undefined {
   }));
 }
 
-function onApprovalRequested(event: unknown): undefined {
+// ---- occurrence correlation (docs/plans/dot-herdr-recovery-slices.md §2) ---
+// Carries (run, task, pane, pane_birth, native_session, toolCallId) through
+// the approval lifecycle into lib/prompt-occurrence.py, the one deterministic
+// fold every consumer (attention-tick.sh, herdr-select.sh, hub.py) reads.
+// native_session is THIS session's omp id (sessionIdOf, same mechanism
+// enforceOwnerApproval already trusts above) — never from env or payload,
+// and stable for the life of this hook module instance, so a late event from
+// an old session's residual process cannot resolve a new session's
+// occurrence: the key simply would not match.
+const PROMPT_OCCURRENCE_PY = path.join(ROOT, "lib", "prompt-occurrence.py");
+const promptOccurrenceAvailable = safeExists(PROMPT_OCCURRENCE_PY);
+
+let registeredPaneBirthCache: string | undefined;
+function registeredPaneBirth(): string {
+  if (registeredPaneBirthCache !== undefined) return registeredPaneBirthCache;
+  if (!WORKER_RUN_ID || !WORKER_TASK_ID || !safeExists(REGISTRY_DB)) {
+    registeredPaneBirthCache = "";
+    return registeredPaneBirthCache;
+  }
+  try {
+    const sql = `SELECT pane_birth FROM tasks WHERE run_id=${sqlQuote(WORKER_RUN_ID)} AND task_id=${sqlQuote(WORKER_TASK_ID)};`;
+    const r = spawnSync("sqlite3", ["-batch", "-noheader", "-cmd", ".timeout 3000", REGISTRY_DB, sql],
+      { encoding: "utf8", timeout: 4_000, stdio: ["ignore", "pipe", "pipe"] });
+    registeredPaneBirthCache = r.status === 0 ? (r.stdout ?? "").trim() : "";
+  } catch {
+    registeredPaneBirthCache = "";
+  }
+  return registeredPaneBirthCache;
+}
+
+function occurrenceIdentityArgs(callId: string, nativeSession: string): string[] {
+  return [
+    "--db", REGISTRY_DB, "--run", WORKER_RUN_ID, "--task", WORKER_TASK_ID, "--pane", WORKER_PANE_ID,
+    "--birth", registeredPaneBirth(), "--session", nativeSession, "--call-id", callId,
+  ];
+}
+
+// Synchronous when the interpreter is already cached, deliberately: the
+// occurrence must be PERSISTED before the notify/screen-probe path below
+// ever runs, or a crash between notify and recording loses the only
+// evidence the prompt existed. This is a monitoring path (same contract as
+// the rest of this file): any failure here never throws and never blocks
+// the tool it observes — but round 6 review (HIGH): it must still be
+// VISIBLE, not silently vanish. Round 7 review (HIGH): a COLD cache (the
+// first occurrence of a session, before any prior resolution) used to be
+// dropped outright — refreshHubPythonAsync() only starts the resolve, it
+// does not finish it, so reading hubPythonCache one line later was always
+// empty on that first call. Round 8 review (5 findings against the round 7
+// fix, all addressed by collapsing to ONE ordered async path instead of a
+// separate warm-sync / cold-queue split):
+//  1. persist-before-notify: recordOccurrence now returns a Promise that
+//     resolves only once this occurrence has actually been attempted
+//     (written or definitively failed+logged), so onApprovalRequested can
+//     await it before calling notifyForPrompt — a notification can no
+//     longer outrun the write it describes.
+//  2. group-kill: runOccurrenceAsync spawns `detached: true` and kills via
+//     killGroup() (same PR #273 round 2 mechanism captureOutput uses) so a
+//     grandchild the interpreter itself blocked on cannot survive a kill
+//     and keep stdio open forever.
+//  4. one ordered path: the WARM short-circuit (recordOccurrence calling a
+//     synchronous spawnSync directly whenever hubPythonCache happened to
+//     already be set) is gone. Every occurrence, warm or cold, is pushed
+//     onto the SAME FIFO queue; a single drainOccurrenceQueue() — guarded
+//     against re-entry — is the only thing that ever calls
+//     runOccurrenceAsync, so persistence order is always arrival order,
+//     never whichever call happened to race hubPythonCache's assignment.
+//  5. count-once: runOccurrenceAsync now checks one shared `settled` guard
+//     at the top of every handler (timeout / error / close) so a failure
+//     that fires more than one of those (Node can emit both 'error' and
+//     'close' for the same spawn failure) is logged and counted exactly
+//     once, not twice.
+// flushPendingOccurrences's own name is gone with the split it drained;
+// drainOccurrenceQueue is its replacement, called directly, by name, from
+// refreshHubPythonAsync's callback and from recordOccurrence itself —
+// reachable from ensureHub()/onBeforeAgentStart, which is exactly why
+// nothing in its closure may contain a *Sync call (it does not:
+// runOccurrenceAsync only ever uses `spawn`, never `spawnSync`). An
+// earlier version of the round 7 fix instead hid a real spawnSync call
+// from the static checker behind an anonymous waiter closure — rejected
+// as the same class of problem as the round 6 glob-evasion correction;
+// this path has nothing to hide.
+const MAX_PENDING_OCCURRENCES = 50;
+const OCCURRENCE_SPAWN_TIMEOUT_MS = 4_000;
+interface PendingOccurrence { args: string[]; resolve: (persisted: boolean) => void; }
+const pendingOccurrenceQueue: PendingOccurrence[] = [];
+let pendingOccurrenceDropped = 0;
+// Round 7 follow-up (Main review): spawn/exit/timeout failures were only
+// logged, never counted. Round 8: a single shared `settled` guard inside
+// runOccurrenceAsync (not just the old `timedOut` flag) makes sure each
+// spawn increments this exactly once even when more than one of its
+// handlers fires for the same outcome.
+let pendingOccurrenceFailed = 0;
+
+// prompt-occurrence.py (lib/prompt-occurrence.py:main) ALWAYS exits 0 and
+// prints exactly one JSON object, by design ("a monitoring CLI must never
+// crash its caller") — exit code alone can never tell a durable write from
+// an internal failure. Its one success shape, for every subcommand
+// (record_seen / record_screen / record_authorized / _resolve), is
+// `{"occ_key": <str>, "written": <str>, ...}` with no `error` key; every
+// failure path (malformed --input-json, an unhandled exception) instead
+// prints `{"error": <str>}` with no `occ_key`. Round 9 review (BLOCK): the
+// TS side never read stdout at all, so an exit-0 JSON error looked
+// identical to a real persist. This is the one place that tells them apart.
+//
+// Round 10 review (narrow defect): a non-empty occ_key with no error was
+// treated as success regardless of `written`, so a `seen` call that landed
+// as record_seen's "mismatch" outcome (lib/prompt-occurrence.py:198-217 —
+// the SAME occurrence identity but a DIFFERENT tool or input than whatever
+// was recorded first) still resolved persisted=true, and the handler would
+// notify the CHANGED command as if it were the one genuinely on record.
+// `seen`'s own written values: "seen" (first write), "enriched" (a digest
+// landed where none existed yet, same identity), "duplicate" (re-seen,
+// same or still-absent digest) all mean this exact occurrence IS durably
+// recorded; "mismatch" means a conflicting write happened instead and must
+// read as a failure here, same as any other unrecognized/absent value.
+// Other subcommands (record_screen/record_authorized/_resolve) are never
+// gated on by a caller — only `seen`'s result reaches onApprovalRequested's
+// notify branch — so their own `written` shapes are left unchecked, same
+// as before.
+const SEEN_DURABLE_WRITTEN: Record<string, true> = { seen: true, enriched: true, duplicate: true };
+function parsePersistedResponse(stdout: string, cmd: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(stdout.trim());
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const r = parsed as Record<string, unknown>;
+    if (typeof r.occ_key !== "string" || r.occ_key.length === 0 || "error" in r) return false;
+    if (cmd !== "seen") return true;
+    return typeof r.written === "string" && Object.hasOwn(SEEN_DURABLE_WRITTEN, r.written);
+  } catch {
+    return false;
+  }
+}
+
+// Genuinely async: spawn + event listeners, never spawnSync. Bounded
+// lifetime: a hung prompt-occurrence.py (e.g. a stuck sqlite lock) must
+// never stall the queue forever — a manual timer (not spawn's own
+// `timeout` option, so the log line can say TIMEOUT distinctly from a
+// normal non-zero exit) kills the child after OCCURRENCE_SPAWN_TIMEOUT_MS.
+// Spawned detached and killed via killGroup() (round 8, finding 2): a
+// plain child.kill() only ever reaches prompt-occurrence.py's own PID, not
+// any grandchild IT is synchronously blocked on — exactly the orphan class
+// PR #273 round 2's killGroup() already exists to close for captureOutput.
+// A single `settled` guard (round 8, finding 5) is checked first in every
+// handler so a failure that fires more than one of timeout/error/close is
+// still counted and resolved exactly once. Always resolves `persisted`
+// (never rejects) so a dropped/failed/killed occurrence cannot produce an
+// unhandled rejection; every failure is logged AND counted before resolve.
+// Round 9 review (BLOCK): resolving `void` on EVERY outcome — including a
+// genuine timeout/EACCES/nonzero exit — made the caller's "did this
+// persist?" indistinguishable from "did this finish?". `persisted` is now
+// explicit: true only for a clean exit whose stdout is a real success
+// response (parsePersistedResponse above); every other outcome resolves
+// false and still logs the truthful reason.
+function runOccurrenceAsync(py: string, args: string[]): Promise<boolean> {
+  const { promise, resolve } = Promise.withResolvers<boolean>();
+  let settled = false;
+  let child;
+  try {
+    child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: ["ignore", "pipe", "pipe"], detached: true });
+  } catch (e: unknown) {
+    pendingOccurrenceFailed++;
+    console.error(`herdr: recordOccurrence: spawn threw (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${e}`);
+    resolve(false);
+    return promise;
+  }
+  let stdout = "";
+  let stderr = "";
+  const liveChild = child;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    pendingOccurrenceFailed++;
+    console.error(`herdr: recordOccurrence: prompt-occurrence.py timed out after ${OCCURRENCE_SPAWN_TIMEOUT_MS}ms (total failed this session: ${pendingOccurrenceFailed}) — killing its process group, occurrence NOT recorded`);
+    if (liveChild.pid) killGroup(liveChild.pid);
+    resolve(false);
+  }, OCCURRENCE_SPAWN_TIMEOUT_MS);
+  child.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
+  child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+  child.on("error", (e: Error) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    pendingOccurrenceFailed++;
+    console.error(`herdr: recordOccurrence: spawn error (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${e}`);
+    resolve(false);
+  });
+  child.on("close", (code: number | null) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    if (code !== 0) {
+      pendingOccurrenceFailed++;
+      console.error(`herdr: recordOccurrence: prompt-occurrence.py failed (status=${code}, total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${stderr.slice(0, 300)}`);
+      resolve(false);
+      return;
+    }
+    if (!parsePersistedResponse(stdout, args[0])) {
+      pendingOccurrenceFailed++;
+      console.error(`herdr: recordOccurrence: prompt-occurrence.py exited 0 but its response was not a success (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${stdout.slice(0, 300)}`);
+      resolve(false);
+      return;
+    }
+    resolve(true);
+  });
+  return promise;
+}
+
+// The ONE path every occurrence goes through, warm or cold (round 8,
+// finding 4): a warm recordOccurrence call used to spawnSync directly,
+// which could complete and persist before an earlier COLD-queued call's
+// async flush got there — an arrival-order violation. Guarded against
+// re-entry (occurrenceDrainInFlight) so at most one drain loop runs; it
+// stops (without consuming the head of the queue) the moment
+// hubPythonCache is empty, leaving every remaining item — and every
+// caller still awaiting its resolve() — queued for the next successful
+// refreshHubPythonAsync to retrigger this same function.
+let occurrenceDrainInFlight = false;
+async function drainOccurrenceQueue(): Promise<void> {
+  if (occurrenceDrainInFlight) return;
+  occurrenceDrainInFlight = true;
+  try {
+    while (pendingOccurrenceQueue.length) {
+      const py = hubPythonCache;
+      if (!py) return;
+      const item = pendingOccurrenceQueue.shift();
+      if (!item) return;
+      const persisted = await runOccurrenceAsync(py, item.args);
+      item.resolve(persisted);
+    }
+  } finally {
+    occurrenceDrainInFlight = false;
+  }
+}
+
+export function recordOccurrence(args: string[]): Promise<boolean> {
+  const { promise, resolve } = Promise.withResolvers<boolean>();
+  if (!promptOccurrenceAvailable || !WORKER_RUN_ID || !WORKER_TASK_ID || !WORKER_PANE_ID) {
+    resolve(false);
+    return promise;
+  }
+  if (pendingOccurrenceQueue.length >= MAX_PENDING_OCCURRENCES) {
+    const dropped = pendingOccurrenceQueue.shift();
+    pendingOccurrenceDropped++;
+    console.error(`herdr: recordOccurrence: pending-queue cap (${MAX_PENDING_OCCURRENCES}) reached — oldest queued occurrence dropped (total dropped this session: ${pendingOccurrenceDropped})`);
+    dropped?.resolve(false); // it will never persist now; its waiter must not hang on it
+  }
+  pendingOccurrenceQueue.push({ args, resolve });
+  if (hubPythonCache) void drainOccurrenceQueue();
+  else refreshHubPythonAsync();
+  return promise;
+}
+
+// Bounded (same eviction shape as inputByCallId/pendingScratch): which
+// in-flight calls this SESSION itself put through the approval menu, and
+// whether a decision was recorded for them yet. This is a fast-path only —
+// it decides completed-vs-withdrawn without a second durable read, but the
+// durable fold (prompt-occurrence.py) independently refuses to trust a
+// completion that was never actually approved, so a lost/evicted entry here
+// degrades to "no occurrence recorded for this call", never a false
+// completion.
+const occurrenceByCallId = new Map<string, { nativeSession: string; decided: boolean }>();
+function trackOccurrence(callId: string, nativeSession: string, decided: boolean): void {
+  occurrenceByCallId.set(callId, { nativeSession, decided });
+  while (occurrenceByCallId.size > INPUT_CACHE_MAX) {
+    const oldest = occurrenceByCallId.keys().next().value;
+    if (oldest === undefined) break;
+    occurrenceByCallId.delete(oldest);
+  }
+}
+
+
+function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     const toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
     const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
     const input = e.input ?? e.args ?? (callId !== undefined ? inputByCallId.get(callId) : undefined);
-    if (callId !== undefined) inputByCallId.delete(callId);
+    // Cache kept, never deleted here: omp can fire tool_approval_requested
+    // more than once for ONE still-open prompt (the existing compound-menu
+    // fixture pins exactly that repeat-firing shape), and deleting on the
+    // first firing silently dropped the SECOND firing's cached input before
+    // this fix (docs/plans/dot-herdr-recovery-slices.md §2, prerequisite
+    // notes on agent-hooks/omp-herdr-control.ts:925).
+    let nativeSession: string | undefined;
+    if (callId !== undefined) nativeSession = sessionIdOf(ctx);
+    if (callId !== undefined) trackOccurrence(callId, nativeSession, false);
     // `reason` is the approval's own words when omp supplies one; the argument
     // summary is the fallback, and still the more useful line for bash.
     const detail = describeToolCall(toolName, input)
       ?? (typeof e.reason === "string" && e.reason ? truncate(e.reason) : undefined);
-    notifyForPrompt(
-      toolName,
-      detail ? `${toolName}: ${detail}` : `omp needs your permission to use ${toolName}`,
-      rawBashCommand(toolName, input),
-    );
+    // Round 8 review (finding 1): this used to call recordOccurrence then
+    // notifyForPrompt on the very next line, so the notification could
+    // race ahead of (or outrun, on a crash) whatever async resolve+write
+    // recordOccurrence still had in flight — fixed by awaiting its
+    // Promise<boolean> before notifying. Round 8 Main review follow-up: an
+    // `async function` handler returns a Promise, which omp's own
+    // "never blocks the agent" event-handler contract requires this NOT
+    // to do (verify-omp-hooks.sh:958) — this synchronous handler now
+    // returns undefined immediately, same as before, and runs the
+    // persist-before-notify sequence in a DETACHED, self-contained task
+    // with its own try/catch, exactly like every other fire-and-forget
+    // path in this file (never awaited by the caller, never throws out).
+    //
+    // Round 9 review (BLOCK): awaiting the promise was only "attempt
+    // before notify" — every failure path (timeout, spawn error/EACCES,
+    // nonzero exit, queue eviction, prompt-occurrence.py exiting 0 with a
+    // JSON error) used to resolve just like a real success, so the
+    // notification fired unconditionally anyway. recordOccurrence now
+    // resolves an explicit `persisted` boolean (true only for a verified
+    // durable write) and this is the one gate: no identity (callId
+    // undefined, nothing was ever attempted) and an attempted-but-failed
+    // write both read as `persisted !== true` here and suppress the
+    // notification — the failure itself was already logged with its
+    // truthful reason and counted inside recordOccurrence/runOccurrenceAsync.
+    void (async () => {
+      try {
+        const persisted = callId !== undefined
+          ? await recordOccurrence([
+              "seen", ...occurrenceIdentityArgs(callId, nativeSession),
+              "--tool", toolName,
+              ...(input !== undefined ? ["--input-json", JSON.stringify(input)] : []),
+              "--source", "tool_approval_requested",
+            ])
+          : false;
+        if (!persisted) {
+          console.error(`herdr: recordOccurrence: occurrence was not durably persisted — suppressing the approval notification for ${toolName} (call ${callId ?? "unknown"})`);
+          return;
+        }
+        notifyForPrompt(
+          toolName,
+          detail ? `${toolName}: ${detail}` : `omp needs your permission to use ${toolName}`,
+          rawBashCommand(toolName, input),
+          callId,
+          nativeSession,
+        );
+      } catch {
+        // MUST NOT throw — see the fail-closed contract at the top of this file.
+      }
+    })();
   } catch {
     // MUST NOT throw — see the fail-closed contract at the top of this file.
   }
@@ -1397,8 +1770,25 @@ function retract(): void {
   if (resolveAvailable) spawnDetached([RESOLVE_SH]);
 }
 
-function onApprovalResolved(): undefined {
+function onApprovalResolved(event?: unknown, ctx?: unknown): undefined {
   try {
+    const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
+    if (callId !== undefined) {
+      const approved = e.approved === true;
+      const nativeSession = sessionIdOf(ctx);
+      trackOccurrence(callId, nativeSession, true);
+      // Approval is never completion (plan §2): this moves the occurrence to
+      // approved_awaiting_completion, or — for a real Deny — resolves it
+      // directly as declined. `false` also covers "no interactive UI" and an
+      // abort, so `reason` carries omp's own words rather than this always
+      // being read as a human denial.
+      recordOccurrence([
+        "authorized", ...occurrenceIdentityArgs(callId, nativeSession),
+        "--decided-by", approved ? "human" : "human_or_abort",
+        "--choice", approved ? "approve" : "deny",
+      ]);
+    }
     retract();
   } catch {
     // see onApprovalRequested().
@@ -1406,13 +1796,28 @@ function onApprovalResolved(): undefined {
   return undefined;
 }
 
-function onExecutionEnd(event: unknown): undefined {
+function onExecutionEnd(event: unknown, ctx?: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     // Only `ask` was ever alerted from tool_execution_start, so only `ask`
     // needs the matching retraction; any other tool ending is not a prompt
     // being answered and must not cost a sweep.
     if (e.toolName === "ask") retract();
+    const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
+    const occ = callId !== undefined ? occurrenceByCallId.get(callId) : undefined;
+    if (callId !== undefined && occ) {
+      occurrenceByCallId.delete(callId);
+      const isError = e.isError === true;
+      if (occ.decided) {
+        recordOccurrence(["completed", ...occurrenceIdentityArgs(callId, occ.nativeSession),
+          ...(isError ? ["--is-error"] : [])]);
+      } else {
+        // Aborted/skipped before a decision ever reached this store — a
+        // withdrawal, never a silent success (plan §2).
+        recordOccurrence(["withdrawn", ...occurrenceIdentityArgs(callId, occ.nativeSession),
+          "--reason", "execution_end_without_decision"]);
+      }
+    }
   } catch {
     // see onApprovalRequested().
   }
@@ -1467,10 +1872,48 @@ function parseEnvelope(stdout: string): ReconcileEnvelope | undefined {
 // human: tasks needing attention or an open decision form. The envelope is
 // acked exactly as before, so the conductor's cursor advances and the page —
 // not the next prompt — carries the history.
+// ensureHub() used to call resolveHubPython() -> a synchronous
+// `spawnSync("bash", [RESOLVE_HUB_PYTHON_SH], ...)` inside
+// onBeforeAgentStart — exactly the pattern PR #273 eliminated everywhere
+// else in this handler (2026-10-10 watchdog: 384 ui.loop-blocked
+// entries/day; onBeforeAgentStart fires every turn, not once per session).
+// Same cache-and-background-refresh shape as hubSummaryCache below:
+// onBeforeAgentStart never waits on this. A cold cache this turn means
+// ensureHub() simply does not attempt to start a hub THIS turn — harmless,
+// since hub.py is normally already up via the launchd agent and this path
+// only matters on a machine where it is not, where a LATER turn's cache
+// hit (or the launchd agent, or `install.sh --hub --apply`) covers it. A
+// cold cache is never treated as "start one unpinned": it is read as "do
+// not start a hub this turn," never as permission to spawn bare `python3`.
+let hubPythonCache: string | undefined;
+let hubPythonRefreshInFlight = false;
+
+function refreshHubPythonAsync(): void {
+  if (hubPythonRefreshInFlight) return;
+  hubPythonRefreshInFlight = true;
+  captureOutput("bash", [RESOLVE_HUB_PYTHON_SH], { timeoutMs: 2_000 }, (ok, out) => {
+    hubPythonRefreshInFlight = false;
+    const py = ok ? out.trim() : "";
+    if (py) {
+      hubPythonCache = py;
+      if (pendingOccurrenceQueue.length) void drainOccurrenceQueue();
+    } else if (pendingOccurrenceQueue.length) {
+      console.error(`herdr: recordOccurrence: resolver failed to find a pinned interpreter — ${pendingOccurrenceQueue.length} queued occurrence(s) still pending, will retry on the next recordOccurrence/ensureHub call`);
+    }
+  });
+}
+
 function ensureHub(): void {
   if (!hubAvailable) return;
+  refreshHubPythonAsync();
+  // FAIL CLOSED, never fall back to bare `python3`: that resolves through
+  // this process's PATH with no guarantee of which interpreter answers —
+  // the exact ambiguous-runtime bug (CLT /usr/bin/python3 3.9.6 vs. an
+  // interactive shell's Homebrew 3.14) this resolver exists to remove.
+  const py = hubPythonCache;
+  if (!py) return;
   try {
-    const child = spawn("python3", [HUB_PY, "--port", String(HUB_PORT)], {
+    const child = spawn(py, [HUB_PY, "--port", String(HUB_PORT)], {
       detached: true,
       stdio: ["ignore", "ignore", "ignore"],
     });

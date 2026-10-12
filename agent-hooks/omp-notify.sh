@@ -94,6 +94,33 @@ for _ in 1 2 3 4 5; do
   if _prompt_is_up; then found=1; break; fi
   sleep 0.3
 done
+
+# Persist a prompt_occ_screen observation against the SAME occurrence
+# onApprovalRequested already recorded `seen` for, whether or not a prompt
+# ever painted — a failed/not-found probe used to just `exit 0` here with
+# nothing left behind (docs/plans/dot-herdr-recovery-slices.md §2:
+# "agent-hooks/omp-notify.sh:95 can return after five failed screen probes
+# without a durable occurrence"). Best-effort and additive: call_id/
+# native_session arrive only from the approval path (notifyForPrompt); an
+# `ask` question (no call id) or a hand-started session (no HERDR_RUN_ID/
+# HERDR_TASK_ID) has no occurrence to attach to and simply skips this,
+# exactly today's behavior.
+call_id="$(printf '%s' "$input" | jq -r '.call_id // ""' 2>/dev/null || printf '')"
+native_session="$(printf '%s' "$input" | jq -r '.native_session // ""' 2>/dev/null || printf '')"
+if [ -n "$call_id" ] && [ -n "$native_session" ] && [ -n "${HERDR_RUN_ID:-}" ] \
+   && [ -n "${HERDR_TASK_ID:-}" ] && [ -f "$here/lib/prompt-occurrence.py" ]; then
+  _occ_pane_birth="$(read_task "$HERDR_RUN_ID" "$HERDR_TASK_ID" 2>/dev/null \
+    | jq -r '.pane_birth // ""' 2>/dev/null || printf '')"
+  _occ_display="$(prompt_occurrence_display "$pane" 2>/dev/null || printf 'read_failed')"
+  _occ_screen_id=""
+  [ "$_occ_display" = pending_parseable ] && _occ_screen_id="$(prompt_id "$pane" 2>/dev/null || printf '')"
+  _occ_py="$(_registry_python 2>/dev/null)" && "$_occ_py" "$here/lib/prompt-occurrence.py" screen \
+    --db "$(registry_db)" --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" --pane "$pane" \
+    --birth "$_occ_pane_birth" --session "$native_session" --call-id "$call_id" \
+    --display "$_occ_display" ${_occ_screen_id:+--prompt-id "$_occ_screen_id"} \
+    >/dev/null 2>&1 || true
+fi
+
 [ "$found" = 1 ] || exit 0
 
 where="${cwd##*/}"

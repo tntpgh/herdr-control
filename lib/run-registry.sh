@@ -39,7 +39,7 @@
 # Sourced by spawn-task.sh (register), agent-hooks/claude-notify.sh and
 # agent-hooks/omp-notify.sh (read + log), lib/reconcile.sh (sweep),
 # lib/pane-guard.sh (task_for_pane), herdr-select.sh (approval lifecycle).
-# Requires: sqlite3, jq.
+# Requires: sqlite3, jq, python3.
 set -uo pipefail
 
 # ---- location ---------------------------------------------------------------
@@ -99,13 +99,95 @@ _now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # so this runs at most once per process even though the DDL is idempotent.
 _HERDR_REGISTRY_READY=0
 
-_registry_schema_version() { printf '10\n'; }
+_registry_schema_version() { printf '11\n'; }
+
+_TASK_AUTHORIZATION_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/task-authorization.py"
+
+# _registry_python — the ONE place lib/run-registry.sh decides which python3
+# interpreter touches the registry. Extends launchd/resolve-hub-python.sh
+# (the same resolver the hub plist and its compile gate pin) rather than
+# re-deriving a second scan: a machine where Homebrew's generic `python3`
+# symlink is missing resolves bare `python3` to the CLT's /usr/bin/python3
+# 3.9.6 in every shell, under which the v12 migration aborts with "unable to
+# open database file" (Main's rehearsal,
+# thurber-os/.handoffs/registry-rehearsal-20261011.log); the SAME pinned
+# 3.14 interpreter the hub uses reaches schema 12 cleanly. The >=3.11 floor
+# the migration needs is enforced INSIDE resolve-hub-python.sh itself
+# (round 6 review: a second floor check here, duplicating the one the
+# shared resolver now also carries, is exactly the kind of two-definitions
+# drift the resolver's own header warns about) — this wrapper only adds
+# caching, not a second version check. FAILS CLOSED: empty/non-executable
+# resolution refuses with a clear stderr message and a nonzero return.
+# Resolved at most once per process and cached in _REGISTRY_PYTHON.
+_REGISTRY_PYTHON_RESOLVER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/launchd/resolve-hub-python.sh"
+_REGISTRY_PYTHON=""
+_registry_python() {
+  if [ -n "$_REGISTRY_PYTHON" ]; then
+    printf '%s\n' "$_REGISTRY_PYTHON"
+    return 0
+  fi
+  local py
+  py="$(bash "$_REGISTRY_PYTHON_RESOLVER" 2>/dev/null)" || py=""
+  if [ -z "$py" ] || [ ! -x "$py" ]; then
+    printf 'run-registry: no pinned python3.11+ interpreter found (resolve-hub-python.sh) — refusing to run registry code under an unpinned /usr/bin/env python3\n' >&2
+    return 1
+  fi
+  _REGISTRY_PYTHON="$py"
+  printf '%s\n' "$py"
+}
+
+_task_authorization_adapter() {
+  local py; py="$(_registry_python)" || return 1
+  "$py" "$_TASK_AUTHORIZATION_HELPER" "$(registry_db)" "$@"
+}
+
+_registry_enable_wal() {
+  # SQLite's journal-mode transition may return SQLITE_BUSY immediately even
+  # with busy_timeout installed. Retry that idempotent transition alone, using
+  # typed lock errors and the same bounded wait budget as ordinary SQL calls.
+  local py; py="$(_registry_python)" || return 1
+  "$py" - "$1" "${HERDR_REGISTRY_BUSY_MS:-5000}" <<'PY'
+import sqlite3
+import sys
+import time
+
+try:
+    path, budget_ms = sys.argv[1:]
+    budget = int(budget_ms) / 1000
+    if budget < 0:
+        raise ValueError("negative registry lock wait budget")
+    deadline = time.monotonic() + budget
+    with sqlite3.connect(path, timeout=0) as db:
+        while True:
+            try:
+                mode = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                if mode != "wal":
+                    raise ValueError("registry did not enter WAL mode")
+                break
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", 0) & 255
+                remaining = deadline - time.monotonic()
+                if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or remaining <= 0:
+                    raise
+                time.sleep(min(0.01, remaining))
+except (sqlite3.Error, OSError, ValueError) as exc:
+    print(f"run-registry: WAL initialization failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
 
 registry_init() {
   [ "$_HERDR_REGISTRY_READY" = 1 ] && return 0
-  local root db
+  # Resolve (and cache) the pinned registry interpreter FIRST: every path
+  # below this point depends on it (_registry_enable_wal immediately below,
+  # the v11/v12 migration further down), so failing here gives the clearest
+  # possible message instead of surfacing from inside the first helper that
+  # happens to need it.
+  _registry_python >/dev/null || return 1
+  local root db existed=0 init_error
   root="$(run_state_root)"
   db="$(registry_db)"
+  [ ! -e "$db" ] || existed=1
   mkdir -p "$root" || {
     printf 'run-registry: cannot create registry root %s\n' "$root" >&2
     return 1
@@ -115,11 +197,11 @@ registry_init() {
   # as the Slack bridge's state dir (see herdr-notify.sh's reg_dir comment).
   chmod 700 "$root" 2>/dev/null || true
 
-  # journal_mode is persisted in the database header, so it is set here rather
-  # than in _sql — WAL is what lets the reconcile sweep read while a hook
-  # writes, instead of the two serializing on a whole-file lock.
-  if ! sqlite3 -batch "$db" "
-PRAGMA journal_mode=WAL;
+  # Set persistent journal mode before ordinary DDL, with a bounded transition
+  # retry for simultaneous first readers. The schema statements retain the
+  # normal connection busy timeout and fail closed on any error.
+  _registry_enable_wal "$db" || return 1
+  if ! init_error="$(sqlite3 -batch -cmd ".timeout ${HERDR_REGISTRY_BUSY_MS:-5000}" "$db" "
 PRAGMA busy_timeout=${HERDR_REGISTRY_BUSY_MS:-5000};
 
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -172,12 +254,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- every reader treats empty as use-the-repo-basename rather than a
   -- distinct project of its own.
   project               TEXT NOT NULL DEFAULT '',
-  -- The task's capability manifest (lib/task-manifest.sh), canonical JSON,
-  -- approved ONCE at spawn by the spawning conductor. '' = no manifest: the
-  -- per-task scope layer in lib/scoped-policy.sh then adds nothing and every
-  -- decision is exactly the pre-manifest one. Stored HERE, not read from the
-  -- worker-writable .handoffs/identity.json, so a worker cannot widen its own
-  -- scope by editing a file in its worktree.
+  -- The recorded capability manifest (lib/task-manifest.sh), canonical JSON.
+  -- Its existence alone proves no approval. Automated authority additionally
+  -- requires the separate protected source receipt and exact task binding.
+  -- Stored HERE, not in worker-writable .handoffs/identity.json.
   manifest             TEXT NOT NULL DEFAULT '',
   label                TEXT NOT NULL DEFAULT '',
   state                TEXT NOT NULL,
@@ -255,22 +335,23 @@ CREATE TABLE IF NOT EXISTS file_approvals (
 );
 
 INSERT OR IGNORE INTO schema_meta(key, value)
-  VALUES ('schema_version', '$(_registry_schema_version)');
-" >/dev/null 2>&1; then
-    printf 'run-registry: failed to initialize %s\n' "$db" >&2
+  VALUES ('schema_version', '10');
+" 2>&1 >/dev/null)"; then
+    printf 'run-registry: failed to initialize %s: %s\n' "$db" "$init_error" >&2
     return 1
   fi
 
+  _migrate_schema_v3 || return 1
+  _migrate_schema_v4 || return 1
+  _migrate_schema_v5 || return 1
+  _migrate_schema_v6 || return 1
+  _migrate_schema_v7 || return 1
+  _migrate_schema_v8 || return 1
+  _migrate_schema_v9 || return 1
+  _migrate_schema_v10 || return 1
+  _migrate_schema_v11 "$existed" || return 1
+  _migrate_legacy_files || return 1
   _HERDR_REGISTRY_READY=1
-  _migrate_schema_v3
-  _migrate_schema_v4
-  _migrate_schema_v5
-  _migrate_schema_v6
-  _migrate_schema_v7
-  _migrate_schema_v8
-  _migrate_schema_v9
-  _migrate_schema_v10
-  _migrate_legacy_files
   return 0
 }
 
@@ -516,6 +597,7 @@ _migrate_schema_v8() {
     _stamp_schema_version 8
   else
     printf 'run-registry: v8 migration (owners table) failed; schema_version NOT advanced\n' >&2
+    return 1
   fi
 }
 
@@ -571,7 +653,68 @@ _migrate_schema_v10() {
     _stamp_schema_version 10
   else
     printf 'run-registry: v10 migration (roles table) failed; schema_version NOT advanced\n' >&2
+    return 1
   fi
+}
+
+# Add a separate receipt table; existing manifests remain unverified. Schema
+# creation and the version stamp share a transaction in the storage adapter.
+_migrate_schema_v11() {
+  # Serialize the version recheck, verified backup, DDL and stamp with the
+  # registry's existing SQLite writer lock. Separate shell connections left a
+  # window where eight first readers backed up into the same second-resolution
+  # filename, or compared a newly migrated backup against a stale version.
+  local py; py="$(_registry_python)" || return 1
+  "$py" - "$(registry_db)" "$_TASK_AUTHORIZATION_HELPER" "${1:-1}" <<'PY'
+import importlib.util
+import os
+import sqlite3
+import sys
+import tempfile
+
+path, helper, existed = sys.argv[1:]
+backup = None
+verified = False
+try:
+    spec = importlib.util.spec_from_file_location("task_authorization_storage", helper)
+    storage = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(storage)
+    with storage.connect(path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+        current = row[0] if row else ""
+        if not current.isdecimal():
+            raise ValueError("invalid pre-migration schema version")
+        if int(current) < 12 and existed == "1":
+            # The locked connection must not back itself up while it has an
+            # open write transaction. A separate read-only connection takes a
+            # consistent online snapshot; the writer lock prevents any other
+            # migrator from advancing its version until verification completes.
+            fd, backup = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".v12.bak",
+                                          dir=os.path.dirname(os.path.abspath(path)))
+            os.close(fd)
+            with storage.connect(path, readonly=True) as source, sqlite3.connect(backup) as target:
+                source.backup(target)
+            with storage.connect(backup, readonly=True) as saved:
+                integrity = saved.execute("PRAGMA integrity_check").fetchone()[0]
+                version = saved.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
+            if integrity != "ok" or version != current:
+                raise ValueError("pre-migration backup failed integrity/version verification")
+            verified = True
+            print(f"run-registry: backed up {path} -> {backup} before migration v12 (integrity+version verified)", file=sys.stderr)
+        # schema() uses this connection's existing transaction and commits only
+        # after both DDL and the monotonic stamp succeed. Closing on error rolls
+        # everything back and releases the writer lock without a stale lockfile.
+        storage.schema(db)
+except Exception as exc:
+    if backup and not verified:
+        try:
+            os.unlink(backup)
+        except OSError:
+            pass
+    print(f"run-registry: v12 migration aborted: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 # ---- one-time import of the pre-SQLite file layout --------------------------
@@ -664,12 +807,15 @@ gen_id() {                              # <prefix> -> "<prefix>_<ts>_<pid>_<rand
 # names whether it asked for one task or all of them.
 _task_json_select() {
   printf "%s" "SELECT json_object(
-    'schema', 9, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
+    'schema', 11, 'run_id', run_id, 'task_id', task_id, 'worker_id', worker_id,
     'conductor_id', conductor_id, 'conductor_pane_id', conductor_pane_id,
     'conductor_pane_birth', conductor_pane_birth, 'pane_id', pane_id,
     'pane_birth', pane_birth, 'agent_session', agent_session, 'repo', repo,
     'worktree', worktree, 'branch', branch, 'trunk', trunk, 'project', project,
     'manifest', manifest, 'approval', approval,
+    'authorization_command_id', COALESCE((SELECT a.command_id FROM task_authorizations a WHERE a.task_id=tasks.task_id), ''),
+    'authorization_source', COALESCE((SELECT a.source FROM task_authorizations a WHERE a.task_id=tasks.task_id), ''),
+    'authorization_status', COALESCE((SELECT a.status FROM task_authorizations a WHERE a.task_id=tasks.task_id), ''),
     'remote_task_id', remote_task_id, 'deadline_at', deadline_at,
     'verified', (verified = 1), 'verify_detail', verify_detail,
     'review_pr_repo', review_pr_repo, 'review_pr_number', review_pr_number,
@@ -687,14 +833,13 @@ _task_json_select() {
 # existing caller that passes 11 args keeps registering exactly as before.
 # project (14th, OPTIONAL) is the project-contract-plan.md #2 label; empty
 # means "no explicit project — every reader falls back to the repo basename".
-# manifest (15th, OPTIONAL) is the canonical capability-manifest JSON from
-# lib/task-manifest.sh; recorded with a `manifest_approved` event naming the
-# spawning conductor and the manifest's sha256 — the one approval decision.
+# manifest (15th, OPTIONAL) is the capability-manifest JSON. Source authority
+# comes from an accepted protected receipt (17th), never the assigned conductor.
 register_task() {
   local run_id="$1" task_id="$2" worker_id="$3" conductor_id="$4" \
         conductor_pane_id="$5" conductor_pane_birth="$6" pane_id="$7" pane_birth="$8" \
         repo="$9" worktree="${10}" label="${11}" branch="${12:-}" trunk="${13:-}" \
-        project="${14:-}" manifest="${15:-}" approval="${16:-menu}"
+        project="${14:-}" manifest="${15:-}" approval="${16:-menu}" authorization_command_id="${17:-}"
   case "$approval" in
     menu|hook) ;;
     *) printf 'run-registry: invalid approval posture %s (menu|hook)\n' "$approval" >&2; return 1 ;;
@@ -705,35 +850,74 @@ register_task() {
     esac
   fi
   registry_init || return 1
-  local at; at="$(_now_iso)"
+  local task_json
+  task_json="$(jq -nc --arg run_id "$run_id" --arg task_id "$task_id" --arg worker_id "$worker_id" \
+    --arg conductor_id "$conductor_id" --arg conductor_pane_id "$conductor_pane_id" \
+    --arg conductor_pane_birth "$conductor_pane_birth" --arg pane_id "$pane_id" --arg pane_birth "$pane_birth" \
+    --arg repo "$repo" --arg worktree "$worktree" --arg branch "$branch" --arg trunk "$trunk" \
+    --arg project "$project" --arg manifest "$manifest" --arg approval "$approval" --arg label "$label" \
+    '$ARGS.named')" || return 1
+  # INSERT plus source binding plus audit events is one transaction. Legacy
+  # registrations still succeed, but cannot fabricate a manifest approval.
+  _task_authorization_adapter register "$task_json" "$authorization_command_id"
+}
 
-  # Plain INSERT, not INSERT OR REPLACE: a task_id collision must be a visible
-  # failure, not a silent overwrite of a live worker's registration. See the
-  # tasks table comment in registry_init.
-  if _sql "INSERT INTO tasks
-      (task_id, run_id, worker_id, conductor_id, conductor_pane_id, conductor_pane_birth,
-       pane_id, pane_birth, repo, worktree, branch, trunk, project, manifest, approval, label, state, created_at, updated_at)
-      VALUES ($(_sq "$task_id"), $(_sq "$run_id"), $(_sq "$worker_id"), $(_sq "$conductor_id"),
-        $(_sq "$conductor_pane_id"), $(_sq "$conductor_pane_birth"), $(_sq "$pane_id"),
-        $(_sq "$pane_birth"), $(_sq "$repo"), $(_sq "$worktree"), $(_sq "$branch"), $(_sq "$trunk"),
-        $(_sq "$project"), $(_sq "$manifest"), $(_sq "$approval"), $(_sq "$label"), 'starting', $(_sq "$at"), $(_sq "$at"));" >/dev/null 2>&1; then
-    append_event "$run_id" "$task_id" "registered" \
-      "$(jq -nc --arg p "$pane_id" --arg l "$label" '{pane_id:$p, label:$l}')" >/dev/null 2>&1
-    if [ "$approval" = hook ]; then
-      append_event "$run_id" "$task_id" "approval_posture" \
-        "$(jq -nc --arg c "$conductor_id" --arg cp "$conductor_pane_id" \
-           '{approval:"hook", approved_by:$c, conductor_pane:$cp}')" >/dev/null 2>&1
-    fi
-    if [ -n "$manifest" ]; then
-      append_event "$run_id" "$task_id" "manifest_approved" \
-        "$(jq -nc --arg c "$conductor_id" --arg cp "$conductor_pane_id" \
-           --arg sha "$(printf '%s' "$manifest" | shasum -a 256 | cut -d' ' -f1)" \
-           --argjson m "$manifest" \
-           '{approved_by:$c, conductor_pane:$cp, manifest_sha256:$sha, manifest:$m}')" >/dev/null 2>&1
-    fi
+# These are protected storage adapters. The publisher verifies the signed
+# source before accept; spawn verifies local ancestry/birth before accept-local.
+# Do not expose either as an inbox operation or an unauthenticated endpoint.
+accept_task_authorization() {
+  registry_init || return 1
+  _task_authorization_adapter accept "$1" "$2" "${3:-}"
+}
+accept_local_task_authorization() {
+  registry_init || return 1
+  _task_authorization_adapter accept-local "$1" "$2" "$3" "$4" "${5:-}"
+}
+read_task_authorization() {
+  _task_authorization_adapter read "$1"
+}
+# Slice 3 (receipt-to-ack recovery, dot-herdr-recovery-slices.md §3):
+# enumeration/confirmation are read of the SAME protected registry row the
+# accept/register/launch adapters above already write -- no new storage,
+# no admission, no spawn. publisher.py calls these INDEPENDENTLY of its own
+# local JSON ack cache, so a crash between a registry commit and
+# `save_state()` cannot silently drop an unconfirmed acknowledgement.
+pending_task_authorization_acks() {
+  if [ -n "${1:-}" ]; then
+    _task_authorization_adapter pending-acks "$1"
+  else
+    _task_authorization_adapter pending-acks
+  fi
+}
+confirm_task_authorization_ack() {
+  _task_authorization_adapter confirm-ack "$1" "$2"
+}
+reserve_task_worktree() {
+  registry_init || return 1
+  local py; py="$(_registry_python)" || return 1
+  "$py" "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" reserve "$@"
+}
+claim_task_worktree_mutation() {
+  local py; py="$(_registry_python)" || return 1
+  "$py" "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" claim-mutation "$@"
+}
+check_worktree_unreserved() {
+  local py; py="$(_registry_python)" || return 1
+  "$py" "${_TASK_AUTHORIZATION_HELPER%/*}/task-reservation.py" "$(registry_db)" check-unreserved "$@"
+}
+mark_authorization_launch() {
+  _task_authorization_adapter launch "$1" "$2" "$3" "$4"
+}
+task_authorization_check() {
+  TASK_AUTHORIZATION_REASON=""
+  local why
+  if why="$(_task_authorization_adapter check "$1" 2>&1)"; then
     return 0
   fi
-  printf 'run-registry: failed to register task %s (duplicate task_id, or database unwritable)\n' "$task_id" >&2
+  case "$why" in
+    'authorization hold: '*) TASK_AUTHORIZATION_REASON="$why" ;;
+    *) TASK_AUTHORIZATION_REASON="authorization hold: protected source unavailable" ;;
+  esac
   return 1
 }
 

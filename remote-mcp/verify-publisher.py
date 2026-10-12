@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behaviour checks for publisher.py. No network beyond a loopback fixture hub,
+"""Behaviour checks for publisher.py. No network; an in-process fixture hub replaces the transport,
 no real herdr: delivery goes to a fake herdr-deliver that records its argv.
 
     python3 remote-mcp/verify-publisher.py
@@ -12,11 +12,9 @@ import os
 import sqlite3
 import sys
 import tempfile
-import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -69,22 +67,12 @@ con.commit()
 con.close()
 
 
-class Hub(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802
-        body = {"/herdr?json=1": {"tasks": TASKS, "herdr_reachable": True, "live": {"connected": True}},
-                "/api/panes": {"connected": True, "panes": PANES},
-                "/api/summary": {"rev": "abc", "live_connected": True, "attention": 1, "open_decisions": 0, "handoff_debt": 0},
-                }.get(self.path)
-        self.send_response(200 if body else 404)
-        self.end_headers()
-        self.wfile.write(json.dumps(body or {}).encode())
+def fixture_hub_get(path):
+    return {"/herdr?json=1": {"tasks": TASKS, "herdr_reachable": True, "live": {"connected": True}},
+            "/api/panes": {"connected": True, "panes": PANES},
+            "/api/summary": {"rev": "abc", "live_connected": True, "attention": 1, "open_decisions": 0, "handoff_debt": 0},
+            }[path]
 
-    def log_message(self, *a):
-        pass
-
-
-hub = HTTPServer(("127.0.0.1", 0), Hub)
-threading.Thread(target=hub.serve_forever, daemon=True).start()
 
 FAKE = TMP / "fake-deliver.sh"
 FAKE.write_text('#!/bin/bash\nfor a in "$@"; do printf "%s\\0" "$a"; done > "$FAKE_ARGV"\n'
@@ -106,7 +94,7 @@ def fake_chrome(name: str, doc: object) -> Path:
 
 CHROME = fake_chrome("fake-chrome-relay.py", GOOD_BROWSER)
 
-os.environ.update(HERDR_HUB_URL=f"http://127.0.0.1:{hub.server_port}", HERDR_RUN_REGISTRY=str(REG),
+os.environ.update(HERDR_HUB_URL="http://fixture.invalid", HERDR_RUN_REGISTRY=str(REG),
                   HERDR_STATE_DIR=str(TMP / "state"), HERDR_DELIVER=str(FAKE), FAKE_ARGV=str(TMP / "argv"),
                   HERDR_CHROME_RELAY=str(CHROME))
 spec = importlib.util.spec_from_file_location("publisher", HERE / "publisher.py")
@@ -114,6 +102,7 @@ pub = importlib.util.module_from_spec(spec)
 sys.modules["publisher"] = pub
 spec.loader.exec_module(pub)
 pub.WORKTREE_ROOTS = (WT_ROOT,)
+pub.hub_get = fixture_hub_get
 
 
 class Snapshot(unittest.TestCase):
@@ -401,6 +390,7 @@ class OwnerDeliveryTicks(unittest.TestCase):
         with patch.object(restarted, "OUT", pub.OUT), patch.object(restarted, "INBOX_ROOT", pub.INBOX_ROOT), \
                 patch.object(restarted, "OWNER_INBOX_ON_MAC", True), \
                 patch.object(restarted, "build", pub.build), \
+                patch.object(restarted, "hub_get", fixture_hub_get), \
                 patch.object(restarted, "registry_owners", pub.registry_owners), \
                 patch.object(restarted, "post_sync", pub.post_sync):
             self.assertEqual(restarted.main([]), 0)

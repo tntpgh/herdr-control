@@ -13,10 +13,22 @@
 		     `op read` had no token at all. `2>/dev/null` because the daemon
 		     must still start on a machine where the file is absent — the
 		     biometric flag above means that case fails fast instead of
-		     hanging on a prompt nobody is there to answer. -->
+		     hanging on a prompt nobody is there to answer.
+
+		     __HUB_PYTHON__ is a pinned, versioned, absolute interpreter path
+		     (install.sh's resolve_hub_python, launchd/agent-lib.sh), NEVER
+		     `/usr/bin/env python3`. launchd resolves `env python3` through
+		     PATH with none of the shell's environment at load time; on a
+		     machine where Homebrew's generic `python3` symlink is missing
+		     that silently lands on the CLT's /usr/bin/python3 3.9.6 while an
+		     interactive shell's `python3` is 3.14 — the plist and a human
+		     typing `python3` would run two different interpreters for "the
+		     same" command. install.sh fails closed (refuses to render this
+		     plist) if no versioned interpreter is found; it never falls back
+		     to the ambiguous `env python3` form. -->
 		<string>/bin/bash</string>
 		<string>-c</string>
-		<string>source "$HOME/.config/op/service-account.env" 2>/dev/null; exec /usr/bin/env python3 __HUB_PY__</string>
+		<string>source "$HOME/.config/op/service-account.env" 2>/dev/null; exec __HUB_PYTHON__ __HUB_PY__</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>

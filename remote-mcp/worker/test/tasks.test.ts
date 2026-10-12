@@ -1,14 +1,14 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { HerdrState } from "../src/state";
-import type { Env } from "../src/types";
+import type { CommandAuthorization, Env } from "../src/types";
 import { callTool, oauthToken, signedSync, snapshot, syncBody } from "./helpers";
 
 const e = env as unknown as Env;
 const fleet = () => e.HERDR_STATE.get(e.HERDR_STATE.idFromName("fleet"));
 
 interface SyncReply {
-  commands: { command_id: string; op: string; remote_task_id: string; payload: Record<string, unknown> }[];
+  commands: { command_id: string; op: string; remote_task_id: string; payload: Record<string, unknown>; authorization?: CommandAuthorization }[];
   audit: { tool: string; decision: string; reason: string }[];
 }
 const syncJson = async (r: Response): Promise<SyncReply> => r.json();
@@ -26,7 +26,7 @@ interface EventsResult { cursor: number; events: unknown[] }
 const CAPS = { max_concurrent: 1, max_per_day: 10, max_minutes: 60 };
 const MODE = { job_class: "research", secrets: "grant" as const, git: "none" as const, writes: [], net_read: [] };
 const TASK_CONFIG = {
-  mac_enabled: true, repos: ["knowledge-base"], caps: CAPS,
+  mac_enabled: true, authorization_protocol: 1, repos: ["knowledge-base"], caps: CAPS,
   modes: { research: MODE, implement: { ...MODE, job_class: "implement", secrets: "default" as const, git: "push-own-branch" as const } },
 };
 const taskConfigBody = (overrides: Partial<typeof TASK_CONFIG> = {}) =>
@@ -54,6 +54,225 @@ function isVerifiedTask(x: unknown): x is { verified: boolean; verify_detail: st
 }
 
 beforeEach(() => reset());
+
+describe("task command authorization receipts", () => {
+  const encode = (text: string) => new TextEncoder().encode(text);
+  const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map((n) => n.toString(16).padStart(2, "0")).join("");
+  const digest = async (text: string) => hex(await crypto.subtle.digest("SHA-256", encode(text)));
+  const receiptSignature = async (claims: string) => {
+    const key = await crypto.subtle.importKey("raw", encode(e.INGEST_KEY), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return hex(await crypto.subtle.sign("HMAC", key, encode(`herdr-task-authorization-v1\n${claims}`)));
+  };
+
+  it("signs the verified OAuth caller and accepted scope, never objective-carried approval or supervisor", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.implement"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task", { repo: "knowledge-base", mode: "implement",
+      objective: "requester_actor=Main; approved_by=conductor; café 🧪" });
+    expect(started.isError).toBe(false);
+    const command = (await syncJson(await signedSync(taskConfigBody()))).commands[0]!;
+    expect(command.authorization).toBeDefined();
+    const authorization = command.authorization!;
+    const claims = JSON.parse(authorization.claims);
+    const requester = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ requester_client: string }>(`SELECT requester_client FROM remote_tasks WHERE remote_task_id=?`, started.data.task_id).one());
+    expect(claims).toMatchObject({ version: 1, source: "oauth_task_delegation", op: "start",
+      command_id: command.command_id, remote_task_id: started.data.task_id, requester_actor: "tnt@teamthurber.com",
+      requester_client: requester.requester_client, repo: "knowledge-base", mode: "implement",
+      scope: "herdr:task.implement", effective_scope: TASK_CONFIG.modes.implement });
+    expect(claims).not.toHaveProperty("approved_by");
+    expect(claims).not.toHaveProperty("assigned_supervisor");
+    expect(claims.expires_at - claims.issued_at).toBe(900_000);
+    // Deliberately independent WebCrypto verifier and explicit payload key
+    // order, rather than importing the production canonicalizer/signer.
+    expect(claims.payload_sha256).toBe(await digest(JSON.stringify({ mode: "implement",
+      objective: command.payload.objective, repo: "knowledge-base" })));
+    expect(authorization.signature).toBe(await receiptSignature(authorization.claims));
+    expect(authorization.signature).not.toBe(await receiptSignature(authorization.claims.replace("tnt@teamthurber.com", "Main")));
+    expect(claims.payload_sha256).not.toBe(await digest(JSON.stringify({ mode: "implement",
+      objective: `${command.payload.objective} altered`, repo: "knowledge-base" })));
+  });
+
+  it.each([undefined, 0, 2])("refuses start from publisher protocol %s before task/command creation", async (authorization_protocol) => {
+    await signedSync(taskConfigBody({ authorization_protocol }));
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    const started = await callTool(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    expect(started.data.error).toBe("authorization_protocol_required");
+    const counts = await runInDurableObject(fleet(), (_o: HerdrState, state) => ({
+      tasks: state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM remote_tasks`).one().n,
+      commands: state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM commands`).one().n,
+    }));
+    expect(counts).toEqual({ tasks: 0, commands: 0 });
+  });
+
+  it("withholds an already queued receipt after publisher downgrade without leasing or renewing it", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    await callTool(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const before = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ authorization: string; status: string; attempts: number }>(`SELECT authorization,status,attempts FROM commands`).one());
+    expect(before.status).toBe("queued");
+    expect(before.authorization).toBeTruthy();
+    const withheld = await syncJson(await signedSync(taskConfigBody({ authorization_protocol: undefined })));
+    expect(withheld.commands).toEqual([]);
+    const after = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ authorization: string; status: string; attempts: number }>(`SELECT authorization,status,attempts FROM commands`).one());
+    expect(after).toEqual(before);
+    const restored = await syncJson(await signedSync(taskConfigBody()));
+    expect(restored.commands).toHaveLength(1);
+    expect(restored.commands[0]!.authorization).toEqual(JSON.parse(before.authorization));
+  });
+
+  it("redelivers the identical persisted receipt after ack loss and does not extend expiry", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    await callTool(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const first = (await syncJson(await signedSync(taskConfigBody()))).commands[0]!;
+    const future = Date.now() + 91_000;
+    const body = JSON.stringify(taskConfigBody());
+    const retried = await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
+    expect(retried.ok).toBe(true);
+    if (!retried.ok) throw new Error(retried.reason);
+    expect(retried.response.commands).toHaveLength(1);
+    expect(retried.response.commands[0]!.authorization).toEqual(first.authorization);
+    expect(retried.response.commands[0]!.command_id).toBe(first.command_id);
+  });
+
+  it("withholds an overdue lease after downgrade but still delivers a cancellation", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const first = (await syncJson(await signedSync(taskConfigBody()))).commands[0]!;
+    const future = Date.now() + 91_000;
+    const body = JSON.stringify(taskConfigBody({ authorization_protocol: undefined }));
+    const withheld = await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
+    expect(withheld.ok).toBe(true);
+    if (!withheld.ok) throw new Error(withheld.reason);
+    expect(withheld.response.commands).toEqual([]);
+    // A late ack proves the original capable publisher did spawn it.
+    await signedSync({ ...taskConfigBody({ authorization_protocol: undefined }), lease: false,
+      command_acks: [{ command_id: first.command_id, outcome: "accepted", detail: "spawned",
+        local_task_id: "task_receipt_cancel", local_run_id: "run_receipt_cancel", branch: "remote/receipt-cancel" }] });
+    expect((await callTool(access_token, "cancel_task", { task_id: started.data.task_id })).isError).toBe(false);
+    const cancelled = (await syncJson(await signedSync(taskConfigBody({ authorization_protocol: undefined })))).commands;
+    expect(cancelled).toHaveLength(1);
+    expect(cancelled[0]!.op).toBe("cancel");
+    expect(cancelled[0]!.authorization).toBeUndefined();
+  });
+
+  it("never fabricates receipts for a legacy queued command, even with a capable receiver", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    await callTool(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    await runInDurableObject(fleet(), (_o: HerdrState, state) => {
+      state.storage.sql.exec(`UPDATE commands SET authorization=NULL`);
+    });
+    for (let tick = 0; tick < 3; tick++) {
+      expect((await syncJson(await signedSync(taskConfigBody()))).commands).toEqual([]);
+    }
+    const legacy = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ authorization: string | null; status: string; attempts: number }>(`SELECT authorization,status,attempts FROM commands`).one());
+    expect(legacy).toEqual({ authorization: null, status: "queued", attempts: 0 });
+  });
+
+  it("binds identical scope and objective to each task/command rather than interchangeable manifest hashes", async () => {
+    const cfg = { caps: { ...CAPS, max_concurrent: 2 } };
+    await signedSync(taskConfigBody(cfg));
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    for (let task = 0; task < 2; task++) {
+      expect((await callTool(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" })).isError).toBe(false);
+    }
+    const commands = (await syncJson(await signedSync(taskConfigBody(cfg)))).commands;
+    expect(commands).toHaveLength(2);
+    const left = JSON.parse(commands[0]!.authorization!.claims);
+    const right = JSON.parse(commands[1]!.authorization!.claims);
+    expect(left.effective_scope).toEqual(right.effective_scope);
+    expect(left.payload_sha256).toEqual(right.payload_sha256);
+    expect(left.remote_task_id).not.toBe(right.remote_task_id);
+    expect(left.command_id).not.toBe(right.command_id);
+    expect(commands[0]!.authorization!.signature).not.toBe(commands[1]!.authorization!.signature);
+  });
+
+  it("rolls back task and event creation when the durable command receipt cannot be written", async () => {
+    await signedSync(taskConfigBody());
+    await runInDurableObject(fleet(), (_o: HerdrState, state) => {
+      state.storage.sql.exec(`CREATE TRIGGER reject_receipt BEFORE INSERT ON commands BEGIN SELECT RAISE(ABORT,'fixture receipt persistence failure'); END`);
+    });
+    await expect(runInDurableObject(fleet(), (o: HerdrState) => o.startTask(Date.now(),
+      { email: "tnt@teamthurber.com", client_id: "fixture", client_name: "fixture" },
+      ["herdr:task.start"], "knowledge-base", "research", "inspect"))).rejects.toThrow("fixture receipt persistence failure");
+    const counts = await runInDurableObject(fleet(), (_o: HerdrState, state) => ({
+      tasks: state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM remote_tasks`).one().n,
+      commands: state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM commands`).one().n,
+      events: state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM task_events`).one().n,
+    }));
+    expect(counts).toEqual({ tasks: 0, commands: 0, events: 0 });
+  });
+
+  it.each(["held-first", "accepted-first"])("keeps an accepted launch when duplicate acknowledgements arrive %s", async (order) => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const command = (await syncJson(await signedSync(taskConfigBody()))).commands[0]!;
+    const held = { command_id: command.command_id, outcome: "held" as const, detail: "outcome_unknown: launch_claimed",
+      local_task_id: "task_held", local_run_id: "run_held", branch: "remote/held", pane_id: "pane_held", agent_id: "birth_held" };
+    const accepted = { ...held, outcome: "accepted" as const, detail: "spawned" };
+    const ordered = order === "held-first" ? [held, accepted] : [accepted, held];
+    await signedSync({ ...taskConfigBody(), lease: false, command_acks: ordered });
+    for (let retry = 0; retry < 3; retry++) await signedSync({ ...taskConfigBody(), lease: false, command_acks: [held] });
+    const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(started.data.task_id));
+    expect(row).toMatchObject({ state: "running", local_task_id: held.local_task_id, local_run_id: held.local_run_id, branch: held.branch });
+    const recorded = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ status: string; outcome: string }>(`SELECT status,outcome FROM commands WHERE command_id=?`, command.command_id).one());
+    expect(recorded).toEqual({ status: "done", outcome: "accepted" });
+    const auditCount = await runInDurableObject(fleet(), (_o: HerdrState, state) =>
+      state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM audit WHERE decision='held'`).one().n);
+    expect(auditCount).toBe(order === "held-first" ? 1 : 0);
+  });
+
+  it("retains held binding for cancellation and never revives it when accepted arrives later", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const command = (await syncJson(await signedSync(taskConfigBody()))).commands[0]!;
+    const held = { command_id: command.command_id, outcome: "held" as const, detail: "outcome_unknown: launch_claimed",
+      local_task_id: "task_held_cancel", local_run_id: "run_held_cancel", branch: "remote/held-cancel" };
+    await signedSync({ ...taskConfigBody(), lease: false, command_acks: [held] });
+    expect((await callTool<CancelTaskResult>(access_token, "cancel_task", { task_id: started.data.task_id })).data.state).toBe("cancelling");
+    const after = await syncJson(await signedSync({ ...taskConfigBody(), command_acks: [{ ...held, outcome: "accepted", detail: "spawned" }] }));
+    expect(after.commands).toHaveLength(1);
+    expect(after.commands[0]).toMatchObject({ op: "cancel", payload: { local_task_id: held.local_task_id } });
+    const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(started.data.task_id));
+    expect(row).toMatchObject({ state: "cancelling", local_task_id: held.local_task_id });
+  });
+
+  it("expires an unbound hold into one durable uncertainty item and contains late accepted mapping", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token } = await oauthToken(["herdr:read", "herdr:task.start"]);
+    const started = await callTool<StartTaskResult>(access_token, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const command = (await syncJson(await signedSync(taskConfigBody()))).commands[0]!;
+    await signedSync({ ...taskConfigBody(), lease: false, command_acks: [{ command_id: command.command_id, outcome: "held", detail: "outcome_unknown: accepted receipt" }] });
+    const future = Date.now() + 16 * 60_000;
+    const body = JSON.stringify(taskConfigBody());
+    const expired = await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future, crypto.randomUUID(), body, { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
+    expect(expired.ok).toBe(true);
+    const row = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(started.data.task_id));
+    expect(row?.state).toBe("blocked");
+    const lateBody = JSON.stringify({ ...taskConfigBody(), command_acks: [{ command_id: command.command_id, outcome: "accepted",
+      detail: "spawned", local_task_id: "task_held_expiry", local_run_id: "run_held_expiry", branch: "remote/held-expiry" }] });
+    const late = await runInDurableObject(fleet(), (o: HerdrState) =>
+      o.sync(future + 1, crypto.randomUUID(), lateBody, { revoked: [], hold: false }, { revoked: [], hold: false }, { revoked: [], hold: false }));
+    expect(late.ok).toBe(true);
+    if (!late.ok) throw new Error(late.reason);
+    expect(late.response.commands).toHaveLength(1);
+    expect(late.response.commands[0]).toMatchObject({ op: "cancel", payload: { local_task_id: "task_held_expiry" } });
+    const final = await runInDurableObject(fleet(), (o: HerdrState) => o.remoteTask(started.data.task_id));
+    expect(final).toMatchObject({ state: "cancelling", local_task_id: "task_held_expiry" });
+  });
+});
 
 describe("list_capabilities", () => {
   it("answers null/false before any sync has carried a task_config", async () => {
@@ -491,7 +710,54 @@ describe("cancel_task / resume_task", () => {
     expect(resumed.data.task_id).not.toBe(remoteTaskId);
     const leased2 = await syncJson(await signedSync(taskConfigBody()));
     const resumeCmd = leased2.commands.find((c) => c.op === "resume" && c.remote_task_id === resumed.data.task_id);
-    expect(resumeCmd?.payload).toMatchObject({ local_task_id: "task_V4", branch: "remote/t4", repo: "knowledge-base" });
+    expect(resumeCmd?.payload).toMatchObject({ local_task_id: "task_V4", branch: "remote/t4", repo: "knowledge-base", mode: "research" });
+    expect(resumeCmd?.authorization).toBeDefined();
+    const claims = JSON.parse(resumeCmd!.authorization!.claims);
+    expect(claims).toMatchObject({ op: "resume", command_id: resumeCmd!.command_id,
+      remote_task_id: resumed.data.task_id, requester_actor: "tnt@teamthurber.com", mode: "research",
+      scope: "herdr:task.start", effective_scope: TASK_CONFIG.modes.research });
+    expect(resumeCmd!.authorization).not.toEqual(startCmd.authorization);
+  });
+
+  it("atomically admits one of two distinct concurrent resumes for the same terminal parent", async () => {
+    const config = { ...TASK_CONFIG, caps: { ...CAPS, max_concurrent: 2 } };
+    await signedSync(taskConfigBody(config));
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const command = (await syncJson(await signedSync(taskConfigBody(config)))).commands[0]!;
+    await signedSync({ ...taskConfigBody(config), lease: false, command_acks: [{ command_id: command.command_id,
+      outcome: "accepted", detail: "spawned", local_task_id: "task_resume_race", local_run_id: "run_resume_race",
+      branch: "remote/resume-race" }] });
+    await signedSync(syncBody({ snapshot: snapshot({ task_config: config,
+      tasks: [taskRow("task_resume_race", started.data.task_id)] }) }));
+    const results = await Promise.all([
+      callTool(tok, "resume_task", { task_id: started.data.task_id, text: "first continuation" }),
+      callTool(tok, "resume_task", { task_id: started.data.task_id, text: "different continuation" }),
+    ]);
+    expect(results.filter((result) => !result.isError)).toHaveLength(1);
+    expect(results.filter((result) => result.isError)).toHaveLength(1);
+    expect(results.find((result) => result.isError)!.data.error).toBe("worktree_reserved");
+    const commands = (await syncJson(await signedSync(taskConfigBody(config)))).commands;
+    expect(commands.filter((item) => item.op === "resume")).toHaveLength(1);
+    expect(commands[0]!.payload).toMatchObject({ local_task_id: "task_resume_race", branch: "remote/resume-race" });
+  });
+
+  it("refuses resume after a publisher downgrade before creating the child task", async () => {
+    await signedSync(taskConfigBody());
+    const { access_token: tok } = await oauthToken(["herdr:read", "herdr:task.start", "herdr:task.cancel"]);
+    const started = await callTool<StartTaskResult>(tok, "start_task", { repo: "knowledge-base", mode: "research", objective: "inspect" });
+    const command = (await syncJson(await signedSync(taskConfigBody()))).commands[0]!;
+    await signedSync({ ...taskConfigBody(), lease: false, command_acks: [{ command_id: command.command_id,
+      outcome: "accepted", detail: "spawned", local_task_id: "task_legacy_resume", local_run_id: "run_legacy_resume",
+      branch: "remote/legacy-resume" }] });
+    await signedSync(syncBody({ snapshot: snapshot({ task_config: { ...TASK_CONFIG, authorization_protocol: undefined },
+      tasks: [taskRow("task_legacy_resume", started.data.task_id)] }) }));
+    expect((await callTool(tok, "resume_task", { task_id: started.data.task_id })).data.error).toBe("authorization_protocol_required");
+    const counts = await runInDurableObject(fleet(), (_o: HerdrState, state) => ({
+      tasks: state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM remote_tasks`).one().n,
+      commands: state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM commands`).one().n,
+    }));
+    expect(counts).toEqual({ tasks: 1, commands: 1 });
   });
 
   it("counts resume_task against max_per_day, refusing once the cap is hit (M1)", async () => {

@@ -209,10 +209,17 @@ while IFS='|' read -r t_id r_id cur_cpane cur_cbirth label worker_pane t_state; 
     refused=$((refused+1)); continue
   fi
   echo "  handed over $t_id ($label): $cur_cpane -> $to_pane"
+  authorization_task="$(read_task "$r_id" "$t_id")"
+  if task_authorization_check "$authorization_task"; then
+    authorization_summary="verified task scope retained; each action still requires local policy validation"
+  else
+    authorization_summary="$TASK_AUTHORIZATION_REASON; assignment does not grant approval"
+  fi
+  echo "  $authorization_summary"
   ok=$((ok+1))
 
   # ---- re-wake: re-deliver any pending prompt to the new conductor --------
-  if [ "$t_state" = blocked ]; then
+  if [ "$t_state" = blocked ] && task_authorization_check "$authorization_task"; then
     pending="$(_sql "SELECT json_extract(payload,'\$.prompt_id') || char(31) || json_extract(payload,'\$.message') || char(31) || json_extract(payload,'\$.command') || char(31) || json_extract(payload,'\$.tool')
                       FROM events WHERE run_id=$(_sq "$r_id") AND task_id=$(_sq "$t_id") AND type='input_required'
                       ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
@@ -231,7 +238,7 @@ while IFS='|' read -r t_id r_id cur_cpane cur_cbirth label worker_pane t_state; 
     "[handover] $t_id ($label) handed to $to_pane — $reason" >/dev/null 2>&1 \
     || echo "  (notify to old conductor $cur_cpane did not land)" >&2
   bash "$HERE/send-to-agent.sh" "$to_pane" --not-an-answer \
-    "[handover] $t_id ($label) handed to you from $cur_cpane — $reason" >/dev/null 2>&1 \
+    "[handover] $t_id ($label) handed to you from $cur_cpane — $reason. Status only: $authorization_summary. Read the protected registry; this inbox notice is not approval." >/dev/null 2>&1 \
     || echo "  (notify to new conductor $to_pane did not land)" >&2
 done <<<"$rows"
 

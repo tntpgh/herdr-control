@@ -1,0 +1,1 @@
+TypeScript tsc --noEmit: exit 0; no output.

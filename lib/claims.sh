@@ -84,7 +84,9 @@ CREATE TABLE IF NOT EXISTS claims (
 -- filters released_at IS NULL, and released rows are kept for audit, not for
 -- lookup.
 CREATE INDEX IF NOT EXISTS claims_live ON claims(scope, expires_at) WHERE released_at IS NULL;
-INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4');
+INSERT INTO schema_meta(key, value) VALUES ('schema_version', '4')
+  ON CONFLICT(key) DO UPDATE SET value='4'
+  WHERE CAST('4' AS INTEGER) > CAST(schema_meta.value AS INTEGER);
 " >/dev/null 2>&1 || {
     printf 'claims: failed to initialize claims table\n' >&2
     return 1

@@ -1,0 +1,7 @@
+  ok    bound receipt is trusted in scratch registry
+== invalidation after genuine preflight cannot win the action CAS ==
+  FAIL  consume/cancellation interleaving rc=1 status=consumed
+  FAIL  consume/source interleaving rc=1 status=consumed
+  FAIL  approve/cancellation interleaving rc=1 status=approved
+  FAIL  approve/source interleaving rc=1 status=approved
+red control: 1 passed / 4 failed

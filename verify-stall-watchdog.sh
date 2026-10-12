@@ -536,6 +536,19 @@ cands = hub.stall_watchdog_candidates(
     [t5b], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
     denied={"t1": {"epoch": NOW - THRESH - 5, "fingerprint": "appr_1"}})
 results["denied_silent_once_worker_resumed"] = cands == []
+# item 4 (SPEC.md, dot-herdr-recovery-slices.md §2): `blocked` is the state
+# the occurrence model now sets while a prompt sits unresolved -- signals
+# 3/4 must not silently exclude it the way `state == "stalled"` alone did.
+t5c = base_task(state="blocked")
+cands = hub.stall_watchdog_candidates(
+    [t5c], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    denied={"t1": {"epoch": NOW - THRESH - 5, "fingerprint": "appr_1"}})
+results["item4_denied_fires_when_blocked"] = any(c["signal"] == "denied" for c in cands)
+t5d = base_task(state="blocked")
+cands = hub.stall_watchdog_candidates(
+    [t5d], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    delivered={"t1": {"epoch": NOW - THRESH - 5, "fingerprint": "42"}})
+results["item4_unprocessed_fires_when_blocked"] = any(c["signal"] == "unprocessed" for c in cands)
 
 # ---- signal 4: unprocessed ---------------------------------------------------
 t6 = base_task(state="stalled")
@@ -598,6 +611,45 @@ cands = hub.stall_watchdog_candidates(
     [t7], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
     pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: None, occurrence_fn=NEW_OCC)
 results["Mb_conductor_prompt_silent_when_birth_cannot_be_confirmed"] = cands == []
+
+# item 4: signal 5 (conductor_prompt) must also see a `blocked` task with a
+# live, birth-matched pane and a real request on screen -- previously
+# `state in IDLE_STATES` excluded `blocked` entirely, so an approval-pending
+# worker was invisible to the one signal built exactly for this.
+t7_blocked = base_task(state="blocked", stored_state="blocked", pane_id="p1", pane_birth="pb1",
+                       updated_at="2026-01-01T00:00:00Z")
+cands = hub.stall_watchdog_candidates(
+    [t7_blocked], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1", occurrence_fn=NEW_OCC)
+results["item4_conductor_prompt_fires_when_blocked"] = any(
+    c["signal"] == "conductor_prompt" for c in cands)
+
+# item 4: "suppress duplicate legacy handling for occurrences that own
+# attention" -- when signal 5 already fires for a blocked task this tick,
+# the coarser denied/unprocessed signals must not ALSO mint a candidate for
+# the SAME task, even though their own conditions are independently met.
+cands = hub.stall_watchdog_candidates(
+    [t7_blocked], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    pane_read_fn=lambda pane: CHROME, pane_birth_fn=lambda pane: "pb1", occurrence_fn=NEW_OCC,
+    denied={"t1": {"epoch": NOW - THRESH - 5, "fingerprint": "appr_1"}},
+    delivered={"t1": {"epoch": NOW - THRESH - 5, "fingerprint": "42"}})
+signals_seen = {c["signal"] for c in cands}
+results["item4_conductor_prompt_still_fires_alongside_legacy_evidence"] = "conductor_prompt" in signals_seen
+results["item4_denied_suppressed_once_conductor_prompt_owns_this_task"] = "denied" not in signals_seen
+results["item4_unprocessed_suppressed_once_conductor_prompt_owns_this_task"] = "unprocessed" not in signals_seen
+results["item4_exactly_one_candidate_for_the_task_this_tick"] = len(cands) == 1
+
+# Without a live conductor_prompt hit (NO occurrence_fn match -- e.g. no
+# live pane read), a blocked task's denied/unprocessed still fire on their
+# own: suppression is scoped to "this tick's signal 5 actually fired",
+# never a blanket "blocked tasks never get the legacy signals".
+cands = hub.stall_watchdog_candidates(
+    [t5c], now=NOW, threshold_s=THRESH, boot_epoch=BOOT,
+    denied={"t1": {"epoch": NOW - THRESH - 5, "fingerprint": "appr_1"}},
+    delivered={"t1": {"epoch": NOW - THRESH - 5, "fingerprint": "42"}})
+signals_seen = {c["signal"] for c in cands}
+results["item4_denied_and_unprocessed_both_fire_when_signal5_has_no_hit"] = (
+    "denied" in signals_seen and "unprocessed" in signals_seen)
 
 # ---- review H1 (r4): the hard-coded 20-row read window drops the exact
 # request this signal exists to catch, in a REAL 46-column omp pane: a

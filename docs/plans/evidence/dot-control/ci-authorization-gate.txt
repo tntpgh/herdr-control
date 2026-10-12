@@ -1,0 +1,529 @@
+LOCAL macOS isolated gate; Ubuntu CI was not run.
+CWD=/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control
++ bash .github/scripts/verify-task-authorization.sh
+
++ python3 remote-mcp/verify-authorization.py 
+test_actor_and_client_require_bounded_text (__main__.AuthorizationVerification.test_actor_and_client_require_bounded_text) ... ok
+test_both_existing_mode_entitlements (__main__.AuthorizationVerification.test_both_existing_mode_entitlements) ... ok
+test_cancel_is_not_a_start_or_resume_delegation (__main__.AuthorizationVerification.test_cancel_is_not_a_start_or_resume_delegation) ... ok
+test_canonical_nested_keys_and_array_order (__main__.AuthorizationVerification.test_canonical_nested_keys_and_array_order) ... ok
+test_claim_tamper_without_resigning (__main__.AuthorizationVerification.test_claim_tamper_without_resigning) ... ok
+test_claims_size_bound (__main__.AuthorizationVerification.test_claims_size_bound) ... ok
+test_command_operation_and_task_substitution (__main__.AuthorizationVerification.test_command_operation_and_task_substitution) ... ok
+test_constructed_object_cannot_claim_verification (__main__.AuthorizationVerification.test_constructed_object_cannot_claim_verification) ... ok
+test_duplicate_nested_scope_key (__main__.AuthorizationVerification.test_duplicate_nested_scope_key) ... ok
+test_duplicate_top_level_json_key (__main__.AuthorizationVerification.test_duplicate_top_level_json_key) ... ok
+test_effective_scope_requires_all_and_only_known_fields (__main__.AuthorizationVerification.test_effective_scope_requires_all_and_only_known_fields) ... ok
+test_every_payload_byte_is_bound (__main__.AuthorizationVerification.test_every_payload_byte_is_bound) ... ok
+test_expired_including_exact_expiry (__main__.AuthorizationVerification.test_expired_including_exact_expiry) ... ok
+test_future_issue_skew_boundary (__main__.AuthorizationVerification.test_future_issue_skew_boundary) ... ok
+test_identical_transport_retry_keeps_same_receipt (__main__.AuthorizationVerification.test_identical_transport_retry_keeps_same_receipt) ... ok
+test_identifier_shape_cannot_be_resigned_into_validity (__main__.AuthorizationVerification.test_identifier_shape_cannot_be_resigned_into_validity) ... ok
+test_invalid_json_payload_fails_as_authorization_error (__main__.AuthorizationVerification.test_invalid_json_payload_fails_as_authorization_error) ... ok
+test_local_effective_scope_drift_refuses_even_narrowing (__main__.AuthorizationVerification.test_local_effective_scope_drift_refuses_even_narrowing) ... ok
+test_local_mode_revocation (__main__.AuthorizationVerification.test_local_mode_revocation) ... ok
+test_local_repo_revocation (__main__.AuthorizationVerification.test_local_repo_revocation) ... ok
+test_malformed_envelope (__main__.AuthorizationVerification.test_malformed_envelope) ... ok
+test_malformed_signature (__main__.AuthorizationVerification.test_malformed_signature) ... ok
+test_matching_manifest_cannot_transfer_receipt_to_another_task (__main__.AuthorizationVerification.test_matching_manifest_cannot_transfer_receipt_to_another_task) ... ok
+test_missing_authorization (__main__.AuthorizationVerification.test_missing_authorization) ... ok
+test_missing_or_nonobject_payload (__main__.AuthorizationVerification.test_missing_or_nonobject_payload) ... ok
+test_missing_or_unknown_claim_field (__main__.AuthorizationVerification.test_missing_or_unknown_claim_field) ... ok
+test_mode_entitlement_cannot_be_downgraded_or_laundered (__main__.AuthorizationVerification.test_mode_entitlement_cannot_be_downgraded_or_laundered) ... ok
+test_parsed_claims_are_defensive_copy (__main__.AuthorizationVerification.test_parsed_claims_are_defensive_copy) ... ok
+test_payload_digest_shape_and_binding (__main__.AuthorizationVerification.test_payload_digest_shape_and_binding) ... ok
+test_protocol_and_source_are_exact (__main__.AuthorizationVerification.test_protocol_and_source_are_exact) ... ok
+test_resume_binds_existing_work_mapping (__main__.AuthorizationVerification.test_resume_binds_existing_work_mapping) ... ok
+test_resume_explicit_mode_must_match (__main__.AuthorizationVerification.test_resume_explicit_mode_must_match) ... ok
+test_resume_requires_explicit_signed_payload_mode (__main__.AuthorizationVerification.test_resume_requires_explicit_signed_payload_mode) ... ok
+test_signed_malformed_json (__main__.AuthorizationVerification.test_signed_malformed_json) ... ok
+test_signed_noncanonical_claims (__main__.AuthorizationVerification.test_signed_noncanonical_claims) ... ok
+test_signed_repo_and_mode_must_match_payload (__main__.AuthorizationVerification.test_signed_repo_and_mode_must_match_payload) ... ok
+test_unavailable_or_short_verification_key (__main__.AuthorizationVerification.test_unavailable_or_short_verification_key) ... ok
+test_unicode_cross_language_wire_vector (__main__.AuthorizationVerification.test_unicode_cross_language_wire_vector) ... ok
+test_unrelated_allowlist_metadata_does_not_change_scope (__main__.AuthorizationVerification.test_unrelated_allowlist_metadata_does_not_change_scope) ... ok
+test_validity_window_maximum_and_order (__main__.AuthorizationVerification.test_validity_window_maximum_and_order) ... ok
+test_validity_window_requires_integer_epoch_milliseconds (__main__.AuthorizationVerification.test_validity_window_requires_integer_epoch_milliseconds) ... ok
+test_verified_receipt_rechecks_command_mutation (__main__.AuthorizationVerification.test_verified_receipt_rechecks_command_mutation) ... ok
+test_verified_receipt_rechecks_envelope (__main__.AuthorizationVerification.test_verified_receipt_rechecks_envelope) ... ok
+test_verified_receipt_rechecks_scope_and_expiry (__main__.AuthorizationVerification.test_verified_receipt_rechecks_scope_and_expiry) ... ok
+test_wrong_key (__main__.AuthorizationVerification.test_wrong_key) ... ok
+test_wrong_signature_domain (__main__.AuthorizationVerification.test_wrong_signature_domain) ... ok
+test_cache_does_not_bypass_current_scope_revalidation (__main__.PublisherAdmission.test_cache_does_not_bypass_current_scope_revalidation) ... ok
+test_cache_does_not_bypass_receipt_expiry (__main__.PublisherAdmission.test_cache_does_not_bypass_receipt_expiry) ... ok
+test_cancel_changed_bytes_refuse_without_second_task_effect (__main__.PublisherAdmission.test_cancel_changed_bytes_refuse_without_second_task_effect) ... ok
+test_cancel_identical_retry_uses_bound_cached_ack (__main__.PublisherAdmission.test_cancel_identical_retry_uses_bound_cached_ack) ... ok
+test_cancel_retry_attempt_changes_reuse_ack_without_second_effect (__main__.PublisherAdmission.test_cancel_retry_attempt_changes_reuse_ack_without_second_effect) ... ok
+test_changed_payload_cannot_reuse_populated_delivery_cache (__main__.PublisherAdmission.test_changed_payload_cannot_reuse_populated_delivery_cache) ... ok
+test_forged_receipt_never_reaches_task_processor (__main__.PublisherAdmission.test_forged_receipt_never_reaches_task_processor) ... ok
+test_legacy_accepted_cache_cannot_authorize_unsigned_start (__main__.PublisherAdmission.test_legacy_accepted_cache_cannot_authorize_unsigned_start) ... ok
+test_legacy_cancel_cache_without_fingerprint_refuses (__main__.PublisherAdmission.test_legacy_cancel_cache_without_fingerprint_refuses) ... ok
+test_missing_receipt_never_reaches_task_processor (__main__.PublisherAdmission.test_missing_receipt_never_reaches_task_processor) ... ok
+test_resume_also_requires_receipt_before_task_processor (__main__.PublisherAdmission.test_resume_also_requires_receipt_before_task_processor) ... ok
+test_unavailable_allowlist_fails_closed_before_task_handoff (__main__.PublisherAdmission.test_unavailable_allowlist_fails_closed_before_task_handoff) ... ok
+test_valid_receipt_passes_verified_object (__main__.PublisherAdmission.test_valid_receipt_passes_verified_object) ... ok
+test_valid_resume_passes_verified_object (__main__.PublisherAdmission.test_valid_resume_passes_verified_object) ... ok
+test_valid_retry_still_reaches_protected_registry_handoff (__main__.PublisherAdmission.test_valid_retry_still_reaches_protected_registry_handoff) ... ok
+test_production_typescript_receipt_has_identical_signature_and_bindings (__main__.TypeScriptIssuerVector.test_production_typescript_receipt_has_identical_signature_and_bindings) ... ok
+test_production_typescript_receipt_rejects_changed_objective (__main__.TypeScriptIssuerVector.test_production_typescript_receipt_rejects_changed_objective) ... ok
+test_production_typescript_receipt_rejects_command_and_scope_substitutions (__main__.TypeScriptIssuerVector.test_production_typescript_receipt_rejects_command_and_scope_substitutions) ... ok
+
+----------------------------------------------------------------------
+Ran 64 tests in 0.020s
+
+OK
+
++ python3 verify-task-authorization.py 
+test_accept_retry_conflict_remote_uniqueness (__main__.RegistryAuthorization.test_accept_retry_conflict_remote_uniqueness) ... ok
+test_binding_and_events_roll_back_together (__main__.RegistryAuthorization.test_binding_and_events_roll_back_together) ... ok
+test_concurrent_accept_has_one_new_receipt (__main__.RegistryAuthorization.test_concurrent_accept_has_one_new_receipt) ... ok
+test_concurrent_binding_and_launch_each_have_one_winner (__main__.RegistryAuthorization.test_concurrent_binding_and_launch_each_have_one_winner) ... ok
+test_crash_windows_never_claim_a_second_launch (__main__.RegistryAuthorization.test_crash_windows_never_claim_a_second_launch) ... ok
+test_deadline_bound_before_launch_and_retry_does_not_extend_it (__main__.RegistryAuthorization.test_deadline_bound_before_launch_and_retry_does_not_extend_it) ... ok
+test_delivery_expiry_does_not_expire_running_task (__main__.RegistryAuthorization.test_delivery_expiry_does_not_expire_running_task) ... ok
+test_distinct_concurrent_jobs_cannot_exchange_receipts (__main__.RegistryAuthorization.test_distinct_concurrent_jobs_cannot_exchange_receipts) ... ok
+test_expired_source_cannot_bind_or_launch (__main__.RegistryAuthorization.test_expired_source_cannot_bind_or_launch) ... ok
+test_handover_preserves_source_with_real_competing_processes (__main__.RegistryAuthorization.test_handover_preserves_source_with_real_competing_processes) ... ok
+test_local_source_concurrent_retry_and_changed_actor (__main__.RegistryAuthorization.test_local_source_concurrent_retry_and_changed_actor) ... ok
+test_migration_backup_failure_stops_before_schema_and_stamp (__main__.RegistryAuthorization.test_migration_backup_failure_stops_before_schema_and_stamp) ... ok
+test_migration_preserves_legacy_hold_and_history (__main__.RegistryAuthorization.test_migration_preserves_legacy_hold_and_history) ... ok
+test_migration_schema_failure_keeps_verified_backup_and_rolls_back (__main__.RegistryAuthorization.test_migration_schema_failure_keeps_verified_backup_and_rolls_back) ... ok
+test_parallel_shell_initializers_share_cold_registry (__main__.RegistryAuthorization.test_parallel_shell_initializers_share_cold_registry) ... ok
+test_parallel_v10_migration_creates_one_verified_backup (__main__.RegistryAuthorization.test_parallel_v10_migration_creates_one_verified_backup) ... ok
+test_remote_registration_requires_claimed_reservation (__main__.RegistryAuthorization.test_remote_registration_requires_claimed_reservation) ... ok
+test_remote_source_is_not_main_approval (__main__.RegistryAuthorization.test_remote_source_is_not_main_approval) ... ok
+test_research_manifest_is_exact_and_restrictions_required (__main__.RegistryAuthorization.test_research_manifest_is_exact_and_restrictions_required) ... ok
+test_resume_requires_payload_mode_in_protocol_one (__main__.RegistryAuthorization.test_resume_requires_payload_mode_in_protocol_one) ... ok
+test_retry_ack_checks_binding_and_permits_terminal_history_only (__main__.RegistryAuthorization.test_retry_ack_checks_binding_and_permits_terminal_history_only) ... ok
+test_schema_source_expiry_entitlement_and_changed_command_refused (__main__.RegistryAuthorization.test_schema_source_expiry_entitlement_and_changed_command_refused) ... ok
+test_source_integrity_and_absence_fail_closed (__main__.RegistryAuthorization.test_source_integrity_and_absence_fail_closed) ... ok
+test_task_binding_wrong_pane_manifest_and_mutable_json_refused (__main__.RegistryAuthorization.test_task_binding_wrong_pane_manifest_and_mutable_json_refused) ... ok
+
+----------------------------------------------------------------------
+Ran 24 tests in 20.061s
+
+OK
+
++ python3 verify-action-transaction.py 
+test_action_snapshot_and_route_checked_in_transaction (__main__.ActionTransactionTests.test_action_snapshot_and_route_checked_in_transaction) ... ok
+test_approval_binds_reviewed_request_fields (__main__.ActionTransactionTests.test_approval_binds_reviewed_request_fields) ... ok
+test_approval_rechecks_current_conductor_birth (__main__.ActionTransactionTests.test_approval_rechecks_current_conductor_birth) ... ok
+test_approved_task_action_survives_supervisor_handover (__main__.ActionTransactionTests.test_approved_task_action_survives_supervisor_handover) ... ok
+test_cli_returns_structured_refusal (__main__.ActionTransactionTests.test_cli_returns_structured_refusal) ... ok
+test_competing_consumers_change_and_execute_once (__main__.ActionTransactionTests.test_competing_consumers_change_and_execute_once) ... ok
+test_decline_and_supersede_remain_available_without_source (__main__.ActionTransactionTests.test_decline_and_supersede_remain_available_without_source) ... ok
+test_file_grant_and_decision_commit_together (__main__.ActionTransactionTests.test_file_grant_and_decision_commit_together) ... ok
+test_invalidator_cannot_commit_between_validation_and_approve (__main__.ActionTransactionTests.test_invalidator_cannot_commit_between_validation_and_approve) ... ok
+test_invalidator_cannot_commit_between_validation_and_consume (__main__.ActionTransactionTests.test_invalidator_cannot_commit_between_validation_and_consume) ... ok
+test_receipt_deleted_before_approve_acquires_lock (__main__.ActionTransactionTests.test_receipt_deleted_before_approve_acquires_lock) ... ok
+test_receipt_deleted_before_consume_acquires_lock (__main__.ActionTransactionTests.test_receipt_deleted_before_consume_acquires_lock) ... ok
+test_task_ends_before_approve_acquires_lock (__main__.ActionTransactionTests.test_task_ends_before_approve_acquires_lock) ... ok
+test_task_ends_before_consume_acquires_lock (__main__.ActionTransactionTests.test_task_ends_before_consume_acquires_lock) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 5.478s
+
+OK
+
++ python3 verify-task-reservation.py 
+test_accepted_crash_expiry_cannot_release_or_late_claim (__main__.WorktreeReservations.test_accepted_crash_expiry_cannot_release_or_late_claim) ... ok
+test_active_parent_cannot_be_replaced_even_with_stopped_claim (__main__.WorktreeReservations.test_active_parent_cannot_be_replaced_even_with_stopped_claim) ... ok
+test_bound_cancelled_crash_expiry_cannot_release_or_late_launch (__main__.WorktreeReservations.test_bound_cancelled_crash_expiry_cannot_release_or_late_launch) ... ok
+test_changed_mutation_target_refuses_without_consuming_claim (__main__.WorktreeReservations.test_changed_mutation_target_refuses_without_consuming_claim) ... ok
+test_corrupted_protected_source_cannot_reserve (__main__.WorktreeReservations.test_corrupted_protected_source_cannot_reserve) ... ok
+test_different_branches_cannot_claim_same_worktree (__main__.WorktreeReservations.test_different_branches_cannot_claim_same_worktree) ... ok
+test_existing_active_local_task_blocks_remote_reservation (__main__.WorktreeReservations.test_existing_active_local_task_blocks_remote_reservation) ... ok
+test_identical_reservation_retry_does_not_restore_mutation_permission (__main__.WorktreeReservations.test_identical_reservation_retry_does_not_restore_mutation_permission) ... ok
+test_latest_launched_terminal_child_permits_exactly_one_successor (__main__.WorktreeReservations.test_latest_launched_terminal_child_permits_exactly_one_successor) ... ok
+test_launch_claimed_cancelled_crash_cannot_release_or_launch_again (__main__.WorktreeReservations.test_launch_claimed_cancelled_crash_cannot_release_or_launch_again) ... ok
+test_local_source_does_not_enter_remote_reservation_path (__main__.WorktreeReservations.test_local_source_does_not_enter_remote_reservation_path) ... ok
+test_missing_reservation_cannot_register_or_validate (__main__.WorktreeReservations.test_missing_reservation_cannot_register_or_validate) ... ok
+test_missing_source_receipt_refuses_reservation (__main__.WorktreeReservations.test_missing_source_receipt_refuses_reservation) ... ok
+test_mutation_claim_is_required_and_consumed_once (__main__.WorktreeReservations.test_mutation_claim_is_required_and_consumed_once) ... ok
+test_new_start_cannot_replace_existing_reservation (__main__.WorktreeReservations.test_new_start_cannot_replace_existing_reservation) ... ok
+test_nonremote_guard_refuses_existing_remote_reservation (__main__.WorktreeReservations.test_nonremote_guard_refuses_existing_remote_reservation) ... ok
+test_path_parent_segments_cannot_create_another_owner (__main__.WorktreeReservations.test_path_parent_segments_cannot_create_another_owner) ... ok
+test_reservation_validator_rejects_changed_path_or_branch (__main__.WorktreeReservations.test_reservation_validator_rejects_changed_path_or_branch) ... ok
+test_resume_requires_launched_terminal_parent_and_exact_attestation (__main__.WorktreeReservations.test_resume_requires_launched_terminal_parent_and_exact_attestation) ... ok
+test_start_branch_must_match_remote_task_suffix (__main__.WorktreeReservations.test_start_branch_must_match_remote_task_suffix) ... ok
+test_start_reserves_exact_canonical_repo_worktree_branch (__main__.WorktreeReservations.test_start_reserves_exact_canonical_repo_worktree_branch) ... ok
+test_substituted_payload_cannot_reserve_an_accepted_receipt (__main__.WorktreeReservations.test_substituted_payload_cannot_reserve_an_accepted_receipt) ... ok
+test_symlink_aliases_cannot_create_another_owner (__main__.WorktreeReservations.test_symlink_aliases_cannot_create_another_owner) ... ok
+test_two_distinct_signed_resumes_have_one_mutating_consumer (__main__.WorktreeReservations.test_two_distinct_signed_resumes_have_one_mutating_consumer) ... ok
+test_unrelated_legacy_empty_paths_do_not_block_new_worktree (__main__.WorktreeReservations.test_unrelated_legacy_empty_paths_do_not_block_new_worktree) ... ok
+
+----------------------------------------------------------------------
+Ran 25 tests in 0.150s
+
+OK
+
++ bash verify-run-registry.sh 
+== init + register ==
+  ok    database created at /var/folders/c5/tt3qy2k11r3gjm1358g7d9xm0000gn/T//herdr-authorization-ci.zU0eak/tmp/tmp.oO128DoX9u/runs/registry.sqlite3
+  ok    journal_mode is WAL
+  ok    task readable
+  ok    state starts starting
+  ok    pane_birth recorded
+== duplicate task_id must FAIL, not silently overwrite ==
+  ok    duplicate task_id refused
+  ok    original registration intact
+== task_for_pane reverse lookup ==
+  ok    task_for_pane finds it
+  ok    unknown pane -> empty
+== SQL injection via a task label (spawn-task.sh shipped this class once) ==
+  ok    tasks table survived
+  ok    label stored verbatim
+== lifecycle transitions ==
+  ok    now running
+== closure-reason gate on completed (project-contract-plan item 1) ==
+  ok    completed with no closure reason refused
+  ok    state unchanged after refusal
+  ok    no state_changed(completed) event written
+  ok    completed with a garbage closure reason refused
+  ok    shipped with no proof refused
+  ok    shipped with a malformed proof refused
+  ok    state still unchanged after every refusal
+  ok    handed_off_to closes without proof
+== shipped WITH a valid proof: accepted, event carries both ==
+  ok    now completed
+  ok    event carries the reason
+  ok    event carries the proof
+  ok    idempotent re-assert of an already-completed task needs no reason
+== _valid_proof_ref: a PROOF.md reference is checked against the REAL file ==
+  ok    an empty real PROOF.md is refused
+  ok    a non-empty real PROOF.md is accepted
+  ok    no worktree on record falls back to the name-shape check
+  ok    a worktree that doesn't exist on disk is refused (no PROOF.md to check)
+== proof shape: a PROOF.md section reference is checked via set_task_state's own worktree lookup ==
+  ok    shipped refused: the task's real PROOF.md exists but is empty
+  ok    state unchanged by the refusal
+  ok    PROOF.md-referencing proof accepted once the file actually holds something
+== a GitHub PR proof must name a MERGED PR and its merge commit (notepad item vi) ==
+  ok    head sha on an OPEN PR refused
+  ok    why names the open state
+  ok    upper-case host and /files sub-path still go through the PR check
+  ok    a PR claim that also names PROOF.md is still checked as a PR claim
+  ok    short merge sha on a MERGED PR accepted
+  ok    full merge sha accepted, case-insensitively
+  ok    a non-merge sha on a MERGED PR refused
+  ok    a CLOSED-unmerged PR refused
+  ok    a github pull URL that does not parse is refused, not shape-checked
+  ok    refused as a PR claim: https://github.com/tntpgh/herdr-control/issues/154
+  ok    refused as a PR claim: https://api.github.com/repos/tntpgh/herdr-control/issues/154
+  ok    refused as a PR claim: https://%67ithub.com/tntpgh/herdr-control/pull/154
+  ok    refused as a PR claim: https://github.com/tntpgh/herdr-control/%70ull/154
+  ok    refused as a PR claim: https://github.com\tntpgh\herdr-control\pull\154
+  ok    refused as a PR claim: https://github.com/tntpgh/herdr-control/pu	ll/154
+  ok    refused as a PR claim: https://ｇithub.com/tntpgh/herdr-control/pull/154
+  ok    refused as a PR claim: https://github。com/tntpgh/herdr-control/pull/154
+  ok    refused as a PR claim: https://github.com/tntpgh/herdr-control/pull/153/../154
+  ok    refused as a PR claim: https://github.com/tntpgh/herdr-control/pull/153/%2e%2e/154
+  ok    refused as a PR claim: https://github.com/tntpgh/herdr-control/pull/153#
+https://github.com/tntpgh/herdr-control/pull/154
+  ok    refused as a PR claim: https:ｇithub.com/tntpgh/herdr-control/pull/154?u=https://x
+  ok    refused as a PR claim: https://ｇithub.com/tntpgh/herdr-control/pull/154
+  ok    refused as a PR claim: https:///ｇithub.com/tntpgh/herdr-control/pull/154
+  ok    non-PR URL keeps the shape check: https://github.com/tntpgh/herdr-control/commit/eb55756
+  ok    non-PR URL keeps the shape check: https://github.com/tntpgh/herdr-control/blob/main/docs/a%20b.md
+  ok    non-PR URL keeps the shape check: https://github.com/tntpgh/herdr-control/tree/fix%2Fshipped
+  ok    non-PR URL keeps the shape check: https://codeberg.org/o/r/pulls/3
+  ok    non-PR URL keeps the shape check: https://xn--bcher-kva.example/release/1
+  ok    PROOF.md ref with a colon + non-ASCII text is not read as a URL host: PROOF.md:§2
+  ok    PROOF.md ref with a colon + non-ASCII text is not read as a URL host: PROOF.md:“Shipped”
+  ok    PROOF.md ref with a colon + non-ASCII text is not read as a URL host: section:—.handoffs/PROOF.md
+  ok    an overlong first word is refused before decoding
+  ok    a '..' inside a segment (PR commit-range view) is not a dot-segment
+  ok    gh failing -> PR proof not accepted
+  ok    why says the check could not run
+  ok    PROOF.md reference unchanged (never asks gh)
+  ok    non-GitHub URL proof unchanged (shape check only)
+  ok    gh absent from PATH -> PR proof not accepted
+  ok    set_task_state refuses shipped for an OPEN PR's head sha
+  ok    state unchanged by the refusal
+  ok    refusal names why
+  ok    merged PR + merge sha completes the task
+  ok    illegal completed -> running refused
+  ok    state unchanged after refusal
+  ok    idempotent same-state re-assert allowed
+== set_task_state compare-and-swap under CONCURRENT racing sweeps ==
+  ok    final state is blocked, not stuck mid-race
+  ok    exactly ONE state_changed event, not 15 duplicates
+== set_task_agent_session: best-effort capture, never overwrites once set ==
+  ok    starts empty
+  ok    captured
+  ok    does not clobber an already-recorded session
+  ok    empty value is a no-op, not a blank overwrite
+== rebaseline_pane_birth: corrects identity WITHOUT touching state or the state machine ==
+  ok    pane_birth updated
+  ok    state untouched by a rebaseline
+  ok    pane_birth_rebaselined event logged
+  ok    re-rebaselining to the SAME value logs no extra event
+  ok    rebaseline_pane_birth refuses a nonexistent task
+== schema v3/v4: agent_session and branch/trunk columns present after migration ==
+  ok    agent_session column exists
+  ok    branch column exists (#3b ownership grant)
+  ok    trunk column exists (#3b ownership grant)
+  ok    schema_version is 11 (source authorization receipts remain separate from legacy task rows)
+  ok    project column exists (project-contract-plan.md #2)
+  ok    manifest column exists (task-scoped approval)
+== event dedup on an explicit event_id (at-least-once retry safety) ==
+  ok    3 identical appends -> 1 row
+== monotonic sequence under CONCURRENT writers (the count-then-append bug) ==
+  ok    all 20 concurrent events landed
+  ok    every sequence is unique
+== all_tasks_json ==
+  ok    one line per task
+  ok    every row parses as JSON
+== checkpoints ==
+  ok    absent checkpoint -> {}
+  ok    checkpoint round-trips
+  ok    checkpoint_age_s fresh (0 s)
+  ok    never-written checkpoint reads as ancient
+  ok    invalid checkpoint json coerced to {}
+== event-stream cursor (the half the file layout could not do) ==
+  ok    events_since returns a backlog (40 events)
+  ok    cursor consumed the backlog
+  ok    new event appears past the cursor
+  ok    not advancing replays
+== events_since carries task ownership (join, not a second query per event) ==
+  ok    event rows carry task_conductor_id/label/repo for ownership scoping
+== deferred ack: clock and acknowledgment are separate facts ==
+  ok    ack committed task_states
+  ok    ack committed cursor
+  ok    clock touch preserves the cursor
+  ok    clock touch preserves task_states
+  ok    throttle clock fresh after touch (0 s)
+  ok    stale ack cannot move the cursor backward
+  ok    task_states follow delivery order (last writer)
+  ok    non-numeric sequence refused
+== task_for_worktree: completion evidence outlives the pane ==
+  ok    found by worktree path
+  ok    unknown worktree is empty, not an error
+== approval lifecycle: decided / attempted / confirmed are DISTINCT ==
+  ok    decided_at recorded
+  ok    attempted_at still empty (decision != delivery)
+  ok    confirmed_at still empty
+  ok    attempted_at recorded
+  ok    confirmed still empty after attempt
+  ok    outcome recorded
+  ok    confirmed_at recorded
+  ok    policy verdict retained
+== prune only touches OLD terminal tasks ==
+  ok    old terminal task pruned
+  ok    recent completed task KEPT
+  ok    non-terminal task KEPT
+  ok    prune rejects a non-integer day count
+== #3b ownership grant: branch/trunk stored and read back; empty by default ==
+  ok    task1 has no grant (11-arg caller)
+  ok    branch recorded
+  ok    trunk recorded
+== task_for_pane breaks an updated_at TIE deterministically (rowid, not scan order) ==
+  ok    the LATER-registered task wins a tie, not scan order
+== legacy file import ==
+  ok    legacy tasks, events and checkpoints imported once, non-destructively
+
+-----
+passed=134 failed=0
+PASS
+
++ bash verify-task-authorization-gates.sh 
+== legacy source: every command shape stays held ==
+  ok    unverified source held: git add result.txt
+  ok    unverified source held: git commit -m fixture
+  ok    unverified source held: git add result.txt && git status && git commit -m fixture
+  ok    unverified source held: cd "/private/tmp/herdr-auth-gates.ek3ARu/wt" && git add result.txt && git status && git commit -m fixture
+  ok    caller JSON cannot forge verification
+== stable hook hold: no repeated requests or grant consumption ==
+  ok    hook attempt 1 held without a request
+  ok    hook attempt 2 held without a request
+  ok    hook attempt 3 held without a request
+  ok    three retries created zero action requests
+  ok    four concurrent enforcing hooks report provenance hold with zero requests
+  ok    decision gate leaves unverified request pending
+  ok    pre-existing approval cannot consume through an unverified source
+  ok    ack-loss reissue retains same grant and holds
+  ok    explicit decline is preserved under provenance failure
+  ok    pending surface 1 reports held
+  ok    pending surface 2 reports held
+  ok    restart/tick retries record one hold and zero notifications/forms
+== trusted receipt: existing grants stay usable within scope ==
+  ok    bound receipt is trusted in scratch registry
+  ok    trusted simple own-branch operation uses existing ownership grant
+  ok    compound command cannot use the simple-command ownership recognizer
+== authority machinery cannot be executed or overwritten by a worker ==
+  ok    authority machinery is human-reserved: python3 /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/task-authorization.py
+  ok    authority machinery is human-reserved: printf x > /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/task-authorization.py
+  ok    ordinary source inspection stays allowed: lib/task-authorization.py
+  ok    authority machinery is human-reserved: python3 /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/task-reservation.py
+  ok    authority machinery is human-reserved: printf x > /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/lib/task-reservation.py
+  ok    ordinary source inspection stays allowed: lib/task-reservation.py
+  ok    authority machinery is human-reserved: bash /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/remote-mcp/registry-bridge.sh
+  ok    authority machinery is human-reserved: printf x > /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/remote-mcp/registry-bridge.sh
+  ok    ordinary source inspection stays allowed: remote-mcp/registry-bridge.sh
+  ok    authority machinery is human-reserved: python3 /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/remote-mcp/authorization.py
+  ok    authority machinery is human-reserved: printf x > /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/remote-mcp/authorization.py
+  ok    ordinary source inspection stays allowed: remote-mcp/authorization.py
+  ok    authority machinery is human-reserved: bash /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/tests/fixtures/task-authorization.sh
+  ok    authority machinery is human-reserved: printf x > /Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/tests/fixtures/task-authorization.sh
+  ok    ordinary source inspection stays allowed: tests/fixtures/task-authorization.sh
+== parser dependency failure is a hold, including existing grants ==
+  ok    missing parser cannot be cleared by ownership grant
+  ok    broken parser runtime cannot be cleared by ownership grant
+  ok    missing parser neither consumes approved grant nor creates replacement
+== verified grant: concurrent consumption and replay ==
+  ok    verified conductor decision is attributed to ancestry, not environment
+  ok    positive decision emits exactly one fixture notification
+  ok    four concurrent consumers: exactly one consumes, three refuse
+  ok    replay of a consumed grant refuses
+== invalidation after genuine preflight cannot win the action CAS ==
+  ok    consume after cancellation: committed invalidation, zero mutation/execution/replacement
+  ok    consume after source: committed invalidation, zero mutation/execution/replacement
+  ok    approve after cancellation: committed invalidation, zero mutation/execution/replacement
+  ok    approve after source: committed invalidation, zero mutation/execution/replacement
+== authorized compound command reaches the fixture menu transport ==
+  ok    authorized compound: exact prompt, current conductor ancestry, one delivered Enter and auditable acknowledgement
+== approved grants revalidate original source ==
+  ok    verified file approval permits its unchanged reviewed bytes
+  ok    old file approval cannot clear newly unverified provenance
+  ok    old one-shot grant cannot clear newly unverified provenance
+== conductor paths require provenance and ancestry; no keys/sends ==
+  ok    menu conductor cannot override provenance hold
+  ok    hook conductor cannot override provenance hold
+  ok    menu rejects forged HERDR_PANE_ID with zero sends
+  ok    action rejects forged HERDR_PANE_ID with zero sends
+  ok    unreadable ancestry fails closed; no env fallback
+  ok    held scenarios: exactly zero consumes, keypresses and notifications
+
+56 passed / 0 failed; live canary runs=0 (not measured)
+
++ bash verify-process-identity-failures.sh 
+PASS ps unavailable with matching partial ancestry: identity unavailable, no caller accepted
+PASS malformed parent pid: identity unavailable, no caller accepted
+PASS cycle or truncated ancestor chain: identity unavailable, no caller accepted
+passed=3 failed=0
+
++ python3 remote-mcp/verify-tasks-e2e.py --registry-only 
+== start_task: real signature admission + registry source binding and deadline ==
+  ok    start accepted
+  ok    registry row exists for real (current schema, register_task())
+  ok    remote_task_id bound atomically through protected receipt registration
+  ok    deadline_at set before launch through protected receipt
+  ok    state is 'starting' immediately after register_task()
+== protected authorization: receipt, ack loss, and source substitution ==
+  ok    receipt reached launched through real registry transitions
+  ok    receipt binds source identity separately from conductor
+  ok    receipt copied deadline before execution
+  ok    lost ack replay resolves only protected task binding
+  ok    lost ack creates no duplicate task and never extends deadline
+  ok    same command id with another signed payload refuses before launch
+== sweep(): real close-done-workers.sh auto-closes a finished research task ==
+  ok    registry row carries a real worktree directory
+  ok    sweep() produced exactly one action
+  ok    action is orchestrator_close
+  ok    real close-done-workers.sh --apply succeeded
+  ok    registry state is 'completed' after the real close-done-workers.sh ran
+== a second task: real registry-bridge.sh cancel ==
+  ok    second start accepted
+  ok    cancel accepted
+  ok    registry state is 'cancelled' after the real registry-bridge.sh cancel ran
+== N5: real registry-bridge.sh cancel skips the pane close when `herdr pane list` itself fails ==
+  ok    third start accepted
+  ok    cancel FAILS (not accepted) when herdr pane list itself fails -- Z1: the row must never be marked cancelled on an unconfirmed pane
+  ok    registry state is NOT 'cancelled' (stays non-terminal for the next retry)
+  ok    `herdr pane list` was attempted
+  ok    `herdr pane close` was NEVER attempted once `pane list` failed (N5, no fail-open)
+  ok    cleanup (cmd_n5_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== R3-3: real registry-bridge.sh cancel refuses when the row's own remote_task_id does not match ==
+  ok    fourth start accepted
+  ok    registry-bridge.sh cancel exits nonzero on a remote_task_id mismatch
+  ok    registry state is untouched by the refused cancel (still starting/running, not cancelled)
+  ok    registry-bridge.sh cancel succeeds when the expected remote_task_id matches the row's own
+  ok    registry state is 'cancelled' once the remote_task_id actually matches
+== R3-6: real registry-bridge.sh cancel skips the pane close when `herdr pane list` returns non-JSON with rc 0 ==
+  ok    fifth start accepted
+  ok    cancel FAILS (not accepted) when `herdr pane list` returns rc=0 but non-JSON -- Z1: an unparseable list must never fail open
+  ok    registry state is NOT 'cancelled' when the pane list could not be parsed
+  ok    `herdr pane list` was attempted
+  ok    `herdr pane close` was NEVER attempted when jq could not parse a rc=0 list (R3-6, no fail-open)
+  ok    cleanup (cmd_r36_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== Z1: real registry-bridge.sh cancel fails (stays non-terminal) when `herdr pane close` itself fails ==
+  ok    sixth start accepted
+  ok    cancel fails when herdr pane close itself fails
+  ok    registry state is NOT 'cancelled' when the close failed (nothing of ours was actually confirmed gone)
+  ok    `herdr pane close` WAS attempted (the live pane matched the registered birth)
+  ok    cleanup (cmd_z1a_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== Z1: real registry-bridge.sh cancel refuses to mark cancelled when the pane is STILL alive after close (no fail-open on a survivor) ==
+  ok    seventh start accepted
+  ok    cancel fails when the pane is STILL reported alive after close (fake herdr's close is a no-op on the fixture pane)
+  ok    registry state is NOT 'cancelled' when the post-close list still shows the SAME pane alive
+  ok    `herdr pane close` WAS attempted before the row was ever refused
+  ok    `herdr pane list` was called TWICE (once before the close, once after, to prove the pane survived it)
+  ok    cleanup (cmd_z1b_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== F2: real registry-bridge.sh cancel on an already-terminal row refuses BEFORE touching any pane ==
+  ok    F2 start accepted
+  ok    F2 first cancel (real pane, real herdr fake) accepted
+  ok    R2-2: a SECOND cancel on an ALREADY-CANCELLED row is idempotent (exits 0, not an error)
+  ok    F2: no `herdr pane list` or `pane close` call was ever made for the already-terminal row (refused before touching any pane)
+  ok    F2: a cancel on a COMPLETED row (not idempotently-cancellable) still refuses and exits nonzero
+  ok    F2: the refusal message says 'already terminal'
+  ok    F2: no `herdr pane list` or `pane close` call was ever made for the completed row either
+== F1: real registry-bridge.sh cancel corroborates a terminal_id mismatch via agent_session (herdr restart case) ==
+  ok    F1a start accepted
+  ok    setup: agent_session stamped for task_e2e_20261010T013904Z_50820_23585
+  ok    F1a: pane close WAS attempted (same agent_session corroborated 'still ours' despite the terminal_id mismatch)
+  ok    F1a: cancel fails here only because this fixture's `pane close` itself fails (proves the match, not the close)
+  ok    cleanup (cmd_f1a_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+  ok    F1b start accepted
+  ok    setup: agent_session stamped for task_e2e_20261010T013907Z_55412_30355
+  ok    F1b: cancel SUCCEEDS when a disagreeing agent_session confirms a different occupant (nothing of ours to close)
+  ok    F1b: `herdr pane close` was NEVER attempted (not our pane)
+  ok    F1b: registry state is 'cancelled'
+  ok    F1c start accepted
+  ok    F1c: cancel FAILS when our own side has no agent_session to corroborate with (fail closed, never guess)
+  ok    F1c: registry state is NOT 'cancelled' (stays non-terminal for the next retry)
+  ok    cleanup (cmd_f1c_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== Fz: real registry-bridge.sh cancel treats a wrong-shaped-but-valid-JSON `herdr pane list` as UNPARSEABLE, never 'gone' ==
+  ok    Fz-a start accepted
+  ok    Fz-a: cancel FAILS on a valid-JSON error envelope (never mistaken for an empty/gone list)
+  ok    Fz-a: `herdr pane close` was NEVER attempted on an unparseable shape
+  ok    cleanup (cmd_fza_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+  ok    Fz-b start accepted
+  ok    Fz-b: cancel FAILS when the matched pane entry is missing terminal_id (found-but-unreadable is never 'absent')
+  ok    Fz-b: `herdr pane close` was NEVER attempted (never confirmed as our own live pane, never confirmed gone either)
+  ok    cleanup (cmd_fzb_cleanup): task cancelled for real once the pane is confirmed gone (restores a working `herdr` and frees the concurrency slot for later sections)
+== R4-1: timeout after protected registration preserves mapping and cancels the orphan ==
+  ok    start returns held (spawn timed out)
+  ok    held timeout retains the exact protected task mapping
+  ok    the protected registered row IS cancelled after the timeout
+== R4-1: real registry-bridge.sh cancel accepts an UNSTAMPED row (set-remote-id failure window) ==
+  ok    setup: register_task for the never-stamped row succeeded
+  ok    the freshly-registered row's remote_task_id is genuinely still empty
+  ok    registry-bridge.sh cancel succeeds against an unstamped row (no false refusal)
+  ok    state is 'cancelled' after cancelling the unstamped row
+== actual overlapping consumers: duplicate receipt held, different tasks isolated ==
+  ok    overlapping duplicate consumer sees exact nonterminal ambiguous-receipt hold
+  ok    only one overlapping consumer executes the launch
+  ok    two different jobs launch concurrently with distinct local tasks
+  ok    concurrent task retains its own remote binding cmd_concurrent_2
+  ok    concurrent task retains its own remote binding cmd_concurrent_3
+== distinct resumes: exclusive worktree mutation and trusted stopped-parent observation ==
+  ok    resume-race setup: authenticated parent launch recorded
+  ok    resume-race setup: parent cancelled only after fake pane is observed absent
+  ok    resume guard refuses the exact stopped-parent observation: invalid pane observation
+  ok    stopped-parent refusal preserves ANSWER, previous answer and SPEC
+  ok    resume guard refuses the exact stopped-parent observation: original pane is present or stop is unproven
+  ok    stopped-parent refusal preserves ANSWER, previous answer and SPEC
+  ok    distinct resumes overlap after reading the same terminal parent
+  ok    losing distinct resume refuses the existing successor reservation
+  ok    losing resume cannot rename ANSWER or overwrite previous answer/SPEC
+  ok    losing resume has no bound task or mutation permission
+  ok    two distinct signed resumes execute exactly one fixture launch
+  ok    winning mutation retires the fresh answer once and preserves SPEC
+  ok    registry retains exactly the winning owner, mutation claim and permanent parent edge
+  ok    resume-race cleanup cancels the one fixture child
+SKIP: independent timer/process-identity checks (--registry-only); no timer verification claimed
+  ok    teardown: every timer created by this fixture is reaped
+
+PASS: real-registry lifecycle checks green; independent timer checks explicitly excluded
+
+exit=0; elapsed=100.826s

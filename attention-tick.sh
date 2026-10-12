@@ -96,21 +96,44 @@ _attn_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/
 
 # attention_probe <pane_id> -> one JSON read of everything the ladder needs,
 # so every consumer of "what is this prompt" agrees instead of racing separate
-# screen reads against the same repaint. {"visible":false} when nothing
-# recognizable is pending right now (answered, or never was one).
+# screen reads against the same repaint. {"visible":false} ONLY for
+# display=no_prompt (docs/plans/dot-herdr-recovery-slices.md §2's
+# prompt_occurrence_display, lib/prompt-parse.sh) — a read that succeeded and
+# found nothing prompt-shaped: answered, or never was one.
+#
+# Before this fix, attention_tick.sh:337's `[ "$visible" = "true" ] || continue`
+# treated a genuinely STUCK pane (something menu-shaped on screen but the
+# strict parser can't resolve it) and a transport failure (herdr itself
+# down) exactly like an answered prompt — both collapsed into the same
+# `prompt_any_visible` false, through the same code this function used to
+# share with that collapse (plan §2: "attention-tick.sh:337 skips
+# unreadable/answered observations together"). Both now return
+# visible:true with an empty command/prompt_id (there is nothing to
+# classify) and verdict:escalate — this codebase's existing fail-closed
+# default (lib/command-policy.sh) for "cannot judge this command": a human
+# should see a pane the controller cannot read, never have the controller
+# go quiet on it.
 attention_probe() {
-  local pane="$1" pid cmd reserved verdict opts
-  if ! prompt_any_visible "$pane" >/dev/null 2>&1; then
-    printf '{"visible":false}\n'
-    return 0
-  fi
-  # The numbered fallback is intentionally loose for unknown agent layouts,
-  # but ordinary finished output can also end in a numbered summary. The
-  # attention controller must require the parser that can actually answer it;
-  # otherwise a dead worker becomes an active debt item.
+  local pane="$1" pid cmd reserved verdict opts display
+  display="$(prompt_occurrence_display "$pane" 2>/dev/null || printf 'read_failed')"
+  case "$display" in
+    no_prompt)
+      printf '{"visible":false}\n'
+      return 0
+      ;;
+    read_failed|pending_unreadable)
+      jq -nc --arg d "$display" \
+        '{visible:true, prompt_id:"", reserved:"", verdict:"escalate", command_text:"", display:$d}'
+      return 0
+      ;;
+  esac
+  # display = pending_parseable: the existing strict parse, unchanged for
+  # every fixture that already resolved before this change.
   if ! prompt_menu_visible "$pane" >/dev/null 2>&1; then
     opts="$(prompt_options "$pane" 2>/dev/null || true)"
     [ -n "$opts" ] || {
+      # The gate's numbered-tail match and the strict numbered parser can
+      # disagree (rare) — unchanged fallback from before this change.
       printf '{"visible":false}\n'
       return 0
     }
@@ -119,8 +142,8 @@ attention_probe() {
   cmd="$(prompt_command_text "$pane" 2>/dev/null)"
   reserved="$(conductor_reserved_reason "$cmd" 2>/dev/null)"
   verdict="$(classify_command "$cmd" 2>/dev/null)" || verdict="escalate"
-  jq -nc --arg pid "$pid" --arg r "$reserved" --arg v "$verdict" --arg cmd "$cmd" \
-    '{visible:true, prompt_id:$pid, reserved:$r, verdict:$v, command_text:$cmd}'
+  jq -nc --arg pid "$pid" --arg r "$reserved" --arg v "$verdict" --arg cmd "$cmd" --arg d "$display" \
+    '{visible:true, prompt_id:$pid, reserved:$r, verdict:$v, command_text:$cmd, display:$d}'
 }
 
 # The one-shot per-key gate: claims "since" for this prompt and, only on the

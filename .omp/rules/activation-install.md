@@ -86,3 +86,71 @@ hand-started Claude session already has.
 
 If the operator does not use omp, skip this entirely: nothing else in this
 runbook depends on it, and it does not affect the Claude hook wiring above.
+
+## Hook adoption: getting a PR's hook bytes live
+
+The Claude hook commands in `settings.json` and the omp extension symlink
+both point at a CHECKOUT PATH, not a commit — `install.sh`'s `$here`, i.e.
+wherever it was run from. A PR branch's hook bytes (e.g. PR #273) go live
+only if something resolves to them:
+
+1. **The installed symlink/hook commands point at whichever checkout
+   `install.sh --apply --repoint` was last run from** (`install.sh:27-31,
+   336-353` — repoint is a deliberate opt-in; a plain re-run never moves an
+   existing wiring). If that was the long-lived `~/Code/herdr-control`
+   checkout on `main`, PR bytes that only exist on a branch/worktree are not
+   live anywhere, merged or not — the bash hooks (`claude-notify.sh`,
+   `claude-pretooluse-cache.sh`, `herdr-resolve.sh`,
+   `interval-reconcile.sh`, `session-reconcile.sh`) read straight off disk
+   at call time, so whichever checkout the command path resolves into is
+   what runs, even without a daemon restart.
+2. **To adopt a PR for real: merge it to `main`, update the checkout the
+   symlink/hooks point at** (`git -C ~/Code/herdr-control pull`, or
+   `install.sh --apply --repoint` from the checkout that should now own it),
+   **then reload:**
+   - Claude Code hooks: no reload needed — each event execs the hook path
+     fresh, so updated bytes on disk take effect on the very next event.
+   - omp extension (`~/.omp/agent/extensions/herdr-control.ts` ->
+     `agent-hooks/omp-herdr-control.ts`): omp's loader hot-reloads on a
+     change to the FILE the symlink currently resolves to
+     (`agent-hooks/omp-herdr-control.ts:93-97`, confirmed in that file's own
+     comment). Whether a symlink *retarget* (new realpath, not just new
+     bytes at the same path) is picked up without restarting the omp
+     session is **not verified here** — `[INFERENCE]` only, not exercised
+     live. Treat "symlink now points at the new checkout" as requiring a
+     fresh omp session until someone confirms otherwise.
+3. **This worktree is not an adoption path.** A task worktree
+   (`~/.herdr/worktrees/herdr-control/<branch>`) is disposable — running
+   `--repoint` from one wires a checkout that gets deleted, silently
+   breaking every hook and the omp extension the next time cleanup runs.
+   Adoption always targets a durable checkout (`~/Code/herdr-control` on
+   `main`, or an explicit APM deploy path), never a worktree.
+
+## Hub interpreter pin: what happens when Homebrew upgrades python3
+
+`install.sh --apply --hub` bakes an ABSOLUTE, versioned interpreter path
+(e.g. `/opt/homebrew/bin/python3.14`, `launchd/resolve-hub-python.sh`) into
+the rendered plist's `exec` line at INSTALL TIME — deliberately, to kill the
+`/usr/bin/env python3` ambiguity (ROUND 2 note above). The tradeoff: that
+path is only as durable as the Homebrew keg it names.
+
+**Symptom:** the hub crash-loops after a routine `brew upgrade python@3.14`
+(or any upgrade that removes an old minor's symlink, e.g. a `3.14` → `3.15`
+cleanup). `KeepAlive=true` in the plist respawns it immediately, so this
+looks like a tight restart loop, not a clean "service down."
+
+**Where it shows up:** `~/Library/Logs/com.herdr-control.hub.log`
+(`StandardOutPath`/`StandardErrorPath` in the plist both point here) gets an
+`exec`-failure line (`No such file or directory`) every time launchd
+respawns it — the failure IS logged, but nothing pages for it; an operator
+has to go looking.
+
+**Fix:** re-run `install.sh --apply --hub`. `resolve_hub_python` re-scans
+`/opt/homebrew/bin` and `/usr/local/bin` at that moment, so it picks up
+whichever minor Homebrew left behind, and the resulting plist is staged
+through `stage_plist` (temp render → `plutil -lint` → timestamped backup of
+the broken one → atomic replace) the same as any other install. There is no
+proactive alert for this today — `verify-deploy.sh`'s "the plist installed
+on THIS machine" section will catch a plist pointing at a `hub.py` that does
+not exist, but not yet an interpreter path that does not exist; that is a
+gap, not a guarantee.

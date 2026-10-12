@@ -41,6 +41,7 @@ from pathlib import Path
 
 from sanitize import clean, read_single_link_regular
 import tasks as rtasks
+from authorization import AuthorizationError, canonical_json, verify_command
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -100,9 +101,9 @@ REPLY_MIN_AGE_S = 30
 LEASE_LOCAL_S = 60
 # Same idea for the Worker's `commands` outbox (start/cancel/resume): a
 # command not even ATTEMPTED within this many seconds of the lease is simply
-# left unacked -- there is no "retry" outcome in CommandAck, only
-# accepted/refused/failed, so omission (letting the Worker's own lease_until
-# expire and re-queue it) is how a command retries, the same end state a
+# left unacked. "held" preserves an uncertain result; it does not ask for
+# a fresh effect. Omitting the ack lets the Worker's lease_until expire and
+# re-queue the command, the same end state a
 # message's explicit "retry" outcome reaches.
 COMMAND_LEASE_LOCAL_S = 60
 # The Mac's own switch, independent of the Worker's MESSAGING_ENABLED: unless
@@ -1484,6 +1485,52 @@ def _trim_owner_replies_to_budget(rows: list[dict], raw: list[dict], budget: int
     return rows, raw
 
 
+def process_leased_command(cmd: dict, key: str, processed: dict, now_s: float) -> dict:
+    """Admission precedes all start/resume execution and cache lookup.
+
+    The JSON cache is delivery bookkeeping, not authorization. Start/resume
+    retries reconcile against the protected registry receipt instead.
+    """
+    cid = cmd.get("command_id", "")
+    if cmd.get("op") in ("start", "resume"):
+        try:
+            authorization = verify_command(cmd, key, rtasks.load_allowlist())
+        except (AuthorizationError, ValueError, OSError, TypeError) as exc:
+            return {"command_id": cid, "outcome": "refused", "detail": f"task authorization refused: {exc}"[:300]}
+        return rtasks.process_command(cmd, authorization=authorization)
+    # Lease attempts and other transport metadata change on a legitimate
+    # redelivery. Bind the effect-bearing command fields only.
+    immutable = {field: cmd.get(field) for field in ("command_id", "op", "remote_task_id", "payload")}
+    fingerprint = hashlib.sha256(canonical_json(immutable).encode("utf-8")).hexdigest()
+    prior = processed.get(cid)
+    if prior:
+        if prior.get("command_sha256") != fingerprint:
+            return {"command_id": cid, "outcome": "refused", "detail": "command replay binding missing or changed"}
+        return prior["ack"]
+    ack = rtasks.process_command(cmd)
+    processed[cid] = {"at": now_s, "command_sha256": fingerprint, "ack": ack}
+    return ack
+
+
+def confirm_receipt_ack_results(reply: dict) -> None:
+    """Receipt-to-ack recovery (§3): CAS-confirm every (command_id, revision)
+    the Worker just echoed back in `command_ack_results` -- this is the ONLY
+    place that happens. An older Worker reply simply has no such field
+    (nothing to confirm; the registry stays pending and the next tick's
+    pending_receipt_acks() keeps resending it, same as before this field
+    existed). A malformed entry is skipped, never raised -- one faulty
+    result must not abort every other confirmation in the same reply."""
+    for r in (reply.get("command_ack_results") or []):
+        if not isinstance(r, dict):
+            continue
+        cid, revision = r.get("command_id"), r.get("revision")
+        if not isinstance(cid, str) or not isinstance(revision, int):
+            continue
+        result = rtasks.confirm_receipt_ack(cid, revision)
+        if result.get("result") not in ("recorded", "already_recorded"):
+            log(f"command_ack_results {cid}@{revision}: {result.get('result')} (current_revision={result.get('current_revision')})")
+
+
 def main(argv: list[str]) -> int:
     os.umask(0o077)  # state.json / audit.jsonl carry emails and client ids
     if "--print-key-fingerprint" in argv:  # identity, never the value (provision.sh compares it to 1Password)
@@ -1516,6 +1563,16 @@ def main(argv: list[str]) -> int:
 
     acks = st.get("pending_acks", [])
     command_acks = st.get("pending_command_acks", [])
+    # Receipt-to-ack recovery (dot-herdr-recovery-slices.md §3): the LOCAL
+    # cache above is exactly what a crash between a registry commit and
+    # save_state() can lose -- a retired/revoked command_id the Worker
+    # never re-leases would then go unconfirmed forever. pending_receipt_acks()
+    # recovers any STILL-unconfirmed receipt straight from the registry's
+    # own revision/acked_revision counter, independent of this cache. The
+    # local cache entry wins on a collision (it can carry live fields like
+    # capability_probe that a bare registry row reconstruction cannot).
+    _cached_ack_ids = {a["command_id"] for a in command_acks if isinstance(a, dict) and a.get("command_id")}
+    command_acks = command_acks + [a for a in rtasks.pending_receipt_acks() if a["command_id"] not in _cached_ack_ids]
     owner_acks = st.get("pending_owner_acks", [])
     # Replies are independent of leasing -- scanned and sent every tick they
     # exist, not gated behind "lease". `session` is filled in HERE, from the
@@ -1615,6 +1672,7 @@ def main(argv: list[str]) -> int:
         st.setdefault("results", {})[f"{r['task_id']}:{r['source']}"] = {"sha256": r["sha256"], "sent_at": now.timestamp()}
     keep = {t["task_id"] for t in snapshot["tasks"]}
     st["results"] = {k: v for k, v in st.get("results", {}).items() if k.split(":", 1)[0] in keep}
+    confirm_receipt_ack_results(reply)
     st["pending_acks"], st["pending_command_acks"], st["pending_owner_acks"] = [], [], []
     append_audit(reply.get("audit") or [])
     st["audit_cursor"] = reply.get("audit_cursor", st.get("audit_cursor", 0))
@@ -1714,13 +1772,10 @@ def main(argv: list[str]) -> int:
     cmd_leased_at = time.monotonic()
     for cmd in commands:
         cid = cmd["command_id"]
-        if cid in processed:
-            ack = processed[cid]["ack"]
-        elif time.monotonic() - cmd_leased_at > COMMAND_LEASE_LOCAL_S:
+        if time.monotonic() - cmd_leased_at > COMMAND_LEASE_LOCAL_S:
             continue  # not even attempted this tick; the Worker's own lease expires and re-queues it
         else:
-            ack = rtasks.process_command(cmd)
-            processed[cid] = {"at": now.timestamp(), "ack": ack}
+            ack = process_leased_command(cmd, key, processed, now.timestamp())
         log(f"command {cid} ({cmd.get('op')}): {ack['outcome']} ({ack.get('detail', '')})")
         new_command_acks.append(ack)
         st["processed_commands"], st["pending_command_acks"] = processed, new_command_acks
@@ -1730,6 +1785,7 @@ def main(argv: list[str]) -> int:
         reply = post_sync(key, {"snapshot": snapshot, "results": [], "acks": new_acks, "command_acks": new_command_acks,
                                 "owner_acks": new_owner_acks, "owner_replies": [],
                                 "audit_cursor": st["audit_cursor"], "lease": False})
+        confirm_receipt_ack_results(reply)
         st["pending_acks"], st["pending_command_acks"], st["pending_owner_acks"] = [], [], []
         append_audit(reply.get("audit") or [])
         st["audit_cursor"] = reply.get("audit_cursor", st["audit_cursor"])

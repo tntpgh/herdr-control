@@ -1,0 +1,26 @@
+....E../opt/homebrew/Cellar/python@3.14/3.14.8_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py:1139: ResourceWarning: subprocess 68912 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+........................................................
+======================================================================
+ERROR: setUpClass (__main__.CapabilityProbe)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/thurbs/Documents/Codex/2026-10-09/task/herdr-control/remote-mcp/verify-tasks.py", line 316, in setUpClass
+    cls.server = HTTPServer(("127.0.0.1", 0), Health)
+                 ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.8_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 457, in __init__
+    self.server_bind()
+    ~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.8_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/http/server.py", line 148, in server_bind
+    socketserver.TCPServer.server_bind(self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.8_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/socketserver.py", line 478, in server_bind
+    self.socket.bind(self.server_address)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 1] Operation not permitted
+
+----------------------------------------------------------------------
+Ran 62 tests in 3.215s
+
+FAILED (errors=1)

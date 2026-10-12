@@ -4170,9 +4170,21 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
 
     Five signals, each its own `fingerprint` (what the claim_once key in
     stall-watchdog.sh re-arms on when it changes). IDLE_STATES (`stalled`,
-    `ready_review`) gates every one of them: review N1 — once a task is
-    `completed`, the conductor closing it IS the action owed, whatever
-    closed it; nothing fires again after that, for any signal.
+    `ready_review`) gates signals 1/2 (handoff/artifact, worktree-completion
+    heuristics that only make sense once a task is actually idle/done).
+    Signals 3/4/5 (denied, unprocessed, conductor_prompt) additionally
+    include `blocked` — item 4 (SPEC.md, dot-herdr-recovery-slices.md §2):
+    `blocked` is the state the occurrence model (herdr-select.sh/
+    push-wake.sh, slice 2 items 2/3) now actually sets while a prompt sits
+    unresolved, and the previous `state == "stalled"` check on signals 3/4
+    silently excluded every blocked task from this watchdog entirely.
+    Signal 5 is computed first and, when it fires, suppresses 3/4 for that
+    SAME task this tick — once the occurrence-precise mechanism already
+    owns tracking a task's unresolved prompt, the older coarser heuristics
+    must not also mint a second, duplicate candidate for the same stuck
+    prompt. Review N1 — once a task is `completed`, the conductor closing
+    it IS the action owed, whatever closed it; nothing fires again after
+    that, for any signal.
       handoff     — the worker's OWN worktree bus says `handed_off_to:
                     <anything>` (review H5: not just the literal
                     `:conductor`) while its pane is STILL the one this task
@@ -4239,6 +4251,7 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                                                        pane_read_fn, pane_birth_fn))
             return _occ[0](tid_, req_, at_)
     IDLE_STATES = ("stalled", "ready_review")
+    BLOCKED_AWARE_STATES = IDLE_STATES + ("blocked",)
     out: list[dict] = []
     for t in tasks:
         tid = t.get("task_id")
@@ -4309,30 +4322,21 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                            "detail": f"{rel} has sat ready {int((now - mtime) / 60)}m with no action",
                            "artifact": rel})
 
-        # ---- signal 3/4: denied, unprocessed --------------------------------
-        if state == "stalled":
-            d = denied.get(tid)
-            if d and d["epoch"] >= boot and (task_start is None or d["epoch"] >= task_start) \
-                    and now - d["epoch"] >= threshold:
-                out.append({**base, "signal": "denied", "fingerprint": d["fingerprint"],
-                           "detail": "a policy-refused prompt was denied, then the worker went idle",
-                           "artifact": ""})
-            m = delivered.get(tid)
-            if m and m["epoch"] >= boot and (task_start is None or m["epoch"] >= task_start) \
-                    and now - m["epoch"] >= threshold:
-                out.append({**base, "signal": "unprocessed", "fingerprint": m["fingerprint"],
-                           "detail": "a message was delivered to this pane and never processed",
-                           "artifact": ""})
-
         # ---- signal 5: conductor_prompt (DESIGN-228) ------------------------
-        # Read on EVERY tick the task is idle with a live, birth-matched
-        # pane, never behind the threshold: the occurrence's first sighting
-        # is its own clock. The threshold below only decides WHEN an
-        # unanswered occurrence starts waking — from `max(since,
+        # Computed BEFORE signals 3/4 (item 4: "suppress duplicate legacy
+        # handling for occurrences that own attention") — once this
+        # occurrence-precise mechanism fires for a task this tick, the
+        # coarser denied/unprocessed heuristics below defer to it instead
+        # of minting a second candidate for the same stuck prompt.
+        # Read on EVERY tick the task is idle/blocked with a live,
+        # birth-matched pane, never behind the threshold: the occurrence's
+        # first sighting is its own clock. The threshold below only decides
+        # WHEN an unanswered occurrence starts waking — from `max(since,
         # first_seen)`, and with no `since >= boot` gate (r3 M1: `updated_at`
         # never moves at idle, so `boot` silenced every task whose last edge
         # predated #223; the deploy seed covers history instead).
-        if state in IDLE_STATES and t.get("pane_id"):
+        conductor_prompt_fired = False
+        if state in BLOCKED_AWARE_STATES and t.get("pane_id"):
             live_birth = pane_birth_fn(t["pane_id"])
             reg_birth = t.get("pane_birth") or ""
             req = (_cp.last_request(pane_read_fn(t["pane_id"]))
@@ -4345,6 +4349,27 @@ def stall_watchdog_candidates(tasks: list[dict], now: float | None = None,
                     out.append({**base, "signal": "conductor_prompt",
                                "fingerprint": f"{req['fp']}|g{occ['gen']}",
                                "detail": req["line"][:200], "artifact": ""})
+                    conductor_prompt_fired = True
+
+        # ---- signal 3/4: denied, unprocessed --------------------------------
+        # `blocked` is included here (not just `stalled`) because that is
+        # the state the occurrence model (herdr-select.sh/push-wake.sh,
+        # slice 2 items 2/3) now actually sets while a prompt sits
+        # unresolved; the previous `state == "stalled"` check silently
+        # excluded every blocked task from this watchdog entirely.
+        if state in ("stalled", "blocked") and not conductor_prompt_fired:
+            d = denied.get(tid)
+            if d and d["epoch"] >= boot and (task_start is None or d["epoch"] >= task_start) \
+                    and now - d["epoch"] >= threshold:
+                out.append({**base, "signal": "denied", "fingerprint": d["fingerprint"],
+                           "detail": "a policy-refused prompt was denied, then the worker went idle",
+                           "artifact": ""})
+            m = delivered.get(tid)
+            if m and m["epoch"] >= boot and (task_start is None or m["epoch"] >= task_start) \
+                    and now - m["epoch"] >= threshold:
+                out.append({**base, "signal": "unprocessed", "fingerprint": m["fingerprint"],
+                           "detail": "a message was delivered to this pane and never processed",
+                           "artifact": ""})
     return out
 
 
