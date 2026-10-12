@@ -399,6 +399,75 @@ else
   ok "round 9 followup: no notification was sent when the real handler's persist attempt exited 0 with a JSON error"
 fi
 
+printf '== round 10 followup: the REAL handler sends NO notification for a mismatch replay (same occurrence, changed command) ==\n'
+# record_seen (lib/prompt-occurrence.py:198-217) writes "mismatch", not
+# "seen"/"enriched"/"duplicate", when the SAME occurrence identity arrives
+# again with a DIFFERENT tool/input digest than whatever was recorded
+# first — parsePersistedResponse must read this as persisted=false for the
+# `seen` call, not just a non-empty occ_key with no error. Same toolCallId
+# both times (a real repeat firing of tool_approval_requested for one
+# still-open prompt, per the cache comment above onApprovalRequested) with
+# a different command the second time. omp-notify.sh (the shared
+# NOTIFYSHIM stub) overwrites its record file per call, which is enough
+# here: a wrongly-sent second notification would overwrite "ls" with
+# "rm -rf /", so the content check below still catches it.
+NOTIFY_REC="$WORK/notify-mismatch.json"; rm -f "$NOTIFY_REC"
+( cd "$here" && HERDR_CONTROL_DIR="$NOTIFYSHIM" HERDR_RUN_STATE_DIR="$WORK/runs" HERDR_RUN_ID=run1 HERDR_TASK_ID=task1 HERDR_PANE_ID="$PANE" \
+  NOTIFY_REC="$NOTIFY_REC" \
+  timeout 20 bun -e '
+const mod = await import(process.cwd() + "/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
+handlers["tool_approval_requested"]({ toolName: "bash", toolCallId: "mismatchcall1", input: { command: "ls" }, reason: "first" });
+await new Promise((r) => setTimeout(r, 1500));
+handlers["tool_approval_requested"]({ toolName: "bash", toolCallId: "mismatchcall1", input: { command: "rm -rf /" }, reason: "second" });
+await new Promise((r) => setTimeout(r, 1500));
+' ) 2>"$WORK/bun-mismatch.err"
+cat "$WORK/bun-mismatch.err" >&2
+if [ -s "$NOTIFY_REC" ] && jq -e '.command == "ls"' "$NOTIFY_REC" >/dev/null 2>&1; then
+  ok "round 10 followup: the one notification on record is the first, genuine 'seen' write — the mismatch replay sent none"
+else
+  bad "expected the one notify file to hold 'ls' only, got: $(cat "$NOTIFY_REC" 2>/dev/null)"
+fi
+
+printf '== round 10 followup: the REAL handler sends NO notification for a malformed partial success ({"occ_key":"x"}, exit 0) ==\n'
+# A fixture prompt-occurrence.py standing in for a buggy/future response
+# shape: occ_key present, no error key, but no `written` field at all.
+# parsePersistedResponse must still read this as persisted=false for the
+# `seen` call, not accept on occ_key alone.
+MALFORMEDSHIM="$WORK/malformedshim"
+mkdir -p "$MALFORMEDSHIM/agent-hooks" "$MALFORMEDSHIM/lib" "$MALFORMEDSHIM/launchd"
+cat > "$MALFORMEDSHIM/agent-hooks/omp-notify.sh" <<'EOS'
+#!/usr/bin/env bash
+cat > "$NOTIFY_REC"
+EOS
+chmod +x "$MALFORMEDSHIM/agent-hooks/omp-notify.sh"
+cat > "$MALFORMEDSHIM/lib/prompt-occurrence.py" <<'EOS'
+#!/usr/bin/env python3
+import json
+print(json.dumps({"occ_key": "x"}))
+EOS
+ln -sf "$here/launchd/resolve-hub-python.sh" "$MALFORMEDSHIM/launchd/resolve-hub-python.sh"
+NOTIFY_REC="$WORK/notify-malformed.json"; rm -f "$NOTIFY_REC"
+( cd "$here" && HERDR_CONTROL_DIR="$MALFORMEDSHIM" HERDR_RUN_STATE_DIR="$WORK/runs" HERDR_RUN_ID=run1 HERDR_TASK_ID=task1 HERDR_PANE_ID="$PANE" \
+  NOTIFY_REC="$NOTIFY_REC" \
+  timeout 20 bun -e '
+const mod = await import(process.cwd() + "/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
+handlers["tool_approval_requested"]({ toolName: "bash", toolCallId: "malformedcall1", input: { command: "git push --force" }, reason: "destructive" });
+await new Promise((r) => setTimeout(r, 1500));
+' ) 2>"$WORK/bun-malformed.err"
+cat "$WORK/bun-malformed.err" >&2
+grep -q 'was not a success' "$WORK/bun-malformed.err" \
+  && ok "a truthful 'exited 0 but its response was not a success' log line was printed for the malformed partial success" \
+  || bad "expected a 'was not a success' log line, got: $(cat "$WORK/bun-malformed.err")"
+if [ -e "$NOTIFY_REC" ]; then
+  bad "the real handler notified despite a malformed partial success (no written field): $(cat "$NOTIFY_REC")"
+else
+  ok "round 10 followup: no notification was sent for a malformed partial success"
+fi
+
 echo "-----"
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

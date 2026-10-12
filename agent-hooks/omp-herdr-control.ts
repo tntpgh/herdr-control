@@ -1497,12 +1497,31 @@ let pendingOccurrenceFailed = 0;
 // prints `{"error": <str>}` with no `occ_key`. Round 9 review (BLOCK): the
 // TS side never read stdout at all, so an exit-0 JSON error looked
 // identical to a real persist. This is the one place that tells them apart.
-function parsePersistedResponse(stdout: string): boolean {
+//
+// Round 10 review (narrow defect): a non-empty occ_key with no error was
+// treated as success regardless of `written`, so a `seen` call that landed
+// as record_seen's "mismatch" outcome (lib/prompt-occurrence.py:198-217 —
+// the SAME occurrence identity but a DIFFERENT tool or input than whatever
+// was recorded first) still resolved persisted=true, and the handler would
+// notify the CHANGED command as if it were the one genuinely on record.
+// `seen`'s own written values: "seen" (first write), "enriched" (a digest
+// landed where none existed yet, same identity), "duplicate" (re-seen,
+// same or still-absent digest) all mean this exact occurrence IS durably
+// recorded; "mismatch" means a conflicting write happened instead and must
+// read as a failure here, same as any other unrecognized/absent value.
+// Other subcommands (record_screen/record_authorized/_resolve) are never
+// gated on by a caller — only `seen`'s result reaches onApprovalRequested's
+// notify branch — so their own `written` shapes are left unchecked, same
+// as before.
+const SEEN_DURABLE_WRITTEN: Record<string, true> = { seen: true, enriched: true, duplicate: true };
+function parsePersistedResponse(stdout: string, cmd: string): boolean {
   try {
     const parsed: unknown = JSON.parse(stdout.trim());
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
     const r = parsed as Record<string, unknown>;
-    return typeof r.occ_key === "string" && r.occ_key.length > 0 && !("error" in r);
+    if (typeof r.occ_key !== "string" || r.occ_key.length === 0 || "error" in r) return false;
+    if (cmd !== "seen") return true;
+    return typeof r.written === "string" && Object.hasOwn(SEEN_DURABLE_WRITTEN, r.written);
   } catch {
     return false;
   }
@@ -1571,7 +1590,7 @@ function runOccurrenceAsync(py: string, args: string[]): Promise<boolean> {
       resolve(false);
       return;
     }
-    if (!parsePersistedResponse(stdout)) {
+    if (!parsePersistedResponse(stdout, args[0])) {
       pendingOccurrenceFailed++;
       console.error(`herdr: recordOccurrence: prompt-occurrence.py exited 0 but its response was not a success (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${stdout.slice(0, 300)}`);
       resolve(false);
