@@ -1022,7 +1022,12 @@ both of which only ever get *stricter* for one spawn, never looser:
   operational `--review-category` (`local-read` / `local-build` /
   `branch-work` / `owned-cleanup`) and a `--review-reason`; the caller's
   pane+birth must match the task's registered conductor; the prompt must be
-  a complete recognized omp panel (elided arguments refuse). It never
+  a complete recognized omp panel (elided arguments refuse); a `write`/`edit`
+  is approved by a peer or conductor only through the pinned
+  `omp.tool-approval-binding.v1` request/session/call/digest resolver, never a
+  terminal key; without that exact protocol it remains human-only. Review uses
+  OMP's canonical effective arguments and the hook-recorded complete payload
+  (`docs/design/complete-approval-payload.md`). It never
   overrides `deny`, operator rules, or the recognized human-reserved forms
   (`conductor_reserved_reason`: secret values, remote mutation, main
   merge/push, governance, control weakening). Every decision records

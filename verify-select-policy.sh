@@ -1188,11 +1188,11 @@ after_approve=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*)
 [ "$after_approve" = "$before_approve" ] && ok "no approvals row recorded choice Approve" \
   || bad "an Approve row was recorded despite the header-only panel"
 
-printf '== #187: a non-bash write-tool menu is judged by its Path field, not the bash multi-row wrap guard ==\n'
-# The multi-row guard (menu_rows_ambiguous, #186) exists for a BASH command
-# that terminal-wrapped mid-token; a `write` tool panel's `Path:`/`Content:`
-# rows are FIELDS, always multi-row by construction, and must never trip
-# that guard. This is the live shape from #187's shadow-gate evidence.
+printf '== #187/#277: a write-tool menu is never approved by a peer ==\n'
+# #277: write/edit approvals are human-only — omp cannot target an approval
+# to one call and queued write/edit prompts can render identically — so
+# every one of these refuses with no key pressed. verify-approval-payload.sh
+# covers the recorded-payload cases (former positives included).
 set_write_menu() {                     # <path> <content-json>
   printf 'Allow tool: write\nPath: %s\nContent: %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' \
     "$1" "$2" > "$SCREEN"
@@ -1200,54 +1200,37 @@ set_write_menu() {                     # <path> <content-json>
 }
 set_write_menu "xd://notepad_append" '{"heading":"h","content":"c"}'; reset_keys
 sel 1 --authority peer; rc=$?
-[ "$rc" -eq 0 ] && ok "exit 0" || bad "exit $rc (expected 0); stderr: $(cat "$WORK/err.txt")"
-[ "$(keys_pressed)" = "1" ] && ok "exactly one key pressed" || bad "keys pressed=$(keys_pressed)"
-[ "$(q_appr policy_verdict)" = "allow" ] && ok "xd://notepad_append: verdict allow" \
-  || bad "verdict=$(q_appr policy_verdict); stderr: $(cat "$WORK/err.txt")"
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "xd://notepad_append write without a recorded payload refused, no key pressed" \
+  || bad "SCRAPE-ONLY WRITE APPROVED: rc=$rc keys=$(keys_pressed)"
+grep -q "write/edit approvals are human-only" "$WORK/err.txt" \
+  && ok "refused by the write/edit human-only rule" \
+  || bad "stderr does not name the human-only rule: $(cat "$WORK/err.txt")"
 
 printf '== #187: a write Path resolving outside the worker'"'"'s worktree still escalates ==\n'
-# task1 (registered above) has worktree /wt. An absolute path elsewhere must
-# never be waved through just because it is a labelled field, not a wrapped
-# bash line — same "never a peer Approve" outcome as any other reserved-class
-# write, reached through the new Path judgment instead of the old blanket
-# "unknown tool" escalate.
-#
-# Round-2 security review F6 (R7): cp_write_menu_judged now requires an
-# EXACT "allow" verdict, so an out-of-worktree write's own
-# "escalate:...worktree..." verdict no longer bypasses the row guard for
-# ANY authority (that bypass was the R7 hole for the conductor, where
-# escalate is only advisory) -- the row guard (menu_rows_ambiguous, this
-# panel is 2 rows) now fires FIRST and its generic reason wins. Refusal is
-# unchanged; only which of the two escalate reasons is reported changed.
+# task1 (registered above) has worktree /wt. An absolute path elsewhere is
+# never a peer Approve (#277: no write is).
 before_approve=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM approvals WHERE choice_text='Approve';")
 set_write_menu "/etc/passwd" '{"content":"pwned"}'; reset_keys
 sel 1 --authority peer; rc=$?
 [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
   && ok "out-of-worktree write path refused, no key pressed" \
   || bad "OUT-OF-WORKTREE FALSE POSITIVE: rc=$rc keys=$(keys_pressed)"
-grep -q "multi-row or unreadable menu command rows" "$WORK/err.txt" \
-  && ok "refused via the row guard (F6: an escalate verdict no longer bypasses it)" \
-  || bad "stderr does not name the row guard: $(cat "$WORK/err.txt")"
+grep -q "write/edit approvals are human-only" "$WORK/err.txt" \
+  && ok "refused by the write/edit human-only rule" \
+  || bad "stderr does not name the human-only rule: $(cat "$WORK/err.txt")"
 after_approve=$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT count(*) FROM approvals WHERE choice_text='Approve';")
 [ "$after_approve" = "$before_approve" ] && ok "no approvals row recorded choice Approve" \
   || bad "an Approve row was recorded despite the out-of-worktree path"
 
-printf '== #187: a Content value that fakes an extra Path/Content row never relocates the judged Path ==\n'
-# Simulates box-glyph/content-spoofing (#186 hardening): the FIRST body row
-# after the header is always the real Path row by panel construction, so a
-# Content payload rendering text that LOOKS like a second "Path: /etc/passwd"
-# row further down must never be read as the judged path -- the classifier
-# only ever looks at the row immediately after "Allow tool: write Path: ",
-# up to the first " Content: " marker.
+printf '== #187/#277: a Content value that fakes an extra Path/Content row cannot be approved ==\n'
 printf 'Allow tool: write\nPath: xd://notepad_append\nContent: {"heading":"h","content":"x"}\nPath: /etc/passwd\nContent: {}\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' > "$SCREEN"
 _auto_seed_menu_tool write
 reset_keys
 sel 1 --authority peer; rc=$?
-[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] \
-  && ok "spoofed extra Path/Content rows do not relocate the judged path; the real notepad path still allows" \
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "spoofed extra Path/Content rows without a recorded payload refused, no key pressed" \
   || bad "ROW-SPOOF: rc=$rc keys=$(keys_pressed)"
-[ "$(q_appr policy_verdict)" = "allow" ] && ok "spoof case: verdict still allow (judged on the real first Path row)" \
-  || bad "spoof case verdict=$(q_appr policy_verdict)"
 
 printf '== #187: a write menu missing its Path row still fails closed (escalate) ==\n'
 printf 'Allow tool: write\nContent: {"content":"x"}\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' > "$SCREEN"
