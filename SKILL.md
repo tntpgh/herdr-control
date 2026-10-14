@@ -208,6 +208,16 @@ actions, operator restrictions, and the human-reserved boundaries in
 it does not contain an untrusted process. Unattended execution requires the
 approved isolated worker boundary; host panes remain attended/trusted work.
 
+A `write`/`edit` peer/conductor approval requires the pinned
+`omp.tool-approval-binding.v1` exact request/session/call/effective-argument
+digest resolver (#277, `docs/design/complete-approval-payload.md`). Herdr sends
+no terminal key; an older or incompatible OMP remains human-only. Review uses
+the canonical effective arguments and complete payload, not the clipped panel:
+`lib/prompt-occurrence.py proposal --db <registry> --run <run>
+--task <task> --pane <worker-pane> --prompt-id <fresh-id> --worktree <wt> --show`
+(`--expect-sha <sha256>` confirms it is still the reviewed payload); a missing,
+changed, truncated, hard-linked or out-of-worktree payload is refused.
+
 **Closing out.** Once a worker's own message/completion event shows it's
 genuinely done (not just an idle prompt mid-turn — check the last real
 message), extract any durable lesson worth keeping and close its tab

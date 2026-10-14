@@ -1091,14 +1091,21 @@ function notifyForPrompt(
 // that fail the central registration/generation check, and for a registered
 // worker's file-mutating call outside its worktree (workerWriteScopeBlock).
 const INPUT_CACHE_MAX = 32;
-const inputByCallId = new Map<string, unknown>();
+// #277: write/edit inputs are cached too, so their approval occurrence records
+// the complete payload (digest + proposal) instead of only a clipped panel.
+// `at` is the dispatch time and `cwd` the directory relative targets resolve
+// against (the same one workerWriteScopeBlock judged).
+const APPROVAL_INPUT_TOOLS: Record<string, true> = { bash: true, shell: true, write: true, edit: true };
+const inputByCallId = new Map<string, { input: unknown; at: number; cwd: string }>();
 
-function cacheBashInput(event: unknown): void {
+function cacheApprovalInput(event: unknown, ctx?: unknown): void {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     const name = typeof e.toolName === "string" ? e.toolName.toLowerCase() : "";
-    if ((name !== "bash" && name !== "shell") || typeof e.toolCallId !== "string") return;
-    inputByCallId.set(e.toolCallId, e.input);
+    if (!Object.hasOwn(APPROVAL_INPUT_TOOLS, name) || typeof e.toolCallId !== "string") return;
+    const c = ctx && typeof ctx === "object" ? (ctx as Record<string, unknown>).cwd : undefined;
+    const cwd = typeof c === "string" && path.isAbsolute(c) ? c : process.cwd();
+    inputByCallId.set(e.toolCallId, { input: e.input, at: Date.now(), cwd });
     while (inputByCallId.size > INPUT_CACHE_MAX) {
       const oldest = inputByCallId.keys().next().value;
       if (oldest === undefined) break;
@@ -1150,7 +1157,7 @@ function readOnlyChildBlock(event: unknown, ctx?: unknown): Block | undefined {
 }
 
 function onToolCall(event: unknown, ctx?: unknown): Block | undefined {
-  cacheBashInput(event);
+  cacheApprovalInput(event, ctx);
   const result = readOnlyChildBlock(event, ctx) ?? pretoolRegistrationBlock(event) ?? workerWriteScopeBlock(event, ctx);
   // Owner mode (design §13) is opted into only by the launch-time label; a
   // session without it never reaches this branch.
@@ -1477,7 +1484,7 @@ function occurrenceIdentityArgs(callId: string, nativeSession: string): string[]
 // this path has nothing to hide.
 const MAX_PENDING_OCCURRENCES = 50;
 const OCCURRENCE_SPAWN_TIMEOUT_MS = 4_000;
-interface PendingOccurrence { args: string[]; resolve: (persisted: boolean) => void; }
+interface PendingOccurrence { args: string[]; stdin?: string; requireProposal: boolean; resolve: (persisted: boolean) => void; }
 const pendingOccurrenceQueue: PendingOccurrence[] = [];
 let pendingOccurrenceDropped = 0;
 // Round 7 follow-up (Main review): spawn/exit/timeout failures were only
@@ -1514,14 +1521,15 @@ let pendingOccurrenceFailed = 0;
 // notify branch — so their own `written` shapes are left unchecked, same
 // as before.
 const SEEN_DURABLE_WRITTEN: Record<string, true> = { seen: true, enriched: true, duplicate: true };
-function parsePersistedResponse(stdout: string, cmd: string): boolean {
+export function parsePersistedResponse(stdout: string, cmd: string, requireProposal = false): boolean {
   try {
     const parsed: unknown = JSON.parse(stdout.trim());
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
     const r = parsed as Record<string, unknown>;
     if (typeof r.occ_key !== "string" || r.occ_key.length === 0 || "error" in r) return false;
     if (cmd !== "seen") return true;
-    return typeof r.written === "string" && Object.hasOwn(SEEN_DURABLE_WRITTEN, r.written);
+    const durable = typeof r.written === "string" && Object.hasOwn(SEEN_DURABLE_WRITTEN, r.written);
+    return durable && (!requireProposal || r.proposal === "written" || r.proposal === "exists");
   } catch {
     return false;
   }
@@ -1547,12 +1555,16 @@ function parsePersistedResponse(stdout: string, cmd: string): boolean {
 // explicit: true only for a clean exit whose stdout is a real success
 // response (parsePersistedResponse above); every other outcome resolves
 // false and still logs the truthful reason.
-function runOccurrenceAsync(py: string, args: string[]): Promise<boolean> {
+function runOccurrenceAsync(py: string, args: string[], stdin?: string, requireProposal = false): Promise<boolean> {
   const { promise, resolve } = Promise.withResolvers<boolean>();
   let settled = false;
   let child;
   try {
-    child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: ["ignore", "pipe", "pipe"], detached: true });
+    child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: true });
+    if (stdin !== undefined && child.stdin) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(stdin);
+    }
   } catch (e: unknown) {
     pendingOccurrenceFailed++;
     console.error(`herdr: recordOccurrence: spawn threw (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${e}`);
@@ -1590,13 +1602,71 @@ function runOccurrenceAsync(py: string, args: string[]): Promise<boolean> {
       resolve(false);
       return;
     }
-    if (!parsePersistedResponse(stdout, args[0])) {
+    if (!parsePersistedResponse(stdout, args[0], requireProposal)) {
       pendingOccurrenceFailed++;
       console.error(`herdr: recordOccurrence: prompt-occurrence.py exited 0 but its response was not a success (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${stdout.slice(0, 300)}`);
       resolve(false);
       return;
     }
     resolve(true);
+  });
+  return promise;
+}
+
+export function readOccurrenceStateAsync(py: string, args: string[]): Promise<Record<string, unknown>> {
+  const { promise, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
+  let settled = false;
+  let child;
+  try {
+    child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: ["ignore", "pipe", "ignore"], detached: true });
+  } catch (error) {
+    reject(error instanceof Error ? error : new Error(String(error)));
+    return promise;
+  }
+  let stdout = "";
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    if (child.pid) killGroup(child.pid);
+    reject(new Error(`prompt-occurrence state lookup timed out after ${OCCURRENCE_SPAWN_TIMEOUT_MS}ms`));
+  }, OCCURRENCE_SPAWN_TIMEOUT_MS);
+  child.stdout?.on("data", (d: Buffer) => { if (stdout.length < 65_536) stdout += d.toString(); });
+  child.on("error", (error: Error) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    reject(error);
+  });
+  child.on("close", (code: number | null) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    if (code !== 0) return reject(new Error(`prompt-occurrence state lookup exited ${code}`));
+    try {
+      const parsed: unknown = JSON.parse(stdout.trim());
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        reject(new Error("prompt-occurrence state lookup returned a non-object"));
+        return;
+      }
+      const record = parsed as Record<string, unknown>;
+      if (typeof record.error === "string" && record.error) {
+        reject(new Error(`prompt-occurrence state lookup failed: ${record.error}`));
+        return;
+      }
+      const validLifecycles = new Set([
+        "unknown", "requested", "approved_awaiting_completion",
+        "resolved:completed", "resolved:declined", "resolved:withdrawn",
+      ]);
+      const validAuthorizations = new Set(["none", "approved"]);
+      if (typeof record.lifecycle !== "string" || !validLifecycles.has(record.lifecycle)
+        || typeof record.authorization !== "string" || !validAuthorizations.has(record.authorization)) {
+        reject(new Error("prompt-occurrence state lookup returned an invalid state schema"));
+        return;
+      }
+      resolve(record);
+    } catch {
+      reject(new Error("prompt-occurrence state lookup returned malformed JSON"));
+    }
   });
   return promise;
 }
@@ -1620,7 +1690,7 @@ async function drainOccurrenceQueue(): Promise<void> {
       if (!py) return;
       const item = pendingOccurrenceQueue.shift();
       if (!item) return;
-      const persisted = await runOccurrenceAsync(py, item.args);
+      const persisted = await runOccurrenceAsync(py, item.args, item.stdin, item.requireProposal);
       item.resolve(persisted);
     }
   } finally {
@@ -1628,7 +1698,9 @@ async function drainOccurrenceQueue(): Promise<void> {
   }
 }
 
-export function recordOccurrence(args: string[]): Promise<boolean> {
+// `stdin` carries tool input (`--input-json -`): write/edit content must not
+// sit in argv, where any local user can read it with ps (#277 review r1).
+export function recordOccurrence(args: string[], stdin?: string): Promise<boolean> {
   const { promise, resolve } = Promise.withResolvers<boolean>();
   if (!promptOccurrenceAvailable || !WORKER_RUN_ID || !WORKER_TASK_ID || !WORKER_PANE_ID) {
     resolve(false);
@@ -1640,10 +1712,36 @@ export function recordOccurrence(args: string[]): Promise<boolean> {
     console.error(`herdr: recordOccurrence: pending-queue cap (${MAX_PENDING_OCCURRENCES}) reached — oldest queued occurrence dropped (total dropped this session: ${pendingOccurrenceDropped})`);
     dropped?.resolve(false); // it will never persist now; its waiter must not hang on it
   }
-  pendingOccurrenceQueue.push({ args, resolve });
+  pendingOccurrenceQueue.push({ args, stdin, requireProposal: args.includes("--bound-envelope"), resolve });
   if (hubPythonCache) void drainOccurrenceQueue();
   else refreshHubPythonAsync();
   return promise;
+}
+
+type BoundApprovalPollScheduler = (
+  callback: () => void,
+  delayMs: number,
+) => ReturnType<typeof setTimeout>;
+
+// Every detached approval-state lookup, including retries, enters through this
+// one rejection boundary. The caller has already returned {defer:true}, so an
+// unhandled rejection here would otherwise strand OMP's exact approval request
+// forever. The injectable scheduler keeps both the immediate and delayed paths
+// deterministic in the hook harness without adding a production test switch.
+export function launchBoundApprovalPoll(
+  poll: () => Promise<void>,
+  deny: (error: unknown) => void,
+  delayMs = 0,
+  scheduler: BoundApprovalPollScheduler = setTimeout,
+): void {
+  const run = (): void => {
+    void poll().catch(deny);
+  };
+  if (delayMs <= 0) {
+    run();
+    return;
+  }
+  scheduler(run, delayMs).unref();
 }
 
 // Bounded (same eviction shape as inputByCallId/pendingScratch): which
@@ -1664,13 +1762,47 @@ function trackOccurrence(callId: string, nativeSession: string, decided: boolean
   }
 }
 
-
-function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
+function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | undefined {
+  let deferred = false;
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     const toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
     const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
-    const input = e.input ?? e.args ?? (callId !== undefined ? inputByCallId.get(callId) : undefined);
+    const cached = callId !== undefined ? inputByCallId.get(callId) : undefined;
+    const requestId = typeof e.requestId === "string" ? e.requestId : "";
+    const coreDigest = typeof e.argumentsDigest === "string" ? e.argumentsDigest : "";
+    const coreArgumentsJson = typeof e.argumentsJson === "string" ? e.argumentsJson : "";
+    const bindingProtocol = e.bindingProtocol === "omp.tool-approval-binding.v1" ? e.bindingProtocol : "";
+    const exclusiveResolver = e.exclusiveResolver === true;
+    const approvalSession = typeof e.sessionId === "string" ? e.sessionId : "";
+    const context = ctx && typeof ctx === "object" ? ctx as Record<string, unknown> : {};
+    const resolveBound = typeof context.resolveToolApproval === "function"
+      ? context.resolveToolApproval as (resolution: Record<string, unknown>) => boolean
+      : undefined;
+    const boundTool = /^(write|edit)$/i.test(toolName);
+    const coreArgumentsValid = /^sha256:[a-f0-9]{64}$/.test(coreDigest)
+      && coreArgumentsJson.length <= 200_000
+      && `sha256:${Bun.SHA256.hash(coreArgumentsJson, "hex")}` === coreDigest;
+    let coreInput: unknown;
+    if (coreArgumentsValid) {
+      try { coreInput = JSON.parse(coreArgumentsJson); } catch { coreInput = undefined; }
+    }
+    deferred = exclusiveResolver && boundTool && Boolean(callId) && Boolean(requestId) && Boolean(bindingProtocol)
+      && Boolean(approvalSession)
+      && /^sha256:[a-f0-9]{64}$/.test(coreDigest)
+      && coreInput !== undefined
+      && Boolean(resolveBound);
+    // A deferred request must be proposed from OMP's exact canonical effective
+    // arguments, never the earlier tool_call cache. The cache remains the
+    // compatibility source for ordinary/unbound events.
+    const input = deferred ? coreInput : (e.input ?? e.args ?? cached?.input);
+    // ceiling: past ~200k chars the input is not recorded (no digest, no
+    // proposal), which leaves that approval human-only.
+    const inputJson = input !== undefined ? JSON.stringify(input) : undefined;
+    const occurrenceStdin = deferred
+      ? JSON.stringify({ input, core_arguments_json: coreArgumentsJson })
+      : inputJson;
+    const recordInput = inputJson !== undefined && inputJson.length <= 200_000;
     // Cache kept, never deleted here: omp can fire tool_approval_requested
     // more than once for ONE still-open prompt (the existing compound-menu
     // fixture pins exactly that repeat-firing shape), and deleting on the
@@ -1714,12 +1846,19 @@ function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
           ? await recordOccurrence([
               "seen", ...occurrenceIdentityArgs(callId, nativeSession),
               "--tool", toolName,
-              ...(input !== undefined ? ["--input-json", JSON.stringify(input)] : []),
+              ...(recordInput ? ["--input-json", "-"] : []),
               "--source", "tool_approval_requested",
-            ])
+              ...(deferred ? ["--approval-request-id", requestId, "--core-arguments-digest", coreDigest,
+                "--binding-protocol", bindingProtocol, "--bound-envelope"] : []),
+              ...(cached ? ["--cwd", cached.cwd, "--dispatched-at-ms", String(cached.at)] : []),
+            ], recordInput ? occurrenceStdin : undefined)
           : false;
         if (!persisted) {
           console.error(`herdr: recordOccurrence: occurrence was not durably persisted — suppressing the approval notification for ${toolName} (call ${callId ?? "unknown"})`);
+          if (deferred && resolveBound && callId) resolveBound({
+            bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
+            argumentsDigest: coreDigest, approved: false, reason: "approval occurrence was not persisted",
+          });
           return;
         }
         notifyForPrompt(
@@ -1729,14 +1868,59 @@ function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
           callId,
           nativeSession,
         );
-      } catch {
-        // MUST NOT throw — see the fail-closed contract at the top of this file.
+        if (deferred && resolveBound && callId) {
+          const identity = [
+            "state", ...occurrenceIdentityArgs(callId, nativeSession),
+          ];
+          const deadline = Date.now() + 60 * 60 * 1000;
+          const denyPollFailure = (error: unknown): void => {
+            resolveBound({
+              bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
+              argumentsDigest: coreDigest, approved: false,
+              reason: `bound approval poll failed: ${error instanceof Error ? error.message : String(error)}`,
+            });
+          };
+          const poll = async (): Promise<void> => {
+            const py = hubPythonCache;
+            if (!py) {
+              if (Date.now() < deadline) launchBoundApprovalPoll(poll, denyPollFailure, 500);
+              else resolveBound({ bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId,
+                toolName, argumentsDigest: coreDigest, approved: false, reason: "bound approval timed out" });
+              return;
+            }
+            const state = await readOccurrenceStateAsync(py, identity);
+            const lifecycle = typeof state?.lifecycle === "string" ? state.lifecycle : "";
+            if (state?.authorization === "approved" && lifecycle === "approved_awaiting_completion") {
+              resolveBound({ bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
+                argumentsDigest: coreDigest, approved: true });
+              return;
+            }
+            if (lifecycle.startsWith("resolved:")) {
+              resolveBound({ bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
+                argumentsDigest: coreDigest, approved: false, reason: lifecycle });
+              return;
+            }
+            if (Date.now() < deadline) launchBoundApprovalPoll(poll, denyPollFailure, 500);
+            else resolveBound({ bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
+              argumentsDigest: coreDigest, approved: false, reason: "bound approval timed out" });
+          };
+          launchBoundApprovalPoll(poll, denyPollFailure);
+        }
+      } catch (error) {
+        // The handler already returned {defer:true}; swallowing an unexpected
+        // detached failure would strand OMP forever. Resolve this exact binding
+        // as denied. A prior one-shot resolution simply returns false.
+        if (deferred && resolveBound && callId) resolveBound({
+          bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
+          argumentsDigest: coreDigest, approved: false,
+          reason: `deferred approval workflow failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
       }
     })();
   } catch {
     // MUST NOT throw — see the fail-closed contract at the top of this file.
   }
-  return undefined;
+  return deferred ? { defer: true } : undefined;
 }
 
 // The `ask` tool is not an approval, so it emits no approval event — it just
@@ -1746,6 +1930,13 @@ function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
 function onExecutionStart(event: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
+    // #277 timing evidence: execution start of a call that went through the
+    // approval menu (lifecycle unchanged; completion still comes from end).
+    const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
+    const occ = callId !== undefined ? occurrenceByCallId.get(callId) : undefined;
+    if (callId !== undefined && occ?.decided) {
+      recordOccurrence(["started", ...occurrenceIdentityArgs(callId, occ.nativeSession)]);
+    }
     if (e.toolName !== "ask") return undefined;
     const args = e.args && typeof e.args === "object" ? (e.args as Record<string, unknown>) : {};
     const questions = Array.isArray(args.questions) ? args.questions : [];
@@ -1758,6 +1949,13 @@ function onExecutionStart(event: unknown): undefined {
     // see onApprovalRequested().
   }
   return undefined;
+}
+
+// OMP v1 invokes this synchronously adjacent to execution, after approval and
+// argument-digest verification. Only the non-mutating filesystem scope guard
+// runs here: never replay tool_call handlers that revise input or emit effects.
+function onExecutionValidate(event: unknown, ctx?: unknown): Block | undefined {
+  return workerWriteScopeBlock(event, ctx);
 }
 
 // Retraction is now edge-triggered too: the prompt was answered (in the
@@ -2486,9 +2684,14 @@ function onSessionStop(): { continue: true; additionalContext: string } | undefi
 
 export default function (pi: HookAPI): void {
   pi.on("tool_call", onToolCall);
-  pi.on("tool_approval_requested", onApprovalRequested);
+  // Patched OMP separates authority from legacy lifecycle observers. Older
+  // OMP versions do not expose this method; their approval event has no exact
+  // binding/resolver, so the compatibility registration remains human-only.
+  if (typeof pi.handleToolApproval === "function") pi.handleToolApproval(onApprovalRequested);
+  else pi.on("tool_approval_requested", onApprovalRequested as never);
   pi.on("tool_approval_resolved", onApprovalResolved);
   pi.on("tool_execution_start", onExecutionStart);
+  pi.on("tool_execution_validate", onExecutionValidate);
   pi.on("tool_execution_end", onExecutionEnd);
   pi.on("before_agent_start", onBeforeAgentStart);
   pi.on("tool_result", onToolResult);
