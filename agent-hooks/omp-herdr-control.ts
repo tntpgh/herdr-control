@@ -1091,21 +1091,14 @@ function notifyForPrompt(
 // that fail the central registration/generation check, and for a registered
 // worker's file-mutating call outside its worktree (workerWriteScopeBlock).
 const INPUT_CACHE_MAX = 32;
-// #277: write/edit inputs are cached too, so their approval occurrence records
-// the complete payload (digest + proposal) instead of only a clipped panel.
-// `at` is the dispatch time and `cwd` the directory relative targets resolve
-// against (the same one workerWriteScopeBlock judged).
-const APPROVAL_INPUT_TOOLS: Record<string, true> = { bash: true, shell: true, write: true, edit: true };
-const inputByCallId = new Map<string, { input: unknown; at: number; cwd: string }>();
+const inputByCallId = new Map<string, unknown>();
 
-function cacheApprovalInput(event: unknown, ctx?: unknown): void {
+function cacheBashInput(event: unknown): void {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     const name = typeof e.toolName === "string" ? e.toolName.toLowerCase() : "";
-    if (!Object.hasOwn(APPROVAL_INPUT_TOOLS, name) || typeof e.toolCallId !== "string") return;
-    const c = ctx && typeof ctx === "object" ? (ctx as Record<string, unknown>).cwd : undefined;
-    const cwd = typeof c === "string" && path.isAbsolute(c) ? c : process.cwd();
-    inputByCallId.set(e.toolCallId, { input: e.input, at: Date.now(), cwd });
+    if ((name !== "bash" && name !== "shell") || typeof e.toolCallId !== "string") return;
+    inputByCallId.set(e.toolCallId, e.input);
     while (inputByCallId.size > INPUT_CACHE_MAX) {
       const oldest = inputByCallId.keys().next().value;
       if (oldest === undefined) break;
@@ -1157,7 +1150,7 @@ function readOnlyChildBlock(event: unknown, ctx?: unknown): Block | undefined {
 }
 
 function onToolCall(event: unknown, ctx?: unknown): Block | undefined {
-  cacheApprovalInput(event, ctx);
+  cacheBashInput(event);
   const result = readOnlyChildBlock(event, ctx) ?? pretoolRegistrationBlock(event) ?? workerWriteScopeBlock(event, ctx);
   // Owner mode (design §13) is opted into only by the launch-time label; a
   // session without it never reaches this branch.
@@ -1484,7 +1477,7 @@ function occurrenceIdentityArgs(callId: string, nativeSession: string): string[]
 // this path has nothing to hide.
 const MAX_PENDING_OCCURRENCES = 50;
 const OCCURRENCE_SPAWN_TIMEOUT_MS = 4_000;
-interface PendingOccurrence { args: string[]; stdin?: string; requireProposal: boolean; resolve: (persisted: boolean) => void; }
+interface PendingOccurrence { args: string[]; resolve: (persisted: boolean) => void; }
 const pendingOccurrenceQueue: PendingOccurrence[] = [];
 let pendingOccurrenceDropped = 0;
 // Round 7 follow-up (Main review): spawn/exit/timeout failures were only
@@ -1521,15 +1514,14 @@ let pendingOccurrenceFailed = 0;
 // notify branch — so their own `written` shapes are left unchecked, same
 // as before.
 const SEEN_DURABLE_WRITTEN: Record<string, true> = { seen: true, enriched: true, duplicate: true };
-export function parsePersistedResponse(stdout: string, cmd: string, requireProposal = false): boolean {
+function parsePersistedResponse(stdout: string, cmd: string): boolean {
   try {
     const parsed: unknown = JSON.parse(stdout.trim());
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
     const r = parsed as Record<string, unknown>;
     if (typeof r.occ_key !== "string" || r.occ_key.length === 0 || "error" in r) return false;
     if (cmd !== "seen") return true;
-    const durable = typeof r.written === "string" && Object.hasOwn(SEEN_DURABLE_WRITTEN, r.written);
-    return durable && (!requireProposal || r.proposal === "written" || r.proposal === "exists");
+    return typeof r.written === "string" && Object.hasOwn(SEEN_DURABLE_WRITTEN, r.written);
   } catch {
     return false;
   }
@@ -1555,16 +1547,12 @@ export function parsePersistedResponse(stdout: string, cmd: string, requirePropo
 // explicit: true only for a clean exit whose stdout is a real success
 // response (parsePersistedResponse above); every other outcome resolves
 // false and still logs the truthful reason.
-function runOccurrenceAsync(py: string, args: string[], stdin?: string, requireProposal = false): Promise<boolean> {
+function runOccurrenceAsync(py: string, args: string[]): Promise<boolean> {
   const { promise, resolve } = Promise.withResolvers<boolean>();
   let settled = false;
   let child;
   try {
-    child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: true });
-    if (stdin !== undefined && child.stdin) {
-      child.stdin.on("error", () => {});
-      child.stdin.end(stdin);
-    }
+    child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: ["ignore", "pipe", "pipe"], detached: true });
   } catch (e: unknown) {
     pendingOccurrenceFailed++;
     console.error(`herdr: recordOccurrence: spawn threw (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${e}`);
@@ -1602,52 +1590,13 @@ function runOccurrenceAsync(py: string, args: string[], stdin?: string, requireP
       resolve(false);
       return;
     }
-    if (!parsePersistedResponse(stdout, args[0], requireProposal)) {
+    if (!parsePersistedResponse(stdout, args[0])) {
       pendingOccurrenceFailed++;
       console.error(`herdr: recordOccurrence: prompt-occurrence.py exited 0 but its response was not a success (total failed this session: ${pendingOccurrenceFailed}) — occurrence NOT recorded: ${stdout.slice(0, 300)}`);
       resolve(false);
       return;
     }
     resolve(true);
-  });
-  return promise;
-}
-
-function readOccurrenceStateAsync(py: string, args: string[]): Promise<Record<string, unknown> | undefined> {
-  const { promise, resolve } = Promise.withResolvers<Record<string, unknown> | undefined>();
-  let settled = false;
-  let child;
-  try {
-    child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: ["ignore", "pipe", "ignore"], detached: true });
-  } catch {
-    resolve(undefined);
-    return promise;
-  }
-  let stdout = "";
-  const timer = setTimeout(() => {
-    if (settled) return;
-    settled = true;
-    if (child.pid) killGroup(child.pid);
-    resolve(undefined);
-  }, OCCURRENCE_SPAWN_TIMEOUT_MS);
-  child.stdout?.on("data", (d: Buffer) => { if (stdout.length < 65_536) stdout += d.toString(); });
-  child.on("error", () => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timer);
-    resolve(undefined);
-  });
-  child.on("close", (code: number | null) => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timer);
-    if (code !== 0) return resolve(undefined);
-    try {
-      const parsed: unknown = JSON.parse(stdout.trim());
-      resolve(parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined);
-    } catch {
-      resolve(undefined);
-    }
   });
   return promise;
 }
@@ -1671,7 +1620,7 @@ async function drainOccurrenceQueue(): Promise<void> {
       if (!py) return;
       const item = pendingOccurrenceQueue.shift();
       if (!item) return;
-      const persisted = await runOccurrenceAsync(py, item.args, item.stdin, item.requireProposal);
+      const persisted = await runOccurrenceAsync(py, item.args);
       item.resolve(persisted);
     }
   } finally {
@@ -1679,9 +1628,7 @@ async function drainOccurrenceQueue(): Promise<void> {
   }
 }
 
-// `stdin` carries tool input (`--input-json -`): write/edit content must not
-// sit in argv, where any local user can read it with ps (#277 review r1).
-export function recordOccurrence(args: string[], stdin?: string): Promise<boolean> {
+export function recordOccurrence(args: string[]): Promise<boolean> {
   const { promise, resolve } = Promise.withResolvers<boolean>();
   if (!promptOccurrenceAvailable || !WORKER_RUN_ID || !WORKER_TASK_ID || !WORKER_PANE_ID) {
     resolve(false);
@@ -1693,7 +1640,7 @@ export function recordOccurrence(args: string[], stdin?: string): Promise<boolea
     console.error(`herdr: recordOccurrence: pending-queue cap (${MAX_PENDING_OCCURRENCES}) reached — oldest queued occurrence dropped (total dropped this session: ${pendingOccurrenceDropped})`);
     dropped?.resolve(false); // it will never persist now; its waiter must not hang on it
   }
-  pendingOccurrenceQueue.push({ args, stdin, requireProposal: args.includes("--bound-envelope"), resolve });
+  pendingOccurrenceQueue.push({ args, resolve });
   if (hubPythonCache) void drainOccurrenceQueue();
   else refreshHubPythonAsync();
   return promise;
@@ -1717,47 +1664,13 @@ function trackOccurrence(callId: string, nativeSession: string, decided: boolean
   }
 }
 
-function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | undefined {
-  let deferred = false;
+
+function onApprovalRequested(event: unknown, ctx?: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
     const toolName = typeof e.toolName === "string" && e.toolName ? e.toolName : "tool";
     const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
-    const cached = callId !== undefined ? inputByCallId.get(callId) : undefined;
-    const requestId = typeof e.requestId === "string" ? e.requestId : "";
-    const coreDigest = typeof e.argumentsDigest === "string" ? e.argumentsDigest : "";
-    const coreArgumentsJson = typeof e.argumentsJson === "string" ? e.argumentsJson : "";
-    const bindingProtocol = e.bindingProtocol === "omp.tool-approval-binding.v1" ? e.bindingProtocol : "";
-    const exclusiveResolver = e.exclusiveResolver === true;
-    const approvalSession = typeof e.sessionId === "string" ? e.sessionId : "";
-    const context = ctx && typeof ctx === "object" ? ctx as Record<string, unknown> : {};
-    const resolveBound = typeof context.resolveToolApproval === "function"
-      ? context.resolveToolApproval as (resolution: Record<string, unknown>) => boolean
-      : undefined;
-    const boundTool = /^(write|edit)$/i.test(toolName);
-    const coreArgumentsValid = /^sha256:[a-f0-9]{64}$/.test(coreDigest)
-      && coreArgumentsJson.length <= 200_000
-      && `sha256:${Bun.SHA256.hash(coreArgumentsJson, "hex")}` === coreDigest;
-    let coreInput: unknown;
-    if (coreArgumentsValid) {
-      try { coreInput = JSON.parse(coreArgumentsJson); } catch { coreInput = undefined; }
-    }
-    deferred = exclusiveResolver && boundTool && Boolean(callId) && Boolean(requestId) && Boolean(bindingProtocol)
-      && Boolean(approvalSession)
-      && /^sha256:[a-f0-9]{64}$/.test(coreDigest)
-      && coreInput !== undefined
-      && Boolean(resolveBound);
-    // A deferred request must be proposed from OMP's exact canonical effective
-    // arguments, never the earlier tool_call cache. The cache remains the
-    // compatibility source for ordinary/unbound events.
-    const input = deferred ? coreInput : (e.input ?? e.args ?? cached?.input);
-    // ceiling: past ~200k chars the input is not recorded (no digest, no
-    // proposal), which leaves that approval human-only.
-    const inputJson = input !== undefined ? JSON.stringify(input) : undefined;
-    const occurrenceStdin = deferred
-      ? JSON.stringify({ input, core_arguments_json: coreArgumentsJson })
-      : inputJson;
-    const recordInput = inputJson !== undefined && inputJson.length <= 200_000;
+    const input = e.input ?? e.args ?? (callId !== undefined ? inputByCallId.get(callId) : undefined);
     // Cache kept, never deleted here: omp can fire tool_approval_requested
     // more than once for ONE still-open prompt (the existing compound-menu
     // fixture pins exactly that repeat-firing shape), and deleting on the
@@ -1801,19 +1714,12 @@ function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | u
           ? await recordOccurrence([
               "seen", ...occurrenceIdentityArgs(callId, nativeSession),
               "--tool", toolName,
-              ...(recordInput ? ["--input-json", "-"] : []),
+              ...(input !== undefined ? ["--input-json", JSON.stringify(input)] : []),
               "--source", "tool_approval_requested",
-              ...(deferred ? ["--approval-request-id", requestId, "--core-arguments-digest", coreDigest,
-                "--binding-protocol", bindingProtocol, "--bound-envelope"] : []),
-              ...(cached ? ["--cwd", cached.cwd, "--dispatched-at-ms", String(cached.at)] : []),
-            ], recordInput ? occurrenceStdin : undefined)
+            ])
           : false;
         if (!persisted) {
           console.error(`herdr: recordOccurrence: occurrence was not durably persisted — suppressing the approval notification for ${toolName} (call ${callId ?? "unknown"})`);
-          if (deferred && resolveBound && callId) resolveBound({
-            bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
-            argumentsDigest: coreDigest, approved: false, reason: "approval occurrence was not persisted",
-          });
           return;
         }
         notifyForPrompt(
@@ -1823,37 +1729,6 @@ function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | u
           callId,
           nativeSession,
         );
-        if (deferred && resolveBound && callId) {
-          const identity = [
-            "state", ...occurrenceIdentityArgs(callId, nativeSession),
-          ];
-          const deadline = Date.now() + 60 * 60 * 1000;
-          const poll = async (): Promise<void> => {
-            const py = hubPythonCache;
-            if (!py) {
-              if (Date.now() < deadline) setTimeout(() => void poll(), 500).unref();
-              else resolveBound({ bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId,
-                toolName, argumentsDigest: coreDigest, approved: false, reason: "bound approval timed out" });
-              return;
-            }
-            const state = await readOccurrenceStateAsync(py, identity);
-            const lifecycle = typeof state?.lifecycle === "string" ? state.lifecycle : "";
-            if (state?.authorization === "approved" && lifecycle === "approved_awaiting_completion") {
-              resolveBound({ bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
-                argumentsDigest: coreDigest, approved: true });
-              return;
-            }
-            if (lifecycle.startsWith("resolved:")) {
-              resolveBound({ bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
-                argumentsDigest: coreDigest, approved: false, reason: lifecycle });
-              return;
-            }
-            if (Date.now() < deadline) setTimeout(() => void poll(), 500).unref();
-            else resolveBound({ bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
-              argumentsDigest: coreDigest, approved: false, reason: "bound approval timed out" });
-          };
-          void poll();
-        }
       } catch {
         // MUST NOT throw — see the fail-closed contract at the top of this file.
       }
@@ -1861,7 +1736,7 @@ function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | u
   } catch {
     // MUST NOT throw — see the fail-closed contract at the top of this file.
   }
-  return deferred ? { defer: true } : undefined;
+  return undefined;
 }
 
 // The `ask` tool is not an approval, so it emits no approval event — it just
@@ -1871,13 +1746,6 @@ function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | u
 function onExecutionStart(event: unknown): undefined {
   try {
     const e = event && typeof event === "object" ? (event as Record<string, unknown>) : {};
-    // #277 timing evidence: execution start of a call that went through the
-    // approval menu (lifecycle unchanged; completion still comes from end).
-    const callId = typeof e.toolCallId === "string" ? e.toolCallId : undefined;
-    const occ = callId !== undefined ? occurrenceByCallId.get(callId) : undefined;
-    if (callId !== undefined && occ?.decided) {
-      recordOccurrence(["started", ...occurrenceIdentityArgs(callId, occ.nativeSession)]);
-    }
     if (e.toolName !== "ask") return undefined;
     const args = e.args && typeof e.args === "object" ? (e.args as Record<string, unknown>) : {};
     const questions = Array.isArray(args.questions) ? args.questions : [];
@@ -1890,13 +1758,6 @@ function onExecutionStart(event: unknown): undefined {
     // see onApprovalRequested().
   }
   return undefined;
-}
-
-// OMP v1 invokes this synchronously adjacent to execution, after approval and
-// argument-digest verification. Only the non-mutating filesystem scope guard
-// runs here: never replay tool_call handlers that revise input or emit effects.
-function onExecutionValidate(event: unknown, ctx?: unknown): Block | undefined {
-  return workerWriteScopeBlock(event, ctx);
 }
 
 // Retraction is now edge-triggered too: the prompt was answered (in the
@@ -2628,7 +2489,6 @@ export default function (pi: HookAPI): void {
   pi.on("tool_approval_requested", onApprovalRequested);
   pi.on("tool_approval_resolved", onApprovalResolved);
   pi.on("tool_execution_start", onExecutionStart);
-  pi.on("tool_execution_validate", onExecutionValidate);
   pi.on("tool_execution_end", onExecutionEnd);
   pi.on("before_agent_start", onBeforeAgentStart);
   pi.on("tool_result", onToolResult);

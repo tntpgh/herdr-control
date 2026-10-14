@@ -429,28 +429,16 @@ fi
 # human-required prompt sitting held for the full 90s grace window exactly
 # like the peer_decide race this branch exists to fix.
 _refuse_non_human() {                   # verdict reason
-  local v="$1" r="$2" c="$cmd_text"
-  # #277: a write/edit is never copied into the shared events table or a wake,
-  # whatever its validation outcome: a verified payload is referenced by
-  # header + hash; anything else (missing/malformed/hash-refused proposal, no
-  # occurrence, tool mismatch) by header only. Raw input stays in the proposal.
-  if [ "${payload_bound:-0}" = 1 ]; then
-    c="$(printf '%s' "$payload_json" | jq -r '.audit_text')"
-  else
-    case "${registry_tool_lc:-}:${panel_tool:-}" in
-      write:*|edit:*) c="Allow tool: $registry_tool_lc [complete payload not verified; panel text withheld]" ;;
-      *:write|*:edit) c="Allow tool: $panel_tool [complete payload not verified; panel text withheld]" ;;
-    esac
-  fi
+  local v="$1" r="$2"
   append_event "$own_run" "$own_task" "approval_escalated" \
-    "$(jq -nc --arg v "$v" --arg r "$r" --arg p "$pane" --arg pid "$current_prompt_id" --arg c "$c" \
+    "$(jq -nc --arg v "$v" --arg r "$r" --arg p "$pane" --arg pid "$current_prompt_id" --arg c "$cmd_text" \
        '{verdict:$v, reason:$r, pane:$p, prompt_id:$pid, command:$c}')" >/dev/null 2>&1 || true
   own_cpane="$(printf '%s' "$own_task_json" | jq -r '.conductor_pane_id // empty' 2>/dev/null)"
   own_label="$(printf '%s' "$own_task_json" | jq -r '.label // empty' 2>/dev/null)"
   release_wake_hold "$pane" "$current_prompt_id" "$own_run" "$own_task" \
     "$own_cpane" "$own_label" \
     "a peer refused this prompt ($v): ${r:-no reason given} — a human must answer it" \
-    "$own_label" "$c" "peer refused: $v" >/dev/null 2>&1 || true
+    "$own_label" "$cmd_text" "peer refused: $v" >/dev/null 2>&1 || true
   exit 8
 }
 
@@ -601,44 +589,6 @@ if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ];
       if [ -z "$registry_tool" ] || [ "$panel_tool" != "$registry_tool_lc" ]; then
         echo "herdr-select: $pane's approval panel claims tool '$panel_tool' but the hook recorded '${registry_tool:-<none>}' for this prompt — refusing." >&2
         _refuse_non_human "escalate" "the panel's claimed tool does not match the hook-recorded tool for this prompt"
-      fi
-      ;;
-  esac
-fi
-
-# ---- herdr-control #277: write/edit approvals are HUMAN-ONLY ---------------
-# omp 18.10.3 resolves an approval only by a keypress on whatever prompt is
-# painted; it has no request-id-targeted resolver. Two queued write/edit
-# prompts can render identically (an edit shows only file names; a write
-# shows its first 2000 chars), so no screen check before Enter can prove
-# which call the key approves. Until an upstream targeted API or an
-# unforgeable call/payload digest exists, no peer or conductor presses
-# Approve on a write/edit. The hook still records the complete payload
-# (lib/prompt-occurrence.py `proposal --show` is the reviewer's view) and
-# the refusal is audited by header + sha256 only (raw input stays in the
-# proposal file, never in the shared events table or a wake).
-payload_bound=0; payload_json=""; bound_resolution=0
-if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ]; then
-  case "$registry_tool_lc:${panel_tool:-}" in
-    write:*|edit:*|*:write|*:edit)
-      show_cmd="(no registered task/prompt: no recorded payload to show)"
-      if [ -n "$own_run" ] && [ -n "$own_task" ] && [ -n "$own_worktree" ] && [ -n "$current_prompt_id" ] && [ -n "${occ_py:-}" ]; then
-        payload_json="$("$occ_py" "$here/lib/prompt-occurrence.py" proposal --db "$(registry_db)" \
-          --run "$own_run" --task "$own_task" --pane "$pane" \
-          --birth "$(printf '%s' "$own_task_json" | jq -r '.pane_birth // empty' 2>/dev/null)" \
-          --prompt-id "$current_prompt_id" --worktree "$own_worktree" --tool "$registry_tool_lc" 2>/dev/null)"
-        [ "$(printf '%s' "$payload_json" | jq -r '.ok == true' 2>/dev/null)" = true ] && payload_bound=1
-        show_cmd="$here/lib/prompt-occurrence.py proposal --db $(registry_db) --run $own_run --task $own_task --pane $pane --prompt-id $current_prompt_id --worktree $own_worktree --show"
-      fi
-      _bound_request="$(printf '%s' "$payload_json" | jq -r '.approval_request_id // empty' 2>/dev/null)"
-      _bound_digest="$(printf '%s' "$payload_json" | jq -r '.core_arguments_digest // empty' 2>/dev/null)"
-      _bound_protocol="$(printf '%s' "$payload_json" | jq -r '.binding_protocol // empty' 2>/dev/null)"
-      if [ "$payload_bound" = 1 ] && [ "$_bound_protocol" = "omp.tool-approval-binding.v1" ] && [ -n "$_bound_request" ] && printf '%s' "$_bound_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
-        bound_resolution=1
-      else
-        echo "herdr-select: write/edit approvals are human-only (exact OMP approval binding unavailable) — refusing." >&2
-        echo "herdr-select: complete payload for the human reviewer: $show_cmd" >&2
-        _refuse_non_human "escalate" "write/edit approval is human-only (#277)"
       fi
       ;;
   esac
@@ -848,14 +798,8 @@ jq -nc --arg pane "$pane" --arg choice "$choice" --arg label "$label" --arg mech
 approval_id="$(gen_id appr)"
 _run="$own_run"
 _task="$own_task"
-# One line, bounded: this is an audit field, not a transcript. For an exact
-# write/edit proposal use only its verified header+digest; the clipped panel
-# may contain the first bytes of a private body.
-if [ "$payload_bound" = 1 ]; then
-  _cmd_record=$(printf '%s' "$payload_json" | jq -r '.audit_text // empty' | tr '\n' ' ' | cut -c1-500)
-else
-  _cmd_record=$(printf '%s' "$cmd_text" | tr '\n' ' ' | cut -c1-500)
-fi
+# One line, bounded: this is an audit field, not a transcript.
+_cmd_record=$(printf '%s' "$cmd_text" | tr '\n' ' ' | cut -c1-500)
 approval_decided "$approval_id" "$pane" "$current_prompt_id" "$choice" "$label" \
   "${HERDR_SELECT_VIA:-cli}" "$authority" "$policy_verdict" "$_cmd_record" \
   "${_run:-}" "${_task:-}" >/dev/null 2>&1 || {
@@ -972,37 +916,6 @@ _require_current_decision() {
   }
 }
 _require_current_decision || exit 6
-
-if [ "$bound_resolution" = 1 ]; then
-  _payload_sha="$(printf '%s' "$payload_json" | jq -r '.payload_sha256 // empty')"
-  _rechecked="$($occ_py "$here/lib/prompt-occurrence.py" proposal --db "$(registry_db)" \
-    --run "$own_run" --task "$own_task" --pane "$pane" \
-    --birth "$(printf '%s' "$own_task_json" | jq -r '.pane_birth // empty')" \
-    --prompt-id "$current_prompt_id" --worktree "$own_worktree" --tool "$registry_tool_lc" \
-    --expect-sha "$_payload_sha" 2>/dev/null)"
-  [ "$(printf '%s' "$_rechecked" | jq -r '.ok == true' 2>/dev/null)" = true ] || {
-    echo "herdr-select: exact approval payload changed during review — refusing." >&2
-    exit 6
-  }
-  _occ_session="$(printf '%s' "$payload_json" | jq -r '.native_session // empty')"
-  _occ_call="$(printf '%s' "$payload_json" | jq -r '.tool_call_id // empty')"
-  _occ_birth="$(printf '%s' "$payload_json" | jq -r '.pane_birth // empty')"
-  [ -n "$_occ_session" ] && [ -n "$_occ_call" ] && [ -n "$_occ_birth" ] || {
-    echo "herdr-select: exact approval occurrence identity is incomplete — refusing." >&2
-    exit 6
-  }
-  "$occ_py" "$here/lib/prompt-occurrence.py" authorized --db "$(registry_db)" \
-    --run "$own_run" --task "$own_task" --pane "$pane" --birth "$_occ_birth" \
-    --session "$_occ_session" --call-id "$_occ_call" --decided-by "$authority" --choice "$label" \
-    >/dev/null 2>&1 || {
-      echo "herdr-select: failed to persist exact approval resolution — refusing." >&2
-      exit 2
-    }
-  _close_blocked_period || true
-  approval_confirmed "$approval_id" "bound-request" \
-    "mechanism=omp-exact-request request=$_bound_request digest=$_bound_digest" >/dev/null 2>&1 || true
-  exit 0
-fi
 
 if [ "$mechanism" = numbered ]; then
   # Claude's and Codex's selection prompts take the bare digit — no Enter,

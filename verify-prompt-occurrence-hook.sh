@@ -14,18 +14,6 @@ pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 
-# -- bound defer requires a usable proposal, not merely a durable seen row --
-persist_out="$(bun -e '
-const m = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
-const row = (proposal) => JSON.stringify({occ_key:"k",written:"seen",proposal});
-console.log(`written:${m.parsePersistedResponse(row("written"),"seen",true)}`);
-console.log(`exists:${m.parsePersistedResponse(row("exists"),"seen",true)}`);
-console.log(`too_large:${m.parsePersistedResponse(row("too_large"),"seen",true)}`);
-' 2>/dev/null)"
-printf '%s\n' "$persist_out" | grep -q '^written:true$' && ok "bound seen row defers when its proposal was written" || bad "bound written proposal was not accepted"
-printf '%s\n' "$persist_out" | grep -q '^exists:true$' && ok "bound duplicate defers when its exact proposal exists" || bad "bound existing proposal was not accepted"
-printf '%s\n' "$persist_out" | grep -q '^too_large:false$' && ok "oversized bound proposal fails persistence and is denied immediately" || bad "oversized bound proposal was allowed to defer"
-
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 STATE="$WORK/state"
@@ -144,36 +132,6 @@ await new Promise(r => setTimeout(r, 200));
 occ_count="$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type LIKE 'prompt_occ_%';")"
 [ "$occ_count" = "0" ] && ok "an auto-approved call (no approval event) records zero occurrence rows" \
   || bad "expected 0 occurrence rows for an unprompted call, got $occ_count"
-
-# -- #277: a write's complete input reaches the registry and a proposal file -
-sqlite3 "$DB" "DELETE FROM events;"
-WCONTENT="$(for i in $(seq 1 40); do printf 'line %02d of a long multi-line write\n' "$i"; done)"; export WCONTENT
-run_bun '
-const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
-const handlers = {};
-mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
-const ctx = { cwd: "'"$WORK"'", sessionManager: { getSessionId: () => "sess-w" } };
-const input = { path: ".handoffs/plan.md", content: process.env.WCONTENT };
-handlers["tool_call"]({ toolName: "write", toolCallId: "call-w", input }, ctx);
-handlers["tool_approval_requested"]({ toolName: "write", toolCallId: "call-w" }, ctx);
-await new Promise(r => setTimeout(r, 300));
-handlers["tool_approval_resolved"]({ toolName: "write", toolCallId: "call-w", approved: true }, ctx);
-handlers["tool_execution_start"]({ toolName: "write", toolCallId: "call-w", args: input }, ctx);
-await new Promise(r => setTimeout(r, 300));
-' >/dev/null
-seen="$(sqlite3 "$DB" "SELECT payload FROM events WHERE type='prompt_occ_seen';")"
-want_sha="$(WCONTENT="$WCONTENT" python3 -c 'import hashlib,json,os
-body=json.dumps({"tool":"write","input":{"path":".handoffs/plan.md","content":os.environ["WCONTENT"]},"known":True},sort_keys=True,separators=(",",":"))
-print(hashlib.sha256(body.encode()).hexdigest())')"
-[ "$(printf '%s' "$seen" | jq -r .payload_sha256)" = "$want_sha" ] && [ "$(printf '%s' "$seen" | jq -r .cwd)" = "$WORK" ] \
-  && [ "$(printf '%s' "$seen" | jq -r '.dispatched_at_ms | type')" = number ] \
-  && ok "write approval records the full payload sha256, cwd and dispatch time" || bad "write seen row: $seen"
-key="$(printf '%s' "$seen" | jq -r .occ_key)"
-[ "$(jq -r .input.content "$STATE/proposals/$key.json" 2>/dev/null)" = "$WCONTENT" ] \
-  && ok "the proposal file holds the complete multi-line content" || bad "proposal file missing or incomplete"
-case "$seen" in *"line 20 of"*) bad "raw content leaked into the shared events table" ;; *) ok "no raw content in the events table" ;; esac
-[ "$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type='prompt_occ_started';")" = 1 ] \
-  && ok "execution start of the approved write is timestamped" || bad "no prompt_occ_started row"
 
 printf -- '-----\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
