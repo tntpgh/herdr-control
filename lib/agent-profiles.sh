@@ -404,8 +404,17 @@ posture_want_for_job() {  # <want> <job> [approval] [purpose=launch|stamp] -> ef
 
 cli_for_agent() {
   local a="$1" spec="$2" want="${3:-}" job="${4:-}" tools_req="${5:-}" approval="${6:-menu}" m e posture flag
-  local has_effort alt alt_model models tools
+  local has_effort alt alt_model models tools omp_bin omp_sha
   local -a argv
+  case "$a" in
+    claude|codex|omp)
+      omp_bin="${HERDR_OMP_BIN:?HERDR_OMP_BIN is required}"
+      [ -x "$omp_bin" ] || { printf 'cli_for_agent: bound OMP launcher missing: %s\n' "$omp_bin" >&2; return 1; }
+      omp_sha="$(shasum -a 256 "$omp_bin" 2>/dev/null | awk '{print $1}')"
+      [ "$omp_sha" = "${HERDR_OMP_LAUNCHER_SHA256:?HERDR_OMP_LAUNCHER_SHA256 is required}" ] || { printf 'cli_for_agent: bound OMP launcher identity mismatch\n' >&2; return 1; }
+      ;;
+    *) omp_bin=omp ;;
+  esac
   # R3-1 (round-3 security review): research/explore's whole write
   # restriction (handoffs_write, N8) is enforced by _cp_write_menu_verdict,
   # which only ever judges a MENU panel. At the default `write` posture omp
@@ -429,7 +438,7 @@ cli_for_agent() {
       alt_model="${alt%% *}"
       [ "$a" = codex ] && m="openai-codex/$m"
       models="${m},${alt_model}"
-      argv=(omp --model "$m")
+      argv=("$omp_bin" --model "$m")
       if [ "$has_effort" = 1 ]; then
         e="${spec##*:}"
         argv+=(--thinking "$e")
@@ -455,7 +464,7 @@ cli_for_agent() {
       # its first bash call" the way it did when the menu shape had no
       # answering path.
       flag="$(posture_flag_for_agent "$a" "$posture")"
-      argv=(omp --model "$m")
+      argv=("$omp_bin" --model "$m")
       if [ "$m" != "$spec" ]; then
         e="${spec##*:}"
         argv+=(--thinking "$e")
@@ -469,7 +478,7 @@ cli_for_agent() {
   # tools_req (the spawner's own --tools override) wins over the job-class
   # table: "all" forces unrestricted, anything else is used verbatim, "" (the
   # default) falls through to the table.
-  if [ "${argv[0]}" = omp ]; then
+  if [ "${argv[0]}" = omp ] || [ "${argv[0]}" = "$omp_bin" ]; then
     case "$tools_req" in
       all) tools="" ;;
       "")  tools="$(tools_for_job "$job")" ;;
