@@ -70,9 +70,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
 import sqlite3
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 DISPLAY_STATES = {"pending_parseable", "pending_unreadable", "no_prompt", "read_failed", "unknown"}
@@ -107,6 +110,11 @@ def occurrence_key(run_id: str, task_id: str, pane_id: str, pane_birth: str,
     return "occ_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
+def _canonical_input_body(tool: str, tool_input: object) -> bytes:
+    return json.dumps({"tool": tool, "input": tool_input, "known": tool_input is not None},
+                      sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+
+
 def input_digest(tool: str, tool_input: object) -> str:
     """Canonical, order-independent digest of tool+input — sorted keys, no
     whitespace, so the identical input serialized two different ways by two
@@ -115,9 +123,78 @@ def input_digest(tool: str, tool_input: object) -> str:
     value, including `{}`/`""` — M3 (Main review): a caller must say "no
     input" by never calling with one, not by having malformed JSON silently
     coerced into an indistinguishable empty value."""
-    body = json.dumps({"tool": tool, "input": tool_input, "known": tool_input is not None},
-                       sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:32]
+    return hashlib.sha256(_canonical_input_body(tool, tool_input)).hexdigest()[:32]
+
+
+def payload_sha256(tool: str, tool_input: object) -> str:
+    """The full sha256 of the same canonical body input_digest truncates: the
+    hash an approval of a complete write/edit payload is bound to (#277)."""
+    return hashlib.sha256(_canonical_input_body(tool, tool_input)).hexdigest()
+
+
+# ---- complete approval payloads for write/edit (herdr-control #277) --------
+# The registry row (prompt_occ_seen/enriched: input_digest + payload_sha256 +
+# cwd) is the trust anchor; the proposal FILE only carries the bytes, because
+# M4 keeps raw tool input out of the shared events table. A file that does not
+# hash to the registry's value is refused, so tampering, truncation or a
+# substituted file cannot be approved. Deleted when the occurrence resolves.
+PROPOSAL_TOOLS = {"write", "edit"}
+PROPOSAL_VERSION = 1
+# Bounded: raw input never enters the shared events table, only this
+# per-occurrence file, capped at PROPOSAL_MAX_BYTES and deleted when the
+# occurrence resolves. Over the cap no file is written: human-only.
+PROPOSAL_MAX_BYTES = 262_144
+NOTEPAD_XD = {"xd://notepad_append", "xd://notepad_priority", "xd://notepad_stats", "xd://notepad_read"}
+# A proposal whose resolution was never recorded (hook queue drop, omp crash,
+# a human approval that never finished) is swept once this old; a prompt
+# still pending past it simply fails closed (no proposal).
+PROPOSAL_MAX_AGE_S = 24 * 3600
+
+
+def proposal_path(db_path: str, key: str) -> Path:
+    return Path(db_path).resolve().parent / "proposals" / f"{key}.json"
+
+
+def _write_proposal(db_path: str, key: str, record: dict) -> str:
+    """Atomic, 0600, never overwrites an existing proposal for the key (the
+    first recorded input is the one the registry digest describes)."""
+    path = proposal_path(db_path, key)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    _sweep_proposals(path.parent)
+    if path.exists():
+        return "exists"
+    data = json.dumps(record, sort_keys=True)
+    if len(data.encode("utf-8")) > PROPOSAL_MAX_BYTES:
+        return "too_large"
+    tmp = path.with_name(f".{key}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return "written"
+
+
+def _drop_proposal(db_path: str, key: str) -> None:
+    try:
+        proposal_path(db_path, key).unlink()
+    except OSError:
+        pass
+
+
+def _sweep_proposals(directory: Path, now: float | None = None) -> None:
+    """Drop proposals (and temp files a killed writer left) past the age cap."""
+    cutoff = (now if now is not None else time.time()) - PROPOSAL_MAX_AGE_S
+    for entry in directory.iterdir():
+        try:
+            if entry.name.endswith((".json", ".tmp")) and entry.lstat().st_mtime < cutoff:
+                entry.unlink()
+        except OSError:
+            pass
 
 
 def _now_iso(now: float | None = None) -> str:
@@ -170,11 +247,15 @@ def _latest_identity(conn: sqlite3.Connection, task_id: str, key: str) -> dict:
 
 def record_seen(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
                 native_session: str, tool_call_id: str, tool: str, tool_input: object,
-                source: str, now: float | None = None) -> dict:
+                source: str, cwd: str = "", dispatched_at_ms: int | None = None,
+                approval_request_id: str = "", core_arguments_digest: str = "",
+                binding_protocol: str = "", core_arguments_json: str = "",
+                now: float | None = None) -> dict:
     conn = _connect(db_path)
     try:
         key = occurrence_key(run_id, task_id, pane_id, pane_birth, native_session, tool_call_id)
         digest = input_digest(tool, tool_input) if tool_input is not None else None
+        full = payload_sha256(tool, tool_input) if tool_input is not None else None
         eid = f"prompt_occ_seen_{key}"
         # M4 (Main review): never persist the raw tool input (a bash command
         # can carry secrets). Identity/mismatch comparison only ever needs
@@ -183,11 +264,37 @@ def record_seen(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_b
         payload = {
             "occ_key": key, "run_id": run_id, "task_id": task_id, "pane_id": pane_id,
             "pane_birth": pane_birth, "native_session": native_session, "tool_call_id": tool_call_id,
-            "tool": tool, "input_digest": digest, "source": source,
+            "tool": tool, "input_digest": digest, "payload_sha256": full, "source": source,
+            "cwd": cwd, "dispatched_at_ms": dispatched_at_ms,
+            "approval_request_id": approval_request_id,
+            "core_arguments_digest": core_arguments_digest,
+            "binding_protocol": binding_protocol,
+            "at_ms": int((now if now is not None else time.time()) * 1000),
         }
+
+        def proposal(written: str) -> dict:
+            out = {"occ_key": key, "written": written}
+            if tool_input is not None and str(tool).lower() in PROPOSAL_TOOLS:
+                try:
+                    out["proposal"] = _write_proposal(db_path, key, {
+                        "version": PROPOSAL_VERSION, "occ_key": key, "run_id": run_id, "task_id": task_id,
+                        "pane_id": pane_id, "pane_birth": pane_birth, "native_session": native_session,
+                        "tool_call_id": tool_call_id, "tool": tool, "input": tool_input,
+                        "payload_sha256": full,
+                        "approval_request_id": approval_request_id,
+                        "core_arguments_digest": core_arguments_digest,
+                        "binding_protocol": binding_protocol,
+                        "core_arguments_json": core_arguments_json,
+                    })
+                except OSError as exc:
+                    # The occurrence itself IS recorded; without its file the
+                    # payload simply cannot be approved by automation.
+                    out["proposal"] = f"failed: {exc}"
+            return out
+
         first = _put(conn, eid, run_id, task_id, "prompt_occ_seen", payload, now)
         if first:
-            return {"occ_key": key, "written": "seen"}
+            return proposal("seen")
         # Already seen: compare against the CURRENT known identity (seen,
         # overridden by enriched if any has landed), never against the
         # original seen row alone — a second, DIFFERENT input arriving after
@@ -204,9 +311,11 @@ def record_seen(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_b
         if prior_digest is None:
             if digest is not None:
                 eeid = f"prompt_occ_enriched_{key}"
-                _put(conn, eeid, run_id, task_id, "prompt_occ_enriched",
-                     {"occ_key": key, "input_digest": digest}, now)
-                return {"occ_key": key, "written": "enriched"}
+                won = _put(conn, eeid, run_id, task_id, "prompt_occ_enriched",
+                           {"occ_key": key, "input_digest": digest, "payload_sha256": full}, now)
+                # Only the call whose enrichment the registry holds may write
+                # the file that has to hash to it.
+                return proposal("enriched") if won else {"occ_key": key, "written": "enriched"}
             return {"occ_key": key, "written": "duplicate"}
         if digest is None or digest == prior_digest:
             return {"occ_key": key, "written": "duplicate"}
@@ -243,8 +352,105 @@ def record_authorized(db_path: str, *, run_id: str, task_id: str, pane_id: str, 
         key = occurrence_key(run_id, task_id, pane_id, pane_birth, native_session, tool_call_id)
         eid = f"prompt_occ_authorized_{key}"
         first = _put(conn, eid, run_id, task_id, "prompt_occ_authorized",
-                     {"occ_key": key, "decided_by": decided_by, "choice": choice}, now)
+                     {"occ_key": key, "decided_by": decided_by, "choice": choice,
+                      "at_ms": int((now if now is not None else time.time()) * 1000)}, now)
+        if str(choice).strip().lower() in DENY_CHOICES:
+            _drop_proposal(db_path, key)
         return {"occ_key": key, "written": "authorized" if first else "duplicate"}
+    finally:
+        conn.close()
+
+
+def authorize_bound(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
+                    native_session: str, tool_call_id: str, approval_request_id: str,
+                    core_arguments_digest: str, worktree: str, conductor_pane: str,
+                    conductor_birth: str, approval_id: str, choice: str, authority: str,
+                    review_reason: str, review_category: str, reviewer: str,
+                    audit_text: str, expect_payload_sha: str, now: float | None = None) -> dict:
+    """Atomically prove current task/conductor authority and claim one bound request."""
+    conn = _connect(db_path)
+    key = occurrence_key(run_id, task_id, pane_id, pane_birth, native_session, tool_call_id)
+    event_id = f"prompt_occ_authorized_{key}"
+    stamp = _now_iso(now)
+    at_ms = int((now if now is not None else time.time()) * 1000)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute(
+            "SELECT run_id,pane_id,pane_birth,worktree,state,conductor_pane_id,conductor_pane_birth "
+            "FROM tasks WHERE task_id=?", (task_id,),
+        ).fetchone()
+        if not task or task[0] != run_id or task[1] != pane_id or task[2] != pane_birth \
+                or task[3] != worktree or task[4] not in {"starting", "running", "blocked"} \
+                or task[5] != conductor_pane or task[6] != conductor_birth:
+            conn.rollback()
+            return {"occ_key": key, "written": "authority_changed"}
+        seen = conn.execute(
+            "SELECT payload,occurred_at FROM events WHERE event_id=? AND run_id=? AND task_id=? AND type='prompt_occ_seen'",
+            (f"prompt_occ_seen_{key}", run_id, task_id),
+        ).fetchone()
+        if not seen:
+            conn.rollback()
+            return {"occ_key": key, "written": "request_missing"}
+        try:
+            payload = json.loads(seen[0])
+        except (TypeError, ValueError):
+            conn.rollback()
+            return {"occ_key": key, "written": "request_malformed"}
+        if payload.get("approval_request_id") != approval_request_id \
+                or payload.get("core_arguments_digest") != core_arguments_digest \
+                or payload.get("binding_protocol") != "omp.tool-approval-binding.v1" \
+                or payload.get("payload_sha256") != expect_payload_sha:
+            conn.rollback()
+            return {"occ_key": key, "written": "request_changed"}
+        try:
+            age = (now if now is not None else time.time()) - datetime.fromisoformat(
+                str(seen[1]).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            conn.rollback()
+            return {"occ_key": key, "written": "request_malformed"}
+        if age < -30 or age > 60 * 60:
+            conn.rollback()
+            return {"occ_key": key, "written": "request_expired"}
+        closed = conn.execute(
+            "SELECT 1 FROM events WHERE run_id=? AND task_id=? "
+            "AND json_extract(payload,'$.occ_key')=? "
+            "AND type IN ('prompt_occ_authorized','prompt_occ_mismatch','prompt_occ_completed',"
+            "'prompt_occ_declined','prompt_occ_withdrawn') LIMIT 1",
+            (run_id, task_id, key),
+        ).fetchone()
+        if closed:
+            conn.rollback()
+            return {"occ_key": key, "written": "closed_or_mismatched"}
+        conn.execute(
+            "INSERT INTO approvals (approval_id,run_id,task_id,pane_id,prompt_id,choice,choice_text,"
+            "decided_by,authority,policy_verdict,command,decided_at,attempted_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (approval_id, run_id, task_id, pane_id, approval_request_id,
+             "1" if str(choice).strip().lower() in APPROVE_CHOICES else "2", choice,
+             "cli", authority, "allow", audit_text[:500], stamp, stamp),
+        )
+        review_payload = {"approval_id": approval_id, "reason": review_reason,
+                          "category": review_category, "reviewer": reviewer,
+                          "approval_request_id": approval_request_id,
+                          "tool_call_id": tool_call_id, "arguments_digest": core_arguments_digest}
+        conn.execute(
+            "INSERT INTO events (event_id,run_id,task_id,type,occurred_at,payload) VALUES (?,?,?,?,?,?)",
+            (f"approval_reviewed_{approval_id}", run_id, task_id, "approval_reviewed", stamp,
+             json.dumps(review_payload, sort_keys=True, separators=(",", ":"))),
+        )
+        conn.execute(
+            "INSERT INTO events (event_id,run_id,task_id,type,occurred_at,payload) VALUES (?,?,?,?,?,?)",
+            (event_id, run_id, task_id, "prompt_occ_authorized", stamp,
+             json.dumps({"occ_key": key, "decided_by": authority, "choice": choice, "at_ms": at_ms},
+                        sort_keys=True, separators=(",", ":"))),
+        )
+        conn.commit()
+        if str(choice).strip().lower() in DENY_CHOICES:
+            _drop_proposal(db_path, key)
+        return {"occ_key": key, "written": "authorized", "approval_id": approval_id}
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return {"occ_key": key, "written": "duplicate"}
     finally:
         conn.close()
 
@@ -256,11 +462,20 @@ def _resolve(db_path: str, kind: str, *, run_id: str, task_id: str, pane_id: str
     try:
         key = occurrence_key(run_id, task_id, pane_id, pane_birth, native_session, tool_call_id)
         eid = f"prompt_{kind}_{key}"
-        payload = {"occ_key": key, **(detail or {})}
+        payload = {"occ_key": key, **(detail or {}),
+                   "at_ms": int((now if now is not None else time.time()) * 1000)}
         first = _put(conn, eid, run_id, task_id, f"prompt_{kind}", payload, now)
+        if kind in ("occ_completed", "occ_declined", "occ_withdrawn"):
+            _drop_proposal(db_path, key)
         return {"occ_key": key, "written": kind if first else "duplicate"}
     finally:
         conn.close()
+
+
+def record_started(db_path: str, **kw) -> dict:
+    """`tool_execution_start` for an approved occurrence: timing evidence
+    only (#277); never changes lifecycle."""
+    return _resolve(db_path, "occ_started", **kw)
 
 
 def record_completed(db_path: str, *, is_error: bool = False, **kw) -> dict:
@@ -322,7 +537,7 @@ def fold_task(db_path: str, run_id: str, task_id: str, readonly: bool = True) ->
             seen_keys.add(key)
         elif typ == "prompt_occ_authorized":
             choice = str(payload.get("choice") or "").strip().lower()
-            if choice not in DENY_CHOICES:
+            if choice in APPROVE_CHOICES:
                 approved_keys.add(key)
 
     occ: dict[str, dict] = {}
@@ -356,6 +571,12 @@ def fold_task(db_path: str, run_id: str, task_id: str, readonly: bool = True) ->
             rec["native_session"] = payload.get("native_session")
             rec["tool_call_id"] = payload.get("tool_call_id")
             rec["source"] = payload.get("source")
+            rec["approval_request_id"] = payload.get("approval_request_id") or ""
+            rec["core_arguments_digest"] = payload.get("core_arguments_digest") or ""
+            rec["binding_protocol"] = payload.get("binding_protocol") or ""
+            if payload.get("payload_sha256") is not None or "payload_sha256" not in rec:
+                rec["payload_sha256"] = payload.get("payload_sha256")
+            rec["cwd"] = payload.get("cwd") or ""
             rec["first_seen_seq"] = sequence
             rec["first_seen_at"] = occurred_at
             # M1 (Main review): a missing pane_birth or native_session is
@@ -368,6 +589,8 @@ def fold_task(db_path: str, run_id: str, task_id: str, readonly: bool = True) ->
         elif typ == "prompt_occ_enriched":
             if rec["input_digest"] is None:
                 rec["input_digest"] = payload.get("input_digest")
+            if rec.get("payload_sha256") is None and payload.get("payload_sha256") is not None:
+                rec["payload_sha256"] = payload.get("payload_sha256")
         elif typ == "prompt_occ_mismatch":
             rec["mismatch"] = True
         elif typ == "prompt_occ_screen":
@@ -445,6 +668,252 @@ def occurrence_state(db_path: str, *, run_id: str, task_id: str, pane_id: str, p
                              "authorization": "none"})
 
 
+_PATH_FIELDS = ("path", "file_path", "filePath", "filepath", "file", "notebook_path", "target", "dest",
+                "destination", "new_path", "newPath")
+_EDIT_HEADER = re.compile(r"^\[(.+)#[0-9A-Fa-f]{4}\]$")
+_EDIT_PATCH = re.compile(r"^\*{3}\s+(?:(?:Add|Update|Delete|Edit)\s+File|Move\s+to):\s*(.+)$", re.I)
+_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def _unquote(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    return s
+
+
+def _path_fields(rec: dict) -> list[str]:
+    out: list[str] = []
+    for k in (*_PATH_FIELDS, "paths", "files"):
+        v = rec.get(k)
+        if isinstance(v, str) and v:
+            out.append(v)
+        elif isinstance(v, list):
+            out.extend(x for x in v if isinstance(x, str) and x)
+    return out
+
+
+def _payload_targets(tool: str, inp: object) -> list[str] | str:
+    """Every file a write/edit input names — the same fields
+    agent-hooks/omp-herdr-control.ts mutationTargets reads."""
+    if not isinstance(inp, dict):
+        return "tool input is not an object"
+    targets = _path_fields(inp)
+    if tool == "write":
+        if not isinstance(inp.get("content"), str):
+            return "write input has no string content"
+        return targets or "write names no path"
+    for k in ("input", "patch", "diff"):
+        text = inp.get(k)
+        if not isinstance(text, str):
+            continue
+        last = ""
+        for line in text.splitlines():
+            t = line.strip()
+            if t.startswith("["):
+                m = _EDIT_HEADER.match(t)
+                if not m:
+                    return f"cannot parse the edit section header {t[:120]!r}"
+                last = _unquote(m.group(1))
+                targets.append(last)
+            elif re.match(r"^mv(\s|$)", t, re.I):
+                dest = _unquote(t[2:])
+                if not dest:
+                    return "an MV op names no destination"
+                targets.append(dest)
+                if last and not os.path.isabs(dest) and not re.match(r"^[~@:\[]", dest):
+                    targets.append(os.path.join(os.path.dirname(last), dest))
+            else:
+                m = _EDIT_PATCH.match(t)
+                if m:
+                    targets.append(_unquote(m.group(1)))
+    for entry in inp.get("edits") or []:
+        if isinstance(entry, dict):
+            targets.extend(_path_fields(entry))
+            if isinstance(entry.get("rename"), str) and entry["rename"]:
+                targets.append(entry["rename"])
+    return targets or "cannot tell which file this edit touches"
+
+
+def _canonical_target(raw: str, cwd: str, wt_real: str, tool: str) -> tuple[str, str]:
+    """(canonical path, "") or ("", refusal). Resolved NOW, so a symlink or
+    directory swapped in after the proposal was recorded is caught."""
+    p = raw.strip()
+    if tool == "write" and p in NOTEPAD_XD:
+        return p, ""
+    if not p or _SCHEME.match(p) or p[0] in "~@[":
+        return "", f"target {raw!r} is not a plain filesystem path"
+    if ".." in p.split("/"):
+        # normpath would collapse `link/..` textually while the kernel follows
+        # `link` first, so the reviewed target could differ from the written one.
+        return "", f"target {raw!r} has a '..' component"
+    if not os.path.isabs(p):
+        if not os.path.isabs(cwd):
+            return "", f"relative target {raw!r} but the occurrence recorded no absolute cwd"
+        p = os.path.join(cwd, p)
+    lexical = os.path.normpath(p)
+    if os.path.islink(lexical):
+        return "", f"target {lexical} is a symlink"
+    canon = os.path.join(os.path.realpath(os.path.dirname(lexical)), os.path.basename(lexical))
+    if os.path.realpath(canon) != canon:
+        return "", f"target {lexical} does not resolve to itself"
+    rel = os.path.relpath(canon, wt_real)
+    if rel == "." or rel == ".." or rel.startswith(".." + os.sep):
+        return "", f"target {canon} is outside the worker worktree {wt_real}"
+    if ".git" in [part.lower() for part in rel.split(os.sep)]:
+        return "", f"target {canon} is inside .git"
+    if os.path.isdir(canon):
+        return "", f"target {canon} is a directory"
+    if os.path.isfile(canon) and os.lstat(canon).st_nlink > 1:
+        # Mirrors the dispatch guard (agent-hooks/omp-herdr-control.ts): a write
+        # through a hard link also changes the file's other names.
+        return "", f"target {canon} is a hard link"
+    return canon, ""
+
+
+def proposal_check(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
+                   screen_prompt_id: str, worktree: str, tool: str = "", expect_sha: str = "",
+                   approval_request_id: str = "", expect_arguments_digest: str = "",
+                   expect_tool_call_id: str = "") -> dict:
+    """Verify the complete write/edit payload behind the prompt now on screen
+    (#277). Fails closed on every missing, malformed, truncated, substituted,
+    stale or out-of-scope case; `ok: true` only when the file hashes to the
+    registry row of the one unresolved occurrence that pane's screen shows."""
+    def no(reason: str) -> dict:
+        return {"ok": False, "reason": reason, "checked_at_ms": int(time.time() * 1000)}
+
+    folded = fold_task(db_path, run_id, task_id)
+    if not isinstance(folded, dict) or "error" in folded:
+        return no(f"occurrence registry unreadable: {folded.get('error') if isinstance(folded, dict) else folded}")
+    bound_lookup = bool(approval_request_id)
+    if bound_lookup:
+        if not expect_arguments_digest or not expect_tool_call_id:
+            return no("bound request lookup requires the reviewed arguments digest and tool call id")
+        matches = [r for r in folded.values()
+                   if r.get("pane_id") == pane_id
+                   and r.get("approval_request_id") == approval_request_id]
+    else:
+        if not screen_prompt_id:
+            return no("no prompt id is readable on screen")
+        matches = [r for r in folded.values()
+                   if r.get("pane_id") == pane_id and r.get("screen_prompt_id") == screen_prompt_id]
+    if not matches:
+        return no("no recorded occurrence matches the exact bound request" if bound_lookup
+                  else "no recorded occurrence of this task matches the prompt on screen")
+    if len(matches) != 1:
+        return no("more than one occurrence claims this bound request" if bound_lookup
+                  else "more than one occurrence claims the prompt on screen")
+    rec = matches[0]
+    rtool = str(rec.get("tool") or "")
+    if rec.get("lifecycle") != "requested":
+        return no(f"occurrence is {rec.get('lifecycle')}, not awaiting approval")
+    if not rec.get("identity_verified") or (pane_birth and rec.get("pane_birth") != pane_birth):
+        return no("occurrence identity is unverified or from a different pane lifetime")
+    if rec.get("mismatch"):
+        return no("occurrence identity/input correlation is mismatched")
+    if bound_lookup:
+        if rec.get("binding_protocol") != "omp.tool-approval-binding.v1":
+            return no("occurrence is not an exact OMP v1 bound request")
+        if rec.get("core_arguments_digest") != expect_arguments_digest:
+            return no("bound request arguments digest differs from the reviewed digest")
+        if rec.get("tool_call_id") != expect_tool_call_id:
+            return no("bound request tool call id differs from the reviewed call")
+        first_seen = rec.get("first_seen_at")
+        try:
+            age = time.time() - datetime.fromisoformat(str(first_seen).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            return no("bound request has no parseable creation time")
+        if age < -30 or age > 60 * 60:
+            return no("bound request is outside the one-hour resolver lifetime")
+    elif rec.get("display") != "pending_parseable":
+        return no(f"occurrence display is {rec.get('display')} (input mismatch or unreadable screen)")
+    if rtool.lower() not in PROPOSAL_TOOLS or (tool and rtool.lower() != tool.lower()):
+        return no(f"occurrence tool {rtool!r} is not the write/edit tool on screen ({tool!r})")
+    digest, full = rec.get("input_digest"), rec.get("payload_sha256")
+    if not digest or not full:
+        return no("no complete payload was recorded for this occurrence")
+    if expect_sha and expect_sha != full:
+        return no(f"payload changed since review: reviewed {expect_sha[:16]}…, recorded {full[:16]}…")
+    path = proposal_path(db_path, rec["occ_key"])
+    try:
+        if path.is_symlink():
+            return no("proposal file is a symlink")
+        if path.stat().st_size > PROPOSAL_MAX_BYTES:
+            return no("proposal file exceeds the size bound")
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return no(f"proposal file missing, unreadable or malformed: {exc.__class__.__name__}")
+    if not isinstance(doc, dict) or doc.get("version") != PROPOSAL_VERSION:
+        return no("proposal file is not a version-1 proposal")
+    want = {"occ_key": rec["occ_key"], "run_id": run_id, "task_id": task_id, "pane_id": pane_id,
+            "pane_birth": rec.get("pane_birth"), "native_session": rec.get("native_session"),
+            "tool_call_id": rec.get("tool_call_id"), "tool": rtool,
+            "approval_request_id": rec.get("approval_request_id") or "",
+            "core_arguments_digest": rec.get("core_arguments_digest") or "",
+            "binding_protocol": rec.get("binding_protocol") or ""}
+    bad = sorted(k for k, v in want.items() if doc.get(k) != v)
+    if bad:
+        return no(f"proposal identity differs from the occurrence: {', '.join(bad)}")
+    if rec.get("binding_protocol"):
+        core_json = doc.get("core_arguments_json")
+        core_digest = rec.get("core_arguments_digest") or ""
+        if not isinstance(core_json, str) or not core_digest.startswith("sha256:"):
+            return no("bound proposal lacks canonical OMP arguments")
+        if "sha256:" + hashlib.sha256(core_json.encode("utf-8")).hexdigest() != core_digest:
+            return no("canonical OMP arguments do not match the bound digest")
+        try:
+            if json.loads(core_json) != doc.get("input"):
+                return no("reviewed proposal differs from OMP effective arguments")
+        except ValueError:
+            return no("canonical OMP arguments are malformed")
+    inp = doc.get("input")
+    if input_digest(rtool, inp) != digest or payload_sha256(rtool, inp) != full:
+        return no("proposal does not hash to the recorded payload (truncated or substituted)")
+    raw_targets = _payload_targets(rtool.lower(), inp)
+    if isinstance(raw_targets, str):
+        return no(raw_targets)
+    wt_real = os.path.realpath(worktree) if worktree else ""
+    if not wt_real or not os.path.isdir(wt_real):
+        return no("the worker worktree is unknown or missing")
+    targets: list[str] = []
+    for raw in raw_targets:
+        canon, err = _canonical_target(raw, rec.get("cwd") or "", wt_real, rtool.lower())
+        if err:
+            return no(err)
+        if canon not in targets:
+            targets.append(canon)
+    if rtool.lower() == "write":
+        body, label = inp["content"], "Content"
+    elif isinstance(inp.get("input"), str) and set(inp) <= {"input"}:
+        body, label = inp["input"], "Input"
+    else:
+        body, label = json.dumps(inp, sort_keys=True, indent=1), "Input"
+    header = f"Allow tool: {rtool.lower()} Path: {', '.join(targets)}"
+    body_bytes = len(body.encode("utf-8"))
+    return {
+        "ok": True, "checked_at_ms": int(time.time() * 1000),
+        "occ_key": rec["occ_key"], "tool": rtool.lower(), "tool_call_id": rec.get("tool_call_id"),
+        "pane_birth": rec.get("pane_birth"), "native_session": rec.get("native_session"),
+        "payload_sha256": full, "input_digest": digest,
+        "approval_request_id": rec.get("approval_request_id"),
+        "core_arguments_digest": rec.get("core_arguments_digest"),
+        "binding_protocol": rec.get("binding_protocol"),
+        "raw_targets": raw_targets, "targets": targets, "body_bytes": body_bytes,
+        "body": body, "review_text": f"{header} {label}: " + " ".join(body.split()),
+        # What shared stores (events, approvals.command) may carry: no raw body.
+        "audit_text": f"{header} [complete payload sha256 {full}, {body_bytes} bytes]",
+    }
+
+
+def _format_show(out: dict) -> str:
+    if not out.get("ok"):
+        return f"REFUSED: {out.get('reason')}\n"
+    return (f"tool: {out['tool']}\ntargets: {' '.join(out['targets'])}\n"
+            f"payload_sha256: {out['payload_sha256']}\nbytes: {out['body_bytes']}\n"
+            f"approval: human-only (#277); --expect-sha {out['payload_sha256']} confirms this payload is unchanged\n"
+            f"----- complete payload -----\n{out['body']}\n----- end payload -----\n")
+
+
 def _add_identity_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--db", required=True)
     p.add_argument("--run", dest="run_id", required=True)
@@ -462,8 +931,15 @@ def main(argv: list[str]) -> int:
     s = sub.add_parser("seen")
     _add_identity_args(s)
     s.add_argument("--tool", required=True)
+    # `-` reads the JSON from stdin, keeping write/edit content out of argv (ps).
     s.add_argument("--input-json", default=None)
     s.add_argument("--source", default="")
+    s.add_argument("--cwd", default="")
+    s.add_argument("--dispatched-at-ms", type=int, default=None)
+    s.add_argument("--approval-request-id", default="")
+    s.add_argument("--core-arguments-digest", default="")
+    s.add_argument("--binding-protocol", default="")
+    s.add_argument("--bound-envelope", action="store_true")
 
     s = sub.add_parser("screen")
     _add_identity_args(s)
@@ -475,6 +951,13 @@ def main(argv: list[str]) -> int:
     s.add_argument("--decided-by", default="")
     s.add_argument("--choice", default="")
 
+    s = sub.add_parser("authorize-bound")
+    _add_identity_args(s)
+    for name in ("approval-request-id", "core-arguments-digest", "worktree", "conductor-pane",
+                 "conductor-birth", "approval-id", "choice", "authority", "review-reason",
+                 "review-category", "reviewer", "audit-text", "expect-payload-sha"):
+        s.add_argument("--" + name, required=True)
+
     for name in ("completed", "declined", "withdrawn"):
         s = sub.add_parser(name)
         _add_identity_args(s)
@@ -483,8 +966,26 @@ def main(argv: list[str]) -> int:
         else:
             s.add_argument("--reason", default="")
 
+    s = sub.add_parser("started")
+    _add_identity_args(s)
+
     s = sub.add_parser("state")
     _add_identity_args(s)
+
+    s = sub.add_parser("proposal")
+    s.add_argument("--db", required=True)
+    s.add_argument("--run", dest="run_id", required=True)
+    s.add_argument("--task", dest="task_id", required=True)
+    s.add_argument("--pane", dest="pane_id", required=True)
+    s.add_argument("--birth", dest="pane_birth", default="")
+    s.add_argument("--prompt-id", dest="screen_prompt_id", default="")
+    s.add_argument("--worktree", required=True)
+    s.add_argument("--tool", default="")
+    s.add_argument("--expect-sha", default="")
+    s.add_argument("--approval-request-id", default="")
+    s.add_argument("--expect-arguments-digest", default="")
+    s.add_argument("--expect-tool-call-id", default="")
+    s.add_argument("--show", action="store_true")
 
     s = sub.add_parser("fold")
     s.add_argument("--db", required=True)
@@ -494,18 +995,31 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
     try:
         if args.cmd == "seen":
+            core_arguments_json = ""
             if args.input_json is None:
                 tool_input = None
             else:
                 try:
-                    tool_input = json.loads(args.input_json)
-                except (TypeError, ValueError):
-                    print(json.dumps({"error": f"malformed --input-json: {args.input_json!r}"}))
+                    raw_input = sys.stdin.read() if args.input_json == "-" else args.input_json
+                    parsed_input = json.loads(raw_input)
+                    if args.bound_envelope:
+                        tool_input = parsed_input["input"]
+                        core_arguments_json = parsed_input["core_arguments_json"]
+                        if not isinstance(core_arguments_json, str):
+                            raise ValueError("core arguments are not a string")
+                    else:
+                        tool_input = parsed_input
+                except (KeyError, TypeError, ValueError):
+                    print(json.dumps({"error": "malformed --input-json"}))
                     return 0
             out = record_seen(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
                                pane_birth=args.pane_birth, native_session=args.native_session,
                                tool_call_id=args.tool_call_id, tool=args.tool, tool_input=tool_input,
-                               source=args.source)
+                               source=args.source, cwd=args.cwd, dispatched_at_ms=args.dispatched_at_ms,
+                               approval_request_id=args.approval_request_id,
+                               core_arguments_digest=args.core_arguments_digest,
+                               binding_protocol=args.binding_protocol,
+                               core_arguments_json=core_arguments_json)
         elif args.cmd == "screen":
             out = record_screen(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
                                  pane_birth=args.pane_birth, native_session=args.native_session,
@@ -516,6 +1030,18 @@ def main(argv: list[str]) -> int:
                                      pane_birth=args.pane_birth, native_session=args.native_session,
                                      tool_call_id=args.tool_call_id, decided_by=args.decided_by,
                                      choice=args.choice)
+        elif args.cmd == "authorize-bound":
+            out = authorize_bound(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
+                                  pane_birth=args.pane_birth, native_session=args.native_session,
+                                  tool_call_id=args.tool_call_id,
+                                  approval_request_id=args.approval_request_id,
+                                  core_arguments_digest=args.core_arguments_digest,
+                                  worktree=args.worktree, conductor_pane=args.conductor_pane,
+                                  conductor_birth=args.conductor_birth, approval_id=args.approval_id,
+                                  choice=args.choice, authority=args.authority,
+                                  review_reason=args.review_reason, review_category=args.review_category,
+                                  reviewer=args.reviewer, audit_text=args.audit_text,
+                                  expect_payload_sha=args.expect_payload_sha)
         elif args.cmd == "completed":
             out = record_completed(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
                                     pane_birth=args.pane_birth, native_session=args.native_session,
@@ -528,6 +1054,20 @@ def main(argv: list[str]) -> int:
             out = record_withdrawn(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
                                     pane_birth=args.pane_birth, native_session=args.native_session,
                                     tool_call_id=args.tool_call_id, reason=args.reason)
+        elif args.cmd == "started":
+            out = record_started(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
+                                 pane_birth=args.pane_birth, native_session=args.native_session,
+                                 tool_call_id=args.tool_call_id)
+        elif args.cmd == "proposal":
+            out = proposal_check(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
+                                 pane_birth=args.pane_birth, screen_prompt_id=args.screen_prompt_id,
+                                 worktree=args.worktree, tool=args.tool, expect_sha=args.expect_sha,
+                                 approval_request_id=args.approval_request_id,
+                                 expect_arguments_digest=args.expect_arguments_digest,
+                                 expect_tool_call_id=args.expect_tool_call_id)
+            if args.show:
+                sys.stdout.write(_format_show(out))
+                return 0
         elif args.cmd == "state":
             out = occurrence_state(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
                                     pane_birth=args.pane_birth, native_session=args.native_session,
@@ -537,7 +1077,10 @@ def main(argv: list[str]) -> int:
         else:
             out = {"error": f"unknown command {args.cmd}"}
     except Exception as exc:  # noqa: BLE001 — a monitoring CLI must never crash its caller
-        out = {"error": str(exc)}
+        out = {"error": str(exc)} if args.cmd != "proposal" else {"ok": False, "reason": f"error: {exc}"}
+        if args.cmd == "proposal" and args.show:
+            sys.stdout.write(_format_show(out))
+            return 0
     print(json.dumps(out, sort_keys=True, default=str))
     return 0
 
