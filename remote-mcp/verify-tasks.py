@@ -31,6 +31,33 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TMP = Path(tempfile.mkdtemp(prefix="herdr-mcp-verify-tasks-"))
+BOUND_RELEASE_REL = Path(".local/opt/omp-herdr-bound/releases/2026-10-14-issue277-v2/omp")
+BOUND_LAUNCHER_SHA256 = "03d7a5f1233471e14ebcdded0ebbe6ae3a15fbc5f2e69b71f9c15519244fc64c"
+
+
+def _isolated_control(name: str) -> tuple[Path, Path, Path]:
+    """Copy control code and inject a launcher only into that private copy.
+
+    Production config stays non-overridable and byte-untouched. The clean CI
+    runner gets a test-only config whose absolute launcher and digest are both
+    explicit, so the real parser is exercised without a production escape hatch.
+    """
+    control = TMP / f"control-{name}"
+    shutil.copytree(HERE.parent, control, ignore=shutil.ignore_patterns(".git", "node_modules", "__pycache__"))
+    home = TMP / f"home-{name}"
+    target = home / BOUND_RELEASE_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("#!/bin/sh\nexit 99\n")
+    target.chmod(0o755)
+    fixture_sha = hashlib.sha256(target.read_bytes()).hexdigest()
+    config = control / "config.sh"
+    text = config.read_text()
+    old_bin = 'HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-14-issue277-v2/omp"'
+    old_sha = f'HERDR_OMP_LAUNCHER_SHA256="{BOUND_LAUNCHER_SHA256}"'
+    assert text.count(old_bin) == 1 and text.count(old_sha) == 1
+    config.write_text(text.replace(old_bin, f'HERDR_OMP_BIN="{target}"').replace(
+        old_sha, f'HERDR_OMP_LAUNCHER_SHA256="{fixture_sha}"'))
+    return control, home, target
 
 # ── fixture: allowlist, registry, fake scripts ──────────────────────────────────
 ALLOWLIST = TMP / "task-allowlist.json"
@@ -314,7 +341,8 @@ class SpawnArgvAgainstRealParser(unittest.TestCase):
         finally:
             tsk.subprocess.run = real_run
         self.assertEqual(len(captured), 2)
-        real_spawn = str(HERE.parent / "spawn-task.sh")
+        control, fixture_home, _ = _isolated_control("argv")
+        real_spawn = str(control / "spawn-task.sh")
         # research now spawns with --approval hook (remote-research-answer-
         # answer-approval, 2026-10-02): spawn-task.sh's own safety check
         # refuses --auto-approve unless the omp extension it would load IS
@@ -323,8 +351,9 @@ class SpawnArgvAgainstRealParser(unittest.TestCase):
         # deployed MAIN checkout, not this test's worktree) --
         # HERDR_OMP_EXTENSION overrides that lookup for exactly this reason
         # (same seam verify-pretool-enforce.sh's own hook dry-run tests use).
-        hook_env = {**os.environ, "HERDR_RUN_STATE_DIR": str(TMP / "argv-runs"),
-                    "HERDR_OMP_EXTENSION": str(HERE.parent / "agent-hooks" / "omp-herdr-control.ts")}
+        hook_env = {**os.environ, "HOME": str(fixture_home),
+                    "HERDR_RUN_STATE_DIR": str(TMP / "argv-runs"),
+                    "HERDR_OMP_EXTENSION": str(control / "agent-hooks" / "omp-herdr-control.ts")}
         for argv in captured:
             brief.write_text("objective\n")  # _spawn unlinks its brief once spawn-task.sh returns
             out = subprocess.run(["bash", real_spawn, *argv[1:], "--dry-run"], capture_output=True, text=True,
@@ -368,10 +397,12 @@ class SpawnReservationBeforeWrites(unittest.TestCase):
             db.commit()
             adapter.schema(db)
             adapter.accept(db, canonical_json(cmd), cmd["authorization"]["claims"])
-        env = {**os.environ, "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
+        control, fixture_home, _ = _isolated_control("reservation")
+        env = {**os.environ, "HOME": str(fixture_home),
+               "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
                "HERDR_RUN_STATE_DIR": str(state), "HERDR_STATE_DIR": str(base / "local-state"),
                "HERDR_WT_DIR": str(wt_root), "HERDR_PANE_ID": "", "HERDR_MCP_CONDUCTOR_PANE": ""}
-        argv = ["bash", str(HERE.parent / "spawn-task.sh"), str(repo), branch, "implement", "claude",
+        argv = ["bash", str(control / "spawn-task.sh"), str(repo), branch, "implement", "claude",
                 "--no-secrets", "--brief", str(brief), "--authorization-command-id", cmd["command_id"]]
         for consumed in (False, True):
             if consumed:
@@ -384,6 +415,32 @@ class SpawnReservationBeforeWrites(unittest.TestCase):
             for name in ("SPEC.md", "ANSWER.md", "ANSWER.prev.md"):
                 self.assertEqual((handoffs / name).read_text(), "sentinel " + name)
         self.assertFalse(calls.exists(), "real spawn must refuse before any external surface call")
+
+
+class BoundLauncherFixture(unittest.TestCase):
+    def test_environment_cannot_override_production_binding(self):
+        home = TMP / "override-home"
+        expected = home / BOUND_RELEASE_REL
+        env = {**os.environ, "HOME": str(home), "HERDR_OMP_BIN": "/tmp/untrusted-omp",
+               "HERDR_OMP_LAUNCHER_SHA256": "0" * 64}
+        script = f'. "{HERE.parent / "config.sh"}"; printf "%s\\n%s\\n" "$HERDR_OMP_BIN" "$HERDR_OMP_LAUNCHER_SHA256"'
+        result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.splitlines(), [str(expected), BOUND_LAUNCHER_SHA256])
+
+    def test_tampered_fixture_refuses_before_dry_run(self):
+        control, home, launcher = _isolated_control("tamper")
+        launcher.write_bytes(launcher.read_bytes() + b"\n# tamper\n")
+        env = {**os.environ, "HOME": str(home)}
+        script = f'. "{control / "config.sh"}"; . "{control / "lib/agent-profiles.sh"}"; cli_for_agent omp sonnet'
+        result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bound OMP launcher identity mismatch", result.stderr)
+
+    def test_isolated_injection_does_not_mutate_production_config(self):
+        config = HERE.parent / "config.sh"
+        before = hashlib.sha256(config.read_bytes()).hexdigest()
+        _isolated_control("immutability")
+        self.assertEqual(hashlib.sha256(config.read_bytes()).hexdigest(), before)
 
 
 class RemoteSpawnConductorRouting(unittest.TestCase):
