@@ -16,7 +16,11 @@ bad()  { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 # (eval'd argv), so %q escapes that the shell strips (`\,`) do not read as
 # a difference. A payload that fails to parse compares unequal.
 argv_of(){ ( eval "set -- $1" 2>/dev/null && printf '%s\n' "$@" ) ; }
-check(){ if [ "$(argv_of "$2")" = "$(argv_of "$3")" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
+normalized_argv(){ argv_of "$1" | sed "1s#^${HERDR_OMP_BIN}\$#omp#"; }
+check(){ if [ "$(normalized_argv "$2")" = "$(normalized_argv "$3")" ]; then ok "$1"; else bad "$1 (expected '$3', got '$2')"; fi; }
+
+actual_omp=$(HERDR_POSTURE_FLOOR=write cli_for_agent omp sonnet | awk '{print $1}')
+check "managed OMP uses absolute bound launcher" "$actual_omp" "$HERDR_OMP_BIN"
 
 printf '== rank ordering ==\n'
 check "yolo   rank" "$(posture_rank yolo)"   "0"
@@ -263,6 +267,7 @@ printf '== argv boundaries: metacharacters in a model spec stay ONE literal argu
 # and its embedded command must NOT execute.
 payload="sonnet;touch $WORK/pwned"
 cli=$(HERDR_POSTURE_FLOOR=write cli_for_agent omp "$payload")
+cli="${cli/#$HERDR_OMP_BIN/omp}"
 omp() { printf '%s\n' "$@" > "$WORK/argv.txt"; }
 eval "$cli"
 unset -f omp
