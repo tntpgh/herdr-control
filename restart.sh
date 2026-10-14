@@ -90,14 +90,15 @@ if [ ${#WANT[@]} -gt 0 ]; then
 fi
 
 verify() {
-  local fail=0 entry label url want st live
+  local fail=0 unobservable=0 entry label url want st live rc curl_bin="${HERDR_CURL:-curl}"
   echo "===== VERIFY ====="
   # macOS ships bash 3.2: no mapfile. A while-read over process substitution
   # keeps `fail` in this shell (a pipe would not).
   while IFS= read -r entry; do
     label=${entry%%|*}
     printf "  %-34s " "$label"
-    st=$(agent_status "$label") || fail=1
+    st=$(agent_status "$label"); rc=$?
+    case "$rc" in 0) ;; 2) unobservable=1 ;; *) fail=1 ;; esac
     echo "$st"
   done < <(services)
   echo
@@ -105,7 +106,8 @@ verify() {
     IFS='|' read -r label url want <<<"$entry"
     [ -z "$url" ] && continue
     # shellcheck disable=SC2086
-    probe_http "${label#com.herdr-control.}" "$url" $want || fail=1
+    probe_http "${label#com.herdr-control.}" "$url" $want; rc=$?
+    case "$rc" in 0) ;; 2) unobservable=1 ;; *) fail=1 ;; esac
   done < <(services)
   # The hub's herdr subscription is a service in its own right now: every
   # blocked-worker surface reads it, and a listener answering 200 while the
@@ -169,11 +171,15 @@ verify() {
   # it, and asking the PORT structurally cannot.
   if [ -d "$HERDR_APP_DIR" ]; then
     printf "  %-34s " "hub serving the deployed rev"
-    _served="$(curl -s --max-time 5 "http://127.0.0.1:${HERDR_HUB_PORT:-8600}/api/summary" 2>/dev/null \
-               | sed -n 's/.*"rev": *"\([^"]*\)".*/\1/p')"
+    _summary="$("$curl_bin" -s --max-time 5 "http://127.0.0.1:${HERDR_HUB_PORT:-8600}/api/summary" 2>/dev/null)"; rc=$?
+    _served="$(printf '%s' "$_summary" | sed -n 's/.*"rev": *"\([^"]*\)".*/\1/p')"
     _want="$(app_rev)"
     if [ -z "$_served" ]; then
-      echo "no answer (hub not serving, or too old to report a rev)" >&2
+      if [ "$rc" -ne 0 ]; then
+        echo "UNOBSERVABLE (revision probe curl_exit=$rc)" >&2; unobservable=1
+      else
+        echo "NO — hub answered without required revision evidence" >&2; fail=1
+      fi
     elif [ "$_served" = "$_want" ]; then
       echo "yes ($_served)"
     else
@@ -194,7 +200,7 @@ verify() {
   printf "  %-34s " "hub herdr subscription"
   local waited=0 budget="${PROBE_READY_SECS:-20}"
   while :; do
-    live=$(curl -s --max-time 5 "http://127.0.0.1:${HERDR_HUB_PORT:-8600}/api/panes" 2>/dev/null)
+    live=$("$curl_bin" -s --max-time 5 "http://127.0.0.1:${HERDR_HUB_PORT:-8600}/api/panes" 2>/dev/null); rc=$?
     printf '%s' "$live" | jq -e '.connected == true' >/dev/null 2>&1 && break
     [ "$waited" -ge "$budget" ] && break
     sleep 1; waited=$((waited + 1))
@@ -202,14 +208,46 @@ verify() {
   if printf '%s' "$live" | jq -e '.connected == true' >/dev/null 2>&1; then
     echo "UP   ($(printf '%s' "$live" | jq -r '"\(.panes | length) panes, \(.stats.events) events, \(.stats.reconnects) reconnects, \(.blocked | length) blocked"')$([ "$waited" -gt 0 ] && printf ', ready after %ss' "$waited"))"
   else
-    echo "DOWN ($(printf '%s' "$live" | jq -r '.stats.last_error // "no response"' 2>/dev/null || echo 'no response'))" >&2
-    fail=1
+    if [ "${rc:-1}" -ne 0 ]; then
+      echo "UNOBSERVABLE (curl_exit=$rc; rerun from a host-visible context)" >&2
+      unobservable=1
+    else
+      echo "DOWN ($(printf '%s' "$live" | jq -r '.stats.last_error // "no response"' 2>/dev/null || echo 'no response'))" >&2
+      fail=1
+    fi
   fi
   if command -v herdr >/dev/null 2>&1; then
     echo
     echo "  panes open: $(herdr pane list 2>/dev/null | grep -o '"pane_id"' | wc -l | tr -d ' ')"
   fi
-  return $fail
+  if [ "$fail" -ne 0 ]; then
+    echo >&2
+    echo "  HEALTH CONFIRMED_DOWN — at least one directly observed check failed." >&2
+    return 1
+  fi
+  if [ "$unobservable" -ne 0 ]; then
+    echo >&2
+    echo "  HEALTH UNOBSERVABLE — do not infer an outage or trigger rollback; rerun from a host-visible context." >&2
+    return 2
+  fi
+  if [ -n "${HERDR_HEALTH_EVIDENCE:-}${HERDR_RECOVERY_BUNDLE:-}" ]; then
+    if [ -z "${HERDR_HEALTH_EVIDENCE:-}" ] || [ -z "${HERDR_RECOVERY_BUNDLE:-}" ] || [ ! -f "$HERDR_RECOVERY_BUNDLE/manifest.json" ]; then
+      echo "  HEALTH CONFIRMED_DOWN — evidence output requires HERDR_HEALTH_EVIDENCE and a recovery bundle" >&2
+      return 1
+    fi
+    _evidence_tmp="$HERDR_HEALTH_EVIDENCE.tmp.$$"
+    _bundle_sha=$(shasum -a 256 "$HERDR_RECOVERY_BUNDLE/manifest.json" | awk '{print $1}')
+    _verifier_sha=$(shasum -a 256 "$here/restart.sh" | awk '{print $1}')
+    _deployed_full=$(git -C "$HERDR_APP_DIR" rev-parse HEAD 2>/dev/null) || return 1
+    jq -n --arg status HEALTHY --argjson checked_at_epoch "$(date -u +%s)" \
+      --arg verifier_sha256 "$_verifier_sha" --arg bundle_manifest_sha256 "$_bundle_sha" \
+      --arg deployed_revision "$_deployed_full" \
+      '{schema:1,status:$status,checked_at_epoch:$checked_at_epoch,verifier_sha256:$verifier_sha256,bundle_manifest_sha256:$bundle_manifest_sha256,deployed_revision:$deployed_revision}' \
+      >"$_evidence_tmp" || { rm -f "$_evidence_tmp"; return 1; }
+    chmod 600 "$_evidence_tmp" && mv "$_evidence_tmp" "$HERDR_HEALTH_EVIDENCE" || { rm -f "$_evidence_tmp"; return 1; }
+  fi
+  echo "  HEALTH HEALTHY"
+  return 0
 }
 
 
@@ -249,7 +287,8 @@ while IFS= read -r entry; do
   reload_agent "$label" "$plist" || rc=1
 done < <(services)
 echo
-verify || rc=1
+verify; verify_rc=$?
+case "$verify_rc" in 0) ;; 2) rc=2 ;; *) rc=1 ;; esac
 echo
 if [ "$rc" = 0 ]; then
   echo "Control plane up."

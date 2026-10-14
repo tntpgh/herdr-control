@@ -118,8 +118,22 @@ _sed_rhs() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
 # ── agent_status LABEL ───────────────────────────────────────────────────────
 # Prints "RUNNING pid=N last_exit=S", "LOADED-NOT-RUNNING", or "NOT-LOADED".
 agent_status() {
-  local label="$1" line pid status
-  line=$(launchctl list 2>/dev/null | awk -v l="$label" '$3==l {print}')
+  local label="$1" line pid status rc launchctl_bin="${HERDR_LAUNCHCTL:-launchctl}" domain="gui/$(id -u)"
+  "$launchctl_bin" print "$domain" >/dev/null 2>&1; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "UNOBSERVABLE launchd_domain=$domain exit=$rc"
+    return 2
+  fi
+  line=$("$launchctl_bin" list 2>/dev/null); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "UNOBSERVABLE launchctl_exit=$rc"
+    return 2
+  fi
+  if [ -z "$line" ]; then
+    echo "UNOBSERVABLE launchctl_list_empty"
+    return 2
+  fi
+  line=$(printf '%s\n' "$line" | awk -v l="$label" '$3==l {print}')
   [ -z "$line" ] && { echo "NOT-LOADED"; return 1; }
   pid=$(awk '{print $1}' <<<"$line"); status=$(awk '{print $2}' <<<"$line")
   [ "$pid" = "-" ] && { echo "LOADED-NOT-RUNNING last_exit=$status"; return 1; }
@@ -145,9 +159,10 @@ agent_status() {
 # restores the old single-shot behaviour.
 probe_http() {
   local name="$1" url="$2"; shift 2
-  local want=" $* " code waited=0 budget="${PROBE_READY_SECS:-20}"
+  local want=" $* " code waited=0 budget="${PROBE_READY_SECS:-20}" rc=0 observable=0 curl_bin="${HERDR_CURL:-curl}"
   while :; do
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null)
+    code=$("$curl_bin" -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null); rc=$?
+    [ "$rc" -eq 0 ] && observable=1
     if [[ "$want" == *" $code "* ]]; then
       if [ "$waited" -gt 0 ]; then
         echo "  UP   $name ($url -> $code, ready after ${waited}s)"
@@ -159,6 +174,10 @@ probe_http() {
     [ "$waited" -ge "$budget" ] && break
     sleep 1; waited=$((waited + 1))
   done
+  if [ "$observable" -eq 0 ]; then
+    echo "  UNOBSERVABLE $name ($url; curl_exit=${rc:-unknown})" >&2
+    return 2
+  fi
   local note=""
   [ "$budget" -gt 0 ] && note=" after ${budget}s"
   echo "  DOWN $name ($url -> ${code:-no response}; wanted: $*)$note" >&2; return 1
