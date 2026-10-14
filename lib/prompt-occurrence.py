@@ -75,6 +75,7 @@ import re
 import sqlite3
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 DISPLAY_STATES = {"pending_parseable", "pending_unreadable", "no_prompt", "read_failed", "unknown"}
@@ -360,6 +361,100 @@ def record_authorized(db_path: str, *, run_id: str, task_id: str, pane_id: str, 
         conn.close()
 
 
+def authorize_bound(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
+                    native_session: str, tool_call_id: str, approval_request_id: str,
+                    core_arguments_digest: str, worktree: str, conductor_pane: str,
+                    conductor_birth: str, approval_id: str, choice: str, authority: str,
+                    review_reason: str, review_category: str, reviewer: str,
+                    audit_text: str, expect_payload_sha: str, now: float | None = None) -> dict:
+    """Atomically prove current task/conductor authority and claim one bound request."""
+    conn = _connect(db_path)
+    key = occurrence_key(run_id, task_id, pane_id, pane_birth, native_session, tool_call_id)
+    event_id = f"prompt_occ_authorized_{key}"
+    stamp = _now_iso(now)
+    at_ms = int((now if now is not None else time.time()) * 1000)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute(
+            "SELECT run_id,pane_id,pane_birth,worktree,state,conductor_pane_id,conductor_pane_birth "
+            "FROM tasks WHERE task_id=?", (task_id,),
+        ).fetchone()
+        if not task or task[0] != run_id or task[1] != pane_id or task[2] != pane_birth \
+                or task[3] != worktree or task[4] not in {"starting", "running", "blocked"} \
+                or task[5] != conductor_pane or task[6] != conductor_birth:
+            conn.rollback()
+            return {"occ_key": key, "written": "authority_changed"}
+        seen = conn.execute(
+            "SELECT payload,occurred_at FROM events WHERE event_id=? AND run_id=? AND task_id=? AND type='prompt_occ_seen'",
+            (f"prompt_occ_seen_{key}", run_id, task_id),
+        ).fetchone()
+        if not seen:
+            conn.rollback()
+            return {"occ_key": key, "written": "request_missing"}
+        try:
+            payload = json.loads(seen[0])
+        except (TypeError, ValueError):
+            conn.rollback()
+            return {"occ_key": key, "written": "request_malformed"}
+        if payload.get("approval_request_id") != approval_request_id \
+                or payload.get("core_arguments_digest") != core_arguments_digest \
+                or payload.get("binding_protocol") != "omp.tool-approval-binding.v1" \
+                or payload.get("payload_sha256") != expect_payload_sha:
+            conn.rollback()
+            return {"occ_key": key, "written": "request_changed"}
+        try:
+            age = (now if now is not None else time.time()) - datetime.fromisoformat(
+                str(seen[1]).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            conn.rollback()
+            return {"occ_key": key, "written": "request_malformed"}
+        if age < -30 or age > 60 * 60:
+            conn.rollback()
+            return {"occ_key": key, "written": "request_expired"}
+        closed = conn.execute(
+            "SELECT 1 FROM events WHERE run_id=? AND task_id=? "
+            "AND json_extract(payload,'$.occ_key')=? "
+            "AND type IN ('prompt_occ_authorized','prompt_occ_mismatch','prompt_occ_completed',"
+            "'prompt_occ_declined','prompt_occ_withdrawn') LIMIT 1",
+            (run_id, task_id, key),
+        ).fetchone()
+        if closed:
+            conn.rollback()
+            return {"occ_key": key, "written": "closed_or_mismatched"}
+        conn.execute(
+            "INSERT INTO approvals (approval_id,run_id,task_id,pane_id,prompt_id,choice,choice_text,"
+            "decided_by,authority,policy_verdict,command,decided_at,attempted_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (approval_id, run_id, task_id, pane_id, approval_request_id,
+             "1" if str(choice).strip().lower() in APPROVE_CHOICES else "2", choice,
+             "cli", authority, "allow", audit_text[:500], stamp, stamp),
+        )
+        review_payload = {"approval_id": approval_id, "reason": review_reason,
+                          "category": review_category, "reviewer": reviewer,
+                          "approval_request_id": approval_request_id,
+                          "tool_call_id": tool_call_id, "arguments_digest": core_arguments_digest}
+        conn.execute(
+            "INSERT INTO events (event_id,run_id,task_id,type,occurred_at,payload) VALUES (?,?,?,?,?,?)",
+            (f"approval_reviewed_{approval_id}", run_id, task_id, "approval_reviewed", stamp,
+             json.dumps(review_payload, sort_keys=True, separators=(",", ":"))),
+        )
+        conn.execute(
+            "INSERT INTO events (event_id,run_id,task_id,type,occurred_at,payload) VALUES (?,?,?,?,?,?)",
+            (event_id, run_id, task_id, "prompt_occ_authorized", stamp,
+             json.dumps({"occ_key": key, "decided_by": authority, "choice": choice, "at_ms": at_ms},
+                        sort_keys=True, separators=(",", ":"))),
+        )
+        conn.commit()
+        if str(choice).strip().lower() in DENY_CHOICES:
+            _drop_proposal(db_path, key)
+        return {"occ_key": key, "written": "authorized", "approval_id": approval_id}
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return {"occ_key": key, "written": "duplicate"}
+    finally:
+        conn.close()
+
+
 def _resolve(db_path: str, kind: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
              native_session: str, tool_call_id: str, detail: dict | None = None,
              now: float | None = None) -> dict:
@@ -442,7 +537,7 @@ def fold_task(db_path: str, run_id: str, task_id: str, readonly: bool = True) ->
             seen_keys.add(key)
         elif typ == "prompt_occ_authorized":
             choice = str(payload.get("choice") or "").strip().lower()
-            if choice not in DENY_CHOICES:
+            if choice in APPROVE_CHOICES:
                 approved_keys.add(key)
 
     occ: dict[str, dict] = {}
@@ -677,7 +772,9 @@ def _canonical_target(raw: str, cwd: str, wt_real: str, tool: str) -> tuple[str,
 
 
 def proposal_check(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
-                   screen_prompt_id: str, worktree: str, tool: str = "", expect_sha: str = "") -> dict:
+                   screen_prompt_id: str, worktree: str, tool: str = "", expect_sha: str = "",
+                   approval_request_id: str = "", expect_arguments_digest: str = "",
+                   expect_tool_call_id: str = "") -> dict:
     """Verify the complete write/edit payload behind the prompt now on screen
     (#277). Fails closed on every missing, malformed, truncated, substituted,
     stale or out-of-scope case; `ok: true` only when the file hashes to the
@@ -685,24 +782,50 @@ def proposal_check(db_path: str, *, run_id: str, task_id: str, pane_id: str, pan
     def no(reason: str) -> dict:
         return {"ok": False, "reason": reason, "checked_at_ms": int(time.time() * 1000)}
 
-    if not screen_prompt_id:
-        return no("no prompt id is readable on screen")
     folded = fold_task(db_path, run_id, task_id)
     if not isinstance(folded, dict) or "error" in folded:
         return no(f"occurrence registry unreadable: {folded.get('error') if isinstance(folded, dict) else folded}")
-    matches = [r for r in folded.values()
-               if r.get("pane_id") == pane_id and r.get("screen_prompt_id") == screen_prompt_id]
+    bound_lookup = bool(approval_request_id)
+    if bound_lookup:
+        if not expect_arguments_digest or not expect_tool_call_id:
+            return no("bound request lookup requires the reviewed arguments digest and tool call id")
+        matches = [r for r in folded.values()
+                   if r.get("pane_id") == pane_id
+                   and r.get("approval_request_id") == approval_request_id]
+    else:
+        if not screen_prompt_id:
+            return no("no prompt id is readable on screen")
+        matches = [r for r in folded.values()
+                   if r.get("pane_id") == pane_id and r.get("screen_prompt_id") == screen_prompt_id]
     if not matches:
-        return no("no recorded occurrence of this task matches the prompt on screen")
+        return no("no recorded occurrence matches the exact bound request" if bound_lookup
+                  else "no recorded occurrence of this task matches the prompt on screen")
     if len(matches) != 1:
-        return no("more than one occurrence claims the prompt on screen")
+        return no("more than one occurrence claims this bound request" if bound_lookup
+                  else "more than one occurrence claims the prompt on screen")
     rec = matches[0]
     rtool = str(rec.get("tool") or "")
     if rec.get("lifecycle") != "requested":
         return no(f"occurrence is {rec.get('lifecycle')}, not awaiting approval")
     if not rec.get("identity_verified") or (pane_birth and rec.get("pane_birth") != pane_birth):
         return no("occurrence identity is unverified or from a different pane lifetime")
-    if rec.get("mismatch") or rec.get("display") != "pending_parseable":
+    if rec.get("mismatch"):
+        return no("occurrence identity/input correlation is mismatched")
+    if bound_lookup:
+        if rec.get("binding_protocol") != "omp.tool-approval-binding.v1":
+            return no("occurrence is not an exact OMP v1 bound request")
+        if rec.get("core_arguments_digest") != expect_arguments_digest:
+            return no("bound request arguments digest differs from the reviewed digest")
+        if rec.get("tool_call_id") != expect_tool_call_id:
+            return no("bound request tool call id differs from the reviewed call")
+        first_seen = rec.get("first_seen_at")
+        try:
+            age = time.time() - datetime.fromisoformat(str(first_seen).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            return no("bound request has no parseable creation time")
+        if age < -30 or age > 60 * 60:
+            return no("bound request is outside the one-hour resolver lifetime")
+    elif rec.get("display") != "pending_parseable":
         return no(f"occurrence display is {rec.get('display')} (input mismatch or unreadable screen)")
     if rtool.lower() not in PROPOSAL_TOOLS or (tool and rtool.lower() != tool.lower()):
         return no(f"occurrence tool {rtool!r} is not the write/edit tool on screen ({tool!r})")
@@ -828,6 +951,13 @@ def main(argv: list[str]) -> int:
     s.add_argument("--decided-by", default="")
     s.add_argument("--choice", default="")
 
+    s = sub.add_parser("authorize-bound")
+    _add_identity_args(s)
+    for name in ("approval-request-id", "core-arguments-digest", "worktree", "conductor-pane",
+                 "conductor-birth", "approval-id", "choice", "authority", "review-reason",
+                 "review-category", "reviewer", "audit-text", "expect-payload-sha"):
+        s.add_argument("--" + name, required=True)
+
     for name in ("completed", "declined", "withdrawn"):
         s = sub.add_parser(name)
         _add_identity_args(s)
@@ -848,10 +978,13 @@ def main(argv: list[str]) -> int:
     s.add_argument("--task", dest="task_id", required=True)
     s.add_argument("--pane", dest="pane_id", required=True)
     s.add_argument("--birth", dest="pane_birth", default="")
-    s.add_argument("--prompt-id", dest="screen_prompt_id", required=True)
+    s.add_argument("--prompt-id", dest="screen_prompt_id", default="")
     s.add_argument("--worktree", required=True)
     s.add_argument("--tool", default="")
     s.add_argument("--expect-sha", default="")
+    s.add_argument("--approval-request-id", default="")
+    s.add_argument("--expect-arguments-digest", default="")
+    s.add_argument("--expect-tool-call-id", default="")
     s.add_argument("--show", action="store_true")
 
     s = sub.add_parser("fold")
@@ -897,6 +1030,18 @@ def main(argv: list[str]) -> int:
                                      pane_birth=args.pane_birth, native_session=args.native_session,
                                      tool_call_id=args.tool_call_id, decided_by=args.decided_by,
                                      choice=args.choice)
+        elif args.cmd == "authorize-bound":
+            out = authorize_bound(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
+                                  pane_birth=args.pane_birth, native_session=args.native_session,
+                                  tool_call_id=args.tool_call_id,
+                                  approval_request_id=args.approval_request_id,
+                                  core_arguments_digest=args.core_arguments_digest,
+                                  worktree=args.worktree, conductor_pane=args.conductor_pane,
+                                  conductor_birth=args.conductor_birth, approval_id=args.approval_id,
+                                  choice=args.choice, authority=args.authority,
+                                  review_reason=args.review_reason, review_category=args.review_category,
+                                  reviewer=args.reviewer, audit_text=args.audit_text,
+                                  expect_payload_sha=args.expect_payload_sha)
         elif args.cmd == "completed":
             out = record_completed(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
                                     pane_birth=args.pane_birth, native_session=args.native_session,
@@ -916,7 +1061,10 @@ def main(argv: list[str]) -> int:
         elif args.cmd == "proposal":
             out = proposal_check(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
                                  pane_birth=args.pane_birth, screen_prompt_id=args.screen_prompt_id,
-                                 worktree=args.worktree, tool=args.tool, expect_sha=args.expect_sha)
+                                 worktree=args.worktree, tool=args.tool, expect_sha=args.expect_sha,
+                                 approval_request_id=args.approval_request_id,
+                                 expect_arguments_digest=args.expect_arguments_digest,
+                                 expect_tool_call_id=args.expect_tool_call_id)
             if args.show:
                 sys.stdout.write(_format_show(out))
                 return 0

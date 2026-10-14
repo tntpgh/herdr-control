@@ -504,6 +504,71 @@ _menu_gate() {                         # <window>
   return 0
 }
 
+# OMP 18.10.4's native approval overlay is not a selectable menu. It ends in
+# an action hint (`<configured chord> approve · <cancel key> deny`) and
+# intentionally has no
+# highlighted row. Recognising this shape is for prompt correlation only:
+# herdr-select may resolve an exact bound request without a terminal key, but
+# prompt_menu_selected stays empty so an unbound approval can never fall back
+# to arrow/Enter navigation.
+_keyhint_gate() {                      # <window>
+  case "$1" in *" approve · "*" deny"*) ;; *) return 1 ;; esac
+  case "$1" in *"Allow tool:"*) ;; *) return 1 ;; esac
+  return 0
+}
+
+_prompt_keyhint_parse() {              # <mode>; window on stdin
+  python3 -c '
+import re, sys
+ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+border = " │|─═┌┐└┘├┤┬┴┼╭╮╰╯"
+raw = [ansi.sub("", line.rstrip("\r\n")) for line in sys.stdin]
+clean = [line.strip(border) for line in raw]
+footer = None
+footer_re = re.compile(r"^\S(?:.*\S)? approve [·•] \S(?:.*\S)? deny(?: [·•] .+ scroll)?$")
+for i in range(len(clean) - 1, -1, -1):
+    if footer_re.fullmatch(clean[i]):
+        footer = i
+        break
+if footer is None:
+    sys.exit(1)
+header = None
+for i in range(footer - 1, -1, -1):
+    if clean[i].startswith("Allow tool:"):
+        header = i
+        break
+if header is None:
+    sys.exit(1)
+rows = []
+for line in clean[header:footer]:
+    line = line.strip()
+    if not line or not any(ch.isalnum() for ch in line):
+        continue
+    rows.append(line)
+if not rows or not rows[0].startswith("Allow tool:"):
+    sys.exit(1)
+mode = sys.argv[1]
+if mode == "visible":
+    sys.exit(0)
+if mode == "options":
+    sys.stdout.write("1\tApprove\n2\tDeny\n")
+elif mode == "selected":
+    sys.exit(1)
+elif mode == "question":
+    sys.stdout.write("\n".join(rows))
+elif mode == "command":
+    sys.stdout.write(" ".join(rows))
+elif mode == "command_rows":
+    sys.stdout.write(str(max(1, len(rows) - 1)))
+elif mode == "command_wrapjoin":
+    sys.exit(1)
+elif mode == "command_both":
+    sys.stdout.write(" ".join(rows) + "\x1e")
+else:
+    sys.exit(1)
+' "$1"
+}
+
 # Parse the complete, known two-choice approval menu from ONE snapshot.
 # Blank rows separate command details too; they are not an option boundary.
 # Unknown/truncated menu shapes fail closed rather than turning detail text
@@ -531,8 +596,12 @@ _menu_gate() {                         # <window>
 _prompt_menu() {                       # <pane> visible|options|selected|question
   local win
   win=$(_menu_window "$1") || return 1
-  _menu_gate "$win" || return 1
-  printf '%s\n' "$win" | _prompt_menu_parse "$2"
+  if _menu_gate "$win"; then
+    printf '%s\n' "$win" | _prompt_menu_parse "$2"
+    return $?
+  fi
+  _keyhint_gate "$win" || return 1
+  printf '%s\n' "$win" | _prompt_keyhint_parse "$2"
 }
 
 # The parser itself: <mode>, window on stdin. Split out from _prompt_menu so a
@@ -1087,6 +1156,9 @@ prompt_any_visible() {                 # <pane>
   if _menu_gate "$win"; then
     printf '%s\n' "$win" | _prompt_menu_parse visible && return 0
   fi
+  if _keyhint_gate "$win"; then
+    printf '%s\n' "$win" | _prompt_keyhint_parse visible && return 0
+  fi
   # tail first, then ONE sed doing both jobs: strip the escapes the menu
   # window carries (_OPT_LINE anchors at start-of-line) and print the option
   # numbers. Two seds and a 200-row strip is measurable when this runs on
@@ -1384,6 +1456,14 @@ prompt_occurrence_display() {           # <pane>
   win="$(printf '%s' "$raw" | _sanitize_utf8)"
   if _menu_gate "$win"; then
     if printf '%s\n' "$win" | _prompt_menu_parse visible; then
+      printf 'pending_parseable\n'
+    else
+      printf 'pending_unreadable\n'
+    fi
+    return 0
+  fi
+  if _keyhint_gate "$win"; then
+    if printf '%s\n' "$win" | _prompt_keyhint_parse visible; then
       printf 'pending_parseable\n'
     else
       printf 'pending_unreadable\n'

@@ -937,6 +937,7 @@ EOS
   # and allowed through, instead of failing closed as "parser unavailable".
   ln -sf "$here/lib/bash-write-targets.sh" "$SHIM/lib/bash-write-targets.sh"
   ln -sf "$here/lib/command-policy.sh" "$SHIM/lib/command-policy.sh"
+  mkdir -p "$SHIM/wt"
   # A genuinely separate `bash -c`, not just a subshell: registry_init's own
   # _HERDR_REGISTRY_READY cache is a plain shell variable, already set to 1
   # by this script's OWN top-level `register_task run1 task1 ...` call
@@ -945,13 +946,39 @@ EOS
   # prompt-occurrence.py writes into) for this shim's DIFFERENT state dir
   # entirely. A fresh process has no inherited cache to skip past.
   HERDR_RUN_STATE_DIR="$SHIM/state" bash -c \
-    '. "$0/lib/run-registry.sh"; register_task shimrun shimtask w1 cond1 "$1" "$2" "$3" "$4" /repo /wt "impl:omp-notify-shim"' \
-    "$here" "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" >/dev/null 2>&1
+    '. "$0/lib/run-registry.sh"; register_task shimrun shimtask w1 cond1 "$1" "$2" "$3" "$4" /repo "$5" "impl:omp-notify-shim"' \
+    "$here" "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" "$SHIM/wt" >/dev/null 2>&1
   shim_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
-    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" bun -e '
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" SHIM_WT="$SHIM/wt" bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+// #277 v2.3: the exact same rejection boundary wraps both the first poll and
+// every scheduled retry. Exercise both paths with injected rejecting lookups;
+// no production test switch or timing race is needed.
+const initialPollDenials = [];
+mod.launchBoundApprovalPoll(
+  async () => { throw new Error("initial lookup rejected"); },
+  error => initialPollDenials.push(error instanceof Error ? error.message : String(error)),
+);
+await new Promise(r => setTimeout(r, 0));
+let scheduledPoll;
+const retryPollDenials = [];
+mod.launchBoundApprovalPoll(
+  async () => { throw new Error("retry lookup rejected"); },
+  error => retryPollDenials.push(error instanceof Error ? error.message : String(error)),
+  500,
+  callback => { scheduledPoll = callback; return { unref() {} }; },
+);
+scheduledPoll();
+await new Promise(r => setTimeout(r, 0));
+console.log("INITIAL_POLL_DENIALS:" + JSON.stringify(initialPollDenials));
+console.log("RETRY_POLL_DENIALS:" + JSON.stringify(retryPollDenials));
 const handlers = {};
-mod.default({ on: (ev, fn) => { handlers[ev] = fn; } });
+let authorityRegistrations = 0;
+mod.default({
+  on: (ev, fn) => { handlers[ev] = fn; },
+  handleToolApproval: fn => { authorityRegistrations++; handlers["tool_approval_requested"] = fn; },
+});
+console.log("AUTHORITY_REGISTRATIONS:" + authorityRegistrations);
 console.log("EVENTS:" + Object.keys(handlers).sort().join(","));
 // Approval notifications stay on approval events. tool_call is registered for
 // two bounded pre-work duties: cache bash input for omp v18.3 approval events
@@ -982,16 +1009,48 @@ handlers["tool_result"]({ toolName: "bash", isError: false, content: [] });
 handlers["tool_approval_resolved"]({ approved: true });
 handlers["agent_end"]({});
 await new Promise(r => setTimeout(r, 600));
+// #277 v2.2: once the handler returns defer, an unexpected failure in its
+// detached workflow must resolve the exact binding as denied, never strand it.
+// process.cwd is used only after durable persistence when notifyForPrompt
+// builds its payload, so making it throw exercises the detached catch itself.
+const boundInput = { path: process.env.SHIM_WT + "/forced.md", content: "forced catch" };
+const boundJson = JSON.stringify(boundInput);
+const boundDigest = "sha256:" + Bun.SHA256.hash(boundJson, "hex");
+const boundResolutions = [];
+const boundReturn = handlers["tool_approval_requested"]({
+  toolName: "write", toolCallId: "call-forced-catch", sessionId: "session-forced-catch",
+  requestId: "request-forced-catch", bindingProtocol: "omp.tool-approval-binding.v1",
+  argumentsJson: boundJson, argumentsDigest: boundDigest, exclusiveResolver: true,
+}, { resolveToolApproval: resolution => { boundResolutions.push(resolution); return true; } });
+console.log("BOUND_RETURN:" + JSON.stringify(boundReturn));
+const realCwd = process.cwd;
+process.cwd = () => { throw new Error("forced detached failure"); };
+await new Promise(r => setTimeout(r, 1200));
+process.cwd = realCwd;
+console.log("BOUND_FAILURE:" + JSON.stringify(boundResolutions));
 ' 2>&1)"
   printf '%s' "$shim_out" \
     | grep -q 'EVENTS:agent_end,before_agent_start,session_stop,tool_approval_requested,tool_approval_resolved,tool_call,tool_execution_end,tool_execution_start,tool_execution_validate,tool_result' \
     && ok "every event is registered, including tool_call cache and pre-tool guard" || bad "events: $shim_out"
+  printf '%s' "$shim_out" | grep -q 'AUTHORITY_REGISTRATIONS:1' \
+    && ok "the Herdr control hook uses the one explicit approval-authority registration" \
+    || bad "approval authority registration was ambiguous: $shim_out"
+  printf '%s' "$shim_out" | grep -q 'INITIAL_POLL_DENIALS:\["initial lookup rejected"\]' \
+    && ok "an initial approval-state polling rejection is caught and denied exactly once" \
+    || bad "initial polling rejection was not caught exactly once: $shim_out"
+  printf '%s' "$shim_out" | grep -q 'RETRY_POLL_DENIALS:\["retry lookup rejected"\]' \
+    && ok "a scheduled approval-state polling rejection is caught and denied exactly once" \
+    || bad "retry polling rejection was not caught exactly once: $shim_out"
   printf '%s' "$shim_out" | grep -q 'TOOLCALL_RETURN:undefined' && printf '%s' "$shim_out" | grep -q 'TOOL_CALL_RETURN:undefined' && printf '%s' "$shim_out" | grep -q 'TOOLCALL_NULL_RETURN:undefined' \
     && ok "tool_call caches bash input and passes ordinary/garbage inputs" || bad "tool_call handler returned non-undefined unexpectedly: $shim_out"
   # Observability handlers return undefined; the pre-tool handler returns
   # undefined for ordinary calls and a block object only for refused delegation.
   printf '%s' "$shim_out" | grep -q 'APPROVAL_RETURN:undefined' \
     && ok "the approval handler returns undefined (never blocks the agent)" || bad "approval handler returned non-undefined"
+  printf '%s' "$shim_out" | grep -q 'BOUND_RETURN:{"defer":true}' \
+    && printf '%s' "$shim_out" | grep -q 'BOUND_FAILURE:\[{.*"approved":false.*"reason":"deferred approval workflow failed: forced detached failure"' \
+    && ok "an unexpected detached deferred-workflow failure resolves the exact binding as denied" \
+    || bad "deferred failure did not resolve fail-closed: $shim_out"
   jq -e '.command == "git push --force"' "$REC.notify" >/dev/null 2>&1 \
     && ok "the untruncated command reaches omp-notify.sh from the tool_call cache (omp's approval event carries no input)" \
     || bad "command field missing from notify JSON: $(cat "$REC.notify" 2>/dev/null)"

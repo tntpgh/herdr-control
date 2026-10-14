@@ -78,8 +78,16 @@ conductor() { ( export HERDR_PANE_ID=w9:p9
   sel 1 --authority conductor --review-category branch-work \
     --review-reason "Reviewed the complete recorded payload and its target." \
     --expect-prompt-id "$(prompt_id "$PANE")" "$@" ); }
+conductor_bound_choice() { ( c="$1"; shift; export HERDR_PANE_ID=w9:p9
+  sel "$c" --authority conductor --review-category branch-work \
+    --review-reason "Reviewed the complete recorded payload and its target." \
+    --approval-request-id "$BOUND_REQUEST" --expect-arguments-digest "$BOUND_DIGEST" \
+    --expect-tool-call-id "$CALL_ID" --expect-payload-sha "$BOUND_PAYLOAD_SHA" "$@" ); }
+conductor_bound() { conductor_bound_choice 1; }
 
-# The panel exactly as omp 18.10.3 paints it (formatApprovalDetails): a write
+# The legacy panel paints a selectable menu. OMP 18.10.4's native approval
+# overlay instead paints an action footer (`Q approve · Esc deny`) with no
+# highlighted row. The installed-stack regression exercises both.
 # shows `Path:` and `Content:` with each field clipped at 2000 chars plus
 # "[…Nch elided…]"; an edit shows only one `File:` row per section.
 render_panel() {                        # <tool> <input-json> -> panel text
@@ -95,12 +103,32 @@ sys.stdout.write(f"Allow tool: {tool}\n{body}\n\n\033[48;2;42;47;65m Approve\033
                  "up/down navigate  enter select  esc cancel\n")
 PY
 }
+render_keyhint_panel() {                # <tool> <input-json> -> OMP 18.10.4 panel
+  python3 - "$1" "$2" <<'PY'
+import json, re, sys
+tool, inp = sys.argv[1], json.loads(sys.argv[2])
+if tool == "write":
+    detail = [f"Path: {inp['path']}", "Content: 1 line in the tool call"]
+else:
+    detail = [f"File: {m}" for m in re.findall(r"^\[([^#\]]+)#", inp["input"], re.M)]
+print("╭─ Allow tool: " + tool)
+for row in detail:
+    print("│ " + row)
+print("├────────────────")
+print("│ ⌃↵/⌃Q approve · Esc deny")
+print("╰────────────────")
+PY
+}
 # What the hook records: input_required (tool identity) + the occurrence with
 # its complete input (seen, on stdin as the hook sends it) + the correlated
 # screen prompt id. The panel is painted from the same input.
 CALL=0
 record() {                              # <tool> <input-json> -> PID CALL_ID OCC_KEY
-  render_panel "$1" "$2" > "$SCREEN"
+  if [ "${PANEL_STYLE:-menu}" = keyhint ]; then
+    render_keyhint_panel "$1" "$2" > "$SCREEN"
+  else
+    render_panel "$1" "$2" > "$SCREEN"
+  fi
   CALL=$((CALL + 1)); CALL_ID="call-$CALL"
   PID="$(prompt_id "$PANE")"
   append_event run1 task1 input_required \
@@ -149,7 +177,7 @@ LONG="$(for i in $(seq 1 60); do printf 'row %03d: value %d, note: keep row %d i
 
 printf '== complete payload capture and review artifact ==\n'
 PLAN="$WT/.handoffs/plan.md"
-IN="$(write_input "$PLAN" "$LONG")"; record write "$IN"; SHA="$(input_sha write "$IN")"
+IN="$(write_input "$PLAN" "$LONG")"; record write "$IN"; SHA="$(input_sha write "$IN")"; LONG_SHA="$SHA"
 show > "$WORK/show.txt"
 grep -qF "row 060: value 420, note: keep row 60 intact." "$WORK/show.txt" && grep -qF "payload_sha256: $SHA" "$WORK/show.txt" \
   && ok "--show prints the complete ${#LONG}-byte payload (last row included) with its independently computed sha256" \
@@ -167,7 +195,13 @@ SENTINEL="PRIVATE-SENTINEL-DO-NOT-AUDIT"
 BOUND_INPUT="$(write_input "$WT/.handoffs/bound.md" "$SENTINEL bound payload")"
 BOUND_JSON="$(printf '%s' "$BOUND_INPUT" | jq -cS .)"
 BOUND_DIGEST="sha256:$(printf '%s' "$BOUND_JSON" | shasum -a 256 | awk '{print $1}')"
-record write "$BOUND_INPUT"
+PANEL_STYLE=keyhint record write "$BOUND_INPUT"
+[ "$(prompt_occurrence_display "$PANE")" = pending_parseable ] \
+  && ok "OMP 18.10.4 key-hint approval panel is parseable for occurrence correlation" \
+  || bad "OMP 18.10.4 key-hint panel was not parseable"
+[ "$(prompt_menu_options "$PANE")" = $'1\tApprove\n2\tDeny' ] && [ -z "$(prompt_menu_selected "$PANE")" ] \
+  && ok "key-hint panel exposes choices but no selectable default" \
+  || bad "key-hint choices/default contract failed"
 approves_before="$(approve_rows)"; reset_keys; conductor; rc=$?
 authorized_count="$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type='prompt_occ_authorized' AND json_extract(payload,'$.occ_key')='$OCC_KEY';")"
 if [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] && [ "$authorized_count" = 1 ] && [ "$(approve_rows)" = $((approves_before + 1)) ]; then
@@ -181,6 +215,84 @@ else
   bad "bound payload sentinel leaked into shared audit state"
 fi
 BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
+
+printf '== exact deferred request resolves with no painted panel ==\n'
+BOUND_REQUEST="request-277-no-panel"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
+BOUND_INPUT="$(write_input "$WT/.handoffs/bound-no-panel.md" "private deferred payload")"
+BOUND_JSON="$(printf '%s' "$BOUND_INPUT" | jq -cS .)"
+BOUND_DIGEST="sha256:$(printf '%s' "$BOUND_JSON" | shasum -a 256 | awk '{print $1}')"
+PANEL_STYLE=keyhint record write "$BOUND_INPUT"; BOUND_PAYLOAD_SHA="$(input_sha write "$BOUND_INPUT")"
+: > "$SCREEN"
+approves_before="$(approve_rows)"; reset_keys; conductor_bound; rc=$?
+authorized_count="$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type='prompt_occ_authorized' AND json_extract(payload,'$.occ_key')='$OCC_KEY';")"
+if [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] && [ "$authorized_count" = 1 ] && [ "$(approve_rows)" = $((approves_before + 1)) ]; then
+  ok "request id + tool call + arguments digest + payload sha resolve without a panel or terminal key"
+else
+  bad "no-panel bound approval: rc=$rc keys=$(keys_pressed) authorized=$authorized_count; $(tail -3 "$WORK/err.txt")"
+fi
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "duplicate bound resolution is refused" \
+  || bad "duplicate bound resolution: rc=$rc keys=$(keys_pressed)"
+
+printf '== deferred request revalidates ownership and resolves once under a race ==\n'
+BOUND_REQUEST="request-277-owner-change"
+BOUND_INPUT="$(write_input "$WT/.handoffs/bound-owner.md" "owner must remain current")"
+BOUND_JSON="$(printf '%s' "$BOUND_INPUT" | jq -cS .)"
+BOUND_DIGEST="sha256:$(printf '%s' "$BOUND_JSON" | shasum -a 256 | awk '{print $1}')"
+PANEL_STYLE=keyhint record write "$BOUND_INPUT"; BOUND_PAYLOAD_SHA="$(input_sha write "$BOUND_INPUT")"; : > "$SCREEN"
+sqlite3 "$DB" "UPDATE tasks SET conductor_pane_id='w8:p8', conductor_pane_birth='other-birth' WHERE run_id='run1' AND task_id='task1';"
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "a former conductor cannot resolve after ownership changes" \
+  || bad "ownership handoff: rc=$rc keys=$(keys_pressed)"
+sqlite3 "$DB" "UPDATE tasks SET conductor_pane_id='w9:p9', conductor_pane_birth='cond-birth' WHERE run_id='run1' AND task_id='task1';"
+
+BOUND_REQUEST="request-277-race"
+BOUND_INPUT="$(write_input "$WT/.handoffs/bound-race.md" "one decision wins")"
+BOUND_JSON="$(printf '%s' "$BOUND_INPUT" | jq -cS .)"
+BOUND_DIGEST="sha256:$(printf '%s' "$BOUND_JSON" | shasum -a 256 | awk '{print $1}')"
+PANEL_STYLE=keyhint record write "$BOUND_INPUT"; BOUND_PAYLOAD_SHA="$(input_sha write "$BOUND_INPUT")"; : > "$SCREEN"
+( conductor_bound_choice 1 >"$WORK/race-approve.out" 2>"$WORK/race-approve.err"; printf '%s' "$?" >"$WORK/race-approve.rc" ) & race_a=$!
+( conductor_bound_choice 2 >"$WORK/race-deny.out" 2>"$WORK/race-deny.err"; printf '%s' "$?" >"$WORK/race-deny.rc" ) & race_d=$!
+wait "$race_a"; wait "$race_d"
+race_rcs="$(cat "$WORK/race-approve.rc") $(cat "$WORK/race-deny.rc")"
+case "$race_rcs" in "0 8"|"8 0") ok "concurrent opposite decisions have exactly one successful resolver" ;;
+  *) bad "concurrent opposite decisions returned $race_rcs" ;;
+esac
+[ "$(keys_pressed)" = 0 ] && ok "concurrent bound decisions send no terminal key" || bad "race sent terminal keys"
+[ "$(sqlite3 "$DB" "SELECT count(*) FROM approvals WHERE prompt_id='$BOUND_REQUEST' AND outcome='lost-race';")" = 1 ] \
+  && ok "the losing concurrent decision is explicitly audited as lost-race" \
+  || bad "concurrent loser was not audited as lost-race"
+
+atomic_claim() {
+  "${OCC[@]}" authorize-bound --db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" \
+    --session "$SESSION" --call-id "$CALL_ID" --approval-request-id "$BOUND_REQUEST" \
+    --core-arguments-digest "$BOUND_DIGEST" --expect-payload-sha "$BOUND_PAYLOAD_SHA" \
+    --worktree "$WT" --conductor-pane w9:p9 --conductor-birth cond-birth \
+    --approval-id "appr-atomic-$CALL_ID" --choice Approve --authority conductor \
+    --review-reason reviewed --review-category branch-work --reviewer w9:p9 --audit-text header
+}
+for terminal in declined withdrawn mismatch; do
+  BOUND_REQUEST="request-277-$terminal"
+  BOUND_INPUT="$(write_input "$WT/.handoffs/bound-$terminal.md" "closed request stays closed")"
+  BOUND_JSON="$(printf '%s' "$BOUND_INPUT" | jq -cS .)"
+  BOUND_DIGEST="sha256:$(printf '%s' "$BOUND_JSON" | shasum -a 256 | awk '{print $1}')"
+  PANEL_STYLE=keyhint record write "$BOUND_INPUT"; BOUND_PAYLOAD_SHA="$(input_sha write "$BOUND_INPUT")"
+  case "$terminal" in
+    declined) "${OCC[@]}" declined --db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" --session "$SESSION" --call-id "$CALL_ID" --reason test >/dev/null ;;
+    withdrawn) "${OCC[@]}" withdrawn --db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" --session "$SESSION" --call-id "$CALL_ID" --reason test >/dev/null ;;
+    mismatch) append_event run1 task1 prompt_occ_mismatch "$(jq -nc --arg k "$OCC_KEY" '{occ_key:$k}')" >/dev/null ;;
+  esac
+  atomic_result="$(atomic_claim)"
+  [ "$(printf '%s' "$atomic_result" | jq -r '.written // empty')" = closed_or_mismatched ] \
+    && ok "atomic claim refuses an occurrence already $terminal" \
+    || bad "atomic claim accepted $terminal occurrence: $atomic_result"
+done
+BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
+SHA="$LONG_SHA"
+
+printf '== older OMP processes remain fail-closed after shared-hook reload ==\n'
+PANEL_STYLE=keyhint record write "$(write_input "$WT/.handoffs/legacy.md" "no binding from older OMP")"
+attempt_all "key-hint write with no exact binding from an older OMP process"
 
 printf '== every non-human write/edit Enter attempt is refused (former positives) ==\n'
 record write "$IN"
@@ -301,6 +413,16 @@ echo "    synthetic: $timeline"
 printf '%s' "$timeline" | grep -Eq '^dispatched=\+0ms proposal_created=\+[0-9]+ms approval_resolved=\+[0-9]+ms exec_start=\+[0-9]+ms exec_end_result=\+[0-9]+ms$' \
   && ok "every lifecycle timestamp is recorded, in order" || bad "timeline incomplete: $timeline"
 [ ! -e "$HERDR_RUN_STATE_DIR/proposals/$OCC_KEY.json" ] && ok "proposal file deleted once the occurrence resolved" || bad "proposal retained after completion"
+
+printf '== unknown authorization choices never validate completion ==\n'
+record write "$(write_input "$WT/.handoffs/unknown-choice.md" "unknown is not approval")"
+unknown_id=(--db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" --session "$SESSION" --call-id "$CALL_ID")
+"${OCC[@]}" authorized "${unknown_id[@]}" --decided-by fixture --choice future-choice >/dev/null
+"${OCC[@]}" completed "${unknown_id[@]}" >/dev/null
+unknown_lifecycle="$("${OCC[@]}" fold --db "$DB" --run run1 --task task1 | jq -r --arg k "$OCC_KEY" '.[$k].lifecycle // empty')"
+[ "$unknown_lifecycle" = resolved:withdrawn ] \
+  && ok "unrecognized choice plus completion is withdrawn, not approved" \
+  || bad "unrecognized choice completion folded as $unknown_lifecycle"
 
 printf '== bash approvals are untouched ==\n'
 printf 'Allow tool: bash\nCommand: ls -la\n\n\033[48;2;42;47;65m Approve\033[0m\n Deny\n\nup/down navigate  enter select  esc cancel\n' > "$SCREEN"; reset_keys

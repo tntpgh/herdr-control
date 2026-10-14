@@ -1613,14 +1613,14 @@ function runOccurrenceAsync(py: string, args: string[], stdin?: string, requireP
   return promise;
 }
 
-function readOccurrenceStateAsync(py: string, args: string[]): Promise<Record<string, unknown> | undefined> {
-  const { promise, resolve } = Promise.withResolvers<Record<string, unknown> | undefined>();
+export function readOccurrenceStateAsync(py: string, args: string[]): Promise<Record<string, unknown>> {
+  const { promise, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
   let settled = false;
   let child;
   try {
     child = spawn(py, [PROMPT_OCCURRENCE_PY, ...args], { stdio: ["ignore", "pipe", "ignore"], detached: true });
-  } catch {
-    resolve(undefined);
+  } catch (error) {
+    reject(error instanceof Error ? error : new Error(String(error)));
     return promise;
   }
   let stdout = "";
@@ -1628,25 +1628,44 @@ function readOccurrenceStateAsync(py: string, args: string[]): Promise<Record<st
     if (settled) return;
     settled = true;
     if (child.pid) killGroup(child.pid);
-    resolve(undefined);
+    reject(new Error(`prompt-occurrence state lookup timed out after ${OCCURRENCE_SPAWN_TIMEOUT_MS}ms`));
   }, OCCURRENCE_SPAWN_TIMEOUT_MS);
   child.stdout?.on("data", (d: Buffer) => { if (stdout.length < 65_536) stdout += d.toString(); });
-  child.on("error", () => {
+  child.on("error", (error: Error) => {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
-    resolve(undefined);
+    reject(error);
   });
   child.on("close", (code: number | null) => {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
-    if (code !== 0) return resolve(undefined);
+    if (code !== 0) return reject(new Error(`prompt-occurrence state lookup exited ${code}`));
     try {
       const parsed: unknown = JSON.parse(stdout.trim());
-      resolve(parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        reject(new Error("prompt-occurrence state lookup returned a non-object"));
+        return;
+      }
+      const record = parsed as Record<string, unknown>;
+      if (typeof record.error === "string" && record.error) {
+        reject(new Error(`prompt-occurrence state lookup failed: ${record.error}`));
+        return;
+      }
+      const validLifecycles = new Set([
+        "unknown", "requested", "approved_awaiting_completion",
+        "resolved:completed", "resolved:declined", "resolved:withdrawn",
+      ]);
+      const validAuthorizations = new Set(["none", "approved"]);
+      if (typeof record.lifecycle !== "string" || !validLifecycles.has(record.lifecycle)
+        || typeof record.authorization !== "string" || !validAuthorizations.has(record.authorization)) {
+        reject(new Error("prompt-occurrence state lookup returned an invalid state schema"));
+        return;
+      }
+      resolve(record);
     } catch {
-      resolve(undefined);
+      reject(new Error("prompt-occurrence state lookup returned malformed JSON"));
     }
   });
   return promise;
@@ -1697,6 +1716,32 @@ export function recordOccurrence(args: string[], stdin?: string): Promise<boolea
   if (hubPythonCache) void drainOccurrenceQueue();
   else refreshHubPythonAsync();
   return promise;
+}
+
+type BoundApprovalPollScheduler = (
+  callback: () => void,
+  delayMs: number,
+) => ReturnType<typeof setTimeout>;
+
+// Every detached approval-state lookup, including retries, enters through this
+// one rejection boundary. The caller has already returned {defer:true}, so an
+// unhandled rejection here would otherwise strand OMP's exact approval request
+// forever. The injectable scheduler keeps both the immediate and delayed paths
+// deterministic in the hook harness without adding a production test switch.
+export function launchBoundApprovalPoll(
+  poll: () => Promise<void>,
+  deny: (error: unknown) => void,
+  delayMs = 0,
+  scheduler: BoundApprovalPollScheduler = setTimeout,
+): void {
+  const run = (): void => {
+    void poll().catch(deny);
+  };
+  if (delayMs <= 0) {
+    run();
+    return;
+  }
+  scheduler(run, delayMs).unref();
 }
 
 // Bounded (same eviction shape as inputByCallId/pendingScratch): which
@@ -1828,10 +1873,17 @@ function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | u
             "state", ...occurrenceIdentityArgs(callId, nativeSession),
           ];
           const deadline = Date.now() + 60 * 60 * 1000;
+          const denyPollFailure = (error: unknown): void => {
+            resolveBound({
+              bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
+              argumentsDigest: coreDigest, approved: false,
+              reason: `bound approval poll failed: ${error instanceof Error ? error.message : String(error)}`,
+            });
+          };
           const poll = async (): Promise<void> => {
             const py = hubPythonCache;
             if (!py) {
-              if (Date.now() < deadline) setTimeout(() => void poll(), 500).unref();
+              if (Date.now() < deadline) launchBoundApprovalPoll(poll, denyPollFailure, 500);
               else resolveBound({ bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId,
                 toolName, argumentsDigest: coreDigest, approved: false, reason: "bound approval timed out" });
               return;
@@ -1848,14 +1900,21 @@ function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | u
                 argumentsDigest: coreDigest, approved: false, reason: lifecycle });
               return;
             }
-            if (Date.now() < deadline) setTimeout(() => void poll(), 500).unref();
+            if (Date.now() < deadline) launchBoundApprovalPoll(poll, denyPollFailure, 500);
             else resolveBound({ bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
               argumentsDigest: coreDigest, approved: false, reason: "bound approval timed out" });
           };
-          void poll();
+          launchBoundApprovalPoll(poll, denyPollFailure);
         }
-      } catch {
-        // MUST NOT throw — see the fail-closed contract at the top of this file.
+      } catch (error) {
+        // The handler already returned {defer:true}; swallowing an unexpected
+        // detached failure would strand OMP forever. Resolve this exact binding
+        // as denied. A prior one-shot resolution simply returns false.
+        if (deferred && resolveBound && callId) resolveBound({
+          bindingProtocol, requestId, sessionId: approvalSession, toolCallId: callId, toolName,
+          argumentsDigest: coreDigest, approved: false,
+          reason: `deferred approval workflow failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
       }
     })();
   } catch {
@@ -2625,7 +2684,11 @@ function onSessionStop(): { continue: true; additionalContext: string } | undefi
 
 export default function (pi: HookAPI): void {
   pi.on("tool_call", onToolCall);
-  pi.on("tool_approval_requested", onApprovalRequested);
+  // Patched OMP separates authority from legacy lifecycle observers. Older
+  // OMP versions do not expose this method; their approval event has no exact
+  // binding/resolver, so the compatibility registration remains human-only.
+  if (typeof pi.handleToolApproval === "function") pi.handleToolApproval(onApprovalRequested);
+  else pi.on("tool_approval_requested", onApprovalRequested as never);
   pi.on("tool_approval_resolved", onApprovalResolved);
   pi.on("tool_execution_start", onExecutionStart);
   pi.on("tool_execution_validate", onExecutionValidate);
