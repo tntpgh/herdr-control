@@ -963,6 +963,19 @@ denied, delivered, owner_acted = _safe_signals3("sig_dtask", now=REG_NOW, thresh
 results["M2_denied_query_finds_the_approval_escalated_row"] = denied.get("dtask", {}).get("fingerprint") == "esc1"
 results["delivered_query_finds_an_unprocessed_message"] = "dtask" in delivered
 
+# A policy escalation is a refusal, but not a denial.  The live PR #294
+# incident produced verdict=escalate for a torn capture and the watchdog
+# falsely announced that a person/policy had denied it.
+conn = sqlite3.connect(str(hub.REGISTRY))
+conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
+             "VALUES ('dtask_escalate','drun','stalled','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
+             "VALUES ('esc_not_deny','drun','dtask_escalate','approval_escalated','2026-01-01T00:00:00Z',"
+             "'{\"verdict\":\"escalate\",\"reason\":\"capture unobservable\"}')")
+conn.commit(); conn.close()
+denied_escalate, _, _ = _safe_signals3("sig_escalate_not_deny", now=REG_NOW, threshold_s=REG_THRESH)
+results["an_escalation_refusal_is_not_reported_as_denied"] = "dtask_escalate" not in denied_escalate
+
 # review M-c(2): a WAY-older approval_escalated row, with no later worker
 # activity, falls outside the window and must not populate `denied` —
 # proof the bound is real, not just "still works for recent rows".
@@ -1097,7 +1110,7 @@ conn = sqlite3.connect(str(hub.REGISTRY))
 conn.execute("INSERT INTO tasks (task_id, run_id, state, created_at, updated_at) "
              "VALUES ('tick1','tickrun','stalled',?,?)", (TICK_TS, TICK_TS))
 conn.execute("INSERT INTO events (event_id, run_id, task_id, type, occurred_at, payload) "
-             "VALUES ('tick_esc','tickrun','tick1','approval_escalated',?,'{}')", (TICK_TS,))
+             "VALUES ('tick_esc','tickrun','tick1','approval_escalated',?,'{\"verdict\":\"deny\"}')", (TICK_TS,))
 conn.commit()
 tick_seq = conn.execute("SELECT sequence FROM events WHERE event_id='tick_esc'").fetchone()[0]
 conn.close()

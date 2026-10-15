@@ -152,7 +152,7 @@ for p in $(panes); do
     held=$((held + 1)); continue; }
   [ -n "$pid" ] || { printf '  -> HELD: no prompt id to bind the answer to\n'; held=$((held + 1)); continue; }
 
-  out="$(bash "$SELECT" "$p" "$choice" --expect-prompt-id "$pid" 2>&1)"; rc=$?
+  out="$(HERDR_SELECT_ACTOR=sweep-approvals bash "$SELECT" "$p" "$choice" --expect-prompt-id "$pid" 2>&1)"; rc=$?
   case "$rc" in
     0) printf '  -> answered %s via herdr-select\n' "$choice"; answered=$((answered + 1)) ;;
     8) # Exit 8 also covers identity, provenance and policy refusals. It is

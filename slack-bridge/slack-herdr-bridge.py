@@ -156,7 +156,7 @@ def select_option(pane, choice, via, alert_ts=None, prompt_id=None):
     argv = ["bash", SELECT, pane, str(choice)]
     if prompt_id:
         argv += ["--expect-prompt-id", prompt_id]
-    env = {**os.environ, "HERDR_SELECT_VIA": via}
+    env = {**os.environ, "HERDR_SELECT_VIA": via, "HERDR_SELECT_ACTOR": via}
     if alert_ts:
         env["HERDR_SELECT_TS"] = str(alert_ts)
     try:

@@ -79,6 +79,7 @@ conductor() { ( export HERDR_PANE_ID=w9:p9
     --review-reason "Reviewed the complete recorded payload and its target." \
     --expect-prompt-id "$(prompt_id "$PANE")" "$@" ); }
 conductor_bound_choice() { ( c="$1"; shift; export HERDR_PANE_ID=w9:p9
+  export HERDR_SELECT_ACTOR=bound-conductor
   sel "$c" --authority conductor --review-category branch-work \
     --review-reason "Reviewed the complete recorded payload and its target." \
     --approval-request-id "$BOUND_REQUEST" --expect-arguments-digest "$BOUND_DIGEST" \
@@ -262,6 +263,12 @@ esac
 [ "$(sqlite3 "$DB" "SELECT count(*) FROM approvals WHERE prompt_id='$BOUND_REQUEST' AND outcome='lost-race';")" = 1 ] \
   && ok "the losing concurrent decision is explicitly audited as lost-race" \
   || bad "concurrent loser was not audited as lost-race"
+[ "$(sqlite3 "$DB" "SELECT count(*) FROM approvals WHERE prompt_id='$BOUND_REQUEST' AND outcome IN ('bound-request','lost-race') AND decided_by='bound-conductor';")" = 2 ] \
+  && ok "both bound race outcomes retain asserted selector actor provenance" \
+  || bad "bound race approvals lost selector actor provenance"
+[ "$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type='prompt_occ_authorized' AND json_extract(payload,'$.decided_by')='bound-conductor' AND json_extract(payload,'$.choice') IN ('Approve','Deny');")" -ge 1 ] \
+  && ok "the winning bound occurrence retains asserted selector actor provenance" \
+  || bad "bound occurrence event lost selector actor provenance"
 
 atomic_claim() {
   "${OCC[@]}" authorize-bound --db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" \
@@ -269,6 +276,7 @@ atomic_claim() {
     --core-arguments-digest "$BOUND_DIGEST" --expect-payload-sha "$BOUND_PAYLOAD_SHA" \
     --worktree "$WT" --conductor-pane w9:p9 --conductor-birth cond-birth \
     --approval-id "appr-atomic-$CALL_ID" --choice Approve --authority conductor \
+    --decided-by atomic-test \
     --review-reason reviewed --review-category branch-work --reviewer w9:p9 --audit-text header
 }
 for terminal in declined withdrawn mismatch; do

@@ -432,6 +432,43 @@ herdr() {
 prompt_command_torn fake:pane
 [ $? -eq 1 ] && ok "menu-shape (omp) clean capture is not flagged torn" \
   || no "menu-shape clean" "prompt_command_torn wrongly reported torn on a clean omp panel"
+
+# PR #294 follow-up, captured-boundary regression.  The live pane contained
+# long valid UTF-8 box rows; macOS iconv accepted every row separately but
+# rejected their concatenation.  Preserve the significant captured boundary
+# bytes here: a U+2502 row ending at LF followed by a U+2570/U+2500.../U+256F
+# box row, repeated past the original streaming-buffer boundary.
+valid_box_capture() {
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    printf 'status padding padding padding padding padding padding padding │\n'
+    printf '╰────────────────────────────────────────────────────────────────────────────╯\n'
+    i=$((i + 1))
+  done
+  printf 'Do you want to proceed?\n❯ 1. Yes\n  2. No\n'
+}
+valid_box_capture | _strict_utf8
+[ $? -eq 0 ] && ok "strict Python validator accepts the captured valid multiline box boundary" \
+  || no "valid multiline UTF-8" "strict validator rejected valid box-drawing bytes"
+{ valid_box_capture; printf '\377'; } | _strict_utf8
+[ $? -ne 0 ] && ok "strict Python validator rejects a malformed interior byte" \
+  || no "malformed UTF-8" "strict validator accepted byte ff"
+herdr() {
+  case "$1 $2" in
+    "pane read") valid_box_capture ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 1 ] && ok "valid multiline box capture is not classified torn" \
+  || no "valid multiline torn gate" "prompt_command_torn rejected valid UTF-8"
+herdr() {
+  case "$1 $2" in
+    "pane read") valid_box_capture; printf '\377' ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 0 ] && ok "malformed multiline capture still fails closed" \
+  || no "malformed multiline torn gate" "prompt_command_torn trusted invalid UTF-8"
 # F3 (independent review, torn-gate-scope-liveness): a torn byte OUTSIDE the
 # classified panel rows (old transcript above the panel) must not flag every
 # future approval on this pane torn — prompt_command_text never reads that

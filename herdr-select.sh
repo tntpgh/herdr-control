@@ -148,6 +148,7 @@ case "$authority" in
   peer|human|conductor) ;;
   *) echo "herdr-select: authority must be peer, human, or conductor, got '$authority'" >&2; exit 2 ;;
 esac
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect-prompt-id) expect_id="${2:?--expect-prompt-id needs a value}"; shift 2 ;;
@@ -166,6 +167,25 @@ while [ $# -gt 0 ]; do
     *) echo "herdr-select: unknown arg '$1'" >&2; exit 2 ;;
   esac
 done
+
+# Durable, caller-asserted actor provenance is distinct from authority. It is
+# audit attribution, not authentication. `peer` says which
+# policy ceiling applied; it does not say whether peer-answer, the sweep, a
+# Slack reply, or an interactive CLI invoked the selector. Resolve this only
+# after argv has finalized authority.
+decision_actor="${HERDR_SELECT_ACTOR:-}"
+if [ -z "$decision_actor" ]; then
+  case "${HERDR_SELECT_VIA:-cli}" in
+    slack-*) decision_actor="${HERDR_SELECT_VIA}" ;;
+    *)
+      if [ "$authority" = conductor ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+        decision_actor="conductor:${HERDR_PANE_ID}"
+      else
+        decision_actor="${HERDR_SELECT_VIA:-cli}"
+      fi
+      ;;
+  esac
+fi
 
 case "$choice" in
   ''|*[!0-9]*) echo "herdr-select: option must be a number, got '$choice'" >&2; exit 2 ;;
@@ -283,6 +303,7 @@ if [ -n "$bound_request_id" ]; then
     --approval-request-id "$bound_request_id" --core-arguments-digest "$bound_arguments_digest" \
     --worktree "$own_worktree" --conductor-pane "$caller_pane" --conductor-birth "$owner_birth" \
     --approval-id "$approval_id" --choice "$label" --authority "$authority" \
+    --decided-by "$decision_actor" \
     --review-reason "$review_reason" --review-category "$review_category" --reviewer "$caller_pane" \
     --audit-text "$audit_text" --expect-payload-sha "$bound_payload_sha" \
     2>/dev/null)" || {
@@ -290,7 +311,7 @@ if [ -n "$bound_request_id" ]; then
     }
   if [ "$(printf '%s' "$authorized_json" | jq -r '.written // empty' 2>/dev/null)" != authorized ]; then
     approval_decided "$approval_id" "$pane" "$bound_request_id" "$choice" "$label" \
-      "${HERDR_SELECT_VIA:-cli}" "$authority" allow "$audit_text" "$own_run" "$own_task" >/dev/null 2>&1 || true
+      "$decision_actor" "$authority" allow "$audit_text" "$own_run" "$own_task" >/dev/null 2>&1 || true
     approval_attempted "$approval_id" >/dev/null 2>&1 || true
     approval_confirmed "$approval_id" "lost-race" \
       "bound request was not claimed: $(printf '%s' "$authorized_json" | jq -r '.written // "unknown"')" >/dev/null 2>&1 || true
@@ -979,12 +1000,12 @@ chmod 700 "$log_dir" 2>/dev/null || true
 [ -e "$log_dir/selections.jsonl" ] || : > "$log_dir/selections.jsonl"
 chmod 600 "$log_dir/selections.jsonl" 2>/dev/null || true
 jq -nc --arg pane "$pane" --arg choice "$choice" --arg label "$label" --arg mechanism "$mechanism" \
-       --arg via "${HERDR_SELECT_VIA:-cli}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       --arg via "${HERDR_SELECT_VIA:-cli}" --arg actor "$decision_actor" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
        --arg prompt_id "$current_prompt_id" \
        --arg authority "$authority" --arg verdict "$policy_verdict" --arg reason "$policy_reason" \
        --arg review_reason "$review_reason" --arg review_category "$review_category" \
        --arg reviewer "${caller_pane:-${HERDR_PANE_ID:-}}" \
-  '{at:$at,pane:$pane,choice:($choice|tonumber),label:$label,mechanism:$mechanism,via:$via,prompt_id:$prompt_id,authority:$authority,policy_verdict:$verdict,policy_reason:$reason,review_reason:$review_reason,review_category:$review_category,reviewer:$reviewer}' \
+  '{at:$at,pane:$pane,choice:($choice|tonumber),label:$label,mechanism:$mechanism,via:$via,actor:$actor,prompt_id:$prompt_id,authority:$authority,policy_verdict:$verdict,policy_reason:$reason,review_reason:$review_reason,review_category:$review_category,reviewer:$reviewer}' \
   >> "$log_dir/selections.jsonl" || {
   echo "herdr-select: failed to write $log_dir/selections.jsonl — refusing to answer without an audit trail." >&2
   exit 2
@@ -1009,7 +1030,7 @@ else
   _cmd_record=$(printf '%s' "$cmd_text" | tr '\n' ' ' | cut -c1-500)
 fi
 approval_decided "$approval_id" "$pane" "$current_prompt_id" "$choice" "$label" \
-  "${HERDR_SELECT_VIA:-cli}" "$authority" "$policy_verdict" "$_cmd_record" \
+  "$decision_actor" "$authority" "$policy_verdict" "$_cmd_record" \
   "${_run:-}" "${_task:-}" >/dev/null 2>&1 || {
     echo "herdr-select: cannot persist approval decision — refusing." >&2; exit 2;
   }
@@ -1147,7 +1168,7 @@ if [ "$bound_resolution" = 1 ]; then
   }
   "$occ_py" "$here/lib/prompt-occurrence.py" authorized --db "$(registry_db)" \
     --run "$own_run" --task "$own_task" --pane "$pane" --birth "$_occ_birth" \
-    --session "$_occ_session" --call-id "$_occ_call" --decided-by "$authority" --choice "$label" \
+    --session "$_occ_session" --call-id "$_occ_call" --decided-by "$decision_actor" --choice "$label" \
     >/dev/null 2>&1 || {
       echo "herdr-select: failed to persist exact approval resolution — refusing." >&2
       exit 2

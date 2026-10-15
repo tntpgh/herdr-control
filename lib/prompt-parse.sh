@@ -532,6 +532,18 @@ for index, chunk in enumerate(chunks):
 ' 2>/dev/null
 }
 
+# Validate the complete decision-time capture with the same strict decoder
+# used by the row-suffix repair above.  Do not use macOS iconv as a boolean
+# validity oracle here: its streaming implementation has returned EINVAL for
+# long, valid, multi-line captures containing box-drawing rows even though
+# Python strict decoding (and iconv applied to every individual row) accepts
+# the exact bytes.  This helper emits nothing and succeeds only for valid
+# UTF-8, so malformed interior bytes still fail closed.
+_strict_utf8() {
+  python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8", "strict")' \
+    >/dev/null 2>&1
+}
+
 # Unsanitized: the same window `_menu_window`/`_pane_visible` read, before
 # `_sanitize_utf8` drops anything. Exists so `prompt_command_torn` below can
 # check the RAW bytes for validity without re-deriving the `herdr pane read`
@@ -1524,7 +1536,7 @@ prompt_command_torn() {                 # <pane> -> 0 torn(-or-unreadable) / 1 p
   fi
   raw_win="$(_pane_read_raw "$1" | _repair_truncated_utf8_suffixes)"
   [ -n "$raw_win" ] || return 0
-  printf '%s' "$raw_win" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && return 1
+  printf '%s' "$raw_win" | _strict_utf8 && return 1
   return 0
 }
 

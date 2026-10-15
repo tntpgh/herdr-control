@@ -4403,9 +4403,10 @@ def _stall_task_signals(now: float | None = None, threshold_s: float | None = No
     than the conductor's last action"). Whether a `conductor_prompt` request
     was answered is the DESIGN-228 fold's (`_stall_cprompt_fold`), not here.
 
-    `denied` (review M2): a policy refusal is `approval_escalated`
-    (`herdr-select.sh`'s `_refuse_non_human`, fired only when the policy
-    itself refused), not an `approvals` row with `policy_verdict='deny'` —
+    `denied` (review M2): a deny-class policy refusal is an
+    `approval_escalated` whose payload verdict is exactly `deny`, not every
+    escalation/refusal and not an `approvals` row with
+    `policy_verdict='deny'` —
     a HUMAN pressing Approve on a deny-classified prompt writes that same
     verdict, and the old query could not tell the two apart. A human's own
     declining CHOICE (`choice_text` deny/no/reject, independent of what
@@ -4447,7 +4448,9 @@ def _stall_task_signals(now: float | None = None, threshold_s: float | None = No
 
         for tid, seq, occurred_at in conn.execute(
                 "SELECT task_id, sequence, occurred_at FROM events "
-                "WHERE type='approval_escalated' AND task_id != '' AND occurred_at >= ? ORDER BY sequence DESC",
+                "WHERE type='approval_escalated' AND task_id != '' "
+                "AND json_extract(payload,'$.verdict')='deny' "
+                "AND occurred_at >= ? ORDER BY sequence DESC",
                 (cutoff,)):
             if tid in denied or not _no_worker_activity_since(tid, seq):
                 continue
