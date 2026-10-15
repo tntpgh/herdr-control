@@ -147,5 +147,57 @@ run_notify ''
   && ok "no call_id/native_session (ask path) skips persistence, unchanged behavior" \
   || bad "expected 0 screen rows with no occurrence identity, got $(screen_rows)"
 
+# -- a panel that paints UNREADABLE and only later parses (w7S:p7 23:31Z) ----
+# The five fast probes miss it; the bounded extension must keep looking and
+# then record the hook's own input_required (tool from the hook event, never
+# the screen) so herdr-select can corroborate the tool.
+keyhint_panel() {                       # live OMP 18.10.4 key-hint approval panel
+  printf '╭─ Allow tool: bash\n│ Command: printf smoke\n├────────────────\n│ 󰘴 󰌑/󰘴 Q approve · 󱊷 deny\n╰────────────────\n'
+}
+unreadable_menu() {                     # gate matches, strict parse fails (row after footer)
+  keyhint_panel; printf 'partially painted output\n'
+}
+tooled_rows() {
+  sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    "SELECT count(*) FROM events WHERE type='input_required' AND json_extract(payload,'\$.tool')='bash';" 2>/dev/null || printf 0
+}
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+# input_required is only appended for a registered task (as every real
+# spawn-task.sh worker is); register one so push_wake's write is observable.
+( . "$here/lib/run-registry.sh"; register_task "$RUN_ID" "$TASK_ID" w1 cond1 "" "" "$WPANE" "" /repo /wt "review:notify-probe" ) >/dev/null 2>&1
+unreadable_menu > "$WORKER_SCREEN"
+( sleep 2.5; keyhint_panel > "$WORKER_SCREEN.tmp" && mv "$WORKER_SCREEN.tmp" "$WORKER_SCREEN" ) &
+run_notify ',"call_id":"call-5","native_session":"sess-5"'
+wait
+[ "$(screen_display)" = pending_parseable ] \
+  && ok "late-parsing panel is recorded pending_parseable after the bounded wait" \
+  || bad "late-parsing panel display=$(screen_display)"
+[ "$(tooled_rows)" -ge 1 ] \
+  && ok "late-parsing panel gets the hook-written input_required carrying tool=bash" \
+  || bad "no tooled input_required for late-parsing panel: $(cat "$WORK/n.err")"
+
+# -- stays unreadable: bounded, no input_required, frame kept owner-only -----
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+unreadable_menu > "$WORKER_SCREEN"
+start=$(date +%s)
+HERDR_NOTIFY_UNREADABLE_PROBES=3 run_notify ',"call_id":"call-6","native_session":"sess-6"'
+elapsed=$(( $(date +%s) - start ))
+diag="$HERDR_RUN_STATE_DIR/diagnostics/notify-unreadable-$TASK_ID-call-6.txt"
+[ "$(tooled_rows)" = 0 ] && [ "$elapsed" -le 6 ] \
+  && ok "a never-parseable panel stays bounded (${elapsed}s) and writes no input_required" \
+  || bad "unreadable panel: tooled=$(tooled_rows) elapsed=${elapsed}s"
+[ -f "$diag" ] && [ "$(stat -f %Lp "$diag" 2>/dev/null || stat -c %a "$diag")" = 600 ] && grep -q 'Allow tool: bash' "$diag" \
+  && ok "final unreadable frame saved 0600 for diagnosis" \
+  || bad "diagnostic frame missing or wrong mode: $(ls -l "$diag" 2>&1)"
+
+# -- absent panel (auto-approved) is NOT extended ---------------------------
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+printf 'ordinary agent output\n' > "$WORKER_SCREEN"
+start=$(date +%s)
+run_notify ',"call_id":"call-7","native_session":"sess-7"'
+elapsed=$(( $(date +%s) - start ))
+[ "$elapsed" -le 4 ] && ok "absent panel keeps the original short probe (${elapsed}s)" \
+  || bad "absent panel waited ${elapsed}s"
+
 printf -- '-----\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

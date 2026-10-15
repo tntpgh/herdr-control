@@ -95,6 +95,24 @@ for _ in 1 2 3 4 5; do
   sleep 0.3
 done
 
+# Something approval-shaped painted but did not yet parse (a tall eval/review
+# panel mid-paint, a status bar mid-repaint): keep probing, bounded, instead
+# of exiting. Exiting here is what left a review-class prompt (w7S:p7,
+# 2026-10-15 23:31Z) with no hook-written input_required row, so herdr-select
+# could never corroborate its tool and refused it forever. Only an UNREADABLE
+# panel extends the wait — an absent one (auto-approved call) still costs
+# exactly the five probes above. Tool identity still comes only from this
+# hook's own event, never from the screen.
+if [ "$found" = 0 ]; then
+  _extra="${HERDR_NOTIFY_UNREADABLE_PROBES:-20}"
+  while [ "$_extra" -gt 0 ] \
+    && [ "$(prompt_occurrence_display "$pane" 2>/dev/null)" = pending_unreadable ]; do
+    sleep 0.5
+    if _prompt_is_up; then found=1; break; fi
+    _extra=$((_extra - 1))
+  done
+fi
+
 # Persist a prompt_occ_screen observation against the SAME occurrence
 # onApprovalRequested already recorded `seen` for, whether or not a prompt
 # ever painted — a failed/not-found probe used to just `exit 0` here with
@@ -121,7 +139,16 @@ if [ -n "$call_id" ] && [ -n "$native_session" ] && [ -n "${HERDR_RUN_ID:-}" ] \
     >/dev/null 2>&1 || true
 fi
 
-[ "$found" = 1 ] || exit 0
+if [ "$found" = 0 ]; then
+  # Still unreadable after the bounded wait: keep the exact frame (owner-only)
+  # so the next parser gap is provable instead of guessed. Best-effort.
+  if [ "${_occ_display:-}" = pending_unreadable ] && [ -n "${HERDR_RUN_STATE_DIR:-}${HOME:-}" ]; then
+    _diag="${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}/diagnostics"
+    ( umask 077; mkdir -p "$_diag" && _pane_read_raw "$pane" --format ansi \
+        > "$_diag/notify-unreadable-${HERDR_TASK_ID:-notask}-${call_id:-nocall}.txt" ) 2>/dev/null || true
+  fi
+  exit 0
+fi
 
 where="${cwd##*/}"
 [ -n "$where" ] && msg="$msg  ·  ${where}"
