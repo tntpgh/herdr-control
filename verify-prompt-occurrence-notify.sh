@@ -161,10 +161,16 @@ tooled_rows() {
   sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
     "SELECT count(*) FROM events WHERE type='input_required' AND json_extract(payload,'\$.tool')='bash';" 2>/dev/null || printf 0
 }
+seen() {                                # <call> <session>: production order — onApprovalRequested records seen first
+  python3 "$here/lib/prompt-occurrence.py" seen --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session "$2" --call-id "$1" \
+    --tool bash --source test >/dev/null 2>&1
+}
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
 # input_required is only appended for a registered task (as every real
 # spawn-task.sh worker is); register one so push_wake's write is observable.
 ( . "$here/lib/run-registry.sh"; register_task "$RUN_ID" "$TASK_ID" w1 cond1 "" "" "$WPANE" "" /repo /wt "review:notify-probe" ) >/dev/null 2>&1
+seen call-5 sess-5
 unreadable_menu > "$WORKER_SCREEN"
 ( sleep 2.5; keyhint_panel > "$WORKER_SCREEN.tmp" && mv "$WORKER_SCREEN.tmp" "$WORKER_SCREEN" ) &
 run_notify ',"call_id":"call-5","native_session":"sess-5"'
@@ -176,22 +182,51 @@ wait
   && ok "late-parsing panel gets the hook-written input_required carrying tool=bash" \
   || bad "no tooled input_required for late-parsing panel: $(cat "$WORK/n.err")"
 
-# -- stays unreadable: bounded, no input_required, frame kept owner-only -----
+# -- superseded during the wait: a later tool call recorded its own seen ----
+# The panel that becomes parseable is the REPLACEMENT's; this hook must not
+# attach its tool/command to it, nor record a screen row for it.
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-8 sess-8
+unreadable_menu > "$WORKER_SCREEN"
+( sleep 1.8; seen call-9 sess-8; sleep 0.7; keyhint_panel > "$WORKER_SCREEN.tmp" && mv "$WORKER_SCREEN.tmp" "$WORKER_SCREEN" ) &
+run_notify ',"call_id":"call-8","native_session":"sess-8"'
+wait
+[ "$(tooled_rows)" = 0 ] && [ "$(screen_rows)" = 0 ] \
+  && ok "superseded occurrence writes neither input_required nor a screen row for the replacement prompt" \
+  || bad "superseded: tooled=$(tooled_rows) screen=$(screen_rows)"
+
+# -- resolved during the wait (declined): cancel, no push ------------------
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-10 sess-10
+unreadable_menu > "$WORKER_SCREEN"
+( sleep 1.8; python3 "$here/lib/prompt-occurrence.py" declined --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-10 --call-id call-10 >/dev/null 2>&1 ) &
+start=$(date +%s)
+run_notify ',"call_id":"call-10","native_session":"sess-10"'
+elapsed=$(( $(date +%s) - start )); wait
+[ "$(tooled_rows)" = 0 ] && [ "$elapsed" -le 5 ] \
+  && ok "a declined occurrence cancels the wait (${elapsed}s) and pushes nothing" \
+  || bad "declined: tooled=$(tooled_rows) elapsed=${elapsed}s"
+
+# -- stays unreadable: hard deadline, no input_required, redacted 0600 shape -
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-6 sess-6
 unreadable_menu > "$WORKER_SCREEN"
 start=$(date +%s)
-HERDR_NOTIFY_UNREADABLE_PROBES=3 run_notify ',"call_id":"call-6","native_session":"sess-6"'
+HERDR_NOTIFY_UNREADABLE_DEADLINE_S=3 run_notify ',"call_id":"call-6","native_session":"sess-6"'
 elapsed=$(( $(date +%s) - start ))
-diag="$HERDR_RUN_STATE_DIR/diagnostics/notify-unreadable-$TASK_ID-call-6.txt"
-[ "$(tooled_rows)" = 0 ] && [ "$elapsed" -le 6 ] \
-  && ok "a never-parseable panel stays bounded (${elapsed}s) and writes no input_required" \
+diag="$HERDR_RUN_STATE_DIR/diagnostics/notify-unreadable-$TASK_ID-call-6.shape"
+[ "$(tooled_rows)" = 0 ] && [ "$elapsed" -le 7 ] \
+  && ok "a never-parseable panel stops at the deadline (${elapsed}s) and writes no input_required" \
   || bad "unreadable panel: tooled=$(tooled_rows) elapsed=${elapsed}s"
-[ -f "$diag" ] && [ "$(stat -f %Lp "$diag" 2>/dev/null || stat -c %a "$diag")" = 600 ] && grep -q 'Allow tool: bash' "$diag" \
-  && ok "final unreadable frame saved 0600 for diagnosis" \
-  || bad "diagnostic frame missing or wrong mode: $(ls -l "$diag" 2>&1)"
+[ -f "$diag" ] && [ "$(stat -f %Lp "$diag" 2>/dev/null || stat -c %a "$diag")" = 600 ] \
+  && grep -q 'aaaaa aaaa: aaaa' "$diag" && ! grep -qE 'Allow|smoke|[0-9]' "$diag" \
+  && ok "final unreadable panel saved as a redacted 0600 shape (no raw text)" \
+  || bad "diagnostic shape missing/unredacted/wrong mode: $(ls -l "$diag" 2>&1)"
 
 # -- absent panel (auto-approved) is NOT extended ---------------------------
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-7 sess-7
 printf 'ordinary agent output\n' > "$WORKER_SCREEN"
 start=$(date +%s)
 run_notify ',"call_id":"call-7","native_session":"sess-7"'

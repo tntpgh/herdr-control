@@ -95,44 +95,73 @@ for _ in 1 2 3 4 5; do
   sleep 0.3
 done
 
-# Something approval-shaped painted but did not yet parse (a tall eval/review
-# panel mid-paint, a status bar mid-repaint): keep probing, bounded, instead
-# of exiting. Exiting here is what left a review-class prompt (w7S:p7,
-# 2026-10-15 23:31Z) with no hook-written input_required row, so herdr-select
-# could never corroborate its tool and refused it forever. Only an UNREADABLE
-# panel extends the wait — an absent one (auto-approved call) still costs
-# exactly the five probes above. Tool identity still comes only from this
-# hook's own event, never from the screen.
-if [ "$found" = 0 ]; then
-  _extra="${HERDR_NOTIFY_UNREADABLE_PROBES:-20}"
-  while [ "$_extra" -gt 0 ] \
+# Occurrence identity for this hook firing. call_id/native_session arrive only
+# from the approval path (notifyForPrompt); an `ask` question (no call id) or a
+# hand-started session (no HERDR_RUN_ID/HERDR_TASK_ID) has no occurrence.
+call_id="$(printf '%s' "$input" | jq -r '.call_id // ""' 2>/dev/null || printf '')"
+native_session="$(printf '%s' "$input" | jq -r '.native_session // ""' 2>/dev/null || printf '')"
+_has_occ=0
+if [ -n "$call_id" ] && [ -n "$native_session" ] && [ -n "${HERDR_RUN_ID:-}" ] \
+   && [ -n "${HERDR_TASK_ID:-}" ] && [ -f "$here/lib/prompt-occurrence.py" ]; then
+  _has_occ=1
+  _occ_pane_birth="$(read_task "$HERDR_RUN_ID" "$HERDR_TASK_ID" 2>/dev/null \
+    | jq -r '.pane_birth // ""' 2>/dev/null || printf '')"
+  _occ_py="$(_registry_python 2>/dev/null)" || _has_occ=0
+fi
+
+# Is the prompt on screen still THIS hook's occurrence? True only when the
+# pane was not recycled, the occurrence is still `requested` (not answered,
+# declined, withdrawn or completed), and no later tool call on this task has
+# recorded its own `seen` — so a replacement prompt painted during the wait can
+# never inherit this hook's tool/command.
+_occ_still_ours() {
+  local live st key latest
+  if [ -n "${_occ_pane_birth:-}" ]; then
+    live="$(pane_birth_now "$pane" 2>/dev/null)" || live=""
+    [ -n "$live" ] && [ "$live" != "$_occ_pane_birth" ] && return 1
+  fi
+  st="$("$_occ_py" "$here/lib/prompt-occurrence.py" state --db "$(registry_db)" \
+    --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" --pane "$pane" --birth "${_occ_pane_birth:-}" \
+    --session "$native_session" --call-id "$call_id" 2>/dev/null)" || return 1
+  [ "$(printf '%s' "$st" | jq -r '.lifecycle // ""' 2>/dev/null)" = requested ] || return 1
+  key="$(printf '%s' "$st" | jq -r '.occ_key // ""' 2>/dev/null)"
+  latest="$(_sql "SELECT json_extract(payload,'\$.occ_key') FROM events
+     WHERE task_id=$(_sq "$HERDR_TASK_ID") AND type='prompt_occ_seen'
+     ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
+  [ -n "$key" ] && [ "$key" = "$latest" ]
+}
+
+# Something approval-shaped painted but did not yet parse (a tall review-class
+# panel mid-paint): keep probing instead of exiting. Exiting here is what left
+# w7S:p7's prompt (2026-10-15 23:31Z) with no hook-written input_required, so
+# herdr-select could never corroborate its tool. Only an UNREADABLE panel with
+# a bound occurrence extends the wait; an absent panel (auto-approved call)
+# still costs exactly the five probes above. Hard wall deadline, cancelled the
+# moment the occurrence resolves or is superseded. Tool identity still comes
+# only from this hook's own event, never from the screen.
+_superseded=0
+if [ "$found" = 0 ] && [ "$_has_occ" = 1 ]; then
+  _deadline=$(( $(date +%s) + ${HERDR_NOTIFY_UNREADABLE_DEADLINE_S:-10} ))
+  while [ "$(date +%s)" -lt "$_deadline" ] \
     && [ "$(prompt_occurrence_display "$pane" 2>/dev/null)" = pending_unreadable ]; do
+    _occ_still_ours || { _superseded=1; break; }
     sleep 0.5
     if _prompt_is_up; then found=1; break; fi
-    _extra=$((_extra - 1))
   done
+  # Re-bind after the wait: the parseable panel must still be ours.
+  if [ "$found" = 1 ] && ! _occ_still_ours; then found=0; _superseded=1; fi
 fi
 
 # Persist a prompt_occ_screen observation against the SAME occurrence
 # onApprovalRequested already recorded `seen` for, whether or not a prompt
 # ever painted — a failed/not-found probe used to just `exit 0` here with
-# nothing left behind (docs/plans/dot-herdr-recovery-slices.md §2:
-# "agent-hooks/omp-notify.sh:95 can return after five failed screen probes
-# without a durable occurrence"). Best-effort and additive: call_id/
-# native_session arrive only from the approval path (notifyForPrompt); an
-# `ask` question (no call id) or a hand-started session (no HERDR_RUN_ID/
-# HERDR_TASK_ID) has no occurrence to attach to and simply skips this,
-# exactly today's behavior.
-call_id="$(printf '%s' "$input" | jq -r '.call_id // ""' 2>/dev/null || printf '')"
-native_session="$(printf '%s' "$input" | jq -r '.native_session // ""' 2>/dev/null || printf '')"
-if [ -n "$call_id" ] && [ -n "$native_session" ] && [ -n "${HERDR_RUN_ID:-}" ] \
-   && [ -n "${HERDR_TASK_ID:-}" ] && [ -f "$here/lib/prompt-occurrence.py" ]; then
-  _occ_pane_birth="$(read_task "$HERDR_RUN_ID" "$HERDR_TASK_ID" 2>/dev/null \
-    | jq -r '.pane_birth // ""' 2>/dev/null || printf '')"
+# nothing left behind (docs/plans/dot-herdr-recovery-slices.md §2). A
+# superseded occurrence records nothing: the screen belongs to another one.
+if [ "$_has_occ" = 1 ] && [ "$_superseded" = 0 ]; then
   _occ_display="$(prompt_occurrence_display "$pane" 2>/dev/null || printf 'read_failed')"
   _occ_screen_id=""
   [ "$_occ_display" = pending_parseable ] && _occ_screen_id="$(prompt_id "$pane" 2>/dev/null || printf '')"
-  _occ_py="$(_registry_python 2>/dev/null)" && "$_occ_py" "$here/lib/prompt-occurrence.py" screen \
+  "$_occ_py" "$here/lib/prompt-occurrence.py" screen \
     --db "$(registry_db)" --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" --pane "$pane" \
     --birth "$_occ_pane_birth" --session "$native_session" --call-id "$call_id" \
     --display "$_occ_display" ${_occ_screen_id:+--prompt-id "$_occ_screen_id"} \
@@ -140,12 +169,17 @@ if [ -n "$call_id" ] && [ -n "$native_session" ] && [ -n "${HERDR_RUN_ID:-}" ] \
 fi
 
 if [ "$found" = 0 ]; then
-  # Still unreadable after the bounded wait: keep the exact frame (owner-only)
-  # so the next parser gap is provable instead of guessed. Best-effort.
-  if [ "${_occ_display:-}" = pending_unreadable ] && [ -n "${HERDR_RUN_STATE_DIR:-}${HOME:-}" ]; then
+  # Still unreadable at the deadline: keep a REDACTED shape of the panel
+  # region (letters→a, digits→9; box/glyph/punctuation kept — what the parser
+  # keys on), last 40 rows, 0600, newest 20 files only. No raw terminal text.
+  if [ "$_superseded" = 0 ] && [ "${_occ_display:-}" = pending_unreadable ]; then
     _diag="${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}/diagnostics"
-    ( umask 077; mkdir -p "$_diag" && _pane_read_raw "$pane" --format ansi \
-        > "$_diag/notify-unreadable-${HERDR_TASK_ID:-notask}-${call_id:-nocall}.txt" ) 2>/dev/null || true
+    ( umask 077; mkdir -p "$_diag" || exit 0
+      _pane_read_raw "$pane" --format ansi | sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | tail -n 40 \
+        | LC_ALL=C tr 'A-Za-z' 'a' | LC_ALL=C tr '0-9' '9' \
+        > "$_diag/notify-unreadable-${HERDR_TASK_ID:-notask}-${call_id:-nocall}.shape"
+      ls -t "$_diag"/notify-unreadable-*.shape 2>/dev/null | tail -n +21 | while IFS= read -r f; do rm -f -- "$f"; done
+    ) 2>/dev/null || true
   fi
   exit 0
 fi
