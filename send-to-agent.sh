@@ -189,14 +189,20 @@ _omp_footer_is_last() {                # <visible text>
 }
 
 looks_like_permission_prompt() {
-  local vis win
-  vis=$(herdr pane read "$pane" --source visible --lines 30 2>/dev/null) || return 2
-  win=$(printf '%s' "$vis" | tail -n 12)
+  local snap win
+  # Delivery is concerned with the pane's CURRENT bottom state, not the
+  # operator's scroll position.  A scrolled visible viewport can retain an
+  # already-answered approval panel indefinitely while the agent is idle;
+  # Herdr's detection source is the bottom-buffer snapshot intended for agent
+  # state detection.  Keep interactive selectors on their default `visible`
+  # source; only this non-interactive pre-send guard opts into `detection`.
+  snap=$(herdr pane read "$pane" --source detection --lines 30 2>/dev/null) || return 2
+  win=$(printf '%s' "$snap" | tail -n 12)
   printf '%s' "$win" | grep -Eq "$_PROMPT_YN" && return 0
   printf '%s' "$win" | grep -Eq "$_PROMPT_ARROW" \
     && printf '%s' "$win" | grep -Eq "$_PROMPT_OPTION" && return 0
-  _omp_footer_is_last "$vis" && return 0
-  [ -n "$(prompt_menu_options "$pane" 2>/dev/null)" ] && return 0
+  _omp_footer_is_last "$snap" && return 0
+  [ -n "$(prompt_menu_options_from "$pane" detection 2>/dev/null)" ] && return 0
   return 1
 }
 

@@ -502,8 +502,17 @@ _pane_read_raw() {                      # <pane> [herdr-pane-read-extra-args...]
   herdr pane read "$pane" --source visible --lines "$_PANE_WINDOW_LINES" "$@" 2>/dev/null
 }
 
+_pane_read_raw_from() {                 # <pane> <source> [extra args...]
+  local pane="$1" source="$2"; shift 2
+  herdr pane read "$pane" --source "$source" --lines "$_PANE_WINDOW_LINES" "$@" 2>/dev/null
+}
+
 _menu_window() {
   _pane_read_raw "$1" --format ansi | _sanitize_utf8
+}
+
+_menu_window_from() {                   # <pane> <source>
+  _pane_read_raw_from "$1" "$2" --format ansi | _sanitize_utf8
 }
 
 # The same window, without ANSI — for the scrapes that work on plain text.
@@ -672,6 +681,17 @@ _prompt_menu() {                       # <pane> visible|options|selected|questio
   fi
   _keyhint_gate "$win" || return 1
   printf '%s\n' "$win" | _prompt_keyhint_parse "$2"
+}
+
+_prompt_menu_from() {                  # <pane> <source> visible|options|selected|question
+  local win
+  win=$(_menu_window_from "$1" "$2") || return 1
+  if _menu_gate "$win"; then
+    printf '%s\n' "$win" | _prompt_menu_parse "$3"
+    return $?
+  fi
+  _keyhint_gate "$win" || return 1
+  printf '%s\n' "$win" | _prompt_keyhint_parse "$3"
 }
 
 # The parser itself: <mode>, window on stdin. Split out from _prompt_menu so a
@@ -1195,6 +1215,7 @@ elif mode == "command_both":
 }
 
 prompt_menu_options()  { _prompt_menu "$1" options; }
+prompt_menu_options_from() { _prompt_menu_from "$1" "$2" options; }
 prompt_menu_selected() { _prompt_menu "$1" selected; }
 prompt_menu_question() { _prompt_menu "$1" question; }
 prompt_menu_command()  { _prompt_menu "$1" command; }
