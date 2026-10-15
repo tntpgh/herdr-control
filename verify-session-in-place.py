@@ -126,16 +126,68 @@ class InPlaceEvidenceTests(unittest.TestCase):
         self.assertTrue(m.has_fresh_normal_session_exit(b'{"type":"custom","customType":"session_exit","data":{"kind":"normal","reason":"dispose"}}\n'))
         self.assertFalse(m.has_fresh_normal_session_exit(b'{"type":"session_exit","kind":"normal","reason":"dispose"}\n'))
 
-    def test_idle_view_requires_bound_pid_and_empty_composer(self):
+    def test_current_agent_status_and_visible_blocker_gate(self):
+        response = {"result": {"agent_status": "idle", "status": "working", "state": "working"}}
+        with mock.patch.object(m, "run", return_value=json.dumps(response).encode()):
+            self.assertEqual(m.agent_status("p"), "idle")
+        obsolete = {"result": {"status": "idle", "state": "idle"}}
+        with mock.patch.object(m, "run", return_value=json.dumps(obsolete).encode()):
+            self.assertEqual(m.agent_status("p"), "")
         info = {"foreground_processes": [{"pid": 77, "name": "omp"}]}
-        self.assertTrue(m.omp_idle_visible(info, "╭──╮\n│  │\n╰──╯\n".encode(), 77))
-        self.assertFalse(m.omp_idle_visible(info, "╭──╮\n│draft│\n╰──╯\n".encode(), 77))
-        self.assertFalse(m.omp_idle_visible(info, "Allow tool:\n╭──╮\n│  │\n╰──╯\n".encode(), 77))
-        self.assertFalse(m.omp_idle_visible(info, "╭──╮\n│  │\n╰──╯\n".encode(), 88))
+        current_footer = "context 42% · model omp\n  ↑ to edit\n".encode()
+        self.assertTrue(m.omp_has_no_visible_blocker(info, current_footer, 77))
+        self.assertFalse(m.omp_has_no_visible_blocker(info, b"Allow tool: bash\n", 77))
+        self.assertFalse(m.omp_has_no_visible_blocker(info, "󰘴 Q approve · 󱊷 deny\n".encode(), 77))
+        self.assertFalse(m.omp_has_no_visible_blocker(info, b"Proceed?\n1. Yes\n2. No\n", 77))
+        self.assertFalse(m.omp_has_no_visible_blocker(info, "Proceed with migration?\n❯ 1. Continue\n  2. Cancel\n".encode(), 77))
+        self.assertFalse(m.omp_has_no_visible_blocker(info, b"Are you sure? [y/N]\n", 77))
+        self.assertFalse(m.omp_has_no_visible_blocker(info, current_footer, 88))
+
+    def owner_confirmation(self, ev, baseline, pid=77):
+        before = ev / "before.json"
+        evidence = ev / "owner-transcript-evidence.json"; evidence.write_text('{"owner":"confirmed"}\n')
+        os.chmod(evidence, 0o600)
+        now = int(m.time.time())
+        value = {"schema": 1, "kind": "omp-supervised-empty-confirmation",
+                 "statement": "composer empty and idle", "before_sha256": m.sha_file(before),
+                 "pane": "p", "terminal": "t", "pid": pid,
+                 "pid_birth": baseline["process"]["birth"], "confirmed_at_epoch": now,
+                 "owner_evidence_kind": "trusted-owner-transcript",
+                 "owner_evidence_sha256": m.sha_file(evidence)}
+        path = ev / "owner-empty-confirmation.json"; path.write_text(json.dumps(value))
+        os.chmod(path, 0o600)
+        return path, evidence
+
+    def test_owner_confirmation_is_capture_identity_and_time_bound(self):
+        ev = self.root / "confirm"; ev.mkdir()
+        baseline = {"created_at_epoch": int(m.time.time()), "process": {"birth": "birth"}}
+        (ev / "before.json").write_text(json.dumps(baseline))
+        path, evidence = self.owner_confirmation(ev, baseline)
+        got = m.owner_empty_confirmation(path, evidence, ev / "before.json", baseline, "p", "t", 77, int(m.time.time()))
+        self.assertEqual(got["owner_evidence_sha256"], m.sha_file(evidence))
+        value = json.loads(path.read_text()); value["pid"] = 78; path.write_text(json.dumps(value))
+        with self.assertRaises(SystemExit):
+            m.owner_empty_confirmation(path, evidence, ev / "before.json", baseline, "p", "t", 77, int(m.time.time()))
+
+    def test_owner_confirmation_rejects_stale_or_changed_evidence(self):
+        ev = self.root / "stale-confirm"; ev.mkdir()
+        now = int(m.time.time())
+        baseline = {"created_at_epoch": now, "process": {"birth": "birth"}}
+        (ev / "before.json").write_text(json.dumps(baseline))
+        path, evidence = self.owner_confirmation(ev, baseline)
+        evidence.write_text('{"owner":"different"}\n')
+        with self.assertRaises(SystemExit):
+            m.owner_empty_confirmation(path, evidence, ev / "before.json", baseline, "p", "t", 77, now)
+        evidence.write_text('{"owner":"confirmed"}\n')
+        value = json.loads(path.read_text()); value["confirmed_at_epoch"] = now - 301
+        value["owner_evidence_sha256"] = m.sha_file(evidence); path.write_text(json.dumps(value))
+        with self.assertRaises(SystemExit):
+            m.owner_empty_confirmation(path, evidence, ev / "before.json", baseline, "p", "t", 77, now)
 
     def test_graceful_exit_sends_exactly_one_ctrl_d_and_records_evidence(self):
         ev = self.root / "exit"; ev.mkdir(); session = self.root / "exit.jsonl"; session.write_text("prefix")
         baseline = self.acceptance_baseline(session, str(self.repo))
+        baseline["created_at_epoch"] = int(m.time.time())
         proc = {"pid": 77, "birth": "birth", "argv": f"omp --resume {session}", "cwd": str(self.repo),
                 "environment_names": [], "mapped_binary": "", "mapped_binary_sha256": "",
                 "mapped_native": "", "mapped_native_sha256": ""}
@@ -152,10 +204,12 @@ class InPlaceEvidenceTests(unittest.TestCase):
                 return b""
             if argv[:2] == ["ps", "-p"]: return b""
             return b""
-        args = types.SimpleNamespace(before=str(ev), pid=77, pane="p", terminal="t", timeout=0.1)
+        confirmation, owner_evidence = self.owner_confirmation(ev, baseline)
+        args = types.SimpleNamespace(before=str(ev), pid=77, pane="p", terminal="t", timeout=0.1,
+                                     owner_confirmation=str(confirmation), owner_evidence=str(owner_evidence))
         with mock.patch.object(m, "process", return_value=proc), mock.patch.object(m, "pane_identity", return_value=pane), \
              mock.patch.object(m, "pid_is_pane_foreground_or_ancestor", return_value=True), \
-             mock.patch.object(m, "agent_is_idle", return_value=True), mock.patch.object(m, "omp_idle_visible", return_value=True), \
+             mock.patch.object(m, "agent_status", return_value="idle"), mock.patch.object(m, "omp_has_no_visible_blocker", return_value=True), \
              mock.patch.object(m, "process_environment_values", return_value=[b"secret-value"]), \
              mock.patch.object(m, "pane_process_info", return_value={"pane_id": "p", "foreground_processes": [{"name": "zsh", "cmdline": "/bin/zsh"}]}), \
              mock.patch.object(m, "pane_read", return_value=b"host repo % "), mock.patch.object(m, "run", side_effect=fake_run):
@@ -170,24 +224,55 @@ class InPlaceEvidenceTests(unittest.TestCase):
                 "environment_names": [], "mapped_binary": "/omp", "mapped_binary_sha256": "bin",
                 "mapped_native": "/native", "mapped_native_sha256": "native"}
         baseline = self.acceptance_baseline(session, str(self.repo)); baseline["process"].update(proc)
+        baseline["created_at_epoch"] = int(m.time.time())
         baseline["process"].pop("argv"); baseline["process"]["argv_sha256"] = m.sha_bytes(f"omp --resume {session}".encode())
         baseline["process"]["resume_args"] = []
         (ev / "before.json").write_text(json.dumps(baseline))
         pane = {"pane": "p", "terminal": "t", "cwd": str(self.repo), "session_file": str(session)}
-        args = types.SimpleNamespace(before=str(ev), pid=77, pane="p", terminal="t", timeout=1.0)
+        confirmation, owner_evidence = self.owner_confirmation(ev, baseline)
+        args = types.SimpleNamespace(before=str(ev), pid=77, pane="p", terminal="t", timeout=1.0,
+                                     owner_confirmation=str(confirmation), owner_evidence=str(owner_evidence))
         drift = dict(proc); drift["argv"] = f"python --resume {session}"
         for current, idle in ((drift, True), (proc, False)):
             with mock.patch.object(m, "process", return_value=current), mock.patch.object(m, "pane_identity", return_value=pane), \
                  mock.patch.object(m, "pid_is_pane_foreground_or_ancestor", return_value=True), \
-                 mock.patch.object(m, "agent_is_idle", return_value=idle), mock.patch.object(m, "omp_idle_visible", return_value=True), \
+                 mock.patch.object(m, "agent_status", return_value="idle" if idle else "working"), mock.patch.object(m, "omp_has_no_visible_blocker", return_value=True), \
                  mock.patch.object(m, "pane_process_info", return_value={}), mock.patch.object(m, "pane_read", return_value=b""), \
                  mock.patch.object(m, "run") as run_call, \
                  self.assertRaises(SystemExit):
                 m.graceful_exit(args)
             self.assertFalse(any(c.args[0][:3] == ["herdr", "agent", "send-keys"] for c in run_call.call_args_list))
 
+    def test_bad_owner_confirmation_creates_no_marker_and_sends_no_key(self):
+        ev = self.root / "bad-owner-exit"; ev.mkdir(); session = self.root / "bad-owner.jsonl"; session.write_text("prefix")
+        proc = {"pid": 77, "birth": "birth", "argv": f"omp --resume {session}", "cwd": str(self.repo),
+                "environment_names": [], "mapped_binary": "/omp", "mapped_binary_sha256": "bin",
+                "mapped_native": "/native", "mapped_native_sha256": "native"}
+        baseline = self.acceptance_baseline(session, str(self.repo)); baseline["process"].update(proc)
+        baseline["created_at_epoch"] = int(m.time.time())
+        baseline["process"].pop("argv"); baseline["process"]["argv_sha256"] = m.sha_bytes(proc["argv"].encode())
+        baseline["process"]["resume_args"] = []
+        (ev / "before.json").write_text(json.dumps(baseline))
+        confirmation, owner_evidence = self.owner_confirmation(ev, baseline)
+        owner_evidence.write_text('{"owner":"changed-after-confirmation"}\n')
+        args = types.SimpleNamespace(before=str(ev), pid=77, pane="p", terminal="t", timeout=1.0,
+                                     owner_confirmation=str(confirmation), owner_evidence=str(owner_evidence))
+        pane = {"pane": "p", "terminal": "t", "cwd": str(self.repo), "session_file": str(session)}
+        with mock.patch.object(m, "process", return_value=proc), mock.patch.object(m, "pane_identity", return_value=pane), \
+             mock.patch.object(m, "pid_is_pane_foreground_or_ancestor", return_value=True), \
+             mock.patch.object(m, "agent_status", return_value="idle"), \
+             mock.patch.object(m, "omp_has_no_visible_blocker", return_value=True), \
+             mock.patch.object(m, "pane_process_info", return_value={"foreground_processes": [{"pid": 77}]}), \
+             mock.patch.object(m, "pane_read", return_value=b"current footer"), \
+             mock.patch.object(m, "run") as run_call, self.assertRaises(SystemExit):
+            m.graceful_exit(args)
+        self.assertFalse((ev / "graceful-exit.attempt").exists())
+        self.assertFalse(any(c.args[0][:3] == ["herdr", "agent", "send-keys"] for c in run_call.call_args_list))
+
     def test_graceful_exit_timeout_is_bounded(self):
-        args = types.SimpleNamespace(before=str(self.root), pid=1, pane="p", terminal="t", timeout=float("inf"))
+        args = types.SimpleNamespace(before=str(self.root), pid=1, pane="p", terminal="t", timeout=float("inf"),
+                                     owner_confirmation=str(self.root / "missing.json"),
+                                     owner_evidence=str(self.root / "missing-evidence.json"))
         (self.root / "before.json").write_text(json.dumps({"process": {"pid": 1, "birth": "b"}, "session_file": "/x", "repo": "/r"}))
         with mock.patch.object(m, "process", return_value={}), self.assertRaises(SystemExit): m.graceful_exit(args)
 

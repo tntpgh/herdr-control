@@ -143,29 +143,82 @@ def pane_read(pane: str, source: str, lines: int) -> bytes:
     return run([herdr, "pane", "read", pane, "--source", source, "--lines", str(lines), "--format", "text"])
 
 
-def agent_is_idle(pane: str) -> bool:
+def agent_status(pane: str) -> str:
     herdr = os.environ.get("HERDR_BIN", "herdr")
     data = json.loads(run([herdr, "agent", "get", pane]).decode())
     result = data.get("result", {})
-    agent = result.get("agent", result)
-    return str(agent.get("status", agent.get("state", ""))).lower() == "idle"
+    if not isinstance(result, dict):
+        return ""
+    # Herdr's documented current field is agent_status.  Do not fall back to
+    # similarly named fields: that previously made synthetic fixtures pass
+    # while the installed API was unobservable to this helper.
+    value = result.get("agent_status")
+    return value.lower() if isinstance(value, str) else ""
 
 
-def omp_idle_visible(info: dict, visible: bytes, pid: int) -> bool:
+def omp_has_no_visible_blocker(info: dict, visible: bytes, pid: int) -> bool:
+    """Reject observable activity/prompts; never infer that the draft is empty."""
     foreground = info.get("foreground_processes")
     if not isinstance(foreground, list) or not any(row.get("pid") == pid for row in foreground if isinstance(row, dict)):
         return False
     text = visible.decode(errors="replace")
-    if re.search(r"allow tool:|approval required|press enter to confirm|streaming|working…|working\.\.\.", text, re.I):
+    if re.search(r"allow tool:|approval required|press enter to confirm|streaming|working…|working\.\.\.|"
+                 r"steering\s*[·:]|checking\s+.*(?:…|\.\.\.)|"
+                 r"\bapprove\b[^\n]*\bdeny\b|\bproceed\?|"
+                 r"(?:^|\n)\s*1[.)]\s*yes\b[\s\S]*?(?:^|\n)\s*2[.)]\s*no\b|"
+                 r"(?:^|\n)\s*[❯>]\s*\d+[.)]\s+\S+[\s\S]*?(?:^|\n)\s*\d+[.)]\s+\S+|"
+                 r"\[[yn]/[yn]\]", text, re.I):
         return False
-    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
-    if len(lines) < 3:
-        return False
-    # OMP's idle composer ends in a three-line empty box. Any editor content
-    # makes the middle row nonblank and therefore fails closed.
-    return bool(re.match(r"^\s*╭.*╮\s*$", lines[-3]) and
-                re.match(r"^\s*│\s*│\s*$", lines[-2]) and
-                re.match(r"^\s*╰.*╯\s*$", lines[-1]))
+    return True
+
+
+def owner_empty_confirmation(path: Path, evidence_path: Path, before_path: Path, baseline: dict,
+                             pane: str, terminal: str, pid: int, now: int) -> dict:
+    """Validate a trusted-shell transcription of the owner's visual check.
+
+    The helper cannot observe editor draft state reliably.  This document is
+    therefore the sole empty-draft evidence and is tightly bound to the fresh
+    capture and live identities.  Raw transcript text is neither needed nor
+    copied into migration evidence.
+    """
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        die("owner empty confirmation is unreadable")
+    try:
+        confirmation_stat = path.lstat()
+        evidence_stat = evidence_path.lstat()
+        confirmation_mode = stat.S_IMODE(confirmation_stat.st_mode)
+        evidence_mode = stat.S_IMODE(evidence_stat.st_mode)
+        actual_evidence_sha = sha_file(evidence_path)
+    except OSError:
+        die("owner evidence is unreadable")
+    if not stat.S_ISREG(confirmation_stat.st_mode) or not stat.S_ISREG(evidence_stat.st_mode) \
+       or confirmation_stat.st_uid != os.getuid() or evidence_stat.st_uid != os.getuid():
+        die("owner confirmation and evidence must be owned regular files")
+    if confirmation_mode & 0o077 or evidence_mode & 0o077:
+        die("owner confirmation and evidence must be private")
+    if not isinstance(value, dict) or value.get("schema") != 1 \
+       or value.get("kind") != "omp-supervised-empty-confirmation" \
+       or value.get("statement") != "composer empty and idle" \
+       or value.get("before_sha256") != sha_file(before_path) \
+       or value.get("pane") != pane or value.get("terminal") != terminal \
+       or value.get("pid") != pid or value.get("pid_birth") != baseline["process"]["birth"]:
+        die("owner empty confirmation binding mismatch")
+    confirmed = value.get("confirmed_at_epoch")
+    captured = baseline.get("created_at_epoch")
+    evidence_sha = value.get("owner_evidence_sha256")
+    evidence_kind = value.get("owner_evidence_kind")
+    if not isinstance(confirmed, int) or not isinstance(captured, int) \
+       or confirmed < captured or confirmed > now or now - confirmed > 300 \
+       or captured > now or now - captured > 600:
+        die("owner empty confirmation is not fresh for this capture")
+    if evidence_kind != "trusted-owner-transcript" \
+       or not isinstance(evidence_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", evidence_sha) \
+       or evidence_sha != actual_evidence_sha:
+        die("owner empty confirmation lacks trusted evidence binding")
+    return {"confirmation_sha256": sha_file(path), "owner_evidence_sha256": evidence_sha,
+            "confirmed_at_epoch": confirmed}
 
 
 def shell_ready(info: dict, visible: bytes) -> bool:
@@ -223,13 +276,30 @@ def graceful_exit(args: argparse.Namespace) -> None:
         die("exit precheck process image changed")
     pre_info = pane_process_info(args.pane)
     pre_visible = pane_read(args.pane, "detection", 80)
-    if not agent_is_idle(args.pane) or not omp_idle_visible(pre_info, pre_visible, args.pid):
+    if agent_status(args.pane) != "idle" or not omp_has_no_visible_blocker(pre_info, pre_visible, args.pid):
         die("exit precheck agent is not idle")
+    owner_confirmation = owner_empty_confirmation(
+        Path(args.owner_confirmation).expanduser().absolute(), Path(args.owner_evidence).expanduser().absolute(), before_path, baseline,
+        args.pane, args.terminal, args.pid, int(time.time()))
     size = session.stat().st_size
     prefix = sha_file(session, size)
     mtime_ns = session.stat().st_mtime_ns
     sensitive = process_environment_values(args.pid)
     exit_path = before_path.parent / "graceful-exit.json"
+    repeated_process = process(args.pid)
+    repeated_info = pane_process_info(args.pane)
+    repeated_visible = pane_read(args.pane, "detection", 80)
+    if repeated_process != current \
+       or pane_identity(args.pane) != expected_pane \
+       or not pid_is_pane_foreground_or_ancestor(args.pid, args.pane) \
+       or agent_status(args.pane) != "idle" \
+       or not omp_has_no_visible_blocker(repeated_info, repeated_visible, args.pid):
+        die("exit precheck state changed before reservation")
+    repeated_confirmation = owner_empty_confirmation(
+        Path(args.owner_confirmation).expanduser().absolute(), Path(args.owner_evidence).expanduser().absolute(), before_path, baseline,
+        args.pane, args.terminal, args.pid, int(time.time()))
+    if repeated_confirmation != owner_confirmation:
+        die("owner empty confirmation changed before reservation")
     reservation = reserve_json(exit_path)
     herdr = os.environ.get("HERDR_BIN", "herdr")
     # This is deliberately the only mutating call in the operation.
@@ -265,7 +335,8 @@ def graceful_exit(args: argparse.Namespace) -> None:
               "session_size_before": size, "session_prefix_sha256": prefix,
               "session_size_after": session.stat().st_size,
               "session_mtime_ns_before": mtime_ns, "session_mtime_ns_after": session.stat().st_mtime_ns,
-              "visible_post_exit_sha256": sha_bytes(visible), "session_exit": "normal/dispose", "key": "ctrl+d"}
+              "visible_post_exit_sha256": sha_bytes(visible), "session_exit": "normal/dispose", "key": "ctrl+d",
+              "owner_confirmation": owner_confirmation}
     publish_reserved_json(exit_path, record, reservation)
     print("session-in-place: one Ctrl+D completed; old process absent and shell ready")
 
@@ -608,6 +679,8 @@ def main() -> None:
     v.set_defaults(func=verify_after)
     r = sub.add_parser("resume-command"); r.add_argument("--before", required=True); r.add_argument("--launcher", required=True); r.add_argument("--launcher-sha256", required=True); r.set_defaults(func=resume_command)
     e = sub.add_parser("graceful-exit"); common(e); e.add_argument("--before", required=True)
+    e.add_argument("--owner-confirmation", required=True)
+    e.add_argument("--owner-evidence", required=True)
     e.add_argument("--timeout", type=float, default=10.0); e.set_defaults(func=graceful_exit)
     a = sub.add_parser("accept"); a.add_argument("--before", required=True); a.add_argument("--pid", type=int, required=True); a.add_argument("--health", required=True); a.add_argument("--revision", required=True); a.add_argument("--verifier", required=True)
     for name in ("bundle", "control", "hook"): a.add_argument("--" + name, required=True)

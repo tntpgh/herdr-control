@@ -38,6 +38,14 @@ required explicit paths and identities.
 
 ### Main self-migration handoff
 
+**Status: blocked; do not execute Main migration.** Reconciliation confirms that
+the handoff below is required by installed operational protocol, although role
+security code binds Main to pane plus terminal birth rather than OMP PID. Active
+registered workers are ineligible handoff targets. If no eligible live non-worker
+conductor exists, the only alternative gate is explicit owner approval of a
+separately reviewed procedural exception naming the trusted external owner shell
+as recovery controller during the gap. No such exception is created here.
+
 Main must never stop or replace itself. Before migrating the pane holding the
 `main` role, Main uses the existing `designate-main.sh --handoff-to <pane>` path
 to transfer the role to a live, non-worker temporary conductor. That conductor
@@ -57,13 +65,20 @@ whose `kind=normal` and `reason=dispose`. It scans only the newly
 appended transcript bytes and visible post-exit pane region for in-memory
 credential values or the literal key token, reporting only pass/fail. Only after
 `graceful-exit.json` exists may the conductor start the exact command with
-`herdr pane run`; then run verify-after → a newly generated host-visible health
-The idle check combines `herdr agent get` state, read-only `pane process-info`,
-and the detection view's exact empty OMP composer; streaming, prompting, editor
-text, or an unrecognized view fails closed. It does not rely on an undocumented
-`process_info.pane_id` field.
-check → accept. Direct `kill`, shell text injection, and an unverified fallback
-command are not supported migration paths. The conductor confirms the
+`herdr pane run`; then run verify-after, a newly generated host-visible health
+check, and accept.
+
+The idle check reads the current API's documented `agent_status`, read-only
+`pane process-info`, and the detection view for prompts/activity. The OMP 18.10.4
+footer is not evidence of an empty editor. Emptiness is established only by an
+immediate owner visual confirmation recorded in a structured private document
+bound to the fresh `before.json` hash, pane/terminal birth, PID/process birth,
+timestamp and trusted owner-transcript evidence hash. Missing, stale or changed
+bindings, non-private evidence, or an evidence-file hash mismatch refuse before
+the no-retry marker or key. The check does not rely on an
+undocumented `process_info.pane_id` field.
+Direct `kill`, shell text injection, and an unverified fallback command are not
+supported migration paths. The conductor confirms the
 replacement pane is live and accepted. Only then does it hand the role
 back with `designate-main.sh --handoff-to <original-main-pane>` and verify
 `designate-main.sh --show` reports the replacement pane's current terminal
