@@ -620,18 +620,26 @@ border = " │|─═┌┐└┘├┤┬┴┼╭╮╰╯"
 raw = [ansi.sub("", line.rstrip("\r\n")) for line in sys.stdin]
 clean = [line.strip(border) for line in raw]
 footer = None
+details_suffix = " · \U000f0634 O details · type to steer instead"
 footer_re = re.compile(r"^\S(?:.*\S)? approve [·•] \S(?:.*\S)? deny(?: [·•] .+ scroll)?$")
 for i in range(len(clean) - 1, -1, -1):
-    if footer_re.fullmatch(clean[i]):
+    candidate = clean[i]
+    if candidate.endswith(details_suffix):
+        candidate = candidate[:-len(details_suffix)]
+    if footer_re.fullmatch(candidate):
         footer = i
         break
 if footer is None:
     sys.exit(1)
-# A completed key-hint panel remains in terminal scrollback.  It is live only
-# while its footer is still bottom-anchored; any meaningful row after it is
-# newer output/composer state and makes the old panel non-actionable.  Border
-# closers and blank padding strip to empty and remain allowed.
-if any(line.strip() for line in clean[footer + 1:]):
+# A completed key-hint panel remains in terminal scrollback. It is live only
+# while its footer is bottom-anchored. The ONE exempt row is OMPs own status
+# bar, matched by its exact rendered shape: raw row opens with the "╭─" box
+# corner, then a braille spinner, an elapsed token, a Powerline U+E0B1
+# separator, and later the U+E0B0 cap. Anything else after the footer —
+# including ordinary output decorated with Powerline glyphs — means stale.
+status_re = re.compile(r"╭─+ [\u2800-\u28ff] \d+[smhd](?:\d+[sm])?(?: \ue0b1 [^\ue0b0\ue0b1\ue0b2\n]+){2,} \ue0b0─[^\ue0b0\ue0b1\ue0b2\n]*\ue0b2[^\ue0b0\ue0b1\ue0b2\n]*─╮")
+after = [(r, c) for r, c in zip(raw[footer + 1:], clean[footer + 1:]) if c.strip()]
+if len(after) > 1 or any(not status_re.fullmatch(r.strip(" │|")) for r, _c in after):
     sys.exit(1)
 header = None
 for i in range(footer - 1, -1, -1):
@@ -684,22 +692,28 @@ import re, sys
 choice = sys.argv[1]
 ansi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 border = " │|─═┌┐└┘├┤┬┴┼╭╮╰╯"
-rows = [ansi.sub("", line.rstrip("\r\n")).strip(border) for line in sys.stdin]
+raw_rows = [ansi.sub("", line.rstrip("\r\n")) for line in sys.stdin]
+rows = [r.strip(border) for r in raw_rows]
+status_re = re.compile(r"╭─+ [\u2800-\u28ff] \d+[smhd](?:\d+[sm])?(?: \ue0b1 [^\ue0b0\ue0b1\ue0b2\n]+){2,} \ue0b0─[^\ue0b0\ue0b1\ue0b2\n]*\ue0b2[^\ue0b0\ue0b1\ue0b2\n]*─╮")
 # U+F0634 is OMPs rendered Ctrl modifier icon, U+F0311 Enter, and U+F12B7 Esc.
 # Require the live 18.10.4 shape exactly; Ctrl+Enter is intentionally not used
 # because Ctrl+Q is the portable documented alternative Herdr can name.
 footer = "\U000f0634 \U000f0311/\U000f0634 Q approve · \U000f12b7 deny"
+details_suffix = " · \U000f0634 O details · type to steer instead"
 footer_re = re.compile(r"^\S(?:.*\S)? approve [·•] \S(?:.*\S)? deny(?: [·•] .+ scroll)?$")
 # Bind to the bottommost CURRENT approval panel, just as _prompt_keyhint_parse
 # does.  An exact footer left in transcript above a newer remapped panel must
 # never lend its chord to the newer panel.
-footer_i = next((i for i in range(len(rows) - 1, -1, -1) if footer_re.fullmatch(rows[i])), None)
-if footer_i is None or rows[footer_i] != footer:
+def footer_core(row):
+    return row[:-len(details_suffix)] if row.endswith(details_suffix) else row
+footer_i = next((i for i in range(len(rows) - 1, -1, -1) if footer_re.fullmatch(footer_core(rows[i]))), None)
+if footer_i is None or rows[footer_i] not in {footer, footer + details_suffix}:
     raise SystemExit(1)
-# Do not lend an old exact footer to ANY newer output, not just a newer
-# approval header.  A dismissed panel followed by prose/composer state is no
-# longer actionable even though its original key hint remains in scrollback.
-if any(row.strip() for row in rows[footer_i + 1:]):
+# Do not lend an old exact footer to newer output. The only exempt row is
+# OMPs own status bar in its exact rendered shape (see status_re); ordinary
+# output, even decorated with Powerline glyphs, makes the panel stale.
+after = [raw_rows[i] for i in range(footer_i + 1, len(rows)) if rows[i].strip()]
+if len(after) > 1 or any(not status_re.fullmatch(r.strip(" │|")) for r in after):
     raise SystemExit(1)
 header_i = next((i for i in range(footer_i - 1, -1, -1) if rows[i].startswith("Allow tool:")), None)
 if header_i is None:

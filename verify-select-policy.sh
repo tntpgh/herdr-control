@@ -411,6 +411,78 @@ sel 2 --authority human; rc=$?
   && ok "real key-hint fixture sends exactly one Esc denial action" \
   || bad "key-hint denial rc=$rc keys='$(cat "$KEYS")'"
 
+# Exact live review-class footer captured from w7S:p7 after PR 295 deployed.
+# It is the normal 18.10.4 binding followed by one fixed details/steering hint;
+# both visibility and action-key validation must consume the same whole row.
+DETAILS_FOOTER='󰘴 󰌑/󰘴 Q approve · 󱊷 deny · 󰘴 O details · type to steer instead'
+set_keyhint_screen "git status --short" "$DETAILS_FOOTER"; reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = "ctrl+q" ] \
+  && ok "review-class key-hint sends exactly one Ctrl+Q approval action" \
+  || bad "review-class key-hint approval rc=$rc keys='$(cat "$KEYS")'"
+
+set_keyhint_screen "git status --short" "$DETAILS_FOOTER"; reset_keys
+sel 2 --authority human; rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = "Esc" ] \
+  && ok "review-class key-hint sends exactly one Esc denial action" \
+  || bad "review-class key-hint denial rc=$rc keys='$(cat "$KEYS")'"
+
+set_keyhint_screen "git status --short" "$DETAILS_FOOTER"
+# Exact status row archived from the live w7S:p7 capture (reviewer-hint-ea4d96aa bundle).
+printf '╭── ⠙ 1h  󰪣 Sonnet 5   knowledge-base/must-touch-r3   review/must-touch-r3 ?1  󰙺 0.41 ─6%%─󰁨─────────1M─ 󰱼 REVIEW: Review must-touch-r3 brief ──╮\n' >> "$SCREEN"
+reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = "ctrl+q" ] \
+  && ok "exact live review-class footer plus OMP status bar is actionable" \
+  || bad "live-shape review footer rc=$rc keys='$(cat "$KEYS")'"
+
+set_keyhint_screen "git status --short" '󰘴 󰌑/󰘴 Q approve · 󱊷 deny · 󰘴 O details about steering'; reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "similar details prose is not accepted as the review-class footer" \
+  || bad "similar details prose rc=$rc keys=$(keys_pressed)"
+
+set_keyhint_screen "git status --short" "$DETAILS_FOOTER"
+printf 'review output continued\n' >> "$SCREEN"; reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "output after review-class footer makes the panel stale" \
+  || bad "stale review-class footer rc=$rc keys=$(keys_pressed)"
+
+# Review r2 blocker: ordinary output decorated with Powerline separators must
+# never pass as the OMP status bar. sel exercises BOTH the visibility parser
+# and the action-key binder; each must refuse with no key sent.
+for decorated in \
+  'build  step 2  done ' \
+  '⠋ 1h  Sonnet 5  repo ' \
+  '╭── output  looks  like a bar ' \
+  '╭── ⠋ 1h  no second separator ' \
+  '╭── ⠋ 1h Sonnet 5 repo ' \
+  '╭── ⠋ 1h  Sonnet 5  repo ' \
+  '╭── ⠋ 1h  Sonnet 5  repo ─6%%─ REVIEW' \
+  '╭── ⠋ 1h  Sonnet 5  repo ─ x ─╮ trailing output'; do
+  set_keyhint_screen "git status --short" "$DETAILS_FOOTER"
+  printf '%s\n' "$decorated" >> "$SCREEN"; reset_keys
+  sel 1 --authority human; rc=$?
+  [ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+    && ok "decorated stale row is not the status bar: $decorated" \
+    || bad "decorated stale row accepted rc=$rc keys=$(keys_pressed): $decorated"
+done
+
+set_keyhint_screen "git status --short" "$DETAILS_FOOTER"
+printf '╭── ⠋ 1h  Sonnet 5  repo \n╭── ⠙ 1h  Sonnet 5  repo \n' >> "$SCREEN"; reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "two status-shaped rows after the footer are stale" \
+  || bad "two status rows accepted rc=$rc keys=$(keys_pressed)"
+
+set_keyhint_screen "git status --short" "󰘴 󰌑/󰘴 Q approve · 󱊷 deny"
+printf 'old output  x  y \n' >> "$SCREEN"; reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "implement-class footer with decorated stale row is refused" \
+  || bad "implement-class decorated stale accepted rc=$rc keys=$(keys_pressed)"
+
 printf '== unknown/remapped key-hint is never guessed ==\n'
 set_keyhint_screen "git status --short" "Alt+A approve · Esc deny"; reset_keys
 sel 1 --authority human; rc=$?
