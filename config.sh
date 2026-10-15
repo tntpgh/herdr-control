@@ -11,7 +11,7 @@
 # smart-name.sh's SMART_NAME_BACKEND default.
 : "${HERDR_DEFAULT_AGENT:=omp}"
 HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-15-issue295-v6/omp"
-HERDR_OMP_LAUNCHER_SHA256="9e8ea3128abff6002905aa839f28305b0f623db01fb22572e40cfa96cd96c473"
+HERDR_OMP_LAUNCHER_SHA256="9bf1f831315865f44de920fca28d3460511cc031c04d1c5a2631635f553e6b8e"
 
 # Extra dirs prepended to PATH so git/gh/jq/python3 (and your agent) resolve even
 # when herdr runs a script with a minimal environment (e.g. from a keybinding).
