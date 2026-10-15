@@ -2,6 +2,7 @@
 import importlib.util
 import contextlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -112,6 +113,95 @@ class InPlaceEvidenceTests(unittest.TestCase):
             self.assertTrue(m.pid_is_pane_foreground_or_ancestor(30, "p"))
             self.assertTrue(m.pid_is_pane_foreground_or_ancestor(20, "p"))
             self.assertFalse(m.pid_is_pane_foreground_or_ancestor(99, "p"))
+
+    def test_shell_ready_rejects_agents_and_requires_prompt(self):
+        shell = {"foreground_processes": [{"name": "zsh", "cmdline": "/bin/zsh"}]}
+        self.assertTrue(m.shell_ready(shell, b"host repo % "))
+        self.assertFalse(m.shell_ready({"foreground_processes": []}, b"host repo % "))
+        self.assertFalse(m.shell_ready({"foreground_processes": []}, b"not a prompt"))
+        self.assertFalse(m.shell_ready({"foreground_processes": [{"name": "omp"}]}, b"host repo % "))
+        self.assertFalse(m.shell_ready({"foreground_processes": [{"name": "zsh"}, {"name": "python"}]}, b"host repo % "))
+
+    def test_only_fresh_normal_dispose_exit_is_accepted(self):
+        self.assertTrue(m.has_fresh_normal_session_exit(b'{"type":"custom","customType":"session_exit","data":{"kind":"normal","reason":"dispose"}}\n'))
+        self.assertFalse(m.has_fresh_normal_session_exit(b'{"type":"session_exit","kind":"normal","reason":"dispose"}\n'))
+
+    def test_idle_view_requires_bound_pid_and_empty_composer(self):
+        info = {"foreground_processes": [{"pid": 77, "name": "omp"}]}
+        self.assertTrue(m.omp_idle_visible(info, "╭──╮\n│  │\n╰──╯\n".encode(), 77))
+        self.assertFalse(m.omp_idle_visible(info, "╭──╮\n│draft│\n╰──╯\n".encode(), 77))
+        self.assertFalse(m.omp_idle_visible(info, "Allow tool:\n╭──╮\n│  │\n╰──╯\n".encode(), 77))
+        self.assertFalse(m.omp_idle_visible(info, "╭──╮\n│  │\n╰──╯\n".encode(), 88))
+
+    def test_graceful_exit_sends_exactly_one_ctrl_d_and_records_evidence(self):
+        ev = self.root / "exit"; ev.mkdir(); session = self.root / "exit.jsonl"; session.write_text("prefix")
+        baseline = self.acceptance_baseline(session, str(self.repo))
+        proc = {"pid": 77, "birth": "birth", "argv": f"omp --resume {session}", "cwd": str(self.repo),
+                "environment_names": [], "mapped_binary": "", "mapped_binary_sha256": "",
+                "mapped_native": "", "mapped_native_sha256": ""}
+        baseline["process"].update({"pid": 77, "birth": "birth", "argv_sha256": m.sha_bytes(proc["argv"].encode()),
+                                    "resume_args": [], "mapped_binary": "", "mapped_binary_sha256": "",
+                                    "mapped_native": "", "mapped_native_sha256": ""})
+        (ev / "before.json").write_text(json.dumps(baseline))
+        pane = {"pane": "p", "terminal": "t", "cwd": str(self.repo), "session_file": str(session)}
+        calls = []
+        def fake_run(argv, check=True):
+            calls.append(argv)
+            if argv[:3] == ["herdr", "agent", "send-keys"]:
+                session.write_text('prefix\n{"type":"custom","customType":"session_exit","data":{"kind":"normal","reason":"dispose"}}\n')
+                return b""
+            if argv[:2] == ["ps", "-p"]: return b""
+            return b""
+        args = types.SimpleNamespace(before=str(ev), pid=77, pane="p", terminal="t", timeout=0.1)
+        with mock.patch.object(m, "process", return_value=proc), mock.patch.object(m, "pane_identity", return_value=pane), \
+             mock.patch.object(m, "pid_is_pane_foreground_or_ancestor", return_value=True), \
+             mock.patch.object(m, "agent_is_idle", return_value=True), mock.patch.object(m, "omp_idle_visible", return_value=True), \
+             mock.patch.object(m, "process_environment_values", return_value=[b"secret-value"]), \
+             mock.patch.object(m, "pane_process_info", return_value={"pane_id": "p", "foreground_processes": [{"name": "zsh", "cmdline": "/bin/zsh"}]}), \
+             mock.patch.object(m, "pane_read", return_value=b"host repo % "), mock.patch.object(m, "run", side_effect=fake_run):
+            m.graceful_exit(args)
+        self.assertEqual([c for c in calls if c[:3] == ["herdr", "agent", "send-keys"]],
+                         [["herdr", "agent", "send-keys", "p", "ctrl+d"]])
+        self.assertTrue((ev / "graceful-exit.json").is_file())
+
+    def test_graceful_exit_rejects_drift_or_nonidle_before_any_key(self):
+        ev = self.root / "reject-exit"; ev.mkdir(); session = self.root / "reject.jsonl"; session.write_text("prefix")
+        proc = {"pid": 77, "birth": "birth", "argv": f"omp --resume {session}", "cwd": str(self.repo),
+                "environment_names": [], "mapped_binary": "/omp", "mapped_binary_sha256": "bin",
+                "mapped_native": "/native", "mapped_native_sha256": "native"}
+        baseline = self.acceptance_baseline(session, str(self.repo)); baseline["process"].update(proc)
+        baseline["process"].pop("argv"); baseline["process"]["argv_sha256"] = m.sha_bytes(f"omp --resume {session}".encode())
+        baseline["process"]["resume_args"] = []
+        (ev / "before.json").write_text(json.dumps(baseline))
+        pane = {"pane": "p", "terminal": "t", "cwd": str(self.repo), "session_file": str(session)}
+        args = types.SimpleNamespace(before=str(ev), pid=77, pane="p", terminal="t", timeout=1.0)
+        drift = dict(proc); drift["argv"] = f"python --resume {session}"
+        for current, idle in ((drift, True), (proc, False)):
+            with mock.patch.object(m, "process", return_value=current), mock.patch.object(m, "pane_identity", return_value=pane), \
+                 mock.patch.object(m, "pid_is_pane_foreground_or_ancestor", return_value=True), \
+                 mock.patch.object(m, "agent_is_idle", return_value=idle), mock.patch.object(m, "omp_idle_visible", return_value=True), \
+                 mock.patch.object(m, "pane_process_info", return_value={}), mock.patch.object(m, "pane_read", return_value=b""), \
+                 mock.patch.object(m, "run") as run_call, \
+                 self.assertRaises(SystemExit):
+                m.graceful_exit(args)
+            self.assertFalse(any(c.args[0][:3] == ["herdr", "agent", "send-keys"] for c in run_call.call_args_list))
+
+    def test_graceful_exit_timeout_is_bounded(self):
+        args = types.SimpleNamespace(before=str(self.root), pid=1, pane="p", terminal="t", timeout=float("inf"))
+        (self.root / "before.json").write_text(json.dumps({"process": {"pid": 1, "birth": "b"}, "session_file": "/x", "repo": "/r"}))
+        with mock.patch.object(m, "process", return_value={}), self.assertRaises(SystemExit): m.graceful_exit(args)
+
+    def test_existing_exit_evidence_blocks_before_send(self):
+        path = self.root / "graceful-exit.json"; path.write_text("existing")
+        with mock.patch.object(m, "run") as run_call, self.assertRaises(SystemExit): m.reserve_json(path)
+        run_call.assert_not_called()
+
+    def test_attempt_reservation_is_exclusive_and_durable(self):
+        path = self.root / "graceful-exit.json"
+        first = m.reserve_json(path)
+        with self.assertRaises(SystemExit): m.reserve_json(path)
+        self.assertTrue(path.with_suffix(".attempt").is_file())
+        os.close(first[0]); Path(first[1]).unlink()
 
     def test_capture_rejects_pid_not_bound_to_pane_before_reading_state(self):
         session = self.root / "capture.jsonl"; session.write_text("session")
