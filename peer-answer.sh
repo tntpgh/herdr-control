@@ -145,7 +145,7 @@ while :; do
     key="$pane:$(prompt_menu_question "$pane" 2>/dev/null | shasum -a 256 | cut -c1-16)"
     skip=0; for r in "${refused[@]:-}"; do [ "$r" = "$key" ] && skip=1 && break; done
     [ "$skip" = 1 ] && continue
-    out="$(with_pane_lock "$pane" bash "$here/herdr-select.sh" "$pane" 1 --authority peer 2>&1)"; rc=$?
+    out="$(HERDR_SELECT_ACTOR=peer-answer with_pane_lock "$pane" bash "$here/herdr-select.sh" "$pane" 1 --authority peer 2>&1)"; rc=$?
     case "$rc" in
       0) echo "$(date '+%H:%M:%S') $pane approved: $(printf '%s' "$out" | tail -1)" ;;
       8) echo "$(date '+%H:%M:%S') $pane left for a human: $(printf '%s' "$out" | grep -m1 'REFUSED\|refusing' || printf '%s' "$out" | tail -1)"

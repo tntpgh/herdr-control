@@ -122,16 +122,26 @@ count_events() {
 
 printf '== SAFE command, peer authority -> allowed, key pressed ==\n'
 set_screen "ls -la /tmp"; reset_keys
-sel 1 --authority peer; rc=$?
+HERDR_SELECT_ACTOR=peer-answer sel 1 --authority peer; rc=$?
 [ "$rc" -eq 0 ] && ok "exit 0" || bad "exit $rc (expected 0); stderr: $(cat "$WORK/err.txt")"
 [ "$(keys_pressed)" = "1" ] && ok "exactly one key pressed" || bad "keys pressed=$(keys_pressed)"
 [ "$(cat "$KEYS")" = "1" ] && ok "the pressed key was the chosen digit" || bad "pressed '$(cat "$KEYS")'"
 [ "$(q_appr policy_verdict)" = "allow" ] && ok "verdict recorded allow" || bad "verdict=$(q_appr policy_verdict)"
 [ "$(q_appr authority)" = "peer" ] && ok "authority recorded peer" || bad "authority=$(q_appr authority)"
+[ "$(q_appr decided_by)" = "peer-answer" ] && ok "actor provenance records peer-answer, distinct from authority" \
+  || bad "decided_by=$(q_appr decided_by) (expected peer-answer)"
+[ "$(tail -1 "$HERDR_BRIDGE_STATE/selections.jsonl" | jq -r '.actor')" = peer-answer ] \
+  && ok "operator audit records the selector actor" || bad "selection actor missing or false"
 [ -n "$(q_appr decided_at)" ]   && ok "decided_at set"   || bad "decided_at empty"
 [ -n "$(q_appr attempted_at)" ] && ok "attempted_at set" || bad "attempted_at empty"
 [ -n "$(q_appr confirmed_at)" ] && ok "confirmed_at set (delivery confirmed)" || bad "confirmed_at empty"
 [ "$(q_appr outcome)" = "pressed" ] && ok "outcome recorded" || bad "outcome=$(q_appr outcome)"
+
+set_screen "pwd"; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(q_appr decided_by)" = cli ] \
+  && ok "unnamed interactive selector stays honestly attributed as cli" \
+  || bad "cli fallback provenance: rc=$rc decided_by=$(q_appr decided_by)"
 
 printf '== DESTRUCTIVE command, peer authority -> REFUSED, no key pressed ==\n'
 set_screen "rm -rf /tmp/scratch"; reset_keys

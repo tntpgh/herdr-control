@@ -365,6 +365,7 @@ def authorize_bound(db_path: str, *, run_id: str, task_id: str, pane_id: str, pa
                     native_session: str, tool_call_id: str, approval_request_id: str,
                     core_arguments_digest: str, worktree: str, conductor_pane: str,
                     conductor_birth: str, approval_id: str, choice: str, authority: str,
+                    decided_by: str,
                     review_reason: str, review_category: str, reviewer: str,
                     audit_text: str, expect_payload_sha: str, now: float | None = None) -> dict:
     """Atomically prove current task/conductor authority and claim one bound request."""
@@ -427,7 +428,7 @@ def authorize_bound(db_path: str, *, run_id: str, task_id: str, pane_id: str, pa
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (approval_id, run_id, task_id, pane_id, approval_request_id,
              "1" if str(choice).strip().lower() in APPROVE_CHOICES else "2", choice,
-             "cli", authority, "allow", audit_text[:500], stamp, stamp),
+             decided_by, authority, "allow", audit_text[:500], stamp, stamp),
         )
         review_payload = {"approval_id": approval_id, "reason": review_reason,
                           "category": review_category, "reviewer": reviewer,
@@ -441,7 +442,7 @@ def authorize_bound(db_path: str, *, run_id: str, task_id: str, pane_id: str, pa
         conn.execute(
             "INSERT INTO events (event_id,run_id,task_id,type,occurred_at,payload) VALUES (?,?,?,?,?,?)",
             (event_id, run_id, task_id, "prompt_occ_authorized", stamp,
-             json.dumps({"occ_key": key, "decided_by": authority, "choice": choice, "at_ms": at_ms},
+             json.dumps({"occ_key": key, "decided_by": decided_by, "choice": choice, "at_ms": at_ms},
                         sort_keys=True, separators=(",", ":"))),
         )
         conn.commit()
@@ -954,7 +955,7 @@ def main(argv: list[str]) -> int:
     s = sub.add_parser("authorize-bound")
     _add_identity_args(s)
     for name in ("approval-request-id", "core-arguments-digest", "worktree", "conductor-pane",
-                 "conductor-birth", "approval-id", "choice", "authority", "review-reason",
+                 "conductor-birth", "approval-id", "choice", "authority", "decided-by", "review-reason",
                  "review-category", "reviewer", "audit-text", "expect-payload-sha"):
         s.add_argument("--" + name, required=True)
 
@@ -1039,6 +1040,7 @@ def main(argv: list[str]) -> int:
                                   worktree=args.worktree, conductor_pane=args.conductor_pane,
                                   conductor_birth=args.conductor_birth, approval_id=args.approval_id,
                                   choice=args.choice, authority=args.authority,
+                                  decided_by=args.decided_by,
                                   review_reason=args.review_reason, review_category=args.review_category,
                                   reviewer=args.reviewer, audit_text=args.audit_text,
                                   expect_payload_sha=args.expect_payload_sha)

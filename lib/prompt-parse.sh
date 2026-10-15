@@ -138,6 +138,11 @@ _is_prose() {
   # under five words ("esc to interrupt", "? for shortcuts") never reach here.
   local low
   low="$(printf '%s' "$1" | tr 'A-Z' 'a-z' | sed -E 's/^[^a-z0-9↑↓(?]*//; s/^[[:space:]]+//')"
+  # Codex review-class prompt footer captured 2026-10-15. Keep this exact and
+  # anchored: a lone "details" or "steer" in later prose is not a prompt hint.
+  case "$low" in
+    "o details · type to steer instead"|"o details - type to steer instead") return 1 ;;
+  esac
   # ANCHORED at the start, because an unanchored pair swallowed real output:
   # " I have applied it. You can use the arrow keys to navigate the tree."
   # contains arrow+navigate and is a sentence about what the agent DID. A hint
@@ -530,6 +535,18 @@ for index, chunk in enumerate(chunks):
             body = body[:exc.start]
     sys.stdout.buffer.write(body + ending)
 ' 2>/dev/null
+}
+
+# Validate the complete decision-time capture with the same strict decoder
+# used by the row-suffix repair above.  Do not use macOS iconv as a boolean
+# validity oracle here: its streaming implementation has returned EINVAL for
+# long, valid, multi-line captures containing box-drawing rows even though
+# Python strict decoding (and iconv applied to every individual row) accepts
+# the exact bytes.  This helper emits nothing and succeeds only for valid
+# UTF-8, so malformed interior bytes still fail closed.
+_strict_utf8() {
+  python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8", "strict")' \
+    >/dev/null 2>&1
 }
 
 # Unsanitized: the same window `_menu_window`/`_pane_visible` read, before
@@ -1524,7 +1541,7 @@ prompt_command_torn() {                 # <pane> -> 0 torn(-or-unreadable) / 1 p
   fi
   raw_win="$(_pane_read_raw "$1" | _repair_truncated_utf8_suffixes)"
   [ -n "$raw_win" ] || return 0
-  printf '%s' "$raw_win" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && return 1
+  printf '%s' "$raw_win" | _strict_utf8 && return 1
   return 0
 }
 
