@@ -43,11 +43,25 @@ Main must never stop or replace itself. Before migrating the pane holding the
 to transfer the role to a live, non-worker temporary conductor. That conductor
 records the current role/birth and performs the same sequence used for every
 pane: capture the baseline; obtain the helper's exact SHA-bound resume command;
-immediately re-read `herdr pane process-info` and require the captured PID is
-still the pane foreground process or its ancestor; only then send one `ctrl-c`
-with `herdr pane send-keys`; require `pane process-info` to
-show the captured PID has left the foreground; start that exact command with
+run `session-in-place.py graceful-exit` with the captured PID, pane and terminal.
+That operation immediately rebinds the pane terminal birth/session/cwd and idle
+PID foreground ancestry and complete captured process image (argv/resume arguments
+and mapped runtime/native module), records transcript size/hash/mtime, and sends exactly
+one logical `ctrl+d` through `herdr agent send-keys <pane> ctrl+d`. OMP 18.10.4 binds Ctrl+D to its
+graceful shutdown path (draft save, session disposal and shutdown hooks); Ctrl+C
+is clear/interrupt and is not an exit mechanism. The helper waits boundedly for
+the exact PID/birth to disappear, then requires the same pane birth/cwd, no
+OMP/agent foreground process, an observed shell prompt, an intact transcript
+prefix, durable post-exit transcript metadata, and a fresh `session_exit` record
+whose `kind=normal` and `reason=dispose`. It scans only the newly
+appended transcript bytes and visible post-exit pane region for in-memory
+credential values or the literal key token, reporting only pass/fail. Only after
+`graceful-exit.json` exists may the conductor start the exact command with
 `herdr pane run`; then run verify-after → a newly generated host-visible health
+The idle check combines `herdr agent get` state, read-only `pane process-info`,
+and the detection view's exact empty OMP composer; streaming, prompting, editor
+text, or an unrecognized view fails closed. It does not rely on an undocumented
+`process_info.pane_id` field.
 check → accept. Direct `kill`, shell text injection, and an unverified fallback
 command are not supported migration paths. The conductor confirms the
 replacement pane is live and accepted. Only then does it hand the role
@@ -57,6 +71,16 @@ birth. A failure before acceptance leaves control with the temporary conductor;
 it restores the verified recovery bundle or stops without touching other
 sessions. A failure after acceptance but before return leaves the replacement
 session running and control with the temporary conductor for explicit recovery.
+
+Herdr's public key API has no expected-PID compare-and-swap. A residual race
+therefore remains between the final read-only PID/ancestry check and delivery of
+`ctrl+d`. The helper narrows but cannot eliminate that interval. Any changed or
+lost pane, PID/birth ambiguity, missing shell, missing normal/dispose exit record,
+or timeout fails closed; never retry the key and never proceed to `pane run`.
+Before the key, the helper atomically creates a durable `graceful-exit.attempt`
+marker. It intentionally remains after success or failure so concurrent or
+retried invocations cannot deliver a second key; removal requires a separately
+reviewed recovery decision.
 
 Before touching a PID, create a private mode-0700 evidence directory outside the repository. Record only:
 
@@ -80,8 +104,9 @@ For each row, in order:
 3. Verify the matching retained bundle with `session-recovery.sh verify` and `restore-check`.
 4. Optionally confirm host-visible Herdr health as a preflight check. This is
    not acceptance evidence and cannot be reused after replacement.
-5. Stop only the freshly discovered and helper-bound OMP PID. Do not close
-   other panes or restart Herdr services.
+5. Stop only the freshly discovered and helper-bound OMP PID with the helper's
+   single guarded `CTRL_D` operation. On any mismatch or timeout, do not send a
+   second key, text, signal, kill, resume command, or any other pane action.
 6. Resume the archived transcript in the same cwd, same pane/terminal mapping, with the specified exact/fallback 18.10.4 runtime, archived hook/config/overlay/authority inputs, and existing credential provider.
 7. Run `verify-after`, then generate a new host-visible `HEALTHY` record bound
    to the bundle, verifier, and deployed revision. It must postdate

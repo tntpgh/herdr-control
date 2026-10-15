@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Evidence helper for serial, in-place OMP session migration.
 
-This tool never signals a process and never writes to a pane.  It captures and
-compares identity/integrity evidence, prints a shell-quoted resume command for
-an external conductor, and records a process-bound acceptance without replacing
-the recovery bundle's historical LIVE_ACCEPTED_AT.
+Apart from `graceful-exit` sending one guarded logical Ctrl+D, this tool never
+signals a process or writes to a pane. It captures and compares integrity
+evidence, prints a shell-quoted resume command, and records a process-bound
+acceptance without replacing the bundle's historical LIVE_ACCEPTED_AT.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -117,6 +118,158 @@ def process(pid: int) -> dict[str, str | int | list[str]]:
             "mapped_native": str(native or ""), "mapped_native_sha256": sha_file(native) if native and native.is_file() else ""}
 
 
+def process_environment_values(pid: int) -> list[bytes]:
+    """Return sensitive environment values in memory only; callers must never print/store them."""
+    ps = os.environ.get("HERDR_PS", "ps")
+    raw = run([ps, "eww", "-p", str(pid), "-o", "command="])
+    names = (b"HERDR_", b"PI_", b"OMP_", b"OP_", b"AWS_", b"AZURE_", b"GOOGLE_",
+             b"GITHUB_", b"GH_", b"OPENAI_", b"ANTHROPIC_")
+    values: list[bytes] = []
+    for match in re.finditer(rb"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)", raw):
+        name, value = match.group(1), match.group(2)
+        if (name.startswith(names) or name in {b"SHELL", b"TMPDIR"}) and value:
+            values.append(value)
+    return values
+
+
+def pane_process_info(pane: str) -> dict:
+    herdr = os.environ.get("HERDR_BIN", "herdr")
+    data = json.loads(run([herdr, "pane", "process-info", "--pane", pane]).decode())
+    return data.get("result", {}).get("process_info", {})
+
+
+def pane_read(pane: str, source: str, lines: int) -> bytes:
+    herdr = os.environ.get("HERDR_BIN", "herdr")
+    return run([herdr, "pane", "read", pane, "--source", source, "--lines", str(lines), "--format", "text"])
+
+
+def agent_is_idle(pane: str) -> bool:
+    herdr = os.environ.get("HERDR_BIN", "herdr")
+    data = json.loads(run([herdr, "agent", "get", pane]).decode())
+    result = data.get("result", {})
+    agent = result.get("agent", result)
+    return str(agent.get("status", agent.get("state", ""))).lower() == "idle"
+
+
+def omp_idle_visible(info: dict, visible: bytes, pid: int) -> bool:
+    foreground = info.get("foreground_processes")
+    if not isinstance(foreground, list) or not any(row.get("pid") == pid for row in foreground if isinstance(row, dict)):
+        return False
+    text = visible.decode(errors="replace")
+    if re.search(r"allow tool:|approval required|press enter to confirm|streaming|working…|working\.\.\.", text, re.I):
+        return False
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return False
+    # OMP's idle composer ends in a three-line empty box. Any editor content
+    # makes the middle row nonblank and therefore fails closed.
+    return bool(re.match(r"^\s*╭.*╮\s*$", lines[-3]) and
+                re.match(r"^\s*│\s*│\s*$", lines[-2]) and
+                re.match(r"^\s*╰.*╯\s*$", lines[-1]))
+
+
+def shell_ready(info: dict, visible: bytes) -> bool:
+    foreground = info.get("foreground_processes")
+    if not isinstance(foreground, list):
+        return False
+    if len(foreground) != 1:
+        return False
+    shell_seen = False
+    for row in foreground:
+        text = " ".join(str(row.get(k, "")) for k in ("name", "cmdline", "command")).lower()
+        if any(word in text for word in ("omp", "oh-my-pi", "codex", "claude", "node", "bun")):
+            return False
+        if re.search(r"(?:^|[/\s-])(zsh|bash|fish|sh)(?:$|\s)", text):
+            shell_seen = True
+    lines = [line.rstrip() for line in visible.decode(errors="replace").splitlines() if line.strip()]
+    return bool(shell_seen and lines and re.search(r"(?:[$#%>❯➜])\s*$", lines[-1]))
+
+
+def has_fresh_normal_session_exit(tail: bytes) -> bool:
+    for line in tail.splitlines():
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        data = row.get("data") if isinstance(row.get("data"), dict) else {}
+        if row.get("type") == "custom" and row.get("customType") == "session_exit" \
+           and data.get("kind") == "normal" and data.get("reason") == "dispose":
+            return True
+    return False
+
+
+def graceful_exit(args: argparse.Namespace) -> None:
+    """One guarded Ctrl+D.  No retry: any ambiguity exits before another pane action."""
+    before_path = Path(args.before).resolve() / "before.json"
+    baseline = json.loads(before_path.read_text())
+    session = Path(baseline["session_file"])
+    expected_pane = {"pane": args.pane, "terminal": args.terminal,
+                     "cwd": baseline["repo"], "session_file": str(session)}
+    current = process(args.pid)
+    if not math.isfinite(args.timeout) or not 0 < args.timeout <= 30:
+        die("exit timeout must be finite and in (0, 30] seconds")
+    if args.pid != baseline["process"]["pid"] or current["birth"] != baseline["process"]["birth"]:
+        die("exit precheck process identity mismatch")
+    if pane_identity(args.pane) != expected_pane or not pid_is_pane_foreground_or_ancestor(args.pid, args.pane):
+        die("exit precheck pane/session/cwd/ancestry mismatch")
+    if current["cwd"] != baseline["repo"]:
+        die("exit precheck cwd mismatch")
+    if sha_bytes(str(current["argv"]).encode()) != baseline["process"]["argv_sha256"] \
+       or safe_resume_args(str(current["argv"])) != baseline["process"]["resume_args"] \
+       or current["mapped_binary"] != baseline["process"]["mapped_binary"] \
+       or current["mapped_binary_sha256"] != baseline["process"]["mapped_binary_sha256"] \
+       or current["mapped_native"] != baseline["process"]["mapped_native"] \
+       or current["mapped_native_sha256"] != baseline["process"]["mapped_native_sha256"]:
+        die("exit precheck process image changed")
+    pre_info = pane_process_info(args.pane)
+    pre_visible = pane_read(args.pane, "detection", 80)
+    if not agent_is_idle(args.pane) or not omp_idle_visible(pre_info, pre_visible, args.pid):
+        die("exit precheck agent is not idle")
+    size = session.stat().st_size
+    prefix = sha_file(session, size)
+    mtime_ns = session.stat().st_mtime_ns
+    sensitive = process_environment_values(args.pid)
+    exit_path = before_path.parent / "graceful-exit.json"
+    reservation = reserve_json(exit_path)
+    herdr = os.environ.get("HERDR_BIN", "herdr")
+    # This is deliberately the only mutating call in the operation.
+    run([herdr, "agent", "send-keys", args.pane, "ctrl+d"])
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        identity = run([os.environ.get("HERDR_PS", "ps"), "-p", str(args.pid), "-o", "lstart="], check=False).strip()
+        if not identity:
+            break
+        if identity.decode(errors="replace") != baseline["process"]["birth"]:
+            break
+        time.sleep(0.2)
+    else:
+        die("graceful exit timed out; no further pane action is permitted")
+    pane_now = pane_identity(args.pane)
+    if pane_now["pane"] != args.pane or pane_now["terminal"] != args.terminal or pane_now["cwd"] != baseline["repo"]:
+        die("post-exit pane birth/cwd mismatch")
+    info = pane_process_info(args.pane)
+    visible = pane_read(args.pane, "visible", 120)
+    if not shell_ready(info, visible):
+        die("post-exit shell is not unambiguously ready")
+    if session.stat().st_size < size or sha_file(session, size) != prefix or session.stat().st_mtime_ns < mtime_ns:
+        die("post-exit transcript durability/prefix mismatch")
+    tail = session.read_bytes()[size:]
+    if not has_fresh_normal_session_exit(tail):
+        die("fresh normal/dispose session_exit record is absent")
+    region = tail + b"\n" + visible
+    if b"CTRL_D" in region or b"ctrl+d" in region.lower() or any(len(value) >= 6 and value in region for value in sensitive):
+        die("post-exit region failed non-disclosing credential/key-token scan")
+    record = {"schema": 1, "kind": "omp-in-place-graceful-exit", "checked_at_epoch": int(time.time()),
+              "pane": args.pane, "terminal": args.terminal, "pid": args.pid,
+              "pid_birth": baseline["process"]["birth"], "before_sha256": sha_file(before_path),
+              "session_size_before": size, "session_prefix_sha256": prefix,
+              "session_size_after": session.stat().st_size,
+              "session_mtime_ns_before": mtime_ns, "session_mtime_ns_after": session.stat().st_mtime_ns,
+              "visible_post_exit_sha256": sha_bytes(visible), "session_exit": "normal/dispose", "key": "ctrl+d"}
+    publish_reserved_json(exit_path, record, reservation)
+    print("session-in-place: one Ctrl+D completed; old process absent and shell ready")
+
+
 def pane_identity(pane: str) -> dict[str, str]:
     herdr = os.environ.get("HERDR_BIN", "herdr")
     data = json.loads(run([herdr, "pane", "list"]).decode())
@@ -134,8 +287,6 @@ def pid_is_pane_foreground_or_ancestor(pid: int, pane: str) -> bool:
     ps = os.environ.get("HERDR_PS", "ps")
     data = json.loads(run([herdr, "pane", "process-info", "--pane", pane]).decode())
     info = data.get("result", {}).get("process_info", {})
-    if info.get("pane_id") != pane:
-        return False
     foreground = info.get("foreground_processes")
     if not isinstance(foreground, list) or not foreground:
         return False
@@ -286,6 +437,43 @@ def atomic_json(path: Path, value: dict) -> None:
         if os.path.exists(tmp): os.unlink(tmp)
 
 
+def reserve_json(path: Path) -> tuple[int, str, str]:
+    """Atomically reserve this logical attempt; the marker intentionally persists."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    if path.exists(): die(f"refusing to overwrite {path}")
+    marker = str(path.with_suffix(".attempt"))
+    try:
+        marker_fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        die(f"graceful-exit attempt already exists for {path}")
+    try:
+        os.write(marker_fd, b"attempted\n"); os.fsync(marker_fd)
+    finally:
+        os.close(marker_fd)
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try: os.fsync(dir_fd)
+    finally: os.close(dir_fd)
+    fd, tmp = tempfile.mkstemp(prefix=".graceful-exit.", dir=path.parent)
+    os.fchmod(fd, 0o600)
+    return fd, tmp, marker
+
+
+def publish_reserved_json(path: Path, value: dict, reservation: tuple[int, str, str]) -> None:
+    fd, tmp, marker = reservation
+    with os.fdopen(fd, "w") as f:
+        json.dump(value, f, sort_keys=True, indent=2); f.write("\n")
+        f.flush(); os.fsync(f.fileno())
+    try:
+        os.link(tmp, path)  # atomic no-overwrite publication
+    except FileExistsError:
+        os.unlink(tmp); die(f"refusing to overwrite {path}")
+    os.unlink(tmp)
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try: os.fsync(dir_fd)
+    finally: os.close(dir_fd)
+
+
 def capture(args: argparse.Namespace) -> None:
     out = Path(args.out).resolve()
     atomic_json(out / "before.json", snapshot(args))
@@ -419,6 +607,8 @@ def main() -> None:
     for name in ("before", "bundle", "binary", "native", "control", "hook"): v.add_argument("--" + name, required=True)
     v.set_defaults(func=verify_after)
     r = sub.add_parser("resume-command"); r.add_argument("--before", required=True); r.add_argument("--launcher", required=True); r.add_argument("--launcher-sha256", required=True); r.set_defaults(func=resume_command)
+    e = sub.add_parser("graceful-exit"); common(e); e.add_argument("--before", required=True)
+    e.add_argument("--timeout", type=float, default=10.0); e.set_defaults(func=graceful_exit)
     a = sub.add_parser("accept"); a.add_argument("--before", required=True); a.add_argument("--pid", type=int, required=True); a.add_argument("--health", required=True); a.add_argument("--revision", required=True); a.add_argument("--verifier", required=True)
     for name in ("bundle", "control", "hook"): a.add_argument("--" + name, required=True)
     a.set_defaults(func=accept)
