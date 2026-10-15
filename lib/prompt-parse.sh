@@ -632,11 +632,14 @@ for i in range(len(clean) - 1, -1, -1):
 if footer is None:
     sys.exit(1)
 # A completed key-hint panel remains in terminal scrollback. It is live only
-# while its footer is bottom-anchored except for OMPs own trailing status bar.
-# That bar carries repeated Powerline separators (U+E0B1); at most two such
-# rows are exempt, matching STATUS_TAIL above. Ordinary output remains stale.
-after = [line.strip() for line in clean[footer + 1:] if line.strip()]
-if len(after) > 2 or any(line.count("\ue0b1") < 2 for line in after):
+# while its footer is bottom-anchored. The ONE exempt row is OMPs own status
+# bar, matched by its exact rendered shape: raw row opens with the "╭─" box
+# corner, then a braille spinner, an elapsed token, a Powerline U+E0B1
+# separator, and later the U+E0B0 cap. Anything else after the footer —
+# including ordinary output decorated with Powerline glyphs — means stale.
+status_re = re.compile(r"^╭─+ [\u2800-\u28ff] \d+[smhd](?:\d+[sm])? \ue0b1 .* \ue0b1 .*\ue0b0")
+after = [(r, c) for r, c in zip(raw[footer + 1:], clean[footer + 1:]) if c.strip()]
+if len(after) > 1 or any(not status_re.match(r.strip(" │|")) for r, _c in after):
     sys.exit(1)
 header = None
 for i in range(footer - 1, -1, -1):
@@ -689,7 +692,9 @@ import re, sys
 choice = sys.argv[1]
 ansi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 border = " │|─═┌┐└┘├┤┬┴┼╭╮╰╯"
-rows = [ansi.sub("", line.rstrip("\r\n")).strip(border) for line in sys.stdin]
+raw_rows = [ansi.sub("", line.rstrip("\r\n")) for line in sys.stdin]
+rows = [r.strip(border) for r in raw_rows]
+status_re = re.compile(r"^╭─+ [\u2800-\u28ff] \d+[smhd](?:\d+[sm])? \ue0b1 .* \ue0b1 .*\ue0b0")
 # U+F0634 is OMPs rendered Ctrl modifier icon, U+F0311 Enter, and U+F12B7 Esc.
 # Require the live 18.10.4 shape exactly; Ctrl+Enter is intentionally not used
 # because Ctrl+Q is the portable documented alternative Herdr can name.
@@ -704,11 +709,11 @@ def footer_core(row):
 footer_i = next((i for i in range(len(rows) - 1, -1, -1) if footer_re.fullmatch(footer_core(rows[i]))), None)
 if footer_i is None or rows[footer_i] not in {footer, footer + details_suffix}:
     raise SystemExit(1)
-# Do not lend an old exact footer to newer output. OMP may paint up to two
-# Powerline-separated status rows below the still-live panel; no other
-# meaningful row is exempt.
-after = [row.strip() for row in rows[footer_i + 1:] if row.strip()]
-if len(after) > 2 or any(row.count("\ue0b1") < 2 for row in after):
+# Do not lend an old exact footer to newer output. The only exempt row is
+# OMPs own status bar in its exact rendered shape (see status_re); ordinary
+# output, even decorated with Powerline glyphs, makes the panel stale.
+after = [raw_rows[i] for i in range(footer_i + 1, len(rows)) if rows[i].strip()]
+if len(after) > 1 or any(not status_re.match(r.strip(" │|")) for r in after):
     raise SystemExit(1)
 header_i = next((i for i in range(footer_i - 1, -1, -1) if rows[i].startswith("Allow tool:")), None)
 if header_i is None:

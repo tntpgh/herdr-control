@@ -428,7 +428,7 @@ sel 2 --authority human; rc=$?
   || bad "review-class key-hint denial rc=$rc keys='$(cat "$KEYS")'"
 
 set_keyhint_screen "git status --short" "$DETAILS_FOOTER"
-printf '⠋ 1h  󰪣 Sonnet 5  repo  branch ?1  0.41 ─6%%─󰁨──────────1M─ REVIEW\n' >> "$SCREEN"
+printf '╭── ⠋ 1h  󰪣 Sonnet 5  repo  branch ?1  0.41 ─6%%─󰁨──────────1M─ REVIEW\n' >> "$SCREEN"
 reset_keys
 sel 1 --authority human; rc=$?
 [ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = "ctrl+q" ] \
@@ -447,6 +447,36 @@ sel 1 --authority human; rc=$?
 [ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
   && ok "output after review-class footer makes the panel stale" \
   || bad "stale review-class footer rc=$rc keys=$(keys_pressed)"
+
+# Review r2 blocker: ordinary output decorated with Powerline separators must
+# never pass as the OMP status bar. sel exercises BOTH the visibility parser
+# and the action-key binder; each must refuse with no key sent.
+for decorated in \
+  'build  step 2  done ' \
+  '⠋ 1h  Sonnet 5  repo ' \
+  '╭── output  looks  like a bar ' \
+  '╭── ⠋ 1h  no second separator '; do
+  set_keyhint_screen "git status --short" "$DETAILS_FOOTER"
+  printf '%s\n' "$decorated" >> "$SCREEN"; reset_keys
+  sel 1 --authority human; rc=$?
+  [ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+    && ok "decorated stale row is not the status bar: $decorated" \
+    || bad "decorated stale row accepted rc=$rc keys=$(keys_pressed): $decorated"
+done
+
+set_keyhint_screen "git status --short" "$DETAILS_FOOTER"
+printf '╭── ⠋ 1h  Sonnet 5  repo \n╭── ⠙ 1h  Sonnet 5  repo \n' >> "$SCREEN"; reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "two status-shaped rows after the footer are stale" \
+  || bad "two status rows accepted rc=$rc keys=$(keys_pressed)"
+
+set_keyhint_screen "git status --short" "󰘴 󰌑/󰘴 Q approve · 󱊷 deny"
+printf 'old output  x  y \n' >> "$SCREEN"; reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "implement-class footer with decorated stale row is refused" \
+  || bad "implement-class decorated stale accepted rc=$rc keys=$(keys_pressed)"
 
 printf '== unknown/remapped key-hint is never guessed ==\n'
 set_keyhint_screen "git status --short" "Alt+A approve · Esc deny"; reset_keys
