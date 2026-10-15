@@ -9,7 +9,7 @@
 # the actual options and named one, by NUMBER, same as always. That is
 # consent; a blind Enter is not.
 #
-# Two prompt SHAPES exist, and the caller never needs to know which one it is
+# Three prompt SHAPES exist, and the caller never needs to know which one it is
 # driving — the option number means the same thing either way:
 #   - numbered (Claude, Codex): `❯ N. text`, answered by pressing the bare
 #     digit — no Enter, since Enter accepts a DEFAULT and a default is
@@ -21,6 +21,9 @@
 #     identical; this script translates that number into "press Down/Up
 #     until the target row is highlighted, then Enter" instead of a digit.
 #     herdr-select.sh's own audit log records the mechanism used.
+#   - keyhint (omp 18.10.4): a non-selectable approval panel whose footer
+#     advertises app.approval.approve as Ctrl+Q and denial as Esc.  The footer
+#     is parsed as an action binding; no highlight, arrows, or Enter are used.
 #
 # Everything below exists to keep the "a human named one" guarantee true:
 #   - the target must be an agent pane (shared gate, lib/pane-guard.sh)
@@ -308,7 +311,7 @@ fi
 # one agent, one prompt style — but "somehow" is exactly what re-checking
 # from scratch each time protects against).
 _current_offer() {   # -> "mechanism<TAB>options-blob" or empty
-  local opts
+  local opts key
   # MENU FIRST. omp paints a queued-message list ("1. Conductor: ...") under
   # the input box, and that matches the numbered shape (`N. text`) exactly -
   # three times on 2026-09-05 the numbered branch "answered" the Approve/Deny
@@ -317,7 +320,11 @@ _current_offer() {   # -> "mechanism<TAB>options-blob" or empty
   # highlight + navigation footer, which claude/codex never render, so they
   # still fall through to numbered unchanged.
   opts=$(prompt_menu_options "$pane")
-  if [ -n "$opts" ]; then printf 'menu\t%s' "$opts"; return; fi
+  if [ -n "$opts" ]; then
+    key=$(prompt_keyhint_action_key "$pane" "$choice" 2>/dev/null || printf '')
+    if [ -n "$key" ]; then printf 'keyhint\t%s' "$opts"; else printf 'menu\t%s' "$opts"; fi
+    return
+  fi
   opts=$(prompt_options "$pane")
   [ -n "$opts" ] && printf 'numbered\t%s' "$opts"
 }
@@ -1097,7 +1104,9 @@ _reopen_blocked_period() {
 # answered, and a pane with nothing pending is running, not blocked.
 _require_unchanged_after_close() {
   _require_current_authority && require_agent_pane "$pane" && require_pane_birth_match "$pane" &&
-    { [ "$mechanism" = numbered ] || [ "$(prompt_menu_selected "$pane")" = "$choice" ]; } &&
+    { [ "$mechanism" = numbered ] ||
+      { [ "$mechanism" = keyhint ] && [ "$(prompt_keyhint_action_key "$pane" "$choice" 2>/dev/null)" = "$action_key" ]; } ||
+      [ "$(prompt_menu_selected "$pane")" = "$choice" ]; } &&
     [ "$(prompt_content_digest "$pane")" = "$current_content" ] && return 0
   prompt_any_visible "$pane" >/dev/null 2>&1 && _reopen_blocked_period
   echo "herdr-select: the prompt in $pane changed while its answer was being recorded — refusing." >&2
@@ -1152,6 +1161,23 @@ if [ "$mechanism" = numbered ]; then
   herdr pane send-keys "$pane" "$choice" >/dev/null 2>&1 || {
     _reopen_blocked_period
     echo "herdr-select: failed to send key '$choice' to $pane" >&2
+    exit 2
+  }
+elif [ "$mechanism" = keyhint ]; then
+  # OMP 18.10.4 approval is an action-key surface, not a selectable menu.
+  # Bind the exact currently rendered action, then re-read after the registry
+  # transition before sending exactly one supported key.  No Enter fallback.
+  action_key=$(prompt_keyhint_action_key "$pane" "$choice" 2>/dev/null || printf '')
+  [ -n "$action_key" ] || {
+    echo "herdr-select: the key-hint action in $pane is unknown or changed — refusing to guess." >&2
+    exit 6
+  }
+  _require_current_decision || exit 6
+  _close_blocked_period || true
+  _require_unchanged_after_close || exit 6
+  herdr pane send-keys "$pane" "$action_key" >/dev/null 2>&1 || {
+    _reopen_blocked_period
+    echo "herdr-select: failed to send bound action key '$action_key' to $pane" >&2
     exit 2
   }
 else
