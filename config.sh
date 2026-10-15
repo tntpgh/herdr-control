@@ -10,8 +10,8 @@
 # claude/codex process, matching spawn-task.sh's cli_for_agent routing and
 # smart-name.sh's SMART_NAME_BACKEND default.
 : "${HERDR_DEFAULT_AGENT:=omp}"
-HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-14-issue277-v3/omp"
-HERDR_OMP_LAUNCHER_SHA256="dc57719481f66856ac7cb1ce40a2ef77baae3a60eea718666e8c83717d4974a1"
+HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-15-issue277-v4/omp"
+HERDR_OMP_LAUNCHER_SHA256="66c6839ad4158e63826331fac08f3d147cbb93607c22710329e0c8e5cdcadba7"
 
 # Extra dirs prepended to PATH so git/gh/jq/python3 (and your agent) resolve even
 # when herdr runs a script with a minimal environment (e.g. from a keybinding).
