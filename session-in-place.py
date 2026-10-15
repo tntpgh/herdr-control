@@ -149,10 +149,13 @@ def agent_status(pane: str) -> str:
     result = data.get("result", {})
     if not isinstance(result, dict):
         return ""
-    # Herdr's documented current field is agent_status.  Do not fall back to
-    # similarly named fields: that previously made synthetic fixtures pass
-    # while the installed API was unobservable to this helper.
-    value = result.get("agent_status")
+    agent = result.get("agent")
+    if not isinstance(agent, dict):
+        return ""
+    # `herdr agent get` returns result.agent.agent_status. Do not fall back to
+    # flat or similarly named fields: synthetic fixtures twice hid an installed
+    # API mismatch here.
+    value = agent.get("agent_status")
     return value.lower() if isinstance(value, str) else ""
 
 

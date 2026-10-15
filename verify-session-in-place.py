@@ -127,10 +127,14 @@ class InPlaceEvidenceTests(unittest.TestCase):
         self.assertFalse(m.has_fresh_normal_session_exit(b'{"type":"session_exit","kind":"normal","reason":"dispose"}\n'))
 
     def test_current_agent_status_and_visible_blocker_gate(self):
-        response = {"result": {"agent_status": "idle", "status": "working", "state": "working"}}
+        # Exact schema captured from current `herdr agent get w7T:p2`; values
+        # unrelated to parsing are minimized, but nesting and type are intact.
+        response = {"id": "cli:agent:get", "result": {"agent": {
+            "agent": "omp", "agent_status": "idle", "pane_id": "w7T:p2",
+            "terminal_id": "term_fixture"}, "type": "agent_info"}}
         with mock.patch.object(m, "run", return_value=json.dumps(response).encode()):
             self.assertEqual(m.agent_status("p"), "idle")
-        obsolete = {"result": {"status": "idle", "state": "idle"}}
+        obsolete = {"result": {"agent_status": "idle", "status": "idle", "state": "idle"}}
         with mock.patch.object(m, "run", return_value=json.dumps(obsolete).encode()):
             self.assertEqual(m.agent_status("p"), "")
         info = {"foreground_processes": [{"pid": 77, "name": "omp"}]}
