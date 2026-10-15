@@ -148,7 +148,9 @@ def agent_is_idle(pane: str) -> bool:
     data = json.loads(run([herdr, "agent", "get", pane]).decode())
     result = data.get("result", {})
     agent = result.get("agent", result)
-    return str(agent.get("status", agent.get("state", ""))).lower() == "idle"
+    status = str(agent.get("agent_status", "")).lower()
+    token_status = str((agent.get("tokens") or {}).get("status", "")).lower()
+    return status == "idle" or (status == "done" and token_status == "idle")
 
 
 def omp_idle_visible(info: dict, visible: bytes, pid: int) -> bool:
@@ -159,13 +161,13 @@ def omp_idle_visible(info: dict, visible: bytes, pid: int) -> bool:
     if re.search(r"allow tool:|approval required|press enter to confirm|streaming|working…|working\.\.\.", text, re.I):
         return False
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
-    if len(lines) < 3:
+    if len(lines) < 2:
         return False
-    # OMP's idle composer ends in a three-line empty box. Any editor content
-    # makes the middle row nonblank and therefore fails closed.
-    return bool(re.match(r"^\s*╭.*╮\s*$", lines[-3]) and
-                re.match(r"^\s*│\s*│\s*$", lines[-2]) and
-                re.match(r"^\s*╰.*╯\s*$", lines[-1]))
+    # OMP 18.10.4's empty composer is the final status/header row followed
+    # immediately by an empty bottom row. A draft adds content rows between
+    # them, so adjacency plus an all-whitespace bottom interior is required.
+    return bool(re.match(r"^\s*╭.*╮\s*$", lines[-2]) and
+                re.match(r"^\s*╰─\s*─╯\s*$", lines[-1]))
 
 
 def shell_ready(info: dict, visible: bytes) -> bool:

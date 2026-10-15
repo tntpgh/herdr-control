@@ -128,10 +128,25 @@ class InPlaceEvidenceTests(unittest.TestCase):
 
     def test_idle_view_requires_bound_pid_and_empty_composer(self):
         info = {"foreground_processes": [{"pid": 77, "name": "omp"}]}
-        self.assertTrue(m.omp_idle_visible(info, "╭──╮\n│  │\n╰──╯\n".encode(), 77))
-        self.assertFalse(m.omp_idle_visible(info, "╭──╮\n│draft│\n╰──╯\n".encode(), 77))
-        self.assertFalse(m.omp_idle_visible(info, "Allow tool:\n╭──╮\n│  │\n╰──╯\n".encode(), 77))
-        self.assertFalse(m.omp_idle_visible(info, "╭──╮\n│  │\n╰──╯\n".encode(), 88))
+        # Sanitized structural fixture captured from real OMP 18.10.4 detection output.
+        empty = "prior transcript\n╭── model · cwd · branch · title ──╮\n╰─                 ─╯\n".encode()
+        self.assertTrue(m.omp_idle_visible(info, empty, 77))
+        self.assertFalse(m.omp_idle_visible(info, "╭── status ──╮\ndraft text\n╰─  ─╯\n".encode(), 77))
+        self.assertFalse(m.omp_idle_visible(info, "Allow tool:\n╭── status ──╮\n╰─  ─╯\n".encode(), 77))
+        self.assertFalse(m.omp_idle_visible(info, empty, 88))
+
+    def test_real_agent_get_idle_shapes(self):
+        fixtures = [
+            {"result": {"agent": {"agent": "omp", "agent_status": "idle", "pane_id": "w7T:p2",
+                                     "agent_session": {"kind": "path", "value": "/redacted/session.jsonl"}}}},
+            {"result": {"agent": {"agent": "omp", "agent_status": "done", "tokens": {"status": "idle"},
+                                     "pane_id": "w72:p1"}}},
+        ]
+        with mock.patch.object(m, "run", side_effect=[json.dumps(x).encode() for x in fixtures]):
+            self.assertTrue(m.agent_is_idle("w7T:p2")); self.assertTrue(m.agent_is_idle("w72:p1"))
+        bad = {"result": {"agent": {"agent": "omp", "agent_status": "streaming"}}}
+        with mock.patch.object(m, "run", return_value=json.dumps(bad).encode()):
+            self.assertFalse(m.agent_is_idle("p"))
 
     def test_graceful_exit_sends_exactly_one_ctrl_d_and_records_evidence(self):
         ev = self.root / "exit"; ev.mkdir(); session = self.root / "exit.jsonl"; session.write_text("prefix")
