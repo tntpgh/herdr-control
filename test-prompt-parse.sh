@@ -224,6 +224,22 @@ for _f in \
     || no "footer phrasing" "REFUSED below: $_f"
 done
 
+# Exact Codex review-class footer captured from task_20261015T210258Z_82765_20824.
+# This is deliberately one fixed, anchored hint rather than a broad details/
+# steer vocabulary match.
+SCREEN=$'Allow this reviewed command?\n1. Yes\n2. No\n  O details · type to steer instead\n'"$BAR"
+[ "$(prompt_options fake:pane | grep -c .)" -eq 2 ] \
+  && ok "review-class O-details/type-to-steer footer preserves live options" \
+  || no "review-class footer" "exact captured footer made the live prompt unrecognisable"
+SCREEN=$'Allow?\n1. Yes\n2. No\nO details about the report type and steering results were saved.\n'"$BAR"
+[ -z "$(prompt_options fake:pane)" ] \
+  && ok "prose merely containing details/type/steer is not a footer" \
+  || no "false review hint" "broad matching treated prose as a live hint"
+SCREEN=$'Allow?\n1. Yes\n2. No\nO details · type to steer instead\nThe review has already completed and output resumed.\n'"$BAR"
+[ -z "$(prompt_options fake:pane)" ] \
+  && ok "fresh output after the review hint makes old options stale" \
+  || no "stale review hint" "stale options survived later prose"
+
 # A WRAPPED option must arrive whole. This is the one failure in this file that
 # asks a human the WRONG question rather than failing to ask: the run was
 # strictly contiguous option lines, so an indented continuation truncated the

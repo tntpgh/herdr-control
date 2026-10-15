@@ -138,6 +138,11 @@ _is_prose() {
   # under five words ("esc to interrupt", "? for shortcuts") never reach here.
   local low
   low="$(printf '%s' "$1" | tr 'A-Z' 'a-z' | sed -E 's/^[^a-z0-9↑↓(?]*//; s/^[[:space:]]+//')"
+  # Codex review-class prompt footer captured 2026-10-15. Keep this exact and
+  # anchored: a lone "details" or "steer" in later prose is not a prompt hint.
+  case "$low" in
+    "o details · type to steer instead"|"o details - type to steer instead") return 1 ;;
+  esac
   # ANCHORED at the start, because an unanchored pair swallowed real output:
   # " I have applied it. You can use the arrow keys to navigate the tree."
   # contains arrow+navigate and is a sentence about what the agent DID. A hint
