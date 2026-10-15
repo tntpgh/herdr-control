@@ -19,6 +19,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export SCREEN_DIR="$WORK/screens"
+export DETECTION_DIR="$WORK/detection"
 export COUNTER="$WORK/enter-count"
 export KEYS="$WORK/keys.log"
 export SENDTEXT="$WORK/send-text.log"
@@ -32,7 +33,7 @@ export HERDR_RUN_STATE_DIR="$WORK/runs"
 . "$here/lib/run-registry.sh"
 registry_init
 _q() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "$1" 2>/dev/null; }
-mkdir -p "$SCREEN_DIR"
+mkdir -p "$SCREEN_DIR" "$DETECTION_DIR"
 
 PANE="w1:p1"
 export PANE
@@ -45,10 +46,21 @@ export PANE
 herdr() {
   case "$1 $2" in
     "pane read")
-      local idx f
+      local idx f source=visible i
+      for ((i=1; i<=$#; i++)); do
+        if [ "${!i}" = "--source" ]; then
+          i=$((i + 1)); source="${!i}"
+          break
+        fi
+      done
       idx=$(cat "$COUNTER" 2>/dev/null); idx="${idx:-0}"
-      f="$SCREEN_DIR/$idx"
-      [ -f "$f" ] || f="$SCREEN_DIR/last"
+      if [ "$source" = "detection" ] && { [ -f "$DETECTION_DIR/$idx" ] || [ -f "$DETECTION_DIR/last" ]; }; then
+        f="$DETECTION_DIR/$idx"
+        [ -f "$f" ] || f="$DETECTION_DIR/last"
+      else
+        f="$SCREEN_DIR/$idx"
+        [ -f "$f" ] || f="$SCREEN_DIR/last"
+      fi
       cat "$f" 2>/dev/null
       ;;
     "pane send-text")
@@ -71,10 +83,12 @@ ok()  { pass=$((pass + 1)); printf '  ok    %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; }
 
 reset_state() {
-  rm -rf "$SCREEN_DIR"; mkdir -p "$SCREEN_DIR"
+  rm -rf "$SCREEN_DIR" "$DETECTION_DIR"; mkdir -p "$SCREEN_DIR" "$DETECTION_DIR"
   echo 0 >"$COUNTER"; : >"$KEYS"; : >"$SENDTEXT"
 }
 screen() { cat >"$SCREEN_DIR/$1"; }              # screen <idx>  <<EOF ... EOF
+detection() { cat >"$DETECTION_DIR/$1"; }        # detection <idx> <<EOF ... EOF
+detection_last_as() { cp "$DETECTION_DIR/$1" "$DETECTION_DIR/last"; }
 last_as() { cp "$SCREEN_DIR/$1" "$SCREEN_DIR/last"; }
 enters_pressed() { grep -c '^Enter$' "$KEYS" 2>/dev/null; }
 send() { ( bash "$here/send-to-agent.sh" "$PANE" "$@" >"$WORK/out.txt" 2>"$WORK/err.txt" ); }
@@ -210,6 +224,53 @@ send "some message"; rc=$?
 [ "$rc" -eq 5 ] && ok "exit 5 REFUSED" || bad "exit $rc: $(cat "$WORK/out.txt") / $(cat "$WORK/err.txt")"
 [ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed on refusal" || bad "Enters=$(enters_pressed)"
 [ ! -s "$SENDTEXT" ] && ok "text never typed into a live prompt" || bad "typed into a prompt: $(cat "$SENDTEXT")"
+
+printf '== stale scrolled viewport prompt does not block a clean bottom-buffer detection snapshot ==\n'
+reset_state
+screen 0 <<'EOF'
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+EOF
+detection 0 <<'EOF'
+❯ deliver this note
+───────────────────
+  branch:main
+EOF
+detection 1 <<'EOF'
+⏺ Working on the delivered note.
+❯
+───────────────────
+  branch:main
+EOF
+screen 1 <<'EOF'
+⏺ Working on the delivered note.
+❯
+───────────────────
+  branch:main
+EOF
+detection_last_as 1
+last_as 0
+send "deliver this note"; rc=$?
+[ "$rc" -eq 0 ] && ok "exit 0, stale visible prompt ignored" || bad "exit $rc: $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "1" ] && ok "one Enter after clean detection precheck" || bad "Enters=$(enters_pressed)"
+[ "$(cat "$SENDTEXT")" = "deliver this note" ] && ok "message typed once" || bad "send-text log: $(cat "$SENDTEXT")"
+
+printf '== live bottom-buffer detection prompt refuses even when visible viewport looks clean ==\n'
+reset_state
+screen 0 <<'EOF'
+⏺ Earlier output in a scrolled viewport.
+EOF
+detection 0 <<'EOF'
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+EOF
+last_as 0
+send "must not be delivered"; rc=$?
+[ "$rc" -eq 5 ] && ok "exit 5 REFUSED on live detection prompt" || bad "exit $rc: $(cat "$WORK/out.txt") / $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed on detection refusal" || bad "Enters=$(enters_pressed)"
+[ ! -s "$SENDTEXT" ] && ok "text never typed into detection prompt" || bad "typed into a prompt: $(cat "$SENDTEXT")"
 
 printf '== boot-time race (2026-09-05, both fresh spawns): paste paints AFTER the baseline read - a "change" that still shows the text is NOT a submit ==\n'
 reset_state
