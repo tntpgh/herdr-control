@@ -366,6 +366,42 @@ herdr() {
 prompt_command_torn fake:pane
 [ $? -eq 0 ] && ok "a torn byte in the raw capture is detected" \
   || no "torn detection" "prompt_command_torn did not report torn"
+# A terminal-width capture can clip a rendered row between UTF-8 bytes.  The
+# decoder can distinguish that newline-bound incomplete suffix from the
+# arbitrary invalid sequence above; only this exact boundary case is repaired.
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      printf 'Bash command\n  curl https://example.com/x -o /tmp/p.json \342\200\n\n1. Yes\n2. No\n'
+      ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 1 ] && ok "an incomplete UTF-8 suffix at a captured row boundary is repaired" \
+  || no "boundary repair" "prompt_command_torn treated viewport clipping as arbitrary invalid bytes"
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      # The filter must see this LF before command substitution removes it.
+      printf 'Bash command\n  curl https://example.com/x -o /tmp/p.json \342\200\n'
+      ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 1 ] && ok "an incomplete UTF-8 suffix on the final captured row is repaired" \
+  || no "final-row repair" "the shell stripped the capture boundary before repair"
+herdr() {
+  case "$1 $2" in
+    "pane read")
+      # No LF follows the incomplete bytes: this is not a captured row
+      # boundary and therefore must retain the fail-closed verdict.
+      printf 'Bash command\n  curl https://example.com/x -o /tmp/p.json \342\200'
+      ;;
+  esac
+}
+prompt_command_torn fake:pane
+[ $? -eq 0 ] && ok "an incomplete UTF-8 suffix at end-of-stream remains torn" \
+  || no "EOF fail closed" "prompt_command_torn repaired bytes without a captured row boundary"
 herdr() {
   case "$1 $2" in
     "pane read")

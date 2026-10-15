@@ -198,6 +198,29 @@ sel 1 --authority peer; rc=$?
   || bad "torn deny-class command was not refused: exit $rc"
 [ "$(keys_pressed)" = "0" ] && ok "NO KEY PRESSED on a torn deny-class command" || bad "keys pressed=$(keys_pressed)"
 
+printf '== terminal-width UTF-8 suffix truncation is repaired without weakening prompt identity ==\n'
+# The screen API can cut a rendered row after the first two bytes of a
+# three-byte em dash.  Because those bytes are the final bytes before the row
+# newline, this is a decoder-proven incomplete suffix rather than arbitrary
+# invalid data inside the command.  The parser already drops those bytes for
+# display; the decision-time torn check must now make the same distinction.
+set_screen_boundary_truncated() {       # <command-text>
+  printf 'Bash command\n   %s \342\200\n   (a description line)\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n' "$1" > "$SCREEN"
+}
+set_screen_boundary_truncated "curl https://example.com/boundary -o /tmp/boundary.json"; reset_keys
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = "1" ] \
+  && ok "decoder-proven incomplete row suffix does not create a false torn-capture escalation" \
+  || bad "boundary truncation was not repaired: rc=$rc keys=$(keys_pressed); stderr: $(cat "$WORK/err.txt")"
+
+# Repairing capture encoding must not weaken the existing occurrence guard.
+# A decision made for any other prompt still refuses before a keypress.
+set_screen_boundary_truncated "curl https://example.com/boundary -o /tmp/boundary.json"; reset_keys
+sel 1 --authority human --expect-prompt-id stale-boundary-prompt; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = "0" ] \
+  && ok "boundary-repaired capture still refuses a stale/mismatched prompt id with zero keys" \
+  || bad "stale boundary prompt escaped identity binding: rc=$rc keys=$(keys_pressed)"
+
 
 printf '== RESERVED form (main merge), classifier ALLOW, peer authority -> REFUSED, no key pressed ==\n'
 # Found live 2026-09-12 (thurber-os plan 012 lab): classify_command says
