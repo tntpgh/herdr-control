@@ -571,6 +571,12 @@ for i in range(len(clean) - 1, -1, -1):
         break
 if footer is None:
     sys.exit(1)
+# A completed key-hint panel remains in terminal scrollback.  It is live only
+# while its footer is still bottom-anchored; any meaningful row after it is
+# newer output/composer state and makes the old panel non-actionable.  Border
+# closers and blank padding strip to empty and remain allowed.
+if any(line.strip() for line in clean[footer + 1:]):
+    sys.exit(1)
 header = None
 for i in range(footer - 1, -1, -1):
     if clean[i].startswith("Allow tool:"):
@@ -634,7 +640,10 @@ footer_re = re.compile(r"^\S(?:.*\S)? approve [·•] \S(?:.*\S)? deny(?: [·•
 footer_i = next((i for i in range(len(rows) - 1, -1, -1) if footer_re.fullmatch(rows[i])), None)
 if footer_i is None or rows[footer_i] != footer:
     raise SystemExit(1)
-if any(row.startswith("Allow tool:") for row in rows[footer_i + 1:]):
+# Do not lend an old exact footer to ANY newer output, not just a newer
+# approval header.  A dismissed panel followed by prose/composer state is no
+# longer actionable even though its original key hint remains in scrollback.
+if any(row.strip() for row in rows[footer_i + 1:]):
     raise SystemExit(1)
 header_i = next((i for i in range(footer_i - 1, -1, -1) if rows[i].startswith("Allow tool:")), None)
 if header_i is None:

@@ -272,6 +272,54 @@ send "must not be delivered"; rc=$?
 [ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed on detection refusal" || bad "Enters=$(enters_pressed)"
 [ ! -s "$SENDTEXT" ] && ok "text never typed into detection prompt" || bad "typed into a prompt: $(cat "$SENDTEXT")"
 
+printf '== dismissed key-hint panel in detection scrollback does not block newer composer state ==\n'
+reset_state
+screen 0 <<'EOF'
+⏺ Newer visible output.
+❯ deliver after dismissed keyhint
+EOF
+detection 0 <<'EOF'
+╭─ Allow tool: bash ─╮
+│ Command: git status │
+├────────────────┤
+│ 󰘴 󰌑/󰘴 Q approve · 󱊷 deny │
+╰────────────────╯
+⏺ Tool completed successfully.
+❯ deliver after dismissed keyhint
+EOF
+detection 1 <<'EOF'
+⏺ Working on the delivered note.
+❯
+EOF
+screen 1 <<'EOF'
+⏺ Working on the delivered note.
+❯
+EOF
+detection_last_as 1
+last_as 0
+send "deliver after dismissed keyhint"; rc=$?
+[ "$rc" -eq 0 ] && ok "exit 0, dismissed key-hint ignored" || bad "exit $rc: $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "1" ] && ok "one Enter after dismissed key-hint" || bad "Enters=$(enters_pressed)"
+[ "$(cat "$SENDTEXT")" = "deliver after dismissed keyhint" ] && ok "key-hint regression message typed once" || bad "send-text log: $(cat "$SENDTEXT")"
+
+printf '== live bottom-anchored key-hint prompt still refuses with zero input ==\n'
+reset_state
+screen 0 <<'EOF'
+⏺ Scrolled visible output.
+EOF
+detection 0 <<'EOF'
+╭─ Allow tool: bash ─╮
+│ Command: git status │
+├────────────────┤
+│ 󰘴 󰌑/󰘴 Q approve · 󱊷 deny │
+╰────────────────╯
+EOF
+last_as 0
+send "must not cross live keyhint"; rc=$?
+[ "$rc" -eq 5 ] && ok "exit 5 REFUSED on live key-hint detection prompt" || bad "exit $rc: $(cat "$WORK/out.txt") / $(cat "$WORK/err.txt")"
+[ "$(enters_pressed)" = "0" ] && ok "NO Enter pressed on live key-hint refusal" || bad "Enters=$(enters_pressed)"
+[ ! -s "$SENDTEXT" ] && ok "text never typed into live key-hint prompt" || bad "typed into key-hint prompt: $(cat "$SENDTEXT")"
+
 printf '== boot-time race (2026-09-05, both fresh spawns): paste paints AFTER the baseline read - a "change" that still shows the text is NOT a submit ==\n'
 reset_state
 screen 0 <<'EOF'
