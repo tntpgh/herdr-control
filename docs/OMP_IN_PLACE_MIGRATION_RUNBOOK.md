@@ -43,7 +43,9 @@ Main must never stop or replace itself. Before migrating the pane holding the
 to transfer the role to a live, non-worker temporary conductor. That conductor
 records the current role/birth and performs the same sequence used for every
 pane: capture the baseline; obtain the helper's exact SHA-bound resume command;
-send one `ctrl-c` with `herdr pane send-keys`; require `pane process-info` to
+immediately re-read `herdr pane process-info` and require the captured PID is
+still the pane foreground process or its ancestor; only then send one `ctrl-c`
+with `herdr pane send-keys`; require `pane process-info` to
 show the captured PID has left the foreground; start that exact command with
 `herdr pane run`; then run verify-after → a newly generated host-visible health
 check → accept. Direct `kill`, shell text injection, and an unverified fallback

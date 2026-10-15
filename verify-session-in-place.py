@@ -113,6 +113,41 @@ class InPlaceEvidenceTests(unittest.TestCase):
             self.assertTrue(m.pid_is_pane_foreground_or_ancestor(20, "p"))
             self.assertFalse(m.pid_is_pane_foreground_or_ancestor(99, "p"))
 
+    def test_capture_rejects_pid_not_bound_to_pane_before_reading_state(self):
+        session = self.root / "capture.jsonl"; session.write_text("session")
+        args = types.SimpleNamespace(repo=str(self.repo), session_file=str(session), control=str(self.root),
+            hook=str(self.root / "hook"), bundle=str(self.root / "bundle"), pid=77, pane="p", terminal="t",
+            target_binary=str(self.root / "omp"), target_native=str(self.root / "native"))
+        proc = {"pid": 77, "birth": "birth", "argv": f"omp --resume {session}", "cwd": str(self.repo),
+                "environment_names": [], "mapped_binary": "", "mapped_binary_sha256": "",
+                "mapped_native": "", "mapped_native_sha256": ""}
+        pane = {"pane": "p", "terminal": "t", "cwd": str(self.repo), "session_file": str(session)}
+        with mock.patch.object(m, "process", return_value=proc), mock.patch.object(m, "pane_identity", return_value=pane), \
+             mock.patch.object(m, "pid_is_pane_foreground_or_ancestor", return_value=False), \
+             mock.patch.object(m, "git") as git_call, self.assertRaises(SystemExit):
+            m.snapshot(args)
+        git_call.assert_not_called()
+
+    def test_capture_rejects_process_that_leaves_pane_during_hashing(self):
+        session = self.root / "capture-race.jsonl"; session.write_text("session")
+        args = types.SimpleNamespace(repo=str(self.repo), session_file=str(session), control=str(self.root),
+            hook=str(self.root / "hook"), bundle=str(self.root / "bundle"), pid=77, pane="p", terminal="t",
+            target_binary=str(self.root / "omp"), target_native=str(self.root / "native"))
+        proc = {"pid": 77, "birth": "birth", "argv": f"omp --resume {session}", "cwd": str(self.repo),
+                "environment_names": [], "mapped_binary": "", "mapped_binary_sha256": "",
+                "mapped_native": "", "mapped_native_sha256": ""}
+        pane = {"pane": "p", "terminal": "t", "cwd": str(self.repo), "session_file": str(session)}
+        def fake_git(_repo, *argv):
+            return b"head\n" if argv == ("rev-parse", "HEAD") else b""
+        with mock.patch.object(m, "process", return_value=proc), mock.patch.object(m, "pane_identity", return_value=pane), \
+             mock.patch.object(m, "pid_is_pane_foreground_or_ancestor", side_effect=[True, False]), \
+             mock.patch.object(m, "bundle_manifest", return_value={}), mock.patch.object(m, "git", side_effect=fake_git), \
+             mock.patch.object(m, "listed_paths", return_value=[]), \
+             mock.patch.object(m, "aggregate_paths", return_value=(m.sha_bytes(b""), 0)), \
+             mock.patch.object(m, "control_evidence", return_value={"control": "ok"}), \
+             mock.patch.object(m, "sha_file", return_value="hash"), self.assertRaises(SystemExit):
+            m.snapshot(args)
+
     def test_acceptance_is_new_process_bound_and_non_overwriting(self):
         ev = self.root / "ev"; ev.mkdir()
         session = self.root / "s_id.jsonl"; session.write_text("session")

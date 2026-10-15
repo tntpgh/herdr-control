@@ -223,6 +223,8 @@ def snapshot(args: argparse.Namespace) -> dict:
     control, hook, bundle = Path(args.control).resolve(), Path(args.hook).resolve(), Path(args.bundle).resolve()
     before = process(args.pid)
     pane_before = pane_identity(args.pane)
+    if not pid_is_pane_foreground_or_ancestor(args.pid, args.pane):
+        die("pid is not the pane foreground process or its ancestor")
     if Path(str(before["cwd"])).resolve() != repo:
         die("process cwd does not match requested repository")
     if pane_before != {"pane": args.pane, "terminal": args.terminal, "cwd": str(repo), "session_file": str(session)}:
@@ -262,7 +264,8 @@ def snapshot(args: argparse.Namespace) -> dict:
         "ignored_sha256": aggregate_paths(repo, listed_paths(repo, True))[0],
         "control": control_evidence(control, hook),
     }
-    if before != after or pane_before != pane_after or sha_file(session, session_size) != result["session_prefix_sha256"] \
+    if before != after or pane_before != pane_after or not pid_is_pane_foreground_or_ancestor(args.pid, args.pane) \
+       or sha_file(session, session_size) != result["session_prefix_sha256"] \
        or any(result[k] != v for k, v in repeat.items()):
         die("process or transcript changed during capture")
     return result
