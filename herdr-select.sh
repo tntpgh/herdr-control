@@ -337,6 +337,12 @@ if [ -z "$offer" ]; then
 fi
 mechanism="${offer%%$'\t'*}"
 options="${offer#*$'\t'}"
+# Both omp approval surfaces are parsed from the same complete panel and carry
+# the same command/tool rows. `keyhint` differs only in delivery (one bound
+# action key instead of highlight navigation), so every non-human panel guard
+# below must cover it exactly as it covers `menu`.
+omp_panel=0
+case "$mechanism" in menu|keyhint) omp_panel=1 ;; esac
 
 label=$(printf '%s\n' "$options" | awk -F'\t' -v c="$choice" '$1==c {print $2; found=1} END{exit !found}') || {
   echo "herdr-select: option '$choice' is not on offer in $pane. Currently ($mechanism):" >&2
@@ -420,7 +426,7 @@ if [ "$authority" = conductor ]; then
     echo "herdr-select: conductor requires --expect-prompt-id and --review-reason after reviewing the complete action and target." >&2
     exit 2
   fi
-  if [ "$mechanism" != menu ]; then
+  if [ "$omp_panel" != 1 ]; then
     echo "herdr-select: reviewed conductor authority requires a complete recognized omp approval panel." >&2
     exit 8
   fi
@@ -673,7 +679,7 @@ if [ "$authority" != human ] && [ -n "$own_run" ] && [ -n "$own_task" ]; then
   # this fix.
   corrob_panel="$cmd_text"
   wrapjoin_text=""
-  if [ "$mechanism" = menu ]; then
+  if [ "$omp_panel" = 1 ]; then
     corroboration_candidates "$pane" "$cmd_text"
     corrob_panel="$CC_PANEL"
     wrapjoin_text="$CC_WRAPJOIN"
@@ -718,7 +724,7 @@ fi
 # rather than treating that literal as if it were command text
 # (REVIEW-189-r4's pre-existing P1/P3: a tall eval with a blank or
 # `Command: ls` tail pressed on main and #189 alike).
-if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ]; then
+if [ "$authority" != human ] && [ "$omp_panel" = 1 ] && [ "$declining" = 0 ]; then
   registry_tool=""
   if [ -n "$own_run" ] && [ -n "$own_task" ]; then
     registry_tool="$(task_input_required_tool "$own_run" "$own_task" "$current_prompt_id" 2>/dev/null)"
@@ -764,7 +770,7 @@ fi
 # the refusal is audited by header + sha256 only (raw input stays in the
 # proposal file, never in the shared events table or a wake).
 payload_bound=0; payload_json=""; bound_resolution=0
-if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ]; then
+if [ "$authority" != human ] && [ "$omp_panel" = 1 ] && [ "$declining" = 0 ]; then
   case "$registry_tool_lc:${panel_tool:-}" in
     write:*|edit:*|*:write|*:edit)
       show_cmd="(no registered task/prompt: no recorded payload to show)"
@@ -816,12 +822,12 @@ cp_write_menu_judged=0
 # escalate a conductor could still press past. Only an exact `allow`
 # verdict means this function actually cleared the panel; an `escalate:`
 # verdict must fall through to the same row guard every other panel gets.
-if [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
+if [ "$authority" != human ] && [ "$omp_panel" = 1 ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
   if [ "$(_cp_write_menu_verdict "$cmd_text" "$own_worktree" 2>/dev/null)" = allow ]; then
     cp_write_menu_judged=1
   fi
 fi
-if [ "$cp_write_menu_judged" = 0 ] && [ "$authority" != human ] && [ "$mechanism" = menu ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
+if [ "$cp_write_menu_judged" = 0 ] && [ "$authority" != human ] && [ "$omp_panel" = 1 ] && [ "$declining" = 0 ] && [ "$cmd_text_is_scrape" = 1 ]; then
   if menu_command_rows="$(prompt_menu_command_rows "$pane" 2>/dev/null)"; then
     case "$menu_command_rows" in
       ''|*[!0-9]*) menu_rows_ambiguous=1 ;;
@@ -860,7 +866,7 @@ fi
 # approval whose arguments the TUI elided is not a complete review surface.
 # Both checks judge the SAME text that was classified — never a fresh read,
 # which can come back empty on a torn frame and would fail open.
-if [ "$authority" != human ] && [ "$declining" = 0 ] && [ "$mechanism" = menu ]; then
+if [ "$authority" != human ] && [ "$declining" = 0 ] && [ "$omp_panel" = 1 ]; then
   if [ -z "${cmd_text//[[:space:]]/}" ]; then
     echo "herdr-select: refusing — cannot read the approval panel in $pane." >&2
     _refuse_non_human "escalate" "cannot read the approval panel"
