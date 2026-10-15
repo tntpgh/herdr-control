@@ -358,6 +358,85 @@ _auto_seed_menu_tool() {                # <tool>
        '{message:$msg, prompt_id:$pid, command:"", tool:$tool}')" >/dev/null 2>&1
 }
 
+set_keyhint_screen() {                  # <command-text> [footer]
+  local footer="${2:-󰘴 󰌑/󰘴 Q approve · 󱊷 deny}"
+  printf '╭─ Allow tool: bash\n│ Command: %s\n├────────────────\n│ %s\n╰────────────────\n' "$1" "$footer" > "$SCREEN"
+  _auto_seed_menu_tool bash
+}
+
+[ "${HERDR_FOCUSED_KEYHINT_ONLY:-0}" != 1 ] || { pass=0; fail=0; }
+printf '== OMP 18.10.4 key-hint approval uses its bound action, never menu navigation ==\n'
+set_keyhint_screen "git status --short"; reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = "ctrl+q" ] \
+  && ok "real key-hint fixture sends exactly one Ctrl+Q approval action" \
+  || bad "key-hint approval rc=$rc keys='$(cat "$KEYS")'"
+
+set_keyhint_screen "git status --short"; reset_keys
+sel 2 --authority human; rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = "Esc" ] \
+  && ok "real key-hint fixture sends exactly one Esc denial action" \
+  || bad "key-hint denial rc=$rc keys='$(cat "$KEYS")'"
+
+printf '== unknown/remapped key-hint is never guessed ==\n'
+set_keyhint_screen "git status --short" "Alt+A approve · Esc deny"; reset_keys
+sel 1 --authority human; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "unknown key-hint refuses with zero keypresses" \
+  || bad "unknown key-hint rc=$rc keys=$(keys_pressed)"
+
+for stacked_choice in 1 2; do
+  printf '╭─ Allow tool: bash\n│ Command: git status --short\n├────────────────\n│ 󰘴 󰌑/󰘴 Q approve · 󱊷 deny\n╰────────────────\n╭─ Allow tool: bash\n│ Command: git log -1\n├────────────────\n│ Alt+A approve · Esc deny\n╰────────────────\n' > "$SCREEN"
+  _auto_seed_menu_tool bash
+  reset_keys
+  sel "$stacked_choice" --authority human; rc=$?
+  [ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+    && ok "stale exact footer cannot authorize current remapped option $stacked_choice" \
+    || bad "stacked remap choice=$stacked_choice rc=$rc keys=$(keys_pressed)"
+done
+
+for unrecognized_choice in 1 2; do
+  printf '╭─ Allow tool: bash\n│ Command: git status --short\n├────────────────\n│ 󰘴 󰌑/󰘴 Q approve · 󱊷 deny\n╰────────────────\n╭─ Allow tool: bash\n│ Command: git log -1\n├────────────────\n│ [approval binding unavailable]\n╰────────────────\n' > "$SCREEN"
+  _auto_seed_menu_tool bash
+  reset_keys
+  sel "$unrecognized_choice" --authority human; rc=$?
+  [ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+    && ok "stale exact footer cannot authorize current unrecognized option $unrecognized_choice" \
+    || bad "stacked unrecognized choice=$unrecognized_choice rc=$rc keys=$(keys_pressed)"
+done
+
+for truncated_choice in 1 2; do
+  printf '╭─ Allow tool: bash\n│ Command: git status --short\n├────────────────\n│ 󰘴 󰌑/󰘴 Q approve · 󱊷 deny\n╰────────────────\n╭─ Allow tool: bash\n│ Command: git log -1\n├────────────────\n' > "$SCREEN"
+  _auto_seed_menu_tool bash
+  reset_keys
+  sel "$truncated_choice" --authority human; rc=$?
+  [ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+    && ok "stale exact footer cannot authorize current truncated option $truncated_choice" \
+    || bad "stacked truncation choice=$truncated_choice rc=$rc keys=$(keys_pressed)"
+done
+
+printf '== stale/changed key-hint decisions fail before any key ==\n'
+set_keyhint_screen "git status --short"; reset_keys
+sel 1 --authority human --expect-prompt-id stale-id; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "stale key-hint prompt id refuses with zero keypresses" \
+  || bad "stale key-hint rc=$rc keys=$(keys_pressed)"
+
+set_keyhint_screen "git status --short"; reset_keys
+SWAP_SCREEN="$WORK/keyhint-swap-screen"
+printf '╭─ Allow tool: bash\n│ Command: git log -1\n├────────────────\n│ 󰘴 󰌑/󰘴 Q approve · 󱊷 deny\n╰────────────────\n' > "$SWAP_SCREEN"
+set_task_state run1 task1 blocked >/dev/null 2>&1
+SWAP_TASK=task1 sel 1 --authority human; rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "post-record prompt change refuses with zero keypresses" \
+  || bad "changed key-hint rc=$rc keys=$(keys_pressed)"
+set_task_state run1 task1 running >/dev/null 2>&1
+[ "${HERDR_FOCUSED_KEYHINT_ONLY:-0}" != 1 ] || {
+  printf '\nkey-hint selector: %s passed, %s failed\n' "$pass" "$fail"
+  [ "$fail" -eq 0 ]
+  exit
+}
+
 # The queue sits ABOVE the panel, which is where omp paints it (verified on a
 # live pane 2026-09-12). That position is what makes this a fingerprint bug
 # rather than a parse failure: the menu extractor opens at "Allow tool:" and

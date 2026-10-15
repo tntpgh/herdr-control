@@ -569,6 +569,46 @@ else:
 ' "$1"
 }
 
+# Return the single Herdr key name for an OMP 18.10.4 key-hint action.  This
+# is deliberately stricter than prompt visibility: a panel may be correlated
+# from its words, but it is actionable only when the rendered footer proves
+# the documented app.approval.approve Ctrl+Q alternative and Esc denial.
+# Unknown/remapped/truncated hints return nothing, so herdr-select never
+# guesses a chord from option position.
+prompt_keyhint_action_key() {          # <pane> <1=Approve|2=Deny>
+  local win
+  win=$(_menu_window "$1") || return 1
+  printf '%s\n' "$win" | python3 -c '
+import re, sys
+choice = sys.argv[1]
+ansi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+border = " │|─═┌┐└┘├┤┬┴┼╭╮╰╯"
+rows = [ansi.sub("", line.rstrip("\r\n")).strip(border) for line in sys.stdin]
+# U+F0634 is OMPs rendered Ctrl modifier icon, U+F0311 Enter, and U+F12B7 Esc.
+# Require the live 18.10.4 shape exactly; Ctrl+Enter is intentionally not used
+# because Ctrl+Q is the portable documented alternative Herdr can name.
+footer = "\U000f0634 \U000f0311/\U000f0634 Q approve · \U000f12b7 deny"
+footer_re = re.compile(r"^\S(?:.*\S)? approve [·•] \S(?:.*\S)? deny(?: [·•] .+ scroll)?$")
+# Bind to the bottommost CURRENT approval panel, just as _prompt_keyhint_parse
+# does.  An exact footer left in transcript above a newer remapped panel must
+# never lend its chord to the newer panel.
+footer_i = next((i for i in range(len(rows) - 1, -1, -1) if footer_re.fullmatch(rows[i])), None)
+if footer_i is None or rows[footer_i] != footer:
+    raise SystemExit(1)
+if any(row.startswith("Allow tool:") for row in rows[footer_i + 1:]):
+    raise SystemExit(1)
+header_i = next((i for i in range(footer_i - 1, -1, -1) if rows[i].startswith("Allow tool:")), None)
+if header_i is None:
+    raise SystemExit(1)
+if choice == "1":
+    sys.stdout.write("ctrl+q")
+elif choice == "2":
+    sys.stdout.write("Esc")
+else:
+    raise SystemExit(1)
+' "$2"
+}
+
 # Parse the complete, known two-choice approval menu from ONE snapshot.
 # Blank rows separate command details too; they are not an option boundary.
 # Unknown/truncated menu shapes fail closed rather than turning detail text
