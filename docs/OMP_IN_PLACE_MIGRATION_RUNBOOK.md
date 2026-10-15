@@ -12,19 +12,54 @@ Scope: serially restart the three named OMP sessions in their existing worktrees
 
 ## Sessions and recovery modes
 
-| Order | Pane | Terminal | Current PID | Session | Recovery mode | Existing verified bundle |
+| Order | Pane | Terminal | Historical bundle PID | Session | Recovery mode | Existing verified bundle |
 |---|---|---|---:|---|---|---|
 | 1 | `w7T:p2` | `term_65dbcb632abf6d1` | 413 | `01a13674-4ac7-702c-8445-793f75fd2e62` | exact 18.10.4 | `pid-413-exact-v2` |
 | 2 | `w7S:p2` | `term_65dbbe3123286cf` | 4004 | `01a1363e-3da7-70ef-a7d4-bc8a77a345ac` | explicit 18.10.3 → 18.10.4 | `pid-4004-version-change-v2` |
 | 3 | `w72:p1` | `term_65d348046218f2` | 25513 | `01a11648-26bf-72fc-b01b-d4eb970d9c37` | explicit 18.9.2 → 18.10.4 | `pid-25513-version-change-v2` |
 
+The PID column identifies the historical bundle, not a live process. In
+particular, bundle PID 413 was previously replaced (PID 79243 was observed
+afterward), and no recorded PID may be assumed current. Immediately before
+each capture, discover the live foreground PID with `herdr pane process-info`
+and require the helper to bind it to the pane, terminal, cwd, and session.
+
 The old 18.10.3 and 18.9.2 filesystem paths no longer exist. They are not valid rollback targets. Their rollback is the retained, verified 18.10.4 compatibility bundle plus the unchanged original worktree and transcript.
 
 ## In-place integrity evidence
 
+Use `session-in-place.py` for the evidence steps. It deliberately never stops a
+process or writes to a pane: `capture` records the private baseline,
+`resume-command` prints a launcher-SHA-bound command for the verified external
+conductor, `verify-after` binds the replacement PID and unchanged in-place
+state, and `accept` writes a new `ACCEPTED.<pid>.json`. The historical bundle's
+`LIVE_ACCEPTED_AT` is never replaced. Run `--help` on each subcommand for the
+required explicit paths and identities.
+
+### Main self-migration handoff
+
+Main must never stop or replace itself. Before migrating the pane holding the
+`main` role, Main uses the existing `designate-main.sh --handoff-to <pane>` path
+to transfer the role to a live, non-worker temporary conductor. That conductor
+records the current role/birth and performs the same sequence used for every
+pane: capture the baseline; obtain the helper's exact SHA-bound resume command;
+send one `ctrl-c` with `herdr pane send-keys`; require `pane process-info` to
+show the captured PID has left the foreground; start that exact command with
+`herdr pane run`; then run verify-after → a newly generated host-visible health
+check → accept. Direct `kill`, shell text injection, and an unverified fallback
+command are not supported migration paths. The conductor confirms the
+replacement pane is live and accepted. Only then does it hand the role
+back with `designate-main.sh --handoff-to <original-main-pane>` and verify
+`designate-main.sh --show` reports the replacement pane's current terminal
+birth. A failure before acceptance leaves control with the temporary conductor;
+it restores the verified recovery bundle or stops without touching other
+sessions. A failure after acceptance but before return leaves the replacement
+session running and control with the temporary conductor for explicit recovery.
+
 Before touching a PID, create a private mode-0700 evidence directory outside the repository. Record only:
 
-1. PID birth, argv, cwd, pane, terminal, and session transcript SHA-256.
+1. PID birth, argv SHA-256 plus sanitized allowlisted resume arguments, cwd,
+   pane, terminal, and session transcript SHA-256. Never store raw argv.
 2. Worktree HEAD, porcelain-v2 status, submodule state, tracked diff digest, untracked-file aggregate digest, and ignored-state aggregate digest.
 3. For ignored state, hash relative paths, regular-file contents, and symlink targets into a single aggregate. Do not copy ignored files and do not print their names or contents.
 4. Hook, config, overlay, authority-library tree, OMP binary, and native-module SHA-256 values.
@@ -41,10 +76,14 @@ For each row, in order:
 1. Confirm the prior row is either untouched or fully accepted.
 2. Capture the in-place integrity evidence above.
 3. Verify the matching retained bundle with `session-recovery.sh verify` and `restore-check`.
-4. Confirm host-visible Herdr health is `HEALTH HEALTHY` and save fresh evidence bound to that bundle, verifier, and deployed revision.
-5. Stop only the named OMP PID. Do not close other panes or restart Herdr services.
+4. Optionally confirm host-visible Herdr health as a preflight check. This is
+   not acceptance evidence and cannot be reused after replacement.
+5. Stop only the freshly discovered and helper-bound OMP PID. Do not close
+   other panes or restart Herdr services.
 6. Resume the archived transcript in the same cwd, same pane/terminal mapping, with the specified exact/fallback 18.10.4 runtime, archived hook/config/overlay/authority inputs, and existing credential provider.
-7. Confirm transcript/session identity, cwd, hook/config/authority hashes, pane registration, and host-visible Herdr health.
+7. Run `verify-after`, then generate a new host-visible `HEALTHY` record bound
+   to the bundle, verifier, and deployed revision. It must postdate
+   `after.json`; preflight health cannot satisfy acceptance.
 8. Recompute worktree and ignored-state aggregates. Existing ignored files must remain in place; only documented normal runtime updates may differ.
 9. Record fresh bundle-bound acceptance. Retain every recovery bundle until all three sessions pass.
 
