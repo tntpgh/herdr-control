@@ -428,7 +428,8 @@ sel 2 --authority human; rc=$?
   || bad "review-class key-hint denial rc=$rc keys='$(cat "$KEYS")'"
 
 set_keyhint_screen "git status --short" "$DETAILS_FOOTER"
-printf '╭── ⠋ 1h  󰪣 Sonnet 5  repo  branch ?1  0.41 ─6%%─󰁨──────────1M─ REVIEW\n' >> "$SCREEN"
+# Exact status row archived from the live w7S:p7 capture (reviewer-hint-ea4d96aa bundle).
+printf '╭── ⠙ 1h  󰪣 Sonnet 5   knowledge-base/must-touch-r3   review/must-touch-r3 ?1  󰙺 0.41 ─6%%─󰁨─────────1M─ 󰱼 REVIEW: Review must-touch-r3 brief ──╮\n' >> "$SCREEN"
 reset_keys
 sel 1 --authority human; rc=$?
 [ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = "ctrl+q" ] \
@@ -455,7 +456,11 @@ for decorated in \
   'build  step 2  done ' \
   '⠋ 1h  Sonnet 5  repo ' \
   '╭── output  looks  like a bar ' \
-  '╭── ⠋ 1h  no second separator '; do
+  '╭── ⠋ 1h  no second separator ' \
+  '╭── ⠋ 1h Sonnet 5 repo ' \
+  '╭── ⠋ 1h  Sonnet 5  repo ' \
+  '╭── ⠋ 1h  Sonnet 5  repo ─6%%─ REVIEW' \
+  '╭── ⠋ 1h  Sonnet 5  repo ─ x ─╮ trailing output'; do
   set_keyhint_screen "git status --short" "$DETAILS_FOOTER"
   printf '%s\n' "$decorated" >> "$SCREEN"; reset_keys
   sel 1 --authority human; rc=$?

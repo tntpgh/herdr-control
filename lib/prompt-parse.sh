@@ -637,9 +637,9 @@ if footer is None:
 # corner, then a braille spinner, an elapsed token, a Powerline U+E0B1
 # separator, and later the U+E0B0 cap. Anything else after the footer —
 # including ordinary output decorated with Powerline glyphs — means stale.
-status_re = re.compile(r"^╭─+ [\u2800-\u28ff] \d+[smhd](?:\d+[sm])? \ue0b1 .* \ue0b1 .*\ue0b0")
+status_re = re.compile(r"╭─+ [\u2800-\u28ff] \d+[smhd](?:\d+[sm])?(?: \ue0b1 [^\ue0b0\ue0b1\ue0b2\n]+){2,} \ue0b0─[^\ue0b0\ue0b1\ue0b2\n]*\ue0b2[^\ue0b0\ue0b1\ue0b2\n]*─╮")
 after = [(r, c) for r, c in zip(raw[footer + 1:], clean[footer + 1:]) if c.strip()]
-if len(after) > 1 or any(not status_re.match(r.strip(" │|")) for r, _c in after):
+if len(after) > 1 or any(not status_re.fullmatch(r.strip(" │|")) for r, _c in after):
     sys.exit(1)
 header = None
 for i in range(footer - 1, -1, -1):
@@ -694,7 +694,7 @@ ansi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 border = " │|─═┌┐└┘├┤┬┴┼╭╮╰╯"
 raw_rows = [ansi.sub("", line.rstrip("\r\n")) for line in sys.stdin]
 rows = [r.strip(border) for r in raw_rows]
-status_re = re.compile(r"^╭─+ [\u2800-\u28ff] \d+[smhd](?:\d+[sm])? \ue0b1 .* \ue0b1 .*\ue0b0")
+status_re = re.compile(r"╭─+ [\u2800-\u28ff] \d+[smhd](?:\d+[sm])?(?: \ue0b1 [^\ue0b0\ue0b1\ue0b2\n]+){2,} \ue0b0─[^\ue0b0\ue0b1\ue0b2\n]*\ue0b2[^\ue0b0\ue0b1\ue0b2\n]*─╮")
 # U+F0634 is OMPs rendered Ctrl modifier icon, U+F0311 Enter, and U+F12B7 Esc.
 # Require the live 18.10.4 shape exactly; Ctrl+Enter is intentionally not used
 # because Ctrl+Q is the portable documented alternative Herdr can name.
@@ -713,7 +713,7 @@ if footer_i is None or rows[footer_i] not in {footer, footer + details_suffix}:
 # OMPs own status bar in its exact rendered shape (see status_re); ordinary
 # output, even decorated with Powerline glyphs, makes the panel stale.
 after = [raw_rows[i] for i in range(footer_i + 1, len(rows)) if rows[i].strip()]
-if len(after) > 1 or any(not status_re.match(r.strip(" │|")) for r in after):
+if len(after) > 1 or any(not status_re.fullmatch(r.strip(" │|")) for r in after):
     raise SystemExit(1)
 header_i = next((i for i in range(footer_i - 1, -1, -1) if rows[i].startswith("Allow tool:")), None)
 if header_i is None:
