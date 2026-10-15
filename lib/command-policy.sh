@@ -5187,6 +5187,12 @@ EOF
 # input is one scan; single-line input (everything before round 5f)
 # is unaffected, since one line was always the whole scan anyway.
 _cp_envdump_word_is_dump() {            # norm [noexempt] -> 0 (true) if it dumps env/printenv, anywhere but the 5 exemptions
+  # This scanner is intentionally ASCII/byte-oriented. Approval-panel chrome
+  # can contain supplementary-plane OMP glyphs; BSD awk aborts on those under
+  # a UTF-8 locale before the policy verdict is reached. Byte locale is safe
+  # here because every token and exemption below is ASCII, and it preserves
+  # the fail-closed policy instead of dropping or rewriting command bytes.
+  local LC_ALL=C LANG=C
   printf '%s' "$1" | awk -v NOEXEMPT="${2:-0}" '
     function is_ident(c) { return (c ~ /[A-Za-z0-9_]/) }
     function is_call_char(c) { return (c ~ /[]A-Za-z0-9_.]/) }

@@ -755,6 +755,84 @@ seed_input_required() {                 # <run> <task> <command> [tool=bash]
        '{message:$msg, prompt_id:$pid, command:$cmd, tool:$tool}')" >/dev/null 2>&1
 }
 
+printf '== key-hint panel uses the same peer/conductor policy path as menu ==\n'
+set_keyhint_screen "git status --short"; reset_keys
+seed_input_required runG taskG "git status --short"
+sel 1 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = "ctrl+q" ] \
+  && ok "peer allow sends exactly the bound key-hint approval action" \
+  || bad "peer key-hint allow rc=$rc keys='$(cat "$KEYS")'; $(cat "$WORK/err.txt")"
+
+set_keyhint_screen "mkfs /dev/disk9"; reset_keys
+seed_input_required runG taskG "mkfs /dev/disk9"
+sel 2 --authority peer; rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = "Esc" ] \
+  && ok "peer deny remains safe and sends exactly the bound denial action" \
+  || bad "peer key-hint deny rc=$rc keys='$(cat "$KEYS")'"
+
+KEYHINT_REVIEW_CMD='git log --oneline --all | grep -i contact | head -20'
+set_keyhint_screen "$KEYHINT_REVIEW_CMD"; reset_keys
+seed_input_required runG taskG "$KEYHINT_REVIEW_CMD"
+( export HERDR_PANE_ID=w9:p9
+  sel 1 --authority conductor --review-category local-read \
+    --review-reason "Reviewed exact read-only history search and target." \
+    --expect-prompt-id "$(prompt_id "$PANE")" ); rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = "ctrl+q" ] \
+  && ok "reviewed conductor local-read sends exactly the bound key-hint approval action" \
+  || bad "conductor key-hint allow rc=$rc keys='$(cat "$KEYS")'; $(cat "$WORK/err.txt")"
+
+set_keyhint_screen "mkfs /dev/disk9"; reset_keys
+seed_input_required runG taskG "mkfs /dev/disk9"
+( export HERDR_PANE_ID=w9:p9
+  sel 2 --authority conductor --review-category local-read \
+    --review-reason "Declined unsafe request." \
+    --expect-prompt-id "$(prompt_id "$PANE")" ); rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$KEYS")" = "Esc" ] \
+  && ok "reviewed conductor deny sends exactly the bound denial action" \
+  || bad "conductor key-hint deny rc=$rc keys='$(cat "$KEYS")'"
+
+set_keyhint_screen "$KEYHINT_REVIEW_CMD"; reset_keys
+seed_input_required runG taskG "$KEYHINT_REVIEW_CMD"
+( export HERDR_PANE_ID=w9:p9
+  sel 1 --authority conductor --review-category local-read \
+    --review-reason "Reviewed exact read-only history search and target." \
+    --expect-prompt-id stale-keyhint-id ); rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "reviewed conductor stale key-hint decision refuses with zero keys" \
+  || bad "conductor stale key-hint rc=$rc keys=$(keys_pressed)"
+
+set_keyhint_screen "$KEYHINT_REVIEW_CMD" "Alt+A approve · Esc deny"; reset_keys
+( export HERDR_PANE_ID=w9:p9
+  sel 1 --authority conductor --review-category local-read \
+    --review-reason "Reviewed exact read-only history search and target." \
+    --expect-prompt-id "$(prompt_id "$PANE")" ); rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "reviewed conductor unknown key binding refuses with zero keys" \
+  || bad "conductor unknown key-hint rc=$rc keys=$(keys_pressed)"
+
+printf '╭─ Allow tool: bash\n│ Command: %s\n├────────────────\n' "$KEYHINT_REVIEW_CMD" > "$SCREEN"
+reset_keys
+( export HERDR_PANE_ID=w9:p9
+  sel 1 --authority conductor --review-category local-read \
+    --review-reason "Reviewed exact read-only history search and target." \
+    --expect-prompt-id "$(prompt_id "$PANE")" ); rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "reviewed conductor truncated key-hint panel refuses with zero keys" \
+  || bad "conductor truncated key-hint rc=$rc keys=$(keys_pressed)"
+
+set_keyhint_screen "$KEYHINT_REVIEW_CMD"; reset_keys
+seed_input_required runG taskG "$KEYHINT_REVIEW_CMD"
+keyhint_before_swap="$(prompt_id "$PANE")"
+SWAP_SCREEN="$WORK/conductor-keyhint-swap-screen"
+printf '╭─ Allow tool: bash\n│ Command: git status --short\n├────────────────\n│ 󰘴 󰌑/󰘴 Q approve · 󱊷 deny\n╰────────────────\n' > "$SWAP_SCREEN"
+( export HERDR_PANE_ID=w9:p9 SWAP_TASK=taskG SWAP_SCREEN
+  sel 1 --authority conductor --review-category local-read \
+    --review-reason "Reviewed exact read-only history search and target." \
+    --expect-prompt-id "$keyhint_before_swap" ); rc=$?
+[ "$rc" -eq 6 ] && [ "$(keys_pressed)" = 0 ] \
+  && ok "reviewed conductor changed key-hint panel refuses with zero keys" \
+  || bad "conductor changed key-hint rc=$rc keys=$(keys_pressed)"
+
 for grant_cmd in "git push origin $GBRANCH" "gh pr create --head $GBRANCH" \
                  "gh pr create --head $GBRANCH --base $GTRUNK" "git add -A" \
                  "git commit -m note" "cd /wt/grant && git push origin $GBRANCH" \

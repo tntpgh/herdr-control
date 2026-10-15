@@ -110,11 +110,14 @@ _DECOR='─│┌┐└┘├┤┬┴┼╭╮╯╰═║█▀▄▏▎▋'
 
 _is_prose() {
   # Any decoration character at all: status bar, panel, rule, progress block.
-  # `index()` on real characters — see design note 2 above.
-  printf '%s\n' "$1" | awk -v g="$_DECOR" '
-    BEGIN { n = split(g, ch, "") }
-    { for (k = 1; k <= n; k++) if (index($0, ch[k])) exit 1
-      exit 0 }' || return 1
+  # Shell patterns compare each complete UTF-8 byte sequence and do not ask
+  # awk to split a multibyte glyph list. That is locale-stable on macOS: BSD
+  # awk can either abort on supplementary-plane glyphs or split the list into
+  # bytes (depending on locale), and byte fragments make unrelated Unicode
+  # prose look decorated merely because it shares a lead byte.
+  case "$1" in
+    *─*|*│*|*┌*|*┐*|*└*|*┘*|*├*|*┤*|*┬*|*┴*|*┼*|*╭*|*╮*|*╯*|*╰*|*═*|*║*|*█*|*▀*|*▄*|*▏*|*▎*|*▋*) return 1 ;;
+  esac
   local words
   words=$(printf '%s\n' "$1" | awk '{ n = 0
     for (i = 1; i <= NF; i++) if ($i ~ /^[A-Za-z][A-Za-z-]+$/) n++
@@ -172,9 +175,37 @@ prompt_options() {
   # sed extraction that follows, and post-prompt output like
   # "249 insertions(+), 18 deletions(-)" was swallowed into the run.
   local block
-  block=$(printf '%s\n' "$win" | awk -v decor="$_DECOR" '
-    BEGIN { ng = split(decor, ch, "") }
-    { line[NR] = $0; isopt[NR] = ($0 ~ /^[[:space:]]*[❯>]?[[:space:]]*[0-9]+[.][[:space:]]+./) }
+  # This pass deliberately treats terminal glyphs as bytes. BSD awk aborts
+  # with "illegal byte sequence" when a supplementary-plane Nerd Font glyph
+  # (used by omp's status panel) reaches its character-oriented index/split
+  # path under a UTF-8 locale. Keep the byte locale scoped to this awk only:
+  # the surrounding parser remains Unicode-aware. In a byte locale the
+  # selection arrow cannot safely live in a bracket expression, so isopt()
+  # removes its exact UTF-8 byte string (or ASCII >) before applying the
+  # otherwise-ASCII option grammar.
+  block=$(printf '%s\n' "$win" | LC_ALL=C LANG=C awk '
+    function option_line(s, t, arrow) {
+      t = s
+      sub(/^[ \t]*/, "", t)
+      arrow = "❯"
+      if (substr(t, 1, length(arrow)) == arrow) t = substr(t, length(arrow) + 1)
+      else if (substr(t, 1, 1) == ">") t = substr(t, 2)
+      sub(/^[ \t]*/, "", t)
+      return t ~ /^[0-9]+[.][ \t]+./
+    }
+    function decorated(s) {
+      # Exact complete UTF-8 byte strings. Splitting the glyph list in the C
+      # locale would turn each glyph into bytes and make unrelated Unicode
+      # prose (an em dash, for example) look decorated when it merely shares
+      # a lead byte, incorrectly exempting stale post-prompt output.
+      return index(s, "─") || index(s, "│") || index(s, "┌") || index(s, "┐") \
+          || index(s, "└") || index(s, "┘") || index(s, "├") || index(s, "┤") \
+          || index(s, "┬") || index(s, "┴") || index(s, "┼") || index(s, "╭") \
+          || index(s, "╮") || index(s, "╯") || index(s, "╰") || index(s, "═") \
+          || index(s, "║") || index(s, "█") || index(s, "▀") || index(s, "▄") \
+          || index(s, "▏") || index(s, "▎") || index(s, "▋")
+    }
+    { line[NR] = $0; isopt[NR] = option_line($0) }
     END {
       last = 0
       for (i = NR; i >= 1; i--) if (isopt[i]) { last = i; break }
@@ -212,8 +243,7 @@ prompt_options() {
       # dist-from-bottom and whether the line carries DECORATION, so the
       # caller can size the status block from the screen instead of guessing.
       for (i = last + 1; i <= NR; i++) {
-        d = 0
-        for (k = 1; k <= ng; k++) if (index(line[i], ch[k])) { d = 1; break }
+        d = decorated(line[i]) ? 1 : 0
         # PRIVATE-USE glyphs by lead byte (U+E000-F8FF -> \356/\357,
         # plane-15/16 -> \363/\364). omp marks its task-description row with
         # one, which is how that row is recognised as status rather than

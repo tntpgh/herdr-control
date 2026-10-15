@@ -306,6 +306,44 @@ case "$(prompt_options fake:pane)" in
   *$'\342\200\224'*) ok "an intact em-dash still renders as a real character" ;;
   *) no "intact em-dash" "got [$(prompt_options fake:pane)]" ;;
 esac
+
+# omp's real status row contains supplementary-plane Nerd Font glyphs. On
+# macOS/BSD awk this used to emit "illegal byte sequence" from prompt_options
+# on every selector invocation, even though the later policy gate still
+# refused the command. Exercise the real UTF-8 bytes under the caller's normal
+# locale and require both options plus a silent parser.
+NF_STATUS=$'\363\260\230\264'   # U+F0634
+herdr() {
+  case "$1 $2" in
+    "pane read") printf '\342\235\257 1. Yes\n  2. No\n%s scoped worker status\n' "$NF_STATUS" ;;
+  esac
+}
+unicode_err="$HERE/.prompt-unicode-err.$$"
+unicode_opts="$(prompt_options fake:pane 2>"$unicode_err")"; unicode_rc=$?
+[ "$unicode_rc" -eq 0 ] && [ "$(printf '%s\n' "$unicode_opts" | wc -l | tr -d ' ')" = 2 ] \
+  && ok "supplementary-plane status glyph preserves both numbered options" \
+  || no "supplementary-plane status glyph" "rc=$unicode_rc options=[$unicode_opts]"
+[ ! -s "$unicode_err" ] \
+  && ok "supplementary-plane status glyph produces no locale diagnostic" \
+  || no "supplementary-plane stderr" "parser wrote stderr"
+rm -f "$unicode_err"
+
+# Byte-mode decoration matching must compare COMPLETE glyph sequences. A
+# previous cut split _DECOR into bytes, causing ordinary Unicode prose that
+# shared the E2 lead byte (em dash / ellipsis) to masquerade as status
+# furniture and leave an already-dismissed prompt actionable.
+for unicode_prose in \
+  'I have applied the change — and moved on.' \
+  'I have applied the change … and moved on.'; do
+  herdr() {
+    case "$1 $2" in
+      "pane read") printf '\342\235\257 1. Yes\n  2. No\n%s\n' "$unicode_prose" ;;
+    esac
+  }
+  [ -z "$(prompt_options fake:pane)" ] \
+    && ok "Unicode prose after numbered options makes them stale" \
+    || no "Unicode stale-prompt prose" "options remained actionable after [$unicode_prose]"
+done
 unset -f herdr
 
 echo
