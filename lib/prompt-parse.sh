@@ -493,6 +493,45 @@ _PANE_WINDOW_LINES=1000
 # call it wraps — an unreadable pane already returns empty, not an error.
 _sanitize_utf8() { iconv -c -f UTF-8 -t UTF-8 2>/dev/null; }
 
+# A terminal capture can end a rendered row in the middle of one UTF-8 code
+# point.  That is not the same thing as an invalid byte inside the captured
+# text: the former is a viewport clipping artefact, while the latter leaves
+# the approval surface untrustworthy and must continue to fail closed.
+#
+# Remove only a decoder-proven incomplete suffix immediately before a captured
+# line ending.  Every other decode error is preserved byte-for-byte for
+# prompt_command_torn() to reject.  This is used only on the decision-time
+# torn check, not the hot polling path.
+_repair_truncated_utf8_suffixes() {
+  python3 -c '
+import sys
+
+chunks = sys.stdin.buffer.read().split(b"\n")
+for index, chunk in enumerate(chunks):
+    # splitlines() also treats terminal control bytes such as VT/FF/FS as
+    # boundaries.  LF is the only captured-row delimiter this exception is
+    # allowed to trust.  The final chunk has no captured newline, so it is
+    # never repaired.
+    has_newline = index < len(chunks) - 1
+    body = chunk[:-1] if has_newline and chunk.endswith(b"\r") else chunk
+    ending = (b"\r" if has_newline and chunk.endswith(b"\r") else b"") + (
+        b"\n" if has_newline else b""
+    )
+    try:
+        body.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        incomplete_suffix = (
+            has_newline
+            and exc.reason == "unexpected end of data"
+            and exc.end == len(body)
+            and 0 < len(body) - exc.start <= 3
+        )
+        if incomplete_suffix:
+            body = body[:exc.start]
+    sys.stdout.buffer.write(body + ending)
+' 2>/dev/null
+}
+
 # Unsanitized: the same window `_menu_window`/`_pane_visible` read, before
 # `_sanitize_utf8` drops anything. Exists so `prompt_command_torn` below can
 # check the RAW bytes for validity without re-deriving the `herdr pane read`
@@ -1471,7 +1510,9 @@ prompt_question() {
 # its whole window — so that branch keeps whole-window validation.
 prompt_command_torn() {                 # <pane> -> 0 torn(-or-unreadable) / 1 proven clean
   local raw_menu clean_q raw_q raw_win
-  raw_menu="$(_pane_read_raw "$1" --format ansi)"
+  # Repair in the pipeline, before command substitution strips trailing LFs;
+  # otherwise a clipped suffix on the capture's final row looks like EOF.
+  raw_menu="$(_pane_read_raw "$1" --format ansi | _repair_truncated_utf8_suffixes)"
   if [ -n "$raw_menu" ]; then
     clean_q="$(printf '%s' "$raw_menu" | _sanitize_utf8 | _prompt_menu_parse question 2>/dev/null)"
     if [ -n "$clean_q" ]; then
@@ -1481,7 +1522,7 @@ prompt_command_torn() {                 # <pane> -> 0 torn(-or-unreadable) / 1 p
     # No complete menu panel either way: prompt_command_text falls through
     # to the whole-window numbered/plain path below, so validate THAT.
   fi
-  raw_win="$(_pane_read_raw "$1")"
+  raw_win="$(_pane_read_raw "$1" | _repair_truncated_utf8_suffixes)"
   [ -n "$raw_win" ] || return 0
   printf '%s' "$raw_win" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && return 1
   return 0
