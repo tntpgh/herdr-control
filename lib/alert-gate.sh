@@ -154,15 +154,26 @@ grace_realert() {
     _ag_out=stood_down
     trap '_ag_trace "done $kind ${pid:-noprompt} $_ag_out"' EXIT
     sleep "$grace"
-    prompt_menu_visible "$pane" 2>/dev/null || [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || exit 0
+    if [ -n "${HERDR_DEFERRED_PID:-}" ]; then
+      # A deferred prompt never paints a panel, and a sibling deferred request
+      # on the same task records its own input_required, so neither the screen
+      # nor "a later input_required" says anything about THIS request. The
+      # caller names a predicate that asks the request's own registry
+      # occurrence; unset means stand down rather than guess.
+      [ -n "${HERDR_GRACE_STILL_OPEN:-}" ] && "$HERDR_GRACE_STILL_OPEN" || exit 0
+    else
+      prompt_menu_visible "$pane" 2>/dev/null || [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || exit 0
+    fi
     # A later prompt on this task supersedes this timer. Without this check,
     # every repeated hook created another timer that eventually woke the
     # conductor for whichever prompt happened to be current at T+grace.
     if [ -n "$run" ] && [ -n "$task" ]; then
-      later="$(_sql "SELECT count(*) FROM events WHERE run_id=$(_sq "$run")
-        AND task_id=$(_sq "$task") AND type='input_required'
-        AND occurred_at > $(_sq "$hold_at");" 2>/dev/null)"
-      [ "${later:-0}" = 0 ] || exit 0
+      if [ -z "${HERDR_DEFERRED_PID:-}" ]; then
+        later="$(_sql "SELECT count(*) FROM events WHERE run_id=$(_sq "$run")
+          AND task_id=$(_sq "$task") AND type='input_required'
+          AND occurred_at > $(_sq "$hold_at");" 2>/dev/null)"
+        [ "${later:-0}" = 0 ] || exit 0
+      fi
       # The claim is shared ON PURPOSE between the held Slack timer, the
       # conductor re-wake push_wake arms, and release_wake_hold (one of them
       # acts on a held prompt, never two). A caller whose alert is NOT an

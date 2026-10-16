@@ -1064,6 +1064,15 @@ function notifyForPrompt(
   command?: string,
   callId?: string,
   nativeSession?: string,
+  // Set only for a deferred (exclusiveResolver) request: OMP paints NO
+  // approval panel in this mode, so the screen probe omp-notify.sh runs for
+  // every ordinary approval can never find one. This is the exact identity
+  // recordOccurrence already wrote to the registry's `seen` record for this
+  // SAME call (the --approval-request-id/--core-arguments-digest/
+  // --binding-protocol/--bound-envelope args a few lines up) — passed again
+  // here so omp-notify.sh can verify its OWN registry row (never the
+  // screen) before alerting, and name the exact occurrence in the alert.
+  deferredIdentity?: { approvalRequestId: string; coreArgumentsDigest: string; bindingProtocol: string },
 ): void {
   if (!notifyAvailable) return;
   const payload: Record<string, unknown> = { tool: toolName, message, cwd: process.cwd() };
@@ -1076,6 +1085,12 @@ function notifyForPrompt(
   // the one onApprovalRequested call below.
   if (callId) payload.call_id = callId;
   if (nativeSession) payload.native_session = nativeSession;
+  if (deferredIdentity) {
+    payload.deferred = true;
+    payload.approval_request_id = deferredIdentity.approvalRequestId;
+    payload.core_arguments_digest = deferredIdentity.coreArgumentsDigest;
+    payload.binding_protocol = deferredIdentity.bindingProtocol;
+  }
   spawnDetached([NOTIFY_SH], JSON.stringify(payload));
 }
 
@@ -1877,6 +1892,7 @@ function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | u
           rawBashCommand(toolName, input),
           callId,
           nativeSession,
+          deferred ? { approvalRequestId: requestId, coreArgumentsDigest: coreDigest, bindingProtocol } : undefined,
         );
         if (deferred && resolveBound && callId) {
           const identity = [

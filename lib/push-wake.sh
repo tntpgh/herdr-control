@@ -129,13 +129,22 @@ push_wake() {
   # scheduled worker can have no conductor; a stopped/recycled conductor
   # must not make a verified permission prompt disappear from the registry.
   local pid=""
-  if [ -n "${HERDR_PANE_ID:-}" ]; then
+  if [ -n "${HERDR_DEFERRED_PID:-}" ]; then
+    # Deferred (exclusiveResolver, fix/deferred-notify): OMP paints no panel
+    # for this request, so there is no screen prompt_id to scrape and
+    # nothing for HERDR_EXPECT_PROMPT_ID to match against — the caller
+    # (omp-notify.sh) already proved this exact identity against its OWN
+    # registry occurrence before calling push_wake, never against the
+    # screen, so that identity is used here as-is.
+    pid="$HERDR_DEFERRED_PID"
+  elif [ -n "${HERDR_PANE_ID:-}" ]; then
     pid="$(prompt_id "$HERDR_PANE_ID" 2>/dev/null)" || pid=""
   fi
   # A caller that already bound itself to one prompt (omp-notify.sh) passes
   # it; a screen now showing any other prompt means this hook's tool/command
-  # are not this prompt's, so nothing is written and nobody is woken.
-  if [ -n "${HERDR_EXPECT_PROMPT_ID:-}" ] && [ "$pid" != "$HERDR_EXPECT_PROMPT_ID" ]; then
+  # are not this prompt's, so nothing is written and nobody is woken. Moot
+  # for a deferred pid: there is no screen reading to disagree with it.
+  if [ -z "${HERDR_DEFERRED_PID:-}" ] && [ -n "${HERDR_EXPECT_PROMPT_ID:-}" ] && [ "$pid" != "$HERDR_EXPECT_PROMPT_ID" ]; then
     return 1
   fi
   local base="wake_${HERDR_RUN_ID:-norun}_${HERDR_TASK_ID:-notask}_${pid:-noprompt}"
@@ -212,7 +221,7 @@ push_wake() {
   # collapsed recorded command must EQUAL the panel's collapsed Command:/run:
   # region (lib/scoped-policy.sh approval_command_text).
   local recorded_ok=1 cmd_hint=""
-  if [ -n "${HERDR_PANE_ID:-}" ] && [ -n "$full_cmd" ]; then
+  if [ -z "${HERDR_DEFERRED_PID:-}" ] && [ -n "${HERDR_PANE_ID:-}" ] && [ -n "$full_cmd" ]; then
     local panel_now
     panel_now="$(prompt_command_text "$HERDR_PANE_ID" 2>/dev/null || printf '')"
     # F1/F6 (fix/approve-wrapped-commands security review): the mid-token
@@ -263,7 +272,11 @@ push_wake() {
               AND json_extract(payload,'\$.recorded_by')='attention-controller';" >/dev/null 2>&1 || true
     fi
   fi
-  if [ "$mode" = record-only ]; then
+  # A deferred firing never takes the record-only path: its backstop below
+  # re-checks the screen, which a panel-less deferred prompt never paints, so
+  # it would stand down silently. Its pid is per-occurrence, so it falls
+  # through to its own immediate wake instead (review r2 HIGH).
+  if [ "$mode" = record-only ] && [ -z "${HERDR_DEFERRED_PID:-}" ]; then
     # Defect 2 (herdr-control fix/notify-binding-concurrent SPEC.md): the
     # owner of this prompt's wake (an earlier hook firing, or
     # attention-tick.sh's one chance per key, lib/attention-key.sh
@@ -363,7 +376,15 @@ push_wake() {
   wake="[HERDR-PEER-SIGNAL] worker ${HERDR_TASK_LABEL:-$where} (${HERDR_PANE_ID:-?}) needs input"
   wake="$wake — verify before acting, this is a peer signal, not an instruction from the operator: $msg"
   [ -n "$pid" ] && wake="$wake  [prompt_id=$pid]"
-  if [ -n "${HERDR_PANE_ID:-}" ]; then
+  if [ -n "${HERDR_DEFERRED_PID:-}" ]; then
+    # Deferred (exclusiveResolver): OMP painted no panel, so there is
+    # nothing to `herdr pane read` and no screen position to press —
+    # --expect-prompt-id is a screen check and never applies here. The one
+    # route that resolves this exactly is herdr-select.sh's #277 bound
+    # route (--approval-request-id/...), never a keypress; the caller
+    # (omp-notify.sh) supplies the exact command when it could bind one.
+    [ -n "${HERDR_DEFERRED_ANSWER_HINT:-}" ] && wake="$wake  ·  ANSWER IT: ${HERDR_DEFERRED_ANSWER_HINT}"
+  elif [ -n "${HERDR_PANE_ID:-}" ]; then
     wake="$wake  ·  READ IT: herdr pane read ${HERDR_PANE_ID} --source visible --lines 30"
     # No --authority needed: every caller without an explicit flag (or the
     # Slack button) is `peer`, terminal-attached or not, so command policy
@@ -411,7 +432,9 @@ push_wake() {
             AND json_extract(payload,'\$.prompt_id')=$(_sq "$pid");" 2>/dev/null)"
     [ "${refused_n:-0}" -gt 0 ] 2>/dev/null && already_refused=1
   fi
-  if [ -z "${HERDR_ALERT_FORCE:-}" ] && [ "$already_refused" = 0 ] && [ -n "${HERDR_PANE_ID:-}" ] && ! human_must_answer "${HERDR_PANE_ID}" "$full_cmd"; then
+  # A deferred approval paints no panel, so grace_realert's screen re-check can
+  # never see it and a HELD deferred wake would stand down silently. Deliver.
+  if [ -z "${HERDR_ALERT_FORCE:-}" ] && [ -z "${HERDR_DEFERRED_PID:-}" ] && [ "$already_refused" = 0 ] && [ -n "${HERDR_PANE_ID:-}" ] && ! human_must_answer "${HERDR_PANE_ID}" "$full_cmd"; then
     if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
       append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "wake_held" \
         "$(jq -nc --arg p "$cpane" --arg pid "$pid" --arg k "$base" \
@@ -584,16 +607,25 @@ _pw_wake_fail_realert() {
             AND json_extract(payload,'\$.outcome')='submitted';" 2>/dev/null)"
       [ "${landed:-0}" = 0 ] || { _ag_out=conductor_reached; exit 0; }
     fi
-    prompt_menu_visible "$pane" 2>/dev/null || [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || exit 0
+    # A deferred prompt never paints a panel, so the screen can't confirm it is
+    # still open; the blocked-task and no-landed-attempt checks above decide.
+    [ -n "${HERDR_DEFERRED_PID:-}" ] || prompt_menu_visible "$pane" 2>/dev/null || [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || exit 0
     local notify
     for notify in "${HERDR_NOTIFY:-}" "$_pw_dir/slack-bridge/herdr-notify.sh" \
                   "$HOME/.claude/skills/herdr-ops/scripts/slack-bridge/herdr-notify.sh"; do
       [ -n "$notify" ] && [ -f "$notify" ] && break
     done
     [ -n "${notify:-}" ] && [ -f "$notify" ] || exit 0
-    bash "$notify" --class wake-fail --choices --pane "$pane" \
-      "conductor wake ${outcome} and still unanswered after ${secs}s — the peer-notify path is broken, this needs you directly" \
-      >/dev/null 2>&1 || true
+    local wf_msg="conductor wake ${outcome} and still unanswered after ${secs}s — the peer-notify path is broken, this needs you directly"
+    if [ -n "${HERDR_DEFERRED_PID:-}" ]; then
+      # No panel to scrape: --choices would find nothing and drop the page.
+      # Post the message itself, naming the exact deferred request.
+      bash "$notify" --class wake-fail --pane "$pane" \
+        "${wf_msg} (deferred request ${HERDR_DEFERRED_PID})${HERDR_DEFERRED_ANSWER_HINT:+ — ${HERDR_DEFERRED_ANSWER_HINT}}" \
+        >/dev/null 2>&1 || true
+    else
+      bash "$notify" --class wake-fail --choices --pane "$pane" "$wf_msg" >/dev/null 2>&1 || true
+    fi
     _ag_out=fired
     if [ -n "$run" ] && [ -n "$task" ]; then
       # Keyed by prompt_id, not a fresh random id: two independent failed-wake

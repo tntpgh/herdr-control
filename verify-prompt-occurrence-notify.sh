@@ -440,5 +440,204 @@ run_notify ',"call_id":"call-36","native_session":"sess-34"'
   && ok "same-session dead occurrence (a later one already withdrawn) does not block" \
   || bad "same-session dead occurrence blocked binding: tooled=$(tooled_rows) $(cat "$WORK/n.err")"
 
+# ---- fix/deferred-notify: deferred (exclusiveResolver) bound approvals must
+# alert, bound to the exact request -------------------------------------------
+# OMP's deferred resolver paints NO panel at all (.handoffs/SPEC.md Cause):
+# the screen probe above found nothing for this mode forever, so these cases
+# exercise the SEPARATE deferred branch directly rather than ever touching
+# $WORKER_SCREEN.
+printf '\n== deferred (exclusiveResolver) notify: alert fires with no painted panel ==\n'
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+: > "$WORKER_SCREEN"   # nothing ever painted for any case below
+
+seed_deferred() {   # <call_id> <session> <approval_request_id> <core_digest>
+  jq -nc '{input:{path:"x"}, core_arguments_json:({path:"x"}|tojson)}' \
+    | python3 "$here/lib/prompt-occurrence.py" seen --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+      --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session "$2" --call-id "$1" \
+      --tool write --source tool_approval_requested --input-json - \
+      --approval-request-id "$3" --core-arguments-digest "$4" \
+      --binding-protocol omp.tool-approval-binding.v1 --bound-envelope >/dev/null 2>&1
+}
+deferred_json() {   # <call_id> <session> <approval_request_id> <core_digest> -> run_notify extra-fields JSON
+  printf ',"deferred":true,"call_id":"%s","native_session":"%s","approval_request_id":"%s","core_arguments_digest":"%s","binding_protocol":"omp.tool-approval-binding.v1"' \
+    "$1" "$2" "$3" "$4"
+}
+input_required_row() {   # -> last input_required payload json
+  sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    "SELECT payload FROM events WHERE type='input_required' ORDER BY sequence DESC LIMIT 1;" 2>/dev/null
+}
+ir_count() {
+  sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    "SELECT count(*) FROM events WHERE type='input_required';" 2>/dev/null || printf 0
+}
+
+# -- POSITIVE: valid deferred identity, no panel at all -> alert fires,
+# bound to the occurrence's own exact request id/digest.
+seed_deferred call-d1 sess-d1 req-d1 digest-d1
+run_notify "$(deferred_json call-d1 sess-d1 req-d1 digest-d1)"
+row="$(input_required_row)"; pid="$(printf '%s' "$row" | jq -r '.prompt_id // ""')"
+msg="$(printf '%s' "$row" | jq -r '.message // ""')"
+[ "$(ir_count)" = 1 ] && ok "deferred: an alert fires with no panel painted (the Cause bug: notify used to exit silently)" \
+  || bad "deferred positive: input_required rows=$(ir_count)"
+case "$pid" in
+  deferred:*) ok "deferred: the bound prompt identity comes from the occurrence, never a screen scrape" ;;
+  *) bad "deferred positive: prompt_id not occurrence-derived: $pid" ;;
+esac
+printf '%s' "$msg" | grep -q 'req-d1' \
+  && ok "deferred: the alert names the exact approval_request_id a conductor can act on" \
+  || bad "deferred positive message missing identity: $msg"
+printf '%s' "$msg" | grep -q 'digest-d1' \
+  && ok "deferred: the alert names the exact core_arguments_digest" \
+  || bad "deferred positive message missing digest: $msg"
+
+# -- NEGATIVE: mismatched request id (never what recordOccurrence durably
+# wrote for this call) -> fails closed on binding, still alerts.
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seed_deferred call-d2 sess-d2 req-d2-real digest-d2
+run_notify "$(deferred_json call-d2 sess-d2 req-d2-WRONG digest-d2)"
+row="$(input_required_row)"; pid="$(printf '%s' "$row" | jq -r '.prompt_id // ""')"
+msg="$(printf '%s' "$row" | jq -r '.message // ""')"
+case "$pid" in
+  deferred-unbound:*) ok "deferred: a mismatched request id still alerts, unbound (never silent)" ;;
+  *) bad "deferred mismatched-request: rows=$(ir_count) pid=$pid" ;;
+esac
+printf '%s' "$msg" | grep -q 'req-d2-real' \
+  && bad "deferred mismatched-request LEAKED the real request id into an unbound alert: $msg" \
+  || ok "deferred: an unbound alert names no approval (fails closed, no false identity)"
+
+# -- NEGATIVE: mismatched core_arguments_digest -> same fail-closed-but-alert.
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seed_deferred call-d3 sess-d3 req-d3 digest-d3-real
+run_notify "$(deferred_json call-d3 sess-d3 req-d3 digest-d3-WRONG)"
+row="$(input_required_row)"; pid="$(printf '%s' "$row" | jq -r '.prompt_id // ""')"
+case "$pid" in
+  deferred-unbound:*) ok "deferred: a mismatched core_arguments_digest still alerts, unbound" ;;
+  *) bad "deferred mismatched-digest: rows=$(ir_count) pid=$pid" ;;
+esac
+
+# -- NEGATIVE: stale (already authorized/resolved) occurrence -> fails
+# closed, still alerts -- the approval is no longer pending to name.
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seed_deferred call-d4 sess-d4 req-d4 digest-d4
+python3 "$here/lib/prompt-occurrence.py" authorized --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-d4 --call-id call-d4 \
+  --decided-by test --choice Approve >/dev/null 2>&1
+run_notify "$(deferred_json call-d4 sess-d4 req-d4 digest-d4)"
+row="$(input_required_row)"; pid="$(printf '%s' "$row" | jq -r '.prompt_id // ""')"
+case "$pid" in
+  deferred-unbound:*) ok "deferred: an already-authorized (stale) occurrence still alerts, unbound" ;;
+  *) bad "deferred stale: rows=$(ir_count) pid=$pid" ;;
+esac
+
+# -- NEGATIVE: replayed/foreign request id -- a DIFFERENT call's identity
+# claimed for this one -> never credited, fails closed.
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seed_deferred call-d5a sess-d5 req-d5-orig digest-d5-orig
+seed_deferred call-d5b sess-d5 req-d5-own digest-d5-own
+run_notify "$(deferred_json call-d5b sess-d5 req-d5-orig digest-d5-orig)"
+row="$(input_required_row)"; pid="$(printf '%s' "$row" | jq -r '.prompt_id // ""')"
+case "$pid" in
+  deferred-unbound:*) ok "deferred: a replayed/foreign request id is never credited to a different call" ;;
+  *) bad "deferred replay wrongly bound: $pid" ;;
+esac
+
+# -- NEGATIVE: missing approval_request_id/binding_protocol -> this script's
+# own deferred=true demotion (never TS's fault) never fabricates an alert
+# straight from the (missing) identity, AND the firing still falls back to
+# the ORDINARY screen-based path rather than going silent outright: with
+# nothing painted it stays quiet (same as an ordinary call), but with a
+# real menu painted it alerts exactly like a non-deferred call would.
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+run_notify ',"deferred":true,"call_id":"call-d6","native_session":"sess-d6"'
+[ "$(ir_count)" = 0 ] \
+  && ok "deferred: missing approval_request_id/binding_protocol never fabricates an alert" \
+  || bad "deferred missing-identity unexpectedly alerted: $(ir_count) rows"
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+omp_menu "ls -la" > "$WORKER_SCREEN"
+seen call-d6b sess-d6b
+run_notify ',"deferred":true,"call_id":"call-d6b","native_session":"sess-d6b"'
+row="$(input_required_row)"; pid="$(printf '%s' "$row" | jq -r '.prompt_id // ""')"
+case "$pid" in
+  deferred:*|deferred-unbound:*) bad "demoted deferred firing still prompt_id=$pid, not the ordinary screen path" ;;
+  "") bad "demoted deferred firing with a real menu painted raised no alert at all" ;;
+  *) ok "deferred: missing identity demotes to the ORDINARY screen-based path, not silence (alerts off the real panel)" ;;
+esac
+: > "$WORKER_SCREEN"
+
+# -- NEGATIVE: two concurrently pending deferred occurrences -- each binds
+# only its OWN exact identity; no "earliest" guess, no cross-binding.
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seed_deferred call-d7a sess-d7 req-d7a digest-d7a
+seed_deferred call-d7b sess-d7 req-d7b digest-d7b
+run_notify "$(deferred_json call-d7b sess-d7 req-d7b digest-d7b)"
+row="$(input_required_row)"; pid="$(printf '%s' "$row" | jq -r '.prompt_id // ""')"
+msg="$(printf '%s' "$row" | jq -r '.message // ""')"
+case "$pid" in
+  deferred:*) ok "deferred: concurrent occurrences -- call-d7b binds exactly its own identity" ;;
+  *) bad "deferred concurrent: call-d7b did not bind: $pid" ;;
+esac
+printf '%s' "$msg" | grep -q 'req-d7a' \
+  && bad "deferred concurrent: call-d7b's alert leaked call-d7a's request id (cross-binding)" \
+  || ok "deferred: no cross-binding between two concurrently pending deferred requests"
+
+# -- UNCHANGED: an ordinary (non-deferred) painted-menu approval still binds
+# a real screen prompt_id, byte-for-byte today's path.
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-d8 sess-d8
+keyhint_panel > "$WORKER_SCREEN"
+run_notify ',"call_id":"call-d8","native_session":"sess-d8"'
+row="$(input_required_row)"; pid="$(printf '%s' "$row" | jq -r '.prompt_id // ""')"
+case "$pid" in
+  deferred*) bad "ordinary approval wrongly took the deferred path: $pid" ;;
+  "") bad "ordinary approval: no prompt_id bound" ;;
+  *) ok "ordinary (non-deferred) approval still binds a real screen prompt_id, unchanged" ;;
+esac
+: > "$WORKER_SCREEN"
+
+# ---- integrated: the REAL hook → human-stale timer → notifier, two concurrent
+# deferred requests in one turn (review r5 HIGH + its sibling-supersession and
+# --choices-drop companions). Nothing painted; production Slack level.
+printf '\n== deferred integrated: two concurrent requests, human-stale per exact id ==\n'
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+: > "$WORKER_SCREEN"
+REC_NOTIFY="$WORK/rec-notify.sh"; REC_LOG="$WORK/rec-notify.log"; : > "$REC_LOG"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n' "$REC_LOG" > "$REC_NOTIFY"
+chmod +x "$REC_NOTIFY"
+fire_deferred() {   # <call_id> <session> <req> <digest>
+  printf '{"tool":"write","message":"omp needs your permission","cwd":"/tmp/repo"%s}' "$(deferred_json "$@")" \
+    | ( export HERDR_PANE_ID="$WPANE" HERDR_RUN_ID="$RUN_ID" HERDR_TASK_ID="$TASK_ID" \
+               HERDR_NOTIFY="$REC_NOTIFY" HERDR_CONDUCTOR_PANE_ID="" \
+               HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=4
+        bash "$here/agent-hooks/omp-notify.sh" >/dev/null 2>&1 )
+}
+stale_posts() { grep -- '--class human-stale' "$REC_LOG" | grep -c -- "$1"; }
+seed_deferred call-i1 sess-i sess-req-i1 digest-i1
+seed_deferred call-i2 sess-i sess-req-i2 digest-i2
+seed_deferred call-i3 sess-i sess-req-i3 digest-i3
+fire_deferred call-i1 sess-i sess-req-i1 digest-i1
+fire_deferred call-i2 sess-i sess-req-i2 digest-i2
+fire_deferred call-i2 sess-i sess-req-i2 digest-i2   # duplicate hook firing, same request
+fire_deferred call-i3 sess-i sess-req-i3 digest-i3
+# Resolved before its timer: call-i3 is answered now, inside the 4s window.
+python3 "$here/lib/prompt-occurrence.py" authorized --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-i --call-id call-i3 \
+  --decided-by test --choice Approve >/dev/null 2>&1
+sleep 7
+[ "$(stale_posts sess-req-i1)" = 1 ] \
+  && ok "integrated: request 1 gets its own human-stale post although request 2 fired after it" \
+  || bad "integrated: request 1 human-stale posts=$(stale_posts sess-req-i1): $(cat "$REC_LOG")"
+[ "$(stale_posts sess-req-i2)" = 1 ] \
+  && ok "integrated: request 2 gets exactly one human-stale post despite a duplicate hook firing" \
+  || bad "integrated: request 2 human-stale posts=$(stale_posts sess-req-i2)"
+[ "$(stale_posts sess-req-i3)" = 0 ] \
+  && ok "integrated: a request resolved before its timer stands down (no post)" \
+  || bad "integrated: resolved request 3 still posted $(stale_posts sess-req-i3)"
+grep -- '--class human-stale' "$REC_LOG" | grep -q -- '--choices' \
+  && bad "integrated: a deferred human-stale post used --choices (droppable)" \
+  || ok "integrated: deferred human-stale posts never use --choices"
+grep -- '--class human-stale' "$REC_LOG" | grep -q -- 'herdr-select.sh' \
+  && ok "integrated: the human-stale post carries the exact-id answer command" \
+  || bad "integrated: human-stale post lacks the answer hint: $(cat "$REC_LOG")"
+
 printf -- '-----\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

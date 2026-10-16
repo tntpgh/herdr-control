@@ -43,6 +43,21 @@ cwd="$(printf '%s' "$input" | jq -r '.cwd // ""' 2>/dev/null || printf '')"
 full_cmd="$(printf '%s' "$input" | jq -r '.command // ""' 2>/dev/null || printf '')"
 [ -n "$msg" ] || msg="omp needs your permission${tool:+ to use $tool}"
 
+# Deferred (exclusiveResolver): agent-hooks/omp-herdr-control.ts's
+# onApprovalRequested sets these ONLY for a request OMP itself resolves
+# through the hook, never through a painted panel (notifyForPrompt's
+# deferredIdentity argument). They are the SAME approval_request_id/
+# core_arguments_digest/binding_protocol recordOccurrence already wrote to
+# this call's own `seen` row — carried again here so this script can verify
+# its OWN registry record (never the screen, which stays blank for this
+# mode) before alerting.
+deferred="$(printf '%s' "$input" | jq -r 'if .deferred == true then "true" else "false" end' 2>/dev/null || printf 'false')"
+approval_request_id="$(printf '%s' "$input" | jq -r '.approval_request_id // ""' 2>/dev/null || printf '')"
+core_arguments_digest="$(printf '%s' "$input" | jq -r '.core_arguments_digest // ""' 2>/dev/null || printf '')"
+binding_protocol="$(printf '%s' "$input" | jq -r '.binding_protocol // ""' 2>/dev/null || printf '')"
+[ "$deferred" = true ] && [ -n "$approval_request_id" ] && [ -n "$core_arguments_digest" ] \
+  && [ "$binding_protocol" = "omp.tool-approval-binding.v1" ] || deferred=false
+
 # The worker's own pane. Without it there is no way to confirm a prompt is real,
 # and alerting unverified is exactly the storm this script exists to avoid — so
 # no pane means no alert. spawn-task.sh stamps HERDR_PANE_ID into the worker's
@@ -126,11 +141,13 @@ case "$_budget" in ''|*[!0-9]*) _budget=10 ;; esac
 [ "$_budget" -lt 1 ] && _budget=1
 SECONDS=0
 found=0
-for _ in 1 2 3 4 5; do
-  if _prompt_is_up; then found=1; break; fi
-  [ "$SECONDS" -lt "$_budget" ] || break
-  sleep 0.3
-done
+if [ "$deferred" != true ]; then
+  for _ in 1 2 3 4 5; do
+    if _prompt_is_up; then found=1; break; fi
+    [ "$SECONDS" -lt "$_budget" ] || break
+    sleep 0.3
+  done
+fi
 
 # Occurrence identity for this hook firing. call_id/native_session arrive only
 # from the approval path (notifyForPrompt); an `ask` question (no call id) or a
@@ -229,6 +246,48 @@ _occ_still_ours() {
   return 1
 }
 
+# Deferred (exclusiveResolver) equivalent of `_occ_still_ours` above. No
+# screen exists to queue panels oldest-first, so there is no "earliest" to
+# pick — this call's own (pane, pane_birth, native_session, call_id) scope
+# already names exactly one occurrence by construction (recordOccurrence
+# wrote it under that exact key), so the check is a single read: still
+# `requested`, no authorization yet, no mismatch, and the registry's OWN
+# recorded approval_request_id/core_arguments_digest/binding_protocol equal
+# the ones THIS firing carries (never trust the firing's claim alone — the
+# comparison is against what recordOccurrence durably wrote). Sets
+# _deferred_bound=1/_deferred_occ_key only on a complete positive match;
+# every other outcome (stale, mismatched ids, replayed request id, missing
+# evidence) leaves _deferred_bound=0, which the caller treats as "alert
+# anyway, but name no actionable approval" rather than silence.
+_deferred_check() {
+  _deferred_bound=0; _deferred_occ_key=""
+  [ "$_has_occ" = 1 ] || return 1
+  local live st lc auth mismatch req dig proto key
+  if [ -n "${_occ_pane_birth:-}" ]; then
+    live="$(pane_birth_now "$pane" 2>/dev/null)" || return 1
+    [ "$live" = "$_occ_pane_birth" ] || return 1
+  fi
+  st="$("$_occ_py" "$here/lib/prompt-occurrence.py" state --db "$(registry_db)" \
+    --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" --pane "$pane" --birth "${_occ_pane_birth:-}" \
+    --session "$native_session" --call-id "$call_id" 2>/dev/null)" || return 1
+  lc="$(printf '%s' "$st" | jq -r '.lifecycle // ""' 2>/dev/null)"
+  auth="$(printf '%s' "$st" | jq -r '.authorization // "none"' 2>/dev/null)"
+  mismatch="$(printf '%s' "$st" | jq -r '.mismatch // false' 2>/dev/null)"
+  req="$(printf '%s' "$st" | jq -r '.approval_request_id // ""' 2>/dev/null)"
+  dig="$(printf '%s' "$st" | jq -r '.core_arguments_digest // ""' 2>/dev/null)"
+  proto="$(printf '%s' "$st" | jq -r '.binding_protocol // ""' 2>/dev/null)"
+  key="$(printf '%s' "$st" | jq -r '.occ_key // ""' 2>/dev/null)"
+  [ "$lc" = requested ] || return 1
+  [ "$auth" = none ] || return 1
+  [ "$mismatch" != true ] || return 1
+  [ -n "$key" ] || return 1
+  [ "$req" = "$approval_request_id" ] || return 1
+  [ "$dig" = "$core_arguments_digest" ] || return 1
+  [ "$proto" = "omp.tool-approval-binding.v1" ] || return 1
+  _deferred_bound=1; _deferred_occ_key="$key"
+  return 0
+}
+
 # Decision trace for this firing: which branch ended it, and why the binding
 # held or failed. Identifiers and booleans only — no screen text, command or
 # tool input — so a probe that ends without provenance is diagnosable from
@@ -260,7 +319,20 @@ _probe_trace() {                        # <outcome> [push_rc] [mode]
 # rather than giving up (the old rule's failure for A) or binding to
 # someone else's (the old rule's failure for B).
 _superseded=0
-if [ "$_has_occ" = 1 ]; then
+_deferred_bound=0
+_deferred_occ_key=""
+if [ "$deferred" = true ]; then
+  # No screen, so none of the queue-ordering/corroboration machinery above
+  # applies — this call's own (pane, birth, session, call_id) scope already
+  # names exactly one occurrence by construction; _deferred_check is the
+  # whole check. `found` is set unconditionally below: unlike an ordinary
+  # approval (silence is correct when nothing ever needed a human), a
+  # deferred request ALWAYS needs one eventually (OMP painted no panel and
+  # has no other way to ask), so an unbound/ambiguous/stale read must still
+  # alert — just naming no actionable approval (SPEC "fail closed on
+  # binding, never fail closed on alerting").
+  [ "$_has_occ" = 1 ] && _deferred_check
+elif [ "$_has_occ" = 1 ]; then
   _occ_still_ours; _entry_rc=$?; _entry_why="$_occ_why"
   if [ "$_entry_rc" = 0 ] && [ "$found" = 1 ] && _panel_matches_call; then
     : # already fully confirmed by the fast probe above: bound, on screen,
@@ -290,17 +362,41 @@ if [ "$_has_occ" = 1 ]; then
     done
   fi
 fi
+[ "$deferred" = true ] && found=1
 
 # The ONE prompt this hook may speak for, captured once right after binding.
 # Every later write/claim/timer uses it and nothing re-reads a fresh id, so a
 # replacement prompt painted meanwhile can never be (re)bound to this hook.
+# Deferred: there is no screen prompt_id to scrape (nothing painted), so the
+# identity is the occurrence's own key instead — "a prompt identity derived
+# from the occurrence, not the screen" (SPEC change 3). An unbound/ambiguous
+# read still gets a (non-identity) token so dedup/provenance keys stay
+# per-call rather than colliding across different deferred requests.
 _bound_pid=""
-[ "$found" = 1 ] && _bound_pid="$(prompt_id "$pane" 2>/dev/null || printf '')"
-[ "$found" = 1 ] && [ -z "$_bound_pid" ] && { found=0; _superseded=1; }
+if [ "$deferred" = true ]; then
+  if [ "$_deferred_bound" = 1 ]; then
+    _bound_pid="deferred:${_deferred_occ_key}"
+  else
+    _bound_pid="deferred-unbound:${call_id:-nocall}_${_probe_firing}"
+  fi
+else
+  [ "$found" = 1 ] && _bound_pid="$(prompt_id "$pane" 2>/dev/null || printf '')"
+  [ "$found" = 1 ] && [ -z "$_bound_pid" ] && { found=0; _superseded=1; }
+fi
 # Final guard, run immediately before each provenance write: the occurrence
-# is still ours AND the screen still shows exactly the bound prompt.
+# is still ours AND (ordinary) the screen still shows exactly the bound
+# prompt, or (deferred, when bound) the registry's own exact identity still
+# matches — never re-verified for a deferred unbound alert, which never
+# claimed an identity to lose.
 _still_bound() {
   [ -n "$_bound_pid" ] || return 1
+  if [ "$deferred" = true ]; then
+    if [ "$_deferred_bound" = 1 ]; then
+      _deferred_check
+      [ "$_deferred_bound" = 1 ] || return 1
+    fi
+    return 0
+  fi
   if [ "$_has_occ" = 1 ]; then _occ_still_ours || return 1; fi
   [ "$(prompt_id "$pane" 2>/dev/null || printf '')" = "$_bound_pid" ]
 }
@@ -310,7 +406,11 @@ _still_bound() {
 # ever painted — a failed/not-found probe used to just `exit 0` here with
 # nothing left behind (docs/plans/dot-herdr-recovery-slices.md §2). A
 # superseded occurrence records nothing: the screen belongs to another one.
-if [ "$_has_occ" = 1 ] && [ "$_superseded" = 0 ]; then
+# Deferred: skipped outright — there is no screen to observe, and recording
+# a "read_failed"/unknown display against an occurrence nothing ever painted
+# would misrepresent what this probe actually checked (the registry, not a
+# screen).
+if [ "$deferred" != true ] && [ "$_has_occ" = 1 ] && [ "$_superseded" = 0 ]; then
   if [ "$found" = 1 ]; then
     _occ_display=pending_parseable; _occ_screen_id="$_bound_pid"
     _still_bound || { found=0; _superseded=1; }
@@ -327,6 +427,22 @@ if [ "$_has_occ" = 1 ] && [ "$_superseded" = 0 ]; then
 fi
 
 if [ "$found" != 1 ]; then _probe_trace no_provenance; exit 0; fi
+
+# Deferred identity for the alert itself (never the screen): named only when
+# exactly bound, so a human/conductor can act through the existing exact-id
+# resolver (lib/prompt-occurrence.py resolve_exact_pending / herdr-select.sh
+# --approval-request-id, #277's human-only bound route) without ever needing
+# a painted panel or a keypress. An unbound/ambiguous read says so plainly
+# instead of naming an approval nobody verified.
+_deferred_hint=""
+if [ "$deferred" = true ]; then
+  if [ "$_deferred_bound" = 1 ]; then
+    msg="$msg  ·  DEFERRED, no panel painted — exact identity: approval_request_id=$approval_request_id tool_call_id=${call_id:-} core_arguments_digest=$core_arguments_digest"
+    _deferred_hint="review: lib/prompt-occurrence.py proposal --run ${HERDR_RUN_ID:-} --task ${HERDR_TASK_ID:-} --pane $pane --tool $tool --approval-request-id $approval_request_id --expect-arguments-digest $core_arguments_digest --expect-tool-call-id ${call_id:-} --show  ·  then herdr-select.sh $pane <1=Approve|2=Deny> --approval-request-id $approval_request_id --approval-arguments-digest $core_arguments_digest --approval-tool-call-id ${call_id:-} --approval-payload-sha <sha-from-review> --review-category <cat> --review-reason '<reason>'"
+  else
+    msg="$msg  ·  DEFERRED, no panel painted — this call's own registry occurrence could not be exactly verified (stale/mismatched/ambiguous); inspect task ${HERDR_TASK_ID:-} directly, no approval can be named"
+  fi
+fi
 
 where="${cwd##*/}"
 [ -n "$where" ] && msg="$msg  ·  ${where}"
@@ -365,9 +481,11 @@ _still_bound || { _probe_trace unbound_before_push; exit 0; }
 _push_mode=wake
 attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$_bound_pid" || _push_mode=record-only
 if [ "$_push_mode" = wake ]; then
-  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" >/dev/null 2>&1
+  HERDR_EXPECT_PROMPT_ID="$_bound_pid" HERDR_DEFERRED_PID="$([ "$deferred" = true ] && printf '%s' "$_bound_pid")" \
+    HERDR_DEFERRED_ANSWER_HINT="$_deferred_hint" push_wake "$msg" "$where" "$full_cmd" "$tool" >/dev/null 2>&1
 else
-  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" record-only >/dev/null 2>&1
+  HERDR_EXPECT_PROMPT_ID="$_bound_pid" HERDR_DEFERRED_PID="$([ "$deferred" = true ] && printf '%s' "$_bound_pid")" \
+    HERDR_DEFERRED_ANSWER_HINT="$_deferred_hint" push_wake "$msg" "$where" "$full_cmd" "$tool" record-only >/dev/null 2>&1
 fi
 _push_rc=$?
 # push_wake's rc conflates "recorded, no wake" with "refused", so the trace
@@ -435,11 +553,23 @@ fi
 if [ "${human_stale:-0}" = 1 ]; then
   # Own claim namespace (lib/alert-gate.sh): a peer refusal or the conductor
   # re-wake takes grace_realert_*, and must not silence this ERROR post.
-  HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" HERDR_GRACE_CLAIM_KIND=human_stale \
-  grace_realert "$pane" "$_bound_pid" \
-    "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-    bash "$notify" --class human-stale --choices --pane "$pane" \
-    "$msg  ·  only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s"
+  if [ "$deferred" = true ]; then
+    # No panel: --choices would re-scrape the pane and drop the post, and the
+    # screen cannot say whether this request is still open. _still_bound asks
+    # its own occurrence (requested, unauthorized) at T+grace instead.
+    HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" HERDR_GRACE_CLAIM_KIND=human_stale \
+    HERDR_DEFERRED_PID="$_bound_pid" HERDR_GRACE_STILL_OPEN=_still_bound \
+    grace_realert "$pane" "$_bound_pid" \
+      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+      bash "$notify" --class human-stale --pane "$pane" \
+      "$msg  ·  only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s${_deferred_hint:+  ·  ${_deferred_hint}}"
+  else
+    HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" HERDR_GRACE_CLAIM_KIND=human_stale \
+    grace_realert "$pane" "$_bound_pid" \
+      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+      bash "$notify" --class human-stale --choices --pane "$pane" \
+      "$msg  ·  only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s"
+  fi
 fi
 
 exit 0
