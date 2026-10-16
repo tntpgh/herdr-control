@@ -235,6 +235,46 @@ reset_keys; conductor_bound; rc=$?
 [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "duplicate bound resolution is refused" \
   || bad "duplicate bound resolution: rc=$rc keys=$(keys_pressed)"
 
+printf '== automated write/edit resolves by its own exact OMP request id, never the painted screen (Finding 1) ==\n'
+BOUND_REQUEST="request-exact-1"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
+EXACT_INPUT="$(write_input "$WT/.handoffs/exact.md" "exact routing payload")"
+EXACT_JSON="$(printf '%s' "$EXACT_INPUT" | jq -cS .)"
+BOUND_DIGEST="sha256:$(printf '%s' "$EXACT_JSON" | shasum -a 256 | awk '{print $1}')"
+record write "$EXACT_INPUT"
+EXACT_OCC="$OCC_KEY"
+approves_before="$(approve_rows)"; reset_keys; sel 1 --authority peer; rc=$?
+authorized_count="$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type='prompt_occ_authorized' AND json_extract(payload,'$.occ_key')='$EXACT_OCC';")"
+if [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] && [ "$authorized_count" = 1 ] && [ "$(approve_rows)" = $((approves_before + 1)) ]; then
+  ok "automated peer approval resolves the sole pending bound write by its own exact request id, no key pressed"
+else
+  bad "automated exact-id approval: rc=$rc keys=$(keys_pressed) authorized=$authorized_count; $(tail -3 "$WORK/err.txt")"
+fi
+
+printf '== two concurrent pending bound write/edit occurrences: automated approval refuses (Finding 1 ambiguity) ==\n'
+BOUND_REQUEST="request-exact-x"
+X_INPUT="$(write_input "$WT/.handoffs/exact-x.md" "X payload, still pending, no fresh screen write of its own")"
+X_JSON="$(printf '%s' "$X_INPUT" | jq -cS .)"
+BOUND_DIGEST="sha256:$(printf '%s' "$X_JSON" | shasum -a 256 | awk '{print $1}')"
+PANEL_STYLE=keyhint record write "$X_INPUT"; X_CALL="$CALL_ID"; X_OCC="$OCC_KEY"
+BOUND_REQUEST="request-exact-y"
+Y_INPUT="$(write_input "$WT/.handoffs/exact-y.md" "Y payload, genuinely the one painted")"
+Y_JSON="$(printf '%s' "$Y_INPUT" | jq -cS .)"
+BOUND_DIGEST="sha256:$(printf '%s' "$Y_JSON" | shasum -a 256 | awk '{print $1}')"
+PANEL_STYLE=keyhint record write "$Y_INPUT"; Y_CALL="$CALL_ID"; Y_OCC="$OCC_KEY"
+approves_before="$(approve_rows)"; reset_keys; sel 1 --authority peer; rc=$?
+x_authorized="$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type='prompt_occ_authorized' AND json_extract(payload,'$.occ_key')='$X_OCC';")"
+y_authorized="$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type='prompt_occ_authorized' AND json_extract(payload,'$.occ_key')='$Y_OCC';")"
+if [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && [ "$x_authorized" = 0 ] && [ "$y_authorized" = 0 ] && \
+   [ "$(approve_rows)" = "$approves_before" ] && grep -qF "write/edit approvals are human-only" "$WORK/err.txt"; then
+  ok "two simultaneously pending bound write/edit occurrences: automated approval refuses instead of guessing which panel owns the screen"
+else
+  bad "ambiguous bound occurrences: rc=$rc keys=$(keys_pressed) x_authorized=$x_authorized y_authorized=$y_authorized; $(tail -3 "$WORK/err.txt")"
+fi
+id=(--db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" --session "$SESSION")
+"${OCC[@]}" withdrawn "${id[@]}" --call-id "$X_CALL" --reason test >/dev/null
+"${OCC[@]}" withdrawn "${id[@]}" --call-id "$Y_CALL" --reason test >/dev/null
+BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
+
 printf '== deferred request revalidates ownership and resolves once under a race ==\n'
 BOUND_REQUEST="request-277-owner-change"
 BOUND_INPUT="$(write_input "$WT/.handoffs/bound-owner.md" "owner must remain current")"
