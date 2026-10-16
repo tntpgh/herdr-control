@@ -89,6 +89,13 @@ fi
 # once painted it stays until someone answers it — so a coarser poll can only
 # delay detection by one interval, never miss it, and it halves the RPCs this
 # fires at the herdr server on every tool call of every pane.
+# One total budget for every probe below, measured from here with bash's
+# SECONDS counter; the env override is clamped to 1..10s.
+_budget="${HERDR_NOTIFY_UNREADABLE_DEADLINE_S:-10}"
+case "$_budget" in ''|*[!0-9]*) _budget=10 ;; esac
+[ "$_budget" -gt 10 ] && _budget=10
+[ "$_budget" -lt 1 ] && _budget=1
+SECONDS=0
 found=0
 for _ in 1 2 3 4 5; do
   if _prompt_is_up; then found=1; break; fi
@@ -123,12 +130,21 @@ _occ_still_ours() {
   st="$("$_occ_py" "$here/lib/prompt-occurrence.py" state --db "$(registry_db)" \
     --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" --pane "$pane" --birth "${_occ_pane_birth:-}" \
     --session "$native_session" --call-id "$call_id" 2>/dev/null)" || return 1
-  [ "$(printf '%s' "$st" | jq -r '.lifecycle // ""' 2>/dev/null)" = requested ] || return 1
+  # `unknown` = no seen recorded for this call (seen is best-effort upstream):
+  # still ours unless a DIFFERENT occurrence is the task's latest. Any
+  # resolution/authorization, or a pane recycle, is positive evidence it is not.
+  case "$(printf '%s' "$st" | jq -r '.lifecycle // ""' 2>/dev/null)" in
+    requested|unknown) ;;
+    *) return 1 ;;
+  esac
+  # The fold downgrades an approved/completed occurrence with unproven
+  # identity to `unknown`; its raw resolution still shows here.
+  [ -z "$(printf '%s' "$st" | jq -r 'select((.authorization // "none") != "none" or (.unresolved_reason // "") != "") | "x"' 2>/dev/null)" ] || return 1
   key="$(printf '%s' "$st" | jq -r '.occ_key // ""' 2>/dev/null)"
   latest="$(_sql "SELECT json_extract(payload,'\$.occ_key') FROM events
      WHERE task_id=$(_sq "$HERDR_TASK_ID") AND type='prompt_occ_seen'
      ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
-  [ -n "$key" ] && [ "$key" = "$latest" ]
+  [ -z "$latest" ] || [ "$key" = "$latest" ]
 }
 
 # Something approval-shaped painted but did not yet parse (a tall review-class
@@ -141,15 +157,18 @@ _occ_still_ours() {
 # only from this hook's own event, never from the screen.
 _superseded=0
 if [ "$found" = 0 ] && [ "$_has_occ" = 1 ]; then
-  _deadline=$(( $(date +%s) + ${HERDR_NOTIFY_UNREADABLE_DEADLINE_S:-10} ))
-  while [ "$(date +%s)" -lt "$_deadline" ] \
+  while [ "$SECONDS" -lt "$_budget" ] \
     && [ "$(prompt_occurrence_display "$pane" 2>/dev/null)" = pending_unreadable ]; do
     _occ_still_ours || { _superseded=1; break; }
     sleep 0.5
     if _prompt_is_up; then found=1; break; fi
   done
-  # Re-bind after the wait: the parseable panel must still be ours.
-  if [ "$found" = 1 ] && ! _occ_still_ours; then found=0; _superseded=1; fi
+fi
+# EVERY successful parse — the fast first probes included — must still be
+# this hook's occurrence before anything is written: a decline/replacement
+# during the first probes would otherwise push this tool onto a new prompt.
+if [ "$found" = 1 ] && [ "$_has_occ" = 1 ] && ! _occ_still_ours; then
+  found=0; _superseded=1
 fi
 
 # Persist a prompt_occ_screen observation against the SAME occurrence
@@ -168,21 +187,7 @@ if [ "$_has_occ" = 1 ] && [ "$_superseded" = 0 ]; then
     >/dev/null 2>&1 || true
 fi
 
-if [ "$found" = 0 ]; then
-  # Still unreadable at the deadline: keep a REDACTED shape of the panel
-  # region (letters→a, digits→9; box/glyph/punctuation kept — what the parser
-  # keys on), last 40 rows, 0600, newest 20 files only. No raw terminal text.
-  if [ "$_superseded" = 0 ] && [ "${_occ_display:-}" = pending_unreadable ]; then
-    _diag="${HERDR_RUN_STATE_DIR:-$HOME/.local/state/herdr/runs}/diagnostics"
-    ( umask 077; mkdir -p "$_diag" || exit 0
-      _pane_read_raw "$pane" --format ansi | sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' | tail -n 40 \
-        | LC_ALL=C tr 'A-Za-z' 'a' | LC_ALL=C tr '0-9' '9' \
-        > "$_diag/notify-unreadable-${HERDR_TASK_ID:-notask}-${call_id:-nocall}.shape"
-      ls -t "$_diag"/notify-unreadable-*.shape 2>/dev/null | tail -n +21 | while IFS= read -r f; do rm -f -- "$f"; done
-    ) 2>/dev/null || true
-  fi
-  exit 0
-fi
+[ "$found" = 1 ] || exit 0
 
 where="${cwd##*/}"
 [ -n "$where" ] && msg="$msg  ·  ${where}"

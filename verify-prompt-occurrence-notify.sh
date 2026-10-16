@@ -208,21 +208,43 @@ elapsed=$(( $(date +%s) - start )); wait
   && ok "a declined occurrence cancels the wait (${elapsed}s) and pushes nothing" \
   || bad "declined: tooled=$(tooled_rows) elapsed=${elapsed}s"
 
-# -- stays unreadable: hard deadline, no input_required, redacted 0600 shape -
+# -- stays unreadable: ONE total budget (fast probes included), env clamped -
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
 seen call-6 sess-6
 unreadable_menu > "$WORKER_SCREEN"
 start=$(date +%s)
 HERDR_NOTIFY_UNREADABLE_DEADLINE_S=3 run_notify ',"call_id":"call-6","native_session":"sess-6"'
 elapsed=$(( $(date +%s) - start ))
-diag="$HERDR_RUN_STATE_DIR/diagnostics/notify-unreadable-$TASK_ID-call-6.shape"
-[ "$(tooled_rows)" = 0 ] && [ "$elapsed" -le 7 ] \
-  && ok "a never-parseable panel stops at the deadline (${elapsed}s) and writes no input_required" \
+[ "$(tooled_rows)" = 0 ] && [ "$elapsed" -le 5 ] \
+  && ok "a never-parseable panel stops within the total budget (${elapsed}s) and writes no input_required" \
   || bad "unreadable panel: tooled=$(tooled_rows) elapsed=${elapsed}s"
-[ -f "$diag" ] && [ "$(stat -f %Lp "$diag" 2>/dev/null || stat -c %a "$diag")" = 600 ] \
-  && grep -q 'aaaaa aaaa: aaaa' "$diag" && ! grep -qE 'Allow|smoke|[0-9]' "$diag" \
-  && ok "final unreadable panel saved as a redacted 0600 shape (no raw text)" \
-  || bad "diagnostic shape missing/unredacted/wrong mode: $(ls -l "$diag" 2>&1)"
+[ ! -e "$HERDR_RUN_STATE_DIR/diagnostics" ] \
+  && ok "no terminal content is captured to disk" \
+  || bad "diagnostics dir exists: $(ls "$HERDR_RUN_STATE_DIR/diagnostics")"
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-14 sess-14
+start=$(date +%s)
+HERDR_NOTIFY_UNREADABLE_DEADLINE_S=999 run_notify ',"call_id":"call-14","native_session":"sess-14"'
+elapsed=$(( $(date +%s) - start ))
+[ "$elapsed" -le 13 ] && ok "an oversized deadline override is clamped to 10s total (${elapsed}s)" \
+  || bad "deadline override not clamped: ${elapsed}s"
+
+# -- races on the FAST path: parseable at once, but no longer ours ----------
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-11 sess-11; seen call-12 sess-11      # replacement already recorded
+keyhint_panel > "$WORKER_SCREEN"
+run_notify ',"call_id":"call-11","native_session":"sess-11"'
+[ "$(tooled_rows)" = 0 ] && [ "$(screen_rows)" = 0 ] \
+  && ok "fast-path parse of a replacement prompt pushes nothing for the old occurrence" \
+  || bad "fast-path replacement: tooled=$(tooled_rows) screen=$(screen_rows)"
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-13 sess-13
+python3 "$here/lib/prompt-occurrence.py" declined --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-13 --call-id call-13 >/dev/null 2>&1
+run_notify ',"call_id":"call-13","native_session":"sess-13"'
+[ "$(tooled_rows)" = 0 ] \
+  && ok "fast-path parse after the occurrence was declined pushes nothing" \
+  || bad "fast-path declined: tooled=$(tooled_rows)"
 
 # -- absent panel (auto-approved) is NOT extended ---------------------------
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
