@@ -125,7 +125,8 @@ fi
 # (no seen, unreadable birth) leaves the prompt unresolved for the
 # reconciliation paths rather than attaching this hook's tool to it.
 _occ_still_ours() {
-  local live st key latest
+  local live st key latest lc
+  _occ_missing=0
   if [ -n "${_occ_pane_birth:-}" ]; then
     live="$(pane_birth_now "$pane" 2>/dev/null)" || return 1
     [ "$live" = "$_occ_pane_birth" ] || return 1
@@ -133,7 +134,11 @@ _occ_still_ours() {
   st="$("$_occ_py" "$here/lib/prompt-occurrence.py" state --db "$(registry_db)" \
     --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" --pane "$pane" --birth "${_occ_pane_birth:-}" \
     --session "$native_session" --call-id "$call_id" 2>/dev/null)" || return 1
-  [ "$(printf '%s' "$st" | jq -r '.lifecycle // ""' 2>/dev/null)" = requested ] || return 1
+  lc="$(printf '%s' "$st" | jq -r '.lifecycle // ""' 2>/dev/null)"
+  # No seen of our own at all: unbound for lack of evidence, not superseded.
+  [ "$lc" = unknown ] && [ "$(printf '%s' "$st" | jq -r '.authorization // "none"' 2>/dev/null)" = none ] \
+    && [ -z "$(printf '%s' "$st" | jq -r '.unresolved_reason // ""' 2>/dev/null)" ] && _occ_missing=1
+  [ "$lc" = requested ] || return 1
   [ "$(printf '%s' "$st" | jq -r '.authorization // "none"' 2>/dev/null)" = none ] || return 1
   key="$(printf '%s' "$st" | jq -r '.occ_key // ""' 2>/dev/null)"
   latest="$(_sql "SELECT json_extract(payload,'\$.occ_key') FROM events
@@ -142,22 +147,30 @@ _occ_still_ours() {
   [ -n "$key" ] && [ "$key" = "$latest" ]
 }
 
-# Something approval-shaped painted but did not yet parse (a tall review-class
-# panel mid-paint): keep probing instead of exiting. Exiting here is what left
-# w7S:p7's prompt (2026-10-15 23:31Z) with no hook-written input_required, so
-# herdr-select could never corroborate its tool. Only an UNREADABLE panel with
-# a bound occurrence extends the wait; an absent panel (auto-approved call)
-# still costs exactly the five probes above. Hard wall deadline, cancelled the
-# moment the occurrence resolves or is superseded. Tool identity still comes
-# only from this hook's own event, never from the screen.
+# The approval panel has not parsed yet: keep probing until the total budget,
+# as long as the occurrence stays bound. This script only runs for a REAL
+# approval request (auto-approved calls never reach it, header comment), so
+# a not-yet-parseable screen is a panel still painting, not an absent one —
+# and a mid-paint frame can read as unreadable OR as no prompt at all (live
+# w7S:p7 2026-10-16 00:45Z: the loop keyed on `pending_unreadable` saw a
+# no-prompt frame, exited, and the next read was unreadable again). Exiting
+# early is what left review-class prompts with no hook-written
+# input_required, so herdr-select could never corroborate their tool.
+# Cancelled the moment the occurrence resolves or is superseded. Tool
+# identity still comes only from this hook's own event, never the screen.
 _superseded=0
+# Unbound at entry (no seen of our own): nothing to wait for — skip, record
+# the screen as before, write no provenance. Bound then lost: superseded.
 if [ "$found" = 0 ] && [ "$_has_occ" = 1 ]; then
-  while [ "$SECONDS" -lt "$_budget" ] \
-    && [ "$(prompt_occurrence_display "$pane" 2>/dev/null)" = pending_unreadable ]; do
-    _occ_still_ours || { _superseded=1; break; }
-    sleep 0.5
-    if _prompt_is_up; then found=1; break; fi
-  done
+  if ! _occ_still_ours; then
+    [ "$_occ_missing" = 1 ] || _superseded=1
+  else
+    while [ "$SECONDS" -lt "$_budget" ]; do
+      _occ_still_ours || { _superseded=1; break; }
+      sleep 0.5
+      if _prompt_is_up; then found=1; break; fi
+    done
+  fi
 fi
 # EVERY successful parse — the fast first probes included — must still be
 # this hook's occurrence before anything is written: a decline/replacement
