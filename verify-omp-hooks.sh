@@ -2136,6 +2136,16 @@ i=0; while [ "$i" -lt 100 ] && ! grep -q '^done wakefail ' "$f7_trace"; do sleep
 grep -q "^done wakefail deferred:req-wf-1 fired$" "$f7_trace" && grep -q 'wake-fail' "$NOTIFIED" \
   && ok "a failed wake for a deferred (panel-less) prompt still pages" \
   || bad "deferred wake-fail stood down: $(cat "$f7_trace"); notified: $(cat "$NOTIFIED")"
+# Review r4 HIGH (row 7b): herdr-notify.sh --choices re-scrapes the worker pane
+# and silently drops the page when nothing survives its filters, which a
+# panel-less deferred prompt can hit. The deferred page must not use
+# --choices, and must name the exact request.
+grep 'wake-fail' "$NOTIFIED" | grep -q -- '--choices' \
+  && bad "deferred wake-fail page used --choices (droppable): $(cat "$NOTIFIED")" \
+  || ok "the deferred wake-fail page is posted without --choices"
+grep -q 'deferred request deferred:req-wf-1' "$NOTIFIED" \
+  && ok "the deferred wake-fail page names the exact request" \
+  || bad "deferred wake-fail page lacks the request id: $(cat "$NOTIFIED")"
 set_task_state runF7 taskF7 completed no-follow-on >/dev/null 2>&1
 clean_screen > "$WORKER_SCREEN"
 
