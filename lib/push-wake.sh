@@ -132,6 +132,12 @@ push_wake() {
   if [ -n "${HERDR_PANE_ID:-}" ]; then
     pid="$(prompt_id "$HERDR_PANE_ID" 2>/dev/null)" || pid=""
   fi
+  # A caller that already bound itself to one prompt (omp-notify.sh) passes
+  # it; a screen now showing any other prompt means this hook's tool/command
+  # are not this prompt's, so nothing is written and nobody is woken.
+  if [ -n "${HERDR_EXPECT_PROMPT_ID:-}" ] && [ "$pid" != "$HERDR_EXPECT_PROMPT_ID" ]; then
+    return 1
+  fi
   local base="wake_${HERDR_RUN_ID:-norun}_${HERDR_TASK_ID:-notask}_${pid:-noprompt}"
 
   # ---- stale/terminal rejection — BEFORE any state change or actionable event

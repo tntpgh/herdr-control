@@ -166,16 +166,35 @@ if [ "$found" = 1 ] && [ "$_has_occ" = 1 ] && ! _occ_still_ours; then
   found=0; _superseded=1
 fi
 
+# The ONE prompt this hook may speak for, captured once right after binding.
+# Every later write/claim/timer uses it and nothing re-reads a fresh id, so a
+# replacement prompt painted meanwhile can never be (re)bound to this hook.
+_bound_pid=""
+[ "$found" = 1 ] && _bound_pid="$(prompt_id "$pane" 2>/dev/null || printf '')"
+[ "$found" = 1 ] && [ -z "$_bound_pid" ] && { found=0; _superseded=1; }
+# Final guard, run immediately before each provenance write: the occurrence
+# is still ours AND the screen still shows exactly the bound prompt.
+_still_bound() {
+  [ -n "$_bound_pid" ] || return 1
+  if [ "$_has_occ" = 1 ]; then _occ_still_ours || return 1; fi
+  [ "$(prompt_id "$pane" 2>/dev/null || printf '')" = "$_bound_pid" ]
+}
+
 # Persist a prompt_occ_screen observation against the SAME occurrence
 # onApprovalRequested already recorded `seen` for, whether or not a prompt
 # ever painted — a failed/not-found probe used to just `exit 0` here with
 # nothing left behind (docs/plans/dot-herdr-recovery-slices.md §2). A
 # superseded occurrence records nothing: the screen belongs to another one.
 if [ "$_has_occ" = 1 ] && [ "$_superseded" = 0 ]; then
-  _occ_display="$(prompt_occurrence_display "$pane" 2>/dev/null || printf 'read_failed')"
-  _occ_screen_id=""
-  [ "$_occ_display" = pending_parseable ] && _occ_screen_id="$(prompt_id "$pane" 2>/dev/null || printf '')"
-  "$_occ_py" "$here/lib/prompt-occurrence.py" screen \
+  if [ "$found" = 1 ]; then
+    _occ_display=pending_parseable; _occ_screen_id="$_bound_pid"
+    _still_bound || { found=0; _superseded=1; }
+  else
+    _occ_display="$(prompt_occurrence_display "$pane" 2>/dev/null || printf 'read_failed')"
+    # Parseable only now (after the bound checks): not ours to name.
+    _occ_screen_id=""
+  fi
+  [ "$_superseded" = 0 ] && "$_occ_py" "$here/lib/prompt-occurrence.py" screen \
     --db "$(registry_db)" --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" --pane "$pane" \
     --birth "$_occ_pane_birth" --session "$native_session" --call-id "$call_id" \
     --display "$_occ_display" ${_occ_screen_id:+--prompt-id "$_occ_screen_id"} \
@@ -187,57 +206,12 @@ fi
 where="${cwd##*/}"
 [ -n "$where" ] && msg="$msg  ·  ${where}"
 
-# ---- outbound Slack alert ---------------------------------------------------
-# Same resolution order as claude-notify.sh so a packaged (APM) install and a
-# plain checkout both work without editing: explicit override, then this
-# checkout, then a deployed herdr-ops skill copy.
-for notify in \
-  "${HERDR_NOTIFY:-}" \
-  "$here/slack-bridge/herdr-notify.sh" \
-  "$HOME/.claude/skills/herdr-ops/scripts/slack-bridge/herdr-notify.sh"
-do
-  [ -n "$notify" ] && [ -f "$notify" ] && break
-done
-if [ -n "${notify:-}" ] && [ -f "$notify" ]; then
-  # --pane, not a cwd hint: unlike the Claude hook we already know exactly which
-  # pane asked, because we just confirmed the prompt on it. Passing the pane
-  # explicitly avoids herdr-notify having to disambiguate several panes sharing
-  # one repo cwd — a wrong guess there sends the operator's reply to a different
-  # agent.
-  #
-  # Gated the same way the conductor wake is (lib/alert-gate.sh, applied inside
-  # push_wake): an allow-class, unreserved prompt is one peer-answer.sh takes in
-  # seconds, and paging for it is what turned an afternoon of ordinary worker
-  # activity into a Slack flood on 2026-09-12. Held, never dropped — if the
-  # prompt outlives the grace window the alert is sent after all.
-  #
-  # Classified for lib/slack-level.sh (2026-09-26): neither send is an error by
-  # itself — the conductor is woken for both below — so at the default level
-  # both are suppressed and logged. What IS an error is a human-only prompt
-  # nobody resolved: that escalates as `human-stale` after HERDR_HUMAN_ALERT_S.
-  # A held prompt that stays stuck escalates from agent-edge.sh as `stuck`.
-  # At HERDR_SLACK_LEVEL=all no escalation timer is armed: the immediate post
-  # goes out, exactly as before. The timer itself is armed AFTER push_wake
-  # below: grace_realert stands down for any input_required recorded after it
-  # was armed, and push_wake records THIS prompt's input_required — armed
-  # first, a second boundary between the two silenced the escalation.
-  . "$here/lib/slack-level.sh"
-  human_stale=0
-  if human_must_answer "$pane" "$full_cmd"; then
-    bash "$notify" --class needs-input --choices --pane "$pane" "$msg" >/dev/null 2>&1 || true
-    [ "$(slack_level)" = errors ] && human_stale=1
-  elif slack_should_send held; then
-    # Armed only when it could post (level `all`). At `errors` a held timer can
-    # only be suppressed, and it shares grace_realert's claim key with the
-    # conductor re-wake push_wake arms for the same prompt — winning that
-    # claim to post nothing cost the conductor its wake (PR #166 review).
-    grace_realert "$pane" "$(prompt_id "$pane" 2>/dev/null || printf '')" \
-      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-      bash "$notify" --class held --choices --pane "$pane" "$msg"
-  fi
-fi
-
 # ---- push wake to the conductor --------------------------------------------
+# Authoritative record FIRST, before any optional (and possibly blocking)
+# notification, under the bound prompt id with a final guard; push_wake
+# itself refuses if the screen no longer shows HERDR_EXPECT_PROMPT_ID, so no
+# window remains between this check and its own prompt_id read.
+#
 # All the guards (agent-pane gate, conductor pane-birth revalidation, prompt_id
 # capture, delivery-outcome recording) live in lib/push-wake.sh, shared with
 # claude-notify.sh so the two cannot drift.
@@ -262,17 +236,68 @@ fi
 # refuses every answer to it (live 2026-09-29, 5 of 68 prompts). Record-only
 # writes/replaces the row and sends no second wake.
 . "$here/lib/attention-key.sh"
-if attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$(prompt_id "$pane" 2>/dev/null)"; then
-  push_wake "$msg" "$where" "$full_cmd" "$tool" >/dev/null 2>&1 || true
+_still_bound || exit 0
+if attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$_bound_pid"; then
+  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" >/dev/null 2>&1 || true
 else
-  push_wake "$msg" "$where" "$full_cmd" "$tool" record-only >/dev/null 2>&1 || true
+  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" record-only >/dev/null 2>&1 || true
+fi
+
+# ---- outbound Slack alert ---------------------------------------------------
+# Same resolution order as claude-notify.sh so a packaged (APM) install and a
+# plain checkout both work without editing: explicit override, then this
+# checkout, then a deployed herdr-ops skill copy.
+for notify in \
+  "${HERDR_NOTIFY:-}" \
+  "$here/slack-bridge/herdr-notify.sh" \
+  "$HOME/.claude/skills/herdr-ops/scripts/slack-bridge/herdr-notify.sh"
+do
+  [ -n "$notify" ] && [ -f "$notify" ] && break
+done
+if [ -n "${notify:-}" ] && [ -f "$notify" ] && _still_bound; then
+  # --pane, not a cwd hint: unlike the Claude hook we already know exactly which
+  # pane asked, because we just confirmed the prompt on it. Passing the pane
+  # explicitly avoids herdr-notify having to disambiguate several panes sharing
+  # one repo cwd — a wrong guess there sends the operator's reply to a different
+  # agent.
+  #
+  # Gated the same way the conductor wake is (lib/alert-gate.sh, applied inside
+  # push_wake): an allow-class, unreserved prompt is one peer-answer.sh takes in
+  # seconds, and paging for it is what turned an afternoon of ordinary worker
+  # activity into a Slack flood on 2026-09-12. Held, never dropped — if the
+  # prompt outlives the grace window the alert is sent after all.
+  #
+  # Classified for lib/slack-level.sh (2026-09-26): neither send is an error by
+  # itself — the conductor is woken for both below — so at the default level
+  # both are suppressed and logged. What IS an error is a human-only prompt
+  # nobody resolved: that escalates as `human-stale` after HERDR_HUMAN_ALERT_S.
+  # A held prompt that stays stuck escalates from agent-edge.sh as `stuck`.
+  # At HERDR_SLACK_LEVEL=all no escalation timer is armed: the immediate post
+  # goes out, exactly as before. The timer is armed AFTER push_wake (above):
+  # grace_realert stands down for any input_required recorded after it was
+  # armed, and push_wake has already recorded THIS prompt's input_required.
+  # Timers key on the bound prompt id, never a fresh read.
+  . "$here/lib/slack-level.sh"
+  human_stale=0
+  if human_must_answer "$pane" "$full_cmd"; then
+    bash "$notify" --class needs-input --choices --pane "$pane" "$msg" >/dev/null 2>&1 || true
+    [ "$(slack_level)" = errors ] && human_stale=1
+  elif slack_should_send held; then
+    # Armed only when it could post (level `all`). At `errors` a held timer can
+    # only be suppressed, and it shares grace_realert's claim key with the
+    # conductor re-wake push_wake arms for the same prompt — winning that
+    # claim to post nothing cost the conductor its wake (PR #166 review).
+    grace_realert "$pane" "$_bound_pid" \
+      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+      bash "$notify" --class held --choices --pane "$pane" "$msg"
+  fi
 fi
 
 if [ "${human_stale:-0}" = 1 ]; then
   # Own claim namespace (lib/alert-gate.sh): a peer refusal or the conductor
   # re-wake takes grace_realert_*, and must not silence this ERROR post.
   HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" HERDR_GRACE_CLAIM_KIND=human_stale \
-  grace_realert "$pane" "$(prompt_id "$pane" 2>/dev/null || printf '')" \
+  grace_realert "$pane" "$_bound_pid" \
     "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
     bash "$notify" --class human-stale --choices --pane "$pane" \
     "$msg  ·  only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s"

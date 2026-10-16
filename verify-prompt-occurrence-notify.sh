@@ -265,6 +265,56 @@ run_notify ',"call_id":"call-16","native_session":"sess-16"'   # delayed old hoo
   && ok "delayed old hook with missing seen cannot attach its tool to the new panel" \
   || bad "old hook/new panel: tooled=$(tooled_rows) screen=$(screen_rows)"
 
+# -- notifier blocks; meanwhile old resolves, new seen, new panel ----------
+# The authoritative record is written before any notification under the
+# bound prompt id; nothing during/after the notifier may give the NEW prompt
+# the old hook's tool.
+keyhint_cmd_panel() {                   # <command>
+  printf '╭─ Allow tool: bash\n│ Command: %s\n├────────────────\n│ 󰘴 󰌑/󰘴 Q approve · 󱊷 deny\n╰────────────────\n' "$1"
+}
+pid_rows() {                            # <prompt_id> -> tooled input_required rows for it
+  sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    "SELECT count(*) FROM events WHERE type='input_required' AND json_extract(payload,'\$.tool')='bash' AND json_extract(payload,'\$.prompt_id')='$1';"
+}
+screen_pid() { ( . "$here/lib/pane-guard.sh"; . "$here/lib/prompt-parse.sh"; prompt_id "$WPANE" ); }
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+keyhint_cmd_panel "rm -rf /tmp/new-prompt" > "$WORK/new.txt"
+keyhint_cmd_panel "rm -rf /tmp/new-prompt" > "$WORKER_SCREEN"; NEW_PID="$(screen_pid)"
+keyhint_cmd_panel "rm -rf /tmp/old-prompt" > "$WORKER_SCREEN"; OLD_PID="$(screen_pid)"
+seen call-20 sess-20
+RACE_NOTIFY="$WORK/race-notify.sh"
+cat > "$RACE_NOTIFY" <<EOS
+#!/usr/bin/env bash
+echo called >> "$WORK/race-called"
+python3 "$here/lib/prompt-occurrence.py" declined --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-20 --call-id call-20 >/dev/null 2>&1
+python3 "$here/lib/prompt-occurrence.py" seen --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-20 --call-id call-21 --tool bash --source test >/dev/null 2>&1
+cp "$WORK/new.txt" "$WORKER_SCREEN"
+sleep 1
+EOS
+chmod +x "$RACE_NOTIFY"
+rm -f "$WORK/race-called"
+printf '{"tool":"bash","message":"m","cwd":"/tmp/repo","command":"rm -rf /tmp/old-prompt","call_id":"call-20","native_session":"sess-20"}' \
+  | ( export HERDR_PANE_ID="$WPANE" HERDR_RUN_ID="$RUN_ID" HERDR_TASK_ID="$TASK_ID" \
+             HERDR_NOTIFY="$RACE_NOTIFY" HERDR_CONDUCTOR_PANE_ID="" HERDR_SLACK_LEVEL=all HERDR_ALERT_GRACE_S=0
+      bash "$here/agent-hooks/omp-notify.sh" >"$WORK/n.out" 2>"$WORK/n.err" )
+sleep 1.5
+[ -n "$NEW_PID" ] && [ "$NEW_PID" != "$OLD_PID" ] && [ -f "$WORK/race-called" ] \
+  && [ "$(pid_rows "$NEW_PID")" = 0 ] && [ "$(pid_rows "$OLD_PID")" = 1 ] \
+  && ok "notifier-blocked race: old prompt keeps its row, new prompt gets no old tool row" \
+  || bad "notifier race: called=$([ -f "$WORK/race-called" ] && echo y || echo n) new=$(pid_rows "$NEW_PID") old=$(pid_rows "$OLD_PID")"
+
+# -- push_wake refuses when the screen is no longer the expected prompt -----
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+cp "$WORK/new.txt" "$WORKER_SCREEN"
+( export HERDR_PANE_ID="$WPANE" HERDR_RUN_ID="$RUN_ID" HERDR_TASK_ID="$TASK_ID" HERDR_CONDUCTOR_PANE_ID=""
+  . "$here/lib/pane-guard.sh"; . "$here/lib/prompt-parse.sh"; . "$here/lib/run-registry.sh"; . "$here/lib/push-wake.sh"
+  HERDR_EXPECT_PROMPT_ID="$OLD_PID" push_wake "m" "repo" "" bash record-only ) >/dev/null 2>&1
+[ "$(pid_rows "$NEW_PID")" = 0 ] && [ "$(pid_rows "$OLD_PID")" = 0 ] \
+  && ok "push_wake with a stale expected prompt id writes nothing" \
+  || bad "push_wake expect-id: new=$(pid_rows "$NEW_PID") old=$(pid_rows "$OLD_PID")"
+
 # -- absent panel (auto-approved) is NOT extended ---------------------------
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
 seen call-7 sess-7
