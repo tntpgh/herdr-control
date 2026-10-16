@@ -412,6 +412,16 @@ elapsed=$(( $(date +%s) - start ))
 [ "$(tooled_rows)" = 0 ] && [ "$elapsed" -ge 2 ] \
   && ok "same-session earlier live requested call still defers the later call (${elapsed}s), unchanged" \
   || bad "same-session live defer: tooled=$(tooled_rows) elapsed=${elapsed}s"
+# Positive control: once call-32 (the blocker) resolves, call-33 — the
+# SAME call this harness just reported blocked — binds. Proves the zero
+# above is a real defer, not a harness that always writes nothing.
+python3 "$here/lib/prompt-occurrence.py" completed --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-32 --call-id call-32 >/dev/null 2>&1
+keyhint_panel > "$WORKER_SCREEN"
+run_notify ',"call_id":"call-33","native_session":"sess-32"'
+[ "$(tooled_rows)" -ge 1 ] \
+  && ok "positive control: once the blocker resolves, the same deferred call-33 binds" \
+  || bad "positive control failed: call-33 never bound after call-32 resolved, tooled=$(tooled_rows)"
 
 # -- same-session: a never-resolved occurrence is DEAD once a LATER
 # occurrence in the same (pane,birth,session) has resolved — omp paints
