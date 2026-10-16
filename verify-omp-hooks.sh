@@ -16,6 +16,10 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export HERDR_RUN_STATE_DIR="$WORK/runs"
 export HERDR_BRIDGE_STATE="$WORK/bridge"
+# herdr-control: approval friction fix (2026-10-16). Every fixture here is a
+# STATIC screen; pin lib/push-wake.sh's new settle-retry (prompt_id_settled)
+# to 0 so it stays a single read, same speed/outcome as before the fix.
+export HERDR_PROMPT_SETTLE_WAIT_S=0
 # Pinned to HERDR_SLACK_LEVEL=all: this suite proves what a post CONTAINS and
 # how it is deduped, which is downstream of the errors-only level filter
 # (lib/slack-level.sh; its own cases are in verify-slack-symptoms.sh). The

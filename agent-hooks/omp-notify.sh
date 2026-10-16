@@ -492,6 +492,22 @@ else
     HERDR_DEFERRED_ANSWER_HINT="$_deferred_hint" push_wake "$msg" "$where" "$full_cmd" "$tool" record-only >/dev/null 2>&1
 fi
 _push_rc=$?
+# herdr-control: approval friction fix review finding 1 (HIGH). In the
+# exact race this patch exists to fix, push_wake's prompt_id_settled can
+# settle onto a DIFFERENT, LATER prompt than the one `_bound_pid` named
+# before the call (the panel genuinely repainted mid-call). push_wake
+# writes the input_required row under that new, correct id — but without
+# this refresh, `_bound_pid` here still names the OLD one, so
+# `_still_bound` (:401) falsely fails against the live (correctly
+# advanced) screen, silently skipping the Slack alert below (:518) for a
+# call that in fact succeeded, and the trace query just below queries by
+# the stale id and logs a false `push_attempted_no_tool_row`. Deferred
+# calls never settle against a screen (prompt_id_settled's screen-read
+# branch is skipped whenever HERDR_DEFERRED_PID is set, lib/push-wake.sh),
+# so PROMPT_SETTLE_PID there is just HERDR_DEFERRED_PID itself —
+# refreshing is a no-op, never read via `$(...)` (a subshell would lose
+# push_wake's global assignment entirely).
+[ "$deferred" != true ] && [ -n "${PROMPT_SETTLE_PID:-}" ] && _bound_pid="$PROMPT_SETTLE_PID"
 # push_wake's rc conflates "recorded, no wake" with "refused", so the trace
 # reports only what it can observe: whether the registry now holds THIS
 # prompt's row carrying THIS hook's tool (possibly from an earlier firing for

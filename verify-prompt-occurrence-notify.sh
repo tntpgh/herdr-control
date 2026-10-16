@@ -32,6 +32,15 @@ trap 'rm -rf "$WORK"' EXIT
 
 export HERDR_RUN_STATE_DIR="$WORK/runs"
 export HERDR_SLACK_LEVEL=all
+# herdr-control: approval friction fix (2026-10-16). lib/push-wake.sh's pid
+# capture now retries (prompt_id_settled, lib/prompt-parse.sh) so a
+# genuinely settling panel gets a second look before the write-time
+# corroboration gives up. Every fixture in this suite is a STATIC screen
+# (nothing changes between reads), so retrying can only add wall time, never
+# change an outcome -- pinned to 0 (single read, today's exact behavior)
+# everywhere except the dedicated settle-retry regression cases below, which
+# set it back explicitly.
+export HERDR_PROMPT_SETTLE_WAIT_S=0
 WORKER_SCREEN="$WORK/worker.txt"
 COND_SCREEN="$WORK/cond.txt"
 : > "$COND_SCREEN"
