@@ -594,5 +594,50 @@ case "$pid" in
 esac
 : > "$WORKER_SCREEN"
 
+# ---- integrated: the REAL hook → human-stale timer → notifier, two concurrent
+# deferred requests in one turn (review r5 HIGH + its sibling-supersession and
+# --choices-drop companions). Nothing painted; production Slack level.
+printf '\n== deferred integrated: two concurrent requests, human-stale per exact id ==\n'
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+: > "$WORKER_SCREEN"
+REC_NOTIFY="$WORK/rec-notify.sh"; REC_LOG="$WORK/rec-notify.log"; : > "$REC_LOG"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n' "$REC_LOG" > "$REC_NOTIFY"
+chmod +x "$REC_NOTIFY"
+fire_deferred() {   # <call_id> <session> <req> <digest>
+  printf '{"tool":"write","message":"omp needs your permission","cwd":"/tmp/repo"%s}' "$(deferred_json "$@")" \
+    | ( export HERDR_PANE_ID="$WPANE" HERDR_RUN_ID="$RUN_ID" HERDR_TASK_ID="$TASK_ID" \
+               HERDR_NOTIFY="$REC_NOTIFY" HERDR_CONDUCTOR_PANE_ID="" \
+               HERDR_SLACK_LEVEL=errors HERDR_HUMAN_ALERT_S=4
+        bash "$here/agent-hooks/omp-notify.sh" >/dev/null 2>&1 )
+}
+stale_posts() { grep -- '--class human-stale' "$REC_LOG" | grep -c -- "$1"; }
+seed_deferred call-i1 sess-i sess-req-i1 digest-i1
+seed_deferred call-i2 sess-i sess-req-i2 digest-i2
+seed_deferred call-i3 sess-i sess-req-i3 digest-i3
+fire_deferred call-i1 sess-i sess-req-i1 digest-i1
+fire_deferred call-i2 sess-i sess-req-i2 digest-i2
+fire_deferred call-i2 sess-i sess-req-i2 digest-i2   # duplicate hook firing, same request
+fire_deferred call-i3 sess-i sess-req-i3 digest-i3
+# Resolved before its timer: call-i3 is answered now, inside the 4s window.
+python3 "$here/lib/prompt-occurrence.py" authorized --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-i --call-id call-i3 \
+  --decided-by test --choice Approve >/dev/null 2>&1
+sleep 7
+[ "$(stale_posts sess-req-i1)" = 1 ] \
+  && ok "integrated: request 1 gets its own human-stale post although request 2 fired after it" \
+  || bad "integrated: request 1 human-stale posts=$(stale_posts sess-req-i1): $(cat "$REC_LOG")"
+[ "$(stale_posts sess-req-i2)" = 1 ] \
+  && ok "integrated: request 2 gets exactly one human-stale post despite a duplicate hook firing" \
+  || bad "integrated: request 2 human-stale posts=$(stale_posts sess-req-i2)"
+[ "$(stale_posts sess-req-i3)" = 0 ] \
+  && ok "integrated: a request resolved before its timer stands down (no post)" \
+  || bad "integrated: resolved request 3 still posted $(stale_posts sess-req-i3)"
+grep -- '--class human-stale' "$REC_LOG" | grep -q -- '--choices' \
+  && bad "integrated: a deferred human-stale post used --choices (droppable)" \
+  || ok "integrated: deferred human-stale posts never use --choices"
+grep -- '--class human-stale' "$REC_LOG" | grep -q -- 'herdr-select.sh' \
+  && ok "integrated: the human-stale post carries the exact-id answer command" \
+  || bad "integrated: human-stale post lacks the answer hint: $(cat "$REC_LOG")"
+
 printf -- '-----\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
