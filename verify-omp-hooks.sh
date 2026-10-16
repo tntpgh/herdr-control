@@ -749,6 +749,17 @@ df_ev() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
   || bad "deferred wake HELD (grace_realert cannot see a deferred prompt)"
 [ "$(df_ev wake_attempted)" = 1 ] && ok "the deferred wake was delivered immediately" \
   || bad "deferred wake_attempted: $(df_ev wake_attempted)"
+# Review r2 HIGH: the hook that LOSES attn_track_claim calls push_wake in
+# record-only mode, whose backstop is the same screen-only grace_realert. A
+# second deferred occurrence on the same pane (distinct pid) must still get
+# its own immediate wake.
+( . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+  HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" HERDR_RUN_ID=runDF HERDR_TASK_ID=taskDF \
+  HERDR_TASK_LABEL="impl:deferred" HERDR_ALERT_GRACE_S=60 HERDR_DEFERRED_PID="deferred:req-df-2" \
+    push_wake "impl:deferred needs input" "hook" "git fetch origin --prune" "bash" record-only >/dev/null 2>&1 )
+[ "$(df_ev wake_attempted)" = 2 ] && ok "a losing (record-only) deferred occurrence still gets its own wake" \
+  || bad "record-only deferred wake_attempted total: $(df_ev wake_attempted) (expected 2)"
+[ "$(df_ev wake_held)" = 0 ] && ok "and is never held" || bad "record-only deferred wake HELD"
 # The human-stale ERROR timer keeps its own claim namespace, so a release or a
 # re-wake that took grace_realert_* for this prompt can never silence it.
 hs_trace="$WORK/hs-trace.log"; : > "$hs_trace"

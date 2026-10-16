@@ -272,7 +272,11 @@ push_wake() {
               AND json_extract(payload,'\$.recorded_by')='attention-controller';" >/dev/null 2>&1 || true
     fi
   fi
-  if [ "$mode" = record-only ]; then
+  # A deferred firing never takes the record-only path: its backstop below
+  # re-checks the screen, which a panel-less deferred prompt never paints, so
+  # it would stand down silently. Its pid is per-occurrence, so it falls
+  # through to its own immediate wake instead (review r2 HIGH).
+  if [ "$mode" = record-only ] && [ -z "${HERDR_DEFERRED_PID:-}" ]; then
     # Defect 2 (herdr-control fix/notify-binding-concurrent SPEC.md): the
     # owner of this prompt's wake (an earlier hook firing, or
     # attention-tick.sh's one chance per key, lib/attention-key.sh
