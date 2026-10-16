@@ -906,6 +906,54 @@ def proposal_check(db_path: str, *, run_id: str, task_id: str, pane_id: str, pan
     }
 
 
+def resolve_exact_pending(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
+                          tool: str = "", screen_prompt_id: str = "") -> dict:
+    """herdr-control security review Finding 1: the automated (non-human)
+    write/edit approval gate must select which occurrence to authorize by
+    its OWN OMP v1 request id, recorded at `seen` time, never by matching
+    the painted screen's prompt id -- a screen-id-only lookup can credit an
+    unreviewed occurrence's payload to a DIFFERENT, still-live painted
+    panel (e.g. one whose own screen write never landed). This returns the
+    one occurrence the automated gate may hand to proposal_check's
+    bound_lookup branch; it never itself verifies the payload -- that
+    re-check still runs, keyed to the exact ids returned here.
+
+    screen_prompt_id, if given, is only a CROSS-CHECK: the screen-correlated
+    lookup (same matching proposal_check's non-bound branch uses) must
+    either find nothing, or agree with the exact occurrence found here.
+    Disagreement, or more than one pending bound write/edit occurrence in
+    this pane's scope, refuses -- there is no safe default to guess with."""
+    def no(reason: str) -> dict:
+        return {"ok": False, "reason": reason}
+
+    folded = fold_task(db_path, run_id, task_id)
+    if not isinstance(folded, dict) or "error" in folded:
+        return no(f"occurrence registry unreadable: {folded.get('error') if isinstance(folded, dict) else folded}")
+    bound = [r for r in folded.values()
+             if r.get("pane_id") == pane_id
+             and (not pane_birth or r.get("pane_birth") == pane_birth)
+             and r.get("lifecycle") == "requested"
+             and str(r.get("tool") or "").lower() in PROPOSAL_TOOLS
+             and (not tool or str(r.get("tool") or "").lower() == tool.lower())
+             and r.get("binding_protocol") == "omp.tool-approval-binding.v1"
+             and r.get("approval_request_id")]
+    if not bound:
+        return no("no bound write/edit occurrence is pending for this pane -- exact resolution unavailable")
+    if len(bound) != 1:
+        return no("more than one pending bound write/edit occurrence in this pane -- ambiguous, refusing")
+    rec = bound[0]
+    if screen_prompt_id:
+        screen_matches = [r for r in folded.values()
+                          if r.get("pane_id") == pane_id and r.get("screen_prompt_id") == screen_prompt_id]
+        if len(screen_matches) > 1:
+            return no("more than one occurrence claims the prompt on screen -- ambiguous, refusing")
+        if screen_matches and screen_matches[0].get("occ_key") != rec.get("occ_key"):
+            return no("the screen-correlated occurrence disagrees with the exact bound occurrence -- refusing")
+    return {"ok": True, "occ_key": rec["occ_key"], "approval_request_id": rec.get("approval_request_id"),
+            "core_arguments_digest": rec.get("core_arguments_digest"), "tool_call_id": rec.get("tool_call_id"),
+            "tool": rec.get("tool")}
+
+
 def _format_show(out: dict) -> str:
     if not out.get("ok"):
         return f"REFUSED: {out.get('reason')}\n"
@@ -987,6 +1035,15 @@ def main(argv: list[str]) -> int:
     s.add_argument("--expect-arguments-digest", default="")
     s.add_argument("--expect-tool-call-id", default="")
     s.add_argument("--show", action="store_true")
+
+    s = sub.add_parser("pending-bound")
+    s.add_argument("--db", required=True)
+    s.add_argument("--run", dest="run_id", required=True)
+    s.add_argument("--task", dest="task_id", required=True)
+    s.add_argument("--pane", dest="pane_id", required=True)
+    s.add_argument("--birth", dest="pane_birth", default="")
+    s.add_argument("--tool", default="")
+    s.add_argument("--prompt-id", dest="screen_prompt_id", default="")
 
     s = sub.add_parser("fold")
     s.add_argument("--db", required=True)
@@ -1070,6 +1127,10 @@ def main(argv: list[str]) -> int:
             if args.show:
                 sys.stdout.write(_format_show(out))
                 return 0
+        elif args.cmd == "pending-bound":
+            out = resolve_exact_pending(args.db, run_id=args.run_id, task_id=args.task_id,
+                                        pane_id=args.pane_id, pane_birth=args.pane_birth,
+                                        tool=args.tool, screen_prompt_id=args.screen_prompt_id)
         elif args.cmd == "state":
             out = occurrence_state(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
                                     pane_birth=args.pane_birth, native_session=args.native_session,

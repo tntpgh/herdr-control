@@ -790,23 +790,50 @@ fi
 # (lib/prompt-occurrence.py `proposal --show` is the reviewer's view) and
 # the refusal is audited by header + sha256 only (raw input stays in the
 # proposal file, never in the shared events table or a wake).
-payload_bound=0; payload_json=""; bound_resolution=0
+payload_bound=0; payload_json=""; bound_resolution=0; exact_json=""
 if [ "$authority" != human ] && [ "$omp_panel" = 1 ] && [ "$declining" = 0 ]; then
   case "$registry_tool_lc:${panel_tool:-}" in
     write:*|edit:*|*:write|*:edit)
       show_cmd="(no registered task/prompt: no recorded payload to show)"
       if [ -n "$own_run" ] && [ -n "$own_task" ] && [ -n "$own_worktree" ] && [ -n "$current_prompt_id" ] && [ -n "${occ_py:-}" ]; then
+        own_birth_for_bound="$(printf '%s' "$own_task_json" | jq -r '.pane_birth // empty' 2>/dev/null)"
+        # The ordinary (screen-correlated) complete-payload check: used ONLY
+        # for the human-reviewer audit text/show command below -- it never
+        # by itself grants automated authorization (#277), bound or not.
         payload_json="$("$occ_py" "$here/lib/prompt-occurrence.py" proposal --db "$(registry_db)" \
-          --run "$own_run" --task "$own_task" --pane "$pane" \
-          --birth "$(printf '%s' "$own_task_json" | jq -r '.pane_birth // empty' 2>/dev/null)" \
+          --run "$own_run" --task "$own_task" --pane "$pane" --birth "$own_birth_for_bound" \
           --prompt-id "$current_prompt_id" --worktree "$own_worktree" --tool "$registry_tool_lc" 2>/dev/null)"
         [ "$(printf '%s' "$payload_json" | jq -r '.ok == true' 2>/dev/null)" = true ] && payload_bound=1
         show_cmd="$here/lib/prompt-occurrence.py proposal --db $(registry_db) --run $own_run --task $own_task --pane $pane --prompt-id $current_prompt_id --worktree $own_worktree --show"
+
+        # herdr-control security review Finding 1: AUTOMATED AUTHORIZATION
+        # must resolve the occurrence by its OWN OMP v1 request id, recorded
+        # at `seen` time, never by matching the painted screen's prompt id
+        # (the check above) -- a screen-id lookup can credit a stale/never-
+        # screen-written occurrence's unreviewed payload to a DIFFERENT,
+        # still-live painted panel. The screen id is passed only as a
+        # CROSS-CHECK: pending-bound refuses if it disagrees with the exact
+        # occurrence, or if more than one pending bound write/edit
+        # occurrence in this pane could own it.
+        pending_json="$("$occ_py" "$here/lib/prompt-occurrence.py" pending-bound --db "$(registry_db)" \
+          --run "$own_run" --task "$own_task" --pane "$pane" --birth "$own_birth_for_bound" \
+          --tool "$registry_tool_lc" --prompt-id "$current_prompt_id" 2>/dev/null)"
+        if [ "$(printf '%s' "$pending_json" | jq -r '.ok == true' 2>/dev/null)" = true ]; then
+          _pending_request="$(printf '%s' "$pending_json" | jq -r '.approval_request_id // empty')"
+          _pending_digest="$(printf '%s' "$pending_json" | jq -r '.core_arguments_digest // empty')"
+          _pending_call="$(printf '%s' "$pending_json" | jq -r '.tool_call_id // empty')"
+          exact_json="$("$occ_py" "$here/lib/prompt-occurrence.py" proposal --db "$(registry_db)" \
+            --run "$own_run" --task "$own_task" --pane "$pane" --birth "$own_birth_for_bound" \
+            --worktree "$own_worktree" --tool "$registry_tool_lc" \
+            --approval-request-id "$_pending_request" \
+            --expect-arguments-digest "$_pending_digest" \
+            --expect-tool-call-id "$_pending_call" 2>/dev/null)"
+        fi
       fi
-      _bound_request="$(printf '%s' "$payload_json" | jq -r '.approval_request_id // empty' 2>/dev/null)"
-      _bound_digest="$(printf '%s' "$payload_json" | jq -r '.core_arguments_digest // empty' 2>/dev/null)"
-      _bound_protocol="$(printf '%s' "$payload_json" | jq -r '.binding_protocol // empty' 2>/dev/null)"
-      if [ "$payload_bound" = 1 ] && [ "$_bound_protocol" = "omp.tool-approval-binding.v1" ] && [ -n "$_bound_request" ] && printf '%s' "$_bound_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+      _bound_request="$(printf '%s' "$exact_json" | jq -r '.approval_request_id // empty' 2>/dev/null)"
+      _bound_digest="$(printf '%s' "$exact_json" | jq -r '.core_arguments_digest // empty' 2>/dev/null)"
+      _bound_protocol="$(printf '%s' "$exact_json" | jq -r '.binding_protocol // empty' 2>/dev/null)"
+      if [ "$(printf '%s' "$exact_json" | jq -r '.ok == true' 2>/dev/null)" = true ] && [ "$_bound_protocol" = "omp.tool-approval-binding.v1" ] && [ -n "$_bound_request" ] && printf '%s' "$_bound_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
         bound_resolution=1
       else
         echo "herdr-select: write/edit approvals are human-only (exact OMP approval binding unavailable) — refusing." >&2
@@ -1149,19 +1176,23 @@ _require_current_decision() {
 _require_current_decision || exit 6
 
 if [ "$bound_resolution" = 1 ]; then
-  _payload_sha="$(printf '%s' "$payload_json" | jq -r '.payload_sha256 // empty')"
+  _payload_sha="$(printf '%s' "$exact_json" | jq -r '.payload_sha256 // empty')"
+  _occ_session="$(printf '%s' "$exact_json" | jq -r '.native_session // empty')"
+  _occ_call="$(printf '%s' "$exact_json" | jq -r '.tool_call_id // empty')"
+  _occ_birth="$(printf '%s' "$exact_json" | jq -r '.pane_birth // empty')"
+  # Re-verify through the SAME exact-request-id bound_lookup used above, not
+  # the screen-correlated branch -- the re-check immediately before the
+  # durable decision must resolve the identical occurrence by its own OMP
+  # request id (herdr-control security review Finding 1).
   _rechecked="$($occ_py "$here/lib/prompt-occurrence.py" proposal --db "$(registry_db)" \
-    --run "$own_run" --task "$own_task" --pane "$pane" \
-    --birth "$(printf '%s' "$own_task_json" | jq -r '.pane_birth // empty')" \
-    --prompt-id "$current_prompt_id" --worktree "$own_worktree" --tool "$registry_tool_lc" \
-    --expect-sha "$_payload_sha" 2>/dev/null)"
+    --run "$own_run" --task "$own_task" --pane "$pane" --birth "$_occ_birth" \
+    --worktree "$own_worktree" --tool "$registry_tool_lc" \
+    --approval-request-id "$_bound_request" --expect-arguments-digest "$_bound_digest" \
+    --expect-tool-call-id "$_occ_call" --expect-sha "$_payload_sha" 2>/dev/null)"
   [ "$(printf '%s' "$_rechecked" | jq -r '.ok == true' 2>/dev/null)" = true ] || {
     echo "herdr-select: exact approval payload changed during review — refusing." >&2
     exit 6
   }
-  _occ_session="$(printf '%s' "$payload_json" | jq -r '.native_session // empty')"
-  _occ_call="$(printf '%s' "$payload_json" | jq -r '.tool_call_id // empty')"
-  _occ_birth="$(printf '%s' "$payload_json" | jq -r '.pane_birth // empty')"
   [ -n "$_occ_session" ] && [ -n "$_occ_call" ] && [ -n "$_occ_birth" ] || {
     echo "herdr-select: exact approval occurrence identity is incomplete — refusing." >&2
     exit 6
