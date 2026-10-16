@@ -126,15 +126,16 @@ fi
 # reconciliation paths rather than attaching this hook's tool to it.
 _occ_still_ours() {
   local live st key latest lc
-  _occ_missing=0
+  _occ_missing=0; _occ_why=birth
   if [ -n "${_occ_pane_birth:-}" ]; then
     live="$(pane_birth_now "$pane" 2>/dev/null)" || return 1
     [ "$live" = "$_occ_pane_birth" ] || return 1
   fi
   st="$("$_occ_py" "$here/lib/prompt-occurrence.py" state --db "$(registry_db)" \
     --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" --pane "$pane" --birth "${_occ_pane_birth:-}" \
-    --session "$native_session" --call-id "$call_id" 2>/dev/null)" || return 1
+    --session "$native_session" --call-id "$call_id" 2>/dev/null)" || { _occ_why=state_failed; return 1; }
   lc="$(printf '%s' "$st" | jq -r '.lifecycle // ""' 2>/dev/null)"
+  _occ_why="lifecycle:${lc:-empty}"
   # No seen of our own at all: unbound for lack of evidence, not superseded.
   [ "$lc" = unknown ] && [ "$(printf '%s' "$st" | jq -r '.authorization // "none"' 2>/dev/null)" = none ] \
     && [ -z "$(printf '%s' "$st" | jq -r '.unresolved_reason // ""' 2>/dev/null)" ] && _occ_missing=1
@@ -144,7 +145,25 @@ _occ_still_ours() {
   latest="$(_sql "SELECT json_extract(payload,'\$.occ_key') FROM events
      WHERE task_id=$(_sq "$HERDR_TASK_ID") AND type='prompt_occ_seen'
      ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
-  [ -n "$key" ] && [ "$key" = "$latest" ]
+  _occ_why=latest
+  [ -n "$key" ] && [ "$key" = "$latest" ] && _occ_why=bound
+}
+
+# Decision trace for this firing: which branch ended it, and why the binding
+# held or failed. Identifiers and booleans only — no screen text, command or
+# tool input — so a probe that ends without provenance is diagnosable from
+# the registry instead of guessed (live w7S:p7 00:45Z/01:00Z both ended ~2s
+# in with no recorded reason).
+_probe_firing="$$_$(date +%s)"       # per-firing, non-secret; call/task carry the correlation
+_probe_trace() {                        # <outcome> [push_rc] [mode]
+  [ "$_has_occ" = 1 ] || return 0
+  append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "notify_probe_outcome" \
+    "$(jq -nc --arg o "$1" --arg rc "${2:-}" --arg md "${3:-}" --arg c "$call_id" --arg fi "$_probe_firing" \
+        --arg f "$found" --arg s "$_superseded" \
+        --arg m "${_occ_missing:-}" --arg w "${_occ_why:-}" --arg e "${_entry_why:-}" --argjson t "$SECONDS" \
+        '{outcome:$o, push_rc:$rc, push_mode:$md, tool_call_id:$c, firing:$fi, found:$f, superseded:$s,
+          missing:$m, last_binding:$w, entry_binding:$e, elapsed_s:$t}')" \
+    "notify_probe_${HERDR_TASK_ID}_${call_id}_${_probe_firing}" >/dev/null 2>&1 || true
 }
 
 # The approval panel has not parsed yet: keep probing until the total budget,
@@ -162,7 +181,8 @@ _superseded=0
 # Unbound at entry (no seen of our own): nothing to wait for — skip, record
 # the screen as before, write no provenance. Bound then lost: superseded.
 if [ "$found" = 0 ] && [ "$_has_occ" = 1 ]; then
-  if ! _occ_still_ours; then
+  _occ_still_ours; _entry_rc=$?; _entry_why="$_occ_why"
+  if [ "$_entry_rc" != 0 ]; then
     [ "$_occ_missing" = 1 ] || _superseded=1
   else
     while [ "$SECONDS" -lt "$_budget" ]; do
@@ -214,7 +234,7 @@ if [ "$_has_occ" = 1 ] && [ "$_superseded" = 0 ]; then
     >/dev/null 2>&1 || true
 fi
 
-[ "$found" = 1 ] || exit 0
+if [ "$found" != 1 ]; then _probe_trace no_provenance; exit 0; fi
 
 where="${cwd##*/}"
 [ -n "$where" ] && msg="$msg  ·  ${where}"
@@ -249,11 +269,25 @@ where="${cwd##*/}"
 # refuses every answer to it (live 2026-09-29, 5 of 68 prompts). Record-only
 # writes/replaces the row and sends no second wake.
 . "$here/lib/attention-key.sh"
-_still_bound || exit 0
-if attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$_bound_pid"; then
-  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" >/dev/null 2>&1 || true
+_still_bound || { _probe_trace unbound_before_push; exit 0; }
+_push_mode=wake
+attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$_bound_pid" || _push_mode=record-only
+if [ "$_push_mode" = wake ]; then
+  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" >/dev/null 2>&1
 else
-  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" record-only >/dev/null 2>&1 || true
+  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" record-only >/dev/null 2>&1
+fi
+_push_rc=$?
+# push_wake's rc conflates "recorded, no wake" with "refused", so the trace
+# reports only what it can observe: whether the registry now holds THIS
+# prompt's row carrying THIS hook's tool (possibly from an earlier firing for
+# the same call) — never that this firing wrote it.
+if [ -n "$tool" ] && [ "$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq "$HERDR_TASK_ID")
+     AND type='input_required' AND json_extract(payload,'\$.prompt_id')=$(_sq "$_bound_pid")
+     AND json_extract(payload,'\$.tool')=$(_sq "$tool");" 2>/dev/null)" -ge 1 ] 2>/dev/null; then
+  _probe_trace push_attempted_tool_row_present "$_push_rc" "$_push_mode"
+else
+  _probe_trace push_attempted_no_tool_row "$_push_rc" "$_push_mode"
 fi
 
 # ---- outbound Slack alert ---------------------------------------------------
