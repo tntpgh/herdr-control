@@ -154,13 +154,16 @@ _occ_still_ours() {
 # tool input — so a probe that ends without provenance is diagnosable from
 # the registry instead of guessed (live w7S:p7 00:45Z/01:00Z both ended ~2s
 # in with no recorded reason).
-_probe_trace() {                        # <outcome>
+_probe_firing="$$_$(date +%s)"       # per-firing, non-secret; call/task carry the correlation
+_probe_trace() {                        # <outcome> [push_rc] [mode]
   [ "$_has_occ" = 1 ] || return 0
   append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "notify_probe_outcome" \
-    "$(jq -nc --arg o "$1" --arg c "$call_id" --arg f "$found" --arg s "$_superseded" \
+    "$(jq -nc --arg o "$1" --arg rc "${2:-}" --arg md "${3:-}" --arg c "$call_id" --arg fi "$_probe_firing" \
+        --arg f "$found" --arg s "$_superseded" \
         --arg m "${_occ_missing:-}" --arg w "${_occ_why:-}" --arg e "${_entry_why:-}" --argjson t "$SECONDS" \
-        '{outcome:$o, tool_call_id:$c, found:$f, superseded:$s, missing:$m, last_binding:$w, entry_binding:$e, elapsed_s:$t}')" \
-    "notify_probe_${HERDR_TASK_ID}_${call_id}" >/dev/null 2>&1 || true
+        '{outcome:$o, push_rc:$rc, push_mode:$md, tool_call_id:$c, firing:$fi, found:$f, superseded:$s,
+          missing:$m, last_binding:$w, entry_binding:$e, elapsed_s:$t}')" \
+    "notify_probe_${HERDR_TASK_ID}_${call_id}_${_probe_firing}" >/dev/null 2>&1 || true
 }
 
 # The approval panel has not parsed yet: keep probing until the total budget,
@@ -267,12 +270,25 @@ where="${cwd##*/}"
 # writes/replaces the row and sends no second wake.
 . "$here/lib/attention-key.sh"
 _still_bound || { _probe_trace unbound_before_push; exit 0; }
-if attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$_bound_pid"; then
-  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" >/dev/null 2>&1 || true
+_push_mode=wake
+attn_track_claim "$pane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" "$_bound_pid" || _push_mode=record-only
+if [ "$_push_mode" = wake ]; then
+  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" >/dev/null 2>&1
 else
-  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" record-only >/dev/null 2>&1 || true
+  HERDR_EXPECT_PROMPT_ID="$_bound_pid" push_wake "$msg" "$where" "$full_cmd" "$tool" record-only >/dev/null 2>&1
 fi
-_probe_trace pushed
+_push_rc=$?
+# push_wake's rc conflates "recorded, no wake" with "refused", so the trace
+# reports only what it can observe: whether the registry now holds THIS
+# prompt's row carrying THIS hook's tool (possibly from an earlier firing for
+# the same call) — never that this firing wrote it.
+if [ -n "$tool" ] && [ "$(_sql "SELECT count(*) FROM events WHERE task_id=$(_sq "$HERDR_TASK_ID")
+     AND type='input_required' AND json_extract(payload,'\$.prompt_id')=$(_sq "$_bound_pid")
+     AND json_extract(payload,'\$.tool')=$(_sq "$tool");" 2>/dev/null)" -ge 1 ] 2>/dev/null; then
+  _probe_trace push_attempted_tool_row_present "$_push_rc" "$_push_mode"
+else
+  _probe_trace push_attempted_no_tool_row "$_push_rc" "$_push_mode"
+fi
 
 # ---- outbound Slack alert ---------------------------------------------------
 # Same resolution order as claude-notify.sh so a packaged (APM) install and a

@@ -56,6 +56,13 @@ if [ "$1 $2" = "pane read" ]; then
   if [ -n "${FAIL_MARKER:-}" ] && [ -f "$FAIL_MARKER" ]; then
     exit 7
   fi
+  # SWITCH_ON_CLAIM: once the hook has taken its attention claim (the step
+  # right before push_wake), serve the replacement screen — a deterministic
+  # "screen changed between the final guard and push_wake's own read".
+  if [ -n "${SWITCH_ON_CLAIM:-}" ] && [ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+       "SELECT count(*) FROM events WHERE type='attention_tracking';" 2>/dev/null)" -gt 0 ] 2>/dev/null; then
+    cat "$SWITCH_ON_CLAIM"; exit 0
+  fi
   cat "${WORKER_SCREEN:?}"
   exit 0
 fi
@@ -347,9 +354,23 @@ sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
 seen call-23 sess-23
 keyhint_panel > "$WORKER_SCREEN"
 run_notify ',"call_id":"call-23","native_session":"sess-23"'
-[ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT json_extract(payload,'\$.outcome') FROM events WHERE type='notify_probe_outcome';")" = pushed ] \
-  && ok "a provenance write is traced as pushed" \
-  || bad "pushed trace missing"
+outc() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT json_extract(payload,'\$.outcome') FROM events WHERE type='notify_probe_outcome' ORDER BY sequence;"; }
+[ "$(outc)" = push_attempted_tool_row_present ] \
+  && ok "a provenance write is traced as attempted with the tool row observed" \
+  || bad "push trace: $(outc)"
+run_notify ',"call_id":"call-23","native_session":"sess-23"'
+[ "$(outc | wc -l | tr -d ' ')" = 2 ] \
+  && ok "a repeat firing for the same call keeps its own trace row" \
+  || bad "repeat firing traces: $(outc | tr '\n' ,)"
+
+# -- expected-id mismatch at push time: refused, traced truthfully -----------
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-24 sess-24
+keyhint_cmd_panel "rm -rf /tmp/old-prompt" > "$WORKER_SCREEN"
+SWITCH_ON_CLAIM="$WORK/new.txt" run_notify ',"call_id":"call-24","native_session":"sess-24"'
+[ "$(pid_rows "$NEW_PID")" = 0 ] && [ "$(pid_rows "$OLD_PID")" = 0 ] && [ "$(outc)" = push_attempted_no_tool_row ] \
+  && ok "screen switching before push_wake's read: nothing written, trace says no tool row" \
+  || bad "expect-id mismatch: new=$(pid_rows "$NEW_PID") old=$(pid_rows "$OLD_PID") trace=$(outc)"
 
 printf -- '-----\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
