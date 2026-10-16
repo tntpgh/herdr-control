@@ -1287,7 +1287,7 @@ const ret = handlers["tool_approval_requested"]({
   toolName: "write", toolCallId: "call-e2e-1", sessionId: "session-e2e-1",
   requestId: "request-e2e-1", bindingProtocol: "omp.tool-approval-binding.v1",
   argumentsJson: json, argumentsDigest: "sha256:" + Bun.SHA256.hash(json, "hex"), exclusiveResolver: true,
-}, { resolveToolApproval: r => { resolutions.push(r); return true; } });
+}, { resolveToolApproval: r => { resolutions.push(r); return true; }, sessionManager: { getSessionId: () => "session-e2e-1" } });
 console.log("E2E_RETURN:" + JSON.stringify(ret));
 // Let persistence land and the first (immediate) poll tick observe "requested".
 await new Promise(r => setTimeout(r, 1200));
@@ -1302,7 +1302,7 @@ const approve = Bun.spawnSync(["python3", process.env.E2E_PY, "authorize-bound",
   "--approval-request-id", seenRow.approval_request_id, "--core-arguments-digest", seenRow.core_arguments_digest,
   "--worktree", process.env.E2E_WT, "--conductor-pane", process.env.E2E_CPANE,
   "--conductor-birth", process.env.E2E_CBIRTH, "--approval-id", "approval-e2e-1",
-  "--choice", "1", "--authority", "conductor", "--decided-by", "test-conductor",
+  "--choice", "Approve", "--authority", "conductor", "--decided-by", "test-conductor",
   "--review-reason", "e2e test", "--review-category", "branch-work", "--reviewer", "test",
   "--audit-text", "e2e authorize-bound", "--expect-payload-sha", seenRow.payload_sha256]);
 console.log("E2E_AUTHORIZE:" + approve.stdout.toString().trim() + approve.stderr.toString().trim());
