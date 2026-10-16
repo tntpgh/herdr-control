@@ -607,7 +607,9 @@ _pw_wake_fail_realert() {
             AND json_extract(payload,'\$.outcome')='submitted';" 2>/dev/null)"
       [ "${landed:-0}" = 0 ] || { _ag_out=conductor_reached; exit 0; }
     fi
-    prompt_menu_visible "$pane" 2>/dev/null || [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || exit 0
+    # A deferred prompt never paints a panel, so the screen can't confirm it is
+    # still open; the blocked-task and no-landed-attempt checks above decide.
+    [ -n "${HERDR_DEFERRED_PID:-}" ] || prompt_menu_visible "$pane" 2>/dev/null || [ -n "$(prompt_options "$pane" 2>/dev/null)" ] || exit 0
     local notify
     for notify in "${HERDR_NOTIFY:-}" "$_pw_dir/slack-bridge/herdr-notify.sh" \
                   "$HOME/.claude/skills/herdr-ops/scripts/slack-bridge/herdr-notify.sh"; do

@@ -2123,6 +2123,19 @@ i=0; while [ "$i" -lt 100 ] && ! grep -q '^done wakefail ' "$f7_trace"; do sleep
 grep -q "^done wakefail $f7_pid2 conductor_reached$" "$f7_trace" && ! grep -q 'wake-fail' "$NOTIFIED" \
   && ok "no wake-fail page when an attempt for the same prompt was submitted" \
   || bad "wake-fail timer: $(cat "$f7_trace"); notified: $(cat "$NOTIFIED")"
+# Review r3 HIGH: a deferred prompt paints no panel, so the wake-fail backstop
+# must not use the screen to decide it was answered. Blocked task, no landed
+# attempt for this deferred pid, clean screen -> it still pages.
+set_task_state runF7 taskF7 blocked >/dev/null 2>&1
+clean_screen > "$WORKER_SCREEN"
+: > "$NOTIFIED"; : > "$f7_trace"
+( export HERDR_ALERT_TRACE="$f7_trace" HERDR_WAKE_FAIL_ALERT_S=1 HERDR_DEFERRED_PID="deferred:req-wf-1"
+  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+  _pw_wake_fail_realert "$WPANE" "deferred:req-wf-1" runF7 taskF7 unsubmitted )
+i=0; while [ "$i" -lt 100 ] && ! grep -q '^done wakefail ' "$f7_trace"; do sleep 0.1; i=$((i + 1)); done
+grep -q "^done wakefail deferred:req-wf-1 fired$" "$f7_trace" && grep -q 'wake-fail' "$NOTIFIED" \
+  && ok "a failed wake for a deferred (panel-less) prompt still pages" \
+  || bad "deferred wake-fail stood down: $(cat "$f7_trace"); notified: $(cat "$NOTIFIED")"
 set_task_state runF7 taskF7 completed no-follow-on >/dev/null 2>&1
 clean_screen > "$WORKER_SCREEN"
 
