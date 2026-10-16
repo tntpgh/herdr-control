@@ -1388,6 +1388,123 @@ prompt_id_of() {
     | shasum -a 256 | cut -d' ' -f1
 }
 
+# _pp_clamp_settle_seconds <raw> -> a sane HERDR_PROMPT_SETTLE_WAIT_S: default
+# 2, clamped to 0..6. Same non-numeric-falls-back-to-default shape as
+# lib/scoped-policy.sh _sp_clamp_wait_seconds, smaller ceiling because this
+# runs inside a detached approval hook (agent-hooks/omp-notify.sh ->
+# lib/push-wake.sh), not a human's interactive keypress.
+_pp_clamp_settle_seconds() {
+  local raw="${1:-}"
+  if ! [[ "$raw" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    printf '2\n'; return 0
+  fi
+  awk -v v="$raw" 'BEGIN{ if (v < 0) v = 0; if (v > 6) v = 6; printf "%s\n", v }'
+}
+
+# prompt_id_settled <pane_id> [full_cmd] -> a prompt_id read from a screen
+# snapshot that actually corroborates full_cmd, not whichever snapshot
+# happened to be on screen the instant the caller asked.
+#
+# herdr-control: approval friction fix (2026-10-16). lib/push-wake.sh used
+# to call prompt_id() once: a worker's SECOND queued tool call fires its
+# approval hook while omp still has the FIRST call's panel painted (omp
+# paints one panel at a time, oldest first), and a command long enough to
+# overflow one panel line can leave the strict parser transiently unable
+# to resolve an identity while the terminal finishes wrapping it. Either
+# way, a single read fingerprints the WRONG (or no) prompt; the
+# input_required row then gets written keyed to that wrong/empty id, and
+# herdr-select.sh's later lookup against the real, settled prompt_id
+# (lib/run-registry.sh task_input_required_tool) never finds it — refused
+# as "hook recorded <none>" (herdr-select.sh:811-813). Measured
+# 2026-10-16: 40 "overflowed one panel line" + 10 "parallel calls/no hook
+# record" administrative cancels in one day in
+# ~/.config/herdr-bridge/selections.jsonl.
+#
+# Retries up to HERDR_PROMPT_SETTLE_WAIT_S (default 2, clamped 0..6,
+# ~0.25s steps — same shape as lib/scoped-policy.sh
+# wait_for_input_required_row, write side instead of read side) until a
+# non-empty prompt_id is read and, when full_cmd is given and
+# lib/scoped-policy.sh's approval_command_text is loaded, the SAME
+# snapshot's Command:/run: region corroborates it. Exhausting the budget
+# still prints whatever the LAST read produced — never worse than the
+# single-shot read it replaces, since that was already this function's
+# first iteration; never a new refusal path, only a second (and third,
+# ...) chance to find the real one before giving up exactly as before.
+#
+# Sets the globals PROMPT_SETTLE_PID (the prompt_id to use) and
+# PROMPT_SETTLE_OK (1 when settled/corroborated, or there was nothing to
+# corroborate against; 0 when the budget ran out still mismatched) — same
+# global-side-channel convention as corroboration_candidates's
+# CC_PANEL/CC_WRAPJOIN above, and for the same reason: a caller that
+# captured this function's pid via `$(...)` command substitution would run
+# it in a SUBSHELL, where a plain `PROMPT_SETTLE_OK=1` assignment vanishes
+# the instant the subshell exits — the caller must call this function
+# directly, never through `$(...)`.
+#
+# HERDR_PROMPT_SETTLE_TRACE is a TEST SEAM (unset in every real
+# deployment): names a file to append "poll N" / "settled" / "timeout" to,
+# so a test can synchronize on it instead of guessing a sleep.
+prompt_id_settled() {
+  local pane="$1" full_cmd="${2:-}" seed_pid="${3:-}"
+  local wait_s step=0.25 elapsed=0 poll=0 pid ok panel_now
+  wait_s="$(_pp_clamp_settle_seconds "${HERDR_PROMPT_SETTLE_WAIT_S:-}")"
+  while :; do
+    poll=$((poll + 1))
+    [ -n "${HERDR_PROMPT_SETTLE_TRACE:-}" ] && printf 'poll %s\n' "$poll" >> "$HERDR_PROMPT_SETTLE_TRACE"
+    # The caller's own quick gate read (push-wake.sh's EXPECT_PROMPT_ID
+    # check / stale-task forensic pid) already paid for one `prompt_id`
+    # read this same instant. Reusing it on poll 1 is safe ONLY when there
+    # is no full_cmd to corroborate: pid and a corroboration read are two
+    # genuinely separate `herdr pane read` calls (prompt_id's own content
+    # read vs prompt_command_text's), so pairing a SEED pid (from an
+    # earlier, possibly stale read) with a corroboration read from A LATER
+    # instant could write a corroborated command next to the WRONG
+    # (stale) prompt_id — the exact bug this fix exists to close, just
+    # relocated. When full_cmd is non-empty, always re-read fresh so pid
+    # and the corroborated command come from reads taken back-to-back in
+    # the SAME poll, never a seed from a different moment.
+    if [ "$poll" = 1 ] && [ -n "$seed_pid" ] && [ -z "$full_cmd" ]; then
+      pid="$seed_pid"
+    else
+      pid="$(prompt_id "$pane" 2>/dev/null)" || pid=""
+    fi
+    ok=1
+    if [ -z "$pid" ]; then
+      ok=0
+    elif [ -n "$full_cmd" ]; then
+      if command -v approval_command_text >/dev/null 2>&1 \
+         && command -v corroboration_candidates >/dev/null 2>&1; then
+        panel_now="$(prompt_command_text "$pane" 2>/dev/null || printf '')"
+        corroboration_candidates "$pane" "$panel_now"
+        approval_command_text "$CC_PANEL" "$full_cmd" "$CC_WRAPJOIN" >/dev/null 2>&1 || ok=0
+      else
+        # lib/scoped-policy.sh is not loaded in this caller's shell: there
+        # is nothing to corroborate full_cmd AGAINST, which is exactly the
+        # condition the pre-existing push-wake.sh corroboration block
+        # treated as a failure (approval_command_text as a bare, undefined
+        # command exits 127, nonzero, same `|| recorded_ok=0` fail-closed
+        # path) — never silently trust an uncorroborated command just
+        # because the checker was not sourced.
+        ok=0
+      fi
+    fi
+    if [ "$ok" = 1 ]; then
+      [ -n "${HERDR_PROMPT_SETTLE_TRACE:-}" ] && printf 'settled\n' >> "$HERDR_PROMPT_SETTLE_TRACE"
+      PROMPT_SETTLE_PID="$pid"
+      PROMPT_SETTLE_OK=1
+      return 0
+    fi
+    if ! awk -v e="$elapsed" -v w="$wait_s" 'BEGIN{exit !(e < w)}'; then
+      [ -n "${HERDR_PROMPT_SETTLE_TRACE:-}" ] && printf 'timeout\n' >> "$HERDR_PROMPT_SETTLE_TRACE"
+      PROMPT_SETTLE_PID="$pid"
+      PROMPT_SETTLE_OK=0
+      return 1
+    fi
+    sleep "$step"
+    elapsed="$(awk -v e="$elapsed" -v s="$step" 'BEGIN{printf "%.4f", e+s}')"
+  done
+}
+
 # prompt_content_digest <pane_id> -> the hash of WHAT is on screen, without the
 # occurrence salt. For the one caller that must re-check the screen after it
 # has itself closed the blocked period (herdr-select.sh, right before its

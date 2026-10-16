@@ -140,6 +140,15 @@ push_wake() {
   elif [ -n "${HERDR_PANE_ID:-}" ]; then
     pid="$(prompt_id "$HERDR_PANE_ID" 2>/dev/null)" || pid=""
   fi
+  # herdr-control: approval friction fix review finding 1 (HIGH, round 2).
+  # Set here, before ANY return path (the EXPECT_PROMPT_ID gate and the
+  # stale/terminal-task rejection below both return before reaching
+  # prompt_id_settled) so a caller that reads PROMPT_SETTLE_PID after
+  # push_wake returns NEVER sees a value left over from an earlier call in
+  # the same shell — every exit path from here down overwrites or confirms
+  # it for THIS call.
+  PROMPT_SETTLE_PID="$pid"
+  PROMPT_SETTLE_OK=0
   # A caller that already bound itself to one prompt (omp-notify.sh) passes
   # it; a screen now showing any other prompt means this hook's tool/command
   # are not this prompt's, so nothing is written and nobody is woken. Moot
@@ -207,34 +216,41 @@ push_wake() {
     fi
   fi
 
-  # ---- change 5 (fix/peer-waits-for-record): corroborate before trusting.
-  # Live canary, 2026-09-26 20:54:33Z: a worker issued two bash tool calls in
-  # one turn; omp painted tool call A's panel first, and the hook firing for
-  # tool call B fingerprinted A's still-painted panel while recording B's
-  # (different) command under A's prompt_id — the row's stable per-prompt id
-  # (INSERT OR IGNORE, below) means the FIRST hook's write wins, so the
-  # prompt now carries a command it never showed. herdr-select.sh's own
-  # short wait for this row (lib/scoped-policy.sh wait_for_input_required_row)
-  # would then WAIT for and TRUST exactly that wrong text, so the
-  # corroboration has to happen here, before the row is ever written — the
-  # same anchored rule herdr-select.sh and human_must_answer enforce: the
-  # collapsed recorded command must EQUAL the panel's collapsed Command:/run:
-  # region (lib/scoped-policy.sh approval_command_text).
-  local recorded_ok=1 cmd_hint=""
-  if [ -z "${HERDR_DEFERRED_PID:-}" ] && [ -n "${HERDR_PANE_ID:-}" ] && [ -n "$full_cmd" ]; then
-    local panel_now
-    panel_now="$(prompt_command_text "$HERDR_PANE_ID" 2>/dev/null || printf '')"
-    # F1/F6 (fix/approve-wrapped-commands security review): the mid-token
-    # wrap-join candidate corroborates here too, only now that F2/F3/F4
-    # (lib/prompt-parse.sh _wrapjoin, lib/scoped-policy.sh
-    # approval_command_text) close the exploits a bare wrap-join would
-    # have opened at this write-time gate. Both candidates come from the
-    # SAME screen snapshot (corroboration_candidates) rather than a second
-    # independent read; a numbered or unparseable pane falls back to
-    # panel_now unchanged.
-    corroboration_candidates "$HERDR_PANE_ID" "$panel_now"
-    approval_command_text "$CC_PANEL" "$full_cmd" "$CC_WRAPJOIN" >/dev/null 2>&1 || recorded_ok=0
+  # ---- herdr-control: approval friction fix (2026-10-16) ------------------
+  # Settle AFTER the stale/terminal check above (which must stay fast — a
+  # dead task's hook refuses on the quick, unsettled `pid`, never waits on
+  # a screen that will only ever confirm what's already known) and BEFORE
+  # the row is written. A single read here used to fingerprint a still-
+  # painted PRIOR panel (a queued parallel tool call omp hasn't repainted
+  # past yet) or fail on a panel whose command overflows one panel line;
+  # either way the row below got written under a wrong or empty prompt_id
+  # that herdr-select.sh's later, settled lookup
+  # (lib/run-registry.sh task_input_required_tool) could never match —
+  # refused as "hook recorded <none>" (herdr-select.sh:811-813). Measured
+  # 2026-10-16: 40 "overflowed one panel line" + 10 "parallel calls/no hook
+  # record" administrative cancels in one day
+  # (~/.config/herdr-bridge/selections.jsonl). prompt_id_settled
+  # (lib/prompt-parse.sh) retries a bounded few times, corroborating
+  # full_cmd against the SAME snapshot each pass (the exact rule change 5
+  # below already enforced on a single snapshot), until the screen is
+  # actually showing the prompt this call is about.
+  if [ -z "${HERDR_DEFERRED_PID:-}" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+    prompt_id_settled "$HERDR_PANE_ID" "$full_cmd" "$pid"
+    pid="$PROMPT_SETTLE_PID"
+    base="wake_${HERDR_RUN_ID:-norun}_${HERDR_TASK_ID:-notask}_${pid:-noprompt}"
+  else
+    PROMPT_SETTLE_PID="$pid"
+    PROMPT_SETTLE_OK=1
   fi
+
+  # ---- change 5 (fix/peer-waits-for-record), subsumed by the approval
+  # friction fix above: prompt_id_settled already corroborated full_cmd
+  # against the settled panel while finding `pid` (same anchored rule —
+  # the collapsed recorded command must EQUAL the panel's collapsed
+  # Command:/run: region, lib/scoped-policy.sh approval_command_text) —
+  # PROMPT_SETTLE_OK carries that verdict here instead of re-reading the
+  # screen a second, independent time.
+  local recorded_ok="${PROMPT_SETTLE_OK:-1}" cmd_hint=""
   if [ "$recorded_ok" = 0 ]; then
     cmd_hint="$(printf '%s' "$full_cmd" | cut -c1-200)"
     # The gate that decides who is woken judges the same (absent) text this
