@@ -271,9 +271,22 @@ if [ -n "$bound_request_id" ]; then
     exit 8
   }
   registry_tool_lc=$(printf '%s' "$payload_json" | jq -r '.tool // empty')
-  case "$registry_tool_lc" in write|edit) ;; *)
-    echo "herdr-select: bound resolution is limited to write/edit." >&2; exit 8 ;;
-  esac
+  # Slice (b), bound-bash: default OFF (env var absent). With the flag off
+  # this case is byte-for-byte today's write|edit-only gate. Binding proves
+  # IDENTITY only -- a bound bash/shell request additionally runs the
+  # command-policy check below (classify_command/conductor_reserved_reason)
+  # against the CANONICAL bound command, never panel text, before it may
+  # resolve. This never changes who may approve (peer stays excluded) or
+  # any category/release pin.
+  if [ "${HERDR_BOUND_BASH:-}" = "1" ]; then
+    case "$registry_tool_lc" in write|edit|bash|shell) ;; *)
+      echo "herdr-select: bound resolution is limited to write/edit/bash/shell." >&2; exit 8 ;;
+    esac
+  else
+    case "$registry_tool_lc" in write|edit) ;; *)
+      echo "herdr-select: bound resolution is limited to write/edit." >&2; exit 8 ;;
+    esac
+  fi
 
   # Re-read task ownership and the proposal immediately before the durable
   # decision.  This is the no-UI equivalent of the legacy final screen read.
@@ -291,6 +304,30 @@ if [ -n "$bound_request_id" ]; then
   [ "$(printf '%s' "$rechecked" | jq -r '.ok == true' 2>/dev/null)" = true ] || {
     echo "herdr-select: bound request changed or expired during review." >&2; exit 8;
   }
+  # Binding proves identity only, never permission: a bound bash/shell
+  # request additionally classifies the CANONICAL bound command (from the
+  # verified proposal, never painted text) and refuses deny-class and
+  # conductor-reserved commands exactly as write/edit's human-only #277
+  # gate stands in for a permission check that bash's shell semantics need
+  # and write/edit never did. Only reachable when registry_tool_lc is
+  # bash|shell, which the tool gate above only allows with the flag on.
+  case "$registry_tool_lc" in
+    bash|shell)
+      _bound_command="$(printf '%s' "$rechecked" | jq -r '.command // empty')"
+      _bound_verdict="$(classify_command "$_bound_command" "$own_worktree")"
+      _bound_reason="$(classify_reason)"
+      if [ "$_bound_verdict" = deny ] || [ -z "${_bound_command//[[:space:]]/}" ]; then
+        echo "herdr-select: bound bash command classifies deny -- binding proves identity only, never permission." >&2
+        echo "herdr-select: $_bound_reason" >&2
+        exit 8
+      fi
+      reservation="$(conductor_reserved_reason "$_bound_command")"
+      if [ -n "$reservation" ]; then
+        echo "herdr-select: $reservation" >&2
+        exit 8
+      fi
+      ;;
+  esac
 
   log_dir="${HERDR_BRIDGE_STATE:-$HOME/.local/state/herdr-bridge}"
   mkdir -p "$log_dir" || exit 2

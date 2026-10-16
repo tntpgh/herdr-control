@@ -138,7 +138,12 @@ def payload_sha256(tool: str, tool_input: object) -> str:
 # M4 keeps raw tool input out of the shared events table. A file that does not
 # hash to the registry's value is refused, so tampering, truncation or a
 # substituted file cannot be approved. Deleted when the occurrence resolves.
-PROPOSAL_TOOLS = {"write", "edit"}
+# Slice (b), bound-bash: default OFF (env var absent). With the flag off,
+# PROPOSAL_TOOLS stays exactly {"write", "edit"} — today's behaviour,
+# byte-for-byte. Binding proves identity only; the canonical bash command
+# still goes through herdr-select.sh's Path A command-policy check.
+HERDR_BOUND_BASH = os.environ.get("HERDR_BOUND_BASH", "").strip() == "1"
+PROPOSAL_TOOLS = {"write", "edit"} | ({"bash", "shell"} if HERDR_BOUND_BASH else set())
 PROPOSAL_VERSION = 1
 # Bounded: raw input never enters the shared events table, only this
 # per-occurrence file, capped at PROPOSAL_MAX_BYTES and deleted when the
@@ -699,6 +704,10 @@ def _payload_targets(tool: str, inp: object) -> list[str] | str:
     agent-hooks/omp-herdr-control.ts mutationTargets reads."""
     if not isinstance(inp, dict):
         return "tool input is not an object"
+    if tool in ("bash", "shell"):
+        # A bash/shell command names no file target; the write/edit-shaped
+        # walk below would misread `command`/`input` text as a patch body.
+        return []
     targets = _path_fields(inp)
     if tool == "write":
         if not isinstance(inp.get("content"), str):
@@ -899,6 +908,7 @@ def proposal_check(db_path: str, *, run_id: str, task_id: str, pane_id: str, pan
         "approval_request_id": rec.get("approval_request_id"),
         "core_arguments_digest": rec.get("core_arguments_digest"),
         "binding_protocol": rec.get("binding_protocol"),
+        "command": (inp.get("command", "") if isinstance(inp, dict) else "") if rtool.lower() in ("bash", "shell") else None,
         "raw_targets": raw_targets, "targets": targets, "body_bytes": body_bytes,
         "body": body, "review_text": f"{header} {label}: " + " ".join(body.split()),
         # What shared stores (events, approvals.command) may carry: no raw body.

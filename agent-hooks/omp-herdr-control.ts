@@ -459,6 +459,13 @@ const WORKER_RUN_ID = process.env.HERDR_RUN_ID?.trim() ?? "";
 const LOAD_HOME = process.env.HOME?.trim() || homedir();
 const LOAD_TMPDIR = process.env.TMPDIR?.trim() ?? "";
 const LOAD_RUN_STATE_DIR = process.env.HERDR_RUN_STATE_DIR?.trim() ?? "";
+// Slice (b), bound-bash: default OFF. With the flag absent, boundTool stays
+// exactly write|edit (today's behaviour, byte-for-byte). Binding here proves
+// IDENTITY only — the canonical command still goes through herdr-select.sh's
+// Path A command-policy check (classify_command/conductor_reserved_reason)
+// before any bash/shell approval resolves; this flag never changes who may
+// approve or which categories are allowed.
+const HERDR_BOUND_BASH = process.env.HERDR_BOUND_BASH?.trim() === "1";
 // ~/.omp/agent/extensions/notepad.ts writes $NOTEPAD_PATH (absolute, or
 // relative to the session cwd) when set, else <cwd>/.handoffs/notepad.md or
 // the legacy <cwd>/.omc/notepad.md. Its mutating tools are judged on exactly
@@ -1779,7 +1786,9 @@ function onApprovalRequested(event: unknown, ctx?: unknown): { defer: true } | u
     const resolveBound = typeof context.resolveToolApproval === "function"
       ? context.resolveToolApproval as (resolution: Record<string, unknown>) => boolean
       : undefined;
-    const boundTool = /^(write|edit)$/i.test(toolName);
+    const boundTool = HERDR_BOUND_BASH
+      ? /^(write|edit|bash|shell)$/i.test(toolName)
+      : /^(write|edit)$/i.test(toolName);
     const coreArgumentsValid = /^sha256:[a-f0-9]{64}$/.test(coreDigest)
       && coreArgumentsJson.length <= 200_000
       && `sha256:${Bun.SHA256.hash(coreArgumentsJson, "hex")}` === coreDigest;

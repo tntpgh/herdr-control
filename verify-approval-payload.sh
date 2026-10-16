@@ -174,6 +174,30 @@ attempt_all() {                         # <label> : peer, conductor, conductor w
   reset_keys; conductor; rc=$?; human_only "conductor: $1"
 }
 write_input() { jq -nc --arg p "$1" --arg c "$2" '{path:$p, content:$c}'; }
+# Slice (b), bound-bash: same shape as record() above, but for a bash/shell
+# occurrence, never a write/edit one -- no panel is rendered (Path A never
+# reads the screen for a bound request; a caller that wants a benign-looking
+# panel on screen writes it to $SCREEN itself before calling this).
+bash_input() { jq -nc --arg c "$1" '{command:$c}'; }
+record_bash() {                         # <command> -> sets CALL_ID PID OCC_KEY
+  CALL=$((CALL + 1)); CALL_ID="call-$CALL"
+  PID="$(prompt_id "$PANE")"
+  local input_json; input_json="$(bash_input "$1")"
+  append_event run1 task1 input_required \
+    "$(jq -nc --arg pid "$PID" '{message:"omp needs permission", prompt_id:$pid, command:"", tool:"bash"}')" >/dev/null 2>&1
+  local id=(--db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" --session "$SESSION" --call-id "$CALL_ID")
+  local recorded_input="$input_json" bound_envelope=""
+  if [ -n "${BOUND_REQUEST:-}" ]; then
+    bound_envelope="--bound-envelope"
+    recorded_input="$(jq -nc --argjson i "$input_json" --arg j "$(printf '%s' "$input_json" | jq -cS .)" '{input:$i,core_arguments_json:$j}')"
+  fi
+  OCC_KEY="$(printf '%s' "$recorded_input" | "${OCC[@]}" seen "${id[@]}" --tool bash --input-json - $bound_envelope \
+    ${BOUND_REQUEST:+--approval-request-id "$BOUND_REQUEST"} \
+    ${BOUND_DIGEST:+--core-arguments-digest "$BOUND_DIGEST"} \
+    ${BOUND_PROTOCOL:+--binding-protocol "$BOUND_PROTOCOL"} \
+    --cwd "$WT" --dispatched-at-ms "$(python3 -c 'import time; print(int(time.time()*1000))')" | jq -r .occ_key)"
+  "${OCC[@]}" screen "${id[@]}" --display pending_parseable --prompt-id "$PID" >/dev/null
+}
 LONG="$(for i in $(seq 1 60); do printf 'row %03d: value %d, note: keep row %d intact.\n' "$i" "$((i * 7))" "$i"; done)"
 
 printf '== complete payload capture and review artifact ==\n'
@@ -431,6 +455,93 @@ unknown_lifecycle="$("${OCC[@]}" fold --db "$DB" --run run1 --task task1 | jq -r
 [ "$unknown_lifecycle" = resolved:withdrawn ] \
   && ok "unrecognized choice plus completion is withdrawn, not approved" \
   || bad "unrecognized choice completion folded as $unknown_lifecycle"
+
+printf '== flag off: bound bash/shell request is refused exactly like today (byte-for-byte) ==\n'
+[ -z "${HERDR_BOUND_BASH:-}" ] || { echo "fixture bug: HERDR_BOUND_BASH leaked into the flag-off section"; exit 1; }
+BOUND_REQUEST="request-bash-flag-off"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
+OFF_CMD="ls -la $WT"
+OFF_JSON="$(bash_input "$OFF_CMD" | jq -cS .)"
+BOUND_DIGEST="sha256:$(printf '%s' "$OFF_JSON" | shasum -a 256 | awk '{print $1}')"
+: > "$SCREEN"
+record_bash "$OFF_CMD"; BOUND_PAYLOAD_SHA="$(input_sha bash "$(bash_input "$OFF_CMD")")"
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && grep -qF "exact bound request verification failed" "$WORK/err.txt" \
+  && ok "flag off: bound bash request refused at the same proposal-tool-gate point as origin/main (byte-for-byte: PROPOSAL_TOOLS excludes bash)" \
+  || bad "flag off bash bind: rc=$rc keys=$(keys_pressed); $(tail -3 "$WORK/err.txt")"
+BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
+
+export HERDR_BOUND_BASH=1
+printf '== flag on: bound bash resolves its exact request id with no keypress ==\n'
+BOUND_REQUEST="request-bash-1"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
+BASH_CMD="ls -la $WT"
+BASH_JSON="$(bash_input "$BASH_CMD" | jq -cS .)"
+BOUND_DIGEST="sha256:$(printf '%s' "$BASH_JSON" | shasum -a 256 | awk '{print $1}')"
+: > "$SCREEN"
+record_bash "$BASH_CMD"; BOUND_PAYLOAD_SHA="$(input_sha bash "$(bash_input "$BASH_CMD")")"
+approves_before="$(approve_rows)"; reset_keys; conductor_bound; rc=$?
+authorized_count="$(sqlite3 "$DB" "SELECT count(*) FROM events WHERE type='prompt_occ_authorized' AND json_extract(payload,'$.occ_key')='$OCC_KEY';")"
+if [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] && [ "$authorized_count" = 1 ] && [ "$(approve_rows)" = $((approves_before + 1)) ]; then
+  ok "flag on: bound bash request resolves its exact request id, no panel read, no key pressed"
+else
+  bad "flag on bash bind: rc=$rc keys=$(keys_pressed) authorized=$authorized_count; $(tail -3 "$WORK/err.txt")"
+fi
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "flag on: duplicate/replayed bound bash resolution is refused (one-shot)" \
+  || bad "bash replay: rc=$rc keys=$(keys_pressed)"
+BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
+
+printf '== flag on: a long multi-line bound bash command resolves with no panel-row ambiguity ==\n'
+BOUND_REQUEST="request-bash-long"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
+LONG_CMD="$(for i in $(seq 1 40); do printf 'echo line-%d; ' "$i"; done)"
+LONG_BASH_JSON="$(bash_input "$LONG_CMD" | jq -cS .)"
+BOUND_DIGEST="sha256:$(printf '%s' "$LONG_BASH_JSON" | shasum -a 256 | awk '{print $1}')"
+: > "$SCREEN"
+record_bash "$LONG_CMD"; BOUND_PAYLOAD_SHA="$(input_sha bash "$(bash_input "$LONG_CMD")")"
+approves_before="$(approve_rows)"; reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] && [ "$(approve_rows)" = $((approves_before + 1)) ] \
+  && ok "a long multi-line bound bash command resolves -- identity, not screen rows, is checked" \
+  || bad "long bash command bind: rc=$rc keys=$(keys_pressed)"
+BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
+
+printf '== flag on: two parallel bash calls bind to their own exact call, no cross-binding ==\n'
+BOUND_PROTOCOL="omp.tool-approval-binding.v1"
+BOUND_REQUEST="request-bash-x"; CMD_X="echo X"
+X_JSON="$(bash_input "$CMD_X" | jq -cS .)"; DIGEST_X="sha256:$(printf '%s' "$X_JSON" | shasum -a 256 | awk '{print $1}')"
+: > "$SCREEN"; BOUND_DIGEST="$DIGEST_X"; record_bash "$CMD_X"
+CALL_ID_X="$CALL_ID"; PAYLOAD_SHA_X="$(input_sha bash "$(bash_input "$CMD_X")")"
+BOUND_REQUEST="request-bash-y"; CMD_Y="echo Y"
+Y_JSON="$(bash_input "$CMD_Y" | jq -cS .)"; DIGEST_Y="sha256:$(printf '%s' "$Y_JSON" | shasum -a 256 | awk '{print $1}')"
+BOUND_DIGEST="$DIGEST_Y"; record_bash "$CMD_Y"
+CALL_ID_Y="$CALL_ID"; PAYLOAD_SHA_Y="$(input_sha bash "$(bash_input "$CMD_Y")")"
+BOUND_REQUEST="request-bash-y"; BOUND_DIGEST="$DIGEST_X"; CALL_ID="$CALL_ID_X"; BOUND_PAYLOAD_SHA="$PAYLOAD_SHA_X"
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "Y's requestId cannot be credited to X's call id/digest (no cross-binding)" \
+  || bad "cross-binding was not refused: rc=$rc keys=$(keys_pressed)"
+BOUND_REQUEST="request-bash-x"; BOUND_DIGEST="$DIGEST_X"; CALL_ID="$CALL_ID_X"; BOUND_PAYLOAD_SHA="$PAYLOAD_SHA_X"
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] && ok "X resolves on its own exact identity" \
+  || bad "X self-resolve failed: rc=$rc keys=$(keys_pressed)"
+BOUND_REQUEST="request-bash-y"; BOUND_DIGEST="$DIGEST_Y"; CALL_ID="$CALL_ID_Y"; BOUND_PAYLOAD_SHA="$PAYLOAD_SHA_Y"
+reset_keys; conductor_bound; rc=$?
+[ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] && ok "Y independently resolves on its own exact identity, unaffected by X" \
+  || bad "Y self-resolve failed: rc=$rc keys=$(keys_pressed)"
+BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""; CALL_ID=""
+
+printf '== flag on: binding proves identity only -- deny/reserved bound commands refused despite a benign painted panel ==\n'
+i=0
+for CMD in "git push origin main" "sqlite3 /tmp/hc-probe.db 'DROP TABLE x;'" "rm -rf /"; do
+  i=$((i + 1))
+  BOUND_REQUEST="request-bash-deny-$i"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
+  DENY_JSON="$(bash_input "$CMD" | jq -cS .)"
+  BOUND_DIGEST="sha256:$(printf '%s' "$DENY_JSON" | shasum -a 256 | awk '{print $1}')"
+  printf 'Allow tool: bash\nCommand: ls -la [unrelated, benign panel]\n\n\033[48;2;42;47;65m Approve\033[0m\n Deny\n\n' > "$SCREEN"
+  record_bash "$CMD"; BOUND_PAYLOAD_SHA="$(input_sha bash "$(bash_input "$CMD")")"
+  reset_keys; conductor_bound; rc=$?
+  [ "$rc" -eq 8 ] && [ "$(keys_pressed)" = 0 ] && ok "deny/reserved bound command refused despite a benign panel: $CMD" \
+    || bad "deny/reserved bound command NOT refused: $CMD rc=$rc keys=$(keys_pressed); $(tail -3 "$WORK/err.txt")"
+  BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
+done
+unset HERDR_BOUND_BASH
 
 printf '== bash approvals are untouched ==\n'
 printf 'Allow tool: bash\nCommand: ls -la\n\n\033[48;2;42;47;65m Approve\033[0m\n Deny\n\nup/down navigate  enter select  esc cancel\n' > "$SCREEN"; reset_keys
