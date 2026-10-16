@@ -553,11 +553,23 @@ fi
 if [ "${human_stale:-0}" = 1 ]; then
   # Own claim namespace (lib/alert-gate.sh): a peer refusal or the conductor
   # re-wake takes grace_realert_*, and must not silence this ERROR post.
-  HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" HERDR_GRACE_CLAIM_KIND=human_stale \
-  grace_realert "$pane" "$_bound_pid" \
-    "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
-    bash "$notify" --class human-stale --choices --pane "$pane" \
-    "$msg  ·  only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s"
+  if [ "$deferred" = true ]; then
+    # No panel: --choices would re-scrape the pane and drop the post, and the
+    # screen cannot say whether this request is still open. _still_bound asks
+    # its own occurrence (requested, unauthorized) at T+grace instead.
+    HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" HERDR_GRACE_CLAIM_KIND=human_stale \
+    HERDR_DEFERRED_PID="$_bound_pid" HERDR_GRACE_STILL_OPEN=_still_bound \
+    grace_realert "$pane" "$_bound_pid" \
+      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+      bash "$notify" --class human-stale --pane "$pane" \
+      "$msg  ·  only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s${_deferred_hint:+  ·  ${_deferred_hint}}"
+  else
+    HERDR_ALERT_GRACE_S="${HERDR_HUMAN_ALERT_S:-300}" HERDR_GRACE_CLAIM_KIND=human_stale \
+    grace_realert "$pane" "$_bound_pid" \
+      "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+      bash "$notify" --class human-stale --choices --pane "$pane" \
+      "$msg  ·  only a human may answer this, still open after ${HERDR_HUMAN_ALERT_S:-300}s"
+  fi
 fi
 
 exit 0

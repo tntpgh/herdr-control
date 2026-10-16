@@ -772,6 +772,34 @@ grep -q "^done human_stale $hs_pid fired$" "$hs_trace" \
   && ok "a human-stale timer still fires after grace_realert_* was claimed" \
   || bad "human-stale timer: $(cat "$hs_trace")"
 clean_screen > "$WORKER_SCREEN"
+# Review r5 HIGH: for a deferred request (no panel ever painted) the
+# human-stale timer must decide from the request's own occurrence, not the
+# screen, and a SIBLING deferred request's later input_required on the same
+# task must not stand it down (two writes in one turn).
+dhs_trace="$WORK/dhs-trace.log"; : > "$dhs_trace"
+still_open() { return 0; }
+( export HERDR_ALERT_TRACE="$dhs_trace"
+  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+  HERDR_ALERT_GRACE_S=2 HERDR_GRACE_CLAIM_KIND=human_stale \
+    HERDR_DEFERRED_PID="deferred:hs-1" HERDR_GRACE_STILL_OPEN=still_open \
+    grace_realert "$WPANE" "deferred:hs-1" runHS taskHS true
+  sleep 1.2
+  append_event runHS taskHS input_required '{"prompt_id":"deferred:hs-2"}' >/dev/null 2>&1 )
+i=0; while [ "$i" -lt 100 ] && ! grep -q '^done ' "$dhs_trace"; do sleep 0.1; i=$((i + 1)); done
+grep -q "^done human_stale deferred:hs-1 fired$" "$dhs_trace" \
+  && ok "a deferred human-stale timer fires panel-less despite a sibling's later input_required" \
+  || bad "deferred human-stale stood down: $(cat "$dhs_trace")"
+: > "$dhs_trace"
+still_closed() { return 1; }
+( export HERDR_ALERT_TRACE="$dhs_trace"
+  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+  HERDR_ALERT_GRACE_S=1 HERDR_GRACE_CLAIM_KIND=human_stale \
+    HERDR_DEFERRED_PID="deferred:hs-3" HERDR_GRACE_STILL_OPEN=still_closed \
+    grace_realert "$WPANE" "deferred:hs-3" runHS taskHS true )
+i=0; while [ "$i" -lt 100 ] && ! grep -q '^done ' "$dhs_trace"; do sleep 0.1; i=$((i + 1)); done
+grep -q "^done human_stale deferred:hs-3 stood_down$" "$dhs_trace" \
+  && ok "a resolved deferred request's human-stale timer stands down" \
+  || bad "resolved deferred human-stale: $(cat "$dhs_trace")"
 set_task_state runHS taskHS completed no-follow-on >/dev/null 2>&1
 
 printf '== conductorless worker still persists its verified input request ==\n'
