@@ -113,6 +113,11 @@ omp_menu() {                            # <command> -> a complete omp approval p
 # -- pending_parseable: a real omp menu is on screen -------------------------
 rm -f "$FAIL_MARKER"
 omp_menu "printf smoke" > "$WORKER_SCREEN"
+( . "$here/lib/run-registry.sh"; register_task "$RUN_ID" "$TASK_ID" w1 cond1 "" "" "$WPANE" "" /repo /wt "review:notify-probe" ) >/dev/null 2>&1
+# Production order: onApprovalRequested records seen before this hook runs.
+python3 "$here/lib/prompt-occurrence.py" seen --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-1 --call-id call-1 \
+  --tool bash --source test >/dev/null 2>&1
 run_notify ',"call_id":"call-1","native_session":"sess-1"'
 [ "$(screen_rows)" = 1 ] && ok "a parseable menu persists exactly one prompt_occ_screen row" \
   || bad "expected 1 screen row, got $(screen_rows): $(cat "$WORK/n.err")"
@@ -245,6 +250,20 @@ run_notify ',"call_id":"call-13","native_session":"sess-13"'
 [ "$(tooled_rows)" = 0 ] \
   && ok "fast-path parse after the occurrence was declined pushes nothing" \
   || bad "fast-path declined: tooled=$(tooled_rows)"
+
+# -- missing seen fails CLOSED: no binding evidence, no provenance write ----
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+keyhint_panel > "$WORKER_SCREEN"                # no seen recorded at all (unknown + empty latest)
+run_notify ',"call_id":"call-15","native_session":"sess-15"'
+[ "$(tooled_rows)" = 0 ] && [ "$(screen_rows)" = 0 ] \
+  && ok "unknown occurrence with no seen anywhere writes no tool provenance" \
+  || bad "unknown+empty latest: tooled=$(tooled_rows) screen=$(screen_rows)"
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-17 sess-16                            # only the NEW call's seen exists
+run_notify ',"call_id":"call-16","native_session":"sess-16"'   # delayed old hook, its seen missing
+[ "$(tooled_rows)" = 0 ] && [ "$(screen_rows)" = 0 ] \
+  && ok "delayed old hook with missing seen cannot attach its tool to the new panel" \
+  || bad "old hook/new panel: tooled=$(tooled_rows) screen=$(screen_rows)"
 
 # -- absent panel (auto-approved) is NOT extended ---------------------------
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"

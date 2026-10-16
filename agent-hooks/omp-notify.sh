@@ -99,6 +99,7 @@ SECONDS=0
 found=0
 for _ in 1 2 3 4 5; do
   if _prompt_is_up; then found=1; break; fi
+  [ "$SECONDS" -lt "$_budget" ] || break
   sleep 0.3
 done
 
@@ -116,35 +117,29 @@ if [ -n "$call_id" ] && [ -n "$native_session" ] && [ -n "${HERDR_RUN_ID:-}" ] \
   _occ_py="$(_registry_python 2>/dev/null)" || _has_occ=0
 fi
 
-# Is the prompt on screen still THIS hook's occurrence? True only when the
-# pane was not recycled, the occurrence is still `requested` (not answered,
-# declined, withdrawn or completed), and no later tool call on this task has
-# recorded its own `seen` — so a replacement prompt painted during the wait can
-# never inherit this hook's tool/command.
+# Is the prompt on screen still THIS hook's occurrence? Fail closed: true only
+# on positive binding — this call's own seen exists and is `requested` (not
+# answered/declined/withdrawn/completed, no authorization), it is the task's
+# latest seen (no later tool call has painted its own prompt), and, when the
+# task registered a pane birth, the live pane matches it. Missing evidence
+# (no seen, unreadable birth) leaves the prompt unresolved for the
+# reconciliation paths rather than attaching this hook's tool to it.
 _occ_still_ours() {
   local live st key latest
   if [ -n "${_occ_pane_birth:-}" ]; then
-    live="$(pane_birth_now "$pane" 2>/dev/null)" || live=""
-    [ -n "$live" ] && [ "$live" != "$_occ_pane_birth" ] && return 1
+    live="$(pane_birth_now "$pane" 2>/dev/null)" || return 1
+    [ "$live" = "$_occ_pane_birth" ] || return 1
   fi
   st="$("$_occ_py" "$here/lib/prompt-occurrence.py" state --db "$(registry_db)" \
     --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" --pane "$pane" --birth "${_occ_pane_birth:-}" \
     --session "$native_session" --call-id "$call_id" 2>/dev/null)" || return 1
-  # `unknown` = no seen recorded for this call (seen is best-effort upstream):
-  # still ours unless a DIFFERENT occurrence is the task's latest. Any
-  # resolution/authorization, or a pane recycle, is positive evidence it is not.
-  case "$(printf '%s' "$st" | jq -r '.lifecycle // ""' 2>/dev/null)" in
-    requested|unknown) ;;
-    *) return 1 ;;
-  esac
-  # The fold downgrades an approved/completed occurrence with unproven
-  # identity to `unknown`; its raw resolution still shows here.
-  [ -z "$(printf '%s' "$st" | jq -r 'select((.authorization // "none") != "none" or (.unresolved_reason // "") != "") | "x"' 2>/dev/null)" ] || return 1
+  [ "$(printf '%s' "$st" | jq -r '.lifecycle // ""' 2>/dev/null)" = requested ] || return 1
+  [ "$(printf '%s' "$st" | jq -r '.authorization // "none"' 2>/dev/null)" = none ] || return 1
   key="$(printf '%s' "$st" | jq -r '.occ_key // ""' 2>/dev/null)"
   latest="$(_sql "SELECT json_extract(payload,'\$.occ_key') FROM events
      WHERE task_id=$(_sq "$HERDR_TASK_ID") AND type='prompt_occ_seen'
      ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
-  [ -z "$latest" ] || [ "$key" = "$latest" ]
+  [ -n "$key" ] && [ "$key" = "$latest" ]
 }
 
 # Something approval-shaped painted but did not yet parse (a tall review-class
