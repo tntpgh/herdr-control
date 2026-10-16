@@ -263,7 +263,42 @@ push_wake() {
               AND json_extract(payload,'\$.recorded_by')='attention-controller';" >/dev/null 2>&1 || true
     fi
   fi
-  [ "$mode" = record-only ] && return 1
+  if [ "$mode" = record-only ]; then
+    # Defect 2 (herdr-control fix/notify-binding-concurrent SPEC.md): the
+    # owner of this prompt's wake (an earlier hook firing, or
+    # attention-tick.sh's one chance per key, lib/attention-key.sh
+    # attn_track_claim) may already have HELD and armed a grace timer for
+    # it — but that timer silently stands down the instant ANY later
+    # input_required row lands on this task (grace_realert's own "later
+    # prompt supersedes" check above in this file), including a later
+    # record-only row like this one. When that happens nobody is left
+    # holding a live timer for a prompt that is still genuinely open, and
+    # the only thing left to notice is attention-tick's own
+    # escalation-to-Main rung (HERDR_WAKE_RESPONSE_S, default 600s) — ~8
+    # minutes slower than the grace window in a live trace
+    # (task_20261016T021313Z_56367_9233, push_mode=record-only at
+    # 02:17:43Z, no wake until the 02:22:44Z re-alert).
+    #
+    # Arm the SAME grace_realert the "held" path below uses, bounded by
+    # HERDR_ALERT_GRACE_S (default 90s, clamp 1..900 — _ag_grace_seconds).
+    # Safe to call unconditionally: grace_realert's own claim_once (shared
+    # key grace_realert_<run>_<task>_<pid>) is the one place that decides
+    # who actually delivers — an owner's timer that is still alive wins
+    # that race and this one silently no-ops at T+grace; an owner's timer
+    # that already stood down (or never existed) means THIS one is the
+    # only clock left, and it fires. No new persistent access, no bypass
+    # of any check: the delayed re-entry (HERDR_ALERT_FORCE=1) still runs
+    # every existing guard (pane_is_agent, conductor pane-birth revalidation,
+    # human_must_answer's own classification) at delivery time, exactly
+    # like the held path a few lines down.
+    if [ -n "$cpane" ] && [ -n "$pid" ] && [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
+      _pw_forced_wake_argv "${HERDR_PANE_ID:-}" "$cpane" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+        "${HERDR_TASK_LABEL:-}" "$msg" "$where" "$full_cmd" "$tool"
+      grace_realert "${HERDR_PANE_ID:-}" "$pid" "${HERDR_RUN_ID:-}" "${HERDR_TASK_ID:-}" \
+        "${_PW_FORCED_WAKE_ARGV[@]}"
+    fi
+    return 1
+  fi
   [ -n "$cpane" ] || return 1
 
   pane_is_agent "$cpane" || return 1

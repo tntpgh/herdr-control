@@ -76,6 +76,28 @@ else
   _prompt_is_up() { prompt_menu_visible "$pane" 2>/dev/null; }
 fi
 
+# Is whatever panel is ON SCREEN right now actually THIS call's own input?
+# `_prompt_is_up` alone only answers "is A panel up" — omp shows one
+# approval panel at a time and paints queued ones oldest-first, so a
+# concurrent call's hook can see its PEER's panel (trace:
+# task_20261016T021313Z_56367_9233 02:13:24-36Z, two bash calls
+# A(`ls`)/B(`git log`) approved the same second; the hook firing for B
+# fingerprinted A's still-painted panel and wrote B's call id against it).
+# `full_cmd` (header comment above) is only populated for a bash/shell
+# approval; other tools have no recorded command text to compare against
+# the panel and rely on the occurrence-ordering check in _occ_still_ours
+# below alone. approval_command_text/corroboration_candidates
+# (lib/scoped-policy.sh, pulled in transitively via lib/push-wake.sh ->
+# lib/alert-gate.sh) are the exact comparison herdr-select.sh and
+# push_wake itself already use to corroborate a recorded command against
+# the panel's Command:/run: region — reused here rather than a second,
+# driftable copy of the same rule.
+_panel_matches_call() {
+  [ -n "$full_cmd" ] || return 0
+  corroboration_candidates "$pane" ""
+  approval_command_text "$CC_PANEL" "$full_cmd" "$CC_WRAPJOIN" >/dev/null 2>&1
+}
+
 # tool_call fires BEFORE omp paints the approval menu, so a single check would
 # usually miss it. Poll briefly. Each attempt costs one `herdr pane read`; the
 # sleep is a real settle rather than a busy loop, and this runs detached from the
@@ -89,6 +111,13 @@ fi
 # once painted it stays until someone answers it — so a coarser poll can only
 # delay detection by one interval, never miss it, and it halves the RPCs this
 # fires at the herdr server on every tool call of every pane.
+#
+# Deliberately cheap and identity-oblivious: this is only a "something
+# painted" hint, never trusted to write provenance on its own. The gate
+# below (occurrence ordering + content corroboration) re-verifies before
+# anything is ever written, so this stays `_prompt_is_up` alone rather than
+# adding a second `herdr pane read` (corroboration_candidates) to every one
+# of these tight 0.3s ticks.
 # One total budget for every probe below, measured from here with bash's
 # SECONDS counter; the env override is clamped to 1..10s.
 _budget="${HERDR_NOTIFY_UNREADABLE_DEADLINE_S:-10}"
@@ -117,16 +146,26 @@ if [ -n "$call_id" ] && [ -n "$native_session" ] && [ -n "${HERDR_RUN_ID:-}" ] \
   _occ_py="$(_registry_python 2>/dev/null)" || _has_occ=0
 fi
 
-# Is the prompt on screen still THIS hook's occurrence? Fail closed: true only
-# on positive binding — this call's own seen exists and is `requested` (not
-# answered/declined/withdrawn/completed, no authorization), it is the task's
-# latest seen (no later tool call has painted its own prompt), and, when the
-# task registered a pane birth, the live pane matches it. Missing evidence
-# (no seen, unreadable birth) leaves the prompt unresolved for the
-# reconciliation paths rather than attaching this hook's tool to it.
+# Is the prompt on screen still THIS hook's occurrence? Fail closed: true
+# only on positive binding — this call's own seen exists and is `requested`
+# (not answered/declined/withdrawn/completed, no authorization), AND it is
+# the EARLIEST still-`requested` occurrence for this task. omp paints
+# queued approval panels oldest-first (a few lines up), so "earliest
+# unresolved" is what is actually on screen right now — the previous rule
+# bound whichever call's own seen was the task's LATEST seen, which is
+# backwards: it let a LATER call's hook bind to an EARLIER call's still-
+# visible panel (root cause, trace at the top of this file's PR), and it
+# made the EARLIER call's own hook give up the instant a later one was
+# seen, even though the earlier call's panel was the one genuinely on
+# screen (trace: hook A exited at once, superseded=1, because A "was not
+# the task's latest seen"). Missing evidence (no seen, unreadable birth)
+# leaves the prompt unresolved for the reconciliation paths rather than
+# attaching this hook's tool to it; "still requested but not yet earliest"
+# is its own outcome (`_occ_not_yet`, never superseded) — the caller keeps
+# waiting for its own turn instead of giving up or wrongly binding.
 _occ_still_ours() {
-  local live st key latest lc
-  _occ_missing=0; _occ_why=birth
+  local live st key earliest lc
+  _occ_missing=0; _occ_why=birth; _occ_not_yet=0
   if [ -n "${_occ_pane_birth:-}" ]; then
     live="$(pane_birth_now "$pane" 2>/dev/null)" || return 1
     [ "$live" = "$_occ_pane_birth" ] || return 1
@@ -142,11 +181,52 @@ _occ_still_ours() {
   [ "$lc" = requested ] || return 1
   [ "$(printf '%s' "$st" | jq -r '.authorization // "none"' 2>/dev/null)" = none ] || return 1
   key="$(printf '%s' "$st" | jq -r '.occ_key // ""' 2>/dev/null)"
-  latest="$(_sql "SELECT json_extract(payload,'\$.occ_key') FROM events
-     WHERE task_id=$(_sq "$HERDR_TASK_ID") AND type='prompt_occ_seen'
-     ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
-  _occ_why=latest
-  [ -n "$key" ] && [ "$key" = "$latest" ] && _occ_why=bound
+  # Scoped to THIS call's own (pane, pane_birth, native_session) — never
+  # the whole task_id. fold_task has no occurrence-identity boundary of its
+  # own (lib/prompt-occurrence.py fold_task queries WHERE run_id=? AND
+  # task_id=? only, with no pane/birth/session filter), so an unscoped
+  # "earliest requested across the task" starves every later call forever
+  # the moment ANY occurrence never resolves — a crashed call, a killed
+  # pane, or omp-herdr-control.ts's in-memory occurrenceByCallId map losing
+  # a call across a harness restart before tool_execution_end ever fires
+  # (review BLOCK, Finding 1: review/notify-binding-concurrent REVIEW.md).
+  # pane_id/pane_birth/native_session are recorded on every fold record
+  # from its own `seen` payload (lib/prompt-occurrence.py fold_task,
+  # rec["pane_id"]/rec["pane_birth"]/rec["native_session"]), so filtering on
+  # them here needs no new fold parameter or registry query — a stale
+  # occurrence from a previous pane birth or session is excluded by
+  # construction, exactly like the `state` call three lines up already
+  # scopes by the same three fields.
+  #
+  # Within the SAME (pane, birth, session) scope a never-resolved
+  # occurrence can still starve every later call in that one session
+  # forever (an aborted call with no tool_execution_end). Ordering proves
+  # it dead instead: if a LATER occurrence (by first_seen_seq) in the same
+  # scope has already resolved (completed/declined/withdrawn — any
+  # `resolved:*` lifecycle), the earlier still-`requested` one cannot
+  # still be the one on screen, because omp paints panels oldest-first —
+  # the later one could not have been reached, let alone resolved, while
+  # the earlier one was still genuinely pending. Excluded by
+  # construction below rather than trusted as "earliest": a requested
+  # occurrence whose first_seen_seq is <= the scope's latest resolved
+  # first_seen_seq is dead weight, not a live blocker. Genuine concurrent
+  # ambiguity (two still-live requested calls) is untouched: neither is
+  # resolved, so neither excludes the other, and the command-corroboration
+  # check below still fails closed on a mismatch.
+  earliest="$("$_occ_py" "$here/lib/prompt-occurrence.py" fold --db "$(registry_db)" \
+    --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" 2>/dev/null \
+    | jq -r --arg p "$pane" --arg b "${_occ_pane_birth:-}" --arg s "$native_session" '
+        [.[] | select(.pane_id==$p) | select(.pane_birth==$b) | select(.native_session==$s)] as $scope
+        | ([$scope[] | select(.lifecycle | startswith("resolved")) | .first_seen_seq] | max // -1) as $deadline
+        | [$scope[] | select(.lifecycle=="requested") | select(.first_seen_seq > $deadline)]
+        | sort_by(.first_seen_seq) | (.[0].occ_key // "")
+      ' 2>/dev/null)"
+  _occ_why=earliest
+  if [ -n "$key" ] && [ "$key" = "$earliest" ]; then _occ_why=bound; return 0; fi
+  # Still genuinely pending (requested, unresolved) — just behind another
+  # call's panel in the queue, never "gone".
+  _occ_not_yet=1
+  return 1
 }
 
 # Decision trace for this firing: which branch ended it, and why the binding
@@ -166,37 +246,49 @@ _probe_trace() {                        # <outcome> [push_rc] [mode]
     "notify_probe_${HERDR_TASK_ID}_${call_id}_${_probe_firing}" >/dev/null 2>&1 || true
 }
 
-# The approval panel has not parsed yet: keep probing until the total budget,
-# as long as the occurrence stays bound. This script only runs for a REAL
-# approval request (auto-approved calls never reach it, header comment), so
-# a not-yet-parseable screen is a panel still painting, not an absent one —
-# and a mid-paint frame can read as unreadable OR as no prompt at all (live
-# w7S:p7 2026-10-16 00:45Z: the loop keyed on `pending_unreadable` saw a
-# no-prompt frame, exited, and the next read was unreadable again). Exiting
-# early is what left review-class prompts with no hook-written
-# input_required, so herdr-select could never corroborate their tool.
-# Cancelled the moment the occurrence resolves or is superseded. Tool
-# identity still comes only from this hook's own event, never the screen.
+# The approval panel being up is not enough on its own (found=1 above is a
+# cheap, identity-oblivious screen check) — everything below re-verifies,
+# right up to the moment provenance is written, that BOTH (a) this is the
+# earliest still-open occurrence for the task (omp paints oldest-first, so
+# that is what is actually on screen) and (b) when a command is recorded at
+# all, the screen's own Command:/run: region equals it. Neither alone is
+# enough: two IDENTICAL commands racing concurrently defeat (b)
+# (approval_command_text's own comment), and two DIFFERENT commands racing
+# concurrently defeat (a) if "ours" were content-blind (the ls/git log
+# trace above). "Still pending but not our turn yet" (`_occ_not_yet`) is
+# never superseded — the caller keeps waiting, bounded, for its OWN panel
+# rather than giving up (the old rule's failure for A) or binding to
+# someone else's (the old rule's failure for B).
 _superseded=0
-# Unbound at entry (no seen of our own): nothing to wait for — skip, record
-# the screen as before, write no provenance. Bound then lost: superseded.
-if [ "$found" = 0 ] && [ "$_has_occ" = 1 ]; then
+if [ "$_has_occ" = 1 ]; then
   _occ_still_ours; _entry_rc=$?; _entry_why="$_occ_why"
-  if [ "$_entry_rc" != 0 ]; then
-    [ "$_occ_missing" = 1 ] || _superseded=1
+  if [ "$_entry_rc" = 0 ] && [ "$found" = 1 ] && _panel_matches_call; then
+    : # already fully confirmed by the fast probe above: bound, on screen,
+      # and (when a command was recorded) the screen agrees with it.
+  elif [ "$_entry_rc" != 0 ] && [ "$_occ_missing" != 1 ] && [ "$_occ_not_yet" != 1 ]; then
+    found=0; _superseded=1
+  elif [ "$_occ_missing" = 1 ]; then
+    # No seen of our own at all: nothing to wait for. A panel the fast
+    # probe already saw (found=1) has no binding evidence behind it either
+    # — never ours to claim or to record a screen row against — so that
+    # case is treated the same as a genuine supersede, exactly as the old
+    # code's separate "every successful parse" re-check used to (it ran
+    # _occ_still_ours again regardless of _occ_missing and wiped found).
+    [ "$found" = 1 ] && _superseded=1
+    found=0
   else
+    found=0
     while [ "$SECONDS" -lt "$_budget" ]; do
-      _occ_still_ours || { _superseded=1; break; }
+      _occ_still_ours
+      if [ $? -ne 0 ] && [ "$_occ_not_yet" != 1 ]; then _superseded=1; break; fi
       sleep 0.5
-      if _prompt_is_up; then found=1; break; fi
+      if _prompt_is_up && _panel_matches_call; then
+        _occ_still_ours
+        if [ $? -eq 0 ]; then found=1; break; fi
+        [ "$_occ_not_yet" = 1 ] || { _superseded=1; break; }
+      fi
     done
   fi
-fi
-# EVERY successful parse — the fast first probes included — must still be
-# this hook's occurrence before anything is written: a decline/replacement
-# during the first probes would otherwise push this tool onto a new prompt.
-if [ "$found" = 1 ] && [ "$_has_occ" = 1 ] && ! _occ_still_ours; then
-  found=0; _superseded=1
 fi
 
 # The ONE prompt this hook may speak for, captured once right after binding.

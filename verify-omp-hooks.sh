@@ -1838,6 +1838,55 @@ grep -q "^done wakefail $f7_pid2 conductor_reached$" "$f7_trace" && ! grep -q 'w
 set_task_state runF7 taskF7 completed no-follow-on >/dev/null 2>&1
 clean_screen > "$WORKER_SCREEN"
 
+printf '== fix/notify-binding-concurrent Defect 2: record-only still arms a bounded backstop ==\n'
+# push_mode=record-only (agent-hooks/omp-notify.sh: attn_track_claim lost to
+# an earlier owner) used to return at lib/push-wake.sh's old record-only
+# line with NOTHING armed for THIS prompt specifically — if the owner's own
+# held timer later stood down (grace_realert's "later input_required
+# supersedes" check, same file) nothing was left watching, and the live
+# trace (SPEC.md Defect 2, task_20261016T021313Z_56367_9233) shows an ~8
+# minute gap down to attention-tick.sh's own 600s-default escalation rung
+# before the conductor ever got a wake. record-only now arms grace_realert
+# itself (the `if [ "$mode" = record-only ]` block), bounded by
+# HERDR_ALERT_GRACE_S — proven here end to end with a real delivery.
+register_task runD2 taskD2 wD2 condD2 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wtD2 "impl:d2" >/dev/null 2>&1
+set_task_state runD2 taskD2 running >/dev/null 2>&1
+d2_n() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE task_id='taskD2' AND type='$1';" 2>/dev/null; }
+omp_menu_screen "git status --short" > "$WORKER_SCREEN"
+clean_screen > "$COND_SCREEN"
+: > "$NOTIFIED"
+( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" HERDR_RUN_ID=runD2 HERDR_TASK_ID=taskD2 \
+         HERDR_TASK_LABEL="impl:d2" HERDR_ALERT_GRACE_S=1
+  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+  push_wake "impl:d2 needs input" "agent-hook" "" "" record-only >/dev/null 2>&1 )
+[ "$(d2_n input_required)" = 1 ] && ok "record-only still records the input_required row" \
+  || bad "record-only input_required rows: $(d2_n input_required) (want 1)"
+[ "$(d2_n wake_attempted)" = 0 ] && ok "record-only itself attempts no immediate wake" \
+  || bad "record-only attempted an immediate wake: $(d2_n wake_attempted)"
+sleep 2.5
+[ "$(d2_n wake_attempted)" -ge 1 ] && ok "the armed backstop delivers a bounded wake after the grace window" \
+  || bad "no backstop wake after the grace window: wake_attempted=$(d2_n wake_attempted)"
+
+# When the owner's own held timer is STILL alive for the same prompt,
+# record-only's backstop must not double-wake — same shared
+# grace_realert_<run>_<task>_<pid> claim the held path and
+# release_wake_hold already share (lib/alert-gate.sh).
+set_task_state runD2 taskD2 running >/dev/null 2>&1
+clean_screen > "$COND_SCREEN"
+omp_menu_screen "git log --oneline -5" > "$WORKER_SCREEN"
+d2_pid2="$(prompt_id "$WPANE")"
+claim_once "grace_realert_runD2_taskD2_${d2_pid2}" runD2 taskD2 grace_realert_claim '{}' >/dev/null 2>&1
+( export HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" HERDR_RUN_ID=runD2 HERDR_TASK_ID=taskD2 \
+         HERDR_TASK_LABEL="impl:d2" HERDR_ALERT_GRACE_S=1
+  . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+  push_wake "impl:d2 needs input" "agent-hook" "" "" record-only >/dev/null 2>&1 )
+sleep 2.5
+[ "$(d2_n wake_attempted)" = 1 ] && ok "a live owner's claim is not double-woken by the record-only backstop" \
+  || bad "wake_attempted after owner-claim-held race: $(d2_n wake_attempted) (want 1, from the first case)"
+set_task_state runD2 taskD2 completed no-follow-on >/dev/null 2>&1
+clean_screen > "$WORKER_SCREEN"
+
 printf '\n%s\n' "-----"
 printf 'passed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then printf 'PASS\n'; exit 0; else printf 'FAIL\n'; exit 1; fi
