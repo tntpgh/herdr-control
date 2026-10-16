@@ -315,15 +315,29 @@ cp "$WORK/new.txt" "$WORKER_SCREEN"
   && ok "push_wake with a stale expected prompt id writes nothing" \
   || bad "push_wake expect-id: new=$(pid_rows "$NEW_PID") old=$(pid_rows "$OLD_PID")"
 
-# -- absent panel (auto-approved) is NOT extended ---------------------------
+# -- mid-paint frame reads as NO prompt, then the panel parses (live 00:45Z) -
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
 seen call-7 sess-7
 printf 'ordinary agent output\n' > "$WORKER_SCREEN"
-start=$(date +%s)
+( sleep 2.5; unreadable_menu > "$WORKER_SCREEN.tmp" && mv "$WORKER_SCREEN.tmp" "$WORKER_SCREEN"
+  sleep 1; printf 'repaint\n' > "$WORKER_SCREEN.tmp" && mv "$WORKER_SCREEN.tmp" "$WORKER_SCREEN"
+  sleep 1; keyhint_panel > "$WORKER_SCREEN.tmp" && mv "$WORKER_SCREEN.tmp" "$WORKER_SCREEN" ) &
 run_notify ',"call_id":"call-7","native_session":"sess-7"'
+wait
+[ "$(tooled_rows)" -ge 1 ] \
+  && ok "a panel that flips no-prompt/unreadable before parsing still gets its tooled row" \
+  || bad "flipping panel: tooled=$(tooled_rows)"
+
+# -- a bound request whose panel never paints: bounded, writes nothing ------
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-22 sess-22
+printf 'ordinary agent output\n' > "$WORKER_SCREEN"
+start=$(date +%s)
+HERDR_NOTIFY_UNREADABLE_DEADLINE_S=3 run_notify ',"call_id":"call-22","native_session":"sess-22"'
 elapsed=$(( $(date +%s) - start ))
-[ "$elapsed" -le 4 ] && ok "absent panel keeps the original short probe (${elapsed}s)" \
-  || bad "absent panel waited ${elapsed}s"
+[ "$elapsed" -le 5 ] && [ "$(tooled_rows)" = 0 ] \
+  && ok "never-painted panel stops at the budget (${elapsed}s) with no tooled row" \
+  || bad "never-painted: ${elapsed}s tooled=$(tooled_rows)"
 
 printf -- '-----\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
