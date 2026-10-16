@@ -274,7 +274,12 @@ fi
 id=(--db "$DB" --run run1 --task task1 --pane "$PANE" --birth "$BIRTH" --session "$SESSION")
 "${OCC[@]}" withdrawn "${id[@]}" --call-id "$X_CALL" --reason test >/dev/null
 "${OCC[@]}" withdrawn "${id[@]}" --call-id "$Y_CALL" --reason test >/dev/null
-BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
+# BOUND_PROTOCOL stays set (NOT cleared here): the sections below reuse the
+# "omp.tool-approval-binding.v1" value this file set once early, same as
+# before this diff's two sections existed -- clearing it here starved every
+# later bound `record()` call of `--binding-protocol` until the file's own
+# designed clear point after the atomic-claim terminal-state loop below.
+BOUND_REQUEST=""; BOUND_DIGEST=""
 
 printf '== deferred request revalidates ownership and resolves once under a race ==\n'
 BOUND_REQUEST="request-277-owner-change"
