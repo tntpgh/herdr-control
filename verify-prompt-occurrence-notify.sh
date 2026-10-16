@@ -384,5 +384,51 @@ SWITCH_ON_CLAIM="$WORK/new.txt" run_notify ',"call_id":"call-24","native_session
   && ok "screen switching before push_wake's read: nothing written, trace says no tool row" \
   || bad "expect-id mismatch: new=$(pid_rows "$NEW_PID") old=$(pid_rows "$OLD_PID") trace=$(outc)"
 
+# -- fix/notify-binding-scope regression: a never-resolved occurrence from a
+# DIFFERENT session (a crash, killed pane, or a harness restart losing the
+# in-memory callId map before tool_execution_end ever fires) must not
+# starve a later call in a different session forever. Before the
+# (pane,birth,session)-scoped fold filter, "earliest requested across the
+# whole task" picked the stale sess-30 occurrence permanently and every
+# later call's hook saw _occ_not_yet=1 forever (review BLOCK, Finding 1).
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-30 sess-30                            # stale: seen, never resolved
+seen call-31 sess-31
+keyhint_panel > "$WORKER_SCREEN"
+run_notify ',"call_id":"call-31","native_session":"sess-31"'
+[ "$(tooled_rows)" -ge 1 ] \
+  && ok "a stale never-resolved occurrence in another session does not block a later session's own call" \
+  || bad "cross-session stale occurrence blocked binding: tooled=$(tooled_rows) $(cat "$WORK/n.err")"
+
+# -- same-session: an earlier, still-open (genuinely live) requested call
+# keeps deferring a later call in that SAME session — unchanged. No
+# resolution has proven the earlier one dead, so it must still win.
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-32 sess-32; seen call-33 sess-32       # call-32 earliest/still open
+keyhint_panel > "$WORKER_SCREEN"
+start=$(date +%s)
+HERDR_NOTIFY_UNREADABLE_DEADLINE_S=3 run_notify ',"call_id":"call-33","native_session":"sess-32"'
+elapsed=$(( $(date +%s) - start ))
+[ "$(tooled_rows)" = 0 ] && [ "$elapsed" -ge 2 ] \
+  && ok "same-session earlier live requested call still defers the later call (${elapsed}s), unchanged" \
+  || bad "same-session live defer: tooled=$(tooled_rows) elapsed=${elapsed}s"
+
+# -- same-session: a never-resolved occurrence is DEAD once a LATER
+# occurrence in the same (pane,birth,session) has resolved — omp paints
+# panels oldest-first, so a later one could not have been reached, let
+# alone resolved, while the earlier one was still genuinely pending.
+# Ordering proves it dead; it must not block a still-later call forever.
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-34 sess-34                             # stale: seen, never resolved
+seen call-35 sess-34
+python3 "$here/lib/prompt-occurrence.py" withdrawn --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-34 --call-id call-35 >/dev/null 2>&1
+seen call-36 sess-34
+keyhint_panel > "$WORKER_SCREEN"
+run_notify ',"call_id":"call-36","native_session":"sess-34"'
+[ "$(tooled_rows)" -ge 1 ] \
+  && ok "same-session dead occurrence (a later one already withdrawn) does not block" \
+  || bad "same-session dead occurrence blocked binding: tooled=$(tooled_rows) $(cat "$WORK/n.err")"
+
 printf -- '-----\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

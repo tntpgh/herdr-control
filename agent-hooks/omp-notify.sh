@@ -181,9 +181,46 @@ _occ_still_ours() {
   [ "$lc" = requested ] || return 1
   [ "$(printf '%s' "$st" | jq -r '.authorization // "none"' 2>/dev/null)" = none ] || return 1
   key="$(printf '%s' "$st" | jq -r '.occ_key // ""' 2>/dev/null)"
+  # Scoped to THIS call's own (pane, pane_birth, native_session) — never
+  # the whole task_id. fold_task has no occurrence-identity boundary of its
+  # own (lib/prompt-occurrence.py fold_task queries WHERE run_id=? AND
+  # task_id=? only, with no pane/birth/session filter), so an unscoped
+  # "earliest requested across the task" starves every later call forever
+  # the moment ANY occurrence never resolves — a crashed call, a killed
+  # pane, or omp-herdr-control.ts's in-memory occurrenceByCallId map losing
+  # a call across a harness restart before tool_execution_end ever fires
+  # (review BLOCK, Finding 1: review/notify-binding-concurrent REVIEW.md).
+  # pane_id/pane_birth/native_session are recorded on every fold record
+  # from its own `seen` payload (lib/prompt-occurrence.py fold_task,
+  # rec["pane_id"]/rec["pane_birth"]/rec["native_session"]), so filtering on
+  # them here needs no new fold parameter or registry query — a stale
+  # occurrence from a previous pane birth or session is excluded by
+  # construction, exactly like the `state` call three lines up already
+  # scopes by the same three fields.
+  #
+  # Within the SAME (pane, birth, session) scope a never-resolved
+  # occurrence can still starve every later call in that one session
+  # forever (an aborted call with no tool_execution_end). Ordering proves
+  # it dead instead: if a LATER occurrence (by first_seen_seq) in the same
+  # scope has already resolved (completed/declined/withdrawn — any
+  # `resolved:*` lifecycle), the earlier still-`requested` one cannot
+  # still be the one on screen, because omp paints panels oldest-first —
+  # the later one could not have been reached, let alone resolved, while
+  # the earlier one was still genuinely pending. Excluded by
+  # construction below rather than trusted as "earliest": a requested
+  # occurrence whose first_seen_seq is <= the scope's latest resolved
+  # first_seen_seq is dead weight, not a live blocker. Genuine concurrent
+  # ambiguity (two still-live requested calls) is untouched: neither is
+  # resolved, so neither excludes the other, and the command-corroboration
+  # check below still fails closed on a mismatch.
   earliest="$("$_occ_py" "$here/lib/prompt-occurrence.py" fold --db "$(registry_db)" \
     --run "$HERDR_RUN_ID" --task "$HERDR_TASK_ID" 2>/dev/null \
-    | jq -r '[.[] | select(.lifecycle=="requested")] | sort_by(.first_seen_seq) | (.[0].occ_key // "")' 2>/dev/null)"
+    | jq -r --arg p "$pane" --arg b "${_occ_pane_birth:-}" --arg s "$native_session" '
+        [.[] | select(.pane_id==$p) | select(.pane_birth==$b) | select(.native_session==$s)] as $scope
+        | ([$scope[] | select(.lifecycle | startswith("resolved")) | .first_seen_seq] | max // -1) as $deadline
+        | [$scope[] | select(.lifecycle=="requested") | select(.first_seen_seq > $deadline)]
+        | sort_by(.first_seen_seq) | (.[0].occ_key // "")
+      ' 2>/dev/null)"
   _occ_why=earliest
   if [ -n "$key" ] && [ "$key" = "$earliest" ]; then _occ_why=bound; return 0; fi
   # Still genuinely pending (requested, unresolved) — just behind another
