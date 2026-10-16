@@ -1179,6 +1179,154 @@ console.log("ON_NO_RESOLVER:" + JSON.stringify(handlers["tool_approval_requested
     && ok "flag on: no resolveToolApproval callback available never defers" \
     || bad "flag-on no-resolver wrongly deferred: $bb_on_out"
 
+  printf '== TS shim: fix/deferred-notify -- deferred identity reaches omp-notify.sh ==\n'
+  # Change 1 (.handoffs/SPEC.md): onApprovalRequested must pass the exact
+  # deferred identity (approval_request_id/core_arguments_digest/
+  # binding_protocol/deferred:true) to notifyForPrompt, never only for an
+  # ordinary approval. A genuine (non-forced-failure) deferred call so the
+  # detached persist-before-notify task actually reaches notifyForPrompt,
+  # unlike the forced-catch case above which never gets that far.
+  : > "$REC.notify"
+  df_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, handleToolApproval: fn => { handlers["tool_approval_requested"] = fn; } });
+const input = { path: process.env.SHIM_WT + "/deferred-notify.md", content: "x" };
+const json = JSON.stringify(input);
+const digest = "sha256:" + Bun.SHA256.hash(json, "hex");
+const resolutions = [];
+const ret = handlers["tool_approval_requested"]({
+  toolName: "write", toolCallId: "call-df-1", sessionId: "session-df-1",
+  requestId: "request-df-1", bindingProtocol: "omp.tool-approval-binding.v1",
+  argumentsJson: json, argumentsDigest: digest, exclusiveResolver: true,
+}, { resolveToolApproval: r => { resolutions.push(r); return true; } });
+console.log("DF_RETURN:" + JSON.stringify(ret));
+await new Promise(r => setTimeout(r, 1000));
+' 2>&1)"
+  printf '%s' "$df_out" | grep -q 'DF_RETURN:{"defer":true}' \
+    && ok "deferred write approval returns {defer:true}, same shape as before" \
+    || bad "deferred write did not defer: $df_out"
+  jq -e '.deferred == true' "$REC.notify" >/dev/null 2>&1 \
+    && ok "notify payload carries deferred:true for an exclusiveResolver request" \
+    || bad "deferred flag missing from notify JSON: $(cat "$REC.notify" 2>/dev/null)"
+  jq -e '.approval_request_id == "request-df-1"' "$REC.notify" >/dev/null 2>&1 \
+    && ok "notify payload carries the exact approval_request_id" \
+    || bad "approval_request_id missing/wrong in notify JSON: $(cat "$REC.notify" 2>/dev/null)"
+  jq -e '.core_arguments_digest | startswith("sha256:")' "$REC.notify" >/dev/null 2>&1 \
+    && ok "notify payload carries the exact core_arguments_digest" \
+    || bad "core_arguments_digest missing/wrong in notify JSON: $(cat "$REC.notify" 2>/dev/null)"
+  jq -e '.binding_protocol == "omp.tool-approval-binding.v1"' "$REC.notify" >/dev/null 2>&1 \
+    && ok "notify payload carries the exact binding_protocol" \
+    || bad "binding_protocol missing/wrong in notify JSON: $(cat "$REC.notify" 2>/dev/null)"
+  # UNCHANGED: an ordinary (non-deferred) approval's notify payload carries
+  # no deferred identity at all -- the ordinary/unbound path is untouched.
+  : > "$REC.notify"
+  ord_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, handleToolApproval: fn => { handlers["tool_approval_requested"] = fn; } });
+const ret = handlers["tool_approval_requested"]({ toolName: "bash", toolCallId: "call-df-ord", reason: "ordinary", approvalMode: "write" });
+console.log("ORD_RETURN:" + JSON.stringify(ret));
+await new Promise(r => setTimeout(r, 1000));
+' 2>&1)"
+  printf '%s' "$ord_out" | grep -q 'ORD_RETURN:undefined' \
+    && ok "an ordinary approval still returns undefined (never defers)" \
+    || bad "ordinary approval wrongly deferred: $ord_out"
+  jq -e 'has("deferred") | not' "$REC.notify" >/dev/null 2>&1 \
+    && ok "an ordinary approval's notify payload carries no deferred identity (unchanged path)" \
+    || bad "ordinary approval notify JSON unexpectedly carries deferred fields: $(cat "$REC.notify" 2>/dev/null)"
+  # NEGATIVE: exclusiveResolver:false on an otherwise-complete v1-bound write
+  # falls back to the OLD menu path -- never defers, and never leaks deferred
+  # identity into the notify payload either.
+  : > "$REC.notify"
+  nx_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, handleToolApproval: fn => { handlers["tool_approval_requested"] = fn; } });
+const input = { path: process.env.SHIM_WT + "/non-exclusive.md", content: "x" };
+const json = JSON.stringify(input);
+const ret = handlers["tool_approval_requested"]({
+  toolName: "write", toolCallId: "call-df-nx", sessionId: "session-df-nx",
+  requestId: "request-df-nx", bindingProtocol: "omp.tool-approval-binding.v1",
+  argumentsJson: json, argumentsDigest: "sha256:" + Bun.SHA256.hash(json, "hex"),
+  exclusiveResolver: false,
+}, { resolveToolApproval: () => true });
+console.log("NX_RETURN:" + JSON.stringify(ret));
+await new Promise(r => setTimeout(r, 1000));
+' 2>&1)"
+  printf '%s' "$nx_out" | grep -q 'NX_RETURN:undefined' \
+    && ok "exclusiveResolver:false on a write never defers (old menu path)" \
+    || bad "exclusiveResolver:false wrongly deferred: $nx_out"
+  jq -e 'has("deferred") | not' "$REC.notify" >/dev/null 2>&1 \
+    && ok "exclusiveResolver:false's notify payload carries no deferred identity either" \
+    || bad "exclusiveResolver:false notify JSON unexpectedly carries deferred fields: $(cat "$REC.notify" 2>/dev/null)"
+
+  printf '== TS shim: fix/deferred-notify -- the poll resolves through the REAL bound resolver (herdr-select'"'"'s own authorize-bound) ==\n'
+  # End to end, no stub in the middle: a genuine deferred write is proposed,
+  # the detached task persists it and starts polling prompt-occurrence.py
+  # state exactly like production; herdr-select.sh's own authorize-bound CLI
+  # (the same one the exact-id resolver in herdr-select.sh calls) approves it
+  # against the SAME registry while the poll is mid-flight; the NEXT poll
+  # tick must see approved_awaiting_completion and resolve the binding
+  # approved=true via ctx.resolveToolApproval -- proving Change 3's occurrence
+  # identity is actually actionable by a conductor, not just well-formed.
+  e2e_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" \
+    E2E_DB="$SHIM/state/registry.sqlite3" E2E_PY="$here/lib/prompt-occurrence.py" \
+    E2E_WT="$SHIM/wt" E2E_CPANE="$CPANE" E2E_CBIRTH="$CBIRTH" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, handleToolApproval: fn => { handlers["tool_approval_requested"] = fn; } });
+const input = { path: process.env.SHIM_WT + "/e2e-resolve.md", content: "x" };
+const json = JSON.stringify(input);
+const resolutions = [];
+const ret = handlers["tool_approval_requested"]({
+  toolName: "write", toolCallId: "call-e2e-1", sessionId: "session-e2e-1",
+  requestId: "request-e2e-1", bindingProtocol: "omp.tool-approval-binding.v1",
+  argumentsJson: json, argumentsDigest: "sha256:" + Bun.SHA256.hash(json, "hex"), exclusiveResolver: true,
+}, { resolveToolApproval: r => { resolutions.push(r); return true; } });
+console.log("E2E_RETURN:" + JSON.stringify(ret));
+// Let persistence land and the first (immediate) poll tick observe "requested".
+await new Promise(r => setTimeout(r, 1200));
+console.log("E2E_STILL_UNRESOLVED:" + JSON.stringify(resolutions));
+const seenQ = Bun.spawnSync(["sqlite3", process.env.E2E_DB,
+  "SELECT payload FROM events WHERE type=\x27prompt_occ_seen\x27 AND task_id=\x27shimtask\x27 AND json_extract(payload,\x27$.tool_call_id\x27)=\x27call-e2e-1\x27;"]);
+const seenRow = JSON.parse(seenQ.stdout.toString().trim().split("\n")[0]);
+const approve = Bun.spawnSync(["python3", process.env.E2E_PY, "authorize-bound",
+  "--db", process.env.E2E_DB, "--run", seenRow.run_id, "--task", seenRow.task_id,
+  "--pane", seenRow.pane_id, "--birth", seenRow.pane_birth,
+  "--session", seenRow.native_session, "--call-id", seenRow.tool_call_id,
+  "--approval-request-id", seenRow.approval_request_id, "--core-arguments-digest", seenRow.core_arguments_digest,
+  "--worktree", process.env.E2E_WT, "--conductor-pane", process.env.E2E_CPANE,
+  "--conductor-birth", process.env.E2E_CBIRTH, "--approval-id", "approval-e2e-1",
+  "--choice", "1", "--authority", "conductor", "--decided-by", "test-conductor",
+  "--review-reason", "e2e test", "--review-category", "branch-work", "--reviewer", "test",
+  "--audit-text", "e2e authorize-bound", "--expect-payload-sha", seenRow.payload_sha256]);
+console.log("E2E_AUTHORIZE:" + approve.stdout.toString().trim() + approve.stderr.toString().trim());
+// Give the poll a chance -- its 500ms ticks room to observe the approval,
+// bounded generously (subprocess-chain jitter) rather than guessing one
+// fixed sleep -- stop as soon as resolveBound actually fires.
+for (let waited = 0; waited < 6000 && resolutions.length === 0; waited += 200) {
+  await new Promise(r => setTimeout(r, 200));
+}
+console.log("E2E_RESOLUTIONS:" + JSON.stringify(resolutions));
+' 2>&1)"
+  printf '%s' "$e2e_out" | grep -q 'E2E_RETURN:{"defer":true}' \
+    && ok "e2e: the deferred write returns {defer:true}" \
+    || bad "e2e return shape wrong: $e2e_out"
+  printf '%s' "$e2e_out" | grep -q 'E2E_STILL_UNRESOLVED:\[\]' \
+    && ok "e2e: still unresolved while only 'requested' is on record (no premature approval)" \
+    || bad "e2e resolved too early: $e2e_out"
+  printf '%s' "$e2e_out" | grep -q '"written": "authorized"' \
+    && ok "e2e: herdr-select's own authorize-bound CLI accepted the exact identity" \
+    || bad "e2e authorize-bound did not land: $e2e_out"
+  printf '%s' "$e2e_out" | grep -q 'E2E_RESOLUTIONS:\[{"bindingProtocol":"omp.tool-approval-binding.v1","requestId":"request-e2e-1","sessionId":"session-e2e-1","toolCallId":"call-e2e-1","toolName":"write","argumentsDigest":"sha256:[0-9a-f]*","approved":true}\]' \
+    && ok "e2e: the hook's own poll observed approved_awaiting_completion and resolved the exact binding approved=true" \
+    || bad "e2e poll did not resolve approved via the real bound resolver: $e2e_out"
+
   printf '== TS shim: every envelope is ACKED, and no report enters the prompt ==\n'
   # History matters here, because these assertions were pointed the wrong way
   # for two releases. 0fbece0 delivered the report through pi.sendMessage and
