@@ -638,6 +638,26 @@ grep -- '--class human-stale' "$REC_LOG" | grep -q -- '--choices' \
 grep -- '--class human-stale' "$REC_LOG" | grep -q -- 'herdr-select.sh' \
   && ok "integrated: the human-stale post carries the exact-id answer command" \
   || bad "integrated: human-stale post lacks the answer hint: $(cat "$REC_LOG")"
+# The generated answer hint must use only flags its two commands accept
+# (v13 canary: --approval-arguments-digest etc. were refused as unknown).
+# Parsed against each command's own argument list; nothing is executed.
+hs_post="$(grep -- '--class human-stale' "$REC_LOG" | grep -- 'sess-req-i1' | head -1)"
+sel_part="${hs_post#*herdr-select.sh }"
+prop_part="${hs_post#*prompt-occurrence.py proposal }"; prop_part="${prop_part%%  ·  then*}"
+sel_known="$(grep -oE '^ +--[a-z-]+\)' "$here/herdr-select.sh" | tr -d ' )' | sort -u)"
+prop_known="$(python3 "$here/lib/prompt-occurrence.py" proposal --help 2>/dev/null | grep -oE -- '--[a-z-]+' | sort -u)"
+bad_flags=""
+for f in $(printf '%s\n' "$sel_part" | grep -oE -- '--[a-z-]+' | sort -u); do
+  printf '%s\n' "$sel_known" | grep -qx -- "$f" || bad_flags="$bad_flags herdr-select:$f"
+done
+for f in $(printf '%s\n' "$prop_part" | grep -oE -- '--[a-z-]+' | sort -u); do
+  printf '%s\n' "$prop_known" | grep -qx -- "$f" || bad_flags="$bad_flags proposal:$f"
+done
+for req in --db --worktree; do printf '%s' "$prop_part" | grep -q -- "$req " || bad_flags="$bad_flags proposal-missing:$req"; done
+printf '%s' "$sel_part" | grep -q -- '--expect-payload-sha ' || bad_flags="$bad_flags select-missing:--expect-payload-sha"
+[ -n "$hs_post" ] && [ -z "$bad_flags" ] \
+  && ok "integrated: the answer hint uses only flags herdr-select.sh and proposal accept" \
+  || bad "integrated: answer hint flags not accepted:${bad_flags:- (no post)}"
 
 printf -- '-----\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

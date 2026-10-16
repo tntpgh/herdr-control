@@ -438,7 +438,11 @@ _deferred_hint=""
 if [ "$deferred" = true ]; then
   if [ "$_deferred_bound" = 1 ]; then
     msg="$msg  ·  DEFERRED, no panel painted — exact identity: approval_request_id=$approval_request_id tool_call_id=${call_id:-} core_arguments_digest=$core_arguments_digest"
-    _deferred_hint="review: lib/prompt-occurrence.py proposal --run ${HERDR_RUN_ID:-} --task ${HERDR_TASK_ID:-} --pane $pane --tool $tool --approval-request-id $approval_request_id --expect-arguments-digest $core_arguments_digest --expect-tool-call-id ${call_id:-} --show  ·  then herdr-select.sh $pane <1=Approve|2=Deny> --approval-request-id $approval_request_id --approval-arguments-digest $core_arguments_digest --approval-tool-call-id ${call_id:-} --approval-payload-sha <sha-from-review> --review-category <cat> --review-reason '<reason>'"
+    # Flags must be ones the commands actually accept (proposal needs --db and
+    # --worktree; herdr-select's bound route takes --expect-*): the v13 canary
+    # hint named --approval-* flags and was refused as an unknown arg.
+    _hint_wt="$(_sql "SELECT worktree FROM tasks WHERE task_id=$(_sq "${HERDR_TASK_ID:-}");" 2>/dev/null)"
+    _deferred_hint="review: lib/prompt-occurrence.py proposal --db $(registry_db) --worktree ${_hint_wt:-<task-worktree>} --run ${HERDR_RUN_ID:-} --task ${HERDR_TASK_ID:-} --pane $pane --tool $tool --approval-request-id $approval_request_id --expect-arguments-digest $core_arguments_digest --expect-tool-call-id ${call_id:-} --show  ·  then herdr-select.sh $pane <1=Approve|2=Deny> --approval-request-id $approval_request_id --expect-arguments-digest $core_arguments_digest --expect-tool-call-id ${call_id:-} --expect-payload-sha <payload_sha256-from-review> --review-category <cat> --review-reason '<reason>'"
   else
     msg="$msg  ·  DEFERRED, no panel painted — this call's own registry occurrence could not be exactly verified (stale/mismatched/ambiguous); inspect task ${HERDR_TASK_ID:-} directly, no approval can be named"
   fi
