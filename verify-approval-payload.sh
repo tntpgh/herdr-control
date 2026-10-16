@@ -249,6 +249,7 @@ if [ "$rc" -eq 0 ] && [ "$(keys_pressed)" = 0 ] && [ "$authorized_count" = 1 ] &
 else
   bad "automated exact-id approval: rc=$rc keys=$(keys_pressed) authorized=$authorized_count; $(tail -3 "$WORK/err.txt")"
 fi
+set_task_state run1 task1 blocked >/dev/null 2>&1
 
 printf '== two concurrent pending bound write/edit occurrences: automated approval refuses (Finding 1 ambiguity) ==\n'
 BOUND_REQUEST="request-exact-x"
