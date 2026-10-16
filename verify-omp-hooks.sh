@@ -730,6 +730,25 @@ grep -q -- '--class needs-input' "$NOTIFIED" \
 i=0; while [ "$i" -lt 150 ] && [ "$(hs_ev wake_result)" = 0 ]; do sleep 0.1; i=$((i + 1)); done
 [ "$(hs_ev wake_attempted)" = 1 ] && ok "Main was woken exactly once (the forced wake)" \
   || bad "wake_attempted for taskHS: $(hs_ev wake_attempted)"
+# Deferred-notify review HIGH: a deferred request paints no panel, so
+# grace_realert's screen re-check can never see it; a HELD deferred wake would
+# stand down silently until the TS poll's 60-min deny. With the same
+# allow-class panel still on screen (it held taskHS above), a deferred
+# push_wake must deliver at once and never hold.
+accept_local_task_authorization runDF-taskDF-claim "$CPANE" "$CBIRTH" /repo '{}' >/dev/null 2>&1
+register_task runDF taskDF wDF condDF "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wtDF "impl:deferred" main '' '' '{}' hook runDF-taskDF-claim >/dev/null 2>&1
+mark_authorization_launch runDF-taskDF-claim taskDF runDF launch_claimed >/dev/null 2>&1
+mark_authorization_launch runDF-taskDF-claim taskDF runDF launched >/dev/null 2>&1
+( . "$here/lib/pane-guard.sh"; . "$here/lib/push-wake.sh"
+  HERDR_PANE_ID="$WPANE" HERDR_CONDUCTOR_PANE_ID="$CPANE" HERDR_RUN_ID=runDF HERDR_TASK_ID=taskDF \
+  HERDR_TASK_LABEL="impl:deferred" HERDR_ALERT_GRACE_S=60 HERDR_DEFERRED_PID="deferred:req-df-1" \
+    push_wake "impl:deferred needs input" "hook" "git fetch origin --prune" "bash" >/dev/null 2>&1 )
+df_ev() { sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  "SELECT count(*) FROM events WHERE task_id='taskDF' AND type='$1';" 2>/dev/null; }
+[ "$(df_ev wake_held)" = 0 ] && ok "a deferred allow-class wake is never held" \
+  || bad "deferred wake HELD (grace_realert cannot see a deferred prompt)"
+[ "$(df_ev wake_attempted)" = 1 ] && ok "the deferred wake was delivered immediately" \
+  || bad "deferred wake_attempted: $(df_ev wake_attempted)"
 # The human-stale ERROR timer keeps its own claim namespace, so a release or a
 # re-wake that took grace_realert_* for this prompt can never silence it.
 hs_trace="$WORK/hs-trace.log"; : > "$hs_trace"

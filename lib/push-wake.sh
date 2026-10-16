@@ -428,7 +428,9 @@ push_wake() {
             AND json_extract(payload,'\$.prompt_id')=$(_sq "$pid");" 2>/dev/null)"
     [ "${refused_n:-0}" -gt 0 ] 2>/dev/null && already_refused=1
   fi
-  if [ -z "${HERDR_ALERT_FORCE:-}" ] && [ "$already_refused" = 0 ] && [ -n "${HERDR_PANE_ID:-}" ] && ! human_must_answer "${HERDR_PANE_ID}" "$full_cmd"; then
+  # A deferred approval paints no panel, so grace_realert's screen re-check can
+  # never see it and a HELD deferred wake would stand down silently. Deliver.
+  if [ -z "${HERDR_ALERT_FORCE:-}" ] && [ -z "${HERDR_DEFERRED_PID:-}" ] && [ "$already_refused" = 0 ] && [ -n "${HERDR_PANE_ID:-}" ] && ! human_must_answer "${HERDR_PANE_ID}" "$full_cmd"; then
     if [ -n "${HERDR_RUN_ID:-}" ] && [ -n "${HERDR_TASK_ID:-}" ]; then
       append_event "$HERDR_RUN_ID" "$HERDR_TASK_ID" "wake_held" \
         "$(jq -nc --arg p "$cpane" --arg pid "$pid" --arg k "$base" \
