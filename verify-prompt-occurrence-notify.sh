@@ -194,18 +194,24 @@ wait
   && ok "late-parsing panel gets the hook-written input_required carrying tool=bash" \
   || bad "no tooled input_required for late-parsing panel: $(cat "$WORK/n.err")"
 
-# -- superseded during the wait: a later tool call recorded its own seen ----
-# The panel that becomes parseable is the REPLACEMENT's; this hook must not
-# attach its tool/command to it, nor record a screen row for it.
+# -- a later tool call's own seen does not disturb an earlier, still-open
+# occurrence's wait: the earlier call keeps waiting for (and correctly
+# binds to) its own panel instead of giving up the instant a later seen
+# exists — the "A" side of the fix/notify-binding-concurrent trace: A's
+# own hook exited at once with superseded=1 merely because A "was not the
+# task's latest seen", even though A's panel was the one genuinely on
+# screen. Only an explicit resolution (declined/withdrawn/completed, the
+# next case below) supersedes a still-open occurrence now — a newer SEEN
+# alone no longer does.
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
 seen call-8 sess-8
 unreadable_menu > "$WORKER_SCREEN"
 ( sleep 1.8; seen call-9 sess-8; sleep 0.7; keyhint_panel > "$WORKER_SCREEN.tmp" && mv "$WORKER_SCREEN.tmp" "$WORKER_SCREEN" ) &
 run_notify ',"call_id":"call-8","native_session":"sess-8"'
 wait
-[ "$(tooled_rows)" = 0 ] && [ "$(screen_rows)" = 0 ] \
-  && ok "superseded occurrence writes neither input_required nor a screen row for the replacement prompt" \
-  || bad "superseded: tooled=$(tooled_rows) screen=$(screen_rows)"
+[ "$(tooled_rows)" -ge 1 ] && [ "$(screen_rows)" = 1 ] \
+  && ok "a still-open earlier occurrence keeps waiting through a later seen and still binds to its own panel" \
+  || bad "earlier-occurrence-survives-later-seen: tooled=$(tooled_rows) screen=$(screen_rows)"
 
 # -- resolved during the wait (declined): cancel, no push ------------------
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
@@ -241,14 +247,20 @@ elapsed=$(( $(date +%s) - start ))
 [ "$elapsed" -le 13 ] && ok "an oversized deadline override is clamped to 10s total (${elapsed}s)" \
   || bad "deadline override not clamped: ${elapsed}s"
 
-# -- races on the FAST path: parseable at once, but no longer ours ----------
+# -- races on the FAST path: a LATER call sees an already-up, ambiguous
+# panel at once but it is not yet its turn — an EARLIER, still-open
+# call-12 was seen first — so it must wait, bounded, for its own panel
+# rather than binding to the one already showing (the "B" side of the
+# same trace). A short deadline override keeps the assertion fast.
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
-seen call-11 sess-11; seen call-12 sess-11      # replacement already recorded
+seen call-12 sess-11; seen call-11 sess-11      # call-12 is earliest/still open
 keyhint_panel > "$WORKER_SCREEN"
-run_notify ',"call_id":"call-11","native_session":"sess-11"'
-[ "$(tooled_rows)" = 0 ] && [ "$(screen_rows)" = 0 ] \
-  && ok "fast-path parse of a replacement prompt pushes nothing for the old occurrence" \
-  || bad "fast-path replacement: tooled=$(tooled_rows) screen=$(screen_rows)"
+start=$(date +%s)
+HERDR_NOTIFY_UNREADABLE_DEADLINE_S=3 run_notify ',"call_id":"call-11","native_session":"sess-11"'
+elapsed=$(( $(date +%s) - start ))
+[ "$(tooled_rows)" = 0 ] && [ "$(screen_rows)" = 1 ] && [ "$elapsed" -ge 2 ] \
+  && ok "fast-path parse while a still-open earlier call is queued ahead waits (${elapsed}s), binding nothing" \
+  || bad "fast-path not-yet-turn: tooled=$(tooled_rows) screen=$(screen_rows) elapsed=${elapsed}s"
 sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
 seen call-13 sess-13
 python3 "$here/lib/prompt-occurrence.py" declined --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
