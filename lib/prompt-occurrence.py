@@ -142,7 +142,9 @@ def payload_sha256(tool: str, tool_input: object) -> str:
 # PROPOSAL_TOOLS stays exactly {"write", "edit"} — today's behaviour,
 # byte-for-byte. Binding proves identity only; the canonical bash command
 # still goes through herdr-select.sh's Path A command-policy check.
-HERDR_BOUND_BASH = os.environ.get("HERDR_BOUND_BASH", "").strip() == "1"
+# Exact "1" only, no whitespace trimming: must match herdr-select.sh and the
+# TS hook byte-for-byte so a padded value is OFF in all three readers.
+HERDR_BOUND_BASH = os.environ.get("HERDR_BOUND_BASH", "") == "1"
 PROPOSAL_TOOLS = {"write", "edit"} | ({"bash", "shell"} if HERDR_BOUND_BASH else set())
 PROPOSAL_VERSION = 1
 # Bounded: raw input never enters the shared events table, only this

@@ -1102,6 +1102,24 @@ console.log("WRITE_FLAG_OFF:" + JSON.stringify(handlers["tool_approval_requested
   printf '%s' "$bb_out" | grep -q 'WRITE_FLAG_OFF:{"defer":true}' \
     && ok "positive control: write still defers under the SAME complete v1 fields" \
     || bad "positive control (write) failed: $bb_out"
+  # A padded flag value is OFF in all three readers (exact "1" only); the
+  # selector never trims, so the hook must not either or bash would defer to a
+  # selector that refuses it (60-minute stall, then deny).
+  bb_pad_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" HERDR_BOUND_BASH=" 1 " bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, handleToolApproval: fn => { handlers["tool_approval_requested"] = fn; } });
+const input = { command: "ls -la" };
+const json = JSON.stringify(input);
+const f = { toolName: "bash", toolCallId: "call-bb-pad", sessionId: "session-bb-pad",
+  requestId: "request-bb-pad", bindingProtocol: "omp.tool-approval-binding.v1",
+  argumentsJson: json, argumentsDigest: "sha256:" + Bun.SHA256.hash(json, "hex"), exclusiveResolver: true };
+console.log("BASH_FLAG_PADDED:" + JSON.stringify(handlers["tool_approval_requested"](f, { resolveToolApproval: () => true })));
+' 2>&1)"
+  printf '%s' "$bb_pad_out" | grep -q 'BASH_FLAG_PADDED:undefined' \
+    && ok "padded HERDR_BOUND_BASH=' 1 ' is OFF in the hook, matching the selector (no split-brain defer)" \
+    || bad "padded flag value turned bound bash ON in the hook: $bb_pad_out"
   bb_on_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
     HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" HERDR_BOUND_BASH=1 bun -e '
 const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");

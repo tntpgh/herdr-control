@@ -465,7 +465,8 @@ const LOAD_RUN_STATE_DIR = process.env.HERDR_RUN_STATE_DIR?.trim() ?? "";
 // Path A command-policy check (classify_command/conductor_reserved_reason)
 // before any bash/shell approval resolves; this flag never changes who may
 // approve or which categories are allowed.
-const HERDR_BOUND_BASH = process.env.HERDR_BOUND_BASH?.trim() === "1";
+// Exact "1" only, no trim: must match herdr-select.sh and prompt-occurrence.py.
+const HERDR_BOUND_BASH = process.env.HERDR_BOUND_BASH === "1";
 // ~/.omp/agent/extensions/notepad.ts writes $NOTEPAD_PATH (absolute, or
 // relative to the session cwd) when set, else <cwd>/.handoffs/notepad.md or
 // the legacy <cwd>/.omc/notepad.md. Its mutating tools are judged on exactly
