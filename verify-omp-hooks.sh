@@ -125,7 +125,13 @@ omp_menu_screen() {
 clean_screen() { printf ' $ \n ready\n'; }
 
 . "$here/lib/run-registry.sh"
-register_task run1 task1 w1 cond1 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt "impl:omp-test" >/dev/null 2>&1
+# Seed the protected launch claim the way verify-task-authorization-gates.sh:116-119
+# and real spawn-task.sh do, so task_authorization_check succeeds and peer_decide
+# classifies the actual command text instead of short-circuiting to reserved.
+accept_local_task_authorization run1-task1-claim "$CPANE" "$CBIRTH" /repo '{}' >/dev/null 2>&1
+register_task run1 task1 w1 cond1 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt "impl:omp-test" main '' '' '{}' hook run1-task1-claim >/dev/null 2>&1
+mark_authorization_launch run1-task1-claim task1 run1 launch_claimed >/dev/null 2>&1
+mark_authorization_launch run1-task1-claim task1 run1 launched >/dev/null 2>&1
 
 . "$here/lib/prompt-parse.sh"
 printf '== current boxed omp menu: command details are not choices ==\n'
@@ -697,7 +703,10 @@ printf '== the hook and push_wake classify a mismatched recorded command the sam
 # judged the panel alone and HELD the wake, so one prompt was both "a human's"
 # and "a peer's". human_must_answer now drops a mismatched command itself, so
 # both judge the panel: held, and no human-only alert for an allow-class panel.
-register_task runHS taskHS wHS condHS "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wtHS "impl:human-stale" >/dev/null 2>&1
+accept_local_task_authorization runHS-taskHS-claim "$CPANE" "$CBIRTH" /repo '{}' >/dev/null 2>&1
+register_task runHS taskHS wHS condHS "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wtHS "impl:human-stale" main '' '' '{}' hook runHS-taskHS-claim >/dev/null 2>&1
+mark_authorization_launch runHS-taskHS-claim taskHS runHS launch_claimed >/dev/null 2>&1
+mark_authorization_launch runHS-taskHS-claim taskHS runHS launched >/dev/null 2>&1
 omp_menu_screen "git fetch origin --prune" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
 : > "$NOTIFIED"
@@ -1068,6 +1077,107 @@ console.log("BOUND_FAILURE:" + JSON.stringify(boundResolutions));
   grep -q 'RECONCILE mode=session'  "$REC" && ok "session reconcile invoked"  || bad "no session reconcile"
   grep -q 'RECONCILE mode=interval' "$REC" && ok "interval reconcile invoked" || bad "no interval reconcile"
   grep -q 'RESOLVE' "$REC" && ok "alert retraction invoked" || bad "no retraction"
+
+
+  printf '== TS shim: bound-bash boundTool gate (HERDR_BOUND_BASH, slice b) ==\n'
+  # Same mechanism the probe used (onApprovalRequested's synchronous `defer`
+  # return IS the boundTool decision): default absent, boundTool stays
+  # EXACTLY write|edit; with the flag set it widens to write|edit|bash|shell,
+  # and every other negative (missing digest/session/requestId, a tool
+  # outside the set, exclusiveResolver=false, no resolver callback) still
+  # never defers -- binding proves identity only, never which tool may bind.
+  bb_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, handleToolApproval: fn => { handlers["tool_approval_requested"] = fn; } });
+function fields(toolName, overrides) {
+  const input = { command: "ls -la" };
+  const json = JSON.stringify(input);
+  const digest = "sha256:" + Bun.SHA256.hash(json, "hex");
+  return Object.assign({
+    toolName, toolCallId: "call-bb-" + toolName, sessionId: "session-bb-" + toolName,
+    requestId: "request-bb-" + toolName, bindingProtocol: "omp.tool-approval-binding.v1",
+    argumentsJson: json, argumentsDigest: digest, exclusiveResolver: true,
+  }, overrides);
+}
+const ctx = { resolveToolApproval: () => true };
+console.log("BASH_FLAG_OFF:" + JSON.stringify(handlers["tool_approval_requested"](fields("bash"), ctx)));
+console.log("WRITE_FLAG_OFF:" + JSON.stringify(handlers["tool_approval_requested"](fields("write"), ctx)));
+' 2>&1)"
+  printf '%s' "$bb_out" | grep -q 'BASH_FLAG_OFF:undefined' \
+    && ok "flag off: a complete v1-bound bash approval still never defers (today's exact boundTool gate)" \
+    || bad "flag-off bash wrongly deferred: $bb_out"
+  printf '%s' "$bb_out" | grep -q 'WRITE_FLAG_OFF:{"defer":true}' \
+    && ok "positive control: write still defers under the SAME complete v1 fields" \
+    || bad "positive control (write) failed: $bb_out"
+  # A padded flag value is OFF in all three readers (exact "1" only); the
+  # selector never trims, so the hook must not either or bash would defer to a
+  # selector that refuses it (60-minute stall, then deny).
+  bb_pad_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" HERDR_BOUND_BASH=" 1 " bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, handleToolApproval: fn => { handlers["tool_approval_requested"] = fn; } });
+const input = { command: "ls -la" };
+const json = JSON.stringify(input);
+const f = { toolName: "bash", toolCallId: "call-bb-pad", sessionId: "session-bb-pad",
+  requestId: "request-bb-pad", bindingProtocol: "omp.tool-approval-binding.v1",
+  argumentsJson: json, argumentsDigest: "sha256:" + Bun.SHA256.hash(json, "hex"), exclusiveResolver: true };
+console.log("BASH_FLAG_PADDED:" + JSON.stringify(handlers["tool_approval_requested"](f, { resolveToolApproval: () => true })));
+' 2>&1)"
+  printf '%s' "$bb_pad_out" | grep -q 'BASH_FLAG_PADDED:undefined' \
+    && ok "padded HERDR_BOUND_BASH=' 1 ' is OFF in the hook, matching the selector (no split-brain defer)" \
+    || bad "padded flag value turned bound bash ON in the hook: $bb_pad_out"
+  bb_on_out="$(HERDR_CONTROL_DIR="$SHIM" HERDR_RUN_STATE_DIR="$SHIM/state" \
+    HERDR_RUN_ID=shimrun HERDR_TASK_ID=shimtask HERDR_PANE_ID="$WPANE" HERDR_BOUND_BASH=1 bun -e '
+const mod = await import("'"$here"'/agent-hooks/omp-herdr-control.ts");
+const handlers = {};
+mod.default({ on: (ev, fn) => { handlers[ev] = fn; }, handleToolApproval: fn => { handlers["tool_approval_requested"] = fn; } });
+function fields(overrides) {
+  const input = { command: "ls -la" };
+  const json = JSON.stringify(input);
+  const digest = "sha256:" + Bun.SHA256.hash(json, "hex");
+  return Object.assign({
+    toolName: "bash", toolCallId: "call-bb-on", sessionId: "session-bb-on",
+    requestId: "request-bb-on", bindingProtocol: "omp.tool-approval-binding.v1",
+    argumentsJson: json, argumentsDigest: digest, exclusiveResolver: true,
+  }, overrides);
+}
+const ctx = { resolveToolApproval: () => true };
+console.log("ON_COMPLETE:" + JSON.stringify(handlers["tool_approval_requested"](fields({}), ctx)));
+console.log("ON_SHELL:" + JSON.stringify(handlers["tool_approval_requested"](fields({ toolName: "shell", toolCallId: "call-bb-shell", requestId: "request-bb-shell" }), ctx)));
+console.log("ON_EVAL:" + JSON.stringify(handlers["tool_approval_requested"](fields({ toolName: "eval", toolCallId: "call-bb-eval", requestId: "request-bb-eval" }), ctx)));
+console.log("ON_NO_DIGEST:" + JSON.stringify(handlers["tool_approval_requested"](fields({ argumentsDigest: "", toolCallId: "call-bb-nodigest", requestId: "request-bb-nodigest" }), ctx)));
+console.log("ON_NO_SESSION:" + JSON.stringify(handlers["tool_approval_requested"](fields({ sessionId: "", toolCallId: "call-bb-nosession", requestId: "request-bb-nosession" }), ctx)));
+console.log("ON_NO_REQUESTID:" + JSON.stringify(handlers["tool_approval_requested"](fields({ requestId: "", toolCallId: "call-bb-noreqid" }), ctx)));
+console.log("ON_NOT_EXCLUSIVE:" + JSON.stringify(handlers["tool_approval_requested"](fields({ exclusiveResolver: false, toolCallId: "call-bb-nonexcl", requestId: "request-bb-nonexcl" }), ctx)));
+console.log("ON_NO_RESOLVER:" + JSON.stringify(handlers["tool_approval_requested"](fields({ toolCallId: "call-bb-noresolver", requestId: "request-bb-noresolver" }), {})));
+' 2>&1)"
+  printf '%s' "$bb_on_out" | grep -q 'ON_COMPLETE:{"defer":true}' \
+    && ok "flag on: a complete v1-bound bash approval defers (positive control for every negative below)" \
+    || bad "flag-on bash did not defer: $bb_on_out"
+  printf '%s' "$bb_on_out" | grep -q 'ON_SHELL:{"defer":true}' \
+    && ok "flag on: a complete v1-bound shell approval defers too" \
+    || bad "flag-on shell did not defer: $bb_on_out"
+  printf '%s' "$bb_on_out" | grep -q 'ON_EVAL:undefined' \
+    && ok "flag on: a tool name outside write/edit/bash/shell never defers" \
+    || bad "flag-on eval wrongly deferred: $bb_on_out"
+  printf '%s' "$bb_on_out" | grep -q 'ON_NO_DIGEST:undefined' \
+    && ok "flag on: missing/malformed arguments digest never defers" \
+    || bad "flag-on missing digest wrongly deferred: $bb_on_out"
+  printf '%s' "$bb_on_out" | grep -q 'ON_NO_SESSION:undefined' \
+    && ok "flag on: missing session id never defers" \
+    || bad "flag-on missing session wrongly deferred: $bb_on_out"
+  printf '%s' "$bb_on_out" | grep -q 'ON_NO_REQUESTID:undefined' \
+    && ok "flag on: missing request id never defers" \
+    || bad "flag-on missing requestId wrongly deferred: $bb_on_out"
+  printf '%s' "$bb_on_out" | grep -q 'ON_NOT_EXCLUSIVE:undefined' \
+    && ok "flag on: exclusiveResolver=false falls back to today's ordinary panel path, never defers" \
+    || bad "flag-on non-exclusive wrongly deferred: $bb_on_out"
+  printf '%s' "$bb_on_out" | grep -q 'ON_NO_RESOLVER:undefined' \
+    && ok "flag on: no resolveToolApproval callback available never defers" \
+    || bad "flag-on no-resolver wrongly deferred: $bb_on_out"
 
   printf '== TS shim: every envelope is ACKED, and no report enters the prompt ==\n'
   # History matters here, because these assertions were pointed the wrong way

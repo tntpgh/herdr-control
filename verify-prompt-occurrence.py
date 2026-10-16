@@ -485,6 +485,39 @@ class CompletePayloadProposal(unittest.TestCase):
         self.assertFalse(got["ok"])
         self.assertIn("differs from OMP effective arguments", got["reason"])
 
+    def test_bound_lookup_mismatch_negatives_each_with_positive_control(self):
+        """herdr-control Finding 1 fix: proposal_check's bound_lookup branch
+        (the path herdr-select.sh now routes automated write/edit approvals
+        through) refuses every mismatch, each proven against the same
+        identity's own positive control."""
+        db, wt = _isolated_db()
+        inp = {"path": str(wt / ".handoffs" / "exact.md"), "content": "exact routing payload"}
+        core_json = json.dumps(inp, sort_keys=True, separators=(",", ":"))
+        digest = "sha256:" + hashlib.sha256(core_json.encode()).hexdigest()
+        po.record_seen(db, **IDENT, tool="write", tool_input=inp, source="tool_approval_requested",
+                       cwd=str(wt), approval_request_id="req-exact", core_arguments_digest=digest,
+                       binding_protocol="omp.tool-approval-binding.v1", core_arguments_json=core_json)
+
+        def bound_check(**over):
+            kw = dict(approval_request_id="req-exact", expect_arguments_digest=digest, expect_tool_call_id="c1")
+            kw.update(over)
+            return po.proposal_check(db, run_id="r1", task_id="t1", pane_id="p1", pane_birth="b1",
+                                     screen_prompt_id="", worktree=str(wt), **kw)
+
+        digest_mismatch = bound_check(expect_arguments_digest="sha256:" + "f" * 64)
+        self.assertFalse(digest_mismatch["ok"])
+        self.assertIn("digest", digest_mismatch["reason"])
+        call_mismatch = bound_check(expect_tool_call_id="wrong-call")
+        self.assertFalse(call_mismatch["ok"])
+        self.assertIn("call id", call_mismatch["reason"])
+        unknown = bound_check(approval_request_id="req-never-issued")
+        self.assertFalse(unknown["ok"])
+        self.assertIn("no recorded occurrence", unknown["reason"])
+        self.assertTrue(bound_check()["ok"])  # positive control: the real identity still resolves
+        # Replay: once resolved, the same exact request id must never re-authorize.
+        po.record_authorized(db, **IDENT, decided_by="peer", choice="approve")
+        self.assertIn("not awaiting approval", bound_check()["reason"])
+
     def test_new_file_absolute_and_relative_paths_resolve(self):
         db, wt = _isolated_db()
         self._occ(db, wt, tool_input={"path": str(wt / "brand-new.md"), "content": "x\ny\n"})
@@ -781,6 +814,100 @@ class CompletePayloadProposal(unittest.TestCase):
                      "--prompt-id", "NOPE", "--worktree", str(wt), "--show"])
         self.assertTrue(buf.getvalue().startswith("REFUSED:"))
         self.assertNotIn("row 000", buf.getvalue())
+
+
+class ExactPendingResolution(unittest.TestCase):
+    """herdr-control security review Finding 1: the automated write/edit
+    approval gate must resolve the occurrence to authorize by its OWN OMP
+    v1 request id (resolve_exact_pending), never by matching the painted
+    screen's prompt id."""
+
+    def _bound(self, db, *, ident, path, content, screen=""):
+        inp = {"path": path, "content": content}
+        core_json = json.dumps(inp, sort_keys=True, separators=(",", ":"))
+        digest = "sha256:" + hashlib.sha256(core_json.encode()).hexdigest()
+        po.record_seen(db, **ident, tool="write", tool_input=inp, source="tool_approval_requested",
+                       cwd="/repo", approval_request_id=f"req-{ident['tool_call_id']}",
+                       core_arguments_digest=digest, binding_protocol="omp.tool-approval-binding.v1",
+                       core_arguments_json=core_json)
+        if screen:
+            po.record_screen(db, **ident, display="pending_parseable", screen_prompt_id=screen)
+
+    def test_resolves_the_sole_pending_bound_occurrence(self):
+        db, wt = _isolated_db()
+        self._bound(db, ident=IDENT, path=str(wt / "x.md"), content="x")
+        got = po.resolve_exact_pending(db, run_id="r1", task_id="t1", pane_id="p1", pane_birth="b1", tool="write")
+        self.assertTrue(got["ok"], got)
+        self.assertEqual(got["approval_request_id"], "req-c1")
+
+    def test_refuses_when_no_bound_occurrence_is_pending(self):
+        """An ordinary (unbound) write/edit occurrence must never resolve
+        here -- it stays human-only, same as before this fix."""
+        db, wt = _isolated_db()
+        po.record_seen(db, **IDENT, tool="write", tool_input={"path": str(wt / "x.md"), "content": "x"},
+                       source="tool_approval_requested", cwd=str(wt))
+        got = po.resolve_exact_pending(db, run_id="r1", task_id="t1", pane_id="p1", pane_birth="b1", tool="write")
+        self.assertFalse(got["ok"])
+        self.assertIn("no bound write/edit occurrence", got["reason"])
+
+    def test_two_pending_bound_occurrences_are_ambiguous_finding_1(self):
+        """Finding 1 regression: X never recorded its own screen_prompt_id
+        (its own notify.sh invocation silently failed), Y's own screen id
+        is the one actually painted. Automated approval must refuse rather
+        than guess which one owns the screen -- it must NEVER credit Y's
+        approval against X's still-live panel."""
+        db, wt = _isolated_db()
+        x = {**IDENT, "tool_call_id": "x"}
+        y = {**IDENT, "tool_call_id": "y"}
+        self._bound(db, ident=x, path=str(wt / "x.md"), content="X payload")   # no screen write at all
+        self._bound(db, ident=y, path=str(wt / "y.md"), content="Y payload", screen="PAINTED")
+        got = po.resolve_exact_pending(db, run_id="r1", task_id="t1", pane_id="p1", pane_birth="b1",
+                                       tool="write", screen_prompt_id="PAINTED")
+        self.assertFalse(got["ok"])
+        self.assertIn("ambiguous", got["reason"])
+        # Positive control: with only Y pending, the same call resolves Y cleanly.
+        po.record_withdrawn(db, **x, reason="test")
+        got2 = po.resolve_exact_pending(db, run_id="r1", task_id="t1", pane_id="p1", pane_birth="b1",
+                                        tool="write", screen_prompt_id="PAINTED")
+        self.assertTrue(got2["ok"], got2)
+        self.assertEqual(got2["approval_request_id"], "req-y")
+
+    def test_screen_cross_check_disagreement_refuses(self):
+        """The one bound pending occurrence (X) is found by its own request
+        id, but a DIFFERENT occurrence's screen write claims the painted
+        prompt id -- the cross-check must refuse rather than trust either
+        side silently."""
+        db, wt = _isolated_db()
+        x = {**IDENT, "tool_call_id": "x"}
+        other = {**IDENT, "task_id": "t1", "tool_call_id": "other"}
+        self._bound(db, ident=x, path=str(wt / "x.md"), content="X payload")
+        po.record_seen(db, **other, tool="bash", tool_input={"command": "ls"}, source="s", cwd=str(wt))
+        po.record_screen(db, **other, display="pending_parseable", screen_prompt_id="PAINTED")
+        got = po.resolve_exact_pending(db, run_id="r1", task_id="t1", pane_id="p1", pane_birth="b1",
+                                       tool="write", screen_prompt_id="PAINTED")
+        self.assertFalse(got["ok"])
+        self.assertIn("disagrees", got["reason"])
+
+    def test_screen_cross_check_agreement_or_absence_resolves(self):
+        db, wt = _isolated_db()
+        self._bound(db, ident=IDENT, path=str(wt / "x.md"), content="x", screen="OWN-ID")
+        # No screen id supplied at all: resolution proceeds on request id alone.
+        self.assertTrue(po.resolve_exact_pending(db, run_id="r1", task_id="t1", pane_id="p1",
+                                                 pane_birth="b1", tool="write")["ok"])
+        # The occurrence's own recorded screen id agrees with what is passed.
+        self.assertTrue(po.resolve_exact_pending(db, run_id="r1", task_id="t1", pane_id="p1", pane_birth="b1",
+                                                 tool="write", screen_prompt_id="OWN-ID")["ok"])
+
+    def test_scoped_by_pane_and_tool(self):
+        db, wt = _isolated_db()
+        other_pane = {**IDENT, "pane_id": "p9", "tool_call_id": "p9call"}
+        self._bound(db, ident=other_pane, path=str(wt / "x.md"), content="x")
+        self.assertFalse(po.resolve_exact_pending(db, run_id="r1", task_id="t1", pane_id="p1",
+                                                  pane_birth="b1", tool="write")["ok"])
+        bash_call = {**IDENT, "tool_call_id": "bashcall"}
+        po.record_seen(db, **bash_call, tool="bash", tool_input={"command": "ls"}, source="s", cwd=str(wt))
+        self.assertFalse(po.resolve_exact_pending(db, run_id="r1", task_id="t1", pane_id="p1",
+                                                  pane_birth="b1", tool="write")["ok"])
 
 
 if __name__ == "__main__":

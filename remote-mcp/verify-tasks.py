@@ -31,8 +31,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TMP = Path(tempfile.mkdtemp(prefix="herdr-mcp-verify-tasks-"))
-BOUND_RELEASE_REL = Path(".local/opt/omp-herdr-bound/releases/2026-10-16-bindwake-v9/omp")
-BOUND_LAUNCHER_SHA256 = "5392dcc6ddf2e0483a49e47b81be6506c33f250f91e646669faac56e9b60cc1d"
+BOUND_RELEASE_REL = Path(".local/opt/omp-herdr-bound/releases/2026-10-16-exactbash-v12/omp")
+BOUND_LAUNCHER_SHA256 = "fcfa8266dfce2bc9f881a5c532f5dbeefb61ac91c3ff938b73fb7ddb2216d4e5"
 
 
 def _isolated_control(name: str) -> tuple[Path, Path, Path]:
@@ -52,7 +52,7 @@ def _isolated_control(name: str) -> tuple[Path, Path, Path]:
     fixture_sha = hashlib.sha256(target.read_bytes()).hexdigest()
     config = control / "config.sh"
     text = config.read_text()
-    old_bin = 'HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-16-bindwake-v9/omp"'
+    old_bin = 'HERDR_OMP_BIN="$HOME/.local/opt/omp-herdr-bound/releases/2026-10-16-exactbash-v12/omp"'
     old_sha = f'HERDR_OMP_LAUNCHER_SHA256="{BOUND_LAUNCHER_SHA256}"'
     assert text.count(old_bin) == 1 and text.count(old_sha) == 1
     config.write_text(text.replace(old_bin, f'HERDR_OMP_BIN="{target}"').replace(
