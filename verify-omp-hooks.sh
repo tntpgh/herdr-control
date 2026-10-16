@@ -125,7 +125,13 @@ omp_menu_screen() {
 clean_screen() { printf ' $ \n ready\n'; }
 
 . "$here/lib/run-registry.sh"
-register_task run1 task1 w1 cond1 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt "impl:omp-test" >/dev/null 2>&1
+# Seed the protected launch claim the way verify-task-authorization-gates.sh:116-119
+# and real spawn-task.sh do, so task_authorization_check succeeds and peer_decide
+# classifies the actual command text instead of short-circuiting to reserved.
+accept_local_task_authorization run1-task1-claim "$CPANE" "$CBIRTH" /repo '{}' >/dev/null 2>&1
+register_task run1 task1 w1 cond1 "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wt "impl:omp-test" main '' '' '{}' hook run1-task1-claim >/dev/null 2>&1
+mark_authorization_launch run1-task1-claim task1 run1 launch_claimed >/dev/null 2>&1
+mark_authorization_launch run1-task1-claim task1 run1 launched >/dev/null 2>&1
 
 . "$here/lib/prompt-parse.sh"
 printf '== current boxed omp menu: command details are not choices ==\n'
@@ -697,7 +703,10 @@ printf '== the hook and push_wake classify a mismatched recorded command the sam
 # judged the panel alone and HELD the wake, so one prompt was both "a human's"
 # and "a peer's". human_must_answer now drops a mismatched command itself, so
 # both judge the panel: held, and no human-only alert for an allow-class panel.
-register_task runHS taskHS wHS condHS "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wtHS "impl:human-stale" >/dev/null 2>&1
+accept_local_task_authorization runHS-taskHS-claim "$CPANE" "$CBIRTH" /repo '{}' >/dev/null 2>&1
+register_task runHS taskHS wHS condHS "$CPANE" "$CBIRTH" "$WPANE" "$WBIRTH" /repo /wtHS "impl:human-stale" main '' '' '{}' hook runHS-taskHS-claim >/dev/null 2>&1
+mark_authorization_launch runHS-taskHS-claim taskHS runHS launch_claimed >/dev/null 2>&1
+mark_authorization_launch runHS-taskHS-claim taskHS runHS launched >/dev/null 2>&1
 omp_menu_screen "git fetch origin --prune" > "$WORKER_SCREEN"
 clean_screen > "$COND_SCREEN"
 : > "$NOTIFIED"
