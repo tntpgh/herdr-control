@@ -338,6 +338,18 @@ elapsed=$(( $(date +%s) - start ))
 [ "$elapsed" -le 5 ] && [ "$(tooled_rows)" = 0 ] \
   && ok "never-painted panel stops at the budget (${elapsed}s) with no tooled row" \
   || bad "never-painted: ${elapsed}s tooled=$(tooled_rows)"
+tr_row="$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT payload FROM events WHERE type='notify_probe_outcome' ORDER BY sequence DESC LIMIT 1;")"
+[ "$(printf '%s' "$tr_row" | jq -r '.outcome+"|"+.entry_binding+"|"+.tool_call_id')" = "no_provenance|bound|call-22" ] \
+  && ! printf '%s' "$tr_row" | grep -q 'ordinary agent output' \
+  && ok "a firing that ends without provenance leaves an id-only outcome trace" \
+  || bad "outcome trace: $tr_row"
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-23 sess-23
+keyhint_panel > "$WORKER_SCREEN"
+run_notify ',"call_id":"call-23","native_session":"sess-23"'
+[ "$(sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "SELECT json_extract(payload,'\$.outcome') FROM events WHERE type='notify_probe_outcome';")" = pushed ] \
+  && ok "a provenance write is traced as pushed" \
+  || bad "pushed trace missing"
 
 printf -- '-----\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
