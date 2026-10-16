@@ -1853,8 +1853,17 @@ echo "== env NAME=val prefix, bash -n syntax check (F6) =="
 # file stays reserved.
 check_reserved   "env PATH=… with an interpreter stays reserved" 'env PATH=/usr/bin:/bin HERDR_WT_DIR=/tmp/x bash verify-spawn-spec-proof.sh'
 check_reserved   "env assignments then a command"          'env HERDR_WT_DIR=/tmp/x HERDR_RUN_STATE_DIR=/tmp/y bash verify-spawn-spec-proof.sh'
-check_reserved   "env two assignments then git"            'env FOO=1 BAR=2 git status'
-check_reserved   "env one assignment then a path command"  'env LC_ALL=C ./run.sh'
+# Round N (2026-10-16), fixing the live false positive this whole SECTION
+# is about: these two used to be reserved too (they matched none of the 5
+# JS-literal exemptions, same as the bun test case below) — now that
+# `env NAME=val... CMD` exempts the leading `env` word from the dump
+# scanner by itself (see `_cp_env_assign_line_exempt`), `git status` and
+# `./run.sh` are neither dangerous names, dirty values, nor a shell/
+# interpreter downstream, so they correctly fall through to unreserved —
+# EXACTLY the verdict `git status` / `./run.sh` alone already get (proved
+# by the equivalence check in tmp/smoke-env-assign.sh), not a new grant.
+check_unreserved "env two assignments then git"            'env FOO=1 BAR=2 git status'
+check_unreserved "env one assignment then a path command"  'env LC_ALL=C ./run.sh'
 check_reserved   "bare env"                                'env'
 check_reserved   "env -0"                                  'env -0'
 check_reserved   "env piped"                               'env | grep X'
@@ -1956,6 +1965,23 @@ check_reserved   "env prefix then sh -c 'env|cat'"         "env A=1 sh -c 'env|c
 check_reserved   "env prefix then sh -c 'x=(env)'"         "env A=1 sh -c 'x=(env)'"
 check_reserved   "cd, env prefix, sh -c 'env;:'"           "cd /wt && env A=1 sh -c 'env;:'"
 check_reserved   "env prefix then git log --format"        "env A=1 git log --format='%h;%s'"
+
+# Round 2 (independent security review HIGH finding, 2026-10-16): the
+# env-assign exemption's dangerous-name check must refuse any NAME this
+# file already treats as exec-capable ahead of an arbitrary command
+# (_CP_EXEC_VAR_NAME_RE ~4360, _CP_EXEC_ASSIGN_NAME_RE ~4378), not just a
+# hand-written subset — PoC rows from the review's traced table plus one
+# per remaining name the review listed as absent from the old list.
+check_reserved   "env EDITOR= hijacks git commit's editor"   "env EDITOR=/tmp/evil-editor git commit"
+check_reserved   "env HOME= redirects git's config dir"      "env HOME=/tmp/evil-home git status"
+check_reserved   "env PAGER= hijacks git log's pager"        "env PAGER=/tmp/evil git log"
+check_reserved   "env LESSOPEN= hijacks less's preprocessor" "env LESSOPEN=/tmp/evil-less-nospace less notes.txt"
+check_reserved   "env VISUAL= hijacks the visual editor"     "env VISUAL=/tmp/evil git commit"
+check_reserved   "env PROMPT_COMMAND= runs on every prompt"  "env PROMPT_COMMAND=/tmp/evil bash"
+check_reserved   "env SHELL= swaps the interactive shell"    "env SHELL=/tmp/evil git status"
+check_reserved   "env SSH_ASKPASS= hijacks ssh's askpass"    "env SSH_ASKPASS=/tmp/evil git fetch"
+check_reserved   "env XDG_CONFIG_HOME= redirects git config" "env XDG_CONFIG_HOME=/tmp/evil git status"
+check_reserved   "env DEVELOPER_DIR= swaps the toolchain"    "env DEVELOPER_DIR=/tmp/evil git status"
 
 echo
 echo "== #184: a bash write outside the pane's registered worktree escalates (peer may not auto-approve) =="
