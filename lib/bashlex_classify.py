@@ -527,7 +527,21 @@ def _walk(node, launcher_names):
 
 def main():
     raw = sys.stdin.read(MAX_INPUT_CHARS + 1)
-    if len(raw) > MAX_INPUT_CHARS:
+    # herdr-control#307: this script's only caller (command-policy.sh's
+    # `_cp_bashlex_findgit_present`, via `<<<"$raw"`) always appends
+    # exactly one trailing newline via bash's here-string, regardless of
+    # whether the original command text already had one — that is a
+    # call-site encoding artifact, not part of the classified command.
+    # Discount a single trailing newline before comparing to the ceiling,
+    # or a command at exactly the 4096-byte cap spuriously reads as 4097
+    # and escalates. Parsing below still sees the full `raw` unchanged
+    # (including that newline) — only this length check is adjusted. Safe
+    # because the shell-side #267 ceiling (command-policy.sh's
+    # `_cp_input_ceiling_hit`) already denies any ORIGINAL command over
+    # 4096 bytes before this helper ever runs, so nothing genuinely over
+    # cap can reach here by discounting one byte.
+    ceiling_len = len(raw) - 1 if raw.endswith("\n") else len(raw)
+    if ceiling_len > MAX_INPUT_CHARS:
         print("ESCALATE input exceeds %d-character parser ceiling" % MAX_INPUT_CHARS)
         return 0
     # A heredoc whose closing delimiter is the LAST line of input with no
