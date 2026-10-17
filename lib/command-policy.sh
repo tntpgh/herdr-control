@@ -5186,7 +5186,7 @@ EOF
 # caller reads as false. Wrapped in BEGIN/END so the whole multi-line
 # input is one scan; single-line input (everything before round 5f)
 # is unaffected, since one line was always the whole scan anyway.
-_cp_envdump_word_is_dump() {            # norm [noexempt] -> 0 (true) if it dumps env/printenv, anywhere but the 5 exemptions
+_cp_envdump_word_is_dump() {            # norm [noexempt] -> 0 (true) if it dumps env/printenv, anywhere but the 5 exemptions (the env-assign carve-out neutralizes matches BEFORE this runs — see _cp_env_assign_neutralize)
   # This scanner is intentionally ASCII/byte-oriented. Approval-panel chrome
   # can contain supplementary-plane OMP glyphs; BSD awk aborts on those under
   # a UTF-8 locale before the policy verdict is reached. Byte locale is safe
@@ -5217,6 +5217,14 @@ _cp_envdump_word_is_dump() {            # norm [noexempt] -> 0 (true) if it dump
         after  = substr(line, i + wlen, 1)
         if (before != "" && is_ident(before)) { i++; continue }
         if (after  != "" && is_ident(after))  { i++; continue }
+        if (before == "-") {
+          before2 = (i > 2) ? substr(line, i - 2, 1) : ""
+          if (before2 != "" && is_ident(before2)) { i++; continue }
+        }
+        if (after == "-") {
+          after2 = substr(line, i + wlen + 1, 1)
+          if (after2 != "" && is_ident(after2)) { i++; continue }
+        }
         exempt = 0
         if (NOEXEMPT != "1") {
           if (after == ".") exempt = 1
@@ -5350,10 +5358,307 @@ _cp_any_interpreter_inline_code() {   # norm -> 0 (true) if ANY of the above
     _cp_rubyperl_inline_code "$1" || _cp_other_inline_code "$1"
 }
 
+# ---- `env NAME=val... CMD` is a variable-setting invocation, not a dump --
+# Round N (2026-10-16), fixing a live false positive: `_cp_envdump_word_is_dump`'s
+# 5 exemptions above are shaped for INERT source text sitting in an outer
+# shell command (JS object literals, `const env = {}`); none of them
+# recognize the actual Unix `env` command setting variables for a real
+# child process. `env PI_NATIVES_DIR=/x bun test a` matched none of the 5
+# and was scanned as a dump, reserving every test invocation through this
+# pattern (live, conductor repro 2026-10-16 21:55Z) — including the exact
+# 3-line wrapper this section is built to cover:
+#   T="$(cd "$(dirname "$0")" && pwd)"
+#   cd "$T/../packages/coding-agent"
+#   exec env PI_NATIVES_DIR="$T/natives-cache" bun test "$1"
+#
+# This answers ONLY "is the LEADING `env` word on THIS LINE an ordinary
+# variable-setting invocation, not a dump?" — a yes neutralizes just that
+# one word occurrence (see `_cp_env_assign_neutralize`); it does not
+# whitelist anything else — the downstream command still goes through
+# classify_command and every other conductor_reserved_reason check exactly
+# as if `env NAME=val` were stripped off. Narrow by construction,
+# fail-closed on anything it cannot parse confidently. Operates on the RAW
+# line (quotes intact), NOT the quote-stripped `norm` used everywhere else
+# in this file: quote-stripping is lossy (`env FOO="a b"` and a stray
+# `env FOO=a X=y` both read as "FOO=a" plus a leftover word once quotes are
+# gone), and that loss is exactly how an EARLIER, PARKED attempt at this
+# same loosening failed a security review — a quoted value with an
+# embedded space could hide a second, fake "command word" ahead of a real
+# `PATH=`/`LD_PRELOAD=` assignment three tokens later. Re-deriving
+# structure from RAW with real quote-pairing closes that gap by
+# construction instead of re-litigating each bypass shape by hand.
+#
+#  - optional leading `exec `, then `env` as its own word, lowercase only —
+#    case variants (`ENV`, `Env`) stay unexempted, same as every other
+#    rule here treats an APFS case variant as dangerous rather than harmless
+#  - one or more `NAME=WORD` assignments, NAME `[A-Za-z_][A-Za-z0-9_]*`;
+#    WORD is read quote-aware (`"..."`, `'...'`, or a bare run with no
+#    quote/backslash/space in it) — anything that doesn't parse as exactly
+#    one such WORD (unterminated quote, a backslash anywhere, a bare run
+#    glued directly onto a quote) is ambiguous and fails closed; any `env`
+#    OPTION (`-i`, `-u`, `-S`, anything starting with `-`) where an
+#    assignment or the command word was expected fails the same way,
+#    because the loop only ever advances past a well-formed token
+#  - a command WORD must follow the assignments — `env FOO=1` alone, with
+#    nothing after it, is not exempt
+#  - every NAME must not be dangerous: PATH, BASH_ENV, ENV, LD_*, DYLD_*,
+#    NODE_OPTIONS, PYTHON*, PERL5*, RUBYOPT, IFS, PS4, SHELLOPTS, GIT_*,
+#    *_PATH, *_ENV, or secret-shaped — same name alternation as
+#    `_CP_SECRET_VAR_RE`; keep the two in sync by hand, their surrounding
+#    syntax differs too much to share the literal string
+#  - every dequoted VALUE must contain no whitespace at all (a quoted value
+#    WITH a space is still refused — Terrence's correction: quote-aware
+#    parsing exists to recognize structure, not to launder a hidden extra
+#    token past the scanner), no shell metacharacter (backtick, `$(`,
+#    `;|&<>`, newline), and every `$NAME`/`${NAME}` in it must name a
+#    variable PROVABLY derived, on an EARLIER line of this SAME command,
+#    by the narrow `NAME=$(cd $(dirname $0) && pwd)` idiom (see
+#    `_cp_env_assign_derived_names`) — a harmless-LOOKING name is not
+#    enough (`T=$OP_TOKEN; env X=$T cmd` must stay reserved exactly as
+#    much as `env X=$OP_TOKEN cmd` does), and an unresolved `$NAME` with no
+#    such derivation anywhere earlier fails closed too
+#  - the command word — basename, after stripping any path prefix, read
+#    quote-aware and then required to match `[A-Za-z0-9_./:-]+` IN FULL (a
+#    positive allowlist, not a blacklist: a redirect glued to the word
+#    (`2>&1`), a comment (`# git status`), a brace/glob assignment
+#    (`{a,b}=c`, `*=x`), or a BASH_FUNC import (`'BASH_FUNC_x%%=() {...}'`)
+#    all fail the allowlist and so fail closed, without each needing its
+#    own rule) — must not be env/printenv, a SHELL (sh/bash/zsh/dash/ksh/
+#    fish: these re-interpret further text as more shell code, so they
+#    stay fail-closed no matter what follows), or one of the INLINE-code
+#    interpreters (node/bun/deno/python*/pypy*/ruby/perl/php/lua*/
+#    osascript) used WITH an inline-eval flag anywhere in the command (the
+#    caller threads in the same `_cp_any_interpreter_inline_code` result
+#    the word scan itself uses) or with no further argument at all (a bare
+#    interpreter drops to a REPL) — `env PI_NATIVES_DIR=/abs bun test
+#    f.ts` is exactly the shape this clause exists to allow: bun run as a
+#    TEST RUNNER, not as an inline-code evaluator
+# Round 2 (independent security review, REQUEST CHANGES, 2026-10-16):
+# a hand-written list here drifted narrower than this file's OWN,
+# already-reviewed answer to "which env var NAMEs are exec-capable ahead
+# of an arbitrary command" — `_CP_EXEC_VAR_NAME_RE` (~4360, read by git/
+# pagers/editors/ssh) and `_CP_EXEC_ASSIGN_NAME_RE` (~4378, HOME/
+# XDG_CONFIG_HOME/PATH assigned ahead of git) — reopening a peer-auto-
+# approve path for `env EDITOR=/tmp/evil git commit`,
+# `env HOME=/tmp/evil-home git status`, etc. (`conductor_reserved_reason`
+# never calls `_cp_exec_name_or_opaque_present`/`_cp_exec_assign_present`
+# itself, so this exemption was the only gate standing between those
+# names and peer auto-approval). Fixed by REFERENCING the three
+# centralized name lists directly inside `_cp_env_assign_dangerous_name`
+# below, instead of copying their alternation text, so they cannot drift
+# out of sync again — any name added to `_CP_EXEC_VAR_NAME_RE`,
+# `_CP_EXEC_ASSIGN_NAME_RE`, or `_CP_INJECTION_ENV_NAME_RE` (LIBXO_OPTIONS/
+# PERL5OPT/PERL5LIB, ~4396) automatically becomes dangerous here too. The
+# regex below keeps only the ADDITIONAL names those three lists do not
+# cover (NODE_OPTIONS, the PYTHON*/IFS/PS4/SHELLOPTS/RUBYOPT shell-and-
+# interpreter hijack vars, a `GIT_*` wildcard broader than EXEC_VAR's
+# named subset, and the generic `*_PATH`/`*_ENV` suffix shapes) plus the
+# secret-name pattern.
+_CP_ENV_ASSIGN_DANGEROUS_NAME_RE='^(NODE_OPTIONS|PYTHON[A-Z0-9_]*|RUBYOPT|IFS|PS4|SHELLOPTS|GIT_[A-Z0-9_]*|[A-Z0-9_]*_PATH|[A-Z0-9_]*_ENV|[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|OP_SERVICE)[A-Z0-9_]*)$'
+_cp_env_assign_dangerous_name() {       # NAME -> 0 if exec-capable/secret-shaped by any list
+  local LC_ALL=C LANG=C
+  local n; n="$(printf '%s' "$1" | tr 'a-z' 'A-Z')"
+  [[ "$n" =~ $_CP_ENV_ASSIGN_DANGEROUS_NAME_RE ]] && return 0
+  [[ "$n" =~ ^($_CP_EXEC_VAR_NAME_RE)$ ]] && return 0
+  [[ "$n" =~ ^($_CP_EXEC_ASSIGN_NAME_RE)$ ]] && return 0
+  [[ "$n" =~ ^($_CP_INJECTION_ENV_NAME_RE)$ ]] && return 0
+  return 1
+}
+_CP_ENV_ASSIGN_SHELL_RE='^(sh|bash|zsh|dash|ksh|fish)$'
+_CP_ENV_ASSIGN_INTERP_RE='^(node|nodejs|bun|deno|python[0-9.]*|pypy[0-9.]*|ruby|perl|php|lua[0-9.]*|osascript)$'
+# Same name alternation as `_CP_SECRET_VAR_RE` (kept separate: the two
+# regexes' surrounding syntax differs too much to share the literal
+# string) — a VALUE that plainly expands a secret-shaped $VAR stays
+# unexempted even if its NAME would otherwise be considered derived.
+_CP_ENV_ASSIGN_SECRET_NAME_RE='(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|OP_SERVICE)'
+# The ONE variable-derivation shape this exemption trusts: a name set, on
+# its own line with nothing else, to exactly `$(cd $(dirname $0) && pwd)`
+# (quotes stripped for matching only) — the standard "my own directory"
+# idiom, which cannot read anything but argv0 and the filesystem. Matched
+# against RAW lines with `"`/`'` characters removed first (a local,
+# throwaway strip for THIS pattern-match only — nothing downstream of here
+# sees the stripped copy), because `scannable_command`'s own quote-strip
+# is followed by `_cp_flatten_substitutions`, which deletes `$(...)`
+# syntax entirely and would make this idiom unrecognizable in `norm`.
+_CP_ENV_ASSIGN_DERIVE_RE='^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=\$\(cd[[:space:]]+\$\(dirname[[:space:]]+\$0\)[[:space:]]*(&&|;)[[:space:]]*pwd\)[[:space:]]*$'
+
+# Reads ONE quote-aware word from the front of `str`: a `"..."` or `'...'`
+# run (content = between the quotes, literally — no escape processing
+# inside), or a bare run of non-space/non-quote/non-backslash characters.
+# Prints `CONTENT<FS>REST` (FS = \x1c) and returns 0 on a clean parse;
+# returns 1 (prints nothing) on anything ambiguous: an unterminated quote,
+# a backslash anywhere in the content (an escape the scanner is not going
+# to interpret — `a\ b` stays reserved rather than guessing what it
+# means), or a quoted run with more non-whitespace glued directly onto its
+# closing quote (`"a"b` — mixed quoting, two pieces of one word).
+_cp_env_assign_read_word() {    # str -> prints CONTENT\x1cREST; 1 on ambiguous
+  local LC_ALL=C LANG=C
+  local s="$1" content restv
+  if [[ "$s" == \"* ]]; then
+    [[ "$s" =~ ^\"([^\"]*)\"(.*)$ ]] || return 1
+    content="${BASH_REMATCH[1]}"; restv="${BASH_REMATCH[2]}"
+  elif [[ "$s" == \'* ]]; then
+    [[ "$s" =~ ^\'([^\']*)\'(.*)$ ]] || return 1
+    content="${BASH_REMATCH[1]}"; restv="${BASH_REMATCH[2]}"
+  else
+    [[ "$s" =~ ^([^[:space:]\"\'\\]+)(.*)$ ]] || return 1
+    content="${BASH_REMATCH[1]}"; restv="${BASH_REMATCH[2]}"
+  fi
+  if [ -n "$restv" ]; then
+    case "$restv" in
+      [[:space:]]*) : ;;
+      *) return 1 ;;
+    esac
+  fi
+  case "$content" in *'\'*) return 1 ;; esac
+  printf '%s\x1c%s' "$content" "$restv"
+}
+
+# A VALUE (already dequoted by `_cp_env_assign_read_word`) is safe if it
+# has no whitespace anywhere, none of the shell metacharacters below, and
+# every `$NAME`/`${NAME}` in it names a variable present in `derived`
+# (space-padded list from `_cp_env_assign_derived_names`) — never merely
+# "not secret-shaped": a harmless-looking name proves nothing about the
+# value it holds (`T=$OP_TOKEN; env X=$T cmd` must stay reserved).
+_cp_env_assign_value_safe() {    # value derived-space-padded -> 0 (true) if safe
+  local LC_ALL=C LANG=C
+  local v="$1" derived=" ${2:-} " rest name
+  case "$v" in
+    *[[:space:]]*) return 1 ;;
+    *'`'*|*'$('*|*';'*|*'|'*|*'&'*|*'<'*|*'>'*|*$'\n'*) return 1 ;;
+  esac
+  rest="$v"
+  while [[ "$rest" == *'$'* ]]; do
+    if [[ "$rest" =~ ^[^\$]*\$\{([A-Za-z_][A-Za-z0-9_]*)\}(.*)$ ]]; then
+      name="${BASH_REMATCH[1]}"; rest="${BASH_REMATCH[2]}"
+    elif [[ "$rest" =~ ^[^\$]*\$([A-Za-z_][A-Za-z0-9_]*)(.*)$ ]]; then
+      name="${BASH_REMATCH[1]}"; rest="${BASH_REMATCH[2]}"
+    else
+      return 1
+    fi
+    [[ "$(printf '%s' "$name" | tr 'a-z' 'A-Z')" =~ $_CP_ENV_ASSIGN_SECRET_NAME_RE ]] && return 1
+    case "$derived" in
+      *" $name "*) : ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# Scans `text` (prior RAW lines of the same command, newline-joined) for
+# the one trusted derivation idiom and prints the space-separated NAMEs it
+# found — empty for a single-line command (nothing CAN be derived earlier
+# in the same command when there is no earlier line), which is exactly why
+# `env X=$T cmd` alone, with no prior `T=$(cd $(dirname $0) && pwd)` line,
+# fails closed.
+_cp_env_assign_derived_names() {   # prior-raw-text -> space-separated NAMEs
+  local LC_ALL=C LANG=C
+  local text="$1" line nq out=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    nq="${line//\"/}"; nq="${nq//\'/}"
+    if [[ "$nq" =~ $_CP_ENV_ASSIGN_DERIVE_RE ]]; then
+      out="$out ${BASH_REMATCH[1]}"
+    fi
+  done <<<"$text"
+  printf '%s' "$out"
+}
+
+# Validates ONE RAW line as `[exec ]env (NAME=WORD)+ CMD...`; 0 (true) if
+# it is safe to neutralize. `derived` is this line's space-padded
+# `_cp_env_assign_derived_names` result (prior lines only).
+_cp_env_assign_line_exempt() {    # raw-line interp-noexempt derived -> 0/1
+  local LC_ALL=C LANG=C
+  local line="$1" interp_noexempt="${2:-0}" derived="${3:-}"
+  local rest name tok word_out value restw consumed=0
+
+  if [[ "$line" =~ ^[[:space:]]*((exec)[[:space:]]+)?(env)[[:space:]]+(.*)$ ]]; then
+    rest="${BASH_REMATCH[4]}"
+  else
+    return 1
+  fi
+
+  while [[ "$rest" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; do
+    name="${BASH_REMATCH[1]}"; tok="${BASH_REMATCH[2]}"
+    _cp_env_assign_dangerous_name "$name" && return 1
+    word_out="$(_cp_env_assign_read_word "$tok")" || return 1
+    value="${word_out%%$'\x1c'*}"; restw="${word_out#*$'\x1c'}"
+    _cp_env_assign_value_safe "$value" "$derived" || return 1
+    consumed=$((consumed + 1))
+    if [ -z "$restw" ]; then
+      rest=""
+      break
+    elif [[ "$restw" =~ ^[[:space:]]+(.*)$ ]]; then
+      rest="${BASH_REMATCH[1]}"
+    else
+      return 1
+    fi
+  done
+  [ "$consumed" -ge 1 ] || return 1
+  [ -n "$rest" ] || return 1
+
+  local cmd_out cmdword cmdrest base baselc
+  cmd_out="$(_cp_env_assign_read_word "$rest")" || return 1
+  cmdword="${cmd_out%%$'\x1c'*}"; cmdrest="${cmd_out#*$'\x1c'}"
+  [[ "$cmdword" =~ ^[A-Za-z0-9_./:-]+$ ]] || return 1
+  [[ "$cmdword" == -* ]] && return 1
+  base="${cmdword##*/}"; baselc="$(printf '%s' "$base" | tr 'A-Z' 'a-z')"
+  if [[ "$baselc" =~ $_CP_ENV_ASSIGN_SHELL_RE ]] || [ "$baselc" = env ] || [ "$baselc" = printenv ]; then
+    return 1
+  fi
+  if [[ "$baselc" =~ $_CP_ENV_ASSIGN_INTERP_RE ]]; then
+    if [ "$interp_noexempt" = 1 ] || [ -z "${cmdrest//[[:space:]]/}" ]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Walks `norm` and `raw` LINE BY LINE in lockstep (a scanned command can be
+# multi-line — a heredoc body, or a short wrapper SCRIPT's full text handed
+# to the policy as one buffer). For each line whose structure validates
+# against the corresponding RAW line (quote-aware; see
+# `_cp_env_assign_line_exempt`), NEUTRALIZES just the matched `env` keyword
+# in the NORM line (3 bytes, replaced with `~~~` — never matches
+# `env`/`printenv` case-insensitively, and keeps every other byte offset on
+# the line unchanged for the word scanner's other 5 JS-literal exemptions)
+# before `_cp_envdump_word_is_dump` ever runs. If `norm` and `raw` disagree
+# on line count (heredoc stripping, ANSI-C decoding, or similar already
+# reshaped the buffer), no line is trusted and nothing is neutralized —
+# the safe fallback, not a special case.
+_cp_env_assign_neutralize() {    # norm raw interp-noexempt -> norm with exempt `env` keywords blanked
+  local LC_ALL=C LANG=C
+  local norm="$1" raw="$2" interp_noexempt="${3:-0}"
+  local nrest="$norm" rrest="$raw" nline rline sep out="" prior="" derived
+  local lead start
+  while :; do
+    case "$nrest" in
+      *$'\n'*) nline="${nrest%%$'\n'*}"; nrest="${nrest#*$'\n'}"; sep=$'\n' ;;
+      *)       nline="$nrest"; nrest=""; sep="" ;;
+    esac
+    case "$rrest" in
+      *$'\n'*) rline="${rrest%%$'\n'*}"; rrest="${rrest#*$'\n'}" ;;
+      *)       rline="$rrest"; rrest="\x02NOMORE" ;;
+    esac
+    if [ "$rline" != "\x02NOMORE" ] && [[ "$nline" =~ ^([[:space:]]*((exec)[[:space:]]+)?)(env)[[:space:]]+ ]]; then
+      lead="${BASH_REMATCH[1]}"
+      derived="$(_cp_env_assign_derived_names "$prior")"
+      if _cp_env_assign_line_exempt "$rline" "$interp_noexempt" "$derived"; then
+        start=${#lead}
+        nline="${nline:0:start}~~~${nline:start+3}"
+      fi
+    fi
+    prior="$prior$rline"$'\n'
+    out="$out$nline$sep"
+    [ -z "$sep" ] && break
+  done
+  printf '%s' "$out"
+}
+
 _cp_env_dump_invoked() {                # raw -> 0 (true) if env/printenv is invoked to dump the environment
   local raw="$1" norm noexempt=0
   norm="$(scannable_command "$raw")"
   _cp_any_interpreter_inline_code "$norm" && noexempt=1
+  norm="$(_cp_env_assign_neutralize "$norm" "$raw" "$noexempt")"
   [ "$(_cp_envdump_word_is_dump "$norm" "$noexempt")" = 1 ] && return 0
   _cp_imatch "$_CP_ENVDUMP_OTHER_RE" "$norm" && return 0
   _cp_imatch "$_CP_ENVDUMP_GETENV_RE" "$norm" && return 0
