@@ -398,8 +398,9 @@ class CliEntryPoint(unittest.TestCase):
 
 def _fresh_db_with_approvals() -> str:
     """Same `events`-only fixture as `_fresh_db`, plus the `approvals` table
-    lib/run-registry.sh's approval_decided() writes (herdr-select.sh calls it
-    BEFORE every keystroke) -- the signal issue #309's correlation reads."""
+    lib/run-registry.sh's approval_decided()/approval_confirmed() write
+    (herdr-select.sh calls approval_decided BEFORE every keystroke, then
+    approval_confirmed after) -- the signal issue #309's correlation reads."""
     db = _fresh_db()
     conn = sqlite3.connect(db)
     conn.executescript(
@@ -409,9 +410,13 @@ def _fresh_db_with_approvals() -> str:
           run_id         TEXT NOT NULL DEFAULT '',
           task_id        TEXT NOT NULL DEFAULT '',
           pane_id        TEXT NOT NULL DEFAULT '',
+          prompt_id      TEXT NOT NULL DEFAULT '',
+          choice         TEXT NOT NULL DEFAULT '',
           decided_by     TEXT NOT NULL DEFAULT '',
           authority      TEXT NOT NULL DEFAULT '',
-          decided_at     TEXT NOT NULL
+          decided_at     TEXT NOT NULL,
+          confirmed_at   TEXT,
+          outcome        TEXT
         );
         CREATE INDEX approvals_by_pane ON approvals(pane_id, decided_at DESC);
         """
@@ -421,13 +426,15 @@ def _fresh_db_with_approvals() -> str:
     return db
 
 
-def _insert_approval(db: str, *, run_id: str, task_id: str, pane_id: str,
-                      decided_by: str, authority: str, at: float) -> None:
+def _insert_approval(db: str, *, run_id: str, task_id: str, pane_id: str, prompt_id: str,
+                      choice: str, decided_by: str, authority: str, at: float,
+                      confirmed: bool = True, outcome: str = "pressed") -> None:
     conn = sqlite3.connect(db)
     conn.execute(
-        "INSERT INTO approvals (approval_id, run_id, task_id, pane_id, decided_by, authority, decided_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (f"appr-{at}", run_id, task_id, pane_id, decided_by, authority, po._now_iso(at)),
+        "INSERT INTO approvals (approval_id, run_id, task_id, pane_id, prompt_id, choice, "
+        "decided_by, authority, decided_at, confirmed_at, outcome) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (f"appr-{at}-{prompt_id}", run_id, task_id, pane_id, prompt_id, choice, decided_by, authority,
+         po._now_iso(at), po._now_iso(at) if confirmed else None, outcome),
     )
     conn.commit()
     conn.close()
@@ -438,12 +445,15 @@ class AuthorizedActorCorrelation(unittest.TestCase):
     omp-resolved approval, so it hands record_authorized() an honest
     'unverified'/'unverified_or_abort' sentinel instead of guessing "human".
     record_authorized() correlates that sentinel against the `approvals`
-    table herdr-select.sh/peer-answer.sh write BEFORE the keystroke and
-    upgrades to the real actor only when a fresh matching row exists."""
+    table herdr-select.sh/peer-answer.sh write BEFORE the keystroke, bound to
+    THIS occurrence's own on-screen prompt id and choice (review finding,
+    2026-10-17), and upgrades to the real actor only when a fresh, identity-
+    matching, actually-delivered row exists."""
 
     def test_peer_press_correlates_to_peer(self):
         db = _fresh_db_with_approvals()
-        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1",
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="PID-A", now=999.0)
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="PID-A", choice="1",
                           decided_by="peer-answer", authority="peer", at=1000.0)
         out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=1000.5)
         rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
@@ -451,7 +461,8 @@ class AuthorizedActorCorrelation(unittest.TestCase):
 
     def test_conductor_press_correlates_to_conductor(self):
         db = _fresh_db_with_approvals()
-        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1",
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="PID-B", now=1999.0)
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="PID-B", choice="1",
                           decided_by="conductor:w7:p2", authority="conductor", at=2000.0)
         out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=2000.2)
         rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
@@ -466,13 +477,15 @@ class AuthorizedActorCorrelation(unittest.TestCase):
 
     def test_unverified_never_becomes_human_with_no_approvals_table(self):
         db = _fresh_db()  # registry predates the approvals table entirely
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="PID-C", now=2999.0)
         out = po.record_authorized(db, **IDENT, decided_by="unverified_or_abort", choice="deny", now=3000.0)
         rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
         self.assertEqual(rec["decided_by"], "unverified_or_abort")
 
     def test_stale_approval_row_outside_window_is_not_used(self):
         db = _fresh_db_with_approvals()
-        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1",
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="PID-D", now=999.0)
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="PID-D", choice="1",
                           decided_by="peer-answer", authority="peer", at=1000.0)
         # 30s later: outside the 20s correlation window -- a different,
         # unrelated prompt in the same pane must not borrow this actor.
@@ -486,12 +499,51 @@ class AuthorizedActorCorrelation(unittest.TestCase):
         verified actor directly -- correlation must only ever apply to the
         'unverified' sentinel, never second-guess an explicit value."""
         db = _fresh_db_with_approvals()
-        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1",
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="PID-E", now=999.0)
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="PID-E", choice="1",
                           decided_by="some-other-actor", authority="peer", at=1000.0)
         out = po.record_authorized(db, **IDENT, decided_by="conductor", choice="approve", now=1000.1)
         rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
         self.assertEqual(rec["decided_by"], "conductor")
 
+    def test_unrelated_prompt_or_choice_in_window_stays_unverified(self):
+        """Review concern 1: an approvals row for a DIFFERENT prompt, or for
+        the SAME prompt but the opposite choice, must never be borrowed for
+        this occurrence even though it is fresh and in the same pane -- e.g.
+        peer-answer.sh denies prompt A, then a human typing directly presses
+        Approve on unrelated prompt B seconds later in the same pane."""
+        db = _fresh_db_with_approvals()
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="OWN-PROMPT", now=999.0)
+        # Different prompt entirely, same choice.
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="OTHER-PROMPT", choice="1",
+                          decided_by="peer-answer", authority="peer", at=1000.0)
+        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=1000.2)
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "unverified")
+        # Same prompt this time, but the recorded choice was a Deny -- must
+        # not be credited for an Approve.
+        other = {**IDENT, "tool_call_id": "c2"}
+        po.record_screen(db, **other, display="pending_parseable", screen_prompt_id="OWN-PROMPT", now=1099.0)
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="OWN-PROMPT", choice="2",
+                          decided_by="peer-answer", authority="peer", at=1100.0)
+        out2 = po.record_authorized(db, **other, decided_by="unverified", choice="approve", now=1100.2)
+        rec2 = po.fold_task(db, "r1", "t1")[out2["occ_key"]]
+        self.assertEqual(rec2["decided_by"], "unverified")
+
+    def test_lost_race_row_not_borrowed(self):
+        """Review concern 2: herdr-select.sh's bound exact-request path
+        writes an `approvals` row with outcome='lost-race' when NO keystroke
+        was ever sent (another claimant won the race,
+        herdr-select.sh:349-356) -- that computed-but-undelivered decision
+        must never be credited to a real, separate approval in the pane."""
+        db = _fresh_db_with_approvals()
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="PID-F", now=999.0)
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="PID-F", choice="1",
+                          decided_by="peer-answer", authority="peer", at=1000.0,
+                          confirmed=True, outcome="lost-race")
+        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=1000.2)
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "unverified")
 
 
 def _isolated_db() -> tuple[str, Path]:

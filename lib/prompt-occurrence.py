@@ -368,19 +368,58 @@ _CORRELATABLE_DECISIONS = {"unverified", "unverified_or_abort"}
 _APPROVAL_CORRELATION_WINDOW_S = 20.0
 
 
+def _occurrence_screen_prompt_id(conn: sqlite3.Connection, task_id: str, occ_key: str) -> str:
+    """The latest on-screen prompt id correlated to this occurrence by
+    whichever reader painted the pane (agent-hooks/omp-notify.sh's own
+    `screen` writes, or herdr-select.sh's for the bound path) -- the same
+    fingerprint `approvals.prompt_id` carries for the row that decided it."""
+    row = conn.execute(
+        "SELECT payload FROM events WHERE task_id=? AND type='prompt_occ_screen' "
+        "AND json_extract(payload,'$.occ_key')=? ORDER BY sequence DESC LIMIT 1",
+        (task_id, occ_key),
+    ).fetchone()
+    if not row:
+        return ""
+    try:
+        return str(json.loads(row[0]).get("screen_prompt_id") or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+
+
 def _correlate_approval_actor(conn: sqlite3.Connection, *, run_id: str, task_id: str,
-                               pane_id: str, now: float) -> str | None:
-    """Most recent `approvals` row for this exact (run, task, pane), if any,
-    decided within the correlation window just before `now`. No row, a row
-    outside the window, or a registry that predates the approvals table ->
-    None: no herdr-select press explains this event, so the caller's honest
-    'unverified' sentinel must stand rather than being guessed into human."""
+                               pane_id: str, occ_key: str, choice: str, now: float) -> str | None:
+    """The `approvals` row (lib/run-registry.sh approval_decided(), written by
+    herdr-select.sh BEFORE every keystroke) that explains THIS occurrence's
+    decision -- never merely "some row in this pane recently" (review finding,
+    2026-10-17, concern 1): a human typing directly in a pane seconds after an
+    unrelated automated press in that same pane must not borrow that press's
+    actor. Bound to the occurrence's own on-screen prompt id (never borrowed
+    across prompts) and the actual choice, 1=approve/2=deny per this table's
+    established convention (authorize_bound's own insert below uses the same
+    mapping) -- never borrowed across a Deny crediting an Approve or vice
+    versa. Excludes decisions that were computed but never delivered
+    (herdr-select.sh:349-356's bound 'lost-race' branch: no keystroke was ever
+    sent for that row -- concern 2) via confirmed_at/outcome. No match, by
+    identity or freshness, -> None: the honest 'unverified' sentinel stands
+    rather than guessing."""
+    screen_prompt_id = _occurrence_screen_prompt_id(conn, task_id, occ_key)
+    if not screen_prompt_id:
+        return None
+    choice_lc = str(choice).strip().lower()
+    if choice_lc in APPROVE_CHOICES:
+        expected_choice = "1"
+    elif choice_lc in DENY_CHOICES:
+        expected_choice = "2"
+    else:
+        return None
     try:
         row = conn.execute(
             "SELECT decided_by, decided_at FROM approvals "
-            "WHERE run_id=? AND task_id=? AND pane_id=? AND decided_by != '' "
+            "WHERE run_id=? AND task_id=? AND pane_id=? AND prompt_id=? AND choice=? "
+            "AND decided_by != '' AND confirmed_at IS NOT NULL "
+            "AND (outcome IS NULL OR outcome != 'lost-race') "
             "ORDER BY decided_at DESC LIMIT 1",
-            (run_id, task_id, pane_id),
+            (run_id, task_id, pane_id, screen_prompt_id, expected_choice),
         ).fetchone()
     except sqlite3.OperationalError:
         return None
@@ -403,12 +442,13 @@ def record_authorized(db_path: str, *, run_id: str, task_id: str, pane_id: str, 
     conn = _connect(db_path)
     try:
         resolved_now = now if now is not None else time.time()
+        key = occurrence_key(run_id, task_id, pane_id, pane_birth, native_session, tool_call_id)
         if decided_by in _CORRELATABLE_DECISIONS:
             correlated = _correlate_approval_actor(conn, run_id=run_id, task_id=task_id,
-                                                    pane_id=pane_id, now=resolved_now)
+                                                    pane_id=pane_id, occ_key=key, choice=choice,
+                                                    now=resolved_now)
             if correlated:
                 decided_by = correlated
-        key = occurrence_key(run_id, task_id, pane_id, pane_birth, native_session, tool_call_id)
         eid = f"prompt_occ_authorized_{key}"
         first = _put(conn, eid, run_id, task_id, "prompt_occ_authorized",
                      {"occ_key": key, "decided_by": decided_by, "choice": choice,
