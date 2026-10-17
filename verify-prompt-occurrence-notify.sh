@@ -41,6 +41,14 @@ export HERDR_SLACK_LEVEL=all
 # everywhere except the dedicated settle-retry regression cases below, which
 # set it back explicitly.
 export HERDR_PROMPT_SETTLE_WAIT_S=0
+# herdr-control #308: the retry loop for an occurrence already proven alive
+# (bound, or genuinely queued behind a still-open sibling) now waits out a
+# SEPARATE, longer `_queue_budget` instead of the short fast-poll `_budget`
+# (agent-hooks/omp-notify.sh). Pinned low here so every pre-existing timing
+# assertion in this suite keeps its old, fast behavior; the dedicated #308
+# regression cases below override it back up, exactly like
+# HERDR_NOTIFY_UNREADABLE_DEADLINE_S above.
+export HERDR_NOTIFY_QUEUE_DEADLINE_S=3
 WORKER_SCREEN="$WORK/worker.txt"
 COND_SCREEN="$WORK/cond.txt"
 : > "$COND_SCREEN"
@@ -448,6 +456,53 @@ run_notify ',"call_id":"call-36","native_session":"sess-34"'
 [ "$(tooled_rows)" -ge 1 ] \
   && ok "same-session dead occurrence (a later one already withdrawn) does not block" \
   || bad "same-session dead occurrence blocked binding: tooled=$(tooled_rows) $(cat "$WORK/n.err")"
+
+# -- herdr-control #308: a BOUND occurrence whose panel paints AFTER the
+# short fast-poll budget is exhausted still gets found, via the longer
+# `_queue_budget` ceiling introduced for this fix -- not the single shared
+# budget the retry loop (agent-hooks/omp-notify.sh ~388-405) used to run
+# on. Before the fix, a short `_budget` left the retry loop with no time
+# left once the panel genuinely painted, and no_provenance fired with
+# found=0 despite the occurrence being `bound` the entire time (the
+# single-call live trace, task_20261017T032453Z_54010_30881, 2026-10-17:
+# `seen` at 03:30:32, panel painted ~6s later, no_provenance at elapsed=10
+# with last_binding=entry_binding=bound).
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-40 sess-40
+: > "$WORKER_SCREEN"
+( sleep 2; keyhint_panel > "$WORKER_SCREEN.tmp" && mv "$WORKER_SCREEN.tmp" "$WORKER_SCREEN" ) &
+start=$(date +%s)
+HERDR_NOTIFY_UNREADABLE_DEADLINE_S=1 HERDR_NOTIFY_QUEUE_DEADLINE_S=5 \
+  run_notify ',"call_id":"call-40","native_session":"sess-40"'
+elapsed=$(( $(date +%s) - start )); wait
+[ "$(tooled_rows)" -ge 1 ] && [ "$elapsed" -ge 1 ] \
+  && ok "bound occurrence painting after the short fast budget still binds via the longer queue budget (#308, ${elapsed}s)" \
+  || bad "late-paint bound occurrence missed: tooled=$(tooled_rows) elapsed=${elapsed}s $(cat "$WORK/n.err")"
+
+# -- herdr-control #308: a call genuinely QUEUED behind a still-open
+# sibling (_occ_not_yet) whose sibling resolves AFTER the short fast
+# budget, but before the longer queue budget, now binds within the SAME
+# hook firing instead of giving up and leaving only the attention
+# controller's tool-less row (the parallel live trace, two calls 40ms
+# apart, task_20261017T032459Z_59522_10571, 2026-10-17: the second hook
+# gave up at its 10s budget while the first prompt was still open,
+# approved 4s later, and the second call's own panel never got read at
+# all -- the exact failure #191 depends on never happening: herdr-select
+# refuses an Approve whose prompt carries no hook-recorded tool).
+sqlite3 "$HERDR_RUN_STATE_DIR/registry.sqlite3" "DELETE FROM events;"
+seen call-41 sess-41; seen call-42 sess-41        # call-41 earliest/still open
+keyhint_panel > "$WORKER_SCREEN"
+( sleep 2
+  python3 "$here/lib/prompt-occurrence.py" completed --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    --run "$RUN_ID" --task "$TASK_ID" --pane "$WPANE" --birth "" --session sess-41 --call-id call-41 >/dev/null 2>&1
+  keyhint_panel > "$WORKER_SCREEN.tmp" && mv "$WORKER_SCREEN.tmp" "$WORKER_SCREEN" ) &
+start=$(date +%s)
+HERDR_NOTIFY_UNREADABLE_DEADLINE_S=1 HERDR_NOTIFY_QUEUE_DEADLINE_S=5 \
+  run_notify ',"call_id":"call-42","native_session":"sess-41"'
+elapsed=$(( $(date +%s) - start )); wait
+[ "$(tooled_rows)" -ge 1 ] && [ "$elapsed" -ge 1 ] \
+  && ok "a queued call whose sibling resolves after the short budget still binds within the same firing (#308, ${elapsed}s)" \
+  || bad "queued-sibling-resolves-late missed: tooled=$(tooled_rows) elapsed=${elapsed}s $(cat "$WORK/n.err")"
 
 # ---- fix/deferred-notify: deferred (exclusiveResolver) bound approvals must
 # alert, bound to the exact request -------------------------------------------

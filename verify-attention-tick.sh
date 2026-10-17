@@ -610,5 +610,66 @@ printf '%s\n' "$W2" | STUB_FAIL_READ="$W2" HERDR_ATTENTION_NOW="$NB2" attention_
 [ "$(_q "SELECT count(*) FROM events WHERE task_id='task20' AND type='attention_tracking';")" = "1" ] \
   && ok "a pane the transport cannot read is tracked instead of silently skipped" \
   || bad "no attention_tracking row when the transport itself failed"
+
+printf '== herdr-control #308: a single still-open occurrence rebinds its exact tool+command ==\n'
+register_task run21 task21 w21 cond21 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt21 "impl:rebind-positive" >/dev/null 2>&1
+set_task_state run21 task21 running >/dev/null 2>&1
+CMD21="env LC_ALL=C git status --short"
+omp_menu_screen "$CMD21" > "$S1"
+: > "$SENT"
+jq -nc --arg cmd "$CMD21" '{command:$cmd}' \
+  | python3 "$here/lib/prompt-occurrence.py" seen --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    --run run21 --task task21 --pane "$W1" --birth "$W1B" --session sess-21 --call-id call-21 \
+    --tool bash --source test --input-json - >/dev/null 2>&1
+printf '%s\n' "$W1" | attention_tick
+tool21="$(_q "SELECT json_extract(payload,'\$.tool') FROM events WHERE task_id='task21' AND type='input_required' ORDER BY sequence DESC LIMIT 1;")"
+cmd21="$(_q "SELECT json_extract(payload,'\$.command') FROM events WHERE task_id='task21' AND type='input_required' ORDER BY sequence DESC LIMIT 1;")"
+[ "$tool21" = "bash" ] && [ "$cmd21" = "$CMD21" ] \
+  && ok "the controller rebinds the exact tool+command for a single surviving occurrence (#308)" \
+  || bad "expected tool=bash command=[$CMD21], got tool=[$tool21] command=[$cmd21]"
+
+printf '== herdr-control #308: 2+ unresolved occurrences on one pane never rebind (ambiguity fails closed) ==\n'
+register_task run22 task22 w22 cond22 "$CND" "$CNDB" "$W2" "$W2B" /repo /wt22 "impl:rebind-ambiguous" >/dev/null 2>&1
+set_task_state run22 task22 running >/dev/null 2>&1
+CMD22A="echo first"
+CMD22B="echo second"
+omp_menu_screen "$CMD22B" > "$S2"
+: > "$SENT"
+jq -nc --arg cmd "$CMD22A" '{command:$cmd}' \
+  | python3 "$here/lib/prompt-occurrence.py" seen --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    --run run22 --task task22 --pane "$W2" --birth "$W2B" --session sess-22a --call-id call-22a \
+    --tool bash --source test --input-json - >/dev/null 2>&1
+jq -nc --arg cmd "$CMD22B" '{command:$cmd}' \
+  | python3 "$here/lib/prompt-occurrence.py" seen --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    --run run22 --task task22 --pane "$W2" --birth "$W2B" --session sess-22b --call-id call-22b \
+    --tool bash --source test --input-json - >/dev/null 2>&1
+printf '%s\n' "$W2" | attention_tick
+tool22="$(_q "SELECT json_extract(payload,'\$.tool') FROM events WHERE task_id='task22' AND type='input_required' ORDER BY sequence DESC LIMIT 1;")"
+cmd22="$(_q "SELECT json_extract(payload,'\$.command') FROM events WHERE task_id='task22' AND type='input_required' ORDER BY sequence DESC LIMIT 1;")"
+[ -z "$tool22" ] && [ -z "$cmd22" ] \
+  && ok "two unresolved occurrences on the same pane never rebind -- ambiguity fails closed, unchanged fallback (#308)" \
+  || bad "expected empty tool/command on ambiguity, got tool=[$tool22] command=[$cmd22]"
+
+printf '== herdr-control #308: a declined/superseded occurrence never rebinds ==\n'
+register_task run23 task23 w23 cond23 "$CND" "$CNDB" "$W1" "$W1B" /repo /wt23 "impl:rebind-dead" >/dev/null 2>&1
+set_task_state run23 task23 running >/dev/null 2>&1
+CMD23="echo stale"
+omp_menu_screen "$CMD23" > "$S1"
+: > "$SENT"
+jq -nc --arg cmd "$CMD23" '{command:$cmd}' \
+  | python3 "$here/lib/prompt-occurrence.py" seen --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+    --run run23 --task task23 --pane "$W1" --birth "$W1B" --session sess-23 --call-id call-23 \
+    --tool bash --source test --input-json - >/dev/null 2>&1
+python3 "$here/lib/prompt-occurrence.py" declined --db "$HERDR_RUN_STATE_DIR/registry.sqlite3" \
+  --run run23 --task task23 --pane "$W1" --birth "$W1B" --session sess-23 --call-id call-23 \
+  --reason test >/dev/null 2>&1
+printf '%s\n' "$W1" | attention_tick
+tool23="$(_q "SELECT json_extract(payload,'\$.tool') FROM events WHERE task_id='task23' AND type='input_required' ORDER BY sequence DESC LIMIT 1;")"
+cmd23="$(_q "SELECT json_extract(payload,'\$.command') FROM events WHERE task_id='task23' AND type='input_required' ORDER BY sequence DESC LIMIT 1;")"
+[ -z "$tool23" ] && [ -z "$cmd23" ] \
+  && ok "a declined/superseded occurrence never rebinds -- dead, correctly excluded (#308)" \
+  || bad "expected empty tool/command for a declined occurrence, got tool=[$tool23] command=[$cmd23]"
+
+
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] && echo PASS || { echo FAIL; exit 1; }

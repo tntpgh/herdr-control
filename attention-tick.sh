@@ -166,15 +166,24 @@ attention_probe() {
 # and Slack exactly as before this file existed — start the hub with
 # `--no-attention`; that is the full rollback, HERDR_WAKE_LEGACY=1 is a
 # narrower one (delivery only).
-_attn_track_and_wake() {                # run_id task_id pane conductor_pane_id label pid key -> since (ISO), stdout
-  local run_id="$1" task_id="$2" pane="$3" conductor_pane_id="$4" label="$5" pid="$6" key="$7"
+_attn_track_and_wake() {                # run_id task_id pane conductor_pane_id label pid key pane_birth -> since (ISO), stdout
+  local run_id="$1" task_id="$2" pane="$3" conductor_pane_id="$4" label="$5" pid="$6" key="$7" pane_birth="${8:-}"
   local eid="attn_track_${key}" claimed=1
   local payload; payload="$(jq -nc --arg p "$pane" --arg k "$key" --arg pid "$pid" '{pane:$p, key:$k, prompt_id:$pid}')"
   claim_once "$eid" "$run_id" "$task_id" "attention_tracking" "$payload" || claimed=0
   if [ "${HERDR_WAKE_LEGACY:-0}" != "1" ] && [ "$claimed" = "1" ]; then
+    # herdr-control #308: try to name the ONE still-open occurrence's exact,
+    # digest-verified tool+command before falling back to today's empty
+    # write (see lib/attention-key.sh's attn_rebind for the identity proof
+    # and its invariants — ordering-only, fails closed on ambiguity, never
+    # a tool without a verified command).
+    local rebind_cmd="" rebind_tool=""
+    if attn_rebind "$run_id" "$task_id" "$pane" "$pane_birth"; then
+      rebind_tool="$ATTN_REBIND_TOOL"; rebind_cmd="$ATTN_REBIND_COMMAND"
+    fi
     HERDR_RUN_ID="$run_id" HERDR_TASK_ID="$task_id" HERDR_PANE_ID="$pane" \
       HERDR_CONDUCTOR_PANE_ID="$conductor_pane_id" HERDR_TASK_LABEL="${label:-$task_id}" \
-      push_wake "${label:-$task_id} needs input" "attention-controller" >/dev/null 2>&1 || true
+      push_wake "${label:-$task_id} needs input" "attention-controller" "$rebind_cmd" "$rebind_tool" >/dev/null 2>&1 || true
   fi
   _sql "SELECT occurred_at FROM events WHERE event_id=$(_sq "$eid") LIMIT 1;" 2>/dev/null
 }
@@ -392,7 +401,7 @@ attention_tick() {
     key="$(attention_dedupe_key "$pane" "$registered_birth" "$cmd")"
 
     local since since_epoch elapsed
-    since="$(_attn_track_and_wake "$run_id" "$task_id" "$pane" "$conductor_pane_id" "$label" "$pid" "$key")"
+    since="$(_attn_track_and_wake "$run_id" "$task_id" "$pane" "$conductor_pane_id" "$label" "$pid" "$key" "$registered_birth")"
     since_epoch="$(_attn_iso_epoch "$since")" || continue
     [ -n "$since_epoch" ] || continue
     _attn_answered_since "$pane" "$pid" "$since" && continue

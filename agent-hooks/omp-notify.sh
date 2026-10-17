@@ -133,12 +133,49 @@ _panel_matches_call() {
 # anything is ever written, so this stays `_prompt_is_up` alone rather than
 # adding a second `herdr pane read` (corroboration_candidates) to every one
 # of these tight 0.3s ticks.
-# One total budget for every probe below, measured from here with bash's
-# SECONDS counter; the env override is clamped to 1..10s.
+# One total budget for the FAST initial poll below (is anything painted at
+# ALL, i.e. was this tool auto-approved with no human needed) -- measured
+# from here with bash's SECONDS counter; the env override is clamped to
+# 1..10s. #308: this same short clock used to also bound the SEPARATE retry
+# loop further down (~line 353) that runs only once the occurrence is
+# already known-alive -- either genuinely bound (onApprovalRequested's own
+# `seen` row already exists, _entry_rc=0) or genuinely queued behind a
+# still-open sibling panel (_occ_not_yet=1, proven alive by ordering, never
+# "gone"). Two independent live traces (2026-10-17) hit this:
+#   - single call, entry_binding=bound: the panel genuinely painted ~6s
+#     after dispatch (attention_tracking timestamp), inside the shared
+#     10s budget on paper, but the retry loop's own per-iteration cost
+#     (two `_occ_still_ours` registry reads plus a `herdr pane read` in
+#     `_panel_matches_call`) left too few 0.5s ticks to ever land on the
+#     painted frame before SECONDS hit 10 -- no_provenance at elapsed_s=10,
+#     found=0, superseded=0.
+#   - two parallel calls 40ms apart: the second's occurrence was genuinely
+#     `_occ_not_yet` (its sibling's panel was still open), so it never
+#     supersedes -- but the sibling took longer than 10s total to resolve
+#     (a human reviewing it), so the second hook gave up BEFORE its own
+#     panel ever painted, 10s before the sibling was even approved.
+# Neither case is "nothing ever needed a human" (the fast poll's own
+# question) -- both are "we already know this occurrence is alive, we are
+# just waiting our turn or waiting for the render to catch up". This hook
+# runs detached from the agent's turn (header comment above): waiting
+# longer here costs nothing but wall-clock in a background process, so the
+# retry loop gets its OWN, much larger ceiling below (`_queue_budget`)
+# instead of inheriting the fast-poll's short one. The binding checks
+# themselves (`_occ_still_ours`, `_panel_matches_call`) are UNCHANGED --
+# this only extends how long a PROVEN-alive occurrence is given to paint
+# and be read, never what counts as proof.
 _budget="${HERDR_NOTIFY_UNREADABLE_DEADLINE_S:-10}"
 case "$_budget" in ''|*[!0-9]*) _budget=10 ;; esac
 [ "$_budget" -gt 10 ] && _budget=10
 [ "$_budget" -lt 1 ] && _budget=1
+# Retry-loop ceiling for an occurrence already proven alive (bound or
+# not-yet-earliest): clamped 10..300s, default 120s -- long enough for a
+# human to resolve a queued sibling or for a slow render to catch up,
+# short enough that a hook process cannot run forever on a dead task.
+_queue_budget="${HERDR_NOTIFY_QUEUE_DEADLINE_S:-120}"
+case "$_queue_budget" in ''|*[!0-9]*) _queue_budget=120 ;; esac
+[ "$_queue_budget" -gt 300 ] && _queue_budget=300
+[ "$_queue_budget" -lt "$_budget" ] && _queue_budget="$_budget"
 SECONDS=0
 found=0
 if [ "$deferred" != true ]; then
@@ -349,8 +386,14 @@ elif [ "$_has_occ" = 1 ]; then
     [ "$found" = 1 ] && _superseded=1
     found=0
   else
+    # #308: this occurrence is already PROVEN alive here -- either bound
+    # (onApprovalRequested's own `seen` row exists) or genuinely queued
+    # (_occ_not_yet, ordering proves it is not dead) -- so it is given the
+    # longer `_queue_budget` ceiling (see its definition above), not the
+    # short fast-poll `_budget`. The binding re-checks inside the loop are
+    # byte-for-byte unchanged; only how long they are retried changes.
     found=0
-    while [ "$SECONDS" -lt "$_budget" ]; do
+    while [ "$SECONDS" -lt "$_queue_budget" ]; do
       _occ_still_ours
       if [ $? -ne 0 ] && [ "$_occ_not_yet" != 1 ]; then _superseded=1; break; fi
       sleep 0.5
