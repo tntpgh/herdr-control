@@ -2007,9 +2007,21 @@ function onApprovalResolved(event?: unknown, ctx?: unknown): undefined {
       // directly as declined. `false` also covers "no interactive UI" and an
       // abort, so `reason` carries omp's own words rather than this always
       // being read as a human denial.
+      //
+      // #309: this event fires for EVERY omp-resolved approval, including
+      // ones herdr-select.sh/peer-answer.sh pressed by sending keys to the
+      // pane — this hook has no way to see who actually pressed the key, so
+      // it must never claim "human". The deferred/bound path (herdr-select.sh
+      // -> authorize-bound) already records the real actor directly and
+      // wins the race (prompt_occ_authorized is first-write-wins), so this
+      // call is a no-op there. For the non-bound/keystroke path, hand
+      // prompt-occurrence.py an honest "unverified" sentinel; its own
+      // record_authorized() correlates against the `approvals` table
+      // herdr-select.sh writes BEFORE every keystroke and upgrades to the
+      // real decided_by when a fresh matching row exists, never guessing.
       recordOccurrence([
         "authorized", ...occurrenceIdentityArgs(callId, nativeSession),
-        "--decided-by", approved ? "human" : "human_or_abort",
+        "--decided-by", approved ? "unverified" : "unverified_or_abort",
         "--choice", approved ? "approve" : "deny",
       ]);
     }

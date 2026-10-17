@@ -396,6 +396,104 @@ class CliEntryPoint(unittest.TestCase):
         self.assertIn("error", out)
 
 
+def _fresh_db_with_approvals() -> str:
+    """Same `events`-only fixture as `_fresh_db`, plus the `approvals` table
+    lib/run-registry.sh's approval_decided() writes (herdr-select.sh calls it
+    BEFORE every keystroke) -- the signal issue #309's correlation reads."""
+    db = _fresh_db()
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE approvals (
+          approval_id    TEXT PRIMARY KEY,
+          run_id         TEXT NOT NULL DEFAULT '',
+          task_id        TEXT NOT NULL DEFAULT '',
+          pane_id        TEXT NOT NULL DEFAULT '',
+          decided_by     TEXT NOT NULL DEFAULT '',
+          authority      TEXT NOT NULL DEFAULT '',
+          decided_at     TEXT NOT NULL
+        );
+        CREATE INDEX approvals_by_pane ON approvals(pane_id, decided_at DESC);
+        """
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _insert_approval(db: str, *, run_id: str, task_id: str, pane_id: str,
+                      decided_by: str, authority: str, at: float) -> None:
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO approvals (approval_id, run_id, task_id, pane_id, decided_by, authority, decided_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (f"appr-{at}", run_id, task_id, pane_id, decided_by, authority, po._now_iso(at)),
+    )
+    conn.commit()
+    conn.close()
+
+
+class AuthorizedActorCorrelation(unittest.TestCase):
+    """#309: agent-hooks/omp-herdr-control.ts can't see who pressed an
+    omp-resolved approval, so it hands record_authorized() an honest
+    'unverified'/'unverified_or_abort' sentinel instead of guessing "human".
+    record_authorized() correlates that sentinel against the `approvals`
+    table herdr-select.sh/peer-answer.sh write BEFORE the keystroke and
+    upgrades to the real actor only when a fresh matching row exists."""
+
+    def test_peer_press_correlates_to_peer(self):
+        db = _fresh_db_with_approvals()
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1",
+                          decided_by="peer-answer", authority="peer", at=1000.0)
+        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=1000.5)
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "peer-answer")
+
+    def test_conductor_press_correlates_to_conductor(self):
+        db = _fresh_db_with_approvals()
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1",
+                          decided_by="conductor:w7:p2", authority="conductor", at=2000.0)
+        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=2000.2)
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "conductor:w7:p2")
+
+    def test_unverified_never_becomes_human_without_a_row(self):
+        db = _fresh_db_with_approvals()  # table exists, no row at all
+        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=3000.0)
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "unverified")
+        self.assertNotEqual(rec["decided_by"], "human")
+
+    def test_unverified_never_becomes_human_with_no_approvals_table(self):
+        db = _fresh_db()  # registry predates the approvals table entirely
+        out = po.record_authorized(db, **IDENT, decided_by="unverified_or_abort", choice="deny", now=3000.0)
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "unverified_or_abort")
+
+    def test_stale_approval_row_outside_window_is_not_used(self):
+        db = _fresh_db_with_approvals()
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1",
+                          decided_by="peer-answer", authority="peer", at=1000.0)
+        # 30s later: outside the 20s correlation window -- a different,
+        # unrelated prompt in the same pane must not borrow this actor.
+        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=1030.0)
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "unverified")
+
+    def test_explicit_decided_by_is_never_overridden_by_correlation(self):
+        """The bound/deferred path (herdr-select.sh authorize-bound /
+        authorized --decided-by "$decision_actor") already asserts the real,
+        verified actor directly -- correlation must only ever apply to the
+        'unverified' sentinel, never second-guess an explicit value."""
+        db = _fresh_db_with_approvals()
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1",
+                          decided_by="some-other-actor", authority="peer", at=1000.0)
+        out = po.record_authorized(db, **IDENT, decided_by="conductor", choice="approve", now=1000.1)
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "conductor")
+
+
+
 def _isolated_db() -> tuple[str, Path]:
     """A registry in its own directory (proposals live beside the db) plus a
     real worktree directory, both realpath'd."""

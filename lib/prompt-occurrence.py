@@ -68,6 +68,7 @@ agent-hooks/omp-herdr-control.ts's own hooks.
 from __future__ import annotations
 
 import argparse
+import calendar
 import hashlib
 import json
 import os
@@ -351,11 +352,62 @@ def record_screen(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane
         conn.close()
 
 
+# #309: a decision recorded by onApprovalResolved for an omp-resolved
+# (non-bound) approval cannot tell WHO pressed the key -- only
+# herdr-select.sh/peer-answer.sh know that, and they already write it into
+# the shared `approvals` table (lib/run-registry.sh approval_decided())
+# BEFORE sending the keystroke that causes omp to fire that event. The hook
+# hands record_authorized() one of these sentinels instead of guessing
+# "human"; record_authorized correlates against that table and upgrades to
+# the real actor when a fresh matching row exists, never otherwise.
+_CORRELATABLE_DECISIONS = {"unverified", "unverified_or_abort"}
+# Generous enough for a slow terminal round trip between herdr-select.sh's
+# pre-keystroke write and omp's own approval-resolved event; short enough
+# that a stale row left by an earlier, unrelated prompt in the same pane
+# can't be mistaken for this one.
+_APPROVAL_CORRELATION_WINDOW_S = 20.0
+
+
+def _correlate_approval_actor(conn: sqlite3.Connection, *, run_id: str, task_id: str,
+                               pane_id: str, now: float) -> str | None:
+    """Most recent `approvals` row for this exact (run, task, pane), if any,
+    decided within the correlation window just before `now`. No row, a row
+    outside the window, or a registry that predates the approvals table ->
+    None: no herdr-select press explains this event, so the caller's honest
+    'unverified' sentinel must stand rather than being guessed into human."""
+    try:
+        row = conn.execute(
+            "SELECT decided_by, decided_at FROM approvals "
+            "WHERE run_id=? AND task_id=? AND pane_id=? AND decided_by != '' "
+            "ORDER BY decided_at DESC LIMIT 1",
+            (run_id, task_id, pane_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    decided_by, decided_at = row
+    try:
+        decided_ts = calendar.timegm(time.strptime(decided_at, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
+    age = now - decided_ts
+    if not (0 <= age <= _APPROVAL_CORRELATION_WINDOW_S):
+        return None
+    return str(decided_by)
+
+
 def record_authorized(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
                        native_session: str, tool_call_id: str, decided_by: str, choice: str,
                        now: float | None = None) -> dict:
     conn = _connect(db_path)
     try:
+        resolved_now = now if now is not None else time.time()
+        if decided_by in _CORRELATABLE_DECISIONS:
+            correlated = _correlate_approval_actor(conn, run_id=run_id, task_id=task_id,
+                                                    pane_id=pane_id, now=resolved_now)
+            if correlated:
+                decided_by = correlated
         key = occurrence_key(run_id, task_id, pane_id, pane_birth, native_session, tool_call_id)
         eid = f"prompt_occ_authorized_{key}"
         first = _put(conn, eid, run_id, task_id, "prompt_occ_authorized",
