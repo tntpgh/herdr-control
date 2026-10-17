@@ -460,6 +460,77 @@ def record_authorized(db_path: str, *, run_id: str, task_id: str, pane_id: str, 
         conn.close()
 
 
+def upgrade_authorized_actor(db_path: str, *, run_id: str, task_id: str,
+                              screen_prompt_id: str, choice: str, decided_by: str) -> dict:
+    """#309 r2: the ordinary (non-bound) keystroke path races
+    onApprovalResolved's immediate correlation attempt (which requires
+    `approvals.confirmed_at IS NOT NULL`) against herdr-select.sh's own
+    `approval_confirmed("pressed", ...)` write, which runs AFTER the
+    keystroke is actually sent (herdr-select.sh:1096 decide -> send-keys ->
+    :1327 confirm). If the hook's correlation query runs first, it finds no
+    confirmed row, and `record_authorized` permanently locks the occurrence
+    at the honest-but-wrong "unverified"/"unverified_or_abort" sentinel
+    (`prompt_occ_authorized` is first-write-wins -- nothing else ever
+    re-attempts correlation for the non-bound path).
+
+    herdr-select.sh calls this immediately after its own
+    `approval_confirmed`, with the exact actor and choice it just verified
+    and pressed, to UPGRADE that sentinel -- never to invent a fresh
+    authorization or downgrade an already-real `decided_by`.
+
+    Identity is established the same way review r2's concern 1 proved safe
+    for `_correlate_approval_actor`: `screen_prompt_id` (`prompt_id_of()`,
+    lib/prompt-parse.sh) hashes pane id + pane birth + prompt period + exact
+    screen content, so it already encodes the pane and the exact on-screen
+    moment -- a different prompt, in this pane or any other, cannot share
+    it. Matched directly against `prompt_occ_screen` events (NOT through
+    `fold_task`: that fold resets `authorization`/`lifecycle` to
+    none/unknown for an occurrence whose `prompt_occ_seen` never carried a
+    proven pane_birth/native_session -- M1, Main review dc6a55d -- which has
+    nothing to do with whether THIS write may proceed and would wrongly
+    refuse a legitimate upgrade). More than one `prompt_occ_screen` match (a
+    genuine, if exotic, content collision) or none at all is an identity
+    that cannot be established uniquely -- no-op either way, never a guess.
+    The stored `choice` on the existing `prompt_occ_authorized` row must
+    also match exactly (never upgrade a Deny into crediting an Approve or
+    vice versa), checked atomically in the same UPDATE as the sentinel
+    guard so a concurrent write can only ever lose the race, never corrupt
+    the row."""
+    if not screen_prompt_id or decided_by in _CORRELATABLE_DECISIONS:
+        return {"written": "no-op", "reason": "invalid arguments"}
+    choice_lc = str(choice).strip().lower()
+    if choice_lc in APPROVE_CHOICES:
+        new_choice = "approve"
+    elif choice_lc in DENY_CHOICES:
+        new_choice = "deny"
+    else:
+        return {"written": "no-op", "reason": "unrecognized choice"}
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT json_extract(payload,'$.occ_key') FROM events "
+            "WHERE run_id=? AND task_id=? AND type='prompt_occ_screen' "
+            "AND json_extract(payload,'$.screen_prompt_id')=?",
+            (run_id, task_id, screen_prompt_id),
+        ).fetchall()
+        keys = {r[0] for r in rows if r[0]}
+        if len(keys) != 1:
+            return {"written": "no-op", "reason": "ambiguous" if keys else "not-found"}
+        key = next(iter(keys))
+        eid = f"prompt_occ_authorized_{key}"
+        cur = conn.execute(
+            "UPDATE events SET payload = json_set(payload, '$.decided_by', ?) "
+            "WHERE task_id=? AND event_id=? "
+            "AND json_extract(payload,'$.decided_by') IN ('unverified','unverified_or_abort') "
+            "AND json_extract(payload,'$.choice')=?",
+            (decided_by, task_id, eid, new_choice),
+        )
+        conn.commit()
+        return {"occ_key": key, "written": "upgraded" if cur.rowcount == 1 else "no-op"}
+    finally:
+        conn.close()
+
+
 def authorize_bound(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
                     native_session: str, tool_call_id: str, approval_request_id: str,
                     core_arguments_digest: str, worktree: str, conductor_pane: str,
@@ -1104,6 +1175,14 @@ def main(argv: list[str]) -> int:
     s.add_argument("--decided-by", default="")
     s.add_argument("--choice", default="")
 
+    s = sub.add_parser("upgrade-actor")
+    s.add_argument("--db", required=True)
+    s.add_argument("--run", dest="run_id", required=True)
+    s.add_argument("--task", dest="task_id", required=True)
+    s.add_argument("--screen-prompt-id", required=True)
+    s.add_argument("--choice", required=True)
+    s.add_argument("--decided-by", required=True)
+
     s = sub.add_parser("authorize-bound")
     _add_identity_args(s)
     for name in ("approval-request-id", "core-arguments-digest", "worktree", "conductor-pane",
@@ -1192,6 +1271,10 @@ def main(argv: list[str]) -> int:
                                      pane_birth=args.pane_birth, native_session=args.native_session,
                                      tool_call_id=args.tool_call_id, decided_by=args.decided_by,
                                      choice=args.choice)
+        elif args.cmd == "upgrade-actor":
+            out = upgrade_authorized_actor(args.db, run_id=args.run_id, task_id=args.task_id,
+                                            screen_prompt_id=args.screen_prompt_id,
+                                            choice=args.choice, decided_by=args.decided_by)
         elif args.cmd == "authorize-bound":
             out = authorize_bound(args.db, run_id=args.run_id, task_id=args.task_id, pane_id=args.pane_id,
                                   pane_birth=args.pane_birth, native_session=args.native_session,

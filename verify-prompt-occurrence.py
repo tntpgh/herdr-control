@@ -546,6 +546,96 @@ class AuthorizedActorCorrelation(unittest.TestCase):
         self.assertEqual(rec["decided_by"], "unverified")
 
 
+class UpgradeAuthorizedActor(unittest.TestCase):
+    """#309 r2: herdr-select.sh's own `approval_confirmed("pressed", ...)`
+    write races omp's immediate correlation attempt -- if the hook's
+    correlate query runs first (before `confirmed_at` is set), it locks the
+    occurrence at the honest "unverified" sentinel forever (first-write-wins).
+    herdr-select.sh calls `upgrade-actor` right after confirming the press to
+    repair exactly that case; `upgrade_authorized_actor()` must only ever
+    replace an unverified sentinel, never invent or downgrade a real value."""
+
+    def test_real_ordering_upgrades_unverified_to_the_actual_actor(self):
+        """The actual production ordering: the hook's correlation write
+        lands with 'unverified' BEFORE herdr-select.sh's approval_confirmed
+        (and thus its own upgrade call) ever happens -- then the upgrade
+        call, once it does happen, replaces the sentinel with the real,
+        just-confirmed actor."""
+        db = _fresh_db()
+        po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="RACE-PID")
+        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve")
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "unverified")  # locked in first, as the race produces
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1",
+                                          screen_prompt_id="RACE-PID", choice="approve",
+                                          decided_by="peer-answer")
+        self.assertEqual(up["written"], "upgraded")
+        rec2 = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec2["decided_by"], "peer-answer")
+
+    def test_upgrade_never_downgrades_an_already_real_value(self):
+        """The bound path (or a prior successful upgrade) already recorded
+        the real, verified actor directly -- a later upgrade call must never
+        second-guess it, matching the existing
+        test_explicit_decided_by_is_never_overridden_by_correlation
+        guarantee for the sentinel-correlation path."""
+        db = _fresh_db()
+        po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="REAL-PID")
+        po.record_authorized(db, **IDENT, decided_by="conductor", choice="approve")
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1",
+                                          screen_prompt_id="REAL-PID", choice="approve",
+                                          decided_by="peer-answer")
+        self.assertEqual(up["written"], "no-op")
+        rec = po.fold_task(db, "r1", "t1")[po.occurrence_key(**IDENT)]
+        self.assertEqual(rec["decided_by"], "conductor")
+
+    def test_upgrade_choice_mismatch_leaves_sentinel_in_place(self):
+        """The occurrence's stored choice was Deny; an upgrade call claiming
+        an Approve for the same screen_prompt_id must never apply -- the
+        confirmed press it describes is not this occurrence's decision."""
+        db = _fresh_db()
+        po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="MISMATCH-PID")
+        po.record_authorized(db, **IDENT, decided_by="unverified_or_abort", choice="deny")
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1",
+                                          screen_prompt_id="MISMATCH-PID", choice="approve",
+                                          decided_by="peer-answer")
+        self.assertEqual(up["written"], "no-op")
+        rec = po.fold_task(db, "r1", "t1")[po.occurrence_key(**IDENT)]
+        self.assertEqual(rec["decided_by"], "unverified_or_abort")
+
+    def test_upgrade_with_no_matching_screen_id_is_a_no_op(self):
+        db = _fresh_db()
+        po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
+        po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve")
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1",
+                                          screen_prompt_id="NEVER-PAINTED", choice="approve",
+                                          decided_by="peer-answer")
+        self.assertEqual(up["written"], "no-op")
+        self.assertEqual(up["reason"], "not-found")
+
+    def test_upgrade_ambiguous_across_two_occurrences_is_a_no_op(self):
+        """Two distinct occurrences somehow share one screen_prompt_id
+        (a content collision) -- refuse to guess which one the confirmed
+        press belongs to, same refusal shape as resolve_exact_pending's own
+        screen-correlated branch for the analogous ambiguity."""
+        db = _fresh_db()
+        a = {**IDENT, "tool_call_id": "a"}
+        b = {**IDENT, "tool_call_id": "b"}
+        po.record_seen(db, **a, tool="bash", tool_input={"command": "x"}, source="s")
+        po.record_seen(db, **b, tool="bash", tool_input={"command": "y"}, source="s")
+        po.record_screen(db, **a, display="pending_parseable", screen_prompt_id="SHARED-PID")
+        po.record_screen(db, **b, display="pending_parseable", screen_prompt_id="SHARED-PID")
+        po.record_authorized(db, **a, decided_by="unverified", choice="approve")
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1",
+                                          screen_prompt_id="SHARED-PID", choice="approve",
+                                          decided_by="peer-answer")
+        self.assertEqual(up["written"], "no-op")
+        self.assertEqual(up["reason"], "ambiguous")
+
+
 def _isolated_db() -> tuple[str, Path]:
     """A registry in its own directory (proposals live beside the db) plus a
     real worktree directory, both realpath'd."""

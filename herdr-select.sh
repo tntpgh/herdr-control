@@ -1327,6 +1327,25 @@ fi
 approval_confirmed "$approval_id" "pressed" \
   "mechanism=$mechanism choice=$choice" >/dev/null 2>&1 || true
 
+# #309 r2: omp's own tool_approval_resolved can fire (and correlate into
+# prompt_occ_authorized, lib/prompt-occurrence.py _correlate_approval_actor)
+# BEFORE the approval_confirmed write just above lands -- correlation
+# requires approvals.confirmed_at, and prompt_occ_authorized is first-write-
+# wins, so that race can permanently lock this occurrence at the honest-but-
+# wrong "unverified"/"unverified_or_abort" sentinel. Now that confirmed_at
+# really is set, ask prompt-occurrence.py to upgrade that sentinel -- and
+# ONLY that sentinel, never a real value, never a fresh authorization -- to
+# the actor and choice just verified and pressed. Best-effort: the key
+# already landed; this only improves attribution, never blocks it.
+if [ -n "$current_prompt_id" ] && [ -n "$own_run" ] && [ -n "$own_task" ] \
+   && [ -f "$here/lib/prompt-occurrence.py" ] && occ_py="$(_registry_python 2>/dev/null)"; then
+  _upgrade_choice=approve
+  [ "$declining" = 1 ] && _upgrade_choice=deny
+  "$occ_py" "$here/lib/prompt-occurrence.py" upgrade-actor --db "$(registry_db)" \
+    --run "$own_run" --task "$own_task" --screen-prompt-id "$current_prompt_id" \
+    --choice "$_upgrade_choice" --decided-by "$decision_actor" >/dev/null 2>&1 || true
+fi
+
 # ---- F7c: a Deny pressed by automation tells the worker WHY ----------------
 # A bare Deny reaches omp as nothing but "denied", so the worker cannot tell
 # "this command is off-limits" from "try that again". Observed: a worker
