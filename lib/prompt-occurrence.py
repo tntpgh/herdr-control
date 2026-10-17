@@ -157,6 +157,72 @@ NOTEPAD_XD = {"xd://notepad_append", "xd://notepad_priority", "xd://notepad_stat
 # still pending past it simply fails closed (no proposal).
 PROPOSAL_MAX_AGE_S = 24 * 3600
 
+# herdr-control #308: the attention-controller's rebind path needs the EXACT
+# command text for a bash/shell occurrence whose own hook never corroborates
+# it against the screen in time (the screen may show it truncated/wrapped;
+# the registry deliberately never persists a bash command elsewhere, M4
+# above). Independent of PROPOSAL_TOOLS/HERDR_BOUND_BASH — that flag gates a
+# DIFFERENT feature (the exclusiveResolver bound-approval flow and its
+# authorize-bound consumption/deletion semantics); this cache is always
+# written for bash/shell, read-only for the rebind lookup below, and never
+# consumed/deleted by authorize-bound. Only `command` is cached, never the
+# whole input object; capped well under a single command line's any
+# realistic length, and bound to this occurrence's own payload_sha256 so a
+# reader can verify it was never swapped before trusting it as
+# corroboration a human never saw re-typed.
+COMMAND_CACHE_TOOLS = {"bash", "shell"}
+COMMAND_CACHE_MAX_BYTES = 8_192
+
+
+def command_cache_path(db_path: str, key: str) -> Path:
+    return Path(db_path).resolve().parent / "cmdcache" / f"{key}.json"
+
+
+def _write_command_cache(db_path: str, key: str, command: str, payload_sha256: str) -> str:
+    """Atomic, 0600, never overwrites an existing cache for the key — same
+    shape as _write_proposal, deliberately a separate file/directory so
+    nothing in the bound-approval flow (_drop_proposal on deny,
+    authorize-bound's consumption) ever touches it."""
+    path = command_cache_path(db_path, key)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    _sweep_proposals(path.parent)
+    if path.exists():
+        return "exists"
+    data = json.dumps({"occ_key": key, "command": command, "payload_sha256": payload_sha256}, sort_keys=True)
+    if len(data.encode("utf-8")) > COMMAND_CACHE_MAX_BYTES:
+        return "too_large"
+    tmp = path.with_name(f".{key}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return "written"
+
+
+def _read_command_cache(db_path: str, key: str) -> dict | None:
+    path = command_cache_path(db_path, key)
+    try:
+        if path.is_symlink():
+            return None
+        if path.stat().st_size > COMMAND_CACHE_MAX_BYTES:
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _drop_command_cache(db_path: str, key: str) -> None:
+    try:
+        command_cache_path(db_path, key).unlink()
+    except OSError:
+        pass
+
+
 
 def proposal_path(db_path: str, key: str) -> Path:
     return Path(db_path).resolve().parent / "proposals" / f"{key}.json"
@@ -297,6 +363,22 @@ def record_seen(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_b
                     # The occurrence itself IS recorded; without its file the
                     # payload simply cannot be approved by automation.
                     out["proposal"] = f"failed: {exc}"
+            # herdr-control #308: cache the exact command for a bash/shell
+            # occurrence, independent of PROPOSAL_TOOLS/HERDR_BOUND_BASH —
+            # best-effort, never blocks the seen record itself. Only ever
+            # `command`, never the whole input object; the rebind reader
+            # (resolve_rebind below) re-verifies payload_sha256 before
+            # trusting it, so a write failure here just means the
+            # attention-controller rebind later fails closed (no cache to
+            # read), same as an over-length one already does.
+            if (tool_input is not None and isinstance(tool_input, dict)
+                    and str(tool).lower() in COMMAND_CACHE_TOOLS and full is not None):
+                cmd = tool_input.get("command")
+                if isinstance(cmd, str) and cmd:
+                    try:
+                        _write_command_cache(db_path, key, cmd, full)
+                    except OSError:
+                        pass
             return out
 
         first = _put(conn, eid, run_id, task_id, "prompt_occ_seen", payload, now)
@@ -475,6 +557,7 @@ def _resolve(db_path: str, kind: str, *, run_id: str, task_id: str, pane_id: str
         first = _put(conn, eid, run_id, task_id, f"prompt_{kind}", payload, now)
         if kind in ("occ_completed", "occ_declined", "occ_withdrawn"):
             _drop_proposal(db_path, key)
+            _drop_command_cache(db_path, key)
         return {"occ_key": key, "written": kind if first else "duplicate"}
     finally:
         conn.close()
@@ -664,6 +747,64 @@ def fold_task(db_path: str, run_id: str, task_id: str, readonly: bool = True) ->
             rec["authorization"] = "none"
             rec["unresolved_reason"] = "identity_unverified"
     return occ
+
+
+def resolve_rebind(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str) -> dict:
+    """herdr-control #308: the attention-controller's own rebind lookup —
+    called ONLY from attention-tick.sh, which never receives a
+    tool_approval_requested event and so has no native_session/call_id to
+    scope by (it only ever sees a blocked pane). Ordering-only identity
+    proof, mirroring agent-hooks/omp-notify.sh's `_occ_still_ours`
+    dead-elimination exactly: within the (pane_id, pane_birth) scope, a
+    `requested` occurrence at or before the scope's latest `resolved:*`
+    sibling's first_seen_seq is dead weight (omp paints panels oldest-
+    first, so it could not still be the one on screen); every other
+    `requested` occurrence is still genuinely open. Because this scope is
+    WEAKER than the hook's own (no native_session), ambiguity — more than
+    one survivor — fails closed (no result) rather than guessing between
+    concurrent calls on the same pane.
+
+    Conductor requirement (2026-10-17): tool identity alone is not enough —
+    with no command, herdr-select.sh's approval_command_text falls back to
+    the scraped (possibly truncated) panel. So the ONLY survivor's exact
+    command must also be available, verified, before this returns ok:true
+    at all — read back ONLY from the per-occurrence cache that same
+    occurrence's own `seen` call wrote (_write_command_cache, keyed by
+    occ_key), and ONLY after its stored payload_sha256 matches the
+    occurrence's own recorded one. A non-bash/shell survivor, a missing or
+    unverifiable cache, or more than one candidate all return ok:false —
+    the caller must then write nothing (today's exact tool-less,
+    command-less fallback), never a tool-only guess.
+    """
+    records = fold_task(db_path, run_id, task_id)
+    if not isinstance(records, dict) or "error" in records:
+        return {"ok": False, "reason": "fold failed"}
+    scope = [r for r in records.values()
+             if r.get("pane_id") == pane_id and r.get("pane_birth") == pane_birth]
+    deadline = max(
+        [r["first_seen_seq"] for r in scope
+         if str(r.get("lifecycle") or "").startswith("resolved") and r.get("first_seen_seq") is not None],
+        default=-1)
+    alive = [r for r in scope
+             if r.get("lifecycle") == "requested"
+             and (r.get("authorization") or "none") == "none"
+             and (r.get("first_seen_seq") if r.get("first_seen_seq") is not None else -1) > deadline]
+    if len(alive) != 1:
+        return {"ok": False, "reason": f"{len(alive)} candidate occurrence(s), need exactly 1"}
+    rec = alive[0]
+    tool = str(rec.get("tool") or "")
+    if tool.lower() not in COMMAND_CACHE_TOOLS:
+        return {"ok": False, "reason": f"tool {tool!r} has no verified-command rebind path"}
+    full = rec.get("payload_sha256")
+    occ_key = rec.get("occ_key")
+    if not full or not occ_key:
+        return {"ok": False, "reason": "occurrence has no recorded payload_sha256 to verify against"}
+    cached = _read_command_cache(db_path, occ_key)
+    command = cached.get("command") if isinstance(cached, dict) else None
+    if (not isinstance(cached, dict) or cached.get("payload_sha256") != full
+            or not isinstance(command, str) or not command):
+        return {"ok": False, "reason": "no verifiable cached command for this occurrence"}
+    return {"ok": True, "occ_key": occ_key, "tool": tool, "command": command}
 
 
 def occurrence_state(db_path: str, *, run_id: str, task_id: str, pane_id: str, pane_birth: str,
@@ -1062,6 +1203,13 @@ def main(argv: list[str]) -> int:
     s.add_argument("--run", dest="run_id", required=True)
     s.add_argument("--task", dest="task_id", required=True)
 
+    s = sub.add_parser("rebind")
+    s.add_argument("--db", required=True)
+    s.add_argument("--run", dest="run_id", required=True)
+    s.add_argument("--task", dest="task_id", required=True)
+    s.add_argument("--pane", dest="pane_id", required=True)
+    s.add_argument("--birth", dest="pane_birth", default="")
+
     args = ap.parse_args(argv)
     try:
         if args.cmd == "seen":
@@ -1149,6 +1297,9 @@ def main(argv: list[str]) -> int:
                                     tool_call_id=args.tool_call_id)
         elif args.cmd == "fold":
             out = fold_task(args.db, args.run_id, args.task_id)
+        elif args.cmd == "rebind":
+            out = resolve_rebind(args.db, run_id=args.run_id, task_id=args.task_id,
+                                  pane_id=args.pane_id, pane_birth=args.pane_birth)
         else:
             out = {"error": f"unknown command {args.cmd}"}
     except Exception as exc:  # noqa: BLE001 — a monitoring CLI must never crash its caller

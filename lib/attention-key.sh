@@ -101,3 +101,37 @@ attn_track_claim() {                    # pane_id run_id task_id [prompt_id] -> 
   claim_once "attn_track_${key}" "$run_id" "$task_id" "attention_tracking" \
     "$(jq -nc --arg p "$pane" --arg k "$key" --arg pid "$pid" '{pane:$p, key:$k, prompt_id:$pid}')"
 }
+
+# herdr-control #308: the attention controller routinely wins attn_track_claim
+# ahead of the hook (lib/push-wake.sh:272-274's own comment) and used to call
+# push_wake with neither tool nor command — leaving a tool-less input_required
+# row that herdr-select.sh's #191 check then refuses ("the hook recorded
+# '<none>'"). This looks up whether the registry ALONE (never the screen) can
+# name exactly one still-open occurrence for this pane AND its exact,
+# digest-verified command — lib/prompt-occurrence.py's resolve_rebind is the
+# single source of truth for both the ordering-only identity proof (mirrors
+# agent-hooks/omp-notify.sh's _occ_still_ours dead-elimination, scoped only
+# to pane+pane_birth since the controller has no native_session/call_id) and
+# the command-cache verification; this is a thin shell wrapper around it.
+#
+# Conductor requirement (2026-10-17): tool identity alone is not enough — an
+# empty recorded command makes herdr-select.sh's approval_command_text fall
+# back to the scraped (possibly truncated) panel, so a successful rebind
+# ALWAYS carries both tool and command, verified, or neither.
+#
+# Sets ATTN_REBIND_TOOL/ATTN_REBIND_COMMAND; returns 0 only when both are
+# non-empty. Requires lib/run-registry.sh (_registry_python, registry_db)
+# already sourced by the caller, same convention as attn_track_claim above.
+_ATTN_KEY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+attn_rebind() {                         # run_id task_id pane_id pane_birth -> 0 if both set
+  local run_id="$1" task_id="$2" pane="$3" birth="$4" py out ok
+  ATTN_REBIND_TOOL=""; ATTN_REBIND_COMMAND=""
+  py="$(_registry_python 2>/dev/null)" || return 1
+  out="$("$py" "$_ATTN_KEY_DIR/prompt-occurrence.py" rebind --db "$(registry_db)" \
+      --run "$run_id" --task "$task_id" --pane "$pane" --birth "$birth" 2>/dev/null)" || return 1
+  ok="$(printf '%s' "$out" | jq -r '.ok // false' 2>/dev/null)"
+  [ "$ok" = true ] || return 1
+  ATTN_REBIND_TOOL="$(printf '%s' "$out" | jq -r '.tool // ""' 2>/dev/null)"
+  ATTN_REBIND_COMMAND="$(printf '%s' "$out" | jq -r '.command // ""' 2>/dev/null)"
+  [ -n "$ATTN_REBIND_TOOL" ] && [ -n "$ATTN_REBIND_COMMAND" ]
+}
