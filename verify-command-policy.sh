@@ -1964,7 +1964,10 @@ check_reserved   "env prefix then bash -c 'const;env'"     "env A=1 bash -c 'con
 check_reserved   "env prefix then sh -c 'env|cat'"         "env A=1 sh -c 'env|cat'"
 check_reserved   "env prefix then sh -c 'x=(env)'"         "env A=1 sh -c 'x=(env)'"
 check_reserved   "cd, env prefix, sh -c 'env;:'"           "cd /wt && env A=1 sh -c 'env;:'"
-check_reserved   "env prefix then git log --format"        "env A=1 git log --format='%h;%s'"
+# Owner-approved 2026-10-17, reviewed in envfix-security r1 PROOF.md:54-64
+# and r2 §4 — R1 (bare env dump) and R2 (quote-flattening rebuild) not
+# reachable; rows 1961-1966 stay reserved.
+check_unreserved "env prefix then git log --format"        "env A=1 git log --format='%h;%s'"
 
 # Round 2 (independent security review HIGH finding, 2026-10-16): the
 # env-assign exemption's dangerous-name check must refuse any NAME this
