@@ -316,5 +316,76 @@ printf '{"tool":"bash","message":"needs review","cwd":"/tmp","command":"git fetc
 [ -s "$NOTIFIED8" ] \
   && ok "Slack alert fired despite the identity advancing mid-call (finding 1: _bound_pid was refreshed)" \
   || bad "Slack alert silently skipped — _bound_pid was NOT refreshed after push_wake's identity advanced (finding 1 regressed)"
+
+printf '== 9. fix/offline-launch-profile (2026-10-17): EXPECT_PROMPT_ID + full_cmd settles instead of refusing on a still-painting SAME prompt ==\n'
+# herdr-select.sh "the hook recorded '<none>' for this prompt" (observed
+# 2026-10-17, review workers w7Y:p7/p8 in ~/Code/tourguide, both long
+# multi-line python3 -c/node -e bash commands, both --no-secrets spawns):
+# agent-hooks/omp-notify.sh's _still_bound() already confirmed the SAME
+# prompt on ITS OWN read and passed HERDR_EXPECT_PROMPT_ID in as that exact
+# identity, but push_wake's own quick read a few lines later can still land
+# on the terminal mid-repaint for a long/tall panel -- before this fix that
+# single disagreeing read refused instantly (rc=1, nothing written at all,
+# not even an uncorroborated row), discarding a real hook record for a
+# prompt that was never actually different, only not finished painting yet.
+# Restore the original arm_settle-driven herdr() stub (section 8 above
+# replaced it with its own read-counting one).
+herdr() {
+  local sub="$1 $2"
+  case "$sub" in
+    "pane read")
+      if [ "$NEVER_SETTLE" = 1 ] || [ "$(date +%s%N)" -lt "$SETTLE_AT_NS" ]; then
+        cat "$STALE_SCREEN_FILE"
+      else
+        cat "$SETTLED_SCREEN_FILE"
+      fi
+      ;;
+    "pane process-info")
+      printf '{"result":{"process_info":{"foreground_processes":[{"name":"omp","cmdline":"omp --model sonnet"}]}}}\n' ;;
+    *) return 0 ;;
+  esac
+}
+export -f herdr
+LONGCMD='python3 -c "import sys; print(sys.version)"'
+omp_menu_screen "git log --oneline -3" > "$STALE_SCREEN_FILE"
+omp_menu_screen "$LONGCMD" > "$SETTLED_SCREEN_FILE"
+# The caller's own bound pid (agent-hooks/omp-notify.sh's _bound_pid) is the
+# REAL prompt's identity, read once against the settled screen -- exactly
+# like a caller whose own earlier read already saw the fully-painted panel.
+arm_settle 0; clear_events
+EXPECT_PID="$(prompt_id "$WPANE")"
+arm_settle 0.3
+before=$(date +%s%N)
+( export HERDR_PROMPT_SETTLE_WAIT_S=2 HERDR_EXPECT_PROMPT_ID="$EXPECT_PID"
+  push_wake "impl:friction needs input" "hook" "$LONGCMD" bash >/dev/null 2>&1 )
+rc=$?
+after=$(date +%s%N)
+elapsed_ms=$(( (after - before) / 1000000 ))
+payload="$(q_payload input_required)"
+printf '%s' "$payload" | jq -e --arg c "$LONGCMD" '.command == $c and (.command_uncorroborated // false) == false and .tool == "bash"' >/dev/null 2>&1 \
+  && ok "the hook recorded the real tool/command for this prompt -- herdr-select.sh will not see '<none>'" \
+  || bad "no corroborated record landed: $payload"
+[ "$elapsed_ms" -ge 250 ] \
+  && ok "took ${elapsed_ms}ms -- genuinely retried past the first disagreeing read, not an accidental instant match" \
+  || bad "resolved in ${elapsed_ms}ms -- suspiciously instant for a read that started disagreeing with EXPECT_PROMPT_ID"
+printf '== 10. regression guard: EXPECT_PROMPT_ID with NO full_cmd still refuses instantly even when the screen would settle ==\n'
+# Same settling fixture as section 9, but full_cmd="" (a non-bash approval,
+# or an older caller) -- nothing to corroborate against, so this must still
+# take the ORIGINAL instant-refuse path (section 4's guarantee), never pay
+# the settle budget just because a screen happens to be mid-repaint.
+arm_settle 0; clear_events
+EXPECT_PID2="$(prompt_id "$WPANE")"
+arm_settle 0.3
+before=$(date +%s%N)
+( export HERDR_PROMPT_SETTLE_WAIT_S=2 HERDR_EXPECT_PROMPT_ID="$EXPECT_PID2"
+  push_wake "impl:friction needs input" "hook" "" bash >/dev/null 2>&1 )
+rc=$?
+after=$(date +%s%N)
+elapsed_ms=$(( (after - before) / 1000000 ))
+[ "$rc" = 1 ] && ok "no full_cmd: still refuses (rc=1) rather than guessing" \
+  || bad "unexpected rc=$rc with no full_cmd to corroborate against"
+[ "$elapsed_ms" -lt 500 ] \
+  && ok "refused in ${elapsed_ms}ms -- no full_cmd never pays the settle budget" \
+  || bad "took ${elapsed_ms}ms -- a full_cmd-less call is now waiting on the settle budget (regression)"
 printf -- '-----\npassed=%s failed=%s\n' "$pass" "$fail"
 if [ "$fail" -eq 0 ]; then echo PASS; exit 0; else echo FAIL; exit 1; fi

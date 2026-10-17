@@ -153,7 +153,31 @@ push_wake() {
   # it; a screen now showing any other prompt means this hook's tool/command
   # are not this prompt's, so nothing is written and nobody is woken. Moot
   # for a deferred pid: there is no screen reading to disagree with it.
-  if [ -z "${HERDR_DEFERRED_PID:-}" ] && [ -n "${HERDR_EXPECT_PROMPT_ID:-}" ] && [ "$pid" != "$HERDR_EXPECT_PROMPT_ID" ]; then
+  # fix/offline-launch-profile (2026-10-17): judged HERE, instant, single
+  # read, ONLY when there is no full_cmd to corroborate against — exactly
+  # what verify-approval-friction.sh section 4 pins ("the 3s settle budget
+  # never ran for this gate") for a genuinely stale binding with nothing to
+  # settle onto. A long multi-line `python3 -c`/`node -e` body legitimately
+  # takes the terminal longer to finish painting than this quick read
+  # allows: the caller's own _still_bound (agent-hooks/omp-notify.sh) can
+  # succeed on ITS read and still lose the race to THIS read a few lines
+  # later, for a panel that is the SAME prompt, just not fully flushed yet.
+  # When full_cmd is present the mismatch is deferred to the settle+
+  # corroborate call below instead of refusing blind on one premature read
+  # (observed 2026-10-17: review workers w7Y:p7/p8 in ~/Code/tourguide lost
+  # their input_required row entirely — herdr-select.sh's "the hook
+  # recorded '<none>' for this prompt" — on exactly this shape).
+  # Review finding 2 (fix/offline-launch-profile, independent review): if a
+  # future caller ever sets HERDR_EXPECT_PROMPT_ID with full_cmd non-empty
+  # but HERDR_PANE_ID unset, the settle block below (its `if [ -z
+  # "${HERDR_DEFERRED_PID:-}" ] && [ -n "${HERDR_PANE_ID:-}" ]` guard) takes
+  # the else branch and never reaches the deferred EXPECT_PROMPT_ID check at
+  # all -- silently accepting an unverified pid. Not currently reachable
+  # (agent-hooks/omp-notify.sh, the only caller, always derives
+  # HERDR_EXPECT_PROMPT_ID from a read of HERDR_PANE_ID itself, so the two
+  # are never set/unset independently) but refuse here too rather than rely
+  # on that invariant holding forever.
+  if [ -z "${HERDR_DEFERRED_PID:-}" ] && [ -n "${HERDR_EXPECT_PROMPT_ID:-}" ] && { [ -z "$full_cmd" ] || [ -z "${HERDR_PANE_ID:-}" ]; } && [ "$pid" != "$HERDR_EXPECT_PROMPT_ID" ]; then
     return 1
   fi
   local base="wake_${HERDR_RUN_ID:-norun}_${HERDR_TASK_ID:-notask}_${pid:-noprompt}"
@@ -238,6 +262,14 @@ push_wake() {
     prompt_id_settled "$HERDR_PANE_ID" "$full_cmd" "$pid"
     pid="$PROMPT_SETTLE_PID"
     base="wake_${HERDR_RUN_ID:-norun}_${HERDR_TASK_ID:-notask}_${pid:-noprompt}"
+    # fix/offline-launch-profile (2026-10-17): the EXPECT_PROMPT_ID check
+    # deferred from above — full_cmd gave the settle call something to
+    # corroborate against, so a mismatch is judged only AFTER giving the
+    # panel the same bounded chance to finish painting that the command-
+    # corroboration retry already gets, never a weaker check than before.
+    if [ -n "${HERDR_EXPECT_PROMPT_ID:-}" ] && [ -n "$full_cmd" ] && [ "$pid" != "$HERDR_EXPECT_PROMPT_ID" ]; then
+      return 1
+    fi
   else
     PROMPT_SETTLE_PID="$pid"
     PROMPT_SETTLE_OK=1
