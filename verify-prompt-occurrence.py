@@ -547,47 +547,89 @@ class AuthorizedActorCorrelation(unittest.TestCase):
 
 
 class UpgradeAuthorizedActor(unittest.TestCase):
-    """#309 r2: herdr-select.sh's own `approval_confirmed("pressed", ...)`
+    """#309 r2/r3: herdr-select.sh's own `approval_confirmed("pressed", ...)`
     write races omp's immediate correlation attempt -- if the hook's
     correlate query runs first (before `confirmed_at` is set), it locks the
     occurrence at the honest "unverified" sentinel forever (first-write-wins).
     herdr-select.sh calls `upgrade-actor` right after confirming the press to
-    repair exactly that case; `upgrade_authorized_actor()` must only ever
-    replace an unverified sentinel, never invent or downgrade a real value."""
+    repair exactly that case. r3: the actor is never a caller-supplied
+    argument -- `upgrade_authorized_actor()` re-derives it ONLY via
+    `_correlate_approval_actor`'s own approvals-table proof (the same one
+    `record_authorized` requires), and records the repair as a NEW
+    `prompt_occ_actor_upgraded` event rather than mutating the original
+    `prompt_occ_authorized` row -- both must survive in the event log."""
 
     def test_real_ordering_upgrades_unverified_to_the_actual_actor(self):
         """The actual production ordering: the hook's correlation write
         lands with 'unverified' BEFORE herdr-select.sh's approval_confirmed
         (and thus its own upgrade call) ever happens -- then the upgrade
-        call, once it does happen, replaces the sentinel with the real,
-        just-confirmed actor."""
-        db = _fresh_db()
+        call, once a confirmed `approvals` row proves the real actor,
+        replaces the folded sentinel with it."""
+        db = _fresh_db_with_approvals()
         po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
-        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="RACE-PID")
-        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve")
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="RACE-PID", now=999.0)
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="RACE-PID", choice="1",
+                          decided_by="peer-answer", authority="peer", at=1000.0)
+        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=1000.1)
         rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
         self.assertEqual(rec["decided_by"], "unverified")  # locked in first, as the race produces
-        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1",
-                                          screen_prompt_id="RACE-PID", choice="approve",
-                                          decided_by="peer-answer")
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1", pane_id="p1",
+                                          screen_prompt_id="RACE-PID", choice="approve", now=1000.2)
         self.assertEqual(up["written"], "upgraded")
         rec2 = po.fold_task(db, "r1", "t1")[out["occ_key"]]
         self.assertEqual(rec2["decided_by"], "peer-answer")
 
+    def test_upgrade_no_op_without_a_confirmed_approvals_row(self):
+        """No `approvals` row at all corroborates this occurrence -- the
+        upgrade must never apply a value it cannot prove, whatever the
+        caller believes was just pressed."""
+        db = _fresh_db_with_approvals()  # table exists, no row at all
+        po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="NO-PROOF-PID", now=999.0)
+        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=1000.0)
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1", pane_id="p1",
+                                          screen_prompt_id="NO-PROOF-PID", choice="approve", now=1000.1)
+        self.assertEqual(up["written"], "no-op")
+        self.assertEqual(up["reason"], "no-corroborated-actor")
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "unverified")
+
+    def test_upgrade_no_op_with_only_a_lost_race_row(self):
+        """herdr-select.sh's bound exact-request path wrote an `approvals`
+        row for this exact prompt/choice/pane, but with outcome='lost-race'
+        (no keystroke was ever sent, r1 concern 2) -- that computed-but-
+        undelivered decision must never prove an upgrade either."""
+        db = _fresh_db_with_approvals()
+        po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="LOST-RACE-PID", now=999.0)
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="LOST-RACE-PID", choice="1",
+                          decided_by="peer-answer", authority="peer", at=1000.0,
+                          confirmed=True, outcome="lost-race")
+        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=1000.1)
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1", pane_id="p1",
+                                          screen_prompt_id="LOST-RACE-PID", choice="approve", now=1000.2)
+        self.assertEqual(up["written"], "no-op")
+        self.assertEqual(up["reason"], "no-corroborated-actor")
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "unverified")
+
     def test_upgrade_never_downgrades_an_already_real_value(self):
         """The bound path (or a prior successful upgrade) already recorded
         the real, verified actor directly -- a later upgrade call must never
-        second-guess it, matching the existing
+        second-guess it, even with a corroborating `approvals` row present
+        for a DIFFERENT actor -- matching the existing
         test_explicit_decided_by_is_never_overridden_by_correlation
         guarantee for the sentinel-correlation path."""
-        db = _fresh_db()
+        db = _fresh_db_with_approvals()
         po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
-        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="REAL-PID")
-        po.record_authorized(db, **IDENT, decided_by="conductor", choice="approve")
-        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1",
-                                          screen_prompt_id="REAL-PID", choice="approve",
-                                          decided_by="peer-answer")
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="REAL-PID", now=999.0)
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="REAL-PID", choice="1",
+                          decided_by="some-other-actor", authority="peer", at=1000.0)
+        po.record_authorized(db, **IDENT, decided_by="conductor", choice="approve", now=1000.1)
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1", pane_id="p1",
+                                          screen_prompt_id="REAL-PID", choice="approve", now=1000.2)
         self.assertEqual(up["written"], "no-op")
+        self.assertEqual(up["reason"], "already-real")
         rec = po.fold_task(db, "r1", "t1")[po.occurrence_key(**IDENT)]
         self.assertEqual(rec["decided_by"], "conductor")
 
@@ -599,10 +641,10 @@ class UpgradeAuthorizedActor(unittest.TestCase):
         po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
         po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="MISMATCH-PID")
         po.record_authorized(db, **IDENT, decided_by="unverified_or_abort", choice="deny")
-        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1",
-                                          screen_prompt_id="MISMATCH-PID", choice="approve",
-                                          decided_by="peer-answer")
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1", pane_id="p1",
+                                          screen_prompt_id="MISMATCH-PID", choice="approve")
         self.assertEqual(up["written"], "no-op")
+        self.assertEqual(up["reason"], "choice-mismatch")
         rec = po.fold_task(db, "r1", "t1")[po.occurrence_key(**IDENT)]
         self.assertEqual(rec["decided_by"], "unverified_or_abort")
 
@@ -610,9 +652,8 @@ class UpgradeAuthorizedActor(unittest.TestCase):
         db = _fresh_db()
         po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
         po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve")
-        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1",
-                                          screen_prompt_id="NEVER-PAINTED", choice="approve",
-                                          decided_by="peer-answer")
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1", pane_id="p1",
+                                          screen_prompt_id="NEVER-PAINTED", choice="approve")
         self.assertEqual(up["written"], "no-op")
         self.assertEqual(up["reason"], "not-found")
 
@@ -629,11 +670,45 @@ class UpgradeAuthorizedActor(unittest.TestCase):
         po.record_screen(db, **a, display="pending_parseable", screen_prompt_id="SHARED-PID")
         po.record_screen(db, **b, display="pending_parseable", screen_prompt_id="SHARED-PID")
         po.record_authorized(db, **a, decided_by="unverified", choice="approve")
-        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1",
-                                          screen_prompt_id="SHARED-PID", choice="approve",
-                                          decided_by="peer-answer")
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1", pane_id="p1",
+                                          screen_prompt_id="SHARED-PID", choice="approve")
         self.assertEqual(up["written"], "no-op")
         self.assertEqual(up["reason"], "ambiguous")
+
+    def test_upgrade_appends_an_event_and_never_overwrites_the_sentinel_in_place(self):
+        """r3 concern 4: the original `prompt_occ_authorized` row (and its
+        sentinel) must remain in the event log unchanged -- the upgrade is a
+        NEW `prompt_occ_actor_upgraded` event, never an in-place UPDATE."""
+        db = _fresh_db_with_approvals()
+        po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
+        po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="AUDIT-PID", now=999.0)
+        _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="AUDIT-PID", choice="1",
+                          decided_by="peer-answer", authority="peer", at=1000.0)
+        out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=1000.1)
+        up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1", pane_id="p1",
+                                          screen_prompt_id="AUDIT-PID", choice="approve", now=1000.2)
+        self.assertEqual(up["written"], "upgraded")
+        conn = sqlite3.connect(db)
+        original = conn.execute(
+            "SELECT payload FROM events WHERE event_id=?",
+            (f"prompt_occ_authorized_{out['occ_key']}",),
+        ).fetchone()
+        self.assertIsNotNone(original)
+        original_payload = json.loads(original[0])
+        self.assertEqual(original_payload["decided_by"], "unverified")  # untouched in the log
+        upgraded_event = conn.execute(
+            "SELECT type, payload FROM events WHERE event_id=?",
+            (f"prompt_occ_actor_upgraded_{out['occ_key']}",),
+        ).fetchone()
+        conn.close()
+        self.assertIsNotNone(upgraded_event)
+        self.assertEqual(upgraded_event[0], "prompt_occ_actor_upgraded")
+        upgraded_payload = json.loads(upgraded_event[1])
+        self.assertEqual(upgraded_payload["from"], "unverified")
+        self.assertEqual(upgraded_payload["to"], "peer-answer")
+        # The fold still resolves to the real actor, by applying the new event.
+        rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
+        self.assertEqual(rec["decided_by"], "peer-answer")
 
 
 def _isolated_db() -> tuple[str, Path]:
