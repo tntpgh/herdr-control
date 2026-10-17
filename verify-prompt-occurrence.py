@@ -440,6 +440,19 @@ def _insert_approval(db: str, *, run_id: str, task_id: str, pane_id: str, prompt
     conn.close()
 
 
+def _confirm_approval(db: str, *, prompt_id: str, at: float, outcome: str = "pressed") -> None:
+    """Simulates herdr-select.sh's `approval_confirmed("pressed", ...)`
+    landing AFTER an earlier, unconfirmed `_insert_approval` -- the real
+    production ordering the r2/r3 upgrade path exists to repair."""
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE approvals SET confirmed_at=?, outcome=? WHERE prompt_id=?",
+        (po._now_iso(at), outcome, prompt_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 class AuthorizedActorCorrelation(unittest.TestCase):
     """#309: agent-hooks/omp-herdr-control.ts can't see who pressed an
     omp-resolved approval, so it hands record_authorized() an honest
@@ -569,8 +582,9 @@ class UpgradeAuthorizedActor(unittest.TestCase):
         po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
         po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="RACE-PID", now=999.0)
         _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="RACE-PID", choice="1",
-                          decided_by="peer-answer", authority="peer", at=1000.0)
+                          decided_by="peer-answer", authority="peer", at=1000.0, confirmed=False)
         out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=1000.1)
+        _confirm_approval(db, prompt_id="RACE-PID", at=1000.15)
         rec = po.fold_task(db, "r1", "t1")[out["occ_key"]]
         self.assertEqual(rec["decided_by"], "unverified")  # locked in first, as the race produces
         up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1", pane_id="p1",
@@ -683,8 +697,9 @@ class UpgradeAuthorizedActor(unittest.TestCase):
         po.record_seen(db, **IDENT, tool="bash", tool_input={"command": "x"}, source="s")
         po.record_screen(db, **IDENT, display="pending_parseable", screen_prompt_id="AUDIT-PID", now=999.0)
         _insert_approval(db, run_id="r1", task_id="t1", pane_id="p1", prompt_id="AUDIT-PID", choice="1",
-                          decided_by="peer-answer", authority="peer", at=1000.0)
+                          decided_by="peer-answer", authority="peer", at=1000.0, confirmed=False)
         out = po.record_authorized(db, **IDENT, decided_by="unverified", choice="approve", now=1000.1)
+        _confirm_approval(db, prompt_id="AUDIT-PID", at=1000.15)
         up = po.upgrade_authorized_actor(db, run_id="r1", task_id="t1", pane_id="p1",
                                           screen_prompt_id="AUDIT-PID", choice="approve", now=1000.2)
         self.assertEqual(up["written"], "upgraded")
