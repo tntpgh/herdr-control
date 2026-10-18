@@ -369,12 +369,67 @@ root=$(repo_root "$proj")
   exit 1; }
 [ -d "$root/.git" ] || git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || { echo "spawn-task: not a git repo: $root" >&2; exit 1; }
 
+# ---- worktree reservation hold (moved ahead of the P2 project-scope probe) --
+# A remote-delegated spawn's authorization receipt is the ENTIRE trust basis
+# for this call -- the P2 ancestry probe below is a no-op for it anyway (a
+# remote publisher call has no live herdr-pane ancestor to find), but used to
+# run FIRST regardless and reached `herdr pane list` -- a real external-
+# surface call -- before this hold could refuse a missing or already-
+# consumed reservation. verify-tasks.py's
+# test_real_spawn_refuses_missing_or_consumed_reservation_before_writes
+# requires zero external calls ahead of that refusal; computing `wt` and
+# running the hold here, before any ancestry probe, satisfies it without
+# weakening either check -- P2 still runs, just after the receipt/
+# reservation gate it was never meant to race.
+wt="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$root")/${branch}"
+# BELT, because the layout is herdr's and this builds it by hand. herdr owns
+# `~/.herdr/worktrees/<repo>/<branch>` and `herdr worktree create` returns the
+# path it chose; eliasstravik/herdr-projects records that return value and
+# never composes the path, which is the more durable shape — if herdr changes
+# the layout, a built path silently diverges from the real one. Migrating this
+# to `herdr worktree create` changes workspace and tab semantics (labels,
+# focus, the posture stamp) and is its own change; until then, refuse a path
+# with an empty segment rather than create one.
+case "$wt" in
+  *//*|*/) echo "spawn-task: refusing a malformed worktree path: $wt" >&2; exit 1 ;;
+esac
+if [ "$dry" != 1 ]; then
+  # Source authority is separate from the pane assigned to supervise the task.
+  # In particular, the publisher's Main fallback is never proof Main approved
+  # the manifest. The remote adapter must have persisted a verified receipt;
+  # local launches must prove the actual caller's live conductor ancestry.
+  if [ -n "$authorization_command_id" ]; then
+    authorization_row="$(read_task_authorization "$authorization_command_id")" || exit 1
+    printf '%s' "$authorization_row" | jq -e --arg repo "$(basename "$root")" --arg job "$job" \
+      '.status == "accepted" and .source == "oauth_task_delegation" and .repo == $repo and .effective_scope.job_class == $job' >/dev/null || {
+      echo "spawn-task: authorization hold: source, repo or job binding mismatch" >&2; exit 1;
+    }
+    # Match the existing allowlist's credential policy; inherited withholding
+    # can only tighten it. This receipt adds no credential grant of its own.
+    source_secrets="$(printf '%s' "$authorization_row" | jq -r '.effective_scope.secrets')"
+    source_posture_ok=0
+    case "$source_secrets:$secrets_req" in
+      grant:grant|default:|default:withhold) source_posture_ok=1 ;;
+    esac
+    if [ "$managed" != 1 ] || [ "$source_posture_ok" != 1 ]; then
+      echo "spawn-task: authorization hold: remote launch credential/agent posture mismatch" >&2; exit 1
+    fi
+    # This durable once-only claim precedes git worktree changes and every
+    # .handoffs write. Expiry/crash never releases an uncertain reservation.
+    claim_task_worktree_mutation "$authorization_command_id" "$root" "$wt" "$branch" >/dev/null || exit 1
+  else
+    # Preserve an already reserved remote worktree even for a local/unmanaged
+    # invocation. This read-only guard does not serialize two brand-new intents.
+    check_worktree_unreserved "$root" "$wt" "$branch" >/dev/null || exit 1
+  fi
+fi
+
 # ---- P2: project-scoped spawn (plan v2 §6.1) --------------------------------
 # "Owns" is a registry fact written by Main, never a label the caller
 # chooses: an orchestrator@<project> pane may spawn only into a repo it
 # holds a live proj: claim for. Runs on EVERY spawn (not only managed
-# launches, unlike the authorization-hold block further down) and before
-# any side effect -- no worktree, no tab, no task row created on refusal.
+# launches, unlike the worktree-reservation hold just above) and before any
+# side effect -- no worktree, no tab, no task row created on refusal.
 # A caller that is NOT a registered orchestrator@* pane (Main, or an
 # ordinary human pane) is unaffected: the check below is a no-op for it,
 # same as today.
@@ -422,18 +477,6 @@ fi
 # #2). --project overrides it; two workers on two branches of the SAME repo
 # share this project unless one is given a narrower --project of its own.
 [ -n "$project_label" ] || project_label="$(basename "$root")"
-wt="${HERDR_WT_DIR:-$HOME/.herdr/worktrees}/$(basename "$root")/${branch}"
-# BELT, because the layout is herdr's and this builds it by hand. herdr owns
-# `~/.herdr/worktrees/<repo>/<branch>` and `herdr worktree create` returns the
-# path it chose; eliasstravik/herdr-projects records that return value and
-# never composes the path, which is the more durable shape — if herdr changes
-# the layout, a built path silently diverges from the real one. Migrating this
-# to `herdr worktree create` changes workspace and tab semantics (labels,
-# focus, the posture stamp) and is its own change; until then, refuse a path
-# with an empty segment rather than create one.
-case "$wt" in
-  *//*|*/) echo "spawn-task: refusing a malformed worktree path: $wt" >&2; exit 1 ;;
-esac
 label="${job}:${branch}"
 events_file=$(handoff_events "$wt")
 wake_pattern="${label}_done"
@@ -578,35 +621,6 @@ if [ "$dry" = 1 ]; then
   spec_note="template — no --brief passed"; [ -n "$brief_file" ] && spec_note="from --brief $brief_file"
   echo "  spec      : $(handoff_spec "$wt")  ($spec_note)"
   exit 0
-fi
-
-# Source authority is separate from the pane assigned to supervise the task.
-# In particular, the publisher's Main fallback is never proof Main approved
-# the manifest. The remote adapter must have persisted a verified receipt;
-# local launches must prove the actual caller's live conductor ancestry.
-if [ -n "$authorization_command_id" ]; then
-  authorization_row="$(read_task_authorization "$authorization_command_id")" || exit 1
-  printf '%s' "$authorization_row" | jq -e --arg repo "$(basename "$root")" --arg job "$job" \
-    '.status == "accepted" and .source == "oauth_task_delegation" and .repo == $repo and .effective_scope.job_class == $job' >/dev/null || {
-    echo "spawn-task: authorization hold: source, repo or job binding mismatch" >&2; exit 1;
-  }
-  # Match the existing allowlist's credential policy; inherited withholding
-  # can only tighten it. This receipt adds no credential grant of its own.
-  source_secrets="$(printf '%s' "$authorization_row" | jq -r '.effective_scope.secrets')"
-  source_posture_ok=0
-  case "$source_secrets:$secrets_req" in
-    grant:grant|default:|default:withhold) source_posture_ok=1 ;;
-  esac
-  if [ "$managed" != 1 ] || [ "$source_posture_ok" != 1 ]; then
-    echo "spawn-task: authorization hold: remote launch credential/agent posture mismatch" >&2; exit 1
-  fi
-  # This durable once-only claim precedes git worktree changes and every
-  # .handoffs write. Expiry/crash never releases an uncertain reservation.
-  claim_task_worktree_mutation "$authorization_command_id" "$root" "$wt" "$branch" >/dev/null || exit 1
-else
-  # Preserve an already reserved remote worktree even for a local/unmanaged
-  # invocation. This read-only guard does not serialize two brand-new intents.
-  check_worktree_unreserved "$root" "$wt" "$branch" >/dev/null || exit 1
 fi
 
 # ---- worktree: create or reuse ---------------------------------------------

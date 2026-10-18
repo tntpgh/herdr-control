@@ -65,6 +65,7 @@ class WorktreeReservations(unittest.TestCase):
         self.db.execute("CREATE TABLE events (event_id TEXT PRIMARY KEY, run_id TEXT, task_id TEXT, type TEXT, occurred_at TEXT, payload TEXT)")
         self.db.commit()
         AUTH.schema(self.db)
+        AUTH.schema_v13(self.db)
         self.enterContext(mock.patch("subprocess.Popen", side_effect=AssertionError("subprocess forbidden in SQLite fixture")))
         self.enterContext(mock.patch("socket.socket", side_effect=AssertionError("socket forbidden in SQLite fixture")))
 
