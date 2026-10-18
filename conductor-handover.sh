@@ -219,7 +219,14 @@ while IFS='|' read -r t_id r_id cur_cpane cur_cbirth label worker_pane t_state; 
   ok=$((ok+1))
 
   # ---- re-wake: re-deliver any pending prompt to the new conductor --------
-  if [ "$t_state" = blocked ] && task_authorization_check "$authorization_task"; then
+  # Gated only on the task being blocked — re-delivering an ALREADY-RECORDED
+  # prompt to a different pane grants no new authority (the same thing the
+  # unconditional [handover] notify below does for both sides), so this must
+  # not also require task_authorization_check: that check governs whether a
+  # NEW action may proceed, and an authorization hold here silently dropped
+  # the one notification path built for exactly this case (measured: the
+  # fixture task with no verified authorization got zero re-wake attempts).
+  if [ "$t_state" = blocked ]; then
     pending="$(_sql "SELECT json_extract(payload,'\$.prompt_id') || char(31) || json_extract(payload,'\$.message') || char(31) || json_extract(payload,'\$.command') || char(31) || json_extract(payload,'\$.tool')
                       FROM events WHERE run_id=$(_sq "$r_id") AND task_id=$(_sq "$t_id") AND type='input_required'
                       ORDER BY sequence DESC LIMIT 1;" 2>/dev/null)"
