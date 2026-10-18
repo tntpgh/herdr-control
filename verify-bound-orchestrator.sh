@@ -218,6 +218,21 @@ printf '== R2: the orchestrator'"'"'s OWN task conductor is still Main (its own 
 orow=$(reg_sql "SELECT conductor_pane_id,conductor_pane_birth FROM tasks WHERE task_id='task_orch';")
 check "orchestrator's own conductor_pane_id=Main" "$(printf '%s' "$orow" | cut -d'|' -f1)" "$MAIN_PANE"
 
+printf '== F1 (security review #334): conductor_pane_id is bound to ancestry, never a self-asserted HERDR_PANE_ID ==\n'
+out=$(env -u HERDR_MCP_CONDUCTOR_PANE -u HERDR_MCP_CONDUCTOR_BIRTH -u HERDR_CONDUCTOR_ID \
+  HERDR_EXTRA_PATH="$stub_dir" PATH="$stub_dir:$PATH" HERDR_WT_DIR="$WT_ROOT" HERDR_RUN_STATE_DIR="$STATE_ROOT" \
+  HERDR_PANE_ID="not-the-orchestrator" HERDR_PANE_BIRTH="spoof-birth" \
+  HERDR_FG_PANE="$ORCH_PANE" HERDR_FG_BIRTH="$ORCH_BIRTH" HERDR_FG_PID="$$" \
+  bash "$HERE/spawn-task.sh" "$HC_RAW" f1-spoof quick /bin/true 2>&1); rc=$?
+check "F1: spoofed HERDR_PANE_ID refused (exit 1)" "$rc" "1"
+check "F1: no child row registered for the spoofed spawn" \
+  "$(reg_sql "SELECT count(*) FROM tasks WHERE repo='$HC' AND branch='f1-spoof';")" "0"
+
+printf '== F2 (security review #334): an orchestrator@* pane cannot use spawn-agent.sh (no task row -> no cap) ==\n'
+out=$(run_as "$ORCH_PANE" "$ORCH_BIRTH" spawn-agent.sh "$HC_RAW" f2-agent 2>&1); rc=$?
+check "F2: in-scope spawn-agent.sh by the orchestrator refused (exit 2)" "$rc" "2"
+case "$out" in *"spawn only via spawn-task.sh"*) ok "F2: refusal names spawn-task.sh" ;; *) bad "F2: refusal message ($out)" ;; esac
+
 printf '== N2: cross-project spawn refused (existing P2 check keeps passing, bound or not) ==\n'
 out=$(run_as "$ORCH_PANE" "$ORCH_BIRTH" spawn-task.sh "$KB_RAW" n2-branch 2>&1); rc=$?
 check "exit 2" "$rc" "2"

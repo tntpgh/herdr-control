@@ -920,6 +920,22 @@ if [ -z "$authorization_command_id" ] && [ "$managed" = 1 ]; then
   accept_local_task_authorization "$authorization_command_id" "$source_pane" "$source_birth" "$root" "$manifest_json" >/dev/null || exit 1
 fi
 
+# Security review PR #334 F1: conductor_pane_id decides who may answer the
+# child's bound prompts (herdr-select.sh), so for a LOCAL spawn (anything but
+# remote-mcp/tasks.py's HERDR_MCP_REMOTE_SPAWN) it must be the
+# ancestry-verified calling pane, never the self-asserted $HERDR_PANE_ID read
+# above -- managed or not. A mismatch means the env lies about who is
+# spawning: refuse.
+if [ -z "${HERDR_MCP_REMOTE_SPAWN:-}" ] && _bind_pane="$(caller_pane_from_ancestry 2>/dev/null)" && [ -n "$_bind_pane" ]; then
+  if [ -n "$conductor_pane_id" ] && [ "$conductor_pane_id" != "$_bind_pane" ]; then
+    echo "spawn-task: refusing — HERDR_PANE_ID ($conductor_pane_id) is not the calling pane ($_bind_pane)" >&2; exit 1
+  fi
+  _bind_birth="$(pane_birth_now "$_bind_pane" 2>/dev/null)"
+  [ -n "$_bind_birth" ] || { echo "spawn-task: refusing — calling pane birth unavailable" >&2; exit 1; }
+  conductor_pane_id="$_bind_pane"; conductor_pane_birth="$_bind_birth"
+  conductor_id="${HERDR_CONDUCTOR_ID:-conductor_${conductor_pane_id}}"
+fi
+
 # ---- workspace + tab (sub-tab in the repo's space) -------------------------
 # Whether THIS call creates the workspace decides the root-tab cleanup below.
 ws_existed=0

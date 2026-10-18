@@ -142,9 +142,8 @@ root=$(repo_root "$proj")
 
 # ---- P2: project-scoped spawn (plan v2 §6.1 step 5: "the other routes to
 # conductor authority get the same check") -----------------------------------
-# Identical refusal to spawn-task.sh's: an orchestrator@<project> pane may
-# spawn only into a repo it holds a live proj: claim for. A caller that is
-# not a registered orchestrator@* pane is unaffected.
+# An orchestrator@<project> pane may not use spawn-agent.sh at all (see the
+# refusal below); every other caller is unaffected.
 if [ -n "$root" ]; then
   _sa_scope_role=""
   _sa_scope_caller_pane="$(caller_pane_from_ancestry 2>/dev/null)"; _sa_scope_rc=$?
@@ -153,21 +152,20 @@ if [ -n "$root" ]; then
     [ -n "$_sa_scope_caller_birth" ] && \
       _sa_scope_role="$(role_for_live_pane "$_sa_scope_caller_pane" "$_sa_scope_caller_birth" 'orchestrator@' 2>/dev/null)"
   fi
+  # Security review PR #334 F2: spawn-agent.sh registers no task row, so the
+  # orchestrator child cap (lib/task-authorization.py register()) and
+  # child->orchestrator routing can't apply here. An orchestrator@* pane
+  # spawns ONLY via spawn-task.sh -- refuse it here, in or out of scope.
   if [ -n "$_sa_scope_role" ]; then
     _sa_scope_root_real="$(cd "$root" 2>/dev/null && pwd -P)"
     [ -n "$_sa_scope_root_real" ] || _sa_scope_root_real="$root"
-    _sa_scope_held="$(claim_holder "proj:$_sa_scope_root_real" 2>/dev/null)"
-    _sa_scope_held_pane="$(printf '%s' "$_sa_scope_held" | jq -r '.pane_id // ""' 2>/dev/null)"
-    _sa_scope_held_birth="$(printf '%s' "$_sa_scope_held" | jq -r '.pane_birth // ""' 2>/dev/null)"
-    if [ "$_sa_scope_held_pane" != "$_sa_scope_caller_pane" ] || [ "$_sa_scope_held_birth" != "$_sa_scope_caller_birth" ]; then
-      echo "spawn-agent: refusing — orchestrator@<p> may spawn only into its own project's repos; $_sa_scope_root_real is not one" >&2
-      append_event "" "" "spawn_scope_refused" \
-        "$(jq -nc --arg actor "$_sa_scope_role" --arg root "$_sa_scope_root_real" \
-             --arg conductor_pane "$_sa_scope_caller_pane" --arg conductor_pane_birth "$_sa_scope_caller_birth" \
-          '{reason:"no_live_proj_claim", actor:$actor, root:$root, conductor_pane:$conductor_pane, conductor_pane_birth:$conductor_pane_birth}')" \
-        >/dev/null 2>&1 || true
-      exit 2
-    fi
+    echo "spawn-agent: refusing — orchestrator@<p> panes spawn only via spawn-task.sh (child cap + routing)" >&2
+    append_event "" "" "spawn_scope_refused" \
+      "$(jq -nc --arg actor "$_sa_scope_role" --arg root "$_sa_scope_root_real" \
+           --arg conductor_pane "$_sa_scope_caller_pane" --arg conductor_pane_birth "$_sa_scope_caller_birth" \
+        '{reason:"orchestrator_must_use_spawn_task", actor:$actor, root:$root, conductor_pane:$conductor_pane, conductor_pane_birth:$conductor_pane_birth}')" \
+      >/dev/null 2>&1 || true
+    exit 2
   fi
 fi
 
