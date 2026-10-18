@@ -469,8 +469,10 @@ _deploy_launcher_preflight() {
   tmp="$(mktemp -d)" || return 1
   git -C "$src" archive "$rev" config.sh lib spawn-task.sh herdr-select.sh agent-hooks/omp-worker-overlay.yml \
     | tar -x -C "$tmp" 2>/dev/null || { echo "deploy: preflight could not extract $rev" >&2; rm -r "$tmp"; return 1; }
-  bin="$(HOME="$HOME" bash -c '. "$1/config.sh" >/dev/null 2>&1; printf %s "$HERDR_OMP_BIN"' _ "$tmp")"
-  want_sha="$(HOME="$HOME" bash -c '. "$1/config.sh" >/dev/null 2>&1; printf %s "$HERDR_OMP_LAUNCHER_SHA256"' _ "$tmp")"
+  # env -i: the two values may come ONLY from the candidate's config.sh, never
+  # from HERDR_* the calling shell already exported (review #336 F1).
+  { IFS= read -r bin; IFS= read -r want_sha; } < <(env -i HOME="$HOME" PATH="$PATH" bash -c \
+    '. "$1/config.sh" >/dev/null 2>&1; printf "%s\n%s\n" "${HERDR_OMP_BIN:-}" "${HERDR_OMP_LAUNCHER_SHA256:-}"' _ "$tmp")
   if [ -z "$bin" ] || [ ! -r "$bin" ]; then
     echo "deploy: preflight — launcher '$bin' named by $rev config.sh is not installed" >&2; rm -r "$tmp"; return 1
   fi
@@ -492,6 +494,7 @@ _deploy_launcher_preflight() {
     fi
   done
   rm -r "$tmp"
+  return 0
 }
 
 # resolve_hub_python — the bash-side call into the ONE canonical interpreter
