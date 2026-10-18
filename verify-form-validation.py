@@ -233,6 +233,17 @@ with tempfile.TemporaryDirectory() as td:
     check("validate_answers rejects the incident payload", err is not None and "pilot" in err, True)
     check("validate_answers accepts a valid payload", validate_answers(sch, {"pilot": "hold"}), None)
 
+    print("== review findings: required checkbox and implicit <option> values ==")
+    cb = _ps('<input type=checkbox name=agree required>')
+    check("required checkbox sent unchecked (false) is rejected", validate_answers(cb, {"agree": False}) is not None, True)
+    check("required checkbox checked is accepted", validate_answers(cb, {"agree": True}), None)
+    sel = _ps('<select name=plan required><option>basic<option> pro </option></select>')
+    check("select without value= derives its enum from option text", sel, {"plan": {"enum": ["basic", "pro"]}})
+    check("select: off-enum value rejected", validate_answers(sel, {"plan": "zzz"}) is not None, True)
+    mixed = _ps('<select name=plan required><option value="b">Basic</option><option>pro</option></select>')
+    check("mixed select keeps both explicit and implicit values", mixed, {"plan": {"enum": ["b", "pro"]}})
+    check("mixed select: implicit option accepted", validate_answers(mixed, {"plan": "pro"}), None)
+
 print()
 print(f"passed={passed} failed={failed}")
 sys.exit(1 if failed else 0)

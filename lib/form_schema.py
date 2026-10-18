@@ -26,6 +26,8 @@ class _SchemaParser(HTMLParser):
         # name -> {"required": bool, "enum": set[str] | None}
         self.fields: dict[str, dict] = {}
         self._select_name: str | None = None
+        # <option> with no value= takes its stripped text as the value (HTML spec).
+        self._option_text: list[str] | None = None
 
     def _field(self, name: str, has_enum: bool) -> dict:
         return self.fields.setdefault(name, {"required": False, "enum": set() if has_enum else None})
@@ -56,8 +58,13 @@ class _SchemaParser(HTMLParser):
             if "required" in d:
                 f["required"] = True
         elif tag == "option":
-            if self._select_name and "value" in d and d["value"] is not None:
+            self._close_option()  # </option> is optional in HTML
+            if not self._select_name:
+                return
+            if "value" in d and d["value"] is not None:
                 self.fields[self._select_name]["enum"].add(d["value"])
+            else:
+                self._option_text = []
         elif tag == "textarea":
             name = d.get("name")
             if not name:
@@ -66,7 +73,18 @@ class _SchemaParser(HTMLParser):
             if "required" in d:
                 f["required"] = True
 
+    def handle_data(self, data: str) -> None:
+        if self._option_text is not None:
+            self._option_text.append(data)
+
+    def _close_option(self) -> None:
+        if self._option_text is not None and self._select_name:
+            self.fields[self._select_name]["enum"].add("".join(self._option_text).strip())
+        self._option_text = None
+
     def handle_endtag(self, tag: str) -> None:
+        if tag in ("option", "select"):
+            self._close_option()
         if tag == "select":
             self._select_name = None
 
@@ -99,7 +117,8 @@ def validate_answers(schema: dict | None, payload: dict) -> str | None:
         if name not in payload:
             return f"{name}: required field missing"
         val = payload[name]
-        if val is None or val == "":
+        # False = an unchecked required checkbox (the template always sends checkboxes as booleans).
+        if val is None or val == "" or val is False:
             return f"{name}: required field missing"
         enum = spec.get("enum")
         if enum and val not in enum:

@@ -1538,6 +1538,12 @@ def record_remote_answer(form_id: str, pending: dict, key: bytes) -> str:
     want = _mirror_mac(key, "answer", form_id, nonce, canon, by)
     if not hmac.compare_digest(str(pending.get("answer_sig") or ""), want):
         return _reject("answer signature invalid")
+    # Same required-field check as record_answer, after the signature (so an
+    # unsigned POST can't probe the schema) and before the claim. No cancel
+    # bypass: this path always writes status=answered.
+    invalid = validate_answers(row.get("schema"), answers)
+    if invalid:
+        return _reject(f"invalid answer: {invalid}")
 
     def _answer(r: dict) -> dict:
         exp = r.get("expires_at")
