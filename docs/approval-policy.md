@@ -245,9 +245,18 @@ is editing `lib/*.sh`. Enforcing it on edit/write would block all of that
 work. Limiting local edits needs its own manifest key, not a new meaning for
 this one.
 
+`manage_skill` (create/update/delete; a `learn` call's optional `skill` block
+too) is covered the same way, by the file its action targets:
+`~/.omp/agent/managed-skills/<name>/SKILL.md`. For a worker that path is
+never inside the worktree, so the call always refuses (closed 2026-10-18,
+after a worker's `manage_skill update` overwrote a skill with no check at
+all — `mutationTargets`/`workerWriteScopeBlock` previously returned
+`undefined`, i.e. allowed, for any tool name it didn't recognize).
+
 Not covered, deliberately: `eval` (exec tier, so it prompts under
-`--approval-mode write`), bash (§1–§9), and tools that write omp's own state
-rather than a path (`learn`, `manage_skill`, `retain`). The hook loads at omp
+`--approval-mode write`), bash (§1–§9), and tools that write omp's own
+shared state rather than a worktree-scoped path — plain `learn` (no `skill`
+block) and `retain` both write the shared mnemopi.db. The hook loads at omp
 session start, and omp has no extension file-watcher. A running worker keeps
 the hook it started with until its next session start.
 

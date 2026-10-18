@@ -2041,6 +2041,16 @@ in_wt_bash_tar_no_C|bash|{"command":"tar -xf a.tar"}
 in_wt_bash_append|bash|{"command":">> .handoffs/x.out"}
 in_wt_bash_devnull|bash|{"command":"> /dev/null 2>&1"}
 in_wt_bash_cd_sub|bash|{"command":"cd sub && echo x > y"}
+manage_skill_create_out|manage_skill|{"action":"create","name":"malicious-skill","description":"d","body":"b"}
+manage_skill_update_out|manage_skill|{"action":"update","name":"decisions-via-formserve","description":"d","body":"b"}
+manage_skill_delete_out|manage_skill|{"action":"delete","name":"decisions-via-formserve"}
+learn_skill_out|learn|{"memory":"m","skill":{"action":"create","name":"new-skill","description":"d","body":"b"}}
+learn_plain|learn|{"memory":"a lesson learned","context":"ctx"}
+memory_edit_forget|memory_edit|{"op":"forget","id":"mem_1"}
+memory_edit_update|memory_edit|{"op":"update","id":"mem_1","content":"x"}
+xd_memory_edit|write|{"path":"xd://memory_edit","content":"{\"op\":\"invalidate\",\"id\":\"mem_1\"}"}
+unknown_tool_path_out|widget_sync|{"path":"$OTHER/widget.txt"}
+unknown_tool_no_path|widget_status|{"note":"hi"}
 EOF
   jq -Rn '[inputs | split("|") | [.[0], .[1], (.[2:] | join("|") | fromjson)]]' "$WORK/scope-cases.txt" > "$WORK/scope-cases.json" \
     || bad "scope case table does not parse"
@@ -2050,7 +2060,7 @@ EOF
   while IFS='|' read -r name _; do
     v="$(verdict "$worker_out" "$name")"
     case "$name" in
-      in_wt_*|scratch_new|scratch_edit_own|scratch_failed|scratch_lsp_nonexistent|notepad_read_ok|local_ok|peer_message|xd_resolve|read_main|grep_main|bash_main|lsp_read_main)
+      in_wt_*|scratch_new|scratch_edit_own|scratch_failed|scratch_lsp_nonexistent|notepad_read_ok|local_ok|peer_message|xd_resolve|read_main|grep_main|bash_main|lsp_read_main|learn_plain|unknown_tool_no_path)
         [ "$v" = ALLOW ] && ok "worker: $name allowed" || bad "worker: $name should be allowed, got: ${v:-<no line>}" ;;
       *)
         case "$v" in "BLOCK herdr write-scope: "*) ok "worker: $name blocked" ;; *) bad "worker: $name should be blocked, got: ${v:-<no line>}" ;; esac ;;
