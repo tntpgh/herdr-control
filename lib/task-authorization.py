@@ -26,10 +26,11 @@ BIND_FIELDS = ("task_id", "run_id", "worker_id", "repo", "worktree", "branch", "
 NON_TERMINAL_STATES = ("starting", "running", "blocked")
 # Bound-orchestrator-mode pilot cap (brief-bound-orchestrator-mode.md req 3):
 # how many non-terminal children a live orchestrator@<p> pane may hold at
-# once. Env-overridable the same way lib/claims.sh's HERDR_CLAIM_TTL_S is --
-# "configurable per claim" without a new schema column for a single-value
-# pilot knob.
-ORCH_CHILD_CAP = int(os.environ.get("HERDR_ORCH_CHILD_CAP", "2"))
+# once. A CONSTANT, deliberately not env-overridable: register() runs in the
+# spawning caller's process, which for an orchestrator child IS the
+# orchestrator, so an env knob would let the capped party raise its own cap.
+# Changing it is a reviewed code change plus a new launcher release.
+ORCH_CHILD_CAP = 2
 
 
 class Refused(ValueError):
