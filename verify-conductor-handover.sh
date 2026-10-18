@@ -61,7 +61,7 @@ export TEST_PID
 . "$here/lib/pane-guard.sh"
 . "$here/lib/prompt-parse.sh"
 . "$here/lib/push-wake.sh"
-
+. "$here/tests/fixtures/task-authorization.sh"
 pass=0 fail=0
 ok()   { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
@@ -130,6 +130,7 @@ CALLER_PANE="$MAIN" bash "$here/designate-main.sh" >/dev/null \
 ch() { bash "$here/conductor-handover.sh" "$@"; }
 
 reg() { register_task run1 "$1" "worker_$1" "cond_$1" "$2" "$3" "$4" "$5" "/repo/x" "/wt/$1" "impl:$1"; }
+regv() { fixture_register_task run1 "$1" "worker_$1" "cond_$1" "$2" "$3" "$4" "$5" "/repo/x" "/wt/$1" "impl:$1"; }
 
 printf '== fixture: six active tasks under C1, one worker pane each ==\n'
 reg taskA "$C1" "$C1B" "$W1" "$W1B"   || bad "register taskA"
@@ -320,6 +321,70 @@ check "nothing sent to the stale env pane (C1)" "$(grep -c "^send-text $C1\$" "$
 check "wake_attempted recorded against the NEW conductor pane, not the stale env one" \
   "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.conductor_pane') FROM events WHERE task_id='taskF' AND type='wake_attempted' ORDER BY sequence DESC LIMIT 1;")" \
   "$C2"
+
+printf '== REWAKE PROOF: a re-wake after handover to an UNVERIFIED task grants no approval ==\n'
+# Owner requires executable proof after v22: a re-wake of an UNVERIFIED task
+# (no accepted/launch_claimed/launched task_authorizations row) must not let
+# the NEW conductor press Approve through herdr-select.sh's own conductor
+# authority check (herdr-select.sh:517, the FIRST task_authorization_check a
+# conductor hits, well before the bound-request/command-policy machinery
+# further down the script).
+reg taskG "$C1" "$C1B" "$W1" "$W1B" || bad "register taskG"
+set_task_state run1 taskG blocked >/dev/null 2>&1 || bad "taskG starting->blocked"
+GCMD="git status --short"
+printf 'Allow tool: bash\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' \
+  "$GCMD" > "$WORK/screen_$(_fsafe "$W1").txt"
+gpid="$(prompt_id "$W1")"
+append_event run1 taskG input_required \
+  "$(jq -nc --arg msg "needs review" --arg pid "$gpid" --arg cmd "$GCMD" --arg tool bash \
+     '{message:$msg, prompt_id:$pid, command:$cmd, tool:$tool}')" >/dev/null
+
+: > "$SENT"
+outG="$(CALLER_PANE="$C1" ch --task taskG --to "$C2" --reason "blocked conductor, unverified task")"; rcG=$?
+check "handover exit 0" "$rcG" "0"
+check "taskG's conductor is now C2" "$(read_task run1 taskG | jq -r .conductor_pane_id)" "$C2"
+check "re-wake attempted: C2 got the re-delivered wake plus the notify (2 sends)" \
+  "$(grep -c "^send-text $C2\$" "$SENT")" "2"
+check "wake_attempted recorded against the new conductor (proves a re-wake was attempted)" \
+  "$(sqlite3 "$(registry_db)" "SELECT json_extract(payload,'\$.conductor_pane') FROM events WHERE task_id='taskG' AND type='wake_attempted' ORDER BY sequence DESC LIMIT 1;")" \
+  "$C2"
+
+: > "$SENT"
+outSel="$(CALLER_PANE="$C2" bash "$here/herdr-select.sh" "$W1" 1 --authority conductor \
+  --expect-prompt-id "$gpid" --review-category branch-work --review-reason x 2>"$WORK/selG.err")"; rcSel=$?
+check "exit 8: the new conductor is refused at the authorization check" "$rcSel" "8"
+grep -q 'authorization' "$WORK/selG.err" \
+  && ok "stderr names the authorization reason" \
+  || bad "stderr missing authorization reason: $(cat "$WORK/selG.err")"
+check "no key pressed (no send-keys call against the stub)" "$(grep -c '^send-keys' "$SENT")" "0"
+
+printf '== positive control: the SAME flow on a VERIFIED task does not exit 8 at the authorization check ==\n'
+regv taskH "$C1" "$C1B" "$W1" "$W1B" >/dev/null || bad "register taskH (verified)"
+set_task_state run1 taskH blocked >/dev/null 2>&1 || bad "taskH starting->blocked"
+HCMD="git status --short --branch"
+printf 'Allow tool: bash\nCommand: %s\n\n\033[48;2;42;47;65m Approve\033[0m\nDeny\n\nup/down navigate  enter select  esc cancel\n' \
+  "$HCMD" > "$WORK/screen_$(_fsafe "$W1").txt"
+hpid="$(prompt_id "$W1")"
+: > "$SENT"
+outH="$(CALLER_PANE="$C1" ch --task taskH --to "$C2" --reason "blocked conductor, verified task")"; rcH=$?
+check "handover exit 0" "$rcH" "0"
+# Seeded AFTER the handover: conductor-handover.sh's own re-wake writes a
+# generic input_required row (same prompt_id, empty tool/command) to record
+# the forced wake it just attempted — unrelated pre-existing behavior, not
+# this case's concern. ORDER BY sequence DESC LIMIT 1 means the LATEST row
+# for this prompt_id wins the tool-corroboration lookup, so the real,
+# tool-bearing row must be appended last to be the one herdr-select reads.
+append_event run1 taskH input_required \
+  "$(jq -nc --arg msg "needs review" --arg pid "$hpid" --arg cmd "$HCMD" --arg tool bash \
+     '{message:$msg, prompt_id:$pid, command:$cmd, tool:$tool}')" >/dev/null
+: > "$SENT"
+outSelV="$(CALLER_PANE="$C2" bash "$here/herdr-select.sh" "$W1" 1 --authority conductor \
+  --expect-prompt-id "$hpid" --review-category branch-work --review-reason x 2>"$WORK/selH.err")"; rcSelV=$?
+check "verified task: exit 0 — the authorization check no longer refuses it" "$rcSelV" "0"
+[ "$rcSelV" = 0 ] || cat "$WORK/selH.err" >&2
+check "the verified conductor's key was pressed" "$(grep -c '^send-keys' "$SENT")" "1"
+
+
 
 
 printf '== help text and bad usage ==\n'
