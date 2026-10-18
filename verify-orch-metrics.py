@@ -251,9 +251,30 @@ def main():
         check("blocked episodes count", be["episodes"] == 3)
         check("blocked total_min", math.isclose(be["total_min"], 80.0))
         check("blocked episodes_ge10", be["episodes_ge10"] == 2)
+        check("blocked min_ge10", math.isclose(be["min_ge10"], 75.0))
+        check("blocked ge10_episode_share", math.isclose(be["ge10_episode_share"], round(2 / 3, 4)))
+        check("blocked ge10_minute_share", math.isclose(be["ge10_minute_share"], round(75 / 80, 4)))
 
+        # --- blocked episodes, single-row edge (just T1 episode 1) ---
+        be_single = orch_metrics.compute_blocked_episodes(
+            conn, "2026-10-09T09:55:00Z", "2026-10-09T10:06:00Z")
+        check("blocked single-row episodes", be_single["episodes"] == 1)
+        check("blocked single-row total_min", math.isclose(be_single["total_min"], 5.0))
+        check("blocked single-row ge10_episode_share", be_single["ge10_episode_share"] == 0.0)
+
+        # --- blocked episodes, empty window ---
+        be_empty = orch_metrics.compute_blocked_episodes(
+            conn, "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        check("blocked empty episodes", be_empty["episodes"] == 0)
+        check("blocked empty total_min", be_empty["total_min"] == 0)
+        check("blocked empty share is None", be_empty["ge10_episode_share"] is None
+              and be_empty["ge10_minute_share"] is None)
+
+        # --- blocked episodes, exact 600s boundary (>= must include it) ---
         be_600 = orch_metrics.compute_blocked_episodes(
             conn, "2026-10-09T15:59:00Z", "2026-10-09T16:11:00Z")
+        check("blocked 600s-boundary episodes", be_600["episodes"] == 1)
+        check("blocked 600s-boundary total_min", math.isclose(be_600["total_min"], 10.0))
         check("blocked 600s-boundary counted as ge10", be_600["episodes_ge10"] == 1)
 
         # --- top escalations ---
@@ -261,7 +282,10 @@ def main():
             conn, "2026-10-09T00:00:00Z", "2026-10-09T23:59:59Z")
         check("escalations total", esc["total"] == 21)
         check("escalations top5 len", len(esc["top"]) == 5)
+        check("escalations top1", esc["top"][0] == {"reason": "multi_row_menu", "n": 6})
         check("escalations top5 excludes 6th", all(r["reason"] != "sixth_reason" for r in esc["top"]))
+        esc_empty = orch_metrics.compute_top_escalations(conn, "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        check("escalations empty window", esc_empty["total"] == 0 and esc_empty["top"] == [])
 
         # --- conductor latency: known deltas 10..100s, plus unresolved ---
         lat = orch_metrics.compute_conductor_latency(
@@ -329,8 +353,13 @@ def main():
 
         # --- wake outcomes ---
         wo = orch_metrics.compute_wake_outcomes(conn, "2026-10-09T15:00:00Z", "2026-10-09T15:02:00Z")
+        check("wake submitted count", wo["counts"]["submitted"] == 6)
+        check("wake unsubmitted count", wo["counts"]["unsubmitted"] == 3)
+        check("wake refused count", wo["counts"]["refused"] == 1)
         check("wake total", wo["total"] == 10)
         check("wake unsubmitted_share", math.isclose(wo["unsubmitted_share"], 0.3))
+        wo_empty = orch_metrics.compute_wake_outcomes(conn, "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        check("wake empty share is None", wo_empty["unsubmitted_share"] is None and wo_empty["total"] == 0)
 
         # --- decisions per day ---
         dpd = orch_metrics.compute_decisions_per_day(conn, "2026-10-10T00:00:00Z", "2026-10-12T23:59:59Z")
@@ -339,22 +368,44 @@ def main():
             {"date": "2026-10-11", "n": 2},
             {"date": "2026-10-12", "n": 2},
         ])
+        dpd_empty = orch_metrics.compute_decisions_per_day(conn, "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        check("decisions/day empty", dpd_empty == [])
 
         # --- repeated (task_id, command) pairs, n>=3 ---
         rc = orch_metrics.compute_repeated_commands(
             conn, "2026-10-20T00:00:00Z", "2026-10-20T23:59:59Z")
         check("repeated commands total_pairs", rc["total_pairs"] == 2)
         check("repeated commands max_n", rc["max_n"] == 4)
+        check("repeated commands excludes <3", all(
+            not (p["task_id"] == "T1" and p["command"] == "cmdB") for p in rc["pairs"]))
+        check("repeated commands includes both qualifying pairs", sorted(
+            (p["task_id"], p["command"], p["n"]) for p in rc["pairs"]
+        ) == [("T1", "cmdA", 4), ("T2", "cmdA", 3)])
+        rc_empty = orch_metrics.compute_repeated_commands(
+            conn, "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        check("repeated commands empty", rc_empty["pairs"] == [] and rc_empty["max_n"] == 0)
 
-        # --- duplicate input_required signals ---
+        # --- duplicate input_required signals by (date, prompt_id) ---
         ds = orch_metrics.compute_duplicate_signals(
             conn, "2026-10-21T00:00:00Z", "2026-10-21T23:59:59Z")
         check("duplicate signals total", ds["total"] == 1)
+        check("duplicate signals entry", ds["duplicates"] == [
+            {"date": "2026-10-21", "prompt_id": "dup1", "n": 2}
+        ])
+        ds_empty = orch_metrics.compute_duplicate_signals(
+            conn, "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        check("duplicate signals empty", ds_empty["duplicates"] == [] and ds_empty["total"] == 0)
 
-        # --- no-provenance overlay occurrences ---
+        # --- no-provenance overlay occurrences, n>=2 ---
         onp = orch_metrics.compute_overlay_no_provenance(
             conn, "2026-10-22T00:00:00Z", "2026-10-22T23:59:59Z")
         check("overlay occurrences total", onp["total"] == 1)
+        check("overlay occurrences entry", onp["occurrences"] == [
+            {"task_id": "T1", "occurrence_id": "occA", "n": 2}
+        ])
+        onp_empty = orch_metrics.compute_overlay_no_provenance(
+            conn, "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        check("overlay occurrences empty", onp_empty["occurrences"] == [] and onp_empty["total"] == 0)
 
         # --- daily (conductor decisions, conductor p90) pairs ---
         dcp = orch_metrics.compute_daily_conductor_pairs(
@@ -362,6 +413,9 @@ def main():
         check("daily conductor pairs", dcp == [
             {"date": "2026-10-09", "decisions": 10, "p90": 90.0}
         ])
+        dcp_empty = orch_metrics.compute_daily_conductor_pairs(
+            conn, "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        check("daily conductor pairs empty", dcp_empty == [])
 
         # --- stop-rule series ---
         srs = orch_metrics.compute_stop_rule_series(
@@ -405,6 +459,11 @@ def main():
         check("main_drops_threads override targets TB only",
               mdt_override["main_pane"] == "w7T:pX" and len(mdt_override["series"]) == 1
               and mdt_override["series"][0]["served"] == 1)
+
+        mdt_empty = orch_metrics.compute_main_drops_threads(
+            conn, "2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        check("main_drops_threads empty window", mdt_empty["main_pane"] == "w72:p1"
+              and mdt_empty["series"] == [])
 
         # --- no-roles-table fixture: main pane unresolved without --main-pane ---
         no_roles_path, no_roles_conn = new_fixture_db(with_roles=False)
