@@ -350,6 +350,7 @@ INSERT OR IGNORE INTO schema_meta(key, value)
   _migrate_schema_v9 || return 1
   _migrate_schema_v10 || return 1
   _migrate_schema_v11 "$existed" || return 1
+  _migrate_schema_v13 "$existed" || return 1
   _migrate_legacy_files || return 1
   _HERDR_REGISTRY_READY=1
   return 0
@@ -717,6 +718,70 @@ except Exception as exc:
 PY
 }
 
+# ---- schema v12 -> v13: consolidate the `claims` table into the numbered
+# chain (review r1 finding 2, orch-p2-r2) -------------------------------------
+# Same backup-verify-stamp shape as _migrate_schema_v11 above, targeting
+# storage.schema_v13 instead of storage.schema: the `claims` table used to
+# be created by two ad hoc, hand-duplicated helpers
+# (_registry_ensure_claims_table below, task-authorization.py's
+# _ensure_claims_table — both deleted) called lazily from inside
+# set_task_conductor/_acquire_pane_lease, neither stamping schema_version,
+# taking a pre-migration backup, or running under the registry's write lock.
+_migrate_schema_v13() {
+  local py; py="$(_registry_python)" || return 1
+  "$py" - "$(registry_db)" "$_TASK_AUTHORIZATION_HELPER" "${1:-1}" <<'PY'
+import importlib.util
+import os
+import sqlite3
+import sys
+import tempfile
+
+path, helper, existed = sys.argv[1:]
+backup = None
+verified = False
+try:
+    spec = importlib.util.spec_from_file_location("task_authorization_storage", helper)
+    storage = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(storage)
+    with storage.connect(path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+        current = row[0] if row else ""
+        if not current.isdecimal():
+            raise ValueError("invalid pre-migration schema version")
+        if int(current) < 13 and existed == "1":
+            # Same reasoning as the v12 backup above: a separate read-only
+            # connection takes the online snapshot while this one holds the
+            # writer lock, so no other migrator can advance the version
+            # until verification completes.
+            fd, backup = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".v13.bak",
+                                          dir=os.path.dirname(os.path.abspath(path)))
+            os.close(fd)
+            with storage.connect(path, readonly=True) as source, sqlite3.connect(backup) as target:
+                source.backup(target)
+            with storage.connect(backup, readonly=True) as saved:
+                integrity = saved.execute("PRAGMA integrity_check").fetchone()[0]
+                version = saved.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
+            if integrity != "ok" or version != current:
+                raise ValueError("pre-migration backup failed integrity/version verification")
+            verified = True
+            print(f"run-registry: backed up {path} -> {backup} before migration v13 (integrity+version verified)", file=sys.stderr)
+        # schema_v13() uses this connection's existing transaction and commits
+        # only after both DDL and the monotonic stamp succeed. Closing on
+        # error rolls everything back and releases the writer lock without a
+        # stale lockfile.
+        storage.schema_v13(db)
+except Exception as exc:
+    if backup and not verified:
+        try:
+            os.unlink(backup)
+        except OSError:
+            pass
+    print(f"run-registry: v13 migration aborted: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 # ---- one-time import of the pre-SQLite file layout --------------------------
 # A registry holding LIVE task state cannot simply be abandoned: dropping a
 # running worker's registration is not a clean slate, it silently disables
@@ -921,35 +986,6 @@ task_authorization_check() {
   return 1
 }
 
-# _registry_ensure_claims_table — the `claims` table belongs to lib/claims.sh
-# (its schema comment there is the authority), but set_task_conductor below
-# writes a `pane:` lease row directly, in the SAME transaction as
-# tasks.conductor_*, which rules out sourcing claims.sh's claim_acquire (a
-# fresh `_sql` call is a fresh connection, a fresh transaction). Mirrors
-# claims.sh claims_init's DDL exactly rather than diverging from it: CREATE
-# TABLE IF NOT EXISTS is idempotent, and the generation column is added only
-# if pragma_table_info does not already show it (an unconditional ALTER
-# would abort the whole script with "duplicate column" on every call after
-# the first).
-_registry_ensure_claims_table() {
-  _sql "CREATE TABLE IF NOT EXISTS claims (
-  claim_id    TEXT PRIMARY KEY,
-  scope       TEXT NOT NULL,
-  pane_id     TEXT NOT NULL DEFAULT '',
-  pane_birth  TEXT NOT NULL DEFAULT '',
-  purpose     TEXT NOT NULL DEFAULT '',
-  parent      TEXT NOT NULL DEFAULT '',
-  claimed_at  TEXT NOT NULL,
-  renewed_at  TEXT NOT NULL,
-  expires_at  TEXT NOT NULL,
-  released_at TEXT
-);
-CREATE INDEX IF NOT EXISTS claims_live ON claims(scope, expires_at) WHERE released_at IS NULL;" >/dev/null 2>&1
-  if [ -z "$(_sql "SELECT 1 FROM pragma_table_info('claims') WHERE name='generation';" 2>/dev/null)" ]; then
-    _sql "ALTER TABLE claims ADD COLUMN generation INTEGER NOT NULL DEFAULT 1;" >/dev/null 2>&1
-  fi
-}
-
 # role_for_live_pane <pane_id> <pane_birth> [label_prefix] -> the role label
 # if a live `roles` row matches this exact pane+birth, else empty. Used to
 # tell "this caller IS a registered orchestrator@<project>" from "this is an
@@ -1034,7 +1070,6 @@ set_task_conductor() {
       return 1
     fi
   fi
-  _registry_ensure_claims_table
   local at eid payload changed lease_id
   at="$(_now_iso)"
   eid="$(gen_id ev)"

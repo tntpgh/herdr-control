@@ -343,8 +343,41 @@ check "branch column exists (#3b ownership grant)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='branch';")" "1"
 check "trunk column exists (#3b ownership grant)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='trunk';")" "1"
-check "schema_version is 12 (receipt-to-ack recovery: task_authorizations gets a durable revision stage counter)" \
-  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "12"
+check "schema_version is 13 (claims table consolidated into the numbered chain, review r1 finding 2)" \
+  "$(sqlite3 "$(registry_db)" "SELECT value FROM schema_meta WHERE key='schema_version';")" "13"
+check "claims table exists after a fresh registry_init (schema_v13, not an ad hoc lazy-create helper)" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='claims';")" "1"
+check "claims.generation column exists" \
+  "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('claims') WHERE name='generation';")" "1"
+
+printf '\n== schema v12 -> v13: claims table migration takes a verified backup (same pattern as v11->v12) ==\n'
+v13_root="$(mktemp -d)/runs"
+(
+  export HERDR_RUN_STATE_DIR="$v13_root"
+  _HERDR_REGISTRY_READY=0
+  registry_init >/dev/null 2>&1
+)
+v13_db="$v13_root/registry.sqlite3"
+sqlite3 "$v13_db" "DROP TABLE IF EXISTS claims; UPDATE schema_meta SET value='12' WHERE key='schema_version';" 2>/dev/null
+v13_fixture_ver="$(sqlite3 -noheader "$v13_db" "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)"
+if [ "$v13_fixture_ver" = 12 ]; then
+  (
+    export HERDR_RUN_STATE_DIR="$v13_root"
+    _HERDR_REGISTRY_READY=0
+    registry_init >/dev/null 2>&1
+  )
+  check "a v12 registry reaches schema 13" \
+    "$(sqlite3 -noheader "$v13_db" "SELECT value FROM schema_meta WHERE key='schema_version';")" "13"
+  check "the claims table exists again after the v13 migration" \
+    "$(sqlite3 "$v13_db" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='claims';")" "1"
+  v13_backups="$(find "$v13_root" -maxdepth 1 -name 'registry.sqlite3.*.v13.bak' 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$v13_backups" = 1 ] && ok "exactly one verified .v13.bak backup was taken before the migration" \
+    || bad "v13 backup count: $v13_backups"
+else
+  bad "could not build a clean v12 fixture (schema_version=$v13_fixture_ver) — test setup itself failed"
+fi
+rm -rf "$(dirname "$v13_root")"
+
 check "project column exists (project-contract-plan.md #2)" \
   "$(sqlite3 "$(registry_db)" "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='project';")" "1"
 check "manifest column exists (task-scoped approval)" \
@@ -509,14 +542,16 @@ printf '{"oldrun/oldtask":{"state":"running","updated_at":"2026-07-01T00:00:00Z"
   printf '  ok    legacy tasks, events and checkpoints imported once, non-destructively\n'
 ) || bad "legacy import"
 [ -d "$(dirname "$legacy_root")" ] && rm -rf "$(dirname "$legacy_root")"
-printf '\n== round 5 (fix/hub-runtime-pin): registry_init reaches schema 12 under a PATH where bare python3 is 3.9.6 ==\n'
+printf '\n== round 5 (fix/hub-runtime-pin): registry_init reaches schema 13 under a PATH where bare python3 is 3.9.6 ==\n'
 # Main's rehearsal (thurber-os/.handoffs/registry-rehearsal-20261011.log):
 # under the CLT's /usr/bin/python3 3.9.6 the v12 migration aborts with
 # "unable to open database file", rc=1; under a pinned 3.14 it reaches
-# schema 12 cleanly. Every registry call site now resolves an explicit,
-# versioned, absolute interpreter (launchd/resolve-hub-python.sh) instead of
-# trusting PATH's `python3` — proved here by making PATH unable to find
-# anything BUT the CLT's 3.9.6 and confirming the migration still succeeds.
+# schema 12 (now 13, review r1 finding 2's claims-table migration) cleanly.
+# Every registry call site now resolves an explicit, versioned, absolute
+# interpreter (launchd/resolve-hub-python.sh) instead of trusting PATH's
+# `python3` — proved here by making PATH unable to find anything BUT the
+# CLT's 3.9.6 and confirming BOTH migrations (v10->v12, v12->v13) still
+# succeed, each with its own verified backup.
 hostile_root="$(mktemp -d)/runs"
 (
   export HERDR_RUN_STATE_DIR="$hostile_root"
@@ -534,9 +569,17 @@ if [ "$fixture_ver" = 10 ]; then
   )"
   hostile_rc="$(printf '%s' "$hostile_out" | grep -o 'RC=[0-9]*' | tail -1 | cut -d= -f2)"
   hostile_final_ver="$(sqlite3 -noheader "$hostile_db" "SELECT value FROM schema_meta WHERE key='schema_version';" 2>/dev/null)"
-  [ "$hostile_rc" = 0 ] && [ "$hostile_final_ver" = 12 ] \
-    && ok "registry_init reaches schema 12 with PATH restricted to /usr/bin:/bin (bare python3 there is 3.9.6)" \
+  [ "$hostile_rc" = 0 ] && [ "$hostile_final_ver" = 13 ] \
+    && ok "registry_init reaches schema 13 with PATH restricted to /usr/bin:/bin (bare python3 there is 3.9.6)" \
     || bad "registry_init under a hostile PATH: rc=$hostile_rc schema_version=$hostile_final_ver ($hostile_out)"
+  case "$hostile_out" in
+    *"before migration v12"*) ok "the v10->v12 migration's backup ran under the hostile PATH too" ;;
+    *) bad "no v12 backup message in hostile-PATH output: $hostile_out" ;;
+  esac
+  case "$hostile_out" in
+    *"before migration v13"*) ok "the v12->v13 claims-table migration's backup ran under the hostile PATH too" ;;
+    *) bad "no v13 backup message in hostile-PATH output: $hostile_out" ;;
+  esac
 else
   bad "could not build a clean v10 fixture (schema_version=$fixture_ver) — test setup itself failed"
 fi

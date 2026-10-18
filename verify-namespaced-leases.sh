@@ -46,6 +46,32 @@ out=$(claim_release_force "pane:p9@birth9" 2>&1); rc=$?
 check "claim_release_force pane: refused (rc=1)" "$rc" "1"
 claim_release "path:$REPO_HC" w:p1 >/dev/null 2>&1
 
+printf '\n== archive-worktrees.sh single-writer fencing: distinct per-invocation identities racing the same path: scope conflict (review r1 #1) ==\n'
+# Mirrors archive-worktrees.sh's _ARCHIVE_PANE fallback when HERDR_PANE_ID is
+# unset: "archive-worktrees.sh:$$" — genuinely distinct per OS process,
+# unlike the pre-fix literal constant "archive-worktrees.sh" every such
+# process shared. This drives claim_acquire's own conflict detection
+# directly (no archive-worktrees.sh run, so its global --apply run_lock
+# cannot be the thing serializing the race and masking the bug).
+WTPATH="$TMPROOT/wt-archive-race"
+aw_id1="archive-worktrees.sh:$$"
+# A genuinely different pid — simulating a second, concurrent
+# archive-worktrees.sh process that also has no HERDR_PANE_ID.
+aw_id2="archive-worktrees.sh:$(( $$ + 1 ))"
+out=$(claim_acquire "path:$WTPATH" "$aw_id1" "archive-worktrees.sh pid $$" 2>&1); rc=$?
+check "first invocation's claim_acquire on path: succeeds (rc=0)" "$rc" "0"
+out2=$(claim_acquire "path:$WTPATH" "$aw_id2" "archive-worktrees.sh pid $(( $$ + 1 ))" 2>&1); rc2=$?
+check "a second, genuinely distinct identity racing the same path: scope is refused (rc=2)" "$rc2" "2"
+check "the conflict names the first invocation as holder" "$(printf '%s' "$out2" | jq -r .pane_id)" "$aw_id1"
+# Pins why the pre-fix shared constant was broken: the SAME identity
+# re-acquiring is a RENEWAL, not a conflict — exactly what let two real
+# processes sharing the literal "archive-worktrees.sh" pane_id collide
+# silently (rc=0 both times) instead of fencing each other.
+out3=$(claim_acquire "path:$WTPATH" "$aw_id1" 2>&1); rc3=$?
+check "the SAME identity re-acquiring its own claim is a renewal (rc=0), not a conflict" "$rc3" "0"
+claim_release "path:$WTPATH" "$aw_id1" >/dev/null 2>&1
+claim_release "path:$WTPATH" "$aw_id2" >/dev/null 2>&1
+
 printf '\n== claim_acquire_proj: Main-only, and generation bumps on every re-grant ==\n'
 out=$(claim_acquire_proj "proj:$REPO_HC" nomain:p nomain:birth orch:p1 orchbirth1 2>&1); rc=$?
 check "a non-main caller is refused (rc=1)" "$rc" "1"
