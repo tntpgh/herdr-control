@@ -68,6 +68,21 @@ HERDR_OMP_LAUNCHER_SHA256="2774bdb46980a4024ec28709026118d2e0fbb1656ccabc36442ef
 #   HERDR_POLICY_EXTRA_RULES=$'deny\tterraform +destroy\tnever unattended\nescalate\tkubectl +delete\task first'
 : "${HERDR_POLICY_EXTRA_RULES:=}"
 
+# ---- bound bash/shell approval (herdr-select.sh/omp-herdr-control.ts/
+# lib/prompt-occurrence.py) ---------------------------------------------------
+# Slice (b), bound-bash (owner-approved, form 20261018T013832-8742, choice
+# b_bound_bash, 01:48Z): a bash/shell approval prompt gets the same
+# exact-identity binding write/edit already have (herdr-select.sh:281,
+# agent-hooks/omp-herdr-control.ts:469, lib/prompt-occurrence.py:148 all read
+# this — exact "1" only, no trim/whitespace, so the three readers can never
+# split-brain on a padded value). Binding proves IDENTITY only: a bound
+# bash/shell command still goes through herdr-select.sh's Path A
+# command-policy check (classify_command/conductor_reserved_reason) against
+# the canonical command before it may resolve. Default ON fleet-wide.
+# Rollback: set this to 0 below, or `export HERDR_BOUND_BASH=0` before
+# spawning/running herdr-select.sh.
+: "${HERDR_BOUND_BASH:=1}"
+
 # ---- canonical operator ancestor rules (managed launches) ------------------
 # Managed omp-backed spawns (spawn-task.sh / spawn-agent.sh) append the
 # nearest ANCESTOR AGENTS.md of the ORIGINAL project root — e.g.
@@ -228,7 +243,7 @@ unset _herdr_main_db _herdr_main_row
 export HERDR_DEFAULT_AGENT HERDR_OMP_BIN HERDR_OMP_LAUNCHER_SHA256 HERDR_SOURCE HERDR_SOCK HERDR_SORT_DONE_FIRST HERDR_SORT_NO_GH
 export HERDR_CODEX_DEEP HERDR_CODEX_STD HERDR_CODEX_FAST
 export HERDR_RECONCILE_INTERVAL_S HERDR_TASK_RETENTION_DAYS
-export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES HERDR_CANONICAL_RULES
+export HERDR_POSTURE_FLOOR HERDR_POLICY_EXTRA_RULES HERDR_CANONICAL_RULES HERDR_BOUND_BASH
 export HERDR_STATE_DIR SMART_NAME_AI SMART_NAME_BACKEND SMART_NAME_MODEL SMART_NAME_TIMEOUT
 export SMART_NAME_COOLDOWN SMART_NAME_EVIDENCE_CHARS HERDR_STALL_SECS
 export HERDR_ATTENTION_INTERVAL_S HERDR_WAKE_RESPONSE_S HERDR_SLACK_LEVEL HERDR_MAIN_PANE_ID HERDR_MAIN_PANE_BIRTH HERDR_WAKE_LEGACY
