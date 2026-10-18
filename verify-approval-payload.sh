@@ -503,7 +503,11 @@ unknown_lifecycle="$("${OCC[@]}" fold --db "$DB" --run run1 --task task1 | jq -r
   || bad "unrecognized choice completion folded as $unknown_lifecycle"
 
 printf '== flag off: bound bash/shell request is refused exactly like today (byte-for-byte) ==\n'
-[ -z "${HERDR_BOUND_BASH:-}" ] || { echo "fixture bug: HERDR_BOUND_BASH leaked into the flag-off section"; exit 1; }
+# config.sh now defaults HERDR_BOUND_BASH to "1" (herdr-control: activate (b)
+# HERDR_BOUND_BASH=1 fleet-wide) and herdr-select.sh sources config.sh, so
+# "off" is no longer the bare-unset default — it must be the documented
+# rollback, an explicit 0, same as a real operator override.
+export HERDR_BOUND_BASH=0
 BOUND_REQUEST="request-bash-flag-off"; BOUND_PROTOCOL="omp.tool-approval-binding.v1"
 OFF_CMD="ls -la $WT"
 OFF_JSON="$(bash_input "$OFF_CMD" | jq -cS .)"
@@ -515,6 +519,28 @@ reset_keys; conductor_bound; rc=$?
   && ok "flag off: bound bash request refused at the same proposal-tool-gate point as origin/main (byte-for-byte: PROPOSAL_TOOLS excludes bash)" \
   || bad "flag off bash bind: rc=$rc keys=$(keys_pressed); $(tail -3 "$WORK/err.txt")"
 BOUND_REQUEST=""; BOUND_DIGEST=""; BOUND_PROTOCOL=""
+unset HERDR_BOUND_BASH
+
+printf '== config.sh plumbing: shell, python and the TS hook see the SAME HERDR_BOUND_BASH (default, and an explicit 0) ==\n'
+for bb_case in default explicit0; do
+  (
+    if [ "$bb_case" = explicit0 ]; then export HERDR_BOUND_BASH=0; else unset HERDR_BOUND_BASH 2>/dev/null || true; fi
+    # shellcheck source=/dev/null
+    . "$here/config.sh" >/dev/null 2>&1
+    shell_seen="${HERDR_BOUND_BASH:-<unset>}"
+    py_seen="$(python3 -c 'import os; print(os.environ.get("HERDR_BOUND_BASH", "<unset>"))')"
+    if command -v bun >/dev/null 2>&1; then
+      ts_seen="$(bun -e 'process.stdout.write(process.env.HERDR_BOUND_BASH ?? "<unset>")')"
+    else
+      ts_seen="$(node -e 'process.stdout.write(process.env.HERDR_BOUND_BASH ?? "<unset>")')"
+    fi
+    if [ "$shell_seen" = "$py_seen" ] && [ "$py_seen" = "$ts_seen" ]; then
+      ok "config.sh plumbing ($bb_case): herdr-select.sh/prompt-occurrence.py/omp-herdr-control.ts all read HERDR_BOUND_BASH=$shell_seen"
+    else
+      bad "config.sh plumbing ($bb_case): split-brain shell=$shell_seen python=$py_seen ts=$ts_seen"
+    fi
+  )
+done
 
 export HERDR_BOUND_BASH=1
 printf '== flag on: bound bash resolves its exact request id with no keypress ==\n'

@@ -104,6 +104,16 @@ set -uo pipefail
 export HERDR_SANCTIONED_ANSWER=1
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH:-}"
 here=$(cd "$(dirname "$0")" && pwd)
+# Neither a human typing this directly nor peer-answer.sh's subprocess call
+# inherits a worker's stamped HERDR_BOUND_BASH (spawn-task.sh/spawn-agent.sh
+# type it into the FRESH worker shell they launch, not into whatever later
+# runs this script). config.sh is the one place that default lives — sourced
+# here the same minimal way ack.sh/guard-raw-prompt-answer.sh already do, so
+# an explicit worker-stamped value still wins (`:=` never overwrites a set
+# var) and every caller shape agrees with herdr-select.sh:281,
+# agent-hooks/omp-herdr-control.ts:469 and lib/prompt-occurrence.py:148.
+# shellcheck source=/dev/null
+[ -r "$here/config.sh" ] && . "$here/config.sh" >/dev/null 2>&1
 . "$here/lib/pane-guard.sh"
 . "$here/lib/prompt-parse.sh"
 . "$here/lib/run-registry.sh"

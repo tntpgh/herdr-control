@@ -988,8 +988,14 @@ true
 #   * HERDR_CANONICAL_RULES = the resolved canonical rules SOURCE path, so a
 #     descendant spawn keeps the same explicit operator source instead of
 #     re-deriving from a possibly different tree — only when one resolved.
-stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_PANE_ID=%q HERDR_TASK_LABEL=%q HERDR_POSTURE_FLOOR=%q' \
-  "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$stamp_posture")
+#   * HERDR_BOUND_BASH = this machine's activation flag for bound bash/shell
+#     approval (config.sh default "1"; rollback: set it to 0 in config.sh or
+#     export HERDR_BOUND_BASH=0 before spawning) — always stamped, config.sh
+#     already gave this process a value before this point, so herdr-select.sh
+#     (#281), omp-herdr-control.ts (#469) and prompt-occurrence.py (#148) all
+#     see the SAME value for this worker, never a bare unset default.
+stamped_cli=$(printf 'export HERDR_RUN_ID=%q HERDR_TASK_ID=%q HERDR_WORKER_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_PANE_ID=%q HERDR_TASK_LABEL=%q HERDR_POSTURE_FLOOR=%q HERDR_BOUND_BASH=%q' \
+  "$run_id" "$task_id" "$worker_id" "$conductor_id" "$conductor_pane_id" "$pane" "$label" "$stamp_posture" "$HERDR_BOUND_BASH")
 [ "$approval_req" = hook ] && stamped_cli="$stamped_cli HERDR_APPROVAL=hook $(printf 'HERDR_CONTROL_DIR=%q' "$canon_root")"
 [ -n "${HERDR_POLICY_EXTRA_RULES:-}" ] && stamped_cli="$stamped_cli $(printf 'HERDR_POLICY_EXTRA_RULES=%q' "$HERDR_POLICY_EXTRA_RULES")"
 [ -n "$CANONICAL_RULES_SRC" ] && stamped_cli="$stamped_cli $(printf 'HERDR_CANONICAL_RULES=%q' "$CANONICAL_RULES_SRC")"

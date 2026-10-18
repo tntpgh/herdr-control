@@ -167,8 +167,11 @@ pane=$(printf '%s' "$tc" | jq -r '.result.root_pane.pane_id // empty')
 # came from inside a herdr pane. HERDR_POSTURE_FLOOR is this spawn's
 # EFFECTIVE posture, so any child herdr launch from this pane can only
 # tighten. No run/task ids are invented here — this pane is NOT registered.
-stamped_cli=$(printf 'export HERDR_PANE_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_POSTURE_FLOOR=%q' \
-  "$pane" "$conductor_id" "$conductor_pane_id" "$eff_posture")
+# HERDR_BOUND_BASH is always stamped too — config.sh's "${HERDR_BOUND_BASH:=1}"
+# default already set it in this process before this point, so the pane sees
+# the same value herdr-select.sh/omp-herdr-control.ts/prompt-occurrence.py do.
+stamped_cli=$(printf 'export HERDR_PANE_ID=%q HERDR_CONDUCTOR_ID=%q HERDR_CONDUCTOR_PANE_ID=%q HERDR_POSTURE_FLOOR=%q HERDR_BOUND_BASH=%q' \
+  "$pane" "$conductor_id" "$conductor_pane_id" "$eff_posture" "$HERDR_BOUND_BASH")
 [ -n "${HERDR_POLICY_EXTRA_RULES:-}" ] && stamped_cli="$stamped_cli $(printf 'HERDR_POLICY_EXTRA_RULES=%q' "$HERDR_POLICY_EXTRA_RULES")"
 [ -n "$CANONICAL_RULES_SRC" ] && stamped_cli="$stamped_cli $(printf 'HERDR_CANONICAL_RULES=%q' "$CANONICAL_RULES_SRC")"
 # op prelude first — same contract as spawn-task.sh and the launchd plists.
